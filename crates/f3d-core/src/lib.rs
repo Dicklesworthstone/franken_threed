@@ -14,6 +14,8 @@ pub mod capability;
 pub mod error;
 pub mod handle;
 pub mod manifest;
+#[cfg(feature = "test-support")]
+pub mod test_evidence;
 
 pub use capability::{AdapterInfo, CapabilityRecord, DeviceLimits};
 pub use error::{F3dError, HandleError, SourceSpan};

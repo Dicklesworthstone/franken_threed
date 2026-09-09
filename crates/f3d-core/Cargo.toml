@@ -14,6 +14,7 @@ workspace = true
 default = ["std", "serde"]
 std = []
 serde = ["dep:serde", "dep:serde_json"]
+test-support = ["std", "serde"]
 
 [dependencies]
 serde = { workspace = true, optional = true }
