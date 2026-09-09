@@ -61,13 +61,6 @@ fn arena_multiple_inserts_and_reuse() {
 }
 
 #[test]
-fn arena_boundary_slot_exhaustion_regression_location_note() {
-    // Note: The arena boundary slot exhaustion regression test requires the crate-internal
-    // test hook `force_set_slot_generation_for_test` and is located in `crates/f3d-core/src/handle.rs`
-    // within `#[cfg(test)] mod tests` to ensure internal test hooks remain private to the crate.
-}
-
-#[test]
 fn gpu_handle_device_generation_lifecycle() {
     let dev1 = DeviceGeneration::INITIAL;
     let dev2 = dev1.next().expect("dev2");
