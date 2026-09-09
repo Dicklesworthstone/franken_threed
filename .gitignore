@@ -33,7 +33,9 @@ flamegraph.folded
 
 # Pinned upstream Three.js working copy. It is materialized by the bootstrap at
 # its exact commit; never commit a vendored copy into this tree.
-/upstream/
+/upstream/*
+!/upstream/PIN.md
+!/upstream/pin.json
 /three.js/
 /vendor/three/
 
