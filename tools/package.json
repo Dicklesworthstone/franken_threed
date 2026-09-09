@@ -1,0 +1,16 @@
+{
+  "name": "franken-threed-tools",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Build-time JavaScript ingestion, module parsing, and AST tooling for FrankenThreeD",
+  "engines": {
+    "node": ">=20.18.0",
+    "npm": ">=10.0.0"
+  },
+  "dependencies": {
+    "acorn": "8.14.0",
+    "acorn-walk": "8.3.4",
+    "rollup": "4.63.1"
+  }
+}
