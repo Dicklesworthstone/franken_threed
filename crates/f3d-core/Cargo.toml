@@ -1,0 +1,24 @@
+[package]
+name = "f3d-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Core typed IDs, layouts, capability records, errors, and feature manifests for FrankenThreeD"
+
+[lints]
+workspace = true
+
+[features]
+default = ["std", "serde"]
+std = []
+serde = ["dep:serde", "dep:serde_json"]
+
+[dependencies]
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde = { workspace = true, features = ["alloc", "derive"] }
+serde_json = { workspace = true, features = ["alloc"] }

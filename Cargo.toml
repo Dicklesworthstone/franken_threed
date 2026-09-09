@@ -1,0 +1,50 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/f3d-core",
+]
+
+# Planned 11 workspace crates (Plan §17.1 / AGENTS.md "Planned Workspace Crates"):
+# No new crates may be added without explicit user approval.
+# Budget ceiling: 245,000 lines total Rust including tests.
+# - crates/f3d-core       (10,000 lines budget: IDs, layouts, capability records, manifest)
+# - crates/f3d-math       (12,000 lines budget: fixed-size math, SIMD batches, geometry)
+# - crates/f3d-scene      (25,000 lines budget: packed scene state, dirty propagation)
+# - crates/f3d-assets     (20,000 lines budget: asset pack, safe decoders)
+# - crates/f3d-shader     (30,000 lines budget: material/TSL/ESSL semantics, WGSL)
+# - crates/f3d-graph      (14,000 lines budget: pass semantics, hazards, schedule)
+# - crates/f3d-gpu        (27,000 lines budget: WebGPU resource/render/compute paths)
+# - crates/f3d-runtime    (12,000 lines budget: Asupersync, lifecycle/host protocol)
+# - crates/f3d-compiler   (24,000 lines budget: route analysis, islands, codegen)
+# - crates/f3d-cli        (7,000 lines budget: build/inspect/verify/bench/serve)
+# - crates/f3d-conformance(24,000 lines budget: feature closure, performance tests)
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["FrankenThreeD Contributors"]
+repository = "https://github.com/Dicklesworthstone/franken_threed"
+homepage = "https://github.com/Dicklesworthstone/franken_threed"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+
+[workspace.dependencies]
+# Small, pinned, audited allowlist (Plan §13.4, §17.1).
+# Serialization: build/diagnostic only, never per-frame hot path.
+serde = { version = "1.0.219", default-features = false, features = ["alloc", "derive"] }
+serde_json = { version = "1.0.140", default-features = false, features = ["alloc"] }
+
+# Internal workspace crates
+f3d-core = { path = "crates/f3d-core", default-features = false }

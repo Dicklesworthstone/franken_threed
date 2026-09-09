@@ -1,0 +1,7 @@
+[toolchain]
+# Pinned dated nightly compatible with Asupersync revision efa5798d139ae3e877e13b2b8b5108fc5fe1a625.
+# Rule: Never a floating nightly in the release contract. Test a new nightly in a
+# separate lane before moving the anchor.
+channel = "nightly-2026-08-31"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]
