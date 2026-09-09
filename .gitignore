@@ -1,0 +1,192 @@
+# Rust build output
+/target/
+target/
+
+# Cargo temporary files
+**/*.rs.bk
+
+# Keep Cargo.lock tracked once the workspace exists. f3d-cli is a binary and the
+# compiler's reproducibility contract depends on pinned inputs. If a future
+# crate is a pure library with a deliberate policy to omit it, change that
+# policy explicitly instead of ignoring it here.
+
+# Rust profiling and coverage output
+*.profraw
+*.profdata
+/coverage/
+/tarpaulin-report.html
+/lcov.info
+/cobertura.xml
+
+# Criterion and benchmark scratch output outside target/
+/criterion/
+/bench-output/
+/bench-results/
+
+# Flamegraph and perf artifacts
+perf.data
+perf.data.old
+flamegraph.svg
+flamegraph.folded
+
+# === FrankenThreeD specific ===
+
+# Pinned upstream Three.js working copy. It is materialized by the bootstrap at
+# its exact commit; never commit a vendored copy into this tree.
+/upstream/
+/three.js/
+/vendor/three/
+
+# Node/JS ingestion toolchain (bundler + parser frontend). Lockfiles stay
+# tracked; installed trees do not.
+node_modules/
+.npm/
+.pnpm-store/
+.yarn/
+!package-lock.json
+!pnpm-lock.yaml
+
+# Generated build artifacts from `f3d build`
+/dist/
+/out/
+*.f3d-report.json
+*.f3d-manifest.json
+
+# Generated WGSL, Wasm, and application-specific kernels. Authored WGSL lives in
+# crate source trees and IS tracked; these are compiler output.
+/generated/
+*.wasm
+*.wat
+!tests/**/fixtures/**/*.wasm
+
+# Benchmark runs, traces, and captures. Raw paired runs that back a published
+# result belong in a deliberate, reviewed commit, not an accidental one.
+/bench-runs/
+/traces/
+/captures/
+*.trace
+*.perfetto-trace
+
+# Screenshot comparison scratch. Golden images are tracked; candidate output and
+# diffs are not — never regenerate a golden from candidate output.
+/screenshots/candidate/
+/screenshots/diff/
+*.actual.png
+*.diff.png
+
+# Browser automation profiles and downloads
+/.playwright/
+/playwright-report/
+/test-results/
+/puppeteer-cache/
+
+# Local device/capability probe dumps
+/capability-records/
+*.capability.json
+
+# Generated docs
+/doc/
+/docs/generated/
+
+# Local databases and ledgers
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+
+# Beads local runtime state. Keep durable issue exports tracked.
+.beads/.br_history/
+.beads/*.lock
+.beads/.*.lock
+# Renamed stale locks keep the original name plus a .stale-<timestamp> suffix,
+# which the two patterns above miss.
+.beads/*.lock.stale-*
+.beads/.*.lock.stale-*
+.beads/.write.lock.stale
+.beads/.write.lock.stale*
+.beads/beads.db.bad_*
+.beads/beads.db.rebuild_*
+.beads/beads.db.pre_idx_fix_*
+.beads/beads.db.pre-*
+.beads/*.pre-repair*
+.beads/pre_idx_fix_*
+.beads/recovery_*/
+.beads/beads.db
+.beads/beads.db-*
+.beads/beads.db-fsqlite-ns-*
+.beads/last-touched
+
+# bv (beads viewer) local config and caches
+.bv/
+
+# br doctor per-run artifacts
+.doctor/
+
+# Beads compliance audit dir (managed by the compliance-verification skill)
+/beads_compliance_audit/
+
+# Logs and local scratch files
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*.orig
+/tmp/
+/scratch/
+
+# Environment and local secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+
+# macOS and editor metadata
+.DS_Store
+._*
+.AppleDouble
+.LSOverride
+.idea/
+.vscode/
+*.iml
+
+# Linux and Windows metadata
+*~
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# RCH and local remote-build scratch directories
+/rch_target*/
+/remote-target*/
+# An unexpanded ${RCH_TARGET_BASE:-${TMPDIR:-/tmp}} (single-quoted through a
+# wrapper) creates this literal directory tree at the repo root.
+/$[{]TMPDIR:-*/
+# Default rustc output when compiling a snippet from stdin.
+/rust_out
+
+# Generated package artifacts
+*.crate
+*.tar.gz
+*.zip
+*.dSYM/
+
+# Agent runtime state (nothing tracked here)
+.claude/
+.codex/
+.ee/
+.ntm/
+
+# Skill-loop progress scratch
+.skill-loop-progress.md
+.skill-loop-progress-*.md
+
+# git-repo-janitor skill scratch workspace
+.repo_janitor_workspace/

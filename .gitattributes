@@ -1,0 +1,20 @@
+# Use the beads merge driver for beads JSONL files.
+.beads/issues.jsonl merge=beads
+
+# Golden screenshots and reference images are byte-exact oracles. Never diff or
+# text-munge them, and never let a merge driver rewrite them.
+tests/**/golden/** -diff -text
+screenshots/golden/** -diff -text
+*.png -diff -text
+*.exr -diff -text
+*.ktx2 -diff -text
+*.basis -diff -text
+
+# Retained upstream fixture assets are byte-exact evidence artifacts.
+tests/**/fixtures/** -diff -text
+
+# Authored WGSL and GLSL are source. Keep them diffable with LF endings.
+*.wgsl text eol=lf
+*.glsl text eol=lf
+*.vert text eol=lf
+*.frag text eol=lf
