@@ -1104,6 +1104,14 @@ contained only:
 - `AGENTS.md`
 - `README.md`
 - `LICENSE`, `.gitignore`, `.gitattributes`
+- `.beads/` — the `br` issue tracker (prefix `f3d`), holding the plan converted
+  into an execution graph: one epic per Section 19 work unit (F3D-01 … F3D-24,
+  with F3D-12/15/18/21/22 split into an early slice and a closure epic exactly
+  as Section 19 prescribes), child tasks under each, three standalone kill-gate
+  beads (Foundation, Bridge, Generalization; gates 3 and 5 live inside F3D-11
+  and F3D-24), and one deferred placeholder for the optional research tier.
+  Epic-level `blocks` edges encode the Section 19 closure ordering; child-level
+  edges encode actual start prerequisites. Start with `br ready --json`.
 
 There is **no Cargo workspace, no pinned Three.js checkout, no test harness, and
 no measurement**. When those are added, update this section or replace it with

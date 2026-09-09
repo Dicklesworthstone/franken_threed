@@ -546,11 +546,13 @@ franken_threed/
 ├── README.md
 ├── LICENSE                                                 # MIT + OpenAI/Anthropic rider
 ├── .gitignore
-└── .gitattributes
+├── .gitattributes
+└── .beads/                                                 # br issue graph: the plan as 212 beads (see AGENTS.md)
 ```
 
 Everything else — the Cargo workspace, the pinned upstream checkout, the feature
-manifest, the conformance harness, the benchmark corpus — is future work.
+manifest, the conformance harness, the benchmark corpus — is future work. The
+work itself is tracked as beads: run `br ready --json` to see what is unblocked.
 
 ---
 
