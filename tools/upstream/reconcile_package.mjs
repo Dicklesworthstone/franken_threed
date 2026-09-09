@@ -64,6 +64,9 @@ export async function listFilesRecursive(dir, rootDir = dir) {
   try {
     const entries = await fs.readdir(dir, { withFileTypes: true });
     for (const entry of entries) {
+      if (entry.name.startsWith('._') || entry.name === '.DS_Store') {
+        continue;
+      }
       const fullPath = path.join(dir, entry.name);
       if (entry.isDirectory()) {
         const subFiles = await listFilesRecursive(fullPath, rootDir);
@@ -371,10 +374,23 @@ export async function reconcilePackage({
   for (const [targetRel, usages] of targetUsage.entries()) {
     if (usages.length > 1) {
       const normalizedTarget = `./${targetRel}`;
-      const reason =
+      let reason =
         explainedAliases.get(normalizedTarget) ||
         explainedAliases.get(targetRel) ||
         null;
+
+      if (!reason) {
+        for (const [pattern, patReason] of explainedAliases.entries()) {
+          if (pattern.endsWith('/*')) {
+            const prefix = pattern.slice(0, -2).replace(/^\.\//, '');
+            if (targetRel === prefix || targetRel.startsWith(prefix + '/')) {
+              reason = patReason;
+              break;
+            }
+          }
+        }
+      }
+
       const isExplained = Boolean(reason);
 
       aliasDuplicates.push({
@@ -390,6 +406,16 @@ export async function reconcilePackage({
 
   // 3. Reconcile and expand files entries (packaged inventory)
   for (const fileEntry of filesField) {
+    if (fileEntry.includes('*') || fileEntry.includes('?') || fileEntry.includes('[')) {
+      missingFilesEntries.push({
+        filesEntry: fileEntry,
+        resolvedPath: fileEntry.replace(/^\.\//, ''),
+        isGlob: true,
+        explained: false,
+        reason: `Package.json 'files' glob pattern '${fileEntry}' is unsupported (literal path expected)`
+      });
+      continue;
+    }
     const entryRel = fileEntry.replace(/^\.\//, '');
     const entryAbs = path.join(absolutePkgDir, entryRel);
     const check = await checkPathExists(entryAbs);

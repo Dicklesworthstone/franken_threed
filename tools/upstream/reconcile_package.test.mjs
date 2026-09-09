@@ -3,12 +3,12 @@
  *
  * Verifies reconciliation rule behavior with synthetic package.json structures:
  * - Clean valid package with static exports and files entries
- * - Missing export targets
+ * - Missing export targets (nonexistent file or directory pretending to be module)
  * - Missing package.json files entries
  * - Alias duplicates (explained vs unexplained)
- * - Wildcard path expansion (e.g. ./addons/* -> ./examples/jsm/*)
+ * - Wildcard path expansion with suffix matching (e.g. ./addons/* -> ./examples/jsm/*)
  * - Conditional exports (import, require, types)
- * - Deterministic JSON formatting stability
+ * - Deterministic JSON formatting stability across runs
  *
  * Implements test requirements for bead f3d-01-upstream-pin-and-census-gl8.1.
  */
@@ -115,16 +115,17 @@ test('reconcilePackage: clean synthetic package with matching files passes with 
   assert.equal(report.summary.wildcard_unmatched_count, 0);
   assert.equal(report.summary.unexplained_discrepancies, 0);
   assert.equal(report.summary.is_clean, true);
+  assert.ok(report.packaged_inventory_files.length >= 5);
 
   // Verify that the wildcard expansion found OrbitControls
-  const orbitExport = report.resolved_exports_sample.find(
+  const orbitExport = report.resolved_exports.find(
     (e) => e.exportKey === './addons/controls/OrbitControls.js'
   );
   assert.ok(orbitExport, 'Wildcard export was expanded and resolved');
   assert.equal(orbitExport.target, 'examples/jsm/controls/OrbitControls.js');
 });
 
-test('reconcilePackage: detects missing export targets and reports them', async () => {
+test('reconcilePackage: detects missing export targets and directories pretending to be modules', async () => {
   const testDir = await createTestDir('missing_export');
 
   const pkgJson = {
@@ -133,24 +134,29 @@ test('reconcilePackage: detects missing export targets and reports them', async 
     type: 'module',
     exports: {
       './missing': './build/three.missing.js',
+      './is_a_dir': './build/some_dir',
       './exists': './build/three.exists.js'
     }
   };
 
   await fs.writeFile(path.join(testDir, 'package.json'), JSON.stringify(pkgJson, null, 2));
-  await fs.mkdir(path.join(testDir, 'build'), { recursive: true });
+  await fs.mkdir(path.join(testDir, 'build', 'some_dir'), { recursive: true });
   await fs.writeFile(path.join(testDir, 'build', 'three.exists.js'), 'export default {};');
 
   const report = await reconcilePackage({ packageDir: testDir });
 
-  assert.equal(report.summary.missing_export_targets_count, 1);
-  assert.equal(report.summary.unexplained_discrepancies, 1);
+  assert.equal(report.summary.missing_export_targets_count, 2);
+  assert.equal(report.summary.unexplained_discrepancies, 2);
   assert.equal(report.summary.is_clean, false);
 
-  const missing = report.discrepancies.missing_export_targets[0];
-  assert.equal(missing.exportKey, './missing');
+  const missing = report.discrepancies.missing_export_targets.find((m) => m.exportKey === './missing');
+  assert.ok(missing);
   assert.equal(missing.target, './build/three.missing.js');
   assert.equal(missing.explained, false);
+
+  const isDir = report.discrepancies.missing_export_targets.find((m) => m.exportKey === './is_a_dir');
+  assert.ok(isDir);
+  assert.ok(isDir.reason.includes('is a directory'));
 });
 
 test('reconcilePackage: detects missing files entries and reports them', async () => {
@@ -178,11 +184,43 @@ test('reconcilePackage: detects missing files entries and reports them', async (
   assert.equal(missingFile.explained, false);
 });
 
+test('reconcilePackage: wildcard pattern with suffix matching (e.g. ./*.js -> ./*.js)', async () => {
+  const testDir = await createTestDir('wildcard_suffix');
+
+  const pkgJson = {
+    name: 'three',
+    version: '0.186.0',
+    type: 'module',
+    exports: {
+      './nodes/*.js': './src/nodes/*.js'
+    }
+  };
+
+  await fs.writeFile(path.join(testDir, 'package.json'), JSON.stringify(pkgJson, null, 2));
+  await fs.mkdir(path.join(testDir, 'src', 'nodes'), { recursive: true });
+
+  await fs.writeFile(path.join(testDir, 'src', 'nodes', 'Node.js'), 'export class Node {}');
+  await fs.writeFile(path.join(testDir, 'src', 'nodes', 'ShaderNode.js'), 'export class ShaderNode {}');
+  // File not matching suffix: should be ignored by this pattern
+  await fs.writeFile(path.join(testDir, 'src', 'nodes', 'README.md'), 'docs');
+
+  const report = await reconcilePackage({ packageDir: testDir });
+
+  assert.equal(report.summary.missing_export_targets_count, 0);
+  assert.equal(report.summary.resolved_exports_count, 2);
+
+  const nodeExp = report.resolved_exports.find((e) => e.exportKey === './nodes/Node.js');
+  assert.ok(nodeExp);
+  assert.equal(nodeExp.target, 'src/nodes/Node.js');
+
+  const shaderExp = report.resolved_exports.find((e) => e.exportKey === './nodes/ShaderNode.js');
+  assert.ok(shaderExp);
+  assert.equal(shaderExp.target, 'src/nodes/ShaderNode.js');
+});
+
 test('reconcilePackage: identifies explained alias duplicates vs unexplained duplicates', async () => {
   const testDir = await createTestDir('alias_duplicates');
 
-  // One intentional alias (build/three.webgpu.js pointed to by ./webgpu and ./custom_alias)
-  // One unexplained duplicate
   const pkgJson = {
     name: 'three',
     version: '0.186.0',
@@ -223,7 +261,7 @@ test('reconcilePackage: identifies explained alias duplicates vs unexplained dup
   assert.equal(unexplainedDup.explained, false);
 });
 
-test('reconcilePackage: deterministic output formatting produces stable output', async () => {
+test('reconcilePackage: deterministic output formatting produces identical bytes without timestamp hacks', async () => {
   const testDir = await createTestDir('deterministic');
 
   const pkgJson = {
@@ -246,12 +284,34 @@ test('reconcilePackage: deterministic output formatting produces stable output',
   const report1 = await reconcilePackage({ packageDir: testDir });
   const report2 = await reconcilePackage({ packageDir: testDir });
 
-  // Disregard non-deterministic timestamps for formatting check
-  report1.timestamp = '2026-09-09T00:00:00.000Z';
-  report2.timestamp = '2026-09-09T00:00:00.000Z';
-
   const json1 = formatDeterministicJson(report1);
   const json2 = formatDeterministicJson(report2);
 
-  assert.equal(json1, json2, 'Report serialization is byte-for-byte deterministic');
+  assert.equal(json1, json2, 'Report serialization is 100% byte-for-byte deterministic across runs');
+});
+
+test('reconcilePackage: glob pattern in package.json files is reported as unsupported', async () => {
+  const testDir = await createTestDir('glob_files');
+
+  const pkgJson = {
+    name: 'three',
+    version: '0.186.0',
+    type: 'module',
+    exports: {},
+    files: ['build', 'src/**/*.js']
+  };
+
+  await fs.writeFile(path.join(testDir, 'package.json'), JSON.stringify(pkgJson, null, 2));
+  await fs.mkdir(path.join(testDir, 'build'), { recursive: true });
+
+  const report = await reconcilePackage({ packageDir: testDir });
+
+  assert.equal(report.summary.missing_files_entries_count, 1);
+  const globEntry = report.discrepancies.missing_files_entries.find((e) => e.filesEntry === 'src/**/*.js');
+  assert.ok(globEntry, 'Glob entry must be recorded in missing_files_entries');
+  assert.equal(globEntry.isGlob, true);
+  assert.ok(
+    globEntry.reason.includes('unsupported'),
+    `Reason must indicate unsupported glob pattern, got: ${globEntry.reason}`
+  );
 });
