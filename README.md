@@ -547,7 +547,7 @@ franken_threed/
 ├── LICENSE                                                 # MIT + OpenAI/Anthropic rider
 ├── .gitignore
 ├── .gitattributes
-└── .beads/                                                 # br issue graph: the plan as 212 beads (see AGENTS.md)
+└── .beads/                                                 # br issue graph: the plan as beads (see AGENTS.md)
 ```
 
 Everything else — the Cargo workspace, the pinned upstream checkout, the feature
