@@ -43,8 +43,8 @@ style = { level = "warn", priority = -1 }
 [workspace.dependencies]
 # Small, pinned, audited allowlist (Plan §13.4, §17.1).
 # Serialization: build/diagnostic only, never per-frame hot path.
-serde = { version = "1.0.219", default-features = false, features = ["alloc", "derive"] }
-serde_json = { version = "1.0.140", default-features = false, features = ["alloc"] }
+serde = { version = "=1.0.229", default-features = false, features = ["alloc", "derive"] }
+serde_json = { version = "=1.0.151", default-features = false, features = ["alloc"] }
 
 # Internal workspace crates
 f3d-core = { path = "crates/f3d-core", default-features = false }

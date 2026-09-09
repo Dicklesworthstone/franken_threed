@@ -164,7 +164,6 @@ mod tests {
         assert!(FeatureStatus::CandidateRefusalOnValidSource.is_blocking());
 
         assert!(!FeatureStatus::Verified.is_blocking());
-        assert!(!FeatureStatus::Retained.is_blocking());
         assert!(!FeatureStatus::HostBlocked.is_blocking());
 
         let mut manifest = FeatureManifest::new_pinned();

@@ -18,13 +18,13 @@ pub struct CapabilityRecord {
     pub webgpu_supported: bool,
     /// GPU adapter information.
     pub adapter: AdapterInfo,
-    /// Enforced WebGPU device limits.
-    pub limits: DeviceLimits,
+    /// Enforced WebGPU device limits, if probed and available.
+    pub limits: Option<DeviceLimits>,
     /// Supported WGSL language feature set.
     pub wgsl_features: Vec<String>,
     /// Preferred canvas presentation format.
     pub preferred_canvas_format: String,
-    /// Canvas color space (e.g. "srgb", "display-p3").
+    /// Canvas color space (e.g. "srgb", "display-p3", or "unknown").
     pub color_space: String,
 }
 
@@ -35,10 +35,10 @@ impl CapabilityRecord {
             host_environment: String::from("unknown"),
             webgpu_supported: false,
             adapter: AdapterInfo::unknown(),
-            limits: DeviceLimits::default_webgpu_limits(),
+            limits: None,
             wgsl_features: Vec::new(),
             preferred_canvas_format: String::from("unknown"),
-            color_space: String::from("srgb"),
+            color_space: String::from("unknown"),
         }
     }
 }

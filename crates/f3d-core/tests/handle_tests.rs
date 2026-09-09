@@ -61,31 +61,10 @@ fn arena_multiple_inserts_and_reuse() {
 }
 
 #[test]
-fn arena_boundary_slot_exhaustion_regression() {
-    let mut arena: Arena<ObjectDomain, &'static str> = Arena::new();
-
-    let h0 = arena.insert("first").expect("insert 0");
-    assert_eq!(h0.index(), 0);
-
-    // Force slot 0 generation to u32::MAX
-    let max_generation = NonZeroU32::new(u32::MAX).unwrap();
-    arena.force_set_slot_generation_for_test(0, max_generation);
-    let h0_max: Handle<ObjectDomain> = Handle::new(0, max_generation);
-
-    // Remove at boundary: slot must become Exhausted
-    let removed = arena.remove(h0_max).expect("remove");
-    assert_eq!(removed, "first");
-
-    // Subsequent insert must NOT select slot 0; must allocate a new slot
-    let h1 = arena.insert("second").expect("insert 1");
-    assert_eq!(
-        h1.index(),
-        1,
-        "Exhausted slot 0 must not be reused to prevent ABA collisions"
-    );
-
-    let h2 = arena.insert("third").expect("insert 2");
-    assert_eq!(h2.index(), 2);
+fn arena_boundary_slot_exhaustion_regression_location_note() {
+    // Note: The arena boundary slot exhaustion regression test requires the crate-internal
+    // test hook `force_set_slot_generation_for_test` and is located in `crates/f3d-core/src/handle.rs`
+    // within `#[cfg(test)] mod tests` to ensure internal test hooks remain private to the crate.
 }
 
 #[test]
@@ -146,8 +125,9 @@ fn capability_record_limits() {
     let record = CapabilityRecord::unknown();
     assert_eq!(record.host_environment, "unknown");
     assert!(!record.webgpu_supported);
-    assert_eq!(record.limits.min_uniform_buffer_offset_alignment, 256);
-    assert_eq!(record.limits.min_storage_buffer_offset_alignment, 256);
+    assert!(record.limits.is_none(), "unknown() must not fabricate limits");
+    assert_eq!(record.preferred_canvas_format, "unknown");
+    assert_eq!(record.color_space, "unknown", "unknown() must not fabricate color space");
 }
 
 #[test]

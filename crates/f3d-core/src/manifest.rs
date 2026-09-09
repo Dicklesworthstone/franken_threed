@@ -63,8 +63,6 @@ pub enum FeatureStatus {
     // === Non-Blocking States ===
     /// Implementation passes all acceptance and conformance criteria under its route.
     Verified,
-    /// Retained ownership verified against upstream reference.
-    Retained,
     /// Prerequisite is missing on host, identical to the reference environment.
     HostBlocked,
 }
@@ -80,7 +78,7 @@ impl FeatureStatus {
             | Self::Stub
             | Self::NoOpSubstitute
             | Self::CandidateRefusalOnValidSource => true,
-            Self::Verified | Self::Retained | Self::HostBlocked => false,
+            Self::Verified | Self::HostBlocked => false,
         }
     }
 }
