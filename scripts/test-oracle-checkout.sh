@@ -119,24 +119,48 @@ EXIT_VERIFY_FAIL=$?
 set -e
 assert_eq "Verify fails on commit mismatch" "${EXIT_VERIFY_FAIL}" "1"
 
-# Test 4d: JSON report validity
+# Test 4d: JSON report validity and null built_artifacts_exist when unrequested
 JSON_REPORT="$("${REPO_ROOT}/scripts/oracle-checkout.sh" --verify --target-dir "${SYNTH_DIR}" --json || true)"
 JSON_PARSE_CHECK="$(node -e '
   try {
     const report = JSON.parse(process.argv[1]);
-    if (report.status === "FAIL" && report.head_matches === false && Array.isArray(report.missing_artifacts)) {
+    if (report.status === "FAIL" &&
+        report.head_matches === false &&
+        report.verify_built_requested === false &&
+        report.built_artifacts_exist === null &&
+        Array.isArray(report.missing_artifacts)) {
       console.log("VALID_REPORT");
     } else {
-      console.log("INVALID_SCHEMA");
+      console.log("INVALID_SCHEMA: " + JSON.stringify(report));
     }
   } catch (e) {
     console.log("PARSE_ERROR: " + e.message);
   }
 ' "${JSON_REPORT}")"
 
-assert_eq "JSON output is well-formed with valid schema" "${JSON_PARSE_CHECK}" "VALID_REPORT"
+assert_eq "JSON output reports built_artifacts_exist: null when unrequested" "${JSON_PARSE_CHECK}" "VALID_REPORT"
 
-# Test 4e: Build refusal without ALLOW_LOCAL_BUILD=1
+# Test 4e: JSON report when --verify-built IS requested
+JSON_REPORT_BUILT="$("${REPO_ROOT}/scripts/oracle-checkout.sh" --verify --verify-built --target-dir "${SYNTH_DIR}" --json || true)"
+JSON_PARSE_CHECK_BUILT="$(node -e '
+  try {
+    const report = JSON.parse(process.argv[1]);
+    if (report.verify_built_requested === true &&
+        report.built_artifacts_exist === false &&
+        Array.isArray(report.missing_artifacts) &&
+        report.missing_artifacts.length > 0) {
+      console.log("VALID_BUILT_REPORT");
+    } else {
+      console.log("INVALID_BUILT_SCHEMA: " + JSON.stringify(report));
+    }
+  } catch (e) {
+    console.log("PARSE_ERROR: " + e.message);
+  }
+' "${JSON_REPORT_BUILT}")"
+
+assert_eq "JSON output reports built_artifacts_exist: false when requested and missing" "${JSON_PARSE_CHECK_BUILT}" "VALID_BUILT_REPORT"
+
+# Test 4f: Build refusal without ALLOW_LOCAL_BUILD=1
 set +e
 "${REPO_ROOT}/scripts/oracle-checkout.sh" --build --target-dir "${SYNTH_DIR}" >/dev/null 2>&1
 EXIT_BUILD_REFUSE=$?

@@ -36,7 +36,8 @@ TARGET_DIR="${REPO_ROOT}/upstream/three.js"
 PIN_JSON="${REPO_ROOT}/tools/upstream/pin.json"
 PIN_MD="${REPO_ROOT}/tools/upstream/PIN.md"
 
-MODE="checkout"
+DO_CHECKOUT=0
+DO_VERIFY=0
 VERIFY_BUILT=0
 JSON_OUTPUT=0
 BUILD=0
@@ -48,7 +49,7 @@ usage() {
 Usage: $(basename "$0") [OPTIONS]
 
 Options:
-  --checkout        Fetch/checkout pinned upstream commit into upstream/three.js (default)
+  --checkout        Fetch/checkout pinned upstream commit into upstream/three.js
   --verify          Verify that checkout matches pinned source commit, tag hash, and pin metadata
   --verify-built    Additionally verify that required built artifacts exist
   --build           Prepare upstream build via RCH (or with ALLOW_LOCAL_BUILD=1)
@@ -70,11 +71,11 @@ EOF
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --checkout)
-      MODE="checkout"
+      DO_CHECKOUT=1
       shift
       ;;
     --verify)
-      MODE="verify"
+      DO_VERIFY=1
       shift
       ;;
     --verify-built)
@@ -233,7 +234,7 @@ do_verify() {
   local ACTUAL_TAG_PEEL=""
   local PIN_METADATA_EXISTS=false
   local PIN_JSON_VALID=false
-  local BUILT_ARTIFACTS_EXIST=true
+  local BUILT_ARTIFACTS_EXIST="null"
   local MISSING_ARTIFACTS=()
   local STATUS="PASS"
 
@@ -273,7 +274,7 @@ do_verify() {
     # 5. Semantic field validation of pin.json via node (not regex or grep)
     if node -e '
       const fs = require("fs");
-      const [,, pinPath, expectedCommit, expectedTag, expectedVer] = process.argv;
+      const [pinPath, expectedCommit, expectedTag, expectedVer] = process.argv.slice(1);
       const data = JSON.parse(fs.readFileSync(pinPath, "utf8"));
       const o = data.oracle || data;
       if (o.source_commit !== expectedCommit) process.exit(1);
@@ -293,6 +294,7 @@ do_verify() {
 
   # 6. Check required built artifacts if requested
   if [[ "${VERIFY_BUILT}" -eq 1 ]]; then
+    BUILT_ARTIFACTS_EXIST="true"
     local REQUIRED_ARTIFACTS=(
       "build/three.module.js"
       "build/three.webgpu.js"
@@ -301,7 +303,7 @@ do_verify() {
     )
     for art in "${REQUIRED_ARTIFACTS[@]}"; do
       if [[ ! -f "${TARGET_DIR}/${art}" ]]; then
-        BUILT_ARTIFACTS_EXIST=false
+        BUILT_ARTIFACTS_EXIST="false"
         MISSING_ARTIFACTS+=("${art}")
         STATUS="FAIL"
       fi
@@ -309,52 +311,53 @@ do_verify() {
   fi
 
   if [[ "${JSON_OUTPUT}" -eq 1 ]]; then
-    # Deterministic JSON emission via node serialization
+    # Deterministic JSON emission via node serialization using environment variables
+    REPORT_STATUS="${STATUS}" \
+    REPORT_RELEASE_NAME="${PINNED_RELEASE_NAME}" \
+    REPORT_RELEASE_DATE="${PINNED_RELEASE_DATE}" \
+    REPORT_EXP_COMMIT="${PINNED_SOURCE_COMMIT}" \
+    REPORT_ACT_HEAD="${ACTUAL_HEAD}" \
+    REPORT_HEAD_MATCHES="${HEAD_MATCHES}" \
+    REPORT_EXP_TAG="${PINNED_TAG_OBJECT_HASH}" \
+    REPORT_ACT_TAG="${ACTUAL_TAG_OBJECT}" \
+    REPORT_TAG_OBJ_MATCHES="${TAG_OBJECT_MATCHES}" \
+    REPORT_ACT_PEEL="${ACTUAL_TAG_PEEL}" \
+    REPORT_TAG_PEEL_MATCHES="${TAG_PEEL_MATCHES}" \
+    REPORT_TARGET_DIR="${TARGET_DIR}" \
+    REPORT_CHECKOUT_EXISTS="${CHECKOUT_EXISTS}" \
+    REPORT_PIN_META_EXISTS="${PIN_METADATA_EXISTS}" \
+    REPORT_PIN_JSON_VALID="${PIN_JSON_VALID}" \
+    REPORT_VERIFY_BUILT_REQ="${VERIFY_BUILT}" \
+    REPORT_BUILT_EXIST="${BUILT_ARTIFACTS_EXIST}" \
+    REPORT_MISSING_ARTS="${MISSING_ARTIFACTS[*]-}" \
     node -e '
-      const [,, status, releaseName, releaseDate, expCommit, actHead, headMatches,
-                 expTag, actTag, tagObjMatches, actPeel, tagPeelMatches,
-                 targetDir, checkoutExists, pinMetaExists, pinJsonValid,
-                 verifyBuiltReq, builtExist, missingArtsJson] = process.argv;
-
+      const e = process.env;
+      const missing = e.REPORT_MISSING_ARTS ? e.REPORT_MISSING_ARTS.split(" ").filter(Boolean) : [];
+      const builtExist = (e.REPORT_VERIFY_BUILT_REQ === "1")
+        ? (e.REPORT_BUILT_EXIST === "true")
+        : null;
       const report = {
-        status,
-        release_name: releaseName,
-        release_date: releaseDate,
-        expected_source_commit: expCommit,
-        actual_head: actHead,
-        head_matches: headMatches === "true",
-        expected_tag_object_hash: expTag,
-        actual_tag_object_hash: actTag,
-        tag_object_matches: tagObjMatches === "true",
-        actual_tag_peeled_commit: actPeel,
-        tag_peel_matches: tagPeelMatches === "true",
-        target_dir: targetDir,
-        checkout_exists: checkoutExists === "true",
-        pin_metadata_exists: pinMetaExists === "true",
-        pin_json_valid: pinJsonValid === "true",
-        verify_built_requested: verifyBuiltReq === "1",
-        built_artifacts_exist: builtExist === "true",
-        missing_artifacts: JSON.parse(missingArtsJson)
+        status: e.REPORT_STATUS,
+        release_name: e.REPORT_RELEASE_NAME,
+        release_date: e.REPORT_RELEASE_DATE,
+        expected_source_commit: e.REPORT_EXP_COMMIT,
+        actual_head: e.REPORT_ACT_HEAD,
+        head_matches: e.REPORT_HEAD_MATCHES === "true",
+        expected_tag_object_hash: e.REPORT_EXP_TAG,
+        actual_tag_object_hash: e.REPORT_ACT_TAG,
+        tag_object_matches: e.REPORT_TAG_OBJ_MATCHES === "true",
+        actual_tag_peeled_commit: e.REPORT_ACT_PEEL,
+        tag_peel_matches: e.REPORT_TAG_PEEL_MATCHES === "true",
+        target_dir: e.REPORT_TARGET_DIR,
+        checkout_exists: e.REPORT_CHECKOUT_EXISTS === "true",
+        pin_metadata_exists: e.REPORT_PIN_META_EXISTS === "true",
+        pin_json_valid: e.REPORT_PIN_JSON_VALID === "true",
+        verify_built_requested: e.REPORT_VERIFY_BUILT_REQ === "1",
+        built_artifacts_exist: builtExist,
+        missing_artifacts: missing
       };
       console.log(JSON.stringify(report, null, 2));
-    ' "${STATUS}" \
-      "${PINNED_RELEASE_NAME}" \
-      "${PINNED_RELEASE_DATE}" \
-      "${PINNED_SOURCE_COMMIT}" \
-      "${ACTUAL_HEAD}" \
-      "${HEAD_MATCHES}" \
-      "${PINNED_TAG_OBJECT_HASH}" \
-      "${ACTUAL_TAG_OBJECT}" \
-      "${TAG_OBJECT_MATCHES}" \
-      "${ACTUAL_TAG_PEEL}" \
-      "${TAG_PEEL_MATCHES}" \
-      "${TARGET_DIR}" \
-      "${CHECKOUT_EXISTS}" \
-      "${PIN_METADATA_EXISTS}" \
-      "${PIN_JSON_VALID}" \
-      "${VERIFY_BUILT}" \
-      "${BUILT_ARTIFACTS_EXIST}" \
-      "$(node -e 'console.log(JSON.stringify(process.argv.slice(1)))' "${MISSING_ARTIFACTS[@]-}")"
+    '
   else
     echo "=== FrankenThreeD Oracle Verification Report ==="
     echo "Status:                     ${STATUS}"
@@ -370,6 +373,8 @@ do_verify() {
       if [[ ${#MISSING_ARTIFACTS[@]} -gt 0 ]]; then
         echo "Missing built artifacts:    ${MISSING_ARTIFACTS[*]}"
       fi
+    else
+      echo "Built artifacts check:      null (not requested)"
     fi
 
     if [[ "${STATUS}" != "PASS" ]]; then
@@ -386,11 +391,13 @@ do_verify() {
   fi
 }
 
-case "${MODE}" in
-  checkout)
-    do_checkout
-    ;;
-  verify)
-    do_verify
-    ;;
-esac
+# Default behavior: if neither --checkout nor --verify is explicitly specified, do checkout (which verifies at end)
+if [[ "${DO_CHECKOUT}" -eq 0 && "${DO_VERIFY}" -eq 0 ]]; then
+  DO_CHECKOUT=1
+fi
+
+if [[ "${DO_CHECKOUT}" -eq 1 ]]; then
+  do_checkout
+elif [[ "${DO_VERIFY}" -eq 1 ]]; then
+  do_verify
+fi
