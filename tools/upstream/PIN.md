@@ -52,3 +52,18 @@ The upstream repository builds the following core bundles via `npm run build`:
 - `build/three.cjs` — CommonJS core bundle
 
 Reconciliation against `package.json` (`exports`, `files`, subpath wildcards, and packaged assets) is performed by `tools/upstream/reconcile_package.mjs`. All discrepancies between metadata and actual filesystem entries are classified as explained (e.g. valid backward-compatible aliases) or unresolved.
+
+---
+
+## 5. E2E Runner Inputs (Bead 01.4)
+
+Facts extracted from upstream Three.js r186 (`148ef33ecb6d2502ff796d4554abd1549c95d519`):
+
+- **Puppeteer**: `^25.0.0` (declared in `package.json` `devDependencies`; resolves to `25.10.0` in upstream `package-lock.json`).
+- **Chromium**: Managed directly by Puppeteer `25.10.0`; no separate `chromium` package is declared in `devDependencies`.
+- **Playwright**: Not declared in upstream `devDependencies`.
+- **Node Engine**:
+  - Upstream `package.json` root: unpinned (`engines` field is omitted).
+  - Upstream `package-lock.json` (`node_modules/puppeteer`): specifies `"node": ">=22.12.0"`.
+  - FrankenThreeD toolchain environment (`tools/package.json`): `"node": ">=20.18.0"`.
+

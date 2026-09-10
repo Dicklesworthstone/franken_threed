@@ -1,0 +1,10 @@
+# SHA256 checksums of upstream build artifacts
+# Pinned Oracle: Three.js r186 (source commit 148ef33ecb6d2502ff796d4554abd1549c95d519)
+# Note: These artifacts are committed in the upstream git repository at commit 148ef33ecb6d2502ff796d4554abd1549c95d519, not from a local rebuild.
+
+b326d5a8b9639e18e3d8debae1c331eaaf426ec703bf218c5ab72b9d6bfa1e94  build/three.cjs
+9edde002b066a9a05676a6127f67735b62baf399bdea529f2f7e31657da769e6  build/three.core.js
+9052042d676cb0fdc1ddfefe193053f34b7ac0513a616fdac4535d49987812ea  build/three.module.js
+6e6b92d8ce467818944f73815a96abadc6392fb34de577d479a23810b6aeeed0  build/three.tsl.js
+a78400fa1d359e81fcc12b84ed0a89a7fbecb4b8373e28ae8f9d2b11f6ea13bc  build/three.webgpu.js
+a6a3a3b59fff0496783cd77162f1733141af31d4b596a5a77004b4f1790d53f6  build/three.webgpu.nodes.js
