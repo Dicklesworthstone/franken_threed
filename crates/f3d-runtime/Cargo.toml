@@ -5,27 +5,24 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Asupersync browser lifecycle and host protocol execution core for FrankenThreeD"
+description = "Asupersync browser execution for FrankenThreeD"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
 
 [lints]
 workspace = true
 
 [features]
-default = ["std", "serde"]
-std = ["f3d-core/std"]
-serde = ["dep:serde", "dep:serde_json", "f3d-core/serde"]
-browser = ["dep:wasm-bindgen", "dep:js-sys", "dep:web-sys"]
+default = []
+browser = ["dep:wasm-bindgen", "dep:js-sys", "asupersync/wasm-browser-minimal"]
 
 [dependencies]
-f3d-core = { workspace = true }
-asupersync = { path = "../../../../dp/asupersync", default-features = false }
-serde = { workspace = true, optional = true }
-serde_json = { workspace = true, optional = true }
-
-wasm-bindgen = { version = "0.2.126", optional = true }
-js-sys = { version = "0.3.103", optional = true }
-web-sys = { version = "0.3.103", optional = true, features = ["Window", "Document", "MessageChannel", "MessagePort"] }
-
-[dev-dependencies]
-serde = { workspace = true, features = ["alloc", "derive"] }
-serde_json = { workspace = true, features = ["alloc"] }
+# Development linkage while the upstream browser fixes are being verified.
+# Absolute path on purpose (root 2283): under RCH the f3d project root canonicalizes to
+# /data/projects on the worker, so a relative ../../../../dp path resolved to a different,
+# stale /data/dp checkout. RCH syncs this exact physical path. Replace with an immutable pin
+# once upstream is ready.
+asupersync = { path = "/Users/jemanuel/dp/asupersync", default-features = false }
+wasm-bindgen = { version = "=0.2.126", optional = true }
+js-sys = { version = "=0.3.103", optional = true }

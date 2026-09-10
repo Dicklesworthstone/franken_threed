@@ -1,124 +1,66 @@
-/**
- * Minimal static JS shim for Asupersync browser execution.
- *
- * Implements microtask scheduling, host-turn (macrotask) yielding via MessageChannel,
- * timer delays, non-reentrant pump invocation, and structured event collection.
- * Strictly no eval, no dynamic script injection.
- */
-'use strict';
-
-class BrowserExecutionShim {
-    constructor(options = {}) {
-        this.burstLimit = options.burstLimit || 32;
-        this.inPump = false;
-        this.macrotaskId = 0;
-        this.events = [];
-        this.onEvent = options.onEvent || null;
-        this.channel = new MessageChannel();
-        this.channel.port1.onmessage = () => this._onMacroTurn();
-        this.scheduledMacro = false;
-        this.pendingMacroCallbacks = [];
-    }
-
-    /**
-     * Schedules a microtask using the standard host queueMicrotask API.
-     */
-    scheduleMicrotask(fn) {
-        if (typeof queueMicrotask === 'function') {
-            queueMicrotask(fn);
-        } else {
-            Promise.resolve().then(fn);
-        }
-    }
-
-    /**
-     * Yields control to the browser macrotask event loop via MessageChannel.
-     */
-    yieldHostTurn(callback) {
-        this.pendingMacroCallbacks.push(callback);
-        if (!this.scheduledMacro) {
-            this.scheduledMacro = true;
-            this.channel.port2.postMessage(undefined);
-        }
-    }
-
-    _onMacroTurn() {
-        this.scheduledMacro = false;
-        this.macrotaskId++;
-        const callbacks = this.pendingMacroCallbacks;
-        this.pendingMacroCallbacks = [];
-        for (const cb of callbacks) {
-            try {
-                cb(this.macrotaskId);
-            } catch (err) {
-                console.error('[f3d-shim] Error in macrotask callback:', err);
-            }
-        }
-    }
-
-    /**
-     * Schedules a timer delay using standard host setTimeout.
-     */
-    scheduleTimer(delayMs, callback) {
-        return setTimeout(() => {
-            this.macrotaskId++;
-            callback(this.macrotaskId);
-        }, delayMs);
-    }
-
-    /**
-     * Invokes the pump with non-reentrancy protection.
-     * Returns true if executed, false if reentrant call was prevented.
-     */
-    pumpStep(pumpFn) {
-        if (this.inPump) {
-            this.recordEvent({
-                probe: 'reentrancy_guard',
-                task_id: 0,
-                event: 'reentrancy_prevented',
-                source: 'microtask',
-                macrotask_id: this.macrotaskId,
-                ts_wall_ms: performance.now(),
-                detail: 'Synchronous pump reentrancy rejected by JS shim guard'
-            });
-            return false;
-        }
-
-        this.inPump = true;
-        try {
-            return pumpFn();
-        } finally {
-            this.inPump = false;
-        }
-    }
-
-    /**
-     * Records a structured telemetry event.
-     */
-    recordEvent(event) {
-        if (!event.ts_wall_ms) {
-            event.ts_wall_ms = Math.round(performance.now());
-        }
-        if (!event.macrotask_id) {
-            event.macrotask_id = this.macrotaskId;
-        }
-        this.events.push(event);
-        if (this.onEvent) {
-            this.onEvent(event);
-        }
-    }
-
-    /**
-     * Exports all events as NDJSON / JSON Lines.
-     */
-    exportNdjson() {
-        return this.events.map(e => JSON.stringify(e)).join('\n');
-    }
-}
-
-if (typeof window !== 'undefined') {
-    window.BrowserExecutionShim = BrowserExecutionShim;
-}
-if (typeof module !== 'undefined' && module.exports) {
-    module.exports = { BrowserExecutionShim };
-}
+// Browser host callbacks for the actual Asupersync Wasm probe. No executor.
+(() => {
+  let wasm;
+  let hostTurn = 0;
+  let finished = false;
+  const events = [];
+  const channel = new MessageChannel();
+  const pending = new Map();
+  let nextCallback = 0;
+  channel.port1.onmessage = ({ data }) => {
+    const callback = pending.get(data);
+    pending.delete(data);
+    if (callback) callback(++hostTurn);
+  };
+  // A Rust panic inside a pump microtask surfaces as an uncaught exception, not as a
+  // rejected start_probes() call; report it instead of letting the run look like a hang.
+  addEventListener('error', e => globalThis.f3dHost.finish(false, String(e.error?.stack || e.message || e)));
+  addEventListener('unhandledrejection', e => globalThis.f3dHost.finish(false, String(e.reason?.stack || e.reason)));
+  globalThis.f3dHost = {
+    attach(exports) {
+      wasm = exports;
+      // Host liveness diagnostic: if this never streams, the main thread is frozen
+      // (synchronous hang in the Wasm); if it streams with 0 polls, the task was never polled.
+      setTimeout(() => this.event('host-diag', 'main-thread-alive-3s', wasm.burst_polls()), 3000);
+      setTimeout(() => this.event('host-diag', 'reenter-probe-says-pump-running', wasm.reenter_probe() ? 1 : 0), 3500);
+    },
+    wait(source, callback) {
+      if (source === 0) {
+        setTimeout(() => callback(++hostTurn), 5);
+      } else if (source === 1) {
+        const id = ++nextCallback;
+        pending.set(id, callback);
+        channel.port2.postMessage(id);
+      } else if (source === 2) {
+        queueMicrotask(() => {
+          const before = wasm.burst_polls();
+          queueMicrotask(() => callback(wasm.burst_polls() - before));
+        });
+      } else {
+        throw new Error(`Unknown host callback source ${source}`);
+      }
+    },
+    reenter() { return wasm.reenter_probe(); },
+    event(probe, step, value) {
+      const event = { probe, step, value, ts_wall: Date.now(), host_time_ms: performance.now(), host_turn: hostTurn };
+      events.push(event);
+      // Stream each observation immediately so a hang still shows how far the Rust program got.
+      fetch('/event', { method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(event), keepalive: true }).catch(() => {});
+    },
+    finish(passed, detail) {
+      if (finished) return;
+      finished = true;
+      const result = {
+        passed, detail, events, owner: 'asupersync-rust-wasm',
+        browser: { userAgent: navigator.userAgent, platform: navigator.platform },
+      };
+      globalThis.__F3D_PROBE_RESULTS__ = result;
+      document.querySelector('#result').textContent = JSON.stringify(result, null, 2);
+      fetch('/result', { method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(result) }).catch(error => console.error('Result delivery failed', error));
+      channel.port1.close();
+      channel.port2.close();
+    },
+  };
+})();
