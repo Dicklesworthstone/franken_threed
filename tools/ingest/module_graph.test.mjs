@@ -268,3 +268,94 @@ export { textureUrl };
   assert.equal(mod.asset_references[0].specifier, './textures/wood.png');
   assert.equal(mod.asset_references[0].source_span.start.line, 2);
 });
+
+// ---------------------------------------------------------------------------
+// IMPORT MAP SCOPES & PACKAGE FALLBACK
+// ---------------------------------------------------------------------------
+
+test('Import map scopes: scoped import overrides top-level mapping for matching referrer', async () => {
+  const scratch = makeScratchDir('f3d_scopes');
+
+  const libGlobal = path.join(scratch, 'lib_global.js');
+  const libScoped = path.join(scratch, 'lib_scoped.js');
+  fs.writeFileSync(libGlobal, 'export const name = "global";', 'utf-8');
+  fs.writeFileSync(libScoped, 'export const name = "scoped";', 'utf-8');
+
+  const subDir = path.join(scratch, 'scoped_zone');
+  fs.mkdirSync(subDir, { recursive: true });
+  const scopedModule = path.join(subDir, 'consumer.js');
+  fs.writeFileSync(scopedModule, 'import { name } from "lib"; export { name };', 'utf-8');
+
+  const htmlFile = path.join(scratch, 'index.html');
+  fs.writeFileSync(htmlFile, `<!DOCTYPE html>
+<html>
+<head>
+<script type="importmap">
+{
+  "imports": {
+    "lib": "./lib_global.js"
+  },
+  "scopes": {
+    "./scoped_zone/": {
+      "lib": "./lib_scoped.js"
+    }
+  }
+}
+</script>
+<script type="module" src="./scoped_zone/consumer.js"></script>
+</head>
+<body></body>
+</html>
+`, 'utf-8');
+
+  const graph = await buildModuleGraph(htmlFile);
+  const scopedModNode = graph.modules[pathToFileURL(scopedModule).href];
+  assert.ok(scopedModNode, 'scopedModule must be in graph');
+
+  const libImp = scopedModNode.static_imports.find(i => i.specifier === 'lib');
+  assert.ok(libImp, 'Must have static import for "lib"');
+  assert.equal(libImp.resolved_id, pathToFileURL(libScoped).href, 'Scoped import must resolve to lib_scoped.js');
+});
+
+test('Package fallback: Resolves bare three imports in pure JS module without HTML import map', async () => {
+  const scratch = makeScratchDir('f3d_pkg_fallback');
+
+  const jsFile = path.join(scratch, 'pure_module.js');
+  fs.writeFileSync(jsFile, `
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+export { THREE, OrbitControls };
+`, 'utf-8');
+
+  const graph = await buildModuleGraph(jsFile);
+  const rootNode = graph.modules[pathToFileURL(jsFile).href];
+  assert.ok(rootNode, 'Root node must exist');
+
+  const threeImp = rootNode.static_imports.find(i => i.specifier === 'three');
+  assert.ok(threeImp && threeImp.resolved_id.endsWith('build/three.module.js'), 'three must resolve via package fallback');
+
+  const addonsImp = rootNode.static_imports.find(i => i.specifier.includes('OrbitControls'));
+  assert.ok(addonsImp && addonsImp.resolved_id.endsWith('examples/jsm/controls/OrbitControls.js'), 'three/addons/* must resolve via package fallback');
+});
+
+test('CLI: Execution produces valid JSON bundle file with identical graph structure', async () => {
+  const scratch = makeScratchDir('f3d_cli_test');
+  const outFile = path.join(scratch, 'h2_graph.json');
+  const h2Path = 'upstream/three.js/examples/webgl_marchingcubes.html';
+
+  const { execFile } = await import('node:child_process');
+  const { promisify } = await import('node:util');
+  const execFileAsync = promisify(execFile);
+
+  const { stdout, stderr } = await execFileAsync(process.execPath, [
+    'tools/ingest/cli.mjs',
+    '--entry', h2Path,
+    '--output', outFile
+  ]);
+
+  assert.ok(fs.existsSync(outFile), `Output file must exist: ${outFile}`);
+  const parsed = JSON.parse(fs.readFileSync(outFile, 'utf-8'));
+  assert.equal(parsed.schema_version, '1.0.0');
+  assert.equal(parsed.summary.total_modules, 8);
+  assert.equal(parsed.summary.total_static_imports, 10);
+});
