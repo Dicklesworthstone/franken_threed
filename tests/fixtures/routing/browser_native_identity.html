@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>FrankenThreeD - Browser Native Identity Routing Fixture (f3d-04.4)</title>
+  <style>
+    body { font-family: monospace; padding: 20px; background: #111; color: #eee; }
+    .pass { color: #4ade80; }
+    .fail { color: #f87171; }
+    canvas { border: 1px solid #444; margin: 4px; display: inline-block; width: 64px; height: 64px; }
+  </style>
+</head>
+<body>
+  <h1>FrankenThreeD - Renderer Construction Routing Fixture</h1>
+  <p>Verifies real native GL context identity, WebGPU canvas acquisition, and canvas irreversibility.</p>
+  <div id="output">Running verification...</div>
+
+  <script type="module">
+    import { runBrowserNativeIdentityVerification } from './browser_native_identity_fixture.mjs';
+
+    window.__f3d_results__ = null;
+
+    try {
+      const outcome = await runBrowserNativeIdentityVerification();
+      window.__f3d_results__ = outcome;
+      const outDiv = document.getElementById('output');
+      outDiv.innerHTML = `<h2 class="${outcome.passed ? 'pass' : 'fail'}">${outcome.passed ? 'ALL PASSED' : 'VERIFICATION FAILED'}</h2><pre>${JSON.stringify(outcome.results, null, 2)}</pre>`;
+    } catch (err) {
+      window.__f3d_results__ = { passed: false, error: err.message };
+      const outDiv = document.getElementById('output');
+      outDiv.innerHTML = `<h2 class="fail">ERROR</h2><pre>${err.stack || err.message}</pre>`;
+    }
+  </script>
+</body>
+</html>
