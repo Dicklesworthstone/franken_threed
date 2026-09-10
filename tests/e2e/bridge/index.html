@@ -77,6 +77,7 @@
       testNegativeBrokenMalformedPacket,
       testSynchronousErrorScopeDiscipline,
       testNegativeBrokenErrorScopeControl,
+      testStaleEpochReadbackPublicationGate,
       getPendingBridgeCapabilities,
     } from "./counterexample_suite.js";
 
@@ -149,10 +150,11 @@
           await wasm.default();
           const buildTriangleFn = wasm.f3d_build_first_frame_packet || wasm.gpu_bridge_build_triangle_packet;
           const buildRedBlueFn = wasm.f3d_build_red_a_blue_b_packet || wasm.gpu_bridge_build_red_blue_packet;
-          if (typeof buildTriangleFn !== "function" || typeof buildRedBlueFn !== "function") {
+          const tryPublishFn = wasm.f3d_try_publish_readback || wasm.gpu_bridge_try_publish_readback;
+          if (typeof buildTriangleFn !== "function" || typeof buildRedBlueFn !== "function" || typeof tryPublishFn !== "function") {
             throw new Error(
               `Compiled application Wasm at /pkg/f3d_runtime.js is missing required exports: ` +
-              `buildTriangleFn=${typeof buildTriangleFn}, buildRedBlueFn=${typeof buildRedBlueFn}`
+              `buildTriangleFn=${typeof buildTriangleFn}, buildRedBlueFn=${typeof buildRedBlueFn}, tryPublishFn=${typeof tryPublishFn}`
             );
           }
           wasmModule = wasm;
@@ -253,6 +255,15 @@
               return "Synchronous submit verified inside scopes; async yields and interleaving rejected.";
             },
           },
+          {
+            id: "stale_epoch_publication_gate",
+            title: "6. Stale-Epoch Readback Publication Gate",
+            ownership: "AUTHORITATIVE (05.7)",
+            desc: "Rust Wasm publication gate (58j.3): real bridge readback epoch verified against advancing region epoch",
+            run: async () => {
+              return await testStaleEpochReadbackPublicationGate(host, wasmModule);
+            },
+          },
         ];
 
         let allPassed = true;
@@ -280,7 +291,7 @@
         }
 
         report.partition = {
-          authoritativeSuites: ["pixel_equivalence", "queue_snapshot_red_a_blue_b", "missing_wasm_rejection"],
+          authoritativeSuites: ["pixel_equivalence", "queue_snapshot_red_a_blue_b", "missing_wasm_rejection", "stale_epoch_publication_gate"],
           smokeChecksOwnedBy05_6: ["malformed_packet_bounds", "error_scope_synchronous_submit"],
           pendingCapabilities: pendingCapabilities.map(p => p.capability),
         };
@@ -289,10 +300,10 @@
 
         if (allPassed) {
           statusBox.className = "status-box pass";
-          statusBox.innerHTML = `<strong>ALL 5 ACTIVE BRIDGE SUITES PASSED VERIFICATION</strong><br>` +
-            `<span style="color:#7ee787;">• <strong>3 Authoritative Suites (05.7):</strong> First-Frame Pixel Equivalence (dual control vs oracle + real GPU broken transform rejection), Red-A/Blue-B Queue Snapshot (PerUseByteBuffer vs real GPU hazard rejection), Missing-Wasm Rejection Control.</span><br>` +
+          statusBox.innerHTML = `<strong>ALL 6 ACTIVE BRIDGE SUITES PASSED VERIFICATION</strong><br>` +
+            `<span style="color:#7ee787;">• <strong>4 Authoritative Suites (05.7):</strong> First-Frame Pixel Equivalence (dual control vs oracle + real GPU broken transform rejection), Red-A/Blue-B Queue Snapshot (PerUseByteBuffer vs real GPU hazard rejection), Missing-Wasm Rejection Control, Stale-Epoch Readback Publication Gate (real Rust Wasm export).</span><br>` +
             `<span style="color:#8b949e;">• <strong>2 Duplicated Smoke Checks:</strong> Malformed Packet Bounds and Synchronous Error-Scope Discipline (retained locally; authoritatively owned by 05.6 gpu_bridge_test.html).</span><br>` +
-            `<span style="color:#d29922;">• <strong>5 Pending Kill-Gate Items:</strong> Bundle reset, generational handles, memory borrow guards, wire validator, stale-epoch publication gate (recorded pending, never faked).</span>`;
+            `<span style="color:#d29922;">• <strong>4 Pending Kill-Gate Items:</strong> Bundle reset, generational handles, memory borrow guards, wire validator (recorded pending, never faked).</span>`;
         } else {
           statusBox.className = "status-box fail";
           statusBox.innerHTML = `<strong>COUNTEREXAMPLE SUITE FAILED:</strong> ${report.errors.join("; ")}`;

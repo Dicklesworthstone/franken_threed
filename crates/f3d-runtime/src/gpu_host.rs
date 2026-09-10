@@ -20,11 +20,11 @@
 //!
 //! # Scope & Limitations (§5.1, NO-CLAIM)
 //! - **Readback Publication Gate**: The readback publication gate ([`ReadbackPublicationState`]
-//!   and [`try_publish_readback`]) is currently a Rust-side native primitive only. The browser bridge
-//!   (`bridge_runtime.js`) decodes and attaches `epochHi` and `epochLo` words onto readback
-//!   buffers, but no browser path feeds these buffers back through `try_publish_readback` in Wasm
-//!   today. Stale-readback rejection is verified exclusively via native Rust unit tests and must not
-//!   be credited as an end-to-end browser-verified rejection until a Wasm readback consumer is linked.
+//!   and [`try_publish_readback`]) is exposed to browser callers as [`gpu_bridge_try_publish_readback`].
+//!   The browser bridge (`bridge_runtime.js`) decodes and attaches `epochHi` and `epochLo` words onto readback
+//!   buffers. JavaScript callers supply the readback epoch words alongside the region's current epoch words to
+//!   `gpu_bridge_try_publish_readback`, which reconstructs both [`Epoch`] values using [`Epoch::from_words`]
+//!   and returns the product freshness gate decision without reimplementing the logic in JavaScript.
 #![forbid(unsafe_code)]
 
 extern crate alloc;
@@ -1151,6 +1151,61 @@ pub fn f3d_build_red_a_blue_b_packet(per_use_versioned: bool) -> Vec<u8> {
         .expect("static red-blue packet encoding must not fail")
 }
 
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen]
+/// Evaluates readback epoch freshness against a target region epoch in the browser (§5.8, 58j.3).
+///
+/// Reconstructs both [`Epoch`] values from their `(high, low)` 32-bit word pairs
+/// using [`Epoch::from_words`] and returns `true` if `readback_epoch == region_epoch`,
+/// or `false` to discard the stale readback.
+pub fn gpu_bridge_try_publish_readback(
+    readback_epoch_hi: u32,
+    readback_epoch_lo: u32,
+    region_epoch_hi: u32,
+    region_epoch_lo: u32,
+) -> bool {
+    try_publish_readback_words(
+        readback_epoch_hi,
+        readback_epoch_lo,
+        region_epoch_hi,
+        region_epoch_lo,
+    )
+}
+
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen]
+/// Evaluates readback epoch freshness against a target region epoch (canonical alias).
+pub fn f3d_try_publish_readback(
+    readback_epoch_hi: u32,
+    readback_epoch_lo: u32,
+    region_epoch_hi: u32,
+    region_epoch_lo: u32,
+) -> bool {
+    gpu_bridge_try_publish_readback(
+        readback_epoch_hi,
+        readback_epoch_lo,
+        region_epoch_hi,
+        region_epoch_lo,
+    )
+}
+
+#[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
+/// Native export for `gpu_bridge_try_publish_readback` for host verification and unit tests.
+#[must_use]
+pub fn gpu_bridge_try_publish_readback(
+    readback_epoch_hi: u32,
+    readback_epoch_lo: u32,
+    region_epoch_hi: u32,
+    region_epoch_lo: u32,
+) -> bool {
+    try_publish_readback_words(
+        readback_epoch_hi,
+        readback_epoch_lo,
+        region_epoch_hi,
+        region_epoch_lo,
+    )
+}
+
 // -----------------------------------------------------------------------------
 // Readback Publication Gate (§5.8, 58j.3)
 // -----------------------------------------------------------------------------
@@ -1161,9 +1216,8 @@ pub fn f3d_build_red_a_blue_b_packet(per_use_versioned: bool) -> Vec<u8> {
 /// is in flight, attempting to publish the readback will detect the stale epoch and
 /// discard the data without overwriting the region's newer state.
 ///
-/// **Limitation**: This is currently a Rust-side native primitive. The browser bridge
-/// attaches `epochHi` and `epochLo` words to readback buffers, but no browser path feeds
-/// them back through `try_publish_readback` in Wasm today.
+/// For browser callers, [`gpu_bridge_try_publish_readback`] provides the callable gate
+/// accepting `(high, low)` epoch words and evaluating freshness.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReadbackPublicationState {
     /// The epoch under which the current data was published.
@@ -1221,6 +1275,20 @@ pub fn try_publish_readback<D: f3d_core::handle::Domain>(
     readback_epoch: Epoch,
 ) -> bool {
     readback_epoch == target_region.current_epoch()
+}
+
+/// Reconstructs readback and region [`Epoch`]s from their `(high, low)` 32-bit word pairs
+/// and evaluates whether the readback's epoch matches the region's current epoch.
+#[must_use]
+pub fn try_publish_readback_words(
+    readback_epoch_hi: u32,
+    readback_epoch_lo: u32,
+    region_epoch_hi: u32,
+    region_epoch_lo: u32,
+) -> bool {
+    let readback_epoch = Epoch::from_words(readback_epoch_hi, readback_epoch_lo);
+    let region_epoch = Epoch::from_words(region_epoch_hi, region_epoch_lo);
+    readback_epoch == region_epoch
 }
 
 #[cfg(test)]
@@ -1759,5 +1827,57 @@ mod tests {
             );
             assert_eq!(*enc_usage, 17);
         }
+    }
+
+    #[test]
+    fn try_publish_readback_word_round_trip() {
+        use f3d_core::{
+            handle::{Handle, MaterialDomain},
+            ownership::Author,
+        };
+
+        // 1. Epoch::ZERO words (0, 0)
+        let (zero_hi, zero_lo) = Epoch::ZERO.to_words();
+        assert_eq!(zero_hi, 0);
+        assert_eq!(zero_lo, 0);
+        assert!(gpu_bridge_try_publish_readback(zero_hi, zero_lo, zero_hi, zero_lo));
+        assert!(try_publish_readback_words(0, 0, 0, 0));
+
+        // 2. Arbitrary multi-word epoch reconstruction and round-trip
+        let epoch_a = Epoch::new(0x1234_5678_9ABC_DEF0);
+        let (a_hi, a_lo) = epoch_a.to_words();
+        assert_eq!(a_hi, 0x1234_5678);
+        assert_eq!(a_lo, 0x9ABC_DEF0);
+        let reconstructed_a = Epoch::from_words(a_hi, a_lo);
+        assert_eq!(epoch_a, reconstructed_a);
+
+        // Matching words -> accepted
+        assert!(gpu_bridge_try_publish_readback(a_hi, a_lo, a_hi, a_lo));
+        assert!(try_publish_readback_words(a_hi, a_lo, a_hi, a_lo));
+
+        // High word mismatch -> rejected
+        assert!(!gpu_bridge_try_publish_readback(a_hi, a_lo, a_hi + 1, a_lo));
+        assert!(!gpu_bridge_try_publish_readback(a_hi + 1, a_lo, a_hi, a_lo));
+
+        // Low word mismatch -> rejected
+        assert!(!gpu_bridge_try_publish_readback(a_hi, a_lo, a_hi, a_lo + 1));
+        assert!(!gpu_bridge_try_publish_readback(a_hi, a_lo + 1, a_hi, a_lo));
+
+        // 3. Integration with RegionState publication progression
+        let handle = Handle::<MaterialDomain>::from_raw(1, 1).expect("valid handle");
+        let mut region = RegionState::new(handle);
+        let (reg_hi0, reg_lo0) = region.current_epoch().to_words();
+        assert!(gpu_bridge_try_publish_readback(reg_hi0, reg_lo0, reg_hi0, reg_lo0));
+
+        // Advance epoch via region.publish
+        let next_epoch = region.publish(Author::Js, Epoch::ZERO).expect("advance epoch");
+        let (reg_hi1, reg_lo1) = next_epoch.to_words();
+        assert_ne!((reg_hi0, reg_lo0), (reg_hi1, reg_lo1));
+
+        // Stale readback (reg_hi0, reg_lo0) against advanced region (reg_hi1, reg_lo1) -> rejected
+        assert!(!gpu_bridge_try_publish_readback(reg_hi0, reg_lo0, reg_hi1, reg_lo1));
+
+        // Fresh readback (reg_hi1, reg_lo1) against advanced region (reg_hi1, reg_lo1) -> accepted
+        assert!(gpu_bridge_try_publish_readback(reg_hi1, reg_lo1, reg_hi1, reg_lo1));
     }
 }

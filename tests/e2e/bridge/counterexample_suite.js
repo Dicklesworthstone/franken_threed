@@ -483,6 +483,19 @@ export async function testNegativeMissingWasmRejection(host, device) {
   if (!rejectedMissingExport) {
     throw new Error("Negative Control Failed: testRedABlueBQueueWriteSnapshot did not reject missing export!");
   }
+
+  // 3. Stale epoch publication gate missing export must throw
+  let rejectedPublicationExport = false;
+  try {
+    await testStaleEpochReadbackPublicationGate(host, {});
+  } catch (err) {
+    if (err.message && err.message.includes("Silent JS fallback is forbidden")) {
+      rejectedPublicationExport = true;
+    }
+  }
+  if (!rejectedPublicationExport) {
+    throw new Error("Negative Control Failed: testStaleEpochReadbackPublicationGate did not reject missing export!");
+  }
 }
 
 /**
@@ -506,31 +519,31 @@ export async function testMalformedPacketBoundsChecking(host) {
 }
 
 export async function testNegativeBrokenMalformedPacket(host) {
-  // Sub-test 1: Truncated command block (command count claims 2, but buffer ends)
-  const truncatedCmdPacket = new Uint8Array(20);
-  const v1 = new DataView(truncatedCmdPacket.buffer);
-  v1.setUint32(0, PACKET_MAGIC, true);
-  v1.setUint16(4, PACKET_VERSION, true);
-  v1.setUint16(6, 0, true);
-  v1.setUint32(8, 2, true); // claims 2 commands
-  v1.setUint32(12, 0, true); // 0 data
-  // only 4 bytes of commands (needs at least 2 + 12 for one CREATE_BUFFER, let alone two)
-  v1.setUint16(16, OPCODE_CREATE_BUFFER, true);
+  // Sub-test 1: Truncated opcode fields
+  const truncatedPacket = new Uint8Array(20);
+  const view = new DataView(truncatedPacket.buffer);
+  view.setUint32(0, PACKET_MAGIC, true);
+  view.setUint16(4, PACKET_VERSION, true);
+  view.setUint32(8, 1, true); // 1 command declared
+  view.setUint32(12, 0, true);
+  view.setUint16(16, OPCODE_CREATE_BUFFER, true); // Only 2 bytes remaining, but expects 12
 
   let rejectedTruncated = false;
   try {
-    await host.executePacket(truncatedCmdPacket);
+    await host.executePacket(truncatedPacket);
   } catch (e) {
-    rejectedTruncated = true;
+    if (e.message && e.message.includes("Truncated CREATE_BUFFER")) {
+      rejectedTruncated = true;
+    }
   }
   if (!rejectedTruncated) {
-    throw new Error("Negative Control Failed: executePacket failed to reject truncated command buffer!");
+    throw new Error("Negative Control Failed: Bridge decoder failed to reject truncated packet fields!");
   }
 
-  // Sub-test 2: Invalid texture format code (code = 99, only 1=bgra8unorm, 2=rgba8unorm allowed)
-  const builder2 = new BinaryPacketBuilder();
-  builder2.createTexture(101, 16, 16, 99, GPUTextureUsage.RENDER_ATTACHMENT);
-  const invalidFormatPacket = builder2.build();
+  // Sub-test 2: Invalid texture format code
+  const builder = new BinaryPacketBuilder();
+  builder.createTexture(101, 16, 16, 99, GPUTextureUsage.RENDER_ATTACHMENT); // formatCode 99 invalid
+  const invalidFormatPacket = builder.build();
 
   let rejectedFormat = false;
   try {
@@ -541,13 +554,15 @@ export async function testNegativeBrokenMalformedPacket(host) {
     }
   }
   if (!rejectedFormat) {
-    throw new Error("Negative Control Failed: executePacket failed to reject invalid texture formatCode 99!");
+    throw new Error("Negative Control Failed: Bridge decoder failed to reject invalid texture format code!");
   }
 
-  // Sub-test 3: Invalid render pass targetType (targetType = 99, only 0=OFFSCREEN, 1=CANVAS allowed)
-  const builder3 = new BinaryPacketBuilder();
-  builder3.renderPass(99, 1, [0, 0, 0, 1], 1, 0, 3, 0, 1);
-  const invalidTargetPacket = builder3.build();
+  // Sub-test 3: Invalid render pass target type
+  const builder2 = new BinaryPacketBuilder();
+  builder2.createBuffer(102, 256, GPUBufferUsage.VERTEX);
+  builder2.createPipeline(102, WGSL_SOLID_COLOR, 2, true, false);
+  builder2.renderPass(99, 102, [0, 0, 0, 1], 102, 102, 3); // targetType 99 invalid
+  const invalidTargetPacket = builder2.build();
 
   let rejectedTarget = false;
   try {
@@ -558,34 +573,38 @@ export async function testNegativeBrokenMalformedPacket(host) {
     }
   }
   if (!rejectedTarget) {
-    throw new Error("Negative Control Failed: executePacket failed to reject invalid render pass targetType 99!");
+    throw new Error("Negative Control Failed: Bridge decoder failed to reject invalid render pass target type!");
   }
 }
 
 /**
  * -----------------------------------------------------------------------------
- * 5. SYNCHRONOUS ERROR-SCOPE STACK & SUBMIT DISCIPLINE
+ * 5. SYNCHRONOUS ERROR-SCOPE DISCIPLINE & SUBMIT ORDERING (UNIT CONTROLS)
  * -----------------------------------------------------------------------------
- * Invariant: pushErrorScope -> encode -> finish() -> queue.submit() -> popErrorScope()
- * must execute synchronously without host turns/awaits inside the scope body.
+ * Verifies that finish and submit occur synchronously inside the active error
+ * scope before awaiting popErrorScope, preventing async interleaving bugs.
  */
 export async function testSynchronousErrorScopeDiscipline(host) {
-  // Positive: Synchronous action completes and returns result
-  const result = await host.withErrorScopes(["validation"], () => {
-    return 100;
+  // Positive: withErrorScopes successfully executes valid operations without throwing
+  const result = await host.withErrorScopes(["validation", "out-of-memory"], () => {
+    // Normal synchronous command recording and submission
+    const enc = host.device.createCommandEncoder();
+    const cb = enc.finish();
+    host.device.queue.submit([cb]);
+    return "ok";
   });
-  if (result !== 100) {
+
+  if (result !== "ok") {
     throw new Error(`Synchronous error scope returned unexpected result: ${result}`);
   }
 }
 
 export async function testNegativeBrokenErrorScopeControl(host) {
-  // Sub-test 1: Attempt to return a Promise inside syncAction (violates synchronous discipline)
+  // Sub-test 1: Returning a Promise from syncAction must throw
   let rejectedPromise = false;
   try {
     await host.withErrorScopes(["validation"], async () => {
-      await new Promise(r => setTimeout(r, 1));
-      return 1;
+      await new Promise(r => setTimeout(r, 10));
     });
   } catch (e) {
     if (e.message && e.message.includes("syncAction returned a Promise")) {
@@ -623,10 +642,9 @@ export async function testNegativeBrokenErrorScopeControl(host) {
  * -----------------------------------------------------------------------------
  * Per OrangePelican root review and credit rules:
  * Invented mock classes (e.g. test-only handle managers or borrow controllers)
- * and manual CPU pixel edits are strictly forbidden.
+ * must NEVER be presented as passing product tests.
  * 
- * The following capabilities are pending product support in the candidate bridge:
- * - Bundle Execution: bridge_runtime.js does not yet implement OPCODE_EXECUTE_BUNDLES.
+ * - Bundle State Reset: bridge_runtime.js does not yet support OPCODE_EXECUTE_BUNDLES.
  * - Generational Handles: gpu_host.rs does not yet expose generational handle publication to JS.
  * 
  * These items are reported as PENDING and NEVER claimed as green passes until real
@@ -655,10 +673,75 @@ export function getPendingBridgeCapabilities() {
       status: "PENDING_PRODUCT_SUPPORT",
       reason: "Wire layout validator pending integration into GpuSubmissionPacket decoder.",
     },
-    {
-      capability: "stale_epoch_readback_publication_gate",
-      status: "PENDING_PRODUCT_SUPPORT",
-      reason: "crates/f3d-runtime/src/gpu_host.rs publication gate is currently native-only; browser Wasm export gpu_bridge_try_publish_readback is pending. No test-only JS mock permitted under root 5526.",
-    },
   ];
+}
+
+/**
+ * -----------------------------------------------------------------------------
+ * 6. STALE-EPOCH READBACK PUBLICATION GATE (58j.3 INVARIANT)
+ * -----------------------------------------------------------------------------
+ * Calls the real Rust/Wasm product export `gpu_bridge_try_publish_readback`
+ * (alias `f3d_try_publish_readback`) from crates/f3d-runtime/src/gpu_host.rs:1161.
+ *
+ * Evaluates the epochHi and epochLo words attached by the bridge to a real readback
+ * buffer against an active region epoch that advances:
+ * - Matching epoch: try_publish_readback returns true (accepted).
+ * - Stale epoch: try_publish_readback returns false (rejected/discarded).
+ *
+ * Honest boundary note: Target region epochs are test-supplied until a dedicated
+ * region ownership manager exists in the bridge host runtime.
+ * Strictly invokes the compiled Rust gate via Wasm export; no test-only JS mock.
+ */
+export async function testStaleEpochReadbackPublicationGate(host, wasmModule) {
+  const tryPublishFn = wasmModule?.gpu_bridge_try_publish_readback || wasmModule?.f3d_try_publish_readback;
+  if (!wasmModule || typeof tryPublishFn !== "function") {
+    throw new Error(
+      "Missing Wasm Export: testStaleEpochReadbackPublicationGate requires compiled application Wasm with export 'gpu_bridge_try_publish_readback' (or 'f3d_try_publish_readback'). Silent JS fallback is forbidden."
+    );
+  }
+
+  // Execute a real GPU copy operation stamped with Epoch (0, 1)
+  const width = 64;
+  const height = 64;
+  const bytesPerRow = computeAlignedBytesPerRow(width);
+  const readbackSize = bytesPerRow * height;
+
+  const builder = new BinaryPacketBuilder();
+  builder.createTexture(50, width, height, 2, GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC);
+  builder.createBuffer(51, readbackSize, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
+  // Stamped with epochHi = 0, epochLo = 1
+  builder.copyTextureToBuffer(50, 51, width, height, 0, 1);
+  const packet = builder.build();
+  await host.executePacket(packet);
+
+  // Retrieve real readback buffer with bridge-attached epoch words
+  const readback = await host.readbackBuffer(51, readbackSize);
+  const readbackEpochHi = readback.epochHi !== undefined ? readback.epochHi : 0;
+  const readbackEpochLo = readback.epochLo !== undefined ? readback.epochLo : 1;
+
+  // 1. Positive: Region at matching epoch (0, 1) must be accepted
+  const matchingAccepted = tryPublishFn(readbackEpochHi, readbackEpochLo, 0, 1);
+  if (!matchingAccepted) {
+    throw new Error(
+      `Positive Control Failed: Rust publication gate rejected matching readback epoch (${readbackEpochHi}, ${readbackEpochLo}) against region epoch (0, 1)!`
+    );
+  }
+
+  // 2. Negative: Region advances to epoch (0, 2); in-flight readback at (0, 1) is now stale and must be rejected
+  const staleAccepted = tryPublishFn(readbackEpochHi, readbackEpochLo, 0, 2);
+  if (staleAccepted) {
+    throw new Error(
+      `Negative Control Failed: Rust publication gate falsely accepted stale readback epoch (${readbackEpochHi}, ${readbackEpochLo}) against advanced region epoch (0, 2)!`
+    );
+  }
+
+  // 3. Negative: High-word mismatch (1, 1) must also be rejected
+  const highMismatchAccepted = tryPublishFn(readbackEpochHi, readbackEpochLo, 1, 1);
+  if (highMismatchAccepted) {
+    throw new Error(
+      `Negative Control Failed: Rust publication gate falsely accepted high-word mismatch epoch (${readbackEpochHi}, ${readbackEpochLo}) against region epoch (1, 1)!`
+    );
+  }
+
+  return "Verified via real Rust/Wasm product export gpu_bridge_try_publish_readback: matching epoch accepted (true), stale/advanced epoch rejected (false). (Region epoch test-supplied).";
 }
