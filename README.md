@@ -26,18 +26,19 @@ Existing authoring knowledge stays useful. You keep writing Three.js.
 
 ## Honest status
 
-**Nothing is implemented.** This repository currently contains one document:
-[`COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENTHREED.md`](COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENTHREED.md)
-(v2.0), plus this README, `AGENTS.md`, and repository hygiene files.
+**Phase 0 foundation work has begun; core specializer/renderer functionality is not yet implemented.**
 
 | Question | Answer |
 |---|---|
-| Is there a Cargo workspace? | No |
-| Is there a compiler, renderer, or CLI? | No |
-| Has any speedup been measured? | **No.** Zero benchmarks have been run |
-| Has the Three.js suite been executed against a candidate? | No |
-| Has the exhaustive symbol/behavior census been executed? | No — the plan defines it, it has not been run |
-| What has been done? | A source-informed architecture and implementation plan, with the pinned upstream source inspected |
+| Is there a Cargo workspace? | **Yes** — workspace with `f3d-core` and `f3d-runtime` crates (`b43f846`, `4ab9611`, `8910299`) |
+| Is the upstream oracle pinned? | **Yes** — Three.js r186 pinned at commit `148ef33ecb6d2502ff796d4554abd1549c95d519` with package reconciliation evidence (`5c2776d`, `7a0ad38`) |
+| Are test evidence conventions in place? | **Yes** — structured event schema and test evidence helper (`3772bbc`) |
+| Does Rust code execute in real browsers? | **Yes** — a real Rust program executes through the Asupersync browser host in HeadlessChrome 152 and Safari 26.5 with eight probes passing (timer wakeups, oneshot join, 1000 host turns, reentry rejection, 10k self-wakes, cooperative cancellation, region drain before close, fetch abort with server-observed disconnect) as of commits `8910299`, `7cd379e`, `8f1ca58` |
+| Is browser execution reproducible from git? | **No** — depends on an **uncommitted upstream asupersync working tree** (development linkage, not reproducible from commits yet) |
+| Is the WebGPU bridge implemented? | **No** — WebGPU bridge, device loss handling, and all-turn burst measurement are not done |
+| Is there a compiler, renderer, or CLI? | **No** — compiler, WebGPU renderer, and CLI orchestration do not exist yet |
+| Has the symbol/export census been run? | **No** — the plan defines the census; it has not been executed |
+| Have benchmarks or hardware targets run? | **No** — physical M5 and iPhone runs are not done; **zero speedup has been measured** |
 
 The plan is deliberately written to be falsifiable. It specifies kill gates that
 can stop this project early, and it says so explicitly. Treat every number below
