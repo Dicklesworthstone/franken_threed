@@ -36,6 +36,8 @@
           const before = wasm.burst_polls();
           queueMicrotask(() => callback(wasm.burst_polls() - before));
         });
+      } else if (source === 3) {
+        setTimeout(() => callback(++hostTurn), 5);
       } else {
         throw new Error(`Unknown host callback source ${source}`);
       }

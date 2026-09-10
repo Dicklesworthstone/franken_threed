@@ -1,15 +1,18 @@
 //! Real Rust futures driven by Asupersync in one browser Wasm instance.
 use crate::{BrowserHostServices, RuntimeBuilder};
 use asupersync::{
+    cx::ChildRegionSpec,
     runtime::{PumpDrainOutcome, Runtime, RuntimeHandle},
-    types::Budget,
+    types::{Budget, CancelKind, CancelReason},
 };
 use std::{
     cell::{Cell, RefCell},
     future::Future,
     pin::Pin,
-    rc::Rc,
-    sync::Arc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU32, Ordering},
+    },
     task::{Context, Poll, Waker},
 };
 use wasm_bindgen::{JsCast, prelude::*};
@@ -41,34 +44,41 @@ struct WaitState {
 struct HostWait {
     source: u32,
     started: bool,
-    state: Rc<RefCell<WaitState>>,
+    state: Arc<Mutex<WaitState>>,
 }
 impl HostWait {
     fn new(source: u32) -> Self {
         Self {
             source,
             started: false,
-            state: Rc::default(),
+            state: Arc::default(),
         }
     }
 }
 impl Future for HostWait {
     type Output = Result<u32, JsValue>;
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if let Some(value) = self.state.borrow_mut().value.take() {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(value) = state.value.take() {
             return Poll::Ready(Ok(value));
         }
-        self.state.borrow_mut().waker = Some(cx.waker().clone());
+        state.waker = Some(cx.waker().clone());
+        drop(state);
         if !self.started {
             self.started = true;
-            let state = Rc::clone(&self.state);
+            let state = Arc::clone(&self.state);
             let callback = Closure::once_into_js(move |value: u32| {
                 let waker = {
-                    let mut state = state.borrow_mut();
+                    let mut state = state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     state.value = Some(value);
                     state.waker.take()
                 };
-                // Release the RefCell borrow before waking the actual runtime.
+                // Release the lock before waking the actual runtime.
                 if let Some(waker) = waker {
                     waker.wake();
                 }
@@ -171,6 +181,89 @@ async fn run(handle: RuntimeHandle) -> Result<(), JsValue> {
     let total = burst.await.map_err(join_error)?;
     require(total == 10_001, "self-waking future lost a wake or poll")?;
     event("burst-first-turn-and-completion", "complete", total);
+
+    // 6. Cooperative cancellation probe
+    let cancel_cx = handle.request_cx_with_budget(Budget::new());
+    let task_cx = cancel_cx.clone();
+    let cleanup_runs = Arc::new(AtomicU32::new(0));
+    let cleanup = Arc::clone(&cleanup_runs);
+    let observed_chunk = Arc::new(AtomicU32::new(0));
+    let obs = Arc::clone(&observed_chunk);
+
+    event("cancellation", "spawn", 0);
+    let cancel_task = handle.spawn_local(async move {
+        let mut chunk = 0;
+        loop {
+            if task_cx.is_cancelled() {
+                obs.store(chunk, Ordering::SeqCst);
+                event("cancellation", "observed", chunk);
+                cleanup.fetch_add(1, Ordering::SeqCst);
+                break;
+            }
+            chunk += 1;
+            asupersync::runtime::yield_now().await;
+        }
+    });
+
+    let _ = HostWait::new(3).await?;
+    cancel_cx.cancel_fast(CancelKind::User);
+    cancel_task.await.map_err(join_error)?;
+
+    require(
+        cleanup_runs.load(Ordering::SeqCst) == 1,
+        "cancellation cleanup did not run exactly once",
+    )?;
+    event("cancellation", "complete", 1);
+
+    // 7. Drain before teardown probe
+    event("drain", "spawn", 8);
+    let drain_cx = handle.request_cx_with_budget(Budget::new());
+    let child_region = drain_cx
+        .open_child_region(ChildRegionSpec::inherit())
+        .await
+        .map_err(join_error)?;
+    event("drain", "region-open", 0);
+
+    let counter = Arc::new(AtomicU32::new(0));
+    for i in 0..8u32 {
+        let counter = Arc::clone(&counter);
+        child_region
+            .cx()
+            .spawn(move |_child_cx| async move {
+                event("drain", "child-started", i);
+                let _ = HostWait::new(1).await;
+                counter.fetch_add(1, Ordering::SeqCst);
+                event("drain", "child-done", i);
+            })
+            .map_err(join_error)?;
+        event("drain", "spawned", i);
+    }
+
+    child_region
+        .cancel(CancelReason::user("probe region teardown"))
+        .map_err(join_error)?;
+    event("drain", "cancel-requested", 0);
+    child_region.close().await.map_err(join_error)?;
+
+    let at_close = counter.load(Ordering::SeqCst);
+    event("drain", "closed", at_close);
+    require(
+        at_close == 8,
+        "region close returned before all children drained",
+    )?;
+
+    // Two more host turns to verify no late publication occurs after region close
+    let _ = HostWait::new(1).await?;
+    let _ = HostWait::new(1).await?;
+    let after = counter.load(Ordering::SeqCst);
+    require(
+        after == at_close,
+        "late publication after region close",
+    )?;
+
+    event("drain", "settled", after);
+    event("drain", "complete", at_close);
+
     Ok(())
 }
 

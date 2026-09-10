@@ -20,7 +20,15 @@ const archive = resolve(process.env.F3D_EVIDENCE_DIR || 'evidence');
 const runDir = join(archive, '02.2', runId);
 mkdirSync(runDir, { recursive: true });
 const evidence = openEvidence('02.2', runId, { baseDir: archive });
-const expected = ['timer', 'channel-join', 'host-turn', 'reentrancy', 'burst-first-turn-and-completion'];
+const expected = [
+  'timer',
+  'channel-join',
+  'host-turn',
+  'reentrancy',
+  'burst-first-turn-and-completion',
+  'cancellation',
+  'drain',
+];
 let browserProcess;
 const streamed = [];
 let settled = false;

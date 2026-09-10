@@ -11,14 +11,16 @@ runtime entry points and provide one real-future regression. The Rust code uses
 Host callback state releases its RefCell borrow before invoking a waker.
 
 The probe exercises three actual timers, a real Asupersync oneshot and local joins,
-1,000 MessageChannel callbacks, synchronous host-to-pump reentry, and a future
-that wakes itself 10,000 times. The burst observation checks for additional polls
+1,000 MessageChannel callbacks, synchronous host-to-pump reentry, a future
+that wakes itself 10,000 times, cooperative cancellation within one chunk, and
+region drain before teardown. The burst observation checks for additional polls
 between two microtasks in the initial turn, followed by completion. It does not
-measure the maximum over every browser turn. Events use actual performance.now()
-values and callback turn identifiers. Error or timeout is failure.
+measure the maximum over every browser turn. Cooperative cancellation and region
+drain before teardown are verified when observed by their respective probe completions.
+Events use actual performance.now() values and callback turn identifiers. Error or timeout is failure.
 
-Cancellation, fetch abort, drain during teardown, device loss, all-turn burst
-measurement, and physical M5/iPhone runs remain separate unmet foundation criteria.
+Fetch abort, device loss, all-turn burst measurement, and physical M5/iPhone runs
+remain separate unmet foundation criteria.
 Runtime ownership is retained for the test page lifetime. This is development
 linkage to an upstream checkout, not an immutable release dependency pin; the Cargo path is
 the absolute, nonportable /Users/jemanuel/dp/asupersync so remote builds compile the synced
