@@ -3,6 +3,13 @@ import path from 'node:path';
 import { execSync } from 'node:child_process';
 
 const UPSTREAM_COMMIT = '148ef33ecb6d2502ff796d4554abd1549c95d519';
+const REQ_FIELDS = ['owner', 'lane', 'bead', 'test', 'level', 'msg'];
+
+export function validateEvent(ev) {
+  for (const f of REQ_FIELDS) {
+    if (!ev || ev[f] == null) throw new Error(`Missing required field: ${f}`);
+  }
+}
 
 export function openEvidence(beadKey, runId, { baseDir = 'evidence' } = {}) {
   const dir = path.join(baseDir, beadKey, runId);
@@ -17,6 +24,7 @@ export function openEvidence(beadKey, runId, { baseDir = 'evidence' } = {}) {
         level: ev.level ?? 'info', owner: ev.owner, route: ev.route ?? null,
         browser: ev.browser ?? null, msg: ev.msg ?? '', data: ev.data ?? {},
       };
+      validateEvent(entry);
       if (entry.level === 'error' || ev.status === 'fail') { fail++; if (!firstFailure) firstFailure = entry; }
       else if (ev.status === 'pass') pass++;
       fs.appendFileSync(eventsPath, JSON.stringify(entry) + '\n');

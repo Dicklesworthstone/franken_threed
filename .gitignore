@@ -82,6 +82,11 @@ node_modules/
 /test-results/
 /puppeteer-cache/
 
+# Test evidence archives (ignored by default; KEEP/ directories are retained)
+evidence/**
+!evidence/**/
+!evidence/**/KEEP/**
+
 # Local device/capability probe dumps
 /capability-records/
 *.capability.json
