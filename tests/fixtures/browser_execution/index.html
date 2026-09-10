@@ -4,8 +4,45 @@
 <h1>Asupersync browser execution</h1>
 <p>This page loads one Rust/Wasm instance. Missing Wasm, errors, and timeouts fail.</p>
 <pre id="result">Waiting for the Wasm program…</pre>
+<script>
+(() => {
+  const omit = new URLSearchParams(location.search).get('omit');
+  if (omit) {
+    if (omit.includes('.')) {
+      const [obj, prop] = omit.split('.');
+      let val;
+      Object.defineProperty(globalThis, obj, {
+        configurable: true,
+        enumerable: true,
+        get: () => val,
+        set: v => {
+          val = v;
+          if (val && typeof val === 'object') {
+            try { delete val[prop]; } catch (_) {}
+          }
+        },
+      });
+    } else {
+      const saved = globalThis[omit];
+      try {
+        delete globalThis[omit];
+      } catch (_) {}
+      window.__f3dOmitted = { name: omit, value: saved };
+    }
+    document.title += ` (omit=${omit})`;
+  }
+})();
+</script>
 <script src="./shim.js"></script>
 <script type="module">
+if (window.__f3dOmitted && window.__f3dOmitted.value) {
+  const { name, value } = window.__f3dOmitted;
+  const origFinish = f3dHost.finish;
+  f3dHost.finish = (passed, detail) => {
+    globalThis[name] = value;
+    origFinish(passed, detail);
+  };
+}
 try {
   const wasm = await import('/pkg/f3d_runtime.js');
   await wasm.default();

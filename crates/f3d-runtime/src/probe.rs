@@ -366,6 +366,46 @@ async fn run(handle: RuntimeHandle) -> Result<(), JsValue> {
     Ok(())
 }
 
+const HOST_CAPABILITIES: &[&str] = &[
+    "f3dHost.wait",
+    "f3dHost.event",
+    "f3dHost.finish",
+    "f3dHost.reenter",
+    "f3dHost.turns",
+    "AbortController",
+    "fetch",
+    "MessageChannel",
+    "queueMicrotask",
+    "setTimeout",
+];
+
+fn check_host_capabilities() -> Result<(), JsValue> {
+    let global = js_sys::global();
+    for &name in HOST_CAPABILITIES {
+        let is_fn = if let Some(sub) = name.strip_prefix("f3dHost.") {
+            let host = js_sys::Reflect::get(&global, &JsValue::from_str("f3dHost"))
+                .unwrap_or_else(|_| JsValue::undefined());
+            if host.is_undefined() || host.is_null() {
+                false
+            } else {
+                let member = js_sys::Reflect::get(&host, &JsValue::from_str(sub))
+                    .unwrap_or_else(|_| JsValue::undefined());
+                member.is_function()
+            }
+        } else {
+            let val = js_sys::Reflect::get(&global, &JsValue::from_str(name))
+                .unwrap_or_else(|_| JsValue::undefined());
+            val.is_function()
+        };
+        if !is_fn {
+            return Err(JsValue::from_str(&format!(
+                "unsupported-host: missing capability {name}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Starts the actual Asupersync task. The page observes completion via the host
 /// callback; no second Rust executor is used to drive an exported async function.
 #[wasm_bindgen]
@@ -374,6 +414,23 @@ pub fn start_probes() -> Result<(), JsValue> {
         !RUNTIME.with(|runtime| runtime.borrow().is_some()),
         "probe already started",
     )?;
+    if let Err(error) = check_host_capabilities() {
+        let message = error
+            .as_string()
+            .unwrap_or_else(|| "unsupported-host: missing capability unknown".to_string());
+        let failed_name = message
+            .strip_prefix("unsupported-host: missing capability ")
+            .unwrap_or("");
+        let index = HOST_CAPABILITIES
+            .iter()
+            .position(|&name| name == failed_name)
+            .map_or(0, |idx| idx as u32);
+        event("unsupported-host", "missing", index);
+        finish(false, &message);
+        return Err(error);
+    }
+    event("unsupported-host", "complete", HOST_CAPABILITIES.len() as u32);
+
     let runtime = RuntimeBuilder::new()
         .worker_threads(1)
         .browser_host_services(Arc::new(BrowserHostServices::with_burst_limit(4)))

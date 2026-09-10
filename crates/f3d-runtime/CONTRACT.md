@@ -19,8 +19,14 @@ that no pump turn executes more than 4 polls via the Rust per-turn counter keyed
 by upstream `pump_turns`. The JavaScript `ceil-avg-per-pump-turn` value is a ceiling-average
 diagnostic across observer intervals, and archived runs before this change over-claimed
 the maximum polls per pump turn by relying on that average. Cooperative cancellation, region
-drain before teardown, fetch abort, and all-turn burst measurement are verified when
-observed by their respective probe completions.
+drain before teardown, fetch abort, all-turn burst measurement, and unsupported-host detection
+are verified when observed by their respective probe completions and test gates.
+Unsupported-host detection verifies that removed or missing required host functions
+and globals (`f3dHost.wait`, `f3dHost.event`, `f3dHost.finish`, `f3dHost.reenter`, `f3dHost.turns`,
+`AbortController`, `fetch`, `MessageChannel`, `queueMicrotask`, `setTimeout`) terminate
+immediately before building an Asupersync runtime with a defined error within one host turn
+and no hang. This covers missing or deleted globals and host functions, not a hook that
+is present but fails to invoke its callback.
 Events use actual performance.now() values and callback turn identifiers. Error or timeout is failure.
 
 Device loss and physical M5/iPhone runs
