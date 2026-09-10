@@ -74,7 +74,7 @@ async function finish(result) {
     msg: detail,
     data: { server_saw_disconnect: serverSawDisconnect, bytes_before_abort: bytesBeforeAbort } });
   const summary = evidence.finish();
-  console.log(JSON.stringify({ passed, browser, runDir, summary }));
+  console.log(JSON.stringify({ passed, browser, runDir, streamed_events: streamed.length, summary }));
   settle(passed);
 }
 const server = createServer((req, res) => {
@@ -117,9 +117,13 @@ const server = createServer((req, res) => {
   }
   if (req.method === 'POST' && req.url === '/event') {
     let body = '';
-    req.on('data', chunk => { body += chunk; if (body.length > 65_536) req.destroy(); });
+    req.on('data', chunk => { body += chunk; if (body.length > 1_048_576) req.destroy(); });
     req.on('end', () => {
-      try { streamed.push(JSON.parse(body)); res.end('streamed'); }
+      try {
+        const parsed = JSON.parse(body);
+        for (const event of Array.isArray(parsed) ? parsed : [parsed]) streamed.push(event);
+        res.end('streamed');
+      }
       catch (error) { res.writeHead(400); res.end(String(error)); }
     });
     return;

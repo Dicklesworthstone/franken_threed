@@ -4,6 +4,15 @@
   let hostTurn = 0;
   let finished = false;
   const events = [];
+  const pendingStream = [];
+  let streamTimer = null;
+  function flushStream() {
+    if (streamTimer !== null) { clearTimeout(streamTimer); streamTimer = null; }
+    if (pendingStream.length === 0) return;
+    const batch = pendingStream.splice(0, pendingStream.length);
+    fetch('/event', { method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(batch) }).catch(() => {});
+  }
   const channel = new MessageChannel();
   const pending = new Map();
   let nextCallback = 0;
@@ -176,12 +185,16 @@
       const event = { probe, step, value, ts_wall: Date.now(), host_time_ms: performance.now(), host_turn: hostTurn };
       events.push(event);
       // Stream each observation immediately so a hang still shows how far the Rust program got.
-      fetch('/event', { method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(event), keepalive: true }).catch(() => {});
+      // Batched streaming: the browser keepalive budget (~64 KB in flight) dropped
+      // ~40% of single-event posts during a 90 s hang, so buffer and flush in chunks.
+      pendingStream.push(event);
+      if (pendingStream.length >= 25) flushStream();
+      else if (streamTimer === null) streamTimer = setTimeout(flushStream, 100);
     },
     finish(passed, detail) {
       if (finished) return;
       finished = true;
+      flushStream();
       const result = {
         passed, detail, events, owner: 'asupersync-rust-wasm',
         browser: { userAgent: navigator.userAgent, platform: navigator.platform },
