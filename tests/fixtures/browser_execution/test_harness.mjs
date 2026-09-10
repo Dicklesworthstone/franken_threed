@@ -28,19 +28,39 @@ const expected = [
   'burst-first-turn-and-completion',
   'cancellation',
   'drain',
+  'fetch-abort',
 ];
 let browserProcess;
 const streamed = [];
 let settled = false;
 let settle;
+let serverSawDisconnect = false;
+let bytesBeforeAbort = 0;
 const completed = new Promise(resolve => { settle = resolve; });
-function finish(result) {
+async function finish(result) {
   if (settled) return;
   settled = true;
   // A timeout carries no events of its own; fall back to the ones streamed before the hang.
   const events = Array.isArray(result.events) && result.events.length > 0 ? result.events : streamed;
+  const hasFetchAbort = events.some(e => e.probe === 'fetch-abort' && e.step === 'complete');
+  if (hasFetchAbort && (!serverSawDisconnect || bytesBeforeAbort <= 0)) {
+    const deadline = Date.now() + 2000;
+    while ((!serverSawDisconnect || bytesBeforeAbort <= 0) && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+  }
   const complete = new Set(events.filter(e => e.step === 'complete').map(e => e.probe));
-  const passed = result.passed === true && expected.every(name => complete.has(name));
+  if (!serverSawDisconnect || bytesBeforeAbort <= 0) {
+    complete.delete('fetch-abort');
+  }
+  let detail = result.detail;
+  let passed = result.passed === true && expected.every(name => complete.has(name));
+  if (hasFetchAbort && (!serverSawDisconnect || bytesBeforeAbort <= 0)) {
+    passed = false;
+    detail = `fetch-abort complete event arrived but server never observed a disconnect on /slow-resource within 2 seconds (server_saw_disconnect=${serverSawDisconnect}, bytes_before_abort=${bytesBeforeAbort})`;
+  } else if (!passed && !detail) {
+    detail = 'Missing required Rust completion observations';
+  }
   for (const event of events) evidence.log({
     lane: 'integration', bead: 'f3d-02-asupersync-browser-execution-58j.2',
     owner: 'asupersync-rust-wasm', route: null, browser: result.browser,
@@ -50,12 +70,50 @@ function finish(result) {
   evidence.log({ lane: 'integration', bead: 'f3d-02-asupersync-browser-execution-58j.2',
     owner: 'asupersync-rust-wasm', test: 'browser-execution', browser: result.browser,
     level: passed ? 'info' : 'error', status: passed ? 'pass' : 'fail',
-    msg: result.detail || 'Missing required Rust completion observations' });
+    msg: detail,
+    data: { server_saw_disconnect: serverSawDisconnect, bytes_before_abort: bytesBeforeAbort } });
   const summary = evidence.finish();
   console.log(JSON.stringify({ passed, browser, runDir, summary }));
   settle(passed);
 }
 const server = createServer((req, res) => {
+  if (req.method === 'GET' && req.url === '/slow-resource') {
+    const totalBytes = 4 * 1024 * 1024;
+    const chunkSize = 16 * 1024;
+    const chunk = Buffer.alloc(chunkSize, 0x42);
+    let bytesSent = 0;
+    res.writeHead(200, {
+      'content-type': 'application/octet-stream',
+      'content-length': String(totalBytes),
+      'cache-control': 'no-store',
+    });
+    const interval = setInterval(() => {
+      if (bytesSent >= totalBytes || res.writableEnded || res.destroyed) {
+        clearInterval(interval);
+        if (!res.writableEnded && !res.destroyed) res.end();
+        return;
+      }
+      res.write(chunk);
+      bytesSent += chunkSize;
+    }, 20);
+    const onDisconnect = () => {
+      clearInterval(interval);
+      if (!serverSawDisconnect && bytesSent < totalBytes) {
+        serverSawDisconnect = true;
+        bytesBeforeAbort = bytesSent;
+      }
+    };
+    req.on('close', onDisconnect);
+    res.on('close', onDisconnect);
+    req.on('error', onDisconnect);
+    res.on('error', onDisconnect);
+    return;
+  }
+  if (req.url === '/server-observed') {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ server_saw_disconnect: serverSawDisconnect, bytes_before_abort: bytesBeforeAbort }));
+    return;
+  }
   if (req.method === 'POST' && req.url === '/event') {
     let body = '';
     req.on('data', chunk => { body += chunk; if (body.length > 65_536) req.destroy(); });
@@ -68,8 +126,14 @@ const server = createServer((req, res) => {
   if (req.method === 'POST' && req.url === '/result') {
     let body = '';
     req.on('data', chunk => { body += chunk; if (body.length > 4_000_000) req.destroy(); });
-    req.on('end', () => {
-      try { finish(JSON.parse(body)); res.end('recorded'); }
+    req.on('end', async () => {
+      try {
+        const data = JSON.parse(body);
+        data.server_saw_disconnect = serverSawDisconnect;
+        data.bytes_before_abort = bytesBeforeAbort;
+        await finish(data);
+        res.end('recorded');
+      }
       catch (error) { res.writeHead(400); res.end(String(error)); finish({ passed: false, detail: String(error) }); }
     });
     return;

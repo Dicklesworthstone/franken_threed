@@ -2,7 +2,7 @@
 use crate::{BrowserHostServices, RuntimeBuilder};
 use asupersync::{
     cx::ChildRegionSpec,
-    runtime::{PumpDrainOutcome, Runtime, RuntimeHandle},
+    runtime::{LocalJoinHandle, PumpDrainOutcome, Runtime, RuntimeHandle},
     types::{Budget, CancelKind, CancelReason},
 };
 use std::{
@@ -263,6 +263,91 @@ async fn run(handle: RuntimeHandle) -> Result<(), JsValue> {
 
     event("drain", "settled", after);
     event("drain", "complete", at_close);
+
+    // 8. Fetch abort probe
+    event("fetch-abort", "spawn", 0);
+    let fetch_cancel_cx = handle.request_cx_with_budget(Budget::new());
+    let task_cx = fetch_cancel_cx.clone();
+
+    let fetch_task: LocalJoinHandle<Result<u32, JsValue>> = handle.spawn_local(async move {
+        let window = web_sys::window().ok_or_else(|| JsValue::from_str("missing window"))?;
+        let controller = web_sys::AbortController::new()?;
+        let signal = controller.signal();
+
+        let init = web_sys::RequestInit::new();
+        init.set_method("GET");
+        init.set_signal(Some(&signal));
+
+        let fetch_promise = window.fetch_with_str_and_init("/slow-resource", &init);
+        let response_val = wasm_bindgen_futures::JsFuture::from(fetch_promise).await?;
+        let response: web_sys::Response = response_val.dyn_into()?;
+        let body = response
+            .body()
+            .ok_or_else(|| JsValue::from_str("missing response body"))?;
+        let reader: web_sys::ReadableStreamDefaultReader = body.get_reader().dyn_into()?;
+
+        let mut bytes_received = 0u32;
+        let mut saw_abort = false;
+
+        let is_abort = |val: &JsValue| {
+            js_sys::Reflect::get(val, &JsValue::from_str("name"))
+                .ok()
+                .and_then(|name| name.as_string())
+                .as_deref()
+                == Some("AbortError")
+                || format!("{val:?}").contains("AbortError")
+        };
+
+        loop {
+            if task_cx.is_cancelled() {
+                controller.abort();
+                let stream_err = wasm_bindgen_futures::JsFuture::from(reader.read()).await.err();
+                if let Some(ref err) = stream_err {
+                    if is_abort(err) {
+                        saw_abort = true;
+                    }
+                }
+                break;
+            }
+
+            match wasm_bindgen_futures::JsFuture::from(reader.read()).await {
+                Ok(chunk_val) => {
+                    let done = js_sys::Reflect::get(&chunk_val, &JsValue::from_str("done"))
+                        .ok()
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if done {
+                        break;
+                    }
+                    let val = js_sys::Reflect::get(&chunk_val, &JsValue::from_str("value"))?;
+                    let chunk_arr = js_sys::Uint8Array::new(&val);
+                    bytes_received += chunk_arr.length();
+                }
+                Err(err) => {
+                    if is_abort(&err) {
+                        saw_abort = true;
+                    }
+                    break;
+                }
+            }
+        }
+
+        require(saw_abort, "fetch stream read did not reject with AbortError")?;
+        Ok::<u32, JsValue>(bytes_received)
+    });
+
+    for _ in 0..20 {
+        let _ = HostWait::new(0).await?;
+    }
+    fetch_cancel_cx.cancel_fast(CancelKind::User);
+    let joined = fetch_task.await.map_err(join_error)?;
+    let bytes_received: u32 = joined?;
+    require(
+        bytes_received > 0,
+        "fetch abort completed without reading any bytes",
+    )?;
+    event("fetch-abort", "aborted", bytes_received);
+    event("fetch-abort", "complete", 1);
 
     Ok(())
 }

@@ -15,11 +15,11 @@ The probe exercises three actual timers, a real Asupersync oneshot and local joi
 that wakes itself 10,000 times, cooperative cancellation within one chunk, and
 region drain before teardown. The burst observation checks for additional polls
 between two microtasks in the initial turn, followed by completion. It does not
-measure the maximum over every browser turn. Cooperative cancellation and region
-drain before teardown are verified when observed by their respective probe completions.
+measure the maximum over every browser turn. Cooperative cancellation, region
+drain before teardown, and fetch abort are verified when observed by their respective probe completions.
 Events use actual performance.now() values and callback turn identifiers. Error or timeout is failure.
 
-Fetch abort, device loss, all-turn burst measurement, and physical M5/iPhone runs
+Device loss, all-turn burst measurement, and physical M5/iPhone runs
 remain separate unmet foundation criteria.
 Runtime ownership is retained for the test page lifetime. This is development
 linkage to an upstream checkout, not an immutable release dependency pin; the Cargo path is
