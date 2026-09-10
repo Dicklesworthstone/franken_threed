@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/f3d-core",
+    "crates/f3d-runtime",
 ]
 
 # Planned 11 workspace crates (Plan §17.1 / AGENTS.md "Planned Workspace Crates"):

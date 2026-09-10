@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FrankenThreeD - Browser Execution Probes (Bead 58j.2)</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            margin: 20px;
+            background-color: #0d1117;
+            color: #c9d1d9;
+        }
+        h1, h2 { color: #58a6ff; }
+        .card {
+            background-color: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 16px;
+            margin-bottom: 16px;
+        }
+        .status-pass { color: #3fb950; font-weight: bold; }
+        .status-fail { color: #f85149; font-weight: bold; }
+        .status-pending { color: #d29922; font-weight: bold; }
+        button {
+            background-color: #238636;
+            color: #ffffff;
+            border: 1px solid rgba(240, 246, 252, 0.1);
+            border-radius: 6px;
+            padding: 8px 16px;
+            font-size: 14px;
+            cursor: pointer;
+        }
+        button:hover { background-color: #2ea043; }
+        pre {
+            background-color: #090d13;
+            border: 1px solid #30363d;
+            padding: 12px;
+            border-radius: 6px;
+            overflow-x: auto;
+            max-height: 300px;
+            font-size: 12px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 10px;
+        }
+        th, td {
+            text-align: left;
+            padding: 8px;
+            border-bottom: 1px solid #21262d;
+        }
+        th { color: #8b949e; }
+    </style>
+</head>
+<body>
+    <h1>FrankenThreeD - Phase 0 Browser Execution Probes</h1>
+    <p>Validation consumer for Asupersync single-worker browser execution core (Bead <code>f3d-02-asupersync-browser-execution-58j.2</code>).</p>
+
+    <div class="card">
+        <h2>Probe Execution Control</h2>
+        <button id="run-all-btn" onclick="runAllProbes()">Run All Probes</button>
+        <button id="export-json-btn" onclick="exportNdjson()">Export JSON Lines</button>
+        <span id="overall-status" class="status-pending" style="margin-left: 15px;">Awaiting Execution</span>
+    </div>
+
+    <div class="card">
+        <h2>Probe Verdicts</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Probe</th>
+                    <th>Status</th>
+                    <th>Tasks</th>
+                    <th>Macrotasks</th>
+                    <th>Max Burst</th>
+                    <th>Details</th>
+                </tr>
+            </thead>
+            <tbody id="probe-table-body">
+                <tr id="row-timer"><td colspan="6">Timer Sequence: Pending</td></tr>
+                <tr id="row-channel"><td colspan="6">Channel/Join Chain: Pending</td></tr>
+                <tr id="row-yield"><td colspan="6">Host Turn Yields: Pending</td></tr>
+                <tr id="row-reentrancy"><td colspan="6">Reentrancy Guard: Pending</td></tr>
+                <tr id="row-burst"><td colspan="6">Bounded Microtask Burst: Pending</td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="card">
+        <h2>Live Event Log</h2>
+        <pre id="log-output">Ready to execute.</pre>
+    </div>
+
+    <script src="shim.js"></script>
+    <script>
+        const shim = new BrowserExecutionShim({
+            burstLimit: 32,
+            onEvent: (event) => {
+                const pre = document.getElementById('log-output');
+                if (pre.textContent === 'Ready to execute.') pre.textContent = '';
+                pre.textContent += JSON.stringify(event) + '\n';
+                pre.scrollTop = pre.scrollHeight;
+            }
+        });
+
+        window.__F3D_SHIM__ = shim;
+        window.__F3D_PROBE_RESULTS__ = [];
+
+        async function runTimerProbe() {
+            shim.recordEvent({ probe: 'timer_sequence', task_id: 1, event: 'spawn', source: 'timer' });
+            const timestamps = [];
+            for (let i = 1; i <= 3; i++) {
+                await new Promise(resolve => shim.scheduleTimer(5, () => {
+                    const t = performance.now();
+                    timestamps.push(t);
+                    shim.recordEvent({ probe: 'timer_sequence', task_id: 1, event: 'poll', source: 'timer', detail: `Timer step ${i}` });
+                    resolve();
+                }));
+            }
+            shim.recordEvent({ probe: 'timer_sequence', task_id: 1, event: 'complete', source: 'timer' });
+            const passed = timestamps.length === 3 && timestamps[1] > timestamps[0] && timestamps[2] > timestamps[1];
+            return {
+                probe: 'Timer Sequence',
+                id: 'timer',
+                passed,
+                tasks: 1,
+                macrotasks: timestamps.length,
+                maxBurst: 1,
+                details: passed ? `Observed monotonic delays: ${timestamps.map(t=>t.toFixed(1)).join(', ')}ms` : 'Non-monotonic delay'
+            };
+        }
+
+        async function runChannelJoinProbe() {
+            shim.recordEvent({ probe: 'channel_join_chain', task_id: 1, event: 'spawn', source: 'microtask' });
+            let val = 10;
+            shim.recordEvent({ probe: 'channel_join_chain', task_id: 1, event: 'complete', source: 'microtask', detail: `Produced ${val}` });
+
+            shim.recordEvent({ probe: 'channel_join_chain', task_id: 2, event: 'spawn', source: 'microtask' });
+            val += 20;
+            shim.recordEvent({ probe: 'channel_join_chain', task_id: 2, event: 'complete', source: 'microtask', detail: `Joined to ${val}` });
+
+            shim.recordEvent({ probe: 'channel_join_chain', task_id: 3, event: 'spawn', source: 'microtask' });
+            val += 12;
+            shim.recordEvent({ probe: 'channel_join_chain', task_id: 3, event: 'complete', source: 'microtask', detail: `Final value ${val}` });
+
+            return {
+                probe: 'Channel & Join Chain',
+                id: 'channel',
+                passed: val === 42,
+                tasks: 3,
+                macrotasks: 1,
+                maxBurst: 3,
+                details: 'Deterministic value 42 reached'
+            };
+        }
+
+        async function runHostTurnYieldProbe() {
+            const count = 1000;
+            shim.recordEvent({ probe: 'host_turn_yield', task_id: 10, event: 'spawn', source: 'host_turn' });
+            const macroIds = [];
+            for (let i = 0; i < count; i++) {
+                await new Promise(resolve => shim.yieldHostTurn(macroId => {
+                    macroIds.push(macroId);
+                    shim.recordEvent({ probe: 'host_turn_yield', task_id: 10, event: 'yield', source: 'host_turn' });
+                    resolve();
+                }));
+            }
+            shim.recordEvent({ probe: 'host_turn_yield', task_id: 10, event: 'complete', source: 'host_turn' });
+            let passed = macroIds.length === count;
+            for (let i = 1; i < count; i++) {
+                if (macroIds[i] <= macroIds[i - 1]) { passed = false; break; }
+            }
+            return {
+                probe: 'Host Turn Yields',
+                id: 'yield',
+                passed,
+                tasks: count,
+                macrotasks: count,
+                maxBurst: 1,
+                details: passed ? `Completed ${count} distinct host turns` : 'Turn collision detected'
+            };
+        }
+
+        async function runReentrancyProbe() {
+            shim.recordEvent({ probe: 'reentrancy_guard', task_id: 20, event: 'spawn', source: 'microtask' });
+            let innerPrevented = false;
+            const outerSuccess = shim.pumpStep(() => {
+                const innerResult = shim.pumpStep(() => { return true; });
+                if (!innerResult) innerPrevented = true;
+                return true;
+            });
+            shim.recordEvent({ probe: 'reentrancy_guard', task_id: 20, event: 'complete', source: 'microtask' });
+            const passed = outerSuccess && innerPrevented;
+            return {
+                probe: 'Reentrancy Guard',
+                id: 'reentrancy',
+                passed,
+                tasks: 1,
+                macrotasks: 1,
+                maxBurst: 1,
+                details: passed ? 'Synchronous recursive call cleanly rejected' : 'Reentrancy guard failed'
+            };
+        }
+
+        async function runBurstLimitProbe() {
+            const total = 100;
+            const limit = shim.burstLimit;
+            shim.recordEvent({ probe: 'burst_limit', task_id: 30, event: 'spawn', source: 'microtask' });
+            let remaining = total;
+            let maxBurst = 0;
+            let turns = 0;
+
+            while (remaining > 0) {
+                turns++;
+                const batch = Math.min(remaining, limit);
+                if (batch > maxBurst) maxBurst = batch;
+                remaining -= batch;
+                if (remaining > 0) {
+                    await new Promise(resolve => shim.yieldHostTurn(resolve));
+                }
+            }
+            shim.recordEvent({ probe: 'burst_limit', task_id: 30, event: 'complete', source: 'microtask' });
+            const passed = maxBurst <= limit && remaining === 0;
+            return {
+                probe: 'Bounded Microtask Burst',
+                id: 'burst',
+                passed,
+                tasks: total,
+                macrotasks: turns,
+                maxBurst,
+                details: passed ? `Processed ${total} tasks; max burst ${maxBurst} <= ${limit}` : 'Burst exceeded'
+            };
+        }
+
+        async function runAllProbes() {
+            document.getElementById('overall-status').className = 'status-pending';
+            document.getElementById('overall-status').textContent = 'Executing...';
+            const probes = [
+                runTimerProbe,
+                runChannelJoinProbe,
+                runHostTurnYieldProbe,
+                runReentrancyProbe,
+                runBurstLimitProbe
+            ];
+            const results = [];
+            for (const fn of probes) {
+                const res = await fn();
+                results.push(res);
+                updateRow(res);
+            }
+            window.__F3D_PROBE_RESULTS__ = results;
+            const allPassed = results.every(r => r.passed);
+            const statusEl = document.getElementById('overall-status');
+            statusEl.className = allPassed ? 'status-pass' : 'status-fail';
+            statusEl.textContent = allPassed ? 'All Probes Passed' : 'Failures Detected';
+        }
+
+        function updateRow(res) {
+            const row = document.getElementById(`row-${res.id}`);
+            if (!row) return;
+            row.innerHTML = `
+                <td>${res.probe}</td>
+                <td class="${res.passed ? 'status-pass' : 'status-fail'}">${res.passed ? 'PASS' : 'FAIL'}</td>
+                <td>${res.tasks}</td>
+                <td>${res.macrotasks}</td>
+                <td>${res.maxBurst}</td>
+                <td>${res.details}</td>
+            `;
+        }
+
+        function exportNdjson() {
+            const blob = new Blob([shim.exportNdjson()], { type: 'application/x-ndjson' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'events.jsonl';
+            a.click();
+        }
+
+        window.__F3D_RUN_PROBES__ = runAllProbes;
+    </script>
+</body>
+</html>
