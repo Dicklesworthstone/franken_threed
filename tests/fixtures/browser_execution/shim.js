@@ -27,7 +27,7 @@
   let burstStartPumpTurns = 0;
   let maxPollsPerTurn = 0;
   let turnsObserved = 0;
-  let maxPollsPerPumpTurn = 0;
+  let ceilAvgPerPumpTurn = 0;
   let maxPumpTurnsPerObservation = 0;
   let observationIndex = 0;
   const anomalies = [];
@@ -53,10 +53,12 @@
       if (pollsDelta > maxPollsPerTurn) maxPollsPerTurn = pollsDelta;
       turnsObserved++;
     }
+    // Average-based granularity diagnostic only (coarse observation interval).
     const perPumpTurn = Math.ceil(pollsDelta / Math.max(1, turnsDelta));
     if (turnsDelta >= 1) {
-      if (perPumpTurn > maxPollsPerPumpTurn) maxPollsPerPumpTurn = perPumpTurn;
+      if (perPumpTurn > ceilAvgPerPumpTurn) ceilAvgPerPumpTurn = perPumpTurn;
     }
+    // Anomaly sampler: average-based granularity diagnostic only.
     if (perPumpTurn > 4) {
       totalAnomalies++;
       if (anomalies.length < 5) {
@@ -80,7 +82,7 @@
     burstResultsEmitted = true;
     const totalPumpTurns = wasm && wasm.pump_turns ? wasm.pump_turns() - burstStartPumpTurns : 0;
     globalThis.f3dHost.event('burst-all-turns', 'pump-turns', totalPumpTurns);
-    globalThis.f3dHost.event('burst-all-turns', 'max-per-pump-turn', maxPollsPerPumpTurn);
+    globalThis.f3dHost.event('burst-all-turns', 'ceil-avg-per-pump-turn', ceilAvgPerPumpTurn);
     globalThis.f3dHost.event('burst-all-turns', 'max-pump-turns-per-observation', maxPumpTurnsPerObservation);
     globalThis.f3dHost.event('burst-all-turns', 'max', maxPollsPerTurn);
     globalThis.f3dHost.event('burst-all-turns', 'turns', turnsObserved);
@@ -101,7 +103,7 @@
       const cb = burstCallback;
       burstCallback = null;
       emitBurstResults();
-      cb(maxPollsPerPumpTurn);
+      cb(ceilAvgPerPumpTurn);
     }
   };
 
@@ -146,7 +148,7 @@
       } else if (source === 4) {
         if (burstDone) {
           emitBurstResults();
-          queueMicrotask(() => callback(maxPollsPerPumpTurn));
+          queueMicrotask(() => callback(ceilAvgPerPumpTurn));
         } else {
           burstCallback = callback;
         }
@@ -164,7 +166,7 @@
         baselinePending = true;
         maxPollsPerTurn = 0;
         turnsObserved = 0;
-        maxPollsPerPumpTurn = 0;
+        ceilAvgPerPumpTurn = 0;
         maxPumpTurnsPerObservation = 0;
         observationIndex = 0;
         anomalies.length = 0;
@@ -179,7 +181,7 @@
           const cb = burstCallback;
           burstCallback = null;
           emitBurstResults();
-          cb(maxPollsPerPumpTurn);
+          cb(ceilAvgPerPumpTurn);
         }
       }
       const event = { probe, step, value, ts_wall: Date.now(), host_time_ms: performance.now(), host_turn: hostTurn };

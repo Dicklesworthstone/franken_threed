@@ -1,12 +1,12 @@
 //! Real Rust futures driven by Asupersync in one browser Wasm instance.
-use crate::{BrowserHostServices, RuntimeBuilder};
+use crate::{BrowserHostServices, RuntimeBuilder, burst::BurstCounter};
 use asupersync::{
     cx::ChildRegionSpec,
     runtime::{LocalJoinHandle, PumpDrainOutcome, Runtime, RuntimeHandle},
     types::{Budget, CancelKind, CancelReason},
 };
 use std::{
-    cell::{Cell, RefCell},
+    cell::RefCell,
     future::Future,
     pin::Pin,
     sync::{
@@ -19,7 +19,7 @@ use wasm_bindgen::{JsCast, prelude::*};
 
 thread_local! {
     static RUNTIME: RefCell<Option<Runtime>> = const { RefCell::new(None) };
-    static BURST_POLLS: Cell<u32> = const { Cell::new(0) };
+    static BURST: RefCell<BurstCounter> = const { RefCell::new(BurstCounter::new()) };
 }
 
 // Named browser binding boundary. The static shim supplies host callbacks only;
@@ -110,13 +110,14 @@ struct SelfWaking {
 impl Future for SelfWaking {
     type Output = u32;
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<u32> {
-        let count = BURST_POLLS.with(|counter| {
-            let count = counter.get() + 1;
-            counter.set(count);
-            count
+        let turn = pump_turns();
+        let total = BURST.with(|counter| {
+            let mut counter = counter.borrow_mut();
+            counter.record(turn);
+            counter.total_polls()
         });
         if self.remaining == 0 {
-            return Poll::Ready(count);
+            return Poll::Ready(total);
         }
         self.remaining -= 1;
         cx.waker().wake_by_ref();
@@ -186,10 +187,12 @@ async fn run(handle: RuntimeHandle) -> Result<(), JsValue> {
     event("burst-first-turn-and-completion", "complete", total);
 
     event("burst-all-turns", "spawn", 0);
-    let max_polls_per_pump_turn = HostWait::new(4).await?;
+    let _js_ceil_avg = HostWait::new(4).await?;
+    let rust_max = burst_max_polls_per_turn();
+    event("burst-all-turns", "rust-max-per-pump-turn", rust_max);
     require(
-        max_polls_per_pump_turn <= 4,
-        "burst all turns exceeded configured burst limit 4",
+        rust_max <= 4,
+        "burst all turns exceeded configured burst limit 4 by Rust per-turn count",
     )?;
     event("burst-all-turns", "complete", 1);
 
@@ -402,7 +405,13 @@ pub fn reenter_probe() -> bool {
 /// Actual number of calls to the self-waking Rust future's `poll` method.
 #[wasm_bindgen]
 pub fn burst_polls() -> u32 {
-    BURST_POLLS.with(Cell::get)
+    BURST.with(|b| b.borrow().total_polls())
+}
+
+/// Maximum number of calls to `SelfWaking::poll` in any single pump turn.
+#[wasm_bindgen]
+pub fn burst_max_polls_per_turn() -> u32 {
+    BURST.with(|b| b.borrow().max_polls_in_a_turn())
 }
 
 /// Actual number of pump turns executed by the Asupersync single-worker pump.

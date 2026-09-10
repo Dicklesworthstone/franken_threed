@@ -6,7 +6,11 @@
 
 pub use asupersync::runtime::{BrowserHostServices, RuntimeBuilder};
 
+pub mod burst;
+
 #[cfg(all(feature = "browser", target_arch = "wasm32"))]
 mod probe;
 #[cfg(all(feature = "browser", target_arch = "wasm32"))]
-pub use probe::{burst_polls, pump_turns, reenter_probe, start_probes};
+pub use probe::{
+    burst_max_polls_per_turn, burst_polls, pump_turns, reenter_probe, start_probes,
+};

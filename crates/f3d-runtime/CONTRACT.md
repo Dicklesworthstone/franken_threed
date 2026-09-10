@@ -14,8 +14,11 @@ The probe exercises three actual timers, a real Asupersync oneshot and local joi
 1,000 MessageChannel callbacks, synchronous host-to-pump reentry, a future
 that wakes itself 10,000 times, cooperative cancellation within one chunk, and
 region drain before teardown. The burst observation checks for additional polls
-between two microtasks in the initial turn, followed by completion, and measures
-the maximum number of pump polls per pump turn (with observer-granularity turns also reported). Cooperative cancellation, region
+between two microtasks in the initial turn, followed by completion, and verifies
+that no pump turn executes more than 4 polls via the Rust per-turn counter keyed
+by upstream `pump_turns`. The JavaScript `ceil-avg-per-pump-turn` value is a ceiling-average
+diagnostic across observer intervals, and archived runs before this change over-claimed
+the maximum polls per pump turn by relying on that average. Cooperative cancellation, region
 drain before teardown, fetch abort, and all-turn burst measurement are verified when
 observed by their respective probe completions.
 Events use actual performance.now() values and callback turn identifiers. Error or timeout is failure.
