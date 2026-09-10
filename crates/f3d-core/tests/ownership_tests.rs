@@ -6,7 +6,7 @@ use core::num::NonZeroU32;
 use f3d_core::handle::{Handle, MaterialDomain, RegionDomain};
 use f3d_core::ownership::{
     Author, DataVersion, Epoch, OwnerMode, OwnershipError, PerUseByteBuffer, PerUseSnapshotStore,
-    RegionState,
+    RegionState, UseRecord,
 };
 
 #[test]
@@ -61,17 +61,18 @@ fn legal_js_to_wasm_publish_and_transfer() {
     assert_eq!(v2.get(), 2);
     assert_eq!(state.unpublished_writes(), 1);
 
-    // JS publishes uncommitted writes at current epoch (0)
+    // JS publishes uncommitted writes at current epoch (0) -> advances epoch to 1
     let ep1 = state
         .publish(Author::Js, Epoch::ZERO)
         .expect("JS publish succeeds");
     assert_eq!(ep1.get(), 1);
     assert_eq!(state.unpublished_writes(), 0);
 
-    // Legal transfer from JS to Wasm at epoch 1
-    state
+    // Legal transfer from JS to Wasm at epoch 1 -> advances epoch to 2
+    let ep2 = state
         .transfer_authority(Author::Js, Author::Wasm, Epoch::new(1))
         .expect("transfer to Wasm succeeds");
+    assert_eq!(ep2.get(), 2);
     assert_eq!(state.author(), Author::Wasm);
     assert_eq!(state.mode(), OwnerMode::Wasm);
 
@@ -80,11 +81,11 @@ fn legal_js_to_wasm_publish_and_transfer() {
     assert_eq!(v3.get(), 3);
     assert_eq!(state.unpublished_writes(), 1);
 
-    // Wasm publishes at epoch 1
-    let ep2 = state
-        .publish(Author::Wasm, Epoch::new(1))
+    // Wasm publishes at epoch 2 -> advances epoch to 3
+    let ep3 = state
+        .publish(Author::Wasm, Epoch::new(2))
         .expect("Wasm publish succeeds");
-    assert_eq!(ep2.get(), 2);
+    assert_eq!(ep3.get(), 3);
     assert_eq!(state.unpublished_writes(), 0);
 }
 
@@ -101,16 +102,17 @@ fn legal_mirrored_mode_transitions() {
     assert!(state.mode().is_mirrored());
     assert_eq!(state.author(), Author::Js);
 
-    // JS writes and publishes
+    // JS writes and publishes (epoch 0 -> 1)
     state.record_write(Author::Js).expect("JS write ok");
     state
         .publish(Author::Js, Epoch::ZERO)
         .expect("JS publish ok");
 
-    // Transfer in mirrored mode changes author to Wasm
-    state
+    // Transfer in mirrored mode changes author to Wasm (epoch 1 -> 2)
+    let ep2 = state
         .transfer_authority(Author::Js, Author::Wasm, Epoch::new(1))
         .expect("transfer in mirrored mode ok");
+    assert_eq!(ep2.get(), 2);
     assert_eq!(
         state.mode(),
         OwnerMode::Mirrored {
@@ -162,8 +164,8 @@ fn red_v1_and_blue_v2_survive_same_submission() {
     assert_eq!(use_b.version(), v2);
 
     // Assert that both slices coexist in the same submission schedule
-    let slice_a = store.get_slice(use_a.slice_id()).expect("lookup slice A");
-    let slice_b = store.get_slice(use_b.slice_id()).expect("lookup slice B");
+    let slice_a = store.get_use(&use_a).expect("lookup slice A via use record");
+    let slice_b = store.get_use(&use_b).expect("lookup slice B via use record");
 
     // Slice A is STILL Red, slice B is Blue - no overwrite occurred
     assert_eq!(*slice_a.data(), red_color);
@@ -204,6 +206,248 @@ fn per_use_byte_buffer_slices_immutable_and_aligned() {
     let raw = byte_buf.as_bytes();
     assert_eq!(&raw[0..4], &red_bytes);
     assert_eq!(&raw[256..260], &blue_bytes);
+}
+
+#[test]
+fn stale_after_reset_reads_fail_not_aba_blue() {
+    // Defect regression: PerUseByteBuffer::get_slice must not trust public UseRecord offsets
+    // after reset. After reset + append blue, an old red record MUST NOT read blue (ABA).
+    let mat_handle = Handle::<MaterialDomain>::new(21, NonZeroU32::new(1).unwrap());
+    let mut byte_buf = PerUseByteBuffer::<MaterialDomain>::new(256).expect("buf new ok");
+
+    let red_bytes = [255u8, 0, 0, 255];
+    let blue_bytes = [0u8, 0, 255, 255];
+
+    let red_record = byte_buf
+        .append_slice(mat_handle, DataVersion::new(1), Epoch::ZERO, &red_bytes)
+        .expect("append red");
+    assert_eq!(byte_buf.get_slice(&red_record).unwrap(), &red_bytes);
+
+    // Frame/submission cycle resets the buffer, advancing the allocation generation
+    let new_gen = byte_buf.reset().expect("reset ok");
+    assert_eq!(new_gen, 2);
+
+    // Pass B appends blue at byte_offset 0
+    let blue_record = byte_buf
+        .append_slice(mat_handle, DataVersion::new(2), Epoch::ZERO, &blue_bytes)
+        .expect("append blue");
+    assert_eq!(blue_record.byte_offset(), 0);
+    assert_eq!(byte_buf.get_slice(&blue_record).unwrap(), &blue_bytes);
+
+    // Invariant: The old red record has generation 1; buffer is at generation 2.
+    // Querying with old red record must strictly FAIL and NEVER return blue!
+    let err = byte_buf
+        .get_slice(&red_record)
+        .expect_err("stale red record must fail after reset");
+    assert_eq!(
+        err,
+        OwnershipError::StaleSliceRecord {
+            expected_generation: 2,
+            actual_generation: 1,
+            slice_id: red_record.slice_id(),
+        }
+    );
+}
+
+#[test]
+fn foreign_store_record_rejected() {
+    let mat_handle = Handle::<MaterialDomain>::new(22, NonZeroU32::new(1).unwrap());
+    let mut store_a = PerUseByteBuffer::<MaterialDomain>::new(256).expect("store a");
+    let store_b = PerUseByteBuffer::<MaterialDomain>::new(256).expect("store b");
+
+    assert_ne!(store_a.store_id(), store_b.store_id());
+
+    let rec_a = store_a
+        .append_slice(mat_handle, DataVersion::new(1), Epoch::ZERO, &[1, 2, 3, 4])
+        .expect("append a");
+
+    // Passing record from store_a into store_b must be rejected
+    let err = store_b
+        .get_slice(&rec_a)
+        .expect_err("foreign record must be rejected");
+    assert_eq!(
+        err,
+        OwnershipError::ForeignSliceRecord {
+            expected_store: store_b.store_id(),
+            actual_store: store_a.store_id(),
+        }
+    );
+}
+
+#[test]
+fn record_offset_tampering_rejected() {
+    let mat_handle = Handle::<MaterialDomain>::new(23, NonZeroU32::new(1).unwrap());
+    let mut byte_buf = PerUseByteBuffer::<MaterialDomain>::new(256).expect("buf ok");
+
+    let rec = byte_buf
+        .append_slice(mat_handle, DataVersion::new(1), Epoch::ZERO, &[10, 20, 30, 40])
+        .expect("append ok");
+
+    // Tamper with byte_offset
+    let tampered = UseRecord::new(
+        rec.resource(),
+        rec.version(),
+        rec.epoch(),
+        rec.store_id(),
+        rec.generation(),
+        rec.slice_id(),
+        rec.byte_offset() + 100, // Tampered offset!
+        rec.byte_length(),
+    );
+
+    let err = byte_buf
+        .get_slice(&tampered)
+        .expect_err("tampered record must fail");
+    assert_eq!(
+        err,
+        OwnershipError::SliceIdentityMismatch {
+            slice_id: rec.slice_id(),
+        }
+    );
+}
+
+#[test]
+fn align_up_overflow_does_not_panic() {
+    let mat_handle = Handle::<MaterialDomain>::new(24, NonZeroU32::new(1).unwrap());
+    let mut store = PerUseSnapshotStore::<MaterialDomain, u32>::new(256).expect("store ok");
+
+    // Extreme byte length triggers overflow check cleanly without panic
+    let err = store
+        .record_use(mat_handle, DataVersion::new(1), Epoch::ZERO, 42, u64::MAX)
+        .expect_err("u64::MAX byte length must overflow next offset");
+    assert_eq!(
+        err,
+        OwnershipError::VersionOverflow { current: 0 }
+    );
+}
+
+#[test]
+fn aba_transfer_replay_prevented() {
+    // Defect regression: transfer_authority must advance publication epoch.
+    // Otherwise JS -> Wasm -> JS allows replaying the stale JS -> Wasm transfer command.
+    let handle = Handle::<RegionDomain>::new(25, NonZeroU32::new(1).unwrap());
+    let mut state = RegionState::new(handle);
+
+    // Initial state: author = JS, epoch = 0
+    assert_eq!(state.author(), Author::Js);
+    assert_eq!(state.current_epoch(), Epoch::ZERO);
+
+    // 1. JS transfers to Wasm at Epoch(0) -> advances epoch to 1
+    let ep1 = state
+        .transfer_authority(Author::Js, Author::Wasm, Epoch::ZERO)
+        .expect("transfer to Wasm ok");
+    assert_eq!(ep1, Epoch::new(1));
+    assert_eq!(state.author(), Author::Wasm);
+
+    // 2. Wasm transfers back to JS at Epoch(1) -> advances epoch to 2
+    let ep2 = state
+        .transfer_authority(Author::Wasm, Author::Js, Epoch::new(1))
+        .expect("transfer back to JS ok");
+    assert_eq!(ep2, Epoch::new(2));
+    assert_eq!(state.author(), Author::Js);
+
+    // 3. Stale transfer replay attempt: re-issuing the original transfer_authority(JS, Wasm, Epoch(0))
+    // Because author is JS again, without epoch advance this would have succeeded (ABA).
+    // With monotonic epoch advance, it is strictly REJECTED with StaleEpoch!
+    let err_stale = state
+        .transfer_authority(Author::Js, Author::Wasm, Epoch::ZERO)
+        .expect_err("stale transfer replay must fail");
+    assert_eq!(
+        err_stale,
+        OwnershipError::StaleEpoch {
+            expected: Epoch::new(2),
+            actual: Epoch::ZERO,
+        }
+    );
+}
+
+#[test]
+fn transition_mode_author_guarded_and_advances_epoch() {
+    let handle = Handle::<RegionDomain>::new(26, NonZeroU32::new(1).unwrap());
+    let mut state = RegionState::new(handle);
+
+    // Unauthorized caller cannot transition mode
+    let err_unauth = state
+        .transition_mode(Author::Wasm, OwnerMode::Wasm, Epoch::ZERO)
+        .expect_err("unauthorized author cannot transition mode");
+    assert_eq!(
+        err_unauth,
+        OwnershipError::UnauthorizedWriter {
+            expected: Author::Js,
+            actual: Author::Wasm,
+        }
+    );
+
+    // Authorized transition advances epoch (0 -> 1)
+    let ep1 = state
+        .transition_mode(Author::Js, OwnerMode::Wasm, Epoch::ZERO)
+        .expect("authorized transition ok");
+    assert_eq!(ep1, Epoch::new(1));
+    assert_eq!(state.author(), Author::Wasm);
+
+    // Stale epoch transition rejected
+    let err_stale = state
+        .transition_mode(Author::Wasm, OwnerMode::Js, Epoch::ZERO)
+        .expect_err("stale transition rejected");
+    assert_eq!(
+        err_stale,
+        OwnershipError::StaleEpoch {
+            expected: Epoch::new(1),
+            actual: Epoch::ZERO,
+        }
+    );
+}
+
+#[test]
+fn dedup_rejects_inconsistent_snapshot_metadata() {
+    let mat_handle = Handle::<MaterialDomain>::new(27, NonZeroU32::new(1).unwrap());
+    let mut byte_buf = PerUseByteBuffer::<MaterialDomain>::new(256).expect("buf ok");
+
+    let rec1 = byte_buf
+        .append_slice(mat_handle, DataVersion::new(1), Epoch::ZERO, &[1, 2, 3, 4])
+        .expect("first record ok");
+
+    // Exact match deduplicates idempotently
+    let rec1_dup = byte_buf
+        .append_slice(mat_handle, DataVersion::new(1), Epoch::ZERO, &[1, 2, 3, 4])
+        .expect("exact match ok");
+    assert_eq!(rec1, rec1_dup);
+
+    // Inconsistent epoch rejected
+    let err_epoch = byte_buf
+        .append_slice(mat_handle, DataVersion::new(1), Epoch::new(1), &[1, 2, 3, 4])
+        .expect_err("inconsistent epoch rejected");
+    assert_eq!(
+        err_epoch,
+        OwnershipError::ImmutableSnapshotViolation {
+            version: DataVersion::new(1),
+            detail: "conflicting metadata or byte content provided for existing immutable version",
+        }
+    );
+
+    // Inconsistent byte length rejected
+    let err_len = byte_buf
+        .append_slice(mat_handle, DataVersion::new(1), Epoch::ZERO, &[1, 2, 3, 4, 5])
+        .expect_err("inconsistent length rejected");
+    assert_eq!(
+        err_len,
+        OwnershipError::ImmutableSnapshotViolation {
+            version: DataVersion::new(1),
+            detail: "conflicting metadata or byte content provided for existing immutable version",
+        }
+    );
+
+    // Inconsistent byte content rejected
+    let err_data = byte_buf
+        .append_slice(mat_handle, DataVersion::new(1), Epoch::ZERO, &[9, 9, 9, 9])
+        .expect_err("inconsistent content rejected");
+    assert_eq!(
+        err_data,
+        OwnershipError::ImmutableSnapshotViolation {
+            version: DataVersion::new(1),
+            detail: "conflicting metadata or byte content provided for existing immutable version",
+        }
+    );
 }
 
 #[test]
@@ -261,13 +505,14 @@ fn transfer_with_unpublished_writes_rejected() {
         }
     );
 
-    // Once published, transfer succeeds
+    // Once published, transfer succeeds (epoch 0 -> 1 on publish, 1 -> 2 on transfer)
     state
         .publish(Author::Js, Epoch::ZERO)
         .expect("publish pending writes");
-    state
+    let ep2 = state
         .transfer_authority(Author::Js, Author::Wasm, Epoch::new(1))
         .expect("transfer now succeeds");
+    assert_eq!(ep2, Epoch::new(2));
     assert_eq!(state.author(), Author::Wasm);
 }
 
@@ -360,7 +605,7 @@ fn late_mutation_corrupting_first_snapshot_fails() {
         .record_use(mat_handle, DataVersion::new(1), Epoch::ZERO, red, 16)
         .expect("record v1 red ok");
 
-    // Recording duplicate with IDENTICAL data is idempotent and returns existing record
+    // Recording duplicate with IDENTICAL metadata and data is idempotent
     let rec1_dup = store
         .record_use(mat_handle, DataVersion::new(1), Epoch::ZERO, red, 16)
         .expect("idempotent record ok");
@@ -375,12 +620,12 @@ fn late_mutation_corrupting_first_snapshot_fails() {
         err,
         OwnershipError::ImmutableSnapshotViolation {
             version: DataVersion::new(1),
-            detail: "conflicting data provided for existing immutable version snapshot",
+            detail: "conflicting metadata or data provided for existing immutable version snapshot",
         }
     );
 
     // Verify first snapshot was not corrupted
-    let slice0 = store.get_slice(rec1.slice_id()).expect("lookup slice");
+    let slice0 = store.get_use(&rec1).expect("lookup slice");
     assert_eq!(*slice0.data(), red);
 }
 
@@ -399,4 +644,17 @@ fn invalid_alignment_rejected() {
         err_non_pow2,
         OwnershipError::InvalidAlignment { alignment: 15 }
     );
+}
+
+#[test]
+fn store_id_overflow_near_max_fails_cleanly() {
+    f3d_core::ownership::set_next_store_id_for_testing(u64::MAX);
+    let err = PerUseByteBuffer::<MaterialDomain>::new(256)
+        .expect_err("store ID at u64::MAX must overflow");
+    assert_eq!(
+        err,
+        OwnershipError::StoreIdOverflow { current: u64::MAX }
+    );
+    // Reset store ID counter for other tests
+    f3d_core::ownership::set_next_store_id_for_testing(100_000);
 }

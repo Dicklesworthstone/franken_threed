@@ -13,7 +13,9 @@ extern crate alloc;
 pub mod capability;
 pub mod error;
 pub mod handle;
+pub mod layout;
 pub mod manifest;
+pub mod ownership;
 #[cfg(feature = "test-support")]
 pub mod test_evidence;
 
@@ -24,9 +26,27 @@ pub use handle::{
     Handle, LifecycleState, MaterialDomain, ObjectDomain, PipelineDomain, RegionDomain,
     RenderTargetDomain, TaskDomain, TextureDomain,
 };
+pub use layout::{
+    AFFINE_ROWS_ALIGNMENT, AFFINE_ROWS_BYTES, AffineRows, COLOR_UNIFORM_BYTES,
+    COPY_BYTES_PER_ROW_ALIGNMENT,
+    DEFAULT_MIN_STORAGE_BUFFER_OFFSET_ALIGNMENT, DEFAULT_MIN_UNIFORM_BUFFER_OFFSET_ALIGNMENT,
+    DrawIndexedIndirectArgs, DrawIndirectArgs, GpuMatrixLayout, InstanceRecord, LayoutError,
+    PROJECTIVE_MAT4_ALIGNMENT, PROJECTIVE_MAT4_BYTES, ProjectiveMat4, WGSL_MAT4X3_BYTES,
+    VERTEX_POS_UV_BYTES, VERTEX_POS_UV_STRIDE, VertexPosUv, WRITE_BUFFER_ALIGNMENT,
+    aligned_bytes_per_row, aligned_copy_bytes_per_row,
+    is_matrix4_affine, is_matrix4_f64_affine, validate_affine_target,
+    validate_composite_storage_array_stride,
+    validate_copy_bytes_per_row, validate_dynamic_storage_offset,
+    validate_dynamic_uniform_offset, validate_storage_array_stride,
+    validate_write_buffer_alignment,
+};
 pub use manifest::{
     FeatureEntry, FeatureManifest, FeatureRoute, FeatureStatus, PINNED_UPSTREAM_COMMIT,
     PINNED_UPSTREAM_RELEASE,
+};
+pub use ownership::{
+    Author, DataVersion, Epoch, OwnerMode, OwnershipError, PerUseByteBuffer,
+    PerUseSnapshotStore, RegionState, SnapshotEntry, UseRecord,
 };
 
 #[cfg(test)]

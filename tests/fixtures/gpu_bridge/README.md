@@ -34,4 +34,5 @@ This fixture verifies the first real Rust/Wasm to WebGPU execution slice and ren
 
 ## No-Claim Boundary
 
-This is an unbenchmarked first bridge slice establishing structural correctness and execution invariants, not a production-selected fastest variant, full renderer, or passed M5/iPhone hardware gate.
+- **Unbenchmarked Slice**: This is an unbenchmarked first bridge slice establishing structural correctness and execution invariants, not a production-selected fastest variant, full renderer, or passed M5/iPhone hardware gate.
+- **Readback Publication Gate Limitation**: The readback publication gate (`ReadbackPublicationState` / `try_publish_readback` in `gpu_host.rs`) is a Rust-side native primitive today. While `bridge_runtime.js` decodes and stamps `epochHi` and `epochLo` onto resolved readback buffers in JavaScript, no browser path currently feeds those readback buffers back into Wasm via `try_publish_readback`. Stale-readback rejection is tested and enforced in native Rust unit tests, but is **not** claimed as an end-to-end browser-verified rejection until a Wasm readback consumer exists.

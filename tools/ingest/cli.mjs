@@ -65,6 +65,9 @@ async function main() {
       fs.writeFileSync(output, jsonStr, 'utf-8');
       console.log(`Module graph bundle written to: ${output}`);
       console.log(`Total modules: ${bundle.summary.total_modules}, Static imports: ${bundle.summary.total_static_imports}, Cycles: ${bundle.summary.cycles_count}`);
+      if (bundle.summary.total_unresolved_native_context_access || bundle.summary.total_unresolved_force_webgl) {
+        console.log(`Unresolved facts: ${bundle.summary.total_unresolved_native_context_access || 0} context access, ${bundle.summary.total_unresolved_force_webgl || 0} forceWebGL`);
+      }
     } else {
       process.stdout.write(jsonStr + '\n');
     }

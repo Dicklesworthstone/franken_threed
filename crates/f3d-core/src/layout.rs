@@ -24,6 +24,21 @@ pub const PROJECTIVE_MAT4_BYTES: usize = 64;
 /// Alignment in bytes of a `ProjectiveMat4` record (16 bytes).
 pub const PROJECTIVE_MAT4_ALIGNMENT: usize = 16;
 
+/// Size in bytes of a single RGBA color uniform record (`vec4<f32>` = 16 bytes).
+pub const COLOR_UNIFORM_BYTES: usize = 16;
+
+/// Alignment in bytes of a color uniform record (`alignof(vec4<f32>)` = 16 bytes under WGSL rules).
+pub const COLOR_UNIFORM_ALIGNMENT: usize = 16;
+
+/// Size in bytes of the canonical position + UV vertex record (`vec3<f32>` pos [12B] + `vec2<f32>` uv [8B] = 20 bytes).
+pub const VERTEX_POS_UV_BYTES: usize = 20;
+
+/// Byte stride for the canonical position + UV vertex buffer layout (20 bytes).
+pub const VERTEX_POS_UV_STRIDE: usize = 20;
+
+/// Alignment in bytes of the canonical position + UV vertex record (4 bytes for f32).
+pub const VERTEX_POS_UV_ALIGNMENT: usize = 4;
+
 /// Size in bytes of a native WGSL `mat4x3<f32>` (4 columns of vec3<f32>, each padded to 16 bytes = 64 bytes).
 ///
 /// Under WGSL layout rules, `alignof(vec3<f32>) == 16` and `sizeof(vec3<f32>) == 12`, but stride
@@ -81,6 +96,8 @@ pub enum LayoutError {
         /// Offset or length that failed alignment.
         value: usize,
     },
+    /// Arithmetic overflow occurred during layout, stride, or pitch calculation.
+    CalculationOverflow,
 }
 
 impl fmt::Display for LayoutError {
@@ -109,6 +126,9 @@ impl fmt::Display for LayoutError {
             }
             Self::UnalignedWriteBuffer { value } => {
                 write!(f, "writeBuffer parameter {value} must be a multiple of 4 bytes")
+            }
+            Self::CalculationOverflow => {
+                write!(f, "arithmetic overflow during layout, stride, or pitch calculation")
             }
         }
     }
@@ -164,13 +184,25 @@ impl AffineRows {
 
     /// Converts a Three.js column-major 4x4 matrix into `AffineRows`.
     ///
-    /// Verifies that row 3 is affine `[0.0, 0.0, 0.0, 1.0]`. If perspective components
-    /// or projective scaling are present, returns `Err(LayoutError::NonAffineMatrix)`.
+    /// Invariant: Exact structural check. Row 3 must be exactly `[0.0, 0.0, 0.0, 1.0]`.
+    /// If any perspective component is non-zero or scale is not 1.0, returns `Err(LayoutError::NonAffineMatrix)`.
     pub fn from_column_major(e: &[f32; 16]) -> Result<Self, LayoutError> {
         if !is_matrix4_affine(e) {
             return Err(LayoutError::NonAffineMatrix);
         }
         Ok(Self::from_column_major_unchecked(e))
+    }
+
+    /// Converts an `f64` Three.js column-major 4x4 matrix into `AffineRows` after verifying affine structure
+    /// at full `f64` precision before narrowing to `f32`.
+    ///
+    /// Returns `Err(LayoutError::NonAffineMatrix)` if any perspective coefficient is non-zero
+    /// or if `e[15] != 1.0`.
+    pub fn from_column_major_f64(e: &[f64; 16]) -> Result<Self, LayoutError> {
+        if !is_matrix4_f64_affine(e) {
+            return Err(LayoutError::NonAffineMatrix);
+        }
+        Ok(Self::from_column_major_f64_unchecked(e))
     }
 
     /// Converts a Three.js column-major 4x4 matrix into `AffineRows` without verifying row 3.
@@ -179,6 +211,15 @@ impl AffineRows {
             r0: [e[0], e[4], e[8], e[12]],
             r1: [e[1], e[5], e[9], e[13]],
             r2: [e[2], e[6], e[10], e[14]],
+        }
+    }
+
+    /// Converts an `f64` Three.js column-major 4x4 matrix into `AffineRows` without verifying row 3.
+    pub const fn from_column_major_f64_unchecked(e: &[f64; 16]) -> Self {
+        Self {
+            r0: [e[0] as f32, e[4] as f32, e[8] as f32, e[12] as f32],
+            r1: [e[1] as f32, e[5] as f32, e[9] as f32, e[13] as f32],
+            r2: [e[2] as f32, e[6] as f32, e[10] as f32, e[14] as f32],
         }
     }
 
@@ -386,17 +427,37 @@ impl ProjectiveMat4 {
         }
         Self { elements }
     }
+    /// Converts an `f64` 16-element column-major matrix to `ProjectiveMat4` by narrowing elements to `f32`.
+    pub fn from_elements_f64(e: &[f64; 16]) -> Self {
+        let mut elements = [0.0f32; 16];
+        for i in 0..16 {
+            elements[i] = e[i] as f32;
+        }
+        Self { elements }
+    }
 }
 
-/// Helper function to determine if a 4x4 matrix is affine.
+/// Checks whether a 4x4 matrix in column-major order represents an affine transformation.
 ///
-/// A matrix is affine if row 3 is `[0, 0, 0, 1]`.
+/// Invariant: Exact structural check. An affine 4x4 matrix must have row 3 equal to
+/// `[0.0, 0.0, 0.0, 1.0]` exactly (`e[3] == 0.0 && e[7] == 0.0 && e[11] == 0.0 && e[15] == 1.0`).
+///
+/// No epsilon is permitted: even small perspective terms (e.g. `e[3] = 5e-7`)
+/// produce significant perspective divide effects on large coordinates (e.g. `x = 1e7 => w = 6`),
+/// and silently discarding them distorts geometry. Any non-zero perspective coefficient or `e[15] != 1.0`
+/// must be retained in `ProjectiveMat4`.
 pub fn is_matrix4_affine(e: &[f32; 16]) -> bool {
-    let eps = 1e-6f32;
-    e[3].abs() <= eps
-        && e[7].abs() <= eps
-        && e[11].abs() <= eps
-        && (e[15] - 1.0f32).abs() <= eps
+    e[3] == 0.0 && e[7] == 0.0 && e[11] == 0.0 && e[15] == 1.0
+}
+
+/// Checks whether an `f64` 4x4 matrix in column-major order represents an affine transformation
+/// before narrowing to `f32`.
+///
+/// Invariant: Exact structural test at source precision. If any perspective element is non-zero
+/// in `f64` or `e[15] != 1.0`, it cannot be narrowed to an affine record without corrupting
+/// the projection.
+pub fn is_matrix4_f64_affine(e: &[f64; 16]) -> bool {
+    e[3] == 0.0 && e[7] == 0.0 && e[11] == 0.0 && e[15] == 1.0
 }
 
 /// Enumeration of distinct GPU matrix memory layout conventions in WebGPU.
@@ -470,23 +531,37 @@ pub fn validate_dynamic_storage_offset(offset: usize, min_alignment: usize) -> R
     }
 }
 
-/// Validates storage buffer array stride for an element type.
+/// Validates storage buffer array stride for an element type with explicit alignment.
 ///
-/// Storage buffer arrays must have element stride >= element size and aligned to 16 bytes for matrix/vector composites.
-pub fn validate_storage_array_stride(stride: usize, element_size: usize) -> Result<(), LayoutError> {
+/// Under WGSL layout rules, storage array stride must be >= element size and a multiple of `element_alignment`.
+pub fn validate_storage_array_stride(
+    stride: usize,
+    element_size: usize,
+    element_alignment: usize,
+) -> Result<(), LayoutError> {
     if stride < element_size {
         return Err(LayoutError::BufferTooSmall {
             required: element_size,
             provided: stride,
         });
     }
-    if stride % 16 != 0 {
+    if element_alignment == 0 || stride % element_alignment != 0 {
         return Err(LayoutError::UnalignedOffset {
             offset: stride,
-            required_alignment: 16,
+            required_alignment: element_alignment,
         });
     }
     Ok(())
+}
+
+/// Validates storage buffer array stride for a 16-byte aligned composite record (e.g. `AffineRows`).
+///
+/// Invariant: Composite records containing `vec4` rows require 16-byte stride alignment.
+pub fn validate_composite_storage_array_stride(
+    stride: usize,
+    element_size: usize,
+) -> Result<(), LayoutError> {
+    validate_storage_array_stride(stride, element_size, 16)
 }
 
 /// Validates WebGPU writeBuffer copy alignment (must be a multiple of 4 bytes).
@@ -511,6 +586,48 @@ pub fn validate_copy_bytes_per_row(bytes_per_row: u32) -> Result<(), LayoutError
         Ok(())
     }
 }
+
+/// Computes the WebGPU copy row pitch (`bytesPerRow`) for a 4-byte-per-pixel (e.g. RGBA8) texture of given width,
+/// aligned to 256 bytes ([`COPY_BYTES_PER_ROW_ALIGNMENT`]), with checked arithmetic overflow.
+///
+/// Under WebGPU specification:
+/// - Each RGBA8 pixel occupies 4 bytes (`width * 4`).
+/// - `bytesPerRow` must be a multiple of 256.
+///
+/// Returns `Err(LayoutError::CalculationOverflow)` if `width * 4` overflows `u32`
+/// or if rounding up to the next 256-byte boundary overflows `u32`.
+pub fn aligned_bytes_per_row(width: u32) -> Result<u32, LayoutError> {
+    let unpadded = width.checked_mul(4).ok_or(LayoutError::CalculationOverflow)?;
+    let align = COPY_BYTES_PER_ROW_ALIGNMENT as u32; // 256
+    let remainder = unpadded % align;
+    let aligned = if remainder == 0 {
+        unpadded
+    } else {
+        unpadded
+            .checked_add(align - remainder)
+            .ok_or(LayoutError::CalculationOverflow)?
+    };
+    Ok(aligned)
+}
+
+/// Computes the WebGPU copy row pitch (`bytesPerRow`) with custom byte-per-pixel size,
+/// aligned to 256 bytes ([`COPY_BYTES_PER_ROW_ALIGNMENT`]), with checked arithmetic overflow.
+pub fn aligned_copy_bytes_per_row(width: u32, bytes_per_pixel: u32) -> Result<u32, LayoutError> {
+    let unpadded = width
+        .checked_mul(bytes_per_pixel)
+        .ok_or(LayoutError::CalculationOverflow)?;
+    let align = COPY_BYTES_PER_ROW_ALIGNMENT as u32; // 256
+    let remainder = unpadded % align;
+    let aligned = if remainder == 0 {
+        unpadded
+    } else {
+        unpadded
+            .checked_add(align - remainder)
+            .ok_or(LayoutError::CalculationOverflow)?
+    };
+    Ok(aligned)
+}
+
 
 /// Instance transform record layout for GPU instance buffers (world transform + instance ID).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -636,6 +753,86 @@ impl DrawIndexedIndirectArgs {
     }
 }
 
+/// Canonical vertex record for GPU vertex buffers containing 3D position and 2D UV coordinates.
+///
+/// Memory layout:
+/// - `position`: `[f32; 3]` at offset 0 (12 bytes, `shaderLocation: 0, format: "float32x3"`)
+/// - `uv`: `[f32; 2]` at offset 12 (8 bytes, `shaderLocation: 1, format: "float32x2"`)
+/// Total size: 20 bytes ([`VERTEX_POS_UV_BYTES`]), alignment 4 bytes ([`VERTEX_POS_UV_ALIGNMENT`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct VertexPosUv {
+    /// 3D position in model space (`[x, y, z]`).
+    pub position: [f32; 3],
+    /// 2D texture coordinates (`[u, v]`).
+    pub uv: [f32; 2],
+}
+
+impl VertexPosUv {
+    /// Byte size of this vertex record (20 bytes).
+    pub const BYTE_SIZE: usize = VERTEX_POS_UV_BYTES;
+
+    /// Byte stride for vertex buffer layouts (20 bytes).
+    pub const STRIDE: usize = VERTEX_POS_UV_STRIDE;
+
+    /// Alignment in bytes (4 bytes).
+    pub const ALIGNMENT: usize = VERTEX_POS_UV_ALIGNMENT;
+
+    /// Constructs a new `VertexPosUv` record.
+    pub const fn new(position: [f32; 3], uv: [f32; 2]) -> Self {
+        Self { position, uv }
+    }
+
+    /// Serializes the vertex record into an exact 20-byte array in little-endian order.
+    pub fn to_bytes(&self) -> [u8; 20] {
+        let mut out = [0u8; 20];
+        out[0..4].copy_from_slice(&self.position[0].to_le_bytes());
+        out[4..8].copy_from_slice(&self.position[1].to_le_bytes());
+        out[8..12].copy_from_slice(&self.position[2].to_le_bytes());
+        out[12..16].copy_from_slice(&self.uv[0].to_le_bytes());
+        out[16..20].copy_from_slice(&self.uv[1].to_le_bytes());
+        out
+    }
+
+    /// Safely writes the 20-byte wire representation into a mutable byte slice.
+    pub fn write_to_slice(&self, out: &mut [u8]) -> Result<(), LayoutError> {
+        if out.len() < Self::BYTE_SIZE {
+            return Err(LayoutError::BufferTooSmall {
+                required: Self::BYTE_SIZE,
+                provided: out.len(),
+            });
+        }
+        out[..Self::BYTE_SIZE].copy_from_slice(&self.to_bytes());
+        Ok(())
+    }
+
+    /// Safely reads the 20-byte vertex record from a slice in little-endian order.
+    pub fn read_from_slice(src: &[u8]) -> Result<Self, LayoutError> {
+        if src.len() < Self::BYTE_SIZE {
+            return Err(LayoutError::BufferTooSmall {
+                required: Self::BYTE_SIZE,
+                provided: src.len(),
+            });
+        }
+        let mut b = [0u8; 20];
+        b.copy_from_slice(&src[..Self::BYTE_SIZE]);
+        Ok(Self::from_bytes(&b))
+    }
+
+    /// Deserializes a `VertexPosUv` record from an exact 20-byte array.
+    pub fn from_bytes(bytes: &[u8; 20]) -> Self {
+        let read_f32 = |offset: usize| -> f32 {
+            let mut b = [0u8; 4];
+            b.copy_from_slice(&bytes[offset..offset + 4]);
+            f32::from_le_bytes(b)
+        };
+        Self {
+            position: [read_f32(0), read_f32(4), read_f32(8)],
+            uv: [read_f32(12), read_f32(16)],
+        }
+    }
+}
+
 /// Canonical WGSL struct declaration for `AffineRows`.
 pub const WGSL_AFFINE_ROWS_DECLARATION: &str = r#"
 struct AffineRows {
@@ -726,6 +923,49 @@ mod tests {
     }
 
     #[test]
+    fn exact_structural_affine_regression_and_f64_eligibility() {
+        // e3 = 5e-7, x = 1e7 => homogeneous w = e3 * x + e15 = 5.0 + 1.0 = 6.0 != 1.0.
+        let mut e = [
+            1.0f32, 0.0, 0.0, 5e-7,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        ];
+        assert!(!is_matrix4_affine(&e));
+        assert_eq!(AffineRows::from_column_major(&e), Err(LayoutError::NonAffineMatrix));
+
+        let proj = ProjectiveMat4::from_elements(e);
+        let h = proj.transform_homogeneous([1e7, 0.0, 0.0, 1.0]);
+        assert_eq!(h[3], 6.0);
+
+        // Subnormal perspective term
+        e[3] = 1e-40;
+        assert!(!is_matrix4_affine(&e));
+        assert_eq!(AffineRows::from_column_major(&e), Err(LayoutError::NonAffineMatrix));
+
+        // Near 1 e15
+        e[3] = 0.0;
+        e[15] = 1.0000001;
+        assert!(!is_matrix4_affine(&e));
+        assert_eq!(AffineRows::from_column_major(&e), Err(LayoutError::NonAffineMatrix));
+
+        // f64 source matrix with small perspective term before narrowing
+        let mut e_f64 = [
+            1.0f64, 0.0, 0.0, 5e-7,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        ];
+        assert!(!is_matrix4_f64_affine(&e_f64));
+        assert_eq!(AffineRows::from_column_major_f64(&e_f64), Err(LayoutError::NonAffineMatrix));
+
+        e_f64[3] = 0.0;
+        assert!(is_matrix4_f64_affine(&e_f64));
+        let affine = AffineRows::from_column_major_f64(&e_f64).expect("valid f64 affine");
+        assert_eq!(affine, AffineRows::identity());
+    }
+
+    #[test]
     fn wgsl_mat4x3_size_distinction() {
         assert_eq!(GpuMatrixLayout::WgslMat4x3Padded64.byte_size(), 64);
         assert_eq!(GpuMatrixLayout::AffineRows48.byte_size(), 48);
@@ -742,4 +982,94 @@ mod tests {
         assert!(validate_copy_bytes_per_row(256).is_ok());
         assert!(validate_copy_bytes_per_row(100).is_err());
     }
+
+    #[test]
+    fn storage_stride_scalar_vec2_and_composite() {
+        // Scalar f32 (size 4, align 4)
+        assert!(validate_storage_array_stride(4, 4, 4).is_ok());
+        assert!(validate_storage_array_stride(8, 4, 4).is_ok());
+        assert_eq!(
+            validate_storage_array_stride(6, 4, 4),
+            Err(LayoutError::UnalignedOffset { offset: 6, required_alignment: 4 })
+        );
+
+        // vec2<f32> (size 8, align 8)
+        assert!(validate_storage_array_stride(8, 8, 8).is_ok());
+        assert!(validate_storage_array_stride(16, 8, 8).is_ok());
+        assert_eq!(
+            validate_storage_array_stride(12, 8, 8),
+            Err(LayoutError::UnalignedOffset { offset: 12, required_alignment: 8 })
+        );
+
+        // Composite record AffineRows (size 48, align 16)
+        assert!(validate_composite_storage_array_stride(48, 48).is_ok());
+        assert!(validate_composite_storage_array_stride(64, 48).is_ok());
+        assert_eq!(
+            validate_composite_storage_array_stride(50, 48),
+            Err(LayoutError::UnalignedOffset { offset: 50, required_alignment: 16 })
+        );
+    }
+
+    #[test]
+    fn aligned_bytes_per_row_calculations() {
+        // Width 32: 32 * 4 = 128 bytes -> rounded up to 256 bytes
+        assert_eq!(aligned_bytes_per_row(32), Ok(256));
+
+        // Width 64: 64 * 4 = 256 bytes -> exact multiple
+        assert_eq!(aligned_bytes_per_row(64), Ok(256));
+
+        // Width 1: 1 * 4 = 4 bytes -> 256 bytes
+        assert_eq!(aligned_bytes_per_row(1), Ok(256));
+
+        // Width 0: 0 bytes -> 0 bytes
+        assert_eq!(aligned_bytes_per_row(0), Ok(0));
+
+        // Overflow: width * 4 overflows u32
+        assert_eq!(aligned_bytes_per_row(u32::MAX), Err(LayoutError::CalculationOverflow));
+        assert_eq!(aligned_bytes_per_row(u32::MAX / 4 + 1), Err(LayoutError::CalculationOverflow));
+
+        // Alignment overflow: unpadded + padding overflows u32
+        assert_eq!(aligned_bytes_per_row(1_073_741_823), Err(LayoutError::CalculationOverflow));
+
+        // Custom bytes_per_pixel helper
+        assert_eq!(aligned_copy_bytes_per_row(32, 4), Ok(256));
+        assert_eq!(aligned_copy_bytes_per_row(32, 8), Ok(256)); // 32 * 8 = 256
+        assert_eq!(aligned_copy_bytes_per_row(33, 8), Ok(512)); // 33 * 8 = 264 -> 512
+    }
+
+    #[test]
+    fn vertex_pos_uv_and_color_uniform_constants_tests() {
+        assert_eq!(COLOR_UNIFORM_BYTES, 16);
+        assert_eq!(COLOR_UNIFORM_ALIGNMENT, 16);
+        assert_eq!(VERTEX_POS_UV_BYTES, 20);
+        assert_eq!(VERTEX_POS_UV_STRIDE, 20);
+        assert_eq!(VERTEX_POS_UV_ALIGNMENT, 4);
+
+        let v = VertexPosUv::new([0.0, 0.5, 0.0], [0.5, 1.0]);
+        assert_eq!(VertexPosUv::BYTE_SIZE, 20);
+        assert_eq!(VertexPosUv::STRIDE, 20);
+        assert_eq!(VertexPosUv::ALIGNMENT, 4);
+
+        let bytes = v.to_bytes();
+        assert_eq!(bytes.len(), 20);
+        let restored = VertexPosUv::from_bytes(&bytes);
+        assert_eq!(v, restored);
+
+        let mut slice = [0u8; 20];
+        v.write_to_slice(&mut slice).expect("write slice ok");
+        let from_slice = VertexPosUv::read_from_slice(&slice).expect("read slice ok");
+        assert_eq!(v, from_slice);
+
+        let mut small = [0u8; 19];
+        assert_eq!(
+            v.write_to_slice(&mut small),
+            Err(LayoutError::BufferTooSmall { required: 20, provided: 19 })
+        );
+        assert_eq!(
+            VertexPosUv::read_from_slice(&small),
+            Err(LayoutError::BufferTooSmall { required: 20, provided: 19 })
+        );
+    }
 }
+
+

@@ -1,0 +1,26 @@
+[package]
+name = "f3d-graph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Pass graph, usage-scope hazard analysis, pass splitting, and execution planning for FrankenThreeD"
+
+[lints]
+workspace = true
+
+[features]
+default = ["std", "serde"]
+std = ["f3d-core/std"]
+serde = ["dep:serde", "dep:serde_json", "f3d-core/serde"]
+test-support = ["std", "serde"]
+
+[dependencies]
+f3d-core = { workspace = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde = { workspace = true, features = ["alloc", "derive"] }
+serde_json = { workspace = true, features = ["alloc"] }

@@ -1,0 +1,23 @@
+[package]
+name = "f3d-math"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Fixed-size 3D math primitives with f64 public semantics matching Three.js r186"
+
+[lints]
+workspace = true
+
+[features]
+default = ["std"]
+std = ["f3d-core/std"]
+serde = ["dep:serde", "f3d-core/serde"]
+
+[dependencies]
+f3d-core = { workspace = true, default-features = false }
+serde = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde = { workspace = true, features = ["alloc", "derive"] }

@@ -3,8 +3,8 @@
  * 
  * F3D Bulk WebGPU Bridge implementation:
  * - Pre-device feature and limit negotiation
- * - Synchronous error-scope stack discipline
- * - Binary coarse checked packet decoder (zero eval/new Function)
+ * - Synchronous error-scope stack discipline: push, encode, finish, submit, pop synchronously; then await
+ * - Bounds-checked binary coarse packet decoder (zero eval/new Function)
  * - Fresh canvas swapchain texture acquisition per render interval
  * - Per-use versioned slices for queue-ordering snapshot isolation (Red-A / Blue-B)
  */
@@ -22,6 +22,16 @@ export const OPCODE_CREATE_TEXTURE = 6;
 export const TARGET_OFFSCREEN = 0;
 export const TARGET_CANVAS = 1;
 
+export const TARGET_FORMAT_PREFERRED_CANVAS = 0;
+export const TARGET_FORMAT_BGRA8UNORM = 1;
+export const TARGET_FORMAT_RGBA8UNORM = 2;
+
+export const TEXTURE_USAGE_COPY_SRC = 1;
+export const TEXTURE_USAGE_COPY_DST = 2;
+export const TEXTURE_USAGE_TEXTURE_BINDING = 4;
+export const TEXTURE_USAGE_STORAGE_BINDING = 8;
+export const TEXTURE_USAGE_RENDER_ATTACHMENT = 16;
+
 export class WebGpuBridgeHost {
   constructor() {
     this.adapter = null;
@@ -31,8 +41,8 @@ export class WebGpuBridgeHost {
     this.textures = new Map();
     this.pipelines = new Map();
     this.bindGroups = new Map();
+    this.bufferEpochs = new Map();
     this.errorScopeActive = false;
-    this.turnCounter = 0;
   }
 
   /**
@@ -145,12 +155,14 @@ export class WebGpuBridgeHost {
     }
 
     let syncResult;
+    let syncError = null;
     try {
       syncResult = syncAction();
-      // Detect if syncAction returned a Promise (await inside body violation)
       if (syncResult && typeof syncResult.then === "function") {
         throw new Error("Error-scope violation: syncAction returned a Promise. Awaits inside error-scope body are strictly forbidden");
       }
+    } catch (err) {
+      syncError = err;
     } finally {
       // Pop all scopes synchronously in reverse order
       const popPromises = [];
@@ -159,7 +171,13 @@ export class WebGpuBridgeHost {
       }
       this.errorScopeActive = false;
 
-      // Now await error scope results after synchronous execution
+      // If syncAction threw, await settled pops and re-throw
+      if (syncError) {
+        await Promise.allSettled(popPromises);
+        throw syncError;
+      }
+
+      // Await error scope results after synchronous execution
       const errors = await Promise.all(popPromises);
       for (const err of errors) {
         if (err) {
@@ -173,6 +191,10 @@ export class WebGpuBridgeHost {
 
   /**
    * Decodes and executes a coarse checked packet binary buffer.
+   *
+   * Invariant: Command recording, canvas texture view acquisition, commandEncoder.finish(),
+   * and queue.submit() all execute SYNCHRONOUSLY inside the pushed error scopes.
+   * Error scopes are popped immediately after submit() and awaited afterwards.
    * Zero eval / new Function.
    */
   async executePacket(packetBytes, canvasContext = null) {
@@ -180,10 +202,12 @@ export class WebGpuBridgeHost {
       throw new Error("Device not initialized");
     }
 
-    const dataView = new DataView(packetBytes.buffer, packetBytes.byteOffset, packetBytes.byteLength);
-    if (dataView.byteLength < 16) {
+    const headerLen = 16;
+    if (packetBytes.byteLength < headerLen) {
       throw new Error("Packet buffer too small for header");
     }
+
+    const dataView = new DataView(packetBytes.buffer, packetBytes.byteOffset, packetBytes.byteLength);
 
     const magic = dataView.getUint32(0, true);
     if (magic !== PACKET_MAGIC) {
@@ -198,22 +222,21 @@ export class WebGpuBridgeHost {
     const commandCount = dataView.getUint32(8, true);
     const dataLen = dataView.getUint32(12, true);
 
-    const commandBlockStart = 16;
     const dataBlockStart = packetBytes.byteLength - dataLen;
-    if (dataBlockStart < commandBlockStart) {
+    if (dataBlockStart < headerLen) {
       throw new Error("Malformed packet: data payload overlaps header");
     }
 
     const dataPayload = packetBytes.subarray(dataBlockStart);
-    let cursor = commandBlockStart;
 
-    const commandEncoder = this.device.createCommandEncoder();
-
-    // Execute synchronous resource allocations and commands inside error scopes
+    // Synchronous execution block inside error scopes
     await this.withErrorScopes(["validation", "out-of-memory"], () => {
+      const commandEncoder = this.device.createCommandEncoder();
+      let cursor = headerLen;
+
       for (let i = 0; i < commandCount; i++) {
-        if (cursor >= dataBlockStart) {
-          throw new Error(`Unexpected end of commands at command ${i} of ${commandCount}`);
+        if (cursor + 2 > dataBlockStart) {
+          throw new Error(`Truncated command at index ${i}: cursor exceeded command block`);
         }
 
         const opcode = dataView.getUint16(cursor, true);
@@ -221,13 +244,17 @@ export class WebGpuBridgeHost {
 
         switch (opcode) {
           case OPCODE_CREATE_BUFFER: {
+            if (cursor + 12 > dataBlockStart) {
+              throw new Error(`Truncated CREATE_BUFFER fields at command ${i}`);
+            }
             const bufferId = dataView.getUint32(cursor, true);
             const size = dataView.getUint32(cursor + 4, true);
             const usage = dataView.getUint32(cursor + 8, true);
             cursor += 12;
 
+            const alignedSize = Math.ceil(Math.max(size, 16) / 4) * 4;
             const buffer = this.device.createBuffer({
-              size: Math.max(size, 16),
+              size: alignedSize,
               usage: usage,
             });
             this.buffers.set(bufferId, buffer);
@@ -235,6 +262,9 @@ export class WebGpuBridgeHost {
           }
 
           case OPCODE_WRITE_BUFFER: {
+            if (cursor + 16 > dataBlockStart) {
+              throw new Error(`Truncated WRITE_BUFFER fields at command ${i}`);
+            }
             const bufferId = dataView.getUint32(cursor, true);
             const offset = dataView.getUint32(cursor + 4, true);
             const dataOffset = dataView.getUint32(cursor + 8, true);
@@ -246,7 +276,7 @@ export class WebGpuBridgeHost {
               throw new Error(`WriteBuffer: unknown bufferId ${bufferId}`);
             }
             if (dataOffset + dataLength > dataPayload.byteLength) {
-              throw new Error("WriteBuffer: data offset out of bounds");
+              throw new Error(`WriteBuffer: data slice out of bounds (offset ${dataOffset} + len ${dataLength} > payload ${dataPayload.byteLength})`);
             }
 
             const chunk = dataPayload.subarray(dataOffset, dataOffset + dataLength);
@@ -255,6 +285,9 @@ export class WebGpuBridgeHost {
           }
 
           case OPCODE_CREATE_TEXTURE: {
+            if (cursor + 20 > dataBlockStart) {
+              throw new Error(`Truncated CREATE_TEXTURE fields at command ${i}`);
+            }
             const textureId = dataView.getUint32(cursor, true);
             const width = dataView.getUint32(cursor + 4, true);
             const height = dataView.getUint32(cursor + 8, true);
@@ -262,7 +295,15 @@ export class WebGpuBridgeHost {
             const usage = dataView.getUint32(cursor + 16, true);
             cursor += 20;
 
-            const format = formatCode === 1 ? "bgra8unorm" : "rgba8unorm";
+            let format;
+            if (formatCode === 1) {
+              format = "bgra8unorm";
+            } else if (formatCode === 2) {
+              format = "rgba8unorm";
+            } else {
+              throw new Error(`Invalid texture formatCode: ${formatCode}`);
+            }
+
             const texture = this.device.createTexture({
               size: [width, height, 1],
               format: format,
@@ -273,23 +314,40 @@ export class WebGpuBridgeHost {
           }
 
           case OPCODE_CREATE_PIPELINE: {
+            if (cursor + 32 > dataBlockStart) {
+              throw new Error(`Truncated CREATE_PIPELINE fields at command ${i}`);
+            }
             const pipelineId = dataView.getUint32(cursor, true);
             const codeOffset = dataView.getUint32(cursor + 4, true);
             const codeLen = dataView.getUint32(cursor + 8, true);
             const formatCode = dataView.getUint32(cursor + 12, true);
             const hasVertexBuffer = dataView.getUint32(cursor + 16, true) === 1;
             const hasUniformBuffer = dataView.getUint32(cursor + 20, true) === 1;
-            cursor += 24;
+            const explicitUniformSize = dataView.getUint32(cursor + 24, true);
+            const explicitVertexStride = dataView.getUint32(cursor + 28, true);
+            cursor += 32;
 
             if (codeOffset + codeLen > dataPayload.byteLength) {
-              throw new Error("CreatePipeline: shader code offset out of bounds");
+              throw new Error(`CreatePipeline: shader code slice out of bounds (offset ${codeOffset} + len ${codeLen} > payload ${dataPayload.byteLength})`);
+            }
+
+            let format;
+            if (formatCode === 0) {
+              format = this.capabilityRecord?.preferredCanvasFormat || "bgra8unorm";
+            } else if (formatCode === 1) {
+              format = "bgra8unorm";
+            } else if (formatCode === 2) {
+              format = "rgba8unorm";
+            } else {
+              throw new Error(`Invalid pipeline target formatCode: ${formatCode}`);
             }
 
             const codeBytes = dataPayload.subarray(codeOffset, codeOffset + codeLen);
             const shaderCode = new TextDecoder().decode(codeBytes);
-            const format = formatCode === 1 ? "bgra8unorm" : "rgba8unorm";
 
             const shaderModule = this.device.createShaderModule({ code: shaderCode });
+
+            const uniformSize = explicitUniformSize > 0 ? explicitUniformSize : (hasUniformBuffer ? 48 : 0);
 
             let bindGroupLayout = null;
             if (hasUniformBuffer) {
@@ -301,7 +359,7 @@ export class WebGpuBridgeHost {
                     buffer: {
                       type: "uniform",
                       hasDynamicOffset: true,
-                      minBindingSize: 48,
+                      minBindingSize: uniformSize,
                     },
                   },
                 ],
@@ -312,10 +370,12 @@ export class WebGpuBridgeHost {
               bindGroupLayouts: bindGroupLayout ? [bindGroupLayout] : [],
             });
 
+            // Default layout matches f3d_core::layout::VERTEX_POS_UV_STRIDE (20 bytes: pos vec3<f32> at 0 + uv vec2<f32> at 12)
+            const vertexStride = explicitVertexStride > 0 ? explicitVertexStride : 20;
             const vertexBuffers = hasVertexBuffer
               ? [
                   {
-                    arrayStride: 20, // 3 floats pos (12) + 2 floats uv (8)
+                    arrayStride: vertexStride,
                     attributes: [
                       { shaderLocation: 0, offset: 0, format: "float32x3" },
                       { shaderLocation: 1, offset: 12, format: "float32x2" },
@@ -341,11 +401,14 @@ export class WebGpuBridgeHost {
               },
             });
 
-            this.pipelines.set(pipelineId, { pipeline, bindGroupLayout, hasUniformBuffer });
+            this.pipelines.set(pipelineId, { pipeline, bindGroupLayout, hasUniformBuffer, uniformSize });
             break;
           }
 
           case OPCODE_RENDER_PASS: {
+            if (cursor + 44 > dataBlockStart) {
+              throw new Error(`Truncated RENDER_PASS fields at command ${i}`);
+            }
             const targetType = dataView.getUint32(cursor, true);
             const targetId = dataView.getUint32(cursor + 4, true);
             const cr = dataView.getFloat32(cursor + 8, true);
@@ -356,21 +419,25 @@ export class WebGpuBridgeHost {
             const vertexBufferId = dataView.getUint32(cursor + 28, true);
             const vertexCount = dataView.getUint32(cursor + 32, true);
             const dynamicOffset = dataView.getUint32(cursor + 36, true);
-            cursor += 40;
+            const uniformBufferId = dataView.getUint32(cursor + 40, true) || 1;
+            cursor += 44;
 
             let targetView;
             if (targetType === TARGET_CANVAS) {
               if (!canvasContext) {
-                throw new Error("RenderPass: canvasContext required for TARGET_CANVAS");
+                // Gracefully skip canvas swapchain presentation pass in headless or pure-offscreen execution
+                continue;
               }
-              // Canvas texture is acquired fresh each frame/pass
+              // Canvas texture is acquired fresh per frame/interval inside the synchronous error scope
               targetView = canvasContext.getCurrentTexture().createView();
-            } else {
+            } else if (targetType === TARGET_OFFSCREEN) {
               const texture = this.textures.get(targetId);
               if (!texture) {
                 throw new Error(`RenderPass: unknown offscreen targetId ${targetId}`);
               }
               targetView = texture.createView();
+            } else {
+              throw new Error(`Invalid render pass targetType: ${targetType}`);
             }
 
             const pipelineRecord = this.pipelines.get(pipelineId);
@@ -392,10 +459,9 @@ export class WebGpuBridgeHost {
             passEncoder.setPipeline(pipelineRecord.pipeline);
 
             if (pipelineRecord.hasUniformBuffer) {
-              // We use uniform buffer 1 by convention for bridge passes
-              const uniformBuf = this.buffers.get(1);
+              const uniformBuf = this.buffers.get(uniformBufferId);
               if (!uniformBuf) {
-                throw new Error("RenderPass: uniform buffer 1 missing for pipeline");
+                throw new Error(`RenderPass: uniform buffer ${uniformBufferId} missing for pipeline`);
               }
               const bindGroup = this.device.createBindGroup({
                 layout: pipelineRecord.bindGroupLayout,
@@ -405,7 +471,7 @@ export class WebGpuBridgeHost {
                     resource: {
                       buffer: uniformBuf,
                       offset: 0,
-                      size: 48,
+                      size: pipelineRecord.uniformSize || 48,
                     },
                   },
                 ],
@@ -427,11 +493,18 @@ export class WebGpuBridgeHost {
           }
 
           case OPCODE_COPY_TEXTURE_TO_BUFFER: {
+            if (cursor + 24 > dataBlockStart) {
+              throw new Error(`Truncated COPY_TEXTURE_TO_BUFFER fields at command ${i}`);
+            }
             const textureId = dataView.getUint32(cursor, true);
             const bufferId = dataView.getUint32(cursor + 4, true);
             const width = dataView.getUint32(cursor + 8, true);
             const height = dataView.getUint32(cursor + 12, true);
-            cursor += 16;
+            const epochHi = dataView.getUint32(cursor + 16, true);
+            const epochLo = dataView.getUint32(cursor + 20, true);
+            cursor += 24;
+
+            this.bufferEpochs.set(bufferId, { epochHi, epochLo });
 
             const texture = this.textures.get(textureId);
             const buffer = this.buffers.get(bufferId);
@@ -439,7 +512,6 @@ export class WebGpuBridgeHost {
               throw new Error("CopyTextureToBuffer: invalid texture or buffer id");
             }
 
-            // Bytes per row must be a multiple of 256
             const unalignedBytesPerRow = width * 4;
             const bytesPerRow = Math.ceil(unalignedBytesPerRow / 256) * 256;
 
@@ -455,10 +527,11 @@ export class WebGpuBridgeHost {
             throw new Error(`Unknown opcode: ${opcode}`);
         }
       }
-    });
 
-    const commandBuffer = commandEncoder.finish();
-    this.device.queue.submit([commandBuffer]);
+      // Finish and submit synchronously inside the error scope
+      const commandBuffer = commandEncoder.finish();
+      this.device.queue.submit([commandBuffer]);
+    });
   }
 
   /**
@@ -474,6 +547,12 @@ export class WebGpuBridgeHost {
     const mapped = buffer.getMappedRange(0, byteLength);
     const copy = new Uint8Array(mapped.slice(0));
     buffer.unmap();
+
+    const recordedEpoch = this.bufferEpochs.get(bufferId) || { epochHi: 0, epochLo: 0 };
+    copy.epochHi = recordedEpoch.epochHi;
+    copy.epochLo = recordedEpoch.epochLo;
+    copy.bufferId = bufferId;
+    copy.data = copy;
     return copy;
   }
 }

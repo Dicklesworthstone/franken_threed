@@ -172,3 +172,157 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
   return result;
 }
+
+import {
+  PACKET_MAGIC,
+  PACKET_VERSION,
+  OPCODE_CREATE_BUFFER,
+  OPCODE_WRITE_BUFFER,
+  OPCODE_CREATE_TEXTURE,
+  OPCODE_CREATE_PIPELINE,
+  OPCODE_RENDER_PASS,
+  OPCODE_COPY_TEXTURE_TO_BUFFER,
+  TEXTURE_USAGE_COPY_SRC,
+  TEXTURE_USAGE_RENDER_ATTACHMENT,
+} from "./bridge_runtime.js";
+
+export { TEXTURE_USAGE_COPY_SRC, TEXTURE_USAGE_RENDER_ATTACHMENT };
+
+/**
+ * Independent JS-side PacketBuilder kept exclusively inside direct_reference.js
+ * as an oracle reference implementation of the binary packet format.
+ */
+export class PacketBuilder {
+  constructor() {
+    this.commands = [];
+    this.dataChunks = [];
+    this.dataTotalLen = 0;
+  }
+
+  createBuffer(bufferId, size, usage) {
+    this.commands.push({ op: OPCODE_CREATE_BUFFER, bufferId, size, usage });
+  }
+
+  writeBuffer(bufferId, offset, dataUint8) {
+    const dataOffset = this.dataTotalLen;
+    this.dataChunks.push(dataUint8);
+    this.dataTotalLen += dataUint8.byteLength;
+    this.commands.push({ op: OPCODE_WRITE_BUFFER, bufferId, offset, dataOffset, dataLength: dataUint8.byteLength });
+  }
+
+  createTexture(textureId, width, height, formatCode, usage) {
+    this.commands.push({ op: OPCODE_CREATE_TEXTURE, textureId, width, height, formatCode, usage });
+  }
+
+  createPipeline(pipelineId, wgslText, formatCode, hasVB, hasUniform, uniformSize = 0, vertexStride = 0) {
+    const codeBytes = new TextEncoder().encode(wgslText);
+    const codeOffset = this.dataTotalLen;
+    this.dataChunks.push(codeBytes);
+    this.dataTotalLen += codeBytes.byteLength;
+    this.commands.push({ op: OPCODE_CREATE_PIPELINE, pipelineId, codeOffset, codeLen: codeBytes.byteLength, formatCode, hasVB, hasUniform, uniformSize, vertexStride });
+  }
+
+  renderPass(targetType, targetId, clearColor, pipelineId, vbId, vertexCount, dynamicOffset = 0, uniformBufferId = 1) {
+    this.commands.push({ op: OPCODE_RENDER_PASS, targetType, targetId, clearColor, pipelineId, vbId, vertexCount, dynamicOffset, uniformBufferId });
+  }
+
+  copyTextureToBuffer(textureId, bufferId, width, height, epochHi = 0, epochLo = 0) {
+    this.commands.push({ op: OPCODE_COPY_TEXTURE_TO_BUFFER, textureId, bufferId, width, height, epochHi, epochLo });
+  }
+
+  build() {
+    const headerLen = 16;
+    let commandBytesLen = 0;
+    for (const cmd of this.commands) {
+      switch (cmd.op) {
+        case OPCODE_CREATE_BUFFER: commandBytesLen += 2 + 12; break;
+        case OPCODE_WRITE_BUFFER: commandBytesLen += 2 + 16; break;
+        case OPCODE_CREATE_TEXTURE: commandBytesLen += 2 + 20; break;
+        case OPCODE_CREATE_PIPELINE: commandBytesLen += 2 + 32; break;
+        case OPCODE_RENDER_PASS: commandBytesLen += 2 + 44; break;
+        case OPCODE_COPY_TEXTURE_TO_BUFFER: commandBytesLen += 2 + 24; break;
+      }
+    }
+
+    const totalLen = headerLen + commandBytesLen + this.dataTotalLen;
+    const out = new Uint8Array(totalLen);
+    const view = new DataView(out.buffer);
+
+    view.setUint32(0, PACKET_MAGIC, true);
+    view.setUint16(4, PACKET_VERSION, true);
+    view.setUint16(6, 0, true);
+    view.setUint32(8, this.commands.length, true);
+    view.setUint32(12, this.dataTotalLen, true);
+
+    let cursor = 16;
+    for (const cmd of this.commands) {
+      view.setUint16(cursor, cmd.op, true);
+      cursor += 2;
+      switch (cmd.op) {
+        case OPCODE_CREATE_BUFFER:
+          view.setUint32(cursor, cmd.bufferId, true);
+          view.setUint32(cursor + 4, cmd.size, true);
+          view.setUint32(cursor + 8, cmd.usage, true);
+          cursor += 12;
+          break;
+        case OPCODE_WRITE_BUFFER:
+          view.setUint32(cursor, cmd.bufferId, true);
+          view.setUint32(cursor + 4, cmd.offset, true);
+          view.setUint32(cursor + 8, cmd.dataOffset, true);
+          view.setUint32(cursor + 12, cmd.dataLength, true);
+          cursor += 16;
+          break;
+        case OPCODE_CREATE_TEXTURE:
+          view.setUint32(cursor, cmd.textureId, true);
+          view.setUint32(cursor + 4, cmd.width, true);
+          view.setUint32(cursor + 8, cmd.height, true);
+          view.setUint32(cursor + 12, cmd.formatCode, true);
+          view.setUint32(cursor + 16, cmd.usage, true);
+          cursor += 20;
+          break;
+        case OPCODE_CREATE_PIPELINE:
+          view.setUint32(cursor, cmd.pipelineId, true);
+          view.setUint32(cursor + 4, cmd.codeOffset, true);
+          view.setUint32(cursor + 8, cmd.codeLen, true);
+          view.setUint32(cursor + 12, cmd.formatCode, true);
+          view.setUint32(cursor + 16, cmd.hasVB ? 1 : 0, true);
+          view.setUint32(cursor + 20, cmd.hasUniform ? 1 : 0, true);
+          view.setUint32(cursor + 24, cmd.uniformSize || 0, true);
+          view.setUint32(cursor + 28, cmd.vertexStride || 0, true);
+          cursor += 32;
+          break;
+        case OPCODE_RENDER_PASS:
+          view.setUint32(cursor, cmd.targetType, true);
+          view.setUint32(cursor + 4, cmd.targetId, true);
+          view.setFloat32(cursor + 8, cmd.clearColor[0], true);
+          view.setFloat32(cursor + 12, cmd.clearColor[1], true);
+          view.setFloat32(cursor + 16, cmd.clearColor[2], true);
+          view.setFloat32(cursor + 20, cmd.clearColor[3], true);
+          view.setUint32(cursor + 24, cmd.pipelineId, true);
+          view.setUint32(cursor + 28, cmd.vbId, true);
+          view.setUint32(cursor + 32, cmd.vertexCount, true);
+          view.setUint32(cursor + 36, cmd.dynamicOffset, true);
+          view.setUint32(cursor + 40, cmd.uniformBufferId || 1, true);
+          cursor += 44;
+          break;
+        case OPCODE_COPY_TEXTURE_TO_BUFFER:
+          view.setUint32(cursor, cmd.textureId, true);
+          view.setUint32(cursor + 4, cmd.bufferId, true);
+          view.setUint32(cursor + 8, cmd.width, true);
+          view.setUint32(cursor + 12, cmd.height, true);
+          view.setUint32(cursor + 16, cmd.epochHi || 0, true);
+          view.setUint32(cursor + 20, cmd.epochLo || 0, true);
+          cursor += 24;
+          break;
+      }
+    }
+
+    let dataCursor = headerLen + commandBytesLen;
+    for (const chunk of this.dataChunks) {
+      out.set(chunk, dataCursor);
+      dataCursor += chunk.byteLength;
+    }
+
+    return out;
+  }
+}

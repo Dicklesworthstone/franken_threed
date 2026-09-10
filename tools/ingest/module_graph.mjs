@@ -13,7 +13,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { SCHEMA_VERSION, IngestionResolutionError } from './types.mjs';
 import { parseHtmlEntries } from './html_parser.mjs';
-import { resolveModuleSpecifier, getBaseUrl } from './resolver.mjs';
+import { resolveModuleSpecifier, getBaseUrl, urlToFilePath } from './resolver.mjs';
 import { analyzeModuleAst } from './ast_analyzer.mjs';
 
 /**
@@ -147,7 +147,7 @@ export async function buildModuleGraph(entryPath, options = {}) {
       sourceCode = item.inlineContent;
       sourcePath = resolvedEntryAbs;
     } else {
-      sourcePath = fileURLToPath(moduleId);
+      sourcePath = urlToFilePath(moduleId);
       try {
         sourceCode = fs.readFileSync(sourcePath, 'utf-8');
       } catch (err) {
@@ -237,8 +237,10 @@ export async function buildModuleGraph(entryPath, options = {}) {
           classification: 'literal',
           specifier: dyn.specifier,
           resolved_id: resolvedTarget,
+          resolvedId: resolvedTarget,
           unresolved: false,
-          source_span: dyn.sourceSpan
+          source_span: dyn.sourceSpan,
+          sourceSpan: dyn.sourceSpan
         });
 
         if (!modules.has(resolvedTarget)) {
@@ -256,8 +258,10 @@ export async function buildModuleGraph(entryPath, options = {}) {
           classification: dyn.classification,
           specifier: null,
           resolved_id: null,
+          resolvedId: null,
           unresolved: true,
-          source_span: dyn.sourceSpan
+          source_span: dyn.sourceSpan,
+          sourceSpan: dyn.sourceSpan
         });
       }
     }
@@ -276,7 +280,11 @@ export async function buildModuleGraph(entryPath, options = {}) {
       prototype_writes: analysis.prototypeWrites,
       has_top_level_side_effects: analysis.hasTopLevelSideEffects,
       has_live_bindings: analysis.hasLiveBindings,
-      mutable_exported_bindings: analysis.mutableExportedBindings
+      mutable_exported_bindings: analysis.mutableExportedBindings,
+      renderer_construction_sites: analysis.renderer_construction_sites,
+      rendererConstructionSites: analysis.renderer_construction_sites,
+      routing_facts: analysis.routing_facts,
+      routingFacts: analysis.routing_facts
     };
 
     modules.set(moduleId, node);
@@ -296,11 +304,27 @@ export async function buildModuleGraph(entryPath, options = {}) {
   let totalDynamicImports = 0;
   let unresolvedDynamicImports = 0;
   let identicalContentPairs = 0;
+  let totalRendererConstructionSites = 0;
+  let totalUnresolvedNativeContextAccess = 0;
+  let totalUnresolvedForceWebGL = 0;
 
   for (const node of modules.values()) {
     totalStaticImports += node.static_imports.length;
     totalDynamicImports += node.dynamic_imports.length;
     unresolvedDynamicImports += node.dynamic_imports.filter(d => d.unresolved).length;
+    totalRendererConstructionSites += node.renderer_construction_sites ? node.renderer_construction_sites.length : 0;
+    const facts = node.routing_facts || node.routingFacts;
+    if (facts && (facts.has_unresolved_context_access || facts.hasUnresolvedContextAccess)) {
+      totalUnresolvedNativeContextAccess++;
+    }
+    const sites = node.renderer_construction_sites || node.rendererConstructionSites;
+    if (sites) {
+      for (const site of sites) {
+        if (site.forceWebGL === 'unresolved' || site.force_webgl === 'unresolved' || site.forceWebGLUnresolved || site.force_webgl_unresolved) {
+          totalUnresolvedForceWebGL++;
+        }
+      }
+    }
     if (node.duplicate_content_with.length > 0) {
       identicalContentPairs += node.duplicate_content_with.length;
     }
@@ -323,7 +347,12 @@ export async function buildModuleGraph(entryPath, options = {}) {
       total_dynamic_imports: totalDynamicImports,
       unresolved_dynamic_imports: unresolvedDynamicImports,
       cycles_count: cycles.length,
-      identical_content_pairs: identicalContentPairs
+      identical_content_pairs: identicalContentPairs,
+      total_renderer_construction_sites: totalRendererConstructionSites,
+      total_unresolved_native_context_access: totalUnresolvedNativeContextAccess,
+      totalUnresolvedNativeContextAccess,
+      total_unresolved_force_webgl: totalUnresolvedForceWebGL,
+      totalUnresolvedForceWebGL
     }
   };
 

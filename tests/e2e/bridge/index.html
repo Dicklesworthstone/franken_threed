@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>FrankenThreeD - WebGPU Bridge Counterexample Suite</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      padding: 24px;
+      background: #0d1117;
+      color: #c9d1d9;
+      line-height: 1.5;
+    }
+    h1 { color: #58a6ff; font-size: 22px; margin-bottom: 8px; }
+    p { color: #8b949e; font-size: 14px; margin-top: 0; }
+    .status-box {
+      margin-top: 16px;
+      padding: 16px;
+      border-radius: 8px;
+      font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+      font-size: 13px;
+    }
+    .running { background: #161b22; border: 1px solid #30363d; color: #58a6ff; }
+    .pass { background: #0d2818; border: 1px solid #238636; color: #3fb950; }
+    .fail { background: #2c0f12; border: 1px solid #da3633; color: #f85149; }
+    .test-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 16px;
+      margin-top: 20px;
+    }
+    .test-card {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      padding: 14px;
+    }
+    .test-card h3 { margin: 0 0 8px 0; font-size: 14px; }
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 12px;
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+    }
+    .badge-pass { background: #238636; color: #fff; }
+    .badge-fail { background: #da3633; color: #fff; }
+    .badge-running { background: #1f6feb; color: #fff; }
+    .badge-pending { background: #9e6a03; color: #fff; }
+    canvas {
+      border: 1px solid #30363d;
+      margin-top: 10px;
+      image-rendering: pixelated;
+      width: 64px;
+      height: 64px;
+    }
+  </style>
+</head>
+<body>
+  <h1>f3d-05.7: WebGPU Bridge Counterexample Suite</h1>
+  <p>Verifying first-frame pixel equivalence, queue snapshot isolation, opcode bounds enforcement, and synchronous error scopes against real GPU execution and direct-JS references.</p>
+
+  <div id="statusBox" class="status-box running">Initializing WebGPU bridge and executing counterexamples...</div>
+
+  <div id="testGrid" class="test-grid"></div>
+
+  <script type="module">
+    import { WebGpuBridgeHost } from "../../fixtures/gpu_bridge/bridge_runtime.js";
+    import {
+      testFirstFramePixelEquivalence,
+      testNegativeBrokenFirstFrameGpuTransform,
+      testRedABlueBQueueWriteSnapshot,
+      testNegativeBrokenRedABlueBQueueHazard,
+      testNegativeMissingWasmRejection,
+      testMalformedPacketBoundsChecking,
+      testNegativeBrokenMalformedPacket,
+      testSynchronousErrorScopeDiscipline,
+      testNegativeBrokenErrorScopeControl,
+      getPendingBridgeCapabilities,
+    } from "./counterexample_suite.js";
+
+    const statusBox = document.getElementById("statusBox");
+    const testGrid = document.getElementById("testGrid");
+
+    const report = {
+      passed: false,
+      timestamp: new Date().toISOString(),
+      userAgent: navigator.userAgent,
+      deviceInfo: null,
+      wasmLoaded: false,
+      suiteResults: {},
+      pendingCapabilities: {},
+      errors: [],
+    };
+
+    function addCard(id, title, description, ownership = null) {
+      const card = document.createElement("div");
+      card.className = "test-card";
+      card.id = `card-${id}`;
+      const ownershipBadge = ownership
+        ? `<span style="font-size:10px; padding:2px 6px; border-radius:4px; margin-right:8px; font-weight:600; ${ownership.startsWith('AUTHORITATIVE') ? 'background:#1f6feb33; color:#58a6ff; border:1px solid #1f6feb' : (ownership.includes('PENDING') ? 'background:#9e6a0333; color:#d29922; border:1px solid #9e6a03' : 'background:#30363d; color:#8b949e; border:1px solid #484f58')}">${ownership}</span>`
+        : '';
+      card.innerHTML = `
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <h3 style="margin:0; font-size:14px;">${title}</h3>
+          <div>
+            ${ownershipBadge}
+            <span class="badge badge-running" id="badge-${id}">RUNNING</span>
+          </div>
+        </div>
+        <div style="font-size:12px; color:#8b949e; margin:6px 0;">${description}</div>
+        <div style="font-size:12px; font-family:monospace;" id="detail-${id}">Executing...</div>
+      `;
+      testGrid.appendChild(card);
+    }
+
+    function updateCard(name, status, detail) {
+      const badge = document.getElementById(`badge-${name}`);
+      const detailEl = document.getElementById(`detail-${name}`);
+      if (status === "PASS") {
+        badge.className = "badge badge-pass";
+        badge.textContent = "PASS";
+        detailEl.style.color = "#3fb950";
+        detailEl.textContent = detail || "Assertion verified successfully.";
+      } else if (status === "PENDING") {
+        badge.className = "badge badge-pending";
+        badge.textContent = "PENDING";
+        detailEl.style.color = "#d29922";
+        detailEl.textContent = detail || "Pending product implementation.";
+      } else {
+        badge.className = "badge badge-fail";
+        badge.textContent = "FAIL";
+        detailEl.style.color = "#f85149";
+        detailEl.textContent = detail || "Test assertion failed.";
+      }
+    }
+
+    async function runSuite() {
+      try {
+        if (!navigator.gpu) {
+          throw new Error("WebGPU is not supported in this browser environment");
+        }
+
+        // Require compiled application Wasm module. No silent fallback allowed.
+        let wasmModule = null;
+        try {
+          const wasm = await import("/pkg/f3d_runtime.js");
+          await wasm.default();
+          const buildTriangleFn = wasm.f3d_build_first_frame_packet || wasm.gpu_bridge_build_triangle_packet;
+          const buildRedBlueFn = wasm.f3d_build_red_a_blue_b_packet || wasm.gpu_bridge_build_red_blue_packet;
+          if (typeof buildTriangleFn !== "function" || typeof buildRedBlueFn !== "function") {
+            throw new Error(
+              `Compiled application Wasm at /pkg/f3d_runtime.js is missing required exports: ` +
+              `buildTriangleFn=${typeof buildTriangleFn}, buildRedBlueFn=${typeof buildRedBlueFn}`
+            );
+          }
+          wasmModule = wasm;
+          report.wasmLoaded = true;
+          console.log("[f3d-05.7] Real compiled application Wasm loaded successfully:", Object.keys(wasm));
+        } catch (wasmErr) {
+          report.wasmLoaded = false;
+          const errMsg = `Wasm Load Failure: Required compiled application Wasm (/pkg/f3d_runtime.js) failed to load: ${wasmErr.message || String(wasmErr)}. Silent JS fallback is strictly forbidden.`;
+          report.errors.push(errMsg);
+          throw new Error(errMsg);
+        }
+
+        const host = new WebGpuBridgeHost();
+        const capRecord = await host.negotiateAndCreateDevice({
+          powerPreference: "high-performance",
+          requiredFeatures: [],
+        });
+        report.deviceInfo = capRecord;
+
+        // Configure a real WebGPU canvas context for TARGET_CANVAS passes authored in Rust/Wasm
+        const canvas = document.createElement("canvas");
+        canvas.id = "webgpu-swapchain-canvas";
+        canvas.width = 64;
+        canvas.height = 64;
+        canvas.style.display = "none";
+        document.body.appendChild(canvas);
+
+        const canvasContext = canvas.getContext("webgpu");
+        if (canvasContext) {
+          const preferredFormat = capRecord.preferredCanvasFormat ||
+            (navigator.gpu && navigator.gpu.getPreferredCanvasFormat ? navigator.gpu.getPreferredCanvasFormat() : "bgra8unorm");
+          canvasContext.configure({
+            device: host.device,
+            format: preferredFormat,
+            alphaMode: "premultiplied",
+          });
+        }
+
+        const activeTests = [
+          {
+            id: "pixel_equivalence",
+            title: "1. First-Frame Pixel Equivalence",
+            ownership: "AUTHORITATIVE (05.7)",
+            desc: "Candidate bridge vs direct-JS oracle reference (0 differences) + real GPU broken transform rejection",
+            run: async () => {
+              const { candidatePixels, oraclePixels } = await testFirstFramePixelEquivalence(
+                host,
+                host.device,
+                wasmModule,
+                64,
+                64,
+                canvasContext
+              );
+              await testNegativeBrokenFirstFrameGpuTransform(host, oraclePixels, 64, 64);
+              return "Verified via real Rust/Wasm binary packet (0 diffs); real GPU broken transform rejected.";
+            },
+          },
+          {
+            id: "queue_snapshot_red_a_blue_b",
+            title: "2. Red-A / Blue-B Queue Snapshot",
+            ownership: "AUTHORITATIVE (05.7)",
+            desc: "Single submission schedule with PerUseByteBuffer slices + real GPU queue hazard rejection",
+            run: async () => {
+              await testRedABlueBQueueWriteSnapshot(host, wasmModule, 64, 64);
+              await testNegativeBrokenRedABlueBQueueHazard(host, wasmModule, 32, 32);
+              return "Target A pure Red, Target B pure Blue (Rust PerUseByteBuffer); GPU queue hazard rejected.";
+            },
+          },
+          {
+            id: "missing_wasm_rejection",
+            title: "3. Missing-Wasm / Export Rejection Control",
+            ownership: "AUTHORITATIVE (05.7)",
+            desc: "Verifies test runner demonstrably rejects runs when application Wasm or required exports are missing",
+            run: async () => {
+              await testNegativeMissingWasmRejection(host, host.device);
+              return "Confirmed: Runner strictly rejects execution when Wasm or required exports are missing.";
+            },
+          },
+          {
+            id: "malformed_packet_bounds",
+            title: "4. Malformed Packet & Opcode Bounds Enforcement",
+            ownership: "SMOKE CHECK (05.6 Owned)",
+            desc: "Valid packet parses; truncated opcode fields and invalid format/target codes strictly rejected",
+            run: async () => {
+              await testMalformedPacketBoundsChecking(host);
+              await testNegativeBrokenMalformedPacket(host);
+              return "Well-formed packet parsed; truncated opcodes and invalid formats/targets strictly rejected.";
+            },
+          },
+          {
+            id: "error_scope_synchronous_submit",
+            title: "5. Synchronous Error-Scope Stack & Submit Discipline",
+            ownership: "SMOKE CHECK (05.6 Owned)",
+            desc: "finish/submit execute synchronously within error scopes; promise yields and interleaving rejected",
+            run: async () => {
+              await testSynchronousErrorScopeDiscipline(host);
+              await testNegativeBrokenErrorScopeControl(host);
+              return "Synchronous submit verified inside scopes; async yields and interleaving rejected.";
+            },
+          },
+        ];
+
+        let allPassed = true;
+
+        for (const t of activeTests) {
+          addCard(t.id, t.title, t.desc, t.ownership);
+          try {
+            const detail = await t.run();
+            report.suiteResults[t.id] = { status: "PASS", detail, ownership: t.ownership };
+            updateCard(t.id, "PASS", detail);
+          } catch (err) {
+            allPassed = false;
+            report.suiteResults[t.id] = { status: "FAIL", error: err.message || String(err), ownership: t.ownership };
+            report.errors.push(`${t.id}: ${err.message || String(err)}`);
+            updateCard(t.id, "FAIL", err.message || String(err));
+          }
+        }
+
+        // Record pending product capabilities (never fake as passed)
+        const pendingCapabilities = getPendingBridgeCapabilities();
+        for (const p of pendingCapabilities) {
+          addCard(p.capability, p.capability, p.reason, "PENDING KILL-GATE");
+          updateCard(p.capability, "PENDING", p.reason);
+          report.pendingCapabilities[p.capability] = p;
+        }
+
+        report.partition = {
+          authoritativeSuites: ["pixel_equivalence", "queue_snapshot_red_a_blue_b", "missing_wasm_rejection"],
+          smokeChecksOwnedBy05_6: ["malformed_packet_bounds", "error_scope_synchronous_submit"],
+          pendingCapabilities: pendingCapabilities.map(p => p.capability),
+        };
+
+        report.passed = allPassed;
+
+        if (allPassed) {
+          statusBox.className = "status-box pass";
+          statusBox.innerHTML = `<strong>ALL 5 ACTIVE BRIDGE SUITES PASSED VERIFICATION</strong><br>` +
+            `<span style="color:#7ee787;">• <strong>3 Authoritative Suites (05.7):</strong> First-Frame Pixel Equivalence (dual control vs oracle + real GPU broken transform rejection), Red-A/Blue-B Queue Snapshot (PerUseByteBuffer vs real GPU hazard rejection), Missing-Wasm Rejection Control.</span><br>` +
+            `<span style="color:#8b949e;">• <strong>2 Duplicated Smoke Checks:</strong> Malformed Packet Bounds and Synchronous Error-Scope Discipline (retained locally; authoritatively owned by 05.6 gpu_bridge_test.html).</span><br>` +
+            `<span style="color:#d29922;">• <strong>5 Pending Kill-Gate Items:</strong> Bundle reset, generational handles, memory borrow guards, wire validator, stale-epoch publication gate (recorded pending, never faked).</span>`;
+        } else {
+          statusBox.className = "status-box fail";
+          statusBox.innerHTML = `<strong>COUNTEREXAMPLE SUITE FAILED:</strong> ${report.errors.join("; ")}`;
+        }
+      } catch (fatal) {
+        report.passed = false;
+        report.errors.push(`Fatal suite error: ${fatal.message || String(fatal)}`);
+        statusBox.className = "status-box fail";
+        statusBox.innerHTML = `<strong>FATAL ERROR:</strong> ${fatal.message || String(fatal)}`;
+      }
+
+      // Send report to server if available
+      try {
+        await fetch("/report", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(report),
+        });
+      } catch (_) {
+        // Standalone browser execution outside test runner harness
+      }
+    }
+
+    runSuite();
+  </script>
+</body>
+</html>

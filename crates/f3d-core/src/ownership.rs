@@ -11,20 +11,56 @@
 //! 1. Only the current author may record writes and advance [`DataVersion`].
 //! 2. Uncommitted writes must be explicitly published via [`Epoch`] progression before
 //!    authority can be transferred.
-//! 3. Authority transfer with stale epoch or pending unpublished writes is strictly rejected.
-//! 4. Versions and epochs are monotonic 64-bit counters decomposed into two explicit 32-bit words
+//! 3. Authority transfer strictly advances the publication [`Epoch`] and rejects stale epochs
+//!    or pending unpublished writes, preventing stale command replay across author roundtrips (ABA).
+//! 4. Mode transitions via [`RegionState::transition_mode`] require explicit authorization from the
+//!    current author, zero pending writes, and monotonic epoch advance.
+//! 5. Versions and epochs are monotonic 64-bit counters decomposed into two explicit 32-bit words
 //!    at host boundaries to prevent precision loss from JavaScript `Number` (IEEE 754 float64).
-//! 5. Pass planning and bridge snapshots retain immutable per-use versions and buffer slices
+//! 6. Pass planning and bridge snapshots retain immutable per-use versions and buffer slices
 //!    so that mutations to a shared resource between passes (e.g. Red in Pass A, Blue in Pass B)
 //!    coexist in the same submission schedule without in-place slot overwrites.
+//! 7. [`PerUseByteBuffer`] and [`PerUseSnapshotStore`] are authoritative, non-clonable allocation
+//!    arenas. Store identifiers are allocated via checked CAS loop to prevent silent counter wraparound.
+//!    Old records after store reset (ABA slice reuse) or records from foreign stores are strictly rejected.
 
 extern crate alloc;
 
 use alloc::vec::Vec;
 use core::fmt;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::HandleError;
 use crate::handle::{Domain, Handle, RegionDomain};
+
+static NEXT_STORE_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Allocates a globally unique store identifier, failing cleanly with typed overflow error
+/// if the counter reaches `u64::MAX`.
+fn allocate_store_id() -> Result<u64, OwnershipError> {
+    let mut current = NEXT_STORE_COUNTER.load(Ordering::Relaxed);
+    loop {
+        let next = current
+            .checked_add(1)
+            .ok_or(OwnershipError::StoreIdOverflow { current })?;
+        match NEXT_STORE_COUNTER.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return Ok(current),
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+/// Set the next store identifier counter for near-max overflow regression testing.
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_next_store_id_for_testing(id: u64) {
+    NEXT_STORE_COUNTER.store(id, Ordering::Relaxed);
+}
 
 /// Authoritative writer identity across the host / runtime boundary.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -260,7 +296,7 @@ impl fmt::Display for DataVersion {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum OwnershipError {
-    /// An unauthorized writer attempted to mutate or publish state.
+    /// An unauthorized writer attempted to mutate, publish, or transition state.
     UnauthorizedWriter {
         /// The author permitted to write.
         expected: Author,
@@ -296,17 +332,57 @@ pub enum OwnershipError {
         /// Current version value that failed to increment.
         current: u64,
     },
-    /// Violation of snapshot immutability: attempted mutation of an existing version snapshot.
+    /// Globally unique store identifier counter overflowed `u64::MAX`.
+    StoreIdOverflow {
+        /// Current store counter value that failed to increment.
+        current: u64,
+    },
+    /// Violation of snapshot immutability: attempted mutation or conflicting metadata for an existing version snapshot.
     ImmutableSnapshotViolation {
         /// Version that was attempted to be re-recorded or corrupted.
         version: DataVersion,
         /// Description of the attempted violation.
         detail: &'static str,
     },
+    /// A use record from an earlier allocation generation was accessed after store reset (ABA slice reuse prevention).
+    StaleSliceRecord {
+        /// Current generation of the buffer/store.
+        expected_generation: u64,
+        /// Stale generation from the provided record.
+        actual_generation: u64,
+        /// Slice ID referenced by the stale record.
+        slice_id: u32,
+    },
+    /// A use record from a different store instance was provided to this store.
+    ForeignSliceRecord {
+        /// Store ID of the receiving store.
+        expected_store: u64,
+        /// Foreign store ID found on the record.
+        actual_store: u64,
+    },
+    /// The provided use record does not match the stored metadata for that slice (offset or size tampering).
+    SliceIdentityMismatch {
+        /// Slice ID where metadata mismatched.
+        slice_id: u32,
+    },
+    /// Slice offset or length exceeds buffer bounds or overflows address calculations.
+    SliceOutOfBounds {
+        /// Slice starting byte offset.
+        offset: u64,
+        /// Slice byte length.
+        length: u64,
+        /// Current buffer length.
+        buffer_len: usize,
+    },
     /// Requested slice was not found in the per-use buffer.
     SliceNotFound {
         /// The requested slice identifier.
         slice_id: u32,
+    },
+    /// Slice byte length is invalid or cannot fit into host address space.
+    InvalidSliceLength {
+        /// The invalid byte length.
+        length: u64,
     },
     /// Alignment requirement was not satisfied (e.g. zero or not a power of two).
     InvalidAlignment {
@@ -350,14 +426,55 @@ impl fmt::Display for OwnershipError {
             Self::VersionOverflow { current } => {
                 write!(f, "data version counter overflow at {current}")
             }
+            Self::StoreIdOverflow { current } => {
+                write!(f, "store ID allocation overflow at {current}")
+            }
             Self::ImmutableSnapshotViolation { version, detail } => {
                 write!(
                     f,
                     "immutable snapshot violation at version {version}: {detail}"
                 )
             }
+            Self::StaleSliceRecord {
+                expected_generation,
+                actual_generation,
+                slice_id,
+            } => {
+                write!(
+                    f,
+                    "stale slice record for slice {slice_id}: buffer generation is {expected_generation}, record has stale generation {actual_generation}"
+                )
+            }
+            Self::ForeignSliceRecord {
+                expected_store,
+                actual_store,
+            } => {
+                write!(
+                    f,
+                    "foreign slice record rejected: store ID {expected_store} cannot resolve record from store ID {actual_store}"
+                )
+            }
+            Self::SliceIdentityMismatch { slice_id } => {
+                write!(
+                    f,
+                    "slice identity mismatch for slice {slice_id}: record metadata does not match stored entry"
+                )
+            }
+            Self::SliceOutOfBounds {
+                offset,
+                length,
+                buffer_len,
+            } => {
+                write!(
+                    f,
+                    "slice out of bounds: range [{offset}..{offset}+{length}] exceeds buffer length {buffer_len}"
+                )
+            }
             Self::SliceNotFound { slice_id } => {
                 write!(f, "per-use slice {slice_id} not found in buffer")
+            }
+            Self::InvalidSliceLength { length } => {
+                write!(f, "invalid slice length {length}: exceeds addressable memory")
             }
             Self::InvalidAlignment { alignment } => {
                 write!(
@@ -515,18 +632,22 @@ impl<D: Domain> RegionState<D> {
     /// 3. `at_epoch == self.current_epoch` (epoch is fresh).
     /// 4. `unpublished_writes == 0` (all writes have been published).
     ///
+    /// Upon successful validation, this advances [`Epoch`] to prevent replay of stale transfer commands,
+    /// updates authority, and returns the newly advanced [`Epoch`].
+    ///
     /// # Errors
     ///
     /// - Returns [`OwnershipError::SameAuthorTransfer`] if `from == to`.
     /// - Returns [`OwnershipError::UnauthorizedWriter`] if `from` is not authoritative.
     /// - Returns [`OwnershipError::StaleEpoch`] if `at_epoch` is stale.
     /// - Returns [`OwnershipError::UnpublishedWritesPending`] if uncommitted writes exist.
+    /// - Returns [`OwnershipError::EpochOverflow`] if advancing the epoch counter overflows.
     pub fn transfer_authority(
         &mut self,
         from: Author,
         to: Author,
         at_epoch: Epoch,
-    ) -> Result<(), OwnershipError> {
+    ) -> Result<Epoch, OwnershipError> {
         if from == to {
             return Err(OwnershipError::SameAuthorTransfer { author: from });
         }
@@ -553,26 +674,43 @@ impl<D: Domain> RegionState<D> {
             });
         }
 
+        let next_epoch = self.current_epoch.checked_next()?;
+        self.current_epoch = next_epoch;
+
         match self.mode {
             OwnerMode::Js => self.mode = OwnerMode::Wasm,
             OwnerMode::Wasm => self.mode = OwnerMode::Js,
             OwnerMode::Mirrored { .. } => self.mode = OwnerMode::Mirrored { author: to },
         }
 
-        Ok(())
+        Ok(self.current_epoch)
     }
 
     /// Transition to a new ownership mode at the specified epoch with zero pending writes.
     ///
+    /// Requires that `author` is the current authoritative author, `at_epoch` matches `self.current_epoch`,
+    /// and `unpublished_writes == 0`. Advances the publication epoch to prevent replay attacks.
+    ///
     /// # Errors
     ///
+    /// - Returns [`OwnershipError::UnauthorizedWriter`] if `author` is not authoritative.
     /// - Returns [`OwnershipError::StaleEpoch`] if `at_epoch` is stale.
     /// - Returns [`OwnershipError::UnpublishedWritesPending`] if uncommitted writes exist.
+    /// - Returns [`OwnershipError::EpochOverflow`] if advancing the epoch counter overflows.
     pub fn transition_mode(
         &mut self,
+        author: Author,
         new_mode: OwnerMode,
         at_epoch: Epoch,
-    ) -> Result<(), OwnershipError> {
+    ) -> Result<Epoch, OwnershipError> {
+        let expected = self.author();
+        if author != expected {
+            return Err(OwnershipError::UnauthorizedWriter {
+                expected,
+                actual: author,
+            });
+        }
+
         if at_epoch != self.current_epoch {
             return Err(OwnershipError::StaleEpoch {
                 expected: self.current_epoch,
@@ -587,8 +725,10 @@ impl<D: Domain> RegionState<D> {
             });
         }
 
+        let next_epoch = self.current_epoch.checked_next()?;
+        self.current_epoch = next_epoch;
         self.mode = new_mode;
-        Ok(())
+        Ok(self.current_epoch)
     }
 }
 
@@ -599,6 +739,8 @@ pub struct UseRecord<D: Domain> {
     resource: Handle<D>,
     version: DataVersion,
     epoch: Epoch,
+    store_id: u64,
+    generation: u64,
     slice_id: u32,
     byte_offset: u64,
     byte_length: u64,
@@ -606,10 +748,13 @@ pub struct UseRecord<D: Domain> {
 
 impl<D: Domain> UseRecord<D> {
     /// Construct a new use record.
+    #[allow(clippy::too_many_arguments)]
     pub const fn new(
         resource: Handle<D>,
         version: DataVersion,
         epoch: Epoch,
+        store_id: u64,
+        generation: u64,
         slice_id: u32,
         byte_offset: u64,
         byte_length: u64,
@@ -618,6 +763,8 @@ impl<D: Domain> UseRecord<D> {
             resource,
             version,
             epoch,
+            store_id,
+            generation,
             slice_id,
             byte_offset,
             byte_length,
@@ -642,7 +789,19 @@ impl<D: Domain> UseRecord<D> {
         self.epoch
     }
 
-    /// Unique index of this slice within the per-use buffer.
+    /// Store instance identifier that allocated this slice.
+    #[inline]
+    pub const fn store_id(&self) -> u64 {
+        self.store_id
+    }
+
+    /// Allocation generation of the store at the time this slice was allocated.
+    #[inline]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Unique index of this slice within the store generation.
     #[inline]
     pub const fn slice_id(&self) -> u32 {
         self.slice_id
@@ -684,48 +843,91 @@ impl<D: Domain, T> SnapshotEntry<D, T> {
 
 /// Aligns `offset` up to the next multiple of `alignment`.
 /// `alignment` must be a power of two.
+///
+/// Uses checked arithmetic to prevent panics on `u64` overflow.
 #[inline]
 const fn align_up(offset: u64, alignment: u64) -> Result<u64, OwnershipError> {
     if alignment == 0 || (alignment & (alignment - 1)) != 0 {
         return Err(OwnershipError::InvalidAlignment { alignment });
     }
     let mask = alignment - 1;
-    let aligned = (offset + mask) & !mask;
-    if aligned < offset {
-        return Err(OwnershipError::VersionOverflow { current: offset });
-    }
+    let added = match offset.checked_add(mask) {
+        Some(val) => val,
+        None => return Err(OwnershipError::VersionOverflow { current: offset }),
+    };
+    let aligned = added & !mask;
     Ok(aligned)
 }
 
-/// Storage pool for immutable per-use snapshots of typed data.
+/// Storage pool for immutable per-use snapshots of value types.
 ///
-/// Ensures that multiple uses of a mutating resource across passes
-/// allocate distinct slices and preserve historical versions without in-place overwrite.
-#[derive(Clone, Debug)]
-pub struct PerUseSnapshotStore<D: Domain, T: Clone> {
+/// Admitted types `T` must be plain value types (`Copy + PartialEq + 'static`, such as uniform structs
+/// or fixed arrays) with no interior mutability or aliased references.
+///
+/// Each store instance possesses authoritative, non-clonable allocation identity.
+/// Ensures that multiple uses of a mutating resource across passes allocate distinct slices
+/// and preserve historical versions without in-place overwrite.
+#[derive(Debug)]
+pub struct PerUseSnapshotStore<D: Domain, T: Copy + PartialEq + 'static> {
+    store_id: u64,
+    generation: u64,
     entries: Vec<SnapshotEntry<D, T>>,
     alignment: u64,
     current_offset: u64,
 }
 
-impl<D: Domain, T: Clone> PerUseSnapshotStore<D, T> {
+impl<D: Domain, T: Copy + PartialEq + 'static> PerUseSnapshotStore<D, T> {
     /// Create a new snapshot store with byte alignment for subsequent slices (e.g. 256 bytes for WebGPU UBOs).
+    ///
+    /// Allocates a globally unique store identifier via checked CAS increment.
     pub fn new(alignment: u64) -> Result<Self, OwnershipError> {
         if alignment == 0 || (alignment & (alignment - 1)) != 0 {
             return Err(OwnershipError::InvalidAlignment { alignment });
         }
+        let store_id = allocate_store_id()?;
         Ok(Self {
+            store_id,
+            generation: 1,
             entries: Vec::new(),
             alignment,
             current_offset: 0,
         })
     }
 
+    /// Construct a store with an explicit store ID for testing.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_store_id_for_testing(store_id: u64, alignment: u64) -> Result<Self, OwnershipError> {
+        if alignment == 0 || (alignment & (alignment - 1)) != 0 {
+            return Err(OwnershipError::InvalidAlignment { alignment });
+        }
+        Ok(Self {
+            store_id,
+            generation: 1,
+            entries: Vec::new(),
+            alignment,
+            current_offset: 0,
+        })
+    }
+
+    /// The store instance identifier.
+    #[inline]
+    pub const fn store_id(&self) -> u64 {
+        self.store_id
+    }
+
+    /// The current allocation generation of this store.
+    #[inline]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// Record a pass use of a resource with its snapshot data.
     ///
-    /// If the resource at the given `version` was already recorded with identical data,
-    /// returns the existing [`UseRecord`]. If conflicting data is provided for an already recorded
-    /// version, returns [`OwnershipError::ImmutableSnapshotViolation`].
+    /// If the resource at the given `version` was already recorded with identical metadata
+    /// (`epoch`, `byte_length`) and `data`, returns the existing [`UseRecord`].
+    /// If conflicting metadata or data is provided for an already recorded version,
+    /// returns [`OwnershipError::ImmutableSnapshotViolation`].
     pub fn record_use(
         &mut self,
         handle: Handle<D>,
@@ -733,41 +935,55 @@ impl<D: Domain, T: Clone> PerUseSnapshotStore<D, T> {
         epoch: Epoch,
         data: T,
         byte_length: u64,
-    ) -> Result<UseRecord<D>, OwnershipError>
-    where
-        T: PartialEq,
-    {
+    ) -> Result<UseRecord<D>, OwnershipError> {
         for entry in &self.entries {
             if entry.record.resource == handle && entry.record.version == version {
-                if entry.data == data {
+                if entry.record.epoch == epoch
+                    && entry.record.byte_length == byte_length
+                    && entry.data == data
+                {
                     return Ok(entry.record);
                 }
                 return Err(OwnershipError::ImmutableSnapshotViolation {
                     version,
-                    detail: "conflicting data provided for existing immutable version snapshot",
+                    detail: "conflicting metadata or data provided for existing immutable version snapshot",
                 });
             }
         }
 
         let aligned_offset = align_up(self.current_offset, self.alignment)?;
-        let next_offset = aligned_offset
+        let slice_end = aligned_offset
             .checked_add(byte_length)
             .ok_or(OwnershipError::VersionOverflow {
                 current: aligned_offset,
             })?;
 
-        let slice_id = self.entries.len() as u32;
+        // Ensure the end offset and the subsequent aligned offset do not overflow u64
+        let _next_aligned = align_up(slice_end, self.alignment).map_err(|_| {
+            OwnershipError::VersionOverflow {
+                current: aligned_offset,
+            }
+        })?;
+
+        let slice_id = u32::try_from(self.entries.len()).map_err(|_| {
+            OwnershipError::VersionOverflow {
+                current: self.entries.len() as u64,
+            }
+        })?;
+
         let record = UseRecord::new(
             handle,
             version,
             epoch,
+            self.store_id,
+            self.generation,
             slice_id,
             aligned_offset,
             byte_length,
         );
 
         self.entries.push(SnapshotEntry { record, data });
-        self.current_offset = next_offset;
+        self.current_offset = slice_end;
         Ok(record)
     }
 
@@ -776,6 +992,35 @@ impl<D: Domain, T: Clone> PerUseSnapshotStore<D, T> {
         self.entries
             .get(slice_id as usize)
             .ok_or(OwnershipError::SliceNotFound { slice_id })
+    }
+
+    /// Look up an entry by its [`UseRecord`], verifying store identity, generation, and record metadata.
+    pub fn get_use(&self, record: &UseRecord<D>) -> Result<&SnapshotEntry<D, T>, OwnershipError> {
+        if record.store_id != self.store_id {
+            return Err(OwnershipError::ForeignSliceRecord {
+                expected_store: self.store_id,
+                actual_store: record.store_id,
+            });
+        }
+        if record.generation != self.generation {
+            return Err(OwnershipError::StaleSliceRecord {
+                expected_generation: self.generation,
+                actual_generation: record.generation,
+                slice_id: record.slice_id,
+            });
+        }
+        let entry = self
+            .entries
+            .get(record.slice_id as usize)
+            .ok_or(OwnershipError::SliceNotFound {
+                slice_id: record.slice_id,
+            })?;
+        if entry.record != *record {
+            return Err(OwnershipError::SliceIdentityMismatch {
+                slice_id: record.slice_id,
+            });
+        }
+        Ok(entry)
     }
 
     /// Look up the first entry for a specific handle and version.
@@ -813,10 +1058,18 @@ impl<D: Domain, T: Clone> PerUseSnapshotStore<D, T> {
         self.current_offset
     }
 
-    /// Reset the store for a subsequent submission cycle or frame.
-    pub fn reset(&mut self) {
+    /// Reset the store for a subsequent submission cycle or frame, advancing the allocation generation
+    /// to invalidate old [`UseRecord`] handles (ABA prevention).
+    pub fn reset(&mut self) -> Result<u64, OwnershipError> {
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .ok_or(OwnershipError::VersionOverflow {
+                current: self.generation,
+            })?;
         self.entries.clear();
         self.current_offset = 0;
+        Ok(self.generation)
     }
 }
 
@@ -824,8 +1077,11 @@ impl<D: Domain, T: Clone> PerUseSnapshotStore<D, T> {
 ///
 /// Ensures byte slices written for distinct versions of a resource are immutable,
 /// contiguous, aligned, and never overwritten by subsequent mutations.
-#[derive(Clone, Debug)]
+/// Each buffer instance is authoritative and non-clonable.
+#[derive(Debug)]
 pub struct PerUseByteBuffer<D: Domain> {
+    store_id: u64,
+    generation: u64,
     records: Vec<UseRecord<D>>,
     bytes: Vec<u8>,
     alignment: u64,
@@ -833,24 +1089,61 @@ pub struct PerUseByteBuffer<D: Domain> {
 
 impl<D: Domain> PerUseByteBuffer<D> {
     /// Create a new byte buffer with specified slice alignment (e.g. 256 for WebGPU UBOs).
+    ///
+    /// Allocates a globally unique store identifier via checked CAS increment.
     pub fn new(alignment: u64) -> Result<Self, OwnershipError> {
         if alignment == 0 || (alignment & (alignment - 1)) != 0 {
             return Err(OwnershipError::InvalidAlignment { alignment });
         }
+        let store_id = allocate_store_id()?;
         Ok(Self {
+            store_id,
+            generation: 1,
             records: Vec::new(),
             bytes: Vec::new(),
             alignment,
         })
     }
 
+    /// Construct a byte buffer with an explicit store ID for testing.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_store_id_for_testing(store_id: u64, alignment: u64) -> Result<Self, OwnershipError> {
+        if alignment == 0 || (alignment & (alignment - 1)) != 0 {
+            return Err(OwnershipError::InvalidAlignment { alignment });
+        }
+        Ok(Self {
+            store_id,
+            generation: 1,
+            records: Vec::new(),
+            bytes: Vec::new(),
+            alignment,
+        })
+    }
+
+    /// The store instance identifier.
+    #[inline]
+    pub const fn store_id(&self) -> u64 {
+        self.store_id
+    }
+
+    /// The current allocation generation of this buffer.
+    #[inline]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// Append an immutable byte slice for a resource version and epoch.
+    ///
+    /// Validates full metadata (`epoch`, `byte_length`) and byte content for idempotent deduplication.
+    /// Performs all offset and alignment calculations with checked bounds before mutating buffer memory.
     ///
     /// # Errors
     ///
     /// - Returns [`OwnershipError::ImmutableSnapshotViolation`] if attempting to re-record
-    ///   an existing version for the same handle with differing content.
+    ///   an existing version for the same handle with differing content or metadata.
     /// - Returns [`OwnershipError::VersionOverflow`] if buffer offsets exceed `u64::MAX`.
+    /// - Returns [`OwnershipError::InvalidSliceLength`] if slice cannot fit in addressable memory.
     pub fn append_slice(
         &mut self,
         handle: Handle<D>,
@@ -858,52 +1151,164 @@ impl<D: Domain> PerUseByteBuffer<D> {
         epoch: Epoch,
         slice_bytes: &[u8],
     ) -> Result<UseRecord<D>, OwnershipError> {
+        let byte_len = slice_bytes.len() as u64;
+
         for record in &self.records {
             if record.resource == handle && record.version == version {
-                let start = record.byte_offset as usize;
-                let end = start + record.byte_length as usize;
-                if let Some(existing) = self.bytes.get(start..end) {
-                    if existing == slice_bytes {
-                        return Ok(*record);
+                let start = match usize::try_from(record.byte_offset) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        return Err(OwnershipError::SliceOutOfBounds {
+                            offset: record.byte_offset,
+                            length: record.byte_length,
+                            buffer_len: self.bytes.len(),
+                        });
                     }
+                };
+                let len = match usize::try_from(record.byte_length) {
+                    Ok(l) => l,
+                    Err(_) => {
+                        return Err(OwnershipError::SliceOutOfBounds {
+                            offset: record.byte_offset,
+                            length: record.byte_length,
+                            buffer_len: self.bytes.len(),
+                        });
+                    }
+                };
+                let end = match start.checked_add(len) {
+                    Some(e) => e,
+                    None => {
+                        return Err(OwnershipError::SliceOutOfBounds {
+                            offset: record.byte_offset,
+                            length: record.byte_length,
+                            buffer_len: self.bytes.len(),
+                        });
+                    }
+                };
+                let existing = self.bytes.get(start..end).ok_or(OwnershipError::SliceOutOfBounds {
+                    offset: record.byte_offset,
+                    length: record.byte_length,
+                    buffer_len: self.bytes.len(),
+                })?;
+
+                if record.epoch == epoch && record.byte_length == byte_len && existing == slice_bytes {
+                    return Ok(*record);
                 }
                 return Err(OwnershipError::ImmutableSnapshotViolation {
                     version,
-                    detail: "conflicting byte content provided for existing immutable version",
+                    detail: "conflicting metadata or byte content provided for existing immutable version",
                 });
             }
         }
 
         let current_len = self.bytes.len() as u64;
         let aligned_offset = align_up(current_len, self.alignment)?;
-        let padding = (aligned_offset - current_len) as usize;
+        let slice_end = aligned_offset
+            .checked_add(byte_len)
+            .ok_or(OwnershipError::VersionOverflow {
+                current: aligned_offset,
+            })?;
 
+        // Ensure the end offset and the subsequent aligned offset do not overflow u64
+        let _next_aligned = align_up(slice_end, self.alignment).map_err(|_| {
+            OwnershipError::VersionOverflow {
+                current: aligned_offset,
+            }
+        })?;
+
+        let _ = usize::try_from(slice_end).map_err(|_| OwnershipError::InvalidSliceLength {
+            length: slice_end,
+        })?;
+
+        let padding = (aligned_offset - current_len) as usize;
         self.bytes.resize(self.bytes.len() + padding, 0);
         let byte_offset = self.bytes.len() as u64;
         self.bytes.extend_from_slice(slice_bytes);
 
-        let slice_id = self.records.len() as u32;
+        let slice_id = u32::try_from(self.records.len()).map_err(|_| {
+            OwnershipError::VersionOverflow {
+                current: self.records.len() as u64,
+            }
+        })?;
+
         let record = UseRecord::new(
             handle,
             version,
             epoch,
+            self.store_id,
+            self.generation,
             slice_id,
             byte_offset,
-            slice_bytes.len() as u64,
+            byte_len,
         );
         self.records.push(record);
         Ok(record)
     }
 
     /// Look up an immutable slice by its [`UseRecord`].
+    ///
+    /// Strictly verifies store instance ID, allocation generation, and stored record equality
+    /// to prevent reading recycled slices (ABA) or trusting foreign/tampered records.
+    /// Slices bytes with checked index calculations without panics.
     pub fn get_slice(&self, record: &UseRecord<D>) -> Result<&[u8], OwnershipError> {
-        let start = record.byte_offset as usize;
-        let end = start + record.byte_length as usize;
-        self.bytes
-            .get(start..end)
+        if record.store_id != self.store_id {
+            return Err(OwnershipError::ForeignSliceRecord {
+                expected_store: self.store_id,
+                actual_store: record.store_id,
+            });
+        }
+        if record.generation != self.generation {
+            return Err(OwnershipError::StaleSliceRecord {
+                expected_generation: self.generation,
+                actual_generation: record.generation,
+                slice_id: record.slice_id,
+            });
+        }
+
+        let stored = self
+            .records
+            .get(record.slice_id as usize)
             .ok_or(OwnershipError::SliceNotFound {
                 slice_id: record.slice_id,
-            })
+            })?;
+
+        if stored != record {
+            return Err(OwnershipError::SliceIdentityMismatch {
+                slice_id: record.slice_id,
+            });
+        }
+
+        let start = usize::try_from(record.byte_offset).map_err(|_| {
+            OwnershipError::SliceOutOfBounds {
+                offset: record.byte_offset,
+                length: record.byte_length,
+                buffer_len: self.bytes.len(),
+            }
+        })?;
+        let len = usize::try_from(record.byte_length).map_err(|_| {
+            OwnershipError::SliceOutOfBounds {
+                offset: record.byte_offset,
+                length: record.byte_length,
+                buffer_len: self.bytes.len(),
+            }
+        })?;
+        let end = start
+            .checked_add(len)
+            .ok_or(OwnershipError::SliceOutOfBounds {
+                offset: record.byte_offset,
+                length: record.byte_length,
+                buffer_len: self.bytes.len(),
+            })?;
+
+        if end > self.bytes.len() {
+            return Err(OwnershipError::SliceOutOfBounds {
+                offset: record.byte_offset,
+                length: record.byte_length,
+                buffer_len: self.bytes.len(),
+            });
+        }
+
+        Ok(&self.bytes[start..end])
     }
 
     /// Look up an immutable slice and record by `slice_id`.
@@ -934,9 +1339,17 @@ impl<D: Domain> PerUseByteBuffer<D> {
         self.bytes.len()
     }
 
-    /// Reset the buffer for a subsequent submission cycle or frame.
-    pub fn reset(&mut self) {
+    /// Reset the buffer for a subsequent submission cycle or frame, advancing the allocation generation
+    /// to invalidate old [`UseRecord`] handles (ABA prevention).
+    pub fn reset(&mut self) -> Result<u64, OwnershipError> {
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .ok_or(OwnershipError::VersionOverflow {
+                current: self.generation,
+            })?;
         self.records.clear();
         self.bytes.clear();
+        Ok(self.generation)
     }
 }

@@ -465,10 +465,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "f3d-graph"
+version = "0.1.0"
+dependencies = [
+ "f3d-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "f3d-math"
+version = "0.1.0"
+dependencies = [
+ "f3d-core",
+ "serde",
+]
+
+[[package]]
 name = "f3d-runtime"
 version = "0.1.0"
 dependencies = [
  "asupersync",
+ "f3d-core",
+ "f3d-graph",
  "js-sys",
  "wasm-bindgen",
  "wasm-bindgen-futures",

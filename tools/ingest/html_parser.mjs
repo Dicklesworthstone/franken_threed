@@ -2,17 +2,45 @@
  * HTML entry point parser.
  * Extracts import maps, inline and external <script type="module"> elements,
  * and <link rel="modulepreload"> hints while preserving source line offsets.
+ *
+ * Robustly ignores HTML comments (<!-- ... -->) without altering line/col numbers,
+ * handles whitespace around attribute '=' signs, unquoted attribute values,
+ * and ignores prefixed attributes like data-type / data-src.
  */
 
 import { IngestionParseError } from './types.mjs';
 
 /**
- * @typedef {Object} ImportMapEntry
- * @property {Record<string, string>} imports
- * @property {Record<string, Record<string, string>>} [scopes]
- * @property {number} startLine
- * @property {number} startColumn
+ * Strips HTML comments while preserving characters and newlines
+ * so that line numbers, column numbers, and byte offsets remain exact.
+ * @param {string} html
+ * @returns {string}
  */
+export function stripHtmlComments(html) {
+  return html.replace(/<!--([\s\S]*?)-->/g, (match) => {
+    return match.replace(/[^\r\n]/g, ' ');
+  });
+}
+
+/**
+ * Robustly parses HTML tag attributes into a lowercase key-value dictionary.
+ * Supports quoted and unquoted values, whitespace around '=', and exact attribute names.
+ * @param {string} attrString
+ * @returns {Record<string, string>}
+ */
+export function parseTagAttributes(attrString) {
+  const attrs = Object.create(null);
+  const attrRegex = /(?:^|\s+)([a-zA-Z0-9_:-]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
+  let match;
+  while ((match = attrRegex.exec(attrString)) !== null) {
+    const name = match[1].toLowerCase();
+    const val = match[2] !== undefined
+      ? match[2]
+      : (match[3] !== undefined ? match[3] : (match[4] !== undefined ? match[4] : ''));
+    attrs[name] = val;
+  }
+  return attrs;
+}
 
 /**
  * @typedef {Object} ModuleScriptEntry
@@ -26,11 +54,11 @@ import { IngestionParseError } from './types.mjs';
 
 /**
  * Parse an HTML document and extract module scripts and import maps.
- * @param {string} htmlContent
+ * @param {string} rawHtmlContent
  * @param {string} documentUrl - Canonical URL of the HTML document
- * @returns {{ importMap: { imports: Record<string, string>, scopes: Record<string, Record<string, string>> }, moduleScripts: ModuleScriptEntry[], preloads: string[] }}
+ * @returns {{ importMap: { imports: Record<string, string | null>, scopes: Record<string, Record<string, string | null>> }, moduleScripts: ModuleScriptEntry[], preloads: string[] }}
  */
-export function parseHtmlEntries(htmlContent, documentUrl) {
+export function parseHtmlEntries(rawHtmlContent, documentUrl) {
   const importMap = {
     imports: {},
     scopes: {}
@@ -40,14 +68,16 @@ export function parseHtmlEntries(htmlContent, documentUrl) {
   /** @type {string[]} */
   const preloads = [];
 
+  // Strip comments while preserving layout coordinates
+  const sanitizedHtml = stripHtmlComments(rawHtmlContent);
+
   // Match <link rel="modulepreload" ...>
-  const linkRegex = /<link\s+[^>]*rel=["']?modulepreload["']?[^>]*>/gi;
+  const linkRegex = /<link\b([^>]*)>/gi;
   let linkMatch;
-  while ((linkMatch = linkRegex.exec(htmlContent)) !== null) {
-    const tag = linkMatch[0];
-    const hrefMatch = /href=["']([^"']+)["']/i.exec(tag);
-    if (hrefMatch) {
-      preloads.push(hrefMatch[1]);
+  while ((linkMatch = linkRegex.exec(sanitizedHtml)) !== null) {
+    const attrs = parseTagAttributes(linkMatch[1]);
+    if (attrs.rel && attrs.rel.toLowerCase() === 'modulepreload' && attrs.href) {
+      preloads.push(attrs.href);
     }
   }
 
@@ -56,19 +86,18 @@ export function parseHtmlEntries(htmlContent, documentUrl) {
   let scriptMatch;
   let inlineModuleIndex = 0;
 
-  while ((scriptMatch = scriptRegex.exec(htmlContent)) !== null) {
+  while ((scriptMatch = scriptRegex.exec(sanitizedHtml)) !== null) {
     const fullTag = scriptMatch[0];
     const attrString = scriptMatch[1];
     const scriptBody = scriptMatch[2];
     const matchOffset = scriptMatch.index;
 
-    // Determine type
-    const typeMatch = /type=["']?([^"'\s>]+)["']?/i.exec(attrString);
-    const scriptType = typeMatch ? typeMatch[1].toLowerCase() : 'text/javascript';
+    const attrs = parseTagAttributes(attrString);
+    const scriptType = (attrs.type || 'text/javascript').toLowerCase();
 
     // Calculate line and column of script body start
     const openingTagEndIndex = matchOffset + fullTag.indexOf('>') + 1;
-    const prefixBeforeBody = htmlContent.slice(0, openingTagEndIndex);
+    const prefixBeforeBody = rawHtmlContent.slice(0, openingTagEndIndex);
     const lines = prefixBeforeBody.split('\n');
     const startLine = lines.length;
     const startColumn = lines[lines.length - 1].length + 1;
@@ -90,9 +119,8 @@ export function parseHtmlEntries(htmlContent, documentUrl) {
         );
       }
     } else if (scriptType === 'module') {
-      const srcMatch = /src=["']([^"']+)["']/i.exec(attrString);
-      if (srcMatch) {
-        const externalSrc = srcMatch[1];
+      if (attrs.src) {
+        const externalSrc = attrs.src;
         moduleScripts.push({
           id: new URL(externalSrc, documentUrl).href,
           src: externalSrc,

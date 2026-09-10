@@ -1,7 +1,8 @@
 /**
  * AST Analyzer for ES Modules.
  * Uses pinned Acorn (8.14.0) to extract imports, exports, dynamic imports,
- * live bindings, classes, prototype writes, and asset patterns with source spans.
+ * live bindings, classes, prototype writes, asset patterns, and renderer
+ * routing facts with precise source spans.
  */
 
 import * as acorn from 'acorn';
@@ -123,6 +124,11 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
   const assetReferences = [];
   const classDeclarations = [];
   const prototypeWrites = [];
+  const rendererConstructionSites = [];
+  const escapes = [];
+  let hasNativeContextAccess = false;
+  let hasOpaqueGLEscapes = false;
+  let hasUnresolvedContextAccess = false;
 
   // Track declarations and mutations for live bindings analysis
   const topLevelDeclarations = new Map(); // name -> kind ('const' | 'let' | 'var' | 'function' | 'class')
@@ -276,6 +282,7 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
   // 2. Mutations to top-level identifiers (AssignmentExpression, UpdateExpression)
   // 3. Classes and prototype writes
   // 4. new URL(..., import.meta.url) asset patterns
+  // 5. Renderer construction sites and WebGL escapes
   walk.simple(ast, {
     ImportExpression(node) {
       const { classification, specifier } = classifyDynamicImportArgument(node.source);
@@ -341,6 +348,7 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
     },
 
     NewExpression(node) {
+      // 1. Check for URL asset references: new URL('...', import.meta.url)
       if (
         node.callee &&
         node.callee.type === 'Identifier' &&
@@ -364,6 +372,123 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
           });
         }
       }
+
+      // 2. Check for Renderer construction: new THREE.WebGLRenderer, new WebGPURenderer, etc.
+      let constructorName = null;
+      if (node.callee.type === 'Identifier') {
+        constructorName = node.callee.name;
+      } else if (node.callee.type === 'MemberExpression' && node.callee.property.type === 'Identifier') {
+        constructorName = node.callee.property.name;
+      }
+
+      if (['WebGLRenderer', 'WebGPURenderer', 'CSS2DRenderer', 'CSS3DRenderer', 'SVGRenderer'].includes(constructorName)) {
+        let forceWebGL = false;
+        let forceWebGLUnresolved = false;
+        let canvasOption = null;
+
+        if (node.arguments.length > 0 && node.arguments[0].type === 'ObjectExpression') {
+          for (const prop of node.arguments[0].properties) {
+            if (prop.type === 'Property') {
+              const propKey = prop.key.name || prop.key.value;
+              if (propKey === 'forceWebGL') {
+                if (prop.value.type === 'Literal') {
+                  forceWebGL = Boolean(prop.value.value);
+                  forceWebGLUnresolved = false;
+                } else {
+                  // Non-literal value (variable, template, expression like !api.webgpu):
+                  // Must be classified as unresolved, not false
+                  forceWebGL = 'unresolved';
+                  forceWebGLUnresolved = true;
+                }
+              } else if (propKey === 'canvas') {
+                if (prop.value.type === 'Literal') canvasOption = String(prop.value.value);
+                else if (prop.value.type === 'Identifier') canvasOption = prop.value.name;
+              }
+            }
+          }
+        }
+
+        const span = toSourceSpan(node, offsets);
+        rendererConstructionSites.push({
+          constructor_name: constructorName,
+          constructorName,
+          force_webgl: forceWebGL,
+          forceWebGL,
+          has_force_webgl: forceWebGL,
+          hasForceWebGL: forceWebGL,
+          force_webgl_unresolved: forceWebGLUnresolved,
+          forceWebGLUnresolved,
+          canvas_option: canvasOption,
+          canvasOption,
+          source_span: span,
+          sourceSpan: span
+        });
+      }
+    },
+
+    CallExpression(node) {
+      // Check for native context access: e.g. canvas.getContext('webgl' | 'webgl2')
+      if (
+        node.callee.type === 'MemberExpression' &&
+        node.callee.property.type === 'Identifier' &&
+        node.callee.property.name === 'getContext'
+      ) {
+        const arg = node.arguments[0];
+        const span = toSourceSpan(node, offsets);
+        const isLiteralString = arg && arg.type === 'Literal' && typeof arg.value === 'string';
+
+        if (!isLiteralString) {
+          // getContext with a non-literal argument (variable, template literal, expression, or missing)
+          // MUST be classified as unresolved native-context access with a source span, never as non-native (Plan §3.3, §5.1)
+          hasNativeContextAccess = true;
+          hasUnresolvedContextAccess = true;
+          escapes.push({
+            type: 'unresolved_native_context_access',
+            classification: 'nonliteral',
+            unresolved: true,
+            source_span: span,
+            sourceSpan: span
+          });
+        } else {
+          const ctxType = arg.value;
+          if (ctxType === '2d' || ctxType === 'bitmaprenderer') {
+            // Explicitly non-native 2D canvas context: ignore
+          } else {
+            hasNativeContextAccess = true;
+            if (ctxType.includes('webgl')) {
+              hasOpaqueGLEscapes = true;
+              escapes.push({
+                type: 'webgl_context_acquisition',
+                context_type: ctxType,
+                contextType: ctxType,
+                source_span: span,
+                sourceSpan: span
+              });
+            } else {
+              escapes.push({
+                type: 'native_context_acquisition',
+                context_type: ctxType,
+                contextType: ctxType,
+                source_span: span,
+                sourceSpan: span
+              });
+            }
+          }
+        }
+      }
+
+      // Check for direct WebGL method calls / extension queries
+      if (node.callee.type === 'MemberExpression' && node.callee.property.type === 'Identifier') {
+        const propName = node.callee.property.name;
+        if (['getExtension', 'getParameter', 'createBuffer', 'bindBuffer', 'createTexture', 'bindTexture'].includes(propName)) {
+          hasOpaqueGLEscapes = true;
+          escapes.push({
+            type: 'opaque_gl_method_call',
+            method: propName,
+            source_span: toSourceSpan(node, offsets)
+          });
+        }
+      }
     }
   });
 
@@ -378,6 +503,18 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
     }
   }
 
+  const routingFacts = {
+    has_opaque_gl_escapes: hasOpaqueGLEscapes,
+    has_native_context_access: hasNativeContextAccess,
+    has_unresolved_context_access: hasUnresolvedContextAccess,
+    hasOpaqueGLEscapes,
+    hasNativeContextAccess,
+    hasUnresolvedContextAccess,
+    renderer_construction_sites: rendererConstructionSites,
+    rendererConstructionSites,
+    escapes
+  };
+
   return {
     staticImports,
     staticExports,
@@ -385,6 +522,10 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
     assetReferences,
     classDeclarations,
     prototypeWrites,
+    rendererConstructionSites,
+    renderer_construction_sites: rendererConstructionSites,
+    routingFacts,
+    routing_facts: routingFacts,
     hasTopLevelSideEffects,
     hasLiveBindings: mutableExportedBindings.length > 0,
     mutableExportedBindings

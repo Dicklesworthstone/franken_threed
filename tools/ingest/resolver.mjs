@@ -2,6 +2,10 @@
  * Module Specifier Resolver.
  * Implements W3C Import Map resolution, relative URL resolution,
  * package exports fallback for Three.js r186, and canonical URL identity.
+ *
+ * Preserves URL queries (?query) and fragments (#hash) for module instance identity.
+ * Strictly respects W3C null mappings (blocked imports) and trailing slash prefix contracts.
+ * Supports explicit absolute file://, http://, and https:// URLs.
  */
 
 import fs from 'node:fs';
@@ -20,12 +24,45 @@ export function getBaseUrl(url) {
 }
 
 /**
+ * Extracts the physical file system path from a file:// URL, stripping query and fragment.
+ * @param {string} url
+ * @returns {string}
+ */
+export function urlToFilePath(url) {
+  const parsed = new URL(url);
+  if (parsed.protocol !== 'file:') {
+    throw new Error(`Cannot convert non-file URL "${url}" to a file system path`);
+  }
+  return fileURLToPath(new URL(parsed.pathname, 'file:///'));
+}
+
+/**
+ * Checks if a string is a valid absolute URL with an admitted scheme.
+ * @param {string} specifier
+ * @returns {boolean}
+ */
+export function isAbsoluteUrl(specifier) {
+  try {
+    const parsed = new URL(specifier);
+    return ['file:', 'http:', 'https:', 'data:'].includes(parsed.protocol);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Matches an import map given specifier and referrer.
+ * Returns:
+ * - string: resolved target URL
+ * - null: no match
+ * - { blocked: true }: explicitly mapped to null (blocked import)
+ * - { error: string }: invalid prefix contract
+ *
  * @param {string} specifier
  * @param {string} referrerUrl
- * @param {{ imports?: Record<string, string>, scopes?: Record<string, Record<string, string>> }} importMap
+ * @param {{ imports?: Record<string, string | null>, scopes?: Record<string, Record<string, string | null>> }} importMap
  * @param {string} mapBaseUrl
- * @returns {string | null}
+ * @returns {string | { blocked: true } | { error: string } | null}
  */
 function matchImportMap(specifier, referrerUrl, importMap, mapBaseUrl) {
   if (!importMap) return null;
@@ -38,7 +75,7 @@ function matchImportMap(specifier, referrerUrl, importMap, mapBaseUrl) {
       if (referrerUrl.startsWith(scopeBase) || referrerUrl.startsWith(scopePrefix)) {
         const scopeImports = importMap.scopes[scopePrefix];
         const match = matchMapEntries(specifier, scopeImports, mapBaseUrl);
-        if (match) return match;
+        if (match !== null) return match;
       }
     }
   }
@@ -53,14 +90,17 @@ function matchImportMap(specifier, referrerUrl, importMap, mapBaseUrl) {
 
 /**
  * @param {string} specifier
- * @param {Record<string, string>} entries
+ * @param {Record<string, string | null>} entries
  * @param {string} mapBaseUrl
- * @returns {string | null}
+ * @returns {string | { blocked: true } | { error: string } | null}
  */
 function matchMapEntries(specifier, entries, mapBaseUrl) {
   // Exact match
   if (Object.prototype.hasOwnProperty.call(entries, specifier)) {
     const target = entries[specifier];
+    if (target === null) {
+      return { blocked: true };
+    }
     return new URL(target, mapBaseUrl).href;
   }
 
@@ -69,6 +109,14 @@ function matchMapEntries(specifier, entries, mapBaseUrl) {
   for (const prefix of prefixKeys) {
     if (specifier.startsWith(prefix)) {
       const targetPrefix = entries[prefix];
+      if (targetPrefix === null) {
+        return { blocked: true };
+      }
+      if (typeof targetPrefix !== 'string' || !targetPrefix.endsWith('/')) {
+        return {
+          error: `Invalid import map prefix mapping: target for prefix "${prefix}" must end with "/" (got "${targetPrefix}")`
+        };
+      }
       const remainder = specifier.slice(prefix.length);
       const combined = targetPrefix + remainder;
       return new URL(combined, mapBaseUrl).href;
@@ -80,13 +128,15 @@ function matchMapEntries(specifier, entries, mapBaseUrl) {
 
 /**
  * Resolves a module specifier against a referrer and import map.
- * Preserves canonical URL identity and ensures the target file exists.
+ * Preserves canonical URL identity (including query and fragment)
+ * and ensures the target file exists.
  *
  * @param {string} specifier - Import specifier string
  * @param {string} referrerUrl - Canonical URL of importing module
- * @param {{ imports?: Record<string, string>, scopes?: Record<string, Record<string, string>> }} [importMap]
+ * @param {{ imports?: Record<string, string | null>, scopes?: Record<string, Record<string, string | null>> }} [importMap]
  * @param {Object} [options]
  * @param {string} [options.packageRootUrl] - Base URL for Three.js package fallback
+ * @param {string} [options.mapBaseUrl] - Base URL for import map resolution
  * @param {{ line: number, column: number, offset: number } | null} [options.span]
  * @returns {string} - Canonical resolved file URL
  */
@@ -100,9 +150,28 @@ export function resolveModuleSpecifier(specifier, referrerUrl, importMap = {}, o
   // 1. Try import map
   const mapped = matchImportMap(specifier, referrerUrl, importMap, mapBaseUrl);
   if (mapped) {
+    if (typeof mapped === 'object' && mapped.blocked) {
+      throw new IngestionResolutionError(
+        `Cannot resolve blocked import specifier "${specifier}" from "${referrerUrl}": mapped to null in import map`,
+        specifier,
+        referrerUrl,
+        span
+      );
+    }
+    if (typeof mapped === 'object' && mapped.error) {
+      throw new IngestionResolutionError(
+        mapped.error,
+        specifier,
+        referrerUrl,
+        span
+      );
+    }
     candidateUrl = mapped;
+  } else if (isAbsoluteUrl(specifier)) {
+    // 2. Explicit absolute URL (file://, http://, https://, data:)
+    candidateUrl = specifier;
   } else if (specifier.startsWith('./') || specifier.startsWith('../') || specifier.startsWith('/')) {
-    // 2. Relative or absolute URL specifier
+    // 3. Relative or pathname specifier
     try {
       candidateUrl = new URL(specifier, referrerBase).href;
     } catch (err) {
@@ -114,7 +183,7 @@ export function resolveModuleSpecifier(specifier, referrerUrl, importMap = {}, o
       );
     }
   } else {
-    // 3. Fallback resolution for pinned Three.js package
+    // 4. Fallback resolution for pinned Three.js package
     const pkgRoot = options.packageRootUrl || pathToFileURL(path.resolve('upstream/three.js/')).href + '/';
     if (specifier === 'three') {
       candidateUrl = new URL('build/three.module.js', pkgRoot).href;
@@ -138,11 +207,11 @@ export function resolveModuleSpecifier(specifier, referrerUrl, importMap = {}, o
     }
   }
 
-  // 4. Verify target exists if file: URL
+  // 5. Verify target exists if file: URL
   if (candidateUrl.startsWith('file://')) {
     let filePath;
     try {
-      filePath = fileURLToPath(candidateUrl);
+      filePath = urlToFilePath(candidateUrl);
     } catch (err) {
       throw new IngestionResolutionError(
         `Invalid file URL "${candidateUrl}" for specifier "${specifier}": ${err.message}`,
@@ -161,13 +230,8 @@ export function resolveModuleSpecifier(specifier, referrerUrl, importMap = {}, o
       );
     }
 
-    // Canonicalize file path (resolve symlinks / casing)
-    try {
-      const realPath = fs.realpathSync(filePath);
-      return pathToFileURL(realPath).href;
-    } catch (err) {
-      return candidateUrl;
-    }
+    // Preserve normalized URL identity (including query and fragment)
+    return new URL(candidateUrl).href;
   }
 
   return candidateUrl;

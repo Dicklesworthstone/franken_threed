@@ -29,6 +29,8 @@ export const EscapeReason = Object.freeze({
   HOST_LIMITATION_FALLBACK: 'host-limitation-fallback',
   CONNECTED_GROUP_CONSTRAINT: 'connected-group-constraint',
   SPECIALIZATION_UNAVAILABLE: 'specialization-unavailable',
+  UNRESOLVED_FORCE_WEBGL: 'unresolved-force-webgl',
+  UNRESOLVED_NATIVE_CONTEXT_ACCESS: 'unresolved-native-context-access',
 });
 
 /**

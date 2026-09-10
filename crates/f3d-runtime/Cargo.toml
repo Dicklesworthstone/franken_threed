@@ -30,6 +30,8 @@ browser = [
 # stale /data/dp checkout. RCH syncs this exact physical path. Replace with an immutable pin
 # once upstream is ready.
 asupersync = { path = "/Users/jemanuel/dp/asupersync", default-features = false }
+f3d-core = { workspace = true, features = ["std"] }
+f3d-graph = { workspace = true, features = ["std"] }
 wasm-bindgen = { version = "=0.2.126", optional = true }
 js-sys = { version = "=0.3.103", optional = true }
 wasm-bindgen-futures = { version = "=0.4.76", optional = true }

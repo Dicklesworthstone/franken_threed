@@ -232,16 +232,17 @@ fn negative_dynamic_uniform_alignment_256_is_not_storage_stride_48() {
     assert!(validate_dynamic_uniform_offset(256, min_uniform_alignment).is_ok());
     assert!(validate_dynamic_uniform_offset(512, min_uniform_alignment).is_ok());
 
-    // Storage array stride validation: 48 is a valid storage stride (multiple of 16 and >= 48)
-    assert!(validate_storage_array_stride(48, 48).is_ok());
+    // Storage array stride validation: 48 is a valid storage stride for 16-byte aligned AffineRows
+    assert!(validate_storage_array_stride(48, 48, 16).is_ok());
+    assert!(validate_composite_storage_array_stride(48, 48).is_ok());
     // Stride smaller than element size is rejected
     assert_eq!(
-        validate_storage_array_stride(32, 48),
+        validate_storage_array_stride(32, 48, 16),
         Err(LayoutError::BufferTooSmall { required: 48, provided: 32 })
     );
     // Stride not aligned to 16 bytes is rejected
     assert_eq!(
-        validate_storage_array_stride(50, 48),
+        validate_storage_array_stride(50, 48, 16),
         Err(LayoutError::UnalignedOffset { offset: 50, required_alignment: 16 })
     );
 }
@@ -361,3 +362,216 @@ fn generated_wgsl_contains_affine_declarations_for_bridge() {
     assert!(wgsl.contains("fn affine_to_mat4x4(m: AffineRows) -> mat4x4<f32>"));
     assert!(wgsl.contains("struct ProjectiveMat4 {"));
 }
+
+#[test]
+fn regression_exact_structural_affine_preserves_small_projective_terms() {
+    // Regression for root review defect:
+    // Any epsilon check (e.g. 1e-6) illegally discards small perspective terms.
+    // Analytical counterexample:
+    // Let e[3] = 5e-7, and point x = 1e7, y = 0, z = 0, w = 1.
+    // Homogeneous w' = e[3]*x + e[7]*y + e[11]*z + e[15]*w
+    //               = (5e-7 * 1e7) + 0 + 0 + 1 = 5.0 + 1.0 = 6.0 != 1.0.
+    // Perspective divide yields x'/w' = 1e7 / 6.0 approx 1.666667e6.
+    // Silently discarding e[3] as "zero" yields w' = 1.0 and x'/w' = 1e7 (a 6x geometric error!).
+    let elements = [
+        1.0f32, 0.0, 0.0, 5e-7,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    ];
+
+    // Must fail exact structural check
+    assert!(!is_matrix4_affine(&elements));
+    let err = AffineRows::from_column_major(&elements).expect_err("must reject small perspective term");
+    assert_eq!(err, LayoutError::NonAffineMatrix);
+
+    // Must be retained as ProjectiveMat4
+    let proj = ProjectiveMat4::from_elements(elements);
+    assert!(!proj.is_affine());
+    let h = proj.transform_homogeneous([1e7, 0.0, 0.0, 1.0]);
+    assert_eq!(h[3], 6.0);
+    assert_eq!(h[0], 1e7);
+
+    // Subnormal perspective component (e.g. 1e-40 or f32::from_bits(1))
+    let mut subnormal_elements = [
+        1.0f32, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    ];
+    subnormal_elements[7] = f32::from_bits(1); // smallest positive subnormal f32
+    assert!(!is_matrix4_affine(&subnormal_elements));
+    assert_eq!(
+        AffineRows::from_column_major(&subnormal_elements),
+        Err(LayoutError::NonAffineMatrix)
+    );
+
+    // Near-1 e15 values: e15 must be exactly 1.0
+    let near_one_high = [
+        1.0f32, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0 + 1e-7,
+    ];
+    assert!(!is_matrix4_affine(&near_one_high));
+    assert_eq!(
+        AffineRows::from_column_major(&near_one_high),
+        Err(LayoutError::NonAffineMatrix)
+    );
+
+    let near_one_low = [
+        1.0f32, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 0.9999999,
+    ];
+    assert!(!is_matrix4_affine(&near_one_low));
+    assert_eq!(
+        AffineRows::from_column_major(&near_one_low),
+        Err(LayoutError::NonAffineMatrix)
+    );
+}
+
+#[test]
+fn regression_f64_source_eligibility_before_narrowing() {
+    // In f64, small perspective terms must be verified BEFORE narrowing to f32.
+    // If a term is non-zero in f64, narrowing or treating as affine would illegally drop it.
+    let f64_elements_with_perspective = [
+        1.0f64, 0.0, 0.0, 1e-15,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    ];
+    assert!(!is_matrix4_f64_affine(&f64_elements_with_perspective));
+    assert_eq!(
+        AffineRows::from_column_major_f64(&f64_elements_with_perspective),
+        Err(LayoutError::NonAffineMatrix)
+    );
+
+    // Valid f64 affine matrix transforms accurately when converted
+    let f64_affine = [
+        2.0f64, 0.0, 0.0, 0.0,
+        0.0, 3.0, 0.0, 0.0,
+        0.0, 0.0, 4.0, 0.0,
+        10.0, 20.0, 30.0, 1.0,
+    ];
+    assert!(is_matrix4_f64_affine(&f64_affine));
+    let affine = AffineRows::from_column_major_f64(&f64_affine).expect("valid f64 affine");
+    assert_eq!(affine.r0, [2.0, 0.0, 0.0, 10.0]);
+    assert_eq!(affine.r1, [0.0, 3.0, 0.0, 20.0]);
+    assert_eq!(affine.r2, [0.0, 0.0, 4.0, 30.0]);
+
+    // Retained ProjectiveMat4 from f64 elements
+    let proj = ProjectiveMat4::from_elements_f64(&f64_elements_with_perspective);
+    assert_eq!(proj.elements[0], 1.0f32);
+}
+
+#[test]
+fn storage_array_stride_lawful_scalar_vec2_and_composite() {
+    // Lawful scalar storage array: f32 (size 4, alignment 4)
+    assert!(validate_storage_array_stride(4, 4, 4).is_ok());
+    assert!(validate_storage_array_stride(8, 4, 4).is_ok());
+    assert!(validate_storage_array_stride(16, 4, 4).is_ok());
+    assert_eq!(
+        validate_storage_array_stride(2, 4, 4),
+        Err(LayoutError::BufferTooSmall { required: 4, provided: 2 })
+    );
+    assert_eq!(
+        validate_storage_array_stride(6, 4, 4),
+        Err(LayoutError::UnalignedOffset { offset: 6, required_alignment: 4 })
+    );
+
+    // Lawful vec2<f32> storage array: (size 8, alignment 8)
+    assert!(validate_storage_array_stride(8, 8, 8).is_ok());
+    assert!(validate_storage_array_stride(16, 8, 8).is_ok());
+    assert!(validate_storage_array_stride(24, 8, 8).is_ok());
+    assert_eq!(
+        validate_storage_array_stride(4, 8, 8),
+        Err(LayoutError::BufferTooSmall { required: 8, provided: 4 })
+    );
+    assert_eq!(
+        validate_storage_array_stride(12, 8, 8),
+        Err(LayoutError::UnalignedOffset { offset: 12, required_alignment: 8 })
+    );
+
+    // Composite 16-byte aligned record: AffineRows (size 48, alignment 16)
+    assert!(validate_storage_array_stride(48, 48, 16).is_ok());
+    assert!(validate_storage_array_stride(64, 48, 16).is_ok());
+    assert!(validate_composite_storage_array_stride(48, 48).is_ok());
+    assert!(validate_composite_storage_array_stride(64, 48).is_ok());
+    assert_eq!(
+        validate_composite_storage_array_stride(50, 48),
+        Err(LayoutError::UnalignedOffset { offset: 50, required_alignment: 16 })
+    );
+}
+
+#[test]
+fn aligned_bytes_per_row_regression_tests() {
+    // Regression for root 5571 item 5:
+    // Readback row pitch for width 32 (128 bytes) must become 256 bytes per WebGPU COPY_BYTES_PER_ROW_ALIGNMENT.
+    assert_eq!(aligned_bytes_per_row(32), Ok(256));
+
+    // Naturally aligned width 64 (256 bytes) stays 256
+    assert_eq!(aligned_bytes_per_row(64), Ok(256));
+
+    // Width 65: 65 * 4 = 260 bytes -> rounded up to 512 bytes
+    assert_eq!(aligned_bytes_per_row(65), Ok(512));
+
+    // Validated by validate_copy_bytes_per_row
+    assert!(validate_copy_bytes_per_row(aligned_bytes_per_row(32).unwrap()).is_ok());
+    assert!(validate_copy_bytes_per_row(aligned_bytes_per_row(65).unwrap()).is_ok());
+
+    // Overflowing width: u32::MAX * 4 overflows u32
+    assert_eq!(aligned_bytes_per_row(u32::MAX), Err(LayoutError::CalculationOverflow));
+    assert_eq!(aligned_bytes_per_row(u32::MAX / 4 + 1), Err(LayoutError::CalculationOverflow));
+
+    // Alignment overflow: 1_073_741_823 * 4 = 4294967292, rounding up by 4 overflows u32
+    assert_eq!(aligned_bytes_per_row(1_073_741_823), Err(LayoutError::CalculationOverflow));
+}
+
+#[test]
+fn vertex_pos_uv_and_color_uniform_wire_invariants() {
+    // 1. Color uniform: 16 bytes, 16-byte aligned
+    assert_eq!(COLOR_UNIFORM_BYTES, 16);
+    assert_eq!(COLOR_UNIFORM_ALIGNMENT, 16);
+
+    // 2. VertexPosUv: 20 bytes, 4-byte aligned, stride 20
+    assert_eq!(VERTEX_POS_UV_BYTES, 20);
+    assert_eq!(VERTEX_POS_UV_STRIDE, 20);
+    assert_eq!(VERTEX_POS_UV_ALIGNMENT, 4);
+    assert_eq!(VertexPosUv::BYTE_SIZE, 20);
+    assert_eq!(VertexPosUv::STRIDE, 20);
+
+    // 3. Triangle 3-vertex buffer layout: 3 * 20 = 60 bytes
+    let vertices = [
+        VertexPosUv::new([0.0, 0.5, 0.0], [0.5, 1.0]),
+        VertexPosUv::new([-0.5, -0.5, 0.0], [0.0, 0.0]),
+        VertexPosUv::new([0.5, -0.5, 0.0], [1.0, 0.0]),
+    ];
+
+    let mut vertex_bytes = [0u8; 60];
+    for (i, v) in vertices.iter().enumerate() {
+        v.write_to_slice(&mut vertex_bytes[i * 20..(i + 1) * 20]).expect("write vertex");
+    }
+
+    // Verify first vertex position float bytes at offsets 0, 4, 8 and uv at 12, 16
+    let v0_pos_x = f32::from_le_bytes([vertex_bytes[0], vertex_bytes[1], vertex_bytes[2], vertex_bytes[3]]);
+    let v0_pos_y = f32::from_le_bytes([vertex_bytes[4], vertex_bytes[5], vertex_bytes[6], vertex_bytes[7]]);
+    let v0_uv_u = f32::from_le_bytes([vertex_bytes[12], vertex_bytes[13], vertex_bytes[14], vertex_bytes[15]]);
+    let v0_uv_v = f32::from_le_bytes([vertex_bytes[16], vertex_bytes[17], vertex_bytes[18], vertex_bytes[19]]);
+    assert_eq!(v0_pos_x, 0.0);
+    assert_eq!(v0_pos_y, 0.5);
+    assert_eq!(v0_uv_u, 0.5);
+    assert_eq!(v0_uv_v, 1.0);
+
+    // Verify round-trip deserialization from buffer slice
+    let restored_v0 = VertexPosUv::read_from_slice(&vertex_bytes[0..20]).expect("read vertex 0");
+    assert_eq!(restored_v0, vertices[0]);
+    let restored_v1 = VertexPosUv::read_from_slice(&vertex_bytes[20..40]).expect("read vertex 1");
+    assert_eq!(restored_v1, vertices[1]);
+    let restored_v2 = VertexPosUv::read_from_slice(&vertex_bytes[40..60]).expect("read vertex 2");
+    assert_eq!(restored_v2, vertices[2]);
+}
+
+
+
