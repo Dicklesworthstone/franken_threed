@@ -26,6 +26,7 @@ const expected = [
   'host-turn',
   'reentrancy',
   'burst-first-turn-and-completion',
+  'burst-all-turns',
   'cancellation',
   'drain',
   'fetch-abort',

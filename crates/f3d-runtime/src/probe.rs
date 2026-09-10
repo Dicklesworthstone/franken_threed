@@ -34,6 +34,8 @@ extern "C" {
     fn finish(passed: bool, detail: &str);
     #[wasm_bindgen(js_namespace = f3dHost, js_name = reenter)]
     fn host_reenter() -> bool;
+    #[wasm_bindgen(js_namespace = f3dHost, js_name = turns)]
+    fn host_turns() -> u32;
 }
 
 #[derive(Default)]
@@ -170,6 +172,7 @@ async fn run(handle: RuntimeHandle) -> Result<(), JsValue> {
     )?;
     event("reentrancy", "complete", 1);
 
+    event("burst-first-turn-and-completion", "spawn", 0);
     let burst = handle.spawn_local(SelfWaking { remaining: 10_000 });
     // Two JS microtask observations run before the next browser task. A
     // self-wake must not sneak another pump microtask into that interval.
@@ -181,6 +184,14 @@ async fn run(handle: RuntimeHandle) -> Result<(), JsValue> {
     let total = burst.await.map_err(join_error)?;
     require(total == 10_001, "self-waking future lost a wake or poll")?;
     event("burst-first-turn-and-completion", "complete", total);
+
+    event("burst-all-turns", "spawn", 0);
+    let max_polls_per_pump_turn = HostWait::new(4).await?;
+    require(
+        max_polls_per_pump_turn <= 4,
+        "burst all turns exceeded configured burst limit 4",
+    )?;
+    event("burst-all-turns", "complete", 1);
 
     // 6. Cooperative cancellation probe
     let cancel_cx = handle.request_cx_with_budget(Budget::new());
@@ -392,4 +403,15 @@ pub fn reenter_probe() -> bool {
 #[wasm_bindgen]
 pub fn burst_polls() -> u32 {
     BURST_POLLS.with(Cell::get)
+}
+
+/// Actual number of pump turns executed by the Asupersync single-worker pump.
+#[wasm_bindgen]
+pub fn pump_turns() -> u32 {
+    RUNTIME.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .and_then(Runtime::browser_pump)
+            .map_or(0, |pump| pump.pump_turns())
+    })
 }
