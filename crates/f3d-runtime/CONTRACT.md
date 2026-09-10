@@ -19,8 +19,11 @@ that no pump turn executes more than 4 polls via the Rust per-turn counter keyed
 by upstream `pump_turns`. The JavaScript `ceil-avg-per-pump-turn` value is a ceiling-average
 diagnostic across observer intervals, and archived runs before this change over-claimed
 the maximum polls per pump turn by relying on that average. Cooperative cancellation, region
-drain before teardown, fetch abort, all-turn burst measurement, and unsupported-host detection
-are verified when observed by their respective probe completions and test gates.
+drain before teardown, stale result generation check, fetch abort, all-turn burst measurement,
+and unsupported-host detection are verified when observed by their respective probe completions
+and test gates. The `stale-result` probe is the generation-checked publication prototype at
+probe scope with a probe-local state cell, not scene state, and the late child is run to completion
+by region close and its value is discarded by the generation check, not by dropping the future.
 Unsupported-host detection verifies that removed or missing required host functions
 and globals (`f3dHost.wait`, `f3dHost.event`, `f3dHost.finish`, `f3dHost.reenter`, `f3dHost.turns`,
 `AbortController`, `fetch`, `MessageChannel`, `queueMicrotask`, `setTimeout`) terminate

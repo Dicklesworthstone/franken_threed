@@ -6,9 +6,10 @@ use asupersync::{
     types::{Budget, CancelKind, CancelReason},
 };
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     future::Future,
     pin::Pin,
+    rc::Rc,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU32, Ordering},
@@ -20,6 +21,7 @@ use wasm_bindgen::{JsCast, prelude::*};
 thread_local! {
     static RUNTIME: RefCell<Option<Runtime>> = const { RefCell::new(None) };
     static BURST: RefCell<BurstCounter> = const { RefCell::new(BurstCounter::new()) };
+    static STALE_DISCARDED: Cell<u32> = const { Cell::new(0) };
 }
 
 // Named browser binding boundary. The static shim supplies host callbacks only;
@@ -122,6 +124,25 @@ impl Future for SelfWaking {
         self.remaining -= 1;
         cx.waker().wake_by_ref();
         Poll::Pending
+    }
+}
+
+#[derive(Default)]
+struct PublishedState {
+    generation: u32,
+    value: Option<u32>,
+}
+
+fn publish(state: &RefCell<PublishedState>, generation: u32, value: u32) -> bool {
+    let mut state = state.borrow_mut();
+    if generation != state.generation {
+        STALE_DISCARDED.with(|counter| counter.set(counter.get() + 1));
+        event("stale-result", "discarded-generation-mismatch", generation);
+        false
+    } else {
+        state.value = Some(value);
+        event("stale-result", "published", value);
+        true
     }
 }
 
@@ -278,7 +299,70 @@ async fn run(handle: RuntimeHandle) -> Result<(), JsValue> {
     event("drain", "settled", after);
     event("drain", "complete", at_close);
 
-    // 8. Fetch abort probe
+    // 8. Stale result generation check probe
+    STALE_DISCARDED.with(|counter| counter.set(0));
+    let state = Rc::new(RefCell::new(PublishedState {
+        generation: 1,
+        value: None,
+    }));
+    event("stale-result", "spawn", 1);
+
+    let region_a_cx = handle.request_cx_with_budget(Budget::new());
+    let region_a = region_a_cx
+        .open_child_region(ChildRegionSpec::inherit())
+        .await
+        .map_err(join_error)?;
+
+    let child_a_state = Rc::clone(&state);
+    region_a
+        .cx()
+        .spawn_local(move |_child_cx| async move {
+            let _ = HostWait::new(3).await;
+            let _ = HostWait::new(3).await;
+            publish(&child_a_state, 1, 1);
+        })
+        .map_err(join_error)?;
+
+    state.borrow_mut().generation = 2;
+    event("stale-result", "replaced", 2);
+    region_a
+        .cancel(CancelReason::user("replaced by generation 2"))
+        .map_err(join_error)?;
+    region_a.close().await.map_err(join_error)?;
+
+    require(
+        state.borrow().value.is_none(),
+        "late child published into replaced region",
+    )?;
+
+    let region_b_cx = handle.request_cx_with_budget(Budget::new());
+    let region_b = region_b_cx
+        .open_child_region(ChildRegionSpec::inherit())
+        .await
+        .map_err(join_error)?;
+
+    let child_b_state = Rc::clone(&state);
+    region_b
+        .cx()
+        .spawn_local(move |_child_cx| async move {
+            let _ = HostWait::new(3).await;
+            publish(&child_b_state, 2, 2);
+        })
+        .map_err(join_error)?;
+    region_b.close().await.map_err(join_error)?;
+
+    require(
+        state.borrow().value == Some(2),
+        "replacement region value missing",
+    )?;
+    let discarded_count = STALE_DISCARDED.with(|counter| counter.get());
+    require(
+        discarded_count == 1,
+        "stale result discarded count must be 1",
+    )?;
+    event("stale-result", "complete", discarded_count);
+
+    // 9. Fetch abort probe
     event("fetch-abort", "spawn", 0);
     let fetch_cancel_cx = handle.request_cx_with_budget(Budget::new());
     let task_cx = fetch_cancel_cx.clone();
