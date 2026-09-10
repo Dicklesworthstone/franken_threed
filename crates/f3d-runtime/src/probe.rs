@@ -1,5 +1,5 @@
 //! Real Rust futures driven by Asupersync in one browser Wasm instance.
-use crate::{BrowserHostServices, RuntimeBuilder, burst::BurstCounter};
+use crate::{BrowserHostServices, RuntimeBuilder, burst::BurstCounter, publication::PublishedState};
 use asupersync::{
     cx::ChildRegionSpec,
     runtime::{LocalJoinHandle, PumpDrainOutcome, Runtime, RuntimeHandle},
@@ -129,20 +129,13 @@ impl Future for SelfWaking {
     }
 }
 
-#[derive(Default)]
-struct PublishedState {
-    generation: u32,
-    value: Option<u32>,
-}
-
 fn publish(state: &RefCell<PublishedState>, generation: u32, value: u32) -> bool {
     let mut state = state.borrow_mut();
-    if generation != state.generation {
+    if !state.try_publish(generation, value) {
         STALE_DISCARDED.with(|counter| counter.set(counter.get() + 1));
         event("stale-result", "discarded-generation-mismatch", generation);
         false
     } else {
-        state.value = Some(value);
         event("stale-result", "published", value);
         true
     }
@@ -303,10 +296,7 @@ async fn run(handle: RuntimeHandle) -> Result<(), JsValue> {
 
     // 8. Stale result generation check probe
     STALE_DISCARDED.with(|counter| counter.set(0));
-    let state = Rc::new(RefCell::new(PublishedState {
-        generation: 1,
-        value: None,
-    }));
+    let state = Rc::new(RefCell::new(PublishedState::new(1)));
     event("stale-result", "spawn", 1);
 
     let region_a_cx = handle.request_cx_with_budget(Budget::new());
@@ -325,15 +315,15 @@ async fn run(handle: RuntimeHandle) -> Result<(), JsValue> {
         })
         .map_err(join_error)?;
 
-    state.borrow_mut().generation = 2;
-    event("stale-result", "replaced", 2);
+    let next_gen = state.borrow_mut().replace();
+    event("stale-result", "replaced", next_gen);
     region_a
         .cancel(CancelReason::user("replaced by generation 2"))
         .map_err(join_error)?;
     region_a.close().await.map_err(join_error)?;
 
     require(
-        state.borrow().value.is_none(),
+        state.borrow().value().is_none(),
         "late child published into replaced region",
     )?;
 
@@ -354,7 +344,7 @@ async fn run(handle: RuntimeHandle) -> Result<(), JsValue> {
     region_b.close().await.map_err(join_error)?;
 
     require(
-        state.borrow().value == Some(2),
+        state.borrow().value() == Some(2),
         "replacement region value missing",
     )?;
     let discarded_count = STALE_DISCARDED.with(|counter| counter.get());

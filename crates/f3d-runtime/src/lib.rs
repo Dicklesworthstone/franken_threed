@@ -7,6 +7,7 @@
 pub use asupersync::runtime::{BrowserHostServices, RuntimeBuilder};
 
 pub mod burst;
+pub mod publication;
 
 #[cfg(all(feature = "browser", target_arch = "wasm32"))]
 mod probe;

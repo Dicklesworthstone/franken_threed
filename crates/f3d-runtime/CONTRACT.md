@@ -6,7 +6,9 @@ The static JavaScript fixture supplies timer/MessageChannel callbacks and record
 observations. It does not simulate task completion or implement an executor.
 
 `browser` enables the wasm32 probe exports. Native builds re-export the admitted
-runtime entry points and provide one real-future regression. The Rust code uses
+runtime entry points and provide native unit tests. Native unit tests use manual pump
+stepping as a fake host with controllable delays and establish scheduler ordering
+only, not browser execution. The Rust code uses
 `forbid(unsafe_code)`; wasm-bindgen/js-sys are the named external browser boundary.
 Host callback state releases its RefCell borrow before invoking a waker.
 
