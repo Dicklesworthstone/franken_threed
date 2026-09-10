@@ -19,14 +19,19 @@ that no pump turn executes more than 4 polls via the Rust per-turn counter keyed
 by upstream `pump_turns`. The JavaScript `ceil-avg-per-pump-turn` value is a ceiling-average
 diagnostic across observer intervals, and archived runs before this change over-claimed
 the maximum polls per pump turn by relying on that average. Cooperative cancellation, region
-drain before teardown, stale result generation check, fetch abort, all-turn burst measurement,
-and unsupported-host detection are verified when observed by their respective probe completions
-and test gates. The `stale-result` probe is the generation-checked publication prototype at
-probe scope with a probe-local state cell, not scene state, and the late child is run to completion
-by region close and its value is discarded by the generation check, not by dropping the future.
+drain before teardown, stale result generation check, fetch abort, post-teardown idle state,
+all-turn burst measurement, and unsupported-host detection are verified when observed by
+their respective probe completions and test gates. The `stale-result` probe is the
+generation-checked publication prototype at probe scope with a probe-local state cell, not scene
+state, and the late child is run to completion by region close and its value is discarded by
+the generation check, not by dropping the future. The `idle` probe counts host waits registered
+through `f3dHost.wait` excluding microtask waits and Rust-initiated fetches through the wrapped
+global `fetch`, not the fixture's own event posts; a fetch is counted only until its response promise settles, so a leaked body reader after headers arrive is not detected by this probe. A cancellation check inside a synchronous kernel
+cannot promise that a main-thread cancellation callback runs before the browser regains control,
+so only observed latency is logged, never a guarantee.
 Unsupported-host detection verifies that removed or missing required host functions
 and globals (`f3dHost.wait`, `f3dHost.event`, `f3dHost.finish`, `f3dHost.reenter`, `f3dHost.turns`,
-`AbortController`, `fetch`, `MessageChannel`, `queueMicrotask`, `setTimeout`) terminate
+`f3dHost.inflight`, `AbortController`, `fetch`, `MessageChannel`, `queueMicrotask`, `setTimeout`) terminate
 immediately before building an Asupersync runtime with a defined error within one host turn
 and no hang. This covers missing or deleted globals and host functions, not a hook that
 is present but fails to invoke its callback.

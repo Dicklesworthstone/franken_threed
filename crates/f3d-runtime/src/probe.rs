@@ -38,6 +38,8 @@ extern "C" {
     fn host_reenter() -> bool;
     #[wasm_bindgen(js_namespace = f3dHost, js_name = turns)]
     fn host_turns() -> u32;
+    #[wasm_bindgen(js_namespace = f3dHost, js_name = inflight)]
+    fn host_inflight(kind: u32) -> u32;
 }
 
 #[derive(Default)]
@@ -447,6 +449,30 @@ async fn run(handle: RuntimeHandle) -> Result<(), JsValue> {
     event("fetch-abort", "aborted", bytes_received);
     event("fetch-abort", "complete", 1);
 
+    // 10. Post-teardown idle probe
+    event("idle", "spawn", 0);
+    let _ = HostWait::new(3).await?;
+    let _ = HostWait::new(3).await?;
+    let _ = HostWait::new(3).await?;
+
+    let w = host_inflight(0);
+    let f = host_inflight(1);
+    event("idle", "pending-waits", w);
+    event("idle", "pending-fetches", f);
+    require(w == 0, "leaked host wait after teardown")?;
+    require(f == 0, "leaked fetch after teardown")?;
+
+    let p1 = pump_turns();
+    let _ = HostWait::new(3).await?;
+    let p2 = pump_turns();
+    let quiet_turns = p2.saturating_sub(p1);
+    event("idle", "quiet-window-pump-turns", quiet_turns);
+    require(
+        quiet_turns <= 2,
+        "pump ran without work during quiet window",
+    )?;
+    event("idle", "complete", quiet_turns);
+
     Ok(())
 }
 
@@ -456,6 +482,7 @@ const HOST_CAPABILITIES: &[&str] = &[
     "f3dHost.finish",
     "f3dHost.reenter",
     "f3dHost.turns",
+    "f3dHost.inflight",
     "AbortController",
     "fetch",
     "MessageChannel",

@@ -35,7 +35,7 @@ const expected = [
   'cancellation',
   'drain',
   'fetch-abort',
-  ...(!omit ? ['stale-result', 'unsupported-host'] : []),
+  ...(!omit ? ['stale-result', 'idle', 'unsupported-host'] : []),
 ];
 let browserProcess;
 let startTime = 0;

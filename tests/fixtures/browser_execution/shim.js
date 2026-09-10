@@ -3,6 +3,20 @@
   let wasm;
   let hostTurn = 0;
   let finished = false;
+  let pendingWaits = 0;
+  let pendingFetches = 0;
+  const nativeFetch = (typeof window !== 'undefined' && window.__f3dOmitted && window.__f3dOmitted.name === 'fetch')
+    ? window.__f3dOmitted.value
+    : globalThis.fetch;
+  if (typeof globalThis.fetch === 'function') {
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = function(...args) {
+      pendingFetches++;
+      return origFetch.apply(this, args).finally(() => {
+        pendingFetches--;
+      });
+    };
+  }
   const events = [];
   const pendingStream = [];
   let streamTimer = null;
@@ -10,7 +24,7 @@
     if (streamTimer !== null) { clearTimeout(streamTimer); streamTimer = null; }
     if (pendingStream.length === 0) return;
     const batch = pendingStream.splice(0, pendingStream.length);
-    fetch('/event', { method: 'POST', headers: { 'content-type': 'application/json' },
+    nativeFetch('/event', { method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify(batch) }).catch(() => {});
   }
   const channel = new MessageChannel();
@@ -111,7 +125,10 @@
     observeTurn(1);
     const callback = pending.get(data);
     pending.delete(data);
-    if (callback) callback(++hostTurn);
+    if (callback) {
+      pendingWaits--;
+      callback(++hostTurn);
+    }
   };
   // A Rust panic inside a pump microtask surfaces as an uncaught exception, not as a
   // rejected start_probes() call; report it instead of letting the run look like a hang.
@@ -127,30 +144,43 @@
     },
     wait(source, callback) {
       if (source === 0) {
+        pendingWaits++;
         setTimeout(() => {
           observeTurn(0);
+          pendingWaits--;
           callback(++hostTurn);
         }, 5);
       } else if (source === 1) {
+        pendingWaits++;
         const id = ++nextCallback;
         pending.set(id, callback);
         channel.port2.postMessage(id);
       } else if (source === 2) {
+        // Source 2 microtask waits are excluded from pendingWaits per contract.
         queueMicrotask(() => {
           const before = wasm.burst_polls();
           queueMicrotask(() => callback(wasm.burst_polls() - before));
         });
       } else if (source === 3) {
+        pendingWaits++;
         setTimeout(() => {
           observeTurn(3);
+          pendingWaits--;
           callback(++hostTurn);
         }, 5);
       } else if (source === 4) {
+        pendingWaits++;
         if (burstDone) {
           emitBurstResults();
-          queueMicrotask(() => callback(ceilAvgPerPumpTurn));
+          queueMicrotask(() => {
+            pendingWaits--;
+            callback(ceilAvgPerPumpTurn);
+          });
         } else {
-          burstCallback = callback;
+          burstCallback = (val) => {
+            pendingWaits--;
+            callback(val);
+          };
         }
       } else {
         throw new Error(`Unknown host callback source ${source}`);
@@ -158,6 +188,11 @@
     },
     reenter() { return wasm.reenter_probe(); },
     turns() { return turnsObserved; },
+    inflight(kind) {
+      if (kind === 0) return pendingWaits;
+      if (kind === 1) return pendingFetches;
+      return 0;
+    },
     event(probe, step, value) {
       if (probe === 'burst-first-turn-and-completion' && step === 'spawn') {
         burstActive = true;
@@ -203,7 +238,7 @@
       };
       globalThis.__F3D_PROBE_RESULTS__ = result;
       document.querySelector('#result').textContent = JSON.stringify(result, null, 2);
-      fetch('/result', { method: 'POST', headers: { 'content-type': 'application/json' },
+      nativeFetch('/result', { method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify(result) }).catch(error => console.error('Result delivery failed', error));
       channel.port1.close();
       channel.port2.close();
