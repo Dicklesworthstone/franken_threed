@@ -98,9 +98,16 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
   } catch (err) {
     const span = err.loc
       ? {
-          line: err.loc.line + (offsets.lineOffset || 0),
-          column: (err.loc.line === 1 ? err.loc.column + (offsets.columnOffset || 0) : err.loc.column),
-          offset: (err.pos || 0) + (offsets.charOffset || 0)
+          start: {
+            line: err.loc.line + (offsets.lineOffset || 0),
+            column: (err.loc.line === 1 ? err.loc.column + (offsets.columnOffset || 0) : err.loc.column),
+            offset: (err.pos || 0) + (offsets.charOffset || 0)
+          },
+          end: {
+            line: err.loc.line + (offsets.lineOffset || 0),
+            column: (err.loc.line === 1 ? err.loc.column + (offsets.columnOffset || 0) : err.loc.column) + 1,
+            offset: (err.pos || 0) + (offsets.charOffset || 0) + 1
+          }
         }
       : null;
     throw new IngestionParseError(
@@ -150,10 +157,12 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
             });
           }
         }
+        const span = toSourceSpan(node, offsets);
         staticImports.push({
           specifier,
-          sourceSpan: toSourceSpan(node, offsets),
-          importedBindings
+          source_span: span,
+          sourceSpan: span,
+          imported_bindings: importedBindings
         });
         break;
       }
@@ -190,11 +199,13 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
             specifiers.push({ local: decl.id.name, exported: decl.id.name });
           }
         }
+        const span = toSourceSpan(node, offsets);
         staticExports.push({
           type: 'named',
           specifier: reexportSpecifier,
           specifiers,
-          sourceSpan: toSourceSpan(node, offsets)
+          source_span: span,
+          sourceSpan: span
         });
         break;
       }
@@ -207,20 +218,25 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
             topLevelDeclarations.set(localName, node.declaration.type === 'FunctionDeclaration' ? 'function' : 'class');
           }
         }
+        const span = toSourceSpan(node, offsets);
         staticExports.push({
           type: 'default',
+          local_name: localName,
           localName,
-          sourceSpan: toSourceSpan(node, offsets)
+          source_span: span,
+          sourceSpan: span
         });
         break;
       }
 
       case 'ExportAllDeclaration': {
+        const span = toSourceSpan(node, offsets);
         staticExports.push({
           type: 'all',
           specifier: node.source.value,
           exported: node.exported ? node.exported.name : null,
-          sourceSpan: toSourceSpan(node, offsets)
+          source_span: span,
+          sourceSpan: span
         });
         break;
       }
@@ -263,11 +279,13 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
   walk.simple(ast, {
     ImportExpression(node) {
       const { classification, specifier } = classifyDynamicImportArgument(node.source);
+      const span = toSourceSpan(node, offsets);
       dynamicImports.push({
         classification,
         specifier,
         unresolved: classification === 'nonliteral',
-        sourceSpan: toSourceSpan(node, offsets)
+        source_span: span,
+        sourceSpan: span
       });
     },
 
@@ -282,10 +300,14 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
       ) {
         const className = node.left.object.object.name;
         const propName = node.left.property.name || (node.left.property.value ? String(node.left.property.value) : null);
+        const span = toSourceSpan(node, offsets);
         prototypeWrites.push({
+          class_name: className,
           className,
+          property_name: propName,
           propertyName: propName,
-          sourceSpan: toSourceSpan(node, offsets)
+          source_span: span,
+          sourceSpan: span
         });
       }
     },
@@ -307,11 +329,14 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
           }
         }
       }
+      const span = toSourceSpan(node, offsets);
       classDeclarations.push({
         name: className,
+        super_class: superClass,
         superClass,
         methods,
-        sourceSpan: toSourceSpan(node, offsets)
+        source_span: span,
+        sourceSpan: span
       });
     },
 
@@ -331,9 +356,11 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
           secondArg.object.type === 'MetaProperty' &&
           secondArg.property.name === 'url'
         ) {
+          const span = toSourceSpan(node, offsets);
           assetReferences.push({
             specifier: firstArg.value,
-            sourceSpan: toSourceSpan(node, offsets)
+            source_span: span,
+            sourceSpan: span
           });
         }
       }
