@@ -26,7 +26,7 @@ all-turn burst measurement, and unsupported-host detection are verified when obs
 their respective probe completions and test gates. The `stale-result` probe is the
 generation-checked publication prototype at probe scope with a probe-local state cell, not scene
 state, and the late child is run to completion by region close and its value is discarded by
-the generation check, not by dropping the future. The `idle` probe counts host waits registered
+the generation check, not by dropping the future. The probe is shown non-vacuous by a negative run (`?negative=generation-check`, harness argument `negative=generation-check`): the same page with the generation check disabled must fail inside `stale-result` with "late child published into replaced region". The `idle` probe counts host waits registered
 through `f3dHost.wait` excluding microtask waits and Rust-initiated fetches through the wrapped
 global `fetch`, not the fixture's own event posts; a fetch is counted only until its response promise settles, so a leaked body reader after headers arrive is not detected by this probe. A cancellation check inside a synchronous kernel
 cannot promise that a main-thread cancellation callback runs before the browser regains control,

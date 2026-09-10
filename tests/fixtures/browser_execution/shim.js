@@ -187,6 +187,7 @@
       }
     },
     reenter() { return wasm.reenter_probe(); },
+    negative() { return (typeof window !== 'undefined' && window.__f3dNegative) || ''; },
     turns() { return turnsObserved; },
     inflight(kind) {
       if (kind === 0) return pendingWaits;

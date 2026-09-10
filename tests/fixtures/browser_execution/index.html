@@ -31,6 +31,12 @@
     }
     document.title += ` (omit=${omit})`;
   }
+  const negative = new URLSearchParams(location.search).get('negative');
+  if (negative) {
+    // Negative run: the Rust probe disables one check by name and the run MUST fail.
+    window.__f3dNegative = negative;
+    document.title += ` (negative=${negative})`;
+  }
 })();
 </script>
 <script src="./shim.js"></script>

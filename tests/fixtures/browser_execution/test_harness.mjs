@@ -9,12 +9,17 @@ import { openEvidence } from '../../../tools/evidence.mjs';
 const fixture = dirname(fileURLToPath(import.meta.url));
 const [packagePath, browser = 'chrome', thirdArg] = process.argv.slice(2);
 if (!packagePath || !['chrome', 'safari'].includes(browser)) {
-  throw new Error('Usage: node test_harness.mjs <wasm-bindgen-package-directory> [chrome|safari] [omit=NAME]');
+  throw new Error('Usage: node test_harness.mjs <wasm-bindgen-package-directory> [chrome|safari] [omit=NAME|negative=NAME]');
 }
 let omit = null;
+let negative = null;
 if (thirdArg) {
-  const parsed = thirdArg.startsWith('omit=') ? thirdArg.slice(5) : thirdArg;
-  if (parsed.length > 0) omit = parsed;
+  if (thirdArg.startsWith('negative=')) {
+    if (thirdArg.length > 9) negative = thirdArg.slice(9);
+  } else {
+    const parsed = thirdArg.startsWith('omit=') ? thirdArg.slice(5) : thirdArg;
+    if (parsed.length > 0) omit = parsed;
+  }
 }
 const pkg = resolve(packagePath);
 for (const name of ['f3d_runtime.js', 'f3d_runtime_bg.wasm']) {
@@ -25,6 +30,14 @@ const archive = resolve(process.env.F3D_EVIDENCE_DIR || 'evidence');
 const runDir = join(archive, '02.2', runId);
 mkdirSync(runDir, { recursive: true });
 const evidence = openEvidence('02.2', runId, { baseDir: archive });
+// Negative runs: the Rust probe disables the named check and the browser run MUST
+// fail with this message after the earlier probes completed; otherwise the probe is vacuous.
+const NEGATIVE_RUNS = {
+  'generation-check': { failsIn: 'stale-result', message: 'late child published into replaced region' },
+};
+if (negative && !NEGATIVE_RUNS[negative]) {
+  throw new Error(`Unknown negative run "${negative}"; known: ${Object.keys(NEGATIVE_RUNS).join(', ')}`);
+}
 const expected = [
   'timer',
   'channel-join',
@@ -34,8 +47,8 @@ const expected = [
   'burst-all-turns',
   'cancellation',
   'drain',
-  'fetch-abort',
-  ...(!omit ? ['stale-result', 'idle', 'unsupported-host'] : []),
+  ...(!negative ? ['fetch-abort'] : []),
+  ...(!omit && !negative ? ['stale-result', 'idle', 'unsupported-host'] : []),
 ];
 let browserProcess;
 let startTime = 0;
@@ -75,6 +88,15 @@ async function finish(result) {
     if (!passed && !detail) {
       detail = `Omit mode failure: expected detail "${expectedDetail}", got "${result.detail}", elapsed=${elapsedMs}ms, result.passed=${result.passed}`;
     }
+  } else if (negative) {
+    const spec = NEGATIVE_RUNS[negative];
+    const failedInProbe = !complete.has(spec.failsIn) && events.some(e => e.probe === spec.failsIn && e.step === 'spawn');
+    const priorComplete = expected.every(name => complete.has(name));
+    const detailMatches = typeof result.detail === 'string' && result.detail.includes(spec.message);
+    passed = result.passed === false && detailMatches && failedInProbe && priorComplete;
+    if (!passed) {
+      detail = `Negative mode failure: expected a failure containing "${spec.message}" inside ${spec.failsIn}, got passed=${result.passed} detail="${result.detail}" prior_complete=${priorComplete} failed_in_probe=${failedInProbe}`;
+    }
   } else {
     passed = result.passed === true && expected.every(name => complete.has(name));
     if (hasFetchAbort && (!serverSawDisconnect || bytesBeforeAbort <= 0)) {
@@ -92,12 +114,14 @@ async function finish(result) {
   });
   evidence.log({
     lane: 'integration', bead: 'f3d-02-asupersync-browser-execution-58j.2',
-    owner: 'asupersync-rust-wasm', test: omit ? 'unsupported-host' : 'browser-execution', browser: result.browser,
+    owner: 'asupersync-rust-wasm', test: omit ? 'unsupported-host' : negative ? `${NEGATIVE_RUNS[negative].failsIn}-negative` : 'browser-execution', browser: result.browser,
     level: passed ? 'info' : 'error', status: passed ? 'pass' : 'fail',
     msg: detail,
     data: omit
       ? { omit, elapsed_ms: elapsedMs, result_passed: result.passed }
-      : { server_saw_disconnect: serverSawDisconnect, bytes_before_abort: bytesBeforeAbort } });
+      : negative
+        ? { negative, elapsed_ms: elapsedMs, result_passed: result.passed, result_detail: result.detail }
+        : { server_saw_disconnect: serverSawDisconnect, bytes_before_abort: bytesBeforeAbort } });
   const summary = evidence.finish();
   console.log(JSON.stringify({ passed, browser, runDir, streamed_events: streamed.length, summary }));
   settle(passed);
@@ -181,7 +205,7 @@ const server = createServer((req, res) => {
   catch (error) { res.writeHead(500); res.end(String(error)); finish({ passed: false, detail: String(error) }); }
 });
 await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-const url = `http://127.0.0.1:${server.address().port}/` + (omit ? `?omit=${omit}` : '');
+const url = `http://127.0.0.1:${server.address().port}/` + (omit ? `?omit=${omit}` : negative ? `?negative=${negative}` : '');
 console.log(`Running ${browser}: ${url}`);
 startTime = Date.now();
 if (browser === 'chrome') {

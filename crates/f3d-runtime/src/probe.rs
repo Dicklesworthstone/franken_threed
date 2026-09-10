@@ -40,6 +40,8 @@ extern "C" {
     fn host_turns() -> u32;
     #[wasm_bindgen(js_namespace = f3dHost, js_name = inflight)]
     fn host_inflight(kind: u32) -> u32;
+    #[wasm_bindgen(js_namespace = f3dHost, js_name = negative)]
+    fn host_negative() -> String;
 }
 
 #[derive(Default)]
@@ -131,6 +133,14 @@ impl Future for SelfWaking {
 
 fn publish(state: &RefCell<PublishedState>, generation: u32, value: u32) -> bool {
     let mut state = state.borrow_mut();
+    // Negative run (`?negative=generation-check`): publish under the current generation
+    // instead of the producer's, i.e. no generation check. The stale-result probe must
+    // then fail with "late child published into replaced region".
+    let generation = if host_negative() == "generation-check" {
+        state.generation()
+    } else {
+        generation
+    };
     if !state.try_publish(generation, value) {
         STALE_DISCARDED.with(|counter| counter.set(counter.get() + 1));
         event("stale-result", "discarded-generation-mismatch", generation);
