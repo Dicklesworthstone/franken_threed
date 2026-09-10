@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>FrankenThreeD - WebGPU Bridge Verification</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; padding: 20px; background: #0e1117; color: #c9d1d9; }
+    h1 { color: #58a6ff; font-size: 20px; }
+    .status { margin-top: 15px; padding: 12px; border-radius: 6px; font-family: monospace; font-size: 13px; }
+    .pass { background: #163821; color: #7ee787; border: 1px solid #238636; }
+    .fail { background: #3d1b1f; color: #ff7b72; border: 1px solid #da3633; }
+    canvas { border: 1px solid #30363d; margin-top: 10px; image-rendering: pixelated; width: 128px; height: 128px; }
+  </style>
+</head>
+<body>
+  <h1>f3d-05.6: Actual First Frame through Rust/Wasm to WebGPU Bridge</h1>
+  <canvas id="canvas" width="64" height="64"></canvas>
+  <div id="output" class="status">Running bridge verification suite...</div>
+
+  <script type="module">
+    import {
+      WebGpuBridgeHost,
+      PACKET_MAGIC,
+      PACKET_VERSION,
+      OPCODE_CREATE_BUFFER,
+      OPCODE_WRITE_BUFFER,
+      OPCODE_CREATE_PIPELINE,
+      OPCODE_RENDER_PASS,
+      OPCODE_COPY_TEXTURE_TO_BUFFER,
+      OPCODE_CREATE_TEXTURE,
+      TARGET_OFFSCREEN,
+      TARGET_CANVAS
+    } from "./bridge_runtime.js";
+    import { renderDirectReferenceTriangle } from "./direct_reference.js";
+
+    const outputEl = document.getElementById("output");
+    const canvas = document.getElementById("canvas");
+    const canvasContext = canvas.getContext("webgpu");
+
+    const results = {
+      passed: false,
+      tests: {},
+      capabilityRecord: null,
+      errors: [],
+    };
+
+    function logPass(name, detail = "") {
+      results.tests[name] = { status: "PASS", detail };
+      console.log(`[PASS] ${name}`, detail);
+    }
+
+    function logFail(name, error) {
+      results.tests[name] = { status: "FAIL", error: error.message || String(error) };
+      results.errors.push(`${name}: ${error.message || String(error)}`);
+      console.error(`[FAIL] ${name}`, error);
+    }
+
+    // Binary packet builder helper in JavaScript matching the Rust GpuSubmissionPacket encoding
+    class PacketBuilder {
+      constructor() {
+        this.commands = [];
+        this.dataChunks = [];
+        this.dataTotalLen = 0;
+      }
+
+      createBuffer(bufferId, size, usage) {
+        this.commands.push({ op: OPCODE_CREATE_BUFFER, bufferId, size, usage });
+      }
+
+      writeBuffer(bufferId, offset, dataUint8) {
+        const dataOffset = this.dataTotalLen;
+        this.dataChunks.push(dataUint8);
+        this.dataTotalLen += dataUint8.byteLength;
+        this.commands.push({ op: OPCODE_WRITE_BUFFER, bufferId, offset, dataOffset, dataLength: dataUint8.byteLength });
+      }
+
+      createTexture(textureId, width, height, formatCode, usage) {
+        this.commands.push({ op: OPCODE_CREATE_TEXTURE, textureId, width, height, formatCode, usage });
+      }
+
+      createPipeline(pipelineId, wgslText, formatCode, hasVB, hasUniform) {
+        const codeBytes = new TextEncoder().encode(wgslText);
+        const codeOffset = this.dataTotalLen;
+        this.dataChunks.push(codeBytes);
+        this.dataTotalLen += codeBytes.byteLength;
+        this.commands.push({ op: OPCODE_CREATE_PIPELINE, pipelineId, codeOffset, codeLen: codeBytes.byteLength, formatCode, hasVB, hasUniform });
+      }
+
+      renderPass(targetType, targetId, clearColor, pipelineId, vbId, vertexCount, dynamicOffset = 0) {
+        this.commands.push({ op: OPCODE_RENDER_PASS, targetType, targetId, clearColor, pipelineId, vbId, vertexCount, dynamicOffset });
+      }
+
+      copyTextureToBuffer(textureId, bufferId, width, height) {
+        this.commands.push({ op: OPCODE_COPY_TEXTURE_TO_BUFFER, textureId, bufferId, width, height });
+      }
+
+      build() {
+        const headerLen = 16;
+        let commandBytesLen = 0;
+        for (const cmd of this.commands) {
+          switch (cmd.op) {
+            case OPCODE_CREATE_BUFFER: commandBytesLen += 2 + 12; break;
+            case OPCODE_WRITE_BUFFER: commandBytesLen += 2 + 16; break;
+            case OPCODE_CREATE_TEXTURE: commandBytesLen += 2 + 20; break;
+            case OPCODE_CREATE_PIPELINE: commandBytesLen += 2 + 24; break;
+            case OPCODE_RENDER_PASS: commandBytesLen += 2 + 40; break;
+            case OPCODE_COPY_TEXTURE_TO_BUFFER: commandBytesLen += 2 + 16; break;
+          }
+        }
+
+        const totalLen = headerLen + commandBytesLen + this.dataTotalLen;
+        const out = new Uint8Array(totalLen);
+        const view = new DataView(out.buffer);
+
+        // Header
+        view.setUint32(0, PACKET_MAGIC, true);
+        view.setUint16(4, PACKET_VERSION, true);
+        view.setUint16(6, 0, true);
+        view.setUint32(8, this.commands.length, true);
+        view.setUint32(12, this.dataTotalLen, true);
+
+        let cursor = 16;
+        for (const cmd of this.commands) {
+          view.setUint16(cursor, cmd.op, true);
+          cursor += 2;
+          switch (cmd.op) {
+            case OPCODE_CREATE_BUFFER:
+              view.setUint32(cursor, cmd.bufferId, true);
+              view.setUint32(cursor + 4, cmd.size, true);
+              view.setUint32(cursor + 8, cmd.usage, true);
+              cursor += 12;
+              break;
+            case OPCODE_WRITE_BUFFER:
+              view.setUint32(cursor, cmd.bufferId, true);
+              view.setUint32(cursor + 4, cmd.offset, true);
+              view.setUint32(cursor + 8, cmd.dataOffset, true);
+              view.setUint32(cursor + 12, cmd.dataLength, true);
+              cursor += 16;
+              break;
+            case OPCODE_CREATE_TEXTURE:
+              view.setUint32(cursor, cmd.textureId, true);
+              view.setUint32(cursor + 4, cmd.width, true);
+              view.setUint32(cursor + 8, cmd.height, true);
+              view.setUint32(cursor + 12, cmd.formatCode, true);
+              view.setUint32(cursor + 16, cmd.usage, true);
+              cursor += 20;
+              break;
+            case OPCODE_CREATE_PIPELINE:
+              view.setUint32(cursor, cmd.pipelineId, true);
+              view.setUint32(cursor + 4, cmd.codeOffset, true);
+              view.setUint32(cursor + 8, cmd.codeLen, true);
+              view.setUint32(cursor + 12, cmd.formatCode, true);
+              view.setUint32(cursor + 16, cmd.hasVB ? 1 : 0, true);
+              view.setUint32(cursor + 20, cmd.hasUniform ? 1 : 0, true);
+              cursor += 24;
+              break;
+            case OPCODE_RENDER_PASS:
+              view.setUint32(cursor, cmd.targetType, true);
+              view.setUint32(cursor + 4, cmd.targetId, true);
+              view.setFloat32(cursor + 8, cmd.clearColor[0], true);
+              view.setFloat32(cursor + 12, cmd.clearColor[1], true);
+              view.setFloat32(cursor + 16, cmd.clearColor[2], true);
+              view.setFloat32(cursor + 20, cmd.clearColor[3], true);
+              view.setUint32(cursor + 24, cmd.pipelineId, true);
+              view.setUint32(cursor + 28, cmd.vbId, true);
+              view.setUint32(cursor + 32, cmd.vertexCount, true);
+              view.setUint32(cursor + 36, cmd.dynamicOffset, true);
+              cursor += 40;
+              break;
+            case OPCODE_COPY_TEXTURE_TO_BUFFER:
+              view.setUint32(cursor, cmd.textureId, true);
+              view.setUint32(cursor + 4, cmd.bufferId, true);
+              view.setUint32(cursor + 8, cmd.width, true);
+              view.setUint32(cursor + 12, cmd.height, true);
+              cursor += 16;
+              break;
+          }
+        }
+
+        // Data payload
+        let dataCursor = headerLen + commandBytesLen;
+        for (const chunk of this.dataChunks) {
+          out.set(chunk, dataCursor);
+          dataCursor += chunk.byteLength;
+        }
+
+        return out;
+      }
+    }
+
+    async function runSuite() {
+      try {
+        const bridge = new WebGpuBridgeHost();
+
+        // 1. Negotiation test: negative (missing required feature must fail explicitly before device creation)
+        try {
+          await bridge.negotiateAndCreateDevice({
+            requiredFeatures: ["non-existent-feature-forbidden-xyz"],
+          });
+          logFail("negotiation_missing_feature", new Error("Expected negotiation to fail for non-existent feature"));
+        } catch (e) {
+          if (e.message.includes("Negotiation failed: required WebGPU feature")) {
+            logPass("negotiation_missing_feature", e.message);
+          } else {
+            logFail("negotiation_missing_feature", e);
+          }
+        }
+
+        // 2. Negotiation test: positive (negotiate valid baseline profile)
+        const cap = await bridge.negotiateAndCreateDevice({
+          requiredFeatures: [],
+          minLimits: {
+            maxTextureDimension2D: 8192,
+            maxBufferSize: 268435456,
+            minUniformBufferOffsetAlignment: 256,
+          },
+        });
+        results.capabilityRecord = cap;
+        logPass("negotiation_positive", `Device negotiated on ${cap.adapter.vendor} (${cap.adapter.architecture})`);
+
+        // Configure canvas context
+        canvasContext.configure({
+          device: bridge.device,
+          format: cap.preferredCanvasFormat,
+          alphaMode: "premultiplied",
+        });
+
+        // 3. Error-scope discipline tests
+        // A: Concurrent task interleaving prevention
+        try {
+          bridge.errorScopeActive = true;
+          await bridge.withErrorScopes(["validation"], () => {});
+          logFail("error_scope_concurrency", new Error("Expected interleaved error scope to be rejected"));
+        } catch (e) {
+          if (e.message.includes("Error-scope serialization violation")) {
+            logPass("error_scope_concurrency", "Concurrent error-scope interleaving correctly rejected");
+          } else {
+            logFail("error_scope_concurrency", e);
+          }
+        } finally {
+          bridge.errorScopeActive = false;
+        }
+
+        // B: Awaiting inside error-scope body detection
+        try {
+          await bridge.withErrorScopes(["validation"], async () => {
+            await new Promise(r => setTimeout(r, 0));
+          });
+          logFail("error_scope_await_detection", new Error("Expected async body inside error scope to be rejected"));
+        } catch (e) {
+          if (e.message.includes("Awaits inside error-scope body are strictly forbidden")) {
+            logPass("error_scope_await_detection", "Await inside error-scope body correctly rejected");
+          } else {
+            logFail("error_scope_await_detection", e);
+          }
+        }
+
+        // 4. Positive First Frame: Real WGSL triangle with AffineRows uniform rendered to offscreen & canvas
+        const triangleShader = `
+struct AffineRows {
+    r0: vec4<f32>,
+    r1: vec4<f32>,
+    r2: vec4<f32>,
+};
+
+fn transform_affine_point(m: AffineRows, p: vec3<f32>) -> vec3<f32> {
+    let v = vec4<f32>(p, 1.0);
+    return vec3<f32>(dot(m.r0, v), dot(m.r1, v), dot(m.r2, v));
+}
+
+@group(0) @binding(0)
+var<uniform> model: AffineRows;
+
+struct VertexInput {
+    @location(0) position: vec3<f32>,
+    @location(1) uv: vec2<f32>,
+};
+
+struct VertexOutput {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(in: VertexInput) -> VertexOutput {
+    var out: VertexOutput;
+    let transformed = transform_affine_point(model, in.position);
+    out.clip_pos = vec4<f32>(transformed, 1.0);
+    out.uv = in.uv;
+    return out;
+}
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    return vec4<f32>(in.uv.x, in.uv.y, 1.0 - in.uv.x, 1.0);
+}
+`;
+
+        const packetBuilder = new PacketBuilder();
+        const vertexData = new Float32Array([
+           0.0,  0.5,  0.0, 0.5, 1.0,
+          -0.5, -0.5,  0.0, 0.0, 0.0,
+           0.5, -0.5,  0.0, 1.0, 0.0,
+        ]);
+        const affineData = new Float32Array([
+          1.0, 0.0, 0.0, 0.0,
+          0.0, 1.0, 0.0, 0.0,
+          0.0, 0.0, 1.0, 0.0,
+        ]);
+
+        packetBuilder.createBuffer(1, 256, 64 | 8); // Uniform buffer
+        packetBuilder.writeBuffer(1, 0, new Uint8Array(affineData.buffer));
+
+        packetBuilder.createBuffer(2, vertexData.byteLength, 32 | 8); // Vertex buffer
+        packetBuilder.writeBuffer(2, 0, new Uint8Array(vertexData.buffer));
+
+        packetBuilder.createTexture(10, 64, 64, 2, 16 | 4); // Offscreen target rgba8unorm
+        const bytesPerRow = Math.ceil((64 * 4) / 256) * 256;
+        packetBuilder.createBuffer(20, bytesPerRow * 64, 1 | 8); // Readback buffer
+
+        packetBuilder.createPipeline(100, triangleShader, 2, true, true);
+
+        // Render pass 1: to offscreen target
+        packetBuilder.renderPass(TARGET_OFFSCREEN, 10, [0.0, 0.0, 0.0, 1.0], 100, 2, 3, 0);
+
+        // Render pass 2: to canvas swapchain (acquires fresh currentTexture)
+        // Note: canvas format may be bgra8unorm or rgba8unorm
+        const canvasFormatCode = cap.preferredCanvasFormat === "bgra8unorm" ? 1 : 2;
+        packetBuilder.createPipeline(101, triangleShader, canvasFormatCode, true, true);
+        packetBuilder.renderPass(TARGET_CANVAS, 0, [0.0, 0.0, 0.0, 1.0], 101, 2, 3, 0);
+
+        // Copy offscreen texture to readback buffer
+        packetBuilder.copyTextureToBuffer(10, 20, 64, 64);
+
+        const packet = packetBuilder.build();
+        await bridge.executePacket(packet, canvasContext);
+
+        // Read back bridge pixels
+        const bridgePixels = await bridge.readbackBuffer(20, bytesPerRow * 64);
+
+        // Direct-JS reference comparison
+        const directPixels = await renderDirectReferenceTriangle(bridge.device, 64, 64);
+
+        // Assert pixel-identical match!
+        if (bridgePixels.byteLength !== directPixels.byteLength) {
+          throw new Error(`Length mismatch: bridge ${bridgePixels.byteLength} vs direct ${directPixels.byteLength}`);
+        }
+
+        let diffCount = 0;
+        let nonZeroCount = 0;
+        for (let i = 0; i < bridgePixels.byteLength; i++) {
+          if (bridgePixels[i] !== 0) nonZeroCount++;
+          if (bridgePixels[i] !== directPixels[i]) diffCount++;
+        }
+
+        if (nonZeroCount === 0) {
+          throw new Error("Rendered image is completely empty/black");
+        }
+        if (diffCount > 0) {
+          throw new Error(`Pixel mismatch between bridge and direct reference: ${diffCount} differences`);
+        }
+
+        logPass("first_frame_pixel_identical", `Bridge matches direct-JS reference across ${bridgePixels.byteLength} bytes (0 diffs, ${nonZeroCount} non-zero bytes)`);
+
+        // 5. Negative: Red-A / Blue-B Snapshot Isolation in Single Queue Submission
+        // A single submission issues two draws with a shared uniform buffer:
+        // Slot 0 (offset 0) = Red, Slot 1 (offset 256) = Blue.
+        const flatShader = `
+struct ColorUniform {
+    color: vec4<f32>,
+};
+@group(0) @binding(0)
+var<uniform> u: ColorUniform;
+
+@vertex
+fn vs_main(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4<f32> {
+    var pos = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>( 3.0, -1.0),
+        vec2<f32>(-1.0,  3.0)
+    );
+    return vec4<f32>(pos[idx], 0.0, 1.0);
+}
+
+@fragment
+fn fs_main() -> @location(0) vec4<f32> {
+    return u.color;
+}
+`;
+
+        const redBlueBuilder = new PacketBuilder();
+        redBlueBuilder.createBuffer(1, 512, 64 | 8); // Uniform buffer for both slots
+
+        const redBytes = new Float32Array([1.0, 0.0, 0.0, 1.0]);
+        const blueBytes = new Float32Array([0.0, 0.0, 1.0, 1.0]);
+        redBlueBuilder.writeBuffer(1, 0, new Uint8Array(redBytes.buffer));
+        redBlueBuilder.writeBuffer(1, 256, new Uint8Array(blueBytes.buffer)); // Slot 1 at 256 bytes
+
+        redBlueBuilder.createTexture(30, 64, 64, 2, 16 | 4); // Target A
+        redBlueBuilder.createTexture(31, 64, 64, 2, 16 | 4); // Target B
+        redBlueBuilder.createBuffer(40, bytesPerRow * 64, 1 | 8); // Readback A
+        redBlueBuilder.createBuffer(41, bytesPerRow * 64, 1 | 8); // Readback B
+
+        redBlueBuilder.createPipeline(200, flatShader, 2, false, true);
+
+        // Draw A binds offset 0 (Red) to Target A
+        redBlueBuilder.renderPass(TARGET_OFFSCREEN, 30, [0.0, 0.0, 0.0, 1.0], 200, 0, 3, 0);
+        // Draw B binds offset 256 (Blue) to Target B in the same submission!
+        redBlueBuilder.renderPass(TARGET_OFFSCREEN, 31, [0.0, 0.0, 0.0, 1.0], 200, 0, 3, 256);
+
+        redBlueBuilder.copyTextureToBuffer(30, 40, 64, 64);
+        redBlueBuilder.copyTextureToBuffer(31, 41, 64, 64);
+
+        await bridge.executePacket(redBlueBuilder.build(), canvasContext);
+
+        const pixelsA = await bridge.readbackBuffer(40, bytesPerRow * 64);
+        const pixelsB = await bridge.readbackBuffer(41, bytesPerRow * 64);
+
+        // Center pixel index: row 32, col 32
+        const centerOffset = 32 * bytesPerRow + 32 * 4;
+        const colorA = [pixelsA[centerOffset], pixelsA[centerOffset + 1], pixelsA[centerOffset + 2], pixelsA[centerOffset + 3]];
+        const colorB = [pixelsB[centerOffset], pixelsB[centerOffset + 1], pixelsB[centerOffset + 2], pixelsB[centerOffset + 3]];
+
+        // Color A must be Red [255, 0, 0, 255], Color B must be Blue [0, 0, 255, 255]
+        if (colorA[0] > 200 && colorA[2] < 50 && colorB[2] > 200 && colorB[0] < 50) {
+          logPass("red_a_blue_b_isolation", `Target A is Red (${colorA.join(",")}), Target B is Blue (${colorB.join(",")}) in same submission`);
+        } else {
+          throw new Error(`Red-A/Blue-B snapshot violation: Target A was [${colorA}], Target B was [${colorB}]`);
+        }
+
+        // 6. Confirm no retained Three.js renderer submission was used
+        if (window.__threeRendererSubmissions && window.__threeRendererSubmissions > 0) {
+          throw new Error("Retained renderer submission detected; all work must go through new WebGPU bridge");
+        }
+        logPass("no_retained_renderer", "Zero retained renderer calls; work issued exclusively through new WebGPU bridge");
+
+        results.passed = results.errors.length === 0;
+      } catch (err) {
+        logFail("suite_execution", err);
+        results.passed = false;
+      }
+
+      window.__f3dBridgeResults = results;
+
+      if (results.passed) {
+        outputEl.className = "status pass";
+        outputEl.textContent = `ALL PASS: ${Object.keys(results.tests).length} tests verified.\n` +
+          JSON.stringify(results.tests, null, 2);
+      } else {
+        outputEl.className = "status fail";
+        outputEl.textContent = `FAILED:\n` + results.errors.join("\n") + "\n\n" +
+          JSON.stringify(results.tests, null, 2);
+      }
+    }
+
+    runSuite();
+  </script>
+</body>
+</html>
