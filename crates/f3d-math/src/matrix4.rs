@@ -1,8 +1,10 @@
 //! 4x4 matrix primitive with `f64` public semantics matching Three.js r186 `Matrix4`.
 
 use core::fmt;
-use crate::vector3::Vector3;
+use crate::narrowing::{check_narrow_f64, NarrowingError, NarrowingTolerance};
 use crate::quaternion::Quaternion;
+use crate::vector3::Vector3;
+
 
 /// A 4x4 matrix stored in column-major order matching Three.js `Matrix4.elements`.
 ///
@@ -523,7 +525,52 @@ impl Matrix4 {
 
         self
     }
+
+    /// Narrows this `f64` 4x4 matrix into `[f32; 16]`, verifying that precision loss does not
+    /// exceed `max_abs_err` or `max_rel_err`.
+    ///
+    /// Non-finite values (`NaN`, `Infinity`) are preserved.
+    pub fn to_f32_checked(
+        &self,
+        max_abs_err: f64,
+        max_rel_err: f64,
+    ) -> Result<[f32; 16], NarrowingError> {
+        self.to_f32_with_policy(max_abs_err, max_rel_err, false)
+    }
+
+    /// Strict narrowing: rejects non-finite components (`NaN`, `Infinity`) and checks tolerance.
+    pub fn to_f32_strict(
+        &self,
+        max_abs_err: f64,
+        max_rel_err: f64,
+    ) -> Result<[f32; 16], NarrowingError> {
+        self.to_f32_with_policy(max_abs_err, max_rel_err, true)
+    }
+
+    /// Narrows this matrix with explicit `NarrowingTolerance` parameters.
+    pub fn to_f32_with_tolerance(
+        &self,
+        tolerance: NarrowingTolerance,
+        strict: bool,
+    ) -> Result<[f32; 16], NarrowingError> {
+        self.to_f32_with_policy(tolerance.max_abs_err, tolerance.max_rel_err, strict)
+    }
+
+    /// Checked narrowing helper evaluating all 16 elements with optional strict non-finite rejection.
+    pub fn to_f32_with_policy(
+        &self,
+        max_abs_err: f64,
+        max_rel_err: f64,
+        strict: bool,
+    ) -> Result<[f32; 16], NarrowingError> {
+        let mut out = [0.0f32; 16];
+        for i in 0..16 {
+            out[i] = check_narrow_f64(self.elements[i], i, max_abs_err, max_rel_err, strict)?;
+        }
+        Ok(out)
+    }
 }
+
 
 /// Target coordinate system for projection matrices matching Three.js r186 constants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

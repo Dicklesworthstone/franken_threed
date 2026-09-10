@@ -20,4 +20,13 @@ export {
   getRendererRoute,
   getRendererDecision,
 } from './construction_adapter.mjs';
+export {
+  PinnedWebGLRenderer,
+  ExactWebGLRenderer,
+  registerExactBackend,
+  createExactBackendRouter,
+  createExactWebGLRenderer,
+  createExactBackendForRenderer,
+  getPinnedWebGLBackend,
+} from './exact_backend.mjs';
 export { generateRouteReport, formatRouteReport } from './route_report.mjs';

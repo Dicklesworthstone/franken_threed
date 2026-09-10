@@ -2,7 +2,9 @@
 
 use core::fmt;
 use crate::matrix4::Matrix4;
+use crate::narrowing::{check_narrow_f64, NarrowingError, NarrowingTolerance};
 use crate::quaternion::Quaternion;
+
 
 /// A 3D vector represented by double-precision `f64` components `(x, y, z)`.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -204,7 +206,51 @@ impl Vector3 {
     pub const fn from_array(a: [f64; 3]) -> Self {
         Self { x: a[0], y: a[1], z: a[2] }
     }
+
+    /// Narrows this `f64` vector into `[f32; 3]`, verifying that precision loss does not
+    /// exceed `max_abs_err` or `max_rel_err`.
+    ///
+    /// Non-finite values (`NaN`, `Infinity`) are preserved.
+    pub fn to_f32_checked(
+        &self,
+        max_abs_err: f64,
+        max_rel_err: f64,
+    ) -> Result<[f32; 3], NarrowingError> {
+        self.to_f32_with_policy(max_abs_err, max_rel_err, false)
+    }
+
+    /// Strict narrowing: rejects non-finite components (`NaN`, `Infinity`) and checks tolerance.
+    pub fn to_f32_strict(
+        &self,
+        max_abs_err: f64,
+        max_rel_err: f64,
+    ) -> Result<[f32; 3], NarrowingError> {
+        self.to_f32_with_policy(max_abs_err, max_rel_err, true)
+    }
+
+    /// Narrows this vector with explicit `NarrowingTolerance` parameters.
+    pub fn to_f32_with_tolerance(
+        &self,
+        tolerance: NarrowingTolerance,
+        strict: bool,
+    ) -> Result<[f32; 3], NarrowingError> {
+        self.to_f32_with_policy(tolerance.max_abs_err, tolerance.max_rel_err, strict)
+    }
+
+    /// Checked narrowing helper evaluating each component with optional strict non-finite rejection.
+    pub fn to_f32_with_policy(
+        &self,
+        max_abs_err: f64,
+        max_rel_err: f64,
+        strict: bool,
+    ) -> Result<[f32; 3], NarrowingError> {
+        let x = check_narrow_f64(self.x, 0, max_abs_err, max_rel_err, strict)?;
+        let y = check_narrow_f64(self.y, 1, max_abs_err, max_rel_err, strict)?;
+        let z = check_narrow_f64(self.z, 2, max_abs_err, max_rel_err, strict)?;
+        Ok([x, y, z])
+    }
 }
+
 
 impl fmt::Display for Vector3 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

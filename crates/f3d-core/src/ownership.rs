@@ -389,6 +389,25 @@ pub enum OwnershipError {
         /// The requested alignment that was invalid.
         alignment: u64,
     },
+    /// Attempted to re-enter a borrow scope while a borrow is already active.
+    BorrowScopeReentry {
+        /// Active borrow token that has not yet exited.
+        active_token: u64,
+    },
+    /// Attempted to exit or access a borrow scope when no borrow is active.
+    BorrowScopeNotActive,
+    /// Token provided to exit a borrow scope does not match the active token.
+    BorrowTokenMismatch {
+        /// Expected token for the active borrow.
+        expected: u64,
+        /// Provided token that mismatched.
+        actual: u64,
+    },
+    /// Linear memory growth attempted while a borrow scope is active or growth is blocked.
+    LinearMemoryGrowthBlocked {
+        /// Current lifecycle state that blocked growth.
+        state: BorrowState,
+    },
     /// Underlying handle validation failed.
     Handle(HandleError),
 }
@@ -480,6 +499,30 @@ impl fmt::Display for OwnershipError {
                 write!(
                     f,
                     "invalid buffer alignment {alignment}: must be a non-zero power of two"
+                )
+            }
+            Self::BorrowScopeReentry { active_token } => {
+                write!(
+                    f,
+                    "re-entry into active borrow scope rejected (active token: {active_token})"
+                )
+            }
+            Self::BorrowScopeNotActive => {
+                write!(
+                    f,
+                    "operation requires an active borrow scope, but scope is not borrowed"
+                )
+            }
+            Self::BorrowTokenMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "borrow token mismatch on exit: expected {expected}, got {actual}"
+                )
+            }
+            Self::LinearMemoryGrowthBlocked { state } => {
+                write!(
+                    f,
+                    "linear memory growth rejected while borrow scope is in state {state}"
                 )
             }
             Self::Handle(e) => write!(f, "handle error in ownership: {e}"),
@@ -1351,5 +1394,323 @@ impl<D: Domain> PerUseByteBuffer<D> {
         self.records.clear();
         self.bytes.clear();
         Ok(self.generation)
+    }
+}
+
+// -----------------------------------------------------------------------------
+// BorrowScope & Safe Host Transport (§6.6, §6.8, §13.1, §13.4)
+// -----------------------------------------------------------------------------
+
+/// Typed lifecycle state of a host/Wasm borrowed memory scope.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum BorrowState {
+    /// No borrow active; linear memory growth and scope entry are permitted.
+    #[default]
+    Idle,
+    /// Active borrow in progress; memory growth, callbacks, and reentrant borrows are strictly forbidden.
+    Borrowed,
+    /// Memory growth is explicitly blocked even when idle (e.g. pinned fixed buffer for zero-copy view stability).
+    GrowthBlocked,
+}
+
+impl fmt::Display for BorrowState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Idle => write!(f, "Idle"),
+            Self::Borrowed => write!(f, "Borrowed"),
+            Self::GrowthBlocked => write!(f, "GrowthBlocked"),
+        }
+    }
+}
+
+/// Opaque token returned when entering a [`BorrowScope`], required to cleanly exit the scope.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[repr(transparent)]
+pub struct BorrowToken(pub u64);
+
+impl BorrowToken {
+    /// Create a new borrow token from raw `u64`.
+    #[inline]
+    pub const fn new(val: u64) -> Self {
+        Self(val)
+    }
+
+    /// Raw numeric token identifier.
+    #[inline]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for BorrowToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "BorrowToken#{}", self.0)
+    }
+}
+
+/// Monotonic byte counters tracking zero-copy views vs explicit buffer copies.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct CopyAccounting {
+    /// Bytes accessed directly via borrowed zero-copy views.
+    pub bytes_view: u64,
+    /// Bytes synchronously copied via WebGPU `writeBuffer`.
+    pub bytes_copied_write_buffer: u64,
+    /// Bytes copied into host-side staging buffers (e.g. unaligned copies or map-read staging).
+    pub bytes_copied_staging: u64,
+}
+
+impl CopyAccounting {
+    /// Create a zeroed copy accounting record.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            bytes_view: 0,
+            bytes_copied_write_buffer: 0,
+            bytes_copied_staging: 0,
+        }
+    }
+
+    /// Record bytes accessed via zero-copy view.
+    #[inline]
+    pub fn record_view(&mut self, bytes: u64) {
+        self.bytes_view = self.bytes_view.saturating_add(bytes);
+    }
+
+    /// Record bytes copied via `writeBuffer`.
+    #[inline]
+    pub fn record_write_buffer_copy(&mut self, bytes: u64) {
+        self.bytes_copied_write_buffer = self.bytes_copied_write_buffer.saturating_add(bytes);
+    }
+
+    /// Record bytes copied into staging buffers.
+    #[inline]
+    pub fn record_staging_copy(&mut self, bytes: u64) {
+        self.bytes_copied_staging = self.bytes_copied_staging.saturating_add(bytes);
+    }
+
+    /// Total bytes explicitly copied (writeBuffer + staging).
+    #[inline]
+    pub const fn total_copied_bytes(&self) -> u64 {
+        self.bytes_copied_write_buffer.saturating_add(self.bytes_copied_staging)
+    }
+
+    /// Total bytes transported across the host/core boundary (view + copied).
+    #[inline]
+    pub const fn total_transported_bytes(&self) -> u64 {
+        self.bytes_view.saturating_add(self.total_copied_bytes())
+    }
+
+    /// Reset counters at frame boundary.
+    #[inline]
+    pub fn reset(&mut self) {
+        self.bytes_view = 0;
+        self.bytes_copied_write_buffer = 0;
+        self.bytes_copied_staging = 0;
+    }
+}
+
+/// Lifetime and safety guard for borrowed Wasm linear memory views.
+///
+/// # Invariants
+///
+/// 1. **No re-entry**: Entering an already borrowed scope returns [`OwnershipError::BorrowScopeReentry`].
+/// 2. **No memory growth during borrow**: Any memory growth request while borrowed returns
+///    [`OwnershipError::LinearMemoryGrowthBlocked`].
+/// 3. **View invalidation on growth**: When growth occurs while idle, `growth_generation` increments,
+///    allowing callers to detect when cached views must be rebuilt.
+/// 4. **Explicit exit validation**: Exiting requires the exact [`BorrowToken`] returned by `enter()`.
+/// 5. **Copy accounting**: Tracks bytes passed by zero-copy view vs bytes copied.
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct BorrowScope {
+    state: BorrowState,
+    active_token: u64,
+    next_token: u64,
+    growth_generation: u64,
+    growth_blocked_explicit: bool,
+    accounting: CopyAccounting,
+}
+
+impl Default for BorrowScope {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BorrowScope {
+    /// Create a new idle borrow scope with initial generation 1.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            state: BorrowState::Idle,
+            active_token: 0,
+            next_token: 1,
+            growth_generation: 1,
+            growth_blocked_explicit: false,
+            accounting: CopyAccounting::new(),
+        }
+    }
+
+    /// Returns the current typed lifecycle state.
+    #[inline]
+    #[must_use]
+    pub const fn state(&self) -> BorrowState {
+        self.state
+    }
+
+    /// Returns `true` if a borrow is currently active.
+    #[inline]
+    #[must_use]
+    pub const fn is_borrowed(&self) -> bool {
+        matches!(self.state, BorrowState::Borrowed)
+    }
+
+    /// Returns `true` if no borrow is active and growth is permitted.
+    #[inline]
+    #[must_use]
+    pub const fn is_idle(&self) -> bool {
+        matches!(self.state, BorrowState::Idle)
+    }
+
+    /// Returns `true` if growth is blocked (either by active borrow or explicit flag).
+    #[inline]
+    #[must_use]
+    pub const fn is_growth_blocked(&self) -> bool {
+        matches!(self.state, BorrowState::Borrowed | BorrowState::GrowthBlocked)
+    }
+
+    /// Returns the monotonic growth generation counter.
+    ///
+    /// Increments whenever linear memory grows. Callers compare this value to detect
+    /// whether external views need to be rebuilt.
+    #[inline]
+    #[must_use]
+    pub const fn growth_generation(&self) -> u64 {
+        self.growth_generation
+    }
+
+    /// Read-only reference to copy accounting counters.
+    #[inline]
+    #[must_use]
+    pub const fn accounting(&self) -> &CopyAccounting {
+        &self.accounting
+    }
+
+    /// Mutable reference to copy accounting counters.
+    #[inline]
+    pub fn accounting_mut(&mut self) -> &mut CopyAccounting {
+        &mut self.accounting
+    }
+
+    /// Enter a borrow scope, obtaining an exclusive [`BorrowToken`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OwnershipError::BorrowScopeReentry`] if a borrow is already active.
+    pub fn enter(&mut self) -> Result<BorrowToken, OwnershipError> {
+        if self.state == BorrowState::Borrowed {
+            return Err(OwnershipError::BorrowScopeReentry {
+                active_token: self.active_token,
+            });
+        }
+        let token_val = self.next_token;
+        self.next_token = self
+            .next_token
+            .checked_add(1)
+            .ok_or(OwnershipError::VersionOverflow {
+                current: self.next_token,
+            })?;
+        self.active_token = token_val;
+        self.state = BorrowState::Borrowed;
+        Ok(BorrowToken(token_val))
+    }
+
+    /// Exit an active borrow scope using the token returned by [`enter`](Self::enter).
+    ///
+    /// # Errors
+    ///
+    /// - Returns [`OwnershipError::BorrowScopeNotActive`] if the scope is not in `Borrowed` state.
+    /// - Returns [`OwnershipError::BorrowTokenMismatch`] if `token` does not match the active borrow.
+    pub fn exit(&mut self, token: BorrowToken) -> Result<(), OwnershipError> {
+        if self.state != BorrowState::Borrowed {
+            return Err(OwnershipError::BorrowScopeNotActive);
+        }
+        if token.0 != self.active_token {
+            return Err(OwnershipError::BorrowTokenMismatch {
+                expected: self.active_token,
+                actual: token.0,
+            });
+        }
+        self.active_token = 0;
+        self.state = if self.growth_blocked_explicit {
+            BorrowState::GrowthBlocked
+        } else {
+            BorrowState::Idle
+        };
+        Ok(())
+    }
+
+    /// Explicitly blocks linear memory growth even when no borrow is active.
+    pub fn block_growth(&mut self) {
+        self.growth_blocked_explicit = true;
+        if self.state == BorrowState::Idle {
+            self.state = BorrowState::GrowthBlocked;
+        }
+    }
+
+    /// Unblocks explicit growth restriction.
+    pub fn unblock_growth(&mut self) {
+        self.growth_blocked_explicit = false;
+        if self.state == BorrowState::GrowthBlocked {
+            self.state = BorrowState::Idle;
+        }
+    }
+
+    /// Attempts to record linear memory growth, advancing `growth_generation`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OwnershipError::LinearMemoryGrowthBlocked`] if a borrow is active
+    /// or growth has been explicitly blocked.
+    pub fn record_growth(&mut self, pages: u32) -> Result<u64, OwnershipError> {
+        if self.is_growth_blocked() {
+            return Err(OwnershipError::LinearMemoryGrowthBlocked { state: self.state });
+        }
+        let _ = pages; // Accounted in metrics / logs
+        self.growth_generation = self
+            .growth_generation
+            .checked_add(1)
+            .ok_or(OwnershipError::VersionOverflow {
+                current: self.growth_generation,
+            })?;
+        Ok(self.growth_generation)
+    }
+
+    /// Record bytes accessed via zero-copy view, enforcing that a borrow scope is active.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OwnershipError::BorrowScopeNotActive`] if called outside an active borrow scope.
+    pub fn record_view_bytes(&mut self, bytes: u64) -> Result<(), OwnershipError> {
+        if !self.is_borrowed() {
+            return Err(OwnershipError::BorrowScopeNotActive);
+        }
+        self.accounting.record_view(bytes);
+        Ok(())
+    }
+
+    /// Record bytes copied via `writeBuffer`.
+    #[inline]
+    pub fn record_write_buffer_copy(&mut self, bytes: u64) {
+        self.accounting.record_write_buffer_copy(bytes);
+    }
+
+    /// Record bytes copied into staging buffers.
+    #[inline]
+    pub fn record_staging_copy(&mut self, bytes: u64) {
+        self.accounting.record_staging_copy(bytes);
     }
 }

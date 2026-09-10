@@ -336,7 +336,48 @@ impl DepthStencilAttachment {
     }
 }
 
-/// Individual draw command within a render pass.
+/// Category of draw command within a render pass (§8.5, AGENTS.md).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum DrawKind {
+    /// Direct non-indexed or indexed draw command (`draw` / `drawIndexed`).
+    Direct,
+    /// Pre-recorded WebGPU render bundle execution (`executeBundles`).
+    Bundle {
+        /// Unique bundle identifier.
+        bundle_id: u32,
+    },
+}
+
+/// Specification of a pre-recorded WebGPU render bundle execution (§8.5, AGENTS.md).
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct RenderBundle {
+    /// Unique bundle identifier.
+    pub bundle_id: u32,
+    /// Bound pipeline ID encapsulated within the bundle.
+    pub pipeline_id: u32,
+    /// Resources used by commands recorded within this bundle.
+    pub uses: Vec<ResourceUse>,
+}
+
+impl RenderBundle {
+    /// Construct a new render bundle specification.
+    pub fn new(bundle_id: u32, pipeline_id: u32, uses: Vec<ResourceUse>) -> Self {
+        Self {
+            bundle_id,
+            pipeline_id,
+            uses,
+        }
+    }
+
+    /// Convert this render bundle into an executable `Draw` command.
+    pub fn to_draw(&self, draw_id: u32) -> Draw {
+        Draw::new_bundle(draw_id, self.bundle_id, self.pipeline_id, self.uses.clone())
+    }
+}
+
+/// Individual draw command or bundle execution within a render pass.
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Draw {
@@ -356,10 +397,19 @@ pub struct Draw {
     pub uniform_dynamic_offset: u32,
     /// Resources used by this specific draw call.
     pub uses: Vec<ResourceUse>,
+    /// Command category: direct draw or pre-recorded bundle execution.
+    pub kind: DrawKind,
+    /// Whether this draw assumes warm/inherited pipeline and binding state from a preceding draw.
+    ///
+    /// Invariant: WebGPU specification states that executing render bundles (`executeBundles`)
+    /// resets all pipeline and bind group state on the render pass encoder.
+    /// A direct draw following a bundle cannot assume warm state (`assumes_warm_state = true`)
+    /// and must explicitly rebind (`assumes_warm_state = false`).
+    pub assumes_warm_state: bool,
 }
 
 impl Draw {
-    /// Construct a simple non-indexed draw command.
+    /// Construct a simple non-indexed direct draw command.
     pub fn new(
         draw_id: u32,
         pipeline_id: u32,
@@ -376,7 +426,66 @@ impl Draw {
             first_instance: 0,
             uniform_dynamic_offset,
             uses,
+            kind: DrawKind::Direct,
+            assumes_warm_state: false,
         }
+    }
+
+    /// Construct a pre-recorded WebGPU render bundle execution command (§8.5, AGENTS.md).
+    pub fn new_bundle(
+        draw_id: u32,
+        bundle_id: u32,
+        pipeline_id: u32,
+        uses: Vec<ResourceUse>,
+    ) -> Self {
+        Self {
+            draw_id,
+            pipeline_id,
+            vertex_count: 0,
+            instance_count: 1,
+            first_vertex: 0,
+            first_instance: 0,
+            uniform_dynamic_offset: 0,
+            uses,
+            kind: DrawKind::Bundle { bundle_id },
+            assumes_warm_state: false,
+        }
+    }
+
+    /// Construct a direct draw that explicitly assumes warm state (inheriting pipeline/bindings from previous draw).
+    pub fn new_warm_state(
+        draw_id: u32,
+        pipeline_id: u32,
+        vertex_count: u32,
+        uniform_dynamic_offset: u32,
+        uses: Vec<ResourceUse>,
+    ) -> Self {
+        Self {
+            draw_id,
+            pipeline_id,
+            vertex_count,
+            instance_count: 1,
+            first_vertex: 0,
+            first_instance: 0,
+            uniform_dynamic_offset,
+            uses,
+            kind: DrawKind::Direct,
+            assumes_warm_state: true,
+        }
+    }
+
+    /// Mark whether this draw assumes warm state from prior draws.
+    #[must_use]
+    pub fn with_assumes_warm_state(mut self, warm: bool) -> Self {
+        self.assumes_warm_state = warm;
+        self
+    }
+
+    /// Sets whether rebind is required (if false, assumes warm state).
+    #[must_use]
+    pub fn with_rebind_required(mut self, rebind: bool) -> Self {
+        self.assumes_warm_state = !rebind;
+        self
     }
 
     /// Draw index within the pass.
@@ -449,6 +558,51 @@ impl Draw {
     #[must_use]
     pub fn vertex_buffer_id(&self) -> u32 {
         self.vertex_buffer().map_or(0, |id| id.get())
+    }
+
+    /// Returns `true` if this command is a pre-recorded render bundle execution.
+    #[inline]
+    #[must_use]
+    pub const fn is_bundle(&self) -> bool {
+        matches!(self.kind, DrawKind::Bundle { .. })
+    }
+
+    /// Returns `true` if this command is a direct draw.
+    #[inline]
+    #[must_use]
+    pub const fn is_direct(&self) -> bool {
+        matches!(self.kind, DrawKind::Direct)
+    }
+
+    /// Returns the bundle ID if this is a bundle execution command.
+    #[inline]
+    #[must_use]
+    pub const fn bundle_id(&self) -> Option<u32> {
+        match self.kind {
+            DrawKind::Bundle { bundle_id } => Some(bundle_id),
+            DrawKind::Direct => None,
+        }
+    }
+
+    /// Returns the draw command category.
+    #[inline]
+    #[must_use]
+    pub const fn kind(&self) -> DrawKind {
+        self.kind
+    }
+
+    /// Returns `true` if this draw assumes warm/inherited pipeline and binding state.
+    #[inline]
+    #[must_use]
+    pub const fn assumes_warm_state(&self) -> bool {
+        self.assumes_warm_state
+    }
+
+    /// Returns `true` if this direct draw explicitly rebinds its state (does not assume warm state).
+    #[inline]
+    #[must_use]
+    pub const fn rebind_required(&self) -> bool {
+        !self.assumes_warm_state
     }
 }
 
@@ -765,6 +919,25 @@ impl Pass {
     /// Add a draw call.
     pub fn with_draw(mut self, draw: Draw) -> Self {
         self.draws.push(draw);
+        self
+    }
+
+    /// Add a pre-recorded render bundle execution to this pass (§8.5, AGENTS.md).
+    pub fn with_bundle(mut self, bundle: RenderBundle) -> Self {
+        let draw_id = self.draws.len() as u32;
+        self.draws.push(bundle.to_draw(draw_id));
+        self
+    }
+
+    /// Add a pre-recorded render bundle execution directly with parameters (§8.5, AGENTS.md).
+    pub fn with_bundle_draw(
+        mut self,
+        bundle_id: u32,
+        pipeline_id: u32,
+        uses: Vec<ResourceUse>,
+    ) -> Self {
+        let draw_id = self.draws.len() as u32;
+        self.draws.push(Draw::new_bundle(draw_id, bundle_id, pipeline_id, uses));
         self
     }
 

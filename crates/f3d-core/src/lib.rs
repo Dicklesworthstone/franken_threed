@@ -45,8 +45,8 @@ pub use manifest::{
     PINNED_UPSTREAM_RELEASE,
 };
 pub use ownership::{
-    Author, DataVersion, Epoch, OwnerMode, OwnershipError, PerUseByteBuffer,
-    PerUseSnapshotStore, RegionState, SnapshotEntry, UseRecord,
+    Author, BorrowScope, BorrowState, BorrowToken, CopyAccounting, DataVersion, Epoch, OwnerMode,
+    OwnershipError, PerUseByteBuffer, PerUseSnapshotStore, RegionState, SnapshotEntry, UseRecord,
 };
 
 #[cfg(test)]

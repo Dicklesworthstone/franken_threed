@@ -21,8 +21,8 @@ use f3d_graph::canvas::{CanvasEpochTracker, CanvasFormat, CanvasId};
 use f3d_graph::error::{CanvasError, GraphError, HazardError};
 use f3d_graph::hazard::{can_split_pass, split_pass_on_hazard, validate_pass_hazards};
 use f3d_graph::pass::{
-    ColorAttachment, CopyCommand, DepthStencilAttachment, Dispatch, Draw, LoadOp, Pass, PassId,
-    PassKind, StoreOp,
+    ColorAttachment, CopyCommand, DepthStencilAttachment, Dispatch, Draw, DrawKind, LoadOp, Pass,
+    PassId, PassKind, RenderBundle, StoreOp,
 };
 use f3d_graph::plan::{
     build_red_a_blue_b_plan, build_red_a_blue_b_render_plan, build_single_pass_bridge_plan,
@@ -1107,4 +1107,139 @@ fn copy_in_render_pass_and_overlapping_copy_endpoints_rejected() {
     });
     let err2 = validate_pass_hazards(&copy_pass).expect_err("overlapping copy must fail");
     assert_eq!(err2, HazardError::OverlappingCopyEndpoints { resource_id: 1 });
+}
+
+#[test]
+fn bundle_inside_copy_pass_rejected() {
+    let mut pass = Pass::new_copy(PassId::new(10), "copy_with_bundle");
+    let bundle_draw = Draw::new_bundle(0, 42, 100, vec![]);
+    pass.draws.push(bundle_draw);
+
+    // Direct hazard check
+    let err = validate_pass_hazards(&pass).expect_err("bundle inside copy pass must be rejected");
+    assert_eq!(err, HazardError::BundleInCopyPass { pass_id: 10 });
+
+    // Through PassGraph compilation
+    let mut graph = PassGraph::new();
+    graph.add_pass(pass).expect("add pass");
+    let compile_err = graph
+        .compile(None)
+        .expect_err("compilation of copy pass with bundle must fail");
+    assert_eq!(
+        compile_err,
+        GraphError::Hazard(HazardError::BundleInCopyPass { pass_id: 10 })
+    );
+}
+
+#[test]
+fn bundle_then_direct_draw_requires_rebind() {
+    let target_tex = ResourceId::new(10);
+    let mut pass = Pass::new_render(PassId::new(1), "bundle_pass");
+    pass.color_attachments
+        .push(ColorAttachment::new_clear(target_tex, [0.0, 0.0, 0.0, 1.0]));
+
+    // Draw 0: Render bundle execution
+    let bundle_draw = Draw::new_bundle(0, 42, 100, vec![]);
+    pass.draws.push(bundle_draw);
+
+    // Draw 1: Direct draw assuming warm state (omitting rebind) -> must fail!
+    let direct_warm = Draw::new(1, 100, 3, 0, vec![]).with_assumes_warm_state(true);
+    pass.draws.push(direct_warm);
+
+    let err = validate_pass_hazards(&pass)
+        .expect_err("direct draw assuming warm state after bundle must fail");
+    assert_eq!(
+        err,
+        HazardError::BundleDirectDrawRequiresRebind {
+            pass_id: 1,
+            draw_id: 1,
+        }
+    );
+
+    // Compilation through PassGraph must also fail with exact hazard
+    let mut bad_graph = PassGraph::new();
+    bad_graph.add_pass(pass.clone()).expect("add pass");
+    let bad_compile = bad_graph.compile(None).expect_err("compile must fail");
+    assert_eq!(
+        bad_compile,
+        GraphError::Hazard(HazardError::BundleDirectDrawRequiresRebind {
+            pass_id: 1,
+            draw_id: 1,
+        })
+    );
+
+    // Now update Draw 1 to explicitly rebind (requires_rebind = true / assumes_warm_state = false)
+    pass.draws[1] = Draw::new(1, 100, 3, 0, vec![]).with_rebind_required(true);
+
+    assert!(validate_pass_hazards(&pass).is_ok());
+
+    let mut good_graph = PassGraph::new();
+    good_graph.add_pass(pass).expect("add pass");
+    let plan = good_graph.compile(None).expect("compile succeeds");
+
+    // Assert plan and segment bundle accessors
+    assert!(plan.has_bundles());
+    assert_eq!(plan.total_bundle_count(), 1);
+    assert_eq!(plan.segment_count(), 1);
+
+    let seg = &plan.segments()[0];
+    assert!(seg.has_bundles());
+    assert_eq!(seg.bundle_count(), 1);
+    assert_eq!(seg.bundle_boundaries(), vec![0]);
+    assert_eq!(seg.bundle_ids(), vec![42]);
+
+    // Draw 1 directly follows bundle Draw 0, so it crosses bundle boundary
+    assert!(seg.draw_crosses_bundle_boundary(1));
+    // Draw 0 does not follow a bundle
+    assert!(!seg.draw_crosses_bundle_boundary(0));
+
+    // Inspect individual draws
+    assert!(seg.draws()[0].is_bundle());
+    assert_eq!(seg.draws()[0].bundle_id(), Some(42));
+    assert_eq!(seg.draws()[0].kind(), DrawKind::Bundle { bundle_id: 42 });
+
+    assert!(seg.draws()[1].is_direct());
+    assert_eq!(seg.draws()[1].bundle_id(), None);
+    assert_eq!(seg.draws()[1].kind(), DrawKind::Direct);
+    assert!(seg.draws()[1].rebind_required());
+    assert!(!seg.draws()[1].assumes_warm_state());
+}
+
+#[test]
+fn bundle_state_reset_interleaved_warm_state_lifecycle() {
+    let target_tex = ResourceId::new(10);
+    let mut pass = Pass::new_render(PassId::new(1), "interleaved_bundle_pass");
+    pass.color_attachments
+        .push(ColorAttachment::new_clear(target_tex, [0.0, 0.0, 0.0, 1.0]));
+
+    // Pass helper: add bundle via RenderBundle
+    let bundle = RenderBundle::new(50, 100, vec![]);
+    pass = pass.with_bundle(bundle); // Draw 0: Bundle 50
+
+    // Draw 1: Direct draw with explicit rebind
+    let draw1 = Draw::new(1, 100, 3, 0, vec![]);
+    pass = pass.with_draw(draw1);
+
+    // Draw 2: Direct draw assuming warm state (inheriting Draw 1's state) -> LEGAL!
+    let draw2 = Draw::new_warm_state(2, 100, 3, 0, vec![]);
+    pass = pass.with_draw(draw2);
+
+    // Validation must succeed because Draw 1 rebinded after Bundle 50
+    assert!(validate_pass_hazards(&pass).is_ok());
+
+    // Draw 3: Another bundle
+    pass = pass.with_bundle_draw(51, 101, vec![]);
+
+    // Draw 4: Direct draw assuming warm state after Bundle 51 -> ILLEGAL!
+    let draw4 = Draw::new_warm_state(4, 101, 3, 0, vec![]);
+    pass = pass.with_draw(draw4);
+
+    let err = validate_pass_hazards(&pass).expect_err("Draw 4 must rebind after Bundle 51");
+    assert_eq!(
+        err,
+        HazardError::BundleDirectDrawRequiresRebind {
+            pass_id: 1,
+            draw_id: 4,
+        }
+    );
 }

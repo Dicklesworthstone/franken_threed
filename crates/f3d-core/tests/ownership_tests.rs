@@ -5,8 +5,8 @@
 use core::num::NonZeroU32;
 use f3d_core::handle::{Handle, MaterialDomain, RegionDomain};
 use f3d_core::ownership::{
-    Author, DataVersion, Epoch, OwnerMode, OwnershipError, PerUseByteBuffer, PerUseSnapshotStore,
-    RegionState, UseRecord,
+    Author, BorrowScope, BorrowState, BorrowToken, CopyAccounting, DataVersion, Epoch, OwnerMode,
+    OwnershipError, PerUseByteBuffer, PerUseSnapshotStore, RegionState, UseRecord,
 };
 
 #[test]
@@ -658,3 +658,205 @@ fn store_id_overflow_near_max_fails_cleanly() {
     // Reset store ID counter for other tests
     f3d_core::ownership::set_next_store_id_for_testing(100_000);
 }
+
+#[test]
+fn borrow_scope_positive_lifecycle_and_view_accounting() {
+    let mut scope = BorrowScope::new();
+    assert_eq!(scope.state(), BorrowState::Idle);
+    assert!(scope.is_idle());
+    assert!(!scope.is_borrowed());
+    assert!(!scope.is_growth_blocked());
+    assert_eq!(scope.growth_generation(), 1);
+
+    // Enter borrow scope
+    let token = scope.enter().expect("enter borrow scope");
+    assert_eq!(token.get(), 1);
+    assert_eq!(scope.state(), BorrowState::Borrowed);
+    assert!(scope.is_borrowed());
+    assert!(!scope.is_idle());
+    assert!(scope.is_growth_blocked());
+
+    // Record zero-copy view bytes while borrowed
+    scope.record_view_bytes(512).expect("record view bytes ok");
+    assert_eq!(scope.accounting().bytes_view, 512);
+    assert_eq!(scope.accounting().total_copied_bytes(), 0);
+    assert_eq!(scope.accounting().total_transported_bytes(), 512);
+
+    // Exit borrow scope with valid token
+    scope.exit(token).expect("exit borrow scope");
+    assert_eq!(scope.state(), BorrowState::Idle);
+    assert!(scope.is_idle());
+    assert!(!scope.is_borrowed());
+    assert!(!scope.is_growth_blocked());
+
+    // Growth generation remains stable across clean borrows without growth
+    assert_eq!(scope.growth_generation(), 1);
+}
+
+#[test]
+fn borrow_scope_reentry_strictly_rejected() {
+    let mut scope = BorrowScope::new();
+    let token1 = scope.enter().expect("initial enter ok");
+    assert_eq!(token1.get(), 1);
+
+    // Reentrant enter attempt fails with typed error containing active token
+    let err = scope.enter().expect_err("reentrant enter must fail");
+    assert_eq!(
+        err,
+        OwnershipError::BorrowScopeReentry {
+            active_token: 1,
+        }
+    );
+
+    // Scope remains borrowed
+    assert_eq!(scope.state(), BorrowState::Borrowed);
+
+    // Exit first borrow
+    scope.exit(token1).expect("exit first borrow");
+    assert!(scope.is_idle());
+
+    // Next enter succeeds with incremented token ID
+    let token2 = scope.enter().expect("second enter ok");
+    assert_eq!(token2.get(), 2);
+    scope.exit(token2).expect("exit second borrow");
+}
+
+#[test]
+fn borrow_scope_growth_during_borrow_strictly_rejected() {
+    let mut scope = BorrowScope::new();
+    assert_eq!(scope.growth_generation(), 1);
+
+    // When idle, linear memory growth succeeds and increments generation
+    let growth_gen2 = scope.record_growth(4).expect("growth while idle ok");
+    assert_eq!(growth_gen2, 2);
+    assert_eq!(scope.growth_generation(), 2);
+
+    // Enter borrow scope
+    let token = scope.enter().expect("enter ok");
+
+    // Attempting linear memory growth while borrowed is strictly rejected
+    let err = scope.record_growth(1).expect_err("growth while borrowed must fail");
+    assert_eq!(
+        err,
+        OwnershipError::LinearMemoryGrowthBlocked {
+            state: BorrowState::Borrowed,
+        }
+    );
+
+    // Generation did not advance
+    assert_eq!(scope.growth_generation(), 2);
+
+    // Exit borrow scope
+    scope.exit(token).expect("exit ok");
+
+    // Growth succeeds again after exit
+    let growth_gen3 = scope.record_growth(2).expect("growth after exit ok");
+    assert_eq!(growth_gen3, 3);
+    assert_eq!(scope.growth_generation(), 3);
+}
+
+#[test]
+fn borrow_scope_explicit_growth_blocked_state() {
+    let mut scope = BorrowScope::new();
+    scope.block_growth();
+    assert_eq!(scope.state(), BorrowState::GrowthBlocked);
+    assert!(scope.is_growth_blocked());
+    assert!(!scope.is_idle());
+    assert!(!scope.is_borrowed());
+
+    // Linear memory growth rejected in GrowthBlocked state
+    let err = scope.record_growth(1).expect_err("growth blocked");
+    assert_eq!(
+        err,
+        OwnershipError::LinearMemoryGrowthBlocked {
+            state: BorrowState::GrowthBlocked,
+        }
+    );
+
+    // Borrows can still be taken while growth is blocked
+    let token = scope.enter().expect("borrow while growth blocked ok");
+    assert_eq!(scope.state(), BorrowState::Borrowed);
+    assert!(scope.is_borrowed());
+
+    // Exiting returns state to GrowthBlocked because explicit block is active
+    scope.exit(token).expect("exit ok");
+    assert_eq!(scope.state(), BorrowState::GrowthBlocked);
+
+    // Unblocking restores Idle state and permits growth
+    scope.unblock_growth();
+    assert_eq!(scope.state(), BorrowState::Idle);
+    assert!(scope.is_idle());
+    let growth_gen = scope.record_growth(1).expect("growth unblocked");
+    assert_eq!(growth_gen, 2);
+}
+
+#[test]
+fn borrow_scope_exit_validation_and_token_mismatch() {
+    let mut scope = BorrowScope::new();
+
+    // Exiting while idle fails
+    let err_idle = scope
+        .exit(BorrowToken::new(1))
+        .expect_err("exit while idle must fail");
+    assert_eq!(err_idle, OwnershipError::BorrowScopeNotActive);
+
+    // Enter scope -> gets token 1
+    let token1 = scope.enter().expect("enter ok");
+    assert_eq!(token1, BorrowToken::new(1));
+
+    // Exiting with wrong token fails
+    let err_mismatch = scope
+        .exit(BorrowToken::new(999))
+        .expect_err("exit with mismatched token must fail");
+    assert_eq!(
+        err_mismatch,
+        OwnershipError::BorrowTokenMismatch {
+            expected: 1,
+            actual: 999,
+        }
+    );
+
+    // State remains borrowed despite failed exit attempt
+    assert_eq!(scope.state(), BorrowState::Borrowed);
+
+    // Exiting with correct token succeeds
+    scope.exit(token1).expect("exit with correct token ok");
+    assert_eq!(scope.state(), BorrowState::Idle);
+}
+
+#[test]
+fn borrow_scope_exact_copy_accounting_counters() {
+    let mut scope = BorrowScope::new();
+
+    // Recording view bytes outside borrow scope is rejected
+    let err_view = scope
+        .record_view_bytes(1024)
+        .expect_err("view outside borrow scope must fail");
+    assert_eq!(err_view, OwnershipError::BorrowScopeNotActive);
+
+    // Enter borrow and record view bytes
+    let token = scope.enter().expect("enter ok");
+    scope.record_view_bytes(1024).expect("record view ok");
+    scope.record_view_bytes(2048).expect("record second view ok");
+    scope.exit(token).expect("exit ok");
+
+    // Record copies (which can happen outside or inside borrows)
+    scope.record_write_buffer_copy(4096);
+    scope.record_staging_copy(512);
+
+    let acct = scope.accounting();
+    assert_eq!(acct.bytes_view, 3072);
+    assert_eq!(acct.bytes_copied_write_buffer, 4096);
+    assert_eq!(acct.bytes_copied_staging, 512);
+    assert_eq!(acct.total_copied_bytes(), 4608);
+    assert_eq!(acct.total_transported_bytes(), 7680);
+
+    // Reset counters (e.g. at frame boundary)
+    scope.accounting_mut().reset();
+    assert_eq!(scope.accounting().bytes_view, 0);
+    assert_eq!(scope.accounting().bytes_copied_write_buffer, 0);
+    assert_eq!(scope.accounting().bytes_copied_staging, 0);
+    assert_eq!(scope.accounting().total_copied_bytes(), 0);
+    assert_eq!(scope.accounting().total_transported_bytes(), 0);
+}
+

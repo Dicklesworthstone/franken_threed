@@ -14,6 +14,7 @@
  * 8. Reentrant constructor regression: reentrant route switch on same canvas rejected with RouteLockError.
  * 9. Native object shape preservation on sealed and frozen instances via external WeakMap diagnostics.
  * 10. Connected groups residency conflict rejection when non-exact renderer is already committed.
+ * 11. Exact-backend component: pinned WebGLRenderer constructed through router with real WebGL2 context on DOM canvas (f3d-04.3).
  */
 
 import {
@@ -21,12 +22,16 @@ import {
   RouteLockError,
   RendererConstructionRouter,
   getRendererRoute,
+  ExactWebGLRenderer,
+  registerExactBackend,
+  createExactBackendRouter,
+  createExactWebGLRenderer,
 } from '../../../tools/compat/index.mjs';
 
 import { WebGLRenderer as PinnedWebGLRenderer } from '../../../upstream/three.js/build/three.module.js';
 import { WebGPURenderer as PinnedWebGPURenderer } from '../../../upstream/three.js/build/three.webgpu.js';
 
-export { PinnedWebGLRenderer, PinnedWebGPURenderer };
+export { PinnedWebGLRenderer, PinnedWebGPURenderer, ExactWebGLRenderer };
 
 /**
  * Run the browser native identity verification suite against real DOM canvases
@@ -453,6 +458,86 @@ export async function runBrowserNativeIdentityVerification() {
   } catch (err) {
     results.push({
       test: 'connected_groups_residency_hazard_rejected',
+      status: 'fail',
+      error: err.message,
+    });
+  }
+
+  // Test 11: Exact-backend component constructs through router and asserts pinned class with real WebGL2 context
+  try {
+    const canvas11 = document.createElement('canvas');
+    canvas11.id = 'canvas-exact-backend-module';
+    canvas11.width = 64;
+    canvas11.height = 64;
+    document.body.appendChild(canvas11);
+
+    // Construct through the registered exact backend router
+    const exactRouter = createExactBackendRouter();
+    const glRenderer = exactRouter.routeAndConstruct({
+      constructorFn: PinnedWebGLRenderer,
+      constructorName: 'WebGLRenderer',
+      options: { canvas: canvas11 },
+      sourceSpan: 'browser_native_identity.html:test11',
+    });
+
+    if (!(glRenderer instanceof PinnedWebGLRenderer)) {
+      throw new Error('Constructed instance is not an instance of pinned Three.js WebGLRenderer');
+    }
+
+    if (glRenderer.isWebGLRenderer !== true) {
+      throw new Error('Renderer instance missing isWebGLRenderer property');
+    }
+
+    // Verify native context identity and attributes verbatim
+    const rawGl = glRenderer.getContext();
+    if (!rawGl) {
+      throw new Error('glRenderer.getContext() returned null or undefined');
+    }
+
+    const isRealWebGL2 = typeof WebGL2RenderingContext !== 'undefined' && rawGl instanceof WebGL2RenderingContext;
+    const isRealWebGL = typeof WebGLRenderingContext !== 'undefined' && rawGl instanceof WebGLRenderingContext;
+
+    if (!isRealWebGL2 && !isRealWebGL) {
+      throw new Error('Acquired context is not an instance of native WebGL(2)RenderingContext');
+    }
+
+    if (rawGl.canvas !== canvas11) {
+      throw new Error('Native context canvas does not match DOM canvas');
+    }
+
+    const attrs = glRenderer.getContextAttributes();
+    if (!attrs || typeof attrs !== 'object') {
+      throw new Error('getContextAttributes() failed or returned non-object');
+    }
+
+    // Also verify direct helper entry point createExactWebGLRenderer
+    const canvas11b = document.createElement('canvas');
+    canvas11b.id = 'canvas-exact-helper-module';
+    canvas11b.width = 64;
+    canvas11b.height = 64;
+    document.body.appendChild(canvas11b);
+
+    const helperRenderer = createExactWebGLRenderer({ canvas: canvas11b }, exactRouter);
+    if (!(helperRenderer instanceof PinnedWebGLRenderer)) {
+      throw new Error('createExactWebGLRenderer returned instance not matching pinned WebGLRenderer class');
+    }
+
+    const helperGl = helperRenderer.getContext();
+    if (!helperGl || helperGl.canvas !== canvas11b) {
+      throw new Error('Helper renderer GL context canvas mismatch');
+    }
+
+    results.push({
+      test: 'exact_backend_router_pinned_webgl2_identity',
+      status: 'pass',
+      route: getRendererRoute(glRenderer),
+      implementation: 'PinnedWebGLRenderer',
+      nativeContext: rawGl.constructor.name,
+      isWebGL2: isRealWebGL2,
+    });
+  } catch (err) {
+    results.push({
+      test: 'exact_backend_router_pinned_webgl2_identity',
       status: 'fail',
       error: err.message,
     });

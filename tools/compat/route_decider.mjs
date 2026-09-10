@@ -109,9 +109,14 @@ export function decideRendererRoute(input = {}) {
   const hasNativeContextAccess = Boolean(analysis.hasNativeContextAccess || analysis.has_native_context_access);
   const hasUnresolvedContextAccess = Boolean(analysis.hasUnresolvedContextAccess || analysis.has_unresolved_context_access);
 
+  const isBrowser = typeof window !== 'undefined';
   const hostCapabilities = {
-    hasWebGPU: typeof navigator !== 'undefined' && 'gpu' in navigator ? true : (input.hostCapabilities?.hasWebGPU ?? false),
-    hasWebGL: typeof window !== 'undefined' ? true : (input.hostCapabilities?.hasWebGL ?? true),
+    hasWebGPU: isBrowser
+      ? (typeof navigator !== 'undefined' && 'gpu' in navigator)
+      : (input.hostCapabilities?.hasWebGPU ?? true),
+    hasWebGL: isBrowser
+      ? true
+      : (input.hostCapabilities?.hasWebGL ?? true),
     ...input.hostCapabilities,
   };
   const specializationAvailable = input.specializationAvailable ?? false;

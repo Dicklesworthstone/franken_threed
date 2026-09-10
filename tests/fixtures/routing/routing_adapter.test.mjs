@@ -39,6 +39,11 @@ import {
   getRendererDecision,
   generateRouteReport,
   formatRouteReport,
+  PinnedWebGLRenderer,
+  ExactWebGLRenderer,
+  registerExactBackend,
+  createExactBackendRouter,
+  createExactWebGLRenderer,
 } from '../../../tools/compat/index.mjs';
 
 import { buildModuleGraph } from '../../../tools/ingest/index.mjs';
@@ -805,19 +810,20 @@ test('Regression: Real H1 bundle with non-literal forceWebGL (! api.webgpu) reco
 
   // 4. Runtime construction router defers to runtime value:
   // When runtime option evaluates to forceWebGL: true (e.g. ?backend=webgl), routes to EXACT_BACKEND
-  const router = new RendererConstructionRouter({
-    specializationAvailable: true,
-    implementations: {
-      [ExecutionRoute.EXACT_BACKEND]: AdmittedWebGLRenderer,
-    },
-  });
-
   class MockWebGPURenderer {
     constructor(opts = {}) {
       this.isWebGPURenderer = true;
       this.opts = opts;
     }
   }
+
+  const router = new RendererConstructionRouter({
+    specializationAvailable: true,
+    implementations: {
+      [ExecutionRoute.EXACT_BACKEND]: AdmittedWebGLRenderer,
+      [ExecutionRoute.SPECIALIZED_WEBGPU]: MockWebGPURenderer,
+    },
+  });
 
   const runtimeForcedInstance = router.routeAndConstruct({
     constructorFn: MockWebGPURenderer,
@@ -839,6 +845,31 @@ test('Regression: Real H1 bundle with non-literal forceWebGL (! api.webgpu) reco
   });
   assert.equal(getRendererRoute(runtimeUnforcedInstance), ExecutionRoute.SPECIALIZED_WEBGPU);
   assert.equal(runtimeUnforcedInstance.isWebGPURenderer, true);
+});
+
+test('Positive: exact_backend component exports pinned WebGLRenderer and registers with construction router', () => {
+  assert.equal(typeof PinnedWebGLRenderer, 'function');
+  assert.equal(PinnedWebGLRenderer.name, 'WebGLRenderer');
+  assert.equal(ExactWebGLRenderer, PinnedWebGLRenderer);
+
+  // Registration on existing router
+  const customRouter = new RendererConstructionRouter();
+  assert.equal(customRouter.implementations[ExecutionRoute.EXACT_BACKEND], undefined);
+  registerExactBackend(customRouter);
+  assert.equal(customRouter.implementations[ExecutionRoute.EXACT_BACKEND], PinnedWebGLRenderer);
+
+  // Invalid router throws TypeError
+  assert.throws(() => registerExactBackend(null), /TypeError/);
+  assert.throws(() => registerExactBackend({}), /TypeError/);
+
+  // Factory creation
+  const exactRouter = createExactBackendRouter();
+  assert.equal(exactRouter.implementations[ExecutionRoute.EXACT_BACKEND], PinnedWebGLRenderer);
+
+  // Config propagation
+  const configuredRouter = createExactBackendRouter({ specializationAvailable: true });
+  assert.equal(configuredRouter.specializationAvailable, true);
+  assert.equal(configuredRouter.implementations[ExecutionRoute.EXACT_BACKEND], PinnedWebGLRenderer);
 });
 
 

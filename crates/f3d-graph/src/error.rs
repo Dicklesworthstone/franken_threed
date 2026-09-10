@@ -6,6 +6,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
+use crate::pass::PassKind;
 use crate::resource::{ResourceAccess, SubresourceRange};
 
 /// Top-level error type for pass graph compilation, scheduling, and validation.
@@ -153,6 +154,29 @@ pub enum HazardError {
         /// Pass where illegal copy was attempted.
         pass_id: u32,
     },
+    /// Attempted to execute a render bundle inside a copy pass (§8.5, AGENTS.md).
+    BundleInCopyPass {
+        /// Pass where illegal bundle was attempted.
+        pass_id: u32,
+    },
+    /// A direct draw following a render bundle assumed warm state instead of rebinding (§8.5, AGENTS.md).
+    ///
+    /// WebGPU specification invariant: `executeBundles` invalidates/resets all cached
+    /// pipeline and bind group state on the render pass encoder. Any direct draw following
+    /// a bundle must explicitly rebind; warm-state assumptions are strictly rejected.
+    BundleDirectDrawRequiresRebind {
+        /// Pass where the violation occurred.
+        pass_id: u32,
+        /// Draw identifier that assumed warm state without rebinding.
+        draw_id: u32,
+    },
+    /// Attempted to execute a render bundle inside a non-render pass (§8.5).
+    BundleInNonRenderPass {
+        /// Pass where illegal bundle was attempted.
+        pass_id: u32,
+        /// Execution category of the invalid pass.
+        pass_kind: PassKind,
+    },
 }
 
 impl fmt::Display for HazardError {
@@ -214,6 +238,25 @@ impl fmt::Display for HazardError {
                 write!(
                     f,
                     "copy command cannot be inserted inside render pass {pass_id}; copies must be in dedicated Copy passes"
+                )
+            }
+            Self::BundleInCopyPass { pass_id } => {
+                write!(
+                    f,
+                    "render bundle cannot be executed inside copy pass {pass_id}; bundles execute strictly within Render passes"
+                )
+            }
+            Self::BundleDirectDrawRequiresRebind { pass_id, draw_id } => {
+                write!(
+                    f,
+                    "direct draw {draw_id} in pass {pass_id} follows a render bundle and assumes warm state; \
+                     bundle execution resets render pass state, requiring explicit rebind"
+                )
+            }
+            Self::BundleInNonRenderPass { pass_id, pass_kind } => {
+                write!(
+                    f,
+                    "render bundle cannot be executed inside {pass_kind:?} pass {pass_id}; bundles execute strictly within Render passes"
                 )
             }
         }

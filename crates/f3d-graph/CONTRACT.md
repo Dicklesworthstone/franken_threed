@@ -128,6 +128,9 @@ public crate APIs <- conformance
   - Negative: Canvas texture caching across output epochs rejected.
   - Positive: Bridge single-pass and two-target plans matching ChartreuseFern's bridge protocol.
   - Positive: Versioned buffer snapshot (Red-A / Blue-B) preserving distinct `DataVersion`s without overwrite.
+  - Negative: Render bundle execution inside a copy pass is rejected (`HazardError::BundleInCopyPass`).
+  - Negative & Positive: Direct draw following a bundle assuming warm state is rejected (`HazardError::BundleDirectDrawRequiresRebind`), while explicit rebind succeeds and correctly reports bundle boundaries and bundle IDs.
+  - Positive: Interleaved bundle and direct draw lifecycle where draws following explicit rebind can inherit state, but a subsequent bundle immediately resets state again.
 
 ---
 
@@ -148,6 +151,8 @@ ChartreuseFern's `crates/f3d-runtime/src/gpu_host.rs` reads compiled `ExecutionP
 | `plan.pass_count()` | `usize` | Number of executed passes produced after compilation. |
 | `plan.split_count()` | `usize` | Number of split passes introduced during hazard resolution. |
 | `plan.split_reasons()` | `&[String]` | Diagnostic descriptions of any pass splits. |
+| `plan.has_bundles()` | `bool` | Returns `true` if any segment executes a render bundle. |
+| `plan.total_bundle_count()` | `usize` | Total number of render bundle executions across all segments. |
 | `plan.validate_execution(tracker)` | `Result<(), GraphError>` | Validates canvas epoch freshness against active tracker intervals. |
 
 ### 11.2 PlanSegment Accessors
@@ -163,9 +168,14 @@ ChartreuseFern's `crates/f3d-runtime/src/gpu_host.rs` reads compiled `ExecutionP
 | `seg.color_attachments()` | `&[ColorAttachment]` | All color attachments bound to this segment. |
 | `seg.primary_color_attachment()` | `Option<&ColorAttachment>` | First color attachment, if any. |
 | `seg.depth_stencil_attachment()` | `Option<&DepthStencilAttachment>` | Optional depth/stencil attachment configuration. |
-| `seg.draws()` | `&[Draw]` | Slice of draw call buckets in this segment. |
+| `seg.draws()` | `&[Draw]` | Slice of draw call buckets in this segment (both direct draws and bundle executions). |
 | `seg.draw_count()` | `usize` | Number of draw call buckets. |
 | `seg.first_draw()` | `Option<&Draw>` | First draw call bucket, if any. |
+| `seg.has_bundles()` | `bool` | Returns `true` if this segment contains any bundle executions. |
+| `seg.bundle_count()` | `usize` | Number of render bundle executions in this segment. |
+| `seg.bundle_boundaries()` | `Vec<usize>` | Draw indices of all bundle executions marking state reset points. |
+| `seg.bundle_ids()` | `Vec<u32>` | List of all bundle IDs executed in this segment. |
+| `seg.draw_crosses_bundle_boundary(draw_idx)` | `bool` | `true` if draw command at `draw_idx` directly follows a bundle execution. |
 | `seg.dispatches()` | `&[Dispatch]` | Slice of compute dispatches in this segment. |
 | `seg.dispatch_count()` | `usize` | Number of compute dispatches. |
 | `seg.copies()` | `&[CopyCommand]` | Slice of copy commands in this segment. |
@@ -190,6 +200,12 @@ ChartreuseFern's `crates/f3d-runtime/src/gpu_host.rs` reads compiled `ExecutionP
 | `DepthStencilAttachment` | `depth_store_op()` | `Option<StoreOp>` | Depth store operation. |
 | `DepthStencilAttachment` | `depth_clear_value()` | `f32` | Depth clear value (typically `1.0`). |
 | `DepthStencilAttachment` | `depth_read_only()` | `bool` | Whether depth writes are disabled. |
+| `Draw` | `kind()` | `DrawKind` | Command category (`Direct` or `Bundle { bundle_id }`). |
+| `Draw` | `is_bundle()` | `bool` | `true` if this command executes a pre-recorded render bundle. |
+| `Draw` | `is_direct()` | `bool` | `true` if this command is a direct draw. |
+| `Draw` | `bundle_id()` | `Option<u32>` | Pre-recorded bundle identifier (`None` for direct draws). |
+| `Draw` | `assumes_warm_state()` | `bool` | `true` if this draw assumes warm/inherited pipeline and binding state. |
+| `Draw` | `rebind_required()` | `bool` | `true` if this draw explicitly rebinds its pipeline and resources. |
 | `Draw` | `pipeline_id()` | `u32` | Bound shader/pipeline variant handle. |
 | `Draw` | `vertex_count()` | `u32` | Number of vertices to draw. |
 | `Draw` | `instance_count()` | `u32` | Number of instances to draw. |
@@ -208,6 +224,28 @@ ChartreuseFern's `crates/f3d-runtime/src/gpu_host.rs` reads compiled `ExecutionP
 | `build_two_target_bridge_plan` | `(offscreen_tex, canvas_res, readback_buf, pipeline_offscreen, pipeline_canvas, vbuf, vcount, width, height, version, canvas_epoch, canvas_tracker)` | 2 Render passes + 1 Copy pass |
 | `build_red_a_blue_b_plan` | `(shared_buf, target_a, target_b, readback_a, readback_b, red_version, blue_version, red_offset, blue_offset, pipeline_id)` | 2 Render passes (black clear `[0.0, 0.0, 0.0, 1.0]`) + 2 Copy passes (`aligned_bytes_per_row(64)`) |
 | `build_red_a_blue_b_render_plan` | `(shared_buf, target_a, target_b, red_version, blue_version, red_offset, blue_offset, pipeline_id)` | 2 Render passes (black clear `[0.0, 0.0, 0.0, 1.0]`) without readback copies |
+
+### 11.5 Render Bundle State-Reset Contract for Bridge Consumption (`gpu_host.rs`)
+
+> **NO-CLAIM: Exposing render bundle boundaries and state-reset tracking is a compositional graph invariant; it is not physical GPU bundle execution, driver command recording, or measured frame acceleration.**
+
+In WebGPU, pre-recorded `GPURenderBundle` objects are executed inside a render pass via `GPURenderPassEncoder.executeBundles([bundle])`.
+
+#### Invariants & Hazard Rules:
+1. **Pass Segregation**: Render bundles execute strictly within `PassKind::Render` passes. Placing a render bundle inside a `PassKind::Copy` pass is an illegal usage hazard and returns `HazardError::BundleInCopyPass { pass_id }`. Placing a bundle inside a `PassKind::Compute` pass returns `HazardError::BundleInNonRenderPass { pass_id, pass_kind: PassKind::Compute }`.
+2. **WebGPU State Invalidation**: Per WebGPU specification, invoking `executeBundles` resets all pipeline state, vertex buffer bindings, index buffer bindings, and bind groups on the current render pass encoder to an empty/unbound state.
+3. **Rebind Requirement (No Warm-State Assumption)**: Any direct draw that immediately follows a render bundle execution within the same render pass CANNOT assume warm state (`assumes_warm_state: true`). It must explicitly rebind its pipeline and bindings (`rebind_required: true` / `assumes_warm_state: false`). Violations are rejected during pass validation with `HazardError::BundleDirectDrawRequiresRebind { pass_id, draw_id }`.
+4. **Subsequent Draw State Propagation**: Once a direct draw following a bundle has rebinded, subsequent direct draws may inherit that restored state until another bundle execution is encountered.
+
+#### Consumer Guide for ChartreuseFern (`f3d-runtime/src/gpu_host.rs`):
+When lowering a `PlanSegment` of kind `PassKind::Render` into `GpuCommand` entries:
+- Iterate through `segment.draws()`.
+- For each `draw`:
+  - If `draw.is_bundle()` (or `if let Some(bundle_id) = draw.bundle_id()`):
+    Emit `GpuCommand::ExecuteBundles { bundle_id }` (or corresponding packet opcode `OPCODE_EXECUTE_BUNDLES`).
+  - If `draw.is_direct()`:
+    If `segment.draw_crosses_bundle_boundary(draw_index)` or `draw.rebind_required()`:
+    Ensure pipeline and bind groups are recorded fresh rather than skipped under any driver-level state cache.
 
 ---
 

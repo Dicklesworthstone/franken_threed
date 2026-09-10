@@ -15,9 +15,12 @@
 
 pub mod conversion;
 pub mod matrix4;
+pub mod narrowing;
 pub mod quaternion;
 pub mod vector3;
 
 pub use matrix4::{CoordinateSystem, Matrix4};
+pub use narrowing::{check_narrow_f64, NarrowingError, NarrowingTolerance};
 pub use quaternion::Quaternion;
 pub use vector3::Vector3;
+

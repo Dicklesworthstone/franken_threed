@@ -28,7 +28,9 @@ core/math <- scene
 | `Quaternion` | 4D quaternion `(x: f64, y: f64, z: f64, w: f64)`. Implements Hamiltonian multiplication, conjugate, invert (via conjugate for unit quaternions), dot, length, and normalize (resets to identity on zero length). Non-unit authored quaternions are preserved and never normalized prematurely. |
 | `Matrix4` | 4x4 matrix stored in column-major order `elements: [f64; 16]`. Implements `multiply_matrices`, `multiply`, `premultiply`, `compose(pos, quat, scale)`, `decompose`, `transpose`, `determinant`, `determinant_affine`, `invert`, `make_perspective`, and `make_orthographic`. |
 | `CoordinateSystem` | Target clip space enum: `CoordinateSystem::WebGL` (depth range [-1, 1], value 2000) and `CoordinateSystem::WebGPU` (depth range [0, 1], value 2001). |
-| Seam conversions | `Matrix4::to_affine_rows(&self) -> Result<AffineRows, LayoutError>`, `Matrix4::from_affine_rows(&AffineRows) -> Self`, `Matrix4::to_projective_mat4(&self) -> ProjectiveMat4`, and `Matrix4::from_projective_mat4(&ProjectiveMat4) -> Self`, bridging CPU simulation math to the verified GPU layouts in `f3d-core` without duplicating wire definitions. |
+| `NarrowingTolerance` | Configurable tolerance parameters: `max_abs_err: f64` and `max_rel_err: f64`, with constants `EXACT`, `DEFAULT_FLOAT`, `PERMISSIVE`. |
+| `NarrowingError` | Error enum with variants `NonFinite { index, value }`, `PrecisionLossExceeded { index, original, narrowed, abs_diff, rel_diff, max_abs_err, max_rel_err }`, and `NonAffineMatrix`. |
+| Seam conversions | `Matrix4::to_affine_rows`, `to_affine_rows_checked`, `to_affine_rows_strict`, `to_projective_mat4`, `to_projective_mat4_checked`, and `to_projective_mat4_strict`, bridging CPU simulation math to the verified GPU layouts in `f3d-core` with explicit precision policy enforcement. |
 
 ---
 
@@ -47,6 +49,7 @@ core/math <- scene
 6. **Signed Zero & IEEE 754**: Calculations use standard IEEE 754 `f64` double precision, preserving signed zero (`-0.0`) and exceptional values (`Infinity`, `NaN`) without artificial clamping.
 7. **No Wire Layout Duplication**: GPU wire layouts (`AffineRows`, `ProjectiveMat4`) reside exclusively in `f3d-core::layout`; `f3d-math` implements conversion methods against those canonical types.
 8. **Projection Matrices & Wire Layouts**: Perspective matrices (`e[11] = -1.0, e[15] = 0.0`) are strictly rejected by `to_affine_rows` and retained byte-for-byte by `to_projective_mat4`. Orthographic matrices (`e[11] = 0.0, e[15] = 1.0`) are affine and convert to `AffineRows`.
+9. **Explicit f64 to f32 Wire Narrowing Policy**: Checked narrowing evaluates absolute error `|val - (val as f32 as f64)|` against `max_abs_err` and relative error against `max_rel_err`. A strict variant rejects non-finite values (`NaN`, `+Infinity`, `-Infinity`). Checked conversions `to_affine_rows_checked` and `to_projective_mat4_checked` reject precision loss exceeding tolerance, with affine shape guarded strictly at `f64` precision.
 
 ---
 
@@ -62,6 +65,11 @@ core/math <- scene
 - Geometric operations that are total (e.g. `invert()` on singular returning all-zero matrix) match upstream Three.js without panicking.
 - Safe fallible alternatives (`try_invert() -> Option<Matrix4>`) return `None` for singular matrices.
 - Layout conversion `to_affine_rows()` returns `Result<AffineRows, LayoutError>` where `LayoutError::NonAffineMatrix` is returned if perspective elements are non-zero.
+- Checked narrowing conversions `to_affine_rows_checked()` and `to_projective_mat4_checked()` return `Result<_, NarrowingError>`:
+  - `NarrowingError::NonAffineMatrix`: Non-affine matrix supplied to affine layout.
+  - `NarrowingError::PrecisionLossExceeded`: Element precision loss exceeds absolute and relative bounds.
+  - `NarrowingError::NonFinite`: Non-finite value (`NaN`, `Infinity`) rejected by strict narrowing policy.
+
 
 ---
 

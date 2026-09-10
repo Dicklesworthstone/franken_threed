@@ -180,6 +180,54 @@ impl PlanSegment {
         self.draws.first()
     }
 
+    /// Returns `true` if this segment contains any render bundle executions.
+    #[inline]
+    #[must_use]
+    pub fn has_bundles(&self) -> bool {
+        self.draws.iter().any(Draw::is_bundle)
+    }
+
+    /// Number of render bundle executions in this segment.
+    #[inline]
+    #[must_use]
+    pub fn bundle_count(&self) -> usize {
+        self.draws.iter().filter(|d| d.is_bundle()).count()
+    }
+
+    /// Returns the draw indices of all bundle executions in this segment.
+    ///
+    /// Invariant: In WebGPU, executing a bundle invalidates all cached render-pass
+    /// state (pipeline and bind groups). Each returned index marks a boundary after which
+    /// any subsequent direct draw must explicitly rebind.
+    #[must_use]
+    pub fn bundle_boundaries(&self) -> Vec<usize> {
+        self.draws
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.is_bundle())
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Returns the list of all bundle IDs executed in this segment.
+    #[must_use]
+    pub fn bundle_ids(&self) -> Vec<u32> {
+        self.draws
+            .iter()
+            .filter_map(Draw::bundle_id)
+            .collect()
+    }
+
+    /// Returns `true` if the draw command at `draw_idx` directly follows a render bundle execution,
+    /// thereby crossing a bundle state-reset boundary where all bindings must be restored.
+    #[must_use]
+    pub fn draw_crosses_bundle_boundary(&self, draw_idx: usize) -> bool {
+        if draw_idx == 0 || draw_idx >= self.draws.len() {
+            return false;
+        }
+        self.draws[draw_idx].is_direct() && self.draws[draw_idx - 1].is_bundle()
+    }
+
     /// Slice of compute dispatches contained in this segment.
     #[inline]
     #[must_use]
@@ -291,6 +339,20 @@ impl ExecutionPlan {
     #[must_use]
     pub fn split_reasons(&self) -> &[String] {
         &self.split_reasons
+    }
+
+    /// Returns `true` if any segment in the plan executes a render bundle.
+    #[inline]
+    #[must_use]
+    pub fn has_bundles(&self) -> bool {
+        self.segments.iter().any(PlanSegment::has_bundles)
+    }
+
+    /// Total number of render bundle executions across all segments in the plan.
+    #[inline]
+    #[must_use]
+    pub fn total_bundle_count(&self) -> usize {
+        self.segments.iter().map(PlanSegment::bundle_count).sum()
     }
 
     /// Validates canvas freshness at the execution/publication boundary.

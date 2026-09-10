@@ -5,7 +5,8 @@
 //! and perspective divide).
 
 use f3d_core::layout::{LayoutError, ProjectiveMat4};
-use f3d_math::{CoordinateSystem, Matrix4, Quaternion, Vector3};
+use f3d_math::{CoordinateSystem, Matrix4, NarrowingError, NarrowingTolerance, Quaternion, Vector3};
+
 
 const EPS: f64 = 1e-10;
 
@@ -608,5 +609,177 @@ fn test_projective_mat4_transform_homogeneous_matches_apply_matrix4() {
         );
     }
 }
+
+#[test]
+fn test_vector3_checked_narrowing_policy() {
+    // 1. Exact value in f32:
+    // 0.5 = 2^-1, -0.25 = -2^-2, 1024.0 = 2^10. Exactly representable with 0 diff.
+    let v_exact = Vector3::new(0.5, -0.25, 1024.0);
+    let narrowed = v_exact.to_f32_checked(0.0, 0.0).expect("exact f32 passes with 0 tolerance");
+    assert_eq!(narrowed, [0.5f32, -0.25f32, 1024.0f32]);
+    let strict_exact = v_exact.to_f32_strict(0.0, 0.0).expect("strict exact passes");
+    assert_eq!(strict_exact, [0.5f32, -0.25f32, 1024.0f32]);
+
+    // 2. Inexact value in f32:
+    // 1.0 + 2^-30 is not representable in f32 (24-bit mantissa).
+    // In f32, 1.0 + 2^-30 rounds to 1.0f32.
+    // Absolute diff = 2^-30 = 9.313225746154785e-10.
+    // Relative diff = 2^-30 / (1.0 + 2^-30) ~= 9.31322573748e-10.
+    let v_inexact = Vector3::new(1.0 + 2.0f64.powi(-30), 0.0, 0.0);
+    // Should fail when tolerance is 1e-12:
+    let err = v_inexact.to_f32_checked(1e-12, 1e-12).expect_err("should reject precision loss");
+    match err {
+        NarrowingError::PrecisionLossExceeded { index, original, narrowed, abs_diff, max_abs_err, .. } => {
+            assert_eq!(index, 0);
+            assert_eq!(original, 1.0 + 2.0f64.powi(-30));
+            assert_eq!(narrowed, 1.0);
+            assert_close(abs_diff, 2.0f64.powi(-30), 1e-18, "abs_diff equals 2^-30");
+            assert_eq!(max_abs_err, 1e-12);
+        }
+        _ => panic!("unexpected error variant: {err:?}"),
+    }
+    // Should pass when tolerance is relaxed to 1e-8:
+    let pass = v_inexact.to_f32_checked(1e-8, 1e-8).expect("passes with 1e-8 tolerance");
+    assert_eq!(pass[0], 1.0f32);
+
+    // 3. Non-finite values: NaN
+    let v_nan = Vector3::new(f64::NAN, 1.0, 2.0);
+    // Permissive mode preserves NaN:
+    let perm_nan = v_nan.to_f32_checked(1e-6, 1e-6).expect("permissive allows NaN");
+    assert!(perm_nan[0].is_nan());
+    assert_eq!(perm_nan[1], 1.0f32);
+    // Strict mode rejects NaN:
+    let strict_nan_err = v_nan.to_f32_strict(1e-6, 1e-6).expect_err("strict mode rejects NaN");
+    match strict_nan_err {
+        NarrowingError::NonFinite { index, value } => {
+            assert_eq!(index, 0);
+            assert!(value.is_nan());
+        }
+        _ => panic!("unexpected error variant: {strict_nan_err:?}"),
+    }
+
+    // 4. Non-finite values: Infinity
+    let v_inf = Vector3::new(1.0, f64::INFINITY, -f64::INFINITY);
+    // Permissive mode preserves Infinity:
+    let perm_inf = v_inf.to_f32_checked(1e-6, 1e-6).expect("permissive allows Infinity");
+    assert_eq!(perm_inf[1], f32::INFINITY);
+    assert_eq!(perm_inf[2], -f32::INFINITY);
+    // Strict mode rejects Infinity:
+    let strict_inf_err = v_inf.to_f32_strict(1e-6, 1e-6).expect_err("strict mode rejects +Infinity");
+    match strict_inf_err {
+        NarrowingError::NonFinite { index, value } => {
+            assert_eq!(index, 1);
+            assert_eq!(value, f64::INFINITY);
+        }
+        _ => panic!("unexpected error variant: {strict_inf_err:?}"),
+    }
+}
+
+#[test]
+fn test_matrix4_checked_narrowing_and_conversions() {
+    // 1. Exact affine matrix in f32:
+    let mut m_exact = Matrix4::identity();
+    m_exact.elements[12] = 2.0;
+    m_exact.elements[13] = -4.5;
+    m_exact.elements[14] = 0.125;
+    let affine = m_exact
+        .to_affine_rows_checked(0.0, 0.0)
+        .expect("exact affine matrix converts with 0.0 tolerance");
+    let proj = m_exact
+        .to_projective_mat4_checked(0.0, 0.0)
+        .expect("exact projective matrix converts with 0.0 tolerance");
+    assert_eq!(affine.r0[3], 2.0f32);
+    assert_eq!(affine.r1[3], -4.5f32);
+    assert_eq!(affine.r2[3], 0.125f32);
+    assert_eq!(proj.elements[12], 2.0f32);
+    assert_eq!(proj.elements[13], -4.5f32);
+    assert_eq!(proj.elements[14], 0.125f32);
+
+    // 2. Inexact element:
+    let mut m_inexact = Matrix4::identity();
+    m_inexact.elements[0] = 1.0 + 2.0f64.powi(-30);
+    let affine_err = m_inexact
+        .to_affine_rows_checked(1e-12, 1e-12)
+        .expect_err("should reject precision loss in affine element");
+    match affine_err {
+        NarrowingError::PrecisionLossExceeded { index, original, .. } => {
+            assert_eq!(index, 0);
+            assert_eq!(original, 1.0 + 2.0f64.powi(-30));
+        }
+        _ => panic!("unexpected: {affine_err:?}"),
+    }
+    let proj_err = m_inexact
+        .to_projective_mat4_checked(1e-12, 1e-12)
+        .expect_err("should reject precision loss in projective element");
+    match proj_err {
+        NarrowingError::PrecisionLossExceeded { index, .. } => assert_eq!(index, 0),
+        _ => panic!("unexpected: {proj_err:?}"),
+    }
+
+    // 3. Strict non-finite rejection: NaN
+    let mut m_nan = Matrix4::identity();
+    m_nan.elements[5] = f64::NAN;
+    let strict_err = m_nan
+        .to_affine_rows_strict(1e-6, 1e-6)
+        .expect_err("strict affine rejects NaN");
+    match strict_err {
+        NarrowingError::NonFinite { index, value } => {
+            assert_eq!(index, 5);
+            assert!(value.is_nan());
+        }
+        _ => panic!("unexpected: {strict_err:?}"),
+    }
+    let proj_nan_err = m_nan
+        .to_projective_mat4_strict(1e-6, 1e-6)
+        .expect_err("strict projective rejects NaN");
+    match proj_nan_err {
+        NarrowingError::NonFinite { index, value } => {
+            assert_eq!(index, 5);
+            assert!(value.is_nan());
+        }
+        _ => panic!("unexpected: {proj_nan_err:?}"),
+    }
+
+    // 4. Strict non-finite rejection: Infinity
+    let mut m_inf = Matrix4::identity();
+    m_inf.elements[10] = f64::INFINITY;
+    let inf_err = m_inf
+        .to_affine_rows_strict(1e-6, 1e-6)
+        .expect_err("strict affine rejects Infinity");
+    match inf_err {
+        NarrowingError::NonFinite { index, value } => {
+            assert_eq!(index, 10);
+            assert_eq!(value, f64::INFINITY);
+        }
+        _ => panic!("unexpected: {inf_err:?}"),
+    }
+
+    // 5. Non-affine matrix rejection before narrowing:
+    // Perspective matrix (e[11] = -1.0, e[15] = 0.0)
+    let mut m_persp = Matrix4::identity();
+    m_persp.make_perspective(-1.0, 1.0, 1.0, -1.0, 2.0, 10.0, CoordinateSystem::WebGPU, false);
+    let non_affine_err = m_persp
+        .to_affine_rows_checked(1e-4, 1e-4)
+        .expect_err("perspective matrix must be rejected by to_affine_rows_checked");
+    assert_eq!(non_affine_err, NarrowingError::NonAffineMatrix);
+
+    // But to_projective_mat4_checked retains it:
+    let proj_persp = m_persp
+        .to_projective_mat4_checked(1e-6, 1e-6)
+        .expect("perspective matrix succeeds in to_projective_mat4_checked");
+    assert_eq!(proj_persp.elements[11], -1.0f32);
+    assert_eq!(proj_persp.elements[15], 0.0f32);
+
+    // Subnormal perspective term (1e-100) must also be rejected by to_affine_rows_checked
+    // even though it would underflow to 0.0 in f32:
+    let mut m_subnormal = Matrix4::identity();
+    m_subnormal.elements[11] = 1e-100;
+    assert_eq!(
+        m_subnormal.to_affine_rows_checked(1e-4, 1e-4),
+        Err(NarrowingError::NonAffineMatrix),
+        "f64 affine shape check runs before narrowing"
+    );
+}
+
 
 

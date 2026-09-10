@@ -6,7 +6,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::error::HazardError;
-use crate::pass::{ColorAttachment, LoadOp, Pass, PassId, PassKind, StoreOp};
+use crate::pass::{ColorAttachment, Draw, LoadOp, Pass, PassId, PassKind, StoreOp};
 use crate::resource::{ResourceId, ResourceKind, SubresourceRange};
 
 /// Validates usage-scope rules for a single pass according to WebGPU specifications (§8.5, [S51]).
@@ -101,6 +101,24 @@ fn validate_render_pass_hazards(pass: &Pass) -> Result<(), HazardError> {
         }
     }
 
+    // 5. Enforce render bundle state reset invariant (§8.5, AGENTS.md):
+    // In WebGPU, executing a render bundle invalidates all cached pipeline and bind group state.
+    // A direct draw following a render bundle cannot assume warm state; it must explicitly rebind.
+    let mut last_was_bundle = false;
+    for draw in &pass.draws {
+        if draw.is_bundle() {
+            last_was_bundle = true;
+        } else if draw.is_direct() {
+            if last_was_bundle && draw.assumes_warm_state() {
+                return Err(HazardError::BundleDirectDrawRequiresRebind {
+                    pass_id: pass.id.get(),
+                    draw_id: draw.draw_id,
+                });
+            }
+            last_was_bundle = false;
+        }
+    }
+
     Ok(())
 }
 
@@ -109,6 +127,12 @@ fn validate_render_pass_hazards(pass: &Pass) -> Result<(), HazardError> {
 /// Invariant: In compute, usage scopes are tracked per dispatch (§8.5, [S51]).
 /// Writable aliases within a single compute dispatch are rejected.
 fn validate_compute_pass_hazards(pass: &Pass) -> Result<(), HazardError> {
+    if pass.draws.iter().any(Draw::is_bundle) {
+        return Err(HazardError::BundleInNonRenderPass {
+            pass_id: pass.id.get(),
+            pass_kind: PassKind::Compute,
+        });
+    }
     for dispatch in &pass.dispatches {
         let uses = &dispatch.uses;
         for i in 0..uses.len() {
@@ -152,6 +176,11 @@ fn validate_compute_pass_hazards(pass: &Pass) -> Result<(), HazardError> {
 
 /// Validates usage scopes within a WebGPU Copy pass.
 fn validate_copy_pass_hazards(pass: &Pass) -> Result<(), HazardError> {
+    if pass.draws.iter().any(Draw::is_bundle) {
+        return Err(HazardError::BundleInCopyPass {
+            pass_id: pass.id.get(),
+        });
+    }
     for copy in &pass.copies {
         let (src, dst) = copy.all_uses(f3d_core::ownership::DataVersion::INITIAL);
         if src.resource_id == dst.resource_id && src.subresource.overlaps(&dst.subresource) {

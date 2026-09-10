@@ -34,8 +34,8 @@ pub use canvas::{CanvasEpochTracker, CanvasFormat, CanvasId, CanvasOutput};
 pub use error::{CanvasError, GraphError, HazardError};
 pub use hazard::{can_split_pass, split_pass_on_hazard, validate_pass_hazards};
 pub use pass::{
-    ColorAttachment, CopyCommand, DepthStencilAttachment, Dispatch, Draw, LoadOp, Pass, PassId,
-    PassKind, StoreOp,
+    ColorAttachment, CopyCommand, DepthStencilAttachment, Dispatch, Draw, DrawKind, LoadOp, Pass,
+    PassId, PassKind, RenderBundle, StoreOp,
 };
 pub use plan::{
     ExecutionPlan, PlanSegment, build_red_a_blue_b_plan, build_red_a_blue_b_render_plan,

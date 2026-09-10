@@ -1,6 +1,6 @@
 //! Integration and contract tests for `f3d-core` GPU wire layout and byte encoding.
 //!
-//! Bead: `f3d-05-ids-layouts-epochs-transport-vqa.2`
+//! Beads: `f3d-05-ids-layouts-epochs-transport-vqa.2`, `f3d-05-ids-layouts-epochs-transport-vqa.3`
 //! Owned path: `crates/f3d-core/tests/layout_tests.rs`
 //!
 //! Note on Claims (Binding):
@@ -9,6 +9,7 @@
 //! matrix semantics (which belong to `f3d-math`, `f3d-shader`, and `f3d-gpu`).
 
 use f3d_core::layout::*;
+use f3d_core::{DataVersion, Epoch};
 
 #[test]
 fn affine_rows_exact_size_and_alignment() {
@@ -573,5 +574,690 @@ fn vertex_pos_uv_and_color_uniform_wire_invariants() {
     assert_eq!(restored_v2, vertices[2]);
 }
 
+// ---------------------------------------------------------------------------
+// Seeded deterministic property tests (f3d-05-ids-layouts-epochs-transport-vqa.3)
+// ---------------------------------------------------------------------------
 
+/// Minimal 64-bit Linear Congruential Generator (LCG) for deterministic property testing.
+///
+/// Multiplier and increment are standard constants from Knuth / MMIX.
+/// Provides a zero-dependency, reproducible pseudo-random stream across platforms.
+#[derive(Clone, Copy, Debug)]
+struct TestLcg {
+    state: u64,
+}
 
+impl TestLcg {
+    const fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self
+            .state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.state
+    }
+
+    fn next_u32(&mut self) -> u32 {
+        (self.next_u64() >> 32) as u32
+    }
+
+    /// Generates a well-behaved finite f32 float in the range `[-2000.0, 2000.0]`.
+    fn next_f32(&mut self) -> f32 {
+        let u = self.next_u32();
+        let normalized = (u as f64) / (u32::MAX as f64);
+        ((normalized * 4000.0) - 2000.0) as f32
+    }
+
+    /// Generates a well-behaved finite f64 float in the range `[-20000.0, 20000.0]`.
+    fn next_f64(&mut self) -> f64 {
+        let u = self.next_u64();
+        let normalized = (u as f64) / (u64::MAX as f64);
+        (normalized * 40000.0) - 20000.0
+    }
+}
+
+#[test]
+fn property_test_affine_rows_byte_roundtrip_and_conversions() {
+    const SEED: u64 = 0xA110_C47E_0001_0001;
+    const ITERATIONS: usize = 5_000;
+    let mut rng = TestLcg::new(SEED);
+
+    for i in 0..ITERATIONS {
+        let r0 = [rng.next_f32(), rng.next_f32(), rng.next_f32(), rng.next_f32()];
+        let r1 = [rng.next_f32(), rng.next_f32(), rng.next_f32(), rng.next_f32()];
+        let r2 = [rng.next_f32(), rng.next_f32(), rng.next_f32(), rng.next_f32()];
+
+        let affine = AffineRows::new(r0, r1, r2);
+
+        // 1. Array byte serialization roundtrip
+        let bytes = affine.to_bytes();
+        assert_eq!(
+            bytes.len(),
+            AFFINE_ROWS_BYTES,
+            "Byte length mismatch for seed {SEED:#018x} at iter {i}"
+        );
+        let restored = AffineRows::from_bytes(&bytes);
+        assert_eq!(
+            restored, affine,
+            "AffineRows::from_bytes roundtrip failed for seed {SEED:#018x} at iter {i}"
+        );
+        assert_eq!(
+            restored.to_bytes(),
+            bytes,
+            "AffineRows restored bytes mismatch for seed {SEED:#018x} at iter {i}"
+        );
+
+        // 2. Slice serialization roundtrip
+        let mut slice_buf = [0u8; 48];
+        affine
+            .write_to_slice(&mut slice_buf)
+            .unwrap_or_else(|e| panic!("write_to_slice failed for seed {SEED:#018x} at iter {i}: {e:?}"));
+        assert_eq!(
+            slice_buf, bytes,
+            "write_to_slice output mismatch for seed {SEED:#018x} at iter {i}"
+        );
+        let from_slice = AffineRows::read_from_slice(&slice_buf)
+            .unwrap_or_else(|e| panic!("read_from_slice failed for seed {SEED:#018x} at iter {i}: {e:?}"));
+        assert_eq!(
+            from_slice, affine,
+            "read_from_slice roundtrip failed for seed {SEED:#018x} at iter {i}"
+        );
+
+        // 3. Column-major 4x4 matrix expansion and reconstruction
+        let col_major = affine.to_column_major();
+        assert!(
+            is_matrix4_affine(&col_major),
+            "to_column_major must produce valid affine matrix for seed {SEED:#018x} at iter {i}"
+        );
+        // Verify mapping: row 0 [e0, e4, e8, e12], row 1 [e1, e5, e9, e13], row 2 [e2, e6, e10, e14]
+        assert_eq!(col_major[0], r0[0], "col_major[0] mapping failed for seed {SEED:#018x} at iter {i}");
+        assert_eq!(col_major[4], r0[1], "col_major[4] mapping failed for seed {SEED:#018x} at iter {i}");
+        assert_eq!(col_major[8], r0[2], "col_major[8] mapping failed for seed {SEED:#018x} at iter {i}");
+        assert_eq!(col_major[12], r0[3], "col_major[12] mapping failed for seed {SEED:#018x} at iter {i}");
+
+        assert_eq!(col_major[1], r1[0], "col_major[1] mapping failed for seed {SEED:#018x} at iter {i}");
+        assert_eq!(col_major[5], r1[1], "col_major[5] mapping failed for seed {SEED:#018x} at iter {i}");
+        assert_eq!(col_major[9], r1[2], "col_major[9] mapping failed for seed {SEED:#018x} at iter {i}");
+        assert_eq!(col_major[13], r1[3], "col_major[13] mapping failed for seed {SEED:#018x} at iter {i}");
+
+        assert_eq!(col_major[2], r2[0], "col_major[2] mapping failed for seed {SEED:#018x} at iter {i}");
+        assert_eq!(col_major[6], r2[1], "col_major[6] mapping failed for seed {SEED:#018x} at iter {i}");
+        assert_eq!(col_major[10], r2[2], "col_major[10] mapping failed for seed {SEED:#018x} at iter {i}");
+        assert_eq!(col_major[14], r2[3], "col_major[14] mapping failed for seed {SEED:#018x} at iter {i}");
+
+        assert_eq!(col_major[3], 0.0, "col_major[3] must be 0 for seed {SEED:#018x} at iter {i}");
+        assert_eq!(col_major[7], 0.0, "col_major[7] must be 0 for seed {SEED:#018x} at iter {i}");
+        assert_eq!(col_major[11], 0.0, "col_major[11] must be 0 for seed {SEED:#018x} at iter {i}");
+        assert_eq!(col_major[15], 1.0, "col_major[15] must be 1 for seed {SEED:#018x} at iter {i}");
+
+        let reconstructed = AffineRows::from_column_major(&col_major)
+            .unwrap_or_else(|e| panic!("from_column_major failed for seed {SEED:#018x} at iter {i}: {e:?}"));
+        assert_eq!(
+            reconstructed, affine,
+            "reconstructed affine matrix mismatch for seed {SEED:#018x} at iter {i}"
+        );
+    }
+}
+
+#[test]
+fn property_test_affine_rows_rejection_of_every_short_length() {
+    const SEED: u64 = 0xB00F_FEE1_0002_0002;
+    const ITERATIONS: usize = 5_000;
+    let mut rng = TestLcg::new(SEED);
+
+    let mut buf = [0u8; 48];
+
+    for i in 0..ITERATIONS {
+        let r0 = [rng.next_f32(), rng.next_f32(), rng.next_f32(), rng.next_f32()];
+        let r1 = [rng.next_f32(), rng.next_f32(), rng.next_f32(), rng.next_f32()];
+        let r2 = [rng.next_f32(), rng.next_f32(), rng.next_f32(), rng.next_f32()];
+        let affine = AffineRows::new(r0, r1, r2);
+
+        // Randomize buffer content
+        for b in buf.iter_mut() {
+            *b = (rng.next_u32() & 0xFF) as u8;
+        }
+
+        // Test EVERY short length strictly below AFFINE_ROWS_BYTES (48)
+        for len in 0..AFFINE_ROWS_BYTES {
+            let write_res = affine.write_to_slice(&mut buf[..len]);
+            assert_eq!(
+                write_res,
+                Err(LayoutError::BufferTooSmall {
+                    required: AFFINE_ROWS_BYTES,
+                    provided: len,
+                }),
+                "write_to_slice must reject short length {len} for seed {SEED:#018x} at iter {i}"
+            );
+
+            let read_res = AffineRows::read_from_slice(&buf[..len]);
+            assert_eq!(
+                read_res,
+                Err(LayoutError::BufferTooSmall {
+                    required: AFFINE_ROWS_BYTES,
+                    provided: len,
+                }),
+                "read_from_slice must reject short length {len} for seed {SEED:#018x} at iter {i}"
+            );
+        }
+    }
+}
+
+#[test]
+fn property_test_affine_rows_rejection_of_non_affine_rows() {
+    const SEED: u64 = 0xC0DE_D00D_0003_0003;
+    const ITERATIONS: usize = 5_000;
+    let mut rng = TestLcg::new(SEED);
+
+    for i in 0..ITERATIONS {
+        // Base affine matrix in f32
+        let mut elements = [0.0f32; 16];
+        for k in 0..16 {
+            elements[k] = rng.next_f32();
+        }
+        // Canonical affine row 3: [0, 0, 0, 1]
+        elements[3] = 0.0;
+        elements[7] = 0.0;
+        elements[11] = 0.0;
+        elements[15] = 1.0;
+
+        // Base matrix must be recognized as affine
+        assert!(
+            is_matrix4_affine(&elements),
+            "Base matrix must be affine for seed {SEED:#018x} at iter {i}"
+        );
+        assert!(
+            AffineRows::from_column_major(&elements).is_ok(),
+            "from_column_major must succeed on affine matrix for seed {SEED:#018x} at iter {i}"
+        );
+
+        // Perturbation target: 0 = e[3], 1 = e[7], 2 = e[11], 3 = e[15]
+        let target = (rng.next_u32() % 4) as usize;
+        let mut perturbed = elements;
+        match target {
+            0 => {
+                let mut v = rng.next_f32();
+                if v == 0.0 {
+                    v = 5e-7;
+                }
+                perturbed[3] = v;
+            }
+            1 => {
+                let mut v = rng.next_f32();
+                if v == 0.0 {
+                    v = 1e-15;
+                }
+                perturbed[7] = v;
+            }
+            2 => {
+                let mut v = rng.next_f32();
+                if v == 0.0 {
+                    v = f32::from_bits(1);
+                } // subnormal
+                perturbed[11] = v;
+            }
+            _ => {
+                // e[15] != 1.0
+                let delta = rng.next_f32();
+                perturbed[15] = if delta == 0.0 { 0.0 } else { 1.0 + delta };
+            }
+        }
+
+        assert!(
+            !is_matrix4_affine(&perturbed),
+            "is_matrix4_affine must reject non-affine row 3 for seed {SEED:#018x} at iter {i}"
+        );
+        assert_eq!(
+            AffineRows::from_column_major(&perturbed),
+            Err(LayoutError::NonAffineMatrix),
+            "from_column_major must return NonAffineMatrix for seed {SEED:#018x} at iter {i}"
+        );
+
+        // Property test for f64 structural affine check
+        let mut elements_f64 = [0.0f64; 16];
+        for k in 0..16 {
+            elements_f64[k] = rng.next_f64();
+        }
+        elements_f64[3] = 0.0;
+        elements_f64[7] = 0.0;
+        elements_f64[11] = 0.0;
+        elements_f64[15] = 1.0;
+
+        assert!(
+            is_matrix4_f64_affine(&elements_f64),
+            "Base f64 matrix must be affine for seed {SEED:#018x} at iter {i}"
+        );
+        assert!(
+            AffineRows::from_column_major_f64(&elements_f64).is_ok(),
+            "from_column_major_f64 must succeed on affine matrix for seed {SEED:#018x} at iter {i}"
+        );
+
+        let mut perturbed_f64 = elements_f64;
+        match target {
+            0 => {
+                let mut v = rng.next_f64();
+                if v == 0.0 {
+                    v = 1e-15;
+                }
+                perturbed_f64[3] = v;
+            }
+            1 => {
+                let mut v = rng.next_f64();
+                if v == 0.0 {
+                    v = 1e-30;
+                }
+                perturbed_f64[7] = v;
+            }
+            2 => {
+                let mut v = rng.next_f64();
+                if v == 0.0 {
+                    v = f64::from_bits(1);
+                } // subnormal
+                perturbed_f64[11] = v;
+            }
+            _ => {
+                let delta = rng.next_f64();
+                perturbed_f64[15] = if delta == 0.0 { 0.0 } else { 1.0 + delta };
+            }
+        }
+
+        assert!(
+            !is_matrix4_f64_affine(&perturbed_f64),
+            "is_matrix4_f64_affine must reject non-affine f64 row 3 for seed {SEED:#018x} at iter {i}"
+        );
+        assert_eq!(
+            AffineRows::from_column_major_f64(&perturbed_f64),
+            Err(LayoutError::NonAffineMatrix),
+            "from_column_major_f64 must return NonAffineMatrix for seed {SEED:#018x} at iter {i}"
+        );
+    }
+}
+
+#[test]
+fn property_test_projective_mat4_byte_roundtrip_and_short_lengths() {
+    const SEED: u64 = 0xD15C_05E4_0004_0004;
+    const ITERATIONS: usize = 5_000;
+    let mut rng = TestLcg::new(SEED);
+
+    let mut buf = [0u8; 64];
+
+    for i in 0..ITERATIONS {
+        let mut elements = [0.0f32; 16];
+        for k in 0..16 {
+            elements[k] = rng.next_f32();
+        }
+        let proj = ProjectiveMat4::from_elements(elements);
+
+        // 1. Array byte serialization roundtrip
+        let bytes = proj.to_bytes();
+        assert_eq!(
+            bytes.len(),
+            PROJECTIVE_MAT4_BYTES,
+            "Byte length mismatch for seed {SEED:#018x} at iter {i}"
+        );
+        let restored = ProjectiveMat4::from_bytes(&bytes);
+        assert_eq!(
+            restored, proj,
+            "ProjectiveMat4::from_bytes roundtrip failed for seed {SEED:#018x} at iter {i}"
+        );
+        assert_eq!(
+            restored.to_bytes(),
+            bytes,
+            "ProjectiveMat4 restored bytes mismatch for seed {SEED:#018x} at iter {i}"
+        );
+
+        // 2. Slice serialization roundtrip
+        proj.write_to_slice(&mut buf)
+            .unwrap_or_else(|e| panic!("write_to_slice failed for seed {SEED:#018x} at iter {i}: {e:?}"));
+        assert_eq!(
+            buf, bytes,
+            "write_to_slice output mismatch for seed {SEED:#018x} at iter {i}"
+        );
+        let from_slice = ProjectiveMat4::read_from_slice(&buf)
+            .unwrap_or_else(|e| panic!("read_from_slice failed for seed {SEED:#018x} at iter {i}: {e:?}"));
+        assert_eq!(
+            from_slice, proj,
+            "read_from_slice roundtrip failed for seed {SEED:#018x} at iter {i}"
+        );
+
+        // 3. Rejection of every short length (0..64)
+        for len in 0..PROJECTIVE_MAT4_BYTES {
+            let write_res = proj.write_to_slice(&mut buf[..len]);
+            assert_eq!(
+                write_res,
+                Err(LayoutError::BufferTooSmall {
+                    required: PROJECTIVE_MAT4_BYTES,
+                    provided: len,
+                }),
+                "write_to_slice must reject short length {len} for seed {SEED:#018x} at iter {i}"
+            );
+
+            let read_res = ProjectiveMat4::read_from_slice(&buf[..len]);
+            assert_eq!(
+                read_res,
+                Err(LayoutError::BufferTooSmall {
+                    required: PROJECTIVE_MAT4_BYTES,
+                    provided: len,
+                }),
+                "read_from_slice must reject short length {len} for seed {SEED:#018x} at iter {i}"
+            );
+        }
+    }
+}
+
+#[test]
+fn property_test_vertex_pos_uv_byte_roundtrip_and_short_lengths() {
+    const SEED: u64 = 0xE1E1_7E57_0005_0005;
+    const ITERATIONS: usize = 5_000;
+    let mut rng = TestLcg::new(SEED);
+
+    let mut buf = [0u8; 20];
+
+    for i in 0..ITERATIONS {
+        let position = [rng.next_f32(), rng.next_f32(), rng.next_f32()];
+        let uv = [rng.next_f32(), rng.next_f32()];
+        let v = VertexPosUv::new(position, uv);
+
+        // 1. Array byte serialization roundtrip
+        let bytes = v.to_bytes();
+        assert_eq!(
+            bytes.len(),
+            VERTEX_POS_UV_BYTES,
+            "Byte length mismatch for seed {SEED:#018x} at iter {i}"
+        );
+        let restored = VertexPosUv::from_bytes(&bytes);
+        assert_eq!(
+            restored, v,
+            "VertexPosUv::from_bytes roundtrip failed for seed {SEED:#018x} at iter {i}"
+        );
+        assert_eq!(
+            restored.to_bytes(),
+            bytes,
+            "VertexPosUv restored bytes mismatch for seed {SEED:#018x} at iter {i}"
+        );
+
+        // 2. Slice serialization roundtrip
+        v.write_to_slice(&mut buf)
+            .unwrap_or_else(|e| panic!("write_to_slice failed for seed {SEED:#018x} at iter {i}: {e:?}"));
+        assert_eq!(
+            buf, bytes,
+            "write_to_slice output mismatch for seed {SEED:#018x} at iter {i}"
+        );
+        let from_slice = VertexPosUv::read_from_slice(&buf)
+            .unwrap_or_else(|e| panic!("read_from_slice failed for seed {SEED:#018x} at iter {i}: {e:?}"));
+        assert_eq!(
+            from_slice, v,
+            "read_from_slice roundtrip failed for seed {SEED:#018x} at iter {i}"
+        );
+
+        // 3. Rejection of every short length (0..20)
+        for len in 0..VERTEX_POS_UV_BYTES {
+            let write_res = v.write_to_slice(&mut buf[..len]);
+            assert_eq!(
+                write_res,
+                Err(LayoutError::BufferTooSmall {
+                    required: VERTEX_POS_UV_BYTES,
+                    provided: len,
+                }),
+                "write_to_slice must reject short length {len} for seed {SEED:#018x} at iter {i}"
+            );
+
+            let read_res = VertexPosUv::read_from_slice(&buf[..len]);
+            assert_eq!(
+                read_res,
+                Err(LayoutError::BufferTooSmall {
+                    required: VERTEX_POS_UV_BYTES,
+                    provided: len,
+                }),
+                "read_from_slice must reject short length {len} for seed {SEED:#018x} at iter {i}"
+            );
+        }
+    }
+}
+
+#[test]
+fn property_test_u32_word_abi_epoch_and_data_version() {
+    const SEED: u64 = 0xF00D_BEEF_0006_0006;
+    const ITERATIONS: usize = 5_000;
+    let mut rng = TestLcg::new(SEED);
+
+    // Explicit edge cases tested first
+    let edge_cases = [
+        0u64,
+        1u64,
+        (u32::MAX as u64) - 1,
+        u32::MAX as u64,
+        (u32::MAX as u64) + 1,
+        0x0000_0001_0000_0000u64,
+        0x7FFF_FFFF_FFFF_FFFFu64,
+        0x8000_0000_0000_0000u64,
+        0xFFFF_FFFF_0000_0000u64,
+        0x0000_0000_FFFF_FFFFu64,
+        u64::MAX - 1,
+        u64::MAX,
+    ];
+
+    for (k, &val) in edge_cases.iter().enumerate() {
+        // Epoch
+        let epoch = Epoch::new(val);
+        let (high, low) = epoch.to_words();
+        assert_eq!(high, (val >> 32) as u32, "Epoch edge case {k} high word mismatch");
+        assert_eq!(low, val as u32, "Epoch edge case {k} low word mismatch");
+        assert_eq!(epoch.high_u32(), high, "Epoch edge case {k} high_u32() mismatch");
+        assert_eq!(epoch.low_u32(), low, "Epoch edge case {k} low_u32() mismatch");
+        let restored_epoch = Epoch::from_words(high, low);
+        assert_eq!(restored_epoch, epoch, "Epoch edge case {k} from_words roundtrip mismatch");
+        assert_eq!(restored_epoch.get(), val, "Epoch edge case {k} get() mismatch");
+
+        // DataVersion
+        let dv = DataVersion::new(val);
+        let (dv_high, dv_low) = dv.to_words();
+        assert_eq!(dv_high, (val >> 32) as u32, "DataVersion edge case {k} high word mismatch");
+        assert_eq!(dv_low, val as u32, "DataVersion edge case {k} low word mismatch");
+        assert_eq!(dv.high_u32(), dv_high, "DataVersion edge case {k} high_u32() mismatch");
+        assert_eq!(dv.low_u32(), dv_low, "DataVersion edge case {k} low_u32() mismatch");
+        let restored_dv = DataVersion::from_words(dv_high, dv_low);
+        assert_eq!(restored_dv, dv, "DataVersion edge case {k} from_words roundtrip mismatch");
+        assert_eq!(restored_dv.get(), val, "DataVersion edge case {k} get() mismatch");
+    }
+
+    // Randomized cases
+    for i in 0..ITERATIONS {
+        let val = rng.next_u64();
+
+        // 1. Epoch word roundtrip
+        let epoch = Epoch::new(val);
+        let (high, low) = epoch.to_words();
+        assert_eq!(
+            high,
+            (val >> 32) as u32,
+            "Epoch high word mismatch for val {val:#018x}, seed {SEED:#018x} at iter {i}"
+        );
+        assert_eq!(
+            low,
+            val as u32,
+            "Epoch low word mismatch for val {val:#018x}, seed {SEED:#018x} at iter {i}"
+        );
+        assert_eq!(
+            epoch.high_u32(),
+            high,
+            "Epoch high_u32() mismatch for val {val:#018x}, seed {SEED:#018x} at iter {i}"
+        );
+        assert_eq!(
+            epoch.low_u32(),
+            low,
+            "Epoch low_u32() mismatch for val {val:#018x}, seed {SEED:#018x} at iter {i}"
+        );
+        let restored_epoch = Epoch::from_words(high, low);
+        assert_eq!(
+            restored_epoch,
+            epoch,
+            "Epoch from_words roundtrip mismatch for val {val:#018x}, seed {SEED:#018x} at iter {i}"
+        );
+        assert_eq!(
+            restored_epoch.get(),
+            val,
+            "Epoch get() mismatch for val {val:#018x}, seed {SEED:#018x} at iter {i}"
+        );
+
+        // 2. DataVersion word roundtrip
+        let dv = DataVersion::new(val);
+        let (dv_high, dv_low) = dv.to_words();
+        assert_eq!(
+            dv_high,
+            (val >> 32) as u32,
+            "DataVersion high word mismatch for val {val:#018x}, seed {SEED:#018x} at iter {i}"
+        );
+        assert_eq!(
+            dv_low,
+            val as u32,
+            "DataVersion low word mismatch for val {val:#018x}, seed {SEED:#018x} at iter {i}"
+        );
+        assert_eq!(
+            dv.high_u32(),
+            dv_high,
+            "DataVersion high_u32() mismatch for val {val:#018x}, seed {SEED:#018x} at iter {i}"
+        );
+        assert_eq!(
+            dv.low_u32(),
+            dv_low,
+            "DataVersion low_u32() mismatch for val {val:#018x}, seed {SEED:#018x} at iter {i}"
+        );
+        let restored_dv = DataVersion::from_words(dv_high, dv_low);
+        assert_eq!(
+            restored_dv,
+            dv,
+            "DataVersion from_words roundtrip mismatch for val {val:#018x}, seed {SEED:#018x} at iter {i}"
+        );
+        assert_eq!(
+            restored_dv.get(),
+            val,
+            "DataVersion get() mismatch for val {val:#018x}, seed {SEED:#018x} at iter {i}"
+        );
+    }
+}
+
+#[test]
+fn property_test_alignment_validators_on_random_offsets() {
+    const SEED: u64 = 0x1234_5678_0007_0007;
+    const ITERATIONS: usize = 5_000;
+    let mut rng = TestLcg::new(SEED);
+
+    let allowed_alignments = [256usize, 512, 1024, 2048, 4096];
+
+    for i in 0..ITERATIONS {
+        let align_idx = (rng.next_u32() as usize) % allowed_alignments.len();
+        let align = allowed_alignments[align_idx];
+        let k = (rng.next_u32() as usize) % 50_000;
+        let aligned_offset = k * align;
+
+        // Dynamic uniform and storage offset: aligned succeeds
+        assert!(
+            validate_dynamic_uniform_offset(aligned_offset, align).is_ok(),
+            "Aligned dynamic uniform offset {aligned_offset} (align {align}) failed for seed {SEED:#018x} at iter {i}"
+        );
+        assert!(
+            validate_dynamic_storage_offset(aligned_offset, align).is_ok(),
+            "Aligned dynamic storage offset {aligned_offset} (align {align}) failed for seed {SEED:#018x} at iter {i}"
+        );
+
+        // Dynamic uniform and storage offset: unaligned fails
+        let rem = (rng.next_u32() as usize % (align - 1)) + 1; // 1 <= rem < align
+        let unaligned_offset = aligned_offset + rem;
+        assert_eq!(
+            validate_dynamic_uniform_offset(unaligned_offset, align),
+            Err(LayoutError::UnalignedOffset {
+                offset: unaligned_offset,
+                required_alignment: align,
+            }),
+            "Unaligned dynamic uniform offset {unaligned_offset} (align {align}) must fail for seed {SEED:#018x} at iter {i}"
+        );
+        assert_eq!(
+            validate_dynamic_storage_offset(unaligned_offset, align),
+            Err(LayoutError::UnalignedOffset {
+                offset: unaligned_offset,
+                required_alignment: align,
+            }),
+            "Unaligned dynamic storage offset {unaligned_offset} (align {align}) must fail for seed {SEED:#018x} at iter {i}"
+        );
+
+        // writeBuffer 4-byte alignment
+        let k_off = (rng.next_u32() as usize) % 50_000;
+        let k_sz = (rng.next_u32() as usize) % 50_000;
+        let aligned_off = k_off * 4;
+        let aligned_sz = k_sz * 4;
+        assert!(
+            validate_write_buffer_alignment(aligned_off, aligned_sz).is_ok(),
+            "Aligned writeBuffer offset {aligned_off}, size {aligned_sz} failed for seed {SEED:#018x} at iter {i}"
+        );
+
+        let rem_off = (rng.next_u32() as usize % 3) + 1; // 1, 2, 3
+        let unaligned_off = aligned_off + rem_off;
+        assert_eq!(
+            validate_write_buffer_alignment(unaligned_off, aligned_sz),
+            Err(LayoutError::UnalignedWriteBuffer { value: unaligned_off }),
+            "Unaligned writeBuffer offset {unaligned_off} must fail for seed {SEED:#018x} at iter {i}"
+        );
+
+        let rem_sz = (rng.next_u32() as usize % 3) + 1; // 1, 2, 3
+        let unaligned_sz = aligned_sz + rem_sz;
+        assert_eq!(
+            validate_write_buffer_alignment(aligned_off, unaligned_sz),
+            Err(LayoutError::UnalignedWriteBuffer { value: unaligned_sz }),
+            "Unaligned writeBuffer size {unaligned_sz} must fail for seed {SEED:#018x} at iter {i}"
+        );
+
+        // Texture copy bytesPerRow 256-byte alignment
+        let k_bpr = rng.next_u32() % 10_000;
+        let aligned_bpr = k_bpr * 256;
+        assert!(
+            validate_copy_bytes_per_row(aligned_bpr).is_ok(),
+            "Aligned bytesPerRow {aligned_bpr} failed for seed {SEED:#018x} at iter {i}"
+        );
+
+        let rem_bpr = (rng.next_u32() % 255) + 1; // 1 <= rem_bpr < 256
+        let unaligned_bpr = aligned_bpr + rem_bpr;
+        assert_eq!(
+            validate_copy_bytes_per_row(unaligned_bpr),
+            Err(LayoutError::UnalignedBytesPerRow {
+                bytes_per_row: unaligned_bpr,
+                required_alignment: 256,
+            }),
+            "Unaligned bytesPerRow {unaligned_bpr} must fail for seed {SEED:#018x} at iter {i}"
+        );
+
+        // Checked row pitch calculation aligned_bytes_per_row(width)
+        let safe_width = rng.next_u32() % (u32::MAX / 4 - 256);
+        let calculated_pitch = aligned_bytes_per_row(safe_width)
+            .unwrap_or_else(|e| panic!("aligned_bytes_per_row failed for safe width {safe_width}, seed {SEED:#018x} at iter {i}: {e:?}"));
+        let unpadded_bytes = safe_width * 4;
+        assert!(
+            calculated_pitch >= unpadded_bytes,
+            "calculated_pitch {calculated_pitch} < unpadded_bytes {unpadded_bytes} for seed {SEED:#018x} at iter {i}"
+        );
+        assert_eq!(
+            calculated_pitch % 256,
+            0,
+            "calculated_pitch {calculated_pitch} must be multiple of 256 for seed {SEED:#018x} at iter {i}"
+        );
+        assert!(
+            calculated_pitch < unpadded_bytes + 256,
+            "calculated_pitch {calculated_pitch} exceeds minimum padding for seed {SEED:#018x} at iter {i}"
+        );
+        assert!(
+            validate_copy_bytes_per_row(calculated_pitch).is_ok(),
+            "calculated_pitch {calculated_pitch} must validate against copy_bytes_per_row for seed {SEED:#018x} at iter {i}"
+        );
+
+        // Calculation overflow on invalid width
+        let overflow_width = (u32::MAX / 4) + 1 + (rng.next_u32() % 100_000);
+        assert_eq!(
+            aligned_bytes_per_row(overflow_width),
+            Err(LayoutError::CalculationOverflow),
+            "aligned_bytes_per_row must return CalculationOverflow for {overflow_width}, seed {SEED:#018x} at iter {i}"
+        );
+    }
+}
