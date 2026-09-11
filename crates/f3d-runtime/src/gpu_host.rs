@@ -6040,7 +6040,7 @@ mod tests {
             GpuCommand::WriteBuffer { buffer_id, offset, data } => {
                 assert_eq!(*buffer_id, 1);
                 assert_eq!(*offset, 0);
-                assert_eq!(data.len(), 768);
+                assert_eq!(data.len(), 528);
                 // Verify uniform snapshot values:
                 // Red [1.0, 0.0, 0.0, 1.0] at 0
                 assert_eq!(f32::from_le_bytes(data[0..4].try_into().unwrap()), 1.0);
@@ -7070,7 +7070,7 @@ mod tests {
         assert_eq!(version, 1);
         assert_eq!(flags, 0);
         assert_eq!(cmd_count, 9);
-        assert_eq!(total_data_len as usize, 120);
+        assert_eq!(total_data_len as usize, 944); // 120 bytes vb2 data + 824 bytes CreatePipeline WGSL source
 
         // Iterate through wire records and inspect the exact bytes for opcode 11
         let mut cursor = 16usize;

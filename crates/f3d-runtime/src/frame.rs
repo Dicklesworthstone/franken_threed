@@ -1970,9 +1970,19 @@ mod tests {
         assert_eq!(seg2.primary_color_attachment().unwrap().target_id(), canvas_target);
         assert_eq!(seg2.primary_color_attachment().unwrap().load_op, LoadOp::Load);
 
-        // 7. Assert through lower_plan that the packet carries three RenderPass first-draw openers in source order
-        // with flags NEW_PASS and >0 vertices (§8.5).
-        assert_eq!(packet.commands().len(), 3);
+        // 7. Assert through lower_plan that the packet carries the prepended uniform WriteBuffer
+        // and three RenderPass first-draw openers in source order with flags NEW_PASS and >0 vertices (§5.5, §8.5).
+        assert_eq!(packet.commands().len(), 4);
+        match &packet.commands()[0] {
+            GpuCommand::WriteBuffer { buffer_id, offset, data } => {
+                assert_eq!(*buffer_id, DEFAULT_MATERIAL_UNIFORM_BUFFER_ID);
+                assert_eq!(*offset, 0);
+                assert_eq!(&data[rec_red.byte_offset()..rec_red.byte_offset() + 4], &red_bytes);
+                assert_eq!(&data[rec_inner.byte_offset()..rec_inner.byte_offset() + 4], &inner_bytes);
+                assert_eq!(&data[rec_blue.byte_offset()..rec_blue.byte_offset() + 4], &blue_bytes);
+            }
+            other => panic!("expected WriteBuffer at index 0, got {other:?}"),
+        }
         let render_passes: Vec<&GpuCommand> = packet
             .commands()
             .iter()
@@ -1988,8 +1998,9 @@ mod tests {
         let pass1_idx = packet.commands().iter().position(|cmd| std::ptr::eq(cmd, render_passes[1])).unwrap();
         let pass2_idx = packet.commands().iter().position(|cmd| std::ptr::eq(cmd, render_passes[2])).unwrap();
 
-        assert!(pass0_idx < pass1_idx);
-        assert!(pass1_idx < pass2_idx);
+        assert_eq!(pass0_idx, 1);
+        assert_eq!(pass1_idx, 2);
+        assert_eq!(pass2_idx, 3);
 
         // 8. Assert draws keep source order: red -> inner -> blue
         assert!(rec_red.byte_offset() < rec_inner.byte_offset());
@@ -2312,8 +2323,18 @@ mod tests {
             .expect("compile submission packet with tracker");
 
         // 6. Assert lowered openers are canvas clear, offscreen clear, canvas load in source order
-        // with flags NEW_PASS and >0 vertices (§8.5).
-        assert_eq!(packet.commands().len(), 3);
+        // with flags NEW_PASS and >0 vertices, preceded by the uniform WriteBuffer (§5.5, §8.5).
+        assert_eq!(packet.commands().len(), 4);
+        match &packet.commands()[0] {
+            GpuCommand::WriteBuffer { buffer_id, offset, data } => {
+                assert_eq!(*buffer_id, DEFAULT_MATERIAL_UNIFORM_BUFFER_ID);
+                assert_eq!(*offset, 0);
+                assert_eq!(&data[rec_red.byte_offset()..rec_red.byte_offset() + 4], &red_bytes);
+                assert_eq!(&data[rec_inner.byte_offset()..rec_inner.byte_offset() + 4], &inner_bytes);
+                assert_eq!(&data[rec_blue.byte_offset()..rec_blue.byte_offset() + 4], &blue_bytes);
+            }
+            other => panic!("expected WriteBuffer at index 0, got {other:?}"),
+        }
         let render_passes: Vec<&GpuCommand> = packet
             .commands()
             .iter()
@@ -2329,8 +2350,9 @@ mod tests {
         let pass1_idx = packet.commands().iter().position(|cmd| std::ptr::eq(cmd, render_passes[1])).unwrap();
         let pass2_idx = packet.commands().iter().position(|cmd| std::ptr::eq(cmd, render_passes[2])).unwrap();
 
-        assert!(pass0_idx < pass1_idx);
-        assert!(pass1_idx < pass2_idx);
+        assert_eq!(pass0_idx, 1);
+        assert_eq!(pass1_idx, 2);
+        assert_eq!(pass2_idx, 3);
     }
 
     fn assert_render_pass_first_draw(
@@ -2428,11 +2450,21 @@ mod tests {
             .expect("snapshot blue");
         session.record_direct_draw(1, 0, 3, Some(rec_blue)).expect("record blue draw");
 
-        // Compile with tracker yields 3 first-draw openers: CANVAS CLEAR NEW_PASS / OFFSCREEN CLEAR NEW_PASS / CANVAS LOAD NEW_PASS
+        // Compile with tracker yields 1 WriteBuffer and 3 first-draw openers: CANVAS CLEAR NEW_PASS / OFFSCREEN CLEAR NEW_PASS / CANVAS LOAD NEW_PASS
         let packet = session
             .build_submission_packet_with_tracker(Some(&tracker))
             .expect("compile submission packet with tracker");
-        assert_eq!(packet.commands().len(), 3);
+        assert_eq!(packet.commands().len(), 4);
+        match &packet.commands()[0] {
+            GpuCommand::WriteBuffer { buffer_id, offset, data } => {
+                assert_eq!(*buffer_id, DEFAULT_MATERIAL_UNIFORM_BUFFER_ID);
+                assert_eq!(*offset, 0);
+                assert_eq!(&data[rec_red.byte_offset()..rec_red.byte_offset() + 4], &[255, 0, 0, 255]);
+                assert_eq!(&data[rec_inner.byte_offset()..rec_inner.byte_offset() + 4], &[0, 255, 0, 255]);
+                assert_eq!(&data[rec_blue.byte_offset()..rec_blue.byte_offset() + 4], &[0, 0, 255, 255]);
+            }
+            other => panic!("expected WriteBuffer at index 0, got {other:?}"),
+        }
         let render_passes: Vec<&GpuCommand> = packet
             .commands()
             .iter()
@@ -2448,8 +2480,9 @@ mod tests {
         let pass1_idx = packet.commands().iter().position(|cmd| std::ptr::eq(cmd, render_passes[1])).unwrap();
         let pass2_idx = packet.commands().iter().position(|cmd| std::ptr::eq(cmd, render_passes[2])).unwrap();
 
-        assert!(pass0_idx < pass1_idx);
-        assert!(pass1_idx < pass2_idx);
+        assert_eq!(pass0_idx, 1);
+        assert_eq!(pass1_idx, 2);
+        assert_eq!(pass2_idx, 3);
     }
 
     #[test]
