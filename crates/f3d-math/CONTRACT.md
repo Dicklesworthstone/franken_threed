@@ -124,7 +124,10 @@ core/math <- scene
 
 - Class: `Deterministic-Scalar-f64`.
 - All operations are pure scalar arithmetic on fixed `f64` values.
-- No hardware-dependent transcendental approximations are used in this transform slice.
+- Transcendental float operations (`sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `exp`, `log`, `pow`, `sqrt`, `cbrt`, `hypot`) delegate to target floating-point methods:
+  - `sqrt`: Correctly rounded (0 ULP difference, bit-for-bit exact with IEEE 754 and V8 reference).
+  - Unary and binary transcendentals: Within 1 ULP of V8 reference vectors across 48,888 test cases (up to 2 ULP on compound reductions `tan` and `hypot` where host libm and V8 polynomial approximations round in opposite directions relative to the true real value).
+  - `pow`: Conforms to IEEE 754-2008 (§9.2.1) / ISO C99 (`1.0.powf(any) == 1.0` and `(-1.0).powf(+-inf) == 1.0`), honestly documenting the 5 divergence cases where ECMAScript §21.2.2.26 requires `NaN`.
 
 ---
 
@@ -184,6 +187,13 @@ core/math <- scene
   - Linear RGB interpolation (`lerp`) and HSL interpolation (`lerp_hsl`).
   - Upstream 3x3 matrix constants (`LINEAR_REC709_TO_XYZ`, `XYZ_TO_LINEAR_DISPLAY_P3`, `LINEAR_SRGB_TO_LINEAR_DISPLAY_P3`, `LINEAR_DISPLAY_P3_TO_LINEAR_SRGB`) and round-trip transformation accuracy.
   - Clamped subtraction and arithmetic operations.
+- Transcendental differential reference tests in `tests/transcendental_differential_tests.rs`:
+  - 48,888 V8-generated test vectors ingested via `include_str!` from `tests/fixtures/math/transcendental_expected.txt` (1,260 unary cases across 10 ops, 47,628 pairwise binary cases across `atan2`, `pow`, `hypot`).
+  - Bit-for-bit evaluation of Rust core/std float methods against Node V8 reference vectors, collecting exact matches, 1-ULP differences, and worst ULP distances.
+  - Verifies `sqrt` is bit-for-bit exact (0 ULP difference, 100% exact match across all 126 cases per IEEE 754 correctly rounded contract).
+  - Verifies all transcendental operations match within 1 ULP on target (bounded by at most 2 ULP on compound reductions `tan` and `hypot`).
+  - Captures and documents the 5 edge cases where ECMAScript §21.2.2.26 specifies `NaN` for `Math.pow(1, NaN)` and `Math.pow(+-1, +-inf)` while IEEE 754-2008 / ISO C99 / Rust `f64::powf` specify `1.0`.
+  - Emits formatted empirical summary table documenting libm vs V8 characteristics.
 
 ---
 
