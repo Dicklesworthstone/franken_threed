@@ -76,10 +76,20 @@ export const SCHEMA_VERSION = '1.0.0';
 
 /**
  * @typedef {Object} DynamicImport
- * @property {'literal' | 'variable' | 'template' | 'expression' | 'empty'} classification - Expression category
+ * @property {'literal' | 'variable' | 'template' | 'expression' | 'empty' | 'finite_set' | 'nonliteral'} classification - Expression category
  * @property {string | null} specifier - Target specifier if literal
  * @property {string | null} resolved_id - Canonical URL of resolved target if literal
+ * @property {string[] | null} [finite_set] - Candidate specifier strings if conditional finite set
+ * @property {string[] | null} [finiteSet] - CamelCase alias for finite_set
+ * @property {string[] | null} [specifiers] - Specifiers list for finite set
+ * @property {string[] | null} [candidates] - Candidate list for finite set
+ * @property {Array<{ specifier: string, resolved_id: string | null, resolvedId?: string | null, error?: string }>} [resolved_targets] - Resolved candidate targets for finite set
+ * @property {Array<{ specifier: string, resolved_id: string | null, resolvedId?: string | null, error?: string }>} [resolvedTargets] - CamelCase alias for resolved_targets
+ * @property {string[]} [resolved_ids] - Canonical URLs of resolved candidates if finite set
+ * @property {string[]} [resolvedIds] - CamelCase alias for resolved_ids
  * @property {boolean} unresolved - True if target cannot be statically resolved
+ * @property {boolean} [claims_closure] - True if complete module closure is statically claimed
+ * @property {boolean} [claimsClosure] - CamelCase alias for claims_closure
  * @property {string} [error] - Error message if literal resolution failed
  * @property {SourceSpan} source_span - Source location span of import() expression
  * @property {SourceSpan} [sourceSpan] - CamelCase alias for source_span

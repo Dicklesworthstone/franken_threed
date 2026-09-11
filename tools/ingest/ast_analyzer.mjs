@@ -55,9 +55,32 @@ function toSourceSpan(node, offsets = {}) {
 }
 
 /**
+ * Recursively extracts all string literal candidate branches from a conditional expression.
+ * Returns null if any branch is not a string literal or purely literal template.
+ * @param {any} node
+ * @returns {string[] | null}
+ */
+function extractConditionalStringLiterals(node) {
+  if (!node) return null;
+  if (node.type === 'ConditionalExpression') {
+    const consequent = extractConditionalStringLiterals(node.consequent);
+    const alternate = extractConditionalStringLiterals(node.alternate);
+    if (!consequent || !alternate) return null;
+    return [...consequent, ...alternate];
+  }
+  if (node.type === 'Literal' && typeof node.value === 'string') {
+    return [node.value];
+  }
+  if (node.type === 'TemplateLiteral' && node.expressions.length === 0 && node.quasis.length > 0) {
+    return [node.quasis.map(q => q.value.cooked ?? q.value.raw).join('')];
+  }
+  return null;
+}
+
+/**
  * Classifies the argument of an ImportExpression (dynamic import).
  * @param {any} sourceNode
- * @returns {{ classification: 'literal' | 'template_enumerable' | 'nonliteral', specifier: string | null }}
+ * @returns {{ classification: 'literal' | 'finite_set' | 'nonliteral', specifier: string | null, specifiers?: string[], finite_set?: string[], finiteSet?: string[], candidates?: string[] }}
  */
 function classifyDynamicImportArgument(sourceNode) {
   if (!sourceNode) {
@@ -70,10 +93,26 @@ function classifyDynamicImportArgument(sourceNode) {
 
   if (sourceNode.type === 'TemplateLiteral') {
     if (sourceNode.expressions.length === 0 && sourceNode.quasis.length > 0) {
-      return { classification: 'literal', specifier: sourceNode.quasis[0].value.raw };
+      const specifier = sourceNode.quasis.map(q => q.value.cooked ?? q.value.raw).join('');
+      return { classification: 'literal', specifier };
     }
     // Template with expressions: not a simple literal
     return { classification: 'nonliteral', specifier: null };
+  }
+
+  if (sourceNode.type === 'ConditionalExpression') {
+    const branches = extractConditionalStringLiterals(sourceNode);
+    if (branches && branches.length > 0) {
+      const unique = Array.from(new Set(branches));
+      return {
+        classification: 'finite_set',
+        specifier: null,
+        specifiers: unique,
+        candidates: unique,
+        finite_set: unique,
+        finiteSet: unique,
+      };
+    }
   }
 
   return { classification: 'nonliteral', specifier: null };
@@ -285,12 +324,11 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
   // 5. Renderer construction sites and WebGL escapes
   walk.simple(ast, {
     ImportExpression(node) {
-      const { classification, specifier } = classifyDynamicImportArgument(node.source);
+      const classified = classifyDynamicImportArgument(node.source);
       const span = toSourceSpan(node, offsets);
       dynamicImports.push({
-        classification,
-        specifier,
-        unresolved: classification === 'nonliteral',
+        ...classified,
+        unresolved: classified.classification === 'nonliteral',
         source_span: span,
         sourceSpan: span
       });

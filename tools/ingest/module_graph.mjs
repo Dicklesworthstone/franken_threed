@@ -226,9 +226,13 @@ export async function buildModuleGraph(entryPath, options = {}) {
             classification: 'literal',
             specifier: dyn.specifier,
             resolved_id: null,
+            resolvedId: null,
             unresolved: true,
+            claims_closure: false,
+            claimsClosure: false,
             error: err.message,
-            source_span: dyn.sourceSpan
+            source_span: dyn.sourceSpan,
+            sourceSpan: dyn.sourceSpan
           });
           continue;
         }
@@ -239,6 +243,8 @@ export async function buildModuleGraph(entryPath, options = {}) {
           resolved_id: resolvedTarget,
           resolvedId: resolvedTarget,
           unresolved: false,
+          claims_closure: true,
+          claimsClosure: true,
           source_span: dyn.sourceSpan,
           sourceSpan: dyn.sourceSpan
         });
@@ -252,6 +258,60 @@ export async function buildModuleGraph(entryPath, options = {}) {
             referrerUrl: moduleId
           });
         }
+      } else if (dyn.classification === 'finite_set' && (dyn.finite_set || dyn.specifiers)) {
+        const candidates = dyn.finite_set || dyn.specifiers;
+        const resolvedTargets = [];
+        let allResolved = true;
+
+        for (const cand of candidates) {
+          try {
+            const resolvedTarget = resolveModuleSpecifier(cand, moduleId, importMap, {
+              mapBaseUrl,
+              packageRootUrl: options.packageRootUrl,
+              span: dyn.sourceSpan
+            });
+            resolvedTargets.push({
+              specifier: cand,
+              resolved_id: resolvedTarget,
+              resolvedId: resolvedTarget,
+            });
+            if (!modules.has(resolvedTarget)) {
+              queue.push({
+                id: resolvedTarget,
+                isInline: false,
+                inlineContent: null,
+                offsets: {},
+                referrerUrl: moduleId
+              });
+            }
+          } catch (err) {
+            allResolved = false;
+            resolvedTargets.push({
+              specifier: cand,
+              resolved_id: null,
+              resolvedId: null,
+              error: err.message
+            });
+          }
+        }
+
+        resolvedDynamicImports.push({
+          classification: 'finite_set',
+          specifier: null,
+          specifiers: candidates,
+          candidates,
+          finite_set: candidates,
+          finiteSet: candidates,
+          resolved_targets: resolvedTargets,
+          resolvedTargets,
+          resolved_ids: resolvedTargets.map(t => t.resolved_id).filter(Boolean),
+          resolvedIds: resolvedTargets.map(t => t.resolvedId).filter(Boolean),
+          unresolved: !allResolved,
+          claims_closure: allResolved,
+          claimsClosure: allResolved,
+          source_span: dyn.sourceSpan,
+          sourceSpan: dyn.sourceSpan
+        });
       } else {
         // Nonliteral dynamic import: classify and preserve as unresolved without claiming closure
         resolvedDynamicImports.push({
@@ -260,6 +320,8 @@ export async function buildModuleGraph(entryPath, options = {}) {
           resolved_id: null,
           resolvedId: null,
           unresolved: true,
+          claims_closure: false,
+          claimsClosure: false,
           source_span: dyn.sourceSpan,
           sourceSpan: dyn.sourceSpan
         });

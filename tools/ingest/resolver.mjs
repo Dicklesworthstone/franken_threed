@@ -126,6 +126,155 @@ function matchMapEntries(specifier, entries, mapBaseUrl) {
   return null;
 }
 
+const PACKAGE_JSON_CACHE = new Map();
+
+/**
+ * Loads and parses a package.json from disk, with in-memory caching.
+ * @param {string} packageJsonPath
+ * @returns {any | null}
+ */
+export function loadPackageJson(packageJsonPath) {
+  if (PACKAGE_JSON_CACHE.has(packageJsonPath)) {
+    return PACKAGE_JSON_CACHE.get(packageJsonPath);
+  }
+  if (!fs.existsSync(packageJsonPath)) {
+    return null;
+  }
+  try {
+    const raw = fs.readFileSync(packageJsonPath, 'utf-8');
+    const parsed = JSON.parse(raw);
+    PACKAGE_JSON_CACHE.set(packageJsonPath, parsed);
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Clears the package.json cache.
+ */
+export function clearPackageJsonCache() {
+  PACKAGE_JSON_CACHE.clear();
+}
+
+/**
+ * Resolves an export target value given admitted conditions ('import', 'default').
+ * Handles string targets, conditional object targets, and null targets.
+ * @param {any} target
+ * @param {string[]} [conditions=['import', 'default']]
+ * @returns {string | null | undefined}
+ */
+export function resolveExportTargetValue(target, conditions = ['import', 'default']) {
+  if (typeof target === 'string') {
+    return target;
+  }
+  if (target === null) {
+    return null;
+  }
+  if (typeof target === 'object') {
+    for (const cond of conditions) {
+      if (Object.prototype.hasOwnProperty.call(target, cond)) {
+        const val = resolveExportTargetValue(target[cond], conditions);
+        if (val !== undefined) return val;
+      }
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Resolves a package subpath using the package.json exports map.
+ * Evaluates exact keys, wildcard pattern keys, and condition priorities ('import', 'default').
+ * Throws IngestionResolutionError with package.json path if not exported or blocked.
+ *
+ * @param {string} subpath - Relative subpath e.g. '.', './webgpu', './addons/controls/OrbitControls.js'
+ * @param {any} exportsField - The `exports` field from package.json
+ * @param {string} packageJsonPath - Path to package.json for error reporting
+ * @param {string} specifier - Full import specifier e.g. 'three/webgpu'
+ * @param {string} referrerUrl - Referrer URL for error reporting
+ * @param {any} [span] - Source span for error reporting
+ * @returns {string} - Relative target path e.g. './build/three.webgpu.js'
+ */
+export function resolvePackageExports(subpath, exportsField, packageJsonPath, specifier, referrerUrl, span) {
+  if (!exportsField || typeof exportsField !== 'object') {
+    throw new IngestionResolutionError(
+      `Package "three" at "${packageJsonPath}" does not define a valid "exports" map`,
+      specifier,
+      referrerUrl,
+      span
+    );
+  }
+
+  // 1. Direct / exact match
+  if (Object.prototype.hasOwnProperty.call(exportsField, subpath)) {
+    const targetVal = exportsField[subpath];
+    const resolved = resolveExportTargetValue(targetVal, ['import', 'default']);
+    if (resolved === null) {
+      throw new IngestionResolutionError(
+        `Cannot resolve blocked package export "${specifier}" from "${referrerUrl}": mapped to null in "${packageJsonPath}"`,
+        specifier,
+        referrerUrl,
+        span
+      );
+    }
+    if (typeof resolved === 'string') {
+      return resolved;
+    }
+    throw new IngestionResolutionError(
+      `Cannot resolve package export "${specifier}" from "${referrerUrl}": no matching condition ('import', 'default') in "${packageJsonPath}"`,
+      specifier,
+      referrerUrl,
+      span
+    );
+  }
+
+  // 2. Pattern matching for keys containing '*'
+  // Node spec: longest prefix match before '*' takes precedence
+  const patternKeys = Object.keys(exportsField)
+    .filter(k => k.includes('*'))
+    .sort((a, b) => {
+      const aPrefix = a.slice(0, a.indexOf('*'));
+      const bPrefix = b.slice(0, b.indexOf('*'));
+      return bPrefix.length - aPrefix.length;
+    });
+
+  for (const patternKey of patternKeys) {
+    const starIdx = patternKey.indexOf('*');
+    const prefix = patternKey.slice(0, starIdx);
+    const suffix = patternKey.slice(starIdx + 1);
+
+    if (subpath.startsWith(prefix) && (suffix === '' || subpath.endsWith(suffix))) {
+      const wildcardMatch = subpath.slice(prefix.length, suffix ? subpath.length - suffix.length : undefined);
+      const targetVal = exportsField[patternKey];
+      const resolvedTarget = resolveExportTargetValue(targetVal, ['import', 'default']);
+
+      if (resolvedTarget === null) {
+        throw new IngestionResolutionError(
+          `Cannot resolve blocked package export "${specifier}" from "${referrerUrl}": pattern "${patternKey}" mapped to null in "${packageJsonPath}"`,
+          specifier,
+          referrerUrl,
+          span
+        );
+      }
+
+      if (typeof resolvedTarget === 'string') {
+        if (resolvedTarget.includes('*')) {
+          return resolvedTarget.replace('*', wildcardMatch);
+        }
+        return resolvedTarget;
+      }
+    }
+  }
+
+  // 3. Subpath not exported
+  throw new IngestionResolutionError(
+    `Cannot resolve package import "${specifier}" from "${referrerUrl}": subpath "${subpath}" is not exported by package.json at "${packageJsonPath}"`,
+    specifier,
+    referrerUrl,
+    span
+  );
+}
+
 /**
  * Resolves a module specifier against a referrer and import map.
  * Preserves canonical URL identity (including query and fragment)
@@ -182,29 +331,51 @@ export function resolveModuleSpecifier(specifier, referrerUrl, importMap = {}, o
         span
       );
     }
-  } else {
-    // 4. Fallback resolution for pinned Three.js package
-    const pkgRoot = options.packageRootUrl || pathToFileURL(path.resolve('upstream/three.js/')).href + '/';
-    if (specifier === 'three') {
-      candidateUrl = new URL('build/three.module.js', pkgRoot).href;
-    } else if (specifier === 'three/webgpu') {
-      candidateUrl = new URL('build/three.webgpu.js', pkgRoot).href;
-    } else if (specifier === 'three/tsl') {
-      candidateUrl = new URL('build/three.tsl.js', pkgRoot).href;
-    } else if (specifier.startsWith('three/addons/')) {
-      const rest = specifier.slice('three/addons/'.length);
-      candidateUrl = new URL(`examples/jsm/${rest}`, pkgRoot).href;
-    } else if (specifier.startsWith('three/src/')) {
-      const rest = specifier.slice('three/src/'.length);
-      candidateUrl = new URL(`src/${rest}`, pkgRoot).href;
+  } else if (specifier === 'three' || specifier.startsWith('three/')) {
+    // 4. Pinned Three.js package resolution via package.json exports map
+    let pkgRootDir;
+    let pkgRootUrl;
+    if (options.packageRootUrl) {
+      if (options.packageRootUrl.startsWith('file://')) {
+        pkgRootUrl = options.packageRootUrl.endsWith('/') ? options.packageRootUrl : options.packageRootUrl + '/';
+        pkgRootDir = urlToFilePath(pkgRootUrl);
+      } else {
+        pkgRootDir = path.resolve(options.packageRootUrl);
+        pkgRootUrl = pathToFileURL(pkgRootDir).href + '/';
+      }
     } else {
+      pkgRootDir = path.resolve('upstream/three.js');
+      pkgRootUrl = pathToFileURL(pkgRootDir).href + '/';
+    }
+
+    const packageJsonPath = path.join(pkgRootDir, 'package.json');
+    const pkgJson = loadPackageJson(packageJsonPath);
+    if (!pkgJson) {
       throw new IngestionResolutionError(
-        `Cannot resolve bare specifier "${specifier}" from "${referrerUrl}": no import map match and no package fallback`,
+        `Cannot resolve package import "${specifier}" from "${referrerUrl}": package.json not found at "${packageJsonPath}"`,
         specifier,
         referrerUrl,
         span
       );
     }
+
+    const subpath = specifier === 'three' ? '.' : './' + specifier.slice('three/'.length);
+    const relativeTarget = resolvePackageExports(
+      subpath,
+      pkgJson.exports,
+      packageJsonPath,
+      specifier,
+      referrerUrl,
+      span
+    );
+    candidateUrl = new URL(relativeTarget, pkgRootUrl).href;
+  } else {
+    throw new IngestionResolutionError(
+      `Cannot resolve bare specifier "${specifier}" from "${referrerUrl}": no import map match and no package fallback`,
+      specifier,
+      referrerUrl,
+      span
+    );
   }
 
   // 5. Verify target exists if file: URL

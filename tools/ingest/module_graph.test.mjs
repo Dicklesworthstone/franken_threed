@@ -623,7 +623,8 @@ test('Routing facts: Ingestion extracts renderer construction sites and WebGL es
   assert.ok(h1Root.renderer_construction_sites.length >= 1, 'H1 must have at least 1 renderer construction site');
   const h1Site = h1Root.renderer_construction_sites[0];
   assert.equal(h1Site.constructor_name, 'WebGPURenderer');
-  assert.equal(h1Site.has_force_webgl, true, 'H1 must detect forceWebGL: !api.webgpu');
+  assert.equal(h1Site.has_force_webgl, 'unresolved', 'H1 must detect forceWebGL: !api.webgpu as unresolved');
+  assert.equal(h1Site.force_webgl_unresolved, true, 'H1 must detect force_webgl_unresolved: true');
   assert.equal(h1Site.source_span.start.line, 188, 'H1 renderer construction must be at line 188');
 
   // Test on real H2
@@ -655,3 +656,463 @@ export function setup(canvas) {
   assert.ok(escapeMod.routing_facts.escapes.length >= 2);
   assert.equal(escapeMod.routing_facts.escapes[0].source_span.start.line, 3);
 });
+
+// ---------------------------------------------------------------------------
+// SINGLETON IDENTITY & DYNAMIC IMPORT FINITE CLOSURE (6mv.1)
+// ---------------------------------------------------------------------------
+
+test('Singleton identity: byte-identical modules at distinct resolved URLs preserve distinct nodes and live-binding namespaces while shared dependency is a single node', async () => {
+  const scratch = makeScratchDir('f3d_singleton_identity');
+
+  // Shared dependency
+  const sharedFile = path.join(scratch, 'shared_dep.js');
+  fs.writeFileSync(sharedFile, `
+export const sharedToken = Symbol('shared_identity');
+export const sharedValue = 'shared_constant_123';
+`, 'utf-8');
+
+  // Two modules with identical byte content at different paths
+  const identicalSource = `
+import { sharedToken, sharedValue } from './shared_dep.js';
+export let counter = 0;
+export function increment() {
+  counter += 1;
+  return counter;
+}
+export { sharedToken, sharedValue };
+`;
+  const fileA = path.join(scratch, 'instance_alpha.js');
+  const fileB = path.join(scratch, 'instance_beta.js');
+  fs.writeFileSync(fileA, identicalSource, 'utf-8');
+  fs.writeFileSync(fileB, identicalSource, 'utf-8');
+
+  // Entry module imports both
+  const entryFile = path.join(scratch, 'entry.js');
+  fs.writeFileSync(entryFile, `
+import * as Alpha from './instance_alpha.js';
+import * as Beta from './instance_beta.js';
+export { Alpha, Beta };
+`, 'utf-8');
+
+  const graph = await buildModuleGraph(entryFile);
+
+  const entryUrl = pathToFileURL(entryFile).href;
+  const urlA = pathToFileURL(fileA).href;
+  const urlB = pathToFileURL(fileB).href;
+  const urlShared = pathToFileURL(sharedFile).href;
+
+  // 1. Two distinct graph nodes for the byte-identical modules
+  assert.ok(graph.modules[urlA], 'instance_alpha.js must have its own graph node');
+  assert.ok(graph.modules[urlB], 'instance_beta.js must have its own graph node');
+  assert.notEqual(urlA, urlB, 'Resolved URLs must be distinct');
+
+  // 2. Both nodes record identical content hashes and duplicate_content_with without merging
+  assert.equal(graph.modules[urlA].content_hash, graph.modules[urlB].content_hash);
+  assert.deepEqual(graph.modules[urlA].duplicate_content_with, [urlB]);
+  assert.deepEqual(graph.modules[urlB].duplicate_content_with, [urlA]);
+
+  // 3. Shared dependency imported by both is a single node
+  assert.ok(graph.modules[urlShared], 'shared_dep.js must exist in graph');
+  const sharedOccurrences = Object.keys(graph.modules).filter(url => url === urlShared);
+  assert.equal(sharedOccurrences.length, 1, 'Shared dependency must be a single graph node');
+  assert.equal(graph.summary.total_modules, 4); // entry, instance_alpha, instance_beta, shared_dep
+
+  // 4. Distinct live-binding namespaces in graph metadata
+  assert.equal(graph.modules[urlA].has_live_bindings, true);
+  assert.equal(graph.modules[urlB].has_live_bindings, true);
+  assert.deepEqual(graph.modules[urlA].mutable_exported_bindings, ['counter']);
+  assert.deepEqual(graph.modules[urlB].mutable_exported_bindings, ['counter']);
+
+  // 5. Distinct live-binding namespaces at runtime execution
+  const modA = await import(urlA);
+  const modB = await import(urlB);
+  assert.notEqual(modA, modB, 'Distinct URL modules must produce distinct namespace objects');
+  assert.equal(modA.sharedToken, modB.sharedToken, 'Shared dependency singleton symbol must be identical');
+
+  assert.equal(modA.counter, 0);
+  assert.equal(modB.counter, 0);
+  modA.increment();
+  assert.equal(modA.counter, 1, 'Mutating modA binding must update modA');
+  assert.equal(modB.counter, 0, 'Mutating modA binding must not affect modB namespace');
+
+  modB.increment();
+  modB.increment();
+  assert.equal(modB.counter, 2, 'Mutating modB binding must update modB');
+  assert.equal(modA.counter, 1, 'modA binding remains independent');
+});
+
+test('Dynamic import finite-closure classification: template literal with only literal segments resolves', async () => {
+  const scratch = makeScratchDir('f3d_dyn_template_literal');
+
+  const targetFile = path.join(scratch, 'target_module.js');
+  fs.writeFileSync(targetFile, `
+export const magic = 42;
+`, 'utf-8');
+
+  const entryFile = path.join(scratch, 'entry.js');
+  fs.writeFileSync(entryFile, `
+export async function loadTarget() {
+  return await import(\`./target_module.js\`);
+}
+`, 'utf-8');
+
+  const graph = await buildModuleGraph(entryFile);
+  const entryUrl = pathToFileURL(entryFile).href;
+  const targetUrl = pathToFileURL(targetFile).href;
+
+  const entryMod = graph.modules[entryUrl];
+  assert.ok(entryMod, 'Entry module must exist in graph');
+  assert.equal(entryMod.dynamic_imports.length, 1);
+
+  const dyn = entryMod.dynamic_imports[0];
+  assert.equal(dyn.classification, 'literal', 'Template literal without expressions must be classified as literal');
+  assert.equal(dyn.specifier, './target_module.js');
+  assert.equal(dyn.unresolved, false);
+  assert.equal(dyn.resolved_id, targetUrl);
+
+  // Target module must be ingested into graph
+  assert.ok(graph.modules[targetUrl], 'Target module referenced via literal template must be in graph');
+  assert.equal(graph.summary.unresolved_dynamic_imports, 0);
+});
+
+test('Dynamic import finite-closure classification: conditional expression of string literals yields a finite set', async () => {
+  const scratch = makeScratchDir('f3d_dyn_conditional_set');
+
+  const branchA = path.join(scratch, 'branch_a.js');
+  const branchB = path.join(scratch, 'branch_b.js');
+  const branchC = path.join(scratch, 'branch_c.js');
+  fs.writeFileSync(branchA, `export const name = 'A';\n`, 'utf-8');
+  fs.writeFileSync(branchB, `export const name = 'B';\n`, 'utf-8');
+  fs.writeFileSync(branchC, `export const name = 'C';\n`, 'utf-8');
+
+  const entryFile = path.join(scratch, 'entry.js');
+  fs.writeFileSync(entryFile, `
+export async function loadWorkers(flag, tier) {
+  const simple = await import(flag ? './branch_a.js' : './branch_b.js');
+  const chained = await import(tier === 1 ? './branch_a.js' : (tier === 2 ? './branch_b.js' : './branch_c.js'));
+  return { simple, chained };
+}
+`, 'utf-8');
+
+  const graph = await buildModuleGraph(entryFile);
+  const entryUrl = pathToFileURL(entryFile).href;
+  const urlA = pathToFileURL(branchA).href;
+  const urlB = pathToFileURL(branchB).href;
+  const urlC = pathToFileURL(branchC).href;
+
+  const entryMod = graph.modules[entryUrl];
+  assert.ok(entryMod, 'Entry module must exist in graph');
+  assert.equal(entryMod.dynamic_imports.length, 2);
+
+  // 1. Simple binary conditional import
+  const dyn1 = entryMod.dynamic_imports[0];
+  assert.equal(dyn1.classification, 'finite_set');
+  assert.deepEqual(dyn1.finite_set, ['./branch_a.js', './branch_b.js']);
+  assert.equal(dyn1.unresolved, false);
+  assert.deepEqual(dyn1.resolved_ids, [urlA, urlB]);
+
+  // 2. Chained conditional import
+  const dyn2 = entryMod.dynamic_imports[1];
+  assert.equal(dyn2.classification, 'finite_set');
+  assert.deepEqual(dyn2.finite_set, ['./branch_a.js', './branch_b.js', './branch_c.js']);
+  assert.equal(dyn2.unresolved, false);
+  assert.deepEqual(dyn2.resolved_ids, [urlA, urlB, urlC]);
+
+  // 3. All finite-set candidates must be reachable and ingested into graph
+  assert.ok(graph.modules[urlA], 'branch_a.js must be ingested');
+  assert.ok(graph.modules[urlB], 'branch_b.js must be ingested');
+  assert.ok(graph.modules[urlC], 'branch_c.js must be ingested');
+  assert.equal(graph.summary.unresolved_dynamic_imports, 0);
+  assert.equal(graph.summary.total_modules, 4); // entry + 3 branches
+});
+
+test('Dynamic import finite-closure classification: identifier argument stays unresolved without claiming closure', async () => {
+  const scratch = makeScratchDir('f3d_dyn_identifier_unresolved');
+
+  const entryFile = path.join(scratch, 'entry.js');
+  fs.writeFileSync(entryFile, `
+export async function loadArbitrary(moduleSpecifierIdentifier) {
+  return await import(moduleSpecifierIdentifier);
+}
+`, 'utf-8');
+
+  const graph = await buildModuleGraph(entryFile);
+  const entryUrl = pathToFileURL(entryFile).href;
+
+  const entryMod = graph.modules[entryUrl];
+  assert.ok(entryMod, 'Entry module must exist in graph');
+  assert.equal(entryMod.dynamic_imports.length, 1);
+
+  const dyn = entryMod.dynamic_imports[0];
+  assert.equal(dyn.classification, 'nonliteral');
+  assert.equal(dyn.specifier, null);
+  assert.equal(dyn.resolved_id, null);
+  assert.equal(dyn.unresolved, true);
+  assert.equal(dyn.finite_set, undefined, 'Must not claim finite set closure for identifier argument');
+
+  const span = dyn.source_span || dyn.sourceSpan;
+  assert.ok(span, 'Must preserve source span');
+  assert.equal(span.start.line, 3);
+  assert.equal(graph.summary.unresolved_dynamic_imports, 1);
+  assert.equal(graph.summary.total_modules, 1);
+});
+
+test('Dynamic import finite-closure classification: candidate resolution failure marks finite_set import unresolved without claiming closure', async () => {
+  const scratch = makeScratchDir('f3d_dyn_candidate_failure');
+
+  const existsFile = path.join(scratch, 'exists.js');
+  fs.writeFileSync(existsFile, `export const available = true;\n`, 'utf-8');
+  // './nonexistent.js' is intentionally omitted
+
+  const entryFile = path.join(scratch, 'entry.js');
+  fs.writeFileSync(entryFile, `
+export async function load(flag) {
+  return await import(flag ? './exists.js' : './nonexistent.js');
+}
+`, 'utf-8');
+
+  const graph = await buildModuleGraph(entryFile);
+  const entryUrl = pathToFileURL(entryFile).href;
+  const existsUrl = pathToFileURL(existsFile).href;
+
+  const entryMod = graph.modules[entryUrl];
+  assert.ok(entryMod, 'Entry module must exist in graph');
+  assert.equal(entryMod.dynamic_imports.length, 1);
+
+  const dyn = entryMod.dynamic_imports[0];
+  assert.equal(dyn.classification, 'finite_set');
+  assert.deepEqual(dyn.finite_set, ['./exists.js', './nonexistent.js']);
+
+  // Must mark unresolved: true and not claim closure when any candidate does not exist
+  assert.equal(dyn.unresolved, true, 'Partial candidate resolution failure must mark dynamic import unresolved');
+  assert.equal(dyn.claims_closure, false, 'Partial candidate resolution failure must not claim closure');
+  assert.equal(dyn.claimsClosure, false);
+
+  // Candidate targets record partial resolution: exists.js resolved, nonexistent.js records error
+  assert.equal(dyn.resolved_targets.length, 2);
+  const existsTarget = dyn.resolved_targets.find(t => t.specifier === './exists.js');
+  const nonexistentTarget = dyn.resolved_targets.find(t => t.specifier === './nonexistent.js');
+  assert.equal(existsTarget.resolved_id, existsUrl);
+  assert.equal(nonexistentTarget.resolved_id, null);
+  assert.ok(nonexistentTarget.error && nonexistentTarget.error.includes('does not exist'));
+
+  // Graph traversal ingested the existing candidate but could not claim closure over nonexistent candidate
+  assert.ok(graph.modules[existsUrl], 'exists.js should be ingested into graph');
+  assert.equal(graph.summary.unresolved_dynamic_imports, 1, 'Unresolved candidate must contribute to summary counter');
+  assert.equal(graph.summary.total_modules, 2); // entry + exists
+});
+
+// ---------------------------------------------------------------------------
+// PACKAGE.JSON EXPORTS RESOLUTION & NEGATIVE SHIELDS (6mv.1)
+// ---------------------------------------------------------------------------
+
+test('Package exports: Resolves three, three/webgpu, three/tsl, three/addons/*, and three/src/* via package.json exports map', async () => {
+  const scratch = makeScratchDir('f3d_pkg_exports_all');
+
+  const entryFile = path.join(scratch, 'app_entry.js');
+  fs.writeFileSync(entryFile, `
+import * as THREE from 'three';
+import * as WebGPU from 'three/webgpu';
+import * as TSL from 'three/tsl';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { Vector3 } from 'three/src/math/Vector3.js';
+export { THREE, WebGPU, TSL, OrbitControls, Vector3 };
+`, 'utf-8');
+
+  const graph = await buildModuleGraph(entryFile);
+  const entryUrl = pathToFileURL(entryFile).href;
+  const entryMod = graph.modules[entryUrl];
+  assert.ok(entryMod, 'Entry module must exist in graph');
+  assert.equal(entryMod.static_imports.length, 5);
+
+  // 1. three -> build/three.module.js inside upstream/three.js/
+  const threeImp = entryMod.static_imports.find(i => i.specifier === 'three');
+  assert.ok(threeImp, 'Must have static import for three');
+  assert.ok(threeImp.resolved_id.includes('upstream/three.js/'), 'three must resolve inside upstream/three.js/');
+  assert.ok(threeImp.resolved_id.endsWith('build/three.module.js'));
+  assert.ok(graph.modules[threeImp.resolved_id]);
+
+  // 2. three/webgpu -> build/three.webgpu.js inside upstream/three.js/
+  const webgpuImp = entryMod.static_imports.find(i => i.specifier === 'three/webgpu');
+  assert.ok(webgpuImp, 'Must have static import for three/webgpu');
+  assert.ok(webgpuImp.resolved_id.includes('upstream/three.js/'), 'three/webgpu must resolve inside upstream/three.js/');
+  assert.ok(webgpuImp.resolved_id.endsWith('build/three.webgpu.js'));
+  assert.ok(graph.modules[webgpuImp.resolved_id]);
+
+  // 3. three/tsl -> build/three.tsl.js inside upstream/three.js/
+  const tslImp = entryMod.static_imports.find(i => i.specifier === 'three/tsl');
+  assert.ok(tslImp, 'Must have static import for three/tsl');
+  assert.ok(tslImp.resolved_id.includes('upstream/three.js/'), 'three/tsl must resolve inside upstream/three.js/');
+  assert.ok(tslImp.resolved_id.endsWith('build/three.tsl.js'));
+  assert.ok(graph.modules[tslImp.resolved_id]);
+
+  // 4. three/addons/* pattern -> examples/jsm/* inside upstream/three.js/
+  const addonsImp = entryMod.static_imports.find(i => i.specifier === 'three/addons/controls/OrbitControls.js');
+  assert.ok(addonsImp, 'Must have static import for three/addons/controls/OrbitControls.js');
+  assert.ok(addonsImp.resolved_id.includes('upstream/three.js/'), 'three/addons/* must resolve inside upstream/three.js/');
+  assert.ok(addonsImp.resolved_id.endsWith('examples/jsm/controls/OrbitControls.js'));
+  assert.ok(graph.modules[addonsImp.resolved_id]);
+
+  // 5. three/src/* pattern -> src/* inside upstream/three.js/
+  const srcImp = entryMod.static_imports.find(i => i.specifier === 'three/src/math/Vector3.js');
+  assert.ok(srcImp, 'Must have static import for three/src/math/Vector3.js');
+  assert.ok(srcImp.resolved_id.includes('upstream/three.js/'), 'three/src/* must resolve inside upstream/three.js/');
+  assert.ok(srcImp.resolved_id.endsWith('src/math/Vector3.js'));
+  assert.ok(graph.modules[srcImp.resolved_id]);
+
+  assert.equal(graph.summary.unresolved_dynamic_imports, 0);
+  assert.ok(graph.summary.total_modules >= 6); // entry + 5 targets
+});
+
+test('Package exports: Subpath patterns respect import and default conditions in package.json exports', async () => {
+  const scratch = makeScratchDir('f3d_pkg_exports_conditions');
+
+  // Create a synthetic package structure
+  const pkgDir = path.join(scratch, 'custom_three');
+  const pkgJsonPath = path.join(pkgDir, 'package.json');
+  fs.mkdirSync(path.join(pkgDir, 'addons_esm/controls'), { recursive: true });
+  fs.mkdirSync(path.join(pkgDir, 'custom_default'), { recursive: true });
+
+  fs.writeFileSync(path.join(pkgDir, 'index.js'), 'export const isRoot = true;\n', 'utf-8');
+  fs.writeFileSync(path.join(pkgDir, 'addons_esm/controls/Orbit.js'), 'export const isOrbit = true;\n', 'utf-8');
+  fs.writeFileSync(path.join(pkgDir, 'custom_default/util.js'), 'export const isUtil = true;\n', 'utf-8');
+
+  fs.writeFileSync(pkgJsonPath, JSON.stringify({
+    name: 'three',
+    type: 'module',
+    exports: {
+      '.': {
+        import: './index.js',
+        default: './index.js'
+      },
+      './addons/*': {
+        import: './addons_esm/*',
+        default: './addons_default/*'
+      },
+      './custom/*': {
+        default: './custom_default/*'
+      }
+    }
+  }, null, 2), 'utf-8');
+
+  const entryFile = path.join(scratch, 'entry.js');
+  fs.writeFileSync(entryFile, `
+import { isRoot } from 'three';
+import { isOrbit } from 'three/addons/controls/Orbit.js';
+import { isUtil } from 'three/custom/util.js';
+export { isRoot, isOrbit, isUtil };
+`, 'utf-8');
+
+  const graph = await buildModuleGraph(entryFile, {
+    packageRootUrl: pathToFileURL(pkgDir).href + '/'
+  });
+
+  const entryUrl = pathToFileURL(entryFile).href;
+  const entryMod = graph.modules[entryUrl];
+  assert.ok(entryMod);
+
+  // Verifies condition 'import' matched for root '.'
+  const rootImp = entryMod.static_imports.find(i => i.specifier === 'three');
+  assert.ok(rootImp && rootImp.resolved_id.endsWith('custom_three/index.js'));
+
+  // Verifies pattern wildcard + condition 'import' matched for './addons/*'
+  const addonsImp = entryMod.static_imports.find(i => i.specifier === 'three/addons/controls/Orbit.js');
+  assert.ok(addonsImp && addonsImp.resolved_id.endsWith('custom_three/addons_esm/controls/Orbit.js'));
+
+  // Verifies pattern wildcard + condition 'default' fallback matched for './custom/*'
+  const customImp = entryMod.static_imports.find(i => i.specifier === 'three/custom/util.js');
+  assert.ok(customImp && customImp.resolved_id.endsWith('custom_three/custom_default/util.js'));
+});
+
+test('Package exports: Unexported subpath fails with exact package.json path in resolution error and marks dynamic import unresolved', async () => {
+  const scratch = makeScratchDir('f3d_pkg_exports_negative');
+  const expectedPkgJsonPath = path.resolve('upstream/three.js/package.json');
+
+  // 1. Static import of an unexported subpath (three/math/Vector3.js is not in exports; only three/src/* is)
+  const staticEntry = path.join(scratch, 'static_entry.js');
+  fs.writeFileSync(staticEntry, `
+import { Vector3 } from 'three/math/Vector3.js';
+export { Vector3 };
+`, 'utf-8');
+
+  await assert.rejects(
+    async () => {
+      await buildModuleGraph(staticEntry);
+    },
+    (err) => {
+      assert.ok(err instanceof IngestionResolutionError, `Expected IngestionResolutionError, got ${err?.constructor?.name}`);
+      assert.ok(
+        err.message.includes(expectedPkgJsonPath),
+        `Error message must contain package.json path "${expectedPkgJsonPath}", got "${err.message}"`
+      );
+      assert.ok(
+        err.message.includes('subpath "./math/Vector3.js" is not exported by package.json'),
+        `Error message must specify non-exported subpath, got "${err.message}"`
+      );
+      return true;
+    }
+  );
+
+  // 2. Dynamic import of an unexported subpath remains unresolved without claiming closure
+  const dynamicEntry = path.join(scratch, 'dynamic_entry.js');
+  fs.writeFileSync(dynamicEntry, `
+export async function loadUnexported() {
+  return await import('three/not_in_exports/some_module.js');
+}
+`, 'utf-8');
+
+  const graph = await buildModuleGraph(dynamicEntry);
+  const dynUrl = pathToFileURL(dynamicEntry).href;
+  const dynMod = graph.modules[dynUrl];
+  assert.ok(dynMod, 'Dynamic entry must exist in graph');
+  assert.equal(dynMod.dynamic_imports.length, 1);
+
+  const dyn = dynMod.dynamic_imports[0];
+  assert.equal(dyn.classification, 'literal');
+  assert.equal(dyn.unresolved, true, 'Unexported subpath dynamic import must remain unresolved');
+  assert.equal(dyn.resolved_id, null);
+  assert.equal(dyn.claims_closure, false, 'Unexported subpath must not claim closure');
+  assert.ok(dyn.error, 'Unresolved dynamic import must preserve error message');
+  assert.ok(
+    dyn.error.includes(expectedPkgJsonPath),
+    `Dynamic import error must carry package.json path "${expectedPkgJsonPath}", got "${dyn.error}"`
+  );
+  assert.ok(
+    dyn.error.includes('subpath "./not_in_exports/some_module.js" is not exported by package.json'),
+    `Dynamic import error must identify unexported subpath, got "${dyn.error}"`
+  );
+  assert.equal(graph.summary.unresolved_dynamic_imports, 1);
+
+  // 3. Synthetic package exports without './src/*' allows verifying that three/src/math/Vector3.js
+  // resolves ONLY when the exports map allows it, and is unresolved with package.json path otherwise
+  const restrictedPkgDir = path.join(scratch, 'restricted_three');
+  const restrictedPkgJson = path.join(restrictedPkgDir, 'package.json');
+  fs.mkdirSync(restrictedPkgDir, { recursive: true });
+  fs.writeFileSync(restrictedPkgJson, JSON.stringify({
+    name: 'three',
+    type: 'module',
+    exports: {
+      '.': './index.js'
+    }
+  }, null, 2), 'utf-8');
+  fs.writeFileSync(path.join(restrictedPkgDir, 'index.js'), 'export const x = 1;\n', 'utf-8');
+
+  const restrictedEntry = path.join(scratch, 'restricted_entry.js');
+  fs.writeFileSync(restrictedEntry, `
+export async function loadSrc() {
+  return await import('three/src/math/Vector3.js');
+}
+`, 'utf-8');
+
+  const restrictedGraph = await buildModuleGraph(restrictedEntry, {
+    packageRootUrl: pathToFileURL(restrictedPkgDir).href + '/'
+  });
+  const reMod = restrictedGraph.modules[pathToFileURL(restrictedEntry).href];
+  const reDyn = reMod.dynamic_imports[0];
+  assert.equal(reDyn.unresolved, true);
+  assert.ok(reDyn.error.includes(restrictedPkgJson));
+  assert.ok(reDyn.error.includes('subpath "./src/math/Vector3.js" is not exported by package.json'));
+});
+
+
+
