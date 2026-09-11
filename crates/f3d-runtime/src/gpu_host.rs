@@ -7070,7 +7070,15 @@ mod tests {
         assert_eq!(version, 1);
         assert_eq!(flags, 0);
         assert_eq!(cmd_count, 9);
-        assert_eq!(total_data_len as usize, 944); // 120 bytes vb2 data + 824 bytes CreatePipeline WGSL source
+        let vertex_bytes = match &commands[1] {
+            GpuCommand::WriteBuffer { data, .. } => data.as_slice(),
+            other => panic!("expected vertex input, got {other:?}"),
+        };
+        let shader_bytes = match &commands[4] {
+            GpuCommand::CreatePipeline { wgsl_code, .. } => wgsl_code.as_bytes(),
+            other => panic!("expected shader input, got {other:?}"),
+        };
+        assert_eq!(total_data_len as usize, vertex_bytes.len() + shader_bytes.len());
 
         // Iterate through wire records and inspect the exact bytes for opcode 11
         let mut cursor = 16usize;
@@ -7105,6 +7113,10 @@ mod tests {
             }
         }
         assert!(found_draw_parameters, "wire stream must contain opcode 11 SetDrawParameters");
+        assert_eq!(cursor + total_data_len as usize, wire_bytes.len());
+        let shader_start = cursor + vertex_bytes.len();
+        assert_eq!(&wire_bytes[cursor..shader_start], vertex_bytes);
+        assert_eq!(&wire_bytes[shader_start..], shader_bytes);
 
         // Mathematical NDC Point-In-Triangle Proof:
         // Triangle base (vertices 3..5): [-0.2, -0.5], [0.2, -0.5], [0.0, 0.5] (CCW winding)

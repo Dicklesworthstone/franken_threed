@@ -1977,9 +1977,12 @@ mod tests {
             GpuCommand::WriteBuffer { buffer_id, offset, data } => {
                 assert_eq!(*buffer_id, DEFAULT_MATERIAL_UNIFORM_BUFFER_ID);
                 assert_eq!(*offset, 0);
-                assert_eq!(&data[rec_red.byte_offset()..rec_red.byte_offset() + 4], &red_bytes);
-                assert_eq!(&data[rec_inner.byte_offset()..rec_inner.byte_offset() + 4], &inner_bytes);
-                assert_eq!(&data[rec_blue.byte_offset()..rec_blue.byte_offset() + 4], &blue_bytes);
+                let red_off = usize::try_from(rec_red.byte_offset()).expect("fixture offset fits usize");
+                let inner_off = usize::try_from(rec_inner.byte_offset()).expect("fixture offset fits usize");
+                let blue_off = usize::try_from(rec_blue.byte_offset()).expect("fixture offset fits usize");
+                assert_eq!(&data[red_off..red_off + 4], &red_bytes);
+                assert_eq!(&data[inner_off..inner_off + 4], &inner_bytes);
+                assert_eq!(&data[blue_off..blue_off + 4], &blue_bytes);
             }
             other => panic!("expected WriteBuffer at index 0, got {other:?}"),
         }
@@ -2329,9 +2332,12 @@ mod tests {
             GpuCommand::WriteBuffer { buffer_id, offset, data } => {
                 assert_eq!(*buffer_id, DEFAULT_MATERIAL_UNIFORM_BUFFER_ID);
                 assert_eq!(*offset, 0);
-                assert_eq!(&data[rec_red.byte_offset()..rec_red.byte_offset() + 4], &red_bytes);
-                assert_eq!(&data[rec_inner.byte_offset()..rec_inner.byte_offset() + 4], &inner_bytes);
-                assert_eq!(&data[rec_blue.byte_offset()..rec_blue.byte_offset() + 4], &blue_bytes);
+                let red_off = usize::try_from(rec_red.byte_offset()).expect("fixture offset fits usize");
+                let inner_off = usize::try_from(rec_inner.byte_offset()).expect("fixture offset fits usize");
+                let blue_off = usize::try_from(rec_blue.byte_offset()).expect("fixture offset fits usize");
+                assert_eq!(&data[red_off..red_off + 4], &red_bytes);
+                assert_eq!(&data[inner_off..inner_off + 4], &inner_bytes);
+                assert_eq!(&data[blue_off..blue_off + 4], &blue_bytes);
             }
             other => panic!("expected WriteBuffer at index 0, got {other:?}"),
         }
@@ -2459,9 +2465,12 @@ mod tests {
             GpuCommand::WriteBuffer { buffer_id, offset, data } => {
                 assert_eq!(*buffer_id, DEFAULT_MATERIAL_UNIFORM_BUFFER_ID);
                 assert_eq!(*offset, 0);
-                assert_eq!(&data[rec_red.byte_offset()..rec_red.byte_offset() + 4], &[255, 0, 0, 255]);
-                assert_eq!(&data[rec_inner.byte_offset()..rec_inner.byte_offset() + 4], &[0, 255, 0, 255]);
-                assert_eq!(&data[rec_blue.byte_offset()..rec_blue.byte_offset() + 4], &[0, 0, 255, 255]);
+                let red_off = usize::try_from(rec_red.byte_offset()).expect("fixture offset fits usize");
+                let inner_off = usize::try_from(rec_inner.byte_offset()).expect("fixture offset fits usize");
+                let blue_off = usize::try_from(rec_blue.byte_offset()).expect("fixture offset fits usize");
+                assert_eq!(&data[red_off..red_off + 4], &[255, 0, 0, 255]);
+                assert_eq!(&data[inner_off..inner_off + 4], &[0, 255, 0, 255]);
+                assert_eq!(&data[blue_off..blue_off + 4], &[0, 0, 255, 255]);
             }
             other => panic!("expected WriteBuffer at index 0, got {other:?}"),
         }
