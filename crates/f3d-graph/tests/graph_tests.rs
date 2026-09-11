@@ -13,7 +13,6 @@
 //! 10. WebGPU copy bytes_per_row 256-byte alignment (width 32 -> 256 bytes).
 //! 11. Red-A / Blue-B versioned buffer snapshot schedule.
 
-use core::num::NonZeroU32;
 use f3d_core::handle::{Handle, MaterialDomain};
 use f3d_core::layout::{aligned_bytes_per_row, COPY_BYTES_PER_ROW_ALIGNMENT};
 use f3d_core::ownership::{DataVersion, Epoch, PerUseByteBuffer};
@@ -28,7 +27,9 @@ use f3d_graph::plan::{
     build_red_a_blue_b_plan, build_red_a_blue_b_render_plan, build_single_pass_bridge_plan,
     build_two_target_bridge_plan,
 };
-use f3d_graph::resource::{ResourceAccess, ResourceId, ResourceUse, SubresourceRange};
+use f3d_graph::resource::{
+    ResourceAccess, ResourceId, ResourceKind, ResourceUse, SubresourceRange, TextureAspect,
+};
 use f3d_graph::schedule::PassGraph;
 
 #[test]
@@ -1306,7 +1307,7 @@ fn property_test_compile_never_panics_and_topological_order() {
             let kind_choice = rng.next_range(0, 2);
             let mut pass = match kind_choice {
                 0 => {
-                    let mut p = Pass::new_render(pass_id, alloc::format!("render_{i}"));
+                    let mut p = Pass::new_render(pass_id, format!("render_{i}"));
                     let target = ResourceId::new(rng.next_range(1, 8));
                     p = p.with_color_attachment(ColorAttachment::new_clear(
                         target,
@@ -1316,12 +1317,12 @@ fn property_test_compile_never_panics_and_topological_order() {
                     p.with_draw(draw)
                 }
                 1 => {
-                    let mut p = Pass::new_compute(pass_id, alloc::format!("compute_{i}"));
+                    let mut p = Pass::new_compute(pass_id, format!("compute_{i}"));
                     let dispatch = Dispatch::new(0, rng.next_range(1, 5), [1, 1, 1], vec![]);
                     p.with_dispatch(dispatch)
                 }
                 _ => {
-                    let mut p = Pass::new_copy(pass_id, alloc::format!("copy_{i}"));
+                    let mut p = Pass::new_copy(pass_id, format!("copy_{i}"));
                     let src = ResourceId::new(rng.next_range(10, 15));
                     let dst = ResourceId::new(rng.next_range(16, 20));
                     let copy = CopyCommand::BufferToBuffer {
@@ -1403,14 +1404,14 @@ fn property_test_overlapping_read_write_subresources_rejected() {
                 // Render pass: ColorAttachment write + Draw texture sampling on overlapping subresource
                 let pass_id = PassId::new(rng.next_range(1, 500));
                 let tex_id = ResourceId::new(rng.next_range(1, 100));
-                let mut pass = Pass::new_render(pass_id, alloc::format!("render_hazard_{iter}"));
+                let mut pass = Pass::new_render(pass_id, format!("render_hazard_{iter}"));
 
                 let mip = rng.next_range(0, 3);
                 let layer = rng.next_range(0, 5);
                 let subresource = SubresourceRange::single_mip_layer(
                     mip,
                     layer,
-                    crate::resource::TextureAspect::All,
+                    TextureAspect::All,
                 );
 
                 let mut ca = ColorAttachment::new_clear(tex_id, [0.0, 0.0, 0.0, 1.0]);
@@ -1419,7 +1420,7 @@ fn property_test_overlapping_read_write_subresources_rejected() {
 
                 let sample_use = ResourceUse {
                     resource_id: tex_id,
-                    kind: crate::resource::ResourceKind::Texture,
+                    kind: ResourceKind::Texture,
                     version: DataVersion::INITIAL,
                     subresource: subresource.clone(),
                     access: ResourceAccess::SampledTexture,
@@ -1431,7 +1432,7 @@ fn property_test_overlapping_read_write_subresources_rejected() {
                 pass = pass.with_draw(Draw::new(0, 10, 3, 0, vec![sample_use]));
 
                 // Because this is the only color attachment, splitting cannot resolve it (feedback loop)
-                let err = validate_pass_hazards(&pass).expect_err(&alloc::format!(
+                let err = validate_pass_hazards(&pass).expect_err(&format!(
                     "Overlapping attachment and sampled texture must be rejected for seed {SEED:#018x} at iter {iter}"
                 ));
                 assert_eq!(
@@ -1447,7 +1448,7 @@ fn property_test_overlapping_read_write_subresources_rejected() {
                 // PassGraph compilation must also reject it
                 let mut graph = PassGraph::new();
                 graph.add_pass(pass).expect("add pass");
-                let compile_err = graph.compile(None).expect_err(&alloc::format!(
+                let compile_err = graph.compile(None).expect_err(&format!(
                     "Compile must reject attachment sampling conflict for seed {SEED:#018x} at iter {iter}"
                 ));
                 assert_eq!(
@@ -1464,7 +1465,7 @@ fn property_test_overlapping_read_write_subresources_rejected() {
                 // Compute pass: dispatch with writable alias (overlapping read+write or write+write)
                 let pass_id = PassId::new(rng.next_range(1, 500));
                 let buf_id = ResourceId::new(rng.next_range(1, 100));
-                let mut pass = Pass::new_compute(pass_id, alloc::format!("compute_hazard_{iter}"));
+                let mut pass = Pass::new_compute(pass_id, format!("compute_hazard_{iter}"));
 
                 let write_use = ResourceUse::buffer_storage_write(buf_id, DataVersion::INITIAL, None, None);
                 let read_use = ResourceUse::buffer_storage_read(buf_id, DataVersion::INITIAL, None, None);
@@ -1472,7 +1473,7 @@ fn property_test_overlapping_read_write_subresources_rejected() {
                 let dispatch = Dispatch::new(0, 10, [1, 1, 1], vec![write_use, read_use]);
                 pass = pass.with_dispatch(dispatch);
 
-                let err = validate_pass_hazards(&pass).expect_err(&alloc::format!(
+                let err = validate_pass_hazards(&pass).expect_err(&format!(
                     "Compute writable alias must be rejected for seed {SEED:#018x} at iter {iter}"
                 ));
                 assert_eq!(
@@ -1489,7 +1490,7 @@ fn property_test_overlapping_read_write_subresources_rejected() {
                 // Copy pass: overlapping source and destination
                 let pass_id = PassId::new(rng.next_range(1, 500));
                 let buf_id = ResourceId::new(rng.next_range(1, 100));
-                let mut pass = Pass::new_copy(pass_id, alloc::format!("copy_hazard_{iter}"));
+                let mut pass = Pass::new_copy(pass_id, format!("copy_hazard_{iter}"));
 
                 let copy = CopyCommand::BufferToBuffer {
                     src: buf_id,
@@ -1500,7 +1501,7 @@ fn property_test_overlapping_read_write_subresources_rejected() {
                 };
                 pass = pass.with_copy(copy);
 
-                let err = validate_pass_hazards(&pass).expect_err(&alloc::format!(
+                let err = validate_pass_hazards(&pass).expect_err(&format!(
                     "Overlapping copy endpoints must be rejected for seed {SEED:#018x} at iter {iter}"
                 ));
                 assert_eq!(
@@ -1524,7 +1525,7 @@ fn property_test_disjoint_offset_buffer_writes_rejected_under_whole_buffer_rule(
     for iter in 0..ITERATIONS {
         let pass_id = PassId::new(rng.next_range(1, 500));
         let buf_id = ResourceId::new(rng.next_range(1, 100));
-        let mut pass = Pass::new_render(pass_id, alloc::format!("whole_buf_{iter}"));
+        let mut pass = Pass::new_render(pass_id, format!("whole_buf_{iter}"));
 
         // Generate strictly non-overlapping disjoint byte ranges in the same buffer
         let offset_a = (rng.next_range(0, 50) * 256) as u64;
@@ -1539,7 +1540,7 @@ fn property_test_disjoint_offset_buffer_writes_rejected_under_whole_buffer_rule(
             "Ranges must be disjoint for seed {SEED:#018x} at iter {iter}"
         );
 
-        // One write (StorageWrite), one read (UniformBuffer)
+        // One write (StorageBufferWrite), one read (UniformBuffer)
         let use_a = ResourceUse::buffer_storage_write(
             buf_id,
             DataVersion::INITIAL,
@@ -1557,7 +1558,7 @@ fn property_test_disjoint_offset_buffer_writes_rejected_under_whole_buffer_rule(
         let draw1 = Draw::new(1, 10, 3, 0, vec![use_b]);
         pass = pass.with_draw(draw0).with_draw(draw1);
 
-        let hazard_err = validate_pass_hazards(&pass).expect_err(&alloc::format!(
+        let hazard_err = validate_pass_hazards(&pass).expect_err(&format!(
             "Whole-buffer rule must reject disjoint offsets for seed {SEED:#018x} at iter {iter}"
         ));
 
@@ -1565,7 +1566,7 @@ fn property_test_disjoint_offset_buffer_writes_rejected_under_whole_buffer_rule(
             hazard_err,
             HazardError::WholeBufferConflict {
                 buffer_id: buf_id.get(),
-                access_a: ResourceAccess::StorageWrite,
+                access_a: ResourceAccess::StorageBufferWrite,
                 access_b: ResourceAccess::UniformBuffer,
                 offset_a: Some(offset_a),
                 offset_b: Some(offset_b),
@@ -1576,14 +1577,14 @@ fn property_test_disjoint_offset_buffer_writes_rejected_under_whole_buffer_rule(
         // Through PassGraph compilation as well
         let mut graph = PassGraph::new();
         graph.add_pass(pass).expect("add pass");
-        let compile_err = graph.compile(None).expect_err(&alloc::format!(
+        let compile_err = graph.compile(None).expect_err(&format!(
             "Compile must reject whole-buffer conflict for seed {SEED:#018x} at iter {iter}"
         ));
         assert_eq!(
             compile_err,
             GraphError::Hazard(HazardError::WholeBufferConflict {
                 buffer_id: buf_id.get(),
-                access_a: ResourceAccess::StorageWrite,
+                access_a: ResourceAccess::StorageBufferWrite,
                 access_b: ResourceAccess::UniformBuffer,
                 offset_a: Some(offset_a),
                 offset_b: Some(offset_b),
@@ -1607,7 +1608,7 @@ fn property_test_duplicate_pass_ids_rejected_before_mutation() {
         for i in 0..initial_count {
             let pid = PassId::new((i as u32) + 1);
             existing_ids.push(pid);
-            let mut pass = Pass::new_render(pid, alloc::format!("init_pass_{i}"));
+            let mut pass = Pass::new_render(pid, format!("init_pass_{i}"));
             pass = pass.with_color_attachment(ColorAttachment::new_clear(
                 ResourceId::new((i as u32) + 10),
                 [0.0, 0.0, 0.0, 1.0],
@@ -1621,7 +1622,7 @@ fn property_test_duplicate_pass_ids_rejected_before_mutation() {
         let dup_id = existing_ids[dup_idx];
 
         let duplicate_pass = Pass::new_render(dup_id, "attempted_duplicate");
-        let err = graph.add_pass(duplicate_pass).expect_err(&alloc::format!(
+        let err = graph.add_pass(duplicate_pass).expect_err(&format!(
             "Duplicate PassId {dup_id} must be rejected for seed {SEED:#018x} at iter {iter}"
         ));
 
@@ -1635,7 +1636,7 @@ fn property_test_duplicate_pass_ids_rejected_before_mutation() {
 
         // Verification of "before mutation":
         // 1. Graph compiles successfully with EXACTLY initial_count segments
-        let plan = graph.compile(None).expect(&alloc::format!(
+        let plan = graph.compile(None).expect(&format!(
             "Graph compile must succeed without corruption for seed {SEED:#018x} at iter {iter}"
         ));
         assert_eq!(
@@ -1676,7 +1677,7 @@ fn property_test_dag_compilation_always_yields_valid_topological_order() {
             let pid = PassId::new((i as u32) + 1);
             pass_ids.push(pid);
 
-            let mut pass = Pass::new_render(pid, alloc::format!("dag_pass_{i}"));
+            let mut pass = Pass::new_render(pid, format!("dag_pass_{i}"));
             pass = pass.with_color_attachment(ColorAttachment::new_clear(
                 ResourceId::new((i as u32) + 10),
                 [0.0, 0.0, 0.0, 1.0],
@@ -1700,7 +1701,7 @@ fn property_test_dag_compilation_always_yields_valid_topological_order() {
             graph.add_pass(pass).expect("add pass");
         }
 
-        let plan = graph.compile(None).expect(&alloc::format!(
+        let plan = graph.compile(None).expect(&format!(
             "DAG compilation must succeed for seed {SEED:#018x} at iter {iter}"
         ));
 
