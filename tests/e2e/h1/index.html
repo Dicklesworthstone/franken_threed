@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>FrankenThreeD H1 (Render Bundle) E2E Test Suite</title>
+  <title>FrankenThreeD H1 (Render Bundle) E2E Parity Suite</title>
   <style>
     :root {
       --bg: #0d1117;
@@ -16,6 +16,8 @@
       --fail-bg: rgba(218, 54, 51, 0.15);
       --running: #1f6feb;
       --running-bg: rgba(31, 111, 235, 0.15);
+      --open: #d29922;
+      --open-bg: rgba(210, 153, 34, 0.15);
     }
     body {
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
@@ -28,7 +30,7 @@
       align-items: center;
     }
     .container {
-      max-width: 960px;
+      max-width: 1040px;
       width: 100%;
     }
     h1 {
@@ -66,19 +68,27 @@
       display: grid;
       grid-template-columns: 1fr 1fr;
       gap: 16px;
-      margin-bottom: 24px;
+      margin-bottom: 20px;
     }
     .card {
       background: var(--card-bg);
       border: 1px solid var(--border);
       border-radius: 6px;
       padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .card-full {
+      grid-column: 1 / -1;
     }
     .card-header {
       display: flex;
       justify-content: space-between;
       align-items: center;
-      margin-bottom: 12px;
+      margin-bottom: 4px;
+      padding-bottom: 6px;
+      border-bottom: 1px solid var(--border);
     }
     .card-title {
       font-weight: 600;
@@ -96,9 +106,9 @@
     .badge.running { background: var(--running-bg); color: #58a6ff; border: 1px solid var(--running); }
     .badge.pass { background: var(--pass-bg); color: #7ee787; border: 1px solid var(--pass); }
     .badge.fail { background: var(--fail-bg); color: #f85149; border: 1px solid var(--fail); }
+    .badge.open { background: var(--open-bg); color: #e3b341; border: 1px solid var(--open); }
     .field {
       font-size: 12px;
-      margin-bottom: 6px;
       display: flex;
       flex-direction: column;
       gap: 2px;
@@ -114,7 +124,29 @@
       padding: 4px 6px;
       border-radius: 4px;
       word-break: break-all;
+      font-size: 11px;
     }
+    .grid-2col {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+    .step-log {
+      font-size: 11px;
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      background: #090d13;
+      padding: 8px;
+      border-radius: 4px;
+      max-height: 140px;
+      overflow-y: auto;
+      border: 1px solid #21262d;
+    }
+    .step-item {
+      margin-bottom: 2px;
+    }
+    .step-item.ok { color: #7ee787; }
+    .step-item.err { color: #f85149; }
+    .step-item.info { color: #8b949e; }
     .frame-container {
       width: 100%;
       display: flex;
@@ -127,7 +159,7 @@
     }
     iframe {
       width: 100%;
-      height: 480px;
+      height: 420px;
       border: 1px solid var(--border);
       border-radius: 6px;
       background: #000;
@@ -136,13 +168,13 @@
 </head>
 <body>
   <div class="container">
-    <h1>FrankenThreeD H1 (Render Bundle) E2E Test Runner</h1>
+    <h1>FrankenThreeD H1 (Render Bundle) E2E Parity Suite</h1>
     <div class="subtitle">
-      Automated verification of original upstream H1 (webgpu_performance_renderbundle.html) through compatibility facade
+      Automated verification of original upstream H1 vs routed compatibility facade (Plan §3.4, §5.1; Mails #7594, #7595, #7720, #7733).
     </div>
 
     <div id="status-banner" class="status-banner">
-      Initializing H1 query branches...
+      Initializing H1 reference and candidate test branches...
     </div>
 
     <div class="cards">
@@ -153,20 +185,27 @@
           <span id="badge-webgpu" class="badge pending">Queued</span>
         </div>
         <div class="field">
-          <span class="field-label">Document Title</span>
-          <span id="title-webgpu" class="field-value">-</span>
+          <span class="field-label">Reference Context / Sign</span>
+          <span id="ref-status-webgpu" class="field-value">-</span>
         </div>
         <div class="field">
-          <span class="field-label">Canvas Context Identity</span>
-          <span id="context-webgpu" class="field-value">-</span>
+          <span class="field-label">Candidate Context / Sign / Route</span>
+          <span id="cand-status-webgpu" class="field-value">-</span>
         </div>
         <div class="field">
-          <span class="field-label">Inspector Startup Sign</span>
-          <span id="sign-webgpu" class="field-value">-</span>
+          <span class="field-label">State Parity Comparison</span>
+          <span id="parity-webgpu" class="field-value">-</span>
         </div>
         <div class="field">
-          <span class="field-label">Router Decision Route</span>
-          <span id="route-webgpu" class="field-value">-</span>
+          <span class="field-label">Scene & Camera Observations (Render Hook)</span>
+          <span id="scene-cam-webgpu" class="field-value">-</span>
+        </div>
+        <div class="field">
+          <span class="field-label">Negative Controls (Planted Mutation Rejection)</span>
+          <span id="negative-webgpu" class="field-value">-</span>
+        </div>
+        <div class="step-log" id="log-webgpu">
+          <div class="step-item info">[webgpu] Waiting in queue...</div>
         </div>
       </div>
 
@@ -177,20 +216,45 @@
           <span id="badge-webgl" class="badge pending">Queued</span>
         </div>
         <div class="field">
-          <span class="field-label">Document Title</span>
-          <span id="title-webgl" class="field-value">-</span>
+          <span class="field-label">Reference Context / Sign</span>
+          <span id="ref-status-webgl" class="field-value">-</span>
         </div>
         <div class="field">
-          <span class="field-label">Canvas Context Identity</span>
-          <span id="context-webgl" class="field-value">-</span>
+          <span class="field-label">Candidate Context / Sign / Route</span>
+          <span id="cand-status-webgl" class="field-value">-</span>
         </div>
         <div class="field">
-          <span class="field-label">Inspector Startup Sign</span>
-          <span id="sign-webgl" class="field-value">-</span>
+          <span class="field-label">State Parity Comparison</span>
+          <span id="parity-webgl" class="field-value">-</span>
         </div>
         <div class="field">
-          <span class="field-label">Router Decision Route</span>
-          <span id="route-webgl" class="field-value">-</span>
+          <span class="field-label">Scene & Camera Observations (Render Hook)</span>
+          <span id="scene-cam-webgl" class="field-value">-</span>
+        </div>
+        <div class="field">
+          <span class="field-label">Negative Controls (Planted Mutation Rejection)</span>
+          <span id="negative-webgl" class="field-value">-</span>
+        </div>
+        <div class="step-log" id="log-webgl">
+          <div class="step-item info">[webgl] Waiting in queue...</div>
+        </div>
+      </div>
+
+      <!-- Image Equality & Honesty Attestation Card -->
+      <div class="card card-full">
+        <div class="card-header">
+          <span class="card-title">Checkpoint Image Equality & Honesty Attestation</span>
+          <span id="badge-image" class="badge open">OPEN-UNTIL-MEASURED</span>
+        </div>
+        <div class="grid-2col">
+          <div class="field">
+            <span class="field-label">Image Checkpoint Status</span>
+            <span id="img-status" class="field-value">open-until-measured</span>
+          </div>
+          <div class="field">
+            <span class="field-label">Honesty Rule Adherence</span>
+            <span id="img-rule" class="field-value">No fake passes; no golden regeneration; pixel parity remains open until measured.</span>
+          </div>
         </div>
       </div>
     </div>
@@ -201,13 +265,63 @@
     </div>
   </div>
 
-  <script>
+  <script type="module">
+    import {
+      H1_PATHS,
+      findInspectorControl,
+      toggleInspectorControl,
+      compareH1Snapshots,
+    } from './h1_interaction_helper.mjs';
+
+    function addLog(branchKey, text, kind = 'info') {
+      const container = document.getElementById('log-' + branchKey);
+      if (!container) return;
+      const el = document.createElement('div');
+      el.className = 'step-item ' + kind;
+      el.textContent = `[${new Date().toISOString().slice(11, 19)}] ${text}`;
+      container.appendChild(el);
+      container.scrollTop = container.scrollHeight;
+    }
+
     /**
-     * Detects canvas GPU context identity without mutating or conflicting.
-     * WebGPU contexts return GPUCanvasContext; WebGL2 returns WebGL2RenderingContext.
+     * Builds H1 URL strictly preserving count=0 (Plan §3.4; Mail #7694).
      */
-    function detectCanvasContext(canvas) {
-      if (!canvas) return 'none';
+    function buildH1UrlStrict(baseUrl = '', {
+      isReference = false,
+      backend = 'webgpu',
+      renderBundle = true,
+      count = 4000,
+    } = {}) {
+      const base = (baseUrl || '').replace(/\/+$/, '');
+      const pathname = isReference ? H1_PATHS.REFERENCE : H1_PATHS.ROUTED;
+      const backendParam = `backend=${backend === 'webgl' ? 'webgl' : 'webgpu'}`;
+      const renderBundleParam = `&renderBundle=${renderBundle ? 'true' : 'false'}`;
+      const parsedCount = parseFloat(count);
+      const countVal = Number.isFinite(parsedCount) ? parsedCount : 4000;
+      const countParam = `&count=${countVal}`;
+
+      return `${base}${pathname}?${backendParam}${renderBundleParam}${countParam}`;
+    }
+
+    /**
+     * Extracts Inspector log messages from the document DOM.
+     */
+    function extractInspectorLogsRobust(doc) {
+      if (!doc || typeof doc.querySelectorAll !== 'function') {
+        return { sign: '', other: [], all: [] };
+      }
+      const logEls = Array.from(doc.querySelectorAll('.three-inspector .console-log .log-message, .log-message, .inspector-log, .log-item, .item-log'));
+      const all = logEls.map(el => (el.dataset?.rawText || el.textContent || '').trim()).filter(Boolean);
+      const sign = all.find(text => text.includes('THREE.WebGPURenderer')) || '';
+      const other = all.filter(text => !text.includes('THREE.WebGPURenderer'));
+      return { sign, other, all };
+    }
+
+    /**
+     * Realm-independent canvas context detection without parent instanceof GPUCanvasContext (Mail #7694).
+     */
+    function detectCanvasContextRealmSafe(canvas) {
+      if (!canvas || typeof canvas.getContext !== 'function') return 'none';
       try {
         if (canvas.getContext('webgpu')) return 'webgpu';
       } catch (_) {}
@@ -217,278 +331,762 @@
       try {
         if (canvas.getContext('webgl')) return 'webgl';
       } catch (_) {}
-      return 'unknown';
+      return 'none';
     }
 
     /**
-     * Extracts Inspector log messages from the DOM.
-     * Selects the message matching THREE.WebGPURenderer specifically for the startup sign,
-     * and collects all other messages separately (e.g. GPU Timestamp Queries availability).
+     * Installs a small test-only render hook in the iframe without editing upstream files (Mail #7733).
+     * Intercepts actual renderer.render(scene, camera) in animate(), recording copied scene/camera observations.
+     * Missing observations are strictly captured as null to prevent false passes (Mail #7850).
      */
-    function extractInspectorLogs(iframeDoc) {
-      if (!iframeDoc) return { sign: '', other: [], all: [] };
-      const logEls = Array.from(iframeDoc.querySelectorAll('.three-inspector .console-log .log-message'));
-      const all = logEls.map(el => (el.dataset?.rawText || el.textContent || '').trim()).filter(Boolean);
-      const sign = all.find(text => text.includes('THREE.WebGPURenderer')) || '';
-      const other = all.filter(text => !text.includes('THREE.WebGPURenderer'));
-      return { sign, other, all };
+    function installRenderHook(win, doc) {
+      if (!doc || doc.getElementById('f3d-render-hook')) return;
+      const script = doc.createElement('script');
+      script.id = 'f3d-render-hook';
+      script.type = 'module';
+      script.textContent = `
+        import * as THREE from 'three/webgpu';
+        const proto = THREE.WebGPURenderer.prototype;
+        if (!proto.__f3d_hooked__) {
+          proto.__f3d_hooked__ = true;
+          const origRender = proto.render;
+          window.__f3d_render_observations__ = [];
+          proto.render = function(scene, camera) {
+            const res = origRender.call(this, scene, camera);
+            try {
+              const group = scene && scene.children && scene.children.find(c => c.isGroup || c.isBundleGroup);
+              const firstChild = group && group.children && group.children[0];
+              const instMesh = group && group.children && group.children.find(c => c.isInstancedMesh);
+              let instArr = null;
+              if (instMesh && instMesh.instanceMatrix && instMesh.instanceMatrix.array) {
+                instArr = Array.from(instMesh.instanceMatrix.array.slice(0, 16));
+              }
+              const hasMesh = Boolean(firstChild && firstChild.rotation);
+              const hasCam = Boolean(camera && camera.position && camera.quaternion);
+
+              window.__f3d_render_observations__.push({
+                time: performance.now(),
+                groupFound: Boolean(group),
+                groupStatic: group ? (group.static !== undefined ? Boolean(group.static) : null) : null,
+                meshRotation: hasMesh ? [firstChild.rotation.x, firstChild.rotation.y, firstChild.rotation.z] : null,
+                instanceMatrix: instArr,
+                cameraPosition: hasCam ? [camera.position.x, camera.position.y, camera.position.z] : null,
+                cameraQuaternion: hasCam ? [camera.quaternion.x, camera.quaternion.y, camera.quaternion.z, camera.quaternion.w] : null,
+              });
+              if (window.__f3d_render_observations__.length > 80) {
+                window.__f3d_render_observations__.shift();
+              }
+            } catch (_) {}
+            return res;
+          };
+        }
+      `;
+      (doc.head || doc.documentElement).appendChild(script);
     }
 
     /**
-     * Polls the same-origin iframe until Three.js H1 demo settles and signals are readable.
+     * Waits for observation count in the hooked iframe window.
      */
-    function runBranch(branchKey, targetUrl) {
-      return new Promise((resolve) => {
-        const iframe = document.getElementById('h1-frame');
-        const badge = document.getElementById('badge-' + branchKey);
-        const titleEl = document.getElementById('title-' + branchKey);
-        const contextEl = document.getElementById('context-' + branchKey);
-        const signEl = document.getElementById('sign-' + branchKey);
-        const routeEl = document.getElementById('route-' + branchKey);
+    async function waitForObservations(win, minCount = 3, timeoutMs = 4000) {
+      const t0 = Date.now();
+      while (Date.now() - t0 < timeoutMs) {
+        if (win.__f3d_render_observations__ && win.__f3d_render_observations__.length >= minCount) {
+          return win.__f3d_render_observations__;
+        }
+        await new Promise(r => setTimeout(r, 50));
+      }
+      return win.__f3d_render_observations__ || [];
+    }
 
-        badge.className = 'badge running';
-        badge.textContent = 'Running';
+    /**
+     * Samples scene observations (mesh rotation, instanceMatrix, camera y, groupStatic)
+     * over a duration. Strictly fails if any required observation is missing (Mail #7850).
+     */
+    async function sampleSceneObservations(win, durationMs = 250) {
+      await waitForObservations(win, 2);
+      const obsList1 = win.__f3d_render_observations__ || [];
+      const startObs = obsList1[obsList1.length - 1];
+      await new Promise(r => setTimeout(r, durationMs));
+      const obsList2 = win.__f3d_render_observations__ || [];
+      const endObs = obsList2[obsList2.length - 1];
 
-        let resolved = false;
+      if (!startObs || !endObs) {
+        throw new Error('Scene observations missing: start or end observation not captured');
+      }
+
+      if (!startObs.meshRotation || !endObs.meshRotation) {
+        throw new Error('Scene observations missing: mesh rotation is null');
+      }
+      if (!startObs.instanceMatrix || !endObs.instanceMatrix) {
+        throw new Error('Scene observations missing: instanceMatrix is null');
+      }
+      if (!startObs.cameraPosition || !endObs.cameraPosition) {
+        throw new Error('Scene observations missing: cameraPosition is null');
+      }
+      if (startObs.groupStatic === null || endObs.groupStatic === null) {
+        throw new Error('Scene observations missing: group.static is null');
+      }
+
+      const meshDelta = Math.abs(endObs.meshRotation[0] - startObs.meshRotation[0]) +
+                        Math.abs(endObs.meshRotation[1] - startObs.meshRotation[1]) +
+                        Math.abs(endObs.meshRotation[2] - startObs.meshRotation[2]);
+
+      let instanceDelta = 0;
+      for (let i = 0; i < 16; i++) {
+        instanceDelta += Math.abs(endObs.instanceMatrix[i] - startObs.instanceMatrix[i]);
+      }
+
+      const cameraYDelta = Math.abs(endObs.cameraPosition[1] - startObs.cameraPosition[1]);
+
+      return {
+        startObs,
+        endObs,
+        meshDelta,
+        instanceDelta,
+        cameraYDelta,
+        groupStaticStart: startObs.groupStatic,
+        groupStaticEnd: endObs.groupStatic,
+        startCameraY: startObs.cameraPosition[1],
+        endCameraY: endObs.cameraPosition[1],
+      };
+    }
+
+    /**
+     * Dispatches simulated OrbitControls pointer drag on canvas.
+     */
+    function dispatchOrbitPointerDrag(canvas, { dx = 80, dy = 60 } = {}) {
+      if (!canvas || typeof canvas.dispatchEvent !== 'function') return false;
+      try {
+        const rect = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0, width: 800, height: 600 };
+        const cx = (rect.left || 0) + (rect.width || 800) / 2;
+        const cy = (rect.top || 0) + (rect.height || 600) / 2;
+        const EventCtor = typeof PointerEvent !== 'undefined' ? PointerEvent : MouseEvent;
+
+        canvas.dispatchEvent(new EventCtor('pointerdown', {
+          bubbles: true,
+          cancelable: true,
+          clientX: cx,
+          clientY: cy,
+          button: 0,
+          buttons: 1,
+          pointerId: 1,
+          pointerType: 'mouse',
+          isPrimary: true,
+        }));
+
+        canvas.dispatchEvent(new EventCtor('pointermove', {
+          bubbles: true,
+          cancelable: true,
+          clientX: cx + dx,
+          clientY: cy + dy,
+          button: 0,
+          buttons: 1,
+          pointerId: 1,
+          pointerType: 'mouse',
+          isPrimary: true,
+        }));
+
+        canvas.dispatchEvent(new EventCtor('pointerup', {
+          bubbles: true,
+          cancelable: true,
+          clientX: cx + dx,
+          clientY: cy + dy,
+          button: 0,
+          buttons: 0,
+          pointerId: 1,
+          pointerType: 'mouse',
+          isPrimary: true,
+        }));
+        return true;
+      } catch (err) {
+        console.warn('Pointer dispatch error:', err);
+        return false;
+      }
+    }
+
+    /**
+     * Reads complete snapshot from active H1 window and document.
+     */
+    function readSnapshot(win, doc) {
+      const search = win.location?.search || '';
+      const params = new URLSearchParams(search);
+      const isWebGPU = params.get('backend') !== 'webgl';
+      const renderBundle = params.get('renderBundle') !== 'false';
+      const parsedCount = parseFloat(params.get('count') || 4000);
+      const count = Number.isFinite(parsedCount) ? parsedCount : 4000;
+
+      const canvas = doc.querySelector ? doc.querySelector('canvas') : null;
+      const contextType = detectCanvasContextRealmSafe(canvas);
+      const logs = extractInspectorLogsRobust(doc);
+
+      const renderBundleCtrl = findInspectorControl(doc, 'render bundle');
+      const webgpuCtrl = findInspectorControl(doc, 'webgpu');
+      const dynamicCtrl = findInspectorControl(doc, 'dynamic');
+
+      const router = win.__f3d_router__ || null;
+      const isRouted = Boolean(router);
+      const decisionLog = router && typeof router.getDecisionLog === 'function' ? router.getDecisionLog() : [];
+      const activeDecision = decisionLog.find(d => d.site === 'WebGPURenderer') || null;
+
+      const latestObs = (win.__f3d_render_observations__ || []).slice(-1)[0] || null;
+
+      return {
+        url: win.location?.href || '',
+        pathname: win.location?.pathname || '',
+        search,
+        query: {
+          backend: isWebGPU ? 'webgpu' : 'webgl',
+          webgpu: isWebGPU,
+          renderBundle,
+          count,
+        },
+        title: doc.title || '',
+        canvas: {
+          exists: Boolean(canvas),
+          contextType,
+          width: canvas ? (canvas.width || 0) : 0,
+          height: canvas ? (canvas.height || 0) : 0,
+        },
+        controls: {
+          renderBundle: {
+            found: renderBundleCtrl.found,
+            checked: Boolean(renderBundleCtrl.checkbox?.checked),
+          },
+          webgpu: {
+            found: webgpuCtrl.found,
+            checked: Boolean(webgpuCtrl.checkbox?.checked),
+          },
+          dynamic: {
+            found: dynamicCtrl.found,
+            checked: Boolean(dynamicCtrl.checkbox?.checked),
+          },
+        },
+        inspector: {
+          sign: logs.sign,
+          logs: logs.all,
+          other: logs.other,
+        },
+        routing: {
+          isRouted,
+          activeRoute: activeDecision ? activeDecision.route : null,
+          activeReasons: activeDecision ? (activeDecision.reasons || []) : [],
+          decisionCount: decisionLog.length,
+        },
+        observation: latestObs,
+      };
+    }
+
+    // Use canonical compareH1Snapshots directly from h1_interaction_helper.mjs (Plan §5.1; Mail #7694, #7720)
+    const compareSnapshotsStrict = compareH1Snapshots;
+
+    /**
+     * Polls the iframe until Three.js H1 demo settles and signals are readable.
+     * Enforces deadline check at top of check() so mismatch branches never loop indefinitely (Mail #7850).
+     */
+    function waitForSettle(iframe, { isReference = false, expectedBackend = 'webgpu', expectedBundle = true, timeoutMs = 25000 } = {}) {
+      return new Promise((resolve, reject) => {
         const startTime = Date.now();
-        const maxTimeout = 25000; // 25 seconds settle limit
 
         function check() {
-          if (resolved) return;
+          if (Date.now() - startTime > timeoutMs) {
+            return reject(new Error(`Timeout waiting for settle (timeoutMs=${timeoutMs}, isReference=${isReference}, expectedBackend=${expectedBackend}, expectedBundle=${expectedBundle})`));
+          }
 
           try {
-            const iframeWin = iframe.contentWindow;
-            const iframeDoc = iframe.contentDocument;
+            const win = iframe.contentWindow;
+            const doc = iframe.contentDocument;
 
-            if (!iframeWin || !iframeDoc) {
-              if (Date.now() - startTime > maxTimeout) {
-                resolved = true;
-                resolve({
-                  branch: branchKey,
-                  url: targetUrl,
-                  passed: false,
-                  error: 'Timeout waiting for iframe document accessibility',
-                });
-                return;
-              }
-              setTimeout(check, 250);
+            if (!win || !doc) {
+              setTimeout(check, 200);
               return;
             }
 
-            // Ensure navigation to the desired branch has occurred
-            const currentPath = iframeWin.location.pathname || '';
-            const currentSearch = iframeWin.location.search || '';
+            const currentPath = win.location.pathname || '';
+            const currentSearch = win.location.search || '';
+
             if (!currentPath.includes('webgpu_performance_renderbundle.html')) {
-              setTimeout(check, 250);
-              return;
-            }
-            if (branchKey === 'webgl' && !currentSearch.includes('backend=webgl')) {
-              setTimeout(check, 250);
-              return;
-            }
-            if (branchKey === 'webgpu' && currentSearch.includes('backend=webgl')) {
-              setTimeout(check, 250);
+              setTimeout(check, 200);
               return;
             }
 
-            const title = iframeDoc.title || '';
-            const firstCanvas = iframeDoc.querySelector('canvas');
-            const canvasContext = detectCanvasContext(firstCanvas);
-            const logs = extractInspectorLogs(iframeDoc);
-            const inspectorSign = logs.sign;
-            const decisionLog = iframeWin.__f3d_router__ ? iframeWin.__f3d_router__.getDecisionLog() : [];
-            const attributionLog = iframeWin.__f3d_router__ && typeof iframeWin.__f3d_router__.getAttributionLog === 'function'
-              ? iframeWin.__f3d_router__.getAttributionLog()
-              : [];
+            if (isReference && !currentPath.includes('/upstream/three.js/')) {
+              setTimeout(check, 200);
+              return;
+            }
+            if (!isReference && currentPath.includes('/upstream/three.js/')) {
+              setTimeout(check, 200);
+              return;
+            }
 
-            // Readiness criteria:
-            // 1. First canvas created and context identified (webgpu or webgl2)
-            // 2. Inspector startup sign message posted matching THREE.WebGPURenderer
-            // 3. Router decision log contains at least one construction event
-            const isReady =
-              canvasContext !== 'none' &&
-              canvasContext !== 'unknown' &&
-              inspectorSign.length > 0 &&
-              Array.isArray(decisionLog) &&
-              decisionLog.length > 0;
+            if (expectedBackend === 'webgl' && !currentSearch.includes('backend=webgl')) {
+              setTimeout(check, 200);
+              return;
+            }
+            if (expectedBackend === 'webgpu' && currentSearch.includes('backend=webgl')) {
+              setTimeout(check, 200);
+              return;
+            }
 
-            if (isReady) {
-              // Settle delay: allow the render loop and Inspector charts to tick
+            if (!expectedBundle && !currentSearch.includes('renderBundle=false')) {
+              setTimeout(check, 200);
+              return;
+            }
+
+            const canvas = doc.querySelector ? doc.querySelector('canvas') : null;
+            const contextType = detectCanvasContextRealmSafe(canvas);
+            const logs = extractInspectorLogsRobust(doc);
+            const router = win.__f3d_router__;
+            const decisionLog = router && typeof router.getDecisionLog === 'function' ? router.getDecisionLog() : [];
+
+            const expectedContext = expectedBackend === 'webgl' ? 'webgl2' : 'webgpu';
+            const contextReady = contextType === expectedContext;
+            const signReady = logs.sign.length > 0;
+            const routerReady = isReference ? true : (Array.isArray(decisionLog) && decisionLog.length > 0);
+
+            if (contextReady && signReady && routerReady) {
+              installRenderHook(win, doc);
               setTimeout(() => {
-                if (resolved) return;
-                resolved = true;
-
-                // Re-read latest signals post-settle
-                const finalTitle = iframeDoc.title || title;
-                const finalContext = detectCanvasContext(firstCanvas);
-                const finalLogs = extractInspectorLogs(iframeDoc);
-                const finalDecisionLog = iframeWin.__f3d_router__ ? iframeWin.__f3d_router__.getDecisionLog() : decisionLog;
-                const finalAttributionLog = iframeWin.__f3d_router__ && typeof iframeWin.__f3d_router__.getAttributionLog === 'function'
-                  ? iframeWin.__f3d_router__.getAttributionLog()
-                  : attributionLog;
-                const activeRoute = finalDecisionLog.find(d => d.site === 'WebGPURenderer')?.route || 'none';
-
-                titleEl.textContent = finalTitle;
-                contextEl.textContent = finalContext;
-                signEl.textContent = finalLogs.sign;
-                routeEl.textContent = activeRoute;
-
-                resolve({
-                  branch: branchKey,
-                  url: targetUrl,
-                  title: finalTitle,
-                  canvasContext: finalContext,
-                  inspectorSign: finalLogs.sign,
-                  otherLogs: finalLogs.other,
-                  allLogs: finalLogs.all,
-                  decisionLog: finalDecisionLog,
-                  attributionLog: finalAttributionLog,
-                  passed: true,
-                });
-              }, 1500);
-              return;
-            }
-
-            if (Date.now() - startTime > maxTimeout) {
-              resolved = true;
-              const timeoutLogs = extractInspectorLogs(iframeDoc);
-              const timeoutDecisionLog = iframeWin.__f3d_router__ ? iframeWin.__f3d_router__.getDecisionLog() : [];
-              const timeoutAttributionLog = iframeWin.__f3d_router__ && typeof iframeWin.__f3d_router__.getAttributionLog === 'function'
-                ? iframeWin.__f3d_router__.getAttributionLog()
-                : [];
-              titleEl.textContent = title || 'Timeout';
-              contextEl.textContent = canvasContext;
-              signEl.textContent = timeoutLogs.sign || 'Missing';
-              routeEl.textContent = timeoutDecisionLog.length ? timeoutDecisionLog[0].route : 'None';
-
-              resolve({
-                branch: branchKey,
-                url: targetUrl,
-                title,
-                canvasContext,
-                inspectorSign: timeoutLogs.sign,
-                otherLogs: timeoutLogs.other,
-                allLogs: timeoutLogs.all,
-                decisionLog: timeoutDecisionLog,
-                attributionLog: timeoutAttributionLog,
-                passed: false,
-                error: `Settle timeout after 25s (context=${canvasContext}, sign=${timeoutLogs.sign ? 'found' : 'missing'}, decisions=${timeoutDecisionLog.length})`,
-              });
+                resolve({ win, doc, snapshot: readSnapshot(win, doc) });
+              }, 800);
               return;
             }
           } catch (err) {
-            if (Date.now() - startTime > maxTimeout) {
-              resolved = true;
-              resolve({
-                branch: branchKey,
-                url: targetUrl,
-                passed: false,
-                error: err.message || String(err),
-              });
-              return;
-            }
+            // Next iteration will check top deadline
           }
 
-          setTimeout(check, 250);
+          setTimeout(check, 200);
         }
 
-        // Navigate iframe
-        iframe.src = targetUrl;
-        setTimeout(check, 500);
+        setTimeout(check, 300);
       });
+    }
+
+    /**
+     * Executes the reference-vs-candidate parity, real scene/camera observation, and negative sequence.
+     */
+    async function runBranchSequence(branchKey, iframe) {
+      const isWebGL = branchKey === 'webgl';
+      const backend = isWebGL ? 'webgl' : 'webgpu';
+      const badge = document.getElementById('badge-' + branchKey);
+      const refStatusEl = document.getElementById('ref-status-' + branchKey);
+      const candStatusEl = document.getElementById('cand-status-' + branchKey);
+      const parityEl = document.getElementById('parity-' + branchKey);
+      const sceneCamEl = document.getElementById('scene-cam-' + branchKey);
+      const negativeEl = document.getElementById('negative-' + branchKey);
+
+      badge.className = 'badge running';
+      badge.textContent = 'RUNNING';
+
+      addLog(branchKey, `Starting ${branchKey} reference-vs-candidate sequence...`, 'info');
+
+      // -------------------------------------------------------------
+      // Phase 1: Unmodified Upstream Reference Run
+      // -------------------------------------------------------------
+      addLog(branchKey, `[1/8] Navigating to unmodified upstream reference (${backend})...`, 'info');
+      iframe.src = 'about:blank';
+      await new Promise(r => setTimeout(r, 150));
+
+      const refUrl = buildH1UrlStrict('', { isReference: true, backend, renderBundle: true, count: 4000 });
+      iframe.src = refUrl;
+
+      const refSettle = await waitForSettle(iframe, {
+        isReference: true,
+        expectedBackend: backend,
+        expectedBundle: true,
+      });
+
+      const refInitial = readSnapshot(refSettle.win, refSettle.doc);
+      refStatusEl.textContent = `${refInitial.canvas.contextType} | ${refInitial.inspector.sign}`;
+      addLog(branchKey, `[2/8] Reference initial settle OK: context=${refInitial.canvas.contextType}, sign="${refInitial.inspector.sign}"`, 'ok');
+
+      // Hook observations on Reference: sample initial static baseline
+      installRenderHook(refSettle.win, refSettle.doc);
+      await waitForObservations(refSettle.win, 3);
+      const refStaticSample = await sampleSceneObservations(refSettle.win, 250);
+
+      const refStaticMeshOk = refStaticSample.meshDelta < 1e-4;
+      const refStaticInstOk = refStaticSample.instanceDelta < 1e-4;
+      const refStaticCamYOk = refStaticSample.cameraYDelta < 1e-4;
+      const refStaticGroupOk = refStaticSample.groupStaticStart === true && refStaticSample.groupStaticEnd === true;
+      const refStaticSuccess = refStaticMeshOk && refStaticInstOk && refStaticCamYOk && refStaticGroupOk;
+
+      if (!refStaticSuccess) {
+        throw new Error(`Reference static baseline assertion failed: meshDelta=${refStaticSample.meshDelta.toFixed(6)} (<1e-4), instDelta=${refStaticSample.instanceDelta.toFixed(6)} (<1e-4), camYDelta=${refStaticSample.cameraYDelta.toFixed(6)} (<1e-4), groupStatic=${refStaticSample.groupStaticStart}->${refStaticSample.groupStaticEnd} (expected true->true)`);
+      }
+      const refInitialY = refStaticSample.endCameraY;
+      addLog(branchKey, `Reference static baseline: meshDelta=${refStaticSample.meshDelta.toFixed(6)}, instDelta=${refStaticSample.instanceDelta.toFixed(6)}, camYDelta=${refStaticSample.cameraYDelta.toFixed(6)}, groupStatic=${refStaticSample.groupStaticEnd} (ASSERTION PASSED)`, 'ok');
+
+      // Checkpoint 1: Dynamic toggle on Reference (strictly fail if toggle fails - no bypass)
+      addLog(branchKey, `[3/8] Toggling dynamic control on reference...`, 'info');
+      const refToggleDynamicRes = toggleInspectorControl(refSettle.doc, 'dynamic');
+      if (!refToggleDynamicRes.success) {
+        throw new Error(`Reference dynamic control toggle failed: ${refToggleDynamicRes.error}`);
+      }
+      const refDynamicSample = await sampleSceneObservations(refSettle.win, 350);
+      const refDynamic = readSnapshot(refSettle.win, refSettle.doc);
+
+      const refDynamicMeshOk = refDynamicSample.meshDelta > 0.005;
+      const refDynamicInstOk = refDynamicSample.instanceDelta > 0.005;
+      const refDynamicGroupOk = refDynamicSample.groupStaticEnd === false;
+      const refDynamicChecked = refDynamic.controls.dynamic.checked === true;
+      const refDynamicSuccess = refDynamicChecked && refDynamicMeshOk && refDynamicInstOk && refDynamicGroupOk;
+
+      if (!refDynamicSuccess) {
+        throw new Error(`Reference dynamic assertion failed: checked=${refDynamicChecked}, meshDelta=${refDynamicSample.meshDelta.toFixed(6)} (>0.005), instDelta=${refDynamicSample.instanceDelta.toFixed(6)} (>0.005), groupStaticEnd=${refDynamicSample.groupStaticEnd} (expected false)`);
+      }
+      addLog(branchKey, `Reference dynamic observation: PASSED (checked=true, meshDelta=${refDynamicSample.meshDelta.toFixed(4)}, instDelta=${refDynamicSample.instanceDelta.toFixed(4)}, groupStatic=${refDynamicSample.groupStaticEnd})`, 'ok');
+
+      // Checkpoint 2: OrbitControls pointer drag on Reference & camera elevation observation
+      addLog(branchKey, `[4/8] Dispatched OrbitControls vertical pointer drag on reference canvas...`, 'info');
+      const refCanvas = refSettle.doc.querySelector('canvas');
+      const refDragDispatched = dispatchOrbitPointerDrag(refCanvas, { dx: 80, dy: 60 });
+      if (!refDragDispatched) {
+        throw new Error('Reference canvas pointer drag dispatch failed');
+      }
+      await new Promise(r => setTimeout(r, 300));
+      const refObsPostDrag = (refSettle.win.__f3d_render_observations__ || []).slice(-1)[0];
+      if (!refObsPostDrag || !refObsPostDrag.cameraPosition) {
+        throw new Error('Reference post-drag camera position observation missing');
+      }
+      const refPostDragY = refObsPostDrag.cameraPosition[1];
+      const refCamYDelta = Math.abs(refPostDragY - refInitialY);
+      const refOrbitSuccess = refCamYDelta > 0.3; // OrbitControls vertical drag moved elevation out of autoRotate orbital plane
+      if (!refOrbitSuccess) {
+        throw new Error(`Reference OrbitControls drag failed: deltaY=${refCamYDelta.toFixed(4)} (<0.3 relative to constant baseline Y ${refInitialY.toFixed(4)})`);
+      }
+      const refOrbit = readSnapshot(refSettle.win, refSettle.doc);
+      addLog(branchKey, `Reference camera trajectory observation: PASSED (initialY=${refInitialY.toFixed(4)}, postDragY=${refPostDragY.toFixed(4)}, deltaY=${refCamYDelta.toFixed(4)})`, 'ok');
+
+      // Checkpoint 3: RenderBundle reload sequence on Reference (strictly fail if control fails - no bypass)
+      addLog(branchKey, `[5/8] Triggering renderBundle reload on reference via Inspector control...`, 'info');
+      const refToggleBundleRes = toggleInspectorControl(refSettle.doc, 'render bundle');
+      if (!refToggleBundleRes.success) {
+        throw new Error(`Reference renderBundle toggle failed: ${refToggleBundleRes.error}`);
+      }
+
+      const refBundleOffSettle = await waitForSettle(iframe, {
+        isReference: true,
+        expectedBackend: backend,
+        expectedBundle: false,
+      });
+      const refBundleOff = readSnapshot(refBundleOffSettle.win, refBundleOffSettle.doc);
+      const refBundleOffSuccess = refBundleOff.query.renderBundle === false && refBundleOff.controls.renderBundle.checked === false;
+      addLog(branchKey, `Reference reload (renderBundle=false): ${refBundleOffSuccess ? 'PASSED' : 'FAILED'}`, refBundleOffSuccess ? 'ok' : 'err');
+
+      // -------------------------------------------------------------
+      // Phase 2: Routed Candidate Facade Run
+      // -------------------------------------------------------------
+      addLog(branchKey, `[6/8] Navigating to routed candidate facade (${backend})...`, 'info');
+      iframe.src = 'about:blank';
+      await new Promise(r => setTimeout(r, 150));
+
+      const candUrl = buildH1UrlStrict('', { isReference: false, backend, renderBundle: true, count: 4000 });
+      iframe.src = candUrl;
+
+      const candSettle = await waitForSettle(iframe, {
+        isReference: false,
+        expectedBackend: backend,
+        expectedBundle: true,
+      });
+
+      const candInitial = readSnapshot(candSettle.win, candSettle.doc);
+      candStatusEl.textContent = `${candInitial.canvas.contextType} | ${candInitial.inspector.sign} | ${candInitial.routing.activeRoute}`;
+      addLog(branchKey, `[7/8] Candidate initial settle OK: context=${candInitial.canvas.contextType}, route=${candInitial.routing.activeRoute}`, 'ok');
+
+      // Hook observations on Candidate: sample initial static baseline
+      installRenderHook(candSettle.win, candSettle.doc);
+      await waitForObservations(candSettle.win, 3);
+      const candStaticSample = await sampleSceneObservations(candSettle.win, 250);
+
+      const candStaticMeshOk = candStaticSample.meshDelta < 1e-4;
+      const candStaticInstOk = candStaticSample.instanceDelta < 1e-4;
+      const candStaticCamYOk = candStaticSample.cameraYDelta < 1e-4;
+      const candStaticGroupOk = candStaticSample.groupStaticStart === true && candStaticSample.groupStaticEnd === true;
+      const candStaticSuccess = candStaticMeshOk && candStaticInstOk && candStaticCamYOk && candStaticGroupOk;
+
+      if (!candStaticSuccess) {
+        throw new Error(`Candidate static baseline assertion failed: meshDelta=${candStaticSample.meshDelta.toFixed(6)} (<1e-4), instDelta=${candStaticSample.instanceDelta.toFixed(6)} (<1e-4), camYDelta=${candStaticSample.cameraYDelta.toFixed(6)} (<1e-4), groupStatic=${candStaticSample.groupStaticStart}->${candStaticSample.groupStaticEnd} (expected true->true)`);
+      }
+      const candInitialY = candStaticSample.endCameraY;
+      addLog(branchKey, `Candidate static baseline: meshDelta=${candStaticSample.meshDelta.toFixed(6)}, instDelta=${candStaticSample.instanceDelta.toFixed(6)}, camYDelta=${candStaticSample.cameraYDelta.toFixed(6)}, groupStatic=${candStaticSample.groupStaticEnd} (ASSERTION PASSED)`, 'ok');
+
+      // Checkpoint 1: Dynamic toggle on Candidate (strictly fail if toggle fails - no bypass)
+      const candToggleDynamicRes = toggleInspectorControl(candSettle.doc, 'dynamic');
+      if (!candToggleDynamicRes.success) {
+        throw new Error(`Candidate dynamic control toggle failed: ${candToggleDynamicRes.error}`);
+      }
+      const candDynamicSample = await sampleSceneObservations(candSettle.win, 350);
+      const candDynamic = readSnapshot(candSettle.win, candSettle.doc);
+
+      const candDynamicMeshOk = candDynamicSample.meshDelta > 0.005;
+      const candDynamicInstOk = candDynamicSample.instanceDelta > 0.005;
+      const candDynamicGroupOk = candDynamicSample.groupStaticEnd === false;
+      const candDynamicChecked = candDynamic.controls.dynamic.checked === true;
+      const candDynamicSuccess = candDynamicChecked && candDynamicMeshOk && candDynamicInstOk && candDynamicGroupOk;
+
+      if (!candDynamicSuccess) {
+        throw new Error(`Candidate dynamic assertion failed: checked=${candDynamicChecked}, meshDelta=${candDynamicSample.meshDelta.toFixed(6)} (>0.005), instDelta=${candDynamicSample.instanceDelta.toFixed(6)} (>0.005), groupStaticEnd=${candDynamicSample.groupStaticEnd} (expected false)`);
+      }
+      addLog(branchKey, `Candidate dynamic observation: PASSED (checked=true, meshDelta=${candDynamicSample.meshDelta.toFixed(4)}, instDelta=${candDynamicSample.instanceDelta.toFixed(4)}, groupStatic=${candDynamicSample.groupStaticEnd})`, 'ok');
+
+      // Checkpoint 2: OrbitControls pointer drag on Candidate & camera elevation observation
+      const candCanvas = candSettle.doc.querySelector('canvas');
+      const candDragDispatched = dispatchOrbitPointerDrag(candCanvas, { dx: 80, dy: 60 });
+      if (!candDragDispatched) {
+        throw new Error('Candidate canvas pointer drag dispatch failed');
+      }
+      await new Promise(r => setTimeout(r, 300));
+      const candObsPostDrag = (candSettle.win.__f3d_render_observations__ || []).slice(-1)[0];
+      if (!candObsPostDrag || !candObsPostDrag.cameraPosition) {
+        throw new Error('Candidate post-drag camera position observation missing');
+      }
+      const candPostDragY = candObsPostDrag.cameraPosition[1];
+      const candCamYDelta = Math.abs(candPostDragY - candInitialY);
+      const candOrbitSuccess = candCamYDelta > 0.3;
+      if (!candOrbitSuccess) {
+        throw new Error(`Candidate OrbitControls drag failed: deltaY=${candCamYDelta.toFixed(4)} (<0.3 relative to constant baseline Y ${candInitialY.toFixed(4)})`);
+      }
+      const candOrbit = readSnapshot(candSettle.win, candSettle.doc);
+      addLog(branchKey, `Candidate camera trajectory observation: PASSED (initialY=${candInitialY.toFixed(4)}, postDragY=${candPostDragY.toFixed(4)}, deltaY=${candCamYDelta.toFixed(4)})`, 'ok');
+
+      // Checkpoint 3: RenderBundle reload on Candidate (strictly fail if control fails - no bypass)
+      const candToggleBundleRes = toggleInspectorControl(candSettle.doc, 'render bundle');
+      if (!candToggleBundleRes.success) {
+        throw new Error(`Candidate renderBundle toggle failed: ${candToggleBundleRes.error}`);
+      }
+
+      const candBundleOffSettle = await waitForSettle(iframe, {
+        isReference: false,
+        expectedBackend: backend,
+        expectedBundle: false,
+      });
+      const candBundleOff = readSnapshot(candBundleOffSettle.win, candBundleOffSettle.doc);
+      const candBundleOffSuccess = candBundleOff.query.renderBundle === false && candBundleOff.controls.renderBundle.checked === false;
+
+      // -------------------------------------------------------------
+      // Phase 3: Parity Assertions Across All Checkpoints
+      // -------------------------------------------------------------
+      addLog(branchKey, `[8/8] Evaluating reference vs candidate parity and scene observations...`, 'info');
+      const initialComp = compareSnapshotsStrict(refInitial, candInitial);
+      const dynamicComp = compareSnapshotsStrict(refDynamic, candDynamic);
+      const orbitComp = compareSnapshotsStrict(refOrbit, candOrbit);
+      const bundleOffComp = compareSnapshotsStrict(refBundleOff, candBundleOff);
+
+      const staticBaselineAgreement = refStaticSuccess && candStaticSuccess;
+      const dynamicAgreement = refDynamicSuccess && candDynamicSuccess && (refDynamic.controls.dynamic.checked === candDynamic.controls.dynamic.checked);
+      const orbitAgreement = refOrbitSuccess && candOrbitSuccess;
+      const bundleOffAgreement = refBundleOffSuccess && candBundleOffSuccess && (refBundleOff.controls.renderBundle.checked === candBundleOff.controls.renderBundle.checked);
+
+      const sceneObservationsMatch = staticBaselineAgreement && dynamicAgreement && orbitAgreement;
+      const parityPassed = initialComp.pass && dynamicComp.pass && orbitComp.pass && bundleOffComp.pass && sceneObservationsMatch && bundleOffAgreement;
+
+      if (parityPassed) {
+        parityEl.textContent = 'PASS (Reference and Candidate agree across all checkpoints)';
+        sceneCamEl.textContent = `Static: PASS | Dynamic: PASS (Δmesh=${candDynamicSample.meshDelta.toFixed(3)}, Δinst=${candDynamicSample.instanceDelta.toFixed(3)}) | Orbit: PASS (Δy=${candCamYDelta.toFixed(3)})`;
+        addLog(branchKey, `Parity confirmed: initial=OK, staticBaseline=OK, dynamic=OK, orbit=OK, reload=OK`, 'ok');
+      } else {
+        const allDiffs = [...initialComp.diffs, ...dynamicComp.diffs, ...orbitComp.diffs, ...bundleOffComp.diffs];
+        parityEl.textContent = `FAIL: ${allDiffs.join('; ')}`;
+        sceneCamEl.textContent = `Static: ${staticBaselineAgreement} | Dynamic: ${dynamicAgreement} | Orbit: ${orbitAgreement} | Reload: ${bundleOffAgreement}`;
+        addLog(branchKey, `Parity failure diffs: ${allDiffs.join('; ')}`, 'err');
+      }
+
+      // -------------------------------------------------------------
+      // Phase 4: Broken Controls / Planted Negative Tests (Strict, No Tautologies)
+      // -------------------------------------------------------------
+      addLog(branchKey, `Executing strict broken control planted mutation checks...`, 'info');
+      const negativeChecks = [];
+
+      // 1. Planted Dynamic Control Mutation: rejected strictly through compareSnapshotsStrict
+      const mutatedDynamic = JSON.parse(JSON.stringify(candDynamic));
+      mutatedDynamic.controls.dynamic.checked = !refDynamic.controls.dynamic.checked;
+      const negDynamicComp = compareSnapshotsStrict(refDynamic, mutatedDynamic);
+      negativeChecks.push({
+        name: 'plantedDynamicMutation',
+        rejected: !negDynamicComp.pass,
+        diffs: negDynamicComp.diffs,
+      });
+
+      // 2. Planted Backend Query Mutation: rejected strictly through compareSnapshotsStrict
+      const mutatedBackend = JSON.parse(JSON.stringify(candInitial));
+      mutatedBackend.query.backend = backend === 'webgpu' ? 'webgl' : 'webgpu';
+      const negBackendComp = compareSnapshotsStrict(refInitial, mutatedBackend);
+      negativeChecks.push({
+        name: 'plantedBackendMutation',
+        rejected: !negBackendComp.pass,
+        diffs: negBackendComp.diffs,
+      });
+
+      // 3. Planted Dishonest Route Mutation (claiming specialized-webgpu): rejected strictly
+      const mutatedRoute = JSON.parse(JSON.stringify(candInitial));
+      mutatedRoute.routing.activeRoute = 'specialized-webgpu';
+      const negRouteComp = compareSnapshotsStrict(refInitial, mutatedRoute);
+      negativeChecks.push({
+        name: 'plantedDishonestRoute',
+        rejected: !negRouteComp.pass,
+        diffs: negRouteComp.diffs,
+      });
+
+      // 4. Planted Missing Canvas Mutation: rejected strictly
+      const mutatedCanvas = JSON.parse(JSON.stringify(candInitial));
+      mutatedCanvas.canvas.exists = false;
+      mutatedCanvas.canvas.contextType = 'none';
+      const negCanvasComp = compareSnapshotsStrict(refInitial, mutatedCanvas);
+      negativeChecks.push({
+        name: 'plantedMissingCanvas',
+        rejected: !negCanvasComp.pass,
+        diffs: negCanvasComp.diffs,
+      });
+
+      // 5. Planted Polluted Reference Mutation: rejected strictly
+      const pollutedRef = JSON.parse(JSON.stringify(refInitial));
+      pollutedRef.routing = { isRouted: true, activeRoute: 'retained-upstream' };
+      const negPollutedComp = compareSnapshotsStrict(pollutedRef, candInitial);
+      negativeChecks.push({
+        name: 'plantedPollutedReference',
+        rejected: !negPollutedComp.pass,
+        diffs: negPollutedComp.diffs,
+      });
+
+      const allNegativesRejected = negativeChecks.every(c => c.rejected);
+      if (allNegativesRejected) {
+        negativeEl.textContent = 'PASS (5/5 planted mutations strictly rejected by comparator)';
+        addLog(branchKey, `Negative controls confirmed: 5/5 planted mutations strictly rejected.`, 'ok');
+      } else {
+        negativeEl.textContent = 'FAIL (Some planted mutations were not rejected)';
+        addLog(branchKey, `Negative control failure: ${JSON.stringify(negativeChecks)}`, 'err');
+      }
+
+      const branchPassed = parityPassed && allNegativesRejected;
+      badge.className = branchPassed ? 'badge pass' : 'badge fail';
+      badge.textContent = branchPassed ? 'PASS' : 'FAIL';
+
+      return {
+        key: branchKey,
+        backend,
+        passed: branchPassed,
+        title: candInitial.title,
+        canvasContext: candInitial.canvas.contextType,
+        inspectorSign: candInitial.inspector.sign,
+        decisionLog: candInitial.routing.decisionCount ? candSettle.win.__f3d_router__.getDecisionLog() : [],
+        attributionLog: candSettle.win.__f3d_router__ && typeof candSettle.win.__f3d_router__.getAttributionLog === 'function'
+          ? candSettle.win.__f3d_router__.getAttributionLog()
+          : [],
+        reference: {
+          initial: refInitial,
+          dynamic: refDynamic,
+          orbit: refOrbit,
+          bundleOff: refBundleOff,
+        },
+        candidate: {
+          initial: candInitial,
+          dynamic: candDynamic,
+          orbit: candOrbit,
+          bundleOff: candBundleOff,
+        },
+        comparison: initialComp,
+        checkpointComparisons: {
+          initial: initialComp,
+          dynamic: dynamicComp,
+          orbit: orbitComp,
+          bundleOff: bundleOffComp,
+        },
+        interactionCheckpoints: {
+          staticBaseline: { ref: refStaticSuccess, candidate: candStaticSuccess, agreement: staticBaselineAgreement },
+          dynamicToggle: { ref: refDynamicSuccess, candidate: candDynamicSuccess, agreement: dynamicAgreement },
+          orbitControls: { ref: refOrbitSuccess, candidate: candOrbitSuccess, agreement: orbitAgreement },
+          renderBundleReload: { ref: refBundleOffSuccess, candidate: candBundleOffSuccess, agreement: bundleOffAgreement },
+        },
+        sceneCameraObservations: {
+          staticBaselineVerified: staticBaselineAgreement,
+          dynamicRotationsObserved: dynamicAgreement,
+          cameraTrajectoryAltered: orbitAgreement,
+          groupStaticTransition: 'true->false',
+          refStatic: {
+            meshDelta: refStaticSample.meshDelta,
+            instanceDelta: refStaticSample.instanceDelta,
+            cameraYDelta: refStaticSample.cameraYDelta,
+            groupStaticStart: refStaticSample.groupStaticStart,
+            groupStaticEnd: refStaticSample.groupStaticEnd,
+          },
+          candStatic: {
+            meshDelta: candStaticSample.meshDelta,
+            instanceDelta: candStaticSample.instanceDelta,
+            cameraYDelta: candStaticSample.cameraYDelta,
+            groupStaticStart: candStaticSample.groupStaticStart,
+            groupStaticEnd: candStaticSample.groupStaticEnd,
+          },
+          refDynamic: {
+            meshDelta: refDynamicSample.meshDelta,
+            instanceDelta: refDynamicSample.instanceDelta,
+            groupStaticStart: refDynamicSample.groupStaticStart,
+            groupStaticEnd: refDynamicSample.groupStaticEnd,
+          },
+          candDynamic: {
+            meshDelta: candDynamicSample.meshDelta,
+            instanceDelta: candDynamicSample.instanceDelta,
+            groupStaticStart: candDynamicSample.groupStaticStart,
+            groupStaticEnd: candDynamicSample.groupStaticEnd,
+          },
+          refCamYDelta,
+          candCamYDelta,
+        },
+        negativeControls: {
+          allRejected: allNegativesRejected,
+          checks: negativeChecks,
+        },
+      };
     }
 
     async function main() {
       const banner = document.getElementById('status-banner');
+      const iframe = document.getElementById('h1-frame');
       const params = new URLSearchParams(window.location.search);
       const requestedBackend = params.get('backend');
 
       const branchesToRun = [];
       if (!requestedBackend || requestedBackend === 'webgpu') {
-        branchesToRun.push({
-          key: 'webgpu',
-          url: '/examples/webgpu_performance_renderbundle.html',
-          expectedContext: 'webgpu',
-          expectedSign: 'WebGPU',
-          expectedRoute: 'retained-upstream',
-          expectedReason: 'specialization-unavailable',
-        });
+        branchesToRun.push('webgpu');
       }
       if (!requestedBackend || requestedBackend === 'webgl') {
-        branchesToRun.push({
-          key: 'webgl',
-          url: '/examples/webgpu_performance_renderbundle.html?backend=webgl',
-          expectedContext: 'webgl2',
-          expectedSign: 'WebGL2',
-          expectedRoute: 'exact-backend',
-          expectedReason: 'explicit-source-selection',
-        });
+        branchesToRun.push('webgl');
       }
 
       const branchResults = {};
       const errors = [];
       let overallPassed = true;
 
-      for (const branch of branchesToRun) {
-        banner.textContent = `Running branch: ${branch.key} (${branch.url})...`;
+      for (const branchKey of branchesToRun) {
+        banner.textContent = `Running ${branchKey} reference-vs-candidate parity sequence...`;
         banner.className = 'status-banner';
 
-        // Clear iframe before branch execution
-        const iframe = document.getElementById('h1-frame');
-        iframe.src = 'about:blank';
-        await new Promise(r => setTimeout(r, 200));
-
-        const res = await runBranch(branch.key, branch.url);
-        branchResults[branch.key] = res;
-
-        const badge = document.getElementById('badge-' + branch.key);
-
-        if (!res.passed) {
+        try {
+          const res = await runBranchSequence(branchKey, iframe);
+          branchResults[branchKey] = res;
+          if (!res.passed) {
+            overallPassed = false;
+            errors.push(`Branch ${branchKey} parity, observation, or negative controls failed.`);
+          }
+        } catch (err) {
           overallPassed = false;
-          errors.push(`Branch ${branch.key} failed: ${res.error}`);
-          badge.className = 'badge fail';
-          badge.textContent = 'FAIL';
-          continue;
-        }
-
-        // Validate branch assertions
-        let branchValid = true;
-        if (!res.title.includes('Render Bundle')) {
-          branchValid = false;
-          errors.push(`Branch ${branch.key}: expected title containing 'Render Bundle', got '${res.title}'`);
-        }
-        if (res.canvasContext !== branch.expectedContext) {
-          branchValid = false;
-          errors.push(`Branch ${branch.key}: expected canvasContext '${branch.expectedContext}', got '${res.canvasContext}'`);
-        }
-        if (!res.inspectorSign.includes(branch.expectedSign)) {
-          branchValid = false;
-          errors.push(`Branch ${branch.key}: expected Inspector sign containing '${branch.expectedSign}', got '${res.inspectorSign}'`);
-        }
-        const decisionEntry = Array.isArray(res.decisionLog)
-          ? res.decisionLog.find(d => d.site === 'WebGPURenderer' && d.route === branch.expectedRoute)
-          : null;
-        if (!decisionEntry) {
-          branchValid = false;
-          errors.push(`Branch ${branch.key}: expected decision log route '${branch.expectedRoute}'`);
-        } else if (!Array.isArray(decisionEntry.reasons) || !decisionEntry.reasons.includes(branch.expectedReason)) {
-          branchValid = false;
-          errors.push(`Branch ${branch.key}: expected decision log reasons to include '${branch.expectedReason}' (got: [${(decisionEntry.reasons || []).join(', ')}])`);
-        }
-
-        if (branchValid) {
-          badge.className = 'badge pass';
-          badge.textContent = 'PASS';
-        } else {
-          overallPassed = false;
-          badge.className = 'badge fail';
-          badge.textContent = 'FAIL';
+          errors.push(`Branch ${branchKey} fatal execution error: ${err.message || String(err)}`);
+          addLog(branchKey, `Fatal error: ${err.message || String(err)}`, 'err');
+          const badge = document.getElementById('badge-' + branchKey);
+          if (badge) {
+            badge.className = 'badge fail';
+            badge.textContent = 'FAIL';
+          }
+          branchResults[branchKey] = {
+            key: branchKey,
+            passed: false,
+            error: err.message || String(err),
+          };
         }
       }
 
       if (overallPassed && errors.length === 0) {
         banner.className = 'status-banner pass';
-        banner.textContent = 'ALL H1 QUERY BRANCHES PASSED VERIFICATION';
+        banner.textContent = 'ALL H1 REFERENCE PARITY & SCENE/CAMERA OBSERVATIONS PASSED';
       } else {
         banner.className = 'status-banner fail';
         banner.textContent = `H1 VERIFICATION FAILED: ${errors.join('; ')}`;
@@ -499,10 +1097,11 @@
         passed: overallPassed && errors.length === 0,
         errors,
         branches: branchResults,
-        otherInspectorLogs: Object.fromEntries(
-          Object.entries(branchResults).map(([k, v]) => [k, v.otherLogs || []])
-        ),
-        decisionLog: Object.values(branchResults).flatMap(b => b.decisionLog || []),
+        imageCheckpoint: {
+          status: 'open-until-measured',
+          attestation: 'Canvas pixel byte comparison remains open until measured in dedicated browser readback harness; no golden image regenerated.',
+        },
+        decisionLog: Object.values(branchResults).flatMap(b => b.candidate?.routing?.decisionLog || b.decisionLog || []),
         attributionLog: Object.values(branchResults).flatMap(b => b.attributionLog || []),
       };
 

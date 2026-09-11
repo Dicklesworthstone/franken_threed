@@ -1,6 +1,7 @@
-// tests/e2e/h1/test_harness.mjs - Automated E2E Runner for H1 (Render Bundle) Demo
-// Plan §3.4, §4.7, §5.1, §6.7, §06.7; Mail #6894, #7028.
-// Modeled on tests/fixtures/routing/test_harness.mjs (Chrome via headless flags, Safari via open, /report seam).
+// tests/e2e/h1/test_harness.mjs - Automated E2E Parity Runner for H1 (Render Bundle) Demo
+// Plan §3.4, §4.7, §5.1, §6.7, Bead f3d-04-module-routing-exact-boundaries-6mv.7; Mails #6894, #7028, #7594, #7595, #7720, #7733, #7850.
+// Verifies reference-vs-candidate parity, real dynamic toggle and OrbitControls scene/camera observations,
+// Ruby's bundle/backend reload sequence, and planted candidate-only negative mutations.
 
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { resolve, dirname, join } from 'node:path';
@@ -36,7 +37,7 @@ if (process.env.PORT) {
 
 const runId = new Date().toISOString().replaceAll(':', '-') + '-' + process.pid;
 const archive = resolve(process.env.F3D_EVIDENCE_DIR || join(repoRoot, 'evidence'));
-const runDir = join(archive, '06.7', runId);
+const runDir = join(archive, '6mv.7', runId);
 mkdirSync(runDir, { recursive: true });
 
 let devServer = null;
@@ -107,7 +108,25 @@ devServer.server.on('request', (req, res) => {
             console.log(`[h1-test-harness] Attribution log saved to ${attributionFile}`);
           }
 
-          console.log('[h1-test-harness] Results received from browser:\n', JSON.stringify(payload.branches || payload, null, 2));
+          console.log('[h1-test-harness] Results received from browser:\n', JSON.stringify({
+            passed: payload.passed,
+            errors: payload.errors,
+            branches: Object.fromEntries(
+              Object.entries(payload.branches || {}).map(([k, v]) => [
+                k,
+                {
+                  passed: v.passed,
+                  canvasContext: v.canvasContext,
+                  inspectorSign: v.inspectorSign,
+                  parity: v.comparison?.pass,
+                  interactions: v.interactionCheckpoints,
+                  sceneCamera: v.sceneCameraObservations,
+                  negatives: v.negativeControls?.allRejected,
+                },
+              ])
+            ),
+            imageCheckpoint: payload.imageCheckpoint,
+          }, null, 2));
 
           // Harness asserts expected backend per query branch
           let assertionsPassed = true;
@@ -175,11 +194,112 @@ devServer.server.on('request', (req, res) => {
                   assertionsPassed = false;
                 }
               }
+
+              // Reference vs Candidate parity comparison assertion
+              if (!branch.comparison || !branch.comparison.pass) {
+                const diffs = branch.comparison?.diffs || [];
+                assertionErrors.push(`Branch '${key}': reference vs candidate state parity failed: ${diffs.join('; ')}`);
+                assertionsPassed = false;
+              }
+
+              // Checkpoint comparisons assertion
+              if (branch.checkpointComparisons) {
+                for (const [stage, comp] of Object.entries(branch.checkpointComparisons)) {
+                  if (!comp.pass) {
+                    assertionErrors.push(`Branch '${key}': checkpoint '${stage}' comparison failed: ${(comp.diffs || []).join('; ')}`);
+                    assertionsPassed = false;
+                  }
+                }
+              }
+
+              // Interaction checkpoints agreement assertion
+              if (!branch.interactionCheckpoints) {
+                assertionErrors.push(`Branch '${key}': missing interactionCheckpoints in report payload`);
+                assertionsPassed = false;
+              } else {
+                const ic = branch.interactionCheckpoints;
+                if (!ic.staticBaseline || !ic.staticBaseline.agreement) {
+                  assertionErrors.push(`Branch '${key}': static baseline interaction agreement failed`);
+                  assertionsPassed = false;
+                }
+                if (!ic.dynamicToggle || !ic.dynamicToggle.agreement) {
+                  assertionErrors.push(`Branch '${key}': dynamic toggle interaction agreement failed`);
+                  assertionsPassed = false;
+                }
+                if (!ic.orbitControls || !ic.orbitControls.agreement) {
+                  assertionErrors.push(`Branch '${key}': OrbitControls interaction agreement failed`);
+                  assertionsPassed = false;
+                }
+                if (!ic.renderBundleReload || !ic.renderBundleReload.agreement) {
+                  assertionErrors.push(`Branch '${key}': renderBundle reload sequence agreement failed`);
+                  assertionsPassed = false;
+                }
+              }
+
+              // Scene and camera observations assertion (Mail #7733, #7850)
+              if (!branch.sceneCameraObservations) {
+                assertionErrors.push(`Branch '${key}': missing sceneCameraObservations in report payload`);
+                assertionsPassed = false;
+              } else {
+                const sco = branch.sceneCameraObservations;
+                if (!sco.staticBaselineVerified) {
+                  assertionErrors.push(`Branch '${key}': static baseline verification failed (mesh, instanceMatrix, or camera Y moved during static baseline)`);
+                  assertionsPassed = false;
+                }
+                if (!sco.dynamicRotationsObserved) {
+                  assertionErrors.push(`Branch '${key}': dynamic rotation observation failed (mesh or instanceMatrix rotations did not become active on dynamic toggle)`);
+                  assertionsPassed = false;
+                }
+                if (!sco.cameraTrajectoryAltered) {
+                  assertionErrors.push(`Branch '${key}': camera trajectory observation failed (OrbitControls vertical drag did not alter camera elevation relative to autoRotate baseline)`);
+                  assertionsPassed = false;
+                }
+                if (sco.groupStaticTransition !== 'true->false') {
+                  assertionErrors.push(`Branch '${key}': BundleGroup.static transition must be 'true->false', got '${sco.groupStaticTransition}'`);
+                  assertionsPassed = false;
+                }
+                if (sco.refStatic && sco.refStatic.meshDelta >= 1e-4) {
+                  assertionErrors.push(`Branch '${key}': reference static mesh moved during baseline (meshDelta=${sco.refStatic.meshDelta})`);
+                  assertionsPassed = false;
+                }
+                if (sco.candStatic && sco.candStatic.meshDelta >= 1e-4) {
+                  assertionErrors.push(`Branch '${key}': candidate static mesh moved during baseline (meshDelta=${sco.candStatic.meshDelta})`);
+                  assertionsPassed = false;
+                }
+                if (sco.refStatic && sco.refStatic.cameraYDelta >= 1e-4) {
+                  assertionErrors.push(`Branch '${key}': reference camera Y moved during autoRotate baseline (cameraYDelta=${sco.refStatic.cameraYDelta})`);
+                  assertionsPassed = false;
+                }
+                if (sco.candStatic && sco.candStatic.cameraYDelta >= 1e-4) {
+                  assertionErrors.push(`Branch '${key}': candidate camera Y moved during autoRotate baseline (cameraYDelta=${sco.candStatic.cameraYDelta})`);
+                  assertionsPassed = false;
+                }
+                if (sco.refDynamic && sco.refDynamic.meshDelta <= 0.005) {
+                  assertionErrors.push(`Branch '${key}': reference mesh did not rotate sufficiently under dynamic (meshDelta=${sco.refDynamic.meshDelta})`);
+                  assertionsPassed = false;
+                }
+                if (sco.candDynamic && sco.candDynamic.meshDelta <= 0.005) {
+                  assertionErrors.push(`Branch '${key}': candidate mesh did not rotate sufficiently under dynamic (meshDelta=${sco.candDynamic.meshDelta})`);
+                  assertionsPassed = false;
+                }
+              }
+
+              // Broken control negative tests assertion
+              if (!branch.negativeControls || !branch.negativeControls.allRejected) {
+                assertionErrors.push(`Branch '${key}': negative control failed (planted mutations were not all rejected)`);
+                assertionsPassed = false;
+              }
             }
           }
 
+          // Image checkpoint honesty assertion
+          if (!payload.imageCheckpoint || payload.imageCheckpoint.status !== 'open-until-measured') {
+            assertionErrors.push(`Image checkpoint status must be 'open-until-measured' (got: '${payload.imageCheckpoint?.status}')`);
+            assertionsPassed = false;
+          }
+
           if (assertionsPassed && assertionErrors.length === 0) {
-            console.log(`[h1-test-harness] ALL H1 ASSERTIONS PASSED in ${browser}`);
+            console.log(`[h1-test-harness] ALL H1 PARITY, SCENE/CAMERA, AND INTERACTION ASSERTIONS PASSED in ${browser}`);
             shutdown(0);
           } else {
             console.error('[h1-test-harness] H1 ASSERTION FAILURES:\n', assertionErrors.join('\n'));
@@ -237,8 +357,8 @@ if (browserProcess) {
   });
 }
 
-// Global timeout: 60s
+// Global timeout: 120s for multi-checkpoint reference-vs-candidate sequence
 setTimeout(() => {
-  console.error('[h1-test-harness] Timeout waiting for H1 test completion (60s)');
+  console.error('[h1-test-harness] Timeout waiting for H1 test completion (120s)');
   shutdown(1);
-}, 60000);
+}, 120000);
