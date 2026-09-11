@@ -48,19 +48,57 @@ public crate APIs <- conformance
 | `ProjectiveMat4` | 64-byte retained full 4x4 matrix record (4 columns of `vec4<f32>`, 16-byte aligned) preserving arbitrary perspective and projection components when matrices are non-affine. |
 | `GpuMatrixLayout` | Enumerates target memory layouts: `AffineRows48` (48B), `ProjectiveMat4x4` (64B), and WGSL native `WgslMat4x3Padded64` (64B, 16-byte column alignment). |
 | `VertexPosUv` | 20-byte canonical vertex record (`position: [f32; 3]` [12B] at offset 0, `uv: [f32; 2]` [8B] at offset 12, 4-byte aligned). Array stride is `VERTEX_POS_UV_STRIDE` (20 bytes). |
-| `InstanceRecord` | 64-byte instance transform record (`transform: AffineRows` [48B], `instance_id: u32` [4B], 12B padding to 16B alignment). |
+| `VertexPosNormalUv` | 32-byte standard vertex record (`position: [f32; 3]` [12B] at offset 0, `normal: [f32; 3]` [12B] at offset 12, `uv: [f32; 2]` [8B] at offset 24, 4-byte aligned). Array stride is `VERTEX_POS_NORMAL_UV_STRIDE` (32 bytes). |
+| `VertexPosColor` | 28-byte standard vertex record (`position: [f32; 3]` [12B] at offset 0, `color: [f32; 4]` [16B] at offset 12, 4-byte aligned). Array stride is `VERTEX_POS_COLOR_STRIDE` (28 bytes). |
+| `InstanceRecord` | 64-byte instance transform record (`transform: AffineRows` [48B, three vec4 rows, not mat3x4 column-major], `instance_id: u32` [4B], `_padding`: 12B trailing alignment padding to 16B struct alignment [64B total]). |
 | `DrawIndirectArgs` | 16-byte WebGPU `drawIndirect` parameter record (`vertex_count`, `instance_count`, `first_vertex`, `first_instance`). |
 | `DrawIndexedIndirectArgs` | 20-byte WebGPU `drawIndexedIndirect` parameter record (`index_count`, `instance_count`, `first_index`, `base_vertex`, `first_instance`). |
+| `LayoutRow` / `LayoutTable` | Introspective layout descriptors and static catalog cross-checked against `core::mem::offset_of` / `size_of`, supporting text dumping via `Display` (`dump_layouts()`) and evidence emission under `05.2`. |
 | `LayoutError` | Strictly typed layout errors: `BufferTooSmall`, `UnalignedOffset`, `NonAffineMatrix`, `IncompatibleTargetLayout`, `UnalignedBytesPerRow`, `UnalignedWriteBuffer`, `CalculationOverflow`. |
 | `AFFINE_ROWS_BYTES` (48) | Size in bytes of a packed `AffineRows` record (alignment: 16). |
 | `PROJECTIVE_MAT4_BYTES` (64) | Size in bytes of a full `ProjectiveMat4` record (alignment: 16). |
 | `COLOR_UNIFORM_BYTES` (16) | Size in bytes of an RGBA color uniform record (`vec4<f32>`, alignment: 16). |
 | `COLOR_UNIFORM_ALIGNMENT` (16) | Byte alignment of a color uniform record under WGSL rules. |
 | `VERTEX_POS_UV_BYTES` (20) | Size in bytes of a canonical position + UV vertex record (`VERTEX_POS_UV_STRIDE` = 20, alignment: 4). |
+| `VERTEX_POS_NORMAL_UV_BYTES` (32) | Size in bytes of a standard position + normal + UV vertex record (`VERTEX_POS_NORMAL_UV_STRIDE` = 32, alignment: 4). |
+| `VERTEX_POS_COLOR_BYTES` (28) | Size in bytes of a standard position + color vertex record (`VERTEX_POS_COLOR_STRIDE` = 28, alignment: 4). |
 | `WRITE_BUFFER_ALIGNMENT` (4) | WebGPU `writeBuffer` offset and size alignment constraint. |
 | `COPY_BYTES_PER_ROW_ALIGNMENT` (256) | WebGPU texture copy row pitch alignment constraint. |
 | `DEFAULT_MIN_UNIFORM_BUFFER_OFFSET_ALIGNMENT` (256) | Default WebGPU dynamic uniform buffer offset alignment limit. |
 | `DEFAULT_MIN_STORAGE_BUFFER_OFFSET_ALIGNMENT` (256) | Default WebGPU dynamic storage buffer offset alignment limit. |
+
+### 2.1.1 Canonical Byte-Offset and Field Layout Catalog (05.2)
+
+Every GPU wire structure in `f3d-core` adheres to a strictly tested byte offset catalog cross-checked against `core::mem::offset_of` and `core::mem::size_of`, verifying that fields tile the full struct `size_of` without gaps or overlaps.
+
+| Record Type | Field | Byte Offset | Size (B) | Alignment (B) | WGSL Type |
+|---|---|---|---|---|---|
+| `AffineRows` | `r0` | 0 | 16 | 16 | `vec4<f32>` |
+| `AffineRows` | `r1` | 16 | 16 | 16 | `vec4<f32>` |
+| `AffineRows` | `r2` | 32 | 16 | 16 | `vec4<f32>` |
+| `ProjectiveMat4` | `elements` | 0 | 64 | 16 | `mat4x4<f32>` |
+| `VertexPosUv` | `position` | 0 | 12 | 4 | `vec3<f32>` |
+| `VertexPosUv` | `uv` | 12 | 8 | 4 | `vec2<f32>` |
+| `VertexPosNormalUv` | `position` | 0 | 12 | 4 | `vec3<f32>` |
+| `VertexPosNormalUv` | `normal` | 12 | 12 | 4 | `vec3<f32>` |
+| `VertexPosNormalUv` | `uv` | 24 | 8 | 4 | `vec2<f32>` |
+| `VertexPosColor` | `position` | 0 | 12 | 4 | `vec3<f32>` |
+| `VertexPosColor` | `color` | 12 | 16 | 4 | `vec4<f32>` |
+| `InstanceRecord` | `transform` | 0 | 48 | 16 | `mat3x4<f32>` |
+| `InstanceRecord` | `instance_id` | 48 | 4 | 4 | `u32` |
+| `InstanceRecord` | `_padding` | 52 | 12 | 4 | `padding` |
+| `DrawIndirectArgs` | `vertex_count` | 0 | 4 | 4 | `u32` |
+| `DrawIndirectArgs` | `instance_count` | 4 | 4 | 4 | `u32` |
+| `DrawIndirectArgs` | `first_vertex` | 8 | 4 | 4 | `u32` |
+| `DrawIndirectArgs` | `first_instance` | 12 | 4 | 4 | `u32` |
+| `DrawIndexedIndirectArgs` | `index_count` | 0 | 4 | 4 | `u32` |
+| `DrawIndexedIndirectArgs` | `instance_count` | 4 | 4 | 4 | `u32` |
+| `DrawIndexedIndirectArgs` | `first_index` | 8 | 4 | 4 | `u32` |
+| `DrawIndexedIndirectArgs` | `base_vertex` | 12 | 4 | 4 | `i32` |
+| `DrawIndexedIndirectArgs` | `first_instance` | 16 | 4 | 4 | `u32` |
+| `ColorUniform` | `rgba` | 0 | 16 | 16 | `vec4<f32>` |
+
+> **Note (`InstanceRecord.transform` and `_padding`)**: `InstanceRecord.transform` is stored on the wire as `AffineRows` (three row-major `vec4<f32>` vectors `r0, r1, r2`), NOT standard WGSL `mat3x4<f32>` column-major layout. Bytes 52..64 constitute 12 bytes of explicit trailing alignment padding (`_padding`) ensuring the record tiles the full 64-byte struct allocation without gaps or overlaps.
 
 ### 2.2 Ownership and Single-Writer Epoch Types
 
@@ -184,6 +222,16 @@ public crate APIs <- conformance
 
 - Unit tests in `src/lib.rs` verify handle packing, unpacking, generation mismatch rejection, arena lifecycle transitions, GPU handle device validation, and manifest blocking logic.
 - Integration tests in `tests/` test serde roundtrip, layout packing, alignment rules, ownership state transitions, immutable per-use versions, and workspace lints.
+- **Deterministic Property Tests (`tests/handle_tests.rs`, `tests/ownership_tests.rs`)**:
+  - Seeded via Knuth/MMIX 64-bit LCG (`TestLcg`) printing seed and iteration on any assertion failure.
+  - **Handle packing roundtrip & zero-generation rejection** (`property_test_handle_pack_unpack_and_words_roundtrip`, `property_test_handle_zero_generation_rejection`): 10,000 iterations verifying bijective `(u32, u32)` words and `u64` bitpack roundtrips across full boundary pairs (`0`, `1`, `u32::MAX`), asserting `Handle::from_raw`, `from_words`, and `unpack_u64` strictly reject generation 0.
+  - **RegionState transition sequences** (`property_test_region_state_transition_sequences`): 2,000 iterations × 50 steps (100,000 randomized operations across `publish`, `transfer_authority`, `transition_mode`, and `record_write`) verifying the state machine never panics and enforcing:
+    - **Stale epoch never accepted**: Any transition presenting an epoch that does not strictly match `current_epoch` is rejected with `OwnershipError::StaleEpoch`.
+    - **Accepted transfer advances epoch**: Every successfully accepted `transfer_authority` call strictly advances `current_epoch` (`next_epoch.get() > prev_epoch.get()`), guaranteeing monotonic epoch advancement across authority transfers.
+  - **Snapshot store & borrow scope interleavings** (`property_test_snapshot_store_and_borrow_scope_interleavings`): 2,000 iterations × 50 steps (100,000 randomized steps interleaving `PerUseSnapshotStore` publish/release and `BorrowScope` enter/growth/exit/accounting) enforcing:
+    - **No ABA after slot reuse**: When a released snapshot slot is reused, its generation strictly increments; reads using a stale generation for that slot are rejected with `OwnershipError::StaleSliceRecord`.
+    - **Growth blocked during borrow**: Linear-memory growth (`record_growth`) is strictly rejected with `OwnershipError::LinearMemoryGrowthBlocked` whenever a borrow scope is active (`BorrowState::Borrowed`). Exiting with a mismatched `BorrowToken` is rejected with `BorrowTokenMismatch` and keeps the scope locked in `Borrowed`.
+    - **Exact copy accounting**: `CopyAccounting` counters (`bytes_view`, `bytes_copied_write_buffer`, `bytes_copied_staging`, `total_copied_bytes`, `total_transported_bytes`) exactly equal cumulative accepted byte counts.
 
 ---
 
