@@ -92,10 +92,18 @@ pub struct RenderContext {
     pub target_id: ResourceId,
     /// Whether this context targets the active browser canvas swapchain.
     pub is_canvas: bool,
+    /// Target attachment width in pixels (§8.5).
+    pub target_width: u32,
+    /// Target attachment height in pixels (§8.5).
+    pub target_height: u32,
     /// Active viewport rectangle `[x, y, width, height]` (CPU metadata).
-    pub viewport: [u32; 4],
+    /// `None` indicates the default full pass attachment bounds.
+    pub viewport: Option<[u32; 4]>,
+    /// Whether an explicit reset of the viewport to full attachment was requested (§8.5).
+    pub viewport_reset: bool,
     /// Active scissor rectangle `[x, y, width, height]` (CPU metadata).
-    pub scissor: [u32; 4],
+    /// `None` indicates scissor testing is disabled (full attachment).
+    pub scissor: Option<[u32; 4]>,
     /// Whether scissor clipping is active (CPU metadata).
     pub scissor_test_enabled: bool,
     /// Semantic epoch of the camera matrix/state for this context (CPU metadata).
@@ -119,8 +127,11 @@ impl RenderContext {
         Self {
             target_id,
             is_canvas: true,
-            viewport: [0, 0, width, height],
-            scissor: [0, 0, width, height],
+            target_width: width,
+            target_height: height,
+            viewport: None,
+            viewport_reset: false,
+            scissor: None,
             scissor_test_enabled: false,
             camera_epoch,
             canvas_output_epoch: None,
@@ -141,8 +152,11 @@ impl RenderContext {
         Self {
             target_id,
             is_canvas: true,
-            viewport: [0, 0, width, height],
-            scissor: [0, 0, width, height],
+            target_width: width,
+            target_height: height,
+            viewport: None,
+            viewport_reset: false,
+            scissor: None,
             scissor_test_enabled: false,
             camera_epoch,
             canvas_output_epoch: Some(canvas_output_epoch),
@@ -164,8 +178,11 @@ impl RenderContext {
         Self {
             target_id,
             is_canvas: false,
-            viewport: [0, 0, width, height],
-            scissor: [0, 0, width, height],
+            target_width: width,
+            target_height: height,
+            viewport: None,
+            viewport_reset: false,
+            scissor: None,
             scissor_test_enabled: false,
             camera_epoch,
             canvas_output_epoch: None,
@@ -174,17 +191,33 @@ impl RenderContext {
         }
     }
 
-    /// Configure the viewport rectangle `[x, y, width, height]`.
+    /// Configure an explicit active viewport rectangle `[x, y, width, height]`.
     #[must_use]
     pub const fn with_viewport(mut self, x: u32, y: u32, width: u32, height: u32) -> Self {
-        self.viewport = [x, y, width, height];
+        self.viewport = Some([x, y, width, height]);
+        self.viewport_reset = false;
         self
     }
 
-    /// Configure the scissor rectangle `[x, y, width, height]`.
+    /// Configure the active viewport rectangle (or `None` for default full pass).
+    #[must_use]
+    pub const fn with_optional_viewport(mut self, viewport: Option<[u32; 4]>) -> Self {
+        self.viewport = viewport;
+        self.viewport_reset = false;
+        self
+    }
+
+    /// Configure an explicit active scissor rectangle `[x, y, width, height]`.
     #[must_use]
     pub const fn with_scissor(mut self, x: u32, y: u32, width: u32, height: u32) -> Self {
-        self.scissor = [x, y, width, height];
+        self.scissor = Some([x, y, width, height]);
+        self
+    }
+
+    /// Configure the active scissor rectangle (or `None` for disabled/full).
+    #[must_use]
+    pub const fn with_optional_scissor(mut self, scissor: Option<[u32; 4]>) -> Self {
+        self.scissor = scissor;
         self
     }
 
@@ -439,6 +472,7 @@ struct ActivePass {
     color_attachment: ColorAttachment,
     draws: Vec<Draw>,
     dependency: Option<PassId>,
+    scissor_used: bool,
 }
 
 /// Saved outer pass descriptor for reentrant pass resumption (§6.7).
@@ -446,6 +480,13 @@ struct ActivePass {
 struct OuterResumeState {
     target_id: ResourceId,
     is_canvas: bool,
+    target_width: u32,
+    target_height: u32,
+    viewport: Option<[u32; 4]>,
+    viewport_reset: bool,
+    scissor: Option<[u32; 4]>,
+    scissor_test_enabled: bool,
+    scissor_used: bool,
     camera_epoch: Epoch,
     canvas_output_epoch: Option<Epoch>,
     name: String,
@@ -509,20 +550,12 @@ impl FrameSession {
         self.canvas_tracker.as_mut()
     }
 
-    /// Marks the canvas frame interval as submitted on the session's stored [`CanvasEpochTracker`].
+    /// Ends the host's canvas acquisition interval on the stored tracker.
     ///
-    /// Delegating to [`CanvasEpochTracker::submit_frame`], this transitions the canvas state to
-    /// submitted, preventing further execution or packet compilation against the current frame
-    /// interval until the next [`CanvasEpochTracker::begin_frame_acquire`].
-    ///
-    /// # Scheduling & Submission Boundary
-    /// Packet construction (such as [`Self::build_submission_packet`] or static packet builders
-    /// like `build_nested_canvas_pass_submission`) only performs schedule synthesis and command
-    /// encoding. It does not issue or execute WebGPU commands. Therefore, submission marking MUST
-    /// be left to the bridge caller (or host runtime) *after* the packet has been submitted to
-    /// the WebGPU queue (`device.queue.submit`), rather than being called automatically upon packet
-    /// construction.
-    pub fn submit_canvas_frame(
+    /// The host calls this when the acquired texture expires. Neither packet
+    /// compilation nor `device.queue.submit` expires it: several packets may
+    /// render to the same canvas within one synchronous rendering interval.
+    pub fn end_canvas_interval(
         &mut self,
         canvas_id: CanvasId,
         epoch: Epoch,
@@ -533,7 +566,7 @@ impl FrameSession {
             }))
         })?;
         tracker
-            .submit_frame(canvas_id, epoch)
+            .end_frame_interval(canvas_id, epoch)
             .map_err(|err| FrameError::Graph(GraphError::Canvas(err)))
     }
 
@@ -555,6 +588,67 @@ impl FrameSession {
     #[inline]
     pub fn context_stack_mut(&mut self) -> &mut RenderContextStack {
         &mut self.context_stack
+    }
+
+    /// Configure the active viewport rectangle `[x, y, width, height]` on the current context (§8.5).
+    pub fn set_viewport(&mut self, x: u32, y: u32, width: u32, height: u32) {
+        let ctx = self.context_stack.current_mut();
+        ctx.viewport = Some([x, y, width, height]);
+        ctx.viewport_reset = false;
+    }
+
+    /// Reset the viewport to the default full-pass attachment bounds (§8.5).
+    pub fn reset_viewport(&mut self) {
+        let ctx = self.context_stack.current_mut();
+        ctx.viewport = None;
+        ctx.viewport_reset = true;
+    }
+
+    /// Configure the active scissor rectangle `[x, y, width, height]` on the current context (§8.5).
+    pub fn set_scissor(&mut self, x: u32, y: u32, width: u32, height: u32) {
+        self.context_stack.current_mut().scissor = Some([x, y, width, height]);
+        if let Some(active) = &mut self.active_pass {
+            active.scissor_used = true;
+        }
+    }
+
+    /// Reset the scissor rectangle to unspecified (§8.5).
+    pub fn reset_scissor(&mut self) {
+        self.context_stack.current_mut().scissor = None;
+        if let Some(active) = &mut self.active_pass {
+            active.scissor_used = true;
+        }
+    }
+
+    /// Enable or disable scissor testing on the current context (§8.5).
+    pub fn set_scissor_test(&mut self, enabled: bool) {
+        self.context_stack.current_mut().scissor_test_enabled = enabled;
+        if enabled {
+            if let Some(active) = &mut self.active_pass {
+                active.scissor_used = true;
+            }
+        }
+    }
+
+    /// Active viewport rectangle `[x, y, width, height]` of the current render context, or `None` if default.
+    #[inline]
+    #[must_use]
+    pub fn viewport(&self) -> Option<[u32; 4]> {
+        self.context_stack.current().viewport
+    }
+
+    /// Active scissor rectangle `[x, y, width, height]` of the current render context, or `None` if disabled.
+    #[inline]
+    #[must_use]
+    pub fn scissor(&self) -> Option<[u32; 4]> {
+        self.context_stack.current().scissor
+    }
+
+    /// Whether scissor test is enabled on the current render context.
+    #[inline]
+    #[must_use]
+    pub fn scissor_test_enabled(&self) -> bool {
+        self.context_stack.current().scissor_test_enabled
     }
 
     /// Reference to the frame scratch arena.
@@ -617,6 +711,7 @@ impl FrameSession {
         };
 
         let dependency = self.last_completed_pass_id;
+        let scissor_used = ctx.scissor_test_enabled || ctx.scissor.is_some();
 
         self.active_pass = Some(ActivePass {
             id: pass_id,
@@ -624,6 +719,7 @@ impl FrameSession {
             color_attachment,
             draws: Vec::new(),
             dependency,
+            scissor_used,
         });
 
         Ok(pass_id)
@@ -644,7 +740,8 @@ impl FrameSession {
         Ok(record)
     }
 
-    /// Record a direct draw command in the active render pass.
+    /// Record a direct draw command with explicit range parameters `[vertex_count, instance_count, first_vertex, first_instance]`
+    /// in WebGPU order (§8.5).
     ///
     /// If a `material_record` is provided:
     /// 1. Validates that the record belongs to the active session's scratch buffer via
@@ -655,11 +752,11 @@ impl FrameSession {
     /// - Returns [`FrameError::NoActivePass`] if no pass is currently open.
     /// - Returns [`FrameError::Ownership`] if `material_record` is foreign or invalid.
     /// - Returns [`FrameError::DrawIdOverflow`] if the draw ID counter exceeds `u32::MAX`.
-    pub fn record_direct_draw(
+    pub fn record_direct_draw_with_range(
         &mut self,
         pipeline_id: u32,
         vertex_buffer_id: u32,
-        vertex_count: u32,
+        range: [u32; 4],
         material_record: Option<UseRecord<MaterialDomain>>,
     ) -> Result<u32, FrameError> {
         let active = self.active_pass.as_mut().ok_or(FrameError::NoActivePass)?;
@@ -703,9 +800,46 @@ impl FrameSession {
             });
         }
 
-        let draw = Draw::new(draw_id, pipeline_id, vertex_count, uniform_offset, uses);
+        let ctx = self.context_stack.current();
+        let viewport = match ctx.viewport {
+            Some(vp) => Some(vp),
+            None if ctx.viewport_reset => Some([0, 0, ctx.target_width, ctx.target_height]),
+            None => None,
+        };
+        if ctx.scissor_test_enabled || ctx.scissor.is_some() {
+            active.scissor_used = true;
+        }
+        let scissor = if ctx.scissor_test_enabled {
+            Some(ctx.scissor.unwrap_or([0, 0, ctx.target_width, ctx.target_height]))
+        } else if active.scissor_used || ctx.scissor.is_some() {
+            Some([0, 0, ctx.target_width, ctx.target_height])
+        } else {
+            None
+        };
+        let draw = Draw::new(draw_id, pipeline_id, range[0], uniform_offset, uses)
+            .with_range(range)
+            .with_viewport(viewport)
+            .with_scissor(scissor, ctx.scissor_test_enabled);
         active.draws.push(draw);
         Ok(draw_id)
+    }
+
+    /// Record a direct draw command in the active render pass with default single-instance parameters `[vertex_count, 1, 0, 0]`.
+    ///
+    /// Delegates directly to [`Self::record_direct_draw_with_range`].
+    pub fn record_direct_draw(
+        &mut self,
+        pipeline_id: u32,
+        vertex_buffer_id: u32,
+        vertex_count: u32,
+        material_record: Option<UseRecord<MaterialDomain>>,
+    ) -> Result<u32, FrameError> {
+        self.record_direct_draw_with_range(
+            pipeline_id,
+            vertex_buffer_id,
+            [vertex_count, 1, 0, 0],
+            material_record,
+        )
     }
 
     /// Record a pre-recorded render bundle execution command in the active render pass (§8.5, 2v8.2).
@@ -799,7 +933,25 @@ impl FrameSession {
             .checked_add(1)
             .ok_or(FrameError::DrawIdOverflow)?;
 
-        let draw = Draw::new_bundle(draw_id, bundle_id, pipeline_id, uses);
+        let ctx = self.context_stack.current();
+        let viewport = match ctx.viewport {
+            Some(vp) => Some(vp),
+            None if ctx.viewport_reset => Some([0, 0, ctx.target_width, ctx.target_height]),
+            None => None,
+        };
+        if ctx.scissor_test_enabled || ctx.scissor.is_some() {
+            active.scissor_used = true;
+        }
+        let scissor = if ctx.scissor_test_enabled {
+            Some(ctx.scissor.unwrap_or([0, 0, ctx.target_width, ctx.target_height]))
+        } else if active.scissor_used || ctx.scissor.is_some() {
+            Some([0, 0, ctx.target_width, ctx.target_height])
+        } else {
+            None
+        };
+        let draw = Draw::new_bundle(draw_id, bundle_id, pipeline_id, uses)
+            .with_viewport(viewport)
+            .with_scissor(scissor, ctx.scissor_test_enabled);
         active.draws.push(draw);
         Ok(draw_id)
     }
@@ -828,6 +980,14 @@ impl FrameSession {
 
     /// Resumes a previously split outer render pass with [`LoadOp::Load`] on the outer target (§6.7).
     fn resume_outer_pass(&mut self, resume: &OuterResumeState) -> Result<PassId, FrameError> {
+        let current_ctx = self.context_stack.current_mut();
+        current_ctx.target_width = resume.target_width;
+        current_ctx.target_height = resume.target_height;
+        current_ctx.viewport = resume.viewport;
+        current_ctx.viewport_reset = resume.viewport_reset;
+        current_ctx.scissor = resume.scissor;
+        current_ctx.scissor_test_enabled = resume.scissor_test_enabled;
+
         let resumed_id = PassId::new(self.next_pass_id);
         self.next_pass_id = self
             .next_pass_id
@@ -844,6 +1004,7 @@ impl FrameSession {
         resumed_color_attachment.store_op = StoreOp::Store;
 
         let dep = self.last_completed_pass_id.or(Some(resume.prefix_pass_id));
+        let scissor_used = resume.scissor_used || resume.scissor_test_enabled || resume.scissor.is_some();
 
         self.active_pass = Some(ActivePass {
             id: resumed_id,
@@ -851,6 +1012,7 @@ impl FrameSession {
             color_attachment: resumed_color_attachment,
             draws: Vec::new(),
             dependency: dep,
+            scissor_used,
         });
 
         Ok(resumed_id)
@@ -903,9 +1065,17 @@ impl FrameSession {
             self.last_completed_pass_id = Some(prefix_id);
 
             let ctx = self.context_stack.current();
+            let scissor_used = active.scissor_used || ctx.scissor_test_enabled || ctx.scissor.is_some();
             Some(OuterResumeState {
                 target_id: ctx.target_id,
                 is_canvas: ctx.is_canvas,
+                target_width: ctx.target_width,
+                target_height: ctx.target_height,
+                viewport: ctx.viewport,
+                viewport_reset: ctx.viewport_reset,
+                scissor: ctx.scissor,
+                scissor_test_enabled: ctx.scissor_test_enabled,
+                scissor_used,
                 camera_epoch: ctx.camera_epoch,
                 canvas_output_epoch: ctx.canvas_output_epoch,
                 name: active.name,
@@ -1199,7 +1369,7 @@ mod tests {
         assert!(!stack.is_root());
         assert_eq!(stack.current().target_id, ResourceId::new(2));
         assert!(!stack.current().is_canvas);
-        assert_eq!(stack.current().viewport, [0, 0, 1024, 1024]);
+        assert_eq!(stack.current().viewport, Some([0, 0, 1024, 1024]));
         assert_eq!(stack.current().camera_epoch, Epoch::new(11));
         assert_eq!(stack.current().camera_projection, [2.0; 16]);
 
@@ -1242,7 +1412,7 @@ mod tests {
 
         // 2. Unwind (panic) safety via std::panic::catch_unwind
         let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = stack.with_nested_context(nested, |s| {
+            let _: Result<(), FrameError> = stack.with_nested_context(nested, |s| {
                 let extra = RenderContext::new_offscreen(ResourceId::new(101), 64, 64, Epoch::ZERO);
                 s.push(extra).expect("push extra");
                 panic!("simulated nested panic");
@@ -1469,19 +1639,17 @@ mod tests {
     }
 
     #[test]
-    fn test_nested_render_propagates_end_render_pass_error() {
+    fn test_nested_render_propagates_callback_error() {
         let root = RenderContext::new_canvas(ResourceId::new(1), 800, 600, Epoch::ZERO);
         let mut session = FrameSession::new(root.clone(), 256).expect("session init");
 
         let nested_ctx = RenderContext::new_offscreen(ResourceId::new(2), 256, 256, Epoch::ZERO);
 
-        // Nested callback begins a pass with an ID that overflows next_pass_id
+        // A callback error propagates after restoring the enclosing context.
         let err: FrameError = session
             .with_nested_render(nested_ctx, |s| {
                 s.begin_render_pass("valid_pass", [0.0, 0.0, 0.0, 1.0]).expect("begin");
-                // Artificially corrupt next_pass_id to force end_render_pass / add_pass error if any
-                // or return a structured error
-                Err(FrameError::InvalidNestingState {
+                Err::<(), FrameError>(FrameError::InvalidNestingState {
                     detail: String::from("explicit error to test propagation"),
                 })
             })
@@ -1718,7 +1886,7 @@ mod tests {
             canvas_target,
             800,
             600,
-            CanvasFormat::Bgra8UnormSrgb,
+            CanvasFormat::Bgra8Unorm,
         );
         let canvas_output = tracker
             .begin_frame_acquire(CanvasId::new(10))
@@ -1802,7 +1970,9 @@ mod tests {
         assert_eq!(seg2.primary_color_attachment().unwrap().target_id(), canvas_target);
         assert_eq!(seg2.primary_color_attachment().unwrap().load_op, LoadOp::Load);
 
-        // 7. Assert through lower_plan that the packet carries three RenderPass openers in source order with flags NEW_PASS
+        // 7. Assert through lower_plan that the packet carries three RenderPass first-draw openers in source order
+        // with flags NEW_PASS and >0 vertices (§8.5).
+        assert_eq!(packet.commands().len(), 3);
         let render_passes: Vec<&GpuCommand> = packet
             .commands()
             .iter()
@@ -1810,80 +1980,16 @@ mod tests {
             .collect();
         assert_eq!(render_passes.len(), 3);
 
-        // Opener 0: main_scene on canvas target 10, clear, NEW_PASS
-        match render_passes[0] {
-            GpuCommand::RenderPass {
-                target_type,
-                target_id,
-                load_op,
-                store_op,
-                pass_flags,
-                pipeline_id,
-                vertex_count,
-                uniform_dynamic_offset,
-                ..
-            } => {
-                assert_eq!(*target_type, TARGET_CANVAS);
-                assert_eq!(*target_id, 10);
-                assert_eq!(*load_op, LOAD_OP_CLEAR);
-                assert_eq!(*store_op, STORE_OP_STORE);
-                assert_eq!(*pass_flags, PASS_FLAG_NEW_PASS);
-                assert_eq!(*pipeline_id, 1);
-                assert_eq!(*vertex_count, 3);
-                assert_eq!(*uniform_dynamic_offset, rec_red.byte_offset() as u32);
-            }
-            other => panic!("expected RenderPass at opener 0, got {other:?}"),
-        }
+        assert_render_pass_first_draw(render_passes[0], TARGET_CANVAS, 10, LOAD_OP_CLEAR, 1, 3, rec_red.byte_offset() as u32);
+        assert_render_pass_first_draw(render_passes[1], TARGET_OFFSCREEN, 11, LOAD_OP_CLEAR, 2, 6, rec_inner.byte_offset() as u32);
+        assert_render_pass_first_draw(render_passes[2], TARGET_CANVAS, 10, LOAD_OP_LOAD, 1, 3, rec_blue.byte_offset() as u32);
 
-        // Opener 1: offscreen_shadow on offscreen target 11, clear, NEW_PASS
-        match render_passes[1] {
-            GpuCommand::RenderPass {
-                target_type,
-                target_id,
-                load_op,
-                store_op,
-                pass_flags,
-                pipeline_id,
-                vertex_count,
-                uniform_dynamic_offset,
-                ..
-            } => {
-                assert_eq!(*target_type, TARGET_OFFSCREEN);
-                assert_eq!(*target_id, 11);
-                assert_eq!(*load_op, LOAD_OP_CLEAR);
-                assert_eq!(*store_op, STORE_OP_STORE);
-                assert_eq!(*pass_flags, PASS_FLAG_NEW_PASS);
-                assert_eq!(*pipeline_id, 2);
-                assert_eq!(*vertex_count, 6);
-                assert_eq!(*uniform_dynamic_offset, rec_inner.byte_offset() as u32);
-            }
-            other => panic!("expected RenderPass at opener 1, got {other:?}"),
-        }
+        let pass0_idx = packet.commands().iter().position(|cmd| std::ptr::eq(cmd, render_passes[0])).unwrap();
+        let pass1_idx = packet.commands().iter().position(|cmd| std::ptr::eq(cmd, render_passes[1])).unwrap();
+        let pass2_idx = packet.commands().iter().position(|cmd| std::ptr::eq(cmd, render_passes[2])).unwrap();
 
-        // Opener 2: main_scene_resumed on canvas target 10, LOAD (no re-clear!), NEW_PASS
-        match render_passes[2] {
-            GpuCommand::RenderPass {
-                target_type,
-                target_id,
-                load_op,
-                store_op,
-                pass_flags,
-                pipeline_id,
-                vertex_count,
-                uniform_dynamic_offset,
-                ..
-            } => {
-                assert_eq!(*target_type, TARGET_CANVAS);
-                assert_eq!(*target_id, 10);
-                assert_eq!(*load_op, LOAD_OP_LOAD); // resumed segment has load_op LOAD and no re-clear!
-                assert_eq!(*store_op, STORE_OP_STORE);
-                assert_eq!(*pass_flags, PASS_FLAG_NEW_PASS); // NEW_PASS flag set on opener!
-                assert_eq!(*pipeline_id, 1);
-                assert_eq!(*vertex_count, 3);
-                assert_eq!(*uniform_dynamic_offset, rec_blue.byte_offset() as u32);
-            }
-            other => panic!("expected RenderPass at opener 2, got {other:?}"),
-        }
+        assert!(pass0_idx < pass1_idx);
+        assert!(pass1_idx < pass2_idx);
 
         // 8. Assert draws keep source order: red -> inner -> blue
         assert!(rec_red.byte_offset() < rec_inner.byte_offset());
@@ -1905,7 +2011,7 @@ mod tests {
             canvas_res_id,
             800,
             600,
-            CanvasFormat::Bgra8UnormSrgb,
+            CanvasFormat::Bgra8Unorm,
         );
 
         // Frame 1: Camera matrix epoch is 42, canvas acquires epoch 1
@@ -2001,7 +2107,7 @@ mod tests {
     }
 
     #[test]
-    fn test_canvas_session_submission_lifecycle_and_interval_rejection() {
+    fn test_canvas_packets_share_interval_until_host_expiry() {
         let canvas_res_id = ResourceId::new(30);
         let canvas_id = CanvasId::new(30);
 
@@ -2011,7 +2117,7 @@ mod tests {
             canvas_res_id,
             800,
             600,
-            CanvasFormat::Bgra8UnormSrgb,
+            CanvasFormat::Bgra8Unorm,
         );
 
         // Frame interval 1: acquire epoch 1
@@ -2045,11 +2151,6 @@ mod tests {
             .expect("compile session 1 packet");
         assert!(!packet1.commands().is_empty());
 
-        // Bridge caller executes packet on GPU queue, then marks submission on session
-        session1
-            .submit_canvas_frame(canvas_id, frame1_output.epoch)
-            .expect("mark canvas frame submitted");
-
         // Session 2 is constructed targeting the same canvas interval and epoch
         let ctx2 = RenderContext::new_canvas_acquired(
             canvas_res_id,
@@ -2066,17 +2167,29 @@ mod tests {
             .record_direct_draw(1, 0, 3, None)
             .expect("record draw 2");
 
-        // Compiling session 2 against the same tracker is rejected with CanvasAlreadySubmitted
+        // A second packet is legal in the same interval. A native queue.submit
+        // does not seal this tracker (actual multiple-submit pixels are checked
+        // in tests/fixtures/gpu_bridge/canvas_lifetime_test.js).
+        let packet2 = session2
+            .build_submission_packet_with_tracker(session1.canvas_tracker())
+            .expect("second packet in the same interval");
+        assert!(!packet2.commands().is_empty());
+
+        session1
+            .end_canvas_interval(canvas_id, frame1_output.epoch)
+            .expect("host expires the acquired canvas texture");
+
+        // Only explicit host expiry rejects further packets against this epoch.
         let stale_res = session2.build_submission_packet_with_tracker(session1.canvas_tracker());
         match stale_res {
-            Err(FrameError::Graph(GraphError::Canvas(CanvasError::CanvasAlreadySubmitted {
+            Err(FrameError::Graph(GraphError::Canvas(CanvasError::CanvasIntervalEnded {
                 canvas_id: id,
-                epoch: submitted_epoch,
+                epoch: ended_epoch,
             }))) => {
                 assert_eq!(id, 30);
-                assert_eq!(submitted_epoch, 1);
+                assert_eq!(ended_epoch, 1);
             }
-            other => panic!("expected CanvasAlreadySubmitted error, got {other:?}"),
+            other => panic!("expected CanvasIntervalEnded error, got {other:?}"),
         }
 
         // Advance to a new frame interval via canvas_tracker_mut: acquire epoch 2
@@ -2119,7 +2232,7 @@ mod tests {
             canvas_target,
             800,
             600,
-            CanvasFormat::Bgra8UnormSrgb,
+            CanvasFormat::Bgra8Unorm,
         );
         let canvas_output = tracker
             .begin_frame_acquire(canvas_id)
@@ -2199,6 +2312,8 @@ mod tests {
             .expect("compile submission packet with tracker");
 
         // 6. Assert lowered openers are canvas clear, offscreen clear, canvas load in source order
+        // with flags NEW_PASS and >0 vertices (§8.5).
+        assert_eq!(packet.commands().len(), 3);
         let render_passes: Vec<&GpuCommand> = packet
             .commands()
             .iter()
@@ -2206,83 +2321,19 @@ mod tests {
             .collect();
         assert_eq!(render_passes.len(), 3);
 
-        // Opener 0: canvas clear in source order
-        match render_passes[0] {
-            GpuCommand::RenderPass {
-                target_type,
-                target_id,
-                load_op,
-                store_op,
-                pass_flags,
-                pipeline_id,
-                vertex_count,
-                uniform_dynamic_offset,
-                ..
-            } => {
-                assert_eq!(*target_type, TARGET_CANVAS);
-                assert_eq!(*target_id, 10);
-                assert_eq!(*load_op, LOAD_OP_CLEAR);
-                assert_eq!(*store_op, STORE_OP_STORE);
-                assert_eq!(*pass_flags, PASS_FLAG_NEW_PASS);
-                assert_eq!(*pipeline_id, 1);
-                assert_eq!(*vertex_count, 3);
-                assert_eq!(*uniform_dynamic_offset, rec_red.byte_offset() as u32);
-            }
-            other => panic!("expected RenderPass opener 0, got {other:?}"),
-        }
+        assert_render_pass_first_draw(render_passes[0], TARGET_CANVAS, 10, LOAD_OP_CLEAR, 1, 3, rec_red.byte_offset() as u32);
+        assert_render_pass_first_draw(render_passes[1], TARGET_OFFSCREEN, 11, LOAD_OP_CLEAR, 2, 6, rec_inner.byte_offset() as u32);
+        assert_render_pass_first_draw(render_passes[2], TARGET_CANVAS, 10, LOAD_OP_LOAD, 1, 3, rec_blue.byte_offset() as u32);
 
-        // Opener 1: offscreen clear in source order
-        match render_passes[1] {
-            GpuCommand::RenderPass {
-                target_type,
-                target_id,
-                load_op,
-                store_op,
-                pass_flags,
-                pipeline_id,
-                vertex_count,
-                uniform_dynamic_offset,
-                ..
-            } => {
-                assert_eq!(*target_type, TARGET_OFFSCREEN);
-                assert_eq!(*target_id, 11);
-                assert_eq!(*load_op, LOAD_OP_CLEAR);
-                assert_eq!(*store_op, STORE_OP_STORE);
-                assert_eq!(*pass_flags, PASS_FLAG_NEW_PASS);
-                assert_eq!(*pipeline_id, 2);
-                assert_eq!(*vertex_count, 6);
-                assert_eq!(*uniform_dynamic_offset, rec_inner.byte_offset() as u32);
-            }
-            other => panic!("expected RenderPass opener 1, got {other:?}"),
-        }
+        let pass0_idx = packet.commands().iter().position(|cmd| std::ptr::eq(cmd, render_passes[0])).unwrap();
+        let pass1_idx = packet.commands().iter().position(|cmd| std::ptr::eq(cmd, render_passes[1])).unwrap();
+        let pass2_idx = packet.commands().iter().position(|cmd| std::ptr::eq(cmd, render_passes[2])).unwrap();
 
-        // Opener 2: canvas load in source order
-        match render_passes[2] {
-            GpuCommand::RenderPass {
-                target_type,
-                target_id,
-                load_op,
-                store_op,
-                pass_flags,
-                pipeline_id,
-                vertex_count,
-                uniform_dynamic_offset,
-                ..
-            } => {
-                assert_eq!(*target_type, TARGET_CANVAS);
-                assert_eq!(*target_id, 10);
-                assert_eq!(*load_op, LOAD_OP_LOAD);
-                assert_eq!(*store_op, STORE_OP_STORE);
-                assert_eq!(*pass_flags, PASS_FLAG_NEW_PASS);
-                assert_eq!(*pipeline_id, 1);
-                assert_eq!(*vertex_count, 3);
-                assert_eq!(*uniform_dynamic_offset, rec_blue.byte_offset() as u32);
-            }
-            other => panic!("expected RenderPass opener 2, got {other:?}"),
-        }
+        assert!(pass0_idx < pass1_idx);
+        assert!(pass1_idx < pass2_idx);
     }
 
-    fn assert_render_pass_opener(
+    fn assert_render_pass_first_draw(
         cmd: &GpuCommand,
         expected_type: u32,
         expected_id: u32,
@@ -2312,7 +2363,7 @@ mod tests {
                 assert_eq!(*vertex_count, expected_vertex_count);
                 assert_eq!(*uniform_dynamic_offset, expected_offset);
             }
-            other => panic!("expected RenderPass, got {other:?}"),
+            other => panic!("expected RenderPass first-draw opener, got {other:?}"),
         }
     }
 
@@ -2328,7 +2379,7 @@ mod tests {
             canvas_target,
             800,
             600,
-            CanvasFormat::Bgra8UnormSrgb,
+            CanvasFormat::Bgra8Unorm,
         );
         let canvas_output = tracker.begin_frame_acquire(canvas_id).expect("acquire canvas");
         let camera_epoch = Epoch::new(1);
@@ -2377,19 +2428,488 @@ mod tests {
             .expect("snapshot blue");
         session.record_direct_draw(1, 0, 3, Some(rec_blue)).expect("record blue draw");
 
-        // Compile with tracker yields 3 openers: CANVAS CLEAR NEW_PASS / OFFSCREEN CLEAR NEW_PASS / CANVAS LOAD NEW_PASS
+        // Compile with tracker yields 3 first-draw openers: CANVAS CLEAR NEW_PASS / OFFSCREEN CLEAR NEW_PASS / CANVAS LOAD NEW_PASS
         let packet = session
             .build_submission_packet_with_tracker(Some(&tracker))
             .expect("compile submission packet with tracker");
-        let passes: Vec<&GpuCommand> = packet
+        assert_eq!(packet.commands().len(), 3);
+        let render_passes: Vec<&GpuCommand> = packet
             .commands()
             .iter()
             .filter(|cmd| matches!(cmd, GpuCommand::RenderPass { .. }))
             .collect();
-        assert_eq!(passes.len(), 3);
+        assert_eq!(render_passes.len(), 3);
 
-        assert_render_pass_opener(passes[0], TARGET_CANVAS, 10, LOAD_OP_CLEAR, 1, 3, rec_red.byte_offset() as u32);
-        assert_render_pass_opener(passes[1], TARGET_OFFSCREEN, 11, LOAD_OP_CLEAR, 2, 6, rec_inner.byte_offset() as u32);
-        assert_render_pass_opener(passes[2], TARGET_CANVAS, 10, LOAD_OP_LOAD, 1, 3, rec_blue.byte_offset() as u32);
+        assert_render_pass_first_draw(render_passes[0], TARGET_CANVAS, 10, LOAD_OP_CLEAR, 1, 3, rec_red.byte_offset() as u32);
+        assert_render_pass_first_draw(render_passes[1], TARGET_OFFSCREEN, 11, LOAD_OP_CLEAR, 2, 6, rec_inner.byte_offset() as u32);
+        assert_render_pass_first_draw(render_passes[2], TARGET_CANVAS, 10, LOAD_OP_LOAD, 1, 3, rec_blue.byte_offset() as u32);
+
+        let pass0_idx = packet.commands().iter().position(|cmd| std::ptr::eq(cmd, render_passes[0])).unwrap();
+        let pass1_idx = packet.commands().iter().position(|cmd| std::ptr::eq(cmd, render_passes[1])).unwrap();
+        let pass2_idx = packet.commands().iter().position(|cmd| std::ptr::eq(cmd, render_passes[2])).unwrap();
+
+        assert!(pass0_idx < pass1_idx);
+        assert!(pass1_idx < pass2_idx);
+    }
+
+    #[test]
+    fn test_nested_render_viewport_and_scissor_preservation_and_restoration() {
+        let canvas_target = ResourceId::new(10);
+        let offscreen_target = ResourceId::new(11);
+        let canvas_id = CanvasId::new(10);
+
+        let mut tracker = CanvasEpochTracker::new();
+        tracker.register_canvas(
+            canvas_id,
+            canvas_target,
+            800,
+            600,
+            CanvasFormat::Bgra8Unorm,
+        );
+        let canvas_output = tracker.begin_frame_acquire(canvas_id).expect("acquire canvas");
+        let camera_epoch = Epoch::new(1);
+        let root_ctx = RenderContext::new_canvas_acquired(
+            canvas_target,
+            800,
+            600,
+            camera_epoch,
+            canvas_output.epoch,
+        )
+        .with_viewport(0, 0, 800, 600)
+        .with_scissor(0, 0, 400, 600)
+        .with_scissor_test(true);
+
+        let mut session = FrameSession::new(root_ctx, 256).expect("session init");
+
+        // 1. Begin outer pass and record outer prefix draw (left half scissor)
+        session.begin_render_pass("canvas_outer", [0.0, 0.0, 0.0, 1.0]).expect("begin outer");
+        let outer_draw_id = session.record_direct_draw(1, 0, 3, None).expect("record outer draw");
+
+        // 2. Execute with_nested_render targeting offscreen texture 11 with distinct viewport and scissor
+        let nested_ctx = RenderContext::new_offscreen(offscreen_target, 256, 256, Epoch::new(2))
+            .with_viewport(0, 0, 256, 256)
+            .with_scissor(32, 32, 128, 128)
+            .with_scissor_test(true);
+
+        let nested_draw_id = session
+            .with_nested_render(nested_ctx, |s| {
+                assert_eq!(s.viewport(), Some([0, 0, 256, 256]));
+                assert_eq!(s.scissor(), Some([32, 32, 128, 128]));
+                assert!(s.scissor_test_enabled());
+
+                s.begin_render_pass("offscreen_nested", [0.2, 0.2, 0.2, 1.0]).expect("begin nested");
+                let id = s.record_direct_draw(2, 0, 6, None).expect("record nested draw");
+                s.end_render_pass().expect("commit nested pass");
+                Ok(id)
+            })
+            .expect("nested render ok");
+
+        // 3. Resumed outer pass is open: verify outer context viewport/scissor were restored
+        assert_eq!(session.viewport(), Some([0, 0, 800, 600]));
+        assert_eq!(session.scissor(), Some([0, 0, 400, 600]));
+        assert!(session.scissor_test_enabled());
+
+        // Update scissor to right half for resumed draw
+        session.set_scissor(400, 0, 400, 600);
+        let resumed_draw_id = session.record_direct_draw(1, 0, 3, None).expect("record resumed draw");
+
+        // End outer resumed pass so it is committed to pass_graph before compilation
+        session.end_render_pass().expect("commit outer resumed pass");
+
+        // 4. Verify pass graph compilation preserves distinct viewport/scissor on each draw
+        let plan = session.pass_graph.compile(Some(&tracker)).expect("compile plan");
+        assert_eq!(plan.segment_count(), 3);
+
+        // Segment 0: outer prefix draw
+        let seg0_draws = plan.segments()[0].draws();
+        assert_eq!(seg0_draws.len(), 1);
+        assert_eq!(seg0_draws[0].draw_id, outer_draw_id);
+        assert_eq!(seg0_draws[0].viewport(), Some([0, 0, 800, 600]));
+        assert_eq!(seg0_draws[0].scissor(), Some([0, 0, 400, 600]));
+        assert!(seg0_draws[0].scissor_test_enabled());
+
+        // Segment 1: nested offscreen draw
+        let seg1_draws = plan.segments()[1].draws();
+        assert_eq!(seg1_draws.len(), 1);
+        assert_eq!(seg1_draws[0].draw_id, nested_draw_id);
+        assert_eq!(seg1_draws[0].viewport(), Some([0, 0, 256, 256]));
+        assert_eq!(seg1_draws[0].scissor(), Some([32, 32, 128, 128]));
+        assert!(seg1_draws[0].scissor_test_enabled());
+
+        // Segment 2: resumed outer draw
+        let seg2_draws = plan.segments()[2].draws();
+        assert_eq!(seg2_draws.len(), 1);
+        assert_eq!(seg2_draws[0].draw_id, resumed_draw_id);
+        assert_eq!(seg2_draws[0].viewport(), Some([0, 0, 800, 600]));
+        assert_eq!(seg2_draws[0].scissor(), Some([400, 0, 400, 600]));
+        assert!(seg2_draws[0].scissor_test_enabled());
+    }
+
+    #[test]
+    fn test_nested_render_viewport_scissor_snapshot_not_overwritten_by_subsequent_mutation() {
+        let root_ctx = RenderContext::new_canvas(ResourceId::new(1), 800, 600, Epoch::ZERO)
+            .with_viewport(0, 0, 800, 600)
+            .with_scissor(10, 20, 100, 200)
+            .with_scissor_test(true);
+        let mut session = FrameSession::new(root_ctx, 256).expect("session init");
+
+        session.begin_render_pass("main", [0.0, 0.0, 0.0, 1.0]).expect("begin pass");
+        let draw_a_id = session.record_direct_draw(1, 0, 3, None).expect("draw A");
+
+        // Mutate context AFTER recording draw A
+        session.set_viewport(999, 999, 50, 50);
+        session.set_scissor(888, 888, 40, 40);
+        session.set_scissor_test(false);
+
+        let draw_b_id = session.record_direct_draw(2, 0, 6, None).expect("draw B");
+
+        // Mutate context again AFTER recording draw B
+        session.set_viewport(111, 222, 333, 444);
+        session.set_scissor(555, 666, 777, 888);
+        session.set_scissor_test(true);
+
+        session.end_render_pass().expect("end pass");
+
+        let plan = session.pass_graph.compile(None).expect("compile plan");
+        let draws = plan.segments()[0].draws();
+        assert_eq!(draws.len(), 2);
+
+        // Draw A must have preserved its snapshot from when it was recorded
+        assert_eq!(draws[0].draw_id, draw_a_id);
+        assert_eq!(draws[0].viewport(), Some([0, 0, 800, 600]));
+        assert_eq!(draws[0].scissor(), Some([10, 20, 100, 200]));
+        assert!(draws[0].scissor_test_enabled());
+
+        // Draw B must have preserved its snapshot from when it was recorded
+        assert_eq!(draws[1].draw_id, draw_b_id);
+        assert_eq!(draws[1].viewport(), Some([999, 999, 50, 50]));
+        // Scissor disabled after enable provides full-attachment scissor to clear clipping
+        assert_eq!(draws[1].scissor(), Some([0, 0, 800, 600]));
+        assert!(!draws[1].scissor_test_enabled());
+    }
+
+    #[test]
+    fn test_viewport_near_neighbor_default_full_vs_explicit_zero_size() {
+        let root_ctx = RenderContext::new_canvas(ResourceId::new(1), 800, 600, Epoch::ZERO);
+        let mut session = FrameSession::new(root_ctx, 256).expect("session init");
+
+        session.begin_render_pass("viewport_pass", [0.0, 0.0, 0.0, 1.0]).expect("begin");
+
+        // Draw 0: default unspecified viewport (None)
+        let id0 = session.record_direct_draw(1, 0, 3, None).expect("draw 0");
+        assert_eq!(session.viewport(), None);
+
+        // Draw 1: explicit zero-size viewport (Some([0, 0, 0, 0])) - near-neighbor case
+        session.set_viewport(0, 0, 0, 0);
+        let id1 = session.record_direct_draw(1, 0, 3, None).expect("draw 1");
+        assert_eq!(session.viewport(), Some([0, 0, 0, 0]));
+
+        // Draw 2: explicit non-zero viewport (Some([0, 0, 800, 600]))
+        session.set_viewport(0, 0, 800, 600);
+        let id2 = session.record_direct_draw(1, 0, 3, None).expect("draw 2");
+        assert_eq!(session.viewport(), Some([0, 0, 800, 600]));
+
+        // Draw 3: reset to default viewport (None on session CPU metadata, explicit full target on emitted draw to clear prior narrow GPU state)
+        session.reset_viewport();
+        let id3 = session.record_direct_draw(1, 0, 3, None).expect("draw 3");
+        assert_eq!(session.viewport(), None);
+
+        session.end_render_pass().expect("end");
+
+        let plan = session.pass_graph.compile(None).expect("compile");
+        let draws = plan.segments()[0].draws();
+        assert_eq!(draws.len(), 4);
+
+        assert_eq!(draws[0].draw_id, id0);
+        assert_eq!(draws[0].viewport(), None);
+
+        assert_eq!(draws[1].draw_id, id1);
+        assert_eq!(draws[1].viewport(), Some([0, 0, 0, 0]));
+        assert_ne!(draws[0].viewport(), draws[1].viewport());
+
+        assert_eq!(draws[2].draw_id, id2);
+        assert_eq!(draws[2].viewport(), Some([0, 0, 800, 600]));
+
+        assert_eq!(draws[3].draw_id, id3);
+        assert_eq!(draws[3].viewport(), Some([0, 0, 800, 600]));
+        assert_ne!(draws[1].viewport(), draws[3].viewport());
+    }
+
+    #[test]
+    fn test_scissor_disable_after_enable_restores_full_attachment_scissor() {
+        let root_ctx = RenderContext::new_canvas(ResourceId::new(1), 1024, 768, Epoch::ZERO);
+        let mut session = FrameSession::new(root_ctx, 256).expect("session init");
+
+        session.begin_render_pass("scissor_pass", [0.0, 0.0, 0.0, 1.0]).expect("begin");
+
+        // Draw 0: scissor never enabled in pass -> None
+        let id0 = session.record_direct_draw(1, 0, 3, None).expect("draw 0");
+        assert_eq!(session.scissor(), None);
+        assert!(!session.scissor_test_enabled());
+
+        // Draw 1: scissor enabled with clipping box
+        session.set_scissor(50, 60, 200, 300);
+        session.set_scissor_test(true);
+        let id1 = session.record_direct_draw(1, 0, 3, None).expect("draw 1");
+        assert_eq!(session.scissor(), Some([50, 60, 200, 300]));
+        assert!(session.scissor_test_enabled());
+
+        // Draw 2: scissor disabled after enable -> emits full attachment [0, 0, 1024, 768]
+        session.set_scissor_test(false);
+        let id2 = session.record_direct_draw(1, 0, 3, None).expect("draw 2");
+        assert!(!session.scissor_test_enabled());
+
+        session.end_render_pass().expect("end");
+
+        let plan = session.pass_graph.compile(None).expect("compile");
+        let draws = plan.segments()[0].draws();
+        assert_eq!(draws.len(), 3);
+
+        // Draw 0: never enabled
+        assert_eq!(draws[0].draw_id, id0);
+        assert_eq!(draws[0].scissor(), None);
+        assert!(!draws[0].scissor_test_enabled());
+
+        // Draw 1: actively clipped
+        assert_eq!(draws[1].draw_id, id1);
+        assert_eq!(draws[1].scissor(), Some([50, 60, 200, 300]));
+        assert!(draws[1].scissor_test_enabled());
+
+        // Draw 2: disabled, carries full-attachment restore rect to clear clipping
+        assert_eq!(draws[2].draw_id, id2);
+        assert_eq!(draws[2].scissor(), Some([0, 0, 1024, 768]));
+        assert!(!draws[2].scissor_test_enabled());
+        assert_ne!(draws[0].scissor(), draws[2].scissor());
+    }
+
+    #[test]
+    fn test_scissor_narrow_then_reset_while_enabled_then_disabled_after_reset() {
+        let root_ctx = RenderContext::new_canvas(ResourceId::new(1), 1024, 768, Epoch::ZERO);
+        let mut session = FrameSession::new(root_ctx, 256).expect("session init");
+
+        session.begin_render_pass("scissor_leak_pass", [0.0, 0.0, 0.0, 1.0]).expect("begin");
+
+        // 1. Draw 0: set narrow scissor, enable scissor test, draw
+        session.set_scissor(50, 60, 200, 300);
+        session.set_scissor_test(true);
+        let id0 = session.record_direct_draw(1, 0, 3, None).expect("draw 0");
+        assert_eq!(session.scissor(), Some([50, 60, 200, 300]));
+        assert!(session.scissor_test_enabled());
+
+        // 2. Draw 1: reset scissor while enabled -> must resolve to full-attachment rectangle to clear narrow clipping
+        session.reset_scissor();
+        assert_eq!(session.scissor(), None); // CPU metadata reflects reset
+        assert!(session.scissor_test_enabled()); // scissor test remains enabled
+        let id1 = session.record_direct_draw(1, 0, 3, None).expect("draw 1");
+
+        // 3. Draw 2: disable scissor test after reset -> must also carry full-attachment restore rect so lower_plan clears clipping
+        session.set_scissor_test(false);
+        assert!(!session.scissor_test_enabled());
+        let id2 = session.record_direct_draw(1, 0, 3, None).expect("draw 2");
+
+        // 4. Draw 3: subsequent draw while disabled -> lower_plan dedups and emits no scissor commands
+        let id3 = session.record_direct_draw(1, 0, 3, None).expect("draw 3");
+
+        session.end_render_pass().expect("end");
+
+        // Verify Draw descriptors in compiled plan
+        let plan = session.pass_graph.compile(None).expect("compile plan");
+        let draws = plan.segments()[0].draws();
+        assert_eq!(draws.len(), 4);
+
+        assert_eq!(draws[0].draw_id, id0);
+        assert_eq!(draws[0].scissor(), Some([50, 60, 200, 300]));
+        assert!(draws[0].scissor_test_enabled());
+
+        assert_eq!(draws[1].draw_id, id1);
+        assert_eq!(draws[1].scissor(), Some([0, 0, 1024, 768]));
+        assert!(draws[1].scissor_test_enabled());
+
+        assert_eq!(draws[2].draw_id, id2);
+        assert_eq!(draws[2].scissor(), Some([0, 0, 1024, 768]));
+        assert!(!draws[2].scissor_test_enabled());
+
+        assert_eq!(draws[3].draw_id, id3);
+        assert_eq!(draws[3].scissor(), Some([0, 0, 1024, 768]));
+        assert!(!draws[3].scissor_test_enabled());
+
+        // Verify lowered commands emitted by lower_plan
+        let commands = lower_plan(&plan).expect("lower plan");
+        let scissor_commands: Vec<&GpuCommand> = commands
+            .iter()
+            .filter(|cmd| matches!(cmd, GpuCommand::SetScissorRect { .. }))
+            .collect();
+
+        // Must emit SetScissorRect for narrow box, then SetScissorRect for full attachment box,
+        // then SetScissorRect on disable, and no further redundant scissor commands once disabled (deduped).
+        assert_eq!(scissor_commands.len(), 3);
+        match scissor_commands[0] {
+            GpuCommand::SetScissorRect { x, y, width, height } => {
+                assert_eq!(*x, 50);
+                assert_eq!(*y, 60);
+                assert_eq!(*width, 200);
+                assert_eq!(*height, 300);
+            }
+            other => panic!("expected narrow SetScissorRect, got {other:?}"),
+        }
+        match scissor_commands[1] {
+            GpuCommand::SetScissorRect { x, y, width, height } => {
+                assert_eq!(*x, 0);
+                assert_eq!(*y, 0);
+                assert_eq!(*width, 1024);
+                assert_eq!(*height, 768);
+            }
+            other => panic!("expected full SetScissorRect on reset, got {other:?}"),
+        }
+        match scissor_commands[2] {
+            GpuCommand::SetScissorRect { x, y, width, height } => {
+                assert_eq!(*x, 0);
+                assert_eq!(*y, 0);
+                assert_eq!(*width, 1024);
+                assert_eq!(*height, 768);
+            }
+            other => panic!("expected full SetScissorRect on disable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_record_direct_draw_with_range_and_opcode11_lowering() {
+        let root_ctx = RenderContext::new_canvas(ResourceId::new(1), 800, 600, Epoch::ZERO);
+        let mut session = FrameSession::new(root_ctx, 256).expect("session init");
+
+        session
+            .begin_render_pass("range_pass", [0.0, 0.0, 0.0, 1.0])
+            .expect("begin pass");
+
+        // 1. Draw 0: standard record_direct_draw (delegates to [count, 1, 0, 0])
+        let id0 = session
+            .record_direct_draw(100, 2, 3, None)
+            .expect("record direct draw default");
+
+        // 2. Draw 1: record_direct_draw_with_range with nonzero starts and two instances [3, 2, 3, 5]
+        let id1 = session
+            .record_direct_draw_with_range(100, 2, [3, 2, 3, 5], None)
+            .expect("record direct draw with range");
+
+        // 3. Draw 2: record_direct_draw_with_range with zero instances [4, 0, 0, 0] (negative zero retained)
+        let id2 = session
+            .record_direct_draw_with_range(100, 2, [4, 0, 0, 0], None)
+            .expect("record direct draw zero instances");
+
+        session.end_render_pass().expect("end pass");
+
+        // Assert compiled Graph Draw records
+        let plan = session.pass_graph.compile(None).expect("compile plan");
+        let draws = plan.segments()[0].draws();
+        assert_eq!(draws.len(), 3);
+
+        // Draw 0: default shape (vertex_count: 3, instance_count: 1, first_vertex: 0, first_instance: 0)
+        assert_eq!(draws[0].draw_id, id0);
+        assert_eq!(draws[0].vertex_count, 3);
+        assert_eq!(draws[0].instance_count(), 1);
+        assert_eq!(draws[0].first_vertex(), 0);
+        assert_eq!(draws[0].first_instance(), 0);
+
+        // Draw 1: positive parameters preserved in Graph
+        assert_eq!(draws[1].draw_id, id1);
+        assert_eq!(draws[1].vertex_count, 3);
+        assert_eq!(draws[1].instance_count(), 2);
+        assert_eq!(draws[1].first_vertex(), 3);
+        assert_eq!(draws[1].first_instance(), 5);
+
+        // Draw 2: zero instance retained in Graph
+        assert_eq!(draws[2].draw_id, id2);
+        assert_eq!(draws[2].vertex_count, 4);
+        assert_eq!(draws[2].instance_count(), 0);
+        assert_eq!(draws[2].first_vertex(), 0);
+        assert_eq!(draws[2].first_instance(), 0);
+
+        // Assert lowered GpuCommands through lower_plan
+        let commands = lower_plan(&plan).expect("lower plan");
+
+        // Draw 0: default range [3, 1, 0, 0] does not emit SetDrawParameters (first draw directly opens pass)
+        // Draw 1: non-default range [3, 2, 3, 5] emits SetDrawParameters (opcode 11) followed by RenderPass draw
+        // Draw 2: zero instance [4, 0, 0, 0] emits SetDrawParameters (opcode 11) followed by RenderPass draw
+        let draw_param_cmds: Vec<&GpuCommand> = commands
+            .iter()
+            .filter(|cmd| matches!(cmd, GpuCommand::SetDrawParameters { .. }))
+            .collect();
+        assert_eq!(draw_param_cmds.len(), 2);
+
+        // First SetDrawParameters is for Draw 1
+        match draw_param_cmds[0] {
+            GpuCommand::SetDrawParameters {
+                instance_count,
+                first_vertex,
+                first_instance,
+            } => {
+                assert_eq!(*instance_count, 2);
+                assert_eq!(*first_vertex, 3);
+                assert_eq!(*first_instance, 5);
+            }
+            other => panic!("expected SetDrawParameters for draw 1, got {other:?}"),
+        }
+
+        // Second SetDrawParameters is for Draw 2 (zero instance preserved)
+        match draw_param_cmds[1] {
+            GpuCommand::SetDrawParameters {
+                instance_count,
+                first_vertex,
+                first_instance,
+            } => {
+                assert_eq!(*instance_count, 0);
+                assert_eq!(*first_vertex, 0);
+                assert_eq!(*first_instance, 0);
+            }
+            other => panic!("expected SetDrawParameters for draw 2, got {other:?}"),
+        }
+
+        // Verify full command sequence order:
+        // 0: RenderPass (opener for Draw 0, vertex_count: 3, PASS_FLAG_NEW_PASS)
+        // 1: SetDrawParameters (for Draw 1: [2, 3, 5])
+        // 2: RenderPass (Draw 1, vertex_count: 3, PASS_FLAG_NONE)
+        // 3: SetDrawParameters (for Draw 2: [0, 0, 0])
+        // 4: RenderPass (Draw 2, vertex_count: 4, PASS_FLAG_NONE)
+        assert_eq!(commands.len(), 5);
+        assert!(matches!(
+            commands[0],
+            GpuCommand::RenderPass {
+                vertex_count: 3,
+                pass_flags: PASS_FLAG_NEW_PASS,
+                ..
+            }
+        ));
+        assert!(matches!(
+            commands[1],
+            GpuCommand::SetDrawParameters {
+                instance_count: 2,
+                first_vertex: 3,
+                first_instance: 5,
+            }
+        ));
+        assert!(matches!(
+            commands[2],
+            GpuCommand::RenderPass {
+                vertex_count: 3,
+                pass_flags: PASS_FLAG_NONE,
+                ..
+            }
+        ));
+        assert!(matches!(
+            commands[3],
+            GpuCommand::SetDrawParameters {
+                instance_count: 0,
+                first_vertex: 0,
+                first_instance: 0,
+            }
+        ));
+        assert!(matches!(
+            commands[4],
+            GpuCommand::RenderPass {
+                vertex_count: 4,
+                pass_flags: PASS_FLAG_NONE,
+                ..
+            }
+        ));
     }
 }

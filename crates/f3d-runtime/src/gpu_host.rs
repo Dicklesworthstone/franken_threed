@@ -353,6 +353,13 @@ pub const OPCODE_CREATE_TEXTURE: u16 = 6;
 pub const OPCODE_RECORD_BUNDLE: u16 = 7;
 /// Opcode for executing pre-recorded render bundles within a render pass.
 pub const OPCODE_EXECUTE_BUNDLES: u16 = 8;
+/// Opcode for configuring the active viewport within an open render pass (`renderPassEncoder.setViewport`).
+pub const OPCODE_SET_VIEWPORT: u16 = 9;
+/// Opcode for configuring the active scissor rectangle within an open render pass (`renderPassEncoder.setScissorRect`).
+pub const OPCODE_SET_SCISSOR_RECT: u16 = 10;
+/// Opcode for configuring draw call parameters (instance count, first vertex, first instance)
+/// immediately preceding a direct render pass draw (`renderPassEncoder.draw`).
+pub const OPCODE_SET_DRAW_PARAMETERS: u16 = 11;
 
 /// GPUBufferUsage flag: map for CPU reading.
 pub const BUFFER_USAGE_MAP_READ: u32 = 1;
@@ -561,6 +568,42 @@ pub enum GpuCommand {
     ExecuteBundles {
         /// List of bundle identifiers to execute in sequence.
         bundle_ids: Vec<u32>,
+    },
+    /// Command to set the active viewport within an open render pass.
+    SetViewport {
+        /// X coordinate of the top-left corner of the viewport in pixels.
+        x: f32,
+        /// Y coordinate of the top-left corner of the viewport in pixels.
+        y: f32,
+        /// Width of the viewport in pixels.
+        width: f32,
+        /// Height of the viewport in pixels.
+        height: f32,
+        /// Minimum depth value in normalized coordinates [0.0, 1.0].
+        min_depth: f32,
+        /// Maximum depth value in normalized coordinates [0.0, 1.0].
+        max_depth: f32,
+    },
+    /// Command to set the active scissor rectangle within an open render pass.
+    SetScissorRect {
+        /// X coordinate of the top-left corner of the scissor rectangle in pixels.
+        x: u32,
+        /// Y coordinate of the top-left corner of the scissor rectangle in pixels.
+        y: u32,
+        /// Width of the scissor rectangle in pixels.
+        width: u32,
+        /// Height of the scissor rectangle in pixels.
+        height: u32,
+    },
+    /// Command to configure draw parameters (instance count, first vertex, first instance)
+    /// for the immediately following direct render pass draw.
+    SetDrawParameters {
+        /// Number of instances to draw.
+        instance_count: u32,
+        /// Index of the first vertex to draw.
+        first_vertex: u32,
+        /// Index of the first instance to draw.
+        first_instance: u32,
     },
 }
 
@@ -785,6 +828,44 @@ impl GpuSubmissionPacket {
                         command_records.extend_from_slice(&id.to_le_bytes());
                     }
                 }
+                GpuCommand::SetViewport {
+                    x,
+                    y,
+                    width,
+                    height,
+                    min_depth,
+                    max_depth,
+                } => {
+                    command_records.extend_from_slice(&OPCODE_SET_VIEWPORT.to_le_bytes());
+                    command_records.extend_from_slice(&x.to_le_bytes());
+                    command_records.extend_from_slice(&y.to_le_bytes());
+                    command_records.extend_from_slice(&width.to_le_bytes());
+                    command_records.extend_from_slice(&height.to_le_bytes());
+                    command_records.extend_from_slice(&min_depth.to_le_bytes());
+                    command_records.extend_from_slice(&max_depth.to_le_bytes());
+                }
+                GpuCommand::SetScissorRect {
+                    x,
+                    y,
+                    width,
+                    height,
+                } => {
+                    command_records.extend_from_slice(&OPCODE_SET_SCISSOR_RECT.to_le_bytes());
+                    command_records.extend_from_slice(&x.to_le_bytes());
+                    command_records.extend_from_slice(&y.to_le_bytes());
+                    command_records.extend_from_slice(&width.to_le_bytes());
+                    command_records.extend_from_slice(&height.to_le_bytes());
+                }
+                GpuCommand::SetDrawParameters {
+                    instance_count,
+                    first_vertex,
+                    first_instance,
+                } => {
+                    command_records.extend_from_slice(&OPCODE_SET_DRAW_PARAMETERS.to_le_bytes());
+                    command_records.extend_from_slice(&instance_count.to_le_bytes());
+                    command_records.extend_from_slice(&first_vertex.to_le_bytes());
+                    command_records.extend_from_slice(&first_instance.to_le_bytes());
+                }
             }
         }
 
@@ -981,6 +1062,8 @@ pub fn lower_plan(plan: &ExecutionPlan) -> Result<Vec<GpuCommand>, PlanLoweringE
                 }
 
                 let mut is_first_command_in_segment = true;
+                let mut current_viewport: Option<[u32; 4]> = None;
+                let mut current_scissor: Option<[u32; 4]> = None;
 
                 // When the first draw in a render pass is a bundle draw, emit an initial
                 // GpuCommand::RenderPass with vertex_count: 0 to open the render pass on the target
@@ -1004,6 +1087,85 @@ pub fn lower_plan(plan: &ExecutionPlan) -> Result<Vec<GpuCommand>, PlanLoweringE
                 }
 
                 for draw in segment.draws() {
+                    let needs_viewport_update = match draw.viewport() {
+                        Some(vp) => current_viewport != Some(vp),
+                        None => false,
+                    };
+
+                    let (needs_scissor_update, target_scissor, next_current_scissor) =
+                        if draw.scissor_test_enabled() {
+                            if let Some(sc) = draw.scissor() {
+                                if current_scissor != Some(sc) {
+                                    (true, Some(sc), Some(sc))
+                                } else {
+                                    (false, None, current_scissor)
+                                }
+                            } else {
+                                (false, None, current_scissor)
+                            }
+                        } else if current_scissor.is_some() {
+                            // Scissor test was disabled after being enabled in this pass.
+                            // Emit full-attachment scissor to clear clipping (WebGPU has no disableScissor).
+                            if let Some(full) = draw.scissor() {
+                                (true, Some(full), None)
+                            } else {
+                                (false, None, current_scissor)
+                            }
+                        } else {
+                            (false, None, current_scissor)
+                        };
+
+                    let needs_draw_parameters = matches!(draw.kind(), DrawKind::Direct)
+                        && (draw.instance_count() != 1
+                            || draw.first_vertex() != 0
+                            || draw.first_instance() != 0);
+
+                    // If a viewport, scissor, or draw parameters command must precede this draw,
+                    // ensure the render pass is open first (WebGPU requires an active render pass encoder
+                    // before setViewport/setScissorRect/draw commands).
+                    if (needs_viewport_update || needs_scissor_update || needs_draw_parameters)
+                        && is_first_command_in_segment
+                    {
+                        commands.push(GpuCommand::RenderPass {
+                            target_type,
+                            target_id,
+                            clear_color,
+                            pipeline_id: 0,
+                            vertex_buffer_id: 0,
+                            vertex_count: 0,
+                            uniform_dynamic_offset: 0,
+                            uniform_buffer_id: 0,
+                            load_op,
+                            store_op,
+                            pass_flags: PASS_FLAG_NEW_PASS,
+                        });
+                        is_first_command_in_segment = false;
+                    }
+
+                    if needs_viewport_update {
+                        let vp = draw.viewport().unwrap();
+                        commands.push(GpuCommand::SetViewport {
+                            x: vp[0] as f32,
+                            y: vp[1] as f32,
+                            width: vp[2] as f32,
+                            height: vp[3] as f32,
+                            min_depth: 0.0,
+                            max_depth: 1.0,
+                        });
+                        current_viewport = Some(vp);
+                    }
+
+                    if needs_scissor_update {
+                        let sc = target_scissor.unwrap();
+                        commands.push(GpuCommand::SetScissorRect {
+                            x: sc[0],
+                            y: sc[1],
+                            width: sc[2],
+                            height: sc[3],
+                        });
+                        current_scissor = next_current_scissor;
+                    }
+
                     match draw.kind() {
                         DrawKind::Bundle { bundle_id } => {
                             commands.push(GpuCommand::ExecuteBundles {
@@ -1011,6 +1173,14 @@ pub fn lower_plan(plan: &ExecutionPlan) -> Result<Vec<GpuCommand>, PlanLoweringE
                             });
                         }
                         DrawKind::Direct => {
+                            if needs_draw_parameters {
+                                commands.push(GpuCommand::SetDrawParameters {
+                                    instance_count: draw.instance_count(),
+                                    first_vertex: draw.first_vertex(),
+                                    first_instance: draw.first_instance(),
+                                });
+                            }
+
                             let uniform_buffer_id = draw
                                 .uses()
                                 .iter()
@@ -2030,9 +2200,9 @@ fn fs_main() -> @location(0) vec4<f32> {\n\
 /// 2. Nested inner pass on Offscreen Target 11: Clear to Black and Green draw (`tri1`, dynamic offset 512).
 /// 3. Outer resumed pass on Canvas Target 10: Resume with `LoadOp::Load` and Blue draw on right half (`tri2`, dynamic offset 256).
 ///
-/// Since the `gpu_bridge` fixture does not provide a canvas readback seam (`canvasContext` lacks `COPY_SRC`
-/// and the bridge maps textures from `this.textures`), this packet emits an offscreen readback of Target 11
-/// to Readback Buffer 20 only. Canvas presentation pixels are presented directly to the browser swapchain.
+/// This packet copies Offscreen Target 11 to Readback Buffer 20. The browser
+/// counterexample suite separately copies the actual canvas texture with `COPY_SRC`
+/// before yielding, checking the outer red/blue pixels as well as the inner target.
 ///
 /// ### Resource Registration & Generational Slot Table (§6.5, vqa.6)
 /// Registers resource IDs in the global generational slot table at generation 1:
@@ -2040,15 +2210,15 @@ fn fs_main() -> @location(0) vec4<f32> {\n\
 /// - Textures: 10 (canvas presentation surface), 11 (offscreen nested render target)
 /// - Pipelines: 200 (offscreen pipeline), 201 (canvas presentation pipeline)
 ///
-/// ### Submission Boundary (per Cobalt 7117)
+/// ### Submission and Canvas Interval Boundaries
 /// Packet construction (`build_nested_canvas_pass_submission` and its binary export
 /// `gpu_bridge_build_nested_canvas_pass_packet`) performs schedule synthesis and command
 /// encoding only. It registers resource handles and prepares the binary command buffer,
-/// but **does not submit the frame or mark the canvas interval as submitted**.
+/// but does not submit work or end the canvas interval.
 ///
-/// Actual submission is left strictly to the bridge caller (or host runtime) invoking
-/// `submit_canvas_frame` / `device.queue.submit()` so that active swapchain presentation
-/// intervals are not prematurely finalized during encoding.
+/// The bridge caller submits work with `device.queue.submit()`. Multiple submissions
+/// may use the same live canvas texture; `FrameSession::end_canvas_interval` belongs
+/// at actual host texture expiry, not at each queue submission.
 pub fn build_nested_canvas_pass_submission() -> GpuSubmissionPacket {
     // Register resource IDs in the generational slot table (§6.5, §8.5, vqa.6, 2v8.4)
     with_global_resource_table(|table| {
@@ -2276,6 +2446,428 @@ fn fs_main() -> @location(0) vec4<f32> {\n\
     packet
 }
 
+/// Constructs a 25-command nested-pass reentrant submission packet exercising real viewport and scissor commands (§6.7, §8.5, 2v8.4).
+///
+/// Executes three logical passes through [`FrameSession::with_nested_render`] lowered via [`lower_plan`]:
+/// 1. Outer prefix pass on Target 10: Clear to Black, Viewport [0, 0, 64, 64], Scissor [0, 0, 32, 64] (left half),
+///    and Red draw (`tri1`, dynamic offset 0).
+/// 2. Nested inner pass on Target 11: Clear to Black, Viewport [16, 16, 32, 32], Scissor [16, 16, 32, 32] (centered sub-rect),
+///    and Green draw (`tri1`, dynamic offset 512).
+/// 3. Outer resumed pass on Target 10: Resume with `LoadOp::Load`, restored Viewport [0, 0, 64, 64], restored Scissor [32, 0, 32, 64] (right half),
+///    and Blue draw (`tri2`, dynamic offset 256).
+///
+/// Copies Target 10 to Readback Buffer 20 and Target 11 to Readback Buffer 21.
+///
+/// ### Distinct Geometric and Sample Points:
+/// - Target 10:
+///   - (24, 32): Inside `tri1` and inside Pass 1 scissor [0, 0, 32, 64] -> Red `[255, 0, 0, 255]`.
+///   - (56, 32): Inside `tri2` and inside Pass 3 scissor [32, 0, 32, 64] -> Blue `[0, 0, 255, 255]`.
+///   - (2, 2): Untouched background outside `tri1`/`tri2` -> Black `[0, 0, 0, 255]`.
+/// - Target 11:
+///   - (24, 32): Inside `tri1` and inside centered scissor [16, 16, 32, 32] -> Green `[0, 255, 0, 255]`.
+///   - (8, 8): Outside centered scissor [16, 16, 32, 32] -> Black `[0, 0, 0, 255]`.
+///   - (56, 32): Outside centered scissor [16, 16, 32, 32] -> Black `[0, 0, 0, 255]`.
+///
+/// If scissor clipping were omitted or restored incorrectly (e.g. Pass 1 scissor leaking into Pass 3),
+/// the right half would be clipped out and (56, 32) would remain Black.
+///
+/// Registers resource IDs in the global generational slot table at generation 1 (§6.5, vqa.6):
+/// - Buffers: 1 (uniform), 2 (tri1), 3 (tri2), 20 (readback target 10), 21 (readback target 11)
+/// - Textures: 10 (target 10), 11 (target 11)
+/// - Pipeline: 200 (flat color pipeline)
+pub fn build_nested_viewport_scissor_submission() -> GpuSubmissionPacket {
+    with_global_resource_table(|table| {
+        table.register(1);   // uniform_buffer_id
+        table.register(2);   // vb1_id (tri1)
+        table.register(3);   // vb2_id (tri2)
+        table.register(10);  // target_10
+        table.register(11);  // target_11
+        table.register(20);  // readback_buffer_10_id
+        table.register(21);  // readback_buffer_11_id
+        table.register(200); // pipeline_id
+    });
+
+    let mut packet = GpuSubmissionPacket::new();
+
+    let uniform_buffer_id = 1;
+    let vb1_id = 2;
+    let vb2_id = 3;
+    let target_10 = 10;
+    let target_11 = 11;
+    let readback_buffer_10_id = 20;
+    let readback_buffer_11_id = 21;
+    let pipeline_id = 200;
+
+    // 1. Vertex buffer 1: Triangle 1 (left side, covers x in [-1, 0], samples at (24, 32))
+    let tri1 = [
+        VertexPosUv::new([-1.0, -1.0, 0.0], [0.0, 0.0]),
+        VertexPosUv::new([0.0, -1.0, 0.0], [0.5, 0.0]),
+        VertexPosUv::new([0.0, 1.0, 0.0], [0.5, 1.0]),
+    ];
+    let mut tri1_bytes = Vec::with_capacity(tri1.len() * VertexPosUv::BYTE_SIZE);
+    for v in &tri1 {
+        tri1_bytes.extend_from_slice(&v.to_bytes());
+    }
+
+    // 2. Vertex buffer 2: Triangle 2 (right side, covers x in [0, 1], samples at (56, 32))
+    let tri2 = [
+        VertexPosUv::new([0.0, -1.0, 0.0], [0.5, 0.0]),
+        VertexPosUv::new([1.0, -1.0, 0.0], [1.0, 0.0]),
+        VertexPosUv::new([1.0, 1.0, 0.0], [1.0, 1.0]),
+    ];
+    let mut tri2_bytes = Vec::with_capacity(tri2.len() * VertexPosUv::BYTE_SIZE);
+    for v in &tri2 {
+        tri2_bytes.extend_from_slice(&v.to_bytes());
+    }
+
+    // 3. Resource creations (matching oracle device allocations): 10 commands (indices 0..9)
+    // Command 0: Uniform buffer 1 (768 bytes: 3 * 256B dynamic slots)
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: uniform_buffer_id,
+        size: 768,
+        usage: BUFFER_USAGE_UNIFORM | BUFFER_USAGE_COPY_DST,
+    });
+
+    // Commands 1 & 2: Vertex buffer 1
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: vb1_id,
+        size: tri1_bytes.len() as u32,
+        usage: BUFFER_USAGE_VERTEX | BUFFER_USAGE_COPY_DST,
+    });
+    packet.push(GpuCommand::WriteBuffer {
+        buffer_id: vb1_id,
+        offset: 0,
+        data: tri1_bytes,
+    });
+
+    // Commands 3 & 4: Vertex buffer 2
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: vb2_id,
+        size: tri2_bytes.len() as u32,
+        usage: BUFFER_USAGE_VERTEX | BUFFER_USAGE_COPY_DST,
+    });
+    packet.push(GpuCommand::WriteBuffer {
+        buffer_id: vb2_id,
+        offset: 0,
+        data: tri2_bytes,
+    });
+
+    // Command 5: Target Texture 10
+    packet.push(GpuCommand::CreateTexture {
+        texture_id: target_10,
+        width: 64,
+        height: 64,
+        format: TARGET_FORMAT_RGBA8UNORM,
+        usage: TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC,
+    });
+
+    // Command 6: Target Texture 11
+    packet.push(GpuCommand::CreateTexture {
+        texture_id: target_11,
+        width: 64,
+        height: 64,
+        format: TARGET_FORMAT_RGBA8UNORM,
+        usage: TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC,
+    });
+
+    // Command 7: Readback buffer 20 (for Target 10)
+    let bytes_per_row = 256u32;
+    let readback_size = bytes_per_row * 64;
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: readback_buffer_10_id,
+        size: readback_size,
+        usage: BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST,
+    });
+
+    // Command 8: Readback buffer 21 (for Target 11)
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: readback_buffer_11_id,
+        size: readback_size,
+        usage: BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST,
+    });
+
+    let flat_shader = "\
+struct ColorUniform {\n\
+    color: vec4<f32>,\n\
+};\n\
+@group(0) @binding(0)\n\
+var<uniform> u: ColorUniform;\n\
+\n\
+struct VertexInput {\n\
+    @location(0) position: vec3<f32>,\n\
+    @location(1) uv: vec2<f32>,\n\
+};\n\
+\n\
+@vertex\n\
+fn vs_main(in: VertexInput) -> @builtin(position) vec4<f32> {\n\
+    return vec4<f32>(in.position, 1.0);\n\
+}\n\
+\n\
+@fragment\n\
+fn fs_main() -> @location(0) vec4<f32> {\n\
+    return u.color;\n\
+}\n";
+
+    // Command 9: Pipeline 200
+    packet.push(GpuCommand::CreatePipeline {
+        pipeline_id,
+        wgsl_code: flat_shader.to_string(),
+        target_format: TARGET_FORMAT_RGBA8UNORM,
+        has_vertex_buffer: true,
+        has_uniform_buffer: true,
+        uniform_size: COLOR_UNIFORM_BYTES as u32,
+        vertex_stride: VERTEX_POS_UV_STRIDE as u32,
+    });
+
+    // 4. Build pass structure through FrameSession with with_nested_render (§6.7, §8.5)
+    let root_ctx = RenderContext::new_offscreen(
+        ResourceId::new(target_10),
+        64,
+        64,
+        Epoch::ZERO,
+    );
+    let mut session = FrameSession::new(root_ctx, 256)
+        .expect("session init must succeed")
+        .with_uniform_buffer_id(uniform_buffer_id);
+
+    let mat_handle = Handle::<MaterialDomain>::from_raw(1, 1).expect("valid material handle");
+    let red_bytes = [1.0f32.to_le_bytes(), 0.0f32.to_le_bytes(), 0.0f32.to_le_bytes(), 1.0f32.to_le_bytes()].concat();
+    let blue_bytes = [0.0f32.to_le_bytes(), 0.0f32.to_le_bytes(), 1.0f32.to_le_bytes(), 1.0f32.to_le_bytes()].concat();
+    let green_bytes = [0.0f32.to_le_bytes(), 1.0f32.to_le_bytes(), 0.0f32.to_le_bytes(), 1.0f32.to_le_bytes()].concat();
+
+    // Snapshot order:
+    // Slot 0 (offset 0): Red [1.0, 0.0, 0.0, 1.0] (Pass 1 - Target 10 left triangle)
+    // Slot 1 (offset 256): Blue [0.0, 0.0, 1.0, 1.0] (Pass 3 - Target 10 right triangle)
+    // Slot 2 (offset 512): Green [0.0, 1.0, 0.0, 1.0] (Pass 2 - Target 11 nested pass)
+    let rec_red = session
+        .snapshot_material_use(mat_handle, DataVersion::new(1), Epoch::ZERO, &red_bytes)
+        .expect("red material snapshot");
+    let rec_blue = session
+        .snapshot_material_use(mat_handle, DataVersion::new(2), Epoch::ZERO, &blue_bytes)
+        .expect("blue material snapshot");
+    let rec_green = session
+        .snapshot_material_use(mat_handle, DataVersion::new(3), Epoch::ZERO, &green_bytes)
+        .expect("green material snapshot");
+
+    // Pass 1: Outer prefix on Target 10: Clear to Black, Viewport [0, 0, 64, 64], Scissor [0, 0, 32, 64]
+    session.set_viewport(0, 0, 64, 64);
+    session.set_scissor(0, 0, 32, 64);
+    session.set_scissor_test(true);
+    session.begin_render_pass("outer_prefix", [0.0, 0.0, 0.0, 1.0]).expect("begin outer prefix pass");
+    session.record_direct_draw(pipeline_id, vb1_id, 3, Some(rec_red)).expect("record red draw");
+
+    // Pass 2: Nested inner pass on Target 11: Clear to Black, Viewport [16, 16, 32, 32], Scissor [16, 16, 32, 32]
+    let nested_ctx = RenderContext::new_offscreen(
+        ResourceId::new(target_11),
+        64,
+        64,
+        Epoch::ZERO,
+    );
+    session
+        .with_nested_render(nested_ctx, |s| {
+            s.set_viewport(16, 16, 32, 32);
+            s.set_scissor(16, 16, 32, 32);
+            s.set_scissor_test(true);
+            s.begin_render_pass("nested_pass", [0.0, 0.0, 0.0, 1.0])?;
+            s.record_direct_draw(pipeline_id, vb1_id, 3, Some(rec_green))?;
+            s.end_render_pass()?;
+            Ok(())
+        })
+        .expect("with_nested_render must succeed");
+
+    // Pass 3: Outer resumed on Target 10: Viewport restored to [0, 0, 64, 64], set scissor to right half [32, 0, 32, 64]
+    session.set_scissor(32, 0, 32, 64);
+    session.record_direct_draw(pipeline_id, vb2_id, 3, Some(rec_blue)).expect("record blue draw");
+    session.end_render_pass().expect("end outer resumed pass");
+
+    let session_packet = session
+        .build_submission_packet()
+        .expect("build session packet must succeed");
+
+    for cmd in session_packet.into_commands() {
+        packet.push(cmd);
+    }
+
+    // Command 23: Copy Target 10 to Readback Buffer 20
+    packet.push(GpuCommand::CopyTextureToBuffer {
+        texture_id: target_10,
+        buffer_id: readback_buffer_10_id,
+        width: 64,
+        height: 64,
+        epoch: Epoch::ZERO,
+    });
+
+    // Command 24: Copy Target 11 to Readback Buffer 21
+    packet.push(GpuCommand::CopyTextureToBuffer {
+        texture_id: target_11,
+        buffer_id: readback_buffer_11_id,
+        width: 64,
+        height: 64,
+        epoch: Epoch::ZERO,
+    });
+
+    packet
+}
+
+/// Builds a real WGSL instanced range submission packet testing `instance_count`, `first_vertex`, and `first_instance` (§8.5, 2v8.5).
+///
+/// Registers resource IDs in the generational slot table at generation 1 (§6.5, vqa.6):
+/// - Buffers: 2 (vertex buffer), 20 (readback buffer)
+/// - Texture: 10 (target texture)
+/// - Pipeline: 200 (instanced color pipeline)
+pub fn build_draw_parameters_submission() -> GpuSubmissionPacket {
+    with_global_resource_table(|table| {
+        table.register(2);   // vb2_id
+        table.register(10);  // target_10
+        table.register(20);  // readback_buffer_20_id
+        table.register(200); // pipeline_id
+    });
+
+    let mut packet = GpuSubmissionPacket::new();
+
+    let vb2_id = 2;
+    let target_10 = 10;
+    let readback_buffer_20_id = 20;
+    let pipeline_id = 200;
+
+    // 1. Vertex buffer 2: 6 vertices (stride 20: 12 bytes position + 8 bytes UV)
+    // First 3 vertices: offscreen / degenerate [3.0, 3.0, 0.0]
+    // Next 3 vertices: centered triangle [-0.2, -0.5, 0.0], [0.2, -0.5, 0.0], [0.0, 0.5, 0.0]
+    let vertices = [
+        VertexPosUv::new([3.0, 3.0, 0.0], [0.0, 0.0]),
+        VertexPosUv::new([3.0, 3.0, 0.0], [0.0, 0.0]),
+        VertexPosUv::new([3.0, 3.0, 0.0], [0.0, 0.0]),
+        VertexPosUv::new([-0.2, -0.5, 0.0], [0.0, 0.0]),
+        VertexPosUv::new([0.2, -0.5, 0.0], [0.0, 0.0]),
+        VertexPosUv::new([0.0, 0.5, 0.0], [0.0, 0.0]),
+    ];
+    let mut vb_bytes = Vec::with_capacity(vertices.len() * VertexPosUv::BYTE_SIZE);
+    for v in &vertices {
+        vb_bytes.extend_from_slice(&v.to_bytes());
+    }
+
+    // Command 0: CreateBuffer 2
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: vb2_id,
+        size: vb_bytes.len() as u32,
+        usage: BUFFER_USAGE_VERTEX | BUFFER_USAGE_COPY_DST,
+    });
+
+    // Command 1: WriteBuffer 2
+    packet.push(GpuCommand::WriteBuffer {
+        buffer_id: vb2_id,
+        offset: 0,
+        data: vb_bytes.clone(),
+    });
+
+    // Command 2: CreateTexture 10 (64x64, rgba8unorm)
+    packet.push(GpuCommand::CreateTexture {
+        texture_id: target_10,
+        width: 64,
+        height: 64,
+        format: TARGET_FORMAT_RGBA8UNORM,
+        usage: TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC,
+    });
+
+    // Command 3: CreateBuffer 20 (readback, 256 * 64 = 16384 bytes)
+    let bytes_per_row = 256u32;
+    let readback_size = bytes_per_row * 64;
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: readback_buffer_20_id,
+        size: readback_size,
+        usage: BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST,
+    });
+
+    // Command 4: CreatePipeline 200
+    let instanced_shader = "\
+struct VertexInput {\n\
+    @location(0) position: vec3<f32>,\n\
+    @location(1) uv: vec2<f32>,\n\
+    @builtin(instance_index) instance_idx: u32,\n\
+};\n\
+\n\
+struct VertexOutput {\n\
+    @builtin(position) position: vec4<f32>,\n\
+    @location(0) color: vec4<f32>,\n\
+};\n\
+\n\
+@vertex\n\
+fn vs_main(in: VertexInput) -> VertexOutput {\n\
+    var out: VertexOutput;\n\
+    var offset_x: f32 = 0.0;\n\
+    var col: vec4<f32> = vec4<f32>(0.0, 0.0, 1.0, 1.0);\n\
+    if (in.instance_idx == 5u) {\n\
+        offset_x = -0.5;\n\
+        col = vec4<f32>(1.0, 0.0, 0.0, 1.0);\n\
+    } else if (in.instance_idx == 6u) {\n\
+        offset_x = 0.5;\n\
+        col = vec4<f32>(0.0, 1.0, 0.0, 1.0);\n\
+    } else {\n\
+        offset_x = 10.0;\n\
+        col = vec4<f32>(0.0, 0.0, 1.0, 1.0);\n\
+    }\n\
+    out.position = vec4<f32>(in.position.x + offset_x, in.position.y, in.position.z, 1.0);\n\
+    out.color = col;\n\
+    return out;\n\
+}\n\
+\n\
+@fragment\n\
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {\n\
+    return in.color;\n\
+}\n";
+
+    packet.push(GpuCommand::CreatePipeline {
+        pipeline_id,
+        wgsl_code: instanced_shader.to_string(),
+        target_format: TARGET_FORMAT_RGBA8UNORM,
+        has_vertex_buffer: true,
+        has_uniform_buffer: false,
+        uniform_size: 0,
+        vertex_stride: VERTEX_POS_UV_STRIDE as u32,
+    });
+
+    // 2. Build pass structure through FrameSession with record_direct_draw_with_range (§6.7, §8.5, 2v8.5)
+    let root_ctx = RenderContext::new_offscreen(
+        ResourceId::new(target_10),
+        64,
+        64,
+        Epoch::ZERO,
+    );
+    let mut session = FrameSession::new(root_ctx, 256)
+        .expect("session init must succeed");
+
+    session
+        .begin_render_pass("draw_params_pass", [0.0, 0.0, 0.0, 1.0])
+        .expect("begin draw_params_pass must succeed");
+
+    session
+        .record_direct_draw_with_range(pipeline_id, vb2_id, [3, 2, 3, 5], None)
+        .expect("record draw with range must succeed");
+
+    session
+        .end_render_pass()
+        .expect("end draw_params_pass must succeed");
+
+    let session_packet = session
+        .build_submission_packet()
+        .expect("build session packet must succeed");
+
+    for cmd in session_packet.into_commands() {
+        packet.push(cmd);
+    }
+
+    // 3. Copy Target 10 to Readback Buffer 20
+    packet.push(GpuCommand::CopyTextureToBuffer {
+        texture_id: target_10,
+        buffer_id: readback_buffer_20_id,
+        width: 64,
+        height: 64,
+        epoch: Epoch::ZERO,
+    });
+
+    packet
+}
+
 // -----------------------------------------------------------------------------
 // Compiled Wasm Exports
 // -----------------------------------------------------------------------------
@@ -2455,6 +3047,76 @@ pub fn gpu_bridge_build_nested_canvas_pass_packet() -> Vec<u8> {
 #[must_use]
 pub fn f3d_build_nested_canvas_pass_packet() -> Vec<u8> {
     gpu_bridge_build_nested_canvas_pass_packet()
+}
+
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen]
+/// Encodes a nested-pass viewport/scissor execution packet (§6.7, §8.5, 2v8.4).
+///
+/// Registers resource IDs (buffers 1, 2, 3, 20, 21, textures 10, 11, pipeline 200) in the
+/// generational slot table at generation 1.
+pub fn gpu_bridge_build_nested_viewport_scissor_packet() -> Vec<u8> {
+    build_nested_viewport_scissor_submission()
+        .encode()
+        .expect("static nested viewport/scissor packet encoding must not fail")
+}
+
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen]
+/// Encodes a nested-pass viewport/scissor execution packet (canonical alias).
+pub fn f3d_build_nested_viewport_scissor_packet() -> Vec<u8> {
+    gpu_bridge_build_nested_viewport_scissor_packet()
+}
+
+#[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
+/// Native export for `gpu_bridge_build_nested_viewport_scissor_packet` for host verification and unit tests.
+#[must_use]
+pub fn gpu_bridge_build_nested_viewport_scissor_packet() -> Vec<u8> {
+    build_nested_viewport_scissor_submission()
+        .encode()
+        .expect("static nested viewport/scissor packet encoding must not fail")
+}
+
+#[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
+/// Native export for `f3d_build_nested_viewport_scissor_packet` (canonical alias).
+#[must_use]
+pub fn f3d_build_nested_viewport_scissor_packet() -> Vec<u8> {
+    gpu_bridge_build_nested_viewport_scissor_packet()
+}
+
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen]
+/// Encodes a draw parameters execution packet (§6.7, §8.5, 2v8.5).
+///
+/// Registers resource IDs (buffers 2, 20, texture 10, pipeline 200) in the
+/// generational slot table at generation 1.
+pub fn gpu_bridge_build_draw_parameters_packet() -> Vec<u8> {
+    build_draw_parameters_submission()
+        .encode()
+        .expect("static draw parameters packet encoding must not fail")
+}
+
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen]
+/// Encodes a draw parameters execution packet (canonical alias).
+pub fn f3d_build_draw_parameters_packet() -> Vec<u8> {
+    gpu_bridge_build_draw_parameters_packet()
+}
+
+#[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
+/// Native export for `gpu_bridge_build_draw_parameters_packet` for host verification and unit tests.
+#[must_use]
+pub fn gpu_bridge_build_draw_parameters_packet() -> Vec<u8> {
+    build_draw_parameters_submission()
+        .encode()
+        .expect("static draw parameters packet encoding must not fail")
+}
+
+#[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
+/// Native export for `f3d_build_draw_parameters_packet` (canonical alias).
+#[must_use]
+pub fn f3d_build_draw_parameters_packet() -> Vec<u8> {
+    gpu_bridge_build_draw_parameters_packet()
 }
 
 #[cfg(all(feature = "browser", target_arch = "wasm32"))]
@@ -4155,20 +4817,23 @@ mod tests {
         // - Affine transform: buffers 1, 2, 20; texture 10; pipeline 200
         // - Nested pass: buffers 1, 2, 3, 20; textures 10, 11; pipeline 200
         // - Nested canvas pass: buffers 1, 2, 3, 20; textures 10, 11; pipelines 200, 201
+        // - Nested viewport/scissor pass: buffers 1, 2, 3, 20; textures 10, 11; pipeline 200
         let _triangle_packet = build_triangle_submission();
         let _bundle_packet = build_bundle_then_direct_draw_submission();
         let _affine_packet = build_affine_rows_transform_submission();
         let _nested_packet = build_nested_pass_submission();
         let _nested_canvas_packet = build_nested_canvas_pass_submission();
+        let _viewport_packet = build_nested_viewport_scissor_submission();
 
         // Verify that binary exports also trigger slot table registration identically
         let _affine_bytes = gpu_bridge_build_affine_rows_transform_packet();
         let _nested_bytes = gpu_bridge_build_nested_pass_packet();
         let _canvas_bytes = gpu_bridge_build_nested_canvas_pass_packet();
+        let _viewport_bytes = gpu_bridge_build_nested_viewport_scissor_packet();
 
         // 2. Fresh generation: all registered resource IDs answer truthfully at generation 1
-        // Buffers: 1 (uniform), 2 (vertex 1), 3 (vertex 2 / readback staging), 20 (readback staging)
-        for buffer_id in [1, 2, 3, 20] {
+        // Buffers: 1 (uniform), 2 (vertex 1), 3 (vertex 2 / readback staging), 20 (readback target 10), 21 (readback target 11)
+        for buffer_id in [1, 2, 3, 20, 21] {
             assert_eq!(check_resource_handle(buffer_id, 1), Ok(true));
             assert!(gpu_bridge_check_resource_handle(buffer_id, 1));
             assert!(f3d_check_resource_handle(buffer_id, 1));
@@ -4189,7 +4854,7 @@ mod tests {
         }
 
         // 3. Zero generation rejection: generation 0 must be rejected via HandleError::InvalidGeneration
-        for id in [1, 2, 3, 10, 11, 20, 100, 200, 201] {
+        for id in [1, 2, 3, 10, 11, 20, 21, 100, 200, 201] {
             assert_eq!(
                 check_resource_handle(id, 0),
                 Err(HandleError::InvalidGeneration { raw_generation: 0 })
@@ -4627,7 +5292,7 @@ mod tests {
         let alias_bytes = f3d_build_affine_rows_transform_packet();
         assert_eq!(wasm_bytes, alias_bytes);
         assert!(!wasm_bytes.is_empty());
-        assert_eq!(&wasm_bytes[0..4], b"F3DP"); // Packet header magic
+        assert_eq!(&wasm_bytes[0..4], &PACKET_MAGIC); // Packet header magic
 
         // Verify hand-computed screen pixel coordinates (64x64 framebuffer):
         // Transform: P' = (0.5 * P.x + 0.5, 0.5 * P.y, P.z)
@@ -4948,10 +5613,9 @@ mod tests {
             ResourceId::new(10),
             [0.0, 0.0, 0.0, 1.0],
         ));
-        p.depth_stencil_attachment = Some(DepthStencilAttachment::new_clear(
+        p.depth_stencil_attachment = Some(DepthStencilAttachment::new_depth_clear(
             ResourceId::new(99),
             1.0,
-            0,
         ));
         p.draws.push(Draw::new(1, 100, 3, 0, Vec::new()));
 
@@ -4986,12 +5650,11 @@ mod tests {
         assert_eq!(&wasm_bytes[0..4], &PACKET_MAGIC);
         assert_eq!(u16::from_le_bytes(wasm_bytes[4..6].try_into().unwrap()), PACKET_VERSION);
         let cmd_count = u32::from_le_bytes(wasm_bytes[8..12].try_into().unwrap());
-        assert_eq!(cmd_count, 14);
 
         // Verify structured commands
         let submission = build_nested_pass_submission();
         let commands = submission.commands();
-        assert_eq!(commands.len(), 14);
+        assert_eq!(cmd_count, commands.len() as u32);
 
         // Verify resource creations
         match &commands[0] {
@@ -5003,9 +5666,15 @@ mod tests {
             other => panic!("expected CreateBuffer at 0, got {other:?}"),
         }
 
-        // Verify 3 RenderPass commands (commands 10, 11, 12)
+        // Verify 3 distinct RenderPass draws matching the three passes (Root 7734)
+        let render_draws: Vec<&GpuCommand> = commands
+            .iter()
+            .filter(|cmd| matches!(cmd, GpuCommand::RenderPass { vertex_count, .. } if *vertex_count == 3))
+            .collect();
+        assert_eq!(render_draws.len(), 3);
+
         // Pass 1: Target 10, Clear to Black, Draw Red left triangle (dynamic offset 0, vb 2)
-        match &commands[10] {
+        match render_draws[0] {
             GpuCommand::RenderPass {
                 target_type,
                 target_id,
@@ -5017,7 +5686,7 @@ mod tests {
                 uniform_buffer_id,
                 load_op,
                 store_op,
-                pass_flags,
+                ..
             } => {
                 assert_eq!(*target_type, TARGET_OFFSCREEN);
                 assert_eq!(*target_id, 10);
@@ -5029,13 +5698,12 @@ mod tests {
                 assert_eq!(*uniform_buffer_id, 1);
                 assert_eq!(*load_op, LOAD_OP_CLEAR);
                 assert_eq!(*store_op, STORE_OP_STORE);
-                assert_eq!(*pass_flags, PASS_FLAG_NEW_PASS);
             }
-            other => panic!("expected RenderPass at 10, got {other:?}"),
+            other => panic!("expected RenderPass draw 0, got {other:?}"),
         }
 
         // Pass 2: Target 11, Nested pass, Clear to Black, Draw Green triangle (dynamic offset 512, vb 2)
-        match &commands[11] {
+        match render_draws[1] {
             GpuCommand::RenderPass {
                 target_type,
                 target_id,
@@ -5047,7 +5715,7 @@ mod tests {
                 uniform_buffer_id,
                 load_op,
                 store_op,
-                pass_flags,
+                ..
             } => {
                 assert_eq!(*target_type, TARGET_OFFSCREEN);
                 assert_eq!(*target_id, 11);
@@ -5059,13 +5727,12 @@ mod tests {
                 assert_eq!(*uniform_buffer_id, 1);
                 assert_eq!(*load_op, LOAD_OP_CLEAR);
                 assert_eq!(*store_op, STORE_OP_STORE);
-                assert_eq!(*pass_flags, PASS_FLAG_NEW_PASS);
             }
-            other => panic!("expected RenderPass at 11, got {other:?}"),
+            other => panic!("expected RenderPass draw 1, got {other:?}"),
         }
 
         // Pass 3: Target 10, Outer resume with LoadOp::Load, Draw Blue right triangle (dynamic offset 256, vb 3)
-        match &commands[12] {
+        match render_draws[2] {
             GpuCommand::RenderPass {
                 target_type,
                 target_id,
@@ -5076,7 +5743,6 @@ mod tests {
                 uniform_buffer_id,
                 load_op,
                 store_op,
-                pass_flags,
                 ..
             } => {
                 assert_eq!(*target_type, TARGET_OFFSCREEN);
@@ -5088,13 +5754,16 @@ mod tests {
                 assert_eq!(*uniform_buffer_id, 1);
                 assert_eq!(*load_op, LOAD_OP_LOAD);
                 assert_eq!(*store_op, STORE_OP_STORE);
-                assert_eq!(*pass_flags, PASS_FLAG_NEW_PASS);
             }
-            other => panic!("expected RenderPass at 12, got {other:?}"),
+            other => panic!("expected RenderPass draw 2, got {other:?}"),
         }
 
-        // Command 13: CopyTextureToBuffer of Target 10 to buffer 20
-        match &commands[13] {
+        // Verify CopyTextureToBuffer of Target 10 to buffer 20
+        let copy_cmd = commands
+            .iter()
+            .find(|cmd| matches!(cmd, GpuCommand::CopyTextureToBuffer { .. }))
+            .expect("expected CopyTextureToBuffer command");
+        match copy_cmd {
             GpuCommand::CopyTextureToBuffer {
                 texture_id,
                 buffer_id,
@@ -5107,13 +5776,23 @@ mod tests {
                 assert_eq!(*width, 64);
                 assert_eq!(*height, 64);
             }
-            other => panic!("expected CopyTextureToBuffer at 13, got {other:?}"),
+            other => panic!("expected CopyTextureToBuffer, got {other:?}"),
         }
 
-        // Verify binary wire format: scan commands from offset 16 and verify the three 44-byte RenderPass records
+        // Verify strict relative source order: draw0 < draw1 < draw2 < copy
+        let draw0_idx = commands.iter().position(|cmd| std::ptr::eq(cmd, render_draws[0])).unwrap();
+        let draw1_idx = commands.iter().position(|cmd| std::ptr::eq(cmd, render_draws[1])).unwrap();
+        let draw2_idx = commands.iter().position(|cmd| std::ptr::eq(cmd, render_draws[2])).unwrap();
+        let copy_idx = commands.iter().position(|cmd| std::ptr::eq(cmd, copy_cmd)).unwrap();
+        assert!(draw0_idx < draw1_idx);
+        assert!(draw1_idx < draw2_idx);
+        assert!(draw2_idx < copy_idx);
+
+        // Verify binary wire format: scan commands dynamically from offset 16 per Root 7734
+        let total_data_len = u32::from_le_bytes(wasm_bytes[12..16].try_into().unwrap());
         let mut cursor = 16usize;
         let mut render_pass_index = 0;
-        for _ in 0..14 {
+        for _ in 0..cmd_count {
             let opcode = u16::from_le_bytes(wasm_bytes[cursor..cursor + 2].try_into().unwrap());
             cursor += 2;
             match opcode {
@@ -5122,6 +5801,13 @@ mod tests {
                 OPCODE_CREATE_TEXTURE => cursor += 20,
                 OPCODE_CREATE_PIPELINE => cursor += 32,
                 OPCODE_COPY_TEXTURE_TO_BUFFER => cursor += 24,
+                OPCODE_SET_VIEWPORT => cursor += 24,
+                OPCODE_SET_SCISSOR_RECT => cursor += 16,
+                OPCODE_SET_DRAW_PARAMETERS => cursor += 12,
+                OPCODE_EXECUTE_BUNDLES => {
+                    let bundle_count = u32::from_le_bytes(wasm_bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
+                    cursor += 4 + bundle_count * 4;
+                }
                 OPCODE_RENDER_PASS => {
                     // Exactly 44-byte record
                     let packed_target = u32::from_le_bytes(wasm_bytes[cursor..cursor + 4].try_into().unwrap());
@@ -5133,50 +5819,52 @@ mod tests {
                     let uniform_buffer_id = u32::from_le_bytes(wasm_bytes[cursor + 40..cursor + 44].try_into().unwrap());
 
                     assert!(validate_target_type(packed_target));
-                    assert_eq!(pipeline_id, 200);
-                    assert_eq!(vertex_count, 3);
-                    assert_eq!(uniform_buffer_id, 1);
 
-                    match render_pass_index {
-                        0 => {
-                            // Pass 1: Target 10, Clear, Store, NewPass, dynamic offset 0, vb 2
-                            assert_eq!(target_id, 10);
-                            assert_eq!(unpack_target_kind(packed_target), TARGET_OFFSCREEN);
-                            assert_eq!(unpack_load_op(packed_target), LOAD_OP_CLEAR);
-                            assert_eq!(unpack_store_op(packed_target), STORE_OP_STORE);
-                            assert_eq!(unpack_pass_flags(packed_target), PASS_FLAG_NEW_PASS);
-                            assert_eq!(dynamic_offset, 0);
-                            assert_eq!(vertex_buffer_id, 2);
+                    // When this record represents a draw with vertices, verify its target and uniforms
+                    if vertex_count > 0 {
+                        assert_eq!(pipeline_id, 200);
+                        assert_eq!(vertex_count, 3);
+                        assert_eq!(uniform_buffer_id, 1);
+
+                        match render_pass_index {
+                            0 => {
+                                // Pass 1: Target 10, Clear, Store, dynamic offset 0, vb 2
+                                assert_eq!(target_id, 10);
+                                assert_eq!(unpack_target_kind(packed_target), TARGET_OFFSCREEN);
+                                assert_eq!(unpack_load_op(packed_target), LOAD_OP_CLEAR);
+                                assert_eq!(unpack_store_op(packed_target), STORE_OP_STORE);
+                                assert_eq!(dynamic_offset, 0);
+                                assert_eq!(vertex_buffer_id, 2);
+                            }
+                            1 => {
+                                // Pass 2: Target 11, Clear, Store, dynamic offset 512, vb 2
+                                assert_eq!(target_id, 11);
+                                assert_eq!(unpack_target_kind(packed_target), TARGET_OFFSCREEN);
+                                assert_eq!(unpack_load_op(packed_target), LOAD_OP_CLEAR);
+                                assert_eq!(unpack_store_op(packed_target), STORE_OP_STORE);
+                                assert_eq!(dynamic_offset, 512);
+                                assert_eq!(vertex_buffer_id, 2);
+                            }
+                            2 => {
+                                // Pass 3: Target 10, LOAD, Store, dynamic offset 256, vb 3
+                                assert_eq!(target_id, 10);
+                                assert_eq!(unpack_target_kind(packed_target), TARGET_OFFSCREEN);
+                                assert_eq!(unpack_load_op(packed_target), LOAD_OP_LOAD);
+                                assert_eq!(unpack_store_op(packed_target), STORE_OP_STORE);
+                                assert_eq!(dynamic_offset, 256);
+                                assert_eq!(vertex_buffer_id, 3);
+                            }
+                            _ => panic!("unexpected render pass index {render_pass_index}"),
                         }
-                        1 => {
-                            // Pass 2: Target 11, Clear, Store, NewPass, dynamic offset 512, vb 2
-                            assert_eq!(target_id, 11);
-                            assert_eq!(unpack_target_kind(packed_target), TARGET_OFFSCREEN);
-                            assert_eq!(unpack_load_op(packed_target), LOAD_OP_CLEAR);
-                            assert_eq!(unpack_store_op(packed_target), STORE_OP_STORE);
-                            assert_eq!(unpack_pass_flags(packed_target), PASS_FLAG_NEW_PASS);
-                            assert_eq!(dynamic_offset, 512);
-                            assert_eq!(vertex_buffer_id, 2);
-                        }
-                        2 => {
-                            // Pass 3: Target 10, LOAD, Store, NewPass, dynamic offset 256, vb 3
-                            assert_eq!(target_id, 10);
-                            assert_eq!(unpack_target_kind(packed_target), TARGET_OFFSCREEN);
-                            assert_eq!(unpack_load_op(packed_target), LOAD_OP_LOAD);
-                            assert_eq!(unpack_store_op(packed_target), STORE_OP_STORE);
-                            assert_eq!(unpack_pass_flags(packed_target), PASS_FLAG_NEW_PASS);
-                            assert_eq!(dynamic_offset, 256);
-                            assert_eq!(vertex_buffer_id, 3);
-                        }
-                        _ => panic!("unexpected render pass index {render_pass_index}"),
+                        render_pass_index += 1;
                     }
-                    render_pass_index += 1;
                     cursor += 44;
                 }
                 other => panic!("unexpected opcode {other} at cursor {cursor}"),
             }
         }
         assert_eq!(render_pass_index, 3);
+        assert_eq!(cursor, wasm_bytes.len() - total_data_len as usize);
 
         // Mathematical verification of pixel sample points on 64x64 offscreen target
         // Viewport mapping: pixel center (px + 0.5, py + 0.5) to NDC (x_ndc, y_ndc)
@@ -5246,14 +5934,16 @@ mod tests {
         assert_eq!(wasm_bytes, canonical_bytes);
         assert!(wasm_bytes.len() >= 16);
 
-        // Header verification: Magic F3DG, version 1, total 14 commands
-        assert_eq!(&wasm_bytes[0..4], b"F3DG");
-        assert_eq!(u16::from_le_bytes(wasm_bytes[4..6].try_into().unwrap()), 1);
-        assert_eq!(u16::from_le_bytes(wasm_bytes[6..8].try_into().unwrap()), 14);
-
         // 2. Verify command structure in GpuSubmissionPacket
         let packet = build_nested_canvas_pass_submission();
         assert_eq!(packet.commands().len(), 14);
+
+        // Header verification: Magic F3DP, version 1, command count matching packet (Root 7734)
+        assert_eq!(&wasm_bytes[0..4], &PACKET_MAGIC);
+        assert_eq!(u16::from_le_bytes(wasm_bytes[4..6].try_into().unwrap()), PACKET_VERSION);
+        assert_eq!(u16::from_le_bytes(wasm_bytes[6..8].try_into().unwrap()), 0); // flags
+        let cmd_count = u32::from_le_bytes(wasm_bytes[8..12].try_into().unwrap());
+        assert_eq!(cmd_count, packet.commands().len() as u32);
 
         // Generational slot table verification:
         // All canvas pass resources (buffers 1, 2, 3, 20, textures 10, 11, pipelines 200, 201) are active at generation 1
@@ -5688,5 +6378,949 @@ mod tests {
         // (24, 32) is drawn Red in Pass 1 and preserved via LoadOp::Load -> Red [255, 0, 0, 255]
         // (56, 32) is drawn Blue in Pass 3 -> Blue [0, 0, 255, 255]
         // (2, 2) is unpainted -> Black [0, 0, 0, 255]
+    }
+
+    #[test]
+    fn test_nested_viewport_scissor_packet_and_command_stream() {
+        let _slot_lock = match TEST_SLOT_TABLE_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        let wasm_bytes = gpu_bridge_build_nested_viewport_scissor_packet();
+        let alias_bytes = f3d_build_nested_viewport_scissor_packet();
+        assert_eq!(wasm_bytes, alias_bytes);
+        assert!(!wasm_bytes.is_empty());
+
+        // 1. Verify packet binary header
+        assert_eq!(&wasm_bytes[0..4], &PACKET_MAGIC);
+        assert_eq!(u16::from_le_bytes(wasm_bytes[4..6].try_into().unwrap()), PACKET_VERSION);
+        let cmd_count = u32::from_le_bytes(wasm_bytes[8..12].try_into().unwrap());
+        assert_eq!(cmd_count, 25);
+
+        // 2. Verify structured commands
+        let submission = build_nested_viewport_scissor_submission();
+        let commands = submission.commands();
+        assert_eq!(commands.len(), 25);
+
+        // Setup commands: 0-9
+        assert!(matches!(&commands[0], GpuCommand::CreateBuffer { buffer_id: 1, size: 768, .. }));
+        assert!(matches!(&commands[1], GpuCommand::CreateBuffer { buffer_id: 2, size: 60, .. }));
+        assert!(matches!(&commands[2], GpuCommand::WriteBuffer { buffer_id: 2, offset: 0, .. }));
+        assert!(matches!(&commands[3], GpuCommand::CreateBuffer { buffer_id: 3, size: 60, .. }));
+        assert!(matches!(&commands[4], GpuCommand::WriteBuffer { buffer_id: 3, offset: 0, .. }));
+        assert!(matches!(&commands[5], GpuCommand::CreateTexture { texture_id: 10, width: 64, height: 64, .. }));
+        assert!(matches!(&commands[6], GpuCommand::CreateTexture { texture_id: 11, width: 64, height: 64, .. }));
+        assert!(matches!(&commands[7], GpuCommand::CreateBuffer { buffer_id: 20, size: 16384, .. }));
+        assert!(matches!(&commands[8], GpuCommand::CreateBuffer { buffer_id: 21, size: 16384, .. }));
+        assert!(matches!(&commands[9], GpuCommand::CreatePipeline { pipeline_id: 200, target_format: TARGET_FORMAT_RGBA8UNORM, .. }));
+
+        // Command 10: WriteBuffer for uniform buffer 1 (768 bytes, emitted by FrameSession)
+        assert!(matches!(&commands[10], GpuCommand::WriteBuffer { buffer_id: 1, offset: 0, .. }));
+
+        // Pass 1 (Outer prefix on Target 10):
+        // Command 11: Opener with vertex_count: 0 and clear color [0, 0, 0, 1]
+        match &commands[11] {
+            GpuCommand::RenderPass { target_id, clear_color, vertex_count, pass_flags, load_op, .. } => {
+                assert_eq!(*target_id, 10);
+                assert_eq!(*clear_color, [0.0, 0.0, 0.0, 1.0]);
+                assert_eq!(*vertex_count, 0);
+                assert_eq!(*pass_flags, PASS_FLAG_NEW_PASS);
+                assert_eq!(*load_op, LOAD_OP_CLEAR);
+            }
+            other => panic!("expected RenderPass opener at index 11, got {other:?}"),
+        }
+
+        // Command 12: SetViewport [0, 0, 64, 64]
+        match &commands[12] {
+            GpuCommand::SetViewport { x, y, width, height, min_depth, max_depth } => {
+                assert_eq!(*x, 0.0);
+                assert_eq!(*y, 0.0);
+                assert_eq!(*width, 64.0);
+                assert_eq!(*height, 64.0);
+                assert_eq!(*min_depth, 0.0);
+                assert_eq!(*max_depth, 1.0);
+            }
+            other => panic!("expected SetViewport at index 12, got {other:?}"),
+        }
+
+        // Command 13: SetScissorRect [0, 0, 32, 64] (left half)
+        match &commands[13] {
+            GpuCommand::SetScissorRect { x, y, width, height } => {
+                assert_eq!(*x, 0);
+                assert_eq!(*y, 0);
+                assert_eq!(*width, 32);
+                assert_eq!(*height, 64);
+            }
+            other => panic!("expected SetScissorRect at index 13, got {other:?}"),
+        }
+
+        // Command 14: Direct draw red tri1
+        match &commands[14] {
+            GpuCommand::RenderPass { target_id, pipeline_id, vertex_buffer_id, vertex_count, uniform_dynamic_offset, pass_flags, .. } => {
+                assert_eq!(*target_id, 10);
+                assert_eq!(*pipeline_id, 200);
+                assert_eq!(*vertex_buffer_id, 2);
+                assert_eq!(*vertex_count, 3);
+                assert_eq!(*uniform_dynamic_offset, 0);
+                assert_eq!(*pass_flags, PASS_FLAG_NONE);
+            }
+            other => panic!("expected RenderPass draw at index 14, got {other:?}"),
+        }
+
+        // Pass 2 (Nested inner pass on Target 11):
+        // Command 15: Opener with vertex_count: 0
+        match &commands[15] {
+            GpuCommand::RenderPass { target_id, vertex_count, pass_flags, load_op, .. } => {
+                assert_eq!(*target_id, 11);
+                assert_eq!(*vertex_count, 0);
+                assert_eq!(*pass_flags, PASS_FLAG_NEW_PASS);
+                assert_eq!(*load_op, LOAD_OP_CLEAR);
+            }
+            other => panic!("expected RenderPass opener at index 15, got {other:?}"),
+        }
+
+        // Command 16: SetViewport [16, 16, 32, 32]
+        match &commands[16] {
+            GpuCommand::SetViewport { x, y, width, height, .. } => {
+                assert_eq!(*x, 16.0);
+                assert_eq!(*y, 16.0);
+                assert_eq!(*width, 32.0);
+                assert_eq!(*height, 32.0);
+            }
+            other => panic!("expected SetViewport at index 16, got {other:?}"),
+        }
+
+        // Command 17: SetScissorRect [16, 16, 32, 32]
+        match &commands[17] {
+            GpuCommand::SetScissorRect { x, y, width, height } => {
+                assert_eq!(*x, 16);
+                assert_eq!(*y, 16);
+                assert_eq!(*width, 32);
+                assert_eq!(*height, 32);
+            }
+            other => panic!("expected SetScissorRect at index 17, got {other:?}"),
+        }
+
+        // Command 18: Direct draw green tri1
+        match &commands[18] {
+            GpuCommand::RenderPass { target_id, pipeline_id, vertex_buffer_id, vertex_count, uniform_dynamic_offset, pass_flags, .. } => {
+                assert_eq!(*target_id, 11);
+                assert_eq!(*pipeline_id, 200);
+                assert_eq!(*vertex_buffer_id, 2);
+                assert_eq!(*vertex_count, 3);
+                assert_eq!(*uniform_dynamic_offset, 512);
+                assert_eq!(*pass_flags, PASS_FLAG_NONE);
+            }
+            other => panic!("expected RenderPass draw at index 18, got {other:?}"),
+        }
+
+        // Pass 3 (Outer resumed pass on Target 10 with LoadOp::Load):
+        // Command 19: Opener with LoadOp::Load
+        match &commands[19] {
+            GpuCommand::RenderPass { target_id, vertex_count, pass_flags, load_op, .. } => {
+                assert_eq!(*target_id, 10);
+                assert_eq!(*vertex_count, 0);
+                assert_eq!(*pass_flags, PASS_FLAG_NEW_PASS);
+                assert_eq!(*load_op, LOAD_OP_LOAD);
+            }
+            other => panic!("expected RenderPass opener at index 19, got {other:?}"),
+        }
+
+        // Command 20: SetViewport [0, 0, 64, 64] (restored outer viewport!)
+        match &commands[20] {
+            GpuCommand::SetViewport { x, y, width, height, .. } => {
+                assert_eq!(*x, 0.0);
+                assert_eq!(*y, 0.0);
+                assert_eq!(*width, 64.0);
+                assert_eq!(*height, 64.0);
+            }
+            other => panic!("expected restored SetViewport at index 20, got {other:?}"),
+        }
+
+        // Command 21: SetScissorRect [32, 0, 32, 64] (resumed right-half scissor!)
+        match &commands[21] {
+            GpuCommand::SetScissorRect { x, y, width, height } => {
+                assert_eq!(*x, 32);
+                assert_eq!(*y, 0);
+                assert_eq!(*width, 32);
+                assert_eq!(*height, 64);
+            }
+            other => panic!("expected SetScissorRect at index 21, got {other:?}"),
+        }
+
+        // Command 22: Direct draw blue tri2
+        match &commands[22] {
+            GpuCommand::RenderPass { target_id, pipeline_id, vertex_buffer_id, vertex_count, uniform_dynamic_offset, pass_flags, .. } => {
+                assert_eq!(*target_id, 10);
+                assert_eq!(*pipeline_id, 200);
+                assert_eq!(*vertex_buffer_id, 3);
+                assert_eq!(*vertex_count, 3);
+                assert_eq!(*uniform_dynamic_offset, 256);
+                assert_eq!(*pass_flags, PASS_FLAG_NONE);
+            }
+            other => panic!("expected RenderPass draw at index 22, got {other:?}"),
+        }
+
+        // Command 23: Copy Texture 10 to Buffer 20
+        match &commands[23] {
+            GpuCommand::CopyTextureToBuffer { texture_id, buffer_id, width, height, .. } => {
+                assert_eq!(*texture_id, 10);
+                assert_eq!(*buffer_id, 20);
+                assert_eq!(*width, 64);
+                assert_eq!(*height, 64);
+            }
+            other => panic!("expected CopyTextureToBuffer at index 23, got {other:?}"),
+        }
+
+        // Command 24: Copy Texture 11 to Buffer 21
+        match &commands[24] {
+            GpuCommand::CopyTextureToBuffer { texture_id, buffer_id, width, height, .. } => {
+                assert_eq!(*texture_id, 11);
+                assert_eq!(*buffer_id, 21);
+                assert_eq!(*width, 64);
+                assert_eq!(*height, 64);
+            }
+            other => panic!("expected CopyTextureToBuffer at index 24, got {other:?}"),
+        }
+
+        // 3. Binary wire cursor walkthrough (matching bridge_runtime.js decoder)
+        let mut cursor = 16usize; // past header
+        let mut opcodes = Vec::new();
+        for _ in 0..cmd_count {
+            let op = u16::from_le_bytes(wasm_bytes[cursor..cursor + 2].try_into().unwrap());
+            cursor += 2;
+            opcodes.push(op);
+            match op {
+                OPCODE_CREATE_BUFFER => cursor += 12,
+                OPCODE_WRITE_BUFFER => cursor += 16,
+                OPCODE_CREATE_TEXTURE => cursor += 20,
+                OPCODE_CREATE_PIPELINE => cursor += 32,
+                OPCODE_RENDER_PASS => cursor += 44,
+                OPCODE_COPY_TEXTURE_TO_BUFFER => cursor += 24,
+                OPCODE_SET_VIEWPORT => {
+                    let x = f32::from_le_bytes(wasm_bytes[cursor..cursor + 4].try_into().unwrap());
+                    let y = f32::from_le_bytes(wasm_bytes[cursor + 4..cursor + 8].try_into().unwrap());
+                    let w = f32::from_le_bytes(wasm_bytes[cursor + 8..cursor + 12].try_into().unwrap());
+                    let h = f32::from_le_bytes(wasm_bytes[cursor + 12..cursor + 16].try_into().unwrap());
+                    let min_d = f32::from_le_bytes(wasm_bytes[cursor + 16..cursor + 20].try_into().unwrap());
+                    let max_d = f32::from_le_bytes(wasm_bytes[cursor + 20..cursor + 24].try_into().unwrap());
+                    assert!(w > 0.0 && h > 0.0);
+                    assert_eq!(min_d, 0.0);
+                    assert_eq!(max_d, 1.0);
+                    let _ = (x, y);
+                    cursor += 24;
+                }
+                OPCODE_SET_SCISSOR_RECT => {
+                    let x = u32::from_le_bytes(wasm_bytes[cursor..cursor + 4].try_into().unwrap());
+                    let y = u32::from_le_bytes(wasm_bytes[cursor + 4..cursor + 8].try_into().unwrap());
+                    let w = u32::from_le_bytes(wasm_bytes[cursor + 8..cursor + 12].try_into().unwrap());
+                    let h = u32::from_le_bytes(wasm_bytes[cursor + 12..cursor + 16].try_into().unwrap());
+                    assert!(w > 0 && h > 0);
+                    let _ = (x, y);
+                    cursor += 16;
+                }
+                other => panic!("unexpected opcode {other} at cursor {cursor}"),
+            }
+        }
+        assert_eq!(opcodes.len(), 25);
+        assert_eq!(
+            opcodes,
+            vec![
+                OPCODE_CREATE_BUFFER,
+                OPCODE_CREATE_BUFFER,
+                OPCODE_WRITE_BUFFER,
+                OPCODE_CREATE_BUFFER,
+                OPCODE_WRITE_BUFFER,
+                OPCODE_CREATE_TEXTURE,
+                OPCODE_CREATE_TEXTURE,
+                OPCODE_CREATE_BUFFER,
+                OPCODE_CREATE_BUFFER,
+                OPCODE_CREATE_PIPELINE,
+                OPCODE_WRITE_BUFFER,
+                // Pass 1:
+                OPCODE_RENDER_PASS,
+                OPCODE_SET_VIEWPORT,
+                OPCODE_SET_SCISSOR_RECT,
+                OPCODE_RENDER_PASS,
+                // Pass 2:
+                OPCODE_RENDER_PASS,
+                OPCODE_SET_VIEWPORT,
+                OPCODE_SET_SCISSOR_RECT,
+                OPCODE_RENDER_PASS,
+                // Pass 3:
+                OPCODE_RENDER_PASS,
+                OPCODE_SET_VIEWPORT,
+                OPCODE_SET_SCISSOR_RECT,
+                OPCODE_RENDER_PASS,
+                // Copies:
+                OPCODE_COPY_TEXTURE_TO_BUFFER,
+                OPCODE_COPY_TEXTURE_TO_BUFFER,
+            ]
+        );
+
+        // 4. Mathematical validation of sample points and scissor bounds:
+        let in_rect = |px: u32, py: u32, r: [u32; 4]| -> bool {
+            px >= r[0] && px < r[0] + r[2] && py >= r[1] && py < r[1] + r[3]
+        };
+
+        // Target 10: Left-half scissor [0, 0, 32, 64] vs Right-half scissor [32, 0, 32, 64]
+        let left_scissor = [0, 0, 32, 64];
+        let right_scissor = [32, 0, 32, 64];
+        assert!(in_rect(24, 32, left_scissor));
+        assert!(!in_rect(56, 32, left_scissor));
+        assert!(!in_rect(24, 32, right_scissor));
+        assert!(in_rect(56, 32, right_scissor));
+
+        // Negative check: If outer prefix scissor [0, 0, 32, 64] were improperly retained into Pass 3,
+        // right-side sample point (56, 32) would be outside the scissor rectangle and clipped to Black.
+        assert!(!in_rect(56, 32, left_scissor));
+
+        // Target 11: Centered sub-rect scissor [16, 16, 32, 32]
+        let inner_scissor = [16, 16, 32, 32];
+        assert!(in_rect(24, 32, inner_scissor)); // Green pixel inside centered scissor
+        assert!(!in_rect(8, 8, inner_scissor));   // Untouched background outside centered scissor
+        assert!(!in_rect(56, 32, inner_scissor)); // Right-half background outside centered scissor
+    }
+
+    #[test]
+    fn test_lower_plan_viewport_scissor_deduplication_and_restoration() {
+        use f3d_graph::{
+            pass::{ColorAttachment, Draw, Pass, PassId},
+            plan::{ExecutionPlan, PlanSegment},
+            resource::ResourceId,
+        };
+
+        let mut pass0 = Pass::new_render(PassId::new(1), "pass_with_changing_scissor");
+        pass0.color_attachments.push(ColorAttachment::new_clear(
+            ResourceId::new(10),
+            [0.0, 0.0, 0.0, 1.0],
+        ));
+
+        // Draw 0: viewport [0, 0, 100, 100], scissor [0, 0, 50, 100]
+        pass0.draws.push(
+            Draw::new(1, 100, 3, 0, Vec::new())
+                .with_viewport(Some([0, 0, 100, 100]))
+                .with_scissor(Some([0, 0, 50, 100]), true),
+        );
+
+        // Draw 1: same viewport [0, 0, 100, 100], changed scissor [50, 0, 50, 100]
+        pass0.draws.push(
+            Draw::new(2, 100, 3, 256, Vec::new())
+                .with_viewport(Some([0, 0, 100, 100]))
+                .with_scissor(Some([50, 0, 50, 100]), true),
+        );
+
+        // Draw 2: identical viewport [0, 0, 100, 100] and identical scissor [50, 0, 50, 100] -> zero state changes
+        pass0.draws.push(
+            Draw::new(3, 100, 3, 512, Vec::new())
+                .with_viewport(Some([0, 0, 100, 100]))
+                .with_scissor(Some([50, 0, 50, 100]), true),
+        );
+
+        // Pass 1 on Target 20: changed viewport, scissor disabled
+        let mut pass1 = Pass::new_render(PassId::new(2), "pass_target_20");
+        pass1.color_attachments.push(ColorAttachment::new_clear(
+            ResourceId::new(20),
+            [0.0, 0.0, 0.0, 1.0],
+        ));
+        pass1.draws.push(
+            Draw::new(4, 100, 3, 0, Vec::new())
+                .with_viewport(Some([10, 10, 40, 40]))
+                .with_scissor(None, false),
+        );
+
+        let plan = ExecutionPlan {
+            segments: vec![
+                PlanSegment::from_pass(&pass0),
+                PlanSegment::from_pass(&pass1),
+            ],
+            canvas_epoch: None,
+            pass_count: 2,
+            split_count: 0,
+            split_reasons: Vec::new(),
+        };
+
+        let commands = lower_plan(&plan).expect("lower plan must succeed");
+
+        // Pass 0:
+        // 0: RenderPass opener (vertex_count: 0, new pass)
+        // 1: SetViewport [0, 0, 100, 100]
+        // 2: SetScissorRect [0, 0, 50, 100]
+        // 3: Draw 0 (vertex_count: 3)
+        // 4: SetScissorRect [50, 0, 50, 100] (viewport was NOT re-emitted!)
+        // 5: Draw 1 (vertex_count: 3)
+        // 6: Draw 2 (vertex_count: 3, neither viewport nor scissor re-emitted!)
+        // Pass 1:
+        // 7: RenderPass opener on target 20 (vertex_count: 0, new pass)
+        // 8: SetViewport [10, 10, 40, 40]
+        // 9: Draw 3 (vertex_count: 3, no scissor emitted)
+        assert_eq!(commands.len(), 10);
+
+        assert!(matches!(&commands[0], GpuCommand::RenderPass { vertex_count: 0, pass_flags: PASS_FLAG_NEW_PASS, .. }));
+        assert!(matches!(&commands[1], GpuCommand::SetViewport { width: 100.0, height: 100.0, .. }));
+        assert!(matches!(&commands[2], GpuCommand::SetScissorRect { x: 0, width: 50, .. }));
+        assert!(matches!(&commands[3], GpuCommand::RenderPass { vertex_count: 3, pass_flags: PASS_FLAG_NONE, .. }));
+        assert!(matches!(&commands[4], GpuCommand::SetScissorRect { x: 50, width: 50, .. }));
+        assert!(matches!(&commands[5], GpuCommand::RenderPass { vertex_count: 3, pass_flags: PASS_FLAG_NONE, .. }));
+        assert!(matches!(&commands[6], GpuCommand::RenderPass { vertex_count: 3, pass_flags: PASS_FLAG_NONE, .. }));
+        assert!(matches!(&commands[7], GpuCommand::RenderPass { target_id: 20, vertex_count: 0, pass_flags: PASS_FLAG_NEW_PASS, .. }));
+        assert!(matches!(&commands[8], GpuCommand::SetViewport { x: 10.0, y: 10.0, width: 40.0, height: 40.0, .. }));
+        assert!(matches!(&commands[9], GpuCommand::RenderPass { target_id: 20, vertex_count: 3, pass_flags: PASS_FLAG_NONE, .. }));
+    }
+
+    #[test]
+    fn test_lower_plan_near_neighbor_default_vs_explicit_zero_viewport_and_scissor_restoration() {
+        use f3d_graph::{
+            pass::{ColorAttachment, Draw, DrawKind, Pass, PassId},
+            plan::{ExecutionPlan, PlanSegment},
+            resource::ResourceId,
+        };
+
+        // Pass 0 on Target 10:
+        // Tests:
+        // - Draw 0: default viewport (None), scissor disabled (None) -> MUST NOT emit SetViewport, MUST NOT emit dummy opener.
+        //   Direct draw is emitted with PASS_FLAG_NEW_PASS directly opening the pass!
+        // - Draw 1: explicit zero viewport Some([0, 0, 0, 0]) -> MUST emit SetViewport(0, 0, 0, 0).
+        // - Draw 2: explicit non-zero viewport Some([0, 0, 800, 600]) and enabled scissor Some([10, 20, 100, 200]) -> emits SetViewport and SetScissorRect.
+        // - Draw 3: scissor disabled after enabled, with full-attachment rect Some([0, 0, 800, 600]) -> MUST emit SetScissorRect(0, 0, 800, 600) to clear clipping.
+        // - Draw 4: bundle execution with active viewport/scissor -> inherits state without extra sets.
+        let mut pass0 = Pass::new_render(PassId::new(1), "pass_near_neighbor");
+        pass0.color_attachments.push(ColorAttachment::new_clear(
+            ResourceId::new(10),
+            [0.0, 0.0, 0.0, 1.0],
+        ));
+
+        // Draw 0: default unspecified viewport (None), no scissor (None)
+        pass0.draws.push(
+            Draw::new(1, 100, 3, 0, Vec::new())
+                .with_viewport(None)
+                .with_scissor(None, false),
+        );
+
+        // Draw 1: near-neighbor explicit zero-size viewport Some([0, 0, 0, 0])
+        pass0.draws.push(
+            Draw::new(2, 100, 3, 256, Vec::new())
+                .with_viewport(Some([0, 0, 0, 0]))
+                .with_scissor(None, false),
+        );
+
+        // Draw 2: non-zero viewport and active scissor test
+        pass0.draws.push(
+            Draw::new(3, 100, 3, 512, Vec::new())
+                .with_viewport(Some([0, 0, 800, 600]))
+                .with_scissor(Some([10, 20, 100, 200]), true),
+        );
+
+        // Draw 3: scissor test disabled after enable -> provides full-attachment scissor to clear clipping
+        pass0.draws.push(
+            Draw::new(4, 100, 3, 768, Vec::new())
+                .with_viewport(Some([0, 0, 800, 600]))
+                .with_full_attachment_scissor(800, 600),
+        );
+
+        // Draw 4: pre-recorded bundle execution inheriting active viewport and cleared scissor
+        pass0.draws.push(
+            Draw::new_bundle(5, 42, 100, Vec::new())
+                .with_viewport(Some([0, 0, 800, 600]))
+                .with_scissor(None, false),
+        );
+
+        let plan = ExecutionPlan {
+            segments: vec![PlanSegment::from_pass(&pass0)],
+            canvas_epoch: None,
+            pass_count: 1,
+            split_count: 0,
+            split_reasons: Vec::new(),
+        };
+
+        let commands = lower_plan(&plan).expect("lower plan must succeed");
+
+        // Expected command stream:
+        // Command 0: Draw 0 direct draw (pass_flags: PASS_FLAG_NEW_PASS, no dummy opener!)
+        // Command 1: SetViewport [0, 0, 0, 0] (explicit zero size!)
+        // Command 2: Draw 1 direct draw (pass_flags: PASS_FLAG_NONE)
+        // Command 3: SetViewport [0, 0, 800, 600]
+        // Command 4: SetScissorRect [10, 20, 100, 200]
+        // Command 5: Draw 2 direct draw (pass_flags: PASS_FLAG_NONE)
+        // Command 6: SetScissorRect [0, 0, 800, 600] (full-attachment restore to clear clipping!)
+        // Command 7: Draw 3 direct draw (pass_flags: PASS_FLAG_NONE)
+        // Command 8: ExecuteBundles [42] (bundle inherits viewport and restored scissor without redundant sets!)
+        assert_eq!(commands.len(), 9);
+
+        // Command 0: Draw 0 directly opens pass
+        match &commands[0] {
+            GpuCommand::RenderPass { vertex_count, pass_flags, load_op, .. } => {
+                assert_eq!(*vertex_count, 3);
+                assert_eq!(*pass_flags, PASS_FLAG_NEW_PASS);
+                assert_eq!(*load_op, LOAD_OP_CLEAR);
+            }
+            other => panic!("expected RenderPass draw opening pass at 0, got {other:?}"),
+        }
+
+        // Command 1: Explicit zero viewport
+        match &commands[1] {
+            GpuCommand::SetViewport { x, y, width, height, min_depth, max_depth } => {
+                assert_eq!(*x, 0.0);
+                assert_eq!(*y, 0.0);
+                assert_eq!(*width, 0.0);
+                assert_eq!(*height, 0.0);
+                assert_eq!(*min_depth, 0.0);
+                assert_eq!(*max_depth, 1.0);
+            }
+            other => panic!("expected SetViewport(0,0,0,0) at 1, got {other:?}"),
+        }
+
+        // Command 2: Draw 1
+        assert!(matches!(&commands[2], GpuCommand::RenderPass { vertex_count: 3, pass_flags: PASS_FLAG_NONE, .. }));
+
+        // Command 3: SetViewport 800x600
+        match &commands[3] {
+            GpuCommand::SetViewport { width, height, .. } => {
+                assert_eq!(*width, 800.0);
+                assert_eq!(*height, 600.0);
+            }
+            other => panic!("expected SetViewport at 3, got {other:?}"),
+        }
+
+        // Command 4: SetScissorRect clipping box
+        match &commands[4] {
+            GpuCommand::SetScissorRect { x, y, width, height } => {
+                assert_eq!(*x, 10);
+                assert_eq!(*y, 20);
+                assert_eq!(*width, 100);
+                assert_eq!(*height, 200);
+            }
+            other => panic!("expected SetScissorRect at 4, got {other:?}"),
+        }
+
+        // Command 5: Draw 2
+        assert!(matches!(&commands[5], GpuCommand::RenderPass { vertex_count: 3, pass_flags: PASS_FLAG_NONE, .. }));
+
+        // Command 6: SetScissorRect full attachment restore
+        match &commands[6] {
+            GpuCommand::SetScissorRect { x, y, width, height } => {
+                assert_eq!(*x, 0);
+                assert_eq!(*y, 0);
+                assert_eq!(*width, 800);
+                assert_eq!(*height, 600);
+            }
+            other => panic!("expected full-attachment SetScissorRect at 6, got {other:?}"),
+        }
+
+        // Command 7: Draw 3
+        assert!(matches!(&commands[7], GpuCommand::RenderPass { vertex_count: 3, pass_flags: PASS_FLAG_NONE, .. }));
+
+        // Command 8: ExecuteBundles
+        match &commands[8] {
+            GpuCommand::ExecuteBundles { bundle_ids } => {
+                assert_eq!(bundle_ids, &alloc::vec![42]);
+            }
+            other => panic!("expected ExecuteBundles at 8, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_draw_parameters_packet_and_command_stream() {
+        let packet = build_draw_parameters_submission();
+        let commands = packet.commands();
+        assert_eq!(commands.len(), 9);
+
+        // Command 0: CreateBuffer vb2 (120 bytes)
+        match &commands[0] {
+            GpuCommand::CreateBuffer { buffer_id, size, usage } => {
+                assert_eq!(*buffer_id, 2);
+                assert_eq!(*size, 120);
+                assert_eq!(*usage, BUFFER_USAGE_VERTEX | BUFFER_USAGE_COPY_DST);
+            }
+            other => panic!("expected CreateBuffer at 0, got {other:?}"),
+        }
+
+        // Command 1: WriteBuffer vb2
+        match &commands[1] {
+            GpuCommand::WriteBuffer { buffer_id, offset, data } => {
+                assert_eq!(*buffer_id, 2);
+                assert_eq!(*offset, 0);
+                assert_eq!(data.len(), 120);
+            }
+            other => panic!("expected WriteBuffer at 1, got {other:?}"),
+        }
+
+        // Command 2: CreateTexture target 10
+        match &commands[2] {
+            GpuCommand::CreateTexture { texture_id, width, height, format, usage } => {
+                assert_eq!(*texture_id, 10);
+                assert_eq!(*width, 64);
+                assert_eq!(*height, 64);
+                assert_eq!(*format, TARGET_FORMAT_RGBA8UNORM);
+                assert_eq!(*usage, TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC);
+            }
+            other => panic!("expected CreateTexture at 2, got {other:?}"),
+        }
+
+        // Command 3: CreateBuffer readback 20
+        match &commands[3] {
+            GpuCommand::CreateBuffer { buffer_id, size, usage } => {
+                assert_eq!(*buffer_id, 20);
+                assert_eq!(*size, 16384);
+                assert_eq!(*usage, BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST);
+            }
+            other => panic!("expected CreateBuffer at 3, got {other:?}"),
+        }
+
+        // Command 4: CreatePipeline 200
+        match &commands[4] {
+            GpuCommand::CreatePipeline {
+                pipeline_id,
+                target_format,
+                has_vertex_buffer,
+                has_uniform_buffer,
+                uniform_size,
+                vertex_stride,
+                wgsl_code,
+            } => {
+                assert_eq!(*pipeline_id, 200);
+                assert_eq!(*target_format, TARGET_FORMAT_RGBA8UNORM);
+                assert!(*has_vertex_buffer);
+                assert!(!*has_uniform_buffer);
+                assert_eq!(*uniform_size, 0);
+                assert_eq!(*vertex_stride, 20);
+                assert!(wgsl_code.contains("@builtin(instance_index)"));
+                assert!(wgsl_code.contains("instance_idx == 5u"));
+                assert!(wgsl_code.contains("instance_idx == 6u"));
+            }
+            other => panic!("expected CreatePipeline at 4, got {other:?}"),
+        }
+
+        // Command 5: RenderPass opener (vertex_count: 0, pass_flags: PASS_FLAG_NEW_PASS)
+        match &commands[5] {
+            GpuCommand::RenderPass {
+                target_type,
+                target_id,
+                vertex_count,
+                pass_flags,
+                load_op,
+                store_op,
+                ..
+            } => {
+                assert_eq!(*target_type, TARGET_OFFSCREEN);
+                assert_eq!(*target_id, 10);
+                assert_eq!(*vertex_count, 0);
+                assert_eq!(*pass_flags, PASS_FLAG_NEW_PASS);
+                assert_eq!(*load_op, LOAD_OP_CLEAR);
+                assert_eq!(*store_op, STORE_OP_STORE);
+            }
+            other => panic!("expected RenderPass opener at 5, got {other:?}"),
+        }
+
+        // Command 6: SetDrawParameters (instance_count: 2, first_vertex: 3, first_instance: 5)
+        match &commands[6] {
+            GpuCommand::SetDrawParameters {
+                instance_count,
+                first_vertex,
+                first_instance,
+            } => {
+                assert_eq!(*instance_count, 2);
+                assert_eq!(*first_vertex, 3);
+                assert_eq!(*first_instance, 5);
+            }
+            other => panic!("expected SetDrawParameters at 6, got {other:?}"),
+        }
+
+        // Command 7: RenderPass direct draw (vertex_count: 3, pass_flags: PASS_FLAG_NONE)
+        match &commands[7] {
+            GpuCommand::RenderPass {
+                target_type,
+                target_id,
+                pipeline_id,
+                vertex_buffer_id,
+                vertex_count,
+                pass_flags,
+                ..
+            } => {
+                assert_eq!(*target_type, TARGET_OFFSCREEN);
+                assert_eq!(*target_id, 10);
+                assert_eq!(*pipeline_id, 200);
+                assert_eq!(*vertex_buffer_id, 2);
+                assert_eq!(*vertex_count, 3);
+                assert_eq!(*pass_flags, PASS_FLAG_NONE);
+            }
+            other => panic!("expected RenderPass draw at 7, got {other:?}"),
+        }
+
+        // Command 8: CopyTextureToBuffer (10 -> 20)
+        match &commands[8] {
+            GpuCommand::CopyTextureToBuffer { texture_id, buffer_id, width, height, .. } => {
+                assert_eq!(*texture_id, 10);
+                assert_eq!(*buffer_id, 20);
+                assert_eq!(*width, 64);
+                assert_eq!(*height, 64);
+            }
+            other => panic!("expected CopyTextureToBuffer at 8, got {other:?}"),
+        }
+
+        // Encode and verify binary wire representation
+        let wire_bytes = packet.encode().expect("encoding must succeed");
+        assert!(wire_bytes.len() >= 16);
+        assert_eq!(&wire_bytes[0..4], &PACKET_MAGIC);
+        let version = u16::from_le_bytes(wire_bytes[4..6].try_into().unwrap());
+        let flags = u16::from_le_bytes(wire_bytes[6..8].try_into().unwrap());
+        let cmd_count = u32::from_le_bytes(wire_bytes[8..12].try_into().unwrap());
+        let total_data_len = u32::from_le_bytes(wire_bytes[12..16].try_into().unwrap());
+        assert_eq!(version, 1);
+        assert_eq!(flags, 0);
+        assert_eq!(cmd_count, 9);
+        assert_eq!(total_data_len as usize, 120);
+
+        // Iterate through wire records and inspect the exact bytes for opcode 11
+        let mut cursor = 16usize;
+        let mut found_draw_parameters = false;
+        for _ in 0..cmd_count {
+            let opcode = u16::from_le_bytes(wire_bytes[cursor..cursor + 2].try_into().unwrap());
+            cursor += 2;
+            match opcode {
+                OPCODE_CREATE_BUFFER => cursor += 12,
+                OPCODE_WRITE_BUFFER => cursor += 16,
+                OPCODE_CREATE_TEXTURE => cursor += 20,
+                OPCODE_CREATE_PIPELINE => cursor += 32,
+                OPCODE_COPY_TEXTURE_TO_BUFFER => cursor += 24,
+                OPCODE_SET_VIEWPORT => cursor += 24,
+                OPCODE_SET_SCISSOR_RECT => cursor += 16,
+                OPCODE_RENDER_PASS => cursor += 44,
+                OPCODE_EXECUTE_BUNDLES => {
+                    let count = u32::from_le_bytes(wire_bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
+                    cursor += 4 + count * 4;
+                }
+                OPCODE_SET_DRAW_PARAMETERS => {
+                    let instance_count = u32::from_le_bytes(wire_bytes[cursor..cursor + 4].try_into().unwrap());
+                    let first_vertex = u32::from_le_bytes(wire_bytes[cursor + 4..cursor + 8].try_into().unwrap());
+                    let first_instance = u32::from_le_bytes(wire_bytes[cursor + 8..cursor + 12].try_into().unwrap());
+                    assert_eq!(instance_count, 2);
+                    assert_eq!(first_vertex, 3);
+                    assert_eq!(first_instance, 5);
+                    cursor += 12;
+                    found_draw_parameters = true;
+                }
+                other => panic!("unexpected opcode {other} at cursor {cursor}"),
+            }
+        }
+        assert!(found_draw_parameters, "wire stream must contain opcode 11 SetDrawParameters");
+
+        // Mathematical NDC Point-In-Triangle Proof:
+        // Triangle base (vertices 3..5): [-0.2, -0.5], [0.2, -0.5], [0.0, 0.5] (CCW winding)
+        // Instance 5 offset x = -0.5 -> [-0.7, -0.5], [-0.3, -0.5], [-0.5, 0.5] (Red)
+        // Instance 6 offset x = +0.5 -> [0.3, -0.5], [0.7, -0.5], [0.5, 0.5] (Green)
+        fn point_in_tri(px: u32, py: u32, v0: [f32; 2], v1: [f32; 2], v2: [f32; 2]) -> bool {
+            let ndc_x = (2.0 * px as f32 + 1.0) / 64.0 - 1.0;
+            let ndc_y = 1.0 - (2.0 * py as f32 + 1.0) / 64.0;
+            let cross = |a: [f32; 2], b: [f32; 2]| -> f32 {
+                (b[0] - a[0]) * (ndc_y - a[1]) - (b[1] - a[1]) * (ndc_x - a[0])
+            };
+            let c0 = cross(v0, v1);
+            let c1 = cross(v1, v2);
+            let c2 = cross(v2, v0);
+            (c0 >= 0.0 && c1 >= 0.0 && c2 >= 0.0) || (c0 <= 0.0 && c1 <= 0.0 && c2 <= 0.0)
+        }
+
+        let tri_inst5_v0 = [-0.7f32, -0.5f32];
+        let tri_inst5_v1 = [-0.3f32, -0.5f32];
+        let tri_inst5_v2 = [-0.5f32, 0.5f32];
+
+        let tri_inst6_v0 = [0.3f32, -0.5f32];
+        let tri_inst6_v1 = [0.7f32, -0.5f32];
+        let tri_inst6_v2 = [0.5f32, 0.5f32];
+
+        // Pixel (16, 32): Inside Instance 5 (Red), outside Instance 6
+        assert!(point_in_tri(16, 32, tri_inst5_v0, tri_inst5_v1, tri_inst5_v2));
+        assert!(!point_in_tri(16, 32, tri_inst6_v0, tri_inst6_v1, tri_inst6_v2));
+
+        // Pixel (48, 32): Inside Instance 6 (Green), outside Instance 5
+        assert!(!point_in_tri(48, 32, tri_inst5_v0, tri_inst5_v1, tri_inst5_v2));
+        assert!(point_in_tri(48, 32, tri_inst6_v0, tri_inst6_v1, tri_inst6_v2));
+
+        // Pixel (32, 32) [screen center]: Outside both instances -> Black
+        assert!(!point_in_tri(32, 32, tri_inst5_v0, tri_inst5_v1, tri_inst5_v2));
+        assert!(!point_in_tri(32, 32, tri_inst6_v0, tri_inst6_v1, tri_inst6_v2));
+
+        // Pixel (2, 2) [top-left corner]: Outside both instances -> Black
+        assert!(!point_in_tri(2, 2, tri_inst5_v0, tri_inst5_v1, tri_inst5_v2));
+        assert!(!point_in_tri(2, 2, tri_inst6_v0, tri_inst6_v1, tri_inst6_v2));
+    }
+
+    #[test]
+    fn test_lower_plan_draw_parameters_omitted_when_default() {
+        use f3d_graph::{
+            pass::{ColorAttachment, Draw, Pass, PassId},
+            plan::PlanSegment,
+        };
+
+        let mut pass = Pass::new_render(PassId::new(1), "pass_default");
+        pass.color_attachments.push(ColorAttachment::new_clear(
+            ResourceId::new(10),
+            [0.0, 0.0, 0.0, 1.0],
+        ));
+
+        // Default draw: instance_count: 1, first_vertex: 0, first_instance: 0
+        let draw = Draw::new(1, 100, 3, 0, Vec::new());
+        assert_eq!(draw.instance_count(), 1);
+        assert_eq!(draw.first_vertex(), 0);
+        assert_eq!(draw.first_instance(), 0);
+        pass.draws.push(draw);
+
+        let plan = ExecutionPlan {
+            segments: alloc::vec![PlanSegment::from_pass(&pass)],
+            canvas_epoch: None,
+            pass_count: 1,
+            split_count: 0,
+            split_reasons: Vec::new(),
+        };
+
+        let commands = lower_plan(&plan).expect("lower plan must succeed");
+
+        // Exactly 1 command: direct RenderPass draw with PASS_FLAG_NEW_PASS
+        // SetDrawParameters is omitted; dummy opener is omitted.
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            GpuCommand::RenderPass { vertex_count, pass_flags, .. } => {
+                assert_eq!(*vertex_count, 3);
+                assert_eq!(*pass_flags, PASS_FLAG_NEW_PASS);
+            }
+            other => panic!("expected RenderPass draw at 0, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_lower_plan_draw_parameters_zero_instance_count() {
+        use f3d_graph::{
+            pass::{ColorAttachment, Draw, Pass, PassId},
+            plan::PlanSegment,
+        };
+
+        let mut pass = Pass::new_render(PassId::new(1), "pass_zero_instances");
+        pass.color_attachments.push(ColorAttachment::new_clear(
+            ResourceId::new(10),
+            [0.0, 0.0, 0.0, 1.0],
+        ));
+
+        let mut draw = Draw::new(1, 100, 3, 0, Vec::new());
+        draw.instance_count = 0; // Zero instances requested
+        assert_eq!(draw.instance_count(), 0);
+        pass.draws.push(draw);
+
+        let plan = ExecutionPlan {
+            segments: alloc::vec![PlanSegment::from_pass(&pass)],
+            canvas_epoch: None,
+            pass_count: 1,
+            split_count: 0,
+            split_reasons: Vec::new(),
+        };
+
+        let commands = lower_plan(&plan).expect("lower plan must succeed");
+
+        // 3 commands:
+        // 0: Opener (vertex_count: 0, pass_flags: PASS_FLAG_NEW_PASS)
+        // 1: SetDrawParameters (instance_count: 0, preserved, not coerced to 1!)
+        // 2: RenderPass draw (vertex_count: 3, pass_flags: PASS_FLAG_NONE)
+        assert_eq!(commands.len(), 3);
+        assert!(matches!(&commands[0], GpuCommand::RenderPass { vertex_count: 0, pass_flags: PASS_FLAG_NEW_PASS, .. }));
+        match &commands[1] {
+            GpuCommand::SetDrawParameters { instance_count, first_vertex, first_instance } => {
+                assert_eq!(*instance_count, 0);
+                assert_eq!(*first_vertex, 0);
+                assert_eq!(*first_instance, 0);
+            }
+            other => panic!("expected SetDrawParameters at 1, got {other:?}"),
+        }
+        assert!(matches!(&commands[2], GpuCommand::RenderPass { vertex_count: 3, pass_flags: PASS_FLAG_NONE, .. }));
+    }
+
+    #[test]
+    fn test_lower_plan_draw_parameters_resets_on_subsequent_draw() {
+        use f3d_graph::{
+            pass::{ColorAttachment, Draw, Pass, PassId},
+            plan::PlanSegment,
+        };
+
+        let mut pass = Pass::new_render(PassId::new(1), "pass_subsequent_reset");
+        pass.color_attachments.push(ColorAttachment::new_clear(
+            ResourceId::new(10),
+            [0.0, 0.0, 0.0, 1.0],
+        ));
+
+        // Draw 0: non-default parameters (instance_count: 4, first_vertex: 10, first_instance: 2)
+        let mut draw0 = Draw::new(1, 100, 3, 0, Vec::new());
+        draw0.instance_count = 4;
+        draw0.first_vertex = 10;
+        draw0.first_instance = 2;
+        pass.draws.push(draw0);
+
+        // Draw 1: default parameters (instance_count: 1, first_vertex: 0, first_instance: 0)
+        let draw1 = Draw::new(2, 100, 3, 0, Vec::new());
+        pass.draws.push(draw1);
+
+        let plan = ExecutionPlan {
+            segments: alloc::vec![PlanSegment::from_pass(&pass)],
+            canvas_epoch: None,
+            pass_count: 1,
+            split_count: 0,
+            split_reasons: Vec::new(),
+        };
+
+        let commands = lower_plan(&plan).expect("lower plan must succeed");
+
+        // 4 commands:
+        // 0: Opener (pass_flags: PASS_FLAG_NEW_PASS)
+        // 1: SetDrawParameters { 4, 10, 2 }
+        // 2: Draw 0 direct draw (pass_flags: PASS_FLAG_NONE)
+        // 3: Draw 1 direct draw (pass_flags: PASS_FLAG_NONE) -- NO SetDrawParameters emitted for Draw 1!
+        assert_eq!(commands.len(), 4);
+        assert!(matches!(&commands[0], GpuCommand::RenderPass { vertex_count: 0, pass_flags: PASS_FLAG_NEW_PASS, .. }));
+        assert!(matches!(&commands[1], GpuCommand::SetDrawParameters { instance_count: 4, first_vertex: 10, first_instance: 2 }));
+        assert!(matches!(&commands[2], GpuCommand::RenderPass { vertex_count: 3, pass_flags: PASS_FLAG_NONE, .. }));
+        assert!(matches!(&commands[3], GpuCommand::RenderPass { vertex_count: 3, pass_flags: PASS_FLAG_NONE, .. }));
+    }
+
+    #[test]
+    fn test_lower_plan_draw_parameters_on_second_draw_after_default_first() {
+        use f3d_graph::{
+            pass::{ColorAttachment, Draw, Pass, PassId},
+            plan::PlanSegment,
+        };
+
+        let mut pass = Pass::new_render(PassId::new(1), "pass_default_then_nondefault");
+        pass.color_attachments.push(ColorAttachment::new_clear(
+            ResourceId::new(10),
+            [0.0, 0.0, 0.0, 1.0],
+        ));
+
+        // Draw 0: default parameters
+        let draw0 = Draw::new(1, 100, 3, 0, Vec::new());
+        pass.draws.push(draw0);
+
+        // Draw 1: non-default parameters (3, 6, 1)
+        let mut draw1 = Draw::new(2, 100, 3, 0, Vec::new());
+        draw1.instance_count = 3;
+        draw1.first_vertex = 6;
+        draw1.first_instance = 1;
+        pass.draws.push(draw1);
+
+        let plan = ExecutionPlan {
+            segments: alloc::vec![PlanSegment::from_pass(&pass)],
+            canvas_epoch: None,
+            pass_count: 1,
+            split_count: 0,
+            split_reasons: Vec::new(),
+        };
+
+        let commands = lower_plan(&plan).expect("lower plan must succeed");
+
+        // 3 commands:
+        // 0: Draw 0 directly opens pass (pass_flags: PASS_FLAG_NEW_PASS)
+        // 1: SetDrawParameters { 3, 6, 1 }
+        // 2: Draw 1 direct draw (pass_flags: PASS_FLAG_NONE)
+        assert_eq!(commands.len(), 3);
+        assert!(matches!(&commands[0], GpuCommand::RenderPass { vertex_count: 3, pass_flags: PASS_FLAG_NEW_PASS, .. }));
+        assert!(matches!(&commands[1], GpuCommand::SetDrawParameters { instance_count: 3, first_vertex: 6, first_instance: 1 }));
+        assert!(matches!(&commands[2], GpuCommand::RenderPass { vertex_count: 3, pass_flags: PASS_FLAG_NONE, .. }));
     }
 }
