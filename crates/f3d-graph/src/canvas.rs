@@ -55,7 +55,8 @@ pub enum CanvasFormat {
 
 /// Concrete canvas swapchain output resource representation for a single frame interval.
 ///
-/// Invariant: Valid strictly between `begin_frame_acquire` and `submit_frame`.
+/// Invariant: Valid between `begin_frame_acquire` and `end_frame_interval`.
+/// Queue submission does not end this interval; multiple submissions may use it.
 /// The pass graph refuses to cache or retain canvas textures across output epochs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -84,7 +85,7 @@ struct CanvasState {
     format: CanvasFormat,
     current_epoch: Epoch,
     is_acquired_in_interval: bool,
-    is_submitted: bool,
+    interval_ended: bool,
 }
 
 /// Manages per-canvas output epochs and validates interval acquisition freshness (§8.5, [S48]).
@@ -131,7 +132,7 @@ impl CanvasEpochTracker {
                 format,
                 current_epoch: Epoch::ZERO,
                 is_acquired_in_interval: false,
-                is_submitted: false,
+                interval_ended: false,
             });
         }
     }
@@ -168,7 +169,7 @@ impl CanvasEpochTracker {
             })?;
         state.current_epoch = next_epoch;
         state.is_acquired_in_interval = true;
-        state.is_submitted = false;
+        state.interval_ended = false;
 
         Ok(CanvasOutput {
             canvas_id,
@@ -194,8 +195,8 @@ impl CanvasEpochTracker {
                 canvas_id: canvas_id.get(),
             })?;
 
-        if state.is_submitted {
-            return Err(CanvasError::CanvasAlreadySubmitted {
+        if state.interval_ended {
+            return Err(CanvasError::CanvasIntervalEnded {
                 canvas_id: canvas_id.get(),
                 epoch: state.current_epoch.get(),
             });
@@ -228,8 +229,11 @@ impl CanvasEpochTracker {
         Ok(())
     }
 
-    /// Marks the canvas frame interval as submitted, preventing any further use until the next acquire.
-    pub fn submit_frame(&mut self, canvas_id: CanvasId, epoch: Epoch) -> Result<(), CanvasError> {
+    /// Ends the host's rendering interval, preventing use until the next acquire.
+    ///
+    /// Call when the host expires the acquired canvas texture, not after each
+    /// `queue.submit`. Multiple submissions within one interval remain legal.
+    pub fn end_frame_interval(&mut self, canvas_id: CanvasId, epoch: Epoch) -> Result<(), CanvasError> {
         self.validate_canvas_access(canvas_id, epoch)?;
         let state = self
             .canvases
@@ -237,7 +241,7 @@ impl CanvasEpochTracker {
             .find(|c| c.canvas_id == canvas_id)
             .unwrap();
         state.is_acquired_in_interval = false;
-        state.is_submitted = true;
+        state.interval_ended = true;
         Ok(())
     }
 
@@ -259,7 +263,7 @@ impl CanvasEpochTracker {
         state.width = new_width;
         state.height = new_height;
         state.is_acquired_in_interval = false;
-        state.is_submitted = false;
+        state.interval_ended = false;
 
         let next_epoch = state
             .current_epoch

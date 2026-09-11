@@ -10,8 +10,8 @@
 //! - **Pass Splitting**: Render passes containing attachment versus sampling conflicts are
 //!   automatically split into ordered sequential passes where draw equivalence permits.
 //! - **Compute Dispatch Scope**: Writable aliases within a single compute dispatch are strictly forbidden.
-//! - **Canvas Freshness**: Canvas swapchain textures are valid strictly inside the frame's
-//!   acquire-to-submit interval and are never cached across frames. Multiple canvases maintain
+//! - **Canvas Freshness**: Canvas textures are valid inside the host's acquisition interval,
+//!   which can include multiple queue submissions. They are never cached across frames. Canvases maintain
 //!   distinct, independent output epochs.
 //! - **No Silent Drops or Fabricated Barriers**: The graph preserves every valid pass and never
 //!   invents synthetic native memory barriers not exposed by WebGPU.

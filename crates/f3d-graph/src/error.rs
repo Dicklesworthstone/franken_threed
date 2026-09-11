@@ -291,11 +291,11 @@ pub enum CanvasError {
         /// Target canvas ID.
         canvas_id: u32,
     },
-    /// Canvas texture used after the frame interval was already submitted.
-    CanvasAlreadySubmitted {
+    /// Canvas texture used after the host ended its acquisition interval.
+    CanvasIntervalEnded {
         /// Target canvas ID.
         canvas_id: u32,
-        /// Submitted epoch.
+        /// Ended interval's epoch.
         epoch: u64,
     },
     /// Attempted to cache a canvas texture across output epochs.
@@ -339,10 +339,10 @@ impl fmt::Display for CanvasError {
                     "canvas {canvas_id} texture not acquired; must acquire before rendering"
                 )
             }
-            Self::CanvasAlreadySubmitted { canvas_id, epoch } => {
+            Self::CanvasIntervalEnded { canvas_id, epoch } => {
                 write!(
                     f,
-                    "canvas {canvas_id} texture at epoch {epoch} was already submitted"
+                    "canvas {canvas_id} texture acquisition interval at epoch {epoch} has ended"
                 )
             }
             Self::CanvasCachedAcrossEpochs {

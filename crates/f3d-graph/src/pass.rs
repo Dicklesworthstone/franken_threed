@@ -406,6 +406,17 @@ pub struct Draw {
     /// A direct draw following a bundle cannot assume warm state (`assumes_warm_state = true`)
     /// and must explicitly rebind (`assumes_warm_state = false`).
     pub assumes_warm_state: bool,
+    /// Active viewport rectangle `[x, y, width, height]` for this draw call (§8.5).
+    /// `None` indicates the draw inherits the default pass/render-target viewport.
+    /// `Some([x, y, width, height])` explicitly sets the viewport, allowing explicit zero-size viewports.
+    pub viewport: Option<[u32; 4]>,
+    /// Active scissor rectangle `[x, y, width, height]` for this draw call (§8.5).
+    /// When `scissor_test_enabled` is true, this is the active clipping rectangle.
+    /// When `scissor_test_enabled` is false, this is either `None` (unspecified) or `Some([0, 0, width, height])`
+    /// representing the full attachment scissor needed to clear clipping after a previous scissor draw.
+    pub scissor: Option<[u32; 4]>,
+    /// Whether scissor test is enabled for this draw call.
+    pub scissor_test_enabled: bool,
 }
 
 impl Draw {
@@ -428,6 +439,9 @@ impl Draw {
             uses,
             kind: DrawKind::Direct,
             assumes_warm_state: false,
+            viewport: None,
+            scissor: None,
+            scissor_test_enabled: false,
         }
     }
 
@@ -449,6 +463,9 @@ impl Draw {
             uses,
             kind: DrawKind::Bundle { bundle_id },
             assumes_warm_state: false,
+            viewport: None,
+            scissor: None,
+            scissor_test_enabled: false,
         }
     }
 
@@ -471,6 +488,9 @@ impl Draw {
             uses,
             kind: DrawKind::Direct,
             assumes_warm_state: true,
+            viewport: None,
+            scissor: None,
+            scissor_test_enabled: false,
         }
     }
 
@@ -603,6 +623,87 @@ impl Draw {
     #[must_use]
     pub const fn rebind_required(&self) -> bool {
         !self.assumes_warm_state
+    }
+
+    /// Configure the active viewport rectangle for this draw call (§8.5).
+    /// `None` indicates the draw inherits the default pass/render-target viewport.
+    #[must_use]
+    pub const fn with_viewport(mut self, viewport: Option<[u32; 4]>) -> Self {
+        self.viewport = viewport;
+        self
+    }
+
+    /// Configure an explicit active viewport rectangle `[x, y, width, height]` for this draw call (§8.5).
+    #[must_use]
+    pub const fn with_viewport_rect(mut self, viewport: [u32; 4]) -> Self {
+        self.viewport = Some(viewport);
+        self
+    }
+
+    /// Configure the active scissor rectangle and test enable flag (§8.5).
+    #[must_use]
+    pub const fn with_scissor(mut self, scissor: Option<[u32; 4]>, enabled: bool) -> Self {
+        self.scissor = scissor;
+        self.scissor_test_enabled = enabled;
+        self
+    }
+
+    /// Configure an explicit active scissor rectangle `[x, y, width, height]` with testing enabled (§8.5).
+    #[must_use]
+    pub const fn with_scissor_rect(mut self, scissor: [u32; 4]) -> Self {
+        self.scissor = Some(scissor);
+        self.scissor_test_enabled = true;
+        self
+    }
+
+    /// Configure an explicit full-attachment scissor rectangle `[0, 0, width, height]` to clear clipping (§8.5).
+    #[must_use]
+    pub const fn with_full_attachment_scissor(mut self, width: u32, height: u32) -> Self {
+        self.scissor = Some([0, 0, width, height]);
+        self.scissor_test_enabled = false;
+        self
+    }
+
+    /// Configure direct draw parameters `[vertex_count, instance_count, first_vertex, first_instance]` in WebGPU order (§8.5).
+    #[must_use]
+    pub const fn with_range(mut self, range: [u32; 4]) -> Self {
+        self.vertex_count = range[0];
+        self.instance_count = range[1];
+        self.first_vertex = range[2];
+        self.first_instance = range[3];
+        self
+    }
+
+    /// Active viewport rectangle `[x, y, width, height]` for this draw call.
+    #[inline]
+    #[must_use]
+    pub const fn viewport(&self) -> Option<[u32; 4]> {
+        self.viewport
+    }
+
+    /// Active viewport rectangle converted to WebGPU coordinates `[x, y, width, height, min_depth, max_depth]`.
+    #[inline]
+    #[must_use]
+    pub const fn viewport_f32(&self) -> Option<[f32; 6]> {
+        if let Some(vp) = self.viewport {
+            Some([vp[0] as f32, vp[1] as f32, vp[2] as f32, vp[3] as f32, 0.0, 1.0])
+        } else {
+            None
+        }
+    }
+
+    /// Active scissor rectangle `[x, y, width, height]` for this draw call.
+    #[inline]
+    #[must_use]
+    pub const fn scissor(&self) -> Option<[u32; 4]> {
+        self.scissor
+    }
+
+    /// Whether scissor test is enabled for this draw call.
+    #[inline]
+    #[must_use]
+    pub const fn scissor_test_enabled(&self) -> bool {
+        self.scissor_test_enabled
     }
 }
 

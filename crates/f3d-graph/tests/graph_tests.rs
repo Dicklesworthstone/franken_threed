@@ -13,6 +13,7 @@
 //! 10. WebGPU copy bytes_per_row 256-byte alignment (width 32 -> 256 bytes).
 //! 11. Red-A / Blue-B versioned buffer snapshot schedule.
 
+use core::num::NonZeroU32;
 use f3d_core::handle::{Handle, MaterialDomain};
 use f3d_core::layout::{aligned_bytes_per_row, COPY_BYTES_PER_ROW_ALIGNMENT};
 use f3d_core::ownership::{DataVersion, Epoch, PerUseByteBuffer};
@@ -440,7 +441,7 @@ fn test_canvas_stale_captured_epoch_rejected_on_tracker_advance() {
     assert!(plan1.validate_execution(&tracker).is_ok());
 
     // Submit frame 1 and advance to Frame 2 (epoch e2)
-    tracker.submit_frame(canvas_id, epoch_e1).expect("submit frame 1");
+    tracker.end_frame_interval(canvas_id, epoch_e1).expect("end frame 1 interval");
     let out2 = tracker.begin_frame_acquire(canvas_id).expect("frame 2 acquire");
     let epoch_e2 = out2.epoch;
     assert_ne!(epoch_e1, epoch_e2);
@@ -759,7 +760,7 @@ fn negative_canvas_texture_cached_across_output_epochs_fails() {
     // Frame 1: Acquire and get epoch 1
     let frame1_output = tracker.begin_frame_acquire(canvas_id).expect("frame 1 acquire");
     let cached_epoch = frame1_output.epoch;
-    tracker.submit_frame(canvas_id, cached_epoch).expect("frame 1 submit");
+    tracker.end_frame_interval(canvas_id, cached_epoch).expect("end frame 1 interval");
 
     // Frame 2: Acquire next interval
     let frame2_output = tracker.begin_frame_acquire(canvas_id).expect("frame 2 acquire");
@@ -809,14 +810,16 @@ fn canvas_lifecycle_acquisition_interval_and_zero_size_policy() {
     assert_eq!(output.width, 1024);
     assert_eq!(output.height, 768);
 
-    // 4. Submit then access again fails with CanvasAlreadySubmitted
-    tracker.submit_frame(canvas_id, output.epoch).expect("submit ok");
+    // 4. Repeated accesses remain valid until the host ends the interval.
+    tracker.validate_canvas_access(canvas_id, output.epoch).expect("first access");
+    tracker.validate_canvas_access(canvas_id, output.epoch).expect("second access");
+    tracker.end_frame_interval(canvas_id, output.epoch).expect("end interval");
     let err = tracker
         .validate_canvas_access(canvas_id, output.epoch)
-        .expect_err("submitted canvas cannot be reused");
+        .expect_err("expired canvas cannot be reused");
     assert_eq!(
         err,
-        CanvasError::CanvasAlreadySubmitted {
+        CanvasError::CanvasIntervalEnded {
             canvas_id: 2,
             epoch: output.epoch.get()
         }
@@ -835,10 +838,10 @@ fn multiple_canvases_maintain_independent_epochs() {
     let out1 = tracker.begin_frame_acquire(c1).unwrap();
     let out2 = tracker.begin_frame_acquire(c2).unwrap();
 
-    // Submit c1 only
-    tracker.submit_frame(c1, out1.epoch).unwrap();
+    // End c1's interval only.
+    tracker.end_frame_interval(c1, out1.epoch).unwrap();
 
-    // c1 is submitted, c2 is still valid in its interval
+    // c1 is expired, c2 is still valid in its interval.
     assert!(tracker.validate_canvas_access(c1, out1.epoch).is_err());
     assert!(tracker.validate_canvas_access(c2, out2.epoch).is_ok());
 
@@ -1731,4 +1734,85 @@ fn property_test_dag_compilation_always_yields_valid_topological_order() {
             }
         }
     }
+}
+
+#[test]
+fn test_draw_viewport_and_scissor_accessors_and_compilation() {
+    let mut graph = PassGraph::new();
+    let pass_id = PassId::new(1);
+    let mut pass = Pass::new_render(pass_id, "viewport_scissor_pass")
+        .with_color_attachment(ColorAttachment::new_clear(ResourceId::new(10), [0.0, 0.0, 0.0, 1.0]));
+
+    // 1. Default draw has None for viewport/scissor and disabled scissor test
+    let default_draw = Draw::new(1, 100, 3, 0, vec![]);
+    assert_eq!(default_draw.viewport(), None);
+    assert_eq!(default_draw.scissor(), None);
+    assert!(!default_draw.scissor_test_enabled());
+
+    // 2. Explicit zero-size viewport (near-neighbor case: distinct from None default)
+    let draw_explicit_zero = Draw::new(2, 100, 3, 0, vec![])
+        .with_viewport_rect([0, 0, 0, 0]);
+    assert_eq!(draw_explicit_zero.viewport(), Some([0, 0, 0, 0]));
+    assert_ne!(draw_explicit_zero.viewport(), default_draw.viewport());
+
+    // 3. Configure distinct non-zero viewport and scissor state
+    let draw_configured = Draw::new(3, 101, 6, 256, vec![])
+        .with_viewport_rect([0, 0, 1920, 1080])
+        .with_scissor_rect([100, 200, 800, 600]);
+
+    assert_eq!(draw_configured.viewport(), Some([0, 0, 1920, 1080]));
+    assert_eq!(draw_configured.viewport_f32(), Some([0.0, 0.0, 1920.0, 1080.0, 0.0, 1.0]));
+    assert_eq!(draw_configured.scissor(), Some([100, 200, 800, 600]));
+    assert!(draw_configured.scissor_test_enabled());
+
+    // 4. Scissor-disable after enable: emit full-attachment scissor to clear clipping
+    let draw_restore_scissor = Draw::new(4, 102, 3, 0, vec![])
+        .with_full_attachment_scissor(1920, 1080);
+    assert_eq!(draw_restore_scissor.scissor(), Some([0, 0, 1920, 1080]));
+    assert!(!draw_restore_scissor.scissor_test_enabled());
+
+    pass = pass
+        .with_draw(default_draw)
+        .with_draw(draw_explicit_zero)
+        .with_draw(draw_configured)
+        .with_draw(draw_restore_scissor);
+    graph.add_pass(pass).expect("add pass");
+
+    // 5. Compile and verify viewport/scissor preservation in execution plan
+    let plan = graph.compile(None).expect("compile plan");
+    assert_eq!(plan.segment_count(), 1);
+    let draws = plan.segments()[0].draws();
+    assert_eq!(draws.len(), 4);
+
+    assert_eq!(draws[0].viewport(), None);
+    assert_eq!(draws[0].scissor(), None);
+    assert!(!draws[0].scissor_test_enabled());
+
+    assert_eq!(draws[1].viewport(), Some([0, 0, 0, 0]));
+
+    assert_eq!(draws[2].viewport(), Some([0, 0, 1920, 1080]));
+    assert_eq!(draws[2].scissor(), Some([100, 200, 800, 600]));
+    assert!(draws[2].scissor_test_enabled());
+
+    assert_eq!(draws[3].scissor(), Some([0, 0, 1920, 1080]));
+    assert!(!draws[3].scissor_test_enabled());
+}
+
+#[test]
+fn test_draw_with_range_preserves_explicit_parameters() {
+    let draw = Draw::new(1, 10, 0, 0, vec![])
+        .with_range([3, 2, 3, 5]);
+
+    assert_eq!(draw.vertex_count, 3);
+    assert_eq!(draw.instance_count(), 2);
+    assert_eq!(draw.first_vertex(), 3);
+    assert_eq!(draw.first_instance(), 5);
+
+    let draw_zero = Draw::new(2, 10, 0, 0, vec![])
+        .with_range([6, 0, 0, 0]);
+
+    assert_eq!(draw_zero.vertex_count, 6);
+    assert_eq!(draw_zero.instance_count(), 0);
+    assert_eq!(draw_zero.first_vertex(), 0);
+    assert_eq!(draw_zero.first_instance(), 0);
 }
