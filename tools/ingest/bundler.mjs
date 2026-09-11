@@ -38,15 +38,10 @@ export function f3dRollupPlugin(options = {}) {
         ? (importer.startsWith('file://') ? importer : pathToFileURL(path.resolve(importer)).href)
         : mapBaseUrl;
 
-      try {
-        const resolved = resolveModuleSpecifier(source, referrerUrl, importMap, {
-          mapBaseUrl,
-          packageRootUrl: options.packageRootUrl
-        });
-        return resolved;
-      } catch (err) {
-        return null;
-      }
+      return resolveModuleSpecifier(source, referrerUrl, importMap, {
+        mapBaseUrl,
+        packageRootUrl: options.packageRootUrl
+      });
     },
 
     load(id) {
@@ -65,12 +60,32 @@ export function f3dRollupPlugin(options = {}) {
 }
 
 /**
+ * @typedef {Object} EmittedChunk
+ * @property {string} fileName - Emitted relative file name
+ * @property {string} code - Generated JavaScript source code
+ * @property {string[]} modules - Module IDs included in this chunk
+ * @property {boolean} isEntry - True if this chunk corresponds to a root entry point
+ * @property {boolean} isDynamicEntry - True if generated from a dynamic import()
+ * @property {string[]} imports - Static dependency chunk file names
+ * @property {string[]} dynamicImports - Dynamic dependency chunk file names
+ * @property {string | null} facadeModuleId - Module ID for entry chunks
+ */
+
+/**
  * Executes an actual Rollup build for an HTML or ESM entry point,
  * producing bundled output code.
  *
  * @param {string} entryPath
  * @param {Object} [options]
- * @returns {Promise<{ code: string, modules: string[] }>}
+ * @returns {Promise<{
+ *   code: string,
+ *   modules: string[],
+ *   isMultiChunk: boolean,
+ *   entryFiles: string[],
+ *   files: Record<string, string>,
+ *   outputChunks: EmittedChunk[],
+ *   chunks: EmittedChunk[]
+ * }>}
  */
 export async function bundleWithRollup(entryPath, options = {}) {
   const resolvedEntryAbs = path.resolve(entryPath);
@@ -79,7 +94,8 @@ export async function bundleWithRollup(entryPath, options = {}) {
 
   let importMap = { imports: {}, scopes: {} };
   const inlineModules = new Map();
-  let inputEntry = entryUrl;
+  let input;
+  const orderedEntryIds = [];
 
   if (isHtml) {
     const htmlContent = fs.readFileSync(resolvedEntryAbs, 'utf-8');
@@ -90,43 +106,128 @@ export async function bundleWithRollup(entryPath, options = {}) {
       throw new Error(`No module scripts found in ${entryPath}`);
     }
 
-    const firstScript = parsed.moduleScripts[0];
-    inputEntry = firstScript.id;
-
     for (const s of parsed.moduleScripts) {
       if (s.inlineContent !== null) {
         inlineModules.set(s.id, s.inlineContent);
       }
+      orderedEntryIds.push(s.id);
     }
+
+    if (parsed.moduleScripts.length === 1 && parsed.moduleScripts[0].src) {
+      input = parsed.moduleScripts[0].id;
+    } else {
+      input = {};
+      parsed.moduleScripts.forEach((s, idx) => {
+        let name;
+        if (s.src) {
+          const cleanSrc = s.src.split('?')[0].split('#')[0];
+          name = path.basename(cleanSrc).replace(/\.[^/.]+$/, '') || 'script';
+        } else {
+          name = `inline_${idx}`;
+        }
+        let entryKey = name;
+        let counter = 1;
+        while (Object.prototype.hasOwnProperty.call(input, entryKey)) {
+          entryKey = `${name}_${counter++}`;
+        }
+        input[entryKey] = s.id;
+      });
+    }
+  } else {
+    input = entryUrl;
+    orderedEntryIds.push(entryUrl);
   }
 
-  const bundle = await rollup({
-    input: inputEntry,
-    plugins: [
-      f3dRollupPlugin({
-        importMap,
-        mapBaseUrl: entryUrl,
-        inlineModules,
-        packageRootUrl: options.packageRootUrl
-      })
-    ],
-    onwarn(warning, warn) {
-      // Suppress known non-fatal warnings (e.g. eval in 3rd party libs or circular deps)
-      if (warning.code === 'CIRCULAR_DEPENDENCY' || warning.code === 'THIS_IS_UNDEFINED') {
-        return;
+  let bundle;
+  try {
+    bundle = await rollup({
+      input,
+      plugins: [
+        f3dRollupPlugin({
+          importMap,
+          mapBaseUrl: entryUrl,
+          inlineModules,
+          packageRootUrl: options.packageRootUrl
+        })
+      ],
+      onwarn(warning, warn) {
+        // Suppress known non-fatal warnings (e.g. eval in 3rd party libs or circular deps)
+        if (warning.code === 'CIRCULAR_DEPENDENCY' || warning.code === 'THIS_IS_UNDEFINED') {
+          return;
+        }
+        // Forward all other warnings honestly
+        warn(warning);
       }
-      // Pass other warnings through
+    });
+
+    const { output } = await bundle.generate({
+      format: 'es'
+    });
+
+    const chunks = output.filter(chunk => chunk.type === 'chunk');
+
+    // Match entry chunks in exact HTML document order
+    const entryChunks = [];
+    const matchedChunkSet = new Set();
+
+    for (const entryId of orderedEntryIds) {
+      const chunk = chunks.find(c => c.facadeModuleId === entryId);
+      if (chunk && !matchedChunkSet.has(chunk)) {
+        entryChunks.push(chunk);
+        matchedChunkSet.add(chunk);
+      }
     }
-  });
 
-  const { output } = await bundle.generate({
-    format: 'es'
-  });
+    for (const chunk of chunks) {
+      if (chunk.isEntry && !matchedChunkSet.has(chunk)) {
+        entryChunks.push(chunk);
+        matchedChunkSet.add(chunk);
+      }
+    }
 
-  const primaryChunk = output.find(chunk => chunk.type === 'chunk');
+    const primaryChunk = entryChunks[0] || chunks[0] || null;
 
-  return {
-    code: primaryChunk ? primaryChunk.code : '',
-    modules: primaryChunk ? Object.keys(primaryChunk.modules) : []
-  };
+    // Collect all modules across all emitted chunks
+    const allModules = [];
+    const seenModules = new Set();
+    for (const chunk of chunks) {
+      for (const mod of Object.keys(chunk.modules || {})) {
+        if (!seenModules.has(mod)) {
+          seenModules.add(mod);
+          allModules.push(mod);
+        }
+      }
+    }
+
+    const outputChunks = chunks.map(c => ({
+      fileName: c.fileName,
+      code: c.code,
+      modules: Object.keys(c.modules || {}),
+      isEntry: Boolean(c.isEntry),
+      isDynamicEntry: Boolean(c.isDynamicEntry),
+      imports: c.imports || [],
+      dynamicImports: c.dynamicImports || [],
+      facadeModuleId: c.facadeModuleId || null
+    }));
+
+    const entryFiles = entryChunks.map(c => c.fileName);
+    const files = Object.fromEntries(chunks.map(c => [c.fileName, c.code]));
+
+    return {
+      // Backward compatibility for single-chunk callers
+      code: primaryChunk ? primaryChunk.code : '',
+      modules: allModules,
+
+      // Multi-chunk & dynamic chunk support
+      isMultiChunk: chunks.length > 1,
+      entryFiles,
+      files,
+      outputChunks,
+      chunks: outputChunks
+    };
+  } finally {
+    if (bundle) {
+      await bundle.close();
+    }
+  }
 }
