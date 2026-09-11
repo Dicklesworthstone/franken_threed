@@ -574,6 +574,66 @@ fn vertex_pos_uv_and_color_uniform_wire_invariants() {
     assert_eq!(restored_v2, vertices[2]);
 }
 
+#[test]
+fn vertex_pos_normal_uv_and_color_offsets_and_sizes() {
+    // 1. VertexPosNormalUv: 32 bytes, 4-byte aligned, stride 32
+    assert_eq!(core::mem::size_of::<VertexPosNormalUv>(), 32);
+    assert_eq!(core::mem::align_of::<VertexPosNormalUv>(), 4);
+    assert_eq!(core::mem::offset_of!(VertexPosNormalUv, position), 0);
+    assert_eq!(core::mem::offset_of!(VertexPosNormalUv, normal), 12);
+    assert_eq!(core::mem::offset_of!(VertexPosNormalUv, uv), 24);
+    assert_eq!(VERTEX_POS_NORMAL_UV_BYTES, 32);
+    assert_eq!(VERTEX_POS_NORMAL_UV_STRIDE, 32);
+    assert_eq!(VERTEX_POS_NORMAL_UV_ALIGNMENT, 4);
+    assert_eq!(VertexPosNormalUv::BYTE_SIZE, 32);
+    assert_eq!(VertexPosNormalUv::STRIDE, 32);
+    assert_eq!(VertexPosNormalUv::ALIGNMENT, 4);
+
+    // 2. VertexPosColor: 28 bytes, 4-byte aligned, stride 28
+    assert_eq!(core::mem::size_of::<VertexPosColor>(), 28);
+    assert_eq!(core::mem::align_of::<VertexPosColor>(), 4);
+    assert_eq!(core::mem::offset_of!(VertexPosColor, position), 0);
+    assert_eq!(core::mem::offset_of!(VertexPosColor, color), 12);
+    assert_eq!(VERTEX_POS_COLOR_BYTES, 28);
+    assert_eq!(VERTEX_POS_COLOR_STRIDE, 28);
+    assert_eq!(VERTEX_POS_COLOR_ALIGNMENT, 4);
+    assert_eq!(VertexPosColor::BYTE_SIZE, 28);
+    assert_eq!(VertexPosColor::STRIDE, 28);
+    assert_eq!(VertexPosColor::ALIGNMENT, 4);
+
+    // 3. Multi-vertex buffer packing test for VertexPosNormalUv
+    let pnu_vertices = [
+        VertexPosNormalUv::new([0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [0.5, 1.0]),
+        VertexPosNormalUv::new([-1.0, -1.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0]),
+        VertexPosNormalUv::new([1.0, -1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0]),
+    ];
+    let mut pnu_bytes = [0u8; 96];
+    for (i, v) in pnu_vertices.iter().enumerate() {
+        v.write_to_slice(&mut pnu_bytes[i * 32..(i + 1) * 32]).expect("write pnu vertex");
+    }
+    for (i, v) in pnu_vertices.iter().enumerate() {
+        let restored = VertexPosNormalUv::read_from_slice(&pnu_bytes[i * 32..(i + 1) * 32])
+            .expect("read pnu vertex");
+        assert_eq!(restored, *v);
+    }
+
+    // 4. Multi-vertex buffer packing test for VertexPosColor
+    let pc_vertices = [
+        VertexPosColor::new([0.0, 1.0, 0.0], [1.0, 0.0, 0.0, 1.0]),
+        VertexPosColor::new([-1.0, -1.0, 0.0], [0.0, 1.0, 0.0, 1.0]),
+        VertexPosColor::new([1.0, -1.0, 0.0], [0.0, 0.0, 1.0, 1.0]),
+    ];
+    let mut pc_bytes = [0u8; 84];
+    for (i, v) in pc_vertices.iter().enumerate() {
+        v.write_to_slice(&mut pc_bytes[i * 28..(i + 1) * 28]).expect("write pc vertex");
+    }
+    for (i, v) in pc_vertices.iter().enumerate() {
+        let restored = VertexPosColor::read_from_slice(&pc_bytes[i * 28..(i + 1) * 28])
+            .expect("read pc vertex");
+        assert_eq!(restored, *v);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Seeded deterministic property tests (f3d-05-ids-layouts-epochs-transport-vqa.3)
 // ---------------------------------------------------------------------------
@@ -777,32 +837,71 @@ fn property_test_affine_rows_rejection_of_non_affine_rows() {
         // Perturbation target: 0 = e[3], 1 = e[7], 2 = e[11], 3 = e[15]
         let target = (rng.next_u32() % 4) as usize;
         let mut perturbed = elements;
+        let stride = i % 8;
         match target {
             0 => {
-                let mut v = rng.next_f32();
-                if v == 0.0 {
-                    v = 5e-7;
-                }
-                perturbed[3] = v;
+                // Perturb e[3]
+                perturbed[3] = match stride {
+                    0 => f32::from_bits(1),           // subnormal float
+                    1 => -5e-7,                       // negative small perspective
+                    2 => f32::MAX,                    // max finite float
+                    3 => f32::MIN_POSITIVE,           // minimum positive normal float
+                    4 => -f32::MAX,                   // negative max finite float
+                    5 => 5e-7,                        // analytical counterexample value
+                    6 => 1e-15,                       // tiny float
+                    _ => {
+                        let v = rng.next_f32();
+                        if v == 0.0 { 0.5 } else { v }
+                    }
+                };
             }
             1 => {
-                let mut v = rng.next_f32();
-                if v == 0.0 {
-                    v = 1e-15;
-                }
-                perturbed[7] = v;
+                // Perturb e[7]
+                perturbed[7] = match stride {
+                    0 => f32::from_bits(1),           // subnormal float
+                    1 => -1e-15,                      // tiny negative float
+                    2 => f32::MAX,                    // max finite float
+                    3 => f32::MIN_POSITIVE,           // minimum positive normal float
+                    4 => -f32::MAX,                   // negative max finite float
+                    5 => 1e-15,                       // analytical tiny value
+                    6 => 5e-7,                        // analytical counterexample value
+                    _ => {
+                        let v = rng.next_f32();
+                        if v == 0.0 { -0.5 } else { v }
+                    }
+                };
             }
             2 => {
-                let mut v = rng.next_f32();
-                if v == 0.0 {
-                    v = f32::from_bits(1);
-                } // subnormal
-                perturbed[11] = v;
+                // Perturb e[11]
+                perturbed[11] = match stride {
+                    0 => f32::from_bits(1),           // subnormal float
+                    1 => f32::from_bits(0x8000_0001), // negative subnormal float
+                    2 => f32::MAX,                    // max finite float
+                    3 => f32::MIN_POSITIVE,           // minimum positive normal float
+                    4 => -1.0,                        // standard perspective depth value
+                    5 => 5e-7,                        // analytical counterexample value
+                    6 => 1e-15,                       // tiny float
+                    _ => {
+                        let v = rng.next_f32();
+                        if v == 0.0 { 2.0 } else { v }
+                    }
+                };
             }
             _ => {
-                // e[15] != 1.0
-                let delta = rng.next_f32();
-                perturbed[15] = if delta == 0.0 { 0.0 } else { 1.0 + delta };
+                // Perturb e[15] (affine requires exactly 1.0)
+                perturbed[15] = match stride {
+                    0 => 0.0,                         // standard zero
+                    1 => -0.0,                        // negative zero (-0.0 != 1.0, must reject)
+                    2 => f32::MAX,                    // max finite float
+                    3 => f32::from_bits(1),           // subnormal float
+                    4 => -1.0,                        // negative one
+                    5 => 1.0 + 1e-7,                  // near-one high
+                    6 => 0.9999999,                   // near-one low
+                    _ => {
+                        let delta = rng.next_f32();
+                        1.0 + if delta == 0.0 { 0.5 } else { delta }
+                    }
+                };
             }
         }
 
@@ -838,29 +937,68 @@ fn property_test_affine_rows_rejection_of_non_affine_rows() {
         let mut perturbed_f64 = elements_f64;
         match target {
             0 => {
-                let mut v = rng.next_f64();
-                if v == 0.0 {
-                    v = 1e-15;
-                }
-                perturbed_f64[3] = v;
+                // Perturb e[3] in f64
+                perturbed_f64[3] = match stride {
+                    0 => f64::from_bits(1),           // subnormal f64
+                    1 => -1e-15,                      // small analytical negative perspective
+                    2 => f64::MAX,                    // max finite f64
+                    3 => f64::MIN_POSITIVE,           // minimum positive normal f64
+                    4 => -f64::MAX,                   // negative max finite f64
+                    5 => 1e-15,                       // analytical tiny value
+                    6 => 1e-30,                       // ultra-tiny value
+                    _ => {
+                        let v = rng.next_f64();
+                        if v == 0.0 { 0.5 } else { v }
+                    }
+                };
             }
             1 => {
-                let mut v = rng.next_f64();
-                if v == 0.0 {
-                    v = 1e-30;
-                }
-                perturbed_f64[7] = v;
+                // Perturb e[7] in f64
+                perturbed_f64[7] = match stride {
+                    0 => f64::from_bits(1),           // subnormal f64
+                    1 => -1e-30,                      // tiny negative f64
+                    2 => f64::MAX,                    // max finite f64
+                    3 => f64::MIN_POSITIVE,           // minimum positive normal f64
+                    4 => -f64::MAX,                   // negative max finite f64
+                    5 => 1e-30,                       // analytical tiny value
+                    6 => 1e-15,                       // analytical tiny value
+                    _ => {
+                        let v = rng.next_f64();
+                        if v == 0.0 { -0.5 } else { v }
+                    }
+                };
             }
             2 => {
-                let mut v = rng.next_f64();
-                if v == 0.0 {
-                    v = f64::from_bits(1);
-                } // subnormal
-                perturbed_f64[11] = v;
+                // Perturb e[11] in f64
+                perturbed_f64[11] = match stride {
+                    0 => f64::from_bits(1),                           // subnormal f64
+                    1 => f64::from_bits(0x8000_0000_0000_0001),       // negative subnormal f64
+                    2 => f64::MAX,                                    // max finite f64
+                    3 => f64::MIN_POSITIVE,                           // minimum positive normal f64
+                    4 => -1.0,                                        // standard perspective depth value
+                    5 => 1e-15,                                       // analytical tiny value
+                    6 => 1e-100,                                      // small normal f64 perspective term
+                    _ => {
+                        let v = rng.next_f64();
+                        if v == 0.0 { 2.0 } else { v }
+                    }
+                };
             }
             _ => {
-                let delta = rng.next_f64();
-                perturbed_f64[15] = if delta == 0.0 { 0.0 } else { 1.0 + delta };
+                // Perturb e[15] in f64 (affine requires exactly 1.0)
+                perturbed_f64[15] = match stride {
+                    0 => 0.0,                         // standard zero
+                    1 => -0.0,                        // negative zero (-0.0 != 1.0, must reject)
+                    2 => f64::MAX,                    // max finite f64
+                    3 => f64::from_bits(1),           // subnormal f64
+                    4 => -1.0,                        // negative one
+                    5 => 1.0 + 1e-15,                 // near-one high in f64
+                    6 => 0.999999999999999,           // near-one low in f64
+                    _ => {
+                        let delta = rng.next_f64();
+                        1.0 + if delta == 0.0 { 0.5 } else { delta }
+                    }
+                };
             }
         }
 
@@ -1010,6 +1148,396 @@ fn property_test_vertex_pos_uv_byte_roundtrip_and_short_lengths() {
                 read_res,
                 Err(LayoutError::BufferTooSmall {
                     required: VERTEX_POS_UV_BYTES,
+                    provided: len,
+                }),
+                "read_from_slice must reject short length {len} for seed {SEED:#018x} at iter {i}"
+            );
+        }
+    }
+}
+
+#[test]
+fn property_test_vertex_pos_normal_uv_byte_roundtrip_and_short_lengths() {
+    const SEED: u64 = 0xE1E1_7E57_0007_0007;
+    const ITERATIONS: usize = 5_000;
+    let mut rng = TestLcg::new(SEED);
+
+    let mut buf = [0u8; 32];
+
+    for i in 0..ITERATIONS {
+        let mut position = [rng.next_f32(), rng.next_f32(), rng.next_f32()];
+        let mut normal = [rng.next_f32(), rng.next_f32(), rng.next_f32()];
+        let mut uv = [rng.next_f32(), rng.next_f32()];
+
+        // Fixed stride perturbations injecting explicit NaN payloads, negative zero, and infinities
+        let stride = i % 8;
+        match stride {
+            0 => {
+                // Explicit quiet NaN with specific non-standard payload (0x7FC0_1234) on position[0]
+                position[0] = f32::from_bits(0x7FC0_1234);
+            }
+            1 => {
+                // Explicit negative zero (-0.0, bit pattern 0x8000_0000) on normal[1] and uv[0]
+                normal[1] = -0.0f32;
+                uv[0] = -0.0f32;
+            }
+            2 => {
+                // Explicit positive infinity (0x7F80_0000) and negative infinity (0xFF80_0000)
+                position[1] = f32::INFINITY;
+                normal[0] = f32::NEG_INFINITY;
+            }
+            3 => {
+                // Explicit negative NaN with distinct payload (0xFFC0_BEEF) on uv[1]
+                uv[1] = f32::from_bits(0xFFC0_BEEF);
+            }
+            4 => {
+                // Complete vector of negative zeros across all fields
+                position = [-0.0f32, -0.0f32, -0.0f32];
+                normal = [-0.0f32, -0.0f32, -0.0f32];
+                uv = [-0.0f32, -0.0f32];
+            }
+            5 => {
+                // Mixed infinities and signaling NaN payloads across attributes
+                position[2] = f32::from_bits(0x7F80_0001); // signaling NaN payload
+                normal[2] = f32::INFINITY;
+                uv[1] = f32::NEG_INFINITY;
+            }
+            6 => {
+                // Arbitrary PRNG-derived NaN payload
+                let payload = (rng.next_u32() & 0x003F_FFFF) | 1;
+                normal[0] = f32::from_bits(0x7FC0_0000 | payload);
+            }
+            _ => {
+                // Default pseudo-random finite normal floats from TestLcg
+            }
+        }
+
+        let v = VertexPosNormalUv::new(position, normal, uv);
+
+        // 1. Array byte serialization roundtrip
+        let bytes = v.to_bytes();
+        assert_eq!(
+            bytes.len(),
+            VERTEX_POS_NORMAL_UV_BYTES,
+            "Byte length mismatch for seed {SEED:#018x} at iter {i} stride {stride}"
+        );
+        let restored = VertexPosNormalUv::from_bytes(&bytes);
+        assert_eq!(
+            restored.to_bytes(),
+            v.to_bytes(),
+            "VertexPosNormalUv::from_bytes roundtrip failed for seed {SEED:#018x} at iter {i} stride {stride}"
+        );
+        assert_eq!(
+            restored.to_bytes(),
+            bytes,
+            "VertexPosNormalUv restored bytes mismatch for seed {SEED:#018x} at iter {i} stride {stride}"
+        );
+
+        // Bit pattern assertions: verify exact IEEE 754 bit-pattern preservation for every field
+        assert_eq!(
+            restored.position[0].to_bits(),
+            position[0].to_bits(),
+            "position[0] bit mismatch for seed {SEED:#018x} at iter {i} stride {stride}"
+        );
+        assert_eq!(
+            restored.position[1].to_bits(),
+            position[1].to_bits(),
+            "position[1] bit mismatch for seed {SEED:#018x} at iter {i} stride {stride}"
+        );
+        assert_eq!(
+            restored.position[2].to_bits(),
+            position[2].to_bits(),
+            "position[2] bit mismatch for seed {SEED:#018x} at iter {i} stride {stride}"
+        );
+        assert_eq!(
+            restored.normal[0].to_bits(),
+            normal[0].to_bits(),
+            "normal[0] bit mismatch for seed {SEED:#018x} at iter {i} stride {stride}"
+        );
+        assert_eq!(
+            restored.normal[1].to_bits(),
+            normal[1].to_bits(),
+            "normal[1] bit mismatch for seed {SEED:#018x} at iter {i} stride {stride}"
+        );
+        assert_eq!(
+            restored.normal[2].to_bits(),
+            normal[2].to_bits(),
+            "normal[2] bit mismatch for seed {SEED:#018x} at iter {i} stride {stride}"
+        );
+        assert_eq!(
+            restored.uv[0].to_bits(),
+            uv[0].to_bits(),
+            "uv[0] bit mismatch for seed {SEED:#018x} at iter {i} stride {stride}"
+        );
+        assert_eq!(
+            restored.uv[1].to_bits(),
+            uv[1].to_bits(),
+            "uv[1] bit mismatch for seed {SEED:#018x} at iter {i} stride {stride}"
+        );
+
+        // 2. Slice serialization roundtrip
+        v.write_to_slice(&mut buf)
+            .unwrap_or_else(|e| panic!("write_to_slice failed for seed {SEED:#018x} at iter {i} stride {stride}: {e:?}"));
+        assert_eq!(
+            buf, bytes,
+            "write_to_slice output mismatch for seed {SEED:#018x} at iter {i} stride {stride}"
+        );
+        let from_slice = VertexPosNormalUv::read_from_slice(&buf)
+            .unwrap_or_else(|e| panic!("read_from_slice failed for seed {SEED:#018x} at iter {i} stride {stride}: {e:?}"));
+        assert_eq!(
+            from_slice.to_bytes(),
+            v.to_bytes(),
+            "read_from_slice roundtrip failed for seed {SEED:#018x} at iter {i} stride {stride}"
+        );
+
+        // Bit pattern assertions on from_slice as well
+        assert_eq!(
+            from_slice.position[0].to_bits(),
+            position[0].to_bits(),
+            "from_slice position[0] bit mismatch for seed {SEED:#018x} at iter {i} stride {stride}"
+        );
+        assert_eq!(
+            from_slice.position[1].to_bits(),
+            position[1].to_bits(),
+            "from_slice position[1] bit mismatch for seed {SEED:#018x} at iter {i} stride {stride}"
+        );
+        assert_eq!(
+            from_slice.position[2].to_bits(),
+            position[2].to_bits(),
+            "from_slice position[2] bit mismatch for seed {SEED:#018x} at iter {i} stride {stride}"
+        );
+        assert_eq!(
+            from_slice.normal[0].to_bits(),
+            normal[0].to_bits(),
+            "from_slice normal[0] bit mismatch for seed {SEED:#018x} at iter {i} stride {stride}"
+        );
+        assert_eq!(
+            from_slice.normal[1].to_bits(),
+            normal[1].to_bits(),
+            "from_slice normal[1] bit mismatch for seed {SEED:#018x} at iter {i} stride {stride}"
+        );
+        assert_eq!(
+            from_slice.normal[2].to_bits(),
+            normal[2].to_bits(),
+            "from_slice normal[2] bit mismatch for seed {SEED:#018x} at iter {i} stride {stride}"
+        );
+        assert_eq!(
+            from_slice.uv[0].to_bits(),
+            uv[0].to_bits(),
+            "from_slice uv[0] bit mismatch for seed {SEED:#018x} at iter {i} stride {stride}"
+        );
+        assert_eq!(
+            from_slice.uv[1].to_bits(),
+            uv[1].to_bits(),
+            "from_slice uv[1] bit mismatch for seed {SEED:#018x} at iter {i} stride {stride}"
+        );
+
+        // 3. Rejection of every short length (0..32)
+        for len in 0..VERTEX_POS_NORMAL_UV_BYTES {
+            let write_res = v.write_to_slice(&mut buf[..len]);
+            assert_eq!(
+                write_res,
+                Err(LayoutError::BufferTooSmall {
+                    required: VERTEX_POS_NORMAL_UV_BYTES,
+                    provided: len,
+                }),
+                "write_to_slice must reject short length {len} for seed {SEED:#018x} at iter {i}"
+            );
+
+            let read_res = VertexPosNormalUv::read_from_slice(&buf[..len]);
+            assert_eq!(
+                read_res,
+                Err(LayoutError::BufferTooSmall {
+                    required: VERTEX_POS_NORMAL_UV_BYTES,
+                    provided: len,
+                }),
+                "read_from_slice must reject short length {len} for seed {SEED:#018x} at iter {i}"
+            );
+        }
+    }
+}
+
+#[test]
+fn property_test_vertex_pos_color_byte_roundtrip_and_short_lengths() {
+    const SEED: u64 = 0xE1E1_7E57_0008_0008;
+    const ITERATIONS: usize = 5_000;
+    let mut rng = TestLcg::new(SEED);
+
+    let mut buf = [0u8; 28];
+
+    for i in 0..ITERATIONS {
+        let mut position = [rng.next_f32(), rng.next_f32(), rng.next_f32()];
+        let mut color = [rng.next_f32(), rng.next_f32(), rng.next_f32(), rng.next_f32()];
+
+        // Fixed stride perturbations injecting explicit NaN payloads, negative zero, and infinities
+        let stride = i % 8;
+        match stride {
+            0 => {
+                // Explicit quiet NaN with specific non-standard payload (0x7FC0_ABCD) on color[3] (alpha)
+                color[3] = f32::from_bits(0x7FC0_ABCD);
+            }
+            1 => {
+                // Explicit negative zero (-0.0, bit pattern 0x8000_0000) on position[0] and color[1]
+                position[0] = -0.0f32;
+                color[1] = -0.0f32;
+            }
+            2 => {
+                // Explicit positive infinity (0x7F80_0000) and negative infinity (0xFF80_0000)
+                position[1] = f32::INFINITY;
+                color[0] = f32::NEG_INFINITY;
+            }
+            3 => {
+                // Explicit negative NaN with distinct payload (0xFFC0_DEAD) on position[2]
+                position[2] = f32::from_bits(0xFFC0_DEAD);
+            }
+            4 => {
+                // Complete vector of negative zeros across all fields
+                position = [-0.0f32, -0.0f32, -0.0f32];
+                color = [-0.0f32, -0.0f32, -0.0f32, -0.0f32];
+            }
+            5 => {
+                // Mixed infinities and signaling NaN payloads across attributes
+                position[0] = f32::from_bits(0x7F80_0001); // signaling NaN payload
+                color[2] = f32::INFINITY;
+                color[3] = f32::NEG_INFINITY;
+            }
+            6 => {
+                // Arbitrary PRNG-derived NaN payload on color[0]
+                let payload = (rng.next_u32() & 0x003F_FFFF) | 1;
+                color[0] = f32::from_bits(0x7FC0_0000 | payload);
+            }
+            _ => {
+                // Default pseudo-random finite normal floats from TestLcg
+            }
+        }
+
+        let v = VertexPosColor::new(position, color);
+
+        // 1. Array byte serialization roundtrip
+        let bytes = v.to_bytes();
+        assert_eq!(
+            bytes.len(),
+            VERTEX_POS_COLOR_BYTES,
+            "Byte length mismatch for seed {SEED:#018x} at iter {i} stride {stride}"
+        );
+        let restored = VertexPosColor::from_bytes(&bytes);
+        assert_eq!(
+            restored.to_bytes(),
+            v.to_bytes(),
+            "VertexPosColor::from_bytes roundtrip failed for seed {SEED:#018x} at iter {i} stride {stride}"
+        );
+        assert_eq!(
+            restored.to_bytes(),
+            bytes,
+            "VertexPosColor restored bytes mismatch for seed {SEED:#018x} at iter {i} stride {stride}"
+        );
+
+        // Bit pattern assertions: verify exact IEEE 754 bit-pattern preservation for every field
+        assert_eq!(
+            restored.position[0].to_bits(),
+            position[0].to_bits(),
+            "position[0] bit mismatch for seed {SEED:#018x} at iter {i} stride {stride}"
+        );
+        assert_eq!(
+            restored.position[1].to_bits(),
+            position[1].to_bits(),
+            "position[1] bit mismatch for seed {SEED:#018x} at iter {i} stride {stride}"
+        );
+        assert_eq!(
+            restored.position[2].to_bits(),
+            position[2].to_bits(),
+            "position[2] bit mismatch for seed {SEED:#018x} at iter {i} stride {stride}"
+        );
+        assert_eq!(
+            restored.color[0].to_bits(),
+            color[0].to_bits(),
+            "color[0] bit mismatch for seed {SEED:#018x} at iter {i} stride {stride}"
+        );
+        assert_eq!(
+            restored.color[1].to_bits(),
+            color[1].to_bits(),
+            "color[1] bit mismatch for seed {SEED:#018x} at iter {i} stride {stride}"
+        );
+        assert_eq!(
+            restored.color[2].to_bits(),
+            color[2].to_bits(),
+            "color[2] bit mismatch for seed {SEED:#018x} at iter {i} stride {stride}"
+        );
+        assert_eq!(
+            restored.color[3].to_bits(),
+            color[3].to_bits(),
+            "color[3] bit mismatch for seed {SEED:#018x} at iter {i} stride {stride}"
+        );
+
+        // 2. Slice serialization roundtrip
+        v.write_to_slice(&mut buf)
+            .unwrap_or_else(|e| panic!("write_to_slice failed for seed {SEED:#018x} at iter {i} stride {stride}: {e:?}"));
+        assert_eq!(
+            buf, bytes,
+            "write_to_slice output mismatch for seed {SEED:#018x} at iter {i} stride {stride}"
+        );
+        let from_slice = VertexPosColor::read_from_slice(&buf)
+            .unwrap_or_else(|e| panic!("read_from_slice failed for seed {SEED:#018x} at iter {i} stride {stride}: {e:?}"));
+        assert_eq!(
+            from_slice.to_bytes(),
+            v.to_bytes(),
+            "read_from_slice roundtrip failed for seed {SEED:#018x} at iter {i} stride {stride}"
+        );
+
+        // Bit pattern assertions on from_slice as well
+        assert_eq!(
+            from_slice.position[0].to_bits(),
+            position[0].to_bits(),
+            "from_slice position[0] bit mismatch for seed {SEED:#018x} at iter {i} stride {stride}"
+        );
+        assert_eq!(
+            from_slice.position[1].to_bits(),
+            position[1].to_bits(),
+            "from_slice position[1] bit mismatch for seed {SEED:#018x} at iter {i} stride {stride}"
+        );
+        assert_eq!(
+            from_slice.position[2].to_bits(),
+            position[2].to_bits(),
+            "from_slice position[2] bit mismatch for seed {SEED:#018x} at iter {i} stride {stride}"
+        );
+        assert_eq!(
+            from_slice.color[0].to_bits(),
+            color[0].to_bits(),
+            "from_slice color[0] bit mismatch for seed {SEED:#018x} at iter {i} stride {stride}"
+        );
+        assert_eq!(
+            from_slice.color[1].to_bits(),
+            color[1].to_bits(),
+            "from_slice color[1] bit mismatch for seed {SEED:#018x} at iter {i} stride {stride}"
+        );
+        assert_eq!(
+            from_slice.color[2].to_bits(),
+            color[2].to_bits(),
+            "from_slice color[2] bit mismatch for seed {SEED:#018x} at iter {i} stride {stride}"
+        );
+        assert_eq!(
+            from_slice.color[3].to_bits(),
+            color[3].to_bits(),
+            "from_slice color[3] bit mismatch for seed {SEED:#018x} at iter {i} stride {stride}"
+        );
+
+        // 3. Rejection of every short length (0..28)
+        for len in 0..VERTEX_POS_COLOR_BYTES {
+            let write_res = v.write_to_slice(&mut buf[..len]);
+            assert_eq!(
+                write_res,
+                Err(LayoutError::BufferTooSmall {
+                    required: VERTEX_POS_COLOR_BYTES,
+                    provided: len,
+                }),
+                "write_to_slice must reject short length {len} for seed {SEED:#018x} at iter {i}"
+            );
+
+            let read_res = VertexPosColor::read_from_slice(&buf[..len]);
+            assert_eq!(
+                read_res,
+                Err(LayoutError::BufferTooSmall {
+                    required: VERTEX_POS_COLOR_BYTES,
                     provided: len,
                 }),
                 "read_from_slice must reject short length {len} for seed {SEED:#018x} at iter {i}"
@@ -1259,5 +1787,209 @@ fn property_test_alignment_validators_on_random_offsets() {
             Err(LayoutError::CalculationOverflow),
             "aligned_bytes_per_row must return CalculationOverflow for {overflow_width}, seed {SEED:#018x} at iter {i}"
         );
+    }
+}
+
+#[test]
+fn test_layout_table_cross_check_and_evidence() {
+    let table = layout_table();
+    assert_eq!(table.len(), 31, "Layout table must contain all 31 defined field and padding rows");
+
+    for row in table {
+        let (expected_offset, expected_size) = match (row.record, row.field) {
+            ("AffineRows", "r0") => (core::mem::offset_of!(AffineRows, r0), core::mem::size_of::<[f32; 4]>()),
+            ("AffineRows", "r1") => (core::mem::offset_of!(AffineRows, r1), core::mem::size_of::<[f32; 4]>()),
+            ("AffineRows", "r2") => (core::mem::offset_of!(AffineRows, r2), core::mem::size_of::<[f32; 4]>()),
+            ("ProjectiveMat4", "elements") => (core::mem::offset_of!(ProjectiveMat4, elements), core::mem::size_of::<[f32; 16]>()),
+            ("VertexPosUv", "position") => (core::mem::offset_of!(VertexPosUv, position), core::mem::size_of::<[f32; 3]>()),
+            ("VertexPosUv", "uv") => (core::mem::offset_of!(VertexPosUv, uv), core::mem::size_of::<[f32; 2]>()),
+            ("VertexPosNormalUv", "position") => (core::mem::offset_of!(VertexPosNormalUv, position), core::mem::size_of::<[f32; 3]>()),
+            ("VertexPosNormalUv", "normal") => (core::mem::offset_of!(VertexPosNormalUv, normal), core::mem::size_of::<[f32; 3]>()),
+            ("VertexPosNormalUv", "uv") => (core::mem::offset_of!(VertexPosNormalUv, uv), core::mem::size_of::<[f32; 2]>()),
+            ("VertexPosColor", "position") => (core::mem::offset_of!(VertexPosColor, position), core::mem::size_of::<[f32; 3]>()),
+            ("VertexPosColor", "color") => (core::mem::offset_of!(VertexPosColor, color), core::mem::size_of::<[f32; 4]>()),
+            ("InstanceRecord", "transform") => (core::mem::offset_of!(InstanceRecord, transform), core::mem::size_of::<AffineRows>()),
+            ("InstanceRecord", "instance_id") => (core::mem::offset_of!(InstanceRecord, instance_id), core::mem::size_of::<u32>()),
+            ("InstanceRecord", "_padding") => (52, 12),
+            ("DrawIndirectArgs", "vertex_count") => (core::mem::offset_of!(DrawIndirectArgs, vertex_count), core::mem::size_of::<u32>()),
+            ("DrawIndirectArgs", "instance_count") => (core::mem::offset_of!(DrawIndirectArgs, instance_count), core::mem::size_of::<u32>()),
+            ("DrawIndirectArgs", "first_vertex") => (core::mem::offset_of!(DrawIndirectArgs, first_vertex), core::mem::size_of::<u32>()),
+            ("DrawIndirectArgs", "first_instance") => (core::mem::offset_of!(DrawIndirectArgs, first_instance), core::mem::size_of::<u32>()),
+            ("DrawIndexedIndirectArgs", "index_count") => (core::mem::offset_of!(DrawIndexedIndirectArgs, index_count), core::mem::size_of::<u32>()),
+            ("DrawIndexedIndirectArgs", "instance_count") => (core::mem::offset_of!(DrawIndexedIndirectArgs, instance_count), core::mem::size_of::<u32>()),
+            ("DrawIndexedIndirectArgs", "first_index") => (core::mem::offset_of!(DrawIndexedIndirectArgs, first_index), core::mem::size_of::<u32>()),
+            ("DrawIndexedIndirectArgs", "base_vertex") => (core::mem::offset_of!(DrawIndexedIndirectArgs, base_vertex), core::mem::size_of::<i32>()),
+            ("DrawIndexedIndirectArgs", "first_instance") => (core::mem::offset_of!(DrawIndexedIndirectArgs, first_instance), core::mem::size_of::<u32>()),
+            ("ColorUniform", "rgba") => (0, COLOR_UNIFORM_BYTES),
+            ("MaterialParams", "color") => (core::mem::offset_of!(MaterialParams, color), core::mem::size_of::<[f32; 4]>()),
+            ("MaterialParams", "opacity") => (core::mem::offset_of!(MaterialParams, opacity), core::mem::size_of::<f32>()),
+            ("MaterialParams", "alpha_test") => (core::mem::offset_of!(MaterialParams, alpha_test), core::mem::size_of::<f32>()),
+            ("MaterialParams", "_pad0") => (core::mem::offset_of!(MaterialParams, _pad0), core::mem::size_of::<[u8; 8]>()),
+            ("MaterialParams", "map_transform") => (core::mem::offset_of!(MaterialParams, map_transform), core::mem::size_of::<AffineRows>()),
+            ("MaterialParams", "flags") => (core::mem::offset_of!(MaterialParams, flags), core::mem::size_of::<u32>()),
+            ("MaterialParams", "_pad1") => (core::mem::offset_of!(MaterialParams, _pad1), core::mem::size_of::<[u8; 12]>()),
+            (unknown_rec, unknown_field) => panic!("Unknown record/field in layout table: {unknown_rec}.{unknown_field}"),
+        };
+
+        assert_eq!(
+            row.offset, expected_offset,
+            "LayoutRow offset mismatch for field {}.{}: expected offset {}, actual offset {}",
+            row.record, row.field, expected_offset, row.offset
+        );
+        assert_eq!(
+            row.size, expected_size,
+            "LayoutRow size mismatch for field {}.{}: expected size {}, actual size {}",
+            row.record, row.field, expected_size, row.size
+        );
+    }
+
+    // Tiling invariant: for each record type, the catalog rows must tile the full size_of with no gaps or overlaps.
+    let record_sizes: &[(&str, usize)] = &[
+        ("AffineRows", core::mem::size_of::<AffineRows>()),
+        ("ProjectiveMat4", core::mem::size_of::<ProjectiveMat4>()),
+        ("VertexPosUv", core::mem::size_of::<VertexPosUv>()),
+        ("VertexPosNormalUv", core::mem::size_of::<VertexPosNormalUv>()),
+        ("VertexPosColor", core::mem::size_of::<VertexPosColor>()),
+        ("InstanceRecord", InstanceRecord::BYTE_SIZE),
+        ("DrawIndirectArgs", core::mem::size_of::<DrawIndirectArgs>()),
+        ("DrawIndexedIndirectArgs", core::mem::size_of::<DrawIndexedIndirectArgs>()),
+        ("ColorUniform", COLOR_UNIFORM_BYTES),
+        ("MaterialParams", core::mem::size_of::<MaterialParams>()),
+    ];
+
+    for &(record_name, expected_total_size) in record_sizes {
+        let mut expected_next_offset = 0;
+        let mut found_any = false;
+        for row in table {
+            if row.record == record_name {
+                found_any = true;
+                assert_eq!(
+                    row.offset, expected_next_offset,
+                    "Gap or overlap detected in record {}: field {} has offset {}, expected {}",
+                    record_name, row.field, row.offset, expected_next_offset
+                );
+                expected_next_offset = row.offset + row.size;
+            }
+        }
+        assert!(found_any, "No rows found for record {}", record_name);
+        assert_eq!(
+            expected_next_offset, expected_total_size,
+            "Record {} rows do not tile the full size_of: tiled {} bytes, size_of is {}",
+            record_name, expected_next_offset, expected_total_size
+        );
+    }
+
+    // Verify Display formatting
+    let table_view = dump_layouts();
+    let display_str = format!("{table_view}");
+    assert!(display_str.contains("RECORD"), "Display must contain column header RECORD");
+    assert!(display_str.contains("WGSL_TYPE"), "Display must contain column header WGSL_TYPE");
+    assert!(display_str.contains("AffineRows"), "Display must render AffineRows");
+    assert!(display_str.contains("VertexPosColor"), "Display must render VertexPosColor");
+    assert!(display_str.contains("ColorUniform"), "Display must render ColorUniform");
+    assert!(display_str.contains("MaterialParams"), "Display must render MaterialParams");
+    assert!(display_str.contains("_padding"), "Display must render _padding row");
+
+    // When test-support feature is active and F3D_EVIDENCE_DIR is set, emit evidence under bead 05.2
+    #[cfg(feature = "test-support")]
+    {
+        if let Ok(evidence_dir) = std::env::var("F3D_EVIDENCE_DIR") {
+            let base = std::path::Path::new(&evidence_dir);
+            let writer = f3d_core::test_evidence::EvidenceWriter::init(base, "05.2", "layout_table")
+                .expect("Failed to initialize EvidenceWriter under 05.2");
+            writer
+                .write_json("layout_catalog.json", &table)
+                .expect("Failed to write layout_catalog.json");
+            writer
+                .write_artifact("layout_table.txt", display_str.as_bytes())
+                .expect("Failed to write layout_table.txt");
+        }
+    }
+}
+
+#[test]
+fn test_material_params_exact_layout_and_roundtrip() {
+    assert_eq!(MATERIAL_PARAMS_BYTES, 96);
+    assert_eq!(MATERIAL_PARAMS_ALIGNMENT, 16);
+    assert_eq!(core::mem::size_of::<MaterialParams>(), 96);
+    assert_eq!(core::mem::offset_of!(MaterialParams, color), 0);
+    assert_eq!(core::mem::offset_of!(MaterialParams, opacity), 16);
+    assert_eq!(core::mem::offset_of!(MaterialParams, alpha_test), 20);
+    assert_eq!(core::mem::offset_of!(MaterialParams, _pad0), 24);
+    assert_eq!(core::mem::offset_of!(MaterialParams, map_transform), 32);
+    assert_eq!(core::mem::offset_of!(MaterialParams, flags), 80);
+    assert_eq!(core::mem::offset_of!(MaterialParams, _pad1), 84);
+
+    let mut mat = MaterialParams::new(
+        [1.0, 0.5, 0.25, 1.0],
+        0.75,
+        0.01,
+        AffineRows::identity(),
+        MATERIAL_FLAG_MAP | MATERIAL_FLAG_ALPHA_MAP | MATERIAL_FLAG_TRANSPARENT,
+    );
+    assert!(mat.has_flag(MATERIAL_FLAG_MAP));
+    assert!(mat.has_flag(MATERIAL_FLAG_ALPHA_MAP));
+    assert!(mat.has_flag(MATERIAL_FLAG_TRANSPARENT));
+    assert!(!mat.has_flag(MATERIAL_FLAG_WIREFRAME));
+    mat.set_flag(MATERIAL_FLAG_WIREFRAME, true);
+    assert!(mat.has_flag(MATERIAL_FLAG_WIREFRAME));
+
+    let bytes = mat.to_bytes();
+    assert_eq!(bytes.len(), 96);
+    let decoded = MaterialParams::from_bytes(&bytes);
+    assert_eq!(decoded, mat);
+
+    let mut buf = [0u8; 96];
+    mat.write_to_slice(&mut buf).expect("write ok");
+    let from_slice = MaterialParams::read_from_slice(&buf).expect("read ok");
+    assert_eq!(from_slice, mat);
+
+    // Buffer too small errors
+    let mut short_buf = [0u8; 95];
+    assert_eq!(
+        mat.write_to_slice(&mut short_buf),
+        Err(LayoutError::BufferTooSmall { required: 96, provided: 95 })
+    );
+    assert_eq!(
+        MaterialParams::read_from_slice(&short_buf),
+        Err(LayoutError::BufferTooSmall { required: 96, provided: 95 })
+    );
+}
+    {
+        if let Ok(evidence_dir) = std::env::var("F3D_EVIDENCE_DIR") {
+            let base = std::path::Path::new(&evidence_dir);
+            let writer = f3d_core::test_evidence::EvidenceWriter::init(base, "05.2", "layout_table")
+                .expect("Failed to initialize EvidenceWriter under 05.2");
+            let event = f3d_core::test_evidence::EvidenceEvent {
+                ts_wall: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0),
+                ts_app: None,
+                lane: "unit".into(),
+                bead: "05.2".into(),
+                test: "test_layout_table_cross_check_and_evidence".into(),
+                step: "layout_table_cross_check".into(),
+                level: "info".into(),
+                owner: "f3d-core".into(),
+                route: None,
+                browser: None,
+                device_generation: None,
+                scene_generation: None,
+                msg: "Verified all 24 layout table rows against core::mem::offset_of, size_of, and gapless tiling".into(),
+                data: Some(serde_json::to_value(table).expect("Failed to serialize layout table")),
+            };
+            writer.write_event(&event).expect("Failed to write evidence event");
+            let summary = f3d_core::test_evidence::EvidenceSummary {
+                commit: "HEAD".into(),
+                upstream_commit: f3d_core::test_evidence::UPSTREAM_COMMIT.into(),
+                bead: "05.2".into(),
+                run_id: "layout_table".into(),
+                pass: table.len(),
+                fail: 0,
+                first_failure: None,
+            };
+            writer.write_summary(&summary).expect("Failed to write evidence summary");
+        }
     }
 }

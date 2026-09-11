@@ -30,6 +30,29 @@ pub const COLOR_UNIFORM_BYTES: usize = 16;
 /// Alignment in bytes of a color uniform record (`alignof(vec4<f32>)` = 16 bytes under WGSL rules).
 pub const COLOR_UNIFORM_ALIGNMENT: usize = 16;
 
+/// Size in bytes of a material uniform parameter block record (`MaterialParams` = 96 bytes).
+pub const MATERIAL_PARAMS_BYTES: usize = 96;
+
+/// Alignment in bytes of a material uniform parameter block record under WGSL uniform rules (16 bytes).
+pub const MATERIAL_PARAMS_ALIGNMENT: usize = 16;
+
+/// Material flag: diffuse texture map is enabled.
+pub const MATERIAL_FLAG_MAP: u32 = 1 << 0;
+/// Material flag: alpha texture map is enabled.
+pub const MATERIAL_FLAG_ALPHA_MAP: u32 = 1 << 1;
+/// Material flag: specular / environment map is enabled.
+pub const MATERIAL_FLAG_ENV_MAP: u32 = 1 << 2;
+/// Material flag: vertex colors are active.
+pub const MATERIAL_FLAG_VERTEX_COLORS: u32 = 1 << 3;
+/// Material flag: wireframe mode is active.
+pub const MATERIAL_FLAG_WIREFRAME: u32 = 1 << 4;
+/// Material flag: scene fog is enabled.
+pub const MATERIAL_FLAG_FOG: u32 = 1 << 5;
+/// Material flag: alpha test threshold is enabled.
+pub const MATERIAL_FLAG_ALPHA_TEST: u32 = 1 << 6;
+/// Material flag: transparent blending is enabled.
+pub const MATERIAL_FLAG_TRANSPARENT: u32 = 1 << 7;
+
 /// Size in bytes of the canonical position + UV vertex record (`vec3<f32>` pos [12B] + `vec2<f32>` uv [8B] = 20 bytes).
 pub const VERTEX_POS_UV_BYTES: usize = 20;
 
@@ -38,6 +61,24 @@ pub const VERTEX_POS_UV_STRIDE: usize = 20;
 
 /// Alignment in bytes of the canonical position + UV vertex record (4 bytes for f32).
 pub const VERTEX_POS_UV_ALIGNMENT: usize = 4;
+
+/// Size in bytes of the position + normal + UV vertex record (`vec3<f32>` pos [12B] + `vec3<f32>` norm [12B] + `vec2<f32>` uv [8B] = 32 bytes).
+pub const VERTEX_POS_NORMAL_UV_BYTES: usize = 32;
+
+/// Byte stride for the position + normal + UV vertex buffer layout (32 bytes).
+pub const VERTEX_POS_NORMAL_UV_STRIDE: usize = 32;
+
+/// Alignment in bytes of the position + normal + UV vertex record (4 bytes for f32).
+pub const VERTEX_POS_NORMAL_UV_ALIGNMENT: usize = 4;
+
+/// Size in bytes of the position + color vertex record (`vec3<f32>` pos [12B] + `vec4<f32>` color [16B] = 28 bytes).
+pub const VERTEX_POS_COLOR_BYTES: usize = 28;
+
+/// Byte stride for the position + color vertex buffer layout (28 bytes).
+pub const VERTEX_POS_COLOR_STRIDE: usize = 28;
+
+/// Alignment in bytes of the position + color vertex record (4 bytes for f32).
+pub const VERTEX_POS_COLOR_ALIGNMENT: usize = 4;
 
 /// Size in bytes of a native WGSL `mat4x3<f32>` (4 columns of vec3<f32>, each padded to 16 bytes = 64 bytes).
 ///
@@ -146,6 +187,7 @@ impl core::error::Error for LayoutError {}
 /// ```
 /// Row 3 is implicitly `[0, 0, 0, 1]` and omitted from the 48-byte record.
 /// On the GPU, point transformation is evaluated by row dot-products with `(x, y, z, 1.0)`.
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct AffineRows {
@@ -325,6 +367,7 @@ impl AffineRows {
 ///
 /// Used for perspective camera projections, orthographic projections with perspective shears,
 /// and non-affine composite transforms.
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ProjectiveMat4 {
@@ -630,6 +673,7 @@ pub fn aligned_copy_bytes_per_row(width: u32, bytes_per_pixel: u32) -> Result<u3
 
 
 /// Instance transform record layout for GPU instance buffers (world transform + instance ID).
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct InstanceRecord {
@@ -683,6 +727,7 @@ impl InstanceRecord {
 }
 
 /// WebGPU DrawIndirect arguments layout (16 bytes, 4-byte aligned).
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct DrawIndirectArgs {
@@ -717,6 +762,7 @@ impl DrawIndirectArgs {
 }
 
 /// WebGPU DrawIndexedIndirect arguments layout (20 bytes, 4-byte aligned).
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct DrawIndexedIndirectArgs {
@@ -759,6 +805,7 @@ impl DrawIndexedIndirectArgs {
 /// - `position`: `[f32; 3]` at offset 0 (12 bytes, `shaderLocation: 0, format: "float32x3"`)
 /// - `uv`: `[f32; 2]` at offset 12 (8 bytes, `shaderLocation: 1, format: "float32x2"`)
 /// Total size: 20 bytes ([`VERTEX_POS_UV_BYTES`]), alignment 4 bytes ([`VERTEX_POS_UV_ALIGNMENT`]).
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct VertexPosUv {
@@ -833,6 +880,177 @@ impl VertexPosUv {
     }
 }
 
+/// Canonical vertex record for GPU vertex buffers containing 3D position, 3D surface normal, and 2D UV coordinates.
+///
+/// Memory layout:
+/// - `position`: `[f32; 3]` at offset 0 (12 bytes, `shaderLocation: 0, format: "float32x3"`)
+/// - `normal`: `[f32; 3]` at offset 12 (12 bytes, `shaderLocation: 1, format: "float32x3"`)
+/// - `uv`: `[f32; 2]` at offset 24 (8 bytes, `shaderLocation: 2, format: "float32x2"`)
+/// Total size: 32 bytes ([`VERTEX_POS_NORMAL_UV_BYTES`]), alignment 4 bytes ([`VERTEX_POS_NORMAL_UV_ALIGNMENT`]).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct VertexPosNormalUv {
+    /// 3D position in model space (`[x, y, z]`).
+    pub position: [f32; 3],
+    /// 3D surface normal vector (`[nx, ny, nz]`).
+    pub normal: [f32; 3],
+    /// 2D texture coordinates (`[u, v]`).
+    pub uv: [f32; 2],
+}
+
+impl VertexPosNormalUv {
+    /// Byte size of this vertex record (32 bytes).
+    pub const BYTE_SIZE: usize = VERTEX_POS_NORMAL_UV_BYTES;
+
+    /// Byte stride for vertex buffer layouts (32 bytes).
+    pub const STRIDE: usize = VERTEX_POS_NORMAL_UV_STRIDE;
+
+    /// Alignment in bytes (4 bytes).
+    pub const ALIGNMENT: usize = VERTEX_POS_NORMAL_UV_ALIGNMENT;
+
+    /// Constructs a new `VertexPosNormalUv` record.
+    pub const fn new(position: [f32; 3], normal: [f32; 3], uv: [f32; 2]) -> Self {
+        Self { position, normal, uv }
+    }
+
+    /// Serializes the vertex record into an exact 32-byte array in little-endian order.
+    pub fn to_bytes(&self) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        out[0..4].copy_from_slice(&self.position[0].to_le_bytes());
+        out[4..8].copy_from_slice(&self.position[1].to_le_bytes());
+        out[8..12].copy_from_slice(&self.position[2].to_le_bytes());
+        out[12..16].copy_from_slice(&self.normal[0].to_le_bytes());
+        out[16..20].copy_from_slice(&self.normal[1].to_le_bytes());
+        out[20..24].copy_from_slice(&self.normal[2].to_le_bytes());
+        out[24..28].copy_from_slice(&self.uv[0].to_le_bytes());
+        out[28..32].copy_from_slice(&self.uv[1].to_le_bytes());
+        out
+    }
+
+    /// Safely writes the 32-byte wire representation into a mutable byte slice.
+    pub fn write_to_slice(&self, out: &mut [u8]) -> Result<(), LayoutError> {
+        if out.len() < Self::BYTE_SIZE {
+            return Err(LayoutError::BufferTooSmall {
+                required: Self::BYTE_SIZE,
+                provided: out.len(),
+            });
+        }
+        out[..Self::BYTE_SIZE].copy_from_slice(&self.to_bytes());
+        Ok(())
+    }
+
+    /// Safely reads the 32-byte vertex record from a slice in little-endian order.
+    pub fn read_from_slice(src: &[u8]) -> Result<Self, LayoutError> {
+        if src.len() < Self::BYTE_SIZE {
+            return Err(LayoutError::BufferTooSmall {
+                required: Self::BYTE_SIZE,
+                provided: src.len(),
+            });
+        }
+        let mut b = [0u8; 32];
+        b.copy_from_slice(&src[..Self::BYTE_SIZE]);
+        Ok(Self::from_bytes(&b))
+    }
+
+    /// Deserializes a `VertexPosNormalUv` record from an exact 32-byte array.
+    pub fn from_bytes(bytes: &[u8; 32]) -> Self {
+        let read_f32 = |offset: usize| -> f32 {
+            let mut b = [0u8; 4];
+            b.copy_from_slice(&bytes[offset..offset + 4]);
+            f32::from_le_bytes(b)
+        };
+        Self {
+            position: [read_f32(0), read_f32(4), read_f32(8)],
+            normal: [read_f32(12), read_f32(16), read_f32(20)],
+            uv: [read_f32(24), read_f32(28)],
+        }
+    }
+}
+
+/// Canonical vertex record for GPU vertex buffers containing 3D position and RGBA vertex color.
+///
+/// Memory layout:
+/// - `position`: `[f32; 3]` at offset 0 (12 bytes, `shaderLocation: 0, format: "float32x3"`)
+/// - `color`: `[f32; 4]` at offset 12 (16 bytes, `shaderLocation: 1, format: "float32x4"`)
+/// Total size: 28 bytes ([`VERTEX_POS_COLOR_BYTES`]), alignment 4 bytes ([`VERTEX_POS_COLOR_ALIGNMENT`]).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct VertexPosColor {
+    /// 3D position in model space (`[x, y, z]`).
+    pub position: [f32; 3],
+    /// RGBA vertex color (`[r, g, b, a]`).
+    pub color: [f32; 4],
+}
+
+impl VertexPosColor {
+    /// Byte size of this vertex record (28 bytes).
+    pub const BYTE_SIZE: usize = VERTEX_POS_COLOR_BYTES;
+
+    /// Byte stride for vertex buffer layouts (28 bytes).
+    pub const STRIDE: usize = VERTEX_POS_COLOR_STRIDE;
+
+    /// Alignment in bytes (4 bytes).
+    pub const ALIGNMENT: usize = VERTEX_POS_COLOR_ALIGNMENT;
+
+    /// Constructs a new `VertexPosColor` record.
+    pub const fn new(position: [f32; 3], color: [f32; 4]) -> Self {
+        Self { position, color }
+    }
+
+    /// Serializes the vertex record into an exact 28-byte array in little-endian order.
+    pub fn to_bytes(&self) -> [u8; 28] {
+        let mut out = [0u8; 28];
+        out[0..4].copy_from_slice(&self.position[0].to_le_bytes());
+        out[4..8].copy_from_slice(&self.position[1].to_le_bytes());
+        out[8..12].copy_from_slice(&self.position[2].to_le_bytes());
+        out[12..16].copy_from_slice(&self.color[0].to_le_bytes());
+        out[16..20].copy_from_slice(&self.color[1].to_le_bytes());
+        out[20..24].copy_from_slice(&self.color[2].to_le_bytes());
+        out[24..28].copy_from_slice(&self.color[3].to_le_bytes());
+        out
+    }
+
+    /// Safely writes the 28-byte wire representation into a mutable byte slice.
+    pub fn write_to_slice(&self, out: &mut [u8]) -> Result<(), LayoutError> {
+        if out.len() < Self::BYTE_SIZE {
+            return Err(LayoutError::BufferTooSmall {
+                required: Self::BYTE_SIZE,
+                provided: out.len(),
+            });
+        }
+        out[..Self::BYTE_SIZE].copy_from_slice(&self.to_bytes());
+        Ok(())
+    }
+
+    /// Safely reads the 28-byte vertex record from a slice in little-endian order.
+    pub fn read_from_slice(src: &[u8]) -> Result<Self, LayoutError> {
+        if src.len() < Self::BYTE_SIZE {
+            return Err(LayoutError::BufferTooSmall {
+                required: Self::BYTE_SIZE,
+                provided: src.len(),
+            });
+        }
+        let mut b = [0u8; 28];
+        b.copy_from_slice(&src[..Self::BYTE_SIZE]);
+        Ok(Self::from_bytes(&b))
+    }
+
+    /// Deserializes a `VertexPosColor` record from an exact 28-byte array.
+    pub fn from_bytes(bytes: &[u8; 28]) -> Self {
+        let read_f32 = |offset: usize| -> f32 {
+            let mut b = [0u8; 4];
+            b.copy_from_slice(&bytes[offset..offset + 4]);
+            f32::from_le_bytes(b)
+        };
+        Self {
+            position: [read_f32(0), read_f32(4), read_f32(8)],
+            color: [read_f32(12), read_f32(16), read_f32(20), read_f32(24)],
+        }
+    }
+}
+
 /// Canonical WGSL struct declaration for `AffineRows`.
 pub const WGSL_AFFINE_ROWS_DECLARATION: &str = r#"
 struct AffineRows {
@@ -871,6 +1089,191 @@ struct ProjectiveMat4 {
 };
 "#;
 
+/// Canonical GPU uniform parameter block record for materials matching Three.js r186 `MeshBasicMaterial`.
+///
+/// WGSL uniform buffer address-space alignment rules mandate 16-byte alignment for uniform structs,
+/// 16-byte alignment for `vec4<f32>` members, and 4-byte alignment for `f32`/`u32` scalars.
+///
+/// Memory layout (96 bytes total, 16-byte aligned):
+/// - `color`: `[f32; 4]` at offset 0 (16 bytes, `vec4<f32>`, RGBA)
+/// - `opacity`: `f32` at offset 16 (4 bytes)
+/// - `alpha_test`: `f32` at offset 20 (4 bytes, matching Three.js `alphaTest`)
+/// - `_pad0`: `[u8; 8]` at offset 24 (8 bytes alignment padding ensuring `map_transform` starts at offset 32)
+/// - `map_transform`: `AffineRows` at offset 32 (48 bytes, 2D UV transform as three `vec4<f32>` rows)
+/// - `flags`: `u32` at offset 80 (4 bytes, material feature/capability bitflags)
+/// - `_pad1`: `[u8; 12]` at offset 84 (12 bytes trailing alignment padding to 16-byte struct alignment)
+/// Total size: 96 bytes ([`MATERIAL_PARAMS_BYTES`]), alignment 16 bytes ([`MATERIAL_PARAMS_ALIGNMENT`]).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct MaterialParams {
+    /// Base diffuse/emissive color (`[r, g, b, a]`).
+    pub color: [f32; 4],
+    /// Material opacity factor in `[0.0, 1.0]`.
+    pub opacity: f32,
+    /// Alpha test threshold below which fragments are discarded.
+    pub alpha_test: f32,
+    /// Alignment padding ensuring `map_transform` starts at a 16-byte boundary.
+    pub _pad0: [u8; 8],
+    /// 2D texture UV map transform (3x3 affine matrix represented as three `vec4<f32>` rows).
+    pub map_transform: AffineRows,
+    /// Feature and capability bitflags for shader branch specialization.
+    pub flags: u32,
+    /// Trailing alignment padding to satisfy the 16-byte uniform block alignment constraint.
+    pub _pad1: [u8; 12],
+}
+
+impl MaterialParams {
+    /// Byte size of this material parameter block record (96 bytes).
+    pub const BYTE_SIZE: usize = MATERIAL_PARAMS_BYTES;
+
+    /// Alignment in bytes (16 bytes).
+    pub const ALIGNMENT: usize = MATERIAL_PARAMS_ALIGNMENT;
+
+    /// Constructs a new `MaterialParams` uniform record.
+    pub const fn new(
+        color: [f32; 4],
+        opacity: f32,
+        alpha_test: f32,
+        map_transform: AffineRows,
+        flags: u32,
+    ) -> Self {
+        Self {
+            color,
+            opacity,
+            alpha_test,
+            _pad0: [0u8; 8],
+            map_transform,
+            flags,
+            _pad1: [0u8; 12],
+        }
+    }
+
+    /// Constructs a default `MeshBasicMaterial` parameter block matching Three.js r186 defaults:
+    /// white opaque color (`[1.0, 1.0, 1.0, 1.0]`), opacity 1.0, alphaTest 0.0, identity UV transform, 0 flags.
+    pub const fn basic() -> Self {
+        Self {
+            color: [1.0, 1.0, 1.0, 1.0],
+            opacity: 1.0,
+            alpha_test: 0.0,
+            _pad0: [0u8; 8],
+            map_transform: AffineRows::identity(),
+            flags: 0,
+            _pad1: [0u8; 12],
+        }
+    }
+
+    /// Checks whether a specific material flag bit is enabled.
+    #[inline]
+    pub const fn has_flag(&self, flag: u32) -> bool {
+        (self.flags & flag) != 0
+    }
+
+    /// Enables or disables a specific material flag bit.
+    #[inline]
+    pub fn set_flag(&mut self, flag: u32, enable: bool) {
+        if enable {
+            self.flags |= flag;
+        } else {
+            self.flags &= !flag;
+        }
+    }
+
+    /// Serializes the material parameter record into an exact 96-byte array in little-endian order.
+    pub fn to_bytes(&self) -> [u8; MATERIAL_PARAMS_BYTES] {
+        let mut out = [0u8; MATERIAL_PARAMS_BYTES];
+        out[0..4].copy_from_slice(&self.color[0].to_le_bytes());
+        out[4..8].copy_from_slice(&self.color[1].to_le_bytes());
+        out[8..12].copy_from_slice(&self.color[2].to_le_bytes());
+        out[12..16].copy_from_slice(&self.color[3].to_le_bytes());
+        out[16..20].copy_from_slice(&self.opacity.to_le_bytes());
+        out[20..24].copy_from_slice(&self.alpha_test.to_le_bytes());
+        out[24..32].copy_from_slice(&self._pad0);
+        out[32..80].copy_from_slice(&self.map_transform.to_bytes());
+        out[80..84].copy_from_slice(&self.flags.to_le_bytes());
+        out[84..96].copy_from_slice(&self._pad1);
+        out
+    }
+
+    /// Safely writes the 96-byte uniform wire representation into a mutable byte slice.
+    pub fn write_to_slice(&self, out: &mut [u8]) -> Result<(), LayoutError> {
+        if out.len() < Self::BYTE_SIZE {
+            return Err(LayoutError::BufferTooSmall {
+                required: Self::BYTE_SIZE,
+                provided: out.len(),
+            });
+        }
+        out[..Self::BYTE_SIZE].copy_from_slice(&self.to_bytes());
+        Ok(())
+    }
+
+    /// Safely reads the 96-byte uniform record from a byte slice in little-endian order.
+    pub fn read_from_slice(src: &[u8]) -> Result<Self, LayoutError> {
+        if src.len() < Self::BYTE_SIZE {
+            return Err(LayoutError::BufferTooSmall {
+                required: Self::BYTE_SIZE,
+                provided: src.len(),
+            });
+        }
+        let mut b = [0u8; MATERIAL_PARAMS_BYTES];
+        b.copy_from_slice(&src[..Self::BYTE_SIZE]);
+        Ok(Self::from_bytes(&b))
+    }
+
+    /// Deserializes a `MaterialParams` record from an exact 96-byte array.
+    pub fn from_bytes(bytes: &[u8; MATERIAL_PARAMS_BYTES]) -> Self {
+        let read_f32 = |offset: usize| -> f32 {
+            let mut b = [0u8; 4];
+            b.copy_from_slice(&bytes[offset..offset + 4]);
+            f32::from_le_bytes(b)
+        };
+        let color = [
+            read_f32(0),
+            read_f32(4),
+            read_f32(8),
+            read_f32(12),
+        ];
+        let opacity = read_f32(16);
+        let alpha_test = read_f32(20);
+        let mut _pad0 = [0u8; 8];
+        _pad0.copy_from_slice(&bytes[24..32]);
+        let mut map_bytes = [0u8; AFFINE_ROWS_BYTES];
+        map_bytes.copy_from_slice(&bytes[32..80]);
+        let map_transform = AffineRows::from_bytes(&map_bytes);
+        let mut flags_bytes = [0u8; 4];
+        flags_bytes.copy_from_slice(&bytes[80..84]);
+        let flags = u32::from_le_bytes(flags_bytes);
+        let mut _pad1 = [0u8; 12];
+        _pad1.copy_from_slice(&bytes[84..96]);
+        Self {
+            color,
+            opacity,
+            alpha_test,
+            _pad0,
+            map_transform,
+            flags,
+            _pad1,
+        }
+    }
+}
+
+impl Default for MaterialParams {
+    fn default() -> Self {
+        Self::basic()
+    }
+}
+
+/// Canonical WGSL struct declaration for `MaterialParams`.
+pub const WGSL_MATERIAL_PARAMS_DECLARATION: &str = r#"
+struct MaterialParams {
+    color: vec4<f32>,
+    opacity: f32,
+    alpha_test: f32,
+    map_transform: AffineRows,
+    flags: u32,
+};
+"#;
+
 /// Returns standard generated WGSL type declarations and helpers for use in shaders.
 pub fn generate_wgsl_declarations() -> String {
     let mut s = String::new();
@@ -878,8 +1281,153 @@ pub fn generate_wgsl_declarations() -> String {
     s.push_str(WGSL_AFFINE_ROWS_DECLARATION.trim());
     s.push_str("\n\n");
     s.push_str(WGSL_PROJECTIVE_MAT4_DECLARATION.trim());
+    s.push_str("\n\n");
+    s.push_str(WGSL_MATERIAL_PARAMS_DECLARATION.trim());
     s.push('\n');
     s
+}
+
+/// Field-level layout descriptor for GPU wire data structures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct LayoutRow {
+    /// Name of the record type (e.g. "AffineRows", "VertexPosUv").
+    pub record: &'static str,
+    /// Name of the struct field or attribute.
+    pub field: &'static str,
+    /// Byte offset within the record.
+    pub offset: usize,
+    /// Size in bytes of the field.
+    pub size: usize,
+    /// Byte alignment of the field.
+    pub align: usize,
+    /// Corresponding WGSL shader data type.
+    pub wgsl_type: &'static str,
+}
+
+impl fmt::Display for LayoutRow {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{:<24} {:<16} {:>6} {:>6} {:>6}  {:<16}",
+            self.record, self.field, self.offset, self.size, self.align, self.wgsl_type
+        )
+    }
+}
+
+/// Static catalog of GPU wire layouts covering every record type in `f3d-core`.
+pub const LAYOUT_TABLE: [LayoutRow; 31] = [
+    // 1. AffineRows (48 bytes, 16-byte aligned)
+    LayoutRow { record: "AffineRows", field: "r0", offset: 0, size: 16, align: 16, wgsl_type: "vec4<f32>" },
+    LayoutRow { record: "AffineRows", field: "r1", offset: 16, size: 16, align: 16, wgsl_type: "vec4<f32>" },
+    LayoutRow { record: "AffineRows", field: "r2", offset: 32, size: 16, align: 16, wgsl_type: "vec4<f32>" },
+
+    // 2. ProjectiveMat4 (64 bytes, 16-byte aligned)
+    LayoutRow { record: "ProjectiveMat4", field: "elements", offset: 0, size: 64, align: 16, wgsl_type: "mat4x4<f32>" },
+
+    // 3. VertexPosUv (20 bytes, 4-byte aligned)
+    LayoutRow { record: "VertexPosUv", field: "position", offset: 0, size: 12, align: 4, wgsl_type: "vec3<f32>" },
+    LayoutRow { record: "VertexPosUv", field: "uv", offset: 12, size: 8, align: 4, wgsl_type: "vec2<f32>" },
+
+    // 4. VertexPosNormalUv (32 bytes, 4-byte aligned)
+    LayoutRow { record: "VertexPosNormalUv", field: "position", offset: 0, size: 12, align: 4, wgsl_type: "vec3<f32>" },
+    LayoutRow { record: "VertexPosNormalUv", field: "normal", offset: 12, size: 12, align: 4, wgsl_type: "vec3<f32>" },
+    LayoutRow { record: "VertexPosNormalUv", field: "uv", offset: 24, size: 8, align: 4, wgsl_type: "vec2<f32>" },
+
+    // 5. VertexPosColor (28 bytes, 4-byte aligned)
+    LayoutRow { record: "VertexPosColor", field: "position", offset: 0, size: 12, align: 4, wgsl_type: "vec3<f32>" },
+    LayoutRow { record: "VertexPosColor", field: "color", offset: 12, size: 16, align: 4, wgsl_type: "vec4<f32>" },
+
+    // 6. InstanceRecord (64 bytes, 16-byte aligned)
+    // Note: `transform` is stored as AffineRows (three vec4<f32> rows), not mat3x4 column-major.
+    // Bytes 52..64 constitute 12 bytes of trailing alignment padding to reach the 64-byte struct allocation.
+    LayoutRow { record: "InstanceRecord", field: "transform", offset: 0, size: 48, align: 16, wgsl_type: "mat3x4<f32>" },
+    LayoutRow { record: "InstanceRecord", field: "instance_id", offset: 48, size: 4, align: 4, wgsl_type: "u32" },
+    LayoutRow { record: "InstanceRecord", field: "_padding", offset: 52, size: 12, align: 4, wgsl_type: "padding" },
+
+    // 7. DrawIndirectArgs (16 bytes, 4-byte aligned)
+    LayoutRow { record: "DrawIndirectArgs", field: "vertex_count", offset: 0, size: 4, align: 4, wgsl_type: "u32" },
+    LayoutRow { record: "DrawIndirectArgs", field: "instance_count", offset: 4, size: 4, align: 4, wgsl_type: "u32" },
+    LayoutRow { record: "DrawIndirectArgs", field: "first_vertex", offset: 8, size: 4, align: 4, wgsl_type: "u32" },
+    LayoutRow { record: "DrawIndirectArgs", field: "first_instance", offset: 12, size: 4, align: 4, wgsl_type: "u32" },
+
+    // 8. DrawIndexedIndirectArgs (20 bytes, 4-byte aligned)
+    LayoutRow { record: "DrawIndexedIndirectArgs", field: "index_count", offset: 0, size: 4, align: 4, wgsl_type: "u32" },
+    LayoutRow { record: "DrawIndexedIndirectArgs", field: "instance_count", offset: 4, size: 4, align: 4, wgsl_type: "u32" },
+    LayoutRow { record: "DrawIndexedIndirectArgs", field: "first_index", offset: 8, size: 4, align: 4, wgsl_type: "u32" },
+    LayoutRow { record: "DrawIndexedIndirectArgs", field: "base_vertex", offset: 12, size: 4, align: 4, wgsl_type: "i32" },
+    LayoutRow { record: "DrawIndexedIndirectArgs", field: "first_instance", offset: 16, size: 4, align: 4, wgsl_type: "u32" },
+
+    // 9. Color Uniform (16 bytes, 16-byte aligned)
+    LayoutRow { record: "ColorUniform", field: "rgba", offset: 0, size: 16, align: 16, wgsl_type: "vec4<f32>" },
+
+    // 10. MaterialParams Uniform (96 bytes, 16-byte aligned)
+    LayoutRow { record: "MaterialParams", field: "color", offset: 0, size: 16, align: 16, wgsl_type: "vec4<f32>" },
+    LayoutRow { record: "MaterialParams", field: "opacity", offset: 16, size: 4, align: 4, wgsl_type: "f32" },
+    LayoutRow { record: "MaterialParams", field: "alpha_test", offset: 20, size: 4, align: 4, wgsl_type: "f32" },
+    LayoutRow { record: "MaterialParams", field: "_pad0", offset: 24, size: 8, align: 4, wgsl_type: "padding" },
+    LayoutRow { record: "MaterialParams", field: "map_transform", offset: 32, size: 48, align: 16, wgsl_type: "mat3x4<f32>" },
+    LayoutRow { record: "MaterialParams", field: "flags", offset: 80, size: 4, align: 4, wgsl_type: "u32" },
+    LayoutRow { record: "MaterialParams", field: "_pad1", offset: 84, size: 12, align: 4, wgsl_type: "padding" },
+];
+
+/// Returns a fixed slice of [`LayoutRow`] descriptors covering every GPU wire record in the crate.
+#[inline]
+pub fn layout_table() -> &'static [LayoutRow] {
+    &LAYOUT_TABLE
+}
+
+/// Formatted text table view of the layout catalog for terminal / CLI diagnostics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LayoutTable(pub &'static [LayoutRow]);
+
+impl LayoutTable {
+    /// Returns the canonical layout table.
+    pub const fn new() -> Self {
+        Self(&LAYOUT_TABLE)
+    }
+
+    /// Returns the inner slice of layout rows.
+    pub const fn as_slice(&self) -> &'static [LayoutRow] {
+        self.0
+    }
+}
+
+impl Default for LayoutTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl core::ops::Deref for LayoutTable {
+    type Target = [LayoutRow];
+    fn deref(&self) -> &Self::Target {
+        self.0
+    }
+}
+
+impl fmt::Display for LayoutTable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            f,
+            "{:<24} {:<16} {:>6} {:>6} {:>6}  {:<16}",
+            "RECORD", "FIELD", "OFFSET", "SIZE", "ALIGN", "WGSL_TYPE"
+        )?;
+        writeln!(
+            f,
+            "{:<24} {:<16} {:>6} {:>6} {:>6}  {:<16}",
+            "------------------------", "----------------", "------", "------", "------", "----------------"
+        )?;
+        for row in self.0 {
+            writeln!(f, "{row}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Helper function to dump all layouts formatted as an aligned text table (`--dump-layouts`).
+pub fn dump_layouts() -> LayoutTable {
+    LayoutTable(layout_table())
 }
 
 #[cfg(test)]
@@ -1069,6 +1617,220 @@ mod tests {
             VertexPosUv::read_from_slice(&small),
             Err(LayoutError::BufferTooSmall { required: 20, provided: 19 })
         );
+    }
+
+    #[test]
+    fn vertex_layout_records_and_offset_tests() {
+        assert_eq!(core::mem::size_of::<VertexPosNormalUv>(), 32);
+        assert_eq!(core::mem::align_of::<VertexPosNormalUv>(), 4);
+        assert_eq!(core::mem::offset_of!(VertexPosNormalUv, position), 0);
+        assert_eq!(core::mem::offset_of!(VertexPosNormalUv, normal), 12);
+        assert_eq!(core::mem::offset_of!(VertexPosNormalUv, uv), 24);
+        assert_eq!(VERTEX_POS_NORMAL_UV_BYTES, 32);
+        assert_eq!(VERTEX_POS_NORMAL_UV_STRIDE, 32);
+        assert_eq!(VERTEX_POS_NORMAL_UV_ALIGNMENT, 4);
+        assert_eq!(VertexPosNormalUv::BYTE_SIZE, 32);
+        assert_eq!(VertexPosNormalUv::STRIDE, 32);
+        assert_eq!(VertexPosNormalUv::ALIGNMENT, 4);
+
+        let v_pnu = VertexPosNormalUv::new([1.0, 2.0, 3.0], [0.0, 1.0, 0.0], [0.25, 0.75]);
+        let bytes_pnu = v_pnu.to_bytes();
+        assert_eq!(bytes_pnu.len(), 32);
+        let restored_pnu = VertexPosNormalUv::from_bytes(&bytes_pnu);
+        assert_eq!(v_pnu, restored_pnu);
+
+        let mut slice_pnu = [0u8; 32];
+        v_pnu.write_to_slice(&mut slice_pnu).expect("write slice ok");
+        let from_slice_pnu = VertexPosNormalUv::read_from_slice(&slice_pnu).expect("read slice ok");
+        assert_eq!(v_pnu, from_slice_pnu);
+
+        let mut small_pnu = [0u8; 31];
+        assert_eq!(
+            v_pnu.write_to_slice(&mut small_pnu),
+            Err(LayoutError::BufferTooSmall { required: 32, provided: 31 })
+        );
+        assert_eq!(
+            VertexPosNormalUv::read_from_slice(&small_pnu),
+            Err(LayoutError::BufferTooSmall { required: 32, provided: 31 })
+        );
+
+        assert_eq!(core::mem::size_of::<VertexPosColor>(), 28);
+        assert_eq!(core::mem::align_of::<VertexPosColor>(), 4);
+        assert_eq!(core::mem::offset_of!(VertexPosColor, position), 0);
+        assert_eq!(core::mem::offset_of!(VertexPosColor, color), 12);
+        assert_eq!(VERTEX_POS_COLOR_BYTES, 28);
+        assert_eq!(VERTEX_POS_COLOR_STRIDE, 28);
+        assert_eq!(VERTEX_POS_COLOR_ALIGNMENT, 4);
+        assert_eq!(VertexPosColor::BYTE_SIZE, 28);
+        assert_eq!(VertexPosColor::STRIDE, 28);
+        assert_eq!(VertexPosColor::ALIGNMENT, 4);
+
+        let v_pc = VertexPosColor::new([1.0, 2.0, 3.0], [1.0, 0.5, 0.25, 1.0]);
+        let bytes_pc = v_pc.to_bytes();
+        assert_eq!(bytes_pc.len(), 28);
+        let restored_pc = VertexPosColor::from_bytes(&bytes_pc);
+        assert_eq!(v_pc, restored_pc);
+
+        let mut slice_pc = [0u8; 28];
+        v_pc.write_to_slice(&mut slice_pc).expect("write slice ok");
+        let from_slice_pc = VertexPosColor::read_from_slice(&slice_pc).expect("read slice ok");
+        assert_eq!(v_pc, from_slice_pc);
+
+        let mut small_pc = [0u8; 27];
+        assert_eq!(
+            v_pc.write_to_slice(&mut small_pc),
+            Err(LayoutError::BufferTooSmall { required: 28, provided: 27 })
+        );
+        assert_eq!(
+            VertexPosColor::read_from_slice(&small_pc),
+            Err(LayoutError::BufferTooSmall { required: 28, provided: 27 })
+        );
+    }
+
+    #[test]
+    fn material_params_layout_and_byte_roundtrip_tests() {
+        assert_eq!(MATERIAL_PARAMS_BYTES, 96);
+        assert_eq!(MATERIAL_PARAMS_ALIGNMENT, 16);
+        assert_eq!(core::mem::size_of::<MaterialParams>(), 96);
+        assert_eq!(core::mem::offset_of!(MaterialParams, color), 0);
+        assert_eq!(core::mem::offset_of!(MaterialParams, opacity), 16);
+        assert_eq!(core::mem::offset_of!(MaterialParams, alpha_test), 20);
+        assert_eq!(core::mem::offset_of!(MaterialParams, _pad0), 24);
+        assert_eq!(core::mem::offset_of!(MaterialParams, map_transform), 32);
+        assert_eq!(core::mem::offset_of!(MaterialParams, flags), 80);
+        assert_eq!(core::mem::offset_of!(MaterialParams, _pad1), 84);
+
+        let mut mat = MaterialParams::new(
+            [0.25, 0.5, 0.75, 1.0],
+            0.85,
+            0.1,
+            AffineRows::identity(),
+            MATERIAL_FLAG_MAP | MATERIAL_FLAG_ALPHA_TEST,
+        );
+        assert!(mat.has_flag(MATERIAL_FLAG_MAP));
+        assert!(mat.has_flag(MATERIAL_FLAG_ALPHA_TEST));
+        assert!(!mat.has_flag(MATERIAL_FLAG_WIREFRAME));
+        mat.set_flag(MATERIAL_FLAG_WIREFRAME, true);
+        assert!(mat.has_flag(MATERIAL_FLAG_WIREFRAME));
+        mat.set_flag(MATERIAL_FLAG_MAP, false);
+        assert!(!mat.has_flag(MATERIAL_FLAG_MAP));
+
+        let bytes = mat.to_bytes();
+        assert_eq!(bytes.len(), 96);
+        let restored = MaterialParams::from_bytes(&bytes);
+        assert_eq!(restored, mat);
+
+        let mut slice_buf = [0u8; 96];
+        mat.write_to_slice(&mut slice_buf).expect("write ok");
+        let read_back = MaterialParams::read_from_slice(&slice_buf).expect("read ok");
+        assert_eq!(read_back, mat);
+
+        // Short buffer error
+        let mut short_buf = [0u8; 80];
+        assert_eq!(
+            mat.write_to_slice(&mut short_buf),
+            Err(LayoutError::BufferTooSmall { required: 96, provided: 80 })
+        );
+        assert_eq!(
+            MaterialParams::read_from_slice(&short_buf),
+            Err(LayoutError::BufferTooSmall { required: 96, provided: 80 })
+        );
+    }
+
+    #[test]
+    fn layout_table_cross_check_and_display() {
+        let table = layout_table();
+        assert_eq!(table.len(), 31);
+
+        for row in table {
+            let (expected_offset, expected_size) = match (row.record, row.field) {
+                ("AffineRows", "r0") => (core::mem::offset_of!(AffineRows, r0), core::mem::size_of::<[f32; 4]>()),
+                ("AffineRows", "r1") => (core::mem::offset_of!(AffineRows, r1), core::mem::size_of::<[f32; 4]>()),
+                ("AffineRows", "r2") => (core::mem::offset_of!(AffineRows, r2), core::mem::size_of::<[f32; 4]>()),
+                ("ProjectiveMat4", "elements") => (core::mem::offset_of!(ProjectiveMat4, elements), core::mem::size_of::<[f32; 16]>()),
+                ("VertexPosUv", "position") => (core::mem::offset_of!(VertexPosUv, position), core::mem::size_of::<[f32; 3]>()),
+                ("VertexPosUv", "uv") => (core::mem::offset_of!(VertexPosUv, uv), core::mem::size_of::<[f32; 2]>()),
+                ("VertexPosNormalUv", "position") => (core::mem::offset_of!(VertexPosNormalUv, position), core::mem::size_of::<[f32; 3]>()),
+                ("VertexPosNormalUv", "normal") => (core::mem::offset_of!(VertexPosNormalUv, normal), core::mem::size_of::<[f32; 3]>()),
+                ("VertexPosNormalUv", "uv") => (core::mem::offset_of!(VertexPosNormalUv, uv), core::mem::size_of::<[f32; 2]>()),
+                ("VertexPosColor", "position") => (core::mem::offset_of!(VertexPosColor, position), core::mem::size_of::<[f32; 3]>()),
+                ("VertexPosColor", "color") => (core::mem::offset_of!(VertexPosColor, color), core::mem::size_of::<[f32; 4]>()),
+                ("InstanceRecord", "transform") => (core::mem::offset_of!(InstanceRecord, transform), core::mem::size_of::<AffineRows>()),
+                ("InstanceRecord", "instance_id") => (core::mem::offset_of!(InstanceRecord, instance_id), core::mem::size_of::<u32>()),
+                ("InstanceRecord", "_padding") => (52, 12),
+                ("DrawIndirectArgs", "vertex_count") => (core::mem::offset_of!(DrawIndirectArgs, vertex_count), core::mem::size_of::<u32>()),
+                ("DrawIndirectArgs", "instance_count") => (core::mem::offset_of!(DrawIndirectArgs, instance_count), core::mem::size_of::<u32>()),
+                ("DrawIndirectArgs", "first_vertex") => (core::mem::offset_of!(DrawIndirectArgs, first_vertex), core::mem::size_of::<u32>()),
+                ("DrawIndirectArgs", "first_instance") => (core::mem::offset_of!(DrawIndirectArgs, first_instance), core::mem::size_of::<u32>()),
+                ("DrawIndexedIndirectArgs", "index_count") => (core::mem::offset_of!(DrawIndexedIndirectArgs, index_count), core::mem::size_of::<u32>()),
+                ("DrawIndexedIndirectArgs", "instance_count") => (core::mem::offset_of!(DrawIndexedIndirectArgs, instance_count), core::mem::size_of::<u32>()),
+                ("DrawIndexedIndirectArgs", "first_index") => (core::mem::offset_of!(DrawIndexedIndirectArgs, first_index), core::mem::size_of::<u32>()),
+                ("DrawIndexedIndirectArgs", "base_vertex") => (core::mem::offset_of!(DrawIndexedIndirectArgs, base_vertex), core::mem::size_of::<i32>()),
+                ("DrawIndexedIndirectArgs", "first_instance") => (core::mem::offset_of!(DrawIndexedIndirectArgs, first_instance), core::mem::size_of::<u32>()),
+                ("ColorUniform", "rgba") => (0, COLOR_UNIFORM_BYTES),
+                ("MaterialParams", "color") => (core::mem::offset_of!(MaterialParams, color), core::mem::size_of::<[f32; 4]>()),
+                ("MaterialParams", "opacity") => (core::mem::offset_of!(MaterialParams, opacity), core::mem::size_of::<f32>()),
+                ("MaterialParams", "alpha_test") => (core::mem::offset_of!(MaterialParams, alpha_test), core::mem::size_of::<f32>()),
+                ("MaterialParams", "_pad0") => (core::mem::offset_of!(MaterialParams, _pad0), core::mem::size_of::<[u8; 8]>()),
+                ("MaterialParams", "map_transform") => (core::mem::offset_of!(MaterialParams, map_transform), core::mem::size_of::<AffineRows>()),
+                ("MaterialParams", "flags") => (core::mem::offset_of!(MaterialParams, flags), core::mem::size_of::<u32>()),
+                ("MaterialParams", "_pad1") => (core::mem::offset_of!(MaterialParams, _pad1), core::mem::size_of::<[u8; 12]>()),
+                (r, f) => panic!("Unknown record/field: {r}.{f}"),
+            };
+
+            assert_eq!(
+                row.offset, expected_offset,
+                "LayoutRow mismatch for field {}.{}: expected offset {}, actual offset {}",
+                row.record, row.field, expected_offset, row.offset
+            );
+            assert_eq!(
+                row.size, expected_size,
+                "LayoutRow mismatch for field {}.{}: expected size {}, actual size {}",
+                row.record, row.field, expected_size, row.size
+            );
+        }
+
+        // Tiling invariant: for each record type, the catalog rows must tile the full size_of with no gaps or overlaps.
+        let record_sizes: &[(&str, usize)] = &[
+            ("AffineRows", core::mem::size_of::<AffineRows>()),
+            ("ProjectiveMat4", core::mem::size_of::<ProjectiveMat4>()),
+            ("VertexPosUv", core::mem::size_of::<VertexPosUv>()),
+            ("VertexPosNormalUv", core::mem::size_of::<VertexPosNormalUv>()),
+            ("VertexPosColor", core::mem::size_of::<VertexPosColor>()),
+            ("InstanceRecord", InstanceRecord::BYTE_SIZE),
+            ("DrawIndirectArgs", core::mem::size_of::<DrawIndirectArgs>()),
+            ("DrawIndexedIndirectArgs", core::mem::size_of::<DrawIndexedIndirectArgs>()),
+            ("ColorUniform", COLOR_UNIFORM_BYTES),
+            ("MaterialParams", core::mem::size_of::<MaterialParams>()),
+        ];
+
+        for &(record_name, expected_total_size) in record_sizes {
+            let mut expected_next_offset = 0;
+            let mut found_any = false;
+            for row in table {
+                if row.record == record_name {
+                    found_any = true;
+                    assert_eq!(
+                        row.offset, expected_next_offset,
+                        "Gap or overlap detected in record {}: field {} has offset {}, expected {}",
+                        record_name, row.field, row.offset, expected_next_offset
+                    );
+                    expected_next_offset = row.offset + row.size;
+                }
+            }
+            assert!(found_any, "No rows found for record {}", record_name);
+            assert_eq!(
+                expected_next_offset, expected_total_size,
+                "Record {} rows do not tile the full size_of: tiled {} bytes, size_of is {}",
+                record_name, expected_next_offset, expected_total_size
+            );
+        }
+
+        let rendered = format!("{}", dump_layouts());
+        assert!(rendered.contains("RECORD"));
+        assert!(rendered.contains("AffineRows"));
+        assert!(rendered.contains("ColorUniform"));
+        assert!(rendered.contains("MaterialParams"));
     }
 }
 
