@@ -1617,12 +1617,12 @@ fn property_test_snapshot_store_and_borrow_scope_interleavings() {
                     match res {
                         Ok(rec) => {
                             assert_eq!(
-                                rec.store_id,
+                                rec.store_id(),
                                 store.store_id(),
                                 "store_id mismatch for seed {SEED:#018x} at iter {iter} step {step}"
                             );
                             assert_eq!(
-                                rec.generation,
+                                rec.generation(),
                                 store.generation(),
                                 "generation mismatch for seed {SEED:#018x} at iter {iter} step {step}"
                             );
@@ -1630,7 +1630,7 @@ fn property_test_snapshot_store_and_borrow_scope_interleavings() {
                                 panic!("get_use failed for newly recorded slice for seed {SEED:#018x} at iter {iter} step {step}: {e:?}")
                             });
                             assert_eq!(
-                                entry.data,
+                                *entry.data(),
                                 color,
                                 "data mismatch for seed {SEED:#018x} at iter {iter} step {step}"
                             );
@@ -1680,12 +1680,12 @@ fn property_test_snapshot_store_and_borrow_scope_interleavings() {
                             panic!("slot reuse record_use failed for seed {SEED:#018x} at iter {iter} step {step}: {e:?}")
                         });
                     assert_eq!(
-                        new_rec.slice_id,
+                        new_rec.slice_id(),
                         0,
                         "reused slot must occupy slice 0 for seed {SEED:#018x} at iter {iter} step {step}"
                     );
                     assert_eq!(
-                        new_rec.generation,
+                        new_rec.generation(),
                         new_store_generation,
                         "reused slot generation mismatch for seed {SEED:#018x} at iter {iter} step {step}"
                     );
@@ -1715,7 +1715,7 @@ fn property_test_snapshot_store_and_borrow_scope_interleavings() {
                     let stale_idx = (rng.next_u32() as usize) % stale_records.len();
                     let stale_rec = &stale_records[stale_idx];
                     assert!(
-                        stale_rec.generation < store.generation(),
+                        stale_rec.generation() < store.generation(),
                         "stale record generation must be strictly less than current store generation for seed {SEED:#018x} at iter {iter} step {step}"
                     );
 
@@ -1734,12 +1734,12 @@ fn property_test_snapshot_store_and_borrow_scope_interleavings() {
                             );
                             assert_eq!(
                                 actual_generation,
-                                stale_rec.generation,
+                                stale_rec.generation(),
                                 "actual_generation mismatch for seed {SEED:#018x} at iter {iter} step {step}"
                             );
                             assert_eq!(
                                 slice_id,
-                                stale_rec.slice_id,
+                                stale_rec.slice_id(),
                                 "slice_id mismatch for seed {SEED:#018x} at iter {iter} step {step}"
                             );
                         }
