@@ -5,7 +5,7 @@
 
 export { SCHEMA_VERSION, IngestionResolutionError, IngestionParseError } from "./types.mjs";
 export { resolveModuleSpecifier, urlToFilePath, isAbsoluteUrl } from "./resolver.mjs";
-export { parseHtmlEntries, parseHtmlEntries as parseHtmlEntry, stripHtmlComments, parseTagAttributes } from "./html_parser.mjs";
+export { parseHtmlEntries, parseHtmlEntries as parseHtmlEntry, stripHtmlComments, stripScriptAndStyleBodies, parseTagAttributes } from "./html_parser.mjs";
 export { analyzeModuleAst } from "./ast_analyzer.mjs";
 export { buildModuleGraph } from "./module_graph.mjs";
 export { bundleWithRollup, f3dRollupPlugin } from "./bundler.mjs";

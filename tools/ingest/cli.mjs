@@ -6,16 +6,19 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { buildModuleGraph } from './module_graph.mjs';
+import { buildApplication } from './build_application.mjs';
 
 function printHelp() {
   console.log(`
-FrankenThreeD Module Graph Ingestion Tool (f3d-04)
+FrankenThreeD Module Graph Ingestion & Application Build Tool (f3d-04)
 
 Usage:
   node tools/ingest/cli.mjs --entry <path_to_html_or_js> [options]
 
 Options:
   --entry <path>        Path to HTML or ESM entry point (required)
+  --build-app <dir>     Emit runnable application build to target directory (must be fresh)
+  --out-dir <dir>       Alias for --build-app
   --output <path>       Output JSON file path (default: stdout)
   --package-root <url>  Base URL or directory for Three.js package fallback
   --help, -h            Show this help message
@@ -27,6 +30,7 @@ async function main() {
   let entry = null;
   let output = null;
   let packageRoot = null;
+  let buildAppDir = null;
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -35,6 +39,8 @@ async function main() {
       process.exit(0);
     } else if (arg === '--entry') {
       entry = args[++i];
+    } else if (arg === '--build-app' || arg === '--out-dir') {
+      buildAppDir = args[++i];
     } else if (arg === '--output') {
       output = args[++i];
     } else if (arg === '--package-root') {
@@ -51,6 +57,25 @@ async function main() {
   }
 
   try {
+    if (buildAppDir) {
+      const appResult = await buildApplication(entry, buildAppDir, {
+        packageRootUrl: packageRoot
+      });
+      console.log(`Runnable application build emitted to: ${appResult.outDir}`);
+      console.log(`Emitted files (${appResult.emittedFiles.length}): ${appResult.emittedFiles.join(', ')}`);
+      console.log(`Entry files: ${appResult.entryFiles.join(', ')} (multi-chunk: ${appResult.isMultiChunk})`);
+
+      if (output) {
+        const outDir = path.dirname(path.resolve(output));
+        if (!fs.existsSync(outDir)) {
+          fs.mkdirSync(outDir, { recursive: true });
+        }
+        fs.writeFileSync(output, JSON.stringify(appResult, null, 2), 'utf-8');
+        console.log(`Application build manifest written to: ${output}`);
+      }
+      return;
+    }
+
     const bundle = await buildModuleGraph(entry, {
       packageRootUrl: packageRoot
     });

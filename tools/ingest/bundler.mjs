@@ -113,11 +113,23 @@ export async function bundleWithRollup(entryPath, options = {}) {
       orderedEntryIds.push(s.id);
     }
 
-    if (parsed.moduleScripts.length === 1 && parsed.moduleScripts[0].src) {
-      input = parsed.moduleScripts[0].id;
+    // Deduplicate Rollup input IDs by exact canonical resolved URL id only.
+    // Preserves query strings (?query) and fragments (#fragment) as distinct ES module identities.
+    const seenInputIds = new Set();
+    const uniqueInputScripts = [];
+
+    for (const s of parsed.moduleScripts) {
+      if (!seenInputIds.has(s.id)) {
+        seenInputIds.add(s.id);
+        uniqueInputScripts.push(s);
+      }
+    }
+
+    if (uniqueInputScripts.length === 1 && uniqueInputScripts[0].src) {
+      input = uniqueInputScripts[0].id;
     } else {
       input = {};
-      parsed.moduleScripts.forEach((s, idx) => {
+      uniqueInputScripts.forEach((s, idx) => {
         let name;
         if (s.src) {
           const cleanSrc = s.src.split('?')[0].split('#')[0];
@@ -166,22 +178,28 @@ export async function bundleWithRollup(entryPath, options = {}) {
 
     const chunks = output.filter(chunk => chunk.type === 'chunk');
 
-    // Match entry chunks in exact HTML document order
+    // Match entry chunks in exact HTML document order.
+    // If an HTML document contains repeated module script references with identical URL
+    // (e.g. two <script type="module" src="./same.mjs"> tags), entryFiles preserves the exact
+    // 1:1 document-order mapping with duplicate file references so HTML re-emission
+    // keeps both script tags pointing to the same emitted chunk, while underlying
+    // chunks and files remain unique. Distinct URLs (including query variants) map to
+    // their own distinct emitted chunks.
+    const entryFiles = [];
     const entryChunks = [];
-    const matchedChunkSet = new Set();
+    const seenEntryChunks = new Set();
 
     for (const entryId of orderedEntryIds) {
       const chunk = chunks.find(c => c.facadeModuleId === entryId);
-      if (chunk && !matchedChunkSet.has(chunk)) {
-        entryChunks.push(chunk);
-        matchedChunkSet.add(chunk);
-      }
-    }
 
-    for (const chunk of chunks) {
-      if (chunk.isEntry && !matchedChunkSet.has(chunk)) {
+      if (!chunk) {
+        throw new Error(`Failed to find emitted chunk for entry module: ${entryId}`);
+      }
+
+      entryFiles.push(chunk.fileName);
+      if (!seenEntryChunks.has(chunk)) {
         entryChunks.push(chunk);
-        matchedChunkSet.add(chunk);
+        seenEntryChunks.add(chunk);
       }
     }
 
@@ -210,7 +228,6 @@ export async function bundleWithRollup(entryPath, options = {}) {
       facadeModuleId: c.facadeModuleId || null
     }));
 
-    const entryFiles = entryChunks.map(c => c.fileName);
     const files = Object.fromEntries(chunks.map(c => [c.fileName, c.code]));
 
     return {

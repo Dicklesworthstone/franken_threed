@@ -133,3 +133,134 @@ test('Import-map null mapping is rejected while nearest permitted mapping resolv
   await import(pathToFileURL(path.join(emitDir, res.entryFiles[0])).href + `?v=${Date.now()}`);
   assert.equal(globalThis.__f3d_permitted, 'nearest_permitted_ok', 'Nearest permitted mapping must resolve and execute');
 });
+
+test('Repeated HTML module scripts preserve document-order entries to unique chunk and execute once', async () => {
+  const scratch = makeScratch('f3d_repeated_entry');
+  fs.writeFileSync(path.join(scratch, 'dep.js'), `export const sharedState = { id: 'shared_identity_singleton', calls: 0 };\n`);
+  fs.writeFileSync(
+    path.join(scratch, 'same.js'),
+    `import { sharedState } from './dep.js';
+(globalThis.__f3d_repeat = globalThis.__f3d_repeat || { sameExec: 0, order: [] }).sameExec++;
+globalThis.__f3d_repeat.order.push('same');
+export { sharedState };
+export const sameVal = 'same_val';
+`
+  );
+  fs.writeFileSync(
+    path.join(scratch, 'other.js'),
+    `import { sharedState } from './dep.js';
+(globalThis.__f3d_repeat = globalThis.__f3d_repeat || { sameExec: 0, order: [] }).order.push('other');
+sharedState.calls++;
+export { sharedState };
+export const otherVal = 'other_val';
+`
+  );
+
+  // HTML with repeated module script reference in document order:
+  // script 0: same.js
+  // script 1: other.js
+  // script 2: same.js (duplicate reference)
+  const html = `<!DOCTYPE html><html><head>
+    <script type="module" src="./same.js"></script>
+    <script type="module" src="./other.js"></script>
+    <script type="module" src="./same.js"></script>
+  </head><body></body></html>`;
+  const htmlFile = path.join(scratch, 'index.html');
+  fs.writeFileSync(htmlFile, html);
+
+  const res = await bundleWithRollup(htmlFile);
+
+  // Positive: 1:1 mapping with HTML script elements in exact document order
+  assert.equal(res.entryFiles.length, 3, 'Must preserve all 3 HTML module script entries in document order');
+  assert.equal(res.entryFiles[0], res.entryFiles[2], 'Repeated module script tags must map to the same emitted chunk file');
+  assert.notEqual(res.entryFiles[0], res.entryFiles[1], 'Distinct module scripts must map to distinct chunk files');
+
+  // Negative: emitted chunk files on disk must remain unique (no duplicate same_1.js chunk)
+  assert.ok(res.files[res.entryFiles[0]], 'First entry chunk must exist in files map');
+  assert.ok(res.files[res.entryFiles[1]], 'Second entry chunk must exist in files map');
+  const entryChunks = res.outputChunks.filter(c => c.isEntry);
+  assert.equal(entryChunks.length, 2, 'Must emit exactly 2 unique entry chunks, avoiding duplicate code emission');
+
+  // Real execution in emitted document order
+  const emitDir = makeScratch('f3d_repeated_emit');
+  emitToDisk(res.files, emitDir);
+
+  globalThis.__f3d_repeat = { sameExec: 0, order: [] };
+  const nonce = Date.now();
+  const importedModules = [];
+  for (const entryFile of res.entryFiles) {
+    const mod = await import(pathToFileURL(path.join(emitDir, entryFile)).href + `?v=${nonce}`);
+    importedModules.push(mod);
+  }
+
+  // Single execution: same.js must execute only once despite two <script> references
+  assert.equal(globalThis.__f3d_repeat.sameExec, 1, 'Module with repeated script references must execute only once (browser module cache identity)');
+  assert.deepEqual(globalThis.__f3d_repeat.order, ['same', 'other'], 'Execution order must match first occurrence in document order');
+
+  // Module identity & shared dependency identity across chunks
+  assert.equal(importedModules[0], importedModules[2], 'Module namespaces for repeated entries must share identical module cache identity');
+  assert.equal(importedModules[0].sharedState, importedModules[1].sharedState, 'Shared dependency must preserve identical object reference across entry chunks');
+  assert.equal(importedModules[0].sharedState.id, 'shared_identity_singleton');
+  assert.equal(importedModules[0].sharedState.calls, 1);
+
+  // Pure duplicate HTML test: two identical <script type="module" src="./same.js"> tags without other scripts
+  const pureHtml = `<!DOCTYPE html><html><head>
+    <script type="module" src="./same.js"></script>
+    <script type="module" src="./same.js"></script>
+  </head><body></body></html>`;
+  const pureHtmlFile = path.join(scratch, 'pure_dup.html');
+  fs.writeFileSync(pureHtmlFile, pureHtml);
+
+  const pureRes = await bundleWithRollup(pureHtmlFile);
+  assert.equal(pureRes.entryFiles.length, 2, 'Pure duplicate HTML must produce 2 entryFile mappings');
+  assert.equal(pureRes.entryFiles[0], pureRes.entryFiles[1], 'Both mappings must point to identical chunk');
+  assert.equal(Object.keys(pureRes.files).length, 1, 'Pure duplicate HTML must emit exactly 1 unique chunk file');
+  assert.equal(pureRes.outputChunks.length, 1, 'Pure duplicate HTML must have exactly 1 output chunk');
+  assert.equal(pureRes.isMultiChunk, false, 'Pure duplicate HTML is single-chunk');
+
+  // Query parameter & fragment test: distinct URL queries are distinct ES module identities.
+  // They must emit separate entry chunks, produce distinct module namespaces, and each execute,
+  // while identical URL references within the same document preserve single execution.
+  const queryHtml = `<!DOCTYPE html><html><head>
+    <script type="module" src="./same.js"></script>
+    <script type="module" src="./same.js?variant=distinct#frag"></script>
+    <script type="module" src="./same.js"></script>
+  </head><body></body></html>`;
+  const queryHtmlFile = path.join(scratch, 'query_identity.html');
+  fs.writeFileSync(queryHtmlFile, queryHtml);
+
+  const queryRes = await bundleWithRollup(queryHtmlFile);
+  assert.equal(queryRes.entryFiles.length, 3, 'Must maintain exact 3 entry files matching HTML script count');
+
+  // Identical URL repeats (tag 0 and tag 2) map to the same emitted chunk file
+  assert.equal(queryRes.entryFiles[0], queryRes.entryFiles[2], 'Identical URL module scripts must map to the same emitted chunk');
+
+  // Distinct URL query variant (tag 1) must map to its own distinct emitted chunk file
+  assert.notEqual(queryRes.entryFiles[0], queryRes.entryFiles[1], 'URL query/fragment variant has distinct module identity and must emit a separate chunk');
+
+  // Exactly 2 unique entry chunks emitted (one for ./same.js, one for ./same.js?variant=distinct#frag)
+  const queryEntryChunks = queryRes.outputChunks.filter(c => c.isEntry);
+  assert.equal(queryEntryChunks.length, 2, 'Must emit exactly 2 distinct entry chunks for the two distinct module URL identities');
+
+  // Real execution proving separate namespaces/instances for query variant and single execution for identical URL repeat
+  const queryEmitDir = makeScratch('f3d_query_emit');
+  emitToDisk(queryRes.files, queryEmitDir);
+
+  globalThis.__f3d_repeat = { sameExec: 0, order: [] };
+  const queryNonce = Date.now();
+  const queryModules = [];
+  for (const entryFile of queryRes.entryFiles) {
+    const mod = await import(pathToFileURL(path.join(queryEmitDir, entryFile)).href + `?v=${queryNonce}`);
+    queryModules.push(mod);
+  }
+
+  // Tag 0 and Tag 2 share the identical module namespace (cached by URL)
+  assert.equal(queryModules[0], queryModules[2], 'Identical URL repeat must share the exact same module namespace');
+
+  // Tag 1 is a separate module namespace instance
+  assert.notEqual(queryModules[0], queryModules[1], 'Query variant must instantiate a distinct module namespace');
+
+  // Total executions: exactly 2 evaluations (one for ./same.js evaluated once across tag 0 and tag 2, and one for the query variant chunk)
+  assert.equal(globalThis.__f3d_repeat.sameExec, 2, 'Both distinct module URL identities must execute, while repeated identical URL executes only once');
+  assert.deepEqual(globalThis.__f3d_repeat.order, ['same', 'same'], 'Both distinct module chunks must execute their top-level code');
+});
