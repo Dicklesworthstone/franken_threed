@@ -131,6 +131,11 @@ public crate APIs <- conformance
   - Negative: Render bundle execution inside a copy pass is rejected (`HazardError::BundleInCopyPass`).
   - Negative & Positive: Direct draw following a bundle assuming warm state is rejected (`HazardError::BundleDirectDrawRequiresRebind`), while explicit rebind succeeds and correctly reports bundle boundaries and bundle IDs.
   - Positive: Interleaved bundle and direct draw lifecycle where draws following explicit rebind can inherit state, but a subsequent bundle immediately resets state again.
+  - Property Test (LCG Fuzzing, 1,000 iterations): Random small pass graphs with random resource uses assert `PassGraph::compile` never panics and all accepted plans satisfy topological order.
+  - Property Test (LCG Fuzzing, 1,000 iterations): Any pass reading and writing overlapping subresources is strictly rejected (`AttachmentSamplingConflict`, `ComputeWritableAlias`, `OverlappingCopyEndpoints`).
+  - Property Test (LCG Fuzzing, 1,000 iterations): Disjoint-offset writes to one buffer are strictly rejected under the whole-buffer rule (`WholeBufferConflict`).
+  - Property Test (LCG Fuzzing, 1,000 iterations): Duplicate PassIds are strictly rejected before mutating graph state (`DuplicatePassId`), leaving graph integrity intact.
+  - Property Test (LCG Fuzzing, 1,000 iterations): Complex DAG structures with random multi-edge dependencies verify that every accepted plan strictly orders dependencies before dependents.
 
 ---
 

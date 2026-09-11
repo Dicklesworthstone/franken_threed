@@ -1243,3 +1243,491 @@ fn bundle_state_reset_interleaved_warm_state_lifecycle() {
         }
     );
 }
+
+// -----------------------------------------------------------------------------
+// Seeded Deterministic Property Tests (fuzzing of plans, vqa.3 & 2v8.2)
+// -----------------------------------------------------------------------------
+
+/// Minimal 64-bit Linear Congruential Generator (LCG) for deterministic property testing.
+///
+/// Multiplier and increment are standard constants from Knuth / MMIX.
+/// Provides a zero-dependency, reproducible pseudo-random stream across platforms.
+#[derive(Clone, Copy, Debug)]
+struct TestLcg {
+    state: u64,
+}
+
+impl TestLcg {
+    const fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self
+            .state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.state
+    }
+
+    fn next_u32(&mut self) -> u32 {
+        (self.next_u64() >> 32) as u32
+    }
+
+    fn next_range(&mut self, min: u32, max: u32) -> u32 {
+        if min >= max {
+            return min;
+        }
+        min + (self.next_u32() % (max - min + 1))
+    }
+
+    fn next_bool(&mut self) -> bool {
+        (self.next_u32() & 1) == 1
+    }
+}
+
+#[test]
+fn property_test_compile_never_panics_and_topological_order() {
+    const SEED: u64 = 0x5EED_F3D9_9A55_0001;
+    const ITERATIONS: usize = 1_000;
+    let mut rng = TestLcg::new(SEED);
+
+    for iter in 0..ITERATIONS {
+        let mut graph = PassGraph::new();
+        let pass_count = rng.next_range(1, 6) as usize;
+
+        let mut expected_deps: Vec<(PassId, Vec<PassId>)> = Vec::new();
+        let mut pass_ids: Vec<PassId> = Vec::new();
+
+        for i in 0..pass_count {
+            let pass_id = PassId::new((i as u32) + 1);
+            pass_ids.push(pass_id);
+
+            let kind_choice = rng.next_range(0, 2);
+            let mut pass = match kind_choice {
+                0 => {
+                    let mut p = Pass::new_render(pass_id, alloc::format!("render_{i}"));
+                    let target = ResourceId::new(rng.next_range(1, 8));
+                    p = p.with_color_attachment(ColorAttachment::new_clear(
+                        target,
+                        [0.0, 0.0, 0.0, 1.0],
+                    ));
+                    let draw = Draw::new(0, rng.next_range(1, 5), 3, 0, vec![]);
+                    p.with_draw(draw)
+                }
+                1 => {
+                    let mut p = Pass::new_compute(pass_id, alloc::format!("compute_{i}"));
+                    let dispatch = Dispatch::new(0, rng.next_range(1, 5), [1, 1, 1], vec![]);
+                    p.with_dispatch(dispatch)
+                }
+                _ => {
+                    let mut p = Pass::new_copy(pass_id, alloc::format!("copy_{i}"));
+                    let src = ResourceId::new(rng.next_range(10, 15));
+                    let dst = ResourceId::new(rng.next_range(16, 20));
+                    let copy = CopyCommand::BufferToBuffer {
+                        src,
+                        src_offset: 0,
+                        dst,
+                        dst_offset: 0,
+                        size: 64,
+                    };
+                    p.with_copy(copy)
+                }
+            };
+
+            // Random dependencies to earlier passes to create valid DAGs
+            let mut deps = Vec::new();
+            if i > 0 && rng.next_bool() {
+                let dep_idx = rng.next_range(0, (i - 1) as u32) as usize;
+                let dep_id = pass_ids[dep_idx];
+                pass = pass.with_dependency(dep_id);
+                deps.push(dep_id);
+            }
+
+            expected_deps.push((pass_id, deps));
+            let add_res = graph.add_pass(pass);
+            assert!(
+                add_res.is_ok(),
+                "Failed to add pass with seed {SEED:#018x} at iter {iter}"
+            );
+        }
+
+        // Randomly add additional dependencies or back-edges to test robustness
+        if pass_count > 1 && rng.next_range(0, 3) == 0 {
+            let from_idx = rng.next_range(0, (pass_count - 1) as u32) as usize;
+            let to_idx = rng.next_range(0, (pass_count - 1) as u32) as usize;
+            if from_idx != to_idx {
+                let _ = graph.add_dependency(pass_ids[from_idx], pass_ids[to_idx]);
+                expected_deps[from_idx].1.push(pass_ids[to_idx]);
+            }
+        }
+
+        // Property: PassGraph::compile NEVER panics
+        let result = graph.compile(None);
+
+        // Property: If compilation succeeds, every accepted plan is a valid topological order
+        if let Ok(plan) = result {
+            let mut seg_order: std::collections::HashMap<PassId, usize> =
+                std::collections::HashMap::new();
+            for (seg_idx, seg) in plan.segments().iter().enumerate() {
+                seg_order.insert(seg.pass_id(), seg_idx);
+            }
+
+            for (pass_id, deps) in &expected_deps {
+                if let Some(&pass_idx) = seg_order.get(pass_id) {
+                    for dep in deps {
+                        if let Some(&dep_idx) = seg_order.get(dep) {
+                            assert!(
+                                dep_idx < pass_idx,
+                                "Topological order invariant violated for seed {SEED:#018x} at iter {iter}: \
+                                 pass {pass_id:?} (seg {pass_idx}) depends on {dep:?} (seg {dep_idx})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn property_test_overlapping_read_write_subresources_rejected() {
+    const SEED: u64 = 0x5EED_F3D9_9A55_0002;
+    const ITERATIONS: usize = 1_000;
+    let mut rng = TestLcg::new(SEED);
+
+    for iter in 0..ITERATIONS {
+        let scenario = rng.next_range(0, 2);
+        match scenario {
+            0 => {
+                // Render pass: ColorAttachment write + Draw texture sampling on overlapping subresource
+                let pass_id = PassId::new(rng.next_range(1, 500));
+                let tex_id = ResourceId::new(rng.next_range(1, 100));
+                let mut pass = Pass::new_render(pass_id, alloc::format!("render_hazard_{iter}"));
+
+                let mip = rng.next_range(0, 3);
+                let layer = rng.next_range(0, 5);
+                let subresource = SubresourceRange::single_mip_layer(
+                    mip,
+                    layer,
+                    crate::resource::TextureAspect::All,
+                );
+
+                let mut ca = ColorAttachment::new_clear(tex_id, [0.0, 0.0, 0.0, 1.0]);
+                ca.view_subresource = subresource.clone();
+                pass = pass.with_color_attachment(ca);
+
+                let sample_use = ResourceUse {
+                    resource_id: tex_id,
+                    kind: crate::resource::ResourceKind::Texture,
+                    version: DataVersion::INITIAL,
+                    subresource: subresource.clone(),
+                    access: ResourceAccess::SampledTexture,
+                    byte_offset: None,
+                    byte_size: None,
+                    canvas_epoch: None,
+                };
+
+                pass = pass.with_draw(Draw::new(0, 10, 3, 0, vec![sample_use]));
+
+                // Because this is the only color attachment, splitting cannot resolve it (feedback loop)
+                let err = validate_pass_hazards(&pass).expect_err(&alloc::format!(
+                    "Overlapping attachment and sampled texture must be rejected for seed {SEED:#018x} at iter {iter}"
+                ));
+                assert_eq!(
+                    err,
+                    HazardError::AttachmentSamplingConflict {
+                        texture_id: tex_id.get(),
+                        pass_id: pass_id.get(),
+                        subresource: subresource.clone(),
+                    },
+                    "Seed {SEED:#018x} failed at iter {iter}"
+                );
+
+                // PassGraph compilation must also reject it
+                let mut graph = PassGraph::new();
+                graph.add_pass(pass).expect("add pass");
+                let compile_err = graph.compile(None).expect_err(&alloc::format!(
+                    "Compile must reject attachment sampling conflict for seed {SEED:#018x} at iter {iter}"
+                ));
+                assert_eq!(
+                    compile_err,
+                    GraphError::Hazard(HazardError::AttachmentSamplingConflict {
+                        texture_id: tex_id.get(),
+                        pass_id: pass_id.get(),
+                        subresource,
+                    }),
+                    "Expected GraphError::Hazard(AttachmentSamplingConflict) for seed {SEED:#018x} at iter {iter}"
+                );
+            }
+            1 => {
+                // Compute pass: dispatch with writable alias (overlapping read+write or write+write)
+                let pass_id = PassId::new(rng.next_range(1, 500));
+                let buf_id = ResourceId::new(rng.next_range(1, 100));
+                let mut pass = Pass::new_compute(pass_id, alloc::format!("compute_hazard_{iter}"));
+
+                let write_use = ResourceUse::buffer_storage_write(buf_id, DataVersion::INITIAL, None, None);
+                let read_use = ResourceUse::buffer_storage_read(buf_id, DataVersion::INITIAL, None, None);
+
+                let dispatch = Dispatch::new(0, 10, [1, 1, 1], vec![write_use, read_use]);
+                pass = pass.with_dispatch(dispatch);
+
+                let err = validate_pass_hazards(&pass).expect_err(&alloc::format!(
+                    "Compute writable alias must be rejected for seed {SEED:#018x} at iter {iter}"
+                ));
+                assert_eq!(
+                    err,
+                    HazardError::ComputeWritableAlias {
+                        resource_id: buf_id.get(),
+                        dispatch_id: 0,
+                        subresource: SubresourceRange::WholeBuffer,
+                    },
+                    "Seed {SEED:#018x} failed at iter {iter}"
+                );
+            }
+            _ => {
+                // Copy pass: overlapping source and destination
+                let pass_id = PassId::new(rng.next_range(1, 500));
+                let buf_id = ResourceId::new(rng.next_range(1, 100));
+                let mut pass = Pass::new_copy(pass_id, alloc::format!("copy_hazard_{iter}"));
+
+                let copy = CopyCommand::BufferToBuffer {
+                    src: buf_id,
+                    src_offset: (rng.next_range(0, 10) * 64) as u64,
+                    dst: buf_id,
+                    dst_offset: (rng.next_range(0, 10) * 64) as u64,
+                    size: 64,
+                };
+                pass = pass.with_copy(copy);
+
+                let err = validate_pass_hazards(&pass).expect_err(&alloc::format!(
+                    "Overlapping copy endpoints must be rejected for seed {SEED:#018x} at iter {iter}"
+                ));
+                assert_eq!(
+                    err,
+                    HazardError::OverlappingCopyEndpoints {
+                        resource_id: buf_id.get(),
+                    },
+                    "Seed {SEED:#018x} failed at iter {iter}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn property_test_disjoint_offset_buffer_writes_rejected_under_whole_buffer_rule() {
+    const SEED: u64 = 0x5EED_F3D9_9A55_0003;
+    const ITERATIONS: usize = 1_000;
+    let mut rng = TestLcg::new(SEED);
+
+    for iter in 0..ITERATIONS {
+        let pass_id = PassId::new(rng.next_range(1, 500));
+        let buf_id = ResourceId::new(rng.next_range(1, 100));
+        let mut pass = Pass::new_render(pass_id, alloc::format!("whole_buf_{iter}"));
+
+        // Generate strictly non-overlapping disjoint byte ranges in the same buffer
+        let offset_a = (rng.next_range(0, 50) * 256) as u64;
+        let size_a = (rng.next_range(1, 4) * 64) as u64;
+        let gap = (rng.next_range(1, 10) * 256) as u64;
+        let offset_b = offset_a + size_a + gap;
+        let size_b = (rng.next_range(1, 4) * 64) as u64;
+
+        // Invariant assertion: bytes are strictly disjoint
+        assert!(
+            offset_a + size_a <= offset_b,
+            "Ranges must be disjoint for seed {SEED:#018x} at iter {iter}"
+        );
+
+        // One write (StorageWrite), one read (UniformBuffer)
+        let use_a = ResourceUse::buffer_storage_write(
+            buf_id,
+            DataVersion::INITIAL,
+            Some(offset_a),
+            Some(size_a),
+        );
+        let use_b = ResourceUse::buffer_uniform(
+            buf_id,
+            DataVersion::INITIAL,
+            Some(offset_b),
+            Some(size_b),
+        );
+
+        let draw0 = Draw::new(0, 10, 3, 0, vec![use_a]);
+        let draw1 = Draw::new(1, 10, 3, 0, vec![use_b]);
+        pass = pass.with_draw(draw0).with_draw(draw1);
+
+        let hazard_err = validate_pass_hazards(&pass).expect_err(&alloc::format!(
+            "Whole-buffer rule must reject disjoint offsets for seed {SEED:#018x} at iter {iter}"
+        ));
+
+        assert_eq!(
+            hazard_err,
+            HazardError::WholeBufferConflict {
+                buffer_id: buf_id.get(),
+                access_a: ResourceAccess::StorageWrite,
+                access_b: ResourceAccess::UniformBuffer,
+                offset_a: Some(offset_a),
+                offset_b: Some(offset_b),
+            },
+            "Expected WholeBufferConflict for seed {SEED:#018x} at iter {iter}"
+        );
+
+        // Through PassGraph compilation as well
+        let mut graph = PassGraph::new();
+        graph.add_pass(pass).expect("add pass");
+        let compile_err = graph.compile(None).expect_err(&alloc::format!(
+            "Compile must reject whole-buffer conflict for seed {SEED:#018x} at iter {iter}"
+        ));
+        assert_eq!(
+            compile_err,
+            GraphError::Hazard(HazardError::WholeBufferConflict {
+                buffer_id: buf_id.get(),
+                access_a: ResourceAccess::StorageWrite,
+                access_b: ResourceAccess::UniformBuffer,
+                offset_a: Some(offset_a),
+                offset_b: Some(offset_b),
+            }),
+            "Expected GraphError::Hazard(WholeBufferConflict) for seed {SEED:#018x} at iter {iter}"
+        );
+    }
+}
+
+#[test]
+fn property_test_duplicate_pass_ids_rejected_before_mutation() {
+    const SEED: u64 = 0x5EED_F3D9_9A55_0004;
+    const ITERATIONS: usize = 1_000;
+    let mut rng = TestLcg::new(SEED);
+
+    for iter in 0..ITERATIONS {
+        let mut graph = PassGraph::new();
+        let initial_count = rng.next_range(1, 6) as usize;
+
+        let mut existing_ids = Vec::new();
+        for i in 0..initial_count {
+            let pid = PassId::new((i as u32) + 1);
+            existing_ids.push(pid);
+            let mut pass = Pass::new_render(pid, alloc::format!("init_pass_{i}"));
+            pass = pass.with_color_attachment(ColorAttachment::new_clear(
+                ResourceId::new((i as u32) + 10),
+                [0.0, 0.0, 0.0, 1.0],
+            ));
+            pass = pass.with_draw(Draw::new(0, 10, 3, 0, vec![]));
+            graph.add_pass(pass).expect("add pass");
+        }
+
+        // Pick one of the existing IDs to duplicate
+        let dup_idx = rng.next_range(0, (initial_count - 1) as u32) as usize;
+        let dup_id = existing_ids[dup_idx];
+
+        let duplicate_pass = Pass::new_render(dup_id, "attempted_duplicate");
+        let err = graph.add_pass(duplicate_pass).expect_err(&alloc::format!(
+            "Duplicate PassId {dup_id} must be rejected for seed {SEED:#018x} at iter {iter}"
+        ));
+
+        assert_eq!(
+            err,
+            GraphError::DuplicatePassId {
+                pass_id: dup_id.get(),
+            },
+            "Expected DuplicatePassId for seed {SEED:#018x} at iter {iter}"
+        );
+
+        // Verification of "before mutation":
+        // 1. Graph compiles successfully with EXACTLY initial_count segments
+        let plan = graph.compile(None).expect(&alloc::format!(
+            "Graph compile must succeed without corruption for seed {SEED:#018x} at iter {iter}"
+        ));
+        assert_eq!(
+            plan.segment_count(),
+            initial_count,
+            "Segment count must remain initial_count (no mutation) for seed {SEED:#018x} at iter {iter}"
+        );
+
+        // 2. Fresh pass can still be added cleanly
+        let fresh_id = PassId::new((initial_count as u32) + 100);
+        let mut fresh_pass = Pass::new_render(fresh_id, "fresh_pass");
+        fresh_pass = fresh_pass.with_color_attachment(ColorAttachment::new_clear(
+            ResourceId::new(99),
+            [0.0, 0.0, 0.0, 1.0],
+        ));
+        fresh_pass = fresh_pass.with_draw(Draw::new(0, 10, 3, 0, vec![]));
+        assert!(
+            graph.add_pass(fresh_pass).is_ok(),
+            "Adding fresh pass must succeed after duplicate rejection for seed {SEED:#018x} at iter {iter}"
+        );
+    }
+}
+
+#[test]
+fn property_test_dag_compilation_always_yields_valid_topological_order() {
+    const SEED: u64 = 0x5EED_F3D9_9A55_0005;
+    const ITERATIONS: usize = 1_000;
+    let mut rng = TestLcg::new(SEED);
+
+    for iter in 0..ITERATIONS {
+        let mut graph = PassGraph::new();
+        let pass_count = rng.next_range(2, 8) as usize;
+
+        let mut pass_ids = Vec::new();
+        let mut direct_deps: Vec<(PassId, Vec<PassId>)> = Vec::new();
+
+        for i in 0..pass_count {
+            let pid = PassId::new((i as u32) + 1);
+            pass_ids.push(pid);
+
+            let mut pass = Pass::new_render(pid, alloc::format!("dag_pass_{i}"));
+            pass = pass.with_color_attachment(ColorAttachment::new_clear(
+                ResourceId::new((i as u32) + 10),
+                [0.0, 0.0, 0.0, 1.0],
+            ));
+            pass = pass.with_draw(Draw::new(0, 10, 3, 0, vec![]));
+
+            // Add 0 to multiple dependencies to prior passes (guaranteed DAG)
+            let mut deps = Vec::new();
+            if i > 0 {
+                let dep_count = rng.next_range(0, i as u32) as usize;
+                for _ in 0..dep_count {
+                    let dep_idx = rng.next_range(0, (i - 1) as u32) as usize;
+                    let dep_id = pass_ids[dep_idx];
+                    if !deps.contains(&dep_id) {
+                        deps.push(dep_id);
+                        pass = pass.with_dependency(dep_id);
+                    }
+                }
+            }
+            direct_deps.push((pid, deps));
+            graph.add_pass(pass).expect("add pass");
+        }
+
+        let plan = graph.compile(None).expect(&alloc::format!(
+            "DAG compilation must succeed for seed {SEED:#018x} at iter {iter}"
+        ));
+
+        assert_eq!(
+            plan.segment_count(),
+            pass_count,
+            "Segment count must match pass count for seed {SEED:#018x} at iter {iter}"
+        );
+
+        let mut seg_index_map: std::collections::HashMap<PassId, usize> =
+            std::collections::HashMap::new();
+        for (idx, seg) in plan.segments().iter().enumerate() {
+            seg_index_map.insert(seg.pass_id(), idx);
+        }
+
+        // Verify topological order invariant: for every dependency (A -> B, B depends on A),
+        // A must be scheduled before B (seg_index(A) < seg_index(B))
+        for (dependent_id, deps) in &direct_deps {
+            let dependent_idx = seg_index_map[dependent_id];
+            for dep_id in deps {
+                let dep_idx = seg_index_map[dep_id];
+                assert!(
+                    dep_idx < dependent_idx,
+                    "Topological ordering failed for seed {SEED:#018x} at iter {iter}: \
+                     dependency {dep_id:?} at {dep_idx} scheduled after dependent {dependent_id:?} at {dependent_idx}"
+                );
+            }
+        }
+    }
+}
