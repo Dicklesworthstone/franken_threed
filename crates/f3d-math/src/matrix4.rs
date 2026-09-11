@@ -1,6 +1,8 @@
 //! 4x4 matrix primitive with `f64` public semantics matching Three.js r186 `Matrix4`.
 
 use core::fmt;
+use crate::euler::{Euler, EulerOrder};
+use crate::jsnum::js_max;
 use crate::narrowing::{check_narrow_f64, NarrowingError, NarrowingTolerance};
 use crate::quaternion::Quaternion;
 use crate::vector3::Vector3;
@@ -392,6 +394,155 @@ impl Matrix4 {
         self.compose(&Vector3::zero(), q, &Vector3::one())
     }
 
+    /// Sets the rotation component of this transformation matrix from Euler angles,
+    /// with the rest of the matrix set to the identity, matching Three.js r186 `Matrix4.makeRotationFromEuler`.
+    ///
+    /// Evaluates direct trigonometric formulas across all six Euler rotation orders
+    /// (`XYZ`, `YXZ`, `ZXY`, `ZYX`, `YZX`, `XZY`) using native `f64::cos` and `f64::sin`
+    /// without routing through quaternion composition.
+    ///
+    /// # Numerics Note
+    /// Evaluates native `f64::sin` and `f64::cos` operations, matching Three.js r186 within
+    /// floating-point tolerance ($10^{-15}$); no bit-identical browser transcendental claim
+    /// is made without a host browser differential proof.
+    pub fn make_rotation_from_euler(&mut self, euler: &Euler) -> &mut Self {
+        let te = &mut self.elements;
+
+        let x = euler.x;
+        let y = euler.y;
+        let z = euler.z;
+        let a = x.cos();
+        let b = x.sin();
+        let c = y.cos();
+        let d = y.sin();
+        let e = z.cos();
+        let f = z.sin();
+
+        match euler.order {
+            EulerOrder::XYZ => {
+                let ae = a * e;
+                let af = a * f;
+                let be = b * e;
+                let bf = b * f;
+
+                te[0] = c * e;
+                te[4] = -c * f;
+                te[8] = d;
+
+                te[1] = af + be * d;
+                te[5] = ae - bf * d;
+                te[9] = -b * c;
+
+                te[2] = bf - ae * d;
+                te[6] = be + af * d;
+                te[10] = a * c;
+            }
+            EulerOrder::YXZ => {
+                let ce = c * e;
+                let cf = c * f;
+                let de = d * e;
+                let df = d * f;
+
+                te[0] = ce + df * b;
+                te[4] = de * b - cf;
+                te[8] = a * d;
+
+                te[1] = a * f;
+                te[5] = a * e;
+                te[9] = -b;
+
+                te[2] = cf * b - de;
+                te[6] = df + ce * b;
+                te[10] = a * c;
+            }
+            EulerOrder::ZXY => {
+                let ce = c * e;
+                let cf = c * f;
+                let de = d * e;
+                let df = d * f;
+
+                te[0] = ce - df * b;
+                te[4] = -a * f;
+                te[8] = de + cf * b;
+
+                te[1] = cf + de * b;
+                te[5] = a * e;
+                te[9] = df - ce * b;
+
+                te[2] = -a * d;
+                te[6] = b;
+                te[10] = a * c;
+            }
+            EulerOrder::ZYX => {
+                let ae = a * e;
+                let af = a * f;
+                let be = b * e;
+                let bf = b * f;
+
+                te[0] = c * e;
+                te[4] = be * d - af;
+                te[8] = ae * d + bf;
+
+                te[1] = c * f;
+                te[5] = bf * d + ae;
+                te[9] = af * d - be;
+
+                te[2] = -d;
+                te[6] = b * c;
+                te[10] = a * c;
+            }
+            EulerOrder::YZX => {
+                let ac = a * c;
+                let ad = a * d;
+                let bc = b * c;
+                let bd = b * d;
+
+                te[0] = c * e;
+                te[4] = bd - ac * f;
+                te[8] = bc * f + ad;
+
+                te[1] = f;
+                te[5] = a * e;
+                te[9] = -b * e;
+
+                te[2] = -d * e;
+                te[6] = ad * f + bc;
+                te[10] = ac - bd * f;
+            }
+            EulerOrder::XZY => {
+                let ac = a * c;
+                let ad = a * d;
+                let bc = b * c;
+                let bd = b * d;
+
+                te[0] = c * e;
+                te[4] = -f;
+                te[8] = d * e;
+
+                te[1] = ac * f + bd;
+                te[5] = a * e;
+                te[9] = ad * f - bc;
+
+                te[2] = bc * f - ad;
+                te[6] = b * e;
+                te[10] = bd * f + ac;
+            }
+        }
+
+        // bottom row
+        te[3] = 0.0;
+        te[7] = 0.0;
+        te[11] = 0.0;
+
+        // last column
+        te[12] = 0.0;
+        te[13] = 0.0;
+        te[14] = 0.0;
+        te[15] = 1.0;
+
+        self
+    }
+
     /// Decomposes this matrix into its position, rotation, and scale components.
     ///
     /// Returns `false` if the affine determinant is zero (matrix is singular), matching Three.js r186.
@@ -454,7 +605,7 @@ impl Matrix4 {
         let scale_y_sq = te[4] * te[4] + te[5] * te[5] + te[6] * te[6];
         let scale_z_sq = te[8] * te[8] + te[9] * te[9] + te[10] * te[10];
 
-        let max_sq = scale_x_sq.max(scale_y_sq).max(scale_z_sq);
+        let max_sq = js_max(js_max(scale_x_sq, scale_y_sq), scale_z_sq);
         max_sq.sqrt()
     }
 

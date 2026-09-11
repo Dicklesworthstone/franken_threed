@@ -6,7 +6,8 @@
 
 use f3d_core::layout::{LayoutError, ProjectiveMat4};
 use f3d_math::{
-    BatchComposeError, CoordinateSystem, Matrix3, Matrix4, NarrowingError, Quaternion, Vector3,
+    BatchComposeError, CoordinateSystem, Euler, EulerOrder, Matrix3, Matrix4, NarrowingError,
+    Quaternion, Vector3,
 };
 
 const EPS: f64 = 1e-10;
@@ -1185,6 +1186,274 @@ fn test_batch_compose_swapped_inputs_differentiate_per_item() {
     assert_ne!(
         normal_outputs[1].elements, swapped_outputs[1].elements,
         "swapping per-item input must produce distinct matrix"
+    );
+}
+
+#[test]
+fn test_make_rotation_from_euler_identity_all_orders() {
+    let orders = [
+        EulerOrder::XYZ,
+        EulerOrder::YXZ,
+        EulerOrder::ZXY,
+        EulerOrder::ZYX,
+        EulerOrder::YZX,
+        EulerOrder::XZY,
+    ];
+    for &order in &orders {
+        let euler = Euler::new(0.0, 0.0, 0.0, order);
+        let mut m = Matrix4::zero();
+        m.make_rotation_from_euler(&euler);
+        assert_eq!(
+            m,
+            Matrix4::identity(),
+            "make_rotation_from_euler on (0,0,0) must yield identity for {order:?}"
+        );
+        assert!(m.is_affine(), "identity rotation must be affine");
+    }
+}
+
+#[test]
+fn test_make_rotation_from_euler_oracle_all_six_orders() {
+    // Exact column-major elements produced by pinned Three.js r186 Matrix4.makeRotationFromEuler
+    // for euler angles (x = 0.3, y = -0.5, z = 0.7) across all six EulerOrder variants.
+    // Trigonometric evaluation uses native f64::sin and f64::cos tested against Three.js within
+    // floating-point tolerance (1e-15); no bit-identical browser transcendental claim is made
+    // without a host browser differential proof.
+    let test_cases: [(EulerOrder, [f64; 16]); 6] = [
+        (
+            EulerOrder::XYZ,
+            [
+                0.6712121661589577, 0.5070818727544463, 0.5406867876359134, 0.0,
+                -0.5653542083811438, 0.8219543695041275, -0.06903356805788474, 0.0,
+                -0.479425538604203, -0.2593433800522308, 0.8383866435942036, 0.0,
+                0.0, 0.0, 0.0, 1.0,
+            ],
+        ),
+        (
+            EulerOrder::YXZ,
+            [
+                0.5799394465903427, 0.6154446635582734, 0.5337584700837362, 0.0,
+                -0.673716999184971, 0.7306816499355124, -0.11049765362538344, 0.0,
+                -0.45801271084729195, -0.29552020666133955, 0.8383866435942036, 0.0,
+                0.0, 0.0, 0.0, 1.0,
+            ],
+        ),
+        (
+            EulerOrder::ZXY,
+            [
+                0.7624848857275728, 0.4569914175773167, 0.45801271084729195, 0.0,
+                -0.6154446635582734, 0.7306816499355124, 0.29552020666133955, 0.0,
+                -0.19961128508842896, -0.5072111697391846, 0.8383866435942036, 0.0,
+                0.0, 0.0, 0.0, 1.0,
+            ],
+        ),
+        (
+            EulerOrder::ZYX,
+            [
+                0.6712121661589577, 0.5653542083811438, 0.479425538604203, 0.0,
+                -0.7238074543621006, 0.6394089303668974, 0.2593433800522308, 0.0,
+                -0.15992809950116813, -0.5210862105571308, 0.8383866435942036, 0.0,
+                0.0, 0.0, 0.0, 1.0,
+            ],
+        ),
+        (
+            EulerOrder::YZX,
+            [
+                0.6712121661589577, 0.644217687237691, 0.3666848775860826, 0.0,
+                -0.6817834387942662, 0.7306816499355124, -0.035716509255276974, 0.0,
+                -0.29093911834963826, -0.22602632124962302, 0.9296593631628186, 0.0,
+                0.0, 0.0, 0.0, 1.0,
+            ],
+        ),
+        (
+            EulerOrder::XZY,
+            [
+                0.6712121661589577, 0.39842357030019004, 0.6250863033449456, 0.0,
+                -0.644217687237691, 0.7306816499355124, 0.22602632124962302, 0.0,
+                -0.3666848775860826, -0.5544032693597385, 0.7471139240255885, 0.0,
+                0.0, 0.0, 0.0, 1.0,
+            ],
+        ),
+    ];
+
+    for (order, expected) in test_cases {
+        let euler = Euler::new(0.3, -0.5, 0.7, order);
+        let mut m = Matrix4::zero();
+        m.make_rotation_from_euler(&euler);
+
+        assert_mat_close(
+            &m,
+            &expected,
+            1e-15,
+            &format!("make_rotation_from_euler oracle match for {order:?}"),
+        );
+        assert!(m.is_affine(), "rotation matrix must be affine for {order:?}");
+    }
+}
+
+#[test]
+fn test_make_rotation_from_euler_elementary_axes() {
+    use core::f64::consts::FRAC_PI_2;
+
+    let orders = [
+        EulerOrder::XYZ,
+        EulerOrder::YXZ,
+        EulerOrder::ZXY,
+        EulerOrder::ZYX,
+        EulerOrder::YZX,
+        EulerOrder::XZY,
+    ];
+
+    for &order in &orders {
+        // Rotation around X by 90 degrees: Y -> Z, Z -> -Y
+        let ex = Euler::new(FRAC_PI_2, 0.0, 0.0, order);
+        let mut mx = Matrix4::zero();
+        mx.make_rotation_from_euler(&ex);
+        let mut v_y = Vector3::new(0.0, 1.0, 0.0);
+        v_y.apply_matrix4(&mx);
+        assert_vec_close(&v_y, [0.0, 0.0, 1.0], 1e-12, "X 90deg rotation (0,1,0)");
+        let mut v_z = Vector3::new(0.0, 0.0, 1.0);
+        v_z.apply_matrix4(&mx);
+        assert_vec_close(&v_z, [0.0, -1.0, 0.0], 1e-12, "X 90deg rotation (0,0,1)");
+
+        // Rotation around Y by 90 degrees: Z -> X, X -> -Z
+        let ey = Euler::new(0.0, FRAC_PI_2, 0.0, order);
+        let mut my = Matrix4::zero();
+        my.make_rotation_from_euler(&ey);
+        let mut v_z2 = Vector3::new(0.0, 0.0, 1.0);
+        v_z2.apply_matrix4(&my);
+        assert_vec_close(&v_z2, [1.0, 0.0, 0.0], 1e-12, "Y 90deg rotation (0,0,1)");
+        let mut v_x = Vector3::new(1.0, 0.0, 0.0);
+        v_x.apply_matrix4(&my);
+        assert_vec_close(&v_x, [0.0, 0.0, -1.0], 1e-12, "Y 90deg rotation (1,0,0)");
+
+        // Rotation around Z by 90 degrees: X -> Y, Y -> -X
+        let ez = Euler::new(0.0, 0.0, FRAC_PI_2, order);
+        let mut mz = Matrix4::zero();
+        mz.make_rotation_from_euler(&ez);
+        let mut v_x2 = Vector3::new(1.0, 0.0, 0.0);
+        v_x2.apply_matrix4(&mz);
+        assert_vec_close(&v_x2, [0.0, 1.0, 0.0], 1e-12, "Z 90deg rotation (1,0,0)");
+        let mut v_y2 = Vector3::new(0.0, 1.0, 0.0);
+        v_y2.apply_matrix4(&mz);
+        assert_vec_close(&v_y2, [-1.0, 0.0, 0.0], 1e-12, "Z 90deg rotation (0,1,0)");
+    }
+}
+
+#[test]
+fn test_make_rotation_from_euler_roundtrip_set_from_rotation_matrix() {
+    let orders = [
+        EulerOrder::XYZ,
+        EulerOrder::YXZ,
+        EulerOrder::ZXY,
+        EulerOrder::ZYX,
+        EulerOrder::YZX,
+        EulerOrder::XZY,
+    ];
+    let angles = [
+        (0.2, 0.3, 0.4),
+        (-0.5, 0.6, -0.7),
+        (0.8, -0.4, 0.2),
+        (-0.1, -0.2, -0.3),
+    ];
+
+    for &order in &orders {
+        for &(x, y, z) in &angles {
+            let e1 = Euler::new(x, y, z, order);
+            let mut m = Matrix4::zero();
+            m.make_rotation_from_euler(&e1);
+
+            let mut e2 = Euler::default();
+            e2.set_from_rotation_matrix(&m, order);
+
+            assert_close(e1.x, e2.x, 1e-12, &format!("Roundtrip X for {order:?}"));
+            assert_close(e1.y, e2.y, 1e-12, &format!("Roundtrip Y for {order:?}"));
+            assert_close(e1.z, e2.z, 1e-12, &format!("Roundtrip Z for {order:?}"));
+        }
+    }
+}
+
+#[test]
+fn test_get_max_scale_on_axis_finite_cases() {
+    // 1. Identity matrix: all axes length 1.0
+    let m_id = Matrix4::identity();
+    assert_close(m_id.get_max_scale_on_axis(), 1.0, EPS, "identity max scale");
+
+    // 2. Pure scale matrix (2, 5, 3)
+    let mut m_scale = Matrix4::identity();
+    m_scale.elements[0] = 2.0;
+    m_scale.elements[5] = 5.0;
+    m_scale.elements[10] = 3.0;
+    assert_close(m_scale.get_max_scale_on_axis(), 5.0, EPS, "diagonal scale max");
+
+    // 3. Negative scales (-4, 2, -3) -> norms are (4, 2, 3) -> max 4
+    let mut m_neg = Matrix4::identity();
+    m_neg.elements[0] = -4.0;
+    m_neg.elements[5] = 2.0;
+    m_neg.elements[10] = -3.0;
+    assert_close(m_neg.get_max_scale_on_axis(), 4.0, EPS, "negative scale max");
+
+    // 4. Upstream Three.js Matrix4.tests.js test vector:
+    // set(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
+    // col 0: (1, 5, 9) -> norm^2 = 1 + 25 + 81 = 107
+    // col 1: (2, 6, 10) -> norm^2 = 4 + 36 + 100 = 140
+    // col 2: (3, 7, 11) -> norm^2 = 9 + 49 + 121 = 179
+    // max norm = sqrt(179)
+    let mut m_three = Matrix4::zero();
+    m_three.set(
+        1.0, 2.0, 3.0, 4.0,
+        5.0, 6.0, 7.0, 8.0,
+        9.0, 10.0, 11.0, 12.0,
+        13.0, 14.0, 15.0, 16.0,
+    );
+    let expected_three = (3.0 * 3.0 + 7.0 * 7.0 + 11.0 * 11.0f64).sqrt();
+    assert_close(
+        m_three.get_max_scale_on_axis(),
+        expected_three,
+        1e-12,
+        "upstream Three.js test vector match",
+    );
+}
+
+#[test]
+fn test_get_max_scale_on_axis_nan_propagation_defect_regression() {
+    // Upstream Three.js evaluates Math.sqrt(Math.max(scaleXSq, scaleYSq, scaleZSq)).
+    // Under ECMAScript semantics, Math.max propagates NaN if ANY argument is NaN.
+    // Rust's f64::max drops NaN (IEEE 754-2008 maxNum), which caused get_max_scale_on_axis
+    // to incorrectly return a finite float when axis elements contained NaN.
+
+    // 1. Single NaN in any 3x3 basis column component must strictly propagate NaN.
+    let axis_indices = [0, 1, 2, 4, 5, 6, 8, 9, 10];
+    for &idx in &axis_indices {
+        let mut m = Matrix4::identity();
+        m.elements[idx] = f64::NAN;
+        assert!(
+            m.get_max_scale_on_axis().is_nan(),
+            "element [{idx}] = NaN must propagate NaN per Three.js r186 Math.max"
+        );
+    }
+
+    // 2. All 3x3 axis components NaN must return NaN.
+    let mut m_all = Matrix4::zero();
+    for &idx in &axis_indices {
+        m_all.elements[idx] = f64::NAN;
+    }
+    assert!(
+        m_all.get_max_scale_on_axis().is_nan(),
+        "all axis components NaN must return NaN"
+    );
+
+    // 3. Translation/perspective column components (te[12], te[13], te[14], te[15]) containing NaN
+    // do not affect axis vectors (columns 0, 1, 2 unaffected), so max scale remains 1.0 matching Three.js.
+    let mut m_trans = Matrix4::identity();
+    m_trans.elements[12] = f64::NAN;
+    m_trans.elements[13] = f64::NAN;
+    m_trans.elements[14] = f64::NAN;
+    assert_close(
+        m_trans.get_max_scale_on_axis(),
+        1.0,
+        EPS,
+        "translation column NaN does not affect axis scale",
     );
 }
 

@@ -2,6 +2,7 @@
 
 use core::fmt;
 use crate::box3::Box3;
+use crate::jsnum::{js_max, js_min};
 use crate::matrix4::Matrix4;
 use crate::plane::Plane;
 use crate::sphere::Sphere;
@@ -102,6 +103,110 @@ impl Ray {
     #[inline]
     pub fn distance_to_point(&self, point: &Vector3) -> f64 {
         self.distance_sq_to_point(point).sqrt()
+    }
+
+    /// Returns the squared distance between this ray and the given line segment `[v0, v1]`.
+    ///
+    /// If `optional_point_on_ray` is provided, it receives the closest point on this ray.
+    /// If `optional_point_on_segment` is provided, it receives the closest point on the segment.
+    /// Matches Three.js r186 `Ray.distanceSqToSegment(v0, v1, optionalPointOnRay, optionalPointOnSegment)`.
+    pub fn distance_sq_to_segment(
+        &self,
+        v0: &Vector3,
+        v1: &Vector3,
+        optional_point_on_ray: Option<&mut Vector3>,
+        optional_point_on_segment: Option<&mut Vector3>,
+    ) -> f64 {
+        let mut seg_center = *v0;
+        seg_center.add(v1).multiply_scalar(0.5);
+
+        let mut seg_dir = *v1;
+        seg_dir.sub(v0).normalize();
+
+        let mut diff = self.origin;
+        diff.sub(&seg_center);
+
+        let seg_extent = v0.distance_to(v1) * 0.5;
+        let a01 = -self.direction.dot(&seg_dir);
+        let b0 = diff.dot(&self.direction);
+        let b1 = -diff.dot(&seg_dir);
+        let c = diff.length_sq();
+        let det = (1.0 - a01 * a01).abs();
+
+        let mut s0: f64;
+        let mut s1: f64;
+        let sqr_dist: f64;
+
+        if det > 0.0 {
+            // The ray and segment are not parallel.
+            s0 = a01 * b1 - b0;
+            s1 = a01 * b0 - b1;
+            let ext_det = seg_extent * det;
+
+            if s0 >= 0.0 {
+                if s1 >= -ext_det {
+                    if s1 <= ext_det {
+                        // region 0: Minimum at interior points of ray and segment.
+                        let inv_det = 1.0 / det;
+                        s0 *= inv_det;
+                        s1 *= inv_det;
+                        sqr_dist = s0 * (s0 + a01 * s1 + 2.0 * b0)
+                            + s1 * (a01 * s0 + s1 + 2.0 * b1)
+                            + c;
+                    } else {
+                        // region 1
+                        s1 = seg_extent;
+                        s0 = js_max(0.0, -(a01 * s1 + b0));
+                        sqr_dist = -s0 * s0 + s1 * (s1 + 2.0 * b1) + c;
+                    }
+                } else {
+                    // region 5
+                    s1 = -seg_extent;
+                    s0 = js_max(0.0, -(a01 * s1 + b0));
+                    sqr_dist = -s0 * s0 + s1 * (s1 + 2.0 * b1) + c;
+                }
+            } else if s1 <= -ext_det {
+                // region 4
+                s0 = js_max(0.0, -(-a01 * seg_extent + b0));
+                s1 = if s0 > 0.0 {
+                    -seg_extent
+                } else {
+                    js_min(js_max(-seg_extent, -b1), seg_extent)
+                };
+                sqr_dist = -s0 * s0 + s1 * (s1 + 2.0 * b1) + c;
+            } else if s1 <= ext_det {
+                // region 3
+                s0 = 0.0;
+                s1 = js_min(js_max(-seg_extent, -b1), seg_extent);
+                sqr_dist = s1 * (s1 + 2.0 * b1) + c;
+            } else {
+                // region 2
+                s0 = js_max(0.0, -(a01 * seg_extent + b0));
+                s1 = if s0 > 0.0 {
+                    seg_extent
+                } else {
+                    js_min(js_max(-seg_extent, -b1), seg_extent)
+                };
+                sqr_dist = -s0 * s0 + s1 * (s1 + 2.0 * b1) + c;
+            }
+        } else {
+            // Ray and segment are parallel.
+            s1 = if a01 > 0.0 { -seg_extent } else { seg_extent };
+            s0 = js_max(0.0, -(a01 * s1 + b0));
+            sqr_dist = -s0 * s0 + s1 * (s1 + 2.0 * b1) + c;
+        }
+
+        if let Some(point_on_ray) = optional_point_on_ray {
+            *point_on_ray = self.origin;
+            point_on_ray.add_scaled_vector(&self.direction, s0);
+        }
+
+        if let Some(point_on_segment) = optional_point_on_segment {
+            *point_on_segment = seg_center;
+            point_on_segment.add_scaled_vector(&seg_dir, s1);
+        }
+
+        sqr_dist
     }
 
     /// Intersects this ray with a sphere, returning the intersection point.

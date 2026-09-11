@@ -13,10 +13,12 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(feature = "std"), no_std)]
 
+pub mod affine3x4;
 pub mod box3;
 pub mod color;
 pub mod conversion;
 pub mod euler;
+pub mod frustum;
 pub mod jsnum;
 pub mod line3;
 pub mod matrix3;
@@ -31,6 +33,7 @@ pub mod vector2;
 pub mod vector3;
 pub mod vector4;
 
+pub use affine3x4::Affine3x4;
 pub use box3::Box3;
 pub use color::{
     linear_to_srgb, srgb_to_linear, Color, ColorSpace, Hsl, StyleOutcome, COLOR_NAMES,
@@ -38,6 +41,7 @@ pub use color::{
     LINEAR_SRGB_TO_LINEAR_DISPLAY_P3, XYZ_TO_LINEAR_DISPLAY_P3, XYZ_TO_LINEAR_REC709,
 };
 pub use euler::{Euler, EulerOrder};
+pub use frustum::Frustum;
 pub use jsnum::{
     js_max, js_max_slice, js_min, js_min_slice, js_rem, js_round, js_shift_left, js_shift_right,
     js_shift_unsigned_right, js_sign, js_trunc, js_unsigned_shift_right, to_int32, to_uint32,

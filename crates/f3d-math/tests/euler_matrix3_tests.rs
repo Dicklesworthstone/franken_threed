@@ -91,6 +91,33 @@ fn test_euler_matrix4_roundtrip_all_orders() {
                 (e1.z - e2.z).abs() < 1e-12,
                 "Matrix4 roundtrip Z mismatch for order {order:?}"
             );
+
+            // Direct make_rotation_from_euler verification
+            let mut m_direct = Matrix4::identity();
+            m_direct.make_rotation_from_euler(&e1);
+
+            for i in 0..16 {
+                assert!(
+                    (m.elements[i] - m_direct.elements[i]).abs() < 1e-12,
+                    "make_rotation_from_euler mismatch with quaternion composition at {i} for {order:?}"
+                );
+            }
+
+            let mut e3 = Euler::default();
+            e3.set_from_rotation_matrix(&m_direct, order);
+
+            assert!(
+                (e1.x - e3.x).abs() < 1e-12,
+                "make_rotation_from_euler roundtrip X mismatch for order {order:?}"
+            );
+            assert!(
+                (e1.y - e3.y).abs() < 1e-12,
+                "make_rotation_from_euler roundtrip Y mismatch for order {order:?}"
+            );
+            assert!(
+                (e1.z - e3.z).abs() < 1e-12,
+                "make_rotation_from_euler roundtrip Z mismatch for order {order:?}"
+            );
         }
     }
 }
