@@ -669,9 +669,21 @@ fn test_zero_allocation_style_and_hex_formatting() {
     assert!(p3_str.starts_with("color(display-p3 "));
     assert!(p3_str.ends_with(')'));
 
-    // Short buffer returns Err(fmt::Error) without truncation or panic
-    let mut short_buf = [0u8; 8];
-    assert!(c.format_style_srgb(&mut short_buf).is_err());
+    // Short buffer (10 bytes) returns Err(fmt::Error) without truncation or panic
+    let mut short_buf_10 = [0u8; 10];
+    assert!(c.format_style_srgb(&mut short_buf_10).is_err());
+    assert!(c.format_style(&mut short_buf_10, ColorSpace::SRGB).is_err());
+
+    // Upstream Color.js:650 does NOT clamp r,g,b in getStyle for sRGB (only getHex clamps)
+    let mut out_of_gamut = Color::new(0.0, 0.0, 0.0);
+    out_of_gamut.set_rgb(300.0 / 255.0, -20.0 / 255.0, 100.0 / 255.0, ColorSpace::SRGB);
+    let mut oog_buf = [0u8; 32];
+    let oog_style = out_of_gamut.format_style_srgb(&mut oog_buf).unwrap();
+    assert_eq!(oog_style, "rgb(300,-20,100)");
+    #[cfg(feature = "std")]
+    {
+        assert_eq!(out_of_gamut.get_style_srgb(), "rgb(300,-20,100)");
+    }
 }
 
 // ============================================================================
