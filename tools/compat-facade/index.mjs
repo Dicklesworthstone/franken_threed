@@ -448,6 +448,7 @@ export function buildFacadeModuleMap(options = {}) {
  * @returns {Promise<{ emittedFiles: string[], count: number, summary: Object }>}
  */
 export async function emitFacadeFiles(targetDir, options = {}) {
+  const resolvedTargetDir = fs.existsSync(targetDir) ? fs.realpathSync(targetDir) : path.resolve(targetDir);
   const result = buildFacadeModuleMap(options);
   const emittedFiles = [];
 
@@ -464,7 +465,7 @@ export async function emitFacadeFiles(targetDir, options = {}) {
       }
     }
 
-    const outPath = path.resolve(targetDir, subPath);
+    const outPath = path.resolve(resolvedTargetDir, subPath);
     const outDir = path.dirname(outPath);
     if (!fs.existsSync(outDir)) {
       fs.mkdirSync(outDir, { recursive: true });

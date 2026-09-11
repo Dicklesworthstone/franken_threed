@@ -69,6 +69,12 @@ export class RendererConstructionRouter {
     this._canvasLocks = new Map();
     /** @type {Map<string, Object>} */
     this._decisions = new Map();
+    /** @type {Array<{ site: string, span: string, route: string, reasons: string[], group: string }>} */
+    this._decisionLog = [];
+    /** @type {Array<{ renderer: string, route: string, submissions: number }>} */
+    this._attributionLog = [];
+    /** @type {WeakSet<object>} */
+    this._hookedInstances = new WeakSet();
     /** @type {WeakMap<object, Object>} */
     this._instanceDiagnostics = new WeakMap();
     this._rendererCounter = 0;
@@ -179,13 +185,43 @@ export class RendererConstructionRouter {
       new Map([[rendererId, initialDecision]])
     );
     const resolved = groupResolutions.get(rendererId) || initialDecision;
+    const groupId = resolved.groupId || rendererId;
+
+    // 3.5 Preflight check canvas lock: reject re-route attempts immediately before implementation lookup
+    const existingLock = this.getCanvasLock(canvasKey);
+    if (existingLock && existingLock.route !== resolved.route) {
+      const rejectedEvent = Object.freeze({
+        site: constructorName,
+        span: sourceSpan,
+        route: resolved.route,
+        reasons: Object.freeze([...resolved.reasons]),
+        group: groupId,
+      });
+      this._decisionLog.push(rejectedEvent);
+      throw new RouteLockError(canvasKeyStr, existingLock.route, resolved.route, sourceSpan);
+    }
 
     // 4. Preflight validate implementation selection for resolved route
+    // Four-tier selection order: targetImplementation, route-conforming constructorFn, registered implementation for the resolved route, truthful throw.
     let targetConstructor = null;
 
     if (typeof targetImplementation === 'function') {
       targetConstructor = targetImplementation;
-    } else {
+    } else if (typeof constructorFn === 'function') {
+      // An explicitly supplied constructorFn is invoked for the resolved route
+      // when it matches the route's contract.
+      if (resolved.route === ExecutionRoute.EXACT_BACKEND && constructorName === 'WebGLRenderer') {
+        targetConstructor = constructorFn;
+      } else if (resolved.route === ExecutionRoute.RETAINED_UPSTREAM && constructorName !== 'WebGLRenderer') {
+        targetConstructor = constructorFn;
+      } else if (resolved.route === ExecutionRoute.GENERAL_WEBGPU && constructorName === 'WebGPURenderer') {
+        targetConstructor = constructorFn;
+      }
+    }
+
+    // If constructorFn was absent or does not implement the resolved route (e.g. WebGPURenderer escaped to EXACT_BACKEND),
+    // look up the admitted implementation from registered implementations.
+    if (!targetConstructor) {
       const mergedImpls = callImplementations
         ? { ...this.implementations, ...callImplementations }
         : this.implementations;
@@ -198,40 +234,28 @@ export class RendererConstructionRouter {
       }
     }
 
-    // If not found in registered implementations, check if constructorFn is a truthful implementation
+    // If still no implementation, throw truthful route-specific error
     if (!targetConstructor) {
       if (resolved.route === ExecutionRoute.RETAINED_UPSTREAM) {
-        if (typeof constructorFn === 'function' && constructorName !== 'WebGLRenderer') {
-          targetConstructor = constructorFn;
-        } else {
-          throw new Error(
-            `Cannot route construction site '${constructorName}' (${sourceSpan}) to '${resolved.route}': ` +
-            `caller-supplied constructor is not a valid retained upstream implementation, and no admitted implementation is registered.`
-          );
-        }
+        throw new Error(
+          `Cannot route construction site '${constructorName}' (${sourceSpan}) to '${resolved.route}': ` +
+          `caller-supplied constructor is not a valid retained upstream implementation, and no admitted implementation is registered.`
+        );
       } else if (resolved.route === ExecutionRoute.EXACT_BACKEND) {
-        if (typeof constructorFn === 'function' && constructorName === 'WebGLRenderer') {
-          targetConstructor = constructorFn;
-        } else {
-          throw new Error(
-            `Cannot route construction site '${constructorName}' (${sourceSpan}) to '${resolved.route}': ` +
-            `no admitted exact backend implementation registered (supplied constructor '${constructorName}' does not implement exact backend).`
-          );
-        }
+        throw new Error(
+          `Cannot route construction site '${constructorName}' (${sourceSpan}) to '${resolved.route}': ` +
+          `no admitted exact backend implementation registered (supplied constructor '${constructorName}' does not implement exact backend).`
+        );
       } else if (resolved.route === ExecutionRoute.SPECIALIZED_WEBGPU) {
         throw new Error(
           `Cannot route construction site '${constructorName}' (${sourceSpan}) to '${resolved.route}': ` +
           `no admitted specialized WebGPU implementation registered.`
         );
       } else if (resolved.route === ExecutionRoute.GENERAL_WEBGPU) {
-        if (typeof constructorFn === 'function' && constructorName === 'WebGPURenderer') {
-          targetConstructor = constructorFn;
-        } else {
-          throw new Error(
-            `Cannot route construction site '${constructorName}' (${sourceSpan}) to '${resolved.route}': ` +
-            `no admitted general WebGPU implementation registered.`
-          );
-        }
+        throw new Error(
+          `Cannot route construction site '${constructorName}' (${sourceSpan}) to '${resolved.route}': ` +
+          `no admitted general WebGPU implementation registered.`
+        );
       }
     }
 
@@ -242,14 +266,9 @@ export class RendererConstructionRouter {
       );
     }
 
-    // 5. Preflight check and RESERVE irreversible canvas lock BEFORE calling constructor
+    // 5. Reserve irreversible canvas lock BEFORE calling constructor
     // (Prevents reentrant route switches on same canvas and preserves lock after constructor throws)
-    const existingLock = this.getCanvasLock(canvasKey);
-    if (existingLock) {
-      if (existingLock.route !== resolved.route) {
-        throw new RouteLockError(canvasKeyStr, existingLock.route, resolved.route, sourceSpan);
-      }
-    } else {
+    if (!existingLock) {
       const lockEntry = {
         route: resolved.route,
         rendererId,
@@ -260,6 +279,16 @@ export class RendererConstructionRouter {
         GLOBAL_CANVAS_OBJECT_LOCKS.set(canvasKey, lockEntry);
       }
     }
+
+    // Emit route decision event for this construction site
+    const decisionEvent = Object.freeze({
+      site: constructorName,
+      span: sourceSpan,
+      route: resolved.route,
+      reasons: Object.freeze([...resolved.reasons]),
+      group: groupId,
+    });
+    this._decisionLog.push(decisionEvent);
 
     // Record committed route in connected groups
     this.connectedGroups.recordCommittedRoute(rendererId, resolved.route);
@@ -280,12 +309,51 @@ export class RendererConstructionRouter {
       );
     }
 
+    // Hook the admitted implementation's render call once, counting submissions
+    if (typeof instance.render === 'function' && !this._hookedInstances.has(instance)) {
+      this._hookedInstances.add(instance);
+      const originalRender = instance.render;
+      let submissions = 0;
+      const router = this;
+      const hookedRender = function (...args) {
+        submissions++;
+        router._attributionLog.push(Object.freeze({
+          renderer: rendererId,
+          route: resolved.route,
+          submissions,
+        }));
+        return originalRender.apply(this, args);
+      };
+
+      try {
+        for (const key of Object.getOwnPropertyNames(originalRender)) {
+          if (key !== 'length' && key !== 'name' && key !== 'prototype') {
+            try {
+              hookedRender[key] = originalRender[key];
+            } catch {}
+          }
+        }
+      } catch {}
+
+      try {
+        instance.render = hookedRender;
+      } catch {
+        try {
+          Object.defineProperty(instance, 'render', {
+            value: hookedRender,
+            writable: true,
+            configurable: true,
+          });
+        } catch {}
+      }
+    }
+
     // 7. Store decision record and diagnostics externally in WeakMaps to preserve native object shape
     const decisionRecord = Object.freeze({
       rendererId,
       route: resolved.route,
       reasons: Object.freeze([...resolved.reasons]),
-      groupId: resolved.groupId || rendererId,
+      groupId,
       canvas: canvasKeyStr,
       sourceSpan,
       timestamp: Date.now(),
@@ -312,7 +380,13 @@ export class RendererConstructionRouter {
             configurable: true,
           },
           __f3d_group_id__: {
-            value: resolved.groupId || rendererId,
+            value: groupId,
+            writable: false,
+            enumerable: true,
+            configurable: true,
+          },
+          __f3d_renderer_id__: {
+            value: rendererId,
             writable: false,
             enumerable: true,
             configurable: true,
@@ -367,5 +441,21 @@ export class RendererConstructionRouter {
    */
   getDecisions() {
     return Array.from(this._decisions.values());
+  }
+
+  /**
+   * Retrieve route decision events in chronological order.
+   * @returns {Array<{ site: string, span: string, route: string, reasons: string[], group: string }>}
+   */
+  getDecisionLog() {
+    return [...this._decisionLog];
+  }
+
+  /**
+   * Retrieve runtime attribution events in chronological order.
+   * @returns {Array<{ renderer: string, route: string, submissions: number }>}
+   */
+  getAttributionLog() {
+    return [...this._attributionLog];
   }
 }

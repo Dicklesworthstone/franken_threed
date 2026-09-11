@@ -872,4 +872,256 @@ test('Positive: exact_backend component exports pinned WebGLRenderer and registe
   assert.equal(configuredRouter.implementations[ExecutionRoute.EXACT_BACKEND], PinnedWebGLRenderer);
 });
 
+test('Regression: caller-supplied constructorFn is invoked exactly once and not shadowed by registered implementations', () => {
+  class AdmittedBackendRenderer {
+    constructor(opts) {
+      this.isAdmitted = true;
+      this.canvas = opts.canvas;
+    }
+  }
+
+  const router = new RendererConstructionRouter({
+    implementations: {
+      [ExecutionRoute.EXACT_BACKEND]: AdmittedBackendRenderer,
+    },
+  });
+
+  let callerCalls = 0;
+  class CallerSuppliedRenderer {
+    constructor(opts) {
+      callerCalls++;
+      this.isCallerSupplied = true;
+      this.canvas = opts.canvas;
+    }
+  }
+
+  // 1. Explicitly supplied constructorFn matching resolved route executes exactly once
+  const instance = router.routeAndConstruct({
+    constructorFn: CallerSuppliedRenderer,
+    constructorName: 'WebGLRenderer',
+    options: { canvas: 'canvas-caller-supplied' },
+    sourceSpan: 'src/caller.js:1:1',
+  });
+
+  assert.equal(callerCalls, 1, 'Caller-supplied constructorFn must execute exactly once');
+  assert.equal(instance.isCallerSupplied, true, 'Instance must be from caller constructorFn, not substituted implementation');
+  assert.equal(instance.isAdmitted, undefined, 'Registered implementation must not shadow caller constructorFn');
+  assert.ok(instance instanceof CallerSuppliedRenderer);
+  assert.equal(getRendererRoute(instance), ExecutionRoute.EXACT_BACKEND);
+
+  // 2. When constructorFn is absent, registered implementation is used
+  const absentConstructorInstance = router.routeAndConstruct({
+    constructorName: 'WebGLRenderer',
+    options: { canvas: 'canvas-absent-constructor' },
+    sourceSpan: 'src/absent.js:1:1',
+  });
+
+  assert.ok(absentConstructorInstance instanceof AdmittedBackendRenderer, 'Registered implementation must be used when constructorFn is absent');
+  assert.equal(absentConstructorInstance.isAdmitted, true);
+  assert.equal(getRendererRoute(absentConstructorInstance), ExecutionRoute.EXACT_BACKEND);
+
+  // 3. Single invocation, error identity, and canvas lock retention when caller-supplied constructor throws
+  class PlannedError extends Error {
+    constructor(msg) {
+      super(msg);
+      this.name = 'PlannedError';
+    }
+  }
+
+  let throwCalls = 0;
+  class ThrowingCallerRenderer {
+    constructor() {
+      throwCalls++;
+      throw new PlannedError('Caller constructor planned failure');
+    }
+  }
+
+  assert.throws(
+    () => {
+      router.routeAndConstruct({
+        constructorFn: ThrowingCallerRenderer,
+        constructorName: 'WebGLRenderer',
+        options: { canvas: 'canvas-throwing-caller' },
+        sourceSpan: 'src/throwing.js:1:1',
+      });
+    },
+    (err) => {
+      assert.ok(err instanceof PlannedError, 'Caller constructor error identity must be preserved');
+      assert.equal(err.message, 'Caller constructor planned failure');
+      return true;
+    }
+  );
+
+  assert.equal(throwCalls, 1, 'Throwing caller constructor must be invoked exactly once');
+  assert.equal(
+    router.getCanvasLock('canvas-throwing-caller')?.route,
+    ExecutionRoute.EXACT_BACKEND,
+    'Canvas lock must be retained after caller constructor throws'
+  );
+});
+
+test('Positive: decision log records H1 branches, reasons, group membership, and rejected offending spans; attribution log tracks submissions', async () => {
+  const h1Bundle = await buildModuleGraph('upstream/three.js/examples/webgpu_performance_renderbundle.html');
+
+  class MockRenderableWebGLRenderer {
+    constructor(opts = {}) {
+      this.isWebGLRenderer = true;
+      this.canvas = opts.canvas;
+      this.renderCalls = 0;
+    }
+    render(scene, camera) {
+      this.renderCalls++;
+      return { scene, camera, target: 'gl' };
+    }
+  }
+
+  class MockRenderableWebGPURenderer {
+    constructor(opts = {}) {
+      this.isWebGPURenderer = true;
+      this.canvas = opts.canvas;
+      this.renderCalls = 0;
+    }
+    render(scene, camera) {
+      this.renderCalls++;
+      return { scene, camera, target: 'gpu' };
+    }
+  }
+
+  const router = new RendererConstructionRouter({
+    specializationAvailable: true,
+    implementations: {
+      [ExecutionRoute.EXACT_BACKEND]: MockRenderableWebGLRenderer,
+      [ExecutionRoute.SPECIALIZED_WEBGPU]: MockRenderableWebGPURenderer,
+    },
+  });
+
+  // 1. Initial decision and attribution logs must be empty
+  assert.deepEqual(router.getDecisionLog(), []);
+  assert.deepEqual(router.getAttributionLog(), []);
+
+  // 2. H1 forceWebGL branch (EXACT_BACKEND)
+  const forcedSpan = 'examples/webgpu_performance_renderbundle.html:85:3';
+  const forcedInstance = router.routeAndConstruct({
+    constructorFn: MockRenderableWebGPURenderer,
+    constructorName: 'WebGPURenderer',
+    options: { canvas: 'canvas-h1-forced', forceWebGL: true },
+    analysis: h1Bundle,
+    hostCapabilities: { hasWebGPU: true, hasWebGL: true },
+    sourceSpan: forcedSpan,
+  });
+
+  assert.equal(getRendererRoute(forcedInstance), ExecutionRoute.EXACT_BACKEND);
+  assert.ok(forcedInstance instanceof MockRenderableWebGLRenderer);
+
+  // Check decision log after H1 forceWebGL construction
+  const decisionLog1 = router.getDecisionLog();
+  assert.equal(decisionLog1.length, 1);
+  const forcedDecision = decisionLog1[0];
+  assert.equal(forcedDecision.site, 'WebGPURenderer');
+  assert.equal(forcedDecision.span, forcedSpan);
+  assert.equal(forcedDecision.route, ExecutionRoute.EXACT_BACKEND);
+  assert.ok(Array.isArray(forcedDecision.reasons));
+  assert.ok(
+    forcedDecision.reasons.includes(EscapeReason.EXPLICIT_SOURCE_SELECTION),
+    'H1 forceWebGL branch must record EXPLICIT_SOURCE_SELECTION in reasons'
+  );
+  assert.ok(typeof forcedDecision.group === 'string' && forcedDecision.group.length > 0, 'Decision must include group membership');
+
+  // 3. H1 WebGPU branch (SPECIALIZED_WEBGPU)
+  const unforcedSpan = 'examples/webgpu_performance_renderbundle.html:95:3';
+  const unforcedInstance = router.routeAndConstruct({
+    constructorFn: MockRenderableWebGPURenderer,
+    constructorName: 'WebGPURenderer',
+    options: { canvas: 'canvas-h1-unforced', forceWebGL: false },
+    analysis: h1Bundle,
+    hostCapabilities: { hasWebGPU: true, hasWebGL: true },
+    sourceSpan: unforcedSpan,
+  });
+
+  assert.equal(getRendererRoute(unforcedInstance), ExecutionRoute.SPECIALIZED_WEBGPU);
+  assert.ok(unforcedInstance instanceof MockRenderableWebGPURenderer);
+
+  // Check decision log after H1 unforced WebGPU construction
+  const decisionLog2 = router.getDecisionLog();
+  assert.equal(decisionLog2.length, 2);
+  const unforcedDecision = decisionLog2[1];
+  assert.equal(unforcedDecision.site, 'WebGPURenderer');
+  assert.equal(unforcedDecision.span, unforcedSpan);
+  assert.equal(unforcedDecision.route, ExecutionRoute.SPECIALIZED_WEBGPU);
+  assert.ok(Array.isArray(unforcedDecision.reasons));
+  assert.ok(typeof unforcedDecision.group === 'string' && unforcedDecision.group.length > 0, 'Decision must include group membership');
+
+  // 4. Rejected re-route on locked canvas must log the offending span
+  const offendingSpan = 'src/offender_component.js:142:7';
+  assert.throws(
+    () => {
+      router.routeAndConstruct({
+        constructorFn: MockRenderableWebGPURenderer,
+        constructorName: 'WebGPURenderer',
+        options: { canvas: 'canvas-h1-forced', forceWebGL: false }, // canvas already locked to EXACT_BACKEND
+        analysis: h1Bundle,
+        hostCapabilities: { hasWebGPU: true, hasWebGL: true },
+        sourceSpan: offendingSpan,
+      });
+    },
+    (err) => {
+      assert.ok(err instanceof RouteLockError);
+      assert.equal(err.sourceSpan, offendingSpan);
+      return true;
+    }
+  );
+
+  // Decision log must record the rejected re-route and its offending span
+  const decisionLog3 = router.getDecisionLog();
+  assert.equal(decisionLog3.length, 3, 'Decision log must record rejected re-route attempt');
+  const rejectedDecision = decisionLog3[2];
+  assert.equal(rejectedDecision.site, 'WebGPURenderer');
+  assert.equal(rejectedDecision.span, offendingSpan, 'Rejected decision must record the offending source span');
+  assert.equal(rejectedDecision.route, ExecutionRoute.SPECIALIZED_WEBGPU);
+  assert.ok(Array.isArray(rejectedDecision.reasons));
+  assert.ok(typeof rejectedDecision.group === 'string' && rejectedDecision.group.length > 0);
+
+  // 5. Runtime attribution log: hook render call once and count submissions
+  assert.deepEqual(router.getAttributionLog(), [], 'Attribution log must be empty before any render call');
+
+  // First render on forcedInstance (EXACT_BACKEND)
+  const res1 = forcedInstance.render('sceneA', 'cameraA');
+  assert.deepEqual(res1, { scene: 'sceneA', camera: 'cameraA', target: 'gl' });
+  assert.equal(forcedInstance.renderCalls, 1);
+
+  const attrLog1 = router.getAttributionLog();
+  assert.equal(attrLog1.length, 1);
+  assert.deepEqual(attrLog1[0], {
+    renderer: forcedInstance.__f3d_renderer_id__,
+    route: ExecutionRoute.EXACT_BACKEND,
+    submissions: 1,
+  });
+
+  // Second render on forcedInstance
+  forcedInstance.render('sceneB', 'cameraB');
+  assert.equal(forcedInstance.renderCalls, 2);
+
+  const attrLog2 = router.getAttributionLog();
+  assert.equal(attrLog2.length, 2);
+  assert.deepEqual(attrLog2[1], {
+    renderer: forcedInstance.__f3d_renderer_id__,
+    route: ExecutionRoute.EXACT_BACKEND,
+    submissions: 2,
+  });
+
+  // Render on unforcedInstance (SPECIALIZED_WEBGPU)
+  const resGPU = unforcedInstance.render('sceneGPU', 'cameraGPU');
+  assert.deepEqual(resGPU, { scene: 'sceneGPU', camera: 'cameraGPU', target: 'gpu' });
+  assert.equal(unforcedInstance.renderCalls, 1);
+
+  const attrLog3 = router.getAttributionLog();
+  assert.equal(attrLog3.length, 3);
+  assert.deepEqual(attrLog3[2], {
+    renderer: unforcedInstance.__f3d_renderer_id__,
+    route: ExecutionRoute.SPECIALIZED_WEBGPU,
+    submissions: 1,
+  });
+});
+
+
 

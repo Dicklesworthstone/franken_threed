@@ -19,16 +19,34 @@
     import { runBrowserNativeIdentityVerification } from './browser_native_identity_fixture.mjs';
 
     window.__f3d_results__ = null;
+    window.__f3d_decision_log__ = null;
+    window.__f3d_attribution_log__ = null;
 
+    let outcome;
     try {
-      const outcome = await runBrowserNativeIdentityVerification();
+      outcome = await runBrowserNativeIdentityVerification();
       window.__f3d_results__ = outcome;
+      window.__f3d_decision_log__ = outcome.decision_log;
+      window.__f3d_attribution_log__ = outcome.attribution_log;
       const outDiv = document.getElementById('output');
       outDiv.innerHTML = `<h2 class="${outcome.passed ? 'pass' : 'fail'}">${outcome.passed ? 'ALL PASSED' : 'VERIFICATION FAILED'}</h2><pre>${JSON.stringify(outcome.results, null, 2)}</pre>`;
     } catch (err) {
-      window.__f3d_results__ = { passed: false, error: err.message };
+      outcome = { passed: false, error: err.message, stack: err.stack, results: [], decision_log: [], attribution_log: [] };
+      window.__f3d_results__ = outcome;
+      window.__f3d_decision_log__ = [];
+      window.__f3d_attribution_log__ = [];
       const outDiv = document.getElementById('output');
       outDiv.innerHTML = `<h2 class="fail">ERROR</h2><pre>${err.stack || err.message}</pre>`;
+    }
+
+    try {
+      await fetch('/report', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(outcome),
+      });
+    } catch (postErr) {
+      console.warn('Failed to post /report to test harness:', postErr);
     }
   </script>
 </body>

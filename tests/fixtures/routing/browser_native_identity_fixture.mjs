@@ -205,6 +205,12 @@ export async function runBrowserNativeIdentityVerification() {
 
   // Test 4: Defect 1 regression - Constructor single invocation & error preservation
   try {
+    const canvasFail = document.createElement('canvas');
+    canvasFail.id = 'canvas-fail-dom';
+    canvasFail.width = 64;
+    canvasFail.height = 64;
+    document.body.appendChild(canvasFail);
+
     let callCount = 0;
     class DomCustomError extends Error {
       constructor(m) { super(m); this.name = 'DomCustomError'; }
@@ -221,7 +227,7 @@ export async function runBrowserNativeIdentityVerification() {
       router.routeAndConstruct({
         constructorFn: FailingConstructor,
         constructorName: 'WebGLRenderer',
-        options: { canvas: 'canvas-fail-dom' },
+        options: { canvas: canvasFail },
       });
     } catch (e) {
       caughtError = e;
@@ -263,12 +269,18 @@ export async function runBrowserNativeIdentityVerification() {
 
   // Test 6: Defect 4 regression - Invalid constructor throws TypeError before construction
   try {
+    const canvasInvalid = document.createElement('canvas');
+    canvasInvalid.id = 'canvas-invalid-dom';
+    canvasInvalid.width = 64;
+    canvasInvalid.height = 64;
+    document.body.appendChild(canvasInvalid);
+
     let threwType = false;
     try {
       router.routeAndConstruct({
         constructorFn: null,
         constructorName: 'WebGLRenderer',
-        options: { canvas: 'invalid-dom-canvas' },
+        options: { canvas: canvasInvalid },
       });
     } catch (e) {
       if (e instanceof TypeError) threwType = true;
@@ -294,6 +306,8 @@ export async function runBrowserNativeIdentityVerification() {
   try {
     const canvasFail = document.createElement('canvas');
     canvasFail.id = 'canvas-dom-bind-fail';
+    canvasFail.width = 64;
+    canvasFail.height = 64;
     document.body.appendChild(canvasFail);
 
     class DomBindFailRenderer {
@@ -347,6 +361,8 @@ export async function runBrowserNativeIdentityVerification() {
   try {
     const canvasReentrant = document.createElement('canvas');
     canvasReentrant.id = 'canvas-dom-reentrant';
+    canvasReentrant.width = 64;
+    canvasReentrant.height = 64;
     document.body.appendChild(canvasReentrant);
 
     class ReentrantDomRenderer {
@@ -387,6 +403,12 @@ export async function runBrowserNativeIdentityVerification() {
 
   // Test 9: Sealed and frozen instances succeed without breaking native shape
   try {
+    const canvasSealed = document.createElement('canvas');
+    canvasSealed.id = 'canvas-dom-sealed';
+    canvasSealed.width = 64;
+    canvasSealed.height = 64;
+    document.body.appendChild(canvasSealed);
+
     class SealedDomRenderer {
       constructor() {
         this.isSealedRenderer = true;
@@ -397,7 +419,7 @@ export async function runBrowserNativeIdentityVerification() {
     const sealedInstance = router.routeAndConstruct({
       constructorFn: SealedDomRenderer,
       constructorName: 'WebGLRenderer',
-      options: { canvas: 'canvas-dom-sealed' },
+      options: { canvas: canvasSealed },
     });
 
     if (!Object.isSealed(sealedInstance)) throw new Error('Instance is not sealed');
@@ -419,9 +441,25 @@ export async function runBrowserNativeIdentityVerification() {
 
   // Test 10: Connected groups residency hazard rejection
   try {
+    const canvasGrp1 = document.createElement('canvas');
+    canvasGrp1.id = 'canvas-grp-dom-1';
+    canvasGrp1.width = 64;
+    canvasGrp1.height = 64;
+    document.body.appendChild(canvasGrp1);
+
+    const canvasGrp2 = document.createElement('canvas');
+    canvasGrp2.id = 'canvas-grp-dom-2';
+    canvasGrp2.width = 64;
+    canvasGrp2.height = 64;
+    document.body.appendChild(canvasGrp2);
+
     const groupRouter = new RendererConstructionRouter({
       implementations: {
         [ExecutionRoute.EXACT_BACKEND]: PinnedWebGLRenderer,
+        [ExecutionRoute.RETAINED_UPSTREAM]: {
+          WebGPURenderer: PinnedWebGPURenderer,
+          default: PinnedWebGPURenderer,
+        },
       },
     });
 
@@ -429,7 +467,7 @@ export async function runBrowserNativeIdentityVerification() {
     groupRouter.routeAndConstruct({
       constructorFn: PinnedWebGPURenderer,
       constructorName: 'WebGPURenderer',
-      options: { canvas: 'canvas-grp-dom-1' },
+      options: { canvas: canvasGrp1 },
       hostCapabilities: { hasWebGPU: true },
       sharedResources: ['dom-shared-rt'],
     });
@@ -440,7 +478,7 @@ export async function runBrowserNativeIdentityVerification() {
       groupRouter.routeAndConstruct({
         constructorFn: PinnedWebGLRenderer,
         constructorName: 'WebGPURenderer',
-        options: { canvas: 'canvas-grp-dom-2' },
+        options: { canvas: canvasGrp2 },
         analysis: { hasOpaqueGLEscapes: true },
         hostCapabilities: { hasWebGPU: true },
         sharedResources: ['dom-shared-rt'],
@@ -464,6 +502,7 @@ export async function runBrowserNativeIdentityVerification() {
   }
 
   // Test 11: Exact-backend component constructs through router and asserts pinned class with real WebGL2 context
+  let exactRouter = null;
   try {
     const canvas11 = document.createElement('canvas');
     canvas11.id = 'canvas-exact-backend-module';
@@ -472,7 +511,7 @@ export async function runBrowserNativeIdentityVerification() {
     document.body.appendChild(canvas11);
 
     // Construct through the registered exact backend router
-    const exactRouter = createExactBackendRouter();
+    exactRouter = createExactBackendRouter();
     const glRenderer = exactRouter.routeAndConstruct({
       constructorFn: PinnedWebGLRenderer,
       constructorName: 'WebGLRenderer',
@@ -544,8 +583,19 @@ export async function runBrowserNativeIdentityVerification() {
   }
 
   const allPassed = results.every((r) => r.status === 'pass');
+  const decisionLog = [
+    ...router.getDecisionLog(),
+    ...(exactRouter ? exactRouter.getDecisionLog() : []),
+  ];
+  const attributionLog = [
+    ...router.getAttributionLog(),
+    ...(exactRouter ? exactRouter.getAttributionLog() : []),
+  ];
+
   return {
     passed: allPassed,
     results,
+    decision_log: decisionLog,
+    attribution_log: attributionLog,
   };
 }
