@@ -1903,6 +1903,36 @@ fn test_layout_table_cross_check_and_evidence() {
             writer
                 .write_artifact("layout_table.txt", display_str.as_bytes())
                 .expect("Failed to write layout_table.txt");
+            let event = f3d_core::test_evidence::EvidenceEvent {
+                ts_wall: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0),
+                ts_app: None,
+                lane: "unit".into(),
+                bead: "05.2".into(),
+                test: "test_layout_table_cross_check_and_evidence".into(),
+                step: "layout_table_cross_check".into(),
+                level: "info".into(),
+                owner: "f3d-core".into(),
+                route: None,
+                browser: None,
+                device_generation: None,
+                scene_generation: None,
+                msg: "Verified all 31 layout table rows against core::mem::offset_of, size_of, and gapless tiling".into(),
+                data: Some(serde_json::to_value(table).expect("Failed to serialize layout table")),
+            };
+            writer.write_event(&event).expect("Failed to write evidence event");
+            let summary = f3d_core::test_evidence::EvidenceSummary {
+                commit: "HEAD".into(),
+                upstream_commit: f3d_core::test_evidence::UPSTREAM_COMMIT.into(),
+                bead: "05.2".into(),
+                run_id: "layout_table".into(),
+                pass: table.len(),
+                fail: 0,
+                first_failure: None,
+            };
+            writer.write_summary(&summary).expect("Failed to write evidence summary");
         }
     }
 }
@@ -1954,42 +1984,4 @@ fn test_material_params_exact_layout_and_roundtrip() {
         MaterialParams::read_from_slice(&short_buf),
         Err(LayoutError::BufferTooSmall { required: 96, provided: 95 })
     );
-}
-    {
-        if let Ok(evidence_dir) = std::env::var("F3D_EVIDENCE_DIR") {
-            let base = std::path::Path::new(&evidence_dir);
-            let writer = f3d_core::test_evidence::EvidenceWriter::init(base, "05.2", "layout_table")
-                .expect("Failed to initialize EvidenceWriter under 05.2");
-            let event = f3d_core::test_evidence::EvidenceEvent {
-                ts_wall: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0),
-                ts_app: None,
-                lane: "unit".into(),
-                bead: "05.2".into(),
-                test: "test_layout_table_cross_check_and_evidence".into(),
-                step: "layout_table_cross_check".into(),
-                level: "info".into(),
-                owner: "f3d-core".into(),
-                route: None,
-                browser: None,
-                device_generation: None,
-                scene_generation: None,
-                msg: "Verified all 24 layout table rows against core::mem::offset_of, size_of, and gapless tiling".into(),
-                data: Some(serde_json::to_value(table).expect("Failed to serialize layout table")),
-            };
-            writer.write_event(&event).expect("Failed to write evidence event");
-            let summary = f3d_core::test_evidence::EvidenceSummary {
-                commit: "HEAD".into(),
-                upstream_commit: f3d_core::test_evidence::UPSTREAM_COMMIT.into(),
-                bead: "05.2".into(),
-                run_id: "layout_table".into(),
-                pass: table.len(),
-                fail: 0,
-                first_failure: None,
-            };
-            writer.write_summary(&summary).expect("Failed to write evidence summary");
-        }
-    }
 }

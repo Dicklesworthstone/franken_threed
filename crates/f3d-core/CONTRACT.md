@@ -51,6 +51,7 @@ public crate APIs <- conformance
 | `VertexPosNormalUv` | 32-byte standard vertex record (`position: [f32; 3]` [12B] at offset 0, `normal: [f32; 3]` [12B] at offset 12, `uv: [f32; 2]` [8B] at offset 24, 4-byte aligned). Array stride is `VERTEX_POS_NORMAL_UV_STRIDE` (32 bytes). |
 | `VertexPosColor` | 28-byte standard vertex record (`position: [f32; 3]` [12B] at offset 0, `color: [f32; 4]` [16B] at offset 12, 4-byte aligned). Array stride is `VERTEX_POS_COLOR_STRIDE` (28 bytes). |
 | `InstanceRecord` | 64-byte instance transform record (`transform: AffineRows` [48B, three vec4 rows, not mat3x4 column-major], `instance_id: u32` [4B], `_padding`: 12B trailing alignment padding to 16B struct alignment [64B total]). |
+| `MaterialParams` | 96-byte material uniform parameter block record matching Three.js r186 `MeshBasicMaterial` (`color: [f32; 4]` [16B], `opacity: f32` [4B], `alpha_test: f32` [4B], `_pad0` [8B], `map_transform: AffineRows` [48B], `flags: u32` [4B], `_pad1` [12B], 16-byte aligned). |
 | `DrawIndirectArgs` | 16-byte WebGPU `drawIndirect` parameter record (`vertex_count`, `instance_count`, `first_vertex`, `first_instance`). |
 | `DrawIndexedIndirectArgs` | 20-byte WebGPU `drawIndexedIndirect` parameter record (`index_count`, `instance_count`, `first_index`, `base_vertex`, `first_instance`). |
 | `LayoutRow` / `LayoutTable` | Introspective layout descriptors and static catalog cross-checked against `core::mem::offset_of` / `size_of`, supporting text dumping via `Display` (`dump_layouts()`) and evidence emission under `05.2`. |
@@ -59,6 +60,8 @@ public crate APIs <- conformance
 | `PROJECTIVE_MAT4_BYTES` (64) | Size in bytes of a full `ProjectiveMat4` record (alignment: 16). |
 | `COLOR_UNIFORM_BYTES` (16) | Size in bytes of an RGBA color uniform record (`vec4<f32>`, alignment: 16). |
 | `COLOR_UNIFORM_ALIGNMENT` (16) | Byte alignment of a color uniform record under WGSL rules. |
+| `MATERIAL_PARAMS_BYTES` (96) | Size in bytes of a `MaterialParams` uniform parameter block record. |
+| `MATERIAL_PARAMS_ALIGNMENT` (16) | Byte alignment of a `MaterialParams` uniform block under WGSL uniform rules. |
 | `VERTEX_POS_UV_BYTES` (20) | Size in bytes of a canonical position + UV vertex record (`VERTEX_POS_UV_STRIDE` = 20, alignment: 4). |
 | `VERTEX_POS_NORMAL_UV_BYTES` (32) | Size in bytes of a standard position + normal + UV vertex record (`VERTEX_POS_NORMAL_UV_STRIDE` = 32, alignment: 4). |
 | `VERTEX_POS_COLOR_BYTES` (28) | Size in bytes of a standard position + color vertex record (`VERTEX_POS_COLOR_STRIDE` = 28, alignment: 4). |
@@ -97,8 +100,17 @@ Every GPU wire structure in `f3d-core` adheres to a strictly tested byte offset 
 | `DrawIndexedIndirectArgs` | `base_vertex` | 12 | 4 | 4 | `i32` |
 | `DrawIndexedIndirectArgs` | `first_instance` | 16 | 4 | 4 | `u32` |
 | `ColorUniform` | `rgba` | 0 | 16 | 16 | `vec4<f32>` |
+| `MaterialParams` | `color` | 0 | 16 | 16 | `vec4<f32>` |
+| `MaterialParams` | `opacity` | 16 | 4 | 4 | `f32` |
+| `MaterialParams` | `alpha_test` | 20 | 4 | 4 | `f32` |
+| `MaterialParams` | `_pad0` | 24 | 8 | 4 | `padding` |
+| `MaterialParams` | `map_transform` | 32 | 48 | 16 | `mat3x4<f32>` |
+| `MaterialParams` | `flags` | 80 | 4 | 4 | `u32` |
+| `MaterialParams` | `_pad1` | 84 | 12 | 4 | `padding` |
 
 > **Note (`InstanceRecord.transform` and `_padding`)**: `InstanceRecord.transform` is stored on the wire as `AffineRows` (three row-major `vec4<f32>` vectors `r0, r1, r2`), NOT standard WGSL `mat3x4<f32>` column-major layout. Bytes 52..64 constitute 12 bytes of explicit trailing alignment padding (`_padding`) ensuring the record tiles the full 64-byte struct allocation without gaps or overlaps.
+
+> **Note (`MaterialParams` uniform layout)**: `MaterialParams` implements the WGSL uniform address space layout rules for Three.js r186 `MeshBasicMaterial`. The 8 bytes of padding (`_pad0` at 24..32) ensure the 2D UV transform (`map_transform: AffineRows`, three `vec4<f32>` rows) starts at a 16-byte boundary. The 12 bytes of trailing padding (`_pad1` at 84..96) satisfy the uniform struct alignment constraint, rounding total size to 96 bytes (a multiple of 16).
 
 ### 2.2 Ownership and Single-Writer Epoch Types
 
