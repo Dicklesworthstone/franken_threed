@@ -135,6 +135,15 @@ pub enum HazardError {
         /// Overlapping subresource range.
         subresource: SubresourceRange,
     },
+    /// Writable binding aliases within a single draw.
+    DrawWritableAlias {
+        /// Resource ID with aliasing writable bindings.
+        resource_id: u32,
+        /// Draw identifier where alias occurred.
+        draw_id: u32,
+        /// Overlapping subresource range.
+        subresource: SubresourceRange,
+    },
     /// Multiple writes to the same subresource within a single pass without synchronization.
     MultipleWriters {
         /// Resource ID with multiple writes.
@@ -214,6 +223,17 @@ impl fmt::Display for HazardError {
                 write!(
                     f,
                     "compute dispatch {dispatch_id} contains writable alias for resource {resource_id} \
+                     at subresource {subresource:?}"
+                )
+            }
+            Self::DrawWritableAlias {
+                resource_id,
+                draw_id,
+                subresource,
+            } => {
+                write!(
+                    f,
+                    "draw {draw_id} contains writable alias for resource {resource_id} \
                      at subresource {subresource:?}"
                 )
             }

@@ -233,21 +233,31 @@ impl ResourceAccess {
         matches!(self, Self::SampledTexture)
     }
 
-    /// Returns `true` if two accesses are compatible within the same render pass usage scope.
+    /// Returns `true` if two accesses are compatible within the same render/compute pass usage scope.
     ///
-    /// WebGPU Usage-Scope Rules:
-    /// - Multiple reads are compatible.
-    /// - Two writes are never compatible in the same scope without an intervening pass/barrier.
-    /// - Read and write to the same subresource are not compatible (except ReadOnlyDepthStencil).
-    /// - An attachment cannot also be sampled in the same render pass.
+    /// WebGPU Usage-Scope Rules (§8.5, WebGPU Compatible Usage List):
+    /// - Storage buffer write accesses are compatible with other storage buffer write accesses
+    ///   at usage-scope level (§8.5, WebGPU storage exception); per-command non-overlapping binding
+    ///   checks are enforced at draw/dispatch level.
+    /// - Multiple reads are always compatible (including UniformBuffer + StorageBufferRead).
+    /// - Mixed read and write to the same buffer are whole-buffer incompatible (e.g. StorageBufferRead + StorageBufferWrite),
+    ///   even at disjoint byte offsets.
+    /// - Two writes are never compatible in the same scope without an intervening pass/barrier (outside the StorageBufferWrite exception).
+    /// - An attachment cannot also be sampled in the same render pass, unless it is a read-only depth-stencil attachment (§8.5).
     #[must_use]
     pub const fn is_compatible_with(&self, other: &Self) -> bool {
         match (self, other) {
+            // Read-only depth-stencil attachment is compatible with sampled views (§8.5, WebGPU compatible usage list)
+            (Self::ReadOnlyDepthStencil, Self::SampledTexture)
+            | (Self::SampledTexture, Self::ReadOnlyDepthStencil) => true,
             // Attachment and sampled texture never coexist in the same render pass
             (a, b) if (a.is_attachment() && b.is_sampled()) || (a.is_sampled() && b.is_attachment()) => false,
-            // Multiple reads are always compatible
+            // Storage buffer write accesses are compatible with other storage buffer write accesses
+            // at usage-scope level (§8.5, WebGPU storage exception)
+            (Self::StorageBufferWrite, Self::StorageBufferWrite) => true,
+            // Multiple reads are always compatible (e.g. UniformBuffer, StorageBufferRead, VertexBuffer, IndexBuffer, SampledTexture)
             (a, b) if a.is_read() && b.is_read() => true,
-            // Writable accesses cannot coexist with any other access to the same subresource
+            // Writable accesses cannot coexist with any other access to the same subresource/buffer
             _ => false,
         }
     }

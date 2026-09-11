@@ -688,7 +688,49 @@ fn negative_compute_per_dispatch_writable_alias_rejected() {
     let buf_storage = ResourceId::new(70);
     let mut pass = Pass::new_compute(PassId::new(1), "compute_hazard_pass");
 
-    // Single dispatch attempting to bind the same storage buffer twice as writable
+    // Single dispatch attempting to bind the same storage buffer twice as writable with overlapping ranges [0, 1024) and [512, 1536)
+    let dispatch = Dispatch::new(
+        0,
+        500,
+        [64, 1, 1],
+        vec![
+            ResourceUse::buffer_storage_write(
+                buf_storage,
+                DataVersion::INITIAL,
+                Some(0),
+                Some(1024),
+            ),
+            ResourceUse::buffer_storage_write(
+                buf_storage,
+                DataVersion::INITIAL,
+                Some(512),
+                Some(1024),
+            ),
+        ],
+    );
+    pass.dispatches.push(dispatch);
+
+    let err = validate_pass_hazards(&pass).expect_err("writable compute aliases must be rejected");
+    match err {
+        HazardError::ComputeWritableAlias {
+            resource_id,
+            dispatch_id,
+            ..
+        } => {
+            assert_eq!(resource_id, buf_storage.get());
+            assert_eq!(dispatch_id, 0);
+        }
+        other => panic!("expected ComputeWritableAlias, got: {other:?}"),
+    }
+}
+
+#[test]
+fn positive_compute_per_dispatch_disjoint_adjacent_writable_ranges_accepted() {
+    // WebGPU storage exception allows disjoint binding ranges in the same dispatch (§8.5, [S51]).
+    // Exact-adjacent ranges [0, 1024) and [1024, 2048) do not overlap.
+    let buf_storage = ResourceId::new(71);
+    let mut pass = Pass::new_compute(PassId::new(1), "compute_adjacent_pass");
+
     let dispatch = Dispatch::new(
         0,
         500,
@@ -710,17 +752,438 @@ fn negative_compute_per_dispatch_writable_alias_rejected() {
     );
     pass.dispatches.push(dispatch);
 
-    let err = validate_pass_hazards(&pass).expect_err("writable compute aliases must be rejected");
+    validate_pass_hazards(&pass)
+        .expect("disjoint adjacent writable ranges in same dispatch must be accepted");
+}
+
+#[test]
+fn positive_storage_buffer_reuse_in_separate_draws_accepted() {
+    // In WebGPU render passes, storage buffers may be reused and written across separate draws (§8.5).
+    let buf_storage = ResourceId::new(72);
+    let mut pass = Pass::new_render(PassId::new(1), "render_separate_draws_storage_pass");
+
+    let draw0 = Draw::new(
+        0,
+        1,
+        3,
+        0,
+        vec![ResourceUse::buffer_storage_write(
+            buf_storage,
+            DataVersion::INITIAL,
+            Some(0),
+            Some(1024),
+        )],
+    );
+    let draw1 = Draw::new(
+        1,
+        1,
+        3,
+        0,
+        vec![ResourceUse::buffer_storage_write(
+            buf_storage,
+            DataVersion::INITIAL,
+            Some(0),
+            Some(1024),
+        )],
+    );
+    pass.draws.push(draw0);
+    pass.draws.push(draw1);
+
+    validate_pass_hazards(&pass)
+        .expect("repeated storage buffer use in separate draws must be accepted");
+}
+
+#[test]
+fn negative_storage_buffer_overlap_in_same_draw_rejected() {
+    // Writable overlapping bindings within a single draw are forbidden (§8.5, [S51]).
+    let buf_storage = ResourceId::new(73);
+    let mut pass = Pass::new_render(PassId::new(1), "render_draw_overlap_pass");
+
+    let draw = Draw::new(
+        0,
+        1,
+        3,
+        0,
+        vec![
+            ResourceUse::buffer_storage_write(
+                buf_storage,
+                DataVersion::INITIAL,
+                Some(0),
+                Some(1024),
+            ),
+            ResourceUse::buffer_storage_write(
+                buf_storage,
+                DataVersion::INITIAL,
+                Some(512),
+                Some(1024),
+            ),
+        ],
+    );
+    pass.draws.push(draw);
+
+    let err = validate_pass_hazards(&pass)
+        .expect_err("overlapping writable storage bindings in same draw must be rejected");
     match err {
-        HazardError::ComputeWritableAlias {
+        HazardError::DrawWritableAlias {
             resource_id,
-            dispatch_id,
+            draw_id,
             ..
         } => {
             assert_eq!(resource_id, buf_storage.get());
-            assert_eq!(dispatch_id, 0);
+            assert_eq!(draw_id, 0);
         }
-        other => panic!("expected ComputeWritableAlias, got: {other:?}"),
+        other => panic!("expected DrawWritableAlias, got: {other:?}"),
+    }
+}
+
+#[test]
+fn positive_storage_buffer_adjacency_in_same_draw_accepted() {
+    // Exact adjacent ranges [0, 1024) and [1024, 2048) in a single draw do not overlap and must be accepted.
+    let buf_storage = ResourceId::new(74);
+    let mut pass = Pass::new_render(PassId::new(1), "render_draw_adjacent_pass");
+
+    let draw = Draw::new(
+        0,
+        1,
+        3,
+        0,
+        vec![
+            ResourceUse::buffer_storage_write(
+                buf_storage,
+                DataVersion::INITIAL,
+                Some(0),
+                Some(1024),
+            ),
+            ResourceUse::buffer_storage_write(
+                buf_storage,
+                DataVersion::INITIAL,
+                Some(1024),
+                Some(1024),
+            ),
+        ],
+    );
+    pass.draws.push(draw);
+
+    validate_pass_hazards(&pass)
+        .expect("disjoint adjacent storage buffer ranges in same draw must be accepted");
+}
+
+#[test]
+fn negative_mixed_role_disjoint_offsets_rejected_in_compute_and_render() {
+    // Invariant (§8.5, [S51]): Whole-buffer rule forbids incompatible roles (UniformBuffer + StorageBufferWrite,
+    // or StorageBufferRead + StorageBufferWrite) even at disjoint offsets, both in render passes and compute passes.
+
+    // A. Render pass with UniformBuffer + StorageBufferWrite at disjoint offsets
+    {
+        let shared_buffer = ResourceId::new(75);
+        let mut pass = Pass::new_render(PassId::new(1), "mixed_render_pass_uniform_write");
+        let draw0 = Draw::new(
+            0,
+            1,
+            3,
+            0,
+            vec![ResourceUse::buffer_uniform(
+                shared_buffer,
+                DataVersion::INITIAL,
+                Some(0),
+                Some(256),
+            )],
+        );
+        let draw1 = Draw::new(
+            1,
+            1,
+            3,
+            0,
+            vec![ResourceUse::buffer_storage_write(
+                shared_buffer,
+                DataVersion::INITIAL,
+                Some(256),
+                Some(1024),
+            )],
+        );
+        pass.draws.push(draw0);
+        pass.draws.push(draw1);
+
+        let err = validate_pass_hazards(&pass)
+            .expect_err("mixed uniform + storage write in render pass must be rejected");
+        match err {
+            HazardError::WholeBufferConflict { buffer_id, .. } => {
+                assert_eq!(buffer_id, shared_buffer.get());
+            }
+            other => panic!("expected WholeBufferConflict, got: {other:?}"),
+        }
+    }
+
+    // B. Render pass with StorageBufferRead + StorageBufferWrite at disjoint offsets
+    {
+        let shared_buffer = ResourceId::new(76);
+        let mut pass = Pass::new_render(PassId::new(2), "mixed_render_pass_read_write");
+        let draw0 = Draw::new(
+            0,
+            1,
+            3,
+            0,
+            vec![ResourceUse::buffer_storage_read(
+                shared_buffer,
+                DataVersion::INITIAL,
+                Some(0),
+                Some(256),
+            )],
+        );
+        let draw1 = Draw::new(
+            1,
+            1,
+            3,
+            0,
+            vec![ResourceUse::buffer_storage_write(
+                shared_buffer,
+                DataVersion::INITIAL,
+                Some(256),
+                Some(1024),
+            )],
+        );
+        pass.draws.push(draw0);
+        pass.draws.push(draw1);
+
+        let err = validate_pass_hazards(&pass)
+            .expect_err("mixed storage read + storage write in render pass must be rejected");
+        match err {
+            HazardError::WholeBufferConflict { buffer_id, .. } => {
+                assert_eq!(buffer_id, shared_buffer.get());
+            }
+            other => panic!("expected WholeBufferConflict, got: {other:?}"),
+        }
+    }
+
+    // C. Compute pass with StorageBufferRead + StorageBufferWrite in the SAME dispatch at disjoint offsets
+    {
+        let shared_buffer = ResourceId::new(77);
+        let mut pass = Pass::new_compute(PassId::new(3), "mixed_compute_same_dispatch_read_write");
+        let dispatch = Dispatch::new(
+            0,
+            500,
+            [64, 1, 1],
+            vec![
+                ResourceUse::buffer_storage_read(
+                    shared_buffer,
+                    DataVersion::INITIAL,
+                    Some(0),
+                    Some(256),
+                ),
+                ResourceUse::buffer_storage_write(
+                    shared_buffer,
+                    DataVersion::INITIAL,
+                    Some(256),
+                    Some(1024),
+                ),
+            ],
+        );
+        pass.dispatches.push(dispatch);
+
+        let err = validate_pass_hazards(&pass)
+            .expect_err("mixed storage read + storage write in same dispatch must be rejected");
+        match err {
+            HazardError::WholeBufferConflict { buffer_id, .. } => {
+                assert_eq!(buffer_id, shared_buffer.get());
+            }
+            other => panic!("expected WholeBufferConflict, got: {other:?}"),
+        }
+    }
+
+    // D. Compute pass with UniformBuffer + StorageBufferWrite in the SAME dispatch at disjoint offsets
+    {
+        let shared_buffer = ResourceId::new(78);
+        let mut pass = Pass::new_compute(PassId::new(4), "mixed_compute_same_dispatch_uniform_write");
+        let dispatch = Dispatch::new(
+            0,
+            500,
+            [64, 1, 1],
+            vec![
+                ResourceUse::buffer_uniform(
+                    shared_buffer,
+                    DataVersion::INITIAL,
+                    Some(0),
+                    Some(256),
+                ),
+                ResourceUse::buffer_storage_write(
+                    shared_buffer,
+                    DataVersion::INITIAL,
+                    Some(256),
+                    Some(1024),
+                ),
+            ],
+        );
+        pass.dispatches.push(dispatch);
+
+        let err = validate_pass_hazards(&pass)
+            .expect_err("mixed uniform + storage write in same dispatch must be rejected");
+        match err {
+            HazardError::WholeBufferConflict { buffer_id, .. } => {
+                assert_eq!(buffer_id, shared_buffer.get());
+            }
+            other => panic!("expected WholeBufferConflict, got: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn positive_compute_separate_dispatches_mixed_roles_accepted() {
+    // In WebGPU (§8.5, [S51]), compute usage scope is each dispatch.
+    // Separate dispatches in the same compute pass can use a buffer in different roles (e.g. uniform read, then storage write).
+    let shared_buffer = ResourceId::new(79);
+    let mut pass = Pass::new_compute(PassId::new(5), "separate_dispatches_compute_pass");
+    let dispatch0 = Dispatch::new(
+        0,
+        500,
+        [64, 1, 1],
+        vec![ResourceUse::buffer_uniform(
+            shared_buffer,
+            DataVersion::INITIAL,
+            Some(0),
+            Some(256),
+        )],
+    );
+    let dispatch1 = Dispatch::new(
+        1,
+        500,
+        [64, 1, 1],
+        vec![ResourceUse::buffer_storage_write(
+            shared_buffer,
+            DataVersion::INITIAL,
+            Some(256),
+            Some(1024),
+        )],
+    );
+    pass.dispatches.push(dispatch0);
+    pass.dispatches.push(dispatch1);
+
+    validate_pass_hazards(&pass)
+        .expect("separate dispatches with mixed buffer roles in same compute pass must be accepted");
+}
+
+#[test]
+fn positive_uniform_and_storage_read_coexistence_accepted() {
+    // In WebGPU (§8.5, [S51]), UniformBuffer and StorageBufferRead are both read-only buffer usages
+    // and ARE compatible on the same buffer within the same pass.
+
+    // A. Render pass
+    {
+        let shared_buffer = ResourceId::new(80);
+        let mut pass = Pass::new_render(PassId::new(1), "uniform_storage_read_render_pass");
+        let draw0 = Draw::new(
+            0,
+            1,
+            3,
+            0,
+            vec![ResourceUse::buffer_uniform(
+                shared_buffer,
+                DataVersion::INITIAL,
+                Some(0),
+                Some(256),
+            )],
+        );
+        let draw1 = Draw::new(
+            1,
+            1,
+            3,
+            0,
+            vec![ResourceUse::buffer_storage_read(
+                shared_buffer,
+                DataVersion::INITIAL,
+                Some(256),
+                Some(1024),
+            )],
+        );
+        pass.draws.push(draw0);
+        pass.draws.push(draw1);
+
+        validate_pass_hazards(&pass)
+            .expect("uniform and storage-read coexistence in render pass must be accepted");
+    }
+
+    // B. Compute pass with both read-only uses in ONE dispatch
+    {
+        let shared_buffer = ResourceId::new(81);
+        let mut pass = Pass::new_compute(PassId::new(2), "uniform_storage_read_compute_pass");
+        let dispatch = Dispatch::new(
+            0,
+            500,
+            [64, 1, 1],
+            vec![
+                ResourceUse::buffer_uniform(
+                    shared_buffer,
+                    DataVersion::INITIAL,
+                    Some(0),
+                    Some(256),
+                ),
+                ResourceUse::buffer_storage_read(
+                    shared_buffer,
+                    DataVersion::INITIAL,
+                    Some(256),
+                    Some(1024),
+                ),
+            ],
+        );
+        pass.dispatches.push(dispatch);
+
+        validate_pass_hazards(&pass)
+            .expect("uniform and storage-read coexistence in single compute dispatch must be accepted");
+    }
+}
+
+#[test]
+fn test_resource_access_compatibility_matrix() {
+    // WebGPU spec (§8.5, Compatible Usage List):
+    // 1. Only StorageBufferWrite + StorageBufferWrite is the storage exception
+    assert!(ResourceAccess::StorageBufferWrite.is_compatible_with(&ResourceAccess::StorageBufferWrite));
+
+    // 2. All-read-only combinations are compatible
+    assert!(ResourceAccess::UniformBuffer.is_compatible_with(&ResourceAccess::StorageBufferRead));
+    assert!(ResourceAccess::StorageBufferRead.is_compatible_with(&ResourceAccess::UniformBuffer));
+    assert!(ResourceAccess::VertexBuffer.is_compatible_with(&ResourceAccess::StorageBufferRead));
+    assert!(ResourceAccess::StorageBufferRead.is_compatible_with(&ResourceAccess::StorageBufferRead));
+
+    // 3. Mixed read/write is whole-buffer incompatible
+    assert!(!ResourceAccess::StorageBufferRead.is_compatible_with(&ResourceAccess::StorageBufferWrite));
+    assert!(!ResourceAccess::StorageBufferWrite.is_compatible_with(&ResourceAccess::StorageBufferRead));
+    assert!(!ResourceAccess::UniformBuffer.is_compatible_with(&ResourceAccess::StorageBufferWrite));
+    assert!(!ResourceAccess::StorageBufferWrite.is_compatible_with(&ResourceAccess::UniformBuffer));
+    assert!(!ResourceAccess::VertexBuffer.is_compatible_with(&ResourceAccess::StorageBufferWrite));
+    assert!(!ResourceAccess::StorageBufferWrite.is_compatible_with(&ResourceAccess::VertexBuffer));
+}
+
+#[test]
+fn test_buffer_range_bounds_via_validate_pass_hazards() {
+    // Unknown (None) or overflow ranges are conservatively treated as potentially overlapping
+    let cases: &[(Option<u64>, Option<u64>, Option<u64>, Option<u64>, bool)] = &[
+        // (offset_a, size_a, offset_b, size_b, is_legal)
+        (Some(0), Some(1024), Some(1024), Some(1024), true),    // exact adjacent -> legal
+        (Some(0), Some(1024), Some(512), Some(1024), false),    // real overlap -> alias
+        (None, Some(1024), Some(1024), Some(1024), false),      // unknown offset -> alias
+        (Some(0), None, Some(1024), Some(1024), false),          // unknown size -> alias
+        (Some(u64::MAX - 10), Some(20), Some(0), Some(1024), false), // overflow -> alias
+    ];
+
+    for (i, &(oa, sa, ob, sb, is_legal)) in cases.iter().enumerate() {
+        let buf = ResourceId::new(90 + i as u32);
+        let mut pass = Pass::new_compute(PassId::new(1), "bounds_check_pass");
+        let dispatch = Dispatch::new(
+            0,
+            500,
+            [64, 1, 1],
+            vec![
+                ResourceUse::buffer_storage_write(buf, DataVersion::INITIAL, oa, sa),
+                ResourceUse::buffer_storage_write(buf, DataVersion::INITIAL, ob, sb),
+            ],
+        );
+        pass.dispatches.push(dispatch);
+
+        if is_legal {
+            validate_pass_hazards(&pass).expect("disjoint ranges must pass");
+        } else {
+            let err = validate_pass_hazards(&pass).expect_err("overlapping/unknown/overflow must fail");
+            assert!(matches!(err, HazardError::ComputeWritableAlias { .. }));
+        }
     }
 }
 
@@ -1815,4 +2278,82 @@ fn test_draw_with_range_preserves_explicit_parameters() {
     assert_eq!(draw_zero.instance_count(), 0);
     assert_eq!(draw_zero.first_vertex(), 0);
     assert_eq!(draw_zero.first_instance(), 0);
+}
+
+#[test]
+fn positive_readonly_depth_stencil_and_sampled_view_coexistence_accepted() {
+    assert!(ResourceAccess::ReadOnlyDepthStencil.is_compatible_with(&ResourceAccess::SampledTexture));
+    assert!(ResourceAccess::SampledTexture.is_compatible_with(&ResourceAccess::ReadOnlyDepthStencil));
+
+    let tex_depth = ResourceId::new(200);
+    let mut pass = Pass::new_render(PassId::new(1), "readonly_depth_sampling_pass");
+    pass.depth_stencil_attachment = Some(DepthStencilAttachment {
+        target_id: tex_depth,
+        view_subresource: SubresourceRange::full_texture(),
+        depth_load_op: Some(LoadOp::Load),
+        depth_store_op: Some(StoreOp::Store),
+        depth_clear_value: 1.0,
+        depth_read_only: true,
+        stencil_load_op: None,
+        stencil_store_op: None,
+        stencil_clear_value: 0,
+        stencil_read_only: true,
+    });
+    pass.draws.push(Draw::new(
+        0, 1, 3, 0,
+        vec![ResourceUse::texture_sampled(
+            tex_depth,
+            DataVersion::INITIAL,
+            SubresourceRange::full_texture(),
+        )],
+    ));
+
+    assert!(validate_pass_hazards(&pass).is_ok());
+
+    let mut graph = PassGraph::new();
+    graph.add_pass(pass).expect("add pass");
+    let plan = graph.compile(None).expect("compile plan");
+    assert_eq!(plan.split_count(), 0);
+    assert_eq!(plan.segment_count(), 1);
+}
+
+#[test]
+fn negative_writable_depth_stencil_and_sampled_view_rejected() {
+    assert!(!ResourceAccess::DepthStencilAttachment.is_compatible_with(&ResourceAccess::SampledTexture));
+    assert!(!ResourceAccess::SampledTexture.is_compatible_with(&ResourceAccess::DepthStencilAttachment));
+
+    let tex_depth = ResourceId::new(201);
+    let mut pass = Pass::new_render(PassId::new(1), "writable_depth_sampling_pass");
+    pass.depth_stencil_attachment = Some(DepthStencilAttachment {
+        target_id: tex_depth,
+        view_subresource: SubresourceRange::full_texture(),
+        depth_load_op: Some(LoadOp::Clear),
+        depth_store_op: Some(StoreOp::Store),
+        depth_clear_value: 1.0,
+        depth_read_only: false,
+        stencil_load_op: None,
+        stencil_store_op: None,
+        stencil_clear_value: 0,
+        stencil_read_only: true,
+    });
+    pass.draws.push(Draw::new(
+        0, 1, 3, 0,
+        vec![ResourceUse::texture_sampled(
+            tex_depth,
+            DataVersion::INITIAL,
+            SubresourceRange::full_texture(),
+        )],
+    ));
+
+    assert!(matches!(
+        validate_pass_hazards(&pass),
+        Err(HazardError::AttachmentSamplingConflict { texture_id, .. }) if texture_id == tex_depth.get()
+    ));
+
+    let mut graph = PassGraph::new();
+    graph.add_pass(pass).expect("add pass");
+    assert!(matches!(
+        graph.compile(None),
+        Err(GraphError::Hazard(HazardError::AttachmentSamplingConflict { texture_id, .. })) if texture_id == tex_depth.get()
+    ));
 }
