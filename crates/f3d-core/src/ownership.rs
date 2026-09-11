@@ -38,12 +38,16 @@ static NEXT_STORE_COUNTER: AtomicU64 = AtomicU64::new(1);
 /// Allocates a globally unique store identifier, failing cleanly with typed overflow error
 /// if the counter reaches `u64::MAX`.
 fn allocate_store_id() -> Result<u64, OwnershipError> {
-    let mut current = NEXT_STORE_COUNTER.load(Ordering::Relaxed);
+    allocate_store_id_from(&NEXT_STORE_COUNTER)
+}
+
+fn allocate_store_id_from(counter: &AtomicU64) -> Result<u64, OwnershipError> {
+    let mut current = counter.load(Ordering::Relaxed);
     loop {
         let next = current
             .checked_add(1)
             .ok_or(OwnershipError::StoreIdOverflow { current })?;
-        match NEXT_STORE_COUNTER.compare_exchange_weak(
+        match counter.compare_exchange_weak(
             current,
             next,
             Ordering::Relaxed,
@@ -55,11 +59,12 @@ fn allocate_store_id() -> Result<u64, OwnershipError> {
     }
 }
 
-/// Set the next store identifier counter for near-max overflow regression testing.
+/// Exercise the production allocator against a test-local counter without
+/// changing the global identities used by concurrently running stores.
 #[doc(hidden)]
 #[cfg(any(test, feature = "test-support"))]
-pub fn set_next_store_id_for_testing(id: u64) {
-    NEXT_STORE_COUNTER.store(id, Ordering::Relaxed);
+pub fn allocate_store_id_for_testing(counter: &AtomicU64) -> Result<u64, OwnershipError> {
+    allocate_store_id_from(counter)
 }
 
 /// Authoritative writer identity across the host / runtime boundary.
@@ -796,6 +801,7 @@ impl<D: Domain> RegionState<D> {
         Ok(self.current_epoch)
     }
 }
+
 
 /// Diagnostic summary of region authorship, mode, and publication epochs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

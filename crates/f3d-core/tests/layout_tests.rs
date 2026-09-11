@@ -1985,3 +1985,44 @@ fn test_material_params_exact_layout_and_roundtrip() {
         Err(LayoutError::BufferTooSmall { required: 96, provided: 95 })
     );
 }
+
+#[test]
+fn test_canonical_layout_macro_consistency_and_regression() {
+    assert!(WGSL_AFFINE_ROWS_DECLARATION.contains("struct AffineRows {"));
+    assert!(WGSL_AFFINE_ROWS_DECLARATION.contains("r0: vec4<f32>,"));
+    assert!(WGSL_AFFINE_ROWS_DECLARATION.contains("r1: vec4<f32>,"));
+    assert!(WGSL_AFFINE_ROWS_DECLARATION.contains("r2: vec4<f32>,"));
+    assert!(WGSL_AFFINE_ROWS_DECLARATION.contains("fn transform_affine_point(m: AffineRows, p: vec3<f32>) -> vec3<f32>"));
+
+    assert!(WGSL_MATERIAL_PARAMS_DECLARATION.contains("struct MaterialParams {"));
+    assert!(WGSL_MATERIAL_PARAMS_DECLARATION.contains("color: vec4<f32>,"));
+    assert!(WGSL_MATERIAL_PARAMS_DECLARATION.contains("opacity: f32,"));
+    assert!(WGSL_MATERIAL_PARAMS_DECLARATION.contains("alpha_test: f32,"));
+    assert!(WGSL_MATERIAL_PARAMS_DECLARATION.contains("map_transform: AffineRows,"));
+    assert!(WGSL_MATERIAL_PARAMS_DECLARATION.contains("flags: u32,"));
+
+    let combined = generate_wgsl_declarations();
+    assert!(combined.contains("struct AffineRows {"));
+    assert!(combined.contains("struct MaterialParams {"));
+
+    let table = layout_table();
+    assert_eq!(table[0].offset, core::mem::offset_of!(AffineRows, r0));
+    assert_eq!(table[1].offset, core::mem::offset_of!(AffineRows, r1));
+    assert_eq!(table[2].offset, core::mem::offset_of!(AffineRows, r2));
+
+    assert_eq!(table[24].offset, core::mem::offset_of!(MaterialParams, color));
+    assert_eq!(table[25].offset, core::mem::offset_of!(MaterialParams, opacity));
+    assert_eq!(table[26].offset, core::mem::offset_of!(MaterialParams, alpha_test));
+    assert_eq!(table[27].offset, core::mem::offset_of!(MaterialParams, _pad0));
+    assert_eq!(table[28].offset, core::mem::offset_of!(MaterialParams, map_transform));
+    assert_eq!(table[29].offset, core::mem::offset_of!(MaterialParams, flags));
+    assert_eq!(table[30].offset, core::mem::offset_of!(MaterialParams, _pad1));
+    assert_eq!(table[28].wgsl_type, "AffineRows");
+
+    let unaligned_offset = 24;
+    assert_ne!(
+        unaligned_offset,
+        core::mem::offset_of!(MaterialParams, map_transform),
+        "map_transform must not reside at unaligned offset 24"
+    );
+}

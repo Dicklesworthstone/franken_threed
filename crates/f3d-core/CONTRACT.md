@@ -87,7 +87,7 @@ Every GPU wire structure in `f3d-core` adheres to a strictly tested byte offset 
 | `VertexPosNormalUv` | `uv` | 24 | 8 | 4 | `vec2<f32>` |
 | `VertexPosColor` | `position` | 0 | 12 | 4 | `vec3<f32>` |
 | `VertexPosColor` | `color` | 12 | 16 | 4 | `vec4<f32>` |
-| `InstanceRecord` | `transform` | 0 | 48 | 16 | `mat3x4<f32>` |
+| `InstanceRecord` | `transform` | 0 | 48 | 16 | `AffineRows` |
 | `InstanceRecord` | `instance_id` | 48 | 4 | 4 | `u32` |
 | `InstanceRecord` | `_padding` | 52 | 12 | 4 | `padding` |
 | `DrawIndirectArgs` | `vertex_count` | 0 | 4 | 4 | `u32` |
@@ -104,7 +104,7 @@ Every GPU wire structure in `f3d-core` adheres to a strictly tested byte offset 
 | `MaterialParams` | `opacity` | 16 | 4 | 4 | `f32` |
 | `MaterialParams` | `alpha_test` | 20 | 4 | 4 | `f32` |
 | `MaterialParams` | `_pad0` | 24 | 8 | 4 | `padding` |
-| `MaterialParams` | `map_transform` | 32 | 48 | 16 | `mat3x4<f32>` |
+| `MaterialParams` | `map_transform` | 32 | 48 | 16 | `AffineRows` |
 | `MaterialParams` | `flags` | 80 | 4 | 4 | `u32` |
 | `MaterialParams` | `_pad1` | 84 | 12 | 4 | `padding` |
 

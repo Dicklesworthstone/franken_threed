@@ -683,6 +683,144 @@ fn same_author_transfer_rejected() {
 }
 
 #[test]
+fn double_writer_detection_in_mirrored_mode_strictly_rejected() {
+    // "A mirror is not a license for two writers. Authority transfers must be ordered,
+    // versioned, and tested. The general fallback is JavaScript ownership." (§5.3, §6.2)
+    let handle = Handle::<RegionDomain>::new(50, NonZeroU32::new(1).unwrap());
+    let mut state = RegionState::with_mode(
+        handle,
+        OwnerMode::Mirrored {
+            author: Author::Js,
+        },
+    );
+
+    assert!(state.mode().is_mirrored());
+    assert_eq!(state.author(), Author::Js);
+    assert_eq!(state.current_epoch(), Epoch::ZERO);
+
+    // 1. While JS is the authoritative author in mirrored mode:
+    // Wasm write attempt must be strictly rejected
+    let err_wasm_write = state
+        .record_write(Author::Wasm)
+        .expect_err("Wasm cannot write when JS is authoritative author in mirrored mode");
+    assert_eq!(
+        err_wasm_write,
+        OwnershipError::UnauthorizedWriter {
+            expected: Author::Js,
+            actual: Author::Wasm,
+        }
+    );
+
+    // Wasm publish attempt must be strictly rejected
+    let err_wasm_pub = state
+        .publish(Author::Wasm, Epoch::ZERO)
+        .expect_err("Wasm cannot publish when JS is authoritative author in mirrored mode");
+    assert_eq!(
+        err_wasm_pub,
+        OwnershipError::UnauthorizedWriter {
+            expected: Author::Js,
+            actual: Author::Wasm,
+        }
+    );
+
+    // Wasm-initiated transfer attempt must be strictly rejected
+    let err_wasm_transfer = state
+        .transfer_authority(Author::Wasm, Author::Js, Epoch::ZERO)
+        .expect_err("unauthorized author cannot initiate authority transfer in mirrored mode");
+    assert_eq!(
+        err_wasm_transfer,
+        OwnershipError::UnauthorizedWriter {
+            expected: Author::Js,
+            actual: Author::Wasm,
+        }
+    );
+
+    // 2. Authoritative JS mutates and publishes
+    let v2 = state.record_write(Author::Js).expect("JS write succeeds");
+    assert_eq!(v2.get(), 2);
+    assert_eq!(state.unpublished_writes(), 1);
+
+    // Transfer rejected while uncommitted writes are pending
+    let err_pending = state
+        .transfer_authority(Author::Js, Author::Wasm, Epoch::ZERO)
+        .expect_err("transfer with uncommitted writes must fail in mirrored mode");
+    assert_eq!(
+        err_pending,
+        OwnershipError::UnpublishedWritesPending {
+            pending_count: 1,
+            current_epoch: Epoch::ZERO,
+        }
+    );
+
+    // JS publishes -> advances epoch to 1, clears unpublished writes
+    let ep1 = state
+        .publish(Author::Js, Epoch::ZERO)
+        .expect("JS publish succeeds");
+    assert_eq!(ep1, Epoch::new(1));
+    assert_eq!(state.unpublished_writes(), 0);
+
+    // Stale transfer attempt at epoch 0 fails
+    let err_stale = state
+        .transfer_authority(Author::Js, Author::Wasm, Epoch::ZERO)
+        .expect_err("stale epoch transfer must fail in mirrored mode");
+    assert_eq!(
+        err_stale,
+        OwnershipError::StaleEpoch {
+            expected: Epoch::new(1),
+            actual: Epoch::ZERO,
+        }
+    );
+
+    // Legal transfer at epoch 1 -> advances epoch to 2, transfers authority to Wasm
+    let ep2 = state
+        .transfer_authority(Author::Js, Author::Wasm, Epoch::new(1))
+        .expect("transfer in mirrored mode succeeds");
+    assert_eq!(ep2, Epoch::new(2));
+    assert_eq!(
+        state.mode(),
+        OwnerMode::Mirrored {
+            author: Author::Wasm,
+        }
+    );
+    assert_eq!(state.author(), Author::Wasm);
+    assert_eq!(state.current_epoch(), Epoch::new(2));
+
+    // 3. Now Wasm is the authoritative author in mirrored mode:
+    // JS write attempt must be strictly rejected
+    let err_js_write = state
+        .record_write(Author::Js)
+        .expect_err("JS cannot write after authority transferred to Wasm in mirrored mode");
+    assert_eq!(
+        err_js_write,
+        OwnershipError::UnauthorizedWriter {
+            expected: Author::Wasm,
+            actual: Author::Js,
+        }
+    );
+
+    // JS publish attempt must be strictly rejected
+    let err_js_pub = state
+        .publish(Author::Js, Epoch::new(2))
+        .expect_err("JS cannot publish after authority transferred to Wasm in mirrored mode");
+    assert_eq!(
+        err_js_pub,
+        OwnershipError::UnauthorizedWriter {
+            expected: Author::Wasm,
+            actual: Author::Js,
+        }
+    );
+
+    // Wasm writes and publishes successfully
+    let v3 = state.record_write(Author::Wasm).expect("Wasm write succeeds");
+    assert_eq!(v3.get(), 3);
+    let ep3 = state
+        .publish(Author::Wasm, Epoch::new(2))
+        .expect("Wasm publish succeeds");
+    assert_eq!(ep3, Epoch::new(3));
+}
+
+
+#[test]
 fn counter_overflow_checked() {
     // Epoch overflow
     let max_epoch = Epoch::new(u64::MAX);
@@ -758,15 +896,21 @@ fn invalid_alignment_rejected() {
 
 #[test]
 fn store_id_overflow_near_max_fails_cleanly() {
-    f3d_core::ownership::set_next_store_id_for_testing(u64::MAX);
-    let err = PerUseByteBuffer::<MaterialDomain>::new(256)
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use f3d_core::ownership::allocate_store_id_for_testing;
+
+    let counter = AtomicU64::new(u64::MAX - 1);
+    assert_eq!(allocate_store_id_for_testing(&counter), Ok(u64::MAX - 1));
+    let err = allocate_store_id_for_testing(&counter)
         .expect_err("store ID at u64::MAX must overflow");
     assert_eq!(
         err,
         OwnershipError::StoreIdOverflow { current: u64::MAX }
     );
-    // Reset store ID counter for other tests
-    f3d_core::ownership::set_next_store_id_for_testing(100_000);
+    assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    assert_eq!(allocate_store_id_for_testing(&counter), Err(err));
+    // Fault injection must not affect ordinary stores or the parallel property test.
+    assert!(PerUseByteBuffer::<MaterialDomain>::new(256).is_ok());
 }
 
 #[test]
@@ -2081,6 +2225,5 @@ fn property_test_snapshot_store_and_borrow_scope_interleavings() {
         }
     }
 }
-
 
 

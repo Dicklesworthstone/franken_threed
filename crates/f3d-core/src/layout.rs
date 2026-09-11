@@ -1051,14 +1051,145 @@ impl VertexPosColor {
     }
 }
 
-/// Canonical WGSL struct declaration for `AffineRows`.
-pub const WGSL_AFFINE_ROWS_DECLARATION: &str = r#"
-struct AffineRows {
-    r0: vec4<f32>,
-    r1: vec4<f32>,
-    r2: vec4<f32>,
-};
+/// Field-level layout descriptor for GPU wire data structures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct LayoutRow {
+    /// Name of the record type (e.g. "AffineRows", "VertexPosUv").
+    pub record: &'static str,
+    /// Name of the struct field or attribute.
+    pub field: &'static str,
+    /// Byte offset within the record.
+    pub offset: usize,
+    /// Size in bytes of the field.
+    pub size: usize,
+    /// Byte alignment of the field.
+    pub align: usize,
+    /// Corresponding WGSL shader data type.
+    pub wgsl_type: &'static str,
+}
 
+impl fmt::Display for LayoutRow {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{:<24} {:<16} {:>6} {:>6} {:>6}  {:<16}",
+            self.record, self.field, self.offset, self.size, self.align, self.wgsl_type
+        )
+    }
+}
+
+/// Helper const function to sort layout rows by ascending byte offset at compile time.
+const fn sort_layout_rows<const N: usize>(mut rows: [LayoutRow; N]) -> [LayoutRow; N] {
+    let mut i = 0;
+    while i < N {
+        let mut j = i + 1;
+        while j < N {
+            if rows[j].offset < rows[i].offset {
+                let tmp = rows[i];
+                rows[i] = rows[j];
+                rows[j] = tmp;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    rows
+}
+
+/// Shared private definition generating both canonical WGSL shader struct declarations
+/// and corresponding compile-time `LayoutRow` catalog slices from a single field list.
+///
+/// Shader-visible fields are defined once with name, WGSL type, offset, size, and alignment,
+/// driving both the WGSL struct declaration and the `LayoutRow` entries.
+/// Non-shader-visible padding is listed separately and incorporated into the layout rows.
+macro_rules! define_canonical_layout {
+    (
+        record: $record:expr,
+        shader_const: $shader_const:ident,
+        layout_rows_const: $layout_const:ident,
+        row_count: $row_count:expr,
+        fields: [
+            $(
+                $f_name:expr, $f_wgsl:expr, $f_offset:expr, $f_size:expr, $f_align:expr
+            );* $(;)?
+        ],
+        extra_shader: $extra:expr $(,)?
+    ) => {
+        define_canonical_layout! {
+            record: $record,
+            shader_const: $shader_const,
+            layout_rows_const: $layout_const,
+            row_count: $row_count,
+            fields: [
+                $( $f_name, $f_wgsl, $f_offset, $f_size, $f_align );*
+            ],
+            padding: [],
+            extra_shader: $extra,
+        }
+    };
+
+    (
+        record: $record:expr,
+        shader_const: $shader_const:ident,
+        layout_rows_const: $layout_const:ident,
+        row_count: $row_count:expr,
+        fields: [
+            $(
+                $f_name:expr, $f_wgsl:expr, $f_offset:expr, $f_size:expr, $f_align:expr
+            );* $(;)?
+        ],
+        padding: [
+            $(
+                $p_name:expr, $p_offset:expr, $p_size:expr, $p_align:expr
+            );* $(;)?
+        ],
+        extra_shader: $extra:expr $(,)?
+    ) => {
+        /// Canonical WGSL shader declaration.
+        pub const $shader_const: &str = concat!(
+            "\nstruct ", $record, " {\n",
+            $( "    ", $f_name, ": ", $f_wgsl, ",\n", )*
+            "};\n",
+            $extra
+        );
+
+        const $layout_const: [LayoutRow; $row_count] = sort_layout_rows([
+            $(
+                LayoutRow {
+                    record: $record,
+                    field: $f_name,
+                    offset: $f_offset,
+                    size: $f_size,
+                    align: $f_align,
+                    wgsl_type: $f_wgsl,
+                },
+            )*
+            $(
+                LayoutRow {
+                    record: $record,
+                    field: $p_name,
+                    offset: $p_offset,
+                    size: $p_size,
+                    align: $p_align,
+                    wgsl_type: "padding",
+                },
+            )*
+        ]);
+    };
+}
+
+define_canonical_layout! {
+    record: "AffineRows",
+    shader_const: WGSL_AFFINE_ROWS_DECLARATION,
+    layout_rows_const: AFFINE_ROWS_LAYOUT_ROWS,
+    row_count: 3,
+    fields: [
+        "r0", "vec4<f32>", 0, 16, 16;
+        "r1", "vec4<f32>", 16, 16, 16;
+        "r2", "vec4<f32>", 32, 16, 16;
+    ],
+    extra_shader: r#"
 fn transform_affine_point(m: AffineRows, p: vec3<f32>) -> vec3<f32> {
     let v = vec4<f32>(p, 1.0);
     return vec3<f32>(dot(m.r0, v), dot(m.r1, v), dot(m.r2, v));
@@ -1077,7 +1208,8 @@ fn affine_to_mat4x4(m: AffineRows) -> mat4x4<f32> {
         vec4<f32>(m.r0.w, m.r1.w, m.r2.w, 1.0)
     );
 }
-"#;
+"#,
+}
 
 /// Canonical WGSL struct declaration for `ProjectiveMat4`.
 pub const WGSL_PROJECTIVE_MAT4_DECLARATION: &str = r#"
@@ -1263,16 +1395,24 @@ impl Default for MaterialParams {
     }
 }
 
-/// Canonical WGSL struct declaration for `MaterialParams`.
-pub const WGSL_MATERIAL_PARAMS_DECLARATION: &str = r#"
-struct MaterialParams {
-    color: vec4<f32>,
-    opacity: f32,
-    alpha_test: f32,
-    map_transform: AffineRows,
-    flags: u32,
-};
-"#;
+define_canonical_layout! {
+    record: "MaterialParams",
+    shader_const: WGSL_MATERIAL_PARAMS_DECLARATION,
+    layout_rows_const: MATERIAL_PARAMS_LAYOUT_ROWS,
+    row_count: 7,
+    fields: [
+        "color", "vec4<f32>", 0, 16, 16;
+        "opacity", "f32", 16, 4, 4;
+        "alpha_test", "f32", 20, 4, 4;
+        "map_transform", "AffineRows", 32, 48, 16;
+        "flags", "u32", 80, 4, 4;
+    ],
+    padding: [
+        "_pad0", 24, 8, 4;
+        "_pad1", 84, 12, 4;
+    ],
+    extra_shader: "",
+}
 
 /// Returns standard generated WGSL type declarations and helpers for use in shaders.
 pub fn generate_wgsl_declarations() -> String {
@@ -1287,40 +1427,12 @@ pub fn generate_wgsl_declarations() -> String {
     s
 }
 
-/// Field-level layout descriptor for GPU wire data structures.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct LayoutRow {
-    /// Name of the record type (e.g. "AffineRows", "VertexPosUv").
-    pub record: &'static str,
-    /// Name of the struct field or attribute.
-    pub field: &'static str,
-    /// Byte offset within the record.
-    pub offset: usize,
-    /// Size in bytes of the field.
-    pub size: usize,
-    /// Byte alignment of the field.
-    pub align: usize,
-    /// Corresponding WGSL shader data type.
-    pub wgsl_type: &'static str,
-}
-
-impl fmt::Display for LayoutRow {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{:<24} {:<16} {:>6} {:>6} {:>6}  {:<16}",
-            self.record, self.field, self.offset, self.size, self.align, self.wgsl_type
-        )
-    }
-}
-
 /// Static catalog of GPU wire layouts covering every record type in `f3d-core`.
 pub const LAYOUT_TABLE: [LayoutRow; 31] = [
     // 1. AffineRows (48 bytes, 16-byte aligned)
-    LayoutRow { record: "AffineRows", field: "r0", offset: 0, size: 16, align: 16, wgsl_type: "vec4<f32>" },
-    LayoutRow { record: "AffineRows", field: "r1", offset: 16, size: 16, align: 16, wgsl_type: "vec4<f32>" },
-    LayoutRow { record: "AffineRows", field: "r2", offset: 32, size: 16, align: 16, wgsl_type: "vec4<f32>" },
+    AFFINE_ROWS_LAYOUT_ROWS[0],
+    AFFINE_ROWS_LAYOUT_ROWS[1],
+    AFFINE_ROWS_LAYOUT_ROWS[2],
 
     // 2. ProjectiveMat4 (64 bytes, 16-byte aligned)
     LayoutRow { record: "ProjectiveMat4", field: "elements", offset: 0, size: 64, align: 16, wgsl_type: "mat4x4<f32>" },
@@ -1341,7 +1453,7 @@ pub const LAYOUT_TABLE: [LayoutRow; 31] = [
     // 6. InstanceRecord (64 bytes, 16-byte aligned)
     // Note: `transform` is stored as AffineRows (three vec4<f32> rows), not mat3x4 column-major.
     // Bytes 52..64 constitute 12 bytes of trailing alignment padding to reach the 64-byte struct allocation.
-    LayoutRow { record: "InstanceRecord", field: "transform", offset: 0, size: 48, align: 16, wgsl_type: "mat3x4<f32>" },
+    LayoutRow { record: "InstanceRecord", field: "transform", offset: 0, size: 48, align: 16, wgsl_type: "AffineRows" },
     LayoutRow { record: "InstanceRecord", field: "instance_id", offset: 48, size: 4, align: 4, wgsl_type: "u32" },
     LayoutRow { record: "InstanceRecord", field: "_padding", offset: 52, size: 12, align: 4, wgsl_type: "padding" },
 
@@ -1362,13 +1474,13 @@ pub const LAYOUT_TABLE: [LayoutRow; 31] = [
     LayoutRow { record: "ColorUniform", field: "rgba", offset: 0, size: 16, align: 16, wgsl_type: "vec4<f32>" },
 
     // 10. MaterialParams Uniform (96 bytes, 16-byte aligned)
-    LayoutRow { record: "MaterialParams", field: "color", offset: 0, size: 16, align: 16, wgsl_type: "vec4<f32>" },
-    LayoutRow { record: "MaterialParams", field: "opacity", offset: 16, size: 4, align: 4, wgsl_type: "f32" },
-    LayoutRow { record: "MaterialParams", field: "alpha_test", offset: 20, size: 4, align: 4, wgsl_type: "f32" },
-    LayoutRow { record: "MaterialParams", field: "_pad0", offset: 24, size: 8, align: 4, wgsl_type: "padding" },
-    LayoutRow { record: "MaterialParams", field: "map_transform", offset: 32, size: 48, align: 16, wgsl_type: "mat3x4<f32>" },
-    LayoutRow { record: "MaterialParams", field: "flags", offset: 80, size: 4, align: 4, wgsl_type: "u32" },
-    LayoutRow { record: "MaterialParams", field: "_pad1", offset: 84, size: 12, align: 4, wgsl_type: "padding" },
+    MATERIAL_PARAMS_LAYOUT_ROWS[0],
+    MATERIAL_PARAMS_LAYOUT_ROWS[1],
+    MATERIAL_PARAMS_LAYOUT_ROWS[2],
+    MATERIAL_PARAMS_LAYOUT_ROWS[3],
+    MATERIAL_PARAMS_LAYOUT_ROWS[4],
+    MATERIAL_PARAMS_LAYOUT_ROWS[5],
+    MATERIAL_PARAMS_LAYOUT_ROWS[6],
 ];
 
 /// Returns a fixed slice of [`LayoutRow`] descriptors covering every GPU wire record in the crate.

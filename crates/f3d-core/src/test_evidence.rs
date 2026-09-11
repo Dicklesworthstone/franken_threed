@@ -81,6 +81,19 @@ impl EvidenceWriter {
         let s = serde_json::to_string_pretty(sum).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         writeln!(File::create(&self.summary_path)?, "{s}")
     }
+    /// Directory of this run (parent of events.jsonl).
+    fn run_dir(&self) -> io::Result<&Path> {
+        self.events_path.parent().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "evidence run dir has no parent"))
+    }
+    /// Write a named pretty-printed JSON artifact into the run directory.
+    pub fn write_json<T: Serialize + ?Sized>(&self, name: &str, value: &T) -> io::Result<()> {
+        let s = serde_json::to_string_pretty(value).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        writeln!(File::create(self.run_dir()?.join(name))?, "{s}")
+    }
+    /// Write a named raw artifact (bytes) into the run directory.
+    pub fn write_artifact(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
+        File::create(self.run_dir()?.join(name))?.write_all(bytes)
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -100,7 +113,7 @@ mod tests {
         w.write_summary(&sum).unwrap();
         let parsed_sum: EvidenceSummary = serde_json::from_str(&fs::read_to_string(&w.summary_path).unwrap()).unwrap();
         assert_eq!(sum, parsed_sum);
-        let _ = fs::remove_dir_all(d);
+        // Scratch artifacts are intentionally preserved (repository no-file-deletion rule).
     }
     #[test]
     fn test_validate_event_rejects_missing_owner() {
