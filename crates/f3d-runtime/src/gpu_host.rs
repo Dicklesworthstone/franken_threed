@@ -65,8 +65,13 @@ use f3d_core::{
         BorrowScope, BorrowToken, DataVersion, Epoch, OwnershipError, PerUseByteBuffer, RegionState,
     },
 };
-use f3d_graph::{DrawKind, ExecutionPlan, PassKind, ResourceAccess};
+use f3d_graph::{
+    CanvasEpochTracker, CanvasFormat, CanvasId, DrawKind, ExecutionPlan, LoadOp, PassKind,
+    ResourceAccess, ResourceId, StoreOp,
+};
 use f3d_math::{Matrix4, Quaternion, Vector3};
+
+use crate::frame::{FrameSession, RenderContext};
 
 #[cfg(all(feature = "browser", target_arch = "wasm32"))]
 use wasm_bindgen::prelude::*;
@@ -376,6 +381,69 @@ pub const TARGET_OFFSCREEN: u32 = 0;
 /// Target kind flag indicating the canvas swapchain texture.
 pub const TARGET_CANVAS: u32 = 1;
 
+/// Load operation: clear attachment to clear color.
+pub const LOAD_OP_CLEAR: u32 = 0;
+/// Load operation: preserve existing attachment contents.
+pub const LOAD_OP_LOAD: u32 = 1;
+/// Load operation: undefined prior contents (discard/dontcare).
+pub const LOAD_OP_DONT_CARE: u32 = 2;
+
+/// Store operation: store rendered results to attachment target.
+pub const STORE_OP_STORE: u32 = 0;
+/// Store operation: discard rendered results at pass end.
+pub const STORE_OP_DISCARD: u32 = 1;
+
+/// Pass flag: no special pass boundary behavior.
+pub const PASS_FLAG_NONE: u32 = 0;
+/// Pass flag: indicates this command begins a new logical render pass.
+pub const PASS_FLAG_NEW_PASS: u32 = 1;
+
+/// Packs target kind, load op, store op, and pass boundary flags into a 32-bit wire integer.
+///
+/// Panics if target_kind > 1, load_op > 2, store_op > 1, or flags > 1.
+#[inline]
+pub const fn pack_target_type(target_kind: u32, load_op: u32, store_op: u32, flags: u32) -> u32 {
+    assert!(target_kind <= 1, "target_kind must be 0 (TARGET_OFFSCREEN) or 1 (TARGET_CANVAS)");
+    assert!(load_op <= 2, "load_op must be 0 (Clear), 1 (Load), or 2 (DontCare)");
+    assert!(store_op <= 1, "store_op must be 0 (Store) or 1 (Discard)");
+    assert!(flags <= 1, "pass_flags can only set bit 0 (PASS_FLAG_NEW_PASS)");
+    (target_kind & 0xFF) | ((load_op & 0xFF) << 8) | ((store_op & 0xFF) << 16) | ((flags & 0xFF) << 24)
+}
+
+/// Validates that a raw 32-bit target_type integer contains only legal target kinds, load/store ops, and flags.
+#[inline]
+pub const fn validate_target_type(target_type: u32) -> bool {
+    let kind = unpack_target_kind(target_type);
+    let load = unpack_load_op(target_type);
+    let store = unpack_store_op(target_type);
+    let flags = unpack_pass_flags(target_type);
+    kind <= 1 && load <= 2 && store <= 1 && flags <= 1
+}
+
+/// Extracts the target kind (TARGET_OFFSCREEN or TARGET_CANVAS) from a packed target_type integer.
+#[inline]
+pub const fn unpack_target_kind(target_type: u32) -> u32 {
+    target_type & 0xFF
+}
+
+/// Extracts the load operation (LOAD_OP_CLEAR, LOAD_OP_LOAD, LOAD_OP_DONT_CARE) from a packed target_type integer.
+#[inline]
+pub const fn unpack_load_op(target_type: u32) -> u32 {
+    (target_type >> 8) & 0xFF
+}
+
+/// Extracts the store operation (STORE_OP_STORE, STORE_OP_DISCARD) from a packed target_type integer.
+#[inline]
+pub const fn unpack_store_op(target_type: u32) -> u32 {
+    (target_type >> 16) & 0xFF
+}
+
+/// Extracts the pass flags from a packed target_type integer.
+#[inline]
+pub const fn unpack_pass_flags(target_type: u32) -> u32 {
+    (target_type >> 24) & 0xFF
+}
+
 /// Target format code indicating the canvas pipeline should adopt the host's negotiated preferredCanvasFormat.
 pub const TARGET_FORMAT_PREFERRED_CANVAS: u32 = 0;
 /// Target format code for standard bgra8unorm swapchain format.
@@ -452,6 +520,12 @@ pub enum GpuCommand {
         uniform_dynamic_offset: u32,
         /// Uniform buffer identifier bound to group 0 (defaults to 1 if 0).
         uniform_buffer_id: u32,
+        /// Explicit load operation (0 = Clear, 1 = Load, 2 = DontCare).
+        load_op: u32,
+        /// Explicit store operation (0 = Store, 1 = Discard).
+        store_op: u32,
+        /// Pass boundary flags (0 = none, 1 = new pass boundary).
+        pass_flags: u32,
     },
     /// Command to copy texture pixel data into a map-readable staging buffer.
     CopyTextureToBuffer {
@@ -653,9 +727,13 @@ impl GpuSubmissionPacket {
                     vertex_count,
                     uniform_dynamic_offset,
                     uniform_buffer_id,
+                    load_op,
+                    store_op,
+                    pass_flags,
                 } => {
                     command_records.extend_from_slice(&OPCODE_RENDER_PASS.to_le_bytes());
-                    command_records.extend_from_slice(&target_type.to_le_bytes());
+                    let packed_target = pack_target_type(*target_type, *load_op, *store_op, *pass_flags);
+                    command_records.extend_from_slice(&packed_target.to_le_bytes());
                     command_records.extend_from_slice(&target_id.to_le_bytes());
                     for c in clear_color {
                         command_records.extend_from_slice(&c.to_le_bytes());
@@ -758,6 +836,18 @@ pub enum PlanLoweringError {
         /// Diagnostic name of the pass segment.
         segment_name: String,
     },
+    /// Render segment configures multiple color attachments (MRT not yet supported by bridge lowering).
+    UnsupportedMultipleColorAttachments {
+        /// Diagnostic name of the pass segment.
+        segment_name: String,
+        /// Number of configured color attachments.
+        count: usize,
+    },
+    /// Render segment configures a depth/stencil attachment (depth not yet supported by bridge lowering).
+    UnsupportedDepthStencilAttachment {
+        /// Diagnostic name of the pass segment.
+        segment_name: String,
+    },
     /// Execution plan contains an unsupported pass kind for bridge lowering.
     UnsupportedPassKind {
         /// Diagnostic name of the pass segment.
@@ -785,6 +875,18 @@ impl core::fmt::Display for PlanLoweringError {
                     "Render segment '{segment_name}' contains zero draw commands"
                 )
             }
+            Self::UnsupportedMultipleColorAttachments { segment_name, count } => {
+                write!(
+                    f,
+                    "Render segment '{segment_name}' configures {count} color attachments; MRT is not supported by bridge lowering"
+                )
+            }
+            Self::UnsupportedDepthStencilAttachment { segment_name } => {
+                write!(
+                    f,
+                    "Render segment '{segment_name}' configures a depth/stencil attachment; depth is not supported by bridge lowering"
+                )
+            }
             Self::UnsupportedPassKind { segment_name } => {
                 write!(
                     f,
@@ -809,9 +911,10 @@ impl core::error::Error for PlanLoweringError {}
 ///
 /// # Architecture & Invariants (§6.1, §6.7)
 /// - **Render Segments**: Primary color attachments map to `TARGET_CANVAS` (if swapchain epoch is bound)
-///   or `TARGET_OFFSCREEN`. Clear colors are preserved verbatim. Each draw is lowered with its bound
-///   pipeline, vertex buffer ID (or 0), vertex count, 256-byte aligned dynamic uniform offset,
-///   and uniform buffer ID (from declared uniform resource use, defaulting to 1).
+///   or `TARGET_OFFSCREEN`. Clear colors and explicit `LoadOp` / `StoreOp` semantics are preserved verbatim.
+///   The opening command of each render pass segment receives `PASS_FLAG_NEW_PASS` to enforce pass boundaries.
+///   Each draw is lowered with its bound pipeline, vertex buffer ID (or 0), vertex count, 256-byte aligned
+///   dynamic uniform offset, and uniform buffer ID (from declared uniform resource use, defaulting to 1).
 /// - **Copy Segments**: `CopyCommand::TextureToBuffer` commands are lowered into `GpuCommand::CopyTextureToBuffer`
 ///   with source texture ID, destination readback buffer ID, width, and height.
 /// - **Compute Segments**: Lowering compute dispatches is not yet supported and returns a structured error.
@@ -821,16 +924,22 @@ pub fn lower_plan(plan: &ExecutionPlan) -> Result<Vec<GpuCommand>, PlanLoweringE
     for segment in plan.segments() {
         match segment.kind() {
             PassKind::Render => {
+                if segment.color_attachments().len() > 1 {
+                    return Err(PlanLoweringError::UnsupportedMultipleColorAttachments {
+                        segment_name: segment.name().to_string(),
+                        count: segment.color_attachments().len(),
+                    });
+                }
+                if segment.depth_stencil_attachment().is_some() {
+                    return Err(PlanLoweringError::UnsupportedDepthStencilAttachment {
+                        segment_name: segment.name().to_string(),
+                    });
+                }
                 let Some(ca) = segment.primary_color_attachment() else {
                     return Err(PlanLoweringError::MissingColorAttachment {
                         segment_name: segment.name().to_string(),
                     });
                 };
-                if segment.draws().is_empty() {
-                    return Err(PlanLoweringError::MissingDrawCommand {
-                        segment_name: segment.name().to_string(),
-                    });
-                }
                 let target_type = if ca.is_canvas() {
                     TARGET_CANVAS
                 } else {
@@ -838,11 +947,45 @@ pub fn lower_plan(plan: &ExecutionPlan) -> Result<Vec<GpuCommand>, PlanLoweringE
                 };
                 let target_id = ca.target_id().get();
                 let clear_color = ca.clear_color();
+                let load_op = match ca.load_op() {
+                    LoadOp::Clear => LOAD_OP_CLEAR,
+                    LoadOp::Load => LOAD_OP_LOAD,
+                    LoadOp::DontCare => LOAD_OP_DONT_CARE,
+                };
+                let store_op = match ca.store_op() {
+                    StoreOp::Store => STORE_OP_STORE,
+                    StoreOp::Discard => STORE_OP_DISCARD,
+                };
+
+                if segment.draws().is_empty() {
+                    if ca.load_op() == LoadOp::Clear {
+                        commands.push(GpuCommand::RenderPass {
+                            target_type,
+                            target_id,
+                            clear_color,
+                            pipeline_id: 0,
+                            vertex_buffer_id: 0,
+                            vertex_count: 0,
+                            uniform_dynamic_offset: 0,
+                            uniform_buffer_id: 0,
+                            load_op,
+                            store_op,
+                            pass_flags: PASS_FLAG_NEW_PASS,
+                        });
+                        continue;
+                    } else {
+                        return Err(PlanLoweringError::MissingDrawCommand {
+                            segment_name: segment.name().to_string(),
+                        });
+                    }
+                }
+
+                let mut is_first_command_in_segment = true;
 
                 // When the first draw in a render pass is a bundle draw, emit an initial
                 // GpuCommand::RenderPass with vertex_count: 0 to open the render pass on the target
-                // with its clear color. Subsequent bundle executes and direct draws occur inside
-                // this same pass without re-clearing.
+                // with its clear color and load/store semantics. Subsequent bundle executes and direct draws
+                // occur inside this same pass without re-clearing.
                 if matches!(segment.draws().first().map(|d| d.kind()), Some(DrawKind::Bundle { .. })) {
                     commands.push(GpuCommand::RenderPass {
                         target_type,
@@ -853,7 +996,11 @@ pub fn lower_plan(plan: &ExecutionPlan) -> Result<Vec<GpuCommand>, PlanLoweringE
                         vertex_count: 0,
                         uniform_dynamic_offset: 0,
                         uniform_buffer_id: 0,
+                        load_op,
+                        store_op,
+                        pass_flags: PASS_FLAG_NEW_PASS,
                     });
+                    is_first_command_in_segment = false;
                 }
 
                 for draw in segment.draws() {
@@ -870,6 +1017,13 @@ pub fn lower_plan(plan: &ExecutionPlan) -> Result<Vec<GpuCommand>, PlanLoweringE
                                 .find(|u| u.access == ResourceAccess::UniformBuffer)
                                 .map_or(1, |u| u.resource_id.get());
 
+                            let pass_flags = if is_first_command_in_segment {
+                                is_first_command_in_segment = false;
+                                PASS_FLAG_NEW_PASS
+                            } else {
+                                PASS_FLAG_NONE
+                            };
+
                             commands.push(GpuCommand::RenderPass {
                                 target_type,
                                 target_id,
@@ -879,6 +1033,9 @@ pub fn lower_plan(plan: &ExecutionPlan) -> Result<Vec<GpuCommand>, PlanLoweringE
                                 vertex_count: draw.vertex_count(),
                                 uniform_dynamic_offset: draw.uniform_dynamic_offset(),
                                 uniform_buffer_id,
+                                load_op,
+                                store_op,
+                                pass_flags,
                             });
                         }
                     }
@@ -1049,6 +1206,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{\n\
         vertex_count: 3,
         uniform_dynamic_offset: 0,
         uniform_buffer_id,
+        load_op: LOAD_OP_CLEAR,
+        store_op: STORE_OP_STORE,
+        pass_flags: PASS_FLAG_NEW_PASS,
     });
 
     // 8. Render pass to canvas swapchain (acquires fresh currentTexture per interval)
@@ -1061,6 +1221,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{\n\
         vertex_count: 3,
         uniform_dynamic_offset: 0,
         uniform_buffer_id,
+        load_op: LOAD_OP_CLEAR,
+        store_op: STORE_OP_STORE,
+        pass_flags: PASS_FLAG_NEW_PASS,
     });
 
     // 9. Copy offscreen texture to readback buffer
@@ -1198,6 +1361,9 @@ fn fs_main() -> @location(0) vec4<f32> {\n\
         vertex_count: 3,
         uniform_dynamic_offset: offset_a,
         uniform_buffer_id,
+        load_op: LOAD_OP_CLEAR,
+        store_op: STORE_OP_STORE,
+        pass_flags: PASS_FLAG_NEW_PASS,
     });
 
     packet.push(GpuCommand::RenderPass {
@@ -1209,6 +1375,9 @@ fn fs_main() -> @location(0) vec4<f32> {\n\
         vertex_count: 3,
         uniform_dynamic_offset: offset_b,
         uniform_buffer_id,
+        load_op: LOAD_OP_CLEAR,
+        store_op: STORE_OP_STORE,
+        pass_flags: PASS_FLAG_NEW_PASS,
     });
 
     packet.push(GpuCommand::CopyTextureToBuffer {
@@ -1285,8 +1454,8 @@ pub fn build_bundle_then_direct_draw_submission() -> GpuSubmissionPacket {
     // 2. Vertex buffer 1: Triangle 1 (left side)
     let vb_bundle_id = 2;
     let tri1 = [
-        VertexPosUv::new([-1.0, 1.0, 0.0], [0.0, 1.0]),
         VertexPosUv::new([-1.0, -1.0, 0.0], [0.0, 0.0]),
+        VertexPosUv::new([0.0, -1.0, 0.0], [0.5, 0.0]),
         VertexPosUv::new([0.0, 1.0, 0.0], [0.5, 1.0]),
     ];
     let mut tri1_bytes = Vec::with_capacity(tri1.len() * VertexPosUv::BYTE_SIZE);
@@ -1403,6 +1572,9 @@ fn fs_main() -> @location(0) vec4<f32> {\n\
         vertex_count: 0,
         uniform_dynamic_offset: 0,
         uniform_buffer_id: 0,
+        load_op: LOAD_OP_CLEAR,
+        store_op: STORE_OP_STORE,
+        pass_flags: PASS_FLAG_NEW_PASS,
     });
 
     // 8. Execute Bundle 1 inside the render pass (draws Green triangle)
@@ -1427,6 +1599,9 @@ fn fs_main() -> @location(0) vec4<f32> {\n\
         vertex_count: 3,
         uniform_dynamic_offset: 256,
         uniform_buffer_id,
+        load_op: LOAD_OP_CLEAR,
+        store_op: STORE_OP_STORE,
+        pass_flags: PASS_FLAG_NONE,
     });
 
     // 11. Copy offscreen target to readback buffer
@@ -1466,6 +1641,10 @@ fn fs_main() -> @location(0) vec4<f32> {\n\
 ///   - Untransformed center `(32, 32)`: outside triangle -> Black `[0, 0, 0, 255]`
 ///   - Left half `(16, 32)`: outside triangle -> Black `[0, 0, 0, 255]`
 ///   - Right border `(60, 32)`: outside triangle -> Black `[0, 0, 0, 255]`
+///
+/// Registers resource IDs (buffers 1, 2, 20, texture 10, pipeline 200) in the global generational
+/// slot table at generation 1 (§6.5, vqa.6). Packet building performs schedule synthesis
+/// and command encoding only, leaving submission to the bridge caller (Mail 7117).
 #[must_use]
 pub fn build_affine_rows_transform_submission() -> GpuSubmissionPacket {
     // Register resource IDs in the generational slot table (§6.5, vqa.6)
@@ -1609,11 +1788,485 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {\n\
         vertex_count: 3,
         uniform_dynamic_offset: 0,
         uniform_buffer_id,
+        load_op: LOAD_OP_CLEAR,
+        store_op: STORE_OP_STORE,
+        pass_flags: PASS_FLAG_NEW_PASS,
     });
 
     // 7. Copy target texture to readback buffer
     packet.push(GpuCommand::CopyTextureToBuffer {
         texture_id: target_texture_id,
+        buffer_id: readback_buffer_id,
+        width: 64,
+        height: 64,
+        epoch: Epoch::ZERO,
+    });
+
+    packet
+}
+
+/// Helper to build a nested-pass reentrant execution submission packet (§6.7, 2v8.4).
+///
+/// Constructs a 3-pass workload using [`FrameSession`] and lowered via [`lower_plan`],
+/// matching byte-for-byte with `renderDirectNestedPassReference` in `oracle_reference.js`:
+/// 1. Pass 1 (Target 10): Outer prefix pass clearing to Black `[0, 0, 0, 1]` with a Red draw on the left half (tri1, offset 0).
+/// 2. Pass 2 (Target 11): Nested inner pass on Target 11 clearing to Black with a Green draw (tri1, offset 512).
+/// 3. Pass 3 (Target 10): Resumed outer pass using `LoadOp::Load` with a Blue draw on the right half (tri2, offset 256).
+/// 4. CopyTextureToBuffer: Copies Target 10 to readback Buffer 20.
+///
+/// Ground truth pixel expectations on 64x64 target:
+/// - (24, 32): Inside left triangle -> Red `[255, 0, 0, 255]`.
+/// - (56, 32): Inside right triangle -> Blue `[0, 0, 255, 255]`.
+/// - (2, 2): Untouched background -> Black `[0, 0, 0, 255]`.
+///
+/// Registers resource IDs (buffers 1, 2, 3, 20, textures 10, 11, pipeline 200) in the global
+/// generational slot table at generation 1 (§6.5, vqa.6). Packet construction performs schedule
+/// synthesis and encoding only, leaving frame submission to the bridge caller (Mail 7117).
+pub fn build_nested_pass_submission() -> GpuSubmissionPacket {
+    with_global_resource_table(|table| {
+        table.register(1);   // uniform_buffer_id
+        table.register(2);   // vb1_id (tri1)
+        table.register(3);   // vb2_id (tri2)
+        table.register(10);  // target_texture_10_id
+        table.register(11);  // target_texture_11_id
+        table.register(20);  // readback_buffer_id
+        table.register(200); // pipeline_id
+    });
+
+    let mut packet = GpuSubmissionPacket::new();
+
+    let uniform_buffer_id = 1;
+    let vb1_id = 2;
+    let vb2_id = 3;
+    let target_10 = 10;
+    let target_11 = 11;
+    let readback_buffer_id = 20;
+    let pipeline_id = 200;
+
+    // 1. Vertex buffer 1: Triangle 1 (left side, covers x in [-1, 0], samples at (24, 32))
+    // Matches renderDirectNestedPassReference tri1Data in oracle_reference.js
+    let tri1 = [
+        VertexPosUv::new([-1.0, -1.0, 0.0], [0.0, 0.0]),
+        VertexPosUv::new([0.0, -1.0, 0.0], [0.5, 0.0]),
+        VertexPosUv::new([0.0, 1.0, 0.0], [0.5, 1.0]),
+    ];
+    let mut tri1_bytes = Vec::with_capacity(tri1.len() * VertexPosUv::BYTE_SIZE);
+    for v in &tri1 {
+        tri1_bytes.extend_from_slice(&v.to_bytes());
+    }
+
+    // 2. Vertex buffer 2: Triangle 2 (right side, covers x in [0, 1], samples at (56, 32))
+    // Matches renderDirectNestedPassReference tri2Data in oracle_reference.js
+    let tri2 = [
+        VertexPosUv::new([0.0, -1.0, 0.0], [0.5, 0.0]),
+        VertexPosUv::new([1.0, -1.0, 0.0], [1.0, 0.0]),
+        VertexPosUv::new([1.0, 1.0, 0.0], [1.0, 1.0]),
+    ];
+    let mut tri2_bytes = Vec::with_capacity(tri2.len() * VertexPosUv::BYTE_SIZE);
+    for v in &tri2 {
+        tri2_bytes.extend_from_slice(&v.to_bytes());
+    }
+
+    // 3. Resource creation commands (matching oracle_reference.js device allocations)
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: uniform_buffer_id,
+        size: 768,
+        usage: BUFFER_USAGE_UNIFORM | BUFFER_USAGE_COPY_DST,
+    });
+
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: vb1_id,
+        size: tri1_bytes.len() as u32,
+        usage: BUFFER_USAGE_VERTEX | BUFFER_USAGE_COPY_DST,
+    });
+    packet.push(GpuCommand::WriteBuffer {
+        buffer_id: vb1_id,
+        offset: 0,
+        data: tri1_bytes,
+    });
+
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: vb2_id,
+        size: tri2_bytes.len() as u32,
+        usage: BUFFER_USAGE_VERTEX | BUFFER_USAGE_COPY_DST,
+    });
+    packet.push(GpuCommand::WriteBuffer {
+        buffer_id: vb2_id,
+        offset: 0,
+        data: tri2_bytes,
+    });
+
+    packet.push(GpuCommand::CreateTexture {
+        texture_id: target_10,
+        width: 64,
+        height: 64,
+        format: TARGET_FORMAT_RGBA8UNORM,
+        usage: TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC,
+    });
+    packet.push(GpuCommand::CreateTexture {
+        texture_id: target_11,
+        width: 64,
+        height: 64,
+        format: TARGET_FORMAT_RGBA8UNORM,
+        usage: TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC,
+    });
+
+    let bytes_per_row = 256u32;
+    let readback_size = bytes_per_row * 64;
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: readback_buffer_id,
+        size: readback_size,
+        usage: BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST,
+    });
+
+    let flat_shader = "\
+struct ColorUniform {\n\
+    color: vec4<f32>,\n\
+};\n\
+@group(0) @binding(0)\n\
+var<uniform> u: ColorUniform;\n\
+\n\
+struct VertexInput {\n\
+    @location(0) position: vec3<f32>,\n\
+    @location(1) uv: vec2<f32>,\n\
+};\n\
+\n\
+@vertex\n\
+fn vs_main(in: VertexInput) -> @builtin(position) vec4<f32> {\n\
+    return vec4<f32>(in.position, 1.0);\n\
+}\n\
+\n\
+@fragment\n\
+fn fs_main() -> @location(0) vec4<f32> {\n\
+    return u.color;\n\
+}\n";
+
+    packet.push(GpuCommand::CreatePipeline {
+        pipeline_id,
+        wgsl_code: flat_shader.to_string(),
+        target_format: TARGET_FORMAT_RGBA8UNORM,
+        has_vertex_buffer: true,
+        has_uniform_buffer: true,
+        uniform_size: COLOR_UNIFORM_BYTES as u32,
+        vertex_stride: VERTEX_POS_UV_STRIDE as u32,
+    });
+
+    // 4. Build pass structure through FrameSession and lower_plan
+    let root_ctx = RenderContext::new_offscreen(
+        ResourceId::new(target_10),
+        64,
+        64,
+        Epoch::ZERO,
+    );
+    let mut session = FrameSession::new(root_ctx, 256)
+        .expect("session init must succeed")
+        .with_uniform_buffer_id(uniform_buffer_id);
+
+    let mat_handle = Handle::<MaterialDomain>::from_raw(1, 1).expect("valid material handle");
+    let red_bytes = [1.0f32.to_le_bytes(), 0.0f32.to_le_bytes(), 0.0f32.to_le_bytes(), 1.0f32.to_le_bytes()].concat();
+    let blue_bytes = [0.0f32.to_le_bytes(), 0.0f32.to_le_bytes(), 1.0f32.to_le_bytes(), 1.0f32.to_le_bytes()].concat();
+    let green_bytes = [0.0f32.to_le_bytes(), 1.0f32.to_le_bytes(), 0.0f32.to_le_bytes(), 1.0f32.to_le_bytes()].concat();
+
+    // Snapshot order matches oracle_reference.js layout:
+    // Offset 0: Red [1.0, 0.0, 0.0, 1.0] (Pass 1 - Target 10 left triangle)
+    // Offset 256: Blue [0.0, 0.0, 1.0, 1.0] (Pass 3 - Target 10 right triangle)
+    // Offset 512: Green [0.0, 1.0, 0.0, 1.0] (Pass 2 - Target 11 nested pass)
+    let rec_red = session
+        .snapshot_material_use(mat_handle, DataVersion::new(1), Epoch::ZERO, &red_bytes)
+        .expect("red material snapshot");
+    let rec_blue = session
+        .snapshot_material_use(mat_handle, DataVersion::new(2), Epoch::ZERO, &blue_bytes)
+        .expect("blue material snapshot");
+    let rec_green = session
+        .snapshot_material_use(mat_handle, DataVersion::new(3), Epoch::ZERO, &green_bytes)
+        .expect("green material snapshot");
+
+    // Pass 1: Outer prefix pass on Target 10 with clear to Black and Red draw on left half (offset 0)
+    session.begin_render_pass("outer_prefix", [0.0, 0.0, 0.0, 1.0]).expect("begin outer prefix pass");
+    session.record_direct_draw(pipeline_id, vb1_id, 3, Some(rec_red)).expect("record red draw");
+
+    // Pass 2: Nested inner pass on Target 11 with Green draw (offset 512, draws tri1 on target 11)
+    let nested_ctx = RenderContext::new_offscreen(
+        ResourceId::new(target_11),
+        64,
+        64,
+        Epoch::ZERO,
+    );
+    session
+        .with_nested_render(nested_ctx, |s| {
+            s.begin_render_pass("nested_pass", [0.0, 0.0, 0.0, 1.0]).expect("begin nested pass");
+            s.record_direct_draw(pipeline_id, vb1_id, 3, Some(rec_green)).expect("record green draw");
+            s.end_render_pass().expect("end nested pass");
+            Ok(())
+        })
+        .expect("with_nested_render must succeed");
+
+    // Pass 3: Outer resumed pass on Target 10 (with LoadOp::Load) and Blue draw on right half (offset 256, draws tri2 on target 10)
+    session.record_direct_draw(pipeline_id, vb2_id, 3, Some(rec_blue)).expect("record blue draw");
+    session.end_render_pass().expect("end outer resumed pass");
+
+    let session_packet = session.build_submission_packet().expect("build session packet must succeed");
+
+    for cmd in session_packet.into_commands() {
+        packet.push(cmd);
+    }
+
+    // 5. Copy Target 10 to Readback Buffer 20
+    packet.push(GpuCommand::CopyTextureToBuffer {
+        texture_id: target_10,
+        buffer_id: readback_buffer_id,
+        width: 64,
+        height: 64,
+        epoch: Epoch::ZERO,
+    });
+
+    packet
+}
+
+/// Constructs a 14-command nested-pass reentrant submission packet targeting a live canvas presentation surface (§6.7, §8.5, 2v8.4).
+///
+/// Executes three logical passes:
+/// 1. Outer prefix pass on Canvas Target 10: Clear to Black and Red draw on left half (`tri1`, dynamic offset 0).
+/// 2. Nested inner pass on Offscreen Target 11: Clear to Black and Green draw (`tri1`, dynamic offset 512).
+/// 3. Outer resumed pass on Canvas Target 10: Resume with `LoadOp::Load` and Blue draw on right half (`tri2`, dynamic offset 256).
+///
+/// Since the `gpu_bridge` fixture does not provide a canvas readback seam (`canvasContext` lacks `COPY_SRC`
+/// and the bridge maps textures from `this.textures`), this packet emits an offscreen readback of Target 11
+/// to Readback Buffer 20 only. Canvas presentation pixels are presented directly to the browser swapchain.
+///
+/// ### Resource Registration & Generational Slot Table (§6.5, vqa.6)
+/// Registers resource IDs in the global generational slot table at generation 1:
+/// - Buffers: 1 (uniform), 2 (tri1), 3 (tri2), 20 (readback staging)
+/// - Textures: 10 (canvas presentation surface), 11 (offscreen nested render target)
+/// - Pipelines: 200 (offscreen pipeline), 201 (canvas presentation pipeline)
+///
+/// ### Submission Boundary (per Cobalt 7117)
+/// Packet construction (`build_nested_canvas_pass_submission` and its binary export
+/// `gpu_bridge_build_nested_canvas_pass_packet`) performs schedule synthesis and command
+/// encoding only. It registers resource handles and prepares the binary command buffer,
+/// but **does not submit the frame or mark the canvas interval as submitted**.
+///
+/// Actual submission is left strictly to the bridge caller (or host runtime) invoking
+/// `submit_canvas_frame` / `device.queue.submit()` so that active swapchain presentation
+/// intervals are not prematurely finalized during encoding.
+pub fn build_nested_canvas_pass_submission() -> GpuSubmissionPacket {
+    // Register resource IDs in the generational slot table (§6.5, §8.5, vqa.6, 2v8.4)
+    with_global_resource_table(|table| {
+        table.register(1);   // uniform_buffer_id
+        table.register(2);   // vb1_id (tri1)
+        table.register(3);   // vb2_id (tri2)
+        table.register(10);  // target_10 (canvas)
+        table.register(11);  // target_11 (offscreen)
+        table.register(20);  // readback_buffer_id
+        table.register(200); // pipeline_offscreen
+        table.register(201); // pipeline_canvas
+    });
+
+    let mut packet = GpuSubmissionPacket::new();
+
+    let uniform_buffer_id = 1;
+    let vb1_id = 2;
+    let vb2_id = 3;
+    let target_10 = 10;
+    let target_11 = 11;
+    let readback_buffer_id = 20;
+    let pipeline_offscreen = 200;
+    let pipeline_canvas = 201;
+
+    // 1. Vertex buffer 1: Triangle 1 (left side, covers x in [-1, 0], samples at (24, 32))
+    let tri1 = [
+        VertexPosUv::new([-1.0, -1.0, 0.0], [0.0, 0.0]),
+        VertexPosUv::new([0.0, -1.0, 0.0], [0.5, 0.0]),
+        VertexPosUv::new([0.0, 1.0, 0.0], [0.5, 1.0]),
+    ];
+    let mut tri1_bytes = Vec::with_capacity(tri1.len() * VertexPosUv::BYTE_SIZE);
+    for v in &tri1 {
+        tri1_bytes.extend_from_slice(&v.to_bytes());
+    }
+
+    // 2. Vertex buffer 2: Triangle 2 (right side, covers x in [0, 1], samples at (56, 32))
+    let tri2 = [
+        VertexPosUv::new([0.0, -1.0, 0.0], [0.5, 0.0]),
+        VertexPosUv::new([1.0, -1.0, 0.0], [1.0, 0.0]),
+        VertexPosUv::new([1.0, 1.0, 0.0], [1.0, 1.0]),
+    ];
+    let mut tri2_bytes = Vec::with_capacity(tri2.len() * VertexPosUv::BYTE_SIZE);
+    for v in &tri2 {
+        tri2_bytes.extend_from_slice(&v.to_bytes());
+    }
+
+    // 3. Resource creation commands (matching oracle device allocations):
+    // Command 0: Uniform buffer 1 (768 bytes: 3 * 256B aligned dynamic slots)
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: uniform_buffer_id,
+        size: 768,
+        usage: BUFFER_USAGE_UNIFORM | BUFFER_USAGE_COPY_DST,
+    });
+
+    // Commands 1 & 2: Vertex buffer 1 (60 bytes)
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: vb1_id,
+        size: tri1_bytes.len() as u32,
+        usage: BUFFER_USAGE_VERTEX | BUFFER_USAGE_COPY_DST,
+    });
+    packet.push(GpuCommand::WriteBuffer {
+        buffer_id: vb1_id,
+        offset: 0,
+        data: tri1_bytes,
+    });
+
+    // Commands 3 & 4: Vertex buffer 2 (60 bytes)
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: vb2_id,
+        size: tri2_bytes.len() as u32,
+        usage: BUFFER_USAGE_VERTEX | BUFFER_USAGE_COPY_DST,
+    });
+    packet.push(GpuCommand::WriteBuffer {
+        buffer_id: vb2_id,
+        offset: 0,
+        data: tri2_bytes,
+    });
+
+    // Command 5: Offscreen texture Target 11 (Canvas Target 10 is acquired via swapchain, not created)
+    packet.push(GpuCommand::CreateTexture {
+        texture_id: target_11,
+        width: 64,
+        height: 64,
+        format: TARGET_FORMAT_RGBA8UNORM,
+        usage: TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC,
+    });
+
+    // Command 6: Readback buffer 20 for Target 11
+    let bytes_per_row = 256u32;
+    let readback_size = bytes_per_row * 64;
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: readback_buffer_id,
+        size: readback_size,
+        usage: BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST,
+    });
+
+    let flat_shader = "\
+struct ColorUniform {\n\
+    color: vec4<f32>,\n\
+};\n\
+@group(0) @binding(0)\n\
+var<uniform> u: ColorUniform;\n\
+\n\
+struct VertexInput {\n\
+    @location(0) position: vec3<f32>,\n\
+    @location(1) uv: vec2<f32>,\n\
+};\n\
+\n\
+@vertex\n\
+fn vs_main(in: VertexInput) -> @builtin(position) vec4<f32> {\n\
+    return vec4<f32>(in.position, 1.0);\n\
+}\n\
+\n\
+@fragment\n\
+fn fs_main() -> @location(0) vec4<f32> {\n\
+    return u.color;\n\
+}\n";
+
+    // Command 7: Pipeline 200 for offscreen target (RGBA8Unorm)
+    packet.push(GpuCommand::CreatePipeline {
+        pipeline_id: pipeline_offscreen,
+        wgsl_code: flat_shader.to_string(),
+        target_format: TARGET_FORMAT_RGBA8UNORM,
+        has_vertex_buffer: true,
+        has_uniform_buffer: true,
+        uniform_size: COLOR_UNIFORM_BYTES as u32,
+        vertex_stride: VERTEX_POS_UV_STRIDE as u32,
+    });
+
+    // Command 8: Pipeline 201 for canvas presentation target (dynamically matches host preferredCanvasFormat)
+    packet.push(GpuCommand::CreatePipeline {
+        pipeline_id: pipeline_canvas,
+        wgsl_code: flat_shader.to_string(),
+        target_format: TARGET_FORMAT_PREFERRED_CANVAS,
+        has_vertex_buffer: true,
+        has_uniform_buffer: true,
+        uniform_size: COLOR_UNIFORM_BYTES as u32,
+        vertex_stride: VERTEX_POS_UV_STRIDE as u32,
+    });
+
+    // 4. Build pass structure through FrameSession with CanvasEpochTracker and lower_plan
+    let mut tracker = CanvasEpochTracker::new();
+    tracker.register_canvas(
+        CanvasId::new(target_10),
+        ResourceId::new(target_10),
+        64,
+        64,
+        CanvasFormat::Bgra8Unorm,
+    );
+    let canvas_output = tracker
+        .begin_frame_acquire(CanvasId::new(target_10))
+        .expect("canvas acquire must succeed");
+
+    let root_ctx = RenderContext::new_canvas_acquired(
+        ResourceId::new(target_10),
+        64,
+        64,
+        Epoch::new(1),
+        canvas_output.epoch,
+    );
+    let mut session = FrameSession::new(root_ctx, 256)
+        .expect("session init must succeed")
+        .with_uniform_buffer_id(uniform_buffer_id);
+
+    let mat_handle = Handle::<MaterialDomain>::from_raw(1, 1).expect("valid material handle");
+    let red_bytes = [1.0f32.to_le_bytes(), 0.0f32.to_le_bytes(), 0.0f32.to_le_bytes(), 1.0f32.to_le_bytes()].concat();
+    let blue_bytes = [0.0f32.to_le_bytes(), 0.0f32.to_le_bytes(), 1.0f32.to_le_bytes(), 1.0f32.to_le_bytes()].concat();
+    let green_bytes = [0.0f32.to_le_bytes(), 1.0f32.to_le_bytes(), 0.0f32.to_le_bytes(), 1.0f32.to_le_bytes()].concat();
+
+    // Snapshot order matches oracle_reference.js layout:
+    // Offset 0: Red [1.0, 0.0, 0.0, 1.0] (Pass 1 - Canvas Target 10 left triangle)
+    // Offset 256: Blue [0.0, 0.0, 1.0, 1.0] (Pass 3 - Canvas Target 10 right triangle)
+    // Offset 512: Green [0.0, 1.0, 0.0, 1.0] (Pass 2 - Offscreen Target 11 nested pass)
+    let rec_red = session
+        .snapshot_material_use(mat_handle, DataVersion::new(1), Epoch::ZERO, &red_bytes)
+        .expect("red material snapshot");
+    let rec_blue = session
+        .snapshot_material_use(mat_handle, DataVersion::new(2), Epoch::ZERO, &blue_bytes)
+        .expect("blue material snapshot");
+    let rec_green = session
+        .snapshot_material_use(mat_handle, DataVersion::new(3), Epoch::ZERO, &green_bytes)
+        .expect("green material snapshot");
+
+    // Pass 1: Outer prefix pass on Canvas Target 10 with clear to Black and Red draw on left half (offset 0)
+    session.begin_render_pass("canvas_prefix", [0.0, 0.0, 0.0, 1.0]).expect("begin canvas prefix pass");
+    session.record_direct_draw(pipeline_canvas, vb1_id, 3, Some(rec_red)).expect("record red draw");
+
+    // Pass 2: Nested inner pass on Offscreen Target 11 with Green draw (offset 512, draws tri1 on target 11)
+    let nested_ctx = RenderContext::new_offscreen(
+        ResourceId::new(target_11),
+        64,
+        64,
+        Epoch::ZERO,
+    );
+    session
+        .with_nested_render(nested_ctx, |s| {
+            s.begin_render_pass("nested_pass", [0.0, 0.0, 0.0, 1.0]).expect("begin nested pass");
+            s.record_direct_draw(pipeline_offscreen, vb1_id, 3, Some(rec_green)).expect("record green draw");
+            s.end_render_pass().expect("end nested pass");
+            Ok(())
+        })
+        .expect("with_nested_render must succeed");
+
+    // Pass 3: Outer resumed pass on Canvas Target 10 (with LoadOp::Load) and Blue draw on right half (offset 256, draws tri2 on target 10)
+    session.record_direct_draw(pipeline_canvas, vb2_id, 3, Some(rec_blue)).expect("record blue draw");
+    session.end_render_pass().expect("end outer canvas resumed pass");
+
+    let session_packet = session
+        .build_submission_packet_with_tracker(Some(&tracker))
+        .expect("build session packet must succeed");
+
+    for cmd in session_packet.into_commands() {
+        packet.push(cmd);
+    }
+
+    // Command 13: Copy Offscreen Target 11 to Readback Buffer 20 (Target 10 has no canvas readback seam)
+    packet.push(GpuCommand::CopyTextureToBuffer {
+        texture_id: target_11,
         buffer_id: readback_buffer_id,
         width: 64,
         height: 64,
@@ -1725,6 +2378,83 @@ pub fn gpu_bridge_build_affine_rows_transform_packet() -> Vec<u8> {
 #[must_use]
 pub fn f3d_build_affine_rows_transform_packet() -> Vec<u8> {
     gpu_bridge_build_affine_rows_transform_packet()
+}
+
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen]
+/// Encodes a nested-pass reentrant execution packet (§6.7, 2v8.4).
+pub fn gpu_bridge_build_nested_pass_packet() -> Vec<u8> {
+    build_nested_pass_submission()
+        .encode()
+        .expect("static nested pass packet encoding must not fail")
+}
+
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen]
+/// Encodes a nested-pass reentrant execution packet (canonical alias).
+pub fn f3d_build_nested_pass_packet() -> Vec<u8> {
+    gpu_bridge_build_nested_pass_packet()
+}
+
+#[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
+/// Native export for `gpu_bridge_build_nested_pass_packet` for host verification and unit tests.
+#[must_use]
+pub fn gpu_bridge_build_nested_pass_packet() -> Vec<u8> {
+    build_nested_pass_submission()
+        .encode()
+        .expect("static nested pass packet encoding must not fail")
+}
+
+#[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
+/// Native export for `f3d_build_nested_pass_packet` (canonical alias).
+#[must_use]
+pub fn f3d_build_nested_pass_packet() -> Vec<u8> {
+    gpu_bridge_build_nested_pass_packet()
+}
+
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen]
+/// Encodes a nested-pass canvas-variant reentrant execution packet (§6.7, §8.5, 2v8.4).
+///
+/// Registers resource IDs (buffers 1, 2, 3, 20, textures 10, 11, pipelines 200, 201) in the
+/// generational slot table at generation 1. Does not submit the frame (Mail 7117); submission
+/// is performed by the bridge caller.
+pub fn gpu_bridge_build_nested_canvas_pass_packet() -> Vec<u8> {
+    build_nested_canvas_pass_submission()
+        .encode()
+        .expect("static nested canvas pass packet encoding must not fail")
+}
+
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen]
+/// Encodes a nested-pass canvas-variant reentrant execution packet (canonical alias).
+///
+/// Registers resource IDs (buffers 1, 2, 3, 20, textures 10, 11, pipelines 200, 201) in the
+/// generational slot table at generation 1. Does not submit the frame (Mail 7117).
+pub fn f3d_build_nested_canvas_pass_packet() -> Vec<u8> {
+    gpu_bridge_build_nested_canvas_pass_packet()
+}
+
+#[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
+/// Native export for `gpu_bridge_build_nested_canvas_pass_packet` for host verification and unit tests.
+///
+/// Registers resource IDs (buffers 1, 2, 3, 20, textures 10, 11, pipelines 200, 201) in the
+/// generational slot table at generation 1. Does not submit the frame (Mail 7117).
+#[must_use]
+pub fn gpu_bridge_build_nested_canvas_pass_packet() -> Vec<u8> {
+    build_nested_canvas_pass_submission()
+        .encode()
+        .expect("static nested canvas pass packet encoding must not fail")
+}
+
+#[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
+/// Native export for `f3d_build_nested_canvas_pass_packet` (canonical alias).
+///
+/// Registers resource IDs (buffers 1, 2, 3, 20, textures 10, 11, pipelines 200, 201) in the
+/// generational slot table at generation 1. Does not submit the frame (Mail 7117).
+#[must_use]
+pub fn f3d_build_nested_canvas_pass_packet() -> Vec<u8> {
+    gpu_bridge_build_nested_canvas_pass_packet()
 }
 
 #[cfg(all(feature = "browser", target_arch = "wasm32"))]
@@ -2434,6 +3164,10 @@ pub fn validate_affine_rows(bytes: &[u8]) -> Result<(), LayoutError> {
 mod tests {
     use super::*;
 
+    /// Test-only mutex serializing tests that mutate, reset, advance, or assert `GLOBAL_RESOURCE_SLOT_TABLE`.
+    /// Tolerates lock poisoning across test failures (§6.5, peer review 7202).
+    static TEST_SLOT_TABLE_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn negotiation_succeeds_when_profile_supported() {
         let req = GpuRequiredProfile {
@@ -2562,6 +3296,10 @@ mod tests {
 
     #[test]
     fn triangle_submission_packet_encoded_valid() {
+        let _slot_lock = match TEST_SLOT_TABLE_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         let packet = build_triangle_submission();
         let encoded = packet.encode().expect("valid packet encoding");
         assert_eq!(&encoded[0..4], &PACKET_MAGIC);
@@ -2771,10 +3509,7 @@ mod tests {
         use f3d_graph::{ColorAttachment, Pass, PassId, ResourceId};
 
         let mut p = Pass::new_render(PassId::new(1), "no_draws_pass");
-        p.color_attachments.push(ColorAttachment::new_clear(
-            ResourceId::new(10),
-            [0.0, 0.0, 0.0, 1.0],
-        ));
+        p.color_attachments.push(ColorAttachment::new_load(ResourceId::new(10)));
         let seg = f3d_graph::PlanSegment::from_pass(&p);
         let plan = ExecutionPlan {
             segments: vec![seg],
@@ -2793,7 +3528,54 @@ mod tests {
     }
 
     #[test]
+    fn lower_plan_permits_zero_draw_pass_with_clear() {
+        use f3d_graph::{ColorAttachment, Pass, PassId, ResourceId};
+
+        let mut p = Pass::new_render(PassId::new(1), "empty_clear_pass");
+        p.color_attachments.push(ColorAttachment::new_clear(
+            ResourceId::new(10),
+            [0.2, 0.4, 0.6, 1.0],
+        ));
+        let seg = f3d_graph::PlanSegment::from_pass(&p);
+        let plan = ExecutionPlan {
+            segments: vec![seg],
+            canvas_epoch: None,
+            pass_count: 1,
+            split_count: 0,
+            split_reasons: Vec::new(),
+        };
+
+        let commands = lower_plan(&plan).expect("empty clear pass must be permitted");
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            GpuCommand::RenderPass {
+                target_type,
+                target_id,
+                clear_color,
+                vertex_count,
+                load_op,
+                store_op,
+                pass_flags,
+                ..
+            } => {
+                assert_eq!(*target_type, TARGET_OFFSCREEN);
+                assert_eq!(*target_id, 10);
+                assert_eq!(*clear_color, [0.2, 0.4, 0.6, 1.0]);
+                assert_eq!(*vertex_count, 0);
+                assert_eq!(*load_op, LOAD_OP_CLEAR);
+                assert_eq!(*store_op, STORE_OP_STORE);
+                assert_eq!(*pass_flags, PASS_FLAG_NEW_PASS);
+            }
+            other => panic!("expected RenderPass clear opener, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn create_texture_usage_includes_copy_src_and_excludes_texture_binding() {
+        let _slot_lock = match TEST_SLOT_TABLE_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         // 1. Verify GpuCommand structured commands for triangle target 10
         let triangle_packet = build_triangle_submission();
         let triangle_create_tex = triangle_packet
@@ -3022,6 +3804,10 @@ mod tests {
 
     #[test]
     fn encode_bundle_commands_and_packet_builder() {
+        let _slot_lock = match TEST_SLOT_TABLE_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         let mut packet = GpuSubmissionPacket::new();
 
         // 1. RecordBundle command
@@ -3104,6 +3890,90 @@ mod tests {
 
         // Verify positive builder and native export
         let positive_packet = build_bundle_then_direct_draw_submission();
+        assert_eq!(positive_packet.commands.len(), 15);
+
+        // Command 9: RecordBundle (opcode 7)
+        match &positive_packet.commands[9] {
+            GpuCommand::RecordBundle {
+                bundle_id,
+                vertex_buffer_id,
+                vertex_count,
+                uniform_dynamic_offset,
+                target_format,
+                ..
+            } => {
+                assert_eq!(*bundle_id, 1);
+                assert_eq!(*vertex_buffer_id, 2);
+                assert_eq!(*vertex_count, 3);
+                assert_eq!(*uniform_dynamic_offset, 0);
+                assert_eq!(*target_format, TARGET_FORMAT_RGBA8UNORM);
+            }
+            other => panic!("expected RecordBundle at command 9, got {other:?}"),
+        }
+
+        // Command 10: RenderPass opener (vertex_count: 0) MUST precede ExecuteBundles
+        match &positive_packet.commands[10] {
+            GpuCommand::RenderPass {
+                target_type,
+                target_id,
+                vertex_count,
+                clear_color,
+                ..
+            } => {
+                assert_eq!(*target_type, TARGET_OFFSCREEN);
+                assert_eq!(*target_id, 10);
+                assert_eq!(*vertex_count, 0);
+                assert_eq!(*clear_color, [0.0, 0.0, 0.0, 1.0]);
+            }
+            other => panic!("expected RenderPass opener at command 10, got {other:?}"),
+        }
+
+        // Command 11: ExecuteBundles ([1])
+        match &positive_packet.commands[11] {
+            GpuCommand::ExecuteBundles { bundle_ids } => {
+                assert_eq!(bundle_ids, &vec![1]);
+            }
+            other => panic!("expected ExecuteBundles at command 11, got {other:?}"),
+        }
+
+        // Command 12: ExecuteBundles ([])
+        match &positive_packet.commands[12] {
+            GpuCommand::ExecuteBundles { bundle_ids } => {
+                assert!(bundle_ids.is_empty());
+            }
+            other => panic!("expected ExecuteBundles at command 12, got {other:?}"),
+        }
+
+        // Command 13: RenderPass direct draw (vertex_count: 3)
+        match &positive_packet.commands[13] {
+            GpuCommand::RenderPass {
+                target_id,
+                vertex_buffer_id,
+                vertex_count,
+                uniform_dynamic_offset,
+                ..
+            } => {
+                assert_eq!(*target_id, 10);
+                assert_eq!(*vertex_buffer_id, 3);
+                assert_eq!(*vertex_count, 3);
+                assert_eq!(*uniform_dynamic_offset, 256);
+            }
+            other => panic!("expected RenderPass direct draw at command 13, got {other:?}"),
+        }
+
+        // Command 14: CopyTextureToBuffer
+        match &positive_packet.commands[14] {
+            GpuCommand::CopyTextureToBuffer {
+                texture_id,
+                buffer_id,
+                ..
+            } => {
+                assert_eq!(*texture_id, 10);
+                assert_eq!(*buffer_id, 20);
+            }
+            other => panic!("expected CopyTextureToBuffer at command 14, got {other:?}"),
+        }
+
         let positive_bytes = positive_packet.encode().expect("encode bundle positive packet");
         assert!(!positive_bytes.is_empty());
         let exported_bytes = gpu_bridge_build_bundle_direct_draw_packet();
@@ -3186,6 +4056,10 @@ mod tests {
 
     #[test]
     fn bundle_then_direct_draw_single_pass_command_shape() {
+        let _slot_lock = match TEST_SLOT_TABLE_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         let packet = build_bundle_then_direct_draw_submission();
         let commands = packet.commands();
 
@@ -3266,28 +4140,63 @@ mod tests {
 
     #[test]
     fn generational_handle_slot_table_fresh_stale_and_zero_generation() {
+        let _slot_lock = match TEST_SLOT_TABLE_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         use f3d_core::error::HandleError;
 
-        // 1. Building triangle and bundle submissions registers their resources
+        // Clean global table state before running test
+        with_global_resource_table(|table| *table = ResourceSlotTable::new());
+
+        // 1. Building submission packets registers their resources in the generational slot table:
+        // - Triangle: buffers 1, 2, 3; texture 10; pipeline 100
+        // - Bundle: buffers 1, 2, 3, 20; texture 10; pipeline 200
+        // - Affine transform: buffers 1, 2, 20; texture 10; pipeline 200
+        // - Nested pass: buffers 1, 2, 3, 20; textures 10, 11; pipeline 200
+        // - Nested canvas pass: buffers 1, 2, 3, 20; textures 10, 11; pipelines 200, 201
         let _triangle_packet = build_triangle_submission();
         let _bundle_packet = build_bundle_then_direct_draw_submission();
+        let _affine_packet = build_affine_rows_transform_submission();
+        let _nested_packet = build_nested_pass_submission();
+        let _nested_canvas_packet = build_nested_canvas_pass_submission();
 
-        // 2. Fresh generation: registered resource (e.g. target 10) is active at generation 1
-        assert_eq!(check_resource_handle(10, 1), Ok(true));
-        assert!(gpu_bridge_check_resource_handle(10, 1));
-        assert!(f3d_check_resource_handle(10, 1));
+        // Verify that binary exports also trigger slot table registration identically
+        let _affine_bytes = gpu_bridge_build_affine_rows_transform_packet();
+        let _nested_bytes = gpu_bridge_build_nested_pass_packet();
+        let _canvas_bytes = gpu_bridge_build_nested_canvas_pass_packet();
 
-        // Another registered resource (e.g. pipeline 100, pipeline 200, buffer 1)
-        assert_eq!(check_resource_handle(1, 1), Ok(true));
-        assert!(gpu_bridge_check_resource_handle(1, 1));
+        // 2. Fresh generation: all registered resource IDs answer truthfully at generation 1
+        // Buffers: 1 (uniform), 2 (vertex 1), 3 (vertex 2 / readback staging), 20 (readback staging)
+        for buffer_id in [1, 2, 3, 20] {
+            assert_eq!(check_resource_handle(buffer_id, 1), Ok(true));
+            assert!(gpu_bridge_check_resource_handle(buffer_id, 1));
+            assert!(f3d_check_resource_handle(buffer_id, 1));
+        }
+
+        // Textures: 10 (canvas / target A), 11 (offscreen nested target)
+        for texture_id in [10, 11] {
+            assert_eq!(check_resource_handle(texture_id, 1), Ok(true));
+            assert!(gpu_bridge_check_resource_handle(texture_id, 1));
+            assert!(f3d_check_resource_handle(texture_id, 1));
+        }
+
+        // Pipelines: 100 (triangle), 200 (direct / offscreen), 201 (canvas presentation)
+        for pipeline_id in [100, 200, 201] {
+            assert_eq!(check_resource_handle(pipeline_id, 1), Ok(true));
+            assert!(gpu_bridge_check_resource_handle(pipeline_id, 1));
+            assert!(f3d_check_resource_handle(pipeline_id, 1));
+        }
 
         // 3. Zero generation rejection: generation 0 must be rejected via HandleError::InvalidGeneration
-        assert_eq!(
-            check_resource_handle(10, 0),
-            Err(HandleError::InvalidGeneration { raw_generation: 0 })
-        );
-        assert!(!gpu_bridge_check_resource_handle(10, 0));
-        assert!(!f3d_check_resource_handle(10, 0));
+        for id in [1, 2, 3, 10, 11, 20, 100, 200, 201] {
+            assert_eq!(
+                check_resource_handle(id, 0),
+                Err(HandleError::InvalidGeneration { raw_generation: 0 })
+            );
+            assert!(!gpu_bridge_check_resource_handle(id, 0));
+            assert!(!f3d_check_resource_handle(id, 0));
+        }
 
         // 4. Stale after reuse: advance generation of slot 10 (simulating slot release and reuse)
         let new_gen = advance_resource_slot_generation(10).expect("advance generation");
@@ -3303,9 +4212,32 @@ mod tests {
         assert!(gpu_bridge_check_resource_handle(10, 2));
         assert!(f3d_check_resource_handle(10, 2));
 
-        // Re-check zero generation still rejected
+        // Also test advance on nested offscreen texture 11 and canvas presentation pipeline 201
+        let new_gen_11 = advance_resource_slot_generation(11).expect("advance generation 11");
+        assert_eq!(new_gen_11, 2);
+        assert_eq!(check_resource_handle(11, 1), Ok(false));
+        assert!(!gpu_bridge_check_resource_handle(11, 1));
+        assert_eq!(check_resource_handle(11, 2), Ok(true));
+        assert!(gpu_bridge_check_resource_handle(11, 2));
+
+        let new_gen_201 = advance_resource_slot_generation(201).expect("advance generation 201");
+        assert_eq!(new_gen_201, 2);
+        assert_eq!(check_resource_handle(201, 1), Ok(false));
+        assert!(!gpu_bridge_check_resource_handle(201, 1));
+        assert_eq!(check_resource_handle(201, 2), Ok(true));
+        assert!(gpu_bridge_check_resource_handle(201, 2));
+
+        // Re-check zero generation still rejected on advanced slots
         assert_eq!(
             check_resource_handle(10, 0),
+            Err(HandleError::InvalidGeneration { raw_generation: 0 })
+        );
+        assert_eq!(
+            check_resource_handle(11, 0),
+            Err(HandleError::InvalidGeneration { raw_generation: 0 })
+        );
+        assert_eq!(
+            check_resource_handle(201, 0),
             Err(HandleError::InvalidGeneration { raw_generation: 0 })
         );
 
@@ -3356,6 +4288,9 @@ mod tests {
             table.release_and_advance(999),
             Err(HandleError::IndexOutOfBounds { index: 999, capacity: 43 })
         );
+
+        // Reset global table to clean state upon test completion
+        with_global_resource_table(|table| *table = ResourceSlotTable::new());
     }
 
     #[test]
@@ -3571,6 +4506,10 @@ mod tests {
 
     #[test]
     fn affine_rows_transform_packet_and_pixel_coordinates() {
+        let _slot_lock = match TEST_SLOT_TABLE_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         let packet = build_affine_rows_transform_submission();
         assert_eq!(packet.commands.len(), 9);
 
@@ -3701,11 +4640,11 @@ mod tests {
         //   v1' = (0.5 * -0.5 + 0.5, 0.5 * -0.5) = (0.25, -0.25)
         //   v2' = (0.5 * 0.5 + 0.5, 0.5 * -0.5) = (0.75, -0.25)
         // Screen pixel mapping on 64x64:
-        //   px = round((x_ndc + 1.0) * 0.5 * 64)
-        //   py = round((1.0 - y_ndc) * 0.5 * 64)
+        //   px = round((x_ndc + 1.0) * 0.5 * 64 - 0.5)
+        //   py = round((1.0 - y_ndc) * 0.5 * 64 - 0.5)
         let ndc_to_pixel = |x: f32, y: f32| -> (u32, u32) {
-            let px = ((x + 1.0) * 0.5 * 64.0).round() as u32;
-            let py = ((1.0 - y) * 0.5 * 64.0).round() as u32;
+            let px = ((x + 1.0) * 0.5 * 64.0 - 0.5).round() as u32;
+            let py = ((1.0 - y) * 0.5 * 64.0 - 0.5).round() as u32;
             (px, py)
         };
         assert_eq!(ndc_to_pixel(0.5, 0.25), (48, 24)); // Top vertex
@@ -3713,5 +4652,1041 @@ mod tests {
         assert_eq!(ndc_to_pixel(0.75, -0.25), (56, 40)); // Bottom-right vertex
         assert_eq!(ndc_to_pixel(0.5, 0.0), (48, 32)); // Center of transformed triangle (interior)
         assert_eq!(ndc_to_pixel(0.0, 0.0), (32, 32)); // Untransformed center (origin, outside transformed triangle)
+    }
+
+    #[test]
+    fn test_pack_unpack_target_type_backwards_compatibility() {
+        // 1. Raw 0 (Offscreen) and raw 1 (Canvas) must unpack with Clear, Store, and No-Flag
+        assert_eq!(unpack_target_kind(TARGET_OFFSCREEN), TARGET_OFFSCREEN);
+        assert_eq!(unpack_load_op(TARGET_OFFSCREEN), LOAD_OP_CLEAR);
+        assert_eq!(unpack_store_op(TARGET_OFFSCREEN), STORE_OP_STORE);
+        assert_eq!(unpack_pass_flags(TARGET_OFFSCREEN), PASS_FLAG_NONE);
+
+        assert_eq!(unpack_target_kind(TARGET_CANVAS), TARGET_CANVAS);
+        assert_eq!(unpack_load_op(TARGET_CANVAS), LOAD_OP_CLEAR);
+        assert_eq!(unpack_store_op(TARGET_CANVAS), STORE_OP_STORE);
+        assert_eq!(unpack_pass_flags(TARGET_CANVAS), PASS_FLAG_NONE);
+
+        // 2. Packing default values produces identical raw integer values
+        assert_eq!(
+            pack_target_type(TARGET_OFFSCREEN, LOAD_OP_CLEAR, STORE_OP_STORE, PASS_FLAG_NONE),
+            0
+        );
+        assert_eq!(
+            pack_target_type(TARGET_CANVAS, LOAD_OP_CLEAR, STORE_OP_STORE, PASS_FLAG_NONE),
+            1
+        );
+
+        // 3. Packing explicit LoadOp::Load, StoreOp::Store, and PASS_FLAG_NEW_PASS round-trips exactly
+        let packed = pack_target_type(TARGET_OFFSCREEN, LOAD_OP_LOAD, STORE_OP_STORE, PASS_FLAG_NEW_PASS);
+        assert_eq!(unpack_target_kind(packed), TARGET_OFFSCREEN);
+        assert_eq!(unpack_load_op(packed), LOAD_OP_LOAD);
+        assert_eq!(unpack_store_op(packed), STORE_OP_STORE);
+        assert_eq!(unpack_pass_flags(packed), PASS_FLAG_NEW_PASS);
+        assert_ne!(packed, 0);
+
+        // 4. Packing DontCare and Discard flags round-trips
+        let packed_discard = pack_target_type(TARGET_CANVAS, LOAD_OP_DONT_CARE, STORE_OP_DISCARD, PASS_FLAG_NONE);
+        assert_eq!(unpack_target_kind(packed_discard), TARGET_CANVAS);
+        assert_eq!(unpack_load_op(packed_discard), LOAD_OP_DONT_CARE);
+        assert_eq!(unpack_store_op(packed_discard), STORE_OP_DISCARD);
+        assert_eq!(unpack_pass_flags(packed_discard), PASS_FLAG_NONE);
+
+        // 5. Positive and negative validation checks for validate_target_type (§6.7, 2v8.4)
+        assert!(validate_target_type(TARGET_OFFSCREEN));
+        assert!(validate_target_type(TARGET_CANVAS));
+        assert!(validate_target_type(packed));
+        assert!(validate_target_type(packed_discard));
+
+        assert!(!validate_target_type(2)); // target_kind > 1
+        assert!(!validate_target_type(0x0300)); // load_op > 2
+        assert!(!validate_target_type(0x020000)); // store_op > 1
+        assert!(!validate_target_type(0x02000000)); // pass_flags has bit 1 set (reserved)
+        assert!(!validate_target_type(0xFF000000)); // unknown upper flag bits
+    }
+
+    #[test]
+    fn test_lower_plan_multi_segment_load_store_pass_boundaries() {
+        use f3d_graph::{
+            pass::{ColorAttachment, Draw, Pass, PassId},
+            plan::{ExecutionPlan, PlanSegment},
+            resource::ResourceId,
+        };
+
+        // Pass 0: Prefix pass on Target 10 with Clear
+        let mut pass0 = Pass::new_render(PassId::new(1), "outer_prefix");
+        pass0.color_attachments.push(ColorAttachment::new_clear(
+            ResourceId::new(10),
+            [0.1, 0.2, 0.3, 1.0],
+        ));
+        pass0.draws.push(Draw::new(1, 100, 3, 0, Vec::new()));
+
+        // Pass 1: Nested pass on Target 20 with Clear
+        let mut pass1 = Pass::new_render(PassId::new(2), "nested_shadow");
+        pass1.color_attachments.push(ColorAttachment::new_clear(
+            ResourceId::new(20),
+            [0.4, 0.5, 0.6, 1.0],
+        ));
+        pass1.draws.push(Draw::new(2, 200, 6, 0, Vec::new()));
+
+        // Pass 2: Resumed pass on Target 10 with LoadOp::Load, containing 2 draws
+        let mut pass2 = Pass::new_render(PassId::new(3), "outer_resumed");
+        pass2.color_attachments.push(ColorAttachment::new_load(ResourceId::new(10)));
+        pass2.draws.push(Draw::new(3, 100, 3, 0, Vec::new()));
+        pass2.draws.push(Draw::new(4, 100, 3, 256, Vec::new()));
+
+        let plan = ExecutionPlan {
+            segments: vec![
+                PlanSegment::from_pass(&pass0),
+                PlanSegment::from_pass(&pass1),
+                PlanSegment::from_pass(&pass2),
+            ],
+            canvas_epoch: None,
+            pass_count: 3,
+            split_count: 0,
+            split_reasons: Vec::new(),
+        };
+
+        let commands = lower_plan(&plan).expect("lower multi-segment plan");
+        assert_eq!(commands.len(), 4);
+
+        // Command 0 (Pass 0 Draw 1): Target 10, Clear, New Pass
+        match &commands[0] {
+            GpuCommand::RenderPass {
+                target_type,
+                target_id,
+                clear_color,
+                pipeline_id,
+                vertex_count,
+                load_op,
+                store_op,
+                pass_flags,
+                ..
+            } => {
+                assert_eq!(*target_type, TARGET_OFFSCREEN);
+                assert_eq!(*target_id, 10);
+                assert_eq!(*clear_color, [0.1, 0.2, 0.3, 1.0]);
+                assert_eq!(*pipeline_id, 100);
+                assert_eq!(*vertex_count, 3);
+                assert_eq!(*load_op, LOAD_OP_CLEAR);
+                assert_eq!(*store_op, STORE_OP_STORE);
+                assert_eq!(*pass_flags, PASS_FLAG_NEW_PASS);
+            }
+            other => panic!("expected RenderPass at command 0, got {other:?}"),
+        }
+
+        // Command 1 (Pass 1 Draw 1): Target 20, Clear, New Pass
+        match &commands[1] {
+            GpuCommand::RenderPass {
+                target_type,
+                target_id,
+                clear_color,
+                pipeline_id,
+                vertex_count,
+                load_op,
+                store_op,
+                pass_flags,
+                ..
+            } => {
+                assert_eq!(*target_type, TARGET_OFFSCREEN);
+                assert_eq!(*target_id, 20);
+                assert_eq!(*clear_color, [0.4, 0.5, 0.6, 1.0]);
+                assert_eq!(*pipeline_id, 200);
+                assert_eq!(*vertex_count, 6);
+                assert_eq!(*load_op, LOAD_OP_CLEAR);
+                assert_eq!(*store_op, STORE_OP_STORE);
+                assert_eq!(*pass_flags, PASS_FLAG_NEW_PASS);
+            }
+            other => panic!("expected RenderPass at command 1, got {other:?}"),
+        }
+
+        // Command 2 (Pass 2 Draw 1): Target 10, LOAD, New Pass
+        match &commands[2] {
+            GpuCommand::RenderPass {
+                target_type,
+                target_id,
+                pipeline_id,
+                vertex_count,
+                uniform_dynamic_offset,
+                load_op,
+                store_op,
+                pass_flags,
+                ..
+            } => {
+                assert_eq!(*target_type, TARGET_OFFSCREEN);
+                assert_eq!(*target_id, 10);
+                assert_eq!(*pipeline_id, 100);
+                assert_eq!(*vertex_count, 3);
+                assert_eq!(*uniform_dynamic_offset, 0);
+                assert_eq!(*load_op, LOAD_OP_LOAD);
+                assert_eq!(*store_op, STORE_OP_STORE);
+                assert_eq!(*pass_flags, PASS_FLAG_NEW_PASS);
+            }
+            other => panic!("expected RenderPass at command 2, got {other:?}"),
+        }
+
+        // Command 3 (Pass 2 Draw 2): Target 10, LOAD, SAME Pass (pass_flags == NONE)
+        match &commands[3] {
+            GpuCommand::RenderPass {
+                target_type,
+                target_id,
+                pipeline_id,
+                vertex_count,
+                uniform_dynamic_offset,
+                load_op,
+                store_op,
+                pass_flags,
+                ..
+            } => {
+                assert_eq!(*target_type, TARGET_OFFSCREEN);
+                assert_eq!(*target_id, 10);
+                assert_eq!(*pipeline_id, 100);
+                assert_eq!(*vertex_count, 3);
+                assert_eq!(*uniform_dynamic_offset, 256);
+                assert_eq!(*load_op, LOAD_OP_LOAD);
+                assert_eq!(*store_op, STORE_OP_STORE);
+                assert_eq!(*pass_flags, PASS_FLAG_NONE);
+            }
+            other => panic!("expected RenderPass at command 3, got {other:?}"),
+        }
+
+        // Binary wire encoding verification: ensure 44-byte records with correctly packed target_type
+        let packet = GpuSubmissionPacket::from_commands(commands);
+        let encoded = packet.encode().expect("encode packet");
+        assert_eq!(encoded.len(), 16 + 4 * (2 + 44));
+
+        let check_cmd = |offset: usize| -> (u32, u32) {
+            let opcode = u16::from_le_bytes([encoded[offset], encoded[offset + 1]]);
+            assert_eq!(opcode, OPCODE_RENDER_PASS);
+            let raw_target_type = u32::from_le_bytes(encoded[offset + 2..offset + 6].try_into().unwrap());
+            let target_id = u32::from_le_bytes(encoded[offset + 6..offset + 10].try_into().unwrap());
+            (raw_target_type, target_id)
+        };
+
+        // Command 0 at offset 16
+        let (raw0, tid0) = check_cmd(16);
+        assert_eq!(tid0, 10);
+        assert_eq!(unpack_target_kind(raw0), TARGET_OFFSCREEN);
+        assert_eq!(unpack_load_op(raw0), LOAD_OP_CLEAR);
+        assert_eq!(unpack_store_op(raw0), STORE_OP_STORE);
+        assert_eq!(unpack_pass_flags(raw0), PASS_FLAG_NEW_PASS);
+
+        // Command 1 at offset 16 + 46 = 62
+        let (raw1, tid1) = check_cmd(62);
+        assert_eq!(tid1, 20);
+        assert_eq!(unpack_target_kind(raw1), TARGET_OFFSCREEN);
+        assert_eq!(unpack_load_op(raw1), LOAD_OP_CLEAR);
+        assert_eq!(unpack_store_op(raw1), STORE_OP_STORE);
+        assert_eq!(unpack_pass_flags(raw1), PASS_FLAG_NEW_PASS);
+
+        // Command 2 at offset 62 + 46 = 108
+        let (raw2, tid2) = check_cmd(108);
+        assert_eq!(tid2, 10);
+        assert_eq!(unpack_target_kind(raw2), TARGET_OFFSCREEN);
+        assert_eq!(unpack_load_op(raw2), LOAD_OP_LOAD);
+        assert_eq!(unpack_store_op(raw2), STORE_OP_STORE);
+        assert_eq!(unpack_pass_flags(raw2), PASS_FLAG_NEW_PASS);
+
+        // Command 3 at offset 108 + 46 = 154
+        let (raw3, tid3) = check_cmd(154);
+        assert_eq!(tid3, 10);
+        assert_eq!(unpack_target_kind(raw3), TARGET_OFFSCREEN);
+        assert_eq!(unpack_load_op(raw3), LOAD_OP_LOAD);
+        assert_eq!(unpack_store_op(raw3), STORE_OP_STORE);
+        assert_eq!(unpack_pass_flags(raw3), PASS_FLAG_NONE);
+    }
+
+    #[test]
+    fn test_lower_plan_rejects_multiple_color_attachments() {
+        use f3d_graph::{
+            pass::{ColorAttachment, Draw, Pass, PassId},
+            plan::{ExecutionPlan, PlanSegment},
+            resource::ResourceId,
+        };
+
+        let mut p = Pass::new_render(PassId::new(1), "mrt_pass");
+        p.color_attachments.push(ColorAttachment::new_clear(
+            ResourceId::new(10),
+            [0.0, 0.0, 0.0, 1.0],
+        ));
+        p.color_attachments.push(ColorAttachment::new_clear(
+            ResourceId::new(11),
+            [1.0, 0.0, 0.0, 1.0],
+        ));
+        p.draws.push(Draw::new(1, 100, 3, 0, Vec::new()));
+
+        let plan = ExecutionPlan {
+            segments: vec![PlanSegment::from_pass(&p)],
+            canvas_epoch: None,
+            pass_count: 1,
+            split_count: 0,
+            split_reasons: Vec::new(),
+        };
+
+        match lower_plan(&plan) {
+            Err(PlanLoweringError::UnsupportedMultipleColorAttachments {
+                segment_name,
+                count,
+            }) => {
+                assert_eq!(segment_name, "mrt_pass");
+                assert_eq!(count, 2);
+            }
+            other => panic!("Expected UnsupportedMultipleColorAttachments error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_lower_plan_rejects_depth_stencil_attachment() {
+        use f3d_graph::{
+            pass::{ColorAttachment, DepthStencilAttachment, Draw, Pass, PassId},
+            plan::{ExecutionPlan, PlanSegment},
+            resource::ResourceId,
+        };
+
+        let mut p = Pass::new_render(PassId::new(1), "depth_pass");
+        p.color_attachments.push(ColorAttachment::new_clear(
+            ResourceId::new(10),
+            [0.0, 0.0, 0.0, 1.0],
+        ));
+        p.depth_stencil_attachment = Some(DepthStencilAttachment::new_clear(
+            ResourceId::new(99),
+            1.0,
+            0,
+        ));
+        p.draws.push(Draw::new(1, 100, 3, 0, Vec::new()));
+
+        let plan = ExecutionPlan {
+            segments: vec![PlanSegment::from_pass(&p)],
+            canvas_epoch: None,
+            pass_count: 1,
+            split_count: 0,
+            split_reasons: Vec::new(),
+        };
+
+        match lower_plan(&plan) {
+            Err(PlanLoweringError::UnsupportedDepthStencilAttachment { segment_name }) => {
+                assert_eq!(segment_name, "depth_pass");
+            }
+            other => panic!("Expected UnsupportedDepthStencilAttachment error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_nested_pass_packet_and_pixel_coordinates() {
+        let _slot_lock = match TEST_SLOT_TABLE_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let wasm_bytes = gpu_bridge_build_nested_pass_packet();
+        let alias_bytes = f3d_build_nested_pass_packet();
+        assert_eq!(wasm_bytes, alias_bytes);
+        assert!(!wasm_bytes.is_empty());
+
+        // Verify header
+        assert_eq!(&wasm_bytes[0..4], &PACKET_MAGIC);
+        assert_eq!(u16::from_le_bytes(wasm_bytes[4..6].try_into().unwrap()), PACKET_VERSION);
+        let cmd_count = u32::from_le_bytes(wasm_bytes[8..12].try_into().unwrap());
+        assert_eq!(cmd_count, 14);
+
+        // Verify structured commands
+        let submission = build_nested_pass_submission();
+        let commands = submission.commands();
+        assert_eq!(commands.len(), 14);
+
+        // Verify resource creations
+        match &commands[0] {
+            GpuCommand::CreateBuffer { buffer_id, size, usage } => {
+                assert_eq!(*buffer_id, 1);
+                assert_eq!(*size, 768);
+                assert_eq!(*usage, BUFFER_USAGE_UNIFORM | BUFFER_USAGE_COPY_DST);
+            }
+            other => panic!("expected CreateBuffer at 0, got {other:?}"),
+        }
+
+        // Verify 3 RenderPass commands (commands 10, 11, 12)
+        // Pass 1: Target 10, Clear to Black, Draw Red left triangle (dynamic offset 0, vb 2)
+        match &commands[10] {
+            GpuCommand::RenderPass {
+                target_type,
+                target_id,
+                clear_color,
+                pipeline_id,
+                vertex_buffer_id,
+                vertex_count,
+                uniform_dynamic_offset,
+                uniform_buffer_id,
+                load_op,
+                store_op,
+                pass_flags,
+            } => {
+                assert_eq!(*target_type, TARGET_OFFSCREEN);
+                assert_eq!(*target_id, 10);
+                assert_eq!(*clear_color, [0.0, 0.0, 0.0, 1.0]);
+                assert_eq!(*pipeline_id, 200);
+                assert_eq!(*vertex_buffer_id, 2);
+                assert_eq!(*vertex_count, 3);
+                assert_eq!(*uniform_dynamic_offset, 0);
+                assert_eq!(*uniform_buffer_id, 1);
+                assert_eq!(*load_op, LOAD_OP_CLEAR);
+                assert_eq!(*store_op, STORE_OP_STORE);
+                assert_eq!(*pass_flags, PASS_FLAG_NEW_PASS);
+            }
+            other => panic!("expected RenderPass at 10, got {other:?}"),
+        }
+
+        // Pass 2: Target 11, Nested pass, Clear to Black, Draw Green triangle (dynamic offset 512, vb 2)
+        match &commands[11] {
+            GpuCommand::RenderPass {
+                target_type,
+                target_id,
+                clear_color,
+                pipeline_id,
+                vertex_buffer_id,
+                vertex_count,
+                uniform_dynamic_offset,
+                uniform_buffer_id,
+                load_op,
+                store_op,
+                pass_flags,
+            } => {
+                assert_eq!(*target_type, TARGET_OFFSCREEN);
+                assert_eq!(*target_id, 11);
+                assert_eq!(*clear_color, [0.0, 0.0, 0.0, 1.0]);
+                assert_eq!(*pipeline_id, 200);
+                assert_eq!(*vertex_buffer_id, 2);
+                assert_eq!(*vertex_count, 3);
+                assert_eq!(*uniform_dynamic_offset, 512);
+                assert_eq!(*uniform_buffer_id, 1);
+                assert_eq!(*load_op, LOAD_OP_CLEAR);
+                assert_eq!(*store_op, STORE_OP_STORE);
+                assert_eq!(*pass_flags, PASS_FLAG_NEW_PASS);
+            }
+            other => panic!("expected RenderPass at 11, got {other:?}"),
+        }
+
+        // Pass 3: Target 10, Outer resume with LoadOp::Load, Draw Blue right triangle (dynamic offset 256, vb 3)
+        match &commands[12] {
+            GpuCommand::RenderPass {
+                target_type,
+                target_id,
+                pipeline_id,
+                vertex_buffer_id,
+                vertex_count,
+                uniform_dynamic_offset,
+                uniform_buffer_id,
+                load_op,
+                store_op,
+                pass_flags,
+                ..
+            } => {
+                assert_eq!(*target_type, TARGET_OFFSCREEN);
+                assert_eq!(*target_id, 10);
+                assert_eq!(*pipeline_id, 200);
+                assert_eq!(*vertex_buffer_id, 3);
+                assert_eq!(*vertex_count, 3);
+                assert_eq!(*uniform_dynamic_offset, 256);
+                assert_eq!(*uniform_buffer_id, 1);
+                assert_eq!(*load_op, LOAD_OP_LOAD);
+                assert_eq!(*store_op, STORE_OP_STORE);
+                assert_eq!(*pass_flags, PASS_FLAG_NEW_PASS);
+            }
+            other => panic!("expected RenderPass at 12, got {other:?}"),
+        }
+
+        // Command 13: CopyTextureToBuffer of Target 10 to buffer 20
+        match &commands[13] {
+            GpuCommand::CopyTextureToBuffer {
+                texture_id,
+                buffer_id,
+                width,
+                height,
+                ..
+            } => {
+                assert_eq!(*texture_id, 10);
+                assert_eq!(*buffer_id, 20);
+                assert_eq!(*width, 64);
+                assert_eq!(*height, 64);
+            }
+            other => panic!("expected CopyTextureToBuffer at 13, got {other:?}"),
+        }
+
+        // Verify binary wire format: scan commands from offset 16 and verify the three 44-byte RenderPass records
+        let mut cursor = 16usize;
+        let mut render_pass_index = 0;
+        for _ in 0..14 {
+            let opcode = u16::from_le_bytes(wasm_bytes[cursor..cursor + 2].try_into().unwrap());
+            cursor += 2;
+            match opcode {
+                OPCODE_CREATE_BUFFER => cursor += 12,
+                OPCODE_WRITE_BUFFER => cursor += 16,
+                OPCODE_CREATE_TEXTURE => cursor += 20,
+                OPCODE_CREATE_PIPELINE => cursor += 32,
+                OPCODE_COPY_TEXTURE_TO_BUFFER => cursor += 24,
+                OPCODE_RENDER_PASS => {
+                    // Exactly 44-byte record
+                    let packed_target = u32::from_le_bytes(wasm_bytes[cursor..cursor + 4].try_into().unwrap());
+                    let target_id = u32::from_le_bytes(wasm_bytes[cursor + 4..cursor + 8].try_into().unwrap());
+                    let pipeline_id = u32::from_le_bytes(wasm_bytes[cursor + 24..cursor + 28].try_into().unwrap());
+                    let vertex_buffer_id = u32::from_le_bytes(wasm_bytes[cursor + 28..cursor + 32].try_into().unwrap());
+                    let vertex_count = u32::from_le_bytes(wasm_bytes[cursor + 32..cursor + 36].try_into().unwrap());
+                    let dynamic_offset = u32::from_le_bytes(wasm_bytes[cursor + 36..cursor + 40].try_into().unwrap());
+                    let uniform_buffer_id = u32::from_le_bytes(wasm_bytes[cursor + 40..cursor + 44].try_into().unwrap());
+
+                    assert!(validate_target_type(packed_target));
+                    assert_eq!(pipeline_id, 200);
+                    assert_eq!(vertex_count, 3);
+                    assert_eq!(uniform_buffer_id, 1);
+
+                    match render_pass_index {
+                        0 => {
+                            // Pass 1: Target 10, Clear, Store, NewPass, dynamic offset 0, vb 2
+                            assert_eq!(target_id, 10);
+                            assert_eq!(unpack_target_kind(packed_target), TARGET_OFFSCREEN);
+                            assert_eq!(unpack_load_op(packed_target), LOAD_OP_CLEAR);
+                            assert_eq!(unpack_store_op(packed_target), STORE_OP_STORE);
+                            assert_eq!(unpack_pass_flags(packed_target), PASS_FLAG_NEW_PASS);
+                            assert_eq!(dynamic_offset, 0);
+                            assert_eq!(vertex_buffer_id, 2);
+                        }
+                        1 => {
+                            // Pass 2: Target 11, Clear, Store, NewPass, dynamic offset 512, vb 2
+                            assert_eq!(target_id, 11);
+                            assert_eq!(unpack_target_kind(packed_target), TARGET_OFFSCREEN);
+                            assert_eq!(unpack_load_op(packed_target), LOAD_OP_CLEAR);
+                            assert_eq!(unpack_store_op(packed_target), STORE_OP_STORE);
+                            assert_eq!(unpack_pass_flags(packed_target), PASS_FLAG_NEW_PASS);
+                            assert_eq!(dynamic_offset, 512);
+                            assert_eq!(vertex_buffer_id, 2);
+                        }
+                        2 => {
+                            // Pass 3: Target 10, LOAD, Store, NewPass, dynamic offset 256, vb 3
+                            assert_eq!(target_id, 10);
+                            assert_eq!(unpack_target_kind(packed_target), TARGET_OFFSCREEN);
+                            assert_eq!(unpack_load_op(packed_target), LOAD_OP_LOAD);
+                            assert_eq!(unpack_store_op(packed_target), STORE_OP_STORE);
+                            assert_eq!(unpack_pass_flags(packed_target), PASS_FLAG_NEW_PASS);
+                            assert_eq!(dynamic_offset, 256);
+                            assert_eq!(vertex_buffer_id, 3);
+                        }
+                        _ => panic!("unexpected render pass index {render_pass_index}"),
+                    }
+                    render_pass_index += 1;
+                    cursor += 44;
+                }
+                other => panic!("unexpected opcode {other} at cursor {cursor}"),
+            }
+        }
+        assert_eq!(render_pass_index, 3);
+
+        // Mathematical verification of pixel sample points on 64x64 offscreen target
+        // Viewport mapping: pixel center (px + 0.5, py + 0.5) to NDC (x_ndc, y_ndc)
+        let pixel_to_ndc = |px: u32, py: u32| -> [f32; 2] {
+            let x = ((px as f32 + 0.5) / 64.0) * 2.0 - 1.0;
+            let y = 1.0 - ((py as f32 + 0.5) / 64.0) * 2.0;
+            [x, y]
+        };
+
+        let ndc_to_pixel = |x: f32, y: f32| -> (u32, u32) {
+            let px = ((x + 1.0) * 0.5 * 64.0 - 0.5).round() as u32;
+            let py = ((1.0 - y) * 0.5 * 64.0 - 0.5).round() as u32;
+            (px, py)
+        };
+
+        // Cross-product point-in-triangle test (counter-clockwise orientation)
+        let point_in_tri = |p: [f32; 2], a: [f32; 2], b: [f32; 2], c: [f32; 2]| -> bool {
+            let cross = |p1: [f32; 2], p2: [f32; 2], p3: [f32; 2]| -> f32 {
+                (p2[0] - p1[0]) * (p3[1] - p1[1]) - (p2[1] - p1[1]) * (p3[0] - p1[0])
+            };
+            let d1 = cross(a, b, p);
+            let d2 = cross(b, c, p);
+            let d3 = cross(c, a, p);
+            let has_neg = (d1 < 0.0) || (d2 < 0.0) || (d3 < 0.0);
+            let has_pos = (d1 > 0.0) || (d2 > 0.0) || (d3 > 0.0);
+            !(has_neg && has_pos)
+        };
+
+        // Tri 1: (-1, -1) -> (0, -1) -> (0, 1) (covers x in [-1, 0], y in [-1, 2x+1])
+        let tri1_a = [-1.0f32, -1.0f32];
+        let tri1_b = [0.0f32, -1.0f32];
+        let tri1_c = [0.0f32, 1.0f32];
+
+        // Tri 2: (0, -1) -> (1, -1) -> (1, 1) (covers x in [0, 1], y in [-1, 2x-1])
+        let tri2_a = [0.0f32, -1.0f32];
+        let tri2_b = [1.0f32, -1.0f32];
+        let tri2_c = [1.0f32, 1.0f32];
+
+        // 1. Pixel (24, 32): inside left triangle (tri1) -> Red [255, 0, 0, 255]
+        let p24_32 = pixel_to_ndc(24, 32);
+        assert_eq!(ndc_to_pixel(p24_32[0], p24_32[1]), (24, 32));
+        assert!(point_in_tri(p24_32, tri1_a, tri1_b, tri1_c));
+        assert!(!point_in_tri(p24_32, tri2_a, tri2_b, tri2_c));
+
+        // 2. Pixel (56, 32): inside right triangle (tri2) -> Blue [0, 0, 255, 255]
+        let p56_32 = pixel_to_ndc(56, 32);
+        assert_eq!(ndc_to_pixel(p56_32[0], p56_32[1]), (56, 32));
+        assert!(point_in_tri(p56_32, tri2_a, tri2_b, tri2_c));
+        assert!(!point_in_tri(p56_32, tri1_a, tri1_b, tri1_c));
+
+        // 3. Pixel (2, 2): outside both triangles -> Black [0, 0, 0, 255]
+        let p2_2 = pixel_to_ndc(2, 2);
+        assert_eq!(ndc_to_pixel(p2_2[0], p2_2[1]), (2, 2));
+        assert!(!point_in_tri(p2_2, tri1_a, tri1_b, tri1_c));
+        assert!(!point_in_tri(p2_2, tri2_a, tri2_b, tri2_c));
+    }
+
+    #[test]
+    fn test_nested_canvas_pass_packet_and_epoch_attachment() {
+        let _slot_lock = match TEST_SLOT_TABLE_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        // 1. Verify that canonical alias matches primary export byte-for-byte
+        let wasm_bytes = gpu_bridge_build_nested_canvas_pass_packet();
+        let canonical_bytes = f3d_build_nested_canvas_pass_packet();
+        assert_eq!(wasm_bytes, canonical_bytes);
+        assert!(wasm_bytes.len() >= 16);
+
+        // Header verification: Magic F3DG, version 1, total 14 commands
+        assert_eq!(&wasm_bytes[0..4], b"F3DG");
+        assert_eq!(u16::from_le_bytes(wasm_bytes[4..6].try_into().unwrap()), 1);
+        assert_eq!(u16::from_le_bytes(wasm_bytes[6..8].try_into().unwrap()), 14);
+
+        // 2. Verify command structure in GpuSubmissionPacket
+        let packet = build_nested_canvas_pass_submission();
+        assert_eq!(packet.commands().len(), 14);
+
+        // Generational slot table verification:
+        // All canvas pass resources (buffers 1, 2, 3, 20, textures 10, 11, pipelines 200, 201) are active at generation 1
+        for &id in &[1, 2, 3, 10, 11, 20, 200, 201] {
+            assert_eq!(check_resource_handle(id, 1), Ok(true));
+            assert!(gpu_bridge_check_resource_handle(id, 1));
+            assert!(f3d_check_resource_handle(id, 1));
+        }
+
+        // Commands 0..4: Buffers
+        match &packet.commands()[0] {
+            GpuCommand::CreateBuffer { buffer_id, size, usage } => {
+                assert_eq!(*buffer_id, 1);
+                assert_eq!(*size, 768);
+                assert_eq!(*usage, BUFFER_USAGE_UNIFORM | BUFFER_USAGE_COPY_DST);
+            }
+            other => panic!("expected CreateBuffer at 0, got {other:?}"),
+        }
+        match &packet.commands()[1] {
+            GpuCommand::CreateBuffer { buffer_id, size, usage } => {
+                assert_eq!(*buffer_id, 2);
+                assert_eq!(*size, 60);
+                assert_eq!(*usage, BUFFER_USAGE_VERTEX | BUFFER_USAGE_COPY_DST);
+            }
+            other => panic!("expected CreateBuffer at 1, got {other:?}"),
+        }
+        match &packet.commands()[2] {
+            GpuCommand::WriteBuffer { buffer_id, offset, data } => {
+                assert_eq!(*buffer_id, 2);
+                assert_eq!(*offset, 0);
+                assert_eq!(data.len(), 60);
+            }
+            other => panic!("expected WriteBuffer at 2, got {other:?}"),
+        }
+        match &packet.commands()[3] {
+            GpuCommand::CreateBuffer { buffer_id, size, usage } => {
+                assert_eq!(*buffer_id, 3);
+                assert_eq!(*size, 60);
+                assert_eq!(*usage, BUFFER_USAGE_VERTEX | BUFFER_USAGE_COPY_DST);
+            }
+            other => panic!("expected CreateBuffer at 3, got {other:?}"),
+        }
+        match &packet.commands()[4] {
+            GpuCommand::WriteBuffer { buffer_id, offset, data } => {
+                assert_eq!(*buffer_id, 3);
+                assert_eq!(*offset, 0);
+                assert_eq!(data.len(), 60);
+            }
+            other => panic!("expected WriteBuffer at 4, got {other:?}"),
+        }
+
+        // Command 5: Offscreen texture Target 11 (Canvas Target 10 is NOT created as an offscreen texture)
+        match &packet.commands()[5] {
+            GpuCommand::CreateTexture { texture_id, width, height, format, usage } => {
+                assert_eq!(*texture_id, 11);
+                assert_eq!(*width, 64);
+                assert_eq!(*height, 64);
+                assert_eq!(*format, TARGET_FORMAT_RGBA8UNORM);
+                assert_eq!(*usage, TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC);
+            }
+            other => panic!("expected CreateTexture at 5, got {other:?}"),
+        }
+
+        // Command 6: Readback buffer 20 for Target 11
+        match &packet.commands()[6] {
+            GpuCommand::CreateBuffer { buffer_id, size, usage } => {
+                assert_eq!(*buffer_id, 20);
+                assert_eq!(*size, 16384);
+                assert_eq!(*usage, BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST);
+            }
+            other => panic!("expected CreateBuffer at 6, got {other:?}"),
+        }
+
+        // Command 7: Pipeline 200 for offscreen target (RGBA8Unorm)
+        match &packet.commands()[7] {
+            GpuCommand::CreatePipeline { pipeline_id, target_format, .. } => {
+                assert_eq!(*pipeline_id, 200);
+                assert_eq!(*target_format, TARGET_FORMAT_RGBA8UNORM);
+            }
+            other => panic!("expected CreatePipeline at 7, got {other:?}"),
+        }
+
+        // Command 8: Pipeline 201 for canvas target (PREFERRED_CANVAS)
+        match &packet.commands()[8] {
+            GpuCommand::CreatePipeline { pipeline_id, target_format, .. } => {
+                assert_eq!(*pipeline_id, 201);
+                assert_eq!(*target_format, TARGET_FORMAT_PREFERRED_CANVAS);
+            }
+            other => panic!("expected CreatePipeline at 8, got {other:?}"),
+        }
+
+        // Command 9: WriteBuffer (uniform arena from FrameSession)
+        match &packet.commands()[9] {
+            GpuCommand::WriteBuffer { buffer_id, offset, data } => {
+                assert_eq!(*buffer_id, 1);
+                assert_eq!(*offset, 0);
+                assert_eq!(data.len(), 768);
+                // Verify uniform snapshot values:
+                // Red [1.0, 0.0, 0.0, 1.0] at 0
+                assert_eq!(f32::from_le_bytes(data[0..4].try_into().unwrap()), 1.0);
+                assert_eq!(f32::from_le_bytes(data[4..8].try_into().unwrap()), 0.0);
+                assert_eq!(f32::from_le_bytes(data[8..12].try_into().unwrap()), 0.0);
+                assert_eq!(f32::from_le_bytes(data[12..16].try_into().unwrap()), 1.0);
+                // Blue [0.0, 0.0, 1.0, 1.0] at 256
+                assert_eq!(f32::from_le_bytes(data[256..260].try_into().unwrap()), 0.0);
+                assert_eq!(f32::from_le_bytes(data[260..264].try_into().unwrap()), 0.0);
+                assert_eq!(f32::from_le_bytes(data[264..268].try_into().unwrap()), 1.0);
+                assert_eq!(f32::from_le_bytes(data[268..272].try_into().unwrap()), 1.0);
+                // Green [0.0, 1.0, 0.0, 1.0] at 512
+                assert_eq!(f32::from_le_bytes(data[512..516].try_into().unwrap()), 0.0);
+                assert_eq!(f32::from_le_bytes(data[516..520].try_into().unwrap()), 1.0);
+                assert_eq!(f32::from_le_bytes(data[520..524].try_into().unwrap()), 0.0);
+                assert_eq!(f32::from_le_bytes(data[524..528].try_into().unwrap()), 1.0);
+            }
+            other => panic!("expected WriteBuffer at 9, got {other:?}"),
+        }
+
+        // Command 10: RenderPass Pass 1 (Canvas Target 10, Clear, NEW_PASS, Pipeline 201, vb1, offset 0)
+        match &packet.commands()[10] {
+            GpuCommand::RenderPass {
+                target_type,
+                target_id,
+                load_op,
+                store_op,
+                pass_flags,
+                pipeline_id,
+                vertex_buffer_id,
+                vertex_count,
+                uniform_dynamic_offset,
+                uniform_buffer_id,
+                ..
+            } => {
+                assert_eq!(*target_type, TARGET_CANVAS);
+                assert_eq!(*target_id, 10);
+                assert_eq!(*load_op, LOAD_OP_CLEAR);
+                assert_eq!(*store_op, STORE_OP_STORE);
+                assert_eq!(*pass_flags, PASS_FLAG_NEW_PASS);
+                assert_eq!(*pipeline_id, 201);
+                assert_eq!(*vertex_buffer_id, 2);
+                assert_eq!(*vertex_count, 3);
+                assert_eq!(*uniform_dynamic_offset, 0);
+                assert_eq!(*uniform_buffer_id, 1);
+            }
+            other => panic!("expected RenderPass at 10, got {other:?}"),
+        }
+
+        // Command 11: RenderPass Pass 2 (Offscreen Target 11, Clear, NEW_PASS, Pipeline 200, vb1, offset 512)
+        match &packet.commands()[11] {
+            GpuCommand::RenderPass {
+                target_type,
+                target_id,
+                load_op,
+                store_op,
+                pass_flags,
+                pipeline_id,
+                vertex_buffer_id,
+                vertex_count,
+                uniform_dynamic_offset,
+                uniform_buffer_id,
+                ..
+            } => {
+                assert_eq!(*target_type, TARGET_OFFSCREEN);
+                assert_eq!(*target_id, 11);
+                assert_eq!(*load_op, LOAD_OP_CLEAR);
+                assert_eq!(*store_op, STORE_OP_STORE);
+                assert_eq!(*pass_flags, PASS_FLAG_NEW_PASS);
+                assert_eq!(*pipeline_id, 200);
+                assert_eq!(*vertex_buffer_id, 2);
+                assert_eq!(*vertex_count, 3);
+                assert_eq!(*uniform_dynamic_offset, 512);
+                assert_eq!(*uniform_buffer_id, 1);
+            }
+            other => panic!("expected RenderPass at 11, got {other:?}"),
+        }
+
+        // Command 12: RenderPass Pass 3 (Canvas Target 10, LOAD, NEW_PASS, Pipeline 201, vb2, offset 256)
+        match &packet.commands()[12] {
+            GpuCommand::RenderPass {
+                target_type,
+                target_id,
+                load_op,
+                store_op,
+                pass_flags,
+                pipeline_id,
+                vertex_buffer_id,
+                vertex_count,
+                uniform_dynamic_offset,
+                uniform_buffer_id,
+                ..
+            } => {
+                assert_eq!(*target_type, TARGET_CANVAS);
+                assert_eq!(*target_id, 10);
+                assert_eq!(*load_op, LOAD_OP_LOAD);
+                assert_eq!(*store_op, STORE_OP_STORE);
+                assert_eq!(*pass_flags, PASS_FLAG_NEW_PASS);
+                assert_eq!(*pipeline_id, 201);
+                assert_eq!(*vertex_buffer_id, 3);
+                assert_eq!(*vertex_count, 3);
+                assert_eq!(*uniform_dynamic_offset, 256);
+                assert_eq!(*uniform_buffer_id, 1);
+            }
+            other => panic!("expected RenderPass at 12, got {other:?}"),
+        }
+
+        // Command 13: CopyTextureToBuffer (Target 11 -> Buffer 20)
+        match &packet.commands()[13] {
+            GpuCommand::CopyTextureToBuffer {
+                texture_id,
+                buffer_id,
+                width,
+                height,
+                ..
+            } => {
+                assert_eq!(*texture_id, 11);
+                assert_eq!(*buffer_id, 20);
+                assert_eq!(*width, 64);
+                assert_eq!(*height, 64);
+            }
+            other => panic!("expected CopyTextureToBuffer at 13, got {other:?}"),
+        }
+
+        // 3. Verify wire encoding: iterate commands from offset 16 and verify 44-byte RenderPass records
+        let mut cursor = 16usize;
+        let mut render_pass_index = 0;
+        for _ in 0..14 {
+            let opcode = u16::from_le_bytes(wasm_bytes[cursor..cursor + 2].try_into().unwrap());
+            cursor += 2;
+            match opcode {
+                OPCODE_CREATE_BUFFER => cursor += 12,
+                OPCODE_WRITE_BUFFER => cursor += 16,
+                OPCODE_CREATE_TEXTURE => cursor += 20,
+                OPCODE_CREATE_PIPELINE => cursor += 32,
+                OPCODE_COPY_TEXTURE_TO_BUFFER => cursor += 24,
+                OPCODE_RENDER_PASS => {
+                    let packed_target = u32::from_le_bytes(wasm_bytes[cursor..cursor + 4].try_into().unwrap());
+                    let target_id = u32::from_le_bytes(wasm_bytes[cursor + 4..cursor + 8].try_into().unwrap());
+                    let pipeline_id = u32::from_le_bytes(wasm_bytes[cursor + 24..cursor + 28].try_into().unwrap());
+                    let vertex_buffer_id = u32::from_le_bytes(wasm_bytes[cursor + 28..cursor + 32].try_into().unwrap());
+                    let vertex_count = u32::from_le_bytes(wasm_bytes[cursor + 32..cursor + 36].try_into().unwrap());
+                    let dynamic_offset = u32::from_le_bytes(wasm_bytes[cursor + 36..cursor + 40].try_into().unwrap());
+                    let uniform_buffer_id = u32::from_le_bytes(wasm_bytes[cursor + 40..cursor + 44].try_into().unwrap());
+
+                    assert!(validate_target_type(packed_target));
+                    assert_eq!(vertex_count, 3);
+                    assert_eq!(uniform_buffer_id, 1);
+
+                    match render_pass_index {
+                        0 => {
+                            // Pass 1: Canvas Target 10, Clear, Store, NewPass, pipeline 201, offset 0, vb 2
+                            assert_eq!(target_id, 10);
+                            assert_eq!(unpack_target_kind(packed_target), TARGET_CANVAS);
+                            assert_eq!(unpack_load_op(packed_target), LOAD_OP_CLEAR);
+                            assert_eq!(unpack_store_op(packed_target), STORE_OP_STORE);
+                            assert_eq!(unpack_pass_flags(packed_target), PASS_FLAG_NEW_PASS);
+                            assert_eq!(pipeline_id, 201);
+                            assert_eq!(dynamic_offset, 0);
+                            assert_eq!(vertex_buffer_id, 2);
+                        }
+                        1 => {
+                            // Pass 2: Offscreen Target 11, Clear, Store, NewPass, pipeline 200, offset 512, vb 2
+                            assert_eq!(target_id, 11);
+                            assert_eq!(unpack_target_kind(packed_target), TARGET_OFFSCREEN);
+                            assert_eq!(unpack_load_op(packed_target), LOAD_OP_CLEAR);
+                            assert_eq!(unpack_store_op(packed_target), STORE_OP_STORE);
+                            assert_eq!(unpack_pass_flags(packed_target), PASS_FLAG_NEW_PASS);
+                            assert_eq!(pipeline_id, 200);
+                            assert_eq!(dynamic_offset, 512);
+                            assert_eq!(vertex_buffer_id, 2);
+                        }
+                        2 => {
+                            // Pass 3: Canvas Target 10, LOAD, Store, NewPass, pipeline 201, offset 256, vb 3
+                            assert_eq!(target_id, 10);
+                            assert_eq!(unpack_target_kind(packed_target), TARGET_CANVAS);
+                            assert_eq!(unpack_load_op(packed_target), LOAD_OP_LOAD);
+                            assert_eq!(unpack_store_op(packed_target), STORE_OP_STORE);
+                            assert_eq!(unpack_pass_flags(packed_target), PASS_FLAG_NEW_PASS);
+                            assert_eq!(pipeline_id, 201);
+                            assert_eq!(dynamic_offset, 256);
+                            assert_eq!(vertex_buffer_id, 3);
+                        }
+                        _ => panic!("unexpected render pass index {render_pass_index}"),
+                    }
+                    render_pass_index += 1;
+                    cursor += 44;
+                }
+                other => panic!("unexpected opcode {other} at cursor {cursor}"),
+            }
+        }
+        assert_eq!(render_pass_index, 3);
+
+        // 4. Assert underlying ExecutionPlan segment and attachment epoch stamping
+        let target_10 = 10;
+        let target_11 = 11;
+        let mut tracker = CanvasEpochTracker::new();
+        tracker.register_canvas(
+            CanvasId::new(target_10),
+            ResourceId::new(target_10),
+            64,
+            64,
+            CanvasFormat::Bgra8Unorm,
+        );
+        let canvas_output = tracker
+            .begin_frame_acquire(CanvasId::new(target_10))
+            .expect("canvas acquire");
+
+        let root_ctx = RenderContext::new_canvas_acquired(
+            ResourceId::new(target_10),
+            64,
+            64,
+            Epoch::new(1),
+            canvas_output.epoch,
+        );
+        let mut session = FrameSession::new(root_ctx, 256)
+            .expect("session init")
+            .with_uniform_buffer_id(1);
+
+        let mat_handle = Handle::<MaterialDomain>::from_raw(1, 1).expect("valid handle");
+        let red_bytes = [1.0f32.to_le_bytes(), 0.0f32.to_le_bytes(), 0.0f32.to_le_bytes(), 1.0f32.to_le_bytes()].concat();
+        let blue_bytes = [0.0f32.to_le_bytes(), 0.0f32.to_le_bytes(), 1.0f32.to_le_bytes(), 1.0f32.to_le_bytes()].concat();
+        let green_bytes = [0.0f32.to_le_bytes(), 1.0f32.to_le_bytes(), 0.0f32.to_le_bytes(), 1.0f32.to_le_bytes()].concat();
+
+        let rec_red = session
+            .snapshot_material_use(mat_handle, DataVersion::new(1), Epoch::ZERO, &red_bytes)
+            .expect("snapshot red");
+        let rec_blue = session
+            .snapshot_material_use(mat_handle, DataVersion::new(2), Epoch::ZERO, &blue_bytes)
+            .expect("snapshot blue");
+        let rec_green = session
+            .snapshot_material_use(mat_handle, DataVersion::new(3), Epoch::ZERO, &green_bytes)
+            .expect("snapshot green");
+
+        session.begin_render_pass("canvas_prefix", [0.0, 0.0, 0.0, 1.0]).expect("begin canvas prefix");
+        session.record_direct_draw(201, 2, 3, Some(rec_red)).expect("draw red");
+
+        let nested_ctx = RenderContext::new_offscreen(
+            ResourceId::new(target_11),
+            64,
+            64,
+            Epoch::ZERO,
+        );
+        session
+            .with_nested_render(nested_ctx, |s| {
+                s.begin_render_pass("nested_pass", [0.0, 0.0, 0.0, 1.0]).expect("begin nested pass");
+                s.record_direct_draw(200, 2, 3, Some(rec_green)).expect("draw green");
+                s.end_render_pass().expect("end nested pass");
+                Ok(())
+            })
+            .expect("nested render");
+
+        session.record_direct_draw(201, 3, 3, Some(rec_blue)).expect("draw blue");
+        session.end_render_pass().expect("end resumed pass");
+
+        let plan = session.pass_graph().compile(Some(&tracker)).expect("compile plan");
+        assert_eq!(plan.canvas_epoch(), Some(canvas_output.epoch));
+        assert_eq!(plan.segment_count(), 3);
+
+        let seg0 = &plan.segments()[0];
+        let seg1 = &plan.segments()[1];
+        let seg2 = &plan.segments()[2];
+
+        assert_eq!(seg0.name(), "canvas_prefix");
+        assert_eq!(seg1.name(), "nested_pass");
+        assert_eq!(seg2.name(), "canvas_prefix_resumed");
+
+        let ca0 = seg0.primary_color_attachment().unwrap();
+        assert!(ca0.is_canvas());
+        assert_eq!(ca0.target_id(), ResourceId::new(10));
+        assert_eq!(ca0.load_op(), LoadOp::Clear);
+        assert_eq!(ca0.store_op(), StoreOp::Store);
+        assert_eq!(ca0.canvas_epoch(), Some(canvas_output.epoch));
+
+        let ca1 = seg1.primary_color_attachment().unwrap();
+        assert!(!ca1.is_canvas());
+        assert_eq!(ca1.target_id(), ResourceId::new(11));
+        assert_eq!(ca1.load_op(), LoadOp::Clear);
+        assert_eq!(ca1.store_op(), StoreOp::Store);
+        assert_eq!(ca1.canvas_epoch(), None);
+
+        let ca2 = seg2.primary_color_attachment().unwrap();
+        assert!(ca2.is_canvas());
+        assert_eq!(ca2.target_id(), ResourceId::new(10));
+        assert_eq!(ca2.load_op(), LoadOp::Load);
+        assert_eq!(ca2.store_op(), StoreOp::Store);
+        assert_eq!(ca2.canvas_epoch(), Some(canvas_output.epoch));
+
+        // 5. Mathematical verification of pixel sample points on 64x64 targets:
+        // Target 11 (offscreen, readback buffer 20):
+        // Only nested_pass executes on Target 11, drawing tri1 with Green [0, 255, 0, 255].
+        // (24, 32) is inside tri1 -> Green
+        // (56, 32) is outside tri1 -> Black (clear color)
+        // (2, 2) is outside tri1 -> Black (clear color)
+        let pixel_to_ndc = |px: u32, py: u32| -> [f32; 2] {
+            let x = ((px as f32 + 0.5) / 64.0) * 2.0 - 1.0;
+            let y = 1.0 - ((py as f32 + 0.5) / 64.0) * 2.0;
+            [x, y]
+        };
+
+        let point_in_tri = |p: [f32; 2], a: [f32; 2], b: [f32; 2], c: [f32; 2]| -> bool {
+            let cross = |p1: [f32; 2], p2: [f32; 2], p3: [f32; 2]| -> f32 {
+                (p2[0] - p1[0]) * (p3[1] - p1[1]) - (p2[1] - p1[1]) * (p3[0] - p1[0])
+            };
+            let d1 = cross(a, b, p);
+            let d2 = cross(b, c, p);
+            let d3 = cross(c, a, p);
+            let has_neg = (d1 < 0.0) || (d2 < 0.0) || (d3 < 0.0);
+            let has_pos = (d1 > 0.0) || (d2 > 0.0) || (d3 > 0.0);
+            !(has_neg && has_pos)
+        };
+
+        let tri1_a = [-1.0f32, -1.0f32];
+        let tri1_b = [0.0f32, -1.0f32];
+        let tri1_c = [0.0f32, 1.0f32];
+
+        let tri2_a = [0.0f32, -1.0f32];
+        let tri2_b = [1.0f32, -1.0f32];
+        let tri2_c = [1.0f32, 1.0f32];
+
+        // Target 11 samples:
+        let p24_32 = pixel_to_ndc(24, 32);
+        assert!(point_in_tri(p24_32, tri1_a, tri1_b, tri1_c));
+        assert!(!point_in_tri(p24_32, tri2_a, tri2_b, tri2_c));
+
+        let p56_32 = pixel_to_ndc(56, 32);
+        assert!(!point_in_tri(p56_32, tri1_a, tri1_b, tri1_c));
+        assert!(point_in_tri(p56_32, tri2_a, tri2_b, tri2_c));
+
+        let p2_2 = pixel_to_ndc(2, 2);
+        assert!(!point_in_tri(p2_2, tri1_a, tri1_b, tri1_c));
+        assert!(!point_in_tri(p2_2, tri2_a, tri2_b, tri2_c));
+
+        // Note: For Canvas Target 10 (presented to swapchain):
+        // (24, 32) is drawn Red in Pass 1 and preserved via LoadOp::Load -> Red [255, 0, 0, 255]
+        // (56, 32) is drawn Blue in Pass 3 -> Blue [0, 0, 255, 255]
+        // (2, 2) is unpainted -> Black [0, 0, 0, 255]
     }
 }
