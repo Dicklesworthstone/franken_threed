@@ -315,6 +315,37 @@ export class RendererConstructionRouter {
       );
     }
 
+    // 6.5 Post-construction registration of internally-created canvas (Plan §3.4, §6.9, Bead 6mv.5).
+    // For known native result own data properties, inspect descriptor/value directly without invoking
+    // observable getters on subclasses or factories, preserving throwing/missing getter contracts.
+    let exposedCanvas = null;
+    const ownDomDesc = Object.getOwnPropertyDescriptor(instance, 'domElement');
+    if (ownDomDesc && 'value' in ownDomDesc && typeof ownDomDesc.value === 'object' && ownDomDesc.value !== null) {
+      exposedCanvas = ownDomDesc.value;
+    } else {
+      const ownBackendDesc = Object.getOwnPropertyDescriptor(instance, 'backend');
+      if (ownBackendDesc && 'value' in ownBackendDesc && ownBackendDesc.value && typeof ownBackendDesc.value === 'object') {
+        const backendDomDesc = Object.getOwnPropertyDescriptor(ownBackendDesc.value, 'domElement');
+        if (backendDomDesc && 'value' in backendDomDesc && typeof backendDomDesc.value === 'object' && backendDomDesc.value !== null) {
+          exposedCanvas = backendDomDesc.value;
+        }
+      }
+    }
+
+    if (exposedCanvas) {
+      const lockEntry = {
+        route: resolved.route,
+        rendererId,
+        sourceSpan,
+      };
+      if (!this._canvasLocks.has(exposedCanvas)) {
+        this._canvasLocks.set(exposedCanvas, lockEntry);
+      }
+      if (!GLOBAL_CANVAS_OBJECT_LOCKS.has(exposedCanvas)) {
+        GLOBAL_CANVAS_OBJECT_LOCKS.set(exposedCanvas, lockEntry);
+      }
+    }
+
     // 7. Store decision record and diagnostics externally in WeakMaps to preserve native object shape
     const decisionRecord = Object.freeze({
       rendererId,

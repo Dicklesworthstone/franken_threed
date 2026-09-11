@@ -62,7 +62,8 @@ export const MIME_TYPES = {
 export function generateRoutedWebGPUSource(options = {}) {
   const importBase = (options.importBase || '').replace(/\/+$/, '');
   const webgpuModulePath = `${importBase}/upstream/three.js/build/three.webgpu.js`;
-  const compatModulePath = `${importBase}/tools/compat/index.mjs`;
+  const routeTypesModulePath = `${importBase}/tools/compat/route_types.mjs`;
+  const constructionAdapterModulePath = `${importBase}/tools/compat/construction_adapter.mjs`;
 
   return `/**
  * FrankenThreeD Compatibility Facade: three/webgpu
@@ -72,10 +73,8 @@ export function generateRoutedWebGPUSource(options = {}) {
  */
 
 import * as UpstreamThreeWebGPU from '${webgpuModulePath}';
-import {
-  RendererConstructionRouter,
-  ExecutionRoute,
-} from '${compatModulePath}';
+import { ExecutionRoute } from '${routeTypesModulePath}';
+import { RendererConstructionRouter } from '${constructionAdapterModulePath}';
 
 // 1. Re-export all members from upstream three.webgpu.js
 export * from '${webgpuModulePath}';

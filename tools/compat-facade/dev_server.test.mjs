@@ -140,6 +140,10 @@ test('Dev Server: Lifecycle, HTTP responses, and H1 delivery', async () => {
     assert.equal(ast.type, 'Program');
     assert.ok(webgpuSource.includes('WebGPURenderer'));
     assert.ok(webgpuSource.includes('RendererConstructionRouter'));
+    assert.ok(webgpuSource.includes('tools/compat/route_types.mjs'), 'Must directly import route_types.mjs');
+    assert.ok(webgpuSource.includes('tools/compat/construction_adapter.mjs'), 'Must directly import construction_adapter.mjs');
+    assert.ok(!webgpuSource.includes('tools/compat/index.mjs'), 'Must not import barrel index.mjs');
+    assert.ok(!webgpuSource.includes('three.module.js'), 'Must not import three.module.js');
 
     // 5. GET /compat-facade/three.js
     const threeRes = await fetch(`${url}/compat-facade/three.js`);
@@ -297,6 +301,24 @@ test('Generated WebGPU Facade Module: Evaluation, Proxy constructor adapter, ins
     'Generated source must not assign to WebGPURenderer.prototype (non-writable ES class prototype)'
   );
 
+  // Require direct routing module imports and absence of gratuitous three.module load
+  assert.ok(
+    generatedSource.includes('/tools/compat/route_types.mjs'),
+    'Generated source must directly import route_types.mjs'
+  );
+  assert.ok(
+    generatedSource.includes('/tools/compat/construction_adapter.mjs'),
+    'Generated source must directly import construction_adapter.mjs'
+  );
+  assert.ok(
+    !generatedSource.includes('/tools/compat/index.mjs'),
+    'Generated source must not import barrel tools/compat/index.mjs (prevents gratuitous WebGL three.module.js load)'
+  );
+  assert.ok(
+    !generatedSource.includes('three.module.js'),
+    'Generated source must not import three.module.js (preserves RNG sequence parity with reference)'
+  );
+
   // 2. Dynamically import the actual generated module via data: URL
   const dataUri = 'data:text/javascript;base64,' + Buffer.from(generatedSource).toString('base64');
   const facadeModule = await import(dataUri);
@@ -377,6 +399,82 @@ test('Generated WebGPU Facade Module: Evaluation, Proxy constructor adapter, ins
   assert.ok(decisions.length >= 3, 'Router must have logged decisions for all constructions');
   assert.equal(decisions[0].site, 'WebGPURenderer');
   assert.equal(decisions[0].span, 'webgpu_performance_renderbundle.html:188:13');
+
+  // 8. Test canvas exposure route locking and getter preservation (Plan §3.4, §6.9, Bead 6mv.5)
+  // Auto-created canvas is registered post-construction via descriptor inspection without invoking
+  // observable getters on subclasses or factories, and preserves throwing getter contracts.
+  const origDoc = globalThis.document;
+  try {
+    globalThis.document = {
+      createElementNS: () => ({
+        style: {},
+        addEventListener: () => {},
+        removeEventListener: () => {},
+        getContext: () => null,
+        setAttribute: () => {},
+      }),
+      createElement: () => ({
+        style: {},
+        addEventListener: () => {},
+        removeEventListener: () => {},
+        getContext: () => null,
+        setAttribute: () => {},
+      }),
+    };
+
+    // 8a. Observable getter counting subclass: construction must NOT invoke getter
+    let subclassGetterCount = 0;
+    class ObservableSubclass extends facadeModule.WebGPURenderer {
+      get domElement() {
+        subclassGetterCount++;
+        return super.domElement;
+      }
+    }
+
+    const sub = new ObservableSubclass({ antialias: true, forceWebGL: false });
+    assert.equal(subclassGetterCount, 0, 'Construction must NOT invoke observable domElement getter on subclass');
+
+    const exposedDomElement = sub.domElement;
+    assert.equal(subclassGetterCount, 1, 'Accessing sub.domElement invokes getter exactly once');
+    assert.ok(exposedDomElement && typeof exposedDomElement === 'object', 'Exposed canvas must be an object');
+    assert.equal(
+      facadeModule.router.getCanvasLock(exposedDomElement)?.route,
+      'retained-upstream',
+      'Exposed canvas must be locked to route upon construction'
+    );
+
+    // Conflicting route attempt on exposed canvas must throw RouteLockError
+    assert.throws(
+      () => {
+        new facadeModule.WebGPURenderer({
+          canvas: exposedDomElement,
+          forceWebGL: true,
+        });
+      },
+      {
+        name: 'RouteLockError',
+      },
+      'Constructing conflicting route on exposed canvas must throw RouteLockError'
+    );
+
+    // 8b. Throwing getter subclass: construction does not invoke getter; caller access faithfully throws
+    class ThrowingGetterSubclass extends facadeModule.WebGPURenderer {
+      get domElement() {
+        throw new Error('user intentional throw');
+      }
+    }
+
+    const throwingSub = new ThrowingGetterSubclass({ antialias: true, forceWebGL: false });
+    assert.ok(throwingSub, 'Construction must succeed without invoking throwing getter');
+    assert.throws(
+      () => { throwingSub.domElement; },
+      /user intentional throw/,
+      'Caller accessing throwingSub.domElement must faithfully receive original throw'
+    );
+  } finally {
+    if (origDoc) globalThis.document = origDoc;
+    else delete globalThis.document;
+  }
 });
 
 test('Served Module Graph Closure: Ingest tools resolve served H1 and Inspector reachable static imports with zero unresolved specifiers', async () => {
@@ -516,7 +614,7 @@ test('Served Module Graph Closure: Ingest tools resolve served H1 and Inspector 
     );
 
     // Verify significant reachable graph closure (facade, Inspector, OrbitControls, TSL, WebGPU, and Three core)
-    assert.ok(fetchedModules.length >= 30, `Expected at least 30 fetched modules, got ${fetchedModules.length}`);
+    assert.ok(fetchedModules.length >= 25, `Expected at least 25 fetched modules, got ${fetchedModules.length}`);
 
     // Verify key modules are present in the fetched set
     const fetchedPaths = new Set(fetchedModules.map(m => m.pathname));
@@ -527,6 +625,16 @@ test('Served Module Graph Closure: Ingest tools resolve served H1 and Inspector 
     assert.ok(fetchedPaths.has('/compat-facade/addons/inspector/RendererInspector.js'), 'Must fetch RendererInspector.js');
     assert.ok(fetchedPaths.has('/upstream/three.js/build/three.webgpu.js'), 'Must fetch upstream three.webgpu.js');
 
+    // Routing modules: direct routing modules present, gratuitous WebGL barrel absent
+    assert.ok(fetchedPaths.has('/tools/compat/route_types.mjs'), 'Must fetch route_types.mjs');
+    assert.ok(fetchedPaths.has('/tools/compat/construction_adapter.mjs'), 'Must fetch construction_adapter.mjs');
+    assert.ok(fetchedPaths.has('/tools/compat/connected_groups.mjs'), 'Must fetch connected_groups.mjs');
+    assert.ok(fetchedPaths.has('/tools/compat/route_decider.mjs'), 'Must fetch route_decider.mjs');
+    assert.ok(!fetchedPaths.has('/tools/compat/exact_backend.mjs'), 'Must NOT fetch exact_backend.mjs (prevents three.module load)');
+    assert.ok(!fetchedPaths.has('/tools/compat/index.mjs'), 'Must NOT fetch barrel index.mjs');
+    assert.ok(!fetchedPaths.has('/tools/compat/route_report.mjs'), 'Must NOT fetch route_report.mjs');
+    assert.ok(!fetchedPaths.has('/upstream/three.js/build/three.module.js'), 'Must NOT fetch three.module.js');
+
     // Inspector tabs
     assert.ok(fetchedPaths.has('/compat-facade/addons/inspector/tabs/Performance.js'), 'Must fetch Performance tab');
     assert.ok(fetchedPaths.has('/compat-facade/addons/inspector/tabs/Memory.js'), 'Must fetch Memory tab');
@@ -535,15 +643,6 @@ test('Served Module Graph Closure: Ingest tools resolve served H1 and Inspector 
     assert.ok(fetchedPaths.has('/compat-facade/addons/inspector/tabs/Settings.js'), 'Must fetch Settings tab');
     assert.ok(fetchedPaths.has('/compat-facade/addons/inspector/tabs/Viewer.js'), 'Must fetch Viewer tab');
     assert.ok(fetchedPaths.has('/compat-facade/addons/inspector/tabs/Timeline.js'), 'Must fetch Timeline tab');
-
-    // Compat router modules
-    assert.ok(fetchedPaths.has('/tools/compat/index.mjs'), 'Must fetch tools/compat/index.mjs');
-    assert.ok(fetchedPaths.has('/tools/compat/route_types.mjs'), 'Must fetch tools/compat/route_types.mjs');
-    assert.ok(fetchedPaths.has('/tools/compat/connected_groups.mjs'), 'Must fetch tools/compat/connected_groups.mjs');
-    assert.ok(fetchedPaths.has('/tools/compat/route_decider.mjs'), 'Must fetch tools/compat/route_decider.mjs');
-    assert.ok(fetchedPaths.has('/tools/compat/construction_adapter.mjs'), 'Must fetch tools/compat/construction_adapter.mjs');
-    assert.ok(fetchedPaths.has('/tools/compat/exact_backend.mjs'), 'Must fetch tools/compat/exact_backend.mjs');
-    assert.ok(fetchedPaths.has('/tools/compat/route_report.mjs'), 'Must fetch tools/compat/route_report.mjs');
 
     // 5. Asset References: Verify asset references surfaced by ingest analysis
     // H1 and Inspector modules make zero static asset references via new URL(..., import.meta.url)
@@ -1000,12 +1099,17 @@ test('Dynamic Import Closure: Dynamic import() sites reachable from served H1 an
     }
 
     // 2. Assert enumeration census of dynamic import sites
-    // Site 1: Settings.js:285 -> import(extUrl) [variable/nonliteral]
-    // Site 2: exact_backend.mjs:95 -> import('../../upstream/three.js/build/three.webgpu.js') [literal]
-    // Site 3: exact_backend.mjs:104 -> import('../../upstream/three.js/build/three.webgpu.js') [literal]
+    // With direct routing imports (no WebGL barrel), exact_backend.mjs is not loaded into H1 WebGPU graph.
+    // Dynamic import site in Settings.js:285 -> import(extUrl) [variable/nonliteral] is discovered.
     assert.ok(
-      dynamicImportSites.length >= 3,
-      `Reachable graph must contain at least 3 dynamic import() sites, found: ${dynamicImportSites.length}`
+      dynamicImportSites.length >= 1,
+      `Reachable graph must contain dynamic import() sites, found: ${dynamicImportSites.length}`
+    );
+
+    // Verify absence of gratuitous exact_backend dynamic import sites in WebGPU route
+    assert.ok(
+      !dynamicImportSites.some(s => s.referrerUrl.includes('/tools/compat/exact_backend.mjs')),
+      'WebGPU facade must not load exact_backend.mjs or its dynamic imports'
     );
 
     const settingsSite = dynamicImportSites.find(s => s.referrerUrl.includes('/inspector/tabs/Settings.js'));
@@ -1022,9 +1126,10 @@ test('Dynamic Import Closure: Dynamic import() sites reachable from served H1 an
     );
 
     // 3. Fetch each dynamic target through the dev server and assert 200 + JavaScript content-type
+    // (Settings.js declares 2 extension targets: ColorGrading and TSLGraph)
     assert.ok(
-      discoveredDynamicTargets.length >= 4,
-      `Must discover at least 4 dynamic targets (found ${discoveredDynamicTargets.length})`
+      discoveredDynamicTargets.length >= 2,
+      `Must discover at least 2 dynamic targets (found ${discoveredDynamicTargets.length})`
     );
 
     for (const target of discoveredDynamicTargets) {
@@ -1055,7 +1160,41 @@ test('Dynamic Import Closure: Dynamic import() sites reachable from served H1 an
   }
 });
 
+test('Module Isolation Guard: Generated WebGPU facade uses direct routing imports without loading three.module.js or invoking Math.random()', async () => {
+  const generatedSource = generateRoutedWebGPUSource({
+    importBase: 'file://' + REPO_ROOT,
+  });
 
+  // Verify explicit direct import paths in source
+  assert.ok(
+    generatedSource.includes('tools/compat/route_types.mjs'),
+    'Must import route_types.mjs directly'
+  );
+  assert.ok(
+    generatedSource.includes('tools/compat/construction_adapter.mjs'),
+    'Must import construction_adapter.mjs directly'
+  );
+  assert.ok(
+    !generatedSource.includes('tools/compat/index.mjs'),
+    'Barrel import tools/compat/index.mjs must be absent'
+  );
+  assert.ok(
+    !generatedSource.includes('three.module.js'),
+    'three.module.js must be absent to prevent RNG consumption shift'
+  );
 
-
-
+  // Verify direct imports do not execute Math.random() calls (no core singletons instantiated)
+  let rngCalls = 0;
+  const origRandom = Math.random;
+  Math.random = () => {
+    rngCalls++;
+    return origRandom();
+  };
+  try {
+    await import(path.resolve(REPO_ROOT, 'tools/compat/route_types.mjs'));
+    await import(path.resolve(REPO_ROOT, 'tools/compat/construction_adapter.mjs'));
+    assert.equal(rngCalls, 0, 'Direct routing imports must invoke Math.random() 0 times');
+  } finally {
+    Math.random = origRandom;
+  }
+});
