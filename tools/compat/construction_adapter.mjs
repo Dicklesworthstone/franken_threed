@@ -9,7 +9,7 @@
  * preserves native object shapes via external diagnostics, and guarantees single execution.
  */
 
-import { ExecutionRoute, RouteLockError, EscapeReason } from './route_types.mjs';
+import { ExecutionRoute, RouteLockError } from './route_types.mjs';
 import { ConnectedCompatibilityGroups } from './connected_groups.mjs';
 import { decideRendererRoute } from './route_decider.mjs';
 
@@ -208,16 +208,10 @@ export class RendererConstructionRouter {
     } else if (typeof constructorFn === 'function') {
       // An explicitly supplied constructorFn is invoked for the resolved route
       // when it matches the route's contract.
-      if (resolved.route === ExecutionRoute.EXACT_BACKEND && constructorName === 'WebGLRenderer') {
-        targetConstructor = constructorFn;
-      } else if (
-        resolved.route === ExecutionRoute.EXACT_BACKEND &&
-        constructorName === 'WebGPURenderer' &&
-        (options.forceWebGL || analysis?.forceWebGL || analysis?.options?.forceWebGL || resolved.reasons.includes(EscapeReason.EXPLICIT_SOURCE_SELECTION))
-      ) {
-        // H1 production route: WebGPURenderer({ forceWebGL: true }) natively selects
-        // WebGLBackend while preserving the WebGPURenderer constructor, prototype,
-        // node renderer, and inspector API. Do NOT substitute legacy WebGLRenderer.
+      if (resolved.route === ExecutionRoute.EXACT_BACKEND) {
+        // Exact ownership preserves the source constructor and its backend choice.
+        // Opaque access is not permission to replace WebGPURenderer with the
+        // legacy WebGLRenderer, including on hosts where upstream falls back.
         targetConstructor = constructorFn;
       } else if (resolved.route === ExecutionRoute.RETAINED_UPSTREAM && constructorName !== 'WebGLRenderer') {
         targetConstructor = constructorFn;
@@ -228,8 +222,8 @@ export class RendererConstructionRouter {
       }
     }
 
-    // If constructorFn was absent or does not implement the resolved route (e.g. WebGPURenderer escaped to EXACT_BACKEND),
-    // look up the admitted implementation from registered implementations.
+    // Without the source constructor, exact replacements must be qualified by
+    // constructor name. The legacy route-level registration is WebGLRenderer only.
     if (!targetConstructor) {
       const mergedImpls = callImplementations
         ? { ...this.implementations, ...callImplementations }
@@ -237,9 +231,12 @@ export class RendererConstructionRouter {
 
       const routeImpl = mergedImpls[resolved.route];
       if (typeof routeImpl === 'function') {
-        targetConstructor = routeImpl;
+        if (resolved.route !== ExecutionRoute.EXACT_BACKEND || constructorName === 'WebGLRenderer') {
+          targetConstructor = routeImpl;
+        }
       } else if (routeImpl && typeof routeImpl === 'object') {
-        targetConstructor = routeImpl[constructorName] || routeImpl['default'] || null;
+        targetConstructor = routeImpl[constructorName] ||
+          (resolved.route !== ExecutionRoute.EXACT_BACKEND ? routeImpl['default'] : null);
       }
     }
 

@@ -83,7 +83,7 @@ test('Positive: WebGLRenderer routes synchronously to EXACT_BACKEND', () => {
   assert.equal(instance.canvas, 'canvas-1');
 });
 
-test('Positive: Opaque GL escapes force WebGPURenderer to EXACT_BACKEND synchronously with implementation dispatch', () => {
+test('Positive: Opaque escapes preserve the source WebGPURenderer constructor and options', () => {
   const router = new RendererConstructionRouter({
     implementations: {
       [ExecutionRoute.EXACT_BACKEND]: AdmittedWebGLRenderer,
@@ -93,6 +93,7 @@ test('Positive: Opaque GL escapes force WebGPURenderer to EXACT_BACKEND synchron
   class FakeWebGPURenderer {
     constructor(opts) {
       this.isWebGPURenderer = true;
+      this.opts = opts;
     }
   }
 
@@ -105,9 +106,9 @@ test('Positive: Opaque GL escapes force WebGPURenderer to EXACT_BACKEND synchron
     sourceSpan: 'src/app.js:25:3',
   });
 
-  assert.ok(instance instanceof AdmittedWebGLRenderer, 'Must instantiate the admitted exact backend implementation');
-  assert.equal(instance.isExactBackend, true);
-  assert.equal(instance.isWebGPURenderer, undefined, 'Must not instantiate the escaped WebGPURenderer constructor');
+  assert.ok(instance instanceof FakeWebGPURenderer, 'Opaque escape must preserve the source constructor');
+  assert.equal(instance.isWebGLRenderer, undefined, 'Must not substitute legacy WebGLRenderer');
+  assert.equal(instance.opts.forceWebGL, undefined, 'Must not force a backend the source did not select');
   assert.equal(getRendererRoute(instance), ExecutionRoute.EXACT_BACKEND);
   assert.ok(getRendererDecision(instance).reasons.includes(EscapeReason.OPAQUE_GL_ESCAPE));
 });
@@ -130,7 +131,7 @@ test('Positive: Native context access forces EXACT_BACKEND with implementation d
     sourceSpan: 'src/custom.js:40:9',
   });
 
-  assert.ok(instance instanceof AdmittedWebGLRenderer);
+  assert.ok(instance instanceof MockRenderer);
   assert.equal(getRendererRoute(instance), ExecutionRoute.EXACT_BACKEND);
   assert.ok(getRendererDecision(instance).reasons.includes(EscapeReason.NATIVE_CONTEXT_ACCESS));
 });
@@ -152,7 +153,7 @@ test('Positive: Host without WebGPU falls back to EXACT_BACKEND with HOST_LIMITA
     sourceSpan: 'src/fallback.js:12:1',
   });
 
-  assert.ok(instance instanceof AdmittedWebGLRenderer);
+  assert.ok(instance instanceof FakeWebGPURenderer, 'The source constructor owns host fallback');
   assert.equal(getRendererRoute(instance), ExecutionRoute.EXACT_BACKEND);
   assert.ok(getRendererDecision(instance).reasons.includes(EscapeReason.HOST_LIMITATION_FALLBACK));
 });
@@ -227,7 +228,8 @@ test('Positive: Connected groups propagate EXACT_BACKEND when sharing mutable re
 
   assert.equal(getRendererRoute(inst1), ExecutionRoute.EXACT_BACKEND);
   assert.equal(getRendererRoute(inst2), ExecutionRoute.EXACT_BACKEND);
-  assert.ok(inst2 instanceof AdmittedWebGLRenderer);
+  assert.ok(inst1 instanceof RendererExact);
+  assert.ok(inst2 instanceof RendererStandard, 'Group routing must preserve the source class');
   assert.equal(getRendererDecision(inst1).groupId, getRendererDecision(inst2).groupId, 'Renderers must share connected group ID');
 });
 
@@ -562,25 +564,45 @@ test('Preserve native object shape: sealed and frozen instances succeed and main
   assert.ok(getRendererDecision(frozenInstance));
 });
 
-test('Defect 2 regression: escaped WebGPU without admitted exact backend implementation throws instead of fake claim', () => {
-  const router = new RendererConstructionRouter(); // No implementations registered
-
-  class SomeWebGPURenderer {}
-
-  assert.throws(
-    () => {
-      router.routeAndConstruct({
-        constructorFn: SomeWebGPURenderer,
+test('Exact fallback without a source constructor requires a constructor-qualified implementation', () => {
+  for (const unqualified of [undefined, AdmittedWebGLRenderer, { default: AdmittedWebGLRenderer }]) {
+    const router = new RendererConstructionRouter({
+      implementations: { [ExecutionRoute.EXACT_BACKEND]: unqualified },
+    });
+    assert.throws(
+      () => router.routeAndConstruct({
         constructorName: 'WebGPURenderer',
         options: { canvas: 'escaped-no-impl-canvas' },
         analysis: { hasOpaqueGLEscapes: true },
-      });
-    },
-    (err) => {
-      assert.match(err.message, /no admitted exact backend implementation registered/);
-      return true;
-    }
-  );
+      }),
+      /no admitted exact backend implementation registered/,
+    );
+    assert.equal(router.getCanvasLock('escaped-no-impl-canvas'), undefined);
+  }
+  class SourceWebGPURenderer {}
+  const router = new RendererConstructionRouter({
+    implementations: { [ExecutionRoute.EXACT_BACKEND]: { WebGPURenderer: SourceWebGPURenderer } },
+  });
+  assert.ok(router.routeAndConstruct({
+    constructorName: 'WebGPURenderer', analysis: { hasOpaqueGLEscapes: true },
+  }) instanceof SourceWebGPURenderer);
+});
+
+test('Opaque WebGPU constructor failure preserves the original error and executes once', () => {
+  const originalError = new TypeError('source constructor failure');
+  let calls = 0;
+  class SourceWebGPURenderer {
+    constructor() { calls++; throw originalError; }
+  }
+  const router = new RendererConstructionRouter({
+    implementations: { [ExecutionRoute.EXACT_BACKEND]: AdmittedWebGLRenderer },
+  });
+  assert.throws(() => router.routeAndConstruct({
+    constructorFn: SourceWebGPURenderer,
+    constructorName: 'WebGPURenderer',
+    analysis: { hasOpaqueGLEscapes: true },
+  }), error => error === originalError);
+  assert.equal(calls, 1);
 });
 
 test('Defect 3 regression: reset() method is removed and canvas locks are permanently irreversible', () => {
@@ -1388,6 +1410,115 @@ test('6mv.4 report criterion: window-independent router decision log and attribu
 
   const lockWebGL = facade.router.getCanvasLock(canvasWebGL);
   assert.equal(lockWebGL?.route, ExecutionRoute.EXACT_BACKEND, 'Canvas lock for WebGL canvas must match exact-backend');
+});
+
+test('Positive and negative: Exact backend router preserves route and permanent canvas lock across WebGL context loss and restore', () => {
+  class TestWebGLRenderer {
+    constructor(opts = {}) {
+      this.isWebGLRenderer = true;
+      this.canvas = opts.canvas;
+    }
+  }
+
+  const router = new RendererConstructionRouter({
+    implementations: {
+      [ExecutionRoute.EXACT_BACKEND]: TestWebGLRenderer,
+    },
+  });
+
+  // Create mock canvas with WEBGL_lose_context simulation capabilities
+  let lostHandler = null;
+  let restoredHandler = null;
+  let contextLostState = false;
+
+  const mockLoseContextExt = {
+    loseContext() {
+      contextLostState = true;
+      if (lostHandler) {
+        lostHandler({ preventDefault: () => {} });
+      }
+    },
+    restoreContext() {
+      contextLostState = false;
+      if (restoredHandler) {
+        restoredHandler({});
+      }
+    },
+  };
+
+  const mockGl = {
+    isContextLost: () => contextLostState,
+    getExtension: (name) => (name === 'WEBGL_lose_context' ? mockLoseContextExt : null),
+  };
+
+  const canvas = {
+    id: 'mock-canvas-loss-restore',
+    getContext: (type) => (type && type.includes('webgl') ? mockGl : null),
+    addEventListener: (type, fn) => {
+      if (type === 'webglcontextlost') lostHandler = fn;
+      if (type === 'webglcontextrestored') restoredHandler = fn;
+    },
+    removeEventListener: () => {},
+  };
+
+  // Route and construct
+  const renderer = router.routeAndConstruct({
+    constructorFn: TestWebGLRenderer,
+    constructorName: 'WebGLRenderer',
+    options: { canvas },
+    sourceSpan: 'test:context_loss_runner_hook',
+  });
+
+  assert.equal(getRendererRoute(renderer), ExecutionRoute.EXACT_BACKEND);
+  assert.equal(router.getCanvasLock(canvas)?.route, ExecutionRoute.EXACT_BACKEND);
+
+  // Trigger context loss
+  mockLoseContextExt.loseContext();
+  assert.equal(mockGl.isContextLost(), true);
+
+  // Canvas lock and route remain permanently EXACT_BACKEND during context loss
+  assert.equal(router.getCanvasLock(canvas)?.route, ExecutionRoute.EXACT_BACKEND);
+  assert.equal(getRendererRoute(renderer), ExecutionRoute.EXACT_BACKEND);
+
+  // Negative control 1: Route switch on canvas during context loss is strictly rejected with RouteLockError
+  assert.throws(
+    () => {
+      router.routeAndConstruct({
+        constructorFn: class MockWebGPURenderer {},
+        constructorName: 'WebGPURenderer',
+        options: { canvas },
+      });
+    },
+    RouteLockError,
+    'Canvas lock must reject late route switch even during WebGL context loss'
+  );
+
+  // Negative control 2: Un-restored state check - skipping restoration leaves isContextLost() true
+  assert.equal(mockGl.isContextLost(), true, 'Context must remain lost when restoration is skipped');
+
+  // Negative control 3: Unadmitted exact backend implementation is rejected
+  assert.throws(
+    () => {
+      const strictRouter = new RendererConstructionRouter({
+        implementations: {},
+      });
+      strictRouter.routeAndConstruct({
+        constructorName: 'WebGPURenderer',
+        options: { canvas: 'unadmitted-loss-canvas' },
+        analysis: { hasOpaqueGLEscapes: true },
+      });
+    },
+    /no admitted exact backend implementation registered/,
+    'Unadmitted class substitution must be rejected'
+  );
+
+  // Restore context
+  mockLoseContextExt.restoreContext();
+  assert.equal(mockGl.isContextLost(), false);
+
+  // Verify route and canvas lock remain intact after restoration
+  assert.equal(getRendererRoute(renderer), ExecutionRoute.EXACT_BACKEND);
+  assert.equal(router.getCanvasLock(canvas)?.route, ExecutionRoute.EXACT_BACKEND);
 });
 
 
