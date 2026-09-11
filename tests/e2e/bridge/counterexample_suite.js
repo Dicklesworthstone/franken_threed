@@ -846,6 +846,174 @@ export async function testStaleEpochReadbackPublicationGate(host, wasmModule) {
  * The only difference from the positive path is the missing rebind. Tested against the
  * EXACT SAME `assertBundleDirectDrawMatch` assertion to verify detection and rejection.
  */
+/**
+ * Helper: Parses binary packet bytes according to bridge runtime opcode layouts
+ * and produces a diagnostic command trace with key fields.
+ */
+export function decodePacketCommandTrace(packetBytes) {
+  if (!packetBytes || packetBytes.byteLength < 16) {
+    return ["<invalid packet: buffer shorter than 16-byte header>"];
+  }
+  const dataView = new DataView(packetBytes.buffer, packetBytes.byteOffset, packetBytes.byteLength);
+  const magic = dataView.getUint32(0, true);
+  const version = dataView.getUint16(4, true);
+  const commandCount = dataView.getUint32(8, true);
+  const dataLen = dataView.getUint32(12, true);
+  const dataBlockStart = packetBytes.byteLength - dataLen;
+
+  const trace = [
+    `Header: magic=0x${magic.toString(16)}, version=${version}, commandCount=${commandCount}, dataLen=${dataLen}`,
+  ];
+
+  let cursor = 16;
+  for (let i = 0; i < commandCount; i++) {
+    if (cursor + 2 > dataBlockStart) {
+      trace.push(`[Cmd ${i}] TRUNCATED: cursor ${cursor} exceeded dataBlockStart ${dataBlockStart}`);
+      break;
+    }
+    const opcode = dataView.getUint16(cursor, true);
+    cursor += 2;
+
+    switch (opcode) {
+      case 1: { // OPCODE_CREATE_BUFFER
+        if (cursor + 12 > dataBlockStart) {
+          trace.push(`[Cmd ${i}] CREATE_BUFFER: truncated`);
+          cursor = dataBlockStart;
+          break;
+        }
+        const bufferId = dataView.getUint32(cursor, true);
+        const size = dataView.getUint32(cursor + 4, true);
+        const usage = dataView.getUint32(cursor + 8, true);
+        cursor += 12;
+        trace.push(`[Cmd ${i}] CREATE_BUFFER: bufferId=${bufferId}, size=${size}, usage=0x${usage.toString(16)}`);
+        break;
+      }
+      case 2: { // OPCODE_WRITE_BUFFER
+        if (cursor + 16 > dataBlockStart) {
+          trace.push(`[Cmd ${i}] WRITE_BUFFER: truncated`);
+          cursor = dataBlockStart;
+          break;
+        }
+        const bufferId = dataView.getUint32(cursor, true);
+        const offset = dataView.getUint32(cursor + 4, true);
+        const dataOffset = dataView.getUint32(cursor + 8, true);
+        const dataLength = dataView.getUint32(cursor + 12, true);
+        cursor += 16;
+        trace.push(`[Cmd ${i}] WRITE_BUFFER: bufferId=${bufferId}, offset=${offset}, dataOffset=${dataOffset}, dataLen=${dataLength}`);
+        break;
+      }
+      case 3: { // OPCODE_CREATE_PIPELINE
+        if (cursor + 32 > dataBlockStart) {
+          trace.push(`[Cmd ${i}] CREATE_PIPELINE: truncated`);
+          cursor = dataBlockStart;
+          break;
+        }
+        const pipelineId = dataView.getUint32(cursor, true);
+        const codeOffset = dataView.getUint32(cursor + 4, true);
+        const codeLen = dataView.getUint32(cursor + 8, true);
+        const formatCode = dataView.getUint32(cursor + 12, true);
+        const hasVB = dataView.getUint32(cursor + 16, true);
+        const hasUB = dataView.getUint32(cursor + 20, true);
+        const uniformSize = dataView.getUint32(cursor + 24, true);
+        const vertexStride = dataView.getUint32(cursor + 28, true);
+        cursor += 32;
+        trace.push(`[Cmd ${i}] CREATE_PIPELINE: pipelineId=${pipelineId}, codeLen=${codeLen}, format=${formatCode}, hasVB=${hasVB}, hasUB=${hasUB}, uniformSize=${uniformSize}, vertexStride=${vertexStride}`);
+        break;
+      }
+      case 4: { // OPCODE_RENDER_PASS
+        if (cursor + 44 > dataBlockStart) {
+          trace.push(`[Cmd ${i}] RENDER_PASS: truncated`);
+          cursor = dataBlockStart;
+          break;
+        }
+        const targetType = dataView.getUint32(cursor, true);
+        const targetId = dataView.getUint32(cursor + 4, true);
+        const cr = dataView.getFloat32(cursor + 8, true).toFixed(2);
+        const cg = dataView.getFloat32(cursor + 12, true).toFixed(2);
+        const cb = dataView.getFloat32(cursor + 16, true).toFixed(2);
+        const ca = dataView.getFloat32(cursor + 20, true).toFixed(2);
+        const pipelineId = dataView.getUint32(cursor + 24, true);
+        const vertexBufferId = dataView.getUint32(cursor + 28, true);
+        const vertexCount = dataView.getUint32(cursor + 32, true);
+        const dynamicOffset = dataView.getUint32(cursor + 36, true);
+        const uniformBufferId = dataView.getUint32(cursor + 40, true);
+        cursor += 44;
+        trace.push(`[Cmd ${i}] RENDER_PASS: targetType=${targetType === 0 ? "Offscreen" : "Canvas"}, targetId=${targetId}, clear=[${cr},${cg},${cb},${ca}], pipelineId=${pipelineId}, vbId=${vertexBufferId}, vertexCount=${vertexCount}, dynOffset=${dynamicOffset}, ubId=${uniformBufferId}`);
+        break;
+      }
+      case 5: { // OPCODE_COPY_TEXTURE_TO_BUFFER
+        if (cursor + 24 > dataBlockStart) {
+          trace.push(`[Cmd ${i}] COPY_TEXTURE_TO_BUFFER: truncated`);
+          cursor = dataBlockStart;
+          break;
+        }
+        const textureId = dataView.getUint32(cursor, true);
+        const bufferId = dataView.getUint32(cursor + 4, true);
+        const w = dataView.getUint32(cursor + 8, true);
+        const h = dataView.getUint32(cursor + 12, true);
+        const epochHi = dataView.getUint32(cursor + 16, true);
+        const epochLo = dataView.getUint32(cursor + 20, true);
+        cursor += 24;
+        trace.push(`[Cmd ${i}] COPY_TEXTURE_TO_BUFFER: textureId=${textureId}, bufferId=${bufferId}, dims=${w}x${h}, epoch=(${epochHi},${epochLo})`);
+        break;
+      }
+      case 6: { // OPCODE_CREATE_TEXTURE
+        if (cursor + 20 > dataBlockStart) {
+          trace.push(`[Cmd ${i}] CREATE_TEXTURE: truncated`);
+          cursor = dataBlockStart;
+          break;
+        }
+        const textureId = dataView.getUint32(cursor, true);
+        const w = dataView.getUint32(cursor + 4, true);
+        const h = dataView.getUint32(cursor + 8, true);
+        const formatCode = dataView.getUint32(cursor + 12, true);
+        const usage = dataView.getUint32(cursor + 16, true);
+        cursor += 20;
+        trace.push(`[Cmd ${i}] CREATE_TEXTURE: textureId=${textureId}, dims=${w}x${h}, format=${formatCode}, usage=0x${usage.toString(16)}`);
+        break;
+      }
+      case 7: { // OPCODE_RECORD_BUNDLE
+        if (cursor + 28 > dataBlockStart) {
+          trace.push(`[Cmd ${i}] RECORD_BUNDLE: truncated`);
+          cursor = dataBlockStart;
+          break;
+        }
+        const bundleId = dataView.getUint32(cursor, true);
+        const pipelineId = dataView.getUint32(cursor + 4, true);
+        const vertexBufferId = dataView.getUint32(cursor + 8, true);
+        const vertexCount = dataView.getUint32(cursor + 12, true);
+        const dynamicOffset = dataView.getUint32(cursor + 16, true);
+        const uniformBufferId = dataView.getUint32(cursor + 20, true);
+        const targetFormatCode = dataView.getUint32(cursor + 24, true);
+        cursor += 28;
+        trace.push(`[Cmd ${i}] RECORD_BUNDLE: bundleId=${bundleId}, pipelineId=${pipelineId}, vbId=${vertexBufferId}, vertexCount=${vertexCount}, dynOffset=${dynamicOffset}, ubId=${uniformBufferId}, format=${targetFormatCode}`);
+        break;
+      }
+      case 8: { // OPCODE_EXECUTE_BUNDLES
+        if (cursor + 4 > dataBlockStart) {
+          trace.push(`[Cmd ${i}] EXECUTE_BUNDLES: truncated`);
+          cursor = dataBlockStart;
+          break;
+        }
+        const bundleCount = dataView.getUint32(cursor, true);
+        cursor += 4;
+        const bundleIds = [];
+        for (let b = 0; b < bundleCount; b++) {
+          if (cursor + 4 > dataBlockStart) break;
+          bundleIds.push(dataView.getUint32(cursor, true));
+          cursor += 4;
+        }
+        trace.push(`[Cmd ${i}] EXECUTE_BUNDLES: count=${bundleCount}, bundleIds=[${bundleIds.join(", ")}]`);
+        break;
+      }
+      default:
+        trace.push(`[Cmd ${i}] UNKNOWN_OPCODE: ${opcode}`);
+        break;
+    }
+  }
+  return trace;
+}
+
 export async function testBundleThenDirectDrawStateReset(host, device, wasmModule, width = 64, height = 64) {
   const buildBundleDirectFn = wasmModule?.f3d_build_bundle_direct_draw_packet || wasmModule?.gpu_bridge_build_bundle_direct_draw_packet;
   if (!wasmModule || typeof buildBundleDirectFn !== "function") {
@@ -860,16 +1028,91 @@ export async function testBundleThenDirectDrawStateReset(host, device, wasmModul
   const bytesPerRow = computeAlignedBytesPerRow(width);
   const readbackSize = bytesPerRow * height;
 
-  await host.executePacket(packet);
-  const candidatePixels = await host.readbackBuffer(readbackBufferId, readbackSize);
+  // 1. Decoded command trace of the real Rust packet
+  const commandTrace = decodePacketCommandTrace(packet);
+
+  // 2. Execute packet and record whether the positive path raised any WebGPU validation error inside the error scope
+  let positiveValidationError = null;
+  try {
+    await host.executePacket(packet);
+  } catch (err) {
+    positiveValidationError = err.message || String(err);
+  }
+
+  // 3. Read back pixels from the offscreen target buffer
+  let candidatePixels;
+  let readbackError = null;
+  try {
+    candidatePixels = await host.readbackBuffer(readbackBufferId, readbackSize);
+  } catch (err) {
+    readbackError = err.message || String(err);
+    candidatePixels = new Uint8Array(readbackSize);
+  }
+
+  // 4. Sample pixels at designated coordinates: (16,32), (48,32), (2,2)
+  const greenIdx = 32 * bytesPerRow + 16 * 4;
+  const blueIdx = 32 * bytesPerRow + 48 * 4;
+  const blackIdx = 2 * bytesPerRow + 2 * 4;
+
+  const s16_32 = [
+    candidatePixels[greenIdx],
+    candidatePixels[greenIdx + 1],
+    candidatePixels[greenIdx + 2],
+    candidatePixels[greenIdx + 3],
+  ];
+  const s48_32 = [
+    candidatePixels[blueIdx],
+    candidatePixels[blueIdx + 1],
+    candidatePixels[blueIdx + 2],
+    candidatePixels[blueIdx + 3],
+  ];
+  const s2_2 = [
+    candidatePixels[blackIdx],
+    candidatePixels[blackIdx + 1],
+    candidatePixels[blackIdx + 2],
+    candidatePixels[blackIdx + 3],
+  ];
+
+  const samplesSummary = `Sampled pixels: (16,32)=[${s16_32.join(",")}], (48,32)=[${s48_32.join(",")}], (2,2)=[${s2_2.join(",")}]`;
+  const valSummary = `Positive WebGPU error scope: ${positiveValidationError ? `ERROR: ${positiveValidationError}` : "CLEAN (no validation error)"}`;
+  const rbSummary = readbackError ? `Readback error: ${readbackError}` : "Readback OK";
+  const traceFormatted = `Decoded Rust Packet Commands (${commandTrace.length}):\n${commandTrace.map((c) => `  ${c}`).join("\n")}`;
 
   // Oracle: Independent direct-JS execution
   const oraclePixels = await renderDirectBundleDirectReference(device, width, height);
 
-  // Positive Assertion: Must match pixel-for-pixel (0 differences) + verify sample points
-  assertBundleDirectDrawMatch(candidatePixels, oraclePixels, width, height);
+  // 5. Positive Assertion: Must match pixel-for-pixel (0 differences) + verify sample points.
+  // If positive path threw validation error or pixel assertion fails, include the command trace,
+  // sampled pixels, and validation error status in the thrown error message.
+  try {
+    if (positiveValidationError) {
+      throw new Error(`WebGPU validation error during positive packet execution: ${positiveValidationError}`);
+    }
+    if (readbackError) {
+      throw new Error(`Buffer readback failed: ${readbackError}`);
+    }
+    assertBundleDirectDrawMatch(candidatePixels, oraclePixels, width, height);
+  } catch (matchErr) {
+    const diagnosticMessage = `BundleThenDirectDraw State Reset Failed:\n${matchErr.message}\n${samplesSummary}\n${valSummary}\n${rbSummary}\n${traceFormatted}`;
+    const err = new Error(diagnosticMessage);
+    err.commandTrace = commandTrace;
+    err.samples = { s16_32, s48_32, s2_2 };
+    err.positiveValidationError = positiveValidationError;
+    throw err;
+  }
 
-  return { candidatePixels, oraclePixels };
+  return {
+    candidatePixels,
+    oraclePixels,
+    commandTrace,
+    samples: {
+      s16_32,
+      s48_32,
+      s2_2,
+    },
+    positiveValidationError,
+    detail: `Bundle-then-direct-draw verified: 0 diffs vs oracle. ${samplesSummary}. ${valSummary}. Trace: ${commandTrace.length} commands.`,
+  };
 }
 
 export async function testNegativeBrokenBundleDirectDraw(host, oraclePixels, width = 64, height = 64) {

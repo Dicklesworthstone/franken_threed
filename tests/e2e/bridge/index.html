@@ -298,15 +298,15 @@
             ownership: "AUTHORITATIVE (05.7)",
             desc: "WebGPU spec state reset after executeBundles: bundle green + direct blue rebind vs direct-JS oracle + omitted rebind rejection",
             run: async () => {
-              const { candidatePixels, oraclePixels } = await testBundleThenDirectDrawStateReset(
+              const res = await testBundleThenDirectDrawStateReset(
                 host,
                 host.device,
                 wasmModule,
                 64,
                 64
               );
-              const brokenResult = await testNegativeBrokenBundleDirectDraw(host, oraclePixels, 64, 64);
-              return `Verified via real Rust/Wasm bundle packet (0 diffs vs oracle); post-bundle draw without rebind rejected (${brokenResult.behavior}).`;
+              const brokenResult = await testNegativeBrokenBundleDirectDraw(host, res.oraclePixels, 64, 64);
+              return `${res.detail} Broken control rejected (${brokenResult.behavior}).`;
             },
           },
           {
