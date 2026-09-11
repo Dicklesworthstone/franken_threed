@@ -7,13 +7,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { bundleWithRollup } from './bundler.mjs';
 import { IngestionResolutionError } from './types.mjs';
 
-const SCRATCH_BASE = '/Volumes/USBNVME16TB/temp_agent_space';
+const SCRATCH_BASE = tmpdir();
 
 function makeScratch(prefix) {
   const dir = path.join(SCRATCH_BASE, `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`);
