@@ -373,3 +373,58 @@ fn test_box3_and_sphere_intersects_plane_and_triangle() {
     assert!(!box_crossing.intersects_triangle(&tri_far), "distant triangle does not intersect box");
     assert!(!tri_far.intersects_box(&box_crossing), "reciprocal distant triangle");
 }
+
+#[test]
+fn test_fixture_tri1_pixel_center_ndc_mapping_and_containment() {
+    // Fixture tri1 in NDC space:
+    // NDC vertices (-1,-1), (0,-1), (0,1) with z=0
+    let tri1 = Triangle::new(
+        Vector3::new(-1.0, -1.0, 0.0),
+        Vector3::new(0.0, -1.0, 0.0),
+        Vector3::new(0.0, 1.0, 0.0),
+    );
+
+    // Viewport dimensions: 64x64
+    let width = 64.0_f64;
+    let height = 64.0_f64;
+
+    // Pinned mapping from pixel-center coordinates (px, py) to WebGPU/Three.js NDC:
+    // x_ndc = (px / width) * 2.0 - 1.0
+    // y_ndc = 1.0 - (py / height) * 2.0
+    let pixel_center_to_ndc = |px: f64, py: f64| -> Vector3 {
+        let x_ndc = (px / width) * 2.0 - 1.0;
+        let y_ndc = 1.0 - (py / height) * 2.0;
+        Vector3::new(x_ndc, y_ndc, 0.0)
+    };
+
+    // Sample Point 1: Left triangle interior at pixel (24, 32), center (24.5, 32.5)
+    // Expected NDC: x = (24.5/64)*2 - 1 = -0.234375, y = 1 - (32.5/64)*2 = -0.015625
+    let p_inside = pixel_center_to_ndc(24.5, 32.5);
+    assert_vec_close(&p_inside, [-0.234375, -0.015625, 0.0], EPS, "p_inside NDC mapping");
+    assert!(
+        tri1.contains_point(&p_inside),
+        "pixel center (24.5, 32.5) at NDC (-0.234375, -0.015625) must be inside tri1"
+    );
+    let bary_inside = tri1.get_barycoord(&p_inside).expect("tri1 is non-degenerate");
+    assert!(bary_inside.x > 0.0 && bary_inside.y > 0.0 && bary_inside.z > 0.0);
+    assert_close(bary_inside.x + bary_inside.y + bary_inside.z, 1.0, EPS, "barycentric sum");
+
+    // Sample Point 2: Right side / outside tri1 at pixel (56, 32), center (56.5, 32.5)
+    // Expected NDC: x = (56.5/64)*2 - 1 = +0.765625, y = 1 - (32.5/64)*2 = -0.015625
+    let p_outside_right = pixel_center_to_ndc(56.5, 32.5);
+    assert_vec_close(&p_outside_right, [0.765625, -0.015625, 0.0], EPS, "p_outside_right NDC mapping");
+    assert!(
+        !tri1.contains_point(&p_outside_right),
+        "pixel center (56.5, 32.5) at NDC (0.765625, -0.015625) must be outside tri1"
+    );
+
+    // Sample Point 3: Background / top-left at pixel (2, 2), center (2.5, 2.5)
+    // Expected NDC: x = (2.5/64)*2 - 1 = -0.921875, y = 1 - (2.5/64)*2 = +0.921875
+    let p_outside_bg = pixel_center_to_ndc(2.5, 2.5);
+    assert_vec_close(&p_outside_bg, [-0.921875, 0.921875, 0.0], EPS, "p_outside_bg NDC mapping");
+    assert!(
+        !tri1.contains_point(&p_outside_bg),
+        "pixel center (2.5, 2.5) at NDC (-0.921875, 0.921875) must be outside tri1"
+    );
+}
+

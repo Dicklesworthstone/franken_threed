@@ -352,6 +352,48 @@ fn test_js_round_spec_cases_half_toward_pos_infinity() {
 }
 
 #[test]
+fn test_js_round_negative_half_ulp_boundaries_and_signed_zero() {
+    // ECMA-262 §21.3.2.28 Math.round negative half-ULP boundary behavior:
+    // 1. -0.5 must round to -0.0
+    assert_neg_zero(js_round(-0.5), "Math.round(-0.5) must be -0.0");
+    assert_eq!(js_round(-0.5).to_bits(), (-0.0f64).to_bits());
+
+    // 2. Values in [-0.5, 0.0) must produce -0.0
+    // -0.5 + 1 ULP (0xbfdfffffffffffff = -0.49999999999999994)
+    let neg_half_plus_ulp = f64::from_bits(0xbfdfffffffffffff);
+    assert_neg_zero(js_round(neg_half_plus_ulp), "Math.round(-0.5 + 1 ULP) must be -0.0");
+
+    // 3. Values strictly less than -0.5 must round down to -1.0 or lower
+    // -0.5 - 1 ULP (0xbfe0000000000001 = -0.5000000000000001)
+    let neg_half_minus_ulp = f64::from_bits(0xbfe0000000000001);
+    assert_eq!(js_round(neg_half_minus_ulp), -1.0, "Math.round(-0.5 - 1 ULP) must be -1.0");
+
+    // 4. -1.5 halfway boundary (rounds toward +Infinity -> -1.0 per ECMAScript)
+    assert_eq!(js_round(-1.5), -1.0, "Math.round(-1.5) must be -1.0 (round-half-up)");
+    // -1.5 + 1 ULP (0xbff7ffffffffffff = -1.4999999999999998) -> -1.0
+    let neg_one_half_plus_ulp = f64::from_bits(0xbff7ffffffffffff);
+    assert_eq!(js_round(neg_one_half_plus_ulp), -1.0, "Math.round(-1.5 + 1 ULP) must be -1.0");
+    // -1.5 - 1 ULP (0xbff8000000000001 = -1.5000000000000002) -> -2.0
+    let neg_one_half_minus_ulp = f64::from_bits(0xbff8000000000001);
+    assert_eq!(js_round(neg_one_half_minus_ulp), -2.0, "Math.round(-1.5 - 1 ULP) must be -2.0");
+
+    // 5. -2.5 halfway boundary (rounds toward +Infinity -> -2.0 per ECMAScript)
+    assert_eq!(js_round(-2.5), -2.0, "Math.round(-2.5) must be -2.0 (round-half-up)");
+    // -2.5 + 1 ULP (0xc003ffffffffffff) -> -2.0
+    let neg_two_half_plus_ulp = f64::from_bits(0xc003ffffffffffff);
+    assert_eq!(js_round(neg_two_half_plus_ulp), -2.0, "Math.round(-2.5 + 1 ULP) must be -2.0");
+    // -2.5 - 1 ULP (0xc004000000000001) -> -3.0
+    let neg_two_half_minus_ulp = f64::from_bits(0xc004000000000001);
+    assert_eq!(js_round(neg_two_half_minus_ulp), -3.0, "Math.round(-2.5 - 1 ULP) must be -3.0");
+
+    // 6. Signed zero preservation
+    assert_neg_zero(js_round(-0.0), "Math.round(-0.0) must be -0.0");
+    assert_pos_zero(js_round(0.0), "Math.round(+0.0) must be +0.0");
+    assert_eq!(js_round(-0.0).to_bits(), (-0.0f64).to_bits());
+    assert_eq!(js_round(0.0).to_bits(), (0.0f64).to_bits());
+}
+
+#[test]
 fn test_js_trunc_spec_cases_and_signed_zero_preservation() {
     // ECMA-262 §21.3.2.35 Math.trunc
     // Invariant: Truncating (-1.0, 0.0) yields -0.0; truncating (0.0, 1.0) yields +0.0

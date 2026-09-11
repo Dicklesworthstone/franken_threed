@@ -183,6 +183,7 @@ core/math <- scene
   - Upstream divergence regressions asserting that invalid styles leave color components completely untouched.
   - 148 CSS named color keyword validation (`COLOR_NAMES`), case-insensitive lookup in `set_color_name`, and fallback from `set_style`.
   - Zero-allocation string formatting into fixed byte slices and custom `core::fmt::Write` destinations.
+  - Exact ECMAScript §7.1.12.1 channel formatting in `get_style` / `format_style` matching Three.js r186 `Color.getStyle()`: nonfinites format as `"NaN"`, `"Infinity"`, `"-Infinity"`; signed zeros format as `"0"`; finite magnitudes $< 10^{21}$ use shortest decimal representation without decimal points or `i64` saturation (e.g. `9223372036854776000` at $2^{63}$, `1000000000000001000` at $1e18 + 1024$); magnitudes $\ge 10^{21}$ format in exponential notation with signed positive exponent (e.g. `"1e+21"`).
   - Rounding fidelity in `get_hex` verifying `crate::jsnum::js_round` round-half-up behavior.
   - Linear RGB interpolation (`lerp`) and HSL interpolation (`lerp_hsl`).
   - Upstream 3x3 matrix constants (`LINEAR_REC709_TO_XYZ`, `XYZ_TO_LINEAR_DISPLAY_P3`, `LINEAR_SRGB_TO_LINEAR_DISPLAY_P3`, `LINEAR_DISPLAY_P3_TO_LINEAR_SRGB`) and round-trip transformation accuracy.

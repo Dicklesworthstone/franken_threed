@@ -367,11 +367,6 @@ impl<'a> BufWriter<'a> {
     fn new(buf: &'a mut [u8]) -> Self {
         Self { buf, len: 0 }
     }
-
-    #[inline]
-    fn as_str(&self) -> Result<&str, core::fmt::Error> {
-        core::str::from_utf8(&self.buf[..self.len]).map_err(|_| core::fmt::Error)
-    }
 }
 
 impl<'a> Write for BufWriter<'a> {
@@ -383,6 +378,58 @@ impl<'a> Write for BufWriter<'a> {
         self.buf[self.len..self.len + bytes.len()].copy_from_slice(bytes);
         self.len += bytes.len();
         Ok(())
+    }
+}
+
+/// Helper formatting an individual channel value per ECMAScript string interpolation.
+///
+/// In Three.js `Color.getStyle`: `rgb(${Math.round(r * 255)},...)`.
+/// - Nonfinite values (`NaN`, `Infinity`, `-Infinity`) format as JS strings `"NaN"`, `"Infinity"`, `"-Infinity"`.
+/// - Zeros (`0.0` and `-0.0`) format as `"0"` per ECMAScript template string evaluation.
+/// - Magnitudes `>= 1e21` format in ECMAScript exponential form with a signed exponent (e.g. `"1e+21"`).
+/// - Finite values `< 1e21` format as shortest decimal strings matching JavaScript `Number.toString()`,
+///   avoiding `i64` saturation at `2^63` and retaining shortest representation beyond `2^53`.
+fn write_js_channel<W: Write>(writer: &mut W, val: f64) -> fmt::Result {
+    if val.is_nan() {
+        writer.write_str("NaN")
+    } else if val.is_infinite() {
+        if val.is_sign_negative() {
+            writer.write_str("-Infinity")
+        } else {
+            writer.write_str("Infinity")
+        }
+    } else if val == 0.0 {
+        writer.write_str("0")
+    } else if val.abs() >= 1e21 {
+        // ECMAScript Number::toString uses exponential notation with a signed exponent (e.g. 1e+21)
+        // for numbers with magnitude >= 1e21. Rust's `{:e}` emits unsigned positive exponents (e.g. 1e21),
+        // so we normalize positive exponents by inserting '+'.
+        let mut buf = [0u8; 40];
+        let len = {
+            let mut bw = BufWriter::new(&mut buf);
+            write!(&mut bw, "{:e}", val)?;
+            bw.len
+        };
+        let bytes = &buf[..len];
+        if let Some(pos) = bytes.iter().position(|&b| b == b'e') {
+            let before = core::str::from_utf8(&bytes[..pos]).map_err(|_| fmt::Error)?;
+            writer.write_str(before)?;
+            let after_bytes = &bytes[pos + 1..];
+            if !after_bytes.is_empty() && after_bytes[0] != b'-' && after_bytes[0] != b'+' {
+                writer.write_str("e+")?;
+            } else {
+                writer.write_str("e")?;
+            }
+            let after = core::str::from_utf8(after_bytes).map_err(|_| fmt::Error)?;
+            writer.write_str(after)
+        } else {
+            let s = core::str::from_utf8(bytes).map_err(|_| fmt::Error)?;
+            writer.write_str(s)
+        }
+    } else {
+        // Rust's float Display for f64 produces the shortest decimal representation (Grisu)
+        // without trailing decimals for integral floats, matching ECMAScript Number::toString.
+        write!(writer, "{}", val)
     }
 }
 
@@ -1083,7 +1130,8 @@ impl Color {
 
     /// Formats this color as a CSS style string writing to a caller-supplied `Write` destination.
     ///
-    /// For standard sRGB: writes `rgb(r,g,b)` using [`crate::jsnum::js_round`].
+    /// For standard sRGB: writes `rgb(r,g,b)` using [`crate::jsnum::js_round`] without clamping.
+    /// Nonfinite channels format as `"NaN"`, `"Infinity"`, `"-Infinity"` matching upstream Three.js.
     /// For other color spaces: writes `color(<colorSpace> r.rrr g.ggg b.bbb)`.
     pub fn write_style<W: Write>(&self, writer: &mut W, color_space: ColorSpace) -> fmt::Result {
         let mut copy = *self;
@@ -1099,10 +1147,16 @@ impl Color {
                 copy.b
             )
         } else {
-            let r = crate::jsnum::js_round(copy.r * 255.0) as i64;
-            let g = crate::jsnum::js_round(copy.g * 255.0) as i64;
-            let b = crate::jsnum::js_round(copy.b * 255.0) as i64;
-            write!(writer, "rgb({},{},{})", r, g, b)
+            let r = crate::jsnum::js_round(copy.r * 255.0);
+            let g = crate::jsnum::js_round(copy.g * 255.0);
+            let b = crate::jsnum::js_round(copy.b * 255.0);
+            writer.write_str("rgb(")?;
+            write_js_channel(writer, r)?;
+            writer.write_str(",")?;
+            write_js_channel(writer, g)?;
+            writer.write_str(",")?;
+            write_js_channel(writer, b)?;
+            writer.write_str(")")
         }
     }
 
@@ -1114,9 +1168,12 @@ impl Color {
 
     /// Formats this color as a CSS style string into a caller-supplied byte buffer without heap allocation.
     pub fn format_style<'a>(&self, buf: &'a mut [u8], color_space: ColorSpace) -> Result<&'a str, fmt::Error> {
-        let mut writer = BufWriter::new(buf);
-        self.write_style(&mut writer, color_space)?;
-        writer.as_str()
+        let len = {
+            let mut writer = BufWriter::new(&mut *buf);
+            self.write_style(&mut writer, color_space)?;
+            writer.len
+        };
+        core::str::from_utf8(&buf[..len]).map_err(|_| fmt::Error)
     }
 
     /// Formats this color as a CSS style string in standard sRGB into a caller-supplied byte buffer.

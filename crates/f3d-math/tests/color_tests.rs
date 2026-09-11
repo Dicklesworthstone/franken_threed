@@ -684,6 +684,59 @@ fn test_zero_allocation_style_and_hex_formatting() {
     {
         assert_eq!(out_of_gamut.get_style_srgb(), "rgb(300,-20,100)");
     }
+
+    // Nonfinite channels format as JS strings ("NaN", "Infinity", "-Infinity") matching upstream getStyle
+    let non_finite_color = Color::new(f64::NAN, f64::INFINITY, f64::NEG_INFINITY);
+    let mut nf_buf = [0u8; 64];
+    let nf_style = non_finite_color.format_style_srgb(&mut nf_buf).unwrap();
+    assert_eq!(nf_style, "rgb(NaN,Infinity,-Infinity)");
+    #[cfg(feature = "std")]
+    {
+        assert_eq!(non_finite_color.get_style_srgb(), "rgb(NaN,Infinity,-Infinity)");
+    }
+
+    // Large finite channels at 2^63:
+    // In JS: (2**63).toString() -> "9223372036854776000" (shortest decimal representation, not saturating i64)
+    let c_2_63 = Color::new(2.0_f64.powi(63) / 255.0, -2.0_f64.powi(63) / 255.0, 100.0 / 255.0);
+    let mut buf_63 = [0u8; 64];
+    let style_63 = c_2_63.format_style_srgb(&mut buf_63).unwrap();
+    assert_eq!(style_63, "rgb(9223372036854776000,-9223372036854776000,100)");
+    #[cfg(feature = "std")]
+    {
+        assert_eq!(c_2_63.get_style_srgb(), "rgb(9223372036854776000,-9223372036854776000,100)");
+    }
+
+    // Representable values near 1e18 beyond 2^53:
+    // (1e18 + 1024).toString() in JS -> "1000000000000001000" (shortest representation, not 1000000000000001024)
+    // 1e18.toString() in JS -> "1000000000000000000"
+    let c_1e18 = Color::new((1e18 + 1024.0) / 255.0, 1e18 / 255.0, 1.0);
+    let mut buf_18 = [0u8; 64];
+    let style_18 = c_1e18.format_style_srgb(&mut buf_18).unwrap();
+    assert_eq!(style_18, "rgb(1000000000000001000,1000000000000000000,255)");
+    #[cfg(feature = "std")]
+    {
+        assert_eq!(c_1e18.get_style_srgb(), "rgb(1000000000000001000,1000000000000000000,255)");
+    }
+
+    // Exponential formatting at >= 1e21 with signed exponent (e.g. 1e+21) matching ECMAScript:
+    let c_1e21 = Color::new(1e21 / 255.0, -1e21 / 255.0, 0.0);
+    let mut buf_21 = [0u8; 64];
+    let style_21 = c_1e21.format_style_srgb(&mut buf_21).unwrap();
+    assert_eq!(style_21, "rgb(1e+21,-1e+21,0)");
+    #[cfg(feature = "std")]
+    {
+        assert_eq!(c_1e21.get_style_srgb(), "rgb(1e+21,-1e+21,0)");
+    }
+
+    // Large exponential (2.55e27) and decimal at 1e20 (< 1e21 threshold):
+    let c_large = Color::new(2.55e27 / 255.0, 1e20 / 255.0, -1e20 / 255.0);
+    let mut buf_large = [0u8; 96];
+    let style_large = c_large.format_style_srgb(&mut buf_large).unwrap();
+    assert_eq!(style_large, "rgb(2.55e+27,100000000000000000000,-100000000000000000000)");
+    #[cfg(feature = "std")]
+    {
+        assert_eq!(c_large.get_style_srgb(), "rgb(2.55e+27,100000000000000000000,-100000000000000000000)");
+    }
 }
 
 // ============================================================================
