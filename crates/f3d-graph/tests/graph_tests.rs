@@ -2290,8 +2290,8 @@ fn positive_readonly_depth_stencil_and_sampled_view_coexistence_accepted() {
     pass.depth_stencil_attachment = Some(DepthStencilAttachment {
         target_id: tex_depth,
         view_subresource: SubresourceRange::full_texture(),
-        depth_load_op: Some(LoadOp::Load),
-        depth_store_op: Some(StoreOp::Store),
+        depth_load_op: None,
+        depth_store_op: None,
         depth_clear_value: 1.0,
         depth_read_only: true,
         stencil_load_op: None,
