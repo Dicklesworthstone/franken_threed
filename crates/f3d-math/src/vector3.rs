@@ -1,6 +1,7 @@
 //! 3D vector primitive with `f64` public semantics matching Three.js r186 `Vector3`.
 
 use core::fmt;
+use crate::matrix3::Matrix3;
 use crate::matrix4::Matrix4;
 use crate::narrowing::{check_narrow_f64, NarrowingError, NarrowingTolerance};
 use crate::quaternion::Quaternion;
@@ -46,6 +47,55 @@ impl Vector3 {
         self
     }
 
+    /// Sets this vector's components from the specified column (0..=3) of a 4x4 matrix.
+    ///
+    /// Matches Three.js r186 `Vector3.setFromMatrixColumn(m, index)`.
+    #[inline]
+    pub fn set_from_matrix_column(&mut self, m: &Matrix4, index: usize) -> &mut Self {
+        let offset = index * 4;
+        self.x = m.elements[offset];
+        self.y = m.elements[offset + 1];
+        self.z = m.elements[offset + 2];
+        self
+    }
+
+    /// Sets this vector's components from the specified column (0..=2) of a 3x3 matrix.
+    ///
+    /// Matches Three.js r186 `Vector3.setFromMatrix3Column(m, index)`.
+    #[inline]
+    pub fn set_from_matrix3_column(&mut self, m: &Matrix3, index: usize) -> &mut Self {
+        let offset = index * 3;
+        self.x = m.elements[offset];
+        self.y = m.elements[offset + 1];
+        self.z = m.elements[offset + 2];
+        self
+    }
+
+    /// Sets this vector's components from the translation column (elements 12, 13, 14) of a 4x4 matrix.
+    ///
+    /// Matches Three.js r186 `Vector3.setFromMatrixPosition(m)`.
+    #[inline]
+    pub fn set_from_matrix_position(&mut self, m: &Matrix4) -> &mut Self {
+        self.x = m.elements[12];
+        self.y = m.elements[13];
+        self.z = m.elements[14];
+        self
+    }
+
+    /// Sets this vector's components to the scale factors extracted from the basis vectors of a 4x4 matrix.
+    ///
+    /// Matches Three.js r186 `Vector3.setFromMatrixScale(m)`.
+    #[inline]
+    pub fn set_from_matrix_scale(&mut self, m: &Matrix4) -> &mut Self {
+        let sx = (m.elements[0] * m.elements[0] + m.elements[1] * m.elements[1] + m.elements[2] * m.elements[2]).sqrt();
+        let sy = (m.elements[4] * m.elements[4] + m.elements[5] * m.elements[5] + m.elements[6] * m.elements[6]).sqrt();
+        let sz = (m.elements[8] * m.elements[8] + m.elements[9] * m.elements[9] + m.elements[10] * m.elements[10]).sqrt();
+        self.x = sx;
+        self.y = sy;
+        self.z = sz;
+        self
+    }
+
     /// Copies components from another vector into this instance.
     #[inline]
     pub fn copy(&mut self, v: &Self) -> &mut Self {
@@ -70,6 +120,50 @@ impl Vector3 {
         self.x -= v.x;
         self.y -= v.y;
         self.z -= v.z;
+        self
+    }
+
+    /// Sets this vector to `a + b`.
+    ///
+    /// Matches Three.js r186 `Vector3.addVectors(a, b)`.
+    #[inline]
+    pub fn add_vectors(&mut self, a: &Self, b: &Self) -> &mut Self {
+        self.x = a.x + b.x;
+        self.y = a.y + b.y;
+        self.z = a.z + b.z;
+        self
+    }
+
+    /// Sets this vector to `a - b`.
+    ///
+    /// Matches Three.js r186 `Vector3.subVectors(a, b)`.
+    #[inline]
+    pub fn sub_vectors(&mut self, a: &Self, b: &Self) -> &mut Self {
+        self.x = a.x - b.x;
+        self.y = a.y - b.y;
+        self.z = a.z - b.z;
+        self
+    }
+
+    /// Adds `v * s` to this vector.
+    ///
+    /// Matches Three.js r186 `Vector3.addScaledVector(v, s)`.
+    #[inline]
+    pub fn add_scaled_vector(&mut self, v: &Self, s: f64) -> &mut Self {
+        self.x += v.x * s;
+        self.y += v.y * s;
+        self.z += v.z * s;
+        self
+    }
+
+    /// Inverts all components of this vector (`self = -self`).
+    ///
+    /// Matches Three.js r186 `Vector3.negate()`.
+    #[inline]
+    pub fn negate(&mut self) -> &mut Self {
+        self.x = -self.x;
+        self.y = -self.y;
+        self.z = -self.z;
         self
     }
 
@@ -104,6 +198,20 @@ impl Vector3 {
         self
     }
 
+    /// Calculates the cross product of this vector with vector `v` and stores the result in `self`.
+    ///
+    /// Matches Three.js r186 `Vector3.cross(v)`.
+    #[inline]
+    pub fn cross(&mut self, v: &Self) -> &mut Self {
+        let x = self.x;
+        let y = self.y;
+        let z = self.z;
+        self.x = y * v.z - z * v.y;
+        self.y = z * v.x - x * v.z;
+        self.z = x * v.y - y * v.x;
+        self
+    }
+
     /// Computes the squared Euclidean length.
     #[inline]
     pub fn length_sq(&self) -> f64 {
@@ -114,6 +222,33 @@ impl Vector3 {
     #[inline]
     pub fn length(&self) -> f64 {
         self.length_sq().sqrt()
+    }
+
+    /// Computes the squared Euclidean distance between this vector and vector `v`.
+    ///
+    /// Matches Three.js r186 `Vector3.distanceToSquared(v)`.
+    #[inline]
+    pub fn distance_to_squared(&self, v: &Self) -> f64 {
+        let dx = self.x - v.x;
+        let dy = self.y - v.y;
+        let dz = self.z - v.z;
+        dx * dx + dy * dy + dz * dz
+    }
+
+    /// Computes the Euclidean distance between this vector and vector `v`.
+    ///
+    /// Matches Three.js r186 `Vector3.distanceTo(v)`.
+    #[inline]
+    pub fn distance_to(&self, v: &Self) -> f64 {
+        self.distance_to_squared(v).sqrt()
+    }
+
+    /// Computes the Manhattan (L1) distance between this vector and vector `v`.
+    ///
+    /// Matches Three.js r186 `Vector3.manhattanDistanceTo(v)`.
+    #[inline]
+    pub fn manhattan_distance_to(&self, v: &Self) -> f64 {
+        (self.x - v.x).abs() + (self.y - v.y).abs() + (self.z - v.z).abs()
     }
 
     /// Divides all components of this vector by scalar `s` matching Three.js r186 `divideScalar`.
@@ -132,6 +267,43 @@ impl Vector3 {
         let l = self.length();
         let denom = if l == 0.0 || l.is_nan() { 1.0 } else { l };
         self.divide_scalar(denom)
+    }
+
+    /// Linearly interpolates between this vector and vector `v` by factor `alpha`.
+    ///
+    /// Matches Three.js r186 `Vector3.lerp(v, alpha)`:
+    /// `self += (v - self) * alpha`.
+    #[inline]
+    pub fn lerp(&mut self, v: &Self, alpha: f64) -> &mut Self {
+        self.x += (v.x - self.x) * alpha;
+        self.y += (v.y - self.y) * alpha;
+        self.z += (v.z - self.z) * alpha;
+        self
+    }
+
+    /// Linearly interpolates between `v1` and `v2` by factor `alpha` and stores in `self`.
+    ///
+    /// Matches Three.js r186 `Vector3.lerpVectors(v1, v2, alpha)`.
+    #[inline]
+    pub fn lerp_vectors(&mut self, v1: &Self, v2: &Self, alpha: f64) -> &mut Self {
+        self.x = v1.x + (v2.x - v1.x) * alpha;
+        self.y = v1.y + (v2.y - v1.y) * alpha;
+        self.z = v1.z + (v2.z - v1.z) * alpha;
+        self
+    }
+
+    /// Returns the angle between this vector and vector `v` in radians.
+    ///
+    /// Matches Three.js r186 `Vector3.angleTo(v)`:
+    /// Returns `PI / 2` when either vector length is zero.
+    #[inline]
+    pub fn angle_to(&self, v: &Self) -> f64 {
+        let denominator = (self.length_sq() * v.length_sq()).sqrt();
+        if denominator == 0.0 {
+            return core::f64::consts::FRAC_PI_2;
+        }
+        let theta = self.dot(v) / denominator;
+        theta.clamp(-1.0, 1.0).acos()
     }
 
     /// Transforms this vector by a 4x4 matrix, including division by the perspective component `w`.
@@ -156,6 +328,38 @@ impl Vector3 {
         self
     }
 
+    /// Projects this vector from world space into normalized device coordinates (NDC)
+    /// given the camera's inverse world matrix (view matrix) and projection matrix.
+    ///
+    /// Matches Three.js r186 `Vector3.project(camera)`:
+    /// `this.applyMatrix4(camera.matrixWorldInverse).applyMatrix4(camera.projectionMatrix)`.
+    #[inline]
+    pub fn project(&mut self, matrix_world_inverse: &Matrix4, projection_matrix: &Matrix4) -> &mut Self {
+        self.apply_matrix4(matrix_world_inverse);
+        self.apply_matrix4(projection_matrix);
+        self
+    }
+
+    /// Unprojects this vector from normalized device coordinates (NDC) into world space
+    /// given the camera's inverse projection matrix and world matrix.
+    ///
+    /// Matches Three.js r186 `Vector3.unproject(camera)`:
+    /// `this.applyMatrix4(camera.projectionMatrixInverse).applyMatrix4(camera.matrixWorld)`.
+    #[inline]
+    pub fn unproject(&mut self, projection_matrix_inverse: &Matrix4, matrix_world: &Matrix4) -> &mut Self {
+        self.apply_matrix4(projection_matrix_inverse);
+        self.apply_matrix4(matrix_world);
+        self
+    }
+
+    /// Projects this vector directly using a combined view-projection matrix.
+    ///
+    /// Evaluates `self.apply_matrix4(view_projection)`.
+    #[inline]
+    pub fn project_view_projection(&mut self, view_projection: &Matrix4) -> &mut Self {
+        self.apply_matrix4(view_projection)
+    }
+
     /// Transforms this direction vector by a 4x4 matrix ignoring translation (`w = 0.0`).
     #[inline]
     pub fn transform_direction(&mut self, m: &Matrix4) -> &mut Self {
@@ -169,6 +373,31 @@ impl Vector3 {
         self.z = e[2] * x + e[6] * y + e[10] * z;
 
         self.normalize()
+    }
+
+    /// Multiplies this vector by 3x3 matrix `m`.
+    ///
+    /// Matches Three.js r186 `Vector3.applyMatrix3(m)`.
+    #[inline]
+    pub fn apply_matrix3(&mut self, m: &Matrix3) -> &mut Self {
+        let x = self.x;
+        let y = self.y;
+        let z = self.z;
+        let e = &m.elements;
+
+        self.x = e[0] * x + e[3] * y + e[6] * z;
+        self.y = e[1] * x + e[4] * y + e[7] * z;
+        self.z = e[2] * x + e[5] * y + e[8] * z;
+
+        self
+    }
+
+    /// Multiplies this vector by the given normal matrix and normalizes the result.
+    ///
+    /// Matches Three.js r186 `Vector3.applyNormalMatrix(m)`.
+    #[inline]
+    pub fn apply_normal_matrix(&mut self, m: &Matrix3) -> &mut Self {
+        self.apply_matrix3(m).normalize()
     }
 
     /// Applies rotation from a quaternion to this vector.

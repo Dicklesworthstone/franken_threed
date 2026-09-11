@@ -190,6 +190,63 @@ impl Quaternion {
         self
     }
 
+    /// Sets this quaternion from Euler angles matching Three.js r186 `Quaternion.setFromEuler`.
+    pub fn set_from_euler(&mut self, euler: &crate::euler::Euler) -> &mut Self {
+        let x = euler.x;
+        let y = euler.y;
+        let z = euler.z;
+        let order = euler.order;
+
+        let c1 = (x / 2.0).cos();
+        let c2 = (y / 2.0).cos();
+        let c3 = (z / 2.0).cos();
+
+        let s1 = (x / 2.0).sin();
+        let s2 = (y / 2.0).sin();
+        let s3 = (z / 2.0).sin();
+
+        match order {
+            crate::euler::EulerOrder::XYZ => {
+                self.x = s1 * c2 * c3 + c1 * s2 * s3;
+                self.y = c1 * s2 * c3 - s1 * c2 * s3;
+                self.z = c1 * c2 * s3 + s1 * s2 * c3;
+                self.w = c1 * c2 * c3 - s1 * s2 * s3;
+            }
+            crate::euler::EulerOrder::YXZ => {
+                self.x = s1 * c2 * c3 + c1 * s2 * s3;
+                self.y = c1 * s2 * c3 - s1 * c2 * s3;
+                self.z = c1 * c2 * s3 - s1 * s2 * c3;
+                self.w = c1 * c2 * c3 + s1 * s2 * s3;
+            }
+            crate::euler::EulerOrder::ZXY => {
+                self.x = s1 * c2 * c3 - c1 * s2 * s3;
+                self.y = c1 * s2 * c3 + s1 * c2 * s3;
+                self.z = c1 * c2 * s3 + s1 * s2 * c3;
+                self.w = c1 * c2 * c3 - s1 * s2 * s3;
+            }
+            crate::euler::EulerOrder::ZYX => {
+                self.x = s1 * c2 * c3 - c1 * s2 * s3;
+                self.y = c1 * s2 * c3 + s1 * c2 * s3;
+                self.z = c1 * c2 * s3 - s1 * s2 * c3;
+                self.w = c1 * c2 * c3 + s1 * s2 * s3;
+            }
+            crate::euler::EulerOrder::YZX => {
+                self.x = s1 * c2 * c3 + c1 * s2 * s3;
+                self.y = c1 * s2 * c3 - s1 * c2 * s3;
+                self.z = c1 * c2 * s3 - s1 * s2 * c3;
+                self.w = c1 * c2 * c3 - s1 * s2 * s3;
+            }
+            crate::euler::EulerOrder::XZY => {
+                self.x = s1 * c2 * c3 - c1 * s2 * s3;
+                self.y = c1 * s2 * c3 - s1 * c2 * s3;
+                self.z = c1 * c2 * s3 + s1 * s2 * c3;
+                self.w = c1 * c2 * c3 + s1 * s2 * s3;
+            }
+        }
+
+        self
+    }
+
     /// Returns components as a fixed-size 4-element array `[x, y, z, w]`.
     #[inline]
     pub const fn to_array(&self) -> [f64; 4] {

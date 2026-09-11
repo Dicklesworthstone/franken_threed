@@ -488,6 +488,7 @@ dependencies = [
  "asupersync",
  "f3d-core",
  "f3d-graph",
+ "f3d-math",
  "js-sys",
  "wasm-bindgen",
  "wasm-bindgen-futures",

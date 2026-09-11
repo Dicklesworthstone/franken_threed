@@ -52,3 +52,4 @@ serde_json = { version = "=1.0.151", default-features = false, features = ["allo
 # Internal workspace crates
 f3d-core = { path = "crates/f3d-core", default-features = false }
 f3d-graph = { path = "crates/f3d-graph", default-features = false }
+f3d-math = { path = "crates/f3d-math", default-features = false }

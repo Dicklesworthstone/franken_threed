@@ -5,7 +5,7 @@
 //! and perspective divide).
 
 use f3d_core::layout::{LayoutError, ProjectiveMat4};
-use f3d_math::{CoordinateSystem, Matrix4, NarrowingError, NarrowingTolerance, Quaternion, Vector3};
+use f3d_math::{CoordinateSystem, Matrix3, Matrix4, NarrowingError, Quaternion, Vector3};
 
 
 const EPS: f64 = 1e-10;
@@ -780,6 +780,232 @@ fn test_matrix4_checked_narrowing_and_conversions() {
         "f64 affine shape check runs before narrowing"
     );
 }
+
+#[test]
+fn test_vector3_cross_and_anti_commutativity() {
+    let ex = Vector3::new(1.0, 0.0, 0.0);
+    let ey = Vector3::new(0.0, 1.0, 0.0);
+    let ez = Vector3::new(0.0, 0.0, 1.0);
+
+    // Standard basis cross products
+    let mut v = ex;
+    v.cross(&ey);
+    assert_vec_close(&v, [0.0, 0.0, 1.0], EPS, "ex cross ey == ez");
+
+    let mut v = ey;
+    v.cross(&ez);
+    assert_vec_close(&v, [1.0, 0.0, 0.0], EPS, "ey cross ez == ex");
+
+    let mut v = ez;
+    v.cross(&ex);
+    assert_vec_close(&v, [0.0, 1.0, 0.0], EPS, "ez cross ex == ey");
+
+    // Anti-commutativity
+    let mut v = ey;
+    v.cross(&ex);
+    assert_vec_close(&v, [0.0, 0.0, -1.0], EPS, "ey cross ex == -ez");
+
+    // Arbitrary vectors: a = (2, 3, 4), b = (5, 6, 7)
+    // a x b = (3*7 - 4*6, 4*5 - 2*7, 2*6 - 3*5) = (21-24, 20-14, 12-15) = (-3, 6, -3)
+    let mut a = Vector3::new(2.0, 3.0, 4.0);
+    let b = Vector3::new(5.0, 6.0, 7.0);
+    a.cross(&b);
+    assert_vec_close(&a, [-3.0, 6.0, -3.0], EPS, "arbitrary cross product");
+
+    // Self cross product is zero
+    let mut s = Vector3::new(2.0, 3.0, 4.0);
+    let s_clone = s;
+    s.cross(&s_clone);
+    assert_vec_close(&s, [0.0, 0.0, 0.0], EPS, "self cross product is zero");
+}
+
+#[test]
+fn test_vector3_lerp_and_lerp_vectors() {
+    let v1 = Vector3::new(10.0, 20.0, 30.0);
+    let v2 = Vector3::new(30.0, 40.0, 50.0);
+
+    // alpha = 0.0
+    let mut v = v1;
+    v.lerp(&v2, 0.0);
+    assert_vec_close(&v, [10.0, 20.0, 30.0], EPS, "lerp alpha=0.0");
+
+    // alpha = 0.5
+    let mut v = v1;
+    v.lerp(&v2, 0.5);
+    assert_vec_close(&v, [20.0, 30.0, 40.0], EPS, "lerp alpha=0.5");
+
+    // alpha = 1.0
+    let mut v = v1;
+    v.lerp(&v2, 1.0);
+    assert_vec_close(&v, [30.0, 40.0, 50.0], EPS, "lerp alpha=1.0");
+
+    // lerp_vectors with alpha = 0.25: 10 + (30-10)*0.25 = 15
+    let mut out = Vector3::zero();
+    out.lerp_vectors(&v1, &v2, 0.25);
+    assert_vec_close(&out, [15.0, 25.0, 35.0], EPS, "lerp_vectors alpha=0.25");
+
+    // Extrapolation with alpha = -0.5: 10 + 20*(-0.5) = 0
+    let mut ext = v1;
+    ext.lerp(&v2, -0.5);
+    assert_vec_close(&ext, [0.0, 10.0, 20.0], EPS, "lerp extrapolation alpha=-0.5");
+}
+
+#[test]
+fn test_vector3_angle_to_analytical() {
+    let ex = Vector3::new(1.0, 0.0, 0.0);
+    let ey = Vector3::new(0.0, 1.0, 0.0);
+    let ez = Vector3::new(0.0, 0.0, 1.0);
+
+    // Orthogonal: PI / 2
+    assert_close(ex.angle_to(&ey), core::f64::consts::FRAC_PI_2, EPS, "ex angle_to ey == PI/2");
+    assert_close(ey.angle_to(&ez), core::f64::consts::FRAC_PI_2, EPS, "ey angle_to ez == PI/2");
+
+    // Collinear same direction: 0
+    assert_close(ex.angle_to(&ex), 0.0, EPS, "ex angle_to ex == 0");
+    let ex2 = Vector3::new(5.0, 0.0, 0.0);
+    assert_close(ex.angle_to(&ex2), 0.0, EPS, "ex angle_to scaled ex == 0");
+
+    // Collinear opposite direction: PI
+    let neg_ex = Vector3::new(-1.0, 0.0, 0.0);
+    assert_close(ex.angle_to(&neg_ex), core::f64::consts::PI, EPS, "ex angle_to -ex == PI");
+
+    // 45 degrees: (1, 1, 0) and (1, 0, 0) -> cos(theta) = 1/sqrt(2) -> PI/4
+    let diag = Vector3::new(1.0, 1.0, 0.0);
+    assert_close(diag.angle_to(&ex), core::f64::consts::FRAC_PI_4, EPS, "(1,1,0) angle_to (1,0,0) == PI/4");
+
+    // Zero vector fallback matching Three.js r186: if denominator == 0 return PI / 2
+    let zero = Vector3::zero();
+    assert_close(zero.angle_to(&ex), core::f64::consts::FRAC_PI_2, EPS, "zero angle_to ex == PI/2");
+    assert_close(ex.angle_to(&zero), core::f64::consts::FRAC_PI_2, EPS, "ex angle_to zero == PI/2");
+}
+
+#[test]
+fn test_vector3_distance_methods_pythagorean() {
+    // 3-4-12 -> 13 Pythagorean quadruple: 3^2 + 4^2 + 12^2 = 9 + 16 + 144 = 169 = 13^2
+    let a = Vector3::new(1.0, 2.0, 3.0);
+    let b = Vector3::new(4.0, 6.0, 15.0);
+
+    assert_close(a.distance_to_squared(&b), 169.0, EPS, "distance_to_squared 3-4-12");
+    assert_close(a.distance_to(&b), 13.0, EPS, "distance_to 3-4-12");
+    assert_close(a.manhattan_distance_to(&b), 19.0, EPS, "manhattan_distance_to 3-4-12");
+
+    // Symmetry
+    assert_close(b.distance_to(&a), 13.0, EPS, "distance_to symmetry");
+    assert_close(b.manhattan_distance_to(&a), 19.0, EPS, "manhattan symmetry");
+
+    // Zero distance to self
+    assert_close(a.distance_to(&a), 0.0, EPS, "distance to self is 0");
+    assert_close(a.distance_to_squared(&a), 0.0, EPS, "distance squared to self is 0");
+    assert_close(a.manhattan_distance_to(&a), 0.0, EPS, "manhattan to self is 0");
+}
+
+#[test]
+fn test_vector3_set_from_matrix_columns_scale_and_position() {
+    let mut m4 = Matrix4::zero();
+    for col in 0..4 {
+        for row in 0..4 {
+            m4.elements[col * 4 + row] = (col * 4 + row + 1) as f64;
+        }
+    }
+
+    let mut v = Vector3::zero();
+    v.set_from_matrix_column(&m4, 0);
+    assert_vec_close(&v, [1.0, 2.0, 3.0], EPS, "m4 column 0");
+
+    v.set_from_matrix_column(&m4, 1);
+    assert_vec_close(&v, [5.0, 6.0, 7.0], EPS, "m4 column 1");
+
+    v.set_from_matrix_column(&m4, 2);
+    assert_vec_close(&v, [9.0, 10.0, 11.0], EPS, "m4 column 2");
+
+    v.set_from_matrix_column(&m4, 3);
+    assert_vec_close(&v, [13.0, 14.0, 15.0], EPS, "m4 column 3");
+
+    v.set_from_matrix_position(&m4);
+    assert_vec_close(&v, [13.0, 14.0, 15.0], EPS, "m4 position column");
+
+    // Matrix3 column extraction
+    let mut m3 = Matrix3::zero();
+    for col in 0..3 {
+        for row in 0..3 {
+            m3.elements[col * 3 + row] = ((col * 3 + row + 1) * 10) as f64;
+        }
+    }
+    v.set_from_matrix3_column(&m3, 0);
+    assert_vec_close(&v, [10.0, 20.0, 30.0], EPS, "m3 column 0");
+
+    v.set_from_matrix3_column(&m3, 1);
+    assert_vec_close(&v, [40.0, 50.0, 60.0], EPS, "m3 column 1");
+
+    v.set_from_matrix3_column(&m3, 2);
+    assert_vec_close(&v, [70.0, 80.0, 90.0], EPS, "m3 column 2");
+
+    // set_from_matrix_scale
+    let mut m_scale = Matrix4::identity();
+    m_scale.elements[0] = 2.0;
+    m_scale.elements[5] = -3.0;
+    m_scale.elements[10] = 4.0;
+    v.set_from_matrix_scale(&m_scale);
+    assert_vec_close(&v, [2.0, 3.0, 4.0], EPS, "set_from_matrix_scale norms");
+}
+
+#[test]
+fn test_vector3_apply_matrix4_perspective_divide_analytical() {
+    let m = Matrix4::from_elements([
+        2.0, 0.0, 0.0, 0.0,
+        0.0, 3.0, 0.0, 0.0,
+        0.0, 0.0, 4.0, -1.0,
+        0.0, 0.0, 5.0, 0.0,
+    ]);
+
+    let mut v = Vector3::new(2.0, 4.0, -2.0);
+    v.apply_matrix4(&m);
+    assert_vec_close(&v, [2.0, 6.0, -1.5], EPS, "apply_matrix4 perspective divide");
+}
+
+#[test]
+fn test_vector3_apply_quaternion_analytical() {
+    let s = (0.5f64).sqrt();
+    let qz_90 = Quaternion::new(0.0, 0.0, s, s);
+    let mut v = Vector3::new(1.0, 0.0, 0.0);
+    v.apply_quaternion(&qz_90);
+    assert_vec_close(&v, [0.0, 1.0, 0.0], EPS, "rot 90 deg around Z");
+
+    let qx_90 = Quaternion::new(s, 0.0, 0.0, s);
+    let mut v = Vector3::new(0.0, 1.0, 0.0);
+    v.apply_quaternion(&qx_90);
+    assert_vec_close(&v, [0.0, 0.0, 1.0], EPS, "rot 90 deg around X");
+
+    let qy_180 = Quaternion::new(0.0, 1.0, 0.0, 0.0);
+    let mut v = Vector3::new(1.0, 2.0, 3.0);
+    v.apply_quaternion(&qy_180);
+    assert_vec_close(&v, [-1.0, 2.0, -3.0], EPS, "rot 180 deg around Y");
+}
+
+#[test]
+fn test_vector3_project_and_unproject_analytical() {
+    let mut matrix_world = Matrix4::identity();
+    matrix_world.elements[14] = 10.0;
+
+    let mut matrix_world_inv = Matrix4::identity();
+    matrix_world_inv.elements[14] = -10.0;
+
+    let mut proj = Matrix4::identity();
+    proj.make_perspective(-1.0, 1.0, 1.0, -1.0, 1.0, 100.0, CoordinateSystem::WebGPU, false);
+
+    let proj_inv = proj.try_invert().expect("perspective projection is invertible");
+
+    let original = Vector3::new(2.5, -1.25, 5.0);
+    let mut p = original;
+    p.project(&matrix_world_inv, &proj);
+
+    let expected_z_ndc = 80.0 / 99.0;
+    assert_vec_close(&p, [0.5, -0.25, expected_z_ndc], 1e-9, "project to NDC");
+
+    p.unproject(&proj_inv, &matrix_world);
+    assert_vec_close(&p, [original.x, original.y, original.z], 1e-9, "unproject roundtrip");
+}
+
 
 
 

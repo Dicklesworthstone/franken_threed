@@ -13,14 +13,42 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(feature = "std"), no_std)]
 
+pub mod box3;
+pub mod color;
 pub mod conversion;
+pub mod euler;
+pub mod jsnum;
+pub mod line3;
+pub mod matrix3;
 pub mod matrix4;
 pub mod narrowing;
+pub mod plane;
 pub mod quaternion;
+pub mod ray;
+pub mod sphere;
+pub mod triangle;
 pub mod vector3;
 
+pub use box3::Box3;
+pub use color::{
+    linear_to_srgb, srgb_to_linear, Color, ColorSpace, Hsl, StyleOutcome, COLOR_NAMES,
+    LINEAR_DISPLAY_P3_TO_LINEAR_SRGB, LINEAR_DISPLAY_P3_TO_XYZ, LINEAR_REC709_TO_XYZ,
+    LINEAR_SRGB_TO_LINEAR_DISPLAY_P3, XYZ_TO_LINEAR_DISPLAY_P3, XYZ_TO_LINEAR_REC709,
+};
+pub use euler::{Euler, EulerOrder};
+pub use jsnum::{
+    js_max, js_max_slice, js_min, js_min_slice, js_rem, js_round, js_shift_left, js_shift_right,
+    js_shift_unsigned_right, js_sign, js_trunc, js_unsigned_shift_right, to_int32, to_uint32,
+};
+pub use line3::Line3;
+pub use matrix3::Matrix3;
 pub use matrix4::{CoordinateSystem, Matrix4};
 pub use narrowing::{check_narrow_f64, NarrowingError, NarrowingTolerance};
+pub use plane::Plane;
 pub use quaternion::Quaternion;
+pub use ray::Ray;
+pub use sphere::Sphere;
+pub use triangle::Triangle;
 pub use vector3::Vector3;
+
 

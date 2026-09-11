@@ -353,6 +353,13 @@ impl Matrix4 {
         self
     }
 
+    /// Sets the rotation component of this transformation matrix from a quaternion,
+    /// with position zero `(0, 0, 0)` and unit scale `(1, 1, 1)` matching Three.js r186.
+    #[inline]
+    pub fn make_rotation_from_quaternion(&mut self, q: &Quaternion) -> &mut Self {
+        self.compose(&Vector3::zero(), q, &Vector3::one())
+    }
+
     /// Decomposes this matrix into its position, rotation, and scale components.
     ///
     /// Returns `false` if the affine determinant is zero (matrix is singular), matching Three.js r186.
@@ -403,6 +410,20 @@ impl Matrix4 {
         scale.z = sz;
 
         true
+    }
+
+    /// Returns the maximum scale factor along the three coordinate axes.
+    ///
+    /// Evaluates `sqrt(max(||col0||^2, ||col1||^2, ||col2||^2))` matching Three.js r186 `Matrix4.getMaxScaleOnAxis()`.
+    #[inline]
+    pub fn get_max_scale_on_axis(&self) -> f64 {
+        let te = &self.elements;
+        let scale_x_sq = te[0] * te[0] + te[1] * te[1] + te[2] * te[2];
+        let scale_y_sq = te[4] * te[4] + te[5] * te[5] + te[6] * te[6];
+        let scale_z_sq = te[8] * te[8] + te[9] * te[9] + te[10] * te[10];
+
+        let max_sq = scale_x_sq.max(scale_y_sq).max(scale_z_sq);
+        max_sq.sqrt()
     }
 
     /// Checks if this matrix represents an affine transformation.
