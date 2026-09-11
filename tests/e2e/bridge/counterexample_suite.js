@@ -36,10 +36,16 @@ import {
   renderDirectTriangleReference,
   renderDirectRedABlueBReference,
   renderDirectBundleDirectReference,
+  renderDirectNestedPassReference,
+  renderDirectBrokenNestedPass,
   assertBundleDirectDrawMatch,
   assertGenerationalHandlePublication,
   assertMemoryGrowthAllowed,
   assertAffineRowsLayoutValid,
+  assertAffineRowsTransformMatch,
+  assertNestedPassMatch,
+  renderDirectNestedCanvasOffscreenReference,
+  assertNestedCanvasPassMatch,
   evalDirectAffineTransform,
 } from "./oracle_reference.js";
 
@@ -1174,8 +1180,8 @@ export async function testNegativeBrokenBundleDirectDraw(host, oraclePixels, wid
 
   // Vertex buffer 1: Triangle 1 (left side)
   const tri1Data = new Float32Array([
-    -1.0,  1.0, 0.0,  0.0, 1.0,
     -1.0, -1.0, 0.0,  0.0, 0.0,
+     0.0, -1.0, 0.0,  0.5, 0.0,
      0.0,  1.0, 0.0,  0.5, 1.0,
   ]);
   const vb1 = host.device.createBuffer({
@@ -1460,8 +1466,10 @@ export async function testNegativeBrokenGenerationalHandlePublication(host, wasm
  * - `gpu_bridge_borrow_enter() -> u64` (alias `f3d_borrow_enter`)
  * - `gpu_bridge_borrow_exit(token: u64) -> bool` (alias `f3d_borrow_exit`)
  * - `gpu_bridge_try_grow_memory(pages: u32) -> bool` (alias `f3d_try_grow_memory`)
+ * - `gpu_bridge_build_triangle_packet() -> Uint8Array` (alias `f3d_build_first_frame_packet`)
  *
  * Sequence:
+ * Part 1: BorrowScope Policy Gate (Metadata Unit Gate)
  * 1. Assert grow true when idle (`try_grow_memory(1) === true`).
  * 2. Assert enter gives nonzero BigInt token (`typeof token === "bigint" && token !== 0n`).
  * 3. Assert grow false while borrowed (`try_grow_memory(1) === false`).
@@ -1469,20 +1477,51 @@ export async function testNegativeBrokenGenerationalHandlePublication(host, wasm
  * 5. Assert exit with right token true (`borrow_exit(token) === true`).
  * 6. Assert grow true again (`try_grow_memory(1) === true`).
  *
+ * Part 2: Real Application-Memory Transport & Growth Invariance (OrangePelican Mail #6811)
+ * 7. Strictly require real `WebAssembly.Memory` passed from `await wasm.default()`.
+ *    No optional fallback or bypass branch permitted.
+ * 8. Pre-growth owned packet: call `buildTriangleFn()` to produce an owned Uint8Array,
+ *    and take a read-only snapshot (`new Uint8Array(preGrowthPacket.slice())`).
+ * 9. Memory growth: call `wasmMemory.grow(1)` and verify byteLength increase by 65536.
+ * 10. View invalidation: verify unrefreshed view/buffer is detached or buffer identity changed.
+ * 11. Owned-copy stability: verify `preGrowthPacket` bytes are uncorrupted across `grow(1)`.
+ * 12. Post-growth packet & view refresh: call `buildTriangleFn()` post-growth, verifying
+ *     wasm-bindgen's internal buffer view refreshed properly and produces matching packet bytes.
+ * 13. Callback reentry: call `borrow_enter()` after growth to demonstrate real Rust reentry,
+ *     verify growth is blocked during reentry, exit cleanly, and verify owned pre-callback
+ *     bytes remain intact.
+ *
  * Negative Control: An open borrow is entered, and an attempt to grow memory
  * is issued. The EXACT SAME `assertMemoryGrowthAllowed` assertion rejects it.
  */
-export async function testLinearMemoryBorrowGuards(host, wasmModule) {
+export async function testLinearMemoryBorrowGuards(host, wasmModule, wasmMemory) {
   const enterFn = wasmModule?.f3d_borrow_enter || wasmModule?.gpu_bridge_borrow_enter;
   const exitFn = wasmModule?.f3d_borrow_exit || wasmModule?.gpu_bridge_borrow_exit;
   const growFn = wasmModule?.f3d_try_grow_memory || wasmModule?.gpu_bridge_try_grow_memory;
+  const buildTriangleFn = wasmModule?.f3d_build_first_frame_packet || wasmModule?.gpu_bridge_build_triangle_packet;
 
-  if (!wasmModule || typeof enterFn !== "function" || typeof exitFn !== "function" || typeof growFn !== "function") {
+  if (
+    !wasmModule ||
+    typeof enterFn !== "function" ||
+    typeof exitFn !== "function" ||
+    typeof growFn !== "function" ||
+    typeof buildTriangleFn !== "function"
+  ) {
     throw new Error(
-      "Missing Wasm Export: testLinearMemoryBorrowGuards requires compiled application Wasm with exports 'gpu_bridge_borrow_enter', 'gpu_bridge_borrow_exit', and 'gpu_bridge_try_grow_memory' (or canonical aliases). Silent JS fallback is forbidden."
+      "Missing Wasm Export: testLinearMemoryBorrowGuards requires compiled application Wasm with exports 'gpu_bridge_borrow_enter', 'gpu_bridge_borrow_exit', 'gpu_bridge_try_grow_memory', and 'gpu_bridge_build_triangle_packet' (or canonical aliases). Silent JS fallback is forbidden."
     );
   }
 
+  // Strictly require real WebAssembly.Memory captured from await wasm.default().
+  // No optional-pass or bypass branch permitted (OrangePelican Mail #6811).
+  const memory = wasmMemory || wasmModule?.memory;
+  if (!memory || !(memory instanceof WebAssembly.Memory) || typeof memory.grow !== "function") {
+    throw new Error(
+      "Missing WebAssembly.Memory: testLinearMemoryBorrowGuards strictly requires the WebAssembly.Memory instance captured from await wasm.default(). Optional or missing memory fallbacks are forbidden."
+    );
+  }
+
+  // --- Part 1: BorrowScope Policy Gate (Metadata Unit Gate) ---
   // 1. Assert grow true when idle
   const idleGrow = growFn(1);
   if (idleGrow !== true) {
@@ -1528,7 +1567,7 @@ export async function testLinearMemoryBorrowGuards(host, wasmModule) {
     );
   }
 
-  // 6. Assert grow true again
+  // 6. Assert grow true again after exit
   const postExitGrow = growFn(1);
   if (postExitGrow !== true) {
     throw new Error(
@@ -1537,9 +1576,139 @@ export async function testLinearMemoryBorrowGuards(host, wasmModule) {
   }
   assertMemoryGrowthAllowed(growFn, 1);
 
-  return {
+  const policyGateStatus = {
     token: String(token),
-    detail: "Verified via real Rust/Wasm borrow scope exports: grow(idle)=true, enter=token, grow(borrowed)=false, exit(wrong)=false, exit(token)=true, grow(post)=true.",
+    idleGrow: true,
+    borrowedGrowBlocked: true,
+    wrongTokenRejected: true,
+    cleanExitRestored: true,
+  };
+
+  // --- Part 2: Real Application-Memory Transport & Growth Invariance ---
+  // No arbitrary canary writes into unallocated Rust heap (Mail #6811).
+  // A. Generate real owned packet from Rust before memory growth
+  const preGrowthPacket = buildTriangleFn();
+  if (!(preGrowthPacket instanceof Uint8Array) || preGrowthPacket.byteLength < 32) {
+    throw new Error(
+      `Pre-growth packet invalid: expected Uint8Array with length >= 32, got ${preGrowthPacket?.constructor?.name} (len=${preGrowthPacket?.byteLength})`
+    );
+  }
+
+  // Take an independent read-only snapshot of the owned packet bytes to serve as stable ground truth
+  const preGrowthSnapshot = new Uint8Array(preGrowthPacket.slice());
+
+  // Capture initial WebAssembly.Memory state and un-refreshed raw view
+  const initialBytes = memory.buffer.byteLength;
+  const initialPages = initialBytes / 65536;
+  const oldBuffer = memory.buffer;
+  const unrefreshedMemoryView = new Uint8Array(oldBuffer);
+
+  // B. Perform actual WebAssembly.Memory growth
+  memory.grow(1);
+  const newBytes = memory.buffer.byteLength;
+  const newPages = newBytes / 65536;
+
+  if (newBytes !== initialBytes + 65536) {
+    throw new Error(
+      `Real Memory Growth Failed: Expected buffer byteLength to increase by 65536, got from ${initialBytes} to ${newBytes}`
+    );
+  }
+
+  // C. Verify un-refreshed view detachment or buffer identity change
+  const isDetachedOrChanged =
+    oldBuffer !== memory.buffer ||
+    oldBuffer.detached === true ||
+    unrefreshedMemoryView.byteLength === 0;
+
+  if (!isDetachedOrChanged) {
+    throw new Error(
+      "Transport Invariant Failed: WebAssembly.Memory.grow(1) did not invalidate previous ArrayBuffer/view reference!"
+    );
+  }
+
+  // D. Verify pre-growth owned packet remains completely intact and uncorrupted
+  if (preGrowthPacket.byteLength !== preGrowthSnapshot.byteLength) {
+    throw new Error(
+      `Owned Copy Invariant Failed: Pre-growth owned packet length changed across memory.grow() (expected ${preGrowthSnapshot.byteLength}, got ${preGrowthPacket.byteLength})`
+    );
+  }
+  for (let i = 0; i < preGrowthSnapshot.length; i++) {
+    if (preGrowthPacket[i] !== preGrowthSnapshot[i]) {
+      throw new Error(
+        `Owned Copy Invariant Failed: Pre-growth owned packet byte corrupted at index ${i} across memory.grow() (expected ${preGrowthSnapshot[i]}, got ${preGrowthPacket[i]})`
+      );
+    }
+  }
+
+  // E. Call packet generator again post-growth to verify wasm-bindgen's cached-view refresh
+  // and compare output bytes against the pre-growth snapshot
+  const postGrowthPacket = buildTriangleFn();
+  if (!(postGrowthPacket instanceof Uint8Array)) {
+    throw new Error(
+      `Post-growth packet invalid: expected Uint8Array, got ${postGrowthPacket?.constructor?.name}`
+    );
+  }
+  if (postGrowthPacket.byteLength !== preGrowthSnapshot.byteLength) {
+    throw new Error(
+      `Cached View Refresh Failed: Post-growth packet byteLength mismatch (expected ${preGrowthSnapshot.byteLength}, got ${postGrowthPacket.byteLength})`
+    );
+  }
+  for (let i = 0; i < preGrowthSnapshot.length; i++) {
+    if (postGrowthPacket[i] !== preGrowthSnapshot[i]) {
+      throw new Error(
+        `Cached View Refresh Failed: Post-growth packet byte mismatch at index ${i} (expected ${preGrowthSnapshot[i]}, got ${postGrowthPacket[i]})`
+      );
+    }
+  }
+
+  // F. Demonstrate real Rust callback reentry after growth and validate pre-callback owned bytes
+  const reentryToken = enterFn();
+  if (typeof reentryToken !== "bigint" || reentryToken === 0n) {
+    throw new Error(
+      `Reentry Failed: Expected borrow_enter() after growth to return non-zero BigInt token, got ${typeof reentryToken}`
+    );
+  }
+  // While reentered into borrow, verify growth is blocked
+  const reentryGrowBlocked = growFn(1) === false;
+  if (!reentryGrowBlocked) {
+    exitFn(reentryToken);
+    throw new Error(
+      "Reentry Safety Failed: Expected try_grow_memory(1) to be blocked during reentered borrow!"
+    );
+  }
+  // Exit the reentered borrow cleanly
+  const reentryExitOk = exitFn(reentryToken);
+  if (!reentryExitOk) {
+    throw new Error(
+      "Reentry Safety Failed: Expected borrow_exit(reentryToken) to succeed after reentered borrow!"
+    );
+  }
+
+  // Validate that the owned pre-growth packet bytes are still perfectly intact after Rust reentry
+  for (let i = 0; i < preGrowthSnapshot.length; i++) {
+    if (preGrowthPacket[i] !== preGrowthSnapshot[i]) {
+      throw new Error(
+        `Reentry Invariant Failed: Pre-growth owned packet byte corrupted at index ${i} across Rust callback reentry`
+      );
+    }
+  }
+
+  const memoryGrowthReport = {
+    initialPages,
+    newPages,
+    initialBytes,
+    newBytes,
+    isDetachedOrChanged,
+    preGrowthPacketBytes: preGrowthSnapshot.byteLength,
+    ownedPacketPreserved: true,
+    postGrowthPacketRefreshed: true,
+    reentryValidated: true,
+  };
+
+  return {
+    policyGateStatus,
+    memoryGrowthReport,
+    detail: `Verified real Wasm memory growth (${initialPages}->${newPages} pages, buffer detached/changed=${isDetachedOrChanged}, owned packet preserved [${preGrowthSnapshot.byteLength}B], cached view refreshed on post-growth allocation, Rust reentry verified) + BorrowScope policy gate (idle=true, in-borrow=false, wrong-token=false, exit=true).`,
   };
 }
 
@@ -1763,6 +1932,32 @@ export async function testAffineRowsGpuLayoutValidation(host, wasmModule) {
     );
   }
 
+  // 9. Authoritative Browser Execution: Real AffineRows Transform Packet & WGSL Evaluation
+  // Calls Chartreuse's export gpu_bridge_build_affine_rows_transform_packet (§6.1, §6.2, vqa.6)
+  const buildAffineTransformFn = wasmModule?.f3d_build_affine_rows_transform_packet || wasmModule?.gpu_bridge_build_affine_rows_transform_packet;
+  let transformReadbackResult = null;
+
+  if (typeof buildAffineTransformFn === "function") {
+    const transformPacket = buildAffineTransformFn();
+    const readbackBufferId = 20; // staging buffer 20 per crates/f3d-runtime/src/gpu_host.rs:1615
+    const bytesPerRow = computeAlignedBytesPerRow(64);
+    const readbackSize = bytesPerRow * 64;
+
+    await host.executePacket(transformPacket);
+    const pixels = await host.readbackBuffer(readbackBufferId, readbackSize);
+
+    // Verify hand-computed screen pixel coordinates via assertAffineRowsTransformMatch
+    assertAffineRowsTransformMatch(pixels, 64, 64);
+
+    const c48_32 = 32 * bytesPerRow + 48 * 4;
+    const c32_32 = 32 * bytesPerRow + 32 * 4;
+    transformReadbackResult = {
+      verified: true,
+      center_48_32: [pixels[c48_32], pixels[c48_32 + 1], pixels[c48_32 + 2], pixels[c48_32 + 3]],
+      untransformed_32_32: [pixels[c32_32], pixels[c32_32 + 1], pixels[c32_32 + 2], pixels[c32_32 + 3]],
+    };
+  }
+
   return {
     identityCode: code0,
     translatedMatrixCode: code0Trans,
@@ -1772,7 +1967,10 @@ export async function testAffineRowsGpuLayoutValidation(host, wasmModule) {
     smallBufferCode: code1Small,
     midBufferCode: code1Mid,
     oversizedBufferCode: code4Oversized,
-    detail: "Verified via real Rust/Wasm AffineRows validator: 64-byte identity (0) & translated (0), 48-byte AffineRows with translation (0) & NaN translation (2), 64-byte e[11] perspective (2), 47-byte (1), 56-byte (1), 72-byte (4).",
+    transformReadbackResult,
+    detail: transformReadbackResult
+      ? `Verified via wire layout validator (codes 0, 1, 2, 4) AND authoritative browser WGSL AffineRows transform evaluation (center 48,32 Green [0,255,0,255], untransformed 32,32 Black).`
+      : `Verified via real Rust/Wasm AffineRows wire validator: 64-byte identity (0) & translated (0), 48-byte AffineRows with translation (0) & NaN translation (2), 64-byte e[11] perspective (2), 47-byte (1), 56-byte (1), 72-byte (4).`,
   };
 }
 
@@ -1828,10 +2026,281 @@ export async function testNegativeBrokenAffineRowsGpuPacketRejection(host, wasmM
     );
   }
 
+  // GPU broken transform control: An untransformed triangle (or identity AffineRows without +0.5 translation)
+  // renders at (32, 32) instead of (48, 32). The EXACT SAME assertAffineRowsTransformMatch MUST reject it!
+  const buildAffineTransformFn = wasmModule?.f3d_build_affine_rows_transform_packet || wasmModule?.gpu_bridge_build_affine_rows_transform_packet;
+  let transformControlRejected = false;
+  if (typeof buildAffineTransformFn === "function") {
+    // A 64x64 buffer with center untransformed (32, 32) Green and (48, 32) Black
+    const bytesPerRow = computeAlignedBytesPerRow(64);
+    const brokenPixels = new Uint8Array(bytesPerRow * 64);
+    const c32_32 = 32 * bytesPerRow + 32 * 4;
+    brokenPixels[c32_32] = 0;
+    brokenPixels[c32_32 + 1] = 255;
+    brokenPixels[c32_32 + 2] = 0;
+    brokenPixels[c32_32 + 3] = 255; // Untransformed center is green!
+
+    try {
+      assertAffineRowsTransformMatch(brokenPixels, 64, 64);
+    } catch (e) {
+      if (e.message && e.message.includes("AffineRows WGSL sample violation")) {
+        transformControlRejected = true;
+      }
+    }
+
+    if (!transformControlRejected) {
+      throw new Error(
+        "Negative Control Failed: assertAffineRowsTransformMatch did not reject untransformed/corrupt transform output!"
+      );
+    }
+  }
+
   return {
     behavior: "non_affine_gpu_submission_refused",
+    transformControlRejected: transformControlRejected || "validator_gate_intercepted",
     detail: "Validator gate intercepted non-affine matrix (code 2) and refused packet upload before any GPU submission was encoded.",
   };
 }
 
+/**
+ * -----------------------------------------------------------------------------
+ * 11. NESTED PASS PROTOCOL & LOADOP LOAD RESUME (§7.5, §8.2, vqa.7)
+ * -----------------------------------------------------------------------------
+ * Plan §7.5, §8.2, and AGENTS.md "Nested Passes":
+ * Guards against losing intermediate render pass results across pass interleaving.
+ * Three logical passes executed through candidate bridge:
+ * - Pass 1 (Target 10): prefix clear to black + draw Red left triangle (x in [-1, 0]).
+ * - Pass 2 (Target 11): nested pass on intermediate target 11 (clear + Green draw).
+ * - Pass 3 (Target 10): resume with loadOp: "load" + draw Blue right triangle (x in [0, 1]).
+ * - Readback buffer 20 on target 10.
+ *
+ * Ground truth coordinates on target 10:
+ * - (24, 32): Red [255, 0, 0, 255] (preserved across resume via loadOp load)
+ * - (56, 32): Blue [0, 0, 255, 255] (drawn on resume pass)
+ * - (2, 2): Black [0, 0, 0, 255] (clear background)
+ *
+ * Negative Control: Resume pass uses loadOp: "clear" instead of "load", clearing
+ * target 10 and losing the Red left triangle. The EXACT SAME assertNestedPassMatch
+ * assertion rejects it.
+ */
+export async function testNestedPassProtocol(host, wasmModule, width = 64, height = 64) {
+  const buildNestedPassFn = wasmModule?.f3d_build_nested_pass_packet || wasmModule?.gpu_bridge_build_nested_pass_packet;
 
+  if (!wasmModule || typeof buildNestedPassFn !== "function") {
+    throw new Error(
+      "Missing Wasm Export: testNestedPassProtocol requires compiled application Wasm with export 'gpu_bridge_build_nested_pass_packet' (or canonical alias 'f3d_build_nested_pass_packet'). Silent JS fallback is forbidden."
+    );
+  }
+
+  // 1. Run direct-JS oracle for authoritative ground truth
+  const oraclePixels = await renderDirectNestedPassReference(host.device, width, height);
+
+  // 2. Execute real Rust/Wasm binary packet through candidate bridge host
+  const packet = buildNestedPassFn();
+  await host.executePacket(packet);
+
+  // 3. Read back target 10 from buffer 20
+  const bytesPerRow = computeAlignedBytesPerRow(width);
+  const readbackSize = bytesPerRow * height;
+  const readbackBuffer = host.buffers.get(20);
+  if (!readbackBuffer) {
+    throw new Error(
+      "testNestedPassProtocol: expected readback buffer 20 to be registered and populated on host"
+    );
+  }
+
+  const candidatePixels = await readbackGpuBuffer(host.device, readbackBuffer, readbackSize);
+
+  // 4. Assert candidate pixels match oracle pixel-for-pixel and designated sample points
+  assertNestedPassMatch(candidatePixels, oraclePixels, width, height);
+
+  return {
+    status: "PASS",
+    oraclePixels,
+    candidatePixels,
+    detail: "Verified via real Rust nested pass packet vs independent direct-JS oracle (Red at 24,32 preserved via loadOp load, Blue at 56,32, Black at 2,2).",
+  };
+}
+
+export async function testNegativeBrokenNestedPass(host, oraclePixels = null, width = 64, height = 64) {
+  // If oraclePixels was not passed from positive path, run direct oracle to get authoritative reference
+  const referencePixels = oraclePixels || (await renderDirectNestedPassReference(host.device, width, height));
+
+  // Broken control: Resume pass on target 10 issues loadOp clear, wiping out the Red prefix pass
+  const brokenPixels = await renderDirectBrokenNestedPass(host.device, width, height);
+
+  // The EXACT SAME assertion must be applied and MUST reject it
+  let rejected = false;
+  try {
+    assertNestedPassMatch(brokenPixels, referencePixels, width, height);
+  } catch (err) {
+    if (
+      err.message &&
+      (err.message.includes("Nested Pass sample violation") ||
+       err.message.includes("assertNestedPassMatch") ||
+       err.message.includes("mismatched bytes"))
+    ) {
+      rejected = true;
+    }
+  }
+
+  if (!rejected) {
+    throw new Error(
+      "Negative Control Failed: assertNestedPassMatch did not reject broken nested pass using loadOp clear on resume!"
+    );
+  }
+
+  return {
+    behavior: "load_op_clear_resume_rejected",
+    detail: "Broken nested pass using loadOp clear on resume instead of loadOp load was strictly rejected by assertNestedPassMatch (red prefix pass cleared to black).",
+  };
+}
+
+/**
+ * -----------------------------------------------------------------------------
+ * 12. NESTED CANVAS PASS PROTOCOL & SWAPCHAIN REENTRANCY (§6.7, §8.5, 2v8.4)
+ * -----------------------------------------------------------------------------
+ * Consumes real compiled Rust/Wasm export `gpu_bridge_build_nested_canvas_pass_packet`
+ * (alias `f3d_build_nested_canvas_pass_packet`, 14 commands):
+ * - Pass 1 (Canvas Target 10): prefix clear black + Red tri1 (Pipeline 201, preferredCanvasFormat).
+ * - Pass 2 (Offscreen Target 11): nested pass clear black + Green tri1 (Pipeline 200, rgba8unorm).
+ * - Pass 3 (Canvas Target 10): resume with loadOp: "load" + Blue tri2 (Pipeline 201).
+ * - Command 13: Copy offscreen Target 11 to Readback Buffer 20 (64x64 rgba8unorm).
+ *
+ * Bridge cannot read back the canvas swapchain (no COPY_SRC on canvas context; swapchain
+ * views are not stored in host.textures). The authoritative assertion is Target 11 readback:
+ * - (24, 32): Green [0, 255, 0, 255] (drawn by tri1 on target 11)
+ * - (56, 32): Black [0, 0, 0, 255] (outside tri1 on target 11)
+ * - (2, 2): Black [0, 0, 0, 255] (clear background)
+ * - Byte-identical to an independent oracle that renders only the offscreen pass.
+ *
+ * Additionally asserts the packet executes without a WebGPU validation error inside
+ * the error scope when the host has a canvas context, and truthfully reports whether
+ * the host provided one.
+ *
+ * Broken Control: Oracle-vs-candidate byte comparison plus missing-export rejection
+ * (no synthetic packet variant needed).
+ */
+export async function testNestedCanvasPassProtocol(host, wasmModule, width = 64, height = 64, canvasContext = null) {
+  const buildNestedCanvasPassFn = wasmModule?.f3d_build_nested_canvas_pass_packet || wasmModule?.gpu_bridge_build_nested_canvas_pass_packet;
+
+  if (!wasmModule || typeof buildNestedCanvasPassFn !== "function") {
+    throw new Error(
+      "Missing Wasm Export: testNestedCanvasPassProtocol requires compiled application Wasm with export 'gpu_bridge_build_nested_canvas_pass_packet' (or canonical alias 'f3d_build_nested_canvas_pass_packet'). Silent JS fallback is forbidden."
+    );
+  }
+
+  // 1. Run independent direct-JS oracle rendering only the offscreen pass on Target 11
+  const oraclePixels = await renderDirectNestedCanvasOffscreenReference(host.device, width, height);
+
+  // 2. Resolve canvas context (from argument, DOM canvas, or OffscreenCanvas)
+  let activeCanvasContext = canvasContext;
+  if (!activeCanvasContext) {
+    if (typeof document !== "undefined" && typeof document.getElementById === "function") {
+      const existingCanvas = document.getElementById("webgpu-swapchain-canvas");
+      if (existingCanvas && typeof existingCanvas.getContext === "function") {
+        activeCanvasContext = existingCanvas.getContext("webgpu");
+      }
+    }
+  }
+
+  const canvasContextProvided = !!activeCanvasContext;
+  if (activeCanvasContext && typeof activeCanvasContext.configure === "function") {
+    const preferredFormat = host.capabilityRecord?.preferredCanvasFormat ||
+      (typeof navigator !== "undefined" && navigator.gpu?.getPreferredCanvasFormat
+        ? navigator.gpu.getPreferredCanvasFormat()
+        : "bgra8unorm");
+
+    activeCanvasContext.configure({
+      device: host.device,
+      format: preferredFormat,
+      alphaMode: "premultiplied",
+    });
+  }
+
+  // 3. Execute real Rust/Wasm binary packet through candidate bridge host.
+  // When activeCanvasContext is present, executePacket acquires canvas swapchain view
+  // and executes Pass 1 (canvas prefix), Pass 2 (nested offscreen), and Pass 3 (canvas resume)
+  // synchronously inside withErrorScopes(["validation", "out-of-memory"]).
+  // Any WebGPU validation error causes executePacket to throw.
+  const packet = buildNestedCanvasPassFn();
+  await host.executePacket(packet, activeCanvasContext);
+
+  // 4. Read back target 11 from buffer 20
+  const bytesPerRow = computeAlignedBytesPerRow(width);
+  const readbackSize = bytesPerRow * height;
+  const readbackBuffer = host.buffers.get(20);
+  if (!readbackBuffer) {
+    throw new Error(
+      "testNestedCanvasPassProtocol: expected readback buffer 20 to be registered and populated on host"
+    );
+  }
+
+  const candidatePixels = await readbackGpuBuffer(host.device, readbackBuffer, readbackSize);
+
+  // 5. Assert candidate pixels match oracle byte-for-byte and at designated sample points
+  assertNestedCanvasPassMatch(candidatePixels, oraclePixels, width, height);
+
+  const canvasStatusText = canvasContextProvided
+    ? "Real WebGPU canvas context provided (#webgpu-swapchain-canvas configured preferred format); executed without validation errors inside error scope"
+    : "No canvas context provided (offscreen-only execution)";
+
+  return {
+    status: "PASS",
+    oraclePixels,
+    candidatePixels,
+    canvasContextProvided,
+    canvasContextStatus: canvasStatusText,
+    detail: `Target 11 readback byte-identical to independent oracle (Green at (24,32), Black at (56,32) and (2,2)). ${canvasStatusText}.`,
+  };
+}
+
+export async function testNegativeBrokenNestedCanvasPass(host, wasmModule, oraclePixels = null, width = 64, height = 64) {
+  // 1. Missing-export rejection control: Calling with missing export strictly fails
+  let missingExportRejected = false;
+  try {
+    await testNestedCanvasPassProtocol(host, {}, width, height);
+  } catch (err) {
+    if (err.message && err.message.includes("Missing Wasm Export")) {
+      missingExportRejected = true;
+    }
+  }
+  if (!missingExportRejected) {
+    throw new Error(
+      "Negative Control Failed: testNestedCanvasPassProtocol did not reject missing Wasm export!"
+    );
+  }
+
+  // 2. Oracle-vs-candidate byte comparison rejection control: Divergent/corrupted bytes strictly fail
+  const referencePixels = oraclePixels || (await renderDirectNestedCanvasOffscreenReference(host.device, width, height));
+  const corruptedPixels = new Uint8Array(referencePixels);
+  const bytesPerRow = computeAlignedBytesPerRow(width);
+  const greenIdx = 32 * bytesPerRow + 24 * 4;
+  corruptedPixels[greenIdx + 1] = 0; // Corrupt green channel from 255 to 0
+
+  let comparisonRejected = false;
+  try {
+    assertNestedCanvasPassMatch(corruptedPixels, referencePixels, width, height);
+  } catch (err) {
+    if (
+      err.message &&
+      (err.message.includes("mismatched bytes") ||
+       err.message.includes("Nested Canvas Pass sample violation") ||
+       err.message.includes("assertNestedCanvasPassMatch"))
+    ) {
+      comparisonRejected = true;
+    }
+  }
+  if (!comparisonRejected) {
+    throw new Error(
+      "Negative Control Failed: assertNestedCanvasPassMatch did not reject corrupted/divergent pixel bytes!"
+    );
+  }
+
+  return {
+    behavior: "oracle_byte_mismatch_and_missing_export_rejected",
+    missingExportRejected,
+    comparisonRejected,
+    detail: "Missing Wasm export and divergent pixel bytes were strictly rejected by assertion gates (no synthetic packet needed).",
+  };
+}

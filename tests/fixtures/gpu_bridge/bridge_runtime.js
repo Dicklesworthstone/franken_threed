@@ -34,6 +34,8 @@ export const TEXTURE_USAGE_TEXTURE_BINDING = 4;
 export const TEXTURE_USAGE_STORAGE_BINDING = 8;
 export const TEXTURE_USAGE_RENDER_ATTACHMENT = 16;
 
+import { isDetached, ensureSafePacketBytes } from "./memory_transport.js";
+
 export class WebGpuBridgeHost {
   constructor() {
     this.adapter = null;
@@ -78,30 +80,60 @@ export class WebGpuBridgeHost {
       }
     }
 
-    // Verify required limits
-    const reqLimits = requiredProfile.minLimits || {};
+    // Verify and forward required limits
+    const reqLimits = {
+      ...(requiredProfile.minLimits || {}),
+      ...(requiredProfile.requiredLimits || {}),
+    };
     const adapterLimits = adapter.limits;
-    if (reqLimits.maxTextureDimension2D && adapterLimits.maxTextureDimension2D < reqLimits.maxTextureDimension2D) {
-      throw new Error(`Negotiation failed: maxTextureDimension2D insufficient (requested ${reqLimits.maxTextureDimension2D}, available ${adapterLimits.maxTextureDimension2D})`);
-    }
-    if (reqLimits.maxBufferSize && adapterLimits.maxBufferSize < reqLimits.maxBufferSize) {
-      throw new Error(`Negotiation failed: maxBufferSize insufficient (requested ${reqLimits.maxBufferSize}, available ${adapterLimits.maxBufferSize})`);
-    }
-    if (reqLimits.minUniformBufferOffsetAlignment && adapterLimits.minUniformBufferOffsetAlignment > reqLimits.minUniformBufferOffsetAlignment) {
-      throw new Error(`Negotiation failed: minUniformBufferOffsetAlignment alignment mismatch (requested ${reqLimits.minUniformBufferOffsetAlignment}, adapter requires ${adapterLimits.minUniformBufferOffsetAlignment})`);
+    const requiredLimits = {};
+
+    for (const [key, requestedVal] of Object.entries(reqLimits)) {
+      if (requestedVal === undefined || requestedVal === null) continue;
+      const availableVal = adapterLimits[key];
+      if (availableVal === undefined) {
+        throw new Error(`Negotiation failed: unknown or unsupported WebGPU limit '${key}'`);
+      }
+      if (key.startsWith("min")) {
+        if (availableVal > requestedVal) {
+          throw new Error(`Negotiation failed: ${key} alignment mismatch (requested ${requestedVal}, adapter requires ${availableVal})`);
+        }
+      } else {
+        if (availableVal < requestedVal) {
+          throw new Error(`Negotiation failed: ${key} insufficient (requested ${requestedVal}, available ${availableVal})`);
+        }
+      }
+      requiredLimits[key] = requestedVal;
     }
 
     // Request the device with only explicitly negotiated features and limits
     const deviceDescriptor = {
       requiredFeatures: requiredFeatures,
-      requiredLimits: {},
+      requiredLimits: requiredLimits,
     };
-    if (reqLimits.minUniformBufferOffsetAlignment) {
-      deviceDescriptor.requiredLimits.minUniformBufferOffsetAlignment = reqLimits.minUniformBufferOffsetAlignment;
-    }
 
     const device = await adapter.requestDevice(deviceDescriptor);
     this.device = device;
+
+    // Assert the resulting device actually meets the requested profile
+    const deviceLimits = device.limits;
+    for (const [key, requestedVal] of Object.entries(requiredLimits)) {
+      const actualVal = deviceLimits[key];
+      if (key.startsWith("min")) {
+        if (actualVal > requestedVal) {
+          throw new Error(`Device limit verification failed: ${key} does not meet requested profile (requested ${requestedVal}, device has ${actualVal})`);
+        }
+      } else {
+        if (actualVal < requestedVal) {
+          throw new Error(`Device limit verification failed: ${key} does not meet requested profile (requested ${requestedVal}, device has ${actualVal})`);
+        }
+      }
+    }
+    for (const feat of requiredFeatures) {
+      if (!device.features.has(feat)) {
+        throw new Error(`Device feature verification failed: required WebGPU feature '${feat}' is not enabled on device`);
+      }
+    }
 
     // Attach uncapturederror listener
     device.addEventListener("uncapturederror", (event) => {
@@ -131,6 +163,14 @@ export class WebGpuBridgeHost {
         minUniformBufferOffsetAlignment: device.limits.minUniformBufferOffsetAlignment,
         minStorageBufferOffsetAlignment: device.limits.minStorageBufferOffsetAlignment,
       },
+      adapterLimits: {
+        maxTextureDimension2D: adapter.limits.maxTextureDimension2D,
+        maxBufferSize: adapter.limits.maxBufferSize,
+        maxBindGroups: adapter.limits.maxBindGroups,
+        minUniformBufferOffsetAlignment: adapter.limits.minUniformBufferOffsetAlignment,
+        minStorageBufferOffsetAlignment: adapter.limits.minStorageBufferOffsetAlignment,
+      },
+      requiredLimits: requiredLimits,
       preferredCanvasFormat: navigator.gpu.getPreferredCanvasFormat(),
     };
 
@@ -206,6 +246,8 @@ export class WebGpuBridgeHost {
       throw new Error("Device not initialized");
     }
 
+    ensureSafePacketBytes(packetBytes);
+
     const headerLen = 16;
     if (packetBytes.byteLength < headerLen) {
       throw new Error("Packet buffer too small for header");
@@ -239,11 +281,19 @@ export class WebGpuBridgeHost {
       let cursor = headerLen;
       let currentPassEncoder = null;
       let currentPassTargetKey = null;
+      let frameCanvasView = null;
       let passState = {
         pipelineId: null,
         uniformBufferId: null,
         dynamicOffset: null,
         vertexBufferId: null,
+      };
+
+      const getCanvasView = () => {
+        if (!frameCanvasView && canvasContext) {
+          frameCanvasView = canvasContext.getCurrentTexture().createView();
+        }
+        return frameCanvasView;
       };
 
       const closeActivePass = () => {
@@ -308,6 +358,9 @@ export class WebGpuBridgeHost {
             }
 
             const chunk = dataPayload.subarray(dataOffset, dataOffset + dataLength);
+            if (isDetached(chunk)) {
+              throw new Error("WriteBuffer: data slice is detached");
+            }
             this.device.queue.writeBuffer(buffer, offset, chunk);
             break;
           }
@@ -440,7 +493,24 @@ export class WebGpuBridgeHost {
             if (cursor + 44 > dataBlockStart) {
               throw new Error(`Truncated RENDER_PASS fields at command ${i}`);
             }
-            const targetType = dataView.getUint32(cursor, true);
+            const rawTargetType = dataView.getUint32(cursor, true);
+            const targetKind = rawTargetType & 0xFF;
+            if (targetKind !== TARGET_OFFSCREEN && targetKind !== TARGET_CANVAS) {
+              throw new Error(`RenderPass: invalid target kind ${targetKind} in 0x${rawTargetType.toString(16)}`);
+            }
+            const loadOpCode = (rawTargetType >> 8) & 0xFF;
+            if (loadOpCode > 2) {
+              throw new Error(`RenderPass: invalid load_op code ${loadOpCode}`);
+            }
+            const storeOpCode = (rawTargetType >> 16) & 0xFF;
+            if (storeOpCode > 1) {
+              throw new Error(`RenderPass: invalid store_op code ${storeOpCode}`);
+            }
+            const passFlags = (rawTargetType >> 24) & 0xFF;
+            if ((passFlags & ~1) !== 0) {
+              throw new Error(`RenderPass: unknown pass flags 0x${passFlags.toString(16)}`);
+            }
+
             const targetId = dataView.getUint32(cursor + 4, true);
             const cr = dataView.getFloat32(cursor + 8, true);
             const cg = dataView.getFloat32(cursor + 12, true);
@@ -453,41 +523,46 @@ export class WebGpuBridgeHost {
             const uniformBufferId = dataView.getUint32(cursor + 40, true) || 1;
             cursor += 44;
 
-            if (targetType === TARGET_OFFSCREEN) {
+            if (targetKind === TARGET_OFFSCREEN) {
               this.lastRenderTargetId = targetId;
             }
 
-            const targetKey = `${targetType}:${targetId}`;
-            if (!currentPassEncoder || currentPassTargetKey !== targetKey) {
+            const isNewPass = (passFlags & 1) !== 0;
+            const targetKey = `${targetKind}:${targetId}`;
+            if (!currentPassEncoder || currentPassTargetKey !== targetKey || isNewPass) {
               closeActivePass();
 
               let targetView;
-              if (targetType === TARGET_CANVAS) {
+              if (targetKind === TARGET_CANVAS) {
                 if (!canvasContext) {
                   // Gracefully skip canvas swapchain presentation pass in headless or pure-offscreen execution
                   continue;
                 }
-                // Canvas texture is acquired fresh per frame/interval inside the synchronous error scope
-                targetView = canvasContext.getCurrentTexture().createView();
-              } else if (targetType === TARGET_OFFSCREEN) {
+                // Canvas swapchain view is acquired at most once per packet execution (§8.5, [S48])
+                targetView = getCanvasView();
+              } else if (targetKind === TARGET_OFFSCREEN) {
                 const texture = this.textures.get(targetId);
                 if (!texture) {
                   throw new Error(`RenderPass: unknown offscreen targetId ${targetId}`);
                 }
                 targetView = texture.createView();
               } else {
-                throw new Error(`Invalid render pass targetType: ${targetType}`);
+                throw new Error(`Invalid render pass targetKind: ${targetKind}`);
+              }
+
+              const loadOp = loadOpCode === 1 ? "load" : "clear";
+              const storeOp = storeOpCode === 1 ? "discard" : "store";
+              const colorAttachmentDesc = {
+                view: targetView,
+                loadOp,
+                storeOp,
+              };
+              if (loadOp === "clear") {
+                colorAttachmentDesc.clearValue = { r: cr, g: cg, b: cb, a: ca };
               }
 
               currentPassEncoder = commandEncoder.beginRenderPass({
-                colorAttachments: [
-                  {
-                    view: targetView,
-                    clearValue: { r: cr, g: cg, b: cb, a: ca },
-                    loadOp: "clear",
-                    storeOp: "store",
-                  },
-                ],
+                colorAttachments: [colorAttachmentDesc],
               });
               currentPassTargetKey = targetKey;
               passState = {
@@ -507,6 +582,10 @@ export class WebGpuBridgeHost {
               if (passState.pipelineId !== pipelineId) {
                 currentPassEncoder.setPipeline(pipelineRecord.pipeline);
                 passState.pipelineId = pipelineId;
+                // The new pipeline may require a different layout or binding size
+                // even when the underlying buffer and dynamic offset are unchanged.
+                passState.uniformBufferId = null;
+                passState.dynamicOffset = null;
               }
 
               if (pipelineRecord.hasUniformBuffer) {
@@ -684,7 +763,7 @@ export class WebGpuBridgeHost {
                 scanCursor += 2;
                 if (nextOp === OPCODE_RENDER_PASS) {
                   if (scanCursor + 44 <= dataBlockStart) {
-                    targetType = dataView.getUint32(scanCursor, true);
+                    targetType = dataView.getUint32(scanCursor, true) & 0xFF;
                     targetId = dataView.getUint32(scanCursor + 4, true);
                     clearColor = [
                       dataView.getFloat32(scanCursor + 8, true),
@@ -734,7 +813,7 @@ export class WebGpuBridgeHost {
                 if (!canvasContext) {
                   continue;
                 }
-                targetView = canvasContext.getCurrentTexture().createView();
+                targetView = getCanvasView();
               } else {
                 const texture = this.textures.get(targetId);
                 if (!texture) {
@@ -790,6 +869,7 @@ export class WebGpuBridgeHost {
       }
 
       closeActivePass();
+      frameCanvasView = null;
       // Finish and submit synchronously inside the error scope
       const commandBuffer = commandEncoder.finish();
       this.device.queue.submit([commandBuffer]);
@@ -805,14 +885,19 @@ export class WebGpuBridgeHost {
       throw new Error(`readbackBuffer: unknown bufferId ${bufferId}`);
     }
 
+    // Capture metadata with this buffer: a later packet can reuse its numeric ID
+    // while mapAsync is pending, but must not relabel these older GPU bytes.
+    const { epochHi, epochLo } = this.bufferEpochs.get(bufferId) || { epochHi: 0, epochLo: 0 };
     await buffer.mapAsync(GPUMapMode.READ, 0, byteLength);
-    const mapped = buffer.getMappedRange(0, byteLength);
-    const copy = new Uint8Array(mapped.slice(0));
-    buffer.unmap();
+    let copy;
+    try {
+      copy = new Uint8Array(buffer.getMappedRange(0, byteLength).slice(0));
+    } finally {
+      buffer.unmap();
+    }
 
-    const recordedEpoch = this.bufferEpochs.get(bufferId) || { epochHi: 0, epochLo: 0 };
-    copy.epochHi = recordedEpoch.epochHi;
-    copy.epochLo = recordedEpoch.epochLo;
+    copy.epochHi = epochHi;
+    copy.epochLo = epochLo;
     copy.bufferId = bufferId;
     copy.data = copy;
     return copy;

@@ -417,8 +417,8 @@ export async function renderDirectBundleDirectReference(device, width = 64, heig
 
   // Vertex buffer 1: Triangle 1 (left side)
   const tri1Data = new Float32Array([
-    -1.0,  1.0, 0.0,  0.0, 1.0,
     -1.0, -1.0, 0.0,  0.0, 0.0,
+     0.0, -1.0, 0.0,  0.5, 0.0,
      0.0,  1.0, 0.0,  0.5, 1.0,
   ]);
   const vb1 = device.createBuffer({
@@ -633,4 +633,648 @@ export function assertAffineRowsLayoutValid(validateFn, bytes) {
   return true;
 }
 
+/**
+ * Dual Assertion Helper: AffineRows WGSL Transform Evaluation (§6.1, §6.2, vqa.6).
+ * Verifies that the WGSL row dot-product shader correctly evaluates the 48-byte AffineRows
+ * wire uniform, asserting expected colors at hand-computed screen coordinates:
+ * - Transformed center (48, 32): Green [0, 255, 0, 255]
+ * - Untransformed center (32, 32): Black [0, 0, 0, 255]
+ * - Viewport bounds (16, 32), (60, 32), (48, 20), (48, 44): Black [0, 0, 0, 255]
+ */
+export function assertAffineRowsTransformMatch(candidatePixels, width = 64, height = 64) {
+  const bytesPerRow = computeAlignedBytesPerRow(width);
 
+  // 1. Transformed center (48, 32): MUST be Green [0, 255, 0, 255]
+  const c48_32 = 32 * bytesPerRow + 48 * 4;
+  const gr = candidatePixels[c48_32];
+  const gg = candidatePixels[c48_32 + 1];
+  const gb = candidatePixels[c48_32 + 2];
+  const ga = candidatePixels[c48_32 + 3];
+  if (gr > 5 || gg < 250 || gb > 5 || ga < 250) {
+    throw new Error(
+      `AffineRows WGSL sample violation at transformed center (48, 32): expected Green [0, 255, 0, 255], observed [${gr}, ${gg}, ${gb}, ${ga}]`
+    );
+  }
+
+  // 2. Untransformed center (32, 32): MUST be Black [0, 0, 0, 255] (triangle was shifted right by +0.5 NDC)
+  const c32_32 = 32 * bytesPerRow + 32 * 4;
+  const ur = candidatePixels[c32_32];
+  const ug = candidatePixels[c32_32 + 1];
+  const ub = candidatePixels[c32_32 + 2];
+  const ua = candidatePixels[c32_32 + 3];
+  if (ur > 5 || ug > 5 || ub > 5 || ua < 250) {
+    throw new Error(
+      `AffineRows WGSL sample violation at untransformed center (32, 32): expected Black [0, 0, 0, 255], observed [${ur}, ${ug}, ${ub}, ${ua}]`
+    );
+  }
+
+  // 3. Left background (16, 32)
+  const c16_32 = 32 * bytesPerRow + 16 * 4;
+  if (candidatePixels[c16_32] > 5 || candidatePixels[c16_32 + 1] > 5 || candidatePixels[c16_32 + 2] > 5) {
+    throw new Error(`AffineRows WGSL sample violation at (16, 32): expected Black background`);
+  }
+
+  // 4. Right background (60, 32)
+  const c60_32 = 32 * bytesPerRow + 60 * 4;
+  if (candidatePixels[c60_32] > 5 || candidatePixels[c60_32 + 1] > 5 || candidatePixels[c60_32 + 2] > 5) {
+    throw new Error(`AffineRows WGSL sample violation at (60, 32): expected Black background`);
+  }
+
+  // 5. Above top vertex (48, 20)
+  const c48_20 = 20 * bytesPerRow + 48 * 4;
+  if (candidatePixels[c48_20] > 5 || candidatePixels[c48_20 + 1] > 5 || candidatePixels[c48_20 + 2] > 5) {
+    throw new Error(`AffineRows WGSL sample violation at (48, 20): expected Black background`);
+  }
+
+  // 6. Below bottom edge (48, 44)
+  const c48_44 = 44 * bytesPerRow + 48 * 4;
+  if (candidatePixels[c48_44] > 5 || candidatePixels[c48_44 + 1] > 5 || candidatePixels[c48_44 + 2] > 5) {
+    throw new Error(`AffineRows WGSL sample violation at (48, 44): expected Black background`);
+  }
+
+  return true;
+}
+
+/**
+ * -----------------------------------------------------------------------------
+ * 11. NESTED PASS PROTOCOL ORACLE REFERENCE (§7.5, §8.2, vqa.7)
+ * -----------------------------------------------------------------------------
+ * Direct-JS WebGPU reference for nested render passes:
+ * - Pass 1: Target 10 prefix clear to black, draws Red left triangle (x in [-1, 0]).
+ * - Pass 2: Target 11 intermediate nested pass (clear, draws Green triangle).
+ * - Pass 3: Target 10 resumed with loadOp: "load", draws Blue right triangle (x in [0, 1]).
+ * - Copies Target 10 to readback buffer and returns pixels.
+ *
+ * Ground truth:
+ * - (24, 32): Red [255, 0, 0, 255] (preserved across nested pass via loadOp load)
+ * - (56, 32): Blue [0, 0, 255, 255] (drawn on resume pass)
+ * - (2, 2): Black [0, 0, 0, 255] (clear/background)
+ */
+export async function renderDirectNestedPassReference(device, width = 64, height = 64) {
+  const target10 = device.createTexture({
+    size: [width, height, 1],
+    format: "rgba8unorm",
+    usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+  });
+
+  const target11 = device.createTexture({
+    size: [width, height, 1],
+    format: "rgba8unorm",
+    usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+  });
+
+  const shaderModule = device.createShaderModule({ code: WGSL_FLAT_COLOR_BUNDLE });
+  const bgl = device.createBindGroupLayout({
+    entries: [
+      {
+        binding: 0,
+        visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+        buffer: { type: "uniform", hasDynamicOffset: true, minBindingSize: 16 },
+      },
+    ],
+  });
+
+  const pipeline = device.createRenderPipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [bgl] }),
+    vertex: {
+      module: shaderModule,
+      entryPoint: "vs_main",
+      buffers: [
+        {
+          arrayStride: 20,
+          attributes: [
+            { shaderLocation: 0, offset: 0, format: "float32x3" },
+            { shaderLocation: 1, offset: 12, format: "float32x2" },
+          ],
+        },
+      ],
+    },
+    fragment: {
+      module: shaderModule,
+      entryPoint: "fs_main",
+      targets: [{ format: "rgba8unorm" }],
+    },
+    primitive: { topology: "triangle-list" },
+  });
+
+  // Uniform buffer (768 bytes, 256-byte aligned offsets):
+  // Offset 0: Red [1.0, 0.0, 0.0, 1.0] (Pass 1 - Target 10 left triangle)
+  // Offset 256: Blue [0.0, 0.0, 1.0, 1.0] (Pass 3 - Target 10 right triangle)
+  // Offset 512: Green [0.0, 1.0, 0.0, 1.0] (Pass 2 - Target 11 nested pass)
+  const uniformBuffer = device.createBuffer({
+    size: 768,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(uniformBuffer, 0, new Float32Array([1.0, 0.0, 0.0, 1.0]));
+  device.queue.writeBuffer(uniformBuffer, 256, new Float32Array([0.0, 0.0, 1.0, 1.0]));
+  device.queue.writeBuffer(uniformBuffer, 512, new Float32Array([0.0, 1.0, 0.0, 1.0]));
+
+  const bindGroup = device.createBindGroup({
+    layout: bgl,
+    entries: [{ binding: 0, resource: { buffer: uniformBuffer, offset: 0, size: 16 } }],
+  });
+
+  // Vertex buffer 1: Triangle 1 (left side, covers x in [-1, 0], samples at (24, 32))
+  const tri1Data = new Float32Array([
+    -1.0, -1.0, 0.0,  0.0, 0.0,
+     0.0, -1.0, 0.0,  0.5, 0.0,
+     0.0,  1.0, 0.0,  0.5, 1.0,
+  ]);
+  const vb1 = device.createBuffer({
+    size: tri1Data.byteLength,
+    usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(vb1, 0, tri1Data);
+
+  // Vertex buffer 2: Triangle 2 (right side, covers x in [0, 1], samples at (56, 32))
+  const tri2Data = new Float32Array([
+     0.0, -1.0, 0.0,  0.5, 0.0,
+     1.0, -1.0, 0.0,  1.0, 0.0,
+     1.0,  1.0, 0.0,  1.0, 1.0,
+  ]);
+  const vb2 = device.createBuffer({
+    size: tri2Data.byteLength,
+    usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(vb2, 0, tri2Data);
+
+  const bytesPerRow = computeAlignedBytesPerRow(width);
+  const readbackSize = bytesPerRow * height;
+  const readback = device.createBuffer({
+    size: readbackSize,
+    usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+  });
+
+  const encoder = device.createCommandEncoder();
+
+  // Pass 1 on Target 10: prefix clear to black + draw Red left triangle
+  const pass1 = encoder.beginRenderPass({
+    colorAttachments: [{
+      view: target10.createView(),
+      clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
+      loadOp: "clear",
+      storeOp: "store",
+    }],
+  });
+  pass1.setPipeline(pipeline);
+  pass1.setBindGroup(0, bindGroup, [0]); // Red
+  pass1.setVertexBuffer(0, vb1);
+  pass1.draw(3, 1, 0, 0);
+  pass1.end();
+
+  // Pass 2 on Target 11: nested pass clear to black + draw Green triangle
+  const pass2 = encoder.beginRenderPass({
+    colorAttachments: [{
+      view: target11.createView(),
+      clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
+      loadOp: "clear",
+      storeOp: "store",
+    }],
+  });
+  pass2.setPipeline(pipeline);
+  pass2.setBindGroup(0, bindGroup, [512]); // Green
+  pass2.setVertexBuffer(0, vb1);
+  pass2.draw(3, 1, 0, 0);
+  pass2.end();
+
+  // Pass 3 on Target 10: resume with loadOp: "load" (preserves Red draw) + draw Blue right triangle
+  const pass3 = encoder.beginRenderPass({
+    colorAttachments: [{
+      view: target10.createView(),
+      loadOp: "load",
+      storeOp: "store",
+    }],
+  });
+  pass3.setPipeline(pipeline);
+  pass3.setBindGroup(0, bindGroup, [256]); // Blue
+  pass3.setVertexBuffer(0, vb2);
+  pass3.draw(3, 1, 0, 0);
+  pass3.end();
+
+  encoder.copyTextureToBuffer(
+    { texture: target10 },
+    { buffer: readback, bytesPerRow, rowsPerImage: height },
+    [width, height, 1]
+  );
+  device.queue.submit([encoder.finish()]);
+
+  const pixels = await readbackGpuBuffer(device, readback, readbackSize);
+
+  target10.destroy();
+  target11.destroy();
+  uniformBuffer.destroy();
+  vb1.destroy();
+  vb2.destroy();
+  readback.destroy();
+
+  return pixels;
+}
+
+/**
+ * Broken Control Reference: Nested Pass with LoadOp Clear Hazard.
+ * Uses loadOp: "clear" instead of loadOp: "load" when resuming target 10 in Pass 3.
+ * As a result, the prefix Red draw from Pass 1 is cleared to black and lost.
+ */
+export async function renderDirectBrokenNestedPass(device, width = 64, height = 64) {
+  const target10 = device.createTexture({
+    size: [width, height, 1],
+    format: "rgba8unorm",
+    usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+  });
+
+  const target11 = device.createTexture({
+    size: [width, height, 1],
+    format: "rgba8unorm",
+    usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+  });
+
+  const shaderModule = device.createShaderModule({ code: WGSL_FLAT_COLOR_BUNDLE });
+  const bgl = device.createBindGroupLayout({
+    entries: [
+      {
+        binding: 0,
+        visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+        buffer: { type: "uniform", hasDynamicOffset: true, minBindingSize: 16 },
+      },
+    ],
+  });
+
+  const pipeline = device.createRenderPipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [bgl] }),
+    vertex: {
+      module: shaderModule,
+      entryPoint: "vs_main",
+      buffers: [
+        {
+          arrayStride: 20,
+          attributes: [
+            { shaderLocation: 0, offset: 0, format: "float32x3" },
+            { shaderLocation: 1, offset: 12, format: "float32x2" },
+          ],
+        },
+      ],
+    },
+    fragment: {
+      module: shaderModule,
+      entryPoint: "fs_main",
+      targets: [{ format: "rgba8unorm" }],
+    },
+    primitive: { topology: "triangle-list" },
+  });
+
+  const uniformBuffer = device.createBuffer({
+    size: 768,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(uniformBuffer, 0, new Float32Array([1.0, 0.0, 0.0, 1.0]));
+  device.queue.writeBuffer(uniformBuffer, 256, new Float32Array([0.0, 0.0, 1.0, 1.0]));
+  device.queue.writeBuffer(uniformBuffer, 512, new Float32Array([0.0, 1.0, 0.0, 1.0]));
+
+  const bindGroup = device.createBindGroup({
+    layout: bgl,
+    entries: [{ binding: 0, resource: { buffer: uniformBuffer, offset: 0, size: 16 } }],
+  });
+
+  const tri1Data = new Float32Array([
+    -1.0, -1.0, 0.0,  0.0, 0.0,
+     0.0, -1.0, 0.0,  0.5, 0.0,
+     0.0,  1.0, 0.0,  0.5, 1.0,
+  ]);
+  const vb1 = device.createBuffer({
+    size: tri1Data.byteLength,
+    usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(vb1, 0, tri1Data);
+
+  const tri2Data = new Float32Array([
+     0.0, -1.0, 0.0,  0.5, 0.0,
+     1.0, -1.0, 0.0,  1.0, 0.0,
+     1.0,  1.0, 0.0,  1.0, 1.0,
+  ]);
+  const vb2 = device.createBuffer({
+    size: tri2Data.byteLength,
+    usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(vb2, 0, tri2Data);
+
+  const bytesPerRow = computeAlignedBytesPerRow(width);
+  const readbackSize = bytesPerRow * height;
+  const readback = device.createBuffer({
+    size: readbackSize,
+    usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+  });
+
+  const encoder = device.createCommandEncoder();
+
+  // Pass 1 on Target 10: prefix clear to black + draw Red left triangle
+  const pass1 = encoder.beginRenderPass({
+    colorAttachments: [{
+      view: target10.createView(),
+      clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
+      loadOp: "clear",
+      storeOp: "store",
+    }],
+  });
+  pass1.setPipeline(pipeline);
+  pass1.setBindGroup(0, bindGroup, [0]); // Red
+  pass1.setVertexBuffer(0, vb1);
+  pass1.draw(3, 1, 0, 0);
+  pass1.end();
+
+  // Pass 2 on Target 11: nested pass
+  const pass2 = encoder.beginRenderPass({
+    colorAttachments: [{
+      view: target11.createView(),
+      clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
+      loadOp: "clear",
+      storeOp: "store",
+    }],
+  });
+  pass2.setPipeline(pipeline);
+  pass2.setBindGroup(0, bindGroup, [512]); // Green
+  pass2.setVertexBuffer(0, vb1);
+  pass2.draw(3, 1, 0, 0);
+  pass2.end();
+
+  // Pass 3 on Target 10 - BROKEN CONTROL: Uses loadOp: "clear" instead of "load"!
+  // This clears Target 10 to black, losing the Red left triangle from Pass 1.
+  const pass3 = encoder.beginRenderPass({
+    colorAttachments: [{
+      view: target10.createView(),
+      clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
+      loadOp: "clear",
+      storeOp: "store",
+    }],
+  });
+  pass3.setPipeline(pipeline);
+  pass3.setBindGroup(0, bindGroup, [256]); // Blue
+  pass3.setVertexBuffer(0, vb2);
+  pass3.draw(3, 1, 0, 0);
+  pass3.end();
+
+  encoder.copyTextureToBuffer(
+    { texture: target10 },
+    { buffer: readback, bytesPerRow, rowsPerImage: height },
+    [width, height, 1]
+  );
+  device.queue.submit([encoder.finish()]);
+
+  const pixels = await readbackGpuBuffer(device, readback, readbackSize);
+
+  target10.destroy();
+  target11.destroy();
+  uniformBuffer.destroy();
+  vb1.destroy();
+  vb2.destroy();
+  readback.destroy();
+
+  return pixels;
+}
+
+/**
+ * Dual Assertion Helper: Nested Pass Verification (§7.5, §8.2, vqa.7).
+ * Asserts byte-for-byte identity against independent direct-JS oracle and
+ * verifies designated sample points:
+ * - Left side (x=24, y=32): Red [255, 0, 0, 255] (preserved across resume via loadOp load)
+ * - Right side (x=56, y=32): Blue [0, 0, 255, 255] (drawn on resume pass)
+ * - Background (x=2, y=2): Black [0, 0, 0, 255] (clear color)
+ */
+export function assertNestedPassMatch(candidatePixels, oraclePixels, width = 64, height = 64) {
+  if (candidatePixels.byteLength !== oraclePixels.byteLength) {
+    throw new Error(
+      `assertNestedPassMatch: byte length mismatch (candidate=${candidatePixels.byteLength}, oracle=${oraclePixels.byteLength})`
+    );
+  }
+  let diffCount = 0;
+  for (let i = 0; i < candidatePixels.length; i++) {
+    if (candidatePixels[i] !== oraclePixels[i]) {
+      diffCount++;
+    }
+  }
+  if (diffCount > 0) {
+    throw new Error(
+      `assertNestedPassMatch: detected ${diffCount} mismatched bytes out of ${candidatePixels.length}`
+    );
+  }
+
+  const bytesPerRow = computeAlignedBytesPerRow(width);
+
+  // 1. Left side (x=24, y=32): Red [255, 0, 0, 255]
+  const redIdx = 32 * bytesPerRow + 24 * 4;
+  const rr = candidatePixels[redIdx];
+  const rg = candidatePixels[redIdx + 1];
+  const rb = candidatePixels[redIdx + 2];
+  const ra = candidatePixels[redIdx + 3];
+  if (rr < 250 || rg > 5 || rb > 5 || ra < 250) {
+    throw new Error(
+      `Nested Pass sample violation at (24, 32): expected Red [255, 0, 0, 255] (preserved across resume with loadOp load), observed [${rr}, ${rg}, ${rb}, ${ra}]`
+    );
+  }
+
+  // 2. Right side (x=56, y=32): Blue [0, 0, 255, 255]
+  const blueIdx = 32 * bytesPerRow + 56 * 4;
+  const br = candidatePixels[blueIdx];
+  const bg = candidatePixels[blueIdx + 1];
+  const bb = candidatePixels[blueIdx + 2];
+  const ba = candidatePixels[blueIdx + 3];
+  if (br > 5 || bg > 5 || bb < 250 || ba < 250) {
+    throw new Error(
+      `Nested Pass sample violation at (56, 32): expected Blue [0, 0, 255, 255], observed [${br}, ${bg}, ${bb}, ${ba}]`
+    );
+  }
+
+  // 3. Clear / background color at (2, 2): Black [0, 0, 0, 255]
+  const bgIdx = 2 * bytesPerRow + 2 * 4;
+  const bgr = candidatePixels[bgIdx];
+  const bgg = candidatePixels[bgIdx + 1];
+  const bgb = candidatePixels[bgIdx + 2];
+  const bga = candidatePixels[bgIdx + 3];
+  if (bgr > 5 || bgg > 5 || bgb > 5 || bga < 250) {
+    throw new Error(
+      `Nested Pass sample violation at (2, 2): expected Black [0, 0, 0, 255], observed [${bgr}, ${bgg}, ${bgb}, ${bga}]`
+    );
+  }
+
+  return true;
+}
+
+/**
+ * 12. Independent Direct-JS Reference: Nested Canvas Offscreen Pass (§6.7, §8.5, 2v8.4)
+ * Renders only the offscreen nested pass (Pass 2) to a 64x64 rgba8unorm texture:
+ * clear to black, draw Green left triangle (tri1, covers x in [-1, 0]), copy to readback buffer.
+ * Decoupled from canvas swapchain passes and candidate bridge packet decoders.
+ */
+export async function renderDirectNestedCanvasOffscreenReference(device, width = 64, height = 64) {
+  const target11 = device.createTexture({
+    size: [width, height, 1],
+    format: "rgba8unorm",
+    usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+  });
+
+  const shaderModule = device.createShaderModule({ code: WGSL_FLAT_COLOR_BUNDLE });
+  const bgl = device.createBindGroupLayout({
+    entries: [
+      {
+        binding: 0,
+        visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+        buffer: { type: "uniform", minBindingSize: 16 },
+      },
+    ],
+  });
+
+  const pipeline = device.createRenderPipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [bgl] }),
+    vertex: {
+      module: shaderModule,
+      entryPoint: "vs_main",
+      buffers: [
+        {
+          arrayStride: 20,
+          attributes: [
+            { shaderLocation: 0, offset: 0, format: "float32x3" },
+            { shaderLocation: 1, offset: 12, format: "float32x2" },
+          ],
+        },
+      ],
+    },
+    fragment: {
+      module: shaderModule,
+      entryPoint: "fs_main",
+      targets: [{ format: "rgba8unorm" }],
+    },
+    primitive: { topology: "triangle-list" },
+  });
+
+  // Green color uniform [0.0, 1.0, 0.0, 1.0]
+  const uniformBuffer = device.createBuffer({
+    size: 16,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(uniformBuffer, 0, new Float32Array([0.0, 1.0, 0.0, 1.0]));
+
+  const bindGroup = device.createBindGroup({
+    layout: bgl,
+    entries: [{ binding: 0, resource: { buffer: uniformBuffer, offset: 0, size: 16 } }],
+  });
+
+  // Triangle 1: left half of viewport, covers x in [-1, 0]
+  const tri1Data = new Float32Array([
+    -1.0, -1.0, 0.0,  0.0, 0.0,
+     0.0, -1.0, 0.0,  0.5, 0.0,
+     0.0,  1.0, 0.0,  0.5, 1.0,
+  ]);
+  const vb1 = device.createBuffer({
+    size: tri1Data.byteLength,
+    usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(vb1, 0, tri1Data);
+
+  const bytesPerRow = computeAlignedBytesPerRow(width);
+  const readbackSize = bytesPerRow * height;
+  const readback = device.createBuffer({
+    size: readbackSize,
+    usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+  });
+
+  const encoder = device.createCommandEncoder();
+
+  // Render pass on Target 11: clear to black + draw Green tri1
+  const pass = encoder.beginRenderPass({
+    colorAttachments: [{
+      view: target11.createView(),
+      clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
+      loadOp: "clear",
+      storeOp: "store",
+    }],
+  });
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.setVertexBuffer(0, vb1);
+  pass.draw(3, 1, 0, 0);
+  pass.end();
+
+  encoder.copyTextureToBuffer(
+    { texture: target11 },
+    { buffer: readback, bytesPerRow, rowsPerImage: height },
+    [width, height, 1]
+  );
+  device.queue.submit([encoder.finish()]);
+
+  const pixels = await readbackGpuBuffer(device, readback, readbackSize);
+
+  target11.destroy();
+  uniformBuffer.destroy();
+  vb1.destroy();
+  readback.destroy();
+
+  return pixels;
+}
+
+/**
+ * Dual Assertion Helper: Nested Canvas Pass Protocol (§6.7, §8.5, 2v8.4).
+ * Asserts byte-for-byte identity against independent direct-JS oracle that renders
+ * only the offscreen pass, and verifies designated sample points on Target 11:
+ * - Left side (x=24, y=32): Green [0, 255, 0, 255] (drawn by tri1 on target 11)
+ * - Right side (x=56, y=32): Black [0, 0, 0, 255] (outside tri1 on target 11)
+ * - Background (x=2, y=2): Black [0, 0, 0, 255] (clear background)
+ */
+export function assertNestedCanvasPassMatch(candidatePixels, oraclePixels, width = 64, height = 64) {
+  if (candidatePixels.byteLength !== oraclePixels.byteLength) {
+    throw new Error(
+      `assertNestedCanvasPassMatch: byte length mismatch (candidate=${candidatePixels.byteLength}, oracle=${oraclePixels.byteLength})`
+    );
+  }
+
+  // 1. Full byte comparison strictly prioritized first
+  let diffCount = 0;
+  for (let i = 0; i < candidatePixels.length; i++) {
+    if (candidatePixels[i] !== oraclePixels[i]) {
+      diffCount++;
+    }
+  }
+  if (diffCount > 0) {
+    throw new Error(
+      `assertNestedCanvasPassMatch: detected ${diffCount} mismatched bytes out of ${candidatePixels.length} against direct-JS oracle`
+    );
+  }
+
+  const bytesPerRow = computeAlignedBytesPerRow(width);
+
+  // 2. Left side (x=24, y=32): Green [0, 255, 0, 255]
+  const greenIdx = 32 * bytesPerRow + 24 * 4;
+  const gr = candidatePixels[greenIdx];
+  const gg = candidatePixels[greenIdx + 1];
+  const gb = candidatePixels[greenIdx + 2];
+  const ga = candidatePixels[greenIdx + 3];
+  if (gr > 5 || gg < 250 || gb > 5 || ga < 250) {
+    throw new Error(
+      `Nested Canvas Pass sample violation at (24, 32): expected Green [0, 255, 0, 255], observed [${gr}, ${gg}, ${gb}, ${ga}]`
+    );
+  }
+
+  // 3. Right side (x=56, y=32): Black [0, 0, 0, 255]
+  const rightIdx = 32 * bytesPerRow + 56 * 4;
+  const rr = candidatePixels[rightIdx];
+  const rg = candidatePixels[rightIdx + 1];
+  const rb = candidatePixels[rightIdx + 2];
+  const ra = candidatePixels[rightIdx + 3];
+  if (rr > 5 || rg > 5 || rb > 5 || ra < 250) {
+    throw new Error(
+      `Nested Canvas Pass sample violation at (56, 32): expected Black [0, 0, 0, 255], observed [${rr}, ${rg}, ${rb}, ${ra}]`
+    );
+  }
+
+  // 4. Background / clear at (2, 2): Black [0, 0, 0, 255]
+  const bgIdx = 2 * bytesPerRow + 2 * 4;
+  const bgr = candidatePixels[bgIdx];
+  const bgg = candidatePixels[bgIdx + 1];
+  const bgb = candidatePixels[bgIdx + 2];
+  const bga = candidatePixels[bgIdx + 3];
+  if (bgr > 5 || bgg > 5 || bgb > 5 || bga < 250) {
+    throw new Error(
+      `Nested Canvas Pass sample violation at (2, 2): expected Black [0, 0, 0, 255], observed [${bgr}, ${bgg}, ${bgb}, ${bga}]`
+    );
+  }
+
+  return true;
+}

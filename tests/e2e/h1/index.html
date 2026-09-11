@@ -1,0 +1,523 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>FrankenThreeD H1 (Render Bundle) E2E Test Suite</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --card-bg: #161b22;
+      --border: #30363d;
+      --text: #c9d1d9;
+      --text-muted: #8b949e;
+      --pass: #238636;
+      --pass-bg: rgba(35, 134, 54, 0.15);
+      --fail: #da3633;
+      --fail-bg: rgba(218, 54, 51, 0.15);
+      --running: #1f6feb;
+      --running-bg: rgba(31, 111, 235, 0.15);
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      margin: 0;
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+    .container {
+      max-width: 960px;
+      width: 100%;
+    }
+    h1 {
+      font-size: 20px;
+      margin: 0 0 8px 0;
+      color: #f0f6fc;
+    }
+    .subtitle {
+      font-size: 13px;
+      color: var(--text-muted);
+      margin-bottom: 20px;
+    }
+    .status-banner {
+      padding: 14px 18px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      margin-bottom: 20px;
+      font-size: 14px;
+      font-weight: 500;
+      background: var(--running-bg);
+      border-color: var(--running);
+      color: #58a6ff;
+    }
+    .status-banner.pass {
+      background: var(--pass-bg);
+      border-color: var(--pass);
+      color: #7ee787;
+    }
+    .status-banner.fail {
+      background: var(--fail-bg);
+      border-color: var(--fail);
+      color: #f85149;
+    }
+    .cards {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 16px;
+    }
+    .card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 12px;
+    }
+    .card-title {
+      font-weight: 600;
+      font-size: 14px;
+      color: #f0f6fc;
+    }
+    .badge {
+      font-size: 11px;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 12px;
+      text-transform: uppercase;
+    }
+    .badge.pending { background: #30363d; color: var(--text-muted); }
+    .badge.running { background: var(--running-bg); color: #58a6ff; border: 1px solid var(--running); }
+    .badge.pass { background: var(--pass-bg); color: #7ee787; border: 1px solid var(--pass); }
+    .badge.fail { background: var(--fail-bg); color: #f85149; border: 1px solid var(--fail); }
+    .field {
+      font-size: 12px;
+      margin-bottom: 6px;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+    .field-label {
+      color: var(--text-muted);
+      font-size: 11px;
+    }
+    .field-value {
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      color: #e6edf3;
+      background: rgba(0, 0, 0, 0.2);
+      padding: 4px 6px;
+      border-radius: 4px;
+      word-break: break-all;
+    }
+    .frame-container {
+      width: 100%;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .frame-header {
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+    iframe {
+      width: 100%;
+      height: 480px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: #000;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>FrankenThreeD H1 (Render Bundle) E2E Test Runner</h1>
+    <div class="subtitle">
+      Automated verification of original upstream H1 (webgpu_performance_renderbundle.html) through compatibility facade
+    </div>
+
+    <div id="status-banner" class="status-banner">
+      Initializing H1 query branches...
+    </div>
+
+    <div class="cards">
+      <!-- WebGPU Branch Card -->
+      <div id="card-webgpu" class="card">
+        <div class="card-header">
+          <span class="card-title">Branch 1: Default (WebGPU)</span>
+          <span id="badge-webgpu" class="badge pending">Queued</span>
+        </div>
+        <div class="field">
+          <span class="field-label">Document Title</span>
+          <span id="title-webgpu" class="field-value">-</span>
+        </div>
+        <div class="field">
+          <span class="field-label">Canvas Context Identity</span>
+          <span id="context-webgpu" class="field-value">-</span>
+        </div>
+        <div class="field">
+          <span class="field-label">Inspector Startup Sign</span>
+          <span id="sign-webgpu" class="field-value">-</span>
+        </div>
+        <div class="field">
+          <span class="field-label">Router Decision Route</span>
+          <span id="route-webgpu" class="field-value">-</span>
+        </div>
+      </div>
+
+      <!-- WebGL Branch Card -->
+      <div id="card-webgl" class="card">
+        <div class="card-header">
+          <span class="card-title">Branch 2: WebGL (?backend=webgl)</span>
+          <span id="badge-webgl" class="badge pending">Queued</span>
+        </div>
+        <div class="field">
+          <span class="field-label">Document Title</span>
+          <span id="title-webgl" class="field-value">-</span>
+        </div>
+        <div class="field">
+          <span class="field-label">Canvas Context Identity</span>
+          <span id="context-webgl" class="field-value">-</span>
+        </div>
+        <div class="field">
+          <span class="field-label">Inspector Startup Sign</span>
+          <span id="sign-webgl" class="field-value">-</span>
+        </div>
+        <div class="field">
+          <span class="field-label">Router Decision Route</span>
+          <span id="route-webgl" class="field-value">-</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="frame-container">
+      <div class="frame-header">Target Application Frame (Same Origin)</div>
+      <iframe id="h1-frame"></iframe>
+    </div>
+  </div>
+
+  <script>
+    /**
+     * Detects canvas GPU context identity without mutating or conflicting.
+     * WebGPU contexts return GPUCanvasContext; WebGL2 returns WebGL2RenderingContext.
+     */
+    function detectCanvasContext(canvas) {
+      if (!canvas) return 'none';
+      try {
+        if (canvas.getContext('webgpu')) return 'webgpu';
+      } catch (_) {}
+      try {
+        if (canvas.getContext('webgl2')) return 'webgl2';
+      } catch (_) {}
+      try {
+        if (canvas.getContext('webgl')) return 'webgl';
+      } catch (_) {}
+      return 'unknown';
+    }
+
+    /**
+     * Extracts Inspector log messages from the DOM.
+     * Selects the message matching THREE.WebGPURenderer specifically for the startup sign,
+     * and collects all other messages separately (e.g. GPU Timestamp Queries availability).
+     */
+    function extractInspectorLogs(iframeDoc) {
+      if (!iframeDoc) return { sign: '', other: [], all: [] };
+      const logEls = Array.from(iframeDoc.querySelectorAll('.three-inspector .console-log .log-message'));
+      const all = logEls.map(el => (el.dataset?.rawText || el.textContent || '').trim()).filter(Boolean);
+      const sign = all.find(text => text.includes('THREE.WebGPURenderer')) || '';
+      const other = all.filter(text => !text.includes('THREE.WebGPURenderer'));
+      return { sign, other, all };
+    }
+
+    /**
+     * Polls the same-origin iframe until Three.js H1 demo settles and signals are readable.
+     */
+    function runBranch(branchKey, targetUrl) {
+      return new Promise((resolve) => {
+        const iframe = document.getElementById('h1-frame');
+        const badge = document.getElementById('badge-' + branchKey);
+        const titleEl = document.getElementById('title-' + branchKey);
+        const contextEl = document.getElementById('context-' + branchKey);
+        const signEl = document.getElementById('sign-' + branchKey);
+        const routeEl = document.getElementById('route-' + branchKey);
+
+        badge.className = 'badge running';
+        badge.textContent = 'Running';
+
+        let resolved = false;
+        const startTime = Date.now();
+        const maxTimeout = 25000; // 25 seconds settle limit
+
+        function check() {
+          if (resolved) return;
+
+          try {
+            const iframeWin = iframe.contentWindow;
+            const iframeDoc = iframe.contentDocument;
+
+            if (!iframeWin || !iframeDoc) {
+              if (Date.now() - startTime > maxTimeout) {
+                resolved = true;
+                resolve({
+                  branch: branchKey,
+                  url: targetUrl,
+                  passed: false,
+                  error: 'Timeout waiting for iframe document accessibility',
+                });
+                return;
+              }
+              setTimeout(check, 250);
+              return;
+            }
+
+            // Ensure navigation to the desired branch has occurred
+            const currentPath = iframeWin.location.pathname || '';
+            const currentSearch = iframeWin.location.search || '';
+            if (!currentPath.includes('webgpu_performance_renderbundle.html')) {
+              setTimeout(check, 250);
+              return;
+            }
+            if (branchKey === 'webgl' && !currentSearch.includes('backend=webgl')) {
+              setTimeout(check, 250);
+              return;
+            }
+            if (branchKey === 'webgpu' && currentSearch.includes('backend=webgl')) {
+              setTimeout(check, 250);
+              return;
+            }
+
+            const title = iframeDoc.title || '';
+            const firstCanvas = iframeDoc.querySelector('canvas');
+            const canvasContext = detectCanvasContext(firstCanvas);
+            const logs = extractInspectorLogs(iframeDoc);
+            const inspectorSign = logs.sign;
+            const decisionLog = iframeWin.__f3d_router__ ? iframeWin.__f3d_router__.getDecisionLog() : [];
+            const attributionLog = iframeWin.__f3d_router__ && typeof iframeWin.__f3d_router__.getAttributionLog === 'function'
+              ? iframeWin.__f3d_router__.getAttributionLog()
+              : [];
+
+            // Readiness criteria:
+            // 1. First canvas created and context identified (webgpu or webgl2)
+            // 2. Inspector startup sign message posted matching THREE.WebGPURenderer
+            // 3. Router decision log contains at least one construction event
+            const isReady =
+              canvasContext !== 'none' &&
+              canvasContext !== 'unknown' &&
+              inspectorSign.length > 0 &&
+              Array.isArray(decisionLog) &&
+              decisionLog.length > 0;
+
+            if (isReady) {
+              // Settle delay: allow the render loop and Inspector charts to tick
+              setTimeout(() => {
+                if (resolved) return;
+                resolved = true;
+
+                // Re-read latest signals post-settle
+                const finalTitle = iframeDoc.title || title;
+                const finalContext = detectCanvasContext(firstCanvas);
+                const finalLogs = extractInspectorLogs(iframeDoc);
+                const finalDecisionLog = iframeWin.__f3d_router__ ? iframeWin.__f3d_router__.getDecisionLog() : decisionLog;
+                const finalAttributionLog = iframeWin.__f3d_router__ && typeof iframeWin.__f3d_router__.getAttributionLog === 'function'
+                  ? iframeWin.__f3d_router__.getAttributionLog()
+                  : attributionLog;
+                const activeRoute = finalDecisionLog.find(d => d.site === 'WebGPURenderer')?.route || 'none';
+
+                titleEl.textContent = finalTitle;
+                contextEl.textContent = finalContext;
+                signEl.textContent = finalLogs.sign;
+                routeEl.textContent = activeRoute;
+
+                resolve({
+                  branch: branchKey,
+                  url: targetUrl,
+                  title: finalTitle,
+                  canvasContext: finalContext,
+                  inspectorSign: finalLogs.sign,
+                  otherLogs: finalLogs.other,
+                  allLogs: finalLogs.all,
+                  decisionLog: finalDecisionLog,
+                  attributionLog: finalAttributionLog,
+                  passed: true,
+                });
+              }, 1500);
+              return;
+            }
+
+            if (Date.now() - startTime > maxTimeout) {
+              resolved = true;
+              const timeoutLogs = extractInspectorLogs(iframeDoc);
+              const timeoutDecisionLog = iframeWin.__f3d_router__ ? iframeWin.__f3d_router__.getDecisionLog() : [];
+              const timeoutAttributionLog = iframeWin.__f3d_router__ && typeof iframeWin.__f3d_router__.getAttributionLog === 'function'
+                ? iframeWin.__f3d_router__.getAttributionLog()
+                : [];
+              titleEl.textContent = title || 'Timeout';
+              contextEl.textContent = canvasContext;
+              signEl.textContent = timeoutLogs.sign || 'Missing';
+              routeEl.textContent = timeoutDecisionLog.length ? timeoutDecisionLog[0].route : 'None';
+
+              resolve({
+                branch: branchKey,
+                url: targetUrl,
+                title,
+                canvasContext,
+                inspectorSign: timeoutLogs.sign,
+                otherLogs: timeoutLogs.other,
+                allLogs: timeoutLogs.all,
+                decisionLog: timeoutDecisionLog,
+                attributionLog: timeoutAttributionLog,
+                passed: false,
+                error: `Settle timeout after 25s (context=${canvasContext}, sign=${timeoutLogs.sign ? 'found' : 'missing'}, decisions=${timeoutDecisionLog.length})`,
+              });
+              return;
+            }
+          } catch (err) {
+            if (Date.now() - startTime > maxTimeout) {
+              resolved = true;
+              resolve({
+                branch: branchKey,
+                url: targetUrl,
+                passed: false,
+                error: err.message || String(err),
+              });
+              return;
+            }
+          }
+
+          setTimeout(check, 250);
+        }
+
+        // Navigate iframe
+        iframe.src = targetUrl;
+        setTimeout(check, 500);
+      });
+    }
+
+    async function main() {
+      const banner = document.getElementById('status-banner');
+      const params = new URLSearchParams(window.location.search);
+      const requestedBackend = params.get('backend');
+
+      const branchesToRun = [];
+      if (!requestedBackend || requestedBackend === 'webgpu') {
+        branchesToRun.push({
+          key: 'webgpu',
+          url: '/examples/webgpu_performance_renderbundle.html',
+          expectedContext: 'webgpu',
+          expectedSign: 'WebGPU',
+          expectedRoute: 'retained-upstream',
+          expectedReason: 'specialization-unavailable',
+        });
+      }
+      if (!requestedBackend || requestedBackend === 'webgl') {
+        branchesToRun.push({
+          key: 'webgl',
+          url: '/examples/webgpu_performance_renderbundle.html?backend=webgl',
+          expectedContext: 'webgl2',
+          expectedSign: 'WebGL2',
+          expectedRoute: 'exact-backend',
+          expectedReason: 'explicit-source-selection',
+        });
+      }
+
+      const branchResults = {};
+      const errors = [];
+      let overallPassed = true;
+
+      for (const branch of branchesToRun) {
+        banner.textContent = `Running branch: ${branch.key} (${branch.url})...`;
+        banner.className = 'status-banner';
+
+        // Clear iframe before branch execution
+        const iframe = document.getElementById('h1-frame');
+        iframe.src = 'about:blank';
+        await new Promise(r => setTimeout(r, 200));
+
+        const res = await runBranch(branch.key, branch.url);
+        branchResults[branch.key] = res;
+
+        const badge = document.getElementById('badge-' + branch.key);
+
+        if (!res.passed) {
+          overallPassed = false;
+          errors.push(`Branch ${branch.key} failed: ${res.error}`);
+          badge.className = 'badge fail';
+          badge.textContent = 'FAIL';
+          continue;
+        }
+
+        // Validate branch assertions
+        let branchValid = true;
+        if (!res.title.includes('Render Bundle')) {
+          branchValid = false;
+          errors.push(`Branch ${branch.key}: expected title containing 'Render Bundle', got '${res.title}'`);
+        }
+        if (res.canvasContext !== branch.expectedContext) {
+          branchValid = false;
+          errors.push(`Branch ${branch.key}: expected canvasContext '${branch.expectedContext}', got '${res.canvasContext}'`);
+        }
+        if (!res.inspectorSign.includes(branch.expectedSign)) {
+          branchValid = false;
+          errors.push(`Branch ${branch.key}: expected Inspector sign containing '${branch.expectedSign}', got '${res.inspectorSign}'`);
+        }
+        const decisionEntry = Array.isArray(res.decisionLog)
+          ? res.decisionLog.find(d => d.site === 'WebGPURenderer' && d.route === branch.expectedRoute)
+          : null;
+        if (!decisionEntry) {
+          branchValid = false;
+          errors.push(`Branch ${branch.key}: expected decision log route '${branch.expectedRoute}'`);
+        } else if (!Array.isArray(decisionEntry.reasons) || !decisionEntry.reasons.includes(branch.expectedReason)) {
+          branchValid = false;
+          errors.push(`Branch ${branch.key}: expected decision log reasons to include '${branch.expectedReason}' (got: [${(decisionEntry.reasons || []).join(', ')}])`);
+        }
+
+        if (branchValid) {
+          badge.className = 'badge pass';
+          badge.textContent = 'PASS';
+        } else {
+          overallPassed = false;
+          badge.className = 'badge fail';
+          badge.textContent = 'FAIL';
+        }
+      }
+
+      if (overallPassed && errors.length === 0) {
+        banner.className = 'status-banner pass';
+        banner.textContent = 'ALL H1 QUERY BRANCHES PASSED VERIFICATION';
+      } else {
+        banner.className = 'status-banner fail';
+        banner.textContent = `H1 VERIFICATION FAILED: ${errors.join('; ')}`;
+      }
+
+      const reportPayload = {
+        browser: navigator.userAgent,
+        passed: overallPassed && errors.length === 0,
+        errors,
+        branches: branchResults,
+        otherInspectorLogs: Object.fromEntries(
+          Object.entries(branchResults).map(([k, v]) => [k, v.otherLogs || []])
+        ),
+        decisionLog: Object.values(branchResults).flatMap(b => b.decisionLog || []),
+        attributionLog: Object.values(branchResults).flatMap(b => b.attributionLog || []),
+      };
+
+      try {
+        await fetch('/report', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(reportPayload),
+        });
+      } catch (err) {
+        console.warn('Failed to post /report seam (running standalone):', err);
+      }
+    }
+
+    window.addEventListener('load', main);
+  </script>
+</body>
+</html>

@@ -32,6 +32,8 @@
       TARGET_CANVAS,
     } from "./bridge_runtime.js";
     import { renderDirectReferenceTriangle } from "./direct_reference.js";
+    import { testReadbackIdReuse } from "./readback_lifetime_test.js";
+    import { testPipelineBindingChange } from "./pipeline_binding_test.js";
 
     const outputEl = document.getElementById("output");
     const canvas = document.getElementById("canvas");
@@ -71,7 +73,7 @@
 
         const bridge = new WebGpuBridgeHost();
 
-        // 1. Negotiation test: negative
+        // 1. Negotiation test: negative feature
         try {
           await bridge.negotiateAndCreateDevice({
             requiredFeatures: ["non-existent-feature-forbidden-xyz"],
@@ -85,17 +87,57 @@
           }
         }
 
-        // 2. Negotiation test: positive
+        // 1b. Negotiation test: excessive limit negative
+        try {
+          const excessiveBridge = new WebGpuBridgeHost();
+          await excessiveBridge.negotiateAndCreateDevice({
+            minLimits: { maxTextureDimension2D: 99999999 },
+          });
+          logFail("negotiation_excessive_limit", new Error("Expected negotiation to fail for excessive maxTextureDimension2D"));
+        } catch (e) {
+          if (e.message.includes("maxTextureDimension2D insufficient")) {
+            logPass("negotiation_excessive_limit", e.message);
+          } else {
+            logFail("negotiation_excessive_limit", e);
+          }
+        }
+
+        // 1c. Negotiation test: alignment mismatch negative
+        try {
+          const alignBridge = new WebGpuBridgeHost();
+          await alignBridge.negotiateAndCreateDevice({
+            minLimits: { minUniformBufferOffsetAlignment: 1 },
+          });
+          logFail("negotiation_alignment_mismatch", new Error("Expected negotiation to fail for alignment mismatch"));
+        } catch (e) {
+          if (e.message.includes("alignment mismatch")) {
+            logPass("negotiation_alignment_mismatch", e.message);
+          } else {
+            logFail("negotiation_alignment_mismatch", e);
+          }
+        }
+
+        // 2. Negotiation test: positive with fixture-selected target limits above defaults
+        const preAdapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+        if (!preAdapter) {
+          throw new Error("Failed to acquire pre-adapter for limit inspection");
+        }
+        const targetTex = preAdapter.limits.maxTextureDimension2D >= 16384 ? 16384 : preAdapter.limits.maxTextureDimension2D;
+        const targetBuf = preAdapter.limits.maxBufferSize >= 1073741824 ? 1073741824 : preAdapter.limits.maxBufferSize;
+
         const cap = await bridge.negotiateAndCreateDevice({
           requiredFeatures: [],
           minLimits: {
-            maxTextureDimension2D: 8192,
-            maxBufferSize: 268435456,
+            maxTextureDimension2D: targetTex,
+            maxBufferSize: targetBuf,
             minUniformBufferOffsetAlignment: 256,
           },
         });
         results.capabilityRecord = cap;
-        logPass("negotiation_positive", `Device negotiated on ${cap.adapter.vendor} (${cap.adapter.architecture})`);
+        logPass(
+          "negotiation_positive",
+          `Device negotiated on ${cap.adapter.vendor} (${cap.adapter.architecture}) with limits: maxTexture=${cap.limits.maxTextureDimension2D} (adapter: ${cap.adapterLimits.maxTextureDimension2D}), maxBuffer=${cap.limits.maxBufferSize} (adapter: ${cap.adapterLimits.maxBufferSize})`
+        );
 
         canvasContext.configure({
           device: bridge.device,
@@ -281,6 +323,9 @@
         } else {
           throw new Error("Negative control failed: unversioned packet falsely passed snapshot isolation check");
         }
+
+        logPass("readback_id_reuse_epoch", await testReadbackIdReuse(bridge));
+        logPass("pipeline_layout_binding_change", await testPipelineBindingChange(bridge));
 
         // 7. Retained renderer exclusion
         if (window.__threeRendererSubmissions && window.__threeRendererSubmissions > 0) {

@@ -32,6 +32,12 @@ This fixture verifies the first real Rust/Wasm to WebGPU execution slice and ren
 6. **No Retained Renderer Submission**:
    - Confirms that zero Three.js / WebGL fallback renderer calls occurred; execution is driven exclusively through the new WebGPU bridge.
 
+7. **Safe Copied Host Transport (`vqa.4`, `memory_transport.js`)**:
+   - **Production Owned Copy-Out**: The shipping execution path relies on wasm-bindgen's native `Vec<u8>` return ABI (`getArrayU8FromWasm0(ptr, len).slice()`), which synchronously creates an owned `Uint8Array` copy decoupled from Wasm linear memory before freeing the Rust allocation.
+   - **Packet Boundary Validation (`ensureSafePacketBytes`)**: Validates that incoming packet bytes are a valid, non-detached `Uint8Array` prior to asynchronous WebGPU command execution without making false claims of producing an owned copy in-place.
+   - **Detachment Detection (`isDetached`)**: Immediately detects and rejects detached or zero-length `ArrayBuffer` instances resulting from Wasm linear memory growth (`memory.grow()`).
+   - **Copy Accounting (`TransportCopyLedger`) & Bounded Helper (`copyFromWasmMemory`)**: Validates finite, non-negative integer ranges for Wasm memory slices and tracks actual transport copies without synthetic inference.
+
 ## No-Claim Boundary
 
 - **Unbenchmarked Slice**: This is an unbenchmarked first bridge slice establishing structural correctness and execution invariants, not a production-selected fastest variant, full renderer, or passed M5/iPhone hardware gate.
