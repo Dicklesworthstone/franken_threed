@@ -182,11 +182,13 @@ import {
   OPCODE_CREATE_PIPELINE,
   OPCODE_RENDER_PASS,
   OPCODE_COPY_TEXTURE_TO_BUFFER,
+  OPCODE_RECORD_BUNDLE,
+  OPCODE_EXECUTE_BUNDLES,
   TEXTURE_USAGE_COPY_SRC,
   TEXTURE_USAGE_RENDER_ATTACHMENT,
 } from "./bridge_runtime.js";
 
-export { TEXTURE_USAGE_COPY_SRC, TEXTURE_USAGE_RENDER_ATTACHMENT };
+export { TEXTURE_USAGE_COPY_SRC, TEXTURE_USAGE_RENDER_ATTACHMENT, OPCODE_RECORD_BUNDLE, OPCODE_EXECUTE_BUNDLES };
 
 /**
  * Independent JS-side PacketBuilder kept exclusively inside direct_reference.js
@@ -230,6 +232,26 @@ export class PacketBuilder {
     this.commands.push({ op: OPCODE_COPY_TEXTURE_TO_BUFFER, textureId, bufferId, width, height, epochHi, epochLo });
   }
 
+  recordBundle(bundleId, pipelineId, vertexBufferId, vertexCount, dynamicOffset = 0, uniformBufferId = 1, targetFormat = 2) {
+    this.commands.push({
+      op: OPCODE_RECORD_BUNDLE,
+      bundleId,
+      pipelineId,
+      vertexBufferId,
+      vertexCount,
+      dynamicOffset,
+      uniformBufferId,
+      targetFormat,
+    });
+  }
+
+  executeBundles(bundleIds) {
+    this.commands.push({
+      op: OPCODE_EXECUTE_BUNDLES,
+      bundleIds,
+    });
+  }
+
   build() {
     const headerLen = 16;
     let commandBytesLen = 0;
@@ -241,6 +263,8 @@ export class PacketBuilder {
         case OPCODE_CREATE_PIPELINE: commandBytesLen += 2 + 32; break;
         case OPCODE_RENDER_PASS: commandBytesLen += 2 + 44; break;
         case OPCODE_COPY_TEXTURE_TO_BUFFER: commandBytesLen += 2 + 24; break;
+        case OPCODE_RECORD_BUNDLE: commandBytesLen += 2 + 28; break;
+        case OPCODE_EXECUTE_BUNDLES: commandBytesLen += 2 + 4 + cmd.bundleIds.length * 4; break;
       }
     }
 
@@ -313,6 +337,24 @@ export class PacketBuilder {
           view.setUint32(cursor + 16, cmd.epochHi || 0, true);
           view.setUint32(cursor + 20, cmd.epochLo || 0, true);
           cursor += 24;
+          break;
+        case OPCODE_RECORD_BUNDLE:
+          view.setUint32(cursor, cmd.bundleId, true);
+          view.setUint32(cursor + 4, cmd.pipelineId, true);
+          view.setUint32(cursor + 8, cmd.vertexBufferId, true);
+          view.setUint32(cursor + 12, cmd.vertexCount, true);
+          view.setUint32(cursor + 16, cmd.dynamicOffset, true);
+          view.setUint32(cursor + 20, cmd.uniformBufferId || 1, true);
+          view.setUint32(cursor + 24, cmd.targetFormat, true);
+          cursor += 28;
+          break;
+        case OPCODE_EXECUTE_BUNDLES:
+          view.setUint32(cursor, cmd.bundleIds.length, true);
+          cursor += 4;
+          for (let b = 0; b < cmd.bundleIds.length; b++) {
+            view.setUint32(cursor, cmd.bundleIds[b], true);
+            cursor += 4;
+          }
           break;
       }
     }

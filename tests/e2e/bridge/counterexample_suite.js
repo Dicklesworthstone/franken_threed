@@ -22,17 +22,24 @@ import {
   OPCODE_RENDER_PASS,
   OPCODE_COPY_TEXTURE_TO_BUFFER,
   OPCODE_CREATE_TEXTURE,
+  OPCODE_RECORD_BUNDLE,
+  OPCODE_EXECUTE_BUNDLES,
   TARGET_OFFSCREEN,
 } from "../../fixtures/gpu_bridge/bridge_runtime.js";
 
 import {
   WGSL_AFFINE_TRIANGLE,
   WGSL_SOLID_COLOR,
+  WGSL_FLAT_COLOR_BUNDLE,
   computeAlignedBytesPerRow,
   readbackGpuBuffer,
   renderDirectTriangleReference,
   renderDirectRedABlueBReference,
   renderDirectBundleDirectReference,
+  assertBundleDirectDrawMatch,
+  assertGenerationalHandlePublication,
+  assertMemoryGrowthAllowed,
+  assertAffineRowsLayoutValid,
   evalDirectAffineTransform,
 } from "./oracle_reference.js";
 
@@ -77,6 +84,26 @@ export class BinaryPacketBuilder {
     this.commands.push({ op: OPCODE_COPY_TEXTURE_TO_BUFFER, textureId, bufferId, width, height, epochHi, epochLo });
   }
 
+  recordBundle(bundleId, pipelineId, vertexBufferId, vertexCount, dynamicOffset = 0, uniformBufferId = 1, targetFormat = 2) {
+    this.commands.push({
+      op: OPCODE_RECORD_BUNDLE,
+      bundleId,
+      pipelineId,
+      vertexBufferId,
+      vertexCount,
+      dynamicOffset,
+      uniformBufferId,
+      targetFormat,
+    });
+  }
+
+  executeBundles(bundleIds) {
+    this.commands.push({
+      op: OPCODE_EXECUTE_BUNDLES,
+      bundleIds,
+    });
+  }
+
   build() {
     const headerLen = 16;
     let commandBytesLen = 0;
@@ -88,6 +115,8 @@ export class BinaryPacketBuilder {
         case OPCODE_CREATE_PIPELINE: commandBytesLen += 2 + 32; break;
         case OPCODE_RENDER_PASS: commandBytesLen += 2 + 44; break;
         case OPCODE_COPY_TEXTURE_TO_BUFFER: commandBytesLen += 2 + 24; break;
+        case OPCODE_RECORD_BUNDLE: commandBytesLen += 2 + 28; break;
+        case OPCODE_EXECUTE_BUNDLES: commandBytesLen += 2 + 4 + cmd.bundleIds.length * 4; break;
       }
     }
 
@@ -160,6 +189,24 @@ export class BinaryPacketBuilder {
           view.setUint32(cursor + 16, cmd.epochHi || 0, true);
           view.setUint32(cursor + 20, cmd.epochLo || 0, true);
           cursor += 24;
+          break;
+        case OPCODE_RECORD_BUNDLE:
+          view.setUint32(cursor, cmd.bundleId, true);
+          view.setUint32(cursor + 4, cmd.pipelineId, true);
+          view.setUint32(cursor + 8, cmd.vertexBufferId, true);
+          view.setUint32(cursor + 12, cmd.vertexCount, true);
+          view.setUint32(cursor + 16, cmd.dynamicOffset, true);
+          view.setUint32(cursor + 20, cmd.uniformBufferId || 1, true);
+          view.setUint32(cursor + 24, cmd.targetFormat, true);
+          cursor += 28;
+          break;
+        case OPCODE_EXECUTE_BUNDLES:
+          view.setUint32(cursor, cmd.bundleIds.length, true);
+          cursor += 4;
+          for (let b = 0; b < cmd.bundleIds.length; b++) {
+            view.setUint32(cursor, cmd.bundleIds[b], true);
+            cursor += 4;
+          }
           break;
       }
     }
@@ -496,6 +543,58 @@ export async function testNegativeMissingWasmRejection(host, device) {
   if (!rejectedPublicationExport) {
     throw new Error("Negative Control Failed: testStaleEpochReadbackPublicationGate did not reject missing export!");
   }
+
+  // 4. Bundle-then-direct draw state reset missing export must throw
+  let rejectedBundleExport = false;
+  try {
+    await testBundleThenDirectDrawStateReset(host, device, {});
+  } catch (err) {
+    if (err.message && err.message.includes("Silent JS fallback is forbidden")) {
+      rejectedBundleExport = true;
+    }
+  }
+  if (!rejectedBundleExport) {
+    throw new Error("Negative Control Failed: testBundleThenDirectDrawStateReset did not reject missing export!");
+  }
+
+  // 5. Generational handle ABA publication missing export must throw
+  let rejectedHandleExport = false;
+  try {
+    await testGenerationalHandleAbaPublication(host, {});
+  } catch (err) {
+    if (err.message && err.message.includes("Silent JS fallback is forbidden")) {
+      rejectedHandleExport = true;
+    }
+  }
+  if (!rejectedHandleExport) {
+    throw new Error("Negative Control Failed: testGenerationalHandleAbaPublication did not reject missing export!");
+  }
+
+  // 6. Linear memory borrow guards missing export must throw
+  let rejectedBorrowExport = false;
+  try {
+    await testLinearMemoryBorrowGuards(host, {});
+  } catch (err) {
+    if (err.message && err.message.includes("Silent JS fallback is forbidden")) {
+      rejectedBorrowExport = true;
+    }
+  }
+  if (!rejectedBorrowExport) {
+    throw new Error("Negative Control Failed: testLinearMemoryBorrowGuards did not reject missing export!");
+  }
+
+  // 7. AffineRows GPU layout validation missing export must throw
+  let rejectedAffineExport = false;
+  try {
+    await testAffineRowsGpuLayoutValidation(host, {});
+  } catch (err) {
+    if (err.message && err.message.includes("Silent JS fallback is forbidden")) {
+      rejectedAffineExport = true;
+    }
+  }
+  if (!rejectedAffineExport) {
+    throw new Error("Negative Control Failed: testAffineRowsGpuLayoutValidation did not reject missing export!");
+  }
 }
 
 /**
@@ -644,36 +743,12 @@ export async function testNegativeBrokenErrorScopeControl(host) {
  * Invented mock classes (e.g. test-only handle managers or borrow controllers)
  * must NEVER be presented as passing product tests.
  * 
- * - Bundle State Reset: bridge_runtime.js does not yet support OPCODE_EXECUTE_BUNDLES.
- * - Generational Handles: gpu_host.rs does not yet expose generational handle publication to JS.
- * 
- * These items are reported as PENDING and NEVER claimed as green passes until real
- * candidate product implementations exist.
+ * All bridge capabilities are now backed by real Rust/Wasm exports.
+ * The pending capability ledger is ZERO.
  */
 
 export function getPendingBridgeCapabilities() {
-  return [
-    {
-      capability: "bundle_then_direct_draw_state_reset",
-      status: "PENDING_PRODUCT_SUPPORT",
-      reason: "bridge_runtime.js does not yet implement bundle execution (OPCODE_EXECUTE_BUNDLES). No mock test is permitted.",
-    },
-    {
-      capability: "generational_handle_aba_publication",
-      status: "PENDING_PRODUCT_SUPPORT",
-      reason: "crates/f3d-runtime/src/gpu_host.rs does not yet expose generational handle publication tables to JS. No mock test is permitted.",
-    },
-    {
-      capability: "linear_memory_borrow_guards",
-      status: "PENDING_PRODUCT_SUPPORT",
-      reason: "Browser Wasm linear memory borrow guard ABI is pending runtime integration. No mock test is permitted.",
-    },
-    {
-      capability: "affine_rows_gpu_layout_validation",
-      status: "PENDING_PRODUCT_SUPPORT",
-      reason: "Wire layout validator pending integration into GpuSubmissionPacket decoder.",
-    },
-  ];
+  return [];
 }
 
 /**
@@ -745,3 +820,775 @@ export async function testStaleEpochReadbackPublicationGate(host, wasmModule) {
 
   return "Verified via real Rust/Wasm product export gpu_bridge_try_publish_readback: matching epoch accepted (true), stale/advanced epoch rejected (false). (Region epoch test-supplied).";
 }
+
+/**
+ * -----------------------------------------------------------------------------
+ * 7. BUNDLE-THEN-DIRECT-DRAW STATE RESET (WEBGPU SPEC INVARIANT)
+ * -----------------------------------------------------------------------------
+ * Plan §8.5, §23 [S37], and AGENTS.md "Bundles reset render-pass state":
+ * WebGPU spec mandates that executeBundles clears the current render pass's
+ * pipeline and bind group bindings. Any subsequent direct draw within the same
+ * pass MUST explicitly re-bind pipeline, bind group, and vertex buffer.
+ *
+ * Calls the real Rust/Wasm product export `gpu_bridge_build_bundle_direct_draw_packet`
+ * (alias `f3d_build_bundle_direct_draw_packet`) from crates/f3d-runtime/src/gpu_host.rs:1414.
+ *
+ * Sequence in the compiled packet:
+ * - Bundle 1: Triangle 1 (left side) with Green uniform at dynamic offset 0.
+ * - executeBundles([1]) -> draws Green triangle.
+ * - executeBundles([])  -> empty bundle list; spec-mandated pass state reset.
+ * - RenderPass direct draw -> Triangle 2 (right side) with Blue uniform at dynamic offset 256.
+ *   Re-binds pipeline, bind group with [256], and vertex buffer 3.
+ * - Readback of target texture matches direct-JS oracle with 0 diffs.
+ *
+ * Negative Control: An explicitly isolated broken GPU operation that issues the post-bundle
+ * direct draw of Triangle 2 without re-issuing setPipeline, setBindGroup, and setVertexBuffer.
+ * The only difference from the positive path is the missing rebind. Tested against the
+ * EXACT SAME `assertBundleDirectDrawMatch` assertion to verify detection and rejection.
+ */
+export async function testBundleThenDirectDrawStateReset(host, device, wasmModule, width = 64, height = 64) {
+  const buildBundleDirectFn = wasmModule?.f3d_build_bundle_direct_draw_packet || wasmModule?.gpu_bridge_build_bundle_direct_draw_packet;
+  if (!wasmModule || typeof buildBundleDirectFn !== "function") {
+    throw new Error(
+      "Missing Wasm Export: testBundleThenDirectDrawStateReset requires compiled application Wasm with export 'gpu_bridge_build_bundle_direct_draw_packet' (or 'f3d_build_bundle_direct_draw_packet'). Silent JS fallback is forbidden."
+    );
+  }
+
+  // REAL RUST/WASM PATH: Packet generated by crates/f3d-runtime/src/gpu_host.rs
+  const packet = buildBundleDirectFn();
+  const readbackBufferId = 20; // Rust build_bundle_then_direct_draw_submission outputs to buffer 20
+  const bytesPerRow = computeAlignedBytesPerRow(width);
+  const readbackSize = bytesPerRow * height;
+
+  await host.executePacket(packet);
+  const candidatePixels = await host.readbackBuffer(readbackBufferId, readbackSize);
+
+  // Oracle: Independent direct-JS execution
+  const oraclePixels = await renderDirectBundleDirectReference(device, width, height);
+
+  // Positive Assertion: Must match pixel-for-pixel (0 differences) + verify sample points
+  assertBundleDirectDrawMatch(candidatePixels, oraclePixels, width, height);
+
+  return { candidatePixels, oraclePixels };
+}
+
+export async function testNegativeBrokenBundleDirectDraw(host, oraclePixels, width = 64, height = 64) {
+  const bytesPerRow = computeAlignedBytesPerRow(width);
+  const readbackSize = bytesPerRow * height;
+
+  const target = host.device.createTexture({
+    size: [width, height, 1],
+    format: "rgba8unorm",
+    usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+  });
+
+  const shaderModule = host.device.createShaderModule({ code: WGSL_FLAT_COLOR_BUNDLE });
+  const bgl = host.device.createBindGroupLayout({
+    entries: [
+      {
+        binding: 0,
+        visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+        buffer: { type: "uniform", hasDynamicOffset: true, minBindingSize: 16 },
+      },
+    ],
+  });
+
+  const pipeline = host.device.createRenderPipeline({
+    layout: host.device.createPipelineLayout({ bindGroupLayouts: [bgl] }),
+    vertex: {
+      module: shaderModule,
+      entryPoint: "vs_main",
+      buffers: [
+        {
+          arrayStride: 20,
+          attributes: [
+            { shaderLocation: 0, offset: 0, format: "float32x3" },
+            { shaderLocation: 1, offset: 12, format: "float32x2" },
+          ],
+        },
+      ],
+    },
+    fragment: {
+      module: shaderModule,
+      entryPoint: "fs_main",
+      targets: [{ format: "rgba8unorm" }],
+    },
+    primitive: { topology: "triangle-list" },
+  });
+
+  // Uniform buffer: Offset 0 Green, Offset 256 Blue
+  const uniformBuffer = host.device.createBuffer({
+    size: 512,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  host.device.queue.writeBuffer(uniformBuffer, 0, new Float32Array([0.0, 1.0, 0.0, 1.0]));
+  host.device.queue.writeBuffer(uniformBuffer, 256, new Float32Array([0.0, 0.0, 1.0, 1.0]));
+
+  const bindGroup = host.device.createBindGroup({
+    layout: bgl,
+    entries: [{ binding: 0, resource: { buffer: uniformBuffer, offset: 0, size: 16 } }],
+  });
+
+  // Vertex buffer 1: Triangle 1 (left side)
+  const tri1Data = new Float32Array([
+    -1.0,  1.0, 0.0,  0.0, 1.0,
+    -1.0, -1.0, 0.0,  0.0, 0.0,
+     0.0,  1.0, 0.0,  0.5, 1.0,
+  ]);
+  const vb1 = host.device.createBuffer({
+    size: tri1Data.byteLength,
+    usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+  });
+  host.device.queue.writeBuffer(vb1, 0, tri1Data);
+
+  // Vertex buffer 2: Triangle 2 (right side)
+  const tri2Data = new Float32Array([
+     0.0, -1.0, 0.0,  0.5, 0.0,
+     1.0, -1.0, 0.0,  1.0, 0.0,
+     1.0,  1.0, 0.0,  1.0, 1.0,
+  ]);
+  const vb2 = host.device.createBuffer({
+    size: tri2Data.byteLength,
+    usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+  });
+  host.device.queue.writeBuffer(vb2, 0, tri2Data);
+
+  // Bundle 1 draws Triangle 1 with Green
+  const bundleEncoder = host.device.createRenderBundleEncoder({
+    colorFormats: ["rgba8unorm"],
+  });
+  bundleEncoder.setPipeline(pipeline);
+  bundleEncoder.setBindGroup(0, bindGroup, [0]);
+  bundleEncoder.setVertexBuffer(0, vb1);
+  bundleEncoder.draw(3, 1, 0, 0);
+  const bundle = bundleEncoder.finish();
+
+  const readback = host.device.createBuffer({
+    size: readbackSize,
+    usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+  });
+
+  // Execute on real GPU inside synchronous error scopes to record exact GPU behavior.
+  // The broken control issues the post-bundle direct draw of Triangle 2 (3 vertices),
+  // but WITHOUT re-issuing setPipeline, setBindGroup, and setVertexBuffer.
+  let validationError = null;
+  try {
+    await host.withErrorScopes(["validation", "out-of-memory"], () => {
+      const encoder = host.device.createCommandEncoder();
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [{
+          view: target.createView(),
+          clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
+          loadOp: "clear",
+          storeOp: "store",
+        }],
+      });
+
+      // 1. Bundle draws Green left triangle
+      pass.executeBundles([bundle]);
+
+      // 2. Empty bundle sequence clears pass state per WebGPU spec invariant
+      pass.executeBundles([]);
+
+      // 3. BROKEN CONTROL: Still issue the post-bundle direct draw of Triangle 2,
+      // but WITHOUT re-issuing setPipeline, setBindGroup, and setVertexBuffer!
+      // The only difference from the positive path is the missing rebind.
+      pass.draw(3, 1, 0, 0);
+
+      pass.end();
+
+      encoder.copyTextureToBuffer(
+        { texture: target },
+        { buffer: readback, bytesPerRow, rowsPerImage: height },
+        [width, height, 1]
+      );
+
+      const commandBuffer = encoder.finish();
+      host.device.queue.submit([commandBuffer]);
+    });
+  } catch (err) {
+    validationError = err;
+  }
+
+  // Record what the real GPU did
+  const recordedGpuBehavior = {
+    behavior: validationError ? "validation_error_captured" : "wrong_geometry_rendered",
+    detail: validationError
+      ? (validationError.message || String(validationError))
+      : "Direct draw issued without rebind; executed with missing/stale pass state on GPU.",
+  };
+
+  // Read back actual GPU pixels from the offscreen target
+  let brokenPixels;
+  try {
+    brokenPixels = await readbackGpuBuffer(host.device, readback, readbackSize);
+  } catch (_) {
+    // If command buffer was marked invalid by WebGPU validation error preventing copy execution,
+    // readback buffer contains its initial unwritten bytes
+    brokenPixels = new Uint8Array(readbackSize);
+  }
+
+  target.destroy();
+  uniformBuffer.destroy();
+  vb1.destroy();
+  vb2.destroy();
+  readback.destroy();
+
+  // The EXACT SAME assertion must be applied to the broken output and MUST reject it
+  let rejected = false;
+  try {
+    assertBundleDirectDrawMatch(brokenPixels, oraclePixels, width, height);
+  } catch (e) {
+    rejected = true;
+  }
+
+  if (!rejected) {
+    throw new Error(
+      "Negative Control Failed: assertBundleDirectDrawMatch did not reject GPU output produced without post-bundle rebind!"
+    );
+  }
+
+  return recordedGpuBehavior;
+}
+
+/**
+ * -----------------------------------------------------------------------------
+ * 8. GENERATIONAL HANDLE ABA PUBLICATION GATE (§6.5, VQA.6)
+ * -----------------------------------------------------------------------------
+ * Plan §6.5, §23 [S33], and AGENTS.md "Generational Handle Slot Table & Publication Gate":
+ * Verifies that GPU resource handles are guarded by a typed NonZeroU32 generation
+ * in the bridge slot table (`f3d_core::Handle` and `crates/f3d-runtime/src/gpu_host.rs`).
+ *
+ * Calls real Rust/Wasm product exports:
+ * - `gpu_bridge_check_resource_handle(index, generation) -> bool` (alias `f3d_check_resource_handle`)
+ * - `gpu_bridge_advance_resource_generation(index) -> u32` (alias `f3d_advance_resource_generation`)
+ *
+ * Sequence:
+ * 1. Execute a real GPU packet (triangle packet registers IDs 1, 2, 3, 10, 100 at generation 1;
+ *    bundle packet registers 1, 2, 3, 10, 20, 200 at generation 1).
+ * 2. Assert `check(id, 1)` is true for registered IDs.
+ * 3. Advance slot generation: `advance(id)` returns 2.
+ * 4. Assert `check(id, 1)` is false (stale ABA generation rejected).
+ * 5. Assert `check(id, 2)` is true (new active generation accepted).
+ * 6. Assert `check(id, 0)` is false (generation zero strictly rejected via HandleError::InvalidGeneration).
+ *
+ * Negative Control: An explicitly isolated broken publication attempt of the completed GPU
+ * resource keyed by the stale generation (generation 1 after advance, or generation 0).
+ * Tested against the EXACT SAME `assertGenerationalHandlePublication` assertion to verify
+ * detection and rejection.
+ */
+export async function testGenerationalHandleAbaPublication(host, wasmModule) {
+  const checkFn = wasmModule?.f3d_check_resource_handle || wasmModule?.gpu_bridge_check_resource_handle;
+  const advanceFn = wasmModule?.f3d_advance_resource_generation || wasmModule?.gpu_bridge_advance_resource_generation;
+  const buildTriangleFn = wasmModule?.f3d_build_first_frame_packet || wasmModule?.gpu_bridge_build_triangle_packet;
+
+  if (!wasmModule || typeof checkFn !== "function" || typeof advanceFn !== "function" || typeof buildTriangleFn !== "function") {
+    throw new Error(
+      "Missing Wasm Export: testGenerationalHandleAbaPublication requires compiled application Wasm with exports 'gpu_bridge_check_resource_handle', 'gpu_bridge_advance_resource_generation', and 'gpu_bridge_build_triangle_packet' (or aliases). Silent JS fallback is forbidden."
+    );
+  }
+
+  // 1. Execute a real GPU packet through the WebGPU bridge
+  // In crates/f3d-runtime/src/gpu_host.rs:890-898, build_triangle_submission registers
+  // resource IDs: 1 (uniform buffer), 2 (vertex buffer), 3 (readback buffer), 10 (target texture), 100 (pipeline)
+  // at initial generation 1 in the global resource slot table.
+  const packet = buildTriangleFn();
+  await host.executePacket(packet);
+
+  const registeredTriangleIds = [1, 2, 3, 10, 100];
+  for (const id of registeredTriangleIds) {
+    if (!checkFn(id, 1)) {
+      throw new Error(
+        `Positive Control Failed: Expected resource id ${id} to be registered at generation 1, but check returned false!`
+      );
+    }
+  }
+
+  // Resource 10 (target texture) lifecycle and ABA publication test
+  const testId = 10;
+
+  // 2. Assert check(id, 1) is true
+  assertGenerationalHandlePublication(checkFn, testId, 1);
+
+  // 3. Assert advance(id) returns 2 (simulating resource slot release and reuse)
+  const newGen = advanceFn(testId);
+  if (newGen !== 2) {
+    throw new Error(
+      `Lifecycle Advance Failed: Expected advance_resource_generation(${testId}) to return 2, got ${newGen}!`
+    );
+  }
+
+  // 4. Assert check(id, 1) is false (stale ABA generation rejected)
+  if (checkFn(testId, 1) !== false) {
+    throw new Error(
+      `ABA Hazard Failed: Expected check_resource_handle(${testId}, 1) to return false after advance, got true!`
+    );
+  }
+
+  // 5. Assert check(id, 2) is true (fresh generation after reallocation accepted)
+  if (checkFn(testId, 2) !== true) {
+    throw new Error(
+      `Positive Control Failed: Expected check_resource_handle(${testId}, 2) to return true after advance, got false!`
+    );
+  }
+  assertGenerationalHandlePublication(checkFn, testId, 2);
+
+  // 6. Assert check(id, 0) is false (generation zero strictly rejected via HandleError::InvalidGeneration)
+  if (checkFn(testId, 0) !== false) {
+    throw new Error(
+      `Generation Zero Invariant Failed: Expected check_resource_handle(${testId}, 0) to return false, got true!`
+    );
+  }
+
+  return {
+    testId,
+    initialGen: 1,
+    advancedGen: newGen,
+    registeredTriangleIds,
+    detail: `Verified via real Rust/Wasm slot table exports: check(${testId}, 1)=true, advance(${testId})=2, check(${testId}, 1)=false, check(${testId}, 2)=true, check(${testId}, 0)=false.`,
+  };
+}
+
+export async function testNegativeBrokenGenerationalHandlePublication(host, wasmModule, testId = 10, staleGeneration = 1) {
+  const checkFn = wasmModule?.f3d_check_resource_handle || wasmModule?.gpu_bridge_check_resource_handle;
+  if (!wasmModule || typeof checkFn !== "function") {
+    throw new Error(
+      "Missing Wasm Export: testNegativeBrokenGenerationalHandlePublication requires 'gpu_bridge_check_resource_handle' (or alias). Silent JS fallback is forbidden."
+    );
+  }
+
+  // Verify that the GPU resource was indeed created and executed on the bridge host
+  if (!host.textures.has(testId)) {
+    throw new Error(
+      `testNegativeBrokenGenerationalHandlePublication: target texture ${testId} not found in bridge host textures`
+    );
+  }
+
+  // A real GPU publication attempt of the completed offscreen target resource,
+  // but keyed by the stale generation (generation 1 after slot advanced to generation 2).
+  // The EXACT SAME assertion `assertGenerationalHandlePublication` must be invoked, and MUST reject it.
+  let rejectedStale = false;
+  try {
+    assertGenerationalHandlePublication(checkFn, testId, staleGeneration);
+  } catch (err) {
+    if (err.message && err.message.includes("Generational Handle Publication Rejected")) {
+      rejectedStale = true;
+    }
+  }
+
+  if (!rejectedStale) {
+    throw new Error(
+      `Negative Control Failed: assertGenerationalHandlePublication did not reject publication attempt with stale generation (${testId}, gen=${staleGeneration})!`
+    );
+  }
+
+  // Also verify generation zero publication attempt is rejected by the exact same assertion
+  let rejectedZero = false;
+  try {
+    assertGenerationalHandlePublication(checkFn, testId, 0);
+  } catch (err) {
+    if (err.message && err.message.includes("Generational Handle Publication Rejected")) {
+      rejectedZero = true;
+    }
+  }
+
+  if (!rejectedZero) {
+    throw new Error(
+      `Negative Control Failed: assertGenerationalHandlePublication did not reject publication attempt with generation zero (${testId}, gen=0)!`
+    );
+  }
+
+  return {
+    behavior: "stale_generation_publication_rejected",
+    detail: `Publication attempt for GPU resource ${testId} keyed by stale generation ${staleGeneration} and zero generation was strictly rejected by assertGenerationalHandlePublication.`,
+  };
+}
+
+/**
+ * -----------------------------------------------------------------------------
+ * 9. LINEAR MEMORY BORROW GUARDS (§6.6, §13.1, VQA.6)
+ * -----------------------------------------------------------------------------
+ * Plan §6.6, §13.1, and AGENTS.md "Unsafe Code" / "Linear Memory":
+ * No application callback, memory growth, or scheduler re-entry may occur while
+ * a Rust borrow of linear memory is live. Release the borrow before calling
+ * effectful host/user code.
+ *
+ * Calls real Rust/Wasm product exports:
+ * - `gpu_bridge_borrow_enter() -> u64` (alias `f3d_borrow_enter`)
+ * - `gpu_bridge_borrow_exit(token: u64) -> bool` (alias `f3d_borrow_exit`)
+ * - `gpu_bridge_try_grow_memory(pages: u32) -> bool` (alias `f3d_try_grow_memory`)
+ *
+ * Sequence:
+ * 1. Assert grow true when idle (`try_grow_memory(1) === true`).
+ * 2. Assert enter gives nonzero BigInt token (`typeof token === "bigint" && token !== 0n`).
+ * 3. Assert grow false while borrowed (`try_grow_memory(1) === false`).
+ * 4. Assert exit with wrong token false (`borrow_exit(wrongToken) === false`).
+ * 5. Assert exit with right token true (`borrow_exit(token) === true`).
+ * 6. Assert grow true again (`try_grow_memory(1) === true`).
+ *
+ * Negative Control: An open borrow is entered, and an attempt to grow memory
+ * is issued. The EXACT SAME `assertMemoryGrowthAllowed` assertion rejects it.
+ */
+export async function testLinearMemoryBorrowGuards(host, wasmModule) {
+  const enterFn = wasmModule?.f3d_borrow_enter || wasmModule?.gpu_bridge_borrow_enter;
+  const exitFn = wasmModule?.f3d_borrow_exit || wasmModule?.gpu_bridge_borrow_exit;
+  const growFn = wasmModule?.f3d_try_grow_memory || wasmModule?.gpu_bridge_try_grow_memory;
+
+  if (!wasmModule || typeof enterFn !== "function" || typeof exitFn !== "function" || typeof growFn !== "function") {
+    throw new Error(
+      "Missing Wasm Export: testLinearMemoryBorrowGuards requires compiled application Wasm with exports 'gpu_bridge_borrow_enter', 'gpu_bridge_borrow_exit', and 'gpu_bridge_try_grow_memory' (or canonical aliases). Silent JS fallback is forbidden."
+    );
+  }
+
+  // 1. Assert grow true when idle
+  const idleGrow = growFn(1);
+  if (idleGrow !== true) {
+    throw new Error(
+      "Positive Control Failed: Expected try_grow_memory(1) to return true while idle!"
+    );
+  }
+  assertMemoryGrowthAllowed(growFn, 1);
+
+  // 2. Assert enter gives nonzero BigInt token (wasm-bindgen u64 is strictly BigInt)
+  const token = enterFn();
+  if (typeof token !== "bigint" || token === 0n) {
+    throw new Error(
+      `Positive Control Failed: Expected borrow_enter() to return non-zero BigInt BorrowToken (wasm-bindgen u64), got ${typeof token} (${token})!`
+    );
+  }
+
+  // 3. Assert grow false while borrowed
+  const borrowedGrow = growFn(1);
+  if (borrowedGrow !== false) {
+    // Clean up borrow before throwing
+    exitFn(token);
+    throw new Error(
+      "Safety Hazard: Expected try_grow_memory(1) to return false while an active borrow is held!"
+    );
+  }
+
+  // 4. Assert exit with wrong token false (BigInt token)
+  const wrongToken = token + 999999n;
+  const wrongExit = exitFn(wrongToken);
+  if (wrongExit !== false) {
+    exitFn(token);
+    throw new Error(
+      "Token Security Failed: Expected borrow_exit with wrong token to return false!"
+    );
+  }
+
+  // 5. Assert exit with right token true
+  const rightExit = exitFn(token);
+  if (rightExit !== true) {
+    throw new Error(
+      "Positive Control Failed: Expected borrow_exit with valid token to return true!"
+    );
+  }
+
+  // 6. Assert grow true again
+  const postExitGrow = growFn(1);
+  if (postExitGrow !== true) {
+    throw new Error(
+      "Positive Control Failed: Expected try_grow_memory(1) to return true after borrow scope exit!"
+    );
+  }
+  assertMemoryGrowthAllowed(growFn, 1);
+
+  return {
+    token: String(token),
+    detail: "Verified via real Rust/Wasm borrow scope exports: grow(idle)=true, enter=token, grow(borrowed)=false, exit(wrong)=false, exit(token)=true, grow(post)=true.",
+  };
+}
+
+export async function testNegativeBrokenLinearMemoryBorrowGuard(host, wasmModule) {
+  const enterFn = wasmModule?.f3d_borrow_enter || wasmModule?.gpu_bridge_borrow_enter;
+  const exitFn = wasmModule?.f3d_borrow_exit || wasmModule?.gpu_bridge_borrow_exit;
+  const growFn = wasmModule?.f3d_try_grow_memory || wasmModule?.gpu_bridge_try_grow_memory;
+
+  if (!wasmModule || typeof enterFn !== "function" || typeof exitFn !== "function" || typeof growFn !== "function") {
+    throw new Error(
+      "Missing Wasm Export: testNegativeBrokenLinearMemoryBorrowGuard requires 'gpu_bridge_borrow_enter' / 'gpu_bridge_try_grow_memory'."
+    );
+  }
+
+  // Enter an active borrow scope (strictly requires BigInt token)
+  const token = enterFn();
+  if (typeof token !== "bigint" || token === 0n) {
+    throw new Error(
+      `Broken Control Setup Failed: borrow_enter did not return valid non-zero BigInt token (got ${typeof token} ${token})`
+    );
+  }
+
+  // Broken attempt: Attempt memory growth while an open borrow is active.
+  // The EXACT SAME `assertMemoryGrowthAllowed` assertion must be invoked, and MUST reject it.
+  let rejected = false;
+  try {
+    assertMemoryGrowthAllowed(growFn, 1);
+  } catch (err) {
+    if (err.message && err.message.includes("Linear Memory Borrow Violation")) {
+      rejected = true;
+    }
+  } finally {
+    // Release the borrow so runtime remains clean
+    exitFn(token);
+  }
+
+  if (!rejected) {
+    throw new Error(
+      "Negative Control Failed: assertMemoryGrowthAllowed did not reject memory growth attempt inside open borrow scope!"
+    );
+  }
+
+  return {
+    behavior: "growth_during_borrow_rejected",
+    detail: "Linear memory growth during open borrow scope was strictly rejected by assertMemoryGrowthAllowed.",
+  };
+}
+
+/**
+ * -----------------------------------------------------------------------------
+ * 10. AFFINEROWS GPU WIRE LAYOUT VALIDATION (§6.1, §6.2, VQA.6)
+ * -----------------------------------------------------------------------------
+ * Plan §6.1, §6.2, §23 [S33], and AGENTS.md "Core Invariants":
+ * AffineRows packs a 4x4 matrix into 3 rows of vec4 (48 bytes: r0, r1, r2),
+ * requiring the fourth row of the transform to be strictly affine `[0.0, 0.0, 0.0, 1.0]`.
+ * Validates wire byte layout and rejects non-affine perspective terms before GPU upload.
+ *
+ * Wire format specifications:
+ * - 48 bytes: decoded as canonical AffineRows wire record (row-major, translation at floats 3, 7, 11).
+ *             Fourth row [0, 0, 0, 1] is implicit. Rejects non-finite floats (NaN/Inf) with code 2.
+ * - 64 bytes: decoded as column-major 4x4 Matrix4. Verified via AffineRows::from_column_major.
+ * - len < 48: rejected with code 1 (LAYOUT_VALIDATION_BUFFER_TOO_SMALL, required: 48).
+ * - 49..63 bytes: rejected with code 1 (LAYOUT_VALIDATION_BUFFER_TOO_SMALL, required: 64).
+ * - len > 64: rejected with code 4 (LAYOUT_VALIDATION_INCOMPATIBLE_TARGET, target: 64).
+ *
+ * Calls real Rust/Wasm product export:
+ * - `gpu_bridge_validate_affine_rows(bytes: Uint8Array) -> i32` (alias `f3d_validate_affine_rows`)
+ *   Return codes:
+ *   - 0: LAYOUT_VALIDATION_OK
+ *   - 1: LAYOUT_VALIDATION_BUFFER_TOO_SMALL (< 48 or 49..63 bytes)
+ *   - 2: LAYOUT_VALIDATION_NON_AFFINE_MATRIX (perspective terms non-zero, invalid scale, or non-finite)
+ *   - 4: LAYOUT_VALIDATION_INCOMPATIBLE_TARGET (> 64 bytes)
+ *   - 3..7: Other LayoutError codes
+ *
+ * Sequence:
+ * 1. 64-byte column-major identity matrix -> validate returns code 0 (valid).
+ *    Verify with `assertAffineRowsLayoutValid`.
+ * 2. 64-byte column-major matrix with nonzero translation (tx=12.5, ty=-4.0, tz=100.0)
+ *    -> validate returns code 0 (valid). Verify with `assertAffineRowsLayoutValid`.
+ * 3. 64-byte column-major matrix with e[11] non-zero (row 3, col 2 perspective term)
+ *    -> validate returns code 2 (LAYOUT_VALIDATION_NON_AFFINE_MATRIX).
+ * 4. 48-byte AffineRows wire record with nonzero translation (tx=12.5 at float 3, ty=-4.0 at float 7, tz=100.0 at float 11)
+ *    -> validate returns code 0 (valid). Verify with `assertAffineRowsLayoutValid`.
+ * 5. 48-byte AffineRows wire record with NaN translation component (float 3 = NaN)
+ *    -> validate returns code 2 (LAYOUT_VALIDATION_NON_AFFINE_MATRIX).
+ * 6. 47-byte buffer (1 byte smaller than 48-byte AffineRows layout, len < 48)
+ *    -> validate returns code 1 (LAYOUT_VALIDATION_BUFFER_TOO_SMALL).
+ * 7. 56-byte buffer (intermediate length, 48 < len < 64)
+ *    -> validate returns code 1 (LAYOUT_VALIDATION_BUFFER_TOO_SMALL).
+ * 8. 72-byte buffer (oversized buffer, len > 64)
+ *    -> validate returns code 4 (LAYOUT_VALIDATION_INCOMPATIBLE_TARGET).
+ *
+ * GPU-Side Control: Attempt to upload a non-affine matrix through the validator gate,
+ * asserting that the packet path refuses before any GPU submission occurs.
+ */
+export async function testAffineRowsGpuLayoutValidation(host, wasmModule) {
+  const validateFn = wasmModule?.f3d_validate_affine_rows || wasmModule?.gpu_bridge_validate_affine_rows;
+
+  if (!wasmModule || typeof validateFn !== "function") {
+    throw new Error(
+      "Missing Wasm Export: testAffineRowsGpuLayoutValidation requires compiled application Wasm with export 'gpu_bridge_validate_affine_rows' (or alias 'f3d_validate_affine_rows'). Silent JS fallback is forbidden."
+    );
+  }
+
+  // 1. Real 64-byte column-major identity matrix:
+  // Column-major 4x4: [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]
+  const identityBytes = new Uint8Array(64);
+  const idFloats = new Float32Array(identityBytes.buffer);
+  idFloats[0] = 1.0;
+  idFloats[5] = 1.0;
+  idFloats[10] = 1.0;
+  idFloats[15] = 1.0;
+
+  const code0 = validateFn(identityBytes);
+  if (code0 !== 0) {
+    throw new Error(
+      `Positive Control Failed: Expected validate_affine_rows(identity) to return 0, got ${code0}!`
+    );
+  }
+  assertAffineRowsLayoutValid(validateFn, identityBytes);
+
+  // 2. Real 64-byte column-major matrix with nonzero translation (tx=12.5, ty=-4.0, tz=100.0):
+  // Translation components in column-major 4x4 are at elements 12, 13, 14 (column 3, rows 0..2).
+  const valid64TransBytes = new Uint8Array(64);
+  const v64Floats = new Float32Array(valid64TransBytes.buffer);
+  v64Floats[0] = 1.0;
+  v64Floats[5] = 1.0;
+  v64Floats[10] = 1.0;
+  v64Floats[15] = 1.0;
+  v64Floats[12] = 12.5;  // tx
+  v64Floats[13] = -4.0;  // ty
+  v64Floats[14] = 100.0; // tz
+
+  const code0Trans = validateFn(valid64TransBytes);
+  if (code0Trans !== 0) {
+    throw new Error(
+      `Positive Control Failed: Expected validate_affine_rows(64-byte translated matrix) to return 0, got ${code0Trans}!`
+    );
+  }
+  assertAffineRowsLayoutValid(validateFn, valid64TransBytes);
+
+  // 3. 64-byte matrix with e[11] non-zero (perspective component at column 2, row 3 in 0-indexed column-major):
+  // Column 2 entries are elements 8, 9, 10, 11 (where 11 is row 3). Non-zero e[11] breaks affine invariant!
+  const nonAffineBytes = new Uint8Array(64);
+  const naFloats = new Float32Array(nonAffineBytes.buffer);
+  naFloats[0] = 1.0;
+  naFloats[5] = 1.0;
+  naFloats[10] = 1.0;
+  naFloats[15] = 1.0;
+  naFloats[11] = 0.5; // perspective element
+
+  const code2 = validateFn(nonAffineBytes);
+  if (code2 !== 2) {
+    throw new Error(
+      `Non-Affine Rejection Failed: Expected validate_affine_rows(nonAffine) to return 2 (NON_AFFINE_MATRIX), got ${code2}!`
+    );
+  }
+
+  // 4. Real 48-byte AffineRows wire record with nonzero translation (tx=12.5, ty=-4.0, tz=100.0):
+  // Row-major 3x4: row 0 [m00,m01,m02,tx], row 1 [m10,m11,m12,ty], row 2 [m20,m21,m22,tz].
+  // Translation is at floats 3, 7, 11.
+  const valid48TransBytes = new Uint8Array(48);
+  const v48Floats = new Float32Array(valid48TransBytes.buffer);
+  v48Floats[0] = 1.0;  // m00
+  v48Floats[5] = 1.0;  // m11
+  v48Floats[10] = 1.0; // m22
+  v48Floats[3] = 12.5;  // tx
+  v48Floats[7] = -4.0;  // ty
+  v48Floats[11] = 100.0; // tz
+
+  const code0AffineTrans = validateFn(valid48TransBytes);
+  if (code0AffineTrans !== 0) {
+    throw new Error(
+      `Positive Control Failed: Expected validate_affine_rows(48-byte translated AffineRows) to return 0, got ${code0AffineTrans}!`
+    );
+  }
+  assertAffineRowsLayoutValid(validateFn, valid48TransBytes);
+
+  // 5. 48-byte AffineRows wire record with NaN translation:
+  // Non-finite translation float must be rejected with code 2 (NON_AFFINE_MATRIX).
+  const nan48Bytes = new Uint8Array(48);
+  const nan48Floats = new Float32Array(nan48Bytes.buffer);
+  nan48Floats[0] = 1.0;
+  nan48Floats[5] = 1.0;
+  nan48Floats[10] = 1.0;
+  nan48Floats[3] = NaN; // NaN translation component
+  nan48Floats[7] = -4.0;
+  nan48Floats[11] = 100.0;
+
+  const code2AffineNan = validateFn(nan48Bytes);
+  if (code2AffineNan !== 2) {
+    throw new Error(
+      `Non-Affine Rejection Failed: Expected validate_affine_rows(48-byte NaN translation) to return 2 (NON_AFFINE_MATRIX), got ${code2AffineNan}!`
+    );
+  }
+
+  // 6. 47-byte buffer (1 byte smaller than 48-byte AffineRows layout, len < 48):
+  const smallBytes = new Uint8Array(47);
+  const code1Small = validateFn(smallBytes);
+  if (code1Small !== 1) {
+    throw new Error(
+      `Buffer Size Rejection Failed: Expected validate_affine_rows(47-byte) to return 1 (BUFFER_TOO_SMALL), got ${code1Small}!`
+    );
+  }
+
+  // 7. 56-byte buffer (intermediate length, 48 < len < 64):
+  const midLenBytes = new Uint8Array(56);
+  const code1Mid = validateFn(midLenBytes);
+  if (code1Mid !== 1) {
+    throw new Error(
+      `Buffer Size Rejection Failed: Expected validate_affine_rows(56-byte) to return 1 (BUFFER_TOO_SMALL), got ${code1Mid}!`
+    );
+  }
+
+  // 8. 72-byte buffer (oversized buffer, len > 64):
+  const oversizedBytes = new Uint8Array(72);
+  const code4Oversized = validateFn(oversizedBytes);
+  if (code4Oversized !== 4) {
+    throw new Error(
+      `Buffer Size Rejection Failed: Expected validate_affine_rows(72-byte) to return 4 (INCOMPATIBLE_TARGET), got ${code4Oversized}!`
+    );
+  }
+
+  return {
+    identityCode: code0,
+    translatedMatrixCode: code0Trans,
+    nonAffineCode: code2,
+    affineRowsTransCode: code0AffineTrans,
+    affineRowsNanCode: code2AffineNan,
+    smallBufferCode: code1Small,
+    midBufferCode: code1Mid,
+    oversizedBufferCode: code4Oversized,
+    detail: "Verified via real Rust/Wasm AffineRows validator: 64-byte identity (0) & translated (0), 48-byte AffineRows with translation (0) & NaN translation (2), 64-byte e[11] perspective (2), 47-byte (1), 56-byte (1), 72-byte (4).",
+  };
+}
+
+export async function testNegativeBrokenAffineRowsGpuPacketRejection(host, wasmModule) {
+  const validateFn = wasmModule?.f3d_validate_affine_rows || wasmModule?.gpu_bridge_validate_affine_rows;
+
+  if (!wasmModule || typeof validateFn !== "function") {
+    throw new Error(
+      "Missing Wasm Export: testNegativeBrokenAffineRowsGpuPacketRejection requires 'gpu_bridge_validate_affine_rows'."
+    );
+  }
+
+  // Construct non-affine matrix with non-zero perspective term (e[11] = 0.5)
+  const nonAffineBytes = new Uint8Array(64);
+  const naFloats = new Float32Array(nonAffineBytes.buffer);
+  naFloats[0] = 1.0;
+  naFloats[5] = 1.0;
+  naFloats[10] = 1.0;
+  naFloats[15] = 1.0;
+  naFloats[11] = 0.5;
+
+  let submissionAttempted = false;
+  let validatorRejected = false;
+
+  try {
+    // GPU-side Control: Upload attempt through validator gate.
+    // The gate MUST validate the matrix bytes and refuse the operation BEFORE constructing
+    // or submitting any binary packet to the GPU.
+    assertAffineRowsLayoutValid(validateFn, nonAffineBytes);
+
+    // If the gate erroneously permitted the matrix, constructing and submitting the packet would execute
+    submissionAttempted = true;
+    const builder = new BinaryPacketBuilder();
+    builder.createBuffer(70, 64, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+    builder.writeBuffer(70, 0, nonAffineBytes);
+    const packet = builder.build();
+    await host.executePacket(packet);
+  } catch (err) {
+    if (err.message && err.message.includes("AffineRows Layout Validation Rejected")) {
+      validatorRejected = true;
+    }
+  }
+
+  if (submissionAttempted) {
+    throw new Error(
+      "Negative Control Failed: Corrupt non-affine transform bypassed validator gate and attempted GPU submission!"
+    );
+  }
+
+  if (!validatorRejected) {
+    throw new Error(
+      "Negative Control Failed: assertAffineRowsLayoutValid did not reject non-affine matrix before GPU submission!"
+    );
+  }
+
+  return {
+    behavior: "non_affine_gpu_submission_refused",
+    detail: "Validator gate intercepted non-affine matrix (code 2) and refused packet upload before any GPU submission was encoded.",
+  };
+}
+
+

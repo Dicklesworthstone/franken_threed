@@ -18,6 +18,8 @@ export const OPCODE_CREATE_PIPELINE = 3;
 export const OPCODE_RENDER_PASS = 4;
 export const OPCODE_COPY_TEXTURE_TO_BUFFER = 5;
 export const OPCODE_CREATE_TEXTURE = 6;
+export const OPCODE_RECORD_BUNDLE = 7;
+export const OPCODE_EXECUTE_BUNDLES = 8;
 
 export const TARGET_OFFSCREEN = 0;
 export const TARGET_CANVAS = 1;
@@ -41,8 +43,10 @@ export class WebGpuBridgeHost {
     this.textures = new Map();
     this.pipelines = new Map();
     this.bindGroups = new Map();
+    this.bundles = new Map();
     this.bufferEpochs = new Map();
     this.errorScopeActive = false;
+    this.lastRenderTargetId = null;
   }
 
   /**
@@ -233,6 +237,28 @@ export class WebGpuBridgeHost {
     await this.withErrorScopes(["validation", "out-of-memory"], () => {
       const commandEncoder = this.device.createCommandEncoder();
       let cursor = headerLen;
+      let currentPassEncoder = null;
+      let currentPassTargetKey = null;
+      let passState = {
+        pipelineId: null,
+        uniformBufferId: null,
+        dynamicOffset: null,
+        vertexBufferId: null,
+      };
+
+      const closeActivePass = () => {
+        if (currentPassEncoder) {
+          currentPassEncoder.end();
+          currentPassEncoder = null;
+          currentPassTargetKey = null;
+          passState = {
+            pipelineId: null,
+            uniformBufferId: null,
+            dynamicOffset: null,
+            vertexBufferId: null,
+          };
+        }
+      };
 
       for (let i = 0; i < commandCount; i++) {
         if (cursor + 2 > dataBlockStart) {
@@ -244,6 +270,7 @@ export class WebGpuBridgeHost {
 
         switch (opcode) {
           case OPCODE_CREATE_BUFFER: {
+            closeActivePass();
             if (cursor + 12 > dataBlockStart) {
               throw new Error(`Truncated CREATE_BUFFER fields at command ${i}`);
             }
@@ -262,6 +289,7 @@ export class WebGpuBridgeHost {
           }
 
           case OPCODE_WRITE_BUFFER: {
+            closeActivePass();
             if (cursor + 16 > dataBlockStart) {
               throw new Error(`Truncated WRITE_BUFFER fields at command ${i}`);
             }
@@ -285,6 +313,7 @@ export class WebGpuBridgeHost {
           }
 
           case OPCODE_CREATE_TEXTURE: {
+            closeActivePass();
             if (cursor + 20 > dataBlockStart) {
               throw new Error(`Truncated CREATE_TEXTURE fields at command ${i}`);
             }
@@ -310,10 +339,12 @@ export class WebGpuBridgeHost {
               usage: usage,
             });
             this.textures.set(textureId, texture);
+            this.lastRenderTargetId = textureId;
             break;
           }
 
           case OPCODE_CREATE_PIPELINE: {
+            closeActivePass();
             if (cursor + 32 > dataBlockStart) {
               throw new Error(`Truncated CREATE_PIPELINE fields at command ${i}`);
             }
@@ -422,77 +453,105 @@ export class WebGpuBridgeHost {
             const uniformBufferId = dataView.getUint32(cursor + 40, true) || 1;
             cursor += 44;
 
-            let targetView;
-            if (targetType === TARGET_CANVAS) {
-              if (!canvasContext) {
-                // Gracefully skip canvas swapchain presentation pass in headless or pure-offscreen execution
-                continue;
-              }
-              // Canvas texture is acquired fresh per frame/interval inside the synchronous error scope
-              targetView = canvasContext.getCurrentTexture().createView();
-            } else if (targetType === TARGET_OFFSCREEN) {
-              const texture = this.textures.get(targetId);
-              if (!texture) {
-                throw new Error(`RenderPass: unknown offscreen targetId ${targetId}`);
-              }
-              targetView = texture.createView();
-            } else {
-              throw new Error(`Invalid render pass targetType: ${targetType}`);
+            if (targetType === TARGET_OFFSCREEN) {
+              this.lastRenderTargetId = targetId;
             }
 
-            const pipelineRecord = this.pipelines.get(pipelineId);
-            if (!pipelineRecord) {
-              throw new Error(`RenderPass: unknown pipelineId ${pipelineId}`);
-            }
+            const targetKey = `${targetType}:${targetId}`;
+            if (!currentPassEncoder || currentPassTargetKey !== targetKey) {
+              closeActivePass();
 
-            const passEncoder = commandEncoder.beginRenderPass({
-              colorAttachments: [
-                {
-                  view: targetView,
-                  clearValue: { r: cr, g: cg, b: cb, a: ca },
-                  loadOp: "clear",
-                  storeOp: "store",
-                },
-              ],
-            });
-
-            passEncoder.setPipeline(pipelineRecord.pipeline);
-
-            if (pipelineRecord.hasUniformBuffer) {
-              const uniformBuf = this.buffers.get(uniformBufferId);
-              if (!uniformBuf) {
-                throw new Error(`RenderPass: uniform buffer ${uniformBufferId} missing for pipeline`);
+              let targetView;
+              if (targetType === TARGET_CANVAS) {
+                if (!canvasContext) {
+                  // Gracefully skip canvas swapchain presentation pass in headless or pure-offscreen execution
+                  continue;
+                }
+                // Canvas texture is acquired fresh per frame/interval inside the synchronous error scope
+                targetView = canvasContext.getCurrentTexture().createView();
+              } else if (targetType === TARGET_OFFSCREEN) {
+                const texture = this.textures.get(targetId);
+                if (!texture) {
+                  throw new Error(`RenderPass: unknown offscreen targetId ${targetId}`);
+                }
+                targetView = texture.createView();
+              } else {
+                throw new Error(`Invalid render pass targetType: ${targetType}`);
               }
-              const bindGroup = this.device.createBindGroup({
-                layout: pipelineRecord.bindGroupLayout,
-                entries: [
+
+              currentPassEncoder = commandEncoder.beginRenderPass({
+                colorAttachments: [
                   {
-                    binding: 0,
-                    resource: {
-                      buffer: uniformBuf,
-                      offset: 0,
-                      size: pipelineRecord.uniformSize || 48,
-                    },
+                    view: targetView,
+                    clearValue: { r: cr, g: cg, b: cb, a: ca },
+                    loadOp: "clear",
+                    storeOp: "store",
                   },
                 ],
               });
-              passEncoder.setBindGroup(0, bindGroup, [dynamicOffset]);
+              currentPassTargetKey = targetKey;
+              passState = {
+                pipelineId: null,
+                uniformBufferId: null,
+                dynamicOffset: null,
+                vertexBufferId: null,
+              };
             }
 
-            if (vertexBufferId > 0) {
-              const vb = this.buffers.get(vertexBufferId);
-              if (!vb) {
-                throw new Error(`RenderPass: unknown vertexBufferId ${vertexBufferId}`);
+            if (vertexCount > 0) {
+              const pipelineRecord = this.pipelines.get(pipelineId);
+              if (!pipelineRecord) {
+                throw new Error(`RenderPass: unknown pipelineId ${pipelineId}`);
               }
-              passEncoder.setVertexBuffer(0, vb);
-            }
 
-            passEncoder.draw(vertexCount, 1, 0, 0);
-            passEncoder.end();
+              if (passState.pipelineId !== pipelineId) {
+                currentPassEncoder.setPipeline(pipelineRecord.pipeline);
+                passState.pipelineId = pipelineId;
+              }
+
+              if (pipelineRecord.hasUniformBuffer) {
+                if (passState.uniformBufferId !== uniformBufferId || passState.dynamicOffset !== dynamicOffset) {
+                  const uniformBuf = this.buffers.get(uniformBufferId);
+                  if (!uniformBuf) {
+                    throw new Error(`RenderPass: uniform buffer ${uniformBufferId} missing for pipeline`);
+                  }
+                  const bindGroup = this.device.createBindGroup({
+                    layout: pipelineRecord.bindGroupLayout,
+                    entries: [
+                      {
+                        binding: 0,
+                        resource: {
+                          buffer: uniformBuf,
+                          offset: 0,
+                          size: pipelineRecord.uniformSize || 48,
+                        },
+                      },
+                    ],
+                  });
+                  currentPassEncoder.setBindGroup(0, bindGroup, [dynamicOffset]);
+                  passState.uniformBufferId = uniformBufferId;
+                  passState.dynamicOffset = dynamicOffset;
+                }
+              }
+
+              if (vertexBufferId > 0) {
+                if (passState.vertexBufferId !== vertexBufferId) {
+                  const vb = this.buffers.get(vertexBufferId);
+                  if (!vb) {
+                    throw new Error(`RenderPass: unknown vertexBufferId ${vertexBufferId}`);
+                  }
+                  currentPassEncoder.setVertexBuffer(0, vb);
+                  passState.vertexBufferId = vertexBufferId;
+                }
+              }
+
+              currentPassEncoder.draw(vertexCount, 1, 0, 0);
+            }
             break;
           }
 
           case OPCODE_COPY_TEXTURE_TO_BUFFER: {
+            closeActivePass();
             if (cursor + 24 > dataBlockStart) {
               throw new Error(`Truncated COPY_TEXTURE_TO_BUFFER fields at command ${i}`);
             }
@@ -523,11 +582,214 @@ export class WebGpuBridgeHost {
             break;
           }
 
+          case OPCODE_RECORD_BUNDLE: {
+            closeActivePass();
+            if (cursor + 28 > dataBlockStart) {
+              throw new Error(`Truncated RECORD_BUNDLE fields at command ${i}`);
+            }
+            const bundleId = dataView.getUint32(cursor, true);
+            const pipelineId = dataView.getUint32(cursor + 4, true);
+            const vertexBufferId = dataView.getUint32(cursor + 8, true);
+            const vertexCount = dataView.getUint32(cursor + 12, true);
+            const dynamicOffset = dataView.getUint32(cursor + 16, true);
+            const uniformBufferId = dataView.getUint32(cursor + 20, true) || 1;
+            const targetFormatCode = dataView.getUint32(cursor + 24, true);
+            cursor += 28;
+
+            let format;
+            if (targetFormatCode === 0) {
+              format = this.capabilityRecord?.preferredCanvasFormat || "bgra8unorm";
+            } else if (targetFormatCode === 1) {
+              format = "bgra8unorm";
+            } else if (targetFormatCode === 2) {
+              format = "rgba8unorm";
+            } else {
+              throw new Error(`Invalid bundle target formatCode: ${targetFormatCode}`);
+            }
+
+            const pipelineRecord = this.pipelines.get(pipelineId);
+            if (!pipelineRecord) {
+              throw new Error(`RecordBundle: unknown pipelineId ${pipelineId}`);
+            }
+
+            const bundleEncoder = this.device.createRenderBundleEncoder({
+              colorFormats: [format],
+            });
+
+            bundleEncoder.setPipeline(pipelineRecord.pipeline);
+
+            if (pipelineRecord.hasUniformBuffer) {
+              const uniformBuf = this.buffers.get(uniformBufferId);
+              if (!uniformBuf) {
+                throw new Error(`RecordBundle: uniform buffer ${uniformBufferId} missing for pipeline`);
+              }
+              const bindGroup = this.device.createBindGroup({
+                layout: pipelineRecord.bindGroupLayout,
+                entries: [
+                  {
+                    binding: 0,
+                    resource: {
+                      buffer: uniformBuf,
+                      offset: 0,
+                      size: pipelineRecord.uniformSize || 48,
+                    },
+                  },
+                ],
+              });
+              bundleEncoder.setBindGroup(0, bindGroup, [dynamicOffset]);
+            }
+
+            if (vertexBufferId > 0) {
+              const vb = this.buffers.get(vertexBufferId);
+              if (!vb) {
+                throw new Error(`RecordBundle: unknown vertexBufferId ${vertexBufferId}`);
+              }
+              bundleEncoder.setVertexBuffer(0, vb);
+            }
+
+            if (vertexCount > 0) {
+              bundleEncoder.draw(vertexCount, 1, 0, 0);
+            }
+
+            const bundle = bundleEncoder.finish();
+            this.bundles.set(bundleId, bundle);
+            break;
+          }
+
+          case OPCODE_EXECUTE_BUNDLES: {
+            if (cursor + 4 > dataBlockStart) {
+              throw new Error(`Truncated EXECUTE_BUNDLES fields at command ${i}`);
+            }
+            const bundleCount = dataView.getUint32(cursor, true);
+            cursor += 4;
+            if (cursor + bundleCount * 4 > dataBlockStart) {
+              throw new Error(`Truncated EXECUTE_BUNDLES list at command ${i}`);
+            }
+            const bundleIds = [];
+            for (let b = 0; b < bundleCount; b++) {
+              bundleIds.push(dataView.getUint32(cursor + b * 4, true));
+            }
+            cursor += bundleCount * 4;
+
+            if (!currentPassEncoder) {
+              // Open pass on enclosing render pass target if not already open
+              let targetType = TARGET_OFFSCREEN;
+              let targetId = 0;
+              let clearColor = [0, 0, 0, 1];
+              let scanCursor = cursor;
+              let foundTarget = false;
+
+              while (scanCursor + 2 <= dataBlockStart) {
+                const nextOp = dataView.getUint16(scanCursor, true);
+                scanCursor += 2;
+                if (nextOp === OPCODE_RENDER_PASS) {
+                  if (scanCursor + 44 <= dataBlockStart) {
+                    targetType = dataView.getUint32(scanCursor, true);
+                    targetId = dataView.getUint32(scanCursor + 4, true);
+                    clearColor = [
+                      dataView.getFloat32(scanCursor + 8, true),
+                      dataView.getFloat32(scanCursor + 12, true),
+                      dataView.getFloat32(scanCursor + 16, true),
+                      dataView.getFloat32(scanCursor + 20, true),
+                    ];
+                    foundTarget = true;
+                  }
+                  break;
+                } else if (nextOp === OPCODE_CREATE_BUFFER) {
+                  scanCursor += 12;
+                } else if (nextOp === OPCODE_WRITE_BUFFER) {
+                  scanCursor += 16;
+                } else if (nextOp === OPCODE_CREATE_TEXTURE) {
+                  scanCursor += 20;
+                } else if (nextOp === OPCODE_CREATE_PIPELINE) {
+                  scanCursor += 32;
+                } else if (nextOp === OPCODE_COPY_TEXTURE_TO_BUFFER) {
+                  scanCursor += 24;
+                } else if (nextOp === OPCODE_RECORD_BUNDLE) {
+                  scanCursor += 28;
+                } else if (nextOp === OPCODE_EXECUTE_BUNDLES) {
+                  if (scanCursor + 4 <= dataBlockStart) {
+                    const cnt = dataView.getUint32(scanCursor, true);
+                    scanCursor += 4 + cnt * 4;
+                  } else {
+                    break;
+                  }
+                } else {
+                  break;
+                }
+              }
+
+              if (!foundTarget && this.lastRenderTargetId) {
+                targetType = TARGET_OFFSCREEN;
+                targetId = this.lastRenderTargetId;
+                foundTarget = true;
+              }
+
+              if (!foundTarget) {
+                throw new Error("ExecuteBundles: no active render pass and no target found");
+              }
+
+              let targetView;
+              if (targetType === TARGET_CANVAS) {
+                if (!canvasContext) {
+                  continue;
+                }
+                targetView = canvasContext.getCurrentTexture().createView();
+              } else {
+                const texture = this.textures.get(targetId);
+                if (!texture) {
+                  throw new Error(`ExecuteBundles: unknown offscreen targetId ${targetId}`);
+                }
+                targetView = texture.createView();
+              }
+
+              currentPassEncoder = commandEncoder.beginRenderPass({
+                colorAttachments: [
+                  {
+                    view: targetView,
+                    clearValue: { r: clearColor[0], g: clearColor[1], b: clearColor[2], a: clearColor[3] },
+                    loadOp: "clear",
+                    storeOp: "store",
+                  },
+                ],
+              });
+              currentPassTargetKey = `${targetType}:${targetId}`;
+              passState = {
+                pipelineId: null,
+                uniformBufferId: null,
+                dynamicOffset: null,
+                vertexBufferId: null,
+              };
+            }
+
+            const bundleList = [];
+            for (const bId of bundleIds) {
+              const b = this.bundles.get(bId);
+              if (!b) {
+                throw new Error(`ExecuteBundles: unknown bundleId ${bId}`);
+              }
+              bundleList.push(b);
+            }
+
+            currentPassEncoder.executeBundles(bundleList);
+
+            // WebGPU Spec Invariant: executeBundles clears pass state!
+            // Any following direct draw MUST explicitly rebind pipeline, bind groups, and vertex buffers.
+            passState = {
+              pipelineId: null,
+              uniformBufferId: null,
+              dynamicOffset: null,
+              vertexBufferId: null,
+            };
+            break;
+          }
+
           default:
             throw new Error(`Unknown opcode: ${opcode}`);
         }
       }
 
+      closeActivePass();
       // Finish and submit synchronously inside the error scope
       const commandBuffer = commandEncoder.finish();
       this.device.queue.submit([commandBuffer]);

@@ -85,6 +85,32 @@ fn fs_main() -> @location(0) vec4<f32> {
 `;
 
 /**
+ * WGSL shader for flat color uniform with VertexPosUv layout (matches gpu_host.rs).
+ */
+export const WGSL_FLAT_COLOR_BUNDLE = `
+struct ColorUniform {
+    color: vec4<f32>,
+};
+@group(0) @binding(0)
+var<uniform> u: ColorUniform;
+
+struct VertexInput {
+    @location(0) position: vec3<f32>,
+    @location(1) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(in: VertexInput) -> @builtin(position) vec4<f32> {
+    return vec4<f32>(in.position, 1.0);
+}
+
+@fragment
+fn fs_main() -> @location(0) vec4<f32> {
+    return u.color;
+}
+`;
+
+/**
  * Helper to compute WebGPU row-pitch aligned to 256 bytes.
  */
 export function computeAlignedBytesPerRow(width) {
@@ -333,19 +359,19 @@ export async function renderDirectRedABlueBReference(device, width = 32, height 
  * Demonstrates that executeBundles clears render-pass state, requiring explicit
  * re-binding before subsequent direct draws.
  */
-export async function renderDirectBundleDirectReference(device, width = 32, height = 32) {
+export async function renderDirectBundleDirectReference(device, width = 64, height = 64) {
   const target = device.createTexture({
     size: [width, height, 1],
     format: "rgba8unorm",
     usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
   });
 
-  const shaderModule = device.createShaderModule({ code: WGSL_SOLID_COLOR });
+  const shaderModule = device.createShaderModule({ code: WGSL_FLAT_COLOR_BUNDLE });
   const bgl = device.createBindGroupLayout({
     entries: [
       {
         binding: 0,
-        visibility: GPUShaderStage.FRAGMENT,
+        visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
         buffer: { type: "uniform", hasDynamicOffset: true, minBindingSize: 16 },
       },
     ],
@@ -353,12 +379,28 @@ export async function renderDirectBundleDirectReference(device, width = 32, heig
 
   const pipeline = device.createRenderPipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [bgl] }),
-    vertex: { module: shaderModule, entryPoint: "vs_main" },
-    fragment: { module: shaderModule, entryPoint: "fs_main", targets: [{ format: "rgba8unorm" }] },
+    vertex: {
+      module: shaderModule,
+      entryPoint: "vs_main",
+      buffers: [
+        {
+          arrayStride: 20,
+          attributes: [
+            { shaderLocation: 0, offset: 0, format: "float32x3" },
+            { shaderLocation: 1, offset: 12, format: "float32x2" },
+          ],
+        },
+      ],
+    },
+    fragment: {
+      module: shaderModule,
+      entryPoint: "fs_main",
+      targets: [{ format: "rgba8unorm" }],
+    },
     primitive: { topology: "triangle-list" },
   });
 
-  // Uniform buffer:
+  // Uniform buffer (512 bytes):
   // Offset 0: Green [0.0, 1.0, 0.0, 1.0] (recorded in bundle)
   // Offset 256: Blue [0.0, 0.0, 1.0, 1.0] (drawn in direct draw)
   const uniformBuffer = device.createBuffer({
@@ -373,13 +415,38 @@ export async function renderDirectBundleDirectReference(device, width = 32, heig
     entries: [{ binding: 0, resource: { buffer: uniformBuffer, offset: 0, size: 16 } }],
   });
 
-  // Record a RenderBundle that draws with Offset 0 (Green)
+  // Vertex buffer 1: Triangle 1 (left side)
+  const tri1Data = new Float32Array([
+    -1.0,  1.0, 0.0,  0.0, 1.0,
+    -1.0, -1.0, 0.0,  0.0, 0.0,
+     0.0,  1.0, 0.0,  0.5, 1.0,
+  ]);
+  const vb1 = device.createBuffer({
+    size: tri1Data.byteLength,
+    usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(vb1, 0, tri1Data);
+
+  // Vertex buffer 2: Triangle 2 (right side)
+  const tri2Data = new Float32Array([
+     0.0, -1.0, 0.0,  0.5, 0.0,
+     1.0, -1.0, 0.0,  1.0, 0.0,
+     1.0,  1.0, 0.0,  1.0, 1.0,
+  ]);
+  const vb2 = device.createBuffer({
+    size: tri2Data.byteLength,
+    usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(vb2, 0, tri2Data);
+
+  // Record a RenderBundle that draws Triangle 1 with Offset 0 (Green)
   const bundleEncoder = device.createRenderBundleEncoder({
     colorFormats: ["rgba8unorm"],
   });
   bundleEncoder.setPipeline(pipeline);
   bundleEncoder.setBindGroup(0, bindGroup, [0]);
-  bundleEncoder.draw(6, 1, 0, 0);
+  bundleEncoder.setVertexBuffer(0, vb1);
+  bundleEncoder.draw(3, 1, 0, 0);
   const bundle = bundleEncoder.finish();
 
   const bytesPerRow = computeAlignedBytesPerRow(width);
@@ -398,22 +465,18 @@ export async function renderDirectBundleDirectReference(device, width = 32, heig
     }],
   });
 
-  // Step 1: Pre-set pipeline and bind group with Offset 256 (Blue)
-  pass.setPipeline(pipeline);
-  pass.setBindGroup(0, bindGroup, [256]);
-
-  // Step 2: Execute bundle (draws Green). Under WebGPU spec, executeBundles
-  // resets active pipeline, bind groups, and vertex/index buffers.
+  // Step 1: Execute bundle (draws Green left triangle).
   pass.executeBundles([bundle]);
 
-  // Step 3: Execute an empty bundle sequence (spec mandates this also resets state)
+  // Step 2: Execute empty bundle sequence (spec mandates this also resets state).
   pass.executeBundles([]);
 
-  // Step 4: Direct draw. Because executeBundles cleared state, adapter MUST re-bind
-  // pipeline and bind group. If not re-bound, WebGPU throws validation error or fails.
+  // Step 3: Direct draw Triangle 2. Because executeBundles cleared state, adapter
+  // MUST re-bind pipeline, bind group (offset 256 = Blue), and vertex buffer (vb2).
   pass.setPipeline(pipeline);
   pass.setBindGroup(0, bindGroup, [256]);
-  pass.draw(6, 1, 0, 0);
+  pass.setVertexBuffer(0, vb2);
+  pass.draw(3, 1, 0, 0);
 
   pass.end();
 
@@ -424,9 +487,72 @@ export async function renderDirectBundleDirectReference(device, width = 32, heig
 
   target.destroy();
   uniformBuffer.destroy();
+  vb1.destroy();
+  vb2.destroy();
   readback.destroy();
 
   return pixels;
+}
+
+/**
+ * Dual Assertion Helper: Bundle-Then-Direct-Draw Verification.
+ * Asserts pixel-for-pixel identity against independent direct-JS oracle
+ * and verifies expected color values at designated sample points:
+ * - Left side (x=16, y=32): Green [0, 255, 0, 255]
+ * - Right side (x=48, y=32): Blue [0, 0, 255, 255]
+ * - Background (x=2, y=2): Black [0, 0, 0, 255]
+ */
+export function assertBundleDirectDrawMatch(candidatePixels, oraclePixels, width = 64, height = 64) {
+  if (candidatePixels.byteLength !== oraclePixels.byteLength) {
+    throw new Error(`assertBundleDirectDrawMatch: byte length mismatch (candidate=${candidatePixels.byteLength}, oracle=${oraclePixels.byteLength})`);
+  }
+  let diffCount = 0;
+  for (let i = 0; i < candidatePixels.length; i++) {
+    if (candidatePixels[i] !== oraclePixels[i]) {
+      diffCount++;
+    }
+  }
+  if (diffCount > 0) {
+    throw new Error(`assertBundleDirectDrawMatch: detected ${diffCount} mismatched bytes out of ${candidatePixels.length}`);
+  }
+
+  const bytesPerRow = computeAlignedBytesPerRow(width);
+
+  // 1. Left side (x=16, y=32): Green [0, 255, 0, 255] from bundle draw
+  const greenIdx = 32 * bytesPerRow + 16 * 4;
+  const gr = candidatePixels[greenIdx];
+  const gg = candidatePixels[greenIdx + 1];
+  const gb = candidatePixels[greenIdx + 2];
+  const ga = candidatePixels[greenIdx + 3];
+  if (gr > 5 || gg < 250 || gb > 5 || ga < 250) {
+    throw new Error(
+      `Bundle-Then-Direct Draw sample violation at (16, 32): expected Green [0, 255, 0, 255], observed [${gr}, ${gg}, ${gb}, ${ga}]`
+    );
+  }
+
+  // 2. Right side (x=48, y=32): Blue [0, 0, 255, 255] from direct draw after state reset
+  const blueIdx = 32 * bytesPerRow + 48 * 4;
+  const br = candidatePixels[blueIdx];
+  const bg = candidatePixels[blueIdx + 1];
+  const bb = candidatePixels[blueIdx + 2];
+  const ba = candidatePixels[blueIdx + 3];
+  if (br > 5 || bg > 5 || bb < 250 || ba < 250) {
+    throw new Error(
+      `Bundle-Then-Direct Draw sample violation at (48, 32): expected Blue [0, 0, 255, 255], observed [${br}, ${bg}, ${bb}, ${ba}]`
+    );
+  }
+
+  // 3. Background (x=2, y=2): Black [0, 0, 0, 255] clear color
+  const blackIdx = 2 * bytesPerRow + 2 * 4;
+  const kr = candidatePixels[blackIdx];
+  const kg = candidatePixels[blackIdx + 1];
+  const kb = candidatePixels[blackIdx + 2];
+  const ka = candidatePixels[blackIdx + 3];
+  if (kr > 5 || kg > 5 || kb > 5 || ka < 250) {
+    throw new Error(
+      `Bundle-Then-Direct Draw sample violation at (2, 2): expected Black [0, 0, 0, 255], observed [${kr}, ${kg}, ${kb}, ${ka}]`
+    );
+  }
 }
 
 /**
@@ -444,3 +570,67 @@ export function evalDirectAffineTransform(matrixColumnMajor, point) {
   const z = e[2] * v[0] + e[6] * v[1] + e[10] * v[2] + e[14] * v[3];
   return [x, y, z];
 }
+
+/**
+ * Dual Assertion Helper: Generational Handle Publication (§6.5, vqa.6).
+ * Asserts that a resource handle index and generation are active and fresh in the
+ * bridge slot table. If the handle is stale (older generation after release/reuse),
+ * unallocated, or generation 0, rejects the publication attempt.
+ */
+export function assertGenerationalHandlePublication(checkFn, resourceId, generation) {
+  if (typeof checkFn !== "function") {
+    throw new Error("assertGenerationalHandlePublication: checkFn must be a function");
+  }
+  const isValid = checkFn(resourceId, generation);
+  if (!isValid) {
+    throw new Error(
+      `Generational Handle Publication Rejected: Resource handle (id=${resourceId}, generation=${generation}) is invalid, stale, or revoked!`
+    );
+  }
+  return true;
+}
+
+/**
+ * Dual Assertion Helper: Linear Memory Growth Invariant (§6.6, §13.1, vqa.6).
+ * Asserts that linear memory growth is permitted. If an open borrow scope is active
+ * across linear memory, growth is strictly refused to prevent pointer/view invalidation.
+ */
+export function assertMemoryGrowthAllowed(growFn, pages = 1) {
+  if (typeof growFn !== "function") {
+    throw new Error("assertMemoryGrowthAllowed: growFn must be a function");
+  }
+  const allowed = growFn(pages);
+  if (!allowed) {
+    throw new Error(
+      `Linear Memory Borrow Violation: Attempted linear memory growth (${pages} pages) while an active borrow scope is held!`
+    );
+  }
+  return true;
+}
+
+/**
+ * Dual Assertion Helper: AffineRows GPU Wire Layout Validation (§6.1, §6.2, vqa.6).
+ * Validates a matrix or wire buffer payload against AffineRows invariants.
+ * Throws structured rejection if buffer is smaller than 48 bytes (code 1),
+ * contains non-affine perspective elements or invalid scaling (code 2),
+ * or encounters other layout violations (codes 3..7).
+ */
+export function assertAffineRowsLayoutValid(validateFn, bytes) {
+  if (typeof validateFn !== "function") {
+    throw new Error("assertAffineRowsLayoutValid: validateFn must be a function");
+  }
+  const code = validateFn(bytes);
+  if (code !== 0) {
+    const reason = code === 1
+      ? "BufferTooSmall (length < 48 or 49..63 bytes)"
+      : code === 2
+      ? "NonAffineMatrix (perspective elements non-zero, invalid scale, or non-finite)"
+      : code === 4
+      ? "IncompatibleTargetLayout (length > 64 bytes)"
+      : `LayoutError code ${code}`;
+    throw new Error(`AffineRows Layout Validation Rejected: ${reason} (code=${code})`);
+  }
+  return true;
+}
+
+
