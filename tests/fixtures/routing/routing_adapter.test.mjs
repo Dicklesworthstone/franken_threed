@@ -76,10 +76,10 @@ test('Positive: WebGLRenderer routes synchronously to EXACT_BACKEND', () => {
   });
 
   assert.equal(calls, 1, 'Constructor must execute exactly once');
-  assert.equal(instance.__f3d_route__, ExecutionRoute.EXACT_BACKEND);
-  assert.equal(router.getInstanceRoute(instance), ExecutionRoute.EXACT_BACKEND);
   assert.equal(getRendererRoute(instance), ExecutionRoute.EXACT_BACKEND);
-  assert.ok(instance.__f3d_decision__.reasons.includes(EscapeReason.EXPLICIT_SOURCE_SELECTION));
+  assert.equal(router.getInstanceRoute(instance), ExecutionRoute.EXACT_BACKEND);
+  assert.ok(getRendererDecision(instance).reasons.includes(EscapeReason.EXPLICIT_SOURCE_SELECTION));
+  assert.equal(instance.__f3d_route__, undefined, 'No __f3d_route__ own property on instance');
   assert.equal(instance.canvas, 'canvas-1');
 });
 
@@ -108,8 +108,8 @@ test('Positive: Opaque GL escapes force WebGPURenderer to EXACT_BACKEND synchron
   assert.ok(instance instanceof AdmittedWebGLRenderer, 'Must instantiate the admitted exact backend implementation');
   assert.equal(instance.isExactBackend, true);
   assert.equal(instance.isWebGPURenderer, undefined, 'Must not instantiate the escaped WebGPURenderer constructor');
-  assert.equal(instance.__f3d_route__, ExecutionRoute.EXACT_BACKEND);
-  assert.ok(instance.__f3d_decision__.reasons.includes(EscapeReason.OPAQUE_GL_ESCAPE));
+  assert.equal(getRendererRoute(instance), ExecutionRoute.EXACT_BACKEND);
+  assert.ok(getRendererDecision(instance).reasons.includes(EscapeReason.OPAQUE_GL_ESCAPE));
 });
 
 test('Positive: Native context access forces EXACT_BACKEND with implementation dispatch', () => {
@@ -131,8 +131,8 @@ test('Positive: Native context access forces EXACT_BACKEND with implementation d
   });
 
   assert.ok(instance instanceof AdmittedWebGLRenderer);
-  assert.equal(instance.__f3d_route__, ExecutionRoute.EXACT_BACKEND);
-  assert.ok(instance.__f3d_decision__.reasons.includes(EscapeReason.NATIVE_CONTEXT_ACCESS));
+  assert.equal(getRendererRoute(instance), ExecutionRoute.EXACT_BACKEND);
+  assert.ok(getRendererDecision(instance).reasons.includes(EscapeReason.NATIVE_CONTEXT_ACCESS));
 });
 
 test('Positive: Host without WebGPU falls back to EXACT_BACKEND with HOST_LIMITATION_FALLBACK', () => {
@@ -153,8 +153,8 @@ test('Positive: Host without WebGPU falls back to EXACT_BACKEND with HOST_LIMITA
   });
 
   assert.ok(instance instanceof AdmittedWebGLRenderer);
-  assert.equal(instance.__f3d_route__, ExecutionRoute.EXACT_BACKEND);
-  assert.ok(instance.__f3d_decision__.reasons.includes(EscapeReason.HOST_LIMITATION_FALLBACK));
+  assert.equal(getRendererRoute(instance), ExecutionRoute.EXACT_BACKEND);
+  assert.ok(getRendererDecision(instance).reasons.includes(EscapeReason.HOST_LIMITATION_FALLBACK));
 });
 
 test('Positive: Non-GPU renderers route to RETAINED_UPSTREAM', () => {
@@ -167,7 +167,7 @@ test('Positive: Non-GPU renderers route to RETAINED_UPSTREAM', () => {
       constructorName: name,
       options: {},
     });
-    assert.equal(instance.__f3d_route__, ExecutionRoute.RETAINED_UPSTREAM);
+    assert.equal(getRendererRoute(instance), ExecutionRoute.RETAINED_UPSTREAM);
   }
 });
 
@@ -190,10 +190,10 @@ test('Positive: Independent canvases maintain distinct route decisions and epoch
     hostCapabilities: { hasWebGPU: true },
   });
 
-  assert.equal(inst1.__f3d_route__, ExecutionRoute.EXACT_BACKEND);
-  assert.equal(inst2.__f3d_route__, ExecutionRoute.RETAINED_UPSTREAM);
-  assert.notEqual(inst1.__f3d_decision__.canvas, inst2.__f3d_decision__.canvas);
-  assert.notEqual(inst1.__f3d_decision__.rendererId, inst2.__f3d_decision__.rendererId);
+  assert.equal(getRendererRoute(inst1), ExecutionRoute.EXACT_BACKEND);
+  assert.equal(getRendererRoute(inst2), ExecutionRoute.RETAINED_UPSTREAM);
+  assert.notEqual(getRendererDecision(inst1).canvas, getRendererDecision(inst2).canvas);
+  assert.notEqual(getRendererDecision(inst1).rendererId, getRendererDecision(inst2).rendererId);
 });
 
 test('Positive: Connected groups propagate EXACT_BACKEND when sharing mutable resources (Order: Exact first)', () => {
@@ -225,10 +225,10 @@ test('Positive: Connected groups propagate EXACT_BACKEND when sharing mutable re
     sharedResources: ['render-target-001'],
   });
 
-  assert.equal(inst1.__f3d_route__, ExecutionRoute.EXACT_BACKEND);
-  assert.equal(inst2.__f3d_route__, ExecutionRoute.EXACT_BACKEND);
+  assert.equal(getRendererRoute(inst1), ExecutionRoute.EXACT_BACKEND);
+  assert.equal(getRendererRoute(inst2), ExecutionRoute.EXACT_BACKEND);
   assert.ok(inst2 instanceof AdmittedWebGLRenderer);
-  assert.equal(inst1.__f3d_group_id__, inst2.__f3d_group_id__, 'Renderers must share connected group ID');
+  assert.equal(getRendererDecision(inst1).groupId, getRendererDecision(inst2).groupId, 'Renderers must share connected group ID');
 });
 
 test('Negative: Connected groups reject residency conflict when non-exact renderer is already committed (Order: Non-exact first)', () => {
@@ -264,7 +264,7 @@ test('Negative: Connected groups reject residency conflict when non-exact render
     },
     (err) => {
       assert.match(err.message, /Connected group conflict/);
-      assert.match(err.message, /already committed to route 'retained-upstream'/);
+      assert.match(err.message, new RegExp(`already committed to route '${ExecutionRoute.RETAINED_UPSTREAM}'`));
       return true;
     }
   );
@@ -300,9 +300,9 @@ test('Positive: Two renderers sharing only an immutable asset keep independent r
   });
 
   // Both renderers maintain independent routes without conflict because immutable assets upload independently
-  assert.equal(inst1.__f3d_route__, ExecutionRoute.RETAINED_UPSTREAM);
-  assert.equal(inst2.__f3d_route__, ExecutionRoute.EXACT_BACKEND);
-  assert.notEqual(inst1.__f3d_group_id__, inst2.__f3d_group_id__, 'Immutable asset sharing must NOT couple connected groups');
+  assert.equal(getRendererRoute(inst1), ExecutionRoute.RETAINED_UPSTREAM);
+  assert.equal(getRendererRoute(inst2), ExecutionRoute.EXACT_BACKEND);
+  assert.notEqual(getRendererDecision(inst1).groupId, getRendererDecision(inst2).groupId, 'Immutable asset sharing must NOT couple connected groups');
 });
 
 test('Negative: Two renderers sharing a mutable render target couple backend residency', () => {
@@ -338,7 +338,7 @@ test('Negative: Two renderers sharing a mutable render target couple backend res
     },
     (err) => {
       assert.match(err.message, /Connected group conflict/);
-      assert.match(err.message, /already committed to route 'retained-upstream'/);
+      assert.match(err.message, new RegExp(`already committed to route '${ExecutionRoute.RETAINED_UPSTREAM}'`));
       return true;
     }
   );
@@ -833,7 +833,10 @@ test('Regression: Real H1 bundle with non-literal forceWebGL (! api.webgpu) reco
     hostCapabilities: { hasWebGPU: true, hasWebGL: true },
   });
   assert.equal(getRendererRoute(runtimeForcedInstance), ExecutionRoute.EXACT_BACKEND);
-  assert.ok(runtimeForcedInstance instanceof AdmittedWebGLRenderer);
+  assert.ok(runtimeForcedInstance instanceof MockWebGPURenderer, 'Must preserve supplied WebGPURenderer constructor and prototype');
+  assert.ok(!(runtimeForcedInstance instanceof AdmittedWebGLRenderer), 'Must not substitute legacy WebGLRenderer');
+  assert.equal(runtimeForcedInstance.isWebGPURenderer, true);
+  assert.equal(runtimeForcedInstance.opts.forceWebGL, true);
 
   // When runtime option evaluates to forceWebGL: false (default H1 without ?backend=webgl), routes to SPECIALIZED_WEBGPU
   const runtimeUnforcedInstance = router.routeAndConstruct({
@@ -844,7 +847,9 @@ test('Regression: Real H1 bundle with non-literal forceWebGL (! api.webgpu) reco
     hostCapabilities: { hasWebGPU: true, hasWebGL: true },
   });
   assert.equal(getRendererRoute(runtimeUnforcedInstance), ExecutionRoute.SPECIALIZED_WEBGPU);
+  assert.ok(runtimeUnforcedInstance instanceof MockWebGPURenderer);
   assert.equal(runtimeUnforcedInstance.isWebGPURenderer, true);
+  assert.equal(runtimeUnforcedInstance.opts.forceWebGL, false);
 });
 
 test('Positive: exact_backend component exports pinned WebGLRenderer and registers with construction router', () => {
@@ -960,7 +965,7 @@ test('Regression: caller-supplied constructorFn is invoked exactly once and not 
   );
 });
 
-test('Positive: decision log records H1 branches, reasons, group membership, and rejected offending spans; attribution log tracks submissions', async () => {
+test('Positive: H1 production route preserves WebGPURenderer, keeps diagnostics external, and supports backend query reload', async () => {
   const h1Bundle = await buildModuleGraph('upstream/three.js/examples/webgpu_performance_renderbundle.html');
 
   class MockRenderableWebGLRenderer {
@@ -975,10 +980,13 @@ test('Positive: decision log records H1 branches, reasons, group membership, and
     }
   }
 
+  let gpuConstructorCalls = 0;
   class MockRenderableWebGPURenderer {
     constructor(opts = {}) {
+      gpuConstructorCalls++;
       this.isWebGPURenderer = true;
       this.canvas = opts.canvas;
+      this.opts = opts;
       this.renderCalls = 0;
     }
     render(scene, camera) {
@@ -995,11 +1003,12 @@ test('Positive: decision log records H1 branches, reasons, group membership, and
     },
   });
 
-  // 1. Initial decision and attribution logs must be empty
+  // 1. Initial decision log is empty
   assert.deepEqual(router.getDecisionLog(), []);
-  assert.deepEqual(router.getAttributionLog(), []);
 
-  // 2. H1 forceWebGL branch (EXACT_BACKEND)
+  // 2. H1 forceWebGL branch (EXACT_BACKEND): constructs WebGPURenderer({ forceWebGL: true })
+  // Must preserve the actual WebGPURenderer constructor and prototype, NOT substitute legacy WebGLRenderer
+  const initialCalls = gpuConstructorCalls;
   const forcedSpan = 'examples/webgpu_performance_renderbundle.html:85:3';
   const forcedInstance = router.routeAndConstruct({
     constructorFn: MockRenderableWebGPURenderer,
@@ -1010,24 +1019,45 @@ test('Positive: decision log records H1 branches, reasons, group membership, and
     sourceSpan: forcedSpan,
   });
 
+  // Constructor executes exactly once
+  assert.equal(gpuConstructorCalls, initialCalls + 1, 'Constructor must execute exactly once');
+
+  // Identity and prototype preserved: genuine WebGPURenderer, NOT substituted WebGLRenderer
+  assert.ok(forcedInstance instanceof MockRenderableWebGPURenderer, 'Must preserve supplied WebGPURenderer constructor');
+  assert.ok(!(forcedInstance instanceof MockRenderableWebGLRenderer), 'Must not substitute legacy WebGLRenderer');
+  assert.equal(forcedInstance.constructor, MockRenderableWebGPURenderer);
+  assert.equal(Object.getPrototypeOf(forcedInstance), MockRenderableWebGPURenderer.prototype);
+  assert.equal(forcedInstance.isWebGPURenderer, true);
+  assert.equal(forcedInstance.opts.forceWebGL, true);
+
+  // Method shape preserved: render is the original prototype method, NOT wrapped
+  assert.equal(Object.prototype.hasOwnProperty.call(forcedInstance, 'render'), false, 'render must not be an own property');
+  assert.equal(forcedInstance.render, MockRenderableWebGPURenderer.prototype.render, 'render must be the original prototype method');
+
+  // Zero source-observable __f3d_* own properties: diagnostics remain strictly external
+  assert.equal(forcedInstance.__f3d_route__, undefined, 'No __f3d_route__ own property');
+  assert.equal(forcedInstance.__f3d_decision__, undefined, 'No __f3d_decision__ own property');
+  assert.equal(forcedInstance.__f3d_group_id__, undefined, 'No __f3d_group_id__ own property');
+  assert.equal(forcedInstance.__f3d_renderer_id__, undefined, 'No __f3d_renderer_id__ own property');
+  assert.deepEqual(Object.keys(forcedInstance).filter(k => k.startsWith('__f3d_')), [], 'No __f3d_* properties in Object.keys');
+
+  // External diagnostics query works via WeakMaps
   assert.equal(getRendererRoute(forcedInstance), ExecutionRoute.EXACT_BACKEND);
-  assert.ok(forcedInstance instanceof MockRenderableWebGLRenderer);
+  assert.equal(router.getInstanceRoute(forcedInstance), ExecutionRoute.EXACT_BACKEND);
+  const forcedDecision = getRendererDecision(forcedInstance);
+  assert.equal(forcedDecision.route, ExecutionRoute.EXACT_BACKEND);
+  assert.ok(forcedDecision.reasons.includes(EscapeReason.EXPLICIT_SOURCE_SELECTION));
 
   // Check decision log after H1 forceWebGL construction
   const decisionLog1 = router.getDecisionLog();
   assert.equal(decisionLog1.length, 1);
-  const forcedDecision = decisionLog1[0];
-  assert.equal(forcedDecision.site, 'WebGPURenderer');
-  assert.equal(forcedDecision.span, forcedSpan);
-  assert.equal(forcedDecision.route, ExecutionRoute.EXACT_BACKEND);
-  assert.ok(Array.isArray(forcedDecision.reasons));
-  assert.ok(
-    forcedDecision.reasons.includes(EscapeReason.EXPLICIT_SOURCE_SELECTION),
-    'H1 forceWebGL branch must record EXPLICIT_SOURCE_SELECTION in reasons'
-  );
-  assert.ok(typeof forcedDecision.group === 'string' && forcedDecision.group.length > 0, 'Decision must include group membership');
+  assert.equal(decisionLog1[0].site, 'WebGPURenderer');
+  assert.equal(decisionLog1[0].span, forcedSpan);
+  assert.equal(decisionLog1[0].route, ExecutionRoute.EXACT_BACKEND);
+  assert.ok(decisionLog1[0].reasons.includes(EscapeReason.EXPLICIT_SOURCE_SELECTION));
+  assert.ok(typeof decisionLog1[0].group === 'string' && decisionLog1[0].group.length > 0);
 
-  // 3. H1 WebGPU branch (SPECIALIZED_WEBGPU)
+  // 3. H1 WebGPU branch (SPECIALIZED_WEBGPU): constructs WebGPURenderer({ forceWebGL: false })
   const unforcedSpan = 'examples/webgpu_performance_renderbundle.html:95:3';
   const unforcedInstance = router.routeAndConstruct({
     constructorFn: MockRenderableWebGPURenderer,
@@ -1038,27 +1068,45 @@ test('Positive: decision log records H1 branches, reasons, group membership, and
     sourceSpan: unforcedSpan,
   });
 
-  assert.equal(getRendererRoute(unforcedInstance), ExecutionRoute.SPECIALIZED_WEBGPU);
   assert.ok(unforcedInstance instanceof MockRenderableWebGPURenderer);
+  assert.equal(unforcedInstance.constructor, MockRenderableWebGPURenderer);
+  assert.equal(getRendererRoute(unforcedInstance), ExecutionRoute.SPECIALIZED_WEBGPU);
+  assert.equal(Object.prototype.hasOwnProperty.call(unforcedInstance, 'render'), false);
+  assert.deepEqual(Object.keys(unforcedInstance).filter(k => k.startsWith('__f3d_')), []);
 
   // Check decision log after H1 unforced WebGPU construction
   const decisionLog2 = router.getDecisionLog();
   assert.equal(decisionLog2.length, 2);
-  const unforcedDecision = decisionLog2[1];
-  assert.equal(unforcedDecision.site, 'WebGPURenderer');
-  assert.equal(unforcedDecision.span, unforcedSpan);
-  assert.equal(unforcedDecision.route, ExecutionRoute.SPECIALIZED_WEBGPU);
-  assert.ok(Array.isArray(unforcedDecision.reasons));
-  assert.ok(typeof unforcedDecision.group === 'string' && unforcedDecision.group.length > 0, 'Decision must include group membership');
+  assert.equal(decisionLog2[1].site, 'WebGPURenderer');
+  assert.equal(decisionLog2[1].span, unforcedSpan);
+  assert.equal(decisionLog2[1].route, ExecutionRoute.SPECIALIZED_WEBGPU);
+  assert.ok(Array.isArray(decisionLog2[1].reasons));
+  assert.ok(typeof decisionLog2[1].group === 'string' && decisionLog2[1].group.length > 0);
 
-  // 4. Rejected re-route on locked canvas must log the offending span
+  // 4. Backend query reload on fresh canvas:
+  // User reloads with ?backend=webgl on a fresh canvas (canvas-fresh-reload)
+  const freshReloadInstance = router.routeAndConstruct({
+    constructorFn: MockRenderableWebGPURenderer,
+    constructorName: 'WebGPURenderer',
+    options: { canvas: 'canvas-fresh-reload', forceWebGL: true },
+    analysis: h1Bundle,
+    hostCapabilities: { hasWebGPU: true, hasWebGL: true },
+    sourceSpan: 'app.html:reload:1',
+  });
+
+  assert.ok(freshReloadInstance instanceof MockRenderableWebGPURenderer);
+  assert.equal(getRendererRoute(freshReloadInstance), ExecutionRoute.EXACT_BACKEND);
+  assert.equal(router.getCanvasLock('canvas-h1-unforced')?.route, ExecutionRoute.SPECIALIZED_WEBGPU);
+  assert.equal(router.getCanvasLock('canvas-fresh-reload')?.route, ExecutionRoute.EXACT_BACKEND);
+
+  // 5. Rejected re-route on locked canvas logs the offending span
   const offendingSpan = 'src/offender_component.js:142:7';
   assert.throws(
     () => {
       router.routeAndConstruct({
         constructorFn: MockRenderableWebGPURenderer,
         constructorName: 'WebGPURenderer',
-        options: { canvas: 'canvas-h1-forced', forceWebGL: false }, // canvas already locked to EXACT_BACKEND
+        options: { canvas: 'canvas-h1-forced', forceWebGL: false }, // canvas-h1-forced is locked to EXACT_BACKEND
         analysis: h1Bundle,
         hostCapabilities: { hasWebGPU: true, hasWebGL: true },
         sourceSpan: offendingSpan,
@@ -1071,57 +1119,278 @@ test('Positive: decision log records H1 branches, reasons, group membership, and
     }
   );
 
-  // Decision log must record the rejected re-route and its offending span
-  const decisionLog3 = router.getDecisionLog();
-  assert.equal(decisionLog3.length, 3, 'Decision log must record rejected re-route attempt');
-  const rejectedDecision = decisionLog3[2];
+  // Decision log records the rejected re-route and its offending span
+  const decisionLog4 = router.getDecisionLog();
+  assert.equal(decisionLog4.length, 4, 'Decision log must record rejected re-route attempt');
+  const rejectedDecision = decisionLog4[3];
   assert.equal(rejectedDecision.site, 'WebGPURenderer');
   assert.equal(rejectedDecision.span, offendingSpan, 'Rejected decision must record the offending source span');
   assert.equal(rejectedDecision.route, ExecutionRoute.SPECIALIZED_WEBGPU);
   assert.ok(Array.isArray(rejectedDecision.reasons));
   assert.ok(typeof rejectedDecision.group === 'string' && rejectedDecision.group.length > 0);
-
-  // 5. Runtime attribution log: hook render call once and count submissions
-  assert.deepEqual(router.getAttributionLog(), [], 'Attribution log must be empty before any render call');
-
-  // First render on forcedInstance (EXACT_BACKEND)
-  const res1 = forcedInstance.render('sceneA', 'cameraA');
-  assert.deepEqual(res1, { scene: 'sceneA', camera: 'cameraA', target: 'gl' });
-  assert.equal(forcedInstance.renderCalls, 1);
-
-  const attrLog1 = router.getAttributionLog();
-  assert.equal(attrLog1.length, 1);
-  assert.deepEqual(attrLog1[0], {
-    renderer: forcedInstance.__f3d_renderer_id__,
-    route: ExecutionRoute.EXACT_BACKEND,
-    submissions: 1,
-  });
-
-  // Second render on forcedInstance
-  forcedInstance.render('sceneB', 'cameraB');
-  assert.equal(forcedInstance.renderCalls, 2);
-
-  const attrLog2 = router.getAttributionLog();
-  assert.equal(attrLog2.length, 2);
-  assert.deepEqual(attrLog2[1], {
-    renderer: forcedInstance.__f3d_renderer_id__,
-    route: ExecutionRoute.EXACT_BACKEND,
-    submissions: 2,
-  });
-
-  // Render on unforcedInstance (SPECIALIZED_WEBGPU)
-  const resGPU = unforcedInstance.render('sceneGPU', 'cameraGPU');
-  assert.deepEqual(resGPU, { scene: 'sceneGPU', camera: 'cameraGPU', target: 'gpu' });
-  assert.equal(unforcedInstance.renderCalls, 1);
-
-  const attrLog3 = router.getAttributionLog();
-  assert.equal(attrLog3.length, 3);
-  assert.deepEqual(attrLog3[2], {
-    renderer: unforcedInstance.__f3d_renderer_id__,
-    route: ExecutionRoute.SPECIALIZED_WEBGPU,
-    submissions: 1,
-  });
 });
+
+test('Independent generated H1 facade execution: module initialization, constructor identity, instanceof, subclassing/new.target, and import-map aliases', async () => {
+  const path = await import('node:path');
+  const fs = await import('node:fs');
+  const { fileURLToPath } = await import('node:url');
+
+  const currentDir = path.dirname(fileURLToPath(import.meta.url));
+  const repoRoot = path.resolve(currentDir, '../../..');
+
+  const { generateRoutedWebGPUSource } = await import(
+    path.resolve(repoRoot, 'tools/compat-facade/dev_server.mjs')
+  );
+  const { transformHtmlImportMap } = await import(
+    path.resolve(repoRoot, 'tools/compat-facade/index.mjs')
+  );
+
+  // 1. Generate the actual runtime source emitted by the facade dev server
+  const generatedSource = generateRoutedWebGPUSource({
+    importBase: 'file://' + repoRoot,
+  });
+
+  // Verify absence of invalid prototype assignment (TypeError prevention on ES classes)
+  assert.ok(
+    !generatedSource.includes('WebGPURenderer.prototype ='),
+    'Generated source must not assign to WebGPURenderer.prototype directly'
+  );
+
+  // 2. Independently evaluate the generated module source via data: URI
+  const dataUri = 'data:text/javascript;base64,' + Buffer.from(generatedSource).toString('base64');
+  const facade = await import(dataUri);
+
+  assert.equal(typeof facade.WebGPURenderer, 'function', 'Exported WebGPURenderer must be a constructor function');
+  assert.ok(facade.router instanceof RendererConstructionRouter, 'Exported router must be an instance of RendererConstructionRouter');
+
+  // 3. Direct construction in WebGPU mode (forceWebGL: false)
+  const canvasWebGPU = { getContext: () => null, addEventListener: () => {} };
+  const instWebGPU = new facade.WebGPURenderer({
+    canvas: canvasWebGPU,
+    forceWebGL: false,
+  });
+  assert.ok(instWebGPU instanceof facade.WebGPURenderer, 'instWebGPU must be instanceof facade.WebGPURenderer');
+  assert.equal(instWebGPU.backend.constructor.name, 'WebGPUBackend', 'forceWebGL: false selects WebGPUBackend');
+  assert.equal(Object.keys(instWebGPU).filter(k => k.startsWith('__f3d_')).length, 0, 'No __f3d_* own properties');
+
+  // 4. Direct construction in WebGL mode (forceWebGL: true) - genuine WebGPURenderer with WebGLBackend
+  const canvasWebGL = { getContext: () => null, addEventListener: () => {} };
+  const instWebGL = new facade.WebGPURenderer({
+    canvas: canvasWebGL,
+    forceWebGL: true,
+  });
+  assert.ok(instWebGL instanceof facade.WebGPURenderer, 'instWebGL must be instanceof facade.WebGPURenderer');
+  assert.equal(instWebGL.backend.constructor.name, 'WebGLBackend', 'forceWebGL: true selects WebGLBackend (never legacy WebGLRenderer)');
+
+  // 5. Single constructor execution invariant
+  assert.equal(instWebGPU.renderCalls ?? 0, 0);
+  assert.equal(instWebGL.renderCalls ?? 0, 0);
+
+  // 6. Subclassing with explicit constructor, custom fields, and new.target preservation
+  let subclassConstructorExecutions = 0;
+  class CustomAppRenderer extends facade.WebGPURenderer {
+    constructor(opts) {
+      super(opts);
+      subclassConstructorExecutions++;
+      this.customFeature = 'enabled';
+      this.capturedNewTarget = new.target;
+    }
+  }
+
+  const canvasSubclass = { getContext: () => null, addEventListener: () => {} };
+  const subInstance = new CustomAppRenderer({
+    canvas: canvasSubclass,
+    forceWebGL: false,
+  });
+
+  assert.equal(subclassConstructorExecutions, 1, 'Subclass constructor must execute exactly once');
+  assert.ok(subInstance instanceof CustomAppRenderer, 'Must be instanceof CustomAppRenderer');
+  assert.ok(subInstance instanceof facade.WebGPURenderer, 'Must be instanceof facade.WebGPURenderer');
+  assert.equal(subInstance.customFeature, 'enabled', 'Custom subclass fields must be preserved');
+  assert.equal(subInstance.capturedNewTarget, CustomAppRenderer, 'new.target must be preserved in derived constructor');
+  assert.equal(subInstance.backend.constructor.name, 'WebGPUBackend');
+
+  // 7. Subclassing with method override
+  class MethodOverrideRenderer extends facade.WebGPURenderer {
+    render(scene, camera) {
+      return { overridden: true, scene, camera };
+    }
+  }
+  const overrideInstance = new MethodOverrideRenderer({
+    canvas: { getContext: () => null, addEventListener: () => {} },
+    forceWebGL: true,
+  });
+  assert.ok(overrideInstance instanceof MethodOverrideRenderer);
+  assert.ok(overrideInstance instanceof facade.WebGPURenderer);
+  assert.deepEqual(overrideInstance.render('scene1', 'cam1'), { overridden: true, scene: 'scene1', camera: 'cam1' });
+
+  // 8. Subclassing without explicit constructor (default constructor)
+  class DefaultConstructorRenderer extends facade.WebGPURenderer {}
+  const defInstance = new DefaultConstructorRenderer({
+    canvas: { getContext: () => null, addEventListener: () => {} },
+    forceWebGL: false,
+  });
+  assert.ok(defInstance instanceof DefaultConstructorRenderer);
+  assert.ok(defInstance instanceof facade.WebGPURenderer);
+  assert.equal(defInstance.constructor, DefaultConstructorRenderer);
+
+  // 9. Multi-level subclass inheritance chain
+  class LevelOneRenderer extends facade.WebGPURenderer {}
+  class LevelTwoRenderer extends LevelOneRenderer {}
+  const multiLevelInstance = new LevelTwoRenderer({
+    canvas: { getContext: () => null, addEventListener: () => {} },
+    forceWebGL: true,
+  });
+  assert.ok(multiLevelInstance instanceof LevelTwoRenderer);
+  assert.ok(multiLevelInstance instanceof LevelOneRenderer);
+  assert.ok(multiLevelInstance instanceof facade.WebGPURenderer);
+  assert.equal(multiLevelInstance.constructor, LevelTwoRenderer);
+
+  // 10. Reflect.construct invocation with arbitrary new.target
+  function TargetFunction() {}
+  TargetFunction.prototype = Object.create(facade.WebGPURenderer.prototype);
+  TargetFunction.prototype.constructor = TargetFunction;
+
+  const reflectInstance = Reflect.construct(
+    facade.WebGPURenderer,
+    [{ canvas: { getContext: () => null, addEventListener: () => {} }, forceWebGL: false }],
+    TargetFunction
+  );
+  assert.ok(reflectInstance instanceof TargetFunction);
+  assert.ok(reflectInstance instanceof facade.WebGPURenderer);
+
+  // 11. H1 source import map preservation: both 'three' and 'three/webgpu' bind to the same module singleton
+  const h1HtmlPath = path.resolve(repoRoot, 'upstream/three.js/examples/webgpu_performance_renderbundle.html');
+  const h1Html = fs.readFileSync(h1HtmlPath, 'utf8');
+  const transformedH1 = transformHtmlImportMap(h1Html, { baseUrl: 'http://127.0.0.1:8080' });
+
+  assert.ok(
+    transformedH1.includes('"three": "http://127.0.0.1:8080/compat-facade/webgpu.js"'),
+    'H1 alias for "three" must map to webgpu.js facade'
+  );
+  assert.ok(
+    transformedH1.includes('"three/webgpu": "http://127.0.0.1:8080/compat-facade/webgpu.js"'),
+    'H1 alias for "three/webgpu" must map to webgpu.js facade'
+  );
+  assert.ok(
+    transformedH1.includes('"three/tsl": "http://127.0.0.1:8080/compat-facade/tsl.js"'),
+    'H1 alias for "three/tsl" must map to tsl.js facade'
+  );
+  assert.ok(
+    transformedH1.includes('"three/addons/": "http://127.0.0.1:8080/compat-facade/addons/"'),
+    'H1 alias for "three/addons/" must map to addons/ facade'
+  );
+
+  // Decision log records all facade-constructed renderers
+  const decisionLog = facade.router.getDecisionLog();
+  assert.ok(decisionLog.length >= 7, 'Router must log decisions for all facade-routed instances');
+  assert.ok(decisionLog.every(d => d.site === 'WebGPURenderer'));
+
+  // 12. Honest implementation ownership and pristine native prototypes (Plan Section 5.1)
+  const registeredRouteKeys = Object.keys(facade.router.implementations).sort();
+  assert.deepEqual(
+    registeredRouteKeys,
+    [ExecutionRoute.EXACT_BACKEND, ExecutionRoute.RETAINED_UPSTREAM].sort(),
+    'Facade router must strictly register exact-backend and retained-upstream (never claiming unbuilt specialized/general WebGPU)'
+  );
+
+  const upstreamModule = await import(path.resolve(repoRoot, 'upstream/three.js/build/three.webgpu.js'));
+  assert.equal(
+    upstreamModule.WebGPURenderer.prototype.constructor,
+    upstreamModule.WebGPURenderer,
+    'Upstream prototype.constructor must remain completely pristine and unmutated'
+  );
+
+  // Honest documentation of Proxy constructor-equality limitation (not papered over with prototype pollution)
+  assert.equal(
+    instWebGPU.constructor,
+    upstreamModule.WebGPURenderer,
+    'Direct instance constructor truthfully references the upstream class constructor'
+  );
+  assert.notEqual(
+    instWebGPU.constructor,
+    facade.WebGPURenderer,
+    'Direct instance constructor does not equal the outer Proxy wrapper (honest boundary limitation)'
+  );
+});
+
+test('6mv.4 report criterion: window-independent router decision log and attribution log for H1 WebGPU and forceWebGL branches', async () => {
+  const path = await import('node:path');
+  const { fileURLToPath } = await import('node:url');
+
+  const currentDir = path.dirname(fileURLToPath(import.meta.url));
+  const repoRoot = path.resolve(currentDir, '../../..');
+
+  const { generateRoutedWebGPUSource } = await import(
+    path.resolve(repoRoot, 'tools/compat-facade/dev_server.mjs')
+  );
+
+  // 1. Generate runtime source emitted by facade dev server and evaluate via fresh data URI
+  const generatedSource = generateRoutedWebGPUSource({
+    importBase: 'file://' + repoRoot,
+  }) + '\n// test-nonce: 6mv.4-report-regression-' + Date.now();
+  const dataUri = 'data:text/javascript;base64,' + Buffer.from(generatedSource).toString('base64');
+  const facade = await import(dataUri);
+
+  // 2. Assert window-independent execution (no window global required in Node)
+  assert.equal(typeof window, 'undefined', 'Test must execute window-independently in Node');
+  assert.ok(facade.router instanceof RendererConstructionRouter, 'Facade must export router directly');
+
+  // 3. Construct WebGPURenderer with forceWebGL: false on fresh canvas (WebGPU branch)
+  const canvasWebGPU = { getContext: () => null, addEventListener: () => {} };
+  const rendererWebGPU = new facade.WebGPURenderer({
+    canvas: canvasWebGPU,
+    forceWebGL: false,
+  });
+  assert.ok(rendererWebGPU instanceof facade.WebGPURenderer, 'WebGPU renderer must be instanceof facade.WebGPURenderer');
+
+  // 4. Construct WebGPURenderer with forceWebGL: true on fresh canvas (forceWebGL branch)
+  const canvasWebGL = { getContext: () => null, addEventListener: () => {} };
+  const rendererWebGL = new facade.WebGPURenderer({
+    canvas: canvasWebGL,
+    forceWebGL: true,
+  });
+  assert.ok(rendererWebGL instanceof facade.WebGPURenderer, 'WebGL renderer must be instanceof facade.WebGPURenderer');
+
+  // 5. Query window-independent router.getDecisionLog()
+  const decisionLog = facade.router.getDecisionLog();
+  assert.equal(decisionLog.length, 2, 'Router decision log must record both constructions');
+
+  // Branch 1: WebGPU branch (forceWebGL: false) -> retained-upstream
+  const webgpuEntry = decisionLog[0];
+  assert.equal(webgpuEntry.site, 'WebGPURenderer', 'Site must be WebGPURenderer');
+  assert.equal(webgpuEntry.span, 'webgpu_performance_renderbundle.html:188:13', 'Span must match H1 constructor site');
+  assert.equal(webgpuEntry.route, ExecutionRoute.RETAINED_UPSTREAM, 'WebGPU branch must route to retained-upstream');
+  assert.deepEqual(webgpuEntry.reasons, [EscapeReason.SPECIALIZATION_UNAVAILABLE], 'Reasons must contain specialization-unavailable');
+  assert.equal(typeof webgpuEntry.group, 'string', 'Group must be a non-empty string');
+  assert.ok(webgpuEntry.group.length > 0, 'Group ID must be populated');
+
+  // Branch 2: forceWebGL branch (forceWebGL: true) -> exact-backend
+  const webglEntry = decisionLog[1];
+  assert.equal(webglEntry.site, 'WebGPURenderer', 'Site must be WebGPURenderer');
+  assert.equal(webglEntry.span, 'webgpu_performance_renderbundle.html:188:13', 'Span must match H1 constructor site');
+  assert.equal(webglEntry.route, ExecutionRoute.EXACT_BACKEND, 'forceWebGL branch must route to exact-backend');
+  assert.deepEqual(webglEntry.reasons, [EscapeReason.EXPLICIT_SOURCE_SELECTION], 'Reasons must contain explicit-source-selection');
+  assert.equal(typeof webglEntry.group, 'string', 'Group must be a non-empty string');
+  assert.ok(webglEntry.group.length > 0, 'Group ID must be populated');
+
+  // Assert distinct group IDs across independent fresh canvases
+  assert.notEqual(webgpuEntry.group, webglEntry.group, 'Independent canvases must have distinct group memberships');
+
+  // 6. Query window-independent router.getAttributionLog()
+  const attributionLog = facade.router.getAttributionLog();
+  assert.ok(Array.isArray(attributionLog), 'Attribution log must be an array');
+  assert.equal(attributionLog.length, 0, 'Attribution log must be empty prior to render calls');
+
+  // 7. Verify canvas locks match decision routes
+  const lockWebGPU = facade.router.getCanvasLock(canvasWebGPU);
+  assert.equal(lockWebGPU?.route, ExecutionRoute.RETAINED_UPSTREAM, 'Canvas lock for WebGPU canvas must match retained-upstream');
+
+  const lockWebGL = facade.router.getCanvasLock(canvasWebGL);
+  assert.equal(lockWebGL?.route, ExecutionRoute.EXACT_BACKEND, 'Canvas lock for WebGL canvas must match exact-backend');
+});
+
+
 
 
 

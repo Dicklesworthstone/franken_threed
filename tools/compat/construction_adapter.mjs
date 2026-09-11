@@ -9,7 +9,7 @@
  * preserves native object shapes via external diagnostics, and guarantees single execution.
  */
 
-import { ExecutionRoute, RouteLockError } from './route_types.mjs';
+import { ExecutionRoute, RouteLockError, EscapeReason } from './route_types.mjs';
 import { ConnectedCompatibilityGroups } from './connected_groups.mjs';
 import { decideRendererRoute } from './route_decider.mjs';
 
@@ -73,8 +73,6 @@ export class RendererConstructionRouter {
     this._decisionLog = [];
     /** @type {Array<{ renderer: string, route: string, submissions: number }>} */
     this._attributionLog = [];
-    /** @type {WeakSet<object>} */
-    this._hookedInstances = new WeakSet();
     /** @type {WeakMap<object, Object>} */
     this._instanceDiagnostics = new WeakMap();
     this._rendererCounter = 0;
@@ -212,9 +210,20 @@ export class RendererConstructionRouter {
       // when it matches the route's contract.
       if (resolved.route === ExecutionRoute.EXACT_BACKEND && constructorName === 'WebGLRenderer') {
         targetConstructor = constructorFn;
+      } else if (
+        resolved.route === ExecutionRoute.EXACT_BACKEND &&
+        constructorName === 'WebGPURenderer' &&
+        (options.forceWebGL || analysis?.forceWebGL || analysis?.options?.forceWebGL || resolved.reasons.includes(EscapeReason.EXPLICIT_SOURCE_SELECTION))
+      ) {
+        // H1 production route: WebGPURenderer({ forceWebGL: true }) natively selects
+        // WebGLBackend while preserving the WebGPURenderer constructor, prototype,
+        // node renderer, and inspector API. Do NOT substitute legacy WebGLRenderer.
+        targetConstructor = constructorFn;
       } else if (resolved.route === ExecutionRoute.RETAINED_UPSTREAM && constructorName !== 'WebGLRenderer') {
         targetConstructor = constructorFn;
       } else if (resolved.route === ExecutionRoute.GENERAL_WEBGPU && constructorName === 'WebGPURenderer') {
+        targetConstructor = constructorFn;
+      } else if (resolved.route === ExecutionRoute.SPECIALIZED_WEBGPU && constructorName === 'WebGPURenderer') {
         targetConstructor = constructorFn;
       }
     }
@@ -309,45 +318,6 @@ export class RendererConstructionRouter {
       );
     }
 
-    // Hook the admitted implementation's render call once, counting submissions
-    if (typeof instance.render === 'function' && !this._hookedInstances.has(instance)) {
-      this._hookedInstances.add(instance);
-      const originalRender = instance.render;
-      let submissions = 0;
-      const router = this;
-      const hookedRender = function (...args) {
-        submissions++;
-        router._attributionLog.push(Object.freeze({
-          renderer: rendererId,
-          route: resolved.route,
-          submissions,
-        }));
-        return originalRender.apply(this, args);
-      };
-
-      try {
-        for (const key of Object.getOwnPropertyNames(originalRender)) {
-          if (key !== 'length' && key !== 'name' && key !== 'prototype') {
-            try {
-              hookedRender[key] = originalRender[key];
-            } catch {}
-          }
-        }
-      } catch {}
-
-      try {
-        instance.render = hookedRender;
-      } catch {
-        try {
-          Object.defineProperty(instance, 'render', {
-            value: hookedRender,
-            writable: true,
-            configurable: true,
-          });
-        } catch {}
-      }
-    }
-
     // 7. Store decision record and diagnostics externally in WeakMaps to preserve native object shape
     const decisionRecord = Object.freeze({
       rendererId,
@@ -362,40 +332,6 @@ export class RendererConstructionRouter {
     this._decisions.set(rendererId, decisionRecord);
     INSTANCE_DIAGNOSTICS.set(instance, decisionRecord);
     this._instanceDiagnostics.set(instance, decisionRecord);
-
-    // Safely decorate instance ONLY if extensible (never throw on sealed/frozen native instances)
-    if (Object.isExtensible(instance)) {
-      try {
-        Object.defineProperties(instance, {
-          __f3d_route__: {
-            value: resolved.route,
-            writable: false,
-            enumerable: true,
-            configurable: true,
-          },
-          __f3d_decision__: {
-            value: decisionRecord,
-            writable: false,
-            enumerable: true,
-            configurable: true,
-          },
-          __f3d_group_id__: {
-            value: groupId,
-            writable: false,
-            enumerable: true,
-            configurable: true,
-          },
-          __f3d_renderer_id__: {
-            value: rendererId,
-            writable: false,
-            enumerable: true,
-            configurable: true,
-          },
-        });
-      } catch {
-        // Sealed/frozen or proxy trap: external diagnostics remain available via WeakMap
-      }
-    }
 
     return instance;
   }

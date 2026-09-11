@@ -86,7 +86,7 @@ export async function runBrowserNativeIdentityVerification() {
     results.push({
       test: 'exact_native_gl_identity',
       status: 'pass',
-      route: glRenderer.__f3d_route__,
+      route: getRendererRoute(glRenderer),
       implementation: 'PinnedWebGLRenderer',
       nativeContext: rawGl.constructor.name,
     });
@@ -191,7 +191,7 @@ export async function runBrowserNativeIdentityVerification() {
     results.push({
       test: 'opaque_escape_native_gl_routing',
       status: 'pass',
-      route: escapedRenderer.__f3d_route__,
+      route: getRendererRoute(escapedRenderer),
       dispatchedImplementation: 'PinnedWebGLRenderer',
       nativeContext: rawGl.constructor.name,
     });
