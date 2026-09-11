@@ -360,6 +360,10 @@ pub const OPCODE_SET_SCISSOR_RECT: u16 = 10;
 /// Opcode for configuring draw call parameters (instance count, first vertex, first instance)
 /// immediately preceding a direct render pass draw (`renderPassEncoder.draw`).
 pub const OPCODE_SET_DRAW_PARAMETERS: u16 = 11;
+/// Opcode for creating a render pipeline with depth/stencil state.
+pub const OPCODE_CREATE_PIPELINE_DEPTH: u16 = 12;
+/// Opcode for encoding a complete render pass with a depth attachment.
+pub const OPCODE_RENDER_PASS_DEPTH: u16 = 13;
 
 /// GPUBufferUsage flag: map for CPU reading.
 pub const BUFFER_USAGE_MAP_READ: u32 = 1;
@@ -457,6 +461,52 @@ pub const TARGET_FORMAT_PREFERRED_CANVAS: u32 = 0;
 pub const TARGET_FORMAT_BGRA8UNORM: u32 = 1;
 /// Target format code for standard rgba8unorm swapchain and offscreen format.
 pub const TARGET_FORMAT_RGBA8UNORM: u32 = 2;
+/// Target format code for standard depth24plus format.
+pub const TARGET_FORMAT_DEPTH24PLUS: u32 = 3;
+/// Target format code for standard depth32float format.
+pub const TARGET_FORMAT_DEPTH32FLOAT: u32 = 4;
+
+/// Depth comparison function: Never.
+pub const DEPTH_COMPARE_NEVER: u32 = 1;
+/// Depth comparison function: Less.
+pub const DEPTH_COMPARE_LESS: u32 = 2;
+/// Depth comparison function: Equal.
+pub const DEPTH_COMPARE_EQUAL: u32 = 3;
+/// Depth comparison function: LessEqual.
+pub const DEPTH_COMPARE_LESS_EQUAL: u32 = 4;
+/// Depth comparison function: Greater.
+pub const DEPTH_COMPARE_GREATER: u32 = 5;
+/// Depth comparison function: NotEqual.
+pub const DEPTH_COMPARE_NOT_EQUAL: u32 = 6;
+/// Depth comparison function: GreaterEqual.
+pub const DEPTH_COMPARE_GREATER_EQUAL: u32 = 7;
+/// Depth comparison function: Always.
+pub const DEPTH_COMPARE_ALWAYS: u32 = 8;
+
+/// Packs depth load op, depth store op, and depth read-only flag into a 32-bit integer.
+#[inline]
+pub const fn pack_depth_ops(load_op: u32, store_op: u32, read_only: bool) -> u32 {
+    let ro_bit = if read_only { 1u32 } else { 0u32 };
+    (load_op & 0xFF) | ((store_op & 0xFF) << 8) | ((ro_bit & 0xFF) << 16)
+}
+
+/// Extracts depth load operation from packed depth ops.
+#[inline]
+pub const fn unpack_depth_load_op(packed: u32) -> u32 {
+    packed & 0xFF
+}
+
+/// Extracts depth store operation from packed depth ops.
+#[inline]
+pub const fn unpack_depth_store_op(packed: u32) -> u32 {
+    (packed >> 8) & 0xFF
+}
+
+/// Extracts depth read-only flag from packed depth ops.
+#[inline]
+pub const fn unpack_depth_read_only(packed: u32) -> bool {
+    ((packed >> 16) & 0xFF) != 0
+}
 
 /// High-level typed commands serialized into the checked packet.
 #[derive(Clone, Debug, PartialEq)]
@@ -604,6 +654,64 @@ pub enum GpuCommand {
         first_vertex: u32,
         /// Index of the first instance to draw.
         first_instance: u32,
+    },
+    /// Command to compile and create a render pipeline from WGSL shader text with depth testing/writing state.
+    CreatePipelineDepth {
+        /// Unique integer identifier for the pipeline.
+        pipeline_id: u32,
+        /// Complete WGSL shader source code.
+        wgsl_code: String,
+        /// Color attachment format code (0 = preferred canvas, 1 = bgra8unorm, 2 = rgba8unorm).
+        target_format: u32,
+        /// Whether the pipeline consumes a vertex buffer at location 0.
+        has_vertex_buffer: bool,
+        /// Whether the pipeline consumes a dynamic uniform buffer at binding 0.
+        has_uniform_buffer: bool,
+        /// Explicit uniform buffer binding byte size.
+        uniform_size: u32,
+        /// Explicit vertex array byte stride.
+        vertex_stride: u32,
+        /// Depth texture format code (3 = depth24plus, 4 = depth32float).
+        depth_format: u32,
+        /// Whether depth writes are enabled.
+        depth_write_enabled: bool,
+        /// Depth comparison function code (1..=8).
+        depth_compare: u32,
+    },
+    /// Command to encode and execute a complete render pass with a depth attachment.
+    RenderPassDepth {
+        /// Target kind (0 = offscreen texture, 1 = canvas texture).
+        target_type: u32,
+        /// Texture identifier when target_type is TARGET_OFFSCREEN.
+        target_id: u32,
+        /// Clear color [R, G, B, A] normalized to [0.0, 1.0].
+        clear_color: [f32; 4],
+        /// Pipeline identifier to bind for rendering.
+        pipeline_id: u32,
+        /// Vertex buffer identifier (or 0 if vertex index generation is used).
+        vertex_buffer_id: u32,
+        /// Number of vertices to draw.
+        vertex_count: u32,
+        /// Dynamic offset for the uniform buffer binding (must be multiple of alignment).
+        uniform_dynamic_offset: u32,
+        /// Uniform buffer identifier bound to group 0 (defaults to 1 if 0).
+        uniform_buffer_id: u32,
+        /// Explicit load operation for color (0 = Clear, 1 = Load, 2 = DontCare).
+        load_op: u32,
+        /// Explicit store operation for color (0 = Store, 1 = Discard).
+        store_op: u32,
+        /// Pass boundary flags (0 = none, 1 = new pass boundary).
+        pass_flags: u32,
+        /// Depth texture identifier.
+        depth_target_id: u32,
+        /// Explicit load operation for depth (0 = Clear, 1 = Load, 2 = DontCare).
+        depth_load_op: u32,
+        /// Explicit store operation for depth (0 = Store, 1 = Discard).
+        depth_store_op: u32,
+        /// Clear depth value normalized to [0.0, 1.0] (typically 1.0).
+        depth_clear_value: f32,
+        /// Whether depth attachment is read-only.
+        depth_read_only: bool,
     },
 }
 
@@ -866,6 +974,84 @@ impl GpuSubmissionPacket {
                     command_records.extend_from_slice(&first_vertex.to_le_bytes());
                     command_records.extend_from_slice(&first_instance.to_le_bytes());
                 }
+                GpuCommand::CreatePipelineDepth {
+                    pipeline_id,
+                    wgsl_code,
+                    target_format,
+                    has_vertex_buffer,
+                    has_uniform_buffer,
+                    uniform_size,
+                    vertex_stride,
+                    depth_format,
+                    depth_write_enabled,
+                    depth_compare,
+                } => {
+                    let bytes = wgsl_code.as_bytes();
+                    let code_len = u32::try_from(bytes.len()).map_err(|_| PacketEncodeError::CommandDataOverflow {
+                        command_index: cmd_idx,
+                        length: bytes.len(),
+                    })?;
+                    let current_len = data_payload.len();
+                    if current_len.checked_add(bytes.len()).map_or(true, |sum| sum > max_payload_len) {
+                        return Err(PacketEncodeError::DataPayloadOverflow {
+                            offset: current_len,
+                            length: bytes.len(),
+                        });
+                    }
+                    let code_offset = u32::try_from(current_len).map_err(|_| PacketEncodeError::DataPayloadOverflow {
+                        offset: current_len,
+                        length: bytes.len(),
+                    })?;
+                    data_payload.extend_from_slice(bytes);
+
+                    command_records.extend_from_slice(&OPCODE_CREATE_PIPELINE_DEPTH.to_le_bytes());
+                    command_records.extend_from_slice(&pipeline_id.to_le_bytes());
+                    command_records.extend_from_slice(&code_offset.to_le_bytes());
+                    command_records.extend_from_slice(&code_len.to_le_bytes());
+                    command_records.extend_from_slice(&target_format.to_le_bytes());
+                    command_records.extend_from_slice(&(if *has_vertex_buffer { 1u32 } else { 0u32 }).to_le_bytes());
+                    command_records.extend_from_slice(&(if *has_uniform_buffer { 1u32 } else { 0u32 }).to_le_bytes());
+                    command_records.extend_from_slice(&uniform_size.to_le_bytes());
+                    command_records.extend_from_slice(&vertex_stride.to_le_bytes());
+                    command_records.extend_from_slice(&depth_format.to_le_bytes());
+                    command_records.extend_from_slice(&(if *depth_write_enabled { 1u32 } else { 0u32 }).to_le_bytes());
+                    command_records.extend_from_slice(&depth_compare.to_le_bytes());
+                }
+                GpuCommand::RenderPassDepth {
+                    target_type,
+                    target_id,
+                    clear_color,
+                    pipeline_id,
+                    vertex_buffer_id,
+                    vertex_count,
+                    uniform_dynamic_offset,
+                    uniform_buffer_id,
+                    load_op,
+                    store_op,
+                    pass_flags,
+                    depth_target_id,
+                    depth_load_op,
+                    depth_store_op,
+                    depth_clear_value,
+                    depth_read_only,
+                } => {
+                    command_records.extend_from_slice(&OPCODE_RENDER_PASS_DEPTH.to_le_bytes());
+                    let packed_target = pack_target_type(*target_type, *load_op, *store_op, *pass_flags);
+                    command_records.extend_from_slice(&packed_target.to_le_bytes());
+                    command_records.extend_from_slice(&target_id.to_le_bytes());
+                    for c in clear_color {
+                        command_records.extend_from_slice(&c.to_le_bytes());
+                    }
+                    command_records.extend_from_slice(&pipeline_id.to_le_bytes());
+                    command_records.extend_from_slice(&vertex_buffer_id.to_le_bytes());
+                    command_records.extend_from_slice(&vertex_count.to_le_bytes());
+                    command_records.extend_from_slice(&uniform_dynamic_offset.to_le_bytes());
+                    command_records.extend_from_slice(&uniform_buffer_id.to_le_bytes());
+                    command_records.extend_from_slice(&depth_target_id.to_le_bytes());
+                    let packed_depth = pack_depth_ops(*depth_load_op, *depth_store_op, *depth_read_only);
+                    command_records.extend_from_slice(&packed_depth.to_le_bytes());
+                    command_records.extend_from_slice(&depth_clear_value.to_le_bytes());
+                }
             }
         }
 
@@ -929,6 +1115,23 @@ pub enum PlanLoweringError {
         /// Diagnostic name of the pass segment.
         segment_name: String,
     },
+    /// Render segment configures a stencil operation (stencil not yet supported by bridge lowering).
+    UnsupportedStencilAttachment {
+        /// Diagnostic name of the pass segment.
+        segment_name: String,
+    },
+    /// Render segment configures render bundle draws with a depth attachment (bundle depth not yet supported by bridge lowering).
+    UnsupportedBundleDepthAttachment {
+        /// Diagnostic name of the pass segment.
+        segment_name: String,
+    },
+    /// Render segment configures an invalid or malformed depth attachment.
+    InvalidDepthAttachment {
+        /// Diagnostic name of the pass segment.
+        segment_name: String,
+        /// Diagnostic reason describing why the depth attachment is malformed.
+        reason: String,
+    },
     /// Execution plan contains an unsupported pass kind for bridge lowering.
     UnsupportedPassKind {
         /// Diagnostic name of the pass segment.
@@ -966,6 +1169,24 @@ impl core::fmt::Display for PlanLoweringError {
                 write!(
                     f,
                     "Render segment '{segment_name}' configures a depth/stencil attachment; depth is not supported by bridge lowering"
+                )
+            }
+            Self::UnsupportedStencilAttachment { segment_name } => {
+                write!(
+                    f,
+                    "Render segment '{segment_name}' configures a stencil operation; stencil is not supported by bridge lowering"
+                )
+            }
+            Self::UnsupportedBundleDepthAttachment { segment_name } => {
+                write!(
+                    f,
+                    "Render segment '{segment_name}' configures render bundle draws with a depth attachment; bundle depth is not supported by bridge lowering"
+                )
+            }
+            Self::InvalidDepthAttachment { segment_name, reason } => {
+                write!(
+                    f,
+                    "Render segment '{segment_name}' configures an invalid depth attachment: {reason}"
                 )
             }
             Self::UnsupportedPassKind { segment_name } => {
@@ -1011,10 +1232,61 @@ pub fn lower_plan(plan: &ExecutionPlan) -> Result<Vec<GpuCommand>, PlanLoweringE
                         count: segment.color_attachments().len(),
                     });
                 }
-                if segment.depth_stencil_attachment().is_some() {
-                    return Err(PlanLoweringError::UnsupportedDepthStencilAttachment {
-                        segment_name: segment.name().to_string(),
-                    });
+                let depth_attachment = segment.depth_stencil_attachment();
+                if let Some(dsa) = depth_attachment {
+                    if dsa.target_id().get() == 0 {
+                        return Err(PlanLoweringError::InvalidDepthAttachment {
+                            segment_name: segment.name().to_string(),
+                            reason: "Depth attachment target ID must not be zero".to_string(),
+                        });
+                    }
+                    if dsa.depth_clear_value().is_nan()
+                        || dsa.depth_clear_value() < 0.0
+                        || dsa.depth_clear_value() > 1.0
+                    {
+                        return Err(PlanLoweringError::InvalidDepthAttachment {
+                            segment_name: segment.name().to_string(),
+                            reason: alloc::format!(
+                                "Depth clear value must be within [0.0, 1.0], got {}",
+                                dsa.depth_clear_value()
+                            ),
+                        });
+                    }
+                    if dsa.depth_read_only() && dsa.depth_load_op() == Some(LoadOp::Clear) {
+                        return Err(PlanLoweringError::InvalidDepthAttachment {
+                            segment_name: segment.name().to_string(),
+                            reason: "Read-only depth attachment cannot specify LoadOp::Clear"
+                                .to_string(),
+                        });
+                    }
+                    if !dsa.depth_read_only() && dsa.depth_load_op().is_none() {
+                        return Err(PlanLoweringError::InvalidDepthAttachment {
+                            segment_name: segment.name().to_string(),
+                            reason: "Writable depth attachment requires explicit depth_load_op"
+                                .to_string(),
+                        });
+                    }
+                    if !dsa.depth_read_only() && dsa.depth_store_op().is_none() {
+                        return Err(PlanLoweringError::InvalidDepthAttachment {
+                            segment_name: segment.name().to_string(),
+                            reason: "Writable depth attachment requires explicit depth_store_op"
+                                .to_string(),
+                        });
+                    }
+                    if dsa.stencil_load_op.is_some()
+                        || dsa.stencil_store_op.is_some()
+                        || !dsa.stencil_read_only
+                        || dsa.stencil_clear_value != 0
+                    {
+                        return Err(PlanLoweringError::UnsupportedStencilAttachment {
+                            segment_name: segment.name().to_string(),
+                        });
+                    }
+                    if segment.draws().iter().any(|d| matches!(d.kind(), DrawKind::Bundle { .. })) {
+                        return Err(PlanLoweringError::UnsupportedBundleDepthAttachment {
+                            segment_name: segment.name().to_string(),
+                        });
+                    }
                 }
                 let Some(ca) = segment.primary_color_attachment() else {
                     return Err(PlanLoweringError::MissingColorAttachment {
@@ -1038,21 +1310,87 @@ pub fn lower_plan(plan: &ExecutionPlan) -> Result<Vec<GpuCommand>, PlanLoweringE
                     StoreOp::Discard => STORE_OP_DISCARD,
                 };
 
-                if segment.draws().is_empty() {
-                    if ca.load_op() == LoadOp::Clear {
+                let (depth_target_id, depth_load_op, depth_store_op, depth_clear_value, depth_read_only) =
+                    if let Some(dsa) = depth_attachment {
+                        let d_read_only = dsa.depth_read_only();
+                        let d_load = match dsa.depth_load_op() {
+                            Some(LoadOp::Clear) => LOAD_OP_CLEAR,
+                            Some(LoadOp::Load) => LOAD_OP_LOAD,
+                            Some(LoadOp::DontCare) => LOAD_OP_DONT_CARE,
+                            None => {
+                                if d_read_only {
+                                    LOAD_OP_LOAD
+                                } else {
+                                    LOAD_OP_CLEAR
+                                }
+                            }
+                        };
+                        let d_store = match dsa.depth_store_op() {
+                            Some(StoreOp::Store) => STORE_OP_STORE,
+                            Some(StoreOp::Discard) => STORE_OP_DISCARD,
+                            None => STORE_OP_STORE,
+                        };
+                        (
+                            dsa.target_id().get(),
+                            d_load,
+                            d_store,
+                            dsa.depth_clear_value(),
+                            d_read_only,
+                        )
+                    } else {
+                        (0, LOAD_OP_CLEAR, STORE_OP_STORE, 1.0f32, false)
+                    };
+
+                let mut emit_render_pass = |commands: &mut Vec<GpuCommand>,
+                                            pipeline_id: u32,
+                                            vertex_buffer_id: u32,
+                                            vertex_count: u32,
+                                            uniform_dynamic_offset: u32,
+                                            uniform_buffer_id: u32,
+                                            pass_flags: u32| {
+                    if depth_attachment.is_some() {
+                        commands.push(GpuCommand::RenderPassDepth {
+                            target_type,
+                            target_id,
+                            clear_color,
+                            pipeline_id,
+                            vertex_buffer_id,
+                            vertex_count,
+                            uniform_dynamic_offset,
+                            uniform_buffer_id,
+                            load_op,
+                            store_op,
+                            pass_flags,
+                            depth_target_id,
+                            depth_load_op,
+                            depth_store_op,
+                            depth_clear_value,
+                            depth_read_only,
+                        });
+                    } else {
                         commands.push(GpuCommand::RenderPass {
                             target_type,
                             target_id,
                             clear_color,
-                            pipeline_id: 0,
-                            vertex_buffer_id: 0,
-                            vertex_count: 0,
-                            uniform_dynamic_offset: 0,
-                            uniform_buffer_id: 0,
+                            pipeline_id,
+                            vertex_buffer_id,
+                            vertex_count,
+                            uniform_dynamic_offset,
+                            uniform_buffer_id,
                             load_op,
                             store_op,
-                            pass_flags: PASS_FLAG_NEW_PASS,
+                            pass_flags,
                         });
+                    }
+                };
+
+                if segment.draws().is_empty() {
+                    let has_color_clear = ca.load_op() == LoadOp::Clear;
+                    let has_depth_clear = depth_attachment
+                        .and_then(|d| d.depth_load_op())
+                        .map_or(false, |op| op == LoadOp::Clear);
+                    if has_color_clear || has_depth_clear {
+                        emit_render_pass(&mut commands, 0, 0, 0, 0, 0, PASS_FLAG_NEW_PASS);
                         continue;
                     } else {
                         return Err(PlanLoweringError::MissingDrawCommand {
@@ -1066,23 +1404,11 @@ pub fn lower_plan(plan: &ExecutionPlan) -> Result<Vec<GpuCommand>, PlanLoweringE
                 let mut current_scissor: Option<[u32; 4]> = None;
 
                 // When the first draw in a render pass is a bundle draw, emit an initial
-                // GpuCommand::RenderPass with vertex_count: 0 to open the render pass on the target
+                // pass opening command with vertex_count: 0 to open the render pass on the target
                 // with its clear color and load/store semantics. Subsequent bundle executes and direct draws
                 // occur inside this same pass without re-clearing.
                 if matches!(segment.draws().first().map(|d| d.kind()), Some(DrawKind::Bundle { .. })) {
-                    commands.push(GpuCommand::RenderPass {
-                        target_type,
-                        target_id,
-                        clear_color,
-                        pipeline_id: 0,
-                        vertex_buffer_id: 0,
-                        vertex_count: 0,
-                        uniform_dynamic_offset: 0,
-                        uniform_buffer_id: 0,
-                        load_op,
-                        store_op,
-                        pass_flags: PASS_FLAG_NEW_PASS,
-                    });
+                    emit_render_pass(&mut commands, 0, 0, 0, 0, 0, PASS_FLAG_NEW_PASS);
                     is_first_command_in_segment = false;
                 }
 
@@ -1126,19 +1452,7 @@ pub fn lower_plan(plan: &ExecutionPlan) -> Result<Vec<GpuCommand>, PlanLoweringE
                     if (needs_viewport_update || needs_scissor_update || needs_draw_parameters)
                         && is_first_command_in_segment
                     {
-                        commands.push(GpuCommand::RenderPass {
-                            target_type,
-                            target_id,
-                            clear_color,
-                            pipeline_id: 0,
-                            vertex_buffer_id: 0,
-                            vertex_count: 0,
-                            uniform_dynamic_offset: 0,
-                            uniform_buffer_id: 0,
-                            load_op,
-                            store_op,
-                            pass_flags: PASS_FLAG_NEW_PASS,
-                        });
+                        emit_render_pass(&mut commands, 0, 0, 0, 0, 0, PASS_FLAG_NEW_PASS);
                         is_first_command_in_segment = false;
                     }
 
@@ -1194,19 +1508,15 @@ pub fn lower_plan(plan: &ExecutionPlan) -> Result<Vec<GpuCommand>, PlanLoweringE
                                 PASS_FLAG_NONE
                             };
 
-                            commands.push(GpuCommand::RenderPass {
-                                target_type,
-                                target_id,
-                                clear_color,
-                                pipeline_id: draw.pipeline_id(),
-                                vertex_buffer_id: draw.vertex_buffer_id(),
-                                vertex_count: draw.vertex_count(),
-                                uniform_dynamic_offset: draw.uniform_dynamic_offset(),
+                            emit_render_pass(
+                                &mut commands,
+                                draw.pipeline_id(),
+                                draw.vertex_buffer_id(),
+                                draw.vertex_count(),
+                                draw.uniform_dynamic_offset(),
                                 uniform_buffer_id,
-                                load_op,
-                                store_op,
                                 pass_flags,
-                            });
+                            );
                         }
                     }
                 }
@@ -3117,6 +3427,409 @@ pub fn gpu_bridge_build_draw_parameters_packet() -> Vec<u8> {
 #[must_use]
 pub fn f3d_build_draw_parameters_packet() -> Vec<u8> {
     gpu_bridge_build_draw_parameters_packet()
+}
+
+/// Builds a real WGSL overlapping-triangle depth execution packet (§8.5).
+///
+/// Tests WebGPU depth attachment lowering, pipeline depth-test/write state, and pass preservation:
+/// - Near triangle at $z = 0.2$ (Green `[0.0, 1.0, 0.0, 1.0]`)
+/// - Far triangle at $z = 0.8$ (Red `[1.0, 0.0, 0.0, 1.0]`)
+/// - Pipeline 100: configured with `depth_compare: Less` (2), `depth_write_enabled: true`, format `depth32float` (4).
+/// Builds a self-contained WebGPU submission packet for overlapping-triangle depth verification.
+///
+/// # Scenarios (§6.1, §6.7, §8.5)
+/// - `0`: Near then Far (`depth_compare: Less`, `depth_write_enabled: true`). Near triangle (z=0.2, green) draws first,
+///   then Far triangle (z=0.8, red) is rejected by depth test, leaving green pixels.
+/// - `1`: Far then Near (`depth_compare: Less`, `depth_write_enabled: true`). Far triangle draws first, then Near triangle
+///   overwrites it via depth test (draw-order swap preservation, producing identical green pixels to scenario 0).
+/// - `2`: Multi-Pass Depth Persistence. Pass 1 renders Near triangle with `Clear`, `Store`. Pass 2 renders Far triangle
+///   with `Load`, `Store` (`LoadOp::Load` on depth). Preserved depth rejects Far triangle, leaving green pixels.
+/// - `3`: Planted Negative Control. Near then Far, but with `depth_compare: Always` and `depth_write_enabled: false`.
+///   Far triangle overwrites Near, producing red pixels [255, 0, 0, 255] and strictly diverging from depth-enabled reference.
+/// - `4`: Readonly Depth. Pass 1 draws Near (Green, z=0.2) with depth_write=true. Pass 2 color Load, depth_read_only=true
+///   (load/store/clear omitted), pipeline depth_write_enabled=false, draws Far (Red, z=0.8). Depth test rejects Far -> Green.
+/// - `5`: Empty Depth Clear Pass. Pass 1 draws Near (Green, z=0.2). Pass 2 color Load, depth Clear (1.0), zero draws.
+///   Pass 3 color Load, depth Load, draws Far (Red, z=0.8). Far passes depth test (< 1.0) and overwrites Near -> Red.
+pub fn build_overlapping_depth_submission(scenario: u32) -> GpuSubmissionPacket {
+    with_global_resource_table(|table| {
+        table.register(2);   // vb_near_id
+        table.register(3);   // vb_far_id
+        table.register(10);  // color_target_texture_id
+        table.register(12);  // depth_target_texture_id
+        table.register(20);  // readback_buffer_id
+        table.register(100); // pipeline_id
+        table.register(101); // pipeline_ro_id
+    });
+
+    let mut packet = GpuSubmissionPacket::new();
+
+    let vb_near_id = 2u32;
+    let vb_far_id = 3u32;
+    let target_color_id = 10u32;
+    let target_depth_id = 12u32;
+    let readback_buffer_id = 20u32;
+    let pipeline_id = 100u32;
+    let pipeline_ro_id = 101u32;
+
+    // 1. Vertex buffer: Near triangle at z = 0.2, Green [0.0, 1.0, 0.0, 1.0]
+    // 3 vertices * 7 floats (stride 28: pos vec3<f32> at offset 0 + color vec4<f32> at offset 12)
+    let near_floats: [f32; 21] = [
+        // x,     y,    z,    r,   g,   b,   a
+         0.0,   0.5,  0.2,  0.0, 1.0, 0.0, 1.0,
+        -0.5,  -0.5,  0.2,  0.0, 1.0, 0.0, 1.0,
+         0.5,  -0.5,  0.2,  0.0, 1.0, 0.0, 1.0,
+    ];
+    let mut near_bytes = Vec::with_capacity(near_floats.len() * 4);
+    for f in near_floats {
+        near_bytes.extend_from_slice(&f.to_le_bytes());
+    }
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: vb_near_id,
+        size: near_bytes.len() as u32,
+        usage: BUFFER_USAGE_VERTEX | BUFFER_USAGE_COPY_DST,
+    });
+    packet.push(GpuCommand::WriteBuffer {
+        buffer_id: vb_near_id,
+        offset: 0,
+        data: near_bytes.clone(),
+    });
+
+    // 2. Vertex buffer: Far triangle at z = 0.8, Red [1.0, 0.0, 0.0, 1.0]
+    // 3 vertices * 7 floats (stride 28: pos vec3<f32> at offset 0 + color vec4<f32> at offset 12)
+    let far_floats: [f32; 21] = [
+        // x,     y,    z,    r,   g,   b,   a
+         0.0,   0.6,  0.8,  1.0, 0.0, 0.0, 1.0,
+        -0.6,  -0.6,  0.8,  1.0, 0.0, 0.0, 1.0,
+         0.6,  -0.6,  0.8,  1.0, 0.0, 0.0, 1.0,
+    ];
+    let mut far_bytes = Vec::with_capacity(far_floats.len() * 4);
+    for f in far_floats {
+        far_bytes.extend_from_slice(&f.to_le_bytes());
+    }
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: vb_far_id,
+        size: far_bytes.len() as u32,
+        usage: BUFFER_USAGE_VERTEX | BUFFER_USAGE_COPY_DST,
+    });
+    packet.push(GpuCommand::WriteBuffer {
+        buffer_id: vb_far_id,
+        offset: 0,
+        data: far_bytes.clone(),
+    });
+
+    // 3. Color target texture (64x64, rgba8unorm)
+    packet.push(GpuCommand::CreateTexture {
+        texture_id: target_color_id,
+        width: 64,
+        height: 64,
+        format: TARGET_FORMAT_RGBA8UNORM,
+        usage: TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC,
+    });
+
+    // 4. Depth target texture (64x64, depth32float)
+    packet.push(GpuCommand::CreateTexture {
+        texture_id: target_depth_id,
+        width: 64,
+        height: 64,
+        format: TARGET_FORMAT_DEPTH32FLOAT,
+        usage: TEXTURE_USAGE_RENDER_ATTACHMENT,
+    });
+
+    // 5. Readback buffer (64 * 256 bytes)
+    let bytes_per_row = 256u32;
+    let readback_size = bytes_per_row * 64;
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: readback_buffer_id,
+        size: readback_size,
+        usage: BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST,
+    });
+
+    // 6. Depth pipeline with WGSL shader (matching directDepthReference verbatim)
+    let depth_shader = "\
+struct VertexInput {\n\
+    @location(0) position: vec3<f32>,\n\
+    @location(1) color: vec4<f32>,\n\
+};\n\
+\n\
+struct VertexOutput {\n\
+    @builtin(position) position: vec4<f32>,\n\
+    @location(0) color: vec4<f32>,\n\
+};\n\
+\n\
+@vertex\n\
+fn vs_main(in: VertexInput) -> VertexOutput {\n\
+    var out: VertexOutput;\n\
+    out.position = vec4<f32>(in.position, 1.0);\n\
+    out.color = in.color;\n\
+    return out;\n\
+}\n\
+\n\
+@fragment\n\
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {\n\
+    return in.color;\n\
+}\n";
+
+    let is_depth_disabled_negative = scenario == 3;
+    let depth_compare = if is_depth_disabled_negative {
+        DEPTH_COMPARE_ALWAYS
+    } else {
+        DEPTH_COMPARE_LESS
+    };
+    let depth_write_enabled = !is_depth_disabled_negative;
+
+    packet.push(GpuCommand::CreatePipelineDepth {
+        pipeline_id,
+        wgsl_code: depth_shader.to_string(),
+        target_format: TARGET_FORMAT_RGBA8UNORM,
+        has_vertex_buffer: true,
+        has_uniform_buffer: false,
+        uniform_size: 0,
+        vertex_stride: 28,
+        depth_format: TARGET_FORMAT_DEPTH32FLOAT,
+        depth_write_enabled,
+        depth_compare,
+    });
+
+    if scenario == 4 {
+        packet.push(GpuCommand::CreatePipelineDepth {
+            pipeline_id: pipeline_ro_id,
+            wgsl_code: depth_shader.to_string(),
+            target_format: TARGET_FORMAT_RGBA8UNORM,
+            has_vertex_buffer: true,
+            has_uniform_buffer: false,
+            uniform_size: 0,
+            vertex_stride: 28,
+            depth_format: TARGET_FORMAT_DEPTH32FLOAT,
+            depth_write_enabled: false,
+            depth_compare: DEPTH_COMPARE_LESS,
+        });
+    }
+
+    // 7. Build passes using f3d-graph's PassGraph and compile to ExecutionPlan
+    use f3d_graph::{
+        pass::{ColorAttachment, DepthStencilAttachment, Draw, Pass, PassId},
+        PassGraph,
+    };
+
+    let mut graph = PassGraph::new();
+
+    let draw_near = Draw::new(
+        1,
+        pipeline_id,
+        3,
+        0,
+        vec![
+            ResourceUse::buffer_vertex(ResourceId::new(vb_near_id), DataVersion::INITIAL, Some(0), Some(near_bytes.len() as u64)),
+        ],
+    );
+
+    let draw_far = Draw::new(
+        2,
+        pipeline_id,
+        3,
+        0,
+        vec![
+            ResourceUse::buffer_vertex(ResourceId::new(vb_far_id), DataVersion::INITIAL, Some(0), Some(far_bytes.len() as u64)),
+        ],
+    );
+
+    if scenario == 2 {
+        // Scenario 2: Multi-Pass Depth Persistence
+        // Pass 1: Clear color to [0,0,0,1], clear depth to 1.0, Store depth, draw Near (Green, z=0.2)
+        let mut pass1 = Pass::new_render(PassId::new(1), "pass_near_clear");
+        pass1.color_attachments.push(ColorAttachment::new_clear(
+            ResourceId::new(target_color_id),
+            [0.0, 0.0, 0.0, 1.0],
+        ));
+        pass1.depth_stencil_attachment = Some(DepthStencilAttachment::new_depth_clear(
+            ResourceId::new(target_depth_id),
+            1.0,
+        ));
+        pass1.draws.push(draw_near);
+        graph.add_pass(pass1).expect("add pass1");
+
+        // Pass 2: Load color, Load depth (LoadOp::Load), Store depth, draw Far (Red, z=0.8)
+        // Depth test rejects Far, preserving earlier Near (Green)
+        let mut pass2 = Pass::new_render(PassId::new(2), "pass_far_load");
+        pass2.color_attachments.push(ColorAttachment::new_load(
+            ResourceId::new(target_color_id),
+        ));
+        pass2.depth_stencil_attachment = Some(DepthStencilAttachment {
+            target_id: ResourceId::new(target_depth_id),
+            view_subresource: f3d_graph::resource::SubresourceRange::full_texture(),
+            depth_load_op: Some(LoadOp::Load),
+            depth_store_op: Some(StoreOp::Store),
+            depth_clear_value: 1.0,
+            depth_read_only: false,
+            stencil_load_op: None,
+            stencil_store_op: None,
+            stencil_clear_value: 0,
+            stencil_read_only: true,
+        });
+        pass2.draws.push(draw_far);
+        graph.add_pass(pass2).expect("add pass2");
+    } else if scenario == 4 {
+        // Scenario 4: Readonly Depth (depthAttachmentDesc omits load/store/clear per WebGPU spec)
+        // Pass 1: Clear color to black, clear depth to 1.0, Store depth, draw Near (Green, z=0.2, depth_write=true)
+        let mut pass1 = Pass::new_render(PassId::new(1), "pass_near_clear");
+        pass1.color_attachments.push(ColorAttachment::new_clear(
+            ResourceId::new(target_color_id),
+            [0.0, 0.0, 0.0, 1.0],
+        ));
+        pass1.depth_stencil_attachment = Some(DepthStencilAttachment::new_depth_clear(
+            ResourceId::new(target_depth_id),
+            1.0,
+        ));
+        pass1.draws.push(draw_near);
+        graph.add_pass(pass1).expect("add pass1");
+
+        // Pass 2: Color Load, Depth read-only (load_op=None, store_op=None, read_only=true)
+        // Pipeline 101 has depth_write_enabled=false. Draw Far (Red, z=0.8). Discarded by depth test -> Green
+        let mut pass2 = Pass::new_render(PassId::new(2), "pass_far_readonly");
+        pass2.color_attachments.push(ColorAttachment::new_load(
+            ResourceId::new(target_color_id),
+        ));
+        pass2.depth_stencil_attachment = Some(DepthStencilAttachment {
+            target_id: ResourceId::new(target_depth_id),
+            view_subresource: f3d_graph::resource::SubresourceRange::full_texture(),
+            depth_load_op: None,
+            depth_store_op: None,
+            depth_clear_value: 1.0,
+            depth_read_only: true,
+            stencil_load_op: None,
+            stencil_store_op: None,
+            stencil_clear_value: 0,
+            stencil_read_only: true,
+        });
+        let draw_far_ro = Draw::new(
+            2,
+            pipeline_ro_id,
+            3,
+            0,
+            vec![
+                ResourceUse::buffer_vertex(ResourceId::new(vb_far_id), DataVersion::INITIAL, Some(0), Some(far_bytes.len() as u64)),
+            ],
+        );
+        pass2.draws.push(draw_far_ro);
+        graph.add_pass(pass2).expect("add pass2");
+    } else if scenario == 5 {
+        // Scenario 5: Empty Depth Clear Pass (proves zero-draw depth clear executes and resets depth)
+        // Pass 1: Clear color and depth, draw Near (Green, z=0.2)
+        let mut pass1 = Pass::new_render(PassId::new(1), "pass_near_clear");
+        pass1.color_attachments.push(ColorAttachment::new_clear(
+            ResourceId::new(target_color_id),
+            [0.0, 0.0, 0.0, 1.0],
+        ));
+        pass1.depth_stencil_attachment = Some(DepthStencilAttachment::new_depth_clear(
+            ResourceId::new(target_depth_id),
+            1.0,
+        ));
+        pass1.draws.push(draw_near);
+        graph.add_pass(pass1).expect("add pass1");
+
+        // Pass 2: Color Load, Depth Clear (1.0), ZERO draws!
+        let mut pass2 = Pass::new_render(PassId::new(2), "pass_empty_depth_clear");
+        pass2.color_attachments.push(ColorAttachment::new_load(
+            ResourceId::new(target_color_id),
+        ));
+        pass2.depth_stencil_attachment = Some(DepthStencilAttachment::new_depth_clear(
+            ResourceId::new(target_depth_id),
+            1.0,
+        ));
+        // Empty draws
+        graph.add_pass(pass2).expect("add pass2");
+
+        // Pass 3: Color Load, Depth Load, draw Far (Red, z=0.8)
+        // Because Pass 2 cleared depth back to 1.0, Far passes depth test (0.8 < 1.0) and overwrites Near -> Red
+        let mut pass3 = Pass::new_render(PassId::new(3), "pass_far_after_clear");
+        pass3.color_attachments.push(ColorAttachment::new_load(
+            ResourceId::new(target_color_id),
+        ));
+        pass3.depth_stencil_attachment = Some(DepthStencilAttachment {
+            target_id: ResourceId::new(target_depth_id),
+            view_subresource: f3d_graph::resource::SubresourceRange::full_texture(),
+            depth_load_op: Some(LoadOp::Load),
+            depth_store_op: Some(StoreOp::Store),
+            depth_clear_value: 1.0,
+            depth_read_only: false,
+            stencil_load_op: None,
+            stencil_store_op: None,
+            stencil_clear_value: 0,
+            stencil_read_only: true,
+        });
+        pass3.draws.push(draw_far);
+        graph.add_pass(pass3).expect("add pass3");
+    } else {
+        // Single pass: Clear depth to 1.0, clear color to [0,0,0,1]
+        let mut pass = Pass::new_render(PassId::new(1), "pass_depth_draws");
+        pass.color_attachments.push(ColorAttachment::new_clear(
+            ResourceId::new(target_color_id),
+            [0.0, 0.0, 0.0, 1.0],
+        ));
+        pass.depth_stencil_attachment = Some(DepthStencilAttachment::new_depth_clear(
+            ResourceId::new(target_depth_id),
+            1.0,
+        ));
+        if scenario == 1 {
+            // Scenario 1: Far then Near (Draw-order swap)
+            pass.draws.push(draw_far);
+            pass.draws.push(draw_near);
+        } else {
+            // Scenario 0 (Near then Far) and Scenario 3 (Negative control: Near then Far with disabled depth)
+            pass.draws.push(draw_near);
+            pass.draws.push(draw_far);
+        }
+        graph.add_pass(pass).expect("add pass");
+    }
+
+    let plan = graph.compile(None).expect("depth pass graph must compile");
+    let lowered_commands = lower_plan(&plan).expect("depth plan lowering must succeed");
+    for cmd in lowered_commands {
+        packet.push(cmd);
+    }
+
+    // 8. Copy texture to readback buffer
+    packet.push(GpuCommand::CopyTextureToBuffer {
+        texture_id: target_color_id,
+        buffer_id: readback_buffer_id,
+        width: 64,
+        height: 64,
+        epoch: Epoch::ZERO,
+    });
+
+    packet
+}
+
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen]
+/// Encodes an overlapping-triangle depth execution packet and returns the raw binary bytes.
+pub fn gpu_bridge_build_overlapping_depth_packet(scenario: u32) -> Vec<u8> {
+    build_overlapping_depth_submission(scenario)
+        .encode()
+        .expect("static overlapping depth packet encoding must not fail")
+}
+
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen]
+/// Encodes an overlapping-triangle depth execution packet (canonical alias).
+pub fn f3d_build_overlapping_depth_packet(scenario: u32) -> Vec<u8> {
+    gpu_bridge_build_overlapping_depth_packet(scenario)
+}
+
+#[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
+/// Native export for `gpu_bridge_build_overlapping_depth_packet` for host verification and unit tests.
+#[must_use]
+pub fn gpu_bridge_build_overlapping_depth_packet(scenario: u32) -> Vec<u8> {
+    build_overlapping_depth_submission(scenario)
+        .encode()
+        .expect("static overlapping depth packet encoding must not fail")
+}
+
+#[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
+/// Native export for `f3d_build_overlapping_depth_packet` (canonical alias).
+#[must_use]
+pub fn f3d_build_overlapping_depth_packet(scenario: u32) -> Vec<u8> {
+    gpu_bridge_build_overlapping_depth_packet(scenario)
 }
 
 #[cfg(all(feature = "browser", target_arch = "wasm32"))]
@@ -5601,7 +6314,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_plan_rejects_depth_stencil_attachment() {
+    fn test_lower_plan_supports_depth_stencil_attachment() {
         use f3d_graph::{
             pass::{ColorAttachment, DepthStencilAttachment, Draw, Pass, PassId},
             plan::{ExecutionPlan, PlanSegment},
@@ -5627,11 +6340,498 @@ mod tests {
             split_reasons: Vec::new(),
         };
 
-        match lower_plan(&plan) {
-            Err(PlanLoweringError::UnsupportedDepthStencilAttachment { segment_name }) => {
-                assert_eq!(segment_name, "depth_pass");
+        let commands = lower_plan(&plan).expect("depth lowering must succeed");
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            GpuCommand::RenderPassDepth {
+                target_type,
+                target_id,
+                pipeline_id,
+                vertex_count,
+                depth_target_id,
+                depth_load_op,
+                depth_store_op,
+                depth_clear_value,
+                depth_read_only,
+                ..
+            } => {
+                assert_eq!(*target_type, TARGET_OFFSCREEN);
+                assert_eq!(*target_id, 10);
+                assert_eq!(*pipeline_id, 100);
+                assert_eq!(*vertex_count, 3);
+                assert_eq!(*depth_target_id, 99);
+                assert_eq!(*depth_load_op, LOAD_OP_CLEAR);
+                assert_eq!(*depth_store_op, STORE_OP_STORE);
+                assert_eq!(*depth_clear_value, 1.0);
+                assert!(!*depth_read_only);
             }
-            other => panic!("Expected UnsupportedDepthStencilAttachment error, got {other:?}"),
+            other => panic!("Expected RenderPassDepth command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_lower_plan_rejects_stencil_attachment() {
+        use f3d_graph::{
+            pass::{ColorAttachment, DepthStencilAttachment, Draw, LoadOp, Pass, PassId, StoreOp},
+            plan::{ExecutionPlan, PlanSegment},
+            resource::ResourceId,
+        };
+
+        let mut p = Pass::new_render(PassId::new(1), "stencil_pass");
+        p.color_attachments.push(ColorAttachment::new_clear(
+            ResourceId::new(10),
+            [0.0, 0.0, 0.0, 1.0],
+        ));
+        p.depth_stencil_attachment = Some(DepthStencilAttachment {
+            target_id: ResourceId::new(99),
+            view_subresource: f3d_graph::resource::SubresourceRange::full_texture(),
+            depth_load_op: Some(LoadOp::Clear),
+            depth_store_op: Some(StoreOp::Store),
+            depth_clear_value: 1.0,
+            depth_read_only: false,
+            stencil_load_op: Some(LoadOp::Clear),
+            stencil_store_op: Some(StoreOp::Store),
+            stencil_clear_value: 0,
+            stencil_read_only: false,
+        });
+        p.draws.push(Draw::new(1, 100, 3, 0, Vec::new()));
+
+        let plan = ExecutionPlan {
+            segments: vec![PlanSegment::from_pass(&p)],
+            canvas_epoch: None,
+            pass_count: 1,
+            split_count: 0,
+            split_reasons: Vec::new(),
+        };
+
+        match lower_plan(&plan) {
+            Err(PlanLoweringError::UnsupportedStencilAttachment { segment_name }) => {
+                assert_eq!(segment_name, "stencil_pass");
+            }
+            other => panic!("Expected UnsupportedStencilAttachment error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_lower_plan_rejects_bundle_depth_attachment() {
+        use f3d_graph::{
+            pass::{ColorAttachment, DepthStencilAttachment, Draw, Pass, PassId},
+            plan::{ExecutionPlan, PlanSegment},
+            resource::ResourceId,
+        };
+
+        let mut p = Pass::new_render(PassId::new(1), "bundle_depth_pass");
+        p.color_attachments.push(ColorAttachment::new_clear(
+            ResourceId::new(10),
+            [0.0, 0.0, 0.0, 1.0],
+        ));
+        p.depth_stencil_attachment = Some(DepthStencilAttachment::new_depth_clear(
+            ResourceId::new(99),
+            1.0,
+        ));
+        p.draws.push(Draw::new_bundle(1, 42, 100, Vec::new()));
+
+        let plan = ExecutionPlan {
+            segments: vec![PlanSegment::from_pass(&p)],
+            canvas_epoch: None,
+            pass_count: 1,
+            split_count: 0,
+            split_reasons: Vec::new(),
+        };
+
+        match lower_plan(&plan) {
+            Err(PlanLoweringError::UnsupportedBundleDepthAttachment { segment_name }) => {
+                assert_eq!(segment_name, "bundle_depth_pass");
+            }
+            other => panic!("Expected UnsupportedBundleDepthAttachment error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_lower_plan_supports_empty_draw_with_depth_clear_and_color_load() {
+        use f3d_graph::{
+            pass::{ColorAttachment, DepthStencilAttachment, Pass, PassId},
+            plan::{ExecutionPlan, PlanSegment},
+            resource::ResourceId,
+        };
+
+        let mut p = Pass::new_render(PassId::new(1), "empty_draw_depth_clear");
+        p.color_attachments.push(ColorAttachment::new_load(ResourceId::new(10)));
+        p.depth_stencil_attachment = Some(DepthStencilAttachment::new_depth_clear(
+            ResourceId::new(12),
+            1.0,
+        ));
+        // Empty draws: valid depth-clear pass with color load
+        assert!(p.draws.is_empty());
+
+        let plan = ExecutionPlan {
+            segments: vec![PlanSegment::from_pass(&p)],
+            canvas_epoch: None,
+            pass_count: 1,
+            split_count: 0,
+            split_reasons: Vec::new(),
+        };
+
+        let commands = lower_plan(&plan).expect("empty draw with depth clear must lower successfully");
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            GpuCommand::RenderPassDepth {
+                target_id,
+                vertex_count,
+                load_op,
+                store_op,
+                pass_flags,
+                depth_target_id,
+                depth_load_op,
+                depth_store_op,
+                depth_clear_value,
+                depth_read_only,
+                ..
+            } => {
+                assert_eq!(*target_id, 10);
+                assert_eq!(*vertex_count, 0);
+                assert_eq!(*load_op, LOAD_OP_LOAD);
+                assert_eq!(*store_op, STORE_OP_STORE);
+                assert_eq!(*pass_flags, PASS_FLAG_NEW_PASS);
+                assert_eq!(*depth_target_id, 12);
+                assert_eq!(*depth_load_op, LOAD_OP_CLEAR);
+                assert_eq!(*depth_store_op, STORE_OP_STORE);
+                assert_eq!(*depth_clear_value, 1.0);
+                assert!(!*depth_read_only);
+            }
+            other => panic!("Expected RenderPassDepth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_lower_plan_rejects_malformed_depth_attachments() {
+        use f3d_graph::{
+            pass::{ColorAttachment, DepthStencilAttachment, Draw, LoadOp, Pass, PassId, StoreOp},
+            plan::{ExecutionPlan, PlanSegment},
+            resource::ResourceId,
+        };
+
+        // Case 1: Target ID 0
+        let mut p1 = Pass::new_render(PassId::new(1), "invalid_target_0");
+        p1.color_attachments.push(ColorAttachment::new_clear(ResourceId::new(10), [0.0; 4]));
+        p1.depth_stencil_attachment = Some(DepthStencilAttachment::new_depth_clear(ResourceId::new(0), 1.0));
+        p1.draws.push(Draw::new(1, 100, 3, 0, Vec::new()));
+        let plan1 = ExecutionPlan {
+            segments: vec![PlanSegment::from_pass(&p1)],
+            canvas_epoch: None,
+            pass_count: 1,
+            split_count: 0,
+            split_reasons: Vec::new(),
+        };
+        assert!(matches!(
+            lower_plan(&plan1),
+            Err(PlanLoweringError::InvalidDepthAttachment { reason, .. }) if reason.contains("must not be zero")
+        ));
+
+        // Case 2: Depth clear value out of range (1.5)
+        let mut p2 = Pass::new_render(PassId::new(2), "invalid_clear_val");
+        p2.color_attachments.push(ColorAttachment::new_clear(ResourceId::new(10), [0.0; 4]));
+        p2.depth_stencil_attachment = Some(DepthStencilAttachment::new_depth_clear(ResourceId::new(12), 1.5));
+        p2.draws.push(Draw::new(1, 100, 3, 0, Vec::new()));
+        let plan2 = ExecutionPlan {
+            segments: vec![PlanSegment::from_pass(&p2)],
+            canvas_epoch: None,
+            pass_count: 1,
+            split_count: 0,
+            split_reasons: Vec::new(),
+        };
+        assert!(matches!(
+            lower_plan(&plan2),
+            Err(PlanLoweringError::InvalidDepthAttachment { reason, .. }) if reason.contains("[0.0, 1.0]")
+        ));
+
+        // Case 3: Read-only depth attachment specifying LoadOp::Clear
+        let mut p3 = Pass::new_render(PassId::new(3), "readonly_clear");
+        p3.color_attachments.push(ColorAttachment::new_clear(ResourceId::new(10), [0.0; 4]));
+        p3.depth_stencil_attachment = Some(DepthStencilAttachment {
+            target_id: ResourceId::new(12),
+            view_subresource: f3d_graph::resource::SubresourceRange::full_texture(),
+            depth_load_op: Some(LoadOp::Clear),
+            depth_store_op: Some(StoreOp::Store),
+            depth_clear_value: 1.0,
+            depth_read_only: true,
+            stencil_load_op: None,
+            stencil_store_op: None,
+            stencil_clear_value: 0,
+            stencil_read_only: true,
+        });
+        p3.draws.push(Draw::new(1, 100, 3, 0, Vec::new()));
+        let plan3 = ExecutionPlan {
+            segments: vec![PlanSegment::from_pass(&p3)],
+            canvas_epoch: None,
+            pass_count: 1,
+            split_count: 0,
+            split_reasons: Vec::new(),
+        };
+        assert!(matches!(
+            lower_plan(&plan3),
+            Err(PlanLoweringError::InvalidDepthAttachment { reason, .. }) if reason.contains("cannot specify LoadOp::Clear")
+        ));
+
+        // Case 4: Color load + Depth load with empty draws (neither clears, no draws -> MissingDrawCommand)
+        let mut p4 = Pass::new_render(PassId::new(4), "color_load_depth_load_no_draws");
+        p4.color_attachments.push(ColorAttachment::new_load(ResourceId::new(10)));
+        p4.depth_stencil_attachment = Some(DepthStencilAttachment {
+            target_id: ResourceId::new(12),
+            view_subresource: f3d_graph::resource::SubresourceRange::full_texture(),
+            depth_load_op: Some(LoadOp::Load),
+            depth_store_op: Some(StoreOp::Store),
+            depth_clear_value: 1.0,
+            depth_read_only: false,
+            stencil_load_op: None,
+            stencil_store_op: None,
+            stencil_clear_value: 0,
+            stencil_read_only: true,
+        });
+        assert!(p4.draws.is_empty());
+        let plan4 = ExecutionPlan {
+            segments: vec![PlanSegment::from_pass(&p4)],
+            canvas_epoch: None,
+            pass_count: 1,
+            split_count: 0,
+            split_reasons: Vec::new(),
+        };
+        assert!(matches!(
+            lower_plan(&plan4),
+            Err(PlanLoweringError::MissingDrawCommand { .. })
+        ));
+    }
+
+    #[test]
+    fn test_lower_plan_depth_read_only_numeric_defaults_and_truth() {
+        use f3d_graph::{
+            pass::{ColorAttachment, DepthStencilAttachment, Draw, Pass, PassId},
+            plan::{ExecutionPlan, PlanSegment},
+            resource::ResourceId,
+        };
+
+        let mut p = Pass::new_render(PassId::new(1), "readonly_truth_pass");
+        p.color_attachments.push(ColorAttachment::new_clear(ResourceId::new(10), [0.0; 4]));
+        p.depth_stencil_attachment = Some(DepthStencilAttachment {
+            target_id: ResourceId::new(12),
+            view_subresource: f3d_graph::resource::SubresourceRange::full_texture(),
+            depth_load_op: None,
+            depth_store_op: None,
+            depth_clear_value: 1.0,
+            depth_read_only: true,
+            stencil_load_op: None,
+            stencil_store_op: None,
+            stencil_clear_value: 0,
+            stencil_read_only: true,
+        });
+        p.draws.push(Draw::new(1, 100, 3, 0, Vec::new()));
+
+        let plan = ExecutionPlan {
+            segments: vec![PlanSegment::from_pass(&p)],
+            canvas_epoch: None,
+            pass_count: 1,
+            split_count: 0,
+            split_reasons: Vec::new(),
+        };
+
+        let commands = lower_plan(&plan).expect("read-only depth plan must lower successfully");
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            GpuCommand::RenderPassDepth {
+                depth_target_id,
+                depth_load_op,
+                depth_store_op,
+                depth_read_only,
+                ..
+            } => {
+                assert_eq!(*depth_target_id, 12);
+                assert!(*depth_read_only);
+                // Wire carries numeric defaults
+                assert_eq!(*depth_load_op, LOAD_OP_LOAD);
+                assert_eq!(*depth_store_op, STORE_OP_STORE);
+            }
+            other => panic!("Expected RenderPassDepth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_depth_wire_protocol_roundtrip_and_overlapping_submission() {
+        let _slot_lock = match TEST_SLOT_TABLE_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        // 1. Test CreatePipelineDepth binary encoding (44 bytes payload)
+        let mut packet = GpuSubmissionPacket::new();
+        packet.push(GpuCommand::CreatePipelineDepth {
+            pipeline_id: 100,
+            wgsl_code: "// test shader".to_string(),
+            target_format: TARGET_FORMAT_RGBA8UNORM,
+            has_vertex_buffer: true,
+            has_uniform_buffer: true,
+            uniform_size: 16,
+            vertex_stride: 20,
+            depth_format: TARGET_FORMAT_DEPTH32FLOAT,
+            depth_write_enabled: true,
+            depth_compare: DEPTH_COMPARE_LESS,
+        });
+
+        let encoded = packet.encode().expect("encoding CreatePipelineDepth");
+        assert_eq!(&encoded[0..4], &PACKET_MAGIC);
+        assert_eq!(u16::from_le_bytes(encoded[4..6].try_into().unwrap()), PACKET_VERSION);
+        assert_eq!(u32::from_le_bytes(encoded[8..12].try_into().unwrap()), 1); // cmd_count = 1
+
+        let op = u16::from_le_bytes(encoded[16..18].try_into().unwrap());
+        assert_eq!(op, OPCODE_CREATE_PIPELINE_DEPTH);
+        assert_eq!(u32::from_le_bytes(encoded[18..22].try_into().unwrap()), 100); // pipeline_id
+        assert_eq!(u32::from_le_bytes(encoded[30..34].try_into().unwrap()), TARGET_FORMAT_RGBA8UNORM);
+        assert_eq!(u32::from_le_bytes(encoded[50..54].try_into().unwrap()), TARGET_FORMAT_DEPTH32FLOAT);
+        assert_eq!(u32::from_le_bytes(encoded[54..58].try_into().unwrap()), 1); // depth_write_enabled = true
+        assert_eq!(u32::from_le_bytes(encoded[58..62].try_into().unwrap()), DEPTH_COMPARE_LESS);
+
+        // 2. Test RenderPassDepth binary encoding (56 bytes payload)
+        let mut pass_packet = GpuSubmissionPacket::new();
+        pass_packet.push(GpuCommand::RenderPassDepth {
+            target_type: TARGET_OFFSCREEN,
+            target_id: 10,
+            clear_color: [0.1, 0.2, 0.3, 1.0],
+            pipeline_id: 100,
+            vertex_buffer_id: 2,
+            vertex_count: 3,
+            uniform_dynamic_offset: 256,
+            uniform_buffer_id: 1,
+            load_op: LOAD_OP_CLEAR,
+            store_op: STORE_OP_STORE,
+            pass_flags: PASS_FLAG_NEW_PASS,
+            depth_target_id: 12,
+            depth_load_op: LOAD_OP_CLEAR,
+            depth_store_op: STORE_OP_STORE,
+            depth_clear_value: 1.0,
+            depth_read_only: false,
+        });
+
+        let enc_pass = pass_packet.encode().expect("encoding RenderPassDepth");
+        let op_pass = u16::from_le_bytes(enc_pass[16..18].try_into().unwrap());
+        assert_eq!(op_pass, OPCODE_RENDER_PASS_DEPTH);
+        let packed_color = u32::from_le_bytes(enc_pass[18..22].try_into().unwrap());
+        assert_eq!(unpack_target_kind(packed_color), TARGET_OFFSCREEN);
+        assert_eq!(unpack_load_op(packed_color), LOAD_OP_CLEAR);
+        assert_eq!(unpack_store_op(packed_color), STORE_OP_STORE);
+        assert_eq!(unpack_pass_flags(packed_color), PASS_FLAG_NEW_PASS);
+
+        assert_eq!(u32::from_le_bytes(enc_pass[22..26].try_into().unwrap()), 10); // color target
+        assert_eq!(u32::from_le_bytes(enc_pass[62..66].try_into().unwrap()), 12); // depth target
+        let packed_depth = u32::from_le_bytes(enc_pass[66..70].try_into().unwrap());
+        assert_eq!(unpack_depth_load_op(packed_depth), LOAD_OP_CLEAR);
+        assert_eq!(unpack_depth_store_op(packed_depth), STORE_OP_STORE);
+        assert!(!unpack_depth_read_only(packed_depth));
+        let clear_depth = f32::from_le_bytes(enc_pass[70..74].try_into().unwrap());
+        assert_eq!(clear_depth, 1.0);
+
+        // 3. Test build_overlapping_depth_submission and canonical exports for all 6 scenarios
+        let packet_0 = build_overlapping_depth_submission(0);
+        let bytes_0 = packet_0.encode().expect("encode scenario 0");
+        assert!(!bytes_0.is_empty());
+
+        let packet_1 = build_overlapping_depth_submission(1);
+        let bytes_1 = packet_1.encode().expect("encode scenario 1");
+        assert!(!bytes_1.is_empty());
+
+        let packet_2 = build_overlapping_depth_submission(2);
+        let bytes_2 = packet_2.encode().expect("encode scenario 2");
+        assert!(!bytes_2.is_empty());
+
+        let packet_3 = build_overlapping_depth_submission(3);
+        let bytes_3 = packet_3.encode().expect("encode scenario 3");
+        assert!(!bytes_3.is_empty());
+
+        let packet_4 = build_overlapping_depth_submission(4);
+        let bytes_4 = packet_4.encode().expect("encode scenario 4");
+        assert!(!bytes_4.is_empty());
+
+        let packet_5 = build_overlapping_depth_submission(5);
+        let bytes_5 = packet_5.encode().expect("encode scenario 5");
+        assert!(!bytes_5.is_empty());
+
+        // Verify Scenario 2 has two passes with depth load op on pass 2
+        let pass_cmds_2: Vec<_> = packet_2
+            .commands()
+            .iter()
+            .filter(|c| matches!(c, GpuCommand::RenderPassDepth { .. }))
+            .collect();
+        assert_eq!(pass_cmds_2.len(), 2);
+        if let GpuCommand::RenderPassDepth { depth_load_op, load_op, .. } = pass_cmds_2[1] {
+            assert_eq!(*depth_load_op, LOAD_OP_LOAD);
+            assert_eq!(*load_op, LOAD_OP_LOAD);
+        } else {
+            panic!("Expected RenderPassDepth for pass 2");
+        }
+
+        // Verify Scenario 3 has disabled depth write and compare Always
+        let pipeline_3 = packet_3
+            .commands()
+            .iter()
+            .find(|c| matches!(c, GpuCommand::CreatePipelineDepth { .. }))
+            .expect("pipeline in scenario 3");
+        if let GpuCommand::CreatePipelineDepth { depth_write_enabled, depth_compare, .. } = pipeline_3 {
+            assert!(!*depth_write_enabled);
+            assert_eq!(*depth_compare, DEPTH_COMPARE_ALWAYS);
+        } else {
+            panic!("Expected CreatePipelineDepth");
+        }
+
+        // Verify Scenario 4 has two passes, pass 2 read-only, and pipeline 101 depth_write_enabled=false
+        let pass_cmds_4: Vec<_> = packet_4
+            .commands()
+            .iter()
+            .filter(|c| matches!(c, GpuCommand::RenderPassDepth { .. }))
+            .collect();
+        assert_eq!(pass_cmds_4.len(), 2);
+        if let GpuCommand::RenderPassDepth { depth_read_only, pipeline_id, .. } = pass_cmds_4[1] {
+            assert!(*depth_read_only);
+            assert_eq!(*pipeline_id, 101);
+        } else {
+            panic!("Expected RenderPassDepth for pass 2 in scenario 4");
+        }
+        let pipeline_ro_4 = packet_4
+            .commands()
+            .iter()
+            .find(|c| matches!(c, GpuCommand::CreatePipelineDepth { pipeline_id: 101, .. }))
+            .expect("pipeline 101 in scenario 4");
+        if let GpuCommand::CreatePipelineDepth { depth_write_enabled, depth_compare, .. } = pipeline_ro_4 {
+            assert!(!*depth_write_enabled);
+            assert_eq!(*depth_compare, DEPTH_COMPARE_LESS);
+        } else {
+            panic!("Expected CreatePipelineDepth 101");
+        }
+
+        // Verify Scenario 5 has three passes: pass 1 draw, pass 2 zero-draw depth clear, pass 3 draw
+        let pass_cmds_5: Vec<_> = packet_5
+            .commands()
+            .iter()
+            .filter(|c| matches!(c, GpuCommand::RenderPassDepth { .. }))
+            .collect();
+        assert_eq!(pass_cmds_5.len(), 3);
+        if let GpuCommand::RenderPassDepth { vertex_count, depth_load_op, .. } = pass_cmds_5[0] {
+            assert_eq!(*vertex_count, 3);
+            assert_eq!(*depth_load_op, LOAD_OP_CLEAR);
+        }
+        if let GpuCommand::RenderPassDepth { vertex_count, load_op, depth_load_op, .. } = pass_cmds_5[1] {
+            assert_eq!(*vertex_count, 0);
+            assert_eq!(*load_op, LOAD_OP_LOAD);
+            assert_eq!(*depth_load_op, LOAD_OP_CLEAR);
+        }
+        if let GpuCommand::RenderPassDepth { vertex_count, load_op, depth_load_op, .. } = pass_cmds_5[2] {
+            assert_eq!(*vertex_count, 3);
+            assert_eq!(*load_op, LOAD_OP_LOAD);
+            assert_eq!(*depth_load_op, LOAD_OP_LOAD);
+        }
+
+        // Both canonical aliases return identical bytes across all scenarios
+        for s in 0..=5 {
+            let canon = f3d_build_overlapping_depth_packet(s);
+            let bridge = gpu_bridge_build_overlapping_depth_packet(s);
+            assert_eq!(canon, bridge);
         }
     }
 
