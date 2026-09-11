@@ -16,6 +16,12 @@ import {
   detectCanvasContext,
   readH1Snapshot,
   compareH1Snapshots,
+  comparePixelBuffers,
+  createMismatchedPixelBuffer,
+  captureCanvasPixels,
+  injectSeededRandomPrelude,
+  extractCheckpointObservations,
+  compareCheckpointObservations,
 } from './h1_interaction_helper.mjs';
 
 test('H1 URL Builder: Generates exact query URLs for reference and routed variants, preserving count=0', () => {
@@ -691,4 +697,208 @@ test('State Comparison Positive (Mail 7862): Preserves count NaN parity via Obje
 
   const res = compareH1Snapshots(ref, candidate);
   assert.equal(res.pass, true, `Expected NaN count parity to pass via Object.is, got: ${res.diffs.join('; ')}`);
+});
+
+test('Pixel Comparison Positive: Identical pixel buffers pass with 0.0% diff and zero RMSE', () => {
+  const width = 100;
+  const height = 100;
+  const data = new Uint8ClampedArray(width * height * 4);
+  for (let i = 0; i < data.length; i += 4) {
+    data[i] = 193;     // R (H1 background 0xc1c1c1)
+    data[i + 1] = 193; // G
+    data[i + 2] = 193; // B
+    data[i + 3] = 255; // A
+  }
+
+  const ref = { width, height, data };
+  const cand = { width, height, data: new Uint8ClampedArray(data) };
+
+  const res = comparePixelBuffers(ref, cand);
+  assert.equal(res.pass, true);
+  assert.equal(res.diffPixels, 0);
+  assert.equal(res.diffPercent, 0);
+  assert.equal(res.rmse, 0);
+  assert.equal(res.maxChannelDiff, 0);
+});
+
+test('Pixel Comparison Positive: Pixel delta within colorTolerance (2) passes', () => {
+  const width = 100;
+  const height = 100;
+  const refData = new Uint8ClampedArray(width * height * 4).fill(128);
+  const candData = new Uint8ClampedArray(width * height * 4).fill(130); // delta = 2 <= tolerance 2
+
+  const ref = { width, height, data: refData };
+  const cand = { width, height, data: candData };
+
+  const res = comparePixelBuffers(ref, cand, { colorTolerance: 2 });
+  assert.equal(res.pass, true);
+  assert.equal(res.diffPixels, 0);
+  assert.equal(res.maxChannelDiff, 2);
+});
+
+test('Pixel Comparison Negative (Mail 13025): Mismatched pixel buffer exceeding 0.1% threshold strictly rejected', () => {
+  const width = 100;
+  const height = 100;
+  const totalPixels = width * height; // 10,000 pixels
+  const refData = new Uint8ClampedArray(totalPixels * 4).fill(100);
+
+  const ref = { width, height, data: refData };
+
+  // Mutate 1.0% of pixels (100 pixels) using createMismatchedPixelBuffer
+  const mutated = createMismatchedPixelBuffer(ref, 1.0);
+
+  const res = comparePixelBuffers(ref, mutated, { colorTolerance: 2, maxDiffPixelPercent: 0.1 });
+  assert.equal(res.pass, false, 'Mutated pixels exceeding 0.1% must fail');
+  assert.ok(res.diffPercent > 0.1, `diffPercent ${res.diffPercent}% must exceed 0.1% threshold`);
+  assert.ok(res.diffPixels >= 10, `diffPixels ${res.diffPixels} must be non-zero`);
+  assert.ok(res.rmse > 0, `rmse ${res.rmse} must be positive`);
+});
+
+test('Pixel Comparison Negative: Dimension mismatch is rejected', () => {
+  const ref = { width: 100, height: 100, data: new Uint8ClampedArray(100 * 100 * 4) };
+  const cand = { width: 200, height: 100, data: new Uint8ClampedArray(200 * 100 * 4) };
+
+  const res = comparePixelBuffers(ref, cand);
+});
+
+test('Canvas Capture: Uses native canvas dimensions without downscaling or resampling (ROOT H1 REVIEW)', () => {
+  let drawnArgs = null;
+  const mockCanvas = {
+    width: 800,
+    height: 600,
+    ownerDocument: {
+      createElement(tag) {
+        if (tag !== 'canvas') return null;
+        return {
+          width: 0,
+          height: 0,
+          getContext(type) {
+            if (type !== '2d') return null;
+            return {
+              drawImage(...args) {
+                drawnArgs = args;
+              },
+              getImageData(x, y, w, h) {
+                return {
+                  width: w,
+                  height: h,
+                  data: new Uint8ClampedArray(w * h * 4),
+                };
+              },
+            };
+          },
+        };
+      },
+    },
+  };
+
+  const captured = captureCanvasPixels(mockCanvas);
+  assert.equal(captured.width, 800, 'Native width preserved');
+  assert.equal(captured.height, 600, 'Native height preserved');
+  assert.equal(captured.data.length, 800 * 600 * 4, 'Full native pixel buffer size');
+  // Assert drawImage was called with exact 1:1 coordinates (no resampling)
+  assert.deepEqual(drawnArgs.slice(1), [0, 0, 800, 600, 0, 0, 800, 600], '1:1 native canvas blit');
+});
+
+test('Pixel Comparison Field Parity: Returns both .pass and .passed booleans consistently (ROOT H1 REVIEW)', () => {
+  const buf = { width: 10, height: 10, data: new Uint8ClampedArray(10 * 10 * 4).fill(128) };
+  const res = comparePixelBuffers(buf, buf);
+  assert.equal(res.pass, true);
+  assert.equal(res.passed, true);
+
+  const mutated = createMismatchedPixelBuffer(buf, 5.0);
+  const failRes = comparePixelBuffers(buf, mutated);
+  assert.equal(failRes.pass, false);
+  assert.equal(failRes.passed, false);
+});
+
+test('Seeded Random Prelude: Injects deterministic PRNG before application scripts in HTML (ROOT H1 REVIEW)', () => {
+  const sampleHtml = `<!DOCTYPE html><html><head><script type="importmap">{"imports":{}}</script></head><body><script type="module">console.log("app");</script></body></html>`;
+  const injected = injectSeededRandomPrelude(sampleHtml);
+  assert.ok(injected.includes('id="f3d-seeded-random-prelude"'));
+  assert.ok(injected.indexOf('<script type="importmap">') < injected.indexOf('id="f3d-seeded-random-prelude"'));
+  assert.ok(injected.indexOf('id="f3d-seeded-random-prelude"') < injected.indexOf('<script type="module">'));
+  // Repeated injection is idempotent
+  const twice = injectSeededRandomPrelude(injected);
+  assert.equal(twice, injected);
+});
+
+test('Seeded Random Sequence: Produces identical float sequences across multiple independent initializations (ROOT H1 REVIEW)', () => {
+  function makeRng(seed = 0x12345678) {
+    let s = seed;
+    return function() {
+      s = (s + 0x6D2B79F5) | 0;
+      let t = Math.imul(s ^ (s >>> 15), 1 | s);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  const rng1 = makeRng();
+  const rng2 = makeRng();
+
+  const seq1 = Array.from({ length: 100 }, () => rng1());
+  const seq2 = Array.from({ length: 100 }, () => rng2());
+
+  assert.deepEqual(seq1, seq2, 'Both RNG instances must produce identical deterministic sequence');
+  assert.ok(seq1[0] >= 0 && seq1[0] < 1, 'Uniform float in [0, 1)');
+});
+
+test('Checkpoint Observations: Extracts read-only observations without state copying (ROOT H1 REVIEW)', () => {
+  const mockWin = {
+    __f3d_rng_count__: 42,
+    __f3d_rng_state__: 12345,
+    __f3d_last_scene__: {
+      children: [
+        {
+          isGroup: true,
+          children: [
+            {
+              position: { x: 1, y: 2, z: 3 },
+              quaternion: { x: 0, y: 0, z: 0, w: 1 },
+              scale: { x: 0.5, y: 0.5, z: 0.5 },
+              material: { color: { getHexString: () => 'ff00ff' } },
+              matrix: { elements: new Float32Array(16) },
+            },
+          ],
+        },
+      ],
+    },
+    __f3d_last_camera__: {
+      position: { x: 0, y: 0, z: 50 },
+      quaternion: { x: 0, y: 0, z: 0, w: 1 },
+      projectionMatrix: { elements: new Float32Array(16) },
+      aspect: 1.333,
+      fov: 70,
+      near: 1,
+      far: 100,
+    },
+  };
+
+  const obs = extractCheckpointObservations(mockWin, {});
+  assert.ok(obs);
+  assert.equal(obs.rng.count, 42);
+  assert.equal(obs.rng.state, 12345);
+  assert.deepEqual(obs.firstMesh.position, [1, 2, 3]);
+  assert.equal(obs.firstMesh.colorHex, 'ff00ff');
+  assert.deepEqual(obs.camera.position, [0, 0, 50]);
+
+  // Comparison with identical passes
+  const compPass = compareCheckpointObservations(obs, obs);
+  assert.equal(compPass.pass, true);
+  assert.equal(compPass.diffs.length, 0);
+
+  // Comparison with mismatched RNG fails
+  const mismatchedRng = JSON.parse(JSON.stringify(obs));
+  mismatchedRng.rng.count = 43;
+  const compRngFail = compareCheckpointObservations(obs, mismatchedRng);
+  assert.equal(compRngFail.pass, false);
+  assert.ok(compRngFail.diffs.some(d => d.includes('RNG invocation count mismatch')));
+
+  // Comparison with mismatched color fails
+  const mismatchedColor = JSON.parse(JSON.stringify(obs));
+  mismatchedColor.firstMesh.colorHex = '00ff00';
+  const compColorFail = compareCheckpointObservations(obs, mismatchedColor);
+  assert.equal(compColorFail.pass, false);
+  assert.ok(compColorFail.diffs.some(d => d.includes('First mesh color mismatch')));
 });

@@ -8,6 +8,7 @@ import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { startDevServer } from '../../../tools/compat-facade/dev_server.mjs';
+import { injectSeededRandomPrelude } from './h1_interaction_helper.mjs';
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, '../../..');
@@ -63,9 +64,87 @@ devServer = await startDevServer({
 const defaultHandler = devServer.server.listeners('request')[0];
 devServer.server.removeAllListeners('request');
 
-// Wrap dev server listener with /report endpoint seam
+// Wrap dev server listener with /report endpoint seam and deterministic H1 response wrapper
 devServer.server.on('request', (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || '127.0.0.1'}`);
+
+  const isH1Page = url.pathname === '/examples/webgpu_performance_renderbundle.html' ||
+                   url.pathname === '/webgpu_performance_renderbundle.html' ||
+                   url.pathname === '/upstream/three.js/examples/webgpu_performance_renderbundle.html';
+
+  if (isH1Page) {
+    const origWriteHead = res.writeHead.bind(res);
+    const origWrite = res.write.bind(res);
+    const origEnd = res.end.bind(res);
+    const chunks = [];
+    let savedStatusCode = 200;
+    let savedStatusMessage = undefined;
+
+    res.writeHead = function (statusCode, ...args) {
+      savedStatusCode = statusCode;
+      for (const arg of args) {
+        if (typeof arg === 'string') {
+          savedStatusMessage = arg;
+        } else if (arg && typeof arg === 'object' && !Array.isArray(arg)) {
+          for (const [k, v] of Object.entries(arg)) {
+            res.setHeader(k, v);
+          }
+        }
+      }
+      return res;
+    };
+
+    res.write = function (chunk, ...args) {
+      if (chunk) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      return true;
+    };
+
+    res.end = function (chunk, ...args) {
+      if (typeof chunk === 'function') {
+        chunk = null;
+      }
+      if (chunk) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+
+      const finalStatusCode = savedStatusCode || res.statusCode || 200;
+      const finalStatusMessage = savedStatusMessage || res.statusMessage;
+
+      // Restore original methods on res to avoid any proxy recursion
+      res.writeHead = origWriteHead;
+      res.write = origWrite;
+      res.end = origEnd;
+
+      if (req.method === 'HEAD') {
+        if (finalStatusMessage) {
+          origWriteHead(finalStatusCode, finalStatusMessage);
+        } else {
+          origWriteHead(finalStatusCode);
+        }
+        return origEnd();
+      }
+
+      const fullBuffer = Buffer.concat(chunks);
+      let html = fullBuffer.toString('utf-8');
+
+      if (finalStatusCode >= 200 && finalStatusCode < 300) {
+        html = injectSeededRandomPrelude(html);
+      }
+      const outBuf = Buffer.from(html, 'utf-8');
+
+      try { res.removeHeader('transfer-encoding'); } catch (_) {}
+      res.setHeader('content-length', outBuf.length);
+
+      if (finalStatusMessage) {
+        origWriteHead(finalStatusCode, finalStatusMessage);
+      } else {
+        origWriteHead(finalStatusCode);
+      }
+
+      return origEnd(outBuf);
+    };
+
+    defaultHandler(req, res);
+    return;
+  }
 
   if (url.pathname === '/report') {
     if (req.method === 'OPTIONS') {
@@ -122,6 +201,8 @@ devServer.server.on('request', (req, res) => {
                   interactions: v.interactionCheckpoints,
                   sceneCamera: v.sceneCameraObservations,
                   negatives: v.negativeControls?.allRejected,
+                  imageComparison: v.imageComparison?.passed ? `PASS (diff=${(v.imageComparison?.diffPercent || 0).toFixed(4)}%, rmse=${(v.imageComparison?.rmse || 0).toFixed(4)})` : 'FAIL',
+                  imageNegativeRejected: v.imageNegativeRejected,
                 },
               ])
             ),
@@ -292,10 +373,39 @@ devServer.server.on('request', (req, res) => {
             }
           }
 
-          // Image checkpoint honesty assertion
-          if (!payload.imageCheckpoint || payload.imageCheckpoint.status !== 'open-until-measured') {
-            assertionErrors.push(`Image checkpoint status must be 'open-until-measured' (got: '${payload.imageCheckpoint?.status}')`);
+          // Image checkpoint assertion (Plan §6 / line 1227; Mail #13025)
+          if (!payload.imageCheckpoint || payload.imageCheckpoint.status !== 'passed') {
+            assertionErrors.push(`Image checkpoint status must be 'passed' (got: '${payload.imageCheckpoint?.status}')`);
             assertionsPassed = false;
+          }
+
+          for (const key of ['webgpu', 'webgl']) {
+            const branch = payload.branches?.[key];
+            if (branch && branch.passed) {
+              if (!branch.imageComparison) {
+                assertionErrors.push(`Branch '${key}': missing imageComparison in report payload`);
+                assertionsPassed = false;
+              } else {
+                const passed = Boolean(branch.imageComparison.pass || branch.imageComparison.passed);
+                if (!passed) {
+                  assertionErrors.push(`Branch '${key}': image pixel comparison failed (diffPercent=${branch.imageComparison.diffPercent?.toFixed(4)}% > ${branch.imageComparison.maxDiffPixelPercent}%, diffPixels=${branch.imageComparison.diffPixels}/${branch.imageComparison.totalPixels})`);
+                  assertionsPassed = false;
+                }
+                if (branch.imageComparison.diffPercent > 0.1) {
+                  assertionErrors.push(`Branch '${key}': image pixel difference ${branch.imageComparison.diffPercent}% exceeds Plan §6 limit of 0.1%`);
+                  assertionsPassed = false;
+                }
+                if (branch.imageComparison.colorTolerance !== 2) {
+                  assertionErrors.push(`Branch '${key}': colorTolerance must be 2 (got: ${branch.imageComparison.colorTolerance})`);
+                  assertionsPassed = false;
+                }
+              }
+
+              if (!branch.imageNegativeRejected) {
+                assertionErrors.push(`Branch '${key}': mismatched-pixel negative control failed (corrupted pixel buffer was not rejected)`);
+                assertionsPassed = false;
+              }
+            }
           }
 
           if (assertionsPassed && assertionErrors.length === 0) {
@@ -355,6 +465,16 @@ if (browserProcess) {
     console.error(`[h1-test-harness] Failed to spawn ${browser}:`, err);
     shutdown(1);
   });
+  if (browserProcess.stdout) {
+    browserProcess.stdout.on('data', chunk => {
+      process.stdout.write(`[browser-stdout] ${chunk}`);
+    });
+  }
+  if (browserProcess.stderr) {
+    browserProcess.stderr.on('data', chunk => {
+      process.stderr.write(`[browser-stderr] ${chunk}`);
+    });
+  }
 }
 
 // Global timeout: 120s for multi-checkpoint reference-vs-candidate sequence

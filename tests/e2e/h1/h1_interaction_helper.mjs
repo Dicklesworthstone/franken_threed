@@ -480,3 +480,382 @@ export function compareH1Snapshots(reference, candidate) {
     },
   };
 }
+
+/**
+ * Compares two pixel buffers asserting exact dimensions, calculating per-channel delta,
+ * diff pixel percentage, RMSE, and enforcing Plan §6 (line 1227) 0.1% different-pixel limit.
+ *
+ * @param {Object} refPixels Reference pixel buffer { width, height, data }
+ * @param {Object} candPixels Candidate pixel buffer { width, height, data }
+ * @param {Object} [options]
+ * @param {number} [options.colorTolerance=2] Maximum allowed per-channel delta before pixel is counted as different
+ * @param {number} [options.maxDiffPixelPercent=0.1] Maximum allowed percentage of different pixels (Plan §6 / line 1227)
+ * @returns {{
+ *   pass: boolean,
+ *   totalPixels: number,
+ *   diffPixels: number,
+ *   diffPercent: number,
+ *   maxChannelDiff: number,
+ *   rmse: number,
+ *   colorTolerance: number,
+ *   maxDiffPixelPercent: number,
+ *   error?: string
+ * }}
+ */
+export function comparePixelBuffers(refPixels, candPixels, {
+  colorTolerance = 2,
+  maxDiffPixelPercent = 0.1,
+} = {}) {
+  if (!refPixels || !candPixels || !refPixels.data || !candPixels.data) {
+    return {
+      pass: false,
+      passed: false,
+      totalPixels: 0,
+      diffPixels: 0,
+      diffPercent: 100,
+      maxChannelDiff: 255,
+      rmse: 255,
+      colorTolerance,
+      maxDiffPixelPercent,
+      error: 'Missing or invalid pixel buffer data',
+    };
+  }
+
+  if (refPixels.width !== candPixels.width || refPixels.height !== candPixels.height) {
+    return {
+      pass: false,
+      passed: false,
+      totalPixels: 0,
+      diffPixels: 0,
+      diffPercent: 100,
+      maxChannelDiff: 255,
+      rmse: 255,
+      colorTolerance,
+      maxDiffPixelPercent,
+      error: `Dimension mismatch: reference ${refPixels.width}x${refPixels.height} vs candidate ${candPixels.width}x${candPixels.height}`,
+    };
+  }
+
+  const totalPixels = refPixels.width * refPixels.height;
+  const len = totalPixels * 4;
+  if (refPixels.data.length < len || candPixels.data.length < len) {
+    return {
+      pass: false,
+      passed: false,
+      totalPixels,
+      diffPixels: totalPixels,
+      diffPercent: 100,
+      maxChannelDiff: 255,
+      rmse: 255,
+      colorTolerance,
+      maxDiffPixelPercent,
+      error: `Pixel byte array length insufficient for ${refPixels.width}x${refPixels.height}`,
+    };
+  }
+
+  let diffPixels = 0;
+  let maxChannelDiff = 0;
+  let sumSquaredDiff = 0;
+
+  for (let i = 0; i < len; i += 4) {
+    const dr = Math.abs(refPixels.data[i] - candPixels.data[i]);
+    const dg = Math.abs(refPixels.data[i + 1] - candPixels.data[i + 1]);
+    const db = Math.abs(refPixels.data[i + 2] - candPixels.data[i + 2]);
+    const da = Math.abs(refPixels.data[i + 3] - candPixels.data[i + 3]);
+
+    const pixelDiff = Math.max(dr, dg, db, da);
+    if (pixelDiff > maxChannelDiff) maxChannelDiff = pixelDiff;
+    sumSquaredDiff += (dr * dr + dg * dg + db * db) / 3;
+
+    if (dr > colorTolerance || dg > colorTolerance || db > colorTolerance || da > colorTolerance) {
+      diffPixels++;
+    }
+  }
+
+  const diffPercent = (diffPixels / totalPixels) * 100;
+  const rmse = Math.sqrt(sumSquaredDiff / totalPixels);
+  const pass = diffPercent <= maxDiffPixelPercent;
+
+  return {
+    pass,
+    passed: pass,
+    totalPixels,
+    diffPixels,
+    diffPercent,
+    maxChannelDiff,
+    rmse,
+    colorTolerance,
+    maxDiffPixelPercent,
+  };
+}
+
+/**
+ * Creates a deliberately mutated copy of a pixel buffer for strict negative testing (Mail #13025).
+ * Mutates a block of pixels exceeding the 0.1% threshold to verify rejection.
+ *
+ * @param {Object} pixelBuffer { width, height, data }
+ * @param {number} [mutatePercent=1.0] Percentage of pixels to mutate (must exceed 0.1%)
+ * @returns {{ width: number, height: number, data: Uint8ClampedArray }}
+ */
+export function createMismatchedPixelBuffer(pixelBuffer, mutatePercent = 1.0) {
+  const width = pixelBuffer.width || 400;
+  const height = pixelBuffer.height || 300;
+  const copy = new Uint8ClampedArray(pixelBuffer.data);
+  const totalPixels = width * height;
+  const pixelsToMutate = Math.max(10, Math.ceil((totalPixels * mutatePercent) / 100));
+
+  for (let p = 0; p < pixelsToMutate; p++) {
+    const idx = p * 4;
+    if (idx + 3 < copy.length) {
+      // Invert color channels and set full alpha to guarantee mismatch
+      copy[idx] = 255 - copy[idx];
+      copy[idx + 1] = 255 - copy[idx + 1];
+      copy[idx + 2] = 255 - copy[idx + 2];
+      copy[idx + 3] = 255;
+    }
+  }
+
+  return {
+    width,
+    height,
+    data: copy,
+  };
+}
+
+/**
+ * Captures pixel buffer from an active HTMLCanvasElement at actual native dimensions.
+ * Avoids any downscaling or image resampling to pass thresholds (ROOT H1 REVIEW).
+ *
+ * @param {HTMLCanvasElement} canvas Source canvas
+ * @param {number} [targetWidth] Optional explicit width override (defaults to native canvas.width)
+ * @param {number} [targetHeight] Optional explicit height override (defaults to native canvas.height)
+ * @returns {{ width: number, height: number, data: Uint8ClampedArray }}
+ */
+export function captureCanvasPixels(canvas, targetWidth, targetHeight) {
+  if (!canvas) throw new Error('Canvas element is required for pixel capture');
+
+  const doc = canvas.ownerDocument || (typeof document !== 'undefined' ? document : null);
+  if (!doc || typeof doc.createElement !== 'function') {
+    throw new Error('Document environment required for canvas pixel capture');
+  }
+
+  // Use actual native canvas dimensions by default; no downscaling or resampling (ROOT H1 REVIEW)
+  const width = targetWidth || canvas.width || 800;
+  const height = targetHeight || canvas.height || 600;
+
+  const offscreen = doc.createElement('canvas');
+  offscreen.width = width;
+  offscreen.height = height;
+  const ctx = offscreen.getContext('2d', { willReadFrequently: true });
+  if (!ctx) throw new Error('Failed to acquire 2D rendering context for canvas readback');
+
+  // Direct 1:1 pixel copy at native resolution
+  ctx.drawImage(canvas, 0, 0, width, height, 0, 0, width, height);
+
+  const imgData = ctx.getImageData(0, 0, width, height);
+  return {
+    width,
+    height,
+    data: imgData.data,
+  };
+}
+
+
+/**
+ * Deterministic pseudo-random sequence prelude for matched H1 testing (ROOT H1 REVIEW).
+ * Overrides Math.random before application scripts run to ensure identical geometry,
+ * transforms, and material colors across reference and candidate runs.
+ * Exposes seed reset callback and read-only invocation counter.
+ */
+export const SEEDED_RANDOM_PRELUDE = `
+<script id="f3d-seeded-random-prelude">
+// Deterministic pseudo-random sequence for matched H1 testing (ROOT H1 REVIEW)
+(function() {
+  const INITIAL_SEED = 0x12345678;
+  let s = INITIAL_SEED;
+  let count = 0;
+  function seededRandom() {
+    count++;
+    s = (s + 0x6D2B79F5) | 0;
+    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  }
+  Math.random = seededRandom;
+  if (typeof window !== 'undefined') {
+    Object.defineProperty(window, '__f3d_rng_count__', {
+      get: () => count,
+      configurable: true,
+    });
+    Object.defineProperty(window, '__f3d_rng_state__', {
+      get: () => s,
+      configurable: true,
+    });
+  }
+})();
+</script>
+`;
+
+/**
+ * Injects the seeded Math.random prelude before application scripts in HTML.
+ *
+ * @param {string} html Target HTML source
+ * @returns {string} Injected HTML
+ */
+export function injectSeededRandomPrelude(html) {
+  if (typeof html !== 'string') return html;
+  if (html.includes('id="f3d-seeded-random-prelude"')) return html;
+
+  const importMapIndex = html.indexOf('<script type="importmap">');
+  if (importMapIndex !== -1) {
+    const endTag = '</script>';
+    const closeIndex = html.indexOf(endTag, importMapIndex);
+    if (closeIndex !== -1) {
+      const insertPos = closeIndex + endTag.length;
+      return html.slice(0, insertPos) + '\n\t\t' + SEEDED_RANDOM_PRELUDE + html.slice(insertPos);
+    }
+  }
+  if (html.includes('<script type="module">')) {
+    return html.replace('<script type="module">', `${SEEDED_RANDOM_PRELUDE}\n\t\t<script type="module">`);
+  }
+  if (html.includes('<script')) {
+    return html.replace('<script', `${SEEDED_RANDOM_PRELUDE}\n\t\t<script`);
+  }
+  if (html.includes('</head>')) {
+    return html.replace('</head>', `${SEEDED_RANDOM_PRELUDE}\n</head>`);
+  }
+  return `${SEEDED_RANDOM_PRELUDE}\n${html}`;
+}
+
+/**
+ * Extracts read-only checkpoint observations (first mesh transform, color, camera/projection, RNG count).
+ * NEVER copies or mutates state (ROOT H1 REVIEW).
+ *
+ * @param {Window} win
+ * @param {Document} doc
+ * @returns {Object|null}
+ */
+export function extractCheckpointObservations(win, doc) {
+  if (!win) return null;
+  const scene = win.__f3d_last_scene__;
+  const camera = win.__f3d_last_camera__;
+  const group = scene && scene.children ? scene.children.find(c => c.isGroup || c.isBundleGroup) : null;
+  const firstMesh = group && group.children ? group.children[0] : null;
+
+  let firstMeshObs = null;
+  if (firstMesh) {
+    firstMeshObs = {
+      position: firstMesh.position ? [firstMesh.position.x, firstMesh.position.y, firstMesh.position.z] : null,
+      quaternion: firstMesh.quaternion ? [firstMesh.quaternion.x, firstMesh.quaternion.y, firstMesh.quaternion.z, firstMesh.quaternion.w] : null,
+      scale: firstMesh.scale ? [firstMesh.scale.x, firstMesh.scale.y, firstMesh.scale.z] : null,
+      colorHex: firstMesh.material && firstMesh.material.color && typeof firstMesh.material.color.getHexString === 'function'
+        ? firstMesh.material.color.getHexString()
+        : null,
+      matrix: firstMesh.matrix && firstMesh.matrix.elements ? Array.from(firstMesh.matrix.elements) : null,
+    };
+  }
+
+  let cameraObs = null;
+  if (camera) {
+    cameraObs = {
+      position: camera.position ? [camera.position.x, camera.position.y, camera.position.z] : null,
+      quaternion: camera.quaternion ? [camera.quaternion.x, camera.quaternion.y, camera.quaternion.z, camera.quaternion.w] : null,
+      projectionMatrix: camera.projectionMatrix && camera.projectionMatrix.elements ? Array.from(camera.projectionMatrix.elements) : null,
+      aspect: camera.aspect !== undefined ? camera.aspect : null,
+      fov: camera.fov !== undefined ? camera.fov : null,
+      near: camera.near !== undefined ? camera.near : null,
+      far: camera.far !== undefined ? camera.far : null,
+    };
+  }
+
+  const rngCount = typeof win.__f3d_rng_count__ === 'number' ? win.__f3d_rng_count__ : null;
+  const rngState = typeof win.__f3d_rng_state__ === 'number' ? win.__f3d_rng_state__ : null;
+
+  return {
+    firstMesh: firstMeshObs,
+    camera: cameraObs,
+    rng: {
+      count: rngCount,
+      state: rngState,
+    },
+  };
+}
+
+/**
+ * Compares read-only checkpoint observations between reference and candidate without copying (ROOT H1 REVIEW).
+ *
+ * @param {Object} refObs Reference observations
+ * @param {Object} candObs Candidate observations
+ * @returns {{ pass: boolean, diffs: string[] }}
+ */
+export function compareCheckpointObservations(refObs, candObs) {
+  const diffs = [];
+  if (!refObs || !candObs) {
+    diffs.push('Missing checkpoint observations (ref or cand null)');
+    return { pass: false, diffs };
+  }
+
+  // 1. RNG invocation count & state agreement
+  if (refObs.rng && candObs.rng) {
+    if (refObs.rng.count !== candObs.rng.count) {
+      diffs.push(`RNG invocation count mismatch: ref=${refObs.rng.count} vs cand=${candObs.rng.count}`);
+    }
+    if (refObs.rng.state !== candObs.rng.state) {
+      diffs.push(`RNG state mismatch: ref=${refObs.rng.state} vs cand=${candObs.rng.state}`);
+    }
+  }
+
+  // 2. First mesh transform and material color
+  if (refObs.firstMesh && candObs.firstMesh) {
+    if (refObs.firstMesh.colorHex !== candObs.firstMesh.colorHex) {
+      diffs.push(`First mesh color mismatch: ref=${refObs.firstMesh.colorHex} vs cand=${candObs.firstMesh.colorHex}`);
+    }
+    if (refObs.firstMesh.position && candObs.firstMesh.position) {
+      for (let i = 0; i < 3; i++) {
+        if (Math.abs(refObs.firstMesh.position[i] - candObs.firstMesh.position[i]) > 1e-4) {
+          diffs.push(`First mesh position[${i}] mismatch: ref=${refObs.firstMesh.position[i].toFixed(4)} vs cand=${candObs.firstMesh.position[i].toFixed(4)}`);
+        }
+      }
+    }
+    if (refObs.firstMesh.scale && candObs.firstMesh.scale) {
+      for (let i = 0; i < 3; i++) {
+        if (Math.abs(refObs.firstMesh.scale[i] - candObs.firstMesh.scale[i]) > 1e-4) {
+          diffs.push(`First mesh scale[${i}] mismatch: ref=${refObs.firstMesh.scale[i].toFixed(4)} vs cand=${candObs.firstMesh.scale[i].toFixed(4)}`);
+        }
+      }
+    }
+    if (refObs.firstMesh.quaternion && candObs.firstMesh.quaternion) {
+      for (let i = 0; i < 4; i++) {
+        if (Math.abs(refObs.firstMesh.quaternion[i] - candObs.firstMesh.quaternion[i]) > 1e-4) {
+          diffs.push(`First mesh quaternion[${i}] mismatch: ref=${refObs.firstMesh.quaternion[i].toFixed(4)} vs cand=${candObs.firstMesh.quaternion[i].toFixed(4)}`);
+        }
+      }
+    }
+  } else {
+    diffs.push('First mesh observation missing in reference or candidate');
+  }
+
+  // 3. Camera projection matrix and parameters
+  if (refObs.camera && candObs.camera) {
+    if (refObs.camera.aspect !== null && candObs.camera.aspect !== null) {
+      if (Math.abs(refObs.camera.aspect - candObs.camera.aspect) > 1e-4) {
+        diffs.push(`Camera aspect mismatch: ref=${refObs.camera.aspect} vs cand=${candObs.camera.aspect}`);
+      }
+    }
+    if (refObs.camera.projectionMatrix && candObs.camera.projectionMatrix) {
+      for (let i = 0; i < 16; i++) {
+        if (Math.abs(refObs.camera.projectionMatrix[i] - candObs.camera.projectionMatrix[i]) > 1e-4) {
+          diffs.push(`Camera projectionMatrix[${i}] mismatch: ref=${refObs.camera.projectionMatrix[i].toFixed(4)} vs cand=${candObs.camera.projectionMatrix[i].toFixed(4)}`);
+          break;
+        }
+      }
+    }
+  } else {
+    diffs.push('Camera observation missing in reference or candidate');
+  }
+
+  return {
+    pass: diffs.length === 0,
+    diffs,
+  };
+}

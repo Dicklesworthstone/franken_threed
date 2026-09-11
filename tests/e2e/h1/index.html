@@ -158,8 +158,9 @@
       color: var(--text-muted);
     }
     iframe {
-      width: 100%;
-      height: 420px;
+      width: 800px;
+      height: 600px;
+      max-width: 100%;
       border: 1px solid var(--border);
       border-radius: 6px;
       background: #000;
@@ -261,9 +262,38 @@
 
     <div class="frame-container">
       <div class="frame-header">Target Application Frame (Same Origin)</div>
-      <iframe id="h1-frame"></iframe>
+      <iframe id="h1-frame" width="800" height="600"></iframe>
     </div>
   </div>
+
+  <script>
+    window.addEventListener('error', (event) => {
+      console.error('[H1-FATAL-ERROR]', event.message, event.filename, event.lineno, event.error);
+      fetch('/report', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          browser: navigator.userAgent,
+          passed: false,
+          errors: [`Uncaught window error: ${event.message} at ${event.filename}:${event.lineno}`],
+          branches: {},
+        }),
+      }).catch(() => {});
+    });
+    window.addEventListener('unhandledrejection', (event) => {
+      console.error('[H1-FATAL-REJECTION]', event.reason);
+      fetch('/report', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          browser: navigator.userAgent,
+          passed: false,
+          errors: [`Unhandled promise rejection: ${event.reason?.message || event.reason}`],
+          branches: {},
+        }),
+      }).catch(() => {});
+    });
+  </script>
 
   <script type="module">
     import {
@@ -271,7 +301,14 @@
       findInspectorControl,
       toggleInspectorControl,
       compareH1Snapshots,
+      comparePixelBuffers,
+      createMismatchedPixelBuffer,
+      captureCanvasPixels,
+      extractCheckpointObservations,
+      compareCheckpointObservations,
     } from './h1_interaction_helper.mjs';
+
+    const FIXED_CHECKPOINT_CAMERA = Object.freeze({ position: [0, 0, 50], quaternion: [0, 0, 0, 1] });
 
     function addLog(branchKey, text, kind = 'info') {
       const container = document.getElementById('log-' + branchKey);
@@ -352,6 +389,17 @@
           const origRender = proto.render;
           window.__f3d_render_observations__ = [];
           proto.render = function(scene, camera) {
+            window.__f3d_last_scene__ = scene;
+            window.__f3d_last_camera__ = camera;
+            window.__f3d_last_renderer__ = this;
+            if (window.__f3d_frozen_camera_state__) {
+              try {
+                const cs = window.__f3d_frozen_camera_state__;
+                camera.position.set(cs.position[0], cs.position[1], cs.position[2]);
+                camera.quaternion.set(cs.quaternion[0], cs.quaternion[1], cs.quaternion[2], cs.quaternion[3]);
+                camera.updateMatrixWorld(true);
+              } catch (_) {}
+            }
             const res = origRender.call(this, scene, camera);
             try {
               const group = scene && scene.children && scene.children.find(c => c.isGroup || c.isBundleGroup);
@@ -716,6 +764,31 @@
       const refInitialY = refStaticSample.endCameraY;
       addLog(branchKey, `Reference static baseline: meshDelta=${refStaticSample.meshDelta.toFixed(6)}, instDelta=${refStaticSample.instanceDelta.toFixed(6)}, camYDelta=${refStaticSample.cameraYDelta.toFixed(6)}, groupStatic=${refStaticSample.groupStaticEnd} (ASSERTION PASSED)`, 'ok');
 
+      // Checkpoint 0: Capture Reference static image checkpoint at explicit fixed camera input (Plan §6 / line 1227; ROOT H1 REVIEW)
+      addLog(branchKey, `Capturing reference static image checkpoint at explicit fixed camera input...`, 'info');
+      const refScene = refSettle.win.__f3d_last_scene__;
+      const refCamera = refSettle.win.__f3d_last_camera__;
+      const refRenderer = refSettle.win.__f3d_last_renderer__;
+      const refCanvas = refSettle.doc.querySelector('canvas');
+      if (!refScene || !refCamera || !refCanvas) {
+        throw new Error('Reference scene, camera, or canvas not available for image capture');
+      }
+
+      // Extract read-only reference checkpoint observations (first mesh transform, color, camera/projection, RNG count; ROOT H1 REVIEW)
+      const refCheckpointObs = extractCheckpointObservations(refSettle.win, refSettle.doc);
+      if (refCheckpointObs && refCheckpointObs.rng) {
+        addLog(branchKey, `Reference observations: RNG count=${refCheckpointObs.rng.count}, firstMesh color=#${refCheckpointObs.firstMesh?.colorHex || 'none'}`, 'info');
+      }
+
+      // Explicit fixed camera input: identical in both runs (ROOT H1 REVIEW)
+      refSettle.win.__f3d_frozen_camera_state__ = FIXED_CHECKPOINT_CAMERA;
+      if (refRenderer && typeof refRenderer.render === 'function') {
+        refRenderer.render(refScene, refCamera);
+      }
+      const refPixels = captureCanvasPixels(refCanvas);
+      refSettle.win.__f3d_frozen_camera_state__ = null;
+      addLog(branchKey, `Reference image captured: ${refPixels.width}x${refPixels.height} native (${refPixels.data.length} bytes)`, 'ok');
+
       // Checkpoint 1: Dynamic toggle on Reference (strictly fail if toggle fails - no bypass)
       addLog(branchKey, `[3/8] Toggling dynamic control on reference...`, 'info');
       const refToggleDynamicRes = toggleInspectorControl(refSettle.doc, 'dynamic');
@@ -738,7 +811,6 @@
 
       // Checkpoint 2: OrbitControls pointer drag on Reference & camera elevation observation
       addLog(branchKey, `[4/8] Dispatched OrbitControls vertical pointer drag on reference canvas...`, 'info');
-      const refCanvas = refSettle.doc.querySelector('canvas');
       const refDragDispatched = dispatchOrbitPointerDrag(refCanvas, { dx: 80, dy: 60 });
       if (!refDragDispatched) {
         throw new Error('Reference canvas pointer drag dispatch failed');
@@ -810,6 +882,63 @@
       const candInitialY = candStaticSample.endCameraY;
       addLog(branchKey, `Candidate static baseline: meshDelta=${candStaticSample.meshDelta.toFixed(6)}, instDelta=${candStaticSample.instanceDelta.toFixed(6)}, camYDelta=${candStaticSample.cameraYDelta.toFixed(6)}, groupStatic=${candStaticSample.groupStaticEnd} (ASSERTION PASSED)`, 'ok');
 
+      // Checkpoint 0: Capture Candidate static image checkpoint at identical explicit fixed camera input (Plan §6 / line 1227; ROOT H1 REVIEW)
+      addLog(branchKey, `Capturing candidate static image checkpoint at explicit fixed camera input...`, 'info');
+      const candScene = candSettle.win.__f3d_last_scene__;
+      const candCamera = candSettle.win.__f3d_last_camera__;
+      const candRenderer = candSettle.win.__f3d_last_renderer__;
+      const candCanvas = candSettle.doc.querySelector('canvas');
+      if (!candScene || !candCamera || !candCanvas) {
+        throw new Error('Candidate scene, camera, or canvas not available for image capture');
+      }
+
+      // Extract read-only candidate checkpoint observations (first mesh transform, color, camera/projection, RNG count; ROOT H1 REVIEW)
+      const candCheckpointObs = extractCheckpointObservations(candSettle.win, candSettle.doc);
+      const checkpointObsComp = compareCheckpointObservations(refCheckpointObs, candCheckpointObs);
+      if (candCheckpointObs && candCheckpointObs.rng) {
+        addLog(branchKey, `Candidate observations: RNG count=${candCheckpointObs.rng.count}, firstMesh color=#${candCheckpointObs.firstMesh?.colorHex || 'none'}`, 'info');
+      }
+      if (!checkpointObsComp.pass) {
+        addLog(branchKey, `Checkpoint observation differences: ${checkpointObsComp.diffs.join('; ')}`, 'warn');
+      } else {
+        addLog(branchKey, `Checkpoint observations match: RNG count/state, firstMesh transform/color, and camera projection are identical (read-only verification passed)`, 'ok');
+      }
+
+      // Drive camera by identical explicit fixed input in both runs without state copying (ROOT H1 REVIEW)
+      candSettle.win.__f3d_frozen_camera_state__ = FIXED_CHECKPOINT_CAMERA;
+      if (candRenderer && typeof candRenderer.render === 'function') {
+        candRenderer.render(candScene, candCamera);
+      }
+      const candPixels = captureCanvasPixels(candCanvas);
+      candSettle.win.__f3d_frozen_camera_state__ = null;
+      addLog(branchKey, `Candidate image captured: ${candPixels.width}x${candPixels.height} native (${candPixels.data.length} bytes)`, 'ok');
+
+      // Compare reference pixels vs candidate pixels (Plan §6 / line 1227: colorTolerance=2, maxDiffPixelPercent=0.1)
+      const pixelComparison = comparePixelBuffers(refPixels, candPixels, {
+        colorTolerance: 2,
+        maxDiffPixelPercent: 0.1,
+      });
+
+      // Mismatched-pixel negative control proving rejection of corrupted pixels (Mail #13025)
+      const mutatedCandPixels = createMismatchedPixelBuffer(candPixels, 1.0);
+      const negativeComp = comparePixelBuffers(refPixels, mutatedCandPixels, {
+        colorTolerance: 2,
+        maxDiffPixelPercent: 0.1,
+      });
+      const negativeRejected = !negativeComp.pass;
+
+      // Do not throw and discard comparison details; record findings for honest reporting (ROOT H1 REVIEW)
+      if (!pixelComparison.pass) {
+        addLog(branchKey, `Pixel comparison failed: diffPercent=${pixelComparison.diffPercent.toFixed(4)}% (>0.1% limit), diffPixels=${pixelComparison.diffPixels}/${pixelComparison.totalPixels}, maxChannelDiff=${pixelComparison.maxChannelDiff}, rmse=${pixelComparison.rmse.toFixed(4)}`, 'err');
+      } else {
+        addLog(branchKey, `Image equality confirmed: diffPercent=${pixelComparison.diffPercent.toFixed(4)}% (<=0.1%), diffPixels=${pixelComparison.diffPixels}/${pixelComparison.totalPixels}, rmse=${pixelComparison.rmse.toFixed(4)}`, 'ok');
+      }
+      if (!negativeRejected) {
+        addLog(branchKey, `Mismatched-pixel negative control failed: mutated pixel buffer was not rejected by comparator`, 'err');
+      } else {
+        addLog(branchKey, `Mismatched-pixel negative control passed: rejected mutated candidate buffer (diffPercent=${negativeComp.diffPercent.toFixed(4)}%)`, 'ok');
+      }
+
       // Checkpoint 1: Dynamic toggle on Candidate (strictly fail if toggle fails - no bypass)
       const candToggleDynamicRes = toggleInspectorControl(candSettle.doc, 'dynamic');
       if (!candToggleDynamicRes.success) {
@@ -830,7 +959,6 @@
       addLog(branchKey, `Candidate dynamic observation: PASSED (checked=true, meshDelta=${candDynamicSample.meshDelta.toFixed(4)}, instDelta=${candDynamicSample.instanceDelta.toFixed(4)}, groupStatic=${candDynamicSample.groupStaticEnd})`, 'ok');
 
       // Checkpoint 2: OrbitControls pointer drag on Candidate & camera elevation observation
-      const candCanvas = candSettle.doc.querySelector('canvas');
       const candDragDispatched = dispatchOrbitPointerDrag(candCanvas, { dx: 80, dy: 60 });
       if (!candDragDispatched) {
         throw new Error('Candidate canvas pointer drag dispatch failed');
@@ -957,17 +1085,43 @@
         addLog(branchKey, `Negative control failure: ${JSON.stringify(negativeChecks)}`, 'err');
       }
 
-      const branchPassed = parityPassed && allNegativesRejected;
+      const branchPassed = parityPassed && allNegativesRejected && pixelComparison.pass && negativeRejected;
       badge.className = branchPassed ? 'badge pass' : 'badge fail';
       badge.textContent = branchPassed ? 'PASS' : 'FAIL';
+
+      let branchError = null;
+      if (!pixelComparison.pass) {
+        branchError = `Pixel comparison failed: diffPercent=${pixelComparison.diffPercent.toFixed(4)}% (>0.1% limit), diffPixels=${pixelComparison.diffPixels}/${pixelComparison.totalPixels}, maxChannelDiff=${pixelComparison.maxChannelDiff}, rmse=${pixelComparison.rmse.toFixed(4)}`;
+      } else if (!negativeRejected) {
+        branchError = 'Mismatched-pixel negative control failed: mutated buffer was not rejected';
+      } else if (!parityPassed) {
+        branchError = 'Reference vs candidate state parity failed';
+      } else if (!allNegativesRejected) {
+        branchError = 'Planted broken control mutations were not all rejected';
+      }
 
       return {
         key: branchKey,
         backend,
         passed: branchPassed,
+        error: branchError,
         title: candInitial.title,
         canvasContext: candInitial.canvas.contextType,
         inspectorSign: candInitial.inspector.sign,
+        imageComparison: pixelComparison,
+        imageNegative: {
+          rejected: negativeRejected,
+          diffPercent: negativeComp.diffPercent,
+          diffPixels: negativeComp.diffPixels,
+          maxChannelDiff: negativeComp.maxChannelDiff,
+          rmse: negativeComp.rmse,
+        },
+        imageNegativeRejected: negativeRejected,
+        checkpointObservations: {
+          reference: refCheckpointObs,
+          candidate: candCheckpointObs,
+          comparison: checkpointObsComp,
+        },
         decisionLog: candInitial.routing.decisionCount ? candSettle.win.__f3d_router__.getDecisionLog() : [],
         attributionLog: candSettle.win.__f3d_router__ && typeof candSettle.win.__f3d_router__.getAttributionLog === 'function'
           ? candSettle.win.__f3d_router__.getAttributionLog()
@@ -1065,7 +1219,11 @@
           branchResults[branchKey] = res;
           if (!res.passed) {
             overallPassed = false;
-            errors.push(`Branch ${branchKey} parity, observation, or negative controls failed.`);
+            if (res.error) {
+              errors.push(`Branch ${branchKey}: ${res.error}`);
+            } else {
+              errors.push(`Branch ${branchKey} parity, observation, or negative controls failed.`);
+            }
           }
         } catch (err) {
           overallPassed = false;
@@ -1080,13 +1238,39 @@
             key: branchKey,
             passed: false,
             error: err.message || String(err),
+            imageComparison: err.imageComparison || null,
+            imageNegative: err.imageNegative || null,
           };
         }
       }
 
-      if (overallPassed && errors.length === 0) {
+      const allBranchesPassed = overallPassed && errors.length === 0;
+      const allImageComparisonsPassed = Object.values(branchResults).length > 0 && Object.values(branchResults).every(b => Boolean(b.imageComparison?.pass || b.imageComparison?.passed));
+      const allImageNegativesRejected = Object.values(branchResults).length > 0 && Object.values(branchResults).every(b => b.imageNegativeRejected);
+
+      const imageCheckpointPassed = allImageComparisonsPassed && allImageNegativesRejected;
+      const imageCheckpointStatus = imageCheckpointPassed ? 'passed' : 'failed';
+
+      const badgeImage = document.getElementById('badge-image');
+      const imgStatusEl = document.getElementById('img-status');
+      const imgRuleEl = document.getElementById('img-rule');
+      if (badgeImage) {
+        badgeImage.className = imageCheckpointPassed ? 'badge pass' : 'badge fail';
+        badgeImage.textContent = imageCheckpointPassed ? 'PASSED' : 'FAILED';
+      }
+      if (imgStatusEl) {
+        const parts = Object.entries(branchResults).map(([k, b]) => `${k}: diff=${(b.imageComparison?.diffPercent || 0).toFixed(4)}%`);
+        imgStatusEl.textContent = `${imageCheckpointStatus.toUpperCase()} (${parts.join(', ')}; negatives: ${allImageNegativesRejected ? 'rejected' : 'failed'})`;
+      }
+      if (imgRuleEl) {
+        imgRuleEl.textContent = imageCheckpointPassed
+          ? 'Plan §6 thresholds verified (diff <= 0.1%, colorTol=2); real negative rejected; zero golden images regenerated.'
+          : 'Plan §6 thresholds failed; diff percent and RMSE recorded; zero golden images regenerated.';
+      }
+
+      if (allBranchesPassed && imageCheckpointPassed) {
         banner.className = 'status-banner pass';
-        banner.textContent = 'ALL H1 REFERENCE PARITY & SCENE/CAMERA OBSERVATIONS PASSED';
+        banner.textContent = 'ALL H1 REFERENCE PARITY, PIXEL EQUALITY & OBSERVATIONS PASSED';
       } else {
         banner.className = 'status-banner fail';
         banner.textContent = `H1 VERIFICATION FAILED: ${errors.join('; ')}`;
@@ -1094,12 +1278,22 @@
 
       const reportPayload = {
         browser: navigator.userAgent,
-        passed: overallPassed && errors.length === 0,
+        passed: allBranchesPassed && imageCheckpointPassed,
         errors,
         branches: branchResults,
         imageCheckpoint: {
-          status: 'open-until-measured',
-          attestation: 'Canvas pixel byte comparison remains open until measured in dedicated browser readback harness; no golden image regenerated.',
+          status: imageCheckpointStatus,
+          attestation: imageCheckpointPassed
+            ? 'Canvas pixel byte comparison measured across WebGPU and WebGL branches; Plan §6 thresholds (colorTolerance <= 2, maxDiffPixelPercent <= 0.1%) enforced; mismatched-pixel negative control rejected; zero golden images regenerated.'
+            : 'Canvas pixel byte comparison measured across WebGPU and WebGL branches; verification failed under Plan §6 thresholds; failure details recorded without golden image regeneration.',
+          branches: {
+            webgpu: branchResults.webgpu?.imageComparison || null,
+            webgl: branchResults.webgl?.imageComparison || null,
+          },
+          negatives: {
+            webgpu: branchResults.webgpu?.imageNegative || null,
+            webgl: branchResults.webgl?.imageNegative || null,
+          },
         },
         decisionLog: Object.values(branchResults).flatMap(b => b.candidate?.routing?.decisionLog || b.decisionLog || []),
         attributionLog: Object.values(branchResults).flatMap(b => b.attributionLog || []),
