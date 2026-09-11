@@ -5,8 +5,9 @@
 //! and perspective divide).
 
 use f3d_core::layout::{LayoutError, ProjectiveMat4};
-use f3d_math::{CoordinateSystem, Matrix3, Matrix4, NarrowingError, Quaternion, Vector3};
-
+use f3d_math::{
+    BatchComposeError, CoordinateSystem, Matrix3, Matrix4, NarrowingError, Quaternion, Vector3,
+};
 
 const EPS: f64 = 1e-10;
 
@@ -1006,6 +1007,184 @@ fn test_vector3_project_and_unproject_analytical() {
     assert_vec_close(&p, [original.x, original.y, original.z], 1e-9, "unproject roundtrip");
 }
 
+#[test]
+fn test_batch_compose_matches_per_item_compose_scalar_exact() {
+    let positions = [
+        Vector3::zero(),
+        Vector3::new(10.0, 20.0, 30.0),
+        Vector3::new(-5.0, 12.5, 0.25),
+        Vector3::new(-0.0, 0.0, -10.0), // explicit -0.0 translation
+    ];
+    let quaternions = [
+        Quaternion::identity(),
+        Quaternion::new(0.0, 0.0, 1.0, 0.0), // 180 deg around Z
+        Quaternion::new(0.1, 0.2, 0.3, 0.4), // non-unit authored quaternion preserved
+        Quaternion::new((0.5f64).sqrt(), 0.0, 0.0, (0.5f64).sqrt()), // 90 deg around X
+    ];
+    let scales = [
+        Vector3::one(),
+        Vector3::new(2.0, 3.0, 4.0),
+        Vector3::new(-1.5, 2.0, -0.5), // negative scaling preserved
+        Vector3::new(0.5, 1.0, 2.0),
+    ];
 
+    let mut individual_outputs = [Matrix4::identity(); 4];
+    for i in 0..4 {
+        individual_outputs[i].compose(&positions[i], &quaternions[i], &scales[i]);
+    }
 
+    let mut batch_outputs = [Matrix4::zero(); 4];
+    Matrix4::batch_compose(&positions, &quaternions, &scales, &mut batch_outputs)
+        .expect("batch_compose should succeed");
+
+    for i in 0..4 {
+        assert_eq!(
+            batch_outputs[i].elements.map(f64::to_bits),
+            individual_outputs[i].elements.map(f64::to_bits),
+            "batch compose item {i} must bitwise equal individual compose (preserving signed zero)"
+        );
+    }
+}
+
+#[test]
+fn test_batch_compose_valid_empty_input() {
+    let mut outputs: [Matrix4; 0] = [];
+    let res = Matrix4::batch_compose(&[], &[], &[], &mut outputs);
+    assert!(res.is_ok(), "empty batch compose must succeed without writes");
+}
+
+#[test]
+fn test_batch_compose_length_mismatch_no_partial_writes() {
+    let positions = [
+        Vector3::new(1.0, 2.0, 3.0),
+        Vector3::new(4.0, 5.0, 6.0),
+        Vector3::new(7.0, 8.0, 9.0),
+    ];
+    let quaternions = [
+        Quaternion::identity(),
+        Quaternion::identity(),
+        Quaternion::identity(),
+    ];
+    let scales = [
+        Vector3::one(),
+        Vector3::one(),
+        Vector3::one(),
+    ];
+
+    let sentinel = Matrix4::from_elements([42.0; 16]);
+
+    // Case 1: quaternions slice too short (2 vs 3)
+    let mut outputs1 = [sentinel; 3];
+    let err1 = Matrix4::batch_compose(&positions, &quaternions[..2], &scales, &mut outputs1);
+    assert_eq!(
+        err1,
+        Err(BatchComposeError::LengthMismatch {
+            positions_len: 3,
+            quaternions_len: 2,
+            scales_len: 3,
+            outputs_len: 3,
+        })
+    );
+    for (i, m) in outputs1.iter().enumerate() {
+        assert_eq!(
+            m.elements, sentinel.elements,
+            "output1 {i} must remain untouched on length mismatch"
+        );
+    }
+
+    // Case 2: outputs slice too short (2 vs 3)
+    let mut outputs_short = [sentinel; 2];
+    let err2 = Matrix4::batch_compose(&positions, &quaternions, &scales, &mut outputs_short);
+    assert_eq!(
+        err2,
+        Err(BatchComposeError::LengthMismatch {
+            positions_len: 3,
+            quaternions_len: 3,
+            scales_len: 3,
+            outputs_len: 2,
+        })
+    );
+    for (i, m) in outputs_short.iter().enumerate() {
+        assert_eq!(
+            m.elements, sentinel.elements,
+            "output_short {i} must remain untouched on length mismatch"
+        );
+    }
+
+    // Case 3: scales slice too short (1 vs 3)
+    let mut outputs3 = [sentinel; 3];
+    let err3 = Matrix4::batch_compose(&positions, &quaternions, &scales[..1], &mut outputs3);
+    assert_eq!(
+        err3,
+        Err(BatchComposeError::LengthMismatch {
+            positions_len: 3,
+            quaternions_len: 3,
+            scales_len: 1,
+            outputs_len: 3,
+        })
+    );
+    for (i, m) in outputs3.iter().enumerate() {
+        assert_eq!(
+            m.elements, sentinel.elements,
+            "output3 {i} must remain untouched on length mismatch"
+        );
+    }
+
+    // Case 4: positions slice too short (2 vs 3)
+    let mut outputs4 = [sentinel; 3];
+    let err4 = Matrix4::batch_compose(&positions[..2], &quaternions, &scales, &mut outputs4);
+    assert_eq!(
+        err4,
+        Err(BatchComposeError::LengthMismatch {
+            positions_len: 2,
+            quaternions_len: 3,
+            scales_len: 3,
+            outputs_len: 3,
+        })
+    );
+    for (i, m) in outputs4.iter().enumerate() {
+        assert_eq!(
+            m.elements, sentinel.elements,
+            "output4 {i} must remain untouched on length mismatch"
+        );
+    }
+}
+
+#[test]
+fn test_batch_compose_swapped_inputs_differentiate_per_item() {
+    let pos_a = Vector3::new(10.0, 0.0, 0.0);
+    let pos_b = Vector3::new(0.0, 20.0, 0.0);
+    let quat_a = Quaternion::identity();
+    let quat_b = Quaternion::new(0.0, 0.0, 1.0, 0.0);
+    let scale_a = Vector3::new(1.0, 2.0, 3.0);
+    let scale_b = Vector3::new(3.0, 2.0, 1.0);
+
+    let mut normal_outputs = [Matrix4::identity(); 2];
+    Matrix4::batch_compose(
+        &[pos_a, pos_b],
+        &[quat_a, quat_b],
+        &[scale_a, scale_b],
+        &mut normal_outputs,
+    )
+    .expect("normal compose succeeds");
+
+    // Swapped positions: pos_b with quat_a/scale_a, pos_a with quat_b/scale_b
+    let mut swapped_outputs = [Matrix4::identity(); 2];
+    Matrix4::batch_compose(
+        &[pos_b, pos_a],
+        &[quat_a, quat_b],
+        &[scale_a, scale_b],
+        &mut swapped_outputs,
+    )
+    .expect("swapped compose succeeds");
+
+    assert_ne!(
+        normal_outputs[0].elements, swapped_outputs[0].elements,
+        "swapping per-item input must produce distinct matrix"
+    );
+    assert_ne!(
+        normal_outputs[1].elements, swapped_outputs[1].elements,
+        "swapping per-item input must produce distinct matrix"
+    );
+}
 

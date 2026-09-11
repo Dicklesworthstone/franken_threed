@@ -353,6 +353,38 @@ impl Matrix4 {
         self
     }
 
+    /// Composes a batch of $N$ transformation matrices from caller-provided position,
+    /// quaternion, and scale slices into a caller-provided `outputs` slice.
+    ///
+    /// # Invariants
+    /// - Evaluates each transform using the exact scalar operation ordering of [`Matrix4::compose`].
+    /// - Validates that all input and output slice lengths match before performing any writes;
+    ///   on length mismatch, returns `Err(BatchComposeError::LengthMismatch)` and leaves `outputs` unmodified.
+    /// - An empty batch ($N = 0$) is valid and immediately returns `Ok(())`.
+    /// - Preserves authored non-unit quaternions, negative scaling, and signed zero without heap allocations.
+    pub fn batch_compose(
+        positions: &[Vector3],
+        quaternions: &[Quaternion],
+        scales: &[Vector3],
+        outputs: &mut [Matrix4],
+    ) -> Result<(), BatchComposeError> {
+        let count = positions.len();
+        if quaternions.len() != count || scales.len() != count || outputs.len() != count {
+            return Err(BatchComposeError::LengthMismatch {
+                positions_len: count,
+                quaternions_len: quaternions.len(),
+                scales_len: scales.len(),
+                outputs_len: outputs.len(),
+            });
+        }
+
+        for i in 0..count {
+            outputs[i].compose(&positions[i], &quaternions[i], &scales[i]);
+        }
+
+        Ok(())
+    }
+
     /// Sets the rotation component of this transformation matrix from a quaternion,
     /// with position zero `(0, 0, 0)` and unit scale `(1, 1, 1)` matching Three.js r186.
     #[inline]
@@ -592,8 +624,47 @@ impl Matrix4 {
     }
 }
 
+/// Errors occurring during batch matrix composition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum BatchComposeError {
+    /// Input or output slice lengths do not match.
+    LengthMismatch {
+        /// Number of position vectors provided.
+        positions_len: usize,
+        /// Number of rotation quaternions provided.
+        quaternions_len: usize,
+        /// Number of scale vectors provided.
+        scales_len: usize,
+        /// Number of output matrices provided.
+        outputs_len: usize,
+    },
+}
+
+impl fmt::Display for BatchComposeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LengthMismatch {
+                positions_len,
+                quaternions_len,
+                scales_len,
+                outputs_len,
+            } => {
+                write!(
+                    f,
+                    "batch compose slice length mismatch: positions={}, quaternions={}, scales={}, outputs={}",
+                    positions_len, quaternions_len, scales_len, outputs_len
+                )
+            }
+        }
+    }
+}
+
+impl core::error::Error for BatchComposeError {}
+
 
 /// Target coordinate system for projection matrices matching Three.js r186 constants.
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum CoordinateSystem {

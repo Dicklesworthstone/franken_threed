@@ -106,7 +106,13 @@ fn test_to_uint32_spec_cases_and_edge_values() {
     // 2^60
     const TWO_POW_60: f64 = 1152921504606846976.0;
     assert_eq!(to_uint32(TWO_POW_60), 0, "ToUint32(2^60) wraps to 0 (multiple of 2^32)");
-    assert_eq!(to_uint32(-TWO_POW_60 + 7.0), 7, "ToUint32(-(2^60) + 7) wraps to 7");
+    // In IEEE 754 f64, -2^60 + 7.0 rounds to -2^60 (matching Node `(-Math.pow(2, 60) + 7) >>> 0 === 0`):
+    assert_eq!(to_uint32(-TWO_POW_60 + 7.0), 0, "ToUint32(-(2^60) + 7) rounds to -2^60 in f64 and wraps to 0");
+
+    // 2^50 (fits within 53-bit mantissa): -(2^50) + 7 wraps modulo 2^32 to 7:
+    const TWO_POW_50: f64 = 1125899906842624.0;
+    assert_eq!(to_uint32(-TWO_POW_50 + 7.0), 7, "ToUint32(-(2^50) + 7) wraps to 7");
+
 
     // Magnitude >= 2^84: all significand bits are at or above 2^32 => identically 0
     assert_eq!(to_uint32(f64::MAX), 0, "ToUint32(f64::MAX) must be 0");

@@ -232,7 +232,7 @@ impl Quaternion {
             }
             crate::euler::EulerOrder::YZX => {
                 self.x = s1 * c2 * c3 + c1 * s2 * s3;
-                self.y = c1 * s2 * c3 - s1 * c2 * s3;
+                self.y = c1 * s2 * c3 + s1 * c2 * s3;
                 self.z = c1 * c2 * s3 - s1 * s2 * c3;
                 self.w = c1 * c2 * c3 - s1 * s2 * s3;
             }

@@ -214,26 +214,30 @@ fn test_ray_intersect_triangle_hit_backface_culled_and_miss() {
     let b = Vector3::new(0.0, 1.0, 1.0);
     let c = Vector3::new(1.0, 0.0, 1.0);
 
-    // Front-facing hit (normal points toward negative octant, ray direction (1, 1, 1) enters front)
+    // (b-a) cross (c-a) points toward the positive octant. The origin ray
+    // therefore hits the back face, as verified against pinned Three.js Ray.
     let mut dir = Vector3::new(1.0, 1.0, 1.0);
     dir.normalize();
     let ray = Ray::new(Vector3::zero(), dir);
 
     // Non-culled hit
     let hit = ray.intersect_triangle(&a, &b, &c, false);
-    assert!(hit.is_some(), "front face non-culled hit");
+    assert!(hit.is_some(), "back face non-culled hit");
     assert_vec_close(&hit.unwrap(), [2.0 / 3.0, 2.0 / 3.0, 2.0 / 3.0], 1e-6, "triangle hit point");
+    assert!(ray.intersect_triangle(&a, &b, &c, true).is_none(),
+        "back face must be culled");
 
-    // Culled hit: ray hitting from backface with backfaceCulling = true
-    let mut back_dir = Vector3::new(-1.0, -1.0, -1.0);
-    back_dir.normalize();
-    let back_ray = Ray::new(Vector3::new(2.0, 2.0, 2.0), back_dir);
-    let hit_culled = back_ray.intersect_triangle(&a, &b, &c, true);
-    assert!(hit_culled.is_none(), "backface hit culled when backfaceCulling is true");
+    // Approaching from the positive octant hits the front face and survives culling.
+    let mut front_dir = Vector3::new(-1.0, -1.0, -1.0);
+    front_dir.normalize();
+    let front_ray = Ray::new(Vector3::new(2.0, 2.0, 2.0), front_dir);
+    let front_hit = front_ray.intersect_triangle(&a, &b, &c, true);
+    assert!(front_hit.is_some(), "front face survives backface culling");
+    assert_vec_close(&front_hit.unwrap(), [2.0 / 3.0, 2.0 / 3.0, 2.0 / 3.0], 1e-6, "front face hit point");
 
-    let hit_not_culled = back_ray.intersect_triangle(&a, &b, &c, false);
-    assert!(hit_not_culled.is_some(), "backface hit detected when backfaceCulling is false");
-    assert_vec_close(&hit_not_culled.unwrap(), [2.0 / 3.0, 2.0 / 3.0, 2.0 / 3.0], 1e-6, "backface hit point");
+    let hit_not_culled = front_ray.intersect_triangle(&a, &b, &c, false);
+    assert!(hit_not_culled.is_some(), "front face hit without culling");
+    assert_vec_close(&hit_not_culled.unwrap(), [2.0 / 3.0, 2.0 / 3.0, 2.0 / 3.0], 1e-6, "front face hit point");
 
     // MISS: Ray pointing wrong direction
     let mut miss_dir = Vector3::new(-1.0, -1.0, -1.0);
@@ -427,4 +431,3 @@ fn test_fixture_tri1_pixel_center_ndc_mapping_and_containment() {
         "pixel center (2.5, 2.5) at NDC (-0.921875, 0.921875) must be outside tri1"
     );
 }
-

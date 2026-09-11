@@ -33,7 +33,7 @@ fn test_srgb_piecewise_threshold_exactness() {
 
     // At threshold: (c * 0.9478672986 + 0.0521327014)^2.4
     let at_thresh = 0.04045;
-    let base_at = 0.04045 * 0.9478672986 + 0.0521327014;
+    let base_at: f64 = 0.04045 * 0.9478672986 + 0.0521327014;
     let expected_at = base_at.powf(2.4);
     assert_eq!(srgb_to_linear(at_thresh), expected_at);
 
@@ -696,46 +696,55 @@ fn test_zero_allocation_style_and_hex_formatting() {
     }
 
     // Large finite channels at 2^63:
-    // In JS: (2**63).toString() -> "9223372036854776000" (shortest decimal representation, not saturating i64)
+    // Three.js r186 Color.getStyle(SRGBColorSpace) converts working linear space to sRGB via linear_to_srgb:
+    // r = 2^63 / 255 -> linear_to_srgb(r) * 255 = 2133018191
+    // g = -2^63 / 255 -> linear_to_srgb(g) * 255 = -2^63 * 12.92 -> "-119165966716163700000"
+    // b = 100 / 255 -> linear_to_srgb(b) * 255 = 168
     let c_2_63 = Color::new(2.0_f64.powi(63) / 255.0, -2.0_f64.powi(63) / 255.0, 100.0 / 255.0);
     let mut buf_63 = [0u8; 64];
     let style_63 = c_2_63.format_style_srgb(&mut buf_63).unwrap();
-    assert_eq!(style_63, "rgb(9223372036854776000,-9223372036854776000,100)");
+    assert_eq!(style_63, "rgb(2133018191,-119165966716163700000,168)");
     #[cfg(feature = "std")]
     {
-        assert_eq!(c_2_63.get_style_srgb(), "rgb(9223372036854776000,-9223372036854776000,100)");
+        assert_eq!(c_2_63.get_style_srgb(), "rgb(2133018191,-119165966716163700000,168)");
     }
 
     // Representable values near 1e18 beyond 2^53:
-    // (1e18 + 1024).toString() in JS -> "1000000000000001000" (shortest representation, not 1000000000000001024)
-    // 1e18.toString() in JS -> "1000000000000000000"
+    // Under linear_to_srgb, (1e18/255)**(1/2.4) * 1.055 * 255 -> 845208004
     let c_1e18 = Color::new((1e18 + 1024.0) / 255.0, 1e18 / 255.0, 1.0);
     let mut buf_18 = [0u8; 64];
     let style_18 = c_1e18.format_style_srgb(&mut buf_18).unwrap();
-    assert_eq!(style_18, "rgb(1000000000000001000,1000000000000000000,255)");
+    assert_eq!(style_18, "rgb(845208004,845208004,255)");
     #[cfg(feature = "std")]
     {
-        assert_eq!(c_1e18.get_style_srgb(), "rgb(1000000000000001000,1000000000000000000,255)");
+        assert_eq!(c_1e18.get_style_srgb(), "rgb(845208004,845208004,255)");
     }
 
     // Exponential formatting at >= 1e21 with signed exponent (e.g. 1e+21) matching ECMAScript:
+    // Under linear_to_srgb:
+    // r = 1e21/255 -> 15029468000
+    // g = -1e21/255 -> -1e21 * 12.92 = -1.292e+22
     let c_1e21 = Color::new(1e21 / 255.0, -1e21 / 255.0, 0.0);
     let mut buf_21 = [0u8; 64];
     let style_21 = c_1e21.format_style_srgb(&mut buf_21).unwrap();
-    assert_eq!(style_21, "rgb(1e+21,-1e+21,0)");
+    assert_eq!(style_21, "rgb(15029468000,-1.292e+22,0)");
     #[cfg(feature = "std")]
     {
-        assert_eq!(c_1e21.get_style_srgb(), "rgb(1e+21,-1e+21,0)");
+        assert_eq!(c_1e21.get_style_srgb(), "rgb(15029468000,-1.292e+22,0)");
     }
 
     // Large exponential (2.55e27) and decimal at 1e20 (< 1e21 threshold):
+    // Under linear_to_srgb:
+    // r = 2.55e27/255 -> 7019281183825
+    // g = 1e20/255 -> 5758158397
+    // b = -1e20/255 -> -1.292e+21
     let c_large = Color::new(2.55e27 / 255.0, 1e20 / 255.0, -1e20 / 255.0);
     let mut buf_large = [0u8; 96];
     let style_large = c_large.format_style_srgb(&mut buf_large).unwrap();
-    assert_eq!(style_large, "rgb(2.55e+27,100000000000000000000,-100000000000000000000)");
+    assert_eq!(style_large, "rgb(7019281183825,5758158397,-1.292e+21)");
     #[cfg(feature = "std")]
     {
-        assert_eq!(c_large.get_style_srgb(), "rgb(2.55e+27,100000000000000000000,-100000000000000000000)");
+        assert_eq!(c_large.get_style_srgb(), "rgb(7019281183825,5758158397,-1.292e+21)");
     }
 }
 

@@ -27,7 +27,9 @@ pub mod quaternion;
 pub mod ray;
 pub mod sphere;
 pub mod triangle;
+pub mod vector2;
 pub mod vector3;
+pub mod vector4;
 
 pub use box3::Box3;
 pub use color::{
@@ -42,13 +44,15 @@ pub use jsnum::{
 };
 pub use line3::Line3;
 pub use matrix3::Matrix3;
-pub use matrix4::{CoordinateSystem, Matrix4};
+pub use matrix4::{BatchComposeError, CoordinateSystem, Matrix4};
 pub use narrowing::{check_narrow_f64, NarrowingError, NarrowingTolerance};
 pub use plane::Plane;
 pub use quaternion::Quaternion;
 pub use ray::Ray;
 pub use sphere::Sphere;
 pub use triangle::Triangle;
+pub use vector2::Vector2;
 pub use vector3::Vector3;
+pub use vector4::Vector4;
 
 
