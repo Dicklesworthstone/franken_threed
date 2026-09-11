@@ -41,6 +41,8 @@
     import { testDeviceReplacement } from "./device_lifetime_test.js";
     import { testViewportScissor } from "./viewport_scissor_test.js";
     import { testDrawParameters } from "./draw_parameters_test.js";
+    import { testMeshScene, testVisibleCanvasMeshScene } from "./mesh_scene_test.js";
+    import { testDepthScene } from "./depth_test.js";
 
     const outputEl = document.getElementById("output");
     const canvas = document.getElementById("canvas");
@@ -338,6 +340,34 @@
         logPass("device_replacement_and_loss", await testDeviceReplacement(buildRedBlueFn));
         logPass("viewport_scissor_rectangles", await testViewportScissor(bridge, buildViewportScissorFn));
         logPass("draw_ranges_and_instances", await testDrawParameters(bridge, wasmExports.f3d_build_draw_parameters_packet));
+        logPass("dynamic_mesh_scene", await testMeshScene(bridge, wasmExports));
+
+        const urlParams = new URLSearchParams(window.location.search);
+        const requestedLane = urlParams.get("lane") || (urlParams.has("canvas") ? "canvas" : (urlParams.has("depth") ? "depth" : "offscreen"));
+
+        if (requestedLane === "canvas" || requestedLane === "all") {
+          const hasCanvasExport =
+            typeof wasmExports.f3d_build_canvas_mesh_packet === "function" ||
+            typeof wasmExports.gpu_bridge_build_canvas_mesh_packet === "function";
+          if (!hasCanvasExport) {
+            throw new Error(
+              "Canvas lane requested, but Wasm module is missing required export f3d_build_canvas_mesh_packet / gpu_bridge_build_canvas_mesh_packet"
+            );
+          }
+          logPass("visible_canvas_mesh_scene", await testVisibleCanvasMeshScene(bridge, wasmExports, canvasContext, canvas));
+        }
+
+        if (requestedLane === "depth" || requestedLane === "all") {
+          const hasDepthExport =
+            typeof wasmExports.f3d_build_overlapping_depth_packet === "function" ||
+            typeof wasmExports.gpu_bridge_build_overlapping_depth_packet === "function";
+          if (!hasDepthExport) {
+            throw new Error(
+              "Depth lane requested, but Wasm module is missing required export f3d_build_overlapping_depth_packet / gpu_bridge_build_overlapping_depth_packet"
+            );
+          }
+          logPass("overlapping_depth_test", await testDepthScene(bridge, wasmExports));
+        }
 
         // 7. Retained renderer exclusion
         if (window.__threeRendererSubmissions && window.__threeRendererSubmissions > 0) {

@@ -12,12 +12,19 @@ const args = process.argv.slice(2);
 let browser = 'chrome';
 let packagePath = null;
 let negative = null;
+let lane = null;
 
 for (const arg of args) {
   if (arg === 'chrome' || arg === 'safari') {
     browser = arg;
   } else if (arg.startsWith('negative=')) {
     negative = arg.slice(9);
+  } else if (arg.startsWith('lane=')) {
+    lane = arg.slice(5);
+  } else if (arg.startsWith('--lane=')) {
+    lane = arg.slice(7);
+  } else if (arg === 'canvas' || arg === 'offscreen' || arg === 'depth') {
+    lane = arg;
   } else if (!arg.startsWith('-')) {
     packagePath = arg;
   }
@@ -109,8 +116,16 @@ server = createServer((req, res) => {
   } else if (url.pathname.startsWith('/browser_execution/pkg/')) {
     const bPkg = resolve(repoRoot, 'tests/fixtures/browser_execution/pkg');
     filePath = join(bPkg, url.pathname.slice('/browser_execution/pkg/'.length));
+  } else if (url.pathname.startsWith('/upstream/') || url.pathname.startsWith('/tools/')) {
+    filePath = join(repoRoot, url.pathname.slice(1));
   } else {
     filePath = join(fixture, url.pathname === '/' ? 'gpu_bridge_test.html' : url.pathname.slice(1));
+    if (!existsSync(filePath)) {
+      const candidateRepo = join(repoRoot, url.pathname.slice(1));
+      if (existsSync(candidateRepo)) {
+        filePath = candidateRepo;
+      }
+    }
   }
 
   if (!existsSync(filePath)) {
@@ -130,7 +145,11 @@ server = createServer((req, res) => {
 
 server.listen(0, '127.0.0.1', () => {
   const port = server.address().port;
-  const targetUrl = `http://127.0.0.1:${port}/`;
+  const params = new URLSearchParams();
+  if (negative) params.set('negative', negative);
+  if (lane) params.set('lane', lane);
+  const queryString = params.toString() ? `?${params.toString()}` : '';
+  const targetUrl = `http://127.0.0.1:${port}/${queryString}`;
   console.log(`[bridge-test-harness] Server listening on ${targetUrl}, launching ${browser}...`);
 
   if (browser === 'chrome') {

@@ -23,6 +23,8 @@ export const OPCODE_EXECUTE_BUNDLES = 8;
 export const OPCODE_SET_VIEWPORT = 9;
 export const OPCODE_SET_SCISSOR_RECT = 10;
 export const OPCODE_SET_DRAW_PARAMETERS = 11;
+export const OPCODE_CREATE_PIPELINE_DEPTH = 12;
+export const OPCODE_RENDER_PASS_DEPTH = 13;
 
 export const TARGET_OFFSCREEN = 0;
 export const TARGET_CANVAS = 1;
@@ -30,6 +32,32 @@ export const TARGET_CANVAS = 1;
 export const TARGET_FORMAT_PREFERRED_CANVAS = 0;
 export const TARGET_FORMAT_BGRA8UNORM = 1;
 export const TARGET_FORMAT_RGBA8UNORM = 2;
+
+export const TEXTURE_FORMAT_BGRA8UNORM = 1;
+export const TEXTURE_FORMAT_RGBA8UNORM = 2;
+export const TEXTURE_FORMAT_DEPTH24PLUS = 3;
+export const TEXTURE_FORMAT_DEPTH32FLOAT = 4;
+
+export const DEPTH_COMPARE_NEVER = 1;
+export const DEPTH_COMPARE_LESS = 2;
+export const DEPTH_COMPARE_EQUAL = 3;
+export const DEPTH_COMPARE_LESS_EQUAL = 4;
+export const DEPTH_COMPARE_GREATER = 5;
+export const DEPTH_COMPARE_NOT_EQUAL = 6;
+export const DEPTH_COMPARE_GREATER_EQUAL = 7;
+export const DEPTH_COMPARE_ALWAYS = 8;
+
+export const DEPTH_COMPARE_NAMES = [
+  null,
+  "never",
+  "less",
+  "equal",
+  "less-equal",
+  "greater",
+  "not-equal",
+  "greater-equal",
+  "always",
+];
 
 export const TEXTURE_USAGE_COPY_SRC = 1;
 export const TEXTURE_USAGE_COPY_DST = 2;
@@ -340,6 +368,7 @@ export class WebGpuBridgeHost {
       let cursor = headerLen;
       let currentPassEncoder = null;
       let currentPassTargetKey = null;
+      let currentPassHasDepth = false;
       let frameCanvasView = null;
       let pendingDrawParameters = null;
       let passState = {
@@ -361,6 +390,7 @@ export class WebGpuBridgeHost {
           currentPassEncoder.end();
           currentPassEncoder = null;
           currentPassTargetKey = null;
+          currentPassHasDepth = false;
           passState = {
             pipelineId: null,
             uniformBufferId: null,
@@ -377,8 +407,8 @@ export class WebGpuBridgeHost {
 
         const opcode = dataView.getUint16(cursor, true);
         cursor += 2;
-        if (pendingDrawParameters && opcode !== OPCODE_RENDER_PASS) {
-          throw new Error("SetDrawParameters must immediately precede RenderPass");
+        if (pendingDrawParameters && opcode !== OPCODE_RENDER_PASS && opcode !== OPCODE_RENDER_PASS_DEPTH) {
+          throw new Error("SetDrawParameters must immediately precede RenderPass or RenderPassDepth");
         }
 
         switch (opcode) {
@@ -441,10 +471,17 @@ export class WebGpuBridgeHost {
             cursor += 20;
 
             let format;
+            let isDepth = false;
             if (formatCode === 1) {
               format = "bgra8unorm";
             } else if (formatCode === 2) {
               format = "rgba8unorm";
+            } else if (formatCode === 3) {
+              format = "depth24plus";
+              isDepth = true;
+            } else if (formatCode === 4) {
+              format = "depth32float";
+              isDepth = true;
             } else {
               throw new Error(`Invalid texture formatCode: ${formatCode}`);
             }
@@ -455,7 +492,9 @@ export class WebGpuBridgeHost {
               usage: usage,
             });
             this.textures.set(textureId, texture);
-            this.lastRenderTargetId = textureId;
+            if (!isDepth) {
+              this.lastRenderTargetId = textureId;
+            }
             break;
           }
 
@@ -525,7 +564,7 @@ export class WebGpuBridgeHost {
                     arrayStride: vertexStride,
                     attributes: [
                       { shaderLocation: 0, offset: 0, format: "float32x3" },
-                      { shaderLocation: 1, offset: 12, format: "float32x2" },
+                      { shaderLocation: 1, offset: 12, format: vertexStride === 28 ? "float32x4" : "float32x2" },
                     ],
                   },
                 ]
@@ -548,7 +587,130 @@ export class WebGpuBridgeHost {
               },
             });
 
-            this.pipelines.set(pipelineId, { pipeline, bindGroupLayout, hasUniformBuffer, uniformSize });
+            this.pipelines.set(pipelineId, { pipeline, bindGroupLayout, hasUniformBuffer, uniformSize, hasDepth: false });
+            break;
+          }
+
+          case OPCODE_CREATE_PIPELINE_DEPTH: {
+            closeActivePass();
+            if (cursor + 44 > dataBlockStart) {
+              throw new Error(`Truncated CREATE_PIPELINE_DEPTH fields at command ${i}`);
+            }
+            const pipelineId = dataView.getUint32(cursor, true);
+            const codeOffset = dataView.getUint32(cursor + 4, true);
+            const codeLen = dataView.getUint32(cursor + 8, true);
+            const formatCode = dataView.getUint32(cursor + 12, true);
+            const hasVertexBuffer = dataView.getUint32(cursor + 16, true) === 1;
+            const hasUniformBuffer = dataView.getUint32(cursor + 20, true) === 1;
+            const explicitUniformSize = dataView.getUint32(cursor + 24, true);
+            const explicitVertexStride = dataView.getUint32(cursor + 28, true);
+            const depthFormatCode = dataView.getUint32(cursor + 32, true);
+            const depthWriteEnabled = dataView.getUint32(cursor + 36, true) === 1;
+            const depthCompareCode = dataView.getUint32(cursor + 40, true);
+            cursor += 44;
+
+            if (codeOffset + codeLen > dataPayload.byteLength) {
+              throw new Error(`CreatePipelineDepth: shader code slice out of bounds (offset ${codeOffset} + len ${codeLen} > payload ${dataPayload.byteLength})`);
+            }
+
+            let format;
+            if (formatCode === 0) {
+              format = this.capabilityRecord?.preferredCanvasFormat || "bgra8unorm";
+            } else if (formatCode === 1) {
+              format = "bgra8unorm";
+            } else if (formatCode === 2) {
+              format = "rgba8unorm";
+            } else {
+              throw new Error(`Invalid pipeline target formatCode: ${formatCode}`);
+            }
+
+            let depthFormat;
+            if (depthFormatCode === 3) {
+              depthFormat = "depth24plus";
+            } else if (depthFormatCode === 4) {
+              depthFormat = "depth32float";
+            } else {
+              throw new Error(`CreatePipelineDepth: invalid depth formatCode ${depthFormatCode}`);
+            }
+
+            if (depthCompareCode < 1 || depthCompareCode > 8) {
+              throw new Error(`CreatePipelineDepth: invalid depth_compare code ${depthCompareCode}`);
+            }
+            const depthCompare = DEPTH_COMPARE_NAMES[depthCompareCode];
+
+            const codeBytes = dataPayload.subarray(codeOffset, codeOffset + codeLen);
+            const shaderCode = new TextDecoder().decode(codeBytes);
+
+            const shaderModule = this.device.createShaderModule({ code: shaderCode });
+
+            const uniformSize = explicitUniformSize > 0 ? explicitUniformSize : (hasUniformBuffer ? 48 : 0);
+
+            let bindGroupLayout = null;
+            if (hasUniformBuffer) {
+              bindGroupLayout = this.device.createBindGroupLayout({
+                entries: [
+                  {
+                    binding: 0,
+                    visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+                    buffer: {
+                      type: "uniform",
+                      hasDynamicOffset: true,
+                      minBindingSize: uniformSize,
+                    },
+                  },
+                ],
+              });
+            }
+
+            const pipelineLayout = this.device.createPipelineLayout({
+              bindGroupLayouts: bindGroupLayout ? [bindGroupLayout] : [],
+            });
+
+            const vertexStride = explicitVertexStride > 0 ? explicitVertexStride : 20;
+            const vertexBuffers = hasVertexBuffer
+              ? [
+                  {
+                    arrayStride: vertexStride,
+                    attributes: [
+                      { shaderLocation: 0, offset: 0, format: "float32x3" },
+                      { shaderLocation: 1, offset: 12, format: vertexStride === 28 ? "float32x4" : "float32x2" },
+                    ],
+                  },
+                ]
+              : [];
+
+            const pipeline = this.device.createRenderPipeline({
+              layout: pipelineLayout,
+              vertex: {
+                module: shaderModule,
+                entryPoint: "vs_main",
+                buffers: vertexBuffers,
+              },
+              fragment: {
+                module: shaderModule,
+                entryPoint: "fs_main",
+                targets: [{ format: format }],
+              },
+              primitive: {
+                topology: "triangle-list",
+              },
+              depthStencil: {
+                format: depthFormat,
+                depthWriteEnabled: depthWriteEnabled,
+                depthCompare: depthCompare,
+              },
+            });
+
+            this.pipelines.set(pipelineId, {
+              pipeline,
+              bindGroupLayout,
+              hasUniformBuffer,
+              uniformSize,
+              hasDepth: true,
+              depthFormat,
+              depthWriteEnabled,
+              depthCompare,
+            });
             break;
           }
 
@@ -594,7 +756,7 @@ export class WebGpuBridgeHost {
             }
 
             const isNewPass = (passFlags & 1) !== 0;
-            const targetKey = `${targetKind}:${targetId}`;
+            const targetKey = `${targetKind}:${targetId}:none`;
             if (hasDrawParameters && (isNewPass || currentPassTargetKey !== targetKey)) {
               throw new Error("SetDrawParameters cannot cross a render-pass boundary");
             }
@@ -633,6 +795,7 @@ export class WebGpuBridgeHost {
                 colorAttachments: [colorAttachmentDesc],
               });
               currentPassTargetKey = targetKey;
+              currentPassHasDepth = false;
               passState = {
                 pipelineId: null,
                 uniformBufferId: null,
@@ -686,6 +849,194 @@ export class WebGpuBridgeHost {
                   const vb = this.buffers.get(vertexBufferId);
                   if (!vb) {
                     throw new Error(`RenderPass: unknown vertexBufferId ${vertexBufferId}`);
+                  }
+                  currentPassEncoder.setVertexBuffer(0, vb);
+                  passState.vertexBufferId = vertexBufferId;
+                }
+              }
+
+              currentPassEncoder.draw(vertexCount, ...drawParameters);
+            }
+            break;
+          }
+
+          case OPCODE_RENDER_PASS_DEPTH: {
+            const hasDrawParameters = pendingDrawParameters !== null;
+            const drawParameters = pendingDrawParameters || [1, 0, 0];
+            pendingDrawParameters = null;
+            if (cursor + 56 > dataBlockStart) {
+              throw new Error(`Truncated RENDER_PASS_DEPTH fields at command ${i}`);
+            }
+            const rawTargetType = dataView.getUint32(cursor, true);
+            const targetKind = rawTargetType & 0xFF;
+            if (targetKind !== TARGET_OFFSCREEN && targetKind !== TARGET_CANVAS) {
+              throw new Error(`RenderPassDepth: invalid target kind ${targetKind} in 0x${rawTargetType.toString(16)}`);
+            }
+            const loadOpCode = (rawTargetType >> 8) & 0xFF;
+            if (loadOpCode > 2) {
+              throw new Error(`RenderPassDepth: invalid load_op code ${loadOpCode}`);
+            }
+            const storeOpCode = (rawTargetType >> 16) & 0xFF;
+            if (storeOpCode > 1) {
+              throw new Error(`RenderPassDepth: invalid store_op code ${storeOpCode}`);
+            }
+            const passFlags = (rawTargetType >> 24) & 0xFF;
+            if ((passFlags & ~1) !== 0) {
+              throw new Error(`RenderPassDepth: unknown pass flags 0x${passFlags.toString(16)}`);
+            }
+
+            const targetId = dataView.getUint32(cursor + 4, true);
+            const cr = dataView.getFloat32(cursor + 8, true);
+            const cg = dataView.getFloat32(cursor + 12, true);
+            const cb = dataView.getFloat32(cursor + 16, true);
+            const ca = dataView.getFloat32(cursor + 20, true);
+            const pipelineId = dataView.getUint32(cursor + 24, true);
+            const vertexBufferId = dataView.getUint32(cursor + 28, true);
+            const vertexCount = dataView.getUint32(cursor + 32, true);
+            const dynamicOffset = dataView.getUint32(cursor + 36, true);
+            const uniformBufferId = dataView.getUint32(cursor + 40, true) || 1;
+            const depthTargetId = dataView.getUint32(cursor + 44, true);
+            const packedDepthOps = dataView.getUint32(cursor + 48, true);
+            const depthClearValue = dataView.getFloat32(cursor + 52, true);
+            cursor += 56;
+
+            const depthLoadOpCode = packedDepthOps & 0xFF;
+            const depthStoreOpCode = (packedDepthOps >> 8) & 0xFF;
+            const depthReadOnlyCode = (packedDepthOps >> 16) & 0xFF;
+            const reservedDepthFlags = (packedDepthOps >> 24) & 0xFF;
+
+            if (depthLoadOpCode > 2) {
+              throw new Error(`RenderPassDepth: invalid depth_load_op code ${depthLoadOpCode}`);
+            }
+            if (depthStoreOpCode > 1) {
+              throw new Error(`RenderPassDepth: invalid depth_store_op code ${depthStoreOpCode}`);
+            }
+            if (depthReadOnlyCode > 1) {
+              throw new Error(`RenderPassDepth: invalid depth_read_only code ${depthReadOnlyCode}`);
+            }
+            if (reservedDepthFlags !== 0) {
+              throw new Error(`RenderPassDepth: reserved depth flags must be 0, received ${reservedDepthFlags}`);
+            }
+
+            if (targetKind === TARGET_OFFSCREEN) {
+              this.lastRenderTargetId = targetId;
+            }
+
+            const isNewPass = (passFlags & 1) !== 0;
+            const targetKey = `${targetKind}:${targetId}:depth:${depthTargetId}`;
+            if (hasDrawParameters && (isNewPass || currentPassTargetKey !== targetKey)) {
+              throw new Error("SetDrawParameters cannot cross a render-pass boundary");
+            }
+
+            if (!currentPassEncoder || currentPassTargetKey !== targetKey || isNewPass) {
+              closeActivePass();
+
+              let targetView;
+              if (targetKind === TARGET_CANVAS) {
+                if (!canvasContext) {
+                  throw new Error("RenderPassDepth: canvas target requires a canvas context");
+                }
+                // Canvas swapchain view is acquired at most once per packet execution (§8.5, [S48])
+                targetView = getCanvasView();
+              } else if (targetKind === TARGET_OFFSCREEN) {
+                const texture = this.textures.get(targetId);
+                if (!texture) {
+                  throw new Error(`RenderPassDepth: unknown offscreen targetId ${targetId}`);
+                }
+                targetView = texture.createView();
+              } else {
+                throw new Error(`Invalid render pass targetKind: ${targetKind}`);
+              }
+
+              const depthTexture = this.textures.get(depthTargetId);
+              if (!depthTexture) {
+                throw new Error(`RenderPassDepth: unknown depthTargetId ${depthTargetId}`);
+              }
+              const depthView = depthTexture.createView();
+
+              const loadOp = loadOpCode === 1 ? "load" : "clear";
+              const storeOp = storeOpCode === 1 ? "discard" : "store";
+              const colorAttachmentDesc = {
+                view: targetView,
+                loadOp,
+                storeOp,
+              };
+              if (loadOp === "clear") {
+                colorAttachmentDesc.clearValue = { r: cr, g: cg, b: cb, a: ca };
+              }
+
+              const depthReadOnly = depthReadOnlyCode === 1;
+              const depthAttachmentDesc = {
+                view: depthView,
+                depthReadOnly,
+              };
+              if (!depthReadOnly) {
+                const depthLoadOp = depthLoadOpCode === 1 ? "load" : "clear";
+                const depthStoreOp = depthStoreOpCode === 1 ? "discard" : "store";
+                depthAttachmentDesc.depthLoadOp = depthLoadOp;
+                depthAttachmentDesc.depthStoreOp = depthStoreOp;
+                if (depthLoadOp === "clear") {
+                  depthAttachmentDesc.depthClearValue = depthClearValue;
+                }
+              }
+
+              currentPassEncoder = commandEncoder.beginRenderPass({
+                colorAttachments: [colorAttachmentDesc],
+                depthStencilAttachment: depthAttachmentDesc,
+              });
+              currentPassTargetKey = targetKey;
+              currentPassHasDepth = true;
+              passState = {
+                pipelineId: null,
+                uniformBufferId: null,
+                dynamicOffset: null,
+                vertexBufferId: null,
+              };
+            }
+
+            if (vertexCount > 0) {
+              const pipelineRecord = this.pipelines.get(pipelineId);
+              if (!pipelineRecord) {
+                throw new Error(`RenderPassDepth: unknown pipelineId ${pipelineId}`);
+              }
+
+              if (passState.pipelineId !== pipelineId) {
+                currentPassEncoder.setPipeline(pipelineRecord.pipeline);
+                passState.pipelineId = pipelineId;
+                passState.uniformBufferId = null;
+                passState.dynamicOffset = null;
+              }
+
+              if (pipelineRecord.hasUniformBuffer) {
+                if (passState.uniformBufferId !== uniformBufferId || passState.dynamicOffset !== dynamicOffset) {
+                  const uniformBuf = this.buffers.get(uniformBufferId);
+                  if (!uniformBuf) {
+                    throw new Error(`RenderPassDepth: uniform buffer ${uniformBufferId} missing for pipeline`);
+                  }
+                  const bindGroup = this.device.createBindGroup({
+                    layout: pipelineRecord.bindGroupLayout,
+                    entries: [
+                      {
+                        binding: 0,
+                        resource: {
+                          buffer: uniformBuf,
+                          offset: 0,
+                          size: pipelineRecord.uniformSize || 48,
+                        },
+                      },
+                    ],
+                  });
+                  currentPassEncoder.setBindGroup(0, bindGroup, [dynamicOffset]);
+                  passState.uniformBufferId = uniformBufferId;
+                  passState.dynamicOffset = dynamicOffset;
+                }
+              }
+
+              if (vertexBufferId > 0) {
+                if (passState.vertexBufferId !== vertexBufferId) {
+                  const vb = this.buffers.get(vertexBufferId);
+                  if (!vb) {
+                    throw new Error(`RenderPassDepth: unknown vertexBufferId ${vertexBufferId}`);
                   }
                   currentPassEncoder.setVertexBuffer(0, vb);
                   passState.vertexBufferId = vertexBufferId;
@@ -758,6 +1109,9 @@ export class WebGpuBridgeHost {
             if (!pipelineRecord) {
               throw new Error(`RecordBundle: unknown pipelineId ${pipelineId}`);
             }
+            if (pipelineRecord.hasDepth) {
+              throw new Error("RecordBundle: bundles with depth attachments are not yet implemented");
+            }
 
             const bundleEncoder = this.device.createRenderBundleEncoder({
               colorFormats: [format],
@@ -804,6 +1158,9 @@ export class WebGpuBridgeHost {
           }
 
           case OPCODE_EXECUTE_BUNDLES: {
+            if (currentPassHasDepth) {
+              throw new Error("ExecuteBundles: bundles in passes with depth attachments are not yet implemented");
+            }
             if (cursor + 4 > dataBlockStart) {
               throw new Error(`Truncated EXECUTE_BUNDLES fields at command ${i}`);
             }
@@ -842,6 +1199,8 @@ export class WebGpuBridgeHost {
                     foundTarget = true;
                   }
                   break;
+                } else if (nextOp === OPCODE_RENDER_PASS_DEPTH) {
+                  throw new Error("ExecuteBundles: bundles in passes with depth attachments are not yet implemented");
                 } else if (nextOp === OPCODE_CREATE_BUFFER) {
                   scanCursor += 12;
                 } else if (nextOp === OPCODE_WRITE_BUFFER) {
@@ -850,10 +1209,18 @@ export class WebGpuBridgeHost {
                   scanCursor += 20;
                 } else if (nextOp === OPCODE_CREATE_PIPELINE) {
                   scanCursor += 32;
+                } else if (nextOp === OPCODE_CREATE_PIPELINE_DEPTH) {
+                  scanCursor += 44;
                 } else if (nextOp === OPCODE_COPY_TEXTURE_TO_BUFFER) {
                   scanCursor += 24;
                 } else if (nextOp === OPCODE_RECORD_BUNDLE) {
                   scanCursor += 28;
+                } else if (nextOp === OPCODE_SET_VIEWPORT) {
+                  scanCursor += 24;
+                } else if (nextOp === OPCODE_SET_SCISSOR_RECT) {
+                  scanCursor += 16;
+                } else if (nextOp === OPCODE_SET_DRAW_PARAMETERS) {
+                  scanCursor += 12;
                 } else if (nextOp === OPCODE_EXECUTE_BUNDLES) {
                   if (scanCursor + 4 <= dataBlockStart) {
                     const cnt = dataView.getUint32(scanCursor, true);
@@ -900,7 +1267,8 @@ export class WebGpuBridgeHost {
                   },
                 ],
               });
-              currentPassTargetKey = `${targetType}:${targetId}`;
+              currentPassTargetKey = `${targetType}:${targetId}:none`;
+              currentPassHasDepth = false;
               passState = {
                 pipelineId: null,
                 uniformBufferId: null,
@@ -989,7 +1357,7 @@ export class WebGpuBridgeHost {
       }
 
       if (pendingDrawParameters) {
-        throw new Error("SetDrawParameters has no following RenderPass");
+        throw new Error("SetDrawParameters has no following RenderPass or RenderPassDepth");
       }
       closeActivePass();
       frameCanvasView = null;
@@ -1033,3 +1401,4 @@ export class WebGpuBridgeHost {
     return copy;
   }
 }
+
