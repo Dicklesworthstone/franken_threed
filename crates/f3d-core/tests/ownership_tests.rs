@@ -5,8 +5,9 @@
 use core::num::NonZeroU32;
 use f3d_core::handle::{Handle, MaterialDomain, RegionDomain};
 use f3d_core::ownership::{
-    Author, BorrowScope, BorrowState, BorrowToken, CopyAccounting, DataVersion, Epoch, OwnerMode,
-    OwnershipError, PerUseByteBuffer, PerUseSnapshotStore, RegionState, UseRecord,
+    Author, BorrowScope, BorrowState, BorrowToken, DataVersion, Epoch, OwnerMode,
+    OwnershipError, PerUseByteBuffer, PerUseSnapshotStore, RegionAuthorshipDump, RegionState,
+    UseRecord,
 };
 
 #[test]
@@ -120,6 +121,115 @@ fn legal_mirrored_mode_transitions() {
         }
     );
     assert_eq!(state.author(), Author::Wasm);
+}
+
+#[test]
+fn region_state_authorship_dump_reflects_transfer() {
+    let handle = Handle::<RegionDomain>::new(42, NonZeroU32::new(1).unwrap());
+    let mut state = RegionState::new(handle);
+
+    // Initial state: Js author, zero epoch, no pending writes
+    let d0 = state.authorship_dump();
+    assert_eq!(
+        d0,
+        RegionAuthorshipDump {
+            mode: OwnerMode::Js,
+            author: Author::Js,
+            current_epoch: Epoch::ZERO,
+            published_epoch: Epoch::ZERO,
+            unpublished_writes: 0,
+        }
+    );
+    assert_eq!(
+        format!("{d0}"),
+        "mode=Js, author=Js, current_epoch=0, published_epoch=0, unpublished_writes=0"
+    );
+
+    // Mutation pending publication: unpublished_writes increments, epochs stay zero
+    state.record_write(Author::Js).expect("JS write succeeds");
+    let d1 = state.authorship_dump();
+    assert_eq!(d1.unpublished_writes, 1);
+    assert_eq!(d1.current_epoch, Epoch::ZERO);
+    assert_eq!(d1.published_epoch, Epoch::ZERO);
+    assert_eq!(
+        format!("{d1}"),
+        "mode=Js, author=Js, current_epoch=0, published_epoch=0, unpublished_writes=1"
+    );
+
+    // Publish advances current_epoch and published_epoch to 1, clears pending writes
+    state
+        .publish(Author::Js, Epoch::ZERO)
+        .expect("JS publish succeeds");
+    let d2 = state.authorship_dump();
+    assert_eq!(d2.current_epoch, Epoch::new(1));
+    assert_eq!(d2.published_epoch, Epoch::new(1));
+    assert_eq!(d2.unpublished_writes, 0);
+    assert_eq!(
+        format!("{d2}"),
+        "mode=Js, author=Js, current_epoch=1, published_epoch=1, unpublished_writes=0"
+    );
+
+    // Transfer authority from JS to Wasm at epoch 1 -> advances current_epoch to 2,
+    // switches mode and author to Wasm, while published_epoch stays at 1
+    let ep2 = state
+        .transfer_authority(Author::Js, Author::Wasm, Epoch::new(1))
+        .expect("transfer to Wasm succeeds");
+    assert_eq!(ep2.get(), 2);
+
+    let d3 = state.authorship_dump();
+    assert_eq!(d3.mode, OwnerMode::Wasm);
+    assert_eq!(d3.author, Author::Wasm);
+    assert_eq!(d3.current_epoch, Epoch::new(2));
+    assert_eq!(d3.published_epoch, Epoch::new(1));
+    assert_eq!(d3.unpublished_writes, 0);
+    assert_eq!(
+        format!("{d3}"),
+        "mode=Wasm, author=Wasm, current_epoch=2, published_epoch=1, unpublished_writes=0"
+    );
+
+    // Transition to Mirrored mode with Author::Wasm -> advances current_epoch to 3
+    state
+        .transition_mode(
+            Author::Wasm,
+            OwnerMode::Mirrored {
+                author: Author::Wasm,
+            },
+            Epoch::new(2),
+        )
+        .expect("transition to mirrored succeeds");
+    let d4 = state.authorship_dump();
+    assert_eq!(
+        d4.mode,
+        OwnerMode::Mirrored {
+            author: Author::Wasm
+        }
+    );
+    assert_eq!(d4.author, Author::Wasm);
+    assert_eq!(d4.current_epoch, Epoch::new(3));
+    assert_eq!(d4.published_epoch, Epoch::new(1));
+    assert_eq!(
+        format!("{d4}"),
+        "mode=Mirrored(Wasm), author=Wasm, current_epoch=3, published_epoch=1, unpublished_writes=0"
+    );
+
+    // Mirrored transfer back to JS advances current_epoch to 4, published_epoch stays at 1
+    state
+        .transfer_authority(Author::Wasm, Author::Js, Epoch::new(3))
+        .expect("transfer mirrored to JS succeeds");
+    let d5 = state.authorship_dump();
+    assert_eq!(
+        d5.mode,
+        OwnerMode::Mirrored {
+            author: Author::Js
+        }
+    );
+    assert_eq!(d5.author, Author::Js);
+    assert_eq!(d5.current_epoch, Epoch::new(4));
+    assert_eq!(d5.published_epoch, Epoch::new(1));
+    assert_eq!(
+        format!("{d5}"),
+        "mode=Mirrored(Js), author=Js, current_epoch=4, published_epoch=1, unpublished_writes=0"
+    );
 }
 
 #[test]
@@ -859,4 +969,1118 @@ fn borrow_scope_exact_copy_accounting_counters() {
     assert_eq!(scope.accounting().total_copied_bytes(), 0);
     assert_eq!(scope.accounting().total_transported_bytes(), 0);
 }
+
+// -----------------------------------------------------------------------------
+// Seeded deterministic property tests (vqa.3)
+// -----------------------------------------------------------------------------
+
+/// Minimal 64-bit Linear Congruential Generator (LCG) for deterministic property testing.
+#[derive(Clone, Copy, Debug)]
+struct TestLcg {
+    state: u64,
+}
+
+impl TestLcg {
+    const fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self
+            .state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.state
+    }
+
+    fn next_u32(&mut self) -> u32 {
+        (self.next_u64() >> 32) as u32
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StepRecord {
+    step: usize,
+    action: &'static str,
+    author: Author,
+    epoch_words: (u32, u32),
+    result_variant: &'static str,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TransitionRing {
+    entries: [Option<StepRecord>; 16],
+    cursor: usize,
+    count: usize,
+}
+
+impl TransitionRing {
+    const fn new() -> Self {
+        Self {
+            entries: [None; 16],
+            cursor: 0,
+            count: 0,
+        }
+    }
+
+    fn push(&mut self, record: StepRecord) {
+        self.entries[self.cursor] = Some(record);
+        self.cursor = (self.cursor + 1) % 16;
+        self.count += 1;
+    }
+}
+
+impl core::fmt::Display for TransitionRing {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let total = if self.count < 16 { self.count } else { 16 };
+        if total == 0 {
+            return write!(f, "    [no steps recorded]");
+        }
+        let start = if self.count < 16 { 0 } else { self.cursor };
+        for i in 0..total {
+            let idx = (start + i) % 16;
+            if let Some(entry) = &self.entries[idx] {
+                if i > 0 {
+                    writeln!(f)?;
+                }
+                write!(
+                    f,
+                    "    [{:02}] step={}: action={}, author={}, epoch_words=({:#010x}, {:#010x}), result={}",
+                    i,
+                    entry.step,
+                    entry.action,
+                    entry.author,
+                    entry.epoch_words.0,
+                    entry.epoch_words.1,
+                    entry.result_variant,
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn result_variant_name<T>(res: &Result<T, OwnershipError>) -> &'static str {
+    match res {
+        Ok(_) => "Ok",
+        Err(OwnershipError::UnauthorizedWriter { .. }) => "Err(UnauthorizedWriter)",
+        Err(OwnershipError::UnpublishedWritesPending { .. }) => "Err(UnpublishedWritesPending)",
+        Err(OwnershipError::StaleEpoch { .. }) => "Err(StaleEpoch)",
+        Err(OwnershipError::SameAuthorTransfer { .. }) => "Err(SameAuthorTransfer)",
+        Err(OwnershipError::EpochOverflow { .. }) => "Err(EpochOverflow)",
+        Err(OwnershipError::VersionOverflow { .. }) => "Err(VersionOverflow)",
+        Err(OwnershipError::StoreIdOverflow { .. }) => "Err(StoreIdOverflow)",
+        Err(OwnershipError::ImmutableSnapshotViolation { .. }) => "Err(ImmutableSnapshotViolation)",
+        Err(OwnershipError::StaleSliceRecord { .. }) => "Err(StaleSliceRecord)",
+        Err(OwnershipError::ForeignSliceRecord { .. }) => "Err(ForeignSliceRecord)",
+        Err(OwnershipError::SliceIdentityMismatch { .. }) => "Err(SliceIdentityMismatch)",
+        Err(OwnershipError::SliceOutOfBounds { .. }) => "Err(SliceOutOfBounds)",
+        Err(OwnershipError::SliceNotFound { .. }) => "Err(SliceNotFound)",
+        Err(OwnershipError::InvalidSliceLength { .. }) => "Err(InvalidSliceLength)",
+        Err(OwnershipError::InvalidAlignment { .. }) => "Err(InvalidAlignment)",
+        Err(OwnershipError::BorrowScopeReentry { .. }) => "Err(BorrowScopeReentry)",
+        Err(OwnershipError::BorrowScopeNotActive) => "Err(BorrowScopeNotActive)",
+        Err(OwnershipError::BorrowTokenMismatch { .. }) => "Err(BorrowTokenMismatch)",
+        Err(OwnershipError::LinearMemoryGrowthBlocked { .. }) => "Err(LinearMemoryGrowthBlocked)",
+        Err(OwnershipError::Handle(_)) => "Err(Handle)",
+    }
+}
+
+fn expect_err_with_ring<T: core::fmt::Debug>(
+    res: Result<T, OwnershipError>,
+    op_desc: &str,
+    seed: u64,
+    iter: usize,
+    step: usize,
+    ring: &TransitionRing,
+) -> OwnershipError {
+    match res {
+        Err(e) => e,
+        Ok(v) => panic!(
+            "{op_desc} must fail but returned Ok({v:?}) for seed {seed:#018x} at iter {iter} step {step}\nrecent transitions:\n{ring}"
+        ),
+    }
+}
+
+fn unwrap_ok_with_ring<T>(
+    res: Result<T, OwnershipError>,
+    op_desc: &str,
+    seed: u64,
+    iter: usize,
+    step: usize,
+    ring: &TransitionRing,
+) -> T {
+    match res {
+        Ok(v) => v,
+        Err(e) => panic!(
+            "{op_desc} failed with error {e:?} for seed {seed:#018x} at iter {iter} step {step}\nrecent transitions:\n{ring}"
+        ),
+    }
+}
+
+#[test]
+fn property_test_region_state_transition_sequences() {
+    const SEED: u64 = 0x0BE4_57A7_E001_0001;
+    const ITERATIONS: usize = 2_000;
+    const STEPS_PER_ITER: usize = 50;
+
+    let mut rng = TestLcg::new(SEED);
+
+    for i in 0..ITERATIONS {
+        let handle_idx = rng.next_u32();
+        let handle_generation = NonZeroU32::new((rng.next_u32() % 10_000) + 1).unwrap();
+        let handle = Handle::<RegionDomain>::new(handle_idx, handle_generation);
+
+        let initial_mode = match rng.next_u32() % 3 {
+            0 => OwnerMode::Js,
+            1 => OwnerMode::Wasm,
+            _ => OwnerMode::Mirrored {
+                author: if rng.next_u32() % 2 == 0 {
+                    Author::Js
+                } else {
+                    Author::Wasm
+                },
+            },
+        };
+        let mut state = RegionState::with_mode(handle, initial_mode);
+        let mut ring = TransitionRing::new();
+
+        for step in 0..STEPS_PER_ITER {
+            let prev_epoch = state.current_epoch();
+            let prev_version = state.current_version();
+            let prev_author = state.author();
+            let prev_unpublished = state.unpublished_writes();
+
+            // Generate an epoch candidate:
+            // 0..=2: exactly matching current_epoch (fresh)
+            // 3: stale epoch (prior to current_epoch)
+            // 4: future/mismatched epoch
+            let epoch_selector = rng.next_u32() % 5;
+            let candidate_epoch = match epoch_selector {
+                0..=2 => prev_epoch,
+                3 => {
+                    let stale_delta = (rng.next_u32() as u64 % 10) + 1;
+                    Epoch::new(prev_epoch.get().saturating_sub(stale_delta))
+                }
+                _ => {
+                    let future_delta = (rng.next_u32() as u64 % 10) + 1;
+                    Epoch::new(prev_epoch.get().wrapping_add(future_delta))
+                }
+            };
+            let is_stale_or_mismatched_epoch = candidate_epoch != prev_epoch;
+
+            let action_type = rng.next_u32() % 4;
+            match action_type {
+                0 => {
+                    // record_write
+                    let writer = if rng.next_u32() % 2 == 0 {
+                        Author::Js
+                    } else {
+                        Author::Wasm
+                    };
+                    let res = state.record_write(writer);
+                    ring.push(StepRecord {
+                        step,
+                        action: "record_write",
+                        author: writer,
+                        epoch_words: candidate_epoch.to_words(),
+                        result_variant: result_variant_name(&res),
+                    });
+
+                    if writer == prev_author {
+                        let new_ver = unwrap_ok_with_ring(
+                            res,
+                            "record_write by authoritative author",
+                            SEED,
+                            i,
+                            step,
+                            &ring,
+                        );
+                        assert_eq!(
+                            new_ver,
+                            prev_version.checked_next().unwrap(),
+                            "version mismatch for seed {SEED:#018x} at iter {i} step {step}\nrecent transitions:\n{ring}"
+                        );
+                        assert_eq!(
+                            state.unpublished_writes(),
+                            prev_unpublished + 1,
+                            "unpublished count mismatch for seed {SEED:#018x} at iter {i} step {step}\nrecent transitions:\n{ring}"
+                        );
+                        assert_eq!(
+                            state.current_epoch(),
+                            prev_epoch,
+                            "epoch must not change on record_write for seed {SEED:#018x} at iter {i} step {step}\nrecent transitions:\n{ring}"
+                        );
+                    } else {
+                        let err = expect_err_with_ring(
+                            res,
+                            "record_write by unauthoritative author",
+                            SEED,
+                            i,
+                            step,
+                            &ring,
+                        );
+                        assert_eq!(
+                            err,
+                            OwnershipError::UnauthorizedWriter {
+                                expected: prev_author,
+                                actual: writer,
+                            },
+                            "error mismatch for seed {SEED:#018x} at iter {i} step {step}\nrecent transitions:\n{ring}"
+                        );
+                        assert_eq!(
+                            state.unpublished_writes(),
+                            prev_unpublished,
+                            "state must not mutate on failed write for seed {SEED:#018x} at iter {i} step {step}\nrecent transitions:\n{ring}"
+                        );
+                    }
+                }
+                1 => {
+                    // publish
+                    let publisher = if rng.next_u32() % 2 == 0 {
+                        Author::Js
+                    } else {
+                        Author::Wasm
+                    };
+                    let res = state.publish(publisher, candidate_epoch);
+                    ring.push(StepRecord {
+                        step,
+                        action: "publish",
+                        author: publisher,
+                        epoch_words: candidate_epoch.to_words(),
+                        result_variant: result_variant_name(&res),
+                    });
+
+                    // INVARIANT: State machine never accepts a stale epoch
+                    if is_stale_or_mismatched_epoch && publisher == prev_author {
+                        assert!(
+                            res.is_err(),
+                            "publish must never accept stale/mismatched epoch {candidate_epoch:?} (current {prev_epoch:?}) for seed {SEED:#018x} at iter {i} step {step}\nrecent transitions:\n{ring}"
+                        );
+                    }
+
+                    if publisher != prev_author {
+                        let err = expect_err_with_ring(
+                            res,
+                            "publish by unauthorized author",
+                            SEED,
+                            i,
+                            step,
+                            &ring,
+                        );
+                        assert_eq!(
+                            err,
+                            OwnershipError::UnauthorizedWriter {
+                                expected: prev_author,
+                                actual: publisher,
+                            },
+                            "error mismatch for seed {SEED:#018x} at iter {i} step {step}\nrecent transitions:\n{ring}"
+                        );
+                    } else if is_stale_or_mismatched_epoch {
+                        let err = expect_err_with_ring(
+                            res,
+                            "publish with stale epoch",
+                            SEED,
+                            i,
+                            step,
+                            &ring,
+                        );
+                        assert_eq!(
+                            err,
+                            OwnershipError::StaleEpoch {
+                                expected: prev_epoch,
+                                actual: candidate_epoch,
+                            },
+                            "error mismatch for seed {SEED:#018x} at iter {i} step {step}\nrecent transitions:\n{ring}"
+                        );
+                    } else {
+                        let new_epoch = unwrap_ok_with_ring(
+                            res,
+                            "authorized publish",
+                            SEED,
+                            i,
+                            step,
+                            &ring,
+                        );
+                        assert_eq!(
+                            new_epoch,
+                            prev_epoch.checked_next().unwrap(),
+                            "published epoch must advance by 1 for seed {SEED:#018x} at iter {i} step {step}\nrecent transitions:\n{ring}"
+                        );
+                        assert_eq!(
+                            state.current_epoch(),
+                            new_epoch,
+                            "state current_epoch mismatch for seed {SEED:#018x} at iter {i} step {step}\nrecent transitions:\n{ring}"
+                        );
+                        assert_eq!(
+                            state.unpublished_writes(),
+                            0,
+                            "unpublished_writes must be cleared on publish for seed {SEED:#018x} at iter {i} step {step}\nrecent transitions:\n{ring}"
+                        );
+                    }
+                }
+                2 => {
+                    // transfer_authority
+                    let from = if rng.next_u32() % 2 == 0 {
+                        Author::Js
+                    } else {
+                        Author::Wasm
+                    };
+                    let to = if rng.next_u32() % 2 == 0 {
+                        Author::Js
+                    } else {
+                        Author::Wasm
+                    };
+                    let res = state.transfer_authority(from, to, candidate_epoch);
+                    ring.push(StepRecord {
+                        step,
+                        action: "transfer_authority",
+                        author: from,
+                        epoch_words: candidate_epoch.to_words(),
+                        result_variant: result_variant_name(&res),
+                    });
+
+                    // INVARIANT: State machine never accepts a stale epoch
+                    if is_stale_or_mismatched_epoch && from == prev_author && from != to {
+                        assert!(
+                            res.is_err(),
+                            "transfer_authority must never accept stale/mismatched epoch {candidate_epoch:?} (current {prev_epoch:?}) for seed {SEED:#018x} at iter {i} step {step}\nrecent transitions:\n{ring}"
+                        );
+                    }
+
+                    if from == to {
+                        let err = expect_err_with_ring(
+                            res,
+                            "same author transfer",
+                            SEED,
+                            i,
+                            step,
+                            &ring,
+                        );
+                        assert_eq!(
+                            err,
+                            OwnershipError::SameAuthorTransfer { author: from },
+                            "error mismatch for seed {SEED:#018x} at iter {i} step {step}\nrecent transitions:\n{ring}"
+                        );
+                    } else if from != prev_author {
+                        let err = expect_err_with_ring(
+                            res,
+                            "transfer from non-author",
+                            SEED,
+                            i,
+                            step,
+                            &ring,
+                        );
+                        assert_eq!(
+                            err,
+                            OwnershipError::UnauthorizedWriter {
+                                expected: prev_author,
+                                actual: from,
+                            },
+                            "error mismatch for seed {SEED:#018x} at iter {i} step {step}\nrecent transitions:\n{ring}"
+                        );
+                    } else if is_stale_or_mismatched_epoch {
+                        let err = expect_err_with_ring(
+                            res,
+                            "transfer with stale epoch",
+                            SEED,
+                            i,
+                            step,
+                            &ring,
+                        );
+                        assert_eq!(
+                            err,
+                            OwnershipError::StaleEpoch {
+                                expected: prev_epoch,
+                                actual: candidate_epoch,
+                            },
+                            "error mismatch for seed {SEED:#018x} at iter {i} step {step}\nrecent transitions:\n{ring}"
+                        );
+                    } else if prev_unpublished > 0 {
+                        let err = expect_err_with_ring(
+                            res,
+                            "transfer with unpublished writes",
+                            SEED,
+                            i,
+                            step,
+                            &ring,
+                        );
+                        assert_eq!(
+                            err,
+                            OwnershipError::UnpublishedWritesPending {
+                                pending_count: prev_unpublished,
+                                current_epoch: prev_epoch,
+                            },
+                            "error mismatch for seed {SEED:#018x} at iter {i} step {step}\nrecent transitions:\n{ring}"
+                        );
+                    } else {
+                        // INVARIANT: Every accepted transfer advances the epoch
+                        let new_epoch = unwrap_ok_with_ring(
+                            res,
+                            "valid authority transfer",
+                            SEED,
+                            i,
+                            step,
+                            &ring,
+                        );
+                        assert_eq!(
+                            new_epoch,
+                            prev_epoch.checked_next().unwrap(),
+                            "accepted transfer must advance epoch for seed {SEED:#018x} at iter {i} step {step}\nrecent transitions:\n{ring}"
+                        );
+                        assert!(
+                            new_epoch.get() > prev_epoch.get(),
+                            "accepted transfer epoch must be strictly greater for seed {SEED:#018x} at iter {i} step {step}\nrecent transitions:\n{ring}"
+                        );
+                        assert_eq!(
+                            state.current_epoch(),
+                            new_epoch,
+                            "current_epoch mismatch for seed {SEED:#018x} at iter {i} step {step}\nrecent transitions:\n{ring}"
+                        );
+                        assert_eq!(
+                            state.author(),
+                            to,
+                            "new author must be {to:?} for seed {SEED:#018x} at iter {i} step {step}\nrecent transitions:\n{ring}"
+                        );
+                        assert_eq!(
+                            state.unpublished_writes(),
+                            0,
+                            "pending writes must be zero for seed {SEED:#018x} at iter {i} step {step}\nrecent transitions:\n{ring}"
+                        );
+                    }
+                }
+                _ => {
+                    // transition_mode
+                    let author = if rng.next_u32() % 2 == 0 {
+                        Author::Js
+                    } else {
+                        Author::Wasm
+                    };
+                    let new_mode = match rng.next_u32() % 3 {
+                        0 => OwnerMode::Js,
+                        1 => OwnerMode::Wasm,
+                        _ => OwnerMode::Mirrored {
+                            author: if rng.next_u32() % 2 == 0 {
+                                Author::Js
+                            } else {
+                                Author::Wasm
+                            },
+                        },
+                    };
+                    let res = state.transition_mode(author, new_mode, candidate_epoch);
+                    ring.push(StepRecord {
+                        step,
+                        action: "transition_mode",
+                        author,
+                        epoch_words: candidate_epoch.to_words(),
+                        result_variant: result_variant_name(&res),
+                    });
+
+                    // INVARIANT: State machine never accepts a stale epoch
+                    if is_stale_or_mismatched_epoch && author == prev_author {
+                        assert!(
+                            res.is_err(),
+                            "transition_mode must never accept stale/mismatched epoch {candidate_epoch:?} (current {prev_epoch:?}) for seed {SEED:#018x} at iter {i} step {step}\nrecent transitions:\n{ring}"
+                        );
+                    }
+
+                    if author != prev_author {
+                        let err = expect_err_with_ring(
+                            res,
+                            "transition_mode by unauthorized author",
+                            SEED,
+                            i,
+                            step,
+                            &ring,
+                        );
+                        assert_eq!(
+                            err,
+                            OwnershipError::UnauthorizedWriter {
+                                expected: prev_author,
+                                actual: author,
+                            },
+                            "error mismatch for seed {SEED:#018x} at iter {i} step {step}\nrecent transitions:\n{ring}"
+                        );
+                    } else if is_stale_or_mismatched_epoch {
+                        let err = expect_err_with_ring(
+                            res,
+                            "transition_mode with stale epoch",
+                            SEED,
+                            i,
+                            step,
+                            &ring,
+                        );
+                        assert_eq!(
+                            err,
+                            OwnershipError::StaleEpoch {
+                                expected: prev_epoch,
+                                actual: candidate_epoch,
+                            },
+                            "error mismatch for seed {SEED:#018x} at iter {i} step {step}\nrecent transitions:\n{ring}"
+                        );
+                    } else if prev_unpublished > 0 {
+                        let err = expect_err_with_ring(
+                            res,
+                            "transition_mode with unpublished writes",
+                            SEED,
+                            i,
+                            step,
+                            &ring,
+                        );
+                        assert_eq!(
+                            err,
+                            OwnershipError::UnpublishedWritesPending {
+                                pending_count: prev_unpublished,
+                                current_epoch: prev_epoch,
+                            },
+                            "error mismatch for seed {SEED:#018x} at iter {i} step {step}\nrecent transitions:\n{ring}"
+                        );
+                    } else {
+                        let new_epoch = unwrap_ok_with_ring(
+                            res,
+                            "valid transition_mode",
+                            SEED,
+                            i,
+                            step,
+                            &ring,
+                        );
+                        assert_eq!(
+                            new_epoch,
+                            prev_epoch.checked_next().unwrap(),
+                            "transition_mode must advance epoch for seed {SEED:#018x} at iter {i} step {step}\nrecent transitions:\n{ring}"
+                        );
+                        assert_eq!(
+                            state.current_epoch(),
+                            new_epoch,
+                            "current_epoch mismatch for seed {SEED:#018x} at iter {i} step {step}\nrecent transitions:\n{ring}"
+                        );
+                        assert_eq!(
+                            state.mode(),
+                            new_mode,
+                            "mode mismatch for seed {SEED:#018x} at iter {i} step {step}\nrecent transitions:\n{ring}"
+                        );
+                        assert_eq!(
+                            state.author(),
+                            new_mode.author(),
+                            "author mismatch for seed {SEED:#018x} at iter {i} step {step}\nrecent transitions:\n{ring}"
+                        );
+                    }
+                }
+            }
+
+            // GLOBAL INVARIANTS AFTER EVERY STEP
+            assert!(
+                state.current_epoch().get() >= prev_epoch.get(),
+                "epoch must never decrease for seed {SEED:#018x} at iter {i} step {step}\nrecent transitions:\n{ring}"
+            );
+        }
+    }
+}
+
+#[test]
+fn property_test_snapshot_store_and_borrow_scope_interleavings() {
+    const SEED: u64 = 0x5070_5580_0001_0001;
+    const ITERATIONS: usize = 2_000;
+    const STEPS_PER_ITER: usize = 50;
+
+    let mut rng = TestLcg::new(SEED);
+
+    for iter in 0..ITERATIONS {
+        let mut store: PerUseSnapshotStore<MaterialDomain, [f32; 4]> =
+            PerUseSnapshotStore::new(16).unwrap_or_else(|e| {
+                panic!("store init failed for seed {SEED:#018x} at iter {iter}: {e:?}")
+            });
+        let mut scope = BorrowScope::new();
+
+        let mut current_records: Vec<(UseRecord<MaterialDomain>, [f32; 4])> = Vec::new();
+        let mut stale_records: Vec<UseRecord<MaterialDomain>> = Vec::new();
+        let mut active_token: Option<BorrowToken> = None;
+        let mut explicit_growth_blocked: bool = false;
+
+        let mut expected_view_bytes: u64 = 0;
+        let mut expected_wb_copies: u64 = 0;
+        let mut expected_staging_copies: u64 = 0;
+
+        for step in 0..STEPS_PER_ITER {
+            let action = rng.next_u32() % 9;
+            match action {
+                0 => {
+                    // 1. Snapshot publish
+                    let mat_index = rng.next_u32() % 8;
+                    let handle = Handle::<MaterialDomain>::new(mat_index, NonZeroU32::new(1).unwrap());
+                    let version_val = (rng.next_u32() % 4) as u64 + 1;
+                    let version = DataVersion::new(version_val);
+                    let epoch = Epoch::new(rng.next_u32() as u64 % 3);
+                    let color = [mat_index as f32, version_val as f32, 0.0, 1.0];
+
+                    let res = store.record_use(handle, version, epoch, color, 16);
+                    match res {
+                        Ok(rec) => {
+                            assert_eq!(
+                                rec.store_id,
+                                store.store_id(),
+                                "store_id mismatch for seed {SEED:#018x} at iter {iter} step {step}"
+                            );
+                            assert_eq!(
+                                rec.generation,
+                                store.generation(),
+                                "generation mismatch for seed {SEED:#018x} at iter {iter} step {step}"
+                            );
+                            let entry = store.get_use(&rec).unwrap_or_else(|e| {
+                                panic!("get_use failed for newly recorded slice for seed {SEED:#018x} at iter {iter} step {step}: {e:?}")
+                            });
+                            assert_eq!(
+                                entry.data,
+                                color,
+                                "data mismatch for seed {SEED:#018x} at iter {iter} step {step}"
+                            );
+                            current_records.push((rec, color));
+                        }
+                        Err(OwnershipError::ImmutableSnapshotViolation { .. }) => {
+                            // Conflicting metadata/data provided for already recorded version; sound rejection
+                        }
+                        Err(other) => {
+                            panic!("unexpected error on record_use for seed {SEED:#018x} at iter {iter} step {step}: {other:?}");
+                        }
+                    }
+                }
+                1 => {
+                    // 2. Reuse of a slot after release (store reset + immediate slot 0 reuse)
+                    let prev_store_generation = store.generation();
+                    let new_store_generation = store.reset().unwrap_or_else(|e| {
+                        panic!("store.reset failed for seed {SEED:#018x} at iter {iter} step {step}: {e:?}")
+                    });
+                    assert_eq!(
+                        new_store_generation,
+                        prev_store_generation + 1,
+                        "generation must advance on reset for seed {SEED:#018x} at iter {iter} step {step}"
+                    );
+                    assert_eq!(
+                        store.len(),
+                        0,
+                        "store must be empty after reset for seed {SEED:#018x} at iter {iter} step {step}"
+                    );
+                    assert_eq!(
+                        store.total_bytes(),
+                        0,
+                        "total_bytes must be 0 after reset for seed {SEED:#018x} at iter {iter} step {step}"
+                    );
+
+                    // All records from prior generation are now stale
+                    for (r, _) in current_records.drain(..) {
+                        stale_records.push(r);
+                    }
+
+                    // Slot reuse: immediately allocate in new generation at slice_id 0
+                    let reuse_handle = Handle::<MaterialDomain>::new(100, NonZeroU32::new(1).unwrap());
+                    let reuse_color = [1.0, 1.0, 1.0, 1.0];
+                    let new_rec = store
+                        .record_use(reuse_handle, DataVersion::new(1), Epoch::ZERO, reuse_color, 16)
+                        .unwrap_or_else(|e| {
+                            panic!("slot reuse record_use failed for seed {SEED:#018x} at iter {iter} step {step}: {e:?}")
+                        });
+                    assert_eq!(
+                        new_rec.slice_id,
+                        0,
+                        "reused slot must occupy slice 0 for seed {SEED:#018x} at iter {iter} step {step}"
+                    );
+                    assert_eq!(
+                        new_rec.generation,
+                        new_store_generation,
+                        "reused slot generation mismatch for seed {SEED:#018x} at iter {iter} step {step}"
+                    );
+                    current_records.push((new_rec, reuse_color));
+                }
+                2 => {
+                    // 3. Read with a stale generation (ABA prevention invariant)
+                    if stale_records.is_empty() {
+                        // Populate a stale record by recording and resetting if empty
+                        if current_records.is_empty() {
+                            let init_h = Handle::<MaterialDomain>::new(1, NonZeroU32::new(1).unwrap());
+                            let init_rec = store
+                                .record_use(init_h, DataVersion::new(1), Epoch::ZERO, [0.5, 0.5, 0.5, 1.0], 16)
+                                .unwrap_or_else(|e| {
+                                    panic!("record_use failed for seed {SEED:#018x} at iter {iter} step {step}: {e:?}")
+                                });
+                            current_records.push((init_rec, [0.5, 0.5, 0.5, 1.0]));
+                        }
+                        let _ = store.reset().unwrap_or_else(|e| {
+                            panic!("reset failed for seed {SEED:#018x} at iter {iter} step {step}: {e:?}")
+                        });
+                        for (r, _) in current_records.drain(..) {
+                            stale_records.push(r);
+                        }
+                    }
+
+                    let stale_idx = (rng.next_u32() as usize) % stale_records.len();
+                    let stale_rec = &stale_records[stale_idx];
+                    assert!(
+                        stale_rec.generation < store.generation(),
+                        "stale record generation must be strictly less than current store generation for seed {SEED:#018x} at iter {iter} step {step}"
+                    );
+
+                    // INVARIANT: A stale generation is NEVER readable after slot reuse (no ABA)
+                    let lookup_res = store.get_use(stale_rec);
+                    match lookup_res {
+                        Err(OwnershipError::StaleSliceRecord {
+                            expected_generation,
+                            actual_generation,
+                            slice_id,
+                        }) => {
+                            assert_eq!(
+                                expected_generation,
+                                store.generation(),
+                                "expected_generation mismatch for seed {SEED:#018x} at iter {iter} step {step}"
+                            );
+                            assert_eq!(
+                                actual_generation,
+                                stale_rec.generation,
+                                "actual_generation mismatch for seed {SEED:#018x} at iter {iter} step {step}"
+                            );
+                            assert_eq!(
+                                slice_id,
+                                stale_rec.slice_id,
+                                "slice_id mismatch for seed {SEED:#018x} at iter {iter} step {step}"
+                            );
+                        }
+                        other => panic!(
+                            "INVARIANT VIOLATION: stale generation read must return StaleSliceRecord, got {other:?} for seed {SEED:#018x} at iter {iter} step {step}"
+                        ),
+                    }
+                }
+                3 => {
+                    // 4. Borrow enter
+                    let enter_res = scope.enter();
+                    if let Some(tok) = active_token {
+                        // Already borrowed: MUST reject reentry
+                        match enter_res {
+                            Err(OwnershipError::BorrowScopeReentry { active_token: act }) => {
+                                assert_eq!(
+                                    act,
+                                    tok.get(),
+                                    "active token mismatch on reentry for seed {SEED:#018x} at iter {iter} step {step}"
+                                );
+                            }
+                            other => panic!(
+                                "INVARIANT VIOLATION: reentrant borrow enter must return BorrowScopeReentry, got {other:?} for seed {SEED:#018x} at iter {iter} step {step}"
+                            ),
+                        }
+                        assert_eq!(
+                            scope.state(),
+                            BorrowState::Borrowed,
+                            "scope must remain Borrowed on reentry attempt for seed {SEED:#018x} at iter {iter} step {step}"
+                        );
+                    } else {
+                        // Idle: MUST succeed
+                        let tok = enter_res.unwrap_or_else(|e| {
+                            panic!("borrow enter while idle failed for seed {SEED:#018x} at iter {iter} step {step}: {e:?}")
+                        });
+                        assert_eq!(
+                            scope.state(),
+                            BorrowState::Borrowed,
+                            "scope must transition to Borrowed for seed {SEED:#018x} at iter {iter} step {step}"
+                        );
+                        assert!(
+                            scope.is_borrowed(),
+                            "is_borrowed must be true for seed {SEED:#018x} at iter {iter} step {step}"
+                        );
+                        active_token = Some(tok);
+                    }
+                }
+                4 => {
+                    // 5. Growth attempt during borrow
+                    let pages = (rng.next_u32() % 8) + 1;
+                    let prev_growth_generation = scope.growth_generation();
+                    let growth_res = scope.record_growth(pages);
+
+                    if scope.is_borrowed() {
+                        // INVARIANT: Growth during an open borrow is ALWAYS rejected
+                        match growth_res {
+                            Err(OwnershipError::LinearMemoryGrowthBlocked { state }) => {
+                                assert_eq!(
+                                    state,
+                                    BorrowState::Borrowed,
+                                    "state must be Borrowed on growth block for seed {SEED:#018x} at iter {iter} step {step}"
+                                );
+                            }
+                            other => panic!(
+                                "INVARIANT VIOLATION: growth during borrow must return LinearMemoryGrowthBlocked, got {other:?} for seed {SEED:#018x} at iter {iter} step {step}"
+                            ),
+                        }
+                        assert_eq!(
+                            scope.growth_generation(),
+                            prev_growth_generation,
+                            "growth_generation must not advance when blocked for seed {SEED:#018x} at iter {iter} step {step}"
+                        );
+                    } else if scope.is_growth_blocked() {
+                        match growth_res {
+                            Err(OwnershipError::LinearMemoryGrowthBlocked { state }) => {
+                                assert_eq!(
+                                    state,
+                                    BorrowState::GrowthBlocked,
+                                    "state must be GrowthBlocked for seed {SEED:#018x} at iter {iter} step {step}"
+                                );
+                            }
+                            other => panic!(
+                                "INVARIANT VIOLATION: growth when GrowthBlocked must fail, got {other:?} for seed {SEED:#018x} at iter {iter} step {step}"
+                            ),
+                        }
+                        assert_eq!(
+                            scope.growth_generation(),
+                            prev_growth_generation,
+                            "growth_generation must not advance for seed {SEED:#018x} at iter {iter} step {step}"
+                        );
+                    } else {
+                        let next_growth_generation = growth_res.unwrap_or_else(|e| {
+                            panic!("growth while idle failed for seed {SEED:#018x} at iter {iter} step {step}: {e:?}")
+                        });
+                        assert_eq!(
+                            next_growth_generation,
+                            prev_growth_generation + 1,
+                            "growth_generation must advance by 1 for seed {SEED:#018x} at iter {iter} step {step}"
+                        );
+                        assert_eq!(
+                            scope.growth_generation(),
+                            next_growth_generation,
+                            "scope growth_generation mismatch for seed {SEED:#018x} at iter {iter} step {step}"
+                        );
+                    }
+                }
+                5 => {
+                    // 6. Borrow exit with matching and mismatching token
+                    if let Some(tok) = active_token {
+                        let test_mismatch = (rng.next_u32() & 1) == 1;
+                        if test_mismatch {
+                            // Exit with mismatched token
+                            let bogus_token = BorrowToken::new(tok.get().wrapping_add(50_000));
+                            let exit_res = scope.exit(bogus_token);
+                            match exit_res {
+                                Err(OwnershipError::BorrowTokenMismatch { expected, actual }) => {
+                                    assert_eq!(
+                                        expected,
+                                        tok.get(),
+                                        "expected token mismatch for seed {SEED:#018x} at iter {iter} step {step}"
+                                    );
+                                    assert_eq!(
+                                        actual,
+                                        bogus_token.get(),
+                                        "actual token mismatch for seed {SEED:#018x} at iter {iter} step {step}"
+                                    );
+                                }
+                                other => panic!(
+                                    "INVARIANT VIOLATION: exit with mismatched token must return BorrowTokenMismatch, got {other:?} for seed {SEED:#018x} at iter {iter} step {step}"
+                                ),
+                            }
+                            // INVARIANT: Exit with a mismatched token never releases
+                            assert_eq!(
+                                scope.state(),
+                                BorrowState::Borrowed,
+                                "scope must remain Borrowed on mismatched exit for seed {SEED:#018x} at iter {iter} step {step}"
+                            );
+                            assert!(
+                                scope.is_borrowed(),
+                                "scope must remain is_borrowed on mismatched exit for seed {SEED:#018x} at iter {iter} step {step}"
+                            );
+                        } else {
+                            // Exit with matching token
+                            scope.exit(tok).unwrap_or_else(|e| {
+                                panic!("valid borrow exit failed for seed {SEED:#018x} at iter {iter} step {step}: {e:?}")
+                            });
+                            if explicit_growth_blocked {
+                                assert_eq!(
+                                    scope.state(),
+                                    BorrowState::GrowthBlocked,
+                                    "scope must return to GrowthBlocked after valid exit when growth explicitly blocked for seed {SEED:#018x} at iter {iter} step {step}"
+                                );
+                                assert!(
+                                    scope.is_growth_blocked(),
+                                    "scope must be growth blocked after exit for seed {SEED:#018x} at iter {iter} step {step}"
+                                );
+                            } else {
+                                assert_eq!(
+                                    scope.state(),
+                                    BorrowState::Idle,
+                                    "scope must return to Idle after valid exit for seed {SEED:#018x} at iter {iter} step {step}"
+                                );
+                                assert!(
+                                    scope.is_idle(),
+                                    "scope must be idle after valid exit for seed {SEED:#018x} at iter {iter} step {step}"
+                                );
+                            }
+                            active_token = None;
+                        }
+                    } else {
+                        // Attempt exit while not borrowed (Idle or GrowthBlocked)
+                        let bogus_token = BorrowToken::new((rng.next_u32() as u64) + 1);
+                        let exit_res = scope.exit(bogus_token);
+                        match exit_res {
+                            Err(OwnershipError::BorrowScopeNotActive) => {}
+                            other => panic!(
+                                "exit while idle must return BorrowScopeNotActive, got {other:?} for seed {SEED:#018x} at iter {iter} step {step}"
+                            ),
+                        }
+                    }
+                }
+                6 => {
+                    // 7. Copy accounting increments
+                    let view_bytes = ((rng.next_u32() % 1024) as u64) + 16;
+                    let view_res = scope.record_view_bytes(view_bytes);
+                    if scope.is_borrowed() {
+                        view_res.unwrap_or_else(|e| {
+                            panic!("record_view_bytes while borrowed failed for seed {SEED:#018x} at iter {iter} step {step}: {e:?}")
+                        });
+                        expected_view_bytes += view_bytes;
+                    } else {
+                        match view_res {
+                            Err(OwnershipError::BorrowScopeNotActive) => {}
+                            other => panic!(
+                                "record_view_bytes outside borrow must return BorrowScopeNotActive, got {other:?} for seed {SEED:#018x} at iter {iter} step {step}"
+                            ),
+                        }
+                    }
+
+                    let wb_bytes = ((rng.next_u32() % 2048) as u64) + 32;
+                    scope.record_write_buffer_copy(wb_bytes);
+                    expected_wb_copies += wb_bytes;
+
+                    let stg_bytes = ((rng.next_u32() % 512) as u64) + 8;
+                    scope.record_staging_copy(stg_bytes);
+                    expected_staging_copies += stg_bytes;
+
+                    // INVARIANT: CopyAccounting counters equal the exact number of accepted copies
+                    let acct = scope.accounting();
+                    assert_eq!(
+                        acct.bytes_view,
+                        expected_view_bytes,
+                        "bytes_view counter mismatch for seed {SEED:#018x} at iter {iter} step {step}"
+                    );
+                    assert_eq!(
+                        acct.bytes_copied_write_buffer,
+                        expected_wb_copies,
+                        "bytes_copied_write_buffer counter mismatch for seed {SEED:#018x} at iter {iter} step {step}"
+                    );
+                    assert_eq!(
+                        acct.bytes_copied_staging,
+                        expected_staging_copies,
+                        "bytes_copied_staging counter mismatch for seed {SEED:#018x} at iter {iter} step {step}"
+                    );
+                    assert_eq!(
+                        acct.total_copied_bytes(),
+                        expected_wb_copies + expected_staging_copies,
+                        "total_copied_bytes mismatch for seed {SEED:#018x} at iter {iter} step {step}"
+                    );
+                    assert_eq!(
+                        acct.total_transported_bytes(),
+                        expected_view_bytes + expected_wb_copies + expected_staging_copies,
+                        "total_transported_bytes mismatch for seed {SEED:#018x} at iter {iter} step {step}"
+                    );
+                }
+                7 => {
+                    // 8. Explicit block_growth
+                    let was_borrowed = scope.is_borrowed();
+                    scope.block_growth();
+                    explicit_growth_blocked = true;
+
+                    // INVARIANT: block_growth always marks is_growth_blocked() true
+                    assert!(
+                        scope.is_growth_blocked(),
+                        "scope must report is_growth_blocked() true after block_growth for seed {SEED:#018x} at iter {iter} step {step}"
+                    );
+
+                    if was_borrowed {
+                        // INVARIANT: block_growth during an active borrow preserves state as Borrowed
+                        assert_eq!(
+                            scope.state(),
+                            BorrowState::Borrowed,
+                            "block_growth during borrow must preserve Borrowed state for seed {SEED:#018x} at iter {iter} step {step}"
+                        );
+                        assert!(
+                            scope.is_borrowed(),
+                            "scope must remain borrowed after block_growth for seed {SEED:#018x} at iter {iter} step {step}"
+                        );
+                    } else {
+                        // INVARIANT: block_growth when not borrowed transitions state to GrowthBlocked
+                        assert_eq!(
+                            scope.state(),
+                            BorrowState::GrowthBlocked,
+                            "state must be GrowthBlocked after block_growth for seed {SEED:#018x} at iter {iter} step {step}"
+                        );
+                        assert!(
+                            !scope.is_idle(),
+                            "scope must not be idle when GrowthBlocked for seed {SEED:#018x} at iter {iter} step {step}"
+                        );
+                    }
+                }
+                _ => {
+                    // 9. Explicit unblock_growth
+                    let was_borrowed = scope.is_borrowed();
+                    let was_growth_blocked = scope.state() == BorrowState::GrowthBlocked;
+                    scope.unblock_growth();
+                    explicit_growth_blocked = false;
+
+                    if was_borrowed {
+                        // INVARIANT: unblock_growth during an active borrow preserves state as Borrowed,
+                        // and growth remains blocked until the borrow exits.
+                        assert_eq!(
+                            scope.state(),
+                            BorrowState::Borrowed,
+                            "unblock_growth during borrow must preserve Borrowed state for seed {SEED:#018x} at iter {iter} step {step}"
+                        );
+                        assert!(
+                            scope.is_borrowed(),
+                            "scope must remain borrowed after unblock_growth for seed {SEED:#018x} at iter {iter} step {step}"
+                        );
+                        assert!(
+                            scope.is_growth_blocked(),
+                            "growth must remain blocked while borrow active for seed {SEED:#018x} at iter {iter} step {step}"
+                        );
+                    } else {
+                        // INVARIANT: unblock restores Idle state and unblocks growth
+                        assert_eq!(
+                            scope.state(),
+                            BorrowState::Idle,
+                            "state must be Idle after unblock_growth for seed {SEED:#018x} at iter {iter} step {step}"
+                        );
+                        assert!(
+                            scope.is_idle(),
+                            "scope must be idle after unblock_growth for seed {SEED:#018x} at iter {iter} step {step}"
+                        );
+                        assert!(
+                            !scope.is_growth_blocked(),
+                            "growth must be unblocked after unblock_growth for seed {SEED:#018x} at iter {iter} step {step}"
+                        );
+
+                        // INVARIANT: unblock restores growth (verify growth succeeds immediately if previously blocked)
+                        if was_growth_blocked {
+                            let prev_gen = scope.growth_generation();
+                            let growth_res = scope.record_growth(1);
+                            let next_gen = growth_res.unwrap_or_else(|e| {
+                                panic!("growth after unblock failed for seed {SEED:#018x} at iter {iter} step {step}: {e:?}")
+                            });
+                            assert_eq!(
+                                next_gen,
+                                prev_gen + 1,
+                                "growth_generation must advance after unblock for seed {SEED:#018x} at iter {iter} step {step}"
+                            );
+                            assert_eq!(
+                                scope.growth_generation(),
+                                next_gen,
+                                "scope growth_generation mismatch after unblock for seed {SEED:#018x} at iter {iter} step {step}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Clean up if a borrow is still open at the end of the iteration
+        if let Some(tok) = active_token {
+            scope.exit(tok).unwrap_or_else(|e| {
+                panic!("final cleanup exit failed for seed {SEED:#018x} at iter {iter}: {e:?}")
+            });
+        }
+    }
+}
+
+
 

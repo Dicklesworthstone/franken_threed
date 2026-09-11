@@ -545,6 +545,7 @@ pub struct RegionState<D: Domain = RegionDomain> {
     handle: Handle<D>,
     mode: OwnerMode,
     current_epoch: Epoch,
+    published_epoch: Epoch,
     current_version: DataVersion,
     unpublished_writes: u32,
 }
@@ -556,6 +557,7 @@ impl<D: Domain> RegionState<D> {
             handle,
             mode: OwnerMode::Js,
             current_epoch: Epoch::ZERO,
+            published_epoch: Epoch::ZERO,
             current_version: DataVersion::INITIAL,
             unpublished_writes: 0,
         }
@@ -567,6 +569,7 @@ impl<D: Domain> RegionState<D> {
             handle,
             mode,
             current_epoch: Epoch::ZERO,
+            published_epoch: Epoch::ZERO,
             current_version: DataVersion::INITIAL,
             unpublished_writes: 0,
         }
@@ -590,10 +593,28 @@ impl<D: Domain> RegionState<D> {
         self.mode.author()
     }
 
-    /// Current published epoch.
+    /// Current coordination epoch.
     #[inline]
     pub const fn current_epoch(&self) -> Epoch {
         self.current_epoch
+    }
+
+    /// Last published epoch for recorded writes.
+    #[inline]
+    pub const fn published_epoch(&self) -> Epoch {
+        self.published_epoch
+    }
+
+    /// Returns a diagnostic snapshot of region authorship, mode, and publication epochs.
+    #[inline]
+    pub const fn authorship_dump(&self) -> RegionAuthorshipDump {
+        RegionAuthorshipDump {
+            mode: self.mode,
+            author: self.author(),
+            current_epoch: self.current_epoch,
+            published_epoch: self.published_epoch,
+            unpublished_writes: self.unpublished_writes,
+        }
     }
 
     /// Current data version.
@@ -663,6 +684,7 @@ impl<D: Domain> RegionState<D> {
 
         let next_epoch = self.current_epoch.checked_next()?;
         self.current_epoch = next_epoch;
+        self.published_epoch = next_epoch;
         self.unpublished_writes = 0;
         Ok(self.current_epoch)
     }
@@ -772,6 +794,32 @@ impl<D: Domain> RegionState<D> {
         self.current_epoch = next_epoch;
         self.mode = new_mode;
         Ok(self.current_epoch)
+    }
+}
+
+/// Diagnostic summary of region authorship, mode, and publication epochs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct RegionAuthorshipDump {
+    /// Region single-writer ownership mode.
+    pub mode: OwnerMode,
+    /// Currently authoritative writer.
+    pub author: Author,
+    /// Current coordination epoch.
+    pub current_epoch: Epoch,
+    /// Last published epoch for recorded writes.
+    pub published_epoch: Epoch,
+    /// Number of uncommitted writes pending publication.
+    pub unpublished_writes: u32,
+}
+
+impl fmt::Display for RegionAuthorshipDump {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "mode={}, author={}, current_epoch={}, published_epoch={}, unpublished_writes={}",
+            self.mode, self.author, self.current_epoch, self.published_epoch, self.unpublished_writes
+        )
     }
 }
 

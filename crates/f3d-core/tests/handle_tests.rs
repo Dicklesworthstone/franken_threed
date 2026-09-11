@@ -1,4 +1,3 @@
-use core::num::NonZeroU32;
 use f3d_core::*;
 
 #[test]
@@ -133,3 +132,175 @@ fn handle_serde_domain_isolation() {
         .expect_err("domain mismatch must be rejected");
     assert!(err.to_string().contains("domain mismatch"));
 }
+
+// -----------------------------------------------------------------------------
+// Seeded deterministic property tests (vqa.3)
+// -----------------------------------------------------------------------------
+
+/// Minimal 64-bit Linear Congruential Generator (LCG) for deterministic property testing.
+///
+/// Multiplier and increment are standard constants from Knuth / MMIX.
+/// Provides a zero-dependency, reproducible pseudo-random stream across platforms.
+#[derive(Clone, Copy, Debug)]
+struct TestLcg {
+    state: u64,
+}
+
+impl TestLcg {
+    const fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self
+            .state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.state
+    }
+
+    fn next_u32(&mut self) -> u32 {
+        (self.next_u64() >> 32) as u32
+    }
+}
+
+#[test]
+fn property_test_handle_pack_unpack_and_words_roundtrip() {
+    const SEED: u64 = 0x4841_4E44_0001_0001;
+
+    // Explicit boundary cases
+    let boundary_pairs: [(u32, u32); 12] = [
+        (0, 1),
+        (0, 2),
+        (0, u32::MAX - 1),
+        (0, u32::MAX),
+        (1, 1),
+        (1, u32::MAX),
+        (u32::MAX - 1, 1),
+        (u32::MAX - 1, u32::MAX),
+        (u32::MAX, 1),
+        (u32::MAX, 2),
+        (u32::MAX, u32::MAX - 1),
+        (u32::MAX, u32::MAX),
+    ];
+    for (idx, (index, generation)) in boundary_pairs.iter().copied().enumerate() {
+        let handle: Handle<GeometryDomain> = Handle::from_raw(index, generation)
+            .unwrap_or_else(|e| panic!("from_raw failed for boundary {idx} ({index}, {generation}): {e:?}"));
+        assert_eq!(handle.index(), index, "index mismatch for boundary {idx}");
+        assert_eq!(handle.generation().get(), generation, "generation mismatch for boundary {idx}");
+
+        let (w0, w1) = handle.to_words();
+        assert_eq!(w0, index, "to_words w0 mismatch for boundary {idx}");
+        assert_eq!(w1, generation, "to_words w1 mismatch for boundary {idx}");
+
+        let reconstructed = Handle::<GeometryDomain>::from_words(w0, w1)
+            .unwrap_or_else(|e| panic!("from_words failed for boundary {idx}: {e:?}"));
+        assert_eq!(handle, reconstructed, "reconstructed mismatch for boundary {idx}");
+
+        let packed = handle.pack_u64();
+        let expected_packed = ((generation as u64) << 32) | (index as u64);
+        assert_eq!(packed, expected_packed, "pack_u64 mismatch for boundary {idx}");
+
+        let unpacked = Handle::<GeometryDomain>::unpack_u64(packed)
+            .unwrap_or_else(|e| panic!("unpack_u64 failed for boundary {idx}: {e:?}"));
+        assert_eq!(handle, unpacked, "unpacked mismatch for boundary {idx}");
+    }
+
+    // Randomized round-trip fuzzing
+    let mut rng = TestLcg::new(SEED);
+    for i in 0..10_000 {
+        let index = rng.next_u32();
+        let mut generation = rng.next_u32();
+        if generation == 0 {
+            generation = 1;
+        }
+
+        let handle: Handle<MaterialDomain> = Handle::from_raw(index, generation)
+            .unwrap_or_else(|e| panic!("from_raw failed for seed {SEED:#018x} at iter {i}: {e:?}"));
+
+        assert_eq!(handle.index(), index, "index mismatch for seed {SEED:#018x} at iter {i}");
+        assert_eq!(handle.generation().get(), generation, "generation mismatch for seed {SEED:#018x} at iter {i}");
+
+        let (w0, w1) = handle.to_words();
+        assert_eq!(w0, index, "w0 mismatch for seed {SEED:#018x} at iter {i}");
+        assert_eq!(w1, generation, "w1 mismatch for seed {SEED:#018x} at iter {i}");
+
+        let from_words = Handle::<MaterialDomain>::from_words(w0, w1)
+            .unwrap_or_else(|e| panic!("from_words failed for seed {SEED:#018x} at iter {i}: {e:?}"));
+        assert_eq!(handle, from_words, "from_words mismatch for seed {SEED:#018x} at iter {i}");
+
+        let packed = handle.pack_u64();
+        let expected_packed = ((generation as u64) << 32) | (index as u64);
+        assert_eq!(packed, expected_packed, "pack_u64 mismatch for seed {SEED:#018x} at iter {i}");
+
+        let unpacked = Handle::<MaterialDomain>::unpack_u64(packed)
+            .unwrap_or_else(|e| panic!("unpack_u64 failed for seed {SEED:#018x} at iter {i}: {e:?}"));
+        assert_eq!(handle, unpacked, "unpack_u64 mismatch for seed {SEED:#018x} at iter {i}");
+    }
+}
+
+#[test]
+fn property_test_handle_zero_generation_rejection() {
+    const SEED: u64 = 0x4841_4E44_0002_0002;
+
+    // Explicit boundary indices with generation 0
+    let boundary_indices = [0, 1, 2, u32::MAX - 1, u32::MAX];
+    for &index in &boundary_indices {
+        let err_raw = Handle::<TextureDomain>::from_raw(index, 0)
+            .expect_err("from_raw must reject zero generation");
+        assert_eq!(
+            err_raw,
+            HandleError::InvalidGeneration { raw_generation: 0 },
+            "expected InvalidGeneration for index {index}"
+        );
+
+        let err_words = Handle::<TextureDomain>::from_words(index, 0)
+            .expect_err("from_words must reject zero generation");
+        assert_eq!(
+            err_words,
+            HandleError::InvalidGeneration { raw_generation: 0 },
+            "expected InvalidGeneration for index {index}"
+        );
+
+        let packed_zero_gen = index as u64; // upper 32 bits = 0
+        let err_unpack = Handle::<TextureDomain>::unpack_u64(packed_zero_gen)
+            .expect_err("unpack_u64 must reject zero generation");
+        assert_eq!(
+            err_unpack,
+            HandleError::InvalidGeneration { raw_generation: 0 },
+            "expected InvalidGeneration for packed {packed_zero_gen:#018x}"
+        );
+    }
+
+    // Randomized fuzzing asserting zero generation is always rejected
+    let mut rng = TestLcg::new(SEED);
+    for i in 0..5_000 {
+        let index = rng.next_u32();
+
+        let err_raw = Handle::<AttributeDomain>::from_raw(index, 0)
+            .expect_err("from_raw must reject 0");
+        assert_eq!(
+            err_raw,
+            HandleError::InvalidGeneration { raw_generation: 0 },
+            "from_raw failed for seed {SEED:#018x} at iter {i}"
+        );
+
+        let err_words = Handle::<AttributeDomain>::from_words(index, 0)
+            .expect_err("from_words must reject 0");
+        assert_eq!(
+            err_words,
+            HandleError::InvalidGeneration { raw_generation: 0 },
+            "from_words failed for seed {SEED:#018x} at iter {i}"
+        );
+
+        let packed_zero_gen = index as u64;
+        let err_unpack = Handle::<AttributeDomain>::unpack_u64(packed_zero_gen)
+            .expect_err("unpack_u64 must reject 0");
+        assert_eq!(
+            err_unpack,
+            HandleError::InvalidGeneration { raw_generation: 0 },
+            "unpack_u64 failed for seed {SEED:#018x} at iter {i}"
+        );
+    }
+}
+
