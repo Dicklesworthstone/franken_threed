@@ -5,6 +5,7 @@
 
 use f3d_math::matrix4::Matrix4;
 use f3d_math::narrowing::NarrowingTolerance;
+use f3d_math::quaternion::Quaternion;
 use f3d_math::vector4::Vector4;
 
 #[test]
@@ -422,4 +423,248 @@ fn test_vector4_get_component_out_of_bounds() {
 fn test_vector4_set_component_out_of_bounds() {
     let mut v = Vector4::zero();
     v.set_component(4, 1.0);
+}
+
+const EPS_AXIS: f64 = 1e-10;
+
+fn assert_vec4_close(v: &Vector4, expected: [f64; 4], eps: f64, msg: &str) {
+    let diff_x = (v.x - expected[0]).abs();
+    let diff_y = (v.y - expected[1]).abs();
+    let diff_z = (v.z - expected[2]).abs();
+    let diff_w = (v.w - expected[3]).abs();
+    assert!(
+        diff_x <= eps && diff_y <= eps && diff_z <= eps && diff_w <= eps,
+        "{msg}: expected {:?}, got {:?} (diffs: [{}, {}, {}, {}] > {eps})",
+        expected,
+        v.to_array(),
+        diff_x,
+        diff_y,
+        diff_z,
+        diff_w,
+    );
+}
+
+#[test]
+fn test_vector4_set_axis_angle_from_quaternion() {
+    // 1. Identity quaternion (0, 0, 0, 1) -> [1.0, 0.0, 0.0, 0.0]
+    let mut v = Vector4::zero();
+    v.set_axis_angle_from_quaternion(&Quaternion::identity());
+    assert_eq!(v, Vector4::new(1.0, 0.0, 0.0, 0.0), "identity quaternion");
+
+    // 2. 90 deg around Y: (0, sin(PI/4), 0, cos(PI/4))
+    // Node oracle: [0.0, 1.0, 0.0, 1.5707963267948966]
+    let half_pi = core::f64::consts::FRAC_PI_4;
+    let q_y_90 = Quaternion::new(0.0, half_pi.sin(), 0.0, half_pi.cos());
+    v.set_axis_angle_from_quaternion(&q_y_90);
+    assert_vec4_close(
+        &v,
+        [0.0, 1.0, 0.0, core::f64::consts::FRAC_PI_2],
+        EPS_AXIS,
+        "90 deg around Y",
+    );
+
+    // 3. 180 deg around Z: (0, 0, 1, 0)
+    // Node oracle: [0.0, 0.0, 1.0, 3.141592653589793]
+    let q_z_180 = Quaternion::new(0.0, 0.0, 1.0, 0.0);
+    v.set_axis_angle_from_quaternion(&q_z_180);
+    assert_vec4_close(
+        &v,
+        [0.0, 0.0, 1.0, core::f64::consts::PI],
+        EPS_AXIS,
+        "180 deg around Z",
+    );
+
+    // 4. Threshold-adjacent below (s < 0.0001):
+    // qw = sqrt(1 - 0.99e-8), s approx 0.0000994987 < 0.0001
+    // Node oracle: [1.0, 0.0, 0.0, 0.00019899748904107667]
+    let qw_below = (1.0 - 0.99e-8_f64).sqrt();
+    let q_below = Quaternion::new(0.0, 0.0000994987, 0.0, qw_below);
+    v.set_axis_angle_from_quaternion(&q_below);
+    assert_vec4_close(
+        &v,
+        [1.0, 0.0, 0.0, 0.00019899748904107667],
+        EPS_AXIS,
+        "quaternion threshold-adjacent s < 0.0001",
+    );
+
+    // 5. Threshold-adjacent above (s > 0.0001):
+    // qw = sqrt(1 - 1.01e-8), s approx 0.000100498756 > 0.0001
+    // Node oracle: [0.0, 1.000000000497436, 0.0, 0.00020099751198460303]
+    let qw_above = (1.0 - 1.01e-8_f64).sqrt();
+    let q_above = Quaternion::new(0.0, 0.000100498756, 0.0, qw_above);
+    v.set_axis_angle_from_quaternion(&q_above);
+    assert_vec4_close(
+        &v,
+        [0.0, 1.000000000497436, 0.0, 0.00020099751198460303],
+        EPS_AXIS,
+        "quaternion threshold-adjacent s > 0.0001",
+    );
+
+    // 6. Non-unit / out-of-domain quaternion (q.w = 2.0):
+    // Node oracle: [NaN, NaN, NaN, NaN]
+    let q_out = Quaternion::new(0.0, 0.0, 0.0, 2.0);
+    v.set_axis_angle_from_quaternion(&q_out);
+    assert!(v.x.is_nan(), "out-of-domain q.w=2 must yield NaN on x");
+    assert!(v.y.is_nan(), "out-of-domain q.w=2 must yield NaN on y");
+    assert!(v.z.is_nan(), "out-of-domain q.w=2 must yield NaN on z");
+    assert!(v.w.is_nan(), "out-of-domain q.w=2 must yield NaN on w");
+
+    // 7. Opposite orientation (q.w = -1.0):
+    // Node oracle: [1.0, 0.0, 0.0, 2 * PI]
+    let q_neg = Quaternion::new(0.0, 0.0, 0.0, -1.0);
+    v.set_axis_angle_from_quaternion(&q_neg);
+    assert_vec4_close(
+        &v,
+        [1.0, 0.0, 0.0, 2.0 * core::f64::consts::PI],
+        EPS_AXIS,
+        "quaternion q.w = -1.0",
+    );
+}
+
+#[test]
+fn test_vector4_set_axis_angle_from_rotation_matrix() {
+    let mut v = Vector4::zero();
+
+    // 1. Identity matrix -> [1.0, 0.0, 0.0, 0.0]
+    let m_ident = Matrix4::identity();
+    v.set_axis_angle_from_rotation_matrix(&m_ident);
+    assert_eq!(v, Vector4::new(1.0, 0.0, 0.0, 0.0), "matrix identity");
+
+    // 2. 180-deg rotation: diagonal branch 1 (xx > yy && xx > zz, xx >= epsilon)
+    // 180 deg around X: diag [1, -1, -1] -> [1.0, 0.0, 0.0, PI]
+    let m_pi_x = Matrix4::from_elements([
+        1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+    ]);
+    v.set_axis_angle_from_rotation_matrix(&m_pi_x);
+    assert_vec4_close(
+        &v,
+        [1.0, 0.0, 0.0, core::f64::consts::PI],
+        EPS_AXIS,
+        "180 deg around X (diag branch 1)",
+    );
+
+    // 3. 180-deg rotation: diagonal branch 2 (yy > zz, yy >= epsilon)
+    // 180 deg around Y: diag [-1, 1, -1] -> [0.0, 1.0, 0.0, PI]
+    let m_pi_y = Matrix4::from_elements([
+        -1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+    ]);
+    v.set_axis_angle_from_rotation_matrix(&m_pi_y);
+    assert_vec4_close(
+        &v,
+        [0.0, 1.0, 0.0, core::f64::consts::PI],
+        EPS_AXIS,
+        "180 deg around Y (diag branch 2)",
+    );
+
+    // 4. 180-deg rotation: diagonal branch 3 (else, zz >= epsilon)
+    // 180 deg around Z: diag [-1, -1, 1] -> [0.0, 0.0, 1.0, PI]
+    let m_pi_z = Matrix4::from_elements([
+        -1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+    ]);
+    v.set_axis_angle_from_rotation_matrix(&m_pi_z);
+    assert_vec4_close(
+        &v,
+        [0.0, 0.0, 1.0, core::f64::consts::PI],
+        EPS_AXIS,
+        "180 deg around Z (diag branch 3)",
+    );
+
+    // 5. 180-deg rotation: diagonal fallback sub-branches (diag < epsilon -> 0.707106781)
+    // Branch 5a: xx < epsilon
+    // Node oracle: [0.0, 0.707106781, 0.707106781, 3.141592653589793]
+    let m_xx_eps = Matrix4::from_elements([
+        -0.99, 0.0, 0.0, 0.0, 0.0, -0.995, 0.0, 0.0, 0.0, 0.0, -0.995, 0.0, 0.0, 0.0, 0.0, 1.0,
+    ]);
+    v.set_axis_angle_from_rotation_matrix(&m_xx_eps);
+    assert_vec4_close(
+        &v,
+        [0.0, 0.707106781, 0.707106781, core::f64::consts::PI],
+        EPS_AXIS,
+        "180 deg xx < epsilon fallback",
+    );
+
+    // Branch 5b: yy < epsilon
+    // Node oracle: [0.707106781, 0.0, 0.707106781, 3.141592653589793]
+    let m_yy_eps = Matrix4::from_elements([
+        -0.995, 0.0, 0.0, 0.0, 0.0, -0.99, 0.0, 0.0, 0.0, 0.0, -0.995, 0.0, 0.0, 0.0, 0.0, 1.0,
+    ]);
+    v.set_axis_angle_from_rotation_matrix(&m_yy_eps);
+    assert_vec4_close(
+        &v,
+        [0.707106781, 0.0, 0.707106781, core::f64::consts::PI],
+        EPS_AXIS,
+        "180 deg yy < epsilon fallback",
+    );
+
+    // Branch 5c: zz < epsilon
+    // Node oracle: [0.707106781, 0.707106781, 0.0, 3.141592653589793]
+    let m_zz_eps = Matrix4::from_elements([
+        -0.995, 0.0, 0.0, 0.0, 0.0, -0.995, 0.0, 0.0, 0.0, 0.0, -0.99, 0.0, 0.0, 0.0, 0.0, 1.0,
+    ]);
+    v.set_axis_angle_from_rotation_matrix(&m_zz_eps);
+    assert_vec4_close(
+        &v,
+        [0.707106781, 0.707106781, 0.0, core::f64::consts::PI],
+        EPS_AXIS,
+        "180 deg zz < epsilon fallback",
+    );
+
+    // 6. General rotation: axis = (1, 2, 3).normalize(), angle = PI / 4
+    // Node oracle: [0.26726124191242434, 0.5345224838248487, 0.8017837257372731, 0.7853981633974484]
+    let m_gen = Matrix4::from_elements([
+        0.7280277253875085,
+        0.6087885979157627,
+        -0.3152016404063445,
+        0.0,
+        -0.525104821111919,
+        0.7907905579903911,
+        0.3145079017103789,
+        0.0,
+        0.4407273056121099,
+        -0.06345657129884827,
+        0.8953952789951956,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+    ]);
+    v.set_axis_angle_from_rotation_matrix(&m_gen);
+    assert_vec4_close(
+        &v,
+        [
+            0.26726124191242434,
+            0.5345224838248487,
+            0.8017837257372731,
+            0.7853981633974484,
+        ],
+        EPS_AXIS,
+        "general rotation (axis 1,2,3 angle pi/4)",
+    );
+
+    // 7. Threshold-adjacent singularity cases:
+    // Asymmetry below epsilon (|m12 - m21| = 0.008 < 0.01): enters identity singularity branch
+    // Node oracle: [1.0, 0.0, 0.0, 0.0]
+    let m_sing_below = Matrix4::from_elements([
+        1.0, 0.004, 0.0, 0.0, -0.004, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+    ]);
+    v.set_axis_angle_from_rotation_matrix(&m_sing_below);
+    assert_eq!(
+        v,
+        Vector4::new(1.0, 0.0, 0.0, 0.0),
+        "singularity threshold below epsilon (0.008 < 0.01)"
+    );
+
+    // Asymmetry above epsilon (|m12 - m21| = 0.012 > 0.01): normal branch (m21 - m12 = 0.012, s = 0.012, z = +1.0)
+    // Node oracle: [0.0, 0.0, 1.0, 0.0]
+    let m_sing_above = Matrix4::from_elements([
+        1.0, 0.006, 0.0, 0.0, -0.006, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+    ]);
+    v.set_axis_angle_from_rotation_matrix(&m_sing_above);
+    assert_vec4_close(
+        &v,
+        [0.0, 0.0, 1.0, 0.0],
+        EPS_AXIS,
+        "singularity threshold above epsilon (0.012 > 0.01)",
+    );
 }

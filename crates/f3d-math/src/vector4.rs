@@ -3,6 +3,7 @@
 use crate::jsnum::{js_max, js_min, js_round, js_trunc};
 use crate::matrix4::Matrix4;
 use crate::narrowing::{check_narrow_f64, NarrowingError, NarrowingTolerance};
+use crate::quaternion::Quaternion;
 use core::fmt;
 
 #[inline]
@@ -282,6 +283,139 @@ impl Vector4 {
     #[inline]
     pub fn divide_scalar(&mut self, scalar: f64) -> &mut Self {
         self.multiply_scalar(1.0 / scalar)
+    }
+
+    /// Sets the x, y, and z components to the axis of rotation and w to the angle
+    /// from quaternion `q`, matching Three.js r186 `Vector4.setAxisAngleFromQuaternion`.
+    ///
+    /// `q` is assumed to be normalized. Does not clamp or re-normalize.
+    #[inline]
+    pub fn set_axis_angle_from_quaternion(&mut self, q: &Quaternion) -> &mut Self {
+        self.w = 2.0 * q.w.acos();
+
+        let s = (1.0 - q.w * q.w).sqrt();
+
+        if s < 0.0001 {
+            self.x = 1.0;
+            self.y = 0.0;
+            self.z = 0.0;
+        } else {
+            self.x = q.x / s;
+            self.y = q.y / s;
+            self.z = q.z / s;
+        }
+
+        self
+    }
+
+    /// Sets the x, y, and z components to the axis of rotation and w to the angle
+    /// from rotation matrix `m`, matching Three.js r186 `Vector4.setAxisAngleFromRotationMatrix`.
+    ///
+    /// Assumes the upper 3x3 of `m` is a pure (unscaled) rotation matrix.
+    #[inline]
+    pub fn set_axis_angle_from_rotation_matrix(&mut self, m: &Matrix4) -> &mut Self {
+        let epsilon = 0.01;
+        let epsilon2 = 0.1;
+
+        let te = &m.elements;
+
+        let m11 = te[0];
+        let m12 = te[4];
+        let m13 = te[8];
+        let m21 = te[1];
+        let m22 = te[5];
+        let m23 = te[9];
+        let m31 = te[2];
+        let m32 = te[6];
+        let m33 = te[10];
+
+        if (m12 - m21).abs() < epsilon && (m13 - m31).abs() < epsilon && (m23 - m32).abs() < epsilon
+        {
+            // singularity found
+            // first check for identity matrix which must have +1 for all terms
+            // in leading diagonal and zero in other terms
+
+            if (m12 + m21).abs() < epsilon2
+                && (m13 + m31).abs() < epsilon2
+                && (m23 + m32).abs() < epsilon2
+                && (m11 + m22 + m33 - 3.0).abs() < epsilon2
+            {
+                // this singularity is identity matrix so angle = 0
+                self.set(1.0, 0.0, 0.0, 0.0);
+                return self;
+            }
+
+            // otherwise this singularity is angle = 180
+            let angle = core::f64::consts::PI;
+
+            let xx = (m11 + 1.0) / 2.0;
+            let yy = (m22 + 1.0) / 2.0;
+            let zz = (m33 + 1.0) / 2.0;
+            let xy = (m12 + m21) / 4.0;
+            let xz = (m13 + m31) / 4.0;
+            let yz = (m23 + m32) / 4.0;
+
+            let x;
+            let y;
+            let z;
+
+            if (xx > yy) && (xx > zz) {
+                // m11 is the largest diagonal term
+                if xx < epsilon {
+                    x = 0.0;
+                    y = 0.707106781;
+                    z = 0.707106781;
+                } else {
+                    let rx = xx.sqrt();
+                    x = rx;
+                    y = xy / rx;
+                    z = xz / rx;
+                }
+            } else if yy > zz {
+                // m22 is the largest diagonal term
+                if yy < epsilon {
+                    x = 0.707106781;
+                    y = 0.0;
+                    z = 0.707106781;
+                } else {
+                    let ry = yy.sqrt();
+                    y = ry;
+                    x = xy / ry;
+                    z = yz / ry;
+                }
+            } else {
+                // m33 is the largest diagonal term so base result on this
+                if zz < epsilon {
+                    x = 0.707106781;
+                    y = 0.707106781;
+                    z = 0.0;
+                } else {
+                    let rz = zz.sqrt();
+                    z = rz;
+                    x = xz / rz;
+                    y = yz / rz;
+                }
+            }
+
+            self.set(x, y, z, angle);
+            return self;
+        }
+
+        // as we have reached here there are no singularities so we can handle normally
+        let mut s =
+            ((m32 - m23) * (m32 - m23) + (m13 - m31) * (m13 - m31) + (m21 - m12) * (m21 - m12))
+                .sqrt();
+
+        if s.abs() < 0.001 {
+            s = 1.0;
+        }
+
+        self.x = (m32 - m23) / s;
+        self.y = (m13 - m31) / s;
+        self.z = (m21 - m12) / s;
+        self.w = ((m11 + m22 + m33 - 1.0) / 2.0).acos();
+
+        self
     }
 
     /// Sets this vector from matrix translation column matching Three.js `Vector4.setFromMatrixPosition`.
