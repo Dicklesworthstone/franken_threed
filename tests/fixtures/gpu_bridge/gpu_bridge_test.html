@@ -21,9 +21,12 @@
     import init, {
       f3d_build_first_frame_packet,
       f3d_build_red_a_blue_b_packet,
+      f3d_build_nested_viewport_scissor_packet,
       gpu_bridge_build_triangle_packet,
       gpu_bridge_build_red_blue_packet,
+      gpu_bridge_build_nested_viewport_scissor_packet,
     } from "/pkg/f3d_runtime.js";
+    import * as wasmExports from "/pkg/f3d_runtime.js";
     import {
       WebGpuBridgeHost,
       PACKET_MAGIC,
@@ -34,6 +37,10 @@
     import { renderDirectReferenceTriangle } from "./direct_reference.js";
     import { testReadbackIdReuse } from "./readback_lifetime_test.js";
     import { testPipelineBindingChange } from "./pipeline_binding_test.js";
+    import { testCanvasSubmissionLifetime } from "./canvas_lifetime_test.js";
+    import { testDeviceReplacement } from "./device_lifetime_test.js";
+    import { testViewportScissor } from "./viewport_scissor_test.js";
+    import { testDrawParameters } from "./draw_parameters_test.js";
 
     const outputEl = document.getElementById("output");
     const canvas = document.getElementById("canvas");
@@ -66,8 +73,9 @@
 
         const buildTriangleFn = f3d_build_first_frame_packet || gpu_bridge_build_triangle_packet;
         const buildRedBlueFn = f3d_build_red_a_blue_b_packet || gpu_bridge_build_red_blue_packet;
+        const buildViewportScissorFn = f3d_build_nested_viewport_scissor_packet || gpu_bridge_build_nested_viewport_scissor_packet;
 
-        if (typeof buildTriangleFn !== "function" || typeof buildRedBlueFn !== "function") {
+        if (typeof buildTriangleFn !== "function" || typeof buildRedBlueFn !== "function" || typeof buildViewportScissorFn !== "function") {
           throw new Error("Missing required Wasm exports from /pkg/f3d_runtime.js");
         }
 
@@ -326,6 +334,10 @@
 
         logPass("readback_id_reuse_epoch", await testReadbackIdReuse(bridge));
         logPass("pipeline_layout_binding_change", await testPipelineBindingChange(bridge));
+        logPass("canvas_multiple_submissions", await testCanvasSubmissionLifetime(bridge));
+        logPass("device_replacement_and_loss", await testDeviceReplacement(buildRedBlueFn));
+        logPass("viewport_scissor_rectangles", await testViewportScissor(bridge, buildViewportScissorFn));
+        logPass("draw_ranges_and_instances", await testDrawParameters(bridge, wasmExports.f3d_build_draw_parameters_packet));
 
         // 7. Retained renderer exclusion
         if (window.__threeRendererSubmissions && window.__threeRendererSubmissions > 0) {

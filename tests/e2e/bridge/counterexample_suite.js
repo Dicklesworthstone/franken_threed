@@ -25,6 +25,7 @@ import {
   OPCODE_RECORD_BUNDLE,
   OPCODE_EXECUTE_BUNDLES,
   TARGET_OFFSCREEN,
+  TARGET_CANVAS,
 } from "../../fixtures/gpu_bridge/bridge_runtime.js";
 
 import {
@@ -673,8 +674,10 @@ export async function testNegativeBrokenMalformedPacket(host) {
   try {
     await host.executePacket(invalidTargetPacket);
   } catch (e) {
-    if (e.message && e.message.includes("Invalid render pass targetType")) {
+    if (e.message === "RenderPass: invalid target kind 99 in 0x63") {
       rejectedTarget = true;
+    } else {
+      throw e;
     }
   }
   if (!rejectedTarget) {
@@ -1326,7 +1329,7 @@ export async function testNegativeBrokenBundleDirectDraw(host, oraclePixels, wid
  * Tested against the EXACT SAME `assertGenerationalHandlePublication` assertion to verify
  * detection and rejection.
  */
-export async function testGenerationalHandleAbaPublication(host, wasmModule) {
+export async function testGenerationalHandleAbaPublication(host, wasmModule, canvasContext) {
   const checkFn = wasmModule?.f3d_check_resource_handle || wasmModule?.gpu_bridge_check_resource_handle;
   const advanceFn = wasmModule?.f3d_advance_resource_generation || wasmModule?.gpu_bridge_advance_resource_generation;
   const buildTriangleFn = wasmModule?.f3d_build_first_frame_packet || wasmModule?.gpu_bridge_build_triangle_packet;
@@ -1342,7 +1345,7 @@ export async function testGenerationalHandleAbaPublication(host, wasmModule) {
   // resource IDs: 1 (uniform buffer), 2 (vertex buffer), 3 (readback buffer), 10 (target texture), 100 (pipeline)
   // at initial generation 1 in the global resource slot table.
   const packet = buildTriangleFn();
-  await host.executePacket(packet);
+  await host.executePacket(packet, canvasContext);
 
   const registeredTriangleIds = [1, 2, 3, 10, 100];
   for (const id of registeredTriangleIds) {
@@ -2167,20 +2170,49 @@ export async function testNegativeBrokenNestedPass(host, oraclePixels = null, wi
  * - Pass 3 (Canvas Target 10): resume with loadOp: "load" + Blue tri2 (Pipeline 201).
  * - Command 13: Copy offscreen Target 11 to Readback Buffer 20 (64x64 rgba8unorm).
  *
- * Bridge cannot read back the canvas swapchain (no COPY_SRC on canvas context; swapchain
- * views are not stored in host.textures). The authoritative assertion is Target 11 readback:
- * - (24, 32): Green [0, 255, 0, 255] (drawn by tri1 on target 11)
- * - (56, 32): Black [0, 0, 0, 255] (outside tri1 on target 11)
- * - (2, 2): Black [0, 0, 0, 255] (clear background)
- * - Byte-identical to an independent oracle that renders only the offscreen pass.
- *
- * Additionally asserts the packet executes without a WebGPU validation error inside
- * the error scope when the host has a canvas context, and truthfully reports whether
- * the host provided one.
- *
- * Broken Control: Oracle-vs-candidate byte comparison plus missing-export rejection
- * (no synthetic packet variant needed).
+ * Configure COPY_SRC and copy the actual canvas before yielding. Compare the
+ * red/blue outer image and green/black inner image with independent native GPU
+ * references. Mutate the resumed canvas load operation to clear and require the
+ * same image assertion to reject the GPU result. Missing exports also reject.
  */
+async function executeNestedCanvasReadback(host, packet, canvasContext, width, height) {
+  if (!canvasContext) throw new Error("Nested canvas readback requires a real canvas context");
+  const device = host.device;
+  const format = navigator.gpu.getPreferredCanvasFormat();
+  const bytesPerRow = computeAlignedBytesPerRow(width);
+  const size = bytesPerRow * height;
+  const buffer = device.createBuffer({ size, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  try {
+    canvasContext.configure({
+      device, format, alphaMode: "premultiplied",
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+    });
+    const executed = host.executePacket(packet, canvasContext);
+    // Copy the actual canvas texture before yielding and allowing it to expire.
+    const copied = host.withErrorScopes(["validation"], () => {
+      const encoder = device.createCommandEncoder();
+      encoder.copyTextureToBuffer(
+        { texture: canvasContext.getCurrentTexture() },
+        { buffer, bytesPerRow }, [width, height, 1],
+      );
+      device.queue.submit([encoder.finish()]);
+    });
+    await Promise.all([executed, copied]);
+    const pixels = await readbackGpuBuffer(device, buffer, size);
+    if (format === "bgra8unorm") {
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          const i = y * bytesPerRow + x * 4;
+          [pixels[i], pixels[i + 2]] = [pixels[i + 2], pixels[i]];
+        }
+      }
+    }
+    return pixels;
+  } finally {
+    buffer.destroy();
+  }
+}
+
 export async function testNestedCanvasPassProtocol(host, wasmModule, width = 64, height = 64, canvasContext = null) {
   const buildNestedCanvasPassFn = wasmModule?.f3d_build_nested_canvas_pass_packet || wasmModule?.gpu_bridge_build_nested_canvas_pass_packet;
 
@@ -2192,6 +2224,9 @@ export async function testNestedCanvasPassProtocol(host, wasmModule, width = 64,
 
   // 1. Run independent direct-JS oracle rendering only the offscreen pass on Target 11
   const oraclePixels = await renderDirectNestedCanvasOffscreenReference(host.device, width, height);
+  // The outer canvas has the same red-prefix / blue-resume image as this
+  // independent native WebGPU reference; no candidate pixels define the oracle.
+  const canvasOraclePixels = await renderDirectNestedPassReference(host.device, width, height);
 
   // 2. Resolve canvas context (from argument, DOM canvas, or OffscreenCanvas)
   let activeCanvasContext = canvasContext;
@@ -2204,27 +2239,14 @@ export async function testNestedCanvasPassProtocol(host, wasmModule, width = 64,
     }
   }
 
-  const canvasContextProvided = !!activeCanvasContext;
-  if (activeCanvasContext && typeof activeCanvasContext.configure === "function") {
-    const preferredFormat = host.capabilityRecord?.preferredCanvasFormat ||
-      (typeof navigator !== "undefined" && navigator.gpu?.getPreferredCanvasFormat
-        ? navigator.gpu.getPreferredCanvasFormat()
-        : "bgra8unorm");
-
-    activeCanvasContext.configure({
-      device: host.device,
-      format: preferredFormat,
-      alphaMode: "premultiplied",
-    });
-  }
-
   // 3. Execute real Rust/Wasm binary packet through candidate bridge host.
   // When activeCanvasContext is present, executePacket acquires canvas swapchain view
   // and executes Pass 1 (canvas prefix), Pass 2 (nested offscreen), and Pass 3 (canvas resume)
   // synchronously inside withErrorScopes(["validation", "out-of-memory"]).
   // Any WebGPU validation error causes executePacket to throw.
   const packet = buildNestedCanvasPassFn();
-  await host.executePacket(packet, activeCanvasContext);
+  const canvasPixels = await executeNestedCanvasReadback(host, packet, activeCanvasContext, width, height);
+  assertNestedPassMatch(canvasPixels, canvasOraclePixels, width, height);
 
   // 4. Read back target 11 from buffer 20
   const bytesPerRow = computeAlignedBytesPerRow(width);
@@ -2241,21 +2263,17 @@ export async function testNestedCanvasPassProtocol(host, wasmModule, width = 64,
   // 5. Assert candidate pixels match oracle byte-for-byte and at designated sample points
   assertNestedCanvasPassMatch(candidatePixels, oraclePixels, width, height);
 
-  const canvasStatusText = canvasContextProvided
-    ? "Real WebGPU canvas context provided (#webgpu-swapchain-canvas configured preferred format); executed without validation errors inside error scope"
-    : "No canvas context provided (offscreen-only execution)";
-
   return {
     status: "PASS",
     oraclePixels,
     candidatePixels,
-    canvasContextProvided,
-    canvasContextStatus: canvasStatusText,
-    detail: `Target 11 readback byte-identical to independent oracle (Green at (24,32), Black at (56,32) and (2,2)). ${canvasStatusText}.`,
+    canvasOraclePixels,
+    canvasPixels,
+    detail: "Rust FrameSession packet: actual canvas is byte-identical to independent red/blue reference; target 11 is byte-identical to independent green/black reference; native GPU error scopes clean.",
   };
 }
 
-export async function testNegativeBrokenNestedCanvasPass(host, wasmModule, oraclePixels = null, width = 64, height = 64) {
+export async function testNegativeBrokenNestedCanvasPass(host, wasmModule, oraclePixels = null, width = 64, height = 64, canvasContext = null) {
   // 1. Missing-export rejection control: Calling with missing export strictly fails
   let missingExportRejected = false;
   try {
@@ -2271,36 +2289,53 @@ export async function testNegativeBrokenNestedCanvasPass(host, wasmModule, oracl
     );
   }
 
-  // 2. Oracle-vs-candidate byte comparison rejection control: Divergent/corrupted bytes strictly fail
-  const referencePixels = oraclePixels || (await renderDirectNestedCanvasOffscreenReference(host.device, width, height));
-  const corruptedPixels = new Uint8Array(referencePixels);
-  const bytesPerRow = computeAlignedBytesPerRow(width);
-  const greenIdx = 32 * bytesPerRow + 24 * 4;
-  corruptedPixels[greenIdx + 1] = 0; // Corrupt green channel from 255 to 0
+  // 2. Change the actual Rust packet's resumed canvas load operation, then render it.
+  const build = wasmModule.f3d_build_nested_canvas_pass_packet || wasmModule.gpu_bridge_build_nested_canvas_pass_packet;
+  const brokenPacket = build().slice();
+  const view = new DataView(brokenPacket.buffer, brokenPacket.byteOffset, brokenPacket.byteLength);
+  const fieldSizes = { 1: 12, 2: 16, 3: 32, 4: 44, 5: 24, 6: 20 };
+  let cursor = 16;
+  let mutations = 0;
+  for (let i = 0; i < view.getUint32(8, true); i++) {
+    const opcode = view.getUint16(cursor, true);
+    cursor += 2;
+    if (opcode === OPCODE_RENDER_PASS) {
+      const packed = view.getUint32(cursor, true);
+      if ((packed & 0xff) === TARGET_CANVAS && ((packed >>> 8) & 0xff) === 1) {
+        view.setUint32(cursor, packed & ~0xff00, true);
+        mutations++;
+      }
+    }
+    if (!fieldSizes[opcode]) throw new Error(`Unexpected nested fixture opcode ${opcode}`);
+    cursor += fieldSizes[opcode];
+  }
+  if (mutations !== 1) throw new Error(`Expected one resumed canvas pass, found ${mutations}`);
+  const referencePixels = oraclePixels || (await renderDirectNestedPassReference(host.device, width, height));
+  const brokenPixels = await executeNestedCanvasReadback(host, brokenPacket, canvasContext, width, height);
 
   let comparisonRejected = false;
   try {
-    assertNestedCanvasPassMatch(corruptedPixels, referencePixels, width, height);
+    assertNestedPassMatch(brokenPixels, referencePixels, width, height);
   } catch (err) {
     if (
       err.message &&
       (err.message.includes("mismatched bytes") ||
-       err.message.includes("Nested Canvas Pass sample violation") ||
-       err.message.includes("assertNestedCanvasPassMatch"))
+       err.message.includes("Nested Pass sample violation") ||
+       err.message.includes("assertNestedPassMatch"))
     ) {
       comparisonRejected = true;
     }
   }
   if (!comparisonRejected) {
     throw new Error(
-      "Negative Control Failed: assertNestedCanvasPassMatch did not reject corrupted/divergent pixel bytes!"
+      "Negative Control Failed: canvas comparison did not reject a real clear-on-resume mutation!"
     );
   }
 
   return {
-    behavior: "oracle_byte_mismatch_and_missing_export_rejected",
+    behavior: "gpu_canvas_clear_on_resume_and_missing_export_rejected",
     missingExportRejected,
     comparisonRejected,
-    detail: "Missing Wasm export and divergent pixel bytes were strictly rejected by assertion gates (no synthetic packet needed).",
+    detail: "Missing Wasm export rejected; a real canvas load-to-clear packet mutation rendered and failed the same independent image assertion.",
   };
 }

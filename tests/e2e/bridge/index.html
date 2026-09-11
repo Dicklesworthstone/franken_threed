@@ -346,7 +346,7 @@
             ownership: "AUTHORITATIVE (05.7)",
             desc: "Rust Wasm generational handle slot table (§6.5): fresh gen verified, advance simulated, stale ABA handle and zero generation strictly rejected",
             run: async () => {
-              const res = await testGenerationalHandleAbaPublication(host, wasmModule);
+              const res = await testGenerationalHandleAbaPublication(host, wasmModule, canvasContext);
               const broken = await testNegativeBrokenGenerationalHandlePublication(host, wasmModule, 10, 1);
               return `Verified via real Rust/Wasm handle exports (fresh gen accepted, advanced gen verified); stale publication attempt rejected (${broken.behavior}).`;
             },
@@ -388,10 +388,10 @@
             id: "nested_canvas_pass_protocol",
             title: "12. Nested Canvas Pass Protocol & Swapchain Reentrancy",
             ownership: "AUTHORITATIVE (05.7)",
-            desc: "14-command packet with canvas prefix clear + red draw (pipeline 201), offscreen 11 clear + green draw (pipeline 200), canvas resume load + blue draw: offscreen target 11 readback (24,32 Green, 56,32 Black, 2,2 Black) matches direct-JS oracle with no validation errors inside error scope",
+            desc: "Rust packet renders red prefix and blue resume on the actual canvas, with nested green offscreen target 11. Both images match independent native WebGPU references; changing the canvas resume load to clear must fail.",
             run: async () => {
               const res = await testNestedCanvasPassProtocol(host, wasmModule, 64, 64, canvasContext);
-              const broken = await testNegativeBrokenNestedCanvasPass(host, wasmModule, res.oraclePixels);
+              const broken = await testNegativeBrokenNestedCanvasPass(host, wasmModule, res.canvasOraclePixels, 64, 64, canvasContext);
               return `${res.detail} Broken control rejected (${broken.behavior}).`;
             },
           },

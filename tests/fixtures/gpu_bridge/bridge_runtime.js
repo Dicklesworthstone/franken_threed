@@ -20,6 +20,9 @@ export const OPCODE_COPY_TEXTURE_TO_BUFFER = 5;
 export const OPCODE_CREATE_TEXTURE = 6;
 export const OPCODE_RECORD_BUNDLE = 7;
 export const OPCODE_EXECUTE_BUNDLES = 8;
+export const OPCODE_SET_VIEWPORT = 9;
+export const OPCODE_SET_SCISSOR_RECT = 10;
+export const OPCODE_SET_DRAW_PARAMETERS = 11;
 
 export const TARGET_OFFSCREEN = 0;
 export const TARGET_CANVAS = 1;
@@ -41,6 +44,8 @@ export class WebGpuBridgeHost {
     this.adapter = null;
     this.device = null;
     this.capabilityRecord = null;
+    this.deviceGeneration = 0;
+    this.deviceRequest = 0;
     this.buffers = new Map();
     this.textures = new Map();
     this.pipelines = new Map();
@@ -51,12 +56,36 @@ export class WebGpuBridgeHost {
     this.lastRenderTargetId = null;
   }
 
+  clearDeviceResources() {
+    this.buffers.clear();
+    this.textures.clear();
+    this.pipelines.clear();
+    this.bindGroups.clear();
+    this.bundles.clear();
+    this.bufferEpochs.clear();
+    this.lastRenderTargetId = null;
+  }
+
+  /** Stop owned work before requesting destruction; device.lost is asynchronous. */
+  destroyDevice() {
+    // Also cancel a pending request that has not published a device yet.
+    this.deviceRequest++;
+    const device = this.device;
+    this.clearDeviceResources();
+    this.device = null;
+    this.adapter = null;
+    this.capabilityRecord = null;
+    this.deviceGeneration++;
+    device?.destroy();
+  }
+
   /**
    * Negotiate features and limits before requesting a device.
    * If a required feature is missing or limits cannot be satisfied,
    * throws a structured error and does not create a device.
    */
   async negotiateAndCreateDevice(requiredProfile = {}) {
+    const request = ++this.deviceRequest;
     if (!navigator.gpu) {
       throw new Error("WebGPU is not supported in this browser environment");
     }
@@ -68,7 +97,9 @@ export class WebGpuBridgeHost {
     if (!adapter) {
       throw new Error("Failed to acquire a WebGPU adapter");
     }
-    this.adapter = adapter;
+    if (request !== this.deviceRequest) {
+      throw new Error("WebGPU device request superseded by a newer request");
+    }
 
     const adapterFeatures = new Set(adapter.features);
     const requiredFeatures = requiredProfile.requiredFeatures || [];
@@ -113,26 +144,34 @@ export class WebGpuBridgeHost {
     };
 
     const device = await adapter.requestDevice(deviceDescriptor);
-    this.device = device;
+    if (request !== this.deviceRequest) {
+      device.destroy();
+      throw new Error("WebGPU device request superseded by a newer request");
+    }
 
     // Assert the resulting device actually meets the requested profile
-    const deviceLimits = device.limits;
-    for (const [key, requestedVal] of Object.entries(requiredLimits)) {
-      const actualVal = deviceLimits[key];
-      if (key.startsWith("min")) {
-        if (actualVal > requestedVal) {
-          throw new Error(`Device limit verification failed: ${key} does not meet requested profile (requested ${requestedVal}, device has ${actualVal})`);
-        }
-      } else {
-        if (actualVal < requestedVal) {
-          throw new Error(`Device limit verification failed: ${key} does not meet requested profile (requested ${requestedVal}, device has ${actualVal})`);
+    try {
+      const deviceLimits = device.limits;
+      for (const [key, requestedVal] of Object.entries(requiredLimits)) {
+        const actualVal = deviceLimits[key];
+        if (key.startsWith("min")) {
+          if (actualVal > requestedVal) {
+            throw new Error(`Device limit verification failed: ${key} does not meet requested profile (requested ${requestedVal}, device has ${actualVal})`);
+          }
+        } else {
+          if (actualVal < requestedVal) {
+            throw new Error(`Device limit verification failed: ${key} does not meet requested profile (requested ${requestedVal}, device has ${actualVal})`);
+          }
         }
       }
-    }
-    for (const feat of requiredFeatures) {
-      if (!device.features.has(feat)) {
-        throw new Error(`Device feature verification failed: required WebGPU feature '${feat}' is not enabled on device`);
+      for (const feat of requiredFeatures) {
+        if (!device.features.has(feat)) {
+          throw new Error(`Device feature verification failed: required WebGPU feature '${feat}' is not enabled on device`);
+        }
       }
+    } catch (error) {
+      device.destroy();
+      throw error;
     }
 
     // Attach uncapturederror listener
@@ -150,7 +189,7 @@ export class WebGpuBridgeHost {
       };
     }
 
-    this.capabilityRecord = {
+    const capabilityRecord = {
       hostEnvironment: navigator.userAgent,
       webgpuSupported: true,
       adapter: adapterInfo,
@@ -174,7 +213,24 @@ export class WebGpuBridgeHost {
       preferredCanvasFormat: navigator.gpu.getPreferredCanvasFormat(),
     };
 
-    return this.capabilityRecord;
+    // Publish only a fully verified device. Numeric IDs never retain residency
+    // from the previous device, even when the new device reuses those IDs.
+    this.clearDeviceResources();
+    this.adapter = adapter;
+    this.device = device;
+    this.capabilityRecord = capabilityRecord;
+    const generation = ++this.deviceGeneration;
+    device.lost.then(() => {
+      // A late loss notification from a retired device must not clear its successor.
+      if (this.device !== device || this.deviceGeneration !== generation) return;
+      this.clearDeviceResources();
+      this.device = null;
+      this.adapter = null;
+      this.capabilityRecord = null;
+      this.deviceGeneration++;
+    });
+
+    return capabilityRecord;
   }
 
   /**
@@ -227,6 +283,9 @@ export class WebGpuBridgeHost {
         if (err) {
           throw new Error(`WebGPU error scope reported error: ${err.message || err}`);
         }
+      }
+      if (this.device !== device) {
+        throw new Error("WebGPU device changed before scoped work completed");
       }
     }
 
@@ -282,6 +341,7 @@ export class WebGpuBridgeHost {
       let currentPassEncoder = null;
       let currentPassTargetKey = null;
       let frameCanvasView = null;
+      let pendingDrawParameters = null;
       let passState = {
         pipelineId: null,
         uniformBufferId: null,
@@ -317,6 +377,9 @@ export class WebGpuBridgeHost {
 
         const opcode = dataView.getUint16(cursor, true);
         cursor += 2;
+        if (pendingDrawParameters && opcode !== OPCODE_RENDER_PASS) {
+          throw new Error("SetDrawParameters must immediately precede RenderPass");
+        }
 
         switch (opcode) {
           case OPCODE_CREATE_BUFFER: {
@@ -490,6 +553,9 @@ export class WebGpuBridgeHost {
           }
 
           case OPCODE_RENDER_PASS: {
+            const hasDrawParameters = pendingDrawParameters !== null;
+            const drawParameters = pendingDrawParameters || [1, 0, 0];
+            pendingDrawParameters = null;
             if (cursor + 44 > dataBlockStart) {
               throw new Error(`Truncated RENDER_PASS fields at command ${i}`);
             }
@@ -529,14 +595,16 @@ export class WebGpuBridgeHost {
 
             const isNewPass = (passFlags & 1) !== 0;
             const targetKey = `${targetKind}:${targetId}`;
+            if (hasDrawParameters && (isNewPass || currentPassTargetKey !== targetKey)) {
+              throw new Error("SetDrawParameters cannot cross a render-pass boundary");
+            }
             if (!currentPassEncoder || currentPassTargetKey !== targetKey || isNewPass) {
               closeActivePass();
 
               let targetView;
               if (targetKind === TARGET_CANVAS) {
                 if (!canvasContext) {
-                  // Gracefully skip canvas swapchain presentation pass in headless or pure-offscreen execution
-                  continue;
+                  throw new Error("RenderPass: canvas target requires a canvas context");
                 }
                 // Canvas swapchain view is acquired at most once per packet execution (§8.5, [S48])
                 targetView = getCanvasView();
@@ -624,7 +692,7 @@ export class WebGpuBridgeHost {
                 }
               }
 
-              currentPassEncoder.draw(vertexCount, 1, 0, 0);
+              currentPassEncoder.draw(vertexCount, ...drawParameters);
             }
             break;
           }
@@ -811,7 +879,7 @@ export class WebGpuBridgeHost {
               let targetView;
               if (targetType === TARGET_CANVAS) {
                 if (!canvasContext) {
-                  continue;
+                  throw new Error("ExecuteBundles: canvas target requires a canvas context");
                 }
                 targetView = getCanvasView();
               } else {
@@ -863,11 +931,66 @@ export class WebGpuBridgeHost {
             break;
           }
 
+          case OPCODE_SET_VIEWPORT: {
+            if (!currentPassEncoder) {
+              throw new Error("SetViewport: no active render pass");
+            }
+            if (cursor + 24 > dataBlockStart) {
+              throw new Error(`Truncated SET_VIEWPORT fields at command ${i}`);
+            }
+            const x = dataView.getFloat32(cursor, true);
+            const y = dataView.getFloat32(cursor + 4, true);
+            const width = dataView.getFloat32(cursor + 8, true);
+            const height = dataView.getFloat32(cursor + 12, true);
+            const minDepth = dataView.getFloat32(cursor + 16, true);
+            const maxDepth = dataView.getFloat32(cursor + 20, true);
+            cursor += 24;
+
+            currentPassEncoder.setViewport(x, y, width, height, minDepth, maxDepth);
+            break;
+          }
+
+          case OPCODE_SET_DRAW_PARAMETERS: {
+            if (!currentPassEncoder) {
+              throw new Error("SetDrawParameters: no active render pass");
+            }
+            if (cursor + 12 > dataBlockStart) {
+              throw new Error(`Truncated SET_DRAW_PARAMETERS fields at command ${i}`);
+            }
+            pendingDrawParameters = [
+              dataView.getUint32(cursor, true),
+              dataView.getUint32(cursor + 4, true),
+              dataView.getUint32(cursor + 8, true),
+            ];
+            cursor += 12;
+            break;
+          }
+
+          case OPCODE_SET_SCISSOR_RECT: {
+            if (!currentPassEncoder) {
+              throw new Error("SetScissorRect: no active render pass");
+            }
+            if (cursor + 16 > dataBlockStart) {
+              throw new Error(`Truncated SET_SCISSOR_RECT fields at command ${i}`);
+            }
+            const x = dataView.getUint32(cursor, true);
+            const y = dataView.getUint32(cursor + 4, true);
+            const width = dataView.getUint32(cursor + 8, true);
+            const height = dataView.getUint32(cursor + 12, true);
+            cursor += 16;
+
+            currentPassEncoder.setScissorRect(x, y, width, height);
+            break;
+          }
+
           default:
             throw new Error(`Unknown opcode: ${opcode}`);
         }
       }
 
+      if (pendingDrawParameters) {
+        throw new Error("SetDrawParameters has no following RenderPass");
+      }
       closeActivePass();
       frameCanvasView = null;
       // Finish and submit synchronously inside the error scope
@@ -880,6 +1003,9 @@ export class WebGpuBridgeHost {
    * Reads back data from a map-readable buffer.
    */
   async readbackBuffer(bufferId, byteLength) {
+    const device = this.device;
+    const deviceGeneration = this.deviceGeneration;
+    if (!device) throw new Error("readbackBuffer: device not initialized");
     const buffer = this.buffers.get(bufferId);
     if (!buffer) {
       throw new Error(`readbackBuffer: unknown bufferId ${bufferId}`);
@@ -891,6 +1017,9 @@ export class WebGpuBridgeHost {
     await buffer.mapAsync(GPUMapMode.READ, 0, byteLength);
     let copy;
     try {
+      if (this.device !== device || this.deviceGeneration !== deviceGeneration) {
+        throw new Error("readbackBuffer: device changed before mapping completed");
+      }
       copy = new Uint8Array(buffer.getMappedRange(0, byteLength).slice(0));
     } finally {
       buffer.unmap();
@@ -899,6 +1028,7 @@ export class WebGpuBridgeHost {
     copy.epochHi = epochHi;
     copy.epochLo = epochLo;
     copy.bufferId = bufferId;
+    copy.deviceGeneration = deviceGeneration;
     copy.data = copy;
     return copy;
   }
