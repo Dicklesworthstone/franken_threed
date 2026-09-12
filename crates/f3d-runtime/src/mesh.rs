@@ -28,15 +28,16 @@ use f3d_core::{
 };
 use f3d_graph::{
     canvas::{CanvasEpochTracker, CanvasFormat, CanvasId},
+    pass::DepthStencilAttachment,
     resource::ResourceId,
 };
 
 use crate::frame::{FrameSession, RenderContext};
 use crate::gpu_host::{
     with_global_resource_table, GpuCommand, GpuSubmissionPacket, BUFFER_USAGE_COPY_DST,
-    BUFFER_USAGE_MAP_READ, BUFFER_USAGE_UNIFORM, BUFFER_USAGE_VERTEX,
-    TARGET_FORMAT_PREFERRED_CANVAS, TARGET_FORMAT_RGBA8UNORM, TEXTURE_USAGE_COPY_SRC,
-    TEXTURE_USAGE_RENDER_ATTACHMENT,
+    BUFFER_USAGE_MAP_READ, BUFFER_USAGE_UNIFORM, BUFFER_USAGE_VERTEX, DEPTH_COMPARE_ALWAYS,
+    TARGET_FORMAT_DEPTH24PLUS, TARGET_FORMAT_PREFERRED_CANVAS, TARGET_FORMAT_RGBA8UNORM,
+    TEXTURE_USAGE_COPY_SRC, TEXTURE_USAGE_RENDER_ATTACHMENT,
 };
 
 #[cfg(all(feature = "browser", target_arch = "wasm32"))]
@@ -55,6 +56,8 @@ pub enum MeshPacketError {
     InvalidMatrixLength { name: &'static str, len: usize },
     /// Color array does not have 3 or 4 elements.
     InvalidColorLength { len: usize },
+    /// Invalid depth comparison operator (must be 1..=8).
+    InvalidDepthCompare { value: u32 },
     /// Target dimension alignment, vertex count, or row pitch calculation failed.
     InvalidDimensions(String),
     /// Render session, graph compilation, or plan lowering error.
@@ -81,6 +84,9 @@ impl fmt::Display for MeshPacketError {
             Self::InvalidColorLength { len } => {
                 write!(f, "color must contain 3 or 4 elements (got {len})")
             }
+            Self::InvalidDepthCompare { value } => {
+                write!(f, "depth compare function code must be between 1 and 8 (got {value})")
+            }
             Self::InvalidDimensions(msg) => write!(f, "invalid dimensions: {msg}"),
             Self::SessionError(msg) => write!(f, "render session error: {msg}"),
             Self::EncodeError(msg) => write!(f, "packet encode error: {msg}"),
@@ -98,6 +104,9 @@ pub const MESH_VERTEX_BUFFER_ID: u32 = 2;
 
 /// Canonical offscreen render target texture identifier.
 pub const MESH_TARGET_TEXTURE_ID: u32 = 10;
+
+/// Canonical offscreen depth texture identifier.
+pub const MESH_DEPTH_TEXTURE_ID: u32 = 11;
 
 /// Canonical staging readback buffer resource identifier.
 pub const MESH_READBACK_BUFFER_ID: u32 = 20;
@@ -262,6 +271,51 @@ impl<'a> DynamicMeshInput<'a> {
     }
 }
 
+/// Depth testing and writing configuration for dynamic mesh render pipeline and pass.
+/// Depth testing and writing configuration for dynamic mesh render pipeline and pass.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct MeshDepthOptions {
+    /// Whether depth testing is enabled.
+    pub depth_test: bool,
+    /// Effective depth writing flag for the GPU pipeline (resolved by host/adapter).
+    pub depth_write: bool,
+    /// WebGPU depth comparison operator (wire codes 1..=8: 1=Never, 2=Less, 3=Equal, 4=LessEqual, 5=Greater, 6=NotEqual, 7=GreaterEqual, 8=Always).
+    /// Forced to [`DEPTH_COMPARE_ALWAYS`] (8) if `depth_test` is false.
+    pub depth_compare: u32,
+}
+
+impl MeshDepthOptions {
+    /// Constructs and validates depth options.
+    ///
+    /// # Errors
+    /// Returns [`MeshPacketError::InvalidDepthCompare`] if `depth_compare` is not in `1..=8`.
+    pub fn new(depth_test: bool, depth_write: bool, depth_compare: u32) -> Result<Self, MeshPacketError> {
+        if !(1..=8).contains(&depth_compare) {
+            return Err(MeshPacketError::InvalidDepthCompare { value: depth_compare });
+        }
+        Ok(Self {
+            depth_test,
+            depth_write,
+            depth_compare,
+        })
+    }
+
+    /// Resolves effective depth write and compare operations according to pinned Three.js r186 WebGPU invariants.
+    ///
+    /// `depth_write` is accepted directly as the effective GPU pipeline write flag (§6.3, r186 WebGPUPipelineUtils.js:224).
+    /// When `depth_test` is false, the comparison operator is forced to [`DEPTH_COMPARE_ALWAYS`] (8).
+    #[inline]
+    #[must_use]
+    pub fn resolve_effective(&self) -> (bool, u32) {
+        let effective_compare = if self.depth_test {
+            self.depth_compare
+        } else {
+            DEPTH_COMPARE_ALWAYS
+        };
+        (self.depth_write, effective_compare)
+    }
+}
+
 /// Generates the WGSL shader source code for dynamic mesh rendering.
 ///
 /// Features a 144-byte uniform buffer with modelView, projection, and color,
@@ -388,6 +442,24 @@ fn prepare_vertex_and_uniform_data(
 
 /// Builds a verified [`GpuSubmissionPacket`] from typed dynamic mesh inputs for offscreen rendering.
 pub fn build_mesh_submission(input: &DynamicMeshInput<'_>) -> Result<GpuSubmissionPacket, MeshPacketError> {
+    build_mesh_submission_internal(input, None)
+}
+
+/// Builds a verified [`GpuSubmissionPacket`] with depth testing/writing from typed dynamic mesh inputs for offscreen rendering.
+pub fn build_mesh_depth_submission(
+    input: &DynamicMeshInput<'_>,
+    depth_test: bool,
+    depth_write: bool,
+    depth_compare: u32,
+) -> Result<GpuSubmissionPacket, MeshPacketError> {
+    let opts = MeshDepthOptions::new(depth_test, depth_write, depth_compare)?;
+    build_mesh_submission_internal(input, Some(opts))
+}
+
+fn build_mesh_submission_internal(
+    input: &DynamicMeshInput<'_>,
+    depth_opts: Option<MeshDepthOptions>,
+) -> Result<GpuSubmissionPacket, MeshPacketError> {
     // 1. Validate dimensions and calculate aligned readback size BEFORE any slot registration/allocation
     if input.width == 0 || input.height == 0 {
         return Err(MeshPacketError::ZeroDimensions {
@@ -416,6 +488,9 @@ pub fn build_mesh_submission(input: &DynamicMeshInput<'_>) -> Result<GpuSubmissi
         table.register(MESH_UNIFORM_BUFFER_ID);
         table.register(MESH_VERTEX_BUFFER_ID);
         table.register(MESH_TARGET_TEXTURE_ID);
+        if depth_opts.is_some() {
+            table.register(MESH_DEPTH_TEXTURE_ID);
+        }
         table.register(MESH_READBACK_BUFFER_ID);
         table.register(MESH_PIPELINE_ID);
     });
@@ -449,6 +524,16 @@ pub fn build_mesh_submission(input: &DynamicMeshInput<'_>) -> Result<GpuSubmissi
         usage: TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC,
     });
 
+    if depth_opts.is_some() {
+        packet.push(GpuCommand::CreateTexture {
+            texture_id: MESH_DEPTH_TEXTURE_ID,
+            width: input.width,
+            height: input.height,
+            format: TARGET_FORMAT_DEPTH24PLUS,
+            usage: TEXTURE_USAGE_RENDER_ATTACHMENT,
+        });
+    }
+
     packet.push(GpuCommand::CreateBuffer {
         buffer_id: MESH_READBACK_BUFFER_ID,
         size: readback_size,
@@ -456,15 +541,31 @@ pub fn build_mesh_submission(input: &DynamicMeshInput<'_>) -> Result<GpuSubmissi
     });
 
     let wgsl_code = generate_mesh_wgsl(input.webgl_depth);
-    packet.push(GpuCommand::CreatePipeline {
-        pipeline_id: MESH_PIPELINE_ID,
-        wgsl_code,
-        target_format: TARGET_FORMAT_RGBA8UNORM,
-        has_vertex_buffer: true,
-        has_uniform_buffer: true,
-        uniform_size: 144,
-        vertex_stride: vertex_stride_u32,
-    });
+    if let Some(depth) = depth_opts {
+        let (depth_write_enabled, depth_compare) = depth.resolve_effective();
+        packet.push(GpuCommand::CreatePipelineDepth {
+            pipeline_id: MESH_PIPELINE_ID,
+            wgsl_code,
+            target_format: TARGET_FORMAT_RGBA8UNORM,
+            has_vertex_buffer: true,
+            has_uniform_buffer: true,
+            uniform_size: 144,
+            vertex_stride: vertex_stride_u32,
+            depth_format: TARGET_FORMAT_DEPTH24PLUS,
+            depth_write_enabled,
+            depth_compare,
+        });
+    } else {
+        packet.push(GpuCommand::CreatePipeline {
+            pipeline_id: MESH_PIPELINE_ID,
+            wgsl_code,
+            target_format: TARGET_FORMAT_RGBA8UNORM,
+            has_vertex_buffer: true,
+            has_uniform_buffer: true,
+            uniform_size: 144,
+            vertex_stride: vertex_stride_u32,
+        });
+    }
 
     // 5. Build pass structure through FrameSession and lower_plan
     let root_ctx = RenderContext::new_offscreen(
@@ -483,9 +584,13 @@ pub fn build_mesh_submission(input: &DynamicMeshInput<'_>) -> Result<GpuSubmissi
         .snapshot_material_use(mat_handle, DataVersion::new(1), Epoch::ZERO, &uniform_bytes)
         .map_err(|e| MeshPacketError::SessionError(alloc::format!("snapshot_material_use: {e:?}")))?;
 
+    let depth_attachment = depth_opts.map(|_| {
+        DepthStencilAttachment::new_depth_clear(ResourceId::new(MESH_DEPTH_TEXTURE_ID), 1.0)
+    });
+
     session
-        .begin_render_pass("mesh_render_pass", MESH_CLEAR_COLOR)
-        .map_err(|e| MeshPacketError::SessionError(alloc::format!("begin_render_pass: {e:?}")))?;
+        .begin_render_pass_with_depth("mesh_render_pass", MESH_CLEAR_COLOR, depth_attachment)
+        .map_err(|e| MeshPacketError::SessionError(alloc::format!("begin_render_pass_with_depth: {e:?}")))?;
     session
         .record_direct_draw(
             MESH_PIPELINE_ID,
@@ -536,6 +641,25 @@ pub fn build_mesh_submission(input: &DynamicMeshInput<'_>) -> Result<GpuSubmissi
 pub fn build_mesh_canvas_submission(
     input: &DynamicMeshInput<'_>,
 ) -> Result<GpuSubmissionPacket, MeshPacketError> {
+    build_mesh_canvas_submission_internal(input, None)
+}
+
+/// Builds a verified [`GpuSubmissionPacket`] with depth testing/writing targeting a visible canvas swapchain
+/// from typed dynamic mesh inputs.
+pub fn build_mesh_canvas_depth_submission(
+    input: &DynamicMeshInput<'_>,
+    depth_test: bool,
+    depth_write: bool,
+    depth_compare: u32,
+) -> Result<GpuSubmissionPacket, MeshPacketError> {
+    let opts = MeshDepthOptions::new(depth_test, depth_write, depth_compare)?;
+    build_mesh_canvas_submission_internal(input, Some(opts))
+}
+
+fn build_mesh_canvas_submission_internal(
+    input: &DynamicMeshInput<'_>,
+    depth_opts: Option<MeshDepthOptions>,
+) -> Result<GpuSubmissionPacket, MeshPacketError> {
     // 1. Validate dimensions BEFORE any slot registration/allocation
     if input.width == 0 || input.height == 0 {
         return Err(MeshPacketError::ZeroDimensions {
@@ -558,6 +682,9 @@ pub fn build_mesh_canvas_submission(
         table.register(MESH_UNIFORM_BUFFER_ID);
         table.register(MESH_VERTEX_BUFFER_ID);
         table.register(MESH_CANVAS_TARGET_ID);
+        if depth_opts.is_some() {
+            table.register(MESH_DEPTH_TEXTURE_ID);
+        }
         table.register(MESH_CANVAS_PIPELINE_ID);
     });
 
@@ -582,16 +709,42 @@ pub fn build_mesh_canvas_submission(
         data: vertex_upload_data,
     });
 
+    if depth_opts.is_some() {
+        packet.push(GpuCommand::CreateTexture {
+            texture_id: MESH_DEPTH_TEXTURE_ID,
+            width: input.width,
+            height: input.height,
+            format: TARGET_FORMAT_DEPTH24PLUS,
+            usage: TEXTURE_USAGE_RENDER_ATTACHMENT,
+        });
+    }
+
     let wgsl_code = generate_mesh_wgsl(input.webgl_depth);
-    packet.push(GpuCommand::CreatePipeline {
-        pipeline_id: MESH_CANVAS_PIPELINE_ID,
-        wgsl_code,
-        target_format: TARGET_FORMAT_PREFERRED_CANVAS,
-        has_vertex_buffer: true,
-        has_uniform_buffer: true,
-        uniform_size: 144,
-        vertex_stride: vertex_stride_u32,
-    });
+    if let Some(depth) = depth_opts {
+        let (depth_write_enabled, depth_compare) = depth.resolve_effective();
+        packet.push(GpuCommand::CreatePipelineDepth {
+            pipeline_id: MESH_CANVAS_PIPELINE_ID,
+            wgsl_code,
+            target_format: TARGET_FORMAT_PREFERRED_CANVAS,
+            has_vertex_buffer: true,
+            has_uniform_buffer: true,
+            uniform_size: 144,
+            vertex_stride: vertex_stride_u32,
+            depth_format: TARGET_FORMAT_DEPTH24PLUS,
+            depth_write_enabled,
+            depth_compare,
+        });
+    } else {
+        packet.push(GpuCommand::CreatePipeline {
+            pipeline_id: MESH_CANVAS_PIPELINE_ID,
+            wgsl_code,
+            target_format: TARGET_FORMAT_PREFERRED_CANVAS,
+            has_vertex_buffer: true,
+            has_uniform_buffer: true,
+            uniform_size: 144,
+            vertex_stride: vertex_stride_u32,
+        });
+    }
 
     // 5. Build pass structure through FrameSession with CanvasEpochTracker and lower_plan
     let mut tracker = CanvasEpochTracker::new();
@@ -623,9 +776,13 @@ pub fn build_mesh_canvas_submission(
         .snapshot_material_use(mat_handle, DataVersion::new(1), Epoch::ZERO, &uniform_bytes)
         .map_err(|e| MeshPacketError::SessionError(alloc::format!("snapshot_material_use: {e:?}")))?;
 
+    let depth_attachment = depth_opts.map(|_| {
+        DepthStencilAttachment::new_depth_clear(ResourceId::new(MESH_DEPTH_TEXTURE_ID), 1.0)
+    });
+
     session
-        .begin_render_pass("mesh_canvas_render_pass", MESH_CLEAR_COLOR)
-        .map_err(|e| MeshPacketError::SessionError(alloc::format!("begin_render_pass: {e:?}")))?;
+        .begin_render_pass_with_depth("mesh_canvas_render_pass", MESH_CLEAR_COLOR, depth_attachment)
+        .map_err(|e| MeshPacketError::SessionError(alloc::format!("begin_render_pass_with_depth: {e:?}")))?;
     session
         .record_direct_draw(
             MESH_CANVAS_PIPELINE_ID,
@@ -773,6 +930,314 @@ pub fn gpu_bridge_build_mesh_packet(
         width,
         height,
         webgl_depth,
+    )
+}
+
+fn build_mesh_depth_packet_impl(
+    positions: &[f32],
+    indices: &[u32],
+    model_view: &[f64],
+    projection: &[f64],
+    color: &[f32],
+    width: u32,
+    height: u32,
+    webgl_depth: bool,
+    depth_test: bool,
+    depth_write: bool,
+    depth_compare: u32,
+) -> Result<Vec<u8>, MeshPacketError> {
+    let input = DynamicMeshInput::try_from_raw(
+        positions,
+        indices,
+        model_view,
+        projection,
+        color,
+        width,
+        height,
+        webgl_depth,
+    )?;
+
+    let packet = build_mesh_depth_submission(&input, depth_test, depth_write, depth_compare)?;
+    packet
+        .encode()
+        .map_err(|e| MeshPacketError::EncodeError(alloc::format!("{e:?}")))
+}
+
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen]
+/// Encodes a dynamic Three.js Mesh-to-Wasm submission packet with depth state (wasm-bindgen export).
+pub fn f3d_build_mesh_depth_packet(
+    positions: &[f32],
+    indices: &[u32],
+    model_view: &[f64],
+    projection: &[f64],
+    color: &[f32],
+    width: u32,
+    height: u32,
+    webgl_depth: bool,
+    depth_test: bool,
+    depth_write: bool,
+    depth_compare: u32,
+) -> Result<Vec<u8>, wasm_bindgen::JsValue> {
+    build_mesh_depth_packet_impl(
+        positions,
+        indices,
+        model_view,
+        projection,
+        color,
+        width,
+        height,
+        webgl_depth,
+        depth_test,
+        depth_write,
+        depth_compare,
+    )
+    .map_err(|e| wasm_bindgen::JsValue::from_str(&e.to_string()))
+}
+
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen]
+/// Encodes a dynamic Three.js Mesh-to-Wasm submission packet with depth state (canonical bridge alias).
+pub fn gpu_bridge_build_mesh_depth_packet(
+    positions: &[f32],
+    indices: &[u32],
+    model_view: &[f64],
+    projection: &[f64],
+    color: &[f32],
+    width: u32,
+    height: u32,
+    webgl_depth: bool,
+    depth_test: bool,
+    depth_write: bool,
+    depth_compare: u32,
+) -> Result<Vec<u8>, wasm_bindgen::JsValue> {
+    f3d_build_mesh_depth_packet(
+        positions,
+        indices,
+        model_view,
+        projection,
+        color,
+        width,
+        height,
+        webgl_depth,
+        depth_test,
+        depth_write,
+        depth_compare,
+    )
+}
+
+#[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
+/// Encodes a dynamic Three.js Mesh-to-Wasm submission packet with depth state for host verification and unit tests.
+pub fn f3d_build_mesh_depth_packet(
+    positions: &[f32],
+    indices: &[u32],
+    model_view: &[f64],
+    projection: &[f64],
+    color: &[f32],
+    width: u32,
+    height: u32,
+    webgl_depth: bool,
+    depth_test: bool,
+    depth_write: bool,
+    depth_compare: u32,
+) -> Result<Vec<u8>, String> {
+    build_mesh_depth_packet_impl(
+        positions,
+        indices,
+        model_view,
+        projection,
+        color,
+        width,
+        height,
+        webgl_depth,
+        depth_test,
+        depth_write,
+        depth_compare,
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
+/// Encodes a dynamic Three.js Mesh-to-Wasm submission packet with depth state (canonical bridge alias).
+pub fn gpu_bridge_build_mesh_depth_packet(
+    positions: &[f32],
+    indices: &[u32],
+    model_view: &[f64],
+    projection: &[f64],
+    color: &[f32],
+    width: u32,
+    height: u32,
+    webgl_depth: bool,
+    depth_test: bool,
+    depth_write: bool,
+    depth_compare: u32,
+) -> Result<Vec<u8>, String> {
+    f3d_build_mesh_depth_packet(
+        positions,
+        indices,
+        model_view,
+        projection,
+        color,
+        width,
+        height,
+        webgl_depth,
+        depth_test,
+        depth_write,
+        depth_compare,
+    )
+}
+
+fn build_mesh_canvas_depth_packet_impl(
+    positions: &[f32],
+    indices: &[u32],
+    model_view: &[f64],
+    projection: &[f64],
+    color: &[f32],
+    width: u32,
+    height: u32,
+    webgl_depth: bool,
+    depth_test: bool,
+    depth_write: bool,
+    depth_compare: u32,
+) -> Result<Vec<u8>, MeshPacketError> {
+    let input = DynamicMeshInput::try_from_raw(
+        positions,
+        indices,
+        model_view,
+        projection,
+        color,
+        width,
+        height,
+        webgl_depth,
+    )?;
+
+    let packet = build_mesh_canvas_depth_submission(&input, depth_test, depth_write, depth_compare)?;
+    packet
+        .encode()
+        .map_err(|e| MeshPacketError::EncodeError(alloc::format!("{e:?}")))
+}
+
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen]
+/// Encodes a dynamic Three.js Mesh-to-Wasm submission packet targeting a visible canvas swapchain with depth state (wasm-bindgen export).
+pub fn f3d_build_canvas_mesh_depth_packet(
+    positions: &[f32],
+    indices: &[u32],
+    model_view: &[f64],
+    projection: &[f64],
+    color: &[f32],
+    width: u32,
+    height: u32,
+    webgl_depth: bool,
+    depth_test: bool,
+    depth_write: bool,
+    depth_compare: u32,
+) -> Result<Vec<u8>, wasm_bindgen::JsValue> {
+    build_mesh_canvas_depth_packet_impl(
+        positions,
+        indices,
+        model_view,
+        projection,
+        color,
+        width,
+        height,
+        webgl_depth,
+        depth_test,
+        depth_write,
+        depth_compare,
+    )
+    .map_err(|e| wasm_bindgen::JsValue::from_str(&e.to_string()))
+}
+
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen]
+/// Encodes a dynamic Three.js Mesh-to-Wasm submission packet targeting a visible canvas swapchain with depth state (canonical bridge alias).
+pub fn gpu_bridge_build_canvas_mesh_depth_packet(
+    positions: &[f32],
+    indices: &[u32],
+    model_view: &[f64],
+    projection: &[f64],
+    color: &[f32],
+    width: u32,
+    height: u32,
+    webgl_depth: bool,
+    depth_test: bool,
+    depth_write: bool,
+    depth_compare: u32,
+) -> Result<Vec<u8>, wasm_bindgen::JsValue> {
+    f3d_build_canvas_mesh_depth_packet(
+        positions,
+        indices,
+        model_view,
+        projection,
+        color,
+        width,
+        height,
+        webgl_depth,
+        depth_test,
+        depth_write,
+        depth_compare,
+    )
+}
+
+#[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
+/// Encodes a dynamic Three.js Mesh-to-Wasm submission packet targeting a visible canvas swapchain with depth state for host verification and unit tests.
+pub fn f3d_build_canvas_mesh_depth_packet(
+    positions: &[f32],
+    indices: &[u32],
+    model_view: &[f64],
+    projection: &[f64],
+    color: &[f32],
+    width: u32,
+    height: u32,
+    webgl_depth: bool,
+    depth_test: bool,
+    depth_write: bool,
+    depth_compare: u32,
+) -> Result<Vec<u8>, String> {
+    build_mesh_canvas_depth_packet_impl(
+        positions,
+        indices,
+        model_view,
+        projection,
+        color,
+        width,
+        height,
+        webgl_depth,
+        depth_test,
+        depth_write,
+        depth_compare,
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
+/// Encodes a dynamic Three.js Mesh-to-Wasm submission packet targeting a visible canvas swapchain with depth state (canonical bridge alias).
+pub fn gpu_bridge_build_canvas_mesh_depth_packet(
+    positions: &[f32],
+    indices: &[u32],
+    model_view: &[f64],
+    projection: &[f64],
+    color: &[f32],
+    width: u32,
+    height: u32,
+    webgl_depth: bool,
+    depth_test: bool,
+    depth_write: bool,
+    depth_compare: u32,
+) -> Result<Vec<u8>, String> {
+    f3d_build_canvas_mesh_depth_packet(
+        positions,
+        indices,
+        model_view,
+        projection,
+        color,
+        width,
+        height,
+        webgl_depth,
+        depth_test,
+        depth_write,
+        depth_compare,
     )
 }
 

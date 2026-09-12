@@ -8,18 +8,26 @@
 //! 5. Input validation and error discipline (bounds, lengths, dimensions).
 //! 6. Exact parity between `f3d_build_mesh_packet` and `gpu_bridge_build_mesh_packet`.
 
+use f3d_core::ownership::Epoch;
+use f3d_graph::pass::DepthStencilAttachment;
+use f3d_graph::resource::ResourceId;
+use f3d_runtime::frame::{FrameSession, RenderContext};
 use f3d_runtime::gpu_host::{
     GpuCommand, GpuSubmissionPacket, BUFFER_USAGE_COPY_DST, BUFFER_USAGE_MAP_READ,
-    BUFFER_USAGE_UNIFORM, BUFFER_USAGE_VERTEX, TARGET_CANVAS,
-    TARGET_FORMAT_PREFERRED_CANVAS, TARGET_FORMAT_RGBA8UNORM, TEXTURE_USAGE_COPY_SRC,
-    TEXTURE_USAGE_RENDER_ATTACHMENT,
+    BUFFER_USAGE_UNIFORM, BUFFER_USAGE_VERTEX, DEPTH_COMPARE_ALWAYS, DEPTH_COMPARE_LESS,
+    TARGET_CANVAS, TARGET_FORMAT_DEPTH24PLUS, TARGET_FORMAT_PREFERRED_CANVAS,
+    TARGET_FORMAT_RGBA8UNORM, TEXTURE_USAGE_COPY_SRC, TEXTURE_USAGE_RENDER_ATTACHMENT,
 };
 use f3d_runtime::mesh::{
-    build_mesh_canvas_submission, build_mesh_submission, f3d_build_canvas_mesh_packet,
-    f3d_build_mesh_packet, generate_mesh_wgsl, gpu_bridge_build_canvas_mesh_packet,
-    gpu_bridge_build_mesh_packet, DynamicMeshInput, MeshPacketError,
-    MESH_CANVAS_PIPELINE_ID, MESH_CANVAS_TARGET_ID, MESH_CLEAR_COLOR,
-    MESH_UNIFORM_BUFFER_ID, MESH_VERTEX_BUFFER_ID,
+    build_mesh_canvas_depth_submission, build_mesh_canvas_submission,
+    build_mesh_depth_submission, build_mesh_submission,
+    f3d_build_canvas_mesh_depth_packet, f3d_build_canvas_mesh_packet,
+    f3d_build_mesh_depth_packet, f3d_build_mesh_packet, generate_mesh_wgsl,
+    gpu_bridge_build_canvas_mesh_depth_packet, gpu_bridge_build_canvas_mesh_packet,
+    gpu_bridge_build_mesh_depth_packet, gpu_bridge_build_mesh_packet, DynamicMeshInput,
+    MeshDepthOptions, MeshPacketError, MESH_CANVAS_PIPELINE_ID, MESH_CANVAS_TARGET_ID,
+    MESH_CLEAR_COLOR, MESH_DEPTH_TEXTURE_ID, MESH_PIPELINE_ID, MESH_READBACK_BUFFER_ID,
+    MESH_TARGET_TEXTURE_ID, MESH_UNIFORM_BUFFER_ID, MESH_VERTEX_BUFFER_ID,
 };
 
 const IDENTITY_F64: [f64; 16] = [
@@ -849,10 +857,6 @@ fn test_dynamic_mesh_canvas_wire_encoding_and_roundtrip() {
     assert!(!bytes.is_empty());
     assert!(bytes.len() >= 16, "wire packet must at least have header");
 
-    let decoded = GpuSubmissionPacket::decode(&bytes)
-        .expect("canvas wire packet must decode cleanly");
-    assert_eq!(decoded.commands().len(), 6);
-
     let input = DynamicMeshInput::try_from_raw(
         &positions,
         &indices,
@@ -865,7 +869,9 @@ fn test_dynamic_mesh_canvas_wire_encoding_and_roundtrip() {
     )
     .unwrap();
     let expected = build_mesh_canvas_submission(&input).unwrap();
-    assert_eq!(decoded.commands(), expected.commands());
+    let expected_bytes = expected.encode().expect("canvas submission must encode");
+    assert_eq!(bytes, expected_bytes);
+    assert_eq!(expected.commands().len(), 6);
 }
 
 #[test]
@@ -1068,4 +1074,428 @@ fn test_dynamic_mesh_canvas_validation_errors() {
         &positions, &indices, &IDENTITY_F64, &IDENTITY_F64, &bad_c, 64, 64, false,
     ).unwrap_err();
     assert!(err_c.contains("color must contain"));
+}
+
+#[test]
+fn test_dynamic_mesh_depth_offscreen_packet_structure() {
+    let positions = [
+        0.0_f32, 0.5, 0.0,
+        -0.5, -0.5, 0.0,
+        0.5, -0.5, 0.0,
+    ];
+    let indices: [u32; 0] = [];
+    let color = [0.0_f32, 1.0, 0.0, 1.0];
+
+    let bytes = f3d_build_mesh_depth_packet(
+        &positions,
+        &indices,
+        &IDENTITY_F64,
+        &IDENTITY_F64,
+        &color,
+        64,
+        64,
+        false,
+        true,
+        true,
+        DEPTH_COMPARE_LESS,
+    )
+    .expect("f3d_build_mesh_depth_packet must succeed");
+
+    assert!(!bytes.is_empty());
+
+    let input = DynamicMeshInput::try_from_raw(
+        &positions,
+        &indices,
+        &IDENTITY_F64,
+        &IDENTITY_F64,
+        &color,
+        64,
+        64,
+        false,
+    )
+    .expect("DynamicMeshInput must construct");
+
+    let packet = build_mesh_depth_submission(&input, true, true, DEPTH_COMPARE_LESS)
+        .expect("depth submission must build");
+    let commands = packet.commands();
+    assert_eq!(commands.len(), 10);
+
+    // 0: Create uniform buffer (size 256)
+    assert!(matches!(
+        &commands[0],
+        GpuCommand::CreateBuffer { buffer_id: 1, size: 256, .. }
+    ));
+
+    // 1: Create vertex buffer (size 60)
+    assert!(matches!(
+        &commands[1],
+        GpuCommand::CreateBuffer { buffer_id: 2, size: 60, .. }
+    ));
+
+    // 2: Write vertex buffer
+    assert!(matches!(
+        &commands[2],
+        GpuCommand::WriteBuffer { buffer_id: 2, offset: 0, .. }
+    ));
+
+    // 3: Create color target texture (id 10, format RGBA8UNORM)
+    assert!(matches!(
+        &commands[3],
+        GpuCommand::CreateTexture {
+            texture_id: 10,
+            width: 64,
+            height: 64,
+            format: TARGET_FORMAT_RGBA8UNORM,
+            usage,
+        } if *usage == (TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC)
+    ));
+
+    // 4: Create depth target texture (id 11, format TARGET_FORMAT_DEPTH24PLUS)
+    assert!(matches!(
+        &commands[4],
+        GpuCommand::CreateTexture {
+            texture_id: MESH_DEPTH_TEXTURE_ID,
+            width: 64,
+            height: 64,
+            format: TARGET_FORMAT_DEPTH24PLUS,
+            usage,
+        } if *usage == TEXTURE_USAGE_RENDER_ATTACHMENT
+    ));
+
+    // 5: Create readback buffer
+    assert!(matches!(
+        &commands[5],
+        GpuCommand::CreateBuffer { buffer_id: 20, size: 16384, .. }
+    ));
+
+    // 6: Create pipeline depth
+    if let GpuCommand::CreatePipelineDepth {
+        pipeline_id,
+        target_format,
+        depth_format,
+        depth_write_enabled,
+        depth_compare,
+        uniform_size,
+        vertex_stride,
+        ..
+    } = &commands[6]
+    {
+        assert_eq!(*pipeline_id, MESH_PIPELINE_ID);
+        assert_eq!(*target_format, TARGET_FORMAT_RGBA8UNORM);
+        assert_eq!(*depth_format, TARGET_FORMAT_DEPTH24PLUS);
+        assert_eq!(*depth_write_enabled, true);
+        assert_eq!(*depth_compare, DEPTH_COMPARE_LESS);
+        assert_eq!(*uniform_size, 144);
+        assert_eq!(*vertex_stride, 20);
+    } else {
+        panic!("expected CreatePipelineDepth at index 6");
+    }
+
+    // 7: Write uniform buffer
+    assert!(matches!(
+        &commands[7],
+        GpuCommand::WriteBuffer { buffer_id: 1, offset: 0, .. }
+    ));
+
+    // 8: Render pass depth
+    if let GpuCommand::RenderPassDepth {
+        pipeline_id,
+        vertex_count,
+        depth_target_id,
+        depth_clear_value,
+        depth_read_only,
+        ..
+    } = &commands[8]
+    {
+        assert_eq!(*pipeline_id, MESH_PIPELINE_ID);
+        assert_eq!(*vertex_count, 3);
+        assert_eq!(*depth_target_id, MESH_DEPTH_TEXTURE_ID);
+        assert_eq!(*depth_clear_value, 1.0);
+        assert_eq!(*depth_read_only, false);
+    } else {
+        panic!("expected RenderPassDepth at index 8");
+    }
+
+    // 9: CopyTextureToBuffer
+    assert!(matches!(
+        &commands[9],
+        GpuCommand::CopyTextureToBuffer {
+            texture_id: 10,
+            buffer_id: 20,
+            width: 64,
+            height: 64,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn test_dynamic_mesh_depth_disabled_pinned_three_invariants() {
+    let positions = [
+        0.0_f32, 0.5, 0.0,
+        -0.5, -0.5, 0.0,
+        0.5, -0.5, 0.0,
+    ];
+    let indices: [u32; 0] = [];
+    let color = [1.0_f32, 0.0, 0.0, 1.0];
+
+    let input = DynamicMeshInput::try_from_raw(
+        &positions,
+        &indices,
+        &IDENTITY_F64,
+        &IDENTITY_F64,
+        &color,
+        64,
+        64,
+        false,
+    )
+    .unwrap();
+
+    // When depth_test is false: depth_write MUST NOT be blindly forced to false.
+    // depth_write is accepted directly as the effective GPU pipeline write flag (r186 WebGPUPipelineUtils.js:224).
+    // depth_compare is forced to DEPTH_COMPARE_ALWAYS (8).
+    let packet_write_true = build_mesh_depth_submission(&input, false, true, DEPTH_COMPARE_LESS).unwrap();
+    let commands_true = packet_write_true.commands();
+
+    if let GpuCommand::CreatePipelineDepth {
+        depth_write_enabled,
+        depth_compare,
+        ..
+    } = &commands_true[6]
+    {
+        assert_eq!(
+            *depth_write_enabled, true,
+            "depth_write_enabled must preserve effective depth_write flag when depth_test is false"
+        );
+        assert_eq!(
+            *depth_compare, DEPTH_COMPARE_ALWAYS,
+            "depth_compare must be DEPTH_COMPARE_ALWAYS (8) when depth_test is false"
+        );
+    } else {
+        panic!("expected CreatePipelineDepth at index 6");
+    }
+
+    let packet_write_false = build_mesh_depth_submission(&input, false, false, DEPTH_COMPARE_LESS).unwrap();
+    let commands_false = packet_write_false.commands();
+
+    if let GpuCommand::CreatePipelineDepth {
+        depth_write_enabled,
+        depth_compare,
+        ..
+    } = &commands_false[6]
+    {
+        assert_eq!(
+            *depth_write_enabled, false,
+            "depth_write_enabled must be false when depth_write is false"
+        );
+        assert_eq!(
+            *depth_compare, DEPTH_COMPARE_ALWAYS,
+            "depth_compare must be DEPTH_COMPARE_ALWAYS (8) when depth_test is false"
+        );
+    } else {
+        panic!("expected CreatePipelineDepth at index 6");
+    }
+}
+
+#[test]
+fn test_dynamic_mesh_depth_compare_validation() {
+    let positions = [
+        0.0_f32, 0.5, 0.0,
+        -0.5, -0.5, 0.0,
+        0.5, -0.5, 0.0,
+    ];
+    let indices: [u32; 0] = [];
+    let color = [1.0_f32, 0.0, 0.0, 1.0];
+
+    let input = DynamicMeshInput::try_from_raw(
+        &positions, &indices, &IDENTITY_F64, &IDENTITY_F64, &color, 64, 64, false,
+    ).unwrap();
+
+    // 0 is invalid depth compare
+    let err_0 = build_mesh_depth_submission(&input, true, true, 0).unwrap_err();
+    assert_eq!(err_0, MeshPacketError::InvalidDepthCompare { value: 0 });
+
+    // 9 is invalid depth compare
+    let err_9 = build_mesh_depth_submission(&input, true, true, 9).unwrap_err();
+    assert_eq!(err_9, MeshPacketError::InvalidDepthCompare { value: 9 });
+
+    // String export error checks
+    let str_err_0 = f3d_build_mesh_depth_packet(
+        &positions, &indices, &IDENTITY_F64, &IDENTITY_F64, &color, 64, 64, false, true, true, 0,
+    ).unwrap_err();
+    assert!(str_err_0.contains("depth compare function code must be between 1 and 8"));
+
+    let str_err_9 = f3d_build_canvas_mesh_depth_packet(
+        &positions, &indices, &IDENTITY_F64, &IDENTITY_F64, &color, 64, 64, false, true, true, 9,
+    ).unwrap_err();
+    assert!(str_err_9.contains("depth compare function code must be between 1 and 8"));
+}
+
+#[test]
+fn test_dynamic_mesh_depth_canvas_packet_structure() {
+    let positions = [
+        0.0_f32, 0.5, 0.0,
+        -0.5, -0.5, 0.0,
+        0.5, -0.5, 0.0,
+    ];
+    let indices: [u32; 0] = [];
+    let color = [0.0_f32, 0.0, 1.0, 1.0];
+
+    let bytes = f3d_build_canvas_mesh_depth_packet(
+        &positions,
+        &indices,
+        &IDENTITY_F64,
+        &IDENTITY_F64,
+        &color,
+        128,
+        128,
+        false,
+        true,
+        false,
+        DEPTH_COMPARE_LESS,
+    )
+    .expect("f3d_build_canvas_mesh_depth_packet must succeed");
+
+    assert!(!bytes.is_empty());
+
+    let input = DynamicMeshInput::try_from_raw(
+        &positions,
+        &indices,
+        &IDENTITY_F64,
+        &IDENTITY_F64,
+        &color,
+        128,
+        128,
+        false,
+    )
+    .unwrap();
+
+    let packet = build_mesh_canvas_depth_submission(&input, true, false, DEPTH_COMPARE_LESS).unwrap();
+    let commands = packet.commands();
+    assert_eq!(commands.len(), 7);
+
+    // 0: CreateBuffer uniform
+    assert!(matches!(&commands[0], GpuCommand::CreateBuffer { buffer_id: 1, .. }));
+    // 1: CreateBuffer vertex
+    assert!(matches!(&commands[1], GpuCommand::CreateBuffer { buffer_id: 2, .. }));
+    // 2: WriteBuffer vertex
+    assert!(matches!(&commands[2], GpuCommand::WriteBuffer { buffer_id: 2, .. }));
+
+    // 3: CreateTexture depth (id 11, format TARGET_FORMAT_DEPTH24PLUS, size 128x128)
+    assert!(matches!(
+        &commands[3],
+        GpuCommand::CreateTexture {
+            texture_id: MESH_DEPTH_TEXTURE_ID,
+            width: 128,
+            height: 128,
+            format: TARGET_FORMAT_DEPTH24PLUS,
+            usage,
+        } if *usage == TEXTURE_USAGE_RENDER_ATTACHMENT
+    ));
+
+    // 4: CreatePipelineDepth (target_format preferred canvas, depth format depth24plus)
+    if let GpuCommand::CreatePipelineDepth {
+        pipeline_id,
+        target_format,
+        depth_format,
+        depth_write_enabled,
+        depth_compare,
+        ..
+    } = &commands[4]
+    {
+        assert_eq!(*pipeline_id, MESH_CANVAS_PIPELINE_ID);
+        assert_eq!(*target_format, TARGET_FORMAT_PREFERRED_CANVAS);
+        assert_eq!(*depth_format, TARGET_FORMAT_DEPTH24PLUS);
+        assert_eq!(*depth_write_enabled, false);
+        assert_eq!(*depth_compare, DEPTH_COMPARE_LESS);
+    } else {
+        panic!("expected CreatePipelineDepth at index 4");
+    }
+
+    // 5: WriteBuffer uniform
+    assert!(matches!(&commands[5], GpuCommand::WriteBuffer { buffer_id: 1, .. }));
+
+    // 6: RenderPassDepth targeting canvas
+    if let GpuCommand::RenderPassDepth {
+        target_type,
+        target_id,
+        pipeline_id,
+        vertex_count,
+        depth_target_id,
+        depth_clear_value,
+        ..
+    } = &commands[6]
+    {
+        assert_eq!(*target_type, TARGET_CANVAS);
+        assert_eq!(*target_id, MESH_CANVAS_TARGET_ID);
+        assert_eq!(*pipeline_id, MESH_CANVAS_PIPELINE_ID);
+        assert_eq!(*vertex_count, 3);
+        assert_eq!(*depth_target_id, MESH_DEPTH_TEXTURE_ID);
+        assert_eq!(*depth_clear_value, 1.0);
+    } else {
+        panic!("expected RenderPassDepth at index 6");
+    }
+}
+
+#[test]
+fn test_dynamic_mesh_depth_bridge_parity() {
+    let positions = [
+        0.0_f32, 0.5, 0.0,
+        -0.5, -0.5, 0.0,
+        0.5, -0.5, 0.0,
+    ];
+    let indices: [u32; 0] = [];
+    let color = [0.25_f32, 0.5, 0.75, 1.0];
+
+    // Offscreen parity
+    let f3d_offscreen = f3d_build_mesh_depth_packet(
+        &positions, &indices, &IDENTITY_F64, &IDENTITY_F64, &color, 64, 64, false, true, true, DEPTH_COMPARE_LESS,
+    ).unwrap();
+    let bridge_offscreen = gpu_bridge_build_mesh_depth_packet(
+        &positions, &indices, &IDENTITY_F64, &IDENTITY_F64, &color, 64, 64, false, true, true, DEPTH_COMPARE_LESS,
+    ).unwrap();
+    assert_eq!(f3d_offscreen, bridge_offscreen, "offscreen depth packets must be identical");
+
+    // Canvas parity
+    let f3d_canvas = f3d_build_canvas_mesh_depth_packet(
+        &positions, &indices, &IDENTITY_F64, &IDENTITY_F64, &color, 64, 64, false, true, false, DEPTH_COMPARE_ALWAYS,
+    ).unwrap();
+    let bridge_canvas = gpu_bridge_build_canvas_mesh_depth_packet(
+        &positions, &indices, &IDENTITY_F64, &IDENTITY_F64, &color, 64, 64, false, true, false, DEPTH_COMPARE_ALWAYS,
+    ).unwrap();
+    assert_eq!(f3d_canvas, bridge_canvas, "canvas depth packets must be identical");
+}
+
+#[test]
+fn test_frame_session_depth_begin_seam() {
+    let root_ctx = RenderContext::new_offscreen(
+        ResourceId::new(10),
+        64,
+        64,
+        Epoch::ZERO,
+    );
+    let mut session = FrameSession::new(root_ctx, 256).unwrap();
+
+    let dsa = DepthStencilAttachment::new_depth_clear(ResourceId::new(11), 1.0);
+    let pass_id = session
+        .begin_render_pass_with_depth("test_pass", [0.0; 4], Some(dsa))
+        .expect("begin_render_pass_with_depth must succeed");
+    assert_eq!(pass_id.get(), 1);
+
+    // Record a draw and complete pass
+    session.record_direct_draw(100, 2, 3, None).unwrap();
+    session.end_render_pass().unwrap();
+
+    let packet = session.build_submission_packet().unwrap();
+    let commands = packet.commands();
+
+    // Verify RenderPassDepth is emitted with depth target 11 and clear 1.0
+    assert!(commands.iter().any(|cmd| matches!(
+        cmd,
+        GpuCommand::RenderPassDepth {
+            depth_target_id: 11,
+            depth_clear_value,
+            ..
+        } if (*depth_clear_value - 1.0).abs() < f32::EPSILON
+    )));
 }

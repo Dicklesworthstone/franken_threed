@@ -40,10 +40,14 @@ pub use gpu_host::{
 };
 
 pub use mesh::{
-    build_mesh_canvas_submission, build_mesh_submission, f3d_build_canvas_mesh_packet,
-    f3d_build_mesh_packet, generate_mesh_wgsl, gpu_bridge_build_canvas_mesh_packet,
-    gpu_bridge_build_mesh_packet, DynamicMeshInput, MeshPacketError,
+    build_mesh_canvas_depth_submission, build_mesh_canvas_submission,
+    build_mesh_depth_submission, build_mesh_submission,
+    f3d_build_canvas_mesh_depth_packet, f3d_build_canvas_mesh_packet,
+    f3d_build_mesh_depth_packet, f3d_build_mesh_packet, generate_mesh_wgsl,
+    gpu_bridge_build_canvas_mesh_depth_packet, gpu_bridge_build_canvas_mesh_packet,
+    gpu_bridge_build_mesh_depth_packet, gpu_bridge_build_mesh_packet,
+    DynamicMeshInput, MeshDepthOptions, MeshPacketError,
     MESH_CANVAS_PIPELINE_ID, MESH_CANVAS_TARGET_ID, MESH_CLEAR_COLOR,
-    MESH_PIPELINE_ID, MESH_READBACK_BUFFER_ID, MESH_TARGET_TEXTURE_ID,
-    MESH_UNIFORM_BUFFER_ID, MESH_VERTEX_BUFFER_ID,
+    MESH_DEPTH_TEXTURE_ID, MESH_PIPELINE_ID, MESH_READBACK_BUFFER_ID,
+    MESH_TARGET_TEXTURE_ID, MESH_UNIFORM_BUFFER_ID, MESH_VERTEX_BUFFER_ID,
 };
