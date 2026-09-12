@@ -6,8 +6,8 @@
 
 use f3d_core::layout::{LayoutError, ProjectiveMat4};
 use f3d_math::{
-    BatchComposeError, CoordinateSystem, Euler, EulerOrder, Matrix3, Matrix4, NarrowingError,
-    Quaternion, Vector3,
+    BatchComposeError, Color, CoordinateSystem, Euler, EulerOrder, Matrix3, Matrix4,
+    NarrowingError, Quaternion, Vector3,
 };
 
 const EPS: f64 = 1e-10;
@@ -2037,3 +2037,540 @@ fn test_matrix4_extract_rotation_cases() {
     assert_mat_close(&dirty_dst2, &rot.elements, 1e-15, "extract_rotation overwrites all 16 elements");
 }
 
+#[test]
+fn test_vector3_projection_and_reflection_cases() {
+    // No-claim: These tests prove scalar-formula parity only, not Object3D/camera integration or Wasm behavior.
+
+    // 1. project (1,2,3) onto (0,0,2) -> (0,0,3)
+    let mut v1 = Vector3::new(1.0, 2.0, 3.0);
+    v1.project_on_vector(&Vector3::new(0.0, 0.0, 2.0));
+    assert_vec_close(&v1, [0.0, 0.0, 3.0], 1e-15, "project (1,2,3) onto (0,0,2)");
+
+    // 2. project onto nonunit (1,1,0) -> dot/lengthSq scaling: dot=3, lengthSq=2 -> (1.5, 1.5, 0.0)
+    let mut v2 = Vector3::new(1.0, 2.0, 3.0);
+    v2.project_on_vector(&Vector3::new(1.0, 1.0, 0.0));
+    assert_vec_close(&v2, [1.5, 1.5, 0.0], 1e-15, "project onto nonunit (1,1,0)");
+
+    // 3. project_on_plane of (1,2,3) with unit normal (0,0,1) -> (1,2,0)
+    let mut v3a = Vector3::new(1.0, 2.0, 3.0);
+    v3a.project_on_plane(&Vector3::new(0.0, 0.0, 1.0));
+    assert_vec_close(&v3a, [1.0, 2.0, 0.0], 1e-15, "project_on_plane unit normal (0,0,1)");
+
+    // and nonunit normal (0,0,2) -> same (1,2,0)
+    let mut v3b = Vector3::new(1.0, 2.0, 3.0);
+    v3b.project_on_plane(&Vector3::new(0.0, 0.0, 2.0));
+    assert_vec_close(&v3b, [1.0, 2.0, 0.0], 1e-15, "project_on_plane nonunit normal (0,0,2)");
+
+    // 4. reflect (1,-1,0) about unit normal (0,1,0) -> (1,1,0)
+    let mut v4 = Vector3::new(1.0, -1.0, 0.0);
+    v4.reflect(&Vector3::new(0.0, 1.0, 0.0));
+    assert_vec_close(&v4, [1.0, 1.0, 0.0], 1e-15, "reflect about unit normal (0,1,0)");
+
+    // 5. reflect with nonunit normal (0,2,0) -> upstream's value (1,7,0)
+    let mut v5 = Vector3::new(1.0, -1.0, 0.0);
+    v5.reflect(&Vector3::new(0.0, 2.0, 0.0));
+    assert_vec_close(&v5, [1.0, 7.0, 0.0], 1e-15, "reflect with nonunit normal (0,2,0)");
+
+    // 6. zero vector v -> (0,0,0) for project_on_vector, identity for plane/reflect
+    let mut v6a = Vector3::new(1.0, 2.0, 3.0);
+    v6a.project_on_vector(&Vector3::zero());
+    assert_vec_close(&v6a, [0.0, 0.0, 0.0], 1e-15, "project_on_vector zero vector resets to zero");
+
+    let mut v6b = Vector3::new(1.0, 2.0, 3.0);
+    v6b.project_on_plane(&Vector3::zero());
+    assert_vec_close(&v6b, [1.0, 2.0, 3.0], 1e-15, "project_on_plane zero normal leaves vector unchanged");
+
+    let mut v6c = Vector3::new(1.0, 2.0, 3.0);
+    v6c.reflect(&Vector3::zero());
+    assert_vec_close(&v6c, [1.0, 2.0, 3.0], 1e-15, "reflect zero normal leaves vector unchanged");
+
+    // 7. Argument aliasing a clone of self
+    let s = Vector3::new(1.0, 2.0, 3.0);
+    let mut v7a = s;
+    v7a.project_on_vector(&s);
+    assert_vec_close(&v7a, [1.0, 2.0, 3.0], 1e-15, "project_on_vector self clone");
+
+    let mut v7b = s;
+    v7b.project_on_plane(&s);
+    assert_vec_close(&v7b, [0.0, 0.0, 0.0], 1e-15, "project_on_plane self clone");
+
+    let mut v7c = s;
+    v7c.reflect(&s);
+    assert_vec_close(&v7c, [-27.0, -54.0, -81.0], 1e-15, "reflect self clone");
+
+    // 8. NaN propagation
+    let v_nan = Vector3::new(f64::NAN, 0.0, 0.0);
+    let mut v8a = s;
+    v8a.project_on_vector(&v_nan);
+    assert!(v8a.x.is_nan() && v8a.y.is_nan() && v8a.z.is_nan(), "project_on_vector NaN");
+
+    let mut v8b = s;
+    v8b.project_on_plane(&v_nan);
+    assert!(v8b.x.is_nan() && v8b.y.is_nan() && v8b.z.is_nan(), "project_on_plane NaN");
+
+    let mut v8c = s;
+    v8c.reflect(&v_nan);
+    assert!(v8c.x.is_nan() && v8c.y.is_nan() && v8c.z.is_nan(), "reflect NaN");
+
+    // 9. Signed zero preservation
+    let mut v9 = Vector3::new(-0.0, 0.0, 0.0);
+    v9.project_on_plane(&Vector3::new(0.0, 1.0, 0.0));
+    assert_eq!(v9.x.to_bits(), (-0.0f64).to_bits(), "project_on_plane preserves -0.0 on x");
+}
+
+#[test]
+fn test_vector3_axis_angle_length_and_coords_cases() {
+    // No-claim: These tests prove scalar-formula parity only, not Object3D/camera integration or Wasm behavior.
+
+    // 1. apply_axis_angle of (1,0,0) about (0,0,1) by PI/2 -> [2.220446049250313e-16, 1.0, 0.0]
+    let mut v1 = Vector3::new(1.0, 0.0, 0.0);
+    v1.apply_axis_angle(&Vector3::new(0.0, 0.0, 1.0), core::f64::consts::FRAC_PI_2);
+    assert_close(v1.x, 2.220446049250313e-16, 1e-15, "apply_axis_angle unit axis (x)");
+    assert_close(v1.y, 1.0, 1e-15, "apply_axis_angle unit axis (y)");
+    assert_close(v1.z, 0.0, 1e-15, "apply_axis_angle unit axis (z)");
+
+    // 2. apply_axis_angle about nonunit axis (0,0,2) by PI/2 -> [-2.999999999999999, 2.0, 0.0]
+    // Upstream Three.js r186 does not normalize the axis, producing (-3.0, 2.0, 0.0).
+    let mut v2 = Vector3::new(1.0, 0.0, 0.0);
+    v2.apply_axis_angle(&Vector3::new(0.0, 0.0, 2.0), core::f64::consts::FRAC_PI_2);
+    assert_close(v2.x, -2.999999999999999, 1e-14, "apply_axis_angle nonunit axis (x)");
+    assert_close(v2.y, 2.0, 1e-15, "apply_axis_angle nonunit axis (y)");
+    assert_close(v2.z, 0.0, 1e-15, "apply_axis_angle nonunit axis (z)");
+
+    // 3. set_length of (3,4,0) to 10 -> (6.0, 8.0, 0.0)
+    let mut v3 = Vector3::new(3.0, 4.0, 0.0);
+    v3.set_length(10.0);
+    assert_vec_close(&v3, [6.000000000000001, 8.0, 0.0], 1e-15, "set_length (3,4,0) to 10");
+
+    // 4. set_length of zero vector -> remains (0.0, 0.0, 0.0)
+    let mut v4 = Vector3::zero();
+    v4.set_length(10.0);
+    assert_vec_close(&v4, [0.0, 0.0, 0.0], 1e-15, "set_length zero vector");
+
+    // 5. clamp_length (3,4,0) [length=5]
+    // with [1,2] -> clamped to 2 -> (1.2, 1.6, 0.0)
+    let mut v5a = Vector3::new(3.0, 4.0, 0.0);
+    v5a.clamp_length(1.0, 2.0);
+    assert_vec_close(&v5a, [1.2000000000000002, 1.6, 0.0], 1e-15, "clamp_length [1,2]");
+
+    // with [10,20] -> clamped to 10 -> (6.0, 8.0, 0.0)
+    let mut v5b = Vector3::new(3.0, 4.0, 0.0);
+    v5b.clamp_length(10.0, 20.0);
+    assert_vec_close(&v5b, [6.000000000000001, 8.0, 0.0], 1e-15, "clamp_length [10,20]");
+
+    // on zero vector with [1,2] -> remains (0.0, 0.0, 0.0)
+    let mut v5c = Vector3::zero();
+    v5c.clamp_length(1.0, 2.0);
+    assert_vec_close(&v5c, [0.0, 0.0, 0.0], 1e-15, "clamp_length zero vector");
+
+    // 6. set_from_spherical_coords(2, PI/3, PI/4) -> [1.224744871391589, 1.0000000000000002, 1.2247448713915892]
+    let mut v6 = Vector3::zero();
+    v6.set_from_spherical_coords(2.0, core::f64::consts::PI / 3.0, core::f64::consts::FRAC_PI_4);
+    assert_close(v6.x, 1.224744871391589, 1e-15, "set_from_spherical_coords (x)");
+    assert_close(v6.y, 1.0000000000000002, 1e-15, "set_from_spherical_coords (y)");
+    assert_close(v6.z, 1.2247448713915892, 1e-15, "set_from_spherical_coords (z)");
+
+    // 7. set_from_cylindrical_coords(2, PI/6, 5) -> [0.9999999999999999, 5.0, 1.7320508075688774]
+    let mut v7 = Vector3::zero();
+    v7.set_from_cylindrical_coords(2.0, core::f64::consts::PI / 6.0, 5.0);
+    assert_close(v7.x, 0.9999999999999999, 1e-15, "set_from_cylindrical_coords (x)");
+    assert_close(v7.y, 5.0, 1e-15, "set_from_cylindrical_coords (y)");
+    assert_close(v7.z, 1.7320508075688774, 1e-15, "set_from_cylindrical_coords (z)");
+}
+
+#[test]
+fn test_matrix4_transform_generators_parity() {
+    let eps = 1e-14;
+
+    // 1. make_rotation_x(PI / 3)
+    let mut m = Matrix4::identity();
+    m.make_rotation_x(core::f64::consts::PI / 3.0);
+    let expected_rot_x = [
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 0.5000000000000001, 0.8660254037844386, 0.0,
+        0.0, -0.8660254037844386, 0.5000000000000001, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    ];
+    for (i, (&actual, &expected)) in m.elements.iter().zip(expected_rot_x.iter()).enumerate() {
+        assert!(
+            (actual - expected).abs() <= eps,
+            "rot_x element {i} mismatch: {actual} vs {expected}"
+        );
+    }
+
+    // 2. make_rotation_y(PI / 3)
+    m.make_rotation_y(core::f64::consts::PI / 3.0);
+    let expected_rot_y = [
+        0.5000000000000001, 0.0, -0.8660254037844386, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.8660254037844386, 0.0, 0.5000000000000001, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    ];
+    for (i, (&actual, &expected)) in m.elements.iter().zip(expected_rot_y.iter()).enumerate() {
+        assert!(
+            (actual - expected).abs() <= eps,
+            "rot_y element {i} mismatch: {actual} vs {expected}"
+        );
+    }
+
+    // 3. make_rotation_z(PI / 3)
+    m.make_rotation_z(core::f64::consts::PI / 3.0);
+    let expected_rot_z = [
+        0.5000000000000001, 0.8660254037844386, 0.0, 0.0,
+        -0.8660254037844386, 0.5000000000000001, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    ];
+    for (i, (&actual, &expected)) in m.elements.iter().zip(expected_rot_z.iter()).enumerate() {
+        assert!(
+            (actual - expected).abs() <= eps,
+            "rot_z element {i} mismatch: {actual} vs {expected}"
+        );
+    }
+
+    // 4. make_rotation_axis
+    let axis = Vector3::new(1.0 / 3.0, 2.0 / 3.0, 2.0 / 3.0);
+    m.make_rotation_axis(&axis, core::f64::consts::PI / 4.0);
+    let expected_rot_axis = [
+        0.73965047216582, 0.5364919027495766, -0.40631713883248666, 0.0,
+        -0.40631713883248666, 0.8372815451036375, 0.36587702431260577, 0.0,
+        0.5364919027495766, -0.10552749647842585, 0.8372815451036375, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    ];
+    for (i, (&actual, &expected)) in m.elements.iter().zip(expected_rot_axis.iter()).enumerate() {
+        assert!(
+            (actual - expected).abs() <= eps,
+            "rot_axis element {i} mismatch: {actual} vs {expected}"
+        );
+    }
+
+    // 5. make_scale
+    m.make_scale(2.0, 3.0, 4.0);
+    let expected_scale = [
+        2.0, 0.0, 0.0, 0.0,
+        0.0, 3.0, 0.0, 0.0,
+        0.0, 0.0, 4.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    ];
+    assert_eq!(m.elements, expected_scale);
+
+    // 5b. make_scale_vec
+    let scale_v = Vector3::new(5.0, 6.0, 7.0);
+    m.make_scale_vec(&scale_v);
+    assert_eq!(
+        m.elements,
+        [
+            5.0, 0.0, 0.0, 0.0,
+            0.0, 6.0, 0.0, 0.0,
+            0.0, 0.0, 7.0, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        ]
+    );
+
+    // 6. make_translation
+    m.make_translation(1.0, 2.0, 3.0);
+    let expected_trans = [
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        1.0, 2.0, 3.0, 1.0,
+    ];
+    assert_eq!(m.elements, expected_trans);
+
+    // 6b. make_translation_vec / make_translation_v
+    let trans_v = Vector3::new(4.0, 5.0, 6.0);
+    m.make_translation_vec(&trans_v);
+    assert_eq!(
+        m.elements,
+        [
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            4.0, 5.0, 6.0, 1.0,
+        ]
+    );
+    m.make_translation_v(&trans_v);
+    assert_eq!(
+        m.elements,
+        [
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            4.0, 5.0, 6.0, 1.0,
+        ]
+    );
+
+    // 7. make_shear
+    m.make_shear(1.0, 2.0, 3.0, 4.0, 5.0, 6.0);
+    let expected_shear = [
+        1.0, 1.0, 2.0, 0.0,
+        3.0, 1.0, 4.0, 0.0,
+        5.0, 6.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    ];
+    assert_eq!(m.elements, expected_shear);
+
+    // 8. make_basis & extract_basis round-trip
+    let bx = Vector3::new(1.0, 2.0, 3.0);
+    let by = Vector3::new(4.0, 5.0, 6.0);
+    let bz = Vector3::new(7.0, 8.0, 10.0);
+    m.make_basis(&bx, &by, &bz);
+    let expected_basis = [
+        1.0, 2.0, 3.0, 0.0,
+        4.0, 5.0, 6.0, 0.0,
+        7.0, 8.0, 10.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    ];
+    assert_eq!(m.elements, expected_basis);
+    let mut ex = Vector3::zero();
+    let mut ey = Vector3::zero();
+    let mut ez = Vector3::zero();
+    m.extract_basis(&mut ex, &mut ey, &mut ez);
+    assert_eq!(ex, bx);
+    assert_eq!(ey, by);
+    assert_eq!(ez, bz);
+
+    // extract_basis with zero affine determinant resets to canonical unit axes
+    let mut m_deg = Matrix4::zero();
+    m_deg.extract_basis(&mut ex, &mut ey, &mut ez);
+    assert_eq!(ex, Vector3::new(1.0, 0.0, 0.0));
+    assert_eq!(ey, Vector3::new(0.0, 1.0, 0.0));
+    assert_eq!(ez, Vector3::new(0.0, 0.0, 1.0));
+
+    // 9. copy_position
+    let mut m_pos = Matrix4::identity();
+    m_pos.set_position(10.0, 20.0, 30.0);
+    let mut m_dst = Matrix4::identity();
+    m_dst.copy_position(&m_pos);
+    assert_eq!(
+        m_dst.elements,
+        [
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            10.0, 20.0, 30.0, 1.0,
+        ]
+    );
+
+    // 10. set_from_matrix3
+    let mut m3 = Matrix3::identity();
+    m3.set(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0);
+    m.set_from_matrix3(&m3);
+    let expected_from_m3 = [
+        1.0, 4.0, 7.0, 0.0,
+        2.0, 5.0, 8.0, 0.0,
+        3.0, 6.0, 9.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    ];
+    assert_eq!(m.elements, expected_from_m3);
+}
+
+#[test]
+fn test_vector3_componentwise_family_cases() {
+    // No-claim: These tests prove scalar-formula parity only, not Object3D/camera integration or Wasm behavior.
+
+    // 1. min / max / clamp with mixed components incl. NaN in one component
+    let v_base = Vector3::new(1.0, -2.0, f64::NAN);
+    let v_other = Vector3::new(-3.0, 4.0, 5.0);
+
+    let mut v_min = v_base;
+    v_min.min(&v_other);
+    assert_close(v_min.x, -3.0, 1e-15, "min x");
+    assert_close(v_min.y, -2.0, 1e-15, "min y");
+    assert!(v_min.z.is_nan(), "min z propagates NaN per ECMAScript Math.min");
+
+    let mut v_max = v_base;
+    v_max.max(&v_other);
+    assert_close(v_max.x, 1.0, 1e-15, "max x");
+    assert_close(v_max.y, 4.0, 1e-15, "max y");
+    assert!(v_max.z.is_nan(), "max z propagates NaN per ECMAScript Math.max");
+
+    let c_min = Vector3::new(-1.0, -1.0, -1.0);
+    let c_max = Vector3::new(2.0, 2.0, 2.0);
+    let mut v_clamp = Vector3::new(0.5, -3.0, f64::NAN);
+    v_clamp.clamp(&c_min, &c_max);
+    assert_close(v_clamp.x, 0.5, 1e-15, "clamp x");
+    assert_close(v_clamp.y, -1.0, 1e-15, "clamp y");
+    assert!(v_clamp.z.is_nan(), "clamp z propagates NaN per ECMAScript clamp");
+
+    // 2. clamp_scalar
+    let mut v_cs = Vector3::new(-5.0, 1.5, 10.0);
+    v_cs.clamp_scalar(0.0, 5.0);
+    assert_vec_close(&v_cs, [0.0, 1.5, 5.0], 1e-15, "clamp_scalar");
+
+    // 3a. floor / ceil / round / round_to_zero on (-1.5, 2.5, -0.5)
+    let v3a = Vector3::new(-1.5, 2.5, -0.5);
+
+    let mut fl3a = v3a;
+    fl3a.floor();
+    assert_vec_close(&fl3a, [-2.0, 2.0, -1.0], 1e-15, "floor (-1.5, 2.5, -0.5)");
+
+    let mut ce3a = v3a;
+    ce3a.ceil();
+    assert_close(ce3a.x, -1.0, 1e-15, "ceil x");
+    assert_close(ce3a.y, 3.0, 1e-15, "ceil y");
+    assert_eq!(ce3a.z.to_bits(), (-0.0f64).to_bits(), "ceil of -0.5 yields -0.0");
+
+    let mut ro3a = v3a;
+    ro3a.round();
+    assert_close(ro3a.x, -1.0, 1e-15, "round x");
+    assert_close(ro3a.y, 3.0, 1e-15, "round y");
+    assert_eq!(ro3a.z.to_bits(), (-0.0f64).to_bits(), "round of -0.5 yields -0.0 per JS Math.round");
+
+    let mut rz3a = v3a;
+    rz3a.round_to_zero();
+    assert_close(rz3a.x, -1.0, 1e-15, "round_to_zero x");
+    assert_close(rz3a.y, 2.0, 1e-15, "round_to_zero y");
+    assert_eq!(rz3a.z.to_bits(), (-0.0f64).to_bits(), "round_to_zero of -0.5 yields -0.0 per JS Math.trunc");
+
+    // 3b. on (0.49999999999999994, -2.5, 1e16+1 as f64)
+    let v3b = Vector3::new(0.49999999999999994, -2.5, 1e16 + 1.0);
+
+    let mut fl3b = v3b;
+    fl3b.floor();
+    assert_vec_close(&fl3b, [0.0, -3.0, 10000000000000000.0], 1e-15, "floor (0.499..., -2.5, 1e16+1)");
+
+    let mut ce3b = v3b;
+    ce3b.ceil();
+    assert_vec_close(&ce3b, [1.0, -2.0, 10000000000000000.0], 1e-15, "ceil (0.499..., -2.5, 1e16+1)");
+
+    let mut ro3b = v3b;
+    ro3b.round();
+    assert_close(ro3b.x, 0.0, 1e-15, "round 0.499... -> 0.0");
+    assert_close(ro3b.y, -2.0, 1e-15, "round -2.5 -> -2.0 per JS Math.round");
+    assert_close(ro3b.z, 10000000000000000.0, 1e-15, "round 1e16+1 preserves integer precision");
+
+    let mut rz3b = v3b;
+    rz3b.round_to_zero();
+    assert_vec_close(&rz3b, [0.0, -2.0, 10000000000000000.0], 1e-15, "round_to_zero (0.499..., -2.5, 1e16+1)");
+
+    // 4. divide by a zero component (Infinity / -Infinity / NaN)
+    let mut v_div = Vector3::new(1.0, -2.0, 0.0);
+    v_div.divide(&Vector3::new(0.0, 0.0, 0.0));
+    assert!(v_div.x.is_infinite() && v_div.x > 0.0, "divide by 0.0 produces +Infinity");
+    assert!(v_div.y.is_infinite() && v_div.y < 0.0, "divide by 0.0 produces -Infinity");
+    assert!(v_div.z.is_nan(), "0.0 / 0.0 produces NaN");
+
+    // 5. multiply_vectors aliasing a = self
+    let mut v_alias = Vector3::new(2.0, 3.0, 4.0);
+    let v_mult = Vector3::new(5.0, 6.0, 7.0);
+    let a_clone = v_alias;
+    v_alias.multiply_vectors(&a_clone, &v_mult);
+    assert_vec_close(&v_alias, [10.0, 18.0, 28.0], 1e-15, "multiply_vectors aliasing a = self");
+
+    // 6. set_scalar / add_scalar / sub_scalar / multiply
+    let mut v_ss = Vector3::zero();
+    v_ss.set_scalar(4.0);
+    assert_vec_close(&v_ss, [4.0, 4.0, 4.0], 1e-15, "set_scalar");
+
+    let mut v_as = Vector3::new(1.0, 2.0, 3.0);
+    v_as.add_scalar(5.0);
+    assert_vec_close(&v_as, [6.0, 7.0, 8.0], 1e-15, "add_scalar");
+
+    let mut v_sub = Vector3::new(10.0, 20.0, 30.0);
+    v_sub.sub_scalar(3.0);
+    assert_vec_close(&v_sub, [7.0, 17.0, 27.0], 1e-15, "sub_scalar");
+
+    let mut v_mul = Vector3::new(2.0, 3.0, 4.0);
+    v_mul.multiply(&Vector3::new(5.0, 6.0, 7.0));
+    assert_vec_close(&v_mul, [10.0, 18.0, 28.0], 1e-15, "multiply");
+
+    // 7. set_component / get_component for indices 0..2 and out-of-range behavior
+    let mut v_comp = Vector3::zero();
+    v_comp.set_component(0, 11.0);
+    v_comp.set_component(1, 22.0);
+    v_comp.set_component(2, 33.0);
+    assert_eq!(v_comp.get_component(0), 11.0, "get_component(0)");
+    assert_eq!(v_comp.get_component(1), 22.0, "get_component(1)");
+    assert_eq!(v_comp.get_component(2), 33.0, "get_component(2)");
+
+    let panic_get = std::panic::catch_unwind(|| {
+        let v = Vector3::new(1.0, 2.0, 3.0);
+        let _ = v.get_component(3);
+    });
+    assert!(panic_get.is_err(), "get_component(3) must panic out of range");
+
+    let panic_set = std::panic::catch_unwind(|| {
+        let mut v = Vector3::new(1.0, 2.0, 3.0);
+        v.set_component(3, 44.0);
+    });
+    assert!(panic_set.is_err(), "set_component(3) must panic out of range");
+}
+
+#[test]
+fn test_vector3_euler_color_manhattan_equals_and_array_slice() {
+    // 1. apply_euler with Euler(0.1, 0.2, 0.3, "XYZ") and "ZYX"
+    // Pinned Node oracle:
+    // v1: [0.9530424007183519, 1.9088666127534895, 3.073749898275398]
+    // v2: [1.041153658386715, 2.091608608750106, 2.9225284408248977]
+    let mut v1 = Vector3::new(1.0, 2.0, 3.0);
+    let e_xyz = Euler::new(0.1, 0.2, 0.3, EulerOrder::XYZ);
+    v1.apply_euler(&e_xyz);
+    assert_vec_close(
+        &v1,
+        [0.9530424007183519, 1.9088666127534895, 3.073749898275398],
+        1e-14,
+        "apply_euler XYZ",
+    );
+
+    let mut v2 = Vector3::new(1.0, 2.0, 3.0);
+    let e_zyx = Euler::new(0.1, 0.2, 0.3, EulerOrder::ZYX);
+    v2.apply_euler(&e_zyx);
+    assert_vec_close(
+        &v2,
+        [1.041153658386715, 2.091608608750106, 2.9225284408248977],
+        1e-14,
+        "apply_euler ZYX",
+    );
+
+    // 2. set_from_euler
+    let mut v3 = Vector3::zero();
+    let e_set = Euler::new(0.5, -0.2, 1.4, EulerOrder::YZX);
+    v3.set_from_euler(&e_set);
+    assert_eq!(v3.x, 0.5, "set_from_euler x");
+    assert_eq!(v3.y, -0.2, "set_from_euler y");
+    assert_eq!(v3.z, 1.4, "set_from_euler z");
+
+    // 3. set_from_color
+    let mut v4 = Vector3::zero();
+    let c = Color::new(0.25, 0.5, 0.75);
+    v4.set_from_color(&c);
+    assert_eq!(v4.x, 0.25, "set_from_color x");
+    assert_eq!(v4.y, 0.5, "set_from_color y");
+    assert_eq!(v4.z, 0.75, "set_from_color z");
+
+    // 4. manhattan_length of (-1, 2, -3) -> 6.0
+    let v5 = Vector3::new(-1.0, 2.0, -3.0);
+    assert_eq!(v5.manhattan_length(), 6.0, "manhattan_length of (-1, 2, -3)");
+
+    // 5. equals cases: identical, different, NaN != NaN, -0.0 == +0.0
+    let a = Vector3::new(1.0, 2.0, 3.0);
+    let b = Vector3::new(1.0, 2.0, 3.0);
+    let diff = Vector3::new(1.0, 2.0, 4.0);
+    let nan_v1 = Vector3::new(f64::NAN, 2.0, 3.0);
+    let nan_v2 = Vector3::new(f64::NAN, 2.0, 3.0);
+    let neg_zero = Vector3::new(-0.0, 0.0, -0.0);
+    let pos_zero = Vector3::new(0.0, -0.0, 0.0);
+
+    assert!(a.equals(&b), "equals identical vectors");
+    assert!(!a.equals(&diff), "equals differing vectors");
+    assert!(!nan_v1.equals(&nan_v2), "equals with NaN components must yield false");
+    assert!(neg_zero.equals(&pos_zero), "equals -0.0 vs +0.0 must yield true");
+
+    // 6. from_slice_offset with offset 2 from 6-element array
+    let arr = [99.0, 88.0, 1.5, 2.5, 3.5, 77.0];
+    let mut v6 = Vector3::zero();
+    v6.from_slice_offset(&arr, 2);
+    assert_eq!(v6, Vector3::new(1.5, 2.5, 3.5), "from_slice_offset at offset 2");
+
+    // 7. to_slice_offset into 6-element sentinel array at offset 1
+    let mut out = [-1.0; 6];
+    let v7 = Vector3::new(4.5, 5.5, 6.5);
+    v7.to_slice_offset(&mut out, 1);
+    assert_eq!(out, [-1.0, 4.5, 5.5, 6.5, -1.0, -1.0], "to_slice_offset at offset 1");
+
+    // 8. set_x / set_y / set_z chaining
+    let mut v8 = Vector3::zero();
+    v8.set_x(10.0).set_y(20.0).set_z(30.0);
+    assert_eq!(v8, Vector3::new(10.0, 20.0, 30.0), "set_x/set_y/set_z chaining");
+}

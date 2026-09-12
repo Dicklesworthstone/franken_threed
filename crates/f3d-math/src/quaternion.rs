@@ -466,6 +466,71 @@ impl Quaternion {
         dst[dst_offset + 3] = w0;
     }
 
+    /// Flat buffer quaternion multiplication following Three.js r186 `Quaternion.multiplyQuaternionsFlat`.
+    ///
+    /// Multiplies the quaternion at `src0[src_offset0..src_offset0 + 4]` by the quaternion
+    /// at `src1[src_offset1..src_offset1 + 4]` and writes the resulting 4-component quaternion
+    /// into `dst[dst_offset..dst_offset + 4]`.
+    ///
+    /// Returns the destination slice `dst` for chaining, matching Three.js r186 `return dst;`.
+    ///
+    /// # Safety and Invariants
+    /// - Follows Three.js r186 scalar operation order exactly:
+    ///   `dst[0] = x0 * w1 + w0 * x1 + y0 * z1 - z0 * y1`
+    ///   `dst[1] = y0 * w1 + w0 * y1 + z0 * x1 - x0 * z1`
+    ///   `dst[2] = z0 * w1 + w0 * z1 + x0 * y1 - y0 * x1`
+    ///   `dst[3] = w0 * w1 - x0 * x1 - y0 * y1 - z0 * z1`
+    /// - Validates bounds of `dst`, `src0`, and `src1` before mutating `dst`. If any slice is too short,
+    ///   the function panics before any write, preventing partial destination corruption.
+    /// - Reads all 8 input components before writing any destination component.
+    ///
+    /// # Panics
+    /// Panics if `dst.len() < dst_offset + 4`, `src0.len() < src_offset0 + 4`, or `src1.len() < src_offset1 + 4`.
+    pub fn multiply_quaternions_flat<'a>(
+        dst: &'a mut [f64],
+        dst_offset: usize,
+        src0: &[f64],
+        src_offset0: usize,
+        src1: &[f64],
+        src_offset1: usize,
+    ) -> &'a mut [f64] {
+        assert!(
+            dst.len() >= dst_offset + 4,
+            "dst slice too short for multiply_quaternions_flat (len: {}, required: {})",
+            dst.len(),
+            dst_offset + 4
+        );
+        assert!(
+            src0.len() >= src_offset0 + 4,
+            "src0 slice too short for multiply_quaternions_flat (len: {}, required: {})",
+            src0.len(),
+            src_offset0 + 4
+        );
+        assert!(
+            src1.len() >= src_offset1 + 4,
+            "src1 slice too short for multiply_quaternions_flat (len: {}, required: {})",
+            src1.len(),
+            src_offset1 + 4
+        );
+
+        let x0 = src0[src_offset0];
+        let y0 = src0[src_offset0 + 1];
+        let z0 = src0[src_offset0 + 2];
+        let w0 = src0[src_offset0 + 3];
+
+        let x1 = src1[src_offset1];
+        let y1 = src1[src_offset1 + 1];
+        let z1 = src1[src_offset1 + 2];
+        let w1 = src1[src_offset1 + 3];
+
+        dst[dst_offset] = x0 * w1 + w0 * x1 + y0 * z1 - z0 * y1;
+        dst[dst_offset + 1] = y0 * w1 + w0 * y1 + z0 * x1 - x0 * z1;
+        dst[dst_offset + 2] = z0 * w1 + w0 * z1 + x0 * y1 - y0 * x1;
+        dst[dst_offset + 3] = w0 * w1 - x0 * x1 - y0 * y1 - z0 * z1;
+
+        dst
+    }
+
     /// Returns true if all components equal `q`.
     #[inline]
     #[must_use]
@@ -483,6 +548,43 @@ impl Quaternion {
     #[inline]
     pub const fn from_array(a: [f64; 4]) -> Self {
         Self { x: a[0], y: a[1], z: a[2], w: a[3] }
+    }
+
+    /// Resets this quaternion to identity `(0, 0, 0, 1)`.
+    ///
+    /// Matches Three.js r186 `Quaternion.identity()`.
+    #[inline]
+    pub fn set_identity(&mut self) -> &mut Self {
+        *self = Self::identity();
+        self
+    }
+
+    /// Sets the components of this quaternion from slice `array` starting at `offset`.
+    ///
+    /// Validates bounds upfront to guarantee no partial mutation on out-of-range input.
+    /// Matches Three.js r186 `Quaternion.fromArray(array, offset)` in the valid native slice domain.
+    #[inline]
+    pub fn from_slice_offset(&mut self, array: &[f64], offset: usize) -> &mut Self {
+        assert!(offset + 4 <= array.len(), "slice too short for quaternion read");
+        self.x = array[offset];
+        self.y = array[offset + 1];
+        self.z = array[offset + 2];
+        self.w = array[offset + 3];
+        self
+    }
+
+    /// Writes the components of this quaternion into `array` starting at `offset`.
+    ///
+    /// Validates bounds upfront to guarantee no partial mutation on out-of-range destination.
+    /// Matches Three.js r186 `Quaternion.toArray(array, offset)` in the valid native slice domain.
+    #[inline]
+    pub fn to_slice_offset<'a>(&self, array: &'a mut [f64], offset: usize) -> &'a mut [f64] {
+        assert!(offset + 4 <= array.len(), "destination slice too short for quaternion write");
+        array[offset] = self.x;
+        array[offset + 1] = self.y;
+        array[offset + 2] = self.z;
+        array[offset + 3] = self.w;
+        array
     }
 
     /// Narrows this `f64` quaternion into `[f32; 4]`, verifying that precision loss does not
@@ -539,5 +641,172 @@ impl Default for Quaternion {
     #[inline]
     fn default() -> Self {
         Self::identity()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_multiply_quaternions_flat_basic_identity() {
+        let src_ident = [0.0, 0.0, 0.0, 1.0];
+        let src_q = [1.5, -2.5, 3.0, 0.5];
+        let mut dst = [0.0; 4];
+
+        Quaternion::multiply_quaternions_flat(&mut dst, 0, &src_q, 0, &src_ident, 0);
+        assert_eq!(dst, [1.5, -2.5, 3.0, 0.5]);
+
+        let mut dst2 = [0.0; 4];
+        Quaternion::multiply_quaternions_flat(&mut dst2, 0, &src_ident, 0, &src_q, 0);
+        assert_eq!(dst2, [1.5, -2.5, 3.0, 0.5]);
+    }
+
+    #[test]
+    fn test_multiply_quaternions_flat_nonzero_offsets_sentinels_nonunit() {
+        let src0 = [100.0, 200.0, 1.5, -2.5, 3.0, 0.5, 300.0];
+        let src_offset0 = 2;
+
+        let src1 = [-10.0, -20.0, -30.0, 2.0, 1.0, -1.5, 4.0, -40.0];
+        let src_offset1 = 3;
+
+        let mut dst = [999.0, 888.0, 0.0, 0.0, 0.0, 0.0, 777.0, 666.0];
+        let dst_offset = 2;
+
+        let ret = Quaternion::multiply_quaternions_flat(
+            &mut dst,
+            dst_offset,
+            &src0,
+            src_offset0,
+            &src1,
+            src_offset1,
+        );
+
+        assert_eq!(ret.len(), 8);
+
+        // Sentinels untouched
+        assert_eq!(dst[0], 999.0);
+        assert_eq!(dst[1], 888.0);
+        assert_eq!(dst[6], 777.0);
+        assert_eq!(dst[7], 666.0);
+
+        // Literal expected values derived from Three.js r186 pinned node oracle
+        assert_eq!(dst[2], 7.75);
+        assert_eq!(dst[3], -1.25);
+        assert_eq!(dst[4], 17.75);
+        assert_eq!(dst[5], 6.0);
+
+        // Consistency with Quaternion::multiply_quaternions
+        let q0 = Quaternion::new(1.5, -2.5, 3.0, 0.5);
+        let q1 = Quaternion::new(2.0, 1.0, -1.5, 4.0);
+        let mut q_check = Quaternion::default();
+        q_check.multiply_quaternions(&q0, &q1);
+        assert_eq!(q_check.x, 7.75);
+        assert_eq!(q_check.y, -1.25);
+        assert_eq!(q_check.z, 17.75);
+        assert_eq!(q_check.w, 6.0);
+    }
+
+    #[test]
+    fn test_multiply_quaternions_flat_second_oracle_case() {
+        let src0 = [0.0, 0.25, -0.75, 1.25, -2.0, 0.0];
+        let src1 = [0.0, 0.0, 3.5, 0.5, -1.0, 2.5, 0.0];
+        let mut dst = [-1.0, -2.0, -3.0, 0.0, 0.0, 0.0, 0.0, -4.0, -5.0];
+
+        Quaternion::multiply_quaternions_flat(&mut dst, 3, &src0, 1, &src1, 2);
+
+        // Sentinels preserved
+        assert_eq!(dst[0], -1.0);
+        assert_eq!(dst[1], -2.0);
+        assert_eq!(dst[2], -3.0);
+        assert_eq!(dst[7], -4.0);
+        assert_eq!(dst[8], -5.0);
+
+        // Expected literal components from pinned Three.js
+        assert_eq!(dst[3], -6.25);
+        assert_eq!(dst[4], 1.75);
+        assert_eq!(dst[5], 7.875);
+        assert_eq!(dst[6], -4.25);
+    }
+
+    #[test]
+    fn test_multiply_quaternions_flat_invalid_dst_no_partial_mutation() {
+        let mut dst = [11.0, 22.0, 33.0, 44.0, 55.0];
+        let src0 = [1.0, 2.0, 3.0, 4.0];
+        let src1 = [5.0, 6.0, 7.0, 8.0];
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Quaternion::multiply_quaternions_flat(&mut dst, 2, &src0, 0, &src1, 0);
+        }));
+        assert!(result.is_err(), "must panic when dst slice is too short");
+        assert_eq!(dst, [11.0, 22.0, 33.0, 44.0, 55.0], "dst must have zero partial mutation");
+
+        let mut dst2 = [11.0, 22.0, 33.0, 44.0, 55.0, 66.0];
+        let src0_short = [1.0, 2.0];
+        let result2 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Quaternion::multiply_quaternions_flat(&mut dst2, 1, &src0_short, 0, &src1, 0);
+        }));
+        assert!(result2.is_err(), "must panic when src0 slice is too short");
+        assert_eq!(dst2, [11.0, 22.0, 33.0, 44.0, 55.0, 66.0], "dst must have zero partial mutation on invalid src0");
+
+        let mut dst3 = [11.0, 22.0, 33.0, 44.0, 55.0, 66.0];
+        let src1_short = [5.0, 6.0, 7.0];
+        let result3 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Quaternion::multiply_quaternions_flat(&mut dst3, 1, &src0, 0, &src1_short, 0);
+        }));
+        assert!(result3.is_err(), "must panic when src1 slice is too short");
+        assert_eq!(dst3, [11.0, 22.0, 33.0, 44.0, 55.0, 66.0], "dst must have zero partial mutation on invalid src1");
+    }
+
+    #[test]
+    fn test_quaternion_identity_and_array_slice_io_with_oracles() {
+        // Node oracle 1: identity on nonunit quaternion resets to (0, 0, 0, 1)
+        let mut q = Quaternion::new(1.5, -2.5, 3.0, 0.5);
+        q.set_identity();
+        assert_eq!(q.x, 0.0);
+        assert_eq!(q.y, 0.0);
+        assert_eq!(q.z, 0.0);
+        assert_eq!(q.w, 1.0);
+        assert_eq!(q, Quaternion::identity());
+
+        // Node oracle 2: fromArray with offset 3 from sentinel buffer
+        // Input: [99.0, 88.0, 77.0, 0.1, 0.2, 0.3, 0.4, 66.0]
+        let buf = [99.0, 88.0, 77.0, 0.1, 0.2, 0.3, 0.4, 66.0];
+        let mut q_from = Quaternion::default();
+        q_from.from_slice_offset(&buf, 3);
+        assert_eq!(q_from.x, 0.1);
+        assert_eq!(q_from.y, 0.2);
+        assert_eq!(q_from.z, 0.3);
+        assert_eq!(q_from.w, 0.4);
+
+        // Node oracle 3: toArray into sentinel buffer at offset 2 preserving sentinels
+        // Input q = (0.5, -0.5, 0.7071, 0.25)
+        let q_to = Quaternion::new(0.5, -0.5, 0.7071, 0.25);
+        let mut dst = [100.0, 200.0, 0.0, 0.0, 0.0, 0.0, 300.0, 400.0];
+        q_to.to_slice_offset(&mut dst, 2);
+        assert_eq!(dst[0], 100.0);
+        assert_eq!(dst[1], 200.0);
+        assert_eq!(dst[2], 0.5);
+        assert_eq!(dst[3], -0.5);
+        assert_eq!(dst[4], 0.7071);
+        assert_eq!(dst[5], 0.25);
+        assert_eq!(dst[6], 300.0);
+        assert_eq!(dst[7], 400.0);
+
+        // Out-of-range bounds checks guarantee zero partial mutation in native slice domain
+        let mut q_err = Quaternion::new(1.0, 2.0, 3.0, 4.0);
+        let short_src = [99.0, 88.0, 77.0, 0.1, 0.2];
+        let res_read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            q_err.from_slice_offset(&short_src, 2);
+        }));
+        assert!(res_read.is_err(), "from_slice_offset must panic on out-of-range read");
+        assert_eq!(q_err, Quaternion::new(1.0, 2.0, 3.0, 4.0), "quaternion must have zero partial mutation on read failure");
+
+        let mut short_dst = [10.0, 20.0, 30.0, 40.0, 50.0];
+        let res_write = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            q_to.to_slice_offset(&mut short_dst, 2);
+        }));
+        assert!(res_write.is_err(), "to_slice_offset must panic on out-of-range write");
+        assert_eq!(short_dst, [10.0, 20.0, 30.0, 40.0, 50.0], "dst buffer must have zero partial mutation on write failure");
     }
 }

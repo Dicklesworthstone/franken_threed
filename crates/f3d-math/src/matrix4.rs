@@ -3,6 +3,7 @@
 use core::fmt;
 use crate::euler::{Euler, EulerOrder};
 use crate::jsnum::js_max;
+use crate::matrix3::Matrix3;
 use crate::narrowing::{check_narrow_f64, NarrowingError, NarrowingTolerance};
 use crate::quaternion::Quaternion;
 use crate::vector3::Vector3;
@@ -827,6 +828,191 @@ impl Matrix4 {
         self
     }
 
+    /// Copies the translation component from matrix `m` into this matrix
+    /// matching Three.js r186 `Matrix4.copyPosition()`.
+    #[inline]
+    pub fn copy_position(&mut self, m: &Self) -> &mut Self {
+        self.elements[12] = m.elements[12];
+        self.elements[13] = m.elements[13];
+        self.elements[14] = m.elements[14];
+        self
+    }
+
+    /// Sets the upper 3x3 elements of this matrix from the given `Matrix3`
+    /// matching Three.js r186 `Matrix4.setFromMatrix3()`.
+    #[inline]
+    pub fn set_from_matrix3(&mut self, m: &Matrix3) -> &mut Self {
+        let me = &m.elements;
+        self.set(
+            me[0], me[3], me[6], 0.0,
+            me[1], me[4], me[7], 0.0,
+            me[2], me[5], me[8], 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        )
+    }
+
+    /// Sets the basis vectors of this matrix matching Three.js r186 `Matrix4.makeBasis()`.
+    #[inline]
+    pub fn make_basis(
+        &mut self,
+        x_axis: &Vector3,
+        y_axis: &Vector3,
+        z_axis: &Vector3,
+    ) -> &mut Self {
+        self.set(
+            x_axis.x, y_axis.x, z_axis.x, 0.0,
+            x_axis.y, y_axis.y, z_axis.y, 0.0,
+            x_axis.z, y_axis.z, z_axis.z, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        )
+    }
+
+    /// Extracts the basis vectors of this matrix into the three given vectors
+    /// matching Three.js r186 `Matrix4.extractBasis()`.
+    ///
+    /// If `self.determinant_affine() == 0.0`, resets basis vectors to canonical axes (1,0,0), (0,1,0), (0,0,1).
+    pub fn extract_basis(
+        &mut self,
+        x_axis: &mut Vector3,
+        y_axis: &mut Vector3,
+        z_axis: &mut Vector3,
+    ) -> &mut Self {
+        if self.determinant_affine() == 0.0 {
+            x_axis.set(1.0, 0.0, 0.0);
+            y_axis.set(0.0, 1.0, 0.0);
+            z_axis.set(0.0, 0.0, 1.0);
+            return self;
+        }
+
+        x_axis.set_from_matrix_column(self, 0);
+        y_axis.set_from_matrix_column(self, 1);
+        z_axis.set_from_matrix_column(self, 2);
+
+        self
+    }
+
+    /// Sets this matrix as a translation transformation matching Three.js r186 `Matrix4.makeTranslation()`.
+    #[inline]
+    pub fn make_translation(&mut self, x: f64, y: f64, z: f64) -> &mut Self {
+        self.set(
+            1.0, 0.0, 0.0, x,
+            0.0, 1.0, 0.0, y,
+            0.0, 0.0, 1.0, z,
+            0.0, 0.0, 0.0, 1.0,
+        )
+    }
+
+    /// Sets this matrix as a translation transformation from a `Vector3`.
+    #[inline]
+    pub fn make_translation_vec(&mut self, v: &Vector3) -> &mut Self {
+        self.make_translation(v.x, v.y, v.z)
+    }
+
+    /// Alias for [`make_translation_vec`](Self::make_translation_vec).
+    #[inline]
+    pub fn make_translation_v(&mut self, v: &Vector3) -> &mut Self {
+        self.make_translation(v.x, v.y, v.z)
+    }
+
+    /// Sets this matrix as a rotation around the X axis by `theta` radians
+    /// matching Three.js r186 `Matrix4.makeRotationX()`.
+    #[inline]
+    pub fn make_rotation_x(&mut self, theta: f64) -> &mut Self {
+        let c = theta.cos();
+        let s = theta.sin();
+        self.set(
+            1.0, 0.0, 0.0, 0.0,
+            0.0, c, -s, 0.0,
+            0.0, s, c, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        )
+    }
+
+    /// Sets this matrix as a rotation around the Y axis by `theta` radians
+    /// matching Three.js r186 `Matrix4.makeRotationY()`.
+    #[inline]
+    pub fn make_rotation_y(&mut self, theta: f64) -> &mut Self {
+        let c = theta.cos();
+        let s = theta.sin();
+        self.set(
+            c, 0.0, s, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            -s, 0.0, c, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        )
+    }
+
+    /// Sets this matrix as a rotation around the Z axis by `theta` radians
+    /// matching Three.js r186 `Matrix4.makeRotationZ()`.
+    #[inline]
+    pub fn make_rotation_z(&mut self, theta: f64) -> &mut Self {
+        let c = theta.cos();
+        let s = theta.sin();
+        self.set(
+            c, -s, 0.0, 0.0,
+            s, c, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        )
+    }
+
+    /// Sets this matrix as a rotation around the normalized `axis` by `angle` radians
+    /// matching Three.js r186 `Matrix4.makeRotationAxis()`.
+    #[inline]
+    pub fn make_rotation_axis(&mut self, axis: &Vector3, angle: f64) -> &mut Self {
+        let c = angle.cos();
+        let s = angle.sin();
+        let t = 1.0 - c;
+        let x = axis.x;
+        let y = axis.y;
+        let z = axis.z;
+        let tx = t * x;
+        let ty = t * y;
+
+        self.set(
+            tx * x + c, tx * y - s * z, tx * z + s * y, 0.0,
+            tx * y + s * z, ty * y + c, ty * z - s * x, 0.0,
+            tx * z - s * y, ty * z + s * x, t * z * z + c, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        )
+    }
+
+    /// Sets this matrix as a scale transformation matching Three.js r186 `Matrix4.makeScale()`.
+    #[inline]
+    pub fn make_scale(&mut self, x: f64, y: f64, z: f64) -> &mut Self {
+        self.set(
+            x, 0.0, 0.0, 0.0,
+            0.0, y, 0.0, 0.0,
+            0.0, 0.0, z, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        )
+    }
+
+    /// Sets this matrix as a scale transformation from a `Vector3`.
+    #[inline]
+    pub fn make_scale_vec(&mut self, v: &Vector3) -> &mut Self {
+        self.make_scale(v.x, v.y, v.z)
+    }
+
+    /// Sets this matrix as a shear transformation matching Three.js r186 `Matrix4.makeShear()`.
+    #[inline]
+    pub fn make_shear(
+        &mut self,
+        xy: f64,
+        xz: f64,
+        yx: f64,
+        yz: f64,
+        zx: f64,
+        zy: f64,
+    ) -> &mut Self {
+        self.set(
+            1.0, yx, zx, 0.0,
+            xy, 1.0, zy, 0.0,
+            xz, yz, 1.0, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        )
+    }
+
     /// Narrows this `f64` 4x4 matrix into `[f32; 16]`, verifying that precision loss does not
     /// exceed `max_abs_err` or `max_rel_err`.
     ///
@@ -869,6 +1055,52 @@ impl Matrix4 {
             out[i] = check_narrow_f64(self.elements[i], i, max_abs_err, max_rel_err, strict)?;
         }
         Ok(out)
+    }
+
+    /// Resets this matrix to the 4x4 identity matrix.
+    ///
+    /// Matches Three.js r186 `Matrix4.identity()`.
+    #[inline]
+    pub fn set_identity(&mut self) -> &mut Self {
+        *self = Self::identity();
+        self
+    }
+
+    /// Returns true if all 16 elements strictly equal those of `other`.
+    ///
+    /// Matches Three.js r186 `Matrix4.equals(matrix)` using strict JS `===` semantics
+    /// (`NaN != NaN` returns `false`, `-0.0 == +0.0` returns `true`).
+    #[inline]
+    #[must_use]
+    pub fn equals(&self, other: &Self) -> bool {
+        for i in 0..16 {
+            if self.elements[i] != other.elements[i] {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Sets the elements of this matrix from the given slice in column-major order starting at `offset`.
+    ///
+    /// Validates bounds upfront to guarantee no partial mutation on out-of-range input.
+    /// Matches Three.js r186 `Matrix4.fromArray(array, offset)` in the valid native slice domain.
+    #[inline]
+    pub fn from_slice_offset(&mut self, array: &[f64], offset: usize) -> &mut Self {
+        assert!(offset + 16 <= array.len(), "slice too short for Matrix4 read");
+        self.elements.copy_from_slice(&array[offset..offset + 16]);
+        self
+    }
+
+    /// Writes the elements of this matrix in column-major order into `array` starting at `offset`.
+    ///
+    /// Validates bounds upfront to guarantee no partial mutation on out-of-range destination.
+    /// Matches Three.js r186 `Matrix4.toArray(array, offset)` in the valid native slice domain.
+    #[inline]
+    pub fn to_slice_offset<'a>(&self, array: &'a mut [f64], offset: usize) -> &'a mut [f64] {
+        assert!(offset + 16 <= array.len(), "destination slice too short for Matrix4 write");
+        array[offset..offset + 16].copy_from_slice(&self.elements);
+        array
     }
 }
 
@@ -948,5 +1180,79 @@ impl Default for Matrix4 {
     #[inline]
     fn default() -> Self {
         Self::identity()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_matrix4_identity_equals_and_array_slice_io_with_oracles() {
+        // Node oracle 1: identity resets matrix to 4x4 identity
+        let mut m = Matrix4::zero();
+        m.set_identity();
+        assert_eq!(m, Matrix4::identity());
+
+        // Node oracle 2: equals with strict === semantics
+        // Identity vs Identity -> true
+        assert!(m.equals(&Matrix4::identity()));
+
+        // -0.0 vs +0.0 -> true
+        let mut m_neg_zero = Matrix4::identity();
+        m_neg_zero.elements[0] = -0.0;
+        let mut m_pos_zero = Matrix4::identity();
+        m_pos_zero.elements[0] = 0.0;
+        assert!(m_neg_zero.equals(&m_pos_zero));
+
+        // NaN element -> false (NaN !== NaN)
+        let mut m_nan = Matrix4::identity();
+        m_nan.elements[5] = f64::NAN;
+        assert!(!m_nan.equals(&m_nan));
+        assert!(!m_nan.equals(&Matrix4::identity()));
+
+        // Node oracle 3: fromArray with offset 4 from a 20-element buffer
+        // Buffer: [-1, -2, -3, -4, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        let mut buf20 = [-1.0, -2.0, -3.0, -4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        for i in 0..16 {
+            buf20[4 + i] = (i + 1) as f64;
+        }
+        let mut m_from = Matrix4::zero();
+        m_from.from_slice_offset(&buf20, 4);
+        for i in 0..16 {
+            assert_eq!(m_from.elements[i], (i + 1) as f64);
+        }
+
+        // Node oracle 4: toArray into a 20-element sentinel buffer at offset 2 preserving sentinels
+        let mut dst20 = [0.0; 20];
+        dst20[0] = 888.0;
+        dst20[1] = 999.0;
+        dst20[18] = 777.0;
+        dst20[19] = 666.0;
+
+        m_from.to_slice_offset(&mut dst20, 2);
+        assert_eq!(dst20[0], 888.0);
+        assert_eq!(dst20[1], 999.0);
+        for i in 0..16 {
+            assert_eq!(dst20[2 + i], (i + 1) as f64);
+        }
+        assert_eq!(dst20[18], 777.0);
+        assert_eq!(dst20[19], 666.0);
+
+        // Out-of-range bounds checks guarantee zero partial mutation in native slice domain
+        let mut m_err = Matrix4::identity();
+        let short_src = [1.0; 18];
+        let res_read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            m_err.from_slice_offset(&short_src, 5);
+        }));
+        assert!(res_read.is_err(), "from_slice_offset must panic on out-of-range read");
+        assert_eq!(m_err, Matrix4::identity(), "matrix must have zero partial mutation on read failure");
+
+        let mut short_dst = [10.0; 18];
+        let res_write = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            m_from.to_slice_offset(&mut short_dst, 5);
+        }));
+        assert!(res_write.is_err(), "to_slice_offset must panic on out-of-range write");
+        assert_eq!(short_dst, [10.0; 18], "destination slice must have zero partial mutation on write failure");
     }
 }
