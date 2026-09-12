@@ -39,6 +39,11 @@ export async function directMeshReference(device, options) {
     width = 64,
     height = 64,
     format = "rgba8unorm",
+    hasDepth = false,
+    depthFormat = "depth24plus",
+    depthWriteEnabled = true,
+    depthCompare = "less",
+    depthClearValue = 1.0,
   } = options;
 
   const bytesPerRow = Math.ceil((width * 4) / 256) * 256;
@@ -47,6 +52,13 @@ export async function directMeshReference(device, options) {
     format,
     usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
   });
+  const depthTexture = hasDepth
+    ? device.createTexture({
+        size: [width, height, 1],
+        format: depthFormat,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT,
+      })
+    : null;
   const readback = device.createBuffer({
     size: bytesPerRow * height,
     usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
@@ -178,13 +190,20 @@ export async function directMeshReference(device, options) {
       topology: "triangle-list",
       cullMode: "none", // DoubleSide
     },
+    depthStencil: hasDepth
+      ? {
+          format: depthFormat,
+          depthWriteEnabled,
+          depthCompare,
+        }
+      : undefined,
   });
 
   device.pushErrorScope("validation");
   let scopeOpen = true;
   try {
     const encoder = device.createCommandEncoder();
-    const pass = encoder.beginRenderPass({
+    const passDesc = {
       colorAttachments: [
         {
           view: target.createView(),
@@ -193,7 +212,16 @@ export async function directMeshReference(device, options) {
           clearValue: [0, 0, 0, 1],
         },
       ],
-    });
+    };
+    if (hasDepth) {
+      passDesc.depthStencilAttachment = {
+        view: depthTexture.createView(),
+        depthClearValue,
+        depthLoadOp: "clear",
+        depthStoreOp: "store",
+      };
+    }
+    const pass = encoder.beginRenderPass(passDesc);
     pass.setPipeline(pipeline);
     pass.setBindGroup(0, bindGroup);
     pass.setVertexBuffer(0, vertexBuffer);
@@ -228,6 +256,7 @@ export async function directMeshReference(device, options) {
     if (scopeOpen) await device.popErrorScope();
     target.destroy();
     readback.destroy();
+    if (depthTexture) depthTexture.destroy();
     vertexBuffer.destroy();
     if (indexBuffer) indexBuffer.destroy();
     uniformBuffer.destroy();
@@ -509,12 +538,34 @@ export async function testMeshScene(bridgeHost, wasmExports, customThree = null,
   // ---------------------------------------------------------------------------
   // Checkpoint 5: Negative Controls - Admission Rejections via Production canAdmitMesh
   // ---------------------------------------------------------------------------
-  mesh.material.depthTest = true;
-  const depthAdmission = adapter.canAdmitMesh(mesh, camera);
-  if (depthAdmission.admitted) {
-    throw new Error("Negative control failed: depthTest=true was admitted without depth buffer");
-  }
+  // 1. Negative control: depthTest=false with depthWrite=true without options.sourceBackend
+  // is ambiguous across backends (WebGL suppresses writes, WebGPU permits writes) and must be refused.
   mesh.material.depthTest = false;
+  mesh.material.depthWrite = true;
+  const ambiguousAdmission = adapter.canAdmitMesh(mesh, camera);
+  if (ambiguousAdmission.admitted) {
+    throw new Error("Negative control failed: depthTest=false + depthWrite=true without options.sourceBackend was admitted");
+  }
+  if (ambiguousAdmission.reason !== adapter.ADMISSION_REJECTION.AMBIGUOUS_DEPTH_PAIR) {
+    throw new Error(`Negative control failed: expected AMBIGUOUS_DEPTH_PAIR, got ${ambiguousAdmission.reason}`);
+  }
+  mesh.material.depthWrite = false;
+
+  // 2. Negative control: polygonOffset is an unsupported material feature
+  mesh.material.polygonOffset = true;
+  const polygonAdmission = adapter.canAdmitMesh(mesh, camera);
+  if (polygonAdmission.admitted) {
+    throw new Error("Negative control failed: polygonOffset=true was admitted");
+  }
+  mesh.material.polygonOffset = false;
+
+  // 3. Negative control: stencilWrite is an unsupported material feature
+  mesh.material.stencilWrite = true;
+  const stencilAdmission = adapter.canAdmitMesh(mesh, camera);
+  if (stencilAdmission.admitted) {
+    throw new Error("Negative control failed: stencilWrite=true was admitted");
+  }
+  mesh.material.stencilWrite = false;
 
   mesh.material.transparent = true;
   const transparentAdmission = adapter.canAdmitMesh(mesh, camera);
@@ -820,4 +871,367 @@ export async function testVisibleCanvasMeshScene(bridgeHost, wasmExports, canvas
   } finally {
     canvasReadback.destroy();
   }
+}
+
+/**
+ * Executes dynamic Three.js Mesh depth mutations through production mesh_adapter -> Wasm exports.
+ *
+ * Verification Requirements (§6.1, §6.7, §8.5):
+ * 1. Real THREE.Mesh depthTest, depthWrite, and depthFunc mutation through actual Wasm new exports.
+ * 2. Independent direct-WebGPU oracle reference for exact bit-for-bit comparison.
+ * 3. Compares clear vs visible for NeverDepth (clear/suppressed) vs AlwaysDepth/LessDepth (visible).
+ * 4. Verifies depth-write-disabled behavior against independent direct WebGPU reference.
+ * 5. Strict missing-export failure on required functions.
+ *
+ * @param {WebGpuBridgeHost} bridgeHost
+ * @param {object} wasmExports
+ * @param {GPUCanvasContext} [canvasContext]
+ * @param {HTMLCanvasElement} [canvas]
+ * @returns {Promise<string>}
+ */
+export async function testMeshDepthScene(bridgeHost, wasmExports, canvasContext = null, canvas = null) {
+  const buildMeshDepthFn =
+    wasmExports?.f3d_build_mesh_depth_packet ||
+    wasmExports?.gpu_bridge_build_mesh_depth_packet;
+
+  if (typeof buildMeshDepthFn !== "function") {
+    throw new Error(
+      "Missing required Wasm mesh depth export: f3d_build_mesh_depth_packet / gpu_bridge_build_mesh_depth_packet"
+    );
+  }
+
+  const THREE = await loadProductionThree();
+  const adapter = await loadProductionAdapter();
+
+  const device = bridgeHost.device;
+  const width = 64;
+  const height = 64;
+  const bytesPerRow = Math.ceil((width * 4) / 256) * 256;
+  const centerIdx = 32 * bytesPerRow + 32 * 4;
+
+  // Geometry: triangle covering center, in z = -2.0 plane
+  const geomNear = new THREE.BufferGeometry();
+  const posNear = new Float32Array([
+    -1.0, -1.0, -2.0,
+     1.0, -1.0, -2.0,
+     0.0,  1.0, -2.0,
+  ]);
+  geomNear.setAttribute("position", new THREE.BufferAttribute(posNear, 3));
+
+  const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 100);
+  camera.position.set(0, 0, 0);
+  camera.lookAt(0, 0, -1);
+  camera.updateMatrixWorld(true);
+  camera.updateProjectionMatrix();
+
+  const greenMaterial = new THREE.MeshBasicMaterial({
+    color: 0x00ff00,
+    side: THREE.DoubleSide,
+    depthTest: true,
+    depthWrite: true,
+    depthFunc: THREE.LessDepth,
+  });
+  const meshNear = new THREE.Mesh(geomNear, greenMaterial);
+  meshNear.updateMatrixWorld(true);
+
+  // Helper to extract raw direct reference parameters from real Three objects
+  function getRawDirectOptions(targetMesh, targetCamera, overrides = {}) {
+    const pos = targetMesh.geometry.attributes.position.array;
+    const mv = targetCamera.matrixWorldInverse.clone().multiply(targetMesh.matrixWorld).elements;
+    const proj = targetCamera.projectionMatrix.elements;
+    const col = [
+      targetMesh.material.color.r,
+      targetMesh.material.color.g,
+      targetMesh.material.color.b,
+      targetMesh.material.opacity ?? 1.0,
+    ];
+    return {
+      positions: pos,
+      indices: null,
+      modelView: mv,
+      projection: proj,
+      webglDepth: true,
+      color: col,
+      width,
+      height,
+      depthFormat: "depth24plus",
+      ...overrides,
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Checkpoint 1: Standard LessDepth -> Mesh Visible (Green)
+  // ---------------------------------------------------------------------------
+  meshNear.material.depthFunc = THREE.LessDepth;
+  meshNear.material.depthTest = true;
+  meshNear.material.depthWrite = true;
+  meshNear.material.needsUpdate = true;
+
+  const { packetBytes: packetLess } = adapter.prepareMeshDepthPacket
+    ? adapter.prepareMeshDepthPacket(meshNear, camera, width, height, wasmExports)
+    : adapter.prepareMeshPacket(meshNear, camera, width, height, wasmExports);
+
+  await bridgeHost.executePacket(packetLess);
+  const candidateLess = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+  const refLess = await directMeshReference(
+    device,
+    getRawDirectOptions(meshNear, camera, {
+      hasDepth: true,
+      depthCompare: "less",
+      depthWriteEnabled: true,
+    })
+  );
+
+  if (differs(candidateLess, refLess)) {
+    throw new Error("Checkpoint 1 failed: LessDepth candidate differs from direct WebGPU reference");
+  }
+  const centerLess = [
+    candidateLess[centerIdx],
+    candidateLess[centerIdx + 1],
+    candidateLess[centerIdx + 2],
+    candidateLess[centerIdx + 3],
+  ];
+  if (centerLess[0] > 50 || centerLess[1] < 200 || centerLess[2] > 50) {
+    throw new Error(`Checkpoint 1 failed: expected visible Green, got [${centerLess}]`);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Checkpoint 2: NeverDepth Mutation -> Depth Test Rejects, Clear Color Remains
+  // ---------------------------------------------------------------------------
+  meshNear.material.depthFunc = THREE.NeverDepth;
+  meshNear.material.needsUpdate = true;
+
+  const { packetBytes: packetNever } = adapter.prepareMeshDepthPacket
+    ? adapter.prepareMeshDepthPacket(meshNear, camera, width, height, wasmExports)
+    : adapter.prepareMeshPacket(meshNear, camera, width, height, wasmExports);
+
+  await bridgeHost.executePacket(packetNever);
+  const candidateNever = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+  const refNever = await directMeshReference(
+    device,
+    getRawDirectOptions(meshNear, camera, {
+      hasDepth: true,
+      depthCompare: "never",
+      depthWriteEnabled: true,
+    })
+  );
+
+  if (differs(candidateNever, refNever)) {
+    throw new Error("Checkpoint 2 failed: NeverDepth candidate differs from direct WebGPU reference");
+  }
+  const centerNever = [
+    candidateNever[centerIdx],
+    candidateNever[centerIdx + 1],
+    candidateNever[centerIdx + 2],
+    candidateNever[centerIdx + 3],
+  ];
+  // Must remain clear color [0, 0, 0, 1] / [0, 0, 0, 255]
+  if (centerNever[0] !== 0 || centerNever[1] !== 0 || centerNever[2] !== 0) {
+    throw new Error(`Checkpoint 2 failed: expected clear black for NeverDepth, got [${centerNever}]`);
+  }
+  if (!differs(candidateNever, candidateLess)) {
+    throw new Error("Checkpoint 2 failed: NeverDepth did not suppress mesh rendering");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Checkpoint 3: AlwaysDepth Mutation -> Depth Test Passes, Mesh Visible
+  // ---------------------------------------------------------------------------
+  meshNear.material.depthFunc = THREE.AlwaysDepth;
+  meshNear.material.needsUpdate = true;
+
+  const { packetBytes: packetAlways } = adapter.prepareMeshDepthPacket
+    ? adapter.prepareMeshDepthPacket(meshNear, camera, width, height, wasmExports)
+    : adapter.prepareMeshPacket(meshNear, camera, width, height, wasmExports);
+
+  await bridgeHost.executePacket(packetAlways);
+  const candidateAlways = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+  const refAlways = await directMeshReference(
+    device,
+    getRawDirectOptions(meshNear, camera, {
+      hasDepth: true,
+      depthCompare: "always",
+      depthWriteEnabled: true,
+    })
+  );
+
+  if (differs(candidateAlways, refAlways)) {
+    throw new Error("Checkpoint 3 failed: AlwaysDepth candidate differs from direct WebGPU reference");
+  }
+  const centerAlways = [
+    candidateAlways[centerIdx],
+    candidateAlways[centerIdx + 1],
+    candidateAlways[centerIdx + 2],
+    candidateAlways[centerIdx + 3],
+  ];
+  if (centerAlways[0] > 50 || centerAlways[1] < 200 || centerAlways[2] > 50) {
+    throw new Error(`Checkpoint 3 failed: expected visible Green for AlwaysDepth, got [${centerAlways}]`);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Checkpoint 4: depthTest = false Disambiguation via options.sourceBackend
+  // ---------------------------------------------------------------------------
+  meshNear.material.depthTest = false;
+  meshNear.material.depthWrite = true;
+  meshNear.material.depthFunc = THREE.NeverDepth; // Even with NeverDepth, depthTest=false overrides to Always
+  meshNear.material.needsUpdate = true;
+
+  // 4a: Ambiguous pair without options.sourceBackend MUST be refused
+  let ambiguousRefused = false;
+  try {
+    if (adapter.prepareMeshDepthPacket) {
+      adapter.prepareMeshDepthPacket(meshNear, camera, width, height, wasmExports);
+    } else {
+      adapter.prepareMeshPacket(meshNear, camera, width, height, wasmExports);
+    }
+  } catch (e) {
+    if (e.message.includes("ambiguous across backends") || e.message.includes("AMBIGUOUS_DEPTH_PAIR")) {
+      ambiguousRefused = true;
+    }
+  }
+  if (!ambiguousRefused) {
+    throw new Error("Checkpoint 4 failed: depthTest=false + depthWrite=true without options.sourceBackend was not refused");
+  }
+
+  // 4b: Positive WebGPU backend: passes depthWrite=true directly (r186 WebGPUPipelineUtils.js:224)
+  const { packetBytes: packetWebGPU } = adapter.prepareMeshDepthPacket
+    ? adapter.prepareMeshDepthPacket(meshNear, camera, width, height, wasmExports, { sourceBackend: "webgpu" })
+    : adapter.prepareMeshPacket(meshNear, camera, width, height, wasmExports, { sourceBackend: "webgpu" });
+
+  await bridgeHost.executePacket(packetWebGPU);
+  const candidateWebGPU = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+  const refWebGPU = await directMeshReference(
+    device,
+    getRawDirectOptions(meshNear, camera, {
+      hasDepth: true,
+      depthCompare: "always",
+      depthWriteEnabled: true,
+    })
+  );
+
+  if (differs(candidateWebGPU, refWebGPU)) {
+    throw new Error("Checkpoint 4b failed: depthTest=false with sourceBackend='webgpu' differs from direct WebGPU reference");
+  }
+  const centerWebGPU = [
+    candidateWebGPU[centerIdx],
+    candidateWebGPU[centerIdx + 1],
+    candidateWebGPU[centerIdx + 2],
+    candidateWebGPU[centerIdx + 3],
+  ];
+  if (centerWebGPU[0] > 50 || centerWebGPU[1] < 200 || centerWebGPU[2] > 50) {
+    throw new Error(`Checkpoint 4b failed: expected visible Green for sourceBackend='webgpu', got [${centerWebGPU}]`);
+  }
+
+  // 4c: Positive WebGL backend: disabled depth test suppresses writes in hardware (depthWriteEnabled = false)
+  const { packetBytes: packetWebGL } = adapter.prepareMeshDepthPacket
+    ? adapter.prepareMeshDepthPacket(meshNear, camera, width, height, wasmExports, { sourceBackend: "webgl" })
+    : adapter.prepareMeshPacket(meshNear, camera, width, height, wasmExports, { sourceBackend: "webgl" });
+
+  await bridgeHost.executePacket(packetWebGL);
+  const candidateWebGL = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+  const refWebGL = await directMeshReference(
+    device,
+    getRawDirectOptions(meshNear, camera, {
+      hasDepth: true,
+      depthCompare: "always",
+      depthWriteEnabled: false,
+    })
+  );
+
+  if (differs(candidateWebGL, refWebGL)) {
+    throw new Error("Checkpoint 4c failed: depthTest=false with sourceBackend='webgl' differs from direct WebGPU reference");
+  }
+  const centerWebGL = [
+    candidateWebGL[centerIdx],
+    candidateWebGL[centerIdx + 1],
+    candidateWebGL[centerIdx + 2],
+    candidateWebGL[centerIdx + 3],
+  ];
+  if (centerWebGL[0] > 50 || centerWebGL[1] < 200 || centerWebGL[2] > 50) {
+    throw new Error(`Checkpoint 4c failed: expected visible Green for sourceBackend='webgl', got [${centerWebGL}]`);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Checkpoint 5: Depth Write Disabled Behavior Verification
+  // ---------------------------------------------------------------------------
+  meshNear.material.depthTest = true;
+  meshNear.material.depthWrite = false;
+  meshNear.material.depthFunc = THREE.LessDepth;
+  meshNear.material.needsUpdate = true;
+
+  const { packetBytes: packetWriteDisabled } = adapter.prepareMeshDepthPacket
+    ? adapter.prepareMeshDepthPacket(meshNear, camera, width, height, wasmExports)
+    : adapter.prepareMeshPacket(meshNear, camera, width, height, wasmExports);
+
+  await bridgeHost.executePacket(packetWriteDisabled);
+  const candidateWriteDisabled = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+  const refWriteDisabled = await directMeshReference(
+    device,
+    getRawDirectOptions(meshNear, camera, {
+      hasDepth: true,
+      depthCompare: "less",
+      depthWriteEnabled: false,
+    })
+  );
+
+  if (differs(candidateWriteDisabled, refWriteDisabled)) {
+    throw new Error("Checkpoint 5 failed: depthWrite=false candidate differs from direct WebGPU reference");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Checkpoint 6: Visible Canvas Mesh with Depth (when canvasContext is provided)
+  // ---------------------------------------------------------------------------
+  if (canvasContext) {
+    const buildCanvasDepthFn =
+      wasmExports?.f3d_build_canvas_mesh_depth_packet ||
+      wasmExports?.gpu_bridge_build_canvas_mesh_depth_packet;
+
+    if (typeof buildCanvasDepthFn !== "function") {
+      throw new Error(
+        "Visible canvas mesh depth requested, but Wasm module is missing required export: f3d_build_canvas_mesh_depth_packet / gpu_bridge_build_canvas_mesh_depth_packet"
+      );
+    }
+
+    const canvasFormat = navigator.gpu.getPreferredCanvasFormat();
+    const { packetBytes: canvasDepthPacket } = adapter.prepareCanvasMeshDepthPacket
+      ? adapter.prepareCanvasMeshDepthPacket(meshNear, camera, width, height, wasmExports)
+      : adapter.prepareCanvasMeshPacket(meshNear, camera, width, height, wasmExports);
+
+    const canvasReadback = device.createBuffer({
+      size: bytesPerRow * height,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+
+    const currentTexture = canvasContext.getCurrentTexture();
+    const execPromise = bridgeHost.executePacket(canvasDepthPacket, canvasContext);
+
+    const copyEncoder = device.createCommandEncoder();
+    copyEncoder.copyTextureToBuffer(
+      { texture: currentTexture },
+      { buffer: canvasReadback, bytesPerRow },
+      [width, height, 1]
+    );
+    device.queue.submit([copyEncoder.finish()]);
+
+    await execPromise;
+    await canvasReadback.mapAsync(GPUMapMode.READ);
+    const canvasPixels = new Uint8Array(canvasReadback.getMappedRange().slice(0));
+    canvasReadback.unmap();
+    canvasReadback.destroy();
+
+    const refCanvas = await directMeshReference(
+      device,
+      getRawDirectOptions(meshNear, camera, {
+        hasDepth: true,
+        depthCompare: "less",
+        depthWriteEnabled: false,
+        format: canvasFormat,
+      })
+    );
+
+    if (differs(canvasPixels, refCanvas)) {
+      throw new Error("Checkpoint 6 failed: Visible canvas mesh depth pixels differ from direct WebGPU reference in canvas format");
+    }
+  }
+
+  return "Real THREE.Mesh depthTest/depthWrite/depthFunc mutation verified (depth24plus): LessDepth produces visible mesh matching direct WebGPU reference; NeverDepth suppresses rendering (clear color preserved); AlwaysDepth renders visible mesh; depthTest=false without sourceBackend refused (AMBIGUOUS_DEPTH_PAIR); sourceBackend='webgpu' enables depthWrite; sourceBackend='webgl' suppresses depthWrite; depthWrite=false verified against independent oracle" + (canvasContext ? "; visible canvas mesh depth verified against direct reference" : "");
 }

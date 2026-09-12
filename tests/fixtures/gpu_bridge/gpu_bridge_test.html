@@ -41,7 +41,7 @@
     import { testDeviceReplacement } from "./device_lifetime_test.js";
     import { testViewportScissor } from "./viewport_scissor_test.js";
     import { testDrawParameters } from "./draw_parameters_test.js";
-    import { testMeshScene, testVisibleCanvasMeshScene } from "./mesh_scene_test.js";
+    import { testMeshScene, testVisibleCanvasMeshScene, testMeshDepthScene } from "./mesh_scene_test.js";
     import { testDepthScene } from "./depth_test.js";
 
     const outputEl = document.getElementById("output");
@@ -343,7 +343,7 @@
         logPass("dynamic_mesh_scene", await testMeshScene(bridge, wasmExports));
 
         const urlParams = new URLSearchParams(window.location.search);
-        const requestedLane = urlParams.get("lane") || (urlParams.has("canvas") ? "canvas" : (urlParams.has("depth") ? "depth" : "offscreen"));
+        const requestedLane = urlParams.get("lane") || (urlParams.has("canvas") ? "canvas" : (urlParams.has("depth") ? "depth" : (urlParams.has("mesh_depth") ? "mesh_depth" : "offscreen")));
 
         if (requestedLane === "canvas" || requestedLane === "all") {
           const hasCanvasExport =
@@ -367,6 +367,18 @@
             );
           }
           logPass("overlapping_depth_test", await testDepthScene(bridge, wasmExports));
+        }
+
+        if (requestedLane === "depth" || requestedLane === "mesh_depth" || requestedLane === "all") {
+          const hasMeshDepthExport =
+            typeof wasmExports.f3d_build_mesh_depth_packet === "function" ||
+            typeof wasmExports.gpu_bridge_build_mesh_depth_packet === "function";
+          if (!hasMeshDepthExport) {
+            throw new Error(
+              "Depth lane requested, but Wasm module is missing required export f3d_build_mesh_depth_packet / gpu_bridge_build_mesh_depth_packet"
+            );
+          }
+          logPass("mesh_depth_scene", await testMeshDepthScene(bridge, wasmExports, canvasContext, canvas));
         }
 
         // 7. Retained renderer exclusion

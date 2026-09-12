@@ -23,7 +23,7 @@ for (const arg of args) {
     lane = arg.slice(5);
   } else if (arg.startsWith('--lane=')) {
     lane = arg.slice(7);
-  } else if (arg === 'canvas' || arg === 'offscreen' || arg === 'depth') {
+  } else if (arg === 'canvas' || arg === 'offscreen' || arg === 'depth' || arg === 'mesh_depth') {
     lane = arg;
   } else if (!arg.startsWith('-')) {
     packagePath = arg;
