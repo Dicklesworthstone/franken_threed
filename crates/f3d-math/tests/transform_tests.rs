@@ -1898,3 +1898,142 @@ fn test_quaternion_set_from_unit_vectors_cases() {
     assert!(q.z.is_nan(), "NaN input propagates NaN to z");
     assert!(q.w.is_nan(), "NaN input propagates NaN to w");
 }
+
+#[test]
+fn test_matrix4_look_at_cases() {
+    let mut m = Matrix4::identity();
+
+    // 1. Ordinary camera basis looking down -Z axis
+    let eye = Vector3::new(0.0, 0.0, 5.0);
+    let target = Vector3::new(0.0, 0.0, 0.0);
+    let up = Vector3::new(0.0, 1.0, 0.0);
+    m.look_at(&eye, &target, &up);
+    let expected_ordinary = [
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    ];
+    assert_mat_close(&m, &expected_ordinary, 1e-15, "look_at ordinary");
+
+    // 2. Diagonal look_at orientation
+    let eye_diag = Vector3::new(1.0, 2.0, 3.0);
+    let target_diag = Vector3::new(4.0, 5.0, 6.0);
+    m.look_at(&eye_diag, &target_diag, &up);
+    let expected_diag = [
+        -0.7071067811865475, 0.0, 0.7071067811865475, 0.0,
+        -0.40824829046386296, 0.8164965809277259, -0.40824829046386296, 0.0,
+        -0.5773502691896257, -0.5773502691896257, -0.5773502691896257, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    ];
+    assert_mat_close(&m, &expected_diag, 1e-14, "look_at diagonal");
+
+    // 3. Coincident eye and target: sets z.z = 1.0 and resolves to identity upper 3x3
+    m.look_at(&eye_diag, &eye_diag, &up);
+    assert_mat_close(&m, &expected_ordinary, 1e-15, "look_at coincident eye/target");
+
+    // 4. Parallel up and z with |up.z| == 1.0
+    let up_z1 = Vector3::new(0.0, 0.0, 1.0);
+    m.look_at(&eye, &target, &up_z1);
+    let expected_parallel_z1 = [
+        0.0, 0.9999999999999999, 0.0, 0.0,
+        -0.9999999949999999, 0.0, 0.0000999999995, 0.0,
+        0.00009999999950000001, 0.0, 0.999999995, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    ];
+    assert_mat_close(&m, &expected_parallel_z1, 1e-14, "look_at parallel up |up.z| == 1");
+
+    // 5. Parallel up and z with |up.z| != 1.0 (looking along +Y with up=(0,1,0))
+    let eye_y = Vector3::new(0.0, 5.0, 0.0);
+    m.look_at(&eye_y, &target, &up);
+    let expected_parallel_y = [
+        0.9999999999999999, 0.0, 0.0, 0.0,
+        0.0, 0.0000999999995, -0.9999999949999999, 0.0,
+        0.0, 0.999999995, 0.00009999999950000001, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    ];
+    assert_mat_close(&m, &expected_parallel_y, 1e-14, "look_at parallel up |up.z| != 1");
+
+    // 6. Source-defined untouched matrix elements:
+    // look_at only writes elements [0..=2], [4..=6], [8..=10].
+    // elements [3], [7], [11], and [12..=15] must be left untouched.
+    let mut m_untouched = Matrix4::from_elements([
+        1.0, 2.0, 3.0, 4.0,
+        5.0, 6.0, 7.0, 8.0,
+        9.0, 10.0, 11.0, 12.0,
+        13.0, 14.0, 15.0, 16.0,
+    ]);
+    m_untouched.look_at(&eye, &target, &up);
+    // Columns 0, 1, 2 top 3 elements are updated to ordinary rotation:
+    assert_close(m_untouched.elements[0], 1.0, 1e-15, "col 0 x");
+    assert_close(m_untouched.elements[1], 0.0, 1e-15, "col 0 y");
+    assert_close(m_untouched.elements[2], 0.0, 1e-15, "col 0 z");
+    assert_close(m_untouched.elements[4], 0.0, 1e-15, "col 1 x");
+    assert_close(m_untouched.elements[5], 1.0, 1e-15, "col 1 y");
+    assert_close(m_untouched.elements[6], 0.0, 1e-15, "col 1 z");
+    assert_close(m_untouched.elements[8], 0.0, 1e-15, "col 2 x");
+    assert_close(m_untouched.elements[9], 0.0, 1e-15, "col 2 y");
+    assert_close(m_untouched.elements[10], 1.0, 1e-15, "col 2 z");
+    // Assert untouched elements:
+    assert_eq!(m_untouched.elements[3], 4.0, "elements[3] preserved untouched");
+    assert_eq!(m_untouched.elements[7], 8.0, "elements[7] preserved untouched");
+    assert_eq!(m_untouched.elements[11], 12.0, "elements[11] preserved untouched");
+    assert_eq!(m_untouched.elements[12], 13.0, "elements[12] preserved untouched");
+    assert_eq!(m_untouched.elements[13], 14.0, "elements[13] preserved untouched");
+    assert_eq!(m_untouched.elements[14], 15.0, "elements[14] preserved untouched");
+    assert_eq!(m_untouched.elements[15], 16.0, "elements[15] preserved untouched");
+}
+
+#[test]
+fn test_matrix4_extract_rotation_cases() {
+    let mut rot = Matrix4::identity();
+    rot.make_rotation_from_euler(&Euler::new(0.2, 0.4, 0.6, EulerOrder::XYZ));
+
+    // 1. Pure rotation extraction
+    let mut dst = Matrix4::zero();
+    dst.extract_rotation(&rot);
+    assert_mat_close(&dst, &rot.elements, 1e-15, "extract_rotation pure");
+
+    // 2. Nonuniform scale: rot * scale(2, 3, 4) extracts pure rot
+    let mut scaled = rot;
+    scaled.scale(&Vector3::new(2.0, 3.0, 4.0));
+    dst.extract_rotation(&scaled);
+    assert_mat_close(&dst, &rot.elements, 1e-14, "extract_rotation nonuniform scale");
+
+    // 3. Negative scale (reflection): rot * scale(-2, 3, 4)
+    // Upstream divides by Euclidean length (positive), preserving the negative sign without reflection normalization
+    let mut neg_scaled = rot;
+    neg_scaled.scale(&Vector3::new(-2.0, 3.0, 4.0));
+    dst.extract_rotation(&neg_scaled);
+    let expected_neg = [
+        -rot.elements[0], -rot.elements[1], -rot.elements[2], 0.0,
+        rot.elements[4], rot.elements[5], rot.elements[6], 0.0,
+        rot.elements[8], rot.elements[9], rot.elements[10], 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    ];
+    assert_mat_close(&dst, &expected_neg, 1e-14, "extract_rotation negative scale");
+
+    // 4. Zero scale / singular matrix (determinant_affine == 0): resets to identity
+    let mut zero_scaled = rot;
+    zero_scaled.scale(&Vector3::new(0.0, 3.0, 4.0));
+    let mut dirty_dst = Matrix4::from_elements([
+        1.0, 2.0, 3.0, 4.0,
+        5.0, 6.0, 7.0, 8.0,
+        9.0, 10.0, 11.0, 12.0,
+        13.0, 14.0, 15.0, 16.0,
+    ]);
+    dirty_dst.extract_rotation(&zero_scaled);
+    assert_mat_close(&dirty_dst, &Matrix4::identity().elements, 1e-15, "extract_rotation zero scale resets to identity");
+
+    // 5. Overwrites all 16 elements on valid matrix:
+    // Unlike look_at, extract_rotation explicitly writes all 16 elements (col 3 is [0,0,0,1], row 3 is [0,0,0,1])
+    let mut dirty_dst2 = Matrix4::from_elements([
+        1.0, 2.0, 3.0, 4.0,
+        5.0, 6.0, 7.0, 8.0,
+        9.0, 10.0, 11.0, 12.0,
+        13.0, 14.0, 15.0, 16.0,
+    ]);
+    dirty_dst2.extract_rotation(&rot);
+    assert_mat_close(&dirty_dst2, &rot.elements, 1e-15, "extract_rotation overwrites all 16 elements");
+}
+

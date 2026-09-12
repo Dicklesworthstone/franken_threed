@@ -387,6 +387,45 @@ impl Matrix4 {
         Ok(())
     }
 
+    /// Extracts the rotation component of matrix `m` into this matrix's rotation component.
+    ///
+    /// If `m.determinant_affine() == 0.0`, resets this matrix to identity matching Three.js r186.
+    /// Note: This method does not support reflection matrices.
+    pub fn extract_rotation(&mut self, m: &Self) -> &mut Self {
+        if m.determinant_affine() == 0.0 {
+            *self = Self::identity();
+            return self;
+        }
+
+        let me = &m.elements;
+
+        let scale_x = 1.0 / (me[0] * me[0] + me[1] * me[1] + me[2] * me[2]).sqrt();
+        let scale_y = 1.0 / (me[4] * me[4] + me[5] * me[5] + me[6] * me[6]).sqrt();
+        let scale_z = 1.0 / (me[8] * me[8] + me[9] * me[9] + me[10] * me[10]).sqrt();
+
+        self.elements[0] = me[0] * scale_x;
+        self.elements[1] = me[1] * scale_x;
+        self.elements[2] = me[2] * scale_x;
+        self.elements[3] = 0.0;
+
+        self.elements[4] = me[4] * scale_y;
+        self.elements[5] = me[5] * scale_y;
+        self.elements[6] = me[6] * scale_y;
+        self.elements[7] = 0.0;
+
+        self.elements[8] = me[8] * scale_z;
+        self.elements[9] = me[9] * scale_z;
+        self.elements[10] = me[10] * scale_z;
+        self.elements[11] = 0.0;
+
+        self.elements[12] = 0.0;
+        self.elements[13] = 0.0;
+        self.elements[14] = 0.0;
+        self.elements[15] = 1.0;
+
+        self
+    }
+
     /// Sets the rotation component of this transformation matrix from a quaternion,
     /// with position zero `(0, 0, 0)` and unit scale `(1, 1, 1)` matching Three.js r186.
     #[inline]
@@ -630,6 +669,64 @@ impl Matrix4 {
             && te[7].abs() <= eps
             && te[11].abs() <= eps
             && (te[15] - 1.0).abs() <= eps
+    }
+
+    /// Constructs a rotation matrix, looking from `eye` towards `target`, oriented by the `up` vector.
+    ///
+    /// Matches Three.js r186 `Matrix4.lookAt`.
+    /// Note: Preserves untouched elements `elements[3]`, `elements[7]`, `elements[11]`,
+    /// and column 3 (`elements[12..16]`).
+    pub fn look_at(&mut self, eye: &Vector3, target: &Vector3, up: &Vector3) -> &mut Self {
+        let mut z = Vector3::new(eye.x - target.x, eye.y - target.y, eye.z - target.z);
+
+        if z.length_sq() == 0.0 {
+            // eye and target are in the same position
+            z.z = 1.0;
+        }
+
+        z.normalize();
+        let mut x = Vector3::new(
+            up.y * z.z - up.z * z.y,
+            up.z * z.x - up.x * z.z,
+            up.x * z.y - up.y * z.x,
+        );
+
+        if x.length_sq() == 0.0 {
+            // up and z are parallel
+            if up.z.abs() == 1.0 {
+                z.x += 0.0001;
+            } else {
+                z.z += 0.0001;
+            }
+
+            z.normalize();
+            x.set(
+                up.y * z.z - up.z * z.y,
+                up.z * z.x - up.x * z.z,
+                up.x * z.y - up.y * z.x,
+            );
+        }
+
+        x.normalize();
+        let y = Vector3::new(
+            z.y * x.z - z.z * x.y,
+            z.z * x.x - z.x * x.z,
+            z.x * x.y - z.y * x.x,
+        );
+
+        self.elements[0] = x.x;
+        self.elements[4] = y.x;
+        self.elements[8] = z.x;
+
+        self.elements[1] = x.y;
+        self.elements[5] = y.y;
+        self.elements[9] = z.y;
+
+        self.elements[2] = x.z;
+        self.elements[6] = y.z;
+        self.elements[10] = z.z;
+
+        self
     }
 
     /// Creates a perspective projection matrix matching Three.js r186 `makePerspective`.
