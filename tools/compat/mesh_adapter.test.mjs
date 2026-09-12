@@ -526,9 +526,9 @@ test('Material features: Rejects advanced and unexercised material features (130
   const vcMesh = createBasicTriangleMesh({ vertexColors: true });
   assert.equal(canAdmitMesh(vcMesh, camera).admitted, false);
 
-  // colorWrite = false
+  // colorWrite = false (admitted in this slice)
   const cwMesh = createBasicTriangleMesh({ colorWrite: false });
-  assert.equal(canAdmitMesh(cwMesh, camera).admitted, false);
+  assert.equal(canAdmitMesh(cwMesh, camera).admitted, true);
 
   // clippingPlanes
   const clipMesh = createBasicTriangleMesh({ clippingPlanes: [new THREE.Plane()] });
@@ -2827,4 +2827,459 @@ test('renderScene: Admits mixed sides and reflected hierarchies into single batc
   // mesh3 (FrontSide, parent reflected det < 0): cull BACK (2), CW (1)
   assert.deepEqual(capturedBatch.cModes, [CULL_MODE_WIRE.NONE, CULL_MODE_WIRE.BACK, CULL_MODE_WIRE.BACK]);
   assert.deepEqual(capturedBatch.fFaces, [FRONT_FACE_WIRE.CCW, FRONT_FACE_WIRE.CCW, FRONT_FACE_WIRE.CW]);
+});
+
+test('Mixed per-mesh depth: prepareMeshBatchPacket routes to f3d_build_mesh_batch_cull_depth_packet with 14 arguments', () => {
+  const camera = createBasicCamera();
+
+  // Mesh 1: depthTest=true, depthWrite=true, depthFunc=LessDepth (compare 2)
+  const mesh1 = createBasicTriangleMesh({
+    color: 0x0000ff,
+    side: THREE.DoubleSide,
+    depthTest: true,
+    depthWrite: true,
+    depthFunc: THREE.LessDepth,
+  });
+
+  // Mesh 2: depthTest=false, depthWrite=true, WebGPU backend -> effective depthWrite=true, depthCompare=ALWAYS (8)
+  const mesh2 = createBasicTriangleMesh({
+    color: 0x00ff00,
+    side: THREE.FrontSide,
+    depthTest: false,
+    depthWrite: true,
+  });
+
+  // Mesh 3: depthTest=true, depthWrite=false, depthFunc=GreaterDepth (compare 5)
+  const mesh3 = createBasicTriangleMesh({
+    color: 0xff0000,
+    side: THREE.BackSide,
+    depthTest: true,
+    depthWrite: false,
+    depthFunc: THREE.GreaterDepth,
+  });
+
+  // Mesh 4: depthTest=false, depthWrite=false -> depthCompare=ALWAYS (8)
+  const mesh4 = createBasicTriangleMesh({
+    color: 0xffff00,
+    side: THREE.FrontSide,
+    depthTest: false,
+    depthWrite: false,
+  });
+
+  let capturedArgs = null;
+  const mockWasm = {
+    f3d_build_mesh_batch_cull_depth_packet: (
+      flatPos, vCounts, mvs, proj, cols, cModes, fFaces, dTests, dWrites, dCompares, w, h, wd, canvas
+    ) => {
+      capturedArgs = {
+        vCounts: Array.from(vCounts),
+        cModes: Array.from(cModes),
+        fFaces: Array.from(fFaces),
+        dTests: Array.from(dTests),
+        dWrites: Array.from(dWrites),
+        dCompares: Array.from(dCompares),
+        w, h, wd, canvas,
+      };
+      return new Uint8Array([0xDE, 0xAD]);
+    },
+  };
+
+  const res = prepareMeshBatchPacket(
+    [mesh1, mesh2, mesh3, mesh4],
+    camera,
+    64,
+    64,
+    mockWasm,
+    { sourceBackend: 'webgpu', target: 'offscreen' }
+  );
+
+  assert.equal(res.meshCount, 4);
+  assert.deepEqual(capturedArgs.vCounts, [3, 3, 3, 3]);
+  assert.deepEqual(capturedArgs.cModes, [CULL_MODE_WIRE.NONE, CULL_MODE_WIRE.BACK, CULL_MODE_WIRE.BACK, CULL_MODE_WIRE.BACK]);
+  assert.deepEqual(capturedArgs.fFaces, [FRONT_FACE_WIRE.CCW, FRONT_FACE_WIRE.CCW, FRONT_FACE_WIRE.CW, FRONT_FACE_WIRE.CCW]);
+  assert.deepEqual(capturedArgs.dTests, [1, 0, 1, 0]);
+  assert.deepEqual(capturedArgs.dWrites, [1, 1, 0, 0]);
+  assert.deepEqual(capturedArgs.dCompares, [
+    DEPTH_WIRE_COMPARE.LESS,
+    DEPTH_WIRE_COMPARE.ALWAYS,
+    DEPTH_WIRE_COMPARE.GREATER,
+    DEPTH_WIRE_COMPARE.ALWAYS,
+  ]);
+  assert.equal(capturedArgs.canvas, false);
+});
+
+test('Mixed per-mesh depth: WebGL backend resolves depthWrite=false when depthTest=false', () => {
+  const camera = createBasicCamera();
+
+  const mesh1 = createBasicTriangleMesh({
+    depthTest: true,
+    depthWrite: true,
+    depthFunc: THREE.LessEqualDepth,
+  });
+
+  const mesh2 = createBasicTriangleMesh({
+    depthTest: false,
+    depthWrite: true, // under WebGL, depthTest=false suppresses hardware depth writes
+  });
+
+  let capturedArgs = null;
+  const mockWasm = {
+    f3d_build_mesh_batch_cull_depth_packet: (
+      flatPos, vCounts, mvs, proj, cols, cModes, fFaces, dTests, dWrites, dCompares, w, h, wd, canvas
+    ) => {
+      capturedArgs = {
+        dTests: Array.from(dTests),
+        dWrites: Array.from(dWrites),
+        dCompares: Array.from(dCompares),
+      };
+      return new Uint8Array([0x01]);
+    },
+  };
+
+  prepareMeshBatchPacket(
+    [mesh1, mesh2],
+    camera,
+    64,
+    64,
+    mockWasm,
+    { sourceBackend: 'webgl' }
+  );
+
+  assert.deepEqual(capturedArgs.dTests, [1, 0]);
+  assert.deepEqual(capturedArgs.dWrites, [1, 0]); // Mesh 2 resolved to 0 under WebGL!
+  assert.deepEqual(capturedArgs.dCompares, [DEPTH_WIRE_COMPARE.LESS_EQUAL, DEPTH_WIRE_COMPARE.ALWAYS]);
+});
+
+test('Mixed per-mesh depth: Safe refusal with INCOMPATIBLE_BATCH_DEPTH when cull_depth export is missing', () => {
+  const camera = createBasicCamera();
+
+  const mesh1 = createDepthTriangleMesh({ depthWrite: true });
+  const mesh2 = createDepthTriangleMesh({ depthWrite: false });
+
+  // Only legacy exports available
+  const mockWasmLegacy = {
+    f3d_build_mesh_batch_cull_packet: () => new Uint8Array(0),
+    f3d_build_mesh_batch_packet: () => new Uint8Array(0),
+  };
+
+  assert.throws(
+    () => prepareMeshBatchPacket([mesh1, mesh2], camera, 64, 64, mockWasmLegacy),
+    (err) => err.reason === 'INCOMPATIBLE_BATCH_DEPTH' && err.message.includes('INCOMPATIBLE_BATCH_DEPTH')
+  );
+
+  // But uniform depth batch succeeds on legacy Wasm
+  let cullPacketCalled = false;
+  const mockWasmUniform = {
+    f3d_build_mesh_batch_cull_packet: () => {
+      cullPacketCalled = true;
+      return new Uint8Array([0x55]);
+    },
+  };
+  const res = prepareMeshBatchPacket([mesh1, mesh1], camera, 64, 64, mockWasmUniform);
+  assert.equal(cullPacketCalled, true);
+  assert.equal(res.meshCount, 2);
+});
+
+test('Mixed per-mesh depth: renderScene admits mixed depth meshes when cull_depth export is present', async () => {
+  const scene = new THREE.Scene();
+  const camera = createBasicCamera();
+
+  const meshWriter = createBasicTriangleMesh({
+    color: 0x0000ff,
+    depthTest: true,
+    depthWrite: true,
+    depthFunc: THREE.LessDepth,
+  });
+
+  const meshOverlay = createBasicTriangleMesh({
+    color: 0x00ff00,
+    depthTest: false,
+    depthWrite: false,
+  });
+
+  scene.add(meshWriter);
+  scene.add(meshOverlay);
+
+  let capturedArgs = null;
+  const mockWasm = {
+    f3d_build_mesh_batch_cull_depth_packet: (
+      flatPos, vCounts, mvs, proj, cols, cModes, fFaces, dTests, dWrites, dCompares, w, h, wd, canvas
+    ) => {
+      capturedArgs = {
+        dTests: Array.from(dTests),
+        dWrites: Array.from(dWrites),
+        dCompares: Array.from(dCompares),
+      };
+      return new Uint8Array([0x99]);
+    },
+  };
+
+  let executed = false;
+  const mockBridgeHost = {
+    executePacket: async (bytes) => {
+      executed = true;
+      assert.deepEqual(bytes, new Uint8Array([0x99]));
+      return { status: 'OK' };
+    },
+  };
+
+  const res = await renderScene(mockBridgeHost, scene, camera, null, mockWasm);
+
+  assert.equal(executed, true);
+  assert.equal(res.refused.length, 0);
+  assert.equal(res.admitted.length, 2);
+  assert.deepEqual(capturedArgs.dTests, [1, 0]);
+  assert.deepEqual(capturedArgs.dWrites, [1, 0]);
+  assert.deepEqual(capturedArgs.dCompares, [DEPTH_WIRE_COMPARE.LESS, DEPTH_WIRE_COMPARE.ALWAYS]);
+});
+
+test('Mixed per-mesh depth: renderScene safely refuses with INCOMPATIBLE_BATCH_DEPTH when cull_depth export is missing', async () => {
+  const scene = new THREE.Scene();
+  const camera = createBasicCamera();
+
+  const meshA = createDepthTriangleMesh({ depthWrite: true });
+  const meshB = createDepthTriangleMesh({ depthWrite: false });
+  scene.add(meshA);
+  scene.add(meshB);
+
+  // Wasm only has legacy f3d_build_mesh_batch_cull_packet
+  const mockWasmNoDepthBatch = {
+    f3d_build_mesh_batch_cull_packet: () => new Uint8Array(0),
+  };
+
+  const mockBridgeHost = {
+    executePacket: async () => {
+      throw new Error('should not be called');
+    },
+  };
+
+  const res = await renderScene(mockBridgeHost, scene, camera, null, mockWasmNoDepthBatch);
+
+  assert.equal(res.admitted.length, 0);
+  assert.equal(res.refused.length, 1);
+  assert.equal(res.reason, 'INCOMPATIBLE_BATCH_DEPTH');
+});
+
+test('Mixed per-mesh depth: renderScene refuses with AMBIGUOUS_DEPTH_PAIR when mesh has depthTest=false and depthWrite=true without sourceBackend', async () => {
+  const scene = new THREE.Scene();
+  const camera = createBasicCamera();
+
+  const meshAmbiguous = createBasicTriangleMesh({
+    depthTest: false,
+    depthWrite: true,
+  });
+  scene.add(meshAmbiguous);
+
+  const mockWasm = {
+    f3d_build_mesh_batch_cull_depth_packet: () => new Uint8Array(0),
+  };
+
+  const mockBridgeHost = {
+    executePacket: async () => {
+      throw new Error('should not be called');
+    },
+  };
+
+  const res = await renderScene(mockBridgeHost, scene, camera, null, mockWasm);
+
+  assert.equal(res.admitted.length, 0);
+  assert.equal(res.refused.length, 1);
+  assert.equal(res.reason, 'AMBIGUOUS_DEPTH_PAIR');
+});
+
+test('Single-mesh canvas routing: renderMesh admits sided N=1 with cull-depth/cull-only exports without requiring legacy canvas exports', async () => {
+  const camera = createBasicCamera();
+  const frontMesh = createBasicTriangleMesh({ side: THREE.FrontSide });
+  const backMesh = createBasicTriangleMesh({ side: THREE.BackSide });
+  const doubleMesh = createBasicTriangleMesh({ side: THREE.DoubleSide });
+
+  const mockCanvasContext = {
+    canvas: { width: 128, height: 128 },
+  };
+
+  // 1. Sided FrontSide mesh with f3d_build_mesh_batch_cull_depth_packet (no legacy canvas export)
+  let capturedArgs = null;
+  let executedContext = null;
+  const mockBridgeHost = {
+    executePacket: async (bytes, ctx) => {
+      executedContext = ctx;
+      return { status: 'OK' };
+    },
+  };
+
+  const mockWasmCullDepth = {
+    f3d_build_mesh_batch_cull_depth_packet: (
+      flatPos, vCounts, mvs, proj, cols, cModes, fFaces, dTests, dWrites, dCompares, w, h, wd, canvas
+    ) => {
+      capturedArgs = { vCounts, cModes, fFaces, w, h, canvas };
+      return new Uint8Array([0x01, 0x02]);
+    },
+  };
+
+  const resFrontDepth = await renderMesh(mockBridgeHost, frontMesh, camera, mockCanvasContext, mockWasmCullDepth);
+  assert.equal(resFrontDepth.target, 'canvas');
+  assert.equal(executedContext, mockCanvasContext);
+  assert.equal(capturedArgs.canvas, true);
+  assert.equal(capturedArgs.vCounts.length, 1);
+  assert.equal(capturedArgs.w, 128);
+  assert.equal(capturedArgs.h, 128);
+
+  // 2. Sided BackSide mesh with f3d_build_mesh_batch_cull_packet (no legacy canvas export)
+  let capturedArgsCull = null;
+  const mockWasmCull = {
+    f3d_build_mesh_batch_cull_packet: (
+      flatPos, vCounts, mvs, proj, cols, cModes, fFaces, w, h, wd, dt, dw, dc, canvas
+    ) => {
+      capturedArgsCull = { vCounts, cModes, fFaces, w, h, canvas };
+      return new Uint8Array([0x03, 0x04]);
+    },
+  };
+
+  const resBackCull = await renderMesh(mockBridgeHost, backMesh, camera, mockCanvasContext, mockWasmCull);
+  assert.equal(resBackCull.target, 'canvas');
+  assert.equal(capturedArgsCull.canvas, true);
+
+  // 3. DoubleSide mesh strictly refuses when only cull exports exist (no legacy canvas export)
+  await assert.rejects(
+    async () => {
+      await renderMesh(mockBridgeHost, doubleMesh, camera, mockCanvasContext, mockWasmCullDepth);
+    },
+    {
+      name: 'Error',
+      message: /canvasContext provided for visible canvas rendering, but wasmModule does not export f3d_build_canvas_mesh_packet/,
+    }
+  );
+
+  // 4. Sided mesh strictly refuses when neither cull export nor canvas export exists
+  const mockWasmOffscreenOnly = {
+    f3d_build_mesh_packet: () => new Uint8Array(0),
+  };
+  await assert.rejects(
+    async () => {
+      await renderMesh(mockBridgeHost, frontMesh, camera, mockCanvasContext, mockWasmOffscreenOnly);
+    },
+    {
+      name: 'Error',
+      message: /canvasContext provided for visible canvas rendering, but wasmModule does not export f3d_build_canvas_mesh_packet/,
+    }
+  );
+});
+
+test('colorWrite: prepareMeshBatchPacket admits colorWrite=false when f3d_build_mesh_batch_cull_depth_color_packet is present', () => {
+  const camera = createBasicCamera();
+  const occluder = createDepthTriangleMesh({ colorWrite: false, depthWrite: true });
+  const visibleMesh = createDepthTriangleMesh({ colorWrite: true, depthWrite: true });
+
+  let capturedColorWrites = null;
+  const mockWasm = {
+    f3d_build_mesh_batch_cull_depth_color_packet: (
+      pos, vCounts, mvs, proj, cols, cModes, fFaces, dTests, dWrites, dCompares, cWrites, w, h, wd, canvas
+    ) => {
+      capturedColorWrites = Array.from(cWrites);
+      return new Uint8Array([0xAA]);
+    },
+  };
+
+  const res = prepareMeshBatchPacket([occluder, visibleMesh], camera, 64, 64, mockWasm);
+  assert.deepEqual(capturedColorWrites, [0, 1]);
+  assert.deepEqual(Array.from(res.colorWrites), [0, 1]);
+  assert.equal(res.meshCount, 2);
+});
+
+test('colorWrite: prepareMeshBatchPacket refuses with INCOMPATIBLE_COLOR_WRITE when export is missing', () => {
+  const camera = createBasicCamera();
+  const occluder = createDepthTriangleMesh({ colorWrite: false });
+
+  // Only older cull_depth export available
+  const mockWasmLegacy = {
+    f3d_build_mesh_batch_cull_depth_packet: () => new Uint8Array(0),
+  };
+
+  assert.throws(
+    () => prepareMeshBatchPacket([occluder], camera, 64, 64, mockWasmLegacy),
+    (err) => err.reason === 'INCOMPATIBLE_COLOR_WRITE' && err.message.includes('INCOMPATIBLE_COLOR_WRITE')
+  );
+});
+
+test('colorWrite: renderScene admits mixed colorWrite meshes when export is present', async () => {
+  const scene = new THREE.Scene();
+  const camera = createBasicCamera();
+  const occluder = createDepthTriangleMesh({ colorWrite: false });
+  const visible = createDepthTriangleMesh({ colorWrite: true });
+  scene.add(occluder);
+  scene.add(visible);
+
+  let executed = false;
+  let capturedColorWrites = null;
+  const mockWasm = {
+    f3d_build_mesh_batch_cull_depth_color_packet: (
+      pos, vCounts, mvs, proj, cols, cModes, fFaces, dTests, dWrites, dCompares, cWrites, w, h, wd, canvas
+    ) => {
+      capturedColorWrites = Array.from(cWrites);
+      return new Uint8Array([0xBB]);
+    },
+  };
+  const mockBridgeHost = {
+    executePacket: async (bytes) => {
+      executed = true;
+      return { status: 'OK' };
+    },
+  };
+
+  const res = await renderScene(mockBridgeHost, scene, camera, null, mockWasm);
+  assert.equal(executed, true);
+  assert.equal(res.refused.length, 0);
+  assert.equal(res.admitted.length, 2);
+  assert.ok(capturedColorWrites !== null);
+});
+
+test('colorWrite: renderScene safely refuses with INCOMPATIBLE_COLOR_WRITE when export is missing', async () => {
+  const scene = new THREE.Scene();
+  const camera = createBasicCamera();
+  const occluder = createDepthTriangleMesh({ colorWrite: false });
+  scene.add(occluder);
+
+  // Wasm lacking cull_depth_color export
+  const mockWasmLegacy = {
+    f3d_build_mesh_batch_cull_depth_packet: () => new Uint8Array(0),
+  };
+  const mockBridgeHost = {
+    executePacket: async () => {
+      throw new Error('should not be called');
+    },
+  };
+
+  const res = await renderScene(mockBridgeHost, scene, camera, null, mockWasmLegacy);
+  assert.equal(res.admitted.length, 0);
+  assert.equal(res.refused.length, 1);
+  assert.equal(res.reason, 'INCOMPATIBLE_COLOR_WRITE');
+});
+
+test('colorWrite: single-mesh buildSingleMeshCullPacket passes colorWrites and refuses on missing export', () => {
+  const camera = createBasicCamera();
+  const occluder = createDepthTriangleMesh({ colorWrite: false });
+  const snap = extractMeshRenderData(occluder, camera, 64, 64);
+
+  // Missing export throws INCOMPATIBLE_COLOR_WRITE
+  const mockWasmLegacy = {
+    f3d_build_mesh_batch_cull_depth_packet: () => new Uint8Array(0),
+  };
+  assert.throws(
+    () => buildSingleMeshCullPacket(snap, 64, 64, mockWasmLegacy, false),
+    (err) => err.reason === 'INCOMPATIBLE_COLOR_WRITE'
+  );
+
+  // Present export captures colorWrites = [0]
+  let capturedColor = null;
+  const mockWasm = {
+    f3d_build_mesh_batch_cull_depth_color_packet: (
+      p, v, m, pr, c, cm, ff, dt, dw, dc, cw, w, h, wd, cv
+    ) => {
+      capturedColor = Array.from(cw);
+      return new Uint8Array([0xCC]);
+    },
+  };
+  const pkt = buildSingleMeshCullPacket(snap, 64, 64, mockWasm, false);
+  assert.deepEqual(capturedColor, [0]);
+  assert.deepEqual(pkt, new Uint8Array([0xCC]));
 });

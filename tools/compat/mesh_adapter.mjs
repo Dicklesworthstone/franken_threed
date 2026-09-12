@@ -5,7 +5,7 @@
  * Extracts dynamic input from real pinned Three.js Mesh + Camera instances into
  * isolated typed arrays for the Wasm/WebGPU execution core:
  * - BufferGeometry position (itemSize 3, non-interleaved, unnormalized) + optional index + drawRange
- * - Opaque untextured MeshBasicMaterial color (Float32Array[4]), DoubleSide only
+ * - Opaque untextured MeshBasicMaterial color (Float32Array[4]), with material-side culling
  * - Dynamic depth state: depthTest, depthWrite, and depthFunc mapped to wire compare codes 1..8
  * - f64 model-view and projection matrices with WebGL-to-WebGPU depth coordinate tracking
  *
@@ -53,7 +53,8 @@ export const ADMISSION_REJECTION = Object.freeze({
   UNSUPPORTED_GEOMETRY: 'UNSUPPORTED_GEOMETRY: Morph targets and multiple geometry groups are not supported in this slice',
   INVALID_MATERIAL: 'INVALID_MATERIAL: Material must be an instance of THREE.MeshBasicMaterial',
   UNSUPPORTED_MATERIAL: 'UNSUPPORTED_MATERIAL: Textured maps, transparency, wireframe, or custom blending are not supported in this slice',
-  UNSUPPORTED_MATERIAL_FEATURE: 'UNSUPPORTED_MATERIAL_FEATURE: vertexColors, colorWrite=false, clippingPlanes, alphaTest/alphaHash, or custom shader hooks are not supported in this slice',
+  UNSUPPORTED_MATERIAL_FEATURE: 'UNSUPPORTED_MATERIAL_FEATURE: vertexColors, clippingPlanes, alphaTest/alphaHash, or custom shader hooks are not supported in this slice',
+  INCOMPATIBLE_COLOR_WRITE: 'INCOMPATIBLE_COLOR_WRITE: Meshes with colorWrite=false require Wasm export f3d_build_mesh_batch_cull_depth_color_packet',
   UNSUPPORTED_DEPTH: 'UNSUPPORTED_DEPTH: Material must have depthTest === false and depthWrite === false in this slice (pipeline has no depth buffer)',
   UNSUPPORTED_STENCIL: 'UNSUPPORTED_STENCIL: Stencil operations are not supported in this slice (material.stencilWrite === true)',
   UNSUPPORTED_POLYGON_OFFSET: 'UNSUPPORTED_POLYGON_OFFSET: Polygon offset is not supported in this slice (material.polygonOffset === true)',
@@ -69,7 +70,7 @@ export const ADMISSION_REJECTION = Object.freeze({
   INDEX_OUT_OF_BOUNDS: 'INDEX_OUT_OF_BOUNDS: Index references vertex out of bounds',
   INVALID_DRAWRANGE: 'INVALID_DRAWRANGE: Invalid drawRange: start and count must be non-negative integers',
   EMPTY_MESH_BATCH: 'EMPTY_MESH_BATCH: Mesh batch must be a non-empty array of meshes',
-  INCOMPATIBLE_BATCH_DEPTH: 'INCOMPATIBLE_BATCH_DEPTH: Meshes in batch have incompatible depth settings; all meshes in batch must share depthTest, depthWrite, and depthCompare',
+  INCOMPATIBLE_BATCH_DEPTH: 'INCOMPATIBLE_BATCH_DEPTH: Meshes in batch have incompatible depth settings for the available legacy Wasm exports; mixed settings require f3d_build_mesh_batch_cull_depth_packet',
   UNSUPPORTED_RENDERABLE: 'UNSUPPORTED_RENDERABLE: Non-mesh renderable objects (Line, Points, Sprite, Light) are not supported in this slice',
   UNSUPPORTED_SCENE_FEATURE: 'UNSUPPORTED_SCENE_FEATURE: Scene-level features (background, fog, overrideMaterial, environment) are not supported in this slice',
 });
@@ -396,9 +397,6 @@ export function canAdmitMesh(mesh, camera, options = {}) {
   if (material.vertexColors === true) {
     return rejectMesh('UNSUPPORTED_MATERIAL_FEATURE');
   }
-  if (material.colorWrite === false) {
-    return rejectMesh('UNSUPPORTED_MATERIAL_FEATURE');
-  }
   if (material.clippingPlanes && material.clippingPlanes.length > 0) {
     return rejectMesh('UNSUPPORTED_MATERIAL_FEATURE');
   }
@@ -595,7 +593,8 @@ export function extractMeshRenderData(mesh, camera, width, height, options = {})
     mat.opacity ?? 1.0,
   ]);
 
-  // Material Depth Settings
+  // Material Color & Depth Settings
+  const colorWrite = mat.colorWrite !== false;
   const depthTest = mat.depthTest !== false;
   const rawDepthWrite = mat.depthWrite !== false;
   const rawDepthFunc = mat.depthFunc ?? LessEqualDepth;
@@ -648,6 +647,7 @@ export function extractMeshRenderData(mesh, camera, width, height, options = {})
     modelView,
     projection,
     color,
+    colorWrite,
     width,
     height,
     webglDepth,
@@ -671,8 +671,22 @@ export function extractMeshRenderData(mesh, camera, width, height, options = {})
  * Invariant: Never falls back to no-cull Wasm entry point for non-DoubleSide meshes.
  */
 function buildSingleMeshCullPacket(snapshot, width, height, wasmModule, isCanvas, options = {}) {
+  const cullDepthColorBatchFn = wasmModule?.f3d_build_mesh_batch_cull_depth_color_packet;
+  const cullDepthBatchFn = wasmModule?.f3d_build_mesh_batch_cull_depth_packet;
   const cullBatchFn = wasmModule?.f3d_build_mesh_batch_cull_packet;
-  if (typeof cullBatchFn !== 'function') {
+
+  if (snapshot.colorWrite === false && typeof cullDepthColorBatchFn !== 'function') {
+    throw createAdmissionError(
+      'INCOMPATIBLE_COLOR_WRITE',
+      'Meshes with colorWrite=false require Wasm export f3d_build_mesh_batch_cull_depth_color_packet'
+    );
+  }
+
+  if (
+    typeof cullDepthColorBatchFn !== 'function' &&
+    typeof cullDepthBatchFn !== 'function' &&
+    typeof cullBatchFn !== 'function'
+  ) {
     throw createAdmissionError(
       'MISSING_CULL_EXPORT',
       `wasmModule is missing f3d_build_mesh_batch_cull_packet export for side ${snapshot.side}. Silent DoubleSide fallback is strictly forbidden.`
@@ -691,6 +705,52 @@ function buildSingleMeshCullPacket(snapshot, width, height, wasmModule, isCanvas
   const vertexCounts = new Uint32Array([vertexCount]);
   const cullModes = new Uint8Array([snapshot.cullMode]);
   const frontFaces = new Uint8Array([snapshot.frontFace]);
+
+  if (typeof cullDepthColorBatchFn === 'function') {
+    const depthTests = new Uint8Array([snapshot.depthTest ? 1 : 0]);
+    const depthWrites = new Uint8Array([snapshot.depthWrite ? 1 : 0]);
+    const depthCompares = new Uint32Array([snapshot.depthCompare]);
+    const colorWrites = new Uint8Array([snapshot.colorWrite ? 1 : 0]);
+    return cullDepthColorBatchFn(
+      positionsToUse,
+      vertexCounts,
+      snapshot.modelView,
+      snapshot.projection,
+      snapshot.color,
+      cullModes,
+      frontFaces,
+      depthTests,
+      depthWrites,
+      depthCompares,
+      colorWrites,
+      width,
+      height,
+      snapshot.webglDepth,
+      isCanvas
+    );
+  }
+
+  if (typeof cullDepthBatchFn === 'function') {
+    const depthTests = new Uint8Array([snapshot.depthTest ? 1 : 0]);
+    const depthWrites = new Uint8Array([snapshot.depthWrite ? 1 : 0]);
+    const depthCompares = new Uint32Array([snapshot.depthCompare]);
+    return cullDepthBatchFn(
+      positionsToUse,
+      vertexCounts,
+      snapshot.modelView,
+      snapshot.projection,
+      snapshot.color,
+      cullModes,
+      frontFaces,
+      depthTests,
+      depthWrites,
+      depthCompares,
+      width,
+      height,
+      snapshot.webglDepth,
+      isCanvas
+    );
+  }
 
   return cullBatchFn(
     positionsToUse,
@@ -1005,12 +1065,20 @@ export async function renderMesh(bridgeHost, mesh, camera, canvasContext, wasmMo
   const isCanvasTarget = canvasContext !== null && canvasContext !== undefined;
 
   if (isCanvasTarget) {
-    const hasCanvasExport = wasmModule && (
+    const side = mesh?.material?.side ?? THREE_SIDE.FRONT_SIDE;
+    const isSidedMesh = side !== THREE_SIDE.DOUBLE_SIDE;
+    const hasSidedCanvasExport = wasmModule && (
+      typeof wasmModule.f3d_build_mesh_batch_cull_depth_color_packet === 'function' ||
+      typeof wasmModule.f3d_build_mesh_batch_cull_depth_packet === 'function' ||
+      typeof wasmModule.f3d_build_mesh_batch_cull_packet === 'function'
+    );
+    const hasLegacyCanvasExport = wasmModule && (
       typeof wasmModule.f3d_build_canvas_mesh_packet === 'function' ||
       typeof wasmModule.f3d_build_canvas_mesh_depth_packet === 'function' ||
       typeof wasmModule.gpu_bridge_build_canvas_mesh_packet === 'function' ||
       typeof wasmModule.gpu_bridge_build_canvas_mesh_depth_packet === 'function'
     );
+    const hasCanvasExport = (isSidedMesh && hasSidedCanvasExport) || hasLegacyCanvasExport;
     if (!hasCanvasExport) {
       throw new Error(
         'renderMesh refused: canvasContext provided for visible canvas rendering, but wasmModule ' +
@@ -1083,12 +1151,19 @@ export function prepareMeshBatchPacket(meshes, camera, width, height, wasmModule
     }
   }
 
+  const cullDepthColorBatchFn = wasmModule?.f3d_build_mesh_batch_cull_depth_color_packet;
+  const cullDepthBatchFn = wasmModule?.f3d_build_mesh_batch_cull_depth_packet;
   const cullBatchFn = wasmModule?.f3d_build_mesh_batch_cull_packet;
   const legacyBatchFn = wasmModule?.f3d_build_mesh_batch_packet;
 
-  if (typeof cullBatchFn !== 'function' && typeof legacyBatchFn !== 'function') {
+  if (
+    typeof cullDepthColorBatchFn !== 'function' &&
+    typeof cullDepthBatchFn !== 'function' &&
+    typeof cullBatchFn !== 'function' &&
+    typeof legacyBatchFn !== 'function'
+  ) {
     throw new Error(
-      'Mesh batch packet preparation failed: wasmModule is missing f3d_build_mesh_batch_packet or f3d_build_mesh_batch_cull_packet export.'
+      'Mesh batch packet preparation failed: wasmModule is missing f3d_build_mesh_batch_packet, f3d_build_mesh_batch_cull_packet, f3d_build_mesh_batch_cull_depth_packet, or f3d_build_mesh_batch_cull_depth_color_packet export.'
     );
   }
 
@@ -1104,45 +1179,54 @@ export function prepareMeshBatchPacket(meshes, camera, width, height, wasmModule
     }
   });
 
-  // Verify shared batch pipeline configuration: depthTest, depthWrite, depthCompare, webglDepth
+  const hasColorWriteDisabled = snapshots.some(s => s.colorWrite === false);
+  if (hasColorWriteDisabled && typeof cullDepthColorBatchFn !== 'function') {
+    throw createAdmissionError(
+      'INCOMPATIBLE_COLOR_WRITE',
+      'Meshes with colorWrite=false require Wasm export f3d_build_mesh_batch_cull_depth_color_packet'
+    );
+  }
+
+  // Verify shared batch pipeline configuration: webglDepth (camera coordinate system)
+  // and check for mixed depth settings across meshes
   const first = snapshots[0];
   const sharedDepthTest = first.depthTest;
   const sharedDepthWrite = first.depthWrite;
   const sharedDepthCompare = first.depthCompare;
   const sharedWebglDepth = first.webglDepth;
 
+  let firstDepthMismatch = '';
   for (let i = 1; i < snapshots.length; i++) {
     const s = snapshots[i];
-    if (s.depthTest !== sharedDepthTest) {
-      throw createAdmissionError(
-        'INCOMPATIBLE_BATCH_DEPTH',
-        `mesh 0 has depthTest=${sharedDepthTest}, mesh ${i} has depthTest=${s.depthTest}`
-      );
-    }
-    if (s.depthWrite !== sharedDepthWrite) {
-      throw createAdmissionError(
-        'INCOMPATIBLE_BATCH_DEPTH',
-        `mesh 0 has depthWrite=${sharedDepthWrite}, mesh ${i} has depthWrite=${s.depthWrite}`
-      );
-    }
-    if (s.depthCompare !== sharedDepthCompare) {
-      throw createAdmissionError(
-        'INCOMPATIBLE_BATCH_DEPTH',
-        `mesh 0 has depthCompare=${sharedDepthCompare}, mesh ${i} has depthCompare=${s.depthCompare}`
-      );
-    }
     if (s.webglDepth !== sharedWebglDepth) {
       throw createAdmissionError(
         'INCOMPATIBLE_BATCH_DEPTH',
         `mesh 0 has webglDepth=${sharedWebglDepth}, mesh ${i} has webglDepth=${s.webglDepth}`
       );
     }
+    const field = s.depthTest !== sharedDepthTest ? 'depthTest'
+      : s.depthWrite !== sharedDepthWrite ? 'depthWrite'
+      : s.depthCompare !== sharedDepthCompare ? 'depthCompare' : null;
+    if (field && !firstDepthMismatch) {
+      firstDepthMismatch = `mesh 0 has ${field}=${first[field]}, mesh ${i} has ${field}=${s[field]}`;
+    }
   }
 
-  // Material side / cull checks and typed array creation
+  if (firstDepthMismatch && typeof cullDepthBatchFn !== 'function') {
+    throw createAdmissionError(
+      'INCOMPATIBLE_BATCH_DEPTH',
+      `${firstDepthMismatch}; wasmModule lacks f3d_build_mesh_batch_cull_depth_packet export. Silent uniform-depth fallback is strictly forbidden.`
+    );
+  }
+
+  // Material side / cull / depth checks and typed array creation
   const n = snapshots.length;
   const cullModes = new Uint8Array(n);
   const frontFaces = new Uint8Array(n);
+  const depthTests = new Uint8Array(n);
+  const depthWrites = new Uint8Array(n);
+  const depthCompares = new Uint32Array(n);
+  const colorWrites = new Uint8Array(n);
   let hasNonDoubleSide = false;
 
   for (let i = 0; i < n; i++) {
@@ -1158,9 +1242,13 @@ export function prepareMeshBatchPacket(meshes, camera, width, height, wasmModule
     }
     cullModes[i] = s.cullMode;
     frontFaces[i] = s.frontFace;
+    depthTests[i] = s.depthTest ? 1 : 0;
+    depthWrites[i] = s.depthWrite ? 1 : 0;
+    depthCompares[i] = s.depthCompare;
+    colorWrites[i] = s.colorWrite ? 1 : 0;
   }
 
-  if (hasNonDoubleSide && typeof cullBatchFn !== 'function') {
+  if (hasNonDoubleSide && typeof cullDepthColorBatchFn !== 'function' && typeof cullDepthBatchFn !== 'function' && typeof cullBatchFn !== 'function') {
     throw createAdmissionError(
       'MISSING_CULL_EXPORT',
       'Mesh batch contains FrontSide or BackSide meshes, but wasmModule is missing f3d_build_mesh_batch_cull_packet export. Silent DoubleSide fallback is strictly forbidden.'
@@ -1196,7 +1284,42 @@ export function prepareMeshBatchPacket(meshes, camera, width, height, wasmModule
 
   let packetBytes;
   try {
-    if (typeof cullBatchFn === 'function') {
+    if (typeof cullDepthColorBatchFn === 'function') {
+      packetBytes = cullDepthColorBatchFn(
+        flatPositions,
+        vertexCounts,
+        modelViews,
+        projection,
+        colors,
+        cullModes,
+        frontFaces,
+        depthTests,
+        depthWrites,
+        depthCompares,
+        colorWrites,
+        width,
+        height,
+        sharedWebglDepth,
+        isCanvas,
+      );
+    } else if (typeof cullDepthBatchFn === 'function') {
+      packetBytes = cullDepthBatchFn(
+        flatPositions,
+        vertexCounts,
+        modelViews,
+        projection,
+        colors,
+        cullModes,
+        frontFaces,
+        depthTests,
+        depthWrites,
+        depthCompares,
+        width,
+        height,
+        sharedWebglDepth,
+        isCanvas,
+      );
+    } else if (typeof cullBatchFn === 'function') {
       packetBytes = cullBatchFn(
         flatPositions,
         vertexCounts,
@@ -1244,6 +1367,9 @@ export function prepareMeshBatchPacket(meshes, camera, width, height, wasmModule
     if (msg.includes('INVALID_FRONT_FACE')) {
       throw createAdmissionError('INVALID_FRONT_FACE', msg);
     }
+    if (msg.includes('INVALID_COLOR_WRITE') || msg.includes('InvalidColorWrite')) {
+      throw createAdmissionError('INCOMPATIBLE_COLOR_WRITE', msg);
+    }
     throw err;
   }
 
@@ -1254,6 +1380,10 @@ export function prepareMeshBatchPacket(meshes, camera, width, height, wasmModule
     totalVertices,
     cullModes,
     frontFaces,
+    depthTests,
+    depthWrites,
+    depthCompares,
+    colorWrites,
     target: isCanvas ? 'canvas' : 'offscreen',
   };
 }
@@ -1301,6 +1431,9 @@ export async function renderMeshBatch(bridgeHost, meshes, camera, canvasContext,
     totalVertices: batchResult.totalVertices,
     cullModes: batchResult.cullModes,
     frontFaces: batchResult.frontFaces,
+    depthTests: batchResult.depthTests,
+    depthWrites: batchResult.depthWrites,
+    depthCompares: batchResult.depthCompares,
     target: batchResult.target,
   };
 }
@@ -1466,8 +1599,13 @@ export async function renderScene(bridgeHost, scene, camera, canvasContext, wasm
     }
   });
 
-  // Verify shared batch pipeline configuration across admitted meshes in scene
-  if (admittedItems.length > 1) {
+  // Verify shared batch pipeline configuration across admitted meshes in scene:
+  // If wasmModule lacks per-mesh depth export, refuse mixed depth settings;
+  // if per-mesh depth export is present, admit mixed depth into the batch.
+  const hasStateExport =
+    wasmModule && typeof wasmModule.f3d_build_mesh_batch_cull_depth_packet === 'function';
+
+  if (!hasStateExport && admittedItems.length > 1) {
     const firstMat = admittedItems[0].mesh.material;
     const sharedDepthTest = firstMat?.depthTest !== false;
     const sharedDepthWrite = firstMat?.depthWrite !== false;
@@ -1484,6 +1622,24 @@ export async function renderScene(bridgeHost, scene, camera, canvasContext, wasm
           admittedItems[i].mesh.uuid,
           'INCOMPATIBLE_BATCH_DEPTH',
           `${ADMISSION_REJECTION.INCOMPATIBLE_BATCH_DEPTH}: scene meshes have conflicting depth settings`
+        ));
+      }
+    }
+  }
+
+  // Verify colorWrite export availability across admitted meshes in scene:
+  // If wasmModule lacks f3d_build_mesh_batch_cull_depth_color_packet, refuse meshes with colorWrite=false
+  const hasColorExport =
+    wasmModule && typeof wasmModule.f3d_build_mesh_batch_cull_depth_color_packet === 'function';
+
+  if (!hasColorExport) {
+    for (let i = 0; i < admittedItems.length; i++) {
+      const mat = admittedItems[i].mesh.material;
+      if (mat?.colorWrite === false) {
+        refused.push(createRefusalItem(
+          admittedItems[i].mesh.uuid,
+          'INCOMPATIBLE_COLOR_WRITE',
+          `${ADMISSION_REJECTION.INCOMPATIBLE_COLOR_WRITE}: material.colorWrite=false requires f3d_build_mesh_batch_cull_depth_color_packet`
         ));
       }
     }
