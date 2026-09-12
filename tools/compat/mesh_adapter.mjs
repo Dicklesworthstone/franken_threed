@@ -39,30 +39,32 @@ const DEFAULT_OBJECT3D_ON_BEFORE_RENDER = Object3D.prototype.onBeforeRender;
 const DEFAULT_OBJECT3D_ON_AFTER_RENDER = Object3D.prototype.onAfterRender;
 
 export const ADMISSION_REJECTION = Object.freeze({
-  NOT_A_MESH: 'Object is not an instance of THREE.Mesh',
-  UNSUPPORTED_MESH_SUBCLASS: 'InstancedMesh, SkinnedMesh, and BatchedMesh are not supported in this scalar slice',
-  NOT_VISIBLE: 'Mesh is not visible (mesh.visible === false)',
-  MATERIAL_NOT_VISIBLE: 'Material is not visible (material.visible === false)',
-  UNSUPPORTED_CALLBACK: 'onBeforeRender and onAfterRender callbacks on mesh or material are not supported in this slice',
-  LAYER_MISMATCH: 'Camera layers do not intersect mesh layers (camera.layers.test(mesh.layers) === false)',
-  INVALID_GEOMETRY: 'Mesh geometry must be an instance of THREE.BufferGeometry',
-  MISSING_POSITION: 'BufferGeometry must have a "position" attribute with itemSize === 3',
-  UNSUPPORTED_ATTRIBUTE: 'Interleaved or normalized vertex attributes are not supported in this slice',
-  UNSUPPORTED_GEOMETRY: 'Morph targets and multiple geometry groups are not supported in this slice',
-  INVALID_MATERIAL: 'Material must be an instance of THREE.MeshBasicMaterial',
-  UNSUPPORTED_MATERIAL: 'Textured maps, transparency, wireframe, or custom blending are not supported in this slice',
-  UNSUPPORTED_MATERIAL_FEATURE: 'vertexColors, colorWrite=false, clippingPlanes, alphaTest/alphaHash, or custom shader hooks are not supported in this slice',
-  UNSUPPORTED_DEPTH: 'Material must have depthTest === false and depthWrite === false in this slice (pipeline has no depth buffer)',
-  UNSUPPORTED_STENCIL: 'Stencil operations are not supported in this slice (material.stencilWrite === true)',
-  UNSUPPORTED_POLYGON_OFFSET: 'Polygon offset is not supported in this slice (material.polygonOffset === true)',
-  UNSUPPORTED_REVERSED_DEPTH: 'Reversed depth buffer is not supported in this slice',
-  INVALID_DEPTH_FUNC: 'Invalid or unsupported depthFunc',
-  AMBIGUOUS_DEPTH_PAIR: 'Material with depthTest=false and depthWrite=true is ambiguous across backends (WebGL suppresses writes, WebGPU permits writes); provide options.sourceBackend ("webgl" | "webgpu")',
-  UNSUPPORTED_SIDE: 'Only DoubleSide (2) is supported in this slice (pipeline has no culling state)',
-  INVALID_CAMERA: 'Camera must be an instance of THREE.Camera with valid projectionMatrix and matrixWorldInverse',
-  INVALID_DIMENSIONS: 'Viewport dimensions must be positive integers',
-  INDEX_OUT_OF_BOUNDS: 'Index references vertex out of bounds',
-  INVALID_DRAWRANGE: 'Invalid drawRange: start and count must be non-negative integers',
+  NOT_A_MESH: 'NOT_A_MESH: Object is not an instance of THREE.Mesh',
+  UNSUPPORTED_MESH_SUBCLASS: 'UNSUPPORTED_MESH_SUBCLASS: InstancedMesh, SkinnedMesh, and BatchedMesh are not supported in this scalar slice',
+  NOT_VISIBLE: 'NOT_VISIBLE: Mesh is not visible (mesh.visible === false)',
+  MATERIAL_NOT_VISIBLE: 'MATERIAL_NOT_VISIBLE: Material is not visible (material.visible === false)',
+  UNSUPPORTED_CALLBACK: 'UNSUPPORTED_CALLBACK: onBeforeRender and onAfterRender callbacks on mesh or material are not supported in this slice',
+  LAYER_MISMATCH: 'LAYER_MISMATCH: Camera layers do not intersect mesh layers (camera.layers.test(mesh.layers) === false)',
+  INVALID_GEOMETRY: 'INVALID_GEOMETRY: Mesh geometry must be an instance of THREE.BufferGeometry',
+  MISSING_POSITION: 'MISSING_POSITION: BufferGeometry must have a "position" attribute with itemSize === 3',
+  UNSUPPORTED_ATTRIBUTE: 'UNSUPPORTED_ATTRIBUTE: Interleaved or normalized vertex attributes are not supported in this slice',
+  UNSUPPORTED_GEOMETRY: 'UNSUPPORTED_GEOMETRY: Morph targets and multiple geometry groups are not supported in this slice',
+  INVALID_MATERIAL: 'INVALID_MATERIAL: Material must be an instance of THREE.MeshBasicMaterial',
+  UNSUPPORTED_MATERIAL: 'UNSUPPORTED_MATERIAL: Textured maps, transparency, wireframe, or custom blending are not supported in this slice',
+  UNSUPPORTED_MATERIAL_FEATURE: 'UNSUPPORTED_MATERIAL_FEATURE: vertexColors, colorWrite=false, clippingPlanes, alphaTest/alphaHash, or custom shader hooks are not supported in this slice',
+  UNSUPPORTED_DEPTH: 'UNSUPPORTED_DEPTH: Material must have depthTest === false and depthWrite === false in this slice (pipeline has no depth buffer)',
+  UNSUPPORTED_STENCIL: 'UNSUPPORTED_STENCIL: Stencil operations are not supported in this slice (material.stencilWrite === true)',
+  UNSUPPORTED_POLYGON_OFFSET: 'UNSUPPORTED_POLYGON_OFFSET: Polygon offset is not supported in this slice (material.polygonOffset === true)',
+  UNSUPPORTED_REVERSED_DEPTH: 'UNSUPPORTED_REVERSED_DEPTH: Reversed depth buffer is not supported in this slice',
+  INVALID_DEPTH_FUNC: 'INVALID_DEPTH_FUNC: Invalid or unsupported depthFunc',
+  AMBIGUOUS_DEPTH_PAIR: 'AMBIGUOUS_DEPTH_PAIR: Material with depthTest=false and depthWrite=true is ambiguous across backends (WebGL suppresses writes, WebGPU permits writes); provide options.sourceBackend ("webgl" | "webgpu")',
+  UNSUPPORTED_SIDE: 'UNSUPPORTED_SIDE: Only DoubleSide (2) is supported in this slice (pipeline has no culling state)',
+  INVALID_CAMERA: 'INVALID_CAMERA: Camera must be an instance of THREE.Camera with valid projectionMatrix and matrixWorldInverse',
+  INVALID_DIMENSIONS: 'INVALID_DIMENSIONS: Viewport dimensions must be positive integers',
+  INDEX_OUT_OF_BOUNDS: 'INDEX_OUT_OF_BOUNDS: Index references vertex out of bounds',
+  INVALID_DRAWRANGE: 'INVALID_DRAWRANGE: Invalid drawRange: start and count must be non-negative integers',
+  EMPTY_MESH_BATCH: 'EMPTY_MESH_BATCH: Mesh batch must be a non-empty array of meshes',
+  INCOMPATIBLE_BATCH_DEPTH: 'INCOMPATIBLE_BATCH_DEPTH: Meshes in batch have incompatible depth settings; all meshes in batch must share depthTest, depthWrite, and depthCompare',
 });
 
 // Supported upstream source backends for resolving backend-specific semantics
@@ -102,25 +104,56 @@ export const THREE_DEPTH_FUNC_TO_WIRE_COMPARE = Object.freeze({
 });
 
 /**
+ * Creates an Error representing an admission or batch rejection.
+ * Ensures the error message carries the stable code prefix (e.g. 'KEY: ...') and sets err.reason = key.
+ *
+ * @param {string} code - Stable error key (e.g. 'EMPTY_MESH_BATCH', 'INCOMPATIBLE_BATCH_DEPTH')
+ * @param {string} [detail] - Additional contextual detail to append
+ * @returns {Error}
+ */
+export function createAdmissionError(code, detail = '') {
+  const reasonText = ADMISSION_REJECTION[code] ?? 'Admission rejected';
+  const prefix = `${code}: `;
+  const baseMessage = reasonText.startsWith(prefix) ? reasonText : `${prefix}${reasonText}`;
+  const message = detail ? `${baseMessage}: ${detail}` : baseMessage;
+  const err = new Error(message);
+  err.reason = code;
+  return err;
+}
+
+function rejectMesh(code) {
+  return {
+    admitted: false,
+    reason: ADMISSION_REJECTION[code],
+    reasonCode: code,
+    code,
+  };
+}
+
+/**
  * Checks if a Three.js Mesh and Camera can be admitted into the dynamic Wasm mesh rendering slice.
  * @param {any} mesh
  * @param {any} camera
  * @param {object} [options]
- * @returns {{ admitted: boolean, reason?: string }}
+ * @returns {{ admitted: boolean, reason?: string, reasonCode?: string, code?: string }}
  */
 export function canAdmitMesh(mesh, camera, options = {}) {
   if (!mesh || !mesh.isMesh) {
-    return { admitted: false, reason: ADMISSION_REJECTION.NOT_A_MESH };
+    return rejectMesh('NOT_A_MESH');
   }
 
   // Explicitly decline subclasses that cannot silently render scalar (root 19:47Z)
   if (mesh.isInstancedMesh || mesh.isSkinnedMesh || mesh.isBatchedMesh) {
-    return { admitted: false, reason: ADMISSION_REJECTION.UNSUPPORTED_MESH_SUBCLASS };
+    return rejectMesh('UNSUPPORTED_MESH_SUBCLASS');
   }
 
-  // Check mesh visibility
-  if (mesh.visible === false) {
-    return { admitted: false, reason: ADMISSION_REJECTION.NOT_VISIBLE };
+  // Check mesh and ancestor visibility (Three.js Renderer.js:3244 subtree culling)
+  let cur = mesh;
+  while (cur) {
+    if (cur.visible === false) {
+      return rejectMesh('NOT_VISIBLE');
+    }
+    cur = cur.parent;
   }
 
   // Reject unsupported object callbacks (root 19:47Z point 2)
@@ -130,54 +163,54 @@ export function canAdmitMesh(mesh, camera, options = {}) {
     (mesh.onAfterRender && mesh.onAfterRender !== DEFAULT_OBJECT3D_ON_AFTER_RENDER) ||
     Object.hasOwn(mesh, 'onAfterRender')
   ) {
-    return { admitted: false, reason: ADMISSION_REJECTION.UNSUPPORTED_CALLBACK };
+    return rejectMesh('UNSUPPORTED_CALLBACK');
   }
 
   // Camera check
   if (!camera || !camera.isCamera || !camera.projectionMatrix || !camera.matrixWorldInverse) {
-    return { admitted: false, reason: ADMISSION_REJECTION.INVALID_CAMERA };
+    return rejectMesh('INVALID_CAMERA');
   }
 
   // Reject reversed depth buffer configurations (root review invariant)
   if (camera.reversedDepth === true || camera.reversedDepthBuffer === true || camera._reversedDepth === true) {
-    return { admitted: false, reason: ADMISSION_REJECTION.UNSUPPORTED_REVERSED_DEPTH };
+    return rejectMesh('UNSUPPORTED_REVERSED_DEPTH');
   }
 
   // Layer intersection check (root 19:47Z)
   if (camera.layers && mesh.layers && !camera.layers.test(mesh.layers)) {
-    return { admitted: false, reason: ADMISSION_REJECTION.LAYER_MISMATCH };
+    return rejectMesh('LAYER_MISMATCH');
   }
 
   const geometry = mesh.geometry;
   if (!geometry || !geometry.isBufferGeometry) {
-    return { admitted: false, reason: ADMISSION_REJECTION.INVALID_GEOMETRY };
+    return rejectMesh('INVALID_GEOMETRY');
   }
 
   const posAttr = geometry.attributes?.position;
   if (!posAttr || posAttr.itemSize !== 3) {
-    return { admitted: false, reason: ADMISSION_REJECTION.MISSING_POSITION };
+    return rejectMesh('MISSING_POSITION');
   }
 
   // Reject interleaved or normalized attributes explicitly
   if (posAttr.isInterleavedBufferAttribute || posAttr.normalized) {
-    return { admitted: false, reason: ADMISSION_REJECTION.UNSUPPORTED_ATTRIBUTE };
+    return rejectMesh('UNSUPPORTED_ATTRIBUTE');
   }
 
   if (geometry.morphAttributes && Object.keys(geometry.morphAttributes).length > 0) {
-    return { admitted: false, reason: ADMISSION_REJECTION.UNSUPPORTED_GEOMETRY };
+    return rejectMesh('UNSUPPORTED_GEOMETRY');
   }
   if (geometry.groups && geometry.groups.length > 1) {
-    return { admitted: false, reason: ADMISSION_REJECTION.UNSUPPORTED_GEOMETRY };
+    return rejectMesh('UNSUPPORTED_GEOMETRY');
   }
 
   const material = mesh.material;
   if (!material || Array.isArray(material) || !material.isMeshBasicMaterial) {
-    return { admitted: false, reason: ADMISSION_REJECTION.INVALID_MATERIAL };
+    return rejectMesh('INVALID_MATERIAL');
   }
 
   // Material visibility check (root 19:47Z point 1)
   if (material.visible === false) {
-    return { admitted: false, reason: ADMISSION_REJECTION.MATERIAL_NOT_VISIBLE };
+    return rejectMesh('MATERIAL_NOT_VISIBLE');
   }
 
   // Reject unsupported material callbacks (root 19:47Z point 2)
@@ -187,33 +220,33 @@ export function canAdmitMesh(mesh, camera, options = {}) {
     material.onAfterRender ||
     Object.hasOwn(material, 'onAfterRender')
   ) {
-    return { admitted: false, reason: ADMISSION_REJECTION.UNSUPPORTED_CALLBACK };
+    return rejectMesh('UNSUPPORTED_CALLBACK');
   }
 
   if (material.transparent === true || (material.opacity !== undefined && material.opacity < 1.0)) {
-    return { admitted: false, reason: ADMISSION_REJECTION.UNSUPPORTED_MATERIAL };
+    return rejectMesh('UNSUPPORTED_MATERIAL');
   }
   if (material.map || material.envMap || material.alphaMap || material.lightMap || material.aoMap) {
-    return { admitted: false, reason: ADMISSION_REJECTION.UNSUPPORTED_MATERIAL };
+    return rejectMesh('UNSUPPORTED_MATERIAL');
   }
   if (material.wireframe === true) {
-    return { admitted: false, reason: ADMISSION_REJECTION.UNSUPPORTED_MATERIAL };
+    return rejectMesh('UNSUPPORTED_MATERIAL');
   }
 
   // Reject stencil operations
   if (material.stencilWrite === true) {
-    return { admitted: false, reason: ADMISSION_REJECTION.UNSUPPORTED_STENCIL };
+    return rejectMesh('UNSUPPORTED_STENCIL');
   }
 
   // Reject polygon offset
   if (material.polygonOffset === true) {
-    return { admitted: false, reason: ADMISSION_REJECTION.UNSUPPORTED_POLYGON_OFFSET };
+    return rejectMesh('UNSUPPORTED_POLYGON_OFFSET');
   }
 
   // Validate depth function if specified
   const rawDepthFunc = material.depthFunc;
   if (rawDepthFunc !== undefined && THREE_DEPTH_FUNC_TO_WIRE_COMPARE[rawDepthFunc] === undefined) {
-    return { admitted: false, reason: ADMISSION_REJECTION.INVALID_DEPTH_FUNC };
+    return rejectMesh('INVALID_DEPTH_FUNC');
   }
 
   // Handle depthTest=false and depthWrite=true ambiguity across backends (root review invariant)
@@ -222,30 +255,30 @@ export function canAdmitMesh(mesh, camera, options = {}) {
   if (!depthTest && depthWrite) {
     const backend = options?.sourceBackend?.toLowerCase();
     if (backend !== SOURCE_BACKEND.WEBGL && backend !== SOURCE_BACKEND.WEBGPU) {
-      return { admitted: false, reason: ADMISSION_REJECTION.AMBIGUOUS_DEPTH_PAIR };
+      return rejectMesh('AMBIGUOUS_DEPTH_PAIR');
     }
   }
 
   // Pipeline has no cull state; require DoubleSide (2) explicitly per 13043 / 13062 point 1
   if (material.side !== 2) {
-    return { admitted: false, reason: ADMISSION_REJECTION.UNSUPPORTED_SIDE };
+    return rejectMesh('UNSUPPORTED_SIDE');
   }
 
   // Strict check on advanced material features
   if (material.vertexColors === true) {
-    return { admitted: false, reason: ADMISSION_REJECTION.UNSUPPORTED_MATERIAL_FEATURE };
+    return rejectMesh('UNSUPPORTED_MATERIAL_FEATURE');
   }
   if (material.colorWrite === false) {
-    return { admitted: false, reason: ADMISSION_REJECTION.UNSUPPORTED_MATERIAL_FEATURE };
+    return rejectMesh('UNSUPPORTED_MATERIAL_FEATURE');
   }
   if (material.clippingPlanes && material.clippingPlanes.length > 0) {
-    return { admitted: false, reason: ADMISSION_REJECTION.UNSUPPORTED_MATERIAL_FEATURE };
+    return rejectMesh('UNSUPPORTED_MATERIAL_FEATURE');
   }
   if ((material.alphaTest && material.alphaTest > 0) || material.alphaHash === true) {
-    return { admitted: false, reason: ADMISSION_REJECTION.UNSUPPORTED_MATERIAL_FEATURE };
+    return rejectMesh('UNSUPPORTED_MATERIAL_FEATURE');
   }
   if (material.blending !== undefined && material.blending !== 1) { // 1 = NormalBlending
-    return { admitted: false, reason: ADMISSION_REJECTION.UNSUPPORTED_MATERIAL_FEATURE };
+    return rejectMesh('UNSUPPORTED_MATERIAL_FEATURE');
   }
 
   // Check for custom shader hooks by comparing against base Material prototype methods
@@ -253,13 +286,13 @@ export function canAdmitMesh(mesh, camera, options = {}) {
     (material.onBeforeCompile && material.onBeforeCompile !== DEFAULT_MATERIAL_ON_BEFORE_COMPILE) ||
     Object.hasOwn(material, 'onBeforeCompile')
   ) {
-    return { admitted: false, reason: ADMISSION_REJECTION.UNSUPPORTED_MATERIAL_FEATURE };
+    return rejectMesh('UNSUPPORTED_MATERIAL_FEATURE');
   }
   if (
     (material.customProgramCacheKey && material.customProgramCacheKey !== DEFAULT_MATERIAL_CUSTOM_PROGRAM_CACHE_KEY) ||
     Object.hasOwn(material, 'customProgramCacheKey')
   ) {
-    return { admitted: false, reason: ADMISSION_REJECTION.UNSUPPORTED_MATERIAL_FEATURE };
+    return rejectMesh('UNSUPPORTED_MATERIAL_FEATURE');
   }
 
   return { admitted: true };
@@ -322,10 +355,10 @@ export function expandIndexedPositions(positions, indices) {
 export function extractMeshRenderData(mesh, camera, width, height, options = {}) {
   const admission = canAdmitMesh(mesh, camera, options);
   if (!admission.admitted) {
-    throw new Error(`Mesh admission rejected: ${admission.reason}`);
+    throw createAdmissionError(admission.code);
   }
   if (!Number.isInteger(width) || width <= 0 || !Number.isInteger(height) || height <= 0) {
-    throw new Error(ADMISSION_REJECTION.INVALID_DIMENSIONS);
+    throw createAdmissionError('INVALID_DIMENSIONS');
   }
 
   const geometry = mesh.geometry;
@@ -337,10 +370,10 @@ export function extractMeshRenderData(mesh, camera, width, height, options = {})
   const drawStart = geometry.drawRange?.start ?? 0;
   const rawDrawCount = geometry.drawRange?.count;
   if (!Number.isInteger(drawStart) || drawStart < 0) {
-    throw new Error(ADMISSION_REJECTION.INVALID_DRAWRANGE);
+    throw createAdmissionError('INVALID_DRAWRANGE', 'start must be non-negative integer');
   }
   if (rawDrawCount !== undefined && rawDrawCount !== Infinity && (!Number.isInteger(rawDrawCount) || rawDrawCount < 0)) {
-    throw new Error(ADMISSION_REJECTION.INVALID_DRAWRANGE);
+    throw createAdmissionError('INVALID_DRAWRANGE', 'count must be non-negative integer');
   }
 
   let positions;
@@ -372,7 +405,10 @@ export function extractMeshRenderData(mesh, camera, width, height, options = {})
         const idx = indexAttr.array[drawStart + i];
         // Explicit bounds check to prevent silent conversion of undefined to 0
         if (idx === undefined || idx < 0 || idx >= totalVertexCount) {
-          throw new Error(`${ADMISSION_REJECTION.INDEX_OUT_OF_BOUNDS}: index ${idx} at position ${drawStart + i} exceeds vertex count ${totalVertexCount}`);
+          throw createAdmissionError(
+            'INDEX_OUT_OF_BOUNDS',
+            `index ${idx} at position ${drawStart + i} exceeds vertex count ${totalVertexCount}`
+          );
         }
         indices[i] = idx;
       }
@@ -436,7 +472,7 @@ export function extractMeshRenderData(mesh, camera, width, height, options = {})
   const rawDepthWrite = mat.depthWrite !== false;
   const rawDepthFunc = mat.depthFunc ?? LessEqualDepth;
   if (THREE_DEPTH_FUNC_TO_WIRE_COMPARE[rawDepthFunc] === undefined) {
-    throw new Error(`${ADMISSION_REJECTION.INVALID_DEPTH_FUNC}: ${rawDepthFunc}`);
+    throw createAdmissionError('INVALID_DEPTH_FUNC', `${rawDepthFunc}`);
   }
 
   // Resolve effective depthWrite:
@@ -454,7 +490,7 @@ export function extractMeshRenderData(mesh, camera, width, height, options = {})
     } else if (backend === SOURCE_BACKEND.WEBGPU) {
       depthWrite = true;
     } else {
-      throw new Error(`Mesh admission rejected: ${ADMISSION_REJECTION.AMBIGUOUS_DEPTH_PAIR}`);
+      throw createAdmissionError('AMBIGUOUS_DEPTH_PAIR');
     }
   }
 
@@ -767,8 +803,8 @@ export async function renderMesh(bridgeHost, mesh, camera, canvasContext, wasmMo
         'does not export f3d_build_canvas_mesh_packet. Silent offscreen-as-visible rendering is strictly forbidden.'
       );
     }
-    const width = canvasContext?.canvas?.width || options.width || 64;
-    const height = canvasContext?.canvas?.height || options.height || 64;
+    const width = canvasContext?.canvas?.width ?? options.width ?? 64;
+    const height = canvasContext?.canvas?.height ?? options.height ?? 64;
     const { packetBytes, snapshot } = prepareCanvasMeshPacket(
       mesh,
       camera,
@@ -781,8 +817,8 @@ export async function renderMesh(bridgeHost, mesh, camera, canvasContext, wasmMo
     return { result, snapshot, target: 'canvas' };
   } else {
     // Honest offscreen execution
-    const width = options.width || 64;
-    const height = options.height || 64;
+    const width = options.width ?? 64;
+    const height = options.height ?? 64;
     const { packetBytes, snapshot } = prepareMeshPacket(
       mesh,
       camera,
@@ -794,6 +830,327 @@ export async function renderMesh(bridgeHost, mesh, camera, canvasContext, wasmMo
     const result = await bridgeHost.executePacket(packetBytes, null);
     return { result, snapshot, target: 'offscreen' };
   }
+}
+
+/**
+ * Prepares a variable-length binary submission packet for an explicit ordered list of compatible meshes.
+ *
+ * Invariants:
+ * - Meshes must be an array with length >= 1. Empty or non-array inputs are strictly rejected.
+ * - Extracts per-draw snapshots via extractMeshRenderData, preserving per-draw transforms and colors.
+ * - Refuses incompatible shared depth settings across meshes rather than silently dropping differences.
+ * - Flattens expanded positions and concatenates per-draw uniforms (modelViews, colors, vertexCounts).
+ * - Invokes wasmModule.f3d_build_mesh_batch_packet (or gpu_bridge_build_mesh_batch_packet).
+ * - Target selection: options.target === 'canvas' sets canvas: true, otherwise offscreen.
+ *
+ * @param {Array<any>} meshes - Explicit ordered list of compatible Three.js Mesh instances
+ * @param {any} camera - Shared Three.js Camera instance
+ * @param {number} width - Viewport width
+ * @param {number} height - Viewport height
+ * @param {object} wasmModule - Loaded Wasm module exposing f3d_build_mesh_batch_packet
+ * @param {object} [options] - Additional options (target, canvas, sourceBackend)
+ * @returns {{ packetBytes: Uint8Array, snapshots: Array<object>, meshCount: number, totalVertices: number, target: 'canvas' | 'offscreen' }}
+ */
+export function prepareMeshBatchPacket(meshes, camera, width, height, wasmModule, options = {}) {
+  if (!Array.isArray(meshes) || meshes.length === 0) {
+    throw createAdmissionError('EMPTY_MESH_BATCH');
+  }
+
+  const batchFn = wasmModule?.f3d_build_mesh_batch_packet;
+
+  if (typeof batchFn !== 'function') {
+    throw new Error(
+      'Mesh batch packet preparation failed: wasmModule is missing f3d_build_mesh_batch_packet export.'
+    );
+  }
+
+  // Extract snapshot for each mesh in the explicit order
+  const snapshots = meshes.map((mesh, index) => {
+    try {
+      return extractMeshRenderData(mesh, camera, width, height, options);
+    } catch (err) {
+      const code = err.reason ?? 'ADMISSION_REJECTED';
+      const batchErr = new Error(`${code}: Mesh batch admission rejected at index ${index}: ${err.message}`);
+      batchErr.reason = code;
+      throw batchErr;
+    }
+  });
+
+  // Verify shared batch pipeline configuration: depthTest, depthWrite, depthCompare, webglDepth
+  const first = snapshots[0];
+  const sharedDepthTest = first.depthTest;
+  const sharedDepthWrite = first.depthWrite;
+  const sharedDepthCompare = first.depthCompare;
+  const sharedWebglDepth = first.webglDepth;
+
+  for (let i = 1; i < snapshots.length; i++) {
+    const s = snapshots[i];
+    if (s.depthTest !== sharedDepthTest) {
+      throw createAdmissionError(
+        'INCOMPATIBLE_BATCH_DEPTH',
+        `mesh 0 has depthTest=${sharedDepthTest}, mesh ${i} has depthTest=${s.depthTest}`
+      );
+    }
+    if (s.depthWrite !== sharedDepthWrite) {
+      throw createAdmissionError(
+        'INCOMPATIBLE_BATCH_DEPTH',
+        `mesh 0 has depthWrite=${sharedDepthWrite}, mesh ${i} has depthWrite=${s.depthWrite}`
+      );
+    }
+    if (s.depthCompare !== sharedDepthCompare) {
+      throw createAdmissionError(
+        'INCOMPATIBLE_BATCH_DEPTH',
+        `mesh 0 has depthCompare=${sharedDepthCompare}, mesh ${i} has depthCompare=${s.depthCompare}`
+      );
+    }
+    if (s.webglDepth !== sharedWebglDepth) {
+      throw createAdmissionError(
+        'INCOMPATIBLE_BATCH_DEPTH',
+        `mesh 0 has webglDepth=${sharedWebglDepth}, mesh ${i} has webglDepth=${s.webglDepth}`
+      );
+    }
+  }
+
+  // Calculate total expanded vertex count across all meshes
+  let totalVertices = 0;
+  for (let i = 0; i < snapshots.length; i++) {
+    totalVertices += snapshots[i].expandedPositions.length / 3;
+  }
+
+  const n = snapshots.length;
+  const flatPositions = new Float32Array(totalVertices * 3);
+  const vertexCounts = new Uint32Array(n);
+  const modelViews = new Float64Array(n * 16);
+  const colors = new Float32Array(n * 4);
+  const projection = first.projection; // Shared camera projection (16 f64)
+
+  let posOffset = 0;
+  for (let i = 0; i < n; i++) {
+    const s = snapshots[i];
+    const vertCount = s.expandedPositions.length / 3;
+    vertexCounts[i] = vertCount;
+
+    flatPositions.set(s.expandedPositions, posOffset);
+    posOffset += s.expandedPositions.length;
+
+    modelViews.set(s.modelView, i * 16);
+    colors.set(s.color, i * 4);
+  }
+
+  const isCanvas = options.target === 'canvas';
+
+  let packetBytes;
+  try {
+    packetBytes = batchFn(
+      flatPositions,
+      vertexCounts,
+      modelViews,
+      projection,
+      colors,
+      width,
+      height,
+      sharedWebglDepth,
+      sharedDepthTest,
+      sharedDepthWrite,
+      sharedDepthCompare,
+      isCanvas,
+    );
+  } catch (err) {
+    const msg = err?.message ?? String(err);
+    if (
+      msg.includes('EmptyMeshList') ||
+      msg.includes('must contain at least one mesh') ||
+      msg.includes('EMPTY_MESH_BATCH')
+    ) {
+      throw createAdmissionError('EMPTY_MESH_BATCH');
+    }
+    throw err;
+  }
+
+  return {
+    packetBytes,
+    snapshots,
+    meshCount: n,
+    totalVertices,
+    target: isCanvas ? 'canvas' : 'offscreen',
+  };
+}
+
+/**
+ * Executes an explicit ordered list of compatible meshes through WebGpuBridgeHost.
+ * If canvasContext is provided, targets the visible canvas swapchain (canvas: true).
+ * Otherwise, executes honest offscreen rendering.
+ *
+ * @param {object} bridgeHost - Initialized WebGpuBridgeHost
+ * @param {Array<any>} meshes - Ordered list of THREE.Mesh instances
+ * @param {any} camera - THREE.Camera instance
+ * @param {any} [canvasContext] - HTMLCanvasElement / GPUCanvasContext (optional)
+ * @param {object} wasmModule - Loaded Wasm module
+ * @param {object} [options]
+ * @returns {Promise<{ result: any, snapshots: Array<object>, meshCount: number, totalVertices: number, target: 'canvas' | 'offscreen' }>}
+ */
+export async function renderMeshBatch(bridgeHost, meshes, camera, canvasContext, wasmModule, options = {}) {
+  if (!bridgeHost || typeof bridgeHost.executePacket !== 'function') {
+    throw new Error('Invalid bridgeHost: must expose executePacket method');
+  }
+
+  if (!Array.isArray(meshes) || meshes.length === 0) {
+    throw createAdmissionError('EMPTY_MESH_BATCH');
+  }
+
+  const isCanvasTarget = canvasContext !== null && canvasContext !== undefined;
+  const width = canvasContext?.canvas?.width ?? options.width ?? 64;
+  const height = canvasContext?.canvas?.height ?? options.height ?? 64;
+
+  const batchResult = prepareMeshBatchPacket(
+    meshes,
+    camera,
+    width,
+    height,
+    wasmModule,
+    { ...options, target: isCanvasTarget ? 'canvas' : 'offscreen' }
+  );
+
+  const result = await bridgeHost.executePacket(batchResult.packetBytes, isCanvasTarget ? canvasContext : null);
+  return {
+    result,
+    snapshots: batchResult.snapshots,
+    meshCount: batchResult.meshCount,
+    totalVertices: batchResult.totalVertices,
+    target: batchResult.target,
+  };
+}
+
+/**
+ * Renders admitted Three.js Mesh instances in a Scene using a single batch packet.
+ *
+ * Traversal & Admission:
+ * - Updates world matrices once across the scene and camera via updateMatrixWorld(true).
+ * - Traverses the scene graph to collect visible THREE.Mesh instances.
+ * - Evaluates each mesh via canAdmitMesh(obj, camera, options), honoring sourceBackend rules.
+ * - Admitted meshes are collected in traversal order.
+ * - Refused meshes are recorded as { uuid, reason } without throwing.
+ *
+ * Submission:
+ * - If admitted set is empty, explicitly refuses without building or submitting a packet,
+ *   returning { admitted: [], refused }.
+ * - If admitted meshes exist, builds ONE batch via prepareMeshBatchPacket and executes
+ *   it via bridgeHost.executePacket.
+ * - Returns { admitted: [uuid...], refused: [{ uuid, reason }] }.
+ *
+ * @param {object} bridgeHost - Initialized WebGpuBridgeHost exposing executePacket
+ * @param {any} scene - THREE.Scene / Object3D hierarchy
+ * @param {any} camera - THREE.Camera instance
+ * @param {any} [canvasContext] - HTMLCanvasElement / GPUCanvasContext (optional)
+ * @param {object} wasmModule - Loaded Wasm module exposing f3d_build_mesh_batch_packet
+ * @param {object} [options] - Additional options (sourceBackend, width, height, etc.)
+ * @returns {Promise<{ admitted: Array<string>, refused: Array<{ uuid: string, reason: string }> }>}
+ */
+export async function renderScene(bridgeHost, scene, camera, canvasContext, wasmModule, options = {}) {
+  if (!bridgeHost || typeof bridgeHost.executePacket !== 'function') {
+    throw new Error('Invalid bridgeHost: must expose executePacket method');
+  }
+  if (!scene || typeof scene.traverse !== 'function') {
+    throw new Error('Invalid scene: must expose traverse method');
+  }
+  if (!camera || !camera.isCamera) {
+    throw createAdmissionError('INVALID_CAMERA');
+  }
+
+  // Update world matrices once before traversal
+  if (typeof scene.updateMatrixWorld === 'function') {
+    scene.updateMatrixWorld(true);
+  }
+  if (typeof camera.updateMatrixWorld === 'function') {
+    camera.updateMatrixWorld(true);
+  }
+
+  const admittedMeshes = [];
+  const refused = [];
+
+  // Traverse scene to collect and evaluate THREE.Mesh instances in traversal order
+  scene.traverse((obj) => {
+    if (!obj || !obj.isMesh) {
+      return;
+    }
+
+    const admission = canAdmitMesh(obj, camera, options);
+    if (admission.admitted) {
+      admittedMeshes.push(obj);
+    } else {
+      refused.push({ uuid: obj.uuid, reason: admission.reason });
+    }
+  });
+
+  // Empty admitted set -> explicit refusal, no submit
+  if (admittedMeshes.length === 0) {
+    const response = {
+      admitted: [],
+      refused,
+    };
+    Object.defineProperty(response, 'reason', {
+      value: 'EMPTY_MESH_BATCH',
+      enumerable: false,
+      writable: true,
+      configurable: true,
+    });
+    Object.defineProperty(response, 'reasonMessage', {
+      value: ADMISSION_REJECTION.EMPTY_MESH_BATCH,
+      enumerable: false,
+      writable: true,
+      configurable: true,
+    });
+    Object.defineProperty(response, 'refusalReason', {
+      value: 'EMPTY_MESH_BATCH',
+      enumerable: false,
+      writable: true,
+      configurable: true,
+    });
+    return response;
+  }
+
+  // Sort admitted meshes ascending by renderOrder (Three.js RenderList.js:20; stable sort preserves traversal order for equal renderOrder)
+  admittedMeshes.sort((a, b) => {
+    const orderA = Number.isFinite(a.renderOrder) ? a.renderOrder : 0;
+    const orderB = Number.isFinite(b.renderOrder) ? b.renderOrder : 0;
+    return orderA - orderB;
+  });
+
+  const admitted = admittedMeshes.map((m) => m.uuid);
+
+  const isCanvasTarget = canvasContext !== null && canvasContext !== undefined;
+  const width = canvasContext?.canvas?.width ?? options.width ?? 64;
+  const height = canvasContext?.canvas?.height ?? options.height ?? 64;
+
+  const batchResult = prepareMeshBatchPacket(
+    admittedMeshes,
+    camera,
+    width,
+    height,
+    wasmModule,
+    { ...options, target: isCanvasTarget ? 'canvas' : 'offscreen' }
+  );
+
+  const result = await bridgeHost.executePacket(
+    batchResult.packetBytes,
+    isCanvasTarget ? canvasContext : null
+  );
+
+  const response = {
+    admitted,
+    refused,
+  };
+
+  if (result !== undefined) {
+    Object.defineProperty(response, 'result', {
+      value: result,
+      enumerable: false,
+      writable: true,
+      configurable: true,
+    });
+  }
+
+  return response;
 }
 
 /**
