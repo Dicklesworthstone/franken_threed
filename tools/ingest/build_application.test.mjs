@@ -1991,11 +1991,79 @@ test('buildApplication preserves importmap verbatim alongside classic scripts wi
     void main() { /* import('./phantom_shader.js') */ }
   </script>
   <script>
-    // Inline classic script using dynamic import against preserved importmap
+    // Inline classic script 1: verifies globals and execution order
+    window.__classicOrder = ['inline1'];
     window.loadDep = () => import('dynamic-dep');
   </script>
   <script src="./external_classic.js"></script>
   <script type="module" src="./main.js"></script>
+  <script>
+    // Inline classic self-check: executes dynamic imports via browser importmap,
+    // verifies classic globals/order, and reports results to /report when under test harness.
+    window.__browserCheckComplete = (async () => {
+      try {
+        const orderOk = Array.isArray(window.__classicOrder) &&
+          window.__classicOrder.length === 2 &&
+          window.__classicOrder[0] === 'inline1' &&
+          window.__classicOrder[1] === 'external';
+
+        const depMod = await window.loadDep();
+        const extMod = await window.loadExt();
+
+        const depOk = Boolean(depMod && depMod.depOk === true);
+        const extOk = Boolean(extMod && extMod.extOk === true);
+        const passed = orderOk && depOk && extOk;
+
+        const results = {
+          orderOk,
+          depOk,
+          extOk,
+          observedOrder: window.__classicOrder,
+          depValue: depMod ? depMod.depOk : undefined,
+          extValue: extMod ? extMod.extOk : undefined
+        };
+
+        window.__browserCheckResults = { passed, results };
+
+        if (typeof fetch === 'function') {
+          try {
+            await fetch('/report', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                passed,
+                results,
+                test: 'classic-import-self-check',
+                detail: passed
+                  ? 'Emitted-page classic dynamic imports, importmap resolution, and run order verified'
+                  : 'Emitted-page classic self-check failed'
+              })
+            });
+          } catch (_) {}
+        }
+        return { passed, results };
+      } catch (err) {
+        const results = { passed: false, error: String(err?.message || err) };
+        window.__browserCheckResults = results;
+        if (typeof fetch === 'function') {
+          try {
+            await fetch('/report', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                passed: false,
+                results,
+                error: String(err?.message || err),
+                test: 'classic-import-self-check',
+                detail: 'Exception during classic self-check: ' + (err?.message || err)
+              })
+            });
+          } catch (_) {}
+        }
+        return results;
+      }
+    })();
+  </script>
 </head>
 <body></body>
 </html>`;
@@ -2009,12 +2077,24 @@ test('buildApplication preserves importmap verbatim alongside classic scripts wi
   fs.writeFileSync(path.join(scratch, 'nested.js'), 'export const nestedOk = true;\n');
   fs.writeFileSync(
     path.join(scratch, 'external_classic.js'),
-    'window.loadExt = () => import("./ext_dep.js");\n'
+    'if (window.__classicOrder) { window.__classicOrder.push("external"); }\nwindow.loadExt = () => import("./ext_dep.js");\n'
   );
   fs.writeFileSync(path.join(scratch, 'ext_dep.js'), 'export const extOk = true;\n');
 
   const res = await buildApplication(path.join(scratch, 'index.html'), outDir);
   assert.equal(res.isHtml, true);
+
+  // Optional artifact directory copy for remote browser execution lane
+  const probeOut = process.env.F3D_BROWSER_PROBE_OUT || process.env.F3D_RESULT_DIR;
+  if (probeOut) {
+    fs.mkdirSync(probeOut, { recursive: true });
+    for (const relFile of res.emittedFiles) {
+      const srcPath = path.join(outDir, relFile);
+      const dstPath = path.join(probeOut, relFile);
+      fs.mkdirSync(path.dirname(dstPath), { recursive: true });
+      fs.copyFileSync(srcPath, dstPath);
+    }
+  }
 
   const rewrittenHtml = fs.readFileSync(path.join(outDir, res.htmlFile), 'utf-8');
 
@@ -2048,7 +2128,11 @@ test('buildApplication preserves importmap verbatim alongside classic scripts wi
     'Shader block pseudo-import must never be emitted as dependency'
   );
 
-  // 3. Inline classic script using dynamic import must be preserved verbatim
+  // 3. Inline classic script 1 using dynamic import must be preserved verbatim
+  assert.ok(
+    rewrittenHtml.includes("window.__classicOrder = ['inline1'];"),
+    'Inline classic script 1 must be preserved verbatim'
+  );
   assert.ok(
     rewrittenHtml.includes("window.loadDep = () => import('dynamic-dep');"),
     'Inline classic script containing dynamic import must be preserved verbatim'
@@ -2060,25 +2144,31 @@ test('buildApplication preserves importmap verbatim alongside classic scripts wi
     'External classic script must be preserved verbatim'
   );
 
-  // 5. Module script is rewritten to emitted chunk
+  // 5. Inline classic self-check script must be preserved verbatim
+  assert.ok(
+    rewrittenHtml.includes('window.__browserCheckComplete'),
+    'Classic self-check script must be preserved verbatim'
+  );
+
+  // 6. Module script is rewritten to emitted chunk
   assert.ok(
     rewrittenHtml.includes(`src="./${res.entryFiles[0]}"`),
     'Module script must reference the emitted chunk'
   );
 
-  // 6. Emitted files list must contain dynamic import target, nested dependency, and external classic files
+  // 7. Emitted files list must contain dynamic import target, nested dependency, and external classic files
   assert.ok(res.emittedFiles.includes('dep.js'), 'dep.js must be in emittedFiles');
   assert.ok(res.emittedFiles.includes('nested.js'), 'nested.js must be in emittedFiles');
   assert.ok(res.emittedFiles.includes('external_classic.js'), 'external_classic.js must be in emittedFiles');
   assert.ok(res.emittedFiles.includes('ext_dep.js'), 'ext_dep.js must be in emittedFiles');
 
-  // 7. All closed files must exist on disk in outDir
+  // 8. All closed files must exist on disk in outDir
   assert.ok(fs.existsSync(path.join(outDir, 'dep.js')), 'dep.js must exist on disk in outDir');
   assert.ok(fs.existsSync(path.join(outDir, 'nested.js')), 'nested.js must exist on disk in outDir');
   assert.ok(fs.existsSync(path.join(outDir, 'external_classic.js')), 'external_classic.js must exist on disk in outDir');
   assert.ok(fs.existsSync(path.join(outDir, 'ext_dep.js')), 'ext_dep.js must exist on disk in outDir');
 
-  // 8. Dynamic imports must execute real exported values from outDir without source tree
+  // 9. Dynamic imports must execute real exported values from outDir without source tree
   const depModule = await import(pathToFileURL(path.join(outDir, 'dep.js')).href);
   assert.equal(depModule.depOk, true, 'dep.js and its nested dependency must execute successfully from outDir');
 
