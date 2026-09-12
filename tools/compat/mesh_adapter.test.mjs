@@ -522,8 +522,11 @@ test('Index bounds check: Explicitly rejects out-of-range indices (13062 point 4
 test('Material features: Rejects advanced and unexercised material features (13062 point 5)', () => {
   const camera = createBasicCamera();
 
-  // vertexColors (admitted in this slice)
-  const vcMesh = createBasicTriangleMesh({ vertexColors: true });
+  // vertexColors (admitted in this slice when color attribute present)
+  const vcGeom = new THREE.BufferGeometry();
+  vcGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
+  vcGeom.setAttribute('color', new THREE.BufferAttribute(new Float32Array(9), 3));
+  const vcMesh = new THREE.Mesh(vcGeom, new THREE.MeshBasicMaterial({ vertexColors: true }));
   assert.equal(canAdmitMesh(vcMesh, camera).admitted, true);
 
   // colorWrite = false (admitted in this slice)
@@ -4059,12 +4062,14 @@ test('Geometry residency: invalid updateRange refuses with INVALID_UPDATE_RANGE 
   }
 });
 
-test('vertexColors: canAdmitMesh admits vertexColors=true with missing color, Float32 RGB/RGBA, and Uint8 normalized RGB/RGBA', () => {
+test('vertexColors: canAdmitMesh admits vertexColors=true with Float32 RGB/RGBA and Uint8 normalized RGB/RGBA, refuses missing color attribute', () => {
   const camera = createBasicCamera();
 
-  // 1. Missing color attribute: admitted per r186 default behavior
+  // 1. Missing color attribute: refused per Root review (WebGL requires color attribute, no defaultAttributeValues)
   const meshNoColor = createBasicTriangleMesh({ vertexColors: true });
-  assert.equal(canAdmitMesh(meshNoColor, camera).admitted, true);
+  const resNoColor = canAdmitMesh(meshNoColor, camera);
+  assert.equal(resNoColor.admitted, false);
+  assert.equal(resNoColor.code, 'MISSING_COLOR_ATTRIBUTE');
 
   // 2. Float32Array RGB (itemSize 3)
   const geomF32Rgb = new THREE.BufferGeometry();
@@ -4101,6 +4106,28 @@ test('vertexColors: canAdmitMesh refuses interleaved, custom upload callback, un
   const resInter = canAdmitMesh(meshInter, camera);
   assert.equal(resInter.admitted, false);
   assert.equal(resInter.code, 'UNSUPPORTED_ATTRIBUTE');
+
+  // 1b. InstancedBufferAttribute on color attribute
+  const geomInstColor = new THREE.BufferGeometry();
+  geomInstColor.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
+  const instColorAttr = new THREE.BufferAttribute(new Float32Array(9), 3);
+  instColorAttr.isInstancedBufferAttribute = true;
+  geomInstColor.setAttribute('color', instColorAttr);
+  const meshInstColor = new THREE.Mesh(geomInstColor, new THREE.MeshBasicMaterial({ vertexColors: true }));
+  const resInstColor = canAdmitMesh(meshInstColor, camera);
+  assert.equal(resInstColor.admitted, false);
+  assert.equal(resInstColor.code, 'UNSUPPORTED_ATTRIBUTE');
+
+  // 1c. InstancedBufferAttribute on position attribute
+  const geomInstPos = new THREE.BufferGeometry();
+  const instPosAttr = new THREE.BufferAttribute(new Float32Array(9), 3);
+  instPosAttr.isInstancedBufferAttribute = true;
+  geomInstPos.setAttribute('position', instPosAttr);
+  geomInstPos.setAttribute('color', new THREE.BufferAttribute(new Float32Array(9), 3));
+  const meshInstPos = new THREE.Mesh(geomInstPos, new THREE.MeshBasicMaterial({ vertexColors: true }));
+  const resInstPos = canAdmitMesh(meshInstPos, camera);
+  assert.equal(resInstPos.admitted, false);
+  assert.equal(resInstPos.code, 'UNSUPPORTED_ATTRIBUTE');
 
   // 2. Custom onUploadCallback on color attribute
   const geomCb = new THREE.BufferGeometry();
@@ -4143,7 +4170,10 @@ test('vertexColors: canAdmitMesh refuses interleaved, custom upload callback, un
 
 test('vertexColors: Wasm export missing strictly refuses with INCOMPATIBLE_VERTEX_COLORS', async () => {
   const camera = createBasicCamera();
-  const mesh = createBasicTriangleMesh({ vertexColors: true });
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
+  geom.setAttribute('color', new THREE.BufferAttribute(new Float32Array(9), 3));
+  const mesh = new THREE.Mesh(geom, new THREE.MeshBasicMaterial({ vertexColors: true }));
   // wasmModule has only cull_depth_color export, missing f3d_build_mesh_batch_vertex_color_packet
   const mockWasm = {
     f3d_build_mesh_batch_cull_depth_color_packet: () => new Uint8Array([0x01]),
@@ -4206,7 +4236,7 @@ test('vertexColors: non-indexed mesh extracts Float32 RGB, RGBA, and normalized 
     0, 0, 1, 1,
   ]);
 
-  // 2. Float32 RGBA (itemSize 4) -> preserves observed alpha
+  // 2. Float32 RGBA (itemSize 4) -> Three.js OPAQUE shader forces output alpha to 1.0
   const geomRgba = new THREE.BufferGeometry();
   geomRgba.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
   geomRgba.setAttribute('color', new THREE.BufferAttribute(new Float32Array([1, 0.5, 0.25, 0.75, 0, 1, 0, 0.5, 0.125, 0.25, 0.5, 0.875]), 4));
@@ -4214,9 +4244,9 @@ test('vertexColors: non-indexed mesh extracts Float32 RGB, RGBA, and normalized 
   const snapRgba = extractMeshRenderData(meshRgba, camera, 64, 64);
   assert.equal(snapRgba.hasVertexColors, true);
   assert.deepEqual(Array.from(snapRgba.expandedVertexColors), [
-    1, 0.5, 0.25, 0.75,
-    0, 1, 0, 0.5,
-    0.125, 0.25, 0.5, 0.875,
+    1, 0.5, 0.25, 1,
+    0, 1, 0, 1,
+    0.125, 0.25, 0.5, 1,
   ]);
 
   // 3. Uint8 normalized RGB -> normalized via getX/getY/getZ
@@ -4274,7 +4304,7 @@ test('vertexColors: indexed mesh expands colors matching selected vertex indices
   ]);
 });
 
-test('vertexColors: batch with mixed colored, uncolored, and missing-color meshes fills uncolored with white', () => {
+test('vertexColors: batch with mixed colored and uncolored meshes fills uncolored with white, refuses missing color attribute', () => {
   const camera = createBasicCamera();
 
   // Mesh 1: vertexColors=true with RGB
@@ -4286,7 +4316,7 @@ test('vertexColors: batch with mixed colored, uncolored, and missing-color meshe
     vertexColors: true,
   }));
 
-  // Mesh 2: vertexColors=false (uncolored)
+  // Mesh 2: vertexColors=false (uncolored, default white fallback)
   const geom2 = new THREE.BufferGeometry();
   geom2.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
   const mesh2 = new THREE.Mesh(geom2, new THREE.MeshBasicMaterial({
@@ -4294,12 +4324,12 @@ test('vertexColors: batch with mixed colored, uncolored, and missing-color meshe
     vertexColors: false,
   }));
 
-  // Mesh 3: vertexColors=true, but NO color attribute (r186 default fallback to white)
+  // Mesh 3: vertexColors=false (uncolored blue)
   const geom3 = new THREE.BufferGeometry();
   geom3.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
   const mesh3 = new THREE.Mesh(geom3, new THREE.MeshBasicMaterial({
     color: 0x0000ff,
-    vertexColors: true,
+    vertexColors: false,
   }));
 
   let capturedArgs = null;
@@ -4339,6 +4369,15 @@ test('vertexColors: batch with mixed colored, uncolored, and missing-color meshe
   assert.equal(capturedArgs.cols[0], 1); // mesh 1 red
   assert.equal(capturedArgs.cols[5], 1); // mesh 2 green
   assert.equal(capturedArgs.cols[10], 1); // mesh 3 blue
+
+  // Batch containing mesh with vertexColors=true and missing color attribute is refused
+  const geomMissing = new THREE.BufferGeometry();
+  geomMissing.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
+  const meshMissing = new THREE.Mesh(geomMissing, new THREE.MeshBasicMaterial({ vertexColors: true }));
+  assert.throws(
+    () => prepareMeshBatchPacket([mesh1, meshMissing], camera, 64, 64, mockWasm),
+    (err) => err.reason === 'MISSING_COLOR_ATTRIBUTE'
+  );
 });
 
 test('vertexColors: renderScene admits mixed vertexColors meshes with export and refuses when missing', async () => {
@@ -4442,3 +4481,53 @@ test('vertexColors: color attribute residency keeps GPU-stale shadow without nee
   await renderMesh(mockHost, mesh, camera, null, mockWasm);
   assert.equal(capturedColors[0], 0.5);
 });
+
+test('Regression: new export-only (vertex_color only) uncolored colorWrite/depth must not get admitted then call undefined legacy export', async () => {
+  const camera = createBasicCamera();
+  // wasmModule has ONLY f3d_build_mesh_batch_vertex_color_packet
+  const mockWasm = {
+    f3d_build_mesh_batch_vertex_color_packet: () => new Uint8Array([0x01]),
+  };
+
+  // 1. Uncolored mesh with colorWrite = false in prepareMeshBatchPacket
+  const uncoloredMeshColorWrite = createBasicTriangleMesh({ colorWrite: false });
+  assert.throws(
+    () => prepareMeshBatchPacket([uncoloredMeshColorWrite], camera, 64, 64, mockWasm),
+    (err) => err.reason === 'INCOMPATIBLE_COLOR_WRITE'
+  );
+
+  // 2. Uncolored meshes with mixed depth in prepareMeshBatchPacket
+  const uncoloredDepth1 = createBasicTriangleMesh({ depthTest: true });
+  const uncoloredDepth2 = createBasicTriangleMesh({ depthTest: false, depthWrite: false });
+  assert.throws(
+    () => prepareMeshBatchPacket([uncoloredDepth1, uncoloredDepth2], camera, 64, 64, mockWasm),
+    (err) => err.reason === 'INCOMPATIBLE_BATCH_DEPTH'
+  );
+
+  // 3. Uncolored mesh with colorWrite = false in renderMesh canvas preflight
+  const mockHost = {
+    executePacket: async () => ({ status: 'OK' }),
+  };
+  await assert.rejects(
+    async () => renderMesh(mockHost, uncoloredMeshColorWrite, camera, { canvas: {} }, mockWasm),
+    (err) => err.reason === 'INCOMPATIBLE_COLOR_WRITE'
+  );
+
+  // 4. Uncolored mesh with colorWrite = false in renderScene
+  const sceneColor = new THREE.Scene();
+  sceneColor.add(uncoloredMeshColorWrite);
+  const resSceneColor = await renderScene(mockHost, sceneColor, camera, null, mockWasm);
+  assert.equal(resSceneColor.admitted.length, 0);
+  assert.equal(resSceneColor.refused.length, 1);
+  assert.equal(resSceneColor.refused[0].code, 'INCOMPATIBLE_COLOR_WRITE');
+
+  // 5. Uncolored meshes with mixed depth in renderScene
+  const sceneDepth = new THREE.Scene();
+  sceneDepth.add(uncoloredDepth1);
+  sceneDepth.add(uncoloredDepth2);
+  const resSceneDepth = await renderScene(mockHost, sceneDepth, camera, null, mockWasm);
+  assert.equal(resSceneDepth.admitted.length, 0);
+  assert.equal(resSceneDepth.refused.length, 1);
+  assert.equal(resSceneDepth.refused[0].code, 'INCOMPATIBLE_BATCH_DEPTH');
+});
+
