@@ -88,6 +88,25 @@ export function isRelativeUrl(url) {
 }
 
 /**
+ * Normalizes a Rollup module ID or filesystem path into a canonical URL string.
+ * Preserves existing URL schemes (e.g. file://, http://, https://) and query/fragment identities.
+ *
+ * @param {string} id
+ * @returns {string | null} Canonical URL string, or null if invalid
+ */
+export function toCanonicalPreloadUrl(id) {
+  if (!id || typeof id !== 'string') return null;
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(id)) {
+    return id;
+  }
+  try {
+    return pathToFileURL(path.resolve(id)).href;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Looks up whether a modulepreload raw href corresponds to an emitted chunk in preloadChunkMap.
  * Uses exact canonical URL resolution (preserving ?query and #fragment as distinct ES module identities)
  * against the referrer directory URL, without stripping query or fragment.
@@ -116,9 +135,11 @@ export function findChunkForPreload(rawHref, referrerDir, preloadChunkMap) {
     }
   }
 
-  // 2. Direct match fallback (for pre-canonicalized URLs or virtual IDs)
-  if (preloadChunkMap.has(trimmed)) {
-    return preloadChunkMap.get(trimmed);
+  // 2. Direct match for scheme-qualified URLs (when referrerDir is absent or rawHref is absolute)
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(trimmed)) {
+    if (preloadChunkMap.has(trimmed)) {
+      return preloadChunkMap.get(trimmed);
+    }
   }
 
   return null;
@@ -210,12 +231,23 @@ export function extractRelativeAssetUrls(rawHtmlContent, preloadChunkMap = null,
 }
 
 /**
- * Strips comments from CSS content.
+ * Strips comments from CSS content while preserving comment-like text
+ * inside single- or double-quoted strings (e.g. url("image/slash-star-not-a-comment-star-slash.png")).
+ *
  * @param {string} css
  * @returns {string}
  */
 export function stripCssComments(css) {
-  return css.replace(/\/\*[\s\S]*?\*\//g, '');
+  if (!css || typeof css !== 'string') return '';
+  return css.replace(
+    /(\/\*[\s\S]*?\*\/)|("(?:[^"\\]|\\.)*")|('(?:[^'\\]|\\.)*')/g,
+    (match, comment) => {
+      if (comment) {
+        return comment.replace(/[^\r\n]/g, ' ');
+      }
+      return match;
+    }
+  );
 }
 
 /**
@@ -557,6 +589,10 @@ export async function buildApplication(entryPath, outDir, options = {}) {
 
   const targetFiles = new Map(); // relativePath -> string | Buffer
   const htmlFileName = isHtml ? path.basename(resolvedEntryAbs) : null;
+  const emittedChunkNames = new Set(Object.keys(bundleResult.files));
+  if (htmlFileName) {
+    emittedChunkNames.add(htmlFileName);
+  }
 
   // Collect all emitted code chunks from Rollup
   for (const [fileName, code] of Object.entries(bundleResult.files)) {
@@ -569,12 +605,18 @@ export async function buildApplication(entryPath, outDir, options = {}) {
     const preloadChunkMap = new Map();
     for (const chunk of bundleResult.chunks) {
       if (chunk.facadeModuleId) {
-        preloadChunkMap.set(chunk.facadeModuleId, chunk.fileName);
+        const canonicalKey = toCanonicalPreloadUrl(chunk.facadeModuleId);
+        if (canonicalKey) {
+          preloadChunkMap.set(canonicalKey, chunk.fileName);
+        }
       }
       if (chunk.modules) {
         const modIds = Array.isArray(chunk.modules) ? chunk.modules : Object.keys(chunk.modules);
         for (const modId of modIds) {
-          preloadChunkMap.set(modId, chunk.fileName);
+          const canonicalKey = toCanonicalPreloadUrl(modId);
+          if (canonicalKey) {
+            preloadChunkMap.set(canonicalKey, chunk.fileName);
+          }
         }
       }
     }
@@ -613,10 +655,18 @@ export async function buildApplication(entryPath, outDir, options = {}) {
       // Browser URI semantics: resolve against referrer directory URL using new URL,
       // then convert file: URL object directly to decoded filesystem path via fileURLToPath.
       // Preserves %20 and other percent-encodings as actual filename bytes on disk.
-      const referrerDirSlash = referrerDir.endsWith(path.sep) ? referrerDir : referrerDir + path.sep;
-      const referrerBaseUrl = pathToFileURL(referrerDirSlash);
-      const resolvedUrl = new URL(trimmedRelUrl, referrerBaseUrl);
-      const srcAssetAbs = fileURLToPath(resolvedUrl);
+      // Wrapped in try/catch to safely handle asset paths containing unencoded literal '%'
+      // not followed by two hex digits (e.g. <img src="./100%_sale.png">).
+      let srcAssetAbs;
+      try {
+        const referrerDirSlash = referrerDir.endsWith(path.sep) ? referrerDir : referrerDir + path.sep;
+        const referrerBaseUrl = pathToFileURL(referrerDirSlash);
+        const resolvedUrl = new URL(trimmedRelUrl, referrerBaseUrl);
+        srcAssetAbs = fileURLToPath(resolvedUrl);
+      } catch {
+        const cleanRelPath = trimmedRelUrl.split(/[?#]/)[0];
+        srcAssetAbs = path.resolve(referrerDir, cleanRelPath);
+      }
 
       // Verify that relative asset path does not escape entry directory
       const relFromEntryDir = path.relative(entryDir, srcAssetAbs);
@@ -625,7 +675,16 @@ export async function buildApplication(entryPath, outDir, options = {}) {
         throw new Error(`Relative resource${context} escapes application root directory: "${relUrl}"`);
       }
 
-      // Check whether this path matches an emitted chunk (e.g. modulepreload referencing an emitted chunk)
+      // Pre-emission collision check: a classic script, stylesheet, or asset must NOT collide
+      // with or silently overwrite/shadow an emitted chunk or the entry HTML file.
+      if (emittedChunkNames.has(relFromEntryDir)) {
+        const context = referrerPath !== resolvedEntryAbs ? ` referenced from "${referrerPath}"` : '';
+        throw new Error(
+          `Collision detected: relative resource "${relUrl}"${context} collides with emitted bundle chunk or entry file "${relFromEntryDir}". Source assets must not collide with emitted chunk names.`
+        );
+      }
+
+      // If asset was already processed and added to targetFiles during this run, skip duplicate copy
       if (targetFiles.has(relFromEntryDir)) {
         continue;
       }

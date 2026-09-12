@@ -30,7 +30,9 @@ import {
   isRelativeUrl,
   extractRelativeAssetUrls,
   extractRelativeCssUrls,
-  findChunkForPreload
+  stripCssComments,
+  findChunkForPreload,
+  toCanonicalPreloadUrl
 } from './build_application.mjs';
 import { parseHtmlEntries, stripScriptAndStyleBodies, stripHtmlComments } from './html_parser.mjs';
 
@@ -1193,7 +1195,7 @@ test('contextual scanner handles interleaved comments, styles, and scripts with 
 
 test('findChunkForPreload resolves exact canonical URLs with query variants without stripping (OrangePelican repro)', () => {
   const map = new Map([
-    ['./same.js', 'a.js'],
+    ['file:///tmp/app/same.js', 'a.js'],
     ['file:///tmp/app/same.js?b', 'b.js']
   ]);
 
@@ -1464,10 +1466,95 @@ test('buildApplication does not reject or attempt to copy content: "url(phantom.
   const res = await buildApplication(path.join(scratch, 'index.html'), outDir);
   assert.equal(res.isHtml, true);
 
-  // real_image.png MUST be copied
+  // style.css and real_image.png MUST be copied
+  assert.ok(fs.existsSync(path.join(outDir, 'style.css')), 'style.css must be emitted');
   assert.ok(fs.existsSync(path.join(outDir, 'real_image.png')), 'real_image.png must be copied to output');
 
   // phantom.png must NOT exist in output
   assert.equal(fs.existsSync(path.join(outDir, 'phantom.png')), false, 'phantom.png must not be emitted');
   assert.equal(fs.existsSync(path.join(outDir, 'phantom_comment.png')), false, 'phantom_comment.png must not be emitted');
+});
+
+test('stripCssComments removes CSS comments while preserving comment-like strings in quotes', () => {
+  const css = `
+    /* header comment */
+    .btn {
+      content: "/* not a comment */";
+      font-family: '/* still not a comment */';
+      background: url("img/*test*/.png");
+    }
+    /* footer comment */
+  `;
+  const stripped = stripCssComments(css);
+  assert.equal(stripped.includes('header comment'), false, 'Header comment must be stripped');
+  assert.equal(stripped.includes('footer comment'), false, 'Footer comment must be stripped');
+  assert.ok(stripped.includes('"/* not a comment */"'), 'Double-quoted comment-like string must be preserved');
+  assert.ok(stripped.includes("'/* still not a comment */'"), 'Single-quoted comment-like string must be preserved');
+  assert.ok(stripped.includes('"img/*test*/.png"'), 'Quoted URL with comment-like string must be preserved');
+});
+
+test('buildApplication rejects when a classic script or asset collides with an emitted bundle chunk', async () => {
+  const scratch = makeScratch('f3d_app_chunk_collision');
+  const outDir = path.join(scratch, 'dist');
+
+  fs.writeFileSync(path.join(scratch, 'main.js'), 'export const isModule = true;\n');
+
+  // Both a module script and a classic non-module script referencing ./main.js
+  const html = `<!DOCTYPE html>
+<html>
+<head>
+  <script type="module" src="./main.js"></script>
+  <script src="./main.js"></script>
+</head>
+<body></body>
+</html>`;
+  fs.writeFileSync(path.join(scratch, 'index.html'), html);
+
+  await assert.rejects(
+    async () => {
+      await buildApplication(path.join(scratch, 'index.html'), outDir);
+    },
+    /Collision detected: relative resource "\.\/main\.js" collides with emitted bundle chunk or entry file "main\.js"/
+  );
+});
+
+test('toCanonicalPreloadUrl normalizes OS paths to file:// URLs and preserves scheme URLs', () => {
+  const osPath = path.resolve('/tmp/app/module.js');
+  const canonical = toCanonicalPreloadUrl(osPath);
+  assert.ok(canonical.startsWith('file://'), 'Must convert OS path to file:// URL');
+  assert.ok(canonical.endsWith('/module.js'), 'Must preserve file path in URL');
+
+  const fileUrl = 'file:///tmp/app/module.js?v=1#hash';
+  assert.equal(toCanonicalPreloadUrl(fileUrl), fileUrl, 'Must preserve existing file:// URL with query and hash');
+
+  const httpUrl = 'https://cdn.example.com/lib.js';
+  assert.equal(toCanonicalPreloadUrl(httpUrl), httpUrl, 'Must preserve existing http(s):// URL');
+});
+
+test('buildApplication handles asset paths containing literal % not followed by two hex digits without URIError', async () => {
+  const scratch = makeScratch('f3d_app_percent_asset');
+  const outDir = path.join(scratch, 'dist');
+
+  // Asset with literal % not valid in URL encoding: 100%_sale.png
+  const imgPath = path.join(scratch, '100%_sale.png');
+  fs.writeFileSync(imgPath, Buffer.from([100, 37, 0]));
+
+  fs.writeFileSync(path.join(scratch, 'main.js'), 'export const ready = true;\n');
+
+  const html = `<!DOCTYPE html>
+<html>
+<head>
+  <script type="module" src="./main.js"></script>
+</head>
+<body>
+  <img src="./100%_sale.png">
+</body>
+</html>`;
+  fs.writeFileSync(path.join(scratch, 'index.html'), html);
+
+  const res = await buildApplication(path.join(scratch, 'index.html'), outDir);
+  assert.equal(res.isHtml, true);
+
+  // 100%_sale.png must be copied into outDir
+  assert.ok(fs.existsSync(path.join(outDir, '100%_sale.png')), '100%_sale.png must be copied to output');
 });
