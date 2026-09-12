@@ -366,3 +366,35 @@ fn test_vector2_set_component_out_of_range_panics() {
     let mut v = Vector2::new(1.0, 2.0);
     v.set_component(2, 5.0);
 }
+
+#[test]
+fn test_vector2_slice_offset_valid_and_out_of_range_behavior() {
+    // 1. Valid slice with nonzero offset from sentinel buffer: matches Three.js Vector2.fromArray(src, 2)
+    let src = [99.0, 99.0, 1.5, -2.5, 99.0];
+    let mut v = Vector2::zero();
+    v.from_slice_offset(&src, 2);
+    assert_eq!(v.x, 1.5, "v.x after from_slice_offset(src, 2)");
+    assert_eq!(v.y, -2.5, "v.y after from_slice_offset(src, 2)");
+
+    // 2. to_slice_offset into sentinel buffer at nonzero offset: matches Three.js Vector2.toArray(dst, 1)
+    let mut dst = [99.0, 0.0, 0.0, 99.0];
+    v.to_slice_offset(&mut dst, 1);
+    assert_eq!(dst, [99.0, 1.5, -2.5, 99.0], "dst buffer with sentinels preserved");
+
+    // 3. Native out-of-range behavior: panics on short slice; partial write occurs before out-of-bounds index
+    let short_src = [7.0];
+    let mut v_partial = Vector2::new(100.0, 200.0);
+    let res_src = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        v_partial.from_slice_offset(&short_src, 0);
+    }));
+    assert!(res_src.is_err(), "must panic when src slice is too short");
+    assert_eq!(v_partial.x, 7.0, "self.x updated before panic on offset + 1");
+    assert_eq!(v_partial.y, 200.0, "self.y untouched");
+
+    let mut short_dst = [0.0];
+    let res_dst = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        v.to_slice_offset(&mut short_dst, 0);
+    }));
+    assert!(res_dst.is_err(), "must panic when dst slice is too short");
+    assert_eq!(short_dst[0], 1.5, "dst[0] updated before panic on offset + 1");
+}

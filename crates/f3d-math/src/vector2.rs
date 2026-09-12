@@ -500,6 +500,37 @@ impl Vector2 {
         Self { x: a[0], y: a[1] }
     }
 
+    /// Reads 2 components from slice `array` starting at `offset` into `self`.
+    ///
+    /// Equivalent to Three.js `Vector2.fromArray(array, offset)` on valid slices.
+    ///
+    /// Requires `array.len() >= offset + 2`.
+    ///
+    /// # Panics
+    /// Panics if `offset + 2 > array.len()`. If `offset < array.len()`, components
+    /// read before the out-of-bounds index will be updated on `self` before panic (partial write).
+    #[inline]
+    pub fn from_slice_offset(&mut self, array: &[f64], offset: usize) -> &mut Self {
+        self.x = array[offset];
+        self.y = array[offset + 1];
+        self
+    }
+
+    /// Writes 2 components of `self` into mutable slice `array` starting at `offset`.
+    ///
+    /// Equivalent to Three.js `Vector2.toArray(array, offset)` on valid slices.
+    ///
+    /// Requires `array.len() >= offset + 2`.
+    ///
+    /// # Panics
+    /// Panics if `offset + 2 > array.len()`. If `offset < array.len()`, elements
+    /// written before the out-of-bounds index will remain modified in `array` before panic (partial write).
+    #[inline]
+    pub fn to_slice_offset(&self, array: &mut [f64], offset: usize) {
+        array[offset] = self.x;
+        array[offset + 1] = self.y;
+    }
+
     /// Narrows this `f64` vector into `[f32; 2]`, verifying that precision loss does not
     /// exceed `max_abs_err` or `max_rel_err`.
     ///
