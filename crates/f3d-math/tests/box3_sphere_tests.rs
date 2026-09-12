@@ -2,6 +2,7 @@
 
 use f3d_math::box3::Box3;
 use f3d_math::matrix4::Matrix4;
+use f3d_math::plane::Plane;
 use f3d_math::sphere::Sphere;
 use f3d_math::vector3::Vector3;
 
@@ -334,4 +335,76 @@ fn test_sphere_union_and_expand() {
     s_small.union(&s1); // s1 encloses s_small
     assert_vec_close(&s_small.center, [0.0, 0.0, 0.0], EPS, "enclosing union center");
     assert_close(s_small.radius, 1.0, EPS, "enclosing union radius");
+}
+
+#[test]
+fn test_upstream_r186_empty_and_inverted_intersection_parity() {
+    let origin = Vector3::zero();
+    let s_default = Sphere::default();
+    let mut s_empty = Sphere::default();
+    s_empty.make_empty();
+
+    // 1. new Sphere().containsPoint(origin) = true
+    assert!(s_default.contains_point(&origin), "new Sphere().containsPoint(origin) must be true");
+    assert!(s_empty.contains_point(&origin), "emptySphere.containsPoint(origin) must be true");
+
+    // 2. emptySphere.intersectsSphere(itself) = true
+    assert!(s_empty.intersects_sphere(&s_empty), "emptySphere.intersectsSphere(itself) must be true");
+    assert!(s_default.intersects_sphere(&s_default), "default Sphere intersects itself");
+
+    // 3. box[-10,10].intersectsSphere(new Sphere()) = true (and symmetric)
+    let b_10 = Box3::new(Vector3::new(-10.0, -10.0, -10.0), Vector3::new(10.0, 10.0, 10.0));
+    assert!(b_10.intersects_sphere(&s_default), "box[-10,10].intersectsSphere(new Sphere()) must be true");
+    assert!(s_default.intersects_box(&b_10), "new Sphere().intersectsBox(box[-10,10]) must be true");
+    assert!(b_10.intersects_sphere(&s_empty), "box[-10,10].intersectsSphere(emptySphere) must be true");
+    assert!(s_empty.intersects_box(&b_10), "emptySphere.intersectsBox(box[-10,10]) must be true");
+
+    // 4. box[-10,10].intersectsBox(inverted min=1 max=-1) = true (and symmetric)
+    let inv = Box3::new(Vector3::new(1.0, 1.0, 1.0), Vector3::new(-1.0, -1.0, -1.0));
+    assert!(b_10.intersects_box(&inv), "box[-10,10].intersectsBox(inv) must be true");
+    assert!(inv.intersects_box(&b_10), "inv.intersectsBox(box[-10,10]) must be true");
+
+    // Authored negative radius arithmetic parity
+    let s_neg = Sphere::new(Vector3::zero(), -5.0);
+    assert!(s_neg.contains_point(&origin), "Sphere(0, -5).containsPoint(0) must be true (0 <= 25)");
+    assert!(s_neg.contains_point(&Vector3::new(4.0, 0.0, 0.0)), "Sphere(0, -5).containsPoint(4,0,0) must be true (16 <= 25)");
+    assert!(!s_neg.contains_point(&Vector3::new(6.0, 0.0, 0.0)), "Sphere(0, -5).containsPoint(6,0,0) must be false (36 <= 25)");
+    assert!(s_neg.intersects_sphere(&s_neg), "Sphere(0, -5).intersectsSphere(itself) must be true (0 <= 100)");
+
+    // Plane intersection arithmetic parity (no is_empty guards)
+    let plane_origin = Plane::new(Vector3::new(0.0, 1.0, 0.0), 0.0);
+    assert!(!s_empty.intersects_plane(&plane_origin), "emptySphere.intersectsPlane(plane) is false (|0| <= -1 is false)");
+    assert!(b_10.intersects_plane(&plane_origin), "box[-10,10].intersectsPlane(plane) is true");
+    assert!(!inv.intersects_plane(&plane_origin), "inverted box intersectsPlane(plane) is false");
+
+    // Inverted box clamp_point evaluates Math.max(min, Math.min(max, value))
+    let inv_clamp = Box3::new(Vector3::new(1.0, 2.0, 3.0), Vector3::new(-1.0, -2.0, -3.0));
+    let clamped_inv = inv_clamp.clamp_point(&origin);
+    assert_vec_close(&clamped_inv, [1.0, 2.0, 3.0], EPS, "inverted box clamp_point returns min bound");
+
+    // NaN point coordinates in clamp_point propagate NaN per ECMA Math.max/min
+    let nan_pt = Vector3::new(f64::NAN, 0.0, 0.0);
+    let clamped_nan_pt = b_10.clamp_point(&nan_pt);
+    assert!(clamped_nan_pt.x.is_nan(), "clamped NaN x is NaN");
+    assert_close(clamped_nan_pt.y, 0.0, EPS, "clamped y remains 0.0");
+    assert_close(clamped_nan_pt.z, 0.0, EPS, "clamped z remains 0.0");
+
+    let inv_clamped_nan = inv_clamp.clamp_point(&nan_pt);
+    assert!(inv_clamped_nan.x.is_nan(), "inverted clamped NaN x is NaN");
+    assert_close(inv_clamped_nan.y, 2.0, EPS, "inverted clamped y is 2.0");
+    assert_close(inv_clamped_nan.z, 3.0, EPS, "inverted clamped z is 3.0");
+
+    // NaN box bounds in clamp_point propagate NaN
+    let nan_box = Box3::new(Vector3::new(f64::NAN, -5.0, -5.0), Vector3::new(5.0, 5.0, 5.0));
+    let clamped_nan_box = nan_box.clamp_point(&origin);
+    assert!(clamped_nan_box.x.is_nan(), "nan_box clamped x is NaN");
+    assert_close(clamped_nan_box.y, 0.0, EPS, "nan_box clamped y is 0.0");
+    assert_close(clamped_nan_box.z, 0.0, EPS, "nan_box clamped z is 0.0");
+
+    // NaN sphere center in predicates returns false
+    let s_nan = Sphere::new(Vector3::new(f64::NAN, 0.0, 0.0), 1.0);
+    assert!(!b_10.intersects_sphere(&s_nan), "box intersects_sphere with NaN center is false");
+    assert!(!inv_clamp.intersects_sphere(&s_nan), "inv intersects_sphere with NaN center is false");
+    assert!(!s_nan.intersects_sphere(&s_default), "NaN sphere intersects_sphere is false");
+    assert!(!s_nan.contains_point(&origin), "NaN sphere contains_point is false");
 }

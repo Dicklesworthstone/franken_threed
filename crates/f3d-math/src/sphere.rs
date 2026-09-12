@@ -94,9 +94,6 @@ impl Sphere {
     /// Matches Three.js r186 `Sphere.containsPoint(point)`.
     #[inline]
     pub fn contains_point(&self, point: &Vector3) -> bool {
-        if self.is_empty() {
-            return false;
-        }
         point.distance_to_squared(&self.center) <= self.radius * self.radius
     }
 
@@ -114,9 +111,6 @@ impl Sphere {
     /// Matches Three.js r186 `Sphere.intersectsSphere(sphere)`.
     #[inline]
     pub fn intersects_sphere(&self, other: &Sphere) -> bool {
-        if self.is_empty() || other.is_empty() {
-            return false;
-        }
         let radius_sum = self.radius + other.radius;
         self.center.distance_to_squared(&other.center) <= radius_sum * radius_sum
     }
@@ -134,9 +128,6 @@ impl Sphere {
     /// Matches Three.js r186 `Sphere.intersectsPlane(plane)`.
     #[inline]
     pub fn intersects_plane(&self, plane: &Plane) -> bool {
-        if self.is_empty() {
-            return false;
-        }
         plane.distance_to_point(&self.center).abs() <= self.radius
     }
 

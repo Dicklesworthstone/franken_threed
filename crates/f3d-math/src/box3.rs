@@ -1,6 +1,7 @@
 //! 3D axis-aligned bounding box (AABB) with `f64` public semantics matching Three.js r186 `Box3`.
 
 use core::fmt;
+use crate::jsnum::{js_max, js_min};
 use crate::matrix4::Matrix4;
 use crate::plane::Plane;
 use crate::sphere::Sphere;
@@ -159,12 +160,9 @@ impl Box3 {
     /// Returns `true` if this bounding box intersects the given bounding box.
     ///
     /// Matches Three.js r186 `Box3.intersectsBox(box)`:
-    /// Uses 6 splitting planes to test overlap. Empty boxes never intersect.
+    /// Uses 6 splitting planes to test overlap.
     #[inline]
     pub fn intersects_box(&self, other: &Box3) -> bool {
-        if self.is_empty() || other.is_empty() {
-            return false;
-        }
         other.max.x >= self.min.x
             && other.min.x <= self.max.x
             && other.max.y >= self.min.y
@@ -179,9 +177,6 @@ impl Box3 {
     /// Finds the closest point on the AABB to the sphere center and tests if distance <= radius.
     #[inline]
     pub fn intersects_sphere(&self, sphere: &Sphere) -> bool {
-        if self.is_empty() || sphere.is_empty() {
-            return false;
-        }
         let closest = self.clamp_point(&sphere.center);
         closest.distance_to_squared(&sphere.center) <= sphere.radius * sphere.radius
     }
@@ -190,10 +185,6 @@ impl Box3 {
     ///
     /// Matches Three.js r186 `Box3.intersectsPlane(plane)`.
     pub fn intersects_plane(&self, plane: &Plane) -> bool {
-        if self.is_empty() {
-            return false;
-        }
-
         let min_val;
         let max_val;
 
@@ -289,9 +280,9 @@ impl Box3 {
     #[inline]
     pub fn clamp_point(&self, point: &Vector3) -> Vector3 {
         Vector3::new(
-            point.x.clamp(self.min.x, self.max.x),
-            point.y.clamp(self.min.y, self.max.y),
-            point.z.clamp(self.min.z, self.max.z),
+            clamp_scalar(point.x, self.min.x, self.max.x),
+            clamp_scalar(point.y, self.min.y, self.max.y),
+            clamp_scalar(point.z, self.min.z, self.max.z),
         )
     }
 
@@ -436,6 +427,11 @@ impl fmt::Display for Box3 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Box3(min: {}, max: {})", self.min, self.max)
     }
+}
+
+#[inline]
+fn clamp_scalar(value: f64, min: f64, max: f64) -> f64 {
+    js_max(min, js_min(max, value))
 }
 
 #[inline]
