@@ -1975,8 +1975,11 @@ test('extractJsModuleDependencies propagates actual parse error if neither modul
 });
 
 test('buildApplication preserves importmap verbatim alongside classic scripts with dynamic import', async () => {
+  const repoRoot = fileURLToPath(new URL('../../', import.meta.url));
   const scratch = makeScratch('f3d_app_importmap_classic');
-  const outDir = path.join(scratch, 'dist');
+  const outDir = process.env.F3D_APP_FIXTURE_OUT
+    ? path.resolve(repoRoot, process.env.F3D_APP_FIXTURE_OUT)
+    : path.join(scratch, 'dist');
 
   const html = `<!DOCTYPE html>
 <html>
@@ -1990,7 +1993,7 @@ test('buildApplication preserves importmap verbatim alongside classic scripts wi
   <script id="shader-block" type="x-shader/x-vertex">
     void main() { /* import('./phantom_shader.js') */ }
   </script>
-  <script>
+  <script type="text/javascript; charset=utf-8">
     // Inline classic script 1: verifies globals and execution order
     window.__classicOrder = ['inline1'];
     window.loadDep = () => import('dynamic-dep');
@@ -2001,66 +2004,81 @@ test('buildApplication preserves importmap verbatim alongside classic scripts wi
     // Inline classic self-check: executes dynamic imports via browser importmap,
     // verifies classic globals/order, and reports results to /report when under test harness.
     window.__browserCheckComplete = (async () => {
+      const loadExtDefined = typeof window.loadExt === 'function';
+      const orderOk = Array.isArray(window.__classicOrder) &&
+        window.__classicOrder.length === 2 &&
+        window.__classicOrder[0] === 'inline1' &&
+        window.__classicOrder[1] === 'external';
+
       try {
-        const orderOk = Array.isArray(window.__classicOrder) &&
-          window.__classicOrder.length === 2 &&
-          window.__classicOrder[0] === 'inline1' &&
-          window.__classicOrder[1] === 'external';
+        if (document.readyState === 'loading') {
+          await new Promise(resolve => window.addEventListener('DOMContentLoaded', resolve, { once: true }));
+        }
 
         const depMod = await window.loadDep();
         const extMod = await window.loadExt();
 
         const depOk = Boolean(depMod && depMod.depOk === true);
         const extOk = Boolean(extMod && extMod.extOk === true);
-        const passed = orderOk && depOk && extOk;
+        const mainOk = Boolean(window.__mainOk === true);
+        const passed = Boolean(orderOk && loadExtDefined && depOk && extOk && mainOk);
 
         const results = {
           orderOk,
+          loadExtDefined,
           depOk,
           extOk,
+          mainOk,
           observedOrder: window.__classicOrder,
           depValue: depMod ? depMod.depOk : undefined,
           extValue: extMod ? extMod.extOk : undefined
         };
 
-        window.__browserCheckResults = { passed, results };
+        const payload = {
+          passed,
+          results,
+          test: 'classic-import-self-check',
+          ...(passed ? {} : { error: 'Self-check assertions failed: ' + JSON.stringify(results) })
+        };
+
+        window.__browserCheckResults = payload;
 
         if (typeof fetch === 'function') {
           try {
             await fetch('/report', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                passed,
-                results,
-                test: 'classic-import-self-check',
-                detail: passed
-                  ? 'Emitted-page classic dynamic imports, importmap resolution, and run order verified'
-                  : 'Emitted-page classic self-check failed'
-              })
+              body: JSON.stringify(payload)
             });
           } catch (_) {}
         }
-        return { passed, results };
+        return payload;
       } catch (err) {
-        const results = { passed: false, error: String(err?.message || err) };
-        window.__browserCheckResults = results;
+        const errorMsg = String(err?.message || err);
+        const payload = {
+          passed: false,
+          results: {
+            orderOk,
+            loadExtDefined,
+            depOk: false,
+            extOk: false,
+            mainOk: Boolean(window.__mainOk === true),
+            observedOrder: window.__classicOrder
+          },
+          error: errorMsg,
+          test: 'classic-import-self-check'
+        };
+        window.__browserCheckResults = payload;
         if (typeof fetch === 'function') {
           try {
             await fetch('/report', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                passed: false,
-                results,
-                error: String(err?.message || err),
-                test: 'classic-import-self-check',
-                detail: 'Exception during classic self-check: ' + (err?.message || err)
-              })
+              body: JSON.stringify(payload)
             });
           } catch (_) {}
         }
-        return results;
+        return payload;
       }
     })();
   </script>
@@ -2069,7 +2087,10 @@ test('buildApplication preserves importmap verbatim alongside classic scripts wi
 </html>`;
 
   fs.writeFileSync(path.join(scratch, 'index.html'), html);
-  fs.writeFileSync(path.join(scratch, 'main.js'), 'export const mainOk = true;\n');
+  fs.writeFileSync(
+    path.join(scratch, 'main.js'),
+    'if (typeof window !== "undefined") { window.__mainOk = true; }\nexport const mainOk = true;\n'
+  );
   fs.writeFileSync(
     path.join(scratch, 'dep.js'),
     'import { nestedOk } from "./nested.js";\nexport const depOk = nestedOk;\n'
@@ -2077,7 +2098,8 @@ test('buildApplication preserves importmap verbatim alongside classic scripts wi
   fs.writeFileSync(path.join(scratch, 'nested.js'), 'export const nestedOk = true;\n');
   fs.writeFileSync(
     path.join(scratch, 'external_classic.js'),
-    'if (window.__classicOrder) { window.__classicOrder.push("external"); }\nwindow.loadExt = () => import("./ext_dep.js");\n'
+    'if (typeof window !== "undefined" && window.__classicOrder) { window.__classicOrder.push("external"); }\n' +
+    'if (typeof window !== "undefined") { window.loadExt = () => import("./ext_dep.js"); }\n'
   );
   fs.writeFileSync(path.join(scratch, 'ext_dep.js'), 'export const extOk = true;\n');
 
@@ -2086,7 +2108,7 @@ test('buildApplication preserves importmap verbatim alongside classic scripts wi
 
   // Optional artifact directory copy for remote browser execution lane
   const probeOut = process.env.F3D_BROWSER_PROBE_OUT || process.env.F3D_RESULT_DIR;
-  if (probeOut) {
+  if (probeOut && path.resolve(probeOut) !== path.resolve(outDir)) {
     fs.mkdirSync(probeOut, { recursive: true });
     for (const relFile of res.emittedFiles) {
       const srcPath = path.join(outDir, relFile);
@@ -2100,27 +2122,23 @@ test('buildApplication preserves importmap verbatim alongside classic scripts wi
 
   // 1. Import map must be preserved verbatim
   assert.ok(
-    rewrittenHtml.includes('<script type="importmap">'),
-    'Import map must be preserved verbatim in emitted HTML'
-  );
-  assert.ok(
-    rewrittenHtml.includes('"dynamic-dep": "./dep.js"'),
-    'Import map contents must be preserved verbatim'
+    rewrittenHtml.includes('{ "imports": { "dynamic-dep": "./dep.js" } }'),
+    'Import map must be preserved verbatim in rewritten HTML'
   );
 
-  // 2. Data blocks (JSON, shaders) must be preserved verbatim and not trigger phantom extractions
+  // 2. Non-JS data block script tags must be preserved verbatim without triggering bundle imports
   assert.ok(
-    rewrittenHtml.includes('<script id="data-block" type="application/json">'),
-    'JSON data block must be preserved verbatim'
+    rewrittenHtml.includes('{ "config": "import(\'./phantom_data.js\')" }'),
+    'JSON data block script must be preserved verbatim'
   );
   assert.ok(
-    rewrittenHtml.includes('<script id="shader-block" type="x-shader/x-vertex">'),
-    'Shader data block must be preserved verbatim'
+    rewrittenHtml.includes('void main() { /* import(\'./phantom_shader.js\') */ }'),
+    'Shader data block script must be preserved verbatim'
   );
   assert.equal(
     res.emittedFiles.includes('phantom_data.js'),
     false,
-    'Data block pseudo-import must never be emitted as dependency'
+    'JSON data block pseudo-import must never be emitted as dependency'
   );
   assert.equal(
     res.emittedFiles.includes('phantom_shader.js'),
@@ -2129,6 +2147,10 @@ test('buildApplication preserves importmap verbatim alongside classic scripts wi
   );
 
   // 3. Inline classic script 1 using dynamic import must be preserved verbatim
+  assert.ok(
+    rewrittenHtml.includes('type="text/javascript; charset=utf-8"'),
+    'Inline classic script with MIME parameter must be preserved verbatim'
+  );
   assert.ok(
     rewrittenHtml.includes("window.__classicOrder = ['inline1'];"),
     'Inline classic script 1 must be preserved verbatim'
@@ -2174,6 +2196,9 @@ test('buildApplication preserves importmap verbatim alongside classic scripts wi
 
   const extModule = await import(pathToFileURL(path.join(outDir, 'ext_dep.js')).href);
   assert.equal(extModule.extOk, true, 'ext_dep.js must execute successfully from outDir');
+
+  const mainModule = await import(pathToFileURL(path.join(outDir, res.entryFiles[0])).href);
+  assert.equal(mainModule.mainOk, true, 'main entry chunk must execute successfully from outDir');
 });
 
 test('buildApplication rejects unresolvable dynamic imports in retained classic scripts honestly', async () => {
