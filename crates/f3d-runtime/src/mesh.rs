@@ -23,7 +23,7 @@ use core::fmt;
 
 use f3d_core::{
     handle::{Handle, MaterialDomain},
-    layout::{aligned_bytes_per_row, VERTEX_POS_UV_STRIDE, VertexPosUv},
+    layout::{aligned_bytes_per_row, VERTEX_POS_COLOR_STRIDE, VERTEX_POS_UV_STRIDE, VertexPosColor, VertexPosUv},
     ownership::{DataVersion, Epoch},
 };
 use f3d_graph::{
@@ -76,6 +76,8 @@ pub enum MeshPacketError {
     InvalidColorWrite { value: u8 },
     /// Array length mismatch for color write array in batch submission.
     InvalidColorWriteArrayLength { expected: usize, actual: usize },
+    /// Array length mismatch for vertex colors in batch submission.
+    InvalidVertexColorLength { expected: usize, actual: usize },
     /// Target dimension alignment, vertex count, or row pitch calculation failed.
     InvalidDimensions(String),
     /// Render session, graph compilation, or plan lowering error.
@@ -137,6 +139,9 @@ impl fmt::Display for MeshPacketError {
             }
             Self::InvalidColorWriteArrayLength { expected, actual } => {
                 write!(f, "color_writes array length must match mesh count {expected} (got {actual})")
+            }
+            Self::InvalidVertexColorLength { expected, actual } => {
+                write!(f, "vertex_colors array length must match total vertex count * 4 = {expected} (got {actual})")
             }
             Self::InvalidDimensions(msg) => write!(f, "invalid dimensions: {msg}"),
             Self::SessionError(msg) => write!(f, "render session error: {msg}"),
@@ -201,6 +206,7 @@ pub struct DynamicMeshInput<'a> {
     cull: Option<(u32, u32)>,
     depth: Option<MeshDepthOptions>,
     color_write: bool,
+    vertex_colors: Option<&'a [f32]>,
 }
 
 impl<'a> DynamicMeshInput<'a> {
@@ -278,6 +284,7 @@ impl<'a> DynamicMeshInput<'a> {
             cull: None,
             depth: None,
             color_write: true,
+            vertex_colors: None,
         })
     }
 
@@ -333,6 +340,29 @@ impl<'a> DynamicMeshInput<'a> {
     #[must_use]
     pub fn color_write(&self) -> bool {
         self.color_write
+    }
+
+    /// Configures optional per-vertex RGBA colors for this mesh.
+    ///
+    /// # Errors
+    /// Returns [`MeshPacketError::InvalidVertexColorLength`] if length does not match `(positions.len() / 3) * 4`.
+    pub fn with_vertex_colors(mut self, vertex_colors: &'a [f32]) -> Result<Self, MeshPacketError> {
+        let expected_len = (self.positions.len() / 3) * 4;
+        if vertex_colors.len() != expected_len {
+            return Err(MeshPacketError::InvalidVertexColorLength {
+                expected: expected_len,
+                actual: vertex_colors.len(),
+            });
+        }
+        self.vertex_colors = Some(vertex_colors);
+        Ok(self)
+    }
+
+    /// Returns the per-vertex RGBA colors if configured.
+    #[inline]
+    #[must_use]
+    pub fn vertex_colors(&self) -> Option<&'a [f32]> {
+        self.vertex_colors
     }
 
     /// Returns the explicit face culling and front-face winding if configured.
@@ -485,14 +515,31 @@ fn compute_depth_tag(depth_write_enabled: bool, depth_compare: u32) -> u32 {
 ///
 /// When `output_srgb` is `false` (offscreen render target), the shader retains linear-sRGB output
 /// matching default upstream `RenderTarget` working space.
-fn generate_mesh_wgsl_internal(webgl_depth: bool, output_srgb: bool) -> String {
+fn generate_mesh_wgsl_internal(webgl_depth: bool, output_srgb: bool, has_vertex_color: bool) -> String {
     let depth_remap = if webgl_depth {
         "    clip.z = (clip.z + clip.w) * 0.5;\n"
     } else {
         ""
     };
 
+    let (struct_defs, vs_assign) = if has_vertex_color {
+        (
+            "struct VertexInput {\n    @location(0) position: vec3<f32>,\n    @location(1) color: vec4<f32>,\n};\n\nstruct VertexOutput {\n    @builtin(position) clip_position: vec4<f32>,\n    @location(0) color: vec4<f32>,\n};\n",
+            "    out.color = in.color;\n",
+        )
+    } else {
+        (
+            "struct VertexInput {\n    @location(0) position: vec3<f32>,\n    @location(1) uv: vec2<f32>,\n};\n\nstruct VertexOutput {\n    @builtin(position) clip_position: vec4<f32>,\n    @location(0) uv: vec2<f32>,\n};\n",
+            "    out.uv = in.uv;\n",
+        )
+    };
+
     let (srgb_fn, fragment_body) = if output_srgb {
+        let eval_color = if has_vertex_color {
+            "    let linear_color = in.color * uniforms.color;\n    let srgb_rgb = srgb_transfer_oetf(linear_color.rgb);\n    return vec4<f32>(srgb_rgb, linear_color.a);\n"
+        } else {
+            "    let srgb_rgb = srgb_transfer_oetf(uniforms.color.rgb);\n    return vec4<f32>(srgb_rgb, uniforms.color.a);\n"
+        };
         (
             "\
 fn srgb_transfer_oetf(color: vec3<f32>) -> vec3<f32> {\n\
@@ -503,11 +550,15 @@ fn srgb_transfer_oetf(color: vec3<f32>) -> vec3<f32> {\n\
 }\n\
 \n\
 ",
-            "    let srgb_rgb = srgb_transfer_oetf(uniforms.color.rgb);\n\
-    return vec4<f32>(srgb_rgb, uniforms.color.a);\n",
+            eval_color,
         )
     } else {
-        ("", "    return uniforms.color;\n")
+        let eval_color = if has_vertex_color {
+            "    return in.color * uniforms.color;\n"
+        } else {
+            "    return uniforms.color;\n"
+        };
+        ("", eval_color)
     };
 
     alloc::format!(
@@ -521,15 +572,7 @@ struct MeshUniforms {{\n\
 @group(0) @binding(0)\n\
 var<uniform> uniforms: MeshUniforms;\n\
 \n\
-struct VertexInput {{\n\
-    @location(0) position: vec3<f32>,\n\
-    @location(1) uv: vec2<f32>,\n\
-}};\n\
-\n\
-struct VertexOutput {{\n\
-    @builtin(position) clip_position: vec4<f32>,\n\
-    @location(0) uv: vec2<f32>,\n\
-}};\n\
+{struct_defs}\
 \n\
 @vertex\n\
 fn vs_main(in: VertexInput) -> VertexOutput {{\n\
@@ -538,7 +581,7 @@ fn vs_main(in: VertexInput) -> VertexOutput {{\n\
     var clip = uniforms.projection * mv_pos;\n\
 {depth_remap}\
     out.clip_position = clip;\n\
-    out.uv = in.uv;\n\
+{vs_assign}\
     return out;\n\
 }}\n\
 \n\
@@ -559,21 +602,63 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{\n\
 /// upstream `RenderTarget` working space.
 #[must_use]
 pub fn generate_mesh_wgsl(webgl_depth: bool) -> String {
-    generate_mesh_wgsl_internal(webgl_depth, false)
+    generate_mesh_wgsl_internal(webgl_depth, false, false)
 }
 
-/// Helper: de-indexes vertex positions and formats the padded uniform buffer record.
+/// Helper: de-indexes vertex positions (and colors) and formats the padded uniform buffer record.
 fn prepare_vertex_and_uniform_data(
     input: &DynamicMeshInput<'_>,
+    use_vertex_color: bool,
 ) -> Result<(u32, u32, u32, Vec<u8>, Vec<u8>), MeshPacketError> {
-    let (vertex_count, vertex_bytes) = if input.indices.is_empty() {
+    let (vertex_count, vertex_bytes, vertex_stride) = if use_vertex_color {
+        let white_color = [1.0f32, 1.0, 1.0, 1.0];
+        if input.indices.is_empty() {
+            let v_count = input.positions.len() / 3;
+            let mut v_bytes = Vec::with_capacity(v_count * VertexPosColor::BYTE_SIZE);
+            for i in 0..v_count {
+                let pos = [input.positions[i * 3], input.positions[i * 3 + 1], input.positions[i * 3 + 2]];
+                let col = if let Some(vc) = input.vertex_colors {
+                    [vc[i * 4], vc[i * 4 + 1], vc[i * 4 + 2], vc[i * 4 + 3]]
+                } else {
+                    white_color
+                };
+                let vertex = VertexPosColor::new(pos, col);
+                v_bytes.extend_from_slice(&vertex.to_bytes());
+            }
+            (v_count, v_bytes, VertexPosColor::STRIDE)
+        } else {
+            let num_triangles = input.indices.len() / 3;
+            let effective_index_count = num_triangles * 3;
+            let vertex_count_avail = input.positions.len() / 3;
+            let mut v_bytes = Vec::with_capacity(effective_index_count * VertexPosColor::BYTE_SIZE);
+            for &idx in &input.indices[..effective_index_count] {
+                if (idx as usize) >= vertex_count_avail {
+                    return Err(MeshPacketError::IndexOutOfBounds {
+                        index: idx,
+                        vertex_count: vertex_count_avail,
+                    });
+                }
+                let base = (idx as usize) * 3;
+                let pos = [input.positions[base], input.positions[base + 1], input.positions[base + 2]];
+                let col = if let Some(vc) = input.vertex_colors {
+                    let col_base = (idx as usize) * 4;
+                    [vc[col_base], vc[col_base + 1], vc[col_base + 2], vc[col_base + 3]]
+                } else {
+                    white_color
+                };
+                let vertex = VertexPosColor::new(pos, col);
+                v_bytes.extend_from_slice(&vertex.to_bytes());
+            }
+            (effective_index_count, v_bytes, VertexPosColor::STRIDE)
+        }
+    } else if input.indices.is_empty() {
         let v_count = input.positions.len() / 3;
         let mut v_bytes = Vec::with_capacity(v_count * VertexPosUv::BYTE_SIZE);
         for chunk in input.positions.chunks_exact(3) {
             let vertex = VertexPosUv::new([chunk[0], chunk[1], chunk[2]], [0.0, 0.0]);
             v_bytes.extend_from_slice(&vertex.to_bytes());
         }
-        (v_count, v_bytes)
+        (v_count, v_bytes, VERTEX_POS_UV_STRIDE)
     } else {
         let num_triangles = input.indices.len() / 3;
         let effective_index_count = num_triangles * 3;
@@ -593,14 +678,14 @@ fn prepare_vertex_and_uniform_data(
             );
             v_bytes.extend_from_slice(&vertex.to_bytes());
         }
-        (effective_index_count, v_bytes)
+        (effective_index_count, v_bytes, VERTEX_POS_UV_STRIDE)
     };
 
     let vertex_count_u32 = u32::try_from(vertex_count)
         .map_err(|_| MeshPacketError::InvalidDimensions("vertex count exceeds u32::MAX".into()))?;
     let raw_vertex_bytes_len = u32::try_from(vertex_bytes.len())
         .map_err(|_| MeshPacketError::InvalidDimensions("vertex buffer bytes exceed u32::MAX".into()))?;
-    let vertex_stride_u32 = u32::try_from(VERTEX_POS_UV_STRIDE)
+    let vertex_stride_u32 = u32::try_from(vertex_stride)
         .map_err(|_| MeshPacketError::InvalidDimensions("vertex stride exceeds u32::MAX".into()))?;
 
     // WebGPU requires buffer size > 0; allocate minimum 4 bytes for empty geometry
@@ -703,13 +788,15 @@ fn build_multi_mesh_submission_internal(
         .ok_or_else(|| MeshPacketError::InvalidDimensions("readback size calculation overflow".into()))?;
 
     // 2. Prepare vertex data and uniform payloads for each mesh
+    let has_vertex_color = inputs.iter().any(|i| i.vertex_colors().is_some());
     let mut total_vertices: u32 = 0;
     let mut total_vertex_bytes: Vec<u8> = Vec::new();
     let mut mesh_draw_ranges: Vec<(u32, u32)> = Vec::with_capacity(inputs.len());
     let mut mesh_uniform_payloads: Vec<Vec<u8>> = Vec::with_capacity(inputs.len());
 
     for input in inputs {
-        let (v_count, _v_stride, _v_size, v_upload, u_bytes) = prepare_vertex_and_uniform_data(input)?;
+        let (v_count, _v_stride, _v_size, v_upload, u_bytes) =
+            prepare_vertex_and_uniform_data(input, has_vertex_color)?;
         let first_vertex = total_vertices;
         total_vertices = total_vertices
             .checked_add(v_count)
@@ -729,8 +816,12 @@ fn build_multi_mesh_submission_internal(
     } else {
         total_vertex_bytes
     };
-    let vertex_stride_u32 = u32::try_from(VERTEX_POS_UV_STRIDE)
-        .map_err(|_| MeshPacketError::InvalidDimensions("vertex stride exceeds u32::MAX".into()))?;
+    let vertex_stride_u32 = if has_vertex_color {
+        u32::try_from(VERTEX_POS_COLOR_STRIDE)
+    } else {
+        u32::try_from(VERTEX_POS_UV_STRIDE)
+    }
+    .map_err(|_| MeshPacketError::InvalidDimensions("vertex stride exceeds u32::MAX".into()))?;
 
     let uniform_buffer_size = u32::try_from(inputs.len())
         .map_err(|_| MeshPacketError::InvalidDimensions("mesh count exceeds u32::MAX".into()))?
@@ -840,7 +931,7 @@ fn build_multi_mesh_submission_internal(
         usage: BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST,
     });
 
-    let wgsl_code = generate_mesh_wgsl_internal(first.webgl_depth, false);
+    let wgsl_code = generate_mesh_wgsl_internal(first.webgl_depth, false, has_vertex_color);
     if has_explicit_cull || has_per_mesh_depth || has_color_write_override {
         if has_depth {
             for &(pipeline_id, cull_mode, front_face, depth_write_enabled, depth_compare, write_mask) in &unique_pipeline_configs {
@@ -1077,13 +1168,15 @@ fn build_multi_mesh_canvas_submission_internal(
     }
 
     // 2. Prepare vertex data and uniform payloads for each mesh
+    let has_vertex_color = inputs.iter().any(|i| i.vertex_colors().is_some());
     let mut total_vertices: u32 = 0;
     let mut total_vertex_bytes: Vec<u8> = Vec::new();
     let mut mesh_draw_ranges: Vec<(u32, u32)> = Vec::with_capacity(inputs.len());
     let mut mesh_uniform_payloads: Vec<Vec<u8>> = Vec::with_capacity(inputs.len());
 
     for input in inputs {
-        let (v_count, _v_stride, _v_size, v_upload, u_bytes) = prepare_vertex_and_uniform_data(input)?;
+        let (v_count, _v_stride, _v_size, v_upload, u_bytes) =
+            prepare_vertex_and_uniform_data(input, has_vertex_color)?;
         let first_vertex = total_vertices;
         total_vertices = total_vertices
             .checked_add(v_count)
@@ -1103,8 +1196,12 @@ fn build_multi_mesh_canvas_submission_internal(
     } else {
         total_vertex_bytes
     };
-    let vertex_stride_u32 = u32::try_from(VERTEX_POS_UV_STRIDE)
-        .map_err(|_| MeshPacketError::InvalidDimensions("vertex stride exceeds u32::MAX".into()))?;
+    let vertex_stride_u32 = if has_vertex_color {
+        u32::try_from(VERTEX_POS_COLOR_STRIDE)
+    } else {
+        u32::try_from(VERTEX_POS_UV_STRIDE)
+    }
+    .map_err(|_| MeshPacketError::InvalidDimensions("vertex stride exceeds u32::MAX".into()))?;
 
     let uniform_buffer_size = u32::try_from(inputs.len())
         .map_err(|_| MeshPacketError::InvalidDimensions("mesh count exceeds u32::MAX".into()))?
@@ -1199,7 +1296,7 @@ fn build_multi_mesh_canvas_submission_internal(
         });
     }
 
-    let wgsl_code = generate_mesh_wgsl_internal(first.webgl_depth, true);
+    let wgsl_code = generate_mesh_wgsl_internal(first.webgl_depth, true, has_vertex_color);
     if has_explicit_cull || has_per_mesh_depth || has_color_write_override {
         if has_depth {
             for &(pipeline_id, cull_mode, front_face, depth_write_enabled, depth_compare, write_mask) in &unique_pipeline_configs {
@@ -2095,9 +2192,8 @@ pub fn f3d_build_mesh_batch_packet(
     .map_err(|e| e.to_string())
 }
 
-/// Encodes a batch of dynamic Three.js meshes with explicit face culling, front-face winding,
-/// and per-mesh depth testing/writing into a unified submission packet.
-pub fn build_mesh_batch_cull_depth_color_packet_impl(
+/// Internal helper encoding a batch of dynamic Three.js meshes with optional per-vertex colors into a unified submission packet.
+fn build_mesh_batch_unified_internal(
     positions: &[f32],
     vertex_counts: &[u32],
     model_views: &[f64],
@@ -2113,6 +2209,7 @@ pub fn build_mesh_batch_cull_depth_color_packet_impl(
     height: u32,
     webgl_depth: bool,
     canvas: bool,
+    vertex_colors: Option<&[f32]>,
 ) -> Result<Vec<u8>, MeshPacketError> {
     let num_meshes = vertex_counts.len();
     if num_meshes == 0 {
@@ -2224,6 +2321,18 @@ pub fn build_mesh_batch_cull_depth_color_packet_impl(
         return Err(MeshPacketError::InvalidPositionLength { len: positions.len() });
     }
 
+    if let Some(vc) = vertex_colors {
+        let expected_vc_len = total_vertices
+            .checked_mul(4)
+            .ok_or_else(|| MeshPacketError::InvalidDimensions("total vertex colors length overflow".into()))?;
+        if vc.len() != expected_vc_len {
+            return Err(MeshPacketError::InvalidVertexColorLength {
+                expected: expected_vc_len,
+                actual: vc.len(),
+            });
+        }
+    }
+
     let mut inputs = Vec::with_capacity(num_meshes);
     let mut current_v_offset: usize = 0;
     for i in 0..num_meshes {
@@ -2234,7 +2343,7 @@ pub fn build_mesh_batch_cull_depth_color_packet_impl(
         let mv_slice = &model_views[i * 16..(i + 1) * 16];
         let col_slice = &colors[i * 4..(i + 1) * 4];
 
-        let input = DynamicMeshInput::try_from_raw(
+        let mut input = DynamicMeshInput::try_from_raw(
             pos_slice,
             &[],
             mv_slice,
@@ -2247,6 +2356,13 @@ pub fn build_mesh_batch_cull_depth_color_packet_impl(
         .with_cull(cull_modes[i] as u32, front_faces[i] as u32)?
         .with_depth_options(depth_tests[i] != 0, depth_writes[i] != 0, depth_compares[i])?
         .with_color_write(color_writes[i] != 0);
+
+        if let Some(vc) = vertex_colors {
+            let vc_start = current_v_offset * 4;
+            let vc_end = vc_start + v_count * 4;
+            input = input.with_vertex_colors(&vc[vc_start..vc_end])?;
+        }
+
         inputs.push(input);
         current_v_offset += v_count;
     }
@@ -2260,6 +2376,85 @@ pub fn build_mesh_batch_cull_depth_color_packet_impl(
     packet
         .encode()
         .map_err(|e| MeshPacketError::EncodeError(alloc::format!("{e:?}")))
+}
+
+/// Encodes a batch of dynamic Three.js meshes with explicit face culling, front-face winding,
+/// and per-mesh depth testing/writing into a unified submission packet.
+pub fn build_mesh_batch_cull_depth_color_packet_impl(
+    positions: &[f32],
+    vertex_counts: &[u32],
+    model_views: &[f64],
+    projection: &[f64],
+    colors: &[f32],
+    cull_modes: &[u8],
+    front_faces: &[u8],
+    depth_tests: &[u8],
+    depth_writes: &[u8],
+    depth_compares: &[u32],
+    color_writes: &[u8],
+    width: u32,
+    height: u32,
+    webgl_depth: bool,
+    canvas: bool,
+) -> Result<Vec<u8>, MeshPacketError> {
+    build_mesh_batch_unified_internal(
+        positions,
+        vertex_counts,
+        model_views,
+        projection,
+        colors,
+        cull_modes,
+        front_faces,
+        depth_tests,
+        depth_writes,
+        depth_compares,
+        color_writes,
+        width,
+        height,
+        webgl_depth,
+        canvas,
+        None,
+    )
+}
+
+/// Encodes a batch of dynamic Three.js meshes with explicit face culling, front-face winding,
+/// per-mesh depth testing/writing, per-mesh color write, and optional per-vertex colors into a unified submission packet.
+pub fn build_mesh_batch_vertex_color_packet_impl(
+    positions: &[f32],
+    vertex_counts: &[u32],
+    model_views: &[f64],
+    projection: &[f64],
+    colors: &[f32],
+    cull_modes: &[u8],
+    front_faces: &[u8],
+    depth_tests: &[u8],
+    depth_writes: &[u8],
+    depth_compares: &[u32],
+    color_writes: &[u8],
+    width: u32,
+    height: u32,
+    webgl_depth: bool,
+    canvas: bool,
+    vertex_colors: &[f32],
+) -> Result<Vec<u8>, MeshPacketError> {
+    build_mesh_batch_unified_internal(
+        positions,
+        vertex_counts,
+        model_views,
+        projection,
+        colors,
+        cull_modes,
+        front_faces,
+        depth_tests,
+        depth_writes,
+        depth_compares,
+        color_writes,
+        width,
+        height,
+        webgl_depth,
+        canvas,
+        Some(vertex_colors),
+    )
 }
 
 /// Encodes a batch of dynamic Three.js meshes with explicit face culling, front-face winding, and per-mesh depth into a unified submission packet.
@@ -2460,6 +2655,49 @@ pub fn f3d_build_mesh_batch_cull_depth_color_packet(
     .map_err(|e| wasm_bindgen::JsValue::from_str(&e.to_string()))
 }
 
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen]
+/// Encodes a batch of dynamic Three.js meshes with explicit face culling, front-face winding,
+/// per-mesh depth, per-mesh color write, and per-vertex colors into a unified submission packet (wasm-bindgen export).
+pub fn f3d_build_mesh_batch_vertex_color_packet(
+    positions: &[f32],
+    vertex_counts: &[u32],
+    model_views: &[f64],
+    projection: &[f64],
+    colors: &[f32],
+    cull_modes: &[u8],
+    front_faces: &[u8],
+    depth_tests: &[u8],
+    depth_writes: &[u8],
+    depth_compares: &[u32],
+    color_writes: &[u8],
+    width: u32,
+    height: u32,
+    webgl_depth: bool,
+    canvas: bool,
+    vertex_colors: &[f32],
+) -> Result<Vec<u8>, wasm_bindgen::JsValue> {
+    build_mesh_batch_vertex_color_packet_impl(
+        positions,
+        vertex_counts,
+        model_views,
+        projection,
+        colors,
+        cull_modes,
+        front_faces,
+        depth_tests,
+        depth_writes,
+        depth_compares,
+        color_writes,
+        width,
+        height,
+        webgl_depth,
+        canvas,
+        vertex_colors,
+    )
+    .map_err(|e| wasm_bindgen::JsValue::from_str(&e.to_string()))
+}
+
 #[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
 /// Encodes a batch of dynamic Three.js meshes with explicit face culling and front-face winding into a unified submission packet for host verification and unit tests.
 pub fn f3d_build_mesh_batch_cull_packet(
@@ -2569,6 +2807,48 @@ pub fn f3d_build_mesh_batch_cull_depth_color_packet(
         height,
         webgl_depth,
         canvas,
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
+/// Encodes a batch of dynamic Three.js meshes with explicit face culling, front-face winding,
+/// per-mesh depth, per-mesh color write, and per-vertex colors into a unified submission packet for host verification and unit tests.
+pub fn f3d_build_mesh_batch_vertex_color_packet(
+    positions: &[f32],
+    vertex_counts: &[u32],
+    model_views: &[f64],
+    projection: &[f64],
+    colors: &[f32],
+    cull_modes: &[u8],
+    front_faces: &[u8],
+    depth_tests: &[u8],
+    depth_writes: &[u8],
+    depth_compares: &[u32],
+    color_writes: &[u8],
+    width: u32,
+    height: u32,
+    webgl_depth: bool,
+    canvas: bool,
+    vertex_colors: &[f32],
+) -> Result<Vec<u8>, String> {
+    build_mesh_batch_vertex_color_packet_impl(
+        positions,
+        vertex_counts,
+        model_views,
+        projection,
+        colors,
+        cull_modes,
+        front_faces,
+        depth_tests,
+        depth_writes,
+        depth_compares,
+        color_writes,
+        width,
+        height,
+        webgl_depth,
+        canvas,
+        vertex_colors,
     )
     .map_err(|e| e.to_string())
 }

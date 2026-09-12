@@ -3648,5 +3648,312 @@ export async function testMultiMeshBatchScene(bridgeHost, wasmExports, canvasCon
     renderer12.dispose();
   }
 
-  return "Variable-length multi-mesh batch verified (depth24plus): near-first/far-second with depthWrite=true produces near mesh (Green) matching independent direct WebGPU reference; near-first/far-second with depthWrite=false produces far mesh (Red) matching independent reference and strictly diverging from depthWrite=true; far-first/near-second with depthWrite=true produces near mesh (Green); immutable snapshots verified with distinct dynamic transforms and colors; negative controls strictly refuse empty batch (EMPTY_MESH_BATCH), mixed depth settings on legacy exports (INCOMPATIBLE_BATCH_DEPTH), and invisible meshes; retained WebGLRenderer multi-mesh oracle matches candidate within tolerance" + (canvasContext ? "; visible canvas batch verified against direct reference" : "") + "; scene hierarchy renderScene verified with translated Group, legitimate culls ignored, positive canvas execution (3 admitted, projected center sRGB colors, depth24plus occlusion, planted negative), and separate visible-unsupported whole-scene refusal; material side culling and reflected winding verified (FrontSide/BackSide/DoubleSide, CCW/CW, reflected det<0 parity, mixed-side multi-mesh batch, dynamic mutation between frames matching direct WebGPU reference); mixed per-mesh depth states verified (depthWrite on/off, Less/Greater depthFunc, interleaved disabled depthTest, reflection with depth, multi-frame depth mutation, canvas renderScene mixed depth); colorWrite=false invisible depth occluders verified (depthWrite on/off occlusion, mixed visible/invisible batch, dynamic mutation between frames, direct WebGPU reference parity with writeMask, canvas execution, DoubleSide single-mesh routing with new export alone)";
+  // ---------------------------------------------------------------------------
+  // Checkpoint 13: Opaque MeshBasicMaterial vertexColors execution
+  // Exercises f3d_build_mesh_batch_vertex_color_packet with distinct per-vertex
+  // colors, non-white material multiplier, indexed drawRange, GPU-stale attribute
+  // mutation without needsUpdate, updated output with needsUpdate, and independent
+  // pinned Three.js WebGLRenderer reference oracle parity (offscreen + canvas).
+  // ---------------------------------------------------------------------------
+  const oracleThree13 = await loadProductionThree();
+  const initialPositions13 = new Float32Array([
+    -0.7, -0.7, -2.0, // V0 (bottom-left)
+     0.7, -0.7, -2.0, // V1 (bottom-right)
+     0.0,  0.7, -2.0, // V2 (top-center)
+     2.0,  2.0, -2.0, // V3 (spare outside)
+  ]);
+  const initialIndices13 = new Uint16Array([3, 0, 1, 2]); // drawRange(1, 3) selects [0, 1, 2]
+  const initialColors13 = new Float32Array([
+    1.0, 0.0, 0.0, 1.0, // V0: Pure Red
+    0.0, 1.0, 0.0, 1.0, // V1: Pure Green
+    0.0, 0.0, 1.0, 1.0, // V2: Pure Blue
+    1.0, 1.0, 1.0, 1.0, // V3: White
+  ]);
+
+  const makeVertexColorMesh13 = (library) => {
+    const geometry = new library.BufferGeometry();
+    geometry.setAttribute("position", new library.BufferAttribute(new Float32Array(initialPositions13), 3));
+    geometry.setAttribute("color", new library.BufferAttribute(new Float32Array(initialColors13), 4));
+    geometry.setIndex(new library.BufferAttribute(new Uint16Array(initialIndices13), 1));
+    geometry.setDrawRange(1, 3); // Skip index 0 (V3), render triangle (V0, V1, V2)
+
+    // Non-white material multiplier (0.5, 0.8, 0.4) strictly verifies that
+    // fragment shader computes: diffuseColor.rgb = vColor.rgb * material.color.rgb
+    const material = new library.MeshBasicMaterial({
+      vertexColors: true,
+      color: 0x80cc66,
+      side: library.DoubleSide,
+      depthTest: false,
+      depthWrite: false,
+    });
+    material.color.setRGB(0.5, 0.8, 0.4);
+
+    const mesh = new library.Mesh(geometry, material);
+    mesh.frustumCulled = false;
+    mesh.updateMatrixWorld(true);
+
+    const scene = new library.Scene();
+    scene.add(mesh);
+    return { mesh, geometry, material, scene };
+  };
+
+  const cand13 = makeVertexColorMesh13(THREE);
+  const ref13 = makeVertexColorMesh13(oracleThree13);
+
+  const camera13 = new oracleThree13.OrthographicCamera(-1, 1, 1, -1, 0.1, 10);
+  camera13.position.set(0, 0, 0);
+  camera13.lookAt(0, 0, -1);
+  camera13.updateMatrixWorld(true);
+
+  const renderer13 = new oracleThree13.WebGLRenderer({
+    canvas: document.createElement("canvas"),
+    antialias: false,
+    preserveDrawingBuffer: true,
+  });
+  renderer13.setSize(width, height, false);
+  renderer13.setClearColor(0x000000, 1);
+  renderer13.toneMapping = oracleThree13.NoToneMapping;
+  const gl13 = renderer13.getContext();
+
+  // Selected probe locations inside the triangle:
+  // - V0 region (bottom-left): (18, 48) -> Red dominates
+  // - V1 region (bottom-right): (46, 48) -> Green dominates
+  // - V2 region (top-center): (32, 18) -> Blue dominates
+  // - Centroid: (32, 32) -> Mix of Red, Green, Blue
+  const probes13 = [
+    [18, 48],
+    [46, 48],
+    [32, 18],
+    [32, 32],
+  ];
+
+  const sampleOracleProbes13 = () => {
+    return probes13.map(([x, y]) => {
+      const pixel = new Uint8Array(4);
+      gl13.readPixels(x, height - 1 - y, 1, 1, gl13.RGBA, gl13.UNSIGNED_BYTE, pixel);
+      return [pixel[0], pixel[1], pixel[2], pixel[3]];
+    });
+  };
+
+  const sampleCandidateProbes13 = (pixels) => {
+    return probes13.map(([x, y]) => {
+      const idx = y * bytesPerRow + x * 4;
+      return [
+        pixels[idx + 0],
+        pixels[idx + 1],
+        pixels[idx + 2],
+        pixels[idx + 3],
+      ];
+    });
+  };
+
+  try {
+    // -------------------------------------------------------------------------
+    // 13a: Frame 1 - Baseline execution against independent WebGLRenderer oracle
+    // -------------------------------------------------------------------------
+    renderer13.outputColorSpace = oracleThree13.LinearSRGBColorSpace;
+    renderer13.render(ref13.scene, camera13);
+    const refProbes1 = sampleOracleProbes13();
+
+    await adapter.renderMeshBatch(bridgeHost, [cand13.mesh], camera13, null, wasmExports, {
+      width,
+      height,
+      sourceBackend: "webgl",
+    });
+    const candPixels1 = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+    const candProbes1 = sampleCandidateProbes13(candPixels1);
+
+    // Parity assertion against WebGLRenderer oracle (tolerance 2)
+    for (let p = 0; p < probes13.length; p++) {
+      const [x, y] = probes13[p];
+      const cand = candProbes1[p];
+      const ref = refProbes1[p];
+      for (let c = 0; c < 4; c++) {
+        if (Math.abs(cand[c] - ref[c]) > 2) {
+          throw new Error(
+            `Checkpoint 13a failed: Baseline probe at (${x}, ${y}) differs from WebGL reference: ` +
+            `candidate [${cand}], reference [${ref}]`
+          );
+        }
+      }
+    }
+
+    // Planted negative 1: Vertex colors must NOT be ignored (avoid root's prior mistake).
+    // If vertexColors were ignored, the color at (18, 48) would be pure material color [128, 204, 102].
+    // At (18, 48), vertex is predominantly Red, so Green must strictly diverge from 204.
+    const uncoloredGreen13 = 204;
+    if (Math.abs(candProbes1[0][1] - uncoloredGreen13) < 50) {
+      throw new Error(
+        `Checkpoint 13a planted negative failed: Probe (18, 48) matched uncolored material color; ` +
+        `vertexColors flag was ignored (green=${candProbes1[0][1]})`
+      );
+    }
+
+    // Planted negative 2: Material color multiplier must NOT be ignored.
+    // If material color was ignored, Red at V0 probe would be ~255 instead of ~128 (0.5 * 255).
+    if (candProbes1[0][0] > 200) {
+      throw new Error(
+        `Checkpoint 13a planted negative failed: Probe (18, 48) red channel is ${candProbes1[0][0]}, ` +
+        `material color multiplier (0.5) was ignored`
+      );
+    }
+
+    // Planted negative 3: Asserting against wrong color must strictly fail
+    const wrongColor13 = [0, 255, 255, 255];
+    const diffFromWrong = Math.max(...candProbes1[0].map((v, i) => Math.abs(v - wrongColor13[i])));
+    if (diffFromWrong <= 2) {
+      throw new Error("Checkpoint 13a planted negative failed: candidate falsely matched wrong color");
+    }
+
+    // -------------------------------------------------------------------------
+    // 13b: Frame 2 - Persistent CPU color mutation without needsUpdate (stays GPU-stale)
+    // -------------------------------------------------------------------------
+    const mutatedColors13 = new Float32Array([
+      0.0, 1.0, 1.0, 1.0, // V0 changed to Cyan [0, 1, 1, 1]
+      1.0, 0.0, 1.0, 1.0, // V1 changed to Magenta [1, 0, 1, 1]
+      1.0, 1.0, 0.0, 1.0, // V2 changed to Yellow [1, 1, 0, 1]
+      0.0, 0.0, 0.0, 1.0, // V3: Black
+    ]);
+    // Mutate candidate color buffer array in place WITHOUT needsUpdate = true
+    cand13.geometry.attributes.color.array.set(mutatedColors13);
+
+    await adapter.renderMeshBatch(bridgeHost, [cand13.mesh], camera13, null, wasmExports, {
+      width,
+      height,
+      sourceBackend: "webgl",
+    });
+    const candPixels2 = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+
+    // Frame 2 output MUST be byte-identical to Frame 1 (GPU memory remained stale)
+    if (differs(candPixels2, candPixels1)) {
+      throw new Error(
+        "Checkpoint 13b failed: Color array mutation without needsUpdate=true altered GPU output; " +
+        "persistent residency staleness guarantee violated"
+      );
+    }
+
+    // -------------------------------------------------------------------------
+    // 13c: Frame 3 - Explicit needsUpdate = true uploads mutated colors
+    // -------------------------------------------------------------------------
+    cand13.geometry.attributes.color.needsUpdate = true;
+    ref13.geometry.attributes.color.array.set(mutatedColors13);
+    ref13.geometry.attributes.color.needsUpdate = true;
+
+    renderer13.render(ref13.scene, camera13);
+    const refProbes3 = sampleOracleProbes13();
+
+    await adapter.renderMeshBatch(bridgeHost, [cand13.mesh], camera13, null, wasmExports, {
+      width,
+      height,
+      sourceBackend: "webgl",
+    });
+    const candPixels3 = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+    const candProbes3 = sampleCandidateProbes13(candPixels3);
+
+    // Assert strictly diverged from Frame 1 (Red at V0 probe went from ~128 to 0)
+    if (Math.abs(candProbes3[0][0] - candProbes1[0][0]) < 50) {
+      throw new Error(
+        `Checkpoint 13c failed: Frame 3 probe (18, 48) red channel did not update after needsUpdate=true ` +
+        `(was ${candProbes1[0][0]}, now ${candProbes3[0][0]})`
+      );
+    }
+
+    // Assert match with updated WebGLRenderer oracle
+    for (let p = 0; p < probes13.length; p++) {
+      const [x, y] = probes13[p];
+      const cand = candProbes3[p];
+      const ref = refProbes3[p];
+      for (let c = 0; c < 4; c++) {
+        if (Math.abs(cand[c] - ref[c]) > 2) {
+          throw new Error(
+            `Checkpoint 13c failed: Frame 3 probe at (${x}, ${y}) differs from WebGL reference: ` +
+            `candidate [${cand}], reference [${ref}]`
+          );
+        }
+      }
+    }
+
+    // -------------------------------------------------------------------------
+    // 13d: Frame 4 - Canvas presentation output verification (sRGB transfer)
+    // -------------------------------------------------------------------------
+    if (canvasContext) {
+      const canvasFormat13 = navigator.gpu.getPreferredCanvasFormat();
+      canvasContext.configure({
+        device,
+        format: canvasFormat13,
+        alphaMode: "opaque",
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+      });
+      await nextFrame();
+
+      const canvasReadback13 = device.createBuffer({
+        size: bytesPerRow * height,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+      });
+      const currentTexture13 = canvasContext.getCurrentTexture();
+      const renderPromise13 = adapter.renderScene(
+        bridgeHost,
+        cand13.scene,
+        camera13,
+        canvasContext,
+        wasmExports,
+        { width, height, sourceBackend: "webgl" }
+      );
+      const copyEncoder13 = device.createCommandEncoder();
+      copyEncoder13.copyTextureToBuffer(
+        { texture: currentTexture13 },
+        { buffer: canvasReadback13, bytesPerRow },
+        [width, height, 1]
+      );
+      device.queue.submit([copyEncoder13.finish()]);
+
+      const sceneResult13 = await renderPromise13;
+      if (sceneResult13.admitted.length !== 1 || sceneResult13.refused.length !== 0) {
+        throw new Error(`Checkpoint 13d failed: Canvas scene render failed: ${JSON.stringify(sceneResult13)}`);
+      }
+
+      await canvasReadback13.mapAsync(GPUMapMode.READ);
+      const canvasPixels13 = new Uint8Array(canvasReadback13.getMappedRange().slice(0));
+      canvasReadback13.unmap();
+      canvasReadback13.destroy();
+
+      // Render WebGLRenderer reference to sRGB color space
+      renderer13.outputColorSpace = oracleThree13.SRGBColorSpace;
+      renderer13.render(ref13.scene, camera13);
+      const refCanvasProbes = sampleOracleProbes13();
+
+      const isBgra13 = canvasFormat13.startsWith("bgra");
+      const rCh13 = isBgra13 ? 2 : 0;
+      const gCh13 = 1;
+      const bCh13 = isBgra13 ? 0 : 2;
+
+      for (let p = 0; p < probes13.length; p++) {
+        const [x, y] = probes13[p];
+        const idx = y * bytesPerRow + x * 4;
+        const candRgba = [
+          canvasPixels13[idx + rCh13],
+          canvasPixels13[idx + gCh13],
+          canvasPixels13[idx + bCh13],
+          canvasPixels13[idx + 3],
+        ];
+        const refRgba = refCanvasProbes[p];
+        for (let c = 0; c < 4; c++) {
+          if (Math.abs(candRgba[c] - refRgba[c]) > 2) {
+            throw new Error(
+              `Checkpoint 13d failed: Canvas probe at (${x}, ${y}) differs from sRGB reference: ` +
+              `candidate [${candRgba}], reference [${refRgba}] (format=${canvasFormat13})`
+            );
+          }
+        }
+      }
+    }
+  } finally {
+    cand13.geometry.dispose();
+    cand13.material.dispose();
+    ref13.geometry.dispose();
+    ref13.material.dispose();
+    renderer13.dispose();
+  }
+
+  return "Variable-length multi-mesh batch verified (depth24plus): near-first/far-second with depthWrite=true produces near mesh (Green) matching independent direct WebGPU reference; near-first/far-second with depthWrite=false produces far mesh (Red) matching independent reference and strictly diverging from depthWrite=true; far-first/near-second with depthWrite=true produces near mesh (Green); immutable snapshots verified with distinct dynamic transforms and colors; negative controls strictly refuse empty batch (EMPTY_MESH_BATCH), mixed depth settings on legacy exports (INCOMPATIBLE_BATCH_DEPTH), and invisible meshes; retained WebGLRenderer multi-mesh oracle matches candidate within tolerance" + (canvasContext ? "; visible canvas batch verified against direct reference" : "") + "; scene hierarchy renderScene verified with translated Group, legitimate culls ignored, positive canvas execution (3 admitted, projected center sRGB colors, depth24plus occlusion, planted negative), and separate visible-unsupported whole-scene refusal; material side culling and reflected winding verified (FrontSide/BackSide/DoubleSide, CCW/CW, reflected det<0 parity, mixed-side multi-mesh batch, dynamic mutation between frames matching direct WebGPU reference); mixed per-mesh depth states verified (depthWrite on/off, Less/Greater depthFunc, interleaved disabled depthTest, reflection with depth, multi-frame depth mutation, canvas renderScene mixed depth); colorWrite=false invisible depth occluders verified (depthWrite on/off occlusion, mixed visible/invisible batch, dynamic mutation between frames, direct WebGPU reference parity with writeMask, canvas execution, DoubleSide single-mesh routing with new export alone); opaque MeshBasicMaterial vertexColors verified (distinct per-vertex colors, non-white material multiplier, indexed drawRange, WebGLRenderer reference parity, GPU-stale attribute mutation without needsUpdate, updated output with needsUpdate, offscreen and canvas sRGB)";
 }
