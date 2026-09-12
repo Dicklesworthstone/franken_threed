@@ -25,6 +25,19 @@ export const OPCODE_SET_SCISSOR_RECT = 10;
 export const OPCODE_SET_DRAW_PARAMETERS = 11;
 export const OPCODE_CREATE_PIPELINE_DEPTH = 12;
 export const OPCODE_RENDER_PASS_DEPTH = 13;
+export const OPCODE_CREATE_PIPELINE_CULL = 14;
+export const OPCODE_CREATE_PIPELINE_DEPTH_CULL = 15;
+
+export const CULL_MODE_NAMES = {
+  0: "none",
+  1: "front",
+  2: "back",
+};
+
+export const FRONT_FACE_NAMES = {
+  0: "ccw",
+  1: "cw",
+};
 
 export const TARGET_OFFSCREEN = 0;
 export const TARGET_CANVAS = 1;
@@ -498,9 +511,12 @@ export class WebGpuBridgeHost {
             break;
           }
 
-          case OPCODE_CREATE_PIPELINE: {
+          case OPCODE_CREATE_PIPELINE:
+          case OPCODE_CREATE_PIPELINE_CULL: {
             closeActivePass();
-            if (cursor + 32 > dataBlockStart) {
+            const hasCullFields = (opcode === OPCODE_CREATE_PIPELINE_CULL);
+            const expectedHeaderSize = hasCullFields ? 40 : 32;
+            if (cursor + expectedHeaderSize > dataBlockStart) {
               throw new Error(`Truncated CREATE_PIPELINE fields at command ${i}`);
             }
             const pipelineId = dataView.getUint32(cursor, true);
@@ -511,7 +527,23 @@ export class WebGpuBridgeHost {
             const hasUniformBuffer = dataView.getUint32(cursor + 20, true) === 1;
             const explicitUniformSize = dataView.getUint32(cursor + 24, true);
             const explicitVertexStride = dataView.getUint32(cursor + 28, true);
-            cursor += 32;
+            let cullModeCode = 0;
+            let frontFaceCode = 0;
+            if (hasCullFields) {
+              cullModeCode = dataView.getUint32(cursor + 32, true);
+              frontFaceCode = dataView.getUint32(cursor + 36, true);
+            }
+            cursor += expectedHeaderSize;
+
+            if (cullModeCode > 2 || !(cullModeCode in CULL_MODE_NAMES)) {
+              throw new Error(`CreatePipeline: invalid cull_mode ${cullModeCode}`);
+            }
+            const cullMode = CULL_MODE_NAMES[cullModeCode];
+
+            if (frontFaceCode > 1 || !(frontFaceCode in FRONT_FACE_NAMES)) {
+              throw new Error(`CreatePipeline: invalid front_face ${frontFaceCode}`);
+            }
+            const frontFace = FRONT_FACE_NAMES[frontFaceCode];
 
             if (codeOffset + codeLen > dataPayload.byteLength) {
               throw new Error(`CreatePipeline: shader code slice out of bounds (offset ${codeOffset} + len ${codeLen} > payload ${dataPayload.byteLength})`);
@@ -584,6 +616,8 @@ export class WebGpuBridgeHost {
               },
               primitive: {
                 topology: "triangle-list",
+                cullMode,
+                frontFace,
               },
             });
 
@@ -591,9 +625,12 @@ export class WebGpuBridgeHost {
             break;
           }
 
-          case OPCODE_CREATE_PIPELINE_DEPTH: {
+          case OPCODE_CREATE_PIPELINE_DEPTH:
+          case OPCODE_CREATE_PIPELINE_DEPTH_CULL: {
             closeActivePass();
-            if (cursor + 44 > dataBlockStart) {
+            const hasCullFields = (opcode === OPCODE_CREATE_PIPELINE_DEPTH_CULL);
+            const expectedHeaderSize = hasCullFields ? 52 : 44;
+            if (cursor + expectedHeaderSize > dataBlockStart) {
               throw new Error(`Truncated CREATE_PIPELINE_DEPTH fields at command ${i}`);
             }
             const pipelineId = dataView.getUint32(cursor, true);
@@ -607,7 +644,23 @@ export class WebGpuBridgeHost {
             const depthFormatCode = dataView.getUint32(cursor + 32, true);
             const depthWriteEnabled = dataView.getUint32(cursor + 36, true) === 1;
             const depthCompareCode = dataView.getUint32(cursor + 40, true);
-            cursor += 44;
+            let cullModeCode = 0;
+            let frontFaceCode = 0;
+            if (hasCullFields) {
+              cullModeCode = dataView.getUint32(cursor + 44, true);
+              frontFaceCode = dataView.getUint32(cursor + 48, true);
+            }
+            cursor += expectedHeaderSize;
+
+            if (cullModeCode > 2 || !(cullModeCode in CULL_MODE_NAMES)) {
+              throw new Error(`CreatePipelineDepth: invalid cull_mode ${cullModeCode}`);
+            }
+            const cullMode = CULL_MODE_NAMES[cullModeCode];
+
+            if (frontFaceCode > 1 || !(frontFaceCode in FRONT_FACE_NAMES)) {
+              throw new Error(`CreatePipelineDepth: invalid front_face ${frontFaceCode}`);
+            }
+            const frontFace = FRONT_FACE_NAMES[frontFaceCode];
 
             if (codeOffset + codeLen > dataPayload.byteLength) {
               throw new Error(`CreatePipelineDepth: shader code slice out of bounds (offset ${codeOffset} + len ${codeLen} > payload ${dataPayload.byteLength})`);
@@ -693,6 +746,8 @@ export class WebGpuBridgeHost {
               },
               primitive: {
                 topology: "triangle-list",
+                cullMode,
+                frontFace,
               },
               depthStencil: {
                 format: depthFormat,
@@ -1210,8 +1265,12 @@ export class WebGpuBridgeHost {
                   scanCursor += 20;
                 } else if (nextOp === OPCODE_CREATE_PIPELINE) {
                   scanCursor += 32;
+                } else if (nextOp === OPCODE_CREATE_PIPELINE_CULL) {
+                  scanCursor += 40;
                 } else if (nextOp === OPCODE_CREATE_PIPELINE_DEPTH) {
                   scanCursor += 44;
+                } else if (nextOp === OPCODE_CREATE_PIPELINE_DEPTH_CULL) {
+                  scanCursor += 52;
                 } else if (nextOp === OPCODE_COPY_TEXTURE_TO_BUFFER) {
                   scanCursor += 24;
                 } else if (nextOp === OPCODE_RECORD_BUNDLE) {
