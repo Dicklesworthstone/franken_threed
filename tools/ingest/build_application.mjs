@@ -92,6 +92,23 @@ export function isRelativeUrl(url) {
 }
 
 /**
+ * Checks whether a URL string has a canonical external scheme (http:, https:, data:).
+ * Does not misclassify root-relative (/...) or local file paths.
+ *
+ * @param {string} url
+ * @returns {boolean}
+ */
+export function isExternalUrl(url) {
+  if (!url || typeof url !== 'string') return false;
+  try {
+    const protocol = new URL(url, 'file:///').protocol;
+    return protocol === 'http:' || protocol === 'https:' || protocol === 'data:';
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Normalizes a Rollup module ID or filesystem path into a canonical URL string.
  * Preserves existing URL schemes (e.g. file://, http://, https://) and query/fragment identities.
  *
@@ -639,6 +656,11 @@ export function rewriteHtmlForBuild(rawHtmlContent, entryFiles, chunkFilesMap = 
         const scriptType = (attrs.type || 'text/javascript').toLowerCase();
 
         if (scriptType === 'module') {
+          if (attrs.src && isExternalUrl(attrs.src)) {
+            // External module root script (http:, https:, data:) preserved verbatim with original attributes
+            return match;
+          }
+
           if (moduleScriptIndex >= entryFiles.length) {
             throw new Error(
               `Module script at index ${moduleScriptIndex} exceeds emitted entry chunk count (${entryFiles.length})`

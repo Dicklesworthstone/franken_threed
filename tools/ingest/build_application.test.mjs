@@ -28,6 +28,7 @@ import {
   rewriteLinkTagAttributes,
   computeIntegrityForContent,
   isRelativeUrl,
+  isExternalUrl,
   extractRelativeAssetUrls,
   extractRelativeCssUrls,
   stripCssComments,
@@ -2497,4 +2498,211 @@ test('buildApplication preserves an HTML module entry also reached by retained c
       assert.equal(entry.count, 2, 'Entry facade must forward live bindings');
     });
   }
+});
+
+test('isExternalUrl detects canonical external schemes (http, https, data) and rejects root-relative / local paths', () => {
+  assert.equal(isExternalUrl('https://cdn.example.com/app.js'), true);
+  assert.equal(isExternalUrl('HTTPS://CDN.EXAMPLE.COM/APP.JS'), true);
+  assert.equal(isExternalUrl('http://example.com/lib.js'), true);
+  assert.equal(isExternalUrl('data:text/javascript,export const x = 1;'), true);
+  assert.equal(isExternalUrl('DATA:text/javascript,export const x = 1;'), true);
+
+  // Canonical URL parser normalizes embedded tabs and newlines
+  assert.equal(isExternalUrl('ht\ntps://cdn.example.com/app.js'), true, 'embedded newline in scheme must normalize to external');
+  assert.equal(isExternalUrl('ht\ttps://cdn.example.com/app.js'), true, 'embedded tab in scheme must normalize to external');
+
+  // Root-relative, relative, and file URLs must NOT be classified as external
+  assert.equal(isExternalUrl('/root/app.js'), false, 'Root-relative path must not be classified as external');
+  assert.equal(isExternalUrl('./local.js'), false, 'Relative path must not be classified as external');
+  assert.equal(isExternalUrl('../parent.js'), false, 'Parent relative path must not be classified as external');
+  assert.equal(isExternalUrl('app.js'), false, 'Bare relative filename must not be classified as external');
+  assert.equal(isExternalUrl('file:///path/to/app.js'), false, 'file:// URL must not be classified as external');
+  assert.equal(isExternalUrl(''), false);
+  assert.equal(isExternalUrl(null), false);
+  assert.equal(isExternalUrl(undefined), false);
+});
+
+test('rewriteHtmlForBuild preserves external module script attrs/order verbatim and handles all-external', () => {
+  // 1. Mixed: external scripts (https, data) and local module script
+  const mixedHtml = `<!DOCTYPE html>
+<html>
+<head>
+  <script type="module" src="https://cdn.example.com/analytics.js" async crossorigin="anonymous" integrity="sha256-abc"></script>
+  <script type="module" src="./app.js"></script>
+  <script type="module" src="data:text/javascript,console.log('inline');"></script>
+</head>
+<body></body>
+</html>`;
+
+  const rewrittenMixed = rewriteHtmlForBuild(mixedHtml, ['chunk-app.js'], { 'chunk-app.js': '/* chunk */' });
+
+  // Assert external scripts are preserved verbatim with all attributes and order
+  assert.ok(
+    rewrittenMixed.includes('<script type="module" src="https://cdn.example.com/analytics.js" async crossorigin="anonymous" integrity="sha256-abc"></script>'),
+    'External https: script must be preserved verbatim with all attributes'
+  );
+  assert.ok(
+    rewrittenMixed.includes('<script type="module" src="data:text/javascript,console.log(\'inline\');"></script>'),
+    'External data: script must be preserved verbatim'
+  );
+  assert.ok(
+    rewrittenMixed.includes('<script type="module" src="./chunk-app.js"></script>'),
+    'Local module script must be rewritten to emitted chunk'
+  );
+
+  // Assert document order: https script before chunk-app before data script
+  const httpsIdx = rewrittenMixed.indexOf('https://cdn.example.com/analytics.js');
+  const chunkIdx = rewrittenMixed.indexOf('chunk-app.js');
+  const dataIdx = rewrittenMixed.indexOf('data:text/javascript');
+  assert.ok(httpsIdx !== -1 && chunkIdx !== -1 && dataIdx !== -1);
+  assert.ok(httpsIdx < chunkIdx, 'https script must precede local chunk in document order');
+  assert.ok(chunkIdx < dataIdx, 'Local chunk must precede data script in document order');
+
+  // 2. All-external: no local entry chunks emitted
+  const allExtHtml = `<!DOCTYPE html>
+<html>
+<head>
+  <script type="module" src="https://cdn.example.com/lib1.js"></script>
+  <script type="module" src="https://cdn.example.com/lib2.js"></script>
+</head>
+<body></body>
+</html>`;
+
+  const rewrittenAllExt = rewriteHtmlForBuild(allExtHtml, []);
+  assert.ok(rewrittenAllExt.includes('src="https://cdn.example.com/lib1.js"'));
+  assert.ok(rewrittenAllExt.includes('src="https://cdn.example.com/lib2.js"'));
+
+  // 3. Root-relative script is treated as local (consumes chunk, not preserved as external)
+  const rootRelHtml = `<!DOCTYPE html><html><head><script type="module" src="/app.js"></script></head></html>`;
+  const rewrittenRoot = rewriteHtmlForBuild(rootRelHtml, ['chunk-root.js']);
+  assert.ok(rewrittenRoot.includes('src="./chunk-root.js"'), 'Root-relative script must be rewritten to chunk');
+
+  // 4. Embedded tabs/newlines in external src preserved without consuming local chunk index
+  const whitespaceHtml = `<!DOCTYPE html>
+<html>
+<head>
+  <script type="module" src="ht\ntps://cdn.example.com/embedded.js"></script>
+  <script type="module" src="./local.js"></script>
+</head>
+</html>`;
+  const rewrittenWs = rewriteHtmlForBuild(whitespaceHtml, ['chunk-local.js']);
+  assert.ok(
+    rewrittenWs.includes('src="ht\ntps://cdn.example.com/embedded.js"'),
+    'External script with embedded whitespace must be preserved verbatim'
+  );
+  assert.ok(
+    rewrittenWs.includes('src="./chunk-local.js"'),
+    'Local module script following embedded-whitespace external script must correctly map to chunk index 0'
+  );
+});
+
+test('buildApplication preserves external HTML module scripts in emitted package without fake chunks', async () => {
+  const scratch = makeScratch('f3d_app_ext_root_module');
+  const outDir = path.join(scratch, 'dist');
+
+  const html = `<!DOCTYPE html>
+<html>
+<head>
+  <script type="module" src="https://cdn.example.com/analytics.js" async crossorigin="anonymous"></script>
+  <script type="module" src="./local.js"></script>
+  <script type="module" src="data:text/javascript,export const dataVal = 100;"></script>
+</head>
+<body><div id="app">App</div></body>
+</html>`;
+
+  fs.writeFileSync(path.join(scratch, 'index.html'), html);
+  fs.writeFileSync(path.join(scratch, 'local.js'), `export const localVal = 'LOCAL';\n`);
+
+  const res = await buildApplication(path.join(scratch, 'index.html'), outDir);
+  assert.equal(res.isHtml, true);
+  assert.equal(res.entryFiles.length, 1, 'Only local module script must emit an entry chunk');
+  assert.ok(!res.chunks.some(c => c.fileName.includes('https:') || c.fileName.includes('data:')), 'External scripts must not emit fake chunks');
+
+  const emittedHtml = fs.readFileSync(path.join(outDir, 'index.html'), 'utf-8');
+  assert.ok(
+    emittedHtml.includes('<script type="module" src="https://cdn.example.com/analytics.js" async crossorigin="anonymous"></script>'),
+    'External https: script must be preserved verbatim in emitted index.html'
+  );
+  assert.ok(
+    emittedHtml.includes('<script type="module" src="data:text/javascript,export const dataVal = 100;"></script>'),
+    'External data: script must be preserved verbatim in emitted index.html'
+  );
+  assert.ok(
+    emittedHtml.includes(`src="./${res.entryFiles[0]}"`),
+    'Local module script must point to emitted entry chunk'
+  );
+
+  // All-external HTML entry point test
+  const scratchAllExt = makeScratch('f3d_app_all_ext_root_module');
+  const outDirAllExt = path.join(scratchAllExt, 'dist');
+  const allExtHtml = `<!DOCTYPE html><html><head>
+  <script type="module" src="https://cdn.example.com/lib.js"></script>
+</head><body></body></html>`;
+  fs.writeFileSync(path.join(scratchAllExt, 'index.html'), allExtHtml);
+
+  const resAllExt = await buildApplication(path.join(scratchAllExt, 'index.html'), outDirAllExt);
+  assert.equal(resAllExt.isHtml, true);
+  assert.equal(resAllExt.entryFiles.length, 0, 'All-external HTML must have zero emitted entry chunks');
+  assert.equal(resAllExt.chunks.length, 0, 'All-external HTML must have zero emitted chunks');
+
+  const emittedAllExtHtml = fs.readFileSync(path.join(outDirAllExt, 'index.html'), 'utf-8');
+  assert.ok(
+    emittedAllExtHtml.includes('<script type="module" src="https://cdn.example.com/lib.js"></script>'),
+    'All-external HTML must emit index.html with external script preserved verbatim'
+  );
+});
+
+test('HTML attribute parser duplicate-name first-wins semantics (parseTagAttributes, parseHtmlEntries, rewriteHtmlForBuild)', () => {
+  // 1. parseTagAttributes: case-folding and duplicate names (first wins)
+  const attrsSrc = parseTagAttributes('src="first.js" SRC="second.js" type="module"');
+  assert.equal(attrsSrc.src, 'first.js', 'First src attribute must win over duplicate uppercase SRC');
+
+  const attrsMulti = parseTagAttributes('sRc="a.js" SRC="b.js" src="c.js"');
+  assert.equal(attrsMulti.src, 'a.js', 'First src attribute must win across multiple case-folded duplicates');
+
+  // 2. parseTagAttributes: first empty value wins (not clobbered by later non-empty)
+  const attrsEmptyFirst = parseTagAttributes('src="" SRC="second.js" type="module"');
+  assert.equal(attrsEmptyFirst.src, '', 'First empty-string attribute value must win over subsequent value');
+
+  const attrsValuelessFirst = parseTagAttributes('src SRC="second.js" type="module"');
+  assert.equal(attrsValuelessFirst.src, '', 'First valueless boolean attribute must win over subsequent value');
+
+  // 3. parseTagAttributes: duplicate type attribute
+  const attrsType = parseTagAttributes('type="module" TYPE="text/javascript"');
+  assert.equal(attrsType.type, 'module', 'First type="module" must win over duplicate TYPE');
+
+  const attrsTypeEmpty = parseTagAttributes('type="" TYPE="module"');
+  assert.equal(attrsTypeEmpty.type, '', 'First empty type must win over subsequent TYPE');
+
+  // 4. parseHtmlEntries: duplicate src and type module selection
+  const htmlDupSrc = '<!DOCTYPE html><html><head><script type="module" src="first.js" SRC="second.js"></script></head></html>';
+  const parsedDupSrc = parseHtmlEntries(htmlDupSrc, 'file:///app/index.html');
+  assert.equal(parsedDupSrc.moduleScripts.length, 1);
+  assert.equal(parsedDupSrc.moduleScripts[0].src, 'first.js', 'parseHtmlEntries must select first src attribute');
+  assert.equal(parsedDupSrc.moduleScripts[0].id, 'file:///app/first.js');
+
+  const htmlTypeClassicFirst = '<!DOCTYPE html><html><head><script type="text/javascript" TYPE="module" src="app.js"></script></head></html>';
+  const parsedClassicFirst = parseHtmlEntries(htmlTypeClassicFirst, 'file:///app/index.html');
+  assert.equal(parsedClassicFirst.moduleScripts.length, 0, 'First type="text/javascript" must prevent selection as module script');
+
+  const htmlTypeModuleFirst = '<!DOCTYPE html><html><head><script type="module" TYPE="text/javascript" src="app.js"></script></head></html>';
+  const parsedModuleFirst = parseHtmlEntries(htmlTypeModuleFirst, 'file:///app/index.html');
+  assert.equal(parsedModuleFirst.moduleScripts.length, 1);
+  assert.equal(parsedModuleFirst.moduleScripts[0].src, 'app.js', 'First type="module" must win and select module script');
+
+  // 5. rewriteHtmlForBuild: uses first src without clobbering unrelated attributes
+  const htmlRewriteLocal = '<!DOCTYPE html><html><head><script type="module" src="first.js" SRC="second.js" id="main-script" async></script></head></html>';
+  const rewrittenLocal = rewriteHtmlForBuild(htmlRewriteLocal, ['chunk-entry.js']);
+  assert.ok(rewrittenLocal.includes('id="main-script"'), 'Unrelated id attribute must be preserved');
+  assert.ok(rewrittenLocal.includes('async'), 'Unrelated async attribute must be preserved');
+  assert.ok(rewrittenLocal.includes('src="./chunk-entry.js"'), 'Script tag must be rewritten to emitted entry chunk');
+
+  // External vs local duplicate: first src determines external preservation
+  const htmlExternalFirst = '<!DOCTYPE html><html><head><script type="module" src="https://cdn.example.com/ext.js" src="./local.js" id="ext-script"></script></head></html>';
+  const rewrittenExt = rewriteHtmlForBuild(htmlExternalFirst, []);
+  assert.ok(
+    rewrittenExt.includes('src="https://cdn.example.com/ext.js"'),
+    'First external src must preserve external script verbatim'
+  );
+  assert.ok(rewrittenExt.includes('id="ext-script"'), 'Unrelated id attribute must be preserved on external script');
 });

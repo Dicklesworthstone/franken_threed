@@ -6,6 +6,8 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -569,4 +571,79 @@ test("f3d-04.4 regression: analyzeModuleAst -> extractGraphRoutingFacts -> evalu
   assert.equal(decisionsTraversal.length, 1);
   assert.equal(decisionsTraversal[0].decision.route, ExecutionRoute.EXACT_BACKEND, "Traversal lookalike forces EXACT_BACKEND");
   assert.ok(decisionsTraversal[0].decision.reasons.includes(EscapeReason.OPAQUE_GL_ESCAPE));
+});
+
+test("Positive: real module graph with external data import routes WebGPURenderer to retained upstream", async () => {
+  const scratch = path.join(tmpdir(), `f3d_route_ext_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
+  fs.mkdirSync(scratch, { recursive: true });
+
+  const mainPath = path.join(scratch, "main.js");
+  fs.writeFileSync(
+    mainPath,
+    `import { val } from 'data:text/javascript,export const val = 1;';
+export function init() {
+  const renderer = new WebGPURenderer();
+  return renderer;
+}
+`
+  );
+
+  const bundle = await buildModuleGraph(mainPath);
+  assert.equal(bundle.external_modules.length, 1);
+
+  // 1. Actual evaluateGraphRoutes with real decideRendererRoute and specializationAvailable: true
+  const decisions = evaluateGraphRoutes(bundle, decideRendererRoute, {
+    hostCapabilities: { hasWebGPU: true, hasWebGL: true },
+    specializationAvailable: true,
+  });
+
+  assert.equal(decisions.length, 1);
+  assert.equal(decisions[0].decision.route, ExecutionRoute.RETAINED_UPSTREAM);
+  assert.ok(
+    decisions[0].decision.reasons.includes("unanalyzed-external-modules"),
+    "WebGPURenderer with external modules must include unanalyzed-external-modules reason"
+  );
+
+  // 2. Direct decideRendererRoute call with caller analysis flag=false still retained due to bundle external_modules
+  const directOverride = decideRendererRoute({
+    bundle,
+    constructorName: "WebGPURenderer",
+    analysis: { hasUnanalyzedModules: false },
+    specializationAvailable: true,
+  });
+  assert.equal(directOverride.route, ExecutionRoute.RETAINED_UPSTREAM);
+  assert.ok(directOverride.reasons.includes("unanalyzed-external-modules"));
+
+  // 3. WebGLRenderer and forceWebGL: true remain exact backend despite unanalyzed modules
+  const webglDecision = decideRendererRoute({
+    bundle,
+    constructorName: "WebGLRenderer",
+    specializationAvailable: true,
+  });
+  assert.equal(webglDecision.route, ExecutionRoute.EXACT_BACKEND);
+
+  const forceDecision = decideRendererRoute({
+    bundle,
+    constructorName: "WebGPURenderer",
+    options: { forceWebGL: true },
+    specializationAvailable: true,
+  });
+  assert.equal(forceDecision.route, ExecutionRoute.EXACT_BACKEND);
+
+  // 4. Actual no-site file tests prepareRouteInputs fallback with unanalyzed modules
+  const noSitePath = path.join(scratch, "no_site.js");
+  fs.writeFileSync(noSitePath, `import 'data:text/javascript,export const x = 2;';\n`);
+  const noSiteBundle = await buildModuleGraph(noSitePath);
+
+  const fallbackInputs = prepareRouteInputs(noSiteBundle);
+  assert.equal(fallbackInputs.length, 1);
+  assert.equal(fallbackInputs[0].analysis.hasUnanalyzedModules, true);
+
+  const fallbackDecision = decideRendererRoute({
+    ...fallbackInputs[0],
+    constructorName: "WebGPURenderer",
+    specializationAvailable: true,
+  });
+  assert.equal(fallbackDecision.route, ExecutionRoute.RETAINED_UPSTREAM);
+  assert.ok(fallbackDecision.reasons.includes("unanalyzed-external-modules"));
 });

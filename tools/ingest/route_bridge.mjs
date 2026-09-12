@@ -102,6 +102,7 @@ export function extractGraphRoutingFacts(bundle, options = {}) {
   let hasOpaqueGLEscapes = false;
   let hasNativeContextAccess = false;
   let hasUnresolvedContextAccess = false;
+  const hasUnanalyzedModules = Array.isArray(bundle.external_modules) && bundle.external_modules.length > 0;
   const escapes = [];
   const constructionSites = [];
 
@@ -164,6 +165,7 @@ export function extractGraphRoutingFacts(bundle, options = {}) {
           has_native_context_access: hasNativeContextAccess,
           hasUnresolvedContextAccess,
           has_unresolved_context_access: hasUnresolvedContextAccess,
+          hasUnanalyzedModules,
         },
         sourceSpan: span,
         source_span: span,
@@ -178,6 +180,7 @@ export function extractGraphRoutingFacts(bundle, options = {}) {
     has_native_context_access: hasNativeContextAccess,
     hasUnresolvedContextAccess,
     has_unresolved_context_access: hasUnresolvedContextAccess,
+    hasUnanalyzedModules,
     escapes,
     constructionSites,
     construction_sites: constructionSites,
@@ -212,6 +215,7 @@ export function prepareRouteInputs(bundle, defaults = {}) {
         has_native_context_access: extracted.hasNativeContextAccess,
         hasUnresolvedContextAccess: extracted.hasUnresolvedContextAccess,
         has_unresolved_context_access: extracted.hasUnresolvedContextAccess,
+        hasUnanalyzedModules: extracted.hasUnanalyzedModules,
         ...defaults.analysis,
       },
       sourceSpan: defaults.sourceSpan || `${bundle.entry_path || "entry"}:0:0`,

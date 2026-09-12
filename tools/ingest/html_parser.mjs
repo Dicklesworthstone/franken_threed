@@ -87,10 +87,12 @@ export function parseTagAttributes(attrString) {
   let match;
   while ((match = attrRegex.exec(attrString)) !== null) {
     const name = match[1].toLowerCase();
-    const val = match[2] !== undefined
-      ? match[2]
-      : (match[3] !== undefined ? match[3] : (match[4] !== undefined ? match[4] : ''));
-    attrs[name] = val;
+    if (attrs[name] === undefined) {
+      const val = match[2] !== undefined
+        ? match[2]
+        : (match[3] !== undefined ? match[3] : (match[4] !== undefined ? match[4] : ''));
+      attrs[name] = val;
+    }
   }
   return attrs;
 }
@@ -182,10 +184,10 @@ export function parseHtmlEntries(rawHtmlContent, documentUrl) {
       try {
         const parsed = JSON.parse(rawScriptBody.trim());
         if (parsed.imports && typeof parsed.imports === 'object') {
-          Object.assign(importMap.imports, parsed.imports);
+          importMap.imports = { ...importMap.imports, ...parsed.imports };
         }
         if (parsed.scopes && typeof parsed.scopes === 'object') {
-          Object.assign(importMap.scopes, parsed.scopes);
+          importMap.scopes = { ...importMap.scopes, ...parsed.scopes };
         }
       } catch (err) {
         throw new IngestionParseError(
