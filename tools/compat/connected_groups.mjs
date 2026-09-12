@@ -260,4 +260,79 @@ export class ConnectedCompatibilityGroups {
     }
     return members;
   }
+
+  /**
+   * Capture a snapshot of current union-find and routing state for transaction rollback.
+   * Deep-copies node descriptors and decision records to isolate future mutations.
+   * @returns {Object}
+   */
+  snapshot() {
+    const nodesCopy = new Map();
+    for (const [k, v] of this._nodes.entries()) {
+      nodesCopy.set(k, {
+        type: v.type,
+        preferredRoute: v.preferredRoute,
+        forcedRoute: v.forcedRoute,
+        isMutable: v.isMutable,
+        reasons: v.reasons ? [...v.reasons] : [],
+      });
+    }
+
+    const groupMembersCopy = new Map();
+    for (const [k, v] of this._groupMembers.entries()) {
+      groupMembersCopy.set(k, new Set(v));
+    }
+
+    const allDecisionsCopy = new Map();
+    for (const [k, v] of this._allDecisions.entries()) {
+      allDecisionsCopy.set(k, {
+        route: v.route,
+        reasons: v.reasons ? [...v.reasons] : [],
+        groupId: v.groupId,
+      });
+    }
+
+    return {
+      parent: new Map(this._parent),
+      rank: new Map(this._rank),
+      nodes: nodesCopy,
+      groupMembers: groupMembersCopy,
+      committedRoutes: new Map(this._committedRoutes),
+      allDecisions: allDecisionsCopy,
+    };
+  }
+
+  /**
+   * Restore union-find and routing state from a previously captured snapshot.
+   * @param {Object} snap
+   */
+  restore(snap) {
+    if (!snap) return;
+    this._parent = new Map(snap.parent);
+    this._rank = new Map(snap.rank);
+    this._nodes = new Map();
+    for (const [k, v] of snap.nodes.entries()) {
+      this._nodes.set(k, {
+        type: v.type,
+        preferredRoute: v.preferredRoute,
+        forcedRoute: v.forcedRoute,
+        isMutable: v.isMutable,
+        reasons: v.reasons ? [...v.reasons] : [],
+      });
+    }
+    this._groupMembers = new Map();
+    for (const [k, v] of snap.groupMembers.entries()) {
+      this._groupMembers.set(k, new Set(v));
+    }
+    this._committedRoutes = new Map(snap.committedRoutes);
+    this._allDecisions = new Map();
+    for (const [k, v] of snap.allDecisions.entries()) {
+      this._allDecisions.set(k, {
+        route: v.route,
+        reasons: v.reasons ? [...v.reasons] : [],
+        groupId: v.groupId,
+      });
+    }
+  }
 }
+
