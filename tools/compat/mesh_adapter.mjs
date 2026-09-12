@@ -60,7 +60,10 @@ export const ADMISSION_REJECTION = Object.freeze({
   UNSUPPORTED_REVERSED_DEPTH: 'UNSUPPORTED_REVERSED_DEPTH: Reversed depth buffer is not supported in this slice',
   INVALID_DEPTH_FUNC: 'INVALID_DEPTH_FUNC: Invalid or unsupported depthFunc',
   AMBIGUOUS_DEPTH_PAIR: 'AMBIGUOUS_DEPTH_PAIR: Material with depthTest=false and depthWrite=true is ambiguous across backends (WebGL suppresses writes, WebGPU permits writes); provide options.sourceBackend ("webgl" | "webgpu")',
-  UNSUPPORTED_SIDE: 'UNSUPPORTED_SIDE: Only DoubleSide (2) is supported in this slice (pipeline has no culling state)',
+  UNSUPPORTED_SIDE: 'UNSUPPORTED_SIDE: Material side must be FrontSide (0), BackSide (1), or DoubleSide (2)',
+  MISSING_CULL_EXPORT: 'MISSING_CULL_EXPORT: FrontSide or BackSide mesh rendering requires Wasm export f3d_build_mesh_batch_cull_packet; silent DoubleSide fallback is strictly forbidden',
+  INVALID_CULL_MODE: 'INVALID_CULL_MODE: Invalid or unknown cull mode wire value',
+  INVALID_FRONT_FACE: 'INVALID_FRONT_FACE: Invalid or unknown front face wire value',
   INVALID_CAMERA: 'INVALID_CAMERA: Camera must be an instance of THREE.Camera with valid projectionMatrix and matrixWorldInverse',
   INVALID_DIMENSIONS: 'INVALID_DIMENSIONS: Viewport dimensions must be positive integers',
   INDEX_OUT_OF_BOUNDS: 'INDEX_OUT_OF_BOUNDS: Index references vertex out of bounds',
@@ -81,6 +84,26 @@ export const SOURCE_BACKEND = Object.freeze({
 export const COORDINATE_SYSTEM = Object.freeze({
   WEBGL: 2000,
   WEBGPU: 2001,
+});
+
+// Pinned Three.js material side constants matching upstream FrontSide, BackSide, DoubleSide
+export const THREE_SIDE = Object.freeze({
+  FRONT_SIDE: 0,
+  BACK_SIDE: 1,
+  DOUBLE_SIDE: 2,
+});
+
+// Wire cull mode codes matching WebGPU GPUCullMode ("none", "front", "back")
+export const CULL_MODE_WIRE = Object.freeze({
+  NONE: 0,
+  FRONT: 1,
+  BACK: 2,
+});
+
+// Wire front face codes matching WebGPU GPUFrontFace ("ccw", "cw")
+export const FRONT_FACE_WIRE = Object.freeze({
+  CCW: 0,
+  CW: 1,
 });
 
 // Wire compare codes matching crates/f3d-runtime/src/gpu_host.rs and bridge_runtime.js
@@ -106,6 +129,29 @@ export const THREE_DEPTH_FUNC_TO_WIRE_COMPARE = Object.freeze({
   [GreaterDepth]: DEPTH_WIRE_COMPARE.GREATER,             // 6 -> 5
   [NotEqualDepth]: DEPTH_WIRE_COMPARE.NOT_EQUAL,          // 7 -> 6
 });
+
+/**
+ * Computes the 3x3 determinant of the upper-left affine transform block of a 4x4 matrix.
+ * Matches Three.js Matrix4.determinantAffine().
+ *
+ * @param {any} matrixWorld - Three.js Matrix4 or object with elements array
+ * @returns {number}
+ */
+export function computeAffineDeterminant(matrixWorld) {
+  if (typeof matrixWorld?.determinantAffine === 'function') {
+    return matrixWorld.determinantAffine();
+  }
+  const te = matrixWorld?.elements;
+  if (!te || te.length < 16) return 1.0;
+  const n11 = te[0], n12 = te[4], n13 = te[8];
+  const n21 = te[1], n22 = te[5], n23 = te[9];
+  const n31 = te[2], n32 = te[6], n33 = te[10];
+  return (
+    n11 * (n22 * n33 - n23 * n32) -
+    n12 * (n21 * n33 - n23 * n31) +
+    n13 * (n21 * n32 - n22 * n31)
+  );
+}
 
 /**
  * Creates an Error representing an admission or batch rejection.
@@ -340,8 +386,9 @@ export function canAdmitMesh(mesh, camera, options = {}) {
     }
   }
 
-  // Pipeline has no cull state; require DoubleSide (2) explicitly per 13043 / 13062 point 1
-  if (material.side !== 2) {
+  // Side admission: FrontSide (0), BackSide (1), and DoubleSide (2) are supported
+  const side = material.side ?? THREE_SIDE.FRONT_SIDE;
+  if (side !== THREE_SIDE.FRONT_SIDE && side !== THREE_SIDE.BACK_SIDE && side !== THREE_SIDE.DOUBLE_SIDE) {
     return rejectMesh('UNSUPPORTED_SIDE');
   }
 
@@ -580,6 +627,20 @@ export function extractMeshRenderData(mesh, camera, width, height, options = {})
     ? THREE_DEPTH_FUNC_TO_WIRE_COMPARE[rawDepthFunc]
     : DEPTH_WIRE_COMPARE.ALWAYS;
 
+  // Material Side & Culling Settings
+  const side = mat.side ?? THREE_SIDE.FRONT_SIDE;
+  if (side !== THREE_SIDE.FRONT_SIDE && side !== THREE_SIDE.BACK_SIDE && side !== THREE_SIDE.DOUBLE_SIDE) {
+    throw createAdmissionError('UNSUPPORTED_SIDE', `material side ${side} is not supported`);
+  }
+
+  const det = computeAffineDeterminant(mesh.matrixWorld);
+  const isReflected = det < 0;
+  let flipSided = (side === THREE_SIDE.BACK_SIDE);
+  if (isReflected) flipSided = !flipSided;
+
+  const cullMode = (side === THREE_SIDE.DOUBLE_SIDE) ? CULL_MODE_WIRE.NONE : CULL_MODE_WIRE.BACK;
+  const frontFace = flipSided ? FRONT_FACE_WIRE.CW : FRONT_FACE_WIRE.CCW;
+
   return Object.freeze({
     positions,
     indices,
@@ -597,8 +658,56 @@ export function extractMeshRenderData(mesh, camera, width, height, options = {})
     vertexCount: positions.length / 3,
     triangleCount,
     isIndexed: indices.length > 0,
-    side: mat.side,
+    side,
+    isReflected,
+    flipSided,
+    cullMode,
+    frontFace,
   });
+}
+
+/**
+ * Helper to route single-mesh FrontSide and BackSide draws through f3d_build_mesh_batch_cull_packet (N=1).
+ * Invariant: Never falls back to no-cull Wasm entry point for non-DoubleSide meshes.
+ */
+function buildSingleMeshCullPacket(snapshot, width, height, wasmModule, isCanvas, options = {}) {
+  const cullBatchFn = wasmModule?.f3d_build_mesh_batch_cull_packet;
+  if (typeof cullBatchFn !== 'function') {
+    throw createAdmissionError(
+      'MISSING_CULL_EXPORT',
+      `wasmModule is missing f3d_build_mesh_batch_cull_packet export for side ${snapshot.side}. Silent DoubleSide fallback is strictly forbidden.`
+    );
+  }
+
+  if (snapshot.cullMode !== CULL_MODE_WIRE.NONE && snapshot.cullMode !== CULL_MODE_WIRE.FRONT && snapshot.cullMode !== CULL_MODE_WIRE.BACK) {
+    throw createAdmissionError('INVALID_CULL_MODE', `snapshot has invalid cullMode ${snapshot.cullMode}`);
+  }
+  if (snapshot.frontFace !== FRONT_FACE_WIRE.CCW && snapshot.frontFace !== FRONT_FACE_WIRE.CW) {
+    throw createAdmissionError('INVALID_FRONT_FACE', `snapshot has invalid frontFace ${snapshot.frontFace}`);
+  }
+
+  const positionsToUse = snapshot.expandedPositions;
+  const vertexCount = positionsToUse.length / 3;
+  const vertexCounts = new Uint32Array([vertexCount]);
+  const cullModes = new Uint8Array([snapshot.cullMode]);
+  const frontFaces = new Uint8Array([snapshot.frontFace]);
+
+  return cullBatchFn(
+    positionsToUse,
+    vertexCounts,
+    snapshot.modelView,
+    snapshot.projection,
+    snapshot.color,
+    cullModes,
+    frontFaces,
+    width,
+    height,
+    snapshot.webglDepth,
+    snapshot.depthTest,
+    snapshot.depthWrite,
+    snapshot.depthCompare,
+    isCanvas
+  );
 }
 
 /**
@@ -611,6 +720,8 @@ export function extractMeshRenderData(mesh, camera, width, height, options = {})
  * - Explicitly refuses execution if the visible canvas export is missing;
  *   silent offscreen fallback is strictly forbidden.
  * - Explicitly refuses execution if mesh requires depth but depth export is missing.
+ * - If mesh is FrontSide or BackSide, routes through f3d_build_mesh_batch_cull_packet (N=1);
+ *   silent DoubleSide fallback is strictly forbidden.
  *
  * @param {any} mesh
  * @param {any} camera
@@ -622,6 +733,11 @@ export function extractMeshRenderData(mesh, camera, width, height, options = {})
  */
 export function prepareCanvasMeshPacket(mesh, camera, width, height, wasmModule, options = {}) {
   const snapshot = extractMeshRenderData(mesh, camera, width, height, options);
+
+  if (snapshot.side !== THREE_SIDE.DOUBLE_SIDE) {
+    const packetBytes = buildSingleMeshCullPacket(snapshot, width, height, wasmModule, true, options);
+    return { packetBytes, snapshot, target: 'canvas' };
+  }
 
   const canvasDepthFn =
     wasmModule?.f3d_build_canvas_mesh_depth_packet ||
@@ -693,6 +809,11 @@ export function prepareCanvasMeshPacket(mesh, camera, width, height, wasmModule,
 export function prepareCanvasMeshDepthPacket(mesh, camera, width, height, wasmModule, options = {}) {
   const snapshot = extractMeshRenderData(mesh, camera, width, height, options);
 
+  if (snapshot.side !== THREE_SIDE.DOUBLE_SIDE) {
+    const packetBytes = buildSingleMeshCullPacket(snapshot, width, height, wasmModule, true, options);
+    return { packetBytes, snapshot, target: 'canvas' };
+  }
+
   const buildFn =
     wasmModule?.f3d_build_canvas_mesh_depth_packet ||
     wasmModule?.gpu_bridge_build_canvas_mesh_depth_packet;
@@ -733,6 +854,8 @@ export function prepareCanvasMeshDepthPacket(mesh, camera, width, height, wasmMo
  * Invariants:
  * - Requires wasmModule to expose f3d_build_mesh_depth_packet or f3d_build_mesh_packet.
  * - Explicitly refuses execution if mesh requires depth but depth export is missing.
+ * - If mesh is FrontSide or BackSide, routes through f3d_build_mesh_batch_cull_packet (N=1);
+ *   silent DoubleSide fallback is strictly forbidden.
  *
  * @param {any} mesh
  * @param {any} camera
@@ -748,6 +871,11 @@ export function prepareMeshPacket(mesh, camera, width, height, wasmModule, optio
   }
 
   const snapshot = extractMeshRenderData(mesh, camera, width, height, options);
+
+  if (snapshot.side !== THREE_SIDE.DOUBLE_SIDE) {
+    const packetBytes = buildSingleMeshCullPacket(snapshot, width, height, wasmModule, false, options);
+    return { packetBytes, snapshot, target: 'offscreen' };
+  }
 
   const depthFn =
     wasmModule?.f3d_build_mesh_depth_packet ||
@@ -815,6 +943,11 @@ export function prepareMeshPacket(mesh, camera, width, height, wasmModule, optio
  */
 export function prepareMeshDepthPacket(mesh, camera, width, height, wasmModule, options = {}) {
   const snapshot = extractMeshRenderData(mesh, camera, width, height, options);
+
+  if (snapshot.side !== THREE_SIDE.DOUBLE_SIDE) {
+    const packetBytes = buildSingleMeshCullPacket(snapshot, width, height, wasmModule, false, options);
+    return { packetBytes, snapshot, target: 'offscreen' };
+  }
 
   const buildFn =
     wasmModule?.f3d_build_mesh_depth_packet ||
@@ -950,11 +1083,12 @@ export function prepareMeshBatchPacket(meshes, camera, width, height, wasmModule
     }
   }
 
-  const batchFn = wasmModule?.f3d_build_mesh_batch_packet;
+  const cullBatchFn = wasmModule?.f3d_build_mesh_batch_cull_packet;
+  const legacyBatchFn = wasmModule?.f3d_build_mesh_batch_packet;
 
-  if (typeof batchFn !== 'function') {
+  if (typeof cullBatchFn !== 'function' && typeof legacyBatchFn !== 'function') {
     throw new Error(
-      'Mesh batch packet preparation failed: wasmModule is missing f3d_build_mesh_batch_packet export.'
+      'Mesh batch packet preparation failed: wasmModule is missing f3d_build_mesh_batch_packet or f3d_build_mesh_batch_cull_packet export.'
     );
   }
 
@@ -1005,13 +1139,40 @@ export function prepareMeshBatchPacket(meshes, camera, width, height, wasmModule
     }
   }
 
+  // Material side / cull checks and typed array creation
+  const n = snapshots.length;
+  const cullModes = new Uint8Array(n);
+  const frontFaces = new Uint8Array(n);
+  let hasNonDoubleSide = false;
+
+  for (let i = 0; i < n; i++) {
+    const s = snapshots[i];
+    if (s.side !== THREE_SIDE.DOUBLE_SIDE) {
+      hasNonDoubleSide = true;
+    }
+    if (s.cullMode !== CULL_MODE_WIRE.NONE && s.cullMode !== CULL_MODE_WIRE.FRONT && s.cullMode !== CULL_MODE_WIRE.BACK) {
+      throw createAdmissionError('INVALID_CULL_MODE', `mesh ${i} has invalid cullMode ${s.cullMode}`);
+    }
+    if (s.frontFace !== FRONT_FACE_WIRE.CCW && s.frontFace !== FRONT_FACE_WIRE.CW) {
+      throw createAdmissionError('INVALID_FRONT_FACE', `mesh ${i} has invalid frontFace ${s.frontFace}`);
+    }
+    cullModes[i] = s.cullMode;
+    frontFaces[i] = s.frontFace;
+  }
+
+  if (hasNonDoubleSide && typeof cullBatchFn !== 'function') {
+    throw createAdmissionError(
+      'MISSING_CULL_EXPORT',
+      'Mesh batch contains FrontSide or BackSide meshes, but wasmModule is missing f3d_build_mesh_batch_cull_packet export. Silent DoubleSide fallback is strictly forbidden.'
+    );
+  }
+
   // Calculate total expanded vertex count across all meshes
   let totalVertices = 0;
   for (let i = 0; i < snapshots.length; i++) {
     totalVertices += snapshots[i].expandedPositions.length / 3;
   }
 
-  const n = snapshots.length;
   const flatPositions = new Float32Array(totalVertices * 3);
   const vertexCounts = new Uint32Array(n);
   const modelViews = new Float64Array(n * 16);
@@ -1035,20 +1196,39 @@ export function prepareMeshBatchPacket(meshes, camera, width, height, wasmModule
 
   let packetBytes;
   try {
-    packetBytes = batchFn(
-      flatPositions,
-      vertexCounts,
-      modelViews,
-      projection,
-      colors,
-      width,
-      height,
-      sharedWebglDepth,
-      sharedDepthTest,
-      sharedDepthWrite,
-      sharedDepthCompare,
-      isCanvas,
-    );
+    if (typeof cullBatchFn === 'function') {
+      packetBytes = cullBatchFn(
+        flatPositions,
+        vertexCounts,
+        modelViews,
+        projection,
+        colors,
+        cullModes,
+        frontFaces,
+        width,
+        height,
+        sharedWebglDepth,
+        sharedDepthTest,
+        sharedDepthWrite,
+        sharedDepthCompare,
+        isCanvas,
+      );
+    } else {
+      packetBytes = legacyBatchFn(
+        flatPositions,
+        vertexCounts,
+        modelViews,
+        projection,
+        colors,
+        width,
+        height,
+        sharedWebglDepth,
+        sharedDepthTest,
+        sharedDepthWrite,
+        sharedDepthCompare,
+        isCanvas,
+      );
+    }
   } catch (err) {
     const msg = err?.message ?? String(err);
     if (
@@ -1058,6 +1238,12 @@ export function prepareMeshBatchPacket(meshes, camera, width, height, wasmModule
     ) {
       throw createAdmissionError('EMPTY_MESH_BATCH');
     }
+    if (msg.includes('INVALID_CULL_MODE')) {
+      throw createAdmissionError('INVALID_CULL_MODE', msg);
+    }
+    if (msg.includes('INVALID_FRONT_FACE')) {
+      throw createAdmissionError('INVALID_FRONT_FACE', msg);
+    }
     throw err;
   }
 
@@ -1066,6 +1252,8 @@ export function prepareMeshBatchPacket(meshes, camera, width, height, wasmModule
     snapshots,
     meshCount: n,
     totalVertices,
+    cullModes,
+    frontFaces,
     target: isCanvas ? 'canvas' : 'offscreen',
   };
 }
@@ -1081,7 +1269,7 @@ export function prepareMeshBatchPacket(meshes, camera, width, height, wasmModule
  * @param {any} [canvasContext] - HTMLCanvasElement / GPUCanvasContext (optional)
  * @param {object} wasmModule - Loaded Wasm module
  * @param {object} [options]
- * @returns {Promise<{ result: any, snapshots: Array<object>, meshCount: number, totalVertices: number, target: 'canvas' | 'offscreen' }>}
+ * @returns {Promise<{ result: any, snapshots: Array<object>, meshCount: number, totalVertices: number, cullModes: Uint8Array, frontFaces: Uint8Array, target: 'canvas' | 'offscreen' }>}
  */
 export async function renderMeshBatch(bridgeHost, meshes, camera, canvasContext, wasmModule, options = {}) {
   if (!bridgeHost || typeof bridgeHost.executePacket !== 'function') {
@@ -1111,6 +1299,8 @@ export async function renderMeshBatch(bridgeHost, meshes, camera, canvasContext,
     snapshots: batchResult.snapshots,
     meshCount: batchResult.meshCount,
     totalVertices: batchResult.totalVertices,
+    cullModes: batchResult.cullModes,
+    frontFaces: batchResult.frontFaces,
     target: batchResult.target,
   };
 }

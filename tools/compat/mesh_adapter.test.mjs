@@ -44,8 +44,12 @@ import {
   ADMISSION_REJECTION,
   createAdmissionError,
   COORDINATE_SYSTEM,
+  THREE_SIDE,
+  CULL_MODE_WIRE,
+  FRONT_FACE_WIRE,
   DEPTH_WIRE_COMPARE,
   THREE_DEPTH_FUNC_TO_WIRE_COMPARE,
+  computeAffineDeterminant,
 } from './mesh_adapter.mjs';
 
 function createBasicTriangleMesh(materialProps = {}, geomProps = {}) {
@@ -394,23 +398,51 @@ test('Positive: Incomplete tail indices dropped in triangle expansion per native
   assert.equal(snapshot.expandedPositions.length, 9); // exactly 1 triangle (3 vertices * 3 coords)
 });
 
-test('Side admission: Only DoubleSide (2) is admitted; FrontSide (0) and BackSide (1) are rejected (13062 point 1)', () => {
+test('Side admission: FrontSide (0), BackSide (1), and DoubleSide (2) are admitted; invalid sides rejected', () => {
   const camera = createBasicCamera();
 
   const doubleMesh = createBasicTriangleMesh({ side: THREE.DoubleSide });
   assert.equal(canAdmitMesh(doubleMesh, camera).admitted, true);
   const doubleSnap = extractMeshRenderData(doubleMesh, camera, 64, 64);
-  assert.equal(doubleSnap.side, 2);
+  assert.equal(doubleSnap.side, THREE_SIDE.DOUBLE_SIDE);
+  assert.equal(doubleSnap.cullMode, CULL_MODE_WIRE.NONE);
 
   const frontMesh = createBasicTriangleMesh({ side: THREE.FrontSide });
-  const frontAdmission = canAdmitMesh(frontMesh, camera);
-  assert.equal(frontAdmission.admitted, false);
-  assert.equal(frontAdmission.reason, ADMISSION_REJECTION.UNSUPPORTED_SIDE);
+  assert.equal(canAdmitMesh(frontMesh, camera).admitted, true);
+  const frontSnap = extractMeshRenderData(frontMesh, camera, 64, 64);
+  assert.equal(frontSnap.side, THREE_SIDE.FRONT_SIDE);
+  assert.equal(frontSnap.cullMode, CULL_MODE_WIRE.BACK);
+  assert.equal(frontSnap.frontFace, FRONT_FACE_WIRE.CCW);
 
   const backMesh = createBasicTriangleMesh({ side: THREE.BackSide });
-  const backAdmission = canAdmitMesh(backMesh, camera);
-  assert.equal(backAdmission.admitted, false);
-  assert.equal(backAdmission.reason, ADMISSION_REJECTION.UNSUPPORTED_SIDE);
+  assert.equal(canAdmitMesh(backMesh, camera).admitted, true);
+  const backSnap = extractMeshRenderData(backMesh, camera, 64, 64);
+  assert.equal(backSnap.side, THREE_SIDE.BACK_SIDE);
+  assert.equal(backSnap.cullMode, CULL_MODE_WIRE.BACK);
+  assert.equal(backSnap.frontFace, FRONT_FACE_WIRE.CW);
+
+  // Default side (undefined) defaults to FrontSide
+  const defaultSideMesh = createBasicTriangleMesh();
+  delete defaultSideMesh.material.side;
+  assert.equal(canAdmitMesh(defaultSideMesh, camera).admitted, true);
+  const defaultSnap = extractMeshRenderData(defaultSideMesh, camera, 64, 64);
+  assert.equal(defaultSnap.side, THREE_SIDE.FRONT_SIDE);
+
+  // Invalid sides: 99, -1, 'unsupported'
+  const invalidMesh99 = createBasicTriangleMesh({ side: 99 });
+  const admission99 = canAdmitMesh(invalidMesh99, camera);
+  assert.equal(admission99.admitted, false);
+  assert.equal(admission99.reason, ADMISSION_REJECTION.UNSUPPORTED_SIDE);
+  assert.throws(
+    () => extractMeshRenderData(invalidMesh99, camera, 64, 64),
+    /UNSUPPORTED_SIDE/
+  );
+
+  const invalidMeshNeg = createBasicTriangleMesh({ side: -1 });
+  assert.equal(canAdmitMesh(invalidMeshNeg, camera).admitted, false);
+
+  const invalidMeshStr = createBasicTriangleMesh({ side: 'two-sided' });
+  assert.equal(canAdmitMesh(invalidMeshStr, camera).admitted, false);
 });
 
 test('drawRange correctness: Clamps Infinity count with nonzero start and preserves empty draw (13062 point 2)', () => {
@@ -1602,7 +1634,7 @@ test('Positive: renderScene collects 3 meshes with distinct colors/transforms in
   assert.deepEqual(capturedBatchArgs.mvs.slice(32, 48), expectedMv3);
 });
 
-test('Refusal: renderScene refuses WHOLE submission when visible InstancedMesh or non-DoubleSide mesh exists (no partial render)', async () => {
+test('Refusal: renderScene refuses WHOLE submission when visible InstancedMesh or unsupported-side mesh exists (no partial render)', async () => {
   const scene = new THREE.Scene();
   const camera = createBasicCamera();
 
@@ -1614,14 +1646,14 @@ test('Refusal: renderScene refuses WHOLE submission when visible InstancedMesh o
   const instMat = new THREE.MeshBasicMaterial({ side: THREE.DoubleSide, depthTest: false, depthWrite: false });
   const instancedMesh = new THREE.InstancedMesh(instGeom, instMat, 2);
 
-  // Non-DoubleSide: side: FrontSide (0)
-  const nonDoubleMesh = createBasicTriangleMesh({ side: THREE.FrontSide });
+  // Unsupported side: side 99
+  const invalidSideMesh = createBasicTriangleMesh({ side: 99 });
 
   const validMesh2 = createBasicTriangleMesh({ color: 0x00ff00 });
 
   scene.add(validMesh1);
   scene.add(instancedMesh);
-  scene.add(nonDoubleMesh);
+  scene.add(invalidSideMesh);
   scene.add(validMesh2);
 
   let capturedBatchArgs = null;
@@ -1652,7 +1684,7 @@ test('Refusal: renderScene refuses WHOLE submission when visible InstancedMesh o
     reason: ADMISSION_REJECTION.UNSUPPORTED_MESH_SUBCLASS,
   });
   assert.deepEqual(res.refused[1], {
-    uuid: nonDoubleMesh.uuid,
+    uuid: invalidSideMesh.uuid,
     reason: ADMISSION_REJECTION.UNSUPPORTED_SIDE,
   });
 
@@ -1725,10 +1757,10 @@ test('Negative: renderScene with empty admitted set explicitly refuses without s
   const instMat = new THREE.MeshBasicMaterial({ side: THREE.DoubleSide });
   const instMesh = new THREE.InstancedMesh(instGeom, instMat, 1);
 
-  const frontMesh = createBasicTriangleMesh({ side: THREE.FrontSide });
+  const invalidMesh = createBasicTriangleMesh({ side: 99 });
 
   scene.add(instMesh);
-  scene.add(frontMesh);
+  scene.add(invalidMesh);
 
   let executeCalled = false;
   const mockBridgeHost = {
@@ -1749,7 +1781,7 @@ test('Negative: renderScene with empty admitted set explicitly refuses without s
   assert.deepEqual(res.admitted, []);
   assert.equal(res.refused.length, 2);
   assert.equal(res.refused[0].uuid, instMesh.uuid);
-  assert.equal(res.refused[1].uuid, frontMesh.uuid);
+  assert.equal(res.refused[1].uuid, invalidMesh.uuid);
   assert.equal(executeCalled, false);
 });
 
@@ -2524,4 +2556,275 @@ test('Refusal: renderScene refuses WHOLE submission when visible scene meshes ha
     assert.equal(res.refused.length, 0);
     assert.equal(execCount, 1);
   }
+});
+
+test('Material Side & Reflected Winding: computeAffineDeterminant and reflection parity table', () => {
+  const camera = createBasicCamera();
+
+  // Helper to test a mesh with specific side and scale
+  function evaluateParity(side, scaleX, scaleY = 1, scaleZ = 1) {
+    const mesh = createBasicTriangleMesh({ side });
+    mesh.scale.set(scaleX, scaleY, scaleZ);
+    mesh.updateMatrixWorld(true);
+    const snap = extractMeshRenderData(mesh, camera, 64, 64);
+    return {
+      det: computeAffineDeterminant(mesh.matrixWorld),
+      isReflected: snap.isReflected,
+      flipSided: snap.flipSided,
+      cullMode: snap.cullMode,
+      frontFace: snap.frontFace,
+      side: snap.side,
+    };
+  }
+
+  // 1. FrontSide + normal transform (det > 0): cullMode BACK (2), frontFace CCW (0)
+  const frontNormal = evaluateParity(THREE.FrontSide, 1, 1, 1);
+  assert.ok(frontNormal.det > 0);
+  assert.equal(frontNormal.isReflected, false);
+  assert.equal(frontNormal.flipSided, false);
+  assert.equal(frontNormal.cullMode, CULL_MODE_WIRE.BACK);
+  assert.equal(frontNormal.frontFace, FRONT_FACE_WIRE.CCW);
+
+  // 2. FrontSide + reflected transform (det < 0 via scale.x = -1): cullMode BACK (2), frontFace CW (1)
+  const frontReflected = evaluateParity(THREE.FrontSide, -1, 1, 1);
+  assert.ok(frontReflected.det < 0);
+  assert.equal(frontReflected.isReflected, true);
+  assert.equal(frontReflected.flipSided, true);
+  assert.equal(frontReflected.cullMode, CULL_MODE_WIRE.BACK);
+  assert.equal(frontReflected.frontFace, FRONT_FACE_WIRE.CW);
+
+  // 3. BackSide + normal transform (det > 0): cullMode BACK (2), frontFace CW (1)
+  const backNormal = evaluateParity(THREE.BackSide, 1, 1, 1);
+  assert.ok(backNormal.det > 0);
+  assert.equal(backNormal.isReflected, false);
+  assert.equal(backNormal.flipSided, true);
+  assert.equal(backNormal.cullMode, CULL_MODE_WIRE.BACK);
+  assert.equal(backNormal.frontFace, FRONT_FACE_WIRE.CW);
+
+  // 4. BackSide + reflected transform (det < 0 via scale.y = -1): cullMode BACK (2), frontFace CCW (0)
+  const backReflected = evaluateParity(THREE.BackSide, 1, -1, 1);
+  assert.ok(backReflected.det < 0);
+  assert.equal(backReflected.isReflected, true);
+  assert.equal(backReflected.flipSided, false);
+  assert.equal(backReflected.cullMode, CULL_MODE_WIRE.BACK);
+  assert.equal(backReflected.frontFace, FRONT_FACE_WIRE.CCW);
+
+  // 5. DoubleSide + normal transform: cullMode NONE (0), frontFace CCW (0)
+  const doubleNormal = evaluateParity(THREE.DoubleSide, 1, 1, 1);
+  assert.equal(doubleNormal.cullMode, CULL_MODE_WIRE.NONE);
+  assert.equal(doubleNormal.frontFace, FRONT_FACE_WIRE.CCW);
+
+  // 6. DoubleSide + reflected transform: cullMode NONE (0), frontFace CW (1)
+  const doubleReflected = evaluateParity(THREE.DoubleSide, -1, 1, 1);
+  assert.equal(doubleReflected.cullMode, CULL_MODE_WIRE.NONE);
+  assert.equal(doubleReflected.frontFace, FRONT_FACE_WIRE.CW);
+
+  // 7. Group hierarchy reflection: Parent group with scale.x = -1 reflects child mesh
+  const parentGroup = new THREE.Group();
+  parentGroup.scale.set(-1, 1, 1);
+  const childMesh = createBasicTriangleMesh({ side: THREE.FrontSide });
+  parentGroup.add(childMesh);
+  parentGroup.updateMatrixWorld(true);
+
+  const childSnap = extractMeshRenderData(childMesh, camera, 64, 64);
+  assert.equal(childSnap.isReflected, true);
+  assert.equal(childSnap.flipSided, true);
+  assert.equal(childSnap.cullMode, CULL_MODE_WIRE.BACK);
+  assert.equal(childSnap.frontFace, FRONT_FACE_WIRE.CW);
+
+  // 8. Double reflection cancels out (scale.x = -1, scale.y = -1 -> det > 0)
+  const doubleNeg = evaluateParity(THREE.FrontSide, -1, -1, 1);
+  assert.ok(doubleNeg.det > 0);
+  assert.equal(doubleNeg.isReflected, false);
+  assert.equal(doubleNeg.flipSided, false);
+  assert.equal(doubleNeg.cullMode, CULL_MODE_WIRE.BACK);
+  assert.equal(doubleNeg.frontFace, FRONT_FACE_WIRE.CCW);
+});
+
+test('Single-mesh APIs: Non-DoubleSide meshes route through f3d_build_mesh_batch_cull_packet (N=1)', () => {
+  const camera = createBasicCamera();
+  const frontMesh = createBasicTriangleMesh({ side: THREE.FrontSide });
+  const backMesh = createBasicTriangleMesh({ side: THREE.BackSide });
+  const doubleMesh = createBasicTriangleMesh({ side: THREE.DoubleSide });
+
+  let cullCallArgs = null;
+  const mockWasm = {
+    f3d_build_mesh_batch_cull_packet: (pos, vCounts, mv, proj, col, cModes, fFaces, w, h, wd, dt, dw, dc, canvas) => {
+      cullCallArgs = { pos, vCounts, mv, proj, col, cModes, fFaces, w, h, wd, dt, dw, dc, canvas };
+      return new Uint8Array([0xCA, 0xFE]);
+    },
+    f3d_build_mesh_depth_packet: () => new Uint8Array([0xDE, 0xAD]),
+    f3d_build_mesh_packet: () => new Uint8Array([0xBE, 0xEF]),
+  };
+
+  // 1. prepareMeshPacket with FrontSide routes to f3d_build_mesh_batch_cull_packet
+  cullCallArgs = null;
+  const resFront = prepareMeshPacket(frontMesh, camera, 64, 64, mockWasm);
+  assert.deepEqual(resFront.packetBytes, new Uint8Array([0xCA, 0xFE]));
+  assert.equal(cullCallArgs.vCounts.length, 1);
+  assert.equal(cullCallArgs.vCounts[0], 3);
+  assert.deepEqual(Array.from(cullCallArgs.cModes), [CULL_MODE_WIRE.BACK]);
+  assert.deepEqual(Array.from(cullCallArgs.fFaces), [FRONT_FACE_WIRE.CCW]);
+  assert.equal(cullCallArgs.canvas, false);
+
+  // 2. prepareMeshDepthPacket with BackSide routes to f3d_build_mesh_batch_cull_packet
+  cullCallArgs = null;
+  const resBack = prepareMeshDepthPacket(backMesh, camera, 64, 64, mockWasm);
+  assert.deepEqual(resBack.packetBytes, new Uint8Array([0xCA, 0xFE]));
+  assert.deepEqual(Array.from(cullCallArgs.cModes), [CULL_MODE_WIRE.BACK]);
+  assert.deepEqual(Array.from(cullCallArgs.fFaces), [FRONT_FACE_WIRE.CW]);
+
+  // 3. prepareCanvasMeshPacket with FrontSide sets canvas=true
+  cullCallArgs = null;
+  const resCanvasFront = prepareCanvasMeshPacket(frontMesh, camera, 64, 64, mockWasm);
+  assert.deepEqual(resCanvasFront.packetBytes, new Uint8Array([0xCA, 0xFE]));
+  assert.equal(cullCallArgs.canvas, true);
+
+  // 4. prepareCanvasMeshDepthPacket with BackSide sets canvas=true
+  cullCallArgs = null;
+  const resCanvasBack = prepareCanvasMeshDepthPacket(backMesh, camera, 64, 64, mockWasm);
+  assert.deepEqual(resCanvasBack.packetBytes, new Uint8Array([0xCA, 0xFE]));
+  assert.equal(cullCallArgs.canvas, true);
+  assert.deepEqual(Array.from(cullCallArgs.cModes), [CULL_MODE_WIRE.BACK]);
+  assert.deepEqual(Array.from(cullCallArgs.fFaces), [FRONT_FACE_WIRE.CW]);
+
+  // 5. DoubleSide mesh still routes through legacy depth/legacy packet builder
+  cullCallArgs = null;
+  const resDouble = prepareMeshPacket(doubleMesh, camera, 64, 64, mockWasm);
+  assert.deepEqual(resDouble.packetBytes, new Uint8Array([0xDE, 0xAD]));
+  assert.equal(cullCallArgs, null, 'DoubleSide mesh must not call cull export when legacy export exists');
+
+  // 6. Non-DoubleSide strictly refuses when f3d_build_mesh_batch_cull_packet is missing
+  const mockWasmNoCull = {
+    f3d_build_mesh_depth_packet: () => new Uint8Array([1]),
+    f3d_build_mesh_packet: () => new Uint8Array([1]),
+  };
+
+  assert.throws(
+    () => prepareMeshPacket(frontMesh, camera, 64, 64, mockWasmNoCull),
+    (err) => err.reason === 'MISSING_CULL_EXPORT' && err.message.includes('MISSING_CULL_EXPORT')
+  );
+
+  assert.throws(
+    () => prepareMeshDepthPacket(backMesh, camera, 64, 64, mockWasmNoCull),
+    (err) => err.reason === 'MISSING_CULL_EXPORT' && err.message.includes('MISSING_CULL_EXPORT')
+  );
+
+  assert.throws(
+    () => prepareCanvasMeshPacket(frontMesh, camera, 64, 64, mockWasmNoCull),
+    (err) => err.reason === 'MISSING_CULL_EXPORT' && err.message.includes('MISSING_CULL_EXPORT')
+  );
+
+  assert.throws(
+    () => prepareCanvasMeshDepthPacket(backMesh, camera, 64, 64, mockWasmNoCull),
+    (err) => err.reason === 'MISSING_CULL_EXPORT' && err.message.includes('MISSING_CULL_EXPORT')
+  );
+});
+
+test('Multi-mesh batch: Mixed-side batch packs cullModes and frontFaces (14 arguments)', () => {
+  const camera = createBasicCamera();
+
+  const meshDouble = createBasicTriangleMesh({ color: 0x0000ff, side: THREE.DoubleSide });
+  const meshFront = createBasicTriangleMesh({ color: 0x00ff00, side: THREE.FrontSide });
+  const meshBack = createBasicTriangleMesh({ color: 0xff0000, side: THREE.BackSide });
+
+  let capturedArgs = null;
+  const mockWasmCull = {
+    f3d_build_mesh_batch_cull_packet: (flatPos, vCounts, mvs, proj, cols, cModes, fFaces, w, h, wd, dt, dw, dc, canvas) => {
+      capturedArgs = { flatPos, vCounts, mvs, proj, cols, cModes, fFaces, w, h, wd, dt, dw, dc, canvas };
+      return new Uint8Array([0x14, 0x00]);
+    },
+  };
+
+  const batchResult = prepareMeshBatchPacket(
+    [meshDouble, meshFront, meshBack],
+    camera,
+    64,
+    64,
+    mockWasmCull,
+    { target: 'offscreen' }
+  );
+
+  assert.equal(batchResult.meshCount, 3);
+  assert.equal(capturedArgs.cModes.length, 3);
+  assert.equal(capturedArgs.fFaces.length, 3);
+  assert.deepEqual(Array.from(batchResult.cullModes), [CULL_MODE_WIRE.NONE, CULL_MODE_WIRE.BACK, CULL_MODE_WIRE.BACK]);
+  assert.deepEqual(Array.from(batchResult.frontFaces), [FRONT_FACE_WIRE.CCW, FRONT_FACE_WIRE.CCW, FRONT_FACE_WIRE.CW]);
+  assert.deepEqual(Array.from(capturedArgs.cModes), [0, 2, 2]);
+  assert.deepEqual(Array.from(capturedArgs.fFaces), [0, 0, 1]);
+  assert.equal(capturedArgs.canvas, false);
+
+  // If Wasm only has legacy f3d_build_mesh_batch_packet, mixed-side batch throws MISSING_CULL_EXPORT
+  const mockWasmLegacyOnly = {
+    f3d_build_mesh_batch_packet: () => new Uint8Array([12]),
+  };
+
+  assert.throws(
+    () => prepareMeshBatchPacket([meshDouble, meshFront], camera, 64, 64, mockWasmLegacyOnly),
+    (err) => err.reason === 'MISSING_CULL_EXPORT' && err.message.includes('MISSING_CULL_EXPORT')
+  );
+
+  // But all-DoubleSide batch on legacy Wasm succeeds via 12-arg call
+  let legacyCalled = false;
+  const mockWasmLegacyOnlyDouble = {
+    f3d_build_mesh_batch_packet: (flatPos, vCounts, mvs, proj, cols, w, h, wd, dt, dw, dc, canvas) => {
+      legacyCalled = true;
+      return new Uint8Array([12]);
+    },
+  };
+  const doubleBatchRes = prepareMeshBatchPacket([meshDouble], camera, 64, 64, mockWasmLegacyOnlyDouble);
+  assert.equal(legacyCalled, true);
+  assert.equal(doubleBatchRes.meshCount, 1);
+});
+
+test('renderScene: Admits mixed sides and reflected hierarchies into single batch execution', async () => {
+  const scene = new THREE.Scene();
+  const camera = createBasicCamera();
+
+  // Mesh 1: Normal DoubleSide
+  const mesh1 = createBasicTriangleMesh({ color: 0x0000ff, side: THREE.DoubleSide });
+
+  // Mesh 2: Normal FrontSide
+  const mesh2 = createBasicTriangleMesh({ color: 0x00ff00, side: THREE.FrontSide });
+
+  // Mesh 3: Child of reflected group
+  const reflectedGroup = new THREE.Group();
+  reflectedGroup.scale.set(-1, 1, 1);
+  const mesh3 = createBasicTriangleMesh({ color: 0xff0000, side: THREE.FrontSide });
+  reflectedGroup.add(mesh3);
+
+  scene.add(mesh1);
+  scene.add(mesh2);
+  scene.add(reflectedGroup);
+
+  let capturedBatch = null;
+  const mockWasm = {
+    f3d_build_mesh_batch_cull_packet: (flatPos, vCounts, mvs, proj, cols, cModes, fFaces, w, h, wd, dt, dw, dc, canvas) => {
+      capturedBatch = { cModes: Array.from(cModes), fFaces: Array.from(fFaces), meshCount: vCounts.length };
+      return new Uint8Array([0xAA, 0xBB]);
+    },
+  };
+
+  let executed = false;
+  const mockBridgeHost = {
+    executePacket: async (bytes) => {
+      executed = true;
+      assert.deepEqual(bytes, new Uint8Array([0xAA, 0xBB]));
+      return { status: 'SCENE_OK' };
+    },
+  };
+
+  const res = await renderScene(mockBridgeHost, scene, camera, null, mockWasm);
+
+  assert.equal(executed, true);
+  assert.equal(res.refused.length, 0);
+  assert.equal(res.admitted.length, 3);
+  assert.deepEqual(res.admitted, [mesh1.uuid, mesh2.uuid, mesh3.uuid]);
+
+  // Check cullModes and frontFaces:
+  // mesh1 (DoubleSide): cull NONE (0), CCW (0)
+  // mesh2 (FrontSide, det > 0): cull BACK (2), CCW (0)
+  // mesh3 (FrontSide, parent reflected det < 0): cull BACK (2), CW (1)
+  assert.deepEqual(capturedBatch.cModes, [CULL_MODE_WIRE.NONE, CULL_MODE_WIRE.BACK, CULL_MODE_WIRE.BACK]);
+  assert.deepEqual(capturedBatch.fFaces, [FRONT_FACE_WIRE.CCW, FRONT_FACE_WIRE.CCW, FRONT_FACE_WIRE.CW]);
 });
