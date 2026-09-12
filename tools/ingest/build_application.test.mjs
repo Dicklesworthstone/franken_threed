@@ -34,7 +34,7 @@ import {
   findChunkForPreload,
   toCanonicalPreloadUrl
 } from './build_application.mjs';
-import { parseHtmlEntries, stripScriptAndStyleBodies, stripHtmlComments } from './html_parser.mjs';
+import { parseHtmlEntries, parseTagAttributes, stripScriptAndStyleBodies, stripHtmlComments } from './html_parser.mjs';
 
 const SCRATCH_BASE = fs.existsSync('/Volumes/USBNVME16TB/temp_agent_space')
   ? '/Volumes/USBNVME16TB/temp_agent_space'
@@ -1772,4 +1772,114 @@ test('buildApplication ignores new URL(..., import.meta.url) when URL identifier
 
   // nonexistent_shadowed.png must NOT be emitted
   assert.equal(res.emittedFiles.some(f => f.endsWith('nonexistent_shadowed.png')), false);
+});
+
+test('buildApplication creates portable bundle for H1 (webgpu_performance_renderbundle.html)', async () => {
+  const scratch = makeScratch('f3d_app_h1_renderbundle');
+  const outDir = path.join(scratch, 'dist');
+  const h1Entry = 'upstream/three.js/examples/webgpu_performance_renderbundle.html';
+  assert.ok(fs.existsSync(h1Entry), `H1 entry point must exist at ${h1Entry}`);
+
+  const res = await buildApplication(h1Entry, outDir);
+  assert.equal(res.isHtml, true, 'Result must indicate HTML application');
+  assert.equal(res.htmlFile, 'webgpu_performance_renderbundle.html', 'Emitted HTML filename must match');
+
+  const htmlPath = path.join(outDir, res.htmlFile);
+  assert.ok(fs.existsSync(htmlPath), `Emitted HTML file must exist on disk: ${htmlPath}`);
+  const rewrittenHtml = fs.readFileSync(htmlPath, 'utf-8');
+
+  // 1. Assert rewritten HTML has no remaining bare 'three' / 'three/addons' specifiers
+  assert.ok(
+    !rewrittenHtml.includes("'three'"),
+    "rewritten HTML must not contain bare 'three' specifier"
+  );
+  assert.ok(
+    !rewrittenHtml.includes("'three/"),
+    "rewritten HTML must not contain bare 'three/' specifier"
+  );
+  assert.ok(
+    !rewrittenHtml.includes("'three/addons"),
+    "rewritten HTML must not contain bare 'three/addons' specifier"
+  );
+  assert.ok(
+    !rewrittenHtml.includes('"three"'),
+    'rewritten HTML must not contain bare "three" specifier'
+  );
+  assert.ok(
+    !rewrittenHtml.includes('"three/'),
+    'rewritten HTML must not contain bare "three/" specifier'
+  );
+  assert.ok(
+    !rewrittenHtml.includes('"three/addons'),
+    'rewritten HTML must not contain bare "three/addons" specifier'
+  );
+  assert.ok(
+    !rewrittenHtml.includes('three/addons'),
+    'rewritten HTML must not contain three/addons'
+  );
+  assert.ok(
+    !/<script\b[^>]*type=["']importmap["']/i.test(rewrittenHtml),
+    'Consumed build-time import map must be removed from portable bundle HTML'
+  );
+
+  // 2. Assert every emitted chunk and referenced asset exists on disk
+  assert.ok(res.emittedFiles.length > 0, 'emittedFiles must not be empty');
+  for (const relFile of res.emittedFiles) {
+    const absPath = path.join(outDir, relFile);
+    assert.ok(fs.existsSync(absPath), `Emitted file must exist on disk: ${relFile}`);
+    assert.ok(fs.statSync(absPath).size > 0, `Emitted file must be non-empty: ${relFile}`);
+  }
+
+  for (const chunk of res.chunks) {
+    const chunkPath = path.join(outDir, chunk.fileName);
+    assert.ok(fs.existsSync(chunkPath), `Emitted chunk must exist on disk: ${chunk.fileName}`);
+    assert.ok(fs.statSync(chunkPath).size > 0, `Emitted chunk must have positive byte length: ${chunk.fileName}`);
+  }
+
+  // Verify all DOM-referenced relative assets exist on disk
+  const domAssets = extractRelativeAssetUrls(rewrittenHtml);
+  for (const assetRel of domAssets) {
+    const assetPath = path.resolve(outDir, assetRel);
+    assert.ok(fs.existsSync(assetPath), `Referenced DOM asset must exist on disk: ${assetRel}`);
+  }
+
+  // 3. Assert modulepreload hrefs resolve to emitted files
+  const linkMatches = [...rewrittenHtml.matchAll(/<link\b((?:[^"'><]+|"[^"]*"|'[^']*')*)>/gi)];
+  for (const match of linkMatches) {
+    const attrs = parseTagAttributes(match[1]);
+    if (attrs.rel && attrs.rel.toLowerCase() === 'modulepreload') {
+      assert.ok(attrs.href, 'modulepreload must provide an href attribute');
+      const cleanHref = attrs.href.split(/[?#]/)[0];
+      const preloadPath = path.resolve(outDir, cleanHref);
+      assert.ok(
+        fs.existsSync(preloadPath),
+        `modulepreload href must resolve to an existing file on disk: ${attrs.href}`
+      );
+    }
+  }
+
+  // 4. Assert SRI hashes match file bytes honestly
+  const tagsWithPotentialIntegrity = [
+    ...rewrittenHtml.matchAll(/<(?:script|link)\b((?:[^"'><]+|"[^"]*"|'[^']*')*)>/gi)
+  ];
+  for (const match of tagsWithPotentialIntegrity) {
+    const attrs = parseTagAttributes(match[1]);
+    if (attrs.integrity) {
+      const ref = attrs.src || attrs.href;
+      assert.ok(ref, `Tag with integrity attribute must reference a file: ${match[0]}`);
+      const cleanRef = ref.split(/[?#]/)[0];
+      const targetPath = path.resolve(outDir, cleanRef);
+      assert.ok(fs.existsSync(targetPath), `Target file for SRI verification must exist: ${targetPath}`);
+      const fileBytes = fs.readFileSync(targetPath);
+
+      for (const token of attrs.integrity.trim().split(/\s+/)) {
+        const dashIdx = token.indexOf('-');
+        assert.ok(dashIdx > 0, `Integrity token must have algo prefix: ${token}`);
+        const algo = token.slice(0, dashIdx);
+        const expectedHash = token.slice(dashIdx + 1);
+        const actualHash = crypto.createHash(algo).update(fileBytes).digest('base64');
+        assert.equal(actualHash, expectedHash, `SRI ${algo} hash must match file bytes`);
+      }
+    }
+  }
 });
