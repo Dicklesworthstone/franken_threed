@@ -20,6 +20,7 @@
 //! CIE 1931 XYZ space using the canonical Three.js r186 3x3 transformation matrices.
 
 use core::fmt::{self, Write};
+use crate::jsnum::{js_max, js_min};
 use crate::matrix3::Matrix3;
 use crate::vector3::Vector3;
 
@@ -298,7 +299,7 @@ pub fn linear_to_srgb(c: f64) -> f64 {
 /// Clamps value between `min` and `max` matching Three.js `MathUtils.clamp`.
 #[inline]
 fn clamp(value: f64, min: f64, max: f64) -> f64 {
-    value.max(min).min(max)
+    js_max(min, js_min(max, value))
 }
 
 /// Euclidean modulo `((n % m) + m) % m` matching Three.js `MathUtils.euclideanModulo`.
@@ -680,6 +681,26 @@ impl Color {
         self.set_rgb(r, g, b, ColorSpace::LinearSRGB)
     }
 
+    /// Copies RGB values converted to `color_space` into `target`.
+    ///
+    /// Matches Three.js r186 `Color.getRGB(target, colorSpace)`.
+    pub fn get_rgb<'a>(&self, target: &'a mut Color, color_space: ColorSpace) -> &'a mut Color {
+        let mut copy = *self;
+        copy.working_to_color_space(color_space);
+        target.r = copy.r;
+        target.g = copy.g;
+        target.b = copy.b;
+        target
+    }
+
+    /// Copies RGB values in the working color space ([`ColorSpace::LinearSRGB`]) into `target`.
+    ///
+    /// Matches Three.js r186 `Color.getRGB(target)`.
+    #[inline]
+    pub fn get_rgb_working<'a>(&self, target: &'a mut Color) -> &'a mut Color {
+        self.get_rgb(target, ColorSpace::LinearSRGB)
+    }
+
     /// Sets this color from an integer hexadecimal value `0xRRGGBB` interpreted in `color_space`.
     ///
     /// Matches Three.js r186 `Color.setHex(hex, colorSpace)`.
@@ -813,8 +834,8 @@ impl Color {
         let g = copy.g;
         let b = copy.b;
 
-        let max = r.max(g).max(b);
-        let min = r.min(g).min(b);
+        let max = js_max(js_max(r, g), b);
+        let min = js_min(js_min(r, g), b);
 
         let lightness = (min + max) / 2.0;
 
@@ -860,6 +881,28 @@ impl Color {
     pub fn offset_hsl(&mut self, h: f64, s: f64, l: f64) -> &mut Self {
         let current = self.get_hsl_working();
         self.set_hsl_working(current.h + h, current.s + s, current.l + l);
+        self
+    }
+
+    /// Copies `color` into this color, converting each component from standard sRGB to Linear sRGB.
+    ///
+    /// Matches Three.js r186 `Color.copySRGBToLinear(color)`:
+    /// `this.r = SRGBToLinear(color.r); ...; return this;`
+    pub fn copy_srgb_to_linear(&mut self, color: &Self) -> &mut Self {
+        self.r = srgb_to_linear(color.r);
+        self.g = srgb_to_linear(color.g);
+        self.b = srgb_to_linear(color.b);
+        self
+    }
+
+    /// Copies `color` into this color, converting each component from Linear sRGB to standard sRGB.
+    ///
+    /// Matches Three.js r186 `Color.copyLinearToSRGB(color)`:
+    /// `this.r = LinearToSRGB(color.r); ...; return this;`
+    pub fn copy_linear_to_srgb(&mut self, color: &Self) -> &mut Self {
+        self.r = linear_to_srgb(color.r);
+        self.g = linear_to_srgb(color.g);
+        self.b = linear_to_srgb(color.b);
         self
     }
 
@@ -1270,9 +1313,9 @@ impl Color {
     /// Matches Three.js r186 `Color.sub`:
     /// `this.r = Math.max(0, this.r - color.r)`
     pub fn sub(&mut self, color: &Self) -> &mut Self {
-        self.r = (self.r - color.r).max(0.0);
-        self.g = (self.g - color.g).max(0.0);
-        self.b = (self.b - color.b).max(0.0);
+        self.r = js_max(0.0, self.r - color.r);
+        self.g = js_max(0.0, self.g - color.g);
+        self.b = js_max(0.0, self.b - color.b);
         self
     }
 
@@ -1331,6 +1374,16 @@ impl Color {
     #[inline]
     pub const fn to_array(&self) -> [f64; 3] {
         [self.r, self.g, self.b]
+    }
+
+    /// Writes RGB components into `array` starting at `offset`.
+    ///
+    /// Matches Three.js r186 `Color.toArray(array, offset)`.
+    pub fn to_array_offset<'a>(&self, array: &'a mut [f64], offset: usize) -> &'a mut [f64] {
+        array[offset] = self.r;
+        array[offset + 1] = self.g;
+        array[offset + 2] = self.b;
+        array
     }
 
     /// Sets components from a slice at the given offset.

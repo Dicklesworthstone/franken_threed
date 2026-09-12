@@ -769,3 +769,92 @@ fn test_get_hex_js_round_exactness() {
     assert_eq!(b, 3);
 }
 
+// ============================================================================
+// 13. Retained New Color APIs: get_rgb, copy sRGB/Linear, to_array_offset
+// ============================================================================
+
+#[test]
+fn test_retained_new_color_apis() {
+    // 1. get_rgb and get_rgb_working into target Color
+    let c = Color::new(0.125, 0.375, 0.625);
+    let mut target = Color::black();
+    c.get_rgb_working(&mut target);
+    assert_eq!(target.r, 0.125);
+    assert_eq!(target.g, 0.375);
+    assert_eq!(target.b, 0.625);
+
+    // Converted get_rgb (DisplayP3 space, matching ColorSpaces fixture)
+    let c_p3 = Color::new(0.3, 0.5, 0.7);
+    let mut target_p3 = Color::black();
+    c_p3.get_rgb(&mut target_p3, ColorSpace::DisplayP3);
+    assert!((target_p3.r - 0.614).abs() < 1e-3);
+    assert!((target_p3.g - 0.731).abs() < 1e-3);
+    assert!((target_p3.b - 0.843).abs() < 1e-3);
+
+    // 2. copy_srgb_to_linear: exact Node Color.copySRGBToLinear(new Color(0.2, 0.5, 0.8))
+    // Linear values: [0.033104766565152086, 0.2140411404715882, 0.6038273388475408]
+    let srgb_src = Color::new(0.2, 0.5, 0.8);
+    let mut c_linear = Color::black();
+    c_linear.copy_srgb_to_linear(&srgb_src);
+    assert_eq!(c_linear.r, 0.033104766565152086);
+    assert_eq!(c_linear.g, 0.2140411404715882);
+    assert_eq!(c_linear.b, 0.6038273388475408);
+
+    // 3. copy_linear_to_srgb: exact Node Color.copyLinearToSRGB(c_linear)
+    // sRGB values: [0.20000579378002176, 0.5000057038898478, 0.8000028754620484]
+    let mut c_srgb = Color::black();
+    c_srgb.copy_linear_to_srgb(&c_linear);
+    assert_eq!(c_srgb.r, 0.20000579378002176);
+    assert_eq!(c_srgb.g, 0.5000057038898478);
+    assert_eq!(c_srgb.b, 0.8000028754620484);
+
+    // 4. to_array_offset: exact Node new Color(0.1, 0.2, 0.3).toArray([99, 99, 99, 99, 99], 1)
+    let c_arr = Color::new(0.1, 0.2, 0.3);
+    let mut arr = [99.0, 99.0, 99.0, 99.0, 99.0];
+    c_arr.to_array_offset(&mut arr, 1);
+    assert_eq!(arr, [99.0, 0.1, 0.2, 0.3, 99.0]);
+}
+
+// ============================================================================
+// 14. Pre-Existing NaN Propagation Corrections (Chartreuse Counterexamples)
+// ============================================================================
+
+#[test]
+fn test_color_nan_propagation_matching_upstream_node_oracle() {
+    // 1. set_hsl(0.0, NaN, 0.5) -> all NaN
+    let mut c1 = Color::new(0.0, 0.0, 0.0);
+    c1.set_hsl_working(0.0, f64::NAN, 0.5);
+    assert!(c1.r.is_nan(), "r should be NaN");
+    assert!(c1.g.is_nan(), "g should be NaN");
+    assert!(c1.b.is_nan(), "b should be NaN");
+
+    // 2. set_hsl(0.0, 0.5, NaN) -> all NaN
+    let mut c2 = Color::new(0.0, 0.0, 0.0);
+    c2.set_hsl_working(0.0, 0.5, f64::NAN);
+    assert!(c2.r.is_nan(), "r should be NaN");
+    assert!(c2.g.is_nan(), "g should be NaN");
+    assert!(c2.b.is_nan(), "b should be NaN");
+
+    // 3. lerp_hsl(..., NaN) -> all NaN
+    let mut c3 = Color::new(1.0, 0.0, 0.0);
+    let blue = Color::new(0.0, 0.0, 1.0);
+    c3.lerp_hsl(&blue, f64::NAN);
+    assert!(c3.r.is_nan(), "r should be NaN");
+    assert!(c3.g.is_nan(), "g should be NaN");
+    assert!(c3.b.is_nan(), "b should be NaN");
+
+    // 4. get_hsl of (NaN, 0.5, 0.5) -> h, s, l all NaN
+    let c4 = Color::new(f64::NAN, 0.5, 0.5);
+    let h4 = c4.get_hsl_working();
+    assert!(h4.h.is_nan(), "h should be NaN");
+    assert!(h4.s.is_nan(), "s should be NaN");
+    assert!(h4.l.is_nan(), "l should be NaN");
+
+    // 5. sub with r = NaN -> r is NaN, g and b stay finite
+    let mut c5 = Color::new(f64::NAN, 1.0, 1.0);
+    c5.sub(&Color::black());
+    assert!(c5.r.is_nan(), "r should be NaN");
+    assert_eq!(c5.g, 1.0);
+    assert_eq!(c5.b, 1.0);
+}
+
