@@ -32,6 +32,8 @@ use f3d_runtime::mesh::{
     f3d_build_mesh_batch_cull_depth_color_packet,
     f3d_build_mesh_batch_cull_depth_packet, f3d_build_mesh_batch_cull_packet,
     f3d_build_mesh_batch_packet,
+    f3d_build_mesh_batch_vertex_color_packet,
+    build_mesh_batch_vertex_color_packet_impl,
     f3d_build_mesh_depth_packet, f3d_build_mesh_packet,
     generate_mesh_wgsl,
     gpu_bridge_build_canvas_mesh_depth_packet, gpu_bridge_build_canvas_mesh_packet,
@@ -2386,12 +2388,17 @@ struct ParsedPacketSummary {
     depth_cull_color_pipelines: Vec<ParsedPipelineDepthCullColor>,
     draw_pipeline_ids: Vec<u32>,
     draw_passes: Vec<ParsedDrawPass>,
+    vertex_strides: Vec<u32>,
+    write_buffers: Vec<(u32, u32, Vec<u8>)>,
 }
 
 fn scan_packet_commands(packet_bytes: &[u8]) -> ParsedPacketSummary {
     assert!(packet_bytes.len() >= 16, "packet too short for header");
     assert_eq!(&packet_bytes[0..4], b"F3DP", "magic mismatch");
+    let total_packet_len = u32::from_le_bytes(packet_bytes[4..8].try_into().unwrap()) as usize;
     let cmd_count = u32::from_le_bytes(packet_bytes[8..12].try_into().unwrap());
+    let total_data_len = u32::from_le_bytes(packet_bytes[12..16].try_into().unwrap()) as usize;
+    let data_payload_start = total_packet_len - total_data_len;
     let mut cursor = 16usize;
     let mut summary = ParsedPacketSummary::default();
 
@@ -2401,10 +2408,21 @@ fn scan_packet_commands(packet_bytes: &[u8]) -> ParsedPacketSummary {
         cursor += 2;
         match op {
             1 => cursor += 12, // CREATE_BUFFER
-            2 => cursor += 16, // WRITE_BUFFER
+            2 => { // WRITE_BUFFER
+                let buffer_id = u32::from_le_bytes(packet_bytes[cursor..cursor + 4].try_into().unwrap());
+                let offset = u32::from_le_bytes(packet_bytes[cursor + 4..cursor + 8].try_into().unwrap());
+                let data_offset = u32::from_le_bytes(packet_bytes[cursor + 8..cursor + 12].try_into().unwrap()) as usize;
+                let data_len = u32::from_le_bytes(packet_bytes[cursor + 12..cursor + 16].try_into().unwrap()) as usize;
+                let abs_start = data_payload_start + data_offset;
+                let data = packet_bytes[abs_start..abs_start + data_len].to_vec();
+                summary.write_buffers.push((buffer_id, offset, data));
+                cursor += 16;
+            }
             OPCODE_CREATE_PIPELINE => { // 3
                 let pid = u32::from_le_bytes(packet_bytes[cursor..cursor + 4].try_into().unwrap());
+                let stride = u32::from_le_bytes(packet_bytes[cursor + 28..cursor + 32].try_into().unwrap());
                 summary.pipelines.push(pid);
+                summary.vertex_strides.push(stride);
                 cursor += 32;
             }
             4 => { // RENDER_PASS
@@ -2435,7 +2453,9 @@ fn scan_packet_commands(packet_bytes: &[u8]) -> ParsedPacketSummary {
             11 => cursor += 12, // SET_DRAW_PARAMETERS
             OPCODE_CREATE_PIPELINE_DEPTH => { // 12
                 let pid = u32::from_le_bytes(packet_bytes[cursor..cursor + 4].try_into().unwrap());
+                let stride = u32::from_le_bytes(packet_bytes[cursor + 28..cursor + 32].try_into().unwrap());
                 summary.depth_pipelines.push(pid);
+                summary.vertex_strides.push(stride);
                 cursor += 44;
             }
             13 => { // RENDER_PASS_DEPTH
@@ -2456,6 +2476,7 @@ fn scan_packet_commands(packet_bytes: &[u8]) -> ParsedPacketSummary {
             }
             OPCODE_CREATE_PIPELINE_CULL => { // 14
                 let pid = u32::from_le_bytes(packet_bytes[cursor..cursor + 4].try_into().unwrap());
+                let stride = u32::from_le_bytes(packet_bytes[cursor + 28..cursor + 32].try_into().unwrap());
                 let cm = u32::from_le_bytes(packet_bytes[cursor + 32..cursor + 36].try_into().unwrap());
                 let ff = u32::from_le_bytes(packet_bytes[cursor + 36..cursor + 40].try_into().unwrap());
                 summary.cull_pipelines.push(ParsedPipelineCull {
@@ -2463,11 +2484,13 @@ fn scan_packet_commands(packet_bytes: &[u8]) -> ParsedPacketSummary {
                     cull_mode: cm,
                     front_face: ff,
                 });
+                summary.vertex_strides.push(stride);
                 cursor += 40;
             }
             OPCODE_CREATE_PIPELINE_DEPTH_CULL => { // 15
                 let pid = u32::from_le_bytes(packet_bytes[cursor..cursor + 4].try_into().unwrap());
                 let target_format = u32::from_le_bytes(packet_bytes[cursor + 12..cursor + 16].try_into().unwrap());
+                let stride = u32::from_le_bytes(packet_bytes[cursor + 28..cursor + 32].try_into().unwrap());
                 let depth_format = u32::from_le_bytes(packet_bytes[cursor + 32..cursor + 36].try_into().unwrap());
                 let depth_write_enabled = u32::from_le_bytes(packet_bytes[cursor + 36..cursor + 40].try_into().unwrap()) == 1;
                 let depth_compare = u32::from_le_bytes(packet_bytes[cursor + 40..cursor + 44].try_into().unwrap());
@@ -2489,11 +2512,13 @@ fn scan_packet_commands(packet_bytes: &[u8]) -> ParsedPacketSummary {
                     cull_mode: cm,
                     front_face: ff,
                 });
+                summary.vertex_strides.push(stride);
                 cursor += 52;
             }
             OPCODE_CREATE_PIPELINE_DEPTH_CULL_COLOR => { // 16
                 let pid = u32::from_le_bytes(packet_bytes[cursor..cursor + 4].try_into().unwrap());
                 let target_format = u32::from_le_bytes(packet_bytes[cursor + 12..cursor + 16].try_into().unwrap());
+                let stride = u32::from_le_bytes(packet_bytes[cursor + 28..cursor + 32].try_into().unwrap());
                 let depth_format = u32::from_le_bytes(packet_bytes[cursor + 32..cursor + 36].try_into().unwrap());
                 let depth_write_enabled = u32::from_le_bytes(packet_bytes[cursor + 36..cursor + 40].try_into().unwrap()) == 1;
                 let depth_compare = u32::from_le_bytes(packet_bytes[cursor + 40..cursor + 44].try_into().unwrap());
@@ -2510,6 +2535,7 @@ fn scan_packet_commands(packet_bytes: &[u8]) -> ParsedPacketSummary {
                     front_face: ff,
                     write_mask,
                 });
+                summary.vertex_strides.push(stride);
                 cursor += 56;
             }
             other => panic!("scan_packet_commands: unexpected opcode {other} at cursor {cursor}"),
@@ -3627,3 +3653,350 @@ fn test_mesh_batch_cull_depth_default_color_write_preserves_pipeline_ids() {
     assert_eq!(canvas_summary.depth_cull_color_pipelines.len(), 0);
 }
 
+#[test]
+fn test_dynamic_mesh_input_with_vertex_colors() {
+    let tri = [0.0f32, 0.5, 0.0, -0.5, -0.5, 0.0, 0.5, -0.5, 0.0];
+    let colors = [
+        1.0f32, 0.0, 0.0, 1.0,
+        0.0, 1.0, 0.0, 1.0,
+        0.0, 0.0, 1.0, 1.0,
+    ];
+    let mesh = DynamicMeshInput::try_from_raw(
+        &tri,
+        &[],
+        &IDENTITY_F64,
+        &IDENTITY_F64,
+        &[1.0, 1.0, 1.0, 1.0],
+        64,
+        64,
+        false,
+    )
+    .expect("valid dynamic mesh input");
+
+    // Successfully configure vertex colors
+    let with_vc = mesh.clone().with_vertex_colors(&colors).expect("valid vertex colors");
+    assert_eq!(with_vc.vertex_colors(), Some(&colors[..]));
+
+    // Reject mismatched length (expected 12 floats for 3 vertices, got 4)
+    let err = mesh.with_vertex_colors(&colors[..4]).unwrap_err();
+    assert!(matches!(
+        err,
+        MeshPacketError::InvalidVertexColorLength { expected: 12, actual: 4 }
+    ));
+}
+
+#[test]
+fn test_mesh_batch_vertex_color_decoded_bytes_and_stride_28() {
+    let tri0 = [
+        0.0f32, 0.5, 0.0,
+        -0.5, -0.5, 0.0,
+        0.5, -0.5, 0.0,
+    ];
+    let tri1 = [
+        1.0f32, 0.0, 0.0,
+        0.0, 1.0, 0.0,
+        0.0, 0.0, 1.0,
+    ];
+    let positions = [tri0, tri1].concat();
+    let vertex_counts = [3u32, 3];
+    let model_views = [IDENTITY_F64, IDENTITY_F64].concat();
+    let projection = IDENTITY_F64;
+    let colors = [
+        1.0f32, 1.0, 1.0, 1.0, // Mesh 0 material multiplier
+        0.5, 0.5, 0.5, 1.0,    // Mesh 1 material multiplier
+    ];
+    let cull_modes = [0u8, 0];
+    let front_faces = [0u8, 0];
+    let depth_tests = [1u8, 1];
+    let depth_writes = [1u8, 1];
+    let depth_compares = [DEPTH_COMPARE_LESS, DEPTH_COMPARE_LESS];
+    let color_writes = [1u8, 1];
+
+    let vc0 = [
+        1.0f32, 0.0, 0.0, 1.0, // Red
+        0.0, 1.0, 0.0, 1.0,    // Green
+        0.0, 0.0, 1.0, 1.0,    // Blue
+    ];
+    let vc1 = [
+        1.0f32, 1.0, 0.0, 1.0, // Yellow
+        0.0, 1.0, 1.0, 1.0,    // Cyan
+        1.0, 0.0, 1.0, 1.0,    // Magenta
+    ];
+    let vertex_colors = [vc0, vc1].concat();
+
+    let packet_bytes = f3d_build_mesh_batch_vertex_color_packet(
+        &positions,
+        &vertex_counts,
+        &model_views,
+        &projection,
+        &colors,
+        &cull_modes,
+        &front_faces,
+        &depth_tests,
+        &depth_writes,
+        &depth_compares,
+        &color_writes,
+        64,
+        64,
+        false,
+        false,
+        &vertex_colors,
+    )
+    .expect("building vertex color batch");
+
+    let summary = scan_packet_commands(&packet_bytes);
+
+    // 1. Assert all created pipelines specify vertex_stride == 28
+    assert!(!summary.vertex_strides.is_empty(), "must create at least one pipeline");
+    for &stride in &summary.vertex_strides {
+        assert_eq!(stride, 28, "vertex colors pipeline must specify stride 28");
+    }
+
+    // 2. Assert vertex buffer upload exists, has exact size 6 * 28 = 168 bytes
+    let vb_upload = summary
+        .write_buffers
+        .iter()
+        .find(|(buf_id, _, _)| *buf_id == MESH_VERTEX_BUFFER_ID)
+        .expect("vertex buffer upload must exist in packet");
+    assert_eq!(vb_upload.1, 0, "upload starts at offset 0");
+    let upload_data = &vb_upload.2;
+    assert_eq!(upload_data.len(), 6 * 28, "6 vertices * 28 bytes per vertex");
+
+    // 3. Verify each vertex has exact 28 bytes: 12 bytes position + 16 bytes color
+    for i in 0..6 {
+        let chunk = &upload_data[i * 28..(i + 1) * 28];
+        let px = f32::from_le_bytes(chunk[0..4].try_into().unwrap());
+        let py = f32::from_le_bytes(chunk[4..8].try_into().unwrap());
+        let pz = f32::from_le_bytes(chunk[8..12].try_into().unwrap());
+        assert_eq!([px, py, pz], [positions[i * 3], positions[i * 3 + 1], positions[i * 3 + 2]]);
+
+        let cr = f32::from_le_bytes(chunk[12..16].try_into().unwrap());
+        let cg = f32::from_le_bytes(chunk[16..20].try_into().unwrap());
+        let cb = f32::from_le_bytes(chunk[20..24].try_into().unwrap());
+        let ca = f32::from_le_bytes(chunk[24..28].try_into().unwrap());
+        assert_eq!(
+            [cr, cg, cb, ca],
+            [
+                vertex_colors[i * 4],
+                vertex_colors[i * 4 + 1],
+                vertex_colors[i * 4 + 2],
+                vertex_colors[i * 4 + 3],
+            ]
+        );
+    }
+}
+
+#[test]
+fn test_mesh_batch_vertex_color_mixed_uncolored_receives_white_color() {
+    let tri0 = [0.0f32, 0.5, 0.0, -0.5, -0.5, 0.0, 0.5, -0.5, 0.0];
+    let tri1 = [1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+    let vc0 = [
+        1.0f32, 0.2, 0.3, 1.0,
+        0.4, 1.0, 0.6, 1.0,
+        0.7, 0.8, 1.0, 1.0,
+    ];
+
+    let mesh0 = DynamicMeshInput::try_from_raw(
+        &tri0,
+        &[],
+        &IDENTITY_F64,
+        &IDENTITY_F64,
+        &[1.0, 0.5, 0.25, 1.0],
+        64,
+        64,
+        false,
+    )
+    .unwrap()
+    .with_vertex_colors(&vc0)
+    .unwrap();
+
+    // mesh1 has NO vertex colors (None)
+    let mesh1 = DynamicMeshInput::try_from_raw(
+        &tri1,
+        &[],
+        &IDENTITY_F64,
+        &IDENTITY_F64,
+        &[0.2, 0.4, 0.8, 1.0],
+        64,
+        64,
+        false,
+    )
+    .unwrap();
+
+    let submission = build_multi_mesh_submission(&[mesh0, mesh1])
+        .expect("multi-mesh submission with mixed vertex colors");
+    let packet_bytes = submission.encode().expect("encoding submission");
+    let summary = scan_packet_commands(&packet_bytes);
+
+    // Both meshes share stride 28
+    assert_eq!(summary.vertex_strides, vec![28]);
+
+    let vb_upload = summary
+        .write_buffers
+        .iter()
+        .find(|(buf_id, _, _)| *buf_id == MESH_VERTEX_BUFFER_ID)
+        .expect("vertex buffer upload");
+    let data = &vb_upload.2;
+    assert_eq!(data.len(), 6 * 28);
+
+    // Mesh 0 has specified colors
+    for i in 0..3 {
+        let chunk = &data[i * 28..(i + 1) * 28];
+        let cr = f32::from_le_bytes(chunk[12..16].try_into().unwrap());
+        let cg = f32::from_le_bytes(chunk[16..20].try_into().unwrap());
+        let cb = f32::from_le_bytes(chunk[20..24].try_into().unwrap());
+        let ca = f32::from_le_bytes(chunk[24..28].try_into().unwrap());
+        assert_eq!([cr, cg, cb, ca], [vc0[i * 4], vc0[i * 4 + 1], vc0[i * 4 + 2], vc0[i * 4 + 3]]);
+    }
+
+    // Mesh 1 (uncolored) has white fallback [1.0, 1.0, 1.0, 1.0] for all vertices
+    for i in 3..6 {
+        let chunk = &data[i * 28..(i + 1) * 28];
+        let cr = f32::from_le_bytes(chunk[12..16].try_into().unwrap());
+        let cg = f32::from_le_bytes(chunk[16..20].try_into().unwrap());
+        let cb = f32::from_le_bytes(chunk[20..24].try_into().unwrap());
+        let ca = f32::from_le_bytes(chunk[24..28].try_into().unwrap());
+        assert_eq!([cr, cg, cb, ca], [1.0, 1.0, 1.0, 1.0], "uncolored mesh must receive white vertex color fallback");
+    }
+}
+
+#[test]
+fn test_mesh_batch_vertex_color_shader_semantics_offscreen_and_canvas() {
+    use f3d_runtime::mesh::generate_mesh_wgsl;
+
+    // Standard legacy shader (no vertex color)
+    let legacy_wgsl = generate_mesh_wgsl(false);
+    assert!(!legacy_wgsl.contains("@location(1) color: vec4<f32>"));
+    assert!(legacy_wgsl.contains("@location(1) uv: vec2<f32>"));
+    assert!(legacy_wgsl.contains("return uniforms.color;"));
+
+    // Offscreen with vertex colors
+    let tri = [0.0f32, 0.5, 0.0, -0.5, -0.5, 0.0, 0.5, -0.5, 0.0];
+    let vc = [1.0f32, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0];
+    let mesh = DynamicMeshInput::try_from_raw(
+        &tri, &[], &IDENTITY_F64, &IDENTITY_F64, &[1.0, 1.0, 1.0, 1.0], 64, 64, false,
+    ).unwrap().with_vertex_colors(&vc).unwrap();
+
+    let offscreen_sub = build_multi_mesh_submission(&[mesh.clone()]).unwrap();
+    let offscreen_cmd = offscreen_sub.commands().iter().find(|c| matches!(c, GpuCommand::CreatePipeline { .. })).unwrap();
+    if let GpuCommand::CreatePipeline { wgsl_code, vertex_stride, .. } = offscreen_cmd {
+        assert_eq!(*vertex_stride, 28);
+        assert!(wgsl_code.contains("@location(1) color: vec4<f32>"));
+        assert!(wgsl_code.contains("out.color = in.color;"));
+        assert!(wgsl_code.contains("return in.color * uniforms.color;"));
+        assert!(!wgsl_code.contains("linear_to_srgb"));
+    } else {
+        panic!("expected CreatePipeline command");
+    }
+
+    // Canvas with vertex colors
+    let canvas_sub = build_multi_mesh_canvas_submission(&[mesh]).unwrap();
+    let canvas_cmd = canvas_sub.commands().iter().find(|c| matches!(c, GpuCommand::CreatePipeline { .. })).unwrap();
+    if let GpuCommand::CreatePipeline { wgsl_code, vertex_stride, .. } = canvas_cmd {
+        assert_eq!(*vertex_stride, 28);
+        assert!(wgsl_code.contains("@location(1) color: vec4<f32>"));
+        assert!(wgsl_code.contains("out.color = in.color;"));
+        assert!(wgsl_code.contains("let linear_color = in.color * uniforms.color;"));
+        assert!(wgsl_code.contains("return linear_to_srgb(linear_color);"));
+    } else {
+        panic!("expected CreatePipeline command");
+    }
+}
+
+#[test]
+fn test_mesh_batch_vertex_color_validation_errors() {
+    let tri = [0.0f32, 0.5, 0.0, -0.5, -0.5, 0.0, 0.5, -0.5, 0.0];
+    let positions = tri;
+    let vertex_counts = [3u32];
+    let model_views = IDENTITY_F64;
+    let projection = IDENTITY_F64;
+    let colors = [1.0f32, 0.0, 0.0, 1.0];
+    let cull_modes = [0u8];
+    let front_faces = [0u8];
+    let depth_tests = [1u8];
+    let depth_writes = [1u8];
+    let depth_compares = [DEPTH_COMPARE_LESS];
+    let color_writes = [1u8];
+
+    // Slices length mismatch: 3 vertices require 3*4 = 12 floats, passed 8 floats
+    let err = f3d_build_mesh_batch_vertex_color_packet(
+        &positions,
+        &vertex_counts,
+        &model_views,
+        &projection,
+        &colors,
+        &cull_modes,
+        &front_faces,
+        &depth_tests,
+        &depth_writes,
+        &depth_compares,
+        &color_writes,
+        64,
+        64,
+        false,
+        false,
+        &[1.0f32; 8],
+    )
+    .unwrap_err();
+    assert!(err.contains("vertex_colors array length must match total vertex count * 4 = 12 (got 8)"));
+}
+
+#[test]
+fn test_mesh_batch_vertex_color_preserves_old_packets_byte_identical() {
+    let tri = [0.0f32, 0.5, 0.0, -0.5, -0.5, 0.0, 0.5, -0.5, 0.0];
+    let positions = tri;
+    let vertex_counts = [3u32];
+    let model_views = IDENTITY_F64;
+    let projection = IDENTITY_F64;
+    let colors = [1.0f32, 0.0, 0.0, 1.0];
+    let cull_modes = [0u8];
+    let front_faces = [0u8];
+    let depth_tests = [1u8];
+    let depth_writes = [1u8];
+    let depth_compares = [DEPTH_COMPARE_LESS];
+    let color_writes = [1u8];
+
+    let cull_depth_color_bytes = f3d_build_mesh_batch_cull_depth_color_packet(
+        &positions,
+        &vertex_counts,
+        &model_views,
+        &projection,
+        &colors,
+        &cull_modes,
+        &front_faces,
+        &depth_tests,
+        &depth_writes,
+        &depth_compares,
+        &color_writes,
+        64,
+        64,
+        false,
+        false,
+    )
+    .expect("cull_depth_color packet");
+
+    let impl_bytes = build_mesh_batch_cull_depth_color_packet_impl(
+        &positions,
+        &vertex_counts,
+        &model_views,
+        &projection,
+        &colors,
+        &cull_modes,
+        &front_faces,
+        &depth_tests,
+        &depth_writes,
+        &depth_compares,
+        &color_writes,
+        64,
+        64,
+        false,
+        false,
+    )
+    .expect("cull_depth_color impl packet");
+
+    assert_eq!(cull_depth_color_bytes, impl_bytes);
+
+    let summary = scan_packet_commands(&cull_depth_color_bytes);
+    // Uncolored batch uses stride 20 (VertexPosUv)
+    assert_eq!(summary.vertex_strides, vec![20]);
+}
