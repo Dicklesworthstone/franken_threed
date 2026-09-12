@@ -966,10 +966,6 @@ export class WebGpuBridgeHost {
               }
 
               const depthReadOnly = depthReadOnlyCode === 1;
-              const isSafari = typeof navigator !== "undefined" &&
-                /Safari/.test(navigator.userAgent) &&
-                !/Chrome/.test(navigator.userAgent) &&
-                !/Chromium/.test(navigator.userAgent);
 
               const depthAttachmentDesc = {
                 view: depthView,
@@ -983,10 +979,6 @@ export class WebGpuBridgeHost {
                 if (depthLoadOp === "clear") {
                   depthAttachmentDesc.depthClearValue = depthClearValue;
                 }
-              } else if (isSafari) {
-                // WebKit WebGPU on Metal workaround: Safari requires explicit depthLoadOp="load"
-                // to load prior depth; omitting it causes MTLLoadActionDontCare/Clear.
-                depthAttachmentDesc.depthLoadOp = "load";
               }
 
               currentPassEncoder = commandEncoder.beginRenderPass({

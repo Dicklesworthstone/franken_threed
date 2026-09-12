@@ -97,6 +97,49 @@ function createBasicCamera(coordSystem = undefined) {
   return camera;
 }
 
+test('renderScene preserves layer-filtered group ordering and culls invisible materials', async () => {
+  const scene = new THREE.Scene();
+  const camera = createBasicCamera();
+  const group = new THREE.Group();
+  group.layers.set(1);
+  group.renderOrder = 10;
+  const first = createBasicTriangleMesh();
+  const second = createBasicTriangleMesh({ color: 0x0000ff });
+  group.add(first);
+  scene.add(group, second);
+  const hiddenMaterial = createBasicTriangleMesh({ wireframe: true, visible: false });
+  scene.add(hiddenMaterial);
+  let submissions = 0;
+  let vertexCounts;
+  const host = { executePacket() { submissions++; } };
+  const wasm = { f3d_build_mesh_batch_packet(_positions, counts) {
+    vertexCounts = Array.from(counts);
+    return new Uint8Array();
+  } };
+  const result = await renderScene(host, scene, camera, null, wasm, { sourceBackend: 'webgpu' });
+  // The group is outside camera layers, but its child is visible; only the child's id breaks the z tie.
+  assert.deepEqual(result.admitted, [first.uuid, second.uuid]);
+  assert.deepEqual(result.refused, []);
+  assert.deepEqual(vertexCounts, [3, 3]);
+  assert.equal(submissions, 1);
+});
+
+test('renderScene refuses scene hooks before building or submitting a partial result', async () => {
+  const camera = createBasicCamera();
+  const scene = new THREE.Scene();
+  scene.add(createBasicTriangleMesh());
+  const fail = () => assert.fail('Refused scene must not invoke hooks, build packets, or submit');
+  const host = { executePacket: fail };
+  const wasm = { f3d_build_mesh_batch_packet: fail };
+  for (const hook of ['onBeforeRender', 'onAfterRender']) {
+    scene[hook] = fail;
+    const result = await renderScene(host, scene, camera, null, wasm);
+    assert.deepEqual(result.admitted, []);
+    assert.equal(result.refused[0].code, 'UNSUPPORTED_CALLBACK');
+    scene[hook] = THREE.Object3D.prototype[hook];
+  }
+});
+
 test('Positive: Real default MeshBasicMaterial inherits prototype methods and is admitted without hook deletion', () => {
   const geom = new THREE.BufferGeometry();
   geom.setAttribute('position', new THREE.BufferAttribute(new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]), 3));
@@ -1559,7 +1602,7 @@ test('Positive: renderScene collects 3 meshes with distinct colors/transforms in
   assert.deepEqual(capturedBatchArgs.mvs.slice(32, 48), expectedMv3);
 });
 
-test('Positive: renderScene admits valid meshes while recording InstancedMesh and non-DoubleSide refusals without throwing', async () => {
+test('Refusal: renderScene refuses WHOLE submission when visible InstancedMesh or non-DoubleSide mesh exists (no partial render)', async () => {
   const scene = new THREE.Scene();
   const camera = createBasicCamera();
 
@@ -1599,8 +1642,8 @@ test('Positive: renderScene admits valid meshes while recording InstancedMesh an
 
   const res = await renderScene(mockBridgeHost, scene, camera, null, mockWasm);
 
-  // Admitted contains exactly the 2 valid meshes in traversal order
-  assert.deepEqual(res.admitted, [validMesh1.uuid, validMesh2.uuid]);
+  // Whole submission refused: admitted is empty (Root Mail 14355: no partial scene rendering)
+  assert.deepEqual(res.admitted, []);
 
   // Refused contains exactly the 2 invalid meshes with reasons
   assert.equal(res.refused.length, 2);
@@ -1613,11 +1656,16 @@ test('Positive: renderScene admits valid meshes while recording InstancedMesh an
     reason: ADMISSION_REJECTION.UNSUPPORTED_SIDE,
   });
 
-  // Exactly one batch packet executed containing the 2 admitted meshes
-  assert.equal(executionCount, 1);
+  // Strict refusal contract: NO batch packet executed, NO batch packet prepared
+  assert.equal(executionCount, 0, 'No packet may be submitted when scene contains visible unsupported items');
+  assert.equal(capturedBatchArgs, null, 'No batch packet builder may be invoked when scene contains refusals');
+  assert.ok(res.reason.includes('UNSUPPORTED_MESH_SUBCLASS') || res.refusalReason.includes('UNSUPPORTED_MESH_SUBCLASS'));
+
+  // Retain renderMeshBatch as explicit API for caller-selected subsets
+  const batchRes = await renderMeshBatch(mockBridgeHost, [validMesh1, validMesh2], camera, null, mockWasm);
+  assert.equal(executionCount, 1, 'renderMeshBatch permits caller-selected subset execution');
+  assert.equal(batchRes.meshCount, 2);
   assert.equal(capturedBatchArgs.vCounts.length, 2);
-  assert.equal(capturedBatchArgs.mvs.length, 32);
-  assert.equal(capturedBatchArgs.cols.length, 8);
 });
 
 test('Positive: renderScene propagates nested Group transforms into emitted per-mesh model-view matrix via single updateMatrixWorld', async () => {
@@ -1959,11 +2007,9 @@ test('Positive: canAdmitMesh and renderScene refuse mesh when ancestor group has
 
   const res = await renderScene(mockBridgeHost, scene, camera, null, mockWasm);
 
-  // Visible mesh admitted, hidden mesh refused
+  // Visible mesh admitted, hidden mesh legitimately culled without causing scene refusal
   assert.deepEqual(res.admitted, [visibleMesh.uuid]);
-  assert.equal(res.refused.length, 1);
-  assert.equal(res.refused[0].uuid, hiddenMesh.uuid);
-  assert.equal(res.refused[0].reason, ADMISSION_REJECTION.NOT_VISIBLE);
+  assert.equal(res.refused.length, 0, 'Hidden nodes are culled and not recorded as scene refusals');
 
   // Batch only contains the 1 visible mesh
   assert.equal(capturedBatchArgs.vCounts.length, 1);
@@ -1988,10 +2034,9 @@ test('Positive: canAdmitMesh and renderScene refuse mesh when ancestor group has
 
   const hiddenRes = await renderScene(mockBridgeHostNoSubmit, hiddenScene, camera, null, mockWasm);
   assert.deepEqual(hiddenRes.admitted, []);
-  assert.equal(hiddenRes.refused.length, 1);
-  assert.equal(hiddenRes.refused[0].uuid, onlyHiddenMesh.uuid);
+  assert.equal(hiddenRes.refused.length, 0, 'Hidden meshes are culled, not recorded as refusals');
   assert.equal(hiddenRes.reason, 'EMPTY_MESH_BATCH');
-  assert.equal(executed, false);
+  assert.equal(executed, false, 'No execution when admitted set is empty');
 });
 
 test('Positive: renderScene sorts admitted meshes ascending by renderOrder (Three.js RenderList parity)', async () => {
@@ -2084,5 +2129,399 @@ test('Positive: renderScene sorts admitted meshes ascending by renderOrder (Thre
   assert.deepEqual(capturedBatchArgs.mvs.slice(48, 64), expectedMvA);
 });
 
+test('Counterexample: Concrete depthWrite=false sorting discrepancy between WebGL (material.id) and WebGPU (projected z)', async () => {
+  const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 100);
+  camera.position.set(0, 0, 0);
+  camera.lookAt(0, 0, -1);
+  camera.updateMatrixWorld();
 
+  // Create matFar FIRST so it gets a lower material.id
+  const matFar = new THREE.MeshBasicMaterial({ color: 0x0000ff, depthWrite: false, side: THREE.DoubleSide });
+  // Create matNear SECOND so it gets a higher material.id
+  const matNear = new THREE.MeshBasicMaterial({ color: 0xff0000, depthWrite: false, side: THREE.DoubleSide });
+  assert.ok(matFar.id < matNear.id, `matFar.id (${matFar.id}) must be < matNear.id (${matNear.id})`);
 
+  // meshNear is closer to camera (z = -2), meshFar is further (z = -10)
+  const meshNear = createBasicTriangleMesh();
+  meshNear.material = matNear;
+  meshNear.position.set(0, 0, -2);
+
+  const meshFar = createBasicTriangleMesh();
+  meshFar.material = matFar;
+  meshFar.position.set(0, 0, -10);
+
+  const scene = new THREE.Scene();
+  scene.add(meshNear);
+  scene.add(meshFar);
+
+  let capturedArgsWebGL = null;
+  const mockWasmWebGL = {
+    f3d_build_mesh_batch_packet: (flatPos, vCounts, mvs, proj, cols, w, h, webglDepth, dt, dw, dc, canvas) => {
+      capturedArgsWebGL = { cols: Array.from(cols) };
+      return new Uint8Array([0x47, 0x4c]);
+    },
+  };
+  const mockBridgeHost = { executePacket: async () => ({ status: 'OK' }) };
+
+  // 1. Under sourceBackend: 'webgl' (matching webgl/WebGLRenderLists.js:11)
+  // WebGL groups/sorts by material.id BEFORE z.
+  // Because matFar.id < matNear.id, meshFar is sorted FIRST, meshNear is sorted SECOND.
+  const resWebGL = await renderScene(mockBridgeHost, scene, camera, null, mockWasmWebGL, { sourceBackend: 'webgl' });
+  assert.deepEqual(resWebGL.admitted, [meshFar.uuid, meshNear.uuid]);
+  // Slot 0 is meshFar (Blue: [0, 0, 1, 1]), Slot 1 is meshNear (Red: [1, 0, 0, 1])
+  assert.equal(capturedArgsWebGL.cols[2], 1.0, 'Slot 0 is Blue (meshFar)');
+  assert.equal(capturedArgsWebGL.cols[4], 1.0, 'Slot 1 is Red (meshNear)');
+  // Concrete runtime effect: Because depthWrite=false, the last drawn object wins and is visible on screen.
+  // In WebGL, meshNear (Red) is drawn second and overwrites meshFar (Blue).
+
+  // 2. Under sourceBackend: 'webgpu' (matching common/RenderList.js:24)
+  // WebGPU has no material.id sorting; it sorts by projected z directly.
+  // meshNear has projected z ~1.8 < meshFar projected z ~9.8.
+  // Therefore, meshNear is sorted FIRST, meshFar is sorted SECOND.
+  let capturedArgsWebGPU = null;
+  const mockWasmWebGPU = {
+    f3d_build_mesh_batch_packet: (flatPos, vCounts, mvs, proj, cols, w, h, webglDepth, dt, dw, dc, canvas) => {
+      capturedArgsWebGPU = { cols: Array.from(cols) };
+      return new Uint8Array([0x47, 0x50, 0x55]);
+    },
+  };
+
+  const resWebGPU = await renderScene(mockBridgeHost, scene, camera, null, mockWasmWebGPU, { sourceBackend: 'webgpu' });
+  assert.deepEqual(resWebGPU.admitted, [meshNear.uuid, meshFar.uuid]);
+  // Slot 0 is meshNear (Red), Slot 1 is meshFar (Blue)
+  assert.equal(capturedArgsWebGPU.cols[0], 1.0, 'Slot 0 is Red (meshNear)');
+  assert.equal(capturedArgsWebGPU.cols[6], 1.0, 'Slot 1 is Blue (meshFar)');
+  // Concrete runtime effect: In WebGPU, meshFar (Blue) is drawn second and overwrites meshNear (Red).
+  // Demonstrating that a renderOrder-only sort contradicts upstream backend sorting and causes opposite pixel output.
+});
+
+test('Positive: renderScene honors groupOrder over mesh renderOrder matching Three.js PainterSort', async () => {
+  const scene = new THREE.Scene();
+  const camera = createBasicCamera();
+
+  // Group A has higher renderOrder (5), but child meshA has lower renderOrder (0)
+  const groupA = new THREE.Group();
+  groupA.renderOrder = 5;
+  const meshA = createBasicTriangleMesh({ color: 0xff0000 });
+  meshA.renderOrder = 0;
+  groupA.add(meshA);
+
+  // Group B has lower renderOrder (1), but child meshB has higher renderOrder (10)
+  const groupB = new THREE.Group();
+  groupB.renderOrder = 1;
+  const meshB = createBasicTriangleMesh({ color: 0x00ff00 });
+  meshB.renderOrder = 10;
+  groupB.add(meshB);
+
+  scene.add(groupA);
+  scene.add(groupB);
+
+  const mockWasm = {
+    f3d_build_mesh_batch_packet: () => new Uint8Array([1, 2, 3]),
+  };
+  const mockBridgeHost = { executePacket: async () => ({}) };
+
+  const res = await renderScene(mockBridgeHost, scene, camera, null, mockWasm);
+
+  // Per Three.js painterSortStable (both WebGL and WebGPU):
+  // groupOrder is compared first (a.groupOrder - b.groupOrder).
+  // groupB has groupOrder 1, groupA has groupOrder 5.
+  // Therefore meshB (groupOrder 1) MUST precede meshA (groupOrder 5),
+  // even though meshA.renderOrder (0) < meshB.renderOrder (10).
+  assert.deepEqual(res.admitted, [meshB.uuid, meshA.uuid]);
+});
+
+test('Positive: renderScene with sortObjects: false preserves scene traversal order', async () => {
+  const camera = createBasicCamera();
+
+  const mesh1 = createBasicTriangleMesh();
+  mesh1.renderOrder = 100;
+
+  const mesh2 = createBasicTriangleMesh();
+  mesh2.renderOrder = -50;
+
+  // Scene 1: traversal order [mesh1, mesh2]
+  const scene1 = new THREE.Scene();
+  scene1.add(mesh1);
+  scene1.add(mesh2);
+
+  const mockWasm = { f3d_build_mesh_batch_packet: () => new Uint8Array([1]) };
+  const mockBridgeHost = { executePacket: async () => ({}) };
+
+  const res1 = await renderScene(mockBridgeHost, scene1, camera, null, mockWasm, { sortObjects: false });
+  assert.deepEqual(res1.admitted, [mesh1.uuid, mesh2.uuid], 'sortObjects=false must preserve traversal order [mesh1, mesh2]');
+
+  // Scene 2: inverted traversal order [mesh2, mesh1]
+  const scene2 = new THREE.Scene();
+  scene2.add(mesh2);
+  scene2.add(mesh1);
+
+  const res2 = await renderScene(mockBridgeHost, scene2, camera, null, mockWasm, { sortObjects: false });
+  assert.deepEqual(res2.admitted, [mesh2.uuid, mesh1.uuid], 'sortObjects=false must preserve traversal order [mesh2, mesh1]');
+});
+
+test('Positive: renderScene respects matrixWorldAutoUpdate = false on scene and camera (renderer source boundaries)', async () => {
+  const scene = new THREE.Scene();
+  const camera = createBasicCamera();
+
+  const mesh = createBasicTriangleMesh();
+  scene.add(mesh);
+
+  // Initialize matrices
+  scene.updateMatrixWorld();
+  camera.updateMatrixWorld();
+
+  assert.equal(mesh.matrixWorld.elements[12], 0);
+
+  // 1. Disable scene.matrixWorldAutoUpdate
+  scene.matrixWorldAutoUpdate = false;
+  mesh.position.set(50, 0, 0);
+  mesh.updateMatrix(); // update local matrix only; matrixWorld remains 0
+
+  let capturedMvs = null;
+  const mockWasm = {
+    f3d_build_mesh_batch_packet: (flatPos, vCounts, mvs) => {
+      capturedMvs = Array.from(mvs);
+      return new Uint8Array([1]);
+    },
+  };
+  const mockBridgeHost = { executePacket: async () => ({}) };
+
+  await renderScene(mockBridgeHost, scene, camera, null, mockWasm);
+
+  // Because scene.matrixWorldAutoUpdate === false, scene.updateMatrixWorld() was NOT called
+  assert.equal(mesh.matrixWorld.elements[12], 0, 'mesh.matrixWorld must NOT be force-updated when scene.matrixWorldAutoUpdate is false');
+  assert.equal(capturedMvs[12], 0, 'Emitted MV translation must remain 0');
+
+  // 2. Disable camera.matrixWorldAutoUpdate
+  camera.matrixWorldAutoUpdate = false;
+  camera.position.set(0, 75, 0);
+  camera.updateMatrix(); // local only
+
+  await renderScene(mockBridgeHost, scene, camera, null, mockWasm);
+  assert.equal(camera.matrixWorld.elements[13], 0, 'camera.matrixWorld must NOT be force-updated when camera.matrixWorldAutoUpdate is false');
+
+  // 3. Child mesh with matrixWorldAutoUpdate = false inside scene with matrixWorldAutoUpdate = true
+  scene.matrixWorldAutoUpdate = true;
+  mesh.matrixWorldAutoUpdate = false;
+  mesh.position.set(99, 0, 0);
+  mesh.updateMatrix();
+
+  await renderScene(mockBridgeHost, scene, camera, null, mockWasm);
+  // scene.updateMatrixWorld() called without force=true honors child.matrixWorldAutoUpdate === false
+  assert.equal(mesh.matrixWorld.elements[12], 0, 'Child mesh with matrixWorldAutoUpdate=false must not be forced by scene update');
+});
+
+test('Refusal & Cull: renderScene refuses visible non-mesh renderables (Line, Points, Sprite, Light) but culls them when hidden/unmatched layer', async () => {
+  const camera = createBasicCamera();
+  const mockWasm = { f3d_build_mesh_batch_packet: () => new Uint8Array([1]) };
+
+  // 1. Visible THREE.Line causes whole-scene refusal
+  {
+    let execCount = 0;
+    const mockBridgeHost = { executePacket: async () => { execCount++; return {}; } };
+    const scene = new THREE.Scene();
+    const validMesh = createBasicTriangleMesh();
+    const lineGeom = new THREE.BufferGeometry();
+    lineGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array([0, 0, 0, 1, 1, 1]), 3));
+    const line = new THREE.Line(lineGeom, new THREE.LineBasicMaterial());
+    scene.add(validMesh);
+    scene.add(line);
+
+    const res = await renderScene(mockBridgeHost, scene, camera, null, mockWasm);
+    assert.deepEqual(res.admitted, [], 'Whole submission refused when visible Line exists');
+    assert.equal(res.refused.length, 1);
+    assert.equal(res.refused[0].uuid, line.uuid);
+    assert.ok(res.refused[0].reason.includes(ADMISSION_REJECTION.UNSUPPORTED_RENDERABLE));
+    assert.equal(execCount, 0, 'No packet execution on refusal');
+  }
+
+  // 2. Visible THREE.Points causes whole-scene refusal
+  {
+    let execCount = 0;
+    const mockBridgeHost = { executePacket: async () => { execCount++; return {}; } };
+    const scene = new THREE.Scene();
+    const validMesh = createBasicTriangleMesh();
+    const ptsGeom = new THREE.BufferGeometry();
+    ptsGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array([0, 0, 0]), 3));
+    const pts = new THREE.Points(ptsGeom, new THREE.PointsMaterial());
+    scene.add(validMesh);
+    scene.add(pts);
+
+    const res = await renderScene(mockBridgeHost, scene, camera, null, mockWasm);
+    assert.deepEqual(res.admitted, []);
+    assert.equal(res.refused.length, 1);
+    assert.equal(res.refused[0].uuid, pts.uuid);
+    assert.equal(execCount, 0);
+  }
+
+  // 3. Visible THREE.Sprite causes whole-scene refusal
+  {
+    let execCount = 0;
+    const mockBridgeHost = { executePacket: async () => { execCount++; return {}; } };
+    const scene = new THREE.Scene();
+    const validMesh = createBasicTriangleMesh();
+    const sprite = new THREE.Sprite(new THREE.SpriteMaterial());
+    scene.add(validMesh);
+    scene.add(sprite);
+
+    const res = await renderScene(mockBridgeHost, scene, camera, null, mockWasm);
+    assert.deepEqual(res.admitted, []);
+    assert.equal(res.refused.length, 1);
+    assert.equal(res.refused[0].uuid, sprite.uuid);
+    assert.equal(execCount, 0);
+  }
+
+  // 4. Visible THREE.DirectionalLight causes whole-scene refusal
+  {
+    let execCount = 0;
+    const mockBridgeHost = { executePacket: async () => { execCount++; return {}; } };
+    const scene = new THREE.Scene();
+    const validMesh = createBasicTriangleMesh();
+    const light = new THREE.DirectionalLight(0xffffff, 1.0);
+    scene.add(validMesh);
+    scene.add(light);
+
+    const res = await renderScene(mockBridgeHost, scene, camera, null, mockWasm);
+    assert.deepEqual(res.admitted, []);
+    assert.equal(res.refused.length, 1);
+    assert.equal(res.refused[0].uuid, light.uuid);
+    assert.equal(execCount, 0);
+  }
+
+  // 5. Legitimate culls: Hidden Line and layer-culled Points do NOT block valid mesh
+  {
+    let execCount = 0;
+    const mockBridgeHost = { executePacket: async () => { execCount++; return { status: 'OK' }; } };
+    const scene = new THREE.Scene();
+    const validMesh = createBasicTriangleMesh();
+
+    const lineGeom = new THREE.BufferGeometry();
+    lineGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array([0, 0, 0, 1, 1, 1]), 3));
+    const hiddenLine = new THREE.Line(lineGeom, new THREE.LineBasicMaterial());
+    hiddenLine.visible = false; // legitimately hidden
+
+    const ptsGeom = new THREE.BufferGeometry();
+    ptsGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array([0, 0, 0]), 3));
+    const layerPts = new THREE.Points(ptsGeom, new THREE.PointsMaterial());
+    layerPts.layers.set(2); // camera is on layer 0; legitimately culled by layer filter
+
+    scene.add(validMesh);
+    scene.add(hiddenLine);
+    scene.add(layerPts);
+
+    const res = await renderScene(mockBridgeHost, scene, camera, null, mockWasm);
+    assert.deepEqual(res.admitted, [validMesh.uuid], 'Valid mesh is admitted and rendered');
+    assert.equal(res.refused.length, 0, 'Hidden/layer-culled renderables are legitimately culled without refusal');
+    assert.equal(execCount, 1, 'Scene packet executed successfully');
+  }
+});
+
+test('Refusal: renderScene refuses WHOLE submission when scene features (background, fog, overrideMaterial, environment) exist', async () => {
+  const camera = createBasicCamera();
+  const mockWasm = { f3d_build_mesh_batch_packet: () => new Uint8Array([1]) };
+
+  // 1. scene.background
+  {
+    let execCount = 0;
+    const mockBridgeHost = { executePacket: async () => { execCount++; return {}; } };
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x123456);
+    scene.add(createBasicTriangleMesh());
+
+    const res = await renderScene(mockBridgeHost, scene, camera, null, mockWasm);
+    assert.deepEqual(res.admitted, []);
+    assert.equal(res.refused.length, 1);
+    assert.equal(res.refused[0].uuid, scene.uuid);
+    assert.ok(res.refused[0].reason.includes('scene.background is not supported'));
+    assert.equal(execCount, 0);
+  }
+
+  // 2. scene.fog
+  {
+    let execCount = 0;
+    const mockBridgeHost = { executePacket: async () => { execCount++; return {}; } };
+    const scene = new THREE.Scene();
+    scene.fog = new THREE.Fog(0xffffff, 1, 100);
+    scene.add(createBasicTriangleMesh());
+
+    const res = await renderScene(mockBridgeHost, scene, camera, null, mockWasm);
+    assert.deepEqual(res.admitted, []);
+    assert.equal(res.refused.length, 1);
+    assert.equal(res.refused[0].uuid, scene.uuid);
+    assert.ok(res.refused[0].reason.includes('scene.fog is not supported'));
+    assert.equal(execCount, 0);
+  }
+
+  // 3. scene.overrideMaterial
+  {
+    let execCount = 0;
+    const mockBridgeHost = { executePacket: async () => { execCount++; return {}; } };
+    const scene = new THREE.Scene();
+    scene.overrideMaterial = new THREE.MeshBasicMaterial();
+    scene.add(createBasicTriangleMesh());
+
+    const res = await renderScene(mockBridgeHost, scene, camera, null, mockWasm);
+    assert.deepEqual(res.admitted, []);
+    assert.equal(res.refused.length, 1);
+    assert.equal(res.refused[0].uuid, scene.uuid);
+    assert.ok(res.refused[0].reason.includes('scene.overrideMaterial is not supported'));
+    assert.equal(execCount, 0);
+  }
+
+  // 4. scene.environment
+  {
+    let execCount = 0;
+    const mockBridgeHost = { executePacket: async () => { execCount++; return {}; } };
+    const scene = new THREE.Scene();
+    scene.environment = new THREE.Texture();
+    scene.add(createBasicTriangleMesh());
+
+    const res = await renderScene(mockBridgeHost, scene, camera, null, mockWasm);
+    assert.deepEqual(res.admitted, []);
+    assert.equal(res.refused.length, 1);
+    assert.equal(res.refused[0].uuid, scene.uuid);
+    assert.ok(res.refused[0].reason.includes('scene.environment is not supported'));
+    assert.equal(execCount, 0);
+  }
+});
+
+test('Refusal: renderScene refuses WHOLE submission when visible scene meshes have conflicting depth settings, but admits when culled', async () => {
+  const camera = createBasicCamera();
+  const mockWasm = { f3d_build_mesh_batch_packet: () => new Uint8Array([1]) };
+
+  // 1. Conflicting depth settings in visible meshes -> whole-scene refusal
+  {
+    let execCount = 0;
+    const mockBridgeHost = { executePacket: async () => { execCount++; return {}; } };
+    const scene = new THREE.Scene();
+    const meshDepthTrue = createBasicTriangleMesh({ depthTest: true });
+    const meshDepthFalse = createBasicTriangleMesh({ depthTest: false });
+    scene.add(meshDepthTrue);
+    scene.add(meshDepthFalse);
+
+    const res = await renderScene(mockBridgeHost, scene, camera, null, mockWasm);
+    assert.deepEqual(res.admitted, []);
+    assert.equal(res.refused.length, 1);
+    assert.equal(res.refused[0].uuid, meshDepthFalse.uuid);
+    assert.ok(res.refused[0].reason.includes(ADMISSION_REJECTION.INCOMPATIBLE_BATCH_DEPTH));
+    assert.equal(execCount, 0);
+  }
+
+  // 2. When the conflicting mesh is hidden -> legitimate cull, visible mesh renders
+  {
+    let execCount = 0;
+    const mockBridgeHost = { executePacket: async () => { execCount++; return { status: 'OK' }; } };
+    const scene = new THREE.Scene();
+    const meshDepthTrue = createBasicTriangleMesh({ depthTest: true });
+    const meshDepthFalse = createBasicTriangleMesh({ depthTest: false });
+    meshDepthFalse.visible = false; // culled!
+    scene.add(meshDepthTrue);
+    scene.add(meshDepthFalse);
+
+    const res = await renderScene(mockBridgeHost, scene, camera, null, mockWasm);
+    assert.deepEqual(res.admitted, [meshDepthTrue.uuid]);
+    assert.equal(res.refused.length, 0);
+    assert.equal(execCount, 1);
+  }
+});

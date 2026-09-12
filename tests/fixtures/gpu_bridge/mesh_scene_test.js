@@ -1947,9 +1947,28 @@ export async function testMultiMeshBatchScene(bridgeHost, wasmExports, canvasCon
   meshIncompatB.material = matFar.clone();
   meshIncompatB.material.depthTest = false;
 
-  let depthTestMismatchRejected = false;
+  // 5b-1: Refusal of ambiguous depthTest=false + depthWrite=true without sourceBackend
+  let ambiguityRejected = false;
   try {
     adapter.prepareMeshBatchPacket([meshIncompatA, meshIncompatB], camera, width, height, wasmExports);
+  } catch (err) {
+    if (
+      err.reason === "AMBIGUOUS_DEPTH_PAIR" ||
+      err.message.includes("AMBIGUOUS_DEPTH_PAIR") ||
+      err.message.includes(adapter.ADMISSION_REJECTION?.AMBIGUOUS_DEPTH_PAIR) ||
+      err.message.includes("ambiguous across backends")
+    ) {
+      ambiguityRejected = true;
+    }
+  }
+  if (!ambiguityRejected) {
+    throw new Error("Checkpoint 5b failed: Ambiguous depthTest=false + depthWrite=true without sourceBackend was not rejected with AMBIGUOUS_DEPTH_PAIR");
+  }
+
+  // 5b-2: Refusal of incompatible depthTest with explicit sourceBackend: 'webgpu'
+  let depthTestMismatchRejected = false;
+  try {
+    adapter.prepareMeshBatchPacket([meshIncompatA, meshIncompatB], camera, width, height, wasmExports, { sourceBackend: "webgpu" });
   } catch (err) {
     const isDepthReason =
       err.reason === "INCOMPATIBLE_BATCH_DEPTH" ||
@@ -2214,18 +2233,7 @@ export async function testMultiMeshBatchScene(bridgeHost, wasmExports, canvasCon
   mesh8C.position.set(0.2, -0.3, 0.0);
   group8.add(mesh8C);
 
-  // Inadmissible 1: InstancedMesh (UNSUPPORTED_MESH_SUBCLASS)
-  const instGeom8 = new THREE.BufferGeometry();
-  instGeom8.setAttribute("position", new THREE.BufferAttribute(new Float32Array([
-    0, 0, 0,
-    1, 0, 0,
-    0, 1, 0,
-  ]), 3));
-  const instMat8 = new THREE.MeshBasicMaterial({ side: THREE.DoubleSide });
-  const instancedMesh8 = new THREE.InstancedMesh(instGeom8, instMat8, 2);
-  group8.add(instancedMesh8);
-
-  // Inadmissible 2: Invisible mesh (NOT_VISIBLE)
+  // Legitimately culled 1: Invisible mesh (visible=false -> culling parity)
   const invisGeom8 = new THREE.BufferGeometry();
   invisGeom8.setAttribute("position", new THREE.BufferAttribute(new Float32Array([
     -0.1, -0.1, 0.0,
@@ -2236,6 +2244,18 @@ export async function testMultiMeshBatchScene(bridgeHost, wasmExports, canvasCon
   const invisibleMesh8 = new THREE.Mesh(invisGeom8, invisMat8);
   invisibleMesh8.visible = false;
   group8.add(invisibleMesh8);
+
+  // Legitimately culled 2: Layer-filtered mesh (camera is layer 0, mesh is layer 2)
+  const layerGeom8 = new THREE.BufferGeometry();
+  layerGeom8.setAttribute("position", new THREE.BufferAttribute(new Float32Array([
+    -0.1, -0.1, 0.0,
+     0.1, -0.1, 0.0,
+     0.0,  0.1, 0.0,
+  ]), 3));
+  const layerMat8 = new THREE.MeshBasicMaterial({ color: 0xffff00, side: THREE.DoubleSide });
+  const layerCulledMesh8 = new THREE.Mesh(layerGeom8, layerMat8);
+  layerCulledMesh8.layers.set(2);
+  group8.add(layerCulledMesh8);
 
   let activeCanvasContext8 = canvasContext;
   if (!activeCanvasContext8 && typeof OffscreenCanvas !== "undefined") {
@@ -2297,7 +2317,7 @@ export async function testMultiMeshBatchScene(bridgeHost, wasmExports, canvasCon
     );
   }
 
-  // 1. Assert renderScene returns admitted=3
+  // 1. Assert renderScene returns admitted=3 for supported hierarchy
   if (!Array.isArray(sceneResult8.admitted) || sceneResult8.admitted.length !== 3) {
     throw new Error(
       `Checkpoint 8 failed: Expected 3 admitted meshes in scene, got ${sceneResult8.admitted?.length}`
@@ -2310,35 +2330,10 @@ export async function testMultiMeshBatchScene(bridgeHost, wasmExports, canvasCon
     }
   }
 
-  // 2. Assert renderScene returns refused=2 carrying reason codes
-  if (!Array.isArray(sceneResult8.refused) || sceneResult8.refused.length !== 2) {
+  // 2. Assert culled meshes (invisible and layer-filtered) were legitimately ignored (refused.length === 0)
+  if (!Array.isArray(sceneResult8.refused) || sceneResult8.refused.length !== 0) {
     throw new Error(
-      `Checkpoint 8 failed: Expected 2 refused meshes in scene, got ${sceneResult8.refused?.length}`
-    );
-  }
-  const instancedRefusal8 = sceneResult8.refused.find(r => r.uuid === instancedMesh8.uuid);
-  if (!instancedRefusal8) {
-    throw new Error("Checkpoint 8 failed: InstancedMesh was not recorded in refused list");
-  }
-  const isInstancedReason8 =
-    instancedRefusal8.reason?.includes("UNSUPPORTED_MESH_SUBCLASS") ||
-    instancedRefusal8.code === "UNSUPPORTED_MESH_SUBCLASS";
-  if (!isInstancedReason8) {
-    throw new Error(
-      `Checkpoint 8 failed: InstancedMesh refusal does not carry UNSUPPORTED_MESH_SUBCLASS reason code, got: "${instancedRefusal8.reason}"`
-    );
-  }
-
-  const invisibleRefusal8 = sceneResult8.refused.find(r => r.uuid === invisibleMesh8.uuid);
-  if (!invisibleRefusal8) {
-    throw new Error("Checkpoint 8 failed: Invisible mesh was not recorded in refused list");
-  }
-  const isInvisibleReason8 =
-    invisibleRefusal8.reason?.includes("NOT_VISIBLE") ||
-    invisibleRefusal8.code === "NOT_VISIBLE";
-  if (!isInvisibleReason8) {
-    throw new Error(
-      `Checkpoint 8 failed: Invisible mesh refusal does not carry NOT_VISIBLE reason code, got: "${invisibleRefusal8.reason}"`
+      `Checkpoint 8 failed: Expected 0 refused meshes for clean scene with culled items, got ${sceneResult8.refused?.length}`
     );
   }
 
@@ -2464,5 +2459,63 @@ export async function testMultiMeshBatchScene(bridgeHost, wasmExports, canvasCon
     }
   }
 
-  return "Variable-length multi-mesh batch verified (depth24plus): near-first/far-second with depthWrite=true produces near mesh (Green) matching independent direct WebGPU reference; near-first/far-second with depthWrite=false produces far mesh (Red) matching independent reference and strictly diverging from depthWrite=true; far-first/near-second with depthWrite=true produces near mesh (Green); immutable snapshots verified with distinct dynamic transforms and colors; negative controls strictly refuse empty batch (EMPTY_MESH_BATCH), mismatched depth settings (INCOMPATIBLE_BATCH_DEPTH), and invisible meshes; retained WebGLRenderer multi-mesh oracle matches candidate within tolerance" + (canvasContext ? "; visible canvas batch verified against direct reference" : "") + "; scene hierarchy renderScene verified with translated Group, admission filtering (3 admitted, InstancedMesh and invisible refused with reason codes), projected center sRGB colors, depth24plus occlusion, and planted negative";
+  // ---------------------------------------------------------------------------
+  // Checkpoint 8b: Visible-unsupported whole-scene refusal (no partial drawing per Root Mail 14355)
+  // ---------------------------------------------------------------------------
+  const sceneRefuse8 = new THREE.Scene();
+  const groupRefuse8 = new THREE.Group();
+  sceneRefuse8.add(groupRefuse8);
+
+  // Add one valid supported mesh
+  const validMesh8 = mesh8A.clone();
+  validMesh8.material = mat8A.clone();
+  groupRefuse8.add(validMesh8);
+
+  // Add one visible unsupported renderable (InstancedMesh)
+  const instGeom8 = new THREE.BufferGeometry();
+  instGeom8.setAttribute("position", new THREE.BufferAttribute(new Float32Array([
+    0, 0, 0,
+    1, 0, 0,
+    0, 1, 0,
+  ]), 3));
+  const instMat8 = new THREE.MeshBasicMaterial({ side: THREE.DoubleSide });
+  const instancedMesh8 = new THREE.InstancedMesh(instGeom8, instMat8, 2);
+  instancedMesh8.visible = true;
+  groupRefuse8.add(instancedMesh8);
+
+  const refuseResult8 = await adapter.renderScene(
+    bridgeHost,
+    sceneRefuse8,
+    camera,
+    activeCanvasContext8,
+    wasmExports,
+    { width, height }
+  );
+
+  // Must refuse WHOLE submission (admitted = 0, no partial scene rendering)
+  if (!Array.isArray(refuseResult8.admitted) || refuseResult8.admitted.length !== 0) {
+    throw new Error(
+      `Checkpoint 8b failed: Visible unsupported content must refuse whole submission (admitted=0), got ${refuseResult8.admitted?.length}`
+    );
+  }
+
+  if (!Array.isArray(refuseResult8.refused) || refuseResult8.refused.length === 0) {
+    throw new Error("Checkpoint 8b failed: Expected at least 1 refused item for visible InstancedMesh");
+  }
+
+  const instancedRefusal8 = refuseResult8.refused.find(r => r.uuid === instancedMesh8.uuid);
+  if (!instancedRefusal8) {
+    throw new Error("Checkpoint 8b failed: Visible InstancedMesh was not recorded in refused list");
+  }
+
+  const isInstancedReason8 =
+    instancedRefusal8.reason?.includes("UNSUPPORTED_MESH_SUBCLASS") ||
+    instancedRefusal8.code === "UNSUPPORTED_MESH_SUBCLASS";
+  if (!isInstancedReason8) {
+    throw new Error(
+      `Checkpoint 8b failed: InstancedMesh refusal does not carry UNSUPPORTED_MESH_SUBCLASS reason code, got: "${instancedRefusal8.reason}"`
+    );
+  }
+
+  return "Variable-length multi-mesh batch verified (depth24plus): near-first/far-second with depthWrite=true produces near mesh (Green) matching independent direct WebGPU reference; near-first/far-second with depthWrite=false produces far mesh (Red) matching independent reference and strictly diverging from depthWrite=true; far-first/near-second with depthWrite=true produces near mesh (Green); immutable snapshots verified with distinct dynamic transforms and colors; negative controls strictly refuse empty batch (EMPTY_MESH_BATCH), mismatched depth settings (INCOMPATIBLE_BATCH_DEPTH), and invisible meshes; retained WebGLRenderer multi-mesh oracle matches candidate within tolerance" + (canvasContext ? "; visible canvas batch verified against direct reference" : "") + "; scene hierarchy renderScene verified with translated Group, legitimate culls ignored, positive canvas execution (3 admitted, projected center sRGB colors, depth24plus occlusion, planted negative), and separate visible-unsupported whole-scene refusal";
 }

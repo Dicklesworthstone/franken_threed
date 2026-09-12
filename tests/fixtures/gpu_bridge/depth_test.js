@@ -220,18 +220,10 @@ export async function directDepthReference(device, options = {}) {
       // Pass 2: Load color, depthReadOnly = true (omitted depthLoadOp, depthStoreOp, depthClearValue)
       // Pipeline with depthWriteEnabled = false. Draw Far (Red, z=0.8).
       // Depth test against Near (0.2) rejects Far, preserving Green.
-      const isSafari = typeof navigator !== "undefined" &&
-        /Safari/.test(navigator.userAgent) &&
-        !/Chrome/.test(navigator.userAgent) &&
-        !/Chromium/.test(navigator.userAgent);
-
       const pass2DepthAttachment = {
         view: depthTexture.createView(),
         depthReadOnly: true,
       };
-      if (isSafari) {
-        pass2DepthAttachment.depthLoadOp = "load";
-      }
 
       const pass2 = encoder.beginRenderPass({
         colorAttachments: [

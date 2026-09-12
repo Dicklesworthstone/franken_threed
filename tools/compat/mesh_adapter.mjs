@@ -20,6 +20,8 @@
 import {
   Material,
   Object3D,
+  Matrix4,
+  Vector4,
   NeverDepth,
   AlwaysDepth,
   LessDepth,
@@ -65,6 +67,8 @@ export const ADMISSION_REJECTION = Object.freeze({
   INVALID_DRAWRANGE: 'INVALID_DRAWRANGE: Invalid drawRange: start and count must be non-negative integers',
   EMPTY_MESH_BATCH: 'EMPTY_MESH_BATCH: Mesh batch must be a non-empty array of meshes',
   INCOMPATIBLE_BATCH_DEPTH: 'INCOMPATIBLE_BATCH_DEPTH: Meshes in batch have incompatible depth settings; all meshes in batch must share depthTest, depthWrite, and depthCompare',
+  UNSUPPORTED_RENDERABLE: 'UNSUPPORTED_RENDERABLE: Non-mesh renderable objects (Line, Points, Sprite, Light) are not supported in this slice',
+  UNSUPPORTED_SCENE_FEATURE: 'UNSUPPORTED_SCENE_FEATURE: Scene-level features (background, fog, overrideMaterial, environment) are not supported in this slice',
 });
 
 // Supported upstream source backends for resolving backend-specific semantics
@@ -128,6 +132,83 @@ function rejectMesh(code) {
     reasonCode: code,
     code,
   };
+}
+
+function createRefusalItem(uuid, code, reason) {
+  const item = {
+    uuid,
+    reason: reason || ADMISSION_REJECTION[code] || code,
+  };
+  Object.defineProperty(item, 'code', {
+    value: code,
+    enumerable: false,
+    writable: true,
+    configurable: true,
+  });
+  return item;
+}
+
+/**
+ * Resolves the effective groupOrder for a scene object per Three.js Renderer.js:3252 / WebGLRenderer.js:1870.
+ * Only groups visited in the camera's layers contribute their renderOrder.
+ *
+ * @param {any} object
+ * @returns {number}
+ */
+function getMeshGroupOrder(object, camera, root) {
+  let cur = object?.parent;
+  while (cur) {
+    if (cur.isGroup && camera.layers.test(cur.layers)) {
+      return Number.isFinite(cur.renderOrder) ? cur.renderOrder : 0;
+    }
+    if (cur === root) break;
+    cur = cur.parent;
+  }
+  return 0;
+}
+
+/**
+ * Three.js WebGPU opaque sort comparator matching common/RenderList.js:14-34.
+ * Order: groupOrder -> renderOrder -> projected z -> id
+ *
+ * @param {object} a
+ * @param {object} b
+ * @returns {number}
+ */
+function painterSortWebGPU(a, b) {
+  if (a.groupOrder !== b.groupOrder) {
+    return a.groupOrder - b.groupOrder;
+  } else if (a.renderOrder !== b.renderOrder) {
+    return a.renderOrder - b.renderOrder;
+  } else if (a.z !== b.z) {
+    return a.z - b.z;
+  } else {
+    return a.id - b.id;
+  }
+}
+
+/**
+ * Three.js WebGL opaque sort comparator matching webgl/WebGLRenderLists.js:1-29.
+ * Order: groupOrder -> renderOrder -> material.id -> materialVariant -> projected z -> id
+ *
+ * @param {object} a
+ * @param {object} b
+ * @returns {number}
+ */
+function painterSortWebGL(a, b) {
+  if (a.groupOrder !== b.groupOrder) {
+    return a.groupOrder - b.groupOrder;
+  } else if (a.renderOrder !== b.renderOrder) {
+    return a.renderOrder - b.renderOrder;
+  } else if (a.materialId !== b.materialId) {
+    return a.materialId - b.materialId;
+  } else if (a.materialVariant !== b.materialVariant) {
+    return a.materialVariant - b.materialVariant;
+  } else if (a.z !== b.z) {
+    return a.z - b.z;
+  } else {
+    return a.id - b.id;
+  }
 }
 
 /**
@@ -856,6 +937,19 @@ export function prepareMeshBatchPacket(meshes, camera, width, height, wasmModule
     throw createAdmissionError('EMPTY_MESH_BATCH');
   }
 
+  // If options.autoUpdate is explicitly true (standalone batch preparation requesting auto-update),
+  // update world matrices according to Three.js boundaries without repeating if autoUpdate is false.
+  if (options.autoUpdate === true) {
+    if (camera.parent === null && camera.matrixWorldAutoUpdate === true && typeof camera.updateMatrixWorld === 'function') {
+      camera.updateMatrixWorld();
+    }
+    for (const mesh of meshes) {
+      if (mesh.matrixWorldAutoUpdate === true && typeof mesh.updateMatrixWorld === 'function') {
+        mesh.updateMatrixWorld();
+      }
+    }
+  }
+
   const batchFn = wasmModule?.f3d_build_mesh_batch_packet;
 
   if (typeof batchFn !== 'function') {
@@ -1025,11 +1119,11 @@ export async function renderMeshBatch(bridgeHost, meshes, camera, canvasContext,
  * Renders admitted Three.js Mesh instances in a Scene using a single batch packet.
  *
  * Traversal & Admission:
- * - Updates world matrices once across the scene and camera via updateMatrixWorld(true).
+ * - Updates scene/camera matrices at the pinned renderer's automatic update boundaries.
  * - Traverses the scene graph to collect visible THREE.Mesh instances.
  * - Evaluates each mesh via canAdmitMesh(obj, camera, options), honoring sourceBackend rules.
- * - Admitted meshes are collected in traversal order.
- * - Refused meshes are recorded as { uuid, reason } without throwing.
+ * - Sorts admitted opaque meshes with the selected source backend's ordering.
+ * - Any unsupported visible content refuses the whole submission before packet construction.
  *
  * Submission:
  * - If admitted set is empty, explicitly refuses without building or submitting a packet,
@@ -1057,36 +1151,188 @@ export async function renderScene(bridgeHost, scene, camera, canvasContext, wasm
     throw createAdmissionError('INVALID_CAMERA');
   }
 
-  // Update world matrices once before traversal
-  if (typeof scene.updateMatrixWorld === 'function') {
-    scene.updateMatrixWorld(true);
+  // Update world matrices according to Three.js renderer source boundaries
+  // (Renderer.js:1755, 3677 / WebGLRenderer.js:1663, 1667)
+  if (scene.matrixWorldAutoUpdate === true && typeof scene.updateMatrixWorld === 'function') {
+    scene.updateMatrixWorld();
   }
-  if (typeof camera.updateMatrixWorld === 'function') {
-    camera.updateMatrixWorld(true);
+  if (camera.parent === null && camera.matrixWorldAutoUpdate === true && typeof camera.updateMatrixWorld === 'function') {
+    camera.updateMatrixWorld();
   }
 
-  const admittedMeshes = [];
+  const projScreenMatrix = new Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+  const vector4 = new Vector4();
+
+  const admittedItems = [];
   const refused = [];
 
-  // Traverse scene to collect and evaluate THREE.Mesh instances in traversal order
+  // Scene-level unsupported properties check (Root Mail 14355)
+  if (scene.onBeforeRender !== DEFAULT_OBJECT3D_ON_BEFORE_RENDER ||
+      scene.onAfterRender !== DEFAULT_OBJECT3D_ON_AFTER_RENDER) {
+    refused.push(createRefusalItem(scene.uuid, 'UNSUPPORTED_CALLBACK'));
+  }
+  if (scene.background !== null && scene.background !== undefined) {
+    refused.push(createRefusalItem(
+      scene.uuid,
+      'UNSUPPORTED_SCENE_FEATURE',
+      `${ADMISSION_REJECTION.UNSUPPORTED_SCENE_FEATURE}: scene.background is not supported`
+    ));
+  }
+  if (scene.fog !== null && scene.fog !== undefined) {
+    refused.push(createRefusalItem(
+      scene.uuid,
+      'UNSUPPORTED_SCENE_FEATURE',
+      `${ADMISSION_REJECTION.UNSUPPORTED_SCENE_FEATURE}: scene.fog is not supported`
+    ));
+  }
+  if (scene.overrideMaterial !== null && scene.overrideMaterial !== undefined) {
+    refused.push(createRefusalItem(
+      scene.uuid,
+      'UNSUPPORTED_SCENE_FEATURE',
+      `${ADMISSION_REJECTION.UNSUPPORTED_SCENE_FEATURE}: scene.overrideMaterial is not supported`
+    ));
+  }
+  if (scene.environment !== null && scene.environment !== undefined) {
+    refused.push(createRefusalItem(
+      scene.uuid,
+      'UNSUPPORTED_SCENE_FEATURE',
+      `${ADMISSION_REJECTION.UNSUPPORTED_SCENE_FEATURE}: scene.environment is not supported`
+    ));
+  }
+
+  function isNodeVisible(node) {
+    let cur = node;
+    while (cur) {
+      if (cur.visible === false) return false;
+      cur = cur.parent;
+    }
+    return true;
+  }
+
+  function isNodeInCameraLayers(node) {
+    if (!camera.layers || !node.layers) return true;
+    return camera.layers.test(node.layers);
+  }
+
+  // Traverse scene to collect visible in-layer renderables; cull hidden/layer-filtered objects legitimately
   scene.traverse((obj) => {
-    if (!obj || !obj.isMesh) {
+    if (!obj || obj === scene) {
       return;
     }
 
-    const admission = canAdmitMesh(obj, camera, options);
-    if (admission.admitted) {
-      admittedMeshes.push(obj);
-    } else {
-      refused.push({ uuid: obj.uuid, reason: admission.reason });
+    // Ignore hidden or camera-layer-filtered content legitimately (Root Mail 14355)
+    if (!isNodeVisible(obj) || !isNodeInCameraLayers(obj)) {
+      return;
+    }
+    if (obj.material?.visible === false) return;
+
+    // Visible, in-layer non-mesh renderables
+    if (obj.isLine || obj.isLineSegments || obj.isLineLoop || obj.isPoints || obj.isSprite || obj.isLight || (obj.geometry && !obj.isMesh)) {
+      refused.push(createRefusalItem(
+        obj.uuid,
+        'UNSUPPORTED_RENDERABLE',
+        `${ADMISSION_REJECTION.UNSUPPORTED_RENDERABLE}: ${obj.type || 'Non-mesh renderable'} is not supported`
+      ));
+      return;
+    }
+
+    // Visible, in-layer Mesh
+    if (obj.isMesh) {
+      const admission = canAdmitMesh(obj, camera, options);
+      if (!admission.admitted) {
+        refused.push(createRefusalItem(
+          obj.uuid,
+          admission.code ?? 'ADMISSION_REJECTED',
+          admission.reason
+        ));
+        return;
+      }
+
+      // Calculate projected z (Three.js WebGLRenderer.js:1924-1936 / Renderer.js:3300-3306)
+      let z = 0;
+      const geom = obj.geometry;
+      if (options.sortObjects !== false && geom) {
+        if (geom.boundingSphere === null && typeof geom.computeBoundingSphere === 'function') {
+          geom.computeBoundingSphere();
+        }
+        if (geom.boundingSphere) {
+          vector4.copy(geom.boundingSphere.center);
+        } else {
+          vector4.set(0, 0, 0, 1);
+        }
+        vector4.applyMatrix4(obj.matrixWorld).applyMatrix4(projScreenMatrix);
+        z = vector4.z;
+      }
+
+      admittedItems.push({
+        mesh: obj,
+        groupOrder: getMeshGroupOrder(obj, camera, scene),
+        renderOrder: Number.isFinite(obj.renderOrder) ? obj.renderOrder : 0,
+        z,
+        id: obj.id,
+        materialId: obj.material?.id ?? 0,
+        materialVariant: 0,
+      });
     }
   });
 
-  // Empty admitted set -> explicit refusal, no submit
-  if (admittedMeshes.length === 0) {
+  // Verify shared batch pipeline configuration across admitted meshes in scene
+  if (admittedItems.length > 1) {
+    const firstMat = admittedItems[0].mesh.material;
+    const sharedDepthTest = firstMat?.depthTest !== false;
+    const sharedDepthWrite = firstMat?.depthWrite !== false;
+    const sharedDepthFunc = firstMat?.depthFunc ?? LessEqualDepth;
+
+    for (let i = 1; i < admittedItems.length; i++) {
+      const mat = admittedItems[i].mesh.material;
+      const dt = mat?.depthTest !== false;
+      const dw = mat?.depthWrite !== false;
+      const df = mat?.depthFunc ?? LessEqualDepth;
+
+      if (dt !== sharedDepthTest || dw !== sharedDepthWrite || df !== sharedDepthFunc) {
+        refused.push(createRefusalItem(
+          admittedItems[i].mesh.uuid,
+          'INCOMPATIBLE_BATCH_DEPTH',
+          `${ADMISSION_REJECTION.INCOMPATIBLE_BATCH_DEPTH}: scene meshes have conflicting depth settings`
+        ));
+      }
+    }
+  }
+
+  // Refuse WHOLE submission on any visible unsupported renderable or scene effect (Root Mail 14355)
+  if (refused.length > 0) {
     const response = {
       admitted: [],
       refused,
+    };
+    const primaryCode = refused[0].code ?? 'UNSUPPORTED_SCENE_CONTENT';
+    const primaryReason = refused[0].reason ?? ADMISSION_REJECTION.UNSUPPORTED_SCENE_FEATURE;
+    Object.defineProperty(response, 'reason', {
+      value: primaryCode,
+      enumerable: false,
+      writable: true,
+      configurable: true,
+    });
+    Object.defineProperty(response, 'reasonMessage', {
+      value: primaryReason,
+      enumerable: false,
+      writable: true,
+      configurable: true,
+    });
+    Object.defineProperty(response, 'refusalReason', {
+      value: primaryCode,
+      enumerable: false,
+      writable: true,
+      configurable: true,
+    });
+    return response;
+  }
+
+  // Empty admitted set -> explicit refusal, no submit
+  if (admittedItems.length === 0) {
+    const response = {
+      admitted: [],
+      refused: [],
     };
     Object.defineProperty(response, 'reason', {
       value: 'EMPTY_MESH_BATCH',
@@ -1109,13 +1355,16 @@ export async function renderScene(bridgeHost, scene, camera, canvasContext, wasm
     return response;
   }
 
-  // Sort admitted meshes ascending by renderOrder (Three.js RenderList.js:20; stable sort preserves traversal order for equal renderOrder)
-  admittedMeshes.sort((a, b) => {
-    const orderA = Number.isFinite(a.renderOrder) ? a.renderOrder : 0;
-    const orderB = Number.isFinite(b.renderOrder) ? b.renderOrder : 0;
-    return orderA - orderB;
-  });
+  // Sort admitted meshes: If options.sortObjects !== false (default true), sort per sourceBackend
+  // WebGL: groupOrder -> renderOrder -> material.id -> materialVariant -> projected z -> id
+  // WebGPU: groupOrder -> renderOrder -> projected z -> id
+  if (options.sortObjects !== false) {
+    const sourceBackend = (options.sourceBackend ?? SOURCE_BACKEND.WEBGPU).toLowerCase();
+    const sortFn = sourceBackend === SOURCE_BACKEND.WEBGL ? painterSortWebGL : painterSortWebGPU;
+    admittedItems.sort(sortFn);
+  }
 
+  const admittedMeshes = admittedItems.map((item) => item.mesh);
   const admitted = admittedMeshes.map((m) => m.uuid);
 
   const isCanvasTarget = canvasContext !== null && canvasContext !== undefined;
@@ -1128,7 +1377,7 @@ export async function renderScene(bridgeHost, scene, camera, canvasContext, wasm
     width,
     height,
     wasmModule,
-    { ...options, target: isCanvasTarget ? 'canvas' : 'offscreen' }
+    { ...options, autoUpdate: false, target: isCanvasTarget ? 'canvas' : 'offscreen' }
   );
 
   const result = await bridgeHost.executePacket(
