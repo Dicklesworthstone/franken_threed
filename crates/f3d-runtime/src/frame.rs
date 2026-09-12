@@ -51,7 +51,7 @@ use f3d_core::{
 };
 use f3d_graph::{
     error::{CanvasError, GraphError},
-    pass::{ColorAttachment, Draw, LoadOp, Pass, PassId, StoreOp},
+    pass::{ColorAttachment, DepthStencilAttachment, Draw, LoadOp, Pass, PassId, StoreOp},
     resource::{ResourceAccess, ResourceId, ResourceUse},
     schedule::PassGraph,
     CanvasEpochTracker, CanvasFormat, CanvasId,
@@ -470,6 +470,7 @@ struct ActivePass {
     id: PassId,
     name: String,
     color_attachment: ColorAttachment,
+    depth_stencil_attachment: Option<DepthStencilAttachment>,
     draws: Vec<Draw>,
     dependency: Option<PassId>,
     scissor_used: bool,
@@ -491,6 +492,7 @@ struct OuterResumeState {
     canvas_output_epoch: Option<Epoch>,
     name: String,
     prefix_pass_id: PassId,
+    depth_stencil_attachment: Option<DepthStencilAttachment>,
 }
 
 /// Orchestrates the source-ordered execution of logical frame operations, passes, and context switches.
@@ -692,6 +694,22 @@ impl FrameSession {
     /// # Errors
     /// Returns [`FrameError::PassAlreadyActive`] if another pass has not been closed via [`Self::end_render_pass`].
     pub fn begin_render_pass(&mut self, name: &str, clear_color: [f32; 4]) -> Result<PassId, FrameError> {
+        self.begin_render_pass_with_depth(name, clear_color, None)
+    }
+
+    /// Begin a new render pass targeting the current context's render target, with an optional depth/stencil attachment.
+    ///
+    /// Constructs a [`ColorAttachment`] configured for canvas or offscreen rendering based on the
+    /// active context state, along with the supplied optional [`DepthStencilAttachment`].
+    ///
+    /// # Errors
+    /// Returns [`FrameError::PassAlreadyActive`] if another pass has not been closed via [`Self::end_render_pass`].
+    pub fn begin_render_pass_with_depth(
+        &mut self,
+        name: &str,
+        clear_color: [f32; 4],
+        depth_attachment: Option<DepthStencilAttachment>,
+    ) -> Result<PassId, FrameError> {
         if let Some(active) = &self.active_pass {
             return Err(FrameError::PassAlreadyActive {
                 pass_id: active.id.get(),
@@ -717,6 +735,7 @@ impl FrameSession {
             id: pass_id,
             name: name.to_string(),
             color_attachment,
+            depth_stencil_attachment: depth_attachment,
             draws: Vec::new(),
             dependency,
             scissor_used,
@@ -965,6 +984,10 @@ impl FrameSession {
         let mut pass = Pass::new_render(active.id, active.name)
             .with_color_attachment(active.color_attachment);
 
+        if let Some(dsa) = active.depth_stencil_attachment {
+            pass = pass.with_depth_stencil_attachment(dsa);
+        }
+
         for draw in active.draws {
             pass = pass.with_draw(draw);
         }
@@ -1003,6 +1026,15 @@ impl FrameSession {
         resumed_color_attachment.load_op = LoadOp::Load;
         resumed_color_attachment.store_op = StoreOp::Store;
 
+        let resumed_depth_attachment = resume.depth_stencil_attachment.as_ref().map(|dsa| {
+            let mut resumed_dsa = dsa.clone();
+            if !resumed_dsa.depth_read_only {
+                resumed_dsa.depth_load_op = Some(LoadOp::Load);
+                resumed_dsa.depth_store_op = dsa.depth_store_op;
+            }
+            resumed_dsa
+        });
+
         let dep = self.last_completed_pass_id.or(Some(resume.prefix_pass_id));
         let scissor_used = resume.scissor_used || resume.scissor_test_enabled || resume.scissor.is_some();
 
@@ -1010,6 +1042,7 @@ impl FrameSession {
             id: resumed_id,
             name: format!("{}_resumed", resume.name),
             color_attachment: resumed_color_attachment,
+            depth_stencil_attachment: resumed_depth_attachment,
             draws: Vec::new(),
             dependency: dep,
             scissor_used,
@@ -1054,6 +1087,16 @@ impl FrameSession {
             let mut pass = Pass::new_render(prefix_id, active.name.clone())
                 .with_color_attachment(active.color_attachment.clone());
 
+            let prefix_dsa = active.depth_stencil_attachment.clone().map(|mut dsa| {
+                if !dsa.depth_read_only && dsa.depth_store_op.is_some() {
+                    dsa.depth_store_op = Some(StoreOp::Store);
+                }
+                dsa
+            });
+            if let Some(ref dsa) = prefix_dsa {
+                pass = pass.with_depth_stencil_attachment(dsa.clone());
+            }
+
             for draw in active.draws {
                 pass = pass.with_draw(draw);
             }
@@ -1080,6 +1123,7 @@ impl FrameSession {
                 canvas_output_epoch: ctx.canvas_output_epoch,
                 name: active.name,
                 prefix_pass_id: prefix_id,
+                depth_stencil_attachment: active.depth_stencil_attachment,
             })
         } else {
             None
@@ -2953,5 +2997,298 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn test_nested_render_with_writable_depth_suspends_and_resumes_outer_pass() {
+        let target_a = ResourceId::new(10);
+        let target_b = ResourceId::new(20);
+        let depth_target = ResourceId::new(30);
+        let shadow_depth_target = ResourceId::new(40);
+
+        let root_ctx = RenderContext::new_canvas(target_a, 1920, 1080, Epoch::new(1))
+            .with_viewport(0, 0, 1920, 1080)
+            .with_camera_projection([1.0; 16]);
+        let mut session = FrameSession::new(root_ctx, 256).expect("session init");
+
+        let mat_handle = Handle::<MaterialDomain>::new(10, NonZeroU32::new(1).unwrap());
+        let near_bytes = [255u8, 0, 0, 255];
+        let far_bytes = [0u8, 255, 0, 255];
+        let shadow_bytes = [0u8, 0, 255, 255];
+
+        let rec_near = session
+            .snapshot_material_use(mat_handle, DataVersion::INITIAL, Epoch::new(1), &near_bytes)
+            .expect("near snapshot");
+
+        // 1. Begin outer pass with writable depth attachment and Discard store intent to test restoration
+        let mut outer_depth = DepthStencilAttachment::new_depth_clear(depth_target, 1.0);
+        outer_depth.depth_store_op = Some(StoreOp::Discard);
+
+        session
+            .begin_render_pass_with_depth("outer_scene", [0.0, 0.0, 0.0, 1.0], Some(outer_depth))
+            .expect("begin outer with depth");
+
+        // Record near draw
+        session.record_direct_draw(1, 0, 3, Some(rec_near)).expect("draw near in outer");
+
+        // 2. Nested render (e.g. shadow map on target_b with shadow_depth_target)
+        let shadow_ctx = RenderContext::new_offscreen(target_b, 512, 512, Epoch::new(2))
+            .with_viewport(0, 0, 512, 512)
+            .with_camera_projection([2.0; 16]);
+
+        session
+            .with_nested_render(shadow_ctx, |s| {
+                let rec_shadow = s
+                    .snapshot_material_use(mat_handle, DataVersion::new(2), Epoch::new(2), &shadow_bytes)
+                    .expect("shadow snapshot");
+                let shadow_depth = DepthStencilAttachment::new_depth_clear(shadow_depth_target, 1.0);
+                s.begin_render_pass_with_depth("nested_shadow", [0.0, 0.0, 0.0, 1.0], Some(shadow_depth))
+                    .expect("begin nested shadow with depth");
+                s.record_direct_draw(2, 0, 6, Some(rec_shadow)).expect("draw in shadow");
+                s.end_render_pass().expect("end shadow");
+                Ok(())
+            })
+            .expect("nested render succeeds");
+
+        // 3. Post-condition: outer pass is resumed
+        assert!(session.active_pass.is_some());
+        let active_resumed = session.active_pass.as_ref().unwrap();
+        assert_eq!(active_resumed.name, "outer_scene_resumed");
+        assert_eq!(active_resumed.color_attachment.load_op, LoadOp::Load);
+
+        // Verify resumed depth attachment properties:
+        // - Must have LoadOp::Load to preserve prior depth writes across the nested pass
+        // - Must restore original final store intent (StoreOp::Discard)
+        let resumed_depth = active_resumed
+            .depth_stencil_attachment
+            .as_ref()
+            .expect("resumed depth attachment present");
+        assert_eq!(resumed_depth.target_id, depth_target);
+        assert_eq!(resumed_depth.depth_load_op, Some(LoadOp::Load));
+        assert_eq!(resumed_depth.depth_store_op, Some(StoreOp::Discard));
+        assert!(!resumed_depth.depth_read_only);
+
+        // 4. Continue outer rendering with far draw
+        let rec_far = session
+            .snapshot_material_use(mat_handle, DataVersion::new(3), Epoch::new(1), &far_bytes)
+            .expect("far snapshot");
+        session.record_direct_draw(1, 0, 3, Some(rec_far)).expect("draw far in outer");
+        session.end_render_pass().expect("end resumed outer");
+
+        // 5. Compile pass graph and verify segments
+        let plan = session.pass_graph().compile(None).expect("compile plan");
+        assert_eq!(plan.segment_count(), 3);
+
+        // Prefix pass: must have StoreOp::Store for depth so nested pass doesn't clobber it
+        let seg_prefix = &plan.segments()[0];
+        assert_eq!(seg_prefix.name(), "outer_scene");
+        let prefix_depth = seg_prefix.depth_stencil_attachment().expect("prefix depth present");
+        assert_eq!(prefix_depth.target_id, depth_target);
+        assert_eq!(prefix_depth.depth_load_op, Some(LoadOp::Clear));
+        assert_eq!(prefix_depth.depth_store_op, Some(StoreOp::Store));
+
+        // Nested pass: independent depth target
+        let seg_nested = &plan.segments()[1];
+        assert_eq!(seg_nested.name(), "nested_shadow");
+        let nested_depth = seg_nested.depth_stencil_attachment().expect("nested depth present");
+        assert_eq!(nested_depth.target_id, shadow_depth_target);
+        assert_eq!(nested_depth.depth_load_op, Some(LoadOp::Clear));
+        assert_eq!(nested_depth.depth_store_op, Some(StoreOp::Store));
+
+        // Resumed pass: LoadOp::Load and original final store intent (Discard)
+        let seg_resumed = &plan.segments()[2];
+        assert_eq!(seg_resumed.name(), "outer_scene_resumed");
+        let final_depth = seg_resumed.depth_stencil_attachment().expect("resumed depth present");
+        assert_eq!(final_depth.target_id, depth_target);
+        assert_eq!(final_depth.depth_load_op, Some(LoadOp::Load));
+        assert_eq!(final_depth.depth_store_op, Some(StoreOp::Discard));
+
+        // 6. Bridge lowering verification
+        let packet = session.build_submission_packet().expect("packet lowers cleanly");
+        let encoded = packet.encode().expect("encode packet");
+        assert!(!encoded.is_empty());
+    }
+
+    #[test]
+    fn test_nested_render_with_readonly_depth_preserves_omitted_ops() {
+        let target_a = ResourceId::new(10);
+        let target_b = ResourceId::new(20);
+        let depth_target = ResourceId::new(30);
+
+        let root_ctx = RenderContext::new_canvas(target_a, 1920, 1080, Epoch::new(1))
+            .with_viewport(0, 0, 1920, 1080);
+        let mut session = FrameSession::new(root_ctx, 256).expect("session init");
+
+        let mat_handle = Handle::<MaterialDomain>::new(10, NonZeroU32::new(1).unwrap());
+        let bytes = [255u8, 0, 0, 255];
+        let rec = session
+            .snapshot_material_use(mat_handle, DataVersion::INITIAL, Epoch::new(1), &bytes)
+            .expect("snapshot");
+
+        // Read-only depth attachment: load_op, store_op omitted (None)
+        let mut readonly_depth = DepthStencilAttachment::new_depth_clear(depth_target, 1.0);
+        readonly_depth.depth_read_only = true;
+        readonly_depth.depth_load_op = None;
+        readonly_depth.depth_store_op = None;
+
+        session
+            .begin_render_pass_with_depth("readonly_pass", [0.0, 0.0, 0.0, 1.0], Some(readonly_depth))
+            .expect("begin readonly pass");
+        session.record_direct_draw(1, 0, 3, Some(rec)).expect("draw in outer");
+
+        // Execute nested render
+        let nested_ctx = RenderContext::new_offscreen(target_b, 256, 256, Epoch::new(2));
+        session
+            .with_nested_render(nested_ctx, |s| {
+                let rec2 = s
+                    .snapshot_material_use(mat_handle, DataVersion::new(2), Epoch::new(2), &bytes)
+                    .expect("snapshot 2");
+                s.begin_render_pass("nested_offscreen", [0.1, 0.1, 0.1, 1.0])
+                    .expect("begin nested");
+                s.record_direct_draw(2, 0, 3, Some(rec2)).expect("draw nested");
+                s.end_render_pass().expect("end nested");
+                Ok(())
+            })
+            .expect("nested succeeds");
+
+        // Resumed pass must maintain omitted load/store ops for readonly depth
+        let active_resumed = session.active_pass.as_ref().unwrap();
+        let resumed_depth = active_resumed
+            .depth_stencil_attachment
+            .as_ref()
+            .expect("resumed depth");
+        assert!(resumed_depth.depth_read_only);
+        assert_eq!(resumed_depth.depth_load_op, None);
+        assert_eq!(resumed_depth.depth_store_op, None);
+
+        session.record_direct_draw(1, 0, 3, Some(rec)).expect("draw in resumed");
+        session.end_render_pass().expect("end resumed");
+
+        let plan = session.pass_graph().compile(None).expect("compile");
+        assert_eq!(plan.segment_count(), 3);
+
+        // Check prefix segment: load/store must be None
+        let seg_prefix = &plan.segments()[0];
+        let p_depth = seg_prefix.depth_stencil_attachment().expect("prefix depth");
+        assert!(p_depth.depth_read_only);
+        assert_eq!(p_depth.depth_load_op, None);
+        assert_eq!(p_depth.depth_store_op, None);
+
+        // Check resumed segment: load/store must be None
+        let seg_resumed = &plan.segments()[2];
+        let r_depth = seg_resumed.depth_stencil_attachment().expect("resumed depth");
+        assert!(r_depth.depth_read_only);
+        assert_eq!(r_depth.depth_load_op, None);
+        assert_eq!(r_depth.depth_store_op, None);
+
+        // Bridge lowering verification
+        let packet = session.build_submission_packet().expect("packet lowers cleanly");
+        let encoded = packet.encode().expect("encode packet");
+        assert!(!encoded.is_empty());
+    }
+
+    #[test]
+    fn test_nested_render_with_no_depth_remains_completely_untouched() {
+        let target_a = ResourceId::new(10);
+        let target_b = ResourceId::new(20);
+
+        let root_ctx = RenderContext::new_canvas(target_a, 1920, 1080, Epoch::new(1))
+            .with_viewport(0, 0, 1920, 1080);
+        let mut session = FrameSession::new(root_ctx, 256).expect("session init");
+
+        let mat_handle = Handle::<MaterialDomain>::new(10, NonZeroU32::new(1).unwrap());
+        let bytes = [255u8, 0, 0, 255];
+        let rec = session
+            .snapshot_material_use(mat_handle, DataVersion::INITIAL, Epoch::new(1), &bytes)
+            .expect("snapshot");
+
+        // Begin without depth (None) via begin_render_pass
+        session.begin_render_pass("no_depth_outer", [0.0, 0.0, 0.0, 1.0]).expect("begin outer");
+        session.record_direct_draw(1, 0, 3, Some(rec)).expect("draw in outer");
+
+        let nested_ctx = RenderContext::new_offscreen(target_b, 256, 256, Epoch::new(2));
+        session
+            .with_nested_render(nested_ctx, |s| {
+                let rec2 = s
+                    .snapshot_material_use(mat_handle, DataVersion::new(2), Epoch::new(2), &bytes)
+                    .expect("snapshot 2");
+                s.begin_render_pass("nested_no_depth", [0.2, 0.2, 0.2, 1.0]).expect("begin nested");
+                s.record_direct_draw(2, 0, 3, Some(rec2)).expect("draw nested");
+                s.end_render_pass().expect("end nested");
+                Ok(())
+            })
+            .expect("nested succeeds");
+
+        // Resumed pass must have None depth attachment
+        let active_resumed = session.active_pass.as_ref().unwrap();
+        assert!(active_resumed.depth_stencil_attachment.is_none());
+
+        session.record_direct_draw(1, 0, 3, Some(rec)).expect("draw in resumed");
+        session.end_render_pass().expect("end resumed");
+
+        let plan = session.pass_graph().compile(None).expect("compile");
+        assert_eq!(plan.segment_count(), 3);
+
+        assert!(plan.segments()[0].depth_stencil_attachment().is_none());
+        assert!(plan.segments()[1].depth_stencil_attachment().is_none());
+        assert!(plan.segments()[2].depth_stencil_attachment().is_none());
+
+        let packet = session.build_submission_packet().expect("packet lowers cleanly");
+        let encoded = packet.encode().expect("encode packet");
+        assert!(!encoded.is_empty());
+    }
+
+    #[test]
+    fn test_nested_render_does_not_sanitize_malformed_descriptors() {
+        let target_a = ResourceId::new(10);
+        let target_b = ResourceId::new(20);
+        let depth_target = ResourceId::new(30);
+
+        let root_ctx = RenderContext::new_canvas(target_a, 1920, 1080, Epoch::new(1))
+            .with_viewport(0, 0, 1920, 1080);
+        let mut session = FrameSession::new(root_ctx, 256).expect("session init");
+
+        let mat_handle = Handle::<MaterialDomain>::new(10, NonZeroU32::new(1).unwrap());
+        let bytes = [255u8, 0, 0, 255];
+        let rec = session
+            .snapshot_material_use(mat_handle, DataVersion::INITIAL, Epoch::new(1), &bytes)
+            .expect("snapshot");
+
+        // Malformed readonly descriptor: illegally has Some(LoadOp::Clear) and Some(StoreOp::Store)
+        let mut malformed_readonly = DepthStencilAttachment::new_depth_clear(depth_target, 1.0);
+        malformed_readonly.depth_read_only = true;
+        malformed_readonly.depth_load_op = Some(LoadOp::Clear);
+        malformed_readonly.depth_store_op = Some(StoreOp::Store);
+
+        session
+            .begin_render_pass_with_depth("malformed_pass", [0.0, 0.0, 0.0, 1.0], Some(malformed_readonly))
+            .expect("begin");
+        session.record_direct_draw(1, 0, 3, Some(rec)).expect("draw");
+
+        let nested_ctx = RenderContext::new_offscreen(target_b, 256, 256, Epoch::new(2));
+        session
+            .with_nested_render(nested_ctx, |s| {
+                let rec2 = s
+                    .snapshot_material_use(mat_handle, DataVersion::new(2), Epoch::new(2), &bytes)
+                    .expect("snapshot 2");
+                s.begin_render_pass("nested", [0.1, 0.1, 0.1, 1.0]).expect("begin");
+                s.record_direct_draw(2, 0, 3, Some(rec2)).expect("draw");
+                s.end_render_pass().expect("end");
+                Ok(())
+            })
+            .expect("nested succeeds");
+
+        // Resumed pass must NOT sanitize the malformed operations: they must stay as authored
+        let active_resumed = session.active_pass.as_ref().unwrap();
+        let resumed_depth = active_resumed.depth_stencil_attachment.as_ref().unwrap();
+        assert_eq!(resumed_depth.depth_load_op, Some(LoadOp::Clear));
+        assert_eq!(resumed_depth.depth_store_op, Some(StoreOp::Store));
+
+        session.record_direct_draw(1, 0, 3, Some(rec)).expect("draw in resumed");
+        session.end_render_pass().expect("end");
+
+        // Lowering validation must reject this malformed readonly descriptor with Clear!
+        let err = session.build_submission_packet().expect_err("must be rejected by lowering validation");
+        assert!(matches!(err, FrameError::PlanLowering(crate::gpu_host::PlanLoweringError::InvalidDepthAttachment { .. })));
     }
 }

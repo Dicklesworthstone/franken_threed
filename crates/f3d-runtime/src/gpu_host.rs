@@ -67,7 +67,7 @@ use f3d_core::{
 };
 use f3d_graph::{
     CanvasEpochTracker, CanvasFormat, CanvasId, DrawKind, ExecutionPlan, LoadOp, PassKind,
-    ResourceAccess, ResourceId, StoreOp,
+    ResourceAccess, ResourceId, ResourceUse, StoreOp,
 };
 use f3d_math::{Matrix4, Quaternion, Vector3};
 
@@ -3608,7 +3608,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {\n\
     // 7. Build passes using f3d-graph's PassGraph and compile to ExecutionPlan
     use f3d_graph::{
         pass::{ColorAttachment, DepthStencilAttachment, Draw, Pass, PassId},
-        PassGraph,
+        PassGraph, ResourceUse,
     };
 
     let mut graph = PassGraph::new();
