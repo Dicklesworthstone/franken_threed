@@ -1521,6 +1521,395 @@ test('Positive and negative: Exact backend router preserves route and permanent 
   assert.equal(router.getCanvasLock(canvas)?.route, ExecutionRoute.EXACT_BACKEND);
 });
 
+test('Regression: nested successful construction surviving outer preflight failure', () => {
+  const connectedGroups = new ConnectedCompatibilityGroups();
+  const router = new RendererConstructionRouter({
+    connectedGroups,
+    implementations: {
+      [ExecutionRoute.RETAINED_UPSTREAM]: function MockRetained() { this.isRetained = true; },
+      [ExecutionRoute.EXACT_BACKEND]: function MockExact() { this.isExact = true; },
+    },
+  });
+
+  // Lock canvas1 to EXACT_BACKEND
+  router.routeAndConstruct({
+    constructorName: 'WebGLRenderer',
+    options: { canvas: 'prelocked-canvas' },
+  });
+
+  let nestedInstance = null;
+  let nestedId = null;
+
+  // sharedResources getter reenters routeAndConstruct during outer preflight
+  const reentrantResources = [
+    {
+      get id() {
+        if (!nestedInstance) {
+          nestedInstance = router.routeAndConstruct({
+            constructorName: 'WebGPURenderer',
+            options: { canvas: 'canvas-nested-survival' },
+            hostCapabilities: { hasWebGPU: true, hasWebGL: true },
+          });
+          nestedId = router.getInstanceDecision(nestedInstance)?.rendererId;
+        }
+        return 'shared-rt-nested';
+      },
+      isMutable: true,
+    },
+  ];
+
+  // Outer attempts to route WebGPURenderer on prelocked-canvas (locked to EXACT_BACKEND)
+  assert.throws(
+    () => {
+      router.routeAndConstruct({
+        constructorName: 'WebGPURenderer',
+        options: { canvas: 'prelocked-canvas' },
+        sharedResources: reentrantResources,
+        hostCapabilities: { hasWebGPU: true, hasWebGL: true },
+      });
+    },
+    RouteLockError
+  );
+
+  // Assert nested renderer survived completely intact
+  assert.ok(nestedInstance, 'Nested renderer must have been constructed');
+  assert.equal(router.getInstanceRoute(nestedInstance), ExecutionRoute.RETAINED_UPSTREAM);
+  assert.equal(router.getCanvasLock('canvas-nested-survival')?.route, ExecutionRoute.RETAINED_UPSTREAM);
+  assert.ok(nestedId, 'Nested renderer must have assigned ID');
+  assert.equal(connectedGroups._committedRoutes.get(nestedId), ExecutionRoute.RETAINED_UPSTREAM);
+});
+
+test('Regression: reentrant construction in callImplementations alters constraints and triggers preflight revalidation failure', () => {
+  const connectedGroups = new ConnectedCompatibilityGroups();
+  const router = new RendererConstructionRouter({
+    connectedGroups,
+    implementations: {
+      [ExecutionRoute.RETAINED_UPSTREAM]: function MockRetained() { this.isRetained = true; },
+      [ExecutionRoute.EXACT_BACKEND]: function MockExact() { this.isExact = true; },
+    },
+  });
+
+  let nestedConstructed = false;
+
+  const dynamicCallImplementations = {
+    get [ExecutionRoute.RETAINED_UPSTREAM]() {
+      if (!nestedConstructed) {
+        nestedConstructed = true;
+        // Nested construction couples shared-target-reval with an EXACT_BACKEND renderer
+        router.routeAndConstruct({
+          constructorName: 'WebGLRenderer',
+          options: { canvas: 'canvas-nested-exact' },
+          sharedResources: ['shared-target-reval'],
+        });
+      }
+      return function MockDynamicRetained() { this.isRetained = true; };
+    },
+  };
+
+  // Outer renderer starts with WebGPURenderer sharing shared-target-reval.
+  // Initially shared-target-reval has no exact constraints.
+  // During implementation lookup, the getter fires and couples shared-target-reval to EXACT_BACKEND.
+  // The post-selection revalidation must conservatively catch this and reject outer construction!
+  assert.throws(
+    () => {
+      router.routeAndConstruct({
+        constructorName: 'WebGPURenderer',
+        options: { canvas: 'canvas-outer-reval' },
+        sharedResources: ['shared-target-reval'],
+        implementations: dynamicCallImplementations,
+        hostCapabilities: { hasWebGPU: true, hasWebGL: true },
+      });
+    },
+    /no admitted exact backend implementation registered/
+  );
+
+  // Canvas of outer was NOT locked
+  assert.equal(router.getCanvasLock('canvas-outer-reval'), undefined);
+  // Nested renderer state is preserved
+  assert.equal(router.getCanvasLock('canvas-nested-exact')?.route, ExecutionRoute.EXACT_BACKEND);
+});
+
+test('Regression: preflight RouteLockError does not poison shared resources for subsequent renderers', () => {
+  const connectedGroups = new ConnectedCompatibilityGroups();
+  const router = new RendererConstructionRouter({
+    connectedGroups,
+    implementations: {
+      [ExecutionRoute.RETAINED_UPSTREAM]: function MockRetained() { this.isRetained = true; },
+      [ExecutionRoute.EXACT_BACKEND]: function MockExact() { this.isExact = true; },
+    },
+  });
+
+  // Lock canvas1 to RETAINED_UPSTREAM
+  router.routeAndConstruct({
+    constructorName: 'WebGPURenderer',
+    options: { canvas: 'canvas-locked-gpu' },
+    hostCapabilities: { hasWebGPU: true, hasWebGL: true },
+  });
+
+  // Attempt WebGLRenderer on canvas-locked-gpu with shared-rt-unpoisoned -> throws RouteLockError
+  assert.throws(
+    () => {
+      router.routeAndConstruct({
+        constructorName: 'WebGLRenderer',
+        options: { canvas: 'canvas-locked-gpu' },
+        sharedResources: ['shared-rt-unpoisoned'],
+      });
+    },
+    RouteLockError
+  );
+
+  // Subsequent WebGPURenderer on fresh canvas sharing shared-rt-unpoisoned must NOT be forced to EXACT_BACKEND
+  const r2 = router.routeAndConstruct({
+    constructorName: 'WebGPURenderer',
+    options: { canvas: 'canvas-fresh-unpoisoned' },
+    sharedResources: ['shared-rt-unpoisoned'],
+    hostCapabilities: { hasWebGPU: true, hasWebGL: true },
+  });
+
+  assert.equal(router.getInstanceRoute(r2), ExecutionRoute.RETAINED_UPSTREAM);
+  assert.equal(router.getCanvasLock('canvas-fresh-unpoisoned')?.route, ExecutionRoute.RETAINED_UPSTREAM);
+});
+
+test('Sunny regression: implementations[EXACT] getter builds retained inner sharing S, then outer fails; inner survives and blocks later exact sharing S', () => {
+  const connectedGroups = new ConnectedCompatibilityGroups();
+  const router = new RendererConstructionRouter({
+    connectedGroups,
+    implementations: {
+      [ExecutionRoute.RETAINED_UPSTREAM]: function MockRetained() { this.isRetained = true; },
+    },
+  });
+
+  let innerConstructed = false;
+  let innerRendererId = null;
+
+  const dynamicImplementations = {
+    get [ExecutionRoute.EXACT_BACKEND]() {
+      if (!innerConstructed) {
+        innerConstructed = true;
+        const inner = router.routeAndConstruct({
+          constructorName: 'WebGPURenderer',
+          options: { canvas: 'canvas-sunny-inner' },
+          sharedResources: ['sunny-resource-S'],
+          hostCapabilities: { hasWebGPU: true, hasWebGL: true },
+        });
+        innerRendererId = router.getInstanceDecision(inner)?.rendererId;
+      }
+      return null; // Outer implementation lookup fails
+    },
+  };
+
+  // Outer attempts EXACT_BACKEND sharing 'sunny-resource-S'; triggers getter and fails
+  assert.throws(
+    () => {
+      router.routeAndConstruct({
+        constructorName: 'WebGLRenderer',
+        options: { canvas: 'canvas-sunny-outer' },
+        sharedResources: ['sunny-resource-S'],
+        implementations: dynamicImplementations,
+      });
+    },
+    /no admitted exact backend implementation registered/
+  );
+
+  // Assert inner survived and is committed to RETAINED_UPSTREAM
+  assert.equal(router.getCanvasLock('canvas-sunny-inner')?.route, ExecutionRoute.RETAINED_UPSTREAM);
+  assert.ok(innerRendererId);
+  assert.equal(connectedGroups._committedRoutes.get(innerRendererId), ExecutionRoute.RETAINED_UPSTREAM);
+
+  // Later exact renderer sharing sunny-resource-S must be rejected with Connected group conflict
+  assert.throws(
+    () => {
+      router.routeAndConstruct({
+        constructorName: 'WebGLRenderer',
+        options: { canvas: 'canvas-sunny-later' },
+        sharedResources: ['sunny-resource-S'],
+        implementations: {
+          [ExecutionRoute.EXACT_BACKEND]: function MockExact() { this.isExact = true; },
+        },
+      });
+    },
+    /Connected group conflict/
+  );
+});
+
+test('Sunny regression: recordCommittedRoute before constructor blocks reentrant exact construction from inside constructor', () => {
+  const connectedGroups = new ConnectedCompatibilityGroups();
+  const router = new RendererConstructionRouter({
+    connectedGroups,
+  });
+
+  let reentrancyAttempted = false;
+  let reentrancyBlocked = false;
+
+  class OuterRetainedRenderer {
+    constructor(opts) {
+      reentrancyAttempted = true;
+      try {
+        router.routeAndConstruct({
+          constructorName: 'WebGLRenderer',
+          options: { canvas: 'canvas-reentrant-inside-constructor' },
+          sharedResources: ['sunny-resource-S2'],
+          implementations: {
+            [ExecutionRoute.EXACT_BACKEND]: function MockExact() { this.isExact = true; },
+          },
+        });
+      } catch (err) {
+        if (/Connected group conflict/.test(err.message)) {
+          reentrancyBlocked = true;
+        }
+        throw err;
+      }
+    }
+  }
+
+  // Outer constructs with OuterRetainedRenderer sharing 'sunny-resource-S2'.
+  // Because recordCommittedRoute runs before targetConstructor(options),
+  // outer's route is committed when constructor body runs, blocking reentrant exact sharing.
+  assert.throws(
+    () => {
+      router.routeAndConstruct({
+        constructorFn: OuterRetainedRenderer,
+        constructorName: 'WebGPURenderer',
+        options: { canvas: 'canvas-outer-main' },
+        sharedResources: ['sunny-resource-S2'],
+        hostCapabilities: { hasWebGPU: true, hasWebGL: true },
+      });
+    },
+    /Connected group conflict/
+  );
+
+  assert.equal(reentrancyAttempted, true);
+  assert.equal(reentrancyBlocked, true);
+});
+
+test('Root regression: available exact implementation selected after reentrant group escalation to EXACT_BACKEND', () => {
+  const connectedGroups = new ConnectedCompatibilityGroups();
+
+  let innerCalls = 0;
+  let getterCalls = 0;
+  let outerExactCalls = 0;
+
+  function ExactWebGPUCtor(opts) {
+    outerExactCalls++;
+    this.isExactWebGPU = true;
+    this.canvas = opts?.canvas;
+  }
+
+  function InnerWebGLCtor(opts) {
+    innerCalls++;
+    this.isInnerWebGL = true;
+    this.canvas = opts?.canvas;
+  }
+
+  function RetainedCtor(opts) {
+    this.isRetained = true;
+  }
+
+  const router = new RendererConstructionRouter({
+    connectedGroups,
+    implementations: {
+      [ExecutionRoute.EXACT_BACKEND]: {
+        WebGLRenderer: InnerWebGLCtor,
+        WebGPURenderer: ExactWebGPUCtor,
+      },
+    },
+  });
+
+  const dynamicImplementations = {
+    get [ExecutionRoute.RETAINED_UPSTREAM]() {
+      getterCalls++;
+      // Inner constructs exact WebGLRenderer sharing 'shared-S'
+      router.routeAndConstruct({
+        constructorName: 'WebGLRenderer',
+        options: { canvas: 'canvas-inner-root' },
+        sharedResources: ['shared-S'],
+      });
+      return RetainedCtor;
+    },
+  };
+
+  // Outer constructs WebGPURenderer sharing 'shared-S'.
+  // Initial route is RETAINED_UPSTREAM. Implementation getter runs and inner exact is constructed.
+  // Group constraint escalates monotonically to EXACT_BACKEND.
+  // Router selects available ExactWebGPUCtor from captured implementation without repeating getter.
+  const outerInstance = router.routeAndConstruct({
+    constructorName: 'WebGPURenderer',
+    options: { canvas: 'canvas-outer-root' },
+    sharedResources: ['shared-S'],
+    implementations: dynamicImplementations,
+    hostCapabilities: { hasWebGPU: true, hasWebGL: true },
+  });
+
+  assert.equal(innerCalls, 1, 'innerCalls must be 1');
+  assert.equal(getterCalls, 1, 'getterCalls must be 1');
+  assert.equal(outerExactCalls, 1, 'outerExactCalls must be 1');
+
+  // Both canvas locks are irreversible and properly set
+  assert.equal(router.getCanvasLock('canvas-inner-root')?.route, ExecutionRoute.EXACT_BACKEND);
+  assert.equal(router.getCanvasLock('canvas-outer-root')?.route, ExecutionRoute.EXACT_BACKEND);
+  assert.equal(router.getInstanceRoute(outerInstance), ExecutionRoute.EXACT_BACKEND);
+});
+
+test('Final review regression: refresh final group metadata after reentrant construction sharing resource', () => {
+  const connectedGroups = new ConnectedCompatibilityGroups();
+  const router = new RendererConstructionRouter({
+    connectedGroups,
+  });
+
+  let innerCalls = 0;
+  let outerCalls = 0;
+  let getterCalls = 0;
+
+  function InnerRetainedCtor(opts) {
+    innerCalls++;
+    this.isInner = true;
+  }
+
+  function OuterRetainedCtor(opts) {
+    outerCalls++;
+    this.isOuter = true;
+  }
+
+  let innerInstance = null;
+
+  const dynamicImplementations = {
+    get [ExecutionRoute.RETAINED_UPSTREAM]() {
+      getterCalls++;
+      innerInstance = router.routeAndConstruct({
+        constructorName: 'WebGPURenderer',
+        options: { canvas: 'canvas-inner-meta' },
+        sharedResources: ['shared-meta-S'],
+        implementations: {
+          [ExecutionRoute.RETAINED_UPSTREAM]: InnerRetainedCtor,
+        },
+        hostCapabilities: { hasWebGPU: true, hasWebGL: true },
+      });
+      return OuterRetainedCtor;
+    },
+  };
+
+  const outerInstance = router.routeAndConstruct({
+    constructorName: 'WebGPURenderer',
+    options: { canvas: 'canvas-outer-meta' },
+    sharedResources: ['shared-meta-S'],
+    implementations: dynamicImplementations,
+    hostCapabilities: { hasWebGPU: true, hasWebGL: true },
+  });
+
+  assert.equal(innerCalls, 1, 'innerCalls must be 1');
+  assert.equal(outerCalls, 1, 'outerCalls must be 1');
+  assert.equal(getterCalls, 1, 'getterCalls must be 1');
+
+  const innerDecision = router.getInstanceDecision(innerInstance);
+  const outerDecision = router.getInstanceDecision(outerInstance);
+
+  assert.ok(innerDecision?.groupId, 'innerDecision must have groupId');
+  assert.ok(outerDecision?.groupId, 'outerDecision must have groupId');
+  assert.equal(outerDecision.groupId, innerDecision.groupId, 'outer and inner renderers sharing S must report the same groupId');
+});
+
+
+
 
 
 

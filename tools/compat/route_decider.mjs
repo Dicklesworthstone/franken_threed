@@ -59,6 +59,7 @@ export function decideRendererRoute(input = {}) {
   let options = { ...input.options };
   let analysis = input.analysis || {};
   let sourceSpan = input.sourceSpan;
+  let hasUnanalyzedModules = Boolean(analysis.hasUnanalyzedModules || analysis.has_unanalyzed_modules);
 
   // Consume RubyCrane's module graph JSON (schema 1.0.0) if passed as analysis or bundle input
   const bundle = input.moduleGraph || input.bundle || (
@@ -67,6 +68,7 @@ export function decideRendererRoute(input = {}) {
 
   if (bundle && typeof bundle === 'object' && bundle.modules) {
     const graphFacts = extractGraphRoutingFacts(bundle);
+    hasUnanalyzedModules ||= Boolean(graphFacts.hasUnanalyzedModules || bundle.external_modules?.length);
     analysis = {
       hasOpaqueGLEscapes: graphFacts.hasOpaqueGLEscapes,
       hasNativeContextAccess: graphFacts.hasNativeContextAccess,
@@ -202,6 +204,14 @@ export function decideRendererRoute(input = {}) {
 
   // WebGPURenderer on capable WebGPU host
   if (constructorName === 'WebGPURenderer') {
+    if (hasUnanalyzedModules) {
+      return {
+        route: ExecutionRoute.RETAINED_UPSTREAM,
+        reasons: [...reasons, 'unanalyzed-external-modules'],
+        sourceSpan,
+        constructorName,
+      };
+    }
     if (specializationAvailable) {
       return {
         route: ExecutionRoute.SPECIALIZED_WEBGPU,
