@@ -1191,9 +1191,51 @@ test('parseSrcsetUrls extracts image candidate URLs per browser/WHATWG srcset se
   );
 
   assert.deepEqual(
+    parseSrcsetUrls('bad.png 2X, good.png 1x'),
+    ['good.png'],
+    'Must skip candidate with uppercase descriptor unit (2X is invalid per WHATWG)'
+  );
+
+  assert.deepEqual(
+    parseSrcsetUrls('bad.png 400W, good.png 1x'),
+    ['good.png'],
+    'Must skip candidate with uppercase descriptor unit (400W is invalid per WHATWG)'
+  );
+
+  assert.deepEqual(
+    parseSrcsetUrls('bad.png 100H, good.png 1x'),
+    ['good.png'],
+    'Must skip candidate with uppercase descriptor unit (100H is invalid per WHATWG)'
+  );
+
+  assert.deepEqual(
     parseSrcsetUrls('zero.png 0w, good.png 1x'),
     ['good.png'],
     'Must skip candidate with zero width (0w)'
+  );
+
+  assert.deepEqual(
+    parseSrcsetUrls('zero.png -0x, good.png 1x'),
+    ['zero.png', 'good.png'],
+    'Must accept candidate with leading minus zero density (-0x is valid zero density)'
+  );
+
+  assert.deepEqual(
+    parseSrcsetUrls('zero2.png -0.0x, good.png 1x'),
+    ['zero2.png', 'good.png'],
+    'Must accept candidate with leading minus zero floating density (-0.0x is valid zero density)'
+  );
+
+  assert.deepEqual(
+    parseSrcsetUrls('neg.png -1x, good.png 1x'),
+    ['good.png'],
+    'Must skip candidate with negative nonzero density (-1x)'
+  );
+
+  assert.deepEqual(
+    parseSrcsetUrls('negfrac.png -0.5x, good.png 1x'),
+    ['good.png'],
+    'Must skip candidate with negative nonzero fractional density (-0.5x)'
   );
 
   assert.deepEqual(
@@ -1218,6 +1260,24 @@ test('parseSrcsetUrls extracts image candidate URLs per browser/WHATWG srcset se
     parseSrcsetUrls('both.png 100w 200h, good.png 1x'),
     ['both.png', 'good.png'],
     'Must accept candidate with valid width and height descriptors (100w 200h)'
+  );
+
+  assert.deepEqual(
+    parseSrcsetUrls('large.png 9007199254740993w, good.png 1x'),
+    ['large.png', 'good.png'],
+    'Must accept valid integer width without arbitrary safe integer cutoff'
+  );
+
+  assert.deepEqual(
+    parseSrcsetUrls('bad.png 1x (foo,bar), good.png 1x'),
+    ['good.png'],
+    'Must not let comma inside parentheses in after_descriptor create a phantom candidate'
+  );
+
+  assert.deepEqual(
+    parseSrcsetUrls('bad.png (a,b), good.png 1x'),
+    ['good.png'],
+    'Must handle descriptor starting with paren in after_descriptor without phantom candidate'
   );
 
   // 9. Non-ASCII whitespace (U+00A0 non-breaking space) is not treated as ASCII whitespace

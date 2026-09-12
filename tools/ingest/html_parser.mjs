@@ -324,6 +324,9 @@ export function parseSrcsetUrls(srcsetString) {
           } else if (c === ',') {
             pos++; // consume candidate separator comma
             break;
+          } else if (c === '(') {
+            currentDescriptor += c;
+            state = 'in_parens';
           } else {
             state = 'in_descriptor';
             currentDescriptor += c;
@@ -342,21 +345,22 @@ export function parseSrcsetUrls(srcsetString) {
       let height = null;
 
       for (const desc of descriptors) {
-        // Valid non-negative integer followed by 'w'
-        if (/^[0-9]+w$/i.test(desc)) {
+        // Valid non-negative integer followed by lowercase 'w'
+        if (/^[0-9]+w$/.test(desc)) {
           if (width !== null || density !== null) {
             error = true;
             break;
           }
           const wVal = parseInt(desc.slice(0, -1), 10);
-          if (wVal === 0 || !Number.isSafeInteger(wVal)) {
+          if (wVal === 0) {
             error = true;
             break;
           }
           width = wVal;
         }
-        // Valid floating-point number followed by 'x' (density >= 0)
-        else if (/^(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?x$/i.test(desc)) {
+        // Valid floating-point number (including leading minus e.g. -0x) followed by lowercase 'x'
+        // WHATWG: density must not be less than 0 (rejects negative nonzero, accepts 0 and -0)
+        else if (/^-?(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?x$/.test(desc)) {
           if (width !== null || density !== null || height !== null) {
             error = true;
             break;
@@ -368,20 +372,20 @@ export function parseSrcsetUrls(srcsetString) {
           }
           density = dVal;
         }
-        // Valid non-negative integer followed by 'h'
-        else if (/^[0-9]+h$/i.test(desc)) {
+        // Valid non-negative integer followed by lowercase 'h'
+        else if (/^[0-9]+h$/.test(desc)) {
           if (height !== null || density !== null) {
             error = true;
             break;
           }
           const hVal = parseInt(desc.slice(0, -1), 10);
-          if (hVal === 0 || !Number.isSafeInteger(hVal)) {
+          if (hVal === 0) {
             error = true;
             break;
           }
           height = hVal;
         } else {
-          // Unknown or malformed descriptor
+          // Unknown or malformed descriptor (including uppercase W/X/H)
           error = true;
           break;
         }
