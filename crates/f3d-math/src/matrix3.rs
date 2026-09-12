@@ -12,6 +12,8 @@
 
 use core::fmt;
 use crate::matrix4::Matrix4;
+use crate::vector2::Vector2;
+use crate::vector3::Vector3;
 
 /// A 3x3 matrix represented in column-major order by double-precision `f64` elements.
 #[derive(Clone, Copy, PartialEq)]
@@ -103,6 +105,59 @@ impl Matrix3 {
     #[inline]
     pub fn copy(&mut self, m: &Self) -> &mut Self {
         self.elements = m.elements;
+        self
+    }
+
+    /// Resets this matrix to the 3x3 identity matrix.
+    ///
+    /// Matches Three.js r186 `Matrix3.identity()`.
+    #[inline]
+    pub fn set_identity(&mut self) -> &mut Self {
+        *self = Self::identity();
+        self
+    }
+
+    /// Sets the elements of this matrix from the given slice in column-major order starting at `offset`.
+    ///
+    /// # Slice-bounds Contract
+    /// Bounds checking (`offset + 9 > array.len()`) is a native Rust API contract,
+    /// not out-of-range Three.js parity.
+    /// Matches Three.js r186 `Matrix3.fromArray(array, offset)` within valid bounds.
+    #[inline]
+    pub fn from_array(&mut self, array: &[f64], offset: usize) -> &mut Self {
+        self.elements.copy_from_slice(&array[offset..offset + 9]);
+        self
+    }
+
+    /// Writes the elements of this matrix in column-major order into `array` starting at `offset`.
+    ///
+    /// # Slice-bounds Contract
+    /// Bounds checking (`offset + 9 > array.len()`) is a native Rust API contract,
+    /// not out-of-range Three.js parity.
+    /// Matches Three.js r186 `Matrix3.toArray(array, offset)` within valid bounds.
+    #[inline]
+    pub fn to_array<'a>(&self, array: &'a mut [f64], offset: usize) -> &'a mut [f64] {
+        array[offset..offset + 9].copy_from_slice(&self.elements);
+        array
+    }
+
+    /// Transposes this matrix into the supplied 9-element array slice, and returns itself unchanged.
+    ///
+    /// # Slice-bounds Contract
+    /// Requires `r.len() >= 9` as a native Rust API contract.
+    /// Matches Three.js r186 `Matrix3.transposeIntoArray(r)`.
+    #[inline]
+    pub fn transpose_into_array(&self, r: &mut [f64]) -> &Self {
+        let m = &self.elements;
+        r[0] = m[0];
+        r[1] = m[3];
+        r[2] = m[6];
+        r[3] = m[1];
+        r[4] = m[4];
+        r[5] = m[7];
+        r[6] = m[2];
+        r[7] = m[5];
+        r[8] = m[8];
         self
     }
 
@@ -261,5 +316,126 @@ impl Matrix3 {
     #[inline]
     pub fn equals(&self, other: &Self) -> bool {
         self.elements == other.elements
+    }
+
+    /// Sets this matrix as a 2D translation transform.
+    ///
+    /// Matches Three.js r186 `Matrix3.makeTranslation(x, y)`.
+    #[inline]
+    pub fn make_translation(&mut self, x: f64, y: f64) -> &mut Self {
+        self.set(
+            1.0, 0.0, x,
+            0.0, 1.0, y,
+            0.0, 0.0, 1.0,
+        )
+    }
+
+    /// Sets this matrix as a 2D translation transform from a [`Vector2`].
+    ///
+    /// Matches Three.js r186 `Matrix3.makeTranslation(vector2)`.
+    #[inline]
+    pub fn make_translation_vec(&mut self, v: &Vector2) -> &mut Self {
+        self.make_translation(v.x, v.y)
+    }
+
+    /// Sets this matrix as a 2D rotational transformation.
+    ///
+    /// Matches Three.js r186 `Matrix3.makeRotation(theta)`.
+    #[inline]
+    pub fn make_rotation(&mut self, theta: f64) -> &mut Self {
+        let c = theta.cos();
+        let s = theta.sin();
+
+        self.set(
+            c, -s, 0.0,
+            s, c, 0.0,
+            0.0, 0.0, 1.0,
+        )
+    }
+
+    /// Sets this matrix as a 2D scale transform.
+    ///
+    /// Matches Three.js r186 `Matrix3.makeScale(x, y)`.
+    #[inline]
+    pub fn make_scale(&mut self, x: f64, y: f64) -> &mut Self {
+        self.set(
+            x, 0.0, 0.0,
+            0.0, y, 0.0,
+            0.0, 0.0, 1.0,
+        )
+    }
+
+    /// Translates this matrix by the given scalar values.
+    ///
+    /// Matches Three.js r186 `Matrix3.translate(tx, ty)`:
+    /// `this.premultiply(_m3.makeTranslation(tx, ty))`.
+    #[inline]
+    pub fn translate(&mut self, tx: f64, ty: f64) -> &mut Self {
+        let mut m = Self::identity();
+        m.make_translation(tx, ty);
+        self.premultiply(&m)
+    }
+
+    /// Rotates this matrix by the given angle in radians.
+    ///
+    /// Matches Three.js r186 `Matrix3.rotate(theta)`:
+    /// `this.premultiply(_m3.makeRotation(-theta))`.
+    #[inline]
+    pub fn rotate(&mut self, theta: f64) -> &mut Self {
+        let mut m = Self::identity();
+        m.make_rotation(-theta);
+        self.premultiply(&m)
+    }
+
+    /// Scales this matrix with the given scalar values.
+    ///
+    /// Matches Three.js r186 `Matrix3.scale(sx, sy)`:
+    /// `this.premultiply(_m3.makeScale(sx, sy))`.
+    #[inline]
+    pub fn scale(&mut self, sx: f64, sy: f64) -> &mut Self {
+        let mut m = Self::identity();
+        m.make_scale(sx, sy);
+        self.premultiply(&m)
+    }
+
+    /// Sets the UV transform matrix from offset, repeat, rotation, and center.
+    ///
+    /// Matches Three.js r186 `Matrix3.setUvTransform(tx, ty, sx, sy, rotation, cx, cy)`.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_uv_transform(
+        &mut self,
+        tx: f64,
+        ty: f64,
+        sx: f64,
+        sy: f64,
+        rotation: f64,
+        cx: f64,
+        cy: f64,
+    ) -> &mut Self {
+        let c = rotation.cos();
+        let s = rotation.sin();
+
+        self.set(
+            sx * c, sx * s, -sx * (c * cx + s * cy) + cx + tx,
+            -sy * s, sy * c, -sy * (-s * cx + c * cy) + cy + ty,
+            0.0, 0.0, 1.0,
+        )
+    }
+
+    /// Extracts the basis of this matrix into the three axis vectors provided.
+    ///
+    /// Matches Three.js r186 `Matrix3.extractBasis(xAxis, yAxis, zAxis)`.
+    #[inline]
+    pub fn extract_basis(
+        &mut self,
+        x_axis: &mut Vector3,
+        y_axis: &mut Vector3,
+        z_axis: &mut Vector3,
+    ) -> &mut Self {
+        x_axis.set_from_matrix3_column(self, 0);
+        y_axis.set_from_matrix3_column(self, 1);
+        z_axis.set_from_matrix3_column(self, 2);
+        self
     }
 }

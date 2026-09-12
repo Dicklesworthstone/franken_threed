@@ -4,6 +4,7 @@ use core::f64::consts::PI;
 use f3d_math::euler::{Euler, EulerOrder};
 use f3d_math::matrix3::Matrix3;
 use f3d_math::matrix4::Matrix4;
+use f3d_math::vector2::Vector2;
 use f3d_math::vector3::Vector3;
 
 #[test]
@@ -361,4 +362,167 @@ fn test_euler_reorder() {
         (dot - 1.0).abs() < 1e-12,
         "Reordering must preserve orientation"
     );
+}
+
+#[test]
+fn test_matrix3_transform_make_translate_rotate_scale_uv_basis() {
+    // 1. make_translation(2.0, 3.0) and make_translation_vec(&Vector2)
+    // Derived from Node Matrix3.js: new Matrix3().makeTranslation(2, 3).elements -> [1,0,0,0,1,0,2,3,1]
+    let mut m_trans = Matrix3::identity();
+    m_trans.make_translation(2.0, 3.0);
+    assert_eq!(m_trans.elements, [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 2.0, 3.0, 1.0]);
+
+    let v_trans = Vector2::new(2.0, 3.0);
+    let mut m_trans_v = Matrix3::identity();
+    m_trans_v.make_translation_vec(&v_trans);
+    assert_eq!(m_trans_v.elements, m_trans.elements);
+
+    // 2. make_rotation(PI / 6.0)
+    // Derived from Node Matrix3.js: new Matrix3().makeRotation(Math.PI / 6).elements
+    // -> [0.8660254037844387, 0.49999999999999994, 0, -0.49999999999999994, 0.8660254037844387, 0, 0, 0, 1]
+    let mut m_rot = Matrix3::identity();
+    m_rot.make_rotation(PI / 6.0);
+    let expected_rot = [
+        0.8660254037844387,
+        0.49999999999999994,
+        0.0,
+        -0.49999999999999994,
+        0.8660254037844387,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+    ];
+    for i in 0..9 {
+        assert!(
+            (m_rot.elements[i] - expected_rot[i]).abs() < 1e-14,
+            "make_rotation mismatch at index {i}"
+        );
+    }
+
+    // 3. make_scale(2.0, 3.0)
+    // Derived from Node Matrix3.js: new Matrix3().makeScale(2, 3).elements -> [2,0,0,0,3,0,0,0,1]
+    let mut m_scale = Matrix3::identity();
+    m_scale.make_scale(2.0, 3.0);
+    assert_eq!(m_scale.elements, [2.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 1.0]);
+
+    // 4. Chained translate(2, 3) then rotate(PI / 6) then scale(2, 3) on non-identity start matrix
+    // Start: Matrix3.set(1, 2, 3, 4, 5, 6, 7, 8, 9)
+    // Derived from Node Matrix3.js:
+    // m = new Matrix3().set(1, 2, 3, 4, 5, 6, 7, 8, 9); m.translate(2, 3); m.rotate(Math.PI / 6); m.scale(2, 3);
+    // -> [50.98076211353316, 42.45190528383291, 7, 60.17691453623979, 48.34421012924618, 8, 69.37306695894642, 54.23651497465943, 9]
+    let mut m_chain = Matrix3::new(
+        1.0, 2.0, 3.0,
+        4.0, 5.0, 6.0,
+        7.0, 8.0, 9.0,
+    );
+    m_chain.translate(2.0, 3.0);
+    m_chain.rotate(PI / 6.0);
+    m_chain.scale(2.0, 3.0);
+    let expected_chain = [
+        50.98076211353316,
+        42.45190528383291,
+        7.0,
+        60.17691453623979,
+        48.34421012924618,
+        8.0,
+        69.37306695894642,
+        54.23651497465943,
+        9.0,
+    ];
+    for i in 0..9 {
+        assert!(
+            (m_chain.elements[i] - expected_chain[i]).abs() < 1e-12,
+            "chained transform mismatch at index {i}: expected {}, got {}",
+            expected_chain[i],
+            m_chain.elements[i]
+        );
+    }
+
+    // 5. set_uv_transform(0.1, 0.2, 2.0, 3.0, PI / 4.0, 0.5, 0.5)
+    // Derived from Node Matrix3.js:
+    // new Matrix3().setUvTransform(0.1, 0.2, 2, 3, Math.PI / 4, 0.5, 0.5).elements
+    // -> [1.4142135623730951, -2.1213203435596424, 0, 1.414213562373095, 2.121320343559643, 0, -0.814213562373095, 0.6999999999999998, 1]
+    let mut m_uv = Matrix3::identity();
+    m_uv.set_uv_transform(0.1, 0.2, 2.0, 3.0, PI / 4.0, 0.5, 0.5);
+    let expected_uv = [
+        1.4142135623730951,
+        -2.1213203435596424,
+        0.0,
+        1.414213562373095,
+        2.121320343559643,
+        0.0,
+        -0.814213562373095,
+        0.6999999999999998,
+        1.0,
+    ];
+    for i in 0..9 {
+        assert!(
+            (m_uv.elements[i] - expected_uv[i]).abs() < 1e-14,
+            "set_uv_transform mismatch at index {i}: expected {}, got {}",
+            expected_uv[i],
+            m_uv.elements[i]
+        );
+    }
+
+    // 6. extract_basis of a known matrix yields its three columns
+    // Derived from Node Matrix3.js:
+    // new Matrix3().set(1, 2, 3, 4, 5, 6, 7, 8, 9).extractBasis(x, y, z)
+    // -> x = [1, 4, 7], y = [2, 5, 8], z = [3, 6, 9]
+    let mut m_basis = Matrix3::new(
+        1.0, 2.0, 3.0,
+        4.0, 5.0, 6.0,
+        7.0, 8.0, 9.0,
+    );
+    let mut x_axis = Vector3::zero();
+    let mut y_axis = Vector3::zero();
+    let mut z_axis = Vector3::zero();
+    m_basis.extract_basis(&mut x_axis, &mut y_axis, &mut z_axis);
+    assert_eq!(x_axis, Vector3::new(1.0, 4.0, 7.0));
+    assert_eq!(y_axis, Vector3::new(2.0, 5.0, 8.0));
+    assert_eq!(z_axis, Vector3::new(3.0, 6.0, 9.0));
+
+    // No-claim line: scalar parity only.
+}
+
+#[test]
+fn test_matrix3_array_and_identity_parity() {
+    // No-claim line: scalar parity only.
+    // Note: slice-bounds behavior is a native API contract, not out-of-range Three.js parity.
+    // Derived Node oracle values verified against Three.js r186 Matrix3.js.
+
+    // 1. Matrix3 from_array offset 2 of a 12-element buffer
+    let buf12 = [999.0, 888.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 777.0];
+    let mut m = Matrix3::zero();
+    let ret_m = m.from_array(&buf12, 2);
+    let expected_elements = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+    assert_eq!(ret_m.elements, expected_elements);
+    assert_eq!(m.elements, expected_elements);
+
+    // 2. Matrix3 to_array into a 12-element sentinel buffer at offset 1
+    let mut out_buf12 = [100.0, 200.0, 300.0, 400.0, 500.0, 600.0, 700.0, 800.0, 900.0, 1000.0, 1100.0, 1200.0];
+    m.to_array(&mut out_buf12, 1);
+    let expected_out_buf12 = [100.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 1100.0, 1200.0];
+    assert_eq!(out_buf12, expected_out_buf12);
+
+    // 3. Matrix3 transpose_into_array of set(1..9) -> exact 9 values
+    let m_trans = Matrix3::new(
+        1.0, 2.0, 3.0,
+        4.0, 5.0, 6.0,
+        7.0, 8.0, 9.0,
+    );
+    let mut r = [-1.0; 9];
+    m_trans.transpose_into_array(&mut r);
+    let expected_r = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+    assert_eq!(r, expected_r);
+
+    // 4. Matrix3 set_identity on a filled matrix
+    let mut m_fill = Matrix3::new(
+        9.0, 8.0, 7.0,
+        6.0, 5.0, 4.0,
+        3.0, 2.0, 1.0,
+    );
+    m_fill.set_identity();
+    assert_eq!(m_fill, Matrix3::identity());
+    assert_eq!(m_fill.elements, [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
 }
