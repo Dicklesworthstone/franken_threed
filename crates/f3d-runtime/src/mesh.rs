@@ -36,10 +36,10 @@ use crate::frame::{FrameSession, RenderContext};
 use crate::gpu_host::{
     with_global_resource_table, GpuCommand, GpuSubmissionPacket, BUFFER_USAGE_COPY_DST,
     BUFFER_USAGE_MAP_READ, BUFFER_USAGE_UNIFORM, BUFFER_USAGE_VERTEX, CULL_MODE_BACK,
-    CULL_MODE_FRONT, CULL_MODE_NONE, DEPTH_COMPARE_ALWAYS, FRONT_FACE_CCW, FRONT_FACE_CW,
-    OPCODE_CREATE_PIPELINE_CULL, OPCODE_CREATE_PIPELINE_DEPTH_CULL, TARGET_FORMAT_DEPTH24PLUS,
-    TARGET_FORMAT_PREFERRED_CANVAS, TARGET_FORMAT_RGBA8UNORM, TEXTURE_USAGE_COPY_SRC,
-    TEXTURE_USAGE_RENDER_ATTACHMENT,
+    CULL_MODE_FRONT, CULL_MODE_NONE, DEPTH_COMPARE_ALWAYS, DEPTH_COMPARE_LESS, FRONT_FACE_CCW,
+    FRONT_FACE_CW, OPCODE_CREATE_PIPELINE_CULL, OPCODE_CREATE_PIPELINE_DEPTH_CULL,
+    TARGET_FORMAT_DEPTH24PLUS, TARGET_FORMAT_PREFERRED_CANVAS, TARGET_FORMAT_RGBA8UNORM,
+    TEXTURE_USAGE_COPY_SRC, TEXTURE_USAGE_RENDER_ATTACHMENT,
 };
 
 #[cfg(all(feature = "browser", target_arch = "wasm32"))]
@@ -60,12 +60,22 @@ pub enum MeshPacketError {
     InvalidColorLength { len: usize },
     /// Invalid depth comparison operator (must be 1..=8).
     InvalidDepthCompare { value: u32 },
+    /// Invalid depth test boolean code (must be 0 = false, 1 = true).
+    InvalidDepthTest { value: u8 },
+    /// Invalid depth write boolean code (must be 0 = false, 1 = true).
+    InvalidDepthWrite { value: u8 },
+    /// Array length mismatch for depth arrays in batch submission.
+    InvalidDepthArrayLength { name: &'static str, expected: usize, actual: usize },
     /// Invalid face culling mode code (must be 0 = None, 1 = Front, 2 = Back).
     InvalidCullMode { value: u8 },
     /// Invalid front face winding code (must be 0 = CCW, 1 = CW).
     InvalidFrontFace { value: u8 },
     /// Array length mismatch for culling arrays in batch submission.
     InvalidCullArrayLength { name: &'static str, expected: usize, actual: usize },
+    /// Invalid color write boolean code (must be 0 = false, 1 = true).
+    InvalidColorWrite { value: u8 },
+    /// Array length mismatch for color write array in batch submission.
+    InvalidColorWriteArrayLength { expected: usize, actual: usize },
     /// Target dimension alignment, vertex count, or row pitch calculation failed.
     InvalidDimensions(String),
     /// Render session, graph compilation, or plan lowering error.
@@ -104,6 +114,15 @@ impl fmt::Display for MeshPacketError {
             Self::InvalidDepthCompare { value } => {
                 write!(f, "depth compare function code must be between 1 and 8 (got {value})")
             }
+            Self::InvalidDepthTest { value } => {
+                write!(f, "depth test code must be 0 (false) or 1 (true) (got {value})")
+            }
+            Self::InvalidDepthWrite { value } => {
+                write!(f, "depth write code must be 0 (false) or 1 (true) (got {value})")
+            }
+            Self::InvalidDepthArrayLength { name, expected, actual } => {
+                write!(f, "{name} array length must match mesh count {expected} (got {actual})")
+            }
             Self::InvalidCullMode { value } => {
                 write!(f, "cull mode code must be between 0 and 2 (got {value})")
             }
@@ -112,6 +131,12 @@ impl fmt::Display for MeshPacketError {
             }
             Self::InvalidCullArrayLength { name, expected, actual } => {
                 write!(f, "{name} array length must match mesh count {expected} (got {actual})")
+            }
+            Self::InvalidColorWrite { value } => {
+                write!(f, "color write code must be 0 (false) or 1 (true) (got {value})")
+            }
+            Self::InvalidColorWriteArrayLength { expected, actual } => {
+                write!(f, "color_writes array length must match mesh count {expected} (got {actual})")
             }
             Self::InvalidDimensions(msg) => write!(f, "invalid dimensions: {msg}"),
             Self::SessionError(msg) => write!(f, "render session error: {msg}"),
@@ -174,6 +199,8 @@ pub struct DynamicMeshInput<'a> {
     height: u32,
     webgl_depth: bool,
     cull: Option<(u32, u32)>,
+    depth: Option<MeshDepthOptions>,
+    color_write: bool,
 }
 
 impl<'a> DynamicMeshInput<'a> {
@@ -249,6 +276,8 @@ impl<'a> DynamicMeshInput<'a> {
             height,
             webgl_depth,
             cull: None,
+            depth: None,
+            color_write: true,
         })
     }
 
@@ -262,6 +291,48 @@ impl<'a> DynamicMeshInput<'a> {
         }
         self.cull = Some((cull_mode, front_face));
         Ok(self)
+    }
+
+    /// Configures explicit depth testing and writing for this mesh.
+    ///
+    /// # Errors
+    /// Returns [`MeshPacketError::InvalidDepthCompare`] if `depth.depth_compare` is not in `1..=8`.
+    pub fn with_depth(mut self, depth: MeshDepthOptions) -> Result<Self, MeshPacketError> {
+        MeshDepthOptions::new(depth.depth_test, depth.depth_write, depth.depth_compare)?;
+        self.depth = Some(depth);
+        Ok(self)
+    }
+
+    /// Configures explicit depth testing and writing for this mesh with parameter validation.
+    pub fn with_depth_options(
+        mut self,
+        depth_test: bool,
+        depth_write: bool,
+        depth_compare: u32,
+    ) -> Result<Self, MeshPacketError> {
+        self.depth = Some(MeshDepthOptions::new(depth_test, depth_write, depth_compare)?);
+        Ok(self)
+    }
+
+    /// Returns the explicit depth testing and writing options if configured.
+    #[inline]
+    #[must_use]
+    pub fn depth(&self) -> Option<MeshDepthOptions> {
+        self.depth
+    }
+
+    /// Configures color channel write mask for this mesh (`true` = write color, `false` = depth-only occluder).
+    #[inline]
+    pub fn with_color_write(mut self, color_write: bool) -> Self {
+        self.color_write = color_write;
+        self
+    }
+
+    /// Returns whether color writes are enabled for this mesh (defaults to true).
+    #[inline]
+    #[must_use]
+    pub fn color_write(&self) -> bool {
+        self.color_write
     }
 
     /// Returns the explicit face culling and front-face winding if configured.
@@ -383,6 +454,26 @@ impl MeshDepthOptions {
             DEPTH_COMPARE_ALWAYS
         };
         (self.depth_write, effective_compare)
+    }
+}
+
+/// Maps effective depth testing/writing settings into a deterministic tag in `0..=15`.
+///
+/// Default WebGPU dynamic mesh depth `(depth_write_enabled = true, depth_compare = DEPTH_COMPARE_LESS (2))`
+/// is mapped to `0`, ensuring backward-compatible pipeline IDs matching legacy base pipeline IDs.
+/// Remaining 15 combinations of `(depth_write_enabled, depth_compare)` are bijectively mapped into `1..=15`.
+#[inline]
+#[must_use]
+fn compute_depth_tag(depth_write_enabled: bool, depth_compare: u32) -> u32 {
+    if depth_write_enabled && depth_compare == DEPTH_COMPARE_LESS {
+        0
+    } else {
+        let raw = (depth_write_enabled as u32) * 8 + (depth_compare.saturating_sub(1));
+        if raw < 9 {
+            raw + 1
+        } else {
+            raw
+        }
     }
 }
 
@@ -647,12 +738,40 @@ fn build_multi_mesh_submission_internal(
         .ok_or_else(|| MeshPacketError::InvalidDimensions("uniform buffer size exceeds u32::MAX".into()))?;
 
     let has_explicit_cull = inputs.iter().any(|i| i.cull().is_some());
-    let mut unique_culls: Vec<(u32, u32)> = Vec::new();
-    if has_explicit_cull {
+    let has_per_mesh_depth = inputs.iter().any(|i| i.depth().is_some());
+    let has_color_write_override = inputs.iter().any(|i| !i.color_write());
+    let has_depth = depth_opts.is_some()
+        || inputs.iter().any(|i| i.depth().map_or(false, |d| d.depth_test || d.depth_write));
+
+    let mut unique_pipeline_configs: Vec<(u32, u32, u32, bool, u32, u32)> = Vec::new();
+    let mut draw_pipeline_ids = Vec::with_capacity(inputs.len());
+
+    if has_explicit_cull || has_per_mesh_depth || has_color_write_override {
         for input in inputs {
-            let pair = input.cull().unwrap_or((CULL_MODE_NONE, FRONT_FACE_CCW));
-            if !unique_culls.contains(&pair) {
-                unique_culls.push(pair);
+            let (cull_mode, front_face) = input.cull().unwrap_or((CULL_MODE_NONE, FRONT_FACE_CCW));
+            let cull_tag = cull_mode * 2 + front_face;
+            let write_mask = if input.color_write() { 0xF } else { 0x0 };
+            let color_tag = if input.color_write() { 0 } else { 1 };
+            if has_depth {
+                let (depth_write_enabled, depth_compare) = if let Some(d) = input.depth().or(depth_opts) {
+                    d.resolve_effective()
+                } else {
+                    (false, DEPTH_COMPARE_ALWAYS)
+                };
+                let depth_tag = compute_depth_tag(depth_write_enabled, depth_compare);
+                let pipeline_id = MESH_PIPELINE_ID + cull_tag + depth_tag * 6 + color_tag * 96;
+                draw_pipeline_ids.push(pipeline_id);
+                let config = (pipeline_id, cull_mode, front_face, depth_write_enabled, depth_compare, write_mask);
+                if !unique_pipeline_configs.contains(&config) {
+                    unique_pipeline_configs.push(config);
+                }
+            } else {
+                let pipeline_id = MESH_PIPELINE_ID + cull_tag + color_tag * 96;
+                draw_pipeline_ids.push(pipeline_id);
+                let config = (pipeline_id, cull_mode, front_face, false, 0, write_mask);
+                if !unique_pipeline_configs.contains(&config) {
+                    unique_pipeline_configs.push(config);
+                }
             }
         }
     }
@@ -662,13 +781,13 @@ fn build_multi_mesh_submission_internal(
         table.register(MESH_UNIFORM_BUFFER_ID);
         table.register(MESH_VERTEX_BUFFER_ID);
         table.register(MESH_TARGET_TEXTURE_ID);
-        if depth_opts.is_some() {
+        if has_depth {
             table.register(MESH_DEPTH_TEXTURE_ID);
         }
         table.register(MESH_READBACK_BUFFER_ID);
-        if has_explicit_cull {
-            for &(cull_mode, front_face) in &unique_culls {
-                table.register(MESH_PIPELINE_ID + (cull_mode * 2 + front_face));
+        if has_explicit_cull || has_per_mesh_depth || has_color_write_override {
+            for &(pipeline_id, ..) in &unique_pipeline_configs {
+                table.register(pipeline_id);
             }
         } else {
             table.register(MESH_PIPELINE_ID);
@@ -704,7 +823,7 @@ fn build_multi_mesh_submission_internal(
         usage: TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC,
     });
 
-    if depth_opts.is_some() {
+    if has_depth {
         packet.push(GpuCommand::CreateTexture {
             texture_id: MESH_DEPTH_TEXTURE_ID,
             width: first.width,
@@ -721,37 +840,73 @@ fn build_multi_mesh_submission_internal(
     });
 
     let wgsl_code = generate_mesh_wgsl_internal(first.webgl_depth, false);
-    if has_explicit_cull {
-        for &(cull_mode, front_face) in &unique_culls {
-            let pipeline_id = MESH_PIPELINE_ID + (cull_mode * 2 + front_face);
-            if let Some(depth) = depth_opts {
-                let (depth_write_enabled, depth_compare) = depth.resolve_effective();
-                packet.push(GpuCommand::CreatePipelineDepthCull {
-                    pipeline_id,
-                    wgsl_code: wgsl_code.clone(),
-                    target_format: TARGET_FORMAT_RGBA8UNORM,
-                    has_vertex_buffer: true,
-                    has_uniform_buffer: true,
-                    uniform_size: 144,
-                    vertex_stride: vertex_stride_u32,
-                    depth_format: TARGET_FORMAT_DEPTH24PLUS,
-                    depth_write_enabled,
-                    depth_compare,
-                    cull_mode,
-                    front_face,
-                });
-            } else {
-                packet.push(GpuCommand::CreatePipelineCull {
-                    pipeline_id,
-                    wgsl_code: wgsl_code.clone(),
-                    target_format: TARGET_FORMAT_RGBA8UNORM,
-                    has_vertex_buffer: true,
-                    has_uniform_buffer: true,
-                    uniform_size: 144,
-                    vertex_stride: vertex_stride_u32,
-                    cull_mode,
-                    front_face,
-                });
+    if has_explicit_cull || has_per_mesh_depth || has_color_write_override {
+        if has_depth {
+            for &(pipeline_id, cull_mode, front_face, depth_write_enabled, depth_compare, write_mask) in &unique_pipeline_configs {
+                if write_mask != 0xF {
+                    packet.push(GpuCommand::CreatePipelineDepthCullColor {
+                        pipeline_id,
+                        wgsl_code: wgsl_code.clone(),
+                        target_format: TARGET_FORMAT_RGBA8UNORM,
+                        has_vertex_buffer: true,
+                        has_uniform_buffer: true,
+                        uniform_size: 144,
+                        vertex_stride: vertex_stride_u32,
+                        depth_format: TARGET_FORMAT_DEPTH24PLUS,
+                        depth_write_enabled,
+                        depth_compare,
+                        cull_mode,
+                        front_face,
+                        write_mask,
+                    });
+                } else {
+                    packet.push(GpuCommand::CreatePipelineDepthCull {
+                        pipeline_id,
+                        wgsl_code: wgsl_code.clone(),
+                        target_format: TARGET_FORMAT_RGBA8UNORM,
+                        has_vertex_buffer: true,
+                        has_uniform_buffer: true,
+                        uniform_size: 144,
+                        vertex_stride: vertex_stride_u32,
+                        depth_format: TARGET_FORMAT_DEPTH24PLUS,
+                        depth_write_enabled,
+                        depth_compare,
+                        cull_mode,
+                        front_face,
+                    });
+                }
+            }
+        } else {
+            for &(pipeline_id, cull_mode, front_face, _, _, write_mask) in &unique_pipeline_configs {
+                if write_mask != 0xF {
+                    packet.push(GpuCommand::CreatePipelineDepthCullColor {
+                        pipeline_id,
+                        wgsl_code: wgsl_code.clone(),
+                        target_format: TARGET_FORMAT_RGBA8UNORM,
+                        has_vertex_buffer: true,
+                        has_uniform_buffer: true,
+                        uniform_size: 144,
+                        vertex_stride: vertex_stride_u32,
+                        depth_format: TARGET_FORMAT_DEPTH24PLUS,
+                        depth_write_enabled: false,
+                        depth_compare: DEPTH_COMPARE_ALWAYS,
+                        cull_mode,
+                        front_face,
+                        write_mask,
+                    });
+                } else {
+                    packet.push(GpuCommand::CreatePipelineCull {
+                        pipeline_id,
+                        wgsl_code: wgsl_code.clone(),
+                        target_format: TARGET_FORMAT_RGBA8UNORM,
+                        has_vertex_buffer: true,
+                        has_uniform_buffer: true,
+                        uniform_size: 144,
+                        vertex_stride: vertex_stride_u32,
+                        cull_mode,
+                        front_face,
+                    });
+                }
             }
         }
     } else if let Some(depth) = depth_opts {
@@ -801,18 +956,19 @@ fn build_multi_mesh_submission_internal(
         mat_records.push(rec_mat);
     }
 
-    let depth_attachment = depth_opts.map(|_| {
-        DepthStencilAttachment::new_depth_clear(ResourceId::new(MESH_DEPTH_TEXTURE_ID), 1.0)
-    });
+    let depth_attachment = if has_depth {
+        Some(DepthStencilAttachment::new_depth_clear(ResourceId::new(MESH_DEPTH_TEXTURE_ID), 1.0))
+    } else {
+        None
+    };
 
     session
         .begin_render_pass_with_depth("mesh_render_pass", MESH_CLEAR_COLOR, depth_attachment)
         .map_err(|e| MeshPacketError::SessionError(alloc::format!("begin_render_pass_with_depth: {e:?}")))?;
 
     for (i, &(first_vertex, v_count)) in mesh_draw_ranges.iter().enumerate() {
-        let draw_pipeline_id = if has_explicit_cull {
-            let (cull_mode, front_face) = inputs[i].cull().unwrap_or((CULL_MODE_NONE, FRONT_FACE_CCW));
-            MESH_PIPELINE_ID + (cull_mode * 2 + front_face)
+        let draw_pipeline_id = if has_explicit_cull || has_per_mesh_depth || has_color_write_override {
+            draw_pipeline_ids[i]
         } else {
             MESH_PIPELINE_ID
         };
@@ -955,12 +1111,40 @@ fn build_multi_mesh_canvas_submission_internal(
         .ok_or_else(|| MeshPacketError::InvalidDimensions("uniform buffer size exceeds u32::MAX".into()))?;
 
     let has_explicit_cull = inputs.iter().any(|i| i.cull().is_some());
-    let mut unique_culls: Vec<(u32, u32)> = Vec::new();
-    if has_explicit_cull {
+    let has_per_mesh_depth = inputs.iter().any(|i| i.depth().is_some());
+    let has_color_write_override = inputs.iter().any(|i| !i.color_write());
+    let has_depth = depth_opts.is_some()
+        || inputs.iter().any(|i| i.depth().map_or(false, |d| d.depth_test || d.depth_write));
+
+    let mut unique_pipeline_configs: Vec<(u32, u32, u32, bool, u32, u32)> = Vec::new();
+    let mut draw_pipeline_ids = Vec::with_capacity(inputs.len());
+
+    if has_explicit_cull || has_per_mesh_depth || has_color_write_override {
         for input in inputs {
-            let pair = input.cull().unwrap_or((CULL_MODE_NONE, FRONT_FACE_CCW));
-            if !unique_culls.contains(&pair) {
-                unique_culls.push(pair);
+            let (cull_mode, front_face) = input.cull().unwrap_or((CULL_MODE_NONE, FRONT_FACE_CCW));
+            let cull_tag = cull_mode * 2 + front_face;
+            let write_mask = if input.color_write() { 0xF } else { 0x0 };
+            let color_tag = if input.color_write() { 0 } else { 1 };
+            if has_depth {
+                let (depth_write_enabled, depth_compare) = if let Some(d) = input.depth().or(depth_opts) {
+                    d.resolve_effective()
+                } else {
+                    (false, DEPTH_COMPARE_ALWAYS)
+                };
+                let depth_tag = compute_depth_tag(depth_write_enabled, depth_compare);
+                let pipeline_id = MESH_CANVAS_PIPELINE_ID + cull_tag + depth_tag * 6 + color_tag * 96;
+                draw_pipeline_ids.push(pipeline_id);
+                let config = (pipeline_id, cull_mode, front_face, depth_write_enabled, depth_compare, write_mask);
+                if !unique_pipeline_configs.contains(&config) {
+                    unique_pipeline_configs.push(config);
+                }
+            } else {
+                let pipeline_id = MESH_CANVAS_PIPELINE_ID + cull_tag + color_tag * 96;
+                draw_pipeline_ids.push(pipeline_id);
+                let config = (pipeline_id, cull_mode, front_face, false, 0, write_mask);
+                if !unique_pipeline_configs.contains(&config) {
+                    unique_pipeline_configs.push(config);
+                }
             }
         }
     }
@@ -970,12 +1154,12 @@ fn build_multi_mesh_canvas_submission_internal(
         table.register(MESH_UNIFORM_BUFFER_ID);
         table.register(MESH_VERTEX_BUFFER_ID);
         table.register(MESH_CANVAS_TARGET_ID);
-        if depth_opts.is_some() {
+        if has_depth {
             table.register(MESH_DEPTH_TEXTURE_ID);
         }
-        if has_explicit_cull {
-            for &(cull_mode, front_face) in &unique_culls {
-                table.register(MESH_CANVAS_PIPELINE_ID + (cull_mode * 2 + front_face));
+        if has_explicit_cull || has_per_mesh_depth || has_color_write_override {
+            for &(pipeline_id, ..) in &unique_pipeline_configs {
+                table.register(pipeline_id);
             }
         } else {
             table.register(MESH_CANVAS_PIPELINE_ID);
@@ -1003,7 +1187,7 @@ fn build_multi_mesh_canvas_submission_internal(
         data: vertex_upload_data,
     });
 
-    if depth_opts.is_some() {
+    if has_depth {
         packet.push(GpuCommand::CreateTexture {
             texture_id: MESH_DEPTH_TEXTURE_ID,
             width: first.width,
@@ -1014,37 +1198,73 @@ fn build_multi_mesh_canvas_submission_internal(
     }
 
     let wgsl_code = generate_mesh_wgsl_internal(first.webgl_depth, true);
-    if has_explicit_cull {
-        for &(cull_mode, front_face) in &unique_culls {
-            let pipeline_id = MESH_CANVAS_PIPELINE_ID + (cull_mode * 2 + front_face);
-            if let Some(depth) = depth_opts {
-                let (depth_write_enabled, depth_compare) = depth.resolve_effective();
-                packet.push(GpuCommand::CreatePipelineDepthCull {
-                    pipeline_id,
-                    wgsl_code: wgsl_code.clone(),
-                    target_format: TARGET_FORMAT_PREFERRED_CANVAS,
-                    has_vertex_buffer: true,
-                    has_uniform_buffer: true,
-                    uniform_size: 144,
-                    vertex_stride: vertex_stride_u32,
-                    depth_format: TARGET_FORMAT_DEPTH24PLUS,
-                    depth_write_enabled,
-                    depth_compare,
-                    cull_mode,
-                    front_face,
-                });
-            } else {
-                packet.push(GpuCommand::CreatePipelineCull {
-                    pipeline_id,
-                    wgsl_code: wgsl_code.clone(),
-                    target_format: TARGET_FORMAT_PREFERRED_CANVAS,
-                    has_vertex_buffer: true,
-                    has_uniform_buffer: true,
-                    uniform_size: 144,
-                    vertex_stride: vertex_stride_u32,
-                    cull_mode,
-                    front_face,
-                });
+    if has_explicit_cull || has_per_mesh_depth || has_color_write_override {
+        if has_depth {
+            for &(pipeline_id, cull_mode, front_face, depth_write_enabled, depth_compare, write_mask) in &unique_pipeline_configs {
+                if write_mask != 0xF {
+                    packet.push(GpuCommand::CreatePipelineDepthCullColor {
+                        pipeline_id,
+                        wgsl_code: wgsl_code.clone(),
+                        target_format: TARGET_FORMAT_PREFERRED_CANVAS,
+                        has_vertex_buffer: true,
+                        has_uniform_buffer: true,
+                        uniform_size: 144,
+                        vertex_stride: vertex_stride_u32,
+                        depth_format: TARGET_FORMAT_DEPTH24PLUS,
+                        depth_write_enabled,
+                        depth_compare,
+                        cull_mode,
+                        front_face,
+                        write_mask,
+                    });
+                } else {
+                    packet.push(GpuCommand::CreatePipelineDepthCull {
+                        pipeline_id,
+                        wgsl_code: wgsl_code.clone(),
+                        target_format: TARGET_FORMAT_PREFERRED_CANVAS,
+                        has_vertex_buffer: true,
+                        has_uniform_buffer: true,
+                        uniform_size: 144,
+                        vertex_stride: vertex_stride_u32,
+                        depth_format: TARGET_FORMAT_DEPTH24PLUS,
+                        depth_write_enabled,
+                        depth_compare,
+                        cull_mode,
+                        front_face,
+                    });
+                }
+            }
+        } else {
+            for &(pipeline_id, cull_mode, front_face, _, _, write_mask) in &unique_pipeline_configs {
+                if write_mask != 0xF {
+                    packet.push(GpuCommand::CreatePipelineDepthCullColor {
+                        pipeline_id,
+                        wgsl_code: wgsl_code.clone(),
+                        target_format: TARGET_FORMAT_PREFERRED_CANVAS,
+                        has_vertex_buffer: true,
+                        has_uniform_buffer: true,
+                        uniform_size: 144,
+                        vertex_stride: vertex_stride_u32,
+                        depth_format: TARGET_FORMAT_DEPTH24PLUS,
+                        depth_write_enabled: false,
+                        depth_compare: DEPTH_COMPARE_ALWAYS,
+                        cull_mode,
+                        front_face,
+                        write_mask,
+                    });
+                } else {
+                    packet.push(GpuCommand::CreatePipelineCull {
+                        pipeline_id,
+                        wgsl_code: wgsl_code.clone(),
+                        target_format: TARGET_FORMAT_PREFERRED_CANVAS,
+                        has_vertex_buffer: true,
+                        has_uniform_buffer: true,
+                        uniform_size: 144,
+                        vertex_stride: vertex_stride_u32,
+                        cull_mode,
+                        front_face,
+                    });
+                }
             }
         }
     } else if let Some(depth) = depth_opts {
@@ -1107,18 +1327,19 @@ fn build_multi_mesh_canvas_submission_internal(
         mat_records.push(rec_mat);
     }
 
-    let depth_attachment = depth_opts.map(|_| {
-        DepthStencilAttachment::new_depth_clear(ResourceId::new(MESH_DEPTH_TEXTURE_ID), 1.0)
-    });
+    let depth_attachment = if has_depth {
+        Some(DepthStencilAttachment::new_depth_clear(ResourceId::new(MESH_DEPTH_TEXTURE_ID), 1.0))
+    } else {
+        None
+    };
 
     session
         .begin_render_pass_with_depth("mesh_canvas_render_pass", MESH_CLEAR_COLOR, depth_attachment)
         .map_err(|e| MeshPacketError::SessionError(alloc::format!("begin_render_pass_with_depth: {e:?}")))?;
 
     for (i, &(first_vertex, v_count)) in mesh_draw_ranges.iter().enumerate() {
-        let draw_pipeline_id = if has_explicit_cull {
-            let (cull_mode, front_face) = inputs[i].cull().unwrap_or((CULL_MODE_NONE, FRONT_FACE_CCW));
-            MESH_CANVAS_PIPELINE_ID + (cull_mode * 2 + front_face)
+        let draw_pipeline_id = if has_explicit_cull || has_per_mesh_depth || has_color_write_override {
+            draw_pipeline_ids[i]
         } else {
             MESH_CANVAS_PIPELINE_ID
         };
@@ -1872,8 +2093,9 @@ pub fn f3d_build_mesh_batch_packet(
     .map_err(|e| e.to_string())
 }
 
-/// Encodes a batch of dynamic Three.js meshes with explicit face culling and front-face winding into a unified submission packet.
-pub fn build_mesh_batch_cull_packet_impl(
+/// Encodes a batch of dynamic Three.js meshes with explicit face culling, front-face winding,
+/// and per-mesh depth testing/writing into a unified submission packet.
+pub fn build_mesh_batch_cull_depth_packet_impl(
     positions: &[f32],
     vertex_counts: &[u32],
     model_views: &[f64],
@@ -1881,12 +2103,12 @@ pub fn build_mesh_batch_cull_packet_impl(
     colors: &[f32],
     cull_modes: &[u8],
     front_faces: &[u8],
+    depth_tests: &[u8],
+    depth_writes: &[u8],
+    depth_compares: &[u32],
     width: u32,
     height: u32,
     webgl_depth: bool,
-    depth_test: bool,
-    depth_write: bool,
-    depth_compare: u32,
     canvas: bool,
 ) -> Result<Vec<u8>, MeshPacketError> {
     let num_meshes = vertex_counts.len();
@@ -1928,6 +2150,33 @@ pub fn build_mesh_batch_cull_packet_impl(
             actual: front_faces.len(),
         });
     }
+    if depth_tests.len() != num_meshes {
+        return Err(MeshPacketError::InvalidDepthArrayLength {
+            name: "depth_tests",
+            expected: num_meshes,
+            actual: depth_tests.len(),
+        });
+    }
+    if depth_writes.len() != num_meshes {
+        return Err(MeshPacketError::InvalidDepthArrayLength {
+            name: "depth_writes",
+            expected: num_meshes,
+            actual: depth_writes.len(),
+        });
+    }
+    if depth_compares.len() != num_meshes {
+        return Err(MeshPacketError::InvalidDepthArrayLength {
+            name: "depth_compares",
+            expected: num_meshes,
+            actual: depth_compares.len(),
+        });
+    }
+    if color_writes.len() != num_meshes {
+        return Err(MeshPacketError::InvalidColorWriteArrayLength {
+            expected: num_meshes,
+            actual: color_writes.len(),
+        });
+    }
     for &cm in cull_modes {
         if cm > 2 {
             return Err(MeshPacketError::InvalidCullMode { value: cm });
@@ -1936,6 +2185,26 @@ pub fn build_mesh_batch_cull_packet_impl(
     for &ff in front_faces {
         if ff > 1 {
             return Err(MeshPacketError::InvalidFrontFace { value: ff });
+        }
+    }
+    for &dt in depth_tests {
+        if dt > 1 {
+            return Err(MeshPacketError::InvalidDepthTest { value: dt });
+        }
+    }
+    for &dw in depth_writes {
+        if dw > 1 {
+            return Err(MeshPacketError::InvalidDepthWrite { value: dw });
+        }
+    }
+    for &dc in depth_compares {
+        if !(1..=8).contains(&dc) {
+            return Err(MeshPacketError::InvalidDepthCompare { value: dc });
+        }
+    }
+    for &cw in color_writes {
+        if cw > 1 {
+            return Err(MeshPacketError::InvalidColorWrite { value: cw });
         }
     }
 
@@ -1972,28 +2241,104 @@ pub fn build_mesh_batch_cull_packet_impl(
             height,
             webgl_depth,
         )?
-        .with_cull(cull_modes[i] as u32, front_faces[i] as u32)?;
+        .with_cull(cull_modes[i] as u32, front_faces[i] as u32)?
+        .with_depth_options(depth_tests[i] != 0, depth_writes[i] != 0, depth_compares[i])?
+        .with_color_write(color_writes[i] != 0);
         inputs.push(input);
         current_v_offset += v_count;
     }
 
     let packet = if canvas {
-        if depth_test || depth_write {
-            build_multi_mesh_canvas_depth_submission(&inputs, depth_test, depth_write, depth_compare)?
-        } else {
-            build_multi_mesh_canvas_submission(&inputs)?
-        }
+        build_multi_mesh_canvas_submission_internal(&inputs, None)?
     } else {
-        if depth_test || depth_write {
-            build_multi_mesh_depth_submission(&inputs, depth_test, depth_write, depth_compare)?
-        } else {
-            build_multi_mesh_submission(&inputs)?
-        }
+        build_multi_mesh_submission_internal(&inputs, None)?
     };
 
     packet
         .encode()
         .map_err(|e| MeshPacketError::EncodeError(alloc::format!("{e:?}")))
+}
+
+/// Encodes a batch of dynamic Three.js meshes with explicit face culling, front-face winding, and per-mesh depth into a unified submission packet.
+pub fn build_mesh_batch_cull_depth_packet_impl(
+    positions: &[f32],
+    vertex_counts: &[u32],
+    model_views: &[f64],
+    projection: &[f64],
+    colors: &[f32],
+    cull_modes: &[u8],
+    front_faces: &[u8],
+    depth_tests: &[u8],
+    depth_writes: &[u8],
+    depth_compares: &[u32],
+    width: u32,
+    height: u32,
+    webgl_depth: bool,
+    canvas: bool,
+) -> Result<Vec<u8>, MeshPacketError> {
+    let color_writes = alloc::vec![1u8; vertex_counts.len()];
+    build_mesh_batch_cull_depth_color_packet_impl(
+        positions,
+        vertex_counts,
+        model_views,
+        projection,
+        colors,
+        cull_modes,
+        front_faces,
+        depth_tests,
+        depth_writes,
+        depth_compares,
+        &color_writes,
+        width,
+        height,
+        webgl_depth,
+        canvas,
+    )
+}
+
+/// Encodes a batch of dynamic Three.js meshes with explicit face culling and front-face winding into a unified submission packet.
+pub fn build_mesh_batch_cull_packet_impl(
+    positions: &[f32],
+    vertex_counts: &[u32],
+    model_views: &[f64],
+    projection: &[f64],
+    colors: &[f32],
+    cull_modes: &[u8],
+    front_faces: &[u8],
+    width: u32,
+    height: u32,
+    webgl_depth: bool,
+    depth_test: bool,
+    depth_write: bool,
+    depth_compare: u32,
+    canvas: bool,
+) -> Result<Vec<u8>, MeshPacketError> {
+    let num_meshes = vertex_counts.len();
+    let effective_compare = if !depth_test && !depth_write && !(1..=8).contains(&depth_compare) {
+        DEPTH_COMPARE_ALWAYS
+    } else {
+        depth_compare
+    };
+    let depth_tests = alloc::vec![if depth_test { 1u8 } else { 0u8 }; num_meshes];
+    let depth_writes = alloc::vec![if depth_write { 1u8 } else { 0u8 }; num_meshes];
+    let depth_compares = alloc::vec![effective_compare; num_meshes];
+
+    build_mesh_batch_cull_depth_packet_impl(
+        positions,
+        vertex_counts,
+        model_views,
+        projection,
+        colors,
+        cull_modes,
+        front_faces,
+        &depth_tests,
+        &depth_writes,
+        &depth_compares,
+        width,
+        height,
+        webgl_depth,
+        canvas,
+    )
 }
 
 #[cfg(all(feature = "browser", target_arch = "wasm32"))]
@@ -2034,6 +2379,84 @@ pub fn f3d_build_mesh_batch_cull_packet(
     .map_err(|e| wasm_bindgen::JsValue::from_str(&e.to_string()))
 }
 
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen]
+/// Encodes a batch of dynamic Three.js meshes with explicit face culling, front-face winding, and per-mesh depth into a unified submission packet (wasm-bindgen export).
+pub fn f3d_build_mesh_batch_cull_depth_packet(
+    positions: &[f32],
+    vertex_counts: &[u32],
+    model_views: &[f64],
+    projection: &[f64],
+    colors: &[f32],
+    cull_modes: &[u8],
+    front_faces: &[u8],
+    depth_tests: &[u8],
+    depth_writes: &[u8],
+    depth_compares: &[u32],
+    width: u32,
+    height: u32,
+    webgl_depth: bool,
+    canvas: bool,
+) -> Result<Vec<u8>, wasm_bindgen::JsValue> {
+    build_mesh_batch_cull_depth_packet_impl(
+        positions,
+        vertex_counts,
+        model_views,
+        projection,
+        colors,
+        cull_modes,
+        front_faces,
+        depth_tests,
+        depth_writes,
+        depth_compares,
+        width,
+        height,
+        webgl_depth,
+        canvas,
+    )
+    .map_err(|e| wasm_bindgen::JsValue::from_str(&e.to_string()))
+}
+
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen]
+/// Encodes a batch of dynamic Three.js meshes with explicit face culling, front-face winding, per-mesh depth, and per-mesh color write into a unified submission packet (wasm-bindgen export).
+pub fn f3d_build_mesh_batch_cull_depth_color_packet(
+    positions: &[f32],
+    vertex_counts: &[u32],
+    model_views: &[f64],
+    projection: &[f64],
+    colors: &[f32],
+    cull_modes: &[u8],
+    front_faces: &[u8],
+    depth_tests: &[u8],
+    depth_writes: &[u8],
+    depth_compares: &[u32],
+    color_writes: &[u8],
+    width: u32,
+    height: u32,
+    webgl_depth: bool,
+    canvas: bool,
+) -> Result<Vec<u8>, wasm_bindgen::JsValue> {
+    build_mesh_batch_cull_depth_color_packet_impl(
+        positions,
+        vertex_counts,
+        model_views,
+        projection,
+        colors,
+        cull_modes,
+        front_faces,
+        depth_tests,
+        depth_writes,
+        depth_compares,
+        color_writes,
+        width,
+        height,
+        webgl_depth,
+        canvas,
+    )
+    .map_err(|e| wasm_bindgen::JsValue::from_str(&e.to_string()))
+}
+
 #[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
 /// Encodes a batch of dynamic Three.js meshes with explicit face culling and front-face winding into a unified submission packet for host verification and unit tests.
 pub fn f3d_build_mesh_batch_cull_packet(
@@ -2066,6 +2489,82 @@ pub fn f3d_build_mesh_batch_cull_packet(
         depth_test,
         depth_write,
         depth_compare,
+        canvas,
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
+/// Encodes a batch of dynamic Three.js meshes with explicit face culling, front-face winding, and per-mesh depth into a unified submission packet for host verification and unit tests.
+pub fn f3d_build_mesh_batch_cull_depth_packet(
+    positions: &[f32],
+    vertex_counts: &[u32],
+    model_views: &[f64],
+    projection: &[f64],
+    colors: &[f32],
+    cull_modes: &[u8],
+    front_faces: &[u8],
+    depth_tests: &[u8],
+    depth_writes: &[u8],
+    depth_compares: &[u32],
+    width: u32,
+    height: u32,
+    webgl_depth: bool,
+    canvas: bool,
+) -> Result<Vec<u8>, String> {
+    build_mesh_batch_cull_depth_packet_impl(
+        positions,
+        vertex_counts,
+        model_views,
+        projection,
+        colors,
+        cull_modes,
+        front_faces,
+        depth_tests,
+        depth_writes,
+        depth_compares,
+        width,
+        height,
+        webgl_depth,
+        canvas,
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
+/// Encodes a batch of dynamic Three.js meshes with explicit face culling, front-face winding, per-mesh depth, and per-mesh color write into a unified submission packet for host verification and unit tests.
+pub fn f3d_build_mesh_batch_cull_depth_color_packet(
+    positions: &[f32],
+    vertex_counts: &[u32],
+    model_views: &[f64],
+    projection: &[f64],
+    colors: &[f32],
+    cull_modes: &[u8],
+    front_faces: &[u8],
+    depth_tests: &[u8],
+    depth_writes: &[u8],
+    depth_compares: &[u32],
+    color_writes: &[u8],
+    width: u32,
+    height: u32,
+    webgl_depth: bool,
+    canvas: bool,
+) -> Result<Vec<u8>, String> {
+    build_mesh_batch_cull_depth_color_packet_impl(
+        positions,
+        vertex_counts,
+        model_views,
+        projection,
+        colors,
+        cull_modes,
+        front_faces,
+        depth_tests,
+        depth_writes,
+        depth_compares,
+        color_writes,
+        width,
+        height,
+        webgl_depth,
         canvas,
     )
     .map_err(|e| e.to_string())

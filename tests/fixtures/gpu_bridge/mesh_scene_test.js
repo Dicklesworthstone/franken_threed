@@ -145,8 +145,14 @@ export async function directMeshReference(device, options) {
   });
 
   const pipelineCache = new Map();
-  const getPipeline = (cullMode = "none", frontFace = "ccw") => {
-    const key = `${cullMode}:${frontFace}`;
+  const getPipeline = (
+    cullMode = "none",
+    frontFace = "ccw",
+    itemDepthWriteEnabled = depthWriteEnabled,
+    itemDepthCompare = depthCompare,
+    itemWriteMask = 0xF
+  ) => {
+    const key = `${cullMode}:${frontFace}:${itemDepthWriteEnabled}:${itemDepthCompare}:${itemWriteMask}`;
     if (!pipelineCache.has(key)) {
       const p = device.createRenderPipeline({
         layout: pipelineLayout,
@@ -166,7 +172,7 @@ export async function directMeshReference(device, options) {
         fragment: {
           module: shaderModule,
           entryPoint: "fs_main",
-          targets: [{ format }],
+          targets: [{ format, writeMask: itemWriteMask }],
         },
         primitive: {
           topology: "triangle-list",
@@ -176,8 +182,8 @@ export async function directMeshReference(device, options) {
         depthStencil: hasDepth
           ? {
               format: depthFormat,
-              depthWriteEnabled,
-              depthCompare,
+              depthWriteEnabled: itemDepthWriteEnabled,
+              depthCompare: itemDepthCompare,
             }
           : undefined,
       });
@@ -242,6 +248,13 @@ export async function directMeshReference(device, options) {
 
     const itemCullMode = item.cullMode || options.cullMode || "none";
     const itemFrontFace = item.frontFace || options.frontFace || "ccw";
+    const itemDepthWriteEnabled = (item.depthWriteEnabled !== undefined)
+      ? item.depthWriteEnabled
+      : depthWriteEnabled;
+    const itemDepthCompare = item.depthCompare || depthCompare;
+    const itemWriteMask = (item.writeMask !== undefined)
+      ? item.writeMask
+      : (item.colorWrite === false ? 0x0 : (options.writeMask !== undefined ? options.writeMask : 0xF));
     preparedDraws.push({
       vertexBuffer: vBuffer,
       indexBuffer: iBuffer,
@@ -252,6 +265,9 @@ export async function directMeshReference(device, options) {
       indicesLength: itemIsIndexed ? itemIndices.length : 0,
       cullMode: itemCullMode,
       frontFace: itemFrontFace,
+      depthWriteEnabled: itemDepthWriteEnabled,
+      depthCompare: itemDepthCompare,
+      writeMask: itemWriteMask,
     });
   }
 
@@ -280,9 +296,9 @@ export async function directMeshReference(device, options) {
     const pass = encoder.beginRenderPass(passDesc);
     let currentPipelineKey = null;
     for (const draw of preparedDraws) {
-      const pipeKey = `${draw.cullMode}:${draw.frontFace}`;
+      const pipeKey = `${draw.cullMode}:${draw.frontFace}:${draw.depthWriteEnabled}:${draw.depthCompare}:${draw.writeMask}`;
       if (pipeKey !== currentPipelineKey) {
-        pass.setPipeline(getPipeline(draw.cullMode, draw.frontFace));
+        pass.setPipeline(getPipeline(draw.cullMode, draw.frontFace, draw.depthWriteEnabled, draw.depthCompare, draw.writeMask));
         currentPipelineKey = pipeKey;
       }
       pass.setBindGroup(0, draw.bindGroup);
@@ -353,7 +369,7 @@ export function nextFrame() {
  * Computes model-view matrix directly via camera.matrixWorldInverse.clone().multiply(mesh.matrixWorld).
  * Reads projection matrix and material directly from source objects.
  */
-function buildIndependentReferenceInput(mesh, camera, width = 64, height = 64) {
+function buildIndependentReferenceInput(mesh, camera, width = 64, height = 64, options = {}) {
   const posAttr = mesh.geometry.attributes.position;
   const vertexCount = posAttr.count;
   const positions = new Float32Array(vertexCount * 3);
@@ -407,6 +423,41 @@ function buildIndependentReferenceInput(mesh, camera, width = 64, height = 64) {
   const frontFace = flipSided ? "cw" : "ccw";
   const cullMode = (side === 2) ? "none" : "back";
 
+  // Material Depth Settings per pinned Three.js r186 semantics
+  const depthTest = (mat && mat.depthTest !== false);
+  const rawDepthWrite = (mat && mat.depthWrite !== false);
+  const rawDepthFunc = (mat && mat.depthFunc !== undefined) ? mat.depthFunc : 3; // 3 = LessEqualDepth
+
+  let depthWriteEnabled = rawDepthWrite;
+  if (!depthTest && rawDepthWrite) {
+    const backend = options?.sourceBackend?.toLowerCase();
+    if (backend === "webgl") {
+      depthWriteEnabled = false;
+    } else if (backend === "webgpu") {
+      depthWriteEnabled = true;
+    } else {
+      throw new Error("AMBIGUOUS_DEPTH_PAIR: Material with depthTest=false and depthWrite=true is ambiguous across backends; provide options.sourceBackend (\"webgl\" | \"webgpu\")");
+    }
+  }
+
+  const THREE_DEPTH_FUNC_TO_COMPARE_STRING = {
+    0: "never",
+    1: "always",
+    2: "less",
+    3: "less-equal",
+    4: "equal",
+    5: "greater-equal",
+    6: "greater",
+    7: "not-equal",
+  };
+
+  const depthCompare = depthTest
+    ? (THREE_DEPTH_FUNC_TO_COMPARE_STRING[rawDepthFunc] || "less")
+    : "always";
+
+  const colorWrite = (mat && mat.colorWrite !== false);
+  const writeMask = colorWrite ? 0xF : 0x0;
+
   return {
     positions,
     indices,
@@ -414,10 +465,15 @@ function buildIndependentReferenceInput(mesh, camera, width = 64, height = 64) {
     projection,
     webglDepth,
     color,
+    colorWrite,
+    writeMask,
     width,
     height,
     cullMode,
     frontFace,
+    depthTest,
+    depthWriteEnabled,
+    depthCompare,
   };
 }
 
@@ -427,7 +483,7 @@ function buildIndependentReferenceInput(mesh, camera, width = 64, height = 64) {
  */
 function buildIndependentBatchReferenceInput(meshes, camera, width = 64, height = 64, extraOptions = {}) {
   const draws = meshes.map((m) => {
-    const single = buildIndependentReferenceInput(m, camera, width, height);
+    const single = buildIndependentReferenceInput(m, camera, width, height, extraOptions);
     return {
       positions: single.positions,
       indices: single.indices,
@@ -435,9 +491,14 @@ function buildIndependentBatchReferenceInput(meshes, camera, width = 64, height 
       color: single.color,
       cullMode: single.cullMode,
       frontFace: single.frontFace,
+      depthTest: single.depthTest,
+      depthWriteEnabled: single.depthWriteEnabled,
+      depthCompare: single.depthCompare,
+      colorWrite: single.colorWrite,
+      writeMask: single.writeMask,
     };
   });
-  const first = buildIndependentReferenceInput(meshes[0], camera, width, height);
+  const first = buildIndependentReferenceInput(meshes[0], camera, width, height, extraOptions);
   return {
     draws,
     projection: first.projection,
@@ -1518,7 +1579,7 @@ export async function testMeshDepthScene(bridgeHost, wasmExports, canvasContext 
  * 4. Checkpoint 4: Proves immutable snapshots with distinct dynamic transforms and colors.
  * 5. Checkpoint 5: Negative controls / refusal testing:
  *    - 5a: Refusal of empty mesh batch (EMPTY_MESH_BATCH).
- *    - 5b: Refusal of incompatible shared depth settings across meshes (INCOMPATIBLE_BATCH_DEPTH).
+ *    - 5b: Legacy-export refusal of mixed depth settings (INCOMPATIBLE_BATCH_DEPTH).
  *    - 5c: Refusal of inadmissible mesh in batch with exact index.
  * 6. Checkpoint 6: Retained WebGLRenderer multi-mesh oracle parity.
  * 7. Checkpoint 7: Visible canvas multi-mesh batch presentation (when canvasContext is provided).
@@ -1980,7 +2041,12 @@ export async function testMultiMeshBatchScene(bridgeHost, wasmExports, canvasCon
     throw new Error("Checkpoint 5a failed: Empty mesh batch was not rejected with EMPTY_MESH_BATCH");
   }
 
-  // 5b: Refusal of incompatible shared depth settings across meshes
+  // 5b: Ambiguous settings still refuse; older exports still refuse mixed depth.
+  // These are real legacy functions, with the new capability deliberately absent.
+  const legacyDepthExports = {
+    f3d_build_mesh_batch_packet: wasmExports.f3d_build_mesh_batch_packet,
+    f3d_build_mesh_batch_cull_packet: wasmExports.f3d_build_mesh_batch_cull_packet,
+  };
   const meshIncompatA = meshNear.clone();
   meshIncompatA.material = matNear.clone();
   meshIncompatA.material.depthTest = true;
@@ -2010,14 +2076,14 @@ export async function testMultiMeshBatchScene(bridgeHost, wasmExports, canvasCon
   // 5b-2: Refusal of incompatible depthTest with explicit sourceBackend: 'webgpu'
   let depthTestMismatchRejected = false;
   try {
-    adapter.prepareMeshBatchPacket([meshIncompatA, meshIncompatB], camera, width, height, wasmExports, { sourceBackend: "webgpu" });
+    adapter.prepareMeshBatchPacket([meshIncompatA, meshIncompatB], camera, width, height, legacyDepthExports, { sourceBackend: "webgpu" });
   } catch (err) {
     const isDepthReason =
       err.reason === "INCOMPATIBLE_BATCH_DEPTH" ||
       err.message.includes("INCOMPATIBLE_BATCH_DEPTH") ||
       err.message.includes(adapter.ADMISSION_REJECTION?.INCOMPATIBLE_BATCH_DEPTH) ||
       err.message.includes("incompatible depth settings");
-    if (isDepthReason && err.message.includes("depthTest")) {
+    if (isDepthReason) {
       depthTestMismatchRejected = true;
     }
   }
@@ -2029,19 +2095,40 @@ export async function testMultiMeshBatchScene(bridgeHost, wasmExports, canvasCon
   meshIncompatB.material.depthWrite = false;
   let depthWriteMismatchRejected = false;
   try {
-    adapter.prepareMeshBatchPacket([meshIncompatA, meshIncompatB], camera, width, height, wasmExports);
+    adapter.prepareMeshBatchPacket([meshIncompatA, meshIncompatB], camera, width, height, legacyDepthExports);
   } catch (err) {
     const isDepthReason =
       err.reason === "INCOMPATIBLE_BATCH_DEPTH" ||
       err.message.includes("INCOMPATIBLE_BATCH_DEPTH") ||
       err.message.includes(adapter.ADMISSION_REJECTION?.INCOMPATIBLE_BATCH_DEPTH) ||
       err.message.includes("incompatible depth settings");
-    if (isDepthReason && err.message.includes("depthWrite")) {
+    if (isDepthReason) {
       depthWriteMismatchRejected = true;
     }
   }
   if (!depthWriteMismatchRejected) {
     throw new Error("Checkpoint 5b failed: Mismatched depthWrite was not rejected with INCOMPATIBLE_BATCH_DEPTH");
+  }
+
+  // 5b-3: Real wasmExports with f3d_build_mesh_batch_cull_depth_packet admits mixed depth
+  let newExportAdmitted = false;
+  try {
+    const admittedBatch = adapter.prepareMeshBatchPacket(
+      [meshIncompatA, meshIncompatB],
+      camera,
+      width,
+      height,
+      wasmExports,
+      { sourceBackend: "webgpu" }
+    );
+    if (admittedBatch && admittedBatch.packetBytes && admittedBatch.packetBytes.length > 0) {
+      newExportAdmitted = true;
+    }
+  } catch (err) {
+    newExportAdmitted = false;
+  }
+  if (!newExportAdmitted) {
+    throw new Error("Checkpoint 5b failed: Real wasmExports with cull_depth export must admit mixed depth settings");
   }
 
   // 5c: Refusal of inadmissible mesh in batch with exact index
@@ -2062,6 +2149,51 @@ export async function testMultiMeshBatchScene(bridgeHost, wasmExports, canvasCon
   }
   if (!invisibleRejected) {
     throw new Error("Checkpoint 5c failed: Inadmissible invisible mesh was not rejected with exact index 1 NOT_VISIBLE");
+  }
+
+  // 5d: Refusal of colorWrite=false on older exports lacking f3d_build_mesh_batch_cull_depth_color_packet
+  const legacyColorExports = {
+    f3d_build_mesh_batch_packet: wasmExports.f3d_build_mesh_batch_packet,
+    f3d_build_mesh_batch_cull_packet: wasmExports.f3d_build_mesh_batch_cull_packet,
+    f3d_build_mesh_batch_cull_depth_packet: wasmExports.f3d_build_mesh_batch_cull_depth_packet,
+  };
+  const meshOccluder5d = meshNear.clone();
+  meshOccluder5d.material = matNear.clone();
+  meshOccluder5d.material.colorWrite = false;
+  let colorWriteLegacyRejected = false;
+  try {
+    adapter.prepareMeshBatchPacket([meshOccluder5d], camera, width, height, legacyColorExports);
+  } catch (err) {
+    if (
+      err.reason === "INCOMPATIBLE_COLOR_WRITE" ||
+      err.message.includes("INCOMPATIBLE_COLOR_WRITE") ||
+      err.message.includes(adapter.ADMISSION_REJECTION?.INCOMPATIBLE_COLOR_WRITE)
+    ) {
+      colorWriteLegacyRejected = true;
+    }
+  }
+  if (!colorWriteLegacyRejected) {
+    throw new Error("Checkpoint 5d failed: colorWrite=false was not rejected with INCOMPATIBLE_COLOR_WRITE on legacy exports");
+  }
+
+  // 5d-2: Real wasmExports with f3d_build_mesh_batch_cull_depth_color_packet admits colorWrite=false
+  let colorWriteAdmitted = false;
+  try {
+    const admittedColorBatch = adapter.prepareMeshBatchPacket(
+      [meshOccluder5d],
+      camera,
+      width,
+      height,
+      wasmExports
+    );
+    if (admittedColorBatch && admittedColorBatch.packetBytes && admittedColorBatch.packetBytes.length > 0) {
+      colorWriteAdmitted = true;
+    }
+  } catch (err) {
+    colorWriteAdmitted = false;
+  }
+  if (!colorWriteAdmitted) {
+    throw new Error("Checkpoint 5d failed: Real wasmExports with cull_depth_color export must admit colorWrite=false");
   }
 
   // ---------------------------------------------------------------------------
@@ -2845,5 +2977,483 @@ export async function testMultiMeshBatchScene(bridgeHost, wasmExports, canvasCon
     throw new Error("Checkpoint 9d-4 failed: Mutated mesh frame 4 candidate differs from direct WebGPU reference");
   }
 
-  return "Variable-length multi-mesh batch verified (depth24plus): near-first/far-second with depthWrite=true produces near mesh (Green) matching independent direct WebGPU reference; near-first/far-second with depthWrite=false produces far mesh (Red) matching independent reference and strictly diverging from depthWrite=true; far-first/near-second with depthWrite=true produces near mesh (Green); immutable snapshots verified with distinct dynamic transforms and colors; negative controls strictly refuse empty batch (EMPTY_MESH_BATCH), mismatched depth settings (INCOMPATIBLE_BATCH_DEPTH), and invisible meshes; retained WebGLRenderer multi-mesh oracle matches candidate within tolerance" + (canvasContext ? "; visible canvas batch verified against direct reference" : "") + "; scene hierarchy renderScene verified with translated Group, legitimate culls ignored, positive canvas execution (3 admitted, projected center sRGB colors, depth24plus occlusion, planted negative), and separate visible-unsupported whole-scene refusal; material side culling and reflected winding verified (FrontSide/BackSide/DoubleSide, CCW/CW, reflected det<0 parity, mixed-side multi-mesh batch, dynamic mutation between frames matching direct WebGPU reference)";
+  // ---------------------------------------------------------------------------
+  // Checkpoint 10: Mixed per-mesh depth states in a single submission
+  // ---------------------------------------------------------------------------
+  const leftIdx10 = 32 * bytesPerRow + 12 * 4;
+  const rightIdx10 = 32 * bytesPerRow + 52 * 4;
+
+  const geomNearLeft10 = new THREE.BufferGeometry();
+  geomNearLeft10.setAttribute("position", new THREE.BufferAttribute(new Float32Array([
+    -1.5, -1.5, -2.0,
+    -0.3, -1.5, -2.0,
+    -0.6,  1.5, -2.0,
+  ]), 3));
+
+  const geomNearRight10 = new THREE.BufferGeometry();
+  geomNearRight10.setAttribute("position", new THREE.BufferAttribute(new Float32Array([
+    0.3, -1.5, -2.0,
+    1.5, -1.5, -2.0,
+    0.6,  1.5, -2.0,
+  ]), 3));
+
+  const geomFarLeft10 = new THREE.BufferGeometry();
+  geomFarLeft10.setAttribute("position", new THREE.BufferAttribute(new Float32Array([
+    -1.5, -1.5, -2.5,
+    -0.3, -1.5, -2.5,
+    -0.6,  1.5, -2.5,
+  ]), 3));
+
+  const geomFarRight10 = new THREE.BufferGeometry();
+  geomFarRight10.setAttribute("position", new THREE.BufferAttribute(new Float32Array([
+    0.3, -1.5, -2.5,
+    1.5, -1.5, -2.5,
+    0.6,  1.5, -2.5,
+  ]), 3));
+
+  const geomNearCenter10 = new THREE.BufferGeometry();
+  geomNearCenter10.setAttribute("position", new THREE.BufferAttribute(new Float32Array([
+    -0.5, -1.0, -2.0,
+     0.5, -1.0, -2.0,
+     0.0,  1.0, -2.0,
+  ]), 3));
+
+  const geomFarCenter10 = new THREE.BufferGeometry();
+  geomFarCenter10.setAttribute("position", new THREE.BufferAttribute(new Float32Array([
+    -0.5, -1.0, -2.5,
+     0.5, -1.0, -2.5,
+     0.0,  1.0, -2.5,
+  ]), 3));
+
+  const geomMiddleCenter10 = new THREE.BufferGeometry();
+  geomMiddleCenter10.setAttribute("position", new THREE.BufferAttribute(new Float32Array([
+    -0.5, -1.0, -2.25,
+     0.5, -1.0, -2.25,
+     0.0,  1.0, -2.25,
+  ]), 3));
+
+  // 10a: Mixed depthWrite (true vs false) in a single pass
+  // Near meshes at z = -2.0:
+  // - meshNearLeft: Blue, depthWrite = false, depthTest = true, LessDepth
+  // - meshNearRight: Red, depthWrite = true, depthTest = true, LessDepth
+  // Far meshes at z = -2.5:
+  // - meshFarLeft: Green, depthWrite = true, depthTest = true, LessDepth (passes against cleared depth -> overwrites Blue with Green)
+  // - meshFarRight: Green, depthWrite = true, depthTest = true, LessDepth (farther depth fails Less -> stays Red)
+  const meshNearLeft10a = new THREE.Mesh(geomNearLeft10, new THREE.MeshBasicMaterial({ color: 0x0000ff, side: THREE.FrontSide, depthTest: true, depthWrite: false, depthFunc: THREE.LessDepth }));
+  const meshNearRight10a = new THREE.Mesh(geomNearRight10, new THREE.MeshBasicMaterial({ color: 0xff0000, side: THREE.FrontSide, depthTest: true, depthWrite: true, depthFunc: THREE.LessDepth }));
+  const meshFarLeft10a = new THREE.Mesh(geomFarLeft10, new THREE.MeshBasicMaterial({ color: 0x00ff00, side: THREE.FrontSide, depthTest: true, depthWrite: true, depthFunc: THREE.LessDepth }));
+  const meshFarRight10a = new THREE.Mesh(geomFarRight10, new THREE.MeshBasicMaterial({ color: 0x00ff00, side: THREE.FrontSide, depthTest: true, depthWrite: true, depthFunc: THREE.LessDepth }));
+  meshNearLeft10a.updateMatrixWorld(true);
+  meshNearRight10a.updateMatrixWorld(true);
+  meshFarLeft10a.updateMatrixWorld(true);
+  meshFarRight10a.updateMatrixWorld(true);
+
+  const batch10a = [meshNearLeft10a, meshNearRight10a, meshFarLeft10a, meshFarRight10a];
+  await adapter.renderMeshBatch(bridgeHost, batch10a, camera, null, wasmExports, { width, height });
+  const cand10a = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+  const ref10a = await directMeshReference(device, buildIndependentBatchReferenceInput(batch10a, camera, width, height, { hasDepth: true, depthFormat: "depth24plus" }));
+
+  if (cand10a[leftIdx10 + 1] === 0 || cand10a[leftIdx10] !== 0 || cand10a[leftIdx10 + 2] !== 0) {
+    throw new Error(`Checkpoint 10a failed: Left must be overwritten to Green by far mesh when depthWrite=false, got [${cand10a[leftIdx10]}, ${cand10a[leftIdx10+1]}, ${cand10a[leftIdx10+2]}]`);
+  }
+  if (cand10a[rightIdx10] === 0 || cand10a[rightIdx10 + 1] !== 0 || cand10a[rightIdx10 + 2] !== 0) {
+    throw new Error(`Checkpoint 10a failed: Right must stay Red (far mesh occluded by near depthWrite=true), got [${cand10a[rightIdx10]}, ${cand10a[rightIdx10+1]}, ${cand10a[rightIdx10+2]}]`);
+  }
+  if (differs(cand10a, ref10a)) {
+    throw new Error("Checkpoint 10a failed: Mixed depthWrite candidate differs from direct WebGPU reference");
+  }
+
+  // 10b: Mixed depthFunc (LessDepth vs GreaterDepth) in a single pass
+  // Base meshes at z = -2.0:
+  // - meshBaseLeft: Red, depthWrite = true, depthTest = true, LessDepth
+  // - meshBaseRight: Red, depthWrite = true, depthTest = true, LessDepth
+  // Far meshes at z = -2.5:
+  // - meshFarLeft: Green, depthWrite = true, depthTest = true, LessDepth (farther depth fails Less -> stays Red)
+  // - meshFarRight: Blue, depthWrite = true, depthTest = true, GreaterDepth (farther depth passes Greater -> becomes Blue)
+  const meshBaseLeft10b = new THREE.Mesh(geomNearLeft10, new THREE.MeshBasicMaterial({ color: 0xff0000, side: THREE.FrontSide, depthTest: true, depthWrite: true, depthFunc: THREE.LessDepth }));
+  const meshBaseRight10b = new THREE.Mesh(geomNearRight10, new THREE.MeshBasicMaterial({ color: 0xff0000, side: THREE.FrontSide, depthTest: true, depthWrite: true, depthFunc: THREE.LessDepth }));
+  const meshFarLeft10b = new THREE.Mesh(geomFarLeft10, new THREE.MeshBasicMaterial({ color: 0x00ff00, side: THREE.FrontSide, depthTest: true, depthWrite: true, depthFunc: THREE.LessDepth }));
+  const meshFarRight10b = new THREE.Mesh(geomFarRight10, new THREE.MeshBasicMaterial({ color: 0x0000ff, side: THREE.FrontSide, depthTest: true, depthWrite: true, depthFunc: THREE.GreaterDepth }));
+  meshBaseLeft10b.updateMatrixWorld(true);
+  meshBaseRight10b.updateMatrixWorld(true);
+  meshFarLeft10b.updateMatrixWorld(true);
+  meshFarRight10b.updateMatrixWorld(true);
+
+  const batch10b = [meshBaseLeft10b, meshBaseRight10b, meshFarLeft10b, meshFarRight10b];
+  await adapter.renderMeshBatch(bridgeHost, batch10b, camera, null, wasmExports, { width, height });
+  const cand10b = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+  const ref10b = await directMeshReference(device, buildIndependentBatchReferenceInput(batch10b, camera, width, height, { hasDepth: true, depthFormat: "depth24plus" }));
+
+  if (cand10b[leftIdx10] === 0 || cand10b[leftIdx10 + 1] !== 0) {
+    throw new Error(`Checkpoint 10b failed: Left must stay Red under LessDepth, got [${cand10b[leftIdx10]}, ${cand10b[leftIdx10+1]}, ${cand10b[leftIdx10+2]}]`);
+  }
+  if (cand10b[rightIdx10 + 2] === 0 || cand10b[rightIdx10] !== 0) {
+    throw new Error(`Checkpoint 10b failed: Right must become Blue under GreaterDepth, got [${cand10b[rightIdx10]}, ${cand10b[rightIdx10+1]}, ${cand10b[rightIdx10+2]}]`);
+  }
+  if (differs(cand10b, ref10b)) {
+    throw new Error("Checkpoint 10b failed: Mixed depthFunc candidate differs from direct WebGPU reference");
+  }
+
+  // 10c: Interleaved disabled depth (depthTest = false -> compare: Always)
+  // Center:
+  // 1. Center base (z = -2.0): Green, depthTest = true, depthWrite = true, LessDepth
+  // 2. Center far (z = -2.5): Red, depthTest = false, depthWrite = false (Always passes, overwrites Green with Red)
+  // 3. Center middle (z = -2.25): Blue, LessDepth fails against the base at -2.
+  // Correct result is Red. An erroneous overlay depth write produces Blue;
+  // erroneously depth-testing the overlay leaves Green instead.
+  const meshBase10c = new THREE.Mesh(geomNearCenter10, new THREE.MeshBasicMaterial({ color: 0x00ff00, side: THREE.FrontSide, depthTest: true, depthWrite: true, depthFunc: THREE.LessDepth }));
+  const meshFar10c = new THREE.Mesh(geomFarCenter10, new THREE.MeshBasicMaterial({ color: 0xff0000, side: THREE.FrontSide, depthTest: false, depthWrite: false }));
+  const meshMiddle10c = new THREE.Mesh(geomMiddleCenter10, new THREE.MeshBasicMaterial({ color: 0x0000ff, side: THREE.FrontSide, depthTest: true, depthWrite: true, depthFunc: THREE.LessDepth }));
+  meshBase10c.updateMatrixWorld(true);
+  meshFar10c.updateMatrixWorld(true);
+  meshMiddle10c.updateMatrixWorld(true);
+
+  const batch10c = [meshBase10c, meshFar10c, meshMiddle10c];
+  await adapter.renderMeshBatch(bridgeHost, batch10c, camera, null, wasmExports, { width, height });
+  const cand10c = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+  const ref10c = await directMeshReference(device, buildIndependentBatchReferenceInput(batch10c, camera, width, height, { hasDepth: true, depthFormat: "depth24plus" }));
+
+  if (cand10c[centerIdx] < 240 || cand10c[centerIdx + 1] > 15 || cand10c[centerIdx + 2] > 15) {
+    throw new Error(`Checkpoint 10c failed: Center must stay Red (overlay did not write depth), got [${cand10c[centerIdx]}, ${cand10c[centerIdx+1]}, ${cand10c[centerIdx+2]}]`);
+  }
+  if (differs(cand10c, ref10c)) {
+    throw new Error("Checkpoint 10c failed: Interleaved disabled depth candidate differs from direct WebGPU reference");
+  }
+
+  // 10d: Side/Reflection mixed with Depth in a single batch
+  // - Left: FrontSide CCW, Blue, z = -2.0, depthWrite = true, LessDepth -> Visible Blue
+  // - Center: Reflected FrontSide CCW (scale.x = -1), Green, z = -2.0, depthWrite = false, LessDepth -> Visible Green
+  // - Right Foreground: BackSide CCW, Yellow (culled!), z = -1.5, depthWrite = true, LessDepth -> Culled
+  // - Right Background: FrontSide CCW, Red, z = -2.5, depthWrite = true, LessDepth -> Visible Red
+  const groupRefl10d = new THREE.Group();
+  groupRefl10d.scale.set(-1, 1, 1);
+  const meshCenter10d = new THREE.Mesh(geomNearCenter10, new THREE.MeshBasicMaterial({ color: 0x00ff00, side: THREE.FrontSide, depthTest: true, depthWrite: false, depthFunc: THREE.LessDepth }));
+  groupRefl10d.add(meshCenter10d);
+  groupRefl10d.updateMatrixWorld(true);
+
+  const meshLeft10d = new THREE.Mesh(geomNearLeft10, new THREE.MeshBasicMaterial({ color: 0x0000ff, side: THREE.FrontSide, depthTest: true, depthWrite: true, depthFunc: THREE.LessDepth }));
+  const meshRightFore10d = new THREE.Mesh(geomNearRight10, new THREE.MeshBasicMaterial({ color: 0xffff00, side: THREE.BackSide, depthTest: true, depthWrite: true, depthFunc: THREE.LessDepth }));
+  meshRightFore10d.position.set(0, 0, 0.5); // z = -1.5
+  const meshRightBack10d = new THREE.Mesh(geomFarRight10, new THREE.MeshBasicMaterial({ color: 0xff0000, side: THREE.FrontSide, depthTest: true, depthWrite: true, depthFunc: THREE.LessDepth }));
+  meshLeft10d.updateMatrixWorld(true);
+  meshRightFore10d.updateMatrixWorld(true);
+  meshRightBack10d.updateMatrixWorld(true);
+
+  const batch10d = [meshLeft10d, meshCenter10d, meshRightFore10d, meshRightBack10d];
+  await adapter.renderMeshBatch(bridgeHost, batch10d, camera, null, wasmExports, { width, height });
+  const cand10d = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+  const ref10d = await directMeshReference(device, buildIndependentBatchReferenceInput(batch10d, camera, width, height, { hasDepth: true, depthFormat: "depth24plus" }));
+
+  if (cand10d[leftIdx10 + 2] === 0 || cand10d[leftIdx10] !== 0) {
+    throw new Error(`Checkpoint 10d failed: Left must be Blue, got [${cand10d[leftIdx10]}, ${cand10d[leftIdx10+1]}, ${cand10d[leftIdx10+2]}]`);
+  }
+  if (cand10d[centerIdx + 1] === 0 || cand10d[centerIdx] !== 0) {
+    throw new Error(`Checkpoint 10d failed: Center must be Green (reflected FrontSide), got [${cand10d[centerIdx]}, ${cand10d[centerIdx+1]}, ${cand10d[centerIdx+2]}]`);
+  }
+  if (cand10d[rightIdx10] === 0 || cand10d[rightIdx10 + 1] !== 0) {
+    throw new Error(`Checkpoint 10d failed: Right must be Red (foreground Yellow culled), got [${cand10d[rightIdx10]}, ${cand10d[rightIdx10+1]}, ${cand10d[rightIdx10+2]}]`);
+  }
+  if (differs(cand10d, ref10d)) {
+    throw new Error("Checkpoint 10d failed: Side/reflection with depth candidate differs from direct WebGPU reference");
+  }
+
+  // 10e: Multi-frame material depth mutation
+  const baseMesh10e = new THREE.Mesh(geomNearCenter10, new THREE.MeshBasicMaterial({ color: 0x00ff00, side: THREE.FrontSide, depthTest: true, depthWrite: true, depthFunc: THREE.LessDepth }));
+  const mutMesh10e = new THREE.Mesh(geomFarCenter10, new THREE.MeshBasicMaterial({ color: 0xff0000, side: THREE.FrontSide, depthTest: true, depthWrite: true, depthFunc: THREE.LessDepth }));
+  baseMesh10e.updateMatrixWorld(true);
+  mutMesh10e.updateMatrixWorld(true);
+
+  // Frame 1: mutMesh at z = -2.5 with LessDepth is occluded by baseMesh at z = -2.0 -> Center stays Green
+  await adapter.renderMeshBatch(bridgeHost, [baseMesh10e, mutMesh10e], camera, null, wasmExports, { width, height });
+  const cand10e1 = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+  const ref10e1 = await directMeshReference(device, buildIndependentBatchReferenceInput([baseMesh10e, mutMesh10e], camera, width, height, { hasDepth: true, depthFormat: "depth24plus" }));
+  if (cand10e1[centerIdx + 1] === 0 || cand10e1[centerIdx] !== 0) {
+    throw new Error("Checkpoint 10e-1 failed: Frame 1 must stay Green (mutMesh occluded)");
+  }
+  if (differs(cand10e1, ref10e1)) {
+    throw new Error("Checkpoint 10e-1 failed: Frame 1 candidate differs from direct WebGPU reference");
+  }
+
+  // Frame 2: Mutate mutMesh to GreaterDepth -> passes test -> Center becomes Red
+  mutMesh10e.material.depthFunc = THREE.GreaterDepth;
+  mutMesh10e.material.needsUpdate = true;
+  await adapter.renderMeshBatch(bridgeHost, [baseMesh10e, mutMesh10e], camera, null, wasmExports, { width, height });
+  const cand10e2 = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+  const ref10e2 = await directMeshReference(device, buildIndependentBatchReferenceInput([baseMesh10e, mutMesh10e], camera, width, height, { hasDepth: true, depthFormat: "depth24plus" }));
+  if (cand10e2[centerIdx] === 0 || cand10e2[centerIdx + 1] !== 0) {
+    throw new Error("Checkpoint 10e-2 failed: Frame 2 (GreaterDepth) must become Red");
+  }
+  if (differs(cand10e2, ref10e2)) {
+    throw new Error("Checkpoint 10e-2 failed: Frame 2 candidate differs from direct WebGPU reference");
+  }
+
+  // Frame 3: Mutate mutMesh to depthTest=false -> compare: Always -> Center stays Red
+  mutMesh10e.material.depthFunc = THREE.LessDepth;
+  mutMesh10e.material.depthTest = false;
+  mutMesh10e.material.depthWrite = false;
+  mutMesh10e.material.needsUpdate = true;
+  await adapter.renderMeshBatch(bridgeHost, [baseMesh10e, mutMesh10e], camera, null, wasmExports, { width, height });
+  const cand10e3 = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+  const ref10e3 = await directMeshReference(device, buildIndependentBatchReferenceInput([baseMesh10e, mutMesh10e], camera, width, height, { hasDepth: true, depthFormat: "depth24plus" }));
+  if (cand10e3[centerIdx] === 0 || cand10e3[centerIdx + 1] !== 0) {
+    throw new Error("Checkpoint 10e-3 failed: Frame 3 (depthTest=false) must become Red");
+  }
+  if (differs(cand10e3, ref10e3)) {
+    throw new Error("Checkpoint 10e-3 failed: Frame 3 candidate differs from direct WebGPU reference");
+  }
+
+  // 10f: Scene entry with mixed depth, sampled from the actual canvas texture.
+  if (canvasContext) {
+    const scene10f = new THREE.Scene();
+    batch10a.forEach((mesh, i) => {
+      mesh.renderOrder = i;
+      scene10f.add(mesh);
+    });
+    const canvasFormat10f = navigator.gpu.getPreferredCanvasFormat();
+    canvasContext.configure({
+      device,
+      format: canvasFormat10f,
+      alphaMode: "opaque",
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+    });
+    await nextFrame();
+    const canvasReadback10f = device.createBuffer({
+      size: bytesPerRow * height,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+    const currentTexture10f = canvasContext.getCurrentTexture();
+    const render10f = adapter.renderScene(bridgeHost, scene10f, camera, canvasContext, wasmExports, { width, height, sourceBackend: "webgpu" });
+    const copy10f = device.createCommandEncoder();
+    copy10f.copyTextureToBuffer(
+      { texture: currentTexture10f },
+      { buffer: canvasReadback10f, bytesPerRow },
+      [width, height, 1]
+    );
+    device.queue.submit([copy10f.finish()]);
+    const result10f = await render10f;
+    if (result10f.admitted.length !== 4 || result10f.refused.length !== 0) {
+      throw new Error(`Checkpoint 10f failed: Mixed-depth scene refused: ${JSON.stringify(result10f)}`);
+    }
+    await canvasReadback10f.mapAsync(GPUMapMode.READ);
+    const cand10f = new Uint8Array(canvasReadback10f.getMappedRange().slice(0));
+    canvasReadback10f.unmap();
+    canvasReadback10f.destroy();
+    const ref10f = await directMeshReference(device, buildIndependentBatchReferenceInput(batch10a, camera, width, height, {
+      hasDepth: true, depthFormat: "depth24plus", format: canvasFormat10f, outputSrgb: true,
+    }));
+    const red10f = canvasFormat10f.startsWith("bgra") ? 2 : 0;
+    const blue10f = canvasFormat10f.startsWith("bgra") ? 0 : 2;
+    if (cand10f[leftIdx10 + 1] < 240 || cand10f[leftIdx10 + red10f] > 15 || cand10f[leftIdx10 + blue10f] > 15) {
+      throw new Error(`Checkpoint 10f failed: Canvas Left must be Green, got [${cand10f.slice(leftIdx10, leftIdx10 + 4)}]`);
+    }
+    if (cand10f[rightIdx10 + red10f] < 240 || cand10f[rightIdx10 + 1] > 15 || cand10f[rightIdx10 + blue10f] > 15) {
+      throw new Error(`Checkpoint 10f failed: Canvas Right must be Red, got [${cand10f.slice(rightIdx10, rightIdx10 + 4)}]`);
+    }
+    if (differs(cand10f, ref10f)) {
+      throw new Error("Checkpoint 10f failed: Canvas mixed depth candidate differs from direct WebGPU reference");
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Checkpoint 11: material.colorWrite=false (invisible depth occluders)
+  // ---------------------------------------------------------------------------
+  const geomOccluder11 = new THREE.BufferGeometry();
+  geomOccluder11.setAttribute("position", new THREE.BufferAttribute(new Float32Array([
+    -1.0, -1.0, -1.5,
+     1.0, -1.0, -1.5,
+     0.0,  1.0, -1.5,
+  ]), 3));
+
+  // 11a: Invisible near occluder (colorWrite=false, depthWrite=true)
+  // 1. Base mesh at z = -2.0: Red (0xff0000), depthWrite=true, depthTest=true, LessDepth
+  // 2. Occluder at z = -1.5: colorWrite=false, depthWrite=true, depthTest=true, LessDepth
+  //    (writes depth at -1.5, leaves framebuffer color Red)
+  // 3. Far mesh at z = -2.5: Green (0x00ff00), colorWrite=true, depthWrite=true, depthTest=true, LessDepth
+  //    (fails depth test against occluder's -1.5 -> rejected)
+  // Expected: Center pixel stays Red.
+  const meshBase11a = new THREE.Mesh(geomNearCenter10, new THREE.MeshBasicMaterial({ color: 0xff0000, side: THREE.FrontSide, depthTest: true, depthWrite: true, depthFunc: THREE.LessDepth }));
+  const meshOccluder11a = new THREE.Mesh(geomOccluder11, new THREE.MeshBasicMaterial({ color: 0x0000ff, colorWrite: false, side: THREE.FrontSide, depthTest: true, depthWrite: true, depthFunc: THREE.LessDepth }));
+  const meshFar11a = new THREE.Mesh(geomFarCenter10, new THREE.MeshBasicMaterial({ color: 0x00ff00, colorWrite: true, side: THREE.FrontSide, depthTest: true, depthWrite: true, depthFunc: THREE.LessDepth }));
+  meshBase11a.updateMatrixWorld(true);
+  meshOccluder11a.updateMatrixWorld(true);
+  meshFar11a.updateMatrixWorld(true);
+
+  const batch11a = [meshBase11a, meshOccluder11a, meshFar11a];
+  await adapter.renderMeshBatch(bridgeHost, batch11a, camera, null, wasmExports, { width, height });
+  const cand11a = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+  const ref11a = await directMeshReference(device, buildIndependentBatchReferenceInput(batch11a, camera, width, height, { hasDepth: true, depthFormat: "depth24plus" }));
+
+  if (cand11a[centerIdx] < 240 || cand11a[centerIdx + 1] > 15 || cand11a[centerIdx + 2] > 15) {
+    throw new Error(`Checkpoint 11a failed: Center must stay Red (near occluder with depthWrite=true occluded far Green), got [${cand11a[centerIdx]}, ${cand11a[centerIdx+1]}, ${cand11a[centerIdx+2]}]`);
+  }
+  if (differs(cand11a, ref11a)) {
+    throw new Error("Checkpoint 11a failed: Invisible occluder candidate differs from direct WebGPU reference");
+  }
+
+  // 11b: Same occluder with depthWrite=false allows far Green through
+  // 1. Base mesh at z = -2.0: Red, depthWrite=false, depthTest=true, LessDepth
+  // 2. Occluder at z = -1.5: colorWrite=false, depthWrite=false, depthTest=true, LessDepth
+  // 3. Far mesh at z = -2.5: Green, colorWrite=true, depthWrite=true, depthTest=true, LessDepth
+  //    (passes against clear depth -> overwrites to Green)
+  // Expected: Center pixel becomes Green.
+  const meshBase11b = new THREE.Mesh(geomNearCenter10, new THREE.MeshBasicMaterial({ color: 0xff0000, side: THREE.FrontSide, depthTest: true, depthWrite: false, depthFunc: THREE.LessDepth }));
+  const meshOccluder11b = new THREE.Mesh(geomOccluder11, new THREE.MeshBasicMaterial({ color: 0x0000ff, colorWrite: false, side: THREE.FrontSide, depthTest: true, depthWrite: false, depthFunc: THREE.LessDepth }));
+  const meshFar11b = new THREE.Mesh(geomFarCenter10, new THREE.MeshBasicMaterial({ color: 0x00ff00, colorWrite: true, side: THREE.FrontSide, depthTest: true, depthWrite: true, depthFunc: THREE.LessDepth }));
+  meshBase11b.updateMatrixWorld(true);
+  meshOccluder11b.updateMatrixWorld(true);
+  meshFar11b.updateMatrixWorld(true);
+
+  const batch11b = [meshBase11b, meshOccluder11b, meshFar11b];
+  await adapter.renderMeshBatch(bridgeHost, batch11b, camera, null, wasmExports, { width, height });
+  const cand11b = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+  const ref11b = await directMeshReference(device, buildIndependentBatchReferenceInput(batch11b, camera, width, height, { hasDepth: true, depthFormat: "depth24plus" }));
+
+  if (cand11b[centerIdx + 1] < 240 || cand11b[centerIdx] > 15 || cand11b[centerIdx + 2] > 15) {
+    throw new Error(`Checkpoint 11b failed: Center must become Green (depthWrite=false occluder allowed far Green), got [${cand11b[centerIdx]}, ${cand11b[centerIdx+1]}, ${cand11b[centerIdx+2]}]`);
+  }
+  if (differs(cand11b, ref11b)) {
+    throw new Error("Checkpoint 11b failed: Non-writing occluder candidate differs from direct WebGPU reference");
+  }
+
+  // 11c: Interleaved visible / invisible in a single batch (spatial multi-mesh)
+  // Left: Base Blue (z = -2.0, depthWrite=true), Occluder (z = -1.5, colorWrite=false, depthWrite=true), Far Yellow (z = -2.5, occluded) -> Left stays Blue
+  // Right: Base Red (z = -2.0, depthWrite=false), Occluder (z = -1.5, colorWrite=false, depthWrite=false), Far Green (z = -2.5, depthWrite=true) -> Right becomes Green
+  const geomOccluderLeft11 = new THREE.BufferGeometry();
+  geomOccluderLeft11.setAttribute("position", new THREE.BufferAttribute(new Float32Array([
+    -1.0, -1.0, -1.5,
+     0.0, -1.0, -1.5,
+    -0.5,  1.0, -1.5,
+  ]), 3));
+  const geomOccluderRight11 = new THREE.BufferGeometry();
+  geomOccluderRight11.setAttribute("position", new THREE.BufferAttribute(new Float32Array([
+     0.0, -1.0, -1.5,
+     1.0, -1.0, -1.5,
+     0.5,  1.0, -1.5,
+  ]), 3));
+
+  const meshLeftBase11c = new THREE.Mesh(geomNearLeft10, new THREE.MeshBasicMaterial({ color: 0x0000ff, side: THREE.FrontSide, depthTest: true, depthWrite: true, depthFunc: THREE.LessDepth }));
+  const meshLeftOcc11c = new THREE.Mesh(geomOccluderLeft11, new THREE.MeshBasicMaterial({ colorWrite: false, side: THREE.FrontSide, depthTest: true, depthWrite: true, depthFunc: THREE.LessDepth }));
+  const meshLeftFar11c = new THREE.Mesh(geomFarLeft10, new THREE.MeshBasicMaterial({ color: 0xffff00, side: THREE.FrontSide, depthTest: true, depthWrite: true, depthFunc: THREE.LessDepth }));
+
+  const meshRightBase11c = new THREE.Mesh(geomNearRight10, new THREE.MeshBasicMaterial({ color: 0xff0000, side: THREE.FrontSide, depthTest: true, depthWrite: false, depthFunc: THREE.LessDepth }));
+  const meshRightOcc11c = new THREE.Mesh(geomOccluderRight11, new THREE.MeshBasicMaterial({ colorWrite: false, side: THREE.FrontSide, depthTest: true, depthWrite: false, depthFunc: THREE.LessDepth }));
+  const meshRightFar11c = new THREE.Mesh(geomFarRight10, new THREE.MeshBasicMaterial({ color: 0x00ff00, side: THREE.FrontSide, depthTest: true, depthWrite: true, depthFunc: THREE.LessDepth }));
+
+  meshLeftBase11c.updateMatrixWorld(true);
+  meshLeftOcc11c.updateMatrixWorld(true);
+  meshLeftFar11c.updateMatrixWorld(true);
+  meshRightBase11c.updateMatrixWorld(true);
+  meshRightOcc11c.updateMatrixWorld(true);
+  meshRightFar11c.updateMatrixWorld(true);
+
+  const batch11c = [meshLeftBase11c, meshLeftOcc11c, meshLeftFar11c, meshRightBase11c, meshRightOcc11c, meshRightFar11c];
+  await adapter.renderMeshBatch(bridgeHost, batch11c, camera, null, wasmExports, { width, height });
+  const cand11c = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+  const ref11c = await directMeshReference(device, buildIndependentBatchReferenceInput(batch11c, camera, width, height, { hasDepth: true, depthFormat: "depth24plus" }));
+
+  if (cand11c[leftIdx10 + 2] < 240 || cand11c[leftIdx10] > 15 || cand11c[leftIdx10 + 1] > 15) {
+    throw new Error(`Checkpoint 11c failed: Left must stay Blue (occluder wrote depth), got [${cand11c[leftIdx10]}, ${cand11c[leftIdx10+1]}, ${cand11c[leftIdx10+2]}]`);
+  }
+  if (cand11c[rightIdx10 + 1] < 240 || cand11c[rightIdx10] > 15 || cand11c[rightIdx10 + 2] > 15) {
+    throw new Error(`Checkpoint 11c failed: Right must become Green (non-writing occluder), got [${cand11c[rightIdx10]}, ${cand11c[rightIdx10+1]}, ${cand11c[rightIdx10+2]}]`);
+  }
+  if (differs(cand11c, ref11c)) {
+    throw new Error("Checkpoint 11c failed: Interleaved visible/invisible batch candidate differs from direct WebGPU reference");
+  }
+
+  // 11d: Dynamic frame-to-frame colorWrite mutation
+  const baseMesh11d = new THREE.Mesh(geomNearCenter10, new THREE.MeshBasicMaterial({ color: 0xff0000, side: THREE.FrontSide, depthTest: true, depthWrite: true, depthFunc: THREE.LessDepth }));
+  const mutMesh11d = new THREE.Mesh(geomOccluder11, new THREE.MeshBasicMaterial({ color: 0x0000ff, colorWrite: false, side: THREE.FrontSide, depthTest: true, depthWrite: true, depthFunc: THREE.LessDepth }));
+  const farMesh11d = new THREE.Mesh(geomFarCenter10, new THREE.MeshBasicMaterial({ color: 0x00ff00, colorWrite: true, side: THREE.FrontSide, depthTest: true, depthWrite: true, depthFunc: THREE.LessDepth }));
+  baseMesh11d.updateMatrixWorld(true);
+  mutMesh11d.updateMatrixWorld(true);
+  farMesh11d.updateMatrixWorld(true);
+
+  // Frame 1: mutMesh has colorWrite=false, depthWrite=true -> Center stays Red
+  await adapter.renderMeshBatch(bridgeHost, [baseMesh11d, mutMesh11d, farMesh11d], camera, null, wasmExports, { width, height });
+  const cand11d1 = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+  const ref11d1 = await directMeshReference(device, buildIndependentBatchReferenceInput([baseMesh11d, mutMesh11d, farMesh11d], camera, width, height, { hasDepth: true, depthFormat: "depth24plus" }));
+  if (cand11d1[centerIdx] < 240 || cand11d1[centerIdx + 1] > 15 || cand11d1[centerIdx + 2] > 15) {
+    throw new Error("Checkpoint 11d-1 failed: Frame 1 must stay Red (colorWrite=false occluder)");
+  }
+  if (differs(cand11d1, ref11d1)) {
+    throw new Error("Checkpoint 11d-1 failed: Frame 1 candidate differs from direct WebGPU reference");
+  }
+
+  // Frame 2: Mutate mutMesh to colorWrite=true -> mutMesh writes Blue at -1.5 -> Center becomes Blue
+  mutMesh11d.material.colorWrite = true;
+  mutMesh11d.material.needsUpdate = true;
+  await adapter.renderMeshBatch(bridgeHost, [baseMesh11d, mutMesh11d, farMesh11d], camera, null, wasmExports, { width, height });
+  const cand11d2 = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+  const ref11d2 = await directMeshReference(device, buildIndependentBatchReferenceInput([baseMesh11d, mutMesh11d, farMesh11d], camera, width, height, { hasDepth: true, depthFormat: "depth24plus" }));
+  if (cand11d2[centerIdx + 2] < 240 || cand11d2[centerIdx] > 15 || cand11d2[centerIdx + 1] > 15) {
+    throw new Error(`Checkpoint 11d-2 failed: Frame 2 (mutated colorWrite=true) must become Blue, got [${cand11d2[centerIdx]}, ${cand11d2[centerIdx+1]}, ${cand11d2[centerIdx+2]}]`);
+  }
+  if (differs(cand11d2, ref11d2)) {
+    throw new Error("Checkpoint 11d-2 failed: Frame 2 candidate differs from direct WebGPU reference");
+  }
+
+  // Frame 3: Mutate mutMesh back to colorWrite=false -> Center stays Red
+  mutMesh11d.material.colorWrite = false;
+  mutMesh11d.material.needsUpdate = true;
+  await adapter.renderMeshBatch(bridgeHost, [baseMesh11d, mutMesh11d, farMesh11d], camera, null, wasmExports, { width, height });
+  const cand11d3 = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+  const ref11d3 = await directMeshReference(device, buildIndependentBatchReferenceInput([baseMesh11d, mutMesh11d, farMesh11d], camera, width, height, { hasDepth: true, depthFormat: "depth24plus" }));
+  if (cand11d3[centerIdx] < 240 || cand11d3[centerIdx + 1] > 15 || cand11d3[centerIdx + 2] > 15) {
+    throw new Error("Checkpoint 11d-3 failed: Frame 3 (mutated colorWrite=false) must stay Red");
+  }
+  if (differs(cand11d3, ref11d3)) {
+    throw new Error("Checkpoint 11d-3 failed: Frame 3 candidate differs from direct WebGPU reference");
+  }
+
+  // 11e: Canvas positive execution of colorWrite=false occluder via renderScene
+  if (canvasContext) {
+    const scene11e = new THREE.Scene();
+    batch11a.forEach((mesh, i) => {
+      mesh.renderOrder = i;
+      scene11e.add(mesh);
+    });
+    const canvasFormat11e = navigator.gpu.getPreferredCanvasFormat();
+    canvasContext.configure({
+      device,
+      format: canvasFormat11e,
+      alphaMode: "opaque",
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+    });
+    await nextFrame();
+    const canvasReadback11e = device.createBuffer({
+      size: bytesPerRow * height,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+    const currentTexture11e = canvasContext.getCurrentTexture();
+    const render11e = adapter.renderScene(bridgeHost, scene11e, camera, canvasContext, wasmExports, { width, height, sourceBackend: "webgpu" });
+    const copy11e = device.createCommandEncoder();
+    copy11e.copyTextureToBuffer(
+      { texture: currentTexture11e },
+      { buffer: canvasReadback11e, bytesPerRow },
+      [width, height, 1]
+    );
+    device.queue.submit([copy11e.finish()]);
+    const result11e = await render11e;
+    if (result11e.admitted.length !== 3 || result11e.refused.length !== 0) {
+      throw new Error(`Checkpoint 11e failed: Occluder scene refused: ${JSON.stringify(result11e)}`);
+    }
+    await canvasReadback11e.mapAsync(GPUMapMode.READ);
+    const cand11e = new Uint8Array(canvasReadback11e.getMappedRange().slice(0));
+    canvasReadback11e.unmap();
+    canvasReadback11e.destroy();
+    const ref11e = await directMeshReference(device, buildIndependentBatchReferenceInput(batch11a, camera, width, height, {
+      hasDepth: true, depthFormat: "depth24plus", format: canvasFormat11e, outputSrgb: true,
+    }));
+    const red11e = canvasFormat11e.startsWith("bgra") ? 2 : 0;
+    const blue11e = canvasFormat11e.startsWith("bgra") ? 0 : 2;
+    if (cand11e[centerIdx + red11e] < 240 || cand11e[centerIdx + 1] > 15 || cand11e[centerIdx + blue11e] > 15) {
+      throw new Error(`Checkpoint 11e failed: Canvas Center must stay Red, got [${cand11e.slice(centerIdx, centerIdx + 4)}]`);
+    }
+    if (differs(cand11e, ref11e)) {
+      throw new Error("Checkpoint 11e failed: Canvas occluder candidate differs from direct WebGPU reference");
+    }
+  }
+
+  return "Variable-length multi-mesh batch verified (depth24plus): near-first/far-second with depthWrite=true produces near mesh (Green) matching independent direct WebGPU reference; near-first/far-second with depthWrite=false produces far mesh (Red) matching independent reference and strictly diverging from depthWrite=true; far-first/near-second with depthWrite=true produces near mesh (Green); immutable snapshots verified with distinct dynamic transforms and colors; negative controls strictly refuse empty batch (EMPTY_MESH_BATCH), mixed depth settings on legacy exports (INCOMPATIBLE_BATCH_DEPTH), and invisible meshes; retained WebGLRenderer multi-mesh oracle matches candidate within tolerance" + (canvasContext ? "; visible canvas batch verified against direct reference" : "") + "; scene hierarchy renderScene verified with translated Group, legitimate culls ignored, positive canvas execution (3 admitted, projected center sRGB colors, depth24plus occlusion, planted negative), and separate visible-unsupported whole-scene refusal; material side culling and reflected winding verified (FrontSide/BackSide/DoubleSide, CCW/CW, reflected det<0 parity, mixed-side multi-mesh batch, dynamic mutation between frames matching direct WebGPU reference); mixed per-mesh depth states verified (depthWrite on/off, Less/Greater depthFunc, interleaved disabled depthTest, reflection with depth, multi-frame depth mutation, canvas renderScene mixed depth); colorWrite=false invisible depth occluders verified (depthWrite on/off occlusion, mixed visible/invisible batch, dynamic mutation between frames, direct WebGPU reference parity with writeMask, canvas execution)";
 }

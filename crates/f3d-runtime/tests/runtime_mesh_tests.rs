@@ -15,9 +15,11 @@ use f3d_runtime::frame::{FrameSession, RenderContext};
 use f3d_runtime::gpu_host::{
     GpuCommand, GpuSubmissionPacket, BUFFER_USAGE_COPY_DST, BUFFER_USAGE_MAP_READ,
     BUFFER_USAGE_UNIFORM, BUFFER_USAGE_VERTEX, CULL_MODE_BACK, CULL_MODE_FRONT,
-    CULL_MODE_NONE, DEPTH_COMPARE_ALWAYS, DEPTH_COMPARE_LESS, FRONT_FACE_CCW, FRONT_FACE_CW,
+    CULL_MODE_NONE, DEPTH_COMPARE_ALWAYS, DEPTH_COMPARE_GREATER, DEPTH_COMPARE_LESS,
+    FRONT_FACE_CCW, FRONT_FACE_CW,
     OPCODE_CREATE_PIPELINE, OPCODE_CREATE_PIPELINE_CULL, OPCODE_CREATE_PIPELINE_DEPTH,
-    OPCODE_CREATE_PIPELINE_DEPTH_CULL, TARGET_CANVAS, TARGET_FORMAT_DEPTH24PLUS,
+    OPCODE_CREATE_PIPELINE_DEPTH_CULL, OPCODE_CREATE_PIPELINE_DEPTH_CULL_COLOR,
+    TARGET_CANVAS, TARGET_FORMAT_DEPTH24PLUS,
     TARGET_FORMAT_PREFERRED_CANVAS, TARGET_FORMAT_RGBA8UNORM, TEXTURE_USAGE_COPY_SRC,
     TEXTURE_USAGE_RENDER_ATTACHMENT,
 };
@@ -27,7 +29,9 @@ use f3d_runtime::mesh::{
     build_multi_mesh_canvas_depth_submission, build_multi_mesh_canvas_submission,
     build_multi_mesh_depth_submission, build_multi_mesh_submission,
     f3d_build_canvas_mesh_depth_packet, f3d_build_canvas_mesh_packet,
-    f3d_build_mesh_batch_cull_packet, f3d_build_mesh_batch_packet,
+    f3d_build_mesh_batch_cull_depth_color_packet,
+    f3d_build_mesh_batch_cull_depth_packet, f3d_build_mesh_batch_cull_packet,
+    f3d_build_mesh_batch_packet,
     f3d_build_mesh_depth_packet, f3d_build_mesh_packet,
     generate_mesh_wgsl,
     gpu_bridge_build_canvas_mesh_depth_packet, gpu_bridge_build_canvas_mesh_packet,
@@ -2341,6 +2345,17 @@ struct ParsedPipelineDepthCull {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct DetailedPipelineDepthCull {
+    pipeline_id: u32,
+    target_format: u32,
+    depth_format: u32,
+    depth_write_enabled: bool,
+    depth_compare: u32,
+    cull_mode: u32,
+    front_face: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedDrawPass {
     opcode: u16,
     pipeline_id: u32,
@@ -2349,12 +2364,26 @@ struct ParsedDrawPass {
     dynamic_offset: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedPipelineDepthCullColor {
+    pipeline_id: u32,
+    target_format: u32,
+    depth_format: u32,
+    depth_write_enabled: bool,
+    depth_compare: u32,
+    cull_mode: u32,
+    front_face: u32,
+    write_mask: u32,
+}
+
 #[derive(Debug, Default)]
 struct ParsedPacketSummary {
     pipelines: Vec<u32>,
     depth_pipelines: Vec<u32>,
     cull_pipelines: Vec<ParsedPipelineCull>,
     depth_cull_pipelines: Vec<ParsedPipelineDepthCull>,
+    detailed_depth_cull_pipelines: Vec<DetailedPipelineDepthCull>,
+    depth_cull_color_pipelines: Vec<ParsedPipelineDepthCullColor>,
     draw_pipeline_ids: Vec<u32>,
     draw_passes: Vec<ParsedDrawPass>,
 }
@@ -2440,6 +2469,8 @@ fn scan_packet_commands(packet_bytes: &[u8]) -> ParsedPacketSummary {
                 let pid = u32::from_le_bytes(packet_bytes[cursor..cursor + 4].try_into().unwrap());
                 let target_format = u32::from_le_bytes(packet_bytes[cursor + 12..cursor + 16].try_into().unwrap());
                 let depth_format = u32::from_le_bytes(packet_bytes[cursor + 32..cursor + 36].try_into().unwrap());
+                let depth_write_enabled = u32::from_le_bytes(packet_bytes[cursor + 36..cursor + 40].try_into().unwrap()) == 1;
+                let depth_compare = u32::from_le_bytes(packet_bytes[cursor + 40..cursor + 44].try_into().unwrap());
                 let cm = u32::from_le_bytes(packet_bytes[cursor + 44..cursor + 48].try_into().unwrap());
                 let ff = u32::from_le_bytes(packet_bytes[cursor + 48..cursor + 52].try_into().unwrap());
                 summary.depth_cull_pipelines.push(ParsedPipelineDepthCull {
@@ -2449,7 +2480,37 @@ fn scan_packet_commands(packet_bytes: &[u8]) -> ParsedPacketSummary {
                     cull_mode: cm,
                     front_face: ff,
                 });
+                summary.detailed_depth_cull_pipelines.push(DetailedPipelineDepthCull {
+                    pipeline_id: pid,
+                    target_format,
+                    depth_format,
+                    depth_write_enabled,
+                    depth_compare,
+                    cull_mode: cm,
+                    front_face: ff,
+                });
                 cursor += 52;
+            }
+            OPCODE_CREATE_PIPELINE_DEPTH_CULL_COLOR => { // 16
+                let pid = u32::from_le_bytes(packet_bytes[cursor..cursor + 4].try_into().unwrap());
+                let target_format = u32::from_le_bytes(packet_bytes[cursor + 12..cursor + 16].try_into().unwrap());
+                let depth_format = u32::from_le_bytes(packet_bytes[cursor + 32..cursor + 36].try_into().unwrap());
+                let depth_write_enabled = u32::from_le_bytes(packet_bytes[cursor + 36..cursor + 40].try_into().unwrap()) == 1;
+                let depth_compare = u32::from_le_bytes(packet_bytes[cursor + 40..cursor + 44].try_into().unwrap());
+                let cm = u32::from_le_bytes(packet_bytes[cursor + 44..cursor + 48].try_into().unwrap());
+                let ff = u32::from_le_bytes(packet_bytes[cursor + 48..cursor + 52].try_into().unwrap());
+                let write_mask = u32::from_le_bytes(packet_bytes[cursor + 52..cursor + 56].try_into().unwrap());
+                summary.depth_cull_color_pipelines.push(ParsedPipelineDepthCullColor {
+                    pipeline_id: pid,
+                    target_format,
+                    depth_format,
+                    depth_write_enabled,
+                    depth_compare,
+                    cull_mode: cm,
+                    front_face: ff,
+                    write_mask,
+                });
+                cursor += 56;
             }
             other => panic!("scan_packet_commands: unexpected opcode {other} at cursor {cursor}"),
         }
@@ -2783,5 +2844,727 @@ fn test_mesh_batch_cull_mixed_side_pipeline_switch_sequence() {
         vertex_count: 3,
         dynamic_offset: 768,
     });
+}
+
+#[test]
+fn test_mesh_batch_cull_depth_mixed_write_single_pass() {
+    let mut positions = Vec::new();
+    for _ in 0..2 {
+        positions.extend_from_slice(&[0.0f32, 0.5, 0.0, -0.5, -0.5, 0.0, 0.5, -0.5, 0.0]);
+    }
+    let vertex_counts = [3u32, 3];
+    let mut model_views = Vec::new();
+    for _ in 0..2 {
+        model_views.extend_from_slice(&IDENTITY_F64);
+    }
+    let projection = IDENTITY_F64;
+    let colors = [
+        1.0f32, 0.0, 0.0, 1.0, // Red (opaque writer)
+        0.0, 1.0, 0.0, 0.5,    // Green (blended/no-write)
+    ];
+    let cull_modes = [0u8, 0];
+    let front_faces = [0u8, 0];
+    let depth_tests = [1u8, 1];
+    let depth_writes = [1u8, 0]; // Mixed: mesh 0 writes depth, mesh 1 does not
+    let depth_compares = [DEPTH_COMPARE_LESS, DEPTH_COMPARE_LESS];
+
+    let packet_bytes = f3d_build_mesh_batch_cull_depth_packet(
+        &positions,
+        &vertex_counts,
+        &model_views,
+        &projection,
+        &colors,
+        &cull_modes,
+        &front_faces,
+        &depth_tests,
+        &depth_writes,
+        &depth_compares,
+        64,
+        64,
+        false,
+        false,
+    )
+    .expect("mixed-write batch packet should build");
+
+    let summary = scan_packet_commands(&packet_bytes);
+
+    // 2 unique pipelines:
+    // Pipeline 100: DoubleSide, depth_write=true, compare=Less (tag 0) -> 100 + 0 + 0 = 100
+    // Pipeline 112: DoubleSide, depth_write=false, compare=Less (tag 2) -> 100 + 0 + 12 = 112
+    assert_eq!(summary.detailed_depth_cull_pipelines.len(), 2);
+    assert_eq!(summary.detailed_depth_cull_pipelines[0], DetailedPipelineDepthCull {
+        pipeline_id: 100,
+        target_format: TARGET_FORMAT_RGBA8UNORM,
+        depth_format: TARGET_FORMAT_DEPTH24PLUS,
+        depth_write_enabled: true,
+        depth_compare: DEPTH_COMPARE_LESS,
+        cull_mode: 0,
+        front_face: 0,
+    });
+    assert_eq!(summary.detailed_depth_cull_pipelines[1], DetailedPipelineDepthCull {
+        pipeline_id: 112,
+        target_format: TARGET_FORMAT_RGBA8UNORM,
+        depth_format: TARGET_FORMAT_DEPTH24PLUS,
+        depth_write_enabled: false,
+        depth_compare: DEPTH_COMPARE_LESS,
+        cull_mode: 0,
+        front_face: 0,
+    });
+
+    // Draws: Draw 0 -> 100 (pass open flag 1), Draw 1 -> 112 (pass retained flag 0)
+    assert_eq!(summary.draw_pipeline_ids, vec![100, 112]);
+    assert_eq!(summary.draw_passes.len(), 2);
+    assert_eq!(summary.draw_passes[0].pass_flags, 1);
+    assert_eq!(summary.draw_passes[1].pass_flags, 0);
+}
+
+#[test]
+fn test_mesh_batch_cull_depth_mixed_compare_single_pass() {
+    let mut positions = Vec::new();
+    for _ in 0..2 {
+        positions.extend_from_slice(&[0.0f32, 0.5, 0.0, -0.5, -0.5, 0.0, 0.5, -0.5, 0.0]);
+    }
+    let vertex_counts = [3u32, 3];
+    let mut model_views = Vec::new();
+    for _ in 0..2 {
+        model_views.extend_from_slice(&IDENTITY_F64);
+    }
+    let projection = IDENTITY_F64;
+    let colors = [
+        1.0f32, 0.0, 0.0, 1.0,
+        0.0, 0.0, 1.0, 1.0,
+    ];
+    let cull_modes = [0u8, 0];
+    let front_faces = [0u8, 0];
+    let depth_tests = [1u8, 1];
+    let depth_writes = [1u8, 1];
+    let depth_compares = [DEPTH_COMPARE_LESS, DEPTH_COMPARE_GREATER]; // Mixed compare functions
+
+    let packet_bytes = f3d_build_mesh_batch_cull_depth_packet(
+        &positions,
+        &vertex_counts,
+        &model_views,
+        &projection,
+        &colors,
+        &cull_modes,
+        &front_faces,
+        &depth_tests,
+        &depth_writes,
+        &depth_compares,
+        64,
+        64,
+        false,
+        false,
+    )
+    .expect("mixed-compare batch packet should build");
+
+    let summary = scan_packet_commands(&packet_bytes);
+
+    // Pipeline 100: DoubleSide, write=true, compare=Less (tag 0) -> 100 + 0 + 0 = 100
+    // Pipeline 172: DoubleSide, write=true, compare=Greater (tag 12) -> 100 + 0 + 12*6 = 172
+    assert_eq!(summary.detailed_depth_cull_pipelines.len(), 2);
+    assert_eq!(summary.detailed_depth_cull_pipelines[0].pipeline_id, 100);
+    assert_eq!(summary.detailed_depth_cull_pipelines[0].depth_compare, DEPTH_COMPARE_LESS);
+    assert_eq!(summary.detailed_depth_cull_pipelines[1].pipeline_id, 172);
+    assert_eq!(summary.detailed_depth_cull_pipelines[1].depth_compare, DEPTH_COMPARE_GREATER);
+
+    assert_eq!(summary.draw_pipeline_ids, vec![100, 172]);
+}
+
+#[test]
+fn test_mesh_batch_cull_depth_disabled_interleaving() {
+    let mut positions = Vec::new();
+    for _ in 0..3 {
+        positions.extend_from_slice(&[0.0f32, 0.5, 0.0, -0.5, -0.5, 0.0, 0.5, -0.5, 0.0]);
+    }
+    let vertex_counts = [3u32, 3, 3];
+    let mut model_views = Vec::new();
+    for _ in 0..3 {
+        model_views.extend_from_slice(&IDENTITY_F64);
+    }
+    let projection = IDENTITY_F64;
+    let colors = [
+        1.0f32, 0.0, 0.0, 1.0,
+        0.0, 1.0, 0.0, 1.0,
+        0.0, 0.0, 1.0, 1.0,
+    ];
+    let cull_modes = [0u8, 0, 0];
+    let front_faces = [0u8, 0, 0];
+    // Mesh 0: enabled, Mesh 1: disabled, Mesh 2: enabled (dedup with Mesh 0)
+    let depth_tests = [1u8, 0, 1];
+    let depth_writes = [1u8, 0, 1];
+    let depth_compares = [DEPTH_COMPARE_LESS, DEPTH_COMPARE_LESS, DEPTH_COMPARE_LESS];
+
+    let packet_bytes = f3d_build_mesh_batch_cull_depth_packet(
+        &positions,
+        &vertex_counts,
+        &model_views,
+        &projection,
+        &colors,
+        &cull_modes,
+        &front_faces,
+        &depth_tests,
+        &depth_writes,
+        &depth_compares,
+        64,
+        64,
+        false,
+        false,
+    )
+    .expect("disabled-interleaved batch packet should build");
+
+    let summary = scan_packet_commands(&packet_bytes);
+
+    // Mesh 1 has depth_test=0 -> resolves to (write=false, compare=ALWAYS)
+    // depth_tag for (false, ALWAYS=8) = 8.
+    // Pipeline ID = 100 + 0 + 8*6 = 148.
+    // Mesh 2 has same config as Mesh 0 -> pipeline 100 deduplicated.
+    assert_eq!(summary.detailed_depth_cull_pipelines.len(), 2);
+    assert_eq!(summary.detailed_depth_cull_pipelines[0].pipeline_id, 100);
+    assert_eq!(summary.detailed_depth_cull_pipelines[0].depth_compare, DEPTH_COMPARE_LESS);
+    assert_eq!(summary.detailed_depth_cull_pipelines[1].pipeline_id, 148);
+    assert_eq!(summary.detailed_depth_cull_pipelines[1].depth_compare, DEPTH_COMPARE_ALWAYS);
+    assert_eq!(summary.detailed_depth_cull_pipelines[1].depth_write_enabled, false);
+
+    assert_eq!(summary.draw_pipeline_ids, vec![100, 148, 100]);
+}
+
+#[test]
+fn test_mesh_batch_cull_depth_mixed_side_and_depth() {
+    let mut positions = Vec::new();
+    for _ in 0..4 {
+        positions.extend_from_slice(&[0.0f32, 0.5, 0.0, -0.5, -0.5, 0.0, 0.5, -0.5, 0.0]);
+    }
+    let vertex_counts = [3u32, 3, 3, 3];
+    let mut model_views = Vec::new();
+    for _ in 0..4 {
+        model_views.extend_from_slice(&IDENTITY_F64);
+    }
+    let projection = IDENTITY_F64;
+    let colors = [
+        1.0f32, 0.0, 0.0, 1.0,
+        0.0, 1.0, 0.0, 1.0,
+        0.0, 0.0, 1.0, 1.0,
+        1.0, 1.0, 0.0, 1.0,
+    ];
+    // Mesh 0: DoubleSide (0,0), write=true, compare=Less -> pipeline 100
+    // Mesh 1: FrontSide  (2,0), write=false, compare=Less (tag 2) -> 100 + 4 + 12 = 116
+    // Mesh 2: FrontSide  (2,0), write=false, compare=Less -> 116 (deduplicated!)
+    // Mesh 3: BackSide   (2,1), depth_test=0 -> write=false, compare=Always (tag 8) -> 100 + 5 + 48 = 153
+    let cull_modes = [0u8, 2, 2, 2];
+    let front_faces = [0u8, 0, 0, 1];
+    let depth_tests = [1u8, 1, 1, 0];
+    let depth_writes = [1u8, 0, 0, 0];
+    let depth_compares = [DEPTH_COMPARE_LESS, DEPTH_COMPARE_LESS, DEPTH_COMPARE_LESS, DEPTH_COMPARE_LESS];
+
+    let packet_bytes = f3d_build_mesh_batch_cull_depth_packet(
+        &positions,
+        &vertex_counts,
+        &model_views,
+        &projection,
+        &colors,
+        &cull_modes,
+        &front_faces,
+        &depth_tests,
+        &depth_writes,
+        &depth_compares,
+        64,
+        64,
+        false,
+        false,
+    )
+    .expect("mixed side and depth packet should build");
+
+    let summary = scan_packet_commands(&packet_bytes);
+
+    assert_eq!(summary.detailed_depth_cull_pipelines.len(), 3);
+    assert_eq!(summary.detailed_depth_cull_pipelines[0].pipeline_id, 100);
+    assert_eq!(summary.detailed_depth_cull_pipelines[1].pipeline_id, 116);
+    assert_eq!(summary.detailed_depth_cull_pipelines[2].pipeline_id, 153);
+
+    assert_eq!(summary.draw_pipeline_ids, vec![100, 116, 116, 153]);
+}
+
+#[test]
+fn test_mesh_batch_cull_depth_canvas() {
+    let mut positions = Vec::new();
+    for _ in 0..2 {
+        positions.extend_from_slice(&[0.0f32, 0.5, 0.0, -0.5, -0.5, 0.0, 0.5, -0.5, 0.0]);
+    }
+    let vertex_counts = [3u32, 3];
+    let mut model_views = Vec::new();
+    for _ in 0..2 {
+        model_views.extend_from_slice(&IDENTITY_F64);
+    }
+    let projection = IDENTITY_F64;
+    let colors = [
+        1.0f32, 0.0, 0.0, 1.0,
+        0.0, 1.0, 0.0, 1.0,
+    ];
+    let cull_modes = [0u8, 2];
+    let front_faces = [0u8, 0];
+    let depth_tests = [1u8, 1];
+    let depth_writes = [1u8, 0];
+    let depth_compares = [DEPTH_COMPARE_LESS, DEPTH_COMPARE_LESS];
+
+    let packet_bytes = f3d_build_mesh_batch_cull_depth_packet(
+        &positions,
+        &vertex_counts,
+        &model_views,
+        &projection,
+        &colors,
+        &cull_modes,
+        &front_faces,
+        &depth_tests,
+        &depth_writes,
+        &depth_compares,
+        64,
+        64,
+        false,
+        true, // canvas = true
+    )
+    .expect("canvas mixed depth batch packet should build");
+
+    let summary = scan_packet_commands(&packet_bytes);
+
+    // Canvas base ID = 101
+    // Mesh 0: 101 + 0 + 0 = 101
+    // Mesh 1: 101 + 4 + 12 = 117
+    assert_eq!(summary.detailed_depth_cull_pipelines.len(), 2);
+    assert_eq!(summary.detailed_depth_cull_pipelines[0].pipeline_id, 101);
+    assert_eq!(summary.detailed_depth_cull_pipelines[0].target_format, TARGET_FORMAT_PREFERRED_CANVAS);
+    assert_eq!(summary.detailed_depth_cull_pipelines[1].pipeline_id, 117);
+    assert_eq!(summary.detailed_depth_cull_pipelines[1].target_format, TARGET_FORMAT_PREFERRED_CANVAS);
+
+    assert_eq!(summary.draw_pipeline_ids, vec![101, 117]);
+}
+
+#[test]
+fn test_mesh_batch_cull_depth_all_disabled_emits_opcode_14() {
+    let mut positions = Vec::new();
+    for _ in 0..2 {
+        positions.extend_from_slice(&[0.0f32, 0.5, 0.0, -0.5, -0.5, 0.0, 0.5, -0.5, 0.0]);
+    }
+    let vertex_counts = [3u32, 3];
+    let mut model_views = Vec::new();
+    for _ in 0..2 {
+        model_views.extend_from_slice(&IDENTITY_F64);
+    }
+    let projection = IDENTITY_F64;
+    let colors = [
+        1.0f32, 0.0, 0.0, 1.0,
+        0.0, 1.0, 0.0, 1.0,
+    ];
+    let cull_modes = [0u8, 2];
+    let front_faces = [0u8, 0];
+    let depth_tests = [0u8, 0];  // Both disabled
+    let depth_writes = [0u8, 0]; // Both disabled
+    let depth_compares = [DEPTH_COMPARE_ALWAYS, DEPTH_COMPARE_ALWAYS];
+
+    let packet_bytes = f3d_build_mesh_batch_cull_depth_packet(
+        &positions,
+        &vertex_counts,
+        &model_views,
+        &projection,
+        &colors,
+        &cull_modes,
+        &front_faces,
+        &depth_tests,
+        &depth_writes,
+        &depth_compares,
+        64,
+        64,
+        false,
+        false,
+    )
+    .expect("all disabled depth batch should build");
+
+    let summary = scan_packet_commands(&packet_bytes);
+
+    // Since has_depth is false, OPCODE_CREATE_PIPELINE_CULL (14) must be emitted, NOT depth pipelines
+    assert_eq!(summary.cull_pipelines.len(), 2);
+    assert_eq!(summary.depth_cull_pipelines.len(), 0);
+    assert_eq!(summary.depth_pipelines.len(), 0);
+    assert_eq!(summary.draw_pipeline_ids, vec![100, 104]);
+}
+
+#[test]
+fn test_mesh_batch_cull_depth_validation_errors() {
+    let positions = [0.0f32, 0.5, 0.0, -0.5, -0.5, 0.0, 0.5, -0.5, 0.0];
+    let vertex_counts = [3u32];
+    let model_views = IDENTITY_F64;
+    let projection = IDENTITY_F64;
+    let colors = [1.0f32, 0.0, 0.0, 1.0];
+    let cull_modes = [0u8];
+    let front_faces = [0u8];
+    let depth_tests = [1u8];
+    let depth_writes = [1u8];
+    let depth_compares = [DEPTH_COMPARE_LESS];
+
+    // 1. Mismatched depth_tests length
+    let err = f3d_build_mesh_batch_cull_depth_packet(
+        &positions, &vertex_counts, &model_views, &projection, &colors,
+        &cull_modes, &front_faces,
+        &[1u8, 0u8], &depth_writes, &depth_compares,
+        64, 64, false, false,
+    ).unwrap_err();
+    assert!(err.contains("depth_tests array length must match mesh count 1 (got 2)"));
+
+    // 2. Mismatched depth_writes length
+    let err = f3d_build_mesh_batch_cull_depth_packet(
+        &positions, &vertex_counts, &model_views, &projection, &colors,
+        &cull_modes, &front_faces,
+        &depth_tests, &[], &depth_compares,
+        64, 64, false, false,
+    ).unwrap_err();
+    assert!(err.contains("depth_writes array length must match mesh count 1 (got 0)"));
+
+    // 3. Mismatched depth_compares length
+    let err = f3d_build_mesh_batch_cull_depth_packet(
+        &positions, &vertex_counts, &model_views, &projection, &colors,
+        &cull_modes, &front_faces,
+        &depth_tests, &depth_writes, &[DEPTH_COMPARE_LESS, DEPTH_COMPARE_LESS],
+        64, 64, false, false,
+    ).unwrap_err();
+    assert!(err.contains("depth_compares array length must match mesh count 1 (got 2)"));
+
+    // 4. Invalid depth_test code (2)
+    let err = f3d_build_mesh_batch_cull_depth_packet(
+        &positions, &vertex_counts, &model_views, &projection, &colors,
+        &cull_modes, &front_faces,
+        &[2u8], &depth_writes, &depth_compares,
+        64, 64, false, false,
+    ).unwrap_err();
+    assert!(err.contains("depth test code must be 0 (false) or 1 (true) (got 2)"));
+
+    // 5. Invalid depth_write code (3)
+    let err = f3d_build_mesh_batch_cull_depth_packet(
+        &positions, &vertex_counts, &model_views, &projection, &colors,
+        &cull_modes, &front_faces,
+        &depth_tests, &[3u8], &depth_compares,
+        64, 64, false, false,
+    ).unwrap_err();
+    assert!(err.contains("depth write code must be 0 (false) or 1 (true) (got 3)"));
+
+    // 6. Invalid depth_compare code (0)
+    let err = f3d_build_mesh_batch_cull_depth_packet(
+        &positions, &vertex_counts, &model_views, &projection, &colors,
+        &cull_modes, &front_faces,
+        &depth_tests, &depth_writes, &[0u32],
+        64, 64, false, false,
+    ).unwrap_err();
+    assert!(err.contains("depth compare function code must be between 1 and 8 (got 0)"));
+
+    // 7. Invalid depth_compare code (9)
+    let err = f3d_build_mesh_batch_cull_depth_packet(
+        &positions, &vertex_counts, &model_views, &projection, &colors,
+        &cull_modes, &front_faces,
+        &depth_tests, &depth_writes, &[9u32],
+        64, 64, false, false,
+    ).unwrap_err();
+    assert!(err.contains("depth compare function code must be between 1 and 8 (got 9)"));
+}
+
+#[test]
+fn test_dynamic_mesh_input_with_depth_validates_raw_struct() {
+    let positions = [0.0f32, 0.5, 0.0, -0.5, -0.5, 0.0, 0.5, -0.5, 0.0];
+    let indices: [u32; 0] = [];
+    let mesh = DynamicMeshInput::try_from_raw(
+        &positions,
+        &indices,
+        &IDENTITY_F64,
+        &IDENTITY_F64,
+        &[1.0, 0.0, 0.0, 1.0],
+        64,
+        64,
+        false,
+    )
+    .expect("valid mesh input");
+
+    // Invalid depth compare code (u32::MAX) bypass via raw struct must be rejected
+    let raw_invalid = MeshDepthOptions {
+        depth_test: true,
+        depth_write: false,
+        depth_compare: u32::MAX,
+    };
+    let err = mesh.clone().with_depth(raw_invalid).unwrap_err();
+    assert!(matches!(err, MeshPacketError::InvalidDepthCompare { value } if value == u32::MAX));
+
+    // Valid raw struct succeeds
+    let raw_valid = MeshDepthOptions {
+        depth_test: true,
+        depth_write: true,
+        depth_compare: DEPTH_COMPARE_LESS,
+    };
+    let configured = mesh.with_depth(raw_valid).expect("valid depth options accepted");
+    assert_eq!(configured.depth(), Some(raw_valid));
+}
+
+#[test]
+fn test_opcode_16_create_pipeline_depth_cull_color_binary_layout() {
+    use f3d_runtime::gpu_host::GpuCommand;
+
+    let mut packet = f3d_runtime::gpu_host::GpuSubmissionPacket::new();
+    let wgsl = "@vertex fn vs() -> @builtin(position) vec4f { return vec4f(0); }\n@fragment fn fs() -> @location(0) vec4f { return vec4f(1); }";
+    packet.push(GpuCommand::CreatePipelineDepthCullColor {
+        pipeline_id: 196,
+        wgsl_code: wgsl.to_string(),
+        target_format: TARGET_FORMAT_RGBA8UNORM,
+        has_vertex_buffer: true,
+        has_uniform_buffer: true,
+        uniform_size: 144,
+        vertex_stride: 20,
+        depth_format: TARGET_FORMAT_DEPTH24PLUS,
+        depth_write_enabled: true,
+        depth_compare: DEPTH_COMPARE_LESS,
+        cull_mode: CULL_MODE_NONE,
+        front_face: FRONT_FACE_CCW,
+        write_mask: 0x0,
+    });
+
+    let encoded = packet.encode().expect("encoding CreatePipelineDepthCullColor");
+    assert_eq!(&encoded[0..4], b"F3DP");
+    let cmd_count = u32::from_le_bytes(encoded[8..12].try_into().unwrap());
+    assert_eq!(cmd_count, 1);
+
+    // Opcode at offset 16 is u16 = 16
+    let op = u16::from_le_bytes(encoded[16..18].try_into().unwrap());
+    assert_eq!(op, OPCODE_CREATE_PIPELINE_DEPTH_CULL_COLOR);
+
+    // Payload length is exactly 56 bytes:
+    // 18..22: pipeline_id (196)
+    assert_eq!(u32::from_le_bytes(encoded[18..22].try_into().unwrap()), 196);
+    // 22..26: code_offset
+    assert_eq!(u32::from_le_bytes(encoded[22..26].try_into().unwrap()), 0);
+    // 26..30: code_len
+    assert_eq!(u32::from_le_bytes(encoded[26..30].try_into().unwrap()), wgsl.len() as u32);
+    // 30..34: target_format
+    assert_eq!(u32::from_le_bytes(encoded[30..34].try_into().unwrap()), TARGET_FORMAT_RGBA8UNORM);
+    // 34..38: has_vertex_buffer
+    assert_eq!(u32::from_le_bytes(encoded[34..38].try_into().unwrap()), 1);
+    // 38..42: has_uniform_buffer
+    assert_eq!(u32::from_le_bytes(encoded[38..42].try_into().unwrap()), 1);
+    // 42..46: uniform_size
+    assert_eq!(u32::from_le_bytes(encoded[42..46].try_into().unwrap()), 144);
+    // 46..50: vertex_stride
+    assert_eq!(u32::from_le_bytes(encoded[46..50].try_into().unwrap()), 20);
+    // 50..54: depth_format
+    assert_eq!(u32::from_le_bytes(encoded[50..54].try_into().unwrap()), TARGET_FORMAT_DEPTH24PLUS);
+    // 54..58: depth_write_enabled
+    assert_eq!(u32::from_le_bytes(encoded[54..58].try_into().unwrap()), 1);
+    // 58..62: depth_compare
+    assert_eq!(u32::from_le_bytes(encoded[58..62].try_into().unwrap()), DEPTH_COMPARE_LESS);
+    // 62..66: cull_mode
+    assert_eq!(u32::from_le_bytes(encoded[62..66].try_into().unwrap()), CULL_MODE_NONE);
+    // 66..70: front_face
+    assert_eq!(u32::from_le_bytes(encoded[66..70].try_into().unwrap()), FRONT_FACE_CCW);
+    // 70..74: write_mask (0x0)
+    assert_eq!(u32::from_le_bytes(encoded[70..74].try_into().unwrap()), 0x0);
+
+    // Verify scan_packet_commands parses opcode 16 properly
+    let summary = scan_packet_commands(&encoded);
+    assert_eq!(summary.depth_cull_color_pipelines.len(), 1);
+    let p = &summary.depth_cull_color_pipelines[0];
+    assert_eq!(p.pipeline_id, 196);
+    assert_eq!(p.write_mask, 0x0);
+    assert_eq!(p.depth_write_enabled, true);
+    assert_eq!(p.depth_compare, DEPTH_COMPARE_LESS);
+}
+
+#[test]
+fn test_mesh_batch_cull_depth_color_mixed_batch() {
+    let tri = [
+        0.0f32,  0.5, -2.0,
+       -0.5,   -0.5, -2.0,
+        0.5,   -0.5, -2.0,
+    ];
+    let positions = [tri, tri].concat();
+    let vertex_counts = [3u32, 3];
+    let model_views = [IDENTITY_F64, IDENTITY_F64].concat();
+    let projection = IDENTITY_F64;
+    let colors = [
+        1.0f32, 0.0, 0.0, 1.0, // Mesh 0: Red
+        0.0, 1.0, 0.0, 1.0,    // Mesh 1: Green
+    ];
+    let cull_modes = [CULL_MODE_NONE as u8, CULL_MODE_NONE as u8];
+    let front_faces = [FRONT_FACE_CCW as u8, FRONT_FACE_CCW as u8];
+    let depth_tests = [1u8, 1];
+    let depth_writes = [1u8, 1];
+    let depth_compares = [DEPTH_COMPARE_LESS, DEPTH_COMPARE_LESS];
+    // Mesh 0: colorWrite = true (1), Mesh 1: colorWrite = false (0) -> invisible occluder
+    let color_writes = [1u8, 0];
+
+    let packet_bytes = f3d_build_mesh_batch_cull_depth_color_packet(
+        &positions,
+        &vertex_counts,
+        &model_views,
+        &projection,
+        &colors,
+        &cull_modes,
+        &front_faces,
+        &depth_tests,
+        &depth_writes,
+        &depth_compares,
+        &color_writes,
+        64,
+        64,
+        false,
+        false,
+    ).expect("building mixed color_write batch");
+
+    let summary = scan_packet_commands(&packet_bytes);
+    // Mesh 0: colorWrite=true -> default pipeline ID 100 (opcode 15)
+    // Mesh 1: colorWrite=false -> occluder pipeline ID 100 + 96 = 196 (opcode 16, write_mask=0)
+    assert_eq!(summary.depth_cull_pipelines.len(), 1, "Expected 1 opcode 15 pipeline for colorWrite=true");
+    assert_eq!(summary.depth_cull_pipelines[0].pipeline_id, 100);
+
+    assert_eq!(summary.depth_cull_color_pipelines.len(), 1, "Expected 1 opcode 16 pipeline for colorWrite=false");
+    assert_eq!(summary.depth_cull_color_pipelines[0].pipeline_id, 196);
+    assert_eq!(summary.depth_cull_color_pipelines[0].write_mask, 0);
+
+    // Two draw passes binding distinct pipelines
+    assert_eq!(summary.draw_pipeline_ids, vec![100, 196]);
+    assert_eq!(summary.draw_passes.len(), 2);
+    assert_eq!(summary.draw_passes[0].pipeline_id, 100);
+    assert_eq!(summary.draw_passes[1].pipeline_id, 196);
+}
+
+#[test]
+fn test_mesh_batch_cull_depth_color_canvas_batch() {
+    let tri = [
+        0.0f32,  0.5, -2.0,
+       -0.5,   -0.5, -2.0,
+        0.5,   -0.5, -2.0,
+    ];
+    let positions = [tri, tri].concat();
+    let vertex_counts = [3u32, 3];
+    let model_views = [IDENTITY_F64, IDENTITY_F64].concat();
+    let projection = IDENTITY_F64;
+    let colors = [
+        1.0f32, 0.0, 0.0, 1.0,
+        0.0, 1.0, 0.0, 1.0,
+    ];
+    let cull_modes = [CULL_MODE_NONE as u8, CULL_MODE_NONE as u8];
+    let front_faces = [FRONT_FACE_CCW as u8, FRONT_FACE_CCW as u8];
+    let depth_tests = [1u8, 1];
+    let depth_writes = [1u8, 1];
+    let depth_compares = [DEPTH_COMPARE_LESS, DEPTH_COMPARE_LESS];
+    let color_writes = [1u8, 0];
+
+    let packet_bytes = f3d_build_mesh_batch_cull_depth_color_packet(
+        &positions,
+        &vertex_counts,
+        &model_views,
+        &projection,
+        &colors,
+        &cull_modes,
+        &front_faces,
+        &depth_tests,
+        &depth_writes,
+        &depth_compares,
+        &color_writes,
+        64,
+        64,
+        false,
+        true, // Canvas target
+    ).expect("building canvas color_write batch");
+
+    let summary = scan_packet_commands(&packet_bytes);
+    // Canvas target: base 101, occluder 101 + 96 = 197
+    assert_eq!(summary.depth_cull_pipelines[0].pipeline_id, 101);
+    assert_eq!(summary.depth_cull_color_pipelines[0].pipeline_id, 197);
+    assert_eq!(summary.draw_pipeline_ids, vec![101, 197]);
+}
+
+#[test]
+fn test_mesh_batch_cull_depth_color_validation_errors() {
+    let tri = [0.0f32, 0.5, 0.0, -0.5, -0.5, 0.0, 0.5, -0.5, 0.0];
+    let positions = tri;
+    let vertex_counts = [3u32];
+    let model_views = IDENTITY_F64;
+    let projection = IDENTITY_F64;
+    let colors = [1.0f32, 0.0, 0.0, 1.0];
+    let cull_modes = [0u8];
+    let front_faces = [0u8];
+    let depth_tests = [1u8];
+    let depth_writes = [1u8];
+    let depth_compares = [DEPTH_COMPARE_LESS];
+
+    // Array length mismatch
+    let err = f3d_build_mesh_batch_cull_depth_color_packet(
+        &positions, &vertex_counts, &model_views, &projection, &colors,
+        &cull_modes, &front_faces,
+        &depth_tests, &depth_writes, &depth_compares,
+        &[], // Empty color_writes for 1 mesh
+        64, 64, false, false,
+    ).unwrap_err();
+    assert!(err.contains("color_writes array length must match mesh count 1 (got 0)"));
+
+    // Invalid color_write value > 1
+    let err2 = f3d_build_mesh_batch_cull_depth_color_packet(
+        &positions, &vertex_counts, &model_views, &projection, &colors,
+        &cull_modes, &front_faces,
+        &depth_tests, &depth_writes, &depth_compares,
+        &[2u8], // invalid
+        64, 64, false, false,
+    ).unwrap_err();
+    assert!(err2.contains("color write code must be 0 (false) or 1 (true) (got 2)"));
+}
+
+#[test]
+fn test_mesh_batch_cull_depth_default_color_write_preserves_pipeline_ids() {
+    let tri = [0.0f32, 0.5, 0.0, -0.5, -0.5, 0.0, 0.5, -0.5, 0.0];
+    let positions = tri;
+    let vertex_counts = [3u32];
+    let model_views = IDENTITY_F64;
+    let projection = IDENTITY_F64;
+    let colors = [1.0f32, 0.0, 0.0, 1.0];
+    let cull_modes = [0u8];
+    let front_faces = [0u8];
+    let depth_tests = [1u8];
+    let depth_writes = [1u8];
+    let depth_compares = [DEPTH_COMPARE_LESS];
+
+    // 1. Offscreen packet via legacy cull_depth export (all color_writes = true)
+    let legacy_bytes = f3d_build_mesh_batch_cull_depth_packet(
+        &positions, &vertex_counts, &model_views, &projection, &colors,
+        &cull_modes, &front_faces,
+        &depth_tests, &depth_writes, &depth_compares,
+        64, 64, false, false,
+    ).expect("building legacy depth batch");
+
+    // 2. Offscreen packet via cull_depth_color export with color_writes = [1]
+    let color_bytes = f3d_build_mesh_batch_cull_depth_color_packet(
+        &positions, &vertex_counts, &model_views, &projection, &colors,
+        &cull_modes, &front_faces,
+        &depth_tests, &depth_writes, &depth_compares,
+        &[1u8],
+        64, 64, false, false,
+    ).expect("building color_write batch");
+
+    // Assert exact byte-identity
+    assert_eq!(legacy_bytes, color_bytes, "Default colorWrite=true batch must be byte-identical to legacy cull_depth packet");
+
+    // Assert pipeline ID bit-identity (100 for offscreen)
+    let legacy_summary = scan_packet_commands(&legacy_bytes);
+    let color_summary = scan_packet_commands(&color_bytes);
+    assert_eq!(legacy_summary.depth_cull_pipelines.len(), 1);
+    assert_eq!(legacy_summary.depth_cull_pipelines[0].pipeline_id, 100);
+    assert_eq!(color_summary.depth_cull_pipelines.len(), 1);
+    assert_eq!(color_summary.depth_cull_pipelines[0].pipeline_id, 100);
+    assert_eq!(color_summary.depth_cull_color_pipelines.len(), 0);
+
+    // Canvas packet pipeline ID bit-identity (101 for canvas)
+    let canvas_bytes = f3d_build_mesh_batch_cull_depth_color_packet(
+        &positions, &vertex_counts, &model_views, &projection, &colors,
+        &cull_modes, &front_faces,
+        &depth_tests, &depth_writes, &depth_compares,
+        &[1u8],
+        64, 64, false, true,
+    ).expect("building canvas default color batch");
+    let canvas_summary = scan_packet_commands(&canvas_bytes);
+    assert_eq!(canvas_summary.depth_cull_pipelines.len(), 1);
+    assert_eq!(canvas_summary.depth_cull_pipelines[0].pipeline_id, 101);
+    assert_eq!(canvas_summary.depth_cull_color_pipelines.len(), 0);
 }
 
