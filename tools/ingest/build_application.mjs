@@ -32,7 +32,9 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { bundleWithRollup } from './bundler.mjs';
-import { parseTagAttributes, parseSrcsetUrls, stripHtmlComments, stripScriptAndStyleBodies } from './html_parser.mjs';
+import { parseTagAttributes, parseSrcsetUrls, stripHtmlComments, stripScriptAndStyleBodies, parseHtmlEntries } from './html_parser.mjs';
+import { resolveModuleSpecifier, urlToFilePath } from './resolver.mjs';
+import { analyzeModuleAst } from './ast_analyzer.mjs';
 
 /**
  * Recomputes Subresource Integrity (SRI) string for modified or bundled content,
@@ -299,6 +301,76 @@ export function extractRelativeCssUrls(cssContent) {
   }
 
   return Array.from(urls);
+}
+
+/**
+ * Scans JavaScript code (module or classic script) to discover static and dynamic
+ * module specifiers as well as static asset references (new URL(..., import.meta.url)).
+ *
+ * Uses AST analysis via analyzeModuleAst, falling back to regex extraction for
+ * classic scripts containing legacy/non-module syntax.
+ *
+ * @param {string} code - Script or module source code
+ * @param {string} [contextUrl='script.js'] - File URL or identifier for error reporting
+ * @returns {{ moduleSpecifiers: string[], assetSpecifiers: string[] }}
+ */
+export function extractJsModuleDependencies(code, contextUrl = 'script.js') {
+  if (!code || typeof code !== 'string') {
+    return { moduleSpecifiers: [], assetSpecifiers: [] };
+  }
+
+  const moduleSpecifiers = new Set();
+  const assetSpecifiers = new Set();
+
+  try {
+    const analysis = analyzeModuleAst(code, contextUrl);
+    if (analysis) {
+      if (Array.isArray(analysis.staticImports)) {
+        for (const st of analysis.staticImports) {
+          if (st.specifier) moduleSpecifiers.add(st.specifier);
+        }
+      }
+      if (Array.isArray(analysis.staticExports)) {
+        for (const ex of analysis.staticExports) {
+          if (ex.specifier) moduleSpecifiers.add(ex.specifier);
+        }
+      }
+      if (Array.isArray(analysis.dynamicImports)) {
+        for (const dyn of analysis.dynamicImports) {
+          if (dyn.classification === 'literal' && dyn.specifier) {
+            moduleSpecifiers.add(dyn.specifier);
+          } else if (dyn.classification === 'finite_set' && Array.isArray(dyn.candidates)) {
+            for (const cand of dyn.candidates) {
+              if (cand) moduleSpecifiers.add(cand);
+            }
+          }
+        }
+      }
+      if (Array.isArray(analysis.assetReferences)) {
+        for (const assetRef of analysis.assetReferences) {
+          if (assetRef.specifier) assetSpecifiers.add(assetRef.specifier);
+        }
+      }
+    }
+  } catch {
+    // Fallback for classic scripts with legacy or non-module syntax (e.g. with statement)
+    const dynRegex = /\bimport\s*\(\s*(?:'([^'\\]*(?:\\.[^'\\]*)*)'|"([^"\\]*(?:\\.[^"\\]*)*)"|`([^`\\]*(?:\\.[^`\\]*)*)`)\s*\)/g;
+    let m;
+    while ((m = dynRegex.exec(code)) !== null) {
+      const spec = m[1] !== undefined ? m[1] : (m[2] !== undefined ? m[2] : m[3]);
+      if (spec) moduleSpecifiers.add(spec);
+    }
+    const staticRegex = /\b(?:import|export)\b[\s\S]*?\bfrom\s*(?:'([^'\\]*(?:\\.[^'\\]*)*)'|"([^"\\]*(?:\\.[^"\\]*)*)")/g;
+    while ((m = staticRegex.exec(code)) !== null) {
+      const spec = m[1] !== undefined ? m[1] : m[2];
+      if (spec) moduleSpecifiers.add(spec);
+    }
+  }
+
+  return {
+    moduleSpecifiers: Array.from(moduleSpecifiers),
+    assetSpecifiers: Array.from(assetSpecifiers)
+  };
 }
 
 /**
@@ -622,6 +694,10 @@ export async function buildApplication(entryPath, outDir, options = {}) {
     }
 
     const rawHtmlContent = fs.readFileSync(resolvedEntryAbs, 'utf-8');
+    const entryBaseUrl = pathToFileURL(resolvedEntryAbs).href;
+    const parsedHtml = parseHtmlEntries(rawHtmlContent, entryBaseUrl);
+    const importMap = parsedHtml.importMap;
+
     const rewrittenHtml = rewriteHtmlForBuild(
       rawHtmlContent,
       bundleResult.entryFiles,
@@ -634,70 +710,157 @@ export async function buildApplication(entryPath, outDir, options = {}) {
     // Excludes modulepreloads that map to bundled chunks
     const relativeAssetUrls = extractRelativeAssetUrls(rawHtmlContent, preloadChunkMap, entryDir);
 
-    // Bounded asset processing queue: handles direct HTML assets and transitive CSS url()/@import children
+    // Bounded asset processing queue: handles direct HTML assets, transitive CSS url()/@import children,
+    // and literal dynamic imports in retained classic scripts and modules.
     const assetQueue = [];
     for (const relUrl of relativeAssetUrls) {
       assetQueue.push({
         relUrl,
         referrerDir: entryDir,
-        referrerPath: resolvedEntryAbs
+        referrerPath: resolvedEntryAbs,
+        isModuleSpecifier: false
       });
     }
 
+    // Scan inline classic scripts in HTML for static literal dynamic imports
+    const sanitizedHtml = stripHtmlComments(rawHtmlContent);
+    const inlineScriptRegex = /<script\b((?:[^"'><]+|"[^"]*"|'[^']*')*)>([\s\S]*?)<\/script\s*>/gi;
+    let inlineMatch;
+    while ((inlineMatch = inlineScriptRegex.exec(sanitizedHtml)) !== null) {
+      const attrs = parseTagAttributes(inlineMatch[1]);
+      const scriptType = (attrs.type || 'text/javascript').toLowerCase();
+      if (scriptType === 'module' || scriptType === 'importmap' || attrs.src) {
+        continue;
+      }
+      const scriptBody = inlineMatch[2];
+      if (!scriptBody || !scriptBody.trim()) continue;
+
+      const { moduleSpecifiers, assetSpecifiers } = extractJsModuleDependencies(scriptBody, entryBaseUrl);
+      for (const spec of moduleSpecifiers) {
+        assetQueue.push({
+          specifier: spec,
+          referrerUrl: entryBaseUrl,
+          referrerDir: entryDir,
+          referrerPath: resolvedEntryAbs,
+          isModuleSpecifier: true
+        });
+      }
+      for (const assetSpec of assetSpecifiers) {
+        assetQueue.push({
+          relUrl: assetSpec,
+          referrerDir: entryDir,
+          referrerPath: resolvedEntryAbs,
+          isModuleSpecifier: false
+        });
+      }
+    }
+
     const visitedCssPaths = new Set();
+    const visitedJsPaths = new Set();
 
     while (assetQueue.length > 0) {
-      const { relUrl, referrerDir, referrerPath } = assetQueue.shift();
-      if (!relUrl || typeof relUrl !== 'string') continue;
-      const trimmedRelUrl = relUrl.trim();
-      if (!trimmedRelUrl) continue;
-
-      // Browser URI semantics: resolve against referrer directory URL using new URL,
-      // then convert file: URL object directly to decoded filesystem path via fileURLToPath.
-      // Preserves %20 and other percent-encodings as actual filename bytes on disk.
-      // Wrapped in try/catch to safely handle asset paths containing unencoded literal '%'
-      // not followed by two hex digits (e.g. <img src="./100%_sale.png">).
+      const item = assetQueue.shift();
       let srcAssetAbs;
-      try {
-        const referrerDirSlash = referrerDir.endsWith(path.sep) ? referrerDir : referrerDir + path.sep;
-        const referrerBaseUrl = pathToFileURL(referrerDirSlash);
-        const resolvedUrl = new URL(trimmedRelUrl, referrerBaseUrl);
-        srcAssetAbs = fileURLToPath(resolvedUrl);
-      } catch {
-        const cleanRelPath = trimmedRelUrl.split(/[?#]/)[0];
-        srcAssetAbs = path.resolve(referrerDir, cleanRelPath);
+      let relFromEntryDir;
+      const referrerPath = item.referrerPath || resolvedEntryAbs;
+
+      if (item.isModuleSpecifier) {
+        if (!item.specifier || typeof item.specifier !== 'string') continue;
+        const trimmedSpecifier = item.specifier.trim();
+        if (!trimmedSpecifier) continue;
+
+        let resolvedUrl;
+        try {
+          resolvedUrl = resolveModuleSpecifier(trimmedSpecifier, item.referrerUrl, importMap, {
+            mapBaseUrl: entryBaseUrl,
+            packageRootUrl: options.packageRootUrl
+          });
+        } catch (err) {
+          let context = '';
+          if (referrerPath !== resolvedEntryAbs) {
+            context = referrerPath.endsWith('.css')
+              ? ` in CSS referenced from "${referrerPath}"`
+              : ` referenced from "${referrerPath}"`;
+          }
+          throw new Error(`Unresolved module specifier${context}: "${trimmedSpecifier}" (${err.message})`);
+        }
+
+        if (!resolvedUrl.startsWith('file://')) {
+          // Non-file URL (e.g. http://, https://, data:); resolved at runtime by browser
+          continue;
+        }
+
+        srcAssetAbs = urlToFilePath(resolvedUrl);
+        relFromEntryDir = path.relative(entryDir, srcAssetAbs);
+      } else {
+        const { relUrl, referrerDir } = item;
+        if (!relUrl || typeof relUrl !== 'string') continue;
+        const trimmedRelUrl = relUrl.trim();
+        if (!trimmedRelUrl) continue;
+
+        // Browser URI semantics: resolve against referrer directory URL using new URL,
+        // then convert file: URL object directly to decoded filesystem path via fileURLToPath.
+        // Preserves %20 and other percent-encodings as actual filename bytes on disk.
+        // Wrapped in try/catch to safely handle asset paths containing unencoded literal '%'
+        // not followed by two hex digits (e.g. <img src="./100%_sale.png">).
+        try {
+          const referrerDirSlash = referrerDir.endsWith(path.sep) ? referrerDir : referrerDir + path.sep;
+          const referrerBaseUrl = pathToFileURL(referrerDirSlash);
+          const resolvedUrl = new URL(trimmedRelUrl, referrerBaseUrl);
+          srcAssetAbs = fileURLToPath(resolvedUrl);
+        } catch {
+          const cleanRelPath = trimmedRelUrl.split(/[?#]/)[0];
+          srcAssetAbs = path.resolve(referrerDir, cleanRelPath);
+        }
+
+        relFromEntryDir = path.relative(entryDir, srcAssetAbs);
       }
 
-      // Verify that relative asset path does not escape entry directory
-      const relFromEntryDir = path.relative(entryDir, srcAssetAbs);
+      // Verify that relative asset or module path does not escape entry directory
       if (relFromEntryDir.startsWith('..') || path.isAbsolute(relFromEntryDir)) {
-        const context = referrerPath !== resolvedEntryAbs ? ` in CSS "${referrerPath}"` : '';
-        throw new Error(`Relative resource${context} escapes application root directory: "${relUrl}"`);
+        const target = item.isModuleSpecifier ? item.specifier : item.relUrl;
+        let context = '';
+        if (referrerPath !== resolvedEntryAbs) {
+          context = referrerPath.endsWith('.css') ? ` in CSS "${referrerPath}"` : ` in "${referrerPath}"`;
+        }
+        throw new Error(`Relative resource${context} escapes application root directory: "${target}"`);
       }
 
-      // Pre-emission collision check: a classic script, stylesheet, or asset must NOT collide
+      // Pre-emission collision check: a classic script, stylesheet, module, or asset must NOT collide
       // with or silently overwrite/shadow an emitted chunk or the entry HTML file.
       if (emittedChunkNames.has(relFromEntryDir)) {
-        const context = referrerPath !== resolvedEntryAbs ? ` referenced from "${referrerPath}"` : '';
+        const target = item.isModuleSpecifier ? item.specifier : item.relUrl;
+        let context = '';
+        if (referrerPath !== resolvedEntryAbs) {
+          context = referrerPath.endsWith('.css')
+            ? ` referenced from "${referrerPath}"`
+            : ` referenced from "${referrerPath}"`;
+        }
         throw new Error(
-          `Collision detected: relative resource "${relUrl}"${context} collides with emitted bundle chunk or entry file "${relFromEntryDir}". Source assets must not collide with emitted chunk names.`
+          `Collision detected: relative resource "${target}"${context} collides with emitted bundle chunk or entry file "${relFromEntryDir}". Source assets must not collide with emitted chunk names.`
         );
       }
 
-      // If asset was already processed and added to targetFiles during this run, skip duplicate copy
+      // If asset or module was already processed and added to targetFiles during this run, skip duplicate copy
       if (targetFiles.has(relFromEntryDir)) {
         continue;
       }
 
       // Explicitly reject unresolved relative resources before output
       if (!fs.existsSync(srcAssetAbs) || !fs.statSync(srcAssetAbs).isFile()) {
-        const context = referrerPath !== resolvedEntryAbs ? ` in CSS referenced from "${referrerPath}"` : '';
+        const target = item.isModuleSpecifier ? item.specifier : item.relUrl;
+        let context = '';
+        if (referrerPath !== resolvedEntryAbs) {
+          context = referrerPath.endsWith('.css')
+            ? ` in CSS referenced from "${referrerPath}"`
+            : ` referenced from "${referrerPath}"`;
+        }
         throw new Error(
-          `Unresolved relative resource${context}: "${relUrl}" not found at "${srcAssetAbs}"`
+          `Unresolved relative resource${context}: "${target}" not found at "${srcAssetAbs}"`
         );
       }
 
-      // Copy asset into bounded closure targetFiles
+      // Copy asset/module into bounded closure targetFiles
       const assetData = fs.readFileSync(srcAssetAbs);
       targetFiles.set(relFromEntryDir, assetData);
 
@@ -711,7 +874,40 @@ export async function buildApplication(entryPath, outDir, options = {}) {
           assetQueue.push({
             relUrl: childUrl,
             referrerDir: cssDir,
-            referrerPath: srcAssetAbs
+            referrerPath: srcAssetAbs,
+            isModuleSpecifier: false
+          });
+        }
+      }
+
+      // If resource is a JS/MJS/CJS file (retained classic script or dynamic import target),
+      // scan for transitive module dependencies (static/dynamic imports, exports) and asset references
+      if (
+        (srcAssetAbs.endsWith('.js') || srcAssetAbs.endsWith('.mjs') || srcAssetAbs.endsWith('.cjs')) &&
+        !visitedJsPaths.has(srcAssetAbs)
+      ) {
+        visitedJsPaths.add(srcAssetAbs);
+        const jsContent = assetData.toString('utf-8');
+        const fileUrl = pathToFileURL(srcAssetAbs).href;
+        const { moduleSpecifiers, assetSpecifiers } = extractJsModuleDependencies(jsContent, fileUrl);
+        const jsDir = path.dirname(srcAssetAbs);
+
+        for (const childSpec of moduleSpecifiers) {
+          assetQueue.push({
+            specifier: childSpec,
+            referrerUrl: fileUrl,
+            referrerDir: jsDir,
+            referrerPath: srcAssetAbs,
+            isModuleSpecifier: true
+          });
+        }
+
+        for (const assetSpec of assetSpecifiers) {
+          assetQueue.push({
+            relUrl: assetSpec,
+            referrerDir: jsDir,
+            referrerPath: srcAssetAbs,
+            isModuleSpecifier: false
           });
         }
       }

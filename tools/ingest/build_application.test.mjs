@@ -32,7 +32,8 @@ import {
   extractRelativeCssUrls,
   stripCssComments,
   findChunkForPreload,
-  toCanonicalPreloadUrl
+  toCanonicalPreloadUrl,
+  extractJsModuleDependencies
 } from './build_application.mjs';
 import { parseHtmlEntries, parseTagAttributes, stripScriptAndStyleBodies, stripHtmlComments } from './html_parser.mjs';
 
@@ -1869,6 +1870,33 @@ test('buildApplication creates portable bundle for H1 (webgpu_performance_render
   }
 });
 
+test('extractJsModuleDependencies discovers static/dynamic imports and asset references', () => {
+  const code = `
+    import { a } from './static_dep.js';
+    export { b } from './reexport.js';
+    window.load = () => import('./dyn_literal.js');
+    const branch = cond ? import('./dyn_cond_a.js') : import('./dyn_cond_b.js');
+    const asset = new URL('./textures/wood.png', import.meta.url);
+  `;
+  const deps = extractJsModuleDependencies(code, 'file:///app/test.js');
+  assert.ok(deps.moduleSpecifiers.includes('./static_dep.js'), 'Discovers static import');
+  assert.ok(deps.moduleSpecifiers.includes('./reexport.js'), 'Discovers re-export');
+  assert.ok(deps.moduleSpecifiers.includes('./dyn_literal.js'), 'Discovers literal dynamic import');
+  assert.ok(deps.moduleSpecifiers.includes('./dyn_cond_a.js'), 'Discovers conditional dynamic import branch A');
+  assert.ok(deps.moduleSpecifiers.includes('./dyn_cond_b.js'), 'Discovers conditional dynamic import branch B');
+  assert.ok(deps.assetSpecifiers.includes('./textures/wood.png'), 'Discovers asset reference');
+});
+
+test('extractJsModuleDependencies falls back gracefully on legacy classic scripts', () => {
+  const legacyCode = `
+    with (window) {
+      loadLegacy = function() { return import('./legacy_dep.js'); };
+    }
+  `;
+  const deps = extractJsModuleDependencies(legacyCode, 'file:///app/legacy.js');
+  assert.ok(deps.moduleSpecifiers.includes('./legacy_dep.js'), 'Discovers dynamic import in legacy script');
+});
+
 test('buildApplication preserves importmap verbatim alongside classic scripts with dynamic import', async () => {
   const scratch = makeScratch('f3d_app_importmap_classic');
   const outDir = path.join(scratch, 'dist');
@@ -1880,9 +1908,10 @@ test('buildApplication preserves importmap verbatim alongside classic scripts wi
     { "imports": { "dynamic-dep": "./dep.js" } }
   </script>
   <script>
-    // Classic script using dynamic import against preserved importmap
+    // Inline classic script using dynamic import against preserved importmap
     window.loadDep = () => import('dynamic-dep');
   </script>
+  <script src="./external_classic.js"></script>
   <script type="module" src="./main.js"></script>
 </head>
 <body></body>
@@ -1890,7 +1919,16 @@ test('buildApplication preserves importmap verbatim alongside classic scripts wi
 
   fs.writeFileSync(path.join(scratch, 'index.html'), html);
   fs.writeFileSync(path.join(scratch, 'main.js'), 'export const mainOk = true;\n');
-  fs.writeFileSync(path.join(scratch, 'dep.js'), 'export const depOk = true;\n');
+  fs.writeFileSync(
+    path.join(scratch, 'dep.js'),
+    'import { nestedOk } from "./nested.js";\nexport const depOk = nestedOk;\n'
+  );
+  fs.writeFileSync(path.join(scratch, 'nested.js'), 'export const nestedOk = true;\n');
+  fs.writeFileSync(
+    path.join(scratch, 'external_classic.js'),
+    'window.loadExt = () => import("./ext_dep.js");\n'
+  );
+  fs.writeFileSync(path.join(scratch, 'ext_dep.js'), 'export const extOk = true;\n');
 
   const res = await buildApplication(path.join(scratch, 'index.html'), outDir);
   assert.equal(res.isHtml, true);
@@ -1907,15 +1945,75 @@ test('buildApplication preserves importmap verbatim alongside classic scripts wi
     'Import map contents must be preserved verbatim'
   );
 
-  // 2. Classic script using dynamic import must be preserved verbatim
+  // 2. Inline classic script using dynamic import must be preserved verbatim
   assert.ok(
     rewrittenHtml.includes("window.loadDep = () => import('dynamic-dep');"),
-    'Classic script containing dynamic import must be preserved verbatim'
+    'Inline classic script containing dynamic import must be preserved verbatim'
   );
 
-  // 3. Module script is rewritten to emitted chunk
+  // 3. External classic script must be preserved verbatim
+  assert.ok(
+    rewrittenHtml.includes('src="./external_classic.js"'),
+    'External classic script must be preserved verbatim'
+  );
+
+  // 4. Module script is rewritten to emitted chunk
   assert.ok(
     rewrittenHtml.includes(`src="./${res.entryFiles[0]}"`),
     'Module script must reference the emitted chunk'
+  );
+
+  // 5. Emitted files list must contain dynamic import target, nested dependency, and external classic files
+  assert.ok(res.emittedFiles.includes('dep.js'), 'dep.js must be in emittedFiles');
+  assert.ok(res.emittedFiles.includes('nested.js'), 'nested.js must be in emittedFiles');
+  assert.ok(res.emittedFiles.includes('external_classic.js'), 'external_classic.js must be in emittedFiles');
+  assert.ok(res.emittedFiles.includes('ext_dep.js'), 'ext_dep.js must be in emittedFiles');
+
+  // 6. All closed files must exist on disk in outDir
+  assert.ok(fs.existsSync(path.join(outDir, 'dep.js')), 'dep.js must exist on disk in outDir');
+  assert.ok(fs.existsSync(path.join(outDir, 'nested.js')), 'nested.js must exist on disk in outDir');
+  assert.ok(fs.existsSync(path.join(outDir, 'external_classic.js')), 'external_classic.js must exist on disk in outDir');
+  assert.ok(fs.existsSync(path.join(outDir, 'ext_dep.js')), 'ext_dep.js must exist on disk in outDir');
+
+  // 7. Dynamic imports must execute real exported values from outDir without source tree
+  const depModule = await import(pathToFileURL(path.join(outDir, 'dep.js')).href);
+  assert.equal(depModule.depOk, true, 'dep.js and its nested dependency must execute successfully from outDir');
+
+  const extModule = await import(pathToFileURL(path.join(outDir, 'ext_dep.js')).href);
+  assert.equal(extModule.extOk, true, 'ext_dep.js must execute successfully from outDir');
+});
+
+test('buildApplication rejects unresolvable dynamic imports in retained classic scripts honestly', async () => {
+  const scratch = makeScratch('f3d_app_missing_classic_dyn');
+  const outDir = path.join(scratch, 'dist');
+
+  const html = `<!DOCTYPE html>
+<html>
+<head>
+  <script>
+    window.loadMissing = () => import('./missing_dep.js');
+  </script>
+  <script type="module" src="./main.js"></script>
+</head>
+<body></body>
+</html>`;
+
+  fs.writeFileSync(path.join(scratch, 'index.html'), html);
+  fs.writeFileSync(path.join(scratch, 'main.js'), 'export const mainOk = true;\n');
+
+  await assert.rejects(
+    async () => {
+      await buildApplication(path.join(scratch, 'index.html'), outDir);
+    },
+    (err) => {
+      const msg = String(err?.message || '');
+      return (
+        msg.includes('Cannot find module') ||
+        msg.includes('Unresolved relative resource') ||
+        msg.includes('Unresolved module specifier') ||
+        msg.includes('missing_dep.js')
+      );
+    },
+    'Must honestly reject missing dynamic import target from retained classic script'
   );
 });
