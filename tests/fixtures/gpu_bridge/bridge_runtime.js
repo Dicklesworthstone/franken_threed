@@ -340,9 +340,14 @@ export class WebGpuBridgeHost {
    * Invariant: Command recording, canvas texture view acquisition, commandEncoder.finish(),
    * and queue.submit() all execute SYNCHRONOUSLY inside the pushed error scopes.
    * Error scopes are popped immediately after submit() and awaited afterwards.
+   * onSubmitted runs synchronously after those pops. It observes issued queue
+   * effects, not GPU completion or successful asynchronous validation.
    * Zero eval / new Function.
    */
-  async executePacket(packetBytes, canvasContext = null) {
+  async executePacket(packetBytes, canvasContext = null, onSubmitted = null) {
+    if (onSubmitted !== null && typeof onSubmitted !== "function") {
+      throw new TypeError("onSubmitted must be a function or null");
+    }
     if (!this.device) {
       throw new Error("Device not initialized");
     }
@@ -377,7 +382,8 @@ export class WebGpuBridgeHost {
     const dataPayload = packetBytes.subarray(dataBlockStart);
 
     // Synchronous execution block inside error scopes
-    await this.withErrorScopes(["validation", "out-of-memory"], () => {
+    let submitted = false;
+    const completion = this.withErrorScopes(["validation", "out-of-memory"], () => {
       const commandEncoder = this.device.createCommandEncoder();
       let cursor = headerLen;
       let currentPassEncoder = null;
@@ -1436,7 +1442,25 @@ export class WebGpuBridgeHost {
       // Finish and submit synchronously inside the error scope
       const commandBuffer = commandEncoder.finish();
       this.device.queue.submit([commandBuffer]);
+      submitted = true;
     });
+    // Keep bookkeeping in queue-effect order even when scope promises settle
+    // in another order. Never invoke the observer while device scopes are open.
+    try {
+      if (submitted && onSubmitted !== null) {
+        const observation = onSubmitted();
+        if (observation && typeof observation.then === "function") {
+          // Reject async observers without leaving their rejection unowned.
+          void Promise.resolve(observation).catch(() => {});
+          throw new TypeError("onSubmitted must complete synchronously");
+        }
+      }
+    } catch (error) {
+      // The already-issued work still owns its asynchronous scope results.
+      await completion.catch(() => {});
+      throw error;
+    }
+    await completion;
   }
 
   /**
@@ -1473,4 +1497,3 @@ export class WebGpuBridgeHost {
     return copy;
   }
 }
-

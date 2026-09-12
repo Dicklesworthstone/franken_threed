@@ -741,6 +741,7 @@ fn build_multi_mesh_submission_internal(
     let has_per_mesh_depth = inputs.iter().any(|i| i.depth().is_some());
     let has_color_write_override = inputs.iter().any(|i| !i.color_write());
     let has_depth = depth_opts.is_some()
+        || has_color_write_override // Opcode 16 pipelines require a matching depth attachment.
         || inputs.iter().any(|i| i.depth().map_or(false, |d| d.depth_test || d.depth_write));
 
     let mut unique_pipeline_configs: Vec<(u32, u32, u32, bool, u32, u32)> = Vec::new();
@@ -1114,6 +1115,7 @@ fn build_multi_mesh_canvas_submission_internal(
     let has_per_mesh_depth = inputs.iter().any(|i| i.depth().is_some());
     let has_color_write_override = inputs.iter().any(|i| !i.color_write());
     let has_depth = depth_opts.is_some()
+        || has_color_write_override // Opcode 16 pipelines require a matching depth attachment.
         || inputs.iter().any(|i| i.depth().map_or(false, |d| d.depth_test || d.depth_write));
 
     let mut unique_pipeline_configs: Vec<(u32, u32, u32, bool, u32, u32)> = Vec::new();
@@ -2095,7 +2097,7 @@ pub fn f3d_build_mesh_batch_packet(
 
 /// Encodes a batch of dynamic Three.js meshes with explicit face culling, front-face winding,
 /// and per-mesh depth testing/writing into a unified submission packet.
-pub fn build_mesh_batch_cull_depth_packet_impl(
+pub fn build_mesh_batch_cull_depth_color_packet_impl(
     positions: &[f32],
     vertex_counts: &[u32],
     model_views: &[f64],
@@ -2106,6 +2108,7 @@ pub fn build_mesh_batch_cull_depth_packet_impl(
     depth_tests: &[u8],
     depth_writes: &[u8],
     depth_compares: &[u32],
+    color_writes: &[u8],
     width: u32,
     height: u32,
     webgl_depth: bool,

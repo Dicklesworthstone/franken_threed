@@ -3512,6 +3512,65 @@ fn test_mesh_batch_cull_depth_color_validation_errors() {
 }
 
 #[test]
+fn test_mesh_batch_color_write_disabled_without_depth_has_compatible_attachments() {
+    let tri = [0.0f32, 0.5, 0.0, -0.5, -0.5, 0.0, 0.5, -0.5, 0.0];
+    let color = [1.0f32, 0.0, 0.0, 1.0];
+    let visible = DynamicMeshInput::try_from_raw(
+        &tri, &[], &IDENTITY_F64, &IDENTITY_F64, &color, 64, 64, false,
+    ).unwrap()
+        .with_cull(CULL_MODE_NONE, FRONT_FACE_CCW).unwrap()
+        .with_depth_options(false, false, DEPTH_COMPARE_LESS).unwrap();
+    let inputs = [visible.clone(), visible.with_color_write(false)];
+
+    for canvas in [false, true] {
+        let packet = if canvas {
+            build_multi_mesh_canvas_submission(&inputs)
+        } else {
+            build_multi_mesh_submission(&inputs)
+        }.expect("mixed color masks with disabled depth must produce a valid packet");
+        let depth_textures = packet.commands().iter().filter(|command| matches!(command,
+            GpuCommand::CreateTexture {
+                texture_id: MESH_DEPTH_TEXTURE_ID, format: TARGET_FORMAT_DEPTH24PLUS, ..
+            }
+        )).count();
+        assert_eq!(depth_textures, 1, "both pipeline masks require the same depth format");
+        let attached_depth_targets: Vec<u32> = packet.commands().iter().filter_map(|command| {
+            if let GpuCommand::RenderPassDepth { depth_target_id, .. } = command {
+                Some(*depth_target_id)
+            } else {
+                None
+            }
+        }).collect();
+        assert_eq!(attached_depth_targets, vec![MESH_DEPTH_TEXTURE_ID; 2]);
+
+        let bytes = f3d_build_mesh_batch_cull_depth_color_packet(
+            &[tri, tri].concat(), &[3, 3], &[IDENTITY_F64, IDENTITY_F64].concat(),
+            &IDENTITY_F64, &[color, color].concat(), &[0, 0], &[0, 0],
+            &[0, 0], &[0, 0], &[DEPTH_COMPARE_LESS; 2], &[1, 0],
+            64, 64, false, canvas,
+        ).unwrap();
+        assert_eq!(bytes, packet.encode().unwrap(), "public export must preserve the typed packet");
+        let summary = scan_packet_commands(&bytes);
+        assert_eq!(summary.detailed_depth_cull_pipelines.len(), 1, "visible pipeline retains full color writes");
+        assert_eq!(summary.depth_cull_color_pipelines.len(), 1);
+        let visible_pipeline = &summary.detailed_depth_cull_pipelines[0];
+        let invisible_pipeline = &summary.depth_cull_color_pipelines[0];
+        assert_eq!(invisible_pipeline.write_mask, 0);
+        for (format, write, compare) in [
+            (visible_pipeline.depth_format, visible_pipeline.depth_write_enabled, visible_pipeline.depth_compare),
+            (invisible_pipeline.depth_format, invisible_pipeline.depth_write_enabled, invisible_pipeline.depth_compare),
+        ] {
+            assert_eq!(format, TARGET_FORMAT_DEPTH24PLUS);
+            assert!(!write, "the compatibility attachment must not enable depth writes");
+            assert_eq!(compare, DEPTH_COMPARE_ALWAYS, "depth testing must remain disabled");
+        }
+        assert_eq!(summary.draw_pipeline_ids, vec![visible_pipeline.pipeline_id, invisible_pipeline.pipeline_id]);
+        assert_eq!(summary.draw_passes.len(), 2);
+        assert!(summary.draw_passes.iter().all(|pass| pass.opcode == 13));
+    }
+}
+
+#[test]
 fn test_mesh_batch_cull_depth_default_color_write_preserves_pipeline_ids() {
     let tri = [0.0f32, 0.5, 0.0, -0.5, -0.5, 0.0, 0.5, -0.5, 0.0];
     let positions = tri;

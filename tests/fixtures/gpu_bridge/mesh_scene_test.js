@@ -3265,13 +3265,13 @@ export async function testMultiMeshBatchScene(bridgeHost, wasmExports, canvasCon
   ]), 3));
 
   // 11a: Invisible near occluder (colorWrite=false, depthWrite=true)
-  // 1. Base mesh at z = -2.0: Red (0xff0000), depthWrite=true, depthTest=true, LessDepth
+  // 1. Base mesh at z = -2.0: Red (0xff0000), depthWrite=false, depthTest=true, LessDepth
   // 2. Occluder at z = -1.5: colorWrite=false, depthWrite=true, depthTest=true, LessDepth
   //    (writes depth at -1.5, leaves framebuffer color Red)
   // 3. Far mesh at z = -2.5: Green (0x00ff00), colorWrite=true, depthWrite=true, depthTest=true, LessDepth
   //    (fails depth test against occluder's -1.5 -> rejected)
   // Expected: Center pixel stays Red.
-  const meshBase11a = new THREE.Mesh(geomNearCenter10, new THREE.MeshBasicMaterial({ color: 0xff0000, side: THREE.FrontSide, depthTest: true, depthWrite: true, depthFunc: THREE.LessDepth }));
+  const meshBase11a = new THREE.Mesh(geomNearCenter10, new THREE.MeshBasicMaterial({ color: 0xff0000, side: THREE.FrontSide, depthTest: true, depthWrite: false, depthFunc: THREE.LessDepth }));
   const meshOccluder11a = new THREE.Mesh(geomOccluder11, new THREE.MeshBasicMaterial({ color: 0x0000ff, colorWrite: false, side: THREE.FrontSide, depthTest: true, depthWrite: true, depthFunc: THREE.LessDepth }));
   const meshFar11a = new THREE.Mesh(geomFarCenter10, new THREE.MeshBasicMaterial({ color: 0x00ff00, colorWrite: true, side: THREE.FrontSide, depthTest: true, depthWrite: true, depthFunc: THREE.LessDepth }));
   meshBase11a.updateMatrixWorld(true);
@@ -3314,9 +3314,12 @@ export async function testMultiMeshBatchScene(bridgeHost, wasmExports, canvasCon
   if (differs(cand11b, ref11b)) {
     throw new Error("Checkpoint 11b failed: Non-writing occluder candidate differs from direct WebGPU reference");
   }
+  if (!differs(cand11a, cand11b)) {
+    throw new Error("Checkpoint 11b failed: Changing only occluder depthWrite must change the rendered image");
+  }
 
   // 11c: Interleaved visible / invisible in a single batch (spatial multi-mesh)
-  // Left: Base Blue (z = -2.0, depthWrite=true), Occluder (z = -1.5, colorWrite=false, depthWrite=true), Far Yellow (z = -2.5, occluded) -> Left stays Blue
+  // Left: Base Blue (z = -2.0, depthWrite=false), Occluder (z = -1.5, colorWrite=false, depthWrite=true), Far Yellow (z = -2.5, occluded) -> Left stays Blue
   // Right: Base Red (z = -2.0, depthWrite=false), Occluder (z = -1.5, colorWrite=false, depthWrite=false), Far Green (z = -2.5, depthWrite=true) -> Right becomes Green
   const geomOccluderLeft11 = new THREE.BufferGeometry();
   geomOccluderLeft11.setAttribute("position", new THREE.BufferAttribute(new Float32Array([
@@ -3331,7 +3334,7 @@ export async function testMultiMeshBatchScene(bridgeHost, wasmExports, canvasCon
      0.5,  1.0, -1.5,
   ]), 3));
 
-  const meshLeftBase11c = new THREE.Mesh(geomNearLeft10, new THREE.MeshBasicMaterial({ color: 0x0000ff, side: THREE.FrontSide, depthTest: true, depthWrite: true, depthFunc: THREE.LessDepth }));
+  const meshLeftBase11c = new THREE.Mesh(geomNearLeft10, new THREE.MeshBasicMaterial({ color: 0x0000ff, side: THREE.FrontSide, depthTest: true, depthWrite: false, depthFunc: THREE.LessDepth }));
   const meshLeftOcc11c = new THREE.Mesh(geomOccluderLeft11, new THREE.MeshBasicMaterial({ colorWrite: false, side: THREE.FrontSide, depthTest: true, depthWrite: true, depthFunc: THREE.LessDepth }));
   const meshLeftFar11c = new THREE.Mesh(geomFarLeft10, new THREE.MeshBasicMaterial({ color: 0xffff00, side: THREE.FrontSide, depthTest: true, depthWrite: true, depthFunc: THREE.LessDepth }));
 
@@ -3362,7 +3365,7 @@ export async function testMultiMeshBatchScene(bridgeHost, wasmExports, canvasCon
   }
 
   // 11d: Dynamic frame-to-frame colorWrite mutation
-  const baseMesh11d = new THREE.Mesh(geomNearCenter10, new THREE.MeshBasicMaterial({ color: 0xff0000, side: THREE.FrontSide, depthTest: true, depthWrite: true, depthFunc: THREE.LessDepth }));
+  const baseMesh11d = new THREE.Mesh(geomNearCenter10, new THREE.MeshBasicMaterial({ color: 0xff0000, side: THREE.FrontSide, depthTest: true, depthWrite: false, depthFunc: THREE.LessDepth }));
   const mutMesh11d = new THREE.Mesh(geomOccluder11, new THREE.MeshBasicMaterial({ color: 0x0000ff, colorWrite: false, side: THREE.FrontSide, depthTest: true, depthWrite: true, depthFunc: THREE.LessDepth }));
   const farMesh11d = new THREE.Mesh(geomFarCenter10, new THREE.MeshBasicMaterial({ color: 0x00ff00, colorWrite: true, side: THREE.FrontSide, depthTest: true, depthWrite: true, depthFunc: THREE.LessDepth }));
   baseMesh11d.updateMatrixWorld(true);
@@ -3455,5 +3458,195 @@ export async function testMultiMeshBatchScene(bridgeHost, wasmExports, canvasCon
     }
   }
 
-  return "Variable-length multi-mesh batch verified (depth24plus): near-first/far-second with depthWrite=true produces near mesh (Green) matching independent direct WebGPU reference; near-first/far-second with depthWrite=false produces far mesh (Red) matching independent reference and strictly diverging from depthWrite=true; far-first/near-second with depthWrite=true produces near mesh (Green); immutable snapshots verified with distinct dynamic transforms and colors; negative controls strictly refuse empty batch (EMPTY_MESH_BATCH), mixed depth settings on legacy exports (INCOMPATIBLE_BATCH_DEPTH), and invisible meshes; retained WebGLRenderer multi-mesh oracle matches candidate within tolerance" + (canvasContext ? "; visible canvas batch verified against direct reference" : "") + "; scene hierarchy renderScene verified with translated Group, legitimate culls ignored, positive canvas execution (3 admitted, projected center sRGB colors, depth24plus occlusion, planted negative), and separate visible-unsupported whole-scene refusal; material side culling and reflected winding verified (FrontSide/BackSide/DoubleSide, CCW/CW, reflected det<0 parity, mixed-side multi-mesh batch, dynamic mutation between frames matching direct WebGPU reference); mixed per-mesh depth states verified (depthWrite on/off, Less/Greater depthFunc, interleaved disabled depthTest, reflection with depth, multi-frame depth mutation, canvas renderScene mixed depth); colorWrite=false invisible depth occluders verified (depthWrite on/off occlusion, mixed visible/invisible batch, dynamic mutation between frames, direct WebGPU reference parity with writeMask, canvas execution)";
+  // 11f: Public single-mesh routing must retain the mask for DoubleSide too.
+  // Exercise the actual color export alone when disabled, then mutate to visible
+  // with the full module. Black vs white detects a silently used legacy export.
+  const single11f = new THREE.Mesh(geomOccluder11, new THREE.MeshBasicMaterial({
+    color: 0xffffff, side: THREE.DoubleSide, depthFunc: THREE.LessDepth,
+  }));
+  single11f.updateMatrixWorld(true);
+  const colorOnlyExports11f = {
+    f3d_build_mesh_batch_cull_depth_color_packet: wasmExports.f3d_build_mesh_batch_cull_depth_color_packet,
+  };
+  for (const context11f of (canvasContext ? [null, canvasContext] : [null])) {
+    const format11f = context11f ? navigator.gpu.getPreferredCanvasFormat() : "rgba8unorm";
+    for (const [depthEnabled11f, colorWrite11f] of [[true, false], [true, true], [false, false], [false, true]]) {
+      single11f.material.depthTest = depthEnabled11f;
+      single11f.material.depthWrite = depthEnabled11f;
+      single11f.material.colorWrite = colorWrite11f;
+      const exports11f = colorWrite11f ? wasmExports : colorOnlyExports11f;
+      let candidate11f;
+      if (context11f) {
+        context11f.configure({ device, format: format11f, alphaMode: "opaque",
+          usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+        await nextFrame();
+        const readback11f = device.createBuffer({ size: bytesPerRow * height,
+          usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+        const texture11f = context11f.getCurrentTexture();
+        const render11f = adapter.renderMesh(bridgeHost, single11f, camera, context11f, exports11f, { width, height });
+        const copy11f = device.createCommandEncoder();
+        copy11f.copyTextureToBuffer({ texture: texture11f },
+          { buffer: readback11f, bytesPerRow }, [width, height, 1]);
+        device.queue.submit([copy11f.finish()]);
+        await render11f;
+        await readback11f.mapAsync(GPUMapMode.READ);
+        candidate11f = new Uint8Array(readback11f.getMappedRange().slice(0));
+        readback11f.unmap();
+        readback11f.destroy();
+      } else {
+        await adapter.renderMesh(bridgeHost, single11f, camera, null, exports11f, { width, height });
+        candidate11f = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+      }
+      const reference11f = await directMeshReference(device,
+        buildIndependentBatchReferenceInput([single11f], camera, width, height, {
+          hasDepth: depthEnabled11f, depthFormat: "depth24plus", format: format11f, outputSrgb: !!context11f,
+        }));
+      const expected11f = colorWrite11f ? 255 : 0;
+      if ([0, 1, 2].some(channel => Math.abs(candidate11f[centerIdx + channel] - expected11f) > 15)) {
+        throw new Error(`Checkpoint 11f failed: DoubleSide single depth=${depthEnabled11f}, colorWrite=${colorWrite11f}, canvas=${!!context11f}: expected RGB ${expected11f}, got ${candidate11f.slice(centerIdx, centerIdx + 4)}`);
+      }
+      if (differs(candidate11f, reference11f)) {
+        throw new Error(`Checkpoint 11f failed: DoubleSide single depth=${depthEnabled11f}, colorWrite=${colorWrite11f}, canvas=${!!context11f} differs from direct WebGPU reference`);
+      }
+    }
+  }
+
+  // 11g: A no-depth batch still needs mutually compatible pipelines/pass state
+  // when one mesh suppresses color. The later Blue draw must leave Red intact.
+  for (const mesh11g of [meshBase11a, meshOccluder11a]) {
+    mesh11g.material.depthTest = false;
+    mesh11g.material.depthWrite = false;
+  }
+  const batch11g = [meshBase11a, meshOccluder11a];
+  await adapter.renderMeshBatch(bridgeHost, batch11g, camera, null, colorOnlyExports11f, { width, height });
+  const candidate11g = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+  const reference11g = await directMeshReference(device,
+    buildIndependentBatchReferenceInput(batch11g, camera, width, height, { hasDepth: false }));
+  if (candidate11g[centerIdx] < 240 || candidate11g[centerIdx + 1] > 15 || candidate11g[centerIdx + 2] > 15) {
+    throw new Error(`Checkpoint 11g failed: No-depth mask batch must stay Red, got ${candidate11g.slice(centerIdx, centerIdx + 4)}`);
+  }
+  if (differs(candidate11g, reference11g)) {
+    throw new Error("Checkpoint 11g failed: No-depth mask batch differs from direct WebGPU reference");
+  }
+
+  // 12: Persistent uploads must preserve GPU-stale bytes independently of CPU edits.
+  // Keep separate source attributes: WebGL consumes updateRanges when it uploads.
+  const oracleThree12 = await import("/upstream/three.js/build/three.module.js");
+  const initialPositions12 = [-0.8, -0.8, -2, 0.8, -0.8, -2, 0, 0.8, -2];
+  const makeUploadMesh12 = (library) => {
+    const geometry = new library.BufferGeometry();
+    geometry.setAttribute("position", new library.BufferAttribute(new Float32Array(initialPositions12), 3));
+    const mesh = new library.Mesh(geometry, new library.MeshBasicMaterial({
+      color: 0xff0000, side: library.DoubleSide, depthTest: false, depthWrite: false,
+    }));
+    mesh.frustumCulled = false;
+    mesh.updateMatrixWorld(true);
+    const scene = new library.Scene();
+    scene.add(mesh);
+    return { mesh, geometry, scene, library };
+  };
+  const reference12 = makeUploadMesh12(oracleThree12);
+  const candidate12 = makeUploadMesh12(THREE);
+  const pair12 = [reference12, candidate12];
+  const camera12 = new oracleThree12.OrthographicCamera(-1, 1, 1, -1, 0.1, 10);
+  camera12.updateMatrixWorld(true);
+  const renderer12 = new oracleThree12.WebGLRenderer({
+    canvas: document.createElement("canvas"), antialias: false, preserveDrawingBuffer: true,
+  });
+  renderer12.setSize(width, height, false);
+  renderer12.setClearColor(0x000000, 1);
+  renderer12.toneMapping = oracleThree12.NoToneMapping;
+  renderer12.outputColorSpace = oracleThree12.SRGBColorSpace;
+  const gl12 = renderer12.getContext();
+  const probes12 = [[32, 32], [54, 22]];
+  const options12 = { width, height, sourceBackend: "webgl" };
+  async function sampleUpload12(phase, expectedRed, route = "mesh") {
+    renderer12.render(reference12.scene, camera12);
+    const referencePixels = probes12.map(([x, y]) => {
+      const pixel = new Uint8Array(4);
+      gl12.readPixels(x, height - 1 - y, 1, 1, gl12.RGBA, gl12.UNSIGNED_BYTE, pixel);
+      return pixel;
+    });
+    if (route === "scene") {
+      const result = await adapter.renderScene(bridgeHost, candidate12.scene, camera12, null, wasmExports, options12);
+      if (result.admitted.length !== 1 || result.refused.length !== 0) {
+        throw new Error(`Checkpoint 12 ${phase}: upload scene refused: ${JSON.stringify(result)}`);
+      }
+    } else if (route === "batch") {
+      await adapter.renderMeshBatch(bridgeHost, [candidate12.mesh], camera12, null, wasmExports, options12);
+    } else {
+      await adapter.renderMesh(bridgeHost, candidate12.mesh, camera12, null, wasmExports, options12);
+    }
+    const pixels = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+    probes12.forEach(([x, y], probe) => {
+      const actual = pixels.slice(y * bytesPerRow + x * 4, y * bytesPerRow + x * 4 + 4);
+      const reference = referencePixels[probe];
+      const expected = [expectedRed[probe], 0, 0, 255];
+      if (expected.some((value, channel) => Math.abs(reference[channel] - value) > 2)) {
+        throw new Error(`Checkpoint 12 ${phase}: WebGL control at (${x},${y}) expected ${expected}, got ${reference}`);
+      }
+      if (expected.some((_, channel) => Math.abs(actual[channel] - reference[channel]) > 2)) {
+        throw new Error(`Checkpoint 12 ${phase}: candidate at (${x},${y}) ${actual} differs from WebGL ${reference}`);
+      }
+    });
+  }
+  try {
+    await sampleUpload12("first upload", [255, 0]);
+    for (const { geometry } of pair12) {
+      const position = geometry.attributes.position;
+      for (let i = 0; i < position.array.length; i += 3) position.array[i] += 5;
+    }
+    const prepared12 = adapter.prepareMeshPacket(candidate12.mesh, camera12, width, height, wasmExports, options12);
+    if (prepared12.snapshot.positions[0] !== candidate12.geometry.attributes.position.array[0]) {
+      throw new Error("Checkpoint 12: pure preparation must still capture current CPU positions");
+    }
+    await sampleUpload12("unrequested CPU edits", [255, 0], "batch");
+    for (const { geometry } of pair12) {
+      geometry.attributes.position.addUpdateRange(0, 3);
+      geometry.attributes.position.needsUpdate = true;
+    }
+    await sampleUpload12("partial upload preserves other vertices", [0, 255], "scene");
+    for (const { geometry } of pair12) {
+      if (geometry.attributes.position.updateRanges.length !== 0) {
+        throw new Error("Checkpoint 12: submitted partial upload did not consume its update range");
+      }
+      geometry.attributes.position.needsUpdate = true;
+    }
+    await sampleUpload12("full upload", [0, 0]);
+    for (const { geometry } of pair12) geometry.attributes.position.array.set(initialPositions12);
+    await sampleUpload12("CPU restore stays stale before disposal", [0, 0], "batch");
+    for (const { geometry } of pair12) geometry.dispose();
+    await sampleUpload12("dispose and reuse refreshes unchanged version", [255, 0], "scene");
+
+    // Independent position/index versions must survive switching render entry points.
+    const indexedPositions12 = [...initialPositions12, ...initialPositions12.map((value, i) => i % 3 === 0 ? value + 5 : value)];
+    for (const { geometry, library } of pair12) {
+      geometry.dispose();
+      geometry.setAttribute("position", new library.BufferAttribute(new Float32Array(indexedPositions12), 3));
+      geometry.setIndex(new library.BufferAttribute(new Uint16Array([0, 1, 2]), 1));
+    }
+    await sampleUpload12("indexed first upload", [255, 0]);
+    for (const { geometry } of pair12) {
+      geometry.index.array.set([3, 4, 5]);
+      geometry.attributes.position.needsUpdate = true;
+    }
+    await sampleUpload12("position upload leaves unrequested indices stale", [255, 0], "batch");
+    for (const { geometry } of pair12) geometry.index.needsUpdate = true;
+    await sampleUpload12("requested index upload", [0, 0], "scene");
+    for (const { geometry } of pair12) {
+      geometry.attributes.position.array.set(initialPositions12, 9);
+      geometry.index.needsUpdate = true;
+    }
+    await sampleUpload12("index upload leaves unrequested positions stale", [0, 0]);
+    for (const { geometry } of pair12) geometry.attributes.position.needsUpdate = true;
+    await sampleUpload12("requested indexed position upload", [255, 0], "batch");
+  } finally {
+    for (const { geometry, mesh } of pair12) {
+      geometry.dispose();
+      mesh.material.dispose();
+    }
+    renderer12.dispose();
+  }
+
+  return "Variable-length multi-mesh batch verified (depth24plus): near-first/far-second with depthWrite=true produces near mesh (Green) matching independent direct WebGPU reference; near-first/far-second with depthWrite=false produces far mesh (Red) matching independent reference and strictly diverging from depthWrite=true; far-first/near-second with depthWrite=true produces near mesh (Green); immutable snapshots verified with distinct dynamic transforms and colors; negative controls strictly refuse empty batch (EMPTY_MESH_BATCH), mixed depth settings on legacy exports (INCOMPATIBLE_BATCH_DEPTH), and invisible meshes; retained WebGLRenderer multi-mesh oracle matches candidate within tolerance" + (canvasContext ? "; visible canvas batch verified against direct reference" : "") + "; scene hierarchy renderScene verified with translated Group, legitimate culls ignored, positive canvas execution (3 admitted, projected center sRGB colors, depth24plus occlusion, planted negative), and separate visible-unsupported whole-scene refusal; material side culling and reflected winding verified (FrontSide/BackSide/DoubleSide, CCW/CW, reflected det<0 parity, mixed-side multi-mesh batch, dynamic mutation between frames matching direct WebGPU reference); mixed per-mesh depth states verified (depthWrite on/off, Less/Greater depthFunc, interleaved disabled depthTest, reflection with depth, multi-frame depth mutation, canvas renderScene mixed depth); colorWrite=false invisible depth occluders verified (depthWrite on/off occlusion, mixed visible/invisible batch, dynamic mutation between frames, direct WebGPU reference parity with writeMask, canvas execution, DoubleSide single-mesh routing with new export alone)";
 }

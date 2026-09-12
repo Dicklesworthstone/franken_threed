@@ -12,7 +12,14 @@ export async function testDeviceReplacement(buildPacket) {
   };
 
   async function render() {
-    await host.executePacket(buildPacket(true));
+    let observed = 0;
+    const completion = host.executePacket(buildPacket(true), null, () => {
+      assert(!host.errorScopeActive, "Submission observer ran inside shared device error scopes");
+      assert(host.buffers.has(40) && host.buffers.has(41), "Submission observer preceded packet execution");
+      observed++;
+    });
+    assert(observed === 1, "Submission observer did not run synchronously exactly once");
+    await completion;
     const red = await host.readbackBuffer(40, 256 * 64);
     const blue = await host.readbackBuffer(41, 256 * 64);
     const offset = 32 * 256 + 32 * 4;
@@ -32,6 +39,21 @@ export async function testDeviceReplacement(buildPacket) {
       "Older device request published after a newer request started");
     assert(requests[1].status === "fulfilled", "Latest device request failed");
     await render();
+
+    // Fail during scoped command decoding, before submit. A failed preparation
+    // must not tell the adapter to publish uploads or clear update ranges.
+    const malformed = buildPacket(true).slice();
+    new DataView(malformed.buffer, malformed.byteOffset, malformed.byteLength).setUint16(16, 0xffff, true);
+    let invalidObserved = false;
+    const invalid = await host.executePacket(malformed, null, () => { invalidObserved = true; }).then(
+      () => null, error => error,
+    );
+    assert(invalid && !invalidObserved, "Malformed packet notified submission despite never reaching submit");
+
+    const asyncObserver = await host.executePacket(buildPacket(true), null,
+      () => host.executePacket(malformed)).then(() => null, error => error);
+    assert(asyncObserver instanceof TypeError && /synchronously/.test(asyncObserver.message),
+      "Async submission observer was accepted or its nested rejection was left unowned");
 
     const firstDevice = host.device;
     const firstGeneration = host.deviceGeneration;
