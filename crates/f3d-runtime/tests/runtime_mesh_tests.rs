@@ -25,7 +25,7 @@ use f3d_runtime::mesh::{
     f3d_build_mesh_depth_packet, f3d_build_mesh_packet, generate_mesh_wgsl,
     gpu_bridge_build_canvas_mesh_depth_packet, gpu_bridge_build_canvas_mesh_packet,
     gpu_bridge_build_mesh_depth_packet, gpu_bridge_build_mesh_packet,
-    srgb_transfer_oetf_cpu, DynamicMeshInput,
+    DynamicMeshInput,
     MeshDepthOptions, MeshPacketError, MESH_CANVAS_PIPELINE_ID, MESH_CANVAS_TARGET_ID,
     MESH_CLEAR_COLOR, MESH_DEPTH_TEXTURE_ID, MESH_PIPELINE_ID, MESH_READBACK_BUFFER_ID,
     MESH_TARGET_TEXTURE_ID, MESH_UNIFORM_BUFFER_ID, MESH_VERTEX_BUFFER_ID,
@@ -1502,62 +1502,117 @@ fn test_frame_session_depth_begin_seam() {
 }
 
 #[test]
-fn test_generate_mesh_wgsl_contains_srgb_oetf_and_encoded_return() {
-    let wgsl_webgpu = generate_mesh_wgsl(false);
+fn test_offscreen_mesh_wgsl_retains_linear_srgb() {
+    let wgsl_native = generate_mesh_wgsl(false);
     assert!(
-        wgsl_webgpu.contains("fn srgb_transfer_oetf(color: vec3<f32>) -> vec3<f32>"),
-        "WGSL must define srgb_transfer_oetf function"
+        !wgsl_native.contains("srgb_transfer_oetf"),
+        "offscreen WGSL must NOT define or invoke srgb_transfer_oetf"
     );
     assert!(
-        wgsl_webgpu.contains("select(a, b, color <= vec3<f32>(0.0031308))"),
-        "WGSL srgb_transfer_oetf must perform conditional select at 0.0031308 threshold"
-    );
-    assert!(
-        wgsl_webgpu.contains("let srgb_rgb = srgb_transfer_oetf(uniforms.color.rgb);"),
-        "fs_main must encode uniforms.color.rgb with srgb_transfer_oetf"
-    );
-    assert!(
-        wgsl_webgpu.contains("return vec4<f32>(srgb_rgb, uniforms.color.a);"),
-        "fs_main must return encoded RGB with unmodified alpha"
+        wgsl_native.contains("return uniforms.color;"),
+        "offscreen WGSL fs_main must retain linear-sRGB output matching default upstream RenderTarget"
     );
 
     let wgsl_webgl = generate_mesh_wgsl(true);
     assert!(
-        wgsl_webgl.contains("fn srgb_transfer_oetf(color: vec3<f32>) -> vec3<f32>"),
-        "WebGL depth mode WGSL must define srgb_transfer_oetf"
+        !wgsl_webgl.contains("srgb_transfer_oetf"),
+        "offscreen WebGL-depth WGSL must NOT define srgb_transfer_oetf"
     );
     assert!(
-        wgsl_webgl.contains("let srgb_rgb = srgb_transfer_oetf(uniforms.color.rgb);"),
-        "WebGL depth mode fs_main must encode uniforms.color.rgb"
+        wgsl_webgl.contains("clip.z = (clip.z + clip.w) * 0.5;"),
+        "offscreen WebGL-depth WGSL must remap clip.z"
     );
+    assert!(
+        wgsl_webgl.contains("return uniforms.color;"),
+        "offscreen WebGL-depth WGSL fs_main must return unencoded uniforms.color"
+    );
+
+    // Verify offscreen submission packets emit linear-sRGB shaders
+    let positions = [0.0_f32, 0.5, 0.0, -0.5, -0.5, 0.0, 0.5, -0.5, 0.0];
+    let indices: [u32; 0] = [];
+    let color = [1.0_f32, 0.5, 0.25, 1.0];
+    let input = DynamicMeshInput::try_from_raw(
+        &positions, &indices, &IDENTITY_F64, &IDENTITY_F64, &color, 64, 64, false,
+    ).unwrap();
+
+    let packet = build_mesh_submission(&input).unwrap();
+    if let GpuCommand::CreatePipeline { wgsl_code, .. } = &packet.commands()[3] {
+        assert!(wgsl_code.contains("return uniforms.color;"));
+        assert!(!wgsl_code.contains("srgb_transfer_oetf"));
+    } else {
+        panic!("expected CreatePipeline at command 3");
+    }
+
+    let depth_opts = MeshDepthOptions::new(true, true, 2).unwrap();
+    let depth_packet = build_mesh_depth_submission(&input, depth_opts).unwrap();
+    if let GpuCommand::CreatePipelineDepth { wgsl_code, .. } = &depth_packet.commands()[4] {
+        assert!(wgsl_code.contains("return uniforms.color;"));
+        assert!(!wgsl_code.contains("srgb_transfer_oetf"));
+    } else {
+        panic!("expected CreatePipelineDepth at command 4");
+    }
 }
 
 #[test]
-fn test_srgb_oetf_cpu_formula_midtone() {
-    // Specification: midtone 0.5 -> ~0.7354 per Three.js r186 ColorManagement.LinearToSRGB
-    let midtone = 0.5_f32;
-    let srgb_midtone = srgb_transfer_oetf_cpu(midtone);
-    assert!(
-        (srgb_midtone - 0.7354).abs() < 1e-4,
-        "sRGB OETF of midtone 0.5 must be ~0.7354 (got {srgb_midtone})"
-    );
-    assert_eq!(
-        (srgb_midtone * 10000.0).round() / 10000.0,
-        0.7354,
-        "sRGB OETF of midtone 0.5 rounded to 4 decimals must equal 0.7354"
-    );
+fn test_canvas_mesh_packet_emits_srgb_oetf() {
+    let positions = [0.0_f32, 0.5, 0.0, -0.5, -0.5, 0.0, 0.5, -0.5, 0.0];
+    let indices: [u32; 0] = [];
+    let color = [1.0_f32, 0.5, 0.25, 1.0];
 
-    // Endpoint 0.0 -> 0.0
-    assert_eq!(srgb_transfer_oetf_cpu(0.0), 0.0);
+    // 1. Native WebGPU canvas submission
+    let input_native = DynamicMeshInput::try_from_raw(
+        &positions, &indices, &IDENTITY_F64, &IDENTITY_F64, &color, 64, 64, false,
+    ).unwrap();
+    let canvas_packet = build_mesh_canvas_submission(&input_native).unwrap();
+    if let GpuCommand::CreatePipeline { wgsl_code, .. } = &canvas_packet.commands()[3] {
+        assert!(
+            wgsl_code.contains("fn srgb_transfer_oetf(color: vec3<f32>) -> vec3<f32>"),
+            "canvas pipeline must define srgb_transfer_oetf"
+        );
+        assert!(
+            wgsl_code.contains("select(a, b, color <= vec3<f32>(0.0031308))"),
+            "canvas pipeline must use threshold 0.0031308 select"
+        );
+        assert!(
+            wgsl_code.contains("pow(clamped, vec3<f32>(0.41666))"),
+            "canvas pipeline must use exponent 0.41666"
+        );
+        assert!(
+            wgsl_code.contains("let srgb_rgb = srgb_transfer_oetf(uniforms.color.rgb);"),
+            "canvas pipeline must encode uniforms.color.rgb"
+        );
+        assert!(
+            wgsl_code.contains("return vec4<f32>(srgb_rgb, uniforms.color.a);"),
+            "canvas pipeline must return encoded RGB with unmodified alpha"
+        );
+        assert!(
+            !wgsl_code.contains("clip.z = (clip.z + clip.w) * 0.5;"),
+            "native WebGPU canvas pipeline must not remap depth"
+        );
+    } else {
+        panic!("expected CreatePipeline at command 3");
+    }
 
-    // Endpoint 1.0 -> 1.0 (within float precision: 1.055 * 1.0 - 0.055 = 1.0)
-    assert!((srgb_transfer_oetf_cpu(1.0) - 1.0).abs() < 1e-6);
+    // 2. WebGL-depth canvas submission
+    let input_webgl = DynamicMeshInput::try_from_raw(
+        &positions, &indices, &IDENTITY_F64, &IDENTITY_F64, &color, 64, 64, true,
+    ).unwrap();
+    let canvas_packet_webgl = build_mesh_canvas_submission(&input_webgl).unwrap();
+    if let GpuCommand::CreatePipeline { wgsl_code, .. } = &canvas_packet_webgl.commands()[3] {
+        assert!(wgsl_code.contains("clip.z = (clip.z + clip.w) * 0.5;"));
+        assert!(wgsl_code.contains("fn srgb_transfer_oetf(color: vec3<f32>) -> vec3<f32>"));
+        assert!(wgsl_code.contains("return vec4<f32>(srgb_rgb, uniforms.color.a);"));
+    } else {
+        panic!("expected CreatePipeline at command 3");
+    }
 
-    // Linear sub-threshold region (v <= 0.0031308): v * 12.92
-    let sub = 0.001_f32;
-    assert_eq!(srgb_transfer_oetf_cpu(sub), 0.001 * 12.92);
-
-    // Linear sub-threshold region negative value
-    let neg = -0.5_f32;
-    assert_eq!(srgb_transfer_oetf_cpu(neg), -0.5 * 12.92);
+    // 3. Depth-enabled canvas submission
+    let depth_opts = MeshDepthOptions::new(true, true, 2).unwrap();
+    let depth_canvas_packet = build_mesh_canvas_depth_submission(&input_native, depth_opts).unwrap();
+    if let GpuCommand::CreatePipelineDepth { wgsl_code, .. } = &depth_canvas_packet.commands()[4] {
+        assert!(wgsl_code.contains("fn srgb_transfer_oetf(color: vec3<f32>) -> vec3<f32>"));
+        assert!(wgsl_code.contains("return vec4<f32>(srgb_rgb, uniforms.color.a);"));
+    } else {
+        panic!("expected CreatePipelineDepth at command 4");
+    }
 }

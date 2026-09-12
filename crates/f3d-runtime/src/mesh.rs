@@ -317,20 +317,20 @@ impl MeshDepthOptions {
 
 /// Shared internal shader helper with canvas sRGB output flag.
 ///
-/// When `canvas_srgb` is `true` (canvas presentation target), the fragment shader applies
+/// When `output_srgb` is `true` (canvas presentation target), the fragment shader applies
 /// the pinned Three.js r186 sRGB OETF transfer (`ColorSpaceFunctions.js:38-48`, exponent 0.41666,
 /// threshold 0.0031308) to `uniforms.color.rgb`, leaving alpha unchanged.
 ///
-/// When `canvas_srgb` is `false` (offscreen render target), the shader retains linear-sRGB output
+/// When `output_srgb` is `false` (offscreen render target), the shader retains linear-sRGB output
 /// matching default upstream `RenderTarget` working space.
-fn generate_mesh_wgsl_internal(webgl_depth: bool, canvas_srgb: bool) -> String {
+fn generate_mesh_wgsl_internal(webgl_depth: bool, output_srgb: bool) -> String {
     let depth_remap = if webgl_depth {
         "    clip.z = (clip.z + clip.w) * 0.5;\n"
     } else {
         ""
     };
 
-    let (srgb_fn, fragment_body) = if canvas_srgb {
+    let (srgb_fn, fragment_body) = if output_srgb {
         (
             "\
 fn srgb_transfer_oetf(color: vec3<f32>) -> vec3<f32> {\n\
@@ -398,28 +398,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{\n\
 #[must_use]
 pub fn generate_mesh_wgsl(webgl_depth: bool) -> String {
     generate_mesh_wgsl_internal(webgl_depth, false)
-}
-
-/// Generates the WGSL shader source code for dynamic canvas mesh rendering (sRGB output).
-///
-/// Applies the pinned Three.js r186 sRGB OETF transfer (`ColorSpaceFunctions.js:38-48`,
-/// exponent 0.41666, threshold 0.0031308) in `fs_main` while keeping alpha unchanged.
-#[must_use]
-pub fn generate_mesh_canvas_wgsl(webgl_depth: bool) -> String {
-    generate_mesh_wgsl_internal(webgl_depth, true)
-}
-
-/// Reference CPU evaluation of sRGB OETF transfer matching Three.js r186 `ColorManagement.LinearToSRGB`.
-///
-/// Evaluates: `v <= 0.0031308 ? v * 12.92 : 1.055 * pow(v, 0.41666) - 0.055`.
-#[inline]
-#[must_use]
-pub fn srgb_transfer_oetf_cpu(v: f32) -> f32 {
-    if v <= 0.0031308 {
-        v * 12.92
-    } else {
-        f3d_math::color::linear_to_srgb(v as f64) as f32
-    }
 }
 
 /// Helper: de-indexes vertex positions and formats the padded uniform buffer record.
@@ -593,7 +571,7 @@ fn build_mesh_submission_internal(
         usage: BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST,
     });
 
-    let wgsl_code = generate_mesh_wgsl(input.webgl_depth);
+    let wgsl_code = generate_mesh_wgsl_internal(input.webgl_depth, false);
     if let Some(depth) = depth_opts {
         let (depth_write_enabled, depth_compare) = depth.resolve_effective();
         packet.push(GpuCommand::CreatePipelineDepth {
@@ -772,7 +750,7 @@ fn build_mesh_canvas_submission_internal(
         });
     }
 
-    let wgsl_code = generate_mesh_canvas_wgsl(input.webgl_depth);
+    let wgsl_code = generate_mesh_wgsl_internal(input.webgl_depth, true);
     if let Some(depth) = depth_opts {
         let (depth_write_enabled, depth_compare) = depth.resolve_effective();
         packet.push(GpuCommand::CreatePipelineDepth {
