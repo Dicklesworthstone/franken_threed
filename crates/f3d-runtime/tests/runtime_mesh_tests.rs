@@ -16,24 +16,29 @@ use f3d_runtime::gpu_host::{
     GpuCommand, GpuSubmissionPacket, BUFFER_USAGE_COPY_DST, BUFFER_USAGE_MAP_READ,
     BUFFER_USAGE_UNIFORM, BUFFER_USAGE_VERTEX, CULL_MODE_BACK, CULL_MODE_FRONT,
     CULL_MODE_NONE, DEPTH_COMPARE_ALWAYS, DEPTH_COMPARE_GREATER, DEPTH_COMPARE_LESS,
+    DEPTH_COMPARE_LESS_EQUAL,
     FRONT_FACE_CCW, FRONT_FACE_CW,
     OPCODE_CREATE_PIPELINE, OPCODE_CREATE_PIPELINE_CULL, OPCODE_CREATE_PIPELINE_DEPTH,
     OPCODE_CREATE_PIPELINE_DEPTH_CULL, OPCODE_CREATE_PIPELINE_DEPTH_CULL_COLOR,
     TARGET_CANVAS, TARGET_FORMAT_DEPTH24PLUS,
-    TARGET_FORMAT_PREFERRED_CANVAS, TARGET_FORMAT_RGBA8UNORM, TEXTURE_USAGE_COPY_SRC,
-    TEXTURE_USAGE_RENDER_ATTACHMENT,
+    TARGET_FORMAT_PREFERRED_CANVAS, TARGET_FORMAT_RGBA8UNORM, TARGET_OFFSCREEN,
+    TEXTURE_USAGE_COPY_SRC, TEXTURE_USAGE_RENDER_ATTACHMENT,
 };
 use f3d_runtime::mesh::{
     build_mesh_canvas_depth_submission, build_mesh_canvas_submission,
     build_mesh_depth_submission, build_mesh_submission,
     build_multi_mesh_canvas_depth_submission, build_multi_mesh_canvas_submission,
     build_multi_mesh_depth_submission, build_multi_mesh_submission,
+    build_scene_clear_packet_impl, build_scene_clear_submission,
     f3d_build_canvas_mesh_depth_packet, f3d_build_canvas_mesh_packet,
     f3d_build_mesh_batch_cull_depth_color_packet,
     f3d_build_mesh_batch_cull_depth_packet, f3d_build_mesh_batch_cull_packet,
     f3d_build_mesh_batch_packet,
+    f3d_build_mesh_batch_vertex_color_clear_packet,
     f3d_build_mesh_batch_vertex_color_packet,
-    build_mesh_batch_vertex_color_packet_impl,
+    f3d_build_scene_clear_packet,
+    build_mesh_batch_cull_depth_color_packet_impl,
+    build_mesh_batch_vertex_color_clear_packet_impl,
     f3d_build_mesh_depth_packet, f3d_build_mesh_packet,
     generate_mesh_wgsl,
     gpu_bridge_build_canvas_mesh_depth_packet, gpu_bridge_build_canvas_mesh_packet,
@@ -2390,15 +2395,18 @@ struct ParsedPacketSummary {
     draw_passes: Vec<ParsedDrawPass>,
     vertex_strides: Vec<u32>,
     write_buffers: Vec<(u32, u32, Vec<u8>)>,
+    clear_colors: Vec<[f32; 4]>,
 }
 
 fn scan_packet_commands(packet_bytes: &[u8]) -> ParsedPacketSummary {
     assert!(packet_bytes.len() >= 16, "packet too short for header");
     assert_eq!(&packet_bytes[0..4], b"F3DP", "magic mismatch");
-    let total_packet_len = u32::from_le_bytes(packet_bytes[4..8].try_into().unwrap()) as usize;
     let cmd_count = u32::from_le_bytes(packet_bytes[8..12].try_into().unwrap());
     let total_data_len = u32::from_le_bytes(packet_bytes[12..16].try_into().unwrap()) as usize;
-    let data_payload_start = total_packet_len - total_data_len;
+    let data_payload_start = packet_bytes
+        .len()
+        .checked_sub(total_data_len)
+        .expect("data payload exceeds packet length");
     let mut cursor = 16usize;
     let mut summary = ParsedPacketSummary::default();
 
@@ -2428,6 +2436,11 @@ fn scan_packet_commands(packet_bytes: &[u8]) -> ParsedPacketSummary {
             4 => { // RENDER_PASS
                 let raw_target = u32::from_le_bytes(packet_bytes[cursor..cursor + 4].try_into().unwrap());
                 let pass_flags = (raw_target >> 24) & 0xFF;
+                let c0 = f32::from_le_bytes(packet_bytes[cursor + 8..cursor + 12].try_into().unwrap());
+                let c1 = f32::from_le_bytes(packet_bytes[cursor + 12..cursor + 16].try_into().unwrap());
+                let c2 = f32::from_le_bytes(packet_bytes[cursor + 16..cursor + 20].try_into().unwrap());
+                let c3 = f32::from_le_bytes(packet_bytes[cursor + 20..cursor + 24].try_into().unwrap());
+                summary.clear_colors.push([c0, c1, c2, c3]);
                 let pid = u32::from_le_bytes(packet_bytes[cursor + 24..cursor + 28].try_into().unwrap());
                 let v_count = u32::from_le_bytes(packet_bytes[cursor + 32..cursor + 36].try_into().unwrap());
                 let dyn_offset = u32::from_le_bytes(packet_bytes[cursor + 36..cursor + 40].try_into().unwrap());
@@ -2461,6 +2474,11 @@ fn scan_packet_commands(packet_bytes: &[u8]) -> ParsedPacketSummary {
             13 => { // RENDER_PASS_DEPTH
                 let raw_target = u32::from_le_bytes(packet_bytes[cursor..cursor + 4].try_into().unwrap());
                 let pass_flags = (raw_target >> 24) & 0xFF;
+                let c0 = f32::from_le_bytes(packet_bytes[cursor + 8..cursor + 12].try_into().unwrap());
+                let c1 = f32::from_le_bytes(packet_bytes[cursor + 12..cursor + 16].try_into().unwrap());
+                let c2 = f32::from_le_bytes(packet_bytes[cursor + 16..cursor + 20].try_into().unwrap());
+                let c3 = f32::from_le_bytes(packet_bytes[cursor + 20..cursor + 24].try_into().unwrap());
+                summary.clear_colors.push([c0, c1, c2, c3]);
                 let pid = u32::from_le_bytes(packet_bytes[cursor + 24..cursor + 28].try_into().unwrap());
                 let v_count = u32::from_le_bytes(packet_bytes[cursor + 32..cursor + 36].try_into().unwrap());
                 let dyn_offset = u32::from_le_bytes(packet_bytes[cursor + 36..cursor + 40].try_into().unwrap());
@@ -3905,8 +3923,10 @@ fn test_mesh_batch_vertex_color_shader_semantics_offscreen_and_canvas() {
     }
 }
 
+/// Verifies encoded packet byte lengths match the saved prior Wasm baseline (`out/browser-probe/legacy_mesh_packet_baseline_20260912.json`).
+/// Note: Length matching checks structural payload sizing; full byte-level hash verification is conducted against compiled Wasm outputs.
 #[test]
-fn test_legacy_mesh_packet_byte_baseline_matches_exact_cases() {
+fn test_legacy_mesh_packet_lengths_match_prior_wasm() {
     let tri = [0.0f32, 0.5, 0.0, -0.5, -0.5, 0.0, 0.5, -0.5, 0.0];
     let vertex_counts = [3u32];
     let model_views = IDENTITY_F64;
@@ -3916,7 +3936,7 @@ fn test_legacy_mesh_packet_byte_baseline_matches_exact_cases() {
     let front_faces = [0u8];
     let depth_tests = [1u8];
     let depth_writes = [1u8];
-    let depth_compares = [DEPTH_COMPARE_LESS];
+    let depth_compares = [DEPTH_COMPARE_LESS_EQUAL];
     let color_writes = [1u8];
 
     // Case 0: canvas=false, webgl_depth=false -> exact length 1267
@@ -3990,8 +4010,11 @@ fn test_mesh_batch_vertex_color_validation_errors() {
     assert!(err.contains("vertex_colors array length must match total vertex count * 4 = 12 (got 8)"));
 }
 
+/// Internal parity verification: confirms that calling public and impl variants of `cull_depth_color`
+/// produces identical packet bytes and retains stride 20 when vertex colors are absent.
+/// Note: This is an internal export-route consistency check, not cross-version byte proof.
 #[test]
-fn test_mesh_batch_vertex_color_preserves_old_packets_byte_identical() {
+fn test_mesh_batch_cull_depth_color_internal_parity_and_stride_20() {
     let tri = [0.0f32, 0.5, 0.0, -0.5, -0.5, 0.0, 0.5, -0.5, 0.0];
     let positions = tri;
     let vertex_counts = [3u32];
@@ -4048,4 +4071,170 @@ fn test_mesh_batch_vertex_color_preserves_old_packets_byte_identical() {
     let summary = scan_packet_commands(&cull_depth_color_bytes);
     // Uncolored batch uses stride 20 (VertexPosUv)
     assert_eq!(summary.vertex_strides, vec![20]);
+}
+
+/// Verifies batch vertex-color clear-color packet semantics:
+/// 1. Default clear color ([0.0, 0.0, 0.0, 1.0]) matches unclear legacy batch byte-for-byte in offscreen and canvas.
+/// 2. Custom clear colors encode properly into render pass commands (verified via parsed clear RGBA).
+/// 3. Public API and internal impl enforce length == 4 validation discipline.
+#[test]
+fn test_mesh_batch_vertex_color_clear_packet_semantics() {
+    let tri = [0.0f32, 0.5, 0.0, -0.5, -0.5, 0.0, 0.5, -0.5, 0.0];
+    let v_colors = [
+        1.0f32, 0.0, 0.0, 1.0,
+        0.0, 1.0, 0.0, 1.0,
+        0.0, 0.0, 1.0, 1.0,
+    ];
+    let build_clear = |canvas: bool, clear: &[f32]| {
+        f3d_build_mesh_batch_vertex_color_clear_packet(
+            &tri, &[3], &IDENTITY_F64, &IDENTITY_F64, &[1.0, 0.0, 0.0, 1.0],
+            &[0], &[0], &[1], &[1], &[DEPTH_COMPARE_LESS], &[1],
+            64, 64, false, canvas, &v_colors, clear,
+        )
+    };
+    let build_legacy = |canvas: bool| {
+        f3d_build_mesh_batch_vertex_color_packet(
+            &tri, &[3], &IDENTITY_F64, &IDENTITY_F64, &[1.0, 0.0, 0.0, 1.0],
+            &[0], &[0], &[1], &[1], &[DEPTH_COMPARE_LESS], &[1],
+            64, 64, false, canvas, &v_colors,
+        ).expect("legacy packet")
+    };
+
+    // 1. Loop over canvas and offscreen: verify legacy default preservation & custom decoded clear colors
+    for canvas in [false, true] {
+        let legacy_bytes = build_legacy(canvas);
+        let default_bytes = build_clear(canvas, &[0.0, 0.0, 0.0, 1.0]).expect("default clear");
+        assert_eq!(legacy_bytes, default_bytes, "default clear must match legacy byte-for-byte");
+
+        let custom_clear = [0.25f32, 0.5, 0.75, 0.9];
+        let custom_bytes = build_clear(canvas, &custom_clear).expect("custom clear");
+        assert_ne!(custom_bytes, default_bytes);
+
+        let summary = scan_packet_commands(&custom_bytes);
+        assert_eq!(summary.clear_colors, vec![custom_clear]);
+        assert_eq!(summary.vertex_strides, vec![28]);
+    }
+
+    // 2. Loop over invalid lengths on public API
+    for bad_len in [0, 1, 2, 3, 5] {
+        let bad_slice = vec![0.5f32; bad_len];
+        let err = build_clear(false, &bad_slice).unwrap_err();
+        assert!(err.contains(&format!("clear_color must contain exactly 4 elements (got {bad_len})")));
+    }
+
+    // 3. One typed invalid-length assert on impl
+    let typed_err = build_mesh_batch_vertex_color_clear_packet_impl(
+        &tri, &[3], &IDENTITY_F64, &IDENTITY_F64, &[1.0, 0.0, 0.0, 1.0],
+        &[0], &[0], &[1], &[1], &[DEPTH_COMPARE_LESS], &[1],
+        64, 64, false, false, &v_colors, &[0.0, 0.0, 0.0],
+    ).unwrap_err();
+    assert!(matches!(typed_err, MeshPacketError::InvalidClearColorLength { len: 3 }));
+}
+
+#[test]
+fn test_scene_clear_packet_structure_and_validation() {
+    let clear_color = [0.2f32, 0.4, 0.6, 0.8];
+
+    // 1. Offscreen clear packet: target10 + readback20 + RenderPass(vertexCount=0) + CopyTextureToBuffer
+    let offscreen_packet = build_scene_clear_submission(64, 64, &clear_color, false)
+        .expect("build offscreen scene clear submission");
+    let offscreen_cmds = offscreen_packet.commands();
+    assert_eq!(offscreen_cmds.len(), 4, "offscreen clear requires exactly 4 commands");
+    match &offscreen_cmds[0] {
+        GpuCommand::CreateTexture { texture_id, width, height, format, usage } => {
+            assert_eq!(*texture_id, MESH_TARGET_TEXTURE_ID);
+            assert_eq!(*width, 64);
+            assert_eq!(*height, 64);
+            assert_eq!(*format, TARGET_FORMAT_RGBA8UNORM);
+            assert_eq!(*usage, TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC);
+        }
+        other => panic!("expected CreateTexture for offscreen target, got {other:?}"),
+    }
+    match &offscreen_cmds[1] {
+        GpuCommand::CreateBuffer { buffer_id, size, usage } => {
+            assert_eq!(*buffer_id, MESH_READBACK_BUFFER_ID);
+            assert_eq!(*size, 256 * 64);
+            assert_eq!(*usage, BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST);
+        }
+        other => panic!("expected CreateBuffer for readback, got {other:?}"),
+    }
+    match &offscreen_cmds[2] {
+        GpuCommand::RenderPass {
+            target_type, target_id, clear_color: c, vertex_count, pipeline_id, vertex_buffer_id, ..
+        } => {
+            assert_eq!(*target_type, TARGET_OFFSCREEN);
+            assert_eq!(*target_id, MESH_TARGET_TEXTURE_ID);
+            assert_eq!(*c, clear_color);
+            assert_eq!(*vertex_count, 0, "clear pass must specify vertex_count=0");
+            assert_eq!(*pipeline_id, 0);
+            assert_eq!(*vertex_buffer_id, 0);
+        }
+        other => panic!("expected RenderPass for offscreen clear, got {other:?}"),
+    }
+    match &offscreen_cmds[3] {
+        GpuCommand::CopyTextureToBuffer { texture_id, buffer_id, width, height, .. } => {
+            assert_eq!(*texture_id, MESH_TARGET_TEXTURE_ID);
+            assert_eq!(*buffer_id, MESH_READBACK_BUFFER_ID);
+            assert_eq!(*width, 64);
+            assert_eq!(*height, 64);
+        }
+        other => panic!("expected CopyTextureToBuffer, got {other:?}"),
+    }
+
+    // Public export parity for offscreen
+    let offscreen_bytes = f3d_build_scene_clear_packet(64, 64, &clear_color, false)
+        .expect("f3d_build_scene_clear_packet offscreen");
+    assert_eq!(offscreen_bytes, offscreen_packet.encode().unwrap());
+
+    // 2. Canvas clear packet: exactly 1 RenderPass(vertexCount=0, canvas target)
+    let canvas_packet = build_scene_clear_submission(64, 64, &clear_color, true)
+        .expect("build canvas scene clear submission");
+    let canvas_cmds = canvas_packet.commands();
+    assert_eq!(canvas_cmds.len(), 1, "canvas clear requires exactly 1 command");
+    match &canvas_cmds[0] {
+        GpuCommand::RenderPass {
+            target_type, target_id, clear_color: c, vertex_count, pipeline_id, vertex_buffer_id, ..
+        } => {
+            assert_eq!(*target_type, TARGET_CANVAS);
+            assert_eq!(*target_id, MESH_CANVAS_TARGET_ID);
+            assert_eq!(*c, clear_color);
+            assert_eq!(*vertex_count, 0, "clear pass must specify vertex_count=0");
+            assert_eq!(*pipeline_id, 0);
+            assert_eq!(*vertex_buffer_id, 0);
+        }
+        other => panic!("expected RenderPass for canvas clear, got {other:?}"),
+    }
+
+    let canvas_bytes = f3d_build_scene_clear_packet(64, 64, &clear_color, true)
+        .expect("f3d_build_scene_clear_packet canvas");
+    assert_eq!(canvas_bytes, canvas_packet.encode().unwrap());
+
+    // 3. Validation: zero dimensions, invalid clear color length, alignment overflow
+    assert!(matches!(
+        build_scene_clear_submission(0, 64, &clear_color, false),
+        Err(MeshPacketError::ZeroDimensions { width: 0, height: 64 })
+    ));
+    assert!(matches!(
+        build_scene_clear_submission(64, 0, &clear_color, true),
+        Err(MeshPacketError::ZeroDimensions { width: 64, height: 0 })
+    ));
+
+    for bad_len in [0, 1, 2, 3, 5] {
+        let bad_slice = vec![0.5f32; bad_len];
+        assert!(matches!(
+            build_scene_clear_submission(64, 64, &bad_slice, false),
+            Err(MeshPacketError::InvalidClearColorLength { len }) if len == bad_len
+        ));
+        let err_str = f3d_build_scene_clear_packet(64, 64, &bad_slice, true).unwrap_err();
+        assert!(err_str.contains(&format!("clear_color must contain exactly 4 elements (got {bad_len})")));
+    }
+
+    assert!(matches!(
+        build_scene_clear_submission(u32::MAX, 64, &clear_color, false),
+        Err(MeshPacketError::InvalidDimensions(_))
+    ));
+    assert!(matches!(
+        build_scene_clear_submission(64, u32::MAX, &clear_color, false),
+        Err(MeshPacketError::InvalidDimensions(_))
+    ));
 }

@@ -37,8 +37,9 @@ use crate::gpu_host::{
     with_global_resource_table, GpuCommand, GpuSubmissionPacket, BUFFER_USAGE_COPY_DST,
     BUFFER_USAGE_MAP_READ, BUFFER_USAGE_UNIFORM, BUFFER_USAGE_VERTEX, CULL_MODE_BACK,
     CULL_MODE_FRONT, CULL_MODE_NONE, DEPTH_COMPARE_ALWAYS, DEPTH_COMPARE_LESS, FRONT_FACE_CCW,
-    FRONT_FACE_CW, OPCODE_CREATE_PIPELINE_CULL, OPCODE_CREATE_PIPELINE_DEPTH_CULL,
-    TARGET_FORMAT_DEPTH24PLUS, TARGET_FORMAT_PREFERRED_CANVAS, TARGET_FORMAT_RGBA8UNORM,
+    FRONT_FACE_CW, LOAD_OP_CLEAR, OPCODE_CREATE_PIPELINE_CULL, OPCODE_CREATE_PIPELINE_DEPTH_CULL,
+    PASS_FLAG_NEW_PASS, STORE_OP_STORE, TARGET_CANVAS, TARGET_FORMAT_DEPTH24PLUS,
+    TARGET_FORMAT_PREFERRED_CANVAS, TARGET_FORMAT_RGBA8UNORM, TARGET_OFFSCREEN,
     TEXTURE_USAGE_COPY_SRC, TEXTURE_USAGE_RENDER_ATTACHMENT,
 };
 
@@ -78,6 +79,8 @@ pub enum MeshPacketError {
     InvalidColorWriteArrayLength { expected: usize, actual: usize },
     /// Array length mismatch for vertex colors in batch submission.
     InvalidVertexColorLength { expected: usize, actual: usize },
+    /// Clear color array does not have exactly 4 elements.
+    InvalidClearColorLength { len: usize },
     /// Target dimension alignment, vertex count, or row pitch calculation failed.
     InvalidDimensions(String),
     /// Render session, graph compilation, or plan lowering error.
@@ -142,6 +145,9 @@ impl fmt::Display for MeshPacketError {
             }
             Self::InvalidVertexColorLength { expected, actual } => {
                 write!(f, "vertex_colors array length must match total vertex count * 4 = {expected} (got {actual})")
+            }
+            Self::InvalidClearColorLength { len } => {
+                write!(f, "clear_color must contain exactly 4 elements (got {len})")
             }
             Self::InvalidDimensions(msg) => write!(f, "invalid dimensions: {msg}"),
             Self::SessionError(msg) => write!(f, "render session error: {msg}"),
@@ -797,7 +803,7 @@ pub fn build_mesh_depth_submission(
 pub fn build_multi_mesh_submission(
     inputs: &[DynamicMeshInput<'_>],
 ) -> Result<GpuSubmissionPacket, MeshPacketError> {
-    build_multi_mesh_submission_internal(inputs, None)
+    build_multi_mesh_submission_internal(inputs, None, None)
 }
 
 /// Builds a verified [`GpuSubmissionPacket`] with depth testing/writing from a slice of dynamic mesh inputs for offscreen rendering.
@@ -808,12 +814,13 @@ pub fn build_multi_mesh_depth_submission(
     depth_compare: u32,
 ) -> Result<GpuSubmissionPacket, MeshPacketError> {
     let opts = MeshDepthOptions::new(depth_test, depth_write, depth_compare)?;
-    build_multi_mesh_submission_internal(inputs, Some(opts))
+    build_multi_mesh_submission_internal(inputs, Some(opts), None)
 }
 
 fn build_multi_mesh_submission_internal(
     inputs: &[DynamicMeshInput<'_>],
     depth_opts: Option<MeshDepthOptions>,
+    clear_color: Option<[f32; 4]>,
 ) -> Result<GpuSubmissionPacket, MeshPacketError> {
     if inputs.is_empty() {
         return Err(MeshPacketError::EmptyMeshList);
@@ -1114,8 +1121,9 @@ fn build_multi_mesh_submission_internal(
         None
     };
 
+    let clear = clear_color.unwrap_or(MESH_CLEAR_COLOR);
     session
-        .begin_render_pass_with_depth("mesh_render_pass", MESH_CLEAR_COLOR, depth_attachment)
+        .begin_render_pass_with_depth("mesh_render_pass", clear, depth_attachment)
         .map_err(|e| MeshPacketError::SessionError(alloc::format!("begin_render_pass_with_depth: {e:?}")))?;
 
     for (i, &(first_vertex, v_count)) in mesh_draw_ranges.iter().enumerate() {
@@ -1182,7 +1190,7 @@ pub fn build_mesh_canvas_depth_submission(
 pub fn build_multi_mesh_canvas_submission(
     inputs: &[DynamicMeshInput<'_>],
 ) -> Result<GpuSubmissionPacket, MeshPacketError> {
-    build_multi_mesh_canvas_submission_internal(inputs, None)
+    build_multi_mesh_canvas_submission_internal(inputs, None, None)
 }
 
 /// Builds a verified [`GpuSubmissionPacket`] with depth testing/writing targeting a visible canvas swapchain
@@ -1194,12 +1202,13 @@ pub fn build_multi_mesh_canvas_depth_submission(
     depth_compare: u32,
 ) -> Result<GpuSubmissionPacket, MeshPacketError> {
     let opts = MeshDepthOptions::new(depth_test, depth_write, depth_compare)?;
-    build_multi_mesh_canvas_submission_internal(inputs, Some(opts))
+    build_multi_mesh_canvas_submission_internal(inputs, Some(opts), None)
 }
 
 fn build_multi_mesh_canvas_submission_internal(
     inputs: &[DynamicMeshInput<'_>],
     depth_opts: Option<MeshDepthOptions>,
+    clear_color: Option<[f32; 4]>,
 ) -> Result<GpuSubmissionPacket, MeshPacketError> {
     if inputs.is_empty() {
         return Err(MeshPacketError::EmptyMeshList);
@@ -1492,8 +1501,9 @@ fn build_multi_mesh_canvas_submission_internal(
         None
     };
 
+    let clear = clear_color.unwrap_or(MESH_CLEAR_COLOR);
     session
-        .begin_render_pass_with_depth("mesh_canvas_render_pass", MESH_CLEAR_COLOR, depth_attachment)
+        .begin_render_pass_with_depth("mesh_canvas_render_pass", clear, depth_attachment)
         .map_err(|e| MeshPacketError::SessionError(alloc::format!("begin_render_pass_with_depth: {e:?}")))?;
 
     for (i, &(first_vertex, v_count)) in mesh_draw_ranges.iter().enumerate() {
@@ -2270,6 +2280,7 @@ fn build_mesh_batch_unified_internal(
     webgl_depth: bool,
     canvas: bool,
     vertex_colors: Option<&[f32]>,
+    clear_color: Option<[f32; 4]>,
 ) -> Result<Vec<u8>, MeshPacketError> {
     let num_meshes = vertex_counts.len();
     if num_meshes == 0 {
@@ -2428,9 +2439,9 @@ fn build_mesh_batch_unified_internal(
     }
 
     let packet = if canvas {
-        build_multi_mesh_canvas_submission_internal(&inputs, None)?
+        build_multi_mesh_canvas_submission_internal(&inputs, None, clear_color)?
     } else {
-        build_multi_mesh_submission_internal(&inputs, None)?
+        build_multi_mesh_submission_internal(&inputs, None, clear_color)?
     };
 
     packet
@@ -2474,6 +2485,7 @@ pub fn build_mesh_batch_cull_depth_color_packet_impl(
         webgl_depth,
         canvas,
         None,
+        None,
     )
 }
 
@@ -2514,7 +2526,159 @@ pub fn build_mesh_batch_vertex_color_packet_impl(
         webgl_depth,
         canvas,
         Some(vertex_colors),
+        None,
     )
+}
+
+/// Encodes a batch of dynamic Three.js meshes with explicit face culling, front-face winding,
+/// per-mesh depth testing/writing, per-mesh color write, per-vertex colors, and pass clear color into a unified submission packet.
+pub fn build_mesh_batch_vertex_color_clear_packet_impl(
+    positions: &[f32],
+    vertex_counts: &[u32],
+    model_views: &[f64],
+    projection: &[f64],
+    colors: &[f32],
+    cull_modes: &[u8],
+    front_faces: &[u8],
+    depth_tests: &[u8],
+    depth_writes: &[u8],
+    depth_compares: &[u32],
+    color_writes: &[u8],
+    width: u32,
+    height: u32,
+    webgl_depth: bool,
+    canvas: bool,
+    vertex_colors: &[f32],
+    clear_color: &[f32],
+) -> Result<Vec<u8>, MeshPacketError> {
+    if clear_color.len() != 4 {
+        return Err(MeshPacketError::InvalidClearColorLength { len: clear_color.len() });
+    }
+    let clear_rgba = [
+        clear_color[0],
+        clear_color[1],
+        clear_color[2],
+        clear_color[3],
+    ];
+    build_mesh_batch_unified_internal(
+        positions,
+        vertex_counts,
+        model_views,
+        projection,
+        colors,
+        cull_modes,
+        front_faces,
+        depth_tests,
+        depth_writes,
+        depth_compares,
+        color_writes,
+        width,
+        height,
+        webgl_depth,
+        canvas,
+        Some(vertex_colors),
+        Some(clear_rgba),
+    )
+}
+
+/// Builds a clear-only [`GpuSubmissionPacket`] for empty scenes
+/// with a background color (without any mesh draws, pipelines, or dummy resources).
+pub fn build_scene_clear_submission(
+    width: u32,
+    height: u32,
+    clear_color: &[f32],
+    canvas: bool,
+) -> Result<GpuSubmissionPacket, MeshPacketError> {
+    if width == 0 || height == 0 {
+        return Err(MeshPacketError::ZeroDimensions { width, height });
+    }
+    if clear_color.len() != 4 {
+        return Err(MeshPacketError::InvalidClearColorLength {
+            len: clear_color.len(),
+        });
+    }
+    let clear_rgba = [
+        clear_color[0],
+        clear_color[1],
+        clear_color[2],
+        clear_color[3],
+    ];
+
+    let mut packet = GpuSubmissionPacket::new();
+
+    if canvas {
+        packet.push(GpuCommand::RenderPass {
+            target_type: TARGET_CANVAS,
+            target_id: MESH_CANVAS_TARGET_ID,
+            clear_color: clear_rgba,
+            pipeline_id: 0,
+            vertex_buffer_id: 0,
+            vertex_count: 0,
+            uniform_dynamic_offset: 0,
+            uniform_buffer_id: 0,
+            load_op: LOAD_OP_CLEAR,
+            store_op: STORE_OP_STORE,
+            pass_flags: PASS_FLAG_NEW_PASS,
+        });
+    } else {
+        let bytes_per_row = aligned_bytes_per_row(width)
+            .map_err(|e| MeshPacketError::InvalidDimensions(alloc::format!("width {width}: {e:?}")))?;
+        let readback_size = bytes_per_row
+            .checked_mul(height)
+            .ok_or_else(|| MeshPacketError::InvalidDimensions("readback size calculation overflow".into()))?;
+
+        with_global_resource_table(|table| {
+            table.register(MESH_TARGET_TEXTURE_ID);
+            table.register(MESH_READBACK_BUFFER_ID);
+        });
+
+        packet.push(GpuCommand::CreateTexture {
+            texture_id: MESH_TARGET_TEXTURE_ID,
+            width,
+            height,
+            format: TARGET_FORMAT_RGBA8UNORM,
+            usage: TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC,
+        });
+        packet.push(GpuCommand::CreateBuffer {
+            buffer_id: MESH_READBACK_BUFFER_ID,
+            size: readback_size,
+            usage: BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST,
+        });
+        packet.push(GpuCommand::RenderPass {
+            target_type: TARGET_OFFSCREEN,
+            target_id: MESH_TARGET_TEXTURE_ID,
+            clear_color: clear_rgba,
+            pipeline_id: 0,
+            vertex_buffer_id: 0,
+            vertex_count: 0,
+            uniform_dynamic_offset: 0,
+            uniform_buffer_id: 0,
+            load_op: LOAD_OP_CLEAR,
+            store_op: STORE_OP_STORE,
+            pass_flags: PASS_FLAG_NEW_PASS,
+        });
+        packet.push(GpuCommand::CopyTextureToBuffer {
+            texture_id: MESH_TARGET_TEXTURE_ID,
+            buffer_id: MESH_READBACK_BUFFER_ID,
+            width,
+            height,
+            epoch: Epoch::ZERO,
+        });
+    }
+
+    Ok(packet)
+}
+
+/// Encodes a clear-only pass for empty scenes with a background color into a submission packet.
+pub fn build_scene_clear_packet_impl(
+    width: u32,
+    height: u32,
+    clear_color: &[f32],
+    canvas: bool,
+) -> Result<Vec<u8>, MeshPacketError> {
+    build_scene_clear_submission(width, height, clear_color, canvas)?
+        .encode()
+        .map_err(|e| MeshPacketError::EncodeError(alloc::format!("{e:?}")))
 }
 
 /// Encodes a batch of dynamic Three.js meshes with explicit face culling, front-face winding, and per-mesh depth into a unified submission packet.
@@ -2758,6 +2922,64 @@ pub fn f3d_build_mesh_batch_vertex_color_packet(
     .map_err(|e| wasm_bindgen::JsValue::from_str(&e.to_string()))
 }
 
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen]
+/// Encodes a batch of dynamic Three.js meshes with explicit face culling, front-face winding,
+/// per-mesh depth, per-mesh color write, per-vertex colors, and pass clear color into a unified submission packet (wasm-bindgen export).
+pub fn f3d_build_mesh_batch_vertex_color_clear_packet(
+    positions: &[f32],
+    vertex_counts: &[u32],
+    model_views: &[f64],
+    projection: &[f64],
+    colors: &[f32],
+    cull_modes: &[u8],
+    front_faces: &[u8],
+    depth_tests: &[u8],
+    depth_writes: &[u8],
+    depth_compares: &[u32],
+    color_writes: &[u8],
+    width: u32,
+    height: u32,
+    webgl_depth: bool,
+    canvas: bool,
+    vertex_colors: &[f32],
+    clear_color: &[f32],
+) -> Result<Vec<u8>, wasm_bindgen::JsValue> {
+    build_mesh_batch_vertex_color_clear_packet_impl(
+        positions,
+        vertex_counts,
+        model_views,
+        projection,
+        colors,
+        cull_modes,
+        front_faces,
+        depth_tests,
+        depth_writes,
+        depth_compares,
+        color_writes,
+        width,
+        height,
+        webgl_depth,
+        canvas,
+        vertex_colors,
+        clear_color,
+    )
+    .map_err(|e| wasm_bindgen::JsValue::from_str(&e.to_string()))
+}
+
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen]
+/// Encodes a clear-only pass for empty scenes with a background color into a submission packet (wasm-bindgen export).
+pub fn f3d_build_scene_clear_packet(
+    width: u32,
+    height: u32,
+    clear_color: &[f32],
+    canvas: bool,
+) -> Result<Vec<u8>, wasm_bindgen::JsValue> {
+    build_scene_clear_packet_impl(width, height, clear_color, canvas)
+        .map_err(|e| wasm_bindgen::JsValue::from_str(&e.to_string()))
+}
+
 #[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
 /// Encodes a batch of dynamic Three.js meshes with explicit face culling and front-face winding into a unified submission packet for host verification and unit tests.
 pub fn f3d_build_mesh_batch_cull_packet(
@@ -2911,4 +3133,59 @@ pub fn f3d_build_mesh_batch_vertex_color_packet(
         vertex_colors,
     )
     .map_err(|e| e.to_string())
+}
+
+#[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
+/// Encodes a batch of dynamic Three.js meshes with explicit face culling, front-face winding,
+/// per-mesh depth, per-mesh color write, per-vertex colors, and pass clear color into a unified submission packet for host verification and unit tests.
+pub fn f3d_build_mesh_batch_vertex_color_clear_packet(
+    positions: &[f32],
+    vertex_counts: &[u32],
+    model_views: &[f64],
+    projection: &[f64],
+    colors: &[f32],
+    cull_modes: &[u8],
+    front_faces: &[u8],
+    depth_tests: &[u8],
+    depth_writes: &[u8],
+    depth_compares: &[u32],
+    color_writes: &[u8],
+    width: u32,
+    height: u32,
+    webgl_depth: bool,
+    canvas: bool,
+    vertex_colors: &[f32],
+    clear_color: &[f32],
+) -> Result<Vec<u8>, String> {
+    build_mesh_batch_vertex_color_clear_packet_impl(
+        positions,
+        vertex_counts,
+        model_views,
+        projection,
+        colors,
+        cull_modes,
+        front_faces,
+        depth_tests,
+        depth_writes,
+        depth_compares,
+        color_writes,
+        width,
+        height,
+        webgl_depth,
+        canvas,
+        vertex_colors,
+        clear_color,
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
+/// Encodes a clear-only pass for empty scenes with a background color into a submission packet for host verification and unit tests.
+pub fn f3d_build_scene_clear_packet(
+    width: u32,
+    height: u32,
+    clear_color: &[f32],
+    canvas: bool,
+) -> Result<Vec<u8>, String> {
+    build_scene_clear_packet_impl(width, height, clear_color, canvas).map_err(|e| e.to_string())
 }

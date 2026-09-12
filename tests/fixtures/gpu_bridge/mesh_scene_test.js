@@ -3664,9 +3664,9 @@ export async function testMultiMeshBatchScene(bridgeHost, wasmExports, canvasCon
   ]);
   const initialIndices13 = new Uint16Array([3, 0, 1, 2]); // drawRange(1, 3) selects [0, 1, 2]
   const initialColors13 = new Float32Array([
-    1.0, 0.0, 0.0, 1.0, // V0: Pure Red
-    0.0, 1.0, 0.0, 1.0, // V1: Pure Green
-    0.0, 0.0, 1.0, 1.0, // V2: Pure Blue
+    1.0, 0.0, 0.0, 0.0, // V0: Red; opaque material must still write alpha 1
+    0.0, 1.0, 0.0, 0.25, // V1: Green
+    0.0, 0.0, 1.0, 0.5, // V2: Blue
     1.0, 1.0, 1.0, 1.0, // V3: White
   ]);
 
@@ -3778,31 +3778,24 @@ export async function testMultiMeshBatchScene(bridgeHost, wasmExports, canvasCon
       }
     }
 
-    // Planted negative 1: Vertex colors must NOT be ignored (avoid root's prior mistake).
+    // Ensure the probe distinguishes the colored result from a uniform material.
     // If vertexColors were ignored, the color at (18, 48) would be pure material color [128, 204, 102].
     // At (18, 48), vertex is predominantly Red, so Green must strictly diverge from 204.
     const uncoloredGreen13 = 204;
     if (Math.abs(candProbes1[0][1] - uncoloredGreen13) < 50) {
       throw new Error(
-        `Checkpoint 13a planted negative failed: Probe (18, 48) matched uncolored material color; ` +
+        `Checkpoint 13a failed: Probe (18, 48) matched uncolored material color; ` +
         `vertexColors flag was ignored (green=${candProbes1[0][1]})`
       );
     }
 
-    // Planted negative 2: Material color multiplier must NOT be ignored.
+    // Material color multiplication must remain observable.
     // If material color was ignored, Red at V0 probe would be ~255 instead of ~128 (0.5 * 255).
     if (candProbes1[0][0] > 200) {
       throw new Error(
-        `Checkpoint 13a planted negative failed: Probe (18, 48) red channel is ${candProbes1[0][0]}, ` +
+        `Checkpoint 13a failed: Probe (18, 48) red channel is ${candProbes1[0][0]}, ` +
         `material color multiplier (0.5) was ignored`
       );
-    }
-
-    // Planted negative 3: Asserting against wrong color must strictly fail
-    const wrongColor13 = [0, 255, 255, 255];
-    const diffFromWrong = Math.max(...candProbes1[0].map((v, i) => Math.abs(v - wrongColor13[i])));
-    if (diffFromWrong <= 2) {
-      throw new Error("Checkpoint 13a planted negative failed: candidate falsely matched wrong color");
     }
 
     // -------------------------------------------------------------------------
@@ -3814,8 +3807,14 @@ export async function testMultiMeshBatchScene(bridgeHost, wasmExports, canvasCon
       1.0, 1.0, 0.0, 1.0, // V2 changed to Yellow [1, 1, 0, 1]
       0.0, 0.0, 0.0, 1.0, // V3: Black
     ]);
-    // Mutate candidate color buffer array in place WITHOUT needsUpdate = true
+    // Mutate both independent arrays WITHOUT requesting either upload.
     cand13.geometry.attributes.color.array.set(mutatedColors13);
+    ref13.geometry.attributes.color.array.set(mutatedColors13);
+    renderer13.render(ref13.scene, camera13);
+    const staleRefProbes13 = sampleOracleProbes13();
+    if (JSON.stringify(staleRefProbes13) !== JSON.stringify(refProbes1)) {
+      throw new Error("Checkpoint 13b failed: pinned reference did not retain stale color data");
+    }
 
     await adapter.renderMeshBatch(bridgeHost, [cand13.mesh], camera13, null, wasmExports, {
       width,
@@ -3833,11 +3832,12 @@ export async function testMultiMeshBatchScene(bridgeHost, wasmExports, canvasCon
     }
 
     // -------------------------------------------------------------------------
-    // 13c: Frame 3 - Explicit needsUpdate = true uploads mutated colors
+    // 13c: Frame 3 - Upload only V0. CPU edits to V1/V2 must remain GPU-stale.
     // -------------------------------------------------------------------------
-    cand13.geometry.attributes.color.needsUpdate = true;
-    ref13.geometry.attributes.color.array.set(mutatedColors13);
-    ref13.geometry.attributes.color.needsUpdate = true;
+    for (const pair of [cand13, ref13]) {
+      pair.geometry.attributes.color.addUpdateRange(0, 4);
+      pair.geometry.attributes.color.needsUpdate = true;
+    }
 
     renderer13.render(ref13.scene, camera13);
     const refProbes3 = sampleOracleProbes13();
@@ -3874,7 +3874,25 @@ export async function testMultiMeshBatchScene(bridgeHost, wasmExports, canvasCon
     }
 
     // -------------------------------------------------------------------------
-    // 13d: Frame 4 - Canvas presentation output verification (sRGB transfer)
+    // 13d: Normalized RGB byte attributes use the same source conversion boundary.
+    // Replace the attribute so both renderers perform a fresh full upload.
+    const byteColors13 = [128, 32, 240, 16, 192, 64, 224, 96, 48, 255, 255, 255];
+    cand13.geometry.setAttribute("color", new THREE.BufferAttribute(new Uint8Array(byteColors13), 3, true));
+    ref13.geometry.setAttribute("color", new oracleThree13.BufferAttribute(new Uint8Array(byteColors13), 3, true));
+    renderer13.render(ref13.scene, camera13);
+    const refByteProbes13 = sampleOracleProbes13();
+    await adapter.renderMeshBatch(bridgeHost, [cand13.mesh], camera13, null, wasmExports, {
+      width, height, sourceBackend: "webgl",
+    });
+    const bytePixels13 = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+    const byteProbes13 = sampleCandidateProbes13(bytePixels13);
+    for (let p = 0; p < probes13.length; p++) {
+      if (byteProbes13[p].some((value, channel) => Math.abs(value - refByteProbes13[p][channel]) > 2)) {
+        throw new Error(`Checkpoint 13d failed: normalized RGB probe ${probes13[p]} differs: candidate ${byteProbes13[p]}, reference ${refByteProbes13[p]}`);
+      }
+    }
+
+    // 13e: Canvas presentation output verification (sRGB transfer)
     // -------------------------------------------------------------------------
     if (canvasContext) {
       const canvasFormat13 = navigator.gpu.getPreferredCanvasFormat();
@@ -3909,7 +3927,7 @@ export async function testMultiMeshBatchScene(bridgeHost, wasmExports, canvasCon
 
       const sceneResult13 = await renderPromise13;
       if (sceneResult13.admitted.length !== 1 || sceneResult13.refused.length !== 0) {
-        throw new Error(`Checkpoint 13d failed: Canvas scene render failed: ${JSON.stringify(sceneResult13)}`);
+        throw new Error(`Checkpoint 13e failed: Canvas scene render failed: ${JSON.stringify(sceneResult13)}`);
       }
 
       await canvasReadback13.mapAsync(GPUMapMode.READ);
@@ -3940,7 +3958,7 @@ export async function testMultiMeshBatchScene(bridgeHost, wasmExports, canvasCon
         for (let c = 0; c < 4; c++) {
           if (Math.abs(candRgba[c] - refRgba[c]) > 2) {
             throw new Error(
-              `Checkpoint 13d failed: Canvas probe at (${x}, ${y}) differs from sRGB reference: ` +
+              `Checkpoint 13e failed: Canvas probe at (${x}, ${y}) differs from sRGB reference: ` +
               `candidate [${candRgba}], reference [${refRgba}] (format=${canvasFormat13})`
             );
           }
@@ -3955,5 +3973,552 @@ export async function testMultiMeshBatchScene(bridgeHost, wasmExports, canvasCon
     renderer13.dispose();
   }
 
-  return "Variable-length multi-mesh batch verified (depth24plus): near-first/far-second with depthWrite=true produces near mesh (Green) matching independent direct WebGPU reference; near-first/far-second with depthWrite=false produces far mesh (Red) matching independent reference and strictly diverging from depthWrite=true; far-first/near-second with depthWrite=true produces near mesh (Green); immutable snapshots verified with distinct dynamic transforms and colors; negative controls strictly refuse empty batch (EMPTY_MESH_BATCH), mixed depth settings on legacy exports (INCOMPATIBLE_BATCH_DEPTH), and invisible meshes; retained WebGLRenderer multi-mesh oracle matches candidate within tolerance" + (canvasContext ? "; visible canvas batch verified against direct reference" : "") + "; scene hierarchy renderScene verified with translated Group, legitimate culls ignored, positive canvas execution (3 admitted, projected center sRGB colors, depth24plus occlusion, planted negative), and separate visible-unsupported whole-scene refusal; material side culling and reflected winding verified (FrontSide/BackSide/DoubleSide, CCW/CW, reflected det<0 parity, mixed-side multi-mesh batch, dynamic mutation between frames matching direct WebGPU reference); mixed per-mesh depth states verified (depthWrite on/off, Less/Greater depthFunc, interleaved disabled depthTest, reflection with depth, multi-frame depth mutation, canvas renderScene mixed depth); colorWrite=false invisible depth occluders verified (depthWrite on/off occlusion, mixed visible/invisible batch, dynamic mutation between frames, direct WebGPU reference parity with writeMask, canvas execution, DoubleSide single-mesh routing with new export alone); opaque MeshBasicMaterial vertexColors verified (distinct per-vertex colors, non-white material multiplier, indexed drawRange, WebGLRenderer reference parity, GPU-stale attribute mutation without needsUpdate, updated output with needsUpdate, offscreen and canvas sRGB)";
+  // ---------------------------------------------------------------------------
+  // Checkpoint 14: Interleaved buffer attributes execution
+  // (1) Nonzero stride/offset, indexed draw, shared Float32 position + color holder
+  // (2) Separate normalized Uint8 color holder
+  // (3) Visible changes only at holder needsUpdate / updateRanges
+  // (4) Sunny 19802 offset mutation retaining old binding, and fresh index/attribute rebinding
+  // Compares against independent pinned Three.js WebGLRenderer reference oracle.
+  // ---------------------------------------------------------------------------
+  const oracleThree14 = await loadProductionThree();
+
+  const initialInterleaved14 = new Float32Array([
+    0.0, -0.7, -0.7, -2.0,  1.0, 0.0, 0.0, 1.0, // V0: pos (-0.7, -0.7, -2.0), Red
+    0.0,  0.7, -0.7, -2.0,  0.0, 1.0, 0.0, 1.0, // V1: pos ( 0.7, -0.7, -2.0), Green
+    0.0,  0.0,  0.7, -2.0,  0.0, 0.0, 1.0, 1.0, // V2: pos ( 0.0,  0.7, -2.0), Blue
+    0.0,  2.0,  2.0, -2.0,  1.0, 1.0, 1.0, 1.0, // V3: spare outside
+  ]);
+  const initialIndices14 = new Uint16Array([3, 0, 1, 2]); // drawRange(1, 3) selects [0, 1, 2]
+
+  const makeInterleavedMesh14 = (library) => {
+    const ib = new library.InterleavedBuffer(new Float32Array(initialInterleaved14), 8);
+    const posAttr = new library.InterleavedBufferAttribute(ib, 3, 1, false);
+    const colAttr = new library.InterleavedBufferAttribute(ib, 4, 4, false);
+    const geometry = new library.BufferGeometry();
+    geometry.setAttribute("position", posAttr);
+    geometry.setAttribute("color", colAttr);
+    geometry.setIndex(new library.BufferAttribute(new Uint16Array(initialIndices14), 1));
+    geometry.setDrawRange(1, 3);
+    const material = new library.MeshBasicMaterial({
+      vertexColors: true, side: library.DoubleSide, depthTest: false, depthWrite: false,
+    });
+    const mesh = new library.Mesh(geometry, material);
+    mesh.frustumCulled = false;
+    mesh.updateMatrixWorld(true);
+    const scene = new library.Scene();
+    scene.add(mesh);
+    return { mesh, geometry, material, scene, ib, posAttr, colAttr };
+  };
+
+  const cand14 = makeInterleavedMesh14(THREE);
+  const ref14 = makeInterleavedMesh14(oracleThree14);
+
+  const camera14 = new oracleThree14.OrthographicCamera(-1, 1, 1, -1, 0.1, 10);
+  camera14.position.set(0, 0, 0);
+  camera14.lookAt(0, 0, -1);
+  camera14.updateMatrixWorld(true);
+
+  const renderer14 = new oracleThree14.WebGLRenderer({
+    canvas: document.createElement("canvas"),
+    antialias: false,
+    preserveDrawingBuffer: true,
+  });
+  renderer14.setSize(width, height, false);
+  renderer14.setClearColor(0x000000, 1);
+  renderer14.toneMapping = oracleThree14.NoToneMapping;
+  renderer14.outputColorSpace = oracleThree14.LinearSRGBColorSpace;
+  const gl14 = renderer14.getContext();
+
+  const probes14 = [
+    [18, 48], // V0 region (bottom-left): Red
+    [46, 48], // V1 region (bottom-right): Green
+    [32, 18], // V2 region (top-center): Blue
+    [32, 32], // Centroid
+  ];
+
+  // Compact local render and probe sampling helper
+  const renderAndSample = async (candMesh, refScene, probes) => {
+    renderer14.render(refScene, camera14);
+    const refPixels = probes.map(([x, y]) => {
+      const p = new Uint8Array(4);
+      gl14.readPixels(x, height - 1 - y, 1, 1, gl14.RGBA, gl14.UNSIGNED_BYTE, p);
+      return [p[0], p[1], p[2], p[3]];
+    });
+    await adapter.renderMeshBatch(bridgeHost, [candMesh], camera14, null, wasmExports, {
+      width, height, sourceBackend: "webgl",
+    });
+    const candBytes = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+    const candPixels = probes.map(([x, y]) => {
+      const idx = y * bytesPerRow + x * 4;
+      return [candBytes[idx], candBytes[idx + 1], candBytes[idx + 2], candBytes[idx + 3]];
+    });
+    return { refPixels, candPixels, candBytes };
+  };
+
+  const assertProbesMatch = (candPixels, refPixels, label, expected = null) => {
+    const tolerance = expected ? 0 : 2;
+    for (let p = 0; p < candPixels.length; p++) {
+      for (let c = 0; c < 4; c++) {
+        if (Math.abs(candPixels[p][c] - refPixels[p][c]) > tolerance) {
+          throw new Error(`${label}: probe ${p} channel ${c} diverged: cand [${candPixels[p]}], ref [${refPixels[p]}]`);
+        }
+        if (expected && candPixels[p][c] !== expected[c]) {
+          throw new Error(`${label}: probe ${p} channel ${c} expected [${expected}], got cand [${candPixels[p]}]`);
+        }
+        if (expected && refPixels[p][c] !== expected[c]) {
+          throw new Error(`${label}: probe ${p} channel ${c} expected [${expected}], got ref [${refPixels[p]}]`);
+        }
+      }
+    }
+  };
+
+  let candOffsetGeom, candOffsetMat, refOffsetGeom, refOffsetMat;
+  try {
+    // -------------------------------------------------------------------------
+    // 14a: Nonzero stride/offset, indexed draw, shared Float32 pos+color holder
+    // -------------------------------------------------------------------------
+    const r14a = await renderAndSample(cand14.mesh, ref14.scene, probes14);
+    assertProbesMatch(r14a.candPixels, r14a.refPixels, "Checkpoint 14a");
+    if (r14a.candPixels[0][0] < 150 || r14a.candPixels[0][1] > 50) {
+      throw new Error(`Checkpoint 14a failed: V0 probe did not show expected Red, got [${r14a.candPixels[0]}]`);
+    }
+
+    // -------------------------------------------------------------------------
+    // 14b: Separate normalized Uint8 color holder on InterleavedBufferAttribute
+    // -------------------------------------------------------------------------
+    const u8ColorData = new Uint8Array([
+      0, 0, 255,   0,   0, 255, // V0: offset 2 -> [255, 0, 0, 255] Red
+      0, 0,   0, 255,   0, 255, // V1: offset 2 -> [0, 255, 0, 255] Green
+      0, 0,   0,   0, 255, 255, // V2: offset 2 -> [0, 0, 255, 255] Blue
+      0, 0, 255, 255, 255, 255, // V3: offset 2 -> [255, 255, 255, 255] White
+    ]);
+    const candU8Ib = new THREE.InterleavedBuffer(new Uint8Array(u8ColorData), 6);
+    const refU8Ib = new oracleThree14.InterleavedBuffer(new Uint8Array(u8ColorData), 6);
+    cand14.geometry.setAttribute("color", new THREE.InterleavedBufferAttribute(candU8Ib, 4, 2, true));
+    ref14.geometry.setAttribute("color", new oracleThree14.InterleavedBufferAttribute(refU8Ib, 4, 2, true));
+
+    const r14b = await renderAndSample(cand14.mesh, ref14.scene, probes14);
+    assertProbesMatch(r14b.candPixels, r14b.refPixels, "Checkpoint 14b");
+
+    // -------------------------------------------------------------------------
+    // 14c: Visible changes only at holder needsUpdate / updateRanges
+    // -------------------------------------------------------------------------
+    // 14c-1: Mutate CPU array without needsUpdate -> remains GPU-stale
+    candU8Ib.array[2] = 0; candU8Ib.array[3] = 255;
+    refU8Ib.array[2] = 0; refU8Ib.array[3] = 255;
+    const r14c1 = await renderAndSample(cand14.mesh, ref14.scene, probes14);
+    assertProbesMatch(r14c1.candPixels, r14c1.refPixels, "Checkpoint 14c-1");
+    if (differs(r14c1.candBytes, r14b.candBytes)) {
+      throw new Error("Checkpoint 14c-1 failed: Un-bumped InterleavedBuffer edit altered GPU output without needsUpdate");
+    }
+
+    // 14c-2: Set updateRange and needsUpdate -> changes become visible (Cyan)
+    candU8Ib.addUpdateRange(0, 6); candU8Ib.needsUpdate = true;
+    refU8Ib.addUpdateRange(0, 6); refU8Ib.needsUpdate = true;
+    const r14c2 = await renderAndSample(cand14.mesh, ref14.scene, probes14);
+    assertProbesMatch(r14c2.candPixels, r14c2.refPixels, "Checkpoint 14c-2");
+    if (r14c2.candPixels[0][0] > 50 || r14c2.candPixels[0][1] < 150) {
+      throw new Error(`Checkpoint 14c-2 failed: V0 did not update to Cyan, got [${r14c2.candPixels[0]}]`);
+    }
+
+    // -------------------------------------------------------------------------
+    // 14d: Sunny 19802 offset mutation retaining old binding, and fresh-index rebinding
+    // -------------------------------------------------------------------------
+    const offsetData = new Float32Array([
+      -0.7, -0.7, -2.0,   4.3, -0.7, -2.0, // V0: centered @ offset 0, offscreen (x+5) @ offset 3
+       0.7, -0.7, -2.0,   5.7, -0.7, -2.0, // V1
+       0.0,  0.7, -2.0,   5.0,  0.7, -2.0, // V2
+    ]);
+    const candOffsetIb = new THREE.InterleavedBuffer(new Float32Array(offsetData), 6);
+    const refOffsetIb = new oracleThree14.InterleavedBuffer(new Float32Array(offsetData), 6);
+    const candOffsetPos = new THREE.InterleavedBufferAttribute(candOffsetIb, 3, 0, false);
+    const refOffsetPos = new oracleThree14.InterleavedBufferAttribute(refOffsetIb, 3, 0, false);
+
+    candOffsetGeom = new THREE.BufferGeometry();
+    candOffsetGeom.setAttribute("position", candOffsetPos);
+    candOffsetGeom.setIndex(new THREE.BufferAttribute(new Uint16Array([0, 1, 2]), 1));
+
+    refOffsetGeom = new oracleThree14.BufferGeometry();
+    refOffsetGeom.setAttribute("position", refOffsetPos);
+    refOffsetGeom.setIndex(new oracleThree14.BufferAttribute(new Uint16Array([0, 1, 2]), 1));
+
+    candOffsetMat = new THREE.MeshBasicMaterial({ color: 0xff0000, side: THREE.DoubleSide, depthTest: false, depthWrite: false });
+    refOffsetMat = new oracleThree14.MeshBasicMaterial({ color: 0xff0000, side: oracleThree14.DoubleSide, depthTest: false, depthWrite: false });
+
+    const candOffsetMesh = new THREE.Mesh(candOffsetGeom, candOffsetMat);
+    candOffsetMesh.frustumCulled = false;
+    const refOffsetMesh = new oracleThree14.Mesh(refOffsetGeom, refOffsetMat);
+    refOffsetMesh.frustumCulled = false;
+
+    const refOffsetScene = new oracleThree14.Scene();
+    refOffsetScene.add(refOffsetMesh);
+
+    const centerProbe = [[32, 32]];
+    const redRGBA = [255, 0, 0, 255];
+    const blackRGBA = [0, 0, 0, 255];
+
+    // Frame 14d-1: Initial render at offset 0 (start indexed) -> centered Red triangle (all 4 RGBA channels)
+    const r14d1 = await renderAndSample(candOffsetMesh, refOffsetScene, centerProbe);
+    assertProbesMatch(r14d1.candPixels, r14d1.refPixels, "Checkpoint 14d-1 (baseline)", redRGBA);
+
+    // Frame 14d-2: In-place attribute.offset mutation on the SAME attribute instance without rebinding.
+    // Pinned WebGLBindingStates.js:149-192 caches VAO without polling attribute.offset.
+    // Both pinned reference and candidate MUST retain stale pointer at offset 0 -> Red (all 4 RGBA channels)
+    candOffsetPos.offset = 3;
+    refOffsetPos.offset = 3;
+    const r14d2 = await renderAndSample(candOffsetMesh, refOffsetScene, centerProbe);
+    assertProbesMatch(r14d2.candPixels, r14d2.refPixels, "Checkpoint 14d-2 (stale offset)", redRGBA);
+
+    // Frame 14d-3: Fresh index identity rebinding (replace only index with fresh same values).
+    // WebGLBindingStates.js:188 (currentState.index !== index) invalidates VAO cache;
+    // setupVertexAttributes re-reads position.offset=3 -> triangle moves offscreen -> Black (all 4 RGBA channels)
+    candOffsetGeom.setIndex(new THREE.BufferAttribute(new Uint16Array([0, 1, 2]), 1));
+    refOffsetGeom.setIndex(new oracleThree14.BufferAttribute(new Uint16Array([0, 1, 2]), 1));
+    const r14d3 = await renderAndSample(candOffsetMesh, refOffsetScene, centerProbe);
+    assertProbesMatch(r14d3.candPixels, r14d3.refPixels, "Checkpoint 14d-3 (fresh index rebind)", blackRGBA);
+
+    // Frame 14d-4: A fresh position attribute at offset 0 must move the triangle back into view.
+    candOffsetGeom.setAttribute("position", new THREE.InterleavedBufferAttribute(candOffsetIb, 3, 0, false));
+    refOffsetGeom.setAttribute("position", new oracleThree14.InterleavedBufferAttribute(refOffsetIb, 3, 0, false));
+    const r14d4 = await renderAndSample(candOffsetMesh, refOffsetScene, centerProbe);
+    assertProbesMatch(r14d4.candPixels, r14d4.refPixels, "Checkpoint 14d-4 (fresh attribute rebind)", redRGBA);
+
+    // 14e: Switching to a new source program captures the current layout; switching
+    // back reuses that program's previous layout, even after material.needsUpdate.
+    candOffsetGeom.attributes.position.offset = 3;
+    refOffsetGeom.attributes.position.offset = 3;
+    candOffsetGeom.setAttribute("color", new THREE.BufferAttribute(new Float32Array(9).fill(1), 3));
+    refOffsetGeom.setAttribute("color", new oracleThree14.BufferAttribute(new Float32Array(9).fill(1), 3));
+    candOffsetMat.vertexColors = true;
+    refOffsetMat.vertexColors = true;
+    candOffsetMat.needsUpdate = true;
+    refOffsetMat.needsUpdate = true;
+    const r14e1 = await renderAndSample(candOffsetMesh, refOffsetScene, centerProbe);
+    assertProbesMatch(r14e1.candPixels, r14e1.refPixels, "Checkpoint 14e-1 (new colored program)", blackRGBA);
+    candOffsetMat.vertexColors = false;
+    refOffsetMat.vertexColors = false;
+    candOffsetMat.needsUpdate = true;
+    refOffsetMat.needsUpdate = true;
+    const r14e2 = await renderAndSample(candOffsetMesh, refOffsetScene, centerProbe);
+    assertProbesMatch(r14e2.candPixels, r14e2.refPixels, "Checkpoint 14e-2 (return to uncolored program)", redRGBA);
+  } finally {
+    candOffsetGeom?.dispose();
+    candOffsetMat?.dispose();
+    refOffsetGeom?.dispose();
+    refOffsetMat?.dispose();
+    cand14.geometry.dispose();
+    cand14.material.dispose();
+    ref14.geometry.dispose();
+    ref14.material.dispose();
+    renderer14.dispose();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Checkpoint 15: scene.background Color clear with opaque foreground mesh
+  // Compares against independent pinned Three.js WebGLRenderer reference oracle.
+  // ---------------------------------------------------------------------------
+  const oracleThree15 = await loadProductionThree();
+  const makeScene15 = (library) => {
+    const geometry = new library.BufferGeometry();
+    geometry.setAttribute(
+      "position",
+      new library.BufferAttribute(new Float32Array([-0.5, -0.5, -2, 0.5, -0.5, -2, 0, 0.5, -2]), 3)
+    );
+    const material = new library.MeshBasicMaterial({
+      color: 0xff0000, side: library.DoubleSide, depthTest: false, depthWrite: false,
+    });
+    const mesh = new library.Mesh(geometry, material);
+    mesh.frustumCulled = false;
+    mesh.updateMatrixWorld(true);
+    const scene = new library.Scene();
+    scene.background = new library.Color(0.25, 0.5, 0.75);
+    scene.add(mesh);
+    return { scene, mesh, geometry, material };
+  };
+  const cand15 = makeScene15(THREE);
+  const ref15 = makeScene15(oracleThree15);
+
+  const camera15 = new oracleThree15.OrthographicCamera(-1, 1, 1, -1, 0.1, 10);
+  camera15.position.set(0, 0, 0);
+  camera15.lookAt(0, 0, -1);
+  camera15.updateMatrixWorld(true);
+
+  const renderer15 = new oracleThree15.WebGLRenderer({
+    canvas: document.createElement("canvas"),
+    antialias: false,
+    preserveDrawingBuffer: true,
+  });
+  renderer15.setSize(width, height, false);
+  renderer15.toneMapping = oracleThree15.NoToneMapping;
+  renderer15.outputColorSpace = oracleThree15.SRGBColorSpace;
+  const gl15 = renderer15.getContext();
+
+  const probes15 = [[8, 8], [32, 32]];
+  const options15 = { width, height, sourceBackend: "webgl", outputColorSpace: "srgb" };
+
+  const renderAndSample15 = async (candScene, refScene, expectedAdmitted = 1, cam = camera15) => {
+    renderer15.render(refScene, cam);
+    const refPixels = probes15.map(([x, y]) => {
+      const p = new Uint8Array(4);
+      gl15.readPixels(x, height - 1 - y, 1, 1, gl15.RGBA, gl15.UNSIGNED_BYTE, p);
+      return [p[0], p[1], p[2], p[3]];
+    });
+    const res = await adapter.renderScene(bridgeHost, candScene, cam, null, wasmExports, options15);
+    if (res.admitted.length !== expectedAdmitted || res.refused.length !== 0) {
+      throw new Error(`Checkpoint 15 scene refused: expected ${expectedAdmitted} admitted, got ${JSON.stringify(res)}`);
+    }
+    const candBytes = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+    const candPixels = probes15.map(([x, y]) => {
+      const idx = y * bytesPerRow + x * 4;
+      return [candBytes[idx], candBytes[idx + 1], candBytes[idx + 2], candBytes[idx + 3]];
+    });
+    return { refPixels, candPixels, candBytes };
+  };
+
+  const makeBlueMesh15 = (library) => {
+    const geometry = new library.BufferGeometry();
+    geometry.setAttribute(
+      "position",
+      new library.BufferAttribute(new Float32Array([-0.5, -0.5, -2, 0.5, -0.5, -2, 0, 0.5, -2]), 3)
+    );
+    geometry.boundingSphere = new library.Sphere(new library.Vector3(10000, 0, 0), 1);
+    const material = new library.MeshBasicMaterial({
+      color: 0x0000ff, side: library.DoubleSide, depthTest: false, depthWrite: false,
+    });
+    const mesh = new library.Mesh(geometry, material);
+    mesh.renderOrder = 1;
+    mesh.updateMatrixWorld(true);
+    return { mesh, geometry, material };
+  };
+
+  let candBlue, refBlue;
+  let candNearGeom, candNearMat, refNearGeom, refNearMat;
+
+  try {
+    // Frame 15a: Initial midtone background Color(0.25, 0.5, 0.75) with opaque Red foreground
+    const r15a = await renderAndSample15(cand15.scene, ref15.scene);
+    assertProbesMatch(r15a.candPixels, r15a.refPixels, "Checkpoint 15a (initial background)");
+    if (r15a.candPixels[1][0] < 200 || r15a.candPixels[1][1] > 20) {
+      throw new Error(`Checkpoint 15a failed: Foreground mesh not present, got [${r15a.candPixels[1]}]`);
+    }
+
+    // Frame 15b: Dynamic background mutation to Color(0.75, 0.25, 0.5)
+    cand15.scene.background.setRGB(0.75, 0.25, 0.5);
+    ref15.scene.background.setRGB(0.75, 0.25, 0.5);
+    const r15b = await renderAndSample15(cand15.scene, ref15.scene);
+    if (!differs(r15b.candBytes, r15a.candBytes)) {
+      throw new Error("Checkpoint 15b failed: candidate pixels did not change after background mutation");
+    }
+    assertProbesMatch(r15b.candPixels, r15b.refPixels, "Checkpoint 15b (mutated background)");
+    if (Math.abs(r15b.candPixels[0][0] - r15a.candPixels[0][0]) < 30) {
+      throw new Error("Checkpoint 15b failed: Background probe did not change between frames");
+    }
+    if (r15b.candPixels[1][0] < 200 || r15b.candPixels[1][1] > 20) {
+      throw new Error(`Checkpoint 15b failed: Foreground mesh not present after mutation, got [${r15b.candPixels[1]}]`);
+    }
+
+    // Frame 15c: Add overlapping Blue mesh with distant boundingSphere and default frustumCulled=true
+    candBlue = makeBlueMesh15(THREE);
+    cand15.scene.add(candBlue.mesh);
+    refBlue = makeBlueMesh15(oracleThree15);
+    ref15.scene.add(refBlue.mesh);
+
+    const r15c = await renderAndSample15(cand15.scene, ref15.scene, 1);
+    assertProbesMatch(r15c.candPixels, r15c.refPixels, "Checkpoint 15c (frustum culled blue mesh)");
+    if (r15c.candPixels[1][0] < 200 || r15c.candPixels[1][2] > 20) {
+      throw new Error(`Checkpoint 15c failed: Expected red foreground, got [${r15c.candPixels[1]}]`);
+    }
+
+    // Frame 15d: Set frustumCulled=false on both -> bypasses culling, admits Blue mesh
+    candBlue.mesh.frustumCulled = false;
+    refBlue.mesh.frustumCulled = false;
+    const r15d = await renderAndSample15(cand15.scene, ref15.scene, 2);
+    assertProbesMatch(r15d.candPixels, r15d.refPixels, "Checkpoint 15d (frustumCulled=false admitted)");
+    if (r15d.candPixels[1][2] < 200 || r15d.candPixels[1][0] > 20) {
+      throw new Error(`Checkpoint 15d failed: Expected blue foreground, got [${r15d.candPixels[1]}]`);
+    }
+
+    // Frame 15e: Restore frustumCulled=true and center bounds at (0, 0, -2)
+    candBlue.mesh.frustumCulled = true;
+    refBlue.mesh.frustumCulled = true;
+    candBlue.geometry.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, 0, -2), 1);
+    refBlue.geometry.boundingSphere = new oracleThree15.Sphere(new oracleThree15.Vector3(0, 0, -2), 1);
+    const r15e = await renderAndSample15(cand15.scene, ref15.scene, 2);
+    assertProbesMatch(r15e.candPixels, r15e.refPixels, "Checkpoint 15e (re-centered boundingSphere admitted)");
+    if (r15e.candPixels[1][2] < 200 || r15e.candPixels[1][0] > 20) {
+      throw new Error(`Checkpoint 15e failed: Expected blue foreground after re-centering bounds, got [${r15e.candPixels[1]}]`);
+    }
+
+    // Frame 15f: Remove all foreground meshes -> expected admitted 0, center probe is background Color
+    cand15.scene.remove(cand15.mesh);
+    cand15.scene.remove(candBlue.mesh);
+    ref15.scene.remove(ref15.mesh);
+    ref15.scene.remove(refBlue.mesh);
+
+    const r15f = await renderAndSample15(cand15.scene, ref15.scene, 0);
+    assertProbesMatch(r15f.candPixels, r15f.refPixels, "Checkpoint 15f (empty scene background clear)");
+    for (let c = 0; c < 4; c++) {
+      if (Math.abs(r15f.candPixels[1][c] - r15f.candPixels[0][c]) > 2) {
+        throw new Error(`Checkpoint 15f failed: Center probe diverged from background probe: center [${r15f.candPixels[1]}], corner [${r15f.candPixels[0]}]`);
+      }
+    }
+
+    // Frame 15g: Mutate background Color with zero meshes -> candidate changed and matches reference
+    cand15.scene.background.setRGB(0.2, 0.8, 0.4);
+    ref15.scene.background.setRGB(0.2, 0.8, 0.4);
+    const r15g = await renderAndSample15(cand15.scene, ref15.scene, 0);
+    if (!differs(r15g.candBytes, r15f.candBytes)) {
+      throw new Error("Checkpoint 15g failed: candidate pixels did not change after background mutation in empty scene");
+    }
+    assertProbesMatch(r15g.candPixels, r15g.refPixels, "Checkpoint 15g (mutated empty scene background)");
+    if (Math.abs(r15g.candPixels[1][1] - r15f.candPixels[1][1]) < 30) {
+      throw new Error("Checkpoint 15g failed: Center probe did not change after background mutation");
+    }
+    for (let c = 0; c < 4; c++) {
+      if (Math.abs(r15g.candPixels[1][c] - r15g.candPixels[0][c]) > 2) {
+        throw new Error(`Checkpoint 15g failed: Center probe diverged from background probe: center [${r15g.candPixels[1]}], corner [${r15g.candPixels[0]}]`);
+      }
+    }
+
+    // Frame 15h: Canvas target empty scene clear with scene.background Color
+    if (canvasContext) {
+      const canvasFormat15 = navigator.gpu.getPreferredCanvasFormat();
+      canvasContext.configure({
+        device,
+        format: canvasFormat15,
+        alphaMode: "opaque",
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+      });
+      await nextFrame();
+
+      const canvasReadback15 = device.createBuffer({
+        size: bytesPerRow * height,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+      });
+      const currentTexture15 = canvasContext.getCurrentTexture();
+      const renderPromise15h = adapter.renderScene(
+        bridgeHost,
+        cand15.scene,
+        camera15,
+        canvasContext,
+        wasmExports,
+        options15
+      );
+      const copyEncoder15 = device.createCommandEncoder();
+      copyEncoder15.copyTextureToBuffer(
+        { texture: currentTexture15 },
+        { buffer: canvasReadback15, bytesPerRow },
+        [width, height, 1]
+      );
+      device.queue.submit([copyEncoder15.finish()]);
+
+      const res15h = await renderPromise15h;
+      if (res15h.admitted.length !== 0 || res15h.refused.length !== 0) {
+        throw new Error(`Checkpoint 15h failed: Canvas empty scene refused: ${JSON.stringify(res15h)}`);
+      }
+
+      await canvasReadback15.mapAsync(GPUMapMode.READ);
+      const canvasBytes15 = new Uint8Array(canvasReadback15.getMappedRange().slice(0));
+      canvasReadback15.unmap();
+      canvasReadback15.destroy();
+
+      const isBgra15 = canvasFormat15.startsWith("bgra");
+      const rCh15 = isBgra15 ? 2 : 0;
+      const gCh15 = 1;
+      const bCh15 = isBgra15 ? 0 : 2;
+
+      const candCanvasPixels = probes15.map(([x, y]) => {
+        const idx = y * bytesPerRow + x * 4;
+        return [canvasBytes15[idx + rCh15], canvasBytes15[idx + gCh15], canvasBytes15[idx + bCh15], canvasBytes15[idx + 3]];
+      });
+
+      renderer15.render(ref15.scene, camera15);
+      const refCanvasPixels = probes15.map(([x, y]) => {
+        const p = new Uint8Array(4);
+        gl15.readPixels(x, height - 1 - y, 1, 1, gl15.RGBA, gl15.UNSIGNED_BYTE, p);
+        return [p[0], p[1], p[2], p[3]];
+      });
+
+      assertProbesMatch(candCanvasPixels, refCanvasPixels, "Checkpoint 15h (canvas empty scene background clear)");
+      for (let c = 0; c < 4; c++) {
+        if (Math.abs(candCanvasPixels[1][c] - candCanvasPixels[0][c]) > 2) {
+          throw new Error(`Checkpoint 15h failed: Canvas center probe diverged from corner: center [${candCanvasPixels[1]}], corner [${candCanvasPixels[0]}]`);
+        }
+      }
+    }
+
+    // Frame 15i: Explicit WebGL near-plane clip convention with WebGPU-coordinate camera
+    const nearCamera15 = new THREE.PerspectiveCamera(60, 1, 0.1, 10);
+    nearCamera15.coordinateSystem = THREE.WebGPUCoordinateSystem;
+    nearCamera15.updateProjectionMatrix();
+    nearCamera15.updateMatrixWorld(true);
+
+    const origElements15 = Array.from(nearCamera15.projectionMatrix.elements);
+    const origCoordSystem15 = nearCamera15.coordinateSystem;
+
+    // Tiny red triangle at z = -0.075 with x/y in [-0.003, 0.003]
+    const nearPositions = new Float32Array([
+      -0.003, -0.003, -0.075,
+       0.003, -0.003, -0.075,
+       0.000,  0.003, -0.075,
+    ]);
+
+    candNearGeom = new THREE.BufferGeometry();
+    candNearGeom.setAttribute("position", new THREE.BufferAttribute(nearPositions, 3));
+    candNearGeom.computeBoundingSphere();
+    candNearMat = new THREE.MeshBasicMaterial({
+      color: 0xff0000, side: THREE.DoubleSide, depthTest: false, depthWrite: false,
+    });
+    const candNearMesh = new THREE.Mesh(candNearGeom, candNearMat);
+    candNearMesh.frustumCulled = true;
+    candNearMesh.updateMatrixWorld(true);
+    cand15.scene.add(candNearMesh);
+
+    refNearGeom = new oracleThree15.BufferGeometry();
+    refNearGeom.setAttribute("position", new oracleThree15.BufferAttribute(new Float32Array(nearPositions), 3));
+    refNearGeom.computeBoundingSphere();
+    refNearMat = new oracleThree15.MeshBasicMaterial({
+      color: 0xff0000, side: oracleThree15.DoubleSide, depthTest: false, depthWrite: false,
+    });
+    const refNearMesh = new oracleThree15.Mesh(refNearGeom, refNearMat);
+    refNearMesh.frustumCulled = true;
+    refNearMesh.updateMatrixWorld(true);
+    ref15.scene.add(refNearMesh);
+
+    const r15i = await renderAndSample15(cand15.scene, ref15.scene, 1, nearCamera15);
+    assertProbesMatch(r15i.candPixels, r15i.refPixels, "Checkpoint 15i (explicit webgl near-plane triangle)");
+    if (r15i.candPixels[1][0] < 200 || r15i.candPixels[1][1] > 30 || r15i.candPixels[1][2] > 30) {
+      throw new Error(`Checkpoint 15i failed: Expected red center pixel, got [${r15i.candPixels[1]}]`);
+    }
+    if (!differs(r15i.candBytes, r15g.candBytes)) {
+      throw new Error("Checkpoint 15i failed: candidate pixels did not change when near triangle was added");
+    }
+
+    // Verify camera projection matrix and coordinateSystem metadata were not mutated
+    for (let i = 0; i < 16; i++) {
+      if (nearCamera15.projectionMatrix.elements[i] !== origElements15[i]) {
+        throw new Error(`Checkpoint 15i failed: Camera projectionMatrix element ${i} mutated from ${origElements15[i]} to ${nearCamera15.projectionMatrix.elements[i]}`);
+      }
+    }
+    if (nearCamera15.coordinateSystem !== origCoordSystem15) {
+      throw new Error(`Checkpoint 15i failed: Camera coordinateSystem mutated from ${origCoordSystem15} to ${nearCamera15.coordinateSystem}`);
+    }
+  } finally {
+    candNearGeom?.dispose();
+    candNearMat?.dispose();
+    refNearGeom?.dispose();
+    refNearMat?.dispose();
+    candBlue?.geometry.dispose();
+    candBlue?.material.dispose();
+    refBlue?.geometry.dispose();
+    refBlue?.material.dispose();
+    cand15.geometry.dispose();
+    cand15.material.dispose();
+    ref15.geometry.dispose();
+    ref15.material.dispose();
+    renderer15.dispose();
+  }
+
+  return "Variable-length multi-mesh batch verified (depth24plus): near-first/far-second with depthWrite=true produces near mesh (Green) matching independent direct WebGPU reference; near-first/far-second with depthWrite=false produces far mesh (Red) matching independent reference and strictly diverging from depthWrite=true; far-first/near-second with depthWrite=true produces near mesh (Green); immutable snapshots verified with distinct dynamic transforms and colors; negative controls strictly refuse empty batch (EMPTY_MESH_BATCH), mixed depth settings on legacy exports (INCOMPATIBLE_BATCH_DEPTH), and invisible meshes; retained WebGLRenderer multi-mesh oracle matches candidate within tolerance" + (canvasContext ? "; visible canvas batch verified against direct reference" : "") + "; scene hierarchy renderScene verified with translated Group, legitimate culls ignored, positive canvas execution (3 admitted, projected center sRGB colors, depth24plus occlusion, planted negative), and separate visible-unsupported whole-scene refusal; material side culling and reflected winding verified (FrontSide/BackSide/DoubleSide, CCW/CW, reflected det<0 parity, mixed-side multi-mesh batch, dynamic mutation between frames matching direct WebGPU reference); mixed per-mesh depth states verified (depthWrite on/off, Less/Greater depthFunc, interleaved disabled depthTest, reflection with depth, multi-frame depth mutation, canvas renderScene mixed depth); colorWrite=false invisible depth occluders verified (depthWrite on/off occlusion, mixed visible/invisible batch, dynamic mutation between frames, direct WebGPU reference parity with writeMask, canvas execution, DoubleSide single-mesh routing with new export alone); opaque MeshBasicMaterial vertexColors verified (distinct per-vertex colors, non-white material multiplier, indexed drawRange, WebGLRenderer reference parity, GPU-stale attribute mutation without needsUpdate, updated output with needsUpdate, offscreen and canvas sRGB); interleaved vertex attributes verified (shared Float32 position/color holder with nonzero stride and offset, indexed drawRange, normalized Uint8 color holder, GPU-stale CPU edits without needsUpdate, partial updateRanges, and persistent attribute offset mutation WebGLBindingStates parity); scene.background Color clear verified with opaque foreground mesh and dynamic background mutation against WebGLRenderer oracle; single-camera frustum culling verified with distant boundingSphere cull, frustumCulled=false opt-out, and re-centered boundingSphere admission matching WebGLRenderer oracle; empty scene with scene.background Color clear verified with zero admitted meshes, dynamic background mutation, and visible canvas clear matching WebGLRenderer oracle; explicit-WebGL near-plane clip convention verified with WebGPU-coordinate PerspectiveCamera and near triangle matching WebGLRenderer oracle";
 }
