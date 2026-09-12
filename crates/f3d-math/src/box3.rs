@@ -67,6 +67,16 @@ impl Box3 {
         self
     }
 
+    /// Copies the values of `other` to this box.
+    ///
+    /// Matches Three.js r186 `Box3.copy(box)`.
+    #[inline]
+    pub fn copy(&mut self, other: &Self) -> &mut Self {
+        self.min = other.min;
+        self.max = other.max;
+        self
+    }
+
     /// Computes the bounding box enclosing the given points.
     ///
     /// Resets this box to empty, then expands by each point.
@@ -79,31 +89,57 @@ impl Box3 {
         self
     }
 
-    /// Sets the bounds to enclose a flat buffer of 3D positions `[x0, y0, z0, x1, y1, z1, ...]`.
+    /// Sets the upper and lower bounds of this box so it encloses the position data
+    /// in the given buffer.
     ///
-    /// Incomplete trailing coordinates are ignored.
+    /// Missing trailing coordinates evaluate to `NaN` per Three.js r186 `_vector.fromArray(array, i)`.
     /// Matches Three.js r186 `Box3.setFromArray(array)`.
     pub fn set_from_buffer(&mut self, buffer: &[f64]) -> &mut Self {
         self.make_empty();
-        for chunk in buffer.chunks_exact(3) {
-            self.expand_by_point(&Vector3::new(chunk[0], chunk[1], chunk[2]));
+        for chunk in buffer.chunks(3) {
+            let x = chunk[0];
+            let y = if chunk.len() > 1 { chunk[1] } else { f64::NAN };
+            let z = if chunk.len() > 2 { chunk[2] } else { f64::NAN };
+            self.expand_by_point(&Vector3::new(x, y, z));
         }
+        self
+    }
+
+    /// Sets the upper and lower bounds of this box so it encloses the position data
+    /// in the given array.
+    ///
+    /// Missing trailing coordinates evaluate to `NaN` per Three.js r186 `_vector.fromArray(array, i)`.
+    /// Matches Three.js r186 `Box3.setFromArray(array)`.
+    #[inline]
+    pub fn set_from_array(&mut self, array: &[f64]) -> &mut Self {
+        self.set_from_buffer(array)
+    }
+
+    /// Centers this box on the given center vector and sets dimensions to the given size values.
+    ///
+    /// Matches Three.js r186 `Box3.setFromCenterAndSize(center, size)`.
+    #[inline]
+    pub fn set_from_center_and_size(&mut self, center: &Vector3, size: &Vector3) -> &mut Self {
+        let half_size = Vector3::new(size.x * 0.5, size.y * 0.5, size.z * 0.5);
+        self.min = Vector3::new(center.x - half_size.x, center.y - half_size.y, center.z - half_size.z);
+        self.max = Vector3::new(center.x + half_size.x, center.y + half_size.y, center.z + half_size.z);
         self
     }
 
     /// Expands the boundaries of this box to include the given point.
     ///
-    /// Evaluates `min = min(min, point)` and `max = max(max, point)` component-wise.
+    /// Evaluates `min = Math.min(min, point)` and `max = Math.max(max, point)` component-wise
+    /// using ECMAScript semantics (propagating NaN and respecting signed zero).
     /// Matches Three.js r186 `Box3.expandByPoint(point)`.
     #[inline]
     pub fn expand_by_point(&mut self, point: &Vector3) -> &mut Self {
-        self.min.x = self.min.x.min(point.x);
-        self.min.y = self.min.y.min(point.y);
-        self.min.z = self.min.z.min(point.z);
+        self.min.x = js_min(self.min.x, point.x);
+        self.min.y = js_min(self.min.y, point.y);
+        self.min.z = js_min(self.min.z, point.z);
 
-        self.max.x = self.max.x.max(point.x);
-        self.max.y = self.max.y.max(point.y);
-        self.max.z = self.max.z.max(point.z);
+        self.max.x = js_max(self.max.x, point.x);
+        self.max.y = js_max(self.max.y, point.y);
+        self.max.z = js_max(self.max.z, point.z);
         self
     }
 
@@ -328,6 +364,33 @@ impl Box3 {
                 self.max.z - self.min.z,
             )
         }
+    }
+
+    /// Returns a bounding sphere that encloses this bounding box.
+    ///
+    /// Matches Three.js r186 `Box3.getBoundingSphere(target)`.
+    #[inline]
+    pub fn get_bounding_sphere<'a>(&self, target: &'a mut Sphere) -> &'a mut Sphere {
+        if self.is_empty() {
+            target.make_empty();
+        } else {
+            target.center = self.get_center();
+            target.radius = self.get_size().length() * 0.5;
+        }
+        target
+    }
+
+    /// Returns a point as a proportion of this box's width, height, and depth.
+    ///
+    /// Preserves direct divide-by-zero to `f64::INFINITY`, `f64::NEG_INFINITY`, or `f64::NAN`.
+    /// Matches Three.js r186 `Box3.getParameter(point, target)`.
+    #[inline]
+    pub fn get_parameter<'a>(&self, point: &Vector3, target: &'a mut Vector3) -> &'a mut Vector3 {
+        target.set(
+            (point.x - self.min.x) / (self.max.x - self.min.x),
+            (point.y - self.min.y) / (self.max.y - self.min.y),
+            (point.z - self.min.z) / (self.max.z - self.min.z),
+        )
     }
 
     /// Computes the union of this box and another, expanding bounds to enclose both.

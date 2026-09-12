@@ -70,17 +70,32 @@ fn test_box3_set_and_set_from_points_and_buffer() {
     // Size: (2 - (-4), 5 - (-1), 8 - 0) = (6, 6, 8)
     assert_vec_close(&b1.get_size(), [6.0, 6.0, 8.0], EPS, "box size");
 
-    // set_from_buffer with trailing coordinate ignored
+    // set_from_buffer matching points
     let buffer = [
         1.0, 2.0, 3.0,
         -4.0, 5.0, 0.0,
         2.0, -1.0, 8.0,
-        999.0, // extra partial coordinate ignored
     ];
     let mut b2 = Box3::empty();
     b2.set_from_buffer(&buffer);
 
     assert!(b1.equals(&b2), "set_from_buffer matches set_from_points");
+
+    // Incomplete trailing coordinate produces NaN on missing components per Three.js r186
+    let buffer_trailing = [
+        1.0, 2.0, 3.0,
+        -4.0, 5.0, 0.0,
+        2.0, -1.0, 8.0,
+        999.0, // incomplete trailing coordinate
+    ];
+    let mut b_trail = Box3::empty();
+    b_trail.set_from_buffer(&buffer_trailing);
+    assert_close(b_trail.min.x, -4.0, EPS, "trail min x");
+    assert_close(b_trail.max.x, 999.0, EPS, "trail max x");
+    assert!(b_trail.min.y.is_nan(), "trail min y is NaN");
+    assert!(b_trail.max.y.is_nan(), "trail max y is NaN");
+    assert!(b_trail.min.z.is_nan(), "trail min z is NaN");
+    assert!(b_trail.max.z.is_nan(), "trail max z is NaN");
 
     // Empty slice yields an empty box
     let mut b_empty_slice = Box3::new(Vector3::zero(), Vector3::new(1.0, 1.0, 1.0));
@@ -407,4 +422,220 @@ fn test_upstream_r186_empty_and_inverted_intersection_parity() {
     assert!(!inv_clamp.intersects_sphere(&s_nan), "inv intersects_sphere with NaN center is false");
     assert!(!s_nan.intersects_sphere(&s_default), "NaN sphere intersects_sphere is false");
     assert!(!s_nan.contains_point(&origin), "NaN sphere contains_point is false");
+}
+
+#[test]
+fn test_box3_missing_methods_node_parity() {
+    // No-claim line: scalar parity only.
+    // Derived Node oracle values verified against Three.js r186 Box3.js.
+
+    // 1. set_from_center_and_size
+    let mut b1 = Box3::empty();
+    let center1 = Vector3::new(1.0, 2.0, 3.0);
+    let size1 = Vector3::new(4.0, 6.0, 8.0);
+    let ret1 = b1.set_from_center_and_size(&center1, &size1);
+    assert_vec_close(&ret1.min, [-1.0, -1.0, -1.0], EPS, "b1 min");
+    assert_vec_close(&ret1.max, [3.0, 5.0, 7.0], EPS, "b1 max");
+    assert_vec_close(&b1.min, [-1.0, -1.0, -1.0], EPS, "mutated b1 min");
+    assert_vec_close(&b1.max, [3.0, 5.0, 7.0], EPS, "mutated b1 max");
+
+    let mut b1b = Box3::empty();
+    let center1b = Vector3::new(-5.0, 10.0, -2.5);
+    let size1b = Vector3::new(0.0, 5.0, 10.0);
+    b1b.set_from_center_and_size(&center1b, &size1b);
+    assert_vec_close(&b1b.min, [-5.0, 7.5, -7.5], EPS, "b1b min with zero width");
+    assert_vec_close(&b1b.max, [-5.0, 12.5, 2.5], EPS, "b1b max with zero width");
+
+    // 2. copy
+    let mut b_copy = Box3::empty();
+    let ret_copy = b_copy.copy(&b1);
+    assert_vec_close(&ret_copy.min, [-1.0, -1.0, -1.0], EPS, "copy min");
+    assert_vec_close(&ret_copy.max, [3.0, 5.0, 7.0], EPS, "copy max");
+    assert!(b_copy.equals(&b1), "copied box equals source box");
+
+    // 3. set_from_array
+    let arr = [1.0, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0, 9.0];
+    let mut b_arr = Box3::new(Vector3::zero(), Vector3::zero());
+    let ret_arr = b_arr.set_from_array(&arr);
+    assert_vec_close(&ret_arr.min, [-4.0, -8.0, -6.0], EPS, "set_from_array min");
+    assert_vec_close(&ret_arr.max, [7.0, 5.0, 9.0], EPS, "set_from_array max");
+
+    // Empty array resets to empty box
+    let mut b_arr_empty = Box3::new(Vector3::zero(), Vector3::new(1.0, 1.0, 1.0));
+    b_arr_empty.set_from_array(&[]);
+    assert!(b_arr_empty.is_empty(), "set_from_array(&[]) produces empty box");
+    assert!(b_arr_empty.min.x.is_infinite() && b_arr_empty.min.x.is_sign_positive(), "min +inf");
+    assert!(b_arr_empty.max.x.is_infinite() && b_arr_empty.max.x.is_sign_negative(), "max -inf");
+
+    // Incomplete trailing coordinates produce NaN on missing components per Three.js r186
+    let mut b_inc1 = Box3::empty();
+    b_inc1.set_from_array(&[1.0]);
+    assert_close(b_inc1.min.x, 1.0, EPS, "inc1 min x");
+    assert_close(b_inc1.max.x, 1.0, EPS, "inc1 max x");
+    assert!(b_inc1.min.y.is_nan() && b_inc1.max.y.is_nan(), "inc1 y is NaN");
+    assert!(b_inc1.min.z.is_nan() && b_inc1.max.z.is_nan(), "inc1 z is NaN");
+
+    let mut b_inc2 = Box3::empty();
+    b_inc2.set_from_array(&[1.0, 2.0]);
+    assert_close(b_inc2.min.x, 1.0, EPS, "inc2 min x");
+    assert_close(b_inc2.max.x, 1.0, EPS, "inc2 max x");
+    assert_close(b_inc2.min.y, 2.0, EPS, "inc2 min y");
+    assert_close(b_inc2.max.y, 2.0, EPS, "inc2 max y");
+    assert!(b_inc2.min.z.is_nan() && b_inc2.max.z.is_nan(), "inc2 z is NaN");
+
+    let mut b_inc4 = Box3::empty();
+    b_inc4.set_from_array(&[1.0, 2.0, 3.0, 4.0]);
+    assert_close(b_inc4.min.x, 1.0, EPS, "inc4 min x");
+    assert_close(b_inc4.max.x, 4.0, EPS, "inc4 max x");
+    assert!(b_inc4.min.y.is_nan() && b_inc4.max.y.is_nan(), "inc4 y is NaN");
+    assert!(b_inc4.min.z.is_nan() && b_inc4.max.z.is_nan(), "inc4 z is NaN");
+
+    let mut b_inc5 = Box3::empty();
+    b_inc5.set_from_array(&[1.0, 2.0, 3.0, 4.0, 5.0]);
+    assert_close(b_inc5.min.x, 1.0, EPS, "inc5 min x");
+    assert_close(b_inc5.max.x, 4.0, EPS, "inc5 max x");
+    assert_close(b_inc5.min.y, 2.0, EPS, "inc5 min y");
+    assert_close(b_inc5.max.y, 5.0, EPS, "inc5 max y");
+    assert!(b_inc5.min.z.is_nan() && b_inc5.max.z.is_nan(), "inc5 z is NaN");
+
+    let arr_trailing = [1.0, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0, 9.0, 999.0, 888.0];
+    let mut b_arr_trail = Box3::empty();
+    b_arr_trail.set_from_array(&arr_trailing);
+    assert_close(b_arr_trail.min.x, -4.0, EPS, "trail min x");
+    assert_close(b_arr_trail.max.x, 999.0, EPS, "trail max x");
+    assert_close(b_arr_trail.min.y, -8.0, EPS, "trail min y");
+    assert_close(b_arr_trail.max.y, 888.0, EPS, "trail max y");
+    assert!(b_arr_trail.min.z.is_nan() && b_arr_trail.max.z.is_nan(), "trail z is NaN");
+
+    // NaN coordinates propagate per ECMAScript Math.min/Math.max
+    let mut b_nan1 = Box3::empty();
+    b_nan1.set_from_array(&[f64::NAN, 2.0, 3.0]);
+    assert!(b_nan1.min.x.is_nan() && b_nan1.max.x.is_nan(), "NaN x propagates");
+    assert_close(b_nan1.min.y, 2.0, EPS, "nan1 y min");
+    assert_close(b_nan1.max.y, 2.0, EPS, "nan1 y max");
+    assert_close(b_nan1.min.z, 3.0, EPS, "nan1 z min");
+    assert_close(b_nan1.max.z, 3.0, EPS, "nan1 z max");
+
+    let mut b_nan2 = Box3::empty();
+    b_nan2.set_from_array(&[1.0, f64::NAN, 3.0]);
+    assert_close(b_nan2.min.x, 1.0, EPS, "nan2 x min");
+    assert_close(b_nan2.max.x, 1.0, EPS, "nan2 x max");
+    assert!(b_nan2.min.y.is_nan() && b_nan2.max.y.is_nan(), "NaN y propagates");
+    assert_close(b_nan2.min.z, 3.0, EPS, "nan2 z min");
+    assert_close(b_nan2.max.z, 3.0, EPS, "nan2 z max");
+
+    // Direct oracles from NavyAspen review 19852
+    let mut b_na1 = Box3::empty();
+    b_na1.set_from_array(&[5.0]);
+    assert_close(b_na1.min.x, 5.0, EPS, "na1 min x");
+    assert_close(b_na1.max.x, 5.0, EPS, "na1 max x");
+    assert!(b_na1.min.y.is_nan() && b_na1.max.y.is_nan(), "na1 y is NaN");
+    assert!(b_na1.min.z.is_nan() && b_na1.max.z.is_nan(), "na1 z is NaN");
+
+    let mut b_na2 = Box3::empty();
+    b_na2.set_from_array(&[5.0, 6.0]);
+    assert_close(b_na2.min.x, 5.0, EPS, "na2 min x");
+    assert_close(b_na2.max.x, 5.0, EPS, "na2 max x");
+    assert_close(b_na2.min.y, 6.0, EPS, "na2 min y");
+    assert_close(b_na2.max.y, 6.0, EPS, "na2 max y");
+    assert!(b_na2.min.z.is_nan() && b_na2.max.z.is_nan(), "na2 z is NaN");
+
+    let mut b_na3 = Box3::empty();
+    b_na3.set_from_array(&[1.0, 2.0, 3.0, 9.0]);
+    assert_close(b_na3.min.x, 1.0, EPS, "na3 min x");
+    assert_close(b_na3.max.x, 9.0, EPS, "na3 max x");
+    assert!(b_na3.min.y.is_nan() && b_na3.max.y.is_nan(), "na3 y is NaN");
+    assert!(b_na3.min.z.is_nan() && b_na3.max.z.is_nan(), "na3 z is NaN");
+
+    let mut b_na4 = Box3::empty();
+    b_na4.set_from_array(&[1.0, 2.0, 3.0, 9.0, 8.0]);
+    assert_close(b_na4.min.x, 1.0, EPS, "na4 min x");
+    assert_close(b_na4.max.x, 9.0, EPS, "na4 max x");
+    assert_close(b_na4.min.y, 2.0, EPS, "na4 min y");
+    assert_close(b_na4.max.y, 8.0, EPS, "na4 max y");
+    assert!(b_na4.min.z.is_nan() && b_na4.max.z.is_nan(), "na4 z is NaN");
+
+    let mut b_na5 = Box3::empty();
+    b_na5.set_from_array(&[1.0, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0, 9.0, 100.0]);
+    assert_close(b_na5.min.x, -4.0, EPS, "na5 min x");
+    assert_close(b_na5.max.x, 100.0, EPS, "na5 max x");
+    assert!(b_na5.min.y.is_nan() && b_na5.max.y.is_nan(), "na5 y is NaN");
+    assert!(b_na5.min.z.is_nan() && b_na5.max.z.is_nan(), "na5 z is NaN");
+
+    let mut b_na6 = Box3::empty();
+    b_na6.set_from_array(&[f64::NAN, 1.0, 2.0, 3.0, 4.0, 5.0]);
+    assert!(b_na6.min.x.is_nan() && b_na6.max.x.is_nan(), "na6 x is NaN");
+    assert_close(b_na6.min.y, 1.0, EPS, "na6 min y");
+    assert_close(b_na6.max.y, 4.0, EPS, "na6 max y");
+    assert_close(b_na6.min.z, 2.0, EPS, "na6 min z");
+    assert_close(b_na6.max.z, 5.0, EPS, "na6 max z");
+
+    // Signed zero handling per ECMAScript Math.min/Math.max
+    let mut b_zero = Box3::empty();
+    b_zero.set_from_array(&[-0.0, 0.0, -0.0]);
+    assert!(b_zero.min.x == 0.0 && b_zero.min.x.is_sign_negative(), "min.x is -0.0");
+    assert!(b_zero.min.y == 0.0 && b_zero.min.y.is_sign_positive(), "min.y is +0.0");
+    assert!(b_zero.min.z == 0.0 && b_zero.min.z.is_sign_negative(), "min.z is -0.0");
+    assert!(b_zero.max.x == 0.0 && b_zero.max.x.is_sign_negative(), "max.x is -0.0");
+    assert!(b_zero.max.y == 0.0 && b_zero.max.y.is_sign_positive(), "max.y is +0.0");
+    assert!(b_zero.max.z == 0.0 && b_zero.max.z.is_sign_negative(), "max.z is -0.0");
+
+    // 4. get_bounding_sphere
+    let b_sphere1 = Box3::new(Vector3::new(-2.0, -3.0, -4.0), Vector3::new(2.0, 3.0, 4.0));
+    let mut s1 = Sphere::empty();
+    let ret_s1 = b_sphere1.get_bounding_sphere(&mut s1);
+    assert_vec_close(&ret_s1.center, [0.0, 0.0, 0.0], EPS, "bounding sphere center");
+    assert_close(ret_s1.radius, 29.0_f64.sqrt(), EPS, "bounding sphere radius sqrt(29)");
+    assert_vec_close(&s1.center, [0.0, 0.0, 0.0], EPS, "mutated target sphere center");
+    assert_close(s1.radius, 29.0_f64.sqrt(), EPS, "mutated target sphere radius");
+
+    let b_sphere2 = Box3::new(Vector3::new(1.0, 2.0, 3.0), Vector3::new(5.0, 8.0, 15.0));
+    let mut s2 = Sphere::empty();
+    b_sphere2.get_bounding_sphere(&mut s2);
+    assert_vec_close(&s2.center, [3.0, 5.0, 9.0], EPS, "b_sphere2 center");
+    assert_close(s2.radius, 7.0, EPS, "b_sphere2 radius 7.0");
+
+    let b_sphere_empty = Box3::empty();
+    let mut s_empty_target = Sphere::new(Vector3::new(10.0, 20.0, 30.0), 50.0);
+    b_sphere_empty.get_bounding_sphere(&mut s_empty_target);
+    assert!(s_empty_target.is_empty(), "empty box bounding sphere is empty");
+    assert_vec_close(&s_empty_target.center, [0.0, 0.0, 0.0], EPS, "empty box sphere center (0,0,0)");
+    assert_close(s_empty_target.radius, -1.0, EPS, "empty box sphere radius -1.0");
+
+    // 5. get_parameter
+    let b_param = Box3::new(Vector3::new(0.0, 10.0, 20.0), Vector3::new(10.0, 30.0, 40.0));
+    let mut param_target = Vector3::zero();
+
+    // Interior point
+    let ret_p1 = b_param.get_parameter(&Vector3::new(5.0, 20.0, 35.0), &mut param_target);
+    assert_vec_close(ret_p1, [0.5, 0.5, 0.75], EPS, "interior parameter");
+    assert_vec_close(&param_target, [0.5, 0.5, 0.75], EPS, "interior parameter target");
+
+    // Boundary point
+    b_param.get_parameter(&Vector3::new(0.0, 10.0, 20.0), &mut param_target);
+    assert_vec_close(&param_target, [0.0, 0.0, 0.0], EPS, "boundary parameter");
+
+    // Outside point
+    b_param.get_parameter(&Vector3::new(15.0, 5.0, 50.0), &mut param_target);
+    assert_vec_close(&param_target, [1.5, -0.25, 1.5], EPS, "outside parameter");
+
+    // Degenerate box with width 0 (divide by zero behavior)
+    let b_degen = Box3::new(Vector3::new(2.0, 0.0, 0.0), Vector3::new(2.0, 4.0, 8.0));
+    // point.x == min.x: (2 - 2) / (2 - 2) = 0.0 / 0.0 = NaN
+    b_degen.get_parameter(&Vector3::new(2.0, 2.0, 4.0), &mut param_target);
+    assert!(param_target.x.is_nan(), "0.0 / 0.0 parameter is NaN");
+    assert_close(param_target.y, 0.5, EPS, "degen y is 0.5");
+    assert_close(param_target.z, 0.5, EPS, "degen z is 0.5");
+
+    // point.x > min.x: (5 - 2) / (2 - 2) = 3.0 / 0.0 = +Infinity
+    b_degen.get_parameter(&Vector3::new(5.0, 2.0, 4.0), &mut param_target);
+    assert!(param_target.x.is_infinite() && param_target.x.is_sign_positive(), "3.0 / 0.0 parameter is +inf");
+    assert_close(param_target.y, 0.5, EPS, "degen y is 0.5");
+    assert_close(param_target.z, 0.5, EPS, "degen z is 0.5");
+
+    // point.x < min.x: (-1 - 2) / (2 - 2) = -3.0 / 0.0 = -Infinity
+    b_degen.get_parameter(&Vector3::new(-1.0, 2.0, 4.0), &mut param_target);
+    assert!(param_target.x.is_infinite() && param_target.x.is_sign_negative(), "-3.0 / 0.0 parameter is -inf");
+    assert_close(param_target.y, 0.5, EPS, "degen y is 0.5");
+    assert_close(param_target.z, 0.5, EPS, "degen z is 0.5");
 }
