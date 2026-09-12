@@ -2235,3 +2235,67 @@ test('buildApplication rejects unresolvable dynamic imports in retained classic 
     'Must honestly reject missing dynamic import target from retained classic script'
   );
 });
+
+test('buildApplication preserves single module evaluation and identity when shared between bundled module entry and retained classic dynamic import', async () => {
+  const scratch = makeScratch('f3d_app_shared_classic_bundled');
+  const outDir = path.join(scratch, 'dist');
+
+  const html = `<!DOCTYPE html>
+<html>
+<head>
+  <script type="module" src="./main.js"></script>
+  <script>
+    window.loadShared = () => import('./shared.js');
+  </script>
+</head>
+<body></body>
+</html>`;
+
+  fs.writeFileSync(path.join(scratch, 'index.html'), html);
+  fs.writeFileSync(
+    path.join(scratch, 'shared.js'),
+    `globalThis.__sharedEvalCount = (globalThis.__sharedEvalCount || 0) + 1;\n` +
+    `export const sharedState = { count: 0, marker: 'canonical' };\n`
+  );
+  fs.writeFileSync(
+    path.join(scratch, 'main.js'),
+    `import { sharedState } from './shared.js';\n` +
+    `sharedState.count += 1;\n` +
+    `globalThis.__mainSharedState = sharedState;\n` +
+    `export const mainOk = true;\n`
+  );
+
+  const res = await buildApplication(path.join(scratch, 'index.html'), outDir);
+  assert.equal(res.isHtml, true);
+
+  assert.ok(res.emittedFiles.includes('shared.js'), 'shared.js must be in emittedFiles');
+  assert.ok(fs.existsSync(path.join(outDir, 'shared.js')), 'shared.js must exist on disk in outDir');
+
+  // Verify single evaluation, identity, and mutation visibility in Node module execution
+  delete globalThis.__sharedEvalCount;
+  delete globalThis.__mainSharedState;
+
+  // Execute bundled main entry chunk
+  const mainModule = await import(pathToFileURL(path.join(outDir, res.entryFiles[0])).href);
+  assert.equal(mainModule.mainOk, true);
+  assert.ok(globalThis.__mainSharedState, '__mainSharedState must be set by main entry');
+  assert.equal(globalThis.__sharedEvalCount, 1, 'shared.js must evaluate exactly once when main runs');
+
+  // Execute dynamic import of shared.js from outDir (as window.loadShared() does)
+  const sharedModule = await import(pathToFileURL(path.join(outDir, 'shared.js')).href);
+  assert.equal(
+    globalThis.__sharedEvalCount,
+    1,
+    'shared.js must not re-evaluate when dynamically imported from retained classic script'
+  );
+  assert.strictEqual(
+    sharedModule.sharedState,
+    globalThis.__mainSharedState,
+    'sharedState object reference must be strictly identical across bundled entry and classic dynamic import'
+  );
+  assert.equal(
+    sharedModule.sharedState.count,
+    1,
+    'sharedState mutation by bundled main entry must be observed by dynamic import'
+  );
+});
