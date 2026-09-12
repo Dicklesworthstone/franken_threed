@@ -110,6 +110,13 @@ impl CanvasEpochTracker {
     }
 
     /// Register a new canvas instance with initial dimensions and format.
+    ///
+    /// If the canvas is already registered:
+    /// - If the configuration (`resource_id`, `width`, `height`, `format`) is identical,
+    ///   the existing state (including active acquisition interval and epoch) is preserved.
+    /// - If any configuration parameter has changed, the canvas surface is reconfigured:
+    ///   the acquired interval is closed (`is_acquired_in_interval = false`), and the epoch
+    ///   advances monotonically without wrapping, rendering any previous frame output stale.
     pub fn register_canvas(
         &mut self,
         canvas_id: CanvasId,
@@ -119,10 +126,27 @@ impl CanvasEpochTracker {
         format: CanvasFormat,
     ) {
         if let Some(pos) = self.canvases.iter().position(|c| c.canvas_id == canvas_id) {
-            self.canvases[pos].resource_id = resource_id;
-            self.canvases[pos].width = width;
-            self.canvases[pos].height = height;
-            self.canvases[pos].format = format;
+            let state = &mut self.canvases[pos];
+            let is_same_config = state.resource_id == resource_id
+                && state.width == width
+                && state.height == height
+                && state.format == format;
+
+            if !is_same_config {
+                state.resource_id = resource_id;
+                state.width = width;
+                state.height = height;
+                state.format = format;
+                state.is_acquired_in_interval = false;
+                state.interval_ended = false;
+
+                // Advance epoch monotonically without wrapping
+                if let Ok(next) = state.current_epoch.checked_next() {
+                    state.current_epoch = next;
+                } else {
+                    state.current_epoch = Epoch::new(u64::MAX);
+                }
+            }
         } else {
             self.canvases.push(CanvasState {
                 canvas_id,

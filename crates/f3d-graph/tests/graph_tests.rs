@@ -1349,6 +1349,121 @@ fn canvas_epoch_overflow_at_u64_max_returns_epoch_overflow_error() {
 }
 
 #[test]
+fn re_register_canvas_with_changed_config_advances_epoch_and_invalidates_acquired_interval() {
+    let canvas_id = CanvasId::new(7);
+    let res1 = ResourceId::new(101);
+    let res2 = ResourceId::new(102);
+    let mut tracker = CanvasEpochTracker::new();
+
+    // 1. Initial registration and acquire
+    tracker.register_canvas(canvas_id, res1, 800, 600, CanvasFormat::Bgra8Unorm);
+    let out1 = tracker
+        .begin_frame_acquire(canvas_id)
+        .expect("initial frame acquire");
+    assert_eq!(out1.epoch, Epoch::new(1));
+    assert_eq!(out1.width, 800);
+    assert_eq!(out1.height, 600);
+    assert_eq!(out1.resource_id, res1);
+    assert_eq!(out1.format, CanvasFormat::Bgra8Unorm);
+
+    // Prior to re-registration, output access is valid
+    tracker
+        .validate_canvas_access(canvas_id, out1.epoch)
+        .expect("access must be valid during active acquisition");
+
+    // 2. Re-register with SAME configuration: explicit no-op on epoch and active interval
+    tracker.register_canvas(canvas_id, res1, 800, 600, CanvasFormat::Bgra8Unorm);
+    assert_eq!(tracker.epoch_of(canvas_id), Some(Epoch::new(1)));
+    tracker
+        .validate_canvas_access(canvas_id, out1.epoch)
+        .expect("same-config re-registration must preserve active acquisition interval and epoch");
+
+    // 3. Re-register with CHANGED dimensions: closes interval and advances epoch
+    tracker.register_canvas(canvas_id, res1, 1024, 768, CanvasFormat::Bgra8Unorm);
+    assert_eq!(
+        tracker.epoch_of(canvas_id),
+        Some(Epoch::new(2)),
+        "re-registration with changed dimensions must advance epoch"
+    );
+
+    // Old output is now stale: interval closed and epoch advanced
+    assert!(
+        tracker.validate_canvas_access(canvas_id, out1.epoch).is_err(),
+        "old output from epoch 1 must be rejected after re-registration"
+    );
+
+    // 4. Re-acquire with new dimensions: advances to epoch 3
+    let out2 = tracker
+        .begin_frame_acquire(canvas_id)
+        .expect("second frame acquire");
+    assert_eq!(out2.epoch, Epoch::new(3));
+    assert_eq!(out2.width, 1024);
+    assert_eq!(out2.height, 768);
+    tracker
+        .validate_canvas_access(canvas_id, out2.epoch)
+        .expect("newly acquired output must be valid");
+
+    // Old out1 remains stale
+    let err_old = tracker
+        .validate_canvas_access(canvas_id, out1.epoch)
+        .expect_err("old output must remain rejected across epochs");
+    assert_eq!(
+        err_old,
+        CanvasError::CanvasCachedAcrossEpochs {
+            canvas_id: 7,
+            cached_epoch: 1,
+            current_epoch: 3,
+        }
+    );
+
+    // 5. Re-register with CHANGED resource_id: advances epoch and invalidates interval
+    tracker.register_canvas(canvas_id, res2, 1024, 768, CanvasFormat::Bgra8Unorm);
+    assert_eq!(tracker.epoch_of(canvas_id), Some(Epoch::new(4)));
+    assert_eq!(tracker.find_by_resource(res1), None);
+    assert_eq!(tracker.find_by_resource(res2), Some(canvas_id));
+    assert!(tracker.validate_canvas_access(canvas_id, out2.epoch).is_err());
+
+    // 6. Re-register with CHANGED format: advances epoch and invalidates interval
+    let out3 = tracker.begin_frame_acquire(canvas_id).expect("acquire 3");
+    assert_eq!(out3.epoch, Epoch::new(5));
+    tracker.register_canvas(canvas_id, res2, 1024, 768, CanvasFormat::Rgba8Unorm);
+    assert_eq!(tracker.epoch_of(canvas_id), Some(Epoch::new(6)));
+    assert!(tracker.validate_canvas_access(canvas_id, out3.epoch).is_err());
+}
+
+#[test]
+fn re_register_canvas_at_u64_max_handles_overflow_without_wrapping() {
+    let canvas_id = CanvasId::new(99);
+    let res = ResourceId::new(500);
+    let mut tracker = CanvasEpochTracker::new();
+    tracker.register_canvas(canvas_id, res, 800, 600, CanvasFormat::Bgra8Unorm);
+
+    // Seed epoch at u64::MAX
+    tracker.seed_epoch_for_test(canvas_id, Epoch::new(u64::MAX));
+    assert_eq!(tracker.epoch_of(canvas_id), Some(Epoch::new(u64::MAX)));
+
+    // Re-register with changed dimensions: must handle overflow by saturating at u64::MAX without wrapping to 0
+    tracker.register_canvas(canvas_id, res, 1280, 720, CanvasFormat::Bgra8Unorm);
+    assert_eq!(
+        tracker.epoch_of(canvas_id),
+        Some(Epoch::new(u64::MAX)),
+        "epoch at u64::MAX must not wrap to 0"
+    );
+
+    // Attempting to acquire after saturation fails with EpochOverflow
+    let err = tracker
+        .begin_frame_acquire(canvas_id)
+        .expect_err("acquiring after epoch saturation must fail with EpochOverflow");
+    assert_eq!(
+        err,
+        CanvasError::EpochOverflow {
+            canvas_id: 99,
+            current: u64::MAX,
+        }
+    );
+}
+
+#[test]
 fn bridge_single_pass_plan_matches_expected_contract() {
     let canvas_res = ResourceId::new(100);
     let vbuf = ResourceId::new(101);
