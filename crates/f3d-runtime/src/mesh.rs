@@ -347,7 +347,9 @@ impl<'a> DynamicMeshInput<'a> {
     /// # Errors
     /// Returns [`MeshPacketError::InvalidVertexColorLength`] if length does not match `(positions.len() / 3) * 4`.
     pub fn with_vertex_colors(mut self, vertex_colors: &'a [f32]) -> Result<Self, MeshPacketError> {
-        let expected_len = (self.positions.len() / 3) * 4;
+        let expected_len = (self.positions.len() / 3)
+            .checked_mul(4)
+            .ok_or_else(|| MeshPacketError::InvalidDimensions("vertex color length calculation overflow".into()))?;
         if vertex_colors.len() != expected_len {
             return Err(MeshPacketError::InvalidVertexColorLength {
                 expected: expected_len,
@@ -516,32 +518,16 @@ fn compute_depth_tag(depth_write_enabled: bool, depth_compare: u32) -> u32 {
 /// When `output_srgb` is `false` (offscreen render target), the shader retains linear-sRGB output
 /// matching default upstream `RenderTarget` working space.
 fn generate_mesh_wgsl_internal(webgl_depth: bool, output_srgb: bool, has_vertex_color: bool) -> String {
-    let depth_remap = if webgl_depth {
-        "    clip.z = (clip.z + clip.w) * 0.5;\n"
-    } else {
-        ""
-    };
-
-    let (struct_defs, vs_assign) = if has_vertex_color {
-        (
-            "struct VertexInput {\n    @location(0) position: vec3<f32>,\n    @location(1) color: vec4<f32>,\n};\n\nstruct VertexOutput {\n    @builtin(position) clip_position: vec4<f32>,\n    @location(0) color: vec4<f32>,\n};\n",
-            "    out.color = in.color;\n",
-        )
-    } else {
-        (
-            "struct VertexInput {\n    @location(0) position: vec3<f32>,\n    @location(1) uv: vec2<f32>,\n};\n\nstruct VertexOutput {\n    @builtin(position) clip_position: vec4<f32>,\n    @location(0) uv: vec2<f32>,\n};\n",
-            "    out.uv = in.uv;\n",
-        )
-    };
-
-    let (srgb_fn, fragment_body) = if output_srgb {
-        let eval_color = if has_vertex_color {
-            "    let linear_color = in.color * uniforms.color;\n    let srgb_rgb = srgb_transfer_oetf(linear_color.rgb);\n    return vec4<f32>(srgb_rgb, linear_color.a);\n"
+    if !has_vertex_color {
+        let depth_remap = if webgl_depth {
+            "    clip.z = (clip.z + clip.w) * 0.5;\n"
         } else {
-            "    let srgb_rgb = srgb_transfer_oetf(uniforms.color.rgb);\n    return vec4<f32>(srgb_rgb, uniforms.color.a);\n"
+            ""
         };
-        (
-            "\
+
+        let (srgb_fn, fragment_body) = if output_srgb {
+            (
+                "\
 fn srgb_transfer_oetf(color: vec3<f32>) -> vec3<f32> {\n\
     let clamped = max(color, vec3<f32>(0.0));\n\
     let a = pow(clamped, vec3<f32>(0.41666)) * 1.055 - vec3<f32>(0.055);\n\
@@ -550,19 +536,15 @@ fn srgb_transfer_oetf(color: vec3<f32>) -> vec3<f32> {\n\
 }\n\
 \n\
 ",
-            eval_color,
-        )
-    } else {
-        let eval_color = if has_vertex_color {
-            "    return in.color * uniforms.color;\n"
+                "    let srgb_rgb = srgb_transfer_oetf(uniforms.color.rgb);\n\
+    return vec4<f32>(srgb_rgb, uniforms.color.a);\n",
+            )
         } else {
-            "    return uniforms.color;\n"
+            ("", "    return uniforms.color;\n")
         };
-        ("", eval_color)
-    };
 
-    alloc::format!(
-        "\
+        alloc::format!(
+            "\
 struct MeshUniforms {{\n\
     model_view: mat4x4<f32>,\n\
     projection: mat4x4<f32>,\n\
@@ -572,7 +554,15 @@ struct MeshUniforms {{\n\
 @group(0) @binding(0)\n\
 var<uniform> uniforms: MeshUniforms;\n\
 \n\
-{struct_defs}\
+struct VertexInput {{\n\
+    @location(0) position: vec3<f32>,\n\
+    @location(1) uv: vec2<f32>,\n\
+}};\n\
+\n\
+struct VertexOutput {{\n\
+    @builtin(position) clip_position: vec4<f32>,\n\
+    @location(0) uv: vec2<f32>,\n\
+}};\n\
 \n\
 @vertex\n\
 fn vs_main(in: VertexInput) -> VertexOutput {{\n\
@@ -581,7 +571,7 @@ fn vs_main(in: VertexInput) -> VertexOutput {{\n\
     var clip = uniforms.projection * mv_pos;\n\
 {depth_remap}\
     out.clip_position = clip;\n\
-{vs_assign}\
+    out.uv = in.uv;\n\
     return out;\n\
 }}\n\
 \n\
@@ -591,7 +581,77 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{\n\
 {fragment_body}\
 }}\n\
 "
-    )
+        )
+    } else {
+        let depth_remap = if webgl_depth {
+            "    clip.z = (clip.z + clip.w) * 0.5;\n"
+        } else {
+            ""
+        };
+
+        let (srgb_fn, fragment_body) = if output_srgb {
+            (
+                "\
+fn srgb_transfer_oetf(color: vec3<f32>) -> vec3<f32> {\n\
+    let clamped = max(color, vec3<f32>(0.0));\n\
+    let a = pow(clamped, vec3<f32>(0.41666)) * 1.055 - vec3<f32>(0.055);\n\
+    let b = color * 12.92;\n\
+    return select(a, b, color <= vec3<f32>(0.0031308));\n\
+}\n\
+\n\
+",
+                "    let linear_color = in.color * uniforms.color;\n\
+    let srgb_rgb = srgb_transfer_oetf(linear_color.rgb);\n\
+    return vec4<f32>(srgb_rgb, 1.0);\n",
+            )
+        } else {
+            (
+                "",
+                "    let linear_color = in.color * uniforms.color;\n\
+    return vec4<f32>(linear_color.rgb, 1.0);\n",
+            )
+        };
+
+        alloc::format!(
+            "\
+struct MeshUniforms {{\n\
+    model_view: mat4x4<f32>,\n\
+    projection: mat4x4<f32>,\n\
+    color: vec4<f32>,\n\
+}};\n\
+\n\
+@group(0) @binding(0)\n\
+var<uniform> uniforms: MeshUniforms;\n\
+\n\
+struct VertexInput {{\n\
+    @location(0) position: vec3<f32>,\n\
+    @location(1) color: vec4<f32>,\n\
+}};\n\
+\n\
+struct VertexOutput {{\n\
+    @builtin(position) clip_position: vec4<f32>,\n\
+    @location(0) color: vec4<f32>,\n\
+}};\n\
+\n\
+@vertex\n\
+fn vs_main(in: VertexInput) -> VertexOutput {{\n\
+    var out: VertexOutput;\n\
+    let mv_pos = uniforms.model_view * vec4<f32>(in.position, 1.0);\n\
+    var clip = uniforms.projection * mv_pos;\n\
+{depth_remap}\
+    out.clip_position = clip;\n\
+    out.color = in.color;\n\
+    return out;\n\
+}}\n\
+\n\
+{srgb_fn}\
+@fragment\n\
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{\n\
+{fragment_body}\
+}}\n\
+"
+        )
+    }
 }
 
 /// Generates the WGSL shader source code for dynamic offscreen mesh rendering (linear-sRGB output).

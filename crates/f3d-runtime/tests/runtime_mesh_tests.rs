@@ -3883,13 +3883,14 @@ fn test_mesh_batch_vertex_color_shader_semantics_offscreen_and_canvas() {
         assert_eq!(*vertex_stride, 28);
         assert!(wgsl_code.contains("@location(1) color: vec4<f32>"));
         assert!(wgsl_code.contains("out.color = in.color;"));
-        assert!(wgsl_code.contains("return in.color * uniforms.color;"));
+        assert!(wgsl_code.contains("let linear_color = in.color * uniforms.color;"));
+        assert!(wgsl_code.contains("return vec4<f32>(linear_color.rgb, 1.0);"));
         assert!(!wgsl_code.contains("linear_to_srgb"));
     } else {
         panic!("expected CreatePipeline command");
     }
 
-    // Canvas with vertex colors
+    // Canvas with vertex colors: applies sRGB OETF transfer and forces alpha = 1.0 per opaque MeshBasicMaterial
     let canvas_sub = build_multi_mesh_canvas_submission(&[mesh]).unwrap();
     let canvas_cmd = canvas_sub.commands().iter().find(|c| matches!(c, GpuCommand::CreatePipeline { .. })).unwrap();
     if let GpuCommand::CreatePipeline { wgsl_code, vertex_stride, .. } = canvas_cmd {
@@ -3897,10 +3898,58 @@ fn test_mesh_batch_vertex_color_shader_semantics_offscreen_and_canvas() {
         assert!(wgsl_code.contains("@location(1) color: vec4<f32>"));
         assert!(wgsl_code.contains("out.color = in.color;"));
         assert!(wgsl_code.contains("let linear_color = in.color * uniforms.color;"));
-        assert!(wgsl_code.contains("return linear_to_srgb(linear_color);"));
+        assert!(wgsl_code.contains("let srgb_rgb = srgb_transfer_oetf(linear_color.rgb);"));
+        assert!(wgsl_code.contains("return vec4<f32>(srgb_rgb, 1.0);"));
     } else {
         panic!("expected CreatePipeline command");
     }
+}
+
+#[test]
+fn test_legacy_mesh_packet_byte_baseline_matches_exact_cases() {
+    let tri = [0.0f32, 0.5, 0.0, -0.5, -0.5, 0.0, 0.5, -0.5, 0.0];
+    let vertex_counts = [3u32];
+    let model_views = IDENTITY_F64;
+    let projection = IDENTITY_F64;
+    let colors = [0.5f32, 0.75, 0.25, 1.0];
+    let cull_modes = [2u8];
+    let front_faces = [0u8];
+    let depth_tests = [1u8];
+    let depth_writes = [1u8];
+    let depth_compares = [DEPTH_COMPARE_LESS];
+    let color_writes = [1u8];
+
+    // Case 0: canvas=false, webgl_depth=false -> exact length 1267
+    let bytes0 = f3d_build_mesh_batch_cull_depth_color_packet(
+        &tri, &vertex_counts, &model_views, &projection, &colors,
+        &cull_modes, &front_faces, &depth_tests, &depth_writes, &depth_compares,
+        &color_writes, 64, 64, false, false,
+    ).expect("building case 0");
+    assert_eq!(bytes0.len(), 1267);
+
+    // Case 1: canvas=false, webgl_depth=true -> exact length 1305
+    let bytes1 = f3d_build_mesh_batch_cull_depth_color_packet(
+        &tri, &vertex_counts, &model_views, &projection, &colors,
+        &cull_modes, &front_faces, &depth_tests, &depth_writes, &depth_compares,
+        &color_writes, 64, 64, true, false,
+    ).expect("building case 1");
+    assert_eq!(bytes1.len(), 1305);
+
+    // Case 2: canvas=true, webgl_depth=false -> exact length 1527
+    let bytes2 = f3d_build_mesh_batch_cull_depth_color_packet(
+        &tri, &vertex_counts, &model_views, &projection, &colors,
+        &cull_modes, &front_faces, &depth_tests, &depth_writes, &depth_compares,
+        &color_writes, 64, 64, false, true,
+    ).expect("building case 2");
+    assert_eq!(bytes2.len(), 1527);
+
+    // Case 3: canvas=true, webgl_depth=true -> exact length 1565
+    let bytes3 = f3d_build_mesh_batch_cull_depth_color_packet(
+        &tri, &vertex_counts, &model_views, &projection, &colors,
+        &cull_modes, &front_faces, &depth_tests, &depth_writes, &depth_compares,
+        &color_writes, 64, 64, true, true,
+    ).expect("building case 3");
+    assert_eq!(bytes3.len(), 1565);
 }
 
 #[test]
