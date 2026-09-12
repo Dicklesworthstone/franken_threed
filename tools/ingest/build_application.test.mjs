@@ -1946,8 +1946,11 @@ test('isClassicJavaScriptType identifies JavaScript MIME types and rejects data 
   assert.equal(isClassicJavaScriptType(''), true);
   assert.equal(isClassicJavaScriptType('text/javascript'), true);
   assert.equal(isClassicJavaScriptType('application/javascript'), true);
-  assert.equal(isClassicJavaScriptType('text/javascript; charset=utf-8'), true);
   assert.equal(isClassicJavaScriptType('text/ecmascript'), true);
+
+  // Parameterized MIME types are treated by browsers as data blocks (not an essence match)
+  assert.equal(isClassicJavaScriptType('text/javascript; charset=utf-8'), false);
+  assert.equal(isClassicJavaScriptType('application/javascript;version=1.8'), false);
 
   // Modules and Import Maps (handled separately)
   assert.equal(isClassicJavaScriptType('module'), false);
@@ -1993,10 +1996,14 @@ test('buildApplication preserves importmap verbatim alongside classic scripts wi
   <script id="shader-block" type="x-shader/x-vertex">
     void main() { /* import('./phantom_shader.js') */ }
   </script>
-  <script type="text/javascript; charset=utf-8">
+  <script type="text/javascript">
     // Inline classic script 1: verifies globals and execution order
     window.__classicOrder = ['inline1'];
     window.loadDep = () => import('dynamic-dep');
+  </script>
+  <script id="param-type-block" type="text/javascript; charset=utf-8">
+    window.__paramTypeRan = true;
+    import('./phantom_param.js');
   </script>
   <script src="./external_classic.js"></script>
   <script type="module" src="./main.js"></script>
@@ -2009,6 +2016,7 @@ test('buildApplication preserves importmap verbatim alongside classic scripts wi
         window.__classicOrder.length === 2 &&
         window.__classicOrder[0] === 'inline1' &&
         window.__classicOrder[1] === 'external';
+      const paramTypeDidNotRun = (window.__paramTypeRan === undefined);
 
       try {
         if (document.readyState === 'loading') {
@@ -2021,11 +2029,12 @@ test('buildApplication preserves importmap verbatim alongside classic scripts wi
         const depOk = Boolean(depMod && depMod.depOk === true);
         const extOk = Boolean(extMod && extMod.extOk === true);
         const mainOk = Boolean(window.__mainOk === true);
-        const passed = Boolean(orderOk && loadExtDefined && depOk && extOk && mainOk);
+        const passed = Boolean(orderOk && loadExtDefined && depOk && extOk && mainOk && paramTypeDidNotRun);
 
         const results = {
           orderOk,
           loadExtDefined,
+          paramTypeDidNotRun,
           depOk,
           extOk,
           mainOk,
@@ -2060,6 +2069,7 @@ test('buildApplication preserves importmap verbatim alongside classic scripts wi
           results: {
             orderOk,
             loadExtDefined,
+            paramTypeDidNotRun,
             depOk: false,
             extOk: false,
             mainOk: Boolean(window.__mainOk === true),
@@ -2145,11 +2155,20 @@ test('buildApplication preserves importmap verbatim alongside classic scripts wi
     false,
     'Shader block pseudo-import must never be emitted as dependency'
   );
+  assert.equal(
+    res.emittedFiles.includes('phantom_param.js'),
+    false,
+    'Parameterized type data block pseudo-import must never be emitted as dependency'
+  );
+  assert.ok(
+    rewrittenHtml.includes('<script id="param-type-block" type="text/javascript; charset=utf-8">'),
+    'Parameterized type data block must be preserved verbatim'
+  );
 
   // 3. Inline classic script 1 using dynamic import must be preserved verbatim
   assert.ok(
-    rewrittenHtml.includes('type="text/javascript; charset=utf-8"'),
-    'Inline classic script with MIME parameter must be preserved verbatim'
+    rewrittenHtml.includes('type="text/javascript"'),
+    'Inline classic script with valid JS MIME type must be preserved verbatim'
   );
   assert.ok(
     rewrittenHtml.includes("window.__classicOrder = ['inline1'];"),

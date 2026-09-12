@@ -338,8 +338,7 @@ export function isClassicJavaScriptType(typeAttr) {
   if (!trimmed) {
     return true;
   }
-  const mime = trimmed.split(';')[0].trim();
-  return CLASSIC_JS_MIME_TYPES.has(mime);
+  return CLASSIC_JS_MIME_TYPES.has(trimmed);
 }
 
 /**
