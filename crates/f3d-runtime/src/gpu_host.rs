@@ -370,6 +370,20 @@ pub const OPCODE_CREATE_PIPELINE_CULL: u16 = 14;
 pub const OPCODE_CREATE_PIPELINE_DEPTH_CULL: u16 = 15;
 /// Opcode for creating a render pipeline with depth state, face culling, front-face winding state, and color write mask.
 pub const OPCODE_CREATE_PIPELINE_DEPTH_CULL_COLOR: u16 = 16;
+/// Opcode for uploading pixel data to a 2D GPU texture.
+pub const OPCODE_WRITE_TEXTURE: u16 = 17;
+/// Opcode for creating a textured render pipeline with texture and sampler bindings.
+pub const OPCODE_CREATE_PIPELINE_TEXTURED: u16 = 18;
+
+/// Sampler filter mode: nearest-neighbor filtering.
+pub const SAMPLER_FILTER_NEAREST: u32 = 0;
+/// Sampler filter mode: linear filtering.
+pub const SAMPLER_FILTER_LINEAR: u32 = 1;
+
+/// Sampler address mode: clamp to edge.
+pub const ADDRESS_MODE_CLAMP_TO_EDGE: u32 = 0;
+/// Sampler address mode: repeat.
+pub const ADDRESS_MODE_REPEAT: u32 = 1;
 
 /// Face culling mode: do not cull any faces (Three.js DoubleSide).
 pub const CULL_MODE_NONE: u32 = 0;
@@ -808,6 +822,27 @@ pub enum GpuCommand {
         /// Whether depth attachment is read-only.
         depth_read_only: bool,
     },
+    /// Command to upload raw pixel data into a 2D GPU texture slice.
+    WriteTexture {
+        texture_id: u32,
+        width: u32,
+        height: u32,
+        bytes_per_row: u32,
+        data: Vec<u8>,
+    },
+    /// Command to compile and create a textured render pipeline with texture and sampler bindings.
+    CreatePipelineTextured {
+        pipeline_id: u32,
+        wgsl_code: String,
+        target_format: u32,
+        has_vertex_buffer: bool,
+        has_uniform_buffer: bool,
+        uniform_size: u32,
+        vertex_stride: u32,
+        texture_id: u32,
+        sampler_filter: u32,
+        address_mode: u32,
+    },
 }
 
 /// Structured encoding failure when packet dimensions or data lengths exceed binary bounds.
@@ -832,6 +867,10 @@ pub enum PacketEncodeError {
         /// Byte length of the command data.
         length: usize,
     },
+    /// Texture data length does not match `bytes_per_row * height`.
+    TextureLengthMismatch { expected: usize, actual: usize },
+    /// Input dimensions, parameter array lengths, or buffer sizing calculation overflow.
+    InvalidDimensions(String),
 }
 
 impl core::fmt::Display for PacketEncodeError {
@@ -845,6 +884,12 @@ impl core::fmt::Display for PacketEncodeError {
             }
             Self::CommandDataOverflow { command_index, length } => {
                 write!(f, "Command {command_index} data length {length} exceeds u32::MAX")
+            }
+            Self::TextureLengthMismatch { expected, actual } => {
+                write!(f, "Texture data length mismatch: expected {expected} (bytes_per_row * height), got {actual}")
+            }
+            Self::InvalidDimensions(msg) => {
+                write!(f, "Invalid dimensions or parameters: {msg}")
             }
         }
     }
@@ -1283,6 +1328,57 @@ impl GpuSubmissionPacket {
                     let packed_depth = pack_depth_ops(*depth_load_op, *depth_store_op, *depth_read_only);
                     command_records.extend_from_slice(&packed_depth.to_le_bytes());
                     command_records.extend_from_slice(&depth_clear_value.to_le_bytes());
+                }
+                GpuCommand::WriteTexture {
+                    texture_id, width, height, bytes_per_row, data,
+                } => {
+                    let expected_len = (*bytes_per_row as usize).checked_mul(*height as usize).ok_or(
+                        PacketEncodeError::CommandDataOverflow { command_index: cmd_idx, length: data.len() },
+                    )?;
+                    if data.len() != expected_len {
+                        return Err(PacketEncodeError::TextureLengthMismatch { expected: expected_len, actual: data.len() });
+                    }
+                    let data_len = u32::try_from(data.len()).map_err(|_| PacketEncodeError::CommandDataOverflow { command_index: cmd_idx, length: data.len() })?;
+                    let current_len = data_payload.len();
+                    if current_len.checked_add(data.len()).map_or(true, |sum| sum > max_payload_len) {
+                        return Err(PacketEncodeError::DataPayloadOverflow { offset: current_len, length: data.len() });
+                    }
+                    let data_offset = u32::try_from(current_len).map_err(|_| PacketEncodeError::DataPayloadOverflow { offset: current_len, length: data.len() })?;
+                    data_payload.extend_from_slice(data);
+
+                    command_records.extend_from_slice(&OPCODE_WRITE_TEXTURE.to_le_bytes());
+                    command_records.extend_from_slice(&texture_id.to_le_bytes());
+                    command_records.extend_from_slice(&width.to_le_bytes());
+                    command_records.extend_from_slice(&height.to_le_bytes());
+                    command_records.extend_from_slice(&bytes_per_row.to_le_bytes());
+                    command_records.extend_from_slice(&data_offset.to_le_bytes());
+                    command_records.extend_from_slice(&data_len.to_le_bytes());
+                }
+                GpuCommand::CreatePipelineTextured {
+                    pipeline_id, wgsl_code, target_format, has_vertex_buffer, has_uniform_buffer,
+                    uniform_size, vertex_stride, texture_id, sampler_filter, address_mode,
+                } => {
+                    let bytes = wgsl_code.as_bytes();
+                    let code_len = u32::try_from(bytes.len()).map_err(|_| PacketEncodeError::CommandDataOverflow { command_index: cmd_idx, length: bytes.len() })?;
+                    let current_len = data_payload.len();
+                    if current_len.checked_add(bytes.len()).map_or(true, |sum| sum > max_payload_len) {
+                        return Err(PacketEncodeError::DataPayloadOverflow { offset: current_len, length: bytes.len() });
+                    }
+                    let code_offset = u32::try_from(current_len).map_err(|_| PacketEncodeError::DataPayloadOverflow { offset: current_len, length: bytes.len() })?;
+                    data_payload.extend_from_slice(bytes);
+
+                    command_records.extend_from_slice(&OPCODE_CREATE_PIPELINE_TEXTURED.to_le_bytes());
+                    command_records.extend_from_slice(&pipeline_id.to_le_bytes());
+                    command_records.extend_from_slice(&code_offset.to_le_bytes());
+                    command_records.extend_from_slice(&code_len.to_le_bytes());
+                    command_records.extend_from_slice(&target_format.to_le_bytes());
+                    command_records.extend_from_slice(&(if *has_vertex_buffer { 1u32 } else { 0u32 }).to_le_bytes());
+                    command_records.extend_from_slice(&(if *has_uniform_buffer { 1u32 } else { 0u32 }).to_le_bytes());
+                    command_records.extend_from_slice(&uniform_size.to_le_bytes());
+                    command_records.extend_from_slice(&vertex_stride.to_le_bytes());
+                    command_records.extend_from_slice(&texture_id.to_le_bytes());
+                    command_records.extend_from_slice(&sampler_filter.to_le_bytes());
+                    command_records.extend_from_slice(&address_mode.to_le_bytes());
                 }
             }
         }
@@ -1783,6 +1879,52 @@ pub fn lower_plan(plan: &ExecutionPlan) -> Result<Vec<GpuCommand>, PlanLoweringE
     Ok(commands)
 }
 
+fn triangle_vertex_bytes() -> Vec<u8> {
+    let vertices = [
+        VertexPosUv::new([0.0, 0.5, 0.0], [0.5, 1.0]),
+        VertexPosUv::new([-0.5, -0.5, 0.0], [0.0, 0.0]),
+        VertexPosUv::new([0.5, -0.5, 0.0], [1.0, 0.0]),
+    ];
+    let mut vertex_bytes = Vec::with_capacity(vertices.len() * VertexPosUv::BYTE_SIZE);
+    for v in &vertices {
+        vertex_bytes.extend_from_slice(&v.to_bytes());
+    }
+    vertex_bytes
+}
+
+fn triangle_wgsl_source() -> String {
+    format!(
+        "{}\n\
+@group(0) @binding(0)\n\
+var<uniform> model: AffineRows;\n\
+\n\
+struct VertexInput {{\n\
+    @location(0) position: vec3<f32>,\n\
+    @location(1) uv: vec2<f32>,\n\
+}};\n\
+\n\
+struct VertexOutput {{\n\
+    @builtin(position) clip_pos: vec4<f32>,\n\
+    @location(0) uv: vec2<f32>,\n\
+}};\n\
+\n\
+@vertex\n\
+fn vs_main(in: VertexInput) -> VertexOutput {{\n\
+    var out: VertexOutput;\n\
+    let transformed = transform_affine_point(model, in.position);\n\
+    out.clip_pos = vec4<f32>(transformed, 1.0);\n\
+    out.uv = in.uv;\n\
+    return out;\n\
+}}\n\
+\n\
+@fragment\n\
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{\n\
+    return vec4<f32>(in.uv.x, in.uv.y, 1.0 - in.uv.x, 1.0);\n\
+}}\n",
+        WGSL_AFFINE_ROWS_DECLARATION
+    )
+}
+
 /// Builds a real WGSL triangle submission packet using `f3d_core::layout::AffineRows`
 /// and `f3d_core::layout::WGSL_AFFINE_ROWS_DECLARATION`.
 pub fn build_triangle_submission() -> GpuSubmissionPacket {
@@ -1790,9 +1932,10 @@ pub fn build_triangle_submission() -> GpuSubmissionPacket {
     with_global_resource_table(|table| {
         table.register(1);   // uniform_buffer_id
         table.register(2);   // vertex_buffer_id
-        table.register(3);   // readback_buffer_id
+        table.register(20);  // readback_buffer_id
         table.register(10);  // target_texture_id
-        table.register(100); // pipeline_id
+        table.register(100); // offscreen pipeline_id
+        table.register(101); // canvas pipeline_id
     });
 
     let mut packet = GpuSubmissionPacket::new();
@@ -1815,15 +1958,7 @@ pub fn build_triangle_submission() -> GpuSubmissionPacket {
 
     // 2. Vertex buffer: 3 vertices using typed VertexPosUv records (no raw float slices)
     let vertex_buffer_id = 2;
-    let vertices = [
-        VertexPosUv::new([0.0, 0.5, 0.0], [0.5, 1.0]),
-        VertexPosUv::new([-0.5, -0.5, 0.0], [0.0, 0.0]),
-        VertexPosUv::new([0.5, -0.5, 0.0], [1.0, 0.0]),
-    ];
-    let mut vertex_bytes = Vec::with_capacity(vertices.len() * VertexPosUv::BYTE_SIZE);
-    for v in &vertices {
-        vertex_bytes.extend_from_slice(&v.to_bytes());
-    }
+    let vertex_bytes = triangle_vertex_bytes();
     packet.push(GpuCommand::CreateBuffer {
         buffer_id: vertex_buffer_id,
         size: vertex_bytes.len() as u32,
@@ -1855,36 +1990,7 @@ pub fn build_triangle_submission() -> GpuSubmissionPacket {
     });
 
     // 4. Construct WGSL shader incorporating RusticRobin's canonical AffineRows definition
-    let wgsl_source = format!(
-        "{}\n\
-@group(0) @binding(0)\n\
-var<uniform> model: AffineRows;\n\
-\n\
-struct VertexInput {{\n\
-    @location(0) position: vec3<f32>,\n\
-    @location(1) uv: vec2<f32>,\n\
-}};\n\
-\n\
-struct VertexOutput {{\n\
-    @builtin(position) clip_pos: vec4<f32>,\n\
-    @location(0) uv: vec2<f32>,\n\
-}};\n\
-\n\
-@vertex\n\
-fn vs_main(in: VertexInput) -> VertexOutput {{\n\
-    var out: VertexOutput;\n\
-    let transformed = transform_affine_point(model, in.position);\n\
-    out.clip_pos = vec4<f32>(transformed, 1.0);\n\
-    out.uv = in.uv;\n\
-    return out;\n\
-}}\n\
-\n\
-@fragment\n\
-fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{\n\
-    return vec4<f32>(in.uv.x, in.uv.y, 1.0 - in.uv.x, 1.0);\n\
-}}\n",
-        WGSL_AFFINE_ROWS_DECLARATION
-    );
+    let wgsl_source = triangle_wgsl_source();
 
     // 5. Pipeline for offscreen target (rgba8unorm = 2)
     packet.push(GpuCommand::CreatePipeline {
@@ -1948,6 +2054,427 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{\n\
     });
 
     packet
+}
+
+/// Packs a flat slice of affine transform rows (`12 * N` f32 values) into 256-byte aligned uniform buffer bytes.
+///
+/// Each 12-float transform occupies 48 bytes followed by 208 zero-padding bytes.
+/// Returns an owned [`Vec<u8>`] without holding active linear memory borrows.
+pub fn pack_affine_rows_uniform_bytes(affine_rows: &[f32]) -> Result<Vec<u8>, PacketEncodeError> {
+    if affine_rows.is_empty() || affine_rows.len() % 12 != 0 {
+        return Err(PacketEncodeError::InvalidDimensions(format!(
+            "affine_rows length {} must be non-empty and a multiple of 12",
+            affine_rows.len()
+        )));
+    }
+    let n_draws = u32::try_from(affine_rows.len() / 12).map_err(|_| {
+        PacketEncodeError::InvalidDimensions("transform count exceeds u32::MAX".to_string())
+    })?;
+    let uniform_buffer_size = n_draws.checked_mul(256).ok_or_else(|| {
+        PacketEncodeError::InvalidDimensions("uniform buffer size overflow".to_string())
+    })? as usize;
+
+    let mut uniform_bytes = vec![0u8; uniform_buffer_size];
+    for (i, chunk) in affine_rows.chunks_exact(12).enumerate() {
+        let offset = i * 256;
+        for (j, &val) in chunk.iter().enumerate() {
+            uniform_bytes[offset + j * 4..offset + j * 4 + 4].copy_from_slice(&val.to_le_bytes());
+        }
+    }
+    Ok(uniform_bytes)
+}
+
+/// Builds an offscreen submission packet drawing `N` triangles with `N` distinct
+/// AffineRows transforms at 256-byte dynamic offsets in a single offscreen render pass.
+///
+/// Uses the canonical triangle UV gradient shader and geometry from `build_triangle_submission`.
+pub fn build_affine_rows_batch_submission(
+    affine_rows: &[f32],
+    width: u32,
+    height: u32,
+) -> Result<GpuSubmissionPacket, PacketEncodeError> {
+    if width == 0 || height == 0 {
+        return Err(PacketEncodeError::InvalidDimensions(
+            "width and height must be non-zero".to_string(),
+        ));
+    }
+
+    let uniform_bytes = pack_affine_rows_uniform_bytes(affine_rows)?;
+    let uniform_buffer_size = u32::try_from(uniform_bytes.len()).map_err(|_| {
+        PacketEncodeError::InvalidDimensions("uniform buffer size exceeds u32::MAX".to_string())
+    })?;
+    let n_draws = (affine_rows.len() / 12) as u32;
+
+    let unpadded_bytes_per_row = width.checked_mul(4).ok_or_else(|| {
+        PacketEncodeError::InvalidDimensions("width * 4 overflow".to_string())
+    })?;
+    let bytes_per_row = unpadded_bytes_per_row
+        .checked_add(255)
+        .map(|v| (v / 256) * 256)
+        .ok_or_else(|| {
+            PacketEncodeError::InvalidDimensions("bytes_per_row alignment overflow".to_string())
+        })?;
+    let readback_size = bytes_per_row.checked_mul(height).ok_or_else(|| {
+        PacketEncodeError::InvalidDimensions("readback size overflow".to_string())
+    })?;
+
+    with_global_resource_table(|table| {
+        table.register(1);   // uniform_buffer_id
+        table.register(2);   // vertex_buffer_id
+        table.register(10);  // target_texture_id
+        table.register(20);  // readback_buffer_id
+        table.register(100); // pipeline_id
+    });
+
+    let mut packet = GpuSubmissionPacket::new();
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: 1,
+        size: uniform_buffer_size,
+        usage: BUFFER_USAGE_UNIFORM | BUFFER_USAGE_COPY_DST,
+    });
+    packet.push(GpuCommand::WriteBuffer {
+        buffer_id: 1,
+        offset: 0,
+        data: uniform_bytes,
+    });
+
+    let vertex_bytes = triangle_vertex_bytes();
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: 2,
+        size: vertex_bytes.len() as u32,
+        usage: BUFFER_USAGE_VERTEX | BUFFER_USAGE_COPY_DST,
+    });
+    packet.push(GpuCommand::WriteBuffer {
+        buffer_id: 2,
+        offset: 0,
+        data: vertex_bytes,
+    });
+
+    packet.push(GpuCommand::CreateTexture {
+        texture_id: 10,
+        width,
+        height,
+        format: TARGET_FORMAT_RGBA8UNORM,
+        usage: TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC,
+    });
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: 20,
+        size: readback_size,
+        usage: BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST,
+    });
+
+    packet.push(GpuCommand::CreatePipeline {
+        pipeline_id: 100,
+        wgsl_code: triangle_wgsl_source(),
+        target_format: TARGET_FORMAT_RGBA8UNORM,
+        has_vertex_buffer: true,
+        has_uniform_buffer: true,
+        uniform_size: AFFINE_ROWS_BYTES as u32,
+        vertex_stride: VERTEX_POS_UV_STRIDE as u32,
+    });
+
+    push_affine_rows_batch_draw_and_readback_commands(&mut packet, n_draws, width, height);
+
+    Ok(packet)
+}
+
+#[inline]
+fn push_affine_rows_batch_draw_and_readback_commands(
+    packet: &mut GpuSubmissionPacket,
+    n_draws: u32,
+    width: u32,
+    height: u32,
+) {
+    for i in 0..n_draws {
+        packet.push(GpuCommand::RenderPass {
+            target_type: TARGET_OFFSCREEN,
+            target_id: 10,
+            clear_color: [0.0, 0.0, 0.0, 1.0],
+            pipeline_id: 100,
+            vertex_buffer_id: 2,
+            vertex_count: 3,
+            uniform_dynamic_offset: i * 256,
+            uniform_buffer_id: 1,
+            load_op: if i == 0 { LOAD_OP_CLEAR } else { LOAD_OP_LOAD },
+            store_op: STORE_OP_STORE,
+            pass_flags: if i == 0 { PASS_FLAG_NEW_PASS } else { PASS_FLAG_NONE },
+        });
+    }
+
+    packet.push(GpuCommand::CopyTextureToBuffer {
+        texture_id: 10,
+        buffer_id: 20,
+        width,
+        height,
+        epoch: Epoch::ZERO,
+    });
+}
+
+/// Builds a verified [`GpuSubmissionPacket`] for updating an already initialized AffineRows scene.
+///
+/// Emits only:
+/// 1. `WriteBuffer` to uniform buffer 1 (offset 0) with updated packed affine transforms.
+/// 2. `N` per-draw `RenderPass` commands reusing existing pipeline 100, vertex buffer 2,
+///    uniform buffer 1, and offscreen target 10.
+/// 3. `CopyTextureToBuffer` from target texture 10 to readback buffer 20.
+///
+/// Note: `expected_draws` and dimensions correspond to the caller's previously initialized scene shape.
+/// This function cannot verify actual GPU allocation capacity and does not claim to; the caller
+/// must execute this packet on the same isolated `GpuBridge` instance where resources 1, 2, 10, 20,
+/// and 100 were previously created without shape or device changes.
+/// Performs no resource creation or global generational table registration.
+pub fn build_affine_rows_batch_frame_submission(
+    affine_rows: &[f32],
+    width: u32,
+    height: u32,
+    expected_draws: u32,
+) -> Result<GpuSubmissionPacket, PacketEncodeError> {
+    if width == 0 || height == 0 {
+        return Err(PacketEncodeError::InvalidDimensions(
+            "width and height must be non-zero".to_string(),
+        ));
+    }
+    if expected_draws == 0 {
+        return Err(PacketEncodeError::InvalidDimensions(
+            "expected_draws must be greater than zero".to_string(),
+        ));
+    }
+    if affine_rows.is_empty() || affine_rows.len() % 12 != 0 {
+        return Err(PacketEncodeError::InvalidDimensions(format!(
+            "affine_rows length {} must be non-empty and a multiple of 12",
+            affine_rows.len()
+        )));
+    }
+    let n_draws = u32::try_from(affine_rows.len() / 12).map_err(|_| {
+        PacketEncodeError::InvalidDimensions("transform count exceeds u32::MAX".to_string())
+    })?;
+    if n_draws != expected_draws {
+        return Err(PacketEncodeError::InvalidDimensions(format!(
+            "draw count mismatch: expected {expected_draws} draws, got {n_draws}"
+        )));
+    }
+
+    let unpadded_bytes_per_row = width.checked_mul(4).ok_or_else(|| {
+        PacketEncodeError::InvalidDimensions("width * 4 overflow".to_string())
+    })?;
+    let bytes_per_row = unpadded_bytes_per_row
+        .checked_add(255)
+        .map(|v| (v / 256) * 256)
+        .ok_or_else(|| {
+            PacketEncodeError::InvalidDimensions("bytes_per_row alignment overflow".to_string())
+        })?;
+    let _readback_size = bytes_per_row.checked_mul(height).ok_or_else(|| {
+        PacketEncodeError::InvalidDimensions("readback size overflow".to_string())
+    })?;
+
+    let uniform_bytes = pack_affine_rows_uniform_bytes(affine_rows)?;
+
+    let mut packet = GpuSubmissionPacket::new();
+    packet.push(GpuCommand::WriteBuffer {
+        buffer_id: 1,
+        offset: 0,
+        data: uniform_bytes,
+    });
+
+    push_affine_rows_batch_draw_and_readback_commands(&mut packet, n_draws, width, height);
+
+    Ok(packet)
+}
+
+/// Builds a textured WGSL triangle submission packet using `f3d_core::layout::AffineRows`
+/// and sampling from a 2D texture (bead vqa.6).
+pub fn build_textured_affine_triangle_packet(
+    pixels: &[u8],
+    tex_w: u32,
+    tex_h: u32,
+    affine: &AffineRows,
+    target_w: u32,
+    target_h: u32,
+) -> Result<GpuSubmissionPacket, PacketEncodeError> {
+    if tex_w == 0 || tex_h == 0 {
+        return Err(PacketEncodeError::InvalidDimensions(format!(
+            "texture dimensions must be non-zero: {tex_w}x{tex_h}"
+        )));
+    }
+    if target_w == 0 || target_h == 0 {
+        return Err(PacketEncodeError::InvalidDimensions(format!(
+            "target dimensions must be non-zero: {target_w}x{target_h}"
+        )));
+    }
+
+    let tex_bytes_per_row = tex_w.checked_mul(4).ok_or_else(|| {
+        PacketEncodeError::InvalidDimensions("texture row pitch overflow (tex_w * 4)".to_string())
+    })?;
+    let expected_pixel_len = (tex_bytes_per_row as usize)
+        .checked_mul(tex_h as usize)
+        .ok_or_else(|| {
+            PacketEncodeError::InvalidDimensions("texture data size overflow (bytes_per_row * tex_h)".to_string())
+        })?;
+    if pixels.len() != expected_pixel_len {
+        return Err(PacketEncodeError::TextureLengthMismatch {
+            expected: expected_pixel_len,
+            actual: pixels.len(),
+        });
+    }
+
+    let unpadded_target_row = target_w.checked_mul(4).ok_or_else(|| {
+        PacketEncodeError::InvalidDimensions("target row unpadded size overflow (target_w * 4)".to_string())
+    })?;
+    let target_bytes_per_row = ((unpadded_target_row.checked_add(255).ok_or_else(|| {
+        PacketEncodeError::InvalidDimensions("target row alignment padding overflow".to_string())
+    })?) / 256)
+        .checked_mul(256)
+        .ok_or_else(|| {
+            PacketEncodeError::InvalidDimensions("target aligned row bytes overflow".to_string())
+        })?;
+    let readback_size = target_bytes_per_row.checked_mul(target_h).ok_or_else(|| {
+        PacketEncodeError::InvalidDimensions("target readback size overflow (bytes_per_row * target_h)".to_string())
+    })?;
+
+    let uniform_buffer_id = 1;
+    let vertex_buffer_id = 2;
+    let target_texture_id = 10;
+    let source_texture_id = 11;
+    let readback_buffer_id = 20;
+    let pipeline_id = 100;
+
+    with_global_resource_table(|table| {
+        for id in [
+            uniform_buffer_id,
+            vertex_buffer_id,
+            target_texture_id,
+            source_texture_id,
+            readback_buffer_id,
+            pipeline_id,
+        ] {
+            table.register(id);
+        }
+    });
+
+    let mut packet = GpuSubmissionPacket::new();
+
+    // 1. Uniform buffer: AffineRows transform
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: uniform_buffer_id,
+        size: DEFAULT_MIN_UNIFORM_BUFFER_OFFSET_ALIGNMENT as u32,
+        usage: BUFFER_USAGE_UNIFORM | BUFFER_USAGE_COPY_DST,
+    });
+    packet.push(GpuCommand::WriteBuffer {
+        buffer_id: uniform_buffer_id,
+        offset: 0,
+        data: affine.to_bytes().to_vec(),
+    });
+
+    // 2. Vertex buffer: 3 vertices matching existing triangle builder (VertexPosUv)
+    let vertices = [
+        VertexPosUv::new([0.0, 0.5, 0.0], [0.5, 1.0]),
+        VertexPosUv::new([-0.5, -0.5, 0.0], [0.0, 0.0]),
+        VertexPosUv::new([0.5, -0.5, 0.0], [1.0, 0.0]),
+    ];
+    let mut vertex_bytes = Vec::with_capacity(vertices.len() * VertexPosUv::BYTE_SIZE);
+    for v in &vertices {
+        vertex_bytes.extend_from_slice(&v.to_bytes());
+    }
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: vertex_buffer_id,
+        size: vertex_bytes.len() as u32,
+        usage: BUFFER_USAGE_VERTEX | BUFFER_USAGE_COPY_DST,
+    });
+    packet.push(GpuCommand::WriteBuffer {
+        buffer_id: vertex_buffer_id,
+        offset: 0,
+        data: vertex_bytes,
+    });
+
+    // 3. Target texture and readback buffer (target_w x target_h)
+    packet.push(GpuCommand::CreateTexture {
+        texture_id: target_texture_id,
+        width: target_w,
+        height: target_h,
+        format: TARGET_FORMAT_RGBA8UNORM,
+        usage: TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC,
+    });
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: readback_buffer_id,
+        size: readback_size,
+        usage: BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST,
+    });
+
+    // 4. Source texture to sample from and pixel upload via WriteTexture
+    packet.push(GpuCommand::CreateTexture {
+        texture_id: source_texture_id,
+        width: tex_w,
+        height: tex_h,
+        format: TARGET_FORMAT_RGBA8UNORM,
+        usage: TEXTURE_USAGE_TEXTURE_BINDING | TEXTURE_USAGE_COPY_DST,
+    });
+    packet.push(GpuCommand::WriteTexture {
+        texture_id: source_texture_id,
+        width: tex_w,
+        height: tex_h,
+        bytes_per_row: tex_bytes_per_row,
+        data: pixels.to_vec(),
+    });
+
+    // 5. WGSL Shader with AffineRows transform and texture sampling
+    let wgsl_source = format!(
+        "{WGSL_AFFINE_ROWS_DECLARATION}\n\
+@group(0) @binding(0) var<uniform> model: AffineRows;\n\
+@group(0) @binding(1) var tex: texture_2d<f32>;\n\
+@group(0) @binding(2) var samp: sampler;\n\
+struct VertexInput {{ @location(0) position: vec3<f32>, @location(1) uv: vec2<f32>, }};\n\
+struct VertexOutput {{ @builtin(position) clip_pos: vec4<f32>, @location(0) uv: vec2<f32>, }};\n\
+@vertex fn vs_main(in: VertexInput) -> VertexOutput {{\n\
+    var out: VertexOutput;\n\
+    let transformed = transform_affine_point(model, in.position);\n\
+    out.clip_pos = vec4<f32>(transformed, 1.0);\n\
+    out.uv = in.uv;\n\
+    return out;\n\
+}}\n\
+@fragment fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{\n\
+    return textureSample(tex, samp, in.uv);\n\
+}}\n"
+    );
+
+    // 6. Textured pipeline for offscreen target (rgba8unorm)
+    packet.push(GpuCommand::CreatePipelineTextured {
+        pipeline_id,
+        wgsl_code: wgsl_source,
+        target_format: TARGET_FORMAT_RGBA8UNORM,
+        has_vertex_buffer: true,
+        has_uniform_buffer: true,
+        uniform_size: AFFINE_ROWS_BYTES as u32,
+        vertex_stride: VERTEX_POS_UV_STRIDE as u32,
+        texture_id: source_texture_id,
+        sampler_filter: SAMPLER_FILTER_NEAREST,
+        address_mode: ADDRESS_MODE_CLAMP_TO_EDGE,
+    });
+
+    // 7. Render pass to offscreen target
+    packet.push(GpuCommand::RenderPass {
+        target_type: TARGET_OFFSCREEN,
+        target_id: target_texture_id,
+        clear_color: [0.0, 0.0, 0.0, 1.0],
+        pipeline_id,
+        vertex_buffer_id,
+        vertex_count: 3,
+        uniform_dynamic_offset: 0,
+        uniform_buffer_id,
+        load_op: LOAD_OP_CLEAR,
+        store_op: STORE_OP_STORE,
+        pass_flags: PASS_FLAG_NEW_PASS,
+    });
+
+    // 8. Copy offscreen texture to readback buffer
+    packet.push(GpuCommand::CopyTextureToBuffer {
+        texture_id: target_texture_id,
+        buffer_id: readback_buffer_id,
+        width: target_w,
+        height: target_h,
+        epoch: Epoch::ZERO,
+    });
+
+    Ok(packet)
 }
 
 /// Helper to build a complete Red-A / Blue-B submission packet proving snapshot isolation
@@ -3498,6 +4025,65 @@ pub fn f3d_build_affine_rows_transform_packet() -> Vec<u8> {
     gpu_bridge_build_affine_rows_transform_packet()
 }
 
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen]
+/// Encodes a batch AffineRows transform submission packet and returns the raw binary bytes.
+pub fn f3d_build_affine_rows_batch_packet(
+    affine_rows: &[f32],
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, wasm_bindgen::JsValue> {
+    build_affine_rows_batch_submission(affine_rows, width, height)
+        .and_then(|p| p.encode())
+        .map_err(|e| wasm_bindgen::JsValue::from_str(&e.to_string()))
+}
+
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen]
+/// Encodes an update packet for an already initialized AffineRows batch scene (wasm-bindgen export).
+pub fn f3d_build_affine_rows_batch_frame_packet(
+    affine_rows: &[f32],
+    width: u32,
+    height: u32,
+    expected_draws: u32,
+) -> Result<Vec<u8>, wasm_bindgen::JsValue> {
+    build_affine_rows_batch_frame_submission(affine_rows, width, height, expected_draws)
+        .and_then(|p| p.encode())
+        .map_err(|e| wasm_bindgen::JsValue::from_str(&e.to_string()))
+}
+
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = f3dHost, js_name = drawCall, catch)]
+    fn host_draw_call(draw_index: u32) -> Result<(), JsValue>;
+}
+
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen]
+/// Synchronously loops `count` iterations invoking the imported host callback `f3dHost.drawCall(index)` (Kill Gate 2 / tmt.5).
+///
+/// Enforces:
+/// - Zero live linear memory slices across host callback invocation.
+/// - Zero RefCell borrows active during host call.
+/// - Zero global table / mutex locks held across the host boundary.
+/// - Immediate propagation of thrown host errors to stop iteration.
+pub fn f3d_bridge_chatty_draw_loop(count: u32) -> Result<u32, JsValue> {
+    for i in 0..count {
+        host_draw_call(i)?;
+    }
+    Ok(count)
+}
+
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen]
+/// Packs a flat slice of 3x4 affine transforms (`12 * N` f32 values) into 256-byte aligned uniform buffer bytes.
+/// Returns an owned `Vec<u8>` for the generated static submission bridge variant.
+pub fn f3d_pack_affine_rows_bytes(affine_rows: &[f32]) -> Result<Vec<u8>, wasm_bindgen::JsValue> {
+    pack_affine_rows_uniform_bytes(affine_rows)
+        .map_err(|e| wasm_bindgen::JsValue::from_str(&e.to_string()))
+}
+
 #[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
 /// Native export for `gpu_bridge_build_affine_rows_transform_packet` for host verification and unit tests.
 #[must_use]
@@ -3512,6 +4098,120 @@ pub fn gpu_bridge_build_affine_rows_transform_packet() -> Vec<u8> {
 #[must_use]
 pub fn f3d_build_affine_rows_transform_packet() -> Vec<u8> {
     gpu_bridge_build_affine_rows_transform_packet()
+}
+
+#[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
+/// Native export for `f3d_build_affine_rows_batch_packet`.
+pub fn f3d_build_affine_rows_batch_packet(
+    affine_rows: &[f32],
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, String> {
+    build_affine_rows_batch_submission(affine_rows, width, height)
+        .and_then(|p| p.encode())
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
+/// Native export for `f3d_build_affine_rows_batch_frame_packet` for host verification and unit tests.
+pub fn f3d_build_affine_rows_batch_frame_packet(
+    affine_rows: &[f32],
+    width: u32,
+    height: u32,
+    expected_draws: u32,
+) -> Result<Vec<u8>, String> {
+    build_affine_rows_batch_frame_submission(affine_rows, width, height, expected_draws)
+        .and_then(|p| p.encode())
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
+/// Native export for `f3d_pack_affine_rows_bytes` for host verification and unit tests.
+pub fn f3d_pack_affine_rows_bytes(affine_rows: &[f32]) -> Result<Vec<u8>, String> {
+    pack_affine_rows_uniform_bytes(affine_rows).map_err(|e| e.to_string())
+}
+
+fn encode_textured_affine_triangle_helper(
+    pixels: &[u8],
+    tex_w: u32,
+    tex_h: u32,
+    affine_data: &[f32],
+    target_w: u32,
+    target_h: u32,
+) -> Result<Vec<u8>, PacketEncodeError> {
+    if affine_data.len() != 12 {
+        return Err(PacketEncodeError::InvalidDimensions(format!(
+            "affine_data must have exactly 12 f32 elements (row-major AffineRows), got {}",
+            affine_data.len()
+        )));
+    }
+    let affine = AffineRows::new(
+        [affine_data[0], affine_data[1], affine_data[2], affine_data[3]],
+        [affine_data[4], affine_data[5], affine_data[6], affine_data[7]],
+        [affine_data[8], affine_data[9], affine_data[10], affine_data[11]],
+    );
+    let packet = build_textured_affine_triangle_packet(
+        pixels, tex_w, tex_h, &affine, target_w, target_h,
+    )?;
+    packet.encode()
+}
+
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen]
+/// Encodes a textured affine triangle submission packet and returns the raw binary bytes (§6.1, §6.2, vqa.6).
+pub fn gpu_bridge_build_textured_affine_triangle_packet(
+    pixels: &[u8],
+    tex_w: u32,
+    tex_h: u32,
+    affine_data: &[f32],
+    target_w: u32,
+    target_h: u32,
+) -> Result<Vec<u8>, wasm_bindgen::JsValue> {
+    encode_textured_affine_triangle_helper(pixels, tex_w, tex_h, affine_data, target_w, target_h)
+        .map_err(|e| wasm_bindgen::JsValue::from_str(&e.to_string()))
+}
+
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen]
+/// Encodes a textured affine triangle submission packet and returns the raw binary bytes (canonical alias).
+pub fn f3d_build_textured_affine_triangle_packet(
+    pixels: &[u8],
+    tex_w: u32,
+    tex_h: u32,
+    affine_data: &[f32],
+    target_w: u32,
+    target_h: u32,
+) -> Result<Vec<u8>, wasm_bindgen::JsValue> {
+    encode_textured_affine_triangle_helper(pixels, tex_w, tex_h, affine_data, target_w, target_h)
+        .map_err(|e| wasm_bindgen::JsValue::from_str(&e.to_string()))
+}
+
+#[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
+/// Native export for `gpu_bridge_build_textured_affine_triangle_packet` for host verification and unit tests.
+pub fn gpu_bridge_build_textured_affine_triangle_packet(
+    pixels: &[u8],
+    tex_w: u32,
+    tex_h: u32,
+    affine_data: &[f32],
+    target_w: u32,
+    target_h: u32,
+) -> Result<Vec<u8>, String> {
+    encode_textured_affine_triangle_helper(pixels, tex_w, tex_h, affine_data, target_w, target_h)
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
+/// Native export for `f3d_build_textured_affine_triangle_packet` (canonical alias).
+pub fn f3d_build_textured_affine_triangle_packet(
+    pixels: &[u8],
+    tex_w: u32,
+    tex_h: u32,
+    affine_data: &[f32],
+    target_w: u32,
+    target_h: u32,
+) -> Result<Vec<u8>, String> {
+    encode_textured_affine_triangle_helper(pixels, tex_w, tex_h, affine_data, target_w, target_h)
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(all(feature = "browser", target_arch = "wasm32"))]
@@ -6265,6 +6965,91 @@ mod tests {
     }
 
     #[test]
+    fn test_affine_rows_batch_packet() {
+        // 1. Validation errors and overflow regressions
+        assert!(f3d_build_affine_rows_batch_packet(&[], 64, 64).is_err());
+        assert!(f3d_build_affine_rows_batch_packet(&[1.0; 11], 64, 64).is_err());
+        assert!(f3d_build_affine_rows_batch_packet(&[1.0; 13], 64, 64).is_err());
+        assert!(f3d_build_affine_rows_batch_packet(&[1.0; 12], 0, 64).is_err());
+        assert!(f3d_build_affine_rows_batch_packet(&[1.0; 12], 64, 0).is_err());
+        // Narrow regression: width = u32::MAX / 4 overflows checked_add(255)
+        assert!(f3d_build_affine_rows_batch_packet(&[1.0; 12], u32::MAX / 4, 1).is_err());
+
+        // 2. Distinct 2-transform batch upload & padding proof
+        let row0 = [1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+        let row1 = [0.5f32, 0.0, 0.0, 0.25, 0.0, 0.5, 0.0, -0.25, 0.0, 0.0, 1.0, 0.0];
+        let mut row0_bytes = [0u8; 48];
+        for (j, &val) in row0.iter().enumerate() {
+            row0_bytes[j * 4..j * 4 + 4].copy_from_slice(&val.to_le_bytes());
+        }
+        let mut row1_bytes = [0u8; 48];
+        for (j, &val) in row1.iter().enumerate() {
+            row1_bytes[j * 4..j * 4 + 4].copy_from_slice(&val.to_le_bytes());
+        }
+        let mut two_rows = Vec::with_capacity(24);
+        two_rows.extend_from_slice(&row0);
+        two_rows.extend_from_slice(&row1);
+
+        let packet = build_affine_rows_batch_submission(&two_rows, 64, 64).expect("valid 2-row batch");
+        assert_eq!(packet.commands.len(), 7 + 2 + 1); // 7 setup + 2 draws + 1 copy = 10 commands
+
+        // Check uniform buffer upload: exact LE bytes for each row and zero padding
+        match &packet.commands[1] {
+            GpuCommand::WriteBuffer { buffer_id, offset, data } => {
+                assert_eq!(*buffer_id, 1);
+                assert_eq!(*offset, 0);
+                assert_eq!(data.len(), 2 * 256);
+                // Exact LE bytes serialization match for each input row
+                assert_eq!(&data[0..48], &row0_bytes[..]);
+                assert_eq!(&data[256..304], &row1_bytes[..]);
+                assert!(data[48..256].iter().all(|&b| b == 0), "slot 0 padding must be zero");
+                assert!(data[304..512].iter().all(|&b| b == 0), "slot 1 padding must be zero");
+            }
+            other => panic!("expected WriteBuffer for uniform, got {other:?}"),
+        }
+
+        // Check draws: single render pass, pipeline 100, dynamic offsets
+        match &packet.commands[7] {
+            GpuCommand::RenderPass { pipeline_id, uniform_dynamic_offset, pass_flags, load_op, .. } => {
+                assert_eq!(*pipeline_id, 100);
+                assert_eq!(*uniform_dynamic_offset, 0);
+                assert_eq!(*pass_flags, PASS_FLAG_NEW_PASS);
+                assert_eq!(*load_op, LOAD_OP_CLEAR);
+            }
+            other => panic!("expected RenderPass draw 0, got {other:?}"),
+        }
+        match &packet.commands[8] {
+            GpuCommand::RenderPass { pipeline_id, uniform_dynamic_offset, pass_flags, load_op, .. } => {
+                assert_eq!(*pipeline_id, 100);
+                assert_eq!(*uniform_dynamic_offset, 256);
+                assert_eq!(*pass_flags, PASS_FLAG_NONE);
+                assert_eq!(*load_op, LOAD_OP_LOAD);
+            }
+            other => panic!("expected RenderPass draw 1, got {other:?}"),
+        }
+
+        // 3. Full 4000-draw batch
+        let mut four_thousand_rows = vec![0.0f32; 4000 * 12];
+        for i in 0..4000 {
+            let offset = i * 12;
+            four_thousand_rows[offset..offset + 12].copy_from_slice(&row0);
+        }
+        let packet_4000 = build_affine_rows_batch_submission(&four_thousand_rows, 256, 256).expect("valid 4000-row batch");
+        assert_eq!(packet_4000.commands.len(), 7 + 4000 + 1); // 4008 commands
+
+        match &packet_4000.commands[0] {
+            GpuCommand::CreateBuffer { size, .. } => {
+                assert_eq!(*size, 4000 * 256);
+            }
+            other => panic!("expected CreateBuffer, got {other:?}"),
+        }
+
+        // 4. Binary encoding check
+        let wasm_bytes = f3d_build_affine_rows_batch_packet(&two_rows, 64, 64).unwrap();
+        assert_eq!(&wasm_bytes[0..4], &PACKET_MAGIC);
+    }
+
+    #[test]
     fn test_pack_unpack_target_type_backwards_compatibility() {
         // 1. Raw 0 (Offscreen) and raw 1 (Canvas) must unpack with Clear, Store, and No-Flag
         assert_eq!(unpack_target_kind(TARGET_OFFSCREEN), TARGET_OFFSCREEN);
@@ -8827,5 +9612,255 @@ mod tests {
         assert!(matches!(&commands[0], GpuCommand::RenderPass { vertex_count: 3, pass_flags: PASS_FLAG_NEW_PASS, .. }));
         assert!(matches!(&commands[1], GpuCommand::SetDrawParameters { instance_count: 3, first_vertex: 6, first_instance: 1 }));
         assert!(matches!(&commands[2], GpuCommand::RenderPass { vertex_count: 3, pass_flags: PASS_FLAG_NONE, .. }));
+    }
+
+    #[test]
+    fn test_write_texture_and_create_pipeline_textured_byte_encoding() {
+        let mut packet = GpuSubmissionPacket::new();
+        let pixel_data = vec![10u8, 20, 30, 40, 50, 60, 70, 80];
+        packet.push(GpuCommand::WriteTexture {
+            texture_id: 11, width: 2, height: 1, bytes_per_row: 8, data: pixel_data.clone(),
+        });
+        let encoded = packet.encode().expect("encoding WriteTexture must succeed");
+        assert_eq!(&encoded[0..4], &PACKET_MAGIC);
+        assert_eq!(u16::from_le_bytes(encoded[4..6].try_into().unwrap()), PACKET_VERSION);
+        assert_eq!(u32::from_le_bytes(encoded[8..12].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(encoded[12..16].try_into().unwrap()), 8);
+
+        // Opcode 17 record: 26 bytes (offset 16..42)
+        assert_eq!(u16::from_le_bytes(encoded[16..18].try_into().unwrap()), OPCODE_WRITE_TEXTURE);
+        assert_eq!(u32::from_le_bytes(encoded[18..22].try_into().unwrap()), 11);
+        assert_eq!(u32::from_le_bytes(encoded[22..26].try_into().unwrap()), 2);
+        assert_eq!(u32::from_le_bytes(encoded[26..30].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(encoded[30..34].try_into().unwrap()), 8);
+        assert_eq!(u32::from_le_bytes(encoded[34..38].try_into().unwrap()), 0);
+        assert_eq!(u32::from_le_bytes(encoded[38..42].try_into().unwrap()), 8);
+        assert_eq!(&encoded[42..50], &pixel_data[..]);
+
+        // 2. Test CreatePipelineTextured byte encoding
+        let mut pipe_packet = GpuSubmissionPacket::new();
+        let wgsl_code = "@fragment fn fs() -> @location(0) vec4<f32> { return vec4(1.0); }";
+        let code_bytes = wgsl_code.as_bytes();
+        pipe_packet.push(GpuCommand::CreatePipelineTextured {
+            pipeline_id: 100, wgsl_code: wgsl_code.to_string(), target_format: TARGET_FORMAT_RGBA8UNORM,
+            has_vertex_buffer: true, has_uniform_buffer: true, uniform_size: 48, vertex_stride: 20,
+            texture_id: 11, sampler_filter: SAMPLER_FILTER_NEAREST, address_mode: ADDRESS_MODE_CLAMP_TO_EDGE,
+        });
+        let enc_pipe = pipe_packet.encode().expect("encoding CreatePipelineTextured must succeed");
+        assert_eq!(&enc_pipe[0..4], &PACKET_MAGIC);
+        assert_eq!(u32::from_le_bytes(enc_pipe[8..12].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(enc_pipe[12..16].try_into().unwrap()), code_bytes.len() as u32);
+
+        // Opcode 18 record: 46 bytes (offset 16..62)
+        assert_eq!(u16::from_le_bytes(enc_pipe[16..18].try_into().unwrap()), OPCODE_CREATE_PIPELINE_TEXTURED);
+        assert_eq!(u32::from_le_bytes(enc_pipe[18..22].try_into().unwrap()), 100);
+        assert_eq!(u32::from_le_bytes(enc_pipe[22..26].try_into().unwrap()), 0);
+        assert_eq!(u32::from_le_bytes(enc_pipe[26..30].try_into().unwrap()), code_bytes.len() as u32);
+        assert_eq!(u32::from_le_bytes(enc_pipe[30..34].try_into().unwrap()), TARGET_FORMAT_RGBA8UNORM);
+        assert_eq!(u32::from_le_bytes(enc_pipe[34..38].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(enc_pipe[38..42].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(enc_pipe[42..46].try_into().unwrap()), 48);
+        assert_eq!(u32::from_le_bytes(enc_pipe[46..50].try_into().unwrap()), 20);
+        assert_eq!(u32::from_le_bytes(enc_pipe[50..54].try_into().unwrap()), 11);
+        assert_eq!(u32::from_le_bytes(enc_pipe[54..58].try_into().unwrap()), SAMPLER_FILTER_NEAREST);
+        assert_eq!(u32::from_le_bytes(enc_pipe[58..62].try_into().unwrap()), ADDRESS_MODE_CLAMP_TO_EDGE);
+        assert_eq!(&enc_pipe[62..62 + code_bytes.len()], code_bytes);
+    }
+
+    #[test]
+    fn test_write_texture_length_mismatch_error() {
+        let mut packet = GpuSubmissionPacket::new();
+        packet.push(GpuCommand::WriteTexture {
+            texture_id: 11, width: 2, height: 2, bytes_per_row: 8, data: vec![0u8; 12],
+        });
+        match packet.encode().expect_err("encode must fail on length mismatch") {
+            PacketEncodeError::TextureLengthMismatch { expected, actual } => {
+                assert_eq!(expected, 16);
+                assert_eq!(actual, 12);
+            }
+            other => panic!("expected TextureLengthMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_textured_affine_triangle_input_validation_errors() {
+        let pixels = [10u8, 20, 30, 40, 50, 60, 70, 80];
+        let affine = AffineRows::identity();
+        for (tex_w, tex_h, target_w, target_h) in [
+            (0, 1, 65, 3), (2, 0, 65, 3), (2, 1, 0, 3), (2, 1, 65, 0),
+            (u32::MAX, 1, 65, 3), (2, 1, u32::MAX, 3),
+            (2, 1, u32::MAX / 4, 3), (2, 1, 64, u32::MAX),
+        ] {
+            assert!(matches!(
+                build_textured_affine_triangle_packet(&pixels, tex_w, tex_h, &affine, target_w, target_h),
+                Err(PacketEncodeError::InvalidDimensions(_))
+            ), "accepted invalid dimensions {tex_w}x{tex_h} -> {target_w}x{target_h}");
+        }
+        assert!(matches!(
+            build_textured_affine_triangle_packet(&pixels[..4], 2, 1, &affine, 65, 3),
+            Err(PacketEncodeError::TextureLengthMismatch { expected: 8, actual: 4 })
+        ));
+        for len in [0, 11, 13] {
+            assert!(f3d_build_textured_affine_triangle_packet(&pixels, 2, 1, &vec![0.0; len], 65, 3).is_err());
+        }
+    }
+
+    #[test]
+    fn test_textured_affine_triangle_packet_builder_and_exports() {
+        // Inputs intentionally differ from the browser's 2x2/64x64 fixture.
+        // A 65-pixel target requires 512-byte padded readback rows.
+        let pixels = [10u8, 20, 30, 40, 50, 60, 70, 80];
+        let affine_data = [1.0f32, 0.0, 0.0, 7.0, 0.0, 2.0, 0.0, -3.0, 0.0, 0.0, 1.0, 0.0];
+        let affine = AffineRows::new([1.0, 0.0, 0.0, 7.0], [0.0, 2.0, 0.0, -3.0], [0.0, 0.0, 1.0, 0.0]);
+        let packet = build_textured_affine_triangle_packet(&pixels, 2, 1, &affine, 65, 3).unwrap();
+        let cmds = packet.commands();
+        assert!(matches!(&cmds[1], GpuCommand::WriteBuffer { data, .. }
+            if data.as_slice() == affine.to_bytes()));
+        assert!(matches!(&cmds[4], GpuCommand::CreateTexture { width: 65, height: 3, .. }));
+        assert!(matches!(&cmds[5], GpuCommand::CreateBuffer { size: 1536, .. }));
+        assert!(matches!(&cmds[7], GpuCommand::WriteTexture {
+            width: 2, height: 1, bytes_per_row: 8, data, ..
+        } if data.as_slice() == pixels));
+        assert!(matches!(&cmds[10], GpuCommand::CopyTextureToBuffer { width: 65, height: 3, .. }));
+        let encoded = packet.encode().unwrap();
+        let native = f3d_build_textured_affine_triangle_packet(&pixels, 2, 1, &affine_data, 65, 3).unwrap();
+        let alias = gpu_bridge_build_textured_affine_triangle_packet(&pixels, 2, 1, &affine_data, 65, 3).unwrap();
+        assert_eq!(encoded, native);
+        assert_eq!(native, alias);
+    }
+
+    #[test]
+    fn test_pack_affine_rows_uniform_bytes_layout_and_validation() {
+        // 1 transform: 12 floats = 48 bytes payload + 208 bytes zero padding = 256 bytes
+        let floats: Vec<f32> = (0..12).map(|i| (i + 1) as f32).collect();
+        let packed = pack_affine_rows_uniform_bytes(&floats).expect("packing 1 transform");
+        assert_eq!(packed.len(), 256);
+        for i in 0..12 {
+            let val = f32::from_le_bytes(packed[i * 4..i * 4 + 4].try_into().unwrap());
+            assert_eq!(val, (i + 1) as f32);
+        }
+        for &b in &packed[48..256] {
+            assert_eq!(b, 0);
+        }
+
+        // 2 transforms = 512 bytes with 256-byte stride
+        let floats2: Vec<f32> = (0..24).map(|i| (i + 1) as f32).collect();
+        let packed2 = pack_affine_rows_uniform_bytes(&floats2).expect("packing 2 transforms");
+        assert_eq!(packed2.len(), 512);
+        let expected_row0: Vec<u8> = floats2[0..12].iter().flat_map(|f| f.to_le_bytes()).collect();
+        let expected_row1: Vec<u8> = floats2[12..24].iter().flat_map(|f| f.to_le_bytes()).collect();
+        assert_eq!(&packed2[0..48], expected_row0.as_slice());
+        assert_eq!(&packed2[256..304], expected_row1.as_slice());
+        for &b in &packed2[48..256] {
+            assert_eq!(b, 0);
+        }
+        for &b in &packed2[304..512] {
+            assert_eq!(b, 0);
+        }
+
+        // Export parity on native
+        assert_eq!(packed, f3d_pack_affine_rows_bytes(&floats).unwrap());
+
+        // Length validation errors
+        assert!(pack_affine_rows_uniform_bytes(&[]).is_err());
+        assert!(pack_affine_rows_uniform_bytes(&[1.0; 11]).is_err());
+        assert!(pack_affine_rows_uniform_bytes(&[1.0; 13]).is_err());
+    }
+
+    #[test]
+    fn test_build_affine_rows_batch_frame_submission_commands_and_validation() {
+        let floats: Vec<f32> = (0..24).map(|i| (i + 1) as f32).collect(); // 2 draws
+        let packet = build_affine_rows_batch_frame_submission(&floats, 64, 64, 2)
+            .expect("2-draw frame update submission");
+        let cmds = packet.commands();
+        // Exactly expected_draws + 2 commands = 4 commands (1 WriteBuffer + 2 RenderPass + 1 CopyTextureToBuffer)
+        assert_eq!(cmds.len(), 4);
+
+        // Command 0: WriteBuffer to uniform buffer 1, offset 0
+        match &cmds[0] {
+            GpuCommand::WriteBuffer { buffer_id, offset, data } => {
+                assert_eq!(*buffer_id, 1);
+                assert_eq!(*offset, 0);
+                assert_eq!(data.len(), 512); // 2 * 256
+                let expected = pack_affine_rows_uniform_bytes(&floats).unwrap();
+                assert_eq!(data.as_slice(), expected.as_slice());
+            }
+            other => panic!("expected WriteBuffer, got {other:?}"),
+        }
+
+        // Commands 1..2: RenderPass on target 10, pipeline 100, vb 2, ub 1
+        for (i, cmd) in cmds[1..3].iter().enumerate() {
+            match cmd {
+                GpuCommand::RenderPass {
+                    target_type, target_id, pipeline_id, vertex_buffer_id, vertex_count,
+                    uniform_buffer_id, uniform_dynamic_offset, load_op, pass_flags, ..
+                } => {
+                    assert_eq!(*target_type, TARGET_OFFSCREEN);
+                    assert_eq!(*target_id, 10);
+                    assert_eq!(*pipeline_id, 100);
+                    assert_eq!(*vertex_buffer_id, 2);
+                    assert_eq!(*vertex_count, 3);
+                    assert_eq!(*uniform_buffer_id, 1);
+                    assert_eq!(*uniform_dynamic_offset, (i as u32) * 256);
+                    assert_eq!(*load_op, if i == 0 { LOAD_OP_CLEAR } else { LOAD_OP_LOAD });
+                    assert_eq!(*pass_flags, if i == 0 { PASS_FLAG_NEW_PASS } else { PASS_FLAG_NONE });
+                }
+                other => panic!("expected RenderPass, got {other:?}"),
+            }
+        }
+
+        // Command 3: CopyTextureToBuffer 10 -> 20
+        match &cmds[3] {
+            GpuCommand::CopyTextureToBuffer { texture_id, buffer_id, width, height, .. } => {
+                assert_eq!(*texture_id, 10);
+                assert_eq!(*buffer_id, 20);
+                assert_eq!(*width, 64);
+                assert_eq!(*height, 64);
+            }
+            other => panic!("expected CopyTextureToBuffer, got {other:?}"),
+        }
+
+        // Public export parity
+        let encoded = packet.encode().unwrap();
+        let exported = f3d_build_affine_rows_batch_frame_packet(&floats, 64, 64, 2).unwrap();
+        assert_eq!(encoded, exported);
+
+        // Validation: mismatch in expected_draws vs float length
+        assert!(matches!(
+            build_affine_rows_batch_frame_submission(&floats, 64, 64, 1),
+            Err(PacketEncodeError::InvalidDimensions(_))
+        ));
+        assert!(matches!(
+            build_affine_rows_batch_frame_submission(&floats, 64, 64, 3),
+            Err(PacketEncodeError::InvalidDimensions(_))
+        ));
+        assert!(matches!(
+            build_affine_rows_batch_frame_submission(&floats, 64, 64, 0),
+            Err(PacketEncodeError::InvalidDimensions(_))
+        ));
+
+        // Validation: zero dimensions & readback overflow
+        assert!(matches!(
+            build_affine_rows_batch_frame_submission(&floats, 0, 64, 2),
+            Err(PacketEncodeError::InvalidDimensions(_))
+        ));
+        assert!(matches!(
+            build_affine_rows_batch_frame_submission(&floats, 64, 0, 2),
+            Err(PacketEncodeError::InvalidDimensions(_))
+        ));
+        assert!(matches!(
+            build_affine_rows_batch_frame_submission(&floats, u32::MAX, 64, 2),
+            Err(PacketEncodeError::InvalidDimensions(_))
+        ));
+        assert!(matches!(
+            build_affine_rows_batch_frame_submission(&floats, 64, u32::MAX, 2),
+            Err(PacketEncodeError::InvalidDimensions(_))
+        ));
+
+        // Validation: invalid float slice length
+        assert!(matches!(
+            build_affine_rows_batch_frame_submission(&[1.0; 23], 64, 64, 2),
+            Err(PacketEncodeError::InvalidDimensions(_))
+        ));
     }
 }

@@ -1,7 +1,9 @@
 import {
   PACKET_MAGIC, PACKET_VERSION, OPCODE_RENDER_PASS,
-  OPCODE_COPY_TEXTURE_TO_BUFFER, TARGET_OFFSCREEN,
+  OPCODE_COPY_TEXTURE_TO_BUFFER, OPCODE_WRITE_TEXTURE,
+  OPCODE_CREATE_PIPELINE_TEXTURED, TARGET_OFFSCREEN,
 } from "./bridge_runtime.js";
+import { PacketBuilder } from "./direct_reference.js";
 
 // Exercise the production JS decoder with real incompatible pipeline layouts.
 export async function testPipelineBindingChange(host) {
@@ -71,7 +73,8 @@ export async function testPipelineBindingChange(host) {
     if (pixel[0] !== 0 || pixel[1] !== 255 || pixel[2] !== 0 || pixel[3] !== 255) {
       throw new Error(`Pipeline binding switch rendered wrong pixel: ${Array.from(pixel.slice(0, 4))}`);
     }
-    return "JS host bridge: pipeline switch from 16-byte to 32-byte layout rebinds the same uniform buffer and renders green";
+    await testTextureBindingAndWriteOrder(host);
+    return "JS host bridge: pipeline layout switch renders green; texture-only pipeline renders blue; interleaved texture writes preserve red-A/blue-B";
   } finally {
     host.buffers.delete(uniformId);
     host.buffers.delete(readbackId);
@@ -81,5 +84,116 @@ export async function testPipelineBindingChange(host) {
     uniform.destroy();
     readback.destroy();
     target.destroy();
+  }
+}
+
+async function testTextureBindingAndWriteOrder(host) {
+  const sourceId = 0x7fffff10, targetId = 0x7fffff11, pipelineId = 0x7fffff12;
+  const readbackIds = [0x7fffff13, 0x7fffff14];
+  const previousTargetId = host.lastRenderTargetId;
+  const red = new Uint8Array([255, 0, 0, 255]);
+  const blue = new Uint8Array([0, 0, 255, 255]);
+  const writeCommandBytes = 26, pipelineCommandBytes = 46;
+
+  // Only the two new opcodes need local encoding; all existing commands use
+  // the fixture's PacketBuilder. These uploads are exactly one RGBA8 texel.
+  function writeTextureCommand(view, cursor, dataOffset) {
+    view.setUint16(cursor, OPCODE_WRITE_TEXTURE, true);
+    [sourceId, 1, 1, 4, dataOffset, 4].forEach((value, index) =>
+      view.setUint32(cursor + 2 + index * 4, value, true));
+  }
+  function assertPixel(bytes, expected, label) {
+    if (expected.some((value, index) => bytes[index] !== value)) {
+      throw new Error(`${label}: expected ${Array.from(expected)}, got ${Array.from(bytes.slice(0, 4))}`);
+    }
+  }
+
+  try {
+    const setup = new PacketBuilder();
+    setup.createTexture(sourceId, 1, 1, 2,
+      GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC);
+    setup.createTexture(targetId, 1, 1, 2,
+      GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC);
+    for (const id of readbackIds) {
+      setup.createBuffer(id, 256, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
+    }
+    await host.executePacket(setup.build());
+
+    const shader = new TextEncoder().encode(`
+      @group(0) @binding(1) var tex: texture_2d<f32>;
+      @group(0) @binding(2) var samp: sampler;
+      @vertex fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+        let p = array<vec2<f32>, 3>(vec2(-1., -1.), vec2(3., -1.), vec2(-1., 3.));
+        return vec4(p[i], 0., 1.);
+      }
+      @fragment fn fs_main() -> @location(0) vec4<f32> {
+        return textureSample(tex, samp, vec2<f32>(0.5));
+      }
+    `);
+    const draw = new PacketBuilder();
+    draw.renderPass(TARGET_OFFSCREEN, targetId, [0, 0, 0, 1], pipelineId, 0, 3);
+    draw.copyTextureToBuffer(targetId, readbackIds[0], 1, 1);
+    const drawPacket = draw.build();
+    const commandPrefixBytes = pipelineCommandBytes + writeCommandBytes;
+    const samplePacket = new Uint8Array(drawPacket.byteLength + commandPrefixBytes + shader.byteLength + blue.byteLength);
+    samplePacket.set(drawPacket.subarray(0, 16));
+    const sampleView = new DataView(samplePacket.buffer);
+    sampleView.setUint32(8, 4, true);
+    sampleView.setUint32(12, shader.byteLength + blue.byteLength, true);
+    sampleView.setUint16(16, OPCODE_CREATE_PIPELINE_TEXTURED, true);
+    // has_vertex_buffer=false, has_uniform_buffer=false: bindings 1 and 2
+    // must still be bound, without a fabricated binding 0 or dynamic offset.
+    [pipelineId, 0, shader.byteLength, 2, 0, 0, 0, 0, sourceId, 0, 0].forEach((value, index) =>
+      sampleView.setUint32(18 + index * 4, value, true));
+    writeTextureCommand(sampleView, 16 + pipelineCommandBytes, shader.byteLength);
+    samplePacket.set(drawPacket.subarray(16), 16 + commandPrefixBytes);
+    const sampleDataStart = drawPacket.byteLength + commandPrefixBytes;
+    samplePacket.set(shader, sampleDataStart);
+    samplePacket.set(blue, sampleDataStart + shader.byteLength);
+    await host.executePacket(samplePacket);
+    assertPixel(await host.readbackBuffer(readbackIds[0], 256), blue,
+      "Texture-only pipeline must sample blue without a uniform buffer");
+
+    // A single packet must preserve command order across queue uploads and
+    // encoded copies: red -> copy A -> blue -> copy B. Ending a pass alone
+    // cannot order the earlier copy before the second queue.writeTexture.
+    // Source and readback A start blue, so omitting the red upload or copy A
+    // cannot accidentally satisfy the expected red result.
+    const copies = new PacketBuilder();
+    for (const id of readbackIds) copies.copyTextureToBuffer(sourceId, id, 1, 1);
+    const copyPacket = copies.build();
+    const copyCommandBytes = 26;
+    const orderedPacket = new Uint8Array(copyPacket.byteLength + 2 * writeCommandBytes + 8);
+    orderedPacket.set(copyPacket.subarray(0, 16));
+    const orderedView = new DataView(orderedPacket.buffer);
+    orderedView.setUint32(8, 4, true);
+    orderedView.setUint32(12, 8, true);
+    let cursor = 16;
+    for (let index = 0; index < 2; index++) {
+      writeTextureCommand(orderedView, cursor, index * 4);
+      cursor += writeCommandBytes;
+      const copyStart = 16 + index * copyCommandBytes;
+      orderedPacket.set(copyPacket.subarray(copyStart, copyStart + copyCommandBytes), cursor);
+      cursor += copyCommandBytes;
+    }
+    orderedPacket.set(red, cursor);
+    orderedPacket.set(blue, cursor + 4);
+    await host.executePacket(orderedPacket);
+    assertPixel(await host.readbackBuffer(readbackIds[0], 256), red,
+      "First encoded texture copy must retain red after the later blue upload");
+    assertPixel(await host.readbackBuffer(readbackIds[1], 256), blue,
+      "Second encoded texture copy must observe blue");
+  } finally {
+    for (const id of readbackIds) {
+      host.buffers.get(id)?.destroy();
+      host.buffers.delete(id);
+      host.bufferEpochs.delete(id);
+    }
+    for (const id of [sourceId, targetId]) {
+      host.textures.get(id)?.destroy();
+      host.textures.delete(id);
+    }
+    host.pipelines.delete(pipelineId);
+    host.lastRenderTargetId = previousTargetId;
   }
 }

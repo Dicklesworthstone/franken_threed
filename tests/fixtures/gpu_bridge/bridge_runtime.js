@@ -28,6 +28,24 @@ export const OPCODE_RENDER_PASS_DEPTH = 13;
 export const OPCODE_CREATE_PIPELINE_CULL = 14;
 export const OPCODE_CREATE_PIPELINE_DEPTH_CULL = 15;
 export const OPCODE_CREATE_PIPELINE_DEPTH_CULL_COLOR = 16;
+export const OPCODE_WRITE_TEXTURE = 17;
+export const OPCODE_CREATE_PIPELINE_TEXTURED = 18;
+
+export const SAMPLER_FILTER_NEAREST = 0;
+export const SAMPLER_FILTER_LINEAR = 1;
+
+export const SAMPLER_FILTER_NAMES = {
+  0: "nearest",
+  1: "linear",
+};
+
+export const ADDRESS_MODE_CLAMP_TO_EDGE = 0;
+export const ADDRESS_MODE_REPEAT = 1;
+
+export const ADDRESS_MODE_NAMES = {
+  0: "clamp-to-edge",
+  1: "repeat",
+};
 
 export const CULL_MODE_NAMES = {
   0: "none",
@@ -385,6 +403,8 @@ export class WebGpuBridgeHost {
     let submitted = false;
     const completion = this.withErrorScopes(["validation", "out-of-memory"], () => {
       const commandEncoder = this.device.createCommandEncoder();
+      const stagingBuffers = [];
+      try {
       let cursor = headerLen;
       let currentPassEncoder = null;
       let currentPassTargetKey = null;
@@ -396,6 +416,7 @@ export class WebGpuBridgeHost {
         uniformBufferId: null,
         dynamicOffset: null,
         vertexBufferId: null,
+        boundPipelineId: null,
       };
 
       const getCanvasView = () => {
@@ -416,6 +437,7 @@ export class WebGpuBridgeHost {
             uniformBufferId: null,
             dynamicOffset: null,
             vertexBufferId: null,
+            boundPipelineId: null,
           };
         }
       };
@@ -515,6 +537,81 @@ export class WebGpuBridgeHost {
             if (!isDepth) {
               this.lastRenderTargetId = textureId;
             }
+            break;
+          }
+
+          case OPCODE_WRITE_TEXTURE: {
+            closeActivePass();
+            if (cursor + 24 > dataBlockStart) {
+              throw new Error(`Truncated WRITE_TEXTURE fields at command ${i}`);
+            }
+            const textureId = dataView.getUint32(cursor, true);
+            const width = dataView.getUint32(cursor + 4, true);
+            const height = dataView.getUint32(cursor + 8, true);
+            const bytesPerRow = dataView.getUint32(cursor + 12, true);
+            const dataOffset = dataView.getUint32(cursor + 16, true);
+            const dataLength = dataView.getUint32(cursor + 20, true);
+            cursor += 24;
+
+            const texture = this.textures.get(textureId);
+            if (!texture) {
+              throw new Error(`WriteTexture: unknown textureId ${textureId}`);
+            }
+
+            const format = texture.format;
+            if (format !== "rgba8unorm" && format !== "bgra8unorm") {
+              throw new Error(`WriteTexture: unsupported texture format ${format}`);
+            }
+
+            if (width === 0 || height === 0) {
+              throw new Error(`WriteTexture: invalid texture dimensions ${width}x${height}`);
+            }
+            const bytesPerTexel = 4;
+            const minRowBytes = width * bytesPerTexel;
+            if (bytesPerRow < minRowBytes) {
+              throw new Error(`WriteTexture: bytesPerRow ${bytesPerRow} less than row width ${minRowBytes}`);
+            }
+            const minDataLength = height > 1 ? (height - 1) * bytesPerRow + minRowBytes : minRowBytes;
+            if (dataLength < minDataLength) {
+              throw new Error(`WriteTexture: dataLength ${dataLength} insufficient for dimensions ${width}x${height} and bytesPerRow ${bytesPerRow}`);
+            }
+
+            if (dataOffset + dataLength > dataPayload.byteLength) {
+              throw new Error(`WriteTexture: data slice out of bounds (offset ${dataOffset} + len ${dataLength} > payload ${dataPayload.byteLength})`);
+            }
+
+            const chunk = dataPayload.subarray(dataOffset, dataOffset + dataLength);
+            if (isDetached(chunk)) {
+              throw new Error("WriteTexture: data slice is detached");
+            }
+
+            const alignedBytesPerRow = Math.ceil(minRowBytes / 256) * 256;
+            const stagingBufferSize = Math.max(alignedBytesPerRow * height, 16);
+
+            const stagingBuffer = this.device.createBuffer({
+              size: stagingBufferSize,
+              usage: GPUBufferUsage.COPY_SRC,
+              mappedAtCreation: true,
+            });
+            stagingBuffers.push(stagingBuffer);
+            const mapped = new Uint8Array(stagingBuffer.getMappedRange());
+            for (let r = 0; r < height; r++) {
+              const srcRowStart = r * bytesPerRow;
+              const dstRowStart = r * alignedBytesPerRow;
+              mapped.set(chunk.subarray(srcRowStart, srcRowStart + minRowBytes), dstRowStart);
+            }
+            stagingBuffer.unmap();
+
+            commandEncoder.copyBufferToTexture(
+              {
+                buffer: stagingBuffer,
+                offset: 0,
+                bytesPerRow: alignedBytesPerRow,
+                rowsPerImage: height,
+              },
+              { texture: texture },
+              [width, height, 1]
+            );
             break;
           }
 
@@ -785,6 +882,153 @@ export class WebGpuBridgeHost {
             break;
           }
 
+          case OPCODE_CREATE_PIPELINE_TEXTURED: {
+            closeActivePass();
+            if (cursor + 44 > dataBlockStart) {
+              throw new Error(`Truncated CREATE_PIPELINE_TEXTURED fields at command ${i}`);
+            }
+            const pipelineId = dataView.getUint32(cursor, true);
+            const codeOffset = dataView.getUint32(cursor + 4, true);
+            const codeLen = dataView.getUint32(cursor + 8, true);
+            const formatCode = dataView.getUint32(cursor + 12, true);
+            const hasVertexBuffer = dataView.getUint32(cursor + 16, true) === 1;
+            const hasUniformBuffer = dataView.getUint32(cursor + 20, true) === 1;
+            const explicitUniformSize = dataView.getUint32(cursor + 24, true);
+            const explicitVertexStride = dataView.getUint32(cursor + 28, true);
+            const textureId = dataView.getUint32(cursor + 32, true);
+            const samplerFilterCode = dataView.getUint32(cursor + 36, true);
+            const addressModeCode = dataView.getUint32(cursor + 40, true);
+            cursor += 44;
+
+            if (samplerFilterCode > 1 || !(samplerFilterCode in SAMPLER_FILTER_NAMES)) {
+              throw new Error(`CreatePipelineTextured: invalid sampler_filter ${samplerFilterCode}`);
+            }
+            const samplerFilter = SAMPLER_FILTER_NAMES[samplerFilterCode];
+
+            if (addressModeCode > 1 || !(addressModeCode in ADDRESS_MODE_NAMES)) {
+              throw new Error(`CreatePipelineTextured: invalid address_mode ${addressModeCode}`);
+            }
+            const addressMode = ADDRESS_MODE_NAMES[addressModeCode];
+
+            const texture = this.textures.get(textureId);
+            if (!texture) {
+              throw new Error(`CreatePipelineTextured: unknown textureId ${textureId}`);
+            }
+
+            if (codeOffset + codeLen > dataPayload.byteLength) {
+              throw new Error(`CreatePipelineTextured: shader code slice out of bounds (offset ${codeOffset} + len ${codeLen} > payload ${dataPayload.byteLength})`);
+            }
+
+            let format;
+            if (formatCode === 0) {
+              format = this.capabilityRecord?.preferredCanvasFormat || "bgra8unorm";
+            } else if (formatCode === 1) {
+              format = "bgra8unorm";
+            } else if (formatCode === 2) {
+              format = "rgba8unorm";
+            } else {
+              throw new Error(`Invalid pipeline target formatCode: ${formatCode}`);
+            }
+
+            const codeBytes = dataPayload.subarray(codeOffset, codeOffset + codeLen);
+            const shaderCode = new TextDecoder().decode(codeBytes);
+
+            const shaderModule = this.device.createShaderModule({ code: shaderCode });
+
+            const uniformSize = explicitUniformSize > 0 ? explicitUniformSize : (hasUniformBuffer ? 48 : 0);
+
+            const sampler = this.device.createSampler({
+              magFilter: samplerFilter,
+              minFilter: samplerFilter,
+              addressModeU: addressMode,
+              addressModeV: addressMode,
+            });
+
+            const bindGroupLayoutEntries = [];
+            if (hasUniformBuffer) {
+              bindGroupLayoutEntries.push({
+                binding: 0,
+                visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+                buffer: {
+                  type: "uniform",
+                  hasDynamicOffset: true,
+                  minBindingSize: uniformSize,
+                },
+              });
+            }
+            bindGroupLayoutEntries.push(
+              {
+                binding: 1,
+                visibility: GPUShaderStage.FRAGMENT,
+                texture: {
+                  sampleType: "float",
+                  viewDimension: "2d",
+                  multisampled: false,
+                },
+              },
+              {
+                binding: 2,
+                visibility: GPUShaderStage.FRAGMENT,
+                sampler: {
+                  type: "filtering",
+                },
+              }
+            );
+
+            const bindGroupLayout = this.device.createBindGroupLayout({
+              entries: bindGroupLayoutEntries,
+            });
+
+            const pipelineLayout = this.device.createPipelineLayout({
+              bindGroupLayouts: [bindGroupLayout],
+            });
+
+            const vertexStride = explicitVertexStride > 0 ? explicitVertexStride : 20;
+            const vertexBuffers = hasVertexBuffer
+              ? [
+                  {
+                    arrayStride: vertexStride,
+                    attributes: [
+                      { shaderLocation: 0, offset: 0, format: "float32x3" },
+                      { shaderLocation: 1, offset: 12, format: vertexStride === 28 ? "float32x4" : "float32x2" },
+                    ],
+                  },
+                ]
+              : [];
+
+            const pipeline = this.device.createRenderPipeline({
+              layout: pipelineLayout,
+              vertex: {
+                module: shaderModule,
+                entryPoint: "vs_main",
+                buffers: vertexBuffers,
+              },
+              fragment: {
+                module: shaderModule,
+                entryPoint: "fs_main",
+                targets: [{ format: format }],
+              },
+              primitive: {
+                topology: "triangle-list",
+                cullMode: "none",
+                frontFace: "ccw",
+              },
+            });
+
+            this.pipelines.set(pipelineId, {
+              pipeline,
+              bindGroupLayout,
+              hasUniformBuffer,
+              uniformSize,
+              hasDepth: false,
+              isTextured: true,
+              texture,
+              sampler,
+              textureView: texture.createView(),
+            });
+            break;
+          }
+
           case OPCODE_RENDER_PASS: {
             const hasDrawParameters = pendingDrawParameters !== null;
             const drawParameters = pendingDrawParameters || [1, 0, 0];
@@ -872,6 +1116,7 @@ export class WebGpuBridgeHost {
                 uniformBufferId: null,
                 dynamicOffset: null,
                 vertexBufferId: null,
+                boundPipelineId: null,
               };
             }
 
@@ -888,30 +1133,55 @@ export class WebGpuBridgeHost {
                 // even when the underlying buffer and dynamic offset are unchanged.
                 passState.uniformBufferId = null;
                 passState.dynamicOffset = null;
+                passState.boundPipelineId = null;
               }
 
-              if (pipelineRecord.hasUniformBuffer) {
-                if (passState.uniformBufferId !== uniformBufferId || passState.dynamicOffset !== dynamicOffset) {
-                  const uniformBuf = this.buffers.get(uniformBufferId);
-                  if (!uniformBuf) {
-                    throw new Error(`RenderPass: uniform buffer ${uniformBufferId} missing for pipeline`);
+              const hasUniform = pipelineRecord.hasUniformBuffer;
+              const isTextured = Boolean(pipelineRecord.isTextured || (pipelineRecord.texture && pipelineRecord.sampler));
+              if (hasUniform || isTextured) {
+                const needsRebind = hasUniform
+                  ? (passState.uniformBufferId !== uniformBufferId || passState.dynamicOffset !== dynamicOffset || passState.boundPipelineId !== pipelineId)
+                  : (passState.boundPipelineId !== pipelineId);
+                if (needsRebind) {
+                  const bindGroupEntries = [];
+                  if (hasUniform) {
+                    const uniformBuf = this.buffers.get(uniformBufferId);
+                    if (!uniformBuf) {
+                      throw new Error(`RenderPass: uniform buffer ${uniformBufferId} missing for pipeline`);
+                    }
+                    bindGroupEntries.push({
+                      binding: 0,
+                      resource: {
+                        buffer: uniformBuf,
+                        offset: 0,
+                        size: pipelineRecord.uniformSize || 48,
+                      },
+                    });
+                  }
+                  if (isTextured) {
+                    bindGroupEntries.push(
+                      {
+                        binding: 1,
+                        resource: pipelineRecord.textureView || pipelineRecord.texture.createView(),
+                      },
+                      {
+                        binding: 2,
+                        resource: pipelineRecord.sampler,
+                      }
+                    );
                   }
                   const bindGroup = this.device.createBindGroup({
                     layout: pipelineRecord.bindGroupLayout,
-                    entries: [
-                      {
-                        binding: 0,
-                        resource: {
-                          buffer: uniformBuf,
-                          offset: 0,
-                          size: pipelineRecord.uniformSize || 48,
-                        },
-                      },
-                    ],
+                    entries: bindGroupEntries,
                   });
-                  currentPassEncoder.setBindGroup(0, bindGroup, [dynamicOffset]);
-                  passState.uniformBufferId = uniformBufferId;
-                  passState.dynamicOffset = dynamicOffset;
+                  if (hasUniform) {
+                    currentPassEncoder.setBindGroup(0, bindGroup, [dynamicOffset]);
+                    passState.uniformBufferId = uniformBufferId;
+                    passState.dynamicOffset = dynamicOffset;
+                  } else {
+                    currentPassEncoder.setBindGroup(0, bindGroup);
+                  }
+                  passState.boundPipelineId = pipelineId;
                 }
               }
 
@@ -1063,6 +1333,7 @@ export class WebGpuBridgeHost {
                 uniformBufferId: null,
                 dynamicOffset: null,
                 vertexBufferId: null,
+                boundPipelineId: null,
               };
             }
 
@@ -1077,30 +1348,55 @@ export class WebGpuBridgeHost {
                 passState.pipelineId = pipelineId;
                 passState.uniformBufferId = null;
                 passState.dynamicOffset = null;
+                passState.boundPipelineId = null;
               }
 
-              if (pipelineRecord.hasUniformBuffer) {
-                if (passState.uniformBufferId !== uniformBufferId || passState.dynamicOffset !== dynamicOffset) {
-                  const uniformBuf = this.buffers.get(uniformBufferId);
-                  if (!uniformBuf) {
-                    throw new Error(`RenderPassDepth: uniform buffer ${uniformBufferId} missing for pipeline`);
+              const hasUniform = pipelineRecord.hasUniformBuffer;
+              const isTextured = Boolean(pipelineRecord.isTextured || (pipelineRecord.texture && pipelineRecord.sampler));
+              if (hasUniform || isTextured) {
+                const needsRebind = hasUniform
+                  ? (passState.uniformBufferId !== uniformBufferId || passState.dynamicOffset !== dynamicOffset || passState.boundPipelineId !== pipelineId)
+                  : (passState.boundPipelineId !== pipelineId);
+                if (needsRebind) {
+                  const bindGroupEntries = [];
+                  if (hasUniform) {
+                    const uniformBuf = this.buffers.get(uniformBufferId);
+                    if (!uniformBuf) {
+                      throw new Error(`RenderPassDepth: uniform buffer ${uniformBufferId} missing for pipeline`);
+                    }
+                    bindGroupEntries.push({
+                      binding: 0,
+                      resource: {
+                        buffer: uniformBuf,
+                        offset: 0,
+                        size: pipelineRecord.uniformSize || 48,
+                      },
+                    });
+                  }
+                  if (isTextured) {
+                    bindGroupEntries.push(
+                      {
+                        binding: 1,
+                        resource: pipelineRecord.textureView || pipelineRecord.texture.createView(),
+                      },
+                      {
+                        binding: 2,
+                        resource: pipelineRecord.sampler,
+                      }
+                    );
                   }
                   const bindGroup = this.device.createBindGroup({
                     layout: pipelineRecord.bindGroupLayout,
-                    entries: [
-                      {
-                        binding: 0,
-                        resource: {
-                          buffer: uniformBuf,
-                          offset: 0,
-                          size: pipelineRecord.uniformSize || 48,
-                        },
-                      },
-                    ],
+                    entries: bindGroupEntries,
                   });
-                  currentPassEncoder.setBindGroup(0, bindGroup, [dynamicOffset]);
-                  passState.uniformBufferId = uniformBufferId;
-                  passState.dynamicOffset = dynamicOffset;
+                  if (hasUniform) {
+                    currentPassEncoder.setBindGroup(0, bindGroup, [dynamicOffset]);
+                    passState.uniformBufferId = uniformBufferId;
+                    passState.dynamicOffset = dynamicOffset;
+                  } else {
+                    currentPassEncoder.setBindGroup(0, bindGroup);
+                  }
+                  passState.boundPipelineId = pipelineId;
                 }
               }
 
@@ -1191,25 +1487,45 @@ export class WebGpuBridgeHost {
 
             bundleEncoder.setPipeline(pipelineRecord.pipeline);
 
-            if (pipelineRecord.hasUniformBuffer) {
-              const uniformBuf = this.buffers.get(uniformBufferId);
-              if (!uniformBuf) {
-                throw new Error(`RecordBundle: uniform buffer ${uniformBufferId} missing for pipeline`);
+            const hasUniform = pipelineRecord.hasUniformBuffer;
+            const isTextured = Boolean(pipelineRecord.isTextured || (pipelineRecord.texture && pipelineRecord.sampler));
+            if (hasUniform || isTextured) {
+              const bindGroupEntries = [];
+              if (hasUniform) {
+                const uniformBuf = this.buffers.get(uniformBufferId);
+                if (!uniformBuf) {
+                  throw new Error(`RecordBundle: uniform buffer ${uniformBufferId} missing for pipeline`);
+                }
+                bindGroupEntries.push({
+                  binding: 0,
+                  resource: {
+                    buffer: uniformBuf,
+                    offset: 0,
+                    size: pipelineRecord.uniformSize || 48,
+                  },
+                });
+              }
+              if (isTextured) {
+                bindGroupEntries.push(
+                  {
+                    binding: 1,
+                    resource: pipelineRecord.textureView || pipelineRecord.texture.createView(),
+                  },
+                  {
+                    binding: 2,
+                    resource: pipelineRecord.sampler,
+                  }
+                );
               }
               const bindGroup = this.device.createBindGroup({
                 layout: pipelineRecord.bindGroupLayout,
-                entries: [
-                  {
-                    binding: 0,
-                    resource: {
-                      buffer: uniformBuf,
-                      offset: 0,
-                      size: pipelineRecord.uniformSize || 48,
-                    },
-                  },
-                ],
+                entries: bindGroupEntries,
               });
-              bundleEncoder.setBindGroup(0, bindGroup, [dynamicOffset]);
+              if (hasUniform) {
+                bundleEncoder.setBindGroup(0, bindGroup, [dynamicOffset]);
+              } else {
+                bundleEncoder.setBindGroup(0, bindGroup);
+              }
             }
 
             if (vertexBufferId > 0) {
@@ -1279,6 +1595,8 @@ export class WebGpuBridgeHost {
                   scanCursor += 16;
                 } else if (nextOp === OPCODE_CREATE_TEXTURE) {
                   scanCursor += 20;
+                } else if (nextOp === OPCODE_WRITE_TEXTURE) {
+                  scanCursor += 24;
                 } else if (nextOp === OPCODE_CREATE_PIPELINE) {
                   scanCursor += 32;
                 } else if (nextOp === OPCODE_CREATE_PIPELINE_CULL) {
@@ -1289,6 +1607,8 @@ export class WebGpuBridgeHost {
                   scanCursor += 52;
                 } else if (nextOp === OPCODE_CREATE_PIPELINE_DEPTH_CULL_COLOR) {
                   scanCursor += 56;
+                } else if (nextOp === OPCODE_CREATE_PIPELINE_TEXTURED) {
+                  scanCursor += 44;
                 } else if (nextOp === OPCODE_COPY_TEXTURE_TO_BUFFER) {
                   scanCursor += 24;
                 } else if (nextOp === OPCODE_RECORD_BUNDLE) {
@@ -1352,6 +1672,7 @@ export class WebGpuBridgeHost {
                 uniformBufferId: null,
                 dynamicOffset: null,
                 vertexBufferId: null,
+                boundPipelineId: null,
               };
             }
 
@@ -1373,6 +1694,7 @@ export class WebGpuBridgeHost {
               uniformBufferId: null,
               dynamicOffset: null,
               vertexBufferId: null,
+              boundPipelineId: null,
             };
             break;
           }
@@ -1443,6 +1765,11 @@ export class WebGpuBridgeHost {
       const commandBuffer = commandEncoder.finish();
       this.device.queue.submit([commandBuffer]);
       submitted = true;
+      } finally {
+        for (const sb of stagingBuffers) {
+          sb.destroy();
+        }
+      }
     });
     // Keep bookkeeping in queue-effect order even when scope promises settle
     // in another order. Never invoke the observer while device scopes are open.

@@ -5,8 +5,10 @@
  * the binary bridge packet decoder, for pixel-identical comparison.
  */
 
-export async function renderDirectReferenceTriangle(device, width = 64, height = 64) {
-  const shaderCode = `
+/**
+ * Shared WGSL shader and vertex data for direct reference triangle rendering.
+ */
+const DIRECT_TRIANGLE_SHADER_CODE = `
 struct AffineRows {
     r0: vec4<f32>,
     r1: vec4<f32>,
@@ -46,6 +48,30 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 }
 `;
 
+const DIRECT_TRIANGLE_VERTEX_DATA = new Float32Array([
+  // x,    y,    z,   u,   v
+   0.0,  0.5,  0.0, 0.5, 1.0,
+  -0.5, -0.5,  0.0, 0.0, 0.0,
+   0.5, -0.5,  0.0, 1.0, 0.0,
+]);
+
+/**
+ * Reusable Direct-JS WebGPU Oracle Renderer.
+ *
+ * Allocates GPU resources (target texture, vertex buffer, uniform buffer, pipeline,
+ * bind group, and readback buffer) once, allowing synchronous repeated-frame rendering
+ * for fixed drawCount transforms without per-frame GPU reallocation.
+ *
+ * @param {GPUDevice} device
+ * @param {number} [width=64]
+ * @param {number} [height=64]
+ * @param {number} [drawCount=1]
+ */
+export function createDirectReferenceRenderer(device, width = 64, height = 64, drawCount = 1) {
+  if (!Number.isInteger(drawCount) || drawCount <= 0) {
+    throw new RangeError("drawCount must be a positive integer");
+  }
+
   // 1. Offscreen target texture
   const targetTexture = device.createTexture({
     size: [width, height, 1],
@@ -54,36 +80,20 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
   });
 
   // 2. Vertex buffer: 3 vertices with position (vec3) and uv (vec2)
-  // Triangle in NDC [-0.5, 0.5]
-  const vertexData = new Float32Array([
-    // x,    y,    z,   u,   v
-     0.0,  0.5,  0.0, 0.5, 1.0,
-    -0.5, -0.5,  0.0, 0.0, 0.0,
-     0.5, -0.5,  0.0, 1.0, 0.0,
-  ]);
   const vertexBuffer = device.createBuffer({
-    size: vertexData.byteLength,
+    size: DIRECT_TRIANGLE_VERTEX_DATA.byteLength,
     usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
   });
-  device.queue.writeBuffer(vertexBuffer, 0, vertexData);
+  device.queue.writeBuffer(vertexBuffer, 0, DIRECT_TRIANGLE_VERTEX_DATA);
 
-  // 3. AffineRows uniform buffer: Identity transform (48 bytes: 3 rows of vec4)
-  // Row 0: [1, 0, 0, 0]
-  // Row 1: [0, 1, 0, 0]
-  // Row 2: [0, 0, 1, 0]
-  const affineData = new Float32Array([
-    1.0, 0.0, 0.0, 0.0,
-    0.0, 1.0, 0.0, 0.0,
-    0.0, 0.0, 1.0, 0.0,
-  ]);
+  // 3. AffineRows uniform buffer: ONE uniform buffer for all draws
   const uniformBuffer = device.createBuffer({
-    size: 256, // aligned to minUniformBufferOffsetAlignment
+    size: drawCount * 256, // 48B records at 256B dynamic offsets
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
-  device.queue.writeBuffer(uniformBuffer, 0, affineData);
 
-  // 4. Pipeline
-  const shaderModule = device.createShaderModule({ code: shaderCode });
+  // 4. Pipeline & Bind Group
+  const shaderModule = device.createShaderModule({ code: DIRECT_TRIANGLE_SHADER_CODE });
   const bindGroupLayout = device.createBindGroupLayout({
     entries: [
       {
@@ -138,7 +148,420 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
   });
 
-  // 6. Encode and submit
+  /**
+   * Synchronously submits one frame of drawCount draws and texture-to-readback copy.
+   *
+   * Validates data count exactly equals initialized drawCount before GPU write,
+   * packs inside frame call, writes uniform then encodes same draws AND same
+   * texture->readback copy as bulk update, synchronously submits, returns queue.onSubmittedWorkDone Promise.
+   *
+   * @param {Float32Array|null} [affineRows=null]
+   * @param {Function|null} [drawEncoder=null]
+   * @param {Uint8Array|Float32Array|Function|null} [preparedUniformData=null]
+   * @param {Object|null} [timingRecord=null]
+   * @returns {Promise<void>}
+   */
+  function submitFrame(affineRows = null, drawEncoder = null, preparedUniformData = null, timingRecord = null) {
+    if (drawEncoder !== null && typeof drawEncoder !== "function") {
+      throw new TypeError("drawEncoder must be a function or null");
+    }
+
+    let uniformData;
+    if (preparedUniformData !== null) {
+      const raw = typeof preparedUniformData === "function" ? preparedUniformData() : preparedUniformData;
+      if (raw instanceof Uint8Array) {
+        if (raw.byteLength !== drawCount * 256) {
+          throw new RangeError(`preparedUniformData Uint8Array byteLength (${raw.byteLength}) must equal drawCount * 256 (${drawCount * 256})`);
+        }
+        uniformData = raw;
+      } else if (raw instanceof Float32Array) {
+        if (raw.length !== drawCount * 64) {
+          throw new RangeError(`preparedUniformData Float32Array length (${raw.length}) must equal drawCount * 64 (${drawCount * 64})`);
+        }
+        uniformData = raw;
+      } else {
+        throw new RangeError("preparedUniformData must be a non-empty Uint8Array or Float32Array with 256-byte aligned records");
+      }
+    } else if (affineRows !== null) {
+      if (!(affineRows instanceof Float32Array) || affineRows.length !== drawCount * 12) {
+        throw new RangeError(`affineRows must be a Float32Array of length drawCount * 12 (${drawCount * 12})`);
+      }
+      uniformData = new Float32Array(drawCount * 64);
+      for (let i = 0; i < drawCount; i++) {
+        const srcOffset = i * 12;
+        const dstOffset = i * 64;
+        for (let j = 0; j < 12; j++) {
+          uniformData[dstOffset + j] = affineRows[srcOffset + j];
+        }
+      }
+    } else {
+      if (drawCount !== 1) {
+        throw new RangeError(`null affineRows requires drawCount = 1, but renderer was initialized with drawCount = ${drawCount}`);
+      }
+      uniformData = new Float32Array(64);
+      uniformData[0] = 1.0;
+      uniformData[5] = 1.0;
+      uniformData[10] = 1.0;
+    }
+
+    // Write uniform before encode/submit
+    device.queue.writeBuffer(uniformBuffer, 0, uniformData);
+
+    // Encode render pass and same texture->readback copy
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [
+        {
+          view: targetTexture.createView(),
+          clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
+          loadOp: "clear",
+          storeOp: "store",
+        },
+      ],
+    });
+    pass.setPipeline(pipeline);
+    pass.setVertexBuffer(0, vertexBuffer);
+    if (typeof drawEncoder === "function") {
+      drawEncoder(pass, bindGroup, drawCount);
+    } else {
+      for (let i = 0; i < drawCount; i++) {
+        pass.setBindGroup(0, bindGroup, [i * 256]);
+        pass.draw(3, 1, 0, 0);
+      }
+    }
+    pass.end();
+
+    encoder.copyTextureToBuffer(
+      { texture: targetTexture },
+      { buffer: readbackBuffer, bytesPerRow: bytesPerRow, rowsPerImage: height },
+      [width, height, 1]
+    );
+
+    const commandBuffer = encoder.finish();
+    const tFinish = timingRecord ? performance.now() : 0;
+    const tSubmitStart = timingRecord ? performance.now() : 0;
+    device.queue.submit([commandBuffer]);
+    const tSubmitEnd = timingRecord ? performance.now() : 0;
+    if (timingRecord) {
+      timingRecord._tFinish = tFinish;
+      timingRecord._tSubmitStart = tSubmitStart;
+      timingRecord._tSubmitEnd = tSubmitEnd;
+    }
+
+    return device.queue.onSubmittedWorkDone();
+  }
+
+  async function readback() {
+    await readbackBuffer.mapAsync(GPUMapMode.READ, 0, bytesPerRow * height);
+    const mapped = readbackBuffer.getMappedRange(0, bytesPerRow * height);
+    const result = new Uint8Array(mapped.slice(0));
+    readbackBuffer.unmap();
+    return result;
+  }
+
+  function destroy() {
+    targetTexture.destroy();
+    vertexBuffer.destroy();
+    uniformBuffer.destroy();
+    readbackBuffer.destroy();
+  }
+
+  return {
+    device,
+    width,
+    height,
+    drawCount,
+    targetTexture,
+    vertexBuffer,
+    uniformBuffer,
+    pipeline,
+    bindGroup,
+    readbackBuffer,
+    submitFrame,
+    readback,
+    destroy,
+  };
+}
+
+export async function renderDirectReferenceTriangle(
+  device,
+  width = 64,
+  height = 64,
+  measurementSeam = null,
+  affineRows = null,
+  drawEncoder = null,
+  preparedUniformData = null
+) {
+  if (drawEncoder !== null && typeof drawEncoder !== "function") {
+    throw new TypeError("drawEncoder must be a function or null");
+  }
+
+  const measure = measurementSeam !== null && typeof measurementSeam === "object";
+  const t0 = measure ? performance.now() : 0;
+
+  let drawCount = 1;
+  let resolvedUniformData = null;
+
+  if (preparedUniformData !== null) {
+    const raw = typeof preparedUniformData === "function" ? preparedUniformData() : preparedUniformData;
+    if (raw instanceof Uint8Array) {
+      if (raw.byteLength === 0 || raw.byteLength % 256 !== 0) {
+        throw new RangeError("preparedUniformData Uint8Array byteLength must be non-empty and divisible by 256");
+      }
+      drawCount = raw.byteLength / 256;
+      resolvedUniformData = raw;
+    } else if (raw instanceof Float32Array) {
+      if (raw.length === 0 || raw.length % 64 !== 0) {
+        throw new RangeError("preparedUniformData Float32Array length must be non-empty and divisible by 64");
+      }
+      drawCount = raw.length / 64;
+      resolvedUniformData = raw;
+    } else {
+      throw new RangeError("preparedUniformData must be a non-empty Uint8Array or Float32Array with 256-byte aligned records");
+    }
+  } else if (affineRows !== null) {
+    if (!(affineRows instanceof Float32Array) || affineRows.length === 0 || affineRows.length % 12 !== 0) {
+      throw new RangeError("affineRows must be a non-empty Float32Array with length divisible by 12");
+    }
+    drawCount = affineRows.length / 12;
+  }
+
+  const renderer = createDirectReferenceRenderer(device, width, height, drawCount);
+  try {
+    const timingRecord = measure ? {} : null;
+    const donePromise = renderer.submitFrame(
+      affineRows,
+      drawEncoder,
+      resolvedUniformData || preparedUniformData,
+      timingRecord
+    );
+
+    if (measure) {
+      const tSubmitEnd = timingRecord._tSubmitEnd;
+      measurementSeam.direct_prepare_ms = timingRecord._tFinish - t0;
+      measurementSeam.direct_submit_ms = tSubmitEnd - timingRecord._tSubmitStart;
+      measurementSeam.cpu_prepare_submit_ms = measurementSeam.direct_prepare_ms + measurementSeam.direct_submit_ms;
+      await donePromise;
+      measurementSeam.gpu_complete_ms = performance.now() - tSubmitEnd;
+    } else {
+      await donePromise;
+    }
+
+    return await renderer.readback();
+  } finally {
+    renderer.destroy();
+  }
+}
+
+/**
+ * Direct-JS WebGPU Oracle Reference: Textured Triangle with AffineRows Transform.
+ *
+ * Executes identical WebGPU rendering work using pure direct WebGPU API calls
+ * (own texture, sampler, uniform buffer, and pipeline), without going through
+ * the binary bridge packet decoder.
+ *
+ * @param {GPUDevice} device
+ * @param {Uint8Array} pixels - Raw texture pixels (RGBA8)
+ * @param {number} [texW=2] - Source texture width
+ * @param {number} [texH=2] - Source texture height
+ * @param {Float32Array|number[]} [affine=null] - 12 floats representing AffineRows
+ * @param {number} [width=64] - Target width
+ * @param {number} [height=64] - Target height
+ * @returns {Promise<Uint8Array>}
+ */
+export async function renderDirectReferenceTexturedTriangle(
+  device,
+  pixels,
+  texW = 2,
+  texH = 2,
+  affine = null,
+  width = 64,
+  height = 64
+) {
+  const shaderCode = `
+struct AffineRows {
+    r0: vec4<f32>,
+    r1: vec4<f32>,
+    r2: vec4<f32>,
+};
+
+fn transform_affine_point(m: AffineRows, p: vec3<f32>) -> vec3<f32> {
+    let v = vec4<f32>(p, 1.0);
+    return vec3<f32>(dot(m.r0, v), dot(m.r1, v), dot(m.r2, v));
+}
+
+@group(0) @binding(0)
+var<uniform> model: AffineRows;
+
+@group(0) @binding(1)
+var tex: texture_2d<f32>;
+
+@group(0) @binding(2)
+var samp: sampler;
+
+struct VertexInput {
+    @location(0) position: vec3<f32>,
+    @location(1) uv: vec2<f32>,
+};
+
+struct VertexOutput {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(in: VertexInput) -> VertexOutput {
+    var out: VertexOutput;
+    let transformed = transform_affine_point(model, in.position);
+    out.clip_pos = vec4<f32>(transformed, 1.0);
+    out.uv = in.uv;
+    return out;
+}
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    return textureSample(tex, samp, in.uv);
+}
+`;
+
+  // 1. Offscreen target texture
+  const targetTexture = device.createTexture({
+    size: [width, height, 1],
+    format: "rgba8unorm",
+    usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+  });
+
+  // 2. Source texture to sample from
+  const sourceTexture = device.createTexture({
+    size: [texW, texH, 1],
+    format: "rgba8unorm",
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+  });
+
+  device.queue.writeTexture(
+    { texture: sourceTexture },
+    pixels,
+    { bytesPerRow: texW * 4, rowsPerImage: texH },
+    [texW, texH, 1]
+  );
+
+  // 3. Sampler: nearest filter, clamp-to-edge
+  const sampler = device.createSampler({
+    magFilter: "nearest",
+    minFilter: "nearest",
+    addressModeU: "clamp-to-edge",
+    addressModeV: "clamp-to-edge",
+  });
+
+  // 4. Vertex buffer: 3 vertices matching gpu_host.rs AffineRows triangle
+  // Vertex 0: pos (0.0, 0.5, 0.0), uv (0.5, 1.0)
+  // Vertex 1: pos (-0.5, -0.5, 0.0), uv (0.0, 0.0)
+  // Vertex 2: pos (0.5, -0.5, 0.0), uv (1.0, 0.0)
+  const vertexData = new Float32Array([
+     0.0,  0.5,  0.0, 0.5, 1.0,
+    -0.5, -0.5,  0.0, 0.0, 0.0,
+     0.5, -0.5,  0.0, 1.0, 0.0,
+  ]);
+  const vertexBuffer = device.createBuffer({
+    size: vertexData.byteLength,
+    usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(vertexBuffer, 0, vertexData);
+
+  // 5. AffineRows uniform buffer (48 bytes: 3 rows of vec4)
+  const affineData = new Float32Array(
+    affine || [
+      1.0, 0.0, 0.0, 0.0,
+      0.0, 1.0, 0.0, 0.0,
+      0.0, 0.0, 1.0, 0.0,
+    ]
+  );
+  const uniformBuffer = device.createBuffer({
+    size: 256,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(uniformBuffer, 0, affineData);
+
+  // 6. Pipeline layout & bind group layout
+  const shaderModule = device.createShaderModule({ code: shaderCode });
+  const bindGroupLayout = device.createBindGroupLayout({
+    entries: [
+      {
+        binding: 0,
+        visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+        buffer: {
+          type: "uniform",
+          hasDynamicOffset: true,
+          minBindingSize: 48,
+        },
+      },
+      {
+        binding: 1,
+        visibility: GPUShaderStage.FRAGMENT,
+        texture: {
+          sampleType: "float",
+          viewDimension: "2d",
+        },
+      },
+      {
+        binding: 2,
+        visibility: GPUShaderStage.FRAGMENT,
+        sampler: {
+          type: "filtering",
+        },
+      },
+    ],
+  });
+
+  const pipeline = device.createRenderPipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
+    vertex: {
+      module: shaderModule,
+      entryPoint: "vs_main",
+      buffers: [
+        {
+          arrayStride: 20,
+          attributes: [
+            { shaderLocation: 0, offset: 0, format: "float32x3" },
+            { shaderLocation: 1, offset: 12, format: "float32x2" },
+          ],
+        },
+      ],
+    },
+    fragment: {
+      module: shaderModule,
+      entryPoint: "fs_main",
+      targets: [{ format: "rgba8unorm" }],
+    },
+    primitive: { topology: "triangle-list" },
+  });
+
+  const bindGroup = device.createBindGroup({
+    layout: bindGroupLayout,
+    entries: [
+      {
+        binding: 0,
+        resource: { buffer: uniformBuffer, offset: 0, size: 48 },
+      },
+      {
+        binding: 1,
+        resource: sourceTexture.createView(),
+      },
+      {
+        binding: 2,
+        resource: sampler,
+      },
+    ],
+  });
+
+  // 7. Readback buffer
+  const bytesPerRow = Math.ceil((width * 4) / 256) * 256;
+  const readbackBuffer = device.createBuffer({
+    size: bytesPerRow * height,
+    usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+  });
+
+  // 8. Encode and submit
   const encoder = device.createCommandEncoder();
   const pass = encoder.beginRenderPass({
     colorAttachments: [
@@ -158,13 +581,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
   encoder.copyTextureToBuffer(
     { texture: targetTexture },
-    { buffer: readbackBuffer, bytesPerRow: bytesPerRow, rowsPerImage: height },
+    { buffer: readbackBuffer, bytesPerRow, rowsPerImage: height },
     [width, height, 1]
   );
 
   device.queue.submit([encoder.finish()]);
 
-  // 7. Readback
+  // 9. Readback
   await readbackBuffer.mapAsync(GPUMapMode.READ, 0, bytesPerRow * height);
   const mapped = readbackBuffer.getMappedRange(0, bytesPerRow * height);
   const result = new Uint8Array(mapped.slice(0));
@@ -172,6 +595,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
   return result;
 }
+
 
 import {
   PACKET_MAGIC,

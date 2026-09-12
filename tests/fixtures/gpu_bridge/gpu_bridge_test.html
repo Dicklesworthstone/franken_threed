@@ -34,7 +34,10 @@
       TARGET_OFFSCREEN,
       TARGET_CANVAS,
     } from "./bridge_runtime.js";
-    import { renderDirectReferenceTriangle } from "./direct_reference.js";
+    import {
+      renderDirectReferenceTriangle,
+      renderDirectReferenceTexturedTriangle,
+    } from "./direct_reference.js";
     import { testReadbackIdReuse } from "./readback_lifetime_test.js";
     import { testPipelineBindingChange } from "./pipeline_binding_test.js";
     import { testCanvasSubmissionLifetime } from "./canvas_lifetime_test.js";
@@ -264,6 +267,18 @@
           throw new Error("Rust Wasm triangle packet generator returned empty or non-Uint8Array packet");
         }
 
+        const checkHandleFn = wasmExports.f3d_check_resource_handle || wasmExports.gpu_bridge_check_resource_handle;
+        if (typeof checkHandleFn !== "function") {
+          throw new Error("Missing required Wasm export: f3d_check_resource_handle");
+        }
+        if (!checkHandleFn(20, 1)) {
+          throw new Error("First-frame resource handle 20 (readback buffer) not registered");
+        }
+        if (!checkHandleFn(101, 1)) {
+          throw new Error("First-frame resource handle 101 (canvas pipeline) not registered");
+        }
+        logPass("first_frame_handle_registration", "Handles 20 and 101 verified registered in global resource table");
+
         await bridge.executePacket(trianglePacket, canvasContext);
 
         const bytesPerRow = 256;
@@ -275,20 +290,628 @@
         }
 
         let diffCount = 0;
-        let nonZeroCount = 0;
+        let nonZeroRgbCount = 0;
         for (let i = 0; i < bridgePixels.byteLength; i++) {
-          if (bridgePixels[i] !== 0) nonZeroCount++;
+          if (i % 4 !== 3 && bridgePixels[i] !== 0) nonZeroRgbCount++;
           if (bridgePixels[i] !== directPixels[i]) diffCount++;
         }
 
-        if (nonZeroCount === 0) {
-          throw new Error("Rendered image is completely empty/black");
+        if (nonZeroRgbCount === 0) {
+          throw new Error("Rendered image has no non-zero RGB color channels");
         }
         if (diffCount > 0) {
           throw new Error(`Pixel mismatch between bridge and direct reference: ${diffCount} differences`);
         }
 
-        logPass("first_frame_pixel_identical", `Bridge matches direct-JS reference across ${bridgePixels.byteLength} bytes (0 diffs, ${nonZeroCount} non-zero bytes)`);
+        logPass("first_frame_pixel_identical", `Bridge matches direct-JS reference across ${bridgePixels.byteLength} bytes (0 diffs, ${nonZeroRgbCount} non-zero RGB bytes)`);
+
+        // 5b. Positive Textured First Frame: Triangle with sampled 2x2 texture and AffineRows transform (bead vqa.6)
+        if (typeof wasmExports.f3d_build_textured_affine_triangle_packet !== "function") {
+          throw new Error(
+            "Missing required Wasm export: f3d_build_textured_affine_triangle_packet"
+          );
+        }
+
+        const texPixels = new Uint8Array([
+          255, 0, 0, 255,     // Texel (0, 0): Red
+          0, 255, 0, 255,     // Texel (1, 0): Green
+          0, 0, 255, 255,     // Texel (0, 1): Blue
+          255, 255, 255, 255, // Texel (1, 1): White
+        ]);
+        // Non-identity AffineRows transform: scale (0.8, 0.8), translate (0.1, -0.05)
+        const affineRows = new Float32Array([
+          0.8, 0.0, 0.0,  0.1,
+          0.0, 0.8, 0.0, -0.05,
+          0.0, 0.0, 1.0,  0.0,
+        ]);
+
+        const texturedPacket = wasmExports.f3d_build_textured_affine_triangle_packet(
+          texPixels,
+          2,
+          2,
+          affineRows,
+          64,
+          64
+        );
+
+        if (!(texturedPacket instanceof Uint8Array) || texturedPacket.byteLength === 0) {
+          throw new Error("Rust Wasm textured triangle packet generator returned empty or non-Uint8Array packet");
+        }
+
+        await bridge.executePacket(texturedPacket);
+
+        const texBridgePixels = await bridge.readbackBuffer(20, bytesPerRow * 64);
+        const texDirectPixels = await renderDirectReferenceTexturedTriangle(
+          bridge.device,
+          texPixels,
+          2,
+          2,
+          affineRows,
+          64,
+          64
+        );
+
+        if (texBridgePixels.byteLength !== texDirectPixels.byteLength) {
+          throw new Error(
+            `Length mismatch: bridge ${texBridgePixels.byteLength} vs direct ${texDirectPixels.byteLength}`
+          );
+        }
+
+        // Full buffer comparison between bridge and direct oracle
+        let texDiffCount = 0;
+        let texNonZeroCount = 0;
+        for (let i = 0; i < texBridgePixels.byteLength; i++) {
+          if (texBridgePixels[i] !== 0) texNonZeroCount++;
+          if (texBridgePixels[i] !== texDirectPixels[i]) texDiffCount++;
+        }
+
+        if (texNonZeroCount === 0) {
+          throw new Error("Textured rendered image is completely empty/black");
+        }
+        if (texDiffCount > 0) {
+          throw new Error(
+            `Pixel mismatch between textured bridge and direct reference: ${texDiffCount} differences`
+          );
+        }
+
+        // Verify distinct probe points in different texels
+        // Declared transformed triangle in 64x64 framebuffer:
+        // V0'=(35.2, 20.8) uv=(0.5, 1.0), V1'=(22.4, 46.4) uv=(0.0, 0.0), V2'=(48.0, 46.4) uv=(1.0, 0.0)
+        // Probe (30, 40) -> bary=(0.230, 0.568, 0.201), uv=(0.316, 0.230) -> Texel (0, 0) Red
+        // Probe (38, 40) -> bary=(0.230, 0.256, 0.514), uv=(0.629, 0.230) -> Texel (1, 0) Green
+        // Probe (31, 31) -> bary=(0.582, 0.354, 0.064), uv=(0.355, 0.582) -> Texel (0, 1) Blue
+        // Probe (38, 30) -> bary=(0.621, 0.061, 0.318), uv=(0.629, 0.621) -> Texel (1, 1) White
+        const probeAt = (x, y) => {
+          const offset = y * bytesPerRow + x * 4;
+          return [
+            texBridgePixels[offset],
+            texBridgePixels[offset + 1],
+            texBridgePixels[offset + 2],
+            texBridgePixels[offset + 3],
+          ];
+        };
+
+        const colorRed = probeAt(30, 40);
+        const colorGreen = probeAt(38, 40);
+        const colorBlue = probeAt(31, 31);
+        const colorWhite = probeAt(38, 30);
+
+        // Assert at least 3 sampled colors differ strictly from each other (>= 100 diff across channels)
+        // A fixed-return-color shader must fail this assertion
+        const channelDist = (c1, c2) =>
+          Math.max(
+            Math.abs(c1[0] - c2[0]),
+            Math.abs(c1[1] - c2[1]),
+            Math.abs(c1[2] - c2[2])
+          );
+
+        const diffRG = channelDist(colorRed, colorGreen);
+        const diffRB = channelDist(colorRed, colorBlue);
+        const diffGB = channelDist(colorGreen, colorBlue);
+
+        if (diffRG < 100 || diffRB < 100 || diffGB < 100) {
+          throw new Error(
+            `Sampled colors do not sufficiently diverge across texels: ` +
+            `diff(R,G)=${diffRG}, diff(R,B)=${diffRB}, diff(G,B)=${diffGB} (colors: Red=[${colorRed}], Green=[${colorGreen}], Blue=[${colorBlue}])`
+          );
+        }
+
+        // Exact nearest-texel RGBA byte checks (all 4 channels including alpha and white)
+        const assertExactRgba = (actual, expected, label) => {
+          for (let c = 0; c < 4; c++) {
+            if (actual[c] !== expected[c]) {
+              throw new Error(
+                `${label} RGBA mismatch at channel ${c}: expected [${expected}], got [${actual}]`
+              );
+            }
+          }
+        };
+
+        assertExactRgba(colorRed, [255, 0, 0, 255], "Probe (30, 40) Red texel (0,0)");
+        assertExactRgba(colorGreen, [0, 255, 0, 255], "Probe (38, 40) Green texel (1,0)");
+        assertExactRgba(colorBlue, [0, 0, 255, 255], "Probe (31, 31) Blue texel (0,1)");
+        assertExactRgba(colorWhite, [255, 255, 255, 255], "Probe (38, 30) White texel (1,1)");
+
+        logPass(
+          "textured_first_frame_pixel_identical",
+          `Bridge matches direct-JS textured reference (0 diffs across ${texBridgePixels.byteLength} bytes, ` +
+          `${texNonZeroCount} non-zero bytes; sampled Red=[${colorRed}], Green=[${colorGreen}], Blue=[${colorBlue}], White=[${colorWhite}])`
+        );
+
+        // 5c. Textured Padded Rows, Repeat Address Mode, and Linear Filter vs Inline Direct Oracle (bead vqa.6)
+        const paddedTextureData = new Uint8Array([
+          255, 0, 0, 255,     0, 255, 0, 255,     0, 0, 255, 255,   0, 0, 0, 0, // Row 0: Red, Green, Blue + 4B pad
+          255, 255, 0, 255,   0, 255, 255, 255,   255, 0, 255, 255, 0, 0, 0, 0, // Row 1: Yellow, Cyan, Magenta + 4B pad
+        ]);
+
+        async function renderDirectOracle(device, wgsl, minMagFilter, addressMode, w = 64, h = 64) {
+          const rowPitch = Math.ceil((w * 4) / 256) * 256;
+          const target = device.createTexture({ size: [w, h, 1], format: "rgba8unorm", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+          const source = device.createTexture({ size: [3, 2, 1], format: "rgba8unorm", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+          device.queue.writeTexture({ texture: source }, paddedTextureData, { bytesPerRow: 16, rowsPerImage: 2 }, [3, 2, 1]);
+          const sampler = device.createSampler({ minFilter: minMagFilter, magFilter: minMagFilter, addressModeU: addressMode, addressModeV: addressMode });
+          const sm = device.createShaderModule({ code: wgsl });
+          const bgl = device.createBindGroupLayout({ entries: [
+            { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d" } },
+            { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
+          ]});
+          const pipeline = device.createRenderPipeline({
+            layout: device.createPipelineLayout({ bindGroupLayouts: [bgl] }),
+            vertex: { module: sm, entryPoint: "vs_main" },
+            fragment: { module: sm, entryPoint: "fs_main", targets: [{ format: "rgba8unorm" }] },
+            primitive: { topology: "triangle-list", cullMode: "none" },
+          });
+          const bg = device.createBindGroup({ layout: bgl, entries: [{ binding: 1, resource: source.createView() }, { binding: 2, resource: sampler }] });
+          const rb = device.createBuffer({ size: rowPitch * h, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+          const enc = device.createCommandEncoder();
+          const p = enc.beginRenderPass({ colorAttachments: [{ view: target.createView(), clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: "clear", storeOp: "store" }] });
+          p.setPipeline(pipeline); p.setBindGroup(0, bg); p.draw(6, 1, 0, 0); p.end();
+          enc.copyTextureToBuffer({ texture: target }, { buffer: rb, bytesPerRow: rowPitch, rowsPerImage: h }, [w, h, 1]);
+          device.queue.submit([enc.finish()]);
+          await rb.mapAsync(GPUMapMode.READ, 0, rowPitch * h);
+          const res = new Uint8Array(rb.getMappedRange(0, rowPitch * h).slice(0));
+          rb.unmap();
+          target.destroy(); source.destroy(); rb.destroy();
+          return res;
+        }
+
+        function build5cPacket(srcId, dstId, rbId, pipeId, wgsl, filterCode, addrCode) {
+          const codeBytes = new TextEncoder().encode(wgsl);
+          const dataLen = codeBytes.byteLength + paddedTextureData.byteLength;
+          const buf = new Uint8Array(16 + 202 + dataLen);
+          const v = new DataView(buf.buffer);
+          v.setUint32(0, PACKET_MAGIC, true); v.setUint16(4, PACKET_VERSION, true); v.setUint32(8, 7, true); v.setUint32(12, dataLen, true);
+          let cur = 16;
+          v.setUint16(cur, 6, true); [srcId, 3, 2, 2, 0x06].forEach((n, i) => v.setUint32(cur + 2 + i * 4, n, true)); cur += 22;
+          v.setUint16(cur, 17, true); [srcId, 3, 2, 16, codeBytes.byteLength, paddedTextureData.byteLength].forEach((n, i) => v.setUint32(cur + 2 + i * 4, n, true)); cur += 26;
+          v.setUint16(cur, 6, true); [dstId, 64, 64, 2, 0x11].forEach((n, i) => v.setUint32(cur + 2 + i * 4, n, true)); cur += 22;
+          v.setUint16(cur, 1, true); [rbId, 256 * 64, 0x09].forEach((n, i) => v.setUint32(cur + 2 + i * 4, n, true)); cur += 14;
+          v.setUint16(cur, 18, true); [pipeId, 0, codeBytes.byteLength, 2, 0, 0, 0, 0, srcId, filterCode, addrCode].forEach((n, i) => v.setUint32(cur + 2 + i * 4, n, true)); cur += 46;
+          v.setUint16(cur, 4, true); v.setUint32(cur + 2, TARGET_OFFSCREEN, true); v.setUint32(cur + 6, dstId, true);
+          v.setFloat32(cur + 10, 0, true); v.setFloat32(cur + 14, 0, true); v.setFloat32(cur + 18, 0, true); v.setFloat32(cur + 22, 1, true);
+          v.setUint32(cur + 26, pipeId, true); v.setUint32(cur + 30, 0, true); v.setUint32(cur + 34, 6, true); v.setUint32(cur + 38, 0, true); v.setUint32(cur + 42, 1, true); cur += 46;
+          v.setUint16(cur, 5, true); [dstId, rbId, 64, 64, 0, 0].forEach((n, i) => v.setUint32(cur + 2 + i * 4, n, true)); cur += 26;
+          buf.set(codeBytes, cur);
+          buf.set(paddedTextureData, cur + codeBytes.byteLength);
+          return buf;
+        }
+
+        const make5cShader = (uvArr) => `
+          struct VertexOutput { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
+          @group(0) @binding(1) var tex: texture_2d<f32>;
+          @group(0) @binding(2) var samp: sampler;
+          @vertex fn vs_main(@builtin(vertex_index) i: u32) -> VertexOutput {
+            var pos = array<vec2<f32>, 6>(vec2(-1., 1.), vec2(1., 1.), vec2(-1., -1.), vec2(-1., -1.), vec2(1., 1.), vec2(1., -1.));
+            var uv = array<vec2<f32>, 6>(${uvArr});
+            var out: VertexOutput; out.pos = vec4(pos[i], 0., 1.); out.uv = uv[i]; return out;
+          }
+          @fragment fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> { return textureSample(tex, samp, in.uv); }
+        `;
+
+        const shader5cA = make5cShader("vec2(0.,0.), vec2(1.,0.), vec2(0.,1.), vec2(0.,1.), vec2(1.,0.), vec2(1.,1.)");
+        const shader5cB = make5cShader("vec2(-0.5,-0.5), vec2(1.5,-0.5), vec2(-0.5,1.5), vec2(-0.5,1.5), vec2(1.5,-0.5), vec2(1.5,1.5)");
+        const shader5cC = make5cShader("vec2(1./3.,0.25), vec2(1./3.,0.25), vec2(1./3.,0.25), vec2(1./3.,0.25), vec2(1./3.,0.25), vec2(1./3.,0.25)");
+
+        const probe5c = (buf, x, y) => {
+          const off = y * bytesPerRow + x * 4;
+          return [buf[off], buf[off + 1], buf[off + 2], buf[off + 3]];
+        };
+
+        // Phase (a): nearest + clamp, 3x2 texture with padded rows -> probe six pixels
+        const directA = await renderDirectOracle(bridge.device, shader5cA, "nearest", "clamp-to-edge");
+        await bridge.executePacket(build5cPacket(500, 501, 511, 521, shader5cA, 0, 0));
+        const bridgeA = await bridge.readbackBuffer(511, bytesPerRow * 64);
+        let diffsA = 0;
+        for (let i = 0; i < bridgeA.byteLength; i++) if (bridgeA[i] !== directA[i]) diffsA++;
+        if (diffsA > 0) throw new Error(`Checkpoint 5c(a) bridge vs direct oracle pixel mismatch: ${diffsA} diffs`);
+        const probeA_00 = probe5c(bridgeA, 10, 16); // Texel (0,0) Red
+        const probeA_10 = probe5c(bridgeA, 32, 16); // Texel (1,0) Green
+        const probeA_20 = probe5c(bridgeA, 53, 16); // Texel (2,0) Blue
+        const probeA_01 = probe5c(bridgeA, 10, 48); // Texel (0,1) Yellow
+        const probeA_11 = probe5c(bridgeA, 32, 48); // Texel (1,1) Cyan
+        const probeA_21 = probe5c(bridgeA, 53, 48); // Texel (2,1) Magenta
+        assertExactRgba(probeA_00, [255, 0, 0, 255], "5c(a) Texel (0,0) Red");
+        assertExactRgba(probeA_10, [0, 255, 0, 255], "5c(a) Texel (1,0) Green");
+        assertExactRgba(probeA_20, [0, 0, 255, 255], "5c(a) Texel (2,0) Blue");
+        assertExactRgba(probeA_01, [255, 255, 0, 255], "5c(a) Texel (0,1) Yellow");
+        assertExactRgba(probeA_11, [0, 255, 255, 255], "5c(a) Texel (1,1) Cyan");
+        assertExactRgba(probeA_21, [255, 0, 255, 255], "5c(a) Texel (2,1) Magenta");
+
+        // Phase (b): address_mode repeat, UVs spanning [-0.5, 1.5] -> probe wrapped regions
+        const directB = await renderDirectOracle(bridge.device, shader5cB, "nearest", "repeat");
+        await bridge.executePacket(build5cPacket(504, 502, 512, 522, shader5cB, 0, 1));
+        const bridgeB = await bridge.readbackBuffer(512, bytesPerRow * 64);
+        let diffsB = 0;
+        for (let i = 0; i < bridgeB.byteLength; i++) if (bridgeB[i] !== directB[i]) diffsB++;
+        if (diffsB > 0) throw new Error(`Checkpoint 5c(b) bridge vs direct oracle pixel mismatch: ${diffsB} diffs`);
+        const probeB_TL = probe5c(bridgeB, 8, 8);   // Wraps to Texel (2,1) Magenta
+        const probeB_TR = probe5c(bridgeB, 56, 8);  // Wraps to Texel (0,1) Yellow
+        const probeB_BL = probe5c(bridgeB, 8, 56);  // Wraps to Texel (2,0) Blue
+        const probeB_BR = probe5c(bridgeB, 56, 56); // Wraps to Texel (0,0) Red
+        assertExactRgba(probeB_TL, [255, 0, 255, 255], "5c(b) wrapped TL -> Texel (2,1)");
+        assertExactRgba(probeB_TR, [255, 255, 0, 255], "5c(b) wrapped TR -> Texel (0,1)");
+        assertExactRgba(probeB_BL, [0, 0, 255, 255], "5c(b) wrapped BL -> Texel (2,0)");
+        assertExactRgba(probeB_BR, [255, 0, 0, 255], "5c(b) wrapped BR -> Texel (0,0)");
+
+        // Phase (c): sampler_filter linear at midpoint between Texel (0,0) and (1,0)
+        const directC = await renderDirectOracle(bridge.device, shader5cC, "linear", "clamp-to-edge");
+        await bridge.executePacket(build5cPacket(505, 503, 513, 523, shader5cC, 1, 0));
+        const bridgeC = await bridge.readbackBuffer(513, bytesPerRow * 64);
+        let diffsC = 0;
+        for (let i = 0; i < bridgeC.byteLength; i++) if (bridgeC[i] !== directC[i]) diffsC++;
+        if (diffsC > 0) throw new Error(`Checkpoint 5c(c) bridge vs direct oracle pixel mismatch: ${diffsC} diffs`);
+        const probeC_mid = probe5c(bridgeC, 32, 32);
+        const oracleC_mid = probe5c(directC, 32, 32);
+        assertExactRgba(probeC_mid, oracleC_mid, "5c(c) midpoint bridge vs direct oracle");
+        if (probeC_mid[0] <= 10 || probeC_mid[0] >= 245 || probeC_mid[1] <= 10 || probeC_mid[1] >= 245) {
+          throw new Error(`5c(c) linear filter failed: midpoint [${probeC_mid}] not intermediate (nearest fallback detected)`);
+        }
+        if (probeC_mid[2] !== 0 || probeC_mid[3] !== 255) {
+          throw new Error(`5c(c) linear filter corrupted blue/alpha channels: [${probeC_mid}]`);
+        }
+
+        // Cleanup bridge resources created for 5c
+        for (const id of [511, 512, 513]) { bridge.buffers.get(id)?.destroy(); bridge.buffers.delete(id); bridge.bufferEpochs.delete(id); }
+        for (const id of [500, 501, 502, 503, 504, 505]) { bridge.textures.get(id)?.destroy(); bridge.textures.delete(id); }
+        for (const id of [521, 522, 523]) bridge.pipelines.delete(id);
+
+        logPass(
+          "textured_padded_repeat_linear_proven",
+          `Checkpoint 5c verified: 3x2 padded rows (bytesPerRow=16) matches oracle (0 diffs across 3 passes); ` +
+          `6-texel nearest probed exact; repeat address mode wrapped probes verified ([${probeB_TL}], [${probeB_TR}], [${probeB_BL}], [${probeB_BR}]); ` +
+          `linear filter verified at midpoint ([${probeC_mid}], strictly intermediate, exact match vs oracle)`
+        );
+
+        // 5d. Matched 4000-Distinct-Uniform First-Draw Comparison
+        // Matched boundaries (first draw on an initialized device):
+        // - 256x256 offscreen rgba8unorm render target with identical CCW triangle geometry & UVs
+        // - 4000 distinct AffineRows uniform transforms (3 rows of vec4<f32>) arranged on an 80x50 grid
+        // - Single queue submission and completion via device.queue.onSubmittedWorkDone()
+        // - Both command buffers include offscreen render pass and copyTextureToBuffer
+        // - Distinct CPU timing metrics:
+        //   Bridge: packet_generation_ms (Wasm), bridge_encode_submit_ms (JS decode+record+submit)
+        //   Direct: direct_prepare_ms (JS setup+record), direct_submit_ms (JS submit)
+        //   Both report comparable cpu_prepare_submit_ms (sum of synchronous CPU preparation/submission wall intervals)
+        // - Notification latency: gpu_complete_ms (submit-to-queue-completion notification latency via onSubmittedWorkDone)
+        // - Packet bytes recorded for bridge path (labeled packet_bytes)
+        // Excluded/unmatched boundaries:
+        // - Transform array preparation is performed outside BOTH timed intervals
+        // - Wasm module compilation, instantiation, and WebGPU adapter/device negotiation are excluded
+        // - CPU buffer readback mapping (mapAsync / getMappedRange / unmap) is strictly excluded
+        // - Incomparable host-call counts are omitted
+        const buildAffineBatchFn = wasmExports.f3d_build_affine_rows_batch_packet;
+        if (typeof buildAffineBatchFn !== "function") {
+          throw new Error("Missing required Wasm export: f3d_build_affine_rows_batch_packet");
+        }
+
+        const batchWidth = 256;
+        const batchHeight = 256;
+        const batchDrawCount = 4000;
+        const sharedRows = new Float32Array(batchDrawCount * 12);
+        const cols = 80;
+        const rows = 50;
+        const sx = 0.018;
+        const sy = 0.028;
+        for (let i = 0; i < batchDrawCount; i++) {
+          const col = i % cols;
+          const row = Math.floor(i / cols);
+          const tx = -0.95 + (col + 0.5) * (1.9 / cols);
+          const ty = -0.95 + (row + 0.5) * (1.9 / rows);
+          const off = i * 12;
+          sharedRows[off]     = sx;  sharedRows[off + 1] = 0.0; sharedRows[off + 2]  = 0.0; sharedRows[off + 3]  = tx;
+          sharedRows[off + 4] = 0.0; sharedRows[off + 5] = sy;  sharedRows[off + 6]  = 0.0; sharedRows[off + 7]  = ty;
+          sharedRows[off + 8] = 0.0; sharedRows[off + 9] = 0.0; sharedRows[off + 10] = 1.0; sharedRows[off + 11] = 0.0;
+        }
+
+        const b_batch_t0 = performance.now();
+        const batchPacket = buildAffineBatchFn(sharedRows, batchWidth, batchHeight);
+        const b_batch_t1 = performance.now();
+        if (!(batchPacket instanceof Uint8Array) || batchPacket.byteLength === 0) {
+          throw new Error("Rust Wasm affine batch packet generator returned empty or non-Uint8Array packet");
+        }
+        const batch_packet_generation_ms = b_batch_t1 - b_batch_t0;
+
+        let b_batch_t_submitted = 0;
+        let b_batch_t_gpu_complete = 0;
+        let b_batch_gpu_done_promise = null;
+        const b_batch_t2 = performance.now();
+        await bridge.executePacket(batchPacket, null, () => {
+          b_batch_t_submitted = performance.now();
+          b_batch_gpu_done_promise = bridge.device.queue.onSubmittedWorkDone().then(() => {
+            b_batch_t_gpu_complete = performance.now();
+          });
+        });
+        const batch_bridge_encode_submit_ms = b_batch_t_submitted - b_batch_t2;
+
+        await b_batch_gpu_done_promise;
+        const batch_bridge_gpu_complete_ms = b_batch_t_gpu_complete - b_batch_t_submitted;
+
+        const batchDirectTiming = {};
+        const directBatchPixels = await renderDirectReferenceTriangle(
+          bridge.device,
+          batchWidth,
+          batchHeight,
+          batchDirectTiming,
+          sharedRows
+        );
+
+        const batchBytesPerRow = 1024;
+        const bridgeBatchPixels = await bridge.readbackBuffer(20, batchBytesPerRow * batchHeight);
+
+        if (bridgeBatchPixels.byteLength !== directBatchPixels.byteLength) {
+          throw new Error(`Length mismatch: bridge ${bridgeBatchPixels.byteLength} vs direct ${directBatchPixels.byteLength}`);
+        }
+
+        let batchDiffCount = 0;
+        let batchNonZeroRgbCount = 0;
+        for (let i = 0; i < bridgeBatchPixels.byteLength; i++) {
+          if (i % 4 !== 3 && bridgeBatchPixels[i] !== 0) batchNonZeroRgbCount++;
+          if (bridgeBatchPixels[i] !== directBatchPixels[i]) batchDiffCount++;
+        }
+
+        if (batchNonZeroRgbCount === 0) {
+          throw new Error("Batch rendered image has no non-zero RGB color channels");
+        }
+        if (batchDiffCount > 0) {
+          throw new Error(`Pixel mismatch between batch bridge and direct reference: ${batchDiffCount} differences`);
+        }
+
+        // Cleanup bridge resources created for 5d
+        for (const id of [1, 2, 20]) { bridge.buffers.get(id)?.destroy(); bridge.buffers.delete(id); bridge.bufferEpochs.delete(id); }
+        bridge.textures.get(10)?.destroy(); bridge.textures.delete(10);
+        bridge.pipelines.delete(100);
+
+        results.affine_rows_batch_measurement = {
+          bridge: {
+            packet_generation_ms: batch_packet_generation_ms,
+            bridge_encode_submit_ms: batch_bridge_encode_submit_ms,
+            cpu_prepare_submit_ms: batch_packet_generation_ms + batch_bridge_encode_submit_ms,
+            gpu_complete_ms: batch_bridge_gpu_complete_ms,
+            packet_bytes: batchPacket.byteLength,
+          },
+          direct_js: {
+            direct_prepare_ms: batchDirectTiming.direct_prepare_ms,
+            direct_submit_ms: batchDirectTiming.direct_submit_ms,
+            cpu_prepare_submit_ms: batchDirectTiming.cpu_prepare_submit_ms,
+            gpu_complete_ms: batchDirectTiming.gpu_complete_ms,
+          },
+        };
+
+        const bBatchMeas = results.affine_rows_batch_measurement.bridge;
+        const dBatchMeas = results.affine_rows_batch_measurement.direct_js;
+
+        for (const [key, val] of Object.entries(bBatchMeas)) {
+          if (key === "packet_bytes") {
+            if (!Number.isInteger(val) || val <= 0) throw new Error(`Invalid bridge batch packet_bytes: ${val}`);
+          } else {
+            if (!Number.isFinite(val) || val < 0) throw new Error(`Invalid bridge batch ${key}: ${val}`);
+          }
+        }
+        for (const [key, val] of Object.entries(dBatchMeas)) {
+          if (!Number.isFinite(val) || val < 0) throw new Error(`Invalid direct_js batch ${key}: ${val}`);
+        }
+
+        logPass(
+          "affine_rows_batch_pixel_identical",
+          `Bridge matches direct-JS reference across ${bridgeBatchPixels.byteLength} bytes for 4000 dynamic-offset draws (0 diffs, ${batchNonZeroRgbCount} non-zero RGB bytes)`
+        );
+
+        logPass(
+          "affine_rows_batch_raw_measurement",
+          `bridge: packet_gen=${bBatchMeas.packet_generation_ms.toFixed(3)}ms encode_submit=${bBatchMeas.bridge_encode_submit_ms.toFixed(3)}ms cpu_total=${bBatchMeas.cpu_prepare_submit_ms.toFixed(3)}ms gpu=${bBatchMeas.gpu_complete_ms.toFixed(3)}ms packet_bytes=${bBatchMeas.packet_bytes}; ` +
+          `direct_js: prepare=${dBatchMeas.direct_prepare_ms.toFixed(3)}ms submit=${dBatchMeas.direct_submit_ms.toFixed(3)}ms cpu_total=${dBatchMeas.cpu_prepare_submit_ms.toFixed(3)}ms gpu=${dBatchMeas.gpu_complete_ms.toFixed(3)}ms`
+        );
+
+        // 5e. Chatty Wasm->Host Driver Variant (Kill Gate 2 / tmt.5)
+        // - Invokes Cobalt's actual Wasm export f3d_bridge_chatty_draw_loop(count)
+        // - Scoped f3dHost.drawCall sets dynamic bind offset i*256 AND draw; try/finally restores callback
+        // - Whole-256x256 RGBA exact comparison against directBatchPixels, RGB non-zero assertion
+        // - Captures raw prepare/submit/gpu_complete timing under identical boundaries
+        const chattyTiming = {};
+        const chattyDrawEncoder = (pass, bindGroup, count) => {
+          const host = (window.f3dHost = window.f3dHost || {});
+          const prevDrawCall = host.drawCall;
+          try {
+            host.drawCall = (index) => {
+              pass.setBindGroup(0, bindGroup, [index * 256]);
+              pass.draw(3, 1, 0, 0);
+            };
+            const chattyFn = wasmExports.f3d_bridge_chatty_draw_loop;
+            if (typeof chattyFn !== "function") {
+              throw new Error("Missing required Wasm export: f3d_bridge_chatty_draw_loop");
+            }
+            chattyFn(count);
+          } finally {
+            if (prevDrawCall !== undefined) {
+              host.drawCall = prevDrawCall;
+            } else {
+              delete host.drawCall;
+            }
+          }
+        };
+
+        const chattyBatchPixels = await renderDirectReferenceTriangle(
+          bridge.device,
+          batchWidth,
+          batchHeight,
+          chattyTiming,
+          sharedRows,
+          chattyDrawEncoder
+        );
+
+        if (chattyBatchPixels.byteLength !== directBatchPixels.byteLength) {
+          throw new Error(`Length mismatch: chatty ${chattyBatchPixels.byteLength} vs direct ${directBatchPixels.byteLength}`);
+        }
+
+        let chattyDiffCount = 0;
+        let chattyNonZeroRgbCount = 0;
+        for (let i = 0; i < chattyBatchPixels.byteLength; i++) {
+          if (i % 4 !== 3 && chattyBatchPixels[i] !== 0) chattyNonZeroRgbCount++;
+          if (chattyBatchPixels[i] !== directBatchPixels[i]) chattyDiffCount++;
+        }
+        if (chattyNonZeroRgbCount === 0) {
+          throw new Error("Chatty rendered image has no non-zero RGB color channels");
+        }
+        if (chattyDiffCount > 0) {
+          throw new Error(`Pixel mismatch between chatty driver and direct reference: ${chattyDiffCount} differences`);
+        }
+
+        results.chatty_batch_measurement = {
+          direct_prepare_ms: chattyTiming.direct_prepare_ms,
+          direct_submit_ms: chattyTiming.direct_submit_ms,
+          cpu_prepare_submit_ms: chattyTiming.cpu_prepare_submit_ms,
+          gpu_complete_ms: chattyTiming.gpu_complete_ms,
+        };
+
+        const cMeas = results.chatty_batch_measurement;
+        for (const [key, val] of Object.entries(cMeas)) {
+          if (!Number.isFinite(val) || val < 0) throw new Error(`Invalid chatty ${key}: ${val}`);
+        }
+
+        logPass(
+          "chatty_batch_pixel_identical",
+          `Chatty Wasm->host driver matches direct-JS reference across ${chattyBatchPixels.byteLength} bytes (0 diffs, ${chattyNonZeroRgbCount} non-zero RGB bytes)`
+        );
+        logPass(
+          "chatty_batch_raw_measurement",
+          `chatty: prepare=${cMeas.direct_prepare_ms.toFixed(3)}ms submit=${cMeas.direct_submit_ms.toFixed(3)}ms cpu_total=${cMeas.cpu_prepare_submit_ms.toFixed(3)}ms gpu=${cMeas.gpu_complete_ms.toFixed(3)}ms`
+        );
+
+        // 5e-neg. Focused Real-Wasm Throw Test: Host callback error propagation (Kill Gate 2)
+        const throwHost = (window.f3dHost = window.f3dHost || {});
+        const prevThrowDrawCall = throwHost.drawCall;
+        const recordedIndices = [];
+        const sentinelError = new Error("sentinel_host_draw_abort");
+        let caughtError = null;
+        try {
+          throwHost.drawCall = (index) => {
+            recordedIndices.push(index);
+            if (index === 2) {
+              throw sentinelError;
+            }
+          };
+          const chattyFn = wasmExports.f3d_bridge_chatty_draw_loop;
+          if (typeof chattyFn !== "function") {
+            throw new Error("Missing required Wasm export: f3d_bridge_chatty_draw_loop");
+          }
+          chattyFn(10);
+        } catch (e) {
+          caughtError = e;
+        } finally {
+          if (prevThrowDrawCall !== undefined) {
+            throwHost.drawCall = prevThrowDrawCall;
+          } else {
+            delete throwHost.drawCall;
+          }
+        }
+
+        if (caughtError !== sentinelError) {
+          throw new Error(`Chatty driver did not propagate same sentinel error: got ${caughtError}`);
+        }
+        if (recordedIndices.length !== 3 || recordedIndices[0] !== 0 || recordedIndices[1] !== 1 || recordedIndices[2] !== 2) {
+          throw new Error(`Chatty driver callback sequence mismatch: expected [0, 1, 2] and no later callbacks, got [${recordedIndices.join(",")}]`);
+        }
+        logPass(
+          "chatty_driver_error_propagation",
+          `Wasm chatty draw loop halted at index 2 upon host exception with original error preserved ([${recordedIndices.join(",")}])`
+        );
+
+        // 5f. Generated Static JS Variant (tmt.5)
+        // - Built via Navy RCH from static_submission_generator.mjs into out/browser-probe/static_submission_4000.js
+        // - Owned Wasm row data copy via f3d_pack_affine_rows_bytes included in prepare time
+        // - Whole-256x256 RGBA exact comparison against directBatchPixels, RGB non-zero assertion
+        // - Reports generated JS byte size separately; no cold-start/warm/speedup claims
+        let genMod;
+        try {
+          genMod = await import("/out/browser-probe/static_submission_4000.js");
+        } catch (e) {
+          throw new Error(`Failed to load generated static module: ${e.message}`);
+        }
+        if (typeof genMod.executeStaticSubmission4000 !== "function") {
+          throw new Error("Missing required export executeStaticSubmission4000 in /out/browser-probe/static_submission_4000.js");
+        }
+
+        const genResp = await fetch("/out/browser-probe/static_submission_4000.js");
+        const generatedJsBytes = (await genResp.arrayBuffer()).byteLength;
+
+        const packAffineFn = wasmExports.f3d_pack_affine_rows_bytes;
+        if (typeof packAffineFn !== "function") {
+          throw new Error("Missing required Wasm export: f3d_pack_affine_rows_bytes");
+        }
+
+        const generatedTiming = {};
+        const generatedBatchPixels = await renderDirectReferenceTriangle(
+          bridge.device,
+          batchWidth,
+          batchHeight,
+          generatedTiming,
+          null,
+          (pass, bindGroup) => genMod.executeStaticSubmission4000(pass, bindGroup),
+          () => packAffineFn(sharedRows)
+        );
+
+        if (generatedBatchPixels.byteLength !== directBatchPixels.byteLength) {
+          throw new Error(`Length mismatch: generated static ${generatedBatchPixels.byteLength} vs direct ${directBatchPixels.byteLength}`);
+        }
+
+        let genDiffCount = 0;
+        let genNonZeroRgbCount = 0;
+        for (let i = 0; i < generatedBatchPixels.byteLength; i++) {
+          if (i % 4 !== 3 && generatedBatchPixels[i] !== 0) genNonZeroRgbCount++;
+          if (generatedBatchPixels[i] !== directBatchPixels[i]) genDiffCount++;
+        }
+        if (genNonZeroRgbCount === 0) {
+          throw new Error("Generated static rendered image has no non-zero RGB color channels");
+        }
+        if (genDiffCount > 0) {
+          throw new Error(`Pixel mismatch between generated static and direct reference: ${genDiffCount} differences`);
+        }
+
+        results.generated_static_batch_measurement = {
+          direct_prepare_ms: generatedTiming.direct_prepare_ms,
+          direct_submit_ms: generatedTiming.direct_submit_ms,
+          cpu_prepare_submit_ms: generatedTiming.cpu_prepare_submit_ms,
+          gpu_complete_ms: generatedTiming.gpu_complete_ms,
+          generated_js_bytes: generatedJsBytes,
+        };
+
+        const gMeas = results.generated_static_batch_measurement;
+        for (const [key, val] of Object.entries(gMeas)) {
+          if (key === "generated_js_bytes") {
+            if (!Number.isInteger(val) || val <= 0) throw new Error(`Invalid generated_js_bytes: ${val}`);
+          } else {
+            if (!Number.isFinite(val) || val < 0) throw new Error(`Invalid generated static ${key}: ${val}`);
+          }
+        }
+
+        logPass(
+          "generated_static_batch_pixel_identical",
+          `Generated static JS matches direct-JS reference across ${generatedBatchPixels.byteLength} bytes (0 diffs, ${genNonZeroRgbCount} non-zero RGB bytes)`
+        );
+        logPass(
+          "generated_static_batch_raw_measurement",
+          `generated_static: prepare=${gMeas.direct_prepare_ms.toFixed(3)}ms submit=${gMeas.direct_submit_ms.toFixed(3)}ms cpu_total=${gMeas.cpu_prepare_submit_ms.toFixed(3)}ms gpu=${gMeas.gpu_complete_ms.toFixed(3)}ms generated_js_bytes=${gMeas.generated_js_bytes}`
+        );
 
         // 6. Red-A / Blue-B Snapshot Isolation in Single Queue Submission (using PerUseByteBuffer)
         const redBluePacket = buildRedBlueFn(true);
