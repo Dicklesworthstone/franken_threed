@@ -44,6 +44,7 @@ export async function directMeshReference(device, options) {
     depthWriteEnabled = true,
     depthCompare = "less",
     depthClearValue = 1.0,
+    outputSrgb = false,
   } = options;
 
   const bytesPerRow = Math.ceil((width * 4) / 256) * 256;
@@ -110,6 +111,27 @@ export async function directMeshReference(device, options) {
     ? "clip.z = (clip.z + clip.w) * 0.5;"
     : "";
 
+  // Linear-sRGB to sRGB OETF transfer function per Three.js r186 ColorSpaceFunctions.js:38-48
+  const srgbFunctionWgsl = outputSrgb
+    ? `
+      fn srgb_transfer_oetf(color: vec3<f32>) -> vec3<f32> {
+        let clamped = max(color, vec3<f32>(0.0));
+        let a = pow(clamped, vec3<f32>(0.41666)) * 1.055 - vec3<f32>(0.055);
+        let b = color * 12.92;
+        return select(a, b, color <= vec3<f32>(0.0031308));
+      }
+    `
+    : "";
+
+  const fragmentReturnWgsl = outputSrgb
+    ? `
+        let srgb_rgb = srgb_transfer_oetf(uniforms.color.rgb);
+        return vec4<f32>(srgb_rgb, uniforms.color.a);
+    `
+    : `
+        return uniforms.color;
+    `;
+
   const shaderModule = device.createShaderModule({
     code: `
       struct MeshUniforms {
@@ -140,9 +162,11 @@ export async function directMeshReference(device, options) {
         return out;
       }
 
+      ${srgbFunctionWgsl}
+
       @fragment
       fn fs_main() -> @location(0) vec4<f32> {
-        return uniforms.color;
+        ${fragmentReturnWgsl}
       }
     `,
   });
@@ -375,6 +399,49 @@ async function loadProductionAdapter(customAdapter) {
     throw new Error("FATAL: Production mesh_adapter.mjs is missing required canAdmitMesh export");
   }
   return adapter;
+}
+
+/**
+ * Retained Three.js WebGLRenderer reference midpoint oracle.
+ * Renders on an isolated canvas with production configuration:
+ * antialias: false, NoToneMapping, outputColorSpace: SRGBColorSpace.
+ * Reads center pixel via gl.readPixels to provide ground-truth Three.js parity.
+ */
+function renderRetainedWebGLReference(THREE, mesh, camera, width = 64, height = 64) {
+  if (typeof document === "undefined" || typeof document.createElement !== "function") {
+    throw new Error("Retained WebGLRenderer reference oracle requires a DOM document environment");
+  }
+  const refCanvas = document.createElement("canvas");
+  refCanvas.width = width;
+  refCanvas.height = height;
+
+  const renderer = new THREE.WebGLRenderer({
+    canvas: refCanvas,
+    antialias: false,
+  });
+  try {
+    renderer.setSize(width, height, false);
+    renderer.toneMapping = THREE.NoToneMapping;
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+    const scene = new THREE.Scene();
+    scene.add(mesh);
+    renderer.render(scene, camera);
+
+    const gl = renderer.getContext();
+    const pixel = new Uint8Array(4);
+    // In WebGL, (0,0) is bottom-left. For canvas center (x=32, y=32),
+    // WebGL row is height - 1 - y = 31.
+    const glX = Math.floor(width / 2);
+    const glY = height - 1 - Math.floor(height / 2);
+    gl.readPixels(glX, glY, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
+    return [pixel[0], pixel[1], pixel[2], pixel[3]];
+  } finally {
+    renderer.dispose();
+    if (typeof refCanvas.remove === "function") {
+      refCanvas.remove();
+    }
+  }
 }
 
 /**
@@ -754,6 +821,7 @@ export async function testVisibleCanvasMeshScene(bridgeHost, wasmExports, canvas
 
     const refInput1 = buildIndependentReferenceInput(mesh, camera, width, height);
     refInput1.format = canvasFormat;
+    refInput1.outputSrgb = true;
     const refPixels1 = await directMeshReference(device, refInput1);
 
     if (differs(canvasPixels1, refPixels1)) {
@@ -787,6 +855,7 @@ export async function testVisibleCanvasMeshScene(bridgeHost, wasmExports, canvas
 
     const refInput2 = buildIndependentReferenceInput(mesh, camera, width, height);
     refInput2.format = canvasFormat;
+    refInput2.outputSrgb = true;
     const refPixels2 = await directMeshReference(device, refInput2);
 
     if (differs(canvasPixels2, refPixels2)) {
@@ -813,6 +882,7 @@ export async function testVisibleCanvasMeshScene(bridgeHost, wasmExports, canvas
 
     const refInput3 = buildIndependentReferenceInput(mesh, camera, width, height);
     refInput3.format = canvasFormat;
+    refInput3.outputSrgb = true;
     const refPixels3 = await directMeshReference(device, refInput3);
 
     if (differs(canvasPixels3, refPixels3)) {
@@ -867,7 +937,57 @@ export async function testVisibleCanvasMeshScene(bridgeHost, wasmExports, canvas
       throw new Error("renderMesh positive canvas output differs from expected reference pixels");
     }
 
-    return "Visible canvas Three.js Mesh rendering matches independent direct WebGPU reference (preferredCanvasFormat) across rAF-separated presentation frames; translation and color mutations observed on swapchain; stale packet and absent canvasContext correctly rejected; Gray's prepareCanvasMeshPacket and renderMesh (with canvas pixel verification) verified directly";
+    // -------------------------------------------------------------------------
+    // Checkpoint 6: Retained WebGLRenderer Reference Oracle Parity (Midtone sRGB)
+    // -------------------------------------------------------------------------
+    // Pinned Three.js r186 WebGPURenderer applies outputColorSpace sRGB encoding
+    // to canvas outputs. We verify candidate Wasm canvas execution against real
+    // retained WebGLRenderer on its own isolated canvas/context.
+    mesh.material.color.setRGB(0.5, 0.5, 0.5);
+
+    const { packetBytes: midtonePacket } = adapter.prepareCanvasMeshPacket(
+      mesh,
+      camera,
+      width,
+      height,
+      wasmExports
+    );
+    await nextFrame();
+    const candidateMidtonePixels = await executeAndReadCanvas(midtonePacket);
+
+    // Run real retained Three.js WebGLRenderer oracle on its own isolated canvas
+    const oracleCenter = renderRetainedWebGLReference(THREE, mesh, camera, width, height);
+
+    // Read candidate center pixel (handling BGRA vs RGBA preferredCanvasFormat)
+    const candR = candidateMidtonePixels[centerIdx + rCh];
+    const candG = candidateMidtonePixels[centerIdx + gCh];
+    const candB = candidateMidtonePixels[centerIdx + bCh];
+    const candA = candidateMidtonePixels[centerIdx + 3];
+
+    // Tolerance 2 match against actual WebGLRenderer readPixels oracle
+    const diffR = Math.abs(candR - oracleCenter[0]);
+    const diffG = Math.abs(candG - oracleCenter[1]);
+    const diffB = Math.abs(candB - oracleCenter[2]);
+    const diffA = Math.abs(candA - oracleCenter[3]);
+
+    if (diffR > 2 || diffG > 2 || diffB > 2 || diffA > 2) {
+      throw new Error(
+        `Checkpoint 6 failed: Candidate canvas midtone pixel [${candR}, ${candG}, ${candB}, ${candA}] ` +
+        `differs from retained WebGLRenderer reference oracle [${oracleCenter}] by > tolerance 2 ` +
+        `(diffs: R=${diffR}, G=${diffG}, B=${diffB}, A=${diffA})`
+      );
+    }
+
+    // Planted negative control: raw linear byte (128 for 0.5) must strictly fail sRGB parity
+    const rawLinearByte = Math.round(0.5 * 255); // 128
+    const linearMismatch = Math.abs(rawLinearByte - oracleCenter[0]);
+    if (linearMismatch <= 2) {
+      throw new Error(
+        `Planted negative failed: raw linear byte ${rawLinearByte} was not rejected by sRGB oracle ${oracleCenter[0]}`
+      );
+    }
+
+    return "Visible canvas Three.js Mesh rendering matches independent direct WebGPU reference (preferredCanvasFormat) across rAF-separated presentation frames; translation and color mutations observed on swapchain; stale packet and absent canvasContext correctly rejected; Gray's prepareCanvasMeshPacket and renderMesh (with canvas pixel verification) verified directly; retained WebGLRenderer midtone sRGB reference oracle matches candidate within tolerance 2 and rejects planted linear byte";
   } finally {
     canvasReadback.destroy();
   }
@@ -1225,6 +1345,7 @@ export async function testMeshDepthScene(bridgeHost, wasmExports, canvasContext 
         depthCompare: "less",
         depthWriteEnabled: false,
         format: canvasFormat,
+        outputSrgb: true,
       })
     );
 
@@ -1233,5 +1354,5 @@ export async function testMeshDepthScene(bridgeHost, wasmExports, canvasContext 
     }
   }
 
-  return "Real THREE.Mesh depthTest/depthWrite/depthFunc mutation verified (depth24plus): LessDepth produces visible mesh matching direct WebGPU reference; NeverDepth suppresses rendering (clear color preserved); AlwaysDepth renders visible mesh; depthTest=false without sourceBackend refused (AMBIGUOUS_DEPTH_PAIR); sourceBackend='webgpu' enables depthWrite; sourceBackend='webgl' suppresses depthWrite; depthWrite=false verified against independent oracle" + (canvasContext ? "; visible canvas mesh depth verified against direct reference" : "");
+  return "Real THREE.Mesh depthTest/depthWrite/depthFunc mutation verified (depth24plus): LessDepth produces visible mesh matching direct WebGPU reference; NeverDepth suppresses rendering (clear color preserved); AlwaysDepth renders visible mesh; depthTest=false without sourceBackend refused (AMBIGUOUS_DEPTH_PAIR); sourceBackend='webgpu' enables depthWrite flag; sourceBackend='webgl' suppresses depthWrite flag; depthWrite=false flag and selected cases verified against independent oracle (single-mesh draw verifies pipeline write flags, multi-object occlusion verified by static depth fixture)" + (canvasContext ? "; visible canvas mesh depth verified against direct reference" : "");
 }

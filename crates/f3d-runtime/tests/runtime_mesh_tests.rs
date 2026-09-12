@@ -24,7 +24,8 @@ use f3d_runtime::mesh::{
     f3d_build_canvas_mesh_depth_packet, f3d_build_canvas_mesh_packet,
     f3d_build_mesh_depth_packet, f3d_build_mesh_packet, generate_mesh_wgsl,
     gpu_bridge_build_canvas_mesh_depth_packet, gpu_bridge_build_canvas_mesh_packet,
-    gpu_bridge_build_mesh_depth_packet, gpu_bridge_build_mesh_packet, DynamicMeshInput,
+    gpu_bridge_build_mesh_depth_packet, gpu_bridge_build_mesh_packet,
+    srgb_transfer_oetf_cpu, DynamicMeshInput,
     MeshDepthOptions, MeshPacketError, MESH_CANVAS_PIPELINE_ID, MESH_CANVAS_TARGET_ID,
     MESH_CLEAR_COLOR, MESH_DEPTH_TEXTURE_ID, MESH_PIPELINE_ID, MESH_READBACK_BUFFER_ID,
     MESH_TARGET_TEXTURE_ID, MESH_UNIFORM_BUFFER_ID, MESH_VERTEX_BUFFER_ID,
@@ -1498,4 +1499,65 @@ fn test_frame_session_depth_begin_seam() {
             ..
         } if (*depth_clear_value - 1.0).abs() < f32::EPSILON
     )));
+}
+
+#[test]
+fn test_generate_mesh_wgsl_contains_srgb_oetf_and_encoded_return() {
+    let wgsl_webgpu = generate_mesh_wgsl(false);
+    assert!(
+        wgsl_webgpu.contains("fn srgb_transfer_oetf(color: vec3<f32>) -> vec3<f32>"),
+        "WGSL must define srgb_transfer_oetf function"
+    );
+    assert!(
+        wgsl_webgpu.contains("select(a, b, color <= vec3<f32>(0.0031308))"),
+        "WGSL srgb_transfer_oetf must perform conditional select at 0.0031308 threshold"
+    );
+    assert!(
+        wgsl_webgpu.contains("let srgb_rgb = srgb_transfer_oetf(uniforms.color.rgb);"),
+        "fs_main must encode uniforms.color.rgb with srgb_transfer_oetf"
+    );
+    assert!(
+        wgsl_webgpu.contains("return vec4<f32>(srgb_rgb, uniforms.color.a);"),
+        "fs_main must return encoded RGB with unmodified alpha"
+    );
+
+    let wgsl_webgl = generate_mesh_wgsl(true);
+    assert!(
+        wgsl_webgl.contains("fn srgb_transfer_oetf(color: vec3<f32>) -> vec3<f32>"),
+        "WebGL depth mode WGSL must define srgb_transfer_oetf"
+    );
+    assert!(
+        wgsl_webgl.contains("let srgb_rgb = srgb_transfer_oetf(uniforms.color.rgb);"),
+        "WebGL depth mode fs_main must encode uniforms.color.rgb"
+    );
+}
+
+#[test]
+fn test_srgb_oetf_cpu_formula_midtone() {
+    // Specification: midtone 0.5 -> ~0.7354 per Three.js r186 ColorManagement.LinearToSRGB
+    let midtone = 0.5_f32;
+    let srgb_midtone = srgb_transfer_oetf_cpu(midtone);
+    assert!(
+        (srgb_midtone - 0.7354).abs() < 1e-4,
+        "sRGB OETF of midtone 0.5 must be ~0.7354 (got {srgb_midtone})"
+    );
+    assert_eq!(
+        (srgb_midtone * 10000.0).round() / 10000.0,
+        0.7354,
+        "sRGB OETF of midtone 0.5 rounded to 4 decimals must equal 0.7354"
+    );
+
+    // Endpoint 0.0 -> 0.0
+    assert_eq!(srgb_transfer_oetf_cpu(0.0), 0.0);
+
+    // Endpoint 1.0 -> 1.0 (within float precision: 1.055 * 1.0 - 0.055 = 1.0)
+    assert!((srgb_transfer_oetf_cpu(1.0) - 1.0).abs() < 1e-6);
+
+    // Linear sub-threshold region (v <= 0.0031308): v * 12.92
+    let sub = 0.001_f32;
+    assert_eq!(srgb_transfer_oetf_cpu(sub), 0.001 * 12.92);
+
+    // Linear sub-threshold region negative value
+    let neg = -0.5_f32;
+    assert_eq!(srgb_transfer_oetf_cpu(neg), -0.5 * 12.92);
 }
