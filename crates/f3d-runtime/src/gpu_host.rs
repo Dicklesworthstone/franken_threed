@@ -368,6 +368,8 @@ pub const OPCODE_RENDER_PASS_DEPTH: u16 = 13;
 pub const OPCODE_CREATE_PIPELINE_CULL: u16 = 14;
 /// Opcode for creating a render pipeline with depth state, face culling, and front-face winding state.
 pub const OPCODE_CREATE_PIPELINE_DEPTH_CULL: u16 = 15;
+/// Opcode for creating a render pipeline with depth state, face culling, front-face winding state, and color write mask.
+pub const OPCODE_CREATE_PIPELINE_DEPTH_CULL_COLOR: u16 = 16;
 
 /// Face culling mode: do not cull any faces (Three.js DoubleSide).
 pub const CULL_MODE_NONE: u32 = 0;
@@ -741,6 +743,35 @@ pub enum GpuCommand {
         cull_mode: u32,
         /// Front-facing winding order (0 = CCW, 1 = CW).
         front_face: u32,
+    },
+    /// Command to compile and create a render pipeline with depth state, explicit face culling, front-face winding state, and color write mask.
+    CreatePipelineDepthCullColor {
+        /// Unique integer identifier for the pipeline.
+        pipeline_id: u32,
+        /// Complete WGSL shader source code.
+        wgsl_code: String,
+        /// Color attachment format code (0 = preferred canvas, 1 = bgra8unorm, 2 = rgba8unorm).
+        target_format: u32,
+        /// Whether the pipeline consumes a vertex buffer at location 0.
+        has_vertex_buffer: bool,
+        /// Whether the pipeline consumes a dynamic uniform buffer at binding 0.
+        has_uniform_buffer: bool,
+        /// Explicit uniform buffer binding byte size.
+        uniform_size: u32,
+        /// Explicit vertex array byte stride.
+        vertex_stride: u32,
+        /// Depth texture format code (3 = depth24plus, 4 = depth32float).
+        depth_format: u32,
+        /// Whether depth writes are enabled.
+        depth_write_enabled: bool,
+        /// Depth comparison function code (1..=8).
+        depth_compare: u32,
+        /// Face culling mode (0 = None, 1 = Front, 2 = Back).
+        cull_mode: u32,
+        /// Front-facing winding order (0 = CCW, 1 = CW).
+        front_face: u32,
+        /// Color write mask (0 = None, 0xF = All, etc.).
+        write_mask: u32,
     },
     /// Command to encode and execute a complete render pass with a depth attachment.
     RenderPassDepth {
@@ -1168,6 +1199,55 @@ impl GpuSubmissionPacket {
                     command_records.extend_from_slice(&depth_compare.to_le_bytes());
                     command_records.extend_from_slice(&cull_mode.to_le_bytes());
                     command_records.extend_from_slice(&front_face.to_le_bytes());
+                }
+                GpuCommand::CreatePipelineDepthCullColor {
+                    pipeline_id,
+                    wgsl_code,
+                    target_format,
+                    has_vertex_buffer,
+                    has_uniform_buffer,
+                    uniform_size,
+                    vertex_stride,
+                    depth_format,
+                    depth_write_enabled,
+                    depth_compare,
+                    cull_mode,
+                    front_face,
+                    write_mask,
+                } => {
+                    let bytes = wgsl_code.as_bytes();
+                    let code_len = u32::try_from(bytes.len()).map_err(|_| PacketEncodeError::CommandDataOverflow {
+                        command_index: cmd_idx,
+                        length: bytes.len(),
+                    })?;
+                    let current_len = data_payload.len();
+                    if current_len.checked_add(bytes.len()).map_or(true, |sum| sum > max_payload_len) {
+                        return Err(PacketEncodeError::DataPayloadOverflow {
+                            offset: current_len,
+                            length: bytes.len(),
+                        });
+                    }
+                    let code_offset = u32::try_from(current_len).map_err(|_| PacketEncodeError::DataPayloadOverflow {
+                        offset: current_len,
+                        length: bytes.len(),
+                    })?;
+                    data_payload.extend_from_slice(bytes);
+
+                    command_records.extend_from_slice(&OPCODE_CREATE_PIPELINE_DEPTH_CULL_COLOR.to_le_bytes());
+                    command_records.extend_from_slice(&pipeline_id.to_le_bytes());
+                    command_records.extend_from_slice(&code_offset.to_le_bytes());
+                    command_records.extend_from_slice(&code_len.to_le_bytes());
+                    command_records.extend_from_slice(&target_format.to_le_bytes());
+                    command_records.extend_from_slice(&(if *has_vertex_buffer { 1u32 } else { 0u32 }).to_le_bytes());
+                    command_records.extend_from_slice(&(if *has_uniform_buffer { 1u32 } else { 0u32 }).to_le_bytes());
+                    command_records.extend_from_slice(&uniform_size.to_le_bytes());
+                    command_records.extend_from_slice(&vertex_stride.to_le_bytes());
+                    command_records.extend_from_slice(&depth_format.to_le_bytes());
+                    command_records.extend_from_slice(&(if *depth_write_enabled { 1u32 } else { 0u32 }).to_le_bytes());
+                    command_records.extend_from_slice(&depth_compare.to_le_bytes());
+                    command_records.extend_from_slice(&cull_mode.to_le_bytes());
+                    command_records.extend_from_slice(&front_face.to_le_bytes());
+                    command_records.extend_from_slice(&write_mask.to_le_bytes());
                 }
                 GpuCommand::RenderPassDepth {
                     target_type,

@@ -27,6 +27,7 @@ export const OPCODE_CREATE_PIPELINE_DEPTH = 12;
 export const OPCODE_RENDER_PASS_DEPTH = 13;
 export const OPCODE_CREATE_PIPELINE_CULL = 14;
 export const OPCODE_CREATE_PIPELINE_DEPTH_CULL = 15;
+export const OPCODE_CREATE_PIPELINE_DEPTH_CULL_COLOR = 16;
 
 export const CULL_MODE_NAMES = {
   0: "none",
@@ -626,10 +627,12 @@ export class WebGpuBridgeHost {
           }
 
           case OPCODE_CREATE_PIPELINE_DEPTH:
-          case OPCODE_CREATE_PIPELINE_DEPTH_CULL: {
+          case OPCODE_CREATE_PIPELINE_DEPTH_CULL:
+          case OPCODE_CREATE_PIPELINE_DEPTH_CULL_COLOR: {
             closeActivePass();
-            const hasCullFields = (opcode === OPCODE_CREATE_PIPELINE_DEPTH_CULL);
-            const expectedHeaderSize = hasCullFields ? 52 : 44;
+            const hasColorFields = (opcode === OPCODE_CREATE_PIPELINE_DEPTH_CULL_COLOR);
+            const hasCullFields = (opcode === OPCODE_CREATE_PIPELINE_DEPTH_CULL || hasColorFields);
+            const expectedHeaderSize = hasColorFields ? 56 : (hasCullFields ? 52 : 44);
             if (cursor + expectedHeaderSize > dataBlockStart) {
               throw new Error(`Truncated CREATE_PIPELINE_DEPTH fields at command ${i}`);
             }
@@ -646,9 +649,13 @@ export class WebGpuBridgeHost {
             const depthCompareCode = dataView.getUint32(cursor + 40, true);
             let cullModeCode = 0;
             let frontFaceCode = 0;
+            let writeMask = 0xF;
             if (hasCullFields) {
               cullModeCode = dataView.getUint32(cursor + 44, true);
               frontFaceCode = dataView.getUint32(cursor + 48, true);
+            }
+            if (hasColorFields) {
+              writeMask = dataView.getUint32(cursor + 52, true);
             }
             cursor += expectedHeaderSize;
 
@@ -742,7 +749,7 @@ export class WebGpuBridgeHost {
               fragment: {
                 module: shaderModule,
                 entryPoint: "fs_main",
-                targets: [{ format: format }],
+                targets: [{ format: format, writeMask: writeMask }],
               },
               primitive: {
                 topology: "triangle-list",
@@ -765,6 +772,9 @@ export class WebGpuBridgeHost {
               depthFormat,
               depthWriteEnabled,
               depthCompare,
+              cullMode,
+              frontFace,
+              writeMask,
             });
             break;
           }
@@ -1271,6 +1281,8 @@ export class WebGpuBridgeHost {
                   scanCursor += 44;
                 } else if (nextOp === OPCODE_CREATE_PIPELINE_DEPTH_CULL) {
                   scanCursor += 52;
+                } else if (nextOp === OPCODE_CREATE_PIPELINE_DEPTH_CULL_COLOR) {
+                  scanCursor += 56;
                 } else if (nextOp === OPCODE_COPY_TEXTURE_TO_BUFFER) {
                   scanCursor += 24;
                 } else if (nextOp === OPCODE_RECORD_BUNDLE) {
