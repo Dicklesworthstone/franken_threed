@@ -431,3 +431,136 @@ fn test_fixture_tri1_pixel_center_ndc_mapping_and_containment() {
         "pixel center (2.5, 2.5) at NDC (-0.921875, 0.921875) must be outside tri1"
     );
 }
+
+#[test]
+fn test_line3_distance_sq_triangle_interpolation_and_copy() {
+    // 1. Line3 copy round-trip
+    let l_orig = Line3::new(Vector3::new(1.0, 2.0, 3.0), Vector3::new(4.0, 5.0, 6.0));
+    let mut l_copy = Line3::default();
+    l_copy.copy(&l_orig);
+    assert!(l_copy.equals(&l_orig), "line3 copy equals");
+    assert_vec_close(&l_copy.start, [1.0, 2.0, 3.0], EPS, "line3 copy start");
+    assert_vec_close(&l_copy.end, [4.0, 5.0, 6.0], EPS, "line3 copy end");
+
+    // 2. Line3 distance_sq_to_line3:
+    // a) Parallel segments
+    let l_par1 = Line3::new(Vector3::new(0.0, 0.0, 0.0), Vector3::new(2.0, 0.0, 0.0));
+    let l_par2 = Line3::new(Vector3::new(0.0, 1.0, 0.0), Vector3::new(2.0, 1.0, 0.0));
+    let mut c1 = Vector3::zero();
+    let mut c2 = Vector3::zero();
+    let d_par = l_par1.distance_sq_to_line3(&l_par2, Some(&mut c1), Some(&mut c2));
+    assert_close(d_par, 1.0, EPS, "parallel distance_sq");
+    assert_vec_close(&c1, [0.0, 0.0, 0.0], EPS, "parallel c1");
+    assert_vec_close(&c2, [0.0, 1.0, 0.0], EPS, "parallel c2");
+
+    // b) Skew segments
+    let l_skew1 = Line3::new(Vector3::new(0.0, 0.0, 0.0), Vector3::new(2.0, 0.0, 0.0));
+    let l_skew2 = Line3::new(Vector3::new(1.0, 1.0, -1.0), Vector3::new(1.0, 1.0, 1.0));
+    let d_skew = l_skew1.distance_sq_to_line3(&l_skew2, Some(&mut c1), Some(&mut c2));
+    assert_close(d_skew, 1.0, EPS, "skew distance_sq");
+    assert_vec_close(&c1, [1.0, 0.0, 0.0], EPS, "skew c1");
+    assert_vec_close(&c2, [1.0, 1.0, 0.0], EPS, "skew c2");
+
+    // c) Segments sharing an endpoint
+    let l_share1 = Line3::new(Vector3::new(0.0, 0.0, 0.0), Vector3::new(1.0, 0.0, 0.0));
+    let l_share2 = Line3::new(Vector3::new(1.0, 0.0, 0.0), Vector3::new(1.0, 1.0, 0.0));
+    let d_share = l_share1.distance_sq_to_line3(&l_share2, Some(&mut c1), Some(&mut c2));
+    assert_close(d_share, 0.0, EPS, "shared endpoint distance_sq");
+    assert_vec_close(&c1, [1.0, 0.0, 0.0], EPS, "shared endpoint c1");
+    assert_vec_close(&c2, [1.0, 0.0, 0.0], EPS, "shared endpoint c2");
+
+    // d) Degenerate zero-length segment
+    let l_deg1 = Line3::new(Vector3::new(1.0, 2.0, 0.0), Vector3::new(1.0, 2.0, 0.0));
+    let l_seg2 = Line3::new(Vector3::new(0.0, 0.0, 0.0), Vector3::new(2.0, 0.0, 0.0));
+    let d_deg = l_deg1.distance_sq_to_line3(&l_seg2, Some(&mut c1), Some(&mut c2));
+    assert_close(d_deg, 4.0, EPS, "degenerate segment distance_sq");
+    assert_vec_close(&c1, [1.0, 2.0, 0.0], EPS, "degenerate segment c1");
+    assert_vec_close(&c2, [1.0, 0.0, 0.0], EPS, "degenerate segment c2");
+
+    // d2) Double-degenerate segments (both zero-length): verifies surprising c1 = p1 - p2 behavior
+    let l_both_deg1 = Line3::new(Vector3::new(1.0, 2.0, 3.0), Vector3::new(1.0, 2.0, 3.0));
+    let l_both_deg2 = Line3::new(Vector3::new(4.0, 6.0, 3.0), Vector3::new(4.0, 6.0, 3.0));
+    let d_both_deg = l_both_deg1.distance_sq_to_line3(&l_both_deg2, Some(&mut c1), Some(&mut c2));
+    assert_close(d_both_deg, 25.0, EPS, "double degenerate distance_sq");
+    assert_vec_close(&c1, [-3.0, -4.0, 0.0], EPS, "double degenerate c1 (diff)");
+    assert_vec_close(&c2, [4.0, 6.0, 3.0], EPS, "double degenerate c2 (p2)");
+
+    // d3) Endpoint clamp case (general branch where t < 0 clamps t=0 and re-clamps s)
+    let l_clamp1 = Line3::new(Vector3::new(0.0, 0.0, 0.0), Vector3::new(2.0, 0.0, 0.0));
+    let l_clamp2 = Line3::new(Vector3::new(3.0, 1.0, 0.0), Vector3::new(3.0, 3.0, 0.0));
+    let d_clamp = l_clamp1.distance_sq_to_line3(&l_clamp2, Some(&mut c1), Some(&mut c2));
+    assert_close(d_clamp, 2.0, EPS, "endpoint clamp distance_sq");
+    assert_vec_close(&c1, [2.0, 0.0, 0.0], EPS, "endpoint clamp c1");
+    assert_vec_close(&c2, [3.0, 1.0, 0.0], EPS, "endpoint clamp c2");
+
+    // e) None targets call
+    let d_none = l_skew1.distance_sq_to_line3(&l_skew2, None, None);
+    assert_close(d_none, 1.0, EPS, "distance_sq with None targets");
+
+    // 3. Triangle copy round-trip
+    let t_orig = Triangle::new(
+        Vector3::new(1.0, 2.0, 3.0),
+        Vector3::new(4.0, 5.0, 6.0),
+        Vector3::new(7.0, 8.0, 9.0),
+    );
+    let mut t_copy = Triangle::default();
+    t_copy.copy(&t_orig);
+    assert!(t_copy.equals(&t_orig), "triangle copy equals");
+    assert_vec_close(&t_copy.a, [1.0, 2.0, 3.0], EPS, "triangle copy a");
+    assert_vec_close(&t_copy.b, [4.0, 5.0, 6.0], EPS, "triangle copy b");
+    assert_vec_close(&t_copy.c, [7.0, 8.0, 9.0], EPS, "triangle copy c");
+
+    // 4. Triangle set_from_points_and_indices with non-sequential indices
+    let points = [
+        Vector3::new(10.0, 11.0, 12.0),
+        Vector3::new(20.0, 21.0, 22.0),
+        Vector3::new(30.0, 31.0, 32.0),
+        Vector3::new(40.0, 41.0, 42.0),
+        Vector3::new(50.0, 51.0, 52.0),
+    ];
+    let mut tri_indexed = Triangle::default();
+    tri_indexed.set_from_points_and_indices(&points, 3, 0, 4);
+    assert_vec_close(&tri_indexed.a, [40.0, 41.0, 42.0], EPS, "indexed a (index 3)");
+    assert_vec_close(&tri_indexed.b, [10.0, 11.0, 12.0], EPS, "indexed b (index 0)");
+    assert_vec_close(&tri_indexed.c, [50.0, 51.0, 52.0], EPS, "indexed c (index 4)");
+
+    // 5. Triangle get_interpolation:
+    // P = (0, 0, 0), (2, 0, 0), (0, 2, 0)
+    let p1 = Vector3::new(0.0, 0.0, 0.0);
+    let p2 = Vector3::new(2.0, 0.0, 0.0);
+    let p3 = Vector3::new(0.0, 2.0, 0.0);
+    let v1 = Vector3::new(10.0, 20.0, 30.0);
+    let v2 = Vector3::new(40.0, 50.0, 60.0);
+    let v3 = Vector3::new(70.0, 80.0, 90.0);
+    let tri_interp = Triangle::new(p1, p2, p3);
+
+    // a) Inside point: (0.5, 0.5, 0.0) -> bary (0.5, 0.25, 0.25) -> (32.5, 42.5, 52.5)
+    let mut target = Vector3::zero();
+    let pt_in = Vector3::new(0.5, 0.5, 0.0);
+    let res_in = tri_interp.get_interpolation(&pt_in, &v1, &v2, &v3, &mut target);
+    assert!(res_in.is_some(), "inside interpolation is Some");
+    assert_vec_close(&target, [32.5, 42.5, 52.5], EPS, "inside interpolated target");
+    assert_vec_close(&res_in.unwrap(), [32.5, 42.5, 52.5], EPS, "inside return value");
+
+    // Static get_interpolation_of on inside point
+    let mut target_static = Vector3::zero();
+    let res_static = Triangle::get_interpolation_of(&pt_in, &p1, &p2, &p3, &v1, &v2, &v3, &mut target_static);
+    assert!(res_static.is_some(), "static interpolation is Some");
+    assert_vec_close(&target_static, [32.5, 42.5, 52.5], EPS, "static interpolated target");
+
+    // b) Outside point: (2.0, 2.0, 0.0) -> bary (-1.0, 1.0, 1.0) -> (100.0, 110.0, 120.0)
+    let pt_out = Vector3::new(2.0, 2.0, 0.0);
+    let res_out = tri_interp.get_interpolation(&pt_out, &v1, &v2, &v3, &mut target);
+    assert!(res_out.is_some(), "outside interpolation is Some");
+    assert_vec_close(&target, [100.0, 110.0, 120.0], EPS, "outside interpolated target");
+
+    // c) Degenerate (collinear) triangle: points (0,0,0), (1,1,1), (2,2,2)
+    let dp1 = Vector3::new(0.0, 0.0, 0.0);
+    let dp2 = Vector3::new(1.0, 1.0, 1.0);
+    let dp3 = Vector3::new(2.0, 2.0, 2.0);
+    let mut deg_target = Vector3::new(9.0, 9.0, 9.0);
+    let pt_deg = Vector3::new(0.5, 0.5, 0.5);
+    let res_deg = Triangle::get_interpolation_of(&pt_deg, &dp1, &dp2, &dp3, &v1, &v2, &v3, &mut deg_target);
+    assert!(res_deg.is_none(), "degenerate interpolation is None");
+    assert_vec_close(&deg_target, [0.0, 0.0, 0.0], EPS, "degenerate target zeroed");
+}

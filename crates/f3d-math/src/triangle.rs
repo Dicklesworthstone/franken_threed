@@ -33,6 +33,34 @@ impl Triangle {
         self
     }
 
+    /// Copies the values of the given triangle to this instance.
+    ///
+    /// Matches Three.js r186 `Triangle.copy(triangle)`.
+    #[inline]
+    pub fn copy(&mut self, triangle: &Triangle) -> &mut Self {
+        self.a = triangle.a;
+        self.b = triangle.b;
+        self.c = triangle.c;
+        self
+    }
+
+    /// Sets the triangle's vertices by copying from points array at the specified indices.
+    ///
+    /// Matches Three.js r186 `Triangle.setFromPointsAndIndices(points, i0, i1, i2)`.
+    #[inline]
+    pub fn set_from_points_and_indices(
+        &mut self,
+        points: &[Vector3],
+        i0: usize,
+        i1: usize,
+        i2: usize,
+    ) -> &mut Self {
+        self.a = points[i0];
+        self.b = points[i1];
+        self.c = points[i2];
+        self
+    }
+
     /// Computes the unit normal vector of a triangle from three vertices.
     ///
     /// If the triangle is degenerate (zero area), returns `(0, 0, 0)`.
@@ -100,6 +128,53 @@ impl Triangle {
     #[inline]
     pub fn get_barycoord(&self, point: &Vector3) -> Option<Vector3> {
         Self::get_barycoord_of(point, &self.a, &self.b, &self.c)
+    }
+
+    /// Computes barycentrically interpolated value for `point` on triangle `(p1, p2, p3)`
+    /// given vertex values `(v1, v2, v3)`.
+    ///
+    /// Returns `None` if the triangle is degenerate.
+    /// Matches Three.js r186 `Triangle.getInterpolation(point, p1, p2, p3, v1, v2, v3, target)`.
+    pub fn get_interpolation_of(
+        point: &Vector3,
+        p1: &Vector3,
+        p2: &Vector3,
+        p3: &Vector3,
+        v1: &Vector3,
+        v2: &Vector3,
+        v3: &Vector3,
+        target: &mut Vector3,
+    ) -> Option<Vector3> {
+        match Self::get_barycoord_of(point, p1, p2, p3) {
+            None => {
+                target.set_scalar(0.0);
+                None
+            }
+            Some(bary) => {
+                target.set_scalar(0.0);
+                target.add_scaled_vector(v1, bary.x);
+                target.add_scaled_vector(v2, bary.y);
+                target.add_scaled_vector(v3, bary.z);
+                Some(*target)
+            }
+        }
+    }
+
+    /// Computes barycentrically interpolated value for `point` on this triangle
+    /// given vertex values `(v1, v2, v3)`.
+    ///
+    /// Returns `None` if the triangle is degenerate.
+    /// Matches Three.js r186 `Triangle.getInterpolation(point, v1, v2, v3, target)`.
+    #[inline]
+    pub fn get_interpolation(
+        &self,
+        point: &Vector3,
+        v1: &Vector3,
+        v2: &Vector3,
+        v3: &Vector3,
+        target: &mut Vector3,
+    ) -> Option<Vector3> {
+        Self::get_interpolation_of(point, &self.a, &self.b, &self.c, v1, v2, v3, target)
     }
 
     /// Returns `true` if `point`, when projected onto the triangle's plane, lies within the triangle.
