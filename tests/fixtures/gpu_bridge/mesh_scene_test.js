@@ -45,6 +45,7 @@ export async function directMeshReference(device, options) {
     depthCompare = "less",
     depthClearValue = 1.0,
     outputSrgb = false,
+    draws = null,
   } = options;
 
   const bytesPerRow = Math.ceil((width * 4) / 256) * 256;
@@ -64,48 +65,6 @@ export async function directMeshReference(device, options) {
     size: bytesPerRow * height,
     usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
   });
-
-  // Stride 20 bytes: 3 floats position [x, y, z] + 2 floats uv [0, 0]
-  const vertexCount = positions.length / 3;
-  const vertexData = new Float32Array(vertexCount * 5);
-  for (let i = 0; i < vertexCount; i++) {
-    vertexData[i * 5 + 0] = positions[i * 3 + 0];
-    vertexData[i * 5 + 1] = positions[i * 3 + 1];
-    vertexData[i * 5 + 2] = positions[i * 3 + 2];
-    vertexData[i * 5 + 3] = 0.0;
-    vertexData[i * 5 + 4] = 0.0;
-  }
-
-  const vertexBuffer = device.createBuffer({
-    size: Math.max(vertexData.byteLength, 16),
-    usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
-  });
-  device.queue.writeBuffer(vertexBuffer, 0, vertexData);
-
-  let indexBuffer = null;
-  const isIndexed = indices && indices.length > 0;
-  if (isIndexed) {
-    indexBuffer = device.createBuffer({
-      size: Math.max(indices.byteLength, 16),
-      usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
-    });
-    device.queue.writeBuffer(indexBuffer, 0, indices);
-  }
-
-  // 144 bytes uniform struct (padded to 256 for standard alignment):
-  // offset 0..64: model_view mat4x4<f32>
-  // offset 64..128: projection mat4x4<f32>
-  // offset 128..144: color vec4<f32>
-  const uniformData = new Float32Array(64); // 256 bytes
-  uniformData.set(new Float32Array(modelView), 0);
-  uniformData.set(new Float32Array(projection), 16);
-  uniformData.set(new Float32Array(color), 32);
-
-  const uniformBuffer = device.createBuffer({
-    size: 256,
-    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-  });
-  device.queue.writeBuffer(uniformBuffer, 0, uniformData);
 
   const remapDepthWgsl = webglDepth
     ? "clip.z = (clip.z + clip.w) * 0.5;"
@@ -181,11 +140,6 @@ export async function directMeshReference(device, options) {
     ],
   });
 
-  const bindGroup = device.createBindGroup({
-    layout: bindGroupLayout,
-    entries: [{ binding: 0, resource: { buffer: uniformBuffer } }],
-  });
-
   const pipelineLayout = device.createPipelineLayout({
     bindGroupLayouts: [bindGroupLayout],
   });
@@ -223,6 +177,71 @@ export async function directMeshReference(device, options) {
       : undefined,
   });
 
+  const drawList = (draws && draws.length > 0)
+    ? draws
+    : [{ positions, indices, modelView, color, projection }];
+
+  const preparedDraws = [];
+  for (const item of drawList) {
+    const itemPositions = item.positions;
+    const itemIndices = item.indices;
+    const itemModelView = item.modelView;
+    const itemColor = item.color;
+    const itemProjection = item.projection || projection;
+
+    const vCount = itemPositions.length / 3;
+    const vData = new Float32Array(vCount * 5);
+    for (let i = 0; i < vCount; i++) {
+      vData[i * 5 + 0] = itemPositions[i * 3 + 0];
+      vData[i * 5 + 1] = itemPositions[i * 3 + 1];
+      vData[i * 5 + 2] = itemPositions[i * 3 + 2];
+      vData[i * 5 + 3] = 0.0;
+      vData[i * 5 + 4] = 0.0;
+    }
+
+    const vBuffer = device.createBuffer({
+      size: Math.max(vData.byteLength, 16),
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    });
+    device.queue.writeBuffer(vBuffer, 0, vData);
+
+    let iBuffer = null;
+    const itemIsIndexed = itemIndices && itemIndices.length > 0;
+    if (itemIsIndexed) {
+      iBuffer = device.createBuffer({
+        size: Math.max(itemIndices.byteLength, 16),
+        usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+      });
+      device.queue.writeBuffer(iBuffer, 0, itemIndices);
+    }
+
+    const uData = new Float32Array(64); // 256 bytes
+    uData.set(new Float32Array(itemModelView), 0);
+    uData.set(new Float32Array(itemProjection), 16);
+    uData.set(new Float32Array(itemColor), 32);
+
+    const uBuffer = device.createBuffer({
+      size: 256,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    device.queue.writeBuffer(uBuffer, 0, uData);
+
+    const bGroup = device.createBindGroup({
+      layout: bindGroupLayout,
+      entries: [{ binding: 0, resource: { buffer: uBuffer } }],
+    });
+
+    preparedDraws.push({
+      vertexBuffer: vBuffer,
+      indexBuffer: iBuffer,
+      uniformBuffer: uBuffer,
+      bindGroup: bGroup,
+      vertexCount: vCount,
+      isIndexed: itemIsIndexed,
+      indicesLength: itemIsIndexed ? itemIndices.length : 0,
+    });
+  }
+
   device.pushErrorScope("validation");
   let scopeOpen = true;
   try {
@@ -247,13 +266,15 @@ export async function directMeshReference(device, options) {
     }
     const pass = encoder.beginRenderPass(passDesc);
     pass.setPipeline(pipeline);
-    pass.setBindGroup(0, bindGroup);
-    pass.setVertexBuffer(0, vertexBuffer);
-    if (isIndexed) {
-      pass.setIndexBuffer(indexBuffer, "uint32");
-      pass.drawIndexed(indices.length, 1, 0, 0, 0);
-    } else {
-      pass.draw(vertexCount, 1, 0, 0);
+    for (const draw of preparedDraws) {
+      pass.setBindGroup(0, draw.bindGroup);
+      pass.setVertexBuffer(0, draw.vertexBuffer);
+      if (draw.isIndexed) {
+        pass.setIndexBuffer(draw.indexBuffer, "uint32");
+        pass.drawIndexed(draw.indicesLength, 1, 0, 0, 0);
+      } else {
+        pass.draw(draw.vertexCount, 1, 0, 0);
+      }
     }
     pass.end();
 
@@ -281,9 +302,11 @@ export async function directMeshReference(device, options) {
     target.destroy();
     readback.destroy();
     if (depthTexture) depthTexture.destroy();
-    vertexBuffer.destroy();
-    if (indexBuffer) indexBuffer.destroy();
-    uniformBuffer.destroy();
+    for (const draw of preparedDraws) {
+      draw.vertexBuffer.destroy();
+      if (draw.indexBuffer) draw.indexBuffer.destroy();
+      draw.uniformBuffer.destroy();
+    }
   }
 }
 
@@ -293,6 +316,16 @@ export function differs(a, b) {
     if (a[i] !== b[i]) return true;
   }
   return false;
+}
+
+export function nextFrame() {
+  return new Promise(resolve => {
+    if (typeof requestAnimationFrame === "function") {
+      requestAnimationFrame(() => resolve());
+    } else {
+      setTimeout(resolve, 16);
+    }
+  });
 }
 
 /**
@@ -360,6 +393,31 @@ function buildIndependentReferenceInput(mesh, camera, width = 64, height = 64) {
   };
 }
 
+/**
+ * Builds reference batch inputs INDEPENDENTLY from an ordered array of Three.js Mesh instances.
+ * Extracts per-mesh positions, indices, modelView, and colors directly from source objects.
+ */
+function buildIndependentBatchReferenceInput(meshes, camera, width = 64, height = 64, extraOptions = {}) {
+  const draws = meshes.map((m) => {
+    const single = buildIndependentReferenceInput(m, camera, width, height);
+    return {
+      positions: single.positions,
+      indices: single.indices,
+      modelView: single.modelView,
+      color: single.color,
+    };
+  });
+  const first = buildIndependentReferenceInput(meshes[0], camera, width, height);
+  return {
+    draws,
+    projection: first.projection,
+    webglDepth: first.webglDepth,
+    width,
+    height,
+    ...extraOptions,
+  };
+}
+
 async function loadProductionThree(customThree) {
   let THREE = customThree || (typeof window !== "undefined" ? window.THREE : null);
   if (!THREE) {
@@ -407,7 +465,7 @@ async function loadProductionAdapter(customAdapter) {
  * antialias: false, NoToneMapping, outputColorSpace: SRGBColorSpace.
  * Reads center pixel via gl.readPixels to provide ground-truth Three.js parity.
  */
-function renderRetainedWebGLReference(THREE, mesh, camera, width = 64, height = 64) {
+function renderRetainedWebGLReference(THREE, meshOrMeshes, camera, width = 64, height = 64) {
   if (typeof document === "undefined" || typeof document.createElement !== "function") {
     throw new Error("Retained WebGLRenderer reference oracle requires a DOM document environment");
   }
@@ -425,7 +483,10 @@ function renderRetainedWebGLReference(THREE, mesh, camera, width = 64, height = 
     renderer.outputColorSpace = THREE.SRGBColorSpace;
 
     const scene = new THREE.Scene();
-    scene.add(mesh);
+    const meshList = Array.isArray(meshOrMeshes) ? meshOrMeshes : [meshOrMeshes];
+    for (const m of meshList) {
+      scene.add(m);
+    }
     renderer.render(scene, camera);
 
     const gl = renderer.getContext();
@@ -943,6 +1004,10 @@ export async function testVisibleCanvasMeshScene(bridgeHost, wasmExports, canvas
     // Pinned Three.js r186 WebGPURenderer applies outputColorSpace sRGB encoding
     // to canvas outputs. We verify candidate Wasm canvas execution against real
     // retained WebGLRenderer on its own isolated canvas/context.
+    // Checkpoint 2 moved the triangle away from the center sample. Restore it
+    // so this comparison observes fragment output, rather than two clear pixels.
+    mesh.position.x = 0;
+    mesh.updateMatrixWorld(true);
     mesh.material.color.setRGB(0.5, 0.5, 0.5);
 
     const { packetBytes: midtonePacket } = adapter.prepareCanvasMeshPacket(
@@ -957,6 +1022,9 @@ export async function testVisibleCanvasMeshScene(bridgeHost, wasmExports, canvas
 
     // Run real retained Three.js WebGLRenderer oracle on its own isolated canvas
     const oracleCenter = renderRetainedWebGLReference(THREE, mesh, camera, width, height);
+    if (oracleCenter.slice(0, 3).some(channel => Math.abs(channel - 188) > 2)) {
+      throw new Error(`Midtone reference did not cover the sample with sRGB gray: [${oracleCenter}]`);
+    }
 
     // Read candidate center pixel (handling BGRA vs RGBA preferredCanvasFormat)
     const candR = candidateMidtonePixels[centerIdx + rCh];
@@ -1312,6 +1380,15 @@ export async function testMeshDepthScene(bridgeHost, wasmExports, canvasContext 
     }
 
     const canvasFormat = navigator.gpu.getPreferredCanvasFormat();
+
+    canvasContext.configure({
+      device,
+      format: canvasFormat,
+      alphaMode: "opaque",
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+    });
+    await nextFrame();
+
     const { packetBytes: canvasDepthPacket } = adapter.prepareCanvasMeshDepthPacket
       ? adapter.prepareCanvasMeshDepthPacket(meshNear, camera, width, height, wasmExports)
       : adapter.prepareCanvasMeshPacket(meshNear, camera, width, height, wasmExports);
@@ -1350,9 +1427,1042 @@ export async function testMeshDepthScene(bridgeHost, wasmExports, canvasContext 
     );
 
     if (differs(canvasPixels, refCanvas)) {
-      throw new Error("Checkpoint 6 failed: Visible canvas mesh depth pixels differ from direct WebGPU reference in canvas format");
+      const diffs = [];
+      let maxDiff = 0;
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          const idx = y * bytesPerRow + x * 4;
+          const c = [canvasPixels[idx], canvasPixels[idx + 1], canvasPixels[idx + 2], canvasPixels[idx + 3]];
+          const r = [refCanvas[idx], refCanvas[idx + 1], refCanvas[idx + 2], refCanvas[idx + 3]];
+          const dR = Math.abs(c[0] - r[0]);
+          const dG = Math.abs(c[1] - r[1]);
+          const dB = Math.abs(c[2] - r[2]);
+          const dA = Math.abs(c[3] - r[3]);
+          const d = Math.max(dR, dG, dB, dA);
+          if (d > 0) {
+            if (d > maxDiff) maxDiff = d;
+            if (diffs.length < 8) {
+              diffs.push(`(${x},${y}): cand=[${c}] ref=[${r}] diff=[${dR},${dG},${dB},${dA}]`);
+            }
+          }
+        }
+      }
+      throw new Error(
+        `Checkpoint 6 failed: Visible canvas mesh depth pixels differ from direct WebGPU reference in canvas format (${canvasFormat}). ` +
+        `Matched settings: depthFormat=depth24plus, depthCompare=less, depthWrite=false, outputSrgb=true. ` +
+        `Max component diff: ${maxDiff}. Sample differing pixels: ${diffs.join("; ")}`
+      );
     }
   }
 
   return "Real THREE.Mesh depthTest/depthWrite/depthFunc mutation verified (depth24plus): LessDepth produces visible mesh matching direct WebGPU reference; NeverDepth suppresses rendering (clear color preserved); AlwaysDepth renders visible mesh; depthTest=false without sourceBackend refused (AMBIGUOUS_DEPTH_PAIR); sourceBackend='webgpu' enables depthWrite flag; sourceBackend='webgl' suppresses depthWrite flag; depthWrite=false flag and selected cases verified against independent oracle (single-mesh draw verifies pipeline write flags, multi-object occlusion verified by static depth fixture)" + (canvasContext ? "; visible canvas mesh depth verified against direct reference" : "");
+}
+
+/**
+ * Suite 4: Variable-length multi-mesh production batch scene verification suite.
+ *
+ * Verification Requirements:
+ * 1. Variable-length multi-mesh production path via prepareMeshBatchPacket / renderMeshBatch.
+ * 2. Actual two overlapping meshes with DISTINCT near/far colors:
+ *    - Near quad at z = -2.0, Green [0, 1, 0, 1]
+ *    - Far quad at z = -4.0, Red [1, 0, 0, 1]
+ * 3. Proves depth writes:
+ *    - Checkpoint 1: Near-first, far-second with depthWrite = true -> near color wins (Green occluding Red).
+ *      Matches independent direct WebGPU reference bit-for-bit.
+ *    - Checkpoint 2: Near-first, far-second with depthWrite = false -> far color overwrites near (Red).
+ *      Matches independent direct WebGPU reference bit-for-bit, and strictly diverges from Checkpoint 1 (Green vs Red).
+ *    - Checkpoint 3: Far-first, near-second with depthWrite = true -> near color overwrites far (Green).
+ *      Matches independent direct WebGPU reference bit-for-bit.
+ * 4. Checkpoint 4: Proves immutable snapshots with distinct dynamic transforms and colors.
+ * 5. Checkpoint 5: Negative controls / refusal testing:
+ *    - 5a: Refusal of empty mesh batch (EMPTY_MESH_BATCH).
+ *    - 5b: Refusal of incompatible shared depth settings across meshes (INCOMPATIBLE_BATCH_DEPTH).
+ *    - 5c: Refusal of inadmissible mesh in batch with exact index.
+ * 6. Checkpoint 6: Retained WebGLRenderer multi-mesh oracle parity.
+ * 7. Checkpoint 7: Visible canvas multi-mesh batch presentation (when canvasContext is provided).
+ *
+ * @param {WebGpuBridgeHost} bridgeHost
+ * @param {object} wasmExports
+ * @param {GPUCanvasContext} [canvasContext]
+ * @param {HTMLCanvasElement} [canvas]
+ * @returns {Promise<string>}
+ */
+export async function testMultiMeshBatchScene(bridgeHost, wasmExports, canvasContext = null, canvas = null) {
+  const buildBatchFn =
+    wasmExports?.f3d_build_mesh_batch_packet ||
+    wasmExports?.gpu_bridge_build_mesh_batch_packet;
+
+  if (typeof buildBatchFn !== "function") {
+    throw new Error(
+      "Missing required Wasm mesh batch export: f3d_build_mesh_batch_packet / gpu_bridge_build_mesh_batch_packet"
+    );
+  }
+
+  const THREE = await loadProductionThree();
+  const adapter = await loadProductionAdapter();
+
+  if (typeof adapter.prepareMeshBatchPacket !== "function") {
+    throw new Error("Missing required prepareMeshBatchPacket in production mesh_adapter.mjs");
+  }
+  if (typeof adapter.renderMeshBatch !== "function") {
+    throw new Error("Missing required renderMeshBatch in production mesh_adapter.mjs");
+  }
+  if (typeof adapter.renderScene !== "function") {
+    throw new Error("Missing required renderScene in production mesh_adapter.mjs");
+  }
+
+  const device = bridgeHost.device;
+  const width = 64;
+  const height = 64;
+  const bytesPerRow = Math.ceil((width * 4) / 256) * 256;
+  const centerIdx = 32 * bytesPerRow + 32 * 4;
+
+  const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 100);
+  camera.position.set(0, 0, 0);
+  camera.lookAt(0, 0, -1);
+  camera.updateMatrixWorld(true);
+  camera.updateProjectionMatrix();
+
+  // Near triangle: z = -2.0, Green (unindexed 3 vertices, strictly enclosing center in solid interior)
+  const geomNear = new THREE.BufferGeometry();
+  const posNear = new Float32Array([
+    -2.0, -1.5, -2.0,
+     2.0, -1.5, -2.0,
+     0.0,  2.0, -2.0,
+  ]);
+  geomNear.setAttribute("position", new THREE.BufferAttribute(posNear, 3));
+
+  const matNear = new THREE.MeshBasicMaterial({
+    color: 0x00ff00, // Green [0, 1, 0, 1]
+    side: THREE.DoubleSide,
+    depthTest: true,
+    depthWrite: true,
+    depthFunc: THREE.LessDepth,
+  });
+  const meshNear = new THREE.Mesh(geomNear, matNear);
+  meshNear.updateMatrixWorld(true);
+
+  // Far triangle: z = -4.0, Red (indexed 3 vertices, strictly enclosing center in solid interior)
+  const geomFar = new THREE.BufferGeometry();
+  const posFar = new Float32Array([
+    -3.0, -2.5, -4.0,
+     3.0, -2.5, -4.0,
+     0.0,  3.5, -4.0,
+  ]);
+  geomFar.setAttribute("position", new THREE.BufferAttribute(posFar, 3));
+  geomFar.setIndex([0, 1, 2]);
+
+  const matFar = new THREE.MeshBasicMaterial({
+    color: 0xff0000, // Red [1, 0, 0, 1]
+    side: THREE.DoubleSide,
+    depthTest: true,
+    depthWrite: true,
+    depthFunc: THREE.LessDepth,
+  });
+  const meshFar = new THREE.Mesh(geomFar, matFar);
+  meshFar.updateMatrixWorld(true);
+
+  // ---------------------------------------------------------------------------
+  // Checkpoint 1: Near-first, far-second with depthWrite = true -> Green
+  // ---------------------------------------------------------------------------
+  meshNear.material.depthWrite = true;
+  meshFar.material.depthWrite = true;
+  meshNear.material.needsUpdate = true;
+  meshFar.material.needsUpdate = true;
+
+  await adapter.renderMeshBatch(
+    bridgeHost,
+    [meshNear, meshFar],
+    camera,
+    null,
+    wasmExports,
+    { width, height }
+  );
+  const candidate1 = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+
+  const ref1 = await directMeshReference(
+    device,
+    buildIndependentBatchReferenceInput(
+      [meshNear, meshFar],
+      camera,
+      width,
+      height,
+      {
+        hasDepth: true,
+        depthFormat: "depth24plus",
+        depthWriteEnabled: true,
+        depthCompare: "less",
+      }
+    )
+  );
+
+  // Assert demonstrably covered non-clear pixel (must not pass from agreeing on clear pixels)
+  if (candidate1[centerIdx] === 0 && candidate1[centerIdx + 1] === 0 && candidate1[centerIdx + 2] === 0) {
+    throw new Error(
+      "Checkpoint 1 failed: Candidate center pixel is clear color (black); triangles must demonstrably cover the sample"
+    );
+  }
+  if (ref1[centerIdx] === 0 && ref1[centerIdx + 1] === 0 && ref1[centerIdx + 2] === 0) {
+    throw new Error(
+      "Checkpoint 1 failed: Reference center pixel is clear color (black); triangles must demonstrably cover the sample"
+    );
+  }
+
+  if (differs(candidate1, ref1)) {
+    throw new Error(
+      "Checkpoint 1 failed: Near-first, far-second with depthWrite=true differs from independent direct WebGPU reference"
+    );
+  }
+
+  if (candidate1[centerIdx + 1] < 240 || candidate1[centerIdx] > 15) {
+    throw new Error(
+      `Checkpoint 1 failed: Expected Green center pixel for depthWrite=true occlusion, got [${candidate1[centerIdx]}, ${candidate1[centerIdx + 1]}, ${candidate1[centerIdx + 2]}]`
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Checkpoint 2: Near-first, far-second with depthWrite = false -> Red
+  // ---------------------------------------------------------------------------
+  meshNear.material.depthWrite = false;
+  meshFar.material.depthWrite = false;
+  meshNear.material.needsUpdate = true;
+  meshFar.material.needsUpdate = true;
+
+  await adapter.renderMeshBatch(
+    bridgeHost,
+    [meshNear, meshFar],
+    camera,
+    null,
+    wasmExports,
+    { width, height }
+  );
+  const candidate2 = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+
+  const ref2 = await directMeshReference(
+    device,
+    buildIndependentBatchReferenceInput(
+      [meshNear, meshFar],
+      camera,
+      width,
+      height,
+      {
+        hasDepth: true,
+        depthFormat: "depth24plus",
+        depthWriteEnabled: false,
+        depthCompare: "less",
+      }
+    )
+  );
+
+  // Assert demonstrably covered non-clear pixel (must not pass from agreeing on clear pixels)
+  if (candidate2[centerIdx] === 0 && candidate2[centerIdx + 1] === 0 && candidate2[centerIdx + 2] === 0) {
+    throw new Error(
+      "Checkpoint 2 failed: Candidate center pixel is clear color (black); triangles must demonstrably cover the sample"
+    );
+  }
+  if (ref2[centerIdx] === 0 && ref2[centerIdx + 1] === 0 && ref2[centerIdx + 2] === 0) {
+    throw new Error(
+      "Checkpoint 2 failed: Reference center pixel is clear color (black); triangles must demonstrably cover the sample"
+    );
+  }
+
+  if (differs(candidate2, ref2)) {
+    throw new Error(
+      "Checkpoint 2 failed: Near-first, far-second with depthWrite=false differs from independent direct WebGPU reference"
+    );
+  }
+
+  if (candidate2[centerIdx] < 240 || candidate2[centerIdx + 1] > 15) {
+    throw new Error(
+      `Checkpoint 2 failed: Expected Red center pixel for depthWrite=false overwrite, got [${candidate2[centerIdx]}, ${candidate2[centerIdx + 1]}, ${candidate2[centerIdx + 2]}]`
+    );
+  }
+
+  // Explicit proof of depth write: candidate1 (Green) and candidate2 (Red) MUST strictly differ!
+  if (!differs(candidate1, candidate2)) {
+    throw new Error(
+      "Checkpoint 2 failed: depthWrite=false output must strictly diverge from depthWrite=true output to prove depth writes"
+    );
+  }
+
+  // Planted negative control: depthWrite=true must strictly reject planted wrong-write (depthWrite=false, Red) output
+  if (!differs(candidate1, ref2)) {
+    throw new Error(
+      "Planted negative failed: depthWrite=true candidate output falsely matched planted wrong-write (depthWrite=false) reference"
+    );
+  }
+  const plantedDiffG1 = Math.abs(candidate1[centerIdx + 1] - ref2[centerIdx + 1]);
+  const plantedDiffR1 = Math.abs(candidate1[centerIdx] - ref2[centerIdx]);
+  if (plantedDiffG1 < 200 || plantedDiffR1 < 200) {
+    throw new Error(
+      `Planted negative failed: depthWrite=true did not strictly diverge from planted wrong-write reference (diffG=${plantedDiffG1}, diffR=${plantedDiffR1})`
+    );
+  }
+
+  // Planted negative control: depthWrite=false must strictly reject planted wrong-write (depthWrite=true, Green) output
+  if (!differs(candidate2, ref1)) {
+    throw new Error(
+      "Planted negative failed: depthWrite=false candidate output falsely matched planted wrong-write (depthWrite=true) reference"
+    );
+  }
+  const plantedDiffG2 = Math.abs(candidate2[centerIdx + 1] - ref1[centerIdx + 1]);
+  const plantedDiffR2 = Math.abs(candidate2[centerIdx] - ref1[centerIdx]);
+  if (plantedDiffG2 < 200 || plantedDiffR2 < 200) {
+    throw new Error(
+      `Planted negative failed: depthWrite=false did not strictly diverge from planted wrong-write reference (diffG=${plantedDiffG2}, diffR=${plantedDiffR2})`
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Checkpoint 3: Far-first, near-second with depthWrite = true -> Green
+  // ---------------------------------------------------------------------------
+  meshNear.material.depthWrite = true;
+  meshFar.material.depthWrite = true;
+  meshNear.material.needsUpdate = true;
+  meshFar.material.needsUpdate = true;
+
+  await adapter.renderMeshBatch(
+    bridgeHost,
+    [meshFar, meshNear],
+    camera,
+    null,
+    wasmExports,
+    { width, height }
+  );
+  const candidate3 = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+
+  const ref3 = await directMeshReference(
+    device,
+    buildIndependentBatchReferenceInput(
+      [meshFar, meshNear],
+      camera,
+      width,
+      height,
+      {
+        hasDepth: true,
+        depthFormat: "depth24plus",
+        depthWriteEnabled: true,
+        depthCompare: "less",
+      }
+    )
+  );
+
+  // Assert demonstrably covered non-clear pixel
+  if (candidate3[centerIdx] === 0 && candidate3[centerIdx + 1] === 0 && candidate3[centerIdx + 2] === 0) {
+    throw new Error(
+      "Checkpoint 3 failed: Candidate center pixel is clear color (black); triangles must demonstrably cover the sample"
+    );
+  }
+
+  if (differs(candidate3, ref3)) {
+    throw new Error(
+      "Checkpoint 3 failed: Far-first, near-second with depthWrite=true differs from independent direct WebGPU reference"
+    );
+  }
+
+  if (candidate3[centerIdx + 1] < 240 || candidate3[centerIdx] > 15) {
+    throw new Error(
+      `Checkpoint 3 failed: Expected Green center pixel for far-first/near-second depth test, got [${candidate3[centerIdx]}, ${candidate3[centerIdx + 1]}, ${candidate3[centerIdx + 2]}]`
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Checkpoint 4: Distinct Dynamic Transforms, Immutable Snapshots, & GPU Output
+  // ---------------------------------------------------------------------------
+  // Shared centered triangle in local space: [-0.4, -0.4, 0], [0.4, -0.4, 0], [0, 0.4, 0]
+  // In camera frustum (fov 45, aspect 1, z=-3 gives half-width ~1.2426):
+  // meshA at (-0.5, 0, -3) maps interior center to pixel (x=19, y=32).
+  // meshB at (+0.5, 0, -3) maps interior center to pixel (x=45, y=32).
+  // Midpoint between them (x=32, y=32) remains clear background.
+  const geomShared = new THREE.BufferGeometry();
+  geomShared.setAttribute("position", new THREE.BufferAttribute(new Float32Array([
+    -0.4, -0.4, 0.0,
+     0.4, -0.4, 0.0,
+     0.0,  0.4, 0.0,
+  ]), 3));
+
+  const matA = new THREE.MeshBasicMaterial({
+    color: 0x0000ff, // Blue [0, 0, 1, 1]
+    side: THREE.DoubleSide,
+    depthTest: true,
+    depthWrite: true,
+    depthFunc: THREE.LessDepth,
+  });
+  const meshA = new THREE.Mesh(geomShared, matA);
+  meshA.position.set(-0.5, 0.0, -3.0);
+  meshA.updateMatrixWorld(true);
+
+  const matB = new THREE.MeshBasicMaterial({
+    color: 0xffff00, // Yellow [1, 1, 0, 1]
+    side: THREE.DoubleSide,
+    depthTest: true,
+    depthWrite: true,
+    depthFunc: THREE.LessDepth,
+  });
+  const meshB = new THREE.Mesh(geomShared, matB);
+  meshB.position.set(0.5, 0.0, -3.0);
+  meshB.updateMatrixWorld(true);
+
+  // 1. Build INDEPENDENT reference inputs BEFORE scene mutation
+  const independentRef4 = await directMeshReference(
+    device,
+    buildIndependentBatchReferenceInput(
+      [meshA, meshB],
+      camera,
+      width,
+      height,
+      {
+        hasDepth: true,
+        depthFormat: "depth24plus",
+        depthWriteEnabled: true,
+        depthCompare: "less",
+      }
+    )
+  );
+
+  // 2. Prepare candidate batch packet (extracts snapshots with distinct modelViews and colors)
+  const batchPrep4 = adapter.prepareMeshBatchPacket(
+    [meshA, meshB],
+    camera,
+    width,
+    height,
+    wasmExports
+  );
+
+  if (batchPrep4.snapshots.length !== 2) {
+    throw new Error(`Checkpoint 4 failed: Expected 2 snapshots, got ${batchPrep4.snapshots.length}`);
+  }
+  const snapA = batchPrep4.snapshots[0];
+  const snapB = batchPrep4.snapshots[1];
+
+  // Verify distinct transforms in snapshot records (m12 = model-view x translation)
+  if (Math.abs(snapA.modelView[12] - (-0.5)) > 0.01) {
+    throw new Error(`Checkpoint 4 failed: Snapshot A modelView x is not -0.5, got ${snapA.modelView[12]}`);
+  }
+  if (Math.abs(snapB.modelView[12] - 0.5) > 0.01) {
+    throw new Error(`Checkpoint 4 failed: Snapshot B modelView x is not +0.5, got ${snapB.modelView[12]}`);
+  }
+  if (Math.abs(snapA.modelView[12] - snapB.modelView[12]) < 0.5) {
+    throw new Error("Checkpoint 4 failed: Snapshots A and B do not have distinct model-view transforms");
+  }
+
+  // Verify distinct colors in snapshot records
+  if (snapA.color[2] < 0.9 || snapA.color[0] > 0.1) {
+    throw new Error("Checkpoint 4 failed: Snapshot A color is not Blue");
+  }
+  if (snapB.color[0] < 0.9 || snapB.color[1] < 0.9) {
+    throw new Error("Checkpoint 4 failed: Snapshot B color is not Yellow");
+  }
+
+  // 3. Mutate scene transforms and colors BEFORE executing packet to catch clobber/stale reread
+  meshA.position.set(100.0, 100.0, 100.0);
+  meshA.material.color.setHex(0x000000);
+  meshA.updateMatrixWorld(true);
+
+  meshB.position.set(-100.0, -100.0, -100.0);
+  meshB.material.color.setHex(0xffffff);
+  meshB.updateMatrixWorld(true);
+
+  // 4. Execute packet on GPU and read back full candidate pixels
+  await bridgeHost.executePacket(batchPrep4.packetBytes);
+  const candidate4 = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+
+  // 5. Compare full candidate pixels against independent direct WebGPU reference
+  if (differs(candidate4, independentRef4)) {
+    throw new Error(
+      "Checkpoint 4 failed: Multi-mesh candidate output with distinct transforms differs from independent direct WebGPU reference"
+    );
+  }
+
+  // 6. Assert known covered interior pixels at y=32:
+  // Left interior pixel (Mesh A, x=19, y=32)
+  const leftIdx = 32 * bytesPerRow + 19 * 4;
+  // Right interior pixel (Mesh B, x=45, y=32)
+  const rightIdx = 32 * bytesPerRow + 45 * 4;
+  // Midpoint pixel between separated triangles (x=32, y=32)
+  const midIdx = 32 * bytesPerRow + 32 * 4;
+
+  // Left pixel must be Blue (R <= 15, G <= 15, B >= 240)
+  if (candidate4[leftIdx + 2] < 240 || candidate4[leftIdx] > 15 || candidate4[leftIdx + 1] > 15) {
+    throw new Error(
+      `Checkpoint 4 failed: Expected Blue interior pixel for Mesh A at (19,32), got [${candidate4[leftIdx]}, ${candidate4[leftIdx + 1]}, ${candidate4[leftIdx + 2]}]`
+    );
+  }
+
+  // Right pixel must be Yellow (R >= 240, G >= 240, B <= 15)
+  if (candidate4[rightIdx] < 240 || candidate4[rightIdx + 1] < 240 || candidate4[rightIdx + 2] > 15) {
+    throw new Error(
+      `Checkpoint 4 failed: Expected Yellow interior pixel for Mesh B at (45,32), got [${candidate4[rightIdx]}, ${candidate4[rightIdx + 1]}, ${candidate4[rightIdx + 2]}]`
+    );
+  }
+
+  // Midpoint between triangles must be clear background (black [0, 0, 0])
+  if (candidate4[midIdx] !== 0 || candidate4[midIdx + 1] !== 0 || candidate4[midIdx + 2] !== 0) {
+    throw new Error(
+      `Checkpoint 4 failed: Expected clear background between separated triangles at (32,32), got [${candidate4[midIdx]}, ${candidate4[midIdx + 1]}, ${candidate4[midIdx + 2]}]`
+    );
+  }
+
+  // 7. Uniform aliasing / transform clobber guards:
+  // Left pixel must strictly not be yellow, and right pixel must strictly not be blue
+  if (candidate4[leftIdx] > 50 || candidate4[leftIdx + 1] > 50) {
+    throw new Error("Checkpoint 4 failed: Left pixel shows uniform aliasing with Mesh B (Yellow clobbered Mesh A)");
+  }
+  if (candidate4[rightIdx + 2] > 50) {
+    throw new Error("Checkpoint 4 failed: Right pixel shows uniform aliasing with Mesh A (Blue clobbered Mesh B)");
+  }
+
+  // 8. Assert snapshots remained immutable despite post-prepare scene mutations
+  if (snapA.color[2] < 0.9 || snapB.color[0] < 0.9) {
+    throw new Error("Checkpoint 4 failed: Post-prepare scene mutation corrupted previous snapshot records");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Checkpoint 5: Negative controls / refusal testing
+  // ---------------------------------------------------------------------------
+  // 5a: Refusal of empty mesh batch
+  let emptyRejected = false;
+  try {
+    adapter.prepareMeshBatchPacket([], camera, width, height, wasmExports);
+  } catch (err) {
+    if (
+      err.reason === "EMPTY_MESH_BATCH" ||
+      err.message.includes("EMPTY_MESH_BATCH") ||
+      err.message.includes(adapter.ADMISSION_REJECTION?.EMPTY_MESH_BATCH) ||
+      err.message.includes("non-empty array")
+    ) {
+      emptyRejected = true;
+    }
+  }
+  if (!emptyRejected) {
+    throw new Error("Checkpoint 5a failed: Empty mesh batch was not rejected with EMPTY_MESH_BATCH");
+  }
+
+  // 5b: Refusal of incompatible shared depth settings across meshes
+  const meshIncompatA = meshNear.clone();
+  meshIncompatA.material = matNear.clone();
+  meshIncompatA.material.depthTest = true;
+
+  const meshIncompatB = meshFar.clone();
+  meshIncompatB.material = matFar.clone();
+  meshIncompatB.material.depthTest = false;
+
+  let depthTestMismatchRejected = false;
+  try {
+    adapter.prepareMeshBatchPacket([meshIncompatA, meshIncompatB], camera, width, height, wasmExports);
+  } catch (err) {
+    const isDepthReason =
+      err.reason === "INCOMPATIBLE_BATCH_DEPTH" ||
+      err.message.includes("INCOMPATIBLE_BATCH_DEPTH") ||
+      err.message.includes(adapter.ADMISSION_REJECTION?.INCOMPATIBLE_BATCH_DEPTH) ||
+      err.message.includes("incompatible depth settings");
+    if (isDepthReason && err.message.includes("depthTest")) {
+      depthTestMismatchRejected = true;
+    }
+  }
+  if (!depthTestMismatchRejected) {
+    throw new Error("Checkpoint 5b failed: Mismatched depthTest was not rejected with INCOMPATIBLE_BATCH_DEPTH");
+  }
+
+  meshIncompatB.material.depthTest = true;
+  meshIncompatB.material.depthWrite = false;
+  let depthWriteMismatchRejected = false;
+  try {
+    adapter.prepareMeshBatchPacket([meshIncompatA, meshIncompatB], camera, width, height, wasmExports);
+  } catch (err) {
+    const isDepthReason =
+      err.reason === "INCOMPATIBLE_BATCH_DEPTH" ||
+      err.message.includes("INCOMPATIBLE_BATCH_DEPTH") ||
+      err.message.includes(adapter.ADMISSION_REJECTION?.INCOMPATIBLE_BATCH_DEPTH) ||
+      err.message.includes("incompatible depth settings");
+    if (isDepthReason && err.message.includes("depthWrite")) {
+      depthWriteMismatchRejected = true;
+    }
+  }
+  if (!depthWriteMismatchRejected) {
+    throw new Error("Checkpoint 5b failed: Mismatched depthWrite was not rejected with INCOMPATIBLE_BATCH_DEPTH");
+  }
+
+  // 5c: Refusal of inadmissible mesh in batch with exact index
+  const meshInvisible = meshFar.clone();
+  meshInvisible.visible = false;
+  let invisibleRejected = false;
+  try {
+    adapter.prepareMeshBatchPacket([meshNear, meshInvisible], camera, width, height, wasmExports);
+  } catch (err) {
+    const isNotVisible =
+      err.reason === "NOT_VISIBLE" ||
+      err.message.includes("NOT_VISIBLE") ||
+      err.message.includes(adapter.ADMISSION_REJECTION?.NOT_VISIBLE) ||
+      err.message.includes("visible = false");
+    if (err.message.includes("Mesh batch admission rejected at index 1") && isNotVisible) {
+      invisibleRejected = true;
+    }
+  }
+  if (!invisibleRejected) {
+    throw new Error("Checkpoint 5c failed: Inadmissible invisible mesh was not rejected with exact index 1 NOT_VISIBLE");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Checkpoint 6: Retained WebGLRenderer multi-mesh oracle parity
+  // ---------------------------------------------------------------------------
+  meshNear.material.depthWrite = true;
+  meshFar.material.depthWrite = true;
+  meshNear.material.needsUpdate = true;
+  meshFar.material.needsUpdate = true;
+
+  const retainedOracle = renderRetainedWebGLReference(
+    THREE,
+    [meshNear, meshFar],
+    camera,
+    width,
+    height
+  );
+
+  // Assert demonstrably covered non-clear pixel from retained WebGL oracle
+  if (retainedOracle[0] === 0 && retainedOracle[1] === 0 && retainedOracle[2] === 0) {
+    throw new Error(
+      `Checkpoint 6 failed: Retained WebGLRenderer oracle sampled clear color (black); triangles must demonstrably cover center`
+    );
+  }
+
+  if (retainedOracle[1] < 240 || retainedOracle[0] > 15) {
+    throw new Error(
+      `Checkpoint 6 failed: Retained WebGLRenderer oracle center is not Green, got [${retainedOracle[0]}, ${retainedOracle[1]}, ${retainedOracle[2]}]`
+    );
+  }
+
+  // Planted negative control: Retained oracle (Green) must strictly reject planted wrong-write (Red, ref2)
+  const oracleWrongDiff = Math.abs(retainedOracle[1] - ref2[centerIdx + 1]);
+  if (oracleWrongDiff < 200) {
+    throw new Error(
+      `Planted negative failed: Retained WebGLRenderer oracle falsely matched planted wrong-write reference (diffG=${oracleWrongDiff})`
+    );
+  }
+
+  const oracleDiffG = Math.abs(candidate1[centerIdx + 1] - retainedOracle[1]);
+  const oracleDiffR = Math.abs(candidate1[centerIdx] - retainedOracle[0]);
+  if (oracleDiffG > 2 || oracleDiffR > 2) {
+    throw new Error(
+      `Checkpoint 6 failed: Candidate center pixel [${candidate1[centerIdx]}, ${candidate1[centerIdx + 1]}] differs from retained WebGLRenderer oracle [${retainedOracle[0]}, ${retainedOracle[1]}] by more than tolerance 2`
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Checkpoint 7: Visible canvas presentation (when canvasContext is provided)
+  // ---------------------------------------------------------------------------
+  if (canvasContext) {
+    const canvasFormat = navigator.gpu.getPreferredCanvasFormat();
+
+    canvasContext.configure({
+      device,
+      format: canvasFormat,
+      alphaMode: "opaque",
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+    });
+    await nextFrame();
+
+    const canvasReadback = device.createBuffer({
+      size: bytesPerRow * height,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+
+    const currentTexture = canvasContext.getCurrentTexture();
+    const execPromise = adapter.renderMeshBatch(
+      bridgeHost,
+      [meshNear, meshFar],
+      camera,
+      canvasContext,
+      wasmExports
+    );
+
+    const copyEncoder = device.createCommandEncoder();
+    copyEncoder.copyTextureToBuffer(
+      { texture: currentTexture },
+      { buffer: canvasReadback, bytesPerRow },
+      [width, height, 1]
+    );
+    device.queue.submit([copyEncoder.finish()]);
+
+    await execPromise;
+    await canvasReadback.mapAsync(GPUMapMode.READ);
+    const canvasPixels = new Uint8Array(canvasReadback.getMappedRange().slice(0));
+    canvasReadback.unmap();
+    canvasReadback.destroy();
+
+    const refCanvas = await directMeshReference(
+      device,
+      buildIndependentBatchReferenceInput(
+        [meshNear, meshFar],
+        camera,
+        width,
+        height,
+        {
+          hasDepth: true,
+          depthFormat: "depth24plus",
+          depthWriteEnabled: true,
+          depthCompare: "less",
+          format: canvasFormat,
+          outputSrgb: true,
+        }
+      )
+    );
+
+    if (differs(canvasPixels, refCanvas)) {
+      const diffs = [];
+      let maxDiff = 0;
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          const idx = y * bytesPerRow + x * 4;
+          const c = [canvasPixels[idx], canvasPixels[idx + 1], canvasPixels[idx + 2], canvasPixels[idx + 3]];
+          const r = [refCanvas[idx], refCanvas[idx + 1], refCanvas[idx + 2], refCanvas[idx + 3]];
+          const dR = Math.abs(c[0] - r[0]);
+          const dG = Math.abs(c[1] - r[1]);
+          const dB = Math.abs(c[2] - r[2]);
+          const dA = Math.abs(c[3] - r[3]);
+          const d = Math.max(dR, dG, dB, dA);
+          if (d > 0) {
+            if (d > maxDiff) maxDiff = d;
+            if (diffs.length < 8) {
+              diffs.push(`(${x},${y}): cand=[${c}] ref=[${r}] diff=[${dR},${dG},${dB},${dA}]`);
+            }
+          }
+        }
+      }
+      throw new Error(
+        `Checkpoint 7 failed: Visible canvas multi-mesh batch pixels differ from direct WebGPU reference in canvas format (${canvasFormat}). ` +
+        `Matched settings: depthFormat=depth24plus, depthCompare=less, depthWrite=true, outputSrgb=true. ` +
+        `Max component diff: ${maxDiff}. Sample differing pixels: ${diffs.join("; ")}`
+      );
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Checkpoint 8: Scene-level hierarchy, admission filtering, and canvas execution via renderScene
+  // ---------------------------------------------------------------------------
+  // Ruby's renderScene (mesh_adapter.mjs:1050+):
+  // - A THREE.Scene with a translated THREE.Group (position: 0.2, -0.1, -3.0)
+  // - Group contains 3 MeshBasicMaterial meshes at distinct positions/colors:
+  //     Mesh 1: Red (Near, z=-2.5 in world space)
+  //     Mesh 2: Green (Far, z=-3.5 in world space)
+  //     Mesh 3: Blue (Distinct, z=-3.0 in world space)
+  // - Group also contains:
+  //     1 InstancedMesh (must be refused with UNSUPPORTED_MESH_SUBCLASS)
+  //     1 invisible mesh (visible=false, must be refused with NOT_VISIBLE)
+  // - Asserts renderScene returns admitted=3 and refused=2 carrying reason codes
+  // - Reads back real canvas pixels
+  // - Asserts each mesh's expected sRGB color at its projected center (tolerance 2)
+  // - Asserts correct occlusion where Mesh 1 and Mesh 2 overlap (depth24plus)
+  // - Asserts a planted negative (wrong expected color must strictly fail)
+
+  const scene8 = new THREE.Scene();
+  const group8 = new THREE.Group();
+  group8.position.set(0.2, -0.1, -3.0);
+  scene8.add(group8);
+
+  // Mesh 1: Red, Near (local: -0.3, 0.2, 0.5 -> world: -0.1, 0.1, -2.5)
+  const geom8A = new THREE.BufferGeometry();
+  geom8A.setAttribute("position", new THREE.BufferAttribute(new Float32Array([
+    -0.3, -0.2, 0.0,
+     0.3, -0.2, 0.0,
+     0.0,  0.3, 0.0,
+  ]), 3));
+  const mat8A = new THREE.MeshBasicMaterial({
+    color: 0xff0000, // Red [1, 0, 0, 1]
+    side: THREE.DoubleSide,
+    depthTest: true,
+    depthWrite: true,
+    depthFunc: THREE.LessDepth,
+  });
+  const mesh8A = new THREE.Mesh(geom8A, mat8A);
+  mesh8A.position.set(-0.3, 0.2, 0.5);
+  group8.add(mesh8A);
+
+  // Mesh 2: Green, Far (local: 0.0, 0.2, -0.5 -> world: 0.2, 0.1, -3.5)
+  const geom8B = new THREE.BufferGeometry();
+  geom8B.setAttribute("position", new THREE.BufferAttribute(new Float32Array([
+    -0.3, -0.2, 0.0,
+     0.3, -0.2, 0.0,
+     0.0,  0.3, 0.0,
+  ]), 3));
+  const mat8B = new THREE.MeshBasicMaterial({
+    color: 0x00ff00, // Green [0, 1, 0, 1]
+    side: THREE.DoubleSide,
+    depthTest: true,
+    depthWrite: true,
+    depthFunc: THREE.LessDepth,
+  });
+  const mesh8B = new THREE.Mesh(geom8B, mat8B);
+  mesh8B.position.set(0.0, 0.2, -0.5);
+  group8.add(mesh8B);
+
+  // Mesh 3: Blue, Distinct (local: 0.2, -0.3, 0.0 -> world: 0.4, -0.4, -3.0)
+  const geom8C = new THREE.BufferGeometry();
+  geom8C.setAttribute("position", new THREE.BufferAttribute(new Float32Array([
+    -0.25, -0.25, 0.0,
+     0.25, -0.25, 0.0,
+     0.0,   0.25, 0.0,
+  ]), 3));
+  const mat8C = new THREE.MeshBasicMaterial({
+    color: 0x0000ff, // Blue [0, 0, 1, 1]
+    side: THREE.DoubleSide,
+    depthTest: true,
+    depthWrite: true,
+    depthFunc: THREE.LessDepth,
+  });
+  const mesh8C = new THREE.Mesh(geom8C, mat8C);
+  mesh8C.position.set(0.2, -0.3, 0.0);
+  group8.add(mesh8C);
+
+  // Inadmissible 1: InstancedMesh (UNSUPPORTED_MESH_SUBCLASS)
+  const instGeom8 = new THREE.BufferGeometry();
+  instGeom8.setAttribute("position", new THREE.BufferAttribute(new Float32Array([
+    0, 0, 0,
+    1, 0, 0,
+    0, 1, 0,
+  ]), 3));
+  const instMat8 = new THREE.MeshBasicMaterial({ side: THREE.DoubleSide });
+  const instancedMesh8 = new THREE.InstancedMesh(instGeom8, instMat8, 2);
+  group8.add(instancedMesh8);
+
+  // Inadmissible 2: Invisible mesh (NOT_VISIBLE)
+  const invisGeom8 = new THREE.BufferGeometry();
+  invisGeom8.setAttribute("position", new THREE.BufferAttribute(new Float32Array([
+    -0.1, -0.1, 0.0,
+     0.1, -0.1, 0.0,
+     0.0,  0.1, 0.0,
+  ]), 3));
+  const invisMat8 = new THREE.MeshBasicMaterial({ color: 0xffffff, side: THREE.DoubleSide });
+  const invisibleMesh8 = new THREE.Mesh(invisGeom8, invisMat8);
+  invisibleMesh8.visible = false;
+  group8.add(invisibleMesh8);
+
+  let activeCanvasContext8 = canvasContext;
+  if (!activeCanvasContext8 && typeof OffscreenCanvas !== "undefined") {
+    try {
+      const offCanvas8 = new OffscreenCanvas(width, height);
+      activeCanvasContext8 = offCanvas8.getContext("webgpu");
+    } catch (_) {}
+  }
+
+  let sceneResult8;
+  let canvasPixels8 = null;
+
+  if (activeCanvasContext8) {
+    const canvasFormat8 = navigator.gpu.getPreferredCanvasFormat();
+    activeCanvasContext8.configure({
+      device,
+      format: canvasFormat8,
+      alphaMode: "opaque",
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+    });
+    await nextFrame();
+
+    const canvasReadback8 = device.createBuffer({
+      size: bytesPerRow * height,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+
+    const currentTexture8 = activeCanvasContext8.getCurrentTexture();
+    const renderScenePromise8 = adapter.renderScene(
+      bridgeHost,
+      scene8,
+      camera,
+      activeCanvasContext8,
+      wasmExports,
+      { width, height }
+    );
+
+    const copyEncoder8 = device.createCommandEncoder();
+    copyEncoder8.copyTextureToBuffer(
+      { texture: currentTexture8 },
+      { buffer: canvasReadback8, bytesPerRow },
+      [width, height, 1]
+    );
+    device.queue.submit([copyEncoder8.finish()]);
+
+    sceneResult8 = await renderScenePromise8;
+    await canvasReadback8.mapAsync(GPUMapMode.READ);
+    canvasPixels8 = new Uint8Array(canvasReadback8.getMappedRange().slice(0));
+    canvasReadback8.unmap();
+    canvasReadback8.destroy();
+  } else {
+    sceneResult8 = await adapter.renderScene(
+      bridgeHost,
+      scene8,
+      camera,
+      null,
+      wasmExports,
+      { width, height }
+    );
+  }
+
+  // 1. Assert renderScene returns admitted=3
+  if (!Array.isArray(sceneResult8.admitted) || sceneResult8.admitted.length !== 3) {
+    throw new Error(
+      `Checkpoint 8 failed: Expected 3 admitted meshes in scene, got ${sceneResult8.admitted?.length}`
+    );
+  }
+  const expectedAdmittedUuids8 = [mesh8A.uuid, mesh8B.uuid, mesh8C.uuid];
+  for (const uuid of expectedAdmittedUuids8) {
+    if (!sceneResult8.admitted.includes(uuid)) {
+      throw new Error(`Checkpoint 8 failed: Admitted list missing expected mesh UUID ${uuid}`);
+    }
+  }
+
+  // 2. Assert renderScene returns refused=2 carrying reason codes
+  if (!Array.isArray(sceneResult8.refused) || sceneResult8.refused.length !== 2) {
+    throw new Error(
+      `Checkpoint 8 failed: Expected 2 refused meshes in scene, got ${sceneResult8.refused?.length}`
+    );
+  }
+  const instancedRefusal8 = sceneResult8.refused.find(r => r.uuid === instancedMesh8.uuid);
+  if (!instancedRefusal8) {
+    throw new Error("Checkpoint 8 failed: InstancedMesh was not recorded in refused list");
+  }
+  const isInstancedReason8 =
+    instancedRefusal8.reason?.includes("UNSUPPORTED_MESH_SUBCLASS") ||
+    instancedRefusal8.code === "UNSUPPORTED_MESH_SUBCLASS";
+  if (!isInstancedReason8) {
+    throw new Error(
+      `Checkpoint 8 failed: InstancedMesh refusal does not carry UNSUPPORTED_MESH_SUBCLASS reason code, got: "${instancedRefusal8.reason}"`
+    );
+  }
+
+  const invisibleRefusal8 = sceneResult8.refused.find(r => r.uuid === invisibleMesh8.uuid);
+  if (!invisibleRefusal8) {
+    throw new Error("Checkpoint 8 failed: Invisible mesh was not recorded in refused list");
+  }
+  const isInvisibleReason8 =
+    invisibleRefusal8.reason?.includes("NOT_VISIBLE") ||
+    invisibleRefusal8.code === "NOT_VISIBLE";
+  if (!isInvisibleReason8) {
+    throw new Error(
+      `Checkpoint 8 failed: Invisible mesh refusal does not carry NOT_VISIBLE reason code, got: "${invisibleRefusal8.reason}"`
+    );
+  }
+
+  // 3. Real canvas pixel assertions: centers, occlusion, planted negative
+  if (canvasPixels8) {
+    const canvasFormat8 = navigator.gpu.getPreferredCanvasFormat();
+    const rCh8 = canvasFormat8.startsWith("bgra") ? 2 : 0;
+    const gCh8 = 1;
+    const bCh8 = canvasFormat8.startsWith("bgra") ? 0 : 2;
+
+    function getRgba8(pixels, x, y) {
+      const idx = y * bytesPerRow + x * 4;
+      return [
+        pixels[idx + rCh8],
+        pixels[idx + gCh8],
+        pixels[idx + bCh8],
+        pixels[idx + 3],
+      ];
+    }
+
+    // Projected centers on 64x64 canvas:
+    // Mesh 1 (Near Red) projected center: (28, 28)
+    const c1_8 = getRgba8(canvasPixels8, 28, 28);
+    // Mesh 2 (Far Green) projected center: (36, 29)
+    const c2_8 = getRgba8(canvasPixels8, 36, 29);
+    // Mesh 3 (Distinct Blue) projected center: (42, 42)
+    const c3_8 = getRgba8(canvasPixels8, 42, 42);
+    // Overlap point: (33, 31) covers both Mesh 1 (Near) and Mesh 2 (Far)
+    const cOverlap8 = getRgba8(canvasPixels8, 33, 31);
+
+    // a) Assert each mesh's expected sRGB color at its projected center (tolerance 2)
+    // Mesh 1: expected sRGB Red [255, 0, 0, 255]
+    if (Math.abs(c1_8[0] - 255) > 2 || c1_8[1] > 2 || c1_8[2] > 2 || Math.abs(c1_8[3] - 255) > 2) {
+      throw new Error(
+        `Checkpoint 8 failed: Mesh 1 projected center (28, 28) expected sRGB Red [255, 0, 0, 255] within tolerance 2, got [${c1_8}]`
+      );
+    }
+
+    // Mesh 2: expected sRGB Green [0, 255, 0, 255]
+    if (c2_8[0] > 2 || Math.abs(c2_8[1] - 255) > 2 || c2_8[2] > 2 || Math.abs(c2_8[3] - 255) > 2) {
+      throw new Error(
+        `Checkpoint 8 failed: Mesh 2 projected center (36, 29) expected sRGB Green [0, 255, 0, 255] within tolerance 2, got [${c2_8}]`
+      );
+    }
+
+    // Mesh 3: expected sRGB Blue [0, 0, 255, 255]
+    if (c3_8[0] > 2 || c3_8[1] > 2 || Math.abs(c3_8[2] - 255) > 2 || Math.abs(c3_8[3] - 255) > 2) {
+      throw new Error(
+        `Checkpoint 8 failed: Mesh 3 projected center (42, 42) expected sRGB Blue [0, 0, 255, 255] within tolerance 2, got [${c3_8}]`
+      );
+    }
+
+    // b) Assert correct occlusion where two overlap (depth24plus): Near Red occludes Far Green
+    if (Math.abs(cOverlap8[0] - 255) > 2 || cOverlap8[1] > 2 || cOverlap8[2] > 2 || Math.abs(cOverlap8[3] - 255) > 2) {
+      throw new Error(
+        `Checkpoint 8 failed: Overlap pixel (33, 31) expected Near Red [255, 0, 0, 255] (occluding Far Green) within tolerance 2, got [${cOverlap8}]`
+      );
+    }
+    // Explicit guard: Far mesh green is occluded (green channel must strictly diverge from 255)
+    if (Math.abs(cOverlap8[1] - 255) < 200) {
+      throw new Error(
+        `Checkpoint 8 failed: Overlap pixel (33, 31) showed Far mesh Green; occlusion by Near Red failed`
+      );
+    }
+
+    // c) Planted negative control: wrong expected color must FAIL
+    let plantedNegativePassed8 = false;
+    const wrongExpectedColor8 = [0, 255, 0, 255]; // Green instead of Red at Mesh 1 center
+    const plantedDiff8 = Math.max(
+      Math.abs(c1_8[0] - wrongExpectedColor8[0]),
+      Math.abs(c1_8[1] - wrongExpectedColor8[1]),
+      Math.abs(c1_8[2] - wrongExpectedColor8[2])
+    );
+    if (plantedDiff8 <= 2) {
+      throw new Error(
+        `Checkpoint 8 planted negative failed: Mesh 1 Red center falsely matched wrong expected Green color [0, 255, 0, 255]`
+      );
+    }
+    if (plantedDiff8 > 200) {
+      plantedNegativePassed8 = true;
+    }
+    if (!plantedNegativePassed8) {
+      throw new Error(
+        `Checkpoint 8 planted negative failed: Wrong expected color did not strictly fail (diff=${plantedDiff8})`
+      );
+    }
+
+    // Also verify against independent direct WebGPU reference
+    const refSceneCanvas8 = await directMeshReference(
+      device,
+      buildIndependentBatchReferenceInput(
+        [mesh8A, mesh8B, mesh8C],
+        camera,
+        width,
+        height,
+        {
+          hasDepth: true,
+          depthFormat: "depth24plus",
+          depthWriteEnabled: true,
+          depthCompare: "less",
+          format: canvasFormat8,
+          outputSrgb: true,
+        }
+      )
+    );
+
+    const refC1_8 = getRgba8(refSceneCanvas8, 28, 28);
+    const refC2_8 = getRgba8(refSceneCanvas8, 36, 29);
+    const refC3_8 = getRgba8(refSceneCanvas8, 42, 42);
+    const refCOverlap8 = getRgba8(refSceneCanvas8, 33, 31);
+
+    if (Math.abs(c1_8[0] - refC1_8[0]) > 2 || Math.abs(c1_8[1] - refC1_8[1]) > 2 || Math.abs(c1_8[2] - refC1_8[2]) > 2) {
+      throw new Error(`Checkpoint 8 failed: Mesh 1 center differs from independent WebGPU reference`);
+    }
+    if (Math.abs(c2_8[0] - refC2_8[0]) > 2 || Math.abs(c2_8[1] - refC2_8[1]) > 2 || Math.abs(c2_8[2] - refC2_8[2]) > 2) {
+      throw new Error(`Checkpoint 8 failed: Mesh 2 center differs from independent WebGPU reference`);
+    }
+    if (Math.abs(c3_8[0] - refC3_8[0]) > 2 || Math.abs(c3_8[1] - refC3_8[1]) > 2 || Math.abs(c3_8[2] - refC3_8[2]) > 2) {
+      throw new Error(`Checkpoint 8 failed: Mesh 3 center differs from independent WebGPU reference`);
+    }
+    if (Math.abs(cOverlap8[0] - refCOverlap8[0]) > 2 || Math.abs(cOverlap8[1] - refCOverlap8[1]) > 2 || Math.abs(cOverlap8[2] - refCOverlap8[2]) > 2) {
+      throw new Error(`Checkpoint 8 failed: Overlap pixel differs from independent WebGPU reference`);
+    }
+  }
+
+  return "Variable-length multi-mesh batch verified (depth24plus): near-first/far-second with depthWrite=true produces near mesh (Green) matching independent direct WebGPU reference; near-first/far-second with depthWrite=false produces far mesh (Red) matching independent reference and strictly diverging from depthWrite=true; far-first/near-second with depthWrite=true produces near mesh (Green); immutable snapshots verified with distinct dynamic transforms and colors; negative controls strictly refuse empty batch (EMPTY_MESH_BATCH), mismatched depth settings (INCOMPATIBLE_BATCH_DEPTH), and invisible meshes; retained WebGLRenderer multi-mesh oracle matches candidate within tolerance" + (canvasContext ? "; visible canvas batch verified against direct reference" : "") + "; scene hierarchy renderScene verified with translated Group, admission filtering (3 admitted, InstancedMesh and invisible refused with reason codes), projected center sRGB colors, depth24plus occlusion, and planted negative";
 }

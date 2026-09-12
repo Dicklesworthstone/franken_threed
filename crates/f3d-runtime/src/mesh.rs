@@ -64,6 +64,15 @@ pub enum MeshPacketError {
     SessionError(String),
     /// Packet encoding error.
     EncodeError(String),
+    /// Multi-mesh submission input list is empty.
+    EmptyMeshList,
+    /// Meshes in a multi-mesh submission have conflicting target dimensions.
+    MismatchedDimensions {
+        expected_width: u32,
+        expected_height: u32,
+        actual_width: u32,
+        actual_height: u32,
+    },
 }
 
 impl fmt::Display for MeshPacketError {
@@ -90,6 +99,16 @@ impl fmt::Display for MeshPacketError {
             Self::InvalidDimensions(msg) => write!(f, "invalid dimensions: {msg}"),
             Self::SessionError(msg) => write!(f, "render session error: {msg}"),
             Self::EncodeError(msg) => write!(f, "packet encode error: {msg}"),
+            Self::EmptyMeshList => write!(f, "mesh inputs list must contain at least one mesh"),
+            Self::MismatchedDimensions {
+                expected_width,
+                expected_height,
+                actual_width,
+                actual_height,
+            } => write!(
+                f,
+                "mismatched mesh dimensions: expected {expected_width}x{expected_height}, got {actual_width}x{actual_height}"
+            ),
         }
     }
 }
@@ -473,7 +492,7 @@ fn prepare_vertex_and_uniform_data(
 
 /// Builds a verified [`GpuSubmissionPacket`] from typed dynamic mesh inputs for offscreen rendering.
 pub fn build_mesh_submission(input: &DynamicMeshInput<'_>) -> Result<GpuSubmissionPacket, MeshPacketError> {
-    build_mesh_submission_internal(input, None)
+    build_multi_mesh_submission(core::slice::from_ref(input))
 }
 
 /// Builds a verified [`GpuSubmissionPacket`] with depth testing/writing from typed dynamic mesh inputs for offscreen rendering.
@@ -483,38 +502,99 @@ pub fn build_mesh_depth_submission(
     depth_write: bool,
     depth_compare: u32,
 ) -> Result<GpuSubmissionPacket, MeshPacketError> {
-    let opts = MeshDepthOptions::new(depth_test, depth_write, depth_compare)?;
-    build_mesh_submission_internal(input, Some(opts))
+    build_multi_mesh_depth_submission(core::slice::from_ref(input), depth_test, depth_write, depth_compare)
 }
 
-fn build_mesh_submission_internal(
-    input: &DynamicMeshInput<'_>,
+/// Builds a verified [`GpuSubmissionPacket`] from a slice of dynamic mesh inputs for offscreen rendering.
+pub fn build_multi_mesh_submission(
+    inputs: &[DynamicMeshInput<'_>],
+) -> Result<GpuSubmissionPacket, MeshPacketError> {
+    build_multi_mesh_submission_internal(inputs, None)
+}
+
+/// Builds a verified [`GpuSubmissionPacket`] with depth testing/writing from a slice of dynamic mesh inputs for offscreen rendering.
+pub fn build_multi_mesh_depth_submission(
+    inputs: &[DynamicMeshInput<'_>],
+    depth_test: bool,
+    depth_write: bool,
+    depth_compare: u32,
+) -> Result<GpuSubmissionPacket, MeshPacketError> {
+    let opts = MeshDepthOptions::new(depth_test, depth_write, depth_compare)?;
+    build_multi_mesh_submission_internal(inputs, Some(opts))
+}
+
+fn build_multi_mesh_submission_internal(
+    inputs: &[DynamicMeshInput<'_>],
     depth_opts: Option<MeshDepthOptions>,
 ) -> Result<GpuSubmissionPacket, MeshPacketError> {
-    // 1. Validate dimensions and calculate aligned readback size BEFORE any slot registration/allocation
-    if input.width == 0 || input.height == 0 {
+    if inputs.is_empty() {
+        return Err(MeshPacketError::EmptyMeshList);
+    }
+    let first = &inputs[0];
+    if first.width == 0 || first.height == 0 {
         return Err(MeshPacketError::ZeroDimensions {
-            width: input.width,
-            height: input.height,
+            width: first.width,
+            height: first.height,
         });
     }
-    let bytes_per_row = aligned_bytes_per_row(input.width)
-        .map_err(|e| MeshPacketError::InvalidDimensions(alloc::format!("width {}: {e:?}", input.width)))?;
+    for input in &inputs[1..] {
+        if input.width != first.width || input.height != first.height {
+            return Err(MeshPacketError::MismatchedDimensions {
+                expected_width: first.width,
+                expected_height: first.height,
+                actual_width: input.width,
+                actual_height: input.height,
+            });
+        }
+        if input.webgl_depth != first.webgl_depth {
+            return Err(MeshPacketError::InvalidDimensions(
+                "all meshes in a multi-mesh submission must share the same webgl_depth setting".into(),
+            ));
+        }
+    }
+
+    let bytes_per_row = aligned_bytes_per_row(first.width)
+        .map_err(|e| MeshPacketError::InvalidDimensions(alloc::format!("width {}: {e:?}", first.width)))?;
     let readback_size = bytes_per_row
-        .checked_mul(input.height)
+        .checked_mul(first.height)
         .ok_or_else(|| MeshPacketError::InvalidDimensions("readback size calculation overflow".into()))?;
 
-    // 2. Determine vertex count, de-index geometry, and build uniform buffer payload
-    let (
-        vertex_count_u32,
-        vertex_stride_u32,
-        vertex_buffer_size,
-        vertex_upload_data,
-        uniform_bytes,
-    ) = prepare_vertex_and_uniform_data(input)?;
+    // 2. Prepare vertex data and uniform payloads for each mesh
+    let mut total_vertices: u32 = 0;
+    let mut total_vertex_bytes: Vec<u8> = Vec::new();
+    let mut mesh_draw_ranges: Vec<(u32, u32)> = Vec::with_capacity(inputs.len());
+    let mut mesh_uniform_payloads: Vec<Vec<u8>> = Vec::with_capacity(inputs.len());
+
+    for input in inputs {
+        let (v_count, _v_stride, _v_size, v_upload, u_bytes) = prepare_vertex_and_uniform_data(input)?;
+        let first_vertex = total_vertices;
+        total_vertices = total_vertices
+            .checked_add(v_count)
+            .ok_or_else(|| MeshPacketError::InvalidDimensions("total vertex count exceeds u32::MAX".into()))?;
+        if v_count > 0 {
+            total_vertex_bytes.extend_from_slice(&v_upload);
+        }
+        mesh_draw_ranges.push((first_vertex, v_count));
+        mesh_uniform_payloads.push(u_bytes);
+    }
+
+    let raw_vertex_bytes_len = u32::try_from(total_vertex_bytes.len())
+        .map_err(|_| MeshPacketError::InvalidDimensions("vertex buffer bytes exceed u32::MAX".into()))?;
+    let vertex_buffer_size = raw_vertex_bytes_len.max(4);
+    let vertex_upload_data = if total_vertex_bytes.is_empty() {
+        alloc::vec![0u8; 4]
+    } else {
+        total_vertex_bytes
+    };
+    let vertex_stride_u32 = u32::try_from(VERTEX_POS_UV_STRIDE)
+        .map_err(|_| MeshPacketError::InvalidDimensions("vertex stride exceeds u32::MAX".into()))?;
+
+    let uniform_buffer_size = u32::try_from(inputs.len())
+        .map_err(|_| MeshPacketError::InvalidDimensions("mesh count exceeds u32::MAX".into()))?
+        .checked_mul(256)
+        .ok_or_else(|| MeshPacketError::InvalidDimensions("uniform buffer size exceeds u32::MAX".into()))?;
 
     // 3. Register canonical resource IDs in the global generational slot table
-    // (Only reached after all validations, layout calculations, and conversions succeed)
     with_global_resource_table(|table| {
         table.register(MESH_UNIFORM_BUFFER_ID);
         table.register(MESH_VERTEX_BUFFER_ID);
@@ -531,7 +611,7 @@ fn build_mesh_submission_internal(
     // 4. Initial GPU resource allocations
     packet.push(GpuCommand::CreateBuffer {
         buffer_id: MESH_UNIFORM_BUFFER_ID,
-        size: 256,
+        size: uniform_buffer_size,
         usage: BUFFER_USAGE_UNIFORM | BUFFER_USAGE_COPY_DST,
     });
 
@@ -549,8 +629,8 @@ fn build_mesh_submission_internal(
 
     packet.push(GpuCommand::CreateTexture {
         texture_id: MESH_TARGET_TEXTURE_ID,
-        width: input.width,
-        height: input.height,
+        width: first.width,
+        height: first.height,
         format: TARGET_FORMAT_RGBA8UNORM,
         usage: TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC,
     });
@@ -558,8 +638,8 @@ fn build_mesh_submission_internal(
     if depth_opts.is_some() {
         packet.push(GpuCommand::CreateTexture {
             texture_id: MESH_DEPTH_TEXTURE_ID,
-            width: input.width,
-            height: input.height,
+            width: first.width,
+            height: first.height,
             format: TARGET_FORMAT_DEPTH24PLUS,
             usage: TEXTURE_USAGE_RENDER_ATTACHMENT,
         });
@@ -571,7 +651,7 @@ fn build_mesh_submission_internal(
         usage: BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST,
     });
 
-    let wgsl_code = generate_mesh_wgsl_internal(input.webgl_depth, false);
+    let wgsl_code = generate_mesh_wgsl_internal(first.webgl_depth, false);
     if let Some(depth) = depth_opts {
         let (depth_write_enabled, depth_compare) = depth.resolve_effective();
         packet.push(GpuCommand::CreatePipelineDepth {
@@ -601,19 +681,23 @@ fn build_mesh_submission_internal(
     // 5. Build pass structure through FrameSession and lower_plan
     let root_ctx = RenderContext::new_offscreen(
         ResourceId::new(MESH_TARGET_TEXTURE_ID),
-        input.width,
-        input.height,
+        first.width,
+        first.height,
         Epoch::ZERO,
     );
     let mut session = FrameSession::new(root_ctx, 256)
         .map_err(|e| MeshPacketError::SessionError(alloc::format!("FrameSession::new: {e:?}")))?
         .with_uniform_buffer_id(MESH_UNIFORM_BUFFER_ID);
 
-    let mat_handle = Handle::<MaterialDomain>::from_raw(1, 1)
-        .map_err(|e| MeshPacketError::SessionError(alloc::format!("Handle::from_raw: {e:?}")))?;
-    let rec_mat = session
-        .snapshot_material_use(mat_handle, DataVersion::new(1), Epoch::ZERO, &uniform_bytes)
-        .map_err(|e| MeshPacketError::SessionError(alloc::format!("snapshot_material_use: {e:?}")))?;
+    let mut mat_records = Vec::with_capacity(inputs.len());
+    for (i, u_bytes) in mesh_uniform_payloads.iter().enumerate() {
+        let mat_handle = Handle::<MaterialDomain>::from_raw(i as u32 + 1, 1)
+            .map_err(|e| MeshPacketError::SessionError(alloc::format!("Handle::from_raw: {e:?}")))?;
+        let rec_mat = session
+            .snapshot_material_use(mat_handle, DataVersion::new(1), Epoch::ZERO, u_bytes)
+            .map_err(|e| MeshPacketError::SessionError(alloc::format!("snapshot_material_use: {e:?}")))?;
+        mat_records.push(rec_mat);
+    }
 
     let depth_attachment = depth_opts.map(|_| {
         DepthStencilAttachment::new_depth_clear(ResourceId::new(MESH_DEPTH_TEXTURE_ID), 1.0)
@@ -622,14 +706,18 @@ fn build_mesh_submission_internal(
     session
         .begin_render_pass_with_depth("mesh_render_pass", MESH_CLEAR_COLOR, depth_attachment)
         .map_err(|e| MeshPacketError::SessionError(alloc::format!("begin_render_pass_with_depth: {e:?}")))?;
-    session
-        .record_direct_draw(
-            MESH_PIPELINE_ID,
-            MESH_VERTEX_BUFFER_ID,
-            vertex_count_u32,
-            Some(rec_mat),
-        )
-        .map_err(|e| MeshPacketError::SessionError(alloc::format!("record_direct_draw: {e:?}")))?;
+
+    for (i, &(first_vertex, v_count)) in mesh_draw_ranges.iter().enumerate() {
+        session
+            .record_direct_draw_with_range(
+                MESH_PIPELINE_ID,
+                MESH_VERTEX_BUFFER_ID,
+                [v_count, 1, first_vertex, 0],
+                Some(mat_records[i]),
+            )
+            .map_err(|e| MeshPacketError::SessionError(alloc::format!("record_direct_draw_with_range: {e:?}")))?;
+    }
+
     session
         .end_render_pass()
         .map_err(|e| MeshPacketError::SessionError(alloc::format!("end_render_pass: {e:?}")))?;
@@ -646,8 +734,8 @@ fn build_mesh_submission_internal(
     packet.push(GpuCommand::CopyTextureToBuffer {
         texture_id: MESH_TARGET_TEXTURE_ID,
         buffer_id: MESH_READBACK_BUFFER_ID,
-        width: input.width,
-        height: input.height,
+        width: first.width,
+        height: first.height,
         epoch: Epoch::ZERO,
     });
 
@@ -656,23 +744,10 @@ fn build_mesh_submission_internal(
 
 /// Builds a verified [`GpuSubmissionPacket`] targeting a visible canvas swapchain
 /// from typed dynamic mesh inputs.
-///
-/// # Canvas Pipeline & Epoch Semantics (§5.1, §6.7, §8.5, [S48])
-/// - **Dynamically Negotiated Format**: Emits pipeline [`MESH_CANVAS_PIPELINE_ID`] with
-///   [`TARGET_FORMAT_PREFERRED_CANVAS`] (format code 0), allowing the browser host to
-///   bind its preferred swapchain format (`bgra8unorm` or `rgba8unorm`).
-/// - **Per-Submission Canvas Acquisition**: Uses a per-submission [`CanvasEpochTracker`] and
-///   [`RenderContext::new_canvas_acquired`] to acquire a single fresh output epoch for this
-///   submission. Because the tracker is instantiated per submission call, epoch values are isolated
-///   to each packet compile; no claim of globally monotonic epochs across independent calls is made.
-/// - **Synchronous Swapchain Texture**: WebGPU swapchain textures are acquired synchronously by the
-///   host per frame execution via `context.getCurrentTexture().createView()`; no offscreen texture
-///   or readback buffer is allocated.
-/// - **Zero New Opcodes**: Emits standard [`GpuCommand::RenderPass`] with `target_type: TARGET_CANVAS`.
 pub fn build_mesh_canvas_submission(
     input: &DynamicMeshInput<'_>,
 ) -> Result<GpuSubmissionPacket, MeshPacketError> {
-    build_mesh_canvas_submission_internal(input, None)
+    build_multi_mesh_canvas_submission(core::slice::from_ref(input))
 }
 
 /// Builds a verified [`GpuSubmissionPacket`] with depth testing/writing targeting a visible canvas swapchain
@@ -683,30 +758,93 @@ pub fn build_mesh_canvas_depth_submission(
     depth_write: bool,
     depth_compare: u32,
 ) -> Result<GpuSubmissionPacket, MeshPacketError> {
-    let opts = MeshDepthOptions::new(depth_test, depth_write, depth_compare)?;
-    build_mesh_canvas_submission_internal(input, Some(opts))
+    build_multi_mesh_canvas_depth_submission(core::slice::from_ref(input), depth_test, depth_write, depth_compare)
 }
 
-fn build_mesh_canvas_submission_internal(
-    input: &DynamicMeshInput<'_>,
+/// Builds a verified [`GpuSubmissionPacket`] targeting a visible canvas swapchain
+/// from a slice of dynamic mesh inputs.
+pub fn build_multi_mesh_canvas_submission(
+    inputs: &[DynamicMeshInput<'_>],
+) -> Result<GpuSubmissionPacket, MeshPacketError> {
+    build_multi_mesh_canvas_submission_internal(inputs, None)
+}
+
+/// Builds a verified [`GpuSubmissionPacket`] with depth testing/writing targeting a visible canvas swapchain
+/// from a slice of dynamic mesh inputs.
+pub fn build_multi_mesh_canvas_depth_submission(
+    inputs: &[DynamicMeshInput<'_>],
+    depth_test: bool,
+    depth_write: bool,
+    depth_compare: u32,
+) -> Result<GpuSubmissionPacket, MeshPacketError> {
+    let opts = MeshDepthOptions::new(depth_test, depth_write, depth_compare)?;
+    build_multi_mesh_canvas_submission_internal(inputs, Some(opts))
+}
+
+fn build_multi_mesh_canvas_submission_internal(
+    inputs: &[DynamicMeshInput<'_>],
     depth_opts: Option<MeshDepthOptions>,
 ) -> Result<GpuSubmissionPacket, MeshPacketError> {
-    // 1. Validate dimensions BEFORE any slot registration/allocation
-    if input.width == 0 || input.height == 0 {
+    if inputs.is_empty() {
+        return Err(MeshPacketError::EmptyMeshList);
+    }
+    let first = &inputs[0];
+    if first.width == 0 || first.height == 0 {
         return Err(MeshPacketError::ZeroDimensions {
-            width: input.width,
-            height: input.height,
+            width: first.width,
+            height: first.height,
         });
     }
+    for input in &inputs[1..] {
+        if input.width != first.width || input.height != first.height {
+            return Err(MeshPacketError::MismatchedDimensions {
+                expected_width: first.width,
+                expected_height: first.height,
+                actual_width: input.width,
+                actual_height: input.height,
+            });
+        }
+        if input.webgl_depth != first.webgl_depth {
+            return Err(MeshPacketError::InvalidDimensions(
+                "all meshes in a multi-mesh submission must share the same webgl_depth setting".into(),
+            ));
+        }
+    }
 
-    // 2. Determine vertex count, de-index geometry, and build uniform buffer payload
-    let (
-        vertex_count_u32,
-        vertex_stride_u32,
-        vertex_buffer_size,
-        vertex_upload_data,
-        uniform_bytes,
-    ) = prepare_vertex_and_uniform_data(input)?;
+    // 2. Prepare vertex data and uniform payloads for each mesh
+    let mut total_vertices: u32 = 0;
+    let mut total_vertex_bytes: Vec<u8> = Vec::new();
+    let mut mesh_draw_ranges: Vec<(u32, u32)> = Vec::with_capacity(inputs.len());
+    let mut mesh_uniform_payloads: Vec<Vec<u8>> = Vec::with_capacity(inputs.len());
+
+    for input in inputs {
+        let (v_count, _v_stride, _v_size, v_upload, u_bytes) = prepare_vertex_and_uniform_data(input)?;
+        let first_vertex = total_vertices;
+        total_vertices = total_vertices
+            .checked_add(v_count)
+            .ok_or_else(|| MeshPacketError::InvalidDimensions("total vertex count exceeds u32::MAX".into()))?;
+        if v_count > 0 {
+            total_vertex_bytes.extend_from_slice(&v_upload);
+        }
+        mesh_draw_ranges.push((first_vertex, v_count));
+        mesh_uniform_payloads.push(u_bytes);
+    }
+
+    let raw_vertex_bytes_len = u32::try_from(total_vertex_bytes.len())
+        .map_err(|_| MeshPacketError::InvalidDimensions("vertex buffer bytes exceed u32::MAX".into()))?;
+    let vertex_buffer_size = raw_vertex_bytes_len.max(4);
+    let vertex_upload_data = if total_vertex_bytes.is_empty() {
+        alloc::vec![0u8; 4]
+    } else {
+        total_vertex_bytes
+    };
+    let vertex_stride_u32 = u32::try_from(VERTEX_POS_UV_STRIDE)
+        .map_err(|_| MeshPacketError::InvalidDimensions("vertex stride exceeds u32::MAX".into()))?;
+
+    let uniform_buffer_size = u32::try_from(inputs.len())
+        .map_err(|_| MeshPacketError::InvalidDimensions("mesh count exceeds u32::MAX".into()))?
+        .checked_mul(256)
+        .ok_or_else(|| MeshPacketError::InvalidDimensions("uniform buffer size exceeds u32::MAX".into()))?;
 
     // 3. Register canonical resource IDs in the global generational slot table
     with_global_resource_table(|table| {
@@ -724,7 +862,7 @@ fn build_mesh_canvas_submission_internal(
     // 4. Initial GPU resource allocations
     packet.push(GpuCommand::CreateBuffer {
         buffer_id: MESH_UNIFORM_BUFFER_ID,
-        size: 256,
+        size: uniform_buffer_size,
         usage: BUFFER_USAGE_UNIFORM | BUFFER_USAGE_COPY_DST,
     });
 
@@ -743,14 +881,14 @@ fn build_mesh_canvas_submission_internal(
     if depth_opts.is_some() {
         packet.push(GpuCommand::CreateTexture {
             texture_id: MESH_DEPTH_TEXTURE_ID,
-            width: input.width,
-            height: input.height,
+            width: first.width,
+            height: first.height,
             format: TARGET_FORMAT_DEPTH24PLUS,
             usage: TEXTURE_USAGE_RENDER_ATTACHMENT,
         });
     }
 
-    let wgsl_code = generate_mesh_wgsl_internal(input.webgl_depth, true);
+    let wgsl_code = generate_mesh_wgsl_internal(first.webgl_depth, true);
     if let Some(depth) = depth_opts {
         let (depth_write_enabled, depth_compare) = depth.resolve_effective();
         packet.push(GpuCommand::CreatePipelineDepth {
@@ -782,8 +920,8 @@ fn build_mesh_canvas_submission_internal(
     tracker.register_canvas(
         CanvasId::new(MESH_CANVAS_TARGET_ID),
         ResourceId::new(MESH_CANVAS_TARGET_ID),
-        input.width,
-        input.height,
+        first.width,
+        first.height,
         CanvasFormat::Bgra8Unorm,
     );
     let canvas_output = tracker
@@ -792,8 +930,8 @@ fn build_mesh_canvas_submission_internal(
 
     let root_ctx = RenderContext::new_canvas_acquired(
         ResourceId::new(MESH_CANVAS_TARGET_ID),
-        input.width,
-        input.height,
+        first.width,
+        first.height,
         Epoch::new(1),
         canvas_output.epoch,
     );
@@ -801,11 +939,15 @@ fn build_mesh_canvas_submission_internal(
         .map_err(|e| MeshPacketError::SessionError(alloc::format!("FrameSession::new: {e:?}")))?
         .with_uniform_buffer_id(MESH_UNIFORM_BUFFER_ID);
 
-    let mat_handle = Handle::<MaterialDomain>::from_raw(1, 1)
-        .map_err(|e| MeshPacketError::SessionError(alloc::format!("Handle::from_raw: {e:?}")))?;
-    let rec_mat = session
-        .snapshot_material_use(mat_handle, DataVersion::new(1), Epoch::ZERO, &uniform_bytes)
-        .map_err(|e| MeshPacketError::SessionError(alloc::format!("snapshot_material_use: {e:?}")))?;
+    let mut mat_records = Vec::with_capacity(inputs.len());
+    for (i, u_bytes) in mesh_uniform_payloads.iter().enumerate() {
+        let mat_handle = Handle::<MaterialDomain>::from_raw(i as u32 + 1, 1)
+            .map_err(|e| MeshPacketError::SessionError(alloc::format!("Handle::from_raw: {e:?}")))?;
+        let rec_mat = session
+            .snapshot_material_use(mat_handle, DataVersion::new(1), Epoch::ZERO, u_bytes)
+            .map_err(|e| MeshPacketError::SessionError(alloc::format!("snapshot_material_use: {e:?}")))?;
+        mat_records.push(rec_mat);
+    }
 
     let depth_attachment = depth_opts.map(|_| {
         DepthStencilAttachment::new_depth_clear(ResourceId::new(MESH_DEPTH_TEXTURE_ID), 1.0)
@@ -814,14 +956,18 @@ fn build_mesh_canvas_submission_internal(
     session
         .begin_render_pass_with_depth("mesh_canvas_render_pass", MESH_CLEAR_COLOR, depth_attachment)
         .map_err(|e| MeshPacketError::SessionError(alloc::format!("begin_render_pass_with_depth: {e:?}")))?;
-    session
-        .record_direct_draw(
-            MESH_CANVAS_PIPELINE_ID,
-            MESH_VERTEX_BUFFER_ID,
-            vertex_count_u32,
-            Some(rec_mat),
-        )
-        .map_err(|e| MeshPacketError::SessionError(alloc::format!("record_direct_draw: {e:?}")))?;
+
+    for (i, &(first_vertex, v_count)) in mesh_draw_ranges.iter().enumerate() {
+        session
+            .record_direct_draw_with_range(
+                MESH_CANVAS_PIPELINE_ID,
+                MESH_VERTEX_BUFFER_ID,
+                [v_count, 1, first_vertex, 0],
+                Some(mat_records[i]),
+            )
+            .map_err(|e| MeshPacketError::SessionError(alloc::format!("record_direct_draw_with_range: {e:?}")))?;
+    }
+
     session
         .end_render_pass()
         .map_err(|e| MeshPacketError::SessionError(alloc::format!("end_render_pass: {e:?}")))?;
@@ -1397,4 +1543,167 @@ pub fn gpu_bridge_build_canvas_mesh_packet(
         height,
         webgl_depth,
     )
+}
+
+fn build_mesh_batch_packet_impl(
+    positions: &[f32],
+    vertex_counts: &[u32],
+    model_views: &[f64],
+    projection: &[f64],
+    colors: &[f32],
+    width: u32,
+    height: u32,
+    webgl_depth: bool,
+    depth_test: bool,
+    depth_write: bool,
+    depth_compare: u32,
+    canvas: bool,
+) -> Result<Vec<u8>, MeshPacketError> {
+    if vertex_counts.is_empty() {
+        return Err(MeshPacketError::EmptyMeshList);
+    }
+    let num_meshes = vertex_counts.len();
+    let expected_mv_len = num_meshes
+        .checked_mul(16)
+        .ok_or_else(|| MeshPacketError::InvalidDimensions("model_views length overflow".into()))?;
+    if model_views.len() != expected_mv_len {
+        return Err(MeshPacketError::InvalidMatrixLength {
+            name: "model_views",
+            len: model_views.len(),
+        });
+    }
+    if projection.len() != 16 {
+        return Err(MeshPacketError::InvalidMatrixLength {
+            name: "projection",
+            len: projection.len(),
+        });
+    }
+    let expected_colors_len = num_meshes
+        .checked_mul(4)
+        .ok_or_else(|| MeshPacketError::InvalidDimensions("colors length overflow".into()))?;
+    if colors.len() != expected_colors_len {
+        return Err(MeshPacketError::InvalidColorLength { len: colors.len() });
+    }
+
+    let mut total_vertices: usize = 0;
+    for &vc in vertex_counts {
+        total_vertices = total_vertices
+            .checked_add(vc as usize)
+            .ok_or_else(|| MeshPacketError::InvalidDimensions("total vertex count overflow".into()))?;
+    }
+    let expected_pos_len = total_vertices
+        .checked_mul(3)
+        .ok_or_else(|| MeshPacketError::InvalidDimensions("total positions length overflow".into()))?;
+    if positions.len() != expected_pos_len {
+        return Err(MeshPacketError::InvalidPositionLength { len: positions.len() });
+    }
+
+    let mut inputs = Vec::with_capacity(num_meshes);
+    let mut current_v_offset: usize = 0;
+    for i in 0..num_meshes {
+        let v_count = vertex_counts[i] as usize;
+        let pos_start = current_v_offset * 3;
+        let pos_end = pos_start + v_count * 3;
+        let pos_slice = &positions[pos_start..pos_end];
+        let mv_slice = &model_views[i * 16..(i + 1) * 16];
+        let col_slice = &colors[i * 4..(i + 1) * 4];
+
+        let input = DynamicMeshInput::try_from_raw(
+            pos_slice,
+            &[],
+            mv_slice,
+            projection,
+            col_slice,
+            width,
+            height,
+            webgl_depth,
+        )?;
+        inputs.push(input);
+        current_v_offset += v_count;
+    }
+
+    let packet = if canvas {
+        if depth_test || depth_write {
+            build_multi_mesh_canvas_depth_submission(&inputs, depth_test, depth_write, depth_compare)?
+        } else {
+            build_multi_mesh_canvas_submission(&inputs)?
+        }
+    } else {
+        if depth_test || depth_write {
+            build_multi_mesh_depth_submission(&inputs, depth_test, depth_write, depth_compare)?
+        } else {
+            build_multi_mesh_submission(&inputs)?
+        }
+    };
+
+    packet
+        .encode()
+        .map_err(|e| MeshPacketError::EncodeError(alloc::format!("{e:?}")))
+}
+
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen]
+/// Encodes a batch of dynamic Three.js meshes into a unified submission packet (wasm-bindgen export).
+pub fn f3d_build_mesh_batch_packet(
+    positions: &[f32],
+    vertex_counts: &[u32],
+    model_views: &[f64],
+    projection: &[f64],
+    colors: &[f32],
+    width: u32,
+    height: u32,
+    webgl_depth: bool,
+    depth_test: bool,
+    depth_write: bool,
+    depth_compare: u32,
+    canvas: bool,
+) -> Result<Vec<u8>, wasm_bindgen::JsValue> {
+    build_mesh_batch_packet_impl(
+        positions,
+        vertex_counts,
+        model_views,
+        projection,
+        colors,
+        width,
+        height,
+        webgl_depth,
+        depth_test,
+        depth_write,
+        depth_compare,
+        canvas,
+    )
+    .map_err(|e| wasm_bindgen::JsValue::from_str(&e.to_string()))
+}
+
+#[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
+/// Encodes a batch of dynamic Three.js meshes into a unified submission packet for host verification and unit tests.
+pub fn f3d_build_mesh_batch_packet(
+    positions: &[f32],
+    vertex_counts: &[u32],
+    model_views: &[f64],
+    projection: &[f64],
+    colors: &[f32],
+    width: u32,
+    height: u32,
+    webgl_depth: bool,
+    depth_test: bool,
+    depth_write: bool,
+    depth_compare: u32,
+    canvas: bool,
+) -> Result<Vec<u8>, String> {
+    build_mesh_batch_packet_impl(
+        positions,
+        vertex_counts,
+        model_views,
+        projection,
+        colors,
+        width,
+        height,
+        webgl_depth,
+        depth_test,
+        depth_write,
+        depth_compare,
+        canvas,
+    )
+    .map_err(|e| e.to_string())
 }
