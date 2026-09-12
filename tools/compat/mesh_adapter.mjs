@@ -73,6 +73,10 @@ export const ADMISSION_REJECTION = Object.freeze({
   INCOMPATIBLE_BATCH_DEPTH: 'INCOMPATIBLE_BATCH_DEPTH: Meshes in batch have incompatible depth settings for the available legacy Wasm exports; mixed settings require f3d_build_mesh_batch_cull_depth_packet',
   UNSUPPORTED_RENDERABLE: 'UNSUPPORTED_RENDERABLE: Non-mesh renderable objects (Line, Points, Sprite, Light) are not supported in this slice',
   UNSUPPORTED_SCENE_FEATURE: 'UNSUPPORTED_SCENE_FEATURE: Scene-level features (background, fog, overrideMaterial, environment) are not supported in this slice',
+  UNSUPPORTED_UPLOAD_CALLBACK: 'UNSUPPORTED_UPLOAD_CALLBACK: Custom onUploadCallback on BufferAttribute is not supported in this slice',
+  INVALID_ATTRIBUTE_RESIZE: "INVALID_ATTRIBUTE_RESIZE: The size of the buffer attribute's array buffer does not match the original size. Resizing buffer attributes is not supported.",
+  AMBIGUOUS_ATTRIBUTE_UPDATE: 'AMBIGUOUS_ATTRIBUTE_UPDATE: Attribute usage or multiple updateRanges behavior is ambiguous across backends; provide options.sourceBackend ("webgl" | "webgpu")',
+  INVALID_UPDATE_RANGE: 'INVALID_UPDATE_RANGE: Invalid updateRange: start must be non-negative integer, count must be positive integer, and start + count must not exceed attribute array length',
 });
 
 // Supported upstream source backends for resolving backend-specific semantics
@@ -258,6 +262,18 @@ function painterSortWebGL(a, b) {
   }
 }
 
+function hasCustomUploadCallback(attr) {
+  if (!attr) return false;
+  if (Object.hasOwn(attr, 'onUploadCallback')) return true;
+  if (typeof attr.onUploadCallback === 'function') {
+    const proto = Object.getPrototypeOf(attr);
+    if (!proto || attr.onUploadCallback !== proto.onUploadCallback) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /**
  * Checks if a Three.js Mesh and Camera can be admitted into the dynamic Wasm mesh rendering slice.
  * @param {any} mesh
@@ -324,6 +340,14 @@ export function canAdmitMesh(mesh, camera, options = {}) {
     return rejectMesh('UNSUPPORTED_ATTRIBUTE');
   }
 
+  // Reject custom upload callbacks on BufferAttribute (root 18462)
+  if (
+    hasCustomUploadCallback(posAttr) ||
+    hasCustomUploadCallback(geometry.index)
+  ) {
+    return rejectMesh('UNSUPPORTED_UPLOAD_CALLBACK');
+  }
+
   if (geometry.morphAttributes && Object.keys(geometry.morphAttributes).length > 0) {
     return rejectMesh('UNSUPPORTED_GEOMETRY');
   }
@@ -384,6 +408,19 @@ export function canAdmitMesh(mesh, camera, options = {}) {
     const backend = options?.sourceBackend?.toLowerCase();
     if (backend !== SOURCE_BACKEND.WEBGL && backend !== SOURCE_BACKEND.WEBGPU) {
       return rejectMesh('AMBIGUOUS_DEPTH_PAIR');
+    }
+  }
+
+  // Handle attribute usage / updateRanges ambiguity across backends (root review 18405 / 18499)
+  const posAttrUsage = posAttr?.usage;
+  const indexAttrUsage = geometry.index?.usage;
+  const hasDynamicUsage = posAttrUsage === 35048 || indexAttrUsage === 35048;
+  const hasMultiRanges = (posAttr.updateRanges && posAttr.updateRanges.length > 1) ||
+                         (geometry.index?.updateRanges && geometry.index.updateRanges.length > 1);
+  if (hasDynamicUsage || hasMultiRanges) {
+    const backend = options?.sourceBackend?.toLowerCase();
+    if (backend !== SOURCE_BACKEND.WEBGL && backend !== SOURCE_BACKEND.WEBGPU) {
+      return rejectMesh('AMBIGUOUS_ATTRIBUTE_UPDATE');
     }
   }
 
@@ -467,6 +504,198 @@ export function expandIndexedPositions(positions, indices) {
   return out;
 }
 
+// Internal Symbol to pass residency context safely without polluting public options
+const RESIDENCY_CONTEXT = Symbol('f3d.residencyContext');
+
+// Module-level WeakMap: bridgeHost -> { deviceGeneration: number, device: any, attributes: WeakMap<BufferAttribute, AttributeGpuRecord>, disposalRegistered: WeakSet<BufferGeometry> }
+const hostResidencyMap = new WeakMap();
+
+function getHostResidency(bridgeHost) {
+  if (!bridgeHost) return null;
+  const currentGen = bridgeHost.deviceGeneration ?? 0;
+  const currentDevice = bridgeHost.device ?? null;
+  let residency = hostResidencyMap.get(bridgeHost);
+  if (!residency) {
+    residency = {
+      deviceGeneration: currentGen,
+      device: currentDevice,
+      attributes: new WeakMap(),
+      disposalRegistered: new WeakSet(),
+    };
+    hostResidencyMap.set(bridgeHost, residency);
+  } else if (residency.deviceGeneration !== currentGen || residency.device !== currentDevice) {
+    residency.deviceGeneration = currentGen;
+    residency.device = currentDevice;
+    residency.attributes = new WeakMap();
+  }
+  return residency;
+}
+
+function resolveHostAttribute(residencyContext, attribute, sourceBackend, geometry) {
+  if (!residencyContext || !attribute) return null;
+  const { residency, pendingCommits, stagedThisPass } = residencyContext;
+  if (!residency) return null;
+
+  // Invalidate on geometry disposal (WebGLGeometries.js:8-24, WebGLAttributes.js:165-178)
+  // Per-residency WeakSet registration without mutating public geometry object (root review 18499)
+  if (geometry && typeof geometry.addEventListener === 'function' && !residency.disposalRegistered.has(geometry)) {
+    residency.disposalRegistered.add(geometry);
+    geometry.addEventListener('dispose', () => {
+      if (geometry.index) residency.attributes.delete(geometry.index);
+      if (geometry.attributes) {
+        for (const name in geometry.attributes) {
+          residency.attributes.delete(geometry.attributes[name]);
+        }
+      }
+    });
+  }
+
+  // If attribute was already staged in this render pass (e.g. shared by multiple meshes)
+  if (stagedThisPass && stagedThisPass.has(attribute)) {
+    return stagedThisPass.get(attribute);
+  }
+
+  let record = residency.attributes.get(attribute);
+
+  // Initial upload: first use on this host & deviceGeneration & device
+  if (!record) {
+    const stagedShadow = attribute.array.slice();
+    record = {
+      version: attribute.version,
+      shadow: stagedShadow,
+      size: attribute.array.byteLength,
+    };
+    if (stagedThisPass) {
+      stagedThisPass.set(attribute, stagedShadow);
+    }
+    // WebGLAttributes.js:5-16: initial creation uploads whole array and does NOT clear existing ranges
+    pendingCommits.push(() => {
+      residency.attributes.set(attribute, record);
+    });
+    return stagedShadow;
+  }
+
+  // Check if update is needed based on sourceBackend
+  // Three.js constants: DynamicDrawUsage = 35048
+  const backend = sourceBackend?.toLowerCase();
+  const isWebGPU = backend === SOURCE_BACKEND.WEBGPU;
+  const isWebGL = backend === SOURCE_BACKEND.WEBGL;
+  const isDynamic = attribute.usage === 35048;
+  const versionBumped = record.version < attribute.version;
+
+  if (!versionBumped && isDynamic) {
+    if (!isWebGPU && !isWebGL) {
+      throw createAdmissionError(
+        'AMBIGUOUS_ATTRIBUTE_UPDATE',
+        'Attribute with DynamicDrawUsage and unchanged version is ambiguous across backends; provide options.sourceBackend ("webgl" | "webgpu")'
+      );
+    }
+  }
+
+  const needsUpload = versionBumped || (isWebGPU && isDynamic);
+
+  // If no upload requested, return GPU-stale shadow!
+  if (!needsUpload) {
+    if (stagedThisPass) {
+      stagedThisPass.set(attribute, record.shadow);
+    }
+    return record.shadow;
+  }
+
+  // Resizing buffer attributes is not supported (WebGLAttributes.js:212-215)
+  if (record.size !== attribute.array.byteLength) {
+    throw createAdmissionError(
+      'INVALID_ATTRIBUTE_RESIZE',
+      "THREE.WebGLAttributes: The size of the buffer attribute's array buffer does not match the original size. Resizing buffer attributes is not supported."
+    );
+  }
+
+  const stagedShadow = record.shadow.slice();
+  const updateRanges = attribute.updateRanges;
+  let clearRanges = false;
+
+  if (!updateRanges || updateRanges.length === 0) {
+    stagedShadow.set(attribute.array);
+  } else {
+    // Validate consumed ranges before any commit (root 18546)
+    // Must be positive integral count/start, within array bounds
+    for (let i = 0; i < updateRanges.length; i++) {
+      const range = updateRanges[i];
+      if (
+        !range ||
+        !Number.isInteger(range.start) ||
+        range.start < 0 ||
+        !Number.isInteger(range.count) ||
+        range.count <= 0 ||
+        range.start + range.count > attribute.array.length
+      ) {
+        throw createAdmissionError(
+          'INVALID_UPDATE_RANGE',
+          `Invalid updateRange at index ${i}: start must be non-negative integer, count must be positive integer, and start + count must not exceed attribute array length`
+        );
+      }
+    }
+
+    clearRanges = true;
+    if (updateRanges.length === 1) {
+      const range = updateRanges[0];
+      stagedShadow.set(attribute.array.subarray(range.start, range.start + range.count), range.start);
+    } else {
+      // Multiple update ranges: WebGL merges with +1, WebGPU updates individually
+      if (!isWebGPU && !isWebGL) {
+        throw createAdmissionError(
+          'AMBIGUOUS_ATTRIBUTE_UPDATE',
+          'Multiple updateRanges on BufferAttribute have ambiguous merging across backends; provide options.sourceBackend ("webgl" | "webgpu")'
+        );
+      }
+      if (isWebGPU) {
+        // WebGPU applies ranges individually (WebGPUAttributeUtils.js:223-272)
+        for (let i = 0; i < updateRanges.length; i++) {
+          const range = updateRanges[i];
+          stagedShadow.set(attribute.array.subarray(range.start, range.start + range.count), range.start);
+        }
+      } else {
+        // WebGL exact +1 merge: range.start <= prev.start + prev.count + 1 (WebGLAttributes.js:119)
+        // Deep-copy each { start, count } so originals are never mutated during preflight!
+        const rangesCopy = updateRanges
+          .map((r) => ({ start: r.start, count: r.count }))
+          .sort((a, b) => a.start - b.start);
+        let mergeIndex = 0;
+        for (let i = 1; i < rangesCopy.length; i++) {
+          const prev = rangesCopy[mergeIndex];
+          const cur = rangesCopy[i];
+          if (cur.start <= prev.start + prev.count + 1) {
+            prev.count = Math.max(prev.count, cur.start + cur.count - prev.start);
+          } else {
+            mergeIndex++;
+            rangesCopy[mergeIndex] = cur;
+          }
+        }
+        rangesCopy.length = mergeIndex + 1;
+        for (let i = 0; i < rangesCopy.length; i++) {
+          const range = rangesCopy[i];
+          stagedShadow.set(attribute.array.subarray(range.start, range.start + range.count), range.start);
+        }
+      }
+    }
+  }
+
+  if (stagedThisPass) {
+    stagedThisPass.set(attribute, stagedShadow);
+  }
+
+  const targetVersion = attribute.version;
+  pendingCommits.push(() => {
+    record.shadow = stagedShadow;
+    record.version = targetVersion;
+    if (clearRanges) {
+      attribute.clearUpdateRanges();
+    }
+  });
+
+  return stagedShadow;
+}
+
 /**
  * Extracts a complete, isolated typed-array snapshot of a Three.js Mesh + Camera.
  * Preserves source matrix-update boundaries without mutating application state.
@@ -491,6 +720,22 @@ export function extractMeshRenderData(mesh, camera, width, height, options = {})
   const posAttr = geometry.attributes.position;
   const totalVertexCount = posAttr.count;
   const indexAttr = geometry.index;
+
+  const residencyContext = options?.[RESIDENCY_CONTEXT];
+  const posShadow = residencyContext
+    ? resolveHostAttribute(residencyContext, posAttr, options.sourceBackend, geometry)
+    : null;
+  const indexShadow = (residencyContext && indexAttr)
+    ? resolveHostAttribute(residencyContext, indexAttr, options.sourceBackend, geometry)
+    : null;
+
+  const effectivePosAttr = posShadow
+    ? Object.create(posAttr, {
+        array: { value: posShadow, writable: true, configurable: true, enumerable: true }
+      })
+    : posAttr;
+
+  const effectiveIndexSource = indexShadow ?? indexAttr?.array;
 
   // Validate drawRange parameters
   const drawStart = geometry.drawRange?.start ?? 0;
@@ -528,7 +773,7 @@ export function extractMeshRenderData(mesh, camera, width, height, options = {})
       for (let i = 0; i < effectiveCount; i++) {
         // Element buffers consume raw integer indices; normalized applies to
         // vertex attributes only. getX() would normalize these into fractions.
-        const idx = indexAttr.array[drawStart + i];
+        const idx = effectiveIndexSource[drawStart + i];
         // Explicit bounds check to prevent silent conversion of undefined to 0
         if (idx === undefined || idx < 0 || idx >= totalVertexCount) {
           throw createAdmissionError(
@@ -542,9 +787,9 @@ export function extractMeshRenderData(mesh, camera, width, height, options = {})
       // Read vertex positions safely
       positions = new Float32Array(totalVertexCount * 3);
       for (let i = 0; i < totalVertexCount; i++) {
-        positions[i * 3] = posAttr.getX(i);
-        positions[i * 3 + 1] = posAttr.getY(i);
-        positions[i * 3 + 2] = posAttr.getZ(i);
+        positions[i * 3] = effectivePosAttr.getX(i);
+        positions[i * 3 + 1] = effectivePosAttr.getY(i);
+        positions[i * 3 + 2] = effectivePosAttr.getZ(i);
       }
       triangleCount = Math.floor(effectiveCount / 3);
     }
@@ -561,9 +806,9 @@ export function extractMeshRenderData(mesh, camera, width, height, options = {})
     positions = new Float32Array(effectiveCount * 3);
     for (let i = 0; i < effectiveCount; i++) {
       const vertIdx = drawStart + i;
-      positions[i * 3] = posAttr.getX(vertIdx);
-      positions[i * 3 + 1] = posAttr.getY(vertIdx);
-      positions[i * 3 + 2] = posAttr.getZ(vertIdx);
+      positions[i * 3] = effectivePosAttr.getX(vertIdx);
+      positions[i * 3 + 1] = effectivePosAttr.getY(vertIdx);
+      positions[i * 3 + 2] = effectivePosAttr.getZ(vertIdx);
     }
     indices = new Uint32Array(0);
     triangleCount = Math.floor(effectiveCount / 3);
@@ -794,7 +1039,7 @@ function buildSingleMeshCullPacket(snapshot, width, height, wasmModule, isCanvas
 export function prepareCanvasMeshPacket(mesh, camera, width, height, wasmModule, options = {}) {
   const snapshot = extractMeshRenderData(mesh, camera, width, height, options);
 
-  if (snapshot.side !== THREE_SIDE.DOUBLE_SIDE) {
+  if (snapshot.side !== THREE_SIDE.DOUBLE_SIDE || snapshot.colorWrite === false) {
     const packetBytes = buildSingleMeshCullPacket(snapshot, width, height, wasmModule, true, options);
     return { packetBytes, snapshot, target: 'canvas' };
   }
@@ -869,7 +1114,7 @@ export function prepareCanvasMeshPacket(mesh, camera, width, height, wasmModule,
 export function prepareCanvasMeshDepthPacket(mesh, camera, width, height, wasmModule, options = {}) {
   const snapshot = extractMeshRenderData(mesh, camera, width, height, options);
 
-  if (snapshot.side !== THREE_SIDE.DOUBLE_SIDE) {
+  if (snapshot.side !== THREE_SIDE.DOUBLE_SIDE || snapshot.colorWrite === false) {
     const packetBytes = buildSingleMeshCullPacket(snapshot, width, height, wasmModule, true, options);
     return { packetBytes, snapshot, target: 'canvas' };
   }
@@ -932,7 +1177,7 @@ export function prepareMeshPacket(mesh, camera, width, height, wasmModule, optio
 
   const snapshot = extractMeshRenderData(mesh, camera, width, height, options);
 
-  if (snapshot.side !== THREE_SIDE.DOUBLE_SIDE) {
+  if (snapshot.side !== THREE_SIDE.DOUBLE_SIDE || snapshot.colorWrite === false) {
     const packetBytes = buildSingleMeshCullPacket(snapshot, width, height, wasmModule, false, options);
     return { packetBytes, snapshot, target: 'offscreen' };
   }
@@ -1004,7 +1249,7 @@ export function prepareMeshPacket(mesh, camera, width, height, wasmModule, optio
 export function prepareMeshDepthPacket(mesh, camera, width, height, wasmModule, options = {}) {
   const snapshot = extractMeshRenderData(mesh, camera, width, height, options);
 
-  if (snapshot.side !== THREE_SIDE.DOUBLE_SIDE) {
+  if (snapshot.side !== THREE_SIDE.DOUBLE_SIDE || snapshot.colorWrite === false) {
     const packetBytes = buildSingleMeshCullPacket(snapshot, width, height, wasmModule, false, options);
     return { packetBytes, snapshot, target: 'offscreen' };
   }
@@ -1064,11 +1309,32 @@ export async function renderMesh(bridgeHost, mesh, camera, canvasContext, wasmMo
 
   const isCanvasTarget = canvasContext !== null && canvasContext !== undefined;
 
+  const residency = getHostResidency(bridgeHost);
+  const pendingCommits = [];
+  const residencyContext = residency ? {
+    residency,
+    pendingCommits,
+    stagedThisPass: new Map(),
+  } : null;
+
+  const renderOptions = {
+    ...options,
+    [RESIDENCY_CONTEXT]: residencyContext,
+  };
+
+  let packetBytes;
+  let snapshot;
+  let target;
+
   if (isCanvasTarget) {
     const side = mesh?.material?.side ?? THREE_SIDE.FRONT_SIDE;
     const isSidedMesh = side !== THREE_SIDE.DOUBLE_SIDE;
+    const colorWriteDisabled = mesh?.material?.colorWrite === false;
+    const hasColorCanvasExport = wasmModule && (
+      typeof wasmModule.f3d_build_mesh_batch_cull_depth_color_packet === 'function'
+    );
     const hasSidedCanvasExport = wasmModule && (
-      typeof wasmModule.f3d_build_mesh_batch_cull_depth_color_packet === 'function' ||
+      hasColorCanvasExport ||
       typeof wasmModule.f3d_build_mesh_batch_cull_depth_packet === 'function' ||
       typeof wasmModule.f3d_build_mesh_batch_cull_packet === 'function'
     );
@@ -1078,40 +1344,62 @@ export async function renderMesh(bridgeHost, mesh, camera, canvasContext, wasmMo
       typeof wasmModule.gpu_bridge_build_canvas_mesh_packet === 'function' ||
       typeof wasmModule.gpu_bridge_build_canvas_mesh_depth_packet === 'function'
     );
-    const hasCanvasExport = (isSidedMesh && hasSidedCanvasExport) || hasLegacyCanvasExport;
-    if (!hasCanvasExport) {
-      throw new Error(
-        'renderMesh refused: canvasContext provided for visible canvas rendering, but wasmModule ' +
-        'does not export f3d_build_canvas_mesh_packet. Silent offscreen-as-visible rendering is strictly forbidden.'
-      );
+    if (colorWriteDisabled) {
+      if (!hasColorCanvasExport) {
+        throw createAdmissionError(
+          'INCOMPATIBLE_COLOR_WRITE',
+          'Meshes with colorWrite=false require Wasm export f3d_build_mesh_batch_cull_depth_color_packet'
+        );
+      }
+    } else {
+      const hasCanvasExport = (isSidedMesh && hasSidedCanvasExport) || hasLegacyCanvasExport;
+      if (!hasCanvasExport) {
+        throw new Error(
+          'renderMesh refused: canvasContext provided for visible canvas rendering, but wasmModule ' +
+          'does not export f3d_build_canvas_mesh_packet. Silent offscreen-as-visible rendering is strictly forbidden.'
+        );
+      }
     }
     const width = canvasContext?.canvas?.width ?? options.width ?? 64;
     const height = canvasContext?.canvas?.height ?? options.height ?? 64;
-    const { packetBytes, snapshot } = prepareCanvasMeshPacket(
+    const prep = prepareCanvasMeshPacket(
       mesh,
       camera,
       width,
       height,
       wasmModule,
-      options,
+      renderOptions,
     );
-    const result = await bridgeHost.executePacket(packetBytes, canvasContext);
-    return { result, snapshot, target: 'canvas' };
+    packetBytes = prep.packetBytes;
+    snapshot = prep.snapshot;
+    target = 'canvas';
   } else {
     // Honest offscreen execution
     const width = options.width ?? 64;
     const height = options.height ?? 64;
-    const { packetBytes, snapshot } = prepareMeshPacket(
+    const prep = prepareMeshPacket(
       mesh,
       camera,
       width,
       height,
       wasmModule,
-      { ...options, target: 'offscreen' },
+      { ...renderOptions, target: 'offscreen' },
     );
-    const result = await bridgeHost.executePacket(packetBytes, null);
-    return { result, snapshot, target: 'offscreen' };
+    packetBytes = prep.packetBytes;
+    snapshot = prep.snapshot;
+    target = 'offscreen';
   }
+
+  const onSubmitted = () => {
+    pendingCommits.forEach((commit) => commit());
+  };
+
+  const result = await bridgeHost.executePacket(
+    packetBytes,
+    isCanvasTarget ? canvasContext : null,
+    onSubmitted
+  );
+  return { result, snapshot, target };
 }
 
 /**
@@ -1212,7 +1500,11 @@ export function prepareMeshBatchPacket(meshes, camera, width, height, wasmModule
     }
   }
 
-  if (firstDepthMismatch && typeof cullDepthBatchFn !== 'function') {
+  if (
+    firstDepthMismatch &&
+    typeof cullDepthColorBatchFn !== 'function' &&
+    typeof cullDepthBatchFn !== 'function'
+  ) {
     throw createAdmissionError(
       'INCOMPATIBLE_BATCH_DEPTH',
       `${firstDepthMismatch}; wasmModule lacks f3d_build_mesh_batch_cull_depth_packet export. Silent uniform-depth fallback is strictly forbidden.`
@@ -1414,16 +1706,36 @@ export async function renderMeshBatch(bridgeHost, meshes, camera, canvasContext,
   const width = canvasContext?.canvas?.width ?? options.width ?? 64;
   const height = canvasContext?.canvas?.height ?? options.height ?? 64;
 
+  const residency = getHostResidency(bridgeHost);
+  const pendingCommits = [];
+  const residencyContext = residency ? {
+    residency,
+    pendingCommits,
+    stagedThisPass: new Map(),
+  } : null;
+
   const batchResult = prepareMeshBatchPacket(
     meshes,
     camera,
     width,
     height,
     wasmModule,
-    { ...options, target: isCanvasTarget ? 'canvas' : 'offscreen' }
+    {
+      ...options,
+      target: isCanvasTarget ? 'canvas' : 'offscreen',
+      [RESIDENCY_CONTEXT]: residencyContext,
+    }
   );
 
-  const result = await bridgeHost.executePacket(batchResult.packetBytes, isCanvasTarget ? canvasContext : null);
+  const onSubmitted = () => {
+    pendingCommits.forEach((commit) => commit());
+  };
+
+  const result = await bridgeHost.executePacket(
+    batchResult.packetBytes,
+    isCanvasTarget ? canvasContext : null,
+    onSubmitted
+  );
   return {
     result,
     snapshots: batchResult.snapshots,
@@ -1603,7 +1915,10 @@ export async function renderScene(bridgeHost, scene, camera, canvasContext, wasm
   // If wasmModule lacks per-mesh depth export, refuse mixed depth settings;
   // if per-mesh depth export is present, admit mixed depth into the batch.
   const hasStateExport =
-    wasmModule && typeof wasmModule.f3d_build_mesh_batch_cull_depth_packet === 'function';
+    wasmModule && (
+      typeof wasmModule.f3d_build_mesh_batch_cull_depth_color_packet === 'function' ||
+      typeof wasmModule.f3d_build_mesh_batch_cull_depth_packet === 'function'
+    );
 
   if (!hasStateExport && admittedItems.length > 1) {
     const firstMat = admittedItems[0].mesh.material;
@@ -1717,18 +2032,36 @@ export async function renderScene(bridgeHost, scene, camera, canvasContext, wasm
   const width = canvasContext?.canvas?.width ?? options.width ?? 64;
   const height = canvasContext?.canvas?.height ?? options.height ?? 64;
 
+  const residency = getHostResidency(bridgeHost);
+  const pendingCommits = [];
+  const residencyContext = residency ? {
+    residency,
+    pendingCommits,
+    stagedThisPass: new Map(),
+  } : null;
+
   const batchResult = prepareMeshBatchPacket(
     admittedMeshes,
     camera,
     width,
     height,
     wasmModule,
-    { ...options, autoUpdate: false, target: isCanvasTarget ? 'canvas' : 'offscreen' }
+    {
+      ...options,
+      autoUpdate: false,
+      target: isCanvasTarget ? 'canvas' : 'offscreen',
+      [RESIDENCY_CONTEXT]: residencyContext,
+    }
   );
+
+  const onSubmitted = () => {
+    pendingCommits.forEach((commit) => commit());
+  };
 
   const result = await bridgeHost.executePacket(
     batchResult.packetBytes,
-    isCanvasTarget ? canvasContext : null
+    isCanvasTarget ? canvasContext : null,
+    onSubmitted
   );
 
   const response = {

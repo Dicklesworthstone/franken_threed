@@ -3255,31 +3255,806 @@ test('colorWrite: renderScene safely refuses with INCOMPATIBLE_COLOR_WRITE when 
   assert.equal(res.reason, 'INCOMPATIBLE_COLOR_WRITE');
 });
 
-test('colorWrite: single-mesh buildSingleMeshCullPacket passes colorWrites and refuses on missing export', () => {
+test('colorWrite: DoubleSide single APIs route colorWrite=false through cull_depth_color export (N=1, cullMode NONE)', () => {
   const camera = createBasicCamera();
-  const occluder = createDepthTriangleMesh({ colorWrite: false });
-  const snap = extractMeshRenderData(occluder, camera, 64, 64);
+  const doubleOccluder = createDepthTriangleMesh({ side: THREE.DoubleSide, colorWrite: false, depthWrite: true });
 
-  // Missing export throws INCOMPATIBLE_COLOR_WRITE
-  const mockWasmLegacy = {
-    f3d_build_mesh_batch_cull_depth_packet: () => new Uint8Array(0),
-  };
-  assert.throws(
-    () => buildSingleMeshCullPacket(snap, 64, 64, mockWasmLegacy, false),
-    (err) => err.reason === 'INCOMPATIBLE_COLOR_WRITE'
-  );
-
-  // Present export captures colorWrites = [0]
-  let capturedColor = null;
+  let capturedCanvas = null;
+  let capturedOffscreen = null;
   const mockWasm = {
     f3d_build_mesh_batch_cull_depth_color_packet: (
-      p, v, m, pr, c, cm, ff, dt, dw, dc, cw, w, h, wd, cv
+      p, v, m, pr, c, cm, ff, dt, dw, dc, cw, w, h, wd, canvas
     ) => {
-      capturedColor = Array.from(cw);
-      return new Uint8Array([0xCC]);
+      const info = {
+        vertexCount: v[0],
+        cullMode: cm[0],
+        frontFace: ff[0],
+        colorWrite: cw[0],
+        depthWrite: dw[0],
+        canvas,
+      };
+      if (canvas) {
+        capturedCanvas = info;
+      } else {
+        capturedOffscreen = info;
+      }
+      return new Uint8Array([0x55]);
     },
   };
-  const pkt = buildSingleMeshCullPacket(snap, 64, 64, mockWasm, false);
-  assert.deepEqual(capturedColor, [0]);
-  assert.deepEqual(pkt, new Uint8Array([0xCC]));
+
+  // 1. prepareMeshPacket (offscreen)
+  const res1 = prepareMeshPacket(doubleOccluder, camera, 64, 64, mockWasm);
+  assert.equal(res1.target, 'offscreen');
+  assert.equal(capturedOffscreen.vertexCount, 3);
+  assert.equal(capturedOffscreen.cullMode, 0); // NONE
+  assert.equal(capturedOffscreen.frontFace, 0); // CCW
+  assert.equal(capturedOffscreen.colorWrite, 0); // false
+  assert.equal(capturedOffscreen.canvas, false);
+
+  // 2. prepareMeshDepthPacket (offscreen)
+  capturedOffscreen = null;
+  const res2 = prepareMeshDepthPacket(doubleOccluder, camera, 64, 64, mockWasm);
+  assert.equal(res2.target, 'offscreen');
+  assert.equal(capturedOffscreen.colorWrite, 0);
+  assert.equal(capturedOffscreen.cullMode, 0);
+
+  // 3. prepareCanvasMeshPacket (canvas)
+  const res3 = prepareCanvasMeshPacket(doubleOccluder, camera, 64, 64, mockWasm);
+  assert.equal(res3.target, 'canvas');
+  assert.equal(capturedCanvas.vertexCount, 3);
+  assert.equal(capturedCanvas.cullMode, 0);
+  assert.equal(capturedCanvas.colorWrite, 0);
+  assert.equal(capturedCanvas.canvas, true);
+
+  // 4. prepareCanvasMeshDepthPacket (canvas)
+  capturedCanvas = null;
+  const res4 = prepareCanvasMeshDepthPacket(doubleOccluder, camera, 64, 64, mockWasm);
+  assert.equal(res4.target, 'canvas');
+  assert.equal(capturedCanvas.colorWrite, 0);
+  assert.equal(capturedCanvas.cullMode, 0);
+  assert.equal(capturedCanvas.canvas, true);
+});
+
+test('colorWrite: DoubleSide single APIs refuse colorWrite=false when cull_depth_color export is missing', () => {
+  const camera = createBasicCamera();
+  const doubleOccluder = createDepthTriangleMesh({ side: THREE.DoubleSide, colorWrite: false });
+
+  // Only legacy single exports and older batch exports available
+  const mockWasmLegacy = {
+    f3d_build_mesh_packet: () => new Uint8Array(0),
+    f3d_build_mesh_depth_packet: () => new Uint8Array(0),
+    f3d_build_canvas_mesh_packet: () => new Uint8Array(0),
+    f3d_build_canvas_mesh_depth_packet: () => new Uint8Array(0),
+    f3d_build_mesh_batch_cull_depth_packet: () => new Uint8Array(0),
+    f3d_build_mesh_batch_cull_packet: () => new Uint8Array(0),
+  };
+
+  assert.throws(
+    () => prepareMeshPacket(doubleOccluder, camera, 64, 64, mockWasmLegacy),
+    (err) => err.reason === 'INCOMPATIBLE_COLOR_WRITE'
+  );
+  assert.throws(
+    () => prepareMeshDepthPacket(doubleOccluder, camera, 64, 64, mockWasmLegacy),
+    (err) => err.reason === 'INCOMPATIBLE_COLOR_WRITE'
+  );
+  assert.throws(
+    () => prepareCanvasMeshPacket(doubleOccluder, camera, 64, 64, mockWasmLegacy),
+    (err) => err.reason === 'INCOMPATIBLE_COLOR_WRITE'
+  );
+  assert.throws(
+    () => prepareCanvasMeshDepthPacket(doubleOccluder, camera, 64, 64, mockWasmLegacy),
+    (err) => err.reason === 'INCOMPATIBLE_COLOR_WRITE'
+  );
+});
+
+test('colorWrite: renderMesh canvas preflight admits and executes DoubleSide colorWrite=false with new export', async () => {
+  const camera = createBasicCamera();
+  const doubleOccluder = createDepthTriangleMesh({ side: THREE.DoubleSide, colorWrite: false });
+  const mockCanvasContext = { canvas: { width: 64, height: 64 } };
+
+  let executedBytes = null;
+  const mockWasm = {
+    f3d_build_mesh_batch_cull_depth_color_packet: (
+      p, v, m, pr, c, cm, ff, dt, dw, dc, cw, w, h, wd, canvas
+    ) => {
+      assert.equal(cm[0], 0);
+      assert.equal(cw[0], 0);
+      assert.equal(canvas, true);
+      return new Uint8Array([0x77]);
+    },
+  };
+  const mockBridgeHost = {
+    executePacket: async (bytes) => {
+      executedBytes = bytes;
+      return { status: 'OK' };
+    },
+  };
+
+  const res = await renderMesh(mockBridgeHost, doubleOccluder, camera, mockCanvasContext, mockWasm);
+  assert.equal(res.target, 'canvas');
+  assert.deepEqual(executedBytes, new Uint8Array([0x77]));
+});
+
+test('colorWrite: renderMesh canvas preflight strictly refuses colorWrite=false when cull_depth_color export is missing', async () => {
+  const camera = createBasicCamera();
+  const doubleOccluder = createDepthTriangleMesh({ side: THREE.DoubleSide, colorWrite: false });
+  const sidedOccluder = createDepthTriangleMesh({ side: THREE.FrontSide, colorWrite: false });
+  const mockCanvasContext = { canvas: { width: 64, height: 64 } };
+
+  // Wasm has legacy canvas exports and older cull exports, but lacks cull_depth_color
+  const mockWasmLegacy = {
+    f3d_build_canvas_mesh_packet: () => new Uint8Array(0),
+    f3d_build_canvas_mesh_depth_packet: () => new Uint8Array(0),
+    f3d_build_mesh_batch_cull_depth_packet: () => new Uint8Array(0),
+    f3d_build_mesh_batch_cull_packet: () => new Uint8Array(0),
+  };
+  const mockBridgeHost = {
+    executePacket: async () => { throw new Error('should not execute'); },
+  };
+
+  await assert.rejects(
+    async () => {
+      await renderMesh(mockBridgeHost, doubleOccluder, camera, mockCanvasContext, mockWasmLegacy);
+    },
+    (err) => err.reason === 'INCOMPATIBLE_COLOR_WRITE'
+  );
+  await assert.rejects(
+    async () => {
+      await renderMesh(mockBridgeHost, sidedOccluder, camera, mockCanvasContext, mockWasmLegacy);
+    },
+    (err) => err.reason === 'INCOMPATIBLE_COLOR_WRITE'
+  );
+});
+
+test('colorWrite: default true-color DoubleSide single APIs preserve existing legacy export routing', () => {
+  const camera = createBasicCamera();
+  const normalDouble = createDepthTriangleMesh({ side: THREE.DoubleSide, colorWrite: true });
+
+  let legacyMeshPacketCalled = false;
+  let legacyCanvasPacketCalled = false;
+  const mockWasmLegacy = {
+    f3d_build_mesh_depth_packet: () => {
+      legacyMeshPacketCalled = true;
+      return new Uint8Array([0x11]);
+    },
+    f3d_build_canvas_mesh_depth_packet: () => {
+      legacyCanvasPacketCalled = true;
+      return new Uint8Array([0x22]);
+    },
+  };
+
+  const resMesh = prepareMeshDepthPacket(normalDouble, camera, 64, 64, mockWasmLegacy);
+  assert.equal(legacyMeshPacketCalled, true);
+  assert.deepEqual(resMesh.packetBytes, new Uint8Array([0x11]));
+
+  const resCanvas = prepareCanvasMeshDepthPacket(normalDouble, camera, 64, 64, mockWasmLegacy);
+  assert.equal(legacyCanvasPacketCalled, true);
+  assert.deepEqual(resCanvas.packetBytes, new Uint8Array([0x22]));
+});
+
+test('Mixed depth + color: prepareMeshBatchPacket admits mixed depth when ONLY cull_depth_color export is present', () => {
+  const camera = createBasicCamera();
+  const meshA = createDepthTriangleMesh({ depthWrite: true, colorWrite: true });
+  const meshB = createDepthTriangleMesh({ depthWrite: false, colorWrite: false });
+
+  let captured = null;
+  // Wasm has ONLY f3d_build_mesh_batch_cull_depth_color_packet
+  const mockWasmNewOnly = {
+    f3d_build_mesh_batch_cull_depth_color_packet: (
+      p, v, m, pr, c, cm, ff, dt, dw, dc, cw, w, h, wd, canvas
+    ) => {
+      captured = {
+        depthWrites: Array.from(dw),
+        colorWrites: Array.from(cw),
+      };
+      return new Uint8Array([0x99]);
+    },
+  };
+
+  const res = prepareMeshBatchPacket([meshA, meshB], camera, 64, 64, mockWasmNewOnly);
+  assert.equal(res.meshCount, 2);
+  assert.deepEqual(captured.depthWrites, [1, 0]);
+  assert.deepEqual(captured.colorWrites, [1, 0]);
+});
+
+test('Mixed depth + color: renderScene admits mixed depth when ONLY cull_depth_color export is present', async () => {
+  const scene = new THREE.Scene();
+  const camera = createBasicCamera();
+  const meshA = createDepthTriangleMesh({ depthWrite: true, colorWrite: true });
+  const meshB = createDepthTriangleMesh({ depthWrite: false, colorWrite: true });
+  scene.add(meshA);
+  scene.add(meshB);
+
+  let executed = false;
+  const mockWasmNewOnly = {
+    f3d_build_mesh_batch_cull_depth_color_packet: (
+      p, v, m, pr, c, cm, ff, dt, dw, dc, cw, w, h, wd, canvas
+    ) => {
+      assert.deepEqual(Array.from(dw), [1, 0]);
+      assert.deepEqual(Array.from(cw), [1, 1]);
+      return new Uint8Array([0x88]);
+    },
+  };
+  const mockBridgeHost = {
+    executePacket: async (bytes) => {
+      executed = true;
+      assert.deepEqual(bytes, new Uint8Array([0x88]));
+      return { status: 'OK' };
+    },
+  };
+
+  const res = await renderScene(mockBridgeHost, scene, camera, null, mockWasmNewOnly);
+  assert.equal(executed, true);
+  assert.equal(res.refused.length, 0);
+  assert.equal(res.admitted.length, 2);
+});
+
+test('Geometry residency: in-place array mutation without needsUpdate keeps GPU-stale shadow in renderMesh', async () => {
+  const camera = createBasicCamera();
+  const geometry = new THREE.BufferGeometry();
+  const posArray = new Float32Array([-1, -1, -2, 1, -1, -2, 0, 1, -2]);
+  const position = new THREE.BufferAttribute(posArray, 3);
+  geometry.setAttribute('position', position);
+  const mesh = new THREE.Mesh(
+    geometry,
+    new THREE.MeshBasicMaterial({ color: 0xff0000, side: THREE.DoubleSide, depthTest: false, depthWrite: false })
+  );
+
+  let capturedPositions = null;
+  const mockWasm = {
+    f3d_build_mesh_packet: (pos) => {
+      capturedPositions = Array.from(pos);
+      return new Uint8Array([0x01]);
+    },
+    f3d_build_mesh_depth_packet: (pos) => {
+      capturedPositions = Array.from(pos);
+      return new Uint8Array([0x01]);
+    },
+  };
+  const mockHost = {
+    deviceGeneration: 0,
+    device: {},
+    executePacket: async (bytes, ctx, onSubmitted) => {
+      if (typeof onSubmitted === 'function') onSubmitted();
+      return { status: 'OK' };
+    },
+  };
+
+  // Frame 1: initial render
+  await renderMesh(mockHost, mesh, camera, null, mockWasm);
+  assert.deepEqual(capturedPositions, [-1, -1, -2, 1, -1, -2, 0, 1, -2]);
+
+  // Frame 2: mutate CPU array in-place WITHOUT needsUpdate = true (version remains 0)
+  for (let i = 0; i < posArray.length; i += 3) posArray[i] += 5.0;
+  assert.equal(position.version, 0);
+
+  // Render frame 2: must upload the GPU-stale shadow, NOT the mutated CPU array!
+  await renderMesh(mockHost, mesh, camera, null, mockWasm);
+  assert.deepEqual(capturedPositions, [-1, -1, -2, 1, -1, -2, 0, 1, -2]);
+
+  // Frame 3: explicit needsUpdate = true bumps version to 1
+  position.needsUpdate = true;
+  assert.equal(position.version, 1);
+
+  await renderMesh(mockHost, mesh, camera, null, mockWasm);
+  assert.deepEqual(capturedPositions, [-1 + 5.0, -1, -2, 1 + 5.0, -1, -2, 5.0, 1, -2]);
+});
+
+test('Geometry residency: partial updateRanges patches only specified components and preserves stale gaps', async () => {
+  const camera = createBasicCamera();
+  const geometry = new THREE.BufferGeometry();
+  const posArray = new Float32Array([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+  const position = new THREE.BufferAttribute(posArray, 3);
+  geometry.setAttribute('position', position);
+  const mesh = new THREE.Mesh(
+    geometry,
+    new THREE.MeshBasicMaterial({ side: THREE.DoubleSide, depthTest: false, depthWrite: false })
+  );
+
+  let captured = null;
+  const mockWasm = {
+    f3d_build_mesh_packet: (pos) => {
+      captured = Array.from(pos);
+      return new Uint8Array([0x01]);
+    },
+    f3d_build_mesh_depth_packet: (pos) => {
+      captured = Array.from(pos);
+      return new Uint8Array([0x01]);
+    },
+  };
+  const mockHost = {
+    deviceGeneration: 0,
+    device: {},
+    executePacket: async (bytes, ctx, onSubmitted) => {
+      if (typeof onSubmitted === 'function') onSubmitted();
+      return { status: 'OK' };
+    },
+  };
+
+  // Initial render
+  await renderMesh(mockHost, mesh, camera, null, mockWasm);
+  assert.deepEqual(captured, [1, 2, 3, 4, 5, 6, 7, 8, 9]);
+
+  // Mutate elements on CPU, but only add updateRange for elements [0..3]
+  posArray[0] = 10;
+  posArray[1] = 20;
+  posArray[2] = 30;
+  posArray[3] = 999; // Element 3 is outside the updateRange!
+  position.addUpdateRange(0, 3); // Update only first 3 components
+  position.needsUpdate = true;
+
+  await renderMesh(mockHost, mesh, camera, null, mockWasm);
+  // Elements [0..2] are updated to [10, 20, 30], element 3 remains GPU-stale (4), NOT 999!
+  assert.deepEqual(captured, [10, 20, 30, 4, 5, 6, 7, 8, 9]);
+  // updateRanges must be cleared upon successful commit
+  assert.equal(position.updateRanges.length, 0);
+});
+
+test('Geometry residency: WebGPU DynamicDrawUsage auto-uploads while WebGL strictly requires version bump', async () => {
+  const camera = createBasicCamera();
+  const geometry = new THREE.BufferGeometry();
+  const posArray = new Float32Array([1, 1, 1, 2, 2, 2, 3, 3, 3]);
+  const position = new THREE.BufferAttribute(posArray, 3);
+  position.usage = THREE.DynamicDrawUsage; // 35048
+  geometry.setAttribute('position', position);
+  const mesh = new THREE.Mesh(
+    geometry,
+    new THREE.MeshBasicMaterial({ side: THREE.DoubleSide, depthTest: false, depthWrite: false })
+  );
+
+  let captured = null;
+  const mockWasm = {
+    f3d_build_mesh_packet: (pos) => {
+      captured = Array.from(pos);
+      return new Uint8Array([0x01]);
+    },
+    f3d_build_mesh_depth_packet: (pos) => {
+      captured = Array.from(pos);
+      return new Uint8Array([0x01]);
+    },
+  };
+  const mockHost = {
+    deviceGeneration: 0,
+    device: {},
+    executePacket: async (bytes, ctx, onSubmitted) => {
+      if (typeof onSubmitted === 'function') onSubmitted();
+      return { status: 'OK' };
+    },
+  };
+
+  // Ambiguous without options.sourceBackend -> must refuse
+  assert.equal(canAdmitMesh(mesh, camera).admitted, false);
+  assert.equal(canAdmitMesh(mesh, camera).code, 'AMBIGUOUS_ATTRIBUTE_UPDATE');
+  await assert.rejects(
+    async () => {
+      await renderMesh(mockHost, mesh, camera, null, mockWasm);
+    },
+    (err) => err.reason === 'AMBIGUOUS_ATTRIBUTE_UPDATE'
+  );
+
+  // WebGL source backend: DynamicDrawUsage does NOT bypass version gate
+  await renderMesh(mockHost, mesh, camera, null, mockWasm, { sourceBackend: 'webgl' });
+  assert.deepEqual(captured, [1, 1, 1, 2, 2, 2, 3, 3, 3]);
+
+  posArray[0] = 77;
+  await renderMesh(mockHost, mesh, camera, null, mockWasm, { sourceBackend: 'webgl' });
+  // Stays stale under WebGL
+  assert.equal(captured[0], 1);
+
+  // WebGPU source backend: DynamicDrawUsage updates on every render even with version 0
+  const mockHostWebGPU = {
+    deviceGeneration: 0,
+    device: {},
+    executePacket: async (bytes, ctx, onSubmitted) => {
+      if (typeof onSubmitted === 'function') onSubmitted();
+      return { status: 'OK' };
+    },
+  };
+  await renderMesh(mockHostWebGPU, mesh, camera, null, mockWasm, { sourceBackend: 'webgpu' });
+  assert.equal(captured[0], 77);
+
+  posArray[0] = 88;
+  await renderMesh(mockHostWebGPU, mesh, camera, null, mockWasm, { sourceBackend: 'webgpu' });
+  assert.equal(captured[0], 88);
+});
+
+test('Geometry residency: multiple updateRanges deep copies ranges and merges with +1 rule in WebGL', async () => {
+  const camera = createBasicCamera();
+  const geometry = new THREE.BufferGeometry();
+  const posArray = new Float32Array([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+  const position = new THREE.BufferAttribute(posArray, 3);
+  geometry.setAttribute('position', position);
+  const mesh = new THREE.Mesh(
+    geometry,
+    new THREE.MeshBasicMaterial({ side: THREE.DoubleSide, depthTest: false, depthWrite: false })
+  );
+
+  let captured = null;
+  const mockWasm = {
+    f3d_build_mesh_packet: (pos) => {
+      captured = Array.from(pos);
+      return new Uint8Array([0x01]);
+    },
+    f3d_build_mesh_depth_packet: (pos) => {
+      captured = Array.from(pos);
+      return new Uint8Array([0x01]);
+    },
+  };
+  const mockHost = {
+    deviceGeneration: 0,
+    device: {},
+    executePacket: async (bytes, ctx, onSubmitted) => {
+      if (typeof onSubmitted === 'function') onSubmitted();
+      return { status: 'OK' };
+    },
+  };
+
+  // Initial render
+  await renderMesh(mockHost, mesh, camera, null, mockWasm, { sourceBackend: 'webgl' });
+  assert.deepEqual(captured, [1, 2, 3, 4, 5, 6, 7, 8, 9]);
+
+  // Mutate elements on CPU
+  for (let i = 0; i < 9; i++) posArray[i] = (i + 1) * 10;
+
+  // Add 2 ranges with a 1-element gap: [0..1] and [2..3]
+  // In WebGL: prev.start=0, prev.count=1; cur.start=2 <= 0 + 1 + 1 (2 <= 2) -> MERGES into [0..3]!
+  // Including gap element index 1!
+  position.addUpdateRange(0, 1);
+  position.addUpdateRange(2, 1);
+  position.needsUpdate = true;
+
+  // Capture original range objects to prove they are NOT mutated during preflight (Point 5)
+  const range0Original = { ...position.updateRanges[0] };
+  const range1Original = { ...position.updateRanges[1] };
+
+  // Without sourceBackend -> refuses AMBIGUOUS_ATTRIBUTE_UPDATE
+  await assert.rejects(
+    async () => {
+      await renderMesh(mockHost, mesh, camera, null, mockWasm);
+    },
+    (err) => err.reason === 'AMBIGUOUS_ATTRIBUTE_UPDATE'
+  );
+
+  // Original range objects were NOT mutated by preflight failure
+  assert.equal(position.updateRanges[0].count, range0Original.count);
+  assert.equal(position.updateRanges[1].count, range1Original.count);
+
+  // Render with WebGL backend: merges across the 1-element gap
+  await renderMesh(mockHost, mesh, camera, null, mockWasm, { sourceBackend: 'webgl' });
+  // Elements [0..2] updated to [10, 20, 30], element 3+ remains stale [4, 5, 6, 7, 8, 9]
+  assert.deepEqual(captured, [10, 20, 30, 4, 5, 6, 7, 8, 9]);
+});
+
+test('Geometry residency: custom onUploadCallback is rejected with UNSUPPORTED_UPLOAD_CALLBACK', async () => {
+  const camera = createBasicCamera();
+  const geometry = new THREE.BufferGeometry();
+  const posAttr = new THREE.BufferAttribute(new Float32Array([0, 0, 0, 1, 1, 1, 2, 2, 2]), 3);
+  posAttr.onUpload(() => {}); // Custom callback registered
+  geometry.setAttribute('position', posAttr);
+  const mesh = new THREE.Mesh(
+    geometry,
+    new THREE.MeshBasicMaterial({ side: THREE.DoubleSide, depthTest: false, depthWrite: false })
+  );
+
+  assert.equal(canAdmitMesh(mesh, camera).admitted, false);
+  assert.equal(canAdmitMesh(mesh, camera).code, 'UNSUPPORTED_UPLOAD_CALLBACK');
+});
+
+test('Geometry residency: resizing buffer attribute throws INVALID_ATTRIBUTE_RESIZE', async () => {
+  const camera = createBasicCamera();
+  const geometry = new THREE.BufferGeometry();
+  const posAttr = new THREE.BufferAttribute(new Float32Array([0, 0, 0, 1, 1, 1, 2, 2, 2]), 3);
+  geometry.setAttribute('position', posAttr);
+  const mesh = new THREE.Mesh(
+    geometry,
+    new THREE.MeshBasicMaterial({ side: THREE.DoubleSide, depthTest: false, depthWrite: false })
+  );
+
+  const mockWasm = {
+    f3d_build_mesh_packet: () => new Uint8Array(0),
+    f3d_build_mesh_depth_packet: () => new Uint8Array(0),
+  };
+  const mockHost = {
+    deviceGeneration: 0,
+    device: {},
+    executePacket: async (bytes, ctx, onSubmitted) => {
+      if (typeof onSubmitted === 'function') onSubmitted();
+      return { status: 'OK' };
+    },
+  };
+
+  await renderMesh(mockHost, mesh, camera, null, mockWasm);
+
+  // Replace array with different length and bump version
+  posAttr.array = new Float32Array([0, 0, 0, 1, 1, 1]); // 6 instead of 9
+  posAttr.needsUpdate = true;
+
+  await assert.rejects(
+    async () => {
+      await renderMesh(mockHost, mesh, camera, null, mockWasm);
+    },
+    (err) => err.reason === 'INVALID_ATTRIBUTE_RESIZE'
+  );
+});
+
+test('Geometry residency: executePacket error does NOT commit shadow or clear updateRanges', async () => {
+  const camera = createBasicCamera();
+  const geometry = new THREE.BufferGeometry();
+  const posArray = new Float32Array([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+  const posAttr = new THREE.BufferAttribute(posArray, 3);
+  geometry.setAttribute('position', posAttr);
+  const mesh = new THREE.Mesh(
+    geometry,
+    new THREE.MeshBasicMaterial({ side: THREE.DoubleSide, depthTest: false, depthWrite: false })
+  );
+
+  let captured = null;
+  const mockWasm = {
+    f3d_build_mesh_packet: (pos) => {
+      captured = Array.from(pos);
+      return new Uint8Array([0x01]);
+    },
+    f3d_build_mesh_depth_packet: (pos) => {
+      captured = Array.from(pos);
+      return new Uint8Array([0x01]);
+    },
+  };
+  let shouldFail = false;
+  const mockHost = {
+    deviceGeneration: 0,
+    device: {},
+    executePacket: async (bytes, ctx, onSubmitted) => {
+      if (shouldFail) {
+        throw new Error('GPU submission encoder error');
+      }
+      if (typeof onSubmitted === 'function') onSubmitted();
+      return { status: 'OK' };
+    },
+  };
+
+  await renderMesh(mockHost, mesh, camera, null, mockWasm);
+  assert.equal(captured[0], 1);
+
+  // Mutate CPU array with needsUpdate and updateRange
+  posArray[0] = 77;
+  posAttr.addUpdateRange(0, 3);
+  posAttr.needsUpdate = true;
+  assert.equal(posAttr.updateRanges.length, 1);
+
+  // Fail execution before onSubmitted
+  shouldFail = true;
+  await assert.rejects(
+    async () => {
+      await renderMesh(mockHost, mesh, camera, null, mockWasm);
+    },
+    /GPU submission encoder error/
+  );
+
+  // Because execution failed, updateRanges must NOT have been cleared!
+  assert.equal(posAttr.updateRanges.length, 1);
+
+  // Now succeed: onSubmitted will run and commit
+  shouldFail = false;
+  await renderMesh(mockHost, mesh, camera, null, mockWasm);
+  assert.equal(captured[0], 77);
+  assert.equal(posAttr.updateRanges.length, 0);
+});
+
+test('Geometry residency: deviceGeneration or device identity change discards shadow and re-uploads', async () => {
+  const camera = createBasicCamera();
+  const geometry = new THREE.BufferGeometry();
+  const posArray = new Float32Array([1, 1, 1, 2, 2, 2, 3, 3, 3]);
+  const posAttr = new THREE.BufferAttribute(posArray, 3);
+  geometry.setAttribute('position', posAttr);
+  const mesh = new THREE.Mesh(
+    geometry,
+    new THREE.MeshBasicMaterial({ side: THREE.DoubleSide, depthTest: false, depthWrite: false })
+  );
+
+  let captured = null;
+  const mockWasm = {
+    f3d_build_mesh_packet: (pos) => {
+      captured = Array.from(pos);
+      return new Uint8Array([0x01]);
+    },
+    f3d_build_mesh_depth_packet: (pos) => {
+      captured = Array.from(pos);
+      return new Uint8Array([0x01]);
+    },
+  };
+  const mockHost = {
+    deviceGeneration: 0,
+    device: { id: 'device-1' },
+    executePacket: async (bytes, ctx, onSubmitted) => {
+      if (typeof onSubmitted === 'function') onSubmitted();
+      return { status: 'OK' };
+    },
+  };
+
+  await renderMesh(mockHost, mesh, camera, null, mockWasm);
+  assert.equal(captured[0], 1);
+
+  // In-place mutation without version bump
+  posArray[0] = 55;
+  // Next render on same generation & same device sees stale shadow
+  await renderMesh(mockHost, mesh, camera, null, mockWasm);
+  assert.equal(captured[0], 1);
+
+  // 1. Device identity changes (new device object, same generation) -> invalidates!
+  mockHost.device = { id: 'device-2' };
+  await renderMesh(mockHost, mesh, camera, null, mockWasm);
+  assert.equal(captured[0], 55);
+
+  // Mutate again without version bump
+  posArray[0] = 66;
+  await renderMesh(mockHost, mesh, camera, null, mockWasm);
+  assert.equal(captured[0], 55);
+
+  // 2. Device generation increments -> invalidates!
+  mockHost.deviceGeneration++;
+  await renderMesh(mockHost, mesh, camera, null, mockWasm);
+  assert.equal(captured[0], 66);
+
+  // Ensure no listener buildup across multiple generation / device changes (Mail 18586)
+  assert.equal(geometry._listeners?.dispose?.length, 1);
+});
+
+test('Geometry residency: multi-host geometry disposal evicts shadows without public property mutation', async () => {
+  const camera = createBasicCamera();
+  const geometry = new THREE.BufferGeometry();
+  const posArray = new Float32Array([1, 1, 1, 2, 2, 2, 3, 3, 3]);
+  const posAttr = new THREE.BufferAttribute(posArray, 3);
+  geometry.setAttribute('position', posAttr);
+  const mesh = new THREE.Mesh(
+    geometry,
+    new THREE.MeshBasicMaterial({ side: THREE.DoubleSide, depthTest: false, depthWrite: false })
+  );
+
+  let capturedA = null;
+  let capturedB = null;
+  const mockWasmA = {
+    f3d_build_mesh_packet: (pos) => { capturedA = Array.from(pos); return new Uint8Array([0x01]); },
+    f3d_build_mesh_depth_packet: (pos) => { capturedA = Array.from(pos); return new Uint8Array([0x01]); },
+  };
+  const mockWasmB = {
+    f3d_build_mesh_packet: (pos) => { capturedB = Array.from(pos); return new Uint8Array([0x01]); },
+    f3d_build_mesh_depth_packet: (pos) => { capturedB = Array.from(pos); return new Uint8Array([0x01]); },
+  };
+  const mockHostA = {
+    deviceGeneration: 0,
+    device: {},
+    executePacket: async (bytes, ctx, onSubmitted) => { if (onSubmitted) onSubmitted(); return { status: 'OK' }; },
+  };
+  const mockHostB = {
+    deviceGeneration: 0,
+    device: {},
+    executePacket: async (bytes, ctx, onSubmitted) => { if (onSubmitted) onSubmitted(); return { status: 'OK' }; },
+  };
+
+  // Render on host A and host B
+  await renderMesh(mockHostA, mesh, camera, null, mockWasmA);
+  await renderMesh(mockHostB, mesh, camera, null, mockWasmB);
+  assert.equal(capturedA[0], 1);
+  assert.equal(capturedB[0], 1);
+
+  // Must NOT attach public flag to geometry (Point 2)
+  assert.equal(geometry._f3d_disposal_registered, undefined);
+
+  // In-place mutation
+  posArray[0] = 99;
+  // Both hosts see stale shadow
+  await renderMesh(mockHostA, mesh, camera, null, mockWasmA);
+  await renderMesh(mockHostB, mesh, camera, null, mockWasmB);
+  assert.equal(capturedA[0], 1);
+  assert.equal(capturedB[0], 1);
+
+  // Dispose geometry -> must evict shadows in BOTH host residencies
+  geometry.dispose();
+
+  // Next render on host A and host B both re-upload fresh CPU data
+  await renderMesh(mockHostA, mesh, camera, null, mockWasmA);
+  await renderMesh(mockHostB, mesh, camera, null, mockWasmB);
+  assert.equal(capturedA[0], 99);
+  assert.equal(capturedB[0], 99);
+});
+
+test('Geometry residency: pure prepareMeshPacket does not cache or retain shadow (stateless snapshot)', () => {
+  const camera = createBasicCamera();
+  const geometry = new THREE.BufferGeometry();
+  const posArray = new Float32Array([1, 1, 1, 2, 2, 2, 3, 3, 3]);
+  const posAttr = new THREE.BufferAttribute(posArray, 3);
+  geometry.setAttribute('position', posAttr);
+  const mesh = new THREE.Mesh(
+    geometry,
+    new THREE.MeshBasicMaterial({ side: THREE.DoubleSide, depthTest: false, depthWrite: false })
+  );
+
+  let captured = null;
+  const mockWasm = {
+    f3d_build_mesh_packet: (pos) => {
+      captured = Array.from(pos);
+      return new Uint8Array([0x01]);
+    },
+    f3d_build_mesh_depth_packet: (pos) => {
+      captured = Array.from(pos);
+      return new Uint8Array([0x01]);
+    },
+  };
+
+  prepareMeshPacket(mesh, camera, 64, 64, mockWasm);
+  assert.equal(captured[0], 1);
+
+  posArray[0] = 42;
+  // Pure preparation takes current CPU snapshot without needsUpdate
+  prepareMeshPacket(mesh, camera, 64, 64, mockWasm);
+  assert.equal(captured[0], 42);
+});
+
+test('Geometry residency: invalid updateRange refuses with INVALID_UPDATE_RANGE and leaves source state untouched', async () => {
+  const camera = createBasicCamera();
+  const geometry = new THREE.BufferGeometry();
+  const posArray = new Float32Array([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+  const position = new THREE.BufferAttribute(posArray, 3);
+  // Add invalid range (count 0) BEFORE initial render:
+  // Initial upload must ignore and preserve updateRanges per source (root 18546)
+  position.addUpdateRange(0, 0);
+  geometry.setAttribute('position', position);
+  const mesh = new THREE.Mesh(
+    geometry,
+    new THREE.MeshBasicMaterial({ side: THREE.DoubleSide, depthTest: false, depthWrite: false })
+  );
+
+  let captured = null;
+  const mockWasm = {
+    f3d_build_mesh_packet: (pos) => {
+      captured = Array.from(pos);
+      return new Uint8Array([0x01]);
+    },
+    f3d_build_mesh_depth_packet: (pos) => {
+      captured = Array.from(pos);
+      return new Uint8Array([0x01]);
+    },
+  };
+  const mockHost = {
+    deviceGeneration: 0,
+    device: {},
+    executePacket: async (bytes, ctx, onSubmitted) => {
+      if (typeof onSubmitted === 'function') onSubmitted();
+      return { status: 'OK' };
+    },
+  };
+
+  // Frame 1: Initial upload must succeed and preserve updateRanges untouched
+  await renderMesh(mockHost, mesh, camera, null, mockWasm);
+  assert.deepEqual(captured, [1, 2, 3, 4, 5, 6, 7, 8, 9]);
+  assert.equal(position.updateRanges.length, 1);
+  assert.equal(position.updateRanges[0].count, 0);
+
+  // Clear ranges and test consumed-range validation during update
+  const invalidRanges = [
+    { start: 0, count: 0 },
+    { start: 0, count: -2 },
+    { start: 0, count: 1.5 },
+    { start: -1, count: 3 },
+    { start: 0.5, count: 3 },
+    { start: 6, count: 5 }, // overflow (6 + 5 = 11 > 9)
+  ];
+
+  for (const inv of invalidRanges) {
+    position.clearUpdateRanges();
+    position.addUpdateRange(inv.start, inv.count);
+    position.needsUpdate = true;
+
+    await assert.rejects(
+      async () => {
+        await renderMesh(mockHost, mesh, camera, null, mockWasm);
+      },
+      (err) => err.reason === 'INVALID_UPDATE_RANGE'
+    );
+
+    // Source ranges must remain untouched on refusal
+    assert.equal(position.updateRanges.length, 1);
+    assert.equal(position.updateRanges[0].start, inv.start);
+    assert.equal(position.updateRanges[0].count, inv.count);
+  }
 });
