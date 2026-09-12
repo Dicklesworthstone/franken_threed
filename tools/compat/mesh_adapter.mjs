@@ -367,7 +367,9 @@ export function extractMeshRenderData(mesh, camera, width, height, options = {})
     } else {
       indices = new Uint32Array(effectiveCount);
       for (let i = 0; i < effectiveCount; i++) {
-        const idx = indexAttr.getX(drawStart + i);
+        // Element buffers consume raw integer indices; normalized applies to
+        // vertex attributes only. getX() would normalize these into fractions.
+        const idx = indexAttr.array[drawStart + i];
         // Explicit bounds check to prevent silent conversion of undefined to 0
         if (idx === undefined || idx < 0 || idx >= totalVertexCount) {
           throw new Error(`${ADMISSION_REJECTION.INDEX_OUT_OF_BOUNDS}: index ${idx} at position ${drawStart + i} exceeds vertex count ${totalVertexCount}`);

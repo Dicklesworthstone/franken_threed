@@ -283,6 +283,26 @@ test('Positive: Extracts indexed Three.js Mesh with strict ordering and expansio
   assert.deepEqual(Array.from(snapshot.expandedPositions.slice(15, 18)), [-1, -1, 0]);
 });
 
+test('Indexed snapshots preserve raw element indices when the attribute is normalized', () => {
+  const camera = createBasicCamera();
+  for (const ArrayType of [Uint16Array, Uint32Array]) {
+    const mesh = createBasicTriangleMesh();
+    const index = new THREE.BufferAttribute(new ArrayType([2, 2, 2, 0, 1, 2]), 1, true);
+    mesh.geometry.setIndex(index);
+    mesh.geometry.setDrawRange(3, 3);
+    assert.ok(index.getX(4) < 1, 'the normalized accessor differs from the element buffer');
+
+    const snapshot = extractMeshRenderData(mesh, camera, 64, 64);
+    assert.deepEqual(Array.from(snapshot.indices), [0, 1, 2]);
+    assert.deepEqual(snapshot.expandedPositions, mesh.geometry.attributes.position.array);
+    assert.equal(index.normalized, true, 'extraction must not mutate the source attribute');
+
+    index.array[5] = 3;
+    assert.throws(() => extractMeshRenderData(mesh, camera, 64, 64), /Index references vertex out of bounds/);
+    assert.deepEqual(Array.from(snapshot.indices), [0, 1, 2], 'prior snapshots retain their indices');
+  }
+});
+
 test('Positive: Empty indexed drawRange passes empty positions (root review invariant)', () => {
   const geometry = new THREE.BufferGeometry();
   const vertices = new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]);
