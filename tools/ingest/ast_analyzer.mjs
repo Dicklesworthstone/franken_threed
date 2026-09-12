@@ -119,6 +119,255 @@ function classifyDynamicImportArgument(sourceNode) {
 }
 
 /**
+ * Recursively collects all identifier names bound by a pattern.
+ * Supports Identifiers, AssignmentPatterns, RestElements, ObjectPatterns, and ArrayPatterns.
+ * @param {any} pattern
+ * @param {Set<string>} [out]
+ * @returns {Set<string>}
+ */
+function collectPatternIdentifiers(pattern, out = new Set()) {
+  if (!pattern) return out;
+  switch (pattern.type) {
+    case 'Identifier':
+      out.add(pattern.name);
+      break;
+    case 'AssignmentPattern':
+      collectPatternIdentifiers(pattern.left, out);
+      break;
+    case 'RestElement':
+      collectPatternIdentifiers(pattern.argument, out);
+      break;
+    case 'ObjectPattern':
+      for (const prop of pattern.properties) {
+        if (prop.type === 'Property') {
+          collectPatternIdentifiers(prop.value, out);
+        } else if (prop.type === 'RestElement') {
+          collectPatternIdentifiers(prop.argument, out);
+        }
+      }
+      break;
+    case 'ArrayPattern':
+      for (const elem of pattern.elements) {
+        if (elem) collectPatternIdentifiers(elem, out);
+      }
+      break;
+  }
+  return out;
+}
+
+const defaultVarBindingCache = new WeakMap();
+
+/**
+ * Checks whether any `var` declaration within a function or module body binds the target name,
+ * without descending across nested function or class boundaries.
+ * @param {any} bodyNode
+ * @param {string} name
+ * @param {WeakMap<any, Map<string, boolean>>} [cache]
+ * @returns {boolean}
+ */
+function hasVarBindingInFunctionScope(bodyNode, name, cache = defaultVarBindingCache) {
+  if (!bodyNode) return false;
+  let map = cache.get(bodyNode);
+  if (!map) {
+    map = new Map();
+    cache.set(bodyNode, map);
+  }
+  if (map.has(name)) return map.get(name);
+
+  let found = false;
+  walk.recursive(bodyNode, null, {
+    VariableDeclaration(decl, state, c) {
+      if (decl.kind === 'var') {
+        for (const d of decl.declarations) {
+          if (collectPatternIdentifiers(d.id).has(name)) {
+            found = true;
+          }
+        }
+      }
+      for (const d of decl.declarations) {
+        if (d.init) c(d.init, state);
+      }
+    },
+    FunctionDeclaration() {},
+    FunctionExpression() {},
+    ArrowFunctionExpression() {},
+    ClassDeclaration() {},
+    ClassExpression() {}
+  });
+
+  map.set(name, found);
+  return found;
+}
+
+/**
+ * Conservatively verifies whether an identifier (e.g. 'URL') is shadowed by any
+ * local declaration, import, parameter, loop header, catch clause, or hoisted `var`
+ * in any scope enclosing the node corresponding to `ancestors`.
+ * @param {string} name
+ * @param {any[]} ancestors
+ * @param {WeakMap<any, Map<string, boolean>>} [varCache]
+ * @returns {boolean}
+ */
+function isIdentifierShadowedAtAncestors(name, ancestors, varCache = defaultVarBindingCache) {
+  for (let i = ancestors.length - 2; i >= 0; i--) {
+    const ancestor = ancestors[i];
+    const child = ancestors[i + 1];
+    if (!ancestor) continue;
+
+    // 1. Function boundaries: parameters, function expression / declaration name, hoisted vars
+    if (
+      ancestor.type === 'FunctionDeclaration' ||
+      ancestor.type === 'FunctionExpression' ||
+      ancestor.type === 'ArrowFunctionExpression'
+    ) {
+      if (ancestor.id && ancestor.id.name === name) return true;
+      if (ancestor.params) {
+        for (const param of ancestor.params) {
+          if (collectPatternIdentifiers(param).has(name)) return true;
+        }
+      }
+      // Body var declarations only scope the function body, not default parameter initializers
+      if (child === ancestor.body && hasVarBindingInFunctionScope(ancestor.body, name, varCache)) return true;
+    }
+
+    // 2. Class declaration / expression self-name in class body
+    if (ancestor.type === 'ClassDeclaration' || ancestor.type === 'ClassExpression') {
+      if (ancestor.id && ancestor.id.name === name) return true;
+    }
+
+    // 3. BlockStatement / StaticBlock / Program body statements
+    if (ancestor.type === 'BlockStatement' || ancestor.type === 'StaticBlock' || ancestor.type === 'Program') {
+      const body = ancestor.body || [];
+      for (const stmt of body) {
+        if (stmt.type === 'VariableDeclaration') {
+          for (const d of stmt.declarations) {
+            if (collectPatternIdentifiers(d.id).has(name)) return true;
+          }
+        } else if (stmt.type === 'FunctionDeclaration') {
+          if (stmt.id && stmt.id.name === name) return true;
+        } else if (stmt.type === 'ClassDeclaration') {
+          if (stmt.id && stmt.id.name === name) return true;
+        } else if (stmt.type === 'ImportDeclaration') {
+          for (const spec of stmt.specifiers) {
+            if (spec.local && spec.local.name === name) return true;
+          }
+        } else if (stmt.type === 'ExportNamedDeclaration' && stmt.declaration) {
+          const decl = stmt.declaration;
+          if (decl.type === 'VariableDeclaration') {
+            for (const d of decl.declarations) {
+              if (collectPatternIdentifiers(d.id).has(name)) return true;
+            }
+          } else if (decl.id && decl.id.name === name) {
+            return true;
+          }
+        } else if (stmt.type === 'ExportDefaultDeclaration' && stmt.declaration) {
+          const decl = stmt.declaration;
+          if (decl.id && decl.id.name === name) {
+            return true;
+          }
+        }
+      }
+      if (ancestor.type === 'Program') {
+        if (hasVarBindingInFunctionScope(ancestor, name, varCache)) return true;
+      }
+    }
+
+    // 4. Switch statement: cases share a single block scope
+    if (ancestor.type === 'SwitchStatement' && ancestor.cases) {
+      for (const sc of ancestor.cases) {
+        if (!sc.consequent) continue;
+        for (const stmt of sc.consequent) {
+          if (stmt.type === 'VariableDeclaration' && (stmt.kind === 'let' || stmt.kind === 'const')) {
+            for (const d of stmt.declarations) {
+              if (collectPatternIdentifiers(d.id).has(name)) return true;
+            }
+          } else if (stmt.type === 'FunctionDeclaration' || stmt.type === 'ClassDeclaration') {
+            if (stmt.id && stmt.id.name === name) return true;
+          }
+        }
+      }
+    }
+
+    // 5. For loop variable declarations
+    if (ancestor.type === 'ForStatement') {
+      if (ancestor.init && ancestor.init.type === 'VariableDeclaration') {
+        for (const d of ancestor.init.declarations) {
+          if (collectPatternIdentifiers(d.id).has(name)) return true;
+        }
+      }
+    }
+    if (ancestor.type === 'ForInStatement' || ancestor.type === 'ForOfStatement') {
+      if (ancestor.left && ancestor.left.type === 'VariableDeclaration') {
+        for (const d of ancestor.left.declarations) {
+          if (collectPatternIdentifiers(d.id).has(name)) return true;
+        }
+      }
+    }
+
+    // 6. Catch clause parameter
+    if (ancestor.type === 'CatchClause') {
+      if (ancestor.param && collectPatternIdentifiers(ancestor.param).has(name)) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Extracts a static string literal or single-quasi template literal from an AST node.
+ * Returns null if the expression is dynamic or not a string.
+ * @param {any} node
+ * @returns {string | null}
+ */
+function extractStaticString(node) {
+  if (!node) return null;
+  if (node.type === 'Literal' && typeof node.value === 'string') {
+    return node.value;
+  }
+  if (
+    node.type === 'TemplateLiteral' &&
+    node.expressions.length === 0 &&
+    node.quasis.length > 0
+  ) {
+    return node.quasis.map(q => q.value.cooked ?? q.value.raw).join('');
+  }
+  return null;
+}
+
+/**
+ * Verifies that a node is strictly an import.meta.url property access:
+ * noncomputed .url or computed literal ['url'] / [`url`].
+ * Strictly rejects new.target.url, variable computed keys like import.meta[url], etc.
+ * @param {any} node
+ * @returns {boolean}
+ */
+function isImportMetaUrl(node) {
+  if (!node || node.type !== 'MemberExpression') return false;
+
+  const obj = node.object;
+  if (!obj || obj.type !== 'MetaProperty') return false;
+  if (!obj.meta || obj.meta.name !== 'import') return false;
+  if (!obj.property || obj.property.name !== 'meta') return false;
+
+  if (!node.computed) {
+    return Boolean(node.property && node.property.type === 'Identifier' && node.property.name === 'url');
+  } else {
+    if (!node.property) return false;
+    if (node.property.type === 'Literal') {
+      return node.property.value === 'url';
+    }
+    if (
+      node.property.type === 'TemplateLiteral' &&
+      node.property.expressions.length === 0 &&
+      node.property.quasis.length > 0
+    ) {
+      const val = node.property.quasis.map(q => q.value.cooked ?? q.value.raw).join('');
+      return val === 'url';
+    }
+    return false;
+  }
+}
+
+/**
  * Analyzes ES module source code using Acorn.
  *
  * @param {string} code - JavaScript module source
@@ -188,18 +437,21 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
               imported: 'default',
               type: 'default'
             });
+            topLevelDeclarations.set(spec.local.name, 'import');
           } else if (spec.type === 'ImportNamespaceSpecifier') {
             importedBindings.push({
               local: spec.local.name,
               imported: '*',
               type: 'namespace'
             });
+            topLevelDeclarations.set(spec.local.name, 'import');
           } else if (spec.type === 'ImportSpecifier') {
             importedBindings.push({
               local: spec.local.name,
               imported: spec.imported.name,
               type: 'named'
             });
+            topLevelDeclarations.set(spec.local.name, 'import');
           }
         }
         const span = toSourceSpan(node, offsets);
@@ -228,10 +480,10 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
           const decl = node.declaration;
           if (decl.type === 'VariableDeclaration') {
             for (const d of decl.declarations) {
-              if (d.id.type === 'Identifier') {
-                topLevelDeclarations.set(d.id.name, decl.kind);
-                exportedBindingNames.add(d.id.name);
-                specifiers.push({ local: d.id.name, exported: d.id.name });
+              for (const name of collectPatternIdentifiers(d.id)) {
+                topLevelDeclarations.set(name, decl.kind);
+                exportedBindingNames.add(name);
+                specifiers.push({ local: name, exported: name });
               }
             }
           } else if (decl.type === 'FunctionDeclaration' && decl.id) {
@@ -288,8 +540,8 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
 
       case 'VariableDeclaration': {
         for (const d of node.declarations) {
-          if (d.id.type === 'Identifier') {
-            topLevelDeclarations.set(d.id.name, node.kind);
+          for (const name of collectPatternIdentifiers(d.id)) {
+            topLevelDeclarations.set(name, node.kind);
           }
         }
         break;
@@ -322,7 +574,7 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
   // 3. Classes and prototype writes
   // 4. new URL(..., import.meta.url) asset patterns
   // 5. Renderer construction sites and WebGL escapes
-  walk.simple(ast, {
+  walk.ancestor(ast, {
     ImportExpression(node) {
       const classified = classifyDynamicImportArgument(node.source);
       const span = toSourceSpan(node, offsets);
@@ -385,26 +637,23 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
       });
     },
 
-    NewExpression(node) {
-      // 1. Check for URL asset references: new URL('...', import.meta.url)
+    NewExpression(node, ancestors) {
+      // 1. Check for URL asset references: new URL(relativeLiteral, import.meta.url)
       if (
         node.callee &&
         node.callee.type === 'Identifier' &&
         node.callee.name === 'URL' &&
-        node.arguments.length >= 2
+        node.arguments.length === 2 &&
+        !isIdentifierShadowedAtAncestors('URL', ancestors)
       ) {
         const firstArg = node.arguments[0];
         const secondArg = node.arguments[1];
-        if (
-          firstArg.type === 'Literal' &&
-          typeof firstArg.value === 'string' &&
-          secondArg.type === 'MemberExpression' &&
-          secondArg.object.type === 'MetaProperty' &&
-          secondArg.property.name === 'url'
-        ) {
+        const specifier = extractStaticString(firstArg);
+
+        if (specifier !== null && isImportMetaUrl(secondArg)) {
           const span = toSourceSpan(node, offsets);
           assetReferences.push({
-            specifier: firstArg.value,
+            specifier,
             source_span: span,
             sourceSpan: span
           });
@@ -558,6 +807,7 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
     staticExports,
     dynamicImports,
     assetReferences,
+    asset_references: assetReferences,
     classDeclarations,
     prototypeWrites,
     rendererConstructionSites,

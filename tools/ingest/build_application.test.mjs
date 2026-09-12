@@ -18,7 +18,7 @@ import fs from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
 import {
@@ -709,15 +709,17 @@ test('rewriteHtmlForBuild and attribute scanners preserve attributes containing 
 <body></body>
 </html>`;
 
+  const appDir = '/test/app';
+  const helperUrl = new URL('./helper.js', pathToFileURL(appDir + path.sep)).href;
   const preloadMap = new Map([
-    ['./helper.js', 'helper_chunk.js']
+    [helperUrl, 'helper_chunk.js']
   ]);
 
   const rewritten = rewriteHtmlForBuild(
     htmlWithGt,
     ['main_chunk.js'],
     { 'main_chunk.js': dummyCode, 'helper_chunk.js': dummyCode },
-    { preloadChunkMap: preloadMap }
+    { preloadChunkMap: preloadMap, entryDir: appDir }
   );
 
   // Assert script tag was not truncated prematurely at ">"
@@ -1557,4 +1559,217 @@ test('buildApplication handles asset paths containing literal % not followed by 
 
   // 100%_sale.png must be copied into outDir
   assert.ok(fs.existsSync(path.join(outDir, '100%_sale.png')), '100%_sale.png must be copied to output');
+});
+
+test('buildApplication emits static module asset new URL(..., import.meta.url) in nested imported module, relocates URL, and copies bytes', async () => {
+  const scratch = makeScratch('f3d_app_mod_asset');
+  const outDir = path.join(scratch, 'dist');
+
+  const assetsDir = path.join(scratch, 'src', 'assets');
+  const nestedDir = path.join(scratch, 'src', 'nested');
+  fs.mkdirSync(assetsDir, { recursive: true });
+  fs.mkdirSync(nestedDir, { recursive: true });
+
+  const woodPngBytes = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 42, 43, 44]);
+  fs.writeFileSync(path.join(assetsDir, 'wood.png'), woodPngBytes);
+
+  fs.writeFileSync(
+    path.join(nestedDir, 'model.js'),
+    `export const textureUrl = new URL('../assets/wood.png', import.meta.url);\n`
+  );
+
+  fs.writeFileSync(
+    path.join(scratch, 'src', 'main.js'),
+    `import { textureUrl } from './nested/model.js';\n` +
+    `export const loadedTexture = textureUrl;\n`
+  );
+
+  const html = `<!DOCTYPE html>
+<html>
+<head>
+  <script type="module" src="./src/main.js"></script>
+</head>
+<body></body>
+</html>`;
+  fs.writeFileSync(path.join(scratch, 'index.html'), html);
+
+  const res = await buildApplication(path.join(scratch, 'index.html'), outDir);
+  assert.equal(res.isHtml, true);
+
+  // Dynamic execution: verify textureUrl evaluates to a genuine URL instance pointing to the emitted asset
+  const modUrl = pathToFileURL(path.join(outDir, res.entryFiles[0])).href + `?v=${Date.now()}`;
+  const mod = await import(modUrl);
+  assert.ok(mod.loadedTexture instanceof URL, 'loadedTexture must be a URL instance');
+
+  const resolvedPath = fileURLToPath(mod.loadedTexture);
+  assert.ok(resolvedPath.startsWith(outDir), 'Resolved asset path must be inside outDir');
+  const relPath = path.relative(outDir, resolvedPath);
+  assert.ok(res.emittedFiles.includes(relPath), 'Relative asset path must be present in res.emittedFiles');
+
+  // Assert reading real emitted asset bytes directly via exported URL matches source asset bytes
+  const readBytesViaUrl = fs.readFileSync(resolvedPath);
+  assert.deepEqual(readBytesViaUrl, woodPngBytes, 'Emitted asset bytes must match source exactly');
+});
+
+test('buildApplication supports import.meta["url"] and whitespace/comments in import.meta . url', async () => {
+  const scratch = makeScratch('f3d_app_mod_asset_meta_bracket');
+  const outDir = path.join(scratch, 'dist');
+
+  const assetBytes = Buffer.from([99, 100, 101]);
+  fs.writeFileSync(path.join(scratch, 'item.bin'), assetBytes);
+
+  fs.writeFileSync(
+    path.join(scratch, 'bracket_loader.js'),
+    `export const bracketUrl = new URL('./item.bin', import.meta['url']);\n` +
+    `export const spacedUrl = new URL('./item.bin', import.meta /* comment */ . url);\n` +
+    String.raw`export const escapedUrl = new U\u0052L('./item.bin', import.meta.url);`
+  );
+
+  const html = `<!DOCTYPE html><html><head><script type="module" src="./bracket_loader.js"></script></head><body></body></html>`;
+  fs.writeFileSync(path.join(scratch, 'index.html'), html);
+
+  const res = await buildApplication(path.join(scratch, 'index.html'), outDir);
+  assert.equal(res.isHtml, true);
+
+  const modUrl = pathToFileURL(path.join(outDir, res.entryFiles[0])).href + `?v=${Date.now()}`;
+  const mod = await import(modUrl);
+  assert.ok(mod.bracketUrl instanceof URL);
+  assert.ok(mod.spacedUrl instanceof URL);
+  assert.ok(mod.escapedUrl instanceof URL);
+
+  const resolvedBracket = fileURLToPath(mod.bracketUrl);
+  const resolvedSpaced = fileURLToPath(mod.spacedUrl);
+  const resolvedEscaped = fileURLToPath(mod.escapedUrl);
+
+  assert.ok(resolvedBracket.startsWith(outDir));
+  assert.ok(resolvedSpaced.startsWith(outDir));
+  assert.ok(resolvedEscaped.startsWith(outDir));
+
+  assert.ok(res.emittedFiles.includes(path.relative(outDir, resolvedBracket)));
+  assert.ok(res.emittedFiles.includes(path.relative(outDir, resolvedSpaced)));
+  assert.ok(res.emittedFiles.includes(path.relative(outDir, resolvedEscaped)));
+
+  assert.deepEqual(fs.readFileSync(resolvedBracket), assetBytes);
+  assert.deepEqual(fs.readFileSync(resolvedSpaced), assetBytes);
+  assert.deepEqual(fs.readFileSync(resolvedEscaped), assetBytes);
+});
+
+test('buildApplication preserves ?query and #hash on new URL(..., import.meta.url) in bundled modules', async () => {
+  const scratch = makeScratch('f3d_app_mod_asset_query');
+  const outDir = path.join(scratch, 'dist');
+
+  const jsonBytes = Buffer.from(JSON.stringify({ key: 'value' }));
+  fs.writeFileSync(path.join(scratch, 'data.json'), jsonBytes);
+
+  fs.writeFileSync(
+    path.join(scratch, 'loader.js'),
+    `export const configUrl = new URL('./data.json?v=42#section', import.meta.url);\n`
+  );
+
+  const html = `<!DOCTYPE html>
+<html>
+<head>
+  <script type="module" src="./loader.js"></script>
+</head>
+<body></body>
+</html>`;
+  fs.writeFileSync(path.join(scratch, 'index.html'), html);
+
+  const res = await buildApplication(path.join(scratch, 'index.html'), outDir);
+  assert.equal(res.isHtml, true);
+
+  // Dynamic execution: verify query and fragment are preserved on the URL instance
+  const modUrl = pathToFileURL(path.join(outDir, res.entryFiles[0])).href + `?v=${Date.now()}`;
+  const mod = await import(modUrl);
+  assert.ok(mod.configUrl instanceof URL, 'configUrl must be a URL instance');
+  assert.equal(mod.configUrl.search, '?v=42', 'Query string must be preserved');
+  assert.equal(mod.configUrl.hash, '#section', 'Hash fragment must be preserved');
+
+  const resolvedPath = fileURLToPath(mod.configUrl);
+  assert.ok(resolvedPath.startsWith(outDir), 'Resolved asset path must be inside outDir');
+  const relPath = path.relative(outDir, resolvedPath);
+  assert.ok(res.emittedFiles.includes(relPath), 'Relative asset path must be present in res.emittedFiles');
+
+  assert.deepEqual(JSON.parse(fs.readFileSync(resolvedPath, 'utf-8')), { key: 'value' });
+});
+
+test('buildApplication explicitly rejects genuinely missing static module asset before output', async () => {
+  const scratch = makeScratch('f3d_app_mod_asset_missing');
+  const outDir = path.join(scratch, 'dist');
+
+  fs.writeFileSync(
+    path.join(scratch, 'broken.js'),
+    `export const missing = new URL('./nonexistent_asset.bin', import.meta.url);\n`
+  );
+
+  const html = `<!DOCTYPE html>
+<html>
+<head>
+  <script type="module" src="./broken.js"></script>
+</head>
+<body></body>
+</html>`;
+  fs.writeFileSync(path.join(scratch, 'index.html'), html);
+
+  await assert.rejects(
+    async () => {
+      await buildApplication(path.join(scratch, 'index.html'), outDir);
+    },
+    /Unresolved module asset: "\.\/nonexistent_asset\.bin"/
+  );
+});
+
+test('buildApplication emits static module assets for standalone ESM library entries', async () => {
+  const scratch = makeScratch('f3d_app_esm_mod_asset');
+  const outDir = path.join(scratch, 'dist');
+
+  const iconBytes = Buffer.from([1, 2, 3, 4]);
+  fs.writeFileSync(path.join(scratch, 'icon.png'), iconBytes);
+
+  fs.writeFileSync(
+    path.join(scratch, 'lib.js'),
+    `export const iconUrl = new URL('./icon.png', import.meta.url);\n`
+  );
+
+  const res = await buildApplication(path.join(scratch, 'lib.js'), outDir);
+  assert.equal(res.isHtml, false);
+
+  const modUrl = pathToFileURL(path.join(outDir, res.entryFiles[0])).href + `?v=${Date.now()}`;
+  const mod = await import(modUrl);
+  assert.ok(mod.iconUrl instanceof URL, 'iconUrl must be a URL instance');
+
+  const resolvedPath = fileURLToPath(mod.iconUrl);
+  assert.ok(resolvedPath.startsWith(outDir), 'Resolved asset path must be inside outDir');
+  const relPath = path.relative(outDir, resolvedPath);
+  assert.ok(res.emittedFiles.includes(relPath), 'Relative asset path must be present in res.emittedFiles');
+  assert.deepEqual(fs.readFileSync(resolvedPath), iconBytes, 'Emitted asset bytes must match source exactly');
+});
+
+test('buildApplication ignores new URL(..., import.meta.url) when URL identifier is shadowed', async () => {
+  const scratch = makeScratch('f3d_app_mod_asset_shadowed');
+  const outDir = path.join(scratch, 'dist');
+
+  fs.writeFileSync(
+    path.join(scratch, 'shadowed.js'),
+    `export function customLoader(URL) {\n` +
+    `  return new URL('./nonexistent_shadowed.png', import.meta.url);\n` +
+    `}\n` +
+    `export const ready = true;\n`
+  );
+
+  const html = `<!DOCTYPE html>
+<html>
+<head>
+  <script type="module" src="./shadowed.js"></script>
+</head>
+<body></body>
+</html>`;
+  fs.writeFileSync(path.join(scratch, 'index.html'), html);
+
+  // Must succeed without throwing "Unresolved module asset: ./nonexistent_shadowed.png"
+  const res = await buildApplication(path.join(scratch, 'index.html'), outDir);
+  assert.equal(res.isHtml, true);
+
+  // nonexistent_shadowed.png must NOT be emitted
+  assert.equal(res.emittedFiles.some(f => f.endsWith('nonexistent_shadowed.png')), false);
 });

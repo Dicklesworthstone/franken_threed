@@ -12,6 +12,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { buildModuleGraph } from './module_graph.mjs';
+import { analyzeModuleAst } from './ast_analyzer.mjs';
 import { parseHtmlEntries, parseSrcsetUrls } from './html_parser.mjs';
 import { bundleWithRollup } from './bundler.mjs';
 import { IngestionResolutionError } from './types.mjs';
@@ -259,22 +260,172 @@ export function getB() {
 // ASSET REFERENCE PATTERNS
 // ---------------------------------------------------------------------------
 
-test('Asset references: new URL(..., import.meta.url) pattern is extracted', async () => {
+test('Asset references: new URL(..., import.meta.url) pattern is extracted with source_span offsets', async () => {
   const scratch = makeScratchDir('f3d_assets');
 
   const file = path.join(scratch, 'asset_module.js');
-  fs.writeFileSync(file, `
+  const code = `
 const textureUrl = new URL('./textures/wood.png', import.meta.url);
-export { textureUrl };
-`, 'utf-8');
+const modelUrl = new URL('./models/chair.glb', import.meta['url']);
+const dataUrl = new URL(\`./data/scene.json\`, import.meta["url"]);
+export { textureUrl, modelUrl, dataUrl };
+`;
+  fs.writeFileSync(file, code, 'utf-8');
+
+  const graph = await buildModuleGraph(file);
+  const mod = graph.modules[pathToFileURL(file).href];
+
+  assert.equal(mod.asset_references.length, 3);
+
+  // Reference 1: standard import.meta.url
+  const ref1 = mod.asset_references[0];
+  assert.equal(ref1.specifier, './textures/wood.png');
+  const span1 = ref1.source_span || ref1.sourceSpan;
+  assert.equal(span1.start.line, 2);
+  assert.equal(code.slice(span1.start.offset, span1.end.offset), "new URL('./textures/wood.png', import.meta.url)");
+
+  // Reference 2: computed single-quote ['url']
+  const ref2 = mod.asset_references[1];
+  assert.equal(ref2.specifier, './models/chair.glb');
+  const span2 = ref2.source_span || ref2.sourceSpan;
+  assert.equal(code.slice(span2.start.offset, span2.end.offset), "new URL('./models/chair.glb', import.meta['url'])");
+
+  // Reference 3: template literal specifier and computed double-quote ["url"]
+  const ref3 = mod.asset_references[2];
+  assert.equal(ref3.specifier, './data/scene.json');
+  const span3 = ref3.source_span || ref3.sourceSpan;
+  assert.equal(code.slice(span3.start.offset, span3.end.offset), 'new URL(`./data/scene.json`, import.meta["url"])');
+});
+
+test('Asset references: conservative URL global-binding guard prevents rewriting shadowed URL', () => {
+  const shadowedSnippets = [
+    // 1. Named import
+    "import { URL } from 'node:url'; export const u = new URL('./t.png', import.meta.url);",
+    // 2. Default import
+    "import URL from './custom_url.js'; export const u = new URL('./t.png', import.meta.url);",
+    // 3. Namespace import
+    "import * as URL from './custom_url.js'; export const u = new URL('./t.png', import.meta.url);",
+    // 4. Top-level const
+    "const URL = class Custom {}; export const u = new URL('./t.png', import.meta.url);",
+    // 5. Top-level let
+    "let URL; export const u = new URL('./t.png', import.meta.url);",
+    // 6. Top-level var
+    "var URL; export const u = new URL('./t.png', import.meta.url);",
+    // 7. Top-level function declaration
+    "function URL() {} export const u = new URL('./t.png', import.meta.url);",
+    // 8. Top-level class declaration
+    "class URL {} export const u = new URL('./t.png', import.meta.url);",
+    // 9. Export default class declaration self-name (Root Error 1)
+    "export default class URL { method() { return new URL('./fake.png', import.meta.url); } }",
+    // 10. Export default function declaration
+    "export default function URL() { return new URL('./fake.png', import.meta.url); }",
+    // 11. Function parameter
+    "export function load(URL) { return new URL('./t.png', import.meta.url); }",
+    // 12. Destructured object parameter
+    "export function load({ URL }) { return new URL('./t.png', import.meta.url); }",
+    // 13. Destructured array parameter
+    "export function load([URL]) { return new URL('./t.png', import.meta.url); }",
+    // 14. Arrow function parameter
+    "export const load = (URL) => new URL('./t.png', import.meta.url);",
+    // 15. Try-catch parameter
+    "try {} catch (URL) { new URL('./t.png', import.meta.url); }",
+    // 16. Block-scoped lexical declaration
+    "{ const URL = 1; new URL('./t.png', import.meta.url); }",
+    // 17. For-of loop declaration
+    "for (const URL of []) { new URL('./t.png', import.meta.url); }",
+    // 18. For loop let declaration
+    "for (let URL = 0; URL < 1; URL++) { new URL('./t.png', import.meta.url); }",
+    // 19. Hoisted var inside function body
+    "function test() { const u = new URL('./t.png', import.meta.url); var URL = 1; }",
+    // 20. Named function expression
+    "const f = function URL() { return new URL('./t.png', import.meta.url); };",
+    // 21. Named class expression
+    "const c = class URL { m() { return new URL('./t.png', import.meta.url); } };"
+  ];
+
+  for (const snippet of shadowedSnippets) {
+    const analysis = analyzeModuleAst(snippet, 'test_shadow.js');
+    assert.equal(
+      analysis.assetReferences.length,
+      0,
+      `Expected 0 asset references for shadowed URL in: ${snippet}`
+    );
+  }
+});
+
+test('Asset references: function body var declarations do not scope default parameter initializers (Root Error 2)', () => {
+  // Positive: default parameter initializer evaluates in parameter scope, where body var URL does not scope
+  const positiveCode = "function f(x = new URL('./real.png', import.meta.url)) { var URL; return x; }";
+  const posAnalysis = analyzeModuleAst(positiveCode, 'test_param_scope_real.js');
+  assert.equal(posAnalysis.assetReferences.length, 1);
+  assert.equal(posAnalysis.assetReferences[0].specifier, './real.png');
+  const span = posAnalysis.assetReferences[0].source_span || posAnalysis.assetReferences[0].sourceSpan;
+  assert.equal(positiveCode.slice(span.start.offset, span.end.offset), "new URL('./real.png', import.meta.url)");
+
+  // Negative: parameter itself is named URL, scoping subsequent parameter initializers
+  const negCode = "function f(URL, x = new URL('./fake.png', import.meta.url)) { return x; }";
+  const negAnalysis = analyzeModuleAst(negCode, 'test_param_scope_fake.js');
+  assert.equal(negAnalysis.assetReferences.length, 0);
+});
+
+test('Asset references: non-matching constructor and property access forms are strictly rejected', () => {
+  const rejectedSnippets = [
+    // Computed property with variable identifier (not literal string)
+    "const url = 'other'; export const u = new URL('./t.png', import.meta[url]);",
+    // MetaProperty other than import.meta (e.g. new.target)
+    "function factory() { return new URL('./t.png', new.target.url); }",
+    // Non-url property access
+    "export const u = new URL('./t.png', import.meta.base);",
+    // Non-url literal property access
+    "export const u = new URL('./t.png', import.meta['base']);",
+    // 3 constructor arguments
+    "export const u = new URL('./t.png', import.meta.url, 'extra');",
+    // 1 constructor argument
+    "export const u = new URL('./t.png');",
+    // Non-literal dynamic specifier
+    "const p = './t.png'; export const u = new URL(p, import.meta.url);",
+    // Template literal with dynamic expressions
+    "const name = 't'; export const u = new URL(`./textures/${name}.png`, import.meta.url);"
+  ];
+
+  for (const snippet of rejectedSnippets) {
+    const analysis = analyzeModuleAst(snippet, 'test_rejected.js');
+    assert.equal(
+      analysis.assetReferences.length,
+      0,
+      `Expected 0 asset references for rejected pattern in: ${snippet}`
+    );
+  }
+});
+
+test('Asset references: local shadowing does not suppress unshadowed references in same module', async () => {
+  const scratch = makeScratchDir('f3d_mixed_scope');
+  const file = path.join(scratch, 'mixed.js');
+  const code = `
+function customLoader(URL) {
+  return new URL('./shadowed_in_function.png', import.meta.url);
+}
+
+{
+  const URL = 'block_local';
+  const x = new URL('./shadowed_in_block.png', import.meta.url);
+}
+
+const validAsset = new URL('./textures/valid_asset.png', import.meta.url);
+export { customLoader, validAsset };
+`;
+  fs.writeFileSync(file, code, 'utf-8');
 
   const graph = await buildModuleGraph(file);
   const mod = graph.modules[pathToFileURL(file).href];
 
   assert.equal(mod.asset_references.length, 1);
-  assert.equal(mod.asset_references[0].specifier, './textures/wood.png');
+  assert.equal(mod.asset_references[0].specifier, './textures/valid_asset.png');
   const span = mod.asset_references[0].source_span || mod.asset_references[0].sourceSpan;
-  assert.equal(span.start.line, 2);
+  assert.equal(
+    code.slice(span.start.offset, span.end.offset),
+    "new URL('./textures/valid_asset.png', import.meta.url)"
+  );
 });
 
 // ---------------------------------------------------------------------------

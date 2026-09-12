@@ -6,14 +6,62 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { rollup } from 'rollup';
 
+import { analyzeModuleAst } from './ast_analyzer.mjs';
 import { parseHtmlEntries } from './html_parser.mjs';
 import { resolveModuleSpecifier, urlToFilePath } from './resolver.mjs';
 
 /**
- * Creates a Rollup plugin utilizing FrankenThreeD's W3C import-map resolver.
+ * Resolves the directory of a module on disk given its Rollup module ID.
+ * Handles file:// URLs, absolute OS paths, inline HTML module IDs, and query/fragment suffixes.
+ * @param {string} id
+ * @param {string} [fallbackBaseUrl]
+ * @returns {string}
+ */
+function getModuleDir(id, fallbackBaseUrl) {
+  let cleanId = id;
+  const hashIdx = cleanId.indexOf('#');
+  if (hashIdx !== -1) cleanId = cleanId.slice(0, hashIdx);
+  const qIdx = cleanId.indexOf('?');
+  if (qIdx !== -1) cleanId = cleanId.slice(0, qIdx);
+
+  if (cleanId.startsWith('file://')) {
+    return path.dirname(urlToFilePath(cleanId));
+  }
+  if (path.isAbsolute(cleanId)) {
+    return path.dirname(cleanId);
+  }
+  if (fallbackBaseUrl) {
+    const cleanBase = fallbackBaseUrl.split(/[?#]/)[0];
+    if (cleanBase.startsWith('file://')) return path.dirname(urlToFilePath(cleanBase));
+    if (path.isAbsolute(cleanBase)) return path.dirname(cleanBase);
+  }
+  return process.cwd();
+}
+
+/**
+ * Checks whether a specifier is a relative local file path.
+ * @param {string} url
+ * @returns {boolean}
+ */
+function isRelativeUrl(url) {
+  if (!url || typeof url !== 'string') return false;
+  const trimmed = url.trim();
+  if (!trimmed) return false;
+  if (trimmed.startsWith('#') || trimmed.startsWith('//') || trimmed.startsWith('/')) {
+    return false;
+  }
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(trimmed)) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Creates a Rollup plugin utilizing FrankenThreeD's W3C import-map resolver
+ * and static module asset emission (new URL(..., import.meta.url)).
  * @param {Object} options
  * @param {{ imports?: Record<string, string | null>, scopes?: Record<string, Record<string, string | null>> }} [options.importMap]
  * @param {string} options.mapBaseUrl
@@ -25,6 +73,7 @@ export function f3dRollupPlugin(options = {}) {
   const importMap = options.importMap || { imports: {}, scopes: {} };
   const mapBaseUrl = options.mapBaseUrl;
   const inlineModules = options.inlineModules || new Map();
+  const emittedAssetsByPath = new Map();
 
   return {
     name: 'f3d-ingest-resolver',
@@ -55,6 +104,87 @@ export function f3dRollupPlugin(options = {}) {
       }
 
       return null;
+    },
+
+    transform(code, id) {
+      if (!code || typeof code !== 'string') return null;
+
+      const analysis = analyzeModuleAst(code, id);
+      const assetRefs = analysis && analysis.assetReferences ? analysis.assetReferences : [];
+      if (assetRefs.length === 0) return null;
+
+      const moduleDir = getModuleDir(id, mapBaseUrl);
+
+      // Sort in descending order of source_span start offset to perform non-shifting slice replacements
+      const sortedRefs = [...assetRefs].sort((a, b) => {
+        const spanA = a.source_span || a.sourceSpan;
+        const spanB = b.source_span || b.sourceSpan;
+        return spanB.start.offset - spanA.start.offset;
+      });
+
+      let transformedCode = code;
+      let hasChanges = false;
+
+      for (const ref of sortedRefs) {
+        const rawSpecifier = ref.specifier;
+        if (!rawSpecifier || typeof rawSpecifier !== 'string') continue;
+
+        const qIdx = rawSpecifier.indexOf('?');
+        const hIdx = rawSpecifier.indexOf('#');
+        let splitIdx = -1;
+        if (qIdx !== -1 && hIdx !== -1) splitIdx = Math.min(qIdx, hIdx);
+        else if (qIdx !== -1) splitIdx = qIdx;
+        else if (hIdx !== -1) splitIdx = hIdx;
+
+        const cleanPath = splitIdx !== -1 ? rawSpecifier.slice(0, splitIdx) : rawSpecifier;
+        const suffix = splitIdx !== -1 ? rawSpecifier.slice(splitIdx) : '';
+
+        if (!isRelativeUrl(cleanPath)) continue;
+
+        let assetAbsPath;
+        try {
+          const dirSlash = moduleDir.endsWith(path.sep) ? moduleDir : moduleDir + path.sep;
+          const resolvedUrl = new URL(cleanPath, pathToFileURL(dirSlash));
+          assetAbsPath = fileURLToPath(resolvedUrl);
+        } catch {
+          assetAbsPath = path.resolve(moduleDir, cleanPath);
+        }
+
+        if (!fs.existsSync(assetAbsPath) || !fs.statSync(assetAbsPath).isFile()) {
+          throw new Error(
+            `Unresolved module asset: "${rawSpecifier}" not found at "${assetAbsPath}" referenced from "${id}"`
+          );
+        }
+
+        let refId = emittedAssetsByPath.get(assetAbsPath);
+        if (!refId) {
+          const assetSource = fs.readFileSync(assetAbsPath);
+          refId = this.emitFile({
+            type: 'asset',
+            name: path.basename(assetAbsPath),
+            source: assetSource
+          });
+          emittedAssetsByPath.set(assetAbsPath, refId);
+        }
+
+        const span = ref.source_span || ref.sourceSpan;
+        const start = span.start.offset;
+        const end = span.end.offset;
+
+        const replacement = suffix
+          ? `new URL(import.meta.ROLLUP_FILE_URL_${refId} + ${JSON.stringify(suffix)})`
+          : `new URL(import.meta.ROLLUP_FILE_URL_${refId})`;
+
+        transformedCode = transformedCode.slice(0, start) + replacement + transformedCode.slice(end);
+        hasChanges = true;
+      }
+
+      if (!hasChanges) return null;
+
+      return {
+        code: transformedCode,
+        map: null
+      };
     }
   };
 }
@@ -177,6 +307,7 @@ export async function bundleWithRollup(entryPath, options = {}) {
     });
 
     const chunks = output.filter(chunk => chunk.type === 'chunk');
+    const assets = output.filter(item => item.type === 'asset');
 
     // Match entry chunks in exact HTML document order.
     // If an HTML document contains repeated module script references with identical URL
@@ -228,7 +359,16 @@ export async function bundleWithRollup(entryPath, options = {}) {
       facadeModuleId: c.facadeModuleId || null
     }));
 
-    const files = Object.fromEntries(chunks.map(c => [c.fileName, c.code]));
+    const outputAssets = assets.map(a => ({
+      fileName: a.fileName,
+      name: a.name,
+      source: a.source
+    }));
+
+    const files = Object.fromEntries([
+      ...chunks.map(c => [c.fileName, c.code]),
+      ...assets.map(a => [a.fileName, typeof a.source === 'string' ? a.source : Buffer.from(a.source)])
+    ]);
 
     return {
       // Backward compatibility for single-chunk callers
@@ -240,7 +380,8 @@ export async function bundleWithRollup(entryPath, options = {}) {
       entryFiles,
       files,
       outputChunks,
-      chunks: outputChunks
+      chunks: outputChunks,
+      assets: outputAssets
     };
   } finally {
     if (bundle) {
