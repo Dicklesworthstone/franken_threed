@@ -262,77 +262,73 @@ export class ConnectedCompatibilityGroups {
   }
 
   /**
-   * Capture a snapshot of current union-find and routing state for transaction rollback.
-   * Deep-copies node descriptors and decision records to isolate future mutations.
-   * @returns {Object}
+   * Preview the resolved route for a candidate renderer connecting to shared resources,
+   * without mutating the connected groups graph.
+   *
+   * @param {{ route: string, reasons: string[] }} initialDecision
+   * @param {Array<{ id: string, isMutable: boolean }>} [resources=[]]
+   * @returns {{ route: string, reasons: readonly string[], groupId?: string }}
    */
-  snapshot() {
-    const nodesCopy = new Map();
-    for (const [k, v] of this._nodes.entries()) {
-      nodesCopy.set(k, {
-        type: v.type,
-        preferredRoute: v.preferredRoute,
-        forcedRoute: v.forcedRoute,
-        isMutable: v.isMutable,
-        reasons: v.reasons ? [...v.reasons] : [],
-      });
+  previewRoute(initialDecision, resources = []) {
+    let requiresExact = initialDecision.route === ExecutionRoute.EXACT_BACKEND;
+    const groupReasons = new Set(initialDecision.reasons || []);
+    let primaryGroupId = undefined;
+
+    const checkedRoots = new Set();
+    for (const { id: resId, isMutable } of resources) {
+      if (!isMutable || !this._nodes.has(resId)) continue;
+      const root = this.find(resId);
+      if (!primaryGroupId) primaryGroupId = root;
+      if (checkedRoots.has(root)) continue;
+      checkedRoots.add(root);
+
+      const members = this.getGroupMembers(root);
+      for (const memberId of members) {
+        const node = this._nodes.get(memberId);
+        if (node && node.type === 'renderer') {
+          const committed = this._committedRoutes.get(memberId);
+          const decision = this._allDecisions.get(memberId);
+          const effectiveRoute = committed || decision?.route || node.preferredRoute;
+          if (effectiveRoute === ExecutionRoute.EXACT_BACKEND) {
+            requiresExact = true;
+            if (decision?.reasons) {
+              for (const r of decision.reasons) groupReasons.add(r);
+            }
+          }
+        }
+      }
     }
 
-    const groupMembersCopy = new Map();
-    for (const [k, v] of this._groupMembers.entries()) {
-      groupMembersCopy.set(k, new Set(v));
+    if (requiresExact) {
+      for (const root of checkedRoots) {
+        const members = this.getGroupMembers(root);
+        for (const memberId of members) {
+          const committed = this._committedRoutes.get(memberId);
+          if (committed && committed !== ExecutionRoute.EXACT_BACKEND) {
+            throw new Error(
+              `Connected group conflict: renderer '${memberId}' is already committed to route '${committed}', ` +
+              `but shared resource connects it to a renderer requiring '${ExecutionRoute.EXACT_BACKEND}'. ` +
+              `Sharing mutable GPU resources across distinct backend residencies without an isolated copy boundary is prohibited.`
+            );
+          }
+        }
+      }
     }
 
-    const allDecisionsCopy = new Map();
-    for (const [k, v] of this._allDecisions.entries()) {
-      allDecisionsCopy.set(k, {
-        route: v.route,
-        reasons: v.reasons ? [...v.reasons] : [],
-        groupId: v.groupId,
-      });
+    const reasons = [...groupReasons];
+    let finalRoute = initialDecision.route;
+    if (requiresExact && finalRoute !== ExecutionRoute.EXACT_BACKEND) {
+      finalRoute = ExecutionRoute.EXACT_BACKEND;
+      if (!reasons.includes(EscapeReason.CONNECTED_GROUP_CONSTRAINT)) {
+        reasons.push(EscapeReason.CONNECTED_GROUP_CONSTRAINT);
+      }
     }
 
     return {
-      parent: new Map(this._parent),
-      rank: new Map(this._rank),
-      nodes: nodesCopy,
-      groupMembers: groupMembersCopy,
-      committedRoutes: new Map(this._committedRoutes),
-      allDecisions: allDecisionsCopy,
+      route: finalRoute,
+      reasons: Object.freeze(reasons),
+      groupId: primaryGroupId,
     };
-  }
-
-  /**
-   * Restore union-find and routing state from a previously captured snapshot.
-   * @param {Object} snap
-   */
-  restore(snap) {
-    if (!snap) return;
-    this._parent = new Map(snap.parent);
-    this._rank = new Map(snap.rank);
-    this._nodes = new Map();
-    for (const [k, v] of snap.nodes.entries()) {
-      this._nodes.set(k, {
-        type: v.type,
-        preferredRoute: v.preferredRoute,
-        forcedRoute: v.forcedRoute,
-        isMutable: v.isMutable,
-        reasons: v.reasons ? [...v.reasons] : [],
-      });
-    }
-    this._groupMembers = new Map();
-    for (const [k, v] of snap.groupMembers.entries()) {
-      this._groupMembers.set(k, new Set(v));
-    }
-    this._committedRoutes = new Map(snap.committedRoutes);
-    this._allDecisions = new Map();
-    for (const [k, v] of snap.allDecisions.entries()) {
-      this._allDecisions.set(k, {
-        route: v.route,
-        reasons: v.reasons ? [...v.reasons] : [],
-        groupId: v.groupId,
-      });
-    }
   }
 }
 

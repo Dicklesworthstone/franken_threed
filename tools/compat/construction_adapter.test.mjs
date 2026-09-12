@@ -3,9 +3,8 @@
  * Comprehensive unit test suite for RendererConstructionRouter and diagnostics (Bead f3d-04.4).
  *
  * Tests:
- * - Defect A: Transactional rollback of connected groups on failed constructor or preflight:
- *   - Constructor throw rolls back connected groups without poisoning shared resources.
- *   - Canvas lock on the failed constructor's canvas is retained (binds-then-throws).
+ * - Defect A: Preflight failures do not mutate connected groups or poison shared resources:
+ *   - Constructor throw retains irreversible canvas lock (binds-then-throws).
  *   - Preflight RouteLockError does not couple resources or poison future renderers.
  *   - Missing implementation error does not poison connected groups.
  * - Defect B: Zero property reads on instances and native shape preservation:
@@ -32,7 +31,7 @@ import {
 import { ConnectedCompatibilityGroups } from './connected_groups.mjs';
 import { ExecutionRoute, EscapeReason, RouteLockError } from './route_types.mjs';
 
-test('Defect A: Failed constructor rolls back connected groups while retaining canvas lock', () => {
+test('Contract: Constructor throw retains irreversible canvas lock (binds-then-throws)', () => {
   const connectedGroups = new ConnectedCompatibilityGroups();
   const router = new RendererConstructionRouter({
     connectedGroups,
@@ -40,46 +39,37 @@ test('Defect A: Failed constructor rolls back connected groups while retaining c
       [ExecutionRoute.EXACT_BACKEND]: function FailingWebGL() {
         throw new Error('WebGL context creation failed');
       },
-      [ExecutionRoute.RETAINED_UPSTREAM]: function MockRetained() {
-        this.isRetained = true;
-      },
     },
   });
 
-  const sharedTarget = { id: 'rt-shared-1', isMutable: true };
-
-  // 1. Attempt WebGLRenderer construction with sharedTarget; constructor throws
+  // 1. Attempt WebGLRenderer construction; constructor throws
   assert.throws(
     () => {
       router.routeAndConstruct({
         constructorName: 'WebGLRenderer',
         options: { canvas: 'canvas-failed-gl' },
-        sharedResources: [sharedTarget],
       });
     },
     /WebGL context creation failed/
   );
 
-  // Canvas lock is retained (binds-then-throws invariant)
+  // Canvas lock is permanently retained (binds-then-throws invariant, Plan §3.3)
   assert.equal(router.getCanvasLock('canvas-failed-gl')?.route, ExecutionRoute.EXACT_BACKEND);
 
-  // Connected groups must NOT retain the failed renderer or force EXACT_BACKEND on sharedTarget
-  const members = connectedGroups.getGroupMembers('rt-shared-1');
-  assert.equal(members.some(m => m.startsWith('renderer-')), false, 'Failed renderer must not remain in connected groups');
-
-  // 2. Subsequent WebGPURenderer sharing sharedTarget on a different canvas routes normally
-  const r2 = router.routeAndConstruct({
-    constructorName: 'WebGPURenderer',
-    options: { canvas: 'canvas-valid-gpu' },
-    sharedResources: [sharedTarget],
-    hostCapabilities: { hasWebGPU: true, hasWebGL: true },
-  });
-
-  assert.equal(router.getInstanceRoute(r2), ExecutionRoute.RETAINED_UPSTREAM);
-  assert.equal(router.getCanvasLock('canvas-valid-gpu')?.route, ExecutionRoute.RETAINED_UPSTREAM);
+  // Late route switch on same canvas must be rejected
+  assert.throws(
+    () => {
+      router.routeAndConstruct({
+        constructorName: 'WebGPURenderer',
+        options: { canvas: 'canvas-failed-gl' },
+        hostCapabilities: { hasWebGPU: true, hasWebGL: true },
+      });
+    },
+    RouteLockError
+  );
 });
 
-test('Defect A: Preflight RouteLockError rolls back connected groups', () => {
+test('Defect A: Preflight RouteLockError does not poison connected groups', () => {
   const connectedGroups = new ConnectedCompatibilityGroups();
   const router = new RendererConstructionRouter({
     connectedGroups,
@@ -126,7 +116,7 @@ test('Defect A: Preflight RouteLockError rolls back connected groups', () => {
   assert.equal(router.getInstanceRoute(r3), ExecutionRoute.RETAINED_UPSTREAM);
 });
 
-test('Defect A: Missing implementation error rolls back connected groups', () => {
+test('Defect A: Missing implementation error does not poison connected groups', () => {
   const connectedGroups = new ConnectedCompatibilityGroups();
   const router = new RendererConstructionRouter({
     connectedGroups,

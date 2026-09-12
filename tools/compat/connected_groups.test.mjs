@@ -7,9 +7,9 @@
  * - Path compression and union-find grouping.
  * - Route propagation across mutable shared resources (exact backend propagation).
  * - Conflict detection when committed non-exact renderer is unioned with exact requirement.
- * - Transactional snapshot and restore:
- *   - Deep copy isolation of nodes, group members, committed routes, and decisions.
- *   - Rollback of intermediate mutations, unions, registrations, and route resolutions.
+ * - previewRoute validation without mutating internal graph state:
+ *   - Route propagation preview over mutable resources without mutating graph.
+ *   - Conflict detection with committed non-exact renderer during preview.
  */
 
 import test from 'node:test';
@@ -72,60 +72,45 @@ test('ConnectedCompatibilityGroups: Rejects conflict if non-exact renderer is al
   );
 });
 
-test('ConnectedCompatibilityGroups: Transactional snapshot and restore', () => {
+test('ConnectedCompatibilityGroups: previewRoute evaluates exact constraint without mutating graph', () => {
   const groups = new ConnectedCompatibilityGroups();
 
-  // Baseline state: one committed renderer and one resource
-  groups.registerRenderer('renderer-base', ExecutionRoute.RETAINED_UPSTREAM);
-  groups.recordCommittedRoute('renderer-base', ExecutionRoute.RETAINED_UPSTREAM);
-  groups.registerResource('rt-base', true);
-  groups.recordResourceSharing('renderer-base', 'rt-base', true);
-  groups.resolveGroupRoutes();
+  // Exact renderer committed to rt-exact
+  groups.registerRenderer('renderer-exact', ExecutionRoute.EXACT_BACKEND);
+  groups.recordCommittedRoute('renderer-exact', ExecutionRoute.EXACT_BACKEND);
+  groups.recordResourceSharing('renderer-exact', 'rt-exact', true);
 
-  // Capture snapshot
-  const snap = groups.snapshot();
-  assert.ok(snap);
+  // Candidate renderer preferring RETAINED_UPSTREAM shares rt-exact
+  const preview = groups.previewRoute(
+    { route: ExecutionRoute.RETAINED_UPSTREAM, reasons: [] },
+    [{ id: 'rt-exact', isMutable: true }]
+  );
 
-  // Perform speculative mutations that simulate a failing renderer construction
-  groups.registerRenderer('renderer-failing', ExecutionRoute.EXACT_BACKEND);
-  groups.registerResource('rt-new', true);
-  groups.recordResourceSharing('renderer-failing', 'rt-base', true);
-  groups.recordResourceSharing('renderer-failing', 'rt-new', true);
+  assert.equal(preview.route, ExecutionRoute.EXACT_BACKEND);
+  assert.ok(preview.reasons.includes(EscapeReason.CONNECTED_GROUP_CONSTRAINT));
 
-  // At this point, rt-base is unioned with renderer-failing
-  assert.equal(groups.find('renderer-failing'), groups.find('rt-base'));
-  assert.equal(groups.getGroupMembers('rt-base').includes('renderer-failing'), true);
-
-  // Restore snapshot (simulating catch block rollback)
-  groups.restore(snap);
-
-  // Verify full rollback: renderer-failing and rt-new do not exist
-  assert.equal(groups._nodes.has('renderer-failing'), false);
-  assert.equal(groups._nodes.has('rt-new'), false);
-  assert.equal(groups.getGroupMembers('rt-base').includes('renderer-failing'), false);
-  assert.deepEqual(groups.getGroupMembers('rt-base').sort(), ['renderer-base', 'rt-base'].sort());
-
-  // Verify baseline route resolution remains valid and uncorrupted
-  const restoredDecisions = groups.resolveGroupRoutes();
-  assert.equal(restoredDecisions.get('renderer-base').route, ExecutionRoute.RETAINED_UPSTREAM);
+  // Graph state must remain unmutated by previewRoute
+  assert.equal(groups._nodes.has('candidate'), false);
+  assert.equal(groups.getGroupMembers('rt-exact').length, 2); // only renderer-exact and rt-exact
 });
 
-test('ConnectedCompatibilityGroups: Deep copy isolation in snapshot', () => {
+test('ConnectedCompatibilityGroups: previewRoute detects conflict with committed non-exact renderer', () => {
   const groups = new ConnectedCompatibilityGroups();
-  groups.registerRenderer('renderer-1', ExecutionRoute.RETAINED_UPSTREAM);
-  groups.registerResource('res-1', false);
 
-  const snap = groups.snapshot();
+  // GPU renderer committed to rt-shared
+  groups.registerRenderer('renderer-gpu', ExecutionRoute.RETAINED_UPSTREAM);
+  groups.recordCommittedRoute('renderer-gpu', ExecutionRoute.RETAINED_UPSTREAM);
+  groups.recordResourceSharing('renderer-gpu', 'rt-shared', true);
 
-  // Mutating original after snapshot should not affect snapshot
-  groups.registerResource('res-1', true); // Promotes isMutable to true
-  const nodeOriginal = groups._nodes.get('res-1');
-  assert.equal(nodeOriginal.isMutable, true);
+  // Candidate renderer requiring EXACT_BACKEND tries to share rt-shared
+  assert.throws(
+    () => groups.previewRoute(
+      { route: ExecutionRoute.EXACT_BACKEND, reasons: [] },
+      [{ id: 'rt-shared', isMutable: true }]
+    ),
+    /Connected group conflict/
+  );
 
-  const snapNode = snap.nodes.get('res-1');
-  assert.equal(snapNode.isMutable, false, 'Snapshot must keep immutable deep copy of node');
-
-  // Restoring should bring back isMutable: false
-  groups.restore(snap);
-  assert.equal(groups.isResourceMutable('res-1'), false);
+  // Graph state must remain unmutated
+  assert.equal(groups.getGroupMembers('rt-shared').length, 2);
 });
