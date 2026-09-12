@@ -37,6 +37,7 @@
     import {
       renderDirectReferenceTriangle,
       renderDirectReferenceTexturedTriangle,
+      createDirectReferenceRenderer,
     } from "./direct_reference.js";
     import { testReadbackIdReuse } from "./readback_lifetime_test.js";
     import { testPipelineBindingChange } from "./pipeline_binding_test.js";
@@ -912,6 +913,152 @@
           "generated_static_batch_raw_measurement",
           `generated_static: prepare=${gMeas.direct_prepare_ms.toFixed(3)}ms submit=${gMeas.direct_submit_ms.toFixed(3)}ms cpu_total=${gMeas.cpu_prepare_submit_ms.toFixed(3)}ms gpu=${gMeas.gpu_complete_ms.toFixed(3)}ms generated_js_bytes=${gMeas.generated_js_bytes}`
         );
+
+        // 5g. Compact Repeated-Frame Check of All Four Variants (Kill Gate 2 / tmt.5)
+        // - Initial setup + 8 frames with alternating small x translation (vary actual data)
+        // - Common two-frame credit loop for all variants (max in-flight <= 2)
+        // - Bulk combines executePacket error-scope completion with queue.onSubmittedWorkDone
+        // - Texture->readback copy per frame; map only after drain
+        // - Validates initial and final pixels vs direct reference and asserts final changed
+        // - Labeled debug repeated-frame with raw measurements; no winner/speedup/coldstart claims
+        const buildAffineFramePacketFn = wasmExports.f3d_build_affine_rows_batch_frame_packet;
+        if (typeof buildAffineFramePacketFn !== "function") {
+          throw new Error("Missing required Wasm export: f3d_build_affine_rows_batch_frame_packet");
+        }
+
+        const batchReadbackSize = batchBytesPerRow * batchHeight;
+        let deviceLost = false;
+        bridge.device.lost.then(() => { deviceLost = true; });
+
+        const repeatedFrames = [];
+        for (let f = 0; f < 8; f++) {
+          const fRows = new Float32Array(sharedRows);
+          const deltaX = (f % 2 === 0 ? 0.005 : -0.005) * (f + 1);
+          for (let i = 0; i < batchDrawCount; i++) {
+            fRows[i * 12 + 3] += deltaX;
+          }
+          repeatedFrames.push(fRows);
+        }
+
+        function comparePixels(a, b) {
+          if (a.byteLength !== b.byteLength) return -1;
+          let diffs = 0;
+          for (let i = 0; i < a.byteLength; i++) {
+            if (a[i] !== b[i]) diffs++;
+          }
+          return diffs;
+        }
+
+        async function runTwoCreditFrameLoop(name, runner, frames) {
+          if (deviceLost) throw new Error(`Device lost before ${name}`);
+          const initPromise = runner.submit(sharedRows);
+          await initPromise;
+          const initialPixels = await runner.readback();
+
+          const inFlight = new Set();
+          let completedCount = 0;
+          let cpuDurationMs = 0;
+          const tStart = performance.now();
+
+          for (let i = 0; i < frames.length; i++) {
+            if (deviceLost) throw new Error(`Device lost during ${name} frame ${i}`);
+            if (inFlight.size >= 2) {
+              const finished = await Promise.race(inFlight);
+              inFlight.delete(finished);
+              completedCount++;
+            }
+            const cpuT0 = performance.now();
+            const framePromise = runner.submit(frames[i]);
+            cpuDurationMs += (performance.now() - cpuT0);
+            let p;
+            p = framePromise.then(() => p);
+            inFlight.add(p);
+          }
+
+          while (inFlight.size > 0) {
+            const finished = await Promise.race(inFlight);
+            inFlight.delete(finished);
+            completedCount++;
+          }
+          const elapsedMs = performance.now() - tStart;
+          if (deviceLost) throw new Error(`Device lost during ${name} drain`);
+
+          const finalPixels = await runner.readback();
+          return { name, initialPixels, finalPixels, completedCount, cpuDurationMs, elapsedMs };
+        }
+
+        const makeOracleRunner = (encoder, prep) => {
+          const r = createDirectReferenceRenderer(bridge.device, batchWidth, batchHeight, batchDrawCount);
+          return {
+            submit: (rows) => r.submitFrame(prep ? null : rows, encoder, prep ? () => prep(rows) : null),
+            readback: () => r.readback(),
+            destroy: () => r.destroy(),
+          };
+        };
+
+        const directRunner = makeOracleRunner(null, null);
+        const directResult = await runTwoCreditFrameLoop("direct", directRunner, repeatedFrames);
+        directRunner.destroy();
+
+        const bulkRunner = {
+          submit: (rows) => {
+            const packet = buildAffineFramePacketFn(rows, batchWidth, batchHeight, batchDrawCount);
+            const packetCompletion = bridge.executePacket(packet);
+            const queuePromise = bridge.device.queue.onSubmittedWorkDone();
+            return Promise.all([packetCompletion, queuePromise]);
+          },
+          readback: () => bridge.readbackBuffer(20, batchReadbackSize),
+          destroy: () => {},
+        };
+        const bulkResult = await runTwoCreditFrameLoop("bulk", bulkRunner, repeatedFrames);
+
+        const chattyRunner = makeOracleRunner(chattyDrawEncoder, null);
+        const chattyResult = await runTwoCreditFrameLoop("chatty", chattyRunner, repeatedFrames);
+        chattyRunner.destroy();
+
+        const genRunner = makeOracleRunner(
+          (pass, bg) => genMod.executeStaticSubmission4000(pass, bg),
+          (rows) => packAffineFn(rows)
+        );
+        const genResult = await runTwoCreditFrameLoop("generated", genRunner, repeatedFrames);
+        genRunner.destroy();
+
+        const directChanged = comparePixels(directResult.finalPixels, directResult.initialPixels);
+        if (directChanged === 0) {
+          throw new Error("[debug repeated-frame] direct final pixels did not change from initial");
+        }
+
+        const repeatedVariants = [bulkResult, chattyResult, genResult];
+        for (const v of repeatedVariants) {
+          if (v.completedCount !== repeatedFrames.length) {
+            throw new Error(`[debug repeated-frame] ${v.name} completed count mismatch: ${v.completedCount}/${repeatedFrames.length}`);
+          }
+          const initDiffs = comparePixels(v.initialPixels, directResult.initialPixels);
+          if (initDiffs > 0) {
+            throw new Error(`[debug repeated-frame] ${v.name} initial pixels mismatch direct reference: ${initDiffs} diffs`);
+          }
+          const finalDiffs = comparePixels(v.finalPixels, directResult.finalPixels);
+          if (finalDiffs > 0) {
+            throw new Error(`[debug repeated-frame] ${v.name} final pixels mismatch direct reference: ${finalDiffs} diffs`);
+          }
+          const changedDiffs = comparePixels(v.finalPixels, v.initialPixels);
+          if (changedDiffs === 0) {
+            throw new Error(`[debug repeated-frame] ${v.name} final pixels did not change from initial`);
+          }
+        }
+
+        results.repeated_frame_measurements = {};
+        for (const res of [directResult, bulkResult, chattyResult, genResult]) {
+          results.repeated_frame_measurements[res.name] = {
+            completed_count: res.completedCount,
+            cpu_duration_ms: res.cpuDurationMs,
+            elapsed_ms: res.elapsedMs,
+          };
+          logPass(
+            `repeated_frame_${res.name}`,
+            `[debug repeated-frame] ${res.name}: completed=${res.completedCount}/${repeatedFrames.length} cpu_duration=${res.cpuDurationMs.toFixed(3)}ms elapsed=${res.elapsedMs.toFixed(3)}ms`
+          );
+        }
 
         // 6. Red-A / Blue-B Snapshot Isolation in Single Queue Submission (using PerUseByteBuffer)
         const redBluePacket = buildRedBlueFn(true);
