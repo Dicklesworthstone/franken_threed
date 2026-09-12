@@ -220,6 +220,19 @@ export async function directDepthReference(device, options = {}) {
       // Pass 2: Load color, depthReadOnly = true (omitted depthLoadOp, depthStoreOp, depthClearValue)
       // Pipeline with depthWriteEnabled = false. Draw Far (Red, z=0.8).
       // Depth test against Near (0.2) rejects Far, preserving Green.
+      const isSafari = typeof navigator !== "undefined" &&
+        /Safari/.test(navigator.userAgent) &&
+        !/Chrome/.test(navigator.userAgent) &&
+        !/Chromium/.test(navigator.userAgent);
+
+      const pass2DepthAttachment = {
+        view: depthTexture.createView(),
+        depthReadOnly: true,
+      };
+      if (isSafari) {
+        pass2DepthAttachment.depthLoadOp = "load";
+      }
+
       const pass2 = encoder.beginRenderPass({
         colorAttachments: [
           {
@@ -228,10 +241,7 @@ export async function directDepthReference(device, options = {}) {
             storeOp: "store",
           },
         ],
-        depthStencilAttachment: {
-          view: depthTexture.createView(),
-          depthReadOnly: true,
-        },
+        depthStencilAttachment: pass2DepthAttachment,
       });
       pass2.setPipeline(pipelineReadOnly);
       pass2.setVertexBuffer(0, farBuffer);
@@ -536,7 +546,11 @@ export async function testDepthScene(bridgeHost, wasmExports) {
     candidatePixels4[centerIdx + 3],
   ];
   if (center4[0] > 50 || center4[1] < 200 || center4[2] > 50 || center4[3] !== 255) {
-    throw new Error(`Checkpoint 5 failed: expected center Green [0, 255, 0, 255] in read-only depth pass, got [${center4}]`);
+    const isRed = center4[0] >= 200 && center4[1] <= 50;
+    const diagnosis = isRed
+      ? "Far geometry (Red) rendered; prior depth (Green, 0.2) was NOT loaded into read-only pass (behaved as Clear/DontCare instead of Load)"
+      : `unexpected center pixel [${center4}]`;
+    throw new Error(`Checkpoint 5 failed: expected center Green [0, 255, 0, 255] in read-only depth pass, got [${center4}]. Diagnosis: ${diagnosis}`);
   }
 
   if (differs(candidatePixels4, candidatePixels0)) {

@@ -6370,6 +6370,63 @@ mod tests {
     }
 
     #[test]
+    fn test_lower_plan_readonly_depth_defaults_to_load_op_load() {
+        use f3d_graph::{
+            pass::{ColorAttachment, DepthStencilAttachment, Draw, Pass, PassId},
+            plan::{ExecutionPlan, PlanSegment},
+            resource::ResourceId,
+        };
+
+        let mut p = Pass::new_render(PassId::new(1), "readonly_depth_pass");
+        p.color_attachments.push(ColorAttachment::new_clear(
+            ResourceId::new(10),
+            [0.0, 0.0, 0.0, 1.0],
+        ));
+        let mut dsa = DepthStencilAttachment::new_depth_clear(ResourceId::new(99), 1.0);
+        dsa.depth_read_only = true;
+        dsa.depth_load_op = None;
+        p.depth_stencil_attachment = Some(dsa);
+        p.draws.push(Draw::new(1, 100, 3, 0, Vec::new()));
+
+        let plan = ExecutionPlan {
+            segments: vec![PlanSegment::from_pass(&p)],
+            canvas_epoch: None,
+            pass_count: 1,
+            split_count: 0,
+            split_reasons: Vec::new(),
+        };
+
+        let commands = lower_plan(&plan).expect("readonly depth lowering must succeed");
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            GpuCommand::RenderPassDepth {
+                depth_load_op,
+                depth_read_only,
+                ..
+            } => {
+                assert_eq!(
+                    *depth_load_op,
+                    LOAD_OP_LOAD,
+                    "depth_read_only=true with None load_op must resolve to LOAD_OP_LOAD (1)"
+                );
+                assert!(*depth_read_only, "depth_read_only must be true");
+            }
+            other => panic!("Expected RenderPassDepth command, got {other:?}"),
+        }
+
+        let mut packet = GpuSubmissionPacket::new();
+        packet.push(commands[0].clone());
+        let bytes = packet.encode().expect("binary packet encoding must succeed");
+        // Header is 16 bytes. Command 0 opcode is at 16..20 (4 bytes).
+        // Command 0 fields start at byte 20 (cursor in bridge_runtime.js).
+        // packed_depth_ops is at cursor + 48 = byte 68.
+        // Byte 68: depth_load_op (u8) = 1 (LOAD_OP_LOAD).
+        // Byte 70: depth_read_only (u8) = 1.
+        assert_eq!(bytes[68], LOAD_OP_LOAD as u8, "byte 68 (depth_load_op) must be LOAD_OP_LOAD = 1");
+        assert_eq!(bytes[70], 1u8, "byte 70 (depth_read_only) must be 1");
+    }
+
+    #[test]
     fn test_lower_plan_rejects_stencil_attachment() {
         use f3d_graph::{
             pass::{ColorAttachment, DepthStencilAttachment, Draw, LoadOp, Pass, PassId, StoreOp},
@@ -6787,8 +6844,9 @@ mod tests {
             .filter(|c| matches!(c, GpuCommand::RenderPassDepth { .. }))
             .collect();
         assert_eq!(pass_cmds_4.len(), 2);
-        if let GpuCommand::RenderPassDepth { depth_read_only, pipeline_id, .. } = pass_cmds_4[1] {
+        if let GpuCommand::RenderPassDepth { depth_read_only, depth_load_op, pipeline_id, .. } = pass_cmds_4[1] {
             assert!(*depth_read_only);
+            assert_eq!(*depth_load_op, LOAD_OP_LOAD, "Scenario 4 pass 2 must emit depth_load_op LOAD_OP_LOAD (1)");
             assert_eq!(*pipeline_id, 101);
         } else {
             panic!("Expected RenderPassDepth for pass 2 in scenario 4");

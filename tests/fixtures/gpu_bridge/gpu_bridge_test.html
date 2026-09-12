@@ -41,7 +41,7 @@
     import { testDeviceReplacement } from "./device_lifetime_test.js";
     import { testViewportScissor } from "./viewport_scissor_test.js";
     import { testDrawParameters } from "./draw_parameters_test.js";
-    import { testMeshScene, testVisibleCanvasMeshScene, testMeshDepthScene } from "./mesh_scene_test.js";
+    import { testMeshScene, testVisibleCanvasMeshScene, testMeshDepthScene, testMultiMeshBatchScene } from "./mesh_scene_test.js";
     import { testDepthScene } from "./depth_test.js";
 
     const outputEl = document.getElementById("output");
@@ -379,6 +379,18 @@
             );
           }
           logPass("mesh_depth_scene", await testMeshDepthScene(bridge, wasmExports, canvasContext, canvas));
+        }
+
+        if (requestedLane === "mesh_batch" || requestedLane === "multi_mesh" || requestedLane === "all") {
+          const hasBatchExport =
+            typeof wasmExports.f3d_build_mesh_batch_packet === "function" ||
+            typeof wasmExports.gpu_bridge_build_mesh_batch_packet === "function";
+          if (!hasBatchExport) {
+            throw new Error(
+              "Multi-mesh batch lane requested, but Wasm module is missing required export f3d_build_mesh_batch_packet / gpu_bridge_build_mesh_batch_packet"
+            );
+          }
+          logPass("multi_mesh_batch_scene", await testMultiMeshBatchScene(bridge, wasmExports, canvasContext, canvas));
         }
 
         // 7. Retained renderer exclusion
