@@ -39,13 +39,19 @@ pub use gpu_host::{
     gpu_bridge_validate_affine_rows,
 };
 
+pub use gpu_host::{
+    CULL_MODE_BACK, CULL_MODE_FRONT, CULL_MODE_NONE, FRONT_FACE_CCW, FRONT_FACE_CW,
+    OPCODE_CREATE_PIPELINE_CULL, OPCODE_CREATE_PIPELINE_DEPTH_CULL,
+};
+
 pub use mesh::{
     build_mesh_canvas_depth_submission, build_mesh_canvas_submission,
     build_mesh_depth_submission, build_mesh_submission,
     build_multi_mesh_canvas_depth_submission, build_multi_mesh_canvas_submission,
     build_multi_mesh_depth_submission, build_multi_mesh_submission,
     f3d_build_canvas_mesh_depth_packet, f3d_build_canvas_mesh_packet,
-    f3d_build_mesh_batch_packet, f3d_build_mesh_depth_packet, f3d_build_mesh_packet,
+    f3d_build_mesh_batch_cull_packet, f3d_build_mesh_batch_packet,
+    f3d_build_mesh_depth_packet, f3d_build_mesh_packet,
     generate_mesh_wgsl,
     gpu_bridge_build_canvas_mesh_depth_packet, gpu_bridge_build_canvas_mesh_packet,
     gpu_bridge_build_mesh_depth_packet,

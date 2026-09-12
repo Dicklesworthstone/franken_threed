@@ -144,38 +144,47 @@ export async function directMeshReference(device, options) {
     bindGroupLayouts: [bindGroupLayout],
   });
 
-  const pipeline = device.createRenderPipeline({
-    layout: pipelineLayout,
-    vertex: {
-      module: shaderModule,
-      entryPoint: "vs_main",
-      buffers: [
-        {
-          arrayStride: 20,
-          attributes: [
-            { shaderLocation: 0, offset: 0, format: "float32x3" },
-            { shaderLocation: 1, offset: 12, format: "float32x2" },
+  const pipelineCache = new Map();
+  const getPipeline = (cullMode = "none", frontFace = "ccw") => {
+    const key = `${cullMode}:${frontFace}`;
+    if (!pipelineCache.has(key)) {
+      const p = device.createRenderPipeline({
+        layout: pipelineLayout,
+        vertex: {
+          module: shaderModule,
+          entryPoint: "vs_main",
+          buffers: [
+            {
+              arrayStride: 20,
+              attributes: [
+                { shaderLocation: 0, offset: 0, format: "float32x3" },
+                { shaderLocation: 1, offset: 12, format: "float32x2" },
+              ],
+            },
           ],
         },
-      ],
-    },
-    fragment: {
-      module: shaderModule,
-      entryPoint: "fs_main",
-      targets: [{ format }],
-    },
-    primitive: {
-      topology: "triangle-list",
-      cullMode: "none", // DoubleSide
-    },
-    depthStencil: hasDepth
-      ? {
-          format: depthFormat,
-          depthWriteEnabled,
-          depthCompare,
-        }
-      : undefined,
-  });
+        fragment: {
+          module: shaderModule,
+          entryPoint: "fs_main",
+          targets: [{ format }],
+        },
+        primitive: {
+          topology: "triangle-list",
+          cullMode,
+          frontFace,
+        },
+        depthStencil: hasDepth
+          ? {
+              format: depthFormat,
+              depthWriteEnabled,
+              depthCompare,
+            }
+          : undefined,
+      });
+      pipelineCache.set(key, p);
+    }
+    return pipelineCache.get(key);
+  };
 
   const drawList = (draws && draws.length > 0)
     ? draws
@@ -231,6 +240,8 @@ export async function directMeshReference(device, options) {
       entries: [{ binding: 0, resource: { buffer: uBuffer } }],
     });
 
+    const itemCullMode = item.cullMode || options.cullMode || "none";
+    const itemFrontFace = item.frontFace || options.frontFace || "ccw";
     preparedDraws.push({
       vertexBuffer: vBuffer,
       indexBuffer: iBuffer,
@@ -239,6 +250,8 @@ export async function directMeshReference(device, options) {
       vertexCount: vCount,
       isIndexed: itemIsIndexed,
       indicesLength: itemIsIndexed ? itemIndices.length : 0,
+      cullMode: itemCullMode,
+      frontFace: itemFrontFace,
     });
   }
 
@@ -265,8 +278,13 @@ export async function directMeshReference(device, options) {
       };
     }
     const pass = encoder.beginRenderPass(passDesc);
-    pass.setPipeline(pipeline);
+    let currentPipelineKey = null;
     for (const draw of preparedDraws) {
+      const pipeKey = `${draw.cullMode}:${draw.frontFace}`;
+      if (pipeKey !== currentPipelineKey) {
+        pass.setPipeline(getPipeline(draw.cullMode, draw.frontFace));
+        currentPipelineKey = pipeKey;
+      }
       pass.setBindGroup(0, draw.bindGroup);
       pass.setVertexBuffer(0, draw.vertexBuffer);
       if (draw.isIndexed) {
@@ -381,6 +399,14 @@ function buildIndependentReferenceInput(mesh, camera, width = 64, height = 64) {
     mat.opacity !== undefined ? mat.opacity : 1.0,
   ]);
 
+  const side = (mat && typeof mat.side === "number") ? mat.side : 0;
+  const isReflected = (typeof mesh.matrixWorld?.determinantAffine === "function")
+    ? (mesh.matrixWorld.determinantAffine() < 0)
+    : false;
+  const flipSided = (side === 1) ? !isReflected : isReflected;
+  const frontFace = flipSided ? "cw" : "ccw";
+  const cullMode = (side === 2) ? "none" : "back";
+
   return {
     positions,
     indices,
@@ -390,6 +416,8 @@ function buildIndependentReferenceInput(mesh, camera, width = 64, height = 64) {
     color,
     width,
     height,
+    cullMode,
+    frontFace,
   };
 }
 
@@ -405,6 +433,8 @@ function buildIndependentBatchReferenceInput(meshes, camera, width = 64, height 
       indices: single.indices,
       modelView: single.modelView,
       color: single.color,
+      cullMode: single.cullMode,
+      frontFace: single.frontFace,
     };
   });
   const first = buildIndependentReferenceInput(meshes[0], camera, width, height);
@@ -709,10 +739,22 @@ export async function testMeshScene(bridgeHost, wasmExports, customThree = null,
   }
   mesh.material.map = null;
 
+  mesh.material.side = THREE.FrontSide;
+  const frontAdmission = adapter.canAdmitMesh(mesh, camera);
+  if (!frontAdmission.admitted) {
+    throw new Error(`Negative control failed: FrontSide was rejected: ${frontAdmission.reason}`);
+  }
+
   mesh.material.side = THREE.BackSide;
+  const backAdmission = adapter.canAdmitMesh(mesh, camera);
+  if (!backAdmission.admitted) {
+    throw new Error(`Negative control failed: BackSide was rejected: ${backAdmission.reason}`);
+  }
+
+  mesh.material.side = 999;
   const sideAdmission = adapter.canAdmitMesh(mesh, camera);
   if (sideAdmission.admitted) {
-    throw new Error("Negative control failed: BackSide was admitted in DoubleSide slice");
+    throw new Error("Negative control failed: invalid side=999 was admitted");
   }
   mesh.material.side = THREE.DoubleSide;
 
@@ -2517,5 +2559,291 @@ export async function testMultiMeshBatchScene(bridgeHost, wasmExports, canvasCon
     );
   }
 
-  return "Variable-length multi-mesh batch verified (depth24plus): near-first/far-second with depthWrite=true produces near mesh (Green) matching independent direct WebGPU reference; near-first/far-second with depthWrite=false produces far mesh (Red) matching independent reference and strictly diverging from depthWrite=true; far-first/near-second with depthWrite=true produces near mesh (Green); immutable snapshots verified with distinct dynamic transforms and colors; negative controls strictly refuse empty batch (EMPTY_MESH_BATCH), mismatched depth settings (INCOMPATIBLE_BATCH_DEPTH), and invisible meshes; retained WebGLRenderer multi-mesh oracle matches candidate within tolerance" + (canvasContext ? "; visible canvas batch verified against direct reference" : "") + "; scene hierarchy renderScene verified with translated Group, legitimate culls ignored, positive canvas execution (3 admitted, projected center sRGB colors, depth24plus occlusion, planted negative), and separate visible-unsupported whole-scene refusal";
+  // ---------------------------------------------------------------------------
+  // Checkpoint 9: Material side culling and reflected mesh winding parity
+  // ---------------------------------------------------------------------------
+  // 9a: FrontSide / BackSide / DoubleSide with both CCW and CW windings
+  // CCW triangle: (-2.0, -1.5, -2.0), (2.0, -1.5, -2.0), (0.0, 2.0, -2.0)
+  // CW triangle:  (0.0, 2.0, -2.0), (2.0, -1.5, -2.0), (-2.0, -1.5, -2.0)
+  const geomCCW9 = new THREE.BufferGeometry();
+  geomCCW9.setAttribute("position", new THREE.BufferAttribute(new Float32Array([
+    -2.0, -1.5, -2.0,
+     2.0, -1.5, -2.0,
+     0.0,  2.0, -2.0,
+  ]), 3));
+
+  const geomCW9 = new THREE.BufferGeometry();
+  geomCW9.setAttribute("position", new THREE.BufferAttribute(new Float32Array([
+     0.0,  2.0, -2.0,
+     2.0, -1.5, -2.0,
+    -2.0, -1.5, -2.0,
+  ]), 3));
+
+  const matFront9 = new THREE.MeshBasicMaterial({ color: 0x00ff00, side: THREE.FrontSide, depthTest: true, depthWrite: true, depthFunc: THREE.LessDepth });
+  const matBack9 = new THREE.MeshBasicMaterial({ color: 0x00ff00, side: THREE.BackSide, depthTest: true, depthWrite: true, depthFunc: THREE.LessDepth });
+  const matDouble9 = new THREE.MeshBasicMaterial({ color: 0x00ff00, side: THREE.DoubleSide, depthTest: true, depthWrite: true, depthFunc: THREE.LessDepth });
+
+  // 9a-1: FrontSide + CCW (det >= 0) -> Visible (Green)
+  const meshFrontCCW = new THREE.Mesh(geomCCW9, matFront9);
+  meshFrontCCW.updateMatrixWorld(true);
+  await adapter.renderMeshBatch(bridgeHost, [meshFrontCCW], camera, null, wasmExports, { width, height });
+  const cand9a1 = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+  const ref9a1 = await directMeshReference(device, buildIndependentBatchReferenceInput([meshFrontCCW], camera, width, height, { hasDepth: true, depthFormat: "depth24plus", depthWriteEnabled: true, depthCompare: "less" }));
+  if (cand9a1[centerIdx + 1] === 0 || cand9a1[centerIdx] !== 0) {
+    throw new Error(`Checkpoint 9a-1 failed: FrontSide CCW must be visible Green, got [${cand9a1[centerIdx]}, ${cand9a1[centerIdx+1]}, ${cand9a1[centerIdx+2]}]`);
+  }
+  if (differs(cand9a1, ref9a1)) {
+    throw new Error("Checkpoint 9a-1 failed: FrontSide CCW candidate differs from direct WebGPU reference");
+  }
+
+  // 9a-2: FrontSide + CW (det >= 0) -> Culled (Clear color black)
+  const meshFrontCW = new THREE.Mesh(geomCW9, matFront9);
+  meshFrontCW.updateMatrixWorld(true);
+  await adapter.renderMeshBatch(bridgeHost, [meshFrontCW], camera, null, wasmExports, { width, height });
+  const cand9a2 = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+  const ref9a2 = await directMeshReference(device, buildIndependentBatchReferenceInput([meshFrontCW], camera, width, height, { hasDepth: true, depthFormat: "depth24plus", depthWriteEnabled: true, depthCompare: "less" }));
+  if (cand9a2[centerIdx + 1] !== 0 || cand9a2[centerIdx] !== 0) {
+    throw new Error(`Checkpoint 9a-2 failed: FrontSide CW must be culled (black), got [${cand9a2[centerIdx]}, ${cand9a2[centerIdx+1]}, ${cand9a2[centerIdx+2]}]`);
+  }
+  if (differs(cand9a2, ref9a2)) {
+    throw new Error("Checkpoint 9a-2 failed: FrontSide CW candidate differs from direct WebGPU reference");
+  }
+
+  // 9a-3: BackSide + CCW (det >= 0) -> Culled (Clear color black)
+  const meshBackCCW = new THREE.Mesh(geomCCW9, matBack9);
+  meshBackCCW.updateMatrixWorld(true);
+  await adapter.renderMeshBatch(bridgeHost, [meshBackCCW], camera, null, wasmExports, { width, height });
+  const cand9a3 = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+  const ref9a3 = await directMeshReference(device, buildIndependentBatchReferenceInput([meshBackCCW], camera, width, height, { hasDepth: true, depthFormat: "depth24plus", depthWriteEnabled: true, depthCompare: "less" }));
+  if (cand9a3[centerIdx + 1] !== 0 || cand9a3[centerIdx] !== 0) {
+    throw new Error(`Checkpoint 9a-3 failed: BackSide CCW must be culled (black), got [${cand9a3[centerIdx]}, ${cand9a3[centerIdx+1]}, ${cand9a3[centerIdx+2]}]`);
+  }
+  if (differs(cand9a3, ref9a3)) {
+    throw new Error("Checkpoint 9a-3 failed: BackSide CCW candidate differs from direct WebGPU reference");
+  }
+
+  // 9a-4: BackSide + CW (det >= 0) -> Visible (Green)
+  const meshBackCW = new THREE.Mesh(geomCW9, matBack9);
+  meshBackCW.updateMatrixWorld(true);
+  await adapter.renderMeshBatch(bridgeHost, [meshBackCW], camera, null, wasmExports, { width, height });
+  const cand9a4 = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+  const ref9a4 = await directMeshReference(device, buildIndependentBatchReferenceInput([meshBackCW], camera, width, height, { hasDepth: true, depthFormat: "depth24plus", depthWriteEnabled: true, depthCompare: "less" }));
+  if (cand9a4[centerIdx + 1] === 0 || cand9a4[centerIdx] !== 0) {
+    throw new Error(`Checkpoint 9a-4 failed: BackSide CW must be visible Green, got [${cand9a4[centerIdx]}, ${cand9a4[centerIdx+1]}, ${cand9a4[centerIdx+2]}]`);
+  }
+  if (differs(cand9a4, ref9a4)) {
+    throw new Error("Checkpoint 9a-4 failed: BackSide CW candidate differs from direct WebGPU reference");
+  }
+
+  // 9a-5: DoubleSide + CCW and CW -> Both Visible
+  const meshDoubleCCW = new THREE.Mesh(geomCCW9, matDouble9);
+  const meshDoubleCW = new THREE.Mesh(geomCW9, matDouble9);
+  meshDoubleCCW.updateMatrixWorld(true);
+  meshDoubleCW.updateMatrixWorld(true);
+  await adapter.renderMeshBatch(bridgeHost, [meshDoubleCCW], camera, null, wasmExports, { width, height });
+  const cand9a5 = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+  const ref9a5 = await directMeshReference(device, buildIndependentBatchReferenceInput([meshDoubleCCW], camera, width, height, { hasDepth: true, depthFormat: "depth24plus", depthWriteEnabled: true, depthCompare: "less" }));
+  if (cand9a5[centerIdx + 1] === 0) {
+    throw new Error("Checkpoint 9a-5 failed: DoubleSide CCW must be visible Green");
+  }
+  if (differs(cand9a5, ref9a5)) {
+    throw new Error("Checkpoint 9a-5 failed: DoubleSide CCW candidate differs from direct WebGPU reference");
+  }
+
+  // 9b: Reflected parent transform (group with scale.x = -1 -> determinantAffine() < 0)
+  const groupReflected9 = new THREE.Group();
+  groupReflected9.scale.set(-1, 1, 1);
+
+  // 9b-1: Reflected FrontSide + CCW -> Screen CW, frontFace=CW -> Visible (Green)
+  const meshReflFrontCCW = new THREE.Mesh(geomCCW9, matFront9);
+  groupReflected9.add(meshReflFrontCCW);
+  groupReflected9.updateMatrixWorld(true);
+  await adapter.renderMeshBatch(bridgeHost, [meshReflFrontCCW], camera, null, wasmExports, { width, height });
+  const cand9b1 = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+  const ref9b1 = await directMeshReference(device, buildIndependentBatchReferenceInput([meshReflFrontCCW], camera, width, height, { hasDepth: true, depthFormat: "depth24plus", depthWriteEnabled: true, depthCompare: "less" }));
+  if (cand9b1[centerIdx + 1] === 0 || cand9b1[centerIdx] !== 0) {
+    throw new Error(`Checkpoint 9b-1 failed: Reflected FrontSide CCW must be visible Green, got [${cand9b1[centerIdx]}, ${cand9b1[centerIdx+1]}, ${cand9b1[centerIdx+2]}]`);
+  }
+  if (differs(cand9b1, ref9b1)) {
+    throw new Error("Checkpoint 9b-1 failed: Reflected FrontSide CCW candidate differs from direct WebGPU reference");
+  }
+  groupReflected9.remove(meshReflFrontCCW);
+
+  // 9b-2: Reflected FrontSide + CW -> Screen CCW, frontFace=CW -> Culled (black)
+  const meshReflFrontCW = new THREE.Mesh(geomCW9, matFront9);
+  groupReflected9.add(meshReflFrontCW);
+  groupReflected9.updateMatrixWorld(true);
+  await adapter.renderMeshBatch(bridgeHost, [meshReflFrontCW], camera, null, wasmExports, { width, height });
+  const cand9b2 = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+  const ref9b2 = await directMeshReference(device, buildIndependentBatchReferenceInput([meshReflFrontCW], camera, width, height, { hasDepth: true, depthFormat: "depth24plus", depthWriteEnabled: true, depthCompare: "less" }));
+  if (cand9b2[centerIdx + 1] !== 0 || cand9b2[centerIdx] !== 0) {
+    throw new Error(`Checkpoint 9b-2 failed: Reflected FrontSide CW must be culled (black), got [${cand9b2[centerIdx]}, ${cand9b2[centerIdx+1]}, ${cand9b2[centerIdx+2]}]`);
+  }
+  if (differs(cand9b2, ref9b2)) {
+    throw new Error("Checkpoint 9b-2 failed: Reflected FrontSide CW candidate differs from direct WebGPU reference");
+  }
+  groupReflected9.remove(meshReflFrontCW);
+
+  // 9b-3: Reflected BackSide + CCW -> Screen CW, frontFace=CCW -> Culled (black)
+  const meshReflBackCCW = new THREE.Mesh(geomCCW9, matBack9);
+  groupReflected9.add(meshReflBackCCW);
+  groupReflected9.updateMatrixWorld(true);
+  await adapter.renderMeshBatch(bridgeHost, [meshReflBackCCW], camera, null, wasmExports, { width, height });
+  const cand9b3 = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+  const ref9b3 = await directMeshReference(device, buildIndependentBatchReferenceInput([meshReflBackCCW], camera, width, height, { hasDepth: true, depthFormat: "depth24plus", depthWriteEnabled: true, depthCompare: "less" }));
+  if (cand9b3[centerIdx + 1] !== 0 || cand9b3[centerIdx] !== 0) {
+    throw new Error(`Checkpoint 9b-3 failed: Reflected BackSide CCW must be culled (black), got [${cand9b3[centerIdx]}, ${cand9b3[centerIdx+1]}, ${cand9b3[centerIdx+2]}]`);
+  }
+  if (differs(cand9b3, ref9b3)) {
+    throw new Error("Checkpoint 9b-3 failed: Reflected BackSide CCW candidate differs from direct WebGPU reference");
+  }
+  groupReflected9.remove(meshReflBackCCW);
+
+  // 9b-4: Reflected BackSide + CW -> Screen CCW, frontFace=CCW -> Visible (Green)
+  const meshReflBackCW = new THREE.Mesh(geomCW9, matBack9);
+  groupReflected9.add(meshReflBackCW);
+  groupReflected9.updateMatrixWorld(true);
+  await adapter.renderMeshBatch(bridgeHost, [meshReflBackCW], camera, null, wasmExports, { width, height });
+  const cand9b4 = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+  const ref9b4 = await directMeshReference(device, buildIndependentBatchReferenceInput([meshReflBackCW], camera, width, height, { hasDepth: true, depthFormat: "depth24plus", depthWriteEnabled: true, depthCompare: "less" }));
+  if (cand9b4[centerIdx + 1] === 0 || cand9b4[centerIdx] !== 0) {
+    throw new Error(`Checkpoint 9b-4 failed: Reflected BackSide CW must be visible Green, got [${cand9b4[centerIdx]}, ${cand9b4[centerIdx+1]}, ${cand9b4[centerIdx+2]}]`);
+  }
+  if (differs(cand9b4, ref9b4)) {
+    throw new Error("Checkpoint 9b-4 failed: Reflected BackSide CW candidate differs from direct WebGPU reference");
+  }
+  groupReflected9.remove(meshReflBackCW);
+
+  // 9c: Mixed-side multi-mesh batch in a single pass
+  const leftIdx9 = 32 * bytesPerRow + 12 * 4;
+  const rightIdx9 = 32 * bytesPerRow + 52 * 4;
+
+  const geomLeft9 = new THREE.BufferGeometry();
+  geomLeft9.setAttribute("position", new THREE.BufferAttribute(new Float32Array([
+    -1.5, -1.5, -2.5,
+    -0.3, -1.5, -2.5,
+    -0.6,  1.5, -2.5,
+  ]), 3));
+  const matLeft9 = new THREE.MeshBasicMaterial({ color: 0x0000ff, side: THREE.DoubleSide, depthTest: true, depthWrite: true, depthFunc: THREE.LessDepth });
+  const meshLeft9 = new THREE.Mesh(geomLeft9, matLeft9);
+  meshLeft9.updateMatrixWorld(true);
+
+  const geomCenter9 = new THREE.BufferGeometry();
+  geomCenter9.setAttribute("position", new THREE.BufferAttribute(new Float32Array([
+    -0.5, -1.0, -2.0,
+     0.5, -1.0, -2.0,
+     0.0,  1.0, -2.0,
+  ]), 3));
+  const matCenter9 = new THREE.MeshBasicMaterial({ color: 0x00ff00, side: THREE.FrontSide, depthTest: true, depthWrite: true, depthFunc: THREE.LessDepth });
+  const meshCenter9 = new THREE.Mesh(geomCenter9, matCenter9);
+  meshCenter9.updateMatrixWorld(true);
+
+  const geomRight9 = new THREE.BufferGeometry();
+  geomRight9.setAttribute("position", new THREE.BufferAttribute(new Float32Array([
+    0.3, -1.5, -2.5,
+    1.5, -1.5, -2.5,
+    0.6,  1.5, -2.5,
+  ]), 3));
+  const matRight9 = new THREE.MeshBasicMaterial({ color: 0xff0000, side: THREE.FrontSide, depthTest: true, depthWrite: true, depthFunc: THREE.LessDepth });
+  const meshRight9 = new THREE.Mesh(geomRight9, matRight9);
+  meshRight9.updateMatrixWorld(true);
+
+  // Culled mesh in foreground (BackSide CCW, Yellow)
+  const matCulled9 = new THREE.MeshBasicMaterial({ color: 0xffff00, side: THREE.BackSide, depthTest: true, depthWrite: true, depthFunc: THREE.LessDepth });
+  const meshCulled9 = new THREE.Mesh(geomCenter9, matCulled9);
+  meshCulled9.position.set(0, 0, 0.5);
+  meshCulled9.updateMatrixWorld(true);
+
+  await adapter.renderMeshBatch(
+    bridgeHost,
+    [meshLeft9, meshCenter9, meshRight9, meshCulled9],
+    camera,
+    null,
+    wasmExports,
+    { width, height }
+  );
+  const cand9c = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+  const ref9c = await directMeshReference(
+    device,
+    buildIndependentBatchReferenceInput(
+      [meshLeft9, meshCenter9, meshRight9, meshCulled9],
+      camera,
+      width,
+      height,
+      { hasDepth: true, depthFormat: "depth24plus", depthWriteEnabled: true, depthCompare: "less" }
+    )
+  );
+
+  if (cand9c[leftIdx9 + 2] === 0 || cand9c[leftIdx9] !== 0) {
+    throw new Error(`Checkpoint 9c failed: Mixed batch Left must be Blue, got [${cand9c[leftIdx9]}, ${cand9c[leftIdx9+1]}, ${cand9c[leftIdx9+2]}]`);
+  }
+  if (cand9c[centerIdx + 1] === 0 || cand9c[centerIdx] !== 0) {
+    throw new Error(`Checkpoint 9c failed: Mixed batch Center must be Green, got [${cand9c[centerIdx]}, ${cand9c[centerIdx+1]}, ${cand9c[centerIdx+2]}]`);
+  }
+  if (cand9c[rightIdx9] === 0 || cand9c[rightIdx9 + 1] !== 0) {
+    throw new Error(`Checkpoint 9c failed: Mixed batch Right must be Red, got [${cand9c[rightIdx9]}, ${cand9c[rightIdx9+1]}, ${cand9c[rightIdx9+2]}]`);
+  }
+  if (differs(cand9c, ref9c)) {
+    throw new Error("Checkpoint 9c failed: Mixed-side batch candidate differs from direct WebGPU reference");
+  }
+
+  // 9d: Dynamic mutation across sequential frames
+  const mutGeom9 = geomCCW9;
+  const mutMat9 = new THREE.MeshBasicMaterial({ color: 0x00ff00, side: THREE.FrontSide, depthTest: true, depthWrite: true, depthFunc: THREE.LessDepth });
+  const mutMesh9 = new THREE.Mesh(mutGeom9, mutMat9);
+  mutMesh9.updateMatrixWorld(true);
+
+  // Frame 1: FrontSide CCW -> Visible (Green)
+  await adapter.renderMeshBatch(bridgeHost, [mutMesh9], camera, null, wasmExports, { width, height });
+  const cand9d1 = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+  const ref9d1 = await directMeshReference(device, buildIndependentBatchReferenceInput([mutMesh9], camera, width, height, { hasDepth: true, depthFormat: "depth24plus", depthWriteEnabled: true, depthCompare: "less" }));
+  if (cand9d1[centerIdx + 1] === 0 || cand9d1[centerIdx] !== 0) {
+    throw new Error("Checkpoint 9d-1 failed: Mutated mesh frame 1 must be visible Green");
+  }
+  if (differs(cand9d1, ref9d1)) {
+    throw new Error("Checkpoint 9d-1 failed: Mutated mesh frame 1 candidate differs from direct WebGPU reference");
+  }
+
+  // Frame 2: Mutate material.side to BackSide -> Culled (Black)
+  mutMesh9.material.side = THREE.BackSide;
+  mutMesh9.material.needsUpdate = true;
+  await adapter.renderMeshBatch(bridgeHost, [mutMesh9], camera, null, wasmExports, { width, height });
+  const cand9d2 = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+  const ref9d2 = await directMeshReference(device, buildIndependentBatchReferenceInput([mutMesh9], camera, width, height, { hasDepth: true, depthFormat: "depth24plus", depthWriteEnabled: true, depthCompare: "less" }));
+  if (cand9d2[centerIdx + 1] !== 0 || cand9d2[centerIdx] !== 0) {
+    throw new Error("Checkpoint 9d-2 failed: Mutated mesh frame 2 (side=BackSide) must be culled (black)");
+  }
+  if (differs(cand9d2, ref9d2)) {
+    throw new Error("Checkpoint 9d-2 failed: Mutated mesh frame 2 candidate differs from direct WebGPU reference");
+  }
+
+  // Frame 3: Mutate material.side to FrontSide and scale.x to -1 -> Reflected FrontSide CCW stays Visible (Green)
+  mutMesh9.material.side = THREE.FrontSide;
+  mutMesh9.material.needsUpdate = true;
+  mutMesh9.scale.set(-1, 1, 1);
+  mutMesh9.updateMatrixWorld(true);
+  await adapter.renderMeshBatch(bridgeHost, [mutMesh9], camera, null, wasmExports, { width, height });
+  const cand9d3 = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+  const ref9d3 = await directMeshReference(device, buildIndependentBatchReferenceInput([mutMesh9], camera, width, height, { hasDepth: true, depthFormat: "depth24plus", depthWriteEnabled: true, depthCompare: "less" }));
+  if (cand9d3[centerIdx + 1] === 0 || cand9d3[centerIdx] !== 0) {
+    throw new Error("Checkpoint 9d-3 failed: Mutated mesh frame 3 (scale.x=-1, side=FrontSide) must be visible Green");
+  }
+  if (differs(cand9d3, ref9d3)) {
+    throw new Error("Checkpoint 9d-3 failed: Mutated mesh frame 3 candidate differs from direct WebGPU reference");
+  }
+
+  // Frame 4: Mutate material.side to BackSide with scale.x = -1 -> Reflected BackSide CCW is Culled (Black)
+  mutMesh9.material.side = THREE.BackSide;
+  mutMesh9.material.needsUpdate = true;
+  await adapter.renderMeshBatch(bridgeHost, [mutMesh9], camera, null, wasmExports, { width, height });
+  const cand9d4 = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+  const ref9d4 = await directMeshReference(device, buildIndependentBatchReferenceInput([mutMesh9], camera, width, height, { hasDepth: true, depthFormat: "depth24plus", depthWriteEnabled: true, depthCompare: "less" }));
+  if (cand9d4[centerIdx + 1] !== 0 || cand9d4[centerIdx] !== 0) {
+    throw new Error("Checkpoint 9d-4 failed: Mutated mesh frame 4 (scale.x=-1, side=BackSide) must be culled (black)");
+  }
+  if (differs(cand9d4, ref9d4)) {
+    throw new Error("Checkpoint 9d-4 failed: Mutated mesh frame 4 candidate differs from direct WebGPU reference");
+  }
+
+  return "Variable-length multi-mesh batch verified (depth24plus): near-first/far-second with depthWrite=true produces near mesh (Green) matching independent direct WebGPU reference; near-first/far-second with depthWrite=false produces far mesh (Red) matching independent reference and strictly diverging from depthWrite=true; far-first/near-second with depthWrite=true produces near mesh (Green); immutable snapshots verified with distinct dynamic transforms and colors; negative controls strictly refuse empty batch (EMPTY_MESH_BATCH), mismatched depth settings (INCOMPATIBLE_BATCH_DEPTH), and invisible meshes; retained WebGLRenderer multi-mesh oracle matches candidate within tolerance" + (canvasContext ? "; visible canvas batch verified against direct reference" : "") + "; scene hierarchy renderScene verified with translated Group, legitimate culls ignored, positive canvas execution (3 admitted, projected center sRGB colors, depth24plus occlusion, planted negative), and separate visible-unsupported whole-scene refusal; material side culling and reflected winding verified (FrontSide/BackSide/DoubleSide, CCW/CW, reflected det<0 parity, mixed-side multi-mesh batch, dynamic mutation between frames matching direct WebGPU reference)";
 }

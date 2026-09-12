@@ -14,9 +14,12 @@ use f3d_graph::resource::ResourceId;
 use f3d_runtime::frame::{FrameSession, RenderContext};
 use f3d_runtime::gpu_host::{
     GpuCommand, GpuSubmissionPacket, BUFFER_USAGE_COPY_DST, BUFFER_USAGE_MAP_READ,
-    BUFFER_USAGE_UNIFORM, BUFFER_USAGE_VERTEX, DEPTH_COMPARE_ALWAYS, DEPTH_COMPARE_LESS,
-    TARGET_CANVAS, TARGET_FORMAT_DEPTH24PLUS, TARGET_FORMAT_PREFERRED_CANVAS,
-    TARGET_FORMAT_RGBA8UNORM, TEXTURE_USAGE_COPY_SRC, TEXTURE_USAGE_RENDER_ATTACHMENT,
+    BUFFER_USAGE_UNIFORM, BUFFER_USAGE_VERTEX, CULL_MODE_BACK, CULL_MODE_FRONT,
+    CULL_MODE_NONE, DEPTH_COMPARE_ALWAYS, DEPTH_COMPARE_LESS, FRONT_FACE_CCW, FRONT_FACE_CW,
+    OPCODE_CREATE_PIPELINE, OPCODE_CREATE_PIPELINE_CULL, OPCODE_CREATE_PIPELINE_DEPTH,
+    OPCODE_CREATE_PIPELINE_DEPTH_CULL, TARGET_CANVAS, TARGET_FORMAT_DEPTH24PLUS,
+    TARGET_FORMAT_PREFERRED_CANVAS, TARGET_FORMAT_RGBA8UNORM, TEXTURE_USAGE_COPY_SRC,
+    TEXTURE_USAGE_RENDER_ATTACHMENT,
 };
 use f3d_runtime::mesh::{
     build_mesh_canvas_depth_submission, build_mesh_canvas_submission,
@@ -24,7 +27,8 @@ use f3d_runtime::mesh::{
     build_multi_mesh_canvas_depth_submission, build_multi_mesh_canvas_submission,
     build_multi_mesh_depth_submission, build_multi_mesh_submission,
     f3d_build_canvas_mesh_depth_packet, f3d_build_canvas_mesh_packet,
-    f3d_build_mesh_batch_packet, f3d_build_mesh_depth_packet, f3d_build_mesh_packet,
+    f3d_build_mesh_batch_cull_packet, f3d_build_mesh_batch_packet,
+    f3d_build_mesh_depth_packet, f3d_build_mesh_packet,
     generate_mesh_wgsl,
     gpu_bridge_build_canvas_mesh_depth_packet, gpu_bridge_build_canvas_mesh_packet,
     gpu_bridge_build_mesh_depth_packet,
@@ -2203,3 +2207,581 @@ fn test_multi_mesh_empty_middle_preserves_vertex_alignment() {
         assert_eq!(*first_vertex, 3, "Mesh 2 has first_vertex 3");
     }
 }
+
+#[test]
+fn test_opcode_create_pipeline_cull_binary_encoding() {
+    let mut packet = GpuSubmissionPacket::new();
+    let wgsl = "@vertex fn vs_main() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0); }";
+    packet.push(GpuCommand::CreatePipelineCull {
+        pipeline_id: 104,
+        wgsl_code: wgsl.to_string(),
+        target_format: TARGET_FORMAT_RGBA8UNORM,
+        has_vertex_buffer: true,
+        has_uniform_buffer: true,
+        uniform_size: 144,
+        vertex_stride: 20,
+        cull_mode: CULL_MODE_BACK,
+        front_face: FRONT_FACE_CW,
+    });
+
+    let encoded = packet.encode().expect("encoding CreatePipelineCull");
+    assert_eq!(&encoded[0..4], b"F3DP");
+    let cmd_count = u32::from_le_bytes(encoded[8..12].try_into().unwrap());
+    assert_eq!(cmd_count, 1);
+
+    // Opcode at offset 16 is u16 = 14
+    let op = u16::from_le_bytes(encoded[16..18].try_into().unwrap());
+    assert_eq!(op, OPCODE_CREATE_PIPELINE_CULL);
+
+    // Payload length is exactly 40 bytes:
+    // 18..22: pipeline_id
+    let pipeline_id = u32::from_le_bytes(encoded[18..22].try_into().unwrap());
+    assert_eq!(pipeline_id, 104);
+    // 22..26: code_offset
+    let code_offset = u32::from_le_bytes(encoded[22..26].try_into().unwrap());
+    assert_eq!(code_offset, 0);
+    // 26..30: code_len
+    let code_len = u32::from_le_bytes(encoded[26..30].try_into().unwrap());
+    assert_eq!(code_len, wgsl.len() as u32);
+    // 30..34: target_format
+    let target_format = u32::from_le_bytes(encoded[30..34].try_into().unwrap());
+    assert_eq!(target_format, TARGET_FORMAT_RGBA8UNORM);
+    // 34..38: has_vertex_buffer
+    assert_eq!(u32::from_le_bytes(encoded[34..38].try_into().unwrap()), 1);
+    // 38..42: has_uniform_buffer
+    assert_eq!(u32::from_le_bytes(encoded[38..42].try_into().unwrap()), 1);
+    // 42..46: uniform_size
+    assert_eq!(u32::from_le_bytes(encoded[42..46].try_into().unwrap()), 144);
+    // 46..50: vertex_stride
+    assert_eq!(u32::from_le_bytes(encoded[46..50].try_into().unwrap()), 20);
+    // 50..54: cull_mode
+    assert_eq!(u32::from_le_bytes(encoded[50..54].try_into().unwrap()), CULL_MODE_BACK);
+    // 54..58: front_face
+    assert_eq!(u32::from_le_bytes(encoded[54..58].try_into().unwrap()), FRONT_FACE_CW);
+
+    // Header size = 16 (file header) + 2 (opcode) + 40 (payload) = 58 bytes
+    // Variable shader code follows at offset 58
+    assert_eq!(&encoded[58..58 + wgsl.len()], wgsl.as_bytes());
+}
+
+#[test]
+fn test_opcode_create_pipeline_depth_cull_binary_encoding() {
+    let mut packet = GpuSubmissionPacket::new();
+    let wgsl = "@vertex fn vs_main() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0); }";
+    packet.push(GpuCommand::CreatePipelineDepthCull {
+        pipeline_id: 105,
+        wgsl_code: wgsl.to_string(),
+        target_format: TARGET_FORMAT_PREFERRED_CANVAS,
+        has_vertex_buffer: true,
+        has_uniform_buffer: true,
+        uniform_size: 144,
+        vertex_stride: 20,
+        depth_format: TARGET_FORMAT_DEPTH24PLUS,
+        depth_write_enabled: true,
+        depth_compare: DEPTH_COMPARE_LESS,
+        cull_mode: CULL_MODE_FRONT,
+        front_face: FRONT_FACE_CCW,
+    });
+
+    let encoded = packet.encode().expect("encoding CreatePipelineDepthCull");
+    assert_eq!(&encoded[0..4], b"F3DP");
+    let cmd_count = u32::from_le_bytes(encoded[8..12].try_into().unwrap());
+    assert_eq!(cmd_count, 1);
+
+    // Opcode at offset 16 is u16 = 15
+    let op = u16::from_le_bytes(encoded[16..18].try_into().unwrap());
+    assert_eq!(op, OPCODE_CREATE_PIPELINE_DEPTH_CULL);
+
+    // Payload length is exactly 52 bytes:
+    // 18..22: pipeline_id
+    assert_eq!(u32::from_le_bytes(encoded[18..22].try_into().unwrap()), 105);
+    // 22..26: code_offset
+    assert_eq!(u32::from_le_bytes(encoded[22..26].try_into().unwrap()), 0);
+    // 26..30: code_len
+    assert_eq!(u32::from_le_bytes(encoded[26..30].try_into().unwrap()), wgsl.len() as u32);
+    // 30..34: target_format
+    assert_eq!(u32::from_le_bytes(encoded[30..34].try_into().unwrap()), TARGET_FORMAT_PREFERRED_CANVAS);
+    // 34..38: has_vertex_buffer
+    assert_eq!(u32::from_le_bytes(encoded[34..38].try_into().unwrap()), 1);
+    // 38..42: has_uniform_buffer
+    assert_eq!(u32::from_le_bytes(encoded[38..42].try_into().unwrap()), 1);
+    // 42..46: uniform_size
+    assert_eq!(u32::from_le_bytes(encoded[42..46].try_into().unwrap()), 144);
+    // 46..50: vertex_stride
+    assert_eq!(u32::from_le_bytes(encoded[46..50].try_into().unwrap()), 20);
+    // 50..54: depth_format
+    assert_eq!(u32::from_le_bytes(encoded[50..54].try_into().unwrap()), TARGET_FORMAT_DEPTH24PLUS);
+    // 54..58: depth_write_enabled
+    assert_eq!(u32::from_le_bytes(encoded[54..58].try_into().unwrap()), 1);
+    // 58..62: depth_compare
+    assert_eq!(u32::from_le_bytes(encoded[58..62].try_into().unwrap()), DEPTH_COMPARE_LESS);
+    // 62..66: cull_mode
+    assert_eq!(u32::from_le_bytes(encoded[62..66].try_into().unwrap()), CULL_MODE_FRONT);
+    // 66..70: front_face
+    assert_eq!(u32::from_le_bytes(encoded[66..70].try_into().unwrap()), FRONT_FACE_CCW);
+
+    // Total header = 16 + 2 + 52 = 70 bytes; shader code follows
+    assert_eq!(&encoded[70..70 + wgsl.len()], wgsl.as_bytes());
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedPipelineCull {
+    pipeline_id: u32,
+    cull_mode: u32,
+    front_face: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedPipelineDepthCull {
+    pipeline_id: u32,
+    target_format: u32,
+    depth_format: u32,
+    cull_mode: u32,
+    front_face: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedDrawPass {
+    opcode: u16,
+    pipeline_id: u32,
+    pass_flags: u32,
+    vertex_count: u32,
+    dynamic_offset: u32,
+}
+
+#[derive(Debug, Default)]
+struct ParsedPacketSummary {
+    pipelines: Vec<u32>,
+    depth_pipelines: Vec<u32>,
+    cull_pipelines: Vec<ParsedPipelineCull>,
+    depth_cull_pipelines: Vec<ParsedPipelineDepthCull>,
+    draw_pipeline_ids: Vec<u32>,
+    draw_passes: Vec<ParsedDrawPass>,
+}
+
+fn scan_packet_commands(packet_bytes: &[u8]) -> ParsedPacketSummary {
+    assert!(packet_bytes.len() >= 16, "packet too short for header");
+    assert_eq!(&packet_bytes[0..4], b"F3DP", "magic mismatch");
+    let cmd_count = u32::from_le_bytes(packet_bytes[8..12].try_into().unwrap());
+    let mut cursor = 16usize;
+    let mut summary = ParsedPacketSummary::default();
+
+    for _ in 0..cmd_count {
+        assert!(cursor + 2 <= packet_bytes.len(), "cursor overflow reading opcode");
+        let op = u16::from_le_bytes(packet_bytes[cursor..cursor + 2].try_into().unwrap());
+        cursor += 2;
+        match op {
+            1 => cursor += 12, // CREATE_BUFFER
+            2 => cursor += 16, // WRITE_BUFFER
+            OPCODE_CREATE_PIPELINE => { // 3
+                let pid = u32::from_le_bytes(packet_bytes[cursor..cursor + 4].try_into().unwrap());
+                summary.pipelines.push(pid);
+                cursor += 32;
+            }
+            4 => { // RENDER_PASS
+                let raw_target = u32::from_le_bytes(packet_bytes[cursor..cursor + 4].try_into().unwrap());
+                let pass_flags = (raw_target >> 24) & 0xFF;
+                let pid = u32::from_le_bytes(packet_bytes[cursor + 24..cursor + 28].try_into().unwrap());
+                let v_count = u32::from_le_bytes(packet_bytes[cursor + 32..cursor + 36].try_into().unwrap());
+                let dyn_offset = u32::from_le_bytes(packet_bytes[cursor + 36..cursor + 40].try_into().unwrap());
+                summary.draw_pipeline_ids.push(pid);
+                summary.draw_passes.push(ParsedDrawPass {
+                    opcode: 4,
+                    pipeline_id: pid,
+                    pass_flags,
+                    vertex_count: v_count,
+                    dynamic_offset: dyn_offset,
+                });
+                cursor += 44;
+            }
+            5 => cursor += 24, // COPY_TEXTURE_TO_BUFFER
+            6 => cursor += 20, // CREATE_TEXTURE
+            7 => cursor += 28, // RECORD_BUNDLE
+            8 => { // EXECUTE_BUNDLES
+                let cnt = u32::from_le_bytes(packet_bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
+                cursor += 4 + cnt * 4;
+            }
+            9 => cursor += 24,  // SET_VIEWPORT
+            10 => cursor += 16, // SET_SCISSOR_RECT
+            11 => cursor += 12, // SET_DRAW_PARAMETERS
+            OPCODE_CREATE_PIPELINE_DEPTH => { // 12
+                let pid = u32::from_le_bytes(packet_bytes[cursor..cursor + 4].try_into().unwrap());
+                summary.depth_pipelines.push(pid);
+                cursor += 44;
+            }
+            13 => { // RENDER_PASS_DEPTH
+                let raw_target = u32::from_le_bytes(packet_bytes[cursor..cursor + 4].try_into().unwrap());
+                let pass_flags = (raw_target >> 24) & 0xFF;
+                let pid = u32::from_le_bytes(packet_bytes[cursor + 24..cursor + 28].try_into().unwrap());
+                let v_count = u32::from_le_bytes(packet_bytes[cursor + 32..cursor + 36].try_into().unwrap());
+                let dyn_offset = u32::from_le_bytes(packet_bytes[cursor + 36..cursor + 40].try_into().unwrap());
+                summary.draw_pipeline_ids.push(pid);
+                summary.draw_passes.push(ParsedDrawPass {
+                    opcode: 13,
+                    pipeline_id: pid,
+                    pass_flags,
+                    vertex_count: v_count,
+                    dynamic_offset: dyn_offset,
+                });
+                cursor += 56;
+            }
+            OPCODE_CREATE_PIPELINE_CULL => { // 14
+                let pid = u32::from_le_bytes(packet_bytes[cursor..cursor + 4].try_into().unwrap());
+                let cm = u32::from_le_bytes(packet_bytes[cursor + 32..cursor + 36].try_into().unwrap());
+                let ff = u32::from_le_bytes(packet_bytes[cursor + 36..cursor + 40].try_into().unwrap());
+                summary.cull_pipelines.push(ParsedPipelineCull {
+                    pipeline_id: pid,
+                    cull_mode: cm,
+                    front_face: ff,
+                });
+                cursor += 40;
+            }
+            OPCODE_CREATE_PIPELINE_DEPTH_CULL => { // 15
+                let pid = u32::from_le_bytes(packet_bytes[cursor..cursor + 4].try_into().unwrap());
+                let target_format = u32::from_le_bytes(packet_bytes[cursor + 12..cursor + 16].try_into().unwrap());
+                let depth_format = u32::from_le_bytes(packet_bytes[cursor + 32..cursor + 36].try_into().unwrap());
+                let cm = u32::from_le_bytes(packet_bytes[cursor + 44..cursor + 48].try_into().unwrap());
+                let ff = u32::from_le_bytes(packet_bytes[cursor + 48..cursor + 52].try_into().unwrap());
+                summary.depth_cull_pipelines.push(ParsedPipelineDepthCull {
+                    pipeline_id: pid,
+                    target_format,
+                    depth_format,
+                    cull_mode: cm,
+                    front_face: ff,
+                });
+                cursor += 52;
+            }
+            other => panic!("scan_packet_commands: unexpected opcode {other} at cursor {cursor}"),
+        }
+    }
+    summary
+}
+
+#[test]
+fn test_mesh_batch_cull_single_mesh_n1() {
+    let positions = [0.0f32, 0.5, 0.0, -0.5, -0.5, 0.0, 0.5, -0.5, 0.0];
+    let vertex_counts = [3u32];
+    let model_views = IDENTITY_F64;
+    let projection = IDENTITY_F64;
+    let colors = [1.0f32, 0.0, 0.0, 1.0];
+    let cull_modes = [CULL_MODE_BACK as u8]; // 2
+    let front_faces = [FRONT_FACE_CCW as u8]; // 0
+
+    let packet_bytes = f3d_build_mesh_batch_cull_packet(
+        &positions,
+        &vertex_counts,
+        &model_views,
+        &projection,
+        &colors,
+        &cull_modes,
+        &front_faces,
+        64,
+        64,
+        false,
+        false,
+        false,
+        DEPTH_COMPARE_ALWAYS,
+        false,
+    )
+    .expect("single mesh cull packet should build");
+
+    let summary = scan_packet_commands(&packet_bytes);
+
+    // Expected pipeline ID: MESH_PIPELINE_ID (100) + (2 * 2 + 0) = 104
+    assert_eq!(summary.cull_pipelines.len(), 1, "CreatePipelineCull (opcode 14) must be emitted");
+    assert_eq!(summary.cull_pipelines[0].pipeline_id, 104);
+    assert_eq!(summary.cull_pipelines[0].cull_mode, CULL_MODE_BACK);
+    assert_eq!(summary.cull_pipelines[0].front_face, FRONT_FACE_CCW);
+
+    assert_eq!(summary.draw_pipeline_ids, vec![104], "RenderPass referencing pipeline 104 must be emitted");
+}
+
+#[test]
+fn test_mesh_batch_cull_multiple_distinct_and_deduplicated_pipelines() {
+    // 4 meshes:
+    // Mesh 0: None, CCW (0, 0) -> pipeline 100
+    // Mesh 1: Back, CCW (2, 0) -> pipeline 104
+    // Mesh 2: Back, CW  (2, 1) -> pipeline 105
+    // Mesh 3: Back, CCW (2, 0) -> pipeline 104 (deduplicated!)
+    let mut positions = Vec::new();
+    for _ in 0..4 {
+        positions.extend_from_slice(&[0.0f32, 0.5, 0.0, -0.5, -0.5, 0.0, 0.5, -0.5, 0.0]);
+    }
+    let vertex_counts = [3u32, 3, 3, 3];
+    let mut model_views = Vec::new();
+    for _ in 0..4 {
+        model_views.extend_from_slice(&IDENTITY_F64);
+    }
+    let projection = IDENTITY_F64;
+    let colors = [
+        1.0f32, 0.0, 0.0, 1.0,
+        0.0, 1.0, 0.0, 1.0,
+        0.0, 0.0, 1.0, 1.0,
+        1.0, 1.0, 0.0, 1.0,
+    ];
+    let cull_modes = [0u8, 2, 2, 2];
+    let front_faces = [0u8, 0, 1, 0];
+
+    let packet_bytes = f3d_build_mesh_batch_cull_packet(
+        &positions,
+        &vertex_counts,
+        &model_views,
+        &projection,
+        &colors,
+        &cull_modes,
+        &front_faces,
+        64,
+        64,
+        false,
+        false,
+        false,
+        DEPTH_COMPARE_ALWAYS,
+        false,
+    )
+    .expect("multi-mesh cull packet should build");
+
+    let summary = scan_packet_commands(&packet_bytes);
+
+    // Exactly 3 unique pipelines created: 100 (0,0), 104 (2,0), 105 (2,1)
+    assert_eq!(summary.cull_pipelines.len(), 3);
+    assert_eq!(summary.cull_pipelines[0], ParsedPipelineCull { pipeline_id: 100, cull_mode: 0, front_face: 0 });
+    assert_eq!(summary.cull_pipelines[1], ParsedPipelineCull { pipeline_id: 104, cull_mode: 2, front_face: 0 });
+    assert_eq!(summary.cull_pipelines[2], ParsedPipelineCull { pipeline_id: 105, cull_mode: 2, front_face: 1 });
+
+    // Draws: 4 draws routed to 100, 104, 105, 104
+    assert_eq!(summary.draw_pipeline_ids, vec![100, 104, 105, 104]);
+}
+
+#[test]
+fn test_mesh_batch_cull_canvas_depth() {
+    let mut positions = Vec::new();
+    for _ in 0..2 {
+        positions.extend_from_slice(&[0.0f32, 0.5, 0.0, -0.5, -0.5, 0.0, 0.5, -0.5, 0.0]);
+    }
+    let vertex_counts = [3u32, 3];
+    let mut model_views = Vec::new();
+    for _ in 0..2 {
+        model_views.extend_from_slice(&IDENTITY_F64);
+    }
+    let projection = IDENTITY_F64;
+    let colors = [
+        1.0f32, 0.0, 0.0, 1.0,
+        0.0, 1.0, 0.0, 1.0,
+    ];
+    let cull_modes = [2u8, 0]; // BackSide (2), DoubleSide (0)
+    let front_faces = [0u8, 0]; // CCW (0)
+
+    let packet_bytes = f3d_build_mesh_batch_cull_packet(
+        &positions,
+        &vertex_counts,
+        &model_views,
+        &projection,
+        &colors,
+        &cull_modes,
+        &front_faces,
+        64,
+        64,
+        false,
+        true, // depth_test
+        true, // depth_write
+        DEPTH_COMPARE_LESS,
+        true, // canvas
+    )
+    .expect("canvas depth cull packet should build");
+
+    let summary = scan_packet_commands(&packet_bytes);
+
+    // Base canvas pipeline ID = 101
+    // Mesh 0: Back (2), CCW (0) -> 101 + 4 = 105
+    // Mesh 1: None (0), CCW (0) -> 101 + 0 = 101
+    assert_eq!(summary.depth_cull_pipelines.len(), 2);
+    assert_eq!(summary.depth_cull_pipelines[0], ParsedPipelineDepthCull {
+        pipeline_id: 105,
+        target_format: TARGET_FORMAT_PREFERRED_CANVAS,
+        depth_format: TARGET_FORMAT_DEPTH24PLUS,
+        cull_mode: 2,
+        front_face: 0,
+    });
+    assert_eq!(summary.depth_cull_pipelines[1], ParsedPipelineDepthCull {
+        pipeline_id: 101,
+        target_format: TARGET_FORMAT_PREFERRED_CANVAS,
+        depth_format: TARGET_FORMAT_DEPTH24PLUS,
+        cull_mode: 0,
+        front_face: 0,
+    });
+
+    assert_eq!(summary.draw_pipeline_ids, vec![105, 101]);
+}
+
+#[test]
+fn test_mesh_batch_cull_validation_discipline() {
+    let positions = [0.0f32, 0.5, 0.0, -0.5, -0.5, 0.0, 0.5, -0.5, 0.0];
+    let vertex_counts = [3u32];
+    let model_views = IDENTITY_F64;
+    let projection = IDENTITY_F64;
+    let colors = [1.0f32, 0.0, 0.0, 1.0];
+
+    // 1. Empty mesh batch
+    let err = f3d_build_mesh_batch_cull_packet(
+        &[], &[], &[], &projection, &[], &[], &[], 64, 64, false, false, false, 8, false,
+    ).unwrap_err();
+    assert!(err.contains("at least one mesh"));
+
+    // 2. Mismatched cull_modes length
+    let err = f3d_build_mesh_batch_cull_packet(
+        &positions, &vertex_counts, &model_views, &projection, &colors,
+        &[0u8, 1u8], &[0u8], // cull_modes len 2 != 1
+        64, 64, false, false, false, 8, false,
+    ).unwrap_err();
+    assert!(err.contains("cull_modes array length must match mesh count 1 (got 2)"));
+
+    // 3. Mismatched front_faces length
+    let err = f3d_build_mesh_batch_cull_packet(
+        &positions, &vertex_counts, &model_views, &projection, &colors,
+        &[0u8], &[], // front_faces len 0 != 1
+        64, 64, false, false, false, 8, false,
+    ).unwrap_err();
+    assert!(err.contains("front_faces array length must match mesh count 1 (got 0)"));
+
+    // 4. Invalid cull_mode code (3)
+    let err = f3d_build_mesh_batch_cull_packet(
+        &positions, &vertex_counts, &model_views, &projection, &colors,
+        &[3u8], &[0u8],
+        64, 64, false, false, false, 8, false,
+    ).unwrap_err();
+    assert!(err.contains("cull mode code must be between 0 and 2 (got 3)"));
+
+    // 5. Invalid front_face code (2)
+    let err = f3d_build_mesh_batch_cull_packet(
+        &positions, &vertex_counts, &model_views, &projection, &colors,
+        &[0u8], &[2u8],
+        64, 64, false, false, false, 8, false,
+    ).unwrap_err();
+    assert!(err.contains("front face code must be 0 (CCW) or 1 (CW) (got 2)"));
+}
+
+#[test]
+fn test_legacy_f3d_build_mesh_batch_packet_preserves_opcode_3_and_12() {
+    let positions = [0.0f32, 0.5, 0.0, -0.5, -0.5, 0.0, 0.5, -0.5, 0.0];
+    let vertex_counts = [3u32];
+    let model_views = IDENTITY_F64;
+    let projection = IDENTITY_F64;
+    let colors = [1.0f32, 0.0, 0.0, 1.0];
+
+    // Offscreen non-depth batch
+    let packet_bytes = f3d_build_mesh_batch_packet(
+        &positions, &vertex_counts, &model_views, &projection, &colors,
+        64, 64, false, false, false, 8, false,
+    ).expect("legacy batch should build");
+
+    let summary_non_depth = scan_packet_commands(&packet_bytes);
+    assert!(summary_non_depth.pipelines.contains(&100), "Legacy batch must emit OPCODE_CREATE_PIPELINE (3)");
+
+    // Offscreen depth batch
+    let depth_packet_bytes = f3d_build_mesh_batch_packet(
+        &positions, &vertex_counts, &model_views, &projection, &colors,
+        64, 64, false, true, true, DEPTH_COMPARE_LESS, false,
+    ).expect("legacy depth batch should build");
+
+    let summary_depth = scan_packet_commands(&depth_packet_bytes);
+    assert!(summary_depth.depth_pipelines.contains(&100), "Legacy depth batch must emit OPCODE_CREATE_PIPELINE_DEPTH (12)");
+}
+
+#[test]
+fn test_mesh_batch_cull_mixed_side_pipeline_switch_sequence() {
+    // 4 meshes in a single depth pass matching Checkpoint 9c:
+    // Mesh 0: DoubleSide, CCW (0, 0) -> pipeline 100
+    // Mesh 1: FrontSide,  CCW (2, 0) -> pipeline 104
+    // Mesh 2: FrontSide,  CCW (2, 0) -> pipeline 104 (deduplicated)
+    // Mesh 3: BackSide,   CW  (2, 1) -> pipeline 105
+    let mut positions = Vec::new();
+    for _ in 0..4 {
+        positions.extend_from_slice(&[0.0f32, 0.5, 0.0, -0.5, -0.5, 0.0, 0.5, -0.5, 0.0]);
+    }
+    let vertex_counts = [3u32, 3, 3, 3];
+    let mut model_views = Vec::new();
+    for _ in 0..4 {
+        model_views.extend_from_slice(&IDENTITY_F64);
+    }
+    let projection = IDENTITY_F64;
+    let colors = [
+        0.0f32, 0.0, 1.0, 1.0, // Blue (DoubleSide)
+        0.0, 1.0, 0.0, 1.0,    // Green (FrontSide)
+        1.0, 0.0, 0.0, 1.0,    // Red (FrontSide)
+        1.0, 1.0, 0.0, 1.0,    // Yellow (BackSide)
+    ];
+    let cull_modes = [0u8, 2, 2, 2];
+    let front_faces = [0u8, 0, 0, 1];
+
+    let packet_bytes = f3d_build_mesh_batch_cull_packet(
+        &positions,
+        &vertex_counts,
+        &model_views,
+        &projection,
+        &colors,
+        &cull_modes,
+        &front_faces,
+        64,
+        64,
+        false,
+        true, // depth_test
+        true, // depth_write
+        DEPTH_COMPARE_LESS,
+        false,
+    )
+    .expect("mixed-side cull packet should build");
+
+    let summary = scan_packet_commands(&packet_bytes);
+
+    // 1. Assert exactly 3 unique depth-cull pipelines created:
+    // 100 (cull_mode=0, front_face=0), 104 (cull_mode=2, front_face=0), 105 (cull_mode=2, front_face=1)
+    assert_eq!(summary.depth_cull_pipelines.len(), 3);
+    assert_eq!(summary.depth_cull_pipelines[0].pipeline_id, 100);
+    assert_eq!(summary.depth_cull_pipelines[0].cull_mode, 0);
+    assert_eq!(summary.depth_cull_pipelines[0].front_face, 0);
+    assert_eq!(summary.depth_cull_pipelines[1].pipeline_id, 104);
+    assert_eq!(summary.depth_cull_pipelines[1].cull_mode, 2);
+    assert_eq!(summary.depth_cull_pipelines[1].front_face, 0);
+    assert_eq!(summary.depth_cull_pipelines[2].pipeline_id, 105);
+    assert_eq!(summary.depth_cull_pipelines[2].cull_mode, 2);
+    assert_eq!(summary.depth_cull_pipelines[2].front_face, 1);
+
+    // 2. Assert per-draw pipeline IDs on wire
+    assert_eq!(summary.draw_pipeline_ids, vec![100, 104, 104, 105]);
+
+    // 3. Assert exact draw passes, pass_flags, and dynamic uniform offsets
+    assert_eq!(summary.draw_passes.len(), 4);
+    // Draw 0: opens pass (pass_flags = 1 = PASS_FLAG_NEW_PASS), uses pipeline 100, dynamic offset 0
+    assert_eq!(summary.draw_passes[0], ParsedDrawPass {
+        opcode: 13,
+        pipeline_id: 100,
+        pass_flags: 1,
+        vertex_count: 3,
+        dynamic_offset: 0,
+    });
+    // Draw 1: keeps pass open (pass_flags = 0), switches pipeline to 104, dynamic offset 256
+    assert_eq!(summary.draw_passes[1], ParsedDrawPass {
+        opcode: 13,
+        pipeline_id: 104,
+        pass_flags: 0,
+        vertex_count: 3,
+        dynamic_offset: 256,
+    });
+    // Draw 2: keeps pass open (pass_flags = 0), retains pipeline 104, dynamic offset 512
+    assert_eq!(summary.draw_passes[2], ParsedDrawPass {
+        opcode: 13,
+        pipeline_id: 104,
+        pass_flags: 0,
+        vertex_count: 3,
+        dynamic_offset: 512,
+    });
+    // Draw 3: keeps pass open (pass_flags = 0), switches pipeline to 105, dynamic offset 768
+    assert_eq!(summary.draw_passes[3], ParsedDrawPass {
+        opcode: 13,
+        pipeline_id: 105,
+        pass_flags: 0,
+        vertex_count: 3,
+        dynamic_offset: 768,
+    });
+}
+
