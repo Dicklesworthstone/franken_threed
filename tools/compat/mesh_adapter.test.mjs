@@ -522,9 +522,9 @@ test('Index bounds check: Explicitly rejects out-of-range indices (13062 point 4
 test('Material features: Rejects advanced and unexercised material features (13062 point 5)', () => {
   const camera = createBasicCamera();
 
-  // vertexColors
+  // vertexColors (admitted in this slice)
   const vcMesh = createBasicTriangleMesh({ vertexColors: true });
-  assert.equal(canAdmitMesh(vcMesh, camera).admitted, false);
+  assert.equal(canAdmitMesh(vcMesh, camera).admitted, true);
 
   // colorWrite = false (admitted in this slice)
   const cwMesh = createBasicTriangleMesh({ colorWrite: false });
@@ -4057,4 +4057,388 @@ test('Geometry residency: invalid updateRange refuses with INVALID_UPDATE_RANGE 
     assert.equal(position.updateRanges[0].start, inv.start);
     assert.equal(position.updateRanges[0].count, inv.count);
   }
+});
+
+test('vertexColors: canAdmitMesh admits vertexColors=true with missing color, Float32 RGB/RGBA, and Uint8 normalized RGB/RGBA', () => {
+  const camera = createBasicCamera();
+
+  // 1. Missing color attribute: admitted per r186 default behavior
+  const meshNoColor = createBasicTriangleMesh({ vertexColors: true });
+  assert.equal(canAdmitMesh(meshNoColor, camera).admitted, true);
+
+  // 2. Float32Array RGB (itemSize 3)
+  const geomF32Rgb = new THREE.BufferGeometry();
+  geomF32Rgb.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
+  geomF32Rgb.setAttribute('color', new THREE.BufferAttribute(new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]), 3));
+  const meshF32Rgb = new THREE.Mesh(geomF32Rgb, new THREE.MeshBasicMaterial({ vertexColors: true }));
+  assert.equal(canAdmitMesh(meshF32Rgb, camera).admitted, true);
+
+  // 3. Float32Array RGBA (itemSize 4)
+  const geomF32Rgba = new THREE.BufferGeometry();
+  geomF32Rgba.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
+  geomF32Rgba.setAttribute('color', new THREE.BufferAttribute(new Float32Array([1, 0, 0, 0.5, 0, 1, 0, 0.8, 0, 0, 1, 1]), 4));
+  const meshF32Rgba = new THREE.Mesh(geomF32Rgba, new THREE.MeshBasicMaterial({ vertexColors: true }));
+  assert.equal(canAdmitMesh(meshF32Rgba, camera).admitted, true);
+
+  // 4. Uint8Array normalized RGB (itemSize 3)
+  const geomU8Rgb = new THREE.BufferGeometry();
+  geomU8Rgb.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
+  geomU8Rgb.setAttribute('color', new THREE.BufferAttribute(new Uint8Array([255, 0, 0, 0, 255, 0, 0, 0, 255]), 3, true));
+  const meshU8Rgb = new THREE.Mesh(geomU8Rgb, new THREE.MeshBasicMaterial({ vertexColors: true }));
+  assert.equal(canAdmitMesh(meshU8Rgb, camera).admitted, true);
+});
+
+test('vertexColors: canAdmitMesh refuses interleaved, custom upload callback, unnormalized Uint8, and invalid itemSize', () => {
+  const camera = createBasicCamera();
+
+  // 1. Interleaved color attribute
+  const geomInter = new THREE.BufferGeometry();
+  geomInter.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
+  const interAttr = new THREE.BufferAttribute(new Float32Array(9), 3);
+  interAttr.isInterleavedBufferAttribute = true;
+  geomInter.setAttribute('color', interAttr);
+  const meshInter = new THREE.Mesh(geomInter, new THREE.MeshBasicMaterial({ vertexColors: true }));
+  const resInter = canAdmitMesh(meshInter, camera);
+  assert.equal(resInter.admitted, false);
+  assert.equal(resInter.code, 'UNSUPPORTED_ATTRIBUTE');
+
+  // 2. Custom onUploadCallback on color attribute
+  const geomCb = new THREE.BufferGeometry();
+  geomCb.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
+  const cbAttr = new THREE.BufferAttribute(new Float32Array(9), 3);
+  cbAttr.onUploadCallback = () => {};
+  geomCb.setAttribute('color', cbAttr);
+  const meshCb = new THREE.Mesh(geomCb, new THREE.MeshBasicMaterial({ vertexColors: true }));
+  const resCb = canAdmitMesh(meshCb, camera);
+  assert.equal(resCb.admitted, false);
+  assert.equal(resCb.code, 'UNSUPPORTED_UPLOAD_CALLBACK');
+
+  // 3. Unnormalized Uint8Array
+  const geomU8Unnorm = new THREE.BufferGeometry();
+  geomU8Unnorm.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
+  geomU8Unnorm.setAttribute('color', new THREE.BufferAttribute(new Uint8Array([255, 0, 0, 0, 255, 0, 0, 0, 255]), 3, false));
+  const meshU8Unnorm = new THREE.Mesh(geomU8Unnorm, new THREE.MeshBasicMaterial({ vertexColors: true }));
+  const resU8 = canAdmitMesh(meshU8Unnorm, camera);
+  assert.equal(resU8.admitted, false);
+  assert.equal(resU8.code, 'INVALID_COLOR_ATTRIBUTE');
+
+  // 4. Invalid itemSize (e.g. 2)
+  const geomSize2 = new THREE.BufferGeometry();
+  geomSize2.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
+  geomSize2.setAttribute('color', new THREE.BufferAttribute(new Float32Array(6), 2));
+  const meshSize2 = new THREE.Mesh(geomSize2, new THREE.MeshBasicMaterial({ vertexColors: true }));
+  const resSize2 = canAdmitMesh(meshSize2, camera);
+  assert.equal(resSize2.admitted, false);
+  assert.equal(resSize2.code, 'INVALID_COLOR_ATTRIBUTE');
+
+  // 5. Mismatched vertex count (fewer colors than positions)
+  const geomShort = new THREE.BufferGeometry();
+  geomShort.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
+  geomShort.setAttribute('color', new THREE.BufferAttribute(new Float32Array(6), 3));
+  const meshShort = new THREE.Mesh(geomShort, new THREE.MeshBasicMaterial({ vertexColors: true }));
+  const resShort = canAdmitMesh(meshShort, camera);
+  assert.equal(resShort.admitted, false);
+  assert.equal(resShort.code, 'INVALID_COLOR_ATTRIBUTE');
+});
+
+test('vertexColors: Wasm export missing strictly refuses with INCOMPATIBLE_VERTEX_COLORS', async () => {
+  const camera = createBasicCamera();
+  const mesh = createBasicTriangleMesh({ vertexColors: true });
+  // wasmModule has only cull_depth_color export, missing f3d_build_mesh_batch_vertex_color_packet
+  const mockWasm = {
+    f3d_build_mesh_batch_cull_depth_color_packet: () => new Uint8Array([0x01]),
+  };
+
+  assert.throws(
+    () => prepareMeshPacket(mesh, camera, 64, 64, mockWasm),
+    (err) => err.reason === 'INCOMPATIBLE_VERTEX_COLORS'
+  );
+
+  assert.throws(
+    () => prepareMeshBatchPacket([mesh], camera, 64, 64, mockWasm),
+    (err) => err.reason === 'INCOMPATIBLE_VERTEX_COLORS'
+  );
+
+  const mockHost = {
+    executePacket: async () => ({ status: 'OK' }),
+  };
+  await assert.rejects(
+    async () => renderMesh(mockHost, mesh, camera, null, mockWasm),
+    (err) => err.reason === 'INCOMPATIBLE_VERTEX_COLORS'
+  );
+});
+
+test('vertexColors: absent vertexColors flag preserves old exports and packet bytes', () => {
+  const camera = createBasicCamera();
+  const mesh = createBasicTriangleMesh(); // vertexColors absent/false
+  let calledExport = null;
+  const mockWasm = {
+    f3d_build_mesh_batch_cull_depth_color_packet: () => {
+      calledExport = 'cull_depth_color';
+      return new Uint8Array([0xaa, 0xbb]);
+    },
+    f3d_build_mesh_batch_vertex_color_packet: () => {
+      calledExport = 'vertex_color';
+      return new Uint8Array([0x11, 0x22]);
+    },
+  };
+
+  const res = prepareMeshBatchPacket([mesh], camera, 64, 64, mockWasm);
+  // Must call old export and return old bytes
+  assert.equal(calledExport, 'cull_depth_color');
+  assert.deepEqual(res.packetBytes, new Uint8Array([0xaa, 0xbb]));
+});
+
+test('vertexColors: non-indexed mesh extracts Float32 RGB, RGBA, and normalized Uint8 correctly', () => {
+  const camera = createBasicCamera();
+
+  // 1. Float32 RGB (itemSize 3) -> alpha defaults to 1.0
+  const geomRgb = new THREE.BufferGeometry();
+  geomRgb.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
+  geomRgb.setAttribute('color', new THREE.BufferAttribute(new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]), 3));
+  const meshRgb = new THREE.Mesh(geomRgb, new THREE.MeshBasicMaterial({ vertexColors: true }));
+  const snapRgb = extractMeshRenderData(meshRgb, camera, 64, 64);
+  assert.equal(snapRgb.vertexColors, true);
+  assert.equal(snapRgb.hasVertexColors, true);
+  assert.deepEqual(Array.from(snapRgb.expandedVertexColors), [
+    1, 0, 0, 1,
+    0, 1, 0, 1,
+    0, 0, 1, 1,
+  ]);
+
+  // 2. Float32 RGBA (itemSize 4) -> preserves observed alpha
+  const geomRgba = new THREE.BufferGeometry();
+  geomRgba.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
+  geomRgba.setAttribute('color', new THREE.BufferAttribute(new Float32Array([1, 0.5, 0.25, 0.75, 0, 1, 0, 0.5, 0.125, 0.25, 0.5, 0.875]), 4));
+  const meshRgba = new THREE.Mesh(geomRgba, new THREE.MeshBasicMaterial({ vertexColors: true }));
+  const snapRgba = extractMeshRenderData(meshRgba, camera, 64, 64);
+  assert.equal(snapRgba.hasVertexColors, true);
+  assert.deepEqual(Array.from(snapRgba.expandedVertexColors), [
+    1, 0.5, 0.25, 0.75,
+    0, 1, 0, 0.5,
+    0.125, 0.25, 0.5, 0.875,
+  ]);
+
+  // 3. Uint8 normalized RGB -> normalized via getX/getY/getZ
+  const geomU8 = new THREE.BufferGeometry();
+  geomU8.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
+  geomU8.setAttribute('color', new THREE.BufferAttribute(new Uint8Array([255, 0, 0, 0, 255, 0, 0, 0, 255]), 3, true));
+  const meshU8 = new THREE.Mesh(geomU8, new THREE.MeshBasicMaterial({ vertexColors: true }));
+  const snapU8 = extractMeshRenderData(meshU8, camera, 64, 64);
+  assert.equal(snapU8.hasVertexColors, true);
+  assert.deepEqual(Array.from(snapU8.expandedVertexColors), [
+    1, 0, 0, 1,
+    0, 1, 0, 1,
+    0, 0, 1, 1,
+  ]);
+});
+
+test('vertexColors: indexed mesh expands colors matching selected vertex indices and drawRange', () => {
+  const camera = createBasicCamera();
+  const geom = new THREE.BufferGeometry();
+  // 4 vertices: V0(red), V1(green), V2(blue), V3(yellow)
+  geom.setAttribute('position', new THREE.BufferAttribute(new Float32Array([
+    0, 0, 0,
+    1, 0, 0,
+    1, 1, 0,
+    0, 1, 0,
+  ]), 3));
+  geom.setAttribute('color', new THREE.BufferAttribute(new Float32Array([
+    1, 0, 0, // V0 Red
+    0, 1, 0, // V1 Green
+    0, 0, 1, // V2 Blue
+    1, 1, 0, // V3 Yellow
+  ]), 3));
+  // 2 triangles: T1: [0, 1, 2], T2: [0, 2, 3]
+  geom.setIndex(new THREE.BufferAttribute(new Uint32Array([0, 1, 2, 0, 2, 3]), 1));
+  const mesh = new THREE.Mesh(geom, new THREE.MeshBasicMaterial({ vertexColors: true }));
+
+  // Full indexed expansion
+  const snap = extractMeshRenderData(mesh, camera, 64, 64);
+  assert.deepEqual(Array.from(snap.expandedVertexColors), [
+    1, 0, 0, 1, // V0
+    0, 1, 0, 1, // V1
+    0, 0, 1, 1, // V2
+    1, 0, 0, 1, // V0
+    0, 0, 1, 1, // V2
+    1, 1, 0, 1, // V3
+  ]);
+
+  // With drawRange: start=3, count=3 (second triangle only [0, 2, 3])
+  geom.setDrawRange(3, 3);
+  const snapRange = extractMeshRenderData(mesh, camera, 64, 64);
+  assert.deepEqual(Array.from(snapRange.expandedVertexColors), [
+    1, 0, 0, 1, // V0
+    0, 0, 1, 1, // V2
+    1, 1, 0, 1, // V3
+  ]);
+});
+
+test('vertexColors: batch with mixed colored, uncolored, and missing-color meshes fills uncolored with white', () => {
+  const camera = createBasicCamera();
+
+  // Mesh 1: vertexColors=true with RGB
+  const geom1 = new THREE.BufferGeometry();
+  geom1.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
+  geom1.setAttribute('color', new THREE.BufferAttribute(new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]), 3));
+  const mesh1 = new THREE.Mesh(geom1, new THREE.MeshBasicMaterial({
+    color: 0xff0000,
+    vertexColors: true,
+  }));
+
+  // Mesh 2: vertexColors=false (uncolored)
+  const geom2 = new THREE.BufferGeometry();
+  geom2.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
+  const mesh2 = new THREE.Mesh(geom2, new THREE.MeshBasicMaterial({
+    color: 0x00ff00,
+    vertexColors: false,
+  }));
+
+  // Mesh 3: vertexColors=true, but NO color attribute (r186 default fallback to white)
+  const geom3 = new THREE.BufferGeometry();
+  geom3.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
+  const mesh3 = new THREE.Mesh(geom3, new THREE.MeshBasicMaterial({
+    color: 0x0000ff,
+    vertexColors: true,
+  }));
+
+  let capturedArgs = null;
+  const mockWasm = {
+    f3d_build_mesh_batch_vertex_color_packet: (
+      flatPos, vCounts, mvs, proj, cols, cModes, fFaces, dTests, dWrites, dCompares, cWrites, w, h, sWebglDepth, isCanvas, flatColors
+    ) => {
+      capturedArgs = { flatPos, vCounts, cols, flatColors };
+      return new Uint8Array([0x56, 0x43]);
+    },
+  };
+
+  const res = prepareMeshBatchPacket([mesh1, mesh2, mesh3], camera, 64, 64, mockWasm);
+  assert.equal(res.snapshots.length, 3);
+  assert.equal(capturedArgs.flatColors.length, 36); // 9 vertices total * 4 RGBA = 36 floats
+
+  // Mesh 1 (first 12 floats): vertex colors
+  assert.deepEqual(Array.from(capturedArgs.flatColors.slice(0, 12)), [
+    1, 0, 0, 1,
+    0, 1, 0, 1,
+    0, 0, 1, 1,
+  ]);
+  // Mesh 2 (next 12 floats): all white [1, 1, 1, 1]
+  assert.deepEqual(Array.from(capturedArgs.flatColors.slice(12, 24)), [
+    1, 1, 1, 1,
+    1, 1, 1, 1,
+    1, 1, 1, 1,
+  ]);
+  // Mesh 3 (last 12 floats): all white [1, 1, 1, 1]
+  assert.deepEqual(Array.from(capturedArgs.flatColors.slice(24, 36)), [
+    1, 1, 1, 1,
+    1, 1, 1, 1,
+    1, 1, 1, 1,
+  ]);
+  // Material colors: 3 meshes * 4 RGBA floats
+  assert.equal(capturedArgs.cols.length, 12);
+  assert.equal(capturedArgs.cols[0], 1); // mesh 1 red
+  assert.equal(capturedArgs.cols[5], 1); // mesh 2 green
+  assert.equal(capturedArgs.cols[10], 1); // mesh 3 blue
+});
+
+test('vertexColors: renderScene admits mixed vertexColors meshes with export and refuses when missing', async () => {
+  const scene = new THREE.Scene();
+  const camera = createBasicCamera();
+
+  const geom1 = new THREE.BufferGeometry();
+  geom1.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
+  geom1.setAttribute('color', new THREE.BufferAttribute(new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]), 3));
+  const mesh1 = new THREE.Mesh(geom1, new THREE.MeshBasicMaterial({ vertexColors: true }));
+
+  const geom2 = new THREE.BufferGeometry();
+  geom2.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
+  const mesh2 = new THREE.Mesh(geom2, new THREE.MeshBasicMaterial({ vertexColors: false }));
+
+  scene.add(mesh1);
+  scene.add(mesh2);
+
+  const mockHost = {
+    executePacket: async () => ({ status: 'OK' }),
+  };
+
+  // 1. When export is missing: refuses whole submission
+  const mockWasmMissing = {
+    f3d_build_mesh_batch_cull_depth_color_packet: () => new Uint8Array([0x01]),
+  };
+  const resMissing = await renderScene(mockHost, scene, camera, null, mockWasmMissing);
+  assert.equal(resMissing.admitted.length, 0);
+  assert.equal(resMissing.refused.length, 1);
+  assert.equal(resMissing.refused[0].code, 'INCOMPATIBLE_VERTEX_COLORS');
+
+  // 2. When export is present: admits both meshes
+  const mockWasmPresent = {
+    f3d_build_mesh_batch_vertex_color_packet: () => new Uint8Array([0x01]),
+  };
+  const resPresent = await renderScene(mockHost, scene, camera, null, mockWasmPresent);
+  assert.equal(resPresent.admitted.length, 2);
+  assert.equal(resPresent.refused.length, 0);
+});
+
+test('vertexColors: color attribute residency keeps GPU-stale shadow without needsUpdate and updates on bump', async () => {
+  const camera = createBasicCamera();
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute('position', new THREE.BufferAttribute(new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]), 3));
+  const colorArray = new Float32Array([
+    1, 0, 0,
+    0, 1, 0,
+    0, 0, 1,
+  ]);
+  const colorAttr = new THREE.BufferAttribute(colorArray, 3);
+  geom.setAttribute('color', colorAttr);
+  const mesh = new THREE.Mesh(geom, new THREE.MeshBasicMaterial({ vertexColors: true }));
+
+  let capturedColors = null;
+  const mockWasm = {
+    f3d_build_mesh_batch_vertex_color_packet: (
+      flatPos, vCounts, mvs, proj, cols, cModes, fFaces, dTests, dWrites, dCompares, cWrites, w, h, sWebglDepth, isCanvas, flatColors
+    ) => {
+      capturedColors = Array.from(flatColors);
+      return new Uint8Array([0x01]);
+    },
+  };
+
+  let submitCount = 0;
+  const mockHost = {
+    deviceGeneration: 0,
+    device: {},
+    executePacket: async (bytes, ctx, onSubmitted) => {
+      submitCount++;
+      if (typeof onSubmitted === 'function') onSubmitted();
+      return { status: 'OK' };
+    },
+  };
+
+  // Frame 1: initial upload
+  await renderMesh(mockHost, mesh, camera, null, mockWasm);
+  assert.equal(capturedColors[0], 1); // red
+
+  // In-place mutation without needsUpdate
+  colorArray[0] = 0.25;
+  // Frame 2: sees GPU-stale cached shadow (still 1.0)
+  await renderMesh(mockHost, mesh, camera, null, mockWasm);
+  assert.equal(capturedColors[0], 1);
+
+  // Partial updateRange with needsUpdate = true
+  colorAttr.addUpdateRange(0, 1); // only patch index 0
+  colorAttr.needsUpdate = true;
+  // Frame 3: patches index 0 and clears updateRanges
+  await renderMesh(mockHost, mesh, camera, null, mockWasm);
+  assert.equal(capturedColors[0], 0.25);
+  assert.equal(colorAttr.updateRanges.length, 0);
+
+  // Pure prepareMeshPacket takes fresh CPU snapshot without caching
+  colorArray[0] = 0.75;
+  const prep = prepareMeshPacket(mesh, camera, 64, 64, mockWasm);
+  assert.equal(prep.snapshot.expandedVertexColors[0], 0.75);
+
+  // Disposal evicts color residency
+  colorArray[0] = 0.5;
+  geom.dispose();
+  await renderMesh(mockHost, mesh, camera, null, mockWasm);
+  assert.equal(capturedColors[0], 0.5);
 });
