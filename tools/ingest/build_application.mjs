@@ -414,8 +414,7 @@ export function rewriteLinkTagAttributes(attrString, chunkFileName, chunkCode = 
 /**
  * Rewrites raw HTML content, replacing active <script type="module"> tags in document
  * order with references to emitted entry chunks while strictly preserving all comments,
- * DOM elements, styles, non-module scripts, and attribute formatting, while removing
- * consumed build-time import maps.
+ * DOM elements, styles, non-module scripts, attribute formatting, and import maps.
  *
  * - Uses quote-aware tag regex so attributes containing ">" (e.g. data-selector="div > span")
  *   are never truncated.
@@ -471,12 +470,7 @@ export function rewriteHtmlForBuild(rawHtmlContent, entryFiles, chunkFilesMap = 
           return `<script${updatedAttrString}></script>`;
         }
 
-        // Import maps are consumed during bundling and removed from the portable bundle HTML
-        if (scriptType === 'importmap') {
-          return '';
-        }
-
-        // Non-module / classic scripts are preserved verbatim
+        // Non-module scripts (including type="importmap") are preserved verbatim
         return match;
       }
 

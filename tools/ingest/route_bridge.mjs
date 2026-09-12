@@ -8,18 +8,66 @@
  * consumed by decideRendererRoute and RendererConstructionRouter.
  */
 
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+const DEFAULT_PINNED_ROOT = new URL("../../upstream/three.js/", import.meta.url).href;
+
+const ADMITTED_BUILD_FILES = new Set([
+  "build/three.cjs",
+  "build/three.core.js",
+  "build/three.module.js",
+  "build/three.tsl.js",
+  "build/three.webgpu.js",
+  "build/three.webgpu.nodes.js",
+]);
+
+/**
+ * Canonicalize a path or URL string using `new URL`, stripping search and hash.
+ * Resolves path traversals (such as `..`) in the URL pathname.
+ * @param {string | null | undefined} input
+ * @param {boolean} [isDirectory=false]
+ * @returns {string | null} Canonical URL string without search/hash
+ */
+function canonicalizeUrl(input, isDirectory = false) {
+  if (!input || typeof input !== "string") return null;
+  let u;
+  try {
+    u = new URL(input);
+  } catch {
+    u = pathToFileURL(path.resolve(input));
+  }
+  u.search = "";
+  u.hash = "";
+  let href = u.href;
+  if (isDirectory && !href.endsWith("/")) {
+    href += "/";
+  }
+  return href;
+}
+
 /**
  * Check if a module URL belongs to upstream Three.js internal build artifacts.
  * Library-internal WebGL implementation calls do not count as application-level escapes (Plan §3.3).
- * @param {string} moduleId
+ *
+ * Uses exact canonical identity under the admitted pinned upstream package root.
+ * Application files (e.g. /app/build/three.custom.js or root/src/../../app.js) are never trusted.
+ *
+ * @param {string} moduleId - Module identifier or file URL
+ * @param {string} [packageRootUrl] - Explicit package root URL/path for callers or test fixtures
  * @returns {boolean}
  */
-export function isInternalLibraryModule(moduleId) {
+export function isInternalLibraryModule(moduleId, packageRootUrl = null) {
   if (!moduleId || typeof moduleId !== "string") return false;
-  return moduleId.includes("/build/three.") ||
-         moduleId.includes("/build/three.webgpu.") ||
-         moduleId.includes("/build/three.core.") ||
-         moduleId.includes("/build/three.module.");
+
+  const root = packageRootUrl ? canonicalizeUrl(packageRootUrl, true) : DEFAULT_PINNED_ROOT;
+  const mod = canonicalizeUrl(moduleId, false);
+  if (!mod || !mod.startsWith(root)) {
+    return false;
+  }
+
+  const rel = mod.slice(root.length);
+  return ADMITTED_BUILD_FILES.has(rel);
 }
 
 /**
@@ -28,6 +76,7 @@ export function isInternalLibraryModule(moduleId) {
  * @param {Object} bundle - Module graph bundle from buildModuleGraph
  * @param {Object} [options]
  * @param {boolean} [options.includeLibraryInternalEscapes=false] - Whether to include escapes inside Three.js build files
+ * @param {string} [options.packageRootUrl] - Explicit package root URL or path
  * @returns {{
  *   hasOpaqueGLEscapes: boolean,
  *   hasNativeContextAccess: boolean,
@@ -47,6 +96,7 @@ export function extractGraphRoutingFacts(bundle, options = {}) {
   }
 
   const includeInternal = options.includeLibraryInternalEscapes ?? false;
+  const packageRootUrl = options.packageRootUrl || options.package_root_url || bundle.package_root_url || bundle.packageRootUrl || null;
   let hasOpaqueGLEscapes = false;
   let hasNativeContextAccess = false;
   let hasUnresolvedContextAccess = false;
@@ -57,7 +107,7 @@ export function extractGraphRoutingFacts(bundle, options = {}) {
 
   // Pass 1: Aggregate application-wide escapes across reachable modules
   for (const mod of modules) {
-    if (!includeInternal && isInternalLibraryModule(mod.id)) {
+    if (!includeInternal && isInternalLibraryModule(mod.id, packageRootUrl)) {
       continue;
     }
 

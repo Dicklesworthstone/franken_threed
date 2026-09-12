@@ -1788,38 +1788,23 @@ test('buildApplication creates portable bundle for H1 (webgpu_performance_render
   assert.ok(fs.existsSync(htmlPath), `Emitted HTML file must exist on disk: ${htmlPath}`);
   const rewrittenHtml = fs.readFileSync(htmlPath, 'utf-8');
 
-  // 1. Assert rewritten HTML has no remaining bare 'three' / 'three/addons' specifiers
+  // 1. Assert module script tag is rewritten to emitted entry chunk and has no inline module imports
   assert.ok(
-    !rewrittenHtml.includes("'three'"),
-    "rewritten HTML must not contain bare 'three' specifier"
+    rewrittenHtml.includes(`src="./${res.entryFiles[0]}"`),
+    'Rewritten HTML must reference the emitted entry chunk'
   );
   assert.ok(
-    !rewrittenHtml.includes("'three/"),
-    "rewritten HTML must not contain bare 'three/' specifier"
+    !rewrittenHtml.includes("import * as THREE from 'three/webgpu'"),
+    'Original inline module imports must be removed from rewritten script tag'
+  );
+  // Import map is preserved verbatim
+  assert.ok(
+    rewrittenHtml.includes('<script type="importmap">'),
+    'Import map must be preserved verbatim in rewritten HTML'
   );
   assert.ok(
-    !rewrittenHtml.includes("'three/addons"),
-    "rewritten HTML must not contain bare 'three/addons' specifier"
-  );
-  assert.ok(
-    !rewrittenHtml.includes('"three"'),
-    'rewritten HTML must not contain bare "three" specifier'
-  );
-  assert.ok(
-    !rewrittenHtml.includes('"three/'),
-    'rewritten HTML must not contain bare "three/" specifier'
-  );
-  assert.ok(
-    !rewrittenHtml.includes('"three/addons'),
-    'rewritten HTML must not contain bare "three/addons" specifier'
-  );
-  assert.ok(
-    !rewrittenHtml.includes('three/addons'),
-    'rewritten HTML must not contain three/addons'
-  );
-  assert.ok(
-    !/<script\b[^>]*type=["']importmap["']/i.test(rewrittenHtml),
-    'Consumed build-time import map must be removed from portable bundle HTML'
+    rewrittenHtml.includes('"three": "../build/three.webgpu.js"'),
+    'Import map entries must be preserved verbatim in rewritten HTML'
   );
 
   // 2. Assert every emitted chunk and referenced asset exists on disk
@@ -1882,4 +1867,55 @@ test('buildApplication creates portable bundle for H1 (webgpu_performance_render
       }
     }
   }
+});
+
+test('buildApplication preserves importmap verbatim alongside classic scripts with dynamic import', async () => {
+  const scratch = makeScratch('f3d_app_importmap_classic');
+  const outDir = path.join(scratch, 'dist');
+
+  const html = `<!DOCTYPE html>
+<html>
+<head>
+  <script type="importmap">
+    { "imports": { "dynamic-dep": "./dep.js" } }
+  </script>
+  <script>
+    // Classic script using dynamic import against preserved importmap
+    window.loadDep = () => import('dynamic-dep');
+  </script>
+  <script type="module" src="./main.js"></script>
+</head>
+<body></body>
+</html>`;
+
+  fs.writeFileSync(path.join(scratch, 'index.html'), html);
+  fs.writeFileSync(path.join(scratch, 'main.js'), 'export const mainOk = true;\n');
+  fs.writeFileSync(path.join(scratch, 'dep.js'), 'export const depOk = true;\n');
+
+  const res = await buildApplication(path.join(scratch, 'index.html'), outDir);
+  assert.equal(res.isHtml, true);
+
+  const rewrittenHtml = fs.readFileSync(path.join(outDir, res.htmlFile), 'utf-8');
+
+  // 1. Import map must be preserved verbatim
+  assert.ok(
+    rewrittenHtml.includes('<script type="importmap">'),
+    'Import map must be preserved verbatim in emitted HTML'
+  );
+  assert.ok(
+    rewrittenHtml.includes('"dynamic-dep": "./dep.js"'),
+    'Import map contents must be preserved verbatim'
+  );
+
+  // 2. Classic script using dynamic import must be preserved verbatim
+  assert.ok(
+    rewrittenHtml.includes("window.loadDep = () => import('dynamic-dep');"),
+    'Classic script containing dynamic import must be preserved verbatim'
+  );
+
+  // 3. Module script is rewritten to emitted chunk
+  assert.ok(
+    rewrittenHtml.includes(`src="./${res.entryFiles[0]}"`),
+    'Module script must reference the emitted chunk'
+  );
 });
