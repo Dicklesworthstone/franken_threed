@@ -33,7 +33,8 @@ import {
   stripCssComments,
   findChunkForPreload,
   toCanonicalPreloadUrl,
-  extractJsModuleDependencies
+  extractJsModuleDependencies,
+  isClassicJavaScriptType
 } from './build_application.mjs';
 import { parseHtmlEntries, parseTagAttributes, stripScriptAndStyleBodies, stripHtmlComments } from './html_parser.mjs';
 
@@ -1887,14 +1888,90 @@ test('extractJsModuleDependencies discovers static/dynamic imports and asset ref
   assert.ok(deps.assetSpecifiers.includes('./textures/wood.png'), 'Discovers asset reference');
 });
 
-test('extractJsModuleDependencies falls back gracefully on legacy classic scripts', () => {
-  const legacyCode = `
-    with (window) {
-      loadLegacy = function() { return import('./legacy_dep.js'); };
+test('extractJsModuleDependencies handles with-statement and escaped specifiers without phantom imports', () => {
+  // Root concrete test case: with(window) + fake import inside string + escaped unicode \u002e
+  const code = String.raw`with(window) { const text = "import('./phantom.js')"; load = () => import('./real\u002ejs'); }`;
+  const deps = extractJsModuleDependencies(code, 'file:///app/with_escaped.js');
+  assert.deepEqual(deps.moduleSpecifiers, ['./real.js'], 'Must decode \\u002e escape and ignore fake import inside string literal');
+  assert.equal(deps.moduleSpecifiers.includes('./phantom.js'), false, 'Must never extract phantom import from string literal');
+});
+
+test('extractJsModuleDependencies ignores dynamic imports inside single-line and block comments', () => {
+  const code = `
+    // import('./line_comment.js');
+    /* import('./block_comment.js'); */
+    /*
+     * import('./multiline_comment.js');
+     */
+    window.load = () => import('./real_comment.js');
+  `;
+  const deps = extractJsModuleDependencies(code, 'file:///app/comments.js');
+  assert.deepEqual(deps.moduleSpecifiers, ['./real_comment.js'], 'Must only discover actual import and ignore comments');
+});
+
+test('extractJsModuleDependencies ignores dynamic import syntax inside strings and templates', () => {
+  const code = `
+    const s1 = "import('./not_real_1.js')";
+    const s2 = 'import("./not_real_2.js")';
+    const s3 = \`import('./not_real_3.js')\`;
+    window.load = () => import('./real_string.js');
+  `;
+  const deps = extractJsModuleDependencies(code, 'file:///app/strings.js');
+  assert.deepEqual(deps.moduleSpecifiers, ['./real_string.js'], 'Must ignore import syntax inside string and template literals');
+});
+
+test('extractJsModuleDependencies decodes escaped unicode specifiers via AST', () => {
+  const code = `
+    load = () => import('./sub\\u002fescaped\\u002ejs');
+  `;
+  const deps = extractJsModuleDependencies(code, 'file:///app/escaped.js');
+  assert.deepEqual(deps.moduleSpecifiers, ['./sub/escaped.js'], 'Must decode unicode escape sequence in specifier string');
+});
+
+test('extractJsModuleDependencies parses classic scripts containing with-statements via script AST', () => {
+  const code = `
+    with (document) {
+      with (body) {
+        load = function() { return import('./with_nested.js'); };
+      }
     }
   `;
-  const deps = extractJsModuleDependencies(legacyCode, 'file:///app/legacy.js');
-  assert.ok(deps.moduleSpecifiers.includes('./legacy_dep.js'), 'Discovers dynamic import in legacy script');
+  const deps = extractJsModuleDependencies(code, 'file:///app/with.js');
+  assert.deepEqual(deps.moduleSpecifiers, ['./with_nested.js'], 'Must parse with-statement with sourceType script');
+});
+
+test('isClassicJavaScriptType identifies JavaScript MIME types and rejects data blocks', () => {
+  // Classic JavaScript
+  assert.equal(isClassicJavaScriptType(undefined), true);
+  assert.equal(isClassicJavaScriptType(''), true);
+  assert.equal(isClassicJavaScriptType('text/javascript'), true);
+  assert.equal(isClassicJavaScriptType('application/javascript'), true);
+  assert.equal(isClassicJavaScriptType('text/javascript; charset=utf-8'), true);
+  assert.equal(isClassicJavaScriptType('text/ecmascript'), true);
+
+  // Modules and Import Maps (handled separately)
+  assert.equal(isClassicJavaScriptType('module'), false);
+  assert.equal(isClassicJavaScriptType('importmap'), false);
+
+  // Data blocks (must be preserved untouched and not scanned as JS)
+  assert.equal(isClassicJavaScriptType('application/json'), false);
+  assert.equal(isClassicJavaScriptType('application/ld+json'), false);
+  assert.equal(isClassicJavaScriptType('x-shader/x-vertex'), false);
+  assert.equal(isClassicJavaScriptType('x-shader/x-fragment'), false);
+  assert.equal(isClassicJavaScriptType('text/template'), false);
+  assert.equal(isClassicJavaScriptType('text/html'), false);
+});
+
+test('extractJsModuleDependencies propagates actual parse error if neither module nor script parses', () => {
+  assert.throws(
+    () => {
+      extractJsModuleDependencies('const = invalid syntax {{;');
+    },
+    (err) => {
+      return err instanceof Error && (err.name === 'IngestionParseError' || err.name === 'SyntaxError');
+    },
+    'Must propagate actual parse error when code is unparseable'
+  );
 });
 
 test('buildApplication preserves importmap verbatim alongside classic scripts with dynamic import', async () => {
@@ -1906,6 +1983,12 @@ test('buildApplication preserves importmap verbatim alongside classic scripts wi
 <head>
   <script type="importmap">
     { "imports": { "dynamic-dep": "./dep.js" } }
+  </script>
+  <script id="data-block" type="application/json">
+    { "config": "import('./phantom_data.js')" }
+  </script>
+  <script id="shader-block" type="x-shader/x-vertex">
+    void main() { /* import('./phantom_shader.js') */ }
   </script>
   <script>
     // Inline classic script using dynamic import against preserved importmap
@@ -1945,37 +2028,57 @@ test('buildApplication preserves importmap verbatim alongside classic scripts wi
     'Import map contents must be preserved verbatim'
   );
 
-  // 2. Inline classic script using dynamic import must be preserved verbatim
+  // 2. Data blocks (JSON, shaders) must be preserved verbatim and not trigger phantom extractions
+  assert.ok(
+    rewrittenHtml.includes('<script id="data-block" type="application/json">'),
+    'JSON data block must be preserved verbatim'
+  );
+  assert.ok(
+    rewrittenHtml.includes('<script id="shader-block" type="x-shader/x-vertex">'),
+    'Shader data block must be preserved verbatim'
+  );
+  assert.equal(
+    res.emittedFiles.includes('phantom_data.js'),
+    false,
+    'Data block pseudo-import must never be emitted as dependency'
+  );
+  assert.equal(
+    res.emittedFiles.includes('phantom_shader.js'),
+    false,
+    'Shader block pseudo-import must never be emitted as dependency'
+  );
+
+  // 3. Inline classic script using dynamic import must be preserved verbatim
   assert.ok(
     rewrittenHtml.includes("window.loadDep = () => import('dynamic-dep');"),
     'Inline classic script containing dynamic import must be preserved verbatim'
   );
 
-  // 3. External classic script must be preserved verbatim
+  // 4. External classic script must be preserved verbatim
   assert.ok(
     rewrittenHtml.includes('src="./external_classic.js"'),
     'External classic script must be preserved verbatim'
   );
 
-  // 4. Module script is rewritten to emitted chunk
+  // 5. Module script is rewritten to emitted chunk
   assert.ok(
     rewrittenHtml.includes(`src="./${res.entryFiles[0]}"`),
     'Module script must reference the emitted chunk'
   );
 
-  // 5. Emitted files list must contain dynamic import target, nested dependency, and external classic files
+  // 6. Emitted files list must contain dynamic import target, nested dependency, and external classic files
   assert.ok(res.emittedFiles.includes('dep.js'), 'dep.js must be in emittedFiles');
   assert.ok(res.emittedFiles.includes('nested.js'), 'nested.js must be in emittedFiles');
   assert.ok(res.emittedFiles.includes('external_classic.js'), 'external_classic.js must be in emittedFiles');
   assert.ok(res.emittedFiles.includes('ext_dep.js'), 'ext_dep.js must be in emittedFiles');
 
-  // 6. All closed files must exist on disk in outDir
+  // 7. All closed files must exist on disk in outDir
   assert.ok(fs.existsSync(path.join(outDir, 'dep.js')), 'dep.js must exist on disk in outDir');
   assert.ok(fs.existsSync(path.join(outDir, 'nested.js')), 'nested.js must exist on disk in outDir');
   assert.ok(fs.existsSync(path.join(outDir, 'external_classic.js')), 'external_classic.js must exist on disk in outDir');
   assert.ok(fs.existsSync(path.join(outDir, 'ext_dep.js')), 'ext_dep.js must exist on disk in outDir');
 
-  // 7. Dynamic imports must execute real exported values from outDir without source tree
+  // 8. Dynamic imports must execute real exported values from outDir without source tree
   const depModule = await import(pathToFileURL(path.join(outDir, 'dep.js')).href);
   assert.equal(depModule.depOk, true, 'dep.js and its nested dependency must execute successfully from outDir');
 

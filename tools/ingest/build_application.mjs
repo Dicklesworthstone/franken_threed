@@ -35,6 +35,8 @@ import { bundleWithRollup } from './bundler.mjs';
 import { parseTagAttributes, parseSrcsetUrls, stripHtmlComments, stripScriptAndStyleBodies, parseHtmlEntries } from './html_parser.mjs';
 import { resolveModuleSpecifier, urlToFilePath } from './resolver.mjs';
 import { analyzeModuleAst } from './ast_analyzer.mjs';
+import * as acorn from 'acorn';
+import * as walk from 'acorn-walk';
 
 /**
  * Recomputes Subresource Integrity (SRI) string for modified or bundled content,
@@ -303,12 +305,73 @@ export function extractRelativeCssUrls(cssContent) {
   return Array.from(urls);
 }
 
+const CLASSIC_JS_MIME_TYPES = new Set([
+  'text/javascript',
+  'application/javascript',
+  'text/ecmascript',
+  'application/ecmascript',
+  'text/jscript',
+  'text/livescript',
+  'application/x-javascript',
+  'application/x-ecmascript',
+  'text/javascript1.0',
+  'text/javascript1.1',
+  'text/javascript1.2',
+  'text/javascript1.3',
+  'text/javascript1.4',
+  'text/javascript1.5',
+]);
+
+/**
+ * Checks whether a <script> element's type attribute represents classic JavaScript.
+ * Returns true if type is omitted, empty, or a standard JavaScript MIME type.
+ * Returns false for 'module', 'importmap', or data blocks ('application/json', shaders, templates, etc.).
+ *
+ * @param {string | null | undefined} typeAttr
+ * @returns {boolean}
+ */
+export function isClassicJavaScriptType(typeAttr) {
+  if (!typeAttr || typeof typeAttr !== 'string') {
+    return true;
+  }
+  const trimmed = typeAttr.trim().toLowerCase();
+  if (!trimmed) {
+    return true;
+  }
+  const mime = trimmed.split(';')[0].trim();
+  return CLASSIC_JS_MIME_TYPES.has(mime);
+}
+
+/**
+ * Recursively extracts static string literals from conditional expression branches.
+ * @param {any} node
+ * @returns {string[] | null}
+ */
+function extractConditionalStringLiterals(node) {
+  if (!node) return null;
+  if (node.type === 'ConditionalExpression') {
+    const consequent = extractConditionalStringLiterals(node.consequent);
+    const alternate = extractConditionalStringLiterals(node.alternate);
+    if (!consequent || !alternate) return null;
+    return [...consequent, ...alternate];
+  }
+  if (node.type === 'Literal' && typeof node.value === 'string') {
+    return [node.value];
+  }
+  if (node.type === 'TemplateLiteral' && node.expressions.length === 0 && node.quasis.length > 0) {
+    return [node.quasis.map(q => q.value.cooked ?? q.value.raw).join('')];
+  }
+  return null;
+}
+
 /**
  * Scans JavaScript code (module or classic script) to discover static and dynamic
  * module specifiers as well as static asset references (new URL(..., import.meta.url)).
  *
- * Uses AST analysis via analyzeModuleAst, falling back to regex extraction for
- * classic scripts containing legacy/non-module syntax.
+ * Uses AST analysis via analyzeModuleAst for ESM, falling back to Acorn AST parsing
+ * with sourceType: 'script' and acorn-walk ImportExpression visitor for classic scripts.
+ * Never uses regex on JavaScript code.
+ * Propagates the actual parse error if neither module nor script parses.
  *
  * @param {string} code - Script or module source code
  * @param {string} [contextUrl='script.js'] - File URL or identifier for error reporting
@@ -322,6 +385,7 @@ export function extractJsModuleDependencies(code, contextUrl = 'script.js') {
   const moduleSpecifiers = new Set();
   const assetSpecifiers = new Set();
 
+  let moduleError = null;
   try {
     const analysis = analyzeModuleAst(code, contextUrl);
     if (analysis) {
@@ -351,21 +415,51 @@ export function extractJsModuleDependencies(code, contextUrl = 'script.js') {
           if (assetRef.specifier) assetSpecifiers.add(assetRef.specifier);
         }
       }
+      return {
+        moduleSpecifiers: Array.from(moduleSpecifiers),
+        assetSpecifiers: Array.from(assetSpecifiers)
+      };
     }
-  } catch {
-    // Fallback for classic scripts with legacy or non-module syntax (e.g. with statement)
-    const dynRegex = /\bimport\s*\(\s*(?:'([^'\\]*(?:\\.[^'\\]*)*)'|"([^"\\]*(?:\\.[^"\\]*)*)"|`([^`\\]*(?:\\.[^`\\]*)*)`)\s*\)/g;
-    let m;
-    while ((m = dynRegex.exec(code)) !== null) {
-      const spec = m[1] !== undefined ? m[1] : (m[2] !== undefined ? m[2] : m[3]);
-      if (spec) moduleSpecifiers.add(spec);
-    }
-    const staticRegex = /\b(?:import|export)\b[\s\S]*?\bfrom\s*(?:'([^'\\]*(?:\\.[^'\\]*)*)'|"([^"\\]*(?:\\.[^"\\]*)*)")/g;
-    while ((m = staticRegex.exec(code)) !== null) {
-      const spec = m[1] !== undefined ? m[1] : m[2];
-      if (spec) moduleSpecifiers.add(spec);
-    }
+  } catch (err) {
+    moduleError = err;
   }
+
+  // Fallback: parse as classic script (sourceType: 'script') via Acorn AST
+  // Never regex JS.
+  let scriptAst;
+  try {
+    scriptAst = acorn.parse(code, {
+      ecmaVersion: 'latest',
+      sourceType: 'script',
+      locations: true,
+      ranges: true
+    });
+  } catch (scriptErr) {
+    throw moduleError || scriptErr;
+  }
+
+  walk.simple(scriptAst, {
+    ImportExpression(node) {
+      if (!node.source) return;
+      if (node.source.type === 'Literal' && typeof node.source.value === 'string') {
+        moduleSpecifiers.add(node.source.value);
+      } else if (
+        node.source.type === 'TemplateLiteral' &&
+        node.source.expressions.length === 0 &&
+        node.source.quasis.length > 0
+      ) {
+        const spec = node.source.quasis.map(q => q.value.cooked ?? q.value.raw).join('');
+        if (spec) moduleSpecifiers.add(spec);
+      } else if (node.source.type === 'ConditionalExpression') {
+        const branches = extractConditionalStringLiterals(node.source);
+        if (branches && Array.isArray(branches)) {
+          for (const b of branches) {
+            if (b) moduleSpecifiers.add(b);
+          }
+        }
+      }
+    }
+  });
 
   return {
     moduleSpecifiers: Array.from(moduleSpecifiers),
@@ -728,8 +822,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
     let inlineMatch;
     while ((inlineMatch = inlineScriptRegex.exec(sanitizedHtml)) !== null) {
       const attrs = parseTagAttributes(inlineMatch[1]);
-      const scriptType = (attrs.type || 'text/javascript').toLowerCase();
-      if (scriptType === 'module' || scriptType === 'importmap' || attrs.src) {
+      if (attrs.src || !isClassicJavaScriptType(attrs.type)) {
         continue;
       }
       const scriptBody = inlineMatch[2];
