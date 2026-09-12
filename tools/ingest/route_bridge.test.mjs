@@ -388,6 +388,13 @@ test("Positive & Unit: isInternalLibraryModule canonical identity checks, lookal
   assert.equal(isInternalLibraryModule("file:///three/build/three.custom.js", "file:///three"), false);
   assert.equal(isInternalLibraryModule("file:///other/build/three.webgpu.js", "file:///three"), false);
 
+  // Browser-hosted package URLs use the same identity check without Node APIs.
+  assert.equal(isInternalLibraryModule("https://example.test/three/build/../build/three.webgpu.js?v=1", "https://example.test/three/"), true);
+  assert.equal(isInternalLibraryModule("https://example.test/app/build/three.webgpu.js", "https://example.test/three/"), false);
+  assert.equal(isInternalLibraryModule("/three%20copy/build/three.module.js", "file:///three%2520copy/"), true);
+  assert.equal(isInternalLibraryModule("build/three.module.js", "file:///three/"), false);
+  assert.equal(isInternalLibraryModule("file:///three/build/three.module.js", "relative/root"), false);
+
   // 9. Invalid inputs
   assert.equal(isInternalLibraryModule(null), false);
   assert.equal(isInternalLibraryModule(""), false);
@@ -563,4 +570,3 @@ test("f3d-04.4 regression: analyzeModuleAst -> extractGraphRoutingFacts -> evalu
   assert.equal(decisionsTraversal[0].decision.route, ExecutionRoute.EXACT_BACKEND, "Traversal lookalike forces EXACT_BACKEND");
   assert.ok(decisionsTraversal[0].decision.reasons.includes(EscapeReason.OPAQUE_GL_ESCAPE));
 });
-

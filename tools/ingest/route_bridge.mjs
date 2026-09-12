@@ -8,9 +8,6 @@
  * consumed by decideRendererRoute and RendererConstructionRouter.
  */
 
-import path from "node:path";
-import { pathToFileURL } from "node:url";
-
 const DEFAULT_PINNED_ROOT = new URL("../../upstream/three.js/", import.meta.url).href;
 
 const ADMITTED_BUILD_FILES = new Set([
@@ -23,7 +20,7 @@ const ADMITTED_BUILD_FILES = new Set([
 ]);
 
 /**
- * Canonicalize a path or URL string using `new URL`, stripping search and hash.
+ * Canonicalize an absolute path or URL using browser-compatible URL operations.
  * Resolves path traversals (such as `..`) in the URL pathname.
  * @param {string | null | undefined} input
  * @param {boolean} [isDirectory=false]
@@ -35,7 +32,12 @@ function canonicalizeUrl(input, isDirectory = false) {
   try {
     u = new URL(input);
   } catch {
-    u = pathToFileURL(path.resolve(input));
+    // Graph IDs are URLs or absolute filesystem paths. Do not guess a working
+    // directory for relative IDs. Setting pathname escapes literal ? and #;
+    // escape % first so a filename containing percent escapes stays literal.
+    if (!input.startsWith("/")) return null;
+    u = new URL("file:///");
+    u.pathname = input.replaceAll("%", "%25");
   }
   u.search = "";
   u.hash = "";
@@ -62,7 +64,7 @@ export function isInternalLibraryModule(moduleId, packageRootUrl = null) {
 
   const root = packageRootUrl ? canonicalizeUrl(packageRootUrl, true) : DEFAULT_PINNED_ROOT;
   const mod = canonicalizeUrl(moduleId, false);
-  if (!mod || !mod.startsWith(root)) {
+  if (!root || !mod || !mod.startsWith(root)) {
     return false;
   }
 
@@ -257,4 +259,3 @@ export function evaluateGraphRoutes(bundle, decideFn, environment = {}) {
 }
 
 export const evaluateModuleGraphRoutes = evaluateGraphRoutes;
-
