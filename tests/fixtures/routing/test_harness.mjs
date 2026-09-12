@@ -122,7 +122,9 @@ server = createServer((req, res) => {
 
 server.listen(0, '127.0.0.1', () => {
   const port = server.address().port;
-  const targetUrl = `http://127.0.0.1:${port}/tests/fixtures/routing/browser_native_identity.html`;
+  // Optional repo-relative page override (e.g. an RCH-emitted application dist); default unchanged.
+  const pagePath = process.env.F3D_ROUTING_PAGE || '/tests/fixtures/routing/browser_native_identity.html';
+  const targetUrl = `http://127.0.0.1:${port}${pagePath.startsWith('/') ? pagePath : '/' + pagePath}`;
   console.log(`[routing-test-harness] Server listening on ${targetUrl}, launching ${browser}...`);
 
   if (browser === 'chrome') {

@@ -1435,6 +1435,68 @@ test('extractRelativeCssUrls skips url() inside quoted strings and comments, ext
   assert.equal(urls.length, 5, 'Must extract exactly the 5 real CSS assets');
 });
 
+test('extractRelativeCssUrls decodes CSS escapes in quoted and unquoted resources', () => {
+  const cases = [
+    [String.raw`.a { background: url("./te\73 t.png") }`, ['./test.png']],
+    [String.raw`@import "./the\6d e.css";`, ['./theme.css']],
+    [String.raw`.a { background: url(./space\ image.png) }`, ['./space image.png']],
+    [String.raw`@import url(./the\6d e.css);`, ['./theme.css']],
+    [String.raw`.a { background: url(./\000074est.png) }`, ['./test.png']],
+    [String.raw`.a { background: url(./\01f680.svg) }`, ['./🚀.svg']],
+    [String.raw`.a { background: url(./paren\(one\).svg) }`, ['./paren(one).svg']],
+    [String.raw`.a { background: url('./quote\'file.svg') }`, ["./quote'file.svg"]],
+    [String.raw`.a { background: url(./te\73 t.png), url('./test.png') }`, ['./test.png']],
+    [String.raw`.a { background: url("\68 ttps://example.com/a.png"), url(\23 local), url(\2f root.png) }`, []],
+    [String.raw`.a { background: url('./\0.svg'), url('./\d800.svg'), url('./\110000.svg') }`, ['./�.svg']],
+  ];
+  for (const [css, expected] of cases) {
+    assert.deepEqual(extractRelativeCssUrls(css), expected, css);
+  }
+});
+
+test('extractRelativeCssUrls handles CSS string continuations without exposing quoted or commented URLs', () => {
+  for (const newline of ['\n', '\r\n', '\r', '\f']) {
+    const css = `.a { background: url("./im\\${newline}age.png"); }`;
+    assert.deepEqual(extractRelativeCssUrls(css), ['./image.png']);
+    assert.deepEqual(extractRelativeCssUrls(`@import './the\\${newline}me.css';`), ['./theme.css']);
+    assert.deepEqual(extractRelativeCssUrls(`.a { background: url(./te\\73${newline}st.png); }`), ['./tesst.png']);
+    assert.deepEqual(extractRelativeCssUrls(`.a { background: url(./im\\${newline}age.png); }`), []);
+    const decoys = `.a { content: "prefix\\${newline}url(phantom.png)"; background: url(real.png); }`;
+    assert.deepEqual(extractRelativeCssUrls(decoys), ['real.png']);
+  }
+  assert.deepEqual(extractRelativeCssUrls(String.raw`
+    /* @import "./mi\73 sing.css"; url(commented.png) */
+    .a { content: "\" url(phantom.png)"; background: url('./re\61 l.png'); }
+  `), ['./real.png']);
+});
+
+test('buildApplication copies transitive CSS escape resources without rewriting source bytes', async () => {
+  const scratch = makeScratch('f3d_app_css_escapes');
+  const outDir = path.join(scratch, 'dist');
+  fs.mkdirSync(path.join(scratch, 'styles'));
+  fs.mkdirSync(path.join(scratch, 'images'));
+  const resources = new Map([
+    ['styles/main.css', String.raw`@import "./the\6d e.css";`],
+    ['styles/theme.css', String.raw`@import url("./nested\20 theme.css");
+      .first { background: url(../images/space\ image.svg); }`],
+    ['styles/nested theme.css', String.raw`.nested { background: url("../images/\000074est.svg"); }`],
+    ['images/space image.svg', '<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"><rect width="2" height="2" fill="red"/></svg>'],
+    ['images/test.svg', '<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"><rect width="2" height="2" fill="blue"/></svg>'],
+  ]);
+  for (const [name, content] of resources) fs.writeFileSync(path.join(scratch, name), content);
+  fs.writeFileSync(path.join(scratch, 'main.js'), 'export const ready = true;\n');
+  fs.writeFileSync(path.join(scratch, 'index.html'), `
+    <link rel="stylesheet" href="./styles/main.css">
+    <script type="module" src="./main.js"></script>
+  `);
+
+  const result = await buildApplication(path.join(scratch, 'index.html'), outDir);
+  for (const [name, content] of resources) {
+    assert.ok(result.emittedFiles.includes(name), `Decoded resource must be emitted: ${name}`);
+    assert.deepEqual(fs.readFileSync(path.join(outDir, name)), Buffer.from(content), `Source bytes must be preserved: ${name}`);
+  }
+});
+
 test('buildApplication does not reject or attempt to copy content: "url(phantom.png)" in linked stylesheet', async () => {
   const scratch = makeScratch('f3d_app_css_string');
   const outDir = path.join(scratch, 'dist');
@@ -2029,7 +2091,14 @@ test('buildApplication preserves importmap verbatim alongside classic scripts wi
         const depOk = Boolean(depMod && depMod.depOk === true);
         const extOk = Boolean(extMod && extMod.extOk === true);
         const mainOk = Boolean(window.__mainOk === true);
-        const passed = Boolean(orderOk && loadExtDefined && depOk && extOk && mainOk && paramTypeDidNotRun);
+        const namespaceIdentity = depMod === window.__mainDepNamespace;
+        const singleEvaluation = window.__depEvaluations === 1;
+        const mainMutationVisible = depMod.state.count === 1 && depMod.liveCount === 1;
+        depMod.increment();
+        const retainedMutationVisible = window.__mainDepNamespace.state.count === 2 &&
+          window.__mainDepNamespace.liveCount === 2;
+        const passed = Boolean(orderOk && loadExtDefined && depOk && extOk && mainOk && paramTypeDidNotRun &&
+          namespaceIdentity && singleEvaluation && mainMutationVisible && retainedMutationVisible);
 
         const results = {
           orderOk,
@@ -2038,6 +2107,10 @@ test('buildApplication preserves importmap verbatim alongside classic scripts wi
           depOk,
           extOk,
           mainOk,
+          namespaceIdentity,
+          singleEvaluation,
+          mainMutationVisible,
+          retainedMutationVisible,
           observedOrder: window.__classicOrder,
           depValue: depMod ? depMod.depOk : undefined,
           extValue: extMod ? extMod.extOk : undefined
@@ -2073,6 +2146,10 @@ test('buildApplication preserves importmap verbatim alongside classic scripts wi
             depOk: false,
             extOk: false,
             mainOk: Boolean(window.__mainOk === true),
+            namespaceIdentity: false,
+            singleEvaluation: false,
+            mainMutationVisible: false,
+            retainedMutationVisible: false,
             observedOrder: window.__classicOrder
           },
           error: errorMsg,
@@ -2099,11 +2176,16 @@ test('buildApplication preserves importmap verbatim alongside classic scripts wi
   fs.writeFileSync(path.join(scratch, 'index.html'), html);
   fs.writeFileSync(
     path.join(scratch, 'main.js'),
+    'import * as depNamespace from "dynamic-dep";\n' +
+    'depNamespace.increment();\nglobalThis.__mainDepNamespace = depNamespace;\n' +
     'if (typeof window !== "undefined") { window.__mainOk = true; }\nexport const mainOk = true;\n'
   );
   fs.writeFileSync(
     path.join(scratch, 'dep.js'),
-    'import { nestedOk } from "./nested.js";\nexport const depOk = nestedOk;\n'
+    'import { nestedOk } from "./nested.js";\nexport const depOk = nestedOk;\n' +
+    'globalThis.__depEvaluations = (globalThis.__depEvaluations || 0) + 1;\n' +
+    'export const state = { count: 0 };\nexport let liveCount = 0;\n' +
+    'export function increment() { state.count += 1; liveCount += 1; }\n'
   );
   fs.writeFileSync(path.join(scratch, 'nested.js'), 'export const nestedOk = true;\n');
   fs.writeFileSync(
@@ -2274,12 +2356,17 @@ test('buildApplication preserves single module evaluation and identity when shar
   fs.writeFileSync(
     path.join(scratch, 'shared.js'),
     `globalThis.__sharedEvalCount = (globalThis.__sharedEvalCount || 0) + 1;\n` +
-    `export const sharedState = { count: 0, marker: 'canonical' };\n`
+    `export const sharedState = { count: 0, marker: 'canonical' };\n` +
+    `export let liveCount = 0;\n` +
+    `export function increment() { liveCount += 1; }\n`
   );
   fs.writeFileSync(
     path.join(scratch, 'main.js'),
     `import { sharedState } from './shared.js';\n` +
+    `import * as sharedNamespace from './shared.js';\n` +
     `sharedState.count += 1;\n` +
+    `sharedNamespace.increment();\n` +
+    `globalThis.__mainSharedNamespace = sharedNamespace;\n` +
     `globalThis.__mainSharedState = sharedState;\n` +
     `export const mainOk = true;\n`
   );
@@ -2317,4 +2404,97 @@ test('buildApplication preserves single module evaluation and identity when shar
     1,
     'sharedState mutation by bundled main entry must be observed by dynamic import'
   );
+  assert.strictEqual(sharedModule, globalThis.__mainSharedNamespace, 'Module namespace must also be identical');
+  assert.equal(sharedModule.liveCount, 1, 'Bundled calls must update retained live exports');
+  sharedModule.increment();
+  sharedModule.sharedState.count += 3;
+  assert.equal(globalThis.__mainSharedNamespace.liveCount, 2, 'Retained calls must update bundled live exports');
+  assert.equal(globalThis.__mainSharedState.count, 4, 'Retained mutations must be visible to the bundled entry');
+});
+
+test('buildApplication preserves transitive retained module namespaces, mutations, and distinct query/fragment identities', async () => {
+  const scratch = makeScratch('f3d_app_transitive_shared');
+  const outDir = path.join(scratch, 'dist');
+  fs.mkdirSync(path.join(scratch, 'modules'));
+  const suffixes = ['', '?variant=one#first', '?variant=one#second', '?variant=two#first'];
+  const sharedImports = suffixes.map((suffix, index) =>
+    `import * as shared${index} from './modules/shared%20state.js${suffix}';`
+  ).join('\n');
+  const sharedNames = suffixes.map((_, index) => `shared${index}`).join(', ');
+  const html = `<script type="module" src="./main.js"></script>
+<script>window.loadRetained = () => import('./retained.js');</script>`;
+  fs.writeFileSync(path.join(scratch, 'index.html'), html);
+  fs.writeFileSync(path.join(scratch, 'modules', 'shared state.js'), `
+    globalThis.__transitiveSharedEvaluations = (globalThis.__transitiveSharedEvaluations || 0) + 1;
+    export const state = { count: 0 };
+    export let count = 0;
+    export function increment() { count += 1; state.count += 1; }
+  `);
+  fs.writeFileSync(path.join(scratch, 'retained.js'), `${sharedImports}
+    export const namespaces = [${sharedNames}];
+  `);
+  fs.writeFileSync(path.join(scratch, 'main.js'), `${sharedImports}
+    export const namespaces = [${sharedNames}];
+    for (const shared of namespaces) shared.increment();
+  `);
+
+  const result = await buildApplication(path.join(scratch, 'index.html'), outDir);
+  assert.ok(result.emittedFiles.includes('retained.js'));
+  assert.ok(result.emittedFiles.includes('modules/shared state.js'));
+  assert.ok(fs.readFileSync(path.join(outDir, 'index.html'), 'utf-8').includes(
+    "<script>window.loadRetained = () => import('./retained.js');</script>"
+  ), 'Retained classic script must remain verbatim');
+
+  globalThis.__transitiveSharedEvaluations = 0;
+  const main = await import(pathToFileURL(path.join(outDir, result.entryFiles[0])).href);
+  const retained = await import(pathToFileURL(path.join(outDir, 'retained.js')).href);
+  assert.equal(globalThis.__transitiveSharedEvaluations, suffixes.length, 'Each exact module URL must evaluate once');
+  assert.equal(new Set(main.namespaces).size, suffixes.length, 'Query and fragment variants must remain distinct');
+  for (let index = 0; index < suffixes.length; index++) {
+    const canonical = await import(pathToFileURL(path.join(outDir, 'modules', 'shared state.js')).href + suffixes[index]);
+    assert.strictEqual(main.namespaces[index], canonical, 'Bundled namespace must be the canonical retained module');
+    assert.strictEqual(retained.namespaces[index], canonical, 'Transitive retained namespace must be canonical');
+    assert.equal(canonical.count, 1, 'Bundled mutation must reach retained live binding');
+    canonical.increment();
+    assert.equal(main.namespaces[index].count, 2, 'Retained mutation must reach bundled live binding');
+    assert.strictEqual(main.namespaces[index].state, retained.namespaces[index].state);
+    assert.equal(main.namespaces[index].state.count, 2);
+  }
+  assert.equal(globalThis.__transitiveSharedEvaluations, suffixes.length, 'Repeated canonical imports must not re-evaluate');
+});
+
+test('buildApplication preserves an HTML module entry also reached by retained classic dynamic import', async t => {
+  for (const [name, defaultExport] of [
+    ['default declaration', 'export default { marker: "shared-entry" };'],
+    ['quoted default alias', 'const state = { marker: "shared-entry" }; export { state as "default" };'],
+    ['quoted namespace default', 'export * as "default" from "./namespace.js";'],
+  ]) {
+    await t.test(name, async () => {
+      const scratch = makeScratch('f3d_app_retained_entry');
+      const outDir = path.join(scratch, 'dist');
+      fs.writeFileSync(path.join(scratch, 'namespace.js'), 'export const marker = "shared-entry";\n');
+      fs.writeFileSync(path.join(scratch, 'index.html'), `
+        <script type="module" src="./shared.js"></script>
+        <script>window.loadSharedEntry = () => import('./shared.js');</script>
+      `);
+      fs.writeFileSync(path.join(scratch, 'shared.js'), `
+        globalThis.__retainedEntryEvaluations = (globalThis.__retainedEntryEvaluations || 0) + 1;
+        ${defaultExport}
+        export let count = 0;
+        export function increment() { count += 1; }
+      `);
+
+      globalThis.__retainedEntryEvaluations = 0;
+      const result = await buildApplication(path.join(scratch, 'index.html'), outDir);
+      const entry = await import(pathToFileURL(path.join(outDir, result.entryFiles[0])).href);
+      const retained = await import(pathToFileURL(path.join(outDir, 'shared.js')).href);
+      assert.equal(globalThis.__retainedEntryEvaluations, 1);
+      assert.equal(entry.default.marker, 'shared-entry');
+      assert.strictEqual(entry.default, retained.default, 'Entry facade must preserve the default export identity');
+      entry.increment();
+      assert.equal(retained.count, 1);
+      retained.increment();
+      assert.equal(entry.count, 2, 'Entry facade must forward live bindings');
+    });
+  }
 });

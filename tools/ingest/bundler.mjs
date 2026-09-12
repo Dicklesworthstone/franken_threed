@@ -66,6 +66,7 @@ function isRelativeUrl(url) {
  * @param {{ imports?: Record<string, string | null>, scopes?: Record<string, Record<string, string | null>> }} [options.importMap]
  * @param {string} options.mapBaseUrl
  * @param {Map<string, string>} [options.inlineModules]
+ * @param {Map<string, string>} [options.retainedModuleUrls] - Exact source URLs mapped to copied output URLs
  * @param {string} [options.packageRootUrl]
  * @returns {import('rollup').Plugin}
  */
@@ -73,6 +74,7 @@ export function f3dRollupPlugin(options = {}) {
   const importMap = options.importMap || { imports: {}, scopes: {} };
   const mapBaseUrl = options.mapBaseUrl;
   const inlineModules = options.inlineModules || new Map();
+  const retainedModuleUrls = options.retainedModuleUrls || new Map();
   const emittedAssetsByPath = new Map();
 
   return {
@@ -87,10 +89,16 @@ export function f3dRollupPlugin(options = {}) {
         ? (importer.startsWith('file://') ? importer : pathToFileURL(path.resolve(importer)).href)
         : mapBaseUrl;
 
-      return resolveModuleSpecifier(source, referrerUrl, importMap, {
+      const resolvedUrl = resolveModuleSpecifier(source, referrerUrl, importMap, {
         mapBaseUrl,
         packageRootUrl: options.packageRootUrl
       });
+      if (importer && retainedModuleUrls.has(resolvedUrl)) {
+        // Both retained imports and bundled imports must reach the same browser module.
+        // These URLs keep their query/fragment identity and are relative to output chunks.
+        return { id: retainedModuleUrls.get(resolvedUrl), external: true };
+      }
+      return resolvedUrl;
     },
 
     load(id) {
@@ -100,7 +108,19 @@ export function f3dRollupPlugin(options = {}) {
 
       if (id.startsWith('file://')) {
         const filePath = urlToFilePath(id);
-        return fs.readFileSync(filePath, 'utf-8');
+        const source = fs.readFileSync(filePath, 'utf-8');
+        if (retainedModuleUrls.has(id)) {
+          // Rollup entry points cannot be external. Forward an HTML entry to its
+          // retained module without evaluating a second copy of its body.
+          const hasDefault = this.parse(source).body.some(node =>
+            node.type === 'ExportDefaultDeclaration' ||
+            (node.type === 'ExportAllDeclaration' && (node.exported?.name ?? node.exported?.value) === 'default') ||
+            (node.type === 'ExportNamedDeclaration' && node.specifiers.some(spec =>
+              (spec.exported.name ?? spec.exported.value) === 'default')));
+          return `export * from ${JSON.stringify(id)};\n` +
+            (hasDefault ? `export { default } from ${JSON.stringify(id)};\n` : '');
+        }
+        return source;
       }
 
       return null;
@@ -289,7 +309,8 @@ export async function bundleWithRollup(entryPath, options = {}) {
           importMap,
           mapBaseUrl: entryUrl,
           inlineModules,
-          packageRootUrl: options.packageRootUrl
+          packageRootUrl: options.packageRootUrl,
+          retainedModuleUrls: options.retainedModuleUrls
         })
       ],
       onwarn(warning, warn) {
@@ -303,7 +324,10 @@ export async function bundleWithRollup(entryPath, options = {}) {
     });
 
     const { output } = await bundle.generate({
-      format: 'es'
+      format: 'es',
+      entryFileNames: chunk => options.retainedModuleUrls?.has(chunk.facadeModuleId)
+        ? 'f3d-entry-[name]-[hash].js'
+        : '[name].js'
     });
 
     const chunks = output.filter(chunk => chunk.type === 'chunk');

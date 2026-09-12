@@ -159,9 +159,10 @@ export function findChunkForPreload(rawHref, referrerDir, preloadChunkMap) {
  * @param {string} rawHtmlContent
  * @param {Map<string, string>} [preloadChunkMap] - Mapped bundle chunks to exclude from static copy
  * @param {string} [referrerDir=''] - Base directory for resolving relative URLs
+ * @param {boolean} [skipModulePreloads=false] - Defer preloads until bundle chunks are known
  * @returns {string[]} Deduplicated list of relative resource URLs
  */
-export function extractRelativeAssetUrls(rawHtmlContent, preloadChunkMap = null, referrerDir = '') {
+export function extractRelativeAssetUrls(rawHtmlContent, preloadChunkMap = null, referrerDir = '', skipModulePreloads = false) {
   const domHtml = stripScriptAndStyleBodies(rawHtmlContent);
   const assets = new Set();
 
@@ -175,8 +176,9 @@ export function extractRelativeAssetUrls(rawHtmlContent, preloadChunkMap = null,
       if (
         attrs.rel &&
         attrs.rel.toLowerCase() === 'modulepreload' &&
-        preloadChunkMap &&
-        findChunkForPreload(attrs.href, referrerDir, preloadChunkMap)
+        (skipModulePreloads || (
+          preloadChunkMap && findChunkForPreload(attrs.href, referrerDir, preloadChunkMap)
+        ))
       ) {
         continue;
       }
@@ -261,7 +263,25 @@ export function stripCssComments(css) {
  * is never extracted as a resource dependency.
  */
 export const CSS_RESOURCE_REGEX =
-  /(\/\*[\s\S]*?\*\/)|(@import\s+(?:url\(\s*)?(?:"([^"\\]*(?:\\.[^"\\]*)*)"|'([^'\\]*(?:\\.[^'\\]*)*)'|([^\s();]+))\s*\)?)|(\burl\(\s*(?:"([^"\\]*(?:\\.[^"\\]*)*)"|'([^'\\]*(?:\\.[^'\\]*)*)'|([^'")\s]+))\s*\))|("(?:[^"\\]|\\.)*")|('(?:[^'\\]|\\.)*')/gi;
+  /(\/\*[\s\S]*?\*\/)|(@import\s+(?:url\(\s*)?(?:"([^"\\]*(?:\\[\s\S][^"\\]*)*)"|'([^'\\]*(?:\\[\s\S][^'\\]*)*)'|((?:\\(?:[0-9a-f]{1,6}(?:\r\n|[ \t\r\n\f])?|[^\r\n\f0-9a-f])|[^\\'"\s();])+))\s*\)?)|(\burl\(\s*(?:"([^"\\]*(?:\\[\s\S][^"\\]*)*)"|'([^'\\]*(?:\\[\s\S][^'\\]*)*)'|((?:\\(?:[0-9a-f]{1,6}(?:\r\n|[ \t\r\n\f])?|[^\r\n\f0-9a-f])|[^\\'"()\s])+))\s*\))|("(?:[^"\\]|\\[\s\S])*")|('(?:[^'\\]|\\[\s\S])*')/gi;
+
+/** Decode CSS string/URL escapes without changing the emitted stylesheet bytes.
+ * https://www.w3.org/TR/css-syntax-3/#consume-escaped-code-point
+ * Quoted strings additionally discard escaped newlines (CRLF is one newline).
+ */
+function decodeCssResourceUrl(rawUrl) {
+  return rawUrl.replace(
+    /\\(?:([0-9a-f]{1,6})(?:\r\n|[ \t\r\n\f])?|(\r\n|[\r\n\f])|([\s\S]))/gi,
+    (_escape, hex, continuation, character) => {
+      if (continuation) return '';
+      if (!hex) return character;
+      const codePoint = Number.parseInt(hex, 16);
+      return codePoint === 0 || codePoint > 0x10ffff || (codePoint >= 0xd800 && codePoint <= 0xdfff)
+        ? '\uFFFD'
+        : String.fromCodePoint(codePoint);
+    }
+  );
+}
 
 /**
  * Extracts relative resource URLs (url(...) and @import) from CSS content.
@@ -287,8 +307,9 @@ export function extractRelativeCssUrls(cssContent) {
     // match[2]: @import statement
     if (match[2]) {
       const rawUrl = match[3] !== undefined ? match[3] : (match[4] !== undefined ? match[4] : match[5]);
-      if (rawUrl && isRelativeUrl(rawUrl)) {
-        urls.add(rawUrl);
+      const url = rawUrl ? decodeCssResourceUrl(rawUrl) : '';
+      if (isRelativeUrl(url)) {
+        urls.add(url);
       }
       continue;
     }
@@ -296,8 +317,9 @@ export function extractRelativeCssUrls(cssContent) {
     // match[6]: url(...) function
     if (match[6]) {
       const rawUrl = match[7] !== undefined ? match[7] : (match[8] !== undefined ? match[8] : match[9]);
-      if (rawUrl && isRelativeUrl(rawUrl)) {
-        urls.add(rawUrl);
+      const url = rawUrl ? decodeCssResourceUrl(rawUrl) : '';
+      if (isRelativeUrl(url)) {
+        urls.add(url);
       }
     }
   }
@@ -747,61 +769,23 @@ export async function buildApplication(entryPath, outDir, options = {}) {
     }
   }
 
-  // Execute Rollup bundling backed by import-map resolver
-  const bundleResult = await bundleWithRollup(resolvedEntryAbs, {
-    packageRootUrl: options.packageRootUrl
-  });
-
   const targetFiles = new Map(); // relativePath -> string | Buffer
   const htmlFileName = isHtml ? path.basename(resolvedEntryAbs) : null;
-  const emittedChunkNames = new Set(Object.keys(bundleResult.files));
-  if (htmlFileName) {
-    emittedChunkNames.add(htmlFileName);
-  }
+  const retainedModuleUrls = new Map(); // exact source URL -> relative output URL
 
-  // Collect all emitted code chunks from Rollup
-  for (const [fileName, code] of Object.entries(bundleResult.files)) {
-    targetFiles.set(fileName, code);
-  }
-
-  // If HTML entry point: process HTML, rewrite module script tags, and enforce bounded asset closure
-  if (isHtml) {
-    // Build map of canonical module URLs to emitted chunk file names for modulepreload rewrites
-    const preloadChunkMap = new Map();
-    for (const chunk of bundleResult.chunks) {
-      if (chunk.facadeModuleId) {
-        const canonicalKey = toCanonicalPreloadUrl(chunk.facadeModuleId);
-        if (canonicalKey) {
-          preloadChunkMap.set(canonicalKey, chunk.fileName);
-        }
-      }
-      if (chunk.modules) {
-        const modIds = Array.isArray(chunk.modules) ? chunk.modules : Object.keys(chunk.modules);
-        for (const modId of modIds) {
-          const canonicalKey = toCanonicalPreloadUrl(modId);
-          if (canonicalKey) {
-            preloadChunkMap.set(canonicalKey, chunk.fileName);
-          }
-        }
-      }
-    }
+  // The same closure walk runs before bundling to establish retained module identity,
+  // then afterward to validate chunk collisions and collect unbundled preloads.
+  function collectHtmlAssets(preloadChunkMap, emittedChunkNames, skipModulePreloads = false) {
+    if (!isHtml) return;
 
     const rawHtmlContent = fs.readFileSync(resolvedEntryAbs, 'utf-8');
     const entryBaseUrl = pathToFileURL(resolvedEntryAbs).href;
     const parsedHtml = parseHtmlEntries(rawHtmlContent, entryBaseUrl);
     const importMap = parsedHtml.importMap;
 
-    const rewrittenHtml = rewriteHtmlForBuild(
-      rawHtmlContent,
-      bundleResult.entryFiles,
-      bundleResult.files,
-      { preloadChunkMap, entryDir }
-    );
-    targetFiles.set(htmlFileName, rewrittenHtml);
-
     // Extract relative assets referenced by the HTML (stylesheets, images, media, non-module scripts)
     // Excludes modulepreloads that map to bundled chunks
-    const relativeAssetUrls = extractRelativeAssetUrls(rawHtmlContent, preloadChunkMap, entryDir);
+    const relativeAssetUrls = extractRelativeAssetUrls(rawHtmlContent, preloadChunkMap, entryDir, skipModulePreloads);
 
     // Bounded asset processing queue: handles direct HTML assets, transitive CSS url()/@import children,
     // and literal dynamic imports in retained classic scripts and modules.
@@ -848,12 +832,13 @@ export async function buildApplication(entryPath, outDir, options = {}) {
     }
 
     const visitedCssPaths = new Set();
-    const visitedJsPaths = new Set();
+    const visitedJsUrls = new Set();
 
     while (assetQueue.length > 0) {
       const item = assetQueue.shift();
       let srcAssetAbs;
       let relFromEntryDir;
+      let moduleUrl;
       const referrerPath = item.referrerPath || resolvedEntryAbs;
 
       if (item.isModuleSpecifier) {
@@ -884,6 +869,10 @@ export async function buildApplication(entryPath, outDir, options = {}) {
 
         srcAssetAbs = urlToFilePath(resolvedUrl);
         relFromEntryDir = path.relative(entryDir, srcAssetAbs);
+        moduleUrl = resolvedUrl;
+        // File copies share bytes, but query/fragment variants remain distinct modules.
+        const entryDirectoryUrl = new URL('./', entryBaseUrl).href;
+        retainedModuleUrls.set(resolvedUrl, './' + resolvedUrl.slice(entryDirectoryUrl.length));
       } else {
         const { relUrl, referrerDir } = item;
         if (!relUrl || typeof relUrl !== 'string') continue;
@@ -933,11 +922,6 @@ export async function buildApplication(entryPath, outDir, options = {}) {
         );
       }
 
-      // If asset or module was already processed and added to targetFiles during this run, skip duplicate copy
-      if (targetFiles.has(relFromEntryDir)) {
-        continue;
-      }
-
       // Explicitly reject unresolved relative resources before output
       if (!fs.existsSync(srcAssetAbs) || !fs.statSync(srcAssetAbs).isFile()) {
         const target = item.isModuleSpecifier ? item.specifier : item.relUrl;
@@ -953,7 +937,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
       }
 
       // Copy asset/module into bounded closure targetFiles
-      const assetData = fs.readFileSync(srcAssetAbs);
+      const assetData = targetFiles.get(relFromEntryDir) || fs.readFileSync(srcAssetAbs);
       targetFiles.set(relFromEntryDir, assetData);
 
       // If asset is a CSS file, scan for transitive child url() and @import resources
@@ -972,15 +956,15 @@ export async function buildApplication(entryPath, outDir, options = {}) {
         }
       }
 
-      // If resource is a JS/MJS/CJS file (retained classic script or dynamic import target),
+      // If resource is a module or JS/MJS/CJS file (retained classic script),
       // scan for transitive module dependencies (static/dynamic imports, exports) and asset references
       if (
-        (srcAssetAbs.endsWith('.js') || srcAssetAbs.endsWith('.mjs') || srcAssetAbs.endsWith('.cjs')) &&
-        !visitedJsPaths.has(srcAssetAbs)
+        (item.isModuleSpecifier || srcAssetAbs.endsWith('.js') || srcAssetAbs.endsWith('.mjs') || srcAssetAbs.endsWith('.cjs')) &&
+        !visitedJsUrls.has(moduleUrl || pathToFileURL(srcAssetAbs).href)
       ) {
-        visitedJsPaths.add(srcAssetAbs);
+        const fileUrl = moduleUrl || pathToFileURL(srcAssetAbs).href;
+        visitedJsUrls.add(fileUrl);
         const jsContent = assetData.toString('utf-8');
-        const fileUrl = pathToFileURL(srcAssetAbs).href;
         const { moduleSpecifiers, assetSpecifiers } = extractJsModuleDependencies(jsContent, fileUrl);
         const jsDir = path.dirname(srcAssetAbs);
 
@@ -1004,6 +988,35 @@ export async function buildApplication(entryPath, outDir, options = {}) {
         }
       }
     }
+  }
+
+  collectHtmlAssets(null, new Set(htmlFileName ? [htmlFileName] : []), true);
+  const bundleResult = await bundleWithRollup(resolvedEntryAbs, {
+    packageRootUrl: options.packageRootUrl,
+    retainedModuleUrls
+  });
+  const emittedChunkNames = new Set(Object.keys(bundleResult.files));
+  if (htmlFileName) emittedChunkNames.add(htmlFileName);
+
+  const preloadChunkMap = new Map();
+  for (const chunk of bundleResult.chunks) {
+    for (const modId of [chunk.facadeModuleId, ...chunk.modules]) {
+      const canonicalKey = toCanonicalPreloadUrl(modId);
+      if (canonicalKey) preloadChunkMap.set(canonicalKey, chunk.fileName);
+    }
+  }
+  collectHtmlAssets(preloadChunkMap, emittedChunkNames);
+
+  for (const [fileName, code] of Object.entries(bundleResult.files)) {
+    targetFiles.set(fileName, code);
+  }
+  if (isHtml) {
+    targetFiles.set(htmlFileName, rewriteHtmlForBuild(
+      fs.readFileSync(resolvedEntryAbs, 'utf-8'),
+      bundleResult.entryFiles,
+      bundleResult.files,
+      { preloadChunkMap, entryDir }
+    ));
   }
 
   // Safe collision check: fail safely without deleting or overwriting (including symlinks)
