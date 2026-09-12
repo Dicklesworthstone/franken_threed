@@ -1457,3 +1457,444 @@ fn test_get_max_scale_on_axis_nan_propagation_defect_regression() {
     );
 }
 
+#[test]
+fn test_quaternion_slerp_endpoints_and_symmetry() {
+    // Vector from Three.js r186 unit/src/math/Quaternion.tests.js slerpTestSkeleton
+    let a = Quaternion::new(
+        0.6753410084407496,
+        0.4087830051091744,
+        0.32856700410659473,
+        0.5185120064806223,
+    );
+    let b = Quaternion::new(
+        0.6602792107657797,
+        0.43647413932562285,
+        0.35119011210236006,
+        0.5001871596632682,
+    );
+
+    // t = 0 yields exactly a
+    let mut s0 = a;
+    s0.slerp(&b, 0.0);
+    assert_close(s0.x, a.x, 1e-15, "slerp @ t=0 (x)");
+    assert_close(s0.y, a.y, 1e-15, "slerp @ t=0 (y)");
+    assert_close(s0.z, a.z, 1e-15, "slerp @ t=0 (z)");
+    assert_close(s0.w, a.w, 1e-15, "slerp @ t=0 (w)");
+
+    // t = 1 yields exactly b
+    let mut s1 = a;
+    s1.slerp(&b, 1.0);
+    assert_close(s1.x, b.x, 1e-15, "slerp @ t=1 (x)");
+    assert_close(s1.y, b.y, 1e-15, "slerp @ t=1 (y)");
+    assert_close(s1.z, b.z, 1e-15, "slerp @ t=1 (z)");
+    assert_close(s1.w, b.w, 1e-15, "slerp @ t=1 (w)");
+
+    // t = 0.5: symmetry dotA == dotB and unit length
+    let mut s05 = a;
+    s05.slerp(&b, 0.5);
+    let dot_a = s05.dot(&a);
+    let dot_b = s05.dot(&b);
+    assert_close(dot_a, dot_b, 1e-14, "slerp symmetry @ t=0.5");
+    assert_close(s05.length(), 1.0, 1e-14, "slerp unit length @ t=0.5");
+
+    // Analytical values matching Three.js r186 exactly
+    assert_close(s05.x, 0.6679638643334043, 1e-14, "slerp @ t=0.5 (x)");
+    assert_close(s05.y, 0.4227258770367419, 1e-14, "slerp @ t=0.5 (y)");
+    assert_close(s05.z, 0.3399568107922252, 1e-14, "slerp @ t=0.5 (z)");
+    assert_close(s05.w, 0.5094668542940572, 1e-14, "slerp @ t=0.5 (w)");
+
+    // t = 0.25
+    let mut s025 = a;
+    s025.slerp(&b, 0.25);
+    assert!(s025.dot(&a) > s025.dot(&b), "closer to a at t=0.25");
+    assert_close(s025.x, 0.6716910906690009, 1e-14, "slerp @ t=0.25 (x)");
+    assert_close(s025.y, 0.4157783681645695, 1e-14, "slerp @ t=0.25 (y)");
+    assert_close(s025.z, 0.3342811445626951, 1e-14, "slerp @ t=0.25 (z)");
+    assert_close(s025.w, 0.5140190110026578, 1e-14, "slerp @ t=0.25 (w)");
+
+    // t = 0.75
+    let mut s075 = a;
+    s075.slerp(&b, 0.75);
+    assert!(s075.dot(&a) < s075.dot(&b), "closer to b at t=0.75");
+    assert_close(s075.x, 0.6641597584206161, 1e-14, "slerp @ t=0.75 (x)");
+    assert_close(s075.y, 0.4296247320992852, 1e-14, "slerp @ t=0.75 (y)");
+    assert_close(s075.z, 0.34559334955203336, 1e-14, "slerp @ t=0.75 (z)");
+    assert_close(s075.w, 0.5048560602871799, 1e-14, "slerp @ t=0.75 (w)");
+}
+
+#[test]
+fn test_quaternion_slerp_canonical_axes_and_diagonals() {
+    let d = (0.5f64).sqrt();
+
+    // 1. Diagonal X/Z from orthogonal axes
+    let mut q1 = Quaternion::new(1.0, 0.0, 0.0, 0.0);
+    let q2 = Quaternion::new(0.0, 0.0, 1.0, 0.0);
+    q1.slerp(&q2, 0.5);
+    assert_close(q1.x, d, 1e-15, "X/Z diagonal (x)");
+    assert_close(q1.y, 0.0, 1e-15, "X/Z diagonal (y)");
+    assert_close(q1.z, d, 1e-15, "X/Z diagonal (z)");
+    assert_close(q1.w, 0.0, 1e-15, "X/Z diagonal (w)");
+
+    // 2. W-unit from diagonals
+    let mut q3 = Quaternion::new(0.0, d, 0.0, d);
+    let q4 = Quaternion::new(0.0, -d, 0.0, d);
+    q3.slerp(&q4, 0.5);
+    assert_close(q3.x, 0.0, 1e-15, "W-unit (x)");
+    assert_close(q3.y, 0.0, 1e-15, "W-unit (y)");
+    assert_close(q3.z, 0.0, 1e-15, "W-unit (z)");
+    assert_close(q3.w, 1.0, 1e-15, "W-unit (w)");
+}
+
+#[test]
+fn test_quaternion_slerp_antipodal_path() {
+    // Quaternions q and -q represent identical orientation; dot product is -1.0.
+    // slerp must negate the target to take the shortest zero-length arc.
+    let q = Quaternion::new(0.0, 0.0, 0.0, 1.0);
+    let minus_q = Quaternion::new(0.0, 0.0, 0.0, -1.0);
+
+    let mut res = q;
+    res.slerp(&minus_q, 0.5);
+    assert_close(res.x, 0.0, 1e-15, "antipodal slerp (x)");
+    assert_close(res.y, 0.0, 1e-15, "antipodal slerp (y)");
+    assert_close(res.z, 0.0, 1e-15, "antipodal slerp (z)");
+    assert_close(res.w, 1.0, 1e-15, "antipodal slerp (w)");
+
+    // At t=1, slerp to -q yields +q (since -q is flipped to +q before interpolating)
+    let mut res1 = q;
+    res1.slerp(&minus_q, 1.0);
+    assert_close(res1.x, 0.0, 1e-15, "antipodal slerp t=1 (x)");
+    assert_close(res1.y, 0.0, 1e-15, "antipodal slerp t=1 (y)");
+    assert_close(res1.z, 0.0, 1e-15, "antipodal slerp t=1 (z)");
+    assert_close(res1.w, 1.0, 1e-15, "antipodal slerp t=1 (w)");
+}
+
+#[test]
+fn test_quaternion_slerp_small_angles_lerp_normalize() {
+    // dot >= 0.9995 triggers linear interpolation followed by normalization.
+    let q1 = Quaternion::new(0.0, 0.0, 0.0, 1.0);
+    let q2 = Quaternion::new(0.001, 0.0, 0.0, (1.0 - 0.001 * 0.001f64).sqrt());
+    assert!(q1.dot(&q2) >= 0.9995, "dot must be >= 0.9995");
+
+    let mut res = q1;
+    res.slerp(&q2, 0.5);
+    assert_close(res.length(), 1.0, 1e-14, "small-angle slerp must normalize result");
+    assert!(res.x > 0.0 && res.x < 0.001, "x must interpolate intermediate value");
+}
+
+#[test]
+fn test_quaternion_slerp_nonunit_authored_and_extrapolation() {
+    // Non-unit quaternions at dot < 0.9995 (orthogonal non-unit)
+    let g = Quaternion::new(2.0, 0.0, 0.0, 0.0);
+    let h = Quaternion::new(0.0, 2.0, 0.0, 0.0);
+
+    let mut res0 = g;
+    res0.slerp(&h, 0.0);
+    assert_close(res0.x, 2.0, 1e-15, "nonunit slerp @ t=0 preserves authored magnitude");
+    assert_close(res0.y, 0.0, 1e-15, "nonunit slerp @ t=0 (y)");
+
+    let mut res1 = g;
+    res1.slerp(&h, 1.0);
+    assert_close(res1.x, 0.0, 1e-15, "nonunit slerp @ t=1 (x)");
+    assert_close(res1.y, 2.0, 1e-15, "nonunit slerp @ t=1 preserves authored magnitude");
+
+    // Extrapolation: t = 2.0
+    // q_a is identity (0 deg rotation); q_b has half-angle PI/4, representing a 90 deg rotation around Y.
+    // Extrapolating to t = 2.0 produces a 180 deg rotation around Y: [0, sin(PI/2), 0, cos(PI/2)] = [0, 1, 0, ~0].
+    let q_a = Quaternion::identity();
+    let q_b = Quaternion::new(0.0, (core::f64::consts::FRAC_PI_4).sin(), 0.0, (core::f64::consts::FRAC_PI_4).cos());
+    let mut ext = q_a;
+    ext.slerp(&q_b, 2.0);
+    assert_close(ext.x, 0.0, 1e-15, "extrapolated slerp (x)");
+    assert_close(ext.y, 1.0, 1e-15, "extrapolated slerp to 180 deg around Y (y)");
+    assert_close(ext.z, 0.0, 1e-15, "extrapolated slerp (z)");
+    assert_close(ext.w, 2.220446049250313e-16, 1e-15, "extrapolated slerp cos(PI/2) (w)");
+}
+
+#[test]
+fn test_quaternion_slerp_nonunit_same_input_t0_normalizes_matching_pinned_r186() {
+    // When slerping between identical non-unit quaternions, dot product is >= 0.9995 (e.g. 2*2 = 4.0).
+    // Pinned Three.js r186 Quaternion.js:746-756 executes the small-angle branch (lerp then normalize),
+    // with NO early return at t=0.
+    // Consequently, authored non-unit quaternions with dot >= 0.9995 are normalized even at t=0.
+    let mut a = Quaternion::new(2.0, 0.0, 0.0, 0.0);
+    let b = Quaternion::new(2.0, 0.0, 0.0, 0.0);
+    a.slerp(&b, 0.0);
+
+    assert_close(a.x, 1.0, 1e-15, "nonunit same-input slerp @ t=0 must normalize to 1.0 per r186");
+    assert_close(a.y, 0.0, 1e-15, "y must remain 0");
+    assert_close(a.z, 0.0, 1e-15, "z must remain 0");
+    assert_close(a.w, 0.0, 1e-15, "w must remain 0");
+}
+
+#[test]
+fn test_quaternion_slerp_nan_propagation() {
+    let mut q = Quaternion::identity();
+    let q_target = Quaternion::new(0.0, 1.0, 0.0, 0.0);
+    q.slerp(&q_target, f64::NAN);
+    assert!(q.x.is_nan(), "slerp with NaN t propagates NaN to x");
+    assert!(q.y.is_nan(), "slerp with NaN t propagates NaN to y");
+    assert!(q.z.is_nan(), "slerp with NaN t propagates NaN to z");
+    assert!(q.w.is_nan(), "slerp with NaN t propagates NaN to w");
+}
+
+#[test]
+fn test_quaternion_slerp_quaternions_and_equals() {
+    let qa = Quaternion::new(1.0, 0.0, 0.0, 0.0);
+    let qb = Quaternion::new(0.0, 0.0, 1.0, 0.0);
+    let mut target = Quaternion::identity();
+    target.slerp_quaternions(&qa, &qb, 0.5);
+
+    let d = (0.5f64).sqrt();
+    let expected = Quaternion::new(d, 0.0, d, 0.0);
+    assert_close(target.x, expected.x, 1e-15, "slerp_quaternions (x)");
+    assert_close(target.z, expected.z, 1e-15, "slerp_quaternions (z)");
+
+    let mut direct = qa;
+    direct.slerp(&qb, 0.5);
+    assert!(target.equals(&direct), "slerp_quaternions must equal copy().slerp()");
+}
+
+#[test]
+fn test_quaternion_slerp_flat() {
+    let src0 = [10.0, 0.6753410084407496, 0.4087830051091744, 0.32856700410659473, 0.5185120064806223];
+    let src1 = [20.0, 0.6602792107657797, 0.43647413932562285, 0.35119011210236006, 0.5001871596632682];
+    let mut dst = [0.0; 6];
+
+    // Offsets: src0 starts at index 1, src1 starts at index 1, dst starts at index 2
+    Quaternion::slerp_flat(&mut dst, 2, &src0, 1, &src1, 1, 0.5);
+    assert_close(dst[2], 0.6679638643334043, 1e-14, "slerp_flat (x)");
+    assert_close(dst[3], 0.4227258770367419, 1e-14, "slerp_flat (y)");
+    assert_close(dst[4], 0.3399568107922252, 1e-14, "slerp_flat (z)");
+    assert_close(dst[5], 0.5094668542940572, 1e-14, "slerp_flat (w)");
+
+    // Identical quaternions early return path in slerp_flat
+    let identical_src = [0.0, 1.0, 2.0, 3.0, 4.0];
+    let mut dst_ident = [0.0; 5];
+    Quaternion::slerp_flat(&mut dst_ident, 1, &identical_src, 1, &identical_src, 1, 0.5);
+    assert_eq!(dst_ident[1], 1.0, "identical slerp_flat preserves x");
+    assert_eq!(dst_ident[2], 2.0, "identical slerp_flat preserves y");
+    assert_eq!(dst_ident[3], 3.0, "identical slerp_flat preserves z");
+    assert_eq!(dst_ident[4], 4.0, "identical slerp_flat preserves w");
+}
+
+#[test]
+fn test_quaternion_angle_to_cases() {
+    let id = Quaternion::identity();
+    let rot_y_pi = Euler::new(0.0, core::f64::consts::PI, 0.0, EulerOrder::XYZ).to_quaternion();
+    let rot_y_2pi = Euler::new(0.0, core::f64::consts::PI * 2.0, 0.0, EulerOrder::XYZ).to_quaternion();
+    let rot_y_half_pi = Euler::new(0.0, core::f64::consts::FRAC_PI_2, 0.0, EulerOrder::XYZ).to_quaternion();
+
+    // 1. Same orientation: angle = 0
+    assert_close(id.angle_to(&id), 0.0, 1e-15, "angleTo(self) == 0");
+
+    // 2. 180 degrees rotation around Y: angle = PI
+    assert_close(id.angle_to(&rot_y_pi), core::f64::consts::PI, 1e-14, "angleTo(180 deg) == PI");
+
+    // 3. 360 degrees rotation around Y: angle = 0
+    assert_close(id.angle_to(&rot_y_2pi), 0.0, 1e-14, "angleTo(360 deg) == 0");
+
+    // 4. 90 degrees rotation around Y: angle = PI / 2
+    assert_close(id.angle_to(&rot_y_half_pi), core::f64::consts::FRAC_PI_2, 1e-14, "angleTo(90 deg) == PI/2");
+
+    // 5. Antipodal quaternion: angle = 0
+    let minus_id = Quaternion::new(0.0, 0.0, 0.0, -1.0);
+    assert_close(id.angle_to(&minus_id), 0.0, 1e-15, "angleTo(-q) == 0");
+
+    // 6. Non-unit or out-of-range dot clamped to [-1, 1] without NaN
+    let q_big1 = Quaternion::new(0.0, 0.0, 0.0, 2.0);
+    let q_big2 = Quaternion::new(0.0, 0.0, 0.0, 2.0);
+    assert_close(q_big1.angle_to(&q_big2), 0.0, 1e-15, "clamped dot prevents acos(>1) NaN");
+
+    // 7. NaN dot propagates NaN
+    let q_nan = Quaternion::new(f64::NAN, 0.0, 0.0, 1.0);
+    assert!(id.angle_to(&q_nan).is_nan(), "angleTo with NaN propagates NaN");
+}
+
+#[test]
+fn test_quaternion_rotate_towards_cases() {
+    let id = Quaternion::identity();
+    let rot_y_pi = Euler::new(0.0, core::f64::consts::PI, 0.0, EulerOrder::XYZ).to_quaternion();
+
+    // 1. step = 0: no rotation
+    let mut q1 = id;
+    q1.rotate_towards(&rot_y_pi, 0.0);
+    assert_close(q1.x, 0.0, 1e-15, "step 0 (x)");
+    assert_close(q1.y, 0.0, 1e-15, "step 0 (y)");
+    assert_close(q1.z, 0.0, 1e-15, "step 0 (z)");
+    assert_close(q1.w, 1.0, 1e-15, "step 0 (w)");
+
+    // 2. step >= angle (overshoot): clamps to target
+    let mut q2 = id;
+    q2.rotate_towards(&rot_y_pi, core::f64::consts::PI * 2.0);
+    assert_close(q2.x, rot_y_pi.x, 1e-15, "overshoot clamp (x)");
+    assert_close(q2.y, rot_y_pi.y, 1e-15, "overshoot clamp (y)");
+    assert_close(q2.z, rot_y_pi.z, 1e-15, "overshoot clamp (z)");
+    assert_close(q2.w, rot_y_pi.w, 1e-15, "overshoot clamp (w)");
+
+    // 3. step = PI / 2 (halfway to 180 deg): rotates 90 deg around Y
+    let mut q3 = id;
+    q3.rotate_towards(&rot_y_pi, core::f64::consts::FRAC_PI_2);
+    let d = (0.5f64).sqrt();
+    assert_close(q3.x, 0.0, 1e-15, "half step (x)");
+    assert_close(q3.y, d, 1e-15, "half step (y)");
+    assert_close(q3.z, 0.0, 1e-15, "half step (z)");
+    assert_close(q3.w, d, 1e-15, "half step (w)");
+    assert_close(q3.angle_to(&id), core::f64::consts::FRAC_PI_2, 1e-14, "angle from start is PI/2");
+    assert_close(q3.angle_to(&rot_y_pi), core::f64::consts::FRAC_PI_2, 1e-14, "angle to target is PI/2");
+
+    // 4. angle == 0 early return: non-unit quaternion is not normalized
+    let mut q_nonunit = Quaternion::new(2.0, 0.0, 0.0, 0.0);
+    let q_same = Quaternion::new(2.0, 0.0, 0.0, 0.0);
+    q_nonunit.rotate_towards(&q_same, 1.0);
+    assert_eq!(q_nonunit.x, 2.0, "angle 0 early return preserves non-unit x");
+    assert_eq!(q_nonunit.y, 0.0, "angle 0 early return preserves non-unit y");
+    assert_eq!(q_nonunit.z, 0.0, "angle 0 early return preserves non-unit z");
+    assert_eq!(q_nonunit.w, 0.0, "angle 0 early return preserves non-unit w");
+}
+
+#[test]
+fn test_quaternion_set_from_axis_angle_cases() {
+    let mut q = Quaternion::identity();
+
+    // 1. Ordinary rotations matching pinned Three.js r186
+    // Y-axis 90 degrees: [0, sin(PI/4), 0, cos(PI/4)]
+    let axis_y = Vector3::new(0.0, 1.0, 0.0);
+    q.set_from_axis_angle(&axis_y, core::f64::consts::FRAC_PI_2);
+    assert_close(q.x, 0.0, 1e-15, "axis_angle y 90 (x)");
+    assert_close(q.y, 0.7071067811865475, 1e-15, "axis_angle y 90 (y)");
+    assert_close(q.z, 0.0, 1e-15, "axis_angle y 90 (z)");
+    assert_close(q.w, 0.7071067811865476, 1e-15, "axis_angle y 90 (w)");
+
+    // X-axis 180 degrees: [sin(PI/2), 0, 0, cos(PI/2)]
+    let axis_x = Vector3::new(1.0, 0.0, 0.0);
+    q.set_from_axis_angle(&axis_x, core::f64::consts::PI);
+    assert_close(q.x, 1.0, 1e-15, "axis_angle x 180 (x)");
+    assert_close(q.y, 0.0, 1e-15, "axis_angle x 180 (y)");
+    assert_close(q.z, 0.0, 1e-15, "axis_angle x 180 (z)");
+    assert_close(q.w, 6.123233995736766e-17, 1e-15, "axis_angle x 180 (w)");
+
+    // 2. Authored non-unit axis (no implicit normalization beyond source)
+    // axis (0, 2, 0) with angle PI/2 scales components by 2 without normalizing
+    let axis_nonunit = Vector3::new(0.0, 2.0, 0.0);
+    q.set_from_axis_angle(&axis_nonunit, core::f64::consts::FRAC_PI_2);
+    assert_close(q.x, 0.0, 1e-15, "nonunit axis_angle (x)");
+    assert_close(q.y, 1.414213562373095, 1e-15, "nonunit axis_angle preserves magnitude (y)");
+    assert_close(q.z, 0.0, 1e-15, "nonunit axis_angle (z)");
+    assert_close(q.w, 0.7071067811865476, 1e-15, "nonunit axis_angle (w)");
+
+    // 3. Zero angle
+    q.set_from_axis_angle(&axis_x, 0.0);
+    assert_close(q.x, 0.0, 1e-15, "zero angle (x)");
+    assert_close(q.y, 0.0, 1e-15, "zero angle (y)");
+    assert_close(q.z, 0.0, 1e-15, "zero angle (z)");
+    assert_close(q.w, 1.0, 1e-15, "zero angle (w)");
+
+    // 4. Signed zero angle: sin(-0.0) produces -0.0 for x, y, z
+    q.set_from_axis_angle(&axis_x, -0.0);
+    assert_eq!(q.x.to_bits(), (-0.0f64).to_bits(), "signed zero angle preserves -0.0 on x");
+    assert_eq!(q.y.to_bits(), (-0.0f64).to_bits(), "signed zero angle preserves -0.0 on y");
+    assert_eq!(q.z.to_bits(), (-0.0f64).to_bits(), "signed zero angle preserves -0.0 on z");
+    assert_close(q.w, 1.0, 1e-15, "signed zero angle w is 1.0");
+
+    // 5. NaN propagation
+    let axis_nan = Vector3::new(f64::NAN, 0.0, 0.0);
+    q.set_from_axis_angle(&axis_nan, core::f64::consts::FRAC_PI_2);
+    assert!(q.x.is_nan(), "NaN axis x propagates NaN");
+    assert_close(q.y, 0.0, 1e-15, "NaN axis y remains 0");
+    assert_close(q.z, 0.0, 1e-15, "NaN axis z remains 0");
+    assert_close(q.w, 0.7071067811865476, 1e-15, "NaN axis w computed from angle");
+
+    q.set_from_axis_angle(&axis_y, f64::NAN);
+    assert!(q.x.is_nan(), "NaN angle propagates NaN to x");
+    assert!(q.y.is_nan(), "NaN angle propagates NaN to y");
+    assert!(q.z.is_nan(), "NaN angle propagates NaN to z");
+    assert!(q.w.is_nan(), "NaN angle propagates NaN to w");
+}
+
+#[test]
+fn test_quaternion_set_from_unit_vectors_cases() {
+    let mut q = Quaternion::identity();
+
+    // 1. Ordinary rotation: 90 deg from X to Y around Z
+    let v_x = Vector3::new(1.0, 0.0, 0.0);
+    let v_y = Vector3::new(0.0, 1.0, 0.0);
+    q.set_from_unit_vectors(&v_x, &v_y);
+    assert_close(q.x, 0.0, 1e-15, "ordinary x to y (x)");
+    assert_close(q.y, 0.0, 1e-15, "ordinary x to y (y)");
+    assert_close(q.z, 0.7071067811865475, 1e-15, "ordinary x to y (z)");
+    assert_close(q.w, 0.7071067811865475, 1e-15, "ordinary x to y (w)");
+
+    // 2. Identical vectors: identity rotation
+    q.set_from_unit_vectors(&v_y, &v_y);
+    assert_close(q.x, 0.0, 1e-15, "identical vectors (x)");
+    assert_close(q.y, 0.0, 1e-15, "identical vectors (y)");
+    assert_close(q.z, 0.0, 1e-15, "identical vectors (z)");
+    assert_close(q.w, 1.0, 1e-15, "identical vectors (w)");
+
+    // 3. Antipodal branch 1: |v_from.x| > |v_from.z|
+    // v_from = (1, 0, 0), v_to = (-1, 0, 0).
+    // |1| > |0| -> x = -v_from.y = -0.0, y = v_from.x = 1.0, z = 0.0, w = 0.0
+    let v_neg_x = Vector3::new(-1.0, 0.0, 0.0);
+    q.set_from_unit_vectors(&v_x, &v_neg_x);
+    assert_eq!(q.x.to_bits(), (-0.0f64).to_bits(), "antipodal branch 1 preserves -0.0 on x");
+    assert_close(q.y, 1.0, 1e-15, "antipodal branch 1 (y)");
+    assert_close(q.z, 0.0, 1e-15, "antipodal branch 1 (z)");
+    assert_close(q.w, 0.0, 1e-15, "antipodal branch 1 (w)");
+
+    // Antipodal branch 1 with general (x, y):
+    let v_xy = Vector3::new(0.6, 0.8, 0.0);
+    let v_neg_xy = Vector3::new(-0.6, -0.8, 0.0);
+    q.set_from_unit_vectors(&v_xy, &v_neg_xy);
+    assert_close(q.x, -0.8, 1e-15, "antipodal branch 1 general (x)");
+    assert_close(q.y, 0.6, 1e-15, "antipodal branch 1 general (y)");
+    assert_close(q.z, 0.0, 1e-15, "antipodal branch 1 general (z)");
+    assert_close(q.w, 0.0, 1e-15, "antipodal branch 1 general (w)");
+
+    // 4. Antipodal branch 2: |v_from.x| <= |v_from.z|
+    // v_from = (0, 0, 1), v_to = (0, 0, -1).
+    // |0| <= |1| -> x = 0.0, y = -v_from.z = -1.0, z = v_from.y = 0.0, w = 0.0
+    let v_z = Vector3::new(0.0, 0.0, 1.0);
+    let v_neg_z = Vector3::new(0.0, 0.0, -1.0);
+    q.set_from_unit_vectors(&v_z, &v_neg_z);
+    assert_close(q.x, 0.0, 1e-15, "antipodal branch 2 (x)");
+    assert_close(q.y, -1.0, 1e-15, "antipodal branch 2 (y)");
+    assert_close(q.z, 0.0, 1e-15, "antipodal branch 2 (z)");
+    assert_close(q.w, 0.0, 1e-15, "antipodal branch 2 (w)");
+
+    // 5. Near threshold tests (r < 1e-8 vs r >= 1e-8)
+    // Below threshold: dot = -1.0 + 0.5e-8 -> r = 0.5e-8 < 1e-8 (enters antipodal branch)
+    let dot_below = -1.0 + 0.5e-8;
+    let v_to_below = Vector3::new(dot_below, (1.0 - dot_below * dot_below).sqrt(), 0.0);
+    q.set_from_unit_vectors(&v_x, &v_to_below);
+    assert_eq!(q.x.to_bits(), (-0.0f64).to_bits(), "near threshold below (x is -0.0)");
+    assert_close(q.y, 1.0, 1e-15, "near threshold below triggers antipodal branch (y)");
+    assert_close(q.z, 0.0, 1e-15, "near threshold below (z)");
+    assert_close(q.w, 0.0, 1e-15, "near threshold below (w)");
+
+    // Above threshold: dot = -1.0 + 2.0e-8 -> r = 2.0e-8 >= 1e-8 (regular cross product branch)
+    let dot_above = -1.0 + 2.0e-8;
+    let v_to_above = Vector3::new(dot_above, (1.0 - dot_above * dot_above).sqrt(), 0.0);
+    q.set_from_unit_vectors(&v_x, &v_to_above);
+    assert_close(q.x, 0.0, 1e-15, "near threshold above (x)");
+    assert_close(q.y, 0.0, 1e-15, "near threshold above (y)");
+    assert_close(q.z, 0.999999995, 1e-14, "near threshold above regular branch (z)");
+    assert_close(q.w, 0.00010000000002879373, 1e-14, "near threshold above regular branch (w)");
+
+    // 6. Non-unit authored inputs (no implicit normalization of inputs beyond source)
+    // v_from = (2, 0, 0), v_to = (0, 2, 0). Upstream yields normalized [0, 0, 4/sqrt(17), 1/sqrt(17)]
+    let v_from_nonunit = Vector3::new(2.0, 0.0, 0.0);
+    let v_to_nonunit = Vector3::new(0.0, 2.0, 0.0);
+    q.set_from_unit_vectors(&v_from_nonunit, &v_to_nonunit);
+    assert_close(q.x, 0.0, 1e-15, "nonunit inputs (x)");
+    assert_close(q.y, 0.0, 1e-15, "nonunit inputs (y)");
+    assert_close(q.z, 0.9701425001453319, 1e-15, "nonunit inputs 4/sqrt(17) (z)");
+    assert_close(q.w, 0.24253562503633297, 1e-15, "nonunit inputs 1/sqrt(17) (w)");
+
+    // 7. NaN propagation
+    let v_nan = Vector3::new(f64::NAN, 0.0, 0.0);
+    q.set_from_unit_vectors(&v_nan, &v_y);
+    assert!(q.x.is_nan(), "NaN input propagates NaN to x");
+    assert!(q.y.is_nan(), "NaN input propagates NaN to y");
+    assert!(q.z.is_nan(), "NaN input propagates NaN to z");
+    assert!(q.w.is_nan(), "NaN input propagates NaN to w");
+}
