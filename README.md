@@ -34,7 +34,7 @@ Existing authoring knowledge stays useful. You keep writing Three.js.
 | Is the upstream oracle pinned? | **Yes** — Three.js r186 pinned at commit `148ef33ecb6d2502ff796d4554abd1549c95d519` with package reconciliation evidence (`5c2776d`, `7a0ad38`) |
 | Are test evidence conventions in place? | **Yes** — structured event schema and test evidence helper (`3772bbc`) |
 | Does Rust code execute in real browsers? | **Yes** — a real Rust program executes through the Asupersync browser host in HeadlessChrome 152 and Safari 26.5 with eight probes passing (timer wakeups, oneshot join, 1000 host turns, reentry rejection, 10k self-wakes, cooperative cancellation, region drain before close, fetch abort with server-observed disconnect) as of commits `8910299`, `7cd379e`, `8f1ca58` |
-| Is browser execution reproducible from git? | **No** — depends on an **uncommitted upstream asupersync working tree** (development linkage, not reproducible from commits yet) |
+| Is the browser runtime dependency reproducible? | **Yes** — published Asupersync `=0.5.0` with a checked-in registry checksum replaces the developer checkout. The browser results above predate this pin and still require a fresh browser run. |
 | Is the WebGPU bridge implemented? | **No** — WebGPU bridge, device loss handling, and all-turn burst measurement are not done |
 | Is there a compiler, renderer, or CLI? | **No** — compiler, WebGPU renderer, and CLI orchestration do not exist yet |
 | Has the symbol/export census been run? | **No** — the plan defines the census; it has not been executed |
