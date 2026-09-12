@@ -31,13 +31,17 @@ import {
   canAdmitMesh,
   extractMeshRenderData,
   prepareMeshPacket,
+  prepareMeshDepthPacket,
   prepareCanvasMeshPacket,
+  prepareCanvasMeshDepthPacket,
   renderMesh,
   renderRetainedFallback,
   multiplyMatrices4x4,
   expandIndexedPositions,
   ADMISSION_REJECTION,
   COORDINATE_SYSTEM,
+  DEPTH_WIRE_COMPARE,
+  THREE_DEPTH_FUNC_TO_WIRE_COMPARE,
 } from './mesh_adapter.mjs';
 
 function createBasicTriangleMesh(materialProps = {}, geomProps = {}) {
@@ -53,6 +57,24 @@ function createBasicTriangleMesh(materialProps = {}, geomProps = {}) {
     depthTest: false,
     depthWrite: false,
     side: THREE.DoubleSide, // Mandatory per 13043 / 13062 point 1
+    ...materialProps,
+  });
+  const mesh = new THREE.Mesh(geometry, material);
+  mesh.updateMatrixWorld();
+  return mesh;
+}
+
+function createDepthTriangleMesh(materialProps = {}, geomProps = {}) {
+  const geometry = new THREE.BufferGeometry();
+  const positions = new Float32Array([
+    0.0,  0.5, 0.0,
+   -0.5, -0.5, 0.0,
+    0.5, -0.5, 0.0,
+  ]);
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  const material = new THREE.MeshBasicMaterial({
+    color: 0xff0000,
+    side: THREE.DoubleSide, // Mandatory DoubleSide
     ...materialProps,
   });
   const mesh = new THREE.Mesh(geometry, material);
@@ -678,3 +700,370 @@ test('Positive: renderMesh executes honest offscreen rendering when canvasContex
   assert.equal(executedContext, null);
 });
 
+test('Positive: Real default MeshBasicMaterial with default depth settings is admitted and extracted', () => {
+  const mesh = createDepthTriangleMesh();
+  const camera = createBasicCamera();
+
+  // Verify Three.js default material properties
+  assert.equal(mesh.material.depthTest, true);
+  assert.equal(mesh.material.depthWrite, true);
+  assert.equal(mesh.material.depthFunc, THREE.LessEqualDepth);
+
+  const admission = canAdmitMesh(mesh, camera);
+  assert.equal(admission.admitted, true, 'Default MeshBasicMaterial with depthTest/depthWrite must be admitted');
+
+  const snapshot = extractMeshRenderData(mesh, camera, 64, 64);
+  assert.equal(snapshot.depthTest, true);
+  assert.equal(snapshot.depthWrite, true);
+  assert.equal(snapshot.depthFunc, THREE.LessEqualDepth);
+  assert.equal(snapshot.depthCompare, DEPTH_WIRE_COMPARE.LESS_EQUAL); // wire 4
+});
+
+test('Positive: All 8 Three.js depth functions map faithfully to wire compare codes 1..8', () => {
+  const camera = createBasicCamera();
+  const cases = [
+    { name: 'NeverDepth', func: THREE.NeverDepth, expectedWire: DEPTH_WIRE_COMPARE.NEVER, wireCode: 1 },
+    { name: 'AlwaysDepth', func: THREE.AlwaysDepth, expectedWire: DEPTH_WIRE_COMPARE.ALWAYS, wireCode: 8 },
+    { name: 'LessDepth', func: THREE.LessDepth, expectedWire: DEPTH_WIRE_COMPARE.LESS, wireCode: 2 },
+    { name: 'LessEqualDepth', func: THREE.LessEqualDepth, expectedWire: DEPTH_WIRE_COMPARE.LESS_EQUAL, wireCode: 4 },
+    { name: 'EqualDepth', func: THREE.EqualDepth, expectedWire: DEPTH_WIRE_COMPARE.EQUAL, wireCode: 3 },
+    { name: 'GreaterEqualDepth', func: THREE.GreaterEqualDepth, expectedWire: DEPTH_WIRE_COMPARE.GREATER_EQUAL, wireCode: 7 },
+    { name: 'GreaterDepth', func: THREE.GreaterDepth, expectedWire: DEPTH_WIRE_COMPARE.GREATER, wireCode: 5 },
+    { name: 'NotEqualDepth', func: THREE.NotEqualDepth, expectedWire: DEPTH_WIRE_COMPARE.NOT_EQUAL, wireCode: 6 },
+  ];
+
+  for (const c of cases) {
+    const mesh = createDepthTriangleMesh({ depthFunc: c.func });
+    const admission = canAdmitMesh(mesh, camera);
+    assert.equal(admission.admitted, true, `${c.name} must be admitted`);
+
+    const snapshot = extractMeshRenderData(mesh, camera, 64, 64);
+    assert.equal(snapshot.depthFunc, c.func, `${c.name} depthFunc mismatch`);
+    assert.equal(snapshot.depthCompare, c.expectedWire, `${c.name} wire compare mismatch`);
+    assert.equal(snapshot.depthCompare, c.wireCode, `${c.name} wire code mismatch`);
+    assert.equal(THREE_DEPTH_FUNC_TO_WIRE_COMPARE[c.func], c.expectedWire);
+  }
+});
+
+test('Positive: depthTest=false forces depthCompare to ALWAYS (8) and resolves depthWrite via sourceBackend', () => {
+  const camera = createBasicCamera();
+
+  // 1. When options.sourceBackend === 'webgpu': WebGPU passes depthWrite directly (depthWriteEnabled = true)
+  for (const func of [THREE.NeverDepth, THREE.LessDepth, THREE.GreaterDepth, THREE.EqualDepth]) {
+    const mesh = createDepthTriangleMesh({ depthTest: false, depthWrite: true, depthFunc: func });
+    assert.equal(canAdmitMesh(mesh, camera, { sourceBackend: 'webgpu' }).admitted, true);
+
+    const snapshot = extractMeshRenderData(mesh, camera, 64, 64, { sourceBackend: 'webgpu' });
+    assert.equal(snapshot.depthTest, false);
+    assert.equal(snapshot.depthWrite, true, 'WebGPU backend must preserve depthWrite=true');
+    assert.equal(snapshot.depthFunc, func);
+    assert.equal(snapshot.depthCompare, DEPTH_WIRE_COMPARE.ALWAYS); // wire 8
+  }
+
+  // 2. When options.sourceBackend === 'webgl': WebGL hardware suppresses writes when depthTest is false
+  for (const func of [THREE.NeverDepth, THREE.LessDepth, THREE.GreaterDepth, THREE.EqualDepth]) {
+    const mesh = createDepthTriangleMesh({ depthTest: false, depthWrite: true, depthFunc: func });
+    assert.equal(canAdmitMesh(mesh, camera, { sourceBackend: 'webgl' }).admitted, true);
+
+    const snapshot = extractMeshRenderData(mesh, camera, 64, 64, { sourceBackend: 'webgl' });
+    assert.equal(snapshot.depthTest, false);
+    assert.equal(snapshot.depthWrite, false, 'WebGL backend must suppress depthWrite to false when depthTest is false');
+    assert.equal(snapshot.depthFunc, func);
+    assert.equal(snapshot.depthCompare, DEPTH_WIRE_COMPARE.ALWAYS); // wire 8
+  }
+
+  // 3. Negative: when depthTest=false and depthWrite=true without sourceBackend, must refuse execution
+  const ambiguousMesh = createDepthTriangleMesh({ depthTest: false, depthWrite: true });
+  const ambiguousAdm = canAdmitMesh(ambiguousMesh, camera);
+  assert.equal(ambiguousAdm.admitted, false);
+  assert.equal(ambiguousAdm.reason, ADMISSION_REJECTION.AMBIGUOUS_DEPTH_PAIR);
+  assert.throws(
+    () => extractMeshRenderData(ambiguousMesh, camera, 64, 64),
+    /ambiguous across backends/,
+  );
+
+  // 4. For depthTest=false with depthWrite=false, no backend parameter needed
+  const noDepthMesh = createDepthTriangleMesh({ depthTest: false, depthWrite: false });
+  assert.equal(canAdmitMesh(noDepthMesh, camera).admitted, true);
+  const noDepthSnap = extractMeshRenderData(noDepthMesh, camera, 64, 64);
+  assert.equal(noDepthSnap.depthTest, false);
+  assert.equal(noDepthSnap.depthWrite, false);
+  assert.equal(noDepthSnap.depthCompare, DEPTH_WIRE_COMPARE.ALWAYS);
+});
+
+test('Positive: Dynamic depth mutations produce fresh isolated snapshots', () => {
+  const mesh = createDepthTriangleMesh(); // Default: depthTest=true, depthWrite=true, depthFunc=LessEqual
+  const camera = createBasicCamera();
+
+  // Snapshot 1: Default
+  const snap1 = extractMeshRenderData(mesh, camera, 64, 64);
+  assert.equal(snap1.depthTest, true);
+  assert.equal(snap1.depthWrite, true);
+  assert.equal(snap1.depthFunc, THREE.LessEqualDepth);
+  assert.equal(snap1.depthCompare, 4);
+
+  // In-place mutation: change to GreaterDepth and depthWrite=false
+  mesh.material.depthFunc = THREE.GreaterDepth;
+  mesh.material.depthWrite = false;
+
+  // Snapshot 2: Reflects mutation
+  const snap2 = extractMeshRenderData(mesh, camera, 64, 64);
+  assert.equal(snap2.depthTest, true);
+  assert.equal(snap2.depthWrite, false);
+  assert.equal(snap2.depthFunc, THREE.GreaterDepth);
+  assert.equal(snap2.depthCompare, 5);
+
+  // Invariant: Snapshot 1 is immutable and unaffected
+  assert.equal(snap1.depthTest, true);
+  assert.equal(snap1.depthWrite, true);
+  assert.equal(snap1.depthFunc, THREE.LessEqualDepth);
+  assert.equal(snap1.depthCompare, 4);
+
+  // In-place mutation: disable depthTest
+  mesh.material.depthTest = false;
+
+  // Snapshot 3: depthTest=false -> depthCompare=ALWAYS (8)
+  const snap3 = extractMeshRenderData(mesh, camera, 64, 64);
+  assert.equal(snap3.depthTest, false);
+  assert.equal(snap3.depthWrite, false);
+  assert.equal(snap3.depthFunc, THREE.GreaterDepth);
+  assert.equal(snap3.depthCompare, 8);
+
+  // Invariant: Snapshots 1 and 2 remain unaffected
+  assert.equal(snap1.depthCompare, 4);
+  assert.equal(snap2.depthCompare, 5);
+});
+
+test('Negative: Unsupported stencil, polygonOffset, reversedDepth, and invalid depthFunc are rejected', () => {
+  const camera = createBasicCamera();
+
+  // 1. stencilWrite === true
+  const stencilMesh = createDepthTriangleMesh({ stencilWrite: true });
+  const stencilAdm = canAdmitMesh(stencilMesh, camera);
+  assert.equal(stencilAdm.admitted, false);
+  assert.equal(stencilAdm.reason, ADMISSION_REJECTION.UNSUPPORTED_STENCIL);
+
+  // 2. polygonOffset === true
+  const polyMesh = createDepthTriangleMesh({ polygonOffset: true });
+  const polyAdm = canAdmitMesh(polyMesh, camera);
+  assert.equal(polyAdm.admitted, false);
+  assert.equal(polyAdm.reason, ADMISSION_REJECTION.UNSUPPORTED_POLYGON_OFFSET);
+
+  // 3. camera.reversedDepth === true (via underlying _reversedDepth)
+  const revCam1 = createBasicCamera();
+  revCam1._reversedDepth = true;
+  assert.equal(revCam1.reversedDepth, true);
+  const normalMesh = createDepthTriangleMesh();
+  const revAdm1 = canAdmitMesh(normalMesh, revCam1);
+  assert.equal(revAdm1.admitted, false);
+  assert.equal(revAdm1.reason, ADMISSION_REJECTION.UNSUPPORTED_REVERSED_DEPTH);
+
+  // 4. camera.reversedDepthBuffer === true
+  const revCam2 = createBasicCamera();
+  revCam2.reversedDepthBuffer = true;
+  const revAdm2 = canAdmitMesh(normalMesh, revCam2);
+  assert.equal(revAdm2.admitted, false);
+  assert.equal(revAdm2.reason, ADMISSION_REJECTION.UNSUPPORTED_REVERSED_DEPTH);
+
+  // 5. Invalid depthFunc
+  const badFuncMesh = createDepthTriangleMesh({ depthFunc: 999 });
+  const badFuncAdm = canAdmitMesh(badFuncMesh, camera);
+  assert.equal(badFuncAdm.admitted, false);
+  assert.equal(badFuncAdm.reason, ADMISSION_REJECTION.INVALID_DEPTH_FUNC);
+  assert.throws(
+    () => extractMeshRenderData(badFuncMesh, camera, 64, 64),
+    /Invalid or unsupported depthFunc/,
+  );
+});
+
+test('Explicit Missing-Export Refusal: Mesh requiring depth strictly refuses Wasm lacking depth exports', () => {
+  const mesh = createDepthTriangleMesh(); // depthTest=true, depthWrite=true
+  const camera = createBasicCamera();
+
+  // Mock Wasm that ONLY exposes legacy 8-arg exports
+  let legacyCalled = false;
+  const mockLegacyWasm = {
+    f3d_build_mesh_packet: () => {
+      legacyCalled = true;
+      return new Uint8Array([1, 2, 3]);
+    },
+    f3d_build_canvas_mesh_packet: () => {
+      legacyCalled = true;
+      return new Uint8Array([4, 5, 6]);
+    },
+  };
+
+  // 1. prepareMeshPacket must refuse when mesh requires depth
+  assert.throws(
+    () => prepareMeshPacket(mesh, camera, 64, 64, mockLegacyWasm),
+    /Mesh requires depth \(depthTest or depthWrite enabled\), but wasmModule is missing f3d_build_mesh_depth_packet export/,
+  );
+  assert.equal(legacyCalled, false, 'Legacy export must NOT be silently called when depth is required');
+
+  // 2. prepareCanvasMeshPacket must refuse when mesh requires depth
+  assert.throws(
+    () => prepareCanvasMeshPacket(mesh, camera, 64, 64, mockLegacyWasm),
+    /Visible canvas mesh requires depth \(depthTest or depthWrite enabled\), but wasmModule is missing f3d_build_canvas_mesh_depth_packet export/,
+  );
+  assert.equal(legacyCalled, false, 'Canvas legacy export must NOT be silently called when depth is required');
+
+  // 3. prepareMeshDepthPacket must refuse when depth export is missing
+  assert.throws(
+    () => prepareMeshDepthPacket(mesh, camera, 64, 64, mockLegacyWasm),
+    /Mesh depth packet preparation failed: wasmModule is missing f3d_build_mesh_depth_packet/,
+  );
+
+  // 4. prepareCanvasMeshDepthPacket must refuse when canvas depth export is missing
+  assert.throws(
+    () => prepareCanvasMeshDepthPacket(mesh, camera, 64, 64, mockLegacyWasm),
+    /Visible canvas mesh depth packet preparation failed: wasmModule is missing f3d_build_canvas_mesh_depth_packet/,
+  );
+});
+
+test('Positive: prepareMeshDepthPacket and prepareCanvasMeshDepthPacket invoke Wasm with exact 11 typed arguments', () => {
+  const mesh = createDepthTriangleMesh({ depthFunc: THREE.GreaterDepth, depthWrite: false });
+  const camera = createBasicCamera();
+
+  // 1. Offscreen depth packet with primary name
+  let capturedOffscreen = null;
+  const mockDepthWasm = {
+    f3d_build_mesh_depth_packet: (pos, ind, mv, proj, col, w, h, webglDepth, depthTest, depthWrite, depthCompare) => {
+      capturedOffscreen = { pos, ind, mv, proj, col, w, h, webglDepth, depthTest, depthWrite, depthCompare };
+      return new Uint8Array([0x44, 0x45, 0x50, 0x54]); // 'DEPT'
+    },
+  };
+
+  const offscreenResult = prepareMeshDepthPacket(mesh, camera, 320, 240, mockDepthWasm);
+  assert.ok(capturedOffscreen, 'f3d_build_mesh_depth_packet must be invoked');
+  assert.equal(capturedOffscreen.pos.length, 9);
+  assert.equal(capturedOffscreen.ind.length, 0);
+  assert.equal(capturedOffscreen.mv.length, 16);
+  assert.equal(capturedOffscreen.proj.length, 16);
+  assert.equal(capturedOffscreen.col.length, 4);
+  assert.equal(capturedOffscreen.w, 320);
+  assert.equal(capturedOffscreen.h, 240);
+  assert.equal(capturedOffscreen.webglDepth, true);
+  assert.equal(capturedOffscreen.depthTest, true);
+  assert.equal(capturedOffscreen.depthWrite, false);
+  assert.equal(capturedOffscreen.depthCompare, 5); // GreaterDepth -> wire 5
+  assert.deepEqual(Array.from(offscreenResult.packetBytes), [0x44, 0x45, 0x50, 0x54]);
+
+  // 2. Canvas depth packet with primary name
+  let capturedCanvas = null;
+  const mockCanvasDepthWasm = {
+    f3d_build_canvas_mesh_depth_packet: (pos, ind, mv, proj, col, w, h, webglDepth, depthTest, depthWrite, depthCompare) => {
+      capturedCanvas = { pos, ind, mv, proj, col, w, h, webglDepth, depthTest, depthWrite, depthCompare };
+      return new Uint8Array([0x43, 0x44, 0x45, 0x50]); // 'CDEP'
+    },
+  };
+
+  const canvasResult = prepareCanvasMeshDepthPacket(mesh, camera, 640, 480, mockCanvasDepthWasm);
+  assert.ok(capturedCanvas, 'f3d_build_canvas_mesh_depth_packet must be invoked');
+  assert.equal(capturedCanvas.w, 640);
+  assert.equal(capturedCanvas.h, 480);
+  assert.equal(capturedCanvas.depthTest, true);
+  assert.equal(capturedCanvas.depthWrite, false);
+  assert.equal(capturedCanvas.depthCompare, 5);
+  assert.deepEqual(Array.from(canvasResult.packetBytes), [0x43, 0x44, 0x45, 0x50]);
+
+  // 3. Fallback to canonical bridge aliases (gpu_bridge_build_mesh_depth_packet, gpu_bridge_build_canvas_mesh_depth_packet)
+  let capturedBridgeAlias = null;
+  const mockAliasWasm = {
+    gpu_bridge_build_mesh_depth_packet: (...args) => {
+      capturedBridgeAlias = args;
+      return new Uint8Array([9, 9, 9]);
+    },
+  };
+  const aliasResult = prepareMeshDepthPacket(mesh, camera, 100, 100, mockAliasWasm);
+  assert.ok(capturedBridgeAlias);
+  assert.equal(capturedBridgeAlias.length, 11);
+  assert.deepEqual(Array.from(aliasResult.packetBytes), [9, 9, 9]);
+});
+
+test('Positive: Legacy no-depth mesh succeeds with 8-arg export when depth export absent, uses 11-arg when available', () => {
+  const noDepthMesh = createBasicTriangleMesh({ depthTest: false, depthWrite: false });
+  const camera = createBasicCamera();
+
+  // 1. Only 8-arg export available -> succeeds via legacy 8-arg export
+  let legacyCalled = false;
+  let captured8Args = null;
+  const mockLegacyWasm = {
+    f3d_build_mesh_packet: (...args) => {
+      legacyCalled = true;
+      captured8Args = args;
+      return new Uint8Array([8, 8, 8]);
+    },
+  };
+
+  const resLegacy = prepareMeshPacket(noDepthMesh, camera, 64, 64, mockLegacyWasm);
+  assert.equal(legacyCalled, true);
+  assert.equal(captured8Args.length, 8);
+  assert.deepEqual(Array.from(resLegacy.packetBytes), [8, 8, 8]);
+
+  // 2. 11-arg export available -> uses 11-arg export with depthTest=false, depthWrite=false, depthCompare=ALWAYS (8)
+  let depthCalled = false;
+  let captured11Args = null;
+  const mockDepthWasm = {
+    f3d_build_mesh_depth_packet: (...args) => {
+      depthCalled = true;
+      captured11Args = args;
+      return new Uint8Array([11, 11, 11]);
+    },
+    f3d_build_mesh_packet: () => {
+      throw new Error('Should prefer depth export when available');
+    },
+  };
+
+  const resDepth = prepareMeshPacket(noDepthMesh, camera, 64, 64, mockDepthWasm);
+  assert.equal(depthCalled, true);
+  assert.equal(captured11Args.length, 11);
+  assert.equal(captured11Args[8], false); // depthTest
+  assert.equal(captured11Args[9], false); // depthWrite
+  assert.equal(captured11Args[10], 8);    // depthCompare ALWAYS
+  assert.deepEqual(Array.from(resDepth.packetBytes), [11, 11, 11]);
+});
+
+test('Positive: renderMesh routes depth-enabled mesh through depth packet builder to WebGpuBridgeHost', async () => {
+  const mesh = createDepthTriangleMesh({ depthFunc: THREE.LessDepth });
+  const camera = createBasicCamera();
+
+  let executedPacket = null;
+  let executedContext = null;
+  const mockBridgeHost = {
+    executePacket: async (packet, ctx) => {
+      executedPacket = packet;
+      executedContext = ctx;
+      return { readbackBufferId: 42 };
+    },
+  };
+
+  const mockWasm = {
+    f3d_build_mesh_depth_packet: (pos, ind, mv, proj, col, w, h, webglDepth, dt, dw, dc) => {
+      assert.equal(dt, true);
+      assert.equal(dw, true);
+      assert.equal(dc, 2); // LessDepth -> 2
+      return new Uint8Array([0x52, 0x45, 0x4e, 0x44]); // 'REND'
+    },
+    f3d_build_canvas_mesh_depth_packet: (pos, ind, mv, proj, col, w, h, webglDepth, dt, dw, dc) => {
+      assert.equal(dt, true);
+      assert.equal(dw, true);
+      assert.equal(dc, 2);
+      return new Uint8Array([0x43, 0x52, 0x45, 0x4e]); // 'CREN'
+    },
+  };
+
+  // 1. Offscreen renderMesh with depth
+  const offscreenRes = await renderMesh(mockBridgeHost, mesh, camera, null, mockWasm, { width: 64, height: 64 });
+  assert.equal(offscreenRes.target, 'offscreen');
+  assert.equal(executedContext, null);
+  assert.deepEqual(Array.from(executedPacket), [0x52, 0x45, 0x4e, 0x44]);
+  assert.equal(offscreenRes.snapshot.depthCompare, 2);
+
+  // 2. Canvas renderMesh with depth
+  const mockCanvasContext = { canvas: { width: 128, height: 128 } };
+  const canvasRes = await renderMesh(mockBridgeHost, mesh, camera, mockCanvasContext, mockWasm);
+  assert.equal(canvasRes.target, 'canvas');
+  assert.equal(executedContext, mockCanvasContext);
+  assert.deepEqual(Array.from(executedPacket), [0x43, 0x52, 0x45, 0x4e]);
+  assert.equal(canvasRes.snapshot.depthCompare, 2);
+});

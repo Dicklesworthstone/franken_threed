@@ -5,7 +5,8 @@
  * Extracts dynamic input from real pinned Three.js Mesh + Camera instances into
  * isolated typed arrays for the Wasm/WebGPU execution core:
  * - BufferGeometry position (itemSize 3, non-interleaved, unnormalized) + optional index + drawRange
- * - Opaque untextured MeshBasicMaterial color (Float32Array[4]), DoubleSide only, depthTest=false, depthWrite=false
+ * - Opaque untextured MeshBasicMaterial color (Float32Array[4]), DoubleSide only
+ * - Dynamic depth state: depthTest, depthWrite, and depthFunc mapped to wire compare codes 1..8
  * - f64 model-view and projection matrices with WebGL-to-WebGPU depth coordinate tracking
  *
  * Invariants:
@@ -16,7 +17,18 @@
  * - Retains unsupported full application route without automatic rerouting.
  */
 
-import { Material, Object3D } from '../../upstream/three.js/build/three.module.js';
+import {
+  Material,
+  Object3D,
+  NeverDepth,
+  AlwaysDepth,
+  LessDepth,
+  LessEqualDepth,
+  EqualDepth,
+  GreaterEqualDepth,
+  GreaterDepth,
+  NotEqualDepth,
+} from '../../upstream/three.js/build/three.module.js';
 
 // Base prototypes default hooks for override detection (avoiding function.toString)
 const DEFAULT_MATERIAL_ON_BEFORE_COMPILE = Material.prototype.onBeforeCompile;
@@ -41,11 +53,22 @@ export const ADMISSION_REJECTION = Object.freeze({
   UNSUPPORTED_MATERIAL: 'Textured maps, transparency, wireframe, or custom blending are not supported in this slice',
   UNSUPPORTED_MATERIAL_FEATURE: 'vertexColors, colorWrite=false, clippingPlanes, alphaTest/alphaHash, or custom shader hooks are not supported in this slice',
   UNSUPPORTED_DEPTH: 'Material must have depthTest === false and depthWrite === false in this slice (pipeline has no depth buffer)',
+  UNSUPPORTED_STENCIL: 'Stencil operations are not supported in this slice (material.stencilWrite === true)',
+  UNSUPPORTED_POLYGON_OFFSET: 'Polygon offset is not supported in this slice (material.polygonOffset === true)',
+  UNSUPPORTED_REVERSED_DEPTH: 'Reversed depth buffer is not supported in this slice',
+  INVALID_DEPTH_FUNC: 'Invalid or unsupported depthFunc',
+  AMBIGUOUS_DEPTH_PAIR: 'Material with depthTest=false and depthWrite=true is ambiguous across backends (WebGL suppresses writes, WebGPU permits writes); provide options.sourceBackend ("webgl" | "webgpu")',
   UNSUPPORTED_SIDE: 'Only DoubleSide (2) is supported in this slice (pipeline has no culling state)',
   INVALID_CAMERA: 'Camera must be an instance of THREE.Camera with valid projectionMatrix and matrixWorldInverse',
   INVALID_DIMENSIONS: 'Viewport dimensions must be positive integers',
   INDEX_OUT_OF_BOUNDS: 'Index references vertex out of bounds',
   INVALID_DRAWRANGE: 'Invalid drawRange: start and count must be non-negative integers',
+});
+
+// Supported upstream source backends for resolving backend-specific semantics
+export const SOURCE_BACKEND = Object.freeze({
+  WEBGL: 'webgl',
+  WEBGPU: 'webgpu',
 });
 
 // Pinned Three.js coordinate system constants
@@ -54,13 +77,38 @@ export const COORDINATE_SYSTEM = Object.freeze({
   WEBGPU: 2001,
 });
 
+// Wire compare codes matching crates/f3d-runtime/src/gpu_host.rs and bridge_runtime.js
+export const DEPTH_WIRE_COMPARE = Object.freeze({
+  NEVER: 1,         // "never"
+  LESS: 2,          // "less"
+  EQUAL: 3,         // "equal"
+  LESS_EQUAL: 4,    // "less-equal"
+  GREATER: 5,       // "greater"
+  NOT_EQUAL: 6,     // "not-equal"
+  GREATER_EQUAL: 7, // "greater-equal"
+  ALWAYS: 8,        // "always"
+});
+
+// Pinned Three.js depth constants (0..7) to wire compare codes (1..8)
+export const THREE_DEPTH_FUNC_TO_WIRE_COMPARE = Object.freeze({
+  [NeverDepth]: DEPTH_WIRE_COMPARE.NEVER,                 // 0 -> 1
+  [AlwaysDepth]: DEPTH_WIRE_COMPARE.ALWAYS,               // 1 -> 8
+  [LessDepth]: DEPTH_WIRE_COMPARE.LESS,                   // 2 -> 2
+  [LessEqualDepth]: DEPTH_WIRE_COMPARE.LESS_EQUAL,         // 3 -> 4
+  [EqualDepth]: DEPTH_WIRE_COMPARE.EQUAL,                 // 4 -> 3
+  [GreaterEqualDepth]: DEPTH_WIRE_COMPARE.GREATER_EQUAL,  // 5 -> 7
+  [GreaterDepth]: DEPTH_WIRE_COMPARE.GREATER,             // 6 -> 5
+  [NotEqualDepth]: DEPTH_WIRE_COMPARE.NOT_EQUAL,          // 7 -> 6
+});
+
 /**
  * Checks if a Three.js Mesh and Camera can be admitted into the dynamic Wasm mesh rendering slice.
  * @param {any} mesh
  * @param {any} camera
+ * @param {object} [options]
  * @returns {{ admitted: boolean, reason?: string }}
  */
-export function canAdmitMesh(mesh, camera) {
+export function canAdmitMesh(mesh, camera, options = {}) {
   if (!mesh || !mesh.isMesh) {
     return { admitted: false, reason: ADMISSION_REJECTION.NOT_A_MESH };
   }
@@ -88,6 +136,11 @@ export function canAdmitMesh(mesh, camera) {
   // Camera check
   if (!camera || !camera.isCamera || !camera.projectionMatrix || !camera.matrixWorldInverse) {
     return { admitted: false, reason: ADMISSION_REJECTION.INVALID_CAMERA };
+  }
+
+  // Reject reversed depth buffer configurations (root review invariant)
+  if (camera.reversedDepth === true || camera.reversedDepthBuffer === true || camera._reversedDepth === true) {
+    return { admitted: false, reason: ADMISSION_REJECTION.UNSUPPORTED_REVERSED_DEPTH };
   }
 
   // Layer intersection check (root 19:47Z)
@@ -147,9 +200,30 @@ export function canAdmitMesh(mesh, camera) {
     return { admitted: false, reason: ADMISSION_REJECTION.UNSUPPORTED_MATERIAL };
   }
 
-  // Pipeline has no depth buffer; require explicit depthTest=false and depthWrite=false
-  if (material.depthTest === true || material.depthWrite === true) {
-    return { admitted: false, reason: ADMISSION_REJECTION.UNSUPPORTED_DEPTH };
+  // Reject stencil operations
+  if (material.stencilWrite === true) {
+    return { admitted: false, reason: ADMISSION_REJECTION.UNSUPPORTED_STENCIL };
+  }
+
+  // Reject polygon offset
+  if (material.polygonOffset === true) {
+    return { admitted: false, reason: ADMISSION_REJECTION.UNSUPPORTED_POLYGON_OFFSET };
+  }
+
+  // Validate depth function if specified
+  const rawDepthFunc = material.depthFunc;
+  if (rawDepthFunc !== undefined && THREE_DEPTH_FUNC_TO_WIRE_COMPARE[rawDepthFunc] === undefined) {
+    return { admitted: false, reason: ADMISSION_REJECTION.INVALID_DEPTH_FUNC };
+  }
+
+  // Handle depthTest=false and depthWrite=true ambiguity across backends (root review invariant)
+  const depthTest = material.depthTest !== false;
+  const depthWrite = material.depthWrite !== false;
+  if (!depthTest && depthWrite) {
+    const backend = options?.sourceBackend?.toLowerCase();
+    if (backend !== SOURCE_BACKEND.WEBGL && backend !== SOURCE_BACKEND.WEBGPU) {
+      return { admitted: false, reason: ADMISSION_REJECTION.AMBIGUOUS_DEPTH_PAIR };
+    }
   }
 
   // Pipeline has no cull state; require DoubleSide (2) explicitly per 13043 / 13062 point 1
@@ -246,7 +320,7 @@ export function expandIndexedPositions(positions, indices) {
  * @returns {object} Isolated typed-array snapshot
  */
 export function extractMeshRenderData(mesh, camera, width, height, options = {}) {
-  const admission = canAdmitMesh(mesh, camera);
+  const admission = canAdmitMesh(mesh, camera, options);
   if (!admission.admitted) {
     throw new Error(`Mesh admission rejected: ${admission.reason}`);
   }
@@ -355,6 +429,38 @@ export function extractMeshRenderData(mesh, camera, width, height, options = {})
     mat.opacity ?? 1.0,
   ]);
 
+  // Material Depth Settings
+  const depthTest = mat.depthTest !== false;
+  const rawDepthWrite = mat.depthWrite !== false;
+  const rawDepthFunc = mat.depthFunc ?? LessEqualDepth;
+  if (THREE_DEPTH_FUNC_TO_WIRE_COMPARE[rawDepthFunc] === undefined) {
+    throw new Error(`${ADMISSION_REJECTION.INVALID_DEPTH_FUNC}: ${rawDepthFunc}`);
+  }
+
+  // Resolve effective depthWrite:
+  // - Under WebGL backend semantics, gl.disable(gl.DEPTH_TEST) suppresses depth writes in hardware,
+  //   so effective depthWrite is false.
+  // - Under WebGPU backend semantics (r186 WebGPUPipelineUtils.js:224), depthWrite is passed directly
+  //   to depthWriteEnabled even when depthTest is false (compare Always), so effective depthWrite is true.
+  // - Requires options.sourceBackend ('webgl' | 'webgpu') to disambiguate; otherwise refused.
+  // - For depthTest=true, or depthWrite=false, no backend parameter is needed.
+  let depthWrite = rawDepthWrite;
+  if (!depthTest && rawDepthWrite) {
+    const backend = options?.sourceBackend?.toLowerCase();
+    if (backend === SOURCE_BACKEND.WEBGL) {
+      depthWrite = false;
+    } else if (backend === SOURCE_BACKEND.WEBGPU) {
+      depthWrite = true;
+    } else {
+      throw new Error(`Mesh admission rejected: ${ADMISSION_REJECTION.AMBIGUOUS_DEPTH_PAIR}`);
+    }
+  }
+
+  // When depthTest is false, WebGPU pipeline uses GPUCompareFunction.Always (wire 8)
+  const depthCompare = depthTest
+    ? THREE_DEPTH_FUNC_TO_WIRE_COMPARE[rawDepthFunc]
+    : DEPTH_WIRE_COMPARE.ALWAYS;
+
   return Object.freeze({
     positions,
     indices,
@@ -365,6 +471,10 @@ export function extractMeshRenderData(mesh, camera, width, height, options = {})
     width,
     height,
     webglDepth,
+    depthTest,
+    depthWrite,
+    depthFunc: rawDepthFunc,
+    depthCompare,
     vertexCount: positions.length / 3,
     triangleCount,
     isIndexed: indices.length > 0,
@@ -374,34 +484,111 @@ export function extractMeshRenderData(mesh, camera, width, height, options = {})
 
 /**
  * Prepares a binary submission packet targeting a visible canvas presentation.
+ * Automatically selects 11-argument depth export when depth is enabled or available,
+ * preserving legacy 8-argument export when depth is disabled.
  *
  * Invariants:
- * - Requires wasmModule to expose f3d_build_canvas_mesh_packet.
+ * - Requires wasmModule to expose f3d_build_canvas_mesh_depth_packet or f3d_build_canvas_mesh_packet.
  * - Explicitly refuses execution if the visible canvas export is missing;
  *   silent offscreen fallback is strictly forbidden.
+ * - Explicitly refuses execution if mesh requires depth but depth export is missing.
  *
  * @param {any} mesh
  * @param {any} camera
  * @param {number} width
  * @param {number} height
- * @param {object} wasmModule - Loaded Wasm module exposing f3d_build_canvas_mesh_packet
+ * @param {object} wasmModule - Loaded Wasm module
  * @param {object} [options]
  * @returns {{ packetBytes: Uint8Array, snapshot: object, target: 'canvas' }}
  */
 export function prepareCanvasMeshPacket(mesh, camera, width, height, wasmModule, options = {}) {
   const snapshot = extractMeshRenderData(mesh, camera, width, height, options);
 
-  if (!wasmModule || typeof wasmModule.f3d_build_canvas_mesh_packet !== 'function') {
+  const canvasDepthFn =
+    wasmModule?.f3d_build_canvas_mesh_depth_packet ||
+    wasmModule?.gpu_bridge_build_canvas_mesh_depth_packet;
+  const canvasLegacyFn =
+    wasmModule?.f3d_build_canvas_mesh_packet ||
+    wasmModule?.gpu_bridge_build_canvas_mesh_packet;
+
+  if (!wasmModule || (typeof canvasDepthFn !== 'function' && typeof canvasLegacyFn !== 'function')) {
     throw new Error(
       'Visible canvas mesh packet preparation failed: wasmModule is missing f3d_build_canvas_mesh_packet export. ' +
       'Silent offscreen-as-visible fallback is strictly forbidden.'
     );
   }
 
+  const requiresDepth = snapshot.depthTest === true || snapshot.depthWrite === true;
+  if (requiresDepth && typeof canvasDepthFn !== 'function') {
+    throw new Error(
+      'Visible canvas mesh requires depth (depthTest or depthWrite enabled), but wasmModule is missing ' +
+      'f3d_build_canvas_mesh_depth_packet export. Silent offscreen-as-visible fallback or retained renderer masquerading is strictly forbidden.'
+    );
+  }
+
   const positionsToUse = options.expandIndices ? snapshot.expandedPositions : snapshot.positions;
   const indicesToUse = options.expandIndices ? new Uint32Array(0) : snapshot.indices;
 
-  const packetBytes = wasmModule.f3d_build_canvas_mesh_packet(
+  let packetBytes;
+  if (typeof canvasDepthFn === 'function') {
+    packetBytes = canvasDepthFn(
+      positionsToUse,
+      indicesToUse,
+      snapshot.modelView,
+      snapshot.projection,
+      snapshot.color,
+      width,
+      height,
+      snapshot.webglDepth,
+      snapshot.depthTest,
+      snapshot.depthWrite,
+      snapshot.depthCompare,
+    );
+  } else {
+    packetBytes = canvasLegacyFn(
+      positionsToUse,
+      indicesToUse,
+      snapshot.modelView,
+      snapshot.projection,
+      snapshot.color,
+      width,
+      height,
+      snapshot.webglDepth,
+    );
+  }
+
+  return { packetBytes, snapshot, target: 'canvas' };
+}
+
+/**
+ * Prepares a binary submission packet with explicit depth settings targeting a visible canvas presentation.
+ *
+ * @param {any} mesh
+ * @param {any} camera
+ * @param {number} width
+ * @param {number} height
+ * @param {object} wasmModule - Loaded Wasm module exposing f3d_build_canvas_mesh_depth_packet
+ * @param {object} [options]
+ * @returns {{ packetBytes: Uint8Array, snapshot: object, target: 'canvas' }}
+ */
+export function prepareCanvasMeshDepthPacket(mesh, camera, width, height, wasmModule, options = {}) {
+  const snapshot = extractMeshRenderData(mesh, camera, width, height, options);
+
+  const buildFn =
+    wasmModule?.f3d_build_canvas_mesh_depth_packet ||
+    wasmModule?.gpu_bridge_build_canvas_mesh_depth_packet;
+
+  if (typeof buildFn !== 'function') {
+    throw new Error(
+      'Visible canvas mesh depth packet preparation failed: wasmModule is missing f3d_build_canvas_mesh_depth_packet / gpu_bridge_build_canvas_mesh_depth_packet export. ' +
+      'Silent offscreen-as-visible fallback or retained renderer masquerading is strictly forbidden.'
+    );
+  }
+
+  const positionsToUse = options.expandIndices ? snapshot.expandedPositions : snapshot.positions;
+  const indicesToUse = options.expandIndices ? new Uint32Array(0) : snapshot.indices;
+
+  const packetBytes = buildFn(
     positionsToUse,
     indicesToUse,
     snapshot.modelView,
@@ -410,6 +597,9 @@ export function prepareCanvasMeshPacket(mesh, camera, width, height, wasmModule,
     width,
     height,
     snapshot.webglDepth,
+    snapshot.depthTest,
+    snapshot.depthWrite,
+    snapshot.depthCompare,
   );
 
   return { packetBytes, snapshot, target: 'canvas' };
@@ -418,12 +608,18 @@ export function prepareCanvasMeshPacket(mesh, camera, width, height, wasmModule,
 /**
  * Prepares a binary GpuSubmissionPacket from real Three.js Mesh inputs via dynamic Wasm export.
  * Defaults to offscreen rendering unless options.target === 'canvas'.
+ * Automatically selects 11-argument depth export when depth is enabled or available,
+ * preserving legacy 8-argument export when depth is disabled.
+ *
+ * Invariants:
+ * - Requires wasmModule to expose f3d_build_mesh_depth_packet or f3d_build_mesh_packet.
+ * - Explicitly refuses execution if mesh requires depth but depth export is missing.
  *
  * @param {any} mesh
  * @param {any} camera
  * @param {number} width
  * @param {number} height
- * @param {object} wasmModule - Loaded Wasm module exposing f3d_build_mesh_packet
+ * @param {object} wasmModule - Loaded Wasm module
  * @param {object} [options]
  * @returns {{ packetBytes: Uint8Array, snapshot: object, target: 'offscreen' | 'canvas' }}
  */
@@ -434,16 +630,88 @@ export function prepareMeshPacket(mesh, camera, width, height, wasmModule, optio
 
   const snapshot = extractMeshRenderData(mesh, camera, width, height, options);
 
-  if (!wasmModule || typeof wasmModule.f3d_build_mesh_packet !== 'function') {
+  const depthFn =
+    wasmModule?.f3d_build_mesh_depth_packet ||
+    wasmModule?.gpu_bridge_build_mesh_depth_packet;
+  const legacyFn =
+    wasmModule?.f3d_build_mesh_packet ||
+    wasmModule?.gpu_bridge_build_mesh_packet;
+
+  if (!wasmModule || (typeof depthFn !== 'function' && typeof legacyFn !== 'function')) {
     throw new Error('Invalid wasmModule: must expose f3d_build_mesh_packet export');
+  }
+
+  const requiresDepth = snapshot.depthTest === true || snapshot.depthWrite === true;
+  if (requiresDepth && typeof depthFn !== 'function') {
+    throw new Error(
+      'Mesh requires depth (depthTest or depthWrite enabled), but wasmModule is missing ' +
+      'f3d_build_mesh_depth_packet export. Silent no-depth fallback or retained renderer masquerading is strictly forbidden.'
+    );
   }
 
   const positionsToUse = options.expandIndices ? snapshot.expandedPositions : snapshot.positions;
   const indicesToUse = options.expandIndices ? new Uint32Array(0) : snapshot.indices;
 
-  // CobaltOrchid signature (8 arguments, confirmed by NavyAspen 13068):
-  // f3d_build_mesh_packet(positions, indices, model_view, projection, color, width, height, webgl_depth)
-  const packetBytes = wasmModule.f3d_build_mesh_packet(
+  let packetBytes;
+  if (typeof depthFn === 'function') {
+    packetBytes = depthFn(
+      positionsToUse,
+      indicesToUse,
+      snapshot.modelView,
+      snapshot.projection,
+      snapshot.color,
+      width,
+      height,
+      snapshot.webglDepth,
+      snapshot.depthTest,
+      snapshot.depthWrite,
+      snapshot.depthCompare,
+    );
+  } else {
+    packetBytes = legacyFn(
+      positionsToUse,
+      indicesToUse,
+      snapshot.modelView,
+      snapshot.projection,
+      snapshot.color,
+      width,
+      height,
+      snapshot.webglDepth,
+    );
+  }
+
+  return { packetBytes, snapshot, target: 'offscreen' };
+}
+
+/**
+ * Prepares a binary GpuSubmissionPacket with explicit depth settings via dynamic Wasm export.
+ *
+ * @param {any} mesh
+ * @param {any} camera
+ * @param {number} width
+ * @param {number} height
+ * @param {object} wasmModule - Loaded Wasm module exposing f3d_build_mesh_depth_packet
+ * @param {object} [options]
+ * @returns {{ packetBytes: Uint8Array, snapshot: object, target: 'offscreen' }}
+ */
+export function prepareMeshDepthPacket(mesh, camera, width, height, wasmModule, options = {}) {
+  const snapshot = extractMeshRenderData(mesh, camera, width, height, options);
+
+  const buildFn =
+    wasmModule?.f3d_build_mesh_depth_packet ||
+    wasmModule?.gpu_bridge_build_mesh_depth_packet;
+
+  if (typeof buildFn !== 'function') {
+    throw new Error(
+      'Mesh depth packet preparation failed: wasmModule is missing f3d_build_mesh_depth_packet / gpu_bridge_build_mesh_depth_packet export. ' +
+      'Silent no-depth fallback or retained renderer masquerading is strictly forbidden.'
+    );
+  }
+
+  const positionsToUse = options.expandIndices ? snapshot.expandedPositions : snapshot.positions;
+  const indicesToUse = options.expandIndices ? new Uint32Array(0) : snapshot.indices;
+
+  const packetBytes = buildFn(
     positionsToUse,
     indicesToUse,
     snapshot.modelView,
@@ -452,6 +720,9 @@ export function prepareMeshPacket(mesh, camera, width, height, wasmModule, optio
     width,
     height,
     snapshot.webglDepth,
+    snapshot.depthTest,
+    snapshot.depthWrite,
+    snapshot.depthCompare,
   );
 
   return { packetBytes, snapshot, target: 'offscreen' };
@@ -461,8 +732,8 @@ export function prepareMeshPacket(mesh, camera, width, height, wasmModule, optio
  * Explicit bridge execution entry: prepares and executes a Mesh render through WebGpuBridgeHost.
  *
  * Invariants:
- * - If canvasContext is provided, routes through wasmModule.f3d_build_canvas_mesh_packet.
- *   If wasmModule lacks f3d_build_canvas_mesh_packet, EXPLICITLY REFUSES canvasContext;
+ * - If canvasContext is provided, routes through wasmModule.f3d_build_canvas_mesh_packet or f3d_build_canvas_mesh_depth_packet.
+ *   If wasmModule lacks canvas exports, EXPLICITLY REFUSES canvasContext;
  *   silent offscreen rendering as visible is strictly forbidden.
  * - If canvasContext is null/undefined, executes an honest offscreen render pass.
  *
@@ -482,7 +753,13 @@ export async function renderMesh(bridgeHost, mesh, camera, canvasContext, wasmMo
   const isCanvasTarget = canvasContext !== null && canvasContext !== undefined;
 
   if (isCanvasTarget) {
-    if (!wasmModule || typeof wasmModule.f3d_build_canvas_mesh_packet !== 'function') {
+    const hasCanvasExport = wasmModule && (
+      typeof wasmModule.f3d_build_canvas_mesh_packet === 'function' ||
+      typeof wasmModule.f3d_build_canvas_mesh_depth_packet === 'function' ||
+      typeof wasmModule.gpu_bridge_build_canvas_mesh_packet === 'function' ||
+      typeof wasmModule.gpu_bridge_build_canvas_mesh_depth_packet === 'function'
+    );
+    if (!hasCanvasExport) {
       throw new Error(
         'renderMesh refused: canvasContext provided for visible canvas rendering, but wasmModule ' +
         'does not export f3d_build_canvas_mesh_packet. Silent offscreen-as-visible rendering is strictly forbidden.'
