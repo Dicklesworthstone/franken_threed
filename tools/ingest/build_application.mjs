@@ -32,7 +32,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { bundleWithRollup } from './bundler.mjs';
-import { parseTagAttributes, stripHtmlComments, stripScriptAndStyleBodies } from './html_parser.mjs';
+import { parseTagAttributes, parseSrcsetUrls, stripHtmlComments, stripScriptAndStyleBodies } from './html_parser.mjs';
 
 /**
  * Recomputes Subresource Integrity (SRI) string for modified or bundled content,
@@ -89,6 +89,8 @@ export function isRelativeUrl(url) {
 
 /**
  * Looks up whether a modulepreload raw href corresponds to an emitted chunk in preloadChunkMap.
+ * Uses exact canonical URL resolution (preserving ?query and #fragment as distinct ES module identities)
+ * against the referrer directory URL, without stripping query or fragment.
  *
  * @param {string} rawHref
  * @param {string} referrerDir
@@ -97,24 +99,31 @@ export function isRelativeUrl(url) {
  */
 export function findChunkForPreload(rawHref, referrerDir, preloadChunkMap) {
   if (!rawHref || typeof rawHref !== 'string' || !preloadChunkMap) return null;
-  const cleanHref = rawHref.split(/[?#]/)[0].trim();
-  if (!cleanHref) return null;
+  const trimmed = rawHref.trim();
+  if (!trimmed) return null;
 
-  if (preloadChunkMap.has(cleanHref)) {
-    return preloadChunkMap.get(cleanHref);
-  }
+  // 1. Canonical URL resolution against referrer directory URL (preserving ?query and #fragment)
   if (referrerDir) {
-    const resolvedAbs = path.resolve(referrerDir, cleanHref);
-    if (preloadChunkMap.has(resolvedAbs)) {
-      return preloadChunkMap.get(resolvedAbs);
-    }
-    const fileUrl = pathToFileURL(resolvedAbs).href;
-    if (preloadChunkMap.has(fileUrl)) {
-      return preloadChunkMap.get(fileUrl);
+    try {
+      const referrerDirSlash = referrerDir.endsWith(path.sep) ? referrerDir : referrerDir + path.sep;
+      const baseUrl = pathToFileURL(referrerDirSlash);
+      const canonicalUrl = new URL(trimmed, baseUrl).href;
+      if (preloadChunkMap.has(canonicalUrl)) {
+        return preloadChunkMap.get(canonicalUrl);
+      }
+    } catch {
+      // Ignore invalid URL resolution
     }
   }
+
+  // 2. Direct match fallback (for pre-canonicalized URLs or virtual IDs)
+  if (preloadChunkMap.has(trimmed)) {
+    return preloadChunkMap.get(trimmed);
+  }
+
   return null;
 }
+
 
 /**
  * Scans HTML content for relative asset references in attributes (e.g. stylesheets,
@@ -157,6 +166,14 @@ export function extractRelativeAssetUrls(rawHtmlContent, preloadChunkMap = null,
     if (attrs.src && isRelativeUrl(attrs.src)) {
       assets.add(attrs.src);
     }
+    if (attrs.srcset) {
+      const srcsetUrls = parseSrcsetUrls(attrs.srcset);
+      for (const u of srcsetUrls) {
+        if (isRelativeUrl(u)) {
+          assets.add(u);
+        }
+      }
+    }
   }
 
   // 3. <script ...> where type != 'module' quote-aware
@@ -176,6 +193,17 @@ export function extractRelativeAssetUrls(rawHtmlContent, preloadChunkMap = null,
     if (attrs.src && isRelativeUrl(attrs.src)) {
       assets.add(attrs.src);
     }
+    if (attrs.poster && isRelativeUrl(attrs.poster)) {
+      assets.add(attrs.poster);
+    }
+    if (attrs.srcset) {
+      const srcsetUrls = parseSrcsetUrls(attrs.srcset);
+      for (const u of srcsetUrls) {
+        if (isRelativeUrl(u)) {
+          assets.add(u);
+        }
+      }
+    }
   }
 
   return Array.from(assets);
@@ -191,31 +219,50 @@ export function stripCssComments(css) {
 }
 
 /**
+ * Contextual scanner regex for CSS resources.
+ * Disambiguates comments, @import rules, url(...) functional notations, and string literals,
+ * so that url(...) inside quoted strings (e.g. content: "url(phantom.png)") or inside comments
+ * is never extracted as a resource dependency.
+ */
+export const CSS_RESOURCE_REGEX =
+  /(\/\*[\s\S]*?\*\/)|(@import\s+(?:url\(\s*)?(?:"([^"\\]*(?:\\.[^"\\]*)*)"|'([^'\\]*(?:\\.[^'\\]*)*)'|([^\s();]+))\s*\)?)|(\burl\(\s*(?:"([^"\\]*(?:\\.[^"\\]*)*)"|'([^'\\]*(?:\\.[^'\\]*)*)'|([^'")\s]+))\s*\))|("(?:[^"\\]|\\.)*")|('(?:[^'\\]|\\.)*')/gi;
+
+/**
  * Extracts relative resource URLs (url(...) and @import) from CSS content.
+ * Skips url(...) occurrences inside single- or double-quoted CSS strings and comments.
  *
  * @param {string} cssContent
  * @returns {string[]} Deduplicated list of relative URLs
  */
 export function extractRelativeCssUrls(cssContent) {
-  const sanitized = stripCssComments(cssContent);
+  if (!cssContent || typeof cssContent !== 'string') return [];
   const urls = new Set();
-
-  // 1. Match @import 'path' or @import url('path')
-  const importRegex = /@import\s+(?:url\(\s*)?(?:"([^"]+)"|'([^']+)'|([^\s();]+))\s*\)?/gi;
+  const regex = new RegExp(CSS_RESOURCE_REGEX.source, 'gi');
   let match;
-  while ((match = importRegex.exec(sanitized)) !== null) {
-    const rawUrl = match[1] !== undefined ? match[1] : (match[2] !== undefined ? match[2] : match[3]);
-    if (rawUrl && isRelativeUrl(rawUrl)) {
-      urls.add(rawUrl);
-    }
-  }
 
-  // 2. Match url(...) functional notation
-  const urlRegex = /\burl\(\s*(?:"([^"]+)"|'([^']+)'|([^\s)'"]+))\s*\)/gi;
-  while ((match = urlRegex.exec(sanitized)) !== null) {
-    const rawUrl = match[1] !== undefined ? match[1] : (match[2] !== undefined ? match[2] : match[3]);
-    if (rawUrl && isRelativeUrl(rawUrl)) {
-      urls.add(rawUrl);
+  while ((match = regex.exec(cssContent)) !== null) {
+    // match[1]: comment -> ignore
+    // match[10]: double-quoted string -> ignore
+    // match[11]: single-quoted string -> ignore
+    if (match[1] || match[10] || match[11]) {
+      continue;
+    }
+
+    // match[2]: @import statement
+    if (match[2]) {
+      const rawUrl = match[3] !== undefined ? match[3] : (match[4] !== undefined ? match[4] : match[5]);
+      if (rawUrl && isRelativeUrl(rawUrl)) {
+        urls.add(rawUrl);
+      }
+      continue;
+    }
+
+    // match[6]: url(...) function
+    if (match[6]) {
+      const rawUrl = match[7] !== undefined ? match[7] : (match[8] !== undefined ? match[8] : match[9]);
+      if (rawUrl && isRelativeUrl(rawUrl)) {
+        urls.add(rawUrl);
+      }
     }
   }
 
@@ -518,30 +565,16 @@ export async function buildApplication(entryPath, outDir, options = {}) {
 
   // If HTML entry point: process HTML, rewrite module script tags, and enforce bounded asset closure
   if (isHtml) {
-    // Build map of module paths/URLs to emitted chunk file names for modulepreload rewrites
+    // Build map of canonical module URLs to emitted chunk file names for modulepreload rewrites
     const preloadChunkMap = new Map();
     for (const chunk of bundleResult.chunks) {
       if (chunk.facadeModuleId) {
         preloadChunkMap.set(chunk.facadeModuleId, chunk.fileName);
-        if (chunk.facadeModuleId.startsWith('file://')) {
-          const filePath = fileURLToPath(chunk.facadeModuleId);
-          preloadChunkMap.set(filePath, chunk.fileName);
-          const relPath = path.relative(entryDir, filePath);
-          preloadChunkMap.set(relPath, chunk.fileName);
-          preloadChunkMap.set('./' + relPath, chunk.fileName);
-        }
       }
       if (chunk.modules) {
         const modIds = Array.isArray(chunk.modules) ? chunk.modules : Object.keys(chunk.modules);
         for (const modId of modIds) {
           preloadChunkMap.set(modId, chunk.fileName);
-          if (modId.startsWith('file://')) {
-            const filePath = fileURLToPath(modId);
-            preloadChunkMap.set(filePath, chunk.fileName);
-            const relPath = path.relative(entryDir, filePath);
-            preloadChunkMap.set(relPath, chunk.fileName);
-            preloadChunkMap.set('./' + relPath, chunk.fileName);
-          }
         }
       }
     }
@@ -573,10 +606,17 @@ export async function buildApplication(entryPath, outDir, options = {}) {
 
     while (assetQueue.length > 0) {
       const { relUrl, referrerDir, referrerPath } = assetQueue.shift();
-      const cleanRelPath = relUrl.split(/[?#]/)[0];
-      if (!cleanRelPath) continue;
+      if (!relUrl || typeof relUrl !== 'string') continue;
+      const trimmedRelUrl = relUrl.trim();
+      if (!trimmedRelUrl) continue;
 
-      const srcAssetAbs = path.resolve(referrerDir, cleanRelPath);
+      // Browser URI semantics: resolve against referrer directory URL using new URL,
+      // then convert file: URL object directly to decoded filesystem path via fileURLToPath.
+      // Preserves %20 and other percent-encodings as actual filename bytes on disk.
+      const referrerDirSlash = referrerDir.endsWith(path.sep) ? referrerDir : referrerDir + path.sep;
+      const referrerBaseUrl = pathToFileURL(referrerDirSlash);
+      const resolvedUrl = new URL(trimmedRelUrl, referrerBaseUrl);
+      const srcAssetAbs = fileURLToPath(resolvedUrl);
 
       // Verify that relative asset path does not escape entry directory
       const relFromEntryDir = path.relative(entryDir, srcAssetAbs);

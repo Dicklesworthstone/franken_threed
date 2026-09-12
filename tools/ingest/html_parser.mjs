@@ -222,3 +222,182 @@ export function parseHtmlEntries(rawHtmlContent, documentUrl) {
 
   return { importMap, moduleScripts, preloads, baseUrl: effectiveBaseUrl, baseHref };
 }
+
+/**
+ * Checks if a character is an ASCII whitespace character per WHATWG HTML spec:
+ * U+0009 TAB, U+000A LF, U+000C FF, U+000D CR, U+0020 SPACE.
+ * (Note: non-breaking space U+00A0 is NOT ASCII whitespace).
+ *
+ * @param {string} ch
+ * @returns {boolean}
+ */
+function isAsciiWhitespace(ch) {
+  return ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' || ch === '\f';
+}
+
+/**
+ * Parses a `srcset` attribute value into an array of candidate image URLs,
+ * adhering strictly to the WHATWG HTML specification (Section 4.8.4.3.8 "Parse a srcset attribute"):
+ * - Collects candidate URLs by advancing until ASCII whitespace (preserving internal commas
+ *   in filenames, query params, and data: URLs without any ad-hoc special cases).
+ * - Strips trailing commas from the URL token if present; if stripped, candidate has no descriptors.
+ * - Parses and validates descriptors (w, x, h) and skips invalid candidates so browser-ignored
+ *   candidates do not trigger phantom missing-file failures.
+ * - Extracts candidate URLs in document order without modifying the original attribute string.
+ *
+ * @param {string} srcsetString - Raw value of the srcset attribute
+ * @returns {string[]} Candidate image URLs extracted in document order
+ */
+export function parseSrcsetUrls(srcsetString) {
+  if (!srcsetString || typeof srcsetString !== 'string') {
+    return [];
+  }
+
+  const urls = [];
+  const input = srcsetString;
+  const len = input.length;
+  let pos = 0;
+
+  while (pos < len) {
+    // 1. Skip leading ASCII whitespace and commas
+    while (pos < len && (isAsciiWhitespace(input[pos]) || input[pos] === ',')) {
+      pos++;
+    }
+    if (pos >= len) break;
+
+    // 2. Collect sequence of characters that are NOT ASCII whitespace
+    const urlStart = pos;
+    while (pos < len && !isAsciiWhitespace(input[pos])) {
+      pos++;
+    }
+    let url = input.slice(urlStart, pos);
+
+    let error = false;
+    const descriptors = [];
+
+    // 3. If url ends with U+002C COMMA (,), strip all trailing commas
+    if (url.endsWith(',')) {
+      let end = url.length;
+      while (end > 0 && url[end - 1] === ',') {
+        end--;
+      }
+      url = url.slice(0, end);
+      // Trailing comma indicates candidate separator without descriptors
+    } else {
+      // 4. Descriptor tokenizer: tokenize descriptors separated by ASCII whitespace
+      // until a comma outside parentheses (or EOF) is encountered
+      let currentDescriptor = '';
+      let state = 'in_descriptor';
+
+      while (pos < len) {
+        const c = input[pos];
+        if (state === 'in_descriptor') {
+          if (isAsciiWhitespace(c)) {
+            if (currentDescriptor.length > 0) {
+              descriptors.push(currentDescriptor);
+              currentDescriptor = '';
+            }
+            state = 'after_descriptor';
+          } else if (c === ',') {
+            pos++; // consume candidate separator comma
+            if (currentDescriptor.length > 0) {
+              descriptors.push(currentDescriptor);
+              currentDescriptor = '';
+            }
+            break;
+          } else if (c === '(') {
+            currentDescriptor += c;
+            state = 'in_parens';
+          } else {
+            currentDescriptor += c;
+          }
+        } else if (state === 'in_parens') {
+          if (c === ')') {
+            currentDescriptor += c;
+            state = 'in_descriptor';
+          } else {
+            currentDescriptor += c;
+          }
+        } else if (state === 'after_descriptor') {
+          if (isAsciiWhitespace(c)) {
+            // stay in after_descriptor
+          } else if (c === ',') {
+            pos++; // consume candidate separator comma
+            break;
+          } else {
+            state = 'in_descriptor';
+            currentDescriptor += c;
+          }
+        }
+        pos++;
+      }
+
+      if (currentDescriptor.length > 0) {
+        descriptors.push(currentDescriptor);
+      }
+
+      // 5. Descriptor parser / validator per WHATWG
+      let width = null;
+      let density = null;
+      let height = null;
+
+      for (const desc of descriptors) {
+        // Valid non-negative integer followed by 'w'
+        if (/^[0-9]+w$/i.test(desc)) {
+          if (width !== null || density !== null) {
+            error = true;
+            break;
+          }
+          const wVal = parseInt(desc.slice(0, -1), 10);
+          if (wVal === 0 || !Number.isSafeInteger(wVal)) {
+            error = true;
+            break;
+          }
+          width = wVal;
+        }
+        // Valid floating-point number followed by 'x' (density >= 0)
+        else if (/^(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?x$/i.test(desc)) {
+          if (width !== null || density !== null || height !== null) {
+            error = true;
+            break;
+          }
+          const dVal = parseFloat(desc.slice(0, -1));
+          if (isNaN(dVal) || dVal < 0) {
+            error = true;
+            break;
+          }
+          density = dVal;
+        }
+        // Valid non-negative integer followed by 'h'
+        else if (/^[0-9]+h$/i.test(desc)) {
+          if (height !== null || density !== null) {
+            error = true;
+            break;
+          }
+          const hVal = parseInt(desc.slice(0, -1), 10);
+          if (hVal === 0 || !Number.isSafeInteger(hVal)) {
+            error = true;
+            break;
+          }
+          height = hVal;
+        } else {
+          // Unknown or malformed descriptor
+          error = true;
+          break;
+        }
+      }
+
+      // If future-compat-h is present, width must also be present
+      if (height !== null && width === null) {
+        error = true;
+      }
+    }
+
+    // Only append valid candidate if no parse error and URL is non-empty
+    if (!error && url.length > 0) {
+      urls.push(url);
+    }
+  }
+
+  return urls;
+}

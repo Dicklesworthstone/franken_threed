@@ -12,7 +12,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { buildModuleGraph } from './module_graph.mjs';
-import { parseHtmlEntries } from './html_parser.mjs';
+import { parseHtmlEntries, parseSrcsetUrls } from './html_parser.mjs';
 import { bundleWithRollup } from './bundler.mjs';
 import { IngestionResolutionError } from './types.mjs';
 
@@ -1115,5 +1115,138 @@ export async function loadSrc() {
   assert.ok(reDyn.error.includes('subpath "./src/math/Vector3.js" is not exported by package.json'));
 });
 
+test('parseSrcsetUrls extracts image candidate URLs per browser/WHATWG srcset semantics', () => {
+  // 1. Basic comma-separated candidates with pixel density descriptors
+  assert.deepEqual(
+    parseSrcsetUrls('small.png 1x, large.png 2x'),
+    ['small.png', 'large.png'],
+    'Must extract URLs with pixel density descriptors'
+  );
 
+  // 2. URLs with internal commas followed by descriptors (WHATWG: non-whitespace token)
+  assert.deepEqual(
+    parseSrcsetUrls('a,b.png 1x, c.png 2x'),
+    ['a,b.png', 'c.png'],
+    'Must parse a,b.png as a single candidate URL when followed by descriptor'
+  );
 
+  // 3. String without whitespace is a single candidate URL (not split at comma)
+  assert.deepEqual(
+    parseSrcsetUrls('a.png,b.png'),
+    ['a.png,b.png'],
+    'Candidate without whitespace must be treated as a single URL token'
+  );
+
+  // 4. Width descriptors and fractional density descriptors
+  assert.deepEqual(
+    parseSrcsetUrls('hero-400.jpg 400w, hero-800.jpg 800w, hero-1200.jpg 1.5x'),
+    ['hero-400.jpg', 'hero-800.jpg', 'hero-1200.jpg'],
+    'Must handle width descriptors and fractional density'
+  );
+
+  // 5. Candidates without descriptors (trailing commas stripped)
+  assert.deepEqual(
+    parseSrcsetUrls('img1.png, img2.png 2x, img3.png'),
+    ['img1.png', 'img2.png', 'img3.png'],
+    'Must handle mixed candidates with and without descriptors'
+  );
+
+  // 6. Irregular whitespace, newlines, tabs, and redundant commas
+  assert.deepEqual(
+    parseSrcsetUrls('\n  a.png\t100w ,\n\t b.png\t200w  ,\n  '),
+    ['a.png', 'b.png'],
+    'Must handle newlines, tabs, and trailing commas'
+  );
+
+  assert.deepEqual(
+    parseSrcsetUrls('a.png\t1x,\n\tc.png\t2x'),
+    ['a.png', 'c.png'],
+    'Must handle tab and newline separators between candidates'
+  );
+
+  // 7. Data URLs containing commas in header and payload (no data: special case needed)
+  assert.deepEqual(
+    parseSrcsetUrls('data:image/png;base64,iVBORw0KGgo= 1x, large.png 2x'),
+    ['data:image/png;base64,iVBORw0KGgo=', 'large.png'],
+    'Must preserve commas inside data: URLs with descriptors'
+  );
+
+  assert.deepEqual(
+    parseSrcsetUrls('data:image/svg+xml;utf8,<svg>,content</svg> 1x, fallback.png 2x'),
+    ['data:image/svg+xml;utf8,<svg>,content</svg>', 'fallback.png'],
+    'Must preserve commas inside SVG data URL payload'
+  );
+
+  assert.deepEqual(
+    parseSrcsetUrls('data:image/png;base64,abc, fallback.png 2x'),
+    ['data:image/png;base64,abc', 'fallback.png'],
+    'Must preserve data URL without descriptor when followed by next candidate'
+  );
+
+  // 8. Descriptor validation: skip invalid candidates per WHATWG spec
+  assert.deepEqual(
+    parseSrcsetUrls('bad.png 2foo, good.png 1x'),
+    ['good.png'],
+    'Must skip candidate with unknown descriptor unit (2foo)'
+  );
+
+  assert.deepEqual(
+    parseSrcsetUrls('zero.png 0w, good.png 1x'),
+    ['good.png'],
+    'Must skip candidate with zero width (0w)'
+  );
+
+  assert.deepEqual(
+    parseSrcsetUrls('dup.png 1x 2x, good.png 1x'),
+    ['good.png'],
+    'Must skip candidate with duplicate density descriptors (1x 2x)'
+  );
+
+  assert.deepEqual(
+    parseSrcsetUrls('mixed.png 100w 2x, good.png 1x'),
+    ['good.png'],
+    'Must skip candidate with mixed width and density descriptors (100w 2x)'
+  );
+
+  assert.deepEqual(
+    parseSrcsetUrls('honly.png 100h, good.png 1x'),
+    ['good.png'],
+    'Must skip candidate with height descriptor but missing width descriptor (100h)'
+  );
+
+  assert.deepEqual(
+    parseSrcsetUrls('both.png 100w 200h, good.png 1x'),
+    ['both.png', 'good.png'],
+    'Must accept candidate with valid width and height descriptors (100w 200h)'
+  );
+
+  // 9. Non-ASCII whitespace (U+00A0 non-breaking space) is not treated as ASCII whitespace
+  assert.deepEqual(
+    parseSrcsetUrls('a\u00A0b.png 1x, c.png 2x'),
+    ['a\u00A0b.png', 'c.png'],
+    'Must not treat U+00A0 as ASCII whitespace'
+  );
+
+  // 10. URL query parameters and fragments
+  assert.deepEqual(
+    parseSrcsetUrls('pic.jpg?w=100&h=100#thumb 100w, pic.jpg?w=200&h=200#full 200w'),
+    ['pic.jpg?w=100&h=100#thumb', 'pic.jpg?w=200&h=200#full'],
+    'Must preserve URL query parameters and fragments in srcset candidates'
+  );
+
+  assert.deepEqual(
+    parseSrcsetUrls('image.jpg?foo=1,2,3 1x, other.jpg 2x'),
+    ['image.jpg?foo=1,2,3', 'other.jpg'],
+    'Must preserve query parameters containing commas'
+  );
+
+  // 11. Single URL with no descriptors
+  assert.deepEqual(parseSrcsetUrls('single.png'), ['single.png']);
+
+  // 12. Empty, whitespace-only, and non-string inputs
+  assert.deepEqual(parseSrcsetUrls(''), []);
+  assert.deepEqual(parseSrcsetUrls('   '), []);
+  assert.deepEqual(parseSrcsetUrls(',  , ,'), []);
+  assert.deepEqual(parseSrcsetUrls(null), []);
+  assert.deepEqual(parseSrcsetUrls(undefined), []);
+});

@@ -28,7 +28,9 @@ import {
   rewriteLinkTagAttributes,
   computeIntegrityForContent,
   isRelativeUrl,
-  extractRelativeAssetUrls
+  extractRelativeAssetUrls,
+  extractRelativeCssUrls,
+  findChunkForPreload
 } from './build_application.mjs';
 import { parseHtmlEntries, stripScriptAndStyleBodies, stripHtmlComments } from './html_parser.mjs';
 
@@ -567,6 +569,132 @@ test('CLI --build-app flag emits runnable application to fresh destination', asy
   }, 'CLI must exit with non-zero error when target directory collides with existing files');
 });
 
+test('CLI preflight rejects destination collisions, existing destinations, symlinks, missing flag values, and unknown options', () => {
+  const scratch = makeScratch('f3d_cli_preflight');
+  const cliPath = path.resolve('tools/ingest/cli.mjs');
+  const entryFile = path.join(scratch, 'app.html');
+  fs.writeFileSync(entryFile, '<!DOCTYPE html><html><head><script type="module" src="./main.js"></script></head><body></body></html>');
+  fs.writeFileSync(path.join(scratch, 'main.js'), 'export const x = 1;\n');
+
+  const existingDest = path.join(scratch, 'existing_manifest.json');
+  fs.writeFileSync(existingDest, '{"pre_existing": true}\n');
+
+  const symlinkDest = path.join(scratch, 'symlink_manifest.json');
+  try {
+    fs.symlinkSync(existingDest, symlinkDest);
+  } catch (_) {
+    // Windows fallback if symlinks not permitted without elevation
+  }
+
+  // 1. Output path collides with input entry file
+  assert.throws(
+    () => {
+      execFileSync(
+        process.execPath,
+        [cliPath, '--entry', entryFile, '--output', entryFile],
+        { stdio: 'pipe' }
+      );
+    },
+    (err) => String(err?.stderr || err?.message || '').includes('collides with the input entry file'),
+    'CLI must reject --output colliding with input entry file'
+  );
+
+  // 2. Output path collides with generated application file (e.g. out/app.html)
+  const distDir = path.join(scratch, 'dist');
+  const collidesWithGenerated = path.join(distDir, 'app.html');
+  assert.throws(
+    () => {
+      execFileSync(
+        process.execPath,
+        [cliPath, '--entry', entryFile, '--build-app', distDir, '--output', collidesWithGenerated],
+        { stdio: 'pipe' }
+      );
+    },
+    (err) => String(err?.stderr || err?.message || '').includes('collides with generated application file'),
+    'CLI must reject --output colliding with generated application file'
+  );
+
+  // 3. Output path collides with build directory itself
+  assert.throws(
+    () => {
+      execFileSync(
+        process.execPath,
+        [cliPath, '--entry', entryFile, '--build-app', distDir, '--output', distDir],
+        { stdio: 'pipe' }
+      );
+    },
+    (err) => String(err?.stderr || err?.message || '').includes('collides with the application build directory'),
+    'CLI must reject --output colliding with build directory'
+  );
+
+  // 4. Output destination already exists
+  assert.throws(
+    () => {
+      execFileSync(
+        process.execPath,
+        [cliPath, '--entry', entryFile, '--output', existingDest],
+        { stdio: 'pipe' }
+      );
+    },
+    (err) => String(err?.stderr || err?.message || '').includes('already exists'),
+    'CLI must reject existing --output destination file'
+  );
+
+  // 5. Output destination is a symlink (if created)
+  if (fs.existsSync(symlinkDest)) {
+    assert.throws(
+      () => {
+        execFileSync(
+          process.execPath,
+          [cliPath, '--entry', entryFile, '--output', symlinkDest],
+          { stdio: 'pipe' }
+        );
+      },
+      (err) => String(err?.stderr || err?.message || '').includes('is a symlink'),
+      'CLI must reject symlink --output destination'
+    );
+  }
+
+  // 6. Missing --build-app option value
+  assert.throws(
+    () => {
+      execFileSync(
+        process.execPath,
+        [cliPath, '--entry', entryFile, '--build-app'],
+        { stdio: 'pipe' }
+      );
+    },
+    (err) => String(err?.stderr || err?.message || '').includes('--build-app requires a directory path argument'),
+    'CLI must reject --build-app missing value'
+  );
+
+  // 7. Missing --build-app option value when followed by another flag
+  assert.throws(
+    () => {
+      execFileSync(
+        process.execPath,
+        [cliPath, '--entry', entryFile, '--build-app', '--output', path.join(scratch, 'out.json')],
+        { stdio: 'pipe' }
+      );
+    },
+    (err) => String(err?.stderr || err?.message || '').includes('--build-app requires a directory path argument'),
+    'CLI must reject --build-app followed immediately by another flag'
+  );
+
+  // 8. Unknown option flag
+  assert.throws(
+    () => {
+      execFileSync(
+        process.execPath,
+        [cliPath, '--entry', entryFile, '--unknown-flag'],
+        { stdio: 'pipe' }
+      );
+    },
+    (err) => String(err?.stderr || err?.message || '').includes('Unknown or invalid argument'),
+    'CLI must reject unknown command-line flags'
+  );
+});
+
 test('rewriteHtmlForBuild and attribute scanners preserve attributes containing ">" without tag truncation', () => {
   const dummyCode = 'console.log("quote-test");\n';
   const htmlWithGt = `<!DOCTYPE html>
@@ -1061,4 +1189,285 @@ test('contextual scanner handles interleaved comments, styles, and scripts with 
   assert.ok(rewritten.includes('<!-- initial comment -->'));
   assert.ok(rewritten.includes('<!-- mid comment -->'));
   assert.ok(rewritten.includes('<!-- final comment -->'));
+});
+
+test('findChunkForPreload resolves exact canonical URLs with query variants without stripping (OrangePelican repro)', () => {
+  const map = new Map([
+    ['./same.js', 'a.js'],
+    ['file:///tmp/app/same.js?b', 'b.js']
+  ]);
+
+  // Root repro: query variant must resolve to b.js, not wrongly fall back or strip to a.js
+  const resultVariant = findChunkForPreload('./same.js?b', '/tmp/app', map);
+  assert.equal(resultVariant, 'b.js', 'Query variant must match its specific chunk b.js');
+
+  // Base entry must still resolve to a.js
+  const resultBase = findChunkForPreload('./same.js', '/tmp/app', map);
+  assert.equal(resultBase, 'a.js', 'Base entry must match a.js');
+
+  // Unknown query variant must return null
+  const resultUnknown = findChunkForPreload('./same.js?c', '/tmp/app', map);
+  assert.equal(resultUnknown, null, 'Unmatched query variant must return null');
+});
+
+test('buildApplication handles distinct query module entries with matching preloads and verifies emitted hrefs', async () => {
+  const scratch = makeScratch('f3d_app_query_preloads');
+  const outDir = path.join(scratch, 'dist');
+
+  fs.writeFileSync(
+    path.join(scratch, 'shared_mod.js'),
+    `export const shared = 'common';\n`
+  );
+
+  const html = `<!DOCTYPE html>
+<html>
+<head>
+  <link rel="modulepreload" href="./shared_mod.js">
+  <link rel="modulepreload" href="./shared_mod.js?variant=special">
+  <script type="module" src="./shared_mod.js"></script>
+  <script type="module" src="./shared_mod.js?variant=special"></script>
+</head>
+<body></body>
+</html>`;
+  fs.writeFileSync(path.join(scratch, 'index.html'), html);
+
+  const res = await buildApplication(path.join(scratch, 'index.html'), outDir);
+  assert.equal(res.isHtml, true);
+  assert.equal(res.entryFiles.length, 2, 'Must have 2 entry file mappings');
+  assert.notEqual(res.entryFiles[0], res.entryFiles[1], 'Distinct query variants must emit distinct chunks');
+
+  // Verify emitted HTML contains rewritten modulepreload links pointing to the distinct chunks
+  const emittedHtml = fs.readFileSync(path.join(outDir, 'index.html'), 'utf-8');
+  assert.ok(
+    emittedHtml.includes(`<link rel="modulepreload" href="./${res.entryFiles[0]}"`),
+    'Preload for base entry must point to first emitted chunk'
+  );
+  assert.ok(
+    emittedHtml.includes(`<link rel="modulepreload" href="./${res.entryFiles[1]}"`),
+    'Preload for query variant must point to second emitted chunk'
+  );
+
+  // Both script tags rewritten to distinct chunks
+  assert.ok(
+    emittedHtml.includes(`<script type="module" src="./${res.entryFiles[0]}"></script>`),
+    'Script tag 1 must point to first chunk'
+  );
+  assert.ok(
+    emittedHtml.includes(`<script type="module" src="./${res.entryFiles[1]}"></script>`),
+    'Script tag 2 must point to second chunk'
+  );
+});
+
+test('buildApplication copies assets containing encoded spaces (%20) with decoded bytes on disk and preserved HTML requestedURL', async () => {
+  const scratch = makeScratch('f3d_app_spaces');
+  const outDir = path.join(scratch, 'dist');
+
+  // Real files on disk with spaces in filenames
+  const imageWithSpace = path.join(scratch, 'hero banner.png');
+  const imageContent = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]); // PNG header
+  fs.writeFileSync(imageWithSpace, imageContent);
+
+  const styleWithSpace = path.join(scratch, 'sub style.css');
+  fs.writeFileSync(
+    styleWithSpace,
+    `body { background-image: url('./hero%20banner.png'); }\n`
+  );
+
+  fs.writeFileSync(path.join(scratch, 'app.js'), `console.log("ready");\n`);
+
+  const html = `<!DOCTYPE html>
+<html>
+<head>
+  <link rel="stylesheet" href="./sub%20style.css">
+  <script type="module" src="./app.js"></script>
+</head>
+<body>
+  <img src="./hero%20banner.png" alt="Hero">
+</body>
+</html>`;
+  fs.writeFileSync(path.join(scratch, 'index.html'), html);
+
+  const res = await buildApplication(path.join(scratch, 'index.html'), outDir);
+  assert.equal(res.isHtml, true);
+
+  // 1. Files on disk must have real space bytes in their names (URL decoded)
+  const emittedCssPath = path.join(outDir, 'sub style.css');
+  const emittedImgPath = path.join(outDir, 'hero banner.png');
+  assert.ok(fs.existsSync(emittedCssPath), 'Emitted CSS file must exist on disk with real space character');
+  assert.ok(fs.existsSync(emittedImgPath), 'Emitted PNG file must exist on disk with real space character');
+  assert.deepEqual(fs.readFileSync(emittedImgPath), imageContent, 'Asset bytes must match original exactly');
+
+  // 2. Emitted HTML must preserve requestedURL in HTML (e.g. %20 encoded)
+  const emittedHtml = fs.readFileSync(path.join(outDir, 'index.html'), 'utf-8');
+  assert.ok(
+    emittedHtml.includes('src="./hero%20banner.png"'),
+    'Emitted HTML must preserve original requested URL for img tag'
+  );
+  assert.ok(
+    emittedHtml.includes('href="./sub%20style.css"'),
+    'Emitted HTML must preserve original requested URL for stylesheet link'
+  );
+});
+
+test('extractRelativeAssetUrls collects srcset candidates and video poster attributes per W3C media semantics', () => {
+  const html = `<!DOCTYPE html>
+<html>
+<head>
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <!-- img with src and srcset -->
+  <img src="./fallback.png" srcset="./small.png 1x, ./large.png 2x, data:image/png;base64,abc 3x">
+
+  <!-- video with poster and source with srcset -->
+  <video poster="./preview.png" controls>
+    <source srcset="./video_480.mp4 480w, ./video_1080.mp4 1080w" type="video/mp4">
+    <source src="./default.mp4" type="video/mp4">
+    <track src="./subtitles_en.vtt" kind="subtitles" srclang="en">
+  </video>
+</body>
+</html>`;
+
+  const assets = extractRelativeAssetUrls(html);
+
+  // Stylesheet
+  assert.ok(assets.includes('./style.css'), 'Must extract stylesheet link');
+
+  // Img src and relative srcset candidates (excluding data: URL)
+  assert.ok(assets.includes('./fallback.png'), 'Must extract img src');
+  assert.ok(assets.includes('./small.png'), 'Must extract img srcset 1x candidate');
+  assert.ok(assets.includes('./large.png'), 'Must extract img srcset 2x candidate');
+  assert.equal(assets.some(a => a.startsWith('data:')), false, 'Must not collect data: URLs as relative assets');
+
+  // Video poster and sources
+  assert.ok(assets.includes('./preview.png'), 'Must extract video poster');
+  assert.ok(assets.includes('./video_480.mp4'), 'Must extract source srcset 480w');
+  assert.ok(assets.includes('./video_1080.mp4'), 'Must extract source srcset 1080w');
+  assert.ok(assets.includes('./default.mp4'), 'Must extract source src');
+  assert.ok(assets.includes('./subtitles_en.vtt'), 'Must extract track src');
+});
+
+test('buildApplication preserves distinct identities for files with spaces vs literal percent-encoded names (a b.js vs a%20b.js)', async () => {
+  const scratch = makeScratch('f3d_app_space_vs_percent');
+  const outDir = path.join(scratch, 'dist');
+
+  // File 1: literally named "a b.js" (contains a space character 0x20)
+  fs.writeFileSync(path.join(scratch, 'a b.js'), 'export const valSpace = "from_space";\n');
+
+  // File 2: literally named "a%20b.js" (contains literal "%", "2", "0")
+  fs.writeFileSync(path.join(scratch, 'a%20b.js'), 'export const valPercent = "from_percent";\n');
+
+  // HTML references both:
+  // - "a b.js" is referenced encoded as "./a%20b.js"
+  // - "a%20b.js" is referenced encoded as "./a%2520b.js"
+  const html = `<!DOCTYPE html>
+<html>
+<head>
+  <link rel="modulepreload" href="./a%20b.js">
+  <link rel="modulepreload" href="./a%2520b.js">
+  <script type="module" src="./a%20b.js"></script>
+  <script type="module" src="./a%2520b.js"></script>
+</head>
+<body></body>
+</html>`;
+  fs.writeFileSync(path.join(scratch, 'index.html'), html);
+
+  const res = await buildApplication(path.join(scratch, 'index.html'), outDir);
+  assert.equal(res.isHtml, true);
+  assert.equal(res.entryFiles.length, 2, 'Must produce 2 entry files');
+  assert.notEqual(res.entryFiles[0], res.entryFiles[1], 'Must emit two distinct chunks for distinct filenames');
+
+  // Emitted HTML must rewrite preloads and script tags to the two distinct chunks
+  const emittedHtml = fs.readFileSync(path.join(outDir, 'index.html'), 'utf-8');
+  assert.ok(
+    emittedHtml.includes(`<link rel="modulepreload" href="./${res.entryFiles[0]}"`),
+    'Preload for space file must point to first chunk'
+  );
+  assert.ok(
+    emittedHtml.includes(`<link rel="modulepreload" href="./${res.entryFiles[1]}"`),
+    'Preload for percent file must point to second chunk'
+  );
+
+  // Both chunks execute and yield their distinct values
+  const modSpace = await import(pathToFileURL(path.join(outDir, res.entryFiles[0])).href + `?v=${Date.now()}`);
+  const modPercent = await import(pathToFileURL(path.join(outDir, res.entryFiles[1])).href + `?v=${Date.now() + 1}`);
+  assert.equal(modSpace.valSpace, 'from_space');
+  assert.equal(modPercent.valPercent, 'from_percent');
+});
+
+test('extractRelativeCssUrls skips url() inside quoted strings and comments, extracting only real URLs and imports', () => {
+  const css = `
+    /* url(commented_phantom.png) */
+    /* @import "commented_style.css"; */
+    .banner {
+      content: "url(phantom_double.png)";
+      content: 'url(phantom_single.png)';
+      content: "/* not comment */ url(phantom_nested.png)";
+      background: url('./real_bg.png');
+      border-image: url("real_border.png");
+      mask: url(real_mask.png);
+    }
+    @import "./real_import.css";
+    @import url('./real_import_url.css');
+  `;
+
+  const urls = extractRelativeCssUrls(css);
+
+  // Negative: must NOT extract URLs from quoted strings or comments
+  assert.equal(urls.includes('phantom_double.png'), false, 'Must not extract url() inside double-quoted string');
+  assert.equal(urls.includes('phantom_single.png'), false, 'Must not extract url() inside single-quoted string');
+  assert.equal(urls.includes('phantom_nested.png'), false, 'Must not extract url() inside string with comment-like text');
+  assert.equal(urls.includes('commented_phantom.png'), false, 'Must not extract url() inside comment');
+  assert.equal(urls.includes('commented_style.css'), false, 'Must not extract @import inside comment');
+
+  // Positive: must extract real url() and @import targets
+  assert.ok(urls.includes('./real_bg.png'), 'Must extract real_bg.png');
+  assert.ok(urls.includes('real_border.png'), 'Must extract real_border.png');
+  assert.ok(urls.includes('real_mask.png'), 'Must extract real_mask.png');
+  assert.ok(urls.includes('./real_import.css'), 'Must extract real_import.css');
+  assert.ok(urls.includes('./real_import_url.css'), 'Must extract real_import_url.css');
+  assert.equal(urls.length, 5, 'Must extract exactly the 5 real CSS assets');
+});
+
+test('buildApplication does not reject or attempt to copy content: "url(phantom.png)" in linked stylesheet', async () => {
+  const scratch = makeScratch('f3d_app_css_string');
+  const outDir = path.join(scratch, 'dist');
+
+  // Real image that exists
+  const realImgPath = path.join(scratch, 'real_image.png');
+  fs.writeFileSync(realImgPath, Buffer.from([1, 2, 3]));
+
+  // CSS file with content: "url(phantom.png)" (which does NOT exist on disk),
+  // plus comment /* url(phantom_comment.png) */,
+  // and real url(real_image.png) which DOES exist on disk.
+  const cssContent = `
+    /* url(phantom_comment.png) */
+    .icon::before {
+      content: "url(phantom.png)";
+      background-image: url('./real_image.png');
+    }
+  `;
+  fs.writeFileSync(path.join(scratch, 'style.css'), cssContent);
+  fs.writeFileSync(path.join(scratch, 'main.js'), 'export const ready = true;\n');
+
+  const html = `<!DOCTYPE html>
+<html>
+<head>
+  <link rel="stylesheet" href="./style.css">
+  <script type="module" src="./main.js"></script>
+</head>
+<body></body>
+</html>`;
+  fs.writeFileSync(path.join(scratch, 'index.html'), html);
+
+  // Must NOT throw "Unresolved relative resource: phantom.png"
+  const res = await buildApplication(path.join(scratch, 'index.html'), outDir);
+  assert.equal(res.isHtml, true);
+
+  // real_image.png MUST be copied
+  assert.ok(fs.existsSync(path.join(outDir, 'real_image.png')), 'real_image.png must be copied to output');
+
+  // phantom.png must NOT exist in output
+  assert.equal(fs.existsSync(path.join(outDir, 'phantom.png')), false, 'phantom.png must not be emitted');
+  assert.equal(fs.existsSync(path.join(outDir, 'phantom_comment.png')), false, 'phantom_comment.png must not be emitted');
 });
