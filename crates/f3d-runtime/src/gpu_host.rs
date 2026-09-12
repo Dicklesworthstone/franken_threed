@@ -6417,13 +6417,16 @@ mod tests {
         let mut packet = GpuSubmissionPacket::new();
         packet.push(commands[0].clone());
         let bytes = packet.encode().expect("binary packet encoding must succeed");
-        // Header is 16 bytes. Command 0 opcode is at 16..20 (4 bytes).
-        // Command 0 fields start at byte 20 (cursor in bridge_runtime.js).
-        // packed_depth_ops is at cursor + 48 = byte 68.
-        // Byte 68: depth_load_op (u8) = 1 (LOAD_OP_LOAD).
-        // Byte 70: depth_read_only (u8) = 1.
-        assert_eq!(bytes[68], LOAD_OP_LOAD as u8, "byte 68 (depth_load_op) must be LOAD_OP_LOAD = 1");
-        assert_eq!(bytes[70], 1u8, "byte 70 (depth_read_only) must be 1");
+        // Header is 16 bytes. Command 0 opcode is u16 at 16..18 (2 bytes).
+        // Command 0 payload fields start at byte 18.
+        // packed_depth_ops is at payload offset 48, which is byte 66..70.
+        let packed_depth = u32::from_le_bytes(bytes[66..70].try_into().unwrap());
+        assert_eq!(unpack_depth_load_op(packed_depth), LOAD_OP_LOAD);
+        assert!(unpack_depth_read_only(packed_depth));
+        // Byte 66: depth_load_op (u8) = 1 (LOAD_OP_LOAD).
+        // Byte 68: depth_read_only (u8) = 1.
+        assert_eq!(bytes[66], LOAD_OP_LOAD as u8, "byte 66 (depth_load_op) must be LOAD_OP_LOAD = 1");
+        assert_eq!(bytes[68], 1u8, "byte 68 (depth_read_only) must be 1");
     }
 
     #[test]
