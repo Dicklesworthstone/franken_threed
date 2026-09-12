@@ -298,6 +298,88 @@ fn positive_automatic_pass_splitting_preserves_targets_and_depth_stencil() {
 }
 
 #[test]
+fn positive_automatic_pass_splitting_preserves_readonly_depth_matrix() {
+    // Tests pass splitting with Color A (intermediate) + Color B (destination) + Read-Only Depth D.
+    // Matrix covers depth sampling: neither draw, second draw only, and both draws (including
+    // draw 0 sampling D before the color hazard in draw 1, proving legal D sampling is not a false split point).
+    // In all variants:
+    // 1. Splitting succeeds into 2 segments at draw 1.
+    // 2. Both segments retain D with depth_read_only=true and absent (None) load/store ops.
+    // 3. Segment 1 stores A+B; Segment 2 drops A, loads B with LoadOp::Load, and stores B.
+    let tex_a = ResourceId::new(150);
+    let tex_b = ResourceId::new(151);
+    let tex_d = ResourceId::new(152);
+    let buf_v = ResourceId::new(153);
+
+    for (sample_draw0, sample_draw1) in [(false, false), (false, true), (true, true)] {
+        let mut pass = Pass::new_render(PassId::new(1), "split_readonly_depth");
+        pass.color_attachments.push(ColorAttachment::new_clear(tex_a, [0.0, 0.0, 0.0, 1.0]));
+        pass.color_attachments.push(ColorAttachment::new_clear(tex_b, [0.0, 0.0, 0.0, 1.0]));
+        let mut dsa = DepthStencilAttachment::new_depth_clear(tex_d, 1.0);
+        dsa.depth_read_only = true;
+        dsa.depth_load_op = None;
+        dsa.depth_store_op = None;
+        pass.depth_stencil_attachment = Some(dsa);
+
+        let mut draw0_uses = vec![ResourceUse::buffer_vertex(buf_v, DataVersion::INITIAL, Some(0), Some(64))];
+        if sample_draw0 {
+            draw0_uses.push(ResourceUse::texture_sampled(tex_d, DataVersion::INITIAL, SubresourceRange::full_texture()));
+        }
+        pass.draws.push(Draw::new(0, 1, 3, 0, draw0_uses));
+
+        let mut draw1_uses = vec![
+            ResourceUse::buffer_vertex(buf_v, DataVersion::INITIAL, Some(0), Some(64)),
+            ResourceUse::texture_sampled(tex_a, DataVersion::INITIAL, SubresourceRange::full_texture()),
+        ];
+        if sample_draw1 {
+            draw1_uses.push(ResourceUse::texture_sampled(tex_d, DataVersion::INITIAL, SubresourceRange::full_texture()));
+        }
+        pass.draws.push(Draw::new(1, 2, 3, 0, draw1_uses));
+
+        assert!(can_split_pass(&pass));
+
+        let mut graph = PassGraph::new();
+        graph.add_pass(pass).expect("add pass");
+        let plan = graph.compile(None).expect("must compile split plan");
+
+        assert_eq!(plan.split_count, 1);
+        assert_eq!(plan.segments.len(), 2);
+
+        // Segment 1 (draw 0): stores colors, keeps read-only depth with absent ops
+        let s1 = &plan.segments[0];
+        assert_eq!(s1.draws.len(), 1);
+        assert_eq!(s1.draws[0].draw_id, 0);
+        assert!(s1.color_attachments.iter().any(|ca| ca.target_id == tex_a && ca.store_op == StoreOp::Store));
+        assert!(s1.color_attachments.iter().any(|ca| ca.target_id == tex_b && ca.store_op == StoreOp::Store));
+        let d1 = s1.depth_stencil_attachment.as_ref().expect("seg1 depth");
+        assert_eq!(d1.target_id, tex_d);
+        assert!(d1.depth_read_only);
+        assert_eq!(d1.depth_load_op, None);
+        assert_eq!(d1.depth_store_op, None);
+        assert!(d1.stencil_read_only);
+        assert_eq!(d1.stencil_load_op, None);
+        assert_eq!(d1.stencil_store_op, None);
+
+        // Segment 2 (draw 1): drops sampled intermediate A, preserves B, preserves read-only depth with absent ops
+        let s2 = &plan.segments[1];
+        assert_eq!(s2.draws.len(), 1);
+        assert_eq!(s2.draws[0].draw_id, 1);
+        assert!(!s2.color_attachments.iter().any(|ca| ca.target_id == tex_a));
+        let ca_b = s2.color_attachments.iter().find(|ca| ca.target_id == tex_b).expect("seg2 color b");
+        assert_eq!(ca_b.load_op, LoadOp::Load);
+        assert_eq!(ca_b.store_op, StoreOp::Store);
+        let d2 = s2.depth_stencil_attachment.as_ref().expect("seg2 depth");
+        assert_eq!(d2.target_id, tex_d);
+        assert!(d2.depth_read_only);
+        assert_eq!(d2.depth_load_op, None);
+        assert_eq!(d2.depth_store_op, None);
+        assert!(d2.stencil_read_only);
+        assert_eq!(d2.stencil_load_op, None);
+        assert_eq!(d2.stencil_store_op, None);
+    }
+}
+
+#[test]
 fn test_split_rewires_downstream_consumers_to_final_segment() {
     // Root Review Defect (4) Counterexample:
     // If Pass 1 is split into Part1 (id 1) and Part2 (id 11), a downstream consumer

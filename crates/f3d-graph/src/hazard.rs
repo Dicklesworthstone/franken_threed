@@ -313,9 +313,9 @@ pub fn can_split_pass(pass: &Pass) -> bool {
         return false;
     }
 
-    // If depth/stencil is sampled in second_draws and depth is writable, that is also unsupported feedback.
+    // If depth/stencil is sampled in second_draws and depth or stencil is writable, that is also unsupported feedback.
     if let Some(ref dsa) = pass.depth_stencil_attachment {
-        if sampled_ids.contains(&dsa.target_id) && !dsa.depth_read_only {
+        if sampled_ids.contains(&dsa.target_id) && (!dsa.depth_read_only || !dsa.stencil_read_only) {
             return false;
         }
     }
@@ -330,7 +330,11 @@ fn find_attachment_sampling_split_point(pass: &Pass) -> Option<usize> {
         attachment_ids.push(ca.target_id);
     }
     if let Some(ref dsa) = pass.depth_stencil_attachment {
-        attachment_ids.push(dsa.target_id);
+        // Read-only depth-stencil attachments can legally be sampled without hazard (§8.5).
+        // Only writable depth/stencil attachments can create attachment-sampling conflicts.
+        if !dsa.depth_read_only || !dsa.stencil_read_only {
+            attachment_ids.push(dsa.target_id);
+        }
     }
 
     for (draw_idx, draw) in pass.draws.iter().enumerate() {
@@ -390,8 +394,10 @@ pub fn split_pass_on_hazard(pass: &Pass, next_pass_id: PassId) -> Result<Vec<Pas
         ca.store_op = StoreOp::Store;
     }
     if let Some(ref mut dsa) = pass1.depth_stencil_attachment {
-        dsa.depth_store_op = Some(StoreOp::Store);
-        if dsa.stencil_store_op.is_some() {
+        if !dsa.depth_read_only {
+            dsa.depth_store_op = Some(StoreOp::Store);
+        }
+        if !dsa.stencil_read_only && dsa.stencil_store_op.is_some() {
             dsa.stencil_store_op = Some(StoreOp::Store);
         }
     }
@@ -411,13 +417,19 @@ pub fn split_pass_on_hazard(pass: &Pass, next_pass_id: PassId) -> Result<Vec<Pas
         }
     }
 
-    // PRESERVE depth/stencil attachment in Pass 2 with LoadOp::Load!
+    // PRESERVE depth/stencil attachment in Pass 2!
+    // Read-only depth-stencil attachments can legally be sampled in Pass 2 and must not be dropped.
+    // Read-only attachments retain absent (None) load/store operations.
     if let Some(ref dsa) = pass.depth_stencil_attachment {
-        if !sampled_ids.contains(&dsa.target_id) {
+        let is_sampled = sampled_ids.contains(&dsa.target_id);
+        let is_read_only = dsa.depth_read_only && dsa.stencil_read_only;
+        if !is_sampled || is_read_only {
             let mut dsa2 = dsa.clone();
-            dsa2.depth_load_op = Some(LoadOp::Load);
-            dsa2.depth_store_op = Some(StoreOp::Store);
-            if dsa2.stencil_load_op.is_some() {
+            if !dsa2.depth_read_only {
+                dsa2.depth_load_op = Some(LoadOp::Load);
+                dsa2.depth_store_op = Some(StoreOp::Store);
+            }
+            if !dsa2.stencil_read_only && dsa2.stencil_load_op.is_some() {
                 dsa2.stencil_load_op = Some(LoadOp::Load);
                 dsa2.stencil_store_op = Some(StoreOp::Store);
             }
