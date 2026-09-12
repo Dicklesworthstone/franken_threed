@@ -24,12 +24,8 @@ browser = [
 ]
 
 [dependencies]
-# Development linkage while the upstream browser fixes are being verified.
-# Absolute path on purpose (root 2283): under RCH the f3d project root canonicalizes to
-# /data/projects on the worker, so a relative ../../../../dp path resolved to a different,
-# stale /data/dp checkout. RCH syncs this exact physical path. Replace with an immutable pin
-# once upstream is ready.
-asupersync = { path = "/Users/jemanuel/dp/asupersync", default-features = false }
+# Published browser host/pump implementation; keep the runtime in this Wasm instance.
+asupersync = { version = "=0.5.0", default-features = false }
 wasm-bindgen = { version = "=0.2.126", optional = true }
 js-sys = { version = "=0.3.103", optional = true }
 wasm-bindgen-futures = { version = "=0.4.76", optional = true }

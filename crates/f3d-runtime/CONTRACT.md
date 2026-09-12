@@ -25,10 +25,10 @@ Events use actual performance.now() values and callback turn identifiers. Error 
 
 Device loss and physical M5/iPhone runs
 remain separate unmet foundation criteria.
-Runtime ownership is retained for the test page lifetime. This is development
-linkage to an upstream checkout, not an immutable release dependency pin; the Cargo path is
-the absolute, nonportable /Users/jemanuel/dp/asupersync so remote builds compile the synced
-upstream rather than a stale checkout resolved through the worker-side project alias.
+Runtime ownership is retained for the test page lifetime. The runtime links
+published Asupersync `=0.5.0`, with its registry checksum recorded in `Cargo.lock`.
+No developer checkout is required. Native and wasm32 compilation checks do not
+refresh the previously recorded browser results; those require new browser runs.
 No acceleration, rendering, complete compatibility, or passed browser run is
 claimed by the presence of this code. Browser results require an actual Wasm
 build and execution in a named installed browser.
