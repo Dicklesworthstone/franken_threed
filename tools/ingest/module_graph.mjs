@@ -26,6 +26,16 @@ function sha256(content) {
 }
 
 /**
+ * Checks if a URL string has an external (non-filesystem) scheme.
+ * @param {string} url
+ * @returns {boolean}
+ */
+function isExternalUrl(url) {
+  if (typeof url !== 'string') return false;
+  return url.startsWith('http://') || url.startsWith('https://') || url.startsWith('data:');
+}
+
+/**
  * Finds all elementary cycles in a directed graph using DFS.
  * @param {Map<string, string[]>} adj
  * @returns {string[][]}
@@ -94,6 +104,8 @@ export async function buildModuleGraph(entryPath, options = {}) {
   const modules = new Map();
   // Map of sha256 -> Array of canonical URLs with identical bytes
   const contentHashMap = new Map();
+  // Set of canonical external URLs (http:, https:, data:)
+  const externalModules = new Set();
 
   if (isHtml) {
     const htmlContent = fs.readFileSync(resolvedEntryAbs, 'utf-8');
@@ -136,7 +148,12 @@ export async function buildModuleGraph(entryPath, options = {}) {
     const item = queue.shift();
     const moduleId = item.id;
 
-    if (modules.has(moduleId)) {
+    if (modules.has(moduleId) || externalModules.has(moduleId)) {
+      continue;
+    }
+
+    if (isExternalUrl(moduleId)) {
+      externalModules.add(moduleId);
       continue;
     }
 
@@ -352,6 +369,81 @@ export async function buildModuleGraph(entryPath, options = {}) {
     modules.set(moduleId, node);
   }
 
+  // Determine tainted modules that reach external or unresolved code using a reverse-edge worklist
+  const tainted = new Set();
+  const incoming = new Map();
+
+  for (const id of modules.keys()) {
+    incoming.set(id, new Set());
+  }
+
+  const worklist = [];
+
+  for (const [id, node] of modules.entries()) {
+    const hasExternalStatic = node.static_imports.some(imp => isExternalUrl(imp.resolved_id));
+    const hasExternalDyn = node.dynamic_imports.some(dyn => {
+      if (dyn.unresolved) return true;
+      if (dyn.resolved_id && isExternalUrl(dyn.resolved_id)) return true;
+      if (dyn.resolved_targets && dyn.resolved_targets.some(t => isExternalUrl(t.resolved_id))) return true;
+      return false;
+    });
+
+    if (hasExternalStatic || hasExternalDyn) {
+      tainted.add(id);
+      worklist.push(id);
+    }
+
+    for (const imp of node.static_imports) {
+      if (modules.has(imp.resolved_id)) {
+        incoming.get(imp.resolved_id).add(id);
+      }
+    }
+    for (const dyn of node.dynamic_imports) {
+      if (dyn.resolved_id && modules.has(dyn.resolved_id)) {
+        incoming.get(dyn.resolved_id).add(id);
+      }
+      if (dyn.resolved_targets) {
+        for (const t of dyn.resolved_targets) {
+          if (t.resolved_id && modules.has(t.resolved_id)) {
+            incoming.get(t.resolved_id).add(id);
+          }
+        }
+      }
+    }
+  }
+
+  while (worklist.length > 0) {
+    const curr = worklist.pop();
+    const dependents = incoming.get(curr) || [];
+    for (const dep of dependents) {
+      if (!tainted.has(dep)) {
+        tainted.add(dep);
+        worklist.push(dep);
+      }
+    }
+  }
+
+  for (const node of modules.values()) {
+    for (const dyn of node.dynamic_imports) {
+      if (dyn.unresolved) {
+        dyn.claims_closure = false;
+        dyn.claimsClosure = false;
+        continue;
+      }
+      if (dyn.classification === 'literal') {
+        const target = dyn.resolved_id;
+        const claims = Boolean(target && !isExternalUrl(target) && !tainted.has(target));
+        dyn.claims_closure = claims;
+        dyn.claimsClosure = claims;
+      } else if (dyn.classification === 'finite_set') {
+        const targets = (dyn.resolved_targets || []).map(t => t.resolved_id);
+        const allClosed = targets.length > 0 && targets.every(t => t && !isExternalUrl(t) && !tainted.has(t));
+        dyn.claims_closure = allClosed;
+        dyn.claimsClosure = allClosed;
+      }
+    }
+  }
+
   // Build adjacency map for cycle detection
   const adjacency = new Map();
   for (const [id, node] of modules.entries()) {
@@ -401,10 +493,12 @@ export async function buildModuleGraph(entryPath, options = {}) {
     entry_path: resolvedEntryAbs,
     root_entries: rootEntryIds,
     import_map: importMap,
+    external_modules: Array.from(externalModules).sort(),
     modules: Object.fromEntries(modules.entries()),
     cycles,
     summary: {
       total_modules: modules.size,
+      total_external_modules: externalModules.size,
       total_static_imports: totalStaticImports,
       total_dynamic_imports: totalDynamicImports,
       unresolved_dynamic_imports: unresolvedDynamicImports,

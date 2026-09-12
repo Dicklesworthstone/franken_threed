@@ -25,6 +25,7 @@ function makeScratch(prefix) {
 
 function emitToDisk(files, dir) {
   for (const [name, code] of Object.entries(files)) {
+    fs.mkdirSync(path.dirname(path.join(dir, name)), { recursive: true });
     fs.writeFileSync(path.join(dir, name), code, 'utf-8');
   }
 }
@@ -263,4 +264,383 @@ export const otherVal = 'other_val';
   // Total executions: exactly 2 evaluations (one for ./same.js evaluated once across tag 0 and tag 2, and one for the query variant chunk)
   assert.equal(globalThis.__f3d_repeat.sameExec, 2, 'Both distinct module URL identities must execute, while repeated identical URL executes only once');
   assert.deepEqual(globalThis.__f3d_repeat.order, ['same', 'same'], 'Both distinct module chunks must execute their top-level code');
+});
+
+test('Finite dynamic import: conditional branches emit chunks, defer effects, preserve identity, evaluate condition once, and preserve synchronous condition throw', async () => {
+  const scratch = makeScratch('f3d_finite_dynamic');
+
+  // Shared dependency to test module identity across static and dynamic boundaries
+  fs.writeFileSync(
+    path.join(scratch, 'shared_dep.js'),
+    `export const singleton = { name: 'singleton_instance', count: 0 };\n`
+  );
+
+  // Branch A (dotfile to exercise resolveFileUrl relative prefix for .hidden.js)
+  fs.writeFileSync(
+    path.join(scratch, '.branch_a.js'),
+    `import { singleton } from './shared_dep.js';
+(globalThis.__f3d_finite_effects = globalThis.__f3d_finite_effects || []).push('.branch_a');
+singleton.count++;
+export const branchName = 'A';
+export { singleton };
+`
+  );
+
+  // Branch B
+  fs.writeFileSync(
+    path.join(scratch, 'branch_b.js'),
+    `import { singleton } from './shared_dep.js';
+(globalThis.__f3d_finite_effects = globalThis.__f3d_finite_effects || []).push('branch_b');
+singleton.count++;
+export const branchName = 'B';
+export { singleton };
+`
+  );
+
+  // Branch for bare __proto__ import-map candidate
+  fs.writeFileSync(
+    path.join(scratch, 'branch_proto.js'),
+    `export const branchName = 'PROTO';\n`
+  );
+
+  // Main entry with conditional dynamic import and shadowed Object
+  fs.writeFileSync(
+    path.join(scratch, 'main.js'),
+    `import { singleton } from './shared_dep.js';
+const Object = null;
+
+export function loadByFlag(flag) {
+  return import(flag ? './.branch_a.js' : './branch_b.js');
+}
+export function loadWithEffect(effectFn) {
+  return import(effectFn() ? './.branch_a.js' : './branch_b.js');
+}
+export function loadWithOptions(flagFn, optionsFn) {
+  return import(flagFn() ? './.branch_a.js' : './branch_b.js', optionsFn());
+}
+export function loadWithProto(flag) {
+  return import(flag ? '__proto__' : './branch_b.js');
+}
+export { singleton };
+`
+  );
+
+  const mapJson = JSON.stringify({
+    imports: {
+      ['__proto__']: './branch_proto.js'
+    }
+  });
+  const html = `<!DOCTYPE html><html><head>
+    <script type="importmap">${mapJson}</script>
+    <script type="module" src="./main.js"></script>
+  </head><body></body></html>`;
+  const htmlFile = path.join(scratch, 'index.html');
+  fs.writeFileSync(htmlFile, html);
+
+  const res = await bundleWithRollup(htmlFile);
+
+  // Multi-chunk output containing dynamic chunk entries
+  assert.equal(res.isMultiChunk, true, 'Conditional dynamic import must produce multi-chunk output');
+  assert.ok(res.outputChunks.length >= 3, 'Must emit main chunk plus branch chunks');
+
+  const emitDir = makeScratch('f3d_finite_emit');
+  emitToDisk(res.files, emitDir);
+
+  globalThis.__f3d_finite_effects = [];
+  const nonce = Date.now();
+  const mainMod = await import(pathToFileURL(path.join(emitDir, res.entryFiles[0])).href + `?v=${nonce}`);
+
+  // 1. Deferred top-level effects: neither branch executes on entry load
+  assert.deepEqual(
+    globalThis.__f3d_finite_effects,
+    [],
+    'Branch top-level effects must remain deferred until dynamic import is evaluated'
+  );
+
+  // 2. Both branches execute emitted output
+  // Branch A (true, .branch_a.js dotfile)
+  const modA1 = await mainMod.loadByFlag(true);
+  assert.equal(modA1.branchName, 'A', 'True branch must load .branch_a.js');
+  assert.deepEqual(globalThis.__f3d_finite_effects, ['.branch_a'], '.branch_a must execute when loaded');
+
+  // Branch B (false, branch_b.js)
+  const modB = await mainMod.loadByFlag(false);
+  assert.equal(modB.branchName, 'B', 'False branch must load branch_b.js');
+  assert.deepEqual(
+    globalThis.__f3d_finite_effects,
+    ['.branch_a', 'branch_b'],
+    'branch_b must execute when loaded'
+  );
+
+  // 3. Shared namespace identity across dynamic calls and static imports
+  const modA2 = await mainMod.loadByFlag(true);
+  assert.equal(modA1, modA2, 'Repeated dynamic import must return identical module namespace instance');
+  assert.equal(
+    modA1.singleton,
+    mainMod.singleton,
+    'Shared singleton must match between static entry and dynamic chunk'
+  );
+  assert.equal(
+    modB.singleton,
+    mainMod.singleton,
+    'Shared singleton must match between distinct dynamic chunks'
+  );
+  assert.equal(mainMod.singleton.count, 2, 'Each branch module must have executed exactly once');
+
+  // 4. Effectful condition evaluated exactly once
+  let conditionEvals = 0;
+  const modA3 = await mainMod.loadWithEffect(() => {
+    conditionEvals++;
+    return true;
+  });
+  assert.equal(conditionEvals, 1, 'Effectful condition must be evaluated exactly once');
+  assert.equal(modA3.branchName, 'A');
+
+  // 5. Condition throwing synchronously distinguishes sync throw vs rejected import Promise
+  const syncErr = new Error('condition_sync_error');
+  assert.throws(
+    () => {
+      mainMod.loadWithEffect(() => {
+        throw syncErr;
+      });
+    },
+    (err) => err === syncErr,
+    'Condition throw must be synchronous and preserve original error identity'
+  );
+
+  // 6. Options expression evaluation order: condition first, options second
+  const evalOrder = [];
+  const modWithOptions = await mainMod.loadWithOptions(
+    () => { evalOrder.push('condition'); return true; },
+    () => { evalOrder.push('options'); return {}; }
+  );
+  assert.deepEqual(evalOrder, ['condition', 'options'], 'Condition must evaluate before options expression');
+  assert.equal(modWithOptions.branchName, 'A');
+
+  // Throwing condition must throw synchronously before options expression is evaluated
+  let optionsEvaluated = false;
+  assert.throws(
+    () => {
+      mainMod.loadWithOptions(
+        () => { throw syncErr; },
+        () => { optionsEvaluated = true; return {}; }
+      );
+    },
+    (err) => err === syncErr,
+    'Throwing condition must throw before options expression'
+  );
+  assert.equal(optionsEvaluated, false, 'Options expression must not evaluate when condition throws');
+
+  // 7. Bare __proto__ import-map candidate works cleanly with shadowed Object = null
+  const modProto = await mainMod.loadWithProto(true);
+  assert.equal(modProto.branchName, 'PROTO', 'Bare __proto__ candidate must resolve via import map and execute');
+});
+
+test('Finite dynamic import: blocked import-map candidate propagates IngestionResolutionError', async () => {
+  const scratch = makeScratch('f3d_finite_blocked');
+  fs.writeFileSync(path.join(scratch, 'ok.js'), `export const ok = true;\n`);
+
+  const mapJson = JSON.stringify({ imports: { 'pkg/blocked/': null, 'pkg/': './pkg/' } });
+  const html = `<!DOCTYPE html><html><head>
+    <script type="importmap">${mapJson}</script>
+    <script type="module">
+      export async function load(flag) {
+        return import(flag ? 'pkg/blocked/forbidden.js' : './ok.js');
+      }
+    </script>
+  </head><body></body></html>`;
+
+  const htmlFile = path.join(scratch, 'index.html');
+  fs.writeFileSync(htmlFile, html);
+
+  await assert.rejects(
+    async () => { await bundleWithRollup(htmlFile); },
+    (err) => err instanceof IngestionResolutionError || err?.name === 'IngestionResolutionError' || String(err?.message || '').includes('blocked') || String(err?.message || '').includes('mapped to null'),
+    'Bundler must reject explicit import-map null candidate in finite dynamic import'
+  );
+});
+
+test('Finite dynamic import: composable wrapping preserves nested asset expression inside condition', async () => {
+  const scratch = makeScratch('f3d_finite_nested_asset');
+  fs.writeFileSync(path.join(scratch, 'dummy.png'), 'PNG_DATA');
+  fs.writeFileSync(path.join(scratch, 'branch_b.js'), `export const b = 'branch_b';\n`);
+
+  fs.writeFileSync(
+    path.join(scratch, 'main.js'),
+    `export function load(flag) {
+      return import((flag && new URL('./dummy.png', import.meta.url).href) ? './branch_b.js' : './branch_b.js');
+    }
+`
+  );
+
+  const res = await bundleWithRollup(path.join(scratch, 'main.js'));
+  assert.ok(res.assets.length >= 1, 'Nested asset inside dynamic import must be emitted as an asset');
+
+  const emitDir = makeScratch('f3d_nested_emit');
+  emitToDisk(res.files, emitDir);
+
+  const nonce = Date.now();
+  const mainMod = await import(pathToFileURL(path.join(emitDir, res.entryFiles[0])).href + `?v=${nonce}`);
+  const mod = await mainMod.load(true);
+  assert.equal(mod.b, 'branch_b', 'Nested asset expression inside condition must execute cleanly');
+});
+
+test('Finite dynamic import: external data: and mixed local/data candidates preserve runtime routes, deferred effects, and identity', async () => {
+  const scratch = makeScratch('f3d_finite_external');
+
+  // Local branch module
+  fs.writeFileSync(
+    path.join(scratch, 'local_branch.js'),
+    `(globalThis.__f3d_ext_effects = globalThis.__f3d_ext_effects || []).push('local');
+export const branchName = 'LOCAL';
+`
+  );
+
+  // Two data: URL modules with effects and exports
+  const dataUrlA = 'data:text/javascript,(globalThis.__f3d_ext_effects=globalThis.__f3d_ext_effects||[]).push("data_a");export const branchName="DATA_A";export const count=1;';
+  const dataUrlB = 'data:text/javascript,(globalThis.__f3d_ext_effects=globalThis.__f3d_ext_effects||[]).push("data_b");export const branchName="DATA_B";export const count=2;';
+
+  // Main entry with static data import, literal dynamic data import,
+  // pure external data: conditional, mixed local/data conditional, and HTTPS candidate
+  fs.writeFileSync(
+    path.join(scratch, 'main.js'),
+    `import { staticVal } from 'data:text/javascript,export const staticVal = "STATIC_DATA";';
+export { staticVal };
+
+export function loadLiteralData() {
+  return import('data:text/javascript,export const literalVal = "LITERAL_DATA";');
+}
+
+export function loadPureData(flag) {
+  return import(flag ? ${JSON.stringify(dataUrlA)} : ${JSON.stringify(dataUrlB)});
+}
+
+export function loadMixed(flag) {
+  return import(flag ? 'aliased-data' : './local_branch.js');
+}
+
+export function loadHttpsCandidate(flag) {
+  return import(flag ? 'https://cdn.example.com/library.js' : ${JSON.stringify(dataUrlA)});
+}
+`
+  );
+
+  const mapJson = JSON.stringify({
+    imports: {
+      'aliased-data': dataUrlA
+    }
+  });
+  const html = `<!DOCTYPE html><html><head>
+    <script type="importmap">${mapJson}</script>
+    <script type="module" src="./main.js"></script>
+  </head><body></body></html>`;
+  const htmlFile = path.join(scratch, 'index.html');
+  fs.writeFileSync(htmlFile, html);
+
+  const res = await bundleWithRollup(htmlFile);
+
+  // Positive: structure - emits entry plus local chunk only (data URLs are preserved as external strings, not file chunks)
+  assert.ok(res.outputChunks.length >= 2, 'Must emit main chunk plus local branch chunk');
+  assert.ok(!res.outputChunks.some(c => c.fileName.includes('data:')), 'External data: modules must not be emitted as file chunks');
+  assert.ok(
+    res.files[res.entryFiles[0]].includes('https://cdn.example.com/library.js'),
+    'Emitted output must preserve HTTPS external route string literal'
+  );
+
+  const emitDir = makeScratch('f3d_ext_emit');
+  emitToDisk(res.files, emitDir);
+
+  globalThis.__f3d_ext_effects = [];
+  const nonce = Date.now();
+  const mainMod = await import(pathToFileURL(path.join(emitDir, res.entryFiles[0])).href + `?v=${nonce}`);
+
+  // 1. Static data: import resolves cleanly without polluting deferred side effects
+  assert.equal(mainMod.staticVal, 'STATIC_DATA', 'Static external data: import must resolve and export correctly');
+  assert.deepEqual(
+    globalThis.__f3d_ext_effects,
+    [],
+    'External and local side effects must remain deferred on initial entry load'
+  );
+
+  // 2. Literal dynamic data: import resolves external route and loads
+  const modLit = await mainMod.loadLiteralData();
+  assert.equal(modLit.literalVal, 'LITERAL_DATA', 'Literal dynamic data: import must resolve external route and load');
+  assert.deepEqual(
+    globalThis.__f3d_ext_effects,
+    [],
+    'Literal data: import without side effects must not pollute side-effects list'
+  );
+
+  // 3. Pure data: URLs execute emitted output
+  const modA1 = await mainMod.loadPureData(true);
+  assert.equal(modA1.branchName, 'DATA_A', 'True branch must load data URL A');
+  assert.deepEqual(globalThis.__f3d_ext_effects, ['data_a']);
+
+  const modB = await mainMod.loadPureData(false);
+  assert.equal(modB.branchName, 'DATA_B', 'False branch must load data URL B');
+  assert.deepEqual(globalThis.__f3d_ext_effects, ['data_a', 'data_b']);
+
+  // 4. Namespace identity across repeated dynamic imports of data URL
+  const modA2 = await mainMod.loadPureData(true);
+  assert.equal(modA1, modA2, 'Repeated dynamic import of data URL must return identical module namespace instance');
+  assert.deepEqual(globalThis.__f3d_ext_effects, ['data_a', 'data_b'], 'Data URL module must execute only once');
+
+  // 5. Mixed conditional: aliased-data from import map and local file branch
+  const modAliased = await mainMod.loadMixed(true);
+  assert.equal(modAliased.branchName, 'DATA_A');
+  assert.equal(modAliased, modA1, 'Aliased data URL must share namespace identity with direct data URL');
+
+  const modLocal = await mainMod.loadMixed(false);
+  assert.equal(modLocal.branchName, 'LOCAL', 'Local branch must load from emitted file chunk');
+  assert.deepEqual(globalThis.__f3d_ext_effects, ['data_a', 'data_b', 'local']);
+
+  // 6. Blocked external import-map candidate is rejected at build time
+  const scratchBlocked = makeScratch('f3d_ext_blocked');
+  const blockedHtml = `<!DOCTYPE html><html><head>
+    <script type="importmap">{"imports":{"blocked-ext/": null}}</script>
+    <script type="module">
+      export function load(flag) {
+        return import(flag ? 'blocked-ext/data.js' : ${JSON.stringify(dataUrlA)});
+      }
+    </script>
+  </head><body></body></html>`;
+  const blockedHtmlFile = path.join(scratchBlocked, 'index.html');
+  fs.writeFileSync(blockedHtmlFile, blockedHtml);
+
+  await assert.rejects(
+    async () => { await bundleWithRollup(blockedHtmlFile); },
+    (err) => err instanceof IngestionResolutionError || err?.name === 'IngestionResolutionError' || String(err?.message || '').includes('blocked') || String(err?.message || '').includes('mapped to null'),
+    'Bundler must reject blocked import-map external candidate in finite dynamic import'
+  );
+});
+
+test('bundleWithRollup handles HTML entries with external root module scripts (mixed and all-external)', async () => {
+  const scratch = makeScratch('f3d_bundle_ext_root_scripts');
+
+  // 1. Mixed: external https script + local script
+  fs.writeFileSync(path.join(scratch, 'local.js'), `export const localVal = 'LOCAL';\n`);
+
+  const mixedHtml = `<!DOCTYPE html><html><head>
+    <script type="module" src="https://cdn.example.com/ext.js"></script>
+    <script type="module" src="./local.js"></script>
+  </head><body></body></html>`;
+  const mixedFile = path.join(scratch, 'mixed.html');
+  fs.writeFileSync(mixedFile, mixedHtml);
+
+  const mixedRes = await bundleWithRollup(mixedFile);
+  assert.equal(mixedRes.entryFiles.length, 1, 'Only local module script must emit an entry chunk');
+  assert.ok(!mixedRes.chunks.some(c => c.fileName.includes('ext.js') || c.fileName.includes('https:')), 'External root script must not emit a chunk');
+
+  // 2. All-external: no local module scripts
+  const allExtHtml = `<!DOCTYPE html><html><head>
+    <script type="module" src="https://cdn.example.com/ext.js"></script>
+    <script type="module" src="data:text/javascript,export const x = 1;"></script>
+  </head><body></body></html>`;
+  const allExtFile = path.join(scratch, 'all_ext.html');
+  fs.writeFileSync(allExtFile, allExtHtml);
+
+  const allExtRes = await bundleWithRollup(allExtFile);
+  assert.equal(allExtRes.entryFiles.length, 0, 'All-external HTML entry must emit zero entry files');
+  assert.equal(allExtRes.chunks.length, 0, 'All-external HTML entry must emit zero chunks');
+  assert.equal(allExtRes.code, '', 'All-external HTML entry must have empty code');
 });

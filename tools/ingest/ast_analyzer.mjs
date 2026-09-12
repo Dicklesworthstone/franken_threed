@@ -55,64 +55,134 @@ function toSourceSpan(node, offsets = {}) {
 }
 
 /**
- * Recursively extracts all string literal candidate branches from a conditional expression.
- * Returns null if any branch is not a string literal or purely literal template.
- * @param {any} node
+ * Recursively extracts all string candidate branches from a finite string expression.
+ * Supports:
+ * - String Literal (typeof node.value === 'string')
+ * - TemplateLiteral (with 0 or more finite string expressions)
+ * - BinaryExpression with operator '+' (both sides finite string expressions)
+ * - ConditionalExpression (both branches finite string expressions)
+ *
+ * Strictly rejects:
+ * - Identifiers, CallExpressions, MemberExpressions, TaggedTemplateExpressions
+ * - Non-string Literals (numbers, booleans, null, regex)
+ * - Binary operators other than '+'
+ * - Expressions whose Cartesian expansion exceeds limit
+ *
+ * @param {any} node - Acorn AST node
+ * @param {number} [limit=128] - Maximum number of candidates before aborting to nonliteral
  * @returns {string[] | null}
  */
-function extractConditionalStringLiterals(node) {
+function extractFiniteStringCandidates(node, limit = 128) {
   if (!node) return null;
-  if (node.type === 'ConditionalExpression') {
-    const consequent = extractConditionalStringLiterals(node.consequent);
-    const alternate = extractConditionalStringLiterals(node.alternate);
-    if (!consequent || !alternate) return null;
-    return [...consequent, ...alternate];
+
+  switch (node.type) {
+    case 'Literal': {
+      if (typeof node.value === 'string') {
+        return [node.value];
+      }
+      return null;
+    }
+
+    case 'TemplateLiteral': {
+      if (node.expressions.length === 0) {
+        if (node.quasis.length > 0) {
+          return [node.quasis.map(q => q.value.cooked ?? q.value.raw).join('')];
+        }
+        return [''];
+      }
+
+      let current = [node.quasis[0].value.cooked ?? node.quasis[0].value.raw];
+      for (let i = 0; i < node.expressions.length; i++) {
+        const exprCands = extractFiniteStringCandidates(node.expressions[i], limit);
+        if (!exprCands || exprCands.length === 0) return null;
+
+        const nextQuasi = node.quasis[i + 1].value.cooked ?? node.quasis[i + 1].value.raw;
+        if (current.length * exprCands.length > limit) return null;
+
+        const next = [];
+        for (const prefix of current) {
+          for (const cand of exprCands) {
+            next.push(prefix + cand + nextQuasi);
+          }
+        }
+        current = Array.from(new Set(next));
+        if (current.length > limit) return null;
+      }
+      return current;
+    }
+
+    case 'BinaryExpression': {
+      if (node.operator !== '+') return null;
+      const left = extractFiniteStringCandidates(node.left, limit);
+      if (!left || left.length === 0) return null;
+      const right = extractFiniteStringCandidates(node.right, limit);
+      if (!right || right.length === 0) return null;
+
+      if (left.length * right.length > limit) return null;
+
+      const combined = [];
+      for (const l of left) {
+        for (const r of right) {
+          combined.push(l + r);
+        }
+      }
+      const unique = Array.from(new Set(combined));
+      if (unique.length > limit) return null;
+      return unique;
+    }
+
+    case 'ConditionalExpression': {
+      // Preserve effects in conditional tests by only collecting alternatives and leaving source unchanged
+      const consequent = extractFiniteStringCandidates(node.consequent, limit);
+      if (!consequent || consequent.length === 0) return null;
+      const alternate = extractFiniteStringCandidates(node.alternate, limit);
+      if (!alternate || alternate.length === 0) return null;
+
+      const unique = Array.from(new Set([...consequent, ...alternate]));
+      if (unique.length > limit) return null;
+      return unique;
+    }
+
+    case 'ParenthesizedExpression':
+      return extractFiniteStringCandidates(node.expression, limit);
+
+    default:
+      return null;
   }
-  if (node.type === 'Literal' && typeof node.value === 'string') {
-    return [node.value];
-  }
-  if (node.type === 'TemplateLiteral' && node.expressions.length === 0 && node.quasis.length > 0) {
-    return [node.quasis.map(q => q.value.cooked ?? q.value.raw).join('')];
-  }
-  return null;
 }
 
 /**
  * Classifies the argument of an ImportExpression (dynamic import).
+ * Exported for Ruby bundler reuse on executable finite conditional imports.
  * @param {any} sourceNode
  * @returns {{ classification: 'literal' | 'finite_set' | 'nonliteral', specifier: string | null, specifiers?: string[], finite_set?: string[], finiteSet?: string[], candidates?: string[] }}
  */
-function classifyDynamicImportArgument(sourceNode) {
+export function classifyDynamicImportArgument(sourceNode) {
   if (!sourceNode) {
     return { classification: 'nonliteral', specifier: null };
   }
 
+  // Fastpaths: actual literal string or 0-expression template
   if (sourceNode.type === 'Literal' && typeof sourceNode.value === 'string') {
     return { classification: 'literal', specifier: sourceNode.value };
   }
 
-  if (sourceNode.type === 'TemplateLiteral') {
-    if (sourceNode.expressions.length === 0 && sourceNode.quasis.length > 0) {
-      const specifier = sourceNode.quasis.map(q => q.value.cooked ?? q.value.raw).join('');
-      return { classification: 'literal', specifier };
-    }
-    // Template with expressions: not a simple literal
-    return { classification: 'nonliteral', specifier: null };
+  if (sourceNode.type === 'TemplateLiteral' && sourceNode.expressions.length === 0 && sourceNode.quasis.length > 0) {
+    const specifier = sourceNode.quasis.map(q => q.value.cooked ?? q.value.raw).join('');
+    return { classification: 'literal', specifier };
   }
 
-  if (sourceNode.type === 'ConditionalExpression') {
-    const branches = extractConditionalStringLiterals(sourceNode);
-    if (branches && branches.length > 0) {
-      const unique = Array.from(new Set(branches));
-      return {
-        classification: 'finite_set',
-        specifier: null,
-        specifiers: unique,
-        candidates: unique,
-        finite_set: unique,
-        finiteSet: unique,
-      };
-    }
+  // Complex finite expressions (binary '+', template interpolation, conditionals)
+  const candidates = extractFiniteStringCandidates(sourceNode, 128);
+  if (candidates && candidates.length > 0) {
+    return {
+      classification: 'finite_set',
+      specifier: null,
+      specifiers: candidates,
+      candidates,
+      finite_set: candidates,
+      finiteSet: candidates,
+    };
   }
 
   return { classification: 'nonliteral', specifier: null };

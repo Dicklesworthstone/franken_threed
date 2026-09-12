@@ -9,7 +9,8 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { rollup } from 'rollup';
 
-import { analyzeModuleAst } from './ast_analyzer.mjs';
+import { analyzeModuleAst, classifyDynamicImportArgument } from './ast_analyzer.mjs';
+import * as walk from 'acorn-walk';
 import { parseHtmlEntries } from './html_parser.mjs';
 import { resolveModuleSpecifier, urlToFilePath } from './resolver.mjs';
 
@@ -60,8 +61,24 @@ function isRelativeUrl(url) {
 }
 
 /**
- * Creates a Rollup plugin utilizing FrankenThreeD's W3C import-map resolver
- * and static module asset emission (new URL(..., import.meta.url)).
+ * Checks whether a URL is an external runtime route (http:, https:, or data:).
+ * @param {string} url
+ * @returns {boolean}
+ */
+function isExternalUrl(url) {
+  if (!url || typeof url !== 'string') return false;
+  try {
+    const protocol = new URL(url, 'file:///').protocol;
+    return protocol === 'http:' || protocol === 'https:' || protocol === 'data:';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Creates a Rollup plugin utilizing FrankenThreeD's W3C import-map resolver,
+ * static module asset emission (new URL(..., import.meta.url)), and executable
+ * finite dynamic import chunk emission (import(flag ? './a.js' : './b.js')).
  * @param {Object} options
  * @param {{ imports?: Record<string, string | null>, scopes?: Record<string, Record<string, string | null>> }} [options.importMap]
  * @param {string} options.mapBaseUrl
@@ -76,9 +93,21 @@ export function f3dRollupPlugin(options = {}) {
   const inlineModules = options.inlineModules || new Map();
   const retainedModuleUrls = options.retainedModuleUrls || new Map();
   const emittedAssetsByPath = new Map();
+  const emittedChunksByUrl = new Map();
+  const dynamicChunkRefIds = new Set();
 
   return {
     name: 'f3d-ingest-resolver',
+
+    resolveFileUrl({ referenceId, relativePath }) {
+      if (dynamicChunkRefIds.has(referenceId)) {
+        const rel = relativePath.startsWith('./') || relativePath.startsWith('../')
+          ? relativePath
+          : `./${relativePath}`;
+        return JSON.stringify(rel);
+      }
+      return null;
+    },
 
     resolveId(source, importer) {
       if (inlineModules.has(source)) {
@@ -97,6 +126,9 @@ export function f3dRollupPlugin(options = {}) {
         // Both retained imports and bundled imports must reach the same browser module.
         // These URLs keep their query/fragment identity and are relative to output chunks.
         return { id: retainedModuleUrls.get(resolvedUrl), external: true };
+      }
+      if (isExternalUrl(resolvedUrl)) {
+        return { id: resolvedUrl, external: true };
       }
       return resolvedUrl;
     },
@@ -129,23 +161,18 @@ export function f3dRollupPlugin(options = {}) {
     transform(code, id) {
       if (!code || typeof code !== 'string') return null;
 
+      const moduleDir = getModuleDir(id, mapBaseUrl);
+      const referrerUrl = id.startsWith('file://')
+        ? id
+        : (path.isAbsolute(id) ? pathToFileURL(id).href : mapBaseUrl);
+
+      const edits = [];
+
+      // 1. Asset reference replacements: new URL(..., import.meta.url)
       const analysis = analyzeModuleAst(code, id);
       const assetRefs = analysis && analysis.assetReferences ? analysis.assetReferences : [];
-      if (assetRefs.length === 0) return null;
 
-      const moduleDir = getModuleDir(id, mapBaseUrl);
-
-      // Sort in descending order of source_span start offset to perform non-shifting slice replacements
-      const sortedRefs = [...assetRefs].sort((a, b) => {
-        const spanA = a.source_span || a.sourceSpan;
-        const spanB = b.source_span || b.sourceSpan;
-        return spanB.start.offset - spanA.start.offset;
-      });
-
-      let transformedCode = code;
-      let hasChanges = false;
-
-      for (const ref of sortedRefs) {
+      for (const ref of assetRefs) {
         const rawSpecifier = ref.specifier;
         if (!rawSpecifier || typeof rawSpecifier !== 'string') continue;
 
@@ -195,11 +222,104 @@ export function f3dRollupPlugin(options = {}) {
           ? `new URL(import.meta.ROLLUP_FILE_URL_${refId} + ${JSON.stringify(suffix)})`
           : `new URL(import.meta.ROLLUP_FILE_URL_${refId})`;
 
-        transformedCode = transformedCode.slice(0, start) + replacement + transformedCode.slice(end);
-        hasChanges = true;
+        edits.push({
+          type: 'replace',
+          pos: start,
+          end: end,
+          priority: 2,
+          text: replacement
+        });
       }
 
-      if (!hasChanges) return null;
+      // 2. Finite dynamic import replacements: import(flag ? './a.js' : './b.js')
+      // Emits candidate branches as separate chunks (with preserveSignature: 'strict')
+      // and wraps the dynamic argument with a safe own-key runtime specifier mapping.
+      let ast;
+      try {
+        ast = this.parse(code);
+      } catch {
+        ast = null;
+      }
+
+      if (ast) {
+        walk.simple(ast, {
+          ImportExpression: (node) => {
+            if (!node.source) return;
+            const classified = classifyDynamicImportArgument(node.source);
+            if (!classified || classified.classification !== 'finite_set' || !classified.candidates || classified.candidates.length === 0) {
+              return;
+            }
+
+            const uniqueBranches = Array.from(new Set(classified.candidates));
+            const specifierMap = new Map();
+
+            for (const cand of uniqueBranches) {
+              const resolvedUrl = resolveModuleSpecifier(cand, referrerUrl, importMap, {
+                mapBaseUrl,
+                packageRootUrl: options.packageRootUrl
+              });
+
+              if (retainedModuleUrls.has(resolvedUrl)) {
+                specifierMap.set(cand, JSON.stringify(retainedModuleUrls.get(resolvedUrl)));
+              } else if (isExternalUrl(resolvedUrl)) {
+                specifierMap.set(cand, JSON.stringify(resolvedUrl));
+              } else {
+                let chunkRefId = emittedChunksByUrl.get(resolvedUrl);
+                if (!chunkRefId) {
+                  chunkRefId = this.emitFile({
+                    type: 'chunk',
+                    id: resolvedUrl,
+                    preserveSignature: 'strict'
+                  });
+                  emittedChunksByUrl.set(resolvedUrl, chunkRefId);
+                  dynamicChunkRefIds.add(chunkRefId);
+                }
+                specifierMap.set(cand, `import.meta.ROLLUP_FILE_URL_${chunkRefId}`);
+              }
+            }
+
+            if (specifierMap.size > 0) {
+              const chain = Array.from(specifierMap.entries())
+                .map(([cand, targetExpr]) => `s === ${JSON.stringify(cand)} ? ${targetExpr} : `)
+                .join('');
+
+              const prefix = `(s => ${chain}s)(`;
+              const suffix = `)`;
+
+              // Composable insertions wrapping the argument preserve child edits inside the argument
+              edits.push({
+                type: 'insert',
+                pos: node.source.start,
+                priority: 1,
+                text: prefix
+              });
+              edits.push({
+                type: 'insert',
+                pos: node.source.end,
+                priority: 3,
+                text: suffix
+              });
+            }
+          }
+        });
+      }
+
+      if (edits.length === 0) return null;
+
+      // Sort descending by position; for coincident positions: suffix (end) before replace before prefix (start)
+      edits.sort((a, b) => {
+        if (b.pos !== a.pos) return b.pos - a.pos;
+        return (b.priority || 0) - (a.priority || 0);
+      });
+
+      let transformedCode = code;
+      for (const e of edits) {
+        if (e.type === 'insert') {
+          transformedCode = transformedCode.slice(0, e.pos) + e.text + transformedCode.slice(e.pos);
+        } else if (e.type === 'replace') {
+          transformedCode = transformedCode.slice(0, e.pos) + e.text + transformedCode.slice(e.end);
+        }
+      }
 
       return {
         code: transformedCode,
@@ -256,7 +376,23 @@ export async function bundleWithRollup(entryPath, options = {}) {
       throw new Error(`No module scripts found in ${entryPath}`);
     }
 
-    for (const s of parsed.moduleScripts) {
+    const localModuleScripts = parsed.moduleScripts.filter(s => !isExternalUrl(s.id));
+
+    // If all module scripts in HTML are external, no Rollup chunks are emitted
+    if (localModuleScripts.length === 0) {
+      return {
+        code: '',
+        modules: [],
+        isMultiChunk: false,
+        entryFiles: [],
+        files: {},
+        outputChunks: [],
+        chunks: [],
+        assets: []
+      };
+    }
+
+    for (const s of localModuleScripts) {
       if (s.inlineContent !== null) {
         inlineModules.set(s.id, s.inlineContent);
       }
@@ -268,7 +404,7 @@ export async function bundleWithRollup(entryPath, options = {}) {
     const seenInputIds = new Set();
     const uniqueInputScripts = [];
 
-    for (const s of parsed.moduleScripts) {
+    for (const s of localModuleScripts) {
       if (!seenInputIds.has(s.id)) {
         seenInputIds.add(s.id);
         uniqueInputScripts.push(s);

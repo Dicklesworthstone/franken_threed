@@ -12,7 +12,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { buildModuleGraph } from './module_graph.mjs';
-import { analyzeModuleAst } from './ast_analyzer.mjs';
+import { analyzeModuleAst, classifyDynamicImportArgument } from './ast_analyzer.mjs';
 import { parseHtmlEntries, parseSrcsetUrls } from './html_parser.mjs';
 import { bundleWithRollup } from './bundler.mjs';
 import { IngestionResolutionError } from './types.mjs';
@@ -1055,6 +1055,144 @@ export async function load(flag) {
 });
 
 // ---------------------------------------------------------------------------
+// DYNAMIC IMPORT EXTENDED BOUNDED STRING-SET EXTRACTION TESTS
+// ---------------------------------------------------------------------------
+
+test('Dynamic import: literal "+" concatenation and template interpolation resolve in module graph', async () => {
+  const scratch = makeScratchDir('f3d_dyn_extended_string_sets');
+
+  const branchA = path.join(scratch, 'branch_a.js');
+  const branchB = path.join(scratch, 'branch_b.js');
+  const branchC = path.join(scratch, 'branch_c.js');
+  fs.writeFileSync(branchA, `export const val = 'A';\n`, 'utf-8');
+  fs.writeFileSync(branchB, `export const val = 'B';\n`, 'utf-8');
+  fs.writeFileSync(branchC, `export const val = 'C';\n`, 'utf-8');
+
+  const entryFile = path.join(scratch, 'entry.js');
+  fs.writeFileSync(entryFile, `
+export async function load(flag, tier) {
+  const litConcat = await import('./branch_' + 'a.js');
+  const condConcat = await import('./branch_' + (flag ? 'a.js' : 'b.js'));
+  const templCond = await import(\`./branch_\${flag ? 'a' : 'b'}.js\`);
+  const nestedDedup = await import(\`./\${tier === 1 ? (flag ? 'branch_a' : 'branch_b') : (flag ? 'branch_a' : 'branch_c')}.js\`);
+  return { litConcat, condConcat, templCond, nestedDedup };
+}
+`, 'utf-8');
+
+  const graph = await buildModuleGraph(entryFile);
+  const entryUrl = pathToFileURL(entryFile).href;
+  const urlA = pathToFileURL(branchA).href;
+  const urlB = pathToFileURL(branchB).href;
+  const urlC = pathToFileURL(branchC).href;
+
+  const entryMod = graph.modules[entryUrl];
+  assert.ok(entryMod, 'Entry module must exist in graph');
+  assert.equal(entryMod.dynamic_imports.length, 4);
+
+  // 1. Literal '+' concatenation: classifies as finite_set
+  const dyn1 = entryMod.dynamic_imports[0];
+  assert.equal(dyn1.classification, 'finite_set');
+  assert.deepEqual(dyn1.finite_set, ['./branch_a.js']);
+  assert.equal(dyn1.unresolved, false);
+  assert.deepEqual(dyn1.resolved_ids, [urlA]);
+  assert.equal(dyn1.claims_closure, true);
+
+  // 2. Concatenation with conditional branches: classifies as finite_set
+  const dyn2 = entryMod.dynamic_imports[1];
+  assert.equal(dyn2.classification, 'finite_set');
+  assert.deepEqual(dyn2.finite_set, ['./branch_a.js', './branch_b.js']);
+  assert.equal(dyn2.unresolved, false);
+  assert.deepEqual(dyn2.resolved_ids, [urlA, urlB]);
+  assert.equal(dyn2.claims_closure, true);
+
+  // 3. Template interpolation with conditional branches: classifies as finite_set
+  const dyn3 = entryMod.dynamic_imports[2];
+  assert.equal(dyn3.classification, 'finite_set');
+  assert.deepEqual(dyn3.finite_set, ['./branch_a.js', './branch_b.js']);
+  assert.equal(dyn3.unresolved, false);
+  assert.deepEqual(dyn3.resolved_ids, [urlA, urlB]);
+  assert.equal(dyn3.claims_closure, true);
+
+  // 4. Nested conditional expressions with deduplication: classifies as finite_set
+  const dyn4 = entryMod.dynamic_imports[3];
+  assert.equal(dyn4.classification, 'finite_set');
+  assert.deepEqual(dyn4.finite_set, ['./branch_a.js', './branch_b.js', './branch_c.js']);
+  assert.equal(dyn4.unresolved, false);
+  assert.deepEqual(dyn4.resolved_ids, [urlA, urlB, urlC]);
+  assert.equal(dyn4.claims_closure, true);
+
+  // All candidate modules must be ingested into the graph
+  assert.ok(graph.modules[urlA]);
+  assert.ok(graph.modules[urlB]);
+  assert.ok(graph.modules[urlC]);
+  assert.equal(graph.summary.unresolved_dynamic_imports, 0);
+  assert.equal(graph.summary.total_modules, 4);
+});
+
+test('Dynamic import: missing candidate failure in template interpolation marks unresolved', async () => {
+  const scratch = makeScratchDir('f3d_dyn_missing_template_cand');
+  const branchA = path.join(scratch, 'branch_a.js');
+  fs.writeFileSync(branchA, `export const a = 1;\n`, 'utf-8');
+
+  const entryFile = path.join(scratch, 'entry.js');
+  fs.writeFileSync(entryFile, `
+export async function load(flag) {
+  return await import(\`./\${flag ? 'branch_a' : 'missing_file'}.js\`);
+}
+`, 'utf-8');
+
+  const graph = await buildModuleGraph(entryFile);
+  const entryUrl = pathToFileURL(entryFile).href;
+  const entryMod = graph.modules[entryUrl];
+  assert.ok(entryMod);
+  assert.equal(entryMod.dynamic_imports.length, 1);
+
+  const dyn = entryMod.dynamic_imports[0];
+  assert.equal(dyn.classification, 'finite_set');
+  assert.deepEqual(dyn.finite_set, ['./branch_a.js', './missing_file.js']);
+  assert.equal(dyn.unresolved, true);
+  assert.equal(dyn.claims_closure, false);
+  assert.equal(graph.summary.unresolved_dynamic_imports, 1);
+});
+
+test('Dynamic import: unsafe unknown expressions and non-string coercions remain unresolved', () => {
+  const code = `
+    import('./dir/' + unknownIdentifier);
+    import(\`./dir/\${unknownIdentifier}.js\`);
+    import(someFunctionCall());
+    import('./dir/' + 42);
+    import(\`./dir/\${42}.js\`);
+    import(tagged\`./dir/\${x}.js\`);
+    import('./dir/' - 'a.js');
+  `;
+  const analysis = analyzeModuleAst(code, 'file:///test/entry.js');
+  assert.equal(analysis.dynamicImports.length, 7);
+
+  for (let i = 0; i < analysis.dynamicImports.length; i++) {
+    const dyn = analysis.dynamicImports[i];
+    assert.equal(dyn.classification, 'nonliteral', `Expression ${i} must be classified as nonliteral`);
+    assert.equal(dyn.specifier, null);
+    assert.equal(dyn.unresolved, true);
+    assert.equal(dyn.finite_set, undefined);
+    assert.ok(dyn.source_span && dyn.sourceSpan, 'Source spans must be preserved');
+  }
+});
+
+test('Dynamic import: Cartesian expansion exceeding 128 candidates stays nonliteral', () => {
+  // 8 binary conditional expressions: 2^8 = 256 > 128
+  const code = `
+    import(\`\${b0?'a':'b'}\${b1?'a':'b'}\${b2?'a':'b'}\${b3?'a':'b'}\${b4?'a':'b'}\${b5?'a':'b'}\${b6?'a':'b'}\${b7?'a':'b'}\`);
+  `;
+  const analysis = analyzeModuleAst(code, 'file:///test/cap_test.js');
+  assert.equal(analysis.dynamicImports.length, 1);
+
+  const dyn = analysis.dynamicImports[0];
+  assert.equal(dyn.classification, 'nonliteral', 'Cartesian expansion exceeding limit must stay nonliteral');
+  assert.equal(dyn.unresolved, true);
+  assert.equal(dyn.finite_set, undefined);
+});
+
+// ---------------------------------------------------------------------------
 // PACKAGE.JSON EXPORTS RESOLUTION & NEGATIVE SHIELDS (6mv.1)
 // ---------------------------------------------------------------------------
 
@@ -1460,4 +1598,147 @@ test('parseSrcsetUrls extracts image candidate URLs per browser/WHATWG srcset se
   assert.deepEqual(parseSrcsetUrls(',  , ,'), []);
   assert.deepEqual(parseSrcsetUrls(null), []);
   assert.deepEqual(parseSrcsetUrls(undefined), []);
+});
+
+test('Positive: buildModuleGraph preserves external data: and finite dynamic candidates without filesystem reads', async () => {
+  const scratch = makeScratchDir('f3d_ext_module_graph');
+  fs.writeFileSync(path.join(scratch, 'local_branch.js'), `export const branch = 'LOCAL';\n`);
+
+  const dataStatic = 'data:text/javascript,export const staticVal = 42;';
+  const dataDyn = 'data:text/javascript,export const dynVal = 99;';
+
+  const mainCode = `
+import { staticVal } from ${JSON.stringify(dataStatic)};
+export { staticVal };
+
+export function loadDataOrLocal(flag) {
+  return import(flag ? ${JSON.stringify(dataDyn)} : './local_branch.js');
+}
+`;
+  const mainPath = path.join(scratch, 'main.js');
+  fs.writeFileSync(mainPath, mainCode);
+
+  const graph = await buildModuleGraph(mainPath);
+
+  assert.equal(graph.schema_version, '1.0.0');
+  assert.ok(Array.isArray(graph.external_modules), 'external_modules must be an array');
+  assert.ok(graph.external_modules.includes(dataStatic), 'external_modules must include static data URL');
+  assert.ok(graph.external_modules.includes(dataDyn), 'external_modules must include dynamic data URL');
+  assert.equal(graph.summary.total_external_modules, 2, 'total_external_modules must match count of distinct external URLs');
+
+  // Assert external modules are NOT queued as filesystem reads and have NO entries in modules map
+  assert.equal(graph.modules[dataStatic], undefined, 'External data: URL must never create a node in modules map');
+  assert.equal(graph.modules[dataDyn], undefined, 'External data: URL must never create a node in modules map');
+
+  const mainUrl = pathToFileURL(mainPath).href;
+  const mainNode = graph.modules[mainUrl];
+  assert.ok(mainNode, 'main.js node must exist in graph');
+  assert.equal(mainNode.static_imports[0].resolved_id, dataStatic);
+
+  assert.equal(mainNode.dynamic_imports.length, 1);
+  const dyn = mainNode.dynamic_imports[0];
+  assert.equal(dyn.classification, 'finite_set');
+  assert.equal(dyn.claims_closure, false, 'Dynamic import with external candidate must not claim closure');
+  assert.equal(dyn.claimsClosure, false);
+});
+
+test('Positive: Dynamic closure status drops through transitive local-to-external edge while standalone closed local branch stays closed', async () => {
+  const scratch = makeScratchDir('f3d_transitive_closure');
+
+  const dataLeaf = 'data:text/javascript,export const extLeaf = "EXT";';
+
+  fs.writeFileSync(
+    path.join(scratch, 'transitive_leaf.js'),
+    `import { extLeaf } from ${JSON.stringify(dataLeaf)};\nexport const leaf = extLeaf;\n`
+  );
+  fs.writeFileSync(
+    path.join(scratch, 'transitive_intermediate.js'),
+    `import { leaf } from './transitive_leaf.js';\nexport const intermediate = leaf;\n`
+  );
+
+  fs.writeFileSync(
+    path.join(scratch, 'standalone_helper.js'),
+    `export const helper = 'HELP';\n`
+  );
+  fs.writeFileSync(
+    path.join(scratch, 'standalone_closed.js'),
+    `import { helper } from './standalone_helper.js';\nexport const closedVal = helper;\n`
+  );
+
+  const mainCode = `
+export function loadTransitive() {
+  return import('./transitive_intermediate.js');
+}
+export function loadStandalone() {
+  return import('./standalone_closed.js');
+}
+`;
+  const mainPath = path.join(scratch, 'main.js');
+  fs.writeFileSync(mainPath, mainCode);
+
+  const graph = await buildModuleGraph(mainPath);
+
+  assert.ok(graph.external_modules.includes(dataLeaf));
+  assert.equal(graph.summary.total_external_modules, 1);
+
+  const mainUrl = pathToFileURL(mainPath).href;
+  const mainNode = graph.modules[mainUrl];
+  assert.ok(mainNode);
+
+  const dynTransitive = mainNode.dynamic_imports.find(d => d.specifier === './transitive_intermediate.js');
+  assert.ok(dynTransitive);
+  assert.equal(
+    dynTransitive.claims_closure,
+    false,
+    'Transitive local edge to external module must drop claims_closure'
+  );
+  assert.equal(dynTransitive.claimsClosure, false);
+
+  const dynStandalone = mainNode.dynamic_imports.find(d => d.specifier === './standalone_closed.js');
+  assert.ok(dynStandalone);
+  assert.equal(
+    dynStandalone.claims_closure,
+    true,
+    'Standalone fully-analyzed local branch must keep claims_closure === true'
+  );
+  assert.equal(dynStandalone.claimsClosure, true);
+});
+
+test('Positive: Cycle containing external dependency drops dynamic closure soundly via reverse-edge worklist', async () => {
+  const scratch = makeScratchDir('f3d_cycle_ext_closure');
+
+  const dataUrl = 'data:text/javascript,export const extNum = 7;';
+
+  fs.writeFileSync(
+    path.join(scratch, 'cycle_a.js'),
+    `import { b } from './cycle_b.js';\nexport const a = b;\n`
+  );
+  fs.writeFileSync(
+    path.join(scratch, 'cycle_b.js'),
+    `import { a } from './cycle_a.js';\nimport { extNum } from ${JSON.stringify(dataUrl)};\nexport const b = extNum;\n`
+  );
+
+  const mainCode = `
+export function loadCycle() {
+  return import('./cycle_a.js');
+}
+`;
+  const mainPath = path.join(scratch, 'main.js');
+  fs.writeFileSync(mainPath, mainCode);
+
+  const graph = await buildModuleGraph(mainPath);
+
+  assert.ok(graph.external_modules.includes(dataUrl));
+  assert.equal(graph.summary.total_external_modules, 1);
+  assert.ok(graph.cycles.length >= 1, 'Cycle between cycle_a and cycle_b must be detected');
+
+  const mainUrl = pathToFileURL(mainPath).href;
+  const mainNode = graph.modules[mainUrl];
+  const dynCycle = mainNode.dynamic_imports[0];
+  assert.equal(
+    dynCycle.claims_closure,
+    false,
+    'Cycle transitively reaching external data URL must drop claims_closure'
+  );
+  assert.equal(dynCycle.claimsClosure, false);
 });
