@@ -102,7 +102,12 @@ export const TEXTURE_USAGE_RENDER_ATTACHMENT = 16;
 import { isDetached, ensureSafePacketBytes } from "./memory_transport.js";
 
 export class WebGpuBridgeHost {
-  constructor() {
+  /**
+   * @param {Object} [options={}]
+   * @param {boolean} [options.wrongImplSkipBundleStateReset=false] - vqa.7 wrong-implementation toggle for the bundle-then-direct counterexample; default off; never set by production paths.
+   * @param {boolean} [options.wrongImplSkipReadbackDeviceCheck=false] - vqa.7 wrong-implementation toggle; default off.
+   */
+  constructor(options = {}) {
     this.adapter = null;
     this.device = null;
     this.capabilityRecord = null;
@@ -116,6 +121,8 @@ export class WebGpuBridgeHost {
     this.bufferEpochs = new Map();
     this.errorScopeActive = false;
     this.lastRenderTargetId = null;
+    this.wrongImplSkipBundleStateReset = options.wrongImplSkipBundleStateReset === true;
+    this.wrongImplSkipReadbackDeviceCheck = options.wrongImplSkipReadbackDeviceCheck === true;
   }
 
   clearDeviceResources() {
@@ -277,6 +284,12 @@ export class WebGpuBridgeHost {
 
     // Publish only a fully verified device. Numeric IDs never retain residency
     // from the previous device, even when the new device reuses those IDs.
+    this.publishDevice(adapter, device, capabilityRecord);
+
+    return capabilityRecord;
+  }
+
+  publishDevice(adapter, device, capabilityRecord) {
     this.clearDeviceResources();
     this.adapter = adapter;
     this.device = device;
@@ -291,8 +304,16 @@ export class WebGpuBridgeHost {
       this.capabilityRecord = null;
       this.deviceGeneration++;
     });
+  }
 
-    return capabilityRecord;
+  /**
+   * vqa.7 test seam that deterministically replaces a live device; never called by production paths.
+   *
+   * @param {GPUAdapter} adapter
+   * @param {GPUDevice} device
+   */
+  installDeviceForTest(adapter, device) {
+    this.publishDevice(adapter, device, null);
   }
 
   /**
@@ -1825,13 +1846,15 @@ export class WebGpuBridgeHost {
 
             // WebGPU Spec Invariant: executeBundles clears pass state!
             // Any following direct draw MUST explicitly rebind pipeline, bind groups, and vertex buffers.
-            passState = {
-              pipelineId: null,
-              uniformBufferId: null,
-              dynamicOffset: null,
-              vertexBufferId: null,
-              boundPipelineId: null,
-            };
+            if (!this.wrongImplSkipBundleStateReset) {
+              passState = {
+                pipelineId: null,
+                uniformBufferId: null,
+                dynamicOffset: null,
+                vertexBufferId: null,
+                boundPipelineId: null,
+              };
+            }
             break;
           }
 
@@ -1944,7 +1967,7 @@ export class WebGpuBridgeHost {
     await buffer.mapAsync(GPUMapMode.READ, 0, byteLength);
     let copy;
     try {
-      if (this.device !== device || this.deviceGeneration !== deviceGeneration) {
+      if (!this.wrongImplSkipReadbackDeviceCheck && (this.device !== device || this.deviceGeneration !== deviceGeneration)) {
         throw new Error("readbackBuffer: device changed before mapping completed");
       }
       copy = new Uint8Array(buffer.getMappedRange(0, byteLength).slice(0));

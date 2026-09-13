@@ -59,7 +59,7 @@ use f3d_core::{
     layout::{
         AFFINE_ROWS_BYTES, AffineRows, COLOR_UNIFORM_BYTES,
         DEFAULT_MIN_UNIFORM_BUFFER_OFFSET_ALIGNMENT, LayoutError, VERTEX_POS_UV_STRIDE,
-        VertexPosUv, WGSL_AFFINE_ROWS_DECLARATION,
+        VertexPosUv, WGSL_AFFINE_ROWS_DECLARATION, WGSL_COLOR_UNIFORM_DECLARATION,
     },
     ownership::{
         BorrowScope, BorrowToken, DataVersion, Epoch, OwnershipError, PerUseByteBuffer, RegionState,
@@ -411,6 +411,15 @@ pub const BUFFER_USAGE_COPY_DST: u32 = 8;
 pub const BUFFER_USAGE_VERTEX: u32 = 32;
 /// GPUBufferUsage flag: uniform buffer.
 pub const BUFFER_USAGE_UNIFORM: u32 = 64;
+
+/// Persistent source buffer ID for AffineRows storage uploads (workload b / tmt.5).
+pub const AFFINE_ROWS_STORAGE_SRC_BUFFER_ID: u32 = 610;
+/// Persistent destination buffer slot 0 for AffineRows storage uploads (workload b / tmt.5).
+pub const AFFINE_ROWS_STORAGE_DST_SLOT_0: u32 = 611;
+/// Persistent destination buffer slot 1 for AffineRows storage uploads (workload b / tmt.5).
+pub const AFFINE_ROWS_STORAGE_DST_SLOT_1: u32 = 612;
+/// Default persistent storage buffer ID alias (workload b / tmt.5).
+pub const AFFINE_ROWS_STORAGE_BUFFER_ID: u32 = AFFINE_ROWS_STORAGE_SRC_BUFFER_ID;
 
 /// GPUTextureUsage flag: copy source.
 pub const TEXTURE_USAGE_COPY_SRC: u32 = 1;
@@ -2250,6 +2259,236 @@ pub fn pack_affine_rows_uniform_bytes(affine_rows: &[f32]) -> Result<Vec<u8>, Pa
     Ok(uniform_bytes)
 }
 
+/// Packs a flat slice of affine transform rows (`12 * N` f32 values) into packed 48-byte storage buffer records.
+///
+/// Reuses [`AffineRows::to_bytes`] for each 12-float record, packing records contiguously
+/// into an exact `48 * N` byte buffer (no 256-byte uniform padding).
+/// Preserves exact bit patterns including `-0.0` and NaN payloads.
+pub fn pack_affine_rows_storage_bytes(affine_rows: &[f32]) -> Result<Vec<u8>, PacketEncodeError> {
+    if affine_rows.is_empty() || affine_rows.len() % 12 != 0 {
+        return Err(PacketEncodeError::InvalidDimensions(format!(
+            "affine_rows length {} must be non-empty and a multiple of 12",
+            affine_rows.len()
+        )));
+    }
+    let n_records = u32::try_from(affine_rows.len() / 12).map_err(|_| {
+        PacketEncodeError::InvalidDimensions("transform count exceeds u32::MAX".to_string())
+    })?;
+    let storage_buffer_size = n_records.checked_mul(48).ok_or_else(|| {
+        PacketEncodeError::InvalidDimensions("storage buffer size overflow".to_string())
+    })? as usize;
+
+    let mut storage_bytes = Vec::with_capacity(storage_buffer_size);
+    for chunk in affine_rows.chunks_exact(12) {
+        let affine = AffineRows::new(
+            [chunk[0], chunk[1], chunk[2], chunk[3]],
+            [chunk[4], chunk[5], chunk[6], chunk[7]],
+            [chunk[8], chunk[9], chunk[10], chunk[11]],
+        );
+        storage_bytes.extend_from_slice(&affine.to_bytes());
+    }
+    Ok(storage_bytes)
+}
+
+/// Builds a [`GpuSubmissionPacket`] initializing persistent buffers for AffineRows storage uploads
+/// (workload b, bead f3d-03-reference-profiles-and-bridge-tmt.5).
+///
+/// Allocates outside the repeated frame measurement:
+/// 1. Source buffer 610 (`COPY_SRC | COPY_DST`) of size `48 * N`.
+/// 2. Destination slot 611 (`MAP_READ | COPY_DST`) of size `48 * N`.
+/// 3. Destination slot 612 (`MAP_READ | COPY_DST`) of size `48 * N`.
+pub fn build_affine_rows_storage_upload_init_submission(
+    expected_records: u32,
+) -> Result<GpuSubmissionPacket, PacketEncodeError> {
+    if expected_records == 0 {
+        return Err(PacketEncodeError::InvalidDimensions(
+            "expected_records must be greater than zero".to_string(),
+        ));
+    }
+    let buffer_size = expected_records.checked_mul(48).ok_or_else(|| {
+        PacketEncodeError::InvalidDimensions("storage upload buffer size overflow".to_string())
+    })?;
+
+    with_global_resource_table(|table| {
+        table.register(AFFINE_ROWS_STORAGE_SRC_BUFFER_ID);
+        table.register(AFFINE_ROWS_STORAGE_DST_SLOT_0);
+        table.register(AFFINE_ROWS_STORAGE_DST_SLOT_1);
+    });
+
+    let mut packet = GpuSubmissionPacket::new();
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: AFFINE_ROWS_STORAGE_SRC_BUFFER_ID,
+        size: buffer_size,
+        usage: BUFFER_USAGE_COPY_SRC | BUFFER_USAGE_COPY_DST,
+    });
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: AFFINE_ROWS_STORAGE_DST_SLOT_0,
+        size: buffer_size,
+        usage: BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST,
+    });
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: AFFINE_ROWS_STORAGE_DST_SLOT_1,
+        size: buffer_size,
+        usage: BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST,
+    });
+    Ok(packet)
+}
+
+/// Builds a [`GpuSubmissionPacket`] for a single frame update in the persistent AffineRows storage upload loop
+/// (workload b, bead f3d-03-reference-profiles-and-bridge-tmt.5).
+///
+/// Invariants:
+/// - Reuses [`pack_affine_rows_storage_bytes`] for bit-exact float layout preservation (-0.0, NaN payloads).
+/// - No buffer creation or re-creation per frame (reallocates nothing).
+/// - Emits exactly two commands:
+///   1. `GpuCommand::WriteBuffer` writing packed `48 * N` bytes to source buffer 610 at offset 0.
+///   2. `GpuCommand::CopyBufferToBuffer` copying `48 * N` bytes from buffer 610 to selected destination slot (611 or 612).
+pub fn build_affine_rows_storage_upload_frame_submission(
+    affine_rows: &[f32],
+    expected_records: u32,
+    destination_slot: u32,
+) -> Result<GpuSubmissionPacket, PacketEncodeError> {
+    if expected_records == 0 {
+        return Err(PacketEncodeError::InvalidDimensions(
+            "expected_records must be greater than zero".to_string(),
+        ));
+    }
+    if destination_slot != AFFINE_ROWS_STORAGE_DST_SLOT_0
+        && destination_slot != AFFINE_ROWS_STORAGE_DST_SLOT_1
+    {
+        return Err(PacketEncodeError::InvalidDimensions(format!(
+            "destination_slot {destination_slot} must be {} or {}",
+            AFFINE_ROWS_STORAGE_DST_SLOT_0, AFFINE_ROWS_STORAGE_DST_SLOT_1
+        )));
+    }
+    let expected_floats = (expected_records as usize)
+        .checked_mul(12)
+        .ok_or_else(|| {
+            PacketEncodeError::InvalidDimensions("expected_records * 12 overflow".to_string())
+        })?;
+    if affine_rows.len() != expected_floats {
+        return Err(PacketEncodeError::InvalidDimensions(format!(
+            "record count mismatch: expected {expected_records} records ({expected_floats} floats), got {} floats",
+            affine_rows.len()
+        )));
+    }
+
+    let storage_bytes = pack_affine_rows_storage_bytes(affine_rows)?;
+    let total_bytes = storage_bytes.len() as u64;
+
+    let mut packet = GpuSubmissionPacket::new();
+    packet.push(GpuCommand::WriteBuffer {
+        buffer_id: AFFINE_ROWS_STORAGE_SRC_BUFFER_ID,
+        offset: 0,
+        data: storage_bytes,
+    });
+    packet.push(GpuCommand::CopyBufferToBuffer {
+        source_buffer_id: AFFINE_ROWS_STORAGE_SRC_BUFFER_ID,
+        source_offset: 0,
+        destination_buffer_id: destination_slot,
+        destination_offset: 0,
+        size: total_bytes,
+        epoch: Epoch::ZERO,
+    });
+    Ok(packet)
+}
+
+/// Individual callback operation emitted by the storage upload callback planner (workload b / tmt.5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StorageUploadCallbackOp {
+    /// Host `f3dHost.writeBuffer(buffer_id, offset, bytes)` callback.
+    WriteBuffer {
+        /// Target buffer identifier (e.g. source buffer 610).
+        buffer_id: u32,
+        /// Byte offset within target buffer.
+        offset: u32,
+        /// Owned packed byte payload.
+        bytes: Vec<u8>,
+    },
+    /// Host `f3dHost.copyBufferToBuffer(src, src_off, dst, dst_off, size)` callback.
+    CopyBufferToBuffer {
+        /// Source buffer identifier (e.g. source buffer 610).
+        src: u32,
+        /// Byte offset within source buffer (Number in JS).
+        src_off: u32,
+        /// Destination buffer identifier (e.g. destination slot 611 or 612).
+        dst: u32,
+        /// Byte offset within destination buffer (Number in JS).
+        dst_off: u32,
+        /// Number of bytes to copy (Number in JS).
+        size: u32,
+    },
+}
+
+/// Maps a storage upload frame [`GpuSubmissionPacket`] to an ordered list of callback operations (workload b / tmt.5).
+///
+/// Converts:
+/// - `GpuCommand::WriteBuffer` to `writeBuffer(buffer_id, offset, bytes)`
+/// - `GpuCommand::CopyBufferToBuffer` to `copyBufferToBuffer(src, src_off, dst, dst_off, size)`
+pub fn map_storage_upload_submission_to_callback_ops(
+    packet: GpuSubmissionPacket,
+) -> Result<Vec<StorageUploadCallbackOp>, PacketEncodeError> {
+    let mut ops = Vec::with_capacity(packet.commands().len());
+    for cmd in packet.into_commands() {
+        match cmd {
+            GpuCommand::WriteBuffer { buffer_id, offset, data } => {
+                ops.push(StorageUploadCallbackOp::WriteBuffer {
+                    buffer_id,
+                    offset,
+                    bytes: data,
+                });
+            }
+            GpuCommand::CopyBufferToBuffer {
+                source_buffer_id,
+                source_offset,
+                destination_buffer_id,
+                destination_offset,
+                size,
+                ..
+            } => {
+                let src_off = u32::try_from(source_offset).map_err(|_| {
+                    PacketEncodeError::InvalidDimensions("source_offset exceeds u32".to_string())
+                })?;
+                let dst_off = u32::try_from(destination_offset).map_err(|_| {
+                    PacketEncodeError::InvalidDimensions("destination_offset exceeds u32".to_string())
+                })?;
+                let copy_size = u32::try_from(size).map_err(|_| {
+                    PacketEncodeError::InvalidDimensions("copy size exceeds u32".to_string())
+                })?;
+                ops.push(StorageUploadCallbackOp::CopyBufferToBuffer {
+                    src: source_buffer_id,
+                    src_off,
+                    dst: destination_buffer_id,
+                    dst_off,
+                    size: copy_size,
+                });
+            }
+            other => {
+                return Err(PacketEncodeError::InvalidDimensions(format!(
+                    "unexpected command in storage upload frame: {other:?}"
+                )));
+            }
+        }
+    }
+    Ok(ops)
+}
+
+/// Pure helper that maps [`build_affine_rows_storage_upload_frame_submission`] to an ordered callback op list (workload b / tmt.5).
+///
+/// Guards and packed bytes are identical to the bulk frame submission, ensuring the GPU work matches by construction.
+pub fn build_affine_rows_storage_upload_callback_ops(
+    affine_rows: &[f32],
+    expected_records: u32,
+    destination_slot: u32,
+) -> Result<Vec<StorageUploadCallbackOp>, PacketEncodeError> {
+    let packet = build_affine_rows_storage_upload_frame_submission(
+        affine_rows,
+        expected_records,
+        destination_slot,
+    )?;
+    map_storage_upload_submission_to_callback_ops(packet)
+}
+
 /// Builds an offscreen submission packet drawing `N` triangles with `N` distinct
 /// AffineRows transforms at 256-byte dynamic offsets in a single offscreen render pass.
 ///
@@ -2598,6 +2837,38 @@ pub fn build_buffer_copy_submission(
     Ok(packet)
 }
 
+/// Builds a submission packet opening a zero-draw canvas render pass immediately followed by
+/// an opcode 20 buffer-to-buffer copy.
+///
+/// Reuses `build_buffer_copy_submission` and inserts a zero-draw canvas `RenderPass`
+/// directly before the trailing `CopyBufferToBuffer` command.
+pub fn build_render_then_copy_submission(
+    data: &[u8],
+    source_offset: u32,
+    destination_offset: u32,
+    size: u32,
+) -> Result<GpuSubmissionPacket, PacketEncodeError> {
+    let mut packet = build_buffer_copy_submission(data, source_offset, destination_offset, size)?;
+    let insert_idx = packet.commands.len().saturating_sub(1);
+    packet.commands.insert(
+        insert_idx,
+        GpuCommand::RenderPass {
+            target_type: TARGET_CANVAS,
+            target_id: 0,
+            clear_color: [0.0, 0.0, 0.0, 1.0],
+            pipeline_id: 0,
+            vertex_buffer_id: 0,
+            vertex_count: 0,
+            uniform_dynamic_offset: 0,
+            uniform_buffer_id: 0,
+            load_op: LOAD_OP_CLEAR,
+            store_op: STORE_OP_STORE,
+            pass_flags: PASS_FLAG_NEW_PASS,
+        },
+    );
+    Ok(packet)
+}
+
 /// Builds a textured WGSL triangle submission packet using `f3d_core::layout::AffineRows`
 /// and sampling from a 2D texture (bead vqa.6).
 pub fn build_textured_affine_triangle_packet(
@@ -2869,10 +3140,9 @@ pub fn build_red_a_blue_b_submission(per_use_versioned: bool) -> GpuSubmissionPa
         usage: BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST,
     });
 
-    let flat_shader = "\
-struct ColorUniform {\n\
-    color: vec4<f32>,\n\
-};\n\
+    let flat_shader = [
+        WGSL_COLOR_UNIFORM_DECLARATION,
+        "\n\
 @group(0) @binding(0)\n\
 var<uniform> u: ColorUniform;\n\
 \n\
@@ -2888,12 +3158,14 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4<f32> {\n\
 \n\
 @fragment\n\
 fn fs_main() -> @location(0) vec4<f32> {\n\
-    return u.color;\n\
-}\n";
+    return u.rgba;\n\
+}\n",
+    ]
+    .concat();
 
     packet.push(GpuCommand::CreatePipeline {
         pipeline_id: 200,
-        wgsl_code: flat_shader.to_string(),
+        wgsl_code: flat_shader,
         target_format: 2, // rgba8unorm
         has_vertex_buffer: false,
         has_uniform_buffer: true,
@@ -3071,10 +3343,9 @@ pub fn build_bundle_then_direct_draw_submission() -> GpuSubmissionPacket {
     });
 
     // 5. Shader and Pipeline: Flat color uniform with VertexPosUv layout
-    let flat_shader = "\
-struct ColorUniform {\n\
-    color: vec4<f32>,\n\
-};\n\
+    let flat_shader = [
+        WGSL_COLOR_UNIFORM_DECLARATION,
+        "\n\
 @group(0) @binding(0)\n\
 var<uniform> u: ColorUniform;\n\
 \n\
@@ -3090,13 +3361,15 @@ fn vs_main(in: VertexInput) -> @builtin(position) vec4<f32> {\n\
 \n\
 @fragment\n\
 fn fs_main() -> @location(0) vec4<f32> {\n\
-    return u.color;\n\
-}\n";
+    return u.rgba;\n\
+}\n",
+    ]
+    .concat();
 
     let pipeline_id = 200;
     packet.push(GpuCommand::CreatePipeline {
         pipeline_id,
-        wgsl_code: flat_shader.to_string(),
+        wgsl_code: flat_shader,
         target_format: TARGET_FORMAT_RGBA8UNORM,
         has_vertex_buffer: true,
         has_uniform_buffer: true,
@@ -3161,6 +3434,242 @@ fn fs_main() -> @location(0) vec4<f32> {\n\
     });
 
     // 11. Copy offscreen target to readback buffer
+    packet.push(GpuCommand::CopyTextureToBuffer {
+        texture_id: target_texture_id,
+        buffer_id: readback_buffer_id,
+        width: 64,
+        height: 64,
+        epoch: Epoch::ZERO,
+    });
+
+    packet
+}
+
+/// Builds a bundle-then-direct-draw submission packet that warms the decoder's
+/// `passState` cache before executing bundles (§6.7, §8.2, vqa.7).
+///
+/// Unlike [`build_bundle_then_direct_draw_submission`], which only issues direct draw
+/// after executing bundles, this submission executes a direct draw of Triangle 2
+/// *before* [`GpuCommand::ExecuteBundles`] (filling the decoder cache), then executes
+/// bundles, and then executes the identical direct draw again.
+///
+/// Sequence:
+/// 1. Create uniform buffer 1 (Green at 0, Blue at 256) and upload colors.
+/// 2. Create vertex buffer 2 (Triangle 1, left) and upload vertices.
+/// 3. Create vertex buffer 3 (Triangle 2, right) and upload vertices.
+/// 4. Create 64x64 target texture 10 and readback buffer 20.
+/// 5. Create flat color pipeline 200 (`VertexPosUv` layout, `ColorUniform`).
+/// 6. Record RenderBundle 1 (Triangle 1, Green at offset 0, 3 vertices).
+/// 7. RenderPass opener: clear black, vertex_count 0, `PASS_FLAG_NEW_PASS`.
+/// 8. Direct draw of Triangle 2 before bundle: pipeline 200, uniform 1 offset 256, vb 3,
+///    vertex_count 3, `PASS_FLAG_NONE`. This fills the decoder cache.
+/// 9. Execute bundles: `[1]` if `!empty_bundle_list`, else `[]`.
+/// 10. Identical direct draw again: same pipeline, uniform, offset, vb, vertex_count and `PASS_FLAG_NONE`.
+/// 11. CopyTextureToBuffer, texture 10 -> buffer 20, 64x64.
+pub fn build_bundle_then_direct_warm_cache_submission(empty_bundle_list: bool) -> GpuSubmissionPacket {
+    // Register resource IDs in the generational slot table (§6.5, vqa.6)
+    with_global_resource_table(|table| {
+        table.register(1);   // uniform_buffer_id
+        table.register(2);   // vb_bundle_id
+        table.register(3);   // vb_direct_id
+        table.register(10);  // target_texture_id
+        table.register(20);  // readback_buffer_id
+        table.register(200); // pipeline_id
+    });
+
+    let mut packet = GpuSubmissionPacket::new();
+
+    // 1. Uniform buffer with Green at offset 0 and Blue at offset 256
+    let uniform_buffer_id = 1;
+    let mut uniform_bytes = Vec::with_capacity(512);
+    let green_color = [0.0f32, 1.0f32, 0.0f32, 1.0f32];
+    for c in green_color {
+        uniform_bytes.extend_from_slice(&c.to_le_bytes());
+    }
+    uniform_bytes.resize(256, 0);
+    let blue_color = [0.0f32, 0.0f32, 1.0f32, 1.0f32];
+    for c in blue_color {
+        uniform_bytes.extend_from_slice(&c.to_le_bytes());
+    }
+    uniform_bytes.resize(512, 0);
+
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: uniform_buffer_id,
+        size: 512,
+        usage: BUFFER_USAGE_UNIFORM | BUFFER_USAGE_COPY_DST,
+    });
+    packet.push(GpuCommand::WriteBuffer {
+        buffer_id: uniform_buffer_id,
+        offset: 0,
+        data: uniform_bytes,
+    });
+
+    // 2. Vertex buffer 1: Triangle 1 (left side)
+    let vb_bundle_id = 2;
+    let tri1 = [
+        VertexPosUv::new([-1.0, -1.0, 0.0], [0.0, 0.0]),
+        VertexPosUv::new([0.0, -1.0, 0.0], [0.5, 0.0]),
+        VertexPosUv::new([0.0, 1.0, 0.0], [0.5, 1.0]),
+    ];
+    let mut tri1_bytes = Vec::with_capacity(tri1.len() * VertexPosUv::BYTE_SIZE);
+    for v in &tri1 {
+        tri1_bytes.extend_from_slice(&v.to_bytes());
+    }
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: vb_bundle_id,
+        size: tri1_bytes.len() as u32,
+        usage: BUFFER_USAGE_VERTEX | BUFFER_USAGE_COPY_DST,
+    });
+    packet.push(GpuCommand::WriteBuffer {
+        buffer_id: vb_bundle_id,
+        offset: 0,
+        data: tri1_bytes,
+    });
+
+    // 3. Vertex buffer 2: Triangle 2 (right side)
+    let vb_direct_id = 3;
+    let tri2 = [
+        VertexPosUv::new([0.0, -1.0, 0.0], [0.5, 0.0]),
+        VertexPosUv::new([1.0, -1.0, 0.0], [1.0, 0.0]),
+        VertexPosUv::new([1.0, 1.0, 0.0], [1.0, 1.0]),
+    ];
+    let mut tri2_bytes = Vec::with_capacity(tri2.len() * VertexPosUv::BYTE_SIZE);
+    for v in &tri2 {
+        tri2_bytes.extend_from_slice(&v.to_bytes());
+    }
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: vb_direct_id,
+        size: tri2_bytes.len() as u32,
+        usage: BUFFER_USAGE_VERTEX | BUFFER_USAGE_COPY_DST,
+    });
+    packet.push(GpuCommand::WriteBuffer {
+        buffer_id: vb_direct_id,
+        offset: 0,
+        data: tri2_bytes,
+    });
+
+    // 4. Target texture and readback buffer (64x64)
+    let target_texture_id = 10;
+    let readback_buffer_id = 20;
+    let bytes_per_row = 256u32;
+    let readback_size = bytes_per_row * 64;
+
+    packet.push(GpuCommand::CreateTexture {
+        texture_id: target_texture_id,
+        width: 64,
+        height: 64,
+        format: TARGET_FORMAT_RGBA8UNORM,
+        usage: TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC,
+    });
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: readback_buffer_id,
+        size: readback_size,
+        usage: BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST,
+    });
+
+    // 5. Shader and Pipeline: Flat color uniform with VertexPosUv layout
+    let flat_shader = [
+        WGSL_COLOR_UNIFORM_DECLARATION,
+        "\n\
+@group(0) @binding(0)\n\
+var<uniform> u: ColorUniform;\n\
+\n\
+struct VertexInput {\n\
+    @location(0) position: vec3<f32>,\n\
+    @location(1) uv: vec2<f32>,\n\
+};\n\
+\n\
+@vertex\n\
+fn vs_main(in: VertexInput) -> @builtin(position) vec4<f32> {\n\
+    return vec4<f32>(in.position, 1.0);\n\
+}\n\
+\n\
+@fragment\n\
+fn fs_main() -> @location(0) vec4<f32> {\n\
+    return u.rgba;\n\
+}\n",
+    ]
+    .concat();
+
+    let pipeline_id = 200;
+    packet.push(GpuCommand::CreatePipeline {
+        pipeline_id,
+        wgsl_code: flat_shader,
+        target_format: TARGET_FORMAT_RGBA8UNORM,
+        has_vertex_buffer: true,
+        has_uniform_buffer: true,
+        uniform_size: COLOR_UNIFORM_BYTES as u32,
+        vertex_stride: VERTEX_POS_UV_STRIDE as u32,
+    });
+
+    // 6. Record RenderBundle 1: draws Triangle 1 with Green (offset 0)
+    let bundle_id = 1;
+    packet.push(GpuCommand::RecordBundle {
+        bundle_id,
+        pipeline_id,
+        vertex_buffer_id: vb_bundle_id,
+        vertex_count: 3,
+        uniform_dynamic_offset: 0,
+        uniform_buffer_id,
+        target_format: TARGET_FORMAT_RGBA8UNORM,
+    });
+
+    // 7. RenderPass opener: clear black, vertex_count 0, PASS_FLAG_NEW_PASS
+    packet.push(GpuCommand::RenderPass {
+        target_type: TARGET_OFFSCREEN,
+        target_id: target_texture_id,
+        clear_color: [0.0, 0.0, 0.0, 1.0],
+        pipeline_id: 0,
+        vertex_buffer_id: 0,
+        vertex_count: 0,
+        uniform_dynamic_offset: 0,
+        uniform_buffer_id: 0,
+        load_op: LOAD_OP_CLEAR,
+        store_op: STORE_OP_STORE,
+        pass_flags: PASS_FLAG_NEW_PASS,
+    });
+
+    // 8. Direct draw of the right triangle BEFORE any bundle: pipeline 200, uniform 1 offset 256,
+    // vb 3, vertex_count 3, PASS_FLAG_NONE (same fields as the existing step-10 draw). This fills the decoder cache.
+    packet.push(GpuCommand::RenderPass {
+        target_type: TARGET_OFFSCREEN,
+        target_id: target_texture_id,
+        clear_color: [0.0, 0.0, 0.0, 1.0],
+        pipeline_id,
+        vertex_buffer_id: vb_direct_id,
+        vertex_count: 3,
+        uniform_dynamic_offset: 256,
+        uniform_buffer_id,
+        load_op: LOAD_OP_CLEAR,
+        store_op: STORE_OP_STORE,
+        pass_flags: PASS_FLAG_NONE,
+    });
+
+    // 9. ExecuteBundles([1]) when empty_bundle_list=false; ExecuteBundles([]) when true.
+    let bundle_ids = if empty_bundle_list {
+        alloc::vec![]
+    } else {
+        alloc::vec![bundle_id]
+    };
+    packet.push(GpuCommand::ExecuteBundles { bundle_ids });
+
+    // 10. The identical direct draw again: same pipeline, uniform, offset, vb, vertex_count and PASS_FLAG_NONE.
+    // A decoder that skipped its reset would believe that state is still bound.
+    packet.push(GpuCommand::RenderPass {
+        target_type: TARGET_OFFSCREEN,
+        target_id: target_texture_id,
+        clear_color: [0.0, 0.0, 0.0, 1.0],
+        pipeline_id,
+        vertex_buffer_id: vb_direct_id,
+        vertex_count: 3,
+        uniform_dynamic_offset: 256,
+        uniform_buffer_id,
+        load_op: LOAD_OP_CLEAR,
+        store_op: STORE_OP_STORE,
+        pass_flags: PASS_FLAG_NONE,
+    });
+
+    // 11. CopyTextureToBuffer, texture 10 -> buffer 20, 64x64.
     packet.push(GpuCommand::CopyTextureToBuffer {
         texture_id: target_texture_id,
         buffer_id: readback_buffer_id,
@@ -3284,18 +3793,9 @@ pub fn build_affine_rows_transform_submission() -> GpuSubmissionPacket {
     });
 
     // 5. WGSL Shader with three row dot-products (§6.1, CONTRACT.md)
-    let affine_shader = "\
-struct AffineRows {\n\
-    r0: vec4<f32>,\n\
-    r1: vec4<f32>,\n\
-    r2: vec4<f32>,\n\
-};\n\
-\n\
-fn transform_affine_point(m: AffineRows, p: vec3<f32>) -> vec3<f32> {\n\
-    let v = vec4<f32>(p, 1.0);\n\
-    return vec3<f32>(dot(m.r0, v), dot(m.r1, v), dot(m.r2, v));\n\
-}\n\
-\n\
+    let affine_shader = [
+        WGSL_AFFINE_ROWS_DECLARATION,
+        "\n\
 @group(0) @binding(0)\n\
 var<uniform> transform: AffineRows;\n\
 \n\
@@ -3321,16 +3821,234 @@ fn vs_main(in: VertexInput) -> VertexOutput {\n\
 @fragment\n\
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {\n\
     return vec4<f32>(0.0, 1.0, 0.0, 1.0);\n\
-}\n";
+}\n",
+    ]
+    .concat();
 
     let pipeline_id = 200;
     packet.push(GpuCommand::CreatePipeline {
         pipeline_id,
-        wgsl_code: affine_shader.to_string(),
+        wgsl_code: affine_shader,
         target_format: TARGET_FORMAT_RGBA8UNORM,
         has_vertex_buffer: true,
         has_uniform_buffer: true,
         uniform_size: AFFINE_ROWS_BYTES as u32,
+        vertex_stride: VERTEX_POS_UV_STRIDE as u32,
+    });
+
+    // 6. Render Pass on target texture clearing to Black and drawing the green triangle
+    packet.push(GpuCommand::RenderPass {
+        target_type: TARGET_OFFSCREEN,
+        target_id: target_texture_id,
+        clear_color: [0.0, 0.0, 0.0, 1.0],
+        pipeline_id,
+        vertex_buffer_id,
+        vertex_count: 3,
+        uniform_dynamic_offset: 0,
+        uniform_buffer_id,
+        load_op: LOAD_OP_CLEAR,
+        store_op: STORE_OP_STORE,
+        pass_flags: PASS_FLAG_NEW_PASS,
+    });
+
+    // 7. Copy target texture to readback buffer
+    packet.push(GpuCommand::CopyTextureToBuffer {
+        texture_id: target_texture_id,
+        buffer_id: readback_buffer_id,
+        width: 64,
+        height: 64,
+        epoch: Epoch::ZERO,
+    });
+
+    packet
+}
+
+/// Builds an AffineRows layout counterexample submission packet (§6.1, §6.2, vqa.7).
+///
+/// Demonstrates the silent layout corruption between packed [`AffineRows`] (48 bytes,
+/// 3 × `vec4<f32>` rows with translation in the 4th component of each row) and standard
+/// WGSL `mat4x3<f32>` (64 bytes, 4 column vectors of `vec3<f32>` each padded to 16 bytes).
+///
+/// When `wrong_mat4x3_layout` is false (correct AffineRows):
+/// - Pipeline uses the canonical [`AffineRows`] struct with row dot-products.
+/// - `uniform_size` is 48 ([`AFFINE_ROWS_BYTES`]).
+/// - The triangle is scaled by 0.5 and translated by (+0.5, 0, 0), landing at screen
+///   center `(48, 32)` (green) with `(32, 32)` outside (black).
+///
+/// When `wrong_mat4x3_layout` is true (silent mat4x3 corruption):
+/// - Pipeline declares `var<uniform> transform: mat4x3<f32>;` and evaluates
+///   `transform * vec4<f32>(in.position, 1.0)`.
+/// - `uniform_size` is 64 bytes.
+/// - The uniform buffer payload is byte-for-byte identical (48 packed AffineRows bytes
+///   padded to 256 bytes). Because `mat4x3<f32>` reads columns with 16-byte alignment,
+///   the x-translation at byte offset 12 falls into column 0 padding, and column 3
+///   (translation) reads the trailing zeros at offset 48..60. Translation is silently lost:
+///   the triangle is centered at `(32, 32)` (green) with `(48, 32)` outside (black).
+///
+/// Only the WGSL code and `uniform_size` differ between the two variants; uniform bytes
+/// and all other command parameters are identical.
+#[must_use]
+pub fn build_affine_rows_layout_counterexample_submission(
+    wrong_mat4x3_layout: bool,
+) -> GpuSubmissionPacket {
+    // Register resource IDs in the generational slot table (§6.5, vqa.6)
+    with_global_resource_table(|table| {
+        table.register(1);   // uniform_buffer_id
+        table.register(2);   // vertex_buffer_id
+        table.register(10);  // target_texture_id
+        table.register(20);  // readback_buffer_id
+        table.register(200); // pipeline_id
+    });
+
+    let mut packet = GpuSubmissionPacket::new();
+
+    // 1. Build transform matrix with translation (+0.5, 0, 0) and scale 0.5
+    let mut matrix = Matrix4::identity();
+    matrix.compose(
+        &Vector3::new(0.5, 0.0, 0.0),
+        &Quaternion::identity(),
+        &Vector3::new(0.5, 0.5, 1.0),
+    );
+    let affine_rows = matrix
+        .to_affine_rows_checked(1e-9, 1e-9)
+        .expect("Matrix4 must narrow to AffineRows cleanly");
+
+    // 2. Uniform buffer with 48-byte AffineRows record at offset 0 (identical bytes for both variants)
+    let uniform_buffer_id = 1;
+    let mut uniform_bytes = Vec::with_capacity(256);
+    uniform_bytes.extend_from_slice(&affine_rows.to_bytes());
+    uniform_bytes.resize(256, 0);
+
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: uniform_buffer_id,
+        size: 256,
+        usage: BUFFER_USAGE_UNIFORM | BUFFER_USAGE_COPY_DST,
+    });
+    packet.push(GpuCommand::WriteBuffer {
+        buffer_id: uniform_buffer_id,
+        offset: 0,
+        data: uniform_bytes,
+    });
+
+    // 3. Vertex buffer with centered triangle
+    let vertex_buffer_id = 2;
+    let tri = [
+        VertexPosUv::new([0.0, 0.5, 0.0], [0.5, 1.0]),
+        VertexPosUv::new([-0.5, -0.5, 0.0], [0.0, 0.0]),
+        VertexPosUv::new([0.5, -0.5, 0.0], [1.0, 0.0]),
+    ];
+    let mut tri_bytes = Vec::with_capacity(tri.len() * VertexPosUv::BYTE_SIZE);
+    for v in &tri {
+        tri_bytes.extend_from_slice(&v.to_bytes());
+    }
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: vertex_buffer_id,
+        size: tri_bytes.len() as u32,
+        usage: BUFFER_USAGE_VERTEX | BUFFER_USAGE_COPY_DST,
+    });
+    packet.push(GpuCommand::WriteBuffer {
+        buffer_id: vertex_buffer_id,
+        offset: 0,
+        data: tri_bytes,
+    });
+
+    // 4. Target texture and readback buffer (64x64)
+    let target_texture_id = 10;
+    let readback_buffer_id = 20;
+    let bytes_per_row = 256u32;
+    let readback_size = bytes_per_row * 64;
+
+    packet.push(GpuCommand::CreateTexture {
+        texture_id: target_texture_id,
+        width: 64,
+        height: 64,
+        format: TARGET_FORMAT_RGBA8UNORM,
+        usage: TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC,
+    });
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: readback_buffer_id,
+        size: readback_size,
+        usage: BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST,
+    });
+
+    // 5. WGSL Shader and uniform_size: only these two fields differ between variants (§6.1, CONTRACT.md)
+    let (wgsl_code, uniform_size) = if wrong_mat4x3_layout {
+        (
+            "\
+@group(0) @binding(0)\n\
+var<uniform> transform: mat4x3<f32>;\n\
+\n\
+struct VertexInput {\n\
+    @location(0) position: vec3<f32>,\n\
+    @location(1) uv: vec2<f32>,\n\
+};\n\
+\n\
+struct VertexOutput {\n\
+    @builtin(position) clip_position: vec4<f32>,\n\
+    @location(0) uv: vec2<f32>,\n\
+};\n\
+\n\
+@vertex\n\
+fn vs_main(in: VertexInput) -> VertexOutput {\n\
+    var out: VertexOutput;\n\
+    let transformed = transform * vec4<f32>(in.position, 1.0);\n\
+    out.clip_position = vec4<f32>(transformed, 1.0);\n\
+    out.uv = in.uv;\n\
+    return out;\n\
+}\n\
+\n\
+@fragment\n\
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {\n\
+    return vec4<f32>(0.0, 1.0, 0.0, 1.0);\n\
+}\n"
+                .to_string(),
+            64u32,
+        )
+    } else {
+        (
+            [
+                WGSL_AFFINE_ROWS_DECLARATION,
+                "\n\
+@group(0) @binding(0)\n\
+var<uniform> transform: AffineRows;\n\
+\n\
+struct VertexInput {\n\
+    @location(0) position: vec3<f32>,\n\
+    @location(1) uv: vec2<f32>,\n\
+};\n\
+\n\
+struct VertexOutput {\n\
+    @builtin(position) clip_position: vec4<f32>,\n\
+    @location(0) uv: vec2<f32>,\n\
+};\n\
+\n\
+@vertex\n\
+fn vs_main(in: VertexInput) -> VertexOutput {\n\
+    var out: VertexOutput;\n\
+    let transformed = transform_affine_point(transform, in.position);\n\
+    out.clip_position = vec4<f32>(transformed, 1.0);\n\
+    out.uv = in.uv;\n\
+    return out;\n\
+}\n\
+\n\
+@fragment\n\
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {\n\
+    return vec4<f32>(0.0, 1.0, 0.0, 1.0);\n\
+}\n",
+            ]
+            .concat(),
+            AFFINE_ROWS_BYTES as u32,
+        )
+    };
+
+    let pipeline_id = 200;
+    packet.push(GpuCommand::CreatePipeline {
+        pipeline_id,
+        wgsl_code,
+        target_format: TARGET_FORMAT_RGBA8UNORM,
+        has_vertex_buffer: true,
+        has_uniform_buffer: true,
+        uniform_size,
         vertex_stride: VERTEX_POS_UV_STRIDE as u32,
     });
 
@@ -3475,10 +4193,9 @@ pub fn build_nested_pass_submission() -> GpuSubmissionPacket {
         usage: BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST,
     });
 
-    let flat_shader = "\
-struct ColorUniform {\n\
-    color: vec4<f32>,\n\
-};\n\
+    let flat_shader = [
+        WGSL_COLOR_UNIFORM_DECLARATION,
+        "\n\
 @group(0) @binding(0)\n\
 var<uniform> u: ColorUniform;\n\
 \n\
@@ -3494,12 +4211,14 @@ fn vs_main(in: VertexInput) -> @builtin(position) vec4<f32> {\n\
 \n\
 @fragment\n\
 fn fs_main() -> @location(0) vec4<f32> {\n\
-    return u.color;\n\
-}\n";
+    return u.rgba;\n\
+}\n",
+    ]
+    .concat();
 
     packet.push(GpuCommand::CreatePipeline {
         pipeline_id,
-        wgsl_code: flat_shader.to_string(),
+        wgsl_code: flat_shader,
         target_format: TARGET_FORMAT_RGBA8UNORM,
         has_vertex_buffer: true,
         has_uniform_buffer: true,
@@ -3701,10 +4420,9 @@ pub fn build_nested_canvas_pass_submission() -> GpuSubmissionPacket {
         usage: BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST,
     });
 
-    let flat_shader = "\
-struct ColorUniform {\n\
-    color: vec4<f32>,\n\
-};\n\
+    let flat_shader = [
+        WGSL_COLOR_UNIFORM_DECLARATION,
+        "\n\
 @group(0) @binding(0)\n\
 var<uniform> u: ColorUniform;\n\
 \n\
@@ -3720,13 +4438,15 @@ fn vs_main(in: VertexInput) -> @builtin(position) vec4<f32> {\n\
 \n\
 @fragment\n\
 fn fs_main() -> @location(0) vec4<f32> {\n\
-    return u.color;\n\
-}\n";
+    return u.rgba;\n\
+}\n",
+    ]
+    .concat();
 
     // Command 7: Pipeline 200 for offscreen target (RGBA8Unorm)
     packet.push(GpuCommand::CreatePipeline {
         pipeline_id: pipeline_offscreen,
-        wgsl_code: flat_shader.to_string(),
+        wgsl_code: flat_shader.clone(),
         target_format: TARGET_FORMAT_RGBA8UNORM,
         has_vertex_buffer: true,
         has_uniform_buffer: true,
@@ -3737,7 +4457,7 @@ fn fs_main() -> @location(0) vec4<f32> {\n\
     // Command 8: Pipeline 201 for canvas presentation target (dynamically matches host preferredCanvasFormat)
     packet.push(GpuCommand::CreatePipeline {
         pipeline_id: pipeline_canvas,
-        wgsl_code: flat_shader.to_string(),
+        wgsl_code: flat_shader,
         target_format: TARGET_FORMAT_PREFERRED_CANVAS,
         has_vertex_buffer: true,
         has_uniform_buffer: true,
@@ -3972,10 +4692,9 @@ pub fn build_nested_viewport_scissor_submission() -> GpuSubmissionPacket {
         usage: BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST,
     });
 
-    let flat_shader = "\
-struct ColorUniform {\n\
-    color: vec4<f32>,\n\
-};\n\
+    let flat_shader = [
+        WGSL_COLOR_UNIFORM_DECLARATION,
+        "\n\
 @group(0) @binding(0)\n\
 var<uniform> u: ColorUniform;\n\
 \n\
@@ -3991,13 +4710,15 @@ fn vs_main(in: VertexInput) -> @builtin(position) vec4<f32> {\n\
 \n\
 @fragment\n\
 fn fs_main() -> @location(0) vec4<f32> {\n\
-    return u.color;\n\
-}\n";
+    return u.rgba;\n\
+}\n",
+    ]
+    .concat();
 
     // Command 9: Pipeline 200
     packet.push(GpuCommand::CreatePipeline {
         pipeline_id,
-        wgsl_code: flat_shader.to_string(),
+        wgsl_code: flat_shader,
         target_format: TARGET_FORMAT_RGBA8UNORM,
         has_vertex_buffer: true,
         has_uniform_buffer: true,
@@ -4328,6 +5049,42 @@ pub fn f3d_build_bundle_direct_draw_packet() -> Vec<u8> {
 
 #[cfg(all(feature = "browser", target_arch = "wasm32"))]
 #[wasm_bindgen]
+/// Encodes a bundle-then-direct warm-cache submission packet and returns the raw binary bytes (§6.7, §8.2, vqa.7).
+pub fn f3d_build_bundle_direct_warm_cache_packet(empty_bundle_list: bool) -> Vec<u8> {
+    build_bundle_then_direct_warm_cache_submission(empty_bundle_list)
+        .encode()
+        .expect("static bundle-direct-warm-cache packet encoding must not fail")
+}
+
+#[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
+/// Native export for `f3d_build_bundle_direct_warm_cache_packet` for host verification and unit tests (§6.7, §8.2, vqa.7).
+#[must_use]
+pub fn f3d_build_bundle_direct_warm_cache_packet(empty_bundle_list: bool) -> Vec<u8> {
+    build_bundle_then_direct_warm_cache_submission(empty_bundle_list)
+        .encode()
+        .expect("static bundle-direct-warm-cache packet encoding must not fail")
+}
+
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen]
+/// Encodes an AffineRows layout counterexample submission packet and returns the raw binary bytes (§6.1, §6.2, vqa.7).
+pub fn f3d_build_affine_rows_layout_counterexample_packet(wrong_mat4x3_layout: bool) -> Vec<u8> {
+    build_affine_rows_layout_counterexample_submission(wrong_mat4x3_layout)
+        .encode()
+        .expect("static affine-rows layout counterexample packet encoding must not fail")
+}
+
+#[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
+/// Native export for `f3d_build_affine_rows_layout_counterexample_packet` for host verification and unit tests (§6.1, §6.2, vqa.7).
+#[must_use]
+pub fn f3d_build_affine_rows_layout_counterexample_packet(wrong_mat4x3_layout: bool) -> Vec<u8> {
+    build_affine_rows_layout_counterexample_submission(wrong_mat4x3_layout)
+        .encode()
+        .expect("static affine-rows layout counterexample packet encoding must not fail")
+}
+
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen]
 /// Encodes an AffineRows transform submission packet and returns the raw binary bytes (§6.1, §6.2, 05.6, vqa.2).
 pub fn gpu_bridge_build_affine_rows_transform_packet() -> Vec<u8> {
     build_affine_rows_transform_submission()
@@ -4371,9 +5128,51 @@ pub fn f3d_build_affine_rows_batch_frame_packet(
 
 #[cfg(all(feature = "browser", target_arch = "wasm32"))]
 #[wasm_bindgen]
+/// Encodes an update packet for an already initialized AffineRows batch scene into the static borrowed packet slot (wasm-bindgen export).
+///
+/// Returns `[ptr, len]` as a 2-element array pointing into WebAssembly linear memory.
+pub fn f3d_build_affine_rows_batch_frame_packet_borrowed(
+    affine_rows: &[f32],
+    width: u32,
+    height: u32,
+    expected_draws: u32,
+) -> Result<Vec<u32>, wasm_bindgen::JsValue> {
+    build_affine_rows_batch_frame_packet_borrowed(affine_rows, width, height, expected_draws)
+        .map(|arr| arr.to_vec())
+        .map_err(|e| wasm_bindgen::JsValue::from_str(&e.to_string()))
+}
+
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen]
+/// Returns the linear memory address (pointer) of the static borrowed frame packet buffer.
+pub fn f3d_borrowed_frame_packet_ptr() -> u32 {
+    borrowed_frame_packet_ptr()
+}
+
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen]
+/// Returns the byte length of the static borrowed frame packet buffer.
+pub fn f3d_borrowed_frame_packet_len() -> u32 {
+    borrowed_frame_packet_len()
+}
+
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen]
 extern "C" {
     #[wasm_bindgen(js_namespace = f3dHost, js_name = drawCall, catch)]
     fn host_draw_call(draw_index: u32) -> Result<(), JsValue>;
+
+    #[wasm_bindgen(js_namespace = f3dHost, js_name = writeBuffer, catch)]
+    fn host_write_buffer(buffer_id: u32, offset: u32, bytes: &js_sys::Uint8Array) -> Result<(), JsValue>;
+
+    #[wasm_bindgen(js_namespace = f3dHost, js_name = copyBufferToBuffer, catch)]
+    fn host_copy_buffer_to_buffer(
+        src: u32,
+        src_off: u32,
+        dst: u32,
+        dst_off: u32,
+        size: u32,
+    ) -> Result<(), JsValue>;
 }
 
 #[cfg(all(feature = "browser", target_arch = "wasm32"))]
@@ -4428,6 +5227,33 @@ pub fn f3d_build_buffer_copy_packet(
 
 #[cfg(all(feature = "browser", target_arch = "wasm32"))]
 #[wasm_bindgen]
+/// Canonical export: builds a submission packet with an active canvas render pass followed by a buffer copy.
+pub fn f3d_build_render_then_copy_packet(
+    data: &[u8],
+    source_offset: u32,
+    destination_offset: u32,
+    size: u32,
+) -> Result<Vec<u8>, JsValue> {
+    build_render_then_copy_submission(data, source_offset, destination_offset, size)
+        .and_then(|packet| packet.encode())
+        .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+#[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
+/// Native export for `f3d_build_render_then_copy_packet` for host execution and unit tests.
+pub fn f3d_build_render_then_copy_packet(
+    data: &[u8],
+    source_offset: u32,
+    destination_offset: u32,
+    size: u32,
+) -> Result<Vec<u8>, String> {
+    build_render_then_copy_submission(data, source_offset, destination_offset, size)
+        .and_then(|packet| packet.encode())
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen]
 /// Synchronously loops `count` iterations invoking the imported host callback `f3dHost.drawCall(index)` (Kill Gate 2 / tmt.5).
 ///
 /// Enforces:
@@ -4444,10 +5270,92 @@ pub fn f3d_bridge_chatty_draw_loop(count: u32) -> Result<u32, JsValue> {
 
 #[cfg(all(feature = "browser", target_arch = "wasm32"))]
 #[wasm_bindgen]
+/// Issues persistent AffineRows storage upload frame via host callbacks (workload b / tmt.5).
+///
+/// Calls [`build_affine_rows_storage_upload_callback_ops`] and invokes imported host callbacks in order:
+/// 1. `f3dHost.writeBuffer(buffer_id, offset, bytes)`
+/// 2. `f3dHost.copyBufferToBuffer(src, src_off, dst, dst_off, size)`
+///
+/// Returns the callback count (2) on success.
+///
+/// Enforces seam invariants:
+/// - Zero live linear memory slices across host callback invocation.
+/// - Zero RefCell borrows active during host call.
+/// - Zero global table / mutex locks held across host boundary.
+/// - Bytes passed as an owned copy (in JS Uint8Array).
+/// - Uses Number rather than BigInt at the JS boundary.
+/// - Immediate propagation of thrown host errors.
+pub fn f3d_bridge_callback_storage_upload_frame(
+    affine_rows: &[f32],
+    expected_records: u32,
+    destination_slot: u32,
+) -> Result<u32, JsValue> {
+    let ops = build_affine_rows_storage_upload_callback_ops(
+        affine_rows,
+        expected_records,
+        destination_slot,
+    ).map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    let mut callback_count = 0u32;
+    for op in ops {
+        match op {
+            StorageUploadCallbackOp::WriteBuffer { buffer_id, offset, bytes } => {
+                let js_bytes = js_sys::Uint8Array::new_with_length(bytes.len() as u32);
+                js_bytes.copy_from(&bytes);
+                drop(bytes);
+                host_write_buffer(buffer_id, offset, &js_bytes)?;
+                callback_count += 1;
+            }
+            StorageUploadCallbackOp::CopyBufferToBuffer { src, src_off, dst, dst_off, size } => {
+                host_copy_buffer_to_buffer(src, src_off, dst, dst_off, size)?;
+                callback_count += 1;
+            }
+        }
+    }
+    Ok(callback_count)
+}
+
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen]
 /// Packs a flat slice of 3x4 affine transforms (`12 * N` f32 values) into 256-byte aligned uniform buffer bytes.
 /// Returns an owned `Vec<u8>` for the generated static submission bridge variant.
 pub fn f3d_pack_affine_rows_bytes(affine_rows: &[f32]) -> Result<Vec<u8>, wasm_bindgen::JsValue> {
     pack_affine_rows_uniform_bytes(affine_rows)
+        .map_err(|e| wasm_bindgen::JsValue::from_str(&e.to_string()))
+}
+
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen]
+/// Packs a flat slice of 3x4 affine transforms (`12 * N` f32 values) into packed 48-byte storage buffer records.
+/// Returns an owned `Vec<u8>` of length `48 * N`.
+pub fn f3d_pack_affine_rows_storage_bytes(
+    affine_rows: &[f32],
+) -> Result<Vec<u8>, wasm_bindgen::JsValue> {
+    pack_affine_rows_storage_bytes(affine_rows)
+        .map_err(|e| wasm_bindgen::JsValue::from_str(&e.to_string()))
+}
+
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen]
+/// Canonical Wasm export: allocates persistent source buffer 610 and destination slots 611 and 612 (workload b / tmt.5).
+pub fn f3d_build_affine_rows_storage_upload_init_packet(
+    expected_records: u32,
+) -> Result<Vec<u8>, wasm_bindgen::JsValue> {
+    build_affine_rows_storage_upload_init_submission(expected_records)
+        .and_then(|packet| packet.encode())
+        .map_err(|e| wasm_bindgen::JsValue::from_str(&e.to_string()))
+}
+
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen]
+/// Canonical Wasm export: writes packed 48-byte records into 610 and copies to destination slot 611 or 612 (workload b / tmt.5).
+pub fn f3d_build_affine_rows_storage_upload_frame_packet(
+    affine_rows: &[f32],
+    expected_records: u32,
+    destination_slot: u32,
+) -> Result<Vec<u8>, wasm_bindgen::JsValue> {
+    build_affine_rows_storage_upload_frame_submission(affine_rows, expected_records, destination_slot)
+        .and_then(|packet| packet.encode())
         .map_err(|e| wasm_bindgen::JsValue::from_str(&e.to_string()))
 }
 
@@ -4493,9 +5401,63 @@ pub fn f3d_build_affine_rows_batch_frame_packet(
 }
 
 #[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
+/// Native export for `f3d_build_affine_rows_batch_frame_packet_borrowed` for host execution and unit tests.
+pub fn f3d_build_affine_rows_batch_frame_packet_borrowed(
+    affine_rows: &[f32],
+    width: u32,
+    height: u32,
+    expected_draws: u32,
+) -> Result<[u32; 2], String> {
+    build_affine_rows_batch_frame_packet_borrowed(affine_rows, width, height, expected_draws)
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
+/// Native export for `f3d_borrowed_frame_packet_ptr` for host execution and unit tests.
+pub fn f3d_borrowed_frame_packet_ptr() -> u32 {
+    borrowed_frame_packet_ptr()
+}
+
+#[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
+/// Native export for `f3d_borrowed_frame_packet_len` for host execution and unit tests.
+pub fn f3d_borrowed_frame_packet_len() -> u32 {
+    borrowed_frame_packet_len()
+}
+
+#[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
 /// Native export for `f3d_pack_affine_rows_bytes` for host verification and unit tests.
 pub fn f3d_pack_affine_rows_bytes(affine_rows: &[f32]) -> Result<Vec<u8>, String> {
     pack_affine_rows_uniform_bytes(affine_rows).map_err(|e| e.to_string())
+}
+
+#[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
+/// Native export for `f3d_pack_affine_rows_storage_bytes` for host verification and unit tests.
+pub fn f3d_pack_affine_rows_storage_bytes(
+    affine_rows: &[f32],
+) -> Result<Vec<u8>, String> {
+    pack_affine_rows_storage_bytes(affine_rows).map_err(|e| e.to_string())
+}
+
+#[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
+/// Native export for `f3d_build_affine_rows_storage_upload_init_packet` for host verification and unit tests.
+pub fn f3d_build_affine_rows_storage_upload_init_packet(
+    expected_records: u32,
+) -> Result<Vec<u8>, String> {
+    build_affine_rows_storage_upload_init_submission(expected_records)
+        .and_then(|packet| packet.encode())
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
+/// Native export for `f3d_build_affine_rows_storage_upload_frame_packet` for host verification and unit tests.
+pub fn f3d_build_affine_rows_storage_upload_frame_packet(
+    affine_rows: &[f32],
+    expected_records: u32,
+    destination_slot: u32,
+) -> Result<Vec<u8>, String> {
+    build_affine_rows_storage_upload_frame_submission(affine_rows, expected_records, destination_slot)
+        .and_then(|packet| packet.encode())
+        .map_err(|e| e.to_string())
 }
 
 fn encode_textured_affine_triangle_helper(
@@ -5663,6 +6625,7 @@ pub fn advance_resource_slot_generation(index: u32) -> Result<u32, HandleError> 
 // -----------------------------------------------------------------------------
 
 static GLOBAL_BORROW_SCOPE: Mutex<Option<BorrowScope>> = Mutex::new(None);
+static GLOBAL_BORROWED_FRAME_PACKET: Mutex<Option<Vec<u8>>> = Mutex::new(None);
 
 /// Executes a closure with mutable access to the global Wasm linear memory borrow scope.
 pub fn with_global_borrow_scope<R>(f: impl FnOnce(&mut BorrowScope) -> R) -> R {
@@ -5734,6 +6697,112 @@ pub fn try_grow_memory(pages: u32) -> bool {
             }
         }
     })
+}
+
+/// Executes a closure with mutable access to the global borrowed frame packet slot.
+pub(crate) fn with_global_borrowed_frame_packet<R>(f: impl FnOnce(&mut Option<Vec<u8>>) -> R) -> R {
+    let mut guard = match GLOBAL_BORROWED_FRAME_PACKET.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    f(&mut guard)
+}
+
+/// Executes a closure with read-only access to the global borrowed frame packet slot.
+pub fn with_global_borrowed_frame_packet_ref<R>(f: impl FnOnce(Option<&[u8]>) -> R) -> R {
+    let guard = match GLOBAL_BORROWED_FRAME_PACKET.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    f(guard.as_deref())
+}
+
+/// Clears the global borrowed frame packet slot, freeing linear memory if held.
+///
+/// Refuses to clear and returns `false` if an active linear memory borrow scope is held,
+/// leaving the slot intact to prevent dangling pointers in active JavaScript views.
+/// Returns `true` when cleared successfully.
+pub fn clear_borrowed_frame_packet() -> bool {
+    let is_borrowed = with_global_borrow_scope(|scope| scope.is_borrowed());
+    if is_borrowed {
+        return false;
+    }
+    with_global_borrowed_frame_packet(|slot| {
+        *slot = None;
+    });
+    true
+}
+
+/// Returns the linear memory address (pointer) of the global borrowed frame packet buffer, or 0 if empty.
+#[must_use]
+pub fn borrowed_frame_packet_ptr() -> u32 {
+    with_global_borrowed_frame_packet_ref(|slot| {
+        slot.map_or(0, |s| (s.as_ptr() as usize) as u32)
+    })
+}
+
+/// Returns the byte length of the global borrowed frame packet buffer, or 0 if empty.
+#[must_use]
+pub fn borrowed_frame_packet_len() -> u32 {
+    with_global_borrowed_frame_packet_ref(|slot| {
+        slot.map_or(0, |s| s.len() as u32)
+    })
+}
+
+/// Returns the current accumulated borrowed view bytes from copy accounting (§6.6, §13.1).
+#[must_use]
+pub fn borrow_scope_bytes_view() -> u64 {
+    with_global_borrow_scope(|scope| scope.accounting().bytes_view)
+}
+
+/// Encodes an update packet for an already initialized AffineRows batch scene into the static borrowed packet slot.
+///
+/// Refuses to rebuild or reallocate the slot if an active linear memory borrow scope is held,
+/// to prevent invalidating active JavaScript typed array views pointing to the buffer.
+/// Records the view transfer length in borrow scope copy accounting.
+///
+/// Returns `[ptr, len]` as WebAssembly linear memory byte offset and byte length.
+pub fn build_affine_rows_batch_frame_packet_borrowed(
+    affine_rows: &[f32],
+    width: u32,
+    height: u32,
+    expected_draws: u32,
+) -> Result<[u32; 2], PacketEncodeError> {
+    with_global_borrow_scope(|scope| {
+        if scope.is_borrowed() {
+            return Err(PacketEncodeError::InvalidDimensions(
+                "linear memory borrow scope is active: cannot rebuild borrowed frame packet slot while borrowed".to_string(),
+            ));
+        }
+        Ok(())
+    })?;
+
+    let packet = build_affine_rows_batch_frame_submission(affine_rows, width, height, expected_draws)?;
+    let encoded = packet.encode()?;
+
+    let len = encoded.len();
+    let len_u32 = u32::try_from(len).map_err(|_| PacketEncodeError::DataPayloadOverflow {
+        offset: 0,
+        length: len,
+    })?;
+
+    with_global_borrow_scope(|scope| {
+        if scope.is_borrowed() {
+            return Err(PacketEncodeError::InvalidDimensions(
+                "linear memory borrow scope is active: cannot rebuild borrowed frame packet slot while borrowed".to_string(),
+            ));
+        }
+        scope.accounting_mut().record_view(len as u64);
+        Ok(())
+    })?;
+
+    let ptr_u32 = with_global_borrowed_frame_packet(|slot| {
+        *slot = Some(encoded);
+        let slice = slot.as_ref().expect("slot was just populated");
+        (slice.as_ptr() as usize) as u32
+    });
+
+    Ok([ptr_u32, len_u32])
 }
 
 // -----------------------------------------------------------------------------
@@ -5841,6 +6910,10 @@ mod tests {
     /// Test-only mutex serializing tests that mutate, reset, advance, or assert `GLOBAL_RESOURCE_SLOT_TABLE`.
     /// Tolerates lock poisoning across test failures (§6.5, peer review 7202).
     static TEST_SLOT_TABLE_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Test-only mutex serializing tests that mutate, reset, advance, or assert `GLOBAL_BORROW_SCOPE` or `GLOBAL_BORROWED_FRAME_PACKET`.
+    /// Tolerates lock poisoning across test failures.
+    static TEST_BORROW_SCOPE_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn negotiation_succeeds_when_profile_supported() {
@@ -6056,6 +7129,80 @@ mod tests {
 
         assert_eq!(lowered, expected_execution_cmds);
         assert_eq!(lowered.len(), 4);
+    }
+
+    #[test]
+    fn lower_plan_two_target_bridge_plan_matches_first_frame_commands() {
+        use f3d_graph::ResourceId;
+
+        let mut tracker = CanvasEpochTracker::new();
+        tracker.register_canvas(
+            CanvasId::new(0),
+            ResourceId::new(0),
+            64,
+            64,
+            CanvasFormat::Bgra8Unorm,
+        );
+        let epoch = tracker
+            .begin_frame_acquire(CanvasId::new(0))
+            .expect("acquire canvas epoch")
+            .epoch;
+
+        let plan = f3d_graph::build_two_target_bridge_plan(
+            ResourceId::new(10),
+            ResourceId::new(0),
+            ResourceId::new(20),
+            100,
+            101,
+            ResourceId::new(2),
+            3,
+            64,
+            64,
+            DataVersion::INITIAL,
+            Some(epoch),
+            Some(&tracker),
+        )
+        .expect("build two-target bridge plan");
+
+        let lowered = lower_plan(&plan).expect("lower plan");
+
+        let expected: Vec<GpuCommand> = build_triangle_submission()
+            .commands()
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c,
+                    GpuCommand::RenderPass { .. } | GpuCommand::CopyTextureToBuffer { .. }
+                )
+            })
+            .cloned()
+            .collect();
+
+        assert_eq!(epoch, Epoch::new(1));
+        assert_eq!(lowered.len(), 3);
+        assert_eq!(expected.len(), 3);
+        assert_eq!(lowered[0], expected[0]);
+        assert_eq!(lowered[1], expected[1]);
+        assert_eq!(
+            lowered[2],
+            GpuCommand::CopyTextureToBuffer {
+                texture_id: 10,
+                buffer_id: 20,
+                width: 64,
+                height: 64,
+                epoch: Epoch::new(1),
+            }
+        );
+        assert_eq!(
+            expected[2],
+            GpuCommand::CopyTextureToBuffer {
+                texture_id: 10,
+                buffer_id: 20,
+                width: 64,
+                height: 64,
+                epoch: Epoch::ZERO,
+            }
+        );
     }
 
     #[test]
@@ -6655,6 +7802,353 @@ mod tests {
     }
 
     #[test]
+    fn bundle_then_direct_warm_cache_command_shape() {
+        let _slot_lock = match TEST_SLOT_TABLE_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        for empty_bundles in [false, true] {
+            let packet = build_bundle_then_direct_warm_cache_submission(empty_bundles);
+            let commands = packet.commands();
+            assert_eq!(commands.len(), 15);
+
+            // Command 0: CreateBuffer uniform (id 1, size 512, UNIFORM | COPY_DST)
+            match &commands[0] {
+                GpuCommand::CreateBuffer { buffer_id, size, usage } => {
+                    assert_eq!(*buffer_id, 1);
+                    assert_eq!(*size, 512);
+                    assert_eq!(*usage, BUFFER_USAGE_UNIFORM | BUFFER_USAGE_COPY_DST);
+                }
+                other => panic!("expected CreateBuffer at index 0, got {other:?}"),
+            }
+
+            // Command 1: WriteBuffer uniform (512 bytes)
+            match &commands[1] {
+                GpuCommand::WriteBuffer { buffer_id, offset, data } => {
+                    assert_eq!(*buffer_id, 1);
+                    assert_eq!(*offset, 0);
+                    assert_eq!(data.len(), 512);
+                }
+                other => panic!("expected WriteBuffer at index 1, got {other:?}"),
+            }
+
+            // Command 2: CreateBuffer vb1 (Triangle 1, bundle, id 2)
+            match &commands[2] {
+                GpuCommand::CreateBuffer { buffer_id, size, usage } => {
+                    assert_eq!(*buffer_id, 2);
+                    assert_eq!(*size, (3 * VertexPosUv::BYTE_SIZE) as u32);
+                    assert_eq!(*usage, BUFFER_USAGE_VERTEX | BUFFER_USAGE_COPY_DST);
+                }
+                other => panic!("expected CreateBuffer at index 2, got {other:?}"),
+            }
+
+            // Command 3: WriteBuffer vb1 (60 bytes)
+            match &commands[3] {
+                GpuCommand::WriteBuffer { buffer_id, offset, data } => {
+                    assert_eq!(*buffer_id, 2);
+                    assert_eq!(*offset, 0);
+                    assert_eq!(data.len(), 3 * VertexPosUv::BYTE_SIZE);
+                }
+                other => panic!("expected WriteBuffer at index 3, got {other:?}"),
+            }
+
+            // Command 4: CreateBuffer vb2 (Triangle 2, direct, id 3)
+            match &commands[4] {
+                GpuCommand::CreateBuffer { buffer_id, size, usage } => {
+                    assert_eq!(*buffer_id, 3);
+                    assert_eq!(*size, (3 * VertexPosUv::BYTE_SIZE) as u32);
+                    assert_eq!(*usage, BUFFER_USAGE_VERTEX | BUFFER_USAGE_COPY_DST);
+                }
+                other => panic!("expected CreateBuffer at index 4, got {other:?}"),
+            }
+
+            // Command 5: WriteBuffer vb2 (60 bytes)
+            match &commands[5] {
+                GpuCommand::WriteBuffer { buffer_id, offset, data } => {
+                    assert_eq!(*buffer_id, 3);
+                    assert_eq!(*offset, 0);
+                    assert_eq!(data.len(), 3 * VertexPosUv::BYTE_SIZE);
+                }
+                other => panic!("expected WriteBuffer at index 5, got {other:?}"),
+            }
+
+            // Command 6: CreateTexture target (id 10, 64x64 RGBA8Unorm)
+            match &commands[6] {
+                GpuCommand::CreateTexture { texture_id, width, height, format, usage } => {
+                    assert_eq!(*texture_id, 10);
+                    assert_eq!(*width, 64);
+                    assert_eq!(*height, 64);
+                    assert_eq!(*format, TARGET_FORMAT_RGBA8UNORM);
+                    assert_eq!(*usage, TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC);
+                }
+                other => panic!("expected CreateTexture at index 6, got {other:?}"),
+            }
+
+            // Command 7: CreateBuffer readback (id 20, 256 * 64)
+            match &commands[7] {
+                GpuCommand::CreateBuffer { buffer_id, size, usage } => {
+                    assert_eq!(*buffer_id, 20);
+                    assert_eq!(*size, 256 * 64);
+                    assert_eq!(*usage, BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST);
+                }
+                other => panic!("expected CreateBuffer at index 7, got {other:?}"),
+            }
+
+            // Command 8: CreatePipeline (flat color shader, id 200)
+            match &commands[8] {
+                GpuCommand::CreatePipeline { pipeline_id, target_format, has_vertex_buffer, has_uniform_buffer, .. } => {
+                    assert_eq!(*pipeline_id, 200);
+                    assert_eq!(*target_format, TARGET_FORMAT_RGBA8UNORM);
+                    assert!(*has_vertex_buffer);
+                    assert!(*has_uniform_buffer);
+                }
+                other => panic!("expected CreatePipeline at index 8, got {other:?}"),
+            }
+
+            // Command 9: RecordBundle 1 (Triangle 1, vb 2, offset 0, count 3)
+            match &commands[9] {
+                GpuCommand::RecordBundle {
+                    bundle_id,
+                    pipeline_id,
+                    vertex_buffer_id,
+                    vertex_count,
+                    uniform_dynamic_offset,
+                    uniform_buffer_id,
+                    target_format,
+                } => {
+                    assert_eq!(*bundle_id, 1);
+                    assert_eq!(*pipeline_id, 200);
+                    assert_eq!(*vertex_buffer_id, 2);
+                    assert_eq!(*vertex_count, 3);
+                    assert_eq!(*uniform_dynamic_offset, 0);
+                    assert_eq!(*uniform_buffer_id, 1);
+                    assert_eq!(*target_format, TARGET_FORMAT_RGBA8UNORM);
+                }
+                other => panic!("expected RecordBundle at index 9, got {other:?}"),
+            }
+
+            // Command 10: RenderPass opener (clear black, vertex_count 0, PASS_FLAG_NEW_PASS)
+            match &commands[10] {
+                GpuCommand::RenderPass {
+                    target_type,
+                    target_id,
+                    clear_color,
+                    pipeline_id,
+                    vertex_buffer_id,
+                    vertex_count,
+                    uniform_dynamic_offset,
+                    uniform_buffer_id,
+                    load_op,
+                    store_op,
+                    pass_flags,
+                } => {
+                    assert_eq!(*target_type, TARGET_OFFSCREEN);
+                    assert_eq!(*target_id, 10);
+                    assert_eq!(*clear_color, [0.0, 0.0, 0.0, 1.0]);
+                    assert_eq!(*pipeline_id, 0);
+                    assert_eq!(*vertex_buffer_id, 0);
+                    assert_eq!(*vertex_count, 0);
+                    assert_eq!(*uniform_dynamic_offset, 0);
+                    assert_eq!(*uniform_buffer_id, 0);
+                    assert_eq!(*load_op, LOAD_OP_CLEAR);
+                    assert_eq!(*store_op, STORE_OP_STORE);
+                    assert_eq!(*pass_flags, PASS_FLAG_NEW_PASS);
+                }
+                other => panic!("expected RenderPass opener at index 10, got {other:?}"),
+            }
+
+            // Command 11: Direct draw of the right triangle BEFORE any bundle:
+            // pipeline 200, uniform 1 offset 256, vb 3, vertex_count 3, PASS_FLAG_NONE
+            match &commands[11] {
+                GpuCommand::RenderPass {
+                    target_type,
+                    target_id,
+                    clear_color,
+                    pipeline_id,
+                    vertex_buffer_id,
+                    vertex_count,
+                    uniform_dynamic_offset,
+                    uniform_buffer_id,
+                    load_op,
+                    store_op,
+                    pass_flags,
+                } => {
+                    assert_eq!(*target_type, TARGET_OFFSCREEN);
+                    assert_eq!(*target_id, 10);
+                    assert_eq!(*clear_color, [0.0, 0.0, 0.0, 1.0]);
+                    assert_eq!(*pipeline_id, 200);
+                    assert_eq!(*vertex_buffer_id, 3);
+                    assert_eq!(*vertex_count, 3);
+                    assert_eq!(*uniform_dynamic_offset, 256);
+                    assert_eq!(*uniform_buffer_id, 1);
+                    assert_eq!(*load_op, LOAD_OP_CLEAR);
+                    assert_eq!(*store_op, STORE_OP_STORE);
+                    assert_eq!(*pass_flags, PASS_FLAG_NONE);
+                }
+                other => panic!("expected RenderPass pre-bundle direct draw at index 11, got {other:?}"),
+            }
+
+            // Command 12: ExecuteBundles ([1] if !empty_bundles else [])
+            match &commands[12] {
+                GpuCommand::ExecuteBundles { bundle_ids } => {
+                    if empty_bundles {
+                        assert!(bundle_ids.is_empty());
+                    } else {
+                        assert_eq!(bundle_ids, &vec![1]);
+                    }
+                }
+                other => panic!("expected ExecuteBundles at index 12, got {other:?}"),
+            }
+
+            // Command 13: Identical direct draw again:
+            // same pipeline, uniform, offset, vb, vertex_count and PASS_FLAG_NONE
+            match &commands[13] {
+                GpuCommand::RenderPass {
+                    target_type,
+                    target_id,
+                    clear_color,
+                    pipeline_id,
+                    vertex_buffer_id,
+                    vertex_count,
+                    uniform_dynamic_offset,
+                    uniform_buffer_id,
+                    load_op,
+                    store_op,
+                    pass_flags,
+                } => {
+                    assert_eq!(*target_type, TARGET_OFFSCREEN);
+                    assert_eq!(*target_id, 10);
+                    assert_eq!(*clear_color, [0.0, 0.0, 0.0, 1.0]);
+                    assert_eq!(*pipeline_id, 200);
+                    assert_eq!(*vertex_buffer_id, 3);
+                    assert_eq!(*vertex_count, 3);
+                    assert_eq!(*uniform_dynamic_offset, 256);
+                    assert_eq!(*uniform_buffer_id, 1);
+                    assert_eq!(*load_op, LOAD_OP_CLEAR);
+                    assert_eq!(*store_op, STORE_OP_STORE);
+                    assert_eq!(*pass_flags, PASS_FLAG_NONE);
+                }
+                other => panic!("expected RenderPass post-bundle direct draw at index 13, got {other:?}"),
+            }
+
+            // Command 14: CopyTextureToBuffer, texture 10 -> buffer 20, 64x64
+            match &commands[14] {
+                GpuCommand::CopyTextureToBuffer {
+                    texture_id,
+                    buffer_id,
+                    width,
+                    height,
+                    epoch,
+                } => {
+                    assert_eq!(*texture_id, 10);
+                    assert_eq!(*buffer_id, 20);
+                    assert_eq!(*width, 64);
+                    assert_eq!(*height, 64);
+                    assert_eq!(*epoch, Epoch::ZERO);
+                }
+                other => panic!("expected CopyTextureToBuffer at index 14, got {other:?}"),
+            }
+
+            // Direct comparison: pre-bundle (11) and post-bundle (13) carry identical fields
+            if let (
+                GpuCommand::RenderPass {
+                    target_type: t0,
+                    target_id: tid0,
+                    clear_color: c0,
+                    pipeline_id: p0,
+                    vertex_buffer_id: vb0,
+                    vertex_count: vc0,
+                    uniform_dynamic_offset: off0,
+                    uniform_buffer_id: ub0,
+                    load_op: lo0,
+                    store_op: st0,
+                    pass_flags: pf0,
+                },
+                GpuCommand::RenderPass {
+                    target_type: t1,
+                    target_id: tid1,
+                    clear_color: c1,
+                    pipeline_id: p1,
+                    vertex_buffer_id: vb1,
+                    vertex_count: vc1,
+                    uniform_dynamic_offset: off1,
+                    uniform_buffer_id: ub1,
+                    load_op: lo1,
+                    store_op: st1,
+                    pass_flags: pf1,
+                },
+            ) = (&commands[11], &commands[13])
+            {
+                assert_eq!(t0, t1);
+                assert_eq!(tid0, tid1);
+                assert_eq!(c0, c1);
+                assert_eq!(p0, p1);
+                assert_eq!(vb0, vb1);
+                assert_eq!(vc0, vc1);
+                assert_eq!(off0, off1);
+                assert_eq!(ub0, ub1);
+                assert_eq!(lo0, lo1);
+                assert_eq!(st0, st1);
+                assert_eq!(pf0, pf1);
+            } else {
+                panic!("commands 11 and 13 must both be RenderPass");
+            }
+
+            // Encode succeeds and encoded opcode sequence matches the command list
+            let encoded = packet.encode().expect("encode must succeed");
+            assert!(!encoded.is_empty());
+            assert_eq!(encoded, f3d_build_bundle_direct_warm_cache_packet(empty_bundles));
+
+            let cmd_count = u32::from_le_bytes(encoded[8..12].try_into().unwrap()) as usize;
+            assert_eq!(cmd_count, 15);
+            let total_data_len = u32::from_le_bytes(encoded[12..16].try_into().unwrap()) as usize;
+
+            let mut opcodes = Vec::new();
+            let mut cursor = 16;
+            for _ in 0..cmd_count {
+                let opcode = u16::from_le_bytes([encoded[cursor], encoded[cursor + 1]]);
+                cursor += 2;
+                opcodes.push(opcode);
+                match opcode {
+                    OPCODE_CREATE_BUFFER => cursor += 12,
+                    OPCODE_WRITE_BUFFER => cursor += 16,
+                    OPCODE_CREATE_TEXTURE => cursor += 20,
+                    OPCODE_CREATE_PIPELINE => cursor += 32,
+                    OPCODE_RENDER_PASS => cursor += 44,
+                    OPCODE_COPY_TEXTURE_TO_BUFFER => cursor += 24,
+                    OPCODE_RECORD_BUNDLE => cursor += 28,
+                    OPCODE_EXECUTE_BUNDLES => {
+                        let count = u32::from_le_bytes(encoded[cursor..cursor + 4].try_into().unwrap()) as usize;
+                        cursor += 4 + count * 4;
+                    }
+                    other => panic!("unknown opcode {other}"),
+                }
+            }
+            assert_eq!(cursor + total_data_len, encoded.len());
+
+            let expected_opcodes = vec![
+                OPCODE_CREATE_BUFFER,
+                OPCODE_WRITE_BUFFER,
+                OPCODE_CREATE_BUFFER,
+                OPCODE_WRITE_BUFFER,
+                OPCODE_CREATE_BUFFER,
+                OPCODE_WRITE_BUFFER,
+                OPCODE_CREATE_TEXTURE,
+                OPCODE_CREATE_BUFFER,
+                OPCODE_CREATE_PIPELINE,
+                OPCODE_RECORD_BUNDLE,
+                OPCODE_RENDER_PASS,
+                OPCODE_RENDER_PASS,
+                OPCODE_EXECUTE_BUNDLES,
+                OPCODE_RENDER_PASS,
+                OPCODE_COPY_TEXTURE_TO_BUFFER,
+            ];
+            assert_eq!(opcodes, expected_opcodes);
+        }
+    }
+
+    #[test]
     fn lower_plan_bundle_then_direct_draw() {
         use f3d_graph::{
             pass::{ColorAttachment, Draw, Pass, PassId},
@@ -6972,6 +8466,11 @@ mod tests {
 
     #[test]
     fn linear_memory_borrow_guards_growth_blocked_and_token_validation() {
+        let _borrow_lock = match TEST_BORROW_SCOPE_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
         // Reset global scope to clean initial state
         with_global_borrow_scope(|scope| *scope = BorrowScope::new());
 
@@ -7329,6 +8828,240 @@ mod tests {
         assert_eq!(ndc_to_pixel(0.75, -0.25), (56, 40)); // Bottom-right vertex
         assert_eq!(ndc_to_pixel(0.5, 0.0), (48, 32)); // Center of transformed triangle (interior)
         assert_eq!(ndc_to_pixel(0.0, 0.0), (32, 32)); // Untransformed center (origin, outside transformed triangle)
+    }
+
+    #[test]
+    fn affine_rows_layout_counterexample_command_shape() {
+        let _slot_lock = match TEST_SLOT_TABLE_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        for wrong_mat4x3 in [false, true] {
+            let packet = build_affine_rows_layout_counterexample_submission(wrong_mat4x3);
+            let commands = packet.commands();
+            assert_eq!(commands.len(), 9);
+
+            // Command 0: CreateBuffer uniform 1 (size 256, UNIFORM | COPY_DST)
+            match &commands[0] {
+                GpuCommand::CreateBuffer { buffer_id, size, usage } => {
+                    assert_eq!(*buffer_id, 1);
+                    assert_eq!(*size, 256);
+                    assert_eq!(*usage, BUFFER_USAGE_UNIFORM | BUFFER_USAGE_COPY_DST);
+                }
+                other => panic!("expected CreateBuffer for uniform at index 0, got {other:?}"),
+            }
+
+            // Command 1: WriteBuffer uniform 1 (256 bytes, first 48 bytes are AffineRows, MUST BE IDENTICAL for both variants)
+            match &commands[1] {
+                GpuCommand::WriteBuffer { buffer_id, offset, data } => {
+                    assert_eq!(*buffer_id, 1);
+                    assert_eq!(*offset, 0);
+                    assert_eq!(data.len(), 256);
+                    let mut arr = [0u8; 48];
+                    arr.copy_from_slice(&data[..48]);
+                    let rows = AffineRows::from_bytes(&arr);
+                    assert_eq!(rows.r0, [0.5, 0.0, 0.0, 0.5]);
+                    assert_eq!(rows.r1, [0.0, 0.5, 0.0, 0.0]);
+                    assert_eq!(rows.r2, [0.0, 0.0, 1.0, 0.0]);
+                    assert!(data[48..].iter().all(|&b| b == 0));
+                }
+                other => panic!("expected WriteBuffer for uniform at index 1, got {other:?}"),
+            }
+
+            // Command 2: CreateBuffer vb 2 (size 60, VERTEX | COPY_DST)
+            match &commands[2] {
+                GpuCommand::CreateBuffer { buffer_id, size, usage } => {
+                    assert_eq!(*buffer_id, 2);
+                    assert_eq!(*size, 60);
+                    assert_eq!(*usage, BUFFER_USAGE_VERTEX | BUFFER_USAGE_COPY_DST);
+                }
+                other => panic!("expected CreateBuffer for vertex at index 2, got {other:?}"),
+            }
+
+            // Command 3: WriteBuffer vb 2 (60 bytes)
+            match &commands[3] {
+                GpuCommand::WriteBuffer { buffer_id, offset, data } => {
+                    assert_eq!(*buffer_id, 2);
+                    assert_eq!(*offset, 0);
+                    assert_eq!(data.len(), 60);
+                }
+                other => panic!("expected WriteBuffer for vertex at index 3, got {other:?}"),
+            }
+
+            // Command 4: CreateTexture target 10 (64x64 RGBA8Unorm)
+            match &commands[4] {
+                GpuCommand::CreateTexture { texture_id, width, height, format, usage } => {
+                    assert_eq!(*texture_id, 10);
+                    assert_eq!(*width, 64);
+                    assert_eq!(*height, 64);
+                    assert_eq!(*format, TARGET_FORMAT_RGBA8UNORM);
+                    assert_eq!(*usage, TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC);
+                }
+                other => panic!("expected CreateTexture at index 4, got {other:?}"),
+            }
+
+            // Command 5: CreateBuffer readback 20 (size 16384)
+            match &commands[5] {
+                GpuCommand::CreateBuffer { buffer_id, size, usage } => {
+                    assert_eq!(*buffer_id, 20);
+                    assert_eq!(*size, 16384);
+                    assert_eq!(*usage, BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST);
+                }
+                other => panic!("expected CreateBuffer for readback at index 5, got {other:?}"),
+            }
+
+            // Command 6: CreatePipeline 200
+            // ONLY wgsl_code and uniform_size (64 vs 48) may differ!
+            match &commands[6] {
+                GpuCommand::CreatePipeline {
+                    pipeline_id,
+                    wgsl_code,
+                    target_format,
+                    has_vertex_buffer,
+                    has_uniform_buffer,
+                    uniform_size,
+                    vertex_stride,
+                } => {
+                    assert_eq!(*pipeline_id, 200);
+                    assert_eq!(*target_format, TARGET_FORMAT_RGBA8UNORM);
+                    assert!(*has_vertex_buffer);
+                    assert!(*has_uniform_buffer);
+                    assert_eq!(*vertex_stride, 20);
+                    if wrong_mat4x3 {
+                        assert_eq!(*uniform_size, 64);
+                        assert!(wgsl_code.contains("var<uniform> transform: mat4x3<f32>;"));
+                        assert!(wgsl_code.contains("transform * vec4<f32>(in.position, 1.0)"));
+                        assert!(!wgsl_code.contains("struct AffineRows"));
+                    } else {
+                        assert_eq!(*uniform_size, 48);
+                        assert!(wgsl_code.contains("struct AffineRows"));
+                        assert!(wgsl_code.contains("var<uniform> transform: AffineRows;"));
+                        assert!(wgsl_code.contains("transform_affine_point(transform, in.position)"));
+                    }
+                }
+                other => panic!("expected CreatePipeline at index 6, got {other:?}"),
+            }
+
+            // Command 7: RenderPass
+            match &commands[7] {
+                GpuCommand::RenderPass {
+                    target_type,
+                    target_id,
+                    clear_color,
+                    pipeline_id,
+                    vertex_buffer_id,
+                    vertex_count,
+                    uniform_dynamic_offset,
+                    uniform_buffer_id,
+                    load_op,
+                    store_op,
+                    pass_flags,
+                } => {
+                    assert_eq!(*target_type, TARGET_OFFSCREEN);
+                    assert_eq!(*target_id, 10);
+                    assert_eq!(*clear_color, [0.0, 0.0, 0.0, 1.0]);
+                    assert_eq!(*pipeline_id, 200);
+                    assert_eq!(*vertex_buffer_id, 2);
+                    assert_eq!(*vertex_count, 3);
+                    assert_eq!(*uniform_dynamic_offset, 0);
+                    assert_eq!(*uniform_buffer_id, 1);
+                    assert_eq!(*load_op, LOAD_OP_CLEAR);
+                    assert_eq!(*store_op, STORE_OP_STORE);
+                    assert_eq!(*pass_flags, PASS_FLAG_NEW_PASS);
+                }
+                other => panic!("expected RenderPass at index 7, got {other:?}"),
+            }
+
+            // Command 8: CopyTextureToBuffer
+            match &commands[8] {
+                GpuCommand::CopyTextureToBuffer { texture_id, buffer_id, width, height, epoch } => {
+                    assert_eq!(*texture_id, 10);
+                    assert_eq!(*buffer_id, 20);
+                    assert_eq!(*width, 64);
+                    assert_eq!(*height, 64);
+                    assert_eq!(*epoch, Epoch::ZERO);
+                }
+                other => panic!("expected CopyTextureToBuffer at index 8, got {other:?}"),
+            }
+
+            // Binary packet encoding assertions and opcode walker bounded by cmd_count
+            let encoded = packet.encode().expect("encode must succeed");
+            assert!(!encoded.is_empty());
+            assert_eq!(encoded, f3d_build_affine_rows_layout_counterexample_packet(wrong_mat4x3));
+
+            let cmd_count = u32::from_le_bytes(encoded[8..12].try_into().unwrap()) as usize;
+            assert_eq!(cmd_count, 9);
+            let total_data_len = u32::from_le_bytes(encoded[12..16].try_into().unwrap()) as usize;
+
+            let mut opcodes = Vec::new();
+            let mut cursor = 16;
+            for _ in 0..cmd_count {
+                let opcode = u16::from_le_bytes([encoded[cursor], encoded[cursor + 1]]);
+                cursor += 2;
+                opcodes.push(opcode);
+                match opcode {
+                    OPCODE_CREATE_BUFFER => cursor += 12,
+                    OPCODE_WRITE_BUFFER => cursor += 16,
+                    OPCODE_CREATE_TEXTURE => cursor += 20,
+                    OPCODE_CREATE_PIPELINE => cursor += 32,
+                    OPCODE_RENDER_PASS => cursor += 44,
+                    OPCODE_COPY_TEXTURE_TO_BUFFER => cursor += 24,
+                    OPCODE_RECORD_BUNDLE => cursor += 28,
+                    OPCODE_EXECUTE_BUNDLES => {
+                        let count = u32::from_le_bytes(encoded[cursor..cursor + 4].try_into().unwrap()) as usize;
+                        cursor += 4 + count * 4;
+                    }
+                    other => panic!("unknown opcode {other}"),
+                }
+            }
+            assert_eq!(cursor + total_data_len, encoded.len());
+
+            let expected_opcodes = vec![
+                OPCODE_CREATE_BUFFER,
+                OPCODE_WRITE_BUFFER,
+                OPCODE_CREATE_BUFFER,
+                OPCODE_WRITE_BUFFER,
+                OPCODE_CREATE_TEXTURE,
+                OPCODE_CREATE_BUFFER,
+                OPCODE_CREATE_PIPELINE,
+                OPCODE_RENDER_PASS,
+                OPCODE_COPY_TEXTURE_TO_BUFFER,
+            ];
+            assert_eq!(opcodes, expected_opcodes);
+        }
+
+        // Cross-variant comparison: Commands 0, 1, 2, 3, 4, 5, 7, 8 must be identical
+        let p_false = build_affine_rows_layout_counterexample_submission(false);
+        let p_true = build_affine_rows_layout_counterexample_submission(true);
+        assert_eq!(p_false.commands[0], p_true.commands[0]);
+        assert_eq!(p_false.commands[1], p_true.commands[1]); // Uniform bytes identical
+        assert_eq!(p_false.commands[2], p_true.commands[2]);
+        assert_eq!(p_false.commands[3], p_true.commands[3]);
+        assert_eq!(p_false.commands[4], p_true.commands[4]);
+        assert_eq!(p_false.commands[5], p_true.commands[5]);
+        assert_eq!(p_false.commands[7], p_true.commands[7]);
+        assert_eq!(p_false.commands[8], p_true.commands[8]);
+
+        // Hand-computed raster pixel coordinates proof matching oracle:
+        let ndc_to_pixel = |x: f32, y: f32| -> (u32, u32) {
+            let px = ((x + 1.0) * 0.5 * 64.0 - 0.5).round() as u32;
+            let py = ((1.0 - y) * 0.5 * 64.0 - 0.5).round() as u32;
+            (px, py)
+        };
+        // Correct AffineRows: scaled by 0.5 and translated by +0.5 x
+        assert_eq!(ndc_to_pixel(0.5, 0.25), (48, 24)); // Top vertex
+        assert_eq!(ndc_to_pixel(0.25, -0.25), (40, 40)); // Bottom-left vertex
+        assert_eq!(ndc_to_pixel(0.75, -0.25), (56, 40)); // Bottom-right vertex
+        assert_eq!(ndc_to_pixel(0.5, 0.0), (48, 32)); // Center of transformed triangle (interior, green)
+        assert_eq!(ndc_to_pixel(0.0, 0.0), (32, 32)); // Origin (outside, black)
+
+        // Wrong mat4x3 layout: translation lost, scaled by 0.5 centered at origin
+        assert_eq!(ndc_to_pixel(0.0, 0.25), (32, 24)); // Top vertex
+        assert_eq!(ndc_to_pixel(-0.25, -0.25), (24, 40)); // Bottom-left vertex
+        assert_eq!(ndc_to_pixel(0.25, -0.25), (40, 40)); // Bottom-right vertex
+        assert_eq!(ndc_to_pixel(0.0, 0.0), (32, 32)); // Center of unshifted triangle (interior, green)
+        assert_eq!(ndc_to_pixel(0.5, 0.0), (48, 32)); // Shifted center (outside, black)
     }
 
     #[test]
@@ -10589,5 +12322,783 @@ mod tests {
                 slice.len()
             );
         }
+    }
+
+    #[test]
+    fn test_build_render_then_copy_packet_and_exports() {
+        let data = [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        let packet = build_render_then_copy_submission(&data, 0, 4, 8)
+            .expect("build_render_then_copy_submission must succeed");
+        let cmds = packet.commands();
+        assert_eq!(cmds.len(), 5);
+
+        assert_eq!(
+            cmds[0],
+            GpuCommand::CreateBuffer {
+                buffer_id: 610,
+                size: 16,
+                usage: BUFFER_USAGE_COPY_SRC | BUFFER_USAGE_COPY_DST,
+            }
+        );
+
+        match &cmds[1] {
+            GpuCommand::WriteBuffer { buffer_id, offset, data: payload } => {
+                assert_eq!(*buffer_id, 610);
+                assert_eq!(*offset, 0);
+                assert_eq!(payload.as_slice(), &data[..]);
+            }
+            other => panic!("expected WriteBuffer, got {other:?}"),
+        }
+
+        assert_eq!(
+            cmds[2],
+            GpuCommand::CreateBuffer {
+                buffer_id: 611,
+                size: 16,
+                usage: BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST,
+            }
+        );
+
+        assert_eq!(
+            cmds[3],
+            GpuCommand::RenderPass {
+                target_type: TARGET_CANVAS,
+                target_id: 0,
+                clear_color: [0.0, 0.0, 0.0, 1.0],
+                pipeline_id: 0,
+                vertex_buffer_id: 0,
+                vertex_count: 0,
+                uniform_dynamic_offset: 0,
+                uniform_buffer_id: 0,
+                load_op: LOAD_OP_CLEAR,
+                store_op: STORE_OP_STORE,
+                pass_flags: PASS_FLAG_NEW_PASS,
+            }
+        );
+
+        assert_eq!(
+            cmds[4],
+            GpuCommand::CopyBufferToBuffer {
+                source_buffer_id: 610,
+                source_offset: 0,
+                destination_buffer_id: 611,
+                destination_offset: 4,
+                size: 8,
+                epoch: Epoch::ZERO,
+            }
+        );
+
+        // Explicitly assert pass command directly precedes copy command
+        assert!(matches!(cmds[3], GpuCommand::RenderPass { .. }));
+        assert!(matches!(cmds[4], GpuCommand::CopyBufferToBuffer { .. }));
+
+        let encoded = packet.encode().expect("encoding packet must succeed");
+        let exported = f3d_build_render_then_copy_packet(&data, 0, 4, 8)
+            .expect("export must succeed");
+        assert_eq!(encoded, exported);
+    }
+
+    #[test]
+    fn test_pack_affine_rows_storage_bytes_and_exports() {
+        let neg_zero = -0.0f32;
+        let nan_payload = f32::from_bits(0x7fc0_1234);
+        assert!(nan_payload.is_nan());
+
+        // 3 distinct records (36 floats)
+        let record0 = [
+            1.0f32, 0.0, 0.0, neg_zero,
+            0.0, 1.0, 0.0, 2.5,
+            0.0, 0.0, 1.0, -10.0,
+        ];
+        let record1 = [
+            2.0f32, 0.0, 0.0, 0.0,
+            0.0, 3.0, 0.0, nan_payload,
+            0.0, 0.0, 4.0, 0.0,
+        ];
+        let record2 = [
+            5.0f32, 6.0, 7.0, 8.0,
+            9.0, 10.0, 11.0, 12.0,
+            13.0, 14.0, 15.0, 16.0,
+        ];
+
+        let mut three_records = Vec::with_capacity(36);
+        three_records.extend_from_slice(&record0);
+        three_records.extend_from_slice(&record1);
+        three_records.extend_from_slice(&record2);
+
+        let packed = pack_affine_rows_storage_bytes(&three_records)
+            .expect("pack_affine_rows_storage_bytes must succeed");
+        assert_eq!(packed.len(), 3 * 48);
+
+        // Verify exact expected bytes per record via f3d_core AffineRows::to_bytes
+        let a0 = AffineRows::new(
+            [record0[0], record0[1], record0[2], record0[3]],
+            [record0[4], record0[5], record0[6], record0[7]],
+            [record0[8], record0[9], record0[10], record0[11]],
+        );
+        let a1 = AffineRows::new(
+            [record1[0], record1[1], record1[2], record1[3]],
+            [record1[4], record1[5], record1[6], record1[7]],
+            [record1[8], record1[9], record1[10], record1[11]],
+        );
+        let a2 = AffineRows::new(
+            [record2[0], record2[1], record2[2], record2[3]],
+            [record2[4], record2[5], record2[6], record2[7]],
+            [record2[8], record2[9], record2[10], record2[11]],
+        );
+
+        assert_eq!(&packed[0..48], &a0.to_bytes());
+        assert_eq!(&packed[48..96], &a1.to_bytes());
+        assert_eq!(&packed[96..144], &a2.to_bytes());
+
+        // Verify exact bit preservation: -0.0 in record0 (offset 12)
+        assert_eq!(&packed[12..16], &(-0.0f32).to_le_bytes());
+        assert_eq!(&packed[12..16], &[0x00, 0x00, 0x00, 0x80]);
+
+        // Verify exact bit preservation: NaN payload in record1 (offset 48 + 28 = 76)
+        assert_eq!(&packed[76..80], &nan_payload.to_le_bytes());
+        assert_eq!(&packed[76..80], &[0x34, 0x12, 0xc0, 0x7f]);
+
+        // Native export parity
+        let exported = f3d_pack_affine_rows_storage_bytes(&three_records)
+            .expect("f3d_pack_affine_rows_storage_bytes export must succeed");
+        assert_eq!(packed, exported);
+
+        // Rejection cases
+        assert!(matches!(
+            pack_affine_rows_storage_bytes(&[]),
+            Err(PacketEncodeError::InvalidDimensions(_))
+        ));
+        for bad_len in [1, 5, 11, 13, 23, 25] {
+            let bad_input = vec![1.0f32; bad_len];
+            assert!(
+                matches!(
+                    pack_affine_rows_storage_bytes(&bad_input),
+                    Err(PacketEncodeError::InvalidDimensions(_))
+                ),
+                "expected rejection for length {bad_len}"
+            );
+        }
+
+        // 4000 records -> 192,000 bytes
+        let large_input = vec![1.0f32; 4000 * 12];
+        let large_packed = pack_affine_rows_storage_bytes(&large_input)
+            .expect("packing 4000 records must succeed");
+        assert_eq!(large_packed.len(), 192_000);
+        let expected_single_record = AffineRows::new(
+            [1.0, 1.0, 1.0, 1.0],
+            [1.0, 1.0, 1.0, 1.0],
+            [1.0, 1.0, 1.0, 1.0],
+        ).to_bytes();
+        for chunk in large_packed.chunks_exact(48) {
+            assert_eq!(chunk, &expected_single_record);
+        }
+    }
+
+    #[test]
+    fn test_affine_rows_storage_upload_init_and_frame_packets() {
+        let neg_zero = -0.0f32;
+        let nan_payload = f32::from_bits(0x7fc0_1234);
+
+        let record0 = [
+            1.0f32, 0.0, 0.0, neg_zero,
+            0.0, 1.0, 0.0, 2.5,
+            0.0, 0.0, 1.0, -10.0,
+        ];
+        let record1 = [
+            2.0f32, 0.0, 0.0, 0.0,
+            0.0, 3.0, 0.0, nan_payload,
+            0.0, 0.0, 4.0, 0.0,
+        ];
+        let record2 = [
+            5.0f32, 6.0, 7.0, 8.0,
+            9.0, 10.0, 11.0, 12.0,
+            13.0, 14.0, 15.0, 16.0,
+        ];
+
+        let mut three_records = Vec::with_capacity(36);
+        three_records.extend_from_slice(&record0);
+        three_records.extend_from_slice(&record1);
+        three_records.extend_from_slice(&record2);
+
+        // 1. Init packet tests: allocates 610 (COPY_SRC|COPY_DST), 611 (MAP_READ|COPY_DST), 612 (MAP_READ|COPY_DST)
+        let init_packet = build_affine_rows_storage_upload_init_submission(3)
+            .expect("build_affine_rows_storage_upload_init_submission must succeed");
+        let init_cmds = init_packet.commands();
+        assert_eq!(init_cmds.len(), 3);
+
+        match &init_cmds[0] {
+            GpuCommand::CreateBuffer { buffer_id, size, usage } => {
+                assert_eq!(*buffer_id, AFFINE_ROWS_STORAGE_SRC_BUFFER_ID);
+                assert_eq!(*size, 3 * 48);
+                assert_eq!(*usage, BUFFER_USAGE_COPY_SRC | BUFFER_USAGE_COPY_DST);
+            }
+            other => panic!("expected CreateBuffer for slot 610, got {other:?}"),
+        }
+        match &init_cmds[1] {
+            GpuCommand::CreateBuffer { buffer_id, size, usage } => {
+                assert_eq!(*buffer_id, AFFINE_ROWS_STORAGE_DST_SLOT_0);
+                assert_eq!(*size, 3 * 48);
+                assert_eq!(*usage, BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST);
+            }
+            other => panic!("expected CreateBuffer for slot 611, got {other:?}"),
+        }
+        match &init_cmds[2] {
+            GpuCommand::CreateBuffer { buffer_id, size, usage } => {
+                assert_eq!(*buffer_id, AFFINE_ROWS_STORAGE_DST_SLOT_1);
+                assert_eq!(*size, 3 * 48);
+                assert_eq!(*usage, BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST);
+            }
+            other => panic!("expected CreateBuffer for slot 612, got {other:?}"),
+        }
+
+        // Init export parity
+        let init_encoded = init_packet.encode().expect("encoding init packet must succeed");
+        let init_exported = f3d_build_affine_rows_storage_upload_init_packet(3)
+            .expect("init export must succeed");
+        assert_eq!(init_encoded, init_exported);
+
+        // 2. Frame packet tests for both slots: slot 611 and slot 612
+        let expected_packed = pack_affine_rows_storage_bytes(&three_records)
+            .expect("pack_affine_rows_storage_bytes must succeed");
+
+        for &dest_slot in &[AFFINE_ROWS_STORAGE_DST_SLOT_0, AFFINE_ROWS_STORAGE_DST_SLOT_1] {
+            let frame_packet = build_affine_rows_storage_upload_frame_submission(&three_records, 3, dest_slot)
+                .expect("build_affine_rows_storage_upload_frame_submission must succeed");
+            let frame_cmds = frame_packet.commands();
+            assert_eq!(frame_cmds.len(), 2);
+
+            // Command 0: WriteBuffer to 610
+            match &frame_cmds[0] {
+                GpuCommand::WriteBuffer { buffer_id, offset, data } => {
+                    assert_eq!(*buffer_id, AFFINE_ROWS_STORAGE_SRC_BUFFER_ID);
+                    assert_eq!(*offset, 0);
+                    assert_eq!(data.len(), 3 * 48);
+                    assert_eq!(data.as_slice(), expected_packed.as_slice());
+                    // Exact bit preservation of -0.0 and NaN payload in payload
+                    assert_eq!(&data[12..16], &[0x00, 0x00, 0x00, 0x80]);
+                    assert_eq!(&data[76..80], &[0x34, 0x12, 0xc0, 0x7f]);
+                }
+                other => panic!("expected WriteBuffer, got {other:?}"),
+            }
+
+            // Command 1: CopyBufferToBuffer from 610 to dest_slot
+            match &frame_cmds[1] {
+                GpuCommand::CopyBufferToBuffer {
+                    source_buffer_id,
+                    source_offset,
+                    destination_buffer_id,
+                    destination_offset,
+                    size,
+                    epoch,
+                } => {
+                    assert_eq!(*source_buffer_id, AFFINE_ROWS_STORAGE_SRC_BUFFER_ID);
+                    assert_eq!(*source_offset, 0);
+                    assert_eq!(*destination_buffer_id, dest_slot);
+                    assert_eq!(*destination_offset, 0);
+                    assert_eq!(*size, 3 * 48);
+                    assert_eq!(*epoch, Epoch::ZERO);
+                }
+                other => panic!("expected CopyBufferToBuffer, got {other:?}"),
+            }
+
+            // Frame export parity
+            let frame_encoded = frame_packet.encode().expect("encoding frame packet must succeed");
+            let frame_exported = f3d_build_affine_rows_storage_upload_frame_packet(&three_records, 3, dest_slot)
+                .expect("frame export must succeed");
+            assert_eq!(frame_encoded, frame_exported);
+        }
+
+        // 3. Rejections and guards
+        assert!(matches!(
+            build_affine_rows_storage_upload_init_submission(0),
+            Err(PacketEncodeError::InvalidDimensions(_))
+        ));
+        assert!(matches!(
+            build_affine_rows_storage_upload_frame_submission(&three_records, 0, AFFINE_ROWS_STORAGE_DST_SLOT_0),
+            Err(PacketEncodeError::InvalidDimensions(_))
+        ));
+        // Invalid destination slots (not 611 or 612)
+        for bad_slot in [0, 610, 613, 999] {
+            assert!(
+                matches!(
+                    build_affine_rows_storage_upload_frame_submission(&three_records, 3, bad_slot),
+                    Err(PacketEncodeError::InvalidDimensions(_))
+                ),
+                "expected rejection for slot {bad_slot}"
+            );
+        }
+        // Count/length mismatch
+        assert!(matches!(
+            build_affine_rows_storage_upload_frame_submission(&three_records, 2, AFFINE_ROWS_STORAGE_DST_SLOT_0),
+            Err(PacketEncodeError::InvalidDimensions(_))
+        ));
+        assert!(matches!(
+            build_affine_rows_storage_upload_frame_submission(&three_records, 4, AFFINE_ROWS_STORAGE_DST_SLOT_0),
+            Err(PacketEncodeError::InvalidDimensions(_))
+        ));
+        assert!(matches!(
+            build_affine_rows_storage_upload_frame_submission(&[], 1, AFFINE_ROWS_STORAGE_DST_SLOT_0),
+            Err(PacketEncodeError::InvalidDimensions(_))
+        ));
+
+        // 4. Scale & byte equality for 4000 records -> 192,000 bytes
+        let large_init = build_affine_rows_storage_upload_init_submission(4000)
+            .expect("init with 4000 records must succeed");
+        assert_eq!(large_init.commands().len(), 3);
+        match &large_init.commands()[0] {
+            GpuCommand::CreateBuffer { buffer_id, size, .. } => {
+                assert_eq!(*buffer_id, AFFINE_ROWS_STORAGE_SRC_BUFFER_ID);
+                assert_eq!(*size, 192_000);
+            }
+            other => panic!("expected CreateBuffer, got {other:?}"),
+        }
+
+        let large_input = vec![1.0f32; 4000 * 12];
+        let large_expected = pack_affine_rows_storage_bytes(&large_input)
+            .expect("pack_affine_rows_storage_bytes for 4000 records must succeed");
+        assert_eq!(large_expected.len(), 192_000);
+
+        let large_frame = build_affine_rows_storage_upload_frame_submission(
+            &large_input,
+            4000,
+            AFFINE_ROWS_STORAGE_DST_SLOT_1,
+        ).expect("frame with 4000 records must succeed");
+        assert_eq!(large_frame.commands().len(), 2);
+        match &large_frame.commands()[0] {
+            GpuCommand::WriteBuffer { buffer_id, offset, data } => {
+                assert_eq!(*buffer_id, AFFINE_ROWS_STORAGE_SRC_BUFFER_ID);
+                assert_eq!(*offset, 0);
+                assert_eq!(data.len(), 192_000);
+                assert_eq!(data.as_slice(), large_expected.as_slice());
+            }
+            other => panic!("expected WriteBuffer, got {other:?}"),
+        }
+        match &large_frame.commands()[1] {
+            GpuCommand::CopyBufferToBuffer { size, destination_buffer_id, .. } => {
+                assert_eq!(*size, 192_000);
+                assert_eq!(*destination_buffer_id, AFFINE_ROWS_STORAGE_DST_SLOT_1);
+            }
+            other => panic!("expected CopyBufferToBuffer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_affine_rows_storage_upload_callback_ops() {
+        let neg_zero = -0.0f32;
+        let nan_payload = f32::from_bits(0x7fc0_1234);
+
+        let record0 = [
+            1.0f32, 0.0, 0.0, neg_zero,
+            0.0, 1.0, 0.0, 2.5,
+            0.0, 0.0, 1.0, -10.0,
+        ];
+        let record1 = [
+            2.0f32, 0.0, 0.0, 0.0,
+            0.0, 3.0, 0.0, nan_payload,
+            0.0, 0.0, 4.0, 0.0,
+        ];
+        let record2 = [
+            5.0f32, 6.0, 7.0, 8.0,
+            9.0, 10.0, 11.0, 12.0,
+            13.0, 14.0, 15.0, 16.0,
+        ];
+
+        let mut three_records = Vec::with_capacity(36);
+        three_records.extend_from_slice(&record0);
+        three_records.extend_from_slice(&record1);
+        three_records.extend_from_slice(&record2);
+
+        let expected_packed = pack_affine_rows_storage_bytes(&three_records)
+            .expect("pack_affine_rows_storage_bytes must succeed");
+
+        // 1. Test for both destination slots: 611 and 612
+        for &dest_slot in &[AFFINE_ROWS_STORAGE_DST_SLOT_0, AFFINE_ROWS_STORAGE_DST_SLOT_1] {
+            let bulk_frame = build_affine_rows_storage_upload_frame_submission(&three_records, 3, dest_slot)
+                .expect("bulk frame submission must succeed");
+            let ops = build_affine_rows_storage_upload_callback_ops(&three_records, 3, dest_slot)
+                .expect("build_affine_rows_storage_upload_callback_ops must succeed");
+
+            assert_eq!(ops.len(), 2);
+            assert_eq!(ops.len(), bulk_frame.commands().len());
+
+            // Op 0: WriteBuffer(buffer_id=610, offset=0, bytes)
+            match &ops[0] {
+                StorageUploadCallbackOp::WriteBuffer { buffer_id, offset, bytes } => {
+                    assert_eq!(*buffer_id, AFFINE_ROWS_STORAGE_SRC_BUFFER_ID);
+                    assert_eq!(*offset, 0);
+                    assert_eq!(bytes.len(), 3 * 48);
+                    match &bulk_frame.commands()[0] {
+                        GpuCommand::WriteBuffer { data, .. } => {
+                            assert_eq!(bytes.as_slice(), data.as_slice());
+                        }
+                        other => panic!("expected WriteBuffer in bulk frame, got {other:?}"),
+                    }
+                    assert_eq!(bytes.as_slice(), expected_packed.as_slice());
+                    // Bit-exact preservation of -0.0 and quiet NaN payload
+                    assert_eq!(&bytes[12..16], &[0x00, 0x00, 0x00, 0x80]);
+                    assert_eq!(&bytes[76..80], &[0x34, 0x12, 0xc0, 0x7f]);
+                }
+                other => panic!("expected WriteBuffer op at index 0, got {other:?}"),
+            }
+
+            // Op 1: CopyBufferToBuffer(src=610, src_off=0, dst=dest_slot, dst_off=0, size=3*48)
+            match &ops[1] {
+                StorageUploadCallbackOp::CopyBufferToBuffer { src, src_off, dst, dst_off, size } => {
+                    assert_eq!(*src, AFFINE_ROWS_STORAGE_SRC_BUFFER_ID);
+                    assert_eq!(*src_off, 0);
+                    assert_eq!(*dst, dest_slot);
+                    assert_eq!(*dst_off, 0);
+                    assert_eq!(*size, 3 * 48);
+                    match &bulk_frame.commands()[1] {
+                        GpuCommand::CopyBufferToBuffer {
+                            source_buffer_id,
+                            source_offset,
+                            destination_buffer_id,
+                            destination_offset,
+                            size: bulk_size,
+                            ..
+                        } => {
+                            assert_eq!(*src, *source_buffer_id);
+                            assert_eq!(*src_off as u64, *source_offset);
+                            assert_eq!(*dst, *destination_buffer_id);
+                            assert_eq!(*dst_off as u64, *destination_offset);
+                            assert_eq!(*size as u64, *bulk_size);
+                        }
+                        other => panic!("expected CopyBufferToBuffer in bulk frame, got {other:?}"),
+                    }
+                }
+                other => panic!("expected CopyBufferToBuffer op at index 1, got {other:?}"),
+            }
+        }
+
+        // 2. Guard rejections: same as bulk frame by construction
+        assert!(matches!(
+            build_affine_rows_storage_upload_callback_ops(&three_records, 0, AFFINE_ROWS_STORAGE_DST_SLOT_0),
+            Err(PacketEncodeError::InvalidDimensions(_))
+        ));
+        for bad_slot in [0, 610, 613, 999] {
+            assert!(
+                matches!(
+                    build_affine_rows_storage_upload_callback_ops(&three_records, 3, bad_slot),
+                    Err(PacketEncodeError::InvalidDimensions(_))
+                ),
+                "expected rejection for slot {bad_slot}"
+            );
+        }
+        assert!(matches!(
+            build_affine_rows_storage_upload_callback_ops(&three_records, 2, AFFINE_ROWS_STORAGE_DST_SLOT_0),
+            Err(PacketEncodeError::InvalidDimensions(_))
+        ));
+        assert!(matches!(
+            build_affine_rows_storage_upload_callback_ops(&three_records, 4, AFFINE_ROWS_STORAGE_DST_SLOT_0),
+            Err(PacketEncodeError::InvalidDimensions(_))
+        ));
+        assert!(matches!(
+            build_affine_rows_storage_upload_callback_ops(&[], 1, AFFINE_ROWS_STORAGE_DST_SLOT_0),
+            Err(PacketEncodeError::InvalidDimensions(_))
+        ));
+
+        // 3. Byte equality for 4000 records -> 192,000 bytes
+        let large_input = vec![1.0f32; 4000 * 12];
+        let large_expected = pack_affine_rows_storage_bytes(&large_input)
+            .expect("pack_affine_rows_storage_bytes for 4000 records must succeed");
+        let large_bulk_frame = build_affine_rows_storage_upload_frame_submission(
+            &large_input,
+            4000,
+            AFFINE_ROWS_STORAGE_DST_SLOT_0,
+        ).expect("bulk frame for 4000 records must succeed");
+
+        let large_ops = build_affine_rows_storage_upload_callback_ops(
+            &large_input,
+            4000,
+            AFFINE_ROWS_STORAGE_DST_SLOT_0,
+        ).expect("callback ops for 4000 records must succeed");
+
+        assert_eq!(large_ops.len(), 2);
+        match &large_ops[0] {
+            StorageUploadCallbackOp::WriteBuffer { buffer_id, offset, bytes } => {
+                assert_eq!(*buffer_id, AFFINE_ROWS_STORAGE_SRC_BUFFER_ID);
+                assert_eq!(*offset, 0);
+                assert_eq!(bytes.len(), 192_000);
+                assert_eq!(bytes.as_slice(), large_expected.as_slice());
+                match &large_bulk_frame.commands()[0] {
+                    GpuCommand::WriteBuffer { data, .. } => {
+                        assert_eq!(bytes.as_slice(), data.as_slice());
+                    }
+                    other => panic!("expected WriteBuffer in bulk frame, got {other:?}"),
+                }
+            }
+            other => panic!("expected WriteBuffer op, got {other:?}"),
+        }
+        match &large_ops[1] {
+            StorageUploadCallbackOp::CopyBufferToBuffer { src, src_off, dst, dst_off, size } => {
+                assert_eq!(*src, AFFINE_ROWS_STORAGE_SRC_BUFFER_ID);
+                assert_eq!(*src_off, 0);
+                assert_eq!(*dst, AFFINE_ROWS_STORAGE_DST_SLOT_0);
+                assert_eq!(*dst_off, 0);
+                assert_eq!(*size, 192_000);
+            }
+            other => panic!("expected CopyBufferToBuffer op, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_borrowed_frame_packet_slot_and_borrow_scope_invariants() {
+        let _borrow_lock = match TEST_BORROW_SCOPE_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        clear_borrowed_frame_packet();
+
+        let floats: Vec<f32> = (0..24).map(|i| (i + 1) as f32).collect(); // 2 draws
+        let owned = f3d_build_affine_rows_batch_frame_packet(&floats, 64, 64, 2)
+            .expect("owned frame packet encode must succeed");
+
+        let view_bytes_0 = borrow_scope_bytes_view();
+
+        // 1. Initial borrowed packet build succeeds
+        let [ptr, len] = f3d_build_affine_rows_batch_frame_packet_borrowed(&floats, 64, 64, 2)
+            .expect("borrowed frame packet build must succeed");
+        assert_ne!(ptr, 0, "borrowed packet pointer must be non-zero");
+        assert_eq!(len as usize, owned.len(), "borrowed packet length must match owned length");
+        assert_eq!(f3d_borrowed_frame_packet_ptr(), ptr, "scalar getter ptr must match returned ptr");
+        assert_eq!(f3d_borrowed_frame_packet_len(), len, "scalar getter len must match returned len");
+        assert_eq!(
+            borrow_scope_bytes_view(),
+            view_bytes_0 + (len as u64),
+            "borrow_scope_bytes_view must increase by exactly len after successful borrowed build"
+        );
+
+        // 2. Reading bytes from the borrowed slot produces the exact same bytes as owned export
+        with_global_borrowed_frame_packet_ref(|slice| {
+            assert_eq!(slice, Some(owned.as_slice()), "borrowed slot bytes must equal owned packet bytes");
+        });
+
+        // 3. Enter borrow scope: active borrow guard
+        let token = f3d_borrow_enter();
+        assert_ne!(token, 0, "entering borrow scope must yield non-zero token");
+
+        // 4. While held: a second call to build borrowed packet must be refused (safety against view invalidation)
+        let view_bytes_before_refusal = borrow_scope_bytes_view();
+        let rebuild_err = f3d_build_affine_rows_batch_frame_packet_borrowed(&floats, 64, 64, 2);
+        assert!(
+            rebuild_err.is_err(),
+            "rebuilding borrowed frame packet while linear memory borrow scope is active must be refused"
+        );
+        assert_eq!(
+            borrow_scope_bytes_view(),
+            view_bytes_before_refusal,
+            "borrow_scope_bytes_view must remain unchanged after refused build"
+        );
+
+        // 5. While held: clear_borrowed_frame_packet must return false and leave slot intact
+        assert!(
+            !clear_borrowed_frame_packet(),
+            "clear_borrowed_frame_packet must return false while linear memory borrow scope is active"
+        );
+        with_global_borrowed_frame_packet_ref(|slice| {
+            assert_eq!(
+                slice,
+                Some(owned.as_slice()),
+                "slot bytes must still equal owned packet after refused clear while borrowed"
+            );
+        });
+
+        // 6. While held: memory growth must be refused
+        assert!(
+            !f3d_try_grow_memory(1),
+            "memory growth must be blocked while linear memory borrow scope is active"
+        );
+
+        // 7. Exit with wrong token must fail and leave scope borrowed
+        assert!(
+            !f3d_borrow_exit(token + 999_999),
+            "exit with mismatched token must fail"
+        );
+        let view_bytes_before_refusal2 = borrow_scope_bytes_view();
+        assert!(
+            f3d_build_affine_rows_batch_frame_packet_borrowed(&floats, 64, 64, 2).is_err(),
+            "rebuild must still fail after failed mismatched exit"
+        );
+        assert_eq!(
+            borrow_scope_bytes_view(),
+            view_bytes_before_refusal2,
+            "borrow_scope_bytes_view must remain unchanged after second refused build"
+        );
+        assert!(
+            !clear_borrowed_frame_packet(),
+            "clear_borrowed_frame_packet must still return false after mismatched exit"
+        );
+        with_global_borrowed_frame_packet_ref(|slice| {
+            assert_eq!(
+                slice,
+                Some(owned.as_slice()),
+                "slot bytes must still equal owned packet after second refused clear"
+            );
+        });
+        assert!(
+            !f3d_try_grow_memory(1),
+            "memory growth must still be blocked after failed mismatched exit"
+        );
+
+        // 8. Exit with correct token succeeds
+        assert!(f3d_borrow_exit(token), "exit with matching token must succeed");
+
+        // 9. After exit: rebuild succeeds and borrow_scope_bytes_view increases by exactly len
+        let view_bytes_before_rebuild = borrow_scope_bytes_view();
+        let [ptr2, len2] = f3d_build_affine_rows_batch_frame_packet_borrowed(&floats, 64, 64, 2)
+            .expect("rebuild after exit must succeed");
+        assert_ne!(ptr2, 0);
+        assert_eq!(len2 as usize, owned.len());
+        assert_eq!(
+            borrow_scope_bytes_view(),
+            view_bytes_before_rebuild + (len2 as u64),
+            "borrow_scope_bytes_view must increase by exactly len2 after second successful build"
+        );
+        with_global_borrowed_frame_packet_ref(|slice| {
+            assert_eq!(slice, Some(owned.as_slice()));
+        });
+
+        // 10. Memory growth succeeds when idle, and f3d_borrow_growth_generation increments
+        let gen_before = f3d_borrow_growth_generation();
+        assert!(f3d_try_grow_memory(1), "idle memory growth must succeed");
+        assert_eq!(
+            f3d_borrow_growth_generation(),
+            gen_before + 1,
+            "growth generation must increment by 1 on successful growth"
+        );
+
+        // 11. After exit: clear_borrowed_frame_packet returns true and empties the slot
+        assert!(
+            clear_borrowed_frame_packet(),
+            "clear_borrowed_frame_packet must return true after exit when scope is idle"
+        );
+        with_global_borrowed_frame_packet_ref(|slice| {
+            assert_eq!(slice, None, "slot must be None after successful clear");
+        });
+    }
+
+    #[test]
+    fn runtime_shaders_use_schema_generated_wgsl_declarations() {
+        let _slot_lock = match TEST_SLOT_TABLE_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        // 1. Verify the six ColorUniform builders use WGSL_COLOR_UNIFORM_DECLARATION
+        // and do not contain the drifted field name `color: vec4<f32>`.
+        let color_builders: [(&str, GpuSubmissionPacket); 6] = [
+            (
+                "build_red_a_blue_b_submission",
+                build_red_a_blue_b_submission(true),
+            ),
+            (
+                "build_bundle_then_direct_draw_submission",
+                build_bundle_then_direct_draw_submission(),
+            ),
+            (
+                "build_bundle_then_direct_warm_cache_submission",
+                build_bundle_then_direct_warm_cache_submission(false),
+            ),
+            (
+                "build_nested_pass_submission",
+                build_nested_pass_submission(),
+            ),
+            (
+                "build_nested_canvas_pass_submission",
+                build_nested_canvas_pass_submission(),
+            ),
+            (
+                "build_nested_viewport_scissor_submission",
+                build_nested_viewport_scissor_submission(),
+            ),
+        ];
+
+        for (name, packet) in &color_builders {
+            let mut pipeline_count = 0;
+            for cmd in packet.commands() {
+                if let GpuCommand::CreatePipeline { wgsl_code, .. } = cmd {
+                    pipeline_count += 1;
+                    assert!(
+                        wgsl_code.contains(WGSL_COLOR_UNIFORM_DECLARATION),
+                        "{name} pipeline must contain schema-generated WGSL_COLOR_UNIFORM_DECLARATION"
+                    );
+                    assert!(
+                        !wgsl_code.contains("color: vec4<f32>"),
+                        "{name} pipeline must not contain drifted field name 'color: vec4<f32>'"
+                    );
+                    assert!(
+                        wgsl_code.contains("u.rgba"),
+                        "{name} pipeline must access schema field 'rgba'"
+                    );
+                }
+            }
+            assert!(
+                pipeline_count > 0,
+                "{name} packet must contain at least one CreatePipeline command"
+            );
+        }
+
+        // 2. Verify the two AffineRows builders use WGSL_AFFINE_ROWS_DECLARATION
+        // and do not contain the drifted field name `color: vec4<f32>`.
+        let affine_builders: [(&str, GpuSubmissionPacket); 2] = [
+            (
+                "build_affine_rows_transform_submission",
+                build_affine_rows_transform_submission(),
+            ),
+            (
+                "build_affine_rows_layout_counterexample_submission(false)",
+                build_affine_rows_layout_counterexample_submission(false),
+            ),
+        ];
+
+        for (name, packet) in &affine_builders {
+            let mut pipeline_count = 0;
+            for cmd in packet.commands() {
+                if let GpuCommand::CreatePipeline { wgsl_code, .. } = cmd {
+                    pipeline_count += 1;
+                    assert!(
+                        wgsl_code.contains(WGSL_AFFINE_ROWS_DECLARATION),
+                        "{name} pipeline must contain schema-generated WGSL_AFFINE_ROWS_DECLARATION"
+                    );
+                    assert!(
+                        !wgsl_code.contains("color: vec4<f32>"),
+                        "{name} pipeline must not contain drifted field name 'color: vec4<f32>'"
+                    );
+                }
+            }
+            assert!(
+                pipeline_count > 0,
+                "{name} packet must contain at least one CreatePipeline command"
+            );
+        }
+
+        // 3. Verify counterexample wrong variant (true):
+        // Must contain `mat4x3<f32>` and must NOT contain `WGSL_AFFINE_ROWS_DECLARATION`.
+        let wrong_packet = build_affine_rows_layout_counterexample_submission(true);
+        let mut found_wrong_pipeline = false;
+        for cmd in wrong_packet.commands() {
+            if let GpuCommand::CreatePipeline { wgsl_code, .. } = cmd {
+                found_wrong_pipeline = true;
+                assert!(
+                    wgsl_code.contains("mat4x3<f32>"),
+                    "wrong layout pipeline must declare mat4x3<f32>"
+                );
+                assert!(
+                    !wgsl_code.contains(WGSL_AFFINE_ROWS_DECLARATION),
+                    "wrong layout pipeline must NOT contain WGSL_AFFINE_ROWS_DECLARATION"
+                );
+                assert!(
+                    !wgsl_code.contains("color: vec4<f32>"),
+                    "wrong layout pipeline must not contain drifted field name 'color: vec4<f32>'"
+                );
+            }
+        }
+        assert!(
+            found_wrong_pipeline,
+            "build_affine_rows_layout_counterexample_submission(true) must contain CreatePipeline"
+        );
     }
 }

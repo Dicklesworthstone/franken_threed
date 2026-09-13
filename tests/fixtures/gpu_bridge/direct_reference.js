@@ -596,6 +596,281 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
   return result;
 }
 
+/**
+ * Generates recordCount distinct 48-byte AffineRows records (recordCount * 12 floats = recordCount * 48 bytes)
+ * as a Float32Array (§6.4, §16.7, §21, tmt.5 workload b).
+ * Preserves exact bit patterns for -0.0 and quiet NaN (0x7fc01337).
+ *
+ * @param {number} [recordCount=4000]
+ * @param {number} [uploadIndex=0]
+ * @returns {Float32Array}
+ */
+export function generatePackedAffineRows(recordCount = 4000, uploadIndex = 0) {
+  if (!Number.isSafeInteger(recordCount) || recordCount <= 0) {
+    throw new RangeError("recordCount must be a positive safe integer");
+  }
+  const buffer = new ArrayBuffer(recordCount * 12 * 4);
+  const floats = new Float32Array(buffer);
+  const uint32s = new Uint32Array(buffer);
+  const delta = uploadIndex * 0.125;
+
+  for (let i = 0; i < recordCount; i++) {
+    const base = i * 12;
+    floats[base + 0] = 1.0 + (i * 0.0001) + delta;
+    floats[base + 1] = 0.01 * ((i % 7) + 1);
+    floats[base + 2] = 0.02 * ((i % 11) + 1);
+    floats[base + 3] = (i * 0.25) + 1.0 + delta;
+    floats[base + 4] = 0.03 * ((i % 5) + 1);
+    floats[base + 5] = 1.0 + (i * 0.0002) + delta;
+    floats[base + 6] = 0.04 * ((i % 13) + 1);
+    floats[base + 7] = (i * 0.5) - 2.0 + delta;
+    floats[base + 8] = 0.05 * ((i % 9) + 1);
+    floats[base + 9] = 0.06 * ((i % 17) + 1);
+    floats[base + 10] = 1.0 + (i * 0.0003) + delta;
+    floats[base + 11] = (i * 0.75) + 3.0 + delta;
+  }
+
+  // Inject -0.0 (0x80000000) and quiet NaN with payload 0x1337 (0x7fc01337) via Uint32Array view
+  // to avoid JS Number NaN canonicalization across the JS->Wasm/host boundary.
+  if (recordCount > 0) {
+    uint32s[1] = 0x80000000;
+    uint32s[2] = 0x7fc01337;
+  }
+
+  return floats;
+}
+
+/**
+ * Reusable Direct-JS WebGPU Persistent Packed Buffer Runner (tmt.5 workload b, root contract 20934).
+ *
+ * INIT once:
+ * - Source buffer 610: COPY_SRC|COPY_DST, size 48*N (192,000 bytes for N=4000)
+ * - Two destination slots 611 and 612: MAP_READ|COPY_DST, size 48*N each
+ *
+ * FRAME (no creation):
+ * - WriteBuffer 610 offset 0 with packed 48*N bytes (192,000 bytes)
+ * - One copy: 610 -> 611 or 612 (alternating slot per frame, matching two-frame credit loop)
+ *
+ * Guards:
+ * - Record count must match the init N (4000)
+ * - Destination must be 611 or 612
+ * - Usage is COPY_SRC|COPY_DST, NOT STORAGE
+ *
+ * @param {GPUDevice} device
+ * @param {number} [recordCount=4000]
+ * @returns {Object}
+ */
+export function createDirectPersistentPackedBufferRunner(device, recordCount = 4000) {
+  if (!device || !device.queue) {
+    throw new TypeError("Valid GPUDevice with queue required");
+  }
+  if (!Number.isSafeInteger(recordCount) || recordCount <= 0) {
+    throw new RangeError("recordCount must be a positive safe integer");
+  }
+
+  const recordBytes = 48; // 3 rows of vec4<f32>
+  const totalBytes = recordCount * recordBytes;
+  const srcBufferId = 610;
+  const dstBufferIds = [611, 612];
+
+  // INIT once: source buffer 610 COPY_SRC|COPY_DST, size 48*N
+  const srcBuffer = device.createBuffer({
+    label: `f3d-persistent-packed-src-${srcBufferId}`,
+    size: totalBytes,
+    usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+  });
+
+  // INIT once: two destination slots 611 and 612, MAP_READ|COPY_DST, size 48*N each
+  const dstBuffer611 = device.createBuffer({
+    label: "f3d-persistent-packed-dst-611",
+    size: totalBytes,
+    usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+  });
+
+  const dstBuffer612 = device.createBuffer({
+    label: "f3d-persistent-packed-dst-612",
+    size: totalBytes,
+    usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+  });
+
+  const dstBuffers = {
+    611: dstBuffer611,
+    612: dstBuffer612,
+  };
+
+  let currentFrameIndex = 0;
+  let lastDestinationBufferId = 611;
+
+  /**
+   * Submits one frame of persistent packed upload and buffer copy (no buffer creation).
+   *
+   * @param {Float32Array|Uint8Array|null} [affineRows=null]
+   * @param {Object|null} [timingRecord=null]
+   * @param {number|null} [targetDestinationId=null] - 611 or 612; if null, alternates 611/612
+   * @returns {Promise<void>}
+   */
+  function submitFrame(affineRows = null, timingRecord = null, targetDestinationId = null) {
+    const t0 = timingRecord ? performance.now() : 0;
+
+    let uploadData;
+    if (affineRows === null) {
+      uploadData = generatePackedAffineRows(recordCount, currentFrameIndex);
+    } else if (ArrayBuffer.isView(affineRows)) {
+      // Guard: record count must match init N (4000 records = 192,000 bytes)
+      if (affineRows.byteLength !== totalBytes) {
+        throw new RangeError(`record count must match the init N (${recordCount} records = ${totalBytes} bytes, got byteLength ${affineRows.byteLength})`);
+      }
+      uploadData = affineRows;
+    } else {
+      throw new TypeError("affineRows must be an ArrayBuffer view (e.g. Float32Array, Uint8Array) or null");
+    }
+
+    // Determine destination slot: must be 611 or 612 (alternating slot per frame if not explicitly specified)
+    let dstId;
+    if (targetDestinationId !== null) {
+      if (targetDestinationId === 0) dstId = 611;
+      else if (targetDestinationId === 1) dstId = 612;
+      else dstId = targetDestinationId;
+      if (dstId !== 611 && dstId !== 612) {
+        throw new RangeError(`destination must be 611 or 612, got ${targetDestinationId}`);
+      }
+    } else {
+      dstId = (currentFrameIndex % 2 === 0) ? 611 : 612;
+    }
+
+    const dstBuffer = dstBuffers[dstId];
+    if (!dstBuffer) {
+      throw new RangeError(`destination must be 611 or 612, got ${dstId}`);
+    }
+
+    lastDestinationBufferId = dstId;
+
+    // 1. FRAME: WriteBuffer 610 offset 0 with the packed 48*N bytes (no creation)
+    device.queue.writeBuffer(srcBuffer, 0, uploadData);
+
+    // 2. FRAME: one copy 610 -> 611 or 612 (alternating slot per frame)
+    const encoder = device.createCommandEncoder({
+      label: `f3d-packed-copy-encoder-frame-${currentFrameIndex}-dst-${dstId}`,
+    });
+    encoder.copyBufferToBuffer(srcBuffer, 0, dstBuffer, 0, totalBytes);
+    const commandBuffer = encoder.finish();
+
+    const tFinish = timingRecord ? performance.now() : 0;
+    const tSubmitStart = timingRecord ? performance.now() : 0;
+    device.queue.submit([commandBuffer]);
+    const tSubmitEnd = timingRecord ? performance.now() : 0;
+
+    if (timingRecord) {
+      timingRecord._t0 = t0;
+      timingRecord._tFinish = tFinish;
+      timingRecord._tSubmitStart = tSubmitStart;
+      timingRecord._tSubmitEnd = tSubmitEnd;
+    }
+
+    currentFrameIndex++;
+    return device.queue.onSubmittedWorkDone();
+  }
+
+  function submit(affineRows) {
+    return submitFrame(affineRows, null, null);
+  }
+
+  async function readback(slotOrId = null) {
+    let dstId;
+    if (slotOrId === null) {
+      dstId = lastDestinationBufferId;
+    } else if (slotOrId === 0) {
+      dstId = 611;
+    } else if (slotOrId === 1) {
+      dstId = 612;
+    } else {
+      dstId = slotOrId;
+    }
+    if (dstId !== 611 && dstId !== 612) {
+      throw new RangeError(`destination must be 611 or 612, got ${slotOrId}`);
+    }
+    const targetBuffer = dstBuffers[dstId];
+    await targetBuffer.mapAsync(GPUMapMode.READ, 0, totalBytes);
+    const mapped = targetBuffer.getMappedRange(0, totalBytes);
+    const result = new Uint8Array(mapped.slice(0));
+    targetBuffer.unmap();
+    return result;
+  }
+
+  function destroy() {
+    srcBuffer.destroy();
+    dstBuffer611.destroy();
+    dstBuffer612.destroy();
+  }
+
+  return {
+    device,
+    recordCount,
+    totalBytes,
+    srcBufferId,
+    dstBufferIds,
+    srcBuffer,
+    dstBuffer611,
+    dstBuffer612,
+    dstBuffers,
+    get lastDestinationBufferId() { return lastDestinationBufferId; },
+    get currentFrameIndex() { return currentFrameIndex; },
+    submitFrame,
+    submit,
+    readback,
+    destroy,
+  };
+}
+
+/**
+ * Direct-JS WebGPU Persistent Packed Upload and Readback Execution (§6.4, §16.7, §21, tmt.5, root contract 20934).
+ *
+ * Executes upload of recordCount packed AffineRows records (totalBytes = recordCount * 48)
+ * into persistent buffer 610 via queue.writeBuffer, copies to readback buffer 611 or 612 via copyBufferToBuffer,
+ * records timing into measurementSeam if provided, and returns mapped readback bytes.
+ *
+ * @param {GPUDevice} device
+ * @param {number} [recordCount=4000]
+ * @param {Object|null} [measurementSeam=null]
+ * @param {Float32Array|Uint8Array|null} [affineRows=null]
+ * @param {number} [destinationId=611] - 611 or 612
+ * @returns {Promise<Uint8Array>}
+ */
+export async function executeDirectPersistentPackedUpload(
+  device,
+  recordCount = 4000,
+  measurementSeam = null,
+  affineRows = null,
+  destinationId = 611
+) {
+  if (destinationId !== 611 && destinationId !== 612) {
+    throw new RangeError(`destination must be 611 or 612, got ${destinationId}`);
+  }
+  const measure = measurementSeam !== null && typeof measurementSeam === "object";
+  const t0 = measure ? performance.now() : 0;
+
+  const runner = createDirectPersistentPackedBufferRunner(device, recordCount);
+  try {
+    const timingRecord = measure ? {} : null;
+    const donePromise = runner.submitFrame(affineRows, timingRecord, destinationId);
+
+    if (measure) {
+      const tSubmitEnd = timingRecord._tSubmitEnd;
+      measurementSeam.direct_prepare_ms = timingRecord._tFinish - t0;
+      measurementSeam.direct_submit_ms = tSubmitEnd - timingRecord._tSubmitStart;
+      measurementSeam.cpu_prepare_submit_ms = measurementSeam.direct_prepare_ms + measurementSeam.direct_submit_ms;
+      await donePromise;
+      measurementSeam.gpu_complete_ms = performance.now() - tSubmitEnd;
+    } else {
+      await donePromise;
+    }
+
+    return await runner.readback(destinationId);
+  } finally {
+    runner.destroy();
+  }
+}
+
 
 import {
   PACKET_MAGIC,
@@ -608,11 +883,18 @@ import {
   OPCODE_COPY_TEXTURE_TO_BUFFER,
   OPCODE_RECORD_BUNDLE,
   OPCODE_EXECUTE_BUNDLES,
+  OPCODE_COPY_BUFFER_TO_BUFFER,
   TEXTURE_USAGE_COPY_SRC,
   TEXTURE_USAGE_RENDER_ATTACHMENT,
 } from "./bridge_runtime.js";
 
-export { TEXTURE_USAGE_COPY_SRC, TEXTURE_USAGE_RENDER_ATTACHMENT, OPCODE_RECORD_BUNDLE, OPCODE_EXECUTE_BUNDLES };
+export {
+  TEXTURE_USAGE_COPY_SRC,
+  TEXTURE_USAGE_RENDER_ATTACHMENT,
+  OPCODE_RECORD_BUNDLE,
+  OPCODE_EXECUTE_BUNDLES,
+  OPCODE_COPY_BUFFER_TO_BUFFER,
+};
 
 /**
  * Independent JS-side PacketBuilder kept exclusively inside direct_reference.js
@@ -676,6 +958,19 @@ export class PacketBuilder {
     });
   }
 
+  copyBufferToBuffer(sourceBufferId, sourceOffset, destinationBufferId, destinationOffset, size, epochHi = 0, epochLo = 0) {
+    this.commands.push({
+      op: OPCODE_COPY_BUFFER_TO_BUFFER,
+      sourceBufferId,
+      sourceOffset,
+      destinationBufferId,
+      destinationOffset,
+      size,
+      epochHi,
+      epochLo,
+    });
+  }
+
   build() {
     const headerLen = 16;
     let commandBytesLen = 0;
@@ -689,6 +984,7 @@ export class PacketBuilder {
         case OPCODE_COPY_TEXTURE_TO_BUFFER: commandBytesLen += 2 + 24; break;
         case OPCODE_RECORD_BUNDLE: commandBytesLen += 2 + 28; break;
         case OPCODE_EXECUTE_BUNDLES: commandBytesLen += 2 + 4 + cmd.bundleIds.length * 4; break;
+        case OPCODE_COPY_BUFFER_TO_BUFFER: commandBytesLen += 2 + 40; break;
       }
     }
 
@@ -779,6 +1075,16 @@ export class PacketBuilder {
             view.setUint32(cursor, cmd.bundleIds[b], true);
             cursor += 4;
           }
+          break;
+        case OPCODE_COPY_BUFFER_TO_BUFFER:
+          view.setUint32(cursor, cmd.sourceBufferId, true);
+          view.setBigUint64(cursor + 4, BigInt(cmd.sourceOffset), true);
+          view.setUint32(cursor + 12, cmd.destinationBufferId, true);
+          view.setBigUint64(cursor + 16, BigInt(cmd.destinationOffset), true);
+          view.setBigUint64(cursor + 24, BigInt(cmd.size), true);
+          view.setUint32(cursor + 32, cmd.epochLo || 0, true);
+          view.setUint32(cursor + 36, cmd.epochHi || 0, true);
+          cursor += 40;
           break;
       }
     }

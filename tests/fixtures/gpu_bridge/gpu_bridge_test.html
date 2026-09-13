@@ -48,6 +48,13 @@
     import { testMeshScene, testVisibleCanvasMeshScene, testMeshDepthScene, testMultiMeshBatchScene } from "./mesh_scene_test.js";
     import { testDepthScene } from "./depth_test.js";
     import { testBufferCopy } from "./buffer_copy_test.js";
+    import { testWorkloadBStorageCopy, testWorkloadBVariants, testWorkloadBMeasurementMode } from "./workload_b_test.js";
+    import { testWorkloadAMeasurementMode, testWorkloadCMeasurementMode, testBorrowedBulkMeasurementMode } from "./workload_ac_measure.js";
+    import { testVariantPreconditions } from "./variant_preconditions.js";
+    import { testTranscendentalBrowser } from "./transcendental_browser_test.js";
+    import { testBundleResetCounterexample } from "./counterexample_bundle_reset_test.js";
+    import { testAffineLayoutCounterexample } from "./counterexample_affine_layout_test.js";
+    import { testStaleReadbackCounterexample } from "./counterexample_stale_readback_test.js";
 
     const outputEl = document.getElementById("output");
     const canvas = document.getElementById("canvas");
@@ -78,6 +85,160 @@
         results.wasm_backed = true;
         logPass("wasm_runtime_linked", "Imported /pkg/f3d_runtime.js and initialized application Wasm");
 
+        const searchParams = new URLSearchParams(window.location.search);
+        if (searchParams.get("lane") === "workload_b_measure") {
+          const bridge = new WebGpuBridgeHost();
+          const cap = await bridge.negotiateAndCreateDevice({ requiredFeatures: [] });
+          results.capabilityRecord = cap;
+
+          const measureResults = await testWorkloadBMeasurementMode(bridge, wasmExports);
+          results.workload_b_measure = measureResults.measurements;
+          for (const key of [
+            "workload_b_bulk_packet",
+            "workload_b_wasm_callbacks",
+            "workload_b_direct_js",
+            "workload_b_generated_js",
+          ]) {
+            const v = measureResults.variants[key];
+            if (v && v.status === "PASS") {
+              logPass(key, v.detail);
+            } else {
+              logFail(key, new Error(v ? (v.error || "Measurement variant failed") : `Missing result for ${key}`));
+            }
+            if (results.tests[key]) {
+              results.tests[key].implementation_owner = v ? v.implementation_owner : "Unknown";
+            }
+          }
+        } else if (searchParams.get("lane") === "workload_a_measure") {
+          const bridge = new WebGpuBridgeHost();
+          const cap = await bridge.negotiateAndCreateDevice({ requiredFeatures: [] });
+          results.capabilityRecord = cap;
+
+          const measureResults = await testWorkloadAMeasurementMode(bridge, wasmExports);
+          results.workload_a_measure = measureResults.measurements;
+          for (const key of [
+            "workload_a_direct",
+            "workload_a_bulk",
+            "workload_a_chatty",
+            "workload_a_generated",
+          ]) {
+            const v = measureResults.variants[key];
+            if (v && v.status === "PASS") {
+              logPass(key, v.detail);
+            } else {
+              logFail(key, new Error(v ? (v.error || "Measurement variant failed") : `Missing result for ${key}`));
+            }
+            if (results.tests[key]) {
+              results.tests[key].implementation_owner = v ? v.implementation_owner : "Unknown";
+            }
+          }
+        } else if (searchParams.get("lane") === "workload_c_measure") {
+          const bridge = new WebGpuBridgeHost();
+          const cap = await bridge.negotiateAndCreateDevice({ requiredFeatures: [] });
+          results.capabilityRecord = cap;
+
+          const measureResults = await testWorkloadCMeasurementMode(bridge, wasmExports);
+          results.workload_c_measure = measureResults.measurements;
+          for (const key of [
+            "workload_c_direct_bundle",
+            "workload_c_bulk_bundle",
+            "workload_c_chatty_bundle",
+            "workload_c_generated_bundle",
+          ]) {
+            const v = measureResults.variants[key];
+            if (v && v.status === "PASS") {
+              logPass(key, v.detail);
+            } else {
+              logFail(key, new Error(v ? (v.error || "Measurement variant failed") : `Missing result for ${key}`));
+            }
+            if (results.tests[key]) {
+              results.tests[key].implementation_owner = v ? v.implementation_owner : "Unknown";
+            }
+          }
+        } else if (searchParams.get("lane") === "variant_preconditions") {
+          const bridge = new WebGpuBridgeHost();
+          const cap = await bridge.negotiateAndCreateDevice({ requiredFeatures: [] });
+          results.capabilityRecord = cap;
+
+          const preResults = await testVariantPreconditions(bridge, wasmExports);
+          results.variant_preconditions = preResults;
+          for (const [key, testRes] of Object.entries(preResults.tests)) {
+            if (testRes.status === "PASS") {
+              logPass(key, testRes.detail);
+            } else {
+              logFail(key, new Error(testRes.error || "Precondition check failed"));
+            }
+            if (results.tests[key]) {
+              results.tests[key].implementation_owner = testRes.implementation_owner || "Unknown";
+            }
+          }
+        } else if (searchParams.get("lane") === "borrowed_bulk_measure") {
+          const memory = (await init()).memory;
+          const bridge = new WebGpuBridgeHost();
+          const cap = await bridge.negotiateAndCreateDevice({ requiredFeatures: [] });
+          results.capabilityRecord = cap;
+
+          const measureResults = await testBorrowedBulkMeasurementMode(bridge, wasmExports, memory);
+          results.borrowed_bulk_measure = measureResults.measurements;
+          for (const key of [
+            "workload_a_direct",
+            "workload_a_bulk",
+            "workload_a_bulk_borrowed",
+          ]) {
+            const v = measureResults.variants[key];
+            if (v && v.status === "PASS") {
+              logPass(key, v.detail);
+            } else {
+              logFail(key, new Error(v ? (v.error || "Measurement variant failed") : `Missing result for ${key}`));
+            }
+            if (results.tests[key]) {
+              results.tests[key].implementation_owner = v ? v.implementation_owner : "Unknown";
+            }
+          }
+        } else if (searchParams.get("lane") === "math_transcendental") {
+          const report = await testTranscendentalBrowser();
+          results.math_transcendental = report;
+          logPass(
+            "math_transcendental_differential",
+            `Total: ${report.grand_totals.total}, exact: ${report.grand_totals.exact_bit_matches}, both_nan: ${report.grand_totals.both_nan_bit_differences}, mismatches: ${report.grand_totals.mismatches}, max_ulp: ${report.grand_totals.max_ulp}`
+          );
+        } else if (searchParams.get("lane") === "counterexamples") {
+          results.host_environment = navigator.userAgent;
+          const report = await testBundleResetCounterexample(wasmExports);
+          results.counterexamples = report;
+          logPass(
+            "counterexample_bundle_then_direct_state_reset",
+            report[false].detail
+          );
+          if (results.tests["counterexample_bundle_then_direct_state_reset"]) {
+            results.tests["counterexample_bundle_then_direct_state_reset"].implementation_owner = "new-backend";
+          }
+          logPass(
+            "counterexample_empty_bundle_list_state_reset",
+            report[true].detail
+          );
+          if (results.tests["counterexample_empty_bundle_list_state_reset"]) {
+            results.tests["counterexample_empty_bundle_list_state_reset"].implementation_owner = "new-backend";
+          }
+          const affineReport = await testAffineLayoutCounterexample(wasmExports);
+          results.counterexample_affine_layout = affineReport;
+          logPass(
+            "counterexample_affine_rows_vs_mat4x3_layout",
+            affineReport.detail
+          );
+          if (results.tests["counterexample_affine_rows_vs_mat4x3_layout"]) {
+            results.tests["counterexample_affine_rows_vs_mat4x3_layout"].implementation_owner = "new-backend";
+          }
+          const staleReport = await testStaleReadbackCounterexample(wasmExports);
+          results.counterexample_stale_readback = staleReport;
+          logPass(
+            "counterexample_stale_readback_after_device_replacement",
+            staleReport.detail
+          );
+          if (results.tests["counterexample_stale_readback_after_device_replacement"]) {
+            results.tests["counterexample_stale_readback_after_device_replacement"].implementation_owner = "new-backend";
+          }
+        } else {
         const buildTriangleFn = f3d_build_first_frame_packet || gpu_bridge_build_triangle_packet;
         const buildRedBlueFn = f3d_build_red_a_blue_b_packet || gpu_bridge_build_red_blue_packet;
         const buildViewportScissorFn = f3d_build_nested_viewport_scissor_packet || gpu_bridge_build_nested_viewport_scissor_packet;
@@ -1313,7 +1474,62 @@
         logPass("viewport_scissor_rectangles", await testViewportScissor(bridge, buildViewportScissorFn));
         logPass("draw_ranges_and_instances", await testDrawParameters(bridge, wasmExports.f3d_build_draw_parameters_packet));
         logPass("dynamic_mesh_scene", await testMeshScene(bridge, wasmExports));
-        logPass("buffer_copy", await testBufferCopy(bridge, wasmExports.f3d_build_buffer_copy_packet));
+        logPass("buffer_copy", await testBufferCopy(bridge, wasmExports, canvasContext));
+        logPass("workload_b_storage_copy", await testWorkloadBStorageCopy(bridge, wasmExports));
+        results.tests.workload_b_storage_copy.implementation_owner = "Rust/Wasm packer and packet encoder; JavaScript WebGPU adapter";
+
+        const bundleResetReport = await testBundleResetCounterexample(wasmExports);
+        logPass(
+          "counterexample_bundle_then_direct_state_reset",
+          bundleResetReport[false].detail
+        );
+        if (results.tests["counterexample_bundle_then_direct_state_reset"]) {
+          results.tests["counterexample_bundle_then_direct_state_reset"].implementation_owner = "new-backend";
+        }
+        logPass(
+          "counterexample_empty_bundle_list_state_reset",
+          bundleResetReport[true].detail
+        );
+        if (results.tests["counterexample_empty_bundle_list_state_reset"]) {
+          results.tests["counterexample_empty_bundle_list_state_reset"].implementation_owner = "new-backend";
+        }
+
+        const affineReport = await testAffineLayoutCounterexample(wasmExports);
+        logPass(
+          "counterexample_affine_rows_vs_mat4x3_layout",
+          affineReport.detail
+        );
+        if (results.tests["counterexample_affine_rows_vs_mat4x3_layout"]) {
+          results.tests["counterexample_affine_rows_vs_mat4x3_layout"].implementation_owner = "new-backend";
+        }
+
+        const staleReport = await testStaleReadbackCounterexample(wasmExports);
+        logPass(
+          "counterexample_stale_readback_after_device_replacement",
+          staleReport.detail
+        );
+        if (results.tests["counterexample_stale_readback_after_device_replacement"]) {
+          results.tests["counterexample_stale_readback_after_device_replacement"].implementation_owner = "new-backend";
+        }
+
+        const wbResults = await testWorkloadBVariants(bridge, wasmExports);
+        results.workload_b_measurements = wbResults.measurements;
+        for (const key of [
+          "workload_b_bulk_packet",
+          "workload_b_wasm_callbacks",
+          "workload_b_direct_js",
+          "workload_b_generated_js",
+        ]) {
+          const v = wbResults.variants[key];
+          if (v && v.status === "PASS") {
+            logPass(key, v.detail);
+          } else {
+            logFail(key, new Error(v ? (v.error || "Variant failed") : `Missing result for ${key}`));
+          }
+          if (results.tests[key]) {
+            results.tests[key].implementation_owner = v ? v.implementation_owner : "Unknown";
+          }
+        }
 
         const urlParams = new URLSearchParams(window.location.search);
         const requestedLane = urlParams.get("lane") || (urlParams.has("canvas") ? "canvas" : (urlParams.has("depth") ? "depth" : (urlParams.has("mesh_depth") ? "mesh_depth" : "offscreen")));
@@ -1371,8 +1587,9 @@
           throw new Error("Retained renderer submission detected; all work must go through new WebGPU bridge");
         }
         logPass("no_retained_renderer", "Zero retained renderer calls; work issued exclusively through new WebGPU bridge");
+      }
 
-        results.passed = results.errors.length === 0 && results.wasm_backed;
+      results.passed = results.errors.length === 0 && results.wasm_backed;
       } catch (err) {
         logFail("suite_execution", err);
         results.passed = false;

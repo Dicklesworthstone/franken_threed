@@ -1,14 +1,11 @@
 // Buffer-to-buffer copy regression using real WebGPU buffers, copyBufferToBuffer, and readback.
-// Exercises canonical Rust export f3d_build_buffer_copy_packet (source 610, destination 611).
+// Exercises canonical Rust exports f3d_build_buffer_copy_packet and f3d_build_render_then_copy_packet.
 
 function findCopyCommandPayloadOffset(bytes) {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const dataLen = view.getUint32(12, true);
-  const commandEnd = bytes.byteLength - dataLen;
+  const commandEnd = bytes.byteLength - view.getUint32(12, true);
   const opcode = view.getUint16(commandEnd - 42, true);
-  if (opcode !== 20) {
-    throw new Error(`Expected opcode 20 at commandEnd-42 (${commandEnd - 42}), found ${opcode}`);
-  }
+  if (opcode !== 20) throw new Error(`Expected opcode 20 at ${commandEnd - 42}, found ${opcode}`);
   return commandEnd - 40;
 }
 
@@ -26,11 +23,15 @@ async function drainAndCleanup(host, srcId, dstId) {
   }
 }
 
-export async function testBufferCopy(host, wasmExports) {
+export async function testBufferCopy(host, wasmExports, canvasContext) {
   const buildPacket = wasmExports?.f3d_build_buffer_copy_packet ||
     (typeof wasmExports === "function" ? wasmExports : null);
   if (typeof buildPacket !== "function") {
     throw new Error("Missing required canonical export: f3d_build_buffer_copy_packet");
+  }
+  const buildRenderCopyPacket = wasmExports?.f3d_build_render_then_copy_packet;
+  if (typeof buildRenderCopyPacket !== "function") {
+    throw new Error("Missing required canonical export: f3d_build_render_then_copy_packet");
   }
   if (!host || !host.device) throw new Error("WebGpuBridgeHost device not initialized");
 
@@ -45,6 +46,17 @@ export async function testBufferCopy(host, wasmExports) {
   const data = new Uint8Array(totalSize);
   for (let i = 0; i < totalSize; i++) data[i] = ((i * 7 + 13) & 0xff) || 1;
 
+  const assertBufferMatches = (readback, label) => {
+    if (readback.byteLength !== totalSize) throw new Error(`${label} length mismatch: got ${readback.byteLength}, expected ${totalSize}`);
+    for (let i = 0; i < copySize; i++) {
+      if (readback[dstOffset + i] !== data[srcOffset + i]) {
+        throw new Error(`${label} mismatch at dst ${dstOffset + i}: got ${readback[dstOffset + i]}, expected ${data[srcOffset + i]}`);
+      }
+    }
+    if (readback.subarray(0, dstOffset).some((b) => b !== 0)) throw new Error(`${label} prefix not zero`);
+    if (readback.subarray(dstOffset + copySize).some((b) => b !== 0)) throw new Error(`${label} suffix not zero`);
+  };
+
   // 2. Build canonical Rust packet and inject opaque 64-bit epoch with high bit set (0x8000000100000002)
   const packet = buildPacket(data, srcOffset, dstOffset, copySize);
   if (!(packet instanceof Uint8Array) || packet.byteLength === 0) {
@@ -58,17 +70,7 @@ export async function testBufferCopy(host, wasmExports) {
   try {
     await host.executePacket(packet);
     const readback = await host.readbackBuffer(dstBufferId, totalSize);
-    if (readback.byteLength !== totalSize) {
-      throw new Error(`Readback length mismatch: got ${readback.byteLength}, expected ${totalSize}`);
-    }
-
-    for (let i = 0; i < copySize; i++) {
-      if (readback[dstOffset + i] !== data[srcOffset + i]) {
-        throw new Error(`Copy mismatch at dst ${dstOffset + i}: got ${readback[dstOffset + i]}, expected ${data[srcOffset + i]}`);
-      }
-    }
-    if (readback.subarray(0, dstOffset).some((b) => b !== 0)) throw new Error("Prefix not zero");
-    if (readback.subarray(dstOffset + copySize).some((b) => b !== 0)) throw new Error("Suffix not zero");
+    assertBufferMatches(readback, "Copy");
 
     // Opaque epoch with high bit set survives in epochHi/Lo
     if ((readback.epochHi >>> 0) !== 0x80000001 || (readback.epochLo >>> 0) !== 2) {
@@ -141,6 +143,18 @@ export async function testBufferCopy(host, wasmExports) {
     if (!rejected) throw new Error(`f3d_build_buffer_copy_packet failed to reject invalid range: ${desc}`);
   }
 
-  // Note: Single-packet pass-before-copy coverage remains outstanding until a unified render-and-copy packet builder seam is introduced.
-  return `Buffer copy verified: 64 bytes copied from 610[16] to 611[32]; exact data matches, surrounding bytes zero; opaque epoch with high bit set preserved in epochHi/Lo; zero-size copy executed and confirmed unchanged; mutated decoder validation errors asserted (pass->copy coverage outstanding)`;
+  // 7. Single-packet pass-before-copy execution using real Rust export f3d_build_render_then_copy_packet
+  try {
+    const renderCopyPacket = buildRenderCopyPacket(data, srcOffset, dstOffset, copySize);
+    if (!(renderCopyPacket instanceof Uint8Array) || renderCopyPacket.byteLength === 0) {
+      throw new Error("f3d_build_render_then_copy_packet returned empty or invalid packet");
+    }
+    await host.executePacket(renderCopyPacket, canvasContext);
+    const rcReadback = await host.readbackBuffer(dstBufferId, totalSize);
+    assertBufferMatches(rcReadback, "Pass->copy");
+  } finally {
+    await drainAndCleanup(host, srcBufferId, dstBufferId);
+  }
+
+  return `Buffer copy verified: 64 bytes copied from 610[16] to 611[32]; exact data matches, surrounding bytes zero; opaque epoch with high bit set preserved in epochHi/Lo; zero-size copy executed and confirmed unchanged; mutated decoder validation errors asserted; pass->copy single-packet verified on canvas`;
 }
