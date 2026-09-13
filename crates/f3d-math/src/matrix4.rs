@@ -1,6 +1,7 @@
 //! 4x4 matrix primitive with `f64` public semantics matching Three.js r186 `Matrix4`.
 
 use core::fmt;
+use core::simd::f64x4;
 use crate::euler::{Euler, EulerOrder};
 use crate::jsnum::js_max;
 use crate::matrix3::Matrix3;
@@ -383,6 +384,177 @@ impl Matrix4 {
 
         for i in 0..count {
             outputs[i].compose(&positions[i], &quaternions[i], &scales[i]);
+        }
+
+        Ok(())
+    }
+
+    /// Composes a batch of $N$ transformation matrices from caller-provided position,
+    /// quaternion, and scale slices using 4-lane `core::simd` vector operations on native hosts,
+    /// with scalar [`Matrix4::compose`] processing any remaining tail elements.
+    ///
+    /// # Invariants
+    /// - Evaluates each transform using the identical algebraic expression ordering and grouping
+    ///   as [`Matrix4::compose`] without reassociation, reordering, or `mul_add` contraction.
+    /// - Validates that all input and output slice lengths match before performing any writes;
+    ///   on length mismatch, returns `Err(BatchComposeError::LengthMismatch)` and leaves `outputs` unmodified.
+    /// - An empty batch ($N = 0$) is valid and immediately returns `Ok(())`.
+    /// - Preserves authored non-unit quaternions, negative scaling, and signed zero without heap allocations.
+    ///
+    /// # Note on Performance Claims
+    /// No acceleration, speedup, or crossover claims are made for this native SIMD kernel.
+    /// The Wasm release contract currently compiles with default flags and does not enable `simd128`,
+    /// so there is no browser SIMD claim. Empirical cross-over benchmarks and browser acceleration
+    /// validation are deferred to dedicated benchmark gates.
+    pub fn batch_compose_simd(
+        positions: &[Vector3],
+        quaternions: &[Quaternion],
+        scales: &[Vector3],
+        outputs: &mut [Matrix4],
+    ) -> Result<(), BatchComposeError> {
+        let count = positions.len();
+        if quaternions.len() != count || scales.len() != count || outputs.len() != count {
+            return Err(BatchComposeError::LengthMismatch {
+                positions_len: count,
+                quaternions_len: quaternions.len(),
+                scales_len: scales.len(),
+                outputs_len: outputs.len(),
+            });
+        }
+
+        let chunks = count / 4;
+        let simd_end = chunks * 4;
+
+        let mut i = 0;
+        while i < simd_end {
+            let x = f64x4::from_array([
+                quaternions[i].x,
+                quaternions[i + 1].x,
+                quaternions[i + 2].x,
+                quaternions[i + 3].x,
+            ]);
+            let y = f64x4::from_array([
+                quaternions[i].y,
+                quaternions[i + 1].y,
+                quaternions[i + 2].y,
+                quaternions[i + 3].y,
+            ]);
+            let z = f64x4::from_array([
+                quaternions[i].z,
+                quaternions[i + 1].z,
+                quaternions[i + 2].z,
+                quaternions[i + 3].z,
+            ]);
+            let w = f64x4::from_array([
+                quaternions[i].w,
+                quaternions[i + 1].w,
+                quaternions[i + 2].w,
+                quaternions[i + 3].w,
+            ]);
+
+            let x2 = x + x;
+            let y2 = y + y;
+            let z2 = z + z;
+
+            let xx = x * x2;
+            let xy = x * y2;
+            let xz = x * z2;
+            let yy = y * y2;
+            let yz = y * z2;
+            let zz = z * z2;
+            let wx = w * x2;
+            let wy = w * y2;
+            let wz = w * z2;
+
+            let sx = f64x4::from_array([
+                scales[i].x,
+                scales[i + 1].x,
+                scales[i + 2].x,
+                scales[i + 3].x,
+            ]);
+            let sy = f64x4::from_array([
+                scales[i].y,
+                scales[i + 1].y,
+                scales[i + 2].y,
+                scales[i + 3].y,
+            ]);
+            let sz = f64x4::from_array([
+                scales[i].z,
+                scales[i + 1].z,
+                scales[i + 2].z,
+                scales[i + 3].z,
+            ]);
+
+            let one = f64x4::splat(1.0);
+            let zero = f64x4::splat(0.0);
+
+            let m0  = (one - (yy + zz)) * sx;
+            let m1  = (xy + wz) * sx;
+            let m2  = (xz - wy) * sx;
+            let m3  = zero;
+
+            let m4  = (xy - wz) * sy;
+            let m5  = (one - (xx + zz)) * sy;
+            let m6  = (yz + wx) * sy;
+            let m7  = zero;
+
+            let m8  = (xz + wy) * sz;
+            let m9  = (yz - wx) * sz;
+            let m10 = (one - (xx + yy)) * sz;
+            let m11 = zero;
+
+            let m12 = f64x4::from_array([
+                positions[i].x,
+                positions[i + 1].x,
+                positions[i + 2].x,
+                positions[i + 3].x,
+            ]);
+            let m13 = f64x4::from_array([
+                positions[i].y,
+                positions[i + 1].y,
+                positions[i + 2].y,
+                positions[i + 3].y,
+            ]);
+            let m14 = f64x4::from_array([
+                positions[i].z,
+                positions[i + 1].z,
+                positions[i + 2].z,
+                positions[i + 3].z,
+            ]);
+            let m15 = one;
+
+            let a0 = m0.to_array();
+            let a1 = m1.to_array();
+            let a2 = m2.to_array();
+            let a3 = m3.to_array();
+            let a4 = m4.to_array();
+            let a5 = m5.to_array();
+            let a6 = m6.to_array();
+            let a7 = m7.to_array();
+            let a8 = m8.to_array();
+            let a9 = m9.to_array();
+            let a10 = m10.to_array();
+            let a11 = m11.to_array();
+            let a12 = m12.to_array();
+            let a13 = m13.to_array();
+            let a14 = m14.to_array();
+            let a15 = m15.to_array();
+
+            for lane in 0..4 {
+                outputs[i + lane].elements = [
+                    a0[lane], a1[lane], a2[lane], a3[lane],
+                    a4[lane], a5[lane], a6[lane], a7[lane],
+                    a8[lane], a9[lane], a10[lane], a11[lane],
+                    a12[lane], a13[lane], a14[lane], a15[lane],
+                ];
+            }
+
+            i += 4;
+        }
+
+        while i < count {
+            outputs[i].compose(&positions[i], &quaternions[i], &scales[i]);
+            i += 1;
         }
 
         Ok(())

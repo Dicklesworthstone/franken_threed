@@ -12,6 +12,7 @@
 
 #![forbid(unsafe_code)]
 #![cfg_attr(not(feature = "std"), no_std)]
+#![feature(portable_simd)]
 
 pub mod affine3x4;
 pub mod box3;
