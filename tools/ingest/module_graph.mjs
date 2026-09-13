@@ -113,6 +113,8 @@ export async function buildModuleGraph(entryPath, options = {}) {
     importMap = parsedHtml.importMap;
 
     for (const script of parsedHtml.moduleScripts) {
+      // Preserve the script element in emitted HTML; it has no executable module.
+      if (script.src === '') continue;
       rootEntryIds.push(script.id);
       queue.push({
         id: script.id,
@@ -127,7 +129,7 @@ export async function buildModuleGraph(entryPath, options = {}) {
       });
     }
 
-    if (rootEntryIds.length === 0) {
+    if (parsedHtml.moduleScripts.length === 0) {
       throw new Error(`No <script type="module"> entry points found in HTML: "${entryPath}"`);
     }
   } else {

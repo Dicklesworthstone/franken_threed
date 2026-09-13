@@ -38,6 +38,7 @@ import {
   isClassicJavaScriptType
 } from './build_application.mjs';
 import { parseHtmlEntries, parseTagAttributes, stripScriptAndStyleBodies, stripHtmlComments } from './html_parser.mjs';
+import { buildModuleGraph } from './module_graph.mjs';
 
 const SCRATCH_BASE = fs.existsSync('/Volumes/USBNVME16TB/temp_agent_space')
   ? '/Volumes/USBNVME16TB/temp_agent_space'
@@ -52,6 +53,34 @@ function makeScratch(prefix) {
   fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ type: 'module' }));
   return dir;
 }
+
+test('empty module src preserves the browser-owned error and never executes its body', async () => {
+  for (const attrs of ['src=""', 'src', 'src="" src="missing.js"']) {
+    const scratch = makeScratch('f3d_empty_module_src');
+    const entry = path.join(scratch, 'index.html');
+    const ignoredTag = `<script type="module" ${attrs} onerror="window.emptySrcError = true">import './must-not-resolve.js'; this is not valid JavaScript</script>`;
+    const html = `<script type="module">globalThis.__f3d_empty_src_order = ['before'];</script>${ignoredTag}<script type="module">globalThis.__f3d_empty_src_order.push('after');</script>`;
+    fs.writeFileSync(entry, html);
+    const parsed = parseHtmlEntries(html, pathToFileURL(entry).href);
+    assert.equal(parsed.moduleScripts[1].src, '');
+    assert.equal(parsed.moduleScripts[1].inlineContent, null);
+    const graph = await buildModuleGraph(entry);
+    assert.equal(Object.keys(graph.modules).length, 2, 'Only the two executable inline modules enter the graph');
+    const built = await buildApplication(entry, path.join(scratch, 'dist'));
+    assert.equal(built.entryFiles.length, 2);
+    assert.ok(fs.readFileSync(path.join(built.outDir, 'index.html'), 'utf8').includes(ignoredTag), 'Preserve the exact tag, error handler, attributes and ignored body');
+    for (const file of built.entryFiles) await import(pathToFileURL(path.join(built.outDir, file)).href);
+    assert.deepEqual(globalThis.__f3d_empty_src_order, ['before', 'after']);
+
+    const emptyOnly = path.join(scratch, 'empty.html');
+    fs.writeFileSync(emptyOnly, ignoredTag);
+    const emptyGraph = await buildModuleGraph(emptyOnly);
+    assert.equal(Object.keys(emptyGraph.modules).length, 0);
+    const emptyBuilt = await buildApplication(emptyOnly, path.join(scratch, 'empty-dist'));
+    assert.deepEqual(emptyBuilt.entryFiles, []);
+    assert.equal(fs.readFileSync(path.join(emptyBuilt.outDir, 'empty.html'), 'utf8'), ignoredTag);
+  }
+});
 
 test('buildApplication emits runnable module-only entry point and executes with real return value', async () => {
   const scratch = makeScratch('f3d_app_js');

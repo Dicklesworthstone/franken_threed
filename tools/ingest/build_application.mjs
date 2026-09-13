@@ -656,6 +656,8 @@ export function rewriteHtmlForBuild(rawHtmlContent, entryFiles, chunkFilesMap = 
         const scriptType = (attrs.type || 'text/javascript').toLowerCase();
 
         if (scriptType === 'module') {
+          // Keep the browser's empty-src error and ignored body, including handlers.
+          if (attrs.src === '') return match;
           if (attrs.src && isExternalUrl(attrs.src)) {
             // External module root script (http:, https:, data:) preserved verbatim with original attributes
             return match;

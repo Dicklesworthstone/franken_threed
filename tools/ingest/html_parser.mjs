@@ -197,7 +197,7 @@ export function parseHtmlEntries(rawHtmlContent, documentUrl) {
         );
       }
     } else if (scriptType === 'module') {
-      if (attrs.src) {
+      if (Object.hasOwn(attrs, 'src')) {
         const externalSrc = attrs.src;
         moduleScripts.push({
           id: new URL(externalSrc, effectiveBaseUrl).href,
