@@ -399,13 +399,8 @@ impl Box3 {
     /// Matches Three.js r186 `Box3.union(box)`.
     #[inline]
     pub fn union(&mut self, other: &Box3) -> &mut Self {
-        self.min.x = self.min.x.min(other.min.x);
-        self.min.y = self.min.y.min(other.min.y);
-        self.min.z = self.min.z.min(other.min.z);
-
-        self.max.x = self.max.x.max(other.max.x);
-        self.max.y = self.max.y.max(other.max.y);
-        self.max.z = self.max.z.max(other.max.z);
+        self.min.min(&other.min);
+        self.max.max(&other.max);
         self
     }
 
@@ -415,13 +410,8 @@ impl Box3 {
     /// Matches Three.js r186 `Box3.intersect(box)`.
     #[inline]
     pub fn intersect(&mut self, other: &Box3) -> &mut Self {
-        self.min.x = self.min.x.max(other.min.x);
-        self.min.y = self.min.y.max(other.min.y);
-        self.min.z = self.min.z.max(other.min.z);
-
-        self.max.x = self.max.x.min(other.max.x);
-        self.max.y = self.max.y.min(other.max.y);
-        self.max.z = self.max.z.min(other.max.z);
+        self.min.max(&other.min);
+        self.max.min(&other.max);
 
         if self.is_empty() {
             self.make_empty();

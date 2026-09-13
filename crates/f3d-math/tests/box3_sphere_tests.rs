@@ -162,6 +162,134 @@ fn test_box3_union_and_intersect() {
 }
 
 #[test]
+fn test_box3_union_intersect_nan_propagation_and_order_independence() {
+    // Upstream Three.js r186 Box3.union/intersect use Vector3.min/max -> Math.min/max.
+    // If either operand contains NaN, Math.min and Math.max propagate NaN
+    // regardless of whether NaN is in self or other (argument order).
+
+    // 1. Union with NaN in other
+    let mut b_self = Box3::new(Vector3::new(1.0, 2.0, 3.0), Vector3::new(4.0, 5.0, 6.0));
+    let b_nan_other = Box3::new(Vector3::new(f64::NAN, 0.0, 0.0), Vector3::new(0.0, f64::NAN, 0.0));
+    b_self.union(&b_nan_other);
+    assert!(b_self.min.x.is_nan(), "union must propagate NaN on min.x from other");
+    assert_close(b_self.min.y, 0.0, EPS, "union preserves finite min.y");
+    assert_close(b_self.min.z, 0.0, EPS, "union preserves finite min.z");
+    assert_close(b_self.max.x, 4.0, EPS, "union preserves finite max.x");
+    assert!(b_self.max.y.is_nan(), "union must propagate NaN on max.y from other");
+    assert_close(b_self.max.z, 6.0, EPS, "union preserves finite max.z");
+
+    // 2. Union with NaN in self (swapped operand order)
+    let mut b_nan_self = Box3::new(Vector3::new(f64::NAN, 0.0, 0.0), Vector3::new(0.0, f64::NAN, 0.0));
+    let b_other = Box3::new(Vector3::new(1.0, 2.0, 3.0), Vector3::new(4.0, 5.0, 6.0));
+    b_nan_self.union(&b_other);
+    assert!(b_nan_self.min.x.is_nan(), "union must propagate NaN on min.x from self");
+    assert_close(b_nan_self.min.y, 0.0, EPS, "union preserves finite min.y");
+    assert_close(b_nan_self.min.z, 0.0, EPS, "union preserves finite min.z");
+    assert_close(b_nan_self.max.x, 4.0, EPS, "union preserves finite max.x");
+    assert!(b_nan_self.max.y.is_nan(), "union must propagate NaN on max.y from self");
+    assert_close(b_nan_self.max.z, 6.0, EPS, "union preserves finite max.z");
+
+    // 3. Intersect with NaN in other
+    let mut b_inter1 = Box3::new(Vector3::new(1.0, 2.0, 3.0), Vector3::new(4.0, 5.0, 6.0));
+    let b_nan_in_min = Box3::new(Vector3::new(f64::NAN, 2.0, 3.0), Vector3::new(4.0, 5.0, 6.0));
+    b_inter1.intersect(&b_nan_in_min);
+    assert!(b_inter1.min.x.is_nan(), "intersect must propagate NaN on min.x from other");
+    assert_close(b_inter1.min.y, 2.0, EPS, "intersect preserves finite min.y");
+    assert_close(b_inter1.min.z, 3.0, EPS, "intersect preserves finite min.z");
+    assert_close(b_inter1.max.x, 4.0, EPS, "intersect preserves finite max.x");
+
+    // 4. Intersect with NaN in self (swapped operand order)
+    let mut b_inter2 = Box3::new(Vector3::new(f64::NAN, 2.0, 3.0), Vector3::new(4.0, 5.0, 6.0));
+    let b_finite = Box3::new(Vector3::new(1.0, 2.0, 3.0), Vector3::new(4.0, 5.0, 6.0));
+    b_inter2.intersect(&b_finite);
+    assert!(b_inter2.min.x.is_nan(), "intersect must propagate NaN on min.x from self");
+    assert_close(b_inter2.min.y, 2.0, EPS, "intersect preserves finite min.y");
+
+    // 5. Intersect with NaN in max
+    let mut b_inter3 = Box3::new(Vector3::new(1.0, 2.0, 3.0), Vector3::new(4.0, f64::NAN, 6.0));
+    b_inter3.intersect(&b_finite);
+    assert!(b_inter3.max.y.is_nan(), "intersect must propagate NaN on max.y");
+    assert_close(b_inter3.max.x, 4.0, EPS, "intersect preserves finite max.x");
+}
+
+#[test]
+fn test_box3_union_intersect_signed_zero_semantics() {
+    // Upstream Three.js r186:
+    // Math.min(-0.0, +0.0) == -0.0
+    // Math.max(-0.0, +0.0) == +0.0
+    let neg_zero = -0.0f64;
+    let pos_zero = 0.0f64;
+
+    // 1. Union: min = min(min, other.min) -> -0.0 wins; max = max(max, other.max) -> +0.0 wins
+    let mut u1 = Box3::new(
+        Vector3::new(pos_zero, neg_zero, pos_zero),
+        Vector3::new(neg_zero, pos_zero, neg_zero),
+    );
+    let u2 = Box3::new(
+        Vector3::new(neg_zero, pos_zero, neg_zero),
+        Vector3::new(pos_zero, neg_zero, pos_zero),
+    );
+    u1.union(&u2);
+
+    assert_eq!(u1.min.x.to_bits(), neg_zero.to_bits(), "union min.x must be -0.0");
+    assert_eq!(u1.min.y.to_bits(), neg_zero.to_bits(), "union min.y must be -0.0");
+    assert_eq!(u1.min.z.to_bits(), neg_zero.to_bits(), "union min.z must be -0.0");
+    assert_eq!(u1.max.x.to_bits(), pos_zero.to_bits(), "union max.x must be +0.0");
+    assert_eq!(u1.max.y.to_bits(), pos_zero.to_bits(), "union max.y must be +0.0");
+    assert_eq!(u1.max.z.to_bits(), pos_zero.to_bits(), "union max.z must be +0.0");
+
+    // 2. Intersect: min = max(min, other.min) -> +0.0 wins; max = min(max, other.max) -> -0.0 wins
+    let mut i1 = Box3::new(
+        Vector3::new(neg_zero, pos_zero, neg_zero),
+        Vector3::new(pos_zero, neg_zero, pos_zero),
+    );
+    let i2 = Box3::new(
+        Vector3::new(pos_zero, neg_zero, pos_zero),
+        Vector3::new(neg_zero, pos_zero, neg_zero),
+    );
+    i1.intersect(&i2);
+
+    assert_eq!(i1.min.x.to_bits(), pos_zero.to_bits(), "intersect min.x must be +0.0");
+    assert_eq!(i1.min.y.to_bits(), pos_zero.to_bits(), "intersect min.y must be +0.0");
+    assert_eq!(i1.min.z.to_bits(), pos_zero.to_bits(), "intersect min.z must be +0.0");
+    assert_eq!(i1.max.x.to_bits(), neg_zero.to_bits(), "intersect max.x must be -0.0");
+    assert_eq!(i1.max.y.to_bits(), neg_zero.to_bits(), "intersect max.y must be -0.0");
+    assert_eq!(i1.max.z.to_bits(), neg_zero.to_bits(), "intersect max.z must be -0.0");
+}
+
+#[test]
+fn test_box3_union_intersect_finite_edge_cases() {
+    // 1. Touching on a single face: [0, 1]^3 and [1, 2] x [0, 1]^2
+    let b1 = Box3::new(Vector3::new(0.0, 0.0, 0.0), Vector3::new(1.0, 1.0, 1.0));
+    let b_face = Box3::new(Vector3::new(1.0, 0.0, 0.0), Vector3::new(2.0, 1.0, 1.0));
+    let mut inter_face = b1;
+    inter_face.intersect(&b_face);
+    assert!(!inter_face.is_empty(), "boxes touching on a face are not empty");
+    assert_vec_close(&inter_face.min, [1.0, 0.0, 0.0], EPS, "touching face min");
+    assert_vec_close(&inter_face.max, [1.0, 1.0, 1.0], EPS, "touching face max");
+
+    // 2. Fully contained box: union is outer, intersect is inner
+    let b_inner = Box3::new(Vector3::new(0.2, 0.2, 0.2), Vector3::new(0.8, 0.8, 0.8));
+    let mut union_cont = b1;
+    union_cont.union(&b_inner);
+    assert_vec_close(&union_cont.min, [0.0, 0.0, 0.0], EPS, "contained union min");
+    assert_vec_close(&union_cont.max, [1.0, 1.0, 1.0], EPS, "contained union max");
+
+    let mut inter_cont = b1;
+    inter_cont.intersect(&b_inner);
+    assert_vec_close(&inter_cont.min, [0.2, 0.2, 0.2], EPS, "contained intersect min");
+    assert_vec_close(&inter_cont.max, [0.8, 0.8, 0.8], EPS, "contained intersect max");
+
+    // 3. Disjoint along one axis yields normalized empty box (+inf, -inf)
+    let b_disjoint_x = Box3::new(Vector3::new(1.1, 0.0, 0.0), Vector3::new(2.0, 1.0, 1.0));
+    let mut inter_disj = b1;
+    inter_disj.intersect(&b_disjoint_x);
+    assert!(inter_disj.is_empty(), "disjoint boxes intersect to empty");
+    assert!(inter_disj.min.x.is_infinite() && inter_disj.min.x.is_sign_positive());
+    assert!(inter_disj.max.x.is_infinite() && inter_disj.max.x.is_sign_negative());
+}
+
+#[test]
 fn test_box3_apply_matrix4_8_corner_non_uniform_scale_and_rotation() {
     // Initial box centered at origin
     let mut b = Box3::new(Vector3::new(-1.0, -2.0, -3.0), Vector3::new(1.0, 2.0, 3.0));
