@@ -2735,3 +2735,52 @@ test('HTML attribute parser duplicate-name first-wins semantics (parseTagAttribu
   );
   assert.ok(rewrittenExt.includes('id="ext-script"'), 'Unrelated id attribute must be preserved on external script');
 });
+
+test('buildApplication ignores bodies of classic scripts with empty, boolean, or duplicate-empty src without false missing-resource errors', async () => {
+  const scratch = makeScratch('f3d_classic_empty_src');
+  const entry = path.join(scratch, 'index.html');
+  const outDir = path.join(scratch, 'dist');
+
+  fs.writeFileSync(
+    path.join(scratch, 'app.js'),
+    `globalThis.__f3d_classic_empty_app_loaded = true;\nexport const status = 'ok';\n`
+  );
+
+  const classicEmpty = '<script src="" onerror="globalThis.__emptyClassicError = true">import("./non_existent_empty.js"); this is not valid JavaScript</script>';
+  const classicBool = '<script src onerror="globalThis.__boolClassicError = true">import("./non_existent_bool.js");</script>';
+  const classicDupEmpty = '<script src="" SRC="second.js" onerror="globalThis.__dupClassicError = true">import("./non_existent_dup.js"); this is not valid JavaScript</script>';
+
+  const html = `<!DOCTYPE html>
+<html>
+<head>
+  <script type="module" src="./app.js"></script>
+  ${classicEmpty}
+  ${classicBool}
+  ${classicDupEmpty}
+</head>
+<body></body>
+</html>`;
+
+  fs.writeFileSync(entry, html);
+
+  const result = await buildApplication(entry, outDir);
+  assert.equal(result.entryFiles.length, 1, 'Exactly one module entry point is emitted');
+
+  const emittedHtml = fs.readFileSync(path.join(outDir, 'index.html'), 'utf8');
+
+  // Verify classic scripts with empty/boolean/duplicate-empty src are preserved verbatim with exact onerror handlers
+  assert.ok(emittedHtml.includes(classicEmpty), 'Classic script with empty src must be preserved verbatim');
+  assert.ok(emittedHtml.includes(classicBool), 'Classic script with boolean src must be preserved verbatim');
+  assert.ok(emittedHtml.includes(classicDupEmpty), 'Classic script with duplicate-empty src must be preserved verbatim');
+
+  // Verify module script is rewritten to emitted entry chunk
+  const emittedChunk = result.entryFiles[0];
+  assert.ok(
+    emittedHtml.includes(`src="./${emittedChunk}"`),
+    'Module script must be rewritten to point to emitted entry chunk'
+  );
+
+  // Execute emitted chunk in Node to confirm valid execution
+  await import(pathToFileURL(path.join(outDir, emittedChunk)).href);
+  assert.equal(globalThis.__f3d_classic_empty_app_loaded, true, 'Adjacent module executed cleanly');
+});

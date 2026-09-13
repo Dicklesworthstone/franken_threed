@@ -829,7 +829,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
     let inlineMatch;
     while ((inlineMatch = inlineScriptRegex.exec(sanitizedHtml)) !== null) {
       const attrs = parseTagAttributes(inlineMatch[1]);
-      if (attrs.src || !isClassicJavaScriptType(attrs.type)) {
+      if (attrs.src !== undefined || !isClassicJavaScriptType(attrs.type)) {
         continue;
       }
       const scriptBody = inlineMatch[2];
