@@ -36,6 +36,12 @@ pub const MATERIAL_PARAMS_BYTES: usize = 96;
 /// Alignment in bytes of a material uniform parameter block record under WGSL uniform rules (16 bytes).
 pub const MATERIAL_PARAMS_ALIGNMENT: usize = 16;
 
+/// Size in bytes of a standard mesh uniform record (`MeshUniforms` = 144 bytes).
+pub const MESH_UNIFORMS_BYTES: usize = 144;
+
+/// Alignment in bytes of a mesh uniform record under WGSL uniform rules (16 bytes).
+pub const MESH_UNIFORMS_ALIGNMENT: usize = 16;
+
 /// Material flag: diffuse texture map is enabled.
 pub const MATERIAL_FLAG_MAP: u32 = 1 << 0;
 /// Material flag: alpha texture map is enabled.
@@ -1113,6 +1119,61 @@ macro_rules! define_canonical_layout {
             $(
                 $f_name:expr, $f_wgsl:expr, $f_offset:expr, $f_size:expr, $f_align:expr
             );* $(;)?
+        ] $(,)?
+    ) => {
+        define_canonical_layout! {
+            record: $record,
+            shader_const: $shader_const,
+            layout_rows_const: $layout_const,
+            row_count: $row_count,
+            fields: [
+                $( $f_name, $f_wgsl, $f_offset, $f_size, $f_align );*
+            ],
+            padding: [],
+            extra_shader: "",
+        }
+    };
+
+    (
+        record: $record:expr,
+        shader_const: $shader_const:ident,
+        layout_rows_const: $layout_const:ident,
+        row_count: $row_count:expr,
+        fields: [
+            $(
+                $f_name:expr, $f_wgsl:expr, $f_offset:expr, $f_size:expr, $f_align:expr
+            );* $(;)?
+        ],
+        padding: [
+            $(
+                $p_name:expr, $p_offset:expr, $p_size:expr, $p_align:expr
+            );* $(;)?
+        ] $(,)?
+    ) => {
+        define_canonical_layout! {
+            record: $record,
+            shader_const: $shader_const,
+            layout_rows_const: $layout_const,
+            row_count: $row_count,
+            fields: [
+                $( $f_name, $f_wgsl, $f_offset, $f_size, $f_align );*
+            ],
+            padding: [
+                $( $p_name, $p_offset, $p_size, $p_align );*
+            ],
+            extra_shader: "",
+        }
+    };
+
+    (
+        record: $record:expr,
+        shader_const: $shader_const:ident,
+        layout_rows_const: $layout_const:ident,
+        row_count: $row_count:expr,
+        fields: [
+            $(
+                $f_name:expr, $f_wgsl:expr, $f_offset:expr, $f_size:expr, $f_align:expr
+            );* $(;)?
         ],
         extra_shader: $extra:expr $(,)?
     ) => {
@@ -1179,6 +1240,72 @@ macro_rules! define_canonical_layout {
     };
 }
 
+/// Shared private definition generating canonical WGSL vertex input shader declarations
+/// and corresponding compile-time `LayoutRow` catalog slices from a single field list.
+///
+/// Note: WGSL struct memory layout rules (host-shareable uniform/storage buffers) do NOT apply
+/// to packed vertex buffer attributes, where fields are tightly packed according to vertex format.
+/// Vertex records are declared as vertex shader stage inputs with explicit `@location(n)` attributes.
+macro_rules! define_canonical_vertex_layout {
+    (
+        record: $record:expr,
+        shader_const: $shader_const:ident,
+        layout_rows_const: $layout_const:ident,
+        row_count: $row_count:expr,
+        fields: [
+            $(
+                $f_loc:expr, $f_name:expr, $f_wgsl:expr, $f_offset:expr, $f_size:expr, $f_align:expr
+            );* $(;)?
+        ] $(,)?
+    ) => {
+        define_canonical_vertex_layout! {
+            record: $record,
+            shader_const: $shader_const,
+            layout_rows_const: $layout_const,
+            row_count: $row_count,
+            fields: [
+                $( $f_loc, $f_name, $f_wgsl, $f_offset, $f_size, $f_align );*
+            ],
+            extra_shader: "",
+        }
+    };
+
+    (
+        record: $record:expr,
+        shader_const: $shader_const:ident,
+        layout_rows_const: $layout_const:ident,
+        row_count: $row_count:expr,
+        fields: [
+            $(
+                $f_loc:expr, $f_name:expr, $f_wgsl:expr, $f_offset:expr, $f_size:expr, $f_align:expr
+            );* $(;)?
+        ],
+        extra_shader: $extra:expr $(,)?
+    ) => {
+        /// Canonical WGSL vertex input shader declaration.
+        pub const $shader_const: &str = concat!(
+            "\nstruct ", $record, " {\n",
+            $( "    @location(", $f_loc, ") ", $f_name, ": ", $f_wgsl, ",\n", )*
+            "};\n",
+            $extra
+        );
+
+        const $layout_const: [LayoutRow; $row_count] = sort_layout_rows([
+            $(
+                LayoutRow {
+                    record: $record,
+                    field: $f_name,
+                    offset: $f_offset,
+                    size: $f_size,
+                    align: $f_align,
+                    wgsl_type: $f_wgsl,
+                },
+            )*
+        ]);
+    };
+}
+
+
 define_canonical_layout! {
     record: "AffineRows",
     shader_const: WGSL_AFFINE_ROWS_DECLARATION,
@@ -1211,15 +1338,16 @@ fn affine_to_mat4x4(m: AffineRows) -> mat4x4<f32> {
 "#,
 }
 
-/// Canonical WGSL struct declaration for `ProjectiveMat4`.
-pub const WGSL_PROJECTIVE_MAT4_DECLARATION: &str = r#"
-struct ProjectiveMat4 {
-    col0: vec4<f32>,
-    col1: vec4<f32>,
-    col2: vec4<f32>,
-    col3: vec4<f32>,
-};
-"#;
+define_canonical_layout! {
+    record: "ProjectiveMat4",
+    shader_const: WGSL_PROJECTIVE_MAT4_DECLARATION,
+    layout_rows_const: PROJECTIVE_MAT4_LAYOUT_ROWS,
+    row_count: 1,
+    fields: [
+        "elements", "mat4x4<f32>", 0, 64, 16;
+    ],
+}
+
 
 /// Canonical GPU uniform parameter block record for materials matching Three.js r186 `MeshBasicMaterial`.
 ///
@@ -1414,6 +1542,103 @@ define_canonical_layout! {
     extra_shader: "",
 }
 
+define_canonical_vertex_layout! {
+    record: "VertexPosUv",
+    shader_const: WGSL_VERTEX_POS_UV_DECLARATION,
+    layout_rows_const: VERTEX_POS_UV_LAYOUT_ROWS,
+    row_count: 2,
+    fields: [
+        0, "position", "vec3<f32>", 0, 12, 4;
+        1, "uv", "vec2<f32>", 12, 8, 4;
+    ],
+}
+
+define_canonical_vertex_layout! {
+    record: "VertexPosNormalUv",
+    shader_const: WGSL_VERTEX_POS_NORMAL_UV_DECLARATION,
+    layout_rows_const: VERTEX_POS_NORMAL_UV_LAYOUT_ROWS,
+    row_count: 3,
+    fields: [
+        0, "position", "vec3<f32>", 0, 12, 4;
+        1, "normal", "vec3<f32>", 12, 12, 4;
+        2, "uv", "vec2<f32>", 24, 8, 4;
+    ],
+}
+
+define_canonical_vertex_layout! {
+    record: "VertexPosColor",
+    shader_const: WGSL_VERTEX_POS_COLOR_DECLARATION,
+    layout_rows_const: VERTEX_POS_COLOR_LAYOUT_ROWS,
+    row_count: 2,
+    fields: [
+        0, "position", "vec3<f32>", 0, 12, 4;
+        1, "color", "vec4<f32>", 12, 16, 4;
+    ],
+}
+
+define_canonical_layout! {
+    record: "InstanceRecord",
+    shader_const: WGSL_INSTANCE_RECORD_DECLARATION,
+    layout_rows_const: INSTANCE_RECORD_LAYOUT_ROWS,
+    row_count: 3,
+    fields: [
+        "transform", "AffineRows", 0, 48, 16;
+        "instance_id", "u32", 48, 4, 4;
+    ],
+    padding: [
+        "_padding", 52, 12, 4;
+    ],
+}
+
+define_canonical_layout! {
+    record: "DrawIndirectArgs",
+    shader_const: WGSL_DRAW_INDIRECT_ARGS_DECLARATION,
+    layout_rows_const: DRAW_INDIRECT_ARGS_LAYOUT_ROWS,
+    row_count: 4,
+    fields: [
+        "vertex_count", "u32", 0, 4, 4;
+        "instance_count", "u32", 4, 4, 4;
+        "first_vertex", "u32", 8, 4, 4;
+        "first_instance", "u32", 12, 4, 4;
+    ],
+}
+
+define_canonical_layout! {
+    record: "DrawIndexedIndirectArgs",
+    shader_const: WGSL_DRAW_INDEXED_INDIRECT_ARGS_DECLARATION,
+    layout_rows_const: DRAW_INDEXED_INDIRECT_ARGS_LAYOUT_ROWS,
+    row_count: 5,
+    fields: [
+        "index_count", "u32", 0, 4, 4;
+        "instance_count", "u32", 4, 4, 4;
+        "first_index", "u32", 8, 4, 4;
+        "base_vertex", "i32", 12, 4, 4;
+        "first_instance", "u32", 16, 4, 4;
+    ],
+}
+
+define_canonical_layout! {
+    record: "ColorUniform",
+    shader_const: WGSL_COLOR_UNIFORM_DECLARATION,
+    layout_rows_const: COLOR_UNIFORM_LAYOUT_ROWS,
+    row_count: 1,
+    fields: [
+        "rgba", "vec4<f32>", 0, 16, 16;
+    ],
+}
+
+define_canonical_layout! {
+    record: "MeshUniforms",
+    shader_const: WGSL_MESH_UNIFORMS_DECLARATION,
+    layout_rows_const: MESH_UNIFORMS_LAYOUT_ROWS,
+    row_count: 3,
+    fields: [
+        "model_view", "mat4x4<f32>", 0, 64, 16;
+        "projection", "mat4x4<f32>", 64, 64, 16;
+        "color", "vec4<f32>", 128, 16, 16;
+    ],
+}
+
 /// Returns standard generated WGSL type declarations and helpers for use in shaders.
 pub fn generate_wgsl_declarations() -> String {
     let mut s = String::new();
@@ -1422,56 +1647,72 @@ pub fn generate_wgsl_declarations() -> String {
     s.push_str("\n\n");
     s.push_str(WGSL_PROJECTIVE_MAT4_DECLARATION.trim());
     s.push_str("\n\n");
+    s.push_str(WGSL_VERTEX_POS_UV_DECLARATION.trim());
+    s.push_str("\n\n");
+    s.push_str(WGSL_VERTEX_POS_NORMAL_UV_DECLARATION.trim());
+    s.push_str("\n\n");
+    s.push_str(WGSL_VERTEX_POS_COLOR_DECLARATION.trim());
+    s.push_str("\n\n");
+    s.push_str(WGSL_INSTANCE_RECORD_DECLARATION.trim());
+    s.push_str("\n\n");
+    s.push_str(WGSL_DRAW_INDIRECT_ARGS_DECLARATION.trim());
+    s.push_str("\n\n");
+    s.push_str(WGSL_DRAW_INDEXED_INDIRECT_ARGS_DECLARATION.trim());
+    s.push_str("\n\n");
+    s.push_str(WGSL_COLOR_UNIFORM_DECLARATION.trim());
+    s.push_str("\n\n");
     s.push_str(WGSL_MATERIAL_PARAMS_DECLARATION.trim());
+    s.push_str("\n\n");
+    s.push_str(WGSL_MESH_UNIFORMS_DECLARATION.trim());
     s.push('\n');
     s
 }
 
 /// Static catalog of GPU wire layouts covering every record type in `f3d-core`.
-pub const LAYOUT_TABLE: [LayoutRow; 31] = [
+pub const LAYOUT_TABLE: [LayoutRow; 34] = [
     // 1. AffineRows (48 bytes, 16-byte aligned)
     AFFINE_ROWS_LAYOUT_ROWS[0],
     AFFINE_ROWS_LAYOUT_ROWS[1],
     AFFINE_ROWS_LAYOUT_ROWS[2],
 
     // 2. ProjectiveMat4 (64 bytes, 16-byte aligned)
-    LayoutRow { record: "ProjectiveMat4", field: "elements", offset: 0, size: 64, align: 16, wgsl_type: "mat4x4<f32>" },
+    PROJECTIVE_MAT4_LAYOUT_ROWS[0],
 
     // 3. VertexPosUv (20 bytes, 4-byte aligned)
-    LayoutRow { record: "VertexPosUv", field: "position", offset: 0, size: 12, align: 4, wgsl_type: "vec3<f32>" },
-    LayoutRow { record: "VertexPosUv", field: "uv", offset: 12, size: 8, align: 4, wgsl_type: "vec2<f32>" },
+    VERTEX_POS_UV_LAYOUT_ROWS[0],
+    VERTEX_POS_UV_LAYOUT_ROWS[1],
 
     // 4. VertexPosNormalUv (32 bytes, 4-byte aligned)
-    LayoutRow { record: "VertexPosNormalUv", field: "position", offset: 0, size: 12, align: 4, wgsl_type: "vec3<f32>" },
-    LayoutRow { record: "VertexPosNormalUv", field: "normal", offset: 12, size: 12, align: 4, wgsl_type: "vec3<f32>" },
-    LayoutRow { record: "VertexPosNormalUv", field: "uv", offset: 24, size: 8, align: 4, wgsl_type: "vec2<f32>" },
+    VERTEX_POS_NORMAL_UV_LAYOUT_ROWS[0],
+    VERTEX_POS_NORMAL_UV_LAYOUT_ROWS[1],
+    VERTEX_POS_NORMAL_UV_LAYOUT_ROWS[2],
 
     // 5. VertexPosColor (28 bytes, 4-byte aligned)
-    LayoutRow { record: "VertexPosColor", field: "position", offset: 0, size: 12, align: 4, wgsl_type: "vec3<f32>" },
-    LayoutRow { record: "VertexPosColor", field: "color", offset: 12, size: 16, align: 4, wgsl_type: "vec4<f32>" },
+    VERTEX_POS_COLOR_LAYOUT_ROWS[0],
+    VERTEX_POS_COLOR_LAYOUT_ROWS[1],
 
     // 6. InstanceRecord (64 bytes, 16-byte aligned)
     // Note: `transform` is stored as AffineRows (three vec4<f32> rows), not mat3x4 column-major.
     // Bytes 52..64 constitute 12 bytes of trailing alignment padding to reach the 64-byte struct allocation.
-    LayoutRow { record: "InstanceRecord", field: "transform", offset: 0, size: 48, align: 16, wgsl_type: "AffineRows" },
-    LayoutRow { record: "InstanceRecord", field: "instance_id", offset: 48, size: 4, align: 4, wgsl_type: "u32" },
-    LayoutRow { record: "InstanceRecord", field: "_padding", offset: 52, size: 12, align: 4, wgsl_type: "padding" },
+    INSTANCE_RECORD_LAYOUT_ROWS[0],
+    INSTANCE_RECORD_LAYOUT_ROWS[1],
+    INSTANCE_RECORD_LAYOUT_ROWS[2],
 
     // 7. DrawIndirectArgs (16 bytes, 4-byte aligned)
-    LayoutRow { record: "DrawIndirectArgs", field: "vertex_count", offset: 0, size: 4, align: 4, wgsl_type: "u32" },
-    LayoutRow { record: "DrawIndirectArgs", field: "instance_count", offset: 4, size: 4, align: 4, wgsl_type: "u32" },
-    LayoutRow { record: "DrawIndirectArgs", field: "first_vertex", offset: 8, size: 4, align: 4, wgsl_type: "u32" },
-    LayoutRow { record: "DrawIndirectArgs", field: "first_instance", offset: 12, size: 4, align: 4, wgsl_type: "u32" },
+    DRAW_INDIRECT_ARGS_LAYOUT_ROWS[0],
+    DRAW_INDIRECT_ARGS_LAYOUT_ROWS[1],
+    DRAW_INDIRECT_ARGS_LAYOUT_ROWS[2],
+    DRAW_INDIRECT_ARGS_LAYOUT_ROWS[3],
 
     // 8. DrawIndexedIndirectArgs (20 bytes, 4-byte aligned)
-    LayoutRow { record: "DrawIndexedIndirectArgs", field: "index_count", offset: 0, size: 4, align: 4, wgsl_type: "u32" },
-    LayoutRow { record: "DrawIndexedIndirectArgs", field: "instance_count", offset: 4, size: 4, align: 4, wgsl_type: "u32" },
-    LayoutRow { record: "DrawIndexedIndirectArgs", field: "first_index", offset: 8, size: 4, align: 4, wgsl_type: "u32" },
-    LayoutRow { record: "DrawIndexedIndirectArgs", field: "base_vertex", offset: 12, size: 4, align: 4, wgsl_type: "i32" },
-    LayoutRow { record: "DrawIndexedIndirectArgs", field: "first_instance", offset: 16, size: 4, align: 4, wgsl_type: "u32" },
+    DRAW_INDEXED_INDIRECT_ARGS_LAYOUT_ROWS[0],
+    DRAW_INDEXED_INDIRECT_ARGS_LAYOUT_ROWS[1],
+    DRAW_INDEXED_INDIRECT_ARGS_LAYOUT_ROWS[2],
+    DRAW_INDEXED_INDIRECT_ARGS_LAYOUT_ROWS[3],
+    DRAW_INDEXED_INDIRECT_ARGS_LAYOUT_ROWS[4],
 
     // 9. Color Uniform (16 bytes, 16-byte aligned)
-    LayoutRow { record: "ColorUniform", field: "rgba", offset: 0, size: 16, align: 16, wgsl_type: "vec4<f32>" },
+    COLOR_UNIFORM_LAYOUT_ROWS[0],
 
     // 10. MaterialParams Uniform (96 bytes, 16-byte aligned)
     MATERIAL_PARAMS_LAYOUT_ROWS[0],
@@ -1481,6 +1722,11 @@ pub const LAYOUT_TABLE: [LayoutRow; 31] = [
     MATERIAL_PARAMS_LAYOUT_ROWS[4],
     MATERIAL_PARAMS_LAYOUT_ROWS[5],
     MATERIAL_PARAMS_LAYOUT_ROWS[6],
+
+    // 11. MeshUniforms Uniform (144 bytes, 16-byte aligned)
+    MESH_UNIFORMS_LAYOUT_ROWS[0],
+    MESH_UNIFORMS_LAYOUT_ROWS[1],
+    MESH_UNIFORMS_LAYOUT_ROWS[2],
 ];
 
 /// Returns a fixed slice of [`LayoutRow`] descriptors covering every GPU wire record in the crate.
@@ -1852,7 +2098,7 @@ mod tests {
     #[test]
     fn layout_table_cross_check_and_display() {
         let table = layout_table();
-        assert_eq!(table.len(), 31);
+        assert_eq!(table.len(), 34);
 
         for row in table {
             let (expected_offset, expected_size) = match (row.record, row.field) {
@@ -1887,6 +2133,9 @@ mod tests {
                 ("MaterialParams", "map_transform") => (core::mem::offset_of!(MaterialParams, map_transform), core::mem::size_of::<AffineRows>()),
                 ("MaterialParams", "flags") => (core::mem::offset_of!(MaterialParams, flags), core::mem::size_of::<u32>()),
                 ("MaterialParams", "_pad1") => (core::mem::offset_of!(MaterialParams, _pad1), core::mem::size_of::<[u8; 12]>()),
+                ("MeshUniforms", "model_view") => (0, 64),
+                ("MeshUniforms", "projection") => (64, 64),
+                ("MeshUniforms", "color") => (128, 16),
                 (r, f) => panic!("Unknown record/field: {r}.{f}"),
             };
 
@@ -1914,6 +2163,7 @@ mod tests {
             ("DrawIndexedIndirectArgs", core::mem::size_of::<DrawIndexedIndirectArgs>()),
             ("ColorUniform", COLOR_UNIFORM_BYTES),
             ("MaterialParams", core::mem::size_of::<MaterialParams>()),
+            ("MeshUniforms", MESH_UNIFORMS_BYTES),
         ];
 
         for &(record_name, expected_total_size) in record_sizes {
@@ -1943,6 +2193,23 @@ mod tests {
         assert!(rendered.contains("AffineRows"));
         assert!(rendered.contains("ColorUniform"));
         assert!(rendered.contains("MaterialParams"));
+        assert!(rendered.contains("MeshUniforms"));
+    }
+
+    #[test]
+    fn generate_wgsl_declarations_contains_all_records() {
+        let decls = generate_wgsl_declarations();
+        assert!(decls.contains("struct AffineRows {"));
+        assert!(decls.contains("struct ProjectiveMat4 {"));
+        assert!(decls.contains("struct VertexPosUv {"));
+        assert!(decls.contains("struct VertexPosNormalUv {"));
+        assert!(decls.contains("struct VertexPosColor {"));
+        assert!(decls.contains("struct InstanceRecord {"));
+        assert!(decls.contains("struct DrawIndirectArgs {"));
+        assert!(decls.contains("struct DrawIndexedIndirectArgs {"));
+        assert!(decls.contains("struct ColorUniform {"));
+        assert!(decls.contains("struct MaterialParams {"));
+        assert!(decls.contains("struct MeshUniforms {"));
     }
 }
 

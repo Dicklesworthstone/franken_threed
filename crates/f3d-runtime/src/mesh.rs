@@ -23,7 +23,10 @@ use core::fmt;
 
 use f3d_core::{
     handle::{Handle, MaterialDomain},
-    layout::{aligned_bytes_per_row, VERTEX_POS_COLOR_STRIDE, VERTEX_POS_UV_STRIDE, VertexPosColor, VertexPosUv},
+    layout::{
+        aligned_bytes_per_row, VertexPosColor, VertexPosUv, MESH_UNIFORMS_BYTES,
+        VERTEX_POS_COLOR_STRIDE, VERTEX_POS_UV_STRIDE, WGSL_MESH_UNIFORMS_DECLARATION,
+    },
     ownership::{DataVersion, Epoch},
 };
 use f3d_graph::{
@@ -550,13 +553,7 @@ fn srgb_transfer_oetf(color: vec3<f32>) -> vec3<f32> {\n\
         };
 
         alloc::format!(
-            "\
-struct MeshUniforms {{\n\
-    model_view: mat4x4<f32>,\n\
-    projection: mat4x4<f32>,\n\
-    color: vec4<f32>,\n\
-}};\n\
-\n\
+            "{WGSL_MESH_UNIFORMS_DECLARATION}\n\
 @group(0) @binding(0)\n\
 var<uniform> uniforms: MeshUniforms;\n\
 \n\
@@ -619,13 +616,7 @@ fn srgb_transfer_oetf(color: vec3<f32>) -> vec3<f32> {\n\
         };
 
         alloc::format!(
-            "\
-struct MeshUniforms {{\n\
-    model_view: mat4x4<f32>,\n\
-    projection: mat4x4<f32>,\n\
-    color: vec4<f32>,\n\
-}};\n\
-\n\
+            "{WGSL_MESH_UNIFORMS_DECLARATION}\n\
 @group(0) @binding(0)\n\
 var<uniform> uniforms: MeshUniforms;\n\
 \n\
@@ -1009,7 +1000,7 @@ fn build_multi_mesh_submission_internal(
                         target_format: TARGET_FORMAT_RGBA8UNORM,
                         has_vertex_buffer: true,
                         has_uniform_buffer: true,
-                        uniform_size: 144,
+                        uniform_size: MESH_UNIFORMS_BYTES as u32,
                         vertex_stride: vertex_stride_u32,
                         depth_format: TARGET_FORMAT_DEPTH24PLUS,
                         depth_write_enabled,
@@ -1025,7 +1016,7 @@ fn build_multi_mesh_submission_internal(
                         target_format: TARGET_FORMAT_RGBA8UNORM,
                         has_vertex_buffer: true,
                         has_uniform_buffer: true,
-                        uniform_size: 144,
+                        uniform_size: MESH_UNIFORMS_BYTES as u32,
                         vertex_stride: vertex_stride_u32,
                         depth_format: TARGET_FORMAT_DEPTH24PLUS,
                         depth_write_enabled,
@@ -1044,7 +1035,7 @@ fn build_multi_mesh_submission_internal(
                         target_format: TARGET_FORMAT_RGBA8UNORM,
                         has_vertex_buffer: true,
                         has_uniform_buffer: true,
-                        uniform_size: 144,
+                        uniform_size: MESH_UNIFORMS_BYTES as u32,
                         vertex_stride: vertex_stride_u32,
                         depth_format: TARGET_FORMAT_DEPTH24PLUS,
                         depth_write_enabled: false,
@@ -1060,7 +1051,7 @@ fn build_multi_mesh_submission_internal(
                         target_format: TARGET_FORMAT_RGBA8UNORM,
                         has_vertex_buffer: true,
                         has_uniform_buffer: true,
-                        uniform_size: 144,
+                        uniform_size: MESH_UNIFORMS_BYTES as u32,
                         vertex_stride: vertex_stride_u32,
                         cull_mode,
                         front_face,
@@ -1076,7 +1067,7 @@ fn build_multi_mesh_submission_internal(
             target_format: TARGET_FORMAT_RGBA8UNORM,
             has_vertex_buffer: true,
             has_uniform_buffer: true,
-            uniform_size: 144,
+            uniform_size: MESH_UNIFORMS_BYTES as u32,
             vertex_stride: vertex_stride_u32,
             depth_format: TARGET_FORMAT_DEPTH24PLUS,
             depth_write_enabled,
@@ -1089,7 +1080,7 @@ fn build_multi_mesh_submission_internal(
             target_format: TARGET_FORMAT_RGBA8UNORM,
             has_vertex_buffer: true,
             has_uniform_buffer: true,
-            uniform_size: 144,
+            uniform_size: MESH_UNIFORMS_BYTES as u32,
             vertex_stride: vertex_stride_u32,
         });
     }
@@ -1376,7 +1367,7 @@ fn build_multi_mesh_canvas_submission_internal(
                         target_format: TARGET_FORMAT_PREFERRED_CANVAS,
                         has_vertex_buffer: true,
                         has_uniform_buffer: true,
-                        uniform_size: 144,
+                        uniform_size: MESH_UNIFORMS_BYTES as u32,
                         vertex_stride: vertex_stride_u32,
                         depth_format: TARGET_FORMAT_DEPTH24PLUS,
                         depth_write_enabled,
@@ -1392,7 +1383,7 @@ fn build_multi_mesh_canvas_submission_internal(
                         target_format: TARGET_FORMAT_PREFERRED_CANVAS,
                         has_vertex_buffer: true,
                         has_uniform_buffer: true,
-                        uniform_size: 144,
+                        uniform_size: MESH_UNIFORMS_BYTES as u32,
                         vertex_stride: vertex_stride_u32,
                         depth_format: TARGET_FORMAT_DEPTH24PLUS,
                         depth_write_enabled,
@@ -1411,7 +1402,7 @@ fn build_multi_mesh_canvas_submission_internal(
                         target_format: TARGET_FORMAT_PREFERRED_CANVAS,
                         has_vertex_buffer: true,
                         has_uniform_buffer: true,
-                        uniform_size: 144,
+                        uniform_size: MESH_UNIFORMS_BYTES as u32,
                         vertex_stride: vertex_stride_u32,
                         depth_format: TARGET_FORMAT_DEPTH24PLUS,
                         depth_write_enabled: false,
@@ -1427,7 +1418,7 @@ fn build_multi_mesh_canvas_submission_internal(
                         target_format: TARGET_FORMAT_PREFERRED_CANVAS,
                         has_vertex_buffer: true,
                         has_uniform_buffer: true,
-                        uniform_size: 144,
+                        uniform_size: MESH_UNIFORMS_BYTES as u32,
                         vertex_stride: vertex_stride_u32,
                         cull_mode,
                         front_face,
@@ -1443,7 +1434,7 @@ fn build_multi_mesh_canvas_submission_internal(
             target_format: TARGET_FORMAT_PREFERRED_CANVAS,
             has_vertex_buffer: true,
             has_uniform_buffer: true,
-            uniform_size: 144,
+            uniform_size: MESH_UNIFORMS_BYTES as u32,
             vertex_stride: vertex_stride_u32,
             depth_format: TARGET_FORMAT_DEPTH24PLUS,
             depth_write_enabled,
@@ -1456,7 +1447,7 @@ fn build_multi_mesh_canvas_submission_internal(
             target_format: TARGET_FORMAT_PREFERRED_CANVAS,
             has_vertex_buffer: true,
             has_uniform_buffer: true,
-            uniform_size: 144,
+            uniform_size: MESH_UNIFORMS_BYTES as u32,
             vertex_stride: vertex_stride_u32,
         });
     }

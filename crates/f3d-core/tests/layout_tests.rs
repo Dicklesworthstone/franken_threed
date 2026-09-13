@@ -1793,7 +1793,7 @@ fn property_test_alignment_validators_on_random_offsets() {
 #[test]
 fn test_layout_table_cross_check_and_evidence() {
     let table = layout_table();
-    assert_eq!(table.len(), 31, "Layout table must contain all 31 defined field and padding rows");
+    assert_eq!(table.len(), 34, "Layout table must contain all 34 defined field and padding rows");
 
     for row in table {
         let (expected_offset, expected_size) = match (row.record, row.field) {
@@ -1828,6 +1828,9 @@ fn test_layout_table_cross_check_and_evidence() {
             ("MaterialParams", "map_transform") => (core::mem::offset_of!(MaterialParams, map_transform), core::mem::size_of::<AffineRows>()),
             ("MaterialParams", "flags") => (core::mem::offset_of!(MaterialParams, flags), core::mem::size_of::<u32>()),
             ("MaterialParams", "_pad1") => (core::mem::offset_of!(MaterialParams, _pad1), core::mem::size_of::<[u8; 12]>()),
+            ("MeshUniforms", "model_view") => (0, 64),
+            ("MeshUniforms", "projection") => (64, 64),
+            ("MeshUniforms", "color") => (128, 16),
             (unknown_rec, unknown_field) => panic!("Unknown record/field in layout table: {unknown_rec}.{unknown_field}"),
         };
 
@@ -1855,6 +1858,7 @@ fn test_layout_table_cross_check_and_evidence() {
         ("DrawIndexedIndirectArgs", core::mem::size_of::<DrawIndexedIndirectArgs>()),
         ("ColorUniform", COLOR_UNIFORM_BYTES),
         ("MaterialParams", core::mem::size_of::<MaterialParams>()),
+        ("MeshUniforms", MESH_UNIFORMS_BYTES),
     ];
 
     for &(record_name, expected_total_size) in record_sizes {
@@ -1888,6 +1892,7 @@ fn test_layout_table_cross_check_and_evidence() {
     assert!(display_str.contains("VertexPosColor"), "Display must render VertexPosColor");
     assert!(display_str.contains("ColorUniform"), "Display must render ColorUniform");
     assert!(display_str.contains("MaterialParams"), "Display must render MaterialParams");
+    assert!(display_str.contains("MeshUniforms"), "Display must render MeshUniforms");
     assert!(display_str.contains("_padding"), "Display must render _padding row");
 
     // When test-support feature is active and F3D_EVIDENCE_DIR is set, emit evidence under bead 05.2
@@ -1919,7 +1924,7 @@ fn test_layout_table_cross_check_and_evidence() {
                 browser: None,
                 device_generation: None,
                 scene_generation: None,
-                msg: "Verified all 31 layout table rows against core::mem::offset_of, size_of, and gapless tiling".into(),
+                msg: "Verified all 34 layout table rows against core::mem::offset_of, size_of, and gapless tiling".into(),
                 data: Some(serde_json::to_value(table).expect("Failed to serialize layout table")),
             };
             writer.write_event(&event).expect("Failed to write evidence event");
@@ -2001,9 +2006,59 @@ fn test_canonical_layout_macro_consistency_and_regression() {
     assert!(WGSL_MATERIAL_PARAMS_DECLARATION.contains("map_transform: AffineRows,"));
     assert!(WGSL_MATERIAL_PARAMS_DECLARATION.contains("flags: u32,"));
 
+    assert!(WGSL_PROJECTIVE_MAT4_DECLARATION.contains("struct ProjectiveMat4 {"));
+    assert!(WGSL_PROJECTIVE_MAT4_DECLARATION.contains("elements: mat4x4<f32>,"));
+
+    assert!(WGSL_INSTANCE_RECORD_DECLARATION.contains("struct InstanceRecord {"));
+    assert!(WGSL_INSTANCE_RECORD_DECLARATION.contains("transform: AffineRows,"));
+    assert!(WGSL_INSTANCE_RECORD_DECLARATION.contains("instance_id: u32,"));
+
+    assert!(WGSL_DRAW_INDIRECT_ARGS_DECLARATION.contains("struct DrawIndirectArgs {"));
+    assert!(WGSL_DRAW_INDIRECT_ARGS_DECLARATION.contains("vertex_count: u32,"));
+    assert!(WGSL_DRAW_INDIRECT_ARGS_DECLARATION.contains("instance_count: u32,"));
+    assert!(WGSL_DRAW_INDIRECT_ARGS_DECLARATION.contains("first_vertex: u32,"));
+    assert!(WGSL_DRAW_INDIRECT_ARGS_DECLARATION.contains("first_instance: u32,"));
+
+    assert!(WGSL_DRAW_INDEXED_INDIRECT_ARGS_DECLARATION.contains("struct DrawIndexedIndirectArgs {"));
+    assert!(WGSL_DRAW_INDEXED_INDIRECT_ARGS_DECLARATION.contains("index_count: u32,"));
+    assert!(WGSL_DRAW_INDEXED_INDIRECT_ARGS_DECLARATION.contains("instance_count: u32,"));
+    assert!(WGSL_DRAW_INDEXED_INDIRECT_ARGS_DECLARATION.contains("first_index: u32,"));
+    assert!(WGSL_DRAW_INDEXED_INDIRECT_ARGS_DECLARATION.contains("base_vertex: i32,"));
+    assert!(WGSL_DRAW_INDEXED_INDIRECT_ARGS_DECLARATION.contains("first_instance: u32,"));
+
+    assert!(WGSL_COLOR_UNIFORM_DECLARATION.contains("struct ColorUniform {"));
+    assert!(WGSL_COLOR_UNIFORM_DECLARATION.contains("rgba: vec4<f32>,"));
+
+    assert!(WGSL_MESH_UNIFORMS_DECLARATION.contains("struct MeshUniforms {"));
+    assert!(WGSL_MESH_UNIFORMS_DECLARATION.contains("model_view: mat4x4<f32>,"));
+    assert!(WGSL_MESH_UNIFORMS_DECLARATION.contains("projection: mat4x4<f32>,"));
+    assert!(WGSL_MESH_UNIFORMS_DECLARATION.contains("color: vec4<f32>,"));
+
+    assert!(WGSL_VERTEX_POS_UV_DECLARATION.contains("struct VertexPosUv {"));
+    assert!(WGSL_VERTEX_POS_UV_DECLARATION.contains("@location(0) position: vec3<f32>,"));
+    assert!(WGSL_VERTEX_POS_UV_DECLARATION.contains("@location(1) uv: vec2<f32>,"));
+
+    assert!(WGSL_VERTEX_POS_NORMAL_UV_DECLARATION.contains("struct VertexPosNormalUv {"));
+    assert!(WGSL_VERTEX_POS_NORMAL_UV_DECLARATION.contains("@location(0) position: vec3<f32>,"));
+    assert!(WGSL_VERTEX_POS_NORMAL_UV_DECLARATION.contains("@location(1) normal: vec3<f32>,"));
+    assert!(WGSL_VERTEX_POS_NORMAL_UV_DECLARATION.contains("@location(2) uv: vec2<f32>,"));
+
+    assert!(WGSL_VERTEX_POS_COLOR_DECLARATION.contains("struct VertexPosColor {"));
+    assert!(WGSL_VERTEX_POS_COLOR_DECLARATION.contains("@location(0) position: vec3<f32>,"));
+    assert!(WGSL_VERTEX_POS_COLOR_DECLARATION.contains("@location(1) color: vec4<f32>,"));
+
     let combined = generate_wgsl_declarations();
     assert!(combined.contains("struct AffineRows {"));
+    assert!(combined.contains("struct ProjectiveMat4 {"));
+    assert!(combined.contains("struct VertexPosUv {"));
+    assert!(combined.contains("struct VertexPosNormalUv {"));
+    assert!(combined.contains("struct VertexPosColor {"));
+    assert!(combined.contains("struct InstanceRecord {"));
+    assert!(combined.contains("struct DrawIndirectArgs {"));
+    assert!(combined.contains("struct DrawIndexedIndirectArgs {"));
+    assert!(combined.contains("struct ColorUniform {"));
     assert!(combined.contains("struct MaterialParams {"));
+    assert!(combined.contains("struct MeshUniforms {"));
 
     let table = layout_table();
     assert_eq!(table[0].offset, core::mem::offset_of!(AffineRows, r0));
@@ -2019,10 +2074,165 @@ fn test_canonical_layout_macro_consistency_and_regression() {
     assert_eq!(table[30].offset, core::mem::offset_of!(MaterialParams, _pad1));
     assert_eq!(table[28].wgsl_type, "AffineRows");
 
+    assert_eq!(table[31].offset, 0);
+    assert_eq!(table[31].field, "model_view");
+    assert_eq!(table[32].offset, 64);
+    assert_eq!(table[32].field, "projection");
+    assert_eq!(table[33].offset, 128);
+    assert_eq!(table[33].field, "color");
+
     let unaligned_offset = 24;
     assert_ne!(
         unaligned_offset,
         core::mem::offset_of!(MaterialParams, map_transform),
         "map_transform must not reside at unaligned offset 24"
+    );
+}
+
+#[test]
+fn test_generate_wgsl_declarations_coverage_of_all_layout_table_records() {
+    let wgsl = generate_wgsl_declarations();
+    let table = layout_table();
+
+    let mut records = Vec::new();
+    for row in table {
+        if !records.contains(&row.record) {
+            records.push(row.record);
+        }
+    }
+
+    assert_eq!(
+        records.len(),
+        11,
+        "LAYOUT_TABLE must define exactly 11 GPU record types"
+    );
+
+    for record in records {
+        let expected_struct = format!("struct {record} {{");
+        assert!(
+            wgsl.contains(&expected_struct),
+            "generate_wgsl_declarations output must contain declaration for record {record}"
+        );
+    }
+}
+
+#[test]
+fn test_wgsl_host_shareable_layout_rule_verification() {
+    // WGSL host-shareable type alignment specification (W3C WGSL § 14.4 Alignment and Size)
+    fn wgsl_align_of(wgsl_type: &str) -> usize {
+        match wgsl_type {
+            "f32" | "u32" | "i32" => 4,
+            "vec2<f32>" => 8,
+            "vec3<f32>" | "vec4<f32>" | "mat4x4<f32>" | "AffineRows" => 16,
+            other => panic!("Unsupported WGSL host-shareable type: {other}"),
+        }
+    }
+
+    // WGSL host-shareable type size specification (W3C WGSL § 14.4 Alignment and Size)
+    fn wgsl_size_of(wgsl_type: &str) -> usize {
+        match wgsl_type {
+            "f32" | "u32" | "i32" => 4,
+            "vec2<f32>" => 8,
+            "vec3<f32>" => 12,
+            "vec4<f32>" => 16,
+            "mat4x4<f32>" => 64, // 4 columns of vec4<f32>
+            "AffineRows" => 48,  // 3 rows of vec4<f32>
+            other => panic!("Unsupported WGSL host-shareable type: {other}"),
+        }
+    }
+
+    // WGSL roundUp rule: roundUp(k, align) = (k + align - 1) & !(align - 1)
+    fn wgsl_round_up(k: usize, align: usize) -> usize {
+        assert!(align > 0 && align.is_power_of_two(), "alignment must be power of two");
+        (k + align - 1) & !(align - 1)
+    }
+
+    let non_vertex_records: &[(&str, usize)] = &[
+        ("AffineRows", core::mem::size_of::<AffineRows>()),
+        ("ProjectiveMat4", core::mem::size_of::<ProjectiveMat4>()),
+        ("InstanceRecord", InstanceRecord::BYTE_SIZE),
+        ("DrawIndirectArgs", core::mem::size_of::<DrawIndirectArgs>()),
+        ("DrawIndexedIndirectArgs", core::mem::size_of::<DrawIndexedIndirectArgs>()),
+        ("ColorUniform", COLOR_UNIFORM_BYTES),
+        ("MaterialParams", core::mem::size_of::<MaterialParams>()),
+        ("MeshUniforms", MESH_UNIFORMS_BYTES),
+    ];
+
+    let table = layout_table();
+
+    for &(record_name, expected_total_size) in non_vertex_records {
+        let record_rows: Vec<&LayoutRow> = table
+            .iter()
+            .filter(|r| r.record == record_name)
+            .collect();
+        assert!(
+            !record_rows.is_empty(),
+            "Record {record_name} must have rows in LAYOUT_TABLE"
+        );
+
+        let mut computed_offset = 0usize;
+        let mut max_align = 1usize;
+
+        for row in &record_rows {
+            if row.wgsl_type != "padding" {
+                let member_align = wgsl_align_of(row.wgsl_type);
+                let member_size = wgsl_size_of(row.wgsl_type);
+
+                // In WGSL host-shareable struct layout, each member offset must be aligned
+                // to its type alignment via roundUp(current_offset, align)
+                let expected_field_offset = wgsl_round_up(computed_offset, member_align);
+
+                assert_eq!(
+                    row.offset, expected_field_offset,
+                    "WGSL field offset mismatch for {}.{}: expected {}, got {}",
+                    row.record, row.field, expected_field_offset, row.offset
+                );
+                assert_eq!(
+                    row.size, member_size,
+                    "WGSL field size mismatch for {}.{}: expected {}, got {}",
+                    row.record, row.field, member_size, row.size
+                );
+                assert_eq!(
+                    row.align, member_align,
+                    "WGSL field alignment mismatch for {}.{}: expected {}, got {}",
+                    row.record, row.field, member_align, row.align
+                );
+
+                max_align = max_align.max(member_align);
+                computed_offset = row.offset + row.size;
+            } else {
+                // Padding row: must seamlessly account for internal or trailing alignment gaps
+                assert_eq!(
+                    row.offset, computed_offset,
+                    "Padding row offset mismatch for {}.{}: expected {}, got {}",
+                    row.record, row.field, computed_offset, row.offset
+                );
+                computed_offset += row.size;
+            }
+        }
+
+        // Struct total size in WGSL host-shareable layout: roundUp(last_member_end, max_align)
+        let wgsl_struct_size = wgsl_round_up(computed_offset, max_align);
+        assert_eq!(
+            computed_offset, wgsl_struct_size,
+            "Record {record_name} trailing size after padding ({computed_offset}) does not match WGSL struct size ({wgsl_struct_size})"
+        );
+        assert_eq!(
+            wgsl_struct_size, expected_total_size,
+            "WGSL computed struct size for {record_name} ({wgsl_struct_size}) does not match Rust struct size ({expected_total_size})"
+        );
+    }
+
+    // Explicitly verify the vertex record invariant:
+    // Vertex buffers are packed attribute arrays described by vertex formats (GPUVertexBufferLayout),
+    // NOT WGSL host-shareable structs.
+    // In WGSL struct layout, a vec2<f32> immediately following vec3<f32> would be padded from 12 to 16.
+    // In VertexPosUv, position (vec3) ends at 12 and uv (vec2) starts at 12 with stride 20.
+    let v_uv = table.iter().find(|r| r.record == "VertexPosUv" && r.field == "uv").unwrap();
+    assert_eq!(v_uv.offset, 12, "VertexPosUv uv must reside at packed vertex offset 12");
+    assert_ne!(
+        v_uv.offset,
+        wgsl_round_up(12, wgsl_align_of("vec2<f32>")),
+        "Vertex buffer attribute uv must NOT have host-shareable struct padding applied"
     );
 }

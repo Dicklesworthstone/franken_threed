@@ -3925,6 +3925,9 @@ fn test_mesh_batch_vertex_color_shader_semantics_offscreen_and_canvas() {
 
 /// Verifies encoded packet byte lengths match the saved prior Wasm baseline (`out/browser-probe/legacy_mesh_packet_baseline_20260912.json`).
 /// Note: Length matching checks structural payload sizing; full byte-level hash verification is conducted against compiled Wasm outputs.
+/// The lengths are the 20260912 baseline plus 13 bytes per packet, because mesh shaders now embed the schema-generated
+/// `WGSL_MESH_UNIFORMS_DECLARATION` (leading newline plus 4-space indentation on 3 fields) in place of the unindented
+/// hand-written struct; one shader per packet.
 #[test]
 fn test_legacy_mesh_packet_lengths_match_prior_wasm() {
     let tri = [0.0f32, 0.5, 0.0, -0.5, -0.5, 0.0, 0.5, -0.5, 0.0];
@@ -3939,37 +3942,37 @@ fn test_legacy_mesh_packet_lengths_match_prior_wasm() {
     let depth_compares = [DEPTH_COMPARE_LESS_EQUAL];
     let color_writes = [1u8];
 
-    // Case 0: canvas=false, webgl_depth=false -> exact length 1267
+    // Case 0: canvas=false, webgl_depth=false -> exact length 1280
     let bytes0 = f3d_build_mesh_batch_cull_depth_color_packet(
         &tri, &vertex_counts, &model_views, &projection, &colors,
         &cull_modes, &front_faces, &depth_tests, &depth_writes, &depth_compares,
         &color_writes, 64, 64, false, false,
     ).expect("building case 0");
-    assert_eq!(bytes0.len(), 1267);
+    assert_eq!(bytes0.len(), 1280);
 
-    // Case 1: canvas=false, webgl_depth=true -> exact length 1305
+    // Case 1: canvas=false, webgl_depth=true -> exact length 1318
     let bytes1 = f3d_build_mesh_batch_cull_depth_color_packet(
         &tri, &vertex_counts, &model_views, &projection, &colors,
         &cull_modes, &front_faces, &depth_tests, &depth_writes, &depth_compares,
         &color_writes, 64, 64, true, false,
     ).expect("building case 1");
-    assert_eq!(bytes1.len(), 1305);
+    assert_eq!(bytes1.len(), 1318);
 
-    // Case 2: canvas=true, webgl_depth=false -> exact length 1527
+    // Case 2: canvas=true, webgl_depth=false -> exact length 1540
     let bytes2 = f3d_build_mesh_batch_cull_depth_color_packet(
         &tri, &vertex_counts, &model_views, &projection, &colors,
         &cull_modes, &front_faces, &depth_tests, &depth_writes, &depth_compares,
         &color_writes, 64, 64, false, true,
     ).expect("building case 2");
-    assert_eq!(bytes2.len(), 1527);
+    assert_eq!(bytes2.len(), 1540);
 
-    // Case 3: canvas=true, webgl_depth=true -> exact length 1565
+    // Case 3: canvas=true, webgl_depth=true -> exact length 1578
     let bytes3 = f3d_build_mesh_batch_cull_depth_color_packet(
         &tri, &vertex_counts, &model_views, &projection, &colors,
         &cull_modes, &front_faces, &depth_tests, &depth_writes, &depth_compares,
         &color_writes, 64, 64, true, true,
     ).expect("building case 3");
-    assert_eq!(bytes3.len(), 1565);
+    assert_eq!(bytes3.len(), 1578);
 }
 
 #[test]
@@ -4237,4 +4240,147 @@ fn test_scene_clear_packet_structure_and_validation() {
         build_scene_clear_submission(64, u32::MAX, &clear_color, false),
         Err(MeshPacketError::InvalidDimensions(_))
     ));
+}
+
+#[test]
+fn mesh_uniforms_packing_and_shaders_follow_schema() {
+    use f3d_core::layout::{layout_table, MESH_UNIFORMS_BYTES, WGSL_MESH_UNIFORMS_DECLARATION};
+
+    let positions = [0.0f32, 0.5, 0.0, -0.5, -0.5, 0.0, 0.5, -0.5, 0.0];
+    let indices: [u32; 0] = [];
+    let model_view: [f64; 16] = [
+        1.0, 2.0, 3.0, 4.0,
+        5.0, 6.0, 7.0, 8.0,
+        9.0, 10.0, 11.0, 12.0,
+        13.0, 14.0, 15.0, 16.0,
+    ];
+    let projection: [f64; 16] = [
+        101.0, 102.0, 103.0, 104.0,
+        105.0, 106.0, 107.0, 108.0,
+        109.0, 110.0, 111.0, 112.0,
+        113.0, 114.0, 115.0, 116.0,
+    ];
+    let color: [f32; 4] = [0.25, 0.5, 0.75, 1.0];
+
+    let input = DynamicMeshInput::try_from_raw(
+        &positions,
+        &indices,
+        &model_view,
+        &projection,
+        &color,
+        64,
+        64,
+        false,
+    )
+    .expect("DynamicMeshInput must construct");
+
+    let offscreen_sub = build_mesh_submission(&input).expect("offscreen submission");
+
+    // 1. Assert WriteBuffer for uniform buffer matches each row of layout_table() for MeshUniforms
+    let table = layout_table();
+    let mesh_rows: Vec<_> = table
+        .iter()
+        .filter(|r| r.record == "MeshUniforms")
+        .collect();
+    assert_eq!(mesh_rows.len(), 3, "MeshUniforms must have exactly 3 schema rows");
+
+    let total_covered_bytes: usize = mesh_rows.iter().map(|r| r.size).sum();
+    assert_eq!(
+        total_covered_bytes, MESH_UNIFORMS_BYTES,
+        "Total layout rows size must equal MESH_UNIFORMS_BYTES (144)"
+    );
+    assert_eq!(total_covered_bytes, 144);
+
+    let uniform_write = offscreen_sub
+        .commands()
+        .iter()
+        .find_map(|cmd| match cmd {
+            GpuCommand::WriteBuffer { buffer_id, data, .. } if *buffer_id == MESH_UNIFORM_BUFFER_ID => {
+                Some(data.as_slice())
+            }
+            _ => None,
+        })
+        .expect("WriteBuffer for MESH_UNIFORM_BUFFER_ID must exist");
+
+    assert!(uniform_write.len() >= MESH_UNIFORMS_BYTES);
+
+    for row in &mesh_rows {
+        let field_bytes = &uniform_write[row.offset..row.offset + row.size];
+        match row.field {
+            "model_view" => {
+                assert_eq!(row.offset, 0);
+                assert_eq!(row.size, 64);
+                for i in 0..16 {
+                    let val = f32::from_le_bytes(field_bytes[i * 4..(i + 1) * 4].try_into().unwrap());
+                    assert_eq!(val, (i + 1) as f32, "model_view[{i}] mismatch");
+                }
+            }
+            "projection" => {
+                assert_eq!(row.offset, 64);
+                assert_eq!(row.size, 64);
+                for i in 0..16 {
+                    let val = f32::from_le_bytes(field_bytes[i * 4..(i + 1) * 4].try_into().unwrap());
+                    assert_eq!(val, (101 + i) as f32, "projection[{i}] mismatch");
+                }
+            }
+            "color" => {
+                assert_eq!(row.offset, 128);
+                assert_eq!(row.size, 16);
+                for i in 0..4 {
+                    let val = f32::from_le_bytes(field_bytes[i * 4..(i + 1) * 4].try_into().unwrap());
+                    assert_eq!(val, color[i], "color[{i}] mismatch");
+                }
+            }
+            other => panic!("Unexpected MeshUniforms field: {other}"),
+        }
+    }
+
+    // Helper to check pipeline commands in a submission packet
+    let check_packet_shaders = |packet: &GpuSubmissionPacket, packet_name: &str| {
+        let mut found_pipeline = false;
+        for cmd in packet.commands() {
+            let (wgsl_code, uniform_size) = match cmd {
+                GpuCommand::CreatePipeline { wgsl_code, uniform_size, .. }
+                | GpuCommand::CreatePipelineDepth { wgsl_code, uniform_size, .. }
+                | GpuCommand::CreatePipelineCull { wgsl_code, uniform_size, .. }
+                | GpuCommand::CreatePipelineDepthCull { wgsl_code, uniform_size, .. }
+                | GpuCommand::CreatePipelineDepthCullColor { wgsl_code, uniform_size, .. } => {
+                    (wgsl_code.as_str(), *uniform_size)
+                }
+                _ => continue,
+            };
+            found_pipeline = true;
+            assert_eq!(
+                uniform_size, 144,
+                "{packet_name} pipeline uniform_size must equal 144"
+            );
+            assert!(
+                wgsl_code.contains(WGSL_MESH_UNIFORMS_DECLARATION),
+                "{packet_name} shader must contain schema-generated WGSL_MESH_UNIFORMS_DECLARATION"
+            );
+            assert_eq!(
+                wgsl_code.matches("struct MeshUniforms {").count(),
+                1,
+                "{packet_name} shader must declare struct MeshUniforms exactly once"
+            );
+        }
+        assert!(found_pipeline, "{packet_name} must contain at least one pipeline creation command");
+    };
+
+    // 2. Offscreen UV packet
+    check_packet_shaders(&offscreen_sub, "offscreen UV");
+
+    // 3. Offscreen vertex-color packet
+    let vc = [
+        1.0f32, 0.0, 0.0, 1.0,
+        0.0, 1.0, 0.0, 1.0,
+        0.0, 0.0, 1.0, 1.0,
+    ];
+    let vc_input = input.clone().with_vertex_colors(&vc).expect("with_vertex_colors");
+    let offscreen_vc_sub = build_multi_mesh_submission(&[vc_input]).expect("offscreen vertex-color submission");
+    check_packet_shaders(&offscreen_vc_sub, "offscreen vertex-color");
+
+    // 4. Canvas packet
+    let canvas_sub = build_mesh_canvas_submission(&input).expect("canvas submission");
+    check_packet_shaders(&canvas_sub, "canvas");
 }
