@@ -4,6 +4,7 @@ use f3d_math::box3::Box3;
 use f3d_math::matrix4::Matrix4;
 use f3d_math::plane::Plane;
 use f3d_math::sphere::Sphere;
+use f3d_math::triangle::Triangle;
 use f3d_math::vector3::Vector3;
 
 const EPS: f64 = 1e-10;
@@ -800,4 +801,60 @@ fn test_box3_missing_methods_node_parity() {
     assert!(param_target.x.is_infinite() && param_target.x.is_sign_negative(), "-3.0 / 0.0 parameter is -inf");
     assert_close(param_target.y, 0.5, EPS, "degen y is 0.5");
     assert_close(param_target.z, 0.5, EPS, "degen z is 0.5");
+}
+
+#[test]
+fn test_box3_intersects_triangle_nan_vertex_matches_upstream() {
+    let box3 = Box3::new(Vector3::new(-1.0, -1.0, -1.0), Vector3::new(1.0, 1.0, 1.0));
+
+    // Normal intersecting triangle
+    let tri_inside = Triangle::new(
+        Vector3::new(0.0, 0.0, 0.0),
+        Vector3::new(0.0, 0.5, 0.0),
+        Vector3::new(0.0, 0.0, 0.5),
+    );
+    assert!(box3.intersects_triangle(&tri_inside), "finite interior triangle intersects");
+
+    // Normal non-intersecting triangle (clearly outside)
+    let tri_outside = Triangle::new(
+        Vector3::new(10.0, 10.0, 10.0),
+        Vector3::new(10.0, 11.0, 10.0),
+        Vector3::new(10.0, 10.0, 11.0),
+    );
+    assert!(!box3.intersects_triangle(&tri_outside), "finite distant triangle does not intersect");
+
+    // Triangles with one NaN vertex:
+    // In upstream Three.js r186 Box3.intersectsTriangle (Box3.js:796):
+    // Math.max(-Math.max(p0, p1, p2), Math.min(p0, p1, p2)) > r
+    // evaluates to NaN > r which is false for all axes, meaning no separating axis is found,
+    // so it returns true.
+    let tri_nan_a = Triangle::new(
+        Vector3::new(f64::NAN, 10.0, 10.0),
+        Vector3::new(10.0, 10.0, 10.0),
+        Vector3::new(10.0, 11.0, 10.0),
+    );
+    assert!(
+        box3.intersects_triangle(&tri_nan_a),
+        "triangle with NaN vertex a matches upstream Box3.js (returns true)"
+    );
+
+    let tri_nan_b = Triangle::new(
+        Vector3::new(10.0, 10.0, 10.0),
+        Vector3::new(10.0, f64::NAN, 10.0),
+        Vector3::new(10.0, 11.0, 10.0),
+    );
+    assert!(
+        box3.intersects_triangle(&tri_nan_b),
+        "triangle with NaN vertex b matches upstream Box3.js (returns true)"
+    );
+
+    let tri_nan_c = Triangle::new(
+        Vector3::new(10.0, 10.0, 10.0),
+        Vector3::new(10.0, 11.0, 10.0),
+        Vector3::new(10.0, 10.0, f64::NAN),
+    );
+    assert!(
+        box3.intersects_triangle(&tri_nan_c),
+        "triangle with NaN vertex c matches upstream Box3.js (returns true)"
+    );
 }

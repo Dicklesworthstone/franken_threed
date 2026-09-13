@@ -493,7 +493,7 @@ fn sat_for_axis(axis: &Vector3, v0: &Vector3, v1: &Vector3, v2: &Vector3, extent
     let p0 = v0.dot(axis);
     let p1 = v1.dot(axis);
     let p2 = v2.dot(axis);
-    let max_p = p0.max(p1).max(p2);
-    let min_p = p0.min(p1).min(p2);
-    (-max_p).max(min_p) <= r
+    let max_p = js_max(js_max(p0, p1), p2);
+    let min_p = js_min(js_min(p0, p1), p2);
+    !(js_max(-max_p, min_p) > r)
 }
