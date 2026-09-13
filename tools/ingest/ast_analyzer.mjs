@@ -721,12 +721,22 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
         const specifier = extractStaticString(firstArg);
 
         if (specifier !== null && isImportMetaUrl(secondArg)) {
-          const span = toSourceSpan(node, offsets);
-          assetReferences.push({
-            specifier,
-            source_span: span,
-            sourceSpan: span
-          });
+          const pathPart = specifier.split(/[?#]/)[0];
+          const isDirectory =
+            pathPart.endsWith('/') ||
+            pathPart === '.' ||
+            pathPart === '..' ||
+            pathPart.endsWith('/.') ||
+            pathPart.endsWith('/..');
+
+          if (!isDirectory) {
+            const span = toSourceSpan(node, offsets);
+            assetReferences.push({
+              specifier,
+              source_span: span,
+              sourceSpan: span
+            });
+          }
         }
       }
 

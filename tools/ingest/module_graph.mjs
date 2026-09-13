@@ -97,6 +97,7 @@ export async function buildModuleGraph(entryPath, options = {}) {
   const isHtml = entryPath.endsWith('.html') || entryPath.endsWith('.htm');
 
   let importMap = { imports: {}, scopes: {} };
+  let mapBaseUrl = entryUrl;
   const rootEntryIds = [];
   const queue = [];
 
@@ -111,6 +112,7 @@ export async function buildModuleGraph(entryPath, options = {}) {
     const htmlContent = fs.readFileSync(resolvedEntryAbs, 'utf-8');
     const parsedHtml = parseHtmlEntries(htmlContent, entryUrl);
     importMap = parsedHtml.importMap;
+    mapBaseUrl = parsedHtml.baseUrl;
 
     for (const script of parsedHtml.moduleScripts) {
       // Preserve the script element in emitted HTML; it has no executable module.
@@ -142,8 +144,6 @@ export async function buildModuleGraph(entryPath, options = {}) {
       referrerUrl: entryUrl
     });
   }
-
-  const mapBaseUrl = entryUrl;
 
   // Process module queue
   while (queue.length > 0) {

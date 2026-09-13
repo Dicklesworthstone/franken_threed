@@ -363,6 +363,7 @@ export async function bundleWithRollup(entryPath, options = {}) {
   const isHtml = entryPath.endsWith('.html') || entryPath.endsWith('.htm');
 
   let importMap = { imports: {}, scopes: {} };
+  let mapBaseUrl = entryUrl;
   const inlineModules = new Map();
   let input;
   const orderedEntryIds = [];
@@ -371,6 +372,7 @@ export async function bundleWithRollup(entryPath, options = {}) {
     const htmlContent = fs.readFileSync(resolvedEntryAbs, 'utf-8');
     const parsed = parseHtmlEntries(htmlContent, entryUrl);
     importMap = parsed.importMap;
+    mapBaseUrl = parsed.baseUrl;
 
     if (parsed.moduleScripts.length === 0) {
       throw new Error(`No module scripts found in ${entryPath}`);
@@ -444,7 +446,7 @@ export async function bundleWithRollup(entryPath, options = {}) {
       plugins: [
         f3dRollupPlugin({
           importMap,
-          mapBaseUrl: entryUrl,
+          mapBaseUrl,
           inlineModules,
           packageRootUrl: options.packageRootUrl,
           retainedModuleUrls: options.retainedModuleUrls

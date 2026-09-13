@@ -135,11 +135,11 @@ export function parseHtmlEntries(rawHtmlContent, documentUrl) {
   let baseMatch;
   while ((baseMatch = baseRegex.exec(domHtml)) !== null) {
     const attrs = parseTagAttributes(baseMatch[1]);
-    if (attrs.href && !baseHref) {
+    if (baseHref === null && Object.hasOwn(attrs, 'href')) {
       baseHref = attrs.href;
     }
   }
-  const effectiveBaseUrl = baseHref ? new URL(baseHref, documentUrl).href : documentUrl;
+  const effectiveBaseUrl = baseHref !== null ? new URL(baseHref, documentUrl).href : documentUrl;
 
   // Match <link rel="modulepreload" ...> using quote-aware attribute scanner on DOM
   const linkRegex = /<link\b((?:[^"'><]+|"[^"]*"|'[^']*')*)>/gi;

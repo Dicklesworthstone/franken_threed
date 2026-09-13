@@ -428,6 +428,19 @@ export { customLoader, validAsset };
   );
 });
 
+test('Asset references: directory base URLs ending with slash, dot, or dot-dot are not recorded as assets', () => {
+  const code = `
+const a = new URL('./real.png', import.meta.url);
+const b = new URL('../../upstream/three.js/', import.meta.url);
+const c = new URL('.', import.meta.url);
+const d = new URL('..', import.meta.url);
+const e = new URL('./dir/?v=1', import.meta.url);
+`;
+  const analysis = analyzeModuleAst(code, 'test_directory_urls.js');
+  assert.equal(analysis.assetReferences.length, 1);
+  assert.equal(analysis.assetReferences[0].specifier, './real.png');
+});
+
 // ---------------------------------------------------------------------------
 // REVIEW REGRESSIONS (MAIL 5523)
 // ---------------------------------------------------------------------------
@@ -1741,4 +1754,122 @@ export function loadCycle() {
     'Cycle transitively reaching external data URL must drop claims_closure'
   );
   assert.equal(dynCycle.claimsClosure, false);
+});
+
+// ---------------------------------------------------------------------------
+// HTML PARSER BASE TAG PARSING REGRESSIONS
+// ---------------------------------------------------------------------------
+
+test('HTML graph resolves import-map addresses and scopes against the effective relative base', async () => {
+  const scratch = makeScratchDir('f3d_graph_relative_base');
+  fs.mkdirSync(path.join(scratch, 'assets'));
+  fs.writeFileSync(path.join(scratch, 'assets', 'app.js'), 'import { answer } from "choice"; export { answer };\n');
+  fs.writeFileSync(path.join(scratch, 'assets', 'dep.js'), 'export const answer = 42;\n');
+  const appUrl = pathToFileURL(path.join(scratch, 'assets', 'app.js')).href;
+  const depUrl = pathToFileURL(path.join(scratch, 'assets', 'dep.js')).href;
+
+  for (const [index, base] of ['./assets/', './assets/base.html'].entries()) {
+    const entry = path.join(scratch, `index${index}.html`);
+    fs.writeFileSync(entry, `<!doctype html><base href="${base}">
+      <script type="importmap">{"imports":{"choice":"./missing.js"},"scopes":{"./":{"choice":"./dep.js"}}}</script>
+      <script type="module" src="./app.js"></script>`);
+    const graph = await buildModuleGraph(entry);
+    assert.deepEqual(graph.root_entries, [appUrl]);
+    assert.equal(graph.modules[appUrl].static_imports[0].resolved_id, depUrl);
+    assert.ok(graph.modules[depUrl]);
+    assert.equal(graph.summary.total_modules, 2);
+  }
+});
+
+test('parseHtmlEntries: <base href=""> first blocks subsequent <base href="/x"> and records empty baseHref', () => {
+  const html = `<!DOCTYPE html>
+<html>
+<head>
+  <base href="">
+  <base href="/x">
+  <script type="module" src="app.js"></script>
+</head>
+<body></body>
+</html>`;
+
+  const docUrl = 'file:///app/dir/index.html';
+  const parsed = parseHtmlEntries(html, docUrl);
+
+  assert.equal(parsed.baseHref, '', 'First base with href="" must be recorded as empty string');
+  assert.equal(parsed.baseUrl, 'file:///app/dir/index.html', 'Empty baseHref resolves effective base to document URL');
+  assert.equal(parsed.moduleScripts.length, 1);
+  assert.equal(
+    parsed.moduleScripts[0].id,
+    'file:///app/dir/app.js',
+    'Module script must resolve relative to document URL, not subsequent /x'
+  );
+});
+
+test('parseHtmlEntries: boolean <base href> blocks subsequent <base href="/x"> and records empty baseHref', () => {
+  const html = `<!DOCTYPE html>
+<html>
+<head>
+  <base href>
+  <base href="/x">
+  <script type="module" src="app.js"></script>
+</head>
+<body></body>
+</html>`;
+
+  const docUrl = 'file:///app/dir/index.html';
+  const parsed = parseHtmlEntries(html, docUrl);
+
+  assert.equal(parsed.baseHref, '', 'Valueless boolean href must be recorded as empty string');
+  assert.equal(parsed.baseUrl, 'file:///app/dir/index.html', 'Effective base must resolve to document URL');
+  assert.equal(parsed.moduleScripts.length, 1);
+  assert.equal(
+    parsed.moduleScripts[0].id,
+    'file:///app/dir/app.js',
+    'Module script must resolve relative to document URL, not subsequent /x'
+  );
+});
+
+test('parseHtmlEntries: target-only <base> is non-recording and allows subsequent <base href> to record', () => {
+  // 1. Target-only base followed by valid href base
+  const htmlWithSubsequent = `<!DOCTYPE html>
+<html>
+<head>
+  <base target="_blank">
+  <base href="/sub/">
+  <script type="module" src="app.js"></script>
+</head>
+<body></body>
+</html>`;
+
+  const docUrl = 'file:///app/dir/index.html';
+  const parsedWithSubsequent = parseHtmlEntries(htmlWithSubsequent, docUrl);
+
+  assert.equal(parsedWithSubsequent.baseHref, '/sub/', 'Target-only base must not record, allowing subsequent base href to win');
+  assert.equal(parsedWithSubsequent.baseUrl, 'file:///sub/', 'Effective base must resolve to /sub/');
+  assert.equal(parsedWithSubsequent.moduleScripts.length, 1);
+  assert.equal(
+    parsedWithSubsequent.moduleScripts[0].id,
+    'file:///sub/app.js',
+    'Module script must resolve relative to /sub/'
+  );
+
+  // 2. Target-only base alone in document (no href attribute on any base)
+  const htmlTargetOnly = `<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <script type="module" src="app.js"></script>
+</head>
+<body></body>
+</html>`;
+
+  const parsedTargetOnly = parseHtmlEntries(htmlTargetOnly, docUrl);
+  assert.equal(parsedTargetOnly.baseHref, null, 'baseHref must remain null when no base element has an href attribute');
+  assert.equal(parsedTargetOnly.baseUrl, 'file:///app/dir/index.html', 'Effective base must default to document URL');
+  assert.equal(parsedTargetOnly.moduleScripts.length, 1);
+  assert.equal(
+    parsedTargetOnly.moduleScripts[0].id,
+    'file:///app/dir/app.js',
+    'Module script must resolve relative to document URL'
+  );
 });

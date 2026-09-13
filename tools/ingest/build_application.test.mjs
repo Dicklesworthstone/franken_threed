@@ -35,7 +35,8 @@ import {
   findChunkForPreload,
   toCanonicalPreloadUrl,
   extractJsModuleDependencies,
-  isClassicJavaScriptType
+  isClassicJavaScriptType,
+  resolveBaseDetails
 } from './build_application.mjs';
 import { parseHtmlEntries, parseTagAttributes, stripScriptAndStyleBodies, stripHtmlComments } from './html_parser.mjs';
 import { buildModuleGraph } from './module_graph.mjs';
@@ -856,14 +857,14 @@ test('parseHtmlEntries reads script body from rawHtmlContent preserving comments
   assert.equal(mapParsed.importMap.imports['<!--pkg-->'], './pkg.js');
 });
 
-test('buildApplication and rewriteHtmlForBuild explicitly reject <base href> before output to preserve document.baseURI semantics', async () => {
+test('buildApplication and rewriteHtmlForBuild explicitly reject root-relative <base href> before output to preserve document.baseURI semantics', async () => {
   const scratch = makeScratch('f3d_app_base_reject');
   const outDir = path.join(scratch, 'dist');
 
   const htmlContent = `<!DOCTYPE html>
 <html>
 <head>
-  <base href="sub/">
+  <base href="/sub/">
   <script type="module" src="app.js"></script>
 </head>
 <body><div id="app">Base Test</div></body>
@@ -875,7 +876,7 @@ test('buildApplication and rewriteHtmlForBuild explicitly reject <base href> bef
     () => {
       rewriteHtmlForBuild(htmlContent, ['chunk.js']);
     },
-    /Explicit rejection: <base href="sub\/"> is not currently supported in application build emitter/,
+    /Explicit rejection: <base href="\/sub\/"> is not currently supported in application build emitter/,
     'rewriteHtmlForBuild must explicitly reject base href before output'
   );
 
@@ -884,7 +885,7 @@ test('buildApplication and rewriteHtmlForBuild explicitly reject <base href> bef
     async () => {
       await buildApplication(path.join(scratch, 'index.html'), outDir);
     },
-    /Explicit rejection: <base href="sub\/"> is not currently supported in application build emitter/,
+    /Explicit rejection: <base href="\/sub\/"> is not currently supported in application build emitter/,
   );
 });
 
@@ -2783,4 +2784,533 @@ test('buildApplication ignores bodies of classic scripts with empty, boolean, or
   // Execute emitted chunk in Node to confirm valid execution
   await import(pathToFileURL(path.join(outDir, emittedChunk)).href);
   assert.equal(globalThis.__f3d_classic_empty_app_loaded, true, 'Adjacent module executed cleanly');
+});
+
+test('buildApplication and rewriteHtmlForBuild positively support empty/boolean <base href> and target-only, ignoring later base tags', async () => {
+  // 1. <base href=""> (empty string): build succeeds, tag preserved verbatim, emitted module executes
+  const scratchEmpty = makeScratch('f3d_base_empty_href');
+  const entryEmpty = path.join(scratchEmpty, 'index.html');
+  const outDirEmpty = path.join(scratchEmpty, 'dist');
+  fs.writeFileSync(
+    path.join(scratchEmpty, 'app.js'),
+    `globalThis.__f3d_base_empty_loaded = true;\nexport const status = 'empty_ok';\n`
+  );
+  const baseTagEmpty = '<base href="">';
+  const htmlEmpty = `<!DOCTYPE html><html><head>${baseTagEmpty}<script type="module" src="./app.js"></script></head><body></body></html>`;
+  fs.writeFileSync(entryEmpty, htmlEmpty);
+
+  const rewrittenEmpty = rewriteHtmlForBuild(htmlEmpty, ['chunk.js']);
+  assert.ok(rewrittenEmpty.includes(baseTagEmpty), 'rewriteHtmlForBuild must preserve <base href=""> verbatim');
+  assert.ok(rewrittenEmpty.includes('src="./chunk.js"'), 'Module script must be rewritten to chunk');
+
+  const resultEmpty = await buildApplication(entryEmpty, outDirEmpty);
+  assert.equal(resultEmpty.entryFiles.length, 1, 'Exactly one entry chunk emitted for empty base href');
+  const emittedEmptyHtml = fs.readFileSync(path.join(outDirEmpty, 'index.html'), 'utf8');
+  assert.ok(emittedEmptyHtml.includes(baseTagEmpty), 'buildApplication must preserve <base href=""> verbatim in emitted HTML');
+  assert.ok(emittedEmptyHtml.includes(`src="./${resultEmpty.entryFiles[0]}"`));
+  await import(pathToFileURL(path.join(outDirEmpty, resultEmpty.entryFiles[0])).href);
+  assert.equal(globalThis.__f3d_base_empty_loaded, true, 'Adjacent module executed cleanly with empty base href');
+
+  // 2. <base href> (boolean / valueless): build succeeds, tag preserved verbatim, emitted module executes
+  const scratchBool = makeScratch('f3d_base_bool_href');
+  const entryBool = path.join(scratchBool, 'index.html');
+  const outDirBool = path.join(scratchBool, 'dist');
+  fs.writeFileSync(
+    path.join(scratchBool, 'app.js'),
+    `globalThis.__f3d_base_bool_loaded = true;\nexport const status = 'bool_ok';\n`
+  );
+  const baseTagBool = '<base href>';
+  const htmlBool = `<!DOCTYPE html><html><head>${baseTagBool}<script type="module" src="./app.js"></script></head><body></body></html>`;
+  fs.writeFileSync(entryBool, htmlBool);
+
+  const rewrittenBool = rewriteHtmlForBuild(htmlBool, ['chunk.js']);
+  assert.ok(rewrittenBool.includes(baseTagBool), 'rewriteHtmlForBuild must preserve boolean <base href> verbatim');
+  assert.ok(rewrittenBool.includes('src="./chunk.js"'));
+
+  const resultBool = await buildApplication(entryBool, outDirBool);
+  assert.equal(resultBool.entryFiles.length, 1, 'Exactly one entry chunk emitted for boolean base href');
+  const emittedBoolHtml = fs.readFileSync(path.join(outDirBool, 'index.html'), 'utf8');
+  assert.ok(emittedBoolHtml.includes(baseTagBool), 'buildApplication must preserve boolean <base href> verbatim in emitted HTML');
+  assert.ok(emittedBoolHtml.includes(`src="./${resultBool.entryFiles[0]}"`));
+  await import(pathToFileURL(path.join(outDirBool, resultBool.entryFiles[0])).href);
+  assert.equal(globalThis.__f3d_base_bool_loaded, true, 'Adjacent module executed cleanly with boolean base href');
+
+  // 3. <base href=""><base href="/x">: empty first base blocks subsequent /x, build succeeds
+  const scratchMulti = makeScratch('f3d_base_empty_first_multi');
+  const entryMulti = path.join(scratchMulti, 'index.html');
+  const outDirMulti = path.join(scratchMulti, 'dist');
+  fs.writeFileSync(
+    path.join(scratchMulti, 'app.js'),
+    `globalThis.__f3d_base_multi_loaded = true;\nexport const status = 'multi_ok';\n`
+  );
+  const htmlMulti = '<!DOCTYPE html><html><head><base href=""><base href="/x"><script type="module" src="./app.js"></script></head><body></body></html>';
+  fs.writeFileSync(entryMulti, htmlMulti);
+
+  const rewrittenMulti = rewriteHtmlForBuild(htmlMulti, ['chunk.js']);
+  assert.ok(rewrittenMulti.includes('<base href="">'), 'rewriteHtmlForBuild must preserve first base tag verbatim');
+  assert.ok(rewrittenMulti.includes('<base href="/x">'), 'rewriteHtmlForBuild must preserve subsequent base tag verbatim');
+  assert.ok(rewrittenMulti.includes('src="./chunk.js"'));
+
+  const resultMulti = await buildApplication(entryMulti, outDirMulti);
+  assert.equal(resultMulti.entryFiles.length, 1, 'Build must succeed when first base href is empty');
+  const emittedMultiHtml = fs.readFileSync(path.join(outDirMulti, 'index.html'), 'utf8');
+  assert.ok(emittedMultiHtml.includes('<base href="">'));
+  assert.ok(emittedMultiHtml.includes('<base href="/x">'));
+  assert.ok(emittedMultiHtml.includes(`src="./${resultMulti.entryFiles[0]}"`));
+  await import(pathToFileURL(path.join(outDirMulti, resultMulti.entryFiles[0])).href);
+  assert.equal(globalThis.__f3d_base_multi_loaded, true, 'Adjacent module executed cleanly when later base is ignored');
+
+  // 4. <base target="_blank"> (target-only, no href): build succeeds, tag preserved verbatim
+  const scratchTarget = makeScratch('f3d_base_target_only');
+  const entryTarget = path.join(scratchTarget, 'index.html');
+  const outDirTarget = path.join(scratchTarget, 'dist');
+  fs.writeFileSync(
+    path.join(scratchTarget, 'app.js'),
+    `globalThis.__f3d_base_target_loaded = true;\nexport const answer = 42;\n`
+  );
+  const htmlTarget = '<!DOCTYPE html><html><head><base target="_blank"><script type="module" src="./app.js"></script></head><body></body></html>';
+  fs.writeFileSync(entryTarget, htmlTarget);
+
+  const rewrittenTarget = rewriteHtmlForBuild(htmlTarget, ['chunk.js']);
+  assert.ok(rewrittenTarget.includes('<base target="_blank">'), 'rewriteHtmlForBuild must preserve base tag without href');
+
+  const resultTarget = await buildApplication(entryTarget, outDirTarget);
+  assert.equal(resultTarget.entryFiles.length, 1, 'Exactly one entry chunk emitted');
+
+  const emittedTargetHtml = fs.readFileSync(path.join(outDirTarget, 'index.html'), 'utf8');
+  assert.ok(emittedTargetHtml.includes('<base target="_blank">'), 'buildApplication must preserve base tag without href verbatim');
+  assert.ok(emittedTargetHtml.includes(`src="./${resultTarget.entryFiles[0]}"`), 'Module script must be rewritten to emitted entry chunk');
+
+  await import(pathToFileURL(path.join(outDirTarget, resultTarget.entryFiles[0])).href);
+  assert.equal(globalThis.__f3d_base_target_loaded, true, 'Adjacent module executed cleanly');
+
+  // 5. Target-only base followed by non-empty base href must still be rejected
+  const htmlTargetThenHref = '<!DOCTYPE html><html><head><base target="_blank"><base href="/x"><script type="module" src="./app.js"></script></head><body></body></html>';
+  assert.throws(
+    () => rewriteHtmlForBuild(htmlTargetThenHref, ['chunk.js']),
+    /Explicit rejection: <base href="\/x"> is not currently supported in application build emitter/
+  );
+});
+
+test('buildApplication consumes already-built TypeScript/JSX application output with import maps, source maps, and type-only modules', async () => {
+  const scratch = makeScratch('f3d_app_tsc_jsx');
+  const outDir = path.join(scratch, 'dist');
+  fs.mkdirSync(path.join(scratch, 'vendor'), { recursive: true });
+
+  // 1. Vendor JSX runtime (mimicking pre-bundled or local react/jsx-runtime)
+  fs.writeFileSync(
+    path.join(scratch, 'vendor', 'jsx-runtime.js'),
+    `export function jsx(type, props) {\n` +
+    `  if (typeof type === 'function') return type(props);\n` +
+    `  return { type, props };\n` +
+    `}\n` +
+    `export function jsxs(type, props) {\n` +
+    `  return jsx(type, props);\n` +
+    `}\n`
+  );
+
+  // 2. Type-only module compiled from TypeScript: tsc emits empty export {}
+  fs.writeFileSync(
+    path.join(scratch, 'types.js'),
+    `// Compiled from TypeScript type-only declarations\nexport {};\n`
+  );
+
+  // 3. Component module with .js-extension relative imports and JSX factory calls
+  fs.writeFileSync(
+    path.join(scratch, 'component.js'),
+    `import { jsx as _jsx } from "react/jsx-runtime";\n` +
+    `import "./types.js";\n\n` +
+    `export function Card({ title, count }) {\n` +
+    `  return _jsx("div", {\n` +
+    `    className: "card",\n` +
+    `    children: [\n` +
+    `      _jsx("h2", { children: title }),\n` +
+    `      _jsx("p", { children: \`Count: \${count}\` })\n` +
+    `    ]\n` +
+    `  });\n` +
+    `}\n`
+  );
+
+  // 4. Real sibling source map for main.js
+  const sourceMapContent = JSON.stringify({
+    version: 3,
+    file: "main.js",
+    sources: ["main.tsx"],
+    sourcesContent: [
+      "import { jsx as _jsx } from 'react/jsx-runtime';\nimport { Card } from './component.js';\nimport './types.js';\nconst tree = _jsx(Card, { title: 'FrankenThreeD TSX', count: 42 });\nglobalThis.__f3d_tsc_jsx_result = tree;\nexport const app = tree;\n"
+    ],
+    mappings: ";;;AAAA,OAAO,EAAE,GAAG,IAAI,IAAI,EAAE,MAAM,mBAAmB,CAAC;AAChD,OAAO,EAAE,IAAI,EAAE,MAAM,gBAAgB,CAAC;AACtC,OAAO,YAAY,CAAC;AACpB,MAAM,IAAI,GAAG,IAAI,CAAC,IAAI,EAAE,EAAE,KAAK,EAAE,oBAAoB,EAAE,KAAK,EAAE,EAAE,EAAE,CAAC,CAAC;AACpE,UAAU,CAAC,qBAAqB,GAAG,IAAI,CAAC;AACxC,OAAO,MAAM,GAAG,GAAG,IAAI,CAAC;",
+    names: []
+  }, null, 2);
+  fs.writeFileSync(path.join(scratch, 'main.js.map'), sourceMapContent);
+
+  // 5. Entry point compiled from main.tsx with sourceMappingURL comment
+  fs.writeFileSync(
+    path.join(scratch, 'main.js'),
+    `import { jsx as _jsx } from "react/jsx-runtime";\n` +
+    `import { Card } from "./component.js";\n` +
+    `import "./types.js";\n\n` +
+    `const tree = _jsx(Card, { title: "FrankenThreeD TSX", count: 42 });\n` +
+    `globalThis.__f3d_tsc_jsx_result = tree;\n` +
+    `export const app = tree;\n` +
+    `//# sourceMappingURL=main.js.map\n`
+  );
+
+  // 6. Application index.html with importmap mapping "react/jsx-runtime" -> "./vendor/jsx-runtime.js"
+  const htmlContent = `<!DOCTYPE html>
+<html>
+<head>
+  <script type="importmap">
+  {
+    "imports": {
+      "react/jsx-runtime": "./vendor/jsx-runtime.js"
+    }
+  }
+  </script>
+  <script type="module" src="./main.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+</body>
+</html>`;
+  fs.writeFileSync(path.join(scratch, 'index.html'), htmlContent);
+
+  // 7. Assert buildApplication succeeds and emits runnable bundle
+  const result = await buildApplication(path.join(scratch, 'index.html'), outDir);
+  assert.equal(result.isHtml, true);
+  assert.equal(result.entryFiles.length, 1, 'Exactly one entry chunk emitted for module entry');
+
+  const emittedChunk = result.entryFiles[0];
+  const emittedHtml = fs.readFileSync(path.join(outDir, 'index.html'), 'utf8');
+
+  // Verify HTML rewrite preserves importmap and points module script to emitted chunk
+  assert.ok(emittedHtml.includes('<script type="importmap">'), 'Emitted HTML must preserve importmap');
+  assert.ok(emittedHtml.includes(`src="./${emittedChunk}"`), 'Emitted HTML must point to bundle chunk');
+
+  // Execute emitted chunk in Node to confirm execution
+  await import(pathToFileURL(path.join(outDir, emittedChunk)).href);
+  assert.ok(globalThis.__f3d_tsc_jsx_result, 'JSX execution result must be recorded');
+  assert.equal(globalThis.__f3d_tsc_jsx_result.type, 'div');
+  assert.equal(globalThis.__f3d_tsc_jsx_result.props.className, 'card');
+  assert.equal(globalThis.__f3d_tsc_jsx_result.props.children[0].props.children, 'FrankenThreeD TSX');
+  assert.equal(globalThis.__f3d_tsc_jsx_result.props.children[1].props.children, 'Count: 42');
+
+  // 8. Observation: record what happens to the .map file in dist
+  const sourceMapInDist = fs.existsSync(path.join(outDir, 'main.js.map'));
+  const chunkMapInDist = fs.existsSync(path.join(outDir, `${emittedChunk}.map`));
+  assert.equal(
+    sourceMapInDist,
+    false,
+    'Observation: pre-existing sourceMappingURL file is not copied as an HTML asset'
+  );
+  assert.equal(
+    chunkMapInDist,
+    false,
+    'Observation: Rollup output does not generate chunk source maps without sourcemap option'
+  );
+});
+
+test('buildApplication and rewriteHtmlForBuild positively support local directory base href with module scripts, preloads, assets, and SRI integrity', async () => {
+  const scratch = makeScratch('f3d_app_local_base_dir');
+  const outDir = path.join(scratch, 'dist');
+  fs.mkdirSync(path.join(scratch, 'assets'), { recursive: true });
+
+  // 1. Assets in ./assets/ directory: module entry, imported sub-module, stylesheet, and image
+  fs.writeFileSync(
+    path.join(scratch, 'assets', 'dep.js'),
+    'export const answer = 42;\n'
+  );
+  const appCode = `import { answer } from 'choice';\n` +
+    `globalThis.__f3d_local_base_app = answer;\n` +
+    `export const main = answer;\n`;
+  fs.writeFileSync(
+    path.join(scratch, 'assets', 'app.js'),
+    appCode
+  );
+
+  const upstreamPngPath = path.resolve(
+    path.dirname(fileURLToPath(import.meta.url)),
+    '../../upstream/three.js/examples/textures/lensflare/lensflare3.png'
+  );
+  const realPngBytes = fs.readFileSync(upstreamPngPath);
+  fs.writeFileSync(
+    path.join(scratch, 'assets', 'logo.png'),
+    realPngBytes
+  );
+  fs.writeFileSync(
+    path.join(scratch, 'assets', 'theme.css'),
+    `body { background: url('./logo.png'); }\n`
+  );
+
+  // Compute valid original SRI from actual assets/app.js bytes using existing computeIntegrityForContent
+  const originalIntegrity = computeIntegrityForContent('sha384-placeholder', appCode);
+
+  // Deliberately do NOT create dep.js at root; missing root target ensures wrong base cannot pass
+  const appUrl = pathToFileURL(path.join(scratch, 'assets', 'app.js')).href + '?v=1';
+  const depUrl = pathToFileURL(path.join(scratch, 'assets', 'dep.js')).href;
+
+  // 2. HTML referencing resources relative to <base href="./assets/">
+  // Import map scopes ./ to assets/dep.js while top-level choice points to missing root target
+  const rawHtml = `<!DOCTYPE html>
+<html>
+<head>
+  <base href="./assets/">
+  <script type="importmap">
+  {
+    "imports": {
+      "choice": "./missing_root_dep.js"
+    },
+    "scopes": {
+      "./": {
+        "choice": "./dep.js"
+      }
+    }
+  }
+  </script>
+  <link rel="stylesheet" href="./theme.css">
+  <link rel="modulepreload" href="./app.js?v=1" integrity="${originalIntegrity}">
+  <script type="module" src="./app.js?v=1" integrity="${originalIntegrity}"></script>
+</head>
+<body>
+  <img src="./logo.png">
+</body>
+</html>`;
+  fs.writeFileSync(path.join(scratch, 'index.html'), rawHtml);
+
+  // 3. Verify actual module graph dependency resolution matches assets/dep.js
+  const graph = await buildModuleGraph(path.join(scratch, 'index.html'));
+  assert.deepEqual(graph.root_entries, [appUrl]);
+  const choiceImport = graph.modules[appUrl].static_imports.find(imp => imp.specifier === 'choice');
+  assert.ok(choiceImport, 'choice import must be recorded');
+  assert.equal(choiceImport.resolved_id, depUrl, 'choice alias must resolve to assets/dep.js against parsed base URL');
+
+  // 4. Unit test rewriteHtmlForBuild with local base href
+  const mockChunkCode = 'console.log("chunk");';
+  const mockPreloadMap = new Map([
+    [appUrl, 'chunk-app.js']
+  ]);
+  const rewrittenHtml = rewriteHtmlForBuild(
+    rawHtml,
+    ['chunk-app.js'],
+    { 'chunk-app.js': mockChunkCode },
+    { preloadChunkMap: mockPreloadMap, entryDir: scratch }
+  );
+
+  // Base tag preserved verbatim
+  assert.ok(rewrittenHtml.includes('<base href="./assets/">'), 'Base tag must be preserved verbatim');
+  // Script tag rewritten to ../ relative to assets base
+  assert.ok(rewrittenHtml.includes('src="../chunk-app.js"'), 'Script src must resolve to output root relative to base dir');
+  // Preload tag rewritten to ../ relative to assets base
+  assert.ok(rewrittenHtml.includes('href="../chunk-app.js"'), 'Preload href must resolve to output root relative to base dir');
+  // SRI integrity recomputed from chunk code
+  const expectedIntegrity = computeIntegrityForContent(originalIntegrity, mockChunkCode);
+  assert.ok(rewrittenHtml.includes(`integrity="${expectedIntegrity}"`), 'SRI integrity must be honestly recomputed');
+  // Stylesheet and image tags preserved verbatim
+  assert.ok(rewrittenHtml.includes('href="./theme.css"'), 'CSS link preserved');
+  assert.ok(rewrittenHtml.includes('src="./logo.png"'), 'IMG src preserved');
+
+  // 5. Test buildApplication end-to-end
+  const result = await buildApplication(path.join(scratch, 'index.html'), outDir);
+  assert.equal(result.isHtml, true);
+  assert.equal(result.entryFiles.length, 1);
+
+  const emittedChunk = result.entryFiles[0];
+  const emittedHtml = fs.readFileSync(path.join(outDir, 'index.html'), 'utf8');
+
+  assert.ok(emittedHtml.includes('<base href="./assets/">'), 'Emitted HTML must retain base tag');
+  assert.ok(emittedHtml.includes(`src="../${emittedChunk}"`), 'Emitted script src must point relative to base directory');
+  assert.ok(emittedHtml.includes(`href="../${emittedChunk}"`), 'Emitted preload href must point relative to base directory');
+
+  // Verify asset files are preserved in the relative output directory structure
+  assert.ok(fs.existsSync(path.join(outDir, 'assets', 'logo.png')), 'Asset logo.png must be copied into assets/');
+  assert.ok(fs.existsSync(path.join(outDir, 'assets', 'theme.css')), 'Asset theme.css must be copied into assets/');
+  const copiedPngBytes = fs.readFileSync(path.join(outDir, 'assets', 'logo.png'));
+  assert.equal(copiedPngBytes.length, realPngBytes.length, 'Copied PNG must match real PNG bytes');
+  assert.ok(copiedPngBytes.length > 100, 'Real PNG must be substantial, loadable image');
+
+  // 6. Execute emitted bundle in Node to confirm import-map alias execution
+  await import(pathToFileURL(path.join(outDir, emittedChunk)).href);
+  assert.equal(globalThis.__f3d_local_base_app, 42, 'Emitted chunk with import-map alias must execute cleanly');
+});
+
+test('buildApplication and rewriteHtmlForBuild support file-shaped base href and nested directory bases', async () => {
+  // 1. File-shaped base: <base href="./assets/base.html">
+  const scratchFile = makeScratch('f3d_app_file_base');
+  const outDirFile = path.join(scratchFile, 'dist');
+  fs.mkdirSync(path.join(scratchFile, 'assets'), { recursive: true });
+
+  fs.writeFileSync(
+    path.join(scratchFile, 'assets', 'dep.js'),
+    'export const val = 84;\n'
+  );
+  fs.writeFileSync(
+    path.join(scratchFile, 'assets', 'app.js'),
+    `import { val } from 'choice';\n` +
+    `globalThis.__f3d_file_base_val = val;\n` +
+    `export const answer = val;\n`
+  );
+
+  const htmlFileBase = `<!DOCTYPE html>
+<html>
+<head>
+  <base href="./assets/base.html">
+  <script type="importmap">
+  {
+    "imports": {
+      "choice": "./missing_root_dep.js"
+    },
+    "scopes": {
+      "./": {
+        "choice": "./dep.js"
+      }
+    }
+  }
+  </script>
+  <script type="module" src="./app.js"></script>
+</head>
+<body></body>
+</html>`;
+  fs.writeFileSync(path.join(scratchFile, 'index.html'), htmlFileBase);
+
+  const appFileUrl = pathToFileURL(path.join(scratchFile, 'assets', 'app.js')).href;
+  const depFileUrl = pathToFileURL(path.join(scratchFile, 'assets', 'dep.js')).href;
+  const graphFile = await buildModuleGraph(path.join(scratchFile, 'index.html'));
+  assert.deepEqual(graphFile.root_entries, [appFileUrl]);
+  const choiceImport = graphFile.modules[appFileUrl].static_imports.find(imp => imp.specifier === 'choice');
+  assert.ok(choiceImport, 'choice import must be recorded for file-shaped base');
+  assert.equal(choiceImport.resolved_id, depFileUrl, 'choice alias must resolve to assets/dep.js under file-shaped base');
+
+  const resultFile = await buildApplication(path.join(scratchFile, 'index.html'), outDirFile);
+  assert.equal(resultFile.entryFiles.length, 1);
+  const emittedFileHtml = fs.readFileSync(path.join(outDirFile, 'index.html'), 'utf8');
+  assert.ok(emittedFileHtml.includes('<base href="./assets/base.html">'), 'File-shaped base preserved');
+  assert.ok(emittedFileHtml.includes(`src="../${resultFile.entryFiles[0]}"`), 'Script rewritten relative to base file directory');
+
+  await import(pathToFileURL(path.join(outDirFile, resultFile.entryFiles[0])).href);
+  assert.equal(globalThis.__f3d_file_base_val, 84, 'Module with import map alias under file-shaped base executed cleanly');
+
+  // 2. Nested directory base: <base href="sub/nested/">
+  const scratchNested = makeScratch('f3d_app_nested_base');
+  const outDirNested = path.join(scratchNested, 'dist');
+  fs.mkdirSync(path.join(scratchNested, 'sub', 'nested'), { recursive: true });
+
+  fs.writeFileSync(
+    path.join(scratchNested, 'sub', 'nested', 'app.js'),
+    'globalThis.__f3d_nested_base_val = 168;\nexport const val = 168;\n'
+  );
+
+  const htmlNested = `<!DOCTYPE html>
+<html>
+<head>
+  <base href="sub/nested/">
+  <script type="module" src="./app.js"></script>
+</head>
+<body></body>
+</html>`;
+  fs.writeFileSync(path.join(scratchNested, 'index.html'), htmlNested);
+
+  const resultNested = await buildApplication(path.join(scratchNested, 'index.html'), outDirNested);
+  assert.equal(resultNested.entryFiles.length, 1);
+  const emittedNestedHtml = fs.readFileSync(path.join(outDirNested, 'index.html'), 'utf8');
+  assert.ok(emittedNestedHtml.includes('<base href="sub/nested/">'));
+  assert.ok(emittedNestedHtml.includes(`src="../../${resultNested.entryFiles[0]}"`), 'Script rewritten with ../../ for two-level nested base');
+
+  await import(pathToFileURL(path.join(outDirNested, resultNested.entryFiles[0])).href);
+  assert.equal(globalThis.__f3d_nested_base_val, 168, 'Module under nested directory base executed cleanly');
+});
+
+test('buildApplication resolves import map and inline classic dynamic imports against parsedHtml.baseUrl', async () => {
+  const scratch = makeScratch('f3d_app_base_importmap');
+  const outDir = path.join(scratch, 'dist');
+  fs.mkdirSync(path.join(scratch, 'assets'), { recursive: true });
+
+  fs.writeFileSync(
+    path.join(scratch, 'assets', 'helper.js'),
+    'export const greet = "hello from base helper";\n'
+  );
+  fs.writeFileSync(
+    path.join(scratch, 'assets', 'dynamic.js'),
+    `globalThis.__f3d_dynamic_mod_executed = "loaded dynamically";\n` +
+    `export const dynamicVal = "loaded dynamically";\n`
+  );
+  fs.writeFileSync(
+    path.join(scratch, 'assets', 'main.js'),
+    `import { greet } from 'mapped-helper';\n` +
+    `globalThis.__f3d_base_importmap_result = greet;\n` +
+    `export const result = greet;\n`
+  );
+
+  const html = `<!DOCTYPE html>
+<html>
+<head>
+  <base href="./assets/">
+  <script type="importmap">
+  {
+    "imports": {
+      "mapped-helper": "./helper.js"
+    }
+  }
+  </script>
+  <script type="module" src="./main.js"></script>
+  <script>
+    import('./dynamic.js').then(m => {
+      globalThis.__f3d_dynamic_result = m.dynamicVal;
+    });
+  </script>
+</head>
+<body></body>
+</html>`;
+  fs.writeFileSync(path.join(scratch, 'index.html'), html);
+
+  const result = await buildApplication(path.join(scratch, 'index.html'), outDir);
+  assert.equal(result.entryFiles.length, 1);
+
+  // Assert import map was resolved against parsedHtml.baseUrl (pointing to assets/helper.js)
+  const emittedChunk = result.entryFiles[0];
+  await import(pathToFileURL(path.join(outDir, emittedChunk)).href);
+  assert.equal(globalThis.__f3d_base_importmap_result, 'hello from base helper');
+
+  // Assert inline classic dynamic import was resolved against parsedHtml.baseUrl and copied to dist/assets/dynamic.js
+  const dynamicAssetPath = path.join(outDir, 'assets', 'dynamic.js');
+  assert.ok(
+    fs.existsSync(dynamicAssetPath),
+    'Static asset closure must include dynamic import resolved against base URL'
+  );
+  await import(pathToFileURL(dynamicAssetPath).href);
+  assert.equal(globalThis.__f3d_dynamic_mod_executed, 'loaded dynamically', 'Copied dynamic module must execute cleanly in Node');
+});
+
+test('buildApplication and rewriteHtmlForBuild explicitly reject remote, protocol-relative, and escaping base hrefs', async () => {
+  const scratch = makeScratch('f3d_app_base_reject_all');
+  const outDir = path.join(scratch, 'dist');
+  fs.writeFileSync(path.join(scratch, 'app.js'), 'export const val = 1;\n');
+
+  const unsupportedBases = [
+    'file:///app/assets/',
+    '/assets/',
+    '\\assets\\',
+    '//cdn.example.com/assets/',
+    'https://cdn.example.com/assets/',
+    '../outside/',
+    '../../escaping/'
+  ];
+
+  for (const badBase of unsupportedBases) {
+    const badHtml = `<!DOCTYPE html><html><head><base href="${badBase}"><script type="module" src="./app.js"></script></head><body></body></html>`;
+    fs.writeFileSync(path.join(scratch, 'index.html'), badHtml);
+
+    // 1. rewriteHtmlForBuild rejects badBase
+    assert.throws(
+      () => rewriteHtmlForBuild(badHtml, ['chunk.js'], {}, { entryDir: scratch }),
+      /Explicit rejection: <base href=".*"> is not currently supported in application build emitter/,
+      `rewriteHtmlForBuild must explicitly reject unsupported base: ${badBase}`
+    );
+
+    // 2. buildApplication rejects badBase
+    await assert.rejects(
+      async () => buildApplication(path.join(scratch, 'index.html'), path.join(outDir, 'test_sub')),
+      /Explicit rejection: <base href=".*"> is not currently supported in application build emitter/,
+      `buildApplication must explicitly reject unsupported base: ${badBase}`
+    );
+  }
 });

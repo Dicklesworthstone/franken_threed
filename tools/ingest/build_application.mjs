@@ -16,8 +16,9 @@
  *   data-integrity are never confused with src or integrity, preserving unrelated
  *   attributes with complex quotes (e.g. data-label='a"b') verbatim.
  * - Honestly recomputes Subresource Integrity (SRI) attributes for emitted chunks.
- * - Explicitly rejects <base href="..."> input before output to preserve document.baseURI
- *   semantics and prevent silent asset/link corruption, leaving base-href support open.
+ * - Positively supports local relative <base href="..."> within application root (directories and file-shaped bases),
+ *   rewriting emitted entry chunks and preloads relative to the effective base directory to preserve document.baseURI semantics.
+ * - Explicitly rejects remote, root-relative, or escaping bases before output to preserve document.baseURI semantics.
  * - Rewrites <link rel="modulepreload"> hrefs to point to emitted chunks instead of raw
  *   source files, updating SRI integrity and skipping static asset copies for bundled modules.
  * - Enforces bounded asset closure by copying relative assets (stylesheets, images,
@@ -145,8 +146,9 @@ export function findChunkForPreload(rawHref, referrerDir, preloadChunkMap) {
   // 1. Canonical URL resolution against referrer directory URL (preserving ?query and #fragment)
   if (referrerDir) {
     try {
-      const referrerDirSlash = referrerDir.endsWith(path.sep) ? referrerDir : referrerDir + path.sep;
-      const baseUrl = pathToFileURL(referrerDirSlash);
+      const baseUrl = referrerDir.startsWith('file://')
+        ? new URL(referrerDir)
+        : pathToFileURL(referrerDir.endsWith(path.sep) ? referrerDir : referrerDir + path.sep);
       const canonicalUrl = new URL(trimmed, baseUrl).href;
       if (preloadChunkMap.has(canonicalUrl)) {
         return preloadChunkMap.get(canonicalUrl);
@@ -506,6 +508,89 @@ export function extractJsModuleDependencies(code, contextUrl = 'script.js') {
 }
 
 /**
+ * Resolves base href details and calculates the chunk prefix relative to the effective base directory.
+ * If baseHref is empty, boolean, or absent, returns { effectiveBaseUrl: documentUrl, effectiveBaseDir: entryDir, chunkPrefix: './' }.
+ * If baseHref is root-relative (/), protocol-relative (//), remote (http:, etc.), or escapes outside the root directory,
+ * throws the explicit rejection error to preserve document.baseURI semantics.
+ * Otherwise, computes the relative prefix from the effective base directory to the application root directory.
+ *
+ * @param {string | null} baseHref
+ * @param {string} [entryDir='']
+ * @param {string} [documentUrl='']
+ * @returns {{ effectiveBaseUrl: string, effectiveBaseDir: string, chunkPrefix: string }}
+ */
+export function resolveBaseDetails(baseHref, entryDir = '', documentUrl = '') {
+  const effectiveDocUrl = documentUrl || (entryDir ? pathToFileURL(path.join(entryDir, 'index.html')).href : 'file:///app/index.html');
+  const effectiveEntryDir = entryDir ? path.resolve(entryDir) : fileURLToPath(new URL('./', effectiveDocUrl));
+
+  if (baseHref === null || baseHref === '' || typeof baseHref !== 'string') {
+    return {
+      effectiveBaseUrl: effectiveDocUrl,
+      effectiveBaseDir: effectiveEntryDir,
+      chunkPrefix: './'
+    };
+  }
+
+  const trimmed = baseHref.trim();
+  if (trimmed === '') {
+    return {
+      effectiveBaseUrl: effectiveDocUrl,
+      effectiveBaseDir: effectiveEntryDir,
+      chunkPrefix: './'
+    };
+  }
+
+  // Reject explicit URL schemes (e.g. file:, http:, https:), protocol-relative (//),
+  // and leading slash/backslash before resolving, to strictly support local relative bases.
+  if (
+    trimmed.startsWith('/') ||
+    trimmed.startsWith('\\') ||
+    trimmed.startsWith('//') ||
+    /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(trimmed)
+  ) {
+    throw new Error(
+      `Explicit rejection: <base href="${baseHref}"> is not currently supported in application build emitter to preserve document.baseURI semantics; base href support remains open.`
+    );
+  }
+
+  let resolvedBaseUrl;
+  try {
+    resolvedBaseUrl = new URL(trimmed, effectiveDocUrl);
+  } catch {
+    throw new Error(
+      `Explicit rejection: <base href="${baseHref}"> is not currently supported in application build emitter to preserve document.baseURI semantics; base href support remains open.`
+    );
+  }
+
+  if (resolvedBaseUrl.protocol !== 'file:') {
+    throw new Error(
+      `Explicit rejection: <base href="${baseHref}"> is not currently supported in application build emitter to preserve document.baseURI semantics; base href support remains open.`
+    );
+  }
+
+  const baseDir = fileURLToPath(new URL('./', resolvedBaseUrl));
+  const relFromEntry = path.relative(effectiveEntryDir, baseDir);
+
+  if (relFromEntry === '..' || relFromEntry.startsWith('..' + path.sep) || path.isAbsolute(relFromEntry)) {
+    throw new Error(
+      `Explicit rejection: <base href="${baseHref}"> is not currently supported in application build emitter to preserve document.baseURI semantics; base href support remains open.`
+    );
+  }
+
+  const relFromBase = path.relative(baseDir, effectiveEntryDir).split(path.sep).join('/');
+  let chunkPrefix = './';
+  if (relFromBase && relFromBase !== '.') {
+    chunkPrefix = relFromBase.endsWith('/') ? relFromBase : relFromBase + '/';
+  }
+
+  return {
+    effectiveBaseUrl: resolvedBaseUrl.href,
+    effectiveBaseDir: baseDir,
+    chunkPrefix
+  };
+}
+
+/**
  * Rewrites attributes of an active <script type="module"> tag.
  *
  * Uses an attribute-aware anchored token match consistent with html_parser.mjs:
@@ -516,9 +601,10 @@ export function extractJsModuleDependencies(code, contextUrl = 'script.js') {
  * @param {string} attrString - Raw attribute text between `<script` and `>`
  * @param {string} chunkFileName - Emitted chunk file name to point to
  * @param {string | Buffer} [chunkCode=''] - Emitted chunk content for SRI hashing
+ * @param {string} [chunkPrefix='./'] - Relative directory prefix from base to output root
  * @returns {string}
  */
-export function rewriteScriptTagAttributes(attrString, chunkFileName, chunkCode = '') {
+export function rewriteScriptTagAttributes(attrString, chunkFileName, chunkCode = '', chunkPrefix = './') {
   const attrRegex = /(?:^|\s+)([a-zA-Z0-9_:-]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
 
   let match;
@@ -541,7 +627,7 @@ export function rewriteScriptTagAttributes(attrString, chunkFileName, chunkCode 
 
     if (name === 'src') {
       hasSrc = true;
-      pieces.push(` src="./${chunkFileName}"`);
+      pieces.push(` src="${chunkPrefix}${chunkFileName}"`);
     } else if (name === 'integrity') {
       const newIntegrity = computeIntegrityForContent(val, chunkCode);
       pieces.push(` integrity="${newIntegrity}"`);
@@ -558,7 +644,7 @@ export function rewriteScriptTagAttributes(attrString, chunkFileName, chunkCode 
 
   // Inject src if not previously present (e.g. inline module script)
   if (!hasSrc) {
-    pieces.push(` src="./${chunkFileName}"`);
+    pieces.push(` src="${chunkPrefix}${chunkFileName}"`);
   }
 
   return pieces.join('');
@@ -568,15 +654,16 @@ export function rewriteScriptTagAttributes(attrString, chunkFileName, chunkCode 
 
 /**
  * Rewrites attributes of a <link rel="modulepreload"> tag that matches an emitted chunk.
- * Points href to "./${chunkFileName}" and recomputes SRI integrity honestly while preserving
+ * Points href to "${chunkPrefix}${chunkFileName}" and recomputes SRI integrity honestly while preserving
  * unrelated attributes (e.g. data-href, data-integrity, as, crossorigin).
  *
  * @param {string} attrString
  * @param {string} chunkFileName
  * @param {string | Buffer} [chunkCode='']
+ * @param {string} [chunkPrefix='./']
  * @returns {string}
  */
-export function rewriteLinkTagAttributes(attrString, chunkFileName, chunkCode = '') {
+export function rewriteLinkTagAttributes(attrString, chunkFileName, chunkCode = '', chunkPrefix = './') {
   const attrRegex = /(?:^|\s+)([a-zA-Z0-9_:-]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
   let match;
   let lastIndex = 0;
@@ -595,7 +682,7 @@ export function rewriteLinkTagAttributes(attrString, chunkFileName, chunkCode = 
     lastIndex = attrRegex.lastIndex;
 
     if (name === 'href') {
-      pieces.push(` href="./${chunkFileName}"`);
+      pieces.push(` href="${chunkPrefix}${chunkFileName}"`);
     } else if (name === 'integrity') {
       if (chunkCode) {
         const newIntegrity = computeIntegrityForContent(val, chunkCode);
@@ -622,7 +709,9 @@ export function rewriteLinkTagAttributes(attrString, chunkFileName, chunkCode = 
  *
  * - Uses quote-aware tag regex so attributes containing ">" (e.g. data-selector="div > span")
  *   are never truncated.
- * - Explicitly rejects <base href="..."> input before output to preserve document.baseURI semantics.
+ * - Positively supports local relative <base href="..."> within application root (directories and file-shaped bases),
+ *   rewriting emitted entry chunks and modulepreloads relative to the effective base directory.
+ * - Explicitly rejects remote, root-relative, or escaping bases to preserve document.baseURI semantics.
  * - Rewrites <link rel="modulepreload"> hrefs to emitted chunks and updates SRI integrity.
  * - Enforces entry count equality in both directions.
  *
@@ -632,12 +721,18 @@ export function rewriteLinkTagAttributes(attrString, chunkFileName, chunkCode = 
  * @param {Object} [options={}]
  * @param {Map<string, string>} [options.preloadChunkMap] - Mapping of module URL/path to emitted chunk
  * @param {string} [options.entryDir=''] - Directory of the entry HTML file
+ * @param {string} [options.documentUrl=''] - URL of the entry HTML document
  * @returns {string}
  */
 export function rewriteHtmlForBuild(rawHtmlContent, entryFiles, chunkFilesMap = {}, options = {}) {
   let moduleScriptIndex = 0;
   const preloadChunkMap = options.preloadChunkMap || null;
   const entryDir = options.entryDir || '';
+  const documentUrl = options.documentUrl || (entryDir ? pathToFileURL(path.join(entryDir, 'index.html')).href : 'file:///app/index.html');
+
+  // Discover effective first base href via parseHtmlEntries and validate base containment up front
+  const parsedHtml = parseHtmlEntries(rawHtmlContent, documentUrl);
+  const { effectiveBaseDir, chunkPrefix } = resolveBaseDetails(parsedHtml.baseHref, entryDir, documentUrl);
 
   // Quote-aware tag scanner:
   // Match HTML comments, <script>...</script>, <style>...</style>, <base ...>, or <link ...>
@@ -675,7 +770,8 @@ export function rewriteHtmlForBuild(rawHtmlContent, entryFiles, chunkFilesMap = 
           const updatedAttrString = rewriteScriptTagAttributes(
             scriptAttrs,
             chunkFileName,
-            chunkCode
+            chunkCode,
+            chunkPrefix
           );
 
           return `<script${updatedAttrString}></script>`;
@@ -685,14 +781,8 @@ export function rewriteHtmlForBuild(rawHtmlContent, entryFiles, chunkFilesMap = 
         return match;
       }
 
-      // Handle <base> tags: explicitly reject if href is specified, to preserve document.baseURI semantics
+      // Handle <base> tags: preserved verbatim in emitted HTML to keep document.baseURI semantics
       if (isBase) {
-        const parsedBase = parseTagAttributes(baseAttrs);
-        if (parsedBase.href) {
-          throw new Error(
-            `Explicit rejection: <base href="${parsedBase.href}"> is not currently supported in application build emitter to preserve document.baseURI semantics; base href support remains open.`
-          );
-        }
         return match;
       }
 
@@ -705,10 +795,10 @@ export function rewriteHtmlForBuild(rawHtmlContent, entryFiles, chunkFilesMap = 
           parsedLink.href &&
           preloadChunkMap
         ) {
-          const chunkFileName = findChunkForPreload(parsedLink.href, entryDir, preloadChunkMap);
+          const chunkFileName = findChunkForPreload(parsedLink.href, effectiveBaseDir, preloadChunkMap);
           if (chunkFileName) {
             const chunkCode = chunkFilesMap[chunkFileName] || '';
-            const updatedLink = rewriteLinkTagAttributes(linkAttrs, chunkFileName, chunkCode);
+            const updatedLink = rewriteLinkTagAttributes(linkAttrs, chunkFileName, chunkCode, chunkPrefix);
             return `<link${updatedLink}>`;
           }
         }
@@ -781,15 +871,10 @@ export async function buildApplication(entryPath, outDir, options = {}) {
 
   if (isHtml) {
     const rawHtml = fs.readFileSync(resolvedEntryAbs, 'utf-8');
-    const domHtml = stripScriptAndStyleBodies(rawHtml);
-    const baseMatch = /<base\b((?:[^"'><]+|"[^"]*"|'[^']*')*)>/i.exec(domHtml);
-    if (baseMatch) {
-      const baseAttrs = parseTagAttributes(baseMatch[1]);
-      if (baseAttrs.href) {
-        throw new Error(
-          `Explicit rejection: <base href="${baseAttrs.href}"> is not currently supported in application build emitter to preserve document.baseURI semantics; base href support remains open.`
-        );
-      }
+    const entryBaseUrl = pathToFileURL(resolvedEntryAbs).href;
+    const parsedHtml = parseHtmlEntries(rawHtml, entryBaseUrl);
+    if (parsedHtml.baseHref !== null) {
+      resolveBaseDetails(parsedHtml.baseHref, entryDir, entryBaseUrl);
     }
   }
 
@@ -806,10 +891,11 @@ export async function buildApplication(entryPath, outDir, options = {}) {
     const entryBaseUrl = pathToFileURL(resolvedEntryAbs).href;
     const parsedHtml = parseHtmlEntries(rawHtmlContent, entryBaseUrl);
     const importMap = parsedHtml.importMap;
+    const { effectiveBaseDir } = resolveBaseDetails(parsedHtml.baseHref, entryDir, entryBaseUrl);
 
     // Extract relative assets referenced by the HTML (stylesheets, images, media, non-module scripts)
     // Excludes modulepreloads that map to bundled chunks
-    const relativeAssetUrls = extractRelativeAssetUrls(rawHtmlContent, preloadChunkMap, entryDir, skipModulePreloads);
+    const relativeAssetUrls = extractRelativeAssetUrls(rawHtmlContent, preloadChunkMap, effectiveBaseDir, skipModulePreloads);
 
     // Bounded asset processing queue: handles direct HTML assets, transitive CSS url()/@import children,
     // and literal dynamic imports in retained classic scripts and modules.
@@ -817,7 +903,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
     for (const relUrl of relativeAssetUrls) {
       assetQueue.push({
         relUrl,
-        referrerDir: entryDir,
+        referrerDir: effectiveBaseDir,
         referrerPath: resolvedEntryAbs,
         isModuleSpecifier: false
       });
@@ -835,12 +921,12 @@ export async function buildApplication(entryPath, outDir, options = {}) {
       const scriptBody = inlineMatch[2];
       if (!scriptBody || !scriptBody.trim()) continue;
 
-      const { moduleSpecifiers, assetSpecifiers } = extractJsModuleDependencies(scriptBody, entryBaseUrl);
+      const { moduleSpecifiers, assetSpecifiers } = extractJsModuleDependencies(scriptBody, parsedHtml.baseUrl);
       for (const spec of moduleSpecifiers) {
         assetQueue.push({
           specifier: spec,
-          referrerUrl: entryBaseUrl,
-          referrerDir: entryDir,
+          referrerUrl: parsedHtml.baseUrl,
+          referrerDir: effectiveBaseDir,
           referrerPath: resolvedEntryAbs,
           isModuleSpecifier: true
         });
@@ -848,7 +934,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
       for (const assetSpec of assetSpecifiers) {
         assetQueue.push({
           relUrl: assetSpec,
-          referrerDir: entryDir,
+          referrerDir: effectiveBaseDir,
           referrerPath: resolvedEntryAbs,
           isModuleSpecifier: false
         });
@@ -873,7 +959,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
         let resolvedUrl;
         try {
           resolvedUrl = resolveModuleSpecifier(trimmedSpecifier, item.referrerUrl, importMap, {
-            mapBaseUrl: entryBaseUrl,
+            mapBaseUrl: parsedHtml.baseUrl,
             packageRootUrl: options.packageRootUrl
           });
         } catch (err) {
@@ -1035,11 +1121,12 @@ export async function buildApplication(entryPath, outDir, options = {}) {
     targetFiles.set(fileName, code);
   }
   if (isHtml) {
+    const entryBaseUrl = pathToFileURL(resolvedEntryAbs).href;
     targetFiles.set(htmlFileName, rewriteHtmlForBuild(
       fs.readFileSync(resolvedEntryAbs, 'utf-8'),
       bundleResult.entryFiles,
       bundleResult.files,
-      { preloadChunkMap, entryDir }
+      { preloadChunkMap, entryDir, documentUrl: entryBaseUrl }
     ));
   }
 
