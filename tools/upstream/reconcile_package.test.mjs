@@ -16,6 +16,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
   reconcilePackage,
@@ -25,9 +26,8 @@ import {
   KNOWN_EXPLAINED_ALIASES
 } from './reconcile_package.mjs';
 
-// Base test temp space honoring the global user rule:
-// "Always use /Volumes/USBNVME16TB/temp_agent_space instead of /tmp/ or other default temporary directories"
-const BASE_TEST_TEMP = '/Volumes/USBNVME16TB/temp_agent_space';
+// scratch dirs under os.tmpdir() so tests run on Linux RCH workers (same as 41896c0)
+const BASE_TEST_TEMP = tmpdir();
 
 async function createTestDir(name) {
   const dir = path.join(BASE_TEST_TEMP, `f3d_reconcile_test_${name}_${Date.now()}_${Math.random().toString(36).slice(2)}`);

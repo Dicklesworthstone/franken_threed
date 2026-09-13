@@ -14,10 +14,15 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const REPO_ROOT = path.resolve(__dirname, '../..');
 
 export const PINNED_ORACLE = {
   release_name: 'Three.js r186',
@@ -48,7 +53,7 @@ test('pin definition: source commit and tag-object hash must never be conflated'
 });
 
 test('pin metadata file: validates tracked pin.json', async () => {
-  const pinJsonPath = path.resolve('tools/upstream/pin.json');
+  const pinJsonPath = path.join(REPO_ROOT, 'tools/upstream/pin.json');
 
   let pinData = null;
   try {
@@ -84,7 +89,7 @@ test('pin metadata file: validates tracked pin.json', async () => {
 });
 
 test('pin documentation: validates PIN.md distinguishes commit vs tag hash', async () => {
-  const pinMdPath = path.resolve('tools/upstream/PIN.md');
+  const pinMdPath = path.join(REPO_ROOT, 'tools/upstream/PIN.md');
 
   let pinDoc = null;
   try {
@@ -108,7 +113,7 @@ test('pin documentation: validates PIN.md distinguishes commit vs tag hash', asy
 });
 
 test('required oracle checkout: verifies upstream/three.js git HEAD matches pinned commit', async () => {
-  const checkoutDir = path.resolve('upstream/three.js');
+  const checkoutDir = path.join(REPO_ROOT, 'upstream/three.js');
   const gitDir = path.join(checkoutDir, '.git');
 
   let gitDirExists = false;

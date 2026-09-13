@@ -2,10 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { tmpdir } from 'node:os';
 import { openEvidence, validateEvent } from './evidence.mjs';
 
 test('evidence logger appends conforming events and generates summary', () => {
-  const tempBase = path.join('/Volumes/USBNVME16TB/temp_agent_space', `evidence_test_${Date.now()}_${process.pid}`);
+  const tempBase = path.join(tmpdir(), `evidence_test_${Date.now()}_${process.pid}`);
   const beadKey = '01.8';
   const runId = 'test-run-001';
 
@@ -107,7 +108,7 @@ test('deliberately malformed event missing owner is rejected with descriptive er
     /Missing required field: owner/
   );
 
-  const tempBase = path.join('/Volumes/USBNVME16TB/temp_agent_space', `evidence_err_${Date.now()}_${process.pid}`);
+  const tempBase = path.join(tmpdir(), `evidence_err_${Date.now()}_${process.pid}`);
   const logger = openEvidence('01.8', 'err-run', { baseDir: tempBase });
   assert.throws(
     () => logger.log(malformed),
