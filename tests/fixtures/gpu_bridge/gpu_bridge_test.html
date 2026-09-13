@@ -47,6 +47,7 @@
     import { testDrawParameters } from "./draw_parameters_test.js";
     import { testMeshScene, testVisibleCanvasMeshScene, testMeshDepthScene, testMultiMeshBatchScene } from "./mesh_scene_test.js";
     import { testDepthScene } from "./depth_test.js";
+    import { testBufferCopy } from "./buffer_copy_test.js";
 
     const outputEl = document.getElementById("output");
     const canvas = document.getElementById("canvas");
@@ -1312,6 +1313,7 @@
         logPass("viewport_scissor_rectangles", await testViewportScissor(bridge, buildViewportScissorFn));
         logPass("draw_ranges_and_instances", await testDrawParameters(bridge, wasmExports.f3d_build_draw_parameters_packet));
         logPass("dynamic_mesh_scene", await testMeshScene(bridge, wasmExports));
+        logPass("buffer_copy", await testBufferCopy(bridge, wasmExports.f3d_build_buffer_copy_packet));
 
         const urlParams = new URLSearchParams(window.location.search);
         const requestedLane = urlParams.get("lane") || (urlParams.has("canvas") ? "canvas" : (urlParams.has("depth") ? "depth" : (urlParams.has("mesh_depth") ? "mesh_depth" : "offscreen")));

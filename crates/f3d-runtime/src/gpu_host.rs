@@ -66,7 +66,7 @@ use f3d_core::{
     },
 };
 use f3d_graph::{
-    CanvasEpochTracker, CanvasFormat, CanvasId, DrawKind, ExecutionPlan, LoadOp, PassKind,
+    CanvasEpochTracker, CanvasFormat, CanvasId, CopyCommand, DrawKind, ExecutionPlan, LoadOp, PassKind,
     ResourceAccess, ResourceId, ResourceUse, StoreOp,
 };
 use f3d_math::{Matrix4, Quaternion, Vector3};
@@ -376,6 +376,8 @@ pub const OPCODE_WRITE_TEXTURE: u16 = 17;
 pub const OPCODE_CREATE_PIPELINE_TEXTURED: u16 = 18;
 /// Record repeated draws with distinct dynamic offsets in one render bundle.
 pub const OPCODE_RECORD_BUNDLE_BATCH: u16 = 19;
+/// Opcode for copying raw bytes from one GPU buffer to another.
+pub const OPCODE_COPY_BUFFER_TO_BUFFER: u16 = 20;
 
 /// Sampler filter mode: nearest-neighbor filtering.
 pub const SAMPLER_FILTER_NEAREST: u32 = 0;
@@ -859,6 +861,21 @@ pub enum GpuCommand {
         texture_id: u32,
         sampler_filter: u32,
         address_mode: u32,
+    },
+    /// Command to copy raw bytes from one GPU buffer to another.
+    CopyBufferToBuffer {
+        /// Source buffer identifier.
+        source_buffer_id: u32,
+        /// Byte offset within the source buffer (must be multiple of 4).
+        source_offset: u64,
+        /// Destination buffer identifier.
+        destination_buffer_id: u32,
+        /// Byte offset within the destination buffer (must be multiple of 4).
+        destination_offset: u64,
+        /// Byte size to copy (must be multiple of 4).
+        size: u64,
+        /// Semantic epoch of the source buffer state region.
+        epoch: Epoch,
     },
 }
 
@@ -1416,6 +1433,43 @@ impl GpuSubmissionPacket {
                     command_records.extend_from_slice(&sampler_filter.to_le_bytes());
                     command_records.extend_from_slice(&address_mode.to_le_bytes());
                 }
+                GpuCommand::CopyBufferToBuffer {
+                    source_buffer_id,
+                    source_offset,
+                    destination_buffer_id,
+                    destination_offset,
+                    size,
+                    epoch,
+                } => {
+                    if source_buffer_id == destination_buffer_id {
+                        return Err(PacketEncodeError::InvalidDimensions(
+                            "Source and destination buffer IDs must be distinct".to_string(),
+                        ));
+                    }
+                    if source_offset % 4 != 0 || destination_offset % 4 != 0 || size % 4 != 0 {
+                        return Err(PacketEncodeError::InvalidDimensions(
+                            "Buffer-to-buffer copy offsets and size must be multiples of 4"
+                                .to_string(),
+                        ));
+                    }
+                    source_offset.checked_add(*size).ok_or_else(|| {
+                        PacketEncodeError::InvalidDimensions(
+                            "source offset + size overflow".to_string(),
+                        )
+                    })?;
+                    destination_offset.checked_add(*size).ok_or_else(|| {
+                        PacketEncodeError::InvalidDimensions(
+                            "destination offset + size overflow".to_string(),
+                        )
+                    })?;
+                    command_records.extend_from_slice(&OPCODE_COPY_BUFFER_TO_BUFFER.to_le_bytes());
+                    command_records.extend_from_slice(&source_buffer_id.to_le_bytes());
+                    command_records.extend_from_slice(&source_offset.to_le_bytes());
+                    command_records.extend_from_slice(&destination_buffer_id.to_le_bytes());
+                    command_records.extend_from_slice(&destination_offset.to_le_bytes());
+                    command_records.extend_from_slice(&size.to_le_bytes());
+                    command_records.extend_from_slice(&epoch.get().to_le_bytes());
+                }
             }
         }
 
@@ -1506,6 +1560,11 @@ pub enum PlanLoweringError {
         /// Diagnostic reason describing the unsupported copy operation.
         reason: String,
     },
+    /// Execution plan contains an invalid copy command.
+    InvalidCopyCommand {
+        /// Diagnostic reason describing why the copy command is invalid.
+        reason: String,
+    },
 }
 
 impl core::fmt::Display for PlanLoweringError {
@@ -1563,6 +1622,12 @@ impl core::fmt::Display for PlanLoweringError {
                 write!(
                     f,
                     "Unsupported copy command during bridge lowering: {reason}"
+                )
+            }
+            Self::InvalidCopyCommand { reason } => {
+                write!(
+                    f,
+                    "Invalid copy command during bridge lowering: {reason}"
                 )
             }
         }
@@ -1887,20 +1952,85 @@ pub fn lower_plan(plan: &ExecutionPlan) -> Result<Vec<GpuCommand>, PlanLoweringE
             }
             PassKind::Copy => {
                 for copy in segment.copies() {
-                    if let Some((tex, buf, width, height, _pitch)) = copy.as_texture_to_buffer() {
-                        commands.push(GpuCommand::CopyTextureToBuffer {
-                            texture_id: tex.get(),
-                            buffer_id: buf.get(),
+                    match copy {
+                        CopyCommand::TextureToBuffer {
+                            texture_id,
+                            buffer_id,
                             width,
                             height,
-                            epoch: plan.canvas_epoch().unwrap_or(Epoch::ZERO),
-                        });
-                    } else {
-                        return Err(PlanLoweringError::UnsupportedCopyCommand {
-                            reason: String::from(
-                                "Only TextureToBuffer copy commands are currently supported by bridge lowering",
-                            ),
-                        });
+                            ..
+                        } => {
+                            commands.push(GpuCommand::CopyTextureToBuffer {
+                                texture_id: texture_id.get(),
+                                buffer_id: buffer_id.get(),
+                                width: *width,
+                                height: *height,
+                                epoch: plan.canvas_epoch().unwrap_or(Epoch::ZERO),
+                            });
+                        }
+                        CopyCommand::BufferToBuffer {
+                            src,
+                            src_offset,
+                            dst,
+                            dst_offset,
+                            size,
+                        } => {
+                            if src == dst {
+                                return Err(PlanLoweringError::InvalidCopyCommand {
+                                    reason: format!(
+                                        "Source buffer {} and destination buffer {} must be distinct",
+                                        src.get(),
+                                        dst.get()
+                                    ),
+                                });
+                            }
+                            if src_offset % 4 != 0 {
+                                return Err(PlanLoweringError::InvalidCopyCommand {
+                                    reason: format!(
+                                        "Source offset {src_offset} must be a multiple of 4"
+                                    ),
+                                });
+                            }
+                            if dst_offset % 4 != 0 {
+                                return Err(PlanLoweringError::InvalidCopyCommand {
+                                    reason: format!(
+                                        "Destination offset {dst_offset} must be a multiple of 4"
+                                    ),
+                                });
+                            }
+                            if size % 4 != 0 {
+                                return Err(PlanLoweringError::InvalidCopyCommand {
+                                    reason: format!("Copy size {size} must be a multiple of 4"),
+                                });
+                            }
+                            src_offset.checked_add(*size).ok_or_else(|| {
+                                PlanLoweringError::InvalidCopyCommand {
+                                    reason: format!(
+                                        "Source offset {src_offset} + size {size} overflow"
+                                    ),
+                                }
+                            })?;
+                            dst_offset.checked_add(*size).ok_or_else(|| {
+                                PlanLoweringError::InvalidCopyCommand {
+                                    reason: format!(
+                                        "Destination offset {dst_offset} + size {size} overflow"
+                                    ),
+                                }
+                            })?;
+                            commands.push(GpuCommand::CopyBufferToBuffer {
+                                source_buffer_id: src.get(),
+                                source_offset: *src_offset,
+                                destination_buffer_id: dst.get(),
+                                destination_offset: *dst_offset,
+                                size: *size,
+                                epoch: plan.canvas_epoch().unwrap_or(Epoch::ZERO),
+                            });
+                        }
+                        other => {
+                            return Err(PlanLoweringError::UnsupportedCopyCommand {
+                                reason: format!("Unsupported copy command variant: {other:?}"),
+                            });
+                        }
                     }
                 }
             }
@@ -2369,6 +2499,102 @@ pub fn build_affine_rows_bundle_submission(
     packet.push(GpuCommand::CopyTextureToBuffer {
         texture_id: 10, buffer_id: 20, width, height, epoch: Epoch::ZERO,
     });
+    Ok(packet)
+}
+
+/// Builds a [`GpuSubmissionPacket`] for buffer-to-buffer copy testing and host verification.
+///
+/// Emits:
+/// 1. `CreateBuffer` for source buffer 610 (`COPY_SRC | COPY_DST`) with size `data.len()`.
+/// 2. `WriteBuffer` uploading `data` to buffer 610 at offset 0.
+/// 3. `CreateBuffer` for destination buffer 611 (`MAP_READ | COPY_DST`) with size `data.len()`.
+/// 4. `CopyBufferToBuffer` (opcode 20) copying `size` bytes from `610` at `source_offset`
+///    to `611` at `destination_offset` with `Epoch::ZERO`.
+pub fn build_buffer_copy_submission(
+    data: &[u8],
+    source_offset: u32,
+    destination_offset: u32,
+    size: u32,
+) -> Result<GpuSubmissionPacket, PacketEncodeError> {
+    if data.is_empty() {
+        return Err(PacketEncodeError::InvalidDimensions(
+            "data must be non-empty".to_string(),
+        ));
+    }
+    if data.len() % 4 != 0 {
+        return Err(PacketEncodeError::InvalidDimensions(format!(
+            "data length {} must be a multiple of 4",
+            data.len()
+        )));
+    }
+    let buffer_size = u32::try_from(data.len()).map_err(|_| {
+        PacketEncodeError::InvalidDimensions("data length exceeds u32::MAX".to_string())
+    })?;
+
+    if source_offset % 4 != 0 {
+        return Err(PacketEncodeError::InvalidDimensions(format!(
+            "source_offset {source_offset} must be a multiple of 4"
+        )));
+    }
+    if destination_offset % 4 != 0 {
+        return Err(PacketEncodeError::InvalidDimensions(format!(
+            "destination_offset {destination_offset} must be a multiple of 4"
+        )));
+    }
+    if size % 4 != 0 {
+        return Err(PacketEncodeError::InvalidDimensions(format!(
+            "size {size} must be a multiple of 4"
+        )));
+    }
+
+    let src_end = source_offset.checked_add(size).ok_or_else(|| {
+        PacketEncodeError::InvalidDimensions("source_offset + size overflow".to_string())
+    })?;
+    if src_end > buffer_size {
+        return Err(PacketEncodeError::InvalidDimensions(format!(
+            "source_offset + size ({src_end}) exceeds buffer size ({buffer_size})"
+        )));
+    }
+
+    let dst_end = destination_offset.checked_add(size).ok_or_else(|| {
+        PacketEncodeError::InvalidDimensions("destination_offset + size overflow".to_string())
+    })?;
+    if dst_end > buffer_size {
+        return Err(PacketEncodeError::InvalidDimensions(format!(
+            "destination_offset + size ({dst_end}) exceeds buffer size ({buffer_size})"
+        )));
+    }
+
+    with_global_resource_table(|table| {
+        table.register(610);
+        table.register(611);
+    });
+
+    let mut packet = GpuSubmissionPacket::new();
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: 610,
+        size: buffer_size,
+        usage: BUFFER_USAGE_COPY_SRC | BUFFER_USAGE_COPY_DST,
+    });
+    packet.push(GpuCommand::WriteBuffer {
+        buffer_id: 610,
+        offset: 0,
+        data: data.to_vec(),
+    });
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: 611,
+        size: buffer_size,
+        usage: BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST,
+    });
+    packet.push(GpuCommand::CopyBufferToBuffer {
+        source_buffer_id: 610,
+        source_offset: source_offset as u64,
+        destination_buffer_id: 611,
+        destination_offset: destination_offset as u64,
+        size: size as u64,
+        epoch: Epoch::ZERO,
+    });
+
     Ok(packet)
 }
 
@@ -4171,6 +4397,33 @@ pub fn f3d_build_affine_rows_bundle_packet(
     build_affine_rows_bundle_submission(
         affine_rows, width, height, expected_draws, tail_draws, record_bundle,
     ).and_then(|packet| packet.encode()).map_err(|e| e.to_string())
+}
+
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen]
+/// Encodes a buffer-to-buffer copy submission packet and returns the raw binary bytes.
+pub fn f3d_build_buffer_copy_packet(
+    data: &[u8],
+    source_offset: u32,
+    destination_offset: u32,
+    size: u32,
+) -> Result<Vec<u8>, JsValue> {
+    build_buffer_copy_submission(data, source_offset, destination_offset, size)
+        .and_then(|packet| packet.encode())
+        .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+#[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
+/// Native export for `f3d_build_buffer_copy_packet` for host execution and unit tests.
+pub fn f3d_build_buffer_copy_packet(
+    data: &[u8],
+    source_offset: u32,
+    destination_offset: u32,
+    size: u32,
+) -> Result<Vec<u8>, String> {
+    build_buffer_copy_submission(data, source_offset, destination_offset, size)
+        .and_then(|packet| packet.encode())
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(all(feature = "browser", target_arch = "wasm32"))]
@@ -10022,5 +10275,319 @@ mod tests {
         }
         assert!(build_affine_rows_bundle_submission(&[], 1, 1, 2, 1, false).is_err());
         assert!(build_affine_rows_bundle_submission(&rows[..23], 1, 1, 2, 1, false).is_err());
+    }
+
+    #[test]
+    fn test_opcode20_buffer_to_buffer_wire_encoding() {
+        let mut packet = GpuSubmissionPacket::new();
+        packet.push(GpuCommand::CopyBufferToBuffer {
+            source_buffer_id: 610,
+            source_offset: 16,
+            destination_buffer_id: 611,
+            destination_offset: 32,
+            size: 64,
+            epoch: Epoch::from_words(0x1234_5678, 0x9ABC_DEF0),
+        });
+
+        let encoded = packet.encode().expect("encoding CopyBufferToBuffer must succeed");
+        // Header: 16 bytes (magic 4, ver 2, flags 2, cmd_count 4, data_len 4)
+        assert_eq!(&encoded[0..4], &PACKET_MAGIC);
+        assert_eq!(u16::from_le_bytes(encoded[4..6].try_into().unwrap()), PACKET_VERSION);
+        assert_eq!(u16::from_le_bytes(encoded[6..8].try_into().unwrap()), 0); // flags
+        assert_eq!(u32::from_le_bytes(encoded[8..12].try_into().unwrap()), 1); // cmd_count
+        assert_eq!(u32::from_le_bytes(encoded[12..16].try_into().unwrap()), 0); // data_len
+
+        // Command record: 42 bytes (offset 16..58)
+        assert_eq!(encoded.len(), 58);
+        assert_eq!(u16::from_le_bytes(encoded[16..18].try_into().unwrap()), OPCODE_COPY_BUFFER_TO_BUFFER);
+        assert_eq!(u32::from_le_bytes(encoded[18..22].try_into().unwrap()), 610);
+        assert_eq!(u64::from_le_bytes(encoded[22..30].try_into().unwrap()), 16);
+        assert_eq!(u32::from_le_bytes(encoded[30..34].try_into().unwrap()), 611);
+        assert_eq!(u64::from_le_bytes(encoded[34..42].try_into().unwrap()), 32);
+        assert_eq!(u64::from_le_bytes(encoded[42..50].try_into().unwrap()), 64);
+        let expected_epoch = ((0x1234_5678u64) << 32) | (0x9ABC_DEF0u64);
+        assert_eq!(u64::from_le_bytes(encoded[50..58].try_into().unwrap()), expected_epoch);
+
+        // Zero-size copy is legal when alignment, distinct handles, and bounds are valid
+        let mut zero_copy_packet = GpuSubmissionPacket::new();
+        zero_copy_packet.push(GpuCommand::CopyBufferToBuffer {
+            source_buffer_id: 1,
+            source_offset: 0,
+            destination_buffer_id: 2,
+            destination_offset: 0,
+            size: 0,
+            epoch: Epoch::ZERO,
+        });
+        assert!(zero_copy_packet.encode().is_ok());
+    }
+
+    #[test]
+    fn test_opcode20_buffer_to_buffer_wire_alignment_and_overflow_validation() {
+        // Source and destination buffer IDs must be distinct
+        let mut same_buf = GpuSubmissionPacket::new();
+        same_buf.push(GpuCommand::CopyBufferToBuffer {
+            source_buffer_id: 1,
+            source_offset: 0,
+            destination_buffer_id: 1,
+            destination_offset: 4,
+            size: 4,
+            epoch: Epoch::ZERO,
+        });
+        assert!(matches!(
+            same_buf.encode(),
+            Err(PacketEncodeError::InvalidDimensions(_))
+        ));
+
+        for (src_off, dst_off, size) in [
+            (1, 0, 4),
+            (0, 2, 4),
+            (0, 0, 3),
+            (u64::MAX - 3, 0, 4),
+            (0, u64::MAX - 3, 4),
+            (u64::MAX, 0, 0),
+        ] {
+            let mut packet = GpuSubmissionPacket::new();
+            packet.push(GpuCommand::CopyBufferToBuffer {
+                source_buffer_id: 1,
+                source_offset: src_off,
+                destination_buffer_id: 2,
+                destination_offset: dst_off,
+                size,
+                epoch: Epoch::ZERO,
+            });
+            assert!(
+                matches!(packet.encode(), Err(PacketEncodeError::InvalidDimensions(_))),
+                "expected encode failure for ({src_off}, {dst_off}, {size})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_lower_plan_buffer_to_buffer() {
+        use f3d_graph::{CopyCommand, ExecutionPlan, PassId, PassKind, PlanSegment, ResourceId};
+
+        let copy_seg = PlanSegment {
+            pass_id: PassId::new(1),
+            name: "b2b_copy".to_string(),
+            kind: PassKind::Copy,
+            color_attachments: vec![],
+            depth_stencil_attachment: None,
+            draws: vec![],
+            dispatches: vec![],
+            copies: vec![CopyCommand::BufferToBuffer {
+                src: ResourceId::new(610),
+                src_offset: 1024,
+                dst: ResourceId::new(611),
+                dst_offset: 2048,
+                size: 512,
+            }],
+            versioned_reads: vec![],
+            versioned_writes: vec![],
+        };
+        let plan = ExecutionPlan {
+            segments: vec![copy_seg],
+            canvas_epoch: Some(Epoch::from_words(0, 42)),
+            pass_count: 1,
+            split_count: 0,
+            split_reasons: vec![],
+        };
+
+        let lowered = lower_plan(&plan).expect("lowering valid BufferToBuffer must succeed");
+        assert_eq!(lowered.len(), 1);
+        match &lowered[0] {
+            GpuCommand::CopyBufferToBuffer {
+                source_buffer_id,
+                source_offset,
+                destination_buffer_id,
+                destination_offset,
+                size,
+                epoch,
+            } => {
+                assert_eq!(*source_buffer_id, 610);
+                assert_eq!(*source_offset, 1024u64);
+                assert_eq!(*destination_buffer_id, 611);
+                assert_eq!(*destination_offset, 2048u64);
+                assert_eq!(*size, 512u64);
+                assert_eq!(*epoch, Epoch::from_words(0, 42));
+            }
+            other => panic!("expected CopyBufferToBuffer, got {other:?}"),
+        }
+
+        for (src_off, dst_off, size) in [
+            (1, 0, 4),
+            (0, 2, 4),
+            (0, 0, 3),
+            (u64::MAX - 3, 0, 4),
+            (0, u64::MAX - 3, 4),
+        ] {
+            let invalid_seg = PlanSegment {
+                pass_id: PassId::new(1),
+                name: "invalid_b2b".to_string(),
+                kind: PassKind::Copy,
+                color_attachments: vec![],
+                depth_stencil_attachment: None,
+                draws: vec![],
+                dispatches: vec![],
+                copies: vec![CopyCommand::BufferToBuffer {
+                    src: ResourceId::new(1),
+                    src_offset: src_off,
+                    dst: ResourceId::new(2),
+                    dst_offset: dst_off,
+                    size,
+                }],
+                versioned_reads: vec![],
+                versioned_writes: vec![],
+            };
+            let invalid_plan = ExecutionPlan {
+                segments: vec![invalid_seg],
+                canvas_epoch: None,
+                pass_count: 1,
+                split_count: 0,
+                split_reasons: vec![],
+            };
+            assert!(
+                matches!(lower_plan(&invalid_plan), Err(PlanLoweringError::InvalidCopyCommand { .. })),
+                "expected InvalidCopyCommand for ({src_off}, {dst_off}, {size})"
+            );
+        }
+
+        // Source and destination buffers must be distinct
+        let same_buf_seg = PlanSegment {
+            pass_id: PassId::new(1),
+            name: "same_buf_b2b".to_string(),
+            kind: PassKind::Copy,
+            color_attachments: vec![],
+            depth_stencil_attachment: None,
+            draws: vec![],
+            dispatches: vec![],
+            copies: vec![CopyCommand::BufferToBuffer {
+                src: ResourceId::new(1),
+                src_offset: 0,
+                dst: ResourceId::new(1),
+                dst_offset: 4,
+                size: 4,
+            }],
+            versioned_reads: vec![],
+            versioned_writes: vec![],
+        };
+        let same_buf_plan = ExecutionPlan {
+            segments: vec![same_buf_seg],
+            canvas_epoch: None,
+            pass_count: 1,
+            split_count: 0,
+            split_reasons: vec![],
+        };
+        assert!(matches!(
+            lower_plan(&same_buf_plan),
+            Err(PlanLoweringError::InvalidCopyCommand { .. })
+        ));
+
+        let unsupp_seg = PlanSegment {
+            pass_id: PassId::new(1),
+            name: "unsupp_copy".to_string(),
+            kind: PassKind::Copy,
+            color_attachments: vec![],
+            depth_stencil_attachment: None,
+            draws: vec![],
+            dispatches: vec![],
+            copies: vec![CopyCommand::TextureToTexture {
+                src: ResourceId::new(1),
+                src_mip: 0,
+                src_layer: 0,
+                dst: ResourceId::new(2),
+                dst_mip: 0,
+                dst_layer: 0,
+                extent: [1, 1, 1],
+            }],
+            versioned_reads: vec![],
+            versioned_writes: vec![],
+        };
+        let unsupp_plan = ExecutionPlan {
+            segments: vec![unsupp_seg],
+            canvas_epoch: None,
+            pass_count: 1,
+            split_count: 0,
+            split_reasons: vec![],
+        };
+        assert!(matches!(
+            lower_plan(&unsupp_plan),
+            Err(PlanLoweringError::UnsupportedCopyCommand { .. })
+        ));
+    }
+
+    #[test]
+    fn test_build_buffer_copy_packet_and_exports() {
+        let data = [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        let packet = build_buffer_copy_submission(&data, 0, 4, 8)
+            .expect("build_buffer_copy_submission must succeed");
+        let cmds = packet.commands();
+        assert_eq!(cmds.len(), 4);
+
+        assert_eq!(
+            cmds[0],
+            GpuCommand::CreateBuffer {
+                buffer_id: 610,
+                size: 16,
+                usage: BUFFER_USAGE_COPY_SRC | BUFFER_USAGE_COPY_DST,
+            }
+        );
+
+        match &cmds[1] {
+            GpuCommand::WriteBuffer { buffer_id, offset, data: payload } => {
+                assert_eq!(*buffer_id, 610);
+                assert_eq!(*offset, 0);
+                assert_eq!(payload.as_slice(), &data[..]);
+            }
+            other => panic!("expected WriteBuffer, got {other:?}"),
+        }
+
+        assert_eq!(
+            cmds[2],
+            GpuCommand::CreateBuffer {
+                buffer_id: 611,
+                size: 16,
+                usage: BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST,
+            }
+        );
+
+        assert_eq!(
+            cmds[3],
+            GpuCommand::CopyBufferToBuffer {
+                source_buffer_id: 610,
+                source_offset: 0,
+                destination_buffer_id: 611,
+                destination_offset: 4,
+                size: 8,
+                epoch: Epoch::ZERO,
+            }
+        );
+
+        let encoded = packet.encode().expect("encoding packet must succeed");
+        let exported = f3d_build_buffer_copy_packet(&data, 0, 4, 8).expect("export must succeed");
+        assert_eq!(encoded, exported);
+
+        // Zero-size copy is legal when alignment, distinct handles, and bounds are valid
+        assert!(build_buffer_copy_submission(&data, 0, 0, 0).is_ok());
+
+        for (slice, src_off, dst_off, size) in [
+            (&[][..], 0, 0, 0),
+            (&[1, 2, 3][..], 0, 0, 0),
+            (&data[..], 1, 0, 4),
+            (&data[..], 0, 2, 4),
+            (&data[..], 0, 0, 3),
+            (&data[..], 12, 0, 8),
+            (&data[..], 0, 12, 8),
+            (&data[..], u32::MAX - 3, 0, 4),
+            (&data[..], 0, u32::MAX - 3, 4),
+        ] {
+            assert!(
+                matches!(
+                    build_buffer_copy_submission(slice, src_off, dst_off, size),
+                    Err(PacketEncodeError::InvalidDimensions(_))
+                ),
+                "expected InvalidDimensions for len={}, src_off={src_off}, dst_off={dst_off}, size={size}",
+                slice.len()
+            );
+        }
     }
 }

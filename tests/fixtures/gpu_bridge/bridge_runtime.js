@@ -31,6 +31,7 @@ export const OPCODE_CREATE_PIPELINE_DEPTH_CULL_COLOR = 16;
 export const OPCODE_WRITE_TEXTURE = 17;
 export const OPCODE_CREATE_PIPELINE_TEXTURED = 18;
 export const OPCODE_RECORD_BUNDLE_BATCH = 19;
+export const OPCODE_COPY_BUFFER_TO_BUFFER = 20;
 
 export const SAMPLER_FILTER_NEAREST = 0;
 export const SAMPLER_FILTER_LINEAR = 1;
@@ -1467,6 +1468,98 @@ export class WebGpuBridgeHost {
             break;
           }
 
+          case OPCODE_COPY_BUFFER_TO_BUFFER: {
+            closeActivePass();
+            if (cursor + 40 > dataBlockStart) {
+              throw new Error(`Truncated COPY_BUFFER_TO_BUFFER fields at command ${i}`);
+            }
+
+            const MAX_SAFE_INTEGER_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
+
+            const sourceBufferId = dataView.getUint32(cursor, true);
+            const srcOffsetBig = dataView.getBigUint64(cursor + 4, true);
+            const destinationBufferId = dataView.getUint32(cursor + 12, true);
+            const dstOffsetBig = dataView.getBigUint64(cursor + 16, true);
+            const sizeBig = dataView.getBigUint64(cursor + 24, true);
+            const epochLo = dataView.getUint32(cursor + 32, true);
+            const epochHi = dataView.getUint32(cursor + 36, true);
+            cursor += 40;
+
+            if (srcOffsetBig > MAX_SAFE_INTEGER_BIGINT) {
+              throw new Error(`CopyBufferToBuffer: source_offset ${srcOffsetBig} exceeds Number.MAX_SAFE_INTEGER`);
+            }
+            if (dstOffsetBig > MAX_SAFE_INTEGER_BIGINT) {
+              throw new Error(`CopyBufferToBuffer: destination_offset ${dstOffsetBig} exceeds Number.MAX_SAFE_INTEGER`);
+            }
+            if (sizeBig > MAX_SAFE_INTEGER_BIGINT) {
+              throw new Error(`CopyBufferToBuffer: size ${sizeBig} exceeds Number.MAX_SAFE_INTEGER`);
+            }
+
+            const sourceOffset = Number(srcOffsetBig);
+            const destinationOffset = Number(dstOffsetBig);
+            const size = Number(sizeBig);
+
+            if (sourceOffset % 4 !== 0) {
+              throw new Error(`CopyBufferToBuffer: source_offset (${sourceOffset}) must be a multiple of 4`);
+            }
+            if (destinationOffset % 4 !== 0) {
+              throw new Error(`CopyBufferToBuffer: destination_offset (${destinationOffset}) must be a multiple of 4`);
+            }
+            if (size % 4 !== 0) {
+              throw new Error(`CopyBufferToBuffer: size (${size}) must be a multiple of 4`);
+            }
+
+            if (srcOffsetBig + sizeBig > MAX_SAFE_INTEGER_BIGINT || !Number.isSafeInteger(sourceOffset + size)) {
+              throw new Error(`CopyBufferToBuffer: source range calculation overflows safe integer bounds`);
+            }
+            if (dstOffsetBig + sizeBig > MAX_SAFE_INTEGER_BIGINT || !Number.isSafeInteger(destinationOffset + size)) {
+              throw new Error(`CopyBufferToBuffer: destination range calculation overflows safe integer bounds`);
+            }
+
+            const srcBuffer = this.buffers.get(sourceBufferId);
+            if (!srcBuffer) {
+              throw new Error(`CopyBufferToBuffer: unknown source bufferId ${sourceBufferId}`);
+            }
+            const dstBuffer = this.buffers.get(destinationBufferId);
+            if (!dstBuffer) {
+              throw new Error(`CopyBufferToBuffer: unknown destination bufferId ${destinationBufferId}`);
+            }
+
+            const COPY_SRC = (typeof GPUBufferUsage !== "undefined" && GPUBufferUsage.COPY_SRC) ? GPUBufferUsage.COPY_SRC : 0x0004;
+            const COPY_DST = (typeof GPUBufferUsage !== "undefined" && GPUBufferUsage.COPY_DST) ? GPUBufferUsage.COPY_DST : 0x0008;
+
+            if ((srcBuffer.usage & COPY_SRC) === 0) {
+              throw new Error(`CopyBufferToBuffer: source buffer ${sourceBufferId} lacks COPY_SRC usage (usage: 0x${srcBuffer.usage.toString(16)})`);
+            }
+            if ((dstBuffer.usage & COPY_DST) === 0) {
+              throw new Error(`CopyBufferToBuffer: destination buffer ${destinationBufferId} lacks COPY_DST usage (usage: 0x${dstBuffer.usage.toString(16)})`);
+            }
+
+            if (sourceOffset + size > srcBuffer.size) {
+              throw new Error(`CopyBufferToBuffer: source range out of bounds (offset ${sourceOffset} + size ${size} = ${sourceOffset + size} > buffer size ${srcBuffer.size})`);
+            }
+            if (destinationOffset + size > dstBuffer.size) {
+              throw new Error(`CopyBufferToBuffer: destination range out of bounds (offset ${destinationOffset} + size ${size} = ${destinationOffset + size} > buffer size ${dstBuffer.size})`);
+            }
+
+            if (srcBuffer === dstBuffer || sourceBufferId === destinationBufferId) {
+              throw new Error(
+                `CopyBufferToBuffer: source and destination buffers must be distinct objects (source: ${sourceBufferId}, destination: ${destinationBufferId})`
+              );
+            }
+
+            this.bufferEpochs.set(destinationBufferId, { epochHi, epochLo });
+
+            commandEncoder.copyBufferToBuffer(
+              srcBuffer,
+              sourceOffset,
+              dstBuffer,
+              destinationOffset,
+              size
+            );
+            break;
+          }
+
           case OPCODE_RECORD_BUNDLE:
           case OPCODE_RECORD_BUNDLE_BATCH: {
             closeActivePass();
@@ -1654,6 +1747,8 @@ export class WebGpuBridgeHost {
                   scanCursor += 28;
                 } else if (nextOp === OPCODE_RECORD_BUNDLE_BATCH) {
                   scanCursor += 36;
+                } else if (nextOp === OPCODE_COPY_BUFFER_TO_BUFFER) {
+                  scanCursor += 40;
                 } else if (nextOp === OPCODE_SET_VIEWPORT) {
                   scanCursor += 24;
                 } else if (nextOp === OPCODE_SET_SCISSOR_RECT) {
