@@ -2,6 +2,7 @@
 
 use core::fmt;
 use crate::box3::Box3;
+use crate::jsnum::js_max;
 use crate::matrix4::Matrix4;
 use crate::plane::Plane;
 use crate::vector3::Vector3;
@@ -82,7 +83,7 @@ impl Sphere {
 
         let mut max_radius_sq = 0.0f64;
         for p in points {
-            max_radius_sq = max_radius_sq.max(self.center.distance_to_squared(p));
+            max_radius_sq = js_max(max_radius_sq, self.center.distance_to_squared(p));
         }
 
         self.radius = max_radius_sq.sqrt();

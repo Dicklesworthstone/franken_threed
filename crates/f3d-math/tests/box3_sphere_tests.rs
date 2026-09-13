@@ -238,6 +238,40 @@ fn test_sphere_empty_convention_and_set_from_points() {
 }
 
 #[test]
+fn test_sphere_set_from_points_propagates_nan_radius() {
+    // Pinned r186 Math.max preserves a NaN distance regardless of point order.
+    let nan_point = Vector3::new(f64::NAN, 2.0, 3.0);
+    let finite_point = Vector3::new(3.0, 4.0, 5.0);
+    let center = Vector3::new(1.0, 1.0, 1.0);
+    for points in [[nan_point, finite_point], [finite_point, nan_point]] {
+        for optional_center in [None, Some(center)] {
+            let mut sphere = Sphere::empty();
+            sphere.set_from_points(&points, optional_center);
+            assert!(sphere.radius.is_nan(), "NaN point must propagate with center {optional_center:?}");
+            if optional_center.is_some() {
+                assert_eq!(sphere.center, center);
+            } else {
+                assert!(sphere.center.x.is_nan());
+                assert_eq!(sphere.center.y, 3.0);
+                assert_eq!(sphere.center.z, 4.0);
+            }
+        }
+    }
+
+    let nan_center = Vector3::new(f64::NAN, 1.0, 1.0);
+    let mut sphere = Sphere::empty();
+    sphere.set_from_points(&[finite_point], Some(nan_center));
+    assert!(sphere.radius.is_nan(), "NaN optional center makes the finite point's distance NaN");
+    assert!(sphere.center.x.is_nan());
+    assert_eq!(sphere.center.y, 1.0);
+    assert_eq!(sphere.center.z, 1.0);
+
+    // With no points, upstream never evaluates a distance and keeps radius zero.
+    sphere.set_from_points(&[], Some(nan_center));
+    assert_eq!(sphere.radius, 0.0);
+}
+
+#[test]
 fn test_sphere_contains_distance_clamp_and_bounding_box() {
     let s = Sphere::new(Vector3::new(0.0, 0.0, 0.0), 5.0);
 
