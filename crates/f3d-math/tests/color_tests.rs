@@ -858,3 +858,102 @@ fn test_color_nan_propagation_matching_upstream_node_oracle() {
     assert_eq!(c5.b, 1.0);
 }
 
+// ============================================================================
+// 15. Functional Style Parsing: Overflow Clamping and Leading Zeros Parity
+// ============================================================================
+
+#[test]
+fn test_style_parsing_channel_overflow_and_leading_zeros_matching_upstream() {
+    let mut c = Color::black();
+
+    // 1. Huge integer channel overflow (u32 overflow: 4294967296 = 2^32) clamps to 255 (1.0)
+    assert_eq!(c.set_style_srgb("rgb(4294967296, 0, 0)"), StyleOutcome::Applied);
+    assert_eq!(c.get_hex_srgb(), 0xFF0000);
+    assert_eq!(c.r, 1.0);
+    assert_eq!(c.g, 0.0);
+    assert_eq!(c.b, 0.0);
+
+    assert_eq!(c.set_style_srgb("rgb(0, 4294967296, 0)"), StyleOutcome::Applied);
+    assert_eq!(c.get_hex_srgb(), 0x00FF00);
+    assert_eq!(c.r, 0.0);
+    assert_eq!(c.g, 1.0);
+    assert_eq!(c.b, 0.0);
+
+    assert_eq!(c.set_style_srgb("rgb(0, 0, 4294967296)"), StyleOutcome::Applied);
+    assert_eq!(c.get_hex_srgb(), 0x0000FF);
+    assert_eq!(c.r, 0.0);
+    assert_eq!(c.g, 0.0);
+    assert_eq!(c.b, 1.0);
+
+    // 2. Huge percentage channel overflow clamps to 100% (1.0)
+    assert_eq!(c.set_style_srgb("rgb(4294967296%, 0%, 0%)"), StyleOutcome::Applied);
+    assert_eq!(c.get_hex_srgb(), 0xFF0000);
+    assert_eq!(c.r, 1.0);
+    assert_eq!(c.g, 0.0);
+    assert_eq!(c.b, 0.0);
+
+    assert_eq!(c.set_style_srgb("rgb(0%, 4294967296%, 0%)"), StyleOutcome::Applied);
+    assert_eq!(c.get_hex_srgb(), 0x00FF00);
+    assert_eq!(c.r, 0.0);
+    assert_eq!(c.g, 1.0);
+    assert_eq!(c.b, 0.0);
+
+    assert_eq!(c.set_style_srgb("rgb(0%, 0%, 4294967296%)"), StyleOutcome::Applied);
+    assert_eq!(c.get_hex_srgb(), 0x0000FF);
+    assert_eq!(c.r, 0.0);
+    assert_eq!(c.g, 0.0);
+    assert_eq!(c.b, 1.0);
+
+    // 3. Very long digit string (400 digits of 9) clamps to 1.0 (red)
+    let nines400 = "9".repeat(400);
+    let nines_str = format!("rgb({}, 0, 0)", nines400);
+    assert_eq!(c.set_style_srgb(&nines_str), StyleOutcome::Applied);
+    assert_eq!(c.get_hex_srgb(), 0xFF0000);
+    assert_eq!(c.r, 1.0);
+    assert_eq!(c.g, 0.0);
+    assert_eq!(c.b, 0.0);
+
+    // 4. Arbitrarily many leading zeros then 1: evaluates to 1/255 channel value
+    // In sRGB, channel 1/255 converts to linear working space r = 0.00030352698352941176
+    let zeros50 = "0".repeat(50);
+    let leading_zeros_one = format!("rgb({}1, 0, 0)", zeros50);
+    assert_eq!(c.set_style_srgb(&leading_zeros_one), StyleOutcome::Applied);
+    assert_eq!(c.get_hex_srgb(), 0x010000);
+    assert_eq!(c.r, 0.00030352698352941176);
+    assert_eq!(c.g, 0.0);
+    assert_eq!(c.b, 0.0);
+
+    // 5. Arbitrarily many leading zeros with value 0: evaluates to 0.0
+    let leading_zeros_zero = format!("rgb({}, 0, 0)", zeros50);
+    assert_eq!(c.set_style_srgb(&leading_zeros_zero), StyleOutcome::Applied);
+    assert_eq!(c.get_hex_srgb(), 0x000000);
+    assert_eq!(c.r, 0.0);
+    assert_eq!(c.g, 0.0);
+    assert_eq!(c.b, 0.0);
+
+    // 6. Alpha handling on huge values: retains AlphaIgnored when alpha < 1.0, Applied when alpha == 1.0
+    assert_eq!(c.set_style_srgb("rgba(4294967296, 0, 0, 0.5)"), StyleOutcome::AlphaIgnored);
+    assert_eq!(c.get_hex_srgb(), 0xFF0000);
+
+    assert_eq!(c.set_style_srgb("rgba(4294967296, 0, 0, 1.0)"), StyleOutcome::Applied);
+    assert_eq!(c.get_hex_srgb(), 0xFF0000);
+
+    assert_eq!(c.set_style_srgb("rgba(4294967296%, 0%, 0%, 0.5)"), StyleOutcome::AlphaIgnored);
+    assert_eq!(c.get_hex_srgb(), 0xFF0000);
+
+    assert_eq!(c.set_style_srgb("rgba(4294967296%, 0%, 0%, 1.0)"), StyleOutcome::Applied);
+    assert_eq!(c.get_hex_srgb(), 0xFF0000);
+
+    // 7. Retain invalid syntax semantics: unchanged color, IgnoredInvalid outcome
+    let sentinel = Color::new(0.1, 0.2, 0.3);
+    let mut test_c = sentinel;
+    assert_eq!(test_c.set_style_srgb("rgb(255.5, 0, 0)"), StyleOutcome::IgnoredInvalid);
+    assert_eq!(test_c, sentinel);
+
+    assert_eq!(test_c.set_style_srgb("rgb(50.5%, 0%, 0%)"), StyleOutcome::IgnoredInvalid);
+    assert_eq!(test_c, sentinel);
+
+    assert_eq!(test_c.set_style_srgb("rgb(-10, 0, 0)"), StyleOutcome::IgnoredInvalid);
+    assert_eq!(test_c, sentinel);
+}
+

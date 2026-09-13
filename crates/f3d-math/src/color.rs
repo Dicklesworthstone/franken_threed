@@ -1035,6 +1035,17 @@ impl Color {
         // Case-sensitive function name matching: Color.js switch (name)
         match name {
             "rgb" | "rgba" => {
+                let parse_channel = |s: &str| -> u32 {
+                    let trimmed = s.trim_start_matches('0');
+                    if trimmed.is_empty() {
+                        0
+                    } else if trimmed.len() > 10 {
+                        u32::MAX
+                    } else {
+                        u32::from_str_radix(trimmed, 10).unwrap_or(u32::MAX)
+                    }
+                };
+
                 // Check integer form: /^\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*(\d*\.?\d+)\s*)?$/
                 let p0 = parts[0];
                 let p1 = parts[1];
@@ -1056,9 +1067,9 @@ impl Color {
                         }
                     }
 
-                    let r_int = u32::from_str_radix(p0, 10).unwrap_or(0);
-                    let g_int = u32::from_str_radix(p1, 10).unwrap_or(0);
-                    let b_int = u32::from_str_radix(p2, 10).unwrap_or(0);
+                    let r_int = parse_channel(p0);
+                    let g_int = parse_channel(p1);
+                    let b_int = parse_channel(p2);
 
                     let r = r_int.min(255) as f64 / 255.0;
                     let g = g_int.min(255) as f64 / 255.0;
@@ -1090,9 +1101,9 @@ impl Color {
                             }
                         }
 
-                        let r_int = u32::from_str_radix(s0, 10).unwrap_or(0);
-                        let g_int = u32::from_str_radix(s1, 10).unwrap_or(0);
-                        let b_int = u32::from_str_radix(s2, 10).unwrap_or(0);
+                        let r_int = parse_channel(s0);
+                        let g_int = parse_channel(s1);
+                        let b_int = parse_channel(s2);
 
                         let r = r_int.min(100) as f64 / 100.0;
                         let g = g_int.min(100) as f64 / 100.0;
