@@ -46,6 +46,7 @@ pub use gpu_host::{
 pub use gpu_host::{
     build_affine_rows_batch_frame_submission, build_affine_rows_batch_submission,
     f3d_build_affine_rows_batch_frame_packet, f3d_build_affine_rows_batch_packet,
+    f3d_build_affine_rows_bundle_packet,
     f3d_pack_affine_rows_bytes, pack_affine_rows_uniform_bytes,
     CULL_MODE_BACK, CULL_MODE_FRONT, CULL_MODE_NONE, FRONT_FACE_CCW, FRONT_FACE_CW,
     OPCODE_CREATE_PIPELINE_CULL, OPCODE_CREATE_PIPELINE_DEPTH_CULL,

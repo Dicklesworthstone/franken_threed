@@ -30,6 +30,7 @@ export const OPCODE_CREATE_PIPELINE_DEPTH_CULL = 15;
 export const OPCODE_CREATE_PIPELINE_DEPTH_CULL_COLOR = 16;
 export const OPCODE_WRITE_TEXTURE = 17;
 export const OPCODE_CREATE_PIPELINE_TEXTURED = 18;
+export const OPCODE_RECORD_BUNDLE_BATCH = 19;
 
 export const SAMPLER_FILTER_NEAREST = 0;
 export const SAMPLER_FILTER_LINEAR = 1;
@@ -418,6 +419,9 @@ export class WebGpuBridgeHost {
         vertexBufferId: null,
         boundPipelineId: null,
       };
+      // Per-executePacket bind-group cache keyed by pipelineRecord -> (GPUBuffer | null) -> GPUBindGroup.
+      // Descriptors use buffer offset 0 with dynamicOffset supplied at setBindGroup time.
+      const packetBindGroups = new Map();
 
       const getCanvasView = () => {
         if (!frameCanvasView && canvasContext) {
@@ -1143,37 +1147,52 @@ export class WebGpuBridgeHost {
                   ? (passState.uniformBufferId !== uniformBufferId || passState.dynamicOffset !== dynamicOffset || passState.boundPipelineId !== pipelineId)
                   : (passState.boundPipelineId !== pipelineId);
                 if (needsRebind) {
-                  const bindGroupEntries = [];
+                  let uniformBuf = null;
                   if (hasUniform) {
-                    const uniformBuf = this.buffers.get(uniformBufferId);
+                    uniformBuf = this.buffers.get(uniformBufferId);
                     if (!uniformBuf) {
                       throw new Error(`RenderPass: uniform buffer ${uniformBufferId} missing for pipeline`);
                     }
-                    bindGroupEntries.push({
-                      binding: 0,
-                      resource: {
-                        buffer: uniformBuf,
-                        offset: 0,
-                        size: pipelineRecord.uniformSize || 48,
-                      },
+                  }
+
+                  let pipelineBindGroups = packetBindGroups.get(pipelineRecord);
+                  if (!pipelineBindGroups) {
+                    pipelineBindGroups = new Map();
+                    packetBindGroups.set(pipelineRecord, pipelineBindGroups);
+                  }
+
+                  let bindGroup = pipelineBindGroups.get(uniformBuf);
+                  if (!bindGroup) {
+                    const bindGroupEntries = [];
+                    if (hasUniform) {
+                      bindGroupEntries.push({
+                        binding: 0,
+                        resource: {
+                          buffer: uniformBuf,
+                          offset: 0,
+                          size: pipelineRecord.uniformSize || 48,
+                        },
+                      });
+                    }
+                    if (isTextured) {
+                      bindGroupEntries.push(
+                        {
+                          binding: 1,
+                          resource: pipelineRecord.textureView || pipelineRecord.texture.createView(),
+                        },
+                        {
+                          binding: 2,
+                          resource: pipelineRecord.sampler,
+                        }
+                      );
+                    }
+                    bindGroup = this.device.createBindGroup({
+                      layout: pipelineRecord.bindGroupLayout,
+                      entries: bindGroupEntries,
                     });
+                    pipelineBindGroups.set(uniformBuf, bindGroup);
                   }
-                  if (isTextured) {
-                    bindGroupEntries.push(
-                      {
-                        binding: 1,
-                        resource: pipelineRecord.textureView || pipelineRecord.texture.createView(),
-                      },
-                      {
-                        binding: 2,
-                        resource: pipelineRecord.sampler,
-                      }
-                    );
-                  }
-                  const bindGroup = this.device.createBindGroup({
-                    layout: pipelineRecord.bindGroupLayout,
-                    entries: bindGroupEntries,
-                  });
+
                   if (hasUniform) {
                     currentPassEncoder.setBindGroup(0, bindGroup, [dynamicOffset]);
                     passState.uniformBufferId = uniformBufferId;
@@ -1448,9 +1467,12 @@ export class WebGpuBridgeHost {
             break;
           }
 
-          case OPCODE_RECORD_BUNDLE: {
+          case OPCODE_RECORD_BUNDLE:
+          case OPCODE_RECORD_BUNDLE_BATCH: {
             closeActivePass();
-            if (cursor + 28 > dataBlockStart) {
+            const isBatch = opcode === OPCODE_RECORD_BUNDLE_BATCH;
+            const fieldBytes = isBatch ? 36 : 28;
+            if (cursor + fieldBytes > dataBlockStart) {
               throw new Error(`Truncated RECORD_BUNDLE fields at command ${i}`);
             }
             const bundleId = dataView.getUint32(cursor, true);
@@ -1460,7 +1482,13 @@ export class WebGpuBridgeHost {
             const dynamicOffset = dataView.getUint32(cursor + 16, true);
             const uniformBufferId = dataView.getUint32(cursor + 20, true) || 1;
             const targetFormatCode = dataView.getUint32(cursor + 24, true);
-            cursor += 28;
+            const drawCount = isBatch ? dataView.getUint32(cursor + 28, true) : 1;
+            const offsetStride = isBatch ? dataView.getUint32(cursor + 32, true) : 0;
+            cursor += fieldBytes;
+            const lastOffset = drawCount === 0 ? dynamicOffset : dynamicOffset + (drawCount - 1) * offsetStride;
+            if (drawCount > 0 && (!Number.isSafeInteger(lastOffset) || lastOffset > 0xffffffff)) {
+              throw new Error("RecordBundleBatch: dynamic offset overflow");
+            }
 
             let format;
             if (targetFormatCode === 0) {
@@ -1480,6 +1508,17 @@ export class WebGpuBridgeHost {
             if (pipelineRecord.hasDepth) {
               throw new Error("RecordBundle: bundles with depth attachments are not yet implemented");
             }
+            const uniformBuf = pipelineRecord.hasUniformBuffer ? this.buffers.get(uniformBufferId) : null;
+            if (pipelineRecord.hasUniformBuffer && !uniformBuf) {
+              throw new Error(`RecordBundle: uniform buffer ${uniformBufferId} missing for pipeline`);
+            }
+            if (isBatch && pipelineRecord.hasUniformBuffer && drawCount > 0) {
+              const alignment = this.device.limits.minUniformBufferOffsetAlignment;
+              if (dynamicOffset % alignment !== 0 || (drawCount > 1 && offsetStride % alignment !== 0) ||
+                  lastOffset + (pipelineRecord.uniformSize || 48) > uniformBuf.size) {
+                throw new Error("RecordBundleBatch: uniform offsets exceed buffer bounds or device alignment");
+              }
+            }
 
             const bundleEncoder = this.device.createRenderBundleEncoder({
               colorFormats: [format],
@@ -1489,13 +1528,10 @@ export class WebGpuBridgeHost {
 
             const hasUniform = pipelineRecord.hasUniformBuffer;
             const isTextured = Boolean(pipelineRecord.isTextured || (pipelineRecord.texture && pipelineRecord.sampler));
+            let bindGroup = null;
             if (hasUniform || isTextured) {
               const bindGroupEntries = [];
               if (hasUniform) {
-                const uniformBuf = this.buffers.get(uniformBufferId);
-                if (!uniformBuf) {
-                  throw new Error(`RecordBundle: uniform buffer ${uniformBufferId} missing for pipeline`);
-                }
                 bindGroupEntries.push({
                   binding: 0,
                   resource: {
@@ -1517,12 +1553,12 @@ export class WebGpuBridgeHost {
                   }
                 );
               }
-              const bindGroup = this.device.createBindGroup({
+              bindGroup = this.device.createBindGroup({
                 layout: pipelineRecord.bindGroupLayout,
                 entries: bindGroupEntries,
               });
               if (hasUniform) {
-                bundleEncoder.setBindGroup(0, bindGroup, [dynamicOffset]);
+                if (drawCount > 0) bundleEncoder.setBindGroup(0, bindGroup, [dynamicOffset]);
               } else {
                 bundleEncoder.setBindGroup(0, bindGroup);
               }
@@ -1536,8 +1572,11 @@ export class WebGpuBridgeHost {
               bundleEncoder.setVertexBuffer(0, vb);
             }
 
-            if (vertexCount > 0) {
-              bundleEncoder.draw(vertexCount, 1, 0, 0);
+            for (let draw = 0; draw < drawCount; draw++) {
+              if (draw > 0 && hasUniform) {
+                bundleEncoder.setBindGroup(0, bindGroup, [dynamicOffset + draw * offsetStride]);
+              }
+              if (vertexCount > 0) bundleEncoder.draw(vertexCount, 1, 0, 0);
             }
 
             const bundle = bundleEncoder.finish();
@@ -1613,6 +1652,8 @@ export class WebGpuBridgeHost {
                   scanCursor += 24;
                 } else if (nextOp === OPCODE_RECORD_BUNDLE) {
                   scanCursor += 28;
+                } else if (nextOp === OPCODE_RECORD_BUNDLE_BATCH) {
+                  scanCursor += 36;
                 } else if (nextOp === OPCODE_SET_VIEWPORT) {
                   scanCursor += 24;
                 } else if (nextOp === OPCODE_SET_SCISSOR_RECT) {

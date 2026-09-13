@@ -918,6 +918,9 @@
         // - Initial setup + 8 frames with alternating small x translation (vary actual data)
         // - Common two-frame credit loop for all variants (max in-flight <= 2)
         // - Bulk combines executePacket error-scope completion with queue.onSubmittedWorkDone
+        // - Direct/chatty/generated wrapped in withErrorScopes assigning donePromise; combined outside
+        // - Runners destroyed in finally after pending work settles, including on failure
+        // - Explicit bulk initialization once before repeated loop (outside timing)
         // - Texture->readback copy per frame; map only after drain
         // - Validates initial and final pixels vs direct reference and asserts final changed
         // - Labeled debug repeated-frame with raw measurements; no winner/speedup/coldstart claims
@@ -930,6 +933,13 @@
         let deviceLost = false;
         bridge.device.lost.then(() => { deviceLost = true; });
 
+        // Explicit bulk initialization once before repeated loop (outside timing)
+        const initBulkPacket = wasmExports.f3d_build_affine_rows_batch_packet(sharedRows, batchWidth, batchHeight);
+        if (!(initBulkPacket instanceof Uint8Array) || initBulkPacket.byteLength === 0) {
+          throw new Error("Failed to generate initial bulk packet");
+        }
+        await bridge.executePacket(initBulkPacket);
+
         const repeatedFrames = [];
         for (let f = 0; f < 8; f++) {
           const fRows = new Float32Array(sharedRows);
@@ -941,7 +951,9 @@
         }
 
         function comparePixels(a, b) {
-          if (a.byteLength !== b.byteLength) return -1;
+          if (!a || !b || a.byteLength !== b.byteLength) {
+            throw new Error(`Pixel buffer length mismatch: ${a?.byteLength} vs ${b?.byteLength}`);
+          }
           let diffs = 0;
           for (let i = 0; i < a.byteLength; i++) {
             if (a[i] !== b[i]) diffs++;
@@ -951,113 +963,302 @@
 
         async function runTwoCreditFrameLoop(name, runner, frames) {
           if (deviceLost) throw new Error(`Device lost before ${name}`);
+
           const initPromise = runner.submit(sharedRows);
           await initPromise;
           const initialPixels = await runner.readback();
 
-          const inFlight = new Set();
+          const inFlight = [];
+          let maxInFlightObserved = 0;
           let completedCount = 0;
+          let firstError = null;
           let cpuDurationMs = 0;
+          let bindGroupCreations = 0;
+          let bundleRecordings = 0;
+          const createBindGroup = bridge.device.createBindGroup;
+          const createRenderBundleEncoder = bridge.device.createRenderBundleEncoder;
+          bridge.device.createBindGroup = function (descriptor) {
+            bindGroupCreations++;
+            return createBindGroup.call(this, descriptor);
+          };
+          bridge.device.createRenderBundleEncoder = function (descriptor) {
+            bundleRecordings++;
+            return createRenderBundleEncoder.call(this, descriptor);
+          };
           const tStart = performance.now();
 
-          for (let i = 0; i < frames.length; i++) {
-            if (deviceLost) throw new Error(`Device lost during ${name} frame ${i}`);
-            if (inFlight.size >= 2) {
-              const finished = await Promise.race(inFlight);
-              inFlight.delete(finished);
-              completedCount++;
+          try {
+            for (let i = 0; i < frames.length; i++) {
+              if (deviceLost && !firstError) firstError = new Error(`Device lost during ${name} frame ${i}`);
+              if (firstError) break;
+
+              if (inFlight.length >= 2) {
+                await inFlight.shift();
+                if (deviceLost && !firstError) firstError = new Error(`Device lost during ${name} frame ${i}`);
+                if (firstError) break;
+              }
+
+              if (inFlight.length + 1 > maxInFlightObserved) {
+                maxInFlightObserved = inFlight.length + 1;
+              }
+
+              const cpuT0 = performance.now();
+              let framePromise;
+              try {
+                framePromise = runner.submit(frames[i]);
+              } catch (submitErr) {
+                if (!firstError) firstError = submitErr;
+                break;
+              }
+              cpuDurationMs += (performance.now() - cpuT0);
+
+              const tracked = framePromise.then(
+                () => {
+                  completedCount++;
+                },
+                (err) => {
+                  if (!firstError) firstError = err;
+                }
+              );
+              inFlight.push(tracked);
             }
-            const cpuT0 = performance.now();
-            const framePromise = runner.submit(frames[i]);
-            cpuDurationMs += (performance.now() - cpuT0);
-            let p;
-            p = framePromise.then(() => p);
-            inFlight.add(p);
+          } finally {
+            try {
+              await Promise.all(inFlight);
+            } finally {
+              bridge.device.createBindGroup = createBindGroup;
+              bridge.device.createRenderBundleEncoder = createRenderBundleEncoder;
+            }
           }
 
-          while (inFlight.size > 0) {
-            const finished = await Promise.race(inFlight);
-            inFlight.delete(finished);
-            completedCount++;
-          }
           const elapsedMs = performance.now() - tStart;
+          if (firstError) throw firstError;
           if (deviceLost) throw new Error(`Device lost during ${name} drain`);
 
           const finalPixels = await runner.readback();
-          return { name, initialPixels, finalPixels, completedCount, cpuDurationMs, elapsedMs };
+          return {
+            name,
+            initialPixels,
+            finalPixels,
+            completedCount,
+            maxInFlight: maxInFlightObserved,
+            cpuDurationMs,
+            elapsedMs,
+            bindGroupCreations,
+            bundleRecordings,
+          };
         }
 
-        const makeOracleRunner = (encoder, prep) => {
+        const settleAll = (promises) =>
+          Promise.allSettled(promises).then((results) => {
+            const failure = results.find((r) => r.status === "rejected");
+            if (failure) throw failure.reason;
+          });
+
+        const makeOracleRunner = (encoder, prep, configure = null) => {
           const r = createDirectReferenceRenderer(bridge.device, batchWidth, batchHeight, batchDrawCount);
+          try {
+            if (configure) encoder = configure(r);
+          } catch (error) {
+            r.destroy();
+            throw error;
+          }
           return {
-            submit: (rows) => r.submitFrame(prep ? null : rows, encoder, prep ? () => prep(rows) : null),
+            submit: (rows) => {
+              let donePromise = null;
+              const scopePromise = bridge.withErrorScopes(["validation", "out-of-memory"], () => {
+                donePromise = r.submitFrame(prep ? null : rows, encoder, prep ? () => prep(rows) : null);
+              });
+              return settleAll([scopePromise, donePromise]);
+            },
             readback: () => r.readback(),
             destroy: () => r.destroy(),
           };
         };
 
-        const directRunner = makeOracleRunner(null, null);
-        const directResult = await runTwoCreditFrameLoop("direct", directRunner, repeatedFrames);
-        directRunner.destroy();
-
-        const bulkRunner = {
-          submit: (rows) => {
-            const packet = buildAffineFramePacketFn(rows, batchWidth, batchHeight, batchDrawCount);
-            const packetCompletion = bridge.executePacket(packet);
-            const queuePromise = bridge.device.queue.onSubmittedWorkDone();
-            return Promise.all([packetCompletion, queuePromise]);
+        const runners = [
+          { name: "direct", runner: makeOracleRunner(null, null) },
+          {
+            name: "bulk",
+            runner: {
+              submit: (rows) => {
+                const packet = buildAffineFramePacketFn(rows, batchWidth, batchHeight, batchDrawCount);
+                const packetCompletion = bridge.executePacket(packet);
+                const queuePromise = bridge.device.queue.onSubmittedWorkDone();
+                return settleAll([packetCompletion, queuePromise]);
+              },
+              readback: () => bridge.readbackBuffer(20, batchReadbackSize),
+              destroy: () => {},
+            },
           },
-          readback: () => bridge.readbackBuffer(20, batchReadbackSize),
-          destroy: () => {},
-        };
-        const bulkResult = await runTwoCreditFrameLoop("bulk", bulkRunner, repeatedFrames);
+          { name: "chatty", runner: makeOracleRunner(chattyDrawEncoder, null) },
+          {
+            name: "generated",
+            runner: makeOracleRunner(
+              (pass, bg) => genMod.executeStaticSubmission4000(pass, bg),
+              (rows) => packAffineFn(rows)
+            ),
+          },
+        ];
 
-        const chattyRunner = makeOracleRunner(chattyDrawEncoder, null);
-        const chattyResult = await runTwoCreditFrameLoop("chatty", chattyRunner, repeatedFrames);
-        chattyRunner.destroy();
+        const allResults = [];
+        try {
+          for (const entry of runners) {
+            allResults.push(await runTwoCreditFrameLoop(entry.name, entry.runner, repeatedFrames));
+          }
+          // One recorded prefix of 3996 draws plus four direct draws, with the
+          // same transforms, readback copy and completion window as the full loop.
+          const bundlePacket = wasmExports.f3d_build_affine_rows_bundle_packet;
+          if (typeof bundlePacket !== "function") throw new Error("Missing f3d_build_affine_rows_bundle_packet");
+          const tailModule = await import("/out/browser-probe/static_submission_tail4.js");
+          const prefixCount = batchDrawCount - 4;
+          const bundleInitPacket = bundlePacket(sharedRows, batchWidth, batchHeight, batchDrawCount, 4, true);
+          await bridge.executePacket(bundleInitPacket);
+          const bulkBundle = bridge.bundles.get(200);
+          if (!bulkBundle) throw new Error("Rust bundle packet did not record bundle 200");
+          // Mutate the real Rust packet's bundle offsets; the preceding upload
+          // remains an issued queue effect, but no invalid bundle may publish.
+          const bundleFields = 16 + 18 + 2;
+          if (new DataView(bundleInitPacket.buffer, bundleInitPacket.byteOffset).getUint16(bundleFields - 2, true) !== 19) {
+            throw new Error("Expected RecordBundleBatch after the frame uniform upload");
+          }
+          for (const [base, stride, expectedError] of [
+            [0xffffffff, 256, /dynamic offset overflow/],
+            [0, 512, /buffer bounds or device alignment/],
+            [4, 256, /buffer bounds or device alignment/],
+          ]) {
+            const bad = bundleInitPacket.slice();
+            const fields = new DataView(bad.buffer, bad.byteOffset);
+            fields.setUint32(bundleFields + 16, base, true);
+            fields.setUint32(bundleFields + 32, stride, true);
+            let rejected = false;
+            try { await bridge.executePacket(bad); }
+            catch (error) {
+              if (!expectedError.test(error.message)) throw error;
+              rejected = true;
+            }
+            if (!rejected || bridge.bundles.get(200) !== bulkBundle) {
+              throw new Error("Invalid bundle offsets were accepted or replaced the recorded bundle");
+            }
+          }
+          logPass("bundle_batch_offset_guards", "Rust-packet mutations rejected overflow, buffer overrun and misalignment without replacing the bundle");
+          results.tests.bundle_batch_offset_guards.implementation_owner = "JS packet decoder on real WebGPU";
 
-        const genRunner = makeOracleRunner(
-          (pass, bg) => genMod.executeStaticSubmission4000(pass, bg),
-          (rows) => packAffineFn(rows)
-        );
-        const genResult = await runTwoCreditFrameLoop("generated", genRunner, repeatedFrames);
-        genRunner.destroy();
-
-        const directChanged = comparePixels(directResult.finalPixels, directResult.initialPixels);
-        if (directChanged === 0) {
-          throw new Error("[debug repeated-frame] direct final pixels did not change from initial");
+          const configureBundle = (kind) => (renderer) => {
+            const recorder = bridge.device.createRenderBundleEncoder({ colorFormats: ["rgba8unorm"] });
+            recorder.setPipeline(renderer.pipeline);
+            recorder.setVertexBuffer(0, renderer.vertexBuffer);
+            for (let i = 0; i < prefixCount; i++) {
+              recorder.setBindGroup(0, renderer.bindGroup, [i * 256]);
+              recorder.draw(3, 1, 0, 0);
+            }
+            const bundle = recorder.finish();
+            return (pass, bindGroup) => {
+              pass.executeBundles([bundle]);
+              // executeBundles clears state even when a binding object is reusable.
+              pass.setPipeline(renderer.pipeline);
+              pass.setVertexBuffer(0, renderer.vertexBuffer);
+              if (kind === "generated") {
+                tailModule.executeStaticSubmission4(pass, bindGroup);
+              } else if (kind === "chatty") {
+                const host = window.f3dHost;
+                const previous = host.drawCall;
+                try {
+                  host.drawCall = (index) => {
+                    pass.setBindGroup(0, bindGroup, [(prefixCount + index) * 256]);
+                    pass.draw(3, 1, 0, 0);
+                  };
+                  wasmExports.f3d_bridge_chatty_draw_loop(4);
+                } finally {
+                  if (previous === undefined) delete host.drawCall;
+                  else host.drawCall = previous;
+                }
+              } else {
+                for (let i = prefixCount; i < batchDrawCount; i++) {
+                  pass.setBindGroup(0, bindGroup, [i * 256]);
+                  pass.draw(3, 1, 0, 0);
+                }
+              }
+            };
+          };
+          for (const kind of ["direct", "chatty", "generated"]) {
+            await bridge.withErrorScopes(["validation", "out-of-memory"], () => {
+              runners.push({ name: `${kind}_bundle`, runner: makeOracleRunner(
+                null, kind === "generated" ? (rows) => packAffineFn(rows) : null,
+                configureBundle(kind)
+              ) });
+            });
+          }
+          runners.push({ name: "bulk_bundle", runner: {
+            submit: (rows) => {
+              if (bridge.bundles.get(200) !== bulkBundle) throw new Error("Bundle identity changed before replay");
+              const packet = bundlePacket(rows, batchWidth, batchHeight, batchDrawCount, 4, false);
+              return settleAll([bridge.executePacket(packet), bridge.device.queue.onSubmittedWorkDone()]);
+            },
+            readback: () => bridge.readbackBuffer(20, batchReadbackSize),
+            destroy: () => {},
+          } });
+          for (const entry of runners.slice(4)) {
+            allResults.push(await runTwoCreditFrameLoop(entry.name, entry.runner, repeatedFrames));
+          }
+          if (bridge.bundles.get(200) !== bulkBundle) throw new Error("Bundle was recreated during repeated frames");
+        } finally {
+          for (const entry of runners) {
+            entry.runner.destroy();
+          }
+        }
+        const [directResult, bulkResult, chattyResult, genResult] = allResults;
+        for (const res of allResults) {
+          if (res.completedCount !== repeatedFrames.length) {
+            throw new Error(`[debug repeated-frame] ${res.name} completed count mismatch: ${res.completedCount}/${repeatedFrames.length}`);
+          }
+          if (res.maxInFlight > 2) {
+            throw new Error(`[debug repeated-frame] ${res.name} exceeded max in-flight 2: ${res.maxInFlight}`);
+          }
+          const expectedBindGroups = res.name.startsWith("bulk") ? repeatedFrames.length : 0;
+          if (res.bindGroupCreations !== expectedBindGroups) {
+            throw new Error(`${res.name}: expected ${expectedBindGroups} bind-group creations, got ${res.bindGroupCreations}`);
+          }
+          if (res.bundleRecordings !== 0) throw new Error(`${res.name}: rerecorded a bundle inside the frame loop`);
+          const changedDiffs = comparePixels(res.finalPixels, res.initialPixels);
+          if (changedDiffs === 0) {
+            throw new Error(`[debug repeated-frame] ${res.name} final pixels did not change from initial`);
+          }
         }
 
-        const repeatedVariants = [bulkResult, chattyResult, genResult];
-        for (const v of repeatedVariants) {
-          if (v.completedCount !== repeatedFrames.length) {
-            throw new Error(`[debug repeated-frame] ${v.name} completed count mismatch: ${v.completedCount}/${repeatedFrames.length}`);
-          }
+        for (const v of allResults.slice(1)) {
           const initDiffs = comparePixels(v.initialPixels, directResult.initialPixels);
-          if (initDiffs > 0) {
+          if (initDiffs !== 0) {
             throw new Error(`[debug repeated-frame] ${v.name} initial pixels mismatch direct reference: ${initDiffs} diffs`);
           }
           const finalDiffs = comparePixels(v.finalPixels, directResult.finalPixels);
-          if (finalDiffs > 0) {
+          if (finalDiffs !== 0) {
             throw new Error(`[debug repeated-frame] ${v.name} final pixels mismatch direct reference: ${finalDiffs} diffs`);
-          }
-          const changedDiffs = comparePixels(v.finalPixels, v.initialPixels);
-          if (changedDiffs === 0) {
-            throw new Error(`[debug repeated-frame] ${v.name} final pixels did not change from initial`);
           }
         }
 
         results.repeated_frame_measurements = {};
-        for (const res of [directResult, bulkResult, chattyResult, genResult]) {
+        for (const res of allResults) {
+          const implementationOwner = {
+            direct: "Direct JS WebGPU",
+            bulk: "Rust/Wasm packet encoder; JS WebGPU decoder",
+            chatty: "Rust/Wasm callback loop; JS WebGPU submission",
+            generated: "Rust/Wasm owned data packing; generated JS submission",
+          }[res.name.split("_")[0]];
           results.repeated_frame_measurements[res.name] = {
+            implementation_owner: implementationOwner,
             completed_count: res.completedCount,
+            max_in_flight: res.maxInFlight,
             cpu_duration_ms: res.cpuDurationMs,
             elapsed_ms: res.elapsedMs,
+            bind_group_creations: res.bindGroupCreations,
+            bundle_recordings: res.bundleRecordings,
           };
           logPass(
             `repeated_frame_${res.name}`,
-            `[debug repeated-frame] ${res.name}: completed=${res.completedCount}/${repeatedFrames.length} cpu_duration=${res.cpuDurationMs.toFixed(3)}ms elapsed=${res.elapsedMs.toFixed(3)}ms`
+            `[debug repeated-frame] ${res.name}: completed=${res.completedCount}/${repeatedFrames.length} max_in_flight=${res.maxInFlight} cpu_duration=${res.cpuDurationMs.toFixed(3)}ms elapsed=${res.elapsedMs.toFixed(3)}ms`
           );
+          results.tests[`repeated_frame_${res.name}`].implementation_owner = implementationOwner;
         }
 
         // 6. Red-A / Blue-B Snapshot Isolation in Single Queue Submission (using PerUseByteBuffer)
