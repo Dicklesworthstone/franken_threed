@@ -94,7 +94,7 @@ impl Line3 {
         }
         let t = start_end.dot(&start_p) / start_end_sq;
         if clamp_to_line {
-            t.clamp(0.0, 1.0)
+            js_clamp(t, 0.0, 1.0)
         } else {
             t
         }

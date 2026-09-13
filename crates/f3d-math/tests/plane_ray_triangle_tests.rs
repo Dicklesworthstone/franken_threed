@@ -564,3 +564,30 @@ fn test_line3_distance_sq_triangle_interpolation_and_copy() {
     assert!(res_deg.is_none(), "degenerate interpolation is None");
     assert_vec_close(&deg_target, [0.0, 0.0, 0.0], EPS, "degenerate target zeroed");
 }
+
+#[test]
+fn test_line3_closest_point_to_point_parameter_signed_zero_clamp() {
+    // Line from (1, 1, 1) to (0, 0, 0): delta is (-1, -1, -1)
+    let line = Line3::new(Vector3::new(1.0, 1.0, 1.0), Vector3::new(0.0, 0.0, 0.0));
+    // Point at start (1, 1, 1): start_p = (0, 0, 0)
+    // delta.dot(start_p) = (-1*0) + (-1*0) + (-1*0) = -0.0 + -0.0 + -0.0 = -0.0
+    // delta_sq = 3.0
+    // t = -0.0 / 3.0 = -0.0
+    let point = Vector3::new(1.0, 1.0, 1.0);
+
+    // Unclamped parameter evaluates to -0.0
+    let t_unclamped = line.closest_point_to_point_parameter(&point, false);
+    assert_eq!(t_unclamped.to_bits(), (-0.0f64).to_bits(), "unclamped t must be -0.0");
+    assert!(t_unclamped.is_sign_negative(), "unclamped t has negative sign");
+
+    // Clamped parameter must clamp -0.0 to +0.0 matching upstream Three.js Line3.js:154 / MathUtils.clamp
+    let t_clamped = line.closest_point_to_point_parameter(&point, true);
+    assert_eq!(t_clamped.to_bits(), (0.0f64).to_bits(), "clamped t must be +0.0 (bits 0)");
+    assert!(!t_clamped.is_sign_negative(), "clamped t has positive sign");
+
+    // Negative t outside [0, 1] also clamps to +0.0
+    let line2 = Line3::new(Vector3::new(0.0, 0.0, 0.0), Vector3::new(1.0, 0.0, 0.0));
+    let point2 = Vector3::new(-0.5, 0.0, 0.0);
+    let t2_clamped = line2.closest_point_to_point_parameter(&point2, true);
+    assert_eq!(t2_clamped.to_bits(), (0.0f64).to_bits(), "clamped negative t is +0.0 (bits 0)");
+}
