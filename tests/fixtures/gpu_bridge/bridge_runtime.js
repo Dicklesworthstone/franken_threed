@@ -32,6 +32,12 @@ export const OPCODE_WRITE_TEXTURE = 17;
 export const OPCODE_CREATE_PIPELINE_TEXTURED = 18;
 export const OPCODE_RECORD_BUNDLE_BATCH = 19;
 export const OPCODE_COPY_BUFFER_TO_BUFFER = 20;
+export const OPCODE_CREATE_COMPUTE_PIPELINE = 21;
+export const OPCODE_DISPATCH_COMPUTE = 22;
+
+export const BINDING_TYPE_UNIFORM = 0;
+export const BINDING_TYPE_STORAGE_READ = 1;
+export const BINDING_TYPE_STORAGE_READ_WRITE = 2;
 
 export const SAMPLER_FILTER_NEAREST = 0;
 export const SAMPLER_FILTER_LINEAR = 1;
@@ -118,6 +124,7 @@ export class WebGpuBridgeHost {
     this.pipelines = new Map();
     this.bindGroups = new Map();
     this.bundles = new Map();
+    this.computePipelines = new Map();
     this.bufferEpochs = new Map();
     this.errorScopeActive = false;
     this.lastRenderTargetId = null;
@@ -131,6 +138,7 @@ export class WebGpuBridgeHost {
     this.pipelines.clear();
     this.bindGroups.clear();
     this.bundles.clear();
+    this.computePipelines.clear();
     this.bufferEpochs.clear();
     this.lastRenderTargetId = null;
   }
@@ -1770,6 +1778,20 @@ export class WebGpuBridgeHost {
                   scanCursor += 36;
                 } else if (nextOp === OPCODE_COPY_BUFFER_TO_BUFFER) {
                   scanCursor += 40;
+                } else if (nextOp === OPCODE_CREATE_COMPUTE_PIPELINE) {
+                  if (scanCursor + 30 <= dataBlockStart) {
+                    const bindingCount = dataView.getUint32(scanCursor + 22, true);
+                    scanCursor += 30 + bindingCount * 16;
+                  } else {
+                    break;
+                  }
+                } else if (nextOp === OPCODE_DISPATCH_COMPUTE) {
+                  if (scanCursor + 22 <= dataBlockStart) {
+                    const bindingCount = dataView.getUint32(scanCursor + 18, true);
+                    scanCursor += 22 + bindingCount * 48;
+                  } else {
+                    break;
+                  }
                 } else if (nextOp === OPCODE_SET_VIEWPORT) {
                   scanCursor += 24;
                 } else if (nextOp === OPCODE_SET_SCISSOR_RECT) {
@@ -1907,6 +1929,279 @@ export class WebGpuBridgeHost {
             cursor += 16;
 
             currentPassEncoder.setScissorRect(x, y, width, height);
+            break;
+          }
+
+          case OPCODE_CREATE_COMPUTE_PIPELINE: {
+            closeActivePass();
+            if (cursor + 30 > dataBlockStart) {
+              throw new RangeError(`Truncated CREATE_COMPUTE_PIPELINE header at command ${i}`);
+            }
+            const _pad0 = dataView.getUint16(cursor, true);
+            const pipelineId = dataView.getUint32(cursor + 2, true);
+            const codeOffset = dataView.getUint32(cursor + 6, true);
+            const codeLen = dataView.getUint32(cursor + 10, true);
+            const entryPointOffset = dataView.getUint32(cursor + 14, true);
+            const entryPointLen = dataView.getUint32(cursor + 18, true);
+            const bindingCount = dataView.getUint32(cursor + 22, true);
+            const _pad1 = dataView.getUint32(cursor + 26, true);
+            cursor += 30;
+
+            if (cursor + bindingCount * 16 > dataBlockStart) {
+              throw new RangeError(`Truncated CREATE_COMPUTE_PIPELINE binding list at command ${i} (needs ${bindingCount * 16} bytes)`);
+            }
+
+            if (codeOffset + codeLen > dataPayload.byteLength) {
+              throw new RangeError(`CreateComputePipeline: WGSL code out of bounds (offset ${codeOffset} + len ${codeLen} > payload ${dataPayload.byteLength})`);
+            }
+            const codeBytes = dataPayload.subarray(codeOffset, codeOffset + codeLen);
+            const wgslCode = new TextDecoder("utf-8").decode(codeBytes);
+
+            let entryPoint = "main";
+            if (entryPointLen > 0) {
+              if (entryPointOffset + entryPointLen > dataPayload.byteLength) {
+                throw new RangeError(`CreateComputePipeline: entry_point out of bounds (offset ${entryPointOffset} + len ${entryPointLen} > payload ${dataPayload.byteLength})`);
+              }
+              const epBytes = dataPayload.subarray(entryPointOffset, entryPointOffset + entryPointLen);
+              entryPoint = new TextDecoder("utf-8").decode(epBytes);
+            }
+
+            const layoutEntries = [];
+            const bindingSpecs = new Map();
+            let storageBufferCount = 0;
+
+            for (let b = 0; b < bindingCount; b++) {
+              const bindingIndex = dataView.getUint32(cursor, true);
+              const bindingType = dataView.getUint32(cursor + 4, true);
+              const minBindingSize = dataView.getUint32(cursor + 8, true);
+              const _pad = dataView.getUint32(cursor + 12, true);
+              cursor += 16;
+
+              if (bindingSpecs.has(bindingIndex)) {
+                throw new Error(`CreateComputePipeline: duplicate binding index ${bindingIndex}`);
+              }
+
+              let bufferType;
+              if (bindingType === BINDING_TYPE_UNIFORM) {
+                bufferType = "uniform";
+              } else if (bindingType === BINDING_TYPE_STORAGE_READ) {
+                bufferType = "read-only-storage";
+                storageBufferCount++;
+              } else if (bindingType === BINDING_TYPE_STORAGE_READ_WRITE) {
+                bufferType = "storage";
+                storageBufferCount++;
+              } else {
+                throw new TypeError(`CreateComputePipeline: invalid binding_type ${bindingType} at index ${b}`);
+              }
+
+              const entry = {
+                binding: bindingIndex,
+                visibility: GPUShaderStage.COMPUTE,
+                buffer: {
+                  type: bufferType,
+                },
+              };
+              if (minBindingSize > 0) {
+                entry.buffer.minBindingSize = minBindingSize;
+              }
+              layoutEntries.push(entry);
+              bindingSpecs.set(bindingIndex, { bindingIndex, bindingType, minBindingSize });
+            }
+
+            if (this.device.limits && this.device.limits.maxStorageBuffersPerShaderStage !== undefined) {
+              if (storageBufferCount > this.device.limits.maxStorageBuffersPerShaderStage) {
+                throw new RangeError(
+                  `CreateComputePipeline: storage buffer count ${storageBufferCount} exceeds device limit maxStorageBuffersPerShaderStage (${this.device.limits.maxStorageBuffersPerShaderStage})`
+                );
+              }
+            }
+
+            const shaderModule = this.device.createShaderModule({ code: wgslCode });
+            const bindGroupLayout = this.device.createBindGroupLayout({ entries: layoutEntries });
+            const pipelineLayout = this.device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] });
+            const computePipeline = this.device.createComputePipeline({
+              layout: pipelineLayout,
+              compute: {
+                module: shaderModule,
+                entryPoint: entryPoint,
+              },
+            });
+
+            this.computePipelines.set(pipelineId, {
+              pipeline: computePipeline,
+              bindGroupLayout: bindGroupLayout,
+              bindingSpecs: bindingSpecs,
+            });
+            break;
+          }
+
+          case OPCODE_DISPATCH_COMPUTE: {
+            closeActivePass();
+            if (cursor + 22 > dataBlockStart) {
+              throw new RangeError(`Truncated DISPATCH_COMPUTE header at command ${i}`);
+            }
+            const _pad0 = dataView.getUint16(cursor, true);
+            const pipelineId = dataView.getUint32(cursor + 2, true);
+            const workgroupCountX = dataView.getUint32(cursor + 6, true);
+            const workgroupCountY = dataView.getUint32(cursor + 10, true);
+            const workgroupCountZ = dataView.getUint32(cursor + 14, true);
+            const bindingCount = dataView.getUint32(cursor + 18, true);
+            cursor += 22;
+
+            if (cursor + bindingCount * 48 > dataBlockStart) {
+              throw new RangeError(`Truncated DISPATCH_COMPUTE binding records at command ${i} (needs ${bindingCount * 48} bytes)`);
+            }
+
+            const pipelineRecord = this.computePipelines.get(pipelineId);
+            if (!pipelineRecord) {
+              throw new Error(`DispatchCompute: unknown compute pipelineId ${pipelineId}`);
+            }
+
+            if (this.device.limits && this.device.limits.maxComputeWorkgroupsPerDimension !== undefined) {
+              const maxDim = this.device.limits.maxComputeWorkgroupsPerDimension;
+              if (workgroupCountX > maxDim || workgroupCountY > maxDim || workgroupCountZ > maxDim) {
+                throw new RangeError(
+                  `DispatchCompute: workgroup count (${workgroupCountX}, ${workgroupCountY}, ${workgroupCountZ}) exceeds device limit maxComputeWorkgroupsPerDimension (${maxDim})`
+                );
+              }
+            }
+
+            const MAX_SAFE_INTEGER_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
+            const parsedBindings = [];
+            const seenBindingIndices = new Set();
+
+            for (let b = 0; b < bindingCount; b++) {
+              const bindingIndex = dataView.getUint32(cursor, true);
+              const bufferId = dataView.getUint32(cursor + 4, true);
+              const offsetBig = dataView.getBigUint64(cursor + 8, true);
+              const sizeBig = dataView.getBigUint64(cursor + 16, true);
+              const bindingType = dataView.getUint32(cursor + 24, true);
+              const _pad = dataView.getUint32(cursor + 28, true);
+              const epochLo = dataView.getUint32(cursor + 32, true);
+              const epochHi = dataView.getUint32(cursor + 36, true);
+              const dataVersionBig = dataView.getBigUint64(cursor + 40, true);
+              cursor += 48;
+
+              if (seenBindingIndices.has(bindingIndex)) {
+                throw new Error(`DispatchCompute: duplicate binding index ${bindingIndex}`);
+              }
+              seenBindingIndices.add(bindingIndex);
+
+              const spec = pipelineRecord.bindingSpecs.get(bindingIndex);
+              if (!spec) {
+                throw new Error(`DispatchCompute: pipeline ${pipelineId} has no binding specification for index ${bindingIndex}`);
+              }
+
+              if (bindingType !== spec.bindingType) {
+                throw new TypeError(`DispatchCompute: binding index ${bindingIndex} type mismatch: dispatch has ${bindingType}, pipeline expects ${spec.bindingType}`);
+              }
+
+              if (offsetBig > MAX_SAFE_INTEGER_BIGINT) {
+                throw new RangeError(`DispatchCompute: binding ${bindingIndex} offset exceeds Number.MAX_SAFE_INTEGER`);
+              }
+              if (sizeBig > MAX_SAFE_INTEGER_BIGINT) {
+                throw new RangeError(`DispatchCompute: binding ${bindingIndex} size exceeds Number.MAX_SAFE_INTEGER`);
+              }
+              const offset = Number(offsetBig);
+              const size = Number(sizeBig);
+
+              if (size === 0) {
+                throw new RangeError(`DispatchCompute: binding ${bindingIndex} size must be greater than 0`);
+              }
+              if ((bindingType === BINDING_TYPE_STORAGE_READ || bindingType === BINDING_TYPE_STORAGE_READ_WRITE) && size % 4 !== 0) {
+                throw new RangeError(`DispatchCompute: storage buffer binding ${bindingIndex} size ${size} must be a multiple of 4 bytes`);
+              }
+              if (spec.minBindingSize > 0 && size < spec.minBindingSize) {
+                throw new RangeError(`DispatchCompute: binding ${bindingIndex} size ${size} is smaller than pipeline minBindingSize (${spec.minBindingSize})`);
+              }
+
+              const buffer = this.buffers.get(bufferId);
+              if (!buffer) {
+                throw new Error(`DispatchCompute: unknown bufferId ${bufferId} for binding ${bindingIndex}`);
+              }
+
+              if (bindingType === BINDING_TYPE_UNIFORM) {
+                const align = (this.device.limits && this.device.limits.minUniformBufferOffsetAlignment) || 256;
+                if (offset % align !== 0) {
+                  throw new RangeError(`DispatchCompute: uniform buffer ${bufferId} offset ${offset} must be aligned to ${align}`);
+                }
+                if (this.device.limits && this.device.limits.maxUniformBufferBindingSize !== undefined && size > this.device.limits.maxUniformBufferBindingSize) {
+                  throw new RangeError(`DispatchCompute: uniform buffer ${bufferId} binding size ${size} exceeds maxUniformBufferBindingSize (${this.device.limits.maxUniformBufferBindingSize})`);
+                }
+              } else if (bindingType === BINDING_TYPE_STORAGE_READ || bindingType === BINDING_TYPE_STORAGE_READ_WRITE) {
+                const align = (this.device.limits && this.device.limits.minStorageBufferOffsetAlignment) || 256;
+                if (offset % align !== 0) {
+                  throw new RangeError(`DispatchCompute: storage buffer ${bufferId} offset ${offset} must be aligned to ${align}`);
+                }
+                if (this.device.limits && this.device.limits.maxStorageBufferBindingSize !== undefined && size > this.device.limits.maxStorageBufferBindingSize) {
+                  throw new RangeError(`DispatchCompute: storage buffer ${bufferId} binding size ${size} exceeds maxStorageBufferBindingSize (${this.device.limits.maxStorageBufferBindingSize})`);
+                }
+              } else {
+                throw new TypeError(`DispatchCompute: invalid binding_type ${bindingType} at binding index ${b}`);
+              }
+
+              if (offset + size > buffer.size) {
+                throw new RangeError(`DispatchCompute: buffer ${bufferId} binding range out of bounds (offset ${offset} + size ${size} = ${offset + size} > buffer size ${buffer.size})`);
+              }
+
+              if (bindingType === BINDING_TYPE_UNIFORM) {
+                const UNIFORM = (typeof GPUBufferUsage !== "undefined" && GPUBufferUsage.UNIFORM) ? GPUBufferUsage.UNIFORM : 0x0040;
+                if ((buffer.usage & UNIFORM) === 0) {
+                  throw new Error(`DispatchCompute: buffer ${bufferId} lacks UNIFORM usage`);
+                }
+              } else {
+                const STORAGE = (typeof GPUBufferUsage !== "undefined" && GPUBufferUsage.STORAGE) ? GPUBufferUsage.STORAGE : 0x0080;
+                if ((buffer.usage & STORAGE) === 0) {
+                  throw new Error(`DispatchCompute: buffer ${bufferId} lacks STORAGE usage`);
+                }
+              }
+
+              parsedBindings.push({
+                bindingIndex,
+                bufferId,
+                buffer,
+                offset,
+                size,
+                bindingType,
+                epochHi,
+                epochLo,
+              });
+            }
+
+            if (seenBindingIndices.size !== pipelineRecord.bindingSpecs.size) {
+              for (const reqIndex of pipelineRecord.bindingSpecs.keys()) {
+                if (!seenBindingIndices.has(reqIndex)) {
+                  throw new Error(`DispatchCompute: missing binding index ${reqIndex} required by pipeline ${pipelineId}`);
+                }
+              }
+            }
+
+            for (let b = 0; b < parsedBindings.length; b++) {
+              const pb = parsedBindings[b];
+              if (pb.bindingType === BINDING_TYPE_STORAGE_READ_WRITE) {
+                this.bufferEpochs.set(pb.bufferId, { epochHi: pb.epochHi, epochLo: pb.epochLo });
+              }
+            }
+
+            const bindGroupEntries = parsedBindings.map((pb) => ({
+              binding: pb.bindingIndex,
+              resource: {
+                buffer: pb.buffer,
+                offset: pb.offset,
+                size: pb.size,
+              },
+            }));
+
+            const bindGroup = this.device.createBindGroup({
+              layout: pipelineRecord.bindGroupLayout,
+              entries: bindGroupEntries,
+            });
+
+            const pass = commandEncoder.beginComputePass();
+            pass.setPipeline(pipelineRecord.pipeline);
+            pass.setBindGroup(0, bindGroup);
+            pass.dispatchWorkgroups(workgroupCountX, workgroupCountY, workgroupCountZ);
+            pass.end();
             break;
           }
 

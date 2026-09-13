@@ -52,6 +52,8 @@
     import { testWorkloadAMeasurementMode, testWorkloadCMeasurementMode, testBorrowedBulkMeasurementMode } from "./workload_ac_measure.js";
     import { testVariantPreconditions } from "./variant_preconditions.js";
     import { testTranscendentalBrowser } from "./transcendental_browser_test.js";
+    import { testSimdComposeBrowser } from "./simd_compose_browser_test.js";
+    import { testComputeAffine } from "./compute_affine_test.js";
     import { testBundleResetCounterexample } from "./counterexample_bundle_reset_test.js";
     import { testAffineLayoutCounterexample } from "./counterexample_affine_layout_test.js";
     import { testStaleReadbackCounterexample } from "./counterexample_stale_readback_test.js";
@@ -79,6 +81,197 @@
       console.error(`[FAIL] ${name}`, error);
     }
 
+    async function runCounterexamplePreflight(wasmExports) {
+      const keys = {};
+      const host_environment = navigator.userAgent;
+
+      // 1. Counterexample suites (each creates and drops its own host/devices)
+      let bundleReport = null;
+      try {
+        bundleReport = await testBundleResetCounterexample(wasmExports);
+        const falsePass = bundleReport && bundleReport[false] && bundleReport[false].status === "PASS";
+        const truePass = bundleReport && bundleReport[true] && bundleReport[true].status === "PASS";
+        keys["counterexample_bundle_then_direct_state_reset"] = {
+          status: falsePass ? "PASS" : "FAIL",
+          detail: bundleReport?.[false]?.detail || "",
+          ...(falsePass ? {} : { error: bundleReport?.[false]?.error || "Bundle-then-direct state reset check failed" }),
+        };
+        keys["counterexample_empty_bundle_list_state_reset"] = {
+          status: truePass ? "PASS" : "FAIL",
+          detail: bundleReport?.[true]?.detail || "",
+          ...(truePass ? {} : { error: bundleReport?.[true]?.error || "Empty bundle list state reset check failed" }),
+        };
+      } catch (err) {
+        keys["counterexample_bundle_then_direct_state_reset"] = {
+          status: "FAIL",
+          error: err.message || String(err),
+          detail: err.message || String(err),
+        };
+        keys["counterexample_empty_bundle_list_state_reset"] = {
+          status: "FAIL",
+          error: err.message || String(err),
+          detail: err.message || String(err),
+        };
+      }
+
+      let affineReport = null;
+      try {
+        affineReport = await testAffineLayoutCounterexample(wasmExports);
+        const affinePass = affineReport && affineReport.status === "PASS";
+        keys["counterexample_affine_rows_vs_mat4x3_layout"] = {
+          status: affinePass ? "PASS" : "FAIL",
+          detail: affineReport?.detail || "",
+          ...(affinePass ? {} : { error: affineReport?.error || "AffineRows vs mat4x3 layout check failed" }),
+        };
+      } catch (err) {
+        keys["counterexample_affine_rows_vs_mat4x3_layout"] = {
+          status: "FAIL",
+          error: err.message || String(err),
+          detail: err.message || String(err),
+        };
+      }
+
+      let staleReport = null;
+      try {
+        staleReport = await testStaleReadbackCounterexample(wasmExports);
+        const stalePass = staleReport && staleReport.status === "PASS";
+        keys["counterexample_stale_readback_after_device_replacement"] = {
+          status: stalePass ? "PASS" : "FAIL",
+          detail: staleReport?.detail || "",
+          ...(stalePass ? {} : { error: staleReport?.error || "Stale readback after device replacement check failed" }),
+        };
+      } catch (err) {
+        keys["counterexample_stale_readback_after_device_replacement"] = {
+          status: "FAIL",
+          error: err.message || String(err),
+          detail: err.message || String(err),
+        };
+      }
+
+      // 2. Per-variant correctness preconditions on its OWN freshly initialized host
+      let preflightBridge = null;
+      let variantPreconditionsResult = null;
+      let variantPreconditionsError = null;
+      try {
+        preflightBridge = new WebGpuBridgeHost();
+        await preflightBridge.negotiateAndCreateDevice({ requiredFeatures: [] });
+        variantPreconditionsResult = await testVariantPreconditions(preflightBridge, wasmExports);
+      } catch (err) {
+        variantPreconditionsError = err;
+      } finally {
+        if (preflightBridge) {
+          try {
+            preflightBridge.destroyDevice();
+          } catch (_) {}
+          preflightBridge = null;
+        }
+      }
+
+      // Record variant precondition tests into keys
+      if (variantPreconditionsResult && variantPreconditionsResult.tests) {
+        for (const [k, v] of Object.entries(variantPreconditionsResult.tests)) {
+          keys[k] = {
+            status: v.status || "FAIL",
+            detail: v.detail || "",
+            ...(v.error ? { error: v.error } : {}),
+            implementation_owner: v.implementation_owner || "Unknown",
+          };
+        }
+      } else if (variantPreconditionsError) {
+        keys["variant_preconditions_execution"] = {
+          status: "FAIL",
+          error: variantPreconditionsError.message || String(variantPreconditionsError),
+          detail: variantPreconditionsError.message || String(variantPreconditionsError),
+        };
+      }
+
+      const REQUIRED_VARIANTS = ["direct", "bulk", "chatty", "generated"];
+      const missingVariants = [];
+      if (variantPreconditionsResult && variantPreconditionsResult.variants) {
+        for (const v of REQUIRED_VARIANTS) {
+          if (!variantPreconditionsResult.variants[v]) {
+            missingVariants.push(v);
+            keys[`precondition_variant_present_${v}`] = {
+              status: "FAIL",
+              error: `Missing required variant in preconditions: ${v}`,
+              detail: `Required variant '${v}' was not reported by testVariantPreconditions`,
+            };
+          }
+        }
+      } else {
+        for (const v of REQUIRED_VARIANTS) {
+          missingVariants.push(v);
+          keys[`precondition_variant_present_${v}`] = {
+            status: "FAIL",
+            error: `Missing required variant in preconditions: ${v}`,
+            detail: `testVariantPreconditions did not return variant records`,
+          };
+        }
+      }
+
+      const counterexamplesPass =
+        keys["counterexample_bundle_then_direct_state_reset"]?.status === "PASS" &&
+        keys["counterexample_empty_bundle_list_state_reset"]?.status === "PASS" &&
+        keys["counterexample_affine_rows_vs_mat4x3_layout"]?.status === "PASS" &&
+        keys["counterexample_stale_readback_after_device_replacement"]?.status === "PASS";
+
+      let variantPreconditionsPass = false;
+      if (variantPreconditionsResult && !variantPreconditionsError && missingVariants.length === 0) {
+        const testsPass = variantPreconditionsResult.tests &&
+          Object.keys(variantPreconditionsResult.tests).length > 0 &&
+          Object.values(variantPreconditionsResult.tests).every(t => t.status === "PASS");
+        const noExcluded = Array.isArray(variantPreconditionsResult.excluded_variants) &&
+          variantPreconditionsResult.excluded_variants.length === 0;
+        variantPreconditionsPass = testsPass && noExcluded;
+      }
+
+      const all_pass = counterexamplesPass && variantPreconditionsPass && missingVariants.length === 0;
+
+      return {
+        gate: "counterexample_suite",
+        keys,
+        missing_variants: missingVariants,
+        variant_preconditions: variantPreconditionsResult,
+        counterexamples: {
+          bundle_reset: bundleReport,
+          affine_layout: affineReport,
+          stale_readback: staleReport,
+        },
+        all_pass,
+        host_environment,
+      };
+    }
+
+    async function executeMeasurementPreflight(wasmExports) {
+      const preflight = await runCounterexamplePreflight(wasmExports);
+      results.measurement_preflight = preflight;
+      if (!preflight.all_pass) {
+        const failureDetails = [];
+        for (const [k, v] of Object.entries(preflight.keys)) {
+          if (v.status !== "PASS") {
+            failureDetails.push(`${k}: ${v.error || v.detail || "FAIL"}`);
+          }
+        }
+        if (preflight.missing_variants && preflight.missing_variants.length > 0) {
+          failureDetails.push(`missing variants: ${preflight.missing_variants.join(", ")}`);
+        }
+        const failMsg = `Measurement preflight gate failed: ${failureDetails.join("; ") || "preflight checks did not pass"}`;
+        logFail("measurement_preflight_counterexamples", new Error(failMsg));
+        if (results.tests["measurement_preflight_counterexamples"]) {
+          results.tests["measurement_preflight_counterexamples"].implementation_owner = "new-backend";
+        }
+        return false;
+      }
+      logPass(
+        "measurement_preflight_counterexamples",
+        "All counterexample suite and variant precondition preflight checks PASSED before measurement"
+      );
+      if (results.tests["measurement_preflight_counterexamples"]) {
+        results.tests["measurement_preflight_counterexamples"].implementation_owner = "new-backend";
+      }
+      return true;
+    }
+
     async function runSuite() {
       try {
         await init();
@@ -87,72 +280,78 @@
 
         const searchParams = new URLSearchParams(window.location.search);
         if (searchParams.get("lane") === "workload_b_measure") {
-          const bridge = new WebGpuBridgeHost();
-          const cap = await bridge.negotiateAndCreateDevice({ requiredFeatures: [] });
-          results.capabilityRecord = cap;
+          if (await executeMeasurementPreflight(wasmExports)) {
+            const bridge = new WebGpuBridgeHost();
+            const cap = await bridge.negotiateAndCreateDevice({ requiredFeatures: [] });
+            results.capabilityRecord = cap;
 
-          const measureResults = await testWorkloadBMeasurementMode(bridge, wasmExports);
-          results.workload_b_measure = measureResults.measurements;
-          for (const key of [
-            "workload_b_bulk_packet",
-            "workload_b_wasm_callbacks",
-            "workload_b_direct_js",
-            "workload_b_generated_js",
-          ]) {
-            const v = measureResults.variants[key];
-            if (v && v.status === "PASS") {
-              logPass(key, v.detail);
-            } else {
-              logFail(key, new Error(v ? (v.error || "Measurement variant failed") : `Missing result for ${key}`));
-            }
-            if (results.tests[key]) {
-              results.tests[key].implementation_owner = v ? v.implementation_owner : "Unknown";
+            const measureResults = await testWorkloadBMeasurementMode(bridge, wasmExports);
+            results.workload_b_measure = measureResults.measurements;
+            for (const key of [
+              "workload_b_bulk_packet",
+              "workload_b_wasm_callbacks",
+              "workload_b_direct_js",
+              "workload_b_generated_js",
+            ]) {
+              const v = measureResults.variants[key];
+              if (v && v.status === "PASS") {
+                logPass(key, v.detail);
+              } else {
+                logFail(key, new Error(v ? (v.error || "Measurement variant failed") : `Missing result for ${key}`));
+              }
+              if (results.tests[key]) {
+                results.tests[key].implementation_owner = v ? v.implementation_owner : "Unknown";
+              }
             }
           }
         } else if (searchParams.get("lane") === "workload_a_measure") {
-          const bridge = new WebGpuBridgeHost();
-          const cap = await bridge.negotiateAndCreateDevice({ requiredFeatures: [] });
-          results.capabilityRecord = cap;
+          if (await executeMeasurementPreflight(wasmExports)) {
+            const bridge = new WebGpuBridgeHost();
+            const cap = await bridge.negotiateAndCreateDevice({ requiredFeatures: [] });
+            results.capabilityRecord = cap;
 
-          const measureResults = await testWorkloadAMeasurementMode(bridge, wasmExports);
-          results.workload_a_measure = measureResults.measurements;
-          for (const key of [
-            "workload_a_direct",
-            "workload_a_bulk",
-            "workload_a_chatty",
-            "workload_a_generated",
-          ]) {
-            const v = measureResults.variants[key];
-            if (v && v.status === "PASS") {
-              logPass(key, v.detail);
-            } else {
-              logFail(key, new Error(v ? (v.error || "Measurement variant failed") : `Missing result for ${key}`));
-            }
-            if (results.tests[key]) {
-              results.tests[key].implementation_owner = v ? v.implementation_owner : "Unknown";
+            const measureResults = await testWorkloadAMeasurementMode(bridge, wasmExports);
+            results.workload_a_measure = measureResults.measurements;
+            for (const key of [
+              "workload_a_direct",
+              "workload_a_bulk",
+              "workload_a_chatty",
+              "workload_a_generated",
+            ]) {
+              const v = measureResults.variants[key];
+              if (v && v.status === "PASS") {
+                logPass(key, v.detail);
+              } else {
+                logFail(key, new Error(v ? (v.error || "Measurement variant failed") : `Missing result for ${key}`));
+              }
+              if (results.tests[key]) {
+                results.tests[key].implementation_owner = v ? v.implementation_owner : "Unknown";
+              }
             }
           }
         } else if (searchParams.get("lane") === "workload_c_measure") {
-          const bridge = new WebGpuBridgeHost();
-          const cap = await bridge.negotiateAndCreateDevice({ requiredFeatures: [] });
-          results.capabilityRecord = cap;
+          if (await executeMeasurementPreflight(wasmExports)) {
+            const bridge = new WebGpuBridgeHost();
+            const cap = await bridge.negotiateAndCreateDevice({ requiredFeatures: [] });
+            results.capabilityRecord = cap;
 
-          const measureResults = await testWorkloadCMeasurementMode(bridge, wasmExports);
-          results.workload_c_measure = measureResults.measurements;
-          for (const key of [
-            "workload_c_direct_bundle",
-            "workload_c_bulk_bundle",
-            "workload_c_chatty_bundle",
-            "workload_c_generated_bundle",
-          ]) {
-            const v = measureResults.variants[key];
-            if (v && v.status === "PASS") {
-              logPass(key, v.detail);
-            } else {
-              logFail(key, new Error(v ? (v.error || "Measurement variant failed") : `Missing result for ${key}`));
-            }
-            if (results.tests[key]) {
-              results.tests[key].implementation_owner = v ? v.implementation_owner : "Unknown";
+            const measureResults = await testWorkloadCMeasurementMode(bridge, wasmExports);
+            results.workload_c_measure = measureResults.measurements;
+            for (const key of [
+              "workload_c_direct_bundle",
+              "workload_c_bulk_bundle",
+              "workload_c_chatty_bundle",
+              "workload_c_generated_bundle",
+            ]) {
+              const v = measureResults.variants[key];
+              if (v && v.status === "PASS") {
+                logPass(key, v.detail);
+              } else {
+                logFail(key, new Error(v ? (v.error || "Measurement variant failed") : `Missing result for ${key}`));
+              }
+              if (results.tests[key]) {
+                results.tests[key].implementation_owner = v ? v.implementation_owner : "Unknown";
+              }
             }
           }
         } else if (searchParams.get("lane") === "variant_preconditions") {
@@ -173,26 +372,28 @@
             }
           }
         } else if (searchParams.get("lane") === "borrowed_bulk_measure") {
-          const memory = (await init()).memory;
-          const bridge = new WebGpuBridgeHost();
-          const cap = await bridge.negotiateAndCreateDevice({ requiredFeatures: [] });
-          results.capabilityRecord = cap;
+          if (await executeMeasurementPreflight(wasmExports)) {
+            const memory = (await init()).memory;
+            const bridge = new WebGpuBridgeHost();
+            const cap = await bridge.negotiateAndCreateDevice({ requiredFeatures: [] });
+            results.capabilityRecord = cap;
 
-          const measureResults = await testBorrowedBulkMeasurementMode(bridge, wasmExports, memory);
-          results.borrowed_bulk_measure = measureResults.measurements;
-          for (const key of [
-            "workload_a_direct",
-            "workload_a_bulk",
-            "workload_a_bulk_borrowed",
-          ]) {
-            const v = measureResults.variants[key];
-            if (v && v.status === "PASS") {
-              logPass(key, v.detail);
-            } else {
-              logFail(key, new Error(v ? (v.error || "Measurement variant failed") : `Missing result for ${key}`));
-            }
-            if (results.tests[key]) {
-              results.tests[key].implementation_owner = v ? v.implementation_owner : "Unknown";
+            const measureResults = await testBorrowedBulkMeasurementMode(bridge, wasmExports, memory);
+            results.borrowed_bulk_measure = measureResults.measurements;
+            for (const key of [
+              "workload_a_direct",
+              "workload_a_bulk",
+              "workload_a_bulk_borrowed",
+            ]) {
+              const v = measureResults.variants[key];
+              if (v && v.status === "PASS") {
+                logPass(key, v.detail);
+              } else {
+                logFail(key, new Error(v ? (v.error || "Measurement variant failed") : `Missing result for ${key}`));
+              }
+              if (results.tests[key]) {
+                results.tests[key].implementation_owner = v ? v.implementation_owner : "Unknown";
+              }
             }
           }
         } else if (searchParams.get("lane") === "math_transcendental") {
@@ -202,6 +403,61 @@
             "math_transcendental_differential",
             `Total: ${report.grand_totals.total}, exact: ${report.grand_totals.exact_bit_matches}, both_nan: ${report.grand_totals.both_nan_bit_differences}, mismatches: ${report.grand_totals.mismatches}, max_ulp: ${report.grand_totals.max_ulp}`
           );
+        } else if (searchParams.get("lane") === "math_simd_compose") {
+          const timingRequested = searchParams.get("timing") === "true";
+          const report = await testSimdComposeBrowser(wasmExports, { timing: timingRequested });
+          results.math_simd_compose = report;
+          if (report.status === "PASS") {
+            logPass(
+              "math_simd_compose_parity",
+              `Sizes tested: ${report.bit_parity.total_sizes_tested}, exact: ${report.bit_parity.total_exact_matches}, both_nan: ${report.bit_parity.total_both_nan_differences}, mismatches: ${report.bit_parity.total_mismatches}`
+            );
+            if (report.timings_executed && report.timings) {
+              logPass(
+                "math_simd_compose_timings",
+                `Workload: ${report.timings.workload}, batches: ${Object.keys(report.timings.batches || {}).length}`
+              );
+            }
+          } else {
+            logFail(
+              "math_simd_compose_parity",
+              new Error(`SIMD compose failed: base_passed=${report.base_passed}, mismatches=${report.bit_parity?.total_mismatches}`)
+            );
+          }
+        } else if (searchParams.get("lane") === "compute_affine") {
+          const report = await testComputeAffine(wasmExports);
+          results.compute_affine = report;
+          if (report.status === "PASS") {
+            logPass("compute_affine_suite", report.detail);
+            if (results.tests["compute_affine_suite"]) {
+              results.tests["compute_affine_suite"].implementation_owner = "new-backend";
+            }
+            for (const [caseKey, caseVal] of Object.entries(report.cases)) {
+              if (caseVal.status === "PASS") {
+                logPass(caseKey, caseVal.detail);
+              } else {
+                logFail(caseKey, new Error(caseVal.error || "Compute case failed"));
+              }
+              if (results.tests[caseKey]) {
+                results.tests[caseKey].implementation_owner = caseVal.implementation_owner || "new-backend";
+              }
+            }
+          } else {
+            logFail("compute_affine_suite", new Error(report.detail || "Compute affine suite failed"));
+            if (results.tests["compute_affine_suite"]) {
+              results.tests["compute_affine_suite"].implementation_owner = "new-backend";
+            }
+            for (const [caseKey, caseVal] of Object.entries(report.cases)) {
+              if (caseVal.status === "PASS") {
+                logPass(caseKey, caseVal.detail);
+              } else {
+                logFail(caseKey, new Error(caseVal.error || "Compute case failed"));
+              }
+              if (results.tests[caseKey]) {
+                results.tests[caseKey].implementation_owner = caseVal.implementation_owner || "new-backend";
+              }
+            }
+          }
         } else if (searchParams.get("lane") === "counterexamples") {
           results.host_environment = navigator.userAgent;
           const report = await testBundleResetCounterexample(wasmExports);

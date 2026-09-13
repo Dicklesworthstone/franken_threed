@@ -728,6 +728,7 @@ async function runWorkloadMeasurement(config) {
     if (typeof wasmExports?.f3d_build_affine_rows_batch_frame_packet === "function") {
       countingWasmExports.f3d_build_affine_rows_batch_frame_packet = function (...args) {
         currentStats.wasm_boundary_calls++;
+        currentStats.js_bytes_copied += args[0].byteLength; // wasm-bindgen copies affine_rows into Wasm.
         const packet = wasmExports.f3d_build_affine_rows_batch_frame_packet.apply(this, args);
         if (packet && packet.byteLength) currentStats.js_bytes_copied += packet.byteLength;
         return packet;
@@ -737,6 +738,7 @@ async function runWorkloadMeasurement(config) {
     if (typeof wasmExports?.f3d_build_affine_rows_bundle_packet === "function") {
       countingWasmExports.f3d_build_affine_rows_bundle_packet = function (...args) {
         currentStats.wasm_boundary_calls++;
+        currentStats.js_bytes_copied += args[0].byteLength;
         const packet = wasmExports.f3d_build_affine_rows_bundle_packet.apply(this, args);
         if (packet && packet.byteLength) currentStats.js_bytes_copied += packet.byteLength;
         return packet;
@@ -746,6 +748,7 @@ async function runWorkloadMeasurement(config) {
     if (typeof wasmExports?.f3d_pack_affine_rows_bytes === "function") {
       countingWasmExports.f3d_pack_affine_rows_bytes = function (...args) {
         currentStats.wasm_boundary_calls++;
+        currentStats.js_bytes_copied += args[0].byteLength;
         const bytes = wasmExports.f3d_pack_affine_rows_bytes.apply(this, args);
         if (bytes && bytes.byteLength) currentStats.js_bytes_copied += bytes.byteLength;
         return bytes;
@@ -775,6 +778,7 @@ async function runWorkloadMeasurement(config) {
     if (typeof wasmExports?.f3d_build_affine_rows_batch_frame_packet_borrowed === "function") {
       countingWasmExports.f3d_build_affine_rows_batch_frame_packet_borrowed = function (...args) {
         currentStats.wasm_boundary_calls++;
+        currentStats.js_bytes_copied += args[0].byteLength;
         const ptrLen = wasmExports.f3d_build_affine_rows_batch_frame_packet_borrowed.apply(this, args);
         currentStats.js_bytes_copied += 8;
         if (ptrLen && ptrLen.length >= 2) {
@@ -1240,8 +1244,8 @@ async function runWorkloadMeasurement(config) {
         gpu_elapsed_ms: "runs from submit start to completion callback, including credit-loop wait",
         elapsed_ms: "round wall time over measured frames only",
         counts: isBorrowedLane
-          ? "wasm_boundary_calls (JS-Wasm exports plus Wasm-JS callbacks, including chatty drawCall callbacks and borrow enter/exit), webgpu_api_calls (device, queue, encoder, pass methods), js_bytes_copied (Wasm-JS boundary copies plus writeBuffer payloads), js_bytes_viewed (direct Wasm memory packet bytes read by JS decoder), and view_rebuilds (Uint8Array view reallocations across frames) measured across 8 untimed frames per runner with counting wrappers removed before timed rounds"
-          : "wasm_boundary_calls (JS-Wasm exports plus Wasm-JS callbacks, including chatty drawCall callbacks), webgpu_api_calls (device, queue, encoder, pass methods), js_bytes_copied (Wasm-JS boundary copies plus writeBuffer payloads) measured across 8 untimed frames per runner with counting wrappers removed before timed rounds",
+          ? "wasm_boundary_calls (JS-Wasm exports plus Wasm-JS callbacks, including chatty drawCall callbacks and borrow enter/exit), webgpu_api_calls (device, queue, encoder, pass methods), js_bytes_copied (JS-to-Wasm input copies, Wasm-to-JS output copies, and writeBuffer payloads; excludes Rust-internal copies), js_bytes_viewed (direct Wasm memory packet bytes read by JS decoder), and view_rebuilds (Uint8Array view reallocations across frames) measured across 8 untimed frames per runner with counting wrappers removed before timed rounds"
+          : "wasm_boundary_calls (JS-Wasm exports plus Wasm-JS callbacks, including chatty drawCall callbacks), webgpu_api_calls (device, queue, encoder, pass methods), js_bytes_copied (JS-to-Wasm input copies, Wasm-to-JS output copies, and writeBuffer payloads; excludes Rust-internal copies) measured across 8 untimed frames per runner with counting wrappers removed before timed rounds",
         queue_identity_stable: "asserts bridge.device.queue === countedQueue on every counted frame; if false, per-frame counts are reported as null with unavailable_reason naming the frame",
         ...(isBorrowedLane
           ? {
@@ -1409,4 +1413,3 @@ export async function testBorrowedBulkMeasurementMode(bridge, wasmExports, memor
     repeatedFrames,
   });
 }
-

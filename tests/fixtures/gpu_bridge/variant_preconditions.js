@@ -20,7 +20,7 @@
  * - "direct": Direct JS WebGPU
  * - "bulk": Rust/Wasm packet encoder; JS WebGPU decoder
  * - "chatty": Rust/Wasm callback loop; JS WebGPU submission
- * - "generated": Hand-specialized static JS pass routines (precondition stand-in; not generator output, no Wasm data packing)
+ * - "generated": Actual static generator output for draw bindings; JS resource/pass setup, no Wasm data packing
  *
  * Correctness only; no timing. Lists any excluded variants explicitly.
  */
@@ -111,25 +111,44 @@ async function readbackStagingBuffer(device, readbackBuffer) {
   return result;
 }
 
-// Hand-specialized static JS pass routines (precondition stand-in; not generator output, no Wasm data packing)
+// Built via RCH using generateStaticSubmissionSource(1, 256, firstDraw).
+// Load only for this variant so missing artifacts cannot break unrelated lanes.
+let generatedDraws;
+async function loadGeneratedDraws() {
+  if (generatedDraws) return;
+  const modules = await Promise.all([
+    import("/out/browser-probe/static_submission_precondition0.js"),
+    import("/out/browser-probe/static_submission_precondition1.js"),
+  ]);
+  const draws = modules.map((module) => module.executeStaticSubmission1);
+  if (draws.some((draw) => typeof draw !== "function")) {
+    throw new Error("Missing executeStaticSubmission1 in generated precondition modules");
+  }
+  generatedDraws = draws;
+}
+
+function executeGeneratedDraw(pass, bindGroup, dynamicOffset) {
+  if (dynamicOffset !== 0 && dynamicOffset !== 256) {
+    throw new RangeError(`No generated precondition draw for offset ${dynamicOffset}`);
+  }
+  generatedDraws[dynamicOffset / 256](pass, bindGroup);
+}
+
 function executeGeneratedRedBluePass(pass, pipeline, bindGroup, dynamicOffset) {
   pass.setPipeline(pipeline);
-  pass.setBindGroup(0, bindGroup, [dynamicOffset]);
-  pass.draw(3, 1, 0, 0);
+  executeGeneratedDraw(pass, bindGroup, dynamicOffset);
 }
 
 function executeGeneratedBundleRecord(bundleEncoder, pipeline, vertexBuffer, bindGroup, dynamicOffset) {
   bundleEncoder.setPipeline(pipeline);
   bundleEncoder.setVertexBuffer(0, vertexBuffer);
-  bundleEncoder.setBindGroup(0, bindGroup, [dynamicOffset]);
-  bundleEncoder.draw(3, 1, 0, 0);
+  executeGeneratedDraw(bundleEncoder, bindGroup, dynamicOffset);
 }
 
 function executeGeneratedBundleDirectPass(pass, pipeline, vertexBuffer, bindGroup, dynamicOffset) {
   pass.setPipeline(pipeline);
   pass.setVertexBuffer(0, vertexBuffer);
-  pass.setBindGroup(0, bindGroup, [dynamicOffset]);
-  pass.draw(3, 1, 0, 0);
+  executeGeneratedDraw(pass, bindGroup, dynamicOffset);
 }
 
 
@@ -138,6 +157,7 @@ function executeGeneratedBundleDirectPass(pass, pipeline, vertexBuffer, bindGrou
  */
 async function runRedABlueBForVariant(variantKey, bridge, wasmExports) {
   const device = bridge.device;
+  if (variantKey === "generated") await loadGeneratedDraws();
 
   if (variantKey === "bulk") {
     // Bulk packet implementation using canonical Wasm exports
@@ -491,6 +511,7 @@ async function runRedABlueBForVariant(variantKey, bridge, wasmExports) {
  */
 async function runBundleThenDirectForVariant(variantKey, bridge, wasmExports) {
   const device = bridge.device;
+  if (variantKey === "generated") await loadGeneratedDraws();
 
   if (variantKey === "bulk") {
     const buildBundleDirectFn = wasmExports.f3d_build_bundle_direct_draw_packet || wasmExports.gpu_bridge_build_bundle_direct_draw_packet;
@@ -693,13 +714,13 @@ export async function testVariantPreconditions(bridge, wasmExports) {
     { key: "direct", owner: "Direct JS WebGPU" },
     { key: "bulk", owner: "Rust/Wasm packet encoder; JS WebGPU decoder" },
     { key: "chatty", owner: "Rust/Wasm callback loop; JS WebGPU submission" },
-    { key: "generated", owner: "Hand-specialized static JS pass routines (precondition stand-in; not generator output, no Wasm data packing)" },
+    { key: "generated", owner: "Generated static draw bindings; JavaScript resource/pass setup, no Wasm data packing" },
   ];
 
   const results = {
     variants: {},
     excluded_variants: [],
-    generated_precondition_scope: "hand_specialized_standin",
+    generated_precondition_scope: "static_submission_generator_output",
     tests: {},
   };
 

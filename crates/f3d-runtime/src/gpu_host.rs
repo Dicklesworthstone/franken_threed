@@ -378,6 +378,17 @@ pub const OPCODE_CREATE_PIPELINE_TEXTURED: u16 = 18;
 pub const OPCODE_RECORD_BUNDLE_BATCH: u16 = 19;
 /// Opcode for copying raw bytes from one GPU buffer to another.
 pub const OPCODE_COPY_BUFFER_TO_BUFFER: u16 = 20;
+/// Opcode for compiling and creating a compute pipeline with explicit bind group layout.
+pub const OPCODE_CREATE_COMPUTE_PIPELINE: u16 = 21;
+/// Opcode for executing a compute pass dispatching workgroups with explicit buffer bindings.
+pub const OPCODE_DISPATCH_COMPUTE: u16 = 22;
+
+/// Compute binding type: uniform buffer (`GPUBufferBindingType.uniform`).
+pub const BINDING_TYPE_UNIFORM: u32 = 0;
+/// Compute binding type: read-only storage buffer (`GPUBufferBindingType.read-only-storage`).
+pub const BINDING_TYPE_STORAGE_READ: u32 = 1;
+/// Compute binding type: read-write storage buffer (`GPUBufferBindingType.storage`).
+pub const BINDING_TYPE_STORAGE_READ_WRITE: u32 = 2;
 
 /// Sampler filter mode: nearest-neighbor filtering.
 pub const SAMPLER_FILTER_NEAREST: u32 = 0;
@@ -411,6 +422,19 @@ pub const BUFFER_USAGE_COPY_DST: u32 = 8;
 pub const BUFFER_USAGE_VERTEX: u32 = 32;
 /// GPUBufferUsage flag: uniform buffer.
 pub const BUFFER_USAGE_UNIFORM: u32 = 64;
+/// GPUBufferUsage flag: storage buffer (`GPUBufferUsage.STORAGE`).
+pub const BUFFER_USAGE_STORAGE: u32 = 128;
+
+/// Default persistent buffer ID for compute AffineRows storage.
+pub const COMPUTE_AFFINE_BUFFER_ID: u32 = 701;
+/// Default persistent buffer ID for compute input points storage.
+pub const COMPUTE_INPUT_POINTS_BUFFER_ID: u32 = 702;
+/// Default persistent buffer ID for compute output points storage.
+pub const COMPUTE_OUTPUT_POINTS_BUFFER_ID: u32 = 703;
+/// Default persistent buffer ID for compute readback staging.
+pub const COMPUTE_READBACK_BUFFER_ID: u32 = 704;
+/// Default persistent pipeline ID for AffineRows compute pipeline.
+pub const COMPUTE_PIPELINE_ID: u32 = 300;
 
 /// Persistent source buffer ID for AffineRows storage uploads (workload b / tmt.5).
 pub const AFFINE_ROWS_STORAGE_SRC_BUFFER_ID: u32 = 610;
@@ -551,6 +575,36 @@ pub const fn unpack_depth_store_op(packed: u32) -> u32 {
 #[inline]
 pub const fn unpack_depth_read_only(packed: u32) -> bool {
     ((packed >> 16) & 0xFF) != 0
+}
+
+/// Layout descriptor for an individual resource binding within a compute pipeline layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GpuComputeBindingLayout {
+    /// Zero-based binding index in group 0 (`@binding(index)`).
+    pub binding_index: u32,
+    /// Binding buffer type (0 = uniform, 1 = read-only storage, 2 = read-write storage).
+    pub binding_type: u32,
+    /// Minimum binding size in bytes (0 if unconstrained).
+    pub min_binding_size: u32,
+}
+
+/// Explicit buffer binding parameter for a compute dispatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GpuBufferBinding {
+    /// Zero-based binding index in group 0 (`@binding(index)`).
+    pub binding_index: u32,
+    /// Allocated GPU buffer identifier.
+    pub buffer_id: u32,
+    /// Byte offset within the bound buffer (must be multiple of 4; device limits checked on host).
+    pub offset: u64,
+    /// Byte size slice bound to this binding (must be multiple of 4, non-zero).
+    pub size: u64,
+    /// Binding buffer type (0 = uniform, 1 = read-only storage, 2 = read-write storage).
+    pub binding_type: u32,
+    /// Semantic epoch of the bound buffer state region.
+    pub epoch: Epoch,
+    /// Per-use buffer data version.
+    pub data_version: DataVersion,
 }
 
 /// High-level typed commands serialized into the checked packet.
@@ -885,6 +939,30 @@ pub enum GpuCommand {
         size: u64,
         /// Semantic epoch of the source buffer state region.
         epoch: Epoch,
+    },
+    /// Command to compile and create a compute pipeline with explicit bind group layout.
+    CreateComputePipeline {
+        /// Unique integer identifier for the pipeline.
+        pipeline_id: u32,
+        /// Complete WGSL shader source code.
+        wgsl_code: String,
+        /// Entry point function name (e.g. "main").
+        entry_point: String,
+        /// Explicit bind group 0 layout entries.
+        bindings: Vec<GpuComputeBindingLayout>,
+    },
+    /// Command to execute a compute pass dispatching workgroups with explicit buffer bindings.
+    DispatchCompute {
+        /// Unique integer identifier for the compute pipeline.
+        pipeline_id: u32,
+        /// Number of workgroups to dispatch in the X dimension.
+        workgroup_count_x: u32,
+        /// Number of workgroups to dispatch in the Y dimension.
+        workgroup_count_y: u32,
+        /// Number of workgroups to dispatch in the Z dimension.
+        workgroup_count_z: u32,
+        /// Explicit buffer bindings bound to group 0.
+        bindings: Vec<GpuBufferBinding>,
     },
 }
 
@@ -1479,6 +1557,166 @@ impl GpuSubmissionPacket {
                     command_records.extend_from_slice(&size.to_le_bytes());
                     command_records.extend_from_slice(&epoch.get().to_le_bytes());
                 }
+                GpuCommand::CreateComputePipeline {
+                    pipeline_id,
+                    wgsl_code,
+                    entry_point,
+                    bindings,
+                } => {
+                    let code_bytes = wgsl_code.as_bytes();
+                    let code_len = u32::try_from(code_bytes.len()).map_err(|_| {
+                        PacketEncodeError::CommandDataOverflow {
+                            command_index: cmd_idx,
+                            length: code_bytes.len(),
+                        }
+                    })?;
+                    let ep_bytes = entry_point.as_bytes();
+                    let ep_len = u32::try_from(ep_bytes.len()).map_err(|_| {
+                        PacketEncodeError::CommandDataOverflow {
+                            command_index: cmd_idx,
+                            length: ep_bytes.len(),
+                        }
+                    })?;
+
+                    let current_len = data_payload.len();
+                    let needed_payload = code_bytes.len().checked_add(ep_bytes.len()).ok_or_else(|| {
+                        PacketEncodeError::DataPayloadOverflow {
+                            offset: current_len,
+                            length: code_bytes.len(),
+                        }
+                    })?;
+                    if current_len.checked_add(needed_payload).map_or(true, |sum| sum > max_payload_len) {
+                        return Err(PacketEncodeError::DataPayloadOverflow {
+                            offset: current_len,
+                            length: needed_payload,
+                        });
+                    }
+
+                    let code_offset = u32::try_from(current_len).map_err(|_| {
+                        PacketEncodeError::DataPayloadOverflow {
+                            offset: current_len,
+                            length: code_bytes.len(),
+                        }
+                    })?;
+                    data_payload.extend_from_slice(code_bytes);
+
+                    let ep_offset = u32::try_from(data_payload.len()).map_err(|_| {
+                        PacketEncodeError::DataPayloadOverflow {
+                            offset: data_payload.len(),
+                            length: ep_bytes.len(),
+                        }
+                    })?;
+                    data_payload.extend_from_slice(ep_bytes);
+
+                    let binding_count = u32::try_from(bindings.len()).map_err(|_| {
+                        PacketEncodeError::InvalidDimensions("binding count exceeds u32::MAX".to_string())
+                    })?;
+
+                    for (i, b) in bindings.iter().enumerate() {
+                        if b.binding_type > BINDING_TYPE_STORAGE_READ_WRITE {
+                            return Err(PacketEncodeError::InvalidDimensions(format!(
+                                "Invalid binding_type {} at binding index {}",
+                                b.binding_type, b.binding_index
+                            )));
+                        }
+                        for other in &bindings[i + 1..] {
+                            if b.binding_index == other.binding_index {
+                                return Err(PacketEncodeError::InvalidDimensions(format!(
+                                    "Duplicate binding index {} in CreateComputePipeline",
+                                    b.binding_index
+                                )));
+                            }
+                        }
+                    }
+
+                    command_records.extend_from_slice(&OPCODE_CREATE_COMPUTE_PIPELINE.to_le_bytes());
+                    command_records.extend_from_slice(&0u16.to_le_bytes()); // _pad0
+                    command_records.extend_from_slice(&pipeline_id.to_le_bytes());
+                    command_records.extend_from_slice(&code_offset.to_le_bytes());
+                    command_records.extend_from_slice(&code_len.to_le_bytes());
+                    command_records.extend_from_slice(&ep_offset.to_le_bytes());
+                    command_records.extend_from_slice(&ep_len.to_le_bytes());
+                    command_records.extend_from_slice(&binding_count.to_le_bytes());
+                    command_records.extend_from_slice(&0u32.to_le_bytes()); // _pad1
+
+                    for b in bindings {
+                        command_records.extend_from_slice(&b.binding_index.to_le_bytes());
+                        command_records.extend_from_slice(&b.binding_type.to_le_bytes());
+                        command_records.extend_from_slice(&b.min_binding_size.to_le_bytes());
+                        command_records.extend_from_slice(&0u32.to_le_bytes()); // _pad
+                    }
+                }
+                GpuCommand::DispatchCompute {
+                    pipeline_id,
+                    workgroup_count_x,
+                    workgroup_count_y,
+                    workgroup_count_z,
+                    bindings,
+                } => {
+                    let binding_count = u32::try_from(bindings.len()).map_err(|_| {
+                        PacketEncodeError::InvalidDimensions("binding count exceeds u32::MAX".to_string())
+                    })?;
+
+                    for (i, b) in bindings.iter().enumerate() {
+                        if b.buffer_id == 0 {
+                            return Err(PacketEncodeError::InvalidDimensions(format!(
+                                "buffer_id must be non-zero for binding {}",
+                                b.binding_index
+                            )));
+                        }
+                        if b.binding_type > BINDING_TYPE_STORAGE_READ_WRITE {
+                            return Err(PacketEncodeError::InvalidDimensions(format!(
+                                "Invalid binding_type {} for binding {}",
+                                b.binding_type, b.binding_index
+                            )));
+                        }
+                        if b.size == 0 {
+                            return Err(PacketEncodeError::InvalidDimensions(format!(
+                                "Binding {} size must be non-zero",
+                                b.binding_index
+                            )));
+                        }
+                        if b.binding_type != BINDING_TYPE_UNIFORM && b.size % 4 != 0 {
+                            return Err(PacketEncodeError::InvalidDimensions(format!(
+                                "Storage binding {} size {} must be a multiple of 4",
+                                b.binding_index, b.size
+                            )));
+                        }
+                        b.offset.checked_add(b.size).ok_or_else(|| {
+                            PacketEncodeError::InvalidDimensions(format!(
+                                "Binding {} offset + size overflow",
+                                b.binding_index
+                            ))
+                        })?;
+                        for other in &bindings[i + 1..] {
+                            if b.binding_index == other.binding_index {
+                                return Err(PacketEncodeError::InvalidDimensions(format!(
+                                    "Duplicate binding index {} in DispatchCompute",
+                                    b.binding_index
+                                )));
+                            }
+                        }
+                    }
+
+                    command_records.extend_from_slice(&OPCODE_DISPATCH_COMPUTE.to_le_bytes());
+                    command_records.extend_from_slice(&0u16.to_le_bytes()); // _pad0
+                    command_records.extend_from_slice(&pipeline_id.to_le_bytes());
+                    command_records.extend_from_slice(&workgroup_count_x.to_le_bytes());
+                    command_records.extend_from_slice(&workgroup_count_y.to_le_bytes());
+                    command_records.extend_from_slice(&workgroup_count_z.to_le_bytes());
+                    command_records.extend_from_slice(&binding_count.to_le_bytes());
+
+                    for b in bindings {
+                        command_records.extend_from_slice(&b.binding_index.to_le_bytes());
+                        command_records.extend_from_slice(&b.buffer_id.to_le_bytes());
+                        command_records.extend_from_slice(&b.offset.to_le_bytes());
+                        command_records.extend_from_slice(&b.size.to_le_bytes());
+                        command_records.extend_from_slice(&b.binding_type.to_le_bytes());
+                        command_records.extend_from_slice(&0u32.to_le_bytes()); // _pad
+                        command_records.extend_from_slice(&b.epoch.get().to_le_bytes());
+                        command_records.extend_from_slice(&b.data_version.get().to_le_bytes());
+                    }
+                }
             }
         }
 
@@ -2043,6 +2281,10 @@ pub fn lower_plan(plan: &ExecutionPlan) -> Result<Vec<GpuCommand>, PlanLoweringE
                     }
                 }
             }
+            // PassKind::Compute lowering from high-level ExecutionPlan awaits explicit WGSL
+            // binding index lowering in the next slice (do not infer binding indices from resource IDs;
+            // packet-level compute execution is supported directly via GpuCommand::CreateComputePipeline
+            // and GpuCommand::DispatchCompute).
             PassKind::Compute => {
                 return Err(PlanLoweringError::UnsupportedPassKind {
                     segment_name: segment.name().to_string(),
@@ -2868,6 +3110,467 @@ pub fn build_render_then_copy_submission(
     );
     Ok(packet)
 }
+
+/// Builds a [`GpuSubmissionPacket`] executing a real compute shader that transforms input points
+/// with packed AffineRows storage and copies transformed points to a map-readable staging buffer.
+///
+/// Supported input contracts:
+/// - Points: Packed 4-float vectors (`[x, y, z, w]`). Multiples of 3 or non-multiples of 4 are rejected.
+/// - Affine transforms: Either 1 transform (broadcast to all points) or exactly 1 transform per point.
+///   All other cardinalities are rejected.
+///
+/// Execution pipeline:
+/// 1. Registers resource IDs in the generational slot table:
+///    - Buffer 701: AffineRows storage (`STORAGE | COPY_DST`)
+///    - Buffer 702: Input points storage (`STORAGE | COPY_DST`)
+///    - Buffer 703: Output points storage (`STORAGE | COPY_SRC`)
+///    - Buffer 704: Readback staging buffer (`MAP_READ | COPY_DST`)
+///    - Pipeline 300: Compute pipeline
+/// 2. Creates and populates storage buffers via `WriteBuffer`.
+/// 3. Compiles compute pipeline with explicit bindings:
+///    - Binding 0: Read-only AffineRows storage (`array<AffineRows>`)
+///    - Binding 1: Read-only Input points storage (`array<vec4<f32>>`)
+///    - Binding 2: Read-write Output points storage (`array<vec4<f32>>`)
+///    Embeds canonical [`WGSL_AFFINE_ROWS_DECLARATION`] from schema (§6.1, vqa.2).
+/// 4. Dispatches compute pass with workgroup size (64, 1, 1).
+/// 5. Copies output storage buffer 703 to readback staging buffer 704 via `CopyBufferToBuffer` (opcode 20).
+pub fn build_affine_rows_compute_submission(
+    affine_rows: &[f32],
+    points: &[f32],
+) -> Result<GpuSubmissionPacket, PacketEncodeError> {
+    if points.is_empty() || points.len() % 4 != 0 {
+        return Err(PacketEncodeError::InvalidDimensions(format!(
+            "points length {} must be non-empty and a multiple of 4 (packed [x, y, z, w] vec4 floats)",
+            points.len()
+        )));
+    }
+    let num_points = points.len() / 4;
+    let mut point_bytes = Vec::with_capacity(points.len() * 4);
+    for &val in points {
+        point_bytes.extend_from_slice(&val.to_le_bytes());
+    }
+
+    let affine_bytes = pack_affine_rows_storage_bytes(affine_rows)?;
+    let num_transforms = affine_rows.len() / 12;
+    if num_transforms != 1 && num_transforms != num_points {
+        return Err(PacketEncodeError::InvalidDimensions(format!(
+            "affine transform count ({num_transforms}) must be either 1 (broadcast to all points) or match point count ({num_points})"
+        )));
+    }
+    let affine_size = affine_bytes.len() as u32;
+    let points_size = u32::try_from(point_bytes.len()).map_err(|_| {
+        PacketEncodeError::InvalidDimensions("points byte length exceeds u32::MAX".to_string())
+    })?;
+
+    with_global_resource_table(|table| {
+        table.register(COMPUTE_AFFINE_BUFFER_ID);
+        table.register(COMPUTE_INPUT_POINTS_BUFFER_ID);
+        table.register(COMPUTE_OUTPUT_POINTS_BUFFER_ID);
+        table.register(COMPUTE_READBACK_BUFFER_ID);
+        table.register(COMPUTE_PIPELINE_ID);
+    });
+
+    let compute_shader = [
+        WGSL_AFFINE_ROWS_DECLARATION,
+        "\n\
+@group(0) @binding(0)\n\
+var<storage, read> affine_transforms: array<AffineRows>;\n\
+\n\
+@group(0) @binding(1)\n\
+var<storage, read> in_points: array<vec4<f32>>;\n\
+\n\
+@group(0) @binding(2)\n\
+var<storage, read_write> out_points: array<vec4<f32>>;\n\
+\n\
+@compute @workgroup_size(64)\n\
+fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {\n\
+    let idx = global_id.x;\n\
+    if (idx >= arrayLength(&in_points)) {\n\
+        return;\n\
+    }\n\
+    let p = in_points[idx].xyz;\n\
+    var transform_idx = 0u;\n\
+    if (arrayLength(&affine_transforms) > 1u) {\n\
+        transform_idx = idx;\n\
+    }\n\
+    let transformed = transform_affine_point(affine_transforms[transform_idx], p);\n\
+    out_points[idx] = vec4<f32>(transformed, 1.0);\n\
+}\n",
+    ]
+    .concat();
+
+    let mut packet = GpuSubmissionPacket::new();
+
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: COMPUTE_AFFINE_BUFFER_ID,
+        size: affine_size,
+        usage: BUFFER_USAGE_STORAGE | BUFFER_USAGE_COPY_DST,
+    });
+    packet.push(GpuCommand::WriteBuffer {
+        buffer_id: COMPUTE_AFFINE_BUFFER_ID,
+        offset: 0,
+        data: affine_bytes,
+    });
+
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: COMPUTE_INPUT_POINTS_BUFFER_ID,
+        size: points_size,
+        usage: BUFFER_USAGE_STORAGE | BUFFER_USAGE_COPY_DST,
+    });
+    packet.push(GpuCommand::WriteBuffer {
+        buffer_id: COMPUTE_INPUT_POINTS_BUFFER_ID,
+        offset: 0,
+        data: point_bytes,
+    });
+
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: COMPUTE_OUTPUT_POINTS_BUFFER_ID,
+        size: points_size,
+        usage: BUFFER_USAGE_STORAGE | BUFFER_USAGE_COPY_SRC,
+    });
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: COMPUTE_READBACK_BUFFER_ID,
+        size: points_size,
+        usage: BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST,
+    });
+
+    packet.push(GpuCommand::CreateComputePipeline {
+        pipeline_id: COMPUTE_PIPELINE_ID,
+        wgsl_code: compute_shader,
+        entry_point: "main".to_string(),
+        bindings: alloc::vec![
+            GpuComputeBindingLayout {
+                binding_index: 0,
+                binding_type: BINDING_TYPE_STORAGE_READ,
+                min_binding_size: 48,
+            },
+            GpuComputeBindingLayout {
+                binding_index: 1,
+                binding_type: BINDING_TYPE_STORAGE_READ,
+                min_binding_size: 16,
+            },
+            GpuComputeBindingLayout {
+                binding_index: 2,
+                binding_type: BINDING_TYPE_STORAGE_READ_WRITE,
+                min_binding_size: 16,
+            },
+        ],
+    });
+
+    let workgroup_count_x = ((num_points as u32).saturating_add(63)) / 64;
+    packet.push(GpuCommand::DispatchCompute {
+        pipeline_id: COMPUTE_PIPELINE_ID,
+        workgroup_count_x: workgroup_count_x.max(1),
+        workgroup_count_y: 1,
+        workgroup_count_z: 1,
+        bindings: alloc::vec![
+            GpuBufferBinding {
+                binding_index: 0,
+                buffer_id: COMPUTE_AFFINE_BUFFER_ID,
+                offset: 0,
+                size: affine_size as u64,
+                binding_type: BINDING_TYPE_STORAGE_READ,
+                epoch: Epoch::ZERO,
+                data_version: DataVersion::new(1),
+            },
+            GpuBufferBinding {
+                binding_index: 1,
+                buffer_id: COMPUTE_INPUT_POINTS_BUFFER_ID,
+                offset: 0,
+                size: points_size as u64,
+                binding_type: BINDING_TYPE_STORAGE_READ,
+                epoch: Epoch::ZERO,
+                data_version: DataVersion::new(1),
+            },
+            GpuBufferBinding {
+                binding_index: 2,
+                buffer_id: COMPUTE_OUTPUT_POINTS_BUFFER_ID,
+                offset: 0,
+                size: points_size as u64,
+                binding_type: BINDING_TYPE_STORAGE_READ_WRITE,
+                epoch: Epoch::ZERO,
+                data_version: DataVersion::new(1),
+            },
+        ],
+    });
+
+    packet.push(GpuCommand::CopyBufferToBuffer {
+        source_buffer_id: COMPUTE_OUTPUT_POINTS_BUFFER_ID,
+        source_offset: 0,
+        destination_buffer_id: COMPUTE_READBACK_BUFFER_ID,
+        destination_offset: 0,
+        size: points_size as u64,
+        epoch: Epoch::ZERO,
+    });
+
+    Ok(packet)
+}
+
+/// Builds a [`GpuSubmissionPacket`] with two sequential compute dispatches demonstrating
+/// independent per-use buffer slices or deliberate input aliasing.
+///
+/// Execution pipeline:
+/// 1. Registers resources in the generational slot table:
+///    - Buffer 701: AffineRows storage (512 bytes: Slice A at 0..256, Slice B at 256..512)
+///    - Buffer 702: Input points storage
+///    - Buffer 703: Output points storage (2 * slice_stride bytes: Slice A at 0, Slice B at slice_stride)
+///    - Buffer 704: Readback staging buffer (2 * slice_stride bytes)
+///    - Pipeline 300: Compute pipeline
+/// 2. Dispatches pass 1 (Matrix A): binds Slice A (offset 0), version 1.
+/// 3. Dispatches pass 2 (Matrix B or aliased Matrix A):
+///    - If `aliased`: binds Slice A (offset 0), version 1 (hazard counterexample).
+///    - If not `aliased`: binds Slice B (offset 256), version 2 (independent per-use slice).
+/// 4. Copies both output slices from Buffer 703 to Readback Buffer 704 via `CopyBufferToBuffer` (opcode 20).
+pub fn build_two_dispatch_affine_compute_submission(
+    matrix_a: &[f32],
+    matrix_b: &[f32],
+    points: &[f32],
+    aliased: bool,
+) -> Result<GpuSubmissionPacket, PacketEncodeError> {
+    if matrix_a.len() != 12 {
+        return Err(PacketEncodeError::InvalidDimensions(format!(
+            "matrix_a length {} must be exactly 12 floats",
+            matrix_a.len()
+        )));
+    }
+    if matrix_b.len() != 12 {
+        return Err(PacketEncodeError::InvalidDimensions(format!(
+            "matrix_b length {} must be exactly 12 floats",
+            matrix_b.len()
+        )));
+    }
+    if points.is_empty() || points.len() % 4 != 0 {
+        return Err(PacketEncodeError::InvalidDimensions(format!(
+            "points length {} must be non-empty and a multiple of 4 (packed [x, y, z, w] vec4 floats)",
+            points.len()
+        )));
+    }
+
+    let num_points = points.len() / 4;
+    let points_byte_len = u32::try_from(points.len() * 4).map_err(|_| {
+        PacketEncodeError::InvalidDimensions("points byte length exceeds u32::MAX".to_string())
+    })?;
+    let output_slice_stride = ((points_byte_len.saturating_add(255)) / 256) * 256;
+    let total_output_size = output_slice_stride.checked_mul(2).ok_or_else(|| {
+        PacketEncodeError::InvalidDimensions("output buffer size overflow".to_string())
+    })?;
+
+    let packed_a = pack_affine_rows_storage_bytes(matrix_a)?;
+    let packed_b = pack_affine_rows_storage_bytes(matrix_b)?;
+    let mut affine_storage = Vec::with_capacity(512);
+    affine_storage.extend_from_slice(&packed_a);
+    affine_storage.resize(256, 0);
+    affine_storage.extend_from_slice(&packed_b);
+    affine_storage.resize(512, 0);
+
+    let mut point_bytes = Vec::with_capacity(points.len() * 4);
+    for &val in points {
+        point_bytes.extend_from_slice(&val.to_le_bytes());
+    }
+
+    with_global_resource_table(|table| {
+        table.register(COMPUTE_AFFINE_BUFFER_ID);
+        table.register(COMPUTE_INPUT_POINTS_BUFFER_ID);
+        table.register(COMPUTE_OUTPUT_POINTS_BUFFER_ID);
+        table.register(COMPUTE_READBACK_BUFFER_ID);
+        table.register(COMPUTE_PIPELINE_ID);
+    });
+
+    let compute_shader = [
+        WGSL_AFFINE_ROWS_DECLARATION,
+        "\n\
+@group(0) @binding(0)\n\
+var<storage, read> affine_transforms: array<AffineRows>;\n\
+\n\
+@group(0) @binding(1)\n\
+var<storage, read> in_points: array<vec4<f32>>;\n\
+\n\
+@group(0) @binding(2)\n\
+var<storage, read_write> out_points: array<vec4<f32>>;\n\
+\n\
+@compute @workgroup_size(64)\n\
+fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {\n\
+    let idx = global_id.x;\n\
+    if (idx >= arrayLength(&in_points)) {\n\
+        return;\n\
+    }\n\
+    let p = in_points[idx].xyz;\n\
+    let transformed = transform_affine_point(affine_transforms[0], p);\n\
+    out_points[idx] = vec4<f32>(transformed, 1.0);\n\
+}\n",
+    ]
+    .concat();
+
+    let mut packet = GpuSubmissionPacket::new();
+
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: COMPUTE_AFFINE_BUFFER_ID,
+        size: 512,
+        usage: BUFFER_USAGE_STORAGE | BUFFER_USAGE_COPY_DST,
+    });
+    packet.push(GpuCommand::WriteBuffer {
+        buffer_id: COMPUTE_AFFINE_BUFFER_ID,
+        offset: 0,
+        data: affine_storage,
+    });
+
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: COMPUTE_INPUT_POINTS_BUFFER_ID,
+        size: points_byte_len,
+        usage: BUFFER_USAGE_STORAGE | BUFFER_USAGE_COPY_DST,
+    });
+    packet.push(GpuCommand::WriteBuffer {
+        buffer_id: COMPUTE_INPUT_POINTS_BUFFER_ID,
+        offset: 0,
+        data: point_bytes,
+    });
+
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: COMPUTE_OUTPUT_POINTS_BUFFER_ID,
+        size: total_output_size,
+        usage: BUFFER_USAGE_STORAGE | BUFFER_USAGE_COPY_SRC,
+    });
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: COMPUTE_READBACK_BUFFER_ID,
+        size: total_output_size,
+        usage: BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST,
+    });
+
+    packet.push(GpuCommand::CreateComputePipeline {
+        pipeline_id: COMPUTE_PIPELINE_ID,
+        wgsl_code: compute_shader,
+        entry_point: "main".to_string(),
+        bindings: alloc::vec![
+            GpuComputeBindingLayout {
+                binding_index: 0,
+                binding_type: BINDING_TYPE_STORAGE_READ,
+                min_binding_size: 48,
+            },
+            GpuComputeBindingLayout {
+                binding_index: 1,
+                binding_type: BINDING_TYPE_STORAGE_READ,
+                min_binding_size: 16,
+            },
+            GpuComputeBindingLayout {
+                binding_index: 2,
+                binding_type: BINDING_TYPE_STORAGE_READ_WRITE,
+                min_binding_size: 16,
+            },
+        ],
+    });
+
+    let workgroup_count_x = ((num_points as u32).saturating_add(63)) / 64;
+
+    // Dispatch 1: binds Slice A (offset 0, DataVersion 1) -> Output Slice A (offset 0)
+    packet.push(GpuCommand::DispatchCompute {
+        pipeline_id: COMPUTE_PIPELINE_ID,
+        workgroup_count_x: workgroup_count_x.max(1),
+        workgroup_count_y: 1,
+        workgroup_count_z: 1,
+        bindings: alloc::vec![
+            GpuBufferBinding {
+                binding_index: 0,
+                buffer_id: COMPUTE_AFFINE_BUFFER_ID,
+                offset: 0,
+                size: 48,
+                binding_type: BINDING_TYPE_STORAGE_READ,
+                epoch: Epoch::ZERO,
+                data_version: DataVersion::new(1),
+            },
+            GpuBufferBinding {
+                binding_index: 1,
+                buffer_id: COMPUTE_INPUT_POINTS_BUFFER_ID,
+                offset: 0,
+                size: points_byte_len as u64,
+                binding_type: BINDING_TYPE_STORAGE_READ,
+                epoch: Epoch::ZERO,
+                data_version: DataVersion::new(1),
+            },
+            GpuBufferBinding {
+                binding_index: 2,
+                buffer_id: COMPUTE_OUTPUT_POINTS_BUFFER_ID,
+                offset: 0,
+                size: points_byte_len as u64,
+                binding_type: BINDING_TYPE_STORAGE_READ_WRITE,
+                epoch: Epoch::ZERO,
+                data_version: DataVersion::new(1),
+            },
+        ],
+    });
+
+    // Dispatch 2: binds Slice B (offset 256, DataVersion 2), or Slice A if aliased
+    let (matrix_offset, data_version) = if aliased {
+        (0u64, DataVersion::new(1))
+    } else {
+        (256u64, DataVersion::new(2))
+    };
+
+    packet.push(GpuCommand::DispatchCompute {
+        pipeline_id: COMPUTE_PIPELINE_ID,
+        workgroup_count_x: workgroup_count_x.max(1),
+        workgroup_count_y: 1,
+        workgroup_count_z: 1,
+        bindings: alloc::vec![
+            GpuBufferBinding {
+                binding_index: 0,
+                buffer_id: COMPUTE_AFFINE_BUFFER_ID,
+                offset: matrix_offset,
+                size: 48,
+                binding_type: BINDING_TYPE_STORAGE_READ,
+                epoch: Epoch::ZERO,
+                data_version,
+            },
+            GpuBufferBinding {
+                binding_index: 1,
+                buffer_id: COMPUTE_INPUT_POINTS_BUFFER_ID,
+                offset: 0,
+                size: points_byte_len as u64,
+                binding_type: BINDING_TYPE_STORAGE_READ,
+                epoch: Epoch::ZERO,
+                data_version,
+            },
+            GpuBufferBinding {
+                binding_index: 2,
+                buffer_id: COMPUTE_OUTPUT_POINTS_BUFFER_ID,
+                offset: output_slice_stride as u64,
+                size: points_byte_len as u64,
+                binding_type: BINDING_TYPE_STORAGE_READ_WRITE,
+                epoch: Epoch::ZERO,
+                data_version,
+            },
+        ],
+    });
+
+    // Copy both output slices to readback staging buffer
+    packet.push(GpuCommand::CopyBufferToBuffer {
+        source_buffer_id: COMPUTE_OUTPUT_POINTS_BUFFER_ID,
+        source_offset: 0,
+        destination_buffer_id: COMPUTE_READBACK_BUFFER_ID,
+        destination_offset: 0,
+        size: total_output_size as u64,
+        epoch: Epoch::ZERO,
+    });
+
+    Ok(packet)
+}
+
+/// Independent mathematical CPU oracle for affine point transformation (test-local).
+///
+/// Computes `P' = (dot(r0, [P.xyz, 1]), dot(r1, [P.xyz, 1]), dot(r2, [P.xyz, 1]))`.
+#[cfg(test)]
+#[must_use]
+pub(crate) fn cpu_transform_affine_point(affine_12: &[f32], point_4: &[f32]) -> [f32; 4] {
+    assert_eq!(affine_12.len(), 12, "affine_12 must have exactly 12 floats");
+    assert_eq!(point_4.len(), 4, "point_4 must have exactly 4 floats [x, y, z, w]");
+    let x = point_4[0];
+    let y = point_4[1];
+    let z = point_4[2];
+    let tx = affine_12[0] * x + affine_12[1] * y + affine_12[2] * z + affine_12[3];
+    let ty = affine_12[4] * x + affine_12[5] * y + affine_12[6] * z + affine_12[7];
+    let tz = affine_12[8] * x + affine_12[9] * y + affine_12[10] * z + affine_12[11];
+    [tx, ty, tz, 1.0]
+}
+
 
 /// Builds a textured WGSL triangle submission packet using `f3d_core::layout::AffineRows`
 /// and sampling from a 2D texture (bead vqa.6).
@@ -5248,6 +5951,56 @@ pub fn f3d_build_render_then_copy_packet(
     size: u32,
 ) -> Result<Vec<u8>, String> {
     build_render_then_copy_submission(data, source_offset, destination_offset, size)
+        .and_then(|packet| packet.encode())
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen]
+/// Canonical Wasm export: builds an AffineRows compute submission packet transforming points in GPU storage.
+pub fn f3d_build_affine_rows_compute_packet(
+    affine_rows: &[f32],
+    points: &[f32],
+) -> Result<Vec<u8>, JsValue> {
+    build_affine_rows_compute_submission(affine_rows, points)
+        .and_then(|packet| packet.encode())
+        .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+#[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
+/// Native export for `f3d_build_affine_rows_compute_packet` for host verification and unit tests.
+pub fn f3d_build_affine_rows_compute_packet(
+    affine_rows: &[f32],
+    points: &[f32],
+) -> Result<Vec<u8>, String> {
+    build_affine_rows_compute_submission(affine_rows, points)
+        .and_then(|packet| packet.encode())
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen]
+/// Canonical Wasm export: builds a two-dispatch AffineRows compute packet for browser counterexample & verification.
+pub fn f3d_build_two_dispatch_affine_compute_packet(
+    matrix_a: &[f32],
+    matrix_b: &[f32],
+    points: &[f32],
+    aliased: bool,
+) -> Result<Vec<u8>, JsValue> {
+    build_two_dispatch_affine_compute_submission(matrix_a, matrix_b, points, aliased)
+        .and_then(|packet| packet.encode())
+        .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+#[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
+/// Native export for `f3d_build_two_dispatch_affine_compute_packet` for host verification and unit tests.
+pub fn f3d_build_two_dispatch_affine_compute_packet(
+    matrix_a: &[f32],
+    matrix_b: &[f32],
+    points: &[f32],
+    aliased: bool,
+) -> Result<Vec<u8>, String> {
+    build_two_dispatch_affine_compute_submission(matrix_a, matrix_b, points, aliased)
         .and_then(|packet| packet.encode())
         .map_err(|e| e.to_string())
 }
@@ -13100,5 +13853,706 @@ mod tests {
             found_wrong_pipeline,
             "build_affine_rows_layout_counterexample_submission(true) must contain CreatePipeline"
         );
+    }
+
+    #[test]
+    fn test_compute_opcodes_byte_layout() {
+        let mut packet = GpuSubmissionPacket::new();
+        let code = "@compute @workgroup_size(64) fn main() {}";
+        let entry = "main";
+        packet.push(GpuCommand::CreateComputePipeline {
+            pipeline_id: 300,
+            wgsl_code: code.to_string(),
+            entry_point: entry.to_string(),
+            bindings: alloc::vec![
+                GpuComputeBindingLayout {
+                    binding_index: 0,
+                    binding_type: BINDING_TYPE_STORAGE_READ,
+                    min_binding_size: 48,
+                },
+                GpuComputeBindingLayout {
+                    binding_index: 1,
+                    binding_type: BINDING_TYPE_STORAGE_READ_WRITE,
+                    min_binding_size: 16,
+                },
+            ],
+        });
+        packet.push(GpuCommand::DispatchCompute {
+            pipeline_id: 300,
+            workgroup_count_x: 4,
+            workgroup_count_y: 1,
+            workgroup_count_z: 1,
+            bindings: alloc::vec![
+                GpuBufferBinding {
+                    binding_index: 0,
+                    buffer_id: 701,
+                    offset: 0,
+                    size: 48,
+                    binding_type: BINDING_TYPE_STORAGE_READ,
+                    epoch: Epoch::new(100),
+                    data_version: DataVersion::new(1),
+                },
+                GpuBufferBinding {
+                    binding_index: 1,
+                    buffer_id: 702,
+                    offset: 256,
+                    size: 64,
+                    binding_type: BINDING_TYPE_STORAGE_READ_WRITE,
+                    epoch: Epoch::new(200),
+                    data_version: DataVersion::new(2),
+                },
+            ],
+        });
+
+        let encoded = packet.encode().expect("compute packet encoding must succeed");
+
+        // 1. Validate packet header (16 bytes)
+        assert_eq!(&encoded[0..4], b"F3DP");
+        assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 1); // version
+        assert_eq!(u16::from_le_bytes([encoded[6], encoded[7]]), 0); // flags
+        assert_eq!(u32::from_le_bytes(encoded[8..12].try_into().unwrap()), 2); // cmd_count
+        let total_data_len = u32::from_le_bytes(encoded[12..16].try_into().unwrap());
+        let expected_payload_len = (code.len() + entry.len()) as u32;
+        assert_eq!(total_data_len, expected_payload_len);
+
+        // 2. Validate Command 0: CreateComputePipeline (Opcode 21)
+        let mut cur = 16;
+        let op0 = u16::from_le_bytes([encoded[cur], encoded[cur + 1]]);
+        assert_eq!(op0, OPCODE_CREATE_COMPUTE_PIPELINE);
+        let pad0 = u16::from_le_bytes([encoded[cur + 2], encoded[cur + 3]]);
+        assert_eq!(pad0, 0);
+        let pipe_id = u32::from_le_bytes(encoded[cur + 4..cur + 8].try_into().unwrap());
+        assert_eq!(pipe_id, 300);
+        let code_off = u32::from_le_bytes(encoded[cur + 8..cur + 12].try_into().unwrap());
+        assert_eq!(code_off, 0);
+        let code_len = u32::from_le_bytes(encoded[cur + 12..cur + 16].try_into().unwrap());
+        assert_eq!(code_len, code.len() as u32);
+        let ep_off = u32::from_le_bytes(encoded[cur + 16..cur + 20].try_into().unwrap());
+        assert_eq!(ep_off, code.len() as u32);
+        let ep_len = u32::from_le_bytes(encoded[cur + 20..cur + 24].try_into().unwrap());
+        assert_eq!(ep_len, entry.len() as u32);
+        let b_count = u32::from_le_bytes(encoded[cur + 24..cur + 28].try_into().unwrap());
+        assert_eq!(b_count, 2);
+        let pad1 = u32::from_le_bytes(encoded[cur + 28..cur + 32].try_into().unwrap());
+        assert_eq!(pad1, 0);
+        cur += 32;
+
+        // Descriptors (2 * 16 bytes)
+        assert_eq!(u32::from_le_bytes(encoded[cur..cur + 4].try_into().unwrap()), 0); // binding_index
+        assert_eq!(u32::from_le_bytes(encoded[cur + 4..cur + 8].try_into().unwrap()), BINDING_TYPE_STORAGE_READ);
+        assert_eq!(u32::from_le_bytes(encoded[cur + 8..cur + 12].try_into().unwrap()), 48); // min_binding_size
+        assert_eq!(u32::from_le_bytes(encoded[cur + 12..cur + 16].try_into().unwrap()), 0); // pad
+        cur += 16;
+
+        assert_eq!(u32::from_le_bytes(encoded[cur..cur + 4].try_into().unwrap()), 1); // binding_index
+        assert_eq!(u32::from_le_bytes(encoded[cur + 4..cur + 8].try_into().unwrap()), BINDING_TYPE_STORAGE_READ_WRITE);
+        assert_eq!(u32::from_le_bytes(encoded[cur + 8..cur + 12].try_into().unwrap()), 16); // min_binding_size
+        assert_eq!(u32::from_le_bytes(encoded[cur + 12..cur + 16].try_into().unwrap()), 0); // pad
+        cur += 16;
+
+        // 3. Validate Command 1: DispatchCompute (Opcode 22)
+        let op1 = u16::from_le_bytes([encoded[cur], encoded[cur + 1]]);
+        assert_eq!(op1, OPCODE_DISPATCH_COMPUTE);
+        assert_eq!(u16::from_le_bytes([encoded[cur + 2], encoded[cur + 3]]), 0); // pad0
+        assert_eq!(u32::from_le_bytes(encoded[cur + 4..cur + 8].try_into().unwrap()), 300); // pipeline_id
+        assert_eq!(u32::from_le_bytes(encoded[cur + 8..cur + 12].try_into().unwrap()), 4); // wg_x
+        assert_eq!(u32::from_le_bytes(encoded[cur + 12..cur + 16].try_into().unwrap()), 1); // wg_y
+        assert_eq!(u32::from_le_bytes(encoded[cur + 16..cur + 20].try_into().unwrap()), 1); // wg_z
+        assert_eq!(u32::from_le_bytes(encoded[cur + 20..cur + 24].try_into().unwrap()), 2); // binding_count
+        cur += 24;
+
+        // Binding record 0 (48 bytes)
+        assert_eq!(u32::from_le_bytes(encoded[cur..cur + 4].try_into().unwrap()), 0); // index
+        assert_eq!(u32::from_le_bytes(encoded[cur + 4..cur + 8].try_into().unwrap()), 701); // buffer_id
+        assert_eq!(u64::from_le_bytes(encoded[cur + 8..cur + 16].try_into().unwrap()), 0); // offset
+        assert_eq!(u64::from_le_bytes(encoded[cur + 16..cur + 24].try_into().unwrap()), 48); // size
+        assert_eq!(u32::from_le_bytes(encoded[cur + 24..cur + 28].try_into().unwrap()), BINDING_TYPE_STORAGE_READ);
+        assert_eq!(u32::from_le_bytes(encoded[cur + 28..cur + 32].try_into().unwrap()), 0); // pad
+        assert_eq!(u64::from_le_bytes(encoded[cur + 32..cur + 40].try_into().unwrap()), 100); // epoch
+        assert_eq!(u64::from_le_bytes(encoded[cur + 40..cur + 48].try_into().unwrap()), 1); // data_version
+        cur += 48;
+
+        // Binding record 1 (48 bytes)
+        assert_eq!(u32::from_le_bytes(encoded[cur..cur + 4].try_into().unwrap()), 1); // index
+        assert_eq!(u32::from_le_bytes(encoded[cur + 4..cur + 8].try_into().unwrap()), 702); // buffer_id
+        assert_eq!(u64::from_le_bytes(encoded[cur + 8..cur + 16].try_into().unwrap()), 256); // offset
+        assert_eq!(u64::from_le_bytes(encoded[cur + 16..cur + 24].try_into().unwrap()), 64); // size
+        assert_eq!(u32::from_le_bytes(encoded[cur + 24..cur + 28].try_into().unwrap()), BINDING_TYPE_STORAGE_READ_WRITE);
+        assert_eq!(u32::from_le_bytes(encoded[cur + 28..cur + 32].try_into().unwrap()), 0); // pad
+        assert_eq!(u64::from_le_bytes(encoded[cur + 32..cur + 40].try_into().unwrap()), 200); // epoch
+        assert_eq!(u64::from_le_bytes(encoded[cur + 40..cur + 48].try_into().unwrap()), 2); // data_version
+        cur += 48;
+
+        // 4. Validate Data Payload
+        assert_eq!(&encoded[cur..cur + code.len()], code.as_bytes());
+        cur += code.len();
+        assert_eq!(&encoded[cur..cur + entry.len()], entry.as_bytes());
+        cur += entry.len();
+
+        assert_eq!(cur, encoded.len());
+    }
+
+    #[test]
+    fn test_compute_validation_and_bounds_rejection() {
+        // 1. CreateComputePipeline: invalid binding_type (> 2)
+        let mut p1 = GpuSubmissionPacket::new();
+        p1.push(GpuCommand::CreateComputePipeline {
+            pipeline_id: 300,
+            wgsl_code: "fn main() {}".to_string(),
+            entry_point: "main".to_string(),
+            bindings: alloc::vec![GpuComputeBindingLayout {
+                binding_index: 0,
+                binding_type: 3,
+                min_binding_size: 0,
+            }],
+        });
+        assert!(p1.encode().is_err());
+
+        // 2. CreateComputePipeline: duplicate binding_index
+        let mut p2 = GpuSubmissionPacket::new();
+        p2.push(GpuCommand::CreateComputePipeline {
+            pipeline_id: 300,
+            wgsl_code: "fn main() {}".to_string(),
+            entry_point: "main".to_string(),
+            bindings: alloc::vec![
+                GpuComputeBindingLayout { binding_index: 0, binding_type: 0, min_binding_size: 0 },
+                GpuComputeBindingLayout { binding_index: 0, binding_type: 1, min_binding_size: 0 },
+            ],
+        });
+        assert!(p2.encode().is_err());
+
+        // 3. CreateComputePipeline: data payload overflow
+        let mut p3 = GpuSubmissionPacket::new();
+        p3.push(GpuCommand::CreateComputePipeline {
+            pipeline_id: 300,
+            wgsl_code: "fn main() {}".to_string(),
+            entry_point: "main".to_string(),
+            bindings: alloc::vec![],
+        });
+        assert!(matches!(p3.encode_bounded(5), Err(PacketEncodeError::DataPayloadOverflow { .. })));
+
+        // 4. DispatchCompute: buffer_id == 0
+        let mut p4 = GpuSubmissionPacket::new();
+        p4.push(GpuCommand::DispatchCompute {
+            pipeline_id: 300,
+            workgroup_count_x: 1,
+            workgroup_count_y: 1,
+            workgroup_count_z: 1,
+            bindings: alloc::vec![GpuBufferBinding {
+                binding_index: 0,
+                buffer_id: 0,
+                offset: 0,
+                size: 16,
+                binding_type: 0,
+                epoch: Epoch::ZERO,
+                data_version: DataVersion::new(1),
+            }],
+        });
+        assert!(p4.encode().is_err());
+
+        // 5. DispatchCompute: offset alignment is not enforced natively without device profile (root 21381)
+        let mut p5 = GpuSubmissionPacket::new();
+        p5.push(GpuCommand::DispatchCompute {
+            pipeline_id: 300,
+            workgroup_count_x: 1,
+            workgroup_count_y: 1,
+            workgroup_count_z: 1,
+            bindings: alloc::vec![GpuBufferBinding {
+                binding_index: 0,
+                buffer_id: 701,
+                offset: 3,
+                size: 16,
+                binding_type: BINDING_TYPE_UNIFORM,
+                epoch: Epoch::ZERO,
+                data_version: DataVersion::new(1),
+            }],
+        });
+        assert!(p5.encode().is_ok());
+
+        // 6. DispatchCompute: size == 0
+        let mut p6 = GpuSubmissionPacket::new();
+        p6.push(GpuCommand::DispatchCompute {
+            pipeline_id: 300,
+            workgroup_count_x: 1,
+            workgroup_count_y: 1,
+            workgroup_count_z: 1,
+            bindings: alloc::vec![GpuBufferBinding {
+                binding_index: 0,
+                buffer_id: 701,
+                offset: 0,
+                size: 0,
+                binding_type: 0,
+                epoch: Epoch::ZERO,
+                data_version: DataVersion::new(1),
+            }],
+        });
+        assert!(p6.encode().is_err());
+
+        // 7. DispatchCompute: storage size % 4 != 0 rejected, but uniform scalar size allowed
+        let mut p7_storage = GpuSubmissionPacket::new();
+        p7_storage.push(GpuCommand::DispatchCompute {
+            pipeline_id: 300,
+            workgroup_count_x: 1,
+            workgroup_count_y: 1,
+            workgroup_count_z: 1,
+            bindings: alloc::vec![GpuBufferBinding {
+                binding_index: 0,
+                buffer_id: 701,
+                offset: 0,
+                size: 15,
+                binding_type: BINDING_TYPE_STORAGE_READ,
+                epoch: Epoch::ZERO,
+                data_version: DataVersion::new(1),
+            }],
+        });
+        assert!(p7_storage.encode().is_err());
+
+        // Uniform bindings: scalar f32 size 4 and arbitrary sizes are permitted
+        let mut p7_uniform = GpuSubmissionPacket::new();
+        p7_uniform.push(GpuCommand::DispatchCompute {
+            pipeline_id: 300,
+            workgroup_count_x: 1,
+            workgroup_count_y: 1,
+            workgroup_count_z: 1,
+            bindings: alloc::vec![
+                GpuBufferBinding {
+                    binding_index: 0,
+                    buffer_id: 701,
+                    offset: 0,
+                    size: 4, // scalar f32 uniform
+                    binding_type: BINDING_TYPE_UNIFORM,
+                    epoch: Epoch::ZERO,
+                    data_version: DataVersion::new(1),
+                },
+                GpuBufferBinding {
+                    binding_index: 1,
+                    buffer_id: 702,
+                    offset: 0,
+                    size: 1, // 1-byte uniform binding (WebGPU CTS createBindGroup)
+                    binding_type: BINDING_TYPE_UNIFORM,
+                    epoch: Epoch::ZERO,
+                    data_version: DataVersion::new(1),
+                },
+            ],
+        });
+        assert!(p7_uniform.encode().is_ok());
+
+        // 8. DispatchCompute: offset + size overflow
+        let mut p8 = GpuSubmissionPacket::new();
+        p8.push(GpuCommand::DispatchCompute {
+            pipeline_id: 300,
+            workgroup_count_x: 1,
+            workgroup_count_y: 1,
+            workgroup_count_z: 1,
+            bindings: alloc::vec![GpuBufferBinding {
+                binding_index: 0,
+                buffer_id: 701,
+                offset: u64::MAX - 3,
+                size: 8,
+                binding_type: 0,
+                epoch: Epoch::ZERO,
+                data_version: DataVersion::new(1),
+            }],
+        });
+        assert!(p8.encode().is_err());
+
+        // 9. DispatchCompute: duplicate binding_index
+        let mut p9 = GpuSubmissionPacket::new();
+        p9.push(GpuCommand::DispatchCompute {
+            pipeline_id: 300,
+            workgroup_count_x: 1,
+            workgroup_count_y: 1,
+            workgroup_count_z: 1,
+            bindings: alloc::vec![
+                GpuBufferBinding {
+                    binding_index: 0,
+                    buffer_id: 701,
+                    offset: 0,
+                    size: 16,
+                    binding_type: 0,
+                    epoch: Epoch::ZERO,
+                    data_version: DataVersion::new(1),
+                },
+                GpuBufferBinding {
+                    binding_index: 0,
+                    buffer_id: 702,
+                    offset: 0,
+                    size: 16,
+                    binding_type: 0,
+                    epoch: Epoch::ZERO,
+                    data_version: DataVersion::new(1),
+                },
+            ],
+        });
+        assert!(p9.encode().is_err());
+
+        // 10. build_affine_rows_compute_submission input bounds & cardinality
+        let valid_affine = [1.0f32; 12];
+        let valid_points = [0.0f32; 4];
+        assert!(build_affine_rows_compute_submission(&[], &valid_points).is_err());
+        assert!(build_affine_rows_compute_submission(&[1.0; 11], &valid_points).is_err());
+        assert!(build_affine_rows_compute_submission(&valid_affine, &[]).is_err());
+        assert!(build_affine_rows_compute_submission(&valid_affine, &[1.0; 3]).is_err()); // vec3 rejected
+        assert!(build_affine_rows_compute_submission(&valid_affine, &[1.0; 5]).is_err()); // non-multiple of 4 rejected
+        // Cardinality: 1 transform for 2 points -> OK (broadcast)
+        let two_points = [0.0f32; 8];
+        assert!(build_affine_rows_compute_submission(&valid_affine, &two_points).is_ok());
+        // Cardinality: 2 transforms for 2 points -> OK (1:1)
+        let two_affines = [1.0f32; 24];
+        assert!(build_affine_rows_compute_submission(&two_affines, &two_points).is_ok());
+        // Cardinality: 2 transforms for 3 points -> Err (neither 1 nor 3)
+        let three_points = [0.0f32; 12];
+        assert!(build_affine_rows_compute_submission(&two_affines, &three_points).is_err());
+    }
+
+    #[test]
+    fn test_render_pass_serialized_before_compute_commands() {
+        // Structural check: verifies serialized command order when interleaving render and compute commands.
+        // NOTE: This is a packet serialization structure check, not GPU execution proof.
+        // Full GPU pass closure before compute execution requires browser verification.
+        let mut packet = GpuSubmissionPacket::new();
+        packet.push(GpuCommand::RenderPass {
+            target_type: TARGET_CANVAS,
+            target_id: 0,
+            clear_color: [0.0, 0.0, 0.0, 1.0],
+            pipeline_id: 100,
+            vertex_buffer_id: 1,
+            vertex_count: 3,
+            uniform_dynamic_offset: 0,
+            uniform_buffer_id: 1,
+            load_op: LOAD_OP_CLEAR,
+            store_op: STORE_OP_STORE,
+            pass_flags: PASS_FLAG_NEW_PASS,
+        });
+        packet.push(GpuCommand::CreateComputePipeline {
+            pipeline_id: 300,
+            wgsl_code: "@compute @workgroup_size(64) fn main() {}".to_string(),
+            entry_point: "main".to_string(),
+            bindings: alloc::vec![],
+        });
+        packet.push(GpuCommand::DispatchCompute {
+            pipeline_id: 300,
+            workgroup_count_x: 1,
+            workgroup_count_y: 1,
+            workgroup_count_z: 1,
+            bindings: alloc::vec![],
+        });
+        packet.push(GpuCommand::CopyBufferToBuffer {
+            source_buffer_id: 703,
+            source_offset: 0,
+            destination_buffer_id: 704,
+            destination_offset: 0,
+            size: 16,
+            epoch: Epoch::ZERO,
+        });
+
+        let encoded = packet.encode().expect("mixed render-compute packet encoding must succeed");
+        assert_eq!(packet.commands().len(), 4);
+
+        // Command 0 is RenderPass (opcode 4) with STORE_OP_STORE and PASS_FLAG_NEW_PASS
+        match &packet.commands()[0] {
+            GpuCommand::RenderPass { store_op, pass_flags, .. } => {
+                assert_eq!(*store_op, STORE_OP_STORE);
+                assert_eq!(*pass_flags, PASS_FLAG_NEW_PASS);
+            }
+            other => panic!("expected RenderPass, got {other:?}"),
+        }
+
+        // Command 1 is CreateComputePipeline (opcode 21)
+        assert!(matches!(&packet.commands()[1], GpuCommand::CreateComputePipeline { .. }));
+
+        // Command 2 is DispatchCompute (opcode 22)
+        assert!(matches!(&packet.commands()[2], GpuCommand::DispatchCompute { .. }));
+
+        // Command 3 is CopyBufferToBuffer (opcode 20)
+        assert!(matches!(&packet.commands()[3], GpuCommand::CopyBufferToBuffer { .. }));
+
+        // Verify encoded byte opcodes in sequence
+        let mut cur = 16;
+        assert_eq!(u16::from_le_bytes([encoded[cur], encoded[cur + 1]]), OPCODE_RENDER_PASS);
+        cur += 46;
+        assert_eq!(u16::from_le_bytes([encoded[cur], encoded[cur + 1]]), OPCODE_CREATE_COMPUTE_PIPELINE);
+        cur += 32;
+        assert_eq!(u16::from_le_bytes([encoded[cur], encoded[cur + 1]]), OPCODE_DISPATCH_COMPUTE);
+        cur += 24;
+        assert_eq!(u16::from_le_bytes([encoded[cur], encoded[cur + 1]]), OPCODE_COPY_BUFFER_TO_BUFFER);
+    }
+
+    #[test]
+    fn test_compute_explicit_bindings_roundtrip() {
+        let bindings_layout = alloc::vec![
+            GpuComputeBindingLayout {
+                binding_index: 0,
+                binding_type: BINDING_TYPE_STORAGE_READ,
+                min_binding_size: 48,
+            },
+            GpuComputeBindingLayout {
+                binding_index: 1,
+                binding_type: BINDING_TYPE_STORAGE_READ,
+                min_binding_size: 16,
+            },
+            GpuComputeBindingLayout {
+                binding_index: 2,
+                binding_type: BINDING_TYPE_STORAGE_READ_WRITE,
+                min_binding_size: 16,
+            },
+        ];
+
+        let bindings_dispatch = alloc::vec![
+            GpuBufferBinding {
+                binding_index: 0,
+                buffer_id: 701,
+                offset: 0,
+                size: 48,
+                binding_type: BINDING_TYPE_STORAGE_READ,
+                epoch: Epoch::new(100),
+                data_version: DataVersion::new(1),
+            },
+            GpuBufferBinding {
+                binding_index: 1,
+                buffer_id: 702,
+                offset: 256,
+                size: 64,
+                binding_type: BINDING_TYPE_STORAGE_READ,
+                epoch: Epoch::new(100),
+                data_version: DataVersion::new(2),
+            },
+            GpuBufferBinding {
+                binding_index: 2,
+                buffer_id: 703,
+                offset: 512,
+                size: 64,
+                binding_type: BINDING_TYPE_STORAGE_READ_WRITE,
+                epoch: Epoch::new(200),
+                data_version: DataVersion::new(3),
+            },
+        ];
+
+        let mut packet = GpuSubmissionPacket::new();
+        packet.push(GpuCommand::CreateComputePipeline {
+            pipeline_id: 300,
+            wgsl_code: "@compute @workgroup_size(64) fn main() {}".to_string(),
+            entry_point: "main".to_string(),
+            bindings: bindings_layout.clone(),
+        });
+        packet.push(GpuCommand::DispatchCompute {
+            pipeline_id: 300,
+            workgroup_count_x: 1,
+            workgroup_count_y: 1,
+            workgroup_count_z: 1,
+            bindings: bindings_dispatch.clone(),
+        });
+
+        let encoded = packet.encode().expect("encoding must succeed");
+
+        // Decode CreateComputePipeline
+        let mut cur = 16;
+        assert_eq!(u16::from_le_bytes([encoded[cur], encoded[cur + 1]]), OPCODE_CREATE_COMPUTE_PIPELINE);
+        assert_eq!(u32::from_le_bytes(encoded[cur + 4..cur + 8].try_into().unwrap()), 300);
+        let b_count = u32::from_le_bytes(encoded[cur + 24..cur + 28].try_into().unwrap()) as usize;
+        assert_eq!(b_count, 3);
+        cur += 32;
+
+        for (i, expected) in bindings_layout.iter().enumerate() {
+            let idx = u32::from_le_bytes(encoded[cur..cur + 4].try_into().unwrap());
+            let b_type = u32::from_le_bytes(encoded[cur + 4..cur + 8].try_into().unwrap());
+            let min_sz = u32::from_le_bytes(encoded[cur + 8..cur + 12].try_into().unwrap());
+            cur += 16;
+            assert_eq!(idx, expected.binding_index, "layout {i} index");
+            assert_eq!(b_type, expected.binding_type, "layout {i} type");
+            assert_eq!(min_sz, expected.min_binding_size, "layout {i} min_size");
+        }
+
+        // Decode DispatchCompute
+        assert_eq!(u16::from_le_bytes([encoded[cur], encoded[cur + 1]]), OPCODE_DISPATCH_COMPUTE);
+        assert_eq!(u32::from_le_bytes(encoded[cur + 4..cur + 8].try_into().unwrap()), 300);
+        assert_eq!(u32::from_le_bytes(encoded[cur + 8..cur + 12].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(encoded[cur + 12..cur + 16].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(encoded[cur + 16..cur + 20].try_into().unwrap()), 1);
+        let d_count = u32::from_le_bytes(encoded[cur + 20..cur + 24].try_into().unwrap()) as usize;
+        assert_eq!(d_count, 3);
+        cur += 24;
+
+        for (i, expected) in bindings_dispatch.iter().enumerate() {
+            let idx = u32::from_le_bytes(encoded[cur..cur + 4].try_into().unwrap());
+            let buf_id = u32::from_le_bytes(encoded[cur + 4..cur + 8].try_into().unwrap());
+            let off = u64::from_le_bytes(encoded[cur + 8..cur + 16].try_into().unwrap());
+            let sz = u64::from_le_bytes(encoded[cur + 16..cur + 24].try_into().unwrap());
+            let b_type = u32::from_le_bytes(encoded[cur + 24..cur + 28].try_into().unwrap());
+            let ep = u64::from_le_bytes(encoded[cur + 32..cur + 40].try_into().unwrap());
+            let dv = u64::from_le_bytes(encoded[cur + 40..cur + 48].try_into().unwrap());
+            cur += 48;
+
+            assert_eq!(idx, expected.binding_index, "dispatch {i} index");
+            assert_eq!(buf_id, expected.buffer_id, "dispatch {i} buffer_id");
+            assert_eq!(off, expected.offset, "dispatch {i} offset");
+            assert_eq!(sz, expected.size, "dispatch {i} size");
+            assert_eq!(b_type, expected.binding_type, "dispatch {i} type");
+            assert_eq!(ep, expected.epoch.get(), "dispatch {i} epoch");
+            assert_eq!(dv, expected.data_version.get(), "dispatch {i} data_version");
+        }
+    }
+
+    #[test]
+    fn test_compute_affine_transformation_cpu_oracle() {
+        // Affine transformation:
+        // Scale (2.0, 3.0, 4.0), Translation (10.0, 20.0, 30.0)
+        // Row 0: [2.0, 0.0, 0.0, 10.0]
+        // Row 1: [0.0, 3.0, 0.0, 20.0]
+        // Row 2: [0.0, 0.0, 4.0, 30.0]
+        let affine_floats = [
+            2.0f32, 0.0, 0.0, 10.0,
+            0.0, 3.0, 0.0, 20.0,
+            0.0, 0.0, 4.0, 30.0,
+        ];
+        let point = [1.0f32, 2.0, 3.0, 1.0];
+
+        // CPU Oracle computation
+        let oracle_out = cpu_transform_affine_point(&affine_floats, &point);
+        assert_eq!(oracle_out, [12.0f32, 26.0, 42.0, 1.0]);
+
+        // Struct AffineRows equivalence
+        let affine = AffineRows::new(
+            [2.0, 0.0, 0.0, 10.0],
+            [0.0, 3.0, 0.0, 20.0],
+            [0.0, 0.0, 4.0, 30.0],
+        );
+        let p3 = [1.0f32, 2.0, 3.0];
+        let p4 = [p3[0], p3[1], p3[2], 1.0];
+        let dot_r0 = affine.r0[0] * p4[0] + affine.r0[1] * p4[1] + affine.r0[2] * p4[2] + affine.r0[3] * p4[3];
+        let dot_r1 = affine.r1[0] * p4[0] + affine.r1[1] * p4[1] + affine.r1[2] * p4[2] + affine.r1[3] * p4[3];
+        let dot_r2 = affine.r2[0] * p4[0] + affine.r2[1] * p4[1] + affine.r2[2] * p4[2] + affine.r2[3] * p4[3];
+        assert_eq!([dot_r0, dot_r1, dot_r2, 1.0], oracle_out);
+
+        // Build submission packet and verify structure
+        let packet = build_affine_rows_compute_submission(&affine_floats, &point)
+            .expect("build_affine_rows_compute_submission must succeed");
+        assert_eq!(packet.commands().len(), 9);
+
+        // Verify WGSL code in CreateComputePipeline contains schema WGSL_AFFINE_ROWS_DECLARATION
+        let mut found_pipeline = false;
+        for cmd in packet.commands() {
+            if let GpuCommand::CreateComputePipeline { wgsl_code, entry_point, .. } = cmd {
+                found_pipeline = true;
+                assert!(wgsl_code.contains(WGSL_AFFINE_ROWS_DECLARATION), "shader must contain schema declaration");
+                assert!(wgsl_code.contains("transform_affine_point"), "shader must call transform_affine_point");
+                assert_eq!(entry_point, "main");
+            }
+        }
+        assert!(found_pipeline);
+
+        // Verify native export
+        let exported_bytes = f3d_build_affine_rows_compute_packet(&affine_floats, &point)
+            .expect("f3d_build_affine_rows_compute_packet export must succeed");
+        assert!(!exported_bytes.is_empty());
+        assert_eq!(&exported_bytes[0..4], b"F3DP");
+    }
+
+    #[test]
+    fn test_two_dispatch_packet_structure_and_oracle_outputs() {
+        // Structural check: verifies multi-dispatch packet structure with non-overlapping buffer slices
+        // and distinct data versions, and confirms that the mathematical CPU oracle produces distinct
+        // expected outputs for matrices A and B.
+        // NOTE: This verifies packet encoding and CPU oracle math, not GPU execution proof.
+        // Real GPU execution proof of independent outputs on WebGPU requires browser execution.
+        // Matrix A: Scale (2.0, 2.0, 2.0), Translation (1.0, 0.0, 0.0) -> r0=[2,0,0,1], r1=[0,2,0,0], r2=[0,0,2,0]
+        let matrix_a_floats = [
+            2.0f32, 0.0, 0.0, 1.0,
+            0.0, 2.0, 0.0, 0.0,
+            0.0, 0.0, 2.0, 0.0,
+        ];
+        // Matrix B: Scale (0.5, 0.5, 0.5), Translation (0.0, 5.0, 0.0) -> r0=[0.5,0,0,0], r1=[0,0.5,0,5], r2=[0,0,0.5,0]
+        let matrix_b_floats = [
+            0.5f32, 0.0, 0.0, 0.0,
+            0.0, 0.5, 0.0, 5.0,
+            0.0, 0.0, 0.5, 0.0,
+        ];
+
+        let point = [2.0f32, 2.0, 2.0, 1.0];
+
+        // Oracle A and Oracle B produce distinct results for the same point
+        let out_a = cpu_transform_affine_point(&matrix_a_floats, &point);
+        let out_b = cpu_transform_affine_point(&matrix_b_floats, &point);
+        assert_eq!(out_a, [5.0f32, 4.0, 4.0, 1.0]);
+        assert_eq!(out_b, [1.0f32, 6.0, 1.0, 1.0]);
+        assert_ne!(out_a, out_b, "Independent dispatches must yield distinct oracle outputs");
+
+        // 1. Independent dispatches with per-use versioned slices
+        let packet = build_two_dispatch_affine_compute_submission(&matrix_a_floats, &matrix_b_floats, &point, false)
+            .expect("two-dispatch submission must succeed");
+        let encoded = packet.encode().expect("two-dispatch packet encoding must succeed");
+        assert!(!encoded.is_empty());
+
+        let dispatches: Vec<&GpuCommand> = packet.commands().iter()
+            .filter(|c| matches!(c, GpuCommand::DispatchCompute { .. }))
+            .collect();
+        assert_eq!(dispatches.len(), 2);
+        if let (
+            GpuCommand::DispatchCompute { bindings: b1, .. },
+            GpuCommand::DispatchCompute { bindings: b2, .. },
+        ) = (dispatches[0], dispatches[1]) {
+            assert_eq!(b1[0].offset, 0);
+            assert_eq!(b1[0].data_version, DataVersion::new(1));
+            assert_eq!(b2[0].offset, 256);
+            assert_eq!(b2[0].data_version, DataVersion::new(2));
+            assert_ne!(b1[0].offset, b2[0].offset);
+            assert_ne!(b1[0].data_version, b2[0].data_version);
+        } else {
+            panic!("expected two DispatchCompute commands");
+        }
+
+        // 2. Aliased dispatches demonstrating input aliasing counterexample
+        let aliased_packet = build_two_dispatch_affine_compute_submission(&matrix_a_floats, &matrix_b_floats, &point, true)
+            .expect("aliased submission must succeed");
+        let dispatches_aliased: Vec<&GpuCommand> = aliased_packet.commands().iter()
+            .filter(|c| matches!(c, GpuCommand::DispatchCompute { .. }))
+            .collect();
+        assert_eq!(dispatches_aliased.len(), 2);
+        if let (
+            GpuCommand::DispatchCompute { bindings: b1, .. },
+            GpuCommand::DispatchCompute { bindings: b2, .. },
+        ) = (dispatches_aliased[0], dispatches_aliased[1]) {
+            assert_eq!(b1[0].offset, 0);
+            assert_eq!(b2[0].offset, 0, "aliased dispatch must reuse slice A offset 0");
+            assert_eq!(b1[0].data_version, b2[0].data_version);
+        }
+
+        // 3. Verify native export
+        let exported = f3d_build_two_dispatch_affine_compute_packet(&matrix_a_floats, &matrix_b_floats, &point, false)
+            .expect("export must succeed");
+        assert_eq!(&exported[0..4], b"F3DP");
+    }
+
+    #[test]
+    fn test_existing_opcodes_and_packet_lengths_stay_identical() {
+        assert_eq!(OPCODE_CREATE_BUFFER, 1);
+        assert_eq!(OPCODE_WRITE_BUFFER, 2);
+        assert_eq!(OPCODE_CREATE_PIPELINE, 3);
+        assert_eq!(OPCODE_RENDER_PASS, 4);
+        assert_eq!(OPCODE_COPY_TEXTURE_TO_BUFFER, 5);
+        assert_eq!(OPCODE_CREATE_TEXTURE, 6);
+        assert_eq!(OPCODE_RECORD_BUNDLE, 7);
+        assert_eq!(OPCODE_EXECUTE_BUNDLES, 8);
+        assert_eq!(OPCODE_SET_VIEWPORT, 9);
+        assert_eq!(OPCODE_SET_SCISSOR_RECT, 10);
+        assert_eq!(OPCODE_SET_DRAW_PARAMETERS, 11);
+        assert_eq!(OPCODE_CREATE_PIPELINE_DEPTH, 12);
+        assert_eq!(OPCODE_RENDER_PASS_DEPTH, 13);
+        assert_eq!(OPCODE_CREATE_PIPELINE_CULL, 14);
+        assert_eq!(OPCODE_CREATE_PIPELINE_DEPTH_CULL, 15);
+        assert_eq!(OPCODE_CREATE_PIPELINE_DEPTH_CULL_COLOR, 16);
+        assert_eq!(OPCODE_WRITE_TEXTURE, 17);
+        assert_eq!(OPCODE_CREATE_PIPELINE_TEXTURED, 18);
+        assert_eq!(OPCODE_RECORD_BUNDLE_BATCH, 19);
+        assert_eq!(OPCODE_COPY_BUFFER_TO_BUFFER, 20);
+        assert_eq!(OPCODE_CREATE_COMPUTE_PIPELINE, 21);
+        assert_eq!(OPCODE_DISPATCH_COMPUTE, 22);
+
+        // Verify buffer copy builder packet is unaffected:
+        // 16B packet header + 14B CreateBuffer + 22B WriteBuffer + 14B CreateBuffer + 42B CopyBufferToBuffer + 4B payload = 112B
+        let copy_packet = build_buffer_copy_submission(&[1, 2, 3, 4], 0, 0, 4)
+            .expect("copy builder must succeed");
+        let copy_encoded = copy_packet.encode().expect("copy encoding must succeed");
+        assert_eq!(copy_encoded.len(), 16 + 14 + 22 + 14 + 42 + 4);
     }
 }

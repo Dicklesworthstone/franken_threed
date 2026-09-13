@@ -605,6 +605,7 @@ export async function testWorkloadBMeasurementMode(host, wasmExports) {
     if (typeof wasmExports?.f3d_build_affine_rows_storage_upload_frame_packet === "function") {
       countingWasmExports.f3d_build_affine_rows_storage_upload_frame_packet = function(...args) {
         currentStats.wasm_boundary_calls++;
+        currentStats.js_bytes_copied += args[0].byteLength; // wasm-bindgen copies affine_rows into Wasm.
         const packet = wasmExports.f3d_build_affine_rows_storage_upload_frame_packet.apply(this, args);
         if (packet && packet.byteLength) {
           currentStats.js_bytes_copied += packet.byteLength;
@@ -616,6 +617,7 @@ export async function testWorkloadBMeasurementMode(host, wasmExports) {
     if (typeof wasmExports?.f3d_bridge_callback_storage_upload_frame === "function") {
       countingWasmExports.f3d_bridge_callback_storage_upload_frame = function(...args) {
         currentStats.wasm_boundary_calls++;
+        currentStats.js_bytes_copied += args[0].byteLength;
         return wasmExports.f3d_bridge_callback_storage_upload_frame.apply(this, args);
       };
     }
@@ -1034,7 +1036,7 @@ export async function testWorkloadBMeasurementMode(host, wasmExports) {
         cpu_ms: "runs from floats in to queue submitted",
         gpu_elapsed_ms: "runs from submit start to completion callback, including credit-loop wait",
         elapsed_ms: "round wall time over measured frames only",
-        counts: "wasm_boundary_calls (JS-Wasm exports plus Wasm-JS callbacks), webgpu_api_calls (device, queue, command encoder, buffer methods), js_bytes_copied (Wasm-JS boundary copies plus writeBuffer payloads) measured across 8 untimed frames per variant with counting wrappers removed before timed rounds",
+        counts: "wasm_boundary_calls (JS-Wasm exports plus Wasm-JS callbacks), webgpu_api_calls (device, queue, command encoder, buffer methods), js_bytes_copied (JS-to-Wasm input copies, Wasm-to-JS output copies, and writeBuffer payloads; excludes Rust-internal copies) measured across 8 untimed frames per variant with counting wrappers removed before timed rounds",
         queue_identity_stable: "asserts host.device.queue === countedQueue on every counted frame; if false, per-frame counts are reported as null with unavailable_reason naming the frame",
         init_ms: "variant persistent init plus first completed frame across 5 separate passes with rotated variant order; records init_ms_samples (5 values), init_ms_median, init_ms_p95, and the init_order of every pass",
         wasm_fetch_ms: "resource-timing download duration for f3d_runtime_bg.wasm, or 'unavailable' if no resource timing entry matches",

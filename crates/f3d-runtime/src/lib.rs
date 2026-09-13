@@ -11,12 +11,17 @@ pub mod frame;
 pub mod gpu_host;
 pub mod mesh;
 pub mod publication;
+pub mod simd_compose;
 
 #[cfg(all(feature = "browser", target_arch = "wasm32"))]
 mod probe;
 #[cfg(all(feature = "browser", target_arch = "wasm32"))]
 pub use probe::{
     burst_max_polls_per_turn, burst_polls, pump_turns, reenter_probe, start_probes,
+};
+pub use simd_compose::{
+    batch_compose_f64_scalar, batch_compose_f64_simd, f3d_batch_compose_scalar,
+    f3d_batch_compose_simd, ComposeMode, SimdComposeError,
 };
 #[cfg(all(feature = "browser", target_arch = "wasm32"))]
 pub use gpu_host::{
@@ -48,6 +53,8 @@ pub use gpu_host::{
     borrow_scope_bytes_view, borrowed_frame_packet_len, borrowed_frame_packet_ptr,
     build_affine_rows_batch_frame_packet_borrowed,
     build_affine_rows_batch_frame_submission, build_affine_rows_batch_submission,
+    build_affine_rows_compute_submission,
+    build_two_dispatch_affine_compute_submission,
     build_affine_rows_layout_counterexample_submission,
     build_affine_rows_storage_upload_callback_ops,
     build_affine_rows_storage_upload_frame_submission,
@@ -60,6 +67,8 @@ pub use gpu_host::{
     f3d_build_affine_rows_batch_frame_packet_borrowed,
     f3d_build_affine_rows_batch_packet,
     f3d_build_affine_rows_bundle_packet,
+    f3d_build_affine_rows_compute_packet,
+    f3d_build_two_dispatch_affine_compute_packet,
     f3d_build_affine_rows_layout_counterexample_packet,
     f3d_build_affine_rows_storage_upload_frame_packet,
     f3d_build_affine_rows_storage_upload_init_packet,
@@ -69,11 +78,15 @@ pub use gpu_host::{
     map_storage_upload_submission_to_callback_ops,
     pack_affine_rows_storage_bytes, pack_affine_rows_uniform_bytes,
     with_global_borrowed_frame_packet_ref,
-    StorageUploadCallbackOp,
+    GpuBufferBinding, GpuComputeBindingLayout, StorageUploadCallbackOp,
     AFFINE_ROWS_STORAGE_BUFFER_ID, AFFINE_ROWS_STORAGE_DST_SLOT_0,
     AFFINE_ROWS_STORAGE_DST_SLOT_1, AFFINE_ROWS_STORAGE_SRC_BUFFER_ID,
+    BINDING_TYPE_STORAGE_READ, BINDING_TYPE_STORAGE_READ_WRITE, BINDING_TYPE_UNIFORM,
+    BUFFER_USAGE_STORAGE,
+    COMPUTE_AFFINE_BUFFER_ID, COMPUTE_INPUT_POINTS_BUFFER_ID,
+    COMPUTE_OUTPUT_POINTS_BUFFER_ID, COMPUTE_READBACK_BUFFER_ID, COMPUTE_PIPELINE_ID,
     CULL_MODE_BACK, CULL_MODE_FRONT, CULL_MODE_NONE, FRONT_FACE_CCW, FRONT_FACE_CW,
-    OPCODE_COPY_BUFFER_TO_BUFFER,
+    OPCODE_COPY_BUFFER_TO_BUFFER, OPCODE_CREATE_COMPUTE_PIPELINE, OPCODE_DISPATCH_COMPUTE,
     OPCODE_CREATE_PIPELINE_CULL, OPCODE_CREATE_PIPELINE_DEPTH_CULL,
     OPCODE_CREATE_PIPELINE_DEPTH_CULL_COLOR,
 };
