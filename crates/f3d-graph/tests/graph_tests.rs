@@ -21,8 +21,8 @@ use f3d_graph::canvas::{CanvasEpochTracker, CanvasFormat, CanvasId};
 use f3d_graph::error::{CanvasError, GraphError, HazardError};
 use f3d_graph::hazard::{can_split_pass, split_pass_on_hazard, validate_pass_hazards};
 use f3d_graph::pass::{
-    ColorAttachment, CopyCommand, DepthStencilAttachment, Dispatch, Draw, DrawKind, LoadOp, Pass,
-    PassId, PassKind, RenderBundle, StoreOp,
+    ColorAttachment, ComputeBufferBinding, CopyCommand, DepthStencilAttachment, Dispatch, Draw,
+    DrawKind, LoadOp, Pass, PassId, PassKind, RenderBundle, StoreOp,
 };
 use f3d_graph::plan::{
     build_red_a_blue_b_plan, build_red_a_blue_b_render_plan, build_single_pass_bridge_plan,
@@ -836,6 +836,192 @@ fn positive_compute_per_dispatch_disjoint_adjacent_writable_ranges_accepted() {
 
     validate_pass_hazards(&pass)
         .expect("disjoint adjacent writable ranges in same dispatch must be accepted");
+}
+
+#[test]
+fn positive_compute_repeated_readonly_use_index_accepted() {
+    // Root 21773: Multiple bindings referencing the same read-only use_index are legal (§8.5).
+    let buf_storage = ResourceId::new(73);
+    let mut pass = Pass::new_compute(PassId::new(1), "compute_readonly_alias_pass");
+
+    let dispatch = Dispatch::new_with_bindings(
+        0,
+        500,
+        [64, 1, 1],
+        vec![ResourceUse::buffer_storage_read(
+            buf_storage,
+            DataVersion::INITIAL,
+            Some(0),
+            Some(1024),
+        )],
+        vec![
+            ComputeBufferBinding::new(0, 0),
+            ComputeBufferBinding::new(1, 0),
+        ],
+    );
+    pass.dispatches.push(dispatch);
+
+    validate_pass_hazards(&pass)
+        .expect("repeated read-only compute binding must be accepted");
+}
+
+#[test]
+fn negative_compute_repeated_writable_use_index_rejected_as_alias() {
+    // Root 21773: Multiple bindings referencing the same writable use_index must be rejected as an alias.
+    let buf_storage = ResourceId::new(74);
+    let mut pass = Pass::new_compute(PassId::new(1), "compute_writable_alias_pass");
+
+    let dispatch = Dispatch::new_with_bindings(
+        0,
+        500,
+        [64, 1, 1],
+        vec![ResourceUse::buffer_storage_write(
+            buf_storage,
+            DataVersion::INITIAL,
+            Some(0),
+            Some(1024),
+        )],
+        vec![
+            ComputeBufferBinding::new(0, 0),
+            ComputeBufferBinding::new(1, 0),
+        ],
+    );
+    pass.dispatches.push(dispatch);
+
+    let err = validate_pass_hazards(&pass)
+        .expect_err("repeated writable compute binding must be rejected as an alias");
+    match err {
+        HazardError::ComputeWritableAlias {
+            resource_id,
+            dispatch_id,
+            subresource,
+        } => {
+            assert_eq!(resource_id, buf_storage.get());
+            assert_eq!(dispatch_id, 0);
+            assert_eq!(subresource, SubresourceRange::WholeBuffer);
+        }
+        other => panic!("expected ComputeWritableAlias, got: {other:?}"),
+    }
+}
+
+#[test]
+fn negative_compute_binding_invalid_use_index_rejected() {
+    // Root 21498: use_index >= dispatch.uses.len() must be rejected with InvalidUseIndex.
+    let buf = ResourceId::new(75);
+    let mut pass = Pass::new_compute(PassId::new(1), "compute_oob_use_pass");
+
+    let dispatch = Dispatch::new_with_bindings(
+        0,
+        500,
+        [64, 1, 1],
+        vec![ResourceUse::buffer_uniform(
+            buf,
+            DataVersion::INITIAL,
+            Some(0),
+            Some(256),
+        )],
+        vec![ComputeBufferBinding::new(0, 99)],
+    );
+    pass.dispatches.push(dispatch);
+
+    let err = validate_pass_hazards(&pass)
+        .expect_err("out of bounds use_index must be rejected");
+    match err {
+        HazardError::InvalidUseIndex {
+            dispatch_id,
+            binding_index,
+            use_index,
+            uses_len,
+        } => {
+            assert_eq!(dispatch_id, 0);
+            assert_eq!(binding_index, 0);
+            assert_eq!(use_index, 99);
+            assert_eq!(uses_len, 1);
+        }
+        other => panic!("expected InvalidUseIndex, got: {other:?}"),
+    }
+}
+
+#[test]
+fn negative_compute_binding_duplicate_binding_index_rejected() {
+    // Root 21498: Duplicate group-0 binding_index must be rejected.
+    let buf0 = ResourceId::new(76);
+    let buf1 = ResourceId::new(77);
+    let mut pass = Pass::new_compute(PassId::new(1), "compute_dup_binding_pass");
+
+    let dispatch = Dispatch::new_with_bindings(
+        0,
+        500,
+        [64, 1, 1],
+        vec![
+            ResourceUse::buffer_storage_read(
+                buf0,
+                DataVersion::INITIAL,
+                Some(0),
+                Some(256),
+            ),
+            ResourceUse::buffer_storage_read(
+                buf1,
+                DataVersion::INITIAL,
+                Some(0),
+                Some(256),
+            ),
+        ],
+        vec![
+            ComputeBufferBinding::new(0, 0),
+            ComputeBufferBinding::new(0, 1),
+        ],
+    );
+    pass.dispatches.push(dispatch);
+
+    let err = validate_pass_hazards(&pass)
+        .expect_err("duplicate binding_index must be rejected");
+    match err {
+        HazardError::DuplicateBindingIndex {
+            dispatch_id,
+            binding_index,
+        } => {
+            assert_eq!(dispatch_id, 0);
+            assert_eq!(binding_index, 0);
+        }
+        other => panic!("expected DuplicateBindingIndex, got: {other:?}"),
+    }
+}
+
+#[test]
+fn negative_compute_binding_incompatible_access_rejected() {
+    // Root 21498: Non-compute buffer access (e.g. VertexAttribute) must be rejected.
+    let buf = ResourceId::new(78);
+    let mut pass = Pass::new_compute(PassId::new(1), "compute_incompatible_access_pass");
+
+    let dispatch = Dispatch::new_with_bindings(
+        0,
+        500,
+        [64, 1, 1],
+        vec![ResourceUse::buffer_vertex(
+            buf,
+            DataVersion::INITIAL,
+            Some(0),
+            Some(256),
+        )],
+        vec![ComputeBufferBinding::new(0, 0)],
+    );
+    pass.dispatches.push(dispatch);
+
+    let err = validate_pass_hazards(&pass)
+        .expect_err("vertex buffer access in compute binding must be rejected");
+    match err {
+        HazardError::IncompatibleAccess {
+            dispatch_id,
+            binding_index,
+            access,
+        } => {
+            assert_eq!(dispatch_id, 0);
+            assert_eq!(binding_index, 0);
+            assert_eq!(access, ResourceAccess::VertexBuffer);
+        }
+        other => panic!("expected IncompatibleAccess, got: {other:?}"),
+    }
 }
 
 #[test]

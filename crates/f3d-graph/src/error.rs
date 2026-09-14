@@ -186,6 +186,51 @@ pub enum HazardError {
         /// Execution category of the invalid pass.
         pass_kind: PassKind,
     },
+    /// Compute dispatch binding references an invalid use_index out of bounds of `dispatch.uses`.
+    InvalidUseIndex {
+        /// Dispatch index where the error occurred.
+        dispatch_id: u32,
+        /// WGSL binding index.
+        binding_index: u32,
+        /// Referenced use index out of bounds.
+        use_index: usize,
+        /// Total number of uses in the dispatch.
+        uses_len: usize,
+    },
+    /// Compute dispatch binding references a non-buffer resource.
+    NonBufferBinding {
+        /// Dispatch index where the error occurred.
+        dispatch_id: u32,
+        /// WGSL binding index.
+        binding_index: u32,
+        /// Referenced resource ID.
+        resource_id: u32,
+    },
+    /// Compute dispatch binding references an incompatible resource access.
+    IncompatibleAccess {
+        /// Dispatch index where the error occurred.
+        dispatch_id: u32,
+        /// WGSL binding index.
+        binding_index: u32,
+        /// Non-compute access type.
+        access: ResourceAccess,
+    },
+    /// Multiple compute bindings in the same dispatch specify the same group-0 binding index.
+    DuplicateBindingIndex {
+        /// Dispatch index where the error occurred.
+        dispatch_id: u32,
+        /// Duplicate WGSL binding index.
+        binding_index: u32,
+    },
+    /// Compute dispatch binding references a buffer use with zero byte_size.
+    UnspecifiedBindingSize {
+        /// Dispatch index where the error occurred.
+        dispatch_id: u32,
+        /// WGSL binding index.
+        binding_index: u32,
+        /// Referenced resource ID.
+        resource_id: u32,
+    },
 }
 
 impl fmt::Display for HazardError {
@@ -277,6 +322,56 @@ impl fmt::Display for HazardError {
                 write!(
                     f,
                     "render bundle cannot be executed inside {pass_kind:?} pass {pass_id}; bundles execute strictly within Render passes"
+                )
+            }
+            Self::InvalidUseIndex {
+                dispatch_id,
+                binding_index,
+                use_index,
+                uses_len,
+            } => {
+                write!(
+                    f,
+                    "compute dispatch {dispatch_id} binding {binding_index} references invalid use_index {use_index} (dispatch has {uses_len} uses)"
+                )
+            }
+            Self::NonBufferBinding {
+                dispatch_id,
+                binding_index,
+                resource_id,
+            } => {
+                write!(
+                    f,
+                    "compute dispatch {dispatch_id} binding {binding_index} references non-buffer resource {resource_id}"
+                )
+            }
+            Self::IncompatibleAccess {
+                dispatch_id,
+                binding_index,
+                access,
+            } => {
+                write!(
+                    f,
+                    "compute dispatch {dispatch_id} binding {binding_index} has incompatible access {access:?}; compute bindings must be UniformBuffer, StorageBufferRead, or StorageBufferWrite"
+                )
+            }
+            Self::DuplicateBindingIndex {
+                dispatch_id,
+                binding_index,
+            } => {
+                write!(
+                    f,
+                    "compute dispatch {dispatch_id} specifies duplicate group-0 binding index {binding_index}"
+                )
+            }
+            Self::UnspecifiedBindingSize {
+                dispatch_id,
+                binding_index,
+                resource_id,
+            } => {
+                write!(
+                    f,
+                    "compute dispatch {dispatch_id} binding {binding_index} for resource {resource_id} has zero size"
                 )
             }
         }

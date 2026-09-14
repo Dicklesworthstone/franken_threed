@@ -707,6 +707,28 @@ impl Draw {
     }
 }
 
+/// Explicit group-0 WGSL binding reference on a compute dispatch (§6.1, §8.5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ComputeBufferBinding {
+    /// WGSL `@binding(index)` in `@group(0)`.
+    pub binding_index: u32,
+    /// Direct index into `Dispatch::uses`.
+    pub use_index: usize,
+}
+
+impl ComputeBufferBinding {
+    /// Construct a new group-0 compute buffer binding referencing a dispatch usage index.
+    #[inline]
+    #[must_use]
+    pub const fn new(binding_index: u32, use_index: usize) -> Self {
+        Self {
+            binding_index,
+            use_index,
+        }
+    }
+}
+
 /// Individual compute dispatch within a compute pass.
 ///
 /// Invariant: Per-dispatch usage-scope rules forbid writable binding aliases (§8.5, [S51]).
@@ -721,10 +743,12 @@ pub struct Dispatch {
     pub workgroups: [u32; 3],
     /// Resources bound to this specific dispatch.
     pub uses: Vec<ResourceUse>,
+    /// Explicit group-0 buffer binding map referencing indices into `uses`.
+    pub bindings: Vec<ComputeBufferBinding>,
 }
 
 impl Dispatch {
-    /// Construct a compute dispatch.
+    /// Construct a compute dispatch with no explicit bindings.
     pub fn new(
         dispatch_id: u32,
         pipeline_id: u32,
@@ -736,7 +760,32 @@ impl Dispatch {
             pipeline_id,
             workgroups,
             uses,
+            bindings: Vec::new(),
         }
+    }
+
+    /// Construct a compute dispatch with explicit group-0 buffer bindings.
+    pub fn new_with_bindings(
+        dispatch_id: u32,
+        pipeline_id: u32,
+        workgroups: [u32; 3],
+        uses: Vec<ResourceUse>,
+        bindings: Vec<ComputeBufferBinding>,
+    ) -> Self {
+        Self {
+            dispatch_id,
+            pipeline_id,
+            workgroups,
+            uses,
+            bindings,
+        }
+    }
+
+    /// Builder method to attach explicit group-0 buffer bindings.
+    #[must_use]
+    pub fn with_bindings(mut self, bindings: Vec<ComputeBufferBinding>) -> Self {
+        self.bindings = bindings;
+        self
     }
 }
 

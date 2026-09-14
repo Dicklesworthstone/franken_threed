@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 
 use crate::error::HazardError;
 use crate::pass::{ColorAttachment, Draw, LoadOp, Pass, PassId, PassKind, StoreOp};
-use crate::resource::{ResourceId, ResourceKind, SubresourceRange};
+use crate::resource::{ResourceAccess, ResourceId, ResourceKind, SubresourceRange};
 
 /// Validates usage-scope rules for a single pass according to WebGPU specifications (§8.5, [S51]).
 ///
@@ -192,6 +192,77 @@ fn validate_compute_pass_hazards(pass: &Pass) -> Result<(), HazardError> {
     // Per-dispatch usage-scope hazard check (§8.5, [S51], WebGPU storage exception)
     for dispatch in &pass.dispatches {
         let uses = &dispatch.uses;
+
+        // 1. Validate explicit group-0 bindings if present (§6.1, root 21419 / 21498)
+        for (b_idx, b) in dispatch.bindings.iter().enumerate() {
+            if b.use_index >= uses.len() {
+                return Err(HazardError::InvalidUseIndex {
+                    dispatch_id: dispatch.dispatch_id,
+                    binding_index: b.binding_index,
+                    use_index: b.use_index,
+                    uses_len: uses.len(),
+                });
+            }
+
+            let u = &uses[b.use_index];
+
+            if u.kind != ResourceKind::Buffer {
+                return Err(HazardError::NonBufferBinding {
+                    dispatch_id: dispatch.dispatch_id,
+                    binding_index: b.binding_index,
+                    resource_id: u.resource_id.get(),
+                });
+            }
+
+            match u.access {
+                ResourceAccess::UniformBuffer
+                | ResourceAccess::StorageBufferRead
+                | ResourceAccess::StorageBufferWrite => {}
+                other => {
+                    return Err(HazardError::IncompatibleAccess {
+                        dispatch_id: dispatch.dispatch_id,
+                        binding_index: b.binding_index,
+                        access: other,
+                    });
+                }
+            }
+
+            if let Some(0) = u.byte_size {
+                return Err(HazardError::UnspecifiedBindingSize {
+                    dispatch_id: dispatch.dispatch_id,
+                    binding_index: b.binding_index,
+                    resource_id: u.resource_id.get(),
+                });
+            }
+
+            for other_b in &dispatch.bindings[b_idx + 1..] {
+                if b.binding_index == other_b.binding_index {
+                    return Err(HazardError::DuplicateBindingIndex {
+                        dispatch_id: dispatch.dispatch_id,
+                        binding_index: b.binding_index,
+                    });
+                }
+            }
+        }
+
+        // 2. Reject repeated writable use_index across distinct bindings (root 21773).
+        // A repeated read-only use_index (UniformBuffer or StorageBufferRead) is legal.
+        for (i, b1) in dispatch.bindings.iter().enumerate() {
+            for b2 in &dispatch.bindings[i + 1..] {
+                if b1.use_index == b2.use_index {
+                    let u = &uses[b1.use_index];
+                    if u.access.is_write() {
+                        return Err(HazardError::ComputeWritableAlias {
+                            resource_id: u.resource_id.get(),
+                            dispatch_id: dispatch.dispatch_id,
+                            subresource: SubresourceRange::WholeBuffer,
+                        });
+                    }
+                }
+            }
+        }
+
+        // 3. Pair-loop over dispatch.uses for distinct usages targeting the same resource
         for i in 0..uses.len() {
             for j in (i + 1)..uses.len() {
                 let u1 = &uses[i];
