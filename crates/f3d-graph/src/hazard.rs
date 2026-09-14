@@ -478,12 +478,12 @@ pub fn split_pass_on_hazard(pass: &Pass, next_pass_id: PassId) -> Result<Vec<Pas
     pass2.dependencies = vec![pass1.id];
     pass2.draws = second_draws.to_vec();
 
-    // Preserve color attachments that are NOT sampled in pass 2 (distinct legal destinations)
+    // Preserve final store/discard operations; only the intermediate pass must store.
+    // Keep color attachments that are not sampled in pass 2 (distinct legal destinations).
     for ca in &pass.color_attachments {
         if !sampled_ids.contains(&ca.target_id) {
             let mut ca2 = ca.clone();
             ca2.load_op = LoadOp::Load;
-            ca2.store_op = StoreOp::Store;
             pass2.color_attachments.push(ca2);
         }
     }
@@ -498,11 +498,9 @@ pub fn split_pass_on_hazard(pass: &Pass, next_pass_id: PassId) -> Result<Vec<Pas
             let mut dsa2 = dsa.clone();
             if !dsa2.depth_read_only {
                 dsa2.depth_load_op = Some(LoadOp::Load);
-                dsa2.depth_store_op = Some(StoreOp::Store);
             }
             if !dsa2.stencil_read_only && dsa2.stencil_load_op.is_some() {
                 dsa2.stencil_load_op = Some(LoadOp::Load);
-                dsa2.stencil_store_op = Some(StoreOp::Store);
             }
             pass2.depth_stencil_attachment = Some(dsa2);
         }

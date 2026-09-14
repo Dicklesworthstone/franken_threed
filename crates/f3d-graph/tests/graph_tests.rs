@@ -258,7 +258,7 @@ fn positive_automatic_pass_splitting_preserves_targets_and_depth_stencil() {
     assert!(can_split_pass(&pass));
 
     let mut graph = PassGraph::new();
-    graph.add_pass(pass).expect("add pass");
+    graph.add_pass(pass.clone()).expect("add pass");
     let plan = graph.compile(None).expect("split pass must compile successfully");
 
     assert_eq!(plan.split_count, 1);
@@ -295,6 +295,40 @@ fn positive_automatic_pass_splitting_preserves_targets_and_depth_stencil() {
     assert_eq!(dsa2.target_id, tex_depth);
     assert_eq!(dsa2.depth_load_op, Some(LoadOp::Load));
     assert_eq!(dsa2.depth_store_op, Some(StoreOp::Store));
+
+    // Final operations belong to the source pass. Only the intermediate segment
+    // forces Store so that the next segment can load its contents.
+    for (color_store, depth_store, stencil_store) in [
+        (StoreOp::Discard, StoreOp::Store, StoreOp::Discard),
+        (StoreOp::Store, StoreOp::Discard, StoreOp::Store),
+    ] {
+        let mut variant = pass.clone();
+        variant.color_attachments[1].store_op = color_store;
+        let depth = variant.depth_stencil_attachment.as_mut().unwrap();
+        depth.depth_store_op = Some(depth_store);
+        depth.stencil_read_only = false;
+        depth.stencil_load_op = Some(LoadOp::Clear);
+        depth.stencil_store_op = Some(stencil_store);
+        let mut graph = PassGraph::new();
+        graph.add_pass(variant).expect("add mixed-store pass");
+        let plan = graph.compile(None).expect("split mixed-store pass");
+        assert_eq!(plan.segments.len(), 2);
+
+        let first = &plan.segments[0];
+        assert!(first.color_attachments.iter().all(|ca| ca.store_op == StoreOp::Store));
+        let first_depth = first.depth_stencil_attachment.as_ref().unwrap();
+        assert_eq!(first_depth.depth_store_op, Some(StoreOp::Store));
+        assert_eq!(first_depth.stencil_store_op, Some(StoreOp::Store));
+        let last = &plan.segments[1];
+        let color = last.color_attachments.iter().find(|ca| ca.target_id == tex_destination).unwrap();
+        assert_eq!(color.load_op, LoadOp::Load);
+        assert_eq!(color.store_op, color_store);
+        let depth = last.depth_stencil_attachment.as_ref().unwrap();
+        assert_eq!(depth.depth_load_op, Some(LoadOp::Load));
+        assert_eq!(depth.stencil_load_op, Some(LoadOp::Load));
+        assert_eq!(depth.depth_store_op, Some(depth_store));
+        assert_eq!(depth.stencil_store_op, Some(stencil_store));
+    }
 }
 
 #[test]
