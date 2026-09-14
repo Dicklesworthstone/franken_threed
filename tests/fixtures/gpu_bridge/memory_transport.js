@@ -5,12 +5,12 @@
  * - Scoped callback borrows cannot enforce memory lifetimes across engine boundaries
  * - The safe production boundary is an owned copy obtained synchronously from actual
  *   application memory before effectful host/user calls
- * - Detects and rejects detached ArrayBuffers (byteLength === 0)
+ * - Detects and rejects detached ArrayBuffers while allowing live zero-byte ranges
  * - Transparent copy accounting for actual bytes copied at this boundary
  */
 
 /**
- * Returns true if the provided ArrayBuffer or TypedArray view is detached or zero-length.
+ * Returns true if the provided ArrayBuffer or TypedArray view is detached.
  * @param {ArrayBuffer|ArrayBufferView} bufferOrView
  * @returns {boolean}
  */
@@ -18,7 +18,15 @@ export function isDetached(bufferOrView) {
   if (!bufferOrView) return true;
   const buf = bufferOrView.buffer || bufferOrView;
   if (buf.detached === true) return true;
-  if (typeof buf.byteLength === "number" && buf.byteLength === 0) return true;
+  if (buf.byteLength === 0) {
+    // Older hosts lack ArrayBuffer.detached. View construction distinguishes a
+    // detached buffer from a live empty buffer without allocating backing bytes.
+    try {
+      new Uint8Array(buf, 0, 0);
+    } catch {
+      return true;
+    }
+  }
   return false;
 }
 
@@ -126,7 +134,7 @@ export function ensureSafePacketBytes(packetBytes) {
   if (!packetBytes || !(packetBytes instanceof Uint8Array)) {
     throw new Error("ensureSafePacketBytes: packetBytes must be a valid Uint8Array");
   }
-  if (isDetached(packetBytes)) {
+  if (packetBytes.byteLength === 0 || isDetached(packetBytes)) {
     throw new Error("ensureSafePacketBytes: received a detached ArrayBuffer or zero-length view");
   }
   return packetBytes;

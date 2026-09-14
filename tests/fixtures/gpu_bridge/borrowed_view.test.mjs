@@ -15,8 +15,42 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { validateMemoryView, globalTransportLedger } from "./memory_transport.js";
+import {
+  validateMemoryView, globalTransportLedger, isDetached, copyFromWasmMemory,
+  ensureSafePacketBytes, TransportCopyLedger,
+} from "./memory_transport.js";
 import { borrowPacketView, currentPacketView } from "./borrowed_view.js";
+
+test("live zero-page memory supports zero-byte transport but not empty command packets", () => {
+  const memory = new WebAssembly.Memory({ initial: 0, maximum: 1 });
+  const ledger = new TransportCopyLedger();
+  assert.equal(isDetached(memory.buffer), false);
+  const copy = copyFromWasmMemory(memory, 0, 0, ledger);
+  assert.equal(copy.length, 0);
+  assert.notEqual(copy.buffer, memory.buffer);
+  assert.deepEqual(ledger.getMetrics(), { copiedBytes: 0, copyCount: 1 });
+  const oldView = borrowPacketView(memory, 0, 0);
+  assert.equal(currentPacketView(oldView, memory, 0, 0), oldView);
+  memory.grow(1);
+  assert.equal(isDetached(oldView), true);
+  assert.throws(() => validateMemoryView(oldView, memory), /detached|stale/);
+  assert.equal(currentPacketView(oldView, memory, 0, 0).buffer, memory.buffer);
+
+  assert.throws(() => ensureSafePacketBytes(copy), /zero-length/);
+  assert.throws(() => ensureSafePacketBytes(new Uint8Array(memory.buffer, 0, 0)), /zero-length/);
+});
+
+test("transport still rejects actually detached buffers and preserves nonempty packets", () => {
+  const buffer = new ArrayBuffer(8);
+  const packet = new Uint8Array(buffer);
+  packet[0] = 42;
+  assert.equal(ensureSafePacketBytes(packet), packet);
+  structuredClone(buffer, { transfer: [buffer] });
+  assert.equal(isDetached(buffer), true);
+  assert.equal(isDetached(packet), true);
+  assert.throws(() => validateMemoryView(packet), /detached/);
+  assert.throws(() => ensureSafePacketBytes(packet), /detached|zero-length/);
+});
 
 test("borrowPacketView and currentPacketView lifecycle and growth invariants", () => {
   const initialMetrics = globalTransportLedger.getMetrics();
