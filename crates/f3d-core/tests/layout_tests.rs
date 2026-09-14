@@ -1793,7 +1793,7 @@ fn property_test_alignment_validators_on_random_offsets() {
 #[test]
 fn test_layout_table_cross_check_and_evidence() {
     let table = layout_table();
-    assert_eq!(table.len(), 34, "Layout table must contain all 34 defined field and padding rows");
+    assert_eq!(table.len(), 42, "Layout table must contain all 42 defined field and padding rows");
 
     for row in table {
         let (expected_offset, expected_size) = match (row.record, row.field) {
@@ -1831,6 +1831,14 @@ fn test_layout_table_cross_check_and_evidence() {
             ("MeshUniforms", "model_view") => (0, 64),
             ("MeshUniforms", "projection") => (64, 64),
             ("MeshUniforms", "color") => (128, 16),
+            ("ToonMeshUniforms", "model_world") => (core::mem::offset_of!(ToonMeshUniforms, model_world), core::mem::size_of::<[f32; 16]>()),
+            ("ToonMeshUniforms", "projection") => (core::mem::offset_of!(ToonMeshUniforms, projection), core::mem::size_of::<[f32; 16]>()),
+            ("ToonMeshUniforms", "camera_view") => (core::mem::offset_of!(ToonMeshUniforms, camera_view), core::mem::size_of::<[f32; 16]>()),
+            ("ToonMeshUniforms", "model_normal_matrix") => (core::mem::offset_of!(ToonMeshUniforms, model_normal_matrix), core::mem::size_of::<[[f32; 4]; 3]>()),
+            ("ToonMeshUniforms", "color") => (core::mem::offset_of!(ToonMeshUniforms, color), core::mem::size_of::<[f32; 4]>()),
+            ("ToonMeshUniforms", "light_direction") => (core::mem::offset_of!(ToonMeshUniforms, light_direction), core::mem::size_of::<[f32; 4]>()),
+            ("ToonMeshUniforms", "light_color") => (core::mem::offset_of!(ToonMeshUniforms, light_color), core::mem::size_of::<[f32; 4]>()),
+            ("ToonMeshUniforms", "params") => (core::mem::offset_of!(ToonMeshUniforms, params), core::mem::size_of::<[u32; 4]>()),
             (unknown_rec, unknown_field) => panic!("Unknown record/field in layout table: {unknown_rec}.{unknown_field}"),
         };
 
@@ -1859,6 +1867,7 @@ fn test_layout_table_cross_check_and_evidence() {
         ("ColorUniform", COLOR_UNIFORM_BYTES),
         ("MaterialParams", core::mem::size_of::<MaterialParams>()),
         ("MeshUniforms", MESH_UNIFORMS_BYTES),
+        ("ToonMeshUniforms", TOON_MESH_UNIFORMS_BYTES),
     ];
 
     for &(record_name, expected_total_size) in record_sizes {
@@ -1893,6 +1902,7 @@ fn test_layout_table_cross_check_and_evidence() {
     assert!(display_str.contains("ColorUniform"), "Display must render ColorUniform");
     assert!(display_str.contains("MaterialParams"), "Display must render MaterialParams");
     assert!(display_str.contains("MeshUniforms"), "Display must render MeshUniforms");
+    assert!(display_str.contains("ToonMeshUniforms"), "Display must render ToonMeshUniforms");
     assert!(display_str.contains("_padding"), "Display must render _padding row");
 
     // When test-support feature is active and F3D_EVIDENCE_DIR is set, emit evidence under bead 05.2
@@ -1924,7 +1934,7 @@ fn test_layout_table_cross_check_and_evidence() {
                 browser: None,
                 device_generation: None,
                 scene_generation: None,
-                msg: "Verified all 34 layout table rows against core::mem::offset_of, size_of, and gapless tiling".into(),
+                msg: "Verified all 42 layout table rows against core::mem::offset_of, size_of, and gapless tiling".into(),
                 data: Some(serde_json::to_value(table).expect("Failed to serialize layout table")),
             };
             writer.write_event(&event).expect("Failed to write evidence event");
@@ -2034,6 +2044,16 @@ fn test_canonical_layout_macro_consistency_and_regression() {
     assert!(WGSL_MESH_UNIFORMS_DECLARATION.contains("projection: mat4x4<f32>,"));
     assert!(WGSL_MESH_UNIFORMS_DECLARATION.contains("color: vec4<f32>,"));
 
+    assert!(WGSL_TOON_MESH_UNIFORMS_DECLARATION.contains("struct ToonMeshUniforms {"));
+    assert!(WGSL_TOON_MESH_UNIFORMS_DECLARATION.contains("model_world: mat4x4<f32>,"));
+    assert!(WGSL_TOON_MESH_UNIFORMS_DECLARATION.contains("projection: mat4x4<f32>,"));
+    assert!(WGSL_TOON_MESH_UNIFORMS_DECLARATION.contains("camera_view: mat4x4<f32>,"));
+    assert!(WGSL_TOON_MESH_UNIFORMS_DECLARATION.contains("model_normal_matrix: mat3x3<f32>,"));
+    assert!(WGSL_TOON_MESH_UNIFORMS_DECLARATION.contains("color: vec4<f32>,"));
+    assert!(WGSL_TOON_MESH_UNIFORMS_DECLARATION.contains("light_direction: vec4<f32>,"));
+    assert!(WGSL_TOON_MESH_UNIFORMS_DECLARATION.contains("light_color: vec4<f32>,"));
+    assert!(WGSL_TOON_MESH_UNIFORMS_DECLARATION.contains("params: vec4<u32>,"));
+
     assert!(WGSL_VERTEX_POS_UV_DECLARATION.contains("struct VertexPosUv {"));
     assert!(WGSL_VERTEX_POS_UV_DECLARATION.contains("@location(0) position: vec3<f32>,"));
     assert!(WGSL_VERTEX_POS_UV_DECLARATION.contains("@location(1) uv: vec2<f32>,"));
@@ -2059,6 +2079,7 @@ fn test_canonical_layout_macro_consistency_and_regression() {
     assert!(combined.contains("struct ColorUniform {"));
     assert!(combined.contains("struct MaterialParams {"));
     assert!(combined.contains("struct MeshUniforms {"));
+    assert!(combined.contains("struct ToonMeshUniforms {"));
 
     let table = layout_table();
     assert_eq!(table[0].offset, core::mem::offset_of!(AffineRows, r0));
@@ -2080,6 +2101,24 @@ fn test_canonical_layout_macro_consistency_and_regression() {
     assert_eq!(table[32].field, "projection");
     assert_eq!(table[33].offset, 128);
     assert_eq!(table[33].field, "color");
+
+    assert_eq!(table[34].offset, 0);
+    assert_eq!(table[34].field, "model_world");
+    assert_eq!(table[35].offset, 64);
+    assert_eq!(table[35].field, "projection");
+    assert_eq!(table[36].offset, 128);
+    assert_eq!(table[36].field, "camera_view");
+    assert_eq!(table[37].offset, 192);
+    assert_eq!(table[37].field, "model_normal_matrix");
+    assert_eq!(table[37].wgsl_type, "mat3x3<f32>");
+    assert_eq!(table[38].offset, 240);
+    assert_eq!(table[38].field, "color");
+    assert_eq!(table[39].offset, 256);
+    assert_eq!(table[39].field, "light_direction");
+    assert_eq!(table[40].offset, 272);
+    assert_eq!(table[40].field, "light_color");
+    assert_eq!(table[41].offset, 288);
+    assert_eq!(table[41].field, "params");
 
     let unaligned_offset = 24;
     assert_ne!(
@@ -2103,8 +2142,8 @@ fn test_generate_wgsl_declarations_coverage_of_all_layout_table_records() {
 
     assert_eq!(
         records.len(),
-        11,
-        "LAYOUT_TABLE must define exactly 11 GPU record types"
+        12,
+        "LAYOUT_TABLE must define exactly 12 GPU record types"
     );
 
     for record in records {
@@ -2123,7 +2162,7 @@ fn test_wgsl_host_shareable_layout_rule_verification() {
         match wgsl_type {
             "f32" | "u32" | "i32" => 4,
             "vec2<f32>" => 8,
-            "vec3<f32>" | "vec4<f32>" | "mat4x4<f32>" | "AffineRows" => 16,
+            "vec3<f32>" | "vec4<f32>" | "vec4<u32>" | "mat4x4<f32>" | "mat3x3<f32>" | "AffineRows" => 16,
             other => panic!("Unsupported WGSL host-shareable type: {other}"),
         }
     }
@@ -2134,8 +2173,9 @@ fn test_wgsl_host_shareable_layout_rule_verification() {
             "f32" | "u32" | "i32" => 4,
             "vec2<f32>" => 8,
             "vec3<f32>" => 12,
-            "vec4<f32>" => 16,
+            "vec4<f32>" | "vec4<u32>" => 16,
             "mat4x4<f32>" => 64, // 4 columns of vec4<f32>
+            "mat3x3<f32>" => 48, // 3 columns of vec3<f32>, each aligned to 16 bytes
             "AffineRows" => 48,  // 3 rows of vec4<f32>
             other => panic!("Unsupported WGSL host-shareable type: {other}"),
         }
@@ -2156,6 +2196,7 @@ fn test_wgsl_host_shareable_layout_rule_verification() {
         ("ColorUniform", COLOR_UNIFORM_BYTES),
         ("MaterialParams", core::mem::size_of::<MaterialParams>()),
         ("MeshUniforms", MESH_UNIFORMS_BYTES),
+        ("ToonMeshUniforms", TOON_MESH_UNIFORMS_BYTES),
     ];
 
     let table = layout_table();
@@ -2235,4 +2276,67 @@ fn test_wgsl_host_shareable_layout_rule_verification() {
         wgsl_round_up(12, wgsl_align_of("vec2<f32>")),
         "Vertex buffer attribute uv must NOT have host-shareable struct padding applied"
     );
+}
+
+#[test]
+fn test_toon_mesh_uniforms_layout_and_roundtrip() {
+    assert_eq!(ToonMeshUniforms::BYTE_SIZE, 304);
+    assert_eq!(ToonMeshUniforms::ALIGNMENT, 16);
+    assert_eq!(ToonMeshUniforms::DYNAMIC_OFFSET_STRIDE, 512);
+    assert_eq!(TOON_MESH_UNIFORMS_BYTES, 304);
+    assert_eq!(TOON_MESH_UNIFORMS_ALIGNMENT, 16);
+    assert_eq!(TOON_MESH_DYNAMIC_OFFSET_STRIDE, 512);
+
+    assert_eq!(core::mem::size_of::<ToonMeshUniforms>(), 304);
+    assert_eq!(core::mem::offset_of!(ToonMeshUniforms, model_world), 0);
+    assert_eq!(core::mem::offset_of!(ToonMeshUniforms, projection), 64);
+    assert_eq!(core::mem::offset_of!(ToonMeshUniforms, camera_view), 128);
+    assert_eq!(core::mem::offset_of!(ToonMeshUniforms, model_normal_matrix), 192);
+    assert_eq!(core::mem::offset_of!(ToonMeshUniforms, color), 240);
+    assert_eq!(core::mem::offset_of!(ToonMeshUniforms, light_direction), 256);
+    assert_eq!(core::mem::offset_of!(ToonMeshUniforms, light_color), 272);
+    assert_eq!(core::mem::offset_of!(ToonMeshUniforms, params), 288);
+
+    let default_u = ToonMeshUniforms::default();
+    let bytes = default_u.to_bytes();
+    assert_eq!(bytes.len(), 304);
+
+    let restored = ToonMeshUniforms::from_bytes(&bytes);
+    assert_eq!(restored, default_u);
+
+    let mut buf = [0u8; 304];
+    default_u.write_to_slice(&mut buf).expect("write ok");
+    let from_slice = ToonMeshUniforms::read_from_slice(&buf).expect("read ok");
+    assert_eq!(from_slice, default_u);
+
+    let mut small = [0u8; 303];
+    assert_eq!(
+        default_u.write_to_slice(&mut small),
+        Err(LayoutError::BufferTooSmall { required: 304, provided: 303 })
+    );
+    assert_eq!(
+        ToonMeshUniforms::read_from_slice(&small),
+        Err(LayoutError::BufferTooSmall { required: 304, provided: 303 })
+    );
+
+    // Dynamic uniform offset alignment validation (stride 512 against standard 256)
+    assert!(validate_dynamic_uniform_offset(0, DEFAULT_MIN_UNIFORM_BUFFER_OFFSET_ALIGNMENT).is_ok());
+    assert!(validate_dynamic_uniform_offset(512, DEFAULT_MIN_UNIFORM_BUFFER_OFFSET_ALIGNMENT).is_ok());
+    assert!(validate_dynamic_uniform_offset(1024, DEFAULT_MIN_UNIFORM_BUFFER_OFFSET_ALIGNMENT).is_ok());
+    assert!(validate_dynamic_uniform_offset(304, DEFAULT_MIN_UNIFORM_BUFFER_OFFSET_ALIGNMENT).is_err());
+
+    // Normal matrix column padding verification
+    let raw_normal: [f32; 9] = [
+        1.0, 2.0, 3.0,  // col 0
+        4.0, 5.0, 6.0,  // col 1
+        7.0, 8.0, 9.0,  // col 2
+    ];
+    let padded = ToonMeshUniforms::pad_normal_matrix(&raw_normal);
+    assert_eq!(padded[0], [1.0, 2.0, 3.0, 0.0]);
+    assert_eq!(padded[1], [4.0, 5.0, 6.0, 0.0]);
+    assert_eq!(padded[2], [7.0, 8.0, 9.0, 0.0]);
+
+    let mut custom = default_u;
+    custom.model_normal_matrix = padded;
+    assert_eq!(custom.unpad_normal_matrix(), raw_normal);
 }

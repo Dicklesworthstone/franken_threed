@@ -42,6 +42,18 @@ pub const MESH_UNIFORMS_BYTES: usize = 144;
 /// Alignment in bytes of a mesh uniform record under WGSL uniform rules (16 bytes).
 pub const MESH_UNIFORMS_ALIGNMENT: usize = 16;
 
+/// Size in bytes of a Toon mesh uniform record (`ToonMeshUniforms` = 304 bytes).
+pub const TOON_MESH_UNIFORMS_BYTES: usize = 304;
+
+/// Alignment in bytes of a Toon mesh uniform record under WGSL uniform rules (16 bytes).
+pub const TOON_MESH_UNIFORMS_ALIGNMENT: usize = 16;
+
+/// Dynamic uniform buffer offset stride for Toon mesh draws (512 bytes).
+///
+/// Guaranteed to satisfy WebGPU `minUniformBufferOffsetAlignment` (256 bytes) while
+/// enclosing the 304-byte payload.
+pub const TOON_MESH_DYNAMIC_OFFSET_STRIDE: usize = 512;
+
 /// Material flag: diffuse texture map is enabled.
 pub const MATERIAL_FLAG_MAP: u32 = 1 << 0;
 /// Material flag: alpha texture map is enabled.
@@ -1639,6 +1651,277 @@ define_canonical_layout! {
     ],
 }
 
+/// Canonical GPU uniform parameter block record for Toon mesh rendering matching Three.js r186 `MeshToonMaterial`.
+///
+/// WGSL uniform buffer address-space alignment rules mandate 16-byte alignment for uniform structs,
+/// 16-byte alignment for `mat4x4<f32>`, 16-byte alignment for each column of `mat3x3<f32>` (48 bytes total),
+/// and 16-byte alignment for `vec4<f32>` / `vec4<u32>`.
+///
+/// Memory layout (304 bytes total, 16-byte aligned):
+/// - `model_world`: `[f32; 16]` at offset 0 (64 bytes, `mat4x4<f32>`)
+/// - `projection`: `[f32; 16]` at offset 64 (64 bytes, `mat4x4<f32>`)
+/// - `camera_view`: `[f32; 16]` at offset 128 (64 bytes, `mat4x4<f32>`)
+/// - `model_normal_matrix`: `[[f32; 4]; 3]` at offset 192 (48 bytes, 3 columns padded to 16B per WGSL std140/uniform alignment)
+/// - `color`: `[f32; 4]` at offset 240 (16 bytes, `vec4<f32>`, surface diffuse / tint)
+/// - `light_direction`: `[f32; 4]` at offset 256 (16 bytes, `vec4<f32>`, view-space direction xyz, 0.0 w)
+/// - `light_color`: `[f32; 4]` at offset 272 (16 bytes, `vec4<f32>`, rgb = color * intensity, 1.0 a)
+/// - `params`: `[u32; 4]` at offset 288 (16 bytes, `vec4<u32>`, side code, flags)
+/// Total size: 304 bytes ([`TOON_MESH_UNIFORMS_BYTES`]), alignment 16 bytes ([`TOON_MESH_UNIFORMS_ALIGNMENT`]).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ToonMeshUniforms {
+    /// Object world transform matrix in column-major order (64 bytes).
+    pub model_world: [f32; 16],
+    /// Camera projection matrix in column-major order (64 bytes).
+    pub projection: [f32; 16],
+    /// Camera view matrix (`matrixWorldInverse`) in column-major order (64 bytes).
+    pub camera_view: [f32; 16],
+    /// Normal transformation matrix as 3 columns of `vec3<f32>`, each padded to 16 bytes (48 bytes).
+    pub model_normal_matrix: [[f32; 4]; 3],
+    /// Surface diffuse / tint color (`[r, g, b, a]`, 16 bytes).
+    pub color: [f32; 4],
+    /// Directional light view-space direction (`[x, y, z, 0.0]`, 16 bytes).
+    pub light_direction: [f32; 4],
+    /// Directional light color scaled by intensity (`[r, g, b, 1.0]`, 16 bytes).
+    pub light_color: [f32; 4],
+    /// Miscellaneous packed parameters (`[side, flags, _reserved0, _reserved1]`, 16 bytes).
+    pub params: [u32; 4],
+}
+
+impl ToonMeshUniforms {
+    /// Byte size of this Toon uniform record (304 bytes).
+    pub const BYTE_SIZE: usize = TOON_MESH_UNIFORMS_BYTES;
+
+    /// Alignment in bytes (16 bytes).
+    pub const ALIGNMENT: usize = TOON_MESH_UNIFORMS_ALIGNMENT;
+
+    /// Dynamic uniform buffer offset stride (512 bytes).
+    pub const DYNAMIC_OFFSET_STRIDE: usize = TOON_MESH_DYNAMIC_OFFSET_STRIDE;
+
+    /// Constructs a new `ToonMeshUniforms` uniform record from explicit fields.
+    pub const fn new(
+        model_world: [f32; 16],
+        projection: [f32; 16],
+        camera_view: [f32; 16],
+        model_normal_matrix: [[f32; 4]; 3],
+        color: [f32; 4],
+        light_direction: [f32; 4],
+        light_color: [f32; 4],
+        params: [u32; 4],
+    ) -> Self {
+        Self {
+            model_world,
+            projection,
+            camera_view,
+            model_normal_matrix,
+            color,
+            light_direction,
+            light_color,
+            params,
+        }
+    }
+
+    /// Converts a 9-element column-major 3x3 normal matrix into explicit 16-byte padded columns.
+    pub const fn pad_normal_matrix(m: &[f32; 9]) -> [[f32; 4]; 3] {
+        [
+            [m[0], m[1], m[2], 0.0],
+            [m[3], m[4], m[5], 0.0],
+            [m[6], m[7], m[8], 0.0],
+        ]
+    }
+
+    /// Extracts the unpadded 9-element column-major 3x3 normal matrix from explicit padded columns.
+    pub const fn unpad_normal_matrix(&self) -> [f32; 9] {
+        [
+            self.model_normal_matrix[0][0],
+            self.model_normal_matrix[0][1],
+            self.model_normal_matrix[0][2],
+            self.model_normal_matrix[1][0],
+            self.model_normal_matrix[1][1],
+            self.model_normal_matrix[1][2],
+            self.model_normal_matrix[2][0],
+            self.model_normal_matrix[2][1],
+            self.model_normal_matrix[2][2],
+        ]
+    }
+
+    /// Serializes the Toon mesh uniform record into an exact 304-byte array in little-endian order.
+    pub fn to_bytes(&self) -> [u8; TOON_MESH_UNIFORMS_BYTES] {
+        let mut out = [0u8; TOON_MESH_UNIFORMS_BYTES];
+        let write_f32 = |slice: &mut [u8], offset: usize, val: f32| {
+            slice[offset..offset + 4].copy_from_slice(&val.to_le_bytes());
+        };
+        let write_u32 = |slice: &mut [u8], offset: usize, val: u32| {
+            slice[offset..offset + 4].copy_from_slice(&val.to_le_bytes());
+        };
+
+        for i in 0..16 {
+            write_f32(&mut out, i * 4, self.model_world[i]);
+        }
+        for i in 0..16 {
+            write_f32(&mut out, 64 + i * 4, self.projection[i]);
+        }
+        for i in 0..16 {
+            write_f32(&mut out, 128 + i * 4, self.camera_view[i]);
+        }
+        for col in 0..3 {
+            for row in 0..4 {
+                write_f32(&mut out, 192 + col * 16 + row * 4, self.model_normal_matrix[col][row]);
+            }
+        }
+        for i in 0..4 {
+            write_f32(&mut out, 240 + i * 4, self.color[i]);
+        }
+        for i in 0..4 {
+            write_f32(&mut out, 256 + i * 4, self.light_direction[i]);
+        }
+        for i in 0..4 {
+            write_f32(&mut out, 272 + i * 4, self.light_color[i]);
+        }
+        for i in 0..4 {
+            write_u32(&mut out, 288 + i * 4, self.params[i]);
+        }
+        out
+    }
+
+    /// Safely writes the 304-byte uniform wire representation into a mutable byte slice.
+    pub fn write_to_slice(&self, out: &mut [u8]) -> Result<(), LayoutError> {
+        if out.len() < Self::BYTE_SIZE {
+            return Err(LayoutError::BufferTooSmall {
+                required: Self::BYTE_SIZE,
+                provided: out.len(),
+            });
+        }
+        out[..Self::BYTE_SIZE].copy_from_slice(&self.to_bytes());
+        Ok(())
+    }
+
+    /// Safely reads the 304-byte uniform record from a byte slice in little-endian order.
+    pub fn read_from_slice(src: &[u8]) -> Result<Self, LayoutError> {
+        if src.len() < Self::BYTE_SIZE {
+            return Err(LayoutError::BufferTooSmall {
+                required: Self::BYTE_SIZE,
+                provided: src.len(),
+            });
+        }
+        let mut b = [0u8; TOON_MESH_UNIFORMS_BYTES];
+        b.copy_from_slice(&src[..Self::BYTE_SIZE]);
+        Ok(Self::from_bytes(&b))
+    }
+
+    /// Deserializes a `ToonMeshUniforms` record from an exact 304-byte array.
+    pub fn from_bytes(bytes: &[u8; TOON_MESH_UNIFORMS_BYTES]) -> Self {
+        let read_f32 = |offset: usize| -> f32 {
+            let mut b = [0u8; 4];
+            b.copy_from_slice(&bytes[offset..offset + 4]);
+            f32::from_le_bytes(b)
+        };
+        let read_u32 = |offset: usize| -> u32 {
+            let mut b = [0u8; 4];
+            b.copy_from_slice(&bytes[offset..offset + 4]);
+            u32::from_le_bytes(b)
+        };
+
+        let mut model_world = [0.0f32; 16];
+        for i in 0..16 {
+            model_world[i] = read_f32(i * 4);
+        }
+
+        let mut projection = [0.0f32; 16];
+        for i in 0..16 {
+            projection[i] = read_f32(64 + i * 4);
+        }
+
+        let mut camera_view = [0.0f32; 16];
+        for i in 0..16 {
+            camera_view[i] = read_f32(128 + i * 4);
+        }
+
+        let mut model_normal_matrix = [[0.0f32; 4]; 3];
+        for col in 0..3 {
+            for row in 0..4 {
+                model_normal_matrix[col][row] = read_f32(192 + col * 16 + row * 4);
+            }
+        }
+
+        let color = [
+            read_f32(240),
+            read_f32(244),
+            read_f32(248),
+            read_f32(252),
+        ];
+
+        let light_direction = [
+            read_f32(256),
+            read_f32(260),
+            read_f32(264),
+            read_f32(268),
+        ];
+
+        let light_color = [
+            read_f32(272),
+            read_f32(276),
+            read_f32(280),
+            read_f32(284),
+        ];
+
+        let params = [
+            read_u32(288),
+            read_u32(292),
+            read_u32(296),
+            read_u32(300),
+        ];
+
+        Self {
+            model_world,
+            projection,
+            camera_view,
+            model_normal_matrix,
+            color,
+            light_direction,
+            light_color,
+            params,
+        }
+    }
+}
+
+impl Default for ToonMeshUniforms {
+    fn default() -> Self {
+        Self {
+            model_world: ProjectiveMat4::identity().elements,
+            projection: ProjectiveMat4::identity().elements,
+            camera_view: ProjectiveMat4::identity().elements,
+            model_normal_matrix: [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+            ],
+            color: [1.0, 1.0, 1.0, 1.0],
+            light_direction: [0.0, 0.0, 1.0, 0.0],
+            light_color: [1.0, 1.0, 1.0, 1.0],
+            params: [0, 0, 0, 0],
+        }
+    }
+}
+
+define_canonical_layout! {
+    record: "ToonMeshUniforms",
+    shader_const: WGSL_TOON_MESH_UNIFORMS_DECLARATION,
+    layout_rows_const: TOON_MESH_UNIFORMS_LAYOUT_ROWS,
+    row_count: 8,
+    fields: [
+        "model_world", "mat4x4<f32>", 0, 64, 16;
+        "projection", "mat4x4<f32>", 64, 64, 16;
+        "camera_view", "mat4x4<f32>", 128, 64, 16;
+        "model_normal_matrix", "mat3x3<f32>", 192, 48, 16;
+        "color", "vec4<f32>", 240, 16, 16;
+        "light_direction", "vec4<f32>", 256, 16, 16;
+        "light_color", "vec4<f32>", 272, 16, 16;
+        "params", "vec4<u32>", 288, 16, 16;
+    ],
+}
+
 /// Returns standard generated WGSL type declarations and helpers for use in shaders.
 pub fn generate_wgsl_declarations() -> String {
     let mut s = String::new();
@@ -1664,12 +1947,14 @@ pub fn generate_wgsl_declarations() -> String {
     s.push_str(WGSL_MATERIAL_PARAMS_DECLARATION.trim());
     s.push_str("\n\n");
     s.push_str(WGSL_MESH_UNIFORMS_DECLARATION.trim());
+    s.push_str("\n\n");
+    s.push_str(WGSL_TOON_MESH_UNIFORMS_DECLARATION.trim());
     s.push('\n');
     s
 }
 
 /// Static catalog of GPU wire layouts covering every record type in `f3d-core`.
-pub const LAYOUT_TABLE: [LayoutRow; 34] = [
+pub const LAYOUT_TABLE: [LayoutRow; 42] = [
     // 1. AffineRows (48 bytes, 16-byte aligned)
     AFFINE_ROWS_LAYOUT_ROWS[0],
     AFFINE_ROWS_LAYOUT_ROWS[1],
@@ -1727,6 +2012,16 @@ pub const LAYOUT_TABLE: [LayoutRow; 34] = [
     MESH_UNIFORMS_LAYOUT_ROWS[0],
     MESH_UNIFORMS_LAYOUT_ROWS[1],
     MESH_UNIFORMS_LAYOUT_ROWS[2],
+
+    // 12. ToonMeshUniforms Uniform (304 bytes, 16-byte aligned)
+    TOON_MESH_UNIFORMS_LAYOUT_ROWS[0],
+    TOON_MESH_UNIFORMS_LAYOUT_ROWS[1],
+    TOON_MESH_UNIFORMS_LAYOUT_ROWS[2],
+    TOON_MESH_UNIFORMS_LAYOUT_ROWS[3],
+    TOON_MESH_UNIFORMS_LAYOUT_ROWS[4],
+    TOON_MESH_UNIFORMS_LAYOUT_ROWS[5],
+    TOON_MESH_UNIFORMS_LAYOUT_ROWS[6],
+    TOON_MESH_UNIFORMS_LAYOUT_ROWS[7],
 ];
 
 /// Returns a fixed slice of [`LayoutRow`] descriptors covering every GPU wire record in the crate.
@@ -2098,7 +2393,7 @@ mod tests {
     #[test]
     fn layout_table_cross_check_and_display() {
         let table = layout_table();
-        assert_eq!(table.len(), 34);
+        assert_eq!(table.len(), 42);
 
         for row in table {
             let (expected_offset, expected_size) = match (row.record, row.field) {
@@ -2136,6 +2431,14 @@ mod tests {
                 ("MeshUniforms", "model_view") => (0, 64),
                 ("MeshUniforms", "projection") => (64, 64),
                 ("MeshUniforms", "color") => (128, 16),
+                ("ToonMeshUniforms", "model_world") => (core::mem::offset_of!(ToonMeshUniforms, model_world), core::mem::size_of::<[f32; 16]>()),
+                ("ToonMeshUniforms", "projection") => (core::mem::offset_of!(ToonMeshUniforms, projection), core::mem::size_of::<[f32; 16]>()),
+                ("ToonMeshUniforms", "camera_view") => (core::mem::offset_of!(ToonMeshUniforms, camera_view), core::mem::size_of::<[f32; 16]>()),
+                ("ToonMeshUniforms", "model_normal_matrix") => (core::mem::offset_of!(ToonMeshUniforms, model_normal_matrix), core::mem::size_of::<[[f32; 4]; 3]>()),
+                ("ToonMeshUniforms", "color") => (core::mem::offset_of!(ToonMeshUniforms, color), core::mem::size_of::<[f32; 4]>()),
+                ("ToonMeshUniforms", "light_direction") => (core::mem::offset_of!(ToonMeshUniforms, light_direction), core::mem::size_of::<[f32; 4]>()),
+                ("ToonMeshUniforms", "light_color") => (core::mem::offset_of!(ToonMeshUniforms, light_color), core::mem::size_of::<[f32; 4]>()),
+                ("ToonMeshUniforms", "params") => (core::mem::offset_of!(ToonMeshUniforms, params), core::mem::size_of::<[u32; 4]>()),
                 (r, f) => panic!("Unknown record/field: {r}.{f}"),
             };
 
@@ -2164,6 +2467,7 @@ mod tests {
             ("ColorUniform", COLOR_UNIFORM_BYTES),
             ("MaterialParams", core::mem::size_of::<MaterialParams>()),
             ("MeshUniforms", MESH_UNIFORMS_BYTES),
+            ("ToonMeshUniforms", TOON_MESH_UNIFORMS_BYTES),
         ];
 
         for &(record_name, expected_total_size) in record_sizes {
@@ -2194,6 +2498,7 @@ mod tests {
         assert!(rendered.contains("ColorUniform"));
         assert!(rendered.contains("MaterialParams"));
         assert!(rendered.contains("MeshUniforms"));
+        assert!(rendered.contains("ToonMeshUniforms"));
     }
 
     #[test]
@@ -2210,6 +2515,60 @@ mod tests {
         assert!(decls.contains("struct ColorUniform {"));
         assert!(decls.contains("struct MaterialParams {"));
         assert!(decls.contains("struct MeshUniforms {"));
+        assert!(decls.contains("struct ToonMeshUniforms {"));
+    }
+
+    #[test]
+    fn toon_mesh_uniforms_layout_and_byte_roundtrip_tests() {
+        assert_eq!(TOON_MESH_UNIFORMS_BYTES, 304);
+        assert_eq!(TOON_MESH_UNIFORMS_ALIGNMENT, 16);
+        assert_eq!(TOON_MESH_DYNAMIC_OFFSET_STRIDE, 512);
+        assert_eq!(core::mem::size_of::<ToonMeshUniforms>(), 304);
+        assert_eq!(core::mem::offset_of!(ToonMeshUniforms, model_world), 0);
+        assert_eq!(core::mem::offset_of!(ToonMeshUniforms, projection), 64);
+        assert_eq!(core::mem::offset_of!(ToonMeshUniforms, camera_view), 128);
+        assert_eq!(core::mem::offset_of!(ToonMeshUniforms, model_normal_matrix), 192);
+        assert_eq!(core::mem::offset_of!(ToonMeshUniforms, color), 240);
+        assert_eq!(core::mem::offset_of!(ToonMeshUniforms, light_direction), 256);
+        assert_eq!(core::mem::offset_of!(ToonMeshUniforms, light_color), 272);
+        assert_eq!(core::mem::offset_of!(ToonMeshUniforms, params), 288);
+
+        let default_uniforms = ToonMeshUniforms::default();
+        let bytes = default_uniforms.to_bytes();
+        assert_eq!(bytes.len(), 304);
+        let restored = ToonMeshUniforms::from_bytes(&bytes);
+        assert_eq!(restored, default_uniforms);
+
+        let mut slice_buf = [0u8; 304];
+        default_uniforms.write_to_slice(&mut slice_buf).expect("write ok");
+        let read_back = ToonMeshUniforms::read_from_slice(&slice_buf).expect("read ok");
+        assert_eq!(read_back, default_uniforms);
+
+        // Short buffer error
+        let mut short_buf = [0u8; 300];
+        assert_eq!(
+            default_uniforms.write_to_slice(&mut short_buf),
+            Err(LayoutError::BufferTooSmall { required: 304, provided: 300 })
+        );
+        assert_eq!(
+            ToonMeshUniforms::read_from_slice(&short_buf),
+            Err(LayoutError::BufferTooSmall { required: 304, provided: 300 })
+        );
+
+        // Normal matrix padding helper verification
+        let mat3_raw = [
+            1.0, 2.0, 3.0,
+            4.0, 5.0, 6.0,
+            7.0, 8.0, 9.0,
+        ];
+        let padded = ToonMeshUniforms::pad_normal_matrix(&mat3_raw);
+        assert_eq!(padded[0], [1.0, 2.0, 3.0, 0.0]);
+        assert_eq!(padded[1], [4.0, 5.0, 6.0, 0.0]);
+        assert_eq!(padded[2], [7.0, 8.0, 9.0, 0.0]);
+
+        let mut custom = default_uniforms;
+        custom.model_normal_matrix = padded;
+        assert_eq!(custom.unpad_normal_matrix(), mat3_raw);
     }
 }
 
