@@ -33,7 +33,7 @@ export function urlToFilePath(url) {
   if (parsed.protocol !== 'file:') {
     throw new Error(`Cannot convert non-file URL "${url}" to a file system path`);
   }
-  return fileURLToPath(new URL(parsed.pathname, 'file:///'));
+  return fileURLToPath(parsed);
 }
 
 /**
@@ -69,12 +69,20 @@ function matchImportMap(specifier, referrerUrl, importMap, mapBaseUrl) {
 
   // 1. Check scopes
   if (importMap.scopes && typeof importMap.scopes === 'object') {
-    const sortedScopes = Object.keys(importMap.scopes).sort((a, b) => b.length - a.length);
-    for (const scopePrefix of sortedScopes) {
-      const scopeBase = new URL(scopePrefix, mapBaseUrl).href;
-      if (referrerUrl.startsWith(scopeBase) || referrerUrl.startsWith(scopePrefix)) {
-        const scopeImports = importMap.scopes[scopePrefix];
-        const match = matchMapEntries(specifier, scopeImports, mapBaseUrl);
+    // WHATWG sorts serialized scope URLs, not their original relative spellings.
+    const scopes = new Map();
+    for (const [prefix, entries] of Object.entries(importMap.scopes)) {
+      let scopeUrl;
+      try {
+        scopeUrl = new URL(prefix, mapBaseUrl).href;
+      } catch {
+        continue; // Unparseable scope URLs are ignored by import-map normalization.
+      }
+      scopes.set(scopeUrl, entries);
+    }
+    for (const scopeBase of [...scopes.keys()].sort().reverse()) {
+      if (referrerUrl === scopeBase || (scopeBase.endsWith('/') && referrerUrl.startsWith(scopeBase))) {
+        const match = matchMapEntries(specifier, scopes.get(scopeBase), mapBaseUrl);
         if (match !== null) return match;
       }
     }
@@ -318,7 +326,7 @@ export function resolveModuleSpecifier(specifier, referrerUrl, importMap = {}, o
     candidateUrl = mapped;
   } else if (isAbsoluteUrl(specifier)) {
     // 2. Explicit absolute URL (file://, http://, https://, data:)
-    candidateUrl = specifier;
+    candidateUrl = new URL(specifier).href;
   } else if (specifier.startsWith('./') || specifier.startsWith('../') || specifier.startsWith('/')) {
     // 3. Relative or pathname specifier
     try {

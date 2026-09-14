@@ -9,16 +9,72 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { buildModuleGraph } from './module_graph.mjs';
 import { analyzeModuleAst, classifyDynamicImportArgument } from './ast_analyzer.mjs';
 import { parseHtmlEntries, parseSrcsetUrls } from './html_parser.mjs';
 import { bundleWithRollup } from './bundler.mjs';
 import { IngestionResolutionError } from './types.mjs';
-import { resolveExportTargetValue, resolvePackageExports } from './resolver.mjs';
+import { resolveExportTargetValue, resolvePackageExports, resolveModuleSpecifier, urlToFilePath } from './resolver.mjs';
 
 const SCRATCH_BASE = tmpdir();
+
+test('Absolute module URLs normalize identity while retaining queries and fragments', () => {
+  const referrer = import.meta.url;
+  const canonical = new URL('./resolver.mjs', referrer).href;
+  assert.equal(resolveModuleSpecifier(canonical.replace('file:', 'FILE:'), referrer), canonical);
+  assert.equal(resolveModuleSpecifier(canonical + '?v=1#one', referrer), canonical + '?v=1#one');
+  assert.notEqual(
+    resolveModuleSpecifier(canonical + '?v=1#one', referrer),
+    resolveModuleSpecifier(canonical + '?v=1#two', referrer)
+  );
+  assert.equal(
+    resolveModuleSpecifier('HTTPS://EXAMPLE.COM:443/a/../module.js?v=1#one', referrer),
+    'https://example.com/module.js?v=1#one'
+  );
+  const missing = new URL('./not-an-existing-f3d-module-for-url-regression.js', referrer).href;
+  assert.throws(() => resolveModuleSpecifier(missing.replace('file:', 'FILE:'), referrer), IngestionResolutionError);
+});
+
+test('File URL conversion preserves host validation and ignores only query and fragment', () => {
+  assert.equal(urlToFilePath(import.meta.url + '?v=1#one'), fileURLToPath(import.meta.url));
+  const remote = new URL(import.meta.url);
+  remote.host = 'not-this-host.example';
+  if (process.platform === 'win32') {
+    assert.equal(urlToFilePath(remote.href), fileURLToPath(remote));
+  } else {
+    assert.throws(() => urlToFilePath(remote.href), { code: 'ERR_INVALID_FILE_URL_HOST' });
+    assert.throws(() => resolveModuleSpecifier(remote.href, import.meta.url), IngestionResolutionError);
+  }
+});
+
+test('Import-map scope matching uses normalized priority and exact or directory boundaries', () => {
+  const options = { mapBaseUrl: 'https://example.com/app/index.html' };
+  const imports = { lib: 'https://cdn.example/default.js' };
+  const exact = { lib: 'https://cdn.example/exact.js' };
+  const broad = { lib: 'https://cdn.example/broad.js' };
+  const resolve = (referrer, scopes) => resolveModuleSpecifier('lib', referrer, { imports, scopes }, options);
+
+  assert.equal(resolve('https://example.com/app/a', {
+    './a': exact, 'https://example.com/app/': broad,
+  }), exact.lib);
+  assert.equal(resolve('https://example.com/app/ab/module.js', { './a': exact }), imports.lib);
+  assert.equal(resolve('https://example.com/app/a/module.js', { './a/': exact }), exact.lib);
+  assert.equal(resolve('https://example.com/app/a/module.js', {
+    './a/': {}, 'https://example.com/app/': broad,
+  }), broad.lib);
+  assert.throws(() => resolve('https://example.com/app/a/module.js', {
+    './a/': { lib: null }, 'https://example.com/app/': broad,
+  }), IngestionResolutionError);
+  // Two spellings of the same normalized scope are one entry; the later value wins.
+  assert.equal(resolve('https://example.com/app/a', {
+    './a': exact, 'https://example.com/app/a': broad,
+  }), broad.lib);
+  assert.equal(resolve('https://example.com/app/a', {
+    'https://[invalid': broad, './a': exact,
+  }), exact.lib);
+});
 
 function makeScratchDir(prefix) {
   const dir = path.join(SCRATCH_BASE, `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
