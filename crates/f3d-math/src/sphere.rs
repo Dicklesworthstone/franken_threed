@@ -214,31 +214,28 @@ impl Sphere {
         if other.is_empty() {
             return self;
         }
+
         if self.is_empty() {
             self.center = other.center;
             self.radius = other.radius;
             return self;
         }
 
-        let d2 = self.center.distance_to_squared(&other.center);
-        let r_diff = other.radius - self.radius;
+        if self.center.equals(&other.center) {
+            self.radius = js_max(self.radius, other.radius);
+        } else {
+            let mut v2 = other.center;
+            v2.sub(&self.center);
+            v2.set_length(other.radius);
 
-        // If one sphere encloses the other
-        if r_diff * r_diff >= d2 {
-            if r_diff >= 0.0 {
-                self.center = other.center;
-                self.radius = other.radius;
-            }
-            return self;
+            let mut p1 = other.center;
+            p1.add(&v2);
+            self.expand_by_point(&p1);
+
+            let mut p2 = other.center;
+            p2.sub(&v2);
+            self.expand_by_point(&p2);
         }
-
-        let d = d2.sqrt();
-        let radius = (d + self.radius + other.radius) * 0.5;
-
-        let mut v = other.center;
-        v.sub(&self.center);
-        self.center.add_scaled_vector(&v, (radius - self.radius) / d);
-        self.radius = radius;
 
         self
     }

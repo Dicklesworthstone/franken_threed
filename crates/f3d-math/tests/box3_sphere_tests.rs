@@ -858,3 +858,74 @@ fn test_box3_intersects_triangle_nan_vertex_matches_upstream() {
         "triangle with NaN vertex c matches upstream Box3.js (returns true)"
     );
 }
+
+#[test]
+fn test_sphere_union_r186_ordered_expansion_and_edge_cases() {
+    // 1. Concrete finite numeric counterexample against previous enclosing-sphere shortcut.
+    // In r186 Sphere.js:355-360, union evaluates ordered expandByPoint calls along _v2.
+    // For s1(0, 1e6) and s2(1e6, 1e-10):
+    // The previous algorithm computed radius = (d + r1 + r2) * 0.5, losing 1e-10 when adding
+    // to 2e6 (producing radius 1e6) and yielding zero center shift.
+    // Pinned r186 shifts center.x by delta = 5.820766091346741e-11 (bits 0x3dd0000000000000).
+    let mut s1 = Sphere::new(Vector3::new(0.0, 0.0, 0.0), 1_000_000.0);
+    let s2 = Sphere::new(Vector3::new(1_000_000.0, 0.0, 0.0), 1e-10);
+    s1.union(&s2);
+    assert_eq!(
+        s1.center.x.to_bits(),
+        0x3dd0000000000000,
+        "center.x must match exact r186 bit pattern (5.820766091346741e-11)"
+    );
+    assert_eq!(s1.center.y.to_bits(), 0);
+    assert_eq!(s1.center.z.to_bits(), 0);
+    assert_eq!(
+        s1.radius.to_bits(),
+        0x412e848000000000,
+        "radius must match exact r186 bit pattern (1_000_000.0)"
+    );
+
+    // 2. Center equality branch (Sphere.js:349-352) and signed-zero preservation:
+    // When this.center.equals(sphere.center), this.center is not mutated, preserving signed zeros.
+    let mut s_neg_zero = Sphere::new(Vector3::new(-0.0, 0.0, 1.0), 3.0);
+    let s_pos_zero = Sphere::new(Vector3::new(0.0, -0.0, 1.0), 7.0);
+    s_neg_zero.union(&s_pos_zero);
+    assert!(s_neg_zero.center.x.is_sign_negative(), "center.x must preserve -0.0");
+    assert!(s_neg_zero.center.y.is_sign_positive(), "center.y must preserve +0.0");
+    assert_eq!(s_neg_zero.center.z, 1.0);
+    assert_eq!(s_neg_zero.radius, 7.0);
+
+    // 3. Center equality with NaN radius:
+    // Math.max(4.0, NaN) = NaN, center is untouched.
+    let mut s_equal_nan = Sphere::new(Vector3::new(1.0, 2.0, 3.0), 4.0);
+    let s_nan_rad = Sphere::new(Vector3::new(1.0, 2.0, 3.0), f64::NAN);
+    s_equal_nan.union(&s_nan_rad);
+    assert_eq!(s_equal_nan.center, Vector3::new(1.0, 2.0, 3.0));
+    assert!(s_equal_nan.radius.is_nan());
+
+    // 4. Different centers with NaN radius:
+    // setLength(NaN) yields NaN point; expandByPoint evaluates lengthSq > radius^2 (false for NaN),
+    // leaving this completely unmodified.
+    let mut s_diff_nan = Sphere::new(Vector3::new(1.0, 2.0, 3.0), 4.0);
+    let s_other_nan = Sphere::new(Vector3::new(5.0, 6.0, 7.0), f64::NAN);
+    s_diff_nan.union(&s_other_nan);
+    assert_eq!(s_diff_nan.center, Vector3::new(1.0, 2.0, 3.0));
+    assert_eq!(s_diff_nan.radius, 4.0);
+
+    // 5. Empty sphere handling (Sphere.js:335-347):
+    let mut s_valid = Sphere::new(Vector3::new(2.0, 3.0, 4.0), 5.0);
+    let s_empty = Sphere::empty();
+    s_valid.union(&s_empty);
+    assert_eq!(s_valid.center, Vector3::new(2.0, 3.0, 4.0));
+    assert_eq!(s_valid.radius, 5.0);
+
+    let mut s_empty_self = Sphere::empty();
+    let s_valid_other = Sphere::new(Vector3::new(2.0, 3.0, 4.0), 5.0);
+    s_empty_self.union(&s_valid_other);
+    assert_eq!(s_empty_self.center, Vector3::new(2.0, 3.0, 4.0));
+    assert_eq!(s_empty_self.radius, 5.0);
+
+    let mut s_both_empty = Sphere::empty();
+    let s_other_empty = Sphere::new(Vector3::new(10.0, 10.0, 10.0), -5.0);
+    s_both_empty.union(&s_other_empty);
+    assert_eq!(s_both_empty.center, Vector3::zero());
+    assert_eq!(s_both_empty.radius, -1.0);
+}
