@@ -24,8 +24,10 @@ use core::fmt;
 use f3d_core::{
     handle::{Handle, MaterialDomain},
     layout::{
-        aligned_bytes_per_row, VertexPosColor, VertexPosUv, MESH_UNIFORMS_BYTES,
-        VERTEX_POS_COLOR_STRIDE, VERTEX_POS_UV_STRIDE, WGSL_MESH_UNIFORMS_DECLARATION,
+        aligned_bytes_per_row, ToonMeshUniforms, VertexPosColor, VertexPosNormalUv, VertexPosUv,
+        MESH_UNIFORMS_BYTES, TOON_MESH_UNIFORMS_BYTES, VERTEX_POS_COLOR_STRIDE,
+        VERTEX_POS_UV_STRIDE, WGSL_MESH_UNIFORMS_DECLARATION,
+        WGSL_TOON_MESH_UNIFORMS_DECLARATION,
     },
     ownership::{DataVersion, Epoch},
 };
@@ -39,11 +41,12 @@ use crate::frame::{FrameSession, RenderContext};
 use crate::gpu_host::{
     with_global_resource_table, GpuCommand, GpuSubmissionPacket, BUFFER_USAGE_COPY_DST,
     BUFFER_USAGE_MAP_READ, BUFFER_USAGE_UNIFORM, BUFFER_USAGE_VERTEX, CULL_MODE_BACK,
-    CULL_MODE_FRONT, CULL_MODE_NONE, DEPTH_COMPARE_ALWAYS, DEPTH_COMPARE_LESS, FRONT_FACE_CCW,
-    FRONT_FACE_CW, LOAD_OP_CLEAR, OPCODE_CREATE_PIPELINE_CULL, OPCODE_CREATE_PIPELINE_DEPTH_CULL,
-    PASS_FLAG_NEW_PASS, STORE_OP_STORE, TARGET_CANVAS, TARGET_FORMAT_DEPTH24PLUS,
-    TARGET_FORMAT_PREFERRED_CANVAS, TARGET_FORMAT_RGBA8UNORM, TARGET_OFFSCREEN,
-    TEXTURE_USAGE_COPY_SRC, TEXTURE_USAGE_RENDER_ATTACHMENT,
+    CULL_MODE_FRONT, CULL_MODE_NONE, DEPTH_COMPARE_ALWAYS, DEPTH_COMPARE_LESS,
+    DEPTH_COMPARE_LESS_EQUAL, FRONT_FACE_CCW, FRONT_FACE_CW, LOAD_OP_CLEAR,
+    OPCODE_CREATE_PIPELINE_CULL, OPCODE_CREATE_PIPELINE_DEPTH_CULL, PASS_FLAG_NEW_PASS,
+    STORE_OP_STORE, TARGET_CANVAS, TARGET_FORMAT_DEPTH24PLUS, TARGET_FORMAT_PREFERRED_CANVAS,
+    TARGET_FORMAT_RGBA8UNORM, TARGET_OFFSCREEN, TEXTURE_USAGE_COPY_SRC,
+    TEXTURE_USAGE_RENDER_ATTACHMENT,
 };
 
 #[cfg(all(feature = "browser", target_arch = "wasm32"))]
@@ -99,6 +102,12 @@ pub enum MeshPacketError {
         actual_width: u32,
         actual_height: u32,
     },
+    /// Normal array length does not match position array length.
+    InvalidNormalLength { expected: usize, actual: usize },
+    /// UV array length does not match vertex count * 2.
+    InvalidUvLength { expected: usize, actual: usize },
+    /// Invalid material side code (must be 0 = FrontSide, 1 = BackSide, 2 = DoubleSide).
+    InvalidSide { value: u32 },
 }
 
 impl fmt::Display for MeshPacketError {
@@ -165,6 +174,15 @@ impl fmt::Display for MeshPacketError {
                 f,
                 "mismatched mesh dimensions: expected {expected_width}x{expected_height}, got {actual_width}x{actual_height}"
             ),
+            Self::InvalidNormalLength { expected, actual } => {
+                write!(f, "normal length mismatch: expected {expected}, actual {actual}")
+            }
+            Self::InvalidUvLength { expected, actual } => {
+                write!(f, "uv length mismatch: expected {expected}, actual {actual}")
+            }
+            Self::InvalidSide { value } => {
+                write!(f, "invalid side: {value} (must be 0, 1, or 2)")
+            }
         }
     }
 }
@@ -197,6 +215,21 @@ pub const MESH_CANVAS_TARGET_ID: u32 = 0;
 
 /// Canonical pipeline resource identifier for the canvas presentation mesh render pipeline.
 pub const MESH_CANVAS_PIPELINE_ID: u32 = 101;
+
+/// Canonical pipeline resource identifier for the toon mesh render pipeline.
+pub const TOON_MESH_PIPELINE_ID: u32 = 300;
+
+/// Canonical pipeline resource identifier for the canvas presentation toon mesh render pipeline.
+pub const TOON_MESH_CANVAS_PIPELINE_ID: u32 = 400;
+
+/// Canonical material side: front-facing only.
+pub const MATERIAL_SIDE_FRONT: u32 = 0;
+
+/// Canonical material side: back-facing only.
+pub const MATERIAL_SIDE_BACK: u32 = 1;
+
+/// Canonical material side: double-sided.
+pub const MATERIAL_SIDE_DOUBLE: u32 = 2;
 
 /// Typed, validated dynamic mesh input parameters ready for GPU schedule synthesis.
 ///
@@ -454,6 +487,179 @@ impl<'a> DynamicMeshInput<'a> {
     }
 }
 
+/// Typed, validated dynamic toon mesh input parameters ready for GPU schedule synthesis.
+///
+/// Invariant: Constructible only via [`ToonMeshInput::try_from_raw`], ensuring
+/// unforgeable dimensions, matrix layouts, color ranges, and index bounds.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToonMeshInput<'a> {
+    positions: &'a [f32],
+    normals: &'a [f32],
+    uvs: Option<&'a [f32]>,
+    indices: &'a [u32],
+    model_world: [f32; 16],
+    projection: [f32; 16],
+    camera_view: [f32; 16],
+    model_normal_matrix: [[f32; 4]; 3],
+    color: [f32; 4],
+    light_direction: [f32; 4],
+    light_color: [f32; 4],
+    side: u32,
+    width: u32,
+    height: u32,
+    webgl_depth: bool,
+    depth: Option<MeshDepthOptions>,
+}
+
+impl<'a> ToonMeshInput<'a> {
+    /// Validates raw slices and constructs an unforgeable `ToonMeshInput`.
+    pub fn try_from_raw(
+        positions: &'a [f32],
+        normals: &'a [f32],
+        uvs: Option<&'a [f32]>,
+        indices: &'a [u32],
+        model_world: &[f64],
+        projection: &[f64],
+        camera_view: &[f64],
+        model_normal_matrix: &[f64],
+        color: &[f32],
+        light_direction: &[f32],
+        light_color: &[f32],
+        side: u32,
+        width: u32,
+        height: u32,
+        webgl_depth: bool,
+    ) -> Result<Self, MeshPacketError> {
+        if width == 0 || height == 0 {
+            return Err(MeshPacketError::ZeroDimensions { width, height });
+        }
+        if positions.len() % 3 != 0 {
+            return Err(MeshPacketError::InvalidPositionLength { len: positions.len() });
+        }
+        if normals.len() != positions.len() {
+            return Err(MeshPacketError::InvalidNormalLength {
+                expected: positions.len(),
+                actual: normals.len(),
+            });
+        }
+        let vertex_count = positions.len() / 3;
+        if let Some(uv) = uvs {
+            if uv.len() != vertex_count * 2 {
+                return Err(MeshPacketError::InvalidUvLength {
+                    expected: vertex_count * 2,
+                    actual: uv.len(),
+                });
+            }
+        }
+        if !indices.is_empty() {
+            let num_triangles = indices.len() / 3;
+            let effective_index_count = num_triangles * 3;
+            for &idx in &indices[..effective_index_count] {
+                if (idx as usize) >= vertex_count {
+                    return Err(MeshPacketError::IndexOutOfBounds {
+                        index: idx,
+                        vertex_count,
+                    });
+                }
+            }
+        }
+        if model_world.len() != 16 {
+            return Err(MeshPacketError::InvalidMatrixLength {
+                name: "model_world",
+                len: model_world.len(),
+            });
+        }
+        if projection.len() != 16 {
+            return Err(MeshPacketError::InvalidMatrixLength {
+                name: "projection",
+                len: projection.len(),
+            });
+        }
+        if camera_view.len() != 16 {
+            return Err(MeshPacketError::InvalidMatrixLength {
+                name: "camera_view",
+                len: camera_view.len(),
+            });
+        }
+        if model_normal_matrix.len() != 9 {
+            return Err(MeshPacketError::InvalidMatrixLength {
+                name: "model_normal_matrix",
+                len: model_normal_matrix.len(),
+            });
+        }
+        if color.len() != 3 && color.len() != 4 {
+            return Err(MeshPacketError::InvalidColorLength { len: color.len() });
+        }
+        if light_direction.len() != 3 && light_direction.len() != 4 {
+            return Err(MeshPacketError::InvalidColorLength { len: light_direction.len() });
+        }
+        if light_color.len() != 3 && light_color.len() != 4 {
+            return Err(MeshPacketError::InvalidColorLength { len: light_color.len() });
+        }
+        if side > 2 {
+            return Err(MeshPacketError::InvalidSide { value: side });
+        }
+
+        let mut mw_f32 = [0.0f32; 16];
+        for (dst, &src) in mw_f32.iter_mut().zip(model_world.iter()) {
+            *dst = src as f32;
+        }
+        let mut proj_f32 = [0.0f32; 16];
+        for (dst, &src) in proj_f32.iter_mut().zip(projection.iter()) {
+            *dst = src as f32;
+        }
+        let mut cv_f32 = [0.0f32; 16];
+        for (dst, &src) in cv_f32.iter_mut().zip(camera_view.iter()) {
+            *dst = src as f32;
+        }
+        let mut norm_f32 = [0.0f32; 9];
+        for (dst, &src) in norm_f32.iter_mut().zip(model_normal_matrix.iter()) {
+            *dst = src as f32;
+        }
+        let norm_padded = ToonMeshUniforms::pad_normal_matrix(&norm_f32);
+
+        let mut color_f32 = [1.0f32; 4];
+        for (dst, &src) in color_f32.iter_mut().zip(color.iter()) {
+            *dst = src;
+        }
+        let mut light_dir_f32 = [0.0f32; 4];
+        for (dst, &src) in light_dir_f32.iter_mut().zip(light_direction.iter()) {
+            *dst = src;
+        }
+        light_dir_f32[3] = 0.0;
+
+        let mut light_col_f32 = [1.0f32; 4];
+        for (dst, &src) in light_col_f32.iter_mut().zip(light_color.iter()) {
+            *dst = src;
+        }
+
+        Ok(Self {
+            positions,
+            normals,
+            uvs,
+            indices,
+            model_world: mw_f32,
+            projection: proj_f32,
+            camera_view: cv_f32,
+            model_normal_matrix: norm_padded,
+            color: color_f32,
+            light_direction: light_dir_f32,
+            light_color: light_col_f32,
+            side,
+            width,
+            height,
+            webgl_depth,
+            depth: None,
+        })
+    }
+
+    /// Configures depth options.
+    pub fn with_depth(mut self, depth: MeshDepthOptions) -> Self {
+        self.depth = Some(depth);
+        self
+    }
+}
+
 /// Depth testing and writing configuration for dynamic mesh render pipeline and pass.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct MeshDepthOptions {
@@ -660,6 +866,180 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{\n\
 #[must_use]
 pub fn generate_mesh_wgsl(webgl_depth: bool) -> String {
     generate_mesh_wgsl_internal(webgl_depth, false, false)
+}
+
+/// Generates the WGSL shader source code for dynamic toon mesh rendering.
+///
+/// Implements Three.js r186 MeshToonNodeMaterial semantics:
+/// - Uniform buffer (304 bytes): `model_world: mat4x4`, `projection: mat4x4`, `camera_view: mat4x4`,
+///   `model_normal_matrix: mat3x3` (std140 padded), `color: vec4`, `light_direction: vec4`,
+///   `light_color: vec4`, `params: vec4<u32>` (side code, flags).
+/// - Model-view transform: `uniforms.camera_view * uniforms.model_world` (ModelNode.js:142).
+/// - Normal transform: `normal_world = uniforms.model_normal_matrix * in.normal`, followed by
+///   `normalize((uniforms.camera_view * vec4<f32>(normal_world, 0.0)).xyz)` in vertex shader (MathNode.js:1001),
+///   and re-normalized in fragment shader after interpolation (Normal.js:61).
+/// - Side handling: FrontSide (params.x == 0), BackSide (params.x == 1), DoubleSide (params.x == 2)
+///   negates normal via `@builtin(front_facing)` (FrontFacingNode.js:91-108).
+/// - Derivative-based toon gradient: `fw = fwidth(coord) * 0.5`,
+///   `mix(vec3(0.7), vec3(1.0), smoothstep(0.7 - fw, 0.7 + fw, coord))` (ToonLightingModel.js:9-29).
+/// - Lambertian diffuse: `irradiance * light_color * color * (1.0 / PI)` (BSDF/BRDF_Lambert.js:5).
+/// - Conditional sRGB OETF transfer for canvas presentation targets.
+#[must_use]
+pub fn generate_toon_mesh_wgsl(webgl_depth: bool, output_srgb: bool) -> String {
+    let depth_remap = if webgl_depth {
+        "    clip.z = (clip.z + clip.w) * 0.5;\n"
+    } else {
+        ""
+    };
+
+    let (srgb_fn, fragment_body) = if output_srgb {
+        (
+            "\
+fn srgb_transfer_oetf(color: vec3<f32>) -> vec3<f32> {\n\
+    let clamped = max(color, vec3<f32>(0.0));\n\
+    let a = pow(clamped, vec3<f32>(0.41666)) * 1.055 - vec3<f32>(0.055);\n\
+    let b = color * 12.92;\n\
+    return select(a, b, color <= vec3<f32>(0.0031308));\n\
+}\n\
+\n\
+",
+            "    let srgb_rgb = srgb_transfer_oetf(clamped_diffuse);\n\
+    return vec4<f32>(srgb_rgb, uniforms.color.a);\n",
+        )
+    } else {
+        (
+            "",
+            "    return vec4<f32>(clamped_diffuse, uniforms.color.a);\n",
+        )
+    };
+
+    alloc::format!(
+        "{WGSL_TOON_MESH_UNIFORMS_DECLARATION}\n\
+@group(0) @binding(0)\n\
+var<uniform> uniforms: ToonMeshUniforms;\n\
+\n\
+struct VertexInput {{\n\
+    @location(0) position: vec3<f32>,\n\
+    @location(1) normal: vec3<f32>,\n\
+    @location(2) uv: vec2<f32>,\n\
+}};\n\
+\n\
+struct VertexOutput {{\n\
+    @builtin(position) clip_position: vec4<f32>,\n\
+    @location(0) v_normal_view: vec3<f32>,\n\
+    @location(1) uv: vec2<f32>,\n\
+}};\n\
+\n\
+@vertex\n\
+fn vs_main(in: VertexInput) -> VertexOutput {{\n\
+    var out: VertexOutput;\n\
+    let model_view = uniforms.camera_view * uniforms.model_world;\n\
+    let mv_pos = model_view * vec4<f32>(in.position, 1.0);\n\
+    var clip = uniforms.projection * mv_pos;\n\
+{depth_remap}\
+    out.clip_position = clip;\n\
+    let normal_world = uniforms.model_normal_matrix * in.normal;\n\
+    let normal_view = normalize((uniforms.camera_view * vec4<f32>(normal_world, 0.0)).xyz);\n\
+    out.v_normal_view = normal_view;\n\
+    out.uv = in.uv;\n\
+    return out;\n\
+}}\n\
+\n\
+{srgb_fn}\
+@fragment\n\
+fn fs_main(in: VertexOutput, @builtin(front_facing) is_front: bool) -> @location(0) vec4<f32> {{\n\
+    var normal_view = normalize(in.v_normal_view);\n\
+    if (uniforms.params.x == 1u) {{\n\
+        normal_view = -normal_view;\n\
+    }} else if (uniforms.params.x == 2u) {{\n\
+        normal_view = select(-normal_view, normal_view, is_front);\n\
+    }}\n\
+    let dot_nl = dot(normal_view, uniforms.light_direction.xyz);\n\
+    let coord_x = dot_nl * 0.5 + 0.5;\n\
+    let fw = fwidth(coord_x) * 0.5;\n\
+    let step_val = smoothstep(0.7 - fw, 0.7 + fw, coord_x);\n\
+    let irradiance = mix(vec3<f32>(0.7), vec3<f32>(1.0), step_val);\n\
+    let direct_diffuse = irradiance * uniforms.light_color.rgb * (uniforms.color.rgb * 0.3183098861837907);\n\
+    let clamped_diffuse = max(direct_diffuse, vec3<f32>(0.0));\n\
+{fragment_body}\
+}}\n\
+"
+    )
+}
+
+/// Helper: de-indexes vertex positions, normals, and UVs into 32-byte [`VertexPosNormalUv`]
+/// records and formats the 304-byte uniform buffer record padded to 512 bytes.
+fn format_toon_mesh_geometry_and_uniforms(
+    input: &ToonMeshInput<'_>,
+) -> Result<(u32, u32, u32, Vec<u8>, Vec<u8>), MeshPacketError> {
+    let vertex_count_avail = input.positions.len() / 3;
+    let num_triangles = input.indices.len() / 3;
+    let (v_count, is_indexed) = if input.indices.is_empty() {
+        (vertex_count_avail, false)
+    } else {
+        (num_triangles * 3, true)
+    };
+
+    let mut v_bytes = Vec::with_capacity(v_count * VertexPosNormalUv::BYTE_SIZE);
+    for i in 0..v_count {
+        let vi = if is_indexed {
+            let idx = input.indices[i];
+            if (idx as usize) >= vertex_count_avail {
+                return Err(MeshPacketError::IndexOutOfBounds {
+                    index: idx,
+                    vertex_count: vertex_count_avail,
+                });
+            }
+            idx as usize
+        } else {
+            i
+        };
+        let p_base = vi * 3;
+        let pos = [input.positions[p_base], input.positions[p_base + 1], input.positions[p_base + 2]];
+        let norm = [input.normals[p_base], input.normals[p_base + 1], input.normals[p_base + 2]];
+        let uv = if let Some(uvs) = input.uvs {
+            [uvs[vi * 2], uvs[vi * 2 + 1]]
+        } else {
+            [0.0, 0.0]
+        };
+        let vertex = VertexPosNormalUv::new(pos, norm, uv);
+        v_bytes.extend_from_slice(&vertex.to_bytes());
+    }
+
+    let vertex_count_u32 = u32::try_from(v_count)
+        .map_err(|_| MeshPacketError::InvalidDimensions("vertex count exceeds u32::MAX".into()))?;
+    let raw_vertex_bytes_len = u32::try_from(v_bytes.len())
+        .map_err(|_| MeshPacketError::InvalidDimensions("vertex buffer bytes exceed u32::MAX".into()))?;
+    let vertex_stride_u32 = u32::try_from(VertexPosNormalUv::STRIDE)
+        .map_err(|_| MeshPacketError::InvalidDimensions("vertex stride exceeds u32::MAX".into()))?;
+    let vertex_buffer_size = raw_vertex_bytes_len.max(4);
+    let vertex_upload_data = if v_bytes.is_empty() {
+        alloc::vec![0u8; 4]
+    } else {
+        v_bytes
+    };
+
+    let uniforms = ToonMeshUniforms::new(
+        input.model_world,
+        input.projection,
+        input.camera_view,
+        input.model_normal_matrix,
+        input.color,
+        input.light_direction,
+        input.light_color,
+        [input.side, 0, 0, 0],
+    );
+    let mut uniform_bytes = Vec::with_capacity(512);
+    uniform_bytes.extend_from_slice(&uniforms.to_bytes());
+    uniform_bytes.resize(512, 0);
+
+    Ok((
+        vertex_count_u32,
+        vertex_stride_u32,
+        vertex_buffer_size,
+        vertex_upload_data,
+        uniform_bytes,
+    ))
 }
 
 /// Helper: de-indexes vertex positions (and colors) and formats the padded uniform buffer record.
@@ -1526,6 +1906,268 @@ fn build_multi_mesh_canvas_submission_internal(
     }
 
     Ok(packet)
+}
+
+fn build_toon_mesh_submission_internal(
+    input: &ToonMeshInput<'_>,
+    is_canvas: bool,
+) -> Result<GpuSubmissionPacket, MeshPacketError> {
+    let target_format = if is_canvas {
+        TARGET_FORMAT_PREFERRED_CANVAS
+    } else {
+        TARGET_FORMAT_RGBA8UNORM
+    };
+
+    let base_pipeline_id = if is_canvas {
+        TOON_MESH_CANVAS_PIPELINE_ID
+    } else {
+        TOON_MESH_PIPELINE_ID
+    };
+
+    let (vertex_count_u32, vertex_stride_u32, vertex_buffer_size, vertex_upload_data, uniform_bytes) =
+        format_toon_mesh_geometry_and_uniforms(input)?;
+
+    let cull_mode = match input.side {
+        MATERIAL_SIDE_FRONT => CULL_MODE_BACK,
+        MATERIAL_SIDE_BACK => CULL_MODE_FRONT,
+        _ => CULL_MODE_NONE,
+    };
+    let front_face = FRONT_FACE_CCW;
+    let (depth_write_enabled, depth_compare) = if let Some(depth_opts) = input.depth {
+        depth_opts.resolve_effective()
+    } else {
+        (true, DEPTH_COMPARE_LESS_EQUAL)
+    };
+
+    let pipeline_id = base_pipeline_id;
+
+    with_global_resource_table(|table| {
+        if is_canvas {
+            table.register(MESH_CANVAS_TARGET_ID);
+        } else {
+            table.register(MESH_TARGET_TEXTURE_ID);
+            table.register(MESH_READBACK_BUFFER_ID);
+        }
+        table.register(MESH_DEPTH_TEXTURE_ID);
+        table.register(MESH_VERTEX_BUFFER_ID);
+        table.register(MESH_UNIFORM_BUFFER_ID);
+        table.register(pipeline_id);
+    });
+
+    let mut packet = GpuSubmissionPacket::new();
+
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: MESH_VERTEX_BUFFER_ID,
+        size: vertex_buffer_size,
+        usage: BUFFER_USAGE_VERTEX | BUFFER_USAGE_COPY_DST,
+    });
+
+    packet.push(GpuCommand::WriteBuffer {
+        buffer_id: MESH_VERTEX_BUFFER_ID,
+        offset: 0,
+        data: vertex_upload_data,
+    });
+
+    packet.push(GpuCommand::CreateTexture {
+        texture_id: MESH_DEPTH_TEXTURE_ID,
+        width: input.width,
+        height: input.height,
+        format: TARGET_FORMAT_DEPTH24PLUS,
+        usage: TEXTURE_USAGE_RENDER_ATTACHMENT,
+    });
+
+    if !is_canvas {
+        let bytes_per_row = aligned_bytes_per_row(input.width)
+            .map_err(|e| MeshPacketError::InvalidDimensions(alloc::format!("width {}: {e:?}", input.width)))?;
+        let readback_size = bytes_per_row
+            .checked_mul(input.height)
+            .ok_or_else(|| MeshPacketError::InvalidDimensions("readback size calculation overflow".into()))?;
+
+        packet.push(GpuCommand::CreateTexture {
+            texture_id: MESH_TARGET_TEXTURE_ID,
+            width: input.width,
+            height: input.height,
+            format: TARGET_FORMAT_RGBA8UNORM,
+            usage: TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC,
+        });
+
+        packet.push(GpuCommand::CreateBuffer {
+            buffer_id: MESH_READBACK_BUFFER_ID,
+            size: readback_size,
+            usage: BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST,
+        });
+    }
+
+    let wgsl_code = generate_toon_mesh_wgsl(input.webgl_depth, is_canvas);
+
+    packet.push(GpuCommand::CreatePipelineDepthCull {
+        pipeline_id,
+        wgsl_code,
+        target_format,
+        has_vertex_buffer: true,
+        has_uniform_buffer: true,
+        uniform_size: TOON_MESH_UNIFORMS_BYTES as u32,
+        vertex_stride: vertex_stride_u32,
+        depth_format: TARGET_FORMAT_DEPTH24PLUS,
+        depth_write_enabled,
+        depth_compare,
+        cull_mode,
+        front_face,
+    });
+
+    let (mut session, tracker_opt) = if is_canvas {
+        let mut tracker = CanvasEpochTracker::new();
+        tracker.register_canvas(
+            CanvasId::new(MESH_CANVAS_TARGET_ID),
+            ResourceId::new(MESH_CANVAS_TARGET_ID),
+            input.width,
+            input.height,
+            CanvasFormat::Bgra8Unorm,
+        );
+        let canvas_output = tracker
+            .begin_frame_acquire(CanvasId::new(MESH_CANVAS_TARGET_ID))
+            .map_err(|e| MeshPacketError::SessionError(alloc::format!("canvas acquire: {e:?}")))?;
+
+        let root_ctx = RenderContext::new_canvas_acquired(
+            ResourceId::new(MESH_CANVAS_TARGET_ID),
+            input.width,
+            input.height,
+            Epoch::new(1),
+            canvas_output.epoch,
+        );
+        let sess = FrameSession::new(root_ctx, 256)
+            .map_err(|e| MeshPacketError::SessionError(alloc::format!("FrameSession::new: {e:?}")))?
+            .with_uniform_buffer_id(MESH_UNIFORM_BUFFER_ID);
+        (sess, Some(tracker))
+    } else {
+        let root_ctx = RenderContext::new_offscreen(
+            ResourceId::new(MESH_TARGET_TEXTURE_ID),
+            input.width,
+            input.height,
+            Epoch::ZERO,
+        );
+        let sess = FrameSession::new(root_ctx, 256)
+            .map_err(|e| MeshPacketError::SessionError(alloc::format!("FrameSession::new: {e:?}")))?
+            .with_uniform_buffer_id(MESH_UNIFORM_BUFFER_ID);
+        (sess, None)
+    };
+
+    let mat_handle = Handle::<MaterialDomain>::from_raw(1, 1)
+        .map_err(|e| MeshPacketError::SessionError(alloc::format!("Handle::from_raw: {e:?}")))?;
+    let rec_mat = session
+        .snapshot_material_use(mat_handle, DataVersion::new(1), Epoch::ZERO, &uniform_bytes)
+        .map_err(|e| MeshPacketError::SessionError(alloc::format!("snapshot_material_use: {e:?}")))?;
+
+    let depth_attachment = Some(DepthStencilAttachment::new_depth_clear(
+        ResourceId::new(MESH_DEPTH_TEXTURE_ID),
+        1.0,
+    ));
+
+    let pass_name = if is_canvas { "toon_mesh_canvas_render_pass" } else { "toon_mesh_render_pass" };
+    session
+        .begin_render_pass_with_depth(pass_name, MESH_CLEAR_COLOR, depth_attachment)
+        .map_err(|e| MeshPacketError::SessionError(alloc::format!("begin_render_pass_with_depth: {e:?}")))?;
+
+    session
+        .record_direct_draw_with_range(
+            pipeline_id,
+            MESH_VERTEX_BUFFER_ID,
+            [vertex_count_u32, 1, 0, 0],
+            Some(rec_mat),
+        )
+        .map_err(|e| MeshPacketError::SessionError(alloc::format!("record_direct_draw_with_range: {e:?}")))?;
+
+    session
+        .end_render_pass()
+        .map_err(|e| MeshPacketError::SessionError(alloc::format!("end_render_pass: {e:?}")))?;
+
+    let session_packet = if let Some(ref trk) = tracker_opt {
+        session
+            .build_submission_packet_with_tracker(Some(trk))
+            .map_err(|e| MeshPacketError::SessionError(alloc::format!("build_submission_packet_with_tracker: {e:?}")))?
+    } else {
+        session
+            .build_submission_packet()
+            .map_err(|e| MeshPacketError::SessionError(alloc::format!("build_submission_packet: {e:?}")))?
+    };
+
+    for cmd in session_packet.into_commands() {
+        packet.push(cmd);
+    }
+
+    if !is_canvas {
+        packet.push(GpuCommand::CopyTextureToBuffer {
+            texture_id: MESH_TARGET_TEXTURE_ID,
+            buffer_id: MESH_READBACK_BUFFER_ID,
+            width: input.width,
+            height: input.height,
+            epoch: Epoch::ZERO,
+        });
+    }
+
+    Ok(packet)
+}
+
+/// Builds a verified [`GpuSubmissionPacket`] from typed dynamic toon mesh input for offscreen rendering.
+pub fn build_toon_mesh_submission(
+    input: &ToonMeshInput<'_>,
+) -> Result<GpuSubmissionPacket, MeshPacketError> {
+    build_toon_mesh_submission_internal(input, false)
+}
+
+/// Builds a verified [`GpuSubmissionPacket`] from typed dynamic toon mesh input targeting a visible canvas swapchain.
+pub fn build_toon_mesh_canvas_submission(
+    input: &ToonMeshInput<'_>,
+) -> Result<GpuSubmissionPacket, MeshPacketError> {
+    build_toon_mesh_submission_internal(input, true)
+}
+
+/// Encodes a dynamic toon mesh into a wire submission packet.
+pub fn build_toon_mesh_packet_impl(
+    positions: &[f32],
+    normals: &[f32],
+    uvs: Option<&[f32]>,
+    indices: &[u32],
+    model_world: &[f64],
+    projection: &[f64],
+    camera_view: &[f64],
+    model_normal_matrix: &[f64],
+    color: &[f32],
+    light_direction: &[f32],
+    light_color: &[f32],
+    side: u32,
+    width: u32,
+    height: u32,
+    webgl_depth: bool,
+    canvas: bool,
+) -> Result<Vec<u8>, MeshPacketError> {
+    let input = ToonMeshInput::try_from_raw(
+        positions,
+        normals,
+        uvs,
+        indices,
+        model_world,
+        projection,
+        camera_view,
+        model_normal_matrix,
+        color,
+        light_direction,
+        light_color,
+        side,
+        width,
+        height,
+        webgl_depth,
+    )?;
+
+    let packet = if canvas {
+        build_toon_mesh_canvas_submission(&input)?
+    } else {
+        build_toon_mesh_submission(&input)?
+    };
+
+    packet
+        .encode()
+        .map_err(|e| MeshPacketError::EncodeError(alloc::format!("{e:?}")))
 }
 
 fn build_mesh_packet_impl(
@@ -3179,4 +3821,170 @@ pub fn f3d_build_scene_clear_packet(
     canvas: bool,
 ) -> Result<Vec<u8>, String> {
     build_scene_clear_packet_impl(width, height, clear_color, canvas).map_err(|e| e.to_string())
+}
+
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen]
+/// Encodes a dynamic Three.js MeshToonNodeMaterial submission packet (wasm-bindgen export).
+pub fn f3d_build_toon_mesh_packet(
+    positions: &[f32],
+    normals: &[f32],
+    uvs: &[f32],
+    indices: &[u32],
+    model_world: &[f64],
+    projection: &[f64],
+    camera_view: &[f64],
+    model_normal_matrix: &[f64],
+    color: &[f32],
+    light_direction: &[f32],
+    light_color: &[f32],
+    side: u32,
+    width: u32,
+    height: u32,
+    webgl_depth: bool,
+    canvas: bool,
+) -> Result<Vec<u8>, wasm_bindgen::JsValue> {
+    let uv_opt = if uvs.is_empty() { None } else { Some(uvs) };
+    build_toon_mesh_packet_impl(
+        positions,
+        normals,
+        uv_opt,
+        indices,
+        model_world,
+        projection,
+        camera_view,
+        model_normal_matrix,
+        color,
+        light_direction,
+        light_color,
+        side,
+        width,
+        height,
+        webgl_depth,
+        canvas,
+    )
+    .map_err(|e| wasm_bindgen::JsValue::from_str(&e.to_string()))
+}
+
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen]
+/// Encodes a dynamic Three.js MeshToonNodeMaterial submission packet via gpu_bridge alias.
+pub fn gpu_bridge_build_toon_mesh_packet(
+    positions: &[f32],
+    normals: &[f32],
+    uvs: &[f32],
+    indices: &[u32],
+    model_world: &[f64],
+    projection: &[f64],
+    camera_view: &[f64],
+    model_normal_matrix: &[f64],
+    color: &[f32],
+    light_direction: &[f32],
+    light_color: &[f32],
+    side: u32,
+    width: u32,
+    height: u32,
+    webgl_depth: bool,
+    canvas: bool,
+) -> Result<Vec<u8>, wasm_bindgen::JsValue> {
+    f3d_build_toon_mesh_packet(
+        positions,
+        normals,
+        uvs,
+        indices,
+        model_world,
+        projection,
+        camera_view,
+        model_normal_matrix,
+        color,
+        light_direction,
+        light_color,
+        side,
+        width,
+        height,
+        webgl_depth,
+        canvas,
+    )
+}
+
+#[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
+/// Encodes a dynamic Three.js MeshToonNodeMaterial submission packet for host verification and unit tests.
+pub fn f3d_build_toon_mesh_packet(
+    positions: &[f32],
+    normals: &[f32],
+    uvs: &[f32],
+    indices: &[u32],
+    model_world: &[f64],
+    projection: &[f64],
+    camera_view: &[f64],
+    model_normal_matrix: &[f64],
+    color: &[f32],
+    light_direction: &[f32],
+    light_color: &[f32],
+    side: u32,
+    width: u32,
+    height: u32,
+    webgl_depth: bool,
+    canvas: bool,
+) -> Result<Vec<u8>, String> {
+    let uv_opt = if uvs.is_empty() { None } else { Some(uvs) };
+    build_toon_mesh_packet_impl(
+        positions,
+        normals,
+        uv_opt,
+        indices,
+        model_world,
+        projection,
+        camera_view,
+        model_normal_matrix,
+        color,
+        light_direction,
+        light_color,
+        side,
+        width,
+        height,
+        webgl_depth,
+        canvas,
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
+/// Encodes a dynamic Three.js MeshToonNodeMaterial submission packet via gpu_bridge alias for host verification.
+pub fn gpu_bridge_build_toon_mesh_packet(
+    positions: &[f32],
+    normals: &[f32],
+    uvs: &[f32],
+    indices: &[u32],
+    model_world: &[f64],
+    projection: &[f64],
+    camera_view: &[f64],
+    model_normal_matrix: &[f64],
+    color: &[f32],
+    light_direction: &[f32],
+    light_color: &[f32],
+    side: u32,
+    width: u32,
+    height: u32,
+    webgl_depth: bool,
+    canvas: bool,
+) -> Result<Vec<u8>, String> {
+    f3d_build_toon_mesh_packet(
+        positions,
+        normals,
+        uvs,
+        indices,
+        model_world,
+        projection,
+        camera_view,
+        model_normal_matrix,
+        color,
+        light_direction,
+        light_color,
+        side,
+        width,
+        height,
+        webgl_depth,
+        canvas,
+    )
 }

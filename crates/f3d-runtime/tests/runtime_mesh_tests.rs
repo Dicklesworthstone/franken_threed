@@ -48,6 +48,10 @@ use f3d_runtime::mesh::{
     MeshPacketError, MESH_CANVAS_PIPELINE_ID, MESH_CANVAS_TARGET_ID,
     MESH_CLEAR_COLOR, MESH_DEPTH_TEXTURE_ID, MESH_PIPELINE_ID, MESH_READBACK_BUFFER_ID,
     MESH_TARGET_TEXTURE_ID, MESH_UNIFORM_BUFFER_ID, MESH_VERTEX_BUFFER_ID,
+    build_toon_mesh_submission,
+    f3d_build_toon_mesh_packet, generate_toon_mesh_wgsl,
+    gpu_bridge_build_toon_mesh_packet,
+    ToonMeshInput, MATERIAL_SIDE_DOUBLE,
 };
 
 const IDENTITY_F64: [f64; 16] = [
@@ -4383,4 +4387,326 @@ fn mesh_uniforms_packing_and_shaders_follow_schema() {
     // 4. Canvas packet
     let canvas_sub = build_mesh_canvas_submission(&input).expect("canvas submission");
     check_packet_shaders(&canvas_sub, "canvas");
+}
+
+// =========================================================================
+// Toon Mesh Tests (Three.js r186 MeshToonNodeMaterial + DirectionalLight)
+// =========================================================================
+
+#[test]
+fn test_toon_mesh_uniform_serialization_layout() {
+    let positions = [0.0f32, 0.5, 0.0, -0.5, -0.5, 0.0, 0.5, -0.5, 0.0];
+    let normals = [0.0f32, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0];
+    let uvs = [0.5f32, 1.0, 0.0, 0.0, 1.0, 0.0];
+    let model_world = [
+        1.0f64, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        10.0, 20.0, 30.0, 1.0,
+    ];
+    let projection = [
+        2.0f64, 0.0, 0.0, 0.0,
+        0.0, 2.0, 0.0, 0.0,
+        0.0, 0.0, -1.0, -1.0,
+        0.0, 0.0, -2.0, 0.0,
+    ];
+    let camera_view = [
+        1.0f64, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, -50.0, 1.0,
+    ];
+    let normal_matrix = [
+        1.0f64, 0.0, 0.0,
+        0.0, 1.0, 0.0,
+        0.0, 0.0, 1.0,
+    ];
+    let color = [0.2f32, 0.4, 0.8, 1.0];
+    let light_dir = [0.0f32, 1.0, 0.0, 0.0];
+    let light_col = [3.4f32, 3.4, 3.4, 1.0];
+
+    let input = ToonMeshInput::try_from_raw(
+        &positions,
+        &normals,
+        Some(&uvs),
+        &[],
+        &model_world,
+        &projection,
+        &camera_view,
+        &normal_matrix,
+        &color,
+        &light_dir,
+        &light_col,
+        MATERIAL_SIDE_DOUBLE,
+        100,
+        100,
+        false,
+    ).expect("ToonMeshInput::try_from_raw");
+
+    let sub = build_toon_mesh_submission(&input).expect("build_toon_mesh_submission");
+
+    // Find the WriteBuffer command for MESH_UNIFORM_BUFFER_ID
+    let mut uniform_write_data = None;
+    for cmd in sub.commands() {
+        if let GpuCommand::WriteBuffer { buffer_id, data, .. } = cmd {
+            if *buffer_id == MESH_UNIFORM_BUFFER_ID {
+                uniform_write_data = Some(data);
+                break;
+            }
+        }
+    }
+    let u_bytes = uniform_write_data.expect("must emit WriteBuffer for uniform buffer");
+    assert_eq!(u_bytes.len(), 512, "uniform allocation must be padded to 512 bytes for 256B alignment");
+
+    // Verify 8 field offsets and values in 304B record
+    // 1. model_world @ 0..64
+    let mw_x = f32::from_le_bytes(u_bytes[48..52].try_into().unwrap());
+    assert_eq!(mw_x, 10.0);
+    // 2. projection @ 64..128
+    let proj_0 = f32::from_le_bytes(u_bytes[64..68].try_into().unwrap());
+    assert_eq!(proj_0, 2.0);
+    // 3. camera_view @ 128..192
+    let cv_z = f32::from_le_bytes(u_bytes[184..188].try_into().unwrap());
+    assert_eq!(cv_z, -50.0);
+    // 4. model_normal_matrix @ 192..240 (3 col-vectors, each 12B + 4B pad)
+    let n00 = f32::from_le_bytes(u_bytes[192..196].try_into().unwrap());
+    assert_eq!(n00, 1.0);
+    let n0_pad = f32::from_le_bytes(u_bytes[204..208].try_into().unwrap());
+    assert_eq!(n0_pad, 0.0, "col 0 pad float must be 0.0");
+    let n11 = f32::from_le_bytes(u_bytes[212..216].try_into().unwrap());
+    assert_eq!(n11, 1.0);
+    let n1_pad = f32::from_le_bytes(u_bytes[220..224].try_into().unwrap());
+    assert_eq!(n1_pad, 0.0, "col 1 pad float must be 0.0");
+    let n22 = f32::from_le_bytes(u_bytes[232..236].try_into().unwrap());
+    assert_eq!(n22, 1.0);
+    let n2_pad = f32::from_le_bytes(u_bytes[236..240].try_into().unwrap());
+    assert_eq!(n2_pad, 0.0, "col 2 pad float must be 0.0");
+    // 5. color @ 240..256
+    let col_r = f32::from_le_bytes(u_bytes[240..244].try_into().unwrap());
+    assert_eq!(col_r, 0.2);
+    // 6. light_direction @ 256..272
+    let ld_y = f32::from_le_bytes(u_bytes[260..264].try_into().unwrap());
+    assert_eq!(ld_y, 1.0);
+    // 7. light_color @ 272..288
+    let lc_r = f32::from_le_bytes(u_bytes[272..276].try_into().unwrap());
+    assert_eq!(lc_r, 3.4);
+    // 8. params @ 288..304
+    let side_code = u32::from_le_bytes(u_bytes[288..292].try_into().unwrap());
+    assert_eq!(side_code, MATERIAL_SIDE_DOUBLE);
+    let param_y = u32::from_le_bytes(u_bytes[292..296].try_into().unwrap());
+    assert_eq!(param_y, 0);
+}
+
+#[test]
+fn test_generate_toon_mesh_wgsl_shader_semantics() {
+    let wgsl_offscreen = generate_toon_mesh_wgsl(false, false);
+    assert!(wgsl_offscreen.contains("struct ToonMeshUniforms {"));
+    assert!(wgsl_offscreen.contains("model_world: mat4x4<f32>"));
+    assert!(wgsl_offscreen.contains("camera_view: mat4x4<f32>"));
+    assert!(wgsl_offscreen.contains("model_normal_matrix: mat3x3<f32>"));
+    assert!(wgsl_offscreen.contains("let model_view = uniforms.camera_view * uniforms.model_world;"));
+    assert!(wgsl_offscreen.contains("let normal_world = uniforms.model_normal_matrix * in.normal;"));
+    assert!(wgsl_offscreen.contains("normalize((uniforms.camera_view * vec4<f32>(normal_world, 0.0)).xyz)"));
+    assert!(wgsl_offscreen.contains("var normal_view = normalize(in.v_normal_view);"));
+    assert!(wgsl_offscreen.contains("@builtin(front_facing) is_front: bool"));
+    assert!(wgsl_offscreen.contains("select(-normal_view, normal_view, is_front)"));
+    assert!(wgsl_offscreen.contains("let fw = fwidth(coord_x) * 0.5;"));
+    assert!(wgsl_offscreen.contains("smoothstep(0.7 - fw, 0.7 + fw, coord_x)"));
+    assert!(wgsl_offscreen.contains("mix(vec3<f32>(0.7), vec3<f32>(1.0), step_val)"));
+    assert!(wgsl_offscreen.contains("0.3183098861837907"));
+    assert!(!wgsl_offscreen.contains("srgb_transfer_oetf"));
+
+    let wgsl_canvas = generate_toon_mesh_wgsl(true, true);
+    assert!(wgsl_canvas.contains("clip.z = (clip.z + clip.w) * 0.5;"));
+    assert!(wgsl_canvas.contains("fn srgb_transfer_oetf"));
+    assert!(wgsl_canvas.contains("srgb_transfer_oetf(clamped_diffuse)"));
+}
+
+#[test]
+fn test_build_toon_mesh_submission_packet_structure() {
+    let positions = [0.0f32, 0.5, 0.0, -0.5, -0.5, 0.0, 0.5, -0.5, 0.0];
+    let normals = [0.0f32, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0];
+    let normal_matrix = [1.0f64, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+    let color = [1.0f32, 0.0, 0.0, 1.0];
+    let light_dir = [0.0f32, 1.0, 0.0, 0.0];
+    let light_col = [3.4f32, 3.4, 3.4, 1.0];
+
+    let input = ToonMeshInput::try_from_raw(
+        &positions,
+        &normals,
+        None,
+        &[],
+        &IDENTITY_F64,
+        &IDENTITY_F64,
+        &IDENTITY_F64,
+        &normal_matrix,
+        &color,
+        &light_dir,
+        &light_col,
+        MATERIAL_SIDE_DOUBLE,
+        64,
+        64,
+        false,
+    ).expect("try_from_raw");
+
+    let sub = build_toon_mesh_submission(&input).expect("build_toon_mesh_submission");
+
+    let mut found_vertex_buffer = false;
+    let mut found_depth_texture = false;
+    let mut found_pipeline = false;
+    let mut found_draw = false;
+    let mut found_copy = false;
+
+    for cmd in sub.commands() {
+        match cmd {
+            GpuCommand::CreateBuffer { buffer_id, size, usage } => {
+                if *buffer_id == MESH_VERTEX_BUFFER_ID {
+                    found_vertex_buffer = true;
+                    assert_eq!(*size, 3 * 32, "vertex buffer size must be 3 * 32 bytes");
+                    assert_eq!(*usage, BUFFER_USAGE_VERTEX | BUFFER_USAGE_COPY_DST);
+                }
+            }
+            GpuCommand::CreateTexture { texture_id, format, .. } => {
+                if *texture_id == MESH_DEPTH_TEXTURE_ID {
+                    found_depth_texture = true;
+                    assert_eq!(*format, TARGET_FORMAT_DEPTH24PLUS);
+                }
+            }
+            GpuCommand::CreatePipelineDepthCull {
+                uniform_size,
+                vertex_stride,
+                depth_compare,
+                depth_write_enabled,
+                cull_mode,
+                ..
+            } => {
+                found_pipeline = true;
+                assert_eq!(*uniform_size, 304, "uniform_size must be 304");
+                assert_eq!(*vertex_stride, 32, "vertex_stride must be 32 (pos, norm, uv)");
+                assert_eq!(*depth_compare, DEPTH_COMPARE_LESS_EQUAL, "depth_compare must be LessEqual (4)");
+                assert!(*depth_write_enabled, "depth_write must be enabled");
+                assert_eq!(*cull_mode, CULL_MODE_NONE, "DoubleSide must have CULL_MODE_NONE (0)");
+            }
+            GpuCommand::RenderPassDepth { vertex_count, .. } => {
+                found_draw = true;
+                assert_eq!(*vertex_count, 3);
+            }
+            GpuCommand::CopyTextureToBuffer { texture_id, buffer_id, .. } => {
+                if *texture_id == MESH_TARGET_TEXTURE_ID && *buffer_id == MESH_READBACK_BUFFER_ID {
+                    found_copy = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    assert!(found_vertex_buffer, "must create vertex buffer");
+    assert!(found_depth_texture, "must create depth texture");
+    assert!(found_pipeline, "must create toon pipeline");
+    assert!(found_draw, "must record draw command");
+    assert!(found_copy, "must copy offscreen texture to readback buffer");
+}
+
+#[test]
+fn test_build_toon_mesh_packet_wire_encoding_parity() {
+    let positions = [0.0f32, 0.5, 0.0, -0.5, -0.5, 0.0, 0.5, -0.5, 0.0];
+    let normals = [0.0f32, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0];
+    let normal_matrix = [1.0f64, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+    let color = [0.5f32, 0.5, 0.5, 1.0];
+    let light_dir = [0.0f32, 1.0, 0.0, 0.0];
+    let light_col = [3.4f32, 3.4, 3.4, 1.0];
+
+    let bytes_f3d = f3d_build_toon_mesh_packet(
+        &positions,
+        &normals,
+        &[],
+        &[],
+        &IDENTITY_F64,
+        &IDENTITY_F64,
+        &IDENTITY_F64,
+        &normal_matrix,
+        &color,
+        &light_dir,
+        &light_col,
+        MATERIAL_SIDE_DOUBLE,
+        32,
+        32,
+        false,
+        false,
+    ).expect("f3d_build_toon_mesh_packet");
+
+    let bytes_bridge = gpu_bridge_build_toon_mesh_packet(
+        &positions,
+        &normals,
+        &[],
+        &[],
+        &IDENTITY_F64,
+        &IDENTITY_F64,
+        &IDENTITY_F64,
+        &normal_matrix,
+        &color,
+        &light_dir,
+        &light_col,
+        MATERIAL_SIDE_DOUBLE,
+        32,
+        32,
+        false,
+        false,
+    ).expect("gpu_bridge_build_toon_mesh_packet");
+
+    assert_eq!(bytes_f3d, bytes_bridge, "f3d and gpu_bridge exports must have exact byte parity");
+    assert!(!bytes_f3d.is_empty(), "wire packet must not be empty");
+}
+
+#[test]
+fn test_toon_mesh_validation_discipline() {
+    let positions = [0.0f32, 0.5, 0.0, -0.5, -0.5, 0.0, 0.5, -0.5, 0.0];
+    let normals = [0.0f32, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0];
+    let normal_matrix = [1.0f64, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+    let color = [1.0f32, 1.0, 1.0, 1.0];
+    let light_dir = [0.0f32, 1.0, 0.0, 0.0];
+    let light_col = [1.0f32, 1.0, 1.0, 1.0];
+
+    // 1. Zero dimensions
+    let err = ToonMeshInput::try_from_raw(
+        &positions, &normals, None, &[],
+        &IDENTITY_F64, &IDENTITY_F64, &IDENTITY_F64, &normal_matrix,
+        &color, &light_dir, &light_col, 0, 0, 100, false,
+    ).unwrap_err();
+    assert!(matches!(err, MeshPacketError::ZeroDimensions { .. }));
+
+    // 2. Invalid position length
+    let bad_pos = [0.0f32, 1.0];
+    let err = ToonMeshInput::try_from_raw(
+        &bad_pos, &normals, None, &[],
+        &IDENTITY_F64, &IDENTITY_F64, &IDENTITY_F64, &normal_matrix,
+        &color, &light_dir, &light_col, 0, 100, 100, false,
+    ).unwrap_err();
+    assert!(matches!(err, MeshPacketError::InvalidPositionLength { .. }));
+
+    // 3. Normal length mismatch
+    let bad_norm = [0.0f32, 0.0, 1.0];
+    let err = ToonMeshInput::try_from_raw(
+        &positions, &bad_norm, None, &[],
+        &IDENTITY_F64, &IDENTITY_F64, &IDENTITY_F64, &normal_matrix,
+        &color, &light_dir, &light_col, 0, 100, 100, false,
+    ).unwrap_err();
+    assert!(matches!(err, MeshPacketError::InvalidNormalLength { expected: 9, actual: 3 }));
+
+    // 4. Invalid side
+    let err = ToonMeshInput::try_from_raw(
+        &positions, &normals, None, &[],
+        &IDENTITY_F64, &IDENTITY_F64, &IDENTITY_F64, &normal_matrix,
+        &color, &light_dir, &light_col, 5, 100, 100, false,
+    ).unwrap_err();
+    assert!(matches!(err, MeshPacketError::InvalidSide { value: 5 }));
+
+    // 5. Index out of bounds
+    let bad_indices = [0u32, 1, 99];
+    let err = ToonMeshInput::try_from_raw(
+        &positions, &normals, None, &bad_indices,
+        &IDENTITY_F64, &IDENTITY_F64, &IDENTITY_F64, &normal_matrix,
+        &color, &light_dir, &light_col, 0, 100, 100, false,
+    ).unwrap_err();
+    assert!(matches!(err, MeshPacketError::IndexOutOfBounds { index: 99, vertex_count: 3 }));
 }
