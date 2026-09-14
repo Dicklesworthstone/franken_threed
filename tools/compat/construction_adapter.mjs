@@ -9,7 +9,7 @@
  * preserves native object shapes via external diagnostics, and guarantees single execution.
  */
 
-import { ExecutionRoute, RouteLockError } from './route_types.mjs';
+import { ExecutionRoute, EscapeReason, RouteLockError } from './route_types.mjs';
 import { ConnectedCompatibilityGroups } from './connected_groups.mjs';
 import { decideRendererRoute } from './route_decider.mjs';
 
@@ -213,9 +213,14 @@ export class RendererConstructionRouter {
     let resolved = this.connectedGroups.previewRoute(initialDecision, parsedResources);
     let groupId = resolved.groupId || rendererId;
 
-    // 3.5 Preflight check canvas lock: reject re-route attempts immediately before implementation lookup
+    // 3.5 Preflight check canvas lock: reject known-incompatible re-route attempts immediately before implementation lookup.
+    // Defer check only when resolved is tentative SPECIALIZED_WEBGPU and existing lock is RETAINED_UPSTREAM,
+    // since specialization may fall back to retained once implementations are inspected.
+    // Known-incompatible mismatches are rejected immediately before any effectful getters are read.
     const existingLock = this.getCanvasLock(canvasKey);
-    if (existingLock && existingLock.route !== resolved.route) {
+    const isPotentiallyCompatible = resolved.route === ExecutionRoute.SPECIALIZED_WEBGPU &&
+      existingLock?.route === ExecutionRoute.RETAINED_UPSTREAM;
+    if (existingLock && existingLock.route !== resolved.route && !isPotentiallyCompatible) {
       const rejectedEvent = Object.freeze({
         site: constructorName,
         span: sourceSpan,
@@ -262,8 +267,6 @@ export class RendererConstructionRouter {
           ctor = constructorFn;
         } else if (route === ExecutionRoute.GENERAL_WEBGPU && constructorName === 'WebGPURenderer') {
           ctor = constructorFn;
-        } else if (route === ExecutionRoute.SPECIALIZED_WEBGPU && constructorName === 'WebGPURenderer') {
-          ctor = constructorFn;
         }
       }
 
@@ -283,18 +286,43 @@ export class RendererConstructionRouter {
       return ctor;
     };
 
+    let currentDecision = initialDecision;
     let targetConstructor = selectConstructorForRoute(resolved.route);
+
+    // If SPECIALIZED_WEBGPU has no registered specialized implementation, fall back truthfully
+    // to RETAINED_UPSTREAM before any effects (canvas lock reservation, connected group mutation, constructor invocation).
+    if (resolved.route === ExecutionRoute.SPECIALIZED_WEBGPU && !targetConstructor) {
+      const fallbackConstructor = selectConstructorForRoute(ExecutionRoute.RETAINED_UPSTREAM);
+      if (fallbackConstructor) {
+        const filteredReasons = resolved.reasons.filter((r) => r !== 'specialized-island-admitted');
+        const fallbackReasons = filteredReasons.includes(EscapeReason.SPECIALIZATION_UNAVAILABLE)
+          ? Object.freeze([...filteredReasons])
+          : Object.freeze([...filteredReasons, EscapeReason.SPECIALIZATION_UNAVAILABLE]);
+        currentDecision = Object.freeze({
+          ...initialDecision,
+          route: ExecutionRoute.RETAINED_UPSTREAM,
+          reasons: fallbackReasons,
+        });
+        resolved = this.connectedGroups.previewRoute(currentDecision, parsedResources);
+        groupId = resolved.groupId || rendererId;
+        if (resolved.route === ExecutionRoute.EXACT_BACKEND) {
+          targetConstructor = selectConstructorForRoute(resolved.route);
+        } else {
+          targetConstructor = fallbackConstructor;
+        }
+      }
+    }
 
     // 4.5 Revalidate current shared-group route after implementation selection (without rereading user getters).
     // Group escalation is monotonic to EXACT_BACKEND under supported construction flow,
     // so bound selection to initial then exact; no generic retries/transaction framework.
     if (resolved.route !== ExecutionRoute.EXACT_BACKEND) {
-      const revalidated = this.connectedGroups.previewRoute(initialDecision, parsedResources);
+      const revalidated = this.connectedGroups.previewRoute(currentDecision, parsedResources);
       if (revalidated.route === ExecutionRoute.EXACT_BACKEND) {
         resolved = revalidated;
         groupId = resolved.groupId || rendererId;
         targetConstructor = selectConstructorForRoute(resolved.route);
-        const revalidatedAfterEscalation = this.connectedGroups.previewRoute(initialDecision, parsedResources);
+        const revalidatedAfterEscalation = this.connectedGroups.previewRoute(currentDecision, parsedResources);
         if (revalidatedAfterEscalation.route !== resolved.route) {
           throw new Error(
             `Cannot route construction site '${constructorName}' (${sourceSpan}): ` +
@@ -342,7 +370,7 @@ export class RendererConstructionRouter {
     }
 
     // Revalidate route and canvas lock immediately before committing
-    const finalRevalidation = this.connectedGroups.previewRoute(initialDecision, parsedResources);
+    const finalRevalidation = this.connectedGroups.previewRoute(currentDecision, parsedResources);
     if (finalRevalidation.route !== resolved.route) {
       throw new Error(
         `Cannot route construction site '${constructorName}' (${sourceSpan}): ` +
