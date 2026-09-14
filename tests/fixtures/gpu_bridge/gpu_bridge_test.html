@@ -45,7 +45,7 @@
     import { testDeviceReplacement } from "./device_lifetime_test.js";
     import { testViewportScissor } from "./viewport_scissor_test.js";
     import { testDrawParameters } from "./draw_parameters_test.js";
-    import { testMeshScene, testVisibleCanvasMeshScene, testMeshDepthScene, testMultiMeshBatchScene } from "./mesh_scene_test.js";
+    import { testMeshScene, testVisibleCanvasMeshScene, testMeshDepthScene, testMultiMeshBatchScene, testToonMeshScene } from "./mesh_scene_test.js";
     import { testDepthScene } from "./depth_test.js";
     import { testBufferCopy } from "./buffer_copy_test.js";
     import { testWorkloadBStorageCopy, testWorkloadBVariants, testWorkloadBMeasurementMode } from "./workload_b_test.js";
@@ -1788,7 +1788,7 @@
         }
 
         const urlParams = new URLSearchParams(window.location.search);
-        const requestedLane = urlParams.get("lane") || (urlParams.has("canvas") ? "canvas" : (urlParams.has("depth") ? "depth" : (urlParams.has("mesh_depth") ? "mesh_depth" : "offscreen")));
+        const requestedLane = urlParams.get("lane") || (urlParams.has("canvas") ? "canvas" : (urlParams.has("depth") ? "depth" : (urlParams.has("mesh_depth") ? "mesh_depth" : (urlParams.has("toon") ? "toon" : "offscreen"))));
 
         if (requestedLane === "canvas" || requestedLane === "all") {
           const hasCanvasExport =
@@ -1836,6 +1836,18 @@
             );
           }
           logPass("multi_mesh_batch_scene", await testMultiMeshBatchScene(bridge, wasmExports, canvasContext, canvas));
+        }
+
+        if (requestedLane === "toon" || requestedLane === "all") {
+          const hasToonExport =
+            typeof wasmExports.f3d_build_toon_mesh_packet === "function" ||
+            typeof wasmExports.gpu_bridge_build_toon_mesh_packet === "function";
+          if (!hasToonExport) {
+            throw new Error(
+              "Toon lane requested, but Wasm module is missing required export f3d_build_toon_mesh_packet / gpu_bridge_build_toon_mesh_packet"
+            );
+          }
+          logPass("toon_mesh_scene", await testToonMeshScene(bridge, wasmExports, canvasContext, canvas));
         }
 
         // 7. Retained renderer exclusion

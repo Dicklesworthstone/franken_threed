@@ -732,10 +732,16 @@ export class WebGpuBridgeHost {
               ? [
                   {
                     arrayStride: vertexStride,
-                    attributes: [
-                      { shaderLocation: 0, offset: 0, format: "float32x3" },
-                      { shaderLocation: 1, offset: 12, format: vertexStride === 28 ? "float32x4" : "float32x2" },
-                    ],
+                    attributes: vertexStride === 32
+                      ? [
+                          { shaderLocation: 0, offset: 0, format: "float32x3" },
+                          { shaderLocation: 1, offset: 12, format: "float32x3" },
+                          { shaderLocation: 2, offset: 24, format: "float32x2" },
+                        ]
+                      : [
+                          { shaderLocation: 0, offset: 0, format: "float32x3" },
+                          { shaderLocation: 1, offset: 12, format: vertexStride === 28 ? "float32x4" : "float32x2" },
+                        ],
                   },
                 ]
               : [];
@@ -868,10 +874,16 @@ export class WebGpuBridgeHost {
               ? [
                   {
                     arrayStride: vertexStride,
-                    attributes: [
-                      { shaderLocation: 0, offset: 0, format: "float32x3" },
-                      { shaderLocation: 1, offset: 12, format: vertexStride === 28 ? "float32x4" : "float32x2" },
-                    ],
+                    attributes: vertexStride === 32
+                      ? [
+                          { shaderLocation: 0, offset: 0, format: "float32x3" },
+                          { shaderLocation: 1, offset: 12, format: "float32x3" },
+                          { shaderLocation: 2, offset: 24, format: "float32x2" },
+                        ]
+                      : [
+                          { shaderLocation: 0, offset: 0, format: "float32x3" },
+                          { shaderLocation: 1, offset: 12, format: vertexStride === 28 ? "float32x4" : "float32x2" },
+                        ],
                   },
                 ]
               : [];
@@ -1022,10 +1034,16 @@ export class WebGpuBridgeHost {
               ? [
                   {
                     arrayStride: vertexStride,
-                    attributes: [
-                      { shaderLocation: 0, offset: 0, format: "float32x3" },
-                      { shaderLocation: 1, offset: 12, format: vertexStride === 28 ? "float32x4" : "float32x2" },
-                    ],
+                    attributes: vertexStride === 32
+                      ? [
+                          { shaderLocation: 0, offset: 0, format: "float32x3" },
+                          { shaderLocation: 1, offset: 12, format: "float32x3" },
+                          { shaderLocation: 2, offset: 24, format: "float32x2" },
+                        ]
+                      : [
+                          { shaderLocation: 0, offset: 0, format: "float32x3" },
+                          { shaderLocation: 1, offset: 12, format: vertexStride === 28 ? "float32x4" : "float32x2" },
+                        ],
                   },
                 ]
               : [];

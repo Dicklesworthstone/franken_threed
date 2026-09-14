@@ -1562,6 +1562,387 @@ export async function testMeshDepthScene(bridgeHost, wasmExports, canvasContext 
 }
 
 /**
+ * Suite 3b: Dynamic Three.js MeshToonMaterial with DirectionalLight verification suite.
+ *
+ * Verification Requirements:
+ * 1. One real Three.js r186 Mesh with MeshToonMaterial (no gradientMap) and one DirectionalLight,
+ *    rendered by the existing upstream reference path (renderRetainedWebGLReference).
+ * 2. Derive candidate inputs from the SAME objects with citations:
+ *    - mesh.matrixWorld (upstream/three.js/src/core/Object3D.js:1176)
+ *    - camera.projectionMatrix (upstream/three.js/src/cameras/PerspectiveCamera.js:337)
+ *    - camera.matrixWorldInverse (upstream/three.js/src/cameras/Camera.js:122)
+ *    - source normal matrix Matrix3 (upstream/three.js/src/nodes/accessors/ModelNode.js:112 and upstream/three.js/src/math/Matrix3.js:352)
+ *    - material.color (upstream/three.js/src/materials/MeshToonMaterial.js:34)
+ *    - view-space light direction (upstream/three.js/src/renderers/webgl/WebGLLights.js:579-582 and upstream/three.js/src/nodes/accessors/Lights.js:139)
+ *    - light.color * intensity (upstream/three.js/src/renderers/webgl/WebGLLights.js:578)
+ *    - material.side (upstream/three.js/src/constants.js:1-3)
+ * 3. Checks (EXPECTED VALUES ONLY, tolerance 2):
+ *    - Frame 1: Candidate probe pixels match upstream reference within tolerance 2.
+ *    - Frame 2: Change light direction; Frame 2 candidate matches upstream frame 2 AND differs from frame 1.
+ *    - Checkpoint 3: DoubleSide orientation handling matches upstream reference.
+ *    - Checkpoint 4 (canvas): Candidate visible swapchain matches retained WebGLRenderer sRGB reference.
+ *
+ * @param {WebGpuBridgeHost} bridgeHost
+ * @param {Record<string, Function>} wasmExports
+ * @param {GPUCanvasContext} [canvasContext]
+ * @param {HTMLCanvasElement} [canvas]
+ * @returns {Promise<string>}
+ */
+export async function testToonMeshScene(bridgeHost, wasmExports, canvasContext = null, canvas = null) {
+  const buildToonMeshFn =
+    wasmExports?.f3d_build_toon_mesh_packet ||
+    wasmExports?.gpu_bridge_build_toon_mesh_packet;
+
+  if (typeof buildToonMeshFn !== "function") {
+    throw new Error(
+      "Missing required Wasm toon export: f3d_build_toon_mesh_packet / gpu_bridge_build_toon_mesh_packet"
+    );
+  }
+
+  const THREE = await loadProductionThree();
+  const adapter = await loadProductionAdapter();
+
+  const width = 64;
+  const height = 64;
+  const bytesPerRow = Math.ceil((width * 4) / 256) * 256;
+  const centerIdx = 32 * bytesPerRow + 32 * 4;
+
+  // Real Three.js r186 geometry: triangle covering center (32, 32) in z = -2.0 plane
+  const geometry = new THREE.BufferGeometry();
+  const positions = new Float32Array([
+    -1.0, -1.0, -2.0,
+     1.0, -1.0, -2.0,
+     0.0,  1.0, -2.0,
+  ]);
+  geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  geometry.computeVertexNormals();
+
+  const uvs = new Float32Array([0.0, 0.0, 1.0, 0.0, 0.5, 1.0]);
+  geometry.setAttribute("uv", new THREE.BufferAttribute(uvs, 2));
+
+  const indices = new Uint32Array([0, 1, 2]);
+  geometry.setIndex(new THREE.BufferAttribute(indices, 1));
+
+  // Real Three.js r186 MeshToonMaterial (no gradientMap)
+  const material = new THREE.MeshToonMaterial({
+    color: 0x2288cc,
+    side: THREE.FrontSide,
+  });
+
+  const mesh = new THREE.Mesh(geometry, material);
+  mesh.position.set(0, 0, 0);
+
+  // Real Three.js r186 DirectionalLight
+  const light = new THREE.DirectionalLight(0xffffff, 1.0);
+  light.position.set(0, 0, 1);
+  light.target.position.set(0, 0, 0);
+
+  // Real Three.js r186 PerspectiveCamera
+  const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 100);
+  camera.position.set(0, 0, 0);
+  camera.lookAt(0, 0, -1);
+
+  // Ensure initial world matrices and projections are clean
+  mesh.updateMatrixWorld(true);
+  light.updateMatrixWorld(true);
+  light.target.updateMatrixWorld(true);
+  camera.updateMatrixWorld(true);
+  camera.updateProjectionMatrix();
+
+  // Helper to build candidate packet from the SAME Three.js objects with exact citations
+  function buildCandidatePacket(targetMesh, targetLight, targetCamera, overrides = {}) {
+    const pos = targetMesh.geometry.attributes.position.array;
+    const norm = targetMesh.geometry.attributes.normal.array;
+    const uv = targetMesh.geometry.attributes.uv ? targetMesh.geometry.attributes.uv.array : new Float32Array(0);
+    const ind = targetMesh.geometry.index ? new Uint32Array(targetMesh.geometry.index.array) : new Uint32Array(0);
+
+    // 1. mesh.matrixWorld (upstream/three.js/src/core/Object3D.js:1176)
+    const modelWorld = new Float64Array(targetMesh.matrixWorld.elements);
+
+    // 2. camera.projectionMatrix (upstream/three.js/src/cameras/PerspectiveCamera.js:337)
+    const projection = new Float64Array(targetCamera.projectionMatrix.elements);
+
+    // 3. camera.matrixWorldInverse (upstream/three.js/src/cameras/Camera.js:122)
+    const cameraView = new Float64Array(targetCamera.matrixWorldInverse.elements);
+
+    // 4. source normal matrix Matrix3 (upstream/three.js/src/nodes/accessors/ModelNode.js:112 and upstream/three.js/src/math/Matrix3.js:352)
+    const normalMatrix3 = new THREE.Matrix3().getNormalMatrix(targetMesh.matrixWorld);
+    const modelNormalMatrix = new Float64Array(normalMatrix3.elements);
+
+    // 5. material.color (upstream/three.js/src/materials/MeshToonMaterial.js:34)
+    const color = new Float32Array([
+      targetMesh.material.color.r,
+      targetMesh.material.color.g,
+      targetMesh.material.color.b,
+      targetMesh.material.opacity ?? 1.0,
+    ]);
+
+    // 6. view-space light direction (upstream/three.js/src/renderers/webgl/WebGLLights.js:579-582 and upstream/three.js/src/nodes/accessors/Lights.js:139)
+    const lightWorldPos = new THREE.Vector3().setFromMatrixPosition(targetLight.matrixWorld);
+    const targetWorldPos = new THREE.Vector3().setFromMatrixPosition(targetLight.target.matrixWorld);
+    const lightDirView = lightWorldPos.sub(targetWorldPos).transformDirection(targetCamera.matrixWorldInverse).normalize();
+    const lightDirection = new Float32Array([lightDirView.x, lightDirView.y, lightDirView.z, 0.0]);
+
+    // 7. light.color * intensity (upstream/three.js/src/renderers/webgl/WebGLLights.js:578)
+    const lightColor = new Float32Array([
+      targetLight.color.r * targetLight.intensity,
+      targetLight.color.g * targetLight.intensity,
+      targetLight.color.b * targetLight.intensity,
+      1.0,
+    ]);
+
+    // 8. material.side (upstream/three.js/src/constants.js:1-3)
+    const side = targetMesh.material.side ?? THREE.FrontSide;
+
+    const webglDepth = overrides.webglDepth !== undefined ? overrides.webglDepth : true;
+    const canvasMode = overrides.canvas !== undefined ? overrides.canvas : false;
+
+    return buildToonMeshFn(
+      pos,
+      norm,
+      uv,
+      ind,
+      modelWorld,
+      projection,
+      cameraView,
+      modelNormalMatrix,
+      color,
+      lightDirection,
+      lightColor,
+      side,
+      width,
+      height,
+      webglDepth,
+      canvasMode
+    );
+  }
+
+  // Helper to execute upstream reference via existing renderRetainedWebGLReference
+  function renderUpstreamReference(targetMesh, targetLight, targetCamera) {
+    const prevOnBefore = targetMesh.onBeforeRender;
+    targetMesh.onBeforeRender = (renderer, scene, cam, geom, mat, grp) => {
+      renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
+      if (typeof prevOnBefore === "function") {
+        prevOnBefore.call(targetMesh, renderer, scene, cam, geom, mat, grp);
+      }
+    };
+    try {
+      return renderRetainedWebGLReference(
+        THREE,
+        [targetMesh, targetLight, targetLight.target],
+        targetCamera,
+        width,
+        height
+      );
+    } finally {
+      targetMesh.onBeforeRender = prevOnBefore;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Checkpoint 1: Frame 1 - Baseline Parity with Upstream WebGLRenderer Reference
+  // ---------------------------------------------------------------------------
+  mesh.updateMatrixWorld(true);
+  light.updateMatrixWorld(true);
+  light.target.updateMatrixWorld(true);
+  camera.updateMatrixWorld(true);
+  camera.updateProjectionMatrix();
+
+  const ref1 = renderUpstreamReference(mesh, light, camera);
+
+  const packet1 = buildCandidatePacket(mesh, light, camera);
+  await bridgeHost.executePacket(packet1);
+  const candidatePixels1 = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+  const candProbe1 = [
+    candidatePixels1[centerIdx],
+    candidatePixels1[centerIdx + 1],
+    candidatePixels1[centerIdx + 2],
+    candidatePixels1[centerIdx + 3],
+  ];
+
+  const diffR1 = Math.abs(candProbe1[0] - ref1[0]);
+  const diffG1 = Math.abs(candProbe1[1] - ref1[1]);
+  const diffB1 = Math.abs(candProbe1[2] - ref1[2]);
+  const diffA1 = Math.abs(candProbe1[3] - ref1[3]);
+
+  if (diffR1 > 2 || diffG1 > 2 || diffB1 > 2 || diffA1 > 2) {
+    throw new Error(
+      `Checkpoint 1 failed: Candidate toon probe [${candProbe1}] differs from upstream reference [${ref1}] by > tolerance 2 ` +
+      `(diffs: R=${diffR1}, G=${diffG1}, B=${diffB1}, A=${diffA1})`
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Checkpoint 2: Frame 2 - Mutate Light Direction
+  // ---------------------------------------------------------------------------
+  light.position.set(0, 0, -5);
+  light.updateMatrixWorld(true);
+  light.target.updateMatrixWorld(true);
+
+  const ref2 = renderUpstreamReference(mesh, light, camera);
+
+  const packet2 = buildCandidatePacket(mesh, light, camera);
+  await bridgeHost.executePacket(packet2);
+  const candidatePixels2 = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+  const candProbe2 = [
+    candidatePixels2[centerIdx],
+    candidatePixels2[centerIdx + 1],
+    candidatePixels2[centerIdx + 2],
+    candidatePixels2[centerIdx + 3],
+  ];
+
+  const diffR2 = Math.abs(candProbe2[0] - ref2[0]);
+  const diffG2 = Math.abs(candProbe2[1] - ref2[1]);
+  const diffB2 = Math.abs(candProbe2[2] - ref2[2]);
+  const diffA2 = Math.abs(candProbe2[3] - ref2[3]);
+
+  if (diffR2 > 2 || diffG2 > 2 || diffB2 > 2 || diffA2 > 2) {
+    throw new Error(
+      `Checkpoint 2 failed: Frame 2 candidate toon probe [${candProbe2}] differs from upstream reference [${ref2}] by > tolerance 2 ` +
+      `(diffs: R=${diffR2}, G=${diffG2}, B=${diffB2}, A=${diffA2})`
+    );
+  }
+
+  const frameDiff = Math.max(
+    Math.abs(candProbe2[0] - candProbe1[0]),
+    Math.abs(candProbe2[1] - candProbe1[1]),
+    Math.abs(candProbe2[2] - candProbe1[2])
+  );
+  if (frameDiff <= 2) {
+    throw new Error(
+      `Checkpoint 2 failed: Frame 2 candidate [${candProbe2}] did not differ from Frame 1 [${candProbe1}] after light direction change (maxDiff=${frameDiff})`
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Checkpoint 3: Frame 3 - Material Side Handling (DoubleSide)
+  // ---------------------------------------------------------------------------
+  mesh.material.side = THREE.DoubleSide;
+  mesh.material.needsUpdate = true;
+
+  const ref3Double = renderUpstreamReference(mesh, light, camera);
+
+  const packet3Double = buildCandidatePacket(mesh, light, camera);
+  await bridgeHost.executePacket(packet3Double);
+  const candidatePixels3Double = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+  const candProbe3Double = [
+    candidatePixels3Double[centerIdx],
+    candidatePixels3Double[centerIdx + 1],
+    candidatePixels3Double[centerIdx + 2],
+    candidatePixels3Double[centerIdx + 3],
+  ];
+
+  const diffR3D = Math.abs(candProbe3Double[0] - ref3Double[0]);
+  const diffG3D = Math.abs(candProbe3Double[1] - ref3Double[1]);
+  const diffB3D = Math.abs(candProbe3Double[2] - ref3Double[2]);
+  const diffA3D = Math.abs(candProbe3Double[3] - ref3Double[3]);
+
+  if (diffR3D > 2 || diffG3D > 2 || diffB3D > 2 || diffA3D > 2) {
+    throw new Error(
+      `Checkpoint 3 failed: DoubleSide candidate toon probe [${candProbe3Double}] differs from upstream reference [${ref3Double}] by > tolerance 2 ` +
+      `(diffs: R=${diffR3D}, G=${diffG3D}, B=${diffB3D}, A=${diffA3D})`
+    );
+  }
+
+  // Restore material side
+  mesh.material.side = THREE.FrontSide;
+  mesh.material.needsUpdate = true;
+
+  // ---------------------------------------------------------------------------
+  // Checkpoint 4: Visible Canvas sRGB Presentation (when canvasContext is provided)
+  // ---------------------------------------------------------------------------
+  let canvasFormat = null;
+  if (canvasContext) {
+    canvasFormat = navigator.gpu.getPreferredCanvasFormat();
+    canvasContext.configure({
+      device: bridgeHost.device,
+      format: canvasFormat,
+      alphaMode: "opaque",
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+    });
+    await nextFrame();
+
+    // Use the frame-1 scene (FrontSide, original light)
+    mesh.material.side = THREE.FrontSide;
+    mesh.material.needsUpdate = true;
+    light.position.set(0, 0, 1);
+    light.target.position.set(0, 0, 0);
+    mesh.updateMatrixWorld(true);
+    light.updateMatrixWorld(true);
+    light.target.updateMatrixWorld(true);
+    camera.updateMatrixWorld(true);
+    camera.updateProjectionMatrix();
+
+    // Build candidate with explicit canvas argument set to true
+    const packet4Canvas = buildCandidatePacket(mesh, light, camera, { canvas: true });
+
+    // Read pixels the same way testVisibleCanvasMeshScene does
+    const canvasReadback = bridgeHost.device.createBuffer({
+      size: bytesPerRow * height,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+
+    let canvasPixels;
+    try {
+      const currentTexture = canvasContext.getCurrentTexture();
+      const execPromise = bridgeHost.executePacket(packet4Canvas, canvasContext);
+
+      const copyEncoder = bridgeHost.device.createCommandEncoder();
+      copyEncoder.copyTextureToBuffer(
+        { texture: currentTexture },
+        { buffer: canvasReadback, bytesPerRow },
+        [width, height, 1]
+      );
+      bridgeHost.device.queue.submit([copyEncoder.finish()]);
+
+      await execPromise;
+      await canvasReadback.mapAsync(GPUMapMode.READ);
+      canvasPixels = new Uint8Array(canvasReadback.getMappedRange().slice(0));
+      canvasReadback.unmap();
+    } finally {
+      canvasReadback.destroy();
+    }
+
+    // Apply bgra/rgba channel mapping from getPreferredCanvasFormat
+    const rCh = canvasFormat.startsWith("bgra") ? 2 : 0;
+    const gCh = 1;
+    const bCh = canvasFormat.startsWith("bgra") ? 0 : 2;
+
+    const candCanvasR = canvasPixels[centerIdx + rCh];
+    const candCanvasG = canvasPixels[centerIdx + gCh];
+    const candCanvasB = canvasPixels[centerIdx + bCh];
+    const candCanvasA = canvasPixels[centerIdx + 3];
+
+    // Compare center probe with renderRetainedWebGLReference using SRGBColorSpace (default, NOT Linear override)
+    const refCanvasSRGB = renderRetainedWebGLReference(
+      THREE,
+      [mesh, light, light.target],
+      camera,
+      width,
+      height
+    );
+
+    const diffCanvasR = Math.abs(candCanvasR - refCanvasSRGB[0]);
+    const diffCanvasG = Math.abs(candCanvasG - refCanvasSRGB[1]);
+    const diffCanvasB = Math.abs(candCanvasB - refCanvasSRGB[2]);
+    const diffCanvasA = Math.abs(candCanvasA - refCanvasSRGB[3]);
+
+    if (diffCanvasR > 2 || diffCanvasG > 2 || diffCanvasB > 2 || diffCanvasA > 2) {
+      throw new Error(
+        `Checkpoint 4 failed: Candidate canvas toon probe [${candCanvasR}, ${candCanvasG}, ${candCanvasB}, ${candCanvasA}] ` +
+        `differs from retained WebGLRenderer reference oracle (${canvasFormat}, sRGB) [${refCanvasSRGB}] by > tolerance 2 ` +
+        `(diffs: R=${diffCanvasR}, G=${diffCanvasG}, B=${diffCanvasB}, A=${diffCanvasA})`
+      );
+    }
+  }
+
+  const baseResult = "Real THREE.Mesh with MeshToonMaterial and DirectionalLight verified against upstream WebGLRenderer reference oracle (tolerance 2): Frame 1 candidate matches upstream reference on identical inputs; Frame 2 light direction change matches upstream frame 2 and strictly differs from frame 1; DoubleSide orientation handling verified against upstream reference; offscreen rgba8unorm only; canvas path not exercised";
+  return canvasContext
+    ? `${baseResult}; canvas sRGB checkpoint verified (${canvasFormat})`
+    : baseResult;
+}
+
+/**
  * Suite 4: Variable-length multi-mesh production batch scene verification suite.
  *
  * Verification Requirements:
