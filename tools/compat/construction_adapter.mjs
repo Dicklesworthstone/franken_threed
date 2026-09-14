@@ -36,18 +36,22 @@ let resourceObjectCounter = 0;
 
 /**
  * Resolve a unique string identifier for a shared resource without mutating its shape.
- * Preserves identity for raw objects and handles resource wrappers ({ resource, target }).
+ * Class instances use object identity; their names and numeric IDs are not globally unique.
+ * Plain descriptors may supply symbolic IDs or resource wrappers ({ resource, target }).
  * @param {any} res
  * @returns {string}
  */
 export function resolveResourceId(res) {
   if (typeof res === 'string') return res;
   if (!res || (typeof res !== 'object' && typeof res !== 'function')) return String(res);
-  if (res.id !== undefined && res.id !== null) return String(res.id);
-  if (res.resourceId !== undefined && res.resourceId !== null) return String(res.resourceId);
-  if (typeof res.name === 'string' && res.name.length > 0) return res.name;
-  if (res.resource && typeof res.resource === 'object') return resolveResourceId(res.resource);
-  if (res.target && typeof res.target === 'object') return resolveResourceId(res.target);
+  const prototype = Object.getPrototypeOf(res);
+  if (prototype === Object.prototype || prototype === null) {
+    if (res.id !== undefined && res.id !== null) return String(res.id);
+    if (res.resourceId !== undefined && res.resourceId !== null) return String(res.resourceId);
+    if (typeof res.name === 'string' && res.name.length > 0) return res.name;
+    if (res.resource && typeof res.resource === 'object') return resolveResourceId(res.resource);
+    if (res.target && typeof res.target === 'object') return resolveResourceId(res.target);
+  }
   let id = RESOURCE_OBJECT_IDS.get(res);
   if (!id) {
     id = `resource-obj-${++resourceObjectCounter}`;

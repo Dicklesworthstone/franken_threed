@@ -31,6 +31,10 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { Texture } from '../../upstream/three.js/src/textures/Texture.js';
+import { BufferGeometry } from '../../upstream/three.js/src/core/BufferGeometry.js';
+import { Material } from '../../upstream/three.js/src/materials/Material.js';
+import { RenderTarget } from '../../upstream/three.js/src/core/RenderTarget.js';
 
 import {
   RendererConstructionRouter,
@@ -40,6 +44,29 @@ import {
 } from './construction_adapter.mjs';
 import { ConnectedCompatibilityGroups } from './connected_groups.mjs';
 import { ExecutionRoute, EscapeReason, RouteLockError } from './route_types.mjs';
+
+test('Resource identity separates actual Three classes and ignores mutable instance labels', () => {
+  const texture = new Texture();
+  const geometry = new BufferGeometry();
+  const material = new Material();
+  // r186 allocates these IDs independently, starting at zero for each class family.
+  assert.equal(texture.id, geometry.id);
+  assert.equal(texture.id, material.id);
+  const resources = [texture, geometry, material];
+  const ids = resources.map(resolveResourceId);
+  assert.equal(new Set(ids).size, resources.length);
+  for (const [index, resource] of resources.entries()) {
+    assert.equal(resolveResourceId({ resource, isMutable: false }), ids[index]);
+    assert.equal(resolveResourceId({ target: resource }), ids[index]);
+    resource.name = 'same display name';
+    assert.equal(resolveResourceId(resource), ids[index]);
+  }
+  const targets = [new RenderTarget(), new RenderTarget()];
+  for (const target of targets) target.name = 'same display name';
+  assert.notEqual(resolveResourceId(targets[0]), resolveResourceId(targets[1]));
+  assert.equal(resolveResourceId({ id: 0 }), '0');
+  assert.equal(resolveResourceId({ resourceId: 'shared' }), 'shared');
+});
 
 test('Contract: Constructor throw retains irreversible canvas lock (binds-then-throws)', () => {
   const connectedGroups = new ConnectedCompatibilityGroups();
