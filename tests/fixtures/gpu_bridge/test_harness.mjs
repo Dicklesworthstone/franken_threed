@@ -13,6 +13,7 @@ let browser = 'chrome';
 let packagePath = null;
 let negative = null;
 let lane = null;
+let timing = false;
 
 for (const arg of args) {
   if (arg === 'chrome' || arg === 'safari') {
@@ -23,6 +24,8 @@ for (const arg of args) {
     lane = arg.slice(5);
   } else if (arg.startsWith('--lane=')) {
     lane = arg.slice(7);
+  } else if (arg.startsWith('timing=') || arg.startsWith('--timing=')) {
+    timing = arg.endsWith('=true');
   } else if (arg === 'canvas' || arg === 'offscreen' || arg === 'depth' || arg === 'mesh_depth' || arg === 'multi_mesh' || arg === 'mesh_batch') {
     lane = arg;
   } else if (!arg.startsWith('-')) {
@@ -148,6 +151,7 @@ server.listen(0, '127.0.0.1', () => {
   const params = new URLSearchParams();
   if (negative) params.set('negative', negative);
   if (lane) params.set('lane', lane);
+  if (timing) params.set('timing', 'true');
   const queryString = params.toString() ? `?${params.toString()}` : '';
   const targetUrl = `http://127.0.0.1:${port}/${queryString}`;
   console.log(`[bridge-test-harness] Server listening on ${targetUrl}, launching ${browser}...`);
