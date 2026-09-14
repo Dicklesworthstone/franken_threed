@@ -41,7 +41,7 @@ use crate::frame::{FrameSession, RenderContext};
 use crate::gpu_host::{
     with_global_resource_table, GpuCommand, GpuSubmissionPacket, BUFFER_USAGE_COPY_DST,
     BUFFER_USAGE_MAP_READ, BUFFER_USAGE_UNIFORM, BUFFER_USAGE_VERTEX, CULL_MODE_BACK,
-    CULL_MODE_FRONT, CULL_MODE_NONE, DEPTH_COMPARE_ALWAYS, DEPTH_COMPARE_LESS,
+    CULL_MODE_NONE, DEPTH_COMPARE_ALWAYS, DEPTH_COMPARE_LESS,
     DEPTH_COMPARE_LESS_EQUAL, FRONT_FACE_CCW, FRONT_FACE_CW, LOAD_OP_CLEAR,
     OPCODE_CREATE_PIPELINE_CULL, OPCODE_CREATE_PIPELINE_DEPTH_CULL, PASS_FLAG_NEW_PASS,
     STORE_OP_STORE, TARGET_CANVAS, TARGET_FORMAT_DEPTH24PLUS, TARGET_FORMAT_PREFERRED_CANVAS,
@@ -505,6 +505,7 @@ pub struct ToonMeshInput<'a> {
     light_direction: [f32; 4],
     light_color: [f32; 4],
     side: u32,
+    negative_determinant: bool,
     width: u32,
     height: u32,
     webgl_depth: bool,
@@ -600,6 +601,23 @@ impl<'a> ToonMeshInput<'a> {
             return Err(MeshPacketError::InvalidSide { value: side });
         }
 
+        // r186 Matrix4.determinantAffine(): preserve the source f64 winding
+        // decision before GPU upload narrows a nearly singular matrix to f32.
+        let n11 = model_world[0];
+        let n12 = model_world[4];
+        let n13 = model_world[8];
+        let n21 = model_world[1];
+        let n22 = model_world[5];
+        let n23 = model_world[9];
+        let n31 = model_world[2];
+        let n32 = model_world[6];
+        let n33 = model_world[10];
+
+        let det_affine = n11 * (n22 * n33 - n23 * n32)
+            - n12 * (n21 * n33 - n23 * n31)
+            + n13 * (n21 * n32 - n22 * n31);
+        let negative_determinant = det_affine < 0.0;
+
         let mut mw_f32 = [0.0f32; 16];
         for (dst, &src) in mw_f32.iter_mut().zip(model_world.iter()) {
             *dst = src as f32;
@@ -646,6 +664,7 @@ impl<'a> ToonMeshInput<'a> {
             light_direction: light_dir_f32,
             light_color: light_col_f32,
             side,
+            negative_determinant,
             width,
             height,
             webgl_depth,
@@ -653,10 +672,14 @@ impl<'a> ToonMeshInput<'a> {
         })
     }
 
-    /// Configures depth options.
-    pub fn with_depth(mut self, depth: MeshDepthOptions) -> Self {
+    /// Configures explicit depth testing and writing for this toon mesh.
+    ///
+    /// # Errors
+    /// Returns [`MeshPacketError::InvalidDepthCompare`] if `depth.depth_compare` is not in `1..=8`.
+    pub fn with_depth(mut self, depth: MeshDepthOptions) -> Result<Self, MeshPacketError> {
+        MeshDepthOptions::new(depth.depth_test, depth.depth_write, depth.depth_compare)?;
         self.depth = Some(depth);
-        self
+        Ok(self)
     }
 }
 
@@ -1927,12 +1950,17 @@ fn build_toon_mesh_submission_internal(
     let (vertex_count_u32, vertex_stride_u32, vertex_buffer_size, vertex_upload_data, uniform_bytes) =
         format_toon_mesh_geometry_and_uniforms(input)?;
 
-    let cull_mode = match input.side {
-        MATERIAL_SIDE_FRONT => CULL_MODE_BACK,
-        MATERIAL_SIDE_BACK => CULL_MODE_FRONT,
-        _ => CULL_MODE_NONE,
+    let flip_sided = (input.side == MATERIAL_SIDE_BACK) ^ input.negative_determinant;
+    let front_face = if flip_sided {
+        FRONT_FACE_CW
+    } else {
+        FRONT_FACE_CCW
     };
-    let front_face = FRONT_FACE_CCW;
+    let cull_mode = if input.side == MATERIAL_SIDE_DOUBLE {
+        CULL_MODE_NONE
+    } else {
+        CULL_MODE_BACK
+    };
     let (depth_write_enabled, depth_compare) = if let Some(depth_opts) = input.depth {
         depth_opts.resolve_effective()
     } else {

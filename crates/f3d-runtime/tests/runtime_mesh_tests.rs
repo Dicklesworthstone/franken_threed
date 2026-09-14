@@ -51,7 +51,7 @@ use f3d_runtime::mesh::{
     build_toon_mesh_submission,
     f3d_build_toon_mesh_packet, generate_toon_mesh_wgsl,
     gpu_bridge_build_toon_mesh_packet,
-    ToonMeshInput, MATERIAL_SIDE_DOUBLE,
+    ToonMeshInput, MATERIAL_SIDE_DOUBLE, MATERIAL_SIDE_FRONT, MATERIAL_SIDE_BACK,
 };
 
 const IDENTITY_F64: [f64; 16] = [
@@ -4709,4 +4709,129 @@ fn test_toon_mesh_validation_discipline() {
         &color, &light_dir, &light_col, 0, 100, 100, false,
     ).unwrap_err();
     assert!(matches!(err, MeshPacketError::IndexOutOfBounds { index: 99, vertex_count: 3 }));
+}
+
+#[test]
+fn test_toon_mesh_pipeline_culling_and_reflected_winding_matrix() {
+    let mut reflected = IDENTITY_F64;
+    reflected[0] = -1.0;
+
+    // Matrix4.determinantAffine() in r186: this 2x2 block has determinant -2^-30,
+    // but narrowing its entries to f32 erases the sign before GPU upload.
+    let epsilon = 1.0 / (1u64 << 30) as f64;
+    let mut cancellation = IDENTITY_F64;
+    cancellation[1] = 1.0;
+    cancellation[4] = 1.0;
+    cancellation[5] = 1.0 - epsilon;
+    assert_eq!(cancellation[0] * cancellation[5] - cancellation[4] * cancellation[1], -epsilon);
+    assert_eq!(cancellation[5] as f32, 1.0);
+
+    // Explicit oracle table from WebGPUPipelineUtils.js:914-922. Do not derive
+    // expected winding by repeating the implementation's determinant/XOR logic.
+    let cases = [
+        ("positive", IDENTITY_F64, [FRONT_FACE_CCW, FRONT_FACE_CW, FRONT_FACE_CCW]),
+        ("reflected", reflected, [FRONT_FACE_CW, FRONT_FACE_CCW, FRONT_FACE_CW]),
+        ("f64 cancellation", cancellation, [FRONT_FACE_CW, FRONT_FACE_CCW, FRONT_FACE_CW]),
+    ];
+    let sides = [
+        (MATERIAL_SIDE_FRONT, CULL_MODE_BACK),
+        (MATERIAL_SIDE_BACK, CULL_MODE_BACK),
+        (MATERIAL_SIDE_DOUBLE, CULL_MODE_NONE),
+    ];
+    let positions = [0.0f32, 0.5, 0.0, -0.5, -0.5, 0.0, 0.5, -0.5, 0.0];
+    let normals = [0.0f32, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0];
+    let normal_matrix = [1.0f64, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+
+    for (label, model_world, expected_faces) in cases {
+        for ((side, expected_cull), expected_face) in sides.into_iter().zip(expected_faces) {
+            let input = ToonMeshInput::try_from_raw(
+                &positions, &normals, None, &[], &model_world,
+                &IDENTITY_F64, &IDENTITY_F64, &normal_matrix,
+                &[1.0, 0.0, 0.0, 1.0], &[0.0, 0.0, 1.0], &[1.0, 1.0, 1.0],
+                side, 64, 64, false,
+            ).expect("valid toon input");
+            let submission = build_toon_mesh_submission(&input).expect("toon submission");
+            let actual = submission.commands().iter().find_map(|cmd| match cmd {
+                GpuCommand::CreatePipelineDepthCull { cull_mode, front_face, .. } => {
+                    Some((*cull_mode, *front_face))
+                }
+                _ => None,
+            }).expect("toon submission must contain a depth/cull pipeline");
+            assert_eq!(actual, (expected_cull, expected_face), "{label}, side={side}");
+        }
+    }
+}
+
+#[test]
+fn test_toon_mesh_input_with_depth_validates_raw_struct() {
+    let positions = [0.0f32, 0.5, 0.0, -0.5, -0.5, 0.0, 0.5, -0.5, 0.0];
+    let normals = [0.0f32, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0];
+    let normal_matrix = [1.0f64, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+    let toon = ToonMeshInput::try_from_raw(
+        &positions,
+        &normals,
+        None,
+        &[],
+        &IDENTITY_F64,
+        &IDENTITY_F64,
+        &IDENTITY_F64,
+        &normal_matrix,
+        &[1.0, 0.0, 0.0, 1.0],
+        &[0.0, 0.0, 1.0],
+        &[1.0, 1.0, 1.0],
+        MATERIAL_SIDE_FRONT,
+        64,
+        64,
+        false,
+    )
+    .expect("valid toon input");
+
+    let inspect_pipeline_depth = |input: &ToonMeshInput| -> (bool, u32) {
+        let sub = build_toon_mesh_submission(input).expect("toon submission");
+        sub.commands()
+            .iter()
+            .find_map(|cmd| match cmd {
+                GpuCommand::CreatePipelineDepthCull {
+                    depth_write_enabled,
+                    depth_compare,
+                    ..
+                } => Some((*depth_write_enabled, *depth_compare)),
+                _ => None,
+            })
+            .expect("toon submission must emit CreatePipelineDepthCull")
+    };
+
+    // Default (unconfigured) depth: depth_write=true, depth_compare=DEPTH_COMPARE_LESS_EQUAL (4)
+    assert_eq!(inspect_pipeline_depth(&toon), (true, DEPTH_COMPARE_LESS_EQUAL));
+
+    // Forged raw struct invalid compare codes: [0, 9, u32::MAX]
+    for bad_compare in [0, 9, u32::MAX] {
+        let raw = MeshDepthOptions {
+            depth_test: true,
+            depth_write: false,
+            depth_compare: bad_compare,
+        };
+        let err = toon.clone().with_depth(raw).unwrap_err();
+        assert!(matches!(
+            err,
+            MeshPacketError::InvalidDepthCompare { value } if value == bad_compare
+        ));
+    }
+
+    // Valid tuples: (test, write, compare) -> (expected_write, expected_compare)
+    // Note: depth_test=false preserves requested depth_write, only forces compare ALWAYS (r186 WebGPUPipelineUtils.js:224)
+    let valid_cases = [
+        ((true, true, DEPTH_COMPARE_LESS), (true, DEPTH_COMPARE_LESS)),
+        ((false, true, DEPTH_COMPARE_GREATER), (true, DEPTH_COMPARE_ALWAYS)),
+        ((true, false, DEPTH_COMPARE_ALWAYS), (false, DEPTH_COMPARE_ALWAYS)),
+    ];
+    for ((test, write, compare), (expected_write, expected_compare)) in valid_cases {
+        let raw = MeshDepthOptions {
+            depth_test: test,
+            depth_write: write,
+            depth_compare: compare,
+        };
+        let configured = toon.clone().with_depth(raw).expect("valid depth options");
+        assert_eq!(inspect_pipeline_depth(&configured), (expected_write, expected_compare));
+    }
 }

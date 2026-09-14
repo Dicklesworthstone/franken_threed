@@ -1579,7 +1579,7 @@ export async function testMeshDepthScene(bridgeHost, wasmExports, canvasContext 
  * 3. Checks (EXPECTED VALUES ONLY, tolerance 2):
  *    - Frame 1: Candidate probe pixels match upstream reference within tolerance 2.
  *    - Frame 2: Change light direction; Frame 2 candidate matches upstream frame 2 AND differs from frame 1.
- *    - Checkpoint 3: DoubleSide orientation handling matches upstream reference.
+ *    - Checkpoint 3: DoubleSide orientation, back-facing handling, and reflected mesh negative-determinant winding match upstream reference.
  *    - Checkpoint 4 (canvas): Candidate visible swapchain matches retained WebGLRenderer sRGB reference.
  *
  * @param {WebGpuBridgeHost} bridgeHost
@@ -1815,8 +1815,9 @@ export async function testToonMeshScene(bridgeHost, wasmExports, canvasContext =
   }
 
   // ---------------------------------------------------------------------------
-  // Checkpoint 3: Frame 3 - Material Side Handling (DoubleSide)
+  // Checkpoint 3: Frame 3 - Material Side Handling (DoubleSide & Back-Face Normal Flipping)
   // ---------------------------------------------------------------------------
+  // 3a: Front-facing DoubleSide baseline
   mesh.material.side = THREE.DoubleSide;
   mesh.material.needsUpdate = true;
 
@@ -1839,12 +1840,177 @@ export async function testToonMeshScene(bridgeHost, wasmExports, canvasContext =
 
   if (diffR3D > 2 || diffG3D > 2 || diffB3D > 2 || diffA3D > 2) {
     throw new Error(
-      `Checkpoint 3 failed: DoubleSide candidate toon probe [${candProbe3Double}] differs from upstream reference [${ref3Double}] by > tolerance 2 ` +
+      `Checkpoint 3a failed: Front-facing DoubleSide candidate toon probe [${candProbe3Double}] ` +
+      `differs from upstream reference [${ref3Double}] by > tolerance 2 ` +
       `(diffs: R=${diffR3D}, G=${diffG3D}, B=${diffB3D}, A=${diffA3D})`
     );
   }
 
-  // Restore material side
+  // 3b: Reversed-winding / back-facing comparison (exercises back-face normal flipping)
+  // Reverse triangle winding: [0, 2, 1] is clockwise (back-facing from camera view)
+  mesh.geometry.setIndex(new THREE.BufferAttribute(new Uint32Array([0, 2, 1]), 1));
+  mesh.geometry.computeVertexNormals();
+
+  // (i) Under FrontSide, the reversed-winding back-facing triangle must be culled by the rasterizer
+  mesh.material.side = THREE.FrontSide;
+  mesh.material.needsUpdate = true;
+
+  const packetCulled = buildCandidatePacket(mesh, light, camera);
+  await bridgeHost.executePacket(packetCulled);
+  const candidatePixelsCulled = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+  const candProbeCulled = [
+    candidatePixelsCulled[centerIdx],
+    candidatePixelsCulled[centerIdx + 1],
+    candidatePixelsCulled[centerIdx + 2],
+    candidatePixelsCulled[centerIdx + 3],
+  ];
+
+  if (candProbeCulled[0] > 2 || candProbeCulled[1] > 2 || candProbeCulled[2] > 2) {
+    throw new Error(
+      `Checkpoint 3b failed: Reversed-winding back-facing triangle under FrontSide was not culled; ` +
+      `expected clear color [0, 0, 0, 255], got [${candProbeCulled}]`
+    );
+  }
+
+  // (ii) Under DoubleSide, the reversed-winding back-facing triangle is rendered with flipped normal
+  mesh.material.side = THREE.DoubleSide;
+  mesh.material.needsUpdate = true;
+
+  const ref3ReversedDouble = renderUpstreamReference(mesh, light, camera);
+
+  const packetReversedDouble = buildCandidatePacket(mesh, light, camera);
+  await bridgeHost.executePacket(packetReversedDouble);
+  const candidatePixelsReversedDouble = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+  const candProbeReversedDouble = [
+    candidatePixelsReversedDouble[centerIdx],
+    candidatePixelsReversedDouble[centerIdx + 1],
+    candidatePixelsReversedDouble[centerIdx + 2],
+    candidatePixelsReversedDouble[centerIdx + 3],
+  ];
+
+  const diffR3RD = Math.abs(candProbeReversedDouble[0] - ref3ReversedDouble[0]);
+  const diffG3RD = Math.abs(candProbeReversedDouble[1] - ref3ReversedDouble[1]);
+  const diffB3RD = Math.abs(candProbeReversedDouble[2] - ref3ReversedDouble[2]);
+  const diffA3RD = Math.abs(candProbeReversedDouble[3] - ref3ReversedDouble[3]);
+
+  if (diffR3RD > 2 || diffG3RD > 2 || diffB3RD > 2 || diffA3RD > 2) {
+    throw new Error(
+      `Checkpoint 3b failed: Reversed-winding DoubleSide candidate toon probe [${candProbeReversedDouble}] ` +
+      `differs from unchanged upstream r186 reference [${ref3ReversedDouble}] by > tolerance 2 ` +
+      `(diffs: R=${diffR3RD}, G=${diffG3RD}, B=${diffB3RD}, A=${diffA3RD})`
+    );
+  }
+
+  // (iii) Prove visibility strictly differs from culled FrontSide
+  const visibilityDiff = Math.max(
+    Math.abs(candProbeReversedDouble[0] - candProbeCulled[0]),
+    Math.abs(candProbeReversedDouble[1] - candProbeCulled[1]),
+    Math.abs(candProbeReversedDouble[2] - candProbeCulled[2])
+  );
+  if (visibilityDiff <= 2) {
+    throw new Error(
+      `Checkpoint 3b failed: Reversed-winding DoubleSide candidate [${candProbeReversedDouble}] ` +
+      `did not differ from culled FrontSide [${candProbeCulled}] (maxDiff=${visibilityDiff})`
+    );
+  }
+
+  // Restore geometry winding and material side
+  mesh.geometry.setIndex(new THREE.BufferAttribute(indices, 1));
+  mesh.geometry.computeVertexNormals();
+  mesh.material.side = THREE.FrontSide;
+  mesh.material.needsUpdate = true;
+
+  // ---------------------------------------------------------------------------
+  // 3c: Reflected mesh (scale.x = -1, negative model-world determinant winding)
+  // ---------------------------------------------------------------------------
+  mesh.scale.x = -1;
+  mesh.updateMatrixWorld(true);
+
+  // (i) Reflected mesh under FrontSide must remain visible (front-face winding inverted to CW)
+  mesh.material.side = THREE.FrontSide;
+  mesh.material.needsUpdate = true;
+
+  const ref3ReflectedFront = renderUpstreamReference(mesh, light, camera);
+
+  const packetReflectedFront = buildCandidatePacket(mesh, light, camera);
+  await bridgeHost.executePacket(packetReflectedFront);
+  const candidatePixelsReflectedFront = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+  const candProbeReflectedFront = [
+    candidatePixelsReflectedFront[centerIdx],
+    candidatePixelsReflectedFront[centerIdx + 1],
+    candidatePixelsReflectedFront[centerIdx + 2],
+    candidatePixelsReflectedFront[centerIdx + 3],
+  ];
+
+  const diffR3RF = Math.abs(candProbeReflectedFront[0] - ref3ReflectedFront[0]);
+  const diffG3RF = Math.abs(candProbeReflectedFront[1] - ref3ReflectedFront[1]);
+  const diffB3RF = Math.abs(candProbeReflectedFront[2] - ref3ReflectedFront[2]);
+  const diffA3RF = Math.abs(candProbeReflectedFront[3] - ref3ReflectedFront[3]);
+
+  if (diffR3RF > 2 || diffG3RF > 2 || diffB3RF > 2 || diffA3RF > 2) {
+    throw new Error(
+      `Checkpoint 3c failed: Reflected FrontSide candidate toon probe [${candProbeReflectedFront}] ` +
+      `differs from unchanged upstream r186 reference [${ref3ReflectedFront}] by > tolerance 2 ` +
+      `(diffs: R=${diffR3RF}, G=${diffG3RF}, B=${diffB3RF}, A=${diffA3RF})`
+    );
+  }
+
+  const diffFromCulledFront = Math.max(
+    Math.abs(candProbeReflectedFront[0] - candProbeCulled[0]),
+    Math.abs(candProbeReflectedFront[1] - candProbeCulled[1]),
+    Math.abs(candProbeReflectedFront[2] - candProbeCulled[2])
+  );
+  if (diffFromCulledFront <= 2) {
+    throw new Error(
+      `Checkpoint 3c failed: Reflected FrontSide candidate [${candProbeReflectedFront}] ` +
+      `was not distinct from culled baseline [${candProbeCulled}] (diff=${diffFromCulledFront})`
+    );
+  }
+
+  // (ii) Reflected mesh under DoubleSide
+  mesh.material.side = THREE.DoubleSide;
+  mesh.material.needsUpdate = true;
+
+  const ref3ReflectedDouble = renderUpstreamReference(mesh, light, camera);
+
+  const packetReflectedDouble = buildCandidatePacket(mesh, light, camera);
+  await bridgeHost.executePacket(packetReflectedDouble);
+  const candidatePixelsReflectedDouble = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+  const candProbeReflectedDouble = [
+    candidatePixelsReflectedDouble[centerIdx],
+    candidatePixelsReflectedDouble[centerIdx + 1],
+    candidatePixelsReflectedDouble[centerIdx + 2],
+    candidatePixelsReflectedDouble[centerIdx + 3],
+  ];
+
+  const diffR3RDbl = Math.abs(candProbeReflectedDouble[0] - ref3ReflectedDouble[0]);
+  const diffG3RDbl = Math.abs(candProbeReflectedDouble[1] - ref3ReflectedDouble[1]);
+  const diffB3RDbl = Math.abs(candProbeReflectedDouble[2] - ref3ReflectedDouble[2]);
+  const diffA3RDbl = Math.abs(candProbeReflectedDouble[3] - ref3ReflectedDouble[3]);
+
+  if (diffR3RDbl > 2 || diffG3RDbl > 2 || diffB3RDbl > 2 || diffA3RDbl > 2) {
+    throw new Error(
+      `Checkpoint 3c failed: Reflected DoubleSide candidate toon probe [${candProbeReflectedDouble}] ` +
+      `differs from unchanged upstream r186 reference [${ref3ReflectedDouble}] by > tolerance 2 ` +
+      `(diffs: R=${diffR3RDbl}, G=${diffG3RDbl}, B=${diffB3RDbl}, A=${diffA3RDbl})`
+    );
+  }
+
+  const diffFromCulledDouble = Math.max(
+    Math.abs(candProbeReflectedDouble[0] - candProbeCulled[0]),
+    Math.abs(candProbeReflectedDouble[1] - candProbeCulled[1]),
+    Math.abs(candProbeReflectedDouble[2] - candProbeCulled[2])
+  );
+  if (diffFromCulledDouble <= 2) {
+    throw new Error(
+      `Checkpoint 3c failed: Reflected DoubleSide candidate [${candProbeReflectedDouble}] ` +
+      `did not differ from culled baseline [${candProbeCulled}] (diff=${diffFromCulledDouble})`
+    );
+  }
+
+  // Restore scale, world matrix, and material side before canvas
+  mesh.scale.set(1, 1, 1);
+  mesh.updateMatrixWorld(true);
   mesh.material.side = THREE.FrontSide;
   mesh.material.needsUpdate = true;
 
@@ -1936,10 +2102,10 @@ export async function testToonMeshScene(bridgeHost, wasmExports, canvasContext =
     }
   }
 
-  const baseResult = "Real THREE.Mesh with MeshToonMaterial and DirectionalLight verified against upstream WebGLRenderer reference oracle (tolerance 2): Frame 1 candidate matches upstream reference on identical inputs; Frame 2 light direction change matches upstream frame 2 and strictly differs from frame 1; DoubleSide orientation handling verified against upstream reference; offscreen rgba8unorm only; canvas path not exercised";
+  const baseResult = "Real THREE.Mesh with MeshToonMaterial and DirectionalLight verified against upstream WebGLRenderer reference oracle (tolerance 2): Frame 1 candidate matches upstream reference on identical inputs; Frame 2 light direction change matches upstream frame 2 and strictly differs from frame 1; DoubleSide orientation, back-facing handling, and reflected mesh negative-determinant winding verified against upstream reference";
   return canvasContext
     ? `${baseResult}; canvas sRGB checkpoint verified (${canvasFormat})`
-    : baseResult;
+    : `${baseResult}; offscreen rgba8unorm only; canvas path not exercised`;
 }
 
 /**
