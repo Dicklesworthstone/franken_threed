@@ -66,8 +66,9 @@ use f3d_core::{
     },
 };
 use f3d_graph::{
-    CanvasEpochTracker, CanvasFormat, CanvasId, CopyCommand, DrawKind, ExecutionPlan, LoadOp, PassKind,
-    ResourceAccess, ResourceId, ResourceUse, StoreOp,
+    CanvasEpochTracker, CanvasFormat, CanvasId, ComputeBufferBinding, CopyCommand, Dispatch,
+    DrawKind, ExecutionPlan, LoadOp, Pass, PassGraph, PassId, PassKind, ResourceAccess,
+    ResourceId, ResourceKind, ResourceUse, StoreOp,
 };
 use f3d_math::{Matrix4, Quaternion, Vector3};
 
@@ -1812,6 +1813,63 @@ pub enum PlanLoweringError {
         /// Diagnostic reason describing why the copy command is invalid.
         reason: String,
     },
+    /// Compute dispatch binding specifies no byte size or a zero byte size.
+    UnspecifiedBindingSize {
+        /// Diagnostic name of the pass segment.
+        segment_name: String,
+        /// Dispatch index where the error occurred.
+        dispatch_id: u32,
+        /// WGSL group-0 binding index.
+        binding_index: u32,
+        /// Referenced resource ID.
+        resource_id: u32,
+    },
+    /// Compute dispatch binding references a resource with a zero buffer ID.
+    InvalidBufferId {
+        /// Diagnostic name of the pass segment.
+        segment_name: String,
+        /// Dispatch index where the error occurred.
+        dispatch_id: u32,
+        /// WGSL group-0 binding index.
+        binding_index: u32,
+        /// Referenced resource ID.
+        resource_id: u32,
+    },
+    /// Compute dispatch binding references an invalid use_index out of bounds of `dispatch.uses`.
+    InvalidBindingUseIndex {
+        /// Diagnostic name of the pass segment.
+        segment_name: String,
+        /// Dispatch index where the error occurred.
+        dispatch_id: u32,
+        /// WGSL group-0 binding index.
+        binding_index: u32,
+        /// Referenced use index out of bounds.
+        use_index: usize,
+        /// Total number of uses in the dispatch.
+        uses_len: usize,
+    },
+    /// Compute dispatch binding references a non-buffer resource.
+    NonBufferBinding {
+        /// Diagnostic name of the pass segment.
+        segment_name: String,
+        /// Dispatch index where the error occurred.
+        dispatch_id: u32,
+        /// WGSL group-0 binding index.
+        binding_index: u32,
+        /// Referenced resource ID.
+        resource_id: u32,
+    },
+    /// Compute dispatch binding references an incompatible resource access.
+    IncompatibleBindingAccess {
+        /// Diagnostic name of the pass segment.
+        segment_name: String,
+        /// Dispatch index where the error occurred.
+        dispatch_id: u32,
+        /// WGSL group-0 binding index.
+        binding_index: u32,
+        /// Non-compute access type.
+        access: ResourceAccess,
+    },
 }
 
 impl core::fmt::Display for PlanLoweringError {
@@ -1877,6 +1935,62 @@ impl core::fmt::Display for PlanLoweringError {
                     "Invalid copy command during bridge lowering: {reason}"
                 )
             }
+            Self::UnspecifiedBindingSize {
+                segment_name,
+                dispatch_id,
+                binding_index,
+                resource_id,
+            } => {
+                write!(
+                    f,
+                    "Compute segment '{segment_name}' dispatch {dispatch_id} binding {binding_index} for resource {resource_id} has unspecified or zero byte size"
+                )
+            }
+            Self::InvalidBufferId {
+                segment_name,
+                dispatch_id,
+                binding_index,
+                resource_id,
+            } => {
+                write!(
+                    f,
+                    "Compute segment '{segment_name}' dispatch {dispatch_id} binding {binding_index} has invalid zero buffer ID (resource {resource_id})"
+                )
+            }
+            Self::InvalidBindingUseIndex {
+                segment_name,
+                dispatch_id,
+                binding_index,
+                use_index,
+                uses_len,
+            } => {
+                write!(
+                    f,
+                    "Compute segment '{segment_name}' dispatch {dispatch_id} binding {binding_index} references out-of-bounds use_index {use_index} (uses length: {uses_len})"
+                )
+            }
+            Self::NonBufferBinding {
+                segment_name,
+                dispatch_id,
+                binding_index,
+                resource_id,
+            } => {
+                write!(
+                    f,
+                    "Compute segment '{segment_name}' dispatch {dispatch_id} binding {binding_index} references non-buffer resource {resource_id}"
+                )
+            }
+            Self::IncompatibleBindingAccess {
+                segment_name,
+                dispatch_id,
+                binding_index,
+                access,
+            } => {
+                write!(
+                    f,
+                    "Compute segment '{segment_name}' dispatch {dispatch_id} binding {binding_index} has incompatible access {access:?}; expected UniformBuffer, StorageBufferRead, or StorageBufferWrite"
+                )
+            }
         }
     }
 }
@@ -1895,7 +2009,9 @@ impl core::error::Error for PlanLoweringError {}
 ///   dynamic uniform offset, and uniform buffer ID (from declared uniform resource use, defaulting to 1).
 /// - **Copy Segments**: `CopyCommand::TextureToBuffer` commands are lowered into `GpuCommand::CopyTextureToBuffer`
 ///   with source texture ID, destination readback buffer ID, width, and height.
-/// - **Compute Segments**: Lowering compute dispatches is not yet supported and returns a structured error.
+/// - **Compute Segments**: Lowers compute dispatches into `GpuCommand::DispatchCompute` (opcode 22)
+///   using explicit group-0 buffer binding maps (`ComputeBufferBinding`), mapping resource IDs to
+///   buffer IDs via the shared `.get()` convention, preserving per-use data versions and epochs.
 pub fn lower_plan(plan: &ExecutionPlan) -> Result<Vec<GpuCommand>, PlanLoweringError> {
     let mut commands = Vec::new();
 
@@ -2281,14 +2397,89 @@ pub fn lower_plan(plan: &ExecutionPlan) -> Result<Vec<GpuCommand>, PlanLoweringE
                     }
                 }
             }
-            // PassKind::Compute lowering from high-level ExecutionPlan awaits explicit WGSL
-            // binding index lowering in the next slice (do not infer binding indices from resource IDs;
-            // packet-level compute execution is supported directly via GpuCommand::CreateComputePipeline
-            // and GpuCommand::DispatchCompute).
             PassKind::Compute => {
-                return Err(PlanLoweringError::UnsupportedPassKind {
-                    segment_name: segment.name().to_string(),
-                });
+                for dispatch in segment.dispatches() {
+                    let mut lowered_bindings = Vec::with_capacity(dispatch.bindings.len());
+                    for b in &dispatch.bindings {
+                        if b.use_index >= dispatch.uses.len() {
+                            return Err(PlanLoweringError::InvalidBindingUseIndex {
+                                segment_name: segment.name().to_string(),
+                                dispatch_id: dispatch.dispatch_id,
+                                binding_index: b.binding_index,
+                                use_index: b.use_index,
+                                uses_len: dispatch.uses.len(),
+                            });
+                        }
+                        let u = &dispatch.uses[b.use_index];
+                        if u.kind != ResourceKind::Buffer {
+                            return Err(PlanLoweringError::NonBufferBinding {
+                                segment_name: segment.name().to_string(),
+                                dispatch_id: dispatch.dispatch_id,
+                                binding_index: b.binding_index,
+                                resource_id: u.resource_id.get(),
+                            });
+                        }
+                        // Reuse the existing lower_plan convention: graph resource IDs map
+                        // directly to numeric GPU buffer handles via .get() (shared convention with
+                        // render and copy passes), requiring non-zero buffer ID.
+                        let buffer_id = u.resource_id.get();
+                        if buffer_id == 0 {
+                            return Err(PlanLoweringError::InvalidBufferId {
+                                segment_name: segment.name().to_string(),
+                                dispatch_id: dispatch.dispatch_id,
+                                binding_index: b.binding_index,
+                                resource_id: buffer_id,
+                            });
+                        }
+                        let size = match u.byte_size {
+                            Some(s) if s > 0 => s,
+                            _ => {
+                                return Err(PlanLoweringError::UnspecifiedBindingSize {
+                                    segment_name: segment.name().to_string(),
+                                    dispatch_id: dispatch.dispatch_id,
+                                    binding_index: b.binding_index,
+                                    resource_id: buffer_id,
+                                });
+                            }
+                        };
+                        let offset = u.byte_offset.unwrap_or(0);
+                        let binding_type = match u.access {
+                            ResourceAccess::UniformBuffer => BINDING_TYPE_UNIFORM,
+                            ResourceAccess::StorageBufferRead => BINDING_TYPE_STORAGE_READ,
+                            ResourceAccess::StorageBufferWrite => BINDING_TYPE_STORAGE_READ_WRITE,
+                            other => {
+                                return Err(PlanLoweringError::IncompatibleBindingAccess {
+                                    segment_name: segment.name().to_string(),
+                                    dispatch_id: dispatch.dispatch_id,
+                                    binding_index: b.binding_index,
+                                    access: other,
+                                });
+                            }
+                        };
+                        let epoch = u
+                            .canvas_epoch
+                            .unwrap_or_else(|| plan.canvas_epoch().unwrap_or(Epoch::ZERO));
+                        let data_version = u.version;
+
+                        lowered_bindings.push(GpuBufferBinding {
+                            binding_index: b.binding_index,
+                            buffer_id,
+                            offset,
+                            size,
+                            binding_type,
+                            epoch,
+                            data_version,
+                        });
+                    }
+
+                    commands.push(GpuCommand::DispatchCompute {
+                        pipeline_id: dispatch.pipeline_id,
+                        workgroup_count_x: dispatch.workgroups[0],
+                        workgroup_count_y: dispatch.workgroups[1],
+                        workgroup_count_z: dispatch.workgroups[2],
+                        bindings: lowered_bindings,
+                    });
+                }
             }
         }
     }
@@ -3461,42 +3652,45 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {\n\
 
     let workgroup_count_x = ((num_points as u32).saturating_add(63)) / 64;
 
+    // Build the execution schedule via PassGraph -> ExecutionPlan -> lower_plan (§6.1, root 21419 / 21779)
+    let mut graph = PassGraph::new();
+
+    let compute_pass_id = PassId::new(2);
+    let mut compute_pass = Pass::new_compute(compute_pass_id, "affine_two_dispatch");
+
     // Dispatch 1: binds Slice A (offset 0, DataVersion 1) -> Output Slice A (offset 0)
-    packet.push(GpuCommand::DispatchCompute {
-        pipeline_id: COMPUTE_PIPELINE_ID,
-        workgroup_count_x: workgroup_count_x.max(1),
-        workgroup_count_y: 1,
-        workgroup_count_z: 1,
-        bindings: alloc::vec![
-            GpuBufferBinding {
-                binding_index: 0,
-                buffer_id: COMPUTE_AFFINE_BUFFER_ID,
-                offset: 0,
-                size: 48,
-                binding_type: BINDING_TYPE_STORAGE_READ,
-                epoch: Epoch::ZERO,
-                data_version: DataVersion::new(1),
-            },
-            GpuBufferBinding {
-                binding_index: 1,
-                buffer_id: COMPUTE_INPUT_POINTS_BUFFER_ID,
-                offset: 0,
-                size: points_byte_len as u64,
-                binding_type: BINDING_TYPE_STORAGE_READ,
-                epoch: Epoch::ZERO,
-                data_version: DataVersion::new(1),
-            },
-            GpuBufferBinding {
-                binding_index: 2,
-                buffer_id: COMPUTE_OUTPUT_POINTS_BUFFER_ID,
-                offset: 0,
-                size: points_byte_len as u64,
-                binding_type: BINDING_TYPE_STORAGE_READ_WRITE,
-                epoch: Epoch::ZERO,
-                data_version: DataVersion::new(1),
-            },
-        ],
-    });
+    let uses_1 = alloc::vec![
+        ResourceUse::buffer_storage_read(
+            ResourceId::new(COMPUTE_AFFINE_BUFFER_ID),
+            DataVersion::new(1),
+            Some(0),
+            Some(48),
+        ),
+        ResourceUse::buffer_storage_read(
+            ResourceId::new(COMPUTE_INPUT_POINTS_BUFFER_ID),
+            DataVersion::new(1),
+            Some(0),
+            Some(points_byte_len as u64),
+        ),
+        ResourceUse::buffer_storage_write(
+            ResourceId::new(COMPUTE_OUTPUT_POINTS_BUFFER_ID),
+            DataVersion::new(1),
+            Some(0),
+            Some(points_byte_len as u64),
+        ),
+    ];
+    let bindings_1 = alloc::vec![
+        ComputeBufferBinding::new(0, 0),
+        ComputeBufferBinding::new(1, 1),
+        ComputeBufferBinding::new(2, 2),
+    ];
+    compute_pass.dispatches.push(Dispatch::new_with_bindings(
+        0,
+        COMPUTE_PIPELINE_ID,
+        [workgroup_count_x.max(1), 1, 1],
+        uses_1,
+        bindings_1,
+    ));
 
     // Dispatch 2: binds Slice B (offset 256, DataVersion 2), or Slice A if aliased
     let (matrix_offset, data_version) = if aliased {
@@ -3505,51 +3699,75 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {\n\
         (256u64, DataVersion::new(2))
     };
 
-    packet.push(GpuCommand::DispatchCompute {
-        pipeline_id: COMPUTE_PIPELINE_ID,
-        workgroup_count_x: workgroup_count_x.max(1),
-        workgroup_count_y: 1,
-        workgroup_count_z: 1,
-        bindings: alloc::vec![
-            GpuBufferBinding {
-                binding_index: 0,
-                buffer_id: COMPUTE_AFFINE_BUFFER_ID,
-                offset: matrix_offset,
-                size: 48,
-                binding_type: BINDING_TYPE_STORAGE_READ,
-                epoch: Epoch::ZERO,
-                data_version,
-            },
-            GpuBufferBinding {
-                binding_index: 1,
-                buffer_id: COMPUTE_INPUT_POINTS_BUFFER_ID,
-                offset: 0,
-                size: points_byte_len as u64,
-                binding_type: BINDING_TYPE_STORAGE_READ,
-                epoch: Epoch::ZERO,
-                data_version,
-            },
-            GpuBufferBinding {
-                binding_index: 2,
-                buffer_id: COMPUTE_OUTPUT_POINTS_BUFFER_ID,
-                offset: output_slice_stride as u64,
-                size: points_byte_len as u64,
-                binding_type: BINDING_TYPE_STORAGE_READ_WRITE,
-                epoch: Epoch::ZERO,
-                data_version,
-            },
-        ],
-    });
+    let uses_2 = alloc::vec![
+        ResourceUse::buffer_storage_read(
+            ResourceId::new(COMPUTE_AFFINE_BUFFER_ID),
+            data_version,
+            Some(matrix_offset),
+            Some(48),
+        ),
+        ResourceUse::buffer_storage_read(
+            ResourceId::new(COMPUTE_INPUT_POINTS_BUFFER_ID),
+            data_version,
+            Some(0),
+            Some(points_byte_len as u64),
+        ),
+        ResourceUse::buffer_storage_write(
+            ResourceId::new(COMPUTE_OUTPUT_POINTS_BUFFER_ID),
+            data_version,
+            Some(output_slice_stride as u64),
+            Some(points_byte_len as u64),
+        ),
+    ];
+    let bindings_2 = alloc::vec![
+        ComputeBufferBinding::new(0, 0),
+        ComputeBufferBinding::new(1, 1),
+        ComputeBufferBinding::new(2, 2),
+    ];
+    compute_pass.dispatches.push(Dispatch::new_with_bindings(
+        1,
+        COMPUTE_PIPELINE_ID,
+        [workgroup_count_x.max(1), 1, 1],
+        uses_2,
+        bindings_2,
+    ));
 
-    // Copy both output slices to readback staging buffer
-    packet.push(GpuCommand::CopyBufferToBuffer {
-        source_buffer_id: COMPUTE_OUTPUT_POINTS_BUFFER_ID,
-        source_offset: 0,
-        destination_buffer_id: COMPUTE_READBACK_BUFFER_ID,
-        destination_offset: 0,
+    graph.add_pass(compute_pass).map_err(|e| {
+        PacketEncodeError::InvalidDimensions(alloc::format!("failed to add compute pass: {e}"))
+    })?;
+
+    // Copy pass: copy both output slices to readback staging buffer
+    let copy_pass_id = PassId::new(1);
+    let mut copy_pass = Pass::new_copy(copy_pass_id, "affine_readback_copy");
+    copy_pass.copies.push(CopyCommand::BufferToBuffer {
+        src: ResourceId::new(COMPUTE_OUTPUT_POINTS_BUFFER_ID),
+        src_offset: 0,
+        dst: ResourceId::new(COMPUTE_READBACK_BUFFER_ID),
+        dst_offset: 0,
         size: total_output_size as u64,
-        epoch: Epoch::ZERO,
     });
+    graph.add_pass(copy_pass).map_err(|e| {
+        PacketEncodeError::InvalidDimensions(alloc::format!("failed to add copy pass: {e}"))
+    })?;
+
+    // Declare explicit execution dependency: readback copy pass (ID 1) depends on compute pass (ID 2).
+    // Reversed pass IDs (compute ID 2 / copy ID 1) ensure that topological dependency sorting
+    // governs execution order rather than incidental numerical PassId sorting (§6.1, root review).
+    graph.add_dependency(copy_pass_id, compute_pass_id).map_err(|e| {
+        PacketEncodeError::InvalidDimensions(alloc::format!("failed to add copy pass dependency on compute: {e}"))
+    })?;
+
+    let plan = graph.compile(None).map_err(|e| {
+        PacketEncodeError::InvalidDimensions(alloc::format!("failed to compile execution plan: {e}"))
+    })?;
+
+    let lowered_commands = lower_plan(&plan).map_err(|e| {
+        PacketEncodeError::InvalidDimensions(alloc::format!("failed to lower execution plan: {e}"))
+    })?;
+
+    for cmd in lowered_commands {
+        packet.push(cmd);
+    }
 
     Ok(packet)
 }
@@ -7659,6 +7877,7 @@ pub fn validate_affine_rows(bytes: &[u8]) -> Result<(), LayoutError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use f3d_graph::{GraphError, HazardError};
 
     /// Test-only mutex serializing tests that mutate, reset, advance, or assert `GLOBAL_RESOURCE_SLOT_TABLE`.
     /// Tolerates lock poisoning across test failures (§6.5, peer review 7202).
@@ -14501,6 +14720,23 @@ mod tests {
             panic!("expected two DispatchCompute commands");
         }
 
+        // Verify topological order: DispatchCompute (Compute Pass ID 2) precedes CopyBufferToBuffer
+        // (Copy Pass ID 1), strictly proving explicit dependency scheduling rather than numerical ID sorting.
+        let dispatch_idx = packet
+            .commands()
+            .iter()
+            .position(|c| matches!(c, GpuCommand::DispatchCompute { .. }))
+            .expect("must contain DispatchCompute");
+        let copy_idx = packet
+            .commands()
+            .iter()
+            .position(|c| matches!(c, GpuCommand::CopyBufferToBuffer { .. }))
+            .expect("must contain CopyBufferToBuffer");
+        assert!(
+            dispatch_idx < copy_idx,
+            "compute dispatches must precede readback copy across reversed pass IDs"
+        );
+
         // 2. Aliased dispatches demonstrating input aliasing counterexample
         let aliased_packet = build_two_dispatch_affine_compute_submission(&matrix_a_floats, &matrix_b_floats, &point, true)
             .expect("aliased submission must succeed");
@@ -14549,10 +14785,162 @@ mod tests {
         assert_eq!(OPCODE_DISPATCH_COMPUTE, 22);
 
         // Verify buffer copy builder packet is unaffected:
-        // 16B packet header + 14B CreateBuffer + 22B WriteBuffer + 14B CreateBuffer + 42B CopyBufferToBuffer + 4B payload = 112B
+        // 16B packet header + 14B CreateBuffer + 18B WriteBuffer (2+4*4) + 14B CreateBuffer + 42B CopyBufferToBuffer + 4B payload = 108B
         let copy_packet = build_buffer_copy_submission(&[1, 2, 3, 4], 0, 0, 4)
             .expect("copy builder must succeed");
         let copy_encoded = copy_packet.encode().expect("copy encoding must succeed");
-        assert_eq!(copy_encoded.len(), 16 + 14 + 22 + 14 + 42 + 4);
+        assert_eq!(copy_encoded.len(), 16 + 14 + 18 + 14 + 42 + 4);
+    }
+
+    #[test]
+    fn test_lower_plan_compute_dispatches_with_bindings() {
+        let mut graph = PassGraph::new();
+        let pass_id = PassId::new(1);
+        let mut pass = Pass::new_compute(pass_id, "compute_test_pass");
+
+        let buf_in = ResourceId::new(701);
+        let buf_out = ResourceId::new(702);
+
+        let uses = alloc::vec![
+            ResourceUse::buffer_storage_read(buf_in, DataVersion::new(3), Some(64), Some(128)),
+            ResourceUse::buffer_storage_write(buf_out, DataVersion::new(4), Some(0), Some(128)),
+        ];
+        let bindings = alloc::vec![
+            ComputeBufferBinding::new(0, 0),
+            ComputeBufferBinding::new(1, 1),
+        ];
+        pass.dispatches.push(Dispatch::new_with_bindings(
+            0,
+            300,
+            [4, 2, 1],
+            uses,
+            bindings,
+        ));
+
+        graph.add_pass(pass).expect("pass addition must succeed");
+        let plan = graph.compile(None).expect("compilation must succeed");
+        let commands = lower_plan(&plan).expect("lower_plan compute must succeed");
+
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            GpuCommand::DispatchCompute {
+                pipeline_id,
+                workgroup_count_x,
+                workgroup_count_y,
+                workgroup_count_z,
+                bindings,
+            } => {
+                assert_eq!(*pipeline_id, 300);
+                assert_eq!(*workgroup_count_x, 4);
+                assert_eq!(*workgroup_count_y, 2);
+                assert_eq!(*workgroup_count_z, 1);
+                assert_eq!(bindings.len(), 2);
+
+                assert_eq!(bindings[0].binding_index, 0);
+                assert_eq!(bindings[0].buffer_id, 701);
+                assert_eq!(bindings[0].offset, 64);
+                assert_eq!(bindings[0].size, 128);
+                assert_eq!(bindings[0].binding_type, BINDING_TYPE_STORAGE_READ);
+                assert_eq!(bindings[0].epoch, Epoch::ZERO);
+                assert_eq!(bindings[0].data_version, DataVersion::new(3));
+
+                assert_eq!(bindings[1].binding_index, 1);
+                assert_eq!(bindings[1].buffer_id, 702);
+                assert_eq!(bindings[1].offset, 0);
+                assert_eq!(bindings[1].size, 128);
+                assert_eq!(bindings[1].binding_type, BINDING_TYPE_STORAGE_READ_WRITE);
+                assert_eq!(bindings[1].epoch, Epoch::ZERO);
+                assert_eq!(bindings[1].data_version, DataVersion::new(4));
+            }
+            other => panic!("expected DispatchCompute, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_lower_plan_compute_rejects_unspecified_binding_size() {
+        let mut graph_none = PassGraph::new();
+        let mut pass_none = Pass::new_compute(PassId::new(1), "compute_none_size_pass");
+        let buf = ResourceId::new(701);
+
+        let uses_none = alloc::vec![
+            ResourceUse::buffer_storage_read(buf, DataVersion::INITIAL, Some(0), None),
+        ];
+        let bindings = alloc::vec![ComputeBufferBinding::new(0, 0)];
+        pass_none.dispatches.push(Dispatch::new_with_bindings(0, 300, [1, 1, 1], uses_none, bindings));
+        graph_none.add_pass(pass_none).expect("add_pass succeeds");
+        let plan_none = graph_none.compile(None).expect("compile succeeds");
+        let err_none = lower_plan(&plan_none).expect_err("lower_plan must reject byte_size None");
+        assert!(matches!(err_none, PlanLoweringError::UnspecifiedBindingSize { .. }));
+    }
+
+    #[test]
+    fn test_lower_plan_compute_rejects_zero_buffer_id() {
+        let mut graph = PassGraph::new();
+        let mut pass = Pass::new_compute(PassId::new(1), "compute_zero_buf_pass");
+        let zero_buf = ResourceId::new(0);
+
+        let uses = alloc::vec![
+            ResourceUse::buffer_storage_read(zero_buf, DataVersion::INITIAL, Some(0), Some(64)),
+        ];
+        let bindings = alloc::vec![ComputeBufferBinding::new(0, 0)];
+        pass.dispatches.push(Dispatch::new_with_bindings(0, 300, [1, 1, 1], uses, bindings));
+        graph.add_pass(pass).expect("add_pass succeeds");
+        let plan = graph.compile(None).expect("compile succeeds");
+        let err = lower_plan(&plan).expect_err("lower_plan must reject buffer_id 0");
+        assert!(matches!(err, PlanLoweringError::InvalidBufferId { .. }));
+    }
+
+    #[test]
+    fn test_graph_compute_rejects_zero_binding_size_before_lower_plan() {
+        let mut graph_zero = PassGraph::new();
+        let mut pass_zero = Pass::new_compute(PassId::new(1), "compute_zero_size_pass");
+        let buf = ResourceId::new(701);
+
+        let uses_zero = alloc::vec![
+            ResourceUse::buffer_storage_read(buf, DataVersion::INITIAL, Some(0), Some(0)),
+        ];
+        let bindings = alloc::vec![ComputeBufferBinding::new(0, 0)];
+        pass_zero.dispatches.push(Dispatch::new_with_bindings(0, 300, [1, 1, 1], uses_zero, bindings));
+        graph_zero.add_pass(pass_zero).expect("add_pass succeeds");
+        let err = graph_zero.compile(None).expect_err("graph compilation must reject byte_size Some(0)");
+        match err {
+            GraphError::Hazard(HazardError::UnspecifiedBindingSize {
+                dispatch_id,
+                binding_index,
+                resource_id,
+            }) => {
+                assert_eq!(dispatch_id, 0);
+                assert_eq!(binding_index, 0);
+                assert_eq!(resource_id, 701);
+            }
+            other => panic!("expected GraphError::Hazard(UnspecifiedBindingSize), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_graph_compute_rejects_incompatible_access_before_lower_plan() {
+        let mut graph = PassGraph::new();
+        let mut pass = Pass::new_compute(PassId::new(1), "compute_incompatible_pass");
+        let buf = ResourceId::new(701);
+
+        let uses = alloc::vec![
+            ResourceUse::buffer_vertex(buf, DataVersion::INITIAL, Some(0), Some(64)),
+        ];
+        let bindings = alloc::vec![ComputeBufferBinding::new(0, 0)];
+        pass.dispatches.push(Dispatch::new_with_bindings(0, 300, [1, 1, 1], uses, bindings));
+        graph.add_pass(pass).expect("add_pass succeeds");
+        let err = graph.compile(None).expect_err("graph compilation must reject incompatible compute access");
+        match err {
+            GraphError::Hazard(HazardError::IncompatibleAccess {
+                dispatch_id,
+                binding_index,
+                access,
+            }) => {
+                assert_eq!(dispatch_id, 0);
+                assert_eq!(binding_index, 0);
+                assert_eq!(access, ResourceAccess::VertexBuffer);
+            }
+            other => panic!("expected GraphError::Hazard(IncompatibleAccess), got {other:?}"),
+        }
     }
 }
