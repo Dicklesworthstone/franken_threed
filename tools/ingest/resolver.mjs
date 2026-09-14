@@ -172,9 +172,9 @@ export function resolveExportTargetValue(target, conditions = ['import', 'defaul
     return null;
   }
   if (typeof target === 'object') {
-    for (const cond of conditions) {
-      if (Object.prototype.hasOwnProperty.call(target, cond)) {
-        const val = resolveExportTargetValue(target[cond], conditions);
+    for (const key of Object.keys(target)) {
+      if (key === 'default' || conditions.includes(key)) {
+        const val = resolveExportTargetValue(target[key], conditions);
         if (val !== undefined) return val;
       }
     }

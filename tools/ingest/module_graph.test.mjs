@@ -16,6 +16,7 @@ import { analyzeModuleAst, classifyDynamicImportArgument } from './ast_analyzer.
 import { parseHtmlEntries, parseSrcsetUrls } from './html_parser.mjs';
 import { bundleWithRollup } from './bundler.mjs';
 import { IngestionResolutionError } from './types.mjs';
+import { resolveExportTargetValue, resolvePackageExports } from './resolver.mjs';
 
 const SCRATCH_BASE = tmpdir();
 
@@ -1871,5 +1872,73 @@ test('parseHtmlEntries: target-only <base> is non-recording and allows subsequen
     parsedTargetOnly.moduleScripts[0].id,
     'file:///app/dir/app.js',
     'Module script must resolve relative to document URL'
+  );
+});
+
+// ---------------------------------------------------------------------------
+// CONDITIONAL EXPORTS OBJECT INSERTION PRIORITY REGRESSION
+// ---------------------------------------------------------------------------
+
+test('Regression: resolveExportTargetValue respects object insertion order', () => {
+  assert.equal(
+    resolveExportTargetValue({ default: './default.js', import: './import.js' }),
+    './default.js'
+  );
+  assert.equal(
+    resolveExportTargetValue({ import: './import.js', default: './default.js' }),
+    './import.js'
+  );
+});
+
+test('Regression: resolveExportTargetValue default always matches and nested no-match continues parent', () => {
+  // Explicit check: default matches even when conditions array excludes 'default'
+  assert.equal(
+    resolveExportTargetValue({ default: './fallback.js' }, ['import']),
+    './fallback.js'
+  );
+  assert.equal(
+    resolveExportTargetValue({ node: './node.js', require: './require.cjs', default: './default.js' }),
+    './default.js'
+  );
+  assert.equal(
+    resolveExportTargetValue({
+      import: { browser: './browser.js', electron: './electron.js' },
+      default: './fallback.js',
+    }),
+    './fallback.js'
+  );
+  assert.equal(
+    resolveExportTargetValue({
+      import: { default: './nested-default.js' },
+      default: './top-default.js',
+    }),
+    './nested-default.js'
+  );
+});
+
+test('Regression: resolveExportTargetValue null target blocks fallback and throws in resolvePackageExports', () => {
+  assert.equal(
+    resolveExportTargetValue({ import: null, default: './default.js' }),
+    null
+  );
+  assert.throws(
+    () => resolvePackageExports(
+      '.',
+      { '.': { import: null, default: './default.js' } },
+      '/fake/package.json',
+      'my-pkg',
+      'file:///app.js'
+    ),
+    err => err instanceof IngestionResolutionError && /mapped to null/.test(err.message)
+  );
+  assert.equal(
+    resolvePackageExports(
+      '.',
+      { '.': { default: './build/default.js', import: './build/import.js' } },
+      '/fake/package.json',
+      'my-pkg',
+      'file:///app.js'
+    ),
+    './build/default.js'
   );
 });
