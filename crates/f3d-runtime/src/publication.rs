@@ -4,7 +4,7 @@
 /// Publication state tracking a monotonic generation and optional value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishedState {
-    generation: u32,
+    generation: Option<u32>,
     value: Option<u32>,
 }
 
@@ -13,14 +13,14 @@ impl PublishedState {
     #[must_use]
     pub fn new(generation: u32) -> Self {
         Self {
-            generation,
+            generation: Some(generation),
             value: None,
         }
     }
 
-    /// Returns the current active generation.
+    /// Returns the current active generation, or `None` if exhausted.
     #[must_use]
-    pub fn generation(&self) -> u32 {
+    pub fn generation(&self) -> Option<u32> {
         self.generation
     }
 
@@ -30,22 +30,27 @@ impl PublishedState {
         self.value
     }
 
-    /// Increments the generation and returns the new one without touching value.
-    pub fn replace(&mut self) -> u32 {
-        self.generation = self.generation.wrapping_add(1);
+    /// Increments the generation with checked arithmetic, returning the new one.
+    ///
+    /// Once the generation reaches `u32::MAX`, subsequent replacements yield `None`
+    /// and transition the state to permanently exhausted without modifying any
+    /// previously published value.
+    pub fn replace(&mut self) -> Option<u32> {
+        self.generation = self.generation.and_then(|g| g.checked_add(1));
         self.generation
     }
 
     /// Attempts to publish a value under the given generation.
     ///
     /// If `generation` matches the current active generation, stores the value
-    /// and returns `true`. On mismatch, leaves `value` untouched and returns `false`.
+    /// and returns `true`. If exhausted or mismatched, leaves `value` untouched
+    /// and returns `false`.
     pub fn try_publish(&mut self, generation: u32, value: u32) -> bool {
-        if generation != self.generation {
-            false
-        } else {
+        if self.generation == Some(generation) {
             self.value = Some(value);
             true
+        } else {
+            false
         }
     }
 }

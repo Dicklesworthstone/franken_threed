@@ -137,7 +137,7 @@ fn publish(state: &RefCell<PublishedState>, generation: u32, value: u32) -> bool
     // instead of the producer's, i.e. no generation check. The stale-result probe must
     // then fail with "late child published into replaced region".
     let generation = if host_negative() == "generation-check" {
-        state.generation()
+        state.generation().unwrap_or(0)
     } else {
         generation
     };
@@ -325,7 +325,10 @@ async fn run(handle: RuntimeHandle) -> Result<(), JsValue> {
         })
         .map_err(join_error)?;
 
-    let next_gen = state.borrow_mut().replace();
+    let next_gen = state
+        .borrow_mut()
+        .replace()
+        .ok_or_else(|| JsValue::from_str("publication generation exhausted"))?;
     event("stale-result", "replaced", next_gen);
     region_a
         .cancel(CancelReason::user("replaced by generation 2"))

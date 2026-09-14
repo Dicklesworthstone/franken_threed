@@ -91,12 +91,61 @@ fn generation_check_discards_stale_publication() {
     assert_eq!(state.value(), Some(10));
 
     let next_gen = state.replace();
-    assert_eq!(next_gen, 2);
+    assert_eq!(next_gen, Some(2));
+    assert_eq!(state.value(), Some(10), "replace preserves previous value");
     assert!(!state.try_publish(1, 20));
     assert_eq!(state.value(), Some(10));
 
     assert!(state.try_publish(2, 30));
     assert_eq!(state.value(), Some(30));
+}
+
+#[test]
+fn publication_exhaustion_at_u32_max_rejects_further_tokens_and_preserves_value() {
+    let mut state = PublishedState::new(u32::MAX - 1);
+    assert!(state.try_publish(u32::MAX - 1, 100));
+    assert_eq!(state.value(), Some(100));
+
+    // MAX-1 -> MAX succeeds:
+    let max_gen = state.replace();
+    assert_eq!(max_gen, Some(u32::MAX));
+    assert_eq!(state.value(), Some(100), "replace preserves previous value");
+
+    // Publishing under active MAX token succeeds:
+    assert!(state.try_publish(u32::MAX, 200));
+    assert_eq!(state.value(), Some(200));
+
+    // Next replace overflows u32 and explicitly exhausts:
+    let exhausted = state.replace();
+    assert_eq!(
+        exhausted, None,
+        "replace beyond u32::MAX must return None (explicit exhaustion)"
+    );
+    assert_eq!(
+        state.value(),
+        Some(200),
+        "exhaustion preserves previous value"
+    );
+
+    // Reject both 0 and MAX tokens after exhaustion:
+    assert!(
+        !state.try_publish(0, 300),
+        "token 0 must be rejected after exhaustion (no wrap to 0)"
+    );
+    assert!(
+        !state.try_publish(u32::MAX, 300),
+        "token MAX must be rejected after exhaustion"
+    );
+    assert_eq!(
+        state.value(),
+        Some(200),
+        "rejected publications must leave previous value untouched"
+    );
+
+    // Subsequent replace calls remain exhausted and continue rejecting:
+    assert_eq!(state.replace(), None);
+    assert!(!state.try_publish(0, 400));
+    assert_eq!(state.value(), Some(200));
 }
 
 #[test]
