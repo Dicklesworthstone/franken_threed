@@ -2096,3 +2096,72 @@ test('Regression (6mv.1): Duplicate normalized keys in imports let later entries
     broadLib.lib
   );
 });
+
+test('Import-map prefix targets normalize before slash validation and suffix resolution', () => {
+  const referrer = 'https://example.com/app/main.js';
+  const options = { mapBaseUrl: 'https://example.com/app/index.html' };
+  for (const target of ['./vendor/.', './vendor/sub/..', './vendor/']) {
+    const map = { imports: { 'pkg/': target } };
+    assert.equal(resolveModuleSpecifier('pkg/', referrer, map, options),
+      'https://example.com/app/vendor/');
+    assert.equal(resolveModuleSpecifier('pkg/sub/../child.js?q=1#part', referrer, map, options),
+      'https://example.com/app/vendor/child.js?q=1#part');
+  }
+});
+
+test('Import-map prefix resolution blocks suffixes that escape the mapped URL', () => {
+  const referrer = 'https://example.com/app/main.js';
+  const span = { line: 3, column: 7, offset: 41 };
+  const map = {
+    imports: { 'pkg/': 'https://fallback.example/pkg/' },
+    scopes: { './': { 'pkg/': './vendor/' } },
+  };
+  for (const specifier of ['pkg/../escape.js', 'pkg/%2e%2e/escape.js', 'pkg//escape.js']) {
+    assert.throws(() => resolveModuleSpecifier(specifier, referrer, map, { span }), err => {
+      assert.ok(err instanceof IngestionResolutionError);
+      assert.equal(err.specifier, specifier);
+      assert.equal(err.referrerUrl, referrer);
+      assert.deepEqual(err.span, span);
+      return /backtracking/.test(err.message);
+    });
+  }
+});
+
+test('Import-map prefix targets with queries do not concatenate suffixes into the query', () => {
+  const referrer = 'https://example.com/app/main.js';
+  const target = 'https://cdn.example/vendor/?v=/';
+  const map = { imports: { 'pkg/': target } };
+  assert.equal(resolveModuleSpecifier('pkg/', referrer, map), target);
+  assert.equal(resolveModuleSpecifier('pkg/#part', referrer, map), target + '#part');
+  assert.throws(() => resolveModuleSpecifier('pkg/child.js', referrer, map),
+    err => err instanceof IngestionResolutionError && /backtracking/.test(err.message));
+});
+
+test('Import-map invalid prefix targets block exact matches as well as subpaths', () => {
+  const referrer = 'https://example.com/app/main.js';
+  const map = { imports: { 'pkg/': './vendor' } };
+  for (const specifier of ['pkg/', 'pkg/child.js']) {
+    assert.throws(() => resolveModuleSpecifier(specifier, referrer, map),
+      err => err instanceof IngestionResolutionError && /must end with/.test(err.message));
+  }
+});
+
+test('Import-map directory keys match subpaths after URL normalization', () => {
+  const referrer = 'https://example.com/app/main.js';
+  const map = { imports: { './dir/.': './vendor/' } };
+  assert.equal(resolveModuleSpecifier('./dir/child.js', referrer, map),
+    'https://example.com/app/vendor/child.js');
+});
+
+test('Import-map non-special URL specifiers allow exact mappings without prefix rewriting', () => {
+  const referrer = 'https://example.com/app/main.js';
+  const prefix = 'data:text/javascript,export default 1//';
+  const specifier = prefix + 'child.js';
+  for (const target of ['https://cdn.example/', null]) {
+    const map = { imports: { [prefix]: target } };
+    assert.equal(resolveModuleSpecifier(specifier, referrer, map), specifier);
+  }
+  assert.equal(resolveModuleSpecifier(specifier, referrer,
+    { imports: { [specifier]: 'https://cdn.example/exact.js' } }),
+    'https://cdn.example/exact.js');
+});

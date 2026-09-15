@@ -144,6 +144,24 @@ function normalizeRequestSpecifier(specifier, referrerUrl) {
   }
 }
 
+/** Resolve a matched address before checking the import-map slash contract. */
+function resolveMapTarget(rawKey, target, mapBaseUrl) {
+  if (typeof target !== 'string') return { blocked: true };
+  let targetUrl;
+  try {
+    const relative = target.startsWith('/') || target.startsWith('./') || target.startsWith('../');
+    targetUrl = new URL(target, relative ? mapBaseUrl : undefined).href;
+  } catch {
+    return { blocked: true };
+  }
+  if (rawKey.endsWith('/') && !targetUrl.endsWith('/')) {
+    return {
+      error: `Invalid import map prefix mapping: target for prefix "${rawKey}" must end with "/" (got "${target}")`
+    };
+  }
+  return targetUrl;
+}
+
 /**
  * Matches a request specifier against import map entries per WHATWG.
  * Normalizes URL-like keys and request specifier; preserves bare specifiers.
@@ -167,31 +185,45 @@ function matchMapEntries(specifier, referrerUrl, entries, mapBaseUrl) {
 
   // 1. Exact match
   if (normalizedEntries.has(normalizedSpecifier)) {
-    const { target } = normalizedEntries.get(normalizedSpecifier);
-    if (target === null) {
-      return { blocked: true };
-    }
-    return new URL(target, mapBaseUrl).href;
+    const { rawKey, target } = normalizedEntries.get(normalizedSpecifier);
+    return resolveMapTarget(rawKey, target, mapBaseUrl);
   }
 
-  // 2. Prefix match (for keys ending with '/')
+  // URL specifiers with non-special schemes only participate in exact matches.
+  let requestUrl = null;
+  try {
+    requestUrl = new URL(normalizedSpecifier);
+  } catch {
+    // Bare specifiers still participate in prefix matching.
+  }
+  if (requestUrl && !['ftp:', 'file:', 'http:', 'https:', 'ws:', 'wss:'].includes(requestUrl.protocol)) {
+    return null;
+  }
+
+  // 2. Prefix match uses normalized keys; raw spelling only governs target validation.
   const prefixEntries = [...normalizedEntries.entries()]
-    .filter(([normKey, { rawKey }]) => rawKey.endsWith('/') && normKey.endsWith('/'))
+    .filter(([normKey]) => normKey.endsWith('/'))
     .sort((a, b) => b[0].length - a[0].length);
 
   for (const [normKey, { rawKey, target }] of prefixEntries) {
     if (normalizedSpecifier.startsWith(normKey)) {
-      if (target === null) {
-        return { blocked: true };
-      }
-      if (typeof target !== 'string' || !target.endsWith('/')) {
+      const targetUrl = resolveMapTarget(rawKey, target, mapBaseUrl);
+      if (typeof targetUrl !== 'string') return targetUrl;
+      const remainder = normalizedSpecifier.slice(normKey.length);
+      let resolvedUrl;
+      try {
+        resolvedUrl = new URL(remainder, targetUrl).href;
+      } catch {
         return {
-          error: `Invalid import map prefix mapping: target for prefix "${rawKey}" must end with "/" (got "${target}")`
+          error: `Cannot resolve import specifier "${specifier}": suffix cannot be parsed relative to import map prefix "${rawKey}"`
         };
       }
-      const remainder = normalizedSpecifier.slice(normKey.length);
-      const combined = target + remainder;
-      return new URL(combined, mapBaseUrl).href;
+      if (!resolvedUrl.startsWith(targetUrl)) {
+        return {
+          error: `Cannot resolve import specifier "${specifier}": backtracking above import map prefix "${rawKey}"`
+        };
+      }
+      return resolvedUrl;
     }
   }
 
