@@ -2008,7 +2008,44 @@ export async function testToonMeshScene(bridgeHost, wasmExports, canvasContext =
     );
   }
 
-  // Restore scale, world matrix, and material side before canvas
+  // 3d: BackSide must cull the original winding and render the reversed winding,
+  // both before and after reflection. Compare each mutation with the live oracle.
+  mesh.material.side = THREE.BackSide;
+  mesh.material.needsUpdate = true;
+  for (const scaleX of [1, -1]) {
+    mesh.scale.x = scaleX;
+    mesh.updateMatrixWorld(true);
+    for (const reversed of [false, true]) {
+      mesh.geometry.setIndex(new THREE.BufferAttribute(
+        new Uint32Array(reversed ? [0, 2, 1] : [0, 1, 2]), 1
+      ));
+      mesh.geometry.computeVertexNormals();
+
+      const reference = renderUpstreamReference(mesh, light, camera);
+      await bridgeHost.executePacket(buildCandidatePacket(mesh, light, camera));
+      const pixels = await bridgeHost.readbackBuffer(20, bytesPerRow * height);
+      const probe = [0, 1, 2, 3].map(channel => pixels[centerIdx + channel]);
+      if (probe.some((channel, i) => Math.abs(channel - reference[i]) > 2)) {
+        throw new Error(
+          `Checkpoint 3d failed: BackSide scale.x=${scaleX}, reversed=${reversed} ` +
+          `candidate [${probe}] differs from upstream [${reference}] by > tolerance 2`
+        );
+      }
+
+      // Oracle agreement alone must not pass if neither path rendered the mesh.
+      const visible = probe.slice(0, 3).some(channel => channel > 2);
+      if (visible !== reversed) {
+        throw new Error(
+          `Checkpoint 3d failed: BackSide scale.x=${scaleX}, reversed=${reversed} ` +
+          `expected ${reversed ? "visible mesh" : "clear color"}, got [${probe}]`
+        );
+      }
+    }
+  }
+
+  // Restore geometry, scale, world matrix, and material side before canvas
+  mesh.geometry.setIndex(new THREE.BufferAttribute(indices, 1));
+  mesh.geometry.computeVertexNormals();
   mesh.scale.set(1, 1, 1);
   mesh.updateMatrixWorld(true);
   mesh.material.side = THREE.FrontSide;
