@@ -2615,12 +2615,29 @@ fn property_test_disjoint_offset_buffer_writes_rejected_under_whole_buffer_rule(
             "Expected WholeBufferConflict for seed {SEED:#018x} at iter {iter}"
         );
 
-        // Through PassGraph compilation as well
+        // Separate draws can be legalized only by separate usage scopes.
         let mut graph = PassGraph::new();
-        graph.add_pass(pass).expect("add pass");
-        let compile_err = graph.compile(None).expect_err(&format!(
-            "Compile must reject whole-buffer conflict for seed {SEED:#018x} at iter {iter}"
-        ));
+        graph.add_pass(pass.clone()).expect("add pass");
+        let plan = graph.compile(None).expect("cross-draw buffer conflict must split");
+        assert_eq!(plan.segments.len(), 2);
+        assert_eq!(plan.split_count, 1);
+        assert_eq!(plan.segments[0].pass_id, pass_id);
+        assert_eq!(plan.segments[0].draws, pass.draws[..1]);
+        assert_eq!(plan.segments[1].draws, pass.draws[1..]);
+        let split = split_pass_on_hazard(&pass, PassId::new(pass_id.get() + 1)).unwrap();
+        assert_eq!(split[1].dependencies, vec![pass_id]);
+        for segment in &split {
+            validate_pass_hazards(segment).expect("each split scope must be legal");
+        }
+
+        // Moving those exact uses into ONE draw must remain a hard failure,
+        // including through compilation. Disjoint offsets never legalize it.
+        let suffix_uses = pass.draws[1].uses.clone();
+        pass.draws[0].uses.extend(suffix_uses);
+        pass.draws.truncate(1);
+        let mut graph = PassGraph::new();
+        graph.add_pass(pass).expect("add within-draw conflict");
+        let compile_err = graph.compile(None).expect_err("a draw cannot be split");
         assert_eq!(
             compile_err,
             GraphError::Hazard(HazardError::WholeBufferConflict {
