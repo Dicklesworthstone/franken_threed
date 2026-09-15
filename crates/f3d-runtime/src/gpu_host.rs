@@ -383,6 +383,12 @@ pub const OPCODE_COPY_BUFFER_TO_BUFFER: u16 = 20;
 pub const OPCODE_CREATE_COMPUTE_PIPELINE: u16 = 21;
 /// Opcode for executing a compute pass dispatching workgroups with explicit buffer bindings.
 pub const OPCODE_DISPATCH_COMPUTE: u16 = 22;
+/// Allocate a texture with an explicit sample count (existing texture payload + u32).
+pub const OPCODE_CREATE_TEXTURE_MULTISAMPLED: u16 = 23;
+/// Create a basic render pipeline with an explicit sample count (existing payload + u32).
+pub const OPCODE_CREATE_PIPELINE_MULTISAMPLED: u16 = 24;
+/// Render with an offscreen color resolve destination (existing render payload + u32).
+pub const OPCODE_RENDER_PASS_RESOLVE: u16 = 25;
 
 /// Compute binding type: uniform buffer (`GPUBufferBindingType.uniform`).
 pub const BINDING_TYPE_UNIFORM: u32 = 0;
@@ -642,6 +648,21 @@ pub enum GpuCommand {
         /// Bitfield of GPUTextureUsage flags.
         usage: u32,
     },
+    /// Allocate a 2D texture with an explicit WebGPU sample count.
+    CreateTextureMultisampled {
+        /// Texture identity.
+        texture_id: u32,
+        /// Width in pixels.
+        width: u32,
+        /// Height in pixels.
+        height: u32,
+        /// Texture format code.
+        format: u32,
+        /// GPUTextureUsage flags.
+        usage: u32,
+        /// WebGPU sample count: 1 or 4.
+        sample_count: u32,
+    },
     /// Command to compile and create a render pipeline from WGSL shader text.
     CreatePipeline {
         /// Unique integer identifier for the pipeline.
@@ -658,6 +679,25 @@ pub enum GpuCommand {
         uniform_size: u32,
         /// Explicit vertex array byte stride (e.g. 20 for position+uv; defaults to 20 if 0 and has_vertex_buffer is true).
         vertex_stride: u32,
+    },
+    /// Create a basic pipeline whose sample count matches its render attachments.
+    CreatePipelineMultisampled {
+        /// Pipeline identity.
+        pipeline_id: u32,
+        /// Complete WGSL source with vs_main and fs_main entry points.
+        wgsl_code: String,
+        /// Color attachment format code.
+        target_format: u32,
+        /// Whether vertex buffer 0 is consumed.
+        has_vertex_buffer: bool,
+        /// Whether dynamic uniform binding 0 is consumed.
+        has_uniform_buffer: bool,
+        /// Uniform binding byte size.
+        uniform_size: u32,
+        /// Vertex array byte stride.
+        vertex_stride: u32,
+        /// WebGPU sample count: 1 or 4.
+        sample_count: u32,
     },
     /// Command to encode and execute a complete render pass.
     RenderPass {
@@ -683,6 +723,33 @@ pub enum GpuCommand {
         store_op: u32,
         /// Pass boundary flags (0 = none, 1 = new pass boundary).
         pass_flags: u32,
+    },
+    /// Render to a multisampled color attachment and resolve at the pass end.
+    RenderPassResolve {
+        /// Source target kind; currently must be offscreen.
+        target_type: u32,
+        /// Multisampled source texture identity.
+        target_id: u32,
+        /// Initial clear color.
+        clear_color: [f32; 4],
+        /// Sample-count-matched pipeline identity.
+        pipeline_id: u32,
+        /// Vertex buffer identity, or zero for vertex_index shaders.
+        vertex_buffer_id: u32,
+        /// Number of vertices to draw; zero permits clear-only passes.
+        vertex_count: u32,
+        /// Dynamic uniform offset.
+        uniform_dynamic_offset: u32,
+        /// Uniform buffer identity.
+        uniform_buffer_id: u32,
+        /// Color load operation.
+        load_op: u32,
+        /// Multisampled source store operation; resolve is independent of discard.
+        store_op: u32,
+        /// Pass boundary flags.
+        pass_flags: u32,
+        /// Single-sampled offscreen resolve destination.
+        resolve_target_id: u32,
     },
     /// Command to copy texture pixel data into a map-readable staging buffer.
     CopyTextureToBuffer {
@@ -1086,13 +1153,25 @@ impl GpuSubmissionPacket {
                     command_records.extend_from_slice(&data_offset.to_le_bytes());
                     command_records.extend_from_slice(&data_len.to_le_bytes());
                 }
-                GpuCommand::CreateTexture { texture_id, width, height, format, usage } => {
-                    command_records.extend_from_slice(&OPCODE_CREATE_TEXTURE.to_le_bytes());
+                GpuCommand::CreateTexture { texture_id, width, height, format, usage }
+                | GpuCommand::CreateTextureMultisampled { texture_id, width, height, format, usage, .. } => {
+                    let sample_count = match cmd {
+                        GpuCommand::CreateTextureMultisampled { sample_count, .. } => Some(*sample_count),
+                        _ => None,
+                    };
+                    if sample_count.is_some_and(|count| count != 1 && count != 4) {
+                        return Err(PacketEncodeError::InvalidDimensions("texture sample count must be 1 or 4".to_string()));
+                    }
+                    let opcode = if sample_count.is_some() { OPCODE_CREATE_TEXTURE_MULTISAMPLED } else { OPCODE_CREATE_TEXTURE };
+                    command_records.extend_from_slice(&opcode.to_le_bytes());
                     command_records.extend_from_slice(&texture_id.to_le_bytes());
                     command_records.extend_from_slice(&width.to_le_bytes());
                     command_records.extend_from_slice(&height.to_le_bytes());
                     command_records.extend_from_slice(&format.to_le_bytes());
                     command_records.extend_from_slice(&usage.to_le_bytes());
+                    if let Some(count) = sample_count {
+                        command_records.extend_from_slice(&count.to_le_bytes());
+                    }
                 }
                 GpuCommand::CreatePipeline {
                     pipeline_id,
@@ -1102,7 +1181,18 @@ impl GpuSubmissionPacket {
                     has_uniform_buffer,
                     uniform_size,
                     vertex_stride,
+                }
+                | GpuCommand::CreatePipelineMultisampled {
+                    pipeline_id, wgsl_code, target_format, has_vertex_buffer,
+                    has_uniform_buffer, uniform_size, vertex_stride, ..
                 } => {
+                    let sample_count = match cmd {
+                        GpuCommand::CreatePipelineMultisampled { sample_count, .. } => Some(*sample_count),
+                        _ => None,
+                    };
+                    if sample_count.is_some_and(|count| count != 1 && count != 4) {
+                        return Err(PacketEncodeError::InvalidDimensions("pipeline sample count must be 1 or 4".to_string()));
+                    }
                     let bytes = wgsl_code.as_bytes();
                     let code_len = u32::try_from(bytes.len()).map_err(|_| PacketEncodeError::CommandDataOverflow {
                         command_index: cmd_idx,
@@ -1121,7 +1211,8 @@ impl GpuSubmissionPacket {
                     })?;
                     data_payload.extend_from_slice(bytes);
 
-                    command_records.extend_from_slice(&OPCODE_CREATE_PIPELINE.to_le_bytes());
+                    let opcode = if sample_count.is_some() { OPCODE_CREATE_PIPELINE_MULTISAMPLED } else { OPCODE_CREATE_PIPELINE };
+                    command_records.extend_from_slice(&opcode.to_le_bytes());
                     command_records.extend_from_slice(&pipeline_id.to_le_bytes());
                     command_records.extend_from_slice(&code_offset.to_le_bytes());
                     command_records.extend_from_slice(&code_len.to_le_bytes());
@@ -1130,6 +1221,9 @@ impl GpuSubmissionPacket {
                     command_records.extend_from_slice(&(if *has_uniform_buffer { 1u32 } else { 0u32 }).to_le_bytes());
                     command_records.extend_from_slice(&uniform_size.to_le_bytes());
                     command_records.extend_from_slice(&vertex_stride.to_le_bytes());
+                    if let Some(count) = sample_count {
+                        command_records.extend_from_slice(&count.to_le_bytes());
+                    }
                 }
                 GpuCommand::RenderPass {
                     target_type,
@@ -1143,8 +1237,21 @@ impl GpuSubmissionPacket {
                     load_op,
                     store_op,
                     pass_flags,
+                }
+                | GpuCommand::RenderPassResolve {
+                    target_type, target_id, clear_color, pipeline_id, vertex_buffer_id,
+                    vertex_count, uniform_dynamic_offset, uniform_buffer_id,
+                    load_op, store_op, pass_flags, ..
                 } => {
-                    command_records.extend_from_slice(&OPCODE_RENDER_PASS.to_le_bytes());
+                    let resolve_target_id = match cmd {
+                        GpuCommand::RenderPassResolve { resolve_target_id, .. } => Some(*resolve_target_id),
+                        _ => None,
+                    };
+                    if resolve_target_id.is_some_and(|id| id == 0 || id == *target_id || *target_type != TARGET_OFFSCREEN) {
+                        return Err(PacketEncodeError::InvalidDimensions("resolve requires distinct offscreen source and destination textures".to_string()));
+                    }
+                    let opcode = if resolve_target_id.is_some() { OPCODE_RENDER_PASS_RESOLVE } else { OPCODE_RENDER_PASS };
+                    command_records.extend_from_slice(&opcode.to_le_bytes());
                     let packed_target = pack_target_type(*target_type, *load_op, *store_op, *pass_flags);
                     command_records.extend_from_slice(&packed_target.to_le_bytes());
                     command_records.extend_from_slice(&target_id.to_le_bytes());
@@ -1156,6 +1263,9 @@ impl GpuSubmissionPacket {
                     command_records.extend_from_slice(&vertex_count.to_le_bytes());
                     command_records.extend_from_slice(&uniform_dynamic_offset.to_le_bytes());
                     command_records.extend_from_slice(&uniform_buffer_id.to_le_bytes());
+                    if let Some(id) = resolve_target_id {
+                        command_records.extend_from_slice(&id.to_le_bytes());
+                    }
                 }
                 GpuCommand::CopyTextureToBuffer { texture_id, buffer_id, width, height, epoch } => {
                     command_records.extend_from_slice(&OPCODE_COPY_TEXTURE_TO_BUFFER.to_le_bytes());
@@ -1776,7 +1886,7 @@ pub enum PlanLoweringError {
         /// Number of configured color attachments.
         count: usize,
     },
-    /// The current bridge packet cannot encode a color attachment resolve operation.
+    /// A resolve combination is outside the current offscreen, color-only bridge path.
     UnsupportedResolveTarget {
         /// Diagnostic name of the pass segment.
         segment_name: String,
@@ -1903,7 +2013,7 @@ impl core::fmt::Display for PlanLoweringError {
             Self::UnsupportedResolveTarget { segment_name, resolve_target } => {
                 write!(
                     f,
-                    "Render segment '{segment_name}' resolves into texture {resolve_target}; resolve operations are not supported by bridge lowering"
+                    "Render segment '{segment_name}' resolves into texture {resolve_target}; this resolve combination is not supported by bridge lowering"
                 )
             }
             Self::UnsupportedDepthStencilAttachment { segment_name } => {
@@ -2098,10 +2208,14 @@ pub fn lower_plan(plan: &ExecutionPlan) -> Result<Vec<GpuCommand>, PlanLoweringE
                         segment_name: segment.name().to_string(),
                     });
                 };
-                if let Some(resolve_target) = ca.resolve_target() {
+                let resolve_target_id = ca.resolve_target().map(|id| id.get());
+                if let Some(resolve_target) = resolve_target_id.filter(|_| {
+                    ca.is_canvas() || depth_attachment.is_some()
+                        || segment.draws().iter().any(|draw| draw.is_bundle())
+                }) {
                     return Err(PlanLoweringError::UnsupportedResolveTarget {
                         segment_name: segment.name().to_string(),
-                        resolve_target: resolve_target.get(),
+                        resolve_target,
                     });
                 }
                 let target_type = if ca.is_canvas() {
@@ -2177,6 +2291,21 @@ pub fn lower_plan(plan: &ExecutionPlan) -> Result<Vec<GpuCommand>, PlanLoweringE
                             depth_store_op,
                             depth_clear_value,
                             depth_read_only,
+                        });
+                    } else if let Some(resolve_target_id) = resolve_target_id {
+                        commands.push(GpuCommand::RenderPassResolve {
+                            target_type,
+                            target_id,
+                            clear_color,
+                            pipeline_id,
+                            vertex_buffer_id,
+                            vertex_count,
+                            uniform_dynamic_offset,
+                            uniform_buffer_id,
+                            load_op,
+                            store_op,
+                            pass_flags,
+                            resolve_target_id,
                         });
                     } else {
                         commands.push(GpuCommand::RenderPass {
@@ -2550,6 +2679,88 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{\n\
 }}\n",
         WGSL_AFFINE_ROWS_DECLARATION
     )
+}
+
+/// Build a 4x offscreen color resolve through the production pass graph and lowerer.
+/// Mode 0 clears red; mode 1 draws a red triangle on opaque black. Both discard
+/// the multisampled source and copy only the resolved image to readback buffer 812.
+pub fn build_multisample_submission(mode: u32) -> Result<GpuSubmissionPacket, PacketEncodeError> {
+    use f3d_graph::{ColorAttachment, Draw};
+    if mode > 1 {
+        return Err(PacketEncodeError::InvalidDimensions("multisample mode must be 0 or 1".to_string()));
+    }
+    let mut packet = GpuSubmissionPacket::new();
+    packet.push(GpuCommand::CreateTextureMultisampled {
+        texture_id: 810, width: 64, height: 64, format: TARGET_FORMAT_RGBA8UNORM,
+        usage: TEXTURE_USAGE_RENDER_ATTACHMENT, sample_count: 4,
+    });
+    packet.push(GpuCommand::CreateTexture {
+        texture_id: 811, width: 64, height: 64, format: TARGET_FORMAT_RGBA8UNORM,
+        usage: TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC,
+    });
+    packet.push(GpuCommand::CreateBuffer {
+        buffer_id: 812, size: 256 * 64,
+        usage: BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST,
+    });
+    if mode == 1 {
+        packet.push(GpuCommand::CreatePipelineMultisampled {
+            pipeline_id: 813,
+            wgsl_code: r#"
+@vertex fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
+    let positions = array<vec2<f32>, 3>(
+        vec2<f32>(-0.5, -0.5), vec2<f32>(0.5, -0.5), vec2<f32>(0.0, 0.5));
+    return vec4<f32>(positions[index], 0.0, 1.0);
+}
+@fragment fn fs_main() -> @location(0) vec4<f32> {
+    return vec4<f32>(1.0, 0.0, 0.0, 1.0);
+}
+"#.to_string(),
+            target_format: TARGET_FORMAT_RGBA8UNORM,
+            has_vertex_buffer: false, has_uniform_buffer: false,
+            uniform_size: 0, vertex_stride: 0, sample_count: 4,
+        });
+    }
+    let mut color = ColorAttachment::new_clear(
+        ResourceId::new(810), if mode == 0 { [1.0, 0.0, 0.0, 1.0] } else { [0.0, 0.0, 0.0, 1.0] },
+    );
+    color.resolve_target = Some(ResourceId::new(811));
+    color.store_op = StoreOp::Discard;
+    let mut render = Pass::new_render(PassId::new(1), "multisample_color")
+        .with_color_attachment(color);
+    if mode == 1 {
+        render.draws.push(Draw::new(0, 813, 3, 0, Vec::new()));
+    }
+    let copy = Pass::new_copy(PassId::new(2), "resolved_readback")
+        .with_dependency(render.id)
+        .with_copy(CopyCommand::TextureToBuffer {
+            texture_id: ResourceId::new(811), buffer_id: ResourceId::new(812),
+            width: 64, height: 64, bytes_per_row: 256,
+        });
+    let mut graph = PassGraph::new();
+    graph.add_pass(render).map_err(|e| PacketEncodeError::InvalidDimensions(e.to_string()))?;
+    graph.add_pass(copy).map_err(|e| PacketEncodeError::InvalidDimensions(e.to_string()))?;
+    let plan = graph.compile(None).map_err(|e| PacketEncodeError::InvalidDimensions(e.to_string()))?;
+    for command in lower_plan(&plan).map_err(|e| PacketEncodeError::InvalidDimensions(e.to_string()))? {
+        packet.push(command);
+    }
+    with_global_resource_table(|table| {
+        for id in [810, 811, 812, 813] { table.register(id); }
+    });
+    Ok(packet)
+}
+
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+#[wasm_bindgen]
+/// Encode the offscreen MSAA resolve probe through the same path as native tests.
+pub fn f3d_build_multisample_packet(mode: u32) -> Result<Vec<u8>, JsValue> {
+    build_multisample_submission(mode).and_then(|packet| packet.encode())
+        .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+#[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
+/// Native entry point for the offscreen MSAA resolve probe.
+pub fn f3d_build_multisample_packet(mode: u32) -> Result<Vec<u8>, String> {
+    build_multisample_submission(mode).and_then(|packet| packet.encode()).map_err(|e| e.to_string())
 }
 
 /// Builds a real WGSL triangle submission packet using `f3d_core::layout::AffineRows`
@@ -10446,14 +10657,107 @@ mod tests {
                 let mut graph = PassGraph::new();
                 graph.add_pass(pass).unwrap();
                 let plan = graph.compile(None).expect("legal resolve usage");
-                assert_eq!(
-                    lower_plan(&plan),
-                    Err(PlanLoweringError::UnsupportedResolveTarget {
-                        segment_name: "resolve_pass".to_string(),
-                        resolve_target: 11,
-                    }),
-                );
+                let commands = lower_plan(&plan).expect("color resolve is lowered");
+                assert!(matches!(
+                    commands.as_slice(),
+                    [GpuCommand::RenderPassResolve {
+                        target_type: TARGET_OFFSCREEN, target_id: 10, resolve_target_id: 11,
+                        vertex_count, load_op: LOAD_OP_CLEAR, store_op: actual_store,
+                        pass_flags: PASS_FLAG_NEW_PASS, ..
+                    }] if *vertex_count == if with_draw { 3 } else { 0 }
+                        && *actual_store == if store_op == StoreOp::Discard { STORE_OP_DISCARD } else { STORE_OP_STORE }
+                ));
             }
+        }
+    }
+
+    #[test]
+    fn multisample_probe_encodes_graph_resolve_before_readback() {
+        for mode in [0, 1] {
+            let packet = build_multisample_submission(mode).unwrap();
+            let bytes = packet.encode().unwrap();
+            let u32_at = |offset| u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+            let opcode_at = |offset| u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap());
+            assert_eq!(u32_at(8), if mode == 0 { 5 } else { 6 });
+            assert_eq!(opcode_at(16), OPCODE_CREATE_TEXTURE_MULTISAMPLED);
+            assert_eq!(u32_at(18), 810);
+            assert_eq!(u32_at(38), 4);
+            assert_eq!(opcode_at(42), OPCODE_CREATE_TEXTURE);
+            assert_eq!(u32_at(44), 811);
+            assert_eq!(opcode_at(64), OPCODE_CREATE_BUFFER);
+            let render_start = if mode == 0 { 78 } else {
+                assert_eq!(opcode_at(78), OPCODE_CREATE_PIPELINE_MULTISAMPLED);
+                assert_eq!(u32_at(112), 4);
+                116
+            };
+            assert_eq!(opcode_at(render_start), OPCODE_RENDER_PASS_RESOLVE);
+            assert_eq!(u32_at(render_start + 6), 810);
+            assert_eq!(u32_at(render_start + 46), 811);
+            assert_eq!(unpack_store_op(u32_at(render_start + 2)), STORE_OP_DISCARD);
+            assert_eq!(opcode_at(render_start + 50), OPCODE_COPY_TEXTURE_TO_BUFFER);
+            assert_eq!(u32_at(render_start + 52), 811);
+            assert_eq!(u32_at(render_start + 56), 812);
+            assert_eq!(bytes.len() - u32_at(12) as usize, render_start + 76);
+            assert_eq!(f3d_build_multisample_packet(mode).unwrap(), bytes);
+        }
+        assert!(build_multisample_submission(2).is_err());
+    }
+
+    #[test]
+    fn multisample_encoding_rejects_invalid_counts_and_resolve_aliases() {
+        let packet = build_multisample_submission(1).unwrap();
+        for count in [0, 2, 8] {
+            for index in [0, 3] {
+                let mut command = packet.commands()[index].clone();
+                match &mut command {
+                    GpuCommand::CreateTextureMultisampled { sample_count, .. }
+                    | GpuCommand::CreatePipelineMultisampled { sample_count, .. } => *sample_count = count,
+                    _ => panic!("expected multisampled allocation"),
+                }
+                assert!(GpuSubmissionPacket::from_commands(vec![command]).encode().is_err());
+            }
+        }
+        for destination in [0, 810] {
+            let mut command = packet.commands()[4].clone();
+            match &mut command {
+                GpuCommand::RenderPassResolve { resolve_target_id, .. } => *resolve_target_id = destination,
+                _ => panic!("expected resolve command"),
+            }
+            assert!(GpuSubmissionPacket::from_commands(vec![command]).encode().is_err());
+        }
+    }
+
+    #[test]
+    fn resolve_lowering_rejects_unimplemented_attachment_combinations() {
+        use f3d_graph::{ColorAttachment, DepthStencilAttachment, Draw, PlanSegment};
+
+        for combination in ["canvas", "depth", "bundle"] {
+            let mut color = if combination == "canvas" {
+                ColorAttachment::new_canvas(ResourceId::new(10), [0.0; 4], Epoch::ZERO)
+            } else {
+                ColorAttachment::new_clear(ResourceId::new(10), [0.0; 4])
+            };
+            color.resolve_target = Some(ResourceId::new(11));
+            let mut pass = Pass::new_render(PassId::new(1), combination)
+                .with_color_attachment(color);
+            if combination == "depth" {
+                pass.depth_stencil_attachment = Some(DepthStencilAttachment::new_depth_clear(
+                    ResourceId::new(12), 1.0,
+                ));
+            }
+            if combination == "bundle" {
+                pass.draws.push(Draw::new_bundle(0, 100, 101, Vec::new()));
+            }
+            let plan = ExecutionPlan {
+                segments: vec![PlanSegment::from_pass(&pass)],
+                canvas_epoch: Some(Epoch::ZERO),
+                pass_count: 1,
+                split_count: 0,
+                split_reasons: Vec::new(),
+            };
+            assert_eq!(lower_plan(&plan), Err(PlanLoweringError::UnsupportedResolveTarget {
+                segment_name: combination.to_string(), resolve_target: 11,
+            }));
         }
     }
 

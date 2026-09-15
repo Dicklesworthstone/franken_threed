@@ -60,6 +60,7 @@ pub use gpu_host::{
     build_affine_rows_storage_upload_frame_submission,
     build_affine_rows_storage_upload_init_submission,
     build_buffer_copy_submission, build_bundle_then_direct_warm_cache_submission,
+    build_multisample_submission, f3d_build_multisample_packet,
     build_render_then_copy_submission,
     clear_borrowed_frame_packet,
     f3d_borrowed_frame_packet_len, f3d_borrowed_frame_packet_ptr,
@@ -89,6 +90,8 @@ pub use gpu_host::{
     OPCODE_COPY_BUFFER_TO_BUFFER, OPCODE_CREATE_COMPUTE_PIPELINE, OPCODE_DISPATCH_COMPUTE,
     OPCODE_CREATE_PIPELINE_CULL, OPCODE_CREATE_PIPELINE_DEPTH_CULL,
     OPCODE_CREATE_PIPELINE_DEPTH_CULL_COLOR,
+    OPCODE_CREATE_TEXTURE_MULTISAMPLED, OPCODE_CREATE_PIPELINE_MULTISAMPLED,
+    OPCODE_RENDER_PASS_RESOLVE,
 };
 
 pub use mesh::{

@@ -45,6 +45,7 @@
     import { testDeviceReplacement } from "./device_lifetime_test.js";
     import { testViewportScissor } from "./viewport_scissor_test.js";
     import { testDrawParameters } from "./draw_parameters_test.js";
+    import { testMultisampleResolve } from "./multisample_resolve_test.js";
     import { testMeshScene, testVisibleCanvasMeshScene, testMeshDepthScene, testMultiMeshBatchScene, testToonMeshScene } from "./mesh_scene_test.js";
     import { testDepthScene } from "./depth_test.js";
     import { testBufferCopy } from "./buffer_copy_test.js";
@@ -279,7 +280,16 @@
         logPass("wasm_runtime_linked", "Imported /pkg/f3d_runtime.js and initialized application Wasm");
 
         const searchParams = new URLSearchParams(window.location.search);
-        if (searchParams.get("lane") === "workload_b_measure") {
+        if (searchParams.get("lane") === "multisample_resolve") {
+          const bridge = new WebGpuBridgeHost();
+          try {
+            results.capabilityRecord = await bridge.negotiateAndCreateDevice({ requiredFeatures: [] });
+            logPass("multisample_color_resolve", await testMultisampleResolve(bridge, wasmExports.f3d_build_multisample_packet));
+            results.tests.multisample_color_resolve.implementation_owner = "Rust/Wasm graph and packet encoder; JavaScript WebGPU adapter";
+          } finally {
+            bridge.destroyDevice();
+          }
+        } else if (searchParams.get("lane") === "workload_b_measure") {
           if (await executeMeasurementPreflight(wasmExports)) {
             const bridge = new WebGpuBridgeHost();
             const cap = await bridge.negotiateAndCreateDevice({ requiredFeatures: [] });
@@ -1729,6 +1739,8 @@
         logPass("device_replacement_and_loss", await testDeviceReplacement(buildRedBlueFn));
         logPass("viewport_scissor_rectangles", await testViewportScissor(bridge, buildViewportScissorFn));
         logPass("draw_ranges_and_instances", await testDrawParameters(bridge, wasmExports.f3d_build_draw_parameters_packet));
+        logPass("multisample_color_resolve", await testMultisampleResolve(bridge, wasmExports.f3d_build_multisample_packet));
+        results.tests.multisample_color_resolve.implementation_owner = "Rust/Wasm graph and packet encoder; JavaScript WebGPU adapter";
         logPass("dynamic_mesh_scene", await testMeshScene(bridge, wasmExports));
         logPass("buffer_copy", await testBufferCopy(bridge, wasmExports, canvasContext));
         logPass("workload_b_storage_copy", await testWorkloadBStorageCopy(bridge, wasmExports));
