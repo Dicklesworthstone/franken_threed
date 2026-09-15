@@ -1776,6 +1776,13 @@ pub enum PlanLoweringError {
         /// Number of configured color attachments.
         count: usize,
     },
+    /// The current bridge packet cannot encode a color attachment resolve operation.
+    UnsupportedResolveTarget {
+        /// Diagnostic name of the pass segment.
+        segment_name: String,
+        /// Requested resolve destination that must not be silently omitted.
+        resolve_target: u32,
+    },
     /// Render segment configures a depth/stencil attachment (depth not yet supported by bridge lowering).
     UnsupportedDepthStencilAttachment {
         /// Diagnostic name of the pass segment.
@@ -1891,6 +1898,12 @@ impl core::fmt::Display for PlanLoweringError {
                 write!(
                     f,
                     "Render segment '{segment_name}' configures {count} color attachments; MRT is not supported by bridge lowering"
+                )
+            }
+            Self::UnsupportedResolveTarget { segment_name, resolve_target } => {
+                write!(
+                    f,
+                    "Render segment '{segment_name}' resolves into texture {resolve_target}; resolve operations are not supported by bridge lowering"
                 )
             }
             Self::UnsupportedDepthStencilAttachment { segment_name } => {
@@ -2085,6 +2098,12 @@ pub fn lower_plan(plan: &ExecutionPlan) -> Result<Vec<GpuCommand>, PlanLoweringE
                         segment_name: segment.name().to_string(),
                     });
                 };
+                if let Some(resolve_target) = ca.resolve_target() {
+                    return Err(PlanLoweringError::UnsupportedResolveTarget {
+                        segment_name: segment.name().to_string(),
+                        resolve_target: resolve_target.get(),
+                    });
+                }
                 let target_type = if ca.is_canvas() {
                     TARGET_CANVAS
                 } else {
@@ -10399,6 +10418,42 @@ mod tests {
                 assert_eq!(count, 2);
             }
             other => panic!("Expected UnsupportedMultipleColorAttachments error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_lower_plan_does_not_silently_omit_resolve_operations() {
+        use f3d_graph::{
+            pass::{ColorAttachment, Draw, Pass, PassId, StoreOp},
+            resource::ResourceId,
+            schedule::PassGraph,
+        };
+
+        // A resolve is still required for clear-only passes and when the
+        // multisampled source is discarded after resolving.
+        for with_draw in [false, true] {
+            for store_op in [StoreOp::Store, StoreOp::Discard] {
+                let mut attachment = ColorAttachment::new_clear(
+                    ResourceId::new(10), [1.0, 0.0, 0.0, 1.0],
+                );
+                attachment.resolve_target = Some(ResourceId::new(11));
+                attachment.store_op = store_op;
+                let mut pass = Pass::new_render(PassId::new(1), "resolve_pass")
+                    .with_color_attachment(attachment);
+                if with_draw {
+                    pass.draws.push(Draw::new(0, 100, 3, 0, Vec::new()));
+                }
+                let mut graph = PassGraph::new();
+                graph.add_pass(pass).unwrap();
+                let plan = graph.compile(None).expect("legal resolve usage");
+                assert_eq!(
+                    lower_plan(&plan),
+                    Err(PlanLoweringError::UnsupportedResolveTarget {
+                        segment_name: "resolve_pass".to_string(),
+                        resolve_target: 11,
+                    }),
+                );
+            }
         }
     }
 
