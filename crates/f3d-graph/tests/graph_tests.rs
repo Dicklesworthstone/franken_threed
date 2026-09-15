@@ -34,6 +34,86 @@ use f3d_graph::resource::{
 use f3d_graph::schedule::PassGraph;
 
 #[test]
+fn resolve_destination_is_recorded_as_a_write_before_later_sampling() {
+    let multisampled = ResourceId::new(710);
+    let resolved = ResourceId::new(711);
+    let output = ResourceId::new(712);
+    let mut attachment = ColorAttachment::new_clear(multisampled, [0.0, 0.0, 0.0, 1.0]);
+    attachment.resolve_target = Some(resolved);
+    // Discarding the multisampled contents does not discard the resolve output.
+    attachment.store_op = StoreOp::Discard;
+    let producer =
+        Pass::new_render(PassId::new(1), "msaa_resolve").with_color_attachment(attachment);
+    assert!(
+        producer
+            .all_uses()
+            .iter()
+            .any(|u| u.resource_id == resolved && u.access.is_write())
+    );
+
+    let consumer = Pass::new_render(PassId::new(2), "sample_resolved")
+        .with_dependency(producer.id)
+        .with_color_attachment(ColorAttachment::new_clear(output, [0.0, 0.0, 0.0, 1.0]))
+        .with_draw(Draw::new(
+            0,
+            1,
+            3,
+            0,
+            vec![ResourceUse::texture_sampled(
+                resolved,
+                DataVersion::INITIAL,
+                SubresourceRange::full_texture(),
+            )],
+        ));
+    let mut graph = PassGraph::new();
+    graph.add_pass(consumer).expect("add consumer");
+    graph.add_pass(producer).expect("add producer");
+    let plan = graph.compile(None).expect("resolve then sample is legal");
+    assert_eq!(plan.segments[0].pass_id, PassId::new(1));
+    assert!(
+        plan.segments[0]
+            .versioned_writes
+            .contains(&(resolved, DataVersion::INITIAL))
+    );
+    assert!(plan.segments[0].all_uses().iter().any(|u| {
+        u.resource_id == resolved && u.access == ResourceAccess::ColorAttachment
+    }));
+    assert!(
+        plan.segments[1]
+            .versioned_reads
+            .contains(&(resolved, DataVersion::INITIAL))
+    );
+}
+
+#[test]
+fn resolve_destination_cannot_be_sampled_in_its_render_pass() {
+    let multisampled = ResourceId::new(720);
+    let resolved = ResourceId::new(721);
+    let mut attachment = ColorAttachment::new_clear(multisampled, [0.0, 0.0, 0.0, 1.0]);
+    attachment.resolve_target = Some(resolved);
+    let pass = Pass::new_render(PassId::new(1), "sample_while_resolving")
+        .with_color_attachment(attachment)
+        .with_draw(Draw::new(
+            0,
+            1,
+            3,
+            0,
+            vec![ResourceUse::texture_sampled(
+                resolved,
+                DataVersion::INITIAL,
+                SubresourceRange::full_texture(),
+            )],
+        ));
+    let mut graph = PassGraph::new();
+    graph.add_pass(pass).expect("add conflicting pass");
+    assert!(matches!(
+        graph.compile(None),
+        Err(GraphError::Hazard(HazardError::AttachmentSamplingConflict { texture_id, .. }))
+            if texture_id == resolved.get()
+    ));
+}
+
+#[test]
 fn positive_legal_read_only_combinations_execute() {
     let mut graph = PassGraph::new();
     let p1_id = PassId::new(1);
@@ -200,15 +280,9 @@ fn negative_unsupported_feedback_loop_rejected_without_dropping_outputs() {
 
 #[test]
 fn positive_automatic_pass_splitting_preserves_targets_and_depth_stencil() {
-    // Root Review Defect (1) Counterexample / Positive:
-    // A legal multi-target pass where Draw 0 writes intermediate TexA and Draw 1
-    // samples TexA while writing to destination TexB, with active Depth/Stencil.
-    // Splitting into Pass1 and Pass2 MUST:
-    // 1. Store TexA and TexB in Pass1 (`StoreOp::Store`).
-    // 2. Preserve Depth/Stencil in Pass1 with `depth_store_op: Some(StoreOp::Store)`.
-    // 3. Preserve TexB in Pass2 with `LoadOp::Load` and `StoreOp::Store`.
-    // 4. Preserve Depth/Stencil in Pass2 with `depth_load_op: Some(LoadOp::Load)` and `depth_store_op: Some(StoreOp::Store)`.
-    // 5. NOT drop depth/stencil or destinations!
+    // First retain the attachment-feedback counterexample: the graph has no
+    // per-draw output mask proving that draw 1 writes only B. Then exercise a
+    // legal split for a buffer changing from vertex input to storage output.
     let tex_intermediate = ResourceId::new(100);
     let tex_destination = ResourceId::new(101);
     let tex_depth = ResourceId::new(102);
@@ -225,7 +299,7 @@ fn positive_automatic_pass_splitting_preserves_targets_and_depth_stencil() {
     ));
     pass.depth_stencil_attachment = Some(DepthStencilAttachment::new_depth_clear(tex_depth, 1.0));
 
-    // Draw 0: Writes to intermediate tex_intermediate
+    // Both color slots are declared for every draw.
     pass.draws.push(Draw::new(
         0,
         1,
@@ -239,7 +313,7 @@ fn positive_automatic_pass_splitting_preserves_targets_and_depth_stencil() {
         )],
     ));
 
-    // Draw 1: Samples intermediate tex_intermediate while writing to tex_destination
+    // This draw still has attachment A bound, even though it samples A.
     pass.draws.push(Draw::new(
         1,
         2,
@@ -255,7 +329,27 @@ fn positive_automatic_pass_splitting_preserves_targets_and_depth_stencil() {
         ],
     ));
 
+    assert!(!can_split_pass(&pass));
+    assert!(matches!(
+        split_pass_on_hazard(&pass, PassId::new(2)),
+        Err(HazardError::AttachmentSamplingConflict { texture_id, .. })
+            if texture_id == tex_intermediate.get()
+    ));
+    let mut conflicting_graph = PassGraph::new();
+    conflicting_graph.add_pass(pass.clone()).unwrap();
+    assert!(matches!(
+        conflicting_graph.compile(None),
+        Err(GraphError::Hazard(HazardError::AttachmentSamplingConflict { .. }))
+    ));
+
+    pass.draws[1].uses = vec![ResourceUse::buffer_storage_write(
+        buf_v, DataVersion::new(2), Some(0), Some(64),
+    )];
+    pass.history_dependencies.push(ResourceId::new(104));
     assert!(can_split_pass(&pass));
+    let split = split_pass_on_hazard(&pass, PassId::new(2)).unwrap();
+    assert_eq!(split[0].history_dependencies, pass.history_dependencies);
+    assert_eq!(split[1].history_dependencies, pass.history_dependencies);
 
     let mut graph = PassGraph::new();
     graph.add_pass(pass.clone()).expect("add pass");
@@ -275,12 +369,20 @@ fn positive_automatic_pass_splitting_preserves_targets_and_depth_stencil() {
     assert_eq!(dsa1.target_id, tex_depth);
     assert_eq!(dsa1.depth_store_op, Some(StoreOp::Store));
 
-    // Segment 2 (Pass 2): preserves destination TexB and depth with LoadOp::Load!
+    // Segment 2 preserves BOTH output slots, draw resources and depth.
     let seg2 = &plan.segments[1];
     assert_eq!(seg2.draws.len(), 1);
     assert_eq!(seg2.draws[0].draw_id, 1);
-    // Intermediate TexA is not bound as attachment in pass 2 (it is sampled)
-    assert!(!seg2.color_attachments.iter().any(|ca| ca.target_id == tex_intermediate));
+    assert_eq!(seg1.draws, pass.draws[..1]);
+    assert_eq!(seg2.draws, pass.draws[1..]);
+    for segment in [seg1, seg2] {
+        assert_eq!(
+            segment.color_attachments.iter().map(|ca| ca.target_id).collect::<Vec<_>>(),
+            vec![tex_intermediate, tex_destination],
+        );
+    }
+    assert_eq!(seg2.color_attachments[0].load_op, LoadOp::Load);
+    assert_eq!(seg2.color_attachments[0].store_op, StoreOp::Store);
     // Destination TexB is PRESERVED with LoadOp::Load and StoreOp::Store
     let ca2_dest = seg2
         .color_attachments
@@ -329,17 +431,63 @@ fn positive_automatic_pass_splitting_preserves_targets_and_depth_stencil() {
         assert_eq!(depth.depth_store_op, Some(depth_store));
         assert_eq!(depth.stencil_store_op, Some(stencil_store));
     }
+
+    // A resolve is a publication at the final boundary, not an intermediate store.
+    let resolved = ResourceId::new(105);
+    let mut resolving = pass.clone();
+    resolving.color_attachments[0].resolve_target = Some(resolved);
+    resolving.color_attachments[0].store_op = StoreOp::Discard;
+    let split = split_pass_on_hazard(&resolving, PassId::new(2)).unwrap();
+    assert_eq!(split[0].color_attachments[0].resolve_target, None);
+    assert_eq!(split[0].color_attachments[0].store_op, StoreOp::Store);
+    assert_eq!(split[1].color_attachments[0].resolve_target, Some(resolved));
+    assert_eq!(split[1].color_attachments[0].store_op, StoreOp::Discard);
+    assert!(!split[0].all_uses().iter().any(|u| u.resource_id == resolved));
+    assert!(split[1].all_uses().iter().any(|u| u.resource_id == resolved && u.access.is_write()));
+
+    // Do not erase an intra-draw conflict or implicit state at a new pass boundary.
+    let mut variants = Vec::new();
+    let mut within_draw = pass.clone();
+    within_draw.draws[1].uses.push(ResourceUse::buffer_vertex(
+        buf_v, DataVersion::INITIAL, Some(0), Some(64),
+    ));
+    variants.push(within_draw);
+    let mut viewport = pass.clone();
+    viewport.draws[0].viewport = Some([0, 0, 32, 32]);
+    variants.push(viewport);
+    let mut scissor = pass.clone();
+    scissor.draws[0].scissor = Some([0, 0, 16, 16]);
+    scissor.draws[0].scissor_test_enabled = true;
+    variants.push(scissor);
+    let mut warm = pass.clone();
+    warm.draws[1].assumes_warm_state = true;
+    variants.push(warm.clone());
+    warm.draws[0] = Draw::new_bundle(0, 1, 1, pass.draws[0].uses.clone());
+    variants.push(warm);
+    let mut missing_stencil_store = pass.clone();
+    let depth = missing_stencil_store.depth_stencil_attachment.as_mut().unwrap();
+    depth.stencil_read_only = false;
+    depth.stencil_load_op = Some(LoadOp::Clear);
+    depth.stencil_store_op = None;
+    variants.push(missing_stencil_store);
+    for variant in variants {
+        assert!(!can_split_pass(&variant));
+        assert!(matches!(
+            split_pass_on_hazard(&variant, PassId::new(2)),
+            Err(HazardError::WholeBufferConflict { .. })
+        ));
+    }
 }
 
 #[test]
 fn positive_automatic_pass_splitting_preserves_readonly_depth_matrix() {
-    // Tests pass splitting with Color A (intermediate) + Color B (destination) + Read-Only Depth D.
+    // Keep read-only depth while splitting a buffer usage transition.
     // Matrix covers depth sampling: neither draw, second draw only, and both draws (including
-    // draw 0 sampling D before the color hazard in draw 1, proving legal D sampling is not a false split point).
+    // draw 0 sampling D before the buffer hazard in draw 1).
     // In all variants:
     // 1. Splitting succeeds into 2 segments at draw 1.
     // 2. Both segments retain D with depth_read_only=true and absent (None) load/store ops.
-    // 3. Segment 1 stores A+B; Segment 2 drops A, loads B with LoadOp::Load, and stores B.
+    // 3. Both segments keep color slots A+B; only the intermediate segment forces Store.
     let tex_a = ResourceId::new(150);
     let tex_b = ResourceId::new(151);
     let tex_d = ResourceId::new(152);
@@ -370,6 +518,18 @@ fn positive_automatic_pass_splitting_preserves_readonly_depth_matrix() {
         }
         pass.draws.push(Draw::new(1, 2, 3, 0, draw1_uses));
 
+        // The former positive fixture silently dropped A. Preserve it as a
+        // negative case before testing an actual output-preserving split.
+        assert!(!can_split_pass(&pass));
+        assert!(matches!(
+            split_pass_on_hazard(&pass, PassId::new(2)),
+            Err(HazardError::AttachmentSamplingConflict { texture_id, .. })
+                if texture_id == tex_a.get()
+        ));
+        pass.draws[1].uses.retain(|u| u.resource_id != tex_a && u.resource_id != buf_v);
+        pass.draws[1].uses.push(ResourceUse::buffer_storage_write(
+            buf_v, DataVersion::new(2), Some(0), Some(64),
+        ));
         assert!(can_split_pass(&pass));
 
         let mut graph = PassGraph::new();
@@ -394,11 +554,14 @@ fn positive_automatic_pass_splitting_preserves_readonly_depth_matrix() {
         assert_eq!(d1.stencil_load_op, None);
         assert_eq!(d1.stencil_store_op, None);
 
-        // Segment 2 (draw 1): drops sampled intermediate A, preserves B, preserves read-only depth with absent ops
+        // Segment 2 preserves both color slots and read-only depth with absent ops.
         let s2 = &plan.segments[1];
         assert_eq!(s2.draws.len(), 1);
         assert_eq!(s2.draws[0].draw_id, 1);
-        assert!(!s2.color_attachments.iter().any(|ca| ca.target_id == tex_a));
+        assert_eq!(s2.color_attachments[0].target_id, tex_a);
+        assert_eq!(s2.color_attachments[1].target_id, tex_b);
+        assert_eq!(s2.color_attachments[0].load_op, LoadOp::Load);
+        assert_eq!(s2.color_attachments[0].store_op, StoreOp::Store);
         let ca_b = s2.color_attachments.iter().find(|ca| ca.target_id == tex_b).expect("seg2 color b");
         assert_eq!(ca_b.load_op, LoadOp::Load);
         assert_eq!(ca_b.store_op, StoreOp::Store);
@@ -449,14 +612,9 @@ fn test_split_rewires_downstream_consumers_to_final_segment() {
         2,
         3,
         0,
-        vec![
-            ResourceUse::buffer_vertex(buf_v, DataVersion::INITIAL, Some(0), Some(64)),
-            ResourceUse::texture_sampled(
-                tex_intermediate,
-                DataVersion::INITIAL,
-                SubresourceRange::full_texture(),
-            ),
-        ],
+        vec![ResourceUse::buffer_storage_write(
+            buf_v, DataVersion::new(2), Some(0), Some(64),
+        )],
     ));
 
     // Downstream consumer Pass 2 depends on Pass 1

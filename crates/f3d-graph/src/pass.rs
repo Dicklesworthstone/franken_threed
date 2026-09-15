@@ -141,7 +141,7 @@ impl ColorAttachment {
         }
     }
 
-    /// Produce the declared resource usage for this attachment.
+    /// Produce the declared resource usage for the primary attachment.
     pub fn to_resource_use(&self, version: DataVersion) -> ResourceUse {
         let (kind, ver) = if let Some(epoch) = self.canvas_epoch {
             (ResourceKind::CanvasOutput, DataVersion::new(epoch.get()))
@@ -158,6 +158,22 @@ impl ColorAttachment {
             byte_size: None,
             canvas_epoch: self.canvas_epoch,
         }
+    }
+
+    /// Include the resolve destination, even when the multisampled source is discarded.
+    pub(crate) fn resource_uses(&self, version: DataVersion) -> impl Iterator<Item = ResourceUse> {
+        let resolve_use = self.resolve_target.map(|resource_id| ResourceUse {
+            resource_id,
+            kind: ResourceKind::Texture,
+            version,
+            // The current resolve-target representation contains no view range.
+            subresource: SubresourceRange::full_texture(),
+            access: ResourceAccess::ColorAttachment,
+            byte_offset: None,
+            byte_size: None,
+            canvas_epoch: None,
+        });
+        core::iter::once(self.to_resource_use(version)).chain(resolve_use)
     }
 
     /// Target resource identifier.
@@ -1114,7 +1130,7 @@ impl Pass {
         let mut uses = Vec::new();
         // Color attachments write at default version
         for ca in &self.color_attachments {
-            uses.push(ca.to_resource_use(DataVersion::INITIAL));
+            uses.extend(ca.resource_uses(DataVersion::INITIAL));
         }
         if let Some(ref dsa) = self.depth_stencil_attachment {
             uses.push(dsa.to_resource_use(DataVersion::INITIAL));

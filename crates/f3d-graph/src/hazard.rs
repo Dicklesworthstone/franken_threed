@@ -6,8 +6,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::error::HazardError;
-use crate::pass::{ColorAttachment, Draw, LoadOp, Pass, PassId, PassKind, StoreOp};
-use crate::resource::{ResourceAccess, ResourceId, ResourceKind, SubresourceRange};
+use crate::pass::{Draw, LoadOp, Pass, PassId, PassKind, StoreOp};
+use crate::resource::{ResourceAccess, ResourceKind, SubresourceRange};
 
 /// Validates usage-scope rules for a single pass according to WebGPU specifications (§8.5, [S51]).
 ///
@@ -60,7 +60,7 @@ fn validate_render_pass_hazards(pass: &Pass) -> Result<(), HazardError> {
     // 2. Collect all attachment uses
     let mut attachment_uses = Vec::new();
     for ca in &pass.color_attachments {
-        attachment_uses.push(ca.to_resource_use(f3d_core::ownership::DataVersion::INITIAL));
+        attachment_uses.extend(ca.resource_uses(f3d_core::ownership::DataVersion::INITIAL));
     }
     if let Some(ref dsa) = pass.depth_stencil_attachment {
         attachment_uses.push(dsa.to_resource_use(f3d_core::ownership::DataVersion::INITIAL));
@@ -338,84 +338,89 @@ fn validate_copy_pass_hazards(pass: &Pass) -> Result<(), HazardError> {
     Ok(())
 }
 
-/// Evaluates whether a pass has hazards that can be resolved by pass splitting without dropping outputs.
+/// Whether two output-preserving passes can resolve a cross-draw buffer usage conflict.
 ///
-/// Invariant: Splitting is legal ONLY when draws can be partitioned such that:
-/// 1. Earlier draws write to an intermediate target.
-/// 2. Later draws sample that intermediate target and output to distinct targets.
-/// 3. Later draws do NOT attempt to write to the sampled target (unsupported feedback loop).
-/// 4. Depth/stencil state is preserved across split segments without discarding depth outputs.
+/// Color attachment slots apply to every draw. Without per-draw output declarations,
+/// sampling an attachment cannot justify removing that attachment from a later segment.
 #[must_use]
 pub fn can_split_pass(pass: &Pass) -> bool {
-    if pass.kind != PassKind::Render || pass.draws.len() < 2 {
-        return false;
-    }
-    let split_idx = match find_attachment_sampling_split_point(pass) {
-        Some(idx) if idx > 0 => idx,
-        _ => return false,
-    };
-
-    let (_, second_draws) = pass.draws.split_at(split_idx);
-
-    let mut attachment_ids = Vec::new();
-    for ca in &pass.color_attachments {
-        attachment_ids.push(ca.target_id);
-    }
-    if let Some(ref dsa) = pass.depth_stencil_attachment {
-        attachment_ids.push(dsa.target_id);
-    }
-
-    let sampled_ids: Vec<ResourceId> = second_draws
-        .iter()
-        .flat_map(|d| d.uses.iter())
-        .filter(|u| u.access.is_sampled() && attachment_ids.contains(&u.resource_id))
-        .map(|u| u.resource_id)
-        .collect();
-
-    // If all color attachments in the pass are sampled in second_draws,
-    // second_draws has no separate legal destination; dropping them is illegal feedback.
-    let remaining_color_targets: Vec<&ColorAttachment> = pass
-        .color_attachments
-        .iter()
-        .filter(|ca| !sampled_ids.contains(&ca.target_id))
-        .collect();
-
-    if remaining_color_targets.is_empty() && !pass.color_attachments.is_empty() {
-        return false;
-    }
-
-    // If depth/stencil is sampled in second_draws and depth or stencil is writable, that is also unsupported feedback.
-    if let Some(ref dsa) = pass.depth_stencil_attachment {
-        if sampled_ids.contains(&dsa.target_id) && (!dsa.depth_read_only || !dsa.stencil_read_only) {
-            return false;
-        }
-    }
-
-    true
+    output_preserving_split(pass).is_some()
 }
 
-/// Finds the draw index where an attachment is first sampled.
-fn find_attachment_sampling_split_point(pass: &Pass) -> Option<usize> {
-    let mut attachment_ids = Vec::new();
-    for ca in &pass.color_attachments {
-        attachment_ids.push(ca.target_id);
-    }
-    if let Some(ref dsa) = pass.depth_stencil_attachment {
-        // Read-only depth-stencil attachments can legally be sampled without hazard (§8.5).
-        // Only writable depth/stencil attachments can create attachment-sampling conflicts.
-        if !dsa.depth_read_only || !dsa.stencil_read_only {
-            attachment_ids.push(dsa.target_id);
-        }
+/// Build at most two segments, preserving every output and its attachment location.
+fn output_preserving_split(pass: &Pass) -> Option<(Pass, Pass)> {
+    if pass.kind != PassKind::Render
+        || !pass.dispatches.is_empty()
+        || !matches!(validate_pass_hazards(pass), Err(HazardError::WholeBufferConflict { .. }))
+    {
+        return None;
     }
 
-    for (draw_idx, draw) in pass.draws.iter().enumerate() {
-        for u in &draw.uses {
-            if u.access.is_sampled() && attachment_ids.contains(&u.resource_id) {
-                return Some(draw_idx);
+    // The first cross-draw conflict determines the boundary. Both halves must
+    // validate independently; within-draw conflicts cannot be repaired by splitting.
+    let split_idx = (1..pass.draws.len()).find(|&idx| {
+        pass.draws[idx].uses.iter().any(|current| {
+            current.kind == ResourceKind::Buffer
+                && pass.draws[..idx].iter().flat_map(|draw| &draw.uses).any(|prior| {
+                    prior.kind == ResourceKind::Buffer
+                        && prior.resource_id == current.resource_id
+                        && !prior.access.is_compatible_with(&current.access)
+                })
+        })
+    })?;
+
+    // The current graph does not materialize inherited viewport/scissor state.
+    // Refuse a boundary that would reset it or rely on warm bindings from the prefix.
+    if pass.draws[split_idx].assumes_warm_state
+        || pass.draws[..split_idx].iter().any(|draw| {
+            draw.viewport.is_some() || draw.scissor.is_some() || draw.scissor_test_enabled
+        })
+    {
+        return None;
+    }
+
+    let mut first = pass.clone();
+    first.draws.truncate(split_idx);
+    let mut last = pass.clone();
+    last.draws = pass.draws[split_idx..].to_vec();
+
+    for (intermediate, final_attachment) in first.color_attachments.iter_mut()
+        .zip(&mut last.color_attachments)
+    {
+        intermediate.store_op = StoreOp::Store;
+        // Publish the resolve only at the source pass's final boundary.
+        intermediate.resolve_target = None;
+        final_attachment.load_op = LoadOp::Load;
+    }
+
+    if let (Some(intermediate), Some(final_attachment)) =
+        (&mut first.depth_stencil_attachment, &mut last.depth_stencil_attachment)
+    {
+        if !intermediate.depth_read_only {
+            match (intermediate.depth_load_op, intermediate.depth_store_op) {
+                (Some(_), Some(_)) => {
+                    intermediate.depth_store_op = Some(StoreOp::Store);
+                    final_attachment.depth_load_op = Some(LoadOp::Load);
+                }
+                (None, None) => {}
+                _ => return None,
+            }
+        }
+        if !intermediate.stencil_read_only {
+            match (intermediate.stencil_load_op, intermediate.stencil_store_op) {
+                (Some(_), Some(_)) => {
+                    intermediate.stencil_store_op = Some(StoreOp::Store);
+                    final_attachment.stencil_load_op = Some(LoadOp::Load);
+                }
+                (None, None) => {}
+                _ => return None,
             }
         }
     }
-    None
+
+    validate_pass_hazards(&first).ok()?;
+    validate_pass_hazards(&last).ok()?;
+    Some((first, last))
 }
 
 /// Splits a conflicting render pass into two sequential legal passes.
@@ -424,91 +429,16 @@ fn find_attachment_sampling_split_point(pass: &Pass) -> Option<usize> {
 /// Does NOT silently drop sampled outputs or depth/stencil state!
 /// The second pass loads existing contents (`LoadOp::Load`) from the first pass's store (`StoreOp::Store`).
 pub fn split_pass_on_hazard(pass: &Pass, next_pass_id: PassId) -> Result<Vec<Pass>, HazardError> {
-    if pass.kind != PassKind::Render {
-        return validate_pass_hazards(pass).map(|()| vec![pass.clone()]);
-    }
-
-    // Check if initial pass is already legal
-    if validate_pass_hazards(pass).is_ok() {
-        return Ok(vec![pass.clone()]);
-    }
-
-    // If the pass cannot be split without dropping outputs or resolving unsupported feedback,
-    // reject with the precise hazard error.
-    if !can_split_pass(pass) {
-        return Err(validate_pass_hazards(pass).unwrap_err());
-    }
-
-    let split_idx = find_attachment_sampling_split_point(pass).unwrap();
-    let (first_draws, second_draws) = pass.draws.split_at(split_idx);
-
-    let mut attachment_ids = Vec::new();
-    for ca in &pass.color_attachments {
-        attachment_ids.push(ca.target_id);
-    }
-    if let Some(ref dsa) = pass.depth_stencil_attachment {
-        attachment_ids.push(dsa.target_id);
-    }
-
-    let sampled_ids: Vec<ResourceId> = second_draws
-        .iter()
-        .flat_map(|d| d.uses.iter())
-        .filter(|u| u.access.is_sampled() && attachment_ids.contains(&u.resource_id))
-        .map(|u| u.resource_id)
-        .collect();
-
-    // Pass 1: Executes draws before the sampling conflict, stores all results
-    let mut pass1 = pass.clone();
+    let original_error = match validate_pass_hazards(pass) {
+        Ok(()) => return Ok(vec![pass.clone()]),
+        Err(error) => error,
+    };
+    let Some((mut pass1, mut pass2)) = output_preserving_split(pass) else {
+        return Err(original_error);
+    };
     pass1.name = alloc::format!("{}_part1", pass.name);
-    pass1.draws = first_draws.to_vec();
-    for ca in &mut pass1.color_attachments {
-        ca.store_op = StoreOp::Store;
-    }
-    if let Some(ref mut dsa) = pass1.depth_stencil_attachment {
-        if !dsa.depth_read_only {
-            dsa.depth_store_op = Some(StoreOp::Store);
-        }
-        if !dsa.stencil_read_only && dsa.stencil_store_op.is_some() {
-            dsa.stencil_store_op = Some(StoreOp::Store);
-        }
-    }
-
-    // Pass 2: Loads results from pass 1, depends on pass 1, executes remaining draws
-    let mut pass2 = Pass::new_render(next_pass_id, alloc::format!("{}_part2", pass.name));
+    pass2.id = next_pass_id;
+    pass2.name = alloc::format!("{}_part2", pass.name);
     pass2.dependencies = vec![pass1.id];
-    pass2.draws = second_draws.to_vec();
-
-    // Preserve final store/discard operations; only the intermediate pass must store.
-    // Keep color attachments that are not sampled in pass 2 (distinct legal destinations).
-    for ca in &pass.color_attachments {
-        if !sampled_ids.contains(&ca.target_id) {
-            let mut ca2 = ca.clone();
-            ca2.load_op = LoadOp::Load;
-            pass2.color_attachments.push(ca2);
-        }
-    }
-
-    // PRESERVE depth/stencil attachment in Pass 2!
-    // Read-only depth-stencil attachments can legally be sampled in Pass 2 and must not be dropped.
-    // Read-only attachments retain absent (None) load/store operations.
-    if let Some(ref dsa) = pass.depth_stencil_attachment {
-        let is_sampled = sampled_ids.contains(&dsa.target_id);
-        let is_read_only = dsa.depth_read_only && dsa.stencil_read_only;
-        if !is_sampled || is_read_only {
-            let mut dsa2 = dsa.clone();
-            if !dsa2.depth_read_only {
-                dsa2.depth_load_op = Some(LoadOp::Load);
-            }
-            if !dsa2.stencil_read_only && dsa2.stencil_load_op.is_some() {
-                dsa2.stencil_load_op = Some(LoadOp::Load);
-            }
-            pass2.depth_stencil_attachment = Some(dsa2);
-        }
-    }
-
-    // Strict validation of both split passes
-    validate_pass_hazards(&pass1)?;
-    validate_pass_hazards(&pass2)?;
-
     Ok(vec![pass1, pass2])
 }

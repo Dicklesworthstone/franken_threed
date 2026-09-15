@@ -77,7 +77,7 @@ impl PlanSegment {
     pub fn all_uses(&self) -> Vec<ResourceUse> {
         let mut uses = Vec::new();
         for ca in &self.color_attachments {
-            uses.push(ca.to_resource_use(DataVersion::INITIAL));
+            uses.extend(ca.resource_uses(DataVersion::INITIAL));
         }
         if let Some(ref dsa) = self.depth_stencil_attachment {
             uses.push(dsa.to_resource_use(DataVersion::INITIAL));
