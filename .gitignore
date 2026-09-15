@@ -197,3 +197,9 @@ Desktop.ini
 
 # git-repo-janitor skill scratch workspace
 .repo_janitor_workspace/
+# Per-machine beads marker (not tracker state).
+.beads/.local_version
+# Accidental empty files at repo root (opcode numbers redirected to cwd).
+/8
+/16
+/24
