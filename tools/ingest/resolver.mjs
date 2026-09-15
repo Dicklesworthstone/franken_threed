@@ -82,7 +82,7 @@ function matchImportMap(specifier, referrerUrl, importMap, mapBaseUrl) {
     }
     for (const scopeBase of [...scopes.keys()].sort().reverse()) {
       if (referrerUrl === scopeBase || (scopeBase.endsWith('/') && referrerUrl.startsWith(scopeBase))) {
-        const match = matchMapEntries(specifier, scopes.get(scopeBase), mapBaseUrl);
+        const match = matchMapEntries(specifier, referrerUrl, scopes.get(scopeBase), mapBaseUrl);
         if (match !== null) return match;
       }
     }
@@ -90,43 +90,107 @@ function matchImportMap(specifier, referrerUrl, importMap, mapBaseUrl) {
 
   // 2. Check top-level imports
   if (importMap.imports && typeof importMap.imports === 'object') {
-    return matchMapEntries(specifier, importMap.imports, mapBaseUrl);
+    return matchMapEntries(specifier, referrerUrl, importMap.imports, mapBaseUrl);
   }
 
   return null;
 }
 
 /**
+ * Normalizes an import map specifier key per WHATWG:
+ * - Empty string returns null (ignored).
+ * - Relative/pathname ("/", "./", "../") or absolute URL is resolved against mapBaseUrl.
+ * - Bare specifiers return the bare key unmodified.
+ * @param {string} key
+ * @param {string} mapBaseUrl
+ * @returns {string | null}
+ */
+function normalizeSpecifierKey(key, mapBaseUrl) {
+  if (key === '') return null;
+  if (key.startsWith('/') || key.startsWith('./') || key.startsWith('../')) {
+    try {
+      return new URL(key, mapBaseUrl).href;
+    } catch {
+      return null;
+    }
+  }
+  try {
+    return new URL(key).href;
+  } catch {
+    return key;
+  }
+}
+
+/**
+ * Normalizes a requested specifier per WHATWG:
+ * - Relative/pathname ("/", "./", "../") or absolute URL is resolved against referrerUrl.
+ * - Bare specifiers return the bare key unmodified.
  * @param {string} specifier
+ * @param {string} referrerUrl
+ * @returns {string}
+ */
+function normalizeRequestSpecifier(specifier, referrerUrl) {
+  if (specifier.startsWith('/') || specifier.startsWith('./') || specifier.startsWith('../')) {
+    try {
+      return new URL(specifier, referrerUrl).href;
+    } catch {
+      return specifier;
+    }
+  }
+  try {
+    return new URL(specifier).href;
+  } catch {
+    return specifier;
+  }
+}
+
+/**
+ * Matches a request specifier against import map entries per WHATWG.
+ * Normalizes URL-like keys and request specifier; preserves bare specifiers.
+ * Evaluates exact match then longest prefix match.
+ *
+ * @param {string} specifier
+ * @param {string} referrerUrl
  * @param {Record<string, string | null>} entries
  * @param {string} mapBaseUrl
  * @returns {string | { blocked: true } | { error: string } | null}
  */
-function matchMapEntries(specifier, entries, mapBaseUrl) {
-  // Exact match
-  if (Object.prototype.hasOwnProperty.call(entries, specifier)) {
-    const target = entries[specifier];
+function matchMapEntries(specifier, referrerUrl, entries, mapBaseUrl) {
+  const normalizedSpecifier = normalizeRequestSpecifier(specifier, referrerUrl);
+
+  const normalizedEntries = new Map();
+  for (const rawKey of Object.keys(entries)) {
+    const normKey = normalizeSpecifierKey(rawKey, mapBaseUrl);
+    if (normKey === null) continue;
+    normalizedEntries.set(normKey, { rawKey, target: entries[rawKey] });
+  }
+
+  // 1. Exact match
+  if (normalizedEntries.has(normalizedSpecifier)) {
+    const { target } = normalizedEntries.get(normalizedSpecifier);
     if (target === null) {
       return { blocked: true };
     }
     return new URL(target, mapBaseUrl).href;
   }
 
-  // Prefix match (for keys ending with '/')
-  const prefixKeys = Object.keys(entries).filter(k => k.endsWith('/')).sort((a, b) => b.length - a.length);
-  for (const prefix of prefixKeys) {
-    if (specifier.startsWith(prefix)) {
-      const targetPrefix = entries[prefix];
-      if (targetPrefix === null) {
+  // 2. Prefix match (for keys ending with '/')
+  const prefixEntries = [...normalizedEntries.entries()]
+    .filter(([normKey, { rawKey }]) => rawKey.endsWith('/') && normKey.endsWith('/'))
+    .sort((a, b) => b[0].length - a[0].length);
+
+  for (const [normKey, { rawKey, target }] of prefixEntries) {
+    if (normalizedSpecifier.startsWith(normKey)) {
+      if (target === null) {
         return { blocked: true };
       }
-      if (typeof targetPrefix !== 'string' || !targetPrefix.endsWith('/')) {
+      if (typeof target !== 'string' || !target.endsWith('/')) {
         return {
-          error: `Invalid import map prefix mapping: target for prefix "${prefix}" must end with "/" (got "${targetPrefix}")`
+          error: `Invalid import map prefix mapping: target for prefix "${rawKey}" must end with "/" (got "${target}")`
         };
       }
-      const remainder = specifier.slice(prefix.length);
-      const combined = targetPrefix + remainder;
+      const remainder = normalizedSpecifier.slice(normKey.length);
+      const combined = target + remainder;
       return new URL(combined, mapBaseUrl).href;
     }
   }

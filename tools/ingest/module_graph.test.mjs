@@ -1998,3 +1998,101 @@ test('Regression: resolveExportTargetValue null target blocks fallback and throw
     './build/default.js'
   );
 });
+
+// ---------------------------------------------------------------------------
+// WHATWG IMPORT-MAP SPECIFIER KEY NORMALIZATION & MATCHING (6mv.1)
+// ---------------------------------------------------------------------------
+
+test('Regression (6mv.1): WHATWG import-map URL key normalization and request matching', () => {
+  const mapBaseUrl = 'https://example.com/app/index.html';
+  const imports = {
+    './dep.js': './replacement.js',
+    'bare-pkg': './vendor/bare.js',
+    './modules/': './vendor/modules/',
+    './blocked.js': null,
+  };
+
+  // Case 1: ./dep.js from nested does not match normalized key /app/dep.js; resolves relative to referrer
+  assert.equal(
+    resolveModuleSpecifier('./dep.js', 'https://example.com/app/nested/main.js', { imports }, { mapBaseUrl }),
+    'https://example.com/app/nested/dep.js'
+  );
+
+  // Case 2: absolute URL https://example.com/app/dep.js matches normalized key /app/dep.js
+  assert.equal(
+    resolveModuleSpecifier('https://example.com/app/dep.js', 'https://example.com/app/main.js', { imports }, { mapBaseUrl }),
+    'https://example.com/app/replacement.js'
+  );
+
+  // Case 3: same-directory relative ./dep.js matches normalized key /app/dep.js
+  assert.equal(
+    resolveModuleSpecifier('./dep.js', 'https://example.com/app/main.js', { imports }, { mapBaseUrl }),
+    'https://example.com/app/replacement.js'
+  );
+
+  // Case 4: bare key stays bare and matches bare specifiers only, not relative ./bare-pkg
+  assert.equal(
+    resolveModuleSpecifier('bare-pkg', 'https://example.com/app/main.js', { imports }, { mapBaseUrl }),
+    'https://example.com/app/vendor/bare.js'
+  );
+  assert.equal(
+    resolveModuleSpecifier('./bare-pkg', 'https://example.com/app/main.js', { imports }, { mapBaseUrl }),
+    'https://example.com/app/bare-pkg'
+  );
+
+  // Case 5: normalized prefix key ending in "/" maps matching paths and handles subpaths
+  assert.equal(
+    resolveModuleSpecifier('./modules/sub/util.js', 'https://example.com/app/main.js', { imports }, { mapBaseUrl }),
+    'https://example.com/app/vendor/modules/sub/util.js'
+  );
+  assert.equal(
+    resolveModuleSpecifier('https://example.com/app/modules/sub/util.js', 'https://example.com/other/main.js', { imports }, { mapBaseUrl }),
+    'https://example.com/app/vendor/modules/sub/util.js'
+  );
+  assert.equal(
+    resolveModuleSpecifier('./modules/sub/util.js', 'https://example.com/app/nested/main.js', { imports }, { mapBaseUrl }),
+    'https://example.com/app/nested/modules/sub/util.js'
+  );
+
+  // Case 6: null blocking on normalized URL key
+  assert.throws(
+    () => resolveModuleSpecifier('https://example.com/app/blocked.js', 'https://example.com/app/main.js', { imports }, { mapBaseUrl }),
+    IngestionResolutionError
+  );
+});
+
+test('Regression (6mv.1): Duplicate normalized keys in imports let later entries win', () => {
+  const mapBaseUrl = 'https://example.com/app/index.html';
+  const exactImports = {
+    './dep.js': './first.js',
+    'https://example.com/app/dep.js': './second.js',
+  };
+  assert.equal(
+    resolveModuleSpecifier('./dep.js', 'https://example.com/app/main.js', { imports: exactImports }, { mapBaseUrl }),
+    'https://example.com/app/second.js'
+  );
+
+  const prefixImports = {
+    './modules/': './first_modules/',
+    'https://example.com/app/modules/': './second_modules/',
+  };
+  assert.equal(
+    resolveModuleSpecifier('./modules/util.js', 'https://example.com/app/main.js', { imports: prefixImports }, { mapBaseUrl }),
+    'https://example.com/app/second_modules/util.js'
+  );
+
+  const scopeOptions = { mapBaseUrl: 'https://example.com/app/index.html' };
+  const scopeImports = { lib: 'https://cdn.example/default.js' };
+  const exactLib = { lib: 'https://cdn.example/exact.js' };
+  const broadLib = { lib: 'https://cdn.example/broad.js' };
+  assert.equal(
+    resolveModuleSpecifier('lib', 'https://example.com/app/a', {
+      imports: scopeImports,
+      scopes: {
+        './a': exactLib,
+        'https://example.com/app/a': broadLib,
+      },
+    }, scopeOptions),
+    broadLib.lib
+  );
+});
