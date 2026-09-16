@@ -103,8 +103,8 @@ export function specializeNumericModule(source, {
   for (const statement of ast.body) {
     const fn = ['ExportNamedDeclaration', 'ExportDefaultDeclaration'].includes(statement.type)
       ? statement.declaration : statement;
-    if (fn?.type !== 'FunctionDeclaration' || !fn.id || fn.body.body.length !== 1 ||
-        fn.body.body[0].type !== 'ForStatement') continue;
+    if (fn?.type !== 'FunctionDeclaration' || !fn.id || fn.body.body.at(-1)?.type !== 'ForStatement' ||
+        fn.body.body.slice(0, -1).some(node => node.type !== 'VariableDeclaration')) continue;
     const item = { functionName: fn.id.name, sourceSpan: span(fn), route: 'retained-js', reason: null, calls: [] };
     report.candidates.push(item);
     // Rebinding before this module's evaluation is possible through an ESM
@@ -131,14 +131,26 @@ export function specializeNumericModule(source, {
       item.detail = error.message;
       continue;
     }
-    // Two bounded AOT variants cover homogeneous Float64Array and Float32Array
-    // updates. Mixed array families remain JS here; explicit kernel ABIs admit
-    // arbitrary f32[]/f64[] mixtures without exponential variant generation.
+    // At most four AOT variants: homogeneous storage, plus the two combinations
+    // of streamed geometry and uniform storage. Do not enumerate 2^N ABIs.
     const float32Types = parameterTypes.map(type => type === 'f64[]' ? 'f32[]' : type);
-    const float32Artifact = compileNumericKernel(source.slice(fn.start, fn.end), {
-      parameterTypes: float32Types, sourceName: `${sourceName}:${fn.id.name}`, maxMemoryPages,
-    });
-    const alternatives = [{ parameterTypes: float32Types, bytes: [...float32Artifact.wasm] }];
+    const layouts = [float32Types];
+    if (artifact.manifest.parameters.some(param => param.access?.minimumLength > 0 && !param.access.indexed)) {
+      for (const uniformType of ['f64[]', 'f32[]']) {
+        layouts.push(artifact.manifest.parameters.map(param => param.type === 'f64' ? 'f64'
+          : param.access.indexed ? (uniformType === 'f64[]' ? 'f32[]' : 'f64[]') : uniformType));
+      }
+    }
+    const seenLayouts = new Set([parameterTypes.join(',')]);
+    const alternatives = [];
+    for (const types of layouts) {
+      if (seenLayouts.has(types.join(','))) continue;
+      seenLayouts.add(types.join(','));
+      const variant = compileNumericKernel(source.slice(fn.start, fn.end), {
+        parameterTypes: types, sourceName: `${sourceName}:${fn.id.name}`, maxMemoryPages,
+      });
+      alternatives.push({ parameterTypes: types, bytes: [...variant.wasm] });
+    }
     const tokenName = fresh('token'), helperName = fresh('call');
     // var + a hoisted helper preserve calls that occur before module evaluation
     // in a cycle: an undefined token routes to the supplied original callee.
@@ -155,9 +167,9 @@ export function specializeNumericModule(source, {
     item.loopStride = artifact.manifest.loopStride ?? 1;
     item.variants = [
       { parameterTypes, wasmBytes: artifact.wasm.length },
-      { parameterTypes: float32Types, wasmBytes: float32Artifact.wasm.length },
+      ...alternatives.map(variant => ({ parameterTypes: variant.parameterTypes, wasmBytes: variant.bytes.length })),
     ];
-    item.wasmBytes = artifact.wasm.length + float32Artifact.wasm.length;
+    item.wasmBytes = item.variants.reduce((sum, variant) => sum + variant.wasmBytes, 0);
     item.guardFallback = 'retained-original-js';
     report.compiledKernels++;
     report.rewrittenCalls += sites.length;

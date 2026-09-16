@@ -45,7 +45,7 @@ function readManifest(module, wasm) {
   let manifest;
   try { manifest = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(sections[0])); }
   catch (cause) { throw new NumericKernelGuardError('KERNEL_ABI_MISMATCH', 'Invalid ABI metadata', { cause }); }
-  const float32Abi = [2, 3].includes(manifest?.version) && manifest.kind === 'closed-numeric-loop';
+  const float32Abi = [2, 3, 4].includes(manifest?.version) && manifest.kind === 'closed-numeric-loop';
   if (!manifest || (!float32Abi && (manifest.version !== 1 || manifest.kind !== 'closed-f64-loop')) ||
       manifest.numericSemantics !== 'f64-operator-order' || manifest.automaticRouteAdmission !== false ||
       !Number.isInteger(manifest.maxMemoryPages) || manifest.maxMemoryPages < 1 ||
@@ -55,8 +55,8 @@ function readManifest(module, wasm) {
       manifest.boundParameter >= manifest.parameters.length) {
     refuse('KERNEL_ABI_MISMATCH', 'Unsupported numeric-kernel ABI');
   }
-  if (manifest.version === 3 && (!Number.isInteger(manifest.loopStride) ||
-      manifest.loopStride < 2 || manifest.loopStride > 16)) {
+  if (manifest.version >= 3 && (!Number.isInteger(manifest.loopStride) ||
+      manifest.loopStride < (manifest.version === 3 ? 2 : 1) || manifest.loopStride > 16)) {
     refuse('KERNEL_ABI_MISMATCH', 'Invalid fixed-stride loop ABI');
   }
   const names = new Set();
@@ -68,6 +68,18 @@ function readManifest(module, wasm) {
       refuse('KERNEL_ABI_MISMATCH', 'Invalid parameter descriptor');
     }
     names.add(param.name);
+    if (manifest.version === 4) {
+      const access = param.access;
+      if (param.type === 'f64' ? access !== undefined :
+          !access || typeof access.indexed !== 'boolean' || !Number.isInteger(access.minimumLength) ||
+          access.minimumLength < 0 || access.minimumLength > 65536 ||
+          (param.write && (!access.indexed || access.minimumLength !== 0)) ||
+          (access.minimumLength > 0 && !param.read) ||
+          (access.indexed && !param.read && !param.write)) {
+        refuse('KERNEL_ABI_MISMATCH', 'Invalid streamed/uniform access extent');
+      }
+      if (access) Object.freeze(access);
+    }
     if (param.write) writes++;
     Object.freeze(param);
   }
@@ -152,12 +164,15 @@ export function instantiateNumericKernel(bytes, { fallback = null, maxMemoryByte
       }
     }
     const count = records.find(record => record.index === manifest.boundParameter).length;
-    if (manifest.version === 3 && count % manifest.loopStride !== 0) {
+    if (manifest.version >= 3 && count % manifest.loopStride !== 0) {
       refuse('KERNEL_LOOP_EXTENT', 'Incomplete final record requires original JavaScript bounds semantics');
     }
     let requiredBytes = 0;
     for (const record of records) {
-      record.byteLength = count * record.elementBytes;
+      const access = record.param.access;
+      record.count = manifest.version === 4
+        ? Math.max(access.indexed ? count : 0, access.minimumLength) : count;
+      record.byteLength = record.count * record.elementBytes;
       record.ptr = Math.ceil(requiredBytes / record.elementBytes) * record.elementBytes;
       requiredBytes = record.ptr + record.byteLength;
     }
@@ -165,14 +180,15 @@ export function instantiateNumericKernel(bytes, { fallback = null, maxMemoryByte
       refuse('KERNEL_MEMORY_LIMIT', `Packed update requires ${requiredBytes} bytes; limit is ${limit}`);
     }
     for (const record of records) {
-      if (record.length < count) refuse('KERNEL_ARRAY_LENGTH', `${record.param.name} is shorter than the loop bound`);
+      if (record.length < record.count) refuse('KERNEL_ARRAY_LENGTH', `${record.param.name} is shorter than its accessed extent`);
     }
     // At most 64 parameter views: no per-element guard scan or scene traversal.
     // Only accessed prefixes matter; overlapping unused tails are harmless.
     for (let i = 0; i < records.length; i++) {
       for (let j = 0; j < i; j++) {
         const a = records[i], b = records[j];
-        if (count && a.buffer === b.buffer && a.offset < b.offset + b.byteLength && b.offset < a.offset + a.byteLength) {
+        if (a.byteLength && b.byteLength && a.buffer === b.buffer &&
+            a.offset < b.offset + b.byteLength && b.offset < a.offset + a.byteLength) {
           refuse('KERNEL_ARRAY_ALIAS', `${a.param.name} and ${b.param.name} have overlapping accessed storage`);
         }
       }
@@ -187,8 +203,8 @@ export function instantiateNumericKernel(bytes, { fallback = null, maxMemoryByte
     const scratchBuffer = memory.buffer;
     records.forEach(record => {
       values[record.index] = record.ptr;
-      record.source = new record.ArrayType(record.buffer, record.offset, count);
-      record.scratch = new record.ArrayType(scratchBuffer, record.ptr, count);
+      record.source = new record.ArrayType(record.buffer, record.offset, record.count);
+      record.scratch = new record.ArrayType(scratchBuffer, record.ptr, record.count);
     });
     return { records, values, count };
   }

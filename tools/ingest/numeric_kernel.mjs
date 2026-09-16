@@ -1,7 +1,7 @@
 /**
  * Closed f64 update-island compiler. This emits executable Wasm, not a route label.
  *
- * Admitted shape: one synchronous function, one counted loop, scalar arithmetic
+ * Admitted shape: pure scalar setup, one counted loop, scalar arithmetic
  * and disjoint fixed-stride Float32Array/Float64Array updates, including conditionals.
  * No calls, escapes, implicit numeric
  * conversions, cross-element dependencies, or arithmetic reassociation.
@@ -104,10 +104,11 @@ export function compileNumericKernel(source, {
     }
     params.set(param.name, { name: param.name, type: parameterTypes[index], index });
   });
-  if (fn.body.body.length !== 1 || fn.body.body[0].type !== 'ForStatement') {
-    fail('Function body must contain exactly one counted for loop', fn.body);
+  const prelude = fn.body.body.slice(0, -1);
+  const loop = fn.body.body.at(-1);
+  if (loop?.type !== 'ForStatement' || prelude.some(node => node.type !== 'VariableDeclaration')) {
+    fail('Function body must contain scalar declarations followed by one counted for loop', fn.body);
   }
-  const loop = fn.body.body[0];
   const init = loop.init;
   if (init?.type !== 'VariableDeclaration' || init.kind !== 'let' || init.declarations.length !== 1) {
     fail('Loop must initialize a fresh let index to zero', init || loop);
@@ -146,12 +147,23 @@ export function compileNumericKernel(source, {
   let statementCount = 0;
   const reads = new Set();
   const writes = new Set();
-  const arrayParameter = node => {
+  const indexed = new Set();
+  const minimumLengths = new Map();
+  let inLoop = false;
+  const arrayParameter = (node, writing = false) => {
     const param = params.get(node?.object?.name);
     if (!['f32[]', 'f64[]'].includes(param?.type) || node?.type !== 'MemberExpression' ||
         node.optional || !node.computed || node.object.type !== 'Identifier') {
       fail('Array access must use the current disjoint loop record', node);
     }
+    if (node.property.type === 'Literal' && Number.isInteger(node.property.value) &&
+        node.property.value >= 0 && node.property.value < 65536) {
+      if (writing) fail('Fixed-index uniform arrays are read-only', node);
+      const minimum = node.property.value + 1;
+      minimumLengths.set(param.name, Math.max(minimumLengths.get(param.name) ?? 0, minimum));
+      return { ...param, elementOffset: node.property.value, fixed: true };
+    }
+    if (!inLoop) fail('Loop-indexed access is unavailable before the loop', node);
     let elementOffset;
     if (node.property.type === 'Identifier' && node.property.name === indexName) {
       elementOffset = 0;
@@ -163,11 +175,13 @@ export function compileNumericKernel(source, {
     } else {
       fail('Array offset must be a constant within the current loop stride', node);
     }
-    return { ...param, elementOffset };
+    indexed.add(param.name);
+    return { ...param, elementOffset, fixed: false };
   };
   const alignment = param => param.type === 'f32[]' ? 2 : 3;
   const memoryOffset = param => u32(param.elementOffset * (param.type === 'f32[]' ? 4 : 8));
-  const address = param => [...get(param.index), ...get(indexLocal), 0x41, alignment(param), 0x74, 0x6a];
+  const address = param => param.fixed ? get(param.index)
+    : [...get(param.index), ...get(indexLocal), 0x41, alignment(param), 0x74, 0x6a];
   const load = param => {
     reads.add(param.name);
     // JavaScript reads float32 storage as a Number. Promote before arithmetic;
@@ -180,7 +194,10 @@ export function compileNumericKernel(source, {
     if (!node || depth > 128) fail('Expression nesting exceeds the admitted bound', node);
     if (node.type === 'Literal' && typeof node.value === 'number') return number(node.value);
     if (node.type === 'Identifier') {
-      if (node.name === indexName) return [...get(indexLocal), 0xb8]; // f64.convert_i32_u
+      if (node.name === indexName) {
+        if (!inLoop) fail('Loop index is not in scope before the loop', node);
+        return [...get(indexLocal), 0xb8]; // f64.convert_i32_u
+      }
       const param = params.get(node.name);
       if (param?.type === 'f64') return get(param.index);
       if (temporaries.has(node.name)) {
@@ -236,7 +253,7 @@ export function compileNumericKernel(source, {
     return [...number(0), ...expression(node, depth + 1), 0x99, 0x63];
   }
 
-  function compileBlock(statements, conditional = false, depth = 0) {
+  function compileBlock(statements, conditional = false, depth = 0, retainScope = false) {
     if (depth > 128) fail('Statement nesting exceeds the admitted bound', loop.body);
     const parentScope = temporaries;
     temporaries = new Map(parentScope);
@@ -286,7 +303,7 @@ export function compileNumericKernel(source, {
             !['=', '+=', '-=', '*=', '/='].includes(assignment.operator)) {
           fail('Loop statements must initialize scalars, branch, or assign array[index]', statement);
         }
-        const target = arrayParameter(assignment.left);
+        const target = arrayParameter(assignment.left, true);
         const value = expression(assignment.right);
         const compound = assignment.operator !== '=';
         bytes.push(...address(target),
@@ -302,24 +319,35 @@ export function compileNumericKernel(source, {
       }
       return bytes;
     } finally {
-      temporaries = parentScope;
+      if (!retainScope) temporaries = parentScope;
     }
   }
 
   const statements = loop.body.type === 'BlockStatement' ? loop.body.body : [loop.body];
+  const setup = compileBlock(prelude, false, 0, true);
+  inLoop = true;
   const instructions = compileBlock(statements);
   if (writes.size === 0) fail('Kernel must produce at least one array output', loop.body);
+  for (const name of minimumLengths.keys()) {
+    if (writes.has(name)) fail('Uniform reads must not depend on an array written by the loop', loop.body);
+  }
+  // v4 separates uniform extents from streamed record extents. Older kernels
+  // keep their original ABI and deterministic bytes when this is not needed.
+  const extentAbi = prelude.length > 0 || minimumLengths.size > 0;
 
   const manifest = {
-    version: loopStride > 1 ? 3 : parameterTypes.includes('f32[]') ? 2 : 1,
-    kind: loopStride > 1 || parameterTypes.includes('f32[]') ? 'closed-numeric-loop' : 'closed-f64-loop',
-    ...(loopStride > 1 ? { loopStride } : {}),
+    version: extentAbi ? 4 : loopStride > 1 ? 3 : parameterTypes.includes('f32[]') ? 2 : 1,
+    kind: extentAbi || loopStride > 1 || parameterTypes.includes('f32[]') ? 'closed-numeric-loop' : 'closed-f64-loop',
+    ...(extentAbi || loopStride > 1 ? { loopStride } : {}),
     functionName: fn.id.name,
     sourceName: String(sourceName),
     sourceSpan: { start: fn.start, end: fn.end },
     parameters: [...params.values()].map(param => ({
       name: param.name, type: param.type,
       read: reads.has(param.name), write: writes.has(param.name),
+      ...(extentAbi && param.type !== 'f64' ? { access: {
+        indexed: indexed.has(param.name), minimumLength: minimumLengths.get(param.name) ?? 0,
+      } } : {}),
     })),
     boundParameter: boundParam.index,
     maxMemoryPages,
@@ -331,6 +359,7 @@ export function compileNumericKernel(source, {
   if (temporaryCount) locals.push([...u32(temporaryCount), F64]);
   const body = [
     ...vector(locals),
+    ...setup,
     0x02, 0x40, 0x03, 0x40, // block; loop
     ...get(indexLocal), ...get(countLocal), 0x4f, 0x0d, 1, // break if i >= count
     ...instructions,
@@ -346,7 +375,10 @@ export function compileNumericKernel(source, {
     ...section(10, vector([[...u32(body.length), ...body]])),
     ...section(0, [...text(NUMERIC_KERNEL_SECTION), ...new TextEncoder().encode(JSON.stringify(manifest))]),
   ]);
-  for (const parameter of manifest.parameters) Object.freeze(parameter);
+  for (const parameter of manifest.parameters) {
+    if (parameter.access) Object.freeze(parameter.access);
+    Object.freeze(parameter);
+  }
   Object.freeze(manifest.parameters);
   Object.freeze(manifest.sourceSpan);
   return Object.freeze({ wasm, manifest: Object.freeze(manifest) });
