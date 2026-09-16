@@ -4,12 +4,13 @@
  * Admitted shape: pure scalar setup, one counted loop, scalar arithmetic
  * and fixed-stride Float32Array/Float64Array updates, including conditionals.
  * Scalar accumulators and a final numeric return execute in source iteration order.
- * No calls, escapes, implicit numeric
- * conversions or arithmetic reassociation.
+ * Closed scalar helpers execute as private Wasm functions. No host calls,
+ * escapes, implicit numeric conversions or arithmetic reassociation.
  * Runtime shape/ownership guards live in numeric_kernel_runtime.mjs. This narrow
  * opt-in ABI is not proof of whole-application closure or a speedup claim.
  */
 import * as acorn from 'acorn';
+import { createScalarHelperCompiler } from './numeric_helpers.mjs';
 
 export const NUMERIC_KERNEL_SECTION = 'f3d.numeric-kernel';
 const F64 = 0x7c;
@@ -69,9 +70,14 @@ function member(node, object, property, computed) {
  * parameterTypes is positional: 'f32[]', 'f64[]' or scalar 'f64'. A matching
  * manifest is embedded in the module, so runtime ABI metadata cannot drift from
  * a separately loaded JSON sidecar. The returned bytes are deterministic.
+ * helperSources optionally maps proven immutable lexical bindings to scalar
+ * function declarations. Only reachable, acyclic, capture-free helpers compile.
+ * These sources must match the original function's actual lexical environment;
+ * specializeNumericModule establishes that proof for linked application code.
  */
 export function compileNumericKernel(source, {
   parameterTypes,
+  helperSources = new Map(),
   sourceName = '<numeric-kernel>',
   maxMemoryPages = DEFAULT_MAX_PAGES,
 } = {}) {
@@ -144,6 +150,7 @@ export function compileNumericKernel(source, {
     fail('Loop must increment the index by a constant stride between 1 and 16', update || loop);
   }
 
+  const helperCompiler = createScalarHelperCompiler(helperSources, fail);
   const countLocal = params.size;
   const indexLocal = countLocal + 1;
   let temporaries = new Map();
@@ -228,6 +235,11 @@ export function compileNumericKernel(source, {
       return [...condition(node.test, depth + 1), 0x04, F64,
         ...expression(node.consequent, depth + 1), 0x05,
         ...expression(node.alternate, depth + 1), 0x0b];
+    }
+    if (node.type === 'CallExpression') {
+      return helperCompiler.call(node, arg => expression(arg, depth + 1),
+        params.has(node.callee.name) || temporaries.has(node.callee.name) ||
+        node.callee.name === indexName || node.callee.name === fn.id.name);
     }
     fail(`Unsupported expression ${node.type}; calls and implicit conversions are not closed`, node);
   }
@@ -410,13 +422,14 @@ export function compileNumericKernel(source, {
     ...get(indexLocal), 0x41, loopStride, 0x6a, ...set(indexLocal), 0x0c, 0,
     0x0b, 0x0b, ...result, 0x0b,
   ];
+  const helperCode = helperCompiler.finish();
   const wasm = new Uint8Array([
     0, 0x61, 0x73, 0x6d, 1, 0, 0, 0,
-    ...section(1, vector([[0x60, ...vector(types.map(type => [type])), ...(resultNode ? [1, F64] : [0])]])),
-    ...section(3, vector([[0]])),
+    ...section(1, vector([[0x60, ...vector(types.map(type => [type])), ...(resultNode ? [1, F64] : [0])], ...helperCode.types])),
+    ...section(3, vector([[0], ...helperCode.functions])),
     ...section(5, vector([[1, ...u32(1), ...u32(maxMemoryPages)]])),
     ...section(7, vector([[...text('run'), 0, 0], [...text('memory'), 2, 0]])),
-    ...section(10, vector([[...u32(body.length), ...body]])),
+    ...section(10, vector([[...u32(body.length), ...body], ...helperCode.bodies])),
     ...section(0, [...text(NUMERIC_KERNEL_SECTION), ...new TextEncoder().encode(JSON.stringify(manifest))]),
   ]);
   for (const parameter of manifest.parameters) {
@@ -425,5 +438,5 @@ export function compileNumericKernel(source, {
   }
   Object.freeze(manifest.parameters);
   Object.freeze(manifest.sourceSpan);
-  return Object.freeze({ wasm, manifest: Object.freeze(manifest) });
+  return Object.freeze({ wasm, manifest: Object.freeze(manifest), helpers: helperCode.helpers });
 }
