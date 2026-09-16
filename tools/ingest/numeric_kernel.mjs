@@ -2,7 +2,7 @@
  * Closed f64 update-island compiler. This emits executable Wasm, not a route label.
  *
  * Admitted shape: one synchronous function, one counted loop, scalar arithmetic
- * and same-index Float64Array reads/writes, including closed conditionals.
+ * and disjoint fixed-stride Float32Array/Float64Array updates, including conditionals.
  * No calls, escapes, implicit numeric
  * conversions, cross-element dependencies, or arithmetic reassociation.
  * Runtime shape/ownership guards live in numeric_kernel_runtime.mjs. This narrow
@@ -65,7 +65,7 @@ function member(node, object, property, computed) {
 
 /**
  * Compile a single source function into a standalone, import-free Wasm module.
- * parameterTypes is positional and contains only 'f64[]' or 'f64'. A matching
+ * parameterTypes is positional: 'f32[]', 'f64[]' or scalar 'f64'. A matching
  * manifest is embedded in the module, so runtime ABI metadata cannot drift from
  * a separately loaded JSON sidecar. The returned bytes are deterministic.
  */
@@ -94,8 +94,8 @@ export function compileNumericKernel(source, {
   }
   if (!Array.isArray(parameterTypes) || parameterTypes.length !== fn.params.length ||
       parameterTypes.length > 64 ||
-      parameterTypes.some(type => type !== 'f64[]' && type !== 'f64')) {
-    fail('Supply one f64[] or f64 type per parameter (at most 64)', fn, 'INVALID_KERNEL_ABI');
+      parameterTypes.some(type => !['f32[]', 'f64[]', 'f64'].includes(type))) {
+    fail('Supply one f32[], f64[] or f64 type per parameter (at most 64)', fn, 'INVALID_KERNEL_ABI');
   }
   const params = new Map();
   fn.params.forEach((param, index) => {
@@ -122,12 +122,21 @@ export function compileNumericKernel(source, {
   const boundParam = params.get(bound?.object?.name);
   if (loop.test?.type !== 'BinaryExpression' || loop.test.operator !== '<' ||
       loop.test.left.type !== 'Identifier' || loop.test.left.name !== indexName ||
-      boundParam?.type !== 'f64[]' || !member(bound, boundParam.name, 'length', false)) {
+      !['f32[]', 'f64[]'].includes(boundParam?.type) || !member(bound, boundParam.name, 'length', false)) {
     fail('Loop condition must be index < arrayParameter.length', loop.test || loop);
   }
-  if (loop.update?.type !== 'UpdateExpression' || loop.update.operator !== '++' ||
-      loop.update.argument.type !== 'Identifier' || loop.update.argument.name !== indexName) {
-    fail('Loop update must increment the index by one', loop.update || loop);
+  const update = loop.update;
+  let loopStride;
+  if (update?.type === 'UpdateExpression' && update.operator === '++' &&
+      update.argument.type === 'Identifier' && update.argument.name === indexName) {
+    loopStride = 1;
+  } else if (update?.type === 'AssignmentExpression' && update.operator === '+=' &&
+      update.left.type === 'Identifier' && update.left.name === indexName &&
+      update.right.type === 'Literal' && Number.isInteger(update.right.value) &&
+      update.right.value >= 1 && update.right.value <= 16) {
+    loopStride = update.right.value;
+  } else {
+    fail('Loop must increment the index by a constant stride between 1 and 16', update || loop);
   }
 
   const countLocal = params.size;
@@ -139,15 +148,33 @@ export function compileNumericKernel(source, {
   const writes = new Set();
   const arrayParameter = node => {
     const param = params.get(node?.object?.name);
-    if (param?.type !== 'f64[]' || !member(node, param.name, indexName, true)) {
-      fail('Array access must use exactly the current loop index', node);
+    if (!['f32[]', 'f64[]'].includes(param?.type) || node?.type !== 'MemberExpression' ||
+        node.optional || !node.computed || node.object.type !== 'Identifier') {
+      fail('Array access must use the current disjoint loop record', node);
     }
-    return param;
+    let elementOffset;
+    if (node.property.type === 'Identifier' && node.property.name === indexName) {
+      elementOffset = 0;
+    } else if (node.property.type === 'BinaryExpression' && node.property.operator === '+' &&
+        node.property.left.type === 'Identifier' && node.property.left.name === indexName &&
+        node.property.right.type === 'Literal' && Number.isInteger(node.property.right.value) &&
+        node.property.right.value >= 0 && node.property.right.value < loopStride) {
+      elementOffset = node.property.right.value;
+    } else {
+      fail('Array offset must be a constant within the current loop stride', node);
+    }
+    return { ...param, elementOffset };
   };
-  const address = param => [...get(param.index), ...get(indexLocal), 0x41, 3, 0x74, 0x6a];
+  const alignment = param => param.type === 'f32[]' ? 2 : 3;
+  const memoryOffset = param => u32(param.elementOffset * (param.type === 'f32[]' ? 4 : 8));
+  const address = param => [...get(param.index), ...get(indexLocal), 0x41, alignment(param), 0x74, 0x6a];
   const load = param => {
     reads.add(param.name);
-    return [...address(param), 0x2b, 3, 0]; // f64.load align=8, offset=0
+    // JavaScript reads float32 storage as a Number. Promote before arithmetic;
+    // using f32 operators here would introduce extra rounding at every operator.
+    return param.type === 'f32[]'
+      ? [...address(param), 0x2a, 2, ...memoryOffset(param), 0xbb] // f32.load; f64.promote_f32
+      : [...address(param), 0x2b, 3, ...memoryOffset(param)]; // f64.load
   };
   function expression(node, depth = 0) {
     if (!node || depth > 128) fail('Expression nesting exceeds the admitted bound', node);
@@ -264,11 +291,14 @@ export function compileNumericKernel(source, {
         const compound = assignment.operator !== '=';
         bytes.push(...address(target),
           ...(compound ? load(target) : []), ...value,
-          ...(compound ? [OPS[assignment.operator[0]]] : []), 0x39, 3, 0);
+          ...(compound ? [OPS[assignment.operator[0]]] : []),
+          // Round at EACH float32 store, including stores read again in this loop.
+          ...(target.type === 'f32[]' ? [0xb6, 0x38, 2] : [0x39, 3]), ...memoryOffset(target));
         writes.add(target.name);
         // A skipped store must preserve the original element, not stale private
         // Wasm memory from a previous invocation. Mark it as a packing input.
-        if (conditional) reads.add(target.name);
+        // Strided stores may leave other record channels untouched.
+        if (conditional || loopStride > 1) reads.add(target.name);
       }
       return bytes;
     } finally {
@@ -281,8 +311,9 @@ export function compileNumericKernel(source, {
   if (writes.size === 0) fail('Kernel must produce at least one array output', loop.body);
 
   const manifest = {
-    version: 1,
-    kind: 'closed-f64-loop',
+    version: loopStride > 1 ? 3 : parameterTypes.includes('f32[]') ? 2 : 1,
+    kind: loopStride > 1 || parameterTypes.includes('f32[]') ? 'closed-numeric-loop' : 'closed-f64-loop',
+    ...(loopStride > 1 ? { loopStride } : {}),
     functionName: fn.id.name,
     sourceName: String(sourceName),
     sourceSpan: { start: fn.start, end: fn.end },
@@ -295,7 +326,7 @@ export function compileNumericKernel(source, {
     numericSemantics: 'f64-operator-order',
     automaticRouteAdmission: false,
   };
-  const types = [...parameterTypes.map(type => type === 'f64[]' ? I32 : F64), I32];
+  const types = [...parameterTypes.map(type => type === 'f64' ? F64 : I32), I32];
   const locals = [[...u32(1), I32]];
   if (temporaryCount) locals.push([...u32(temporaryCount), F64]);
   const body = [
@@ -303,7 +334,7 @@ export function compileNumericKernel(source, {
     0x02, 0x40, 0x03, 0x40, // block; loop
     ...get(indexLocal), ...get(countLocal), 0x4f, 0x0d, 1, // break if i >= count
     ...instructions,
-    ...get(indexLocal), 0x41, 1, 0x6a, ...set(indexLocal), 0x0c, 0,
+    ...get(indexLocal), 0x41, loopStride, 0x6a, ...set(indexLocal), 0x0c, 0,
     0x0b, 0x0b, 0x0b,
   ];
   const wasm = new Uint8Array([

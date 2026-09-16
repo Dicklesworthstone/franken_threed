@@ -1,5 +1,5 @@
 /**
- * Browser/Node host for compileNumericKernel's explicit, closed f64-array ABI.
+ * Browser/Node host for compileNumericKernel's explicit, closed numeric-array ABI.
  * No parser, DOM, GPU, eval, scheduler, or eager WebAssembly instantiation.
  *
  * Validate all arguments before effects; pack independent array prefixes into
@@ -11,6 +11,7 @@ const SECTION = 'f3d.numeric-kernel';
 const PAGE_BYTES = 65536;
 const MAX_BYTES = 1024 * 1024 * 1024;
 const F64Array = Float64Array;
+const F32Array = Float32Array;
 const U8Array = Uint8Array;
 const apply = Reflect.apply;
 const descriptor = Object.getOwnPropertyDescriptor;
@@ -44,7 +45,8 @@ function readManifest(module, wasm) {
   let manifest;
   try { manifest = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(sections[0])); }
   catch (cause) { throw new NumericKernelGuardError('KERNEL_ABI_MISMATCH', 'Invalid ABI metadata', { cause }); }
-  if (!manifest || manifest.version !== 1 || manifest.kind !== 'closed-f64-loop' ||
+  const float32Abi = [2, 3].includes(manifest?.version) && manifest.kind === 'closed-numeric-loop';
+  if (!manifest || (!float32Abi && (manifest.version !== 1 || manifest.kind !== 'closed-f64-loop')) ||
       manifest.numericSemantics !== 'f64-operator-order' || manifest.automaticRouteAdmission !== false ||
       !Number.isInteger(manifest.maxMemoryPages) || manifest.maxMemoryPages < 1 ||
       manifest.maxMemoryPages > MAX_BYTES / PAGE_BYTES || !Array.isArray(manifest.parameters) ||
@@ -53,11 +55,15 @@ function readManifest(module, wasm) {
       manifest.boundParameter >= manifest.parameters.length) {
     refuse('KERNEL_ABI_MISMATCH', 'Unsupported numeric-kernel ABI');
   }
+  if (manifest.version === 3 && (!Number.isInteger(manifest.loopStride) ||
+      manifest.loopStride < 2 || manifest.loopStride > 16)) {
+    refuse('KERNEL_ABI_MISMATCH', 'Invalid fixed-stride loop ABI');
+  }
   const names = new Set();
   let writes = 0;
   for (const param of manifest.parameters) {
     if (!param || typeof param.name !== 'string' || names.has(param.name) ||
-        !['f64[]', 'f64'].includes(param.type) || typeof param.read !== 'boolean' ||
+        !(float32Abi ? ['f32[]', 'f64[]', 'f64'] : ['f64[]', 'f64']).includes(param.type) || typeof param.read !== 'boolean' ||
         typeof param.write !== 'boolean' || (param.type === 'f64' && (param.write || param.read))) {
       refuse('KERNEL_ABI_MISMATCH', 'Invalid parameter descriptor');
     }
@@ -65,7 +71,7 @@ function readManifest(module, wasm) {
     if (param.write) writes++;
     Object.freeze(param);
   }
-  if (!writes || manifest.parameters[manifest.boundParameter].type !== 'f64[]') {
+  if (!writes || manifest.parameters[manifest.boundParameter].type === 'f64') {
     refuse('KERNEL_ABI_MISMATCH', 'Missing output or invalid array loop bound');
   }
   Object.freeze(manifest.parameters);
@@ -73,13 +79,16 @@ function readManifest(module, wasm) {
   return Object.freeze(manifest);
 }
 
-function arrayInfo(value, name, checkLength) {
+function arrayInfo(value, param, checkLength) {
+  const { name } = param;
+  const ArrayType = param.type === 'f32[]' ? F32Array : F64Array;
+  const tag = param.type === 'f32[]' ? 'Float32Array' : 'Float64Array';
   // Native slot access rejects proxies without running their traps or user getters.
-  if (apply(typedTag, value, []) !== 'Float64Array' || prototype(value) !== F64Array.prototype) {
-    refuse('KERNEL_ARRAY_TYPE', `${name} must be a genuine, non-subclass Float64Array`);
+  if (apply(typedTag, value, []) !== tag || prototype(value) !== ArrayType.prototype) {
+    refuse('KERNEL_ARRAY_TYPE', `${name} must be a genuine, non-subclass ${tag}`);
   }
-  if (checkLength && (descriptor(value, 'length') || descriptor(F64Array.prototype, 'length') ||
-      prototype(F64Array.prototype) !== typedPrototype || descriptor(typedPrototype, 'length')?.get !== typedLength)) {
+  if (checkLength && (descriptor(value, 'length') || descriptor(ArrayType.prototype, 'length') ||
+      prototype(ArrayType.prototype) !== typedPrototype || descriptor(typedPrototype, 'length')?.get !== typedLength)) {
     refuse('KERNEL_MUTABLE_LENGTH', `${name}.length no longer has intrinsic semantics`);
   }
   const buffer = apply(typedBuffer, value, []);
@@ -94,7 +103,8 @@ function arrayInfo(value, name, checkLength) {
     if (cause instanceof NumericKernelGuardError) throw cause;
     throw new NumericKernelGuardError('KERNEL_ARRAY_OWNERSHIP', `${name} has shared or detached storage`, { cause });
   }
-  return { buffer, offset: apply(typedOffset, value, []), length: apply(typedLength, value, []) };
+  return { buffer, offset: apply(typedOffset, value, []), length: apply(typedLength, value, []),
+    ArrayType, elementBytes: param.type === 'f32[]' ? 4 : 8 };
 }
 
 /**
@@ -138,12 +148,19 @@ export function instantiateNumericKernel(bytes, { fallback = null, maxMemoryByte
       if (param.type === 'f64') {
         if (typeof args[i] !== 'number') refuse('KERNEL_SCALAR_TYPE', `${param.name} must be a number without coercion`);
       } else {
-        records.push({ ...arrayInfo(args[i], param.name, i === manifest.boundParameter), param, index: i });
+        records.push({ ...arrayInfo(args[i], param, i === manifest.boundParameter), param, index: i });
       }
     }
     const count = records.find(record => record.index === manifest.boundParameter).length;
-    const bytesPerArray = count * 8;
-    const requiredBytes = bytesPerArray * records.length;
+    if (manifest.version === 3 && count % manifest.loopStride !== 0) {
+      refuse('KERNEL_LOOP_EXTENT', 'Incomplete final record requires original JavaScript bounds semantics');
+    }
+    let requiredBytes = 0;
+    for (const record of records) {
+      record.byteLength = count * record.elementBytes;
+      record.ptr = Math.ceil(requiredBytes / record.elementBytes) * record.elementBytes;
+      requiredBytes = record.ptr + record.byteLength;
+    }
     if (!Number.isSafeInteger(requiredBytes) || requiredBytes > limit) {
       refuse('KERNEL_MEMORY_LIMIT', `Packed update requires ${requiredBytes} bytes; limit is ${limit}`);
     }
@@ -155,7 +172,7 @@ export function instantiateNumericKernel(bytes, { fallback = null, maxMemoryByte
     for (let i = 0; i < records.length; i++) {
       for (let j = 0; j < i; j++) {
         const a = records[i], b = records[j];
-        if (count && a.buffer === b.buffer && a.offset < b.offset + bytesPerArray && b.offset < a.offset + bytesPerArray) {
+        if (count && a.buffer === b.buffer && a.offset < b.offset + b.byteLength && b.offset < a.offset + a.byteLength) {
           refuse('KERNEL_ARRAY_ALIAS', `${a.param.name} and ${b.param.name} have overlapping accessed storage`);
         }
       }
@@ -168,13 +185,12 @@ export function instantiateNumericKernel(bytes, { fallback = null, maxMemoryByte
     if (pages > currentPages) memory.grow(pages - currentPages);
     // Acquire every view AFTER possible memory.grow; never retain detached views.
     const scratchBuffer = memory.buffer;
-    records.forEach((record, slot) => {
-      const ptr = slot * bytesPerArray;
-      values[record.index] = ptr;
-      record.source = new F64Array(record.buffer, record.offset, count);
-      record.scratch = new F64Array(scratchBuffer, ptr, count);
+    records.forEach(record => {
+      values[record.index] = record.ptr;
+      record.source = new record.ArrayType(record.buffer, record.offset, count);
+      record.scratch = new record.ArrayType(scratchBuffer, record.ptr, count);
     });
-    return { records, values, count, bytesPerArray };
+    return { records, values, count };
   }
 
   function run(...args) {
@@ -202,7 +218,7 @@ export function instantiateNumericKernel(bytes, { fallback = null, maxMemoryByte
     stats.wasmCalls++;
     stats.lastGuardFailure = null;
     for (const record of prepared.records) {
-      stats.copiedBytes += prepared.bytesPerArray * (Number(record.param.read) + Number(record.param.write));
+      stats.copiedBytes += record.byteLength * (Number(record.param.read) + Number(record.param.write));
     }
   }
 
