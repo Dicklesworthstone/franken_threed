@@ -103,8 +103,10 @@ export function specializeNumericModule(source, {
   for (const statement of ast.body) {
     const fn = ['ExportNamedDeclaration', 'ExportDefaultDeclaration'].includes(statement.type)
       ? statement.declaration : statement;
-    if (fn?.type !== 'FunctionDeclaration' || !fn.id || fn.body.body.at(-1)?.type !== 'ForStatement' ||
-        fn.body.body.slice(0, -1).some(node => node.type !== 'VariableDeclaration')) continue;
+    if (fn?.type !== 'FunctionDeclaration' || !fn.id) continue;
+    const loopPosition = fn.body.body.length - (fn.body.body.at(-1)?.type === 'ReturnStatement' ? 2 : 1);
+    if (fn.body.body[loopPosition]?.type !== 'ForStatement' ||
+        fn.body.body.slice(0, loopPosition).some(node => node.type !== 'VariableDeclaration')) continue;
     const item = { functionName: fn.id.name, sourceSpan: span(fn), route: 'retained-js', reason: null, calls: [] };
     report.candidates.push(item);
     // Rebinding before this module's evaluation is possible through an ESM
@@ -165,6 +167,8 @@ export function specializeNumericModule(source, {
     item.route = 'guarded-numeric-wasm';
     item.parameterTypes = parameterTypes;
     item.loopStride = artifact.manifest.loopStride ?? 1;
+    item.resultType = artifact.manifest.resultType ?? 'void';
+    if (artifact.manifest.iterationSemantics) item.iterationSemantics = artifact.manifest.iterationSemantics;
     item.variants = [
       { parameterTypes, wasmBytes: artifact.wasm.length },
       ...alternatives.map(variant => ({ parameterTypes: variant.parameterTypes, wasmBytes: variant.bytes.length })),

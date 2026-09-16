@@ -21,7 +21,10 @@ import { instantiateNumericKernel, NumericKernelGuardError } from './runtime.mjs
 import retained from './retained.mjs';
 export { retained };
 const manifest = ${JSON.stringify(artifact.manifest, null, 2)};
-for (const parameter of manifest.parameters) Object.freeze(parameter);
+for (const parameter of manifest.parameters) {
+  if (parameter.access) Object.freeze(parameter.access);
+  Object.freeze(parameter);
+}
 Object.freeze(manifest.parameters);
 Object.freeze(manifest.sourceSpan);
 Object.freeze(manifest);

@@ -2,9 +2,10 @@
  * Closed f64 update-island compiler. This emits executable Wasm, not a route label.
  *
  * Admitted shape: pure scalar setup, one counted loop, scalar arithmetic
- * and disjoint fixed-stride Float32Array/Float64Array updates, including conditionals.
+ * and fixed-stride Float32Array/Float64Array updates, including conditionals.
+ * Scalar accumulators and a final numeric return execute in source iteration order.
  * No calls, escapes, implicit numeric
- * conversions, cross-element dependencies, or arithmetic reassociation.
+ * conversions or arithmetic reassociation.
  * Runtime shape/ownership guards live in numeric_kernel_runtime.mjs. This narrow
  * opt-in ABI is not proof of whole-application closure or a speedup claim.
  */
@@ -104,11 +105,14 @@ export function compileNumericKernel(source, {
     }
     params.set(param.name, { name: param.name, type: parameterTypes[index], index });
   });
-  const prelude = fn.body.body.slice(0, -1);
-  const loop = fn.body.body.at(-1);
+  const resultNode = fn.body.body.at(-1)?.type === 'ReturnStatement' ? fn.body.body.at(-1) : null;
+  const loopPosition = fn.body.body.length - (resultNode ? 2 : 1);
+  const prelude = fn.body.body.slice(0, loopPosition);
+  const loop = fn.body.body[loopPosition];
   if (loop?.type !== 'ForStatement' || prelude.some(node => node.type !== 'VariableDeclaration')) {
     fail('Function body must contain scalar declarations followed by one counted for loop', fn.body);
   }
+  if (resultNode && !resultNode.argument) fail('Final return must be a numeric expression', resultNode);
   const init = loop.init;
   if (init?.type !== 'VariableDeclaration' || init.kind !== 'let' || init.declarations.length !== 1) {
     fail('Loop must initialize a fresh let index to zero', init || loop);
@@ -145,6 +149,8 @@ export function compileNumericKernel(source, {
   let temporaries = new Map();
   let temporaryCount = 0;
   let statementCount = 0;
+  const mutableLocals = new Set();
+  const scalarWrites = new Set();
   const reads = new Set();
   const writes = new Set();
   const indexed = new Set();
@@ -195,7 +201,7 @@ export function compileNumericKernel(source, {
     if (node.type === 'Literal' && typeof node.value === 'number') return number(node.value);
     if (node.type === 'Identifier') {
       if (node.name === indexName) {
-        if (!inLoop) fail('Loop index is not in scope before the loop', node);
+        if (!inLoop) fail('Loop index is not in scope outside the loop', node);
         return [...get(indexLocal), 0xb8]; // f64.convert_i32_u
       }
       const param = params.get(node.name);
@@ -207,6 +213,9 @@ export function compileNumericKernel(source, {
       }
       fail(`Unresolved or non-scalar binding ${node.name}`, node);
     }
+    // The bound view's intrinsic length is already guarded and cannot change
+    // during an import-free call over fixed, unshared buffers.
+    if (member(node, boundParam.name, 'length', false)) return [...get(countLocal), 0xb8];
     if (node.type === 'MemberExpression') return load(arrayParameter(node));
     if (node.type === 'UnaryExpression' && (node.operator === '+' || node.operator === '-')) {
       const operand = expression(node.argument, depth + 1);
@@ -253,6 +262,21 @@ export function compileNumericKernel(source, {
     return [...number(0), ...expression(node, depth + 1), 0x99, 0x63];
   }
 
+  function mutableScalar(node) {
+    if (node?.type !== 'Identifier' || node.name === indexName) {
+      fail('Scalar updates require a mutable local or scalar parameter, not the loop index', node);
+    }
+    if (temporaries.has(node.name)) {
+      const local = temporaries.get(node.name);
+      if (local === null) fail(`Binding ${node.name} is used before initialization`, node);
+      if (!mutableLocals.has(local)) fail(`Cannot assign to constant binding ${node.name}`, node);
+      return local;
+    }
+    const param = params.get(node.name);
+    if (param?.type === 'f64') return param.index;
+    fail(`Unresolved or non-scalar assignment ${node.name}`, node);
+  }
+
   function compileBlock(statements, conditional = false, depth = 0, retainScope = false) {
     if (depth > 128) fail('Statement nesting exceeds the admitted bound', loop.body);
     const parentScope = temporaries;
@@ -284,6 +308,7 @@ export function compileNumericKernel(source, {
             const initializer = expression(variable.init);
             const local = indexLocal + 1 + temporaryCount++;
             temporaries.set(variable.id.name, local);
+            if (statement.kind === 'let') mutableLocals.add(local);
             bytes.push(...initializer, ...set(local));
           }
           continue;
@@ -299,9 +324,22 @@ export function compileNumericKernel(source, {
           continue;
         }
         const assignment = statement.type === 'ExpressionStatement' ? statement.expression : null;
+        if (assignment?.type === 'UpdateExpression' && ['++', '--'].includes(assignment.operator)) {
+          const local = mutableScalar(assignment.argument);
+          bytes.push(...get(local), ...number(1), OPS[assignment.operator[0]], ...set(local));
+          scalarWrites.add(local);
+          continue;
+        }
         if (assignment?.type !== 'AssignmentExpression' ||
             !['=', '+=', '-=', '*=', '/='].includes(assignment.operator)) {
-          fail('Loop statements must initialize scalars, branch, or assign array[index]', statement);
+          fail('Loop statements must initialize scalars, branch, or assign scalars/array[index]', statement);
+        }
+        if (assignment.left.type === 'Identifier') {
+          const local = mutableScalar(assignment.left);
+          bytes.push(...(assignment.operator === '=' ? [] : get(local)), ...expression(assignment.right),
+            ...(assignment.operator === '=' ? [] : [OPS[assignment.operator[0]]]), ...set(local));
+          scalarWrites.add(local);
+          continue;
         }
         const target = arrayParameter(assignment.left, true);
         const value = expression(assignment.right);
@@ -327,18 +365,24 @@ export function compileNumericKernel(source, {
   const setup = compileBlock(prelude, false, 0, true);
   inLoop = true;
   const instructions = compileBlock(statements);
-  if (writes.size === 0) fail('Kernel must produce at least one array output', loop.body);
+  inLoop = false;
+  const result = resultNode ? expression(resultNode.argument) : [];
+  if (writes.size === 0 && !resultNode) fail('Kernel must produce an array output or numeric return', loop.body);
   for (const name of minimumLengths.keys()) {
     if (writes.has(name)) fail('Uniform reads must not depend on an array written by the loop', loop.body);
   }
   // v4 separates uniform extents from streamed record extents. Older kernels
   // keep their original ABI and deterministic bytes when this is not needed.
-  const extentAbi = prelude.length > 0 || minimumLengths.size > 0;
+  // v5 records ordered scalar state and optional results. Array access extents
+  // do not authorize parallelizing or reassociating loop-carried accumulators.
+  const orderedAbi = scalarWrites.size > 0 || resultNode !== null;
+  const extentAbi = orderedAbi || prelude.length > 0 || minimumLengths.size > 0;
 
   const manifest = {
-    version: extentAbi ? 4 : loopStride > 1 ? 3 : parameterTypes.includes('f32[]') ? 2 : 1,
+    version: orderedAbi ? 5 : extentAbi ? 4 : loopStride > 1 ? 3 : parameterTypes.includes('f32[]') ? 2 : 1,
     kind: extentAbi || loopStride > 1 || parameterTypes.includes('f32[]') ? 'closed-numeric-loop' : 'closed-f64-loop',
     ...(extentAbi || loopStride > 1 ? { loopStride } : {}),
+    ...(orderedAbi ? { resultType: resultNode ? 'f64' : 'void', iterationSemantics: 'ordered' } : {}),
     functionName: fn.id.name,
     sourceName: String(sourceName),
     sourceSpan: { start: fn.start, end: fn.end },
@@ -364,11 +408,11 @@ export function compileNumericKernel(source, {
     ...get(indexLocal), ...get(countLocal), 0x4f, 0x0d, 1, // break if i >= count
     ...instructions,
     ...get(indexLocal), 0x41, loopStride, 0x6a, ...set(indexLocal), 0x0c, 0,
-    0x0b, 0x0b, 0x0b,
+    0x0b, 0x0b, ...result, 0x0b,
   ];
   const wasm = new Uint8Array([
     0, 0x61, 0x73, 0x6d, 1, 0, 0, 0,
-    ...section(1, vector([[0x60, ...vector(types.map(type => [type])), 0]])),
+    ...section(1, vector([[0x60, ...vector(types.map(type => [type])), ...(resultNode ? [1, F64] : [0])]])),
     ...section(3, vector([[0]])),
     ...section(5, vector([[1, ...u32(1), ...u32(maxMemoryPages)]])),
     ...section(7, vector([[...text('run'), 0, 0], [...text('memory'), 2, 0]])),

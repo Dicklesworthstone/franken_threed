@@ -45,7 +45,7 @@ function readManifest(module, wasm) {
   let manifest;
   try { manifest = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(sections[0])); }
   catch (cause) { throw new NumericKernelGuardError('KERNEL_ABI_MISMATCH', 'Invalid ABI metadata', { cause }); }
-  const float32Abi = [2, 3, 4].includes(manifest?.version) && manifest.kind === 'closed-numeric-loop';
+  const float32Abi = [2, 3, 4, 5].includes(manifest?.version) && manifest.kind === 'closed-numeric-loop';
   if (!manifest || (!float32Abi && (manifest.version !== 1 || manifest.kind !== 'closed-f64-loop')) ||
       manifest.numericSemantics !== 'f64-operator-order' || manifest.automaticRouteAdmission !== false ||
       !Number.isInteger(manifest.maxMemoryPages) || manifest.maxMemoryPages < 1 ||
@@ -59,6 +59,10 @@ function readManifest(module, wasm) {
       manifest.loopStride < (manifest.version === 3 ? 2 : 1) || manifest.loopStride > 16)) {
     refuse('KERNEL_ABI_MISMATCH', 'Invalid fixed-stride loop ABI');
   }
+  if (manifest.version === 5 && (!['f64', 'void'].includes(manifest.resultType) ||
+      manifest.iterationSemantics !== 'ordered')) {
+    refuse('KERNEL_ABI_MISMATCH', 'Invalid ordered-loop result ABI');
+  }
   const names = new Set();
   let writes = 0;
   for (const param of manifest.parameters) {
@@ -68,7 +72,7 @@ function readManifest(module, wasm) {
       refuse('KERNEL_ABI_MISMATCH', 'Invalid parameter descriptor');
     }
     names.add(param.name);
-    if (manifest.version === 4) {
+    if (manifest.version >= 4) {
       const access = param.access;
       if (param.type === 'f64' ? access !== undefined :
           !access || typeof access.indexed !== 'boolean' || !Number.isInteger(access.minimumLength) ||
@@ -83,7 +87,8 @@ function readManifest(module, wasm) {
     if (param.write) writes++;
     Object.freeze(param);
   }
-  if (!writes || manifest.parameters[manifest.boundParameter].type === 'f64') {
+  if ((!writes && !(manifest.version === 5 && manifest.resultType === 'f64')) ||
+      manifest.parameters[manifest.boundParameter].type === 'f64') {
     refuse('KERNEL_ABI_MISMATCH', 'Missing output or invalid array loop bound');
   }
   Object.freeze(manifest.parameters);
@@ -164,13 +169,14 @@ export function instantiateNumericKernel(bytes, { fallback = null, maxMemoryByte
       }
     }
     const count = records.find(record => record.index === manifest.boundParameter).length;
+    if (count > 0xfffffff0) refuse('KERNEL_LOOP_EXTENT', 'Loop extent exceeds the non-wrapping i32 range');
     if (manifest.version >= 3 && count % manifest.loopStride !== 0) {
       refuse('KERNEL_LOOP_EXTENT', 'Incomplete final record requires original JavaScript bounds semantics');
     }
     let requiredBytes = 0;
     for (const record of records) {
       const access = record.param.access;
-      record.count = manifest.version === 4
+      record.count = manifest.version >= 4
         ? Math.max(access.indexed ? count : 0, access.minimumLength) : count;
       record.byteLength = record.count * record.elementBytes;
       record.ptr = Math.ceil(requiredBytes / record.elementBytes) * record.elementBytes;
@@ -187,7 +193,10 @@ export function instantiateNumericKernel(bytes, { fallback = null, maxMemoryByte
     for (let i = 0; i < records.length; i++) {
       for (let j = 0; j < i; j++) {
         const a = records[i], b = records[j];
-        if (a.byteLength && b.byteLength && a.buffer === b.buffer &&
+        // Ordered reductions can read the same input twice (e.g. dot(a, a)).
+        // Unshared fixed buffers cannot change between the two private copies.
+        if ((manifest.version < 5 || a.param.write || b.param.write) &&
+            a.byteLength && b.byteLength && a.buffer === b.buffer &&
             a.offset < b.offset + b.byteLength && b.offset < a.offset + a.byteLength) {
           refuse('KERNEL_ARRAY_ALIAS', `${a.param.name} and ${b.param.name} have overlapping accessed storage`);
         }
@@ -212,12 +221,16 @@ export function instantiateNumericKernel(bytes, { fallback = null, maxMemoryByte
   function run(...args) {
     if (disposed) refuse('KERNEL_DISPOSED', 'The numeric kernel has been disposed');
     let prepared;
+    let result;
     try {
       prepared = prepare(args);
       for (const record of prepared.records) {
         if (record.param.read) apply(typedSet, record.scratch, [record.source]);
       }
-      execute(...prepared.values, prepared.count);
+      result = execute(...prepared.values, prepared.count);
+      if (manifest.version === 5 && manifest.resultType === 'f64' && typeof result !== 'number') {
+        refuse('KERNEL_ABI_MISMATCH', 'Numeric return was not produced before publication');
+      }
     } catch (cause) {
       const error = cause instanceof NumericKernelGuardError ? cause :
         new NumericKernelGuardError('KERNEL_EXECUTION_FAILED', 'Wasm preparation/execution failed before publication', { cause });
@@ -236,6 +249,7 @@ export function instantiateNumericKernel(bytes, { fallback = null, maxMemoryByte
     for (const record of prepared.records) {
       stats.copiedBytes += record.byteLength * (Number(record.param.read) + Number(record.param.write));
     }
+    if (manifest.version === 5 && manifest.resultType === 'f64') return result;
   }
 
   return Object.freeze({
