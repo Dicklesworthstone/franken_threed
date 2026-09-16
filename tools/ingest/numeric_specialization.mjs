@@ -1,5 +1,5 @@
 /**
- * Discover closed update loops and specialize ordinary ESM call sites.
+ * Discover closed update loops/pipelines and specialize ordinary ESM call sites.
  *
  * Original declarations/exports/identities remain untouched. Only direct calls
  * in this source unit are rewritten, with a runtime callee-identity guard.
@@ -120,8 +120,12 @@ export function specializeNumericModule(source, {
       ? statement.declaration : statement;
     if (fn?.type !== 'FunctionDeclaration' || !fn.id) continue;
     const loopPosition = fn.body.body.length - (fn.body.body.at(-1)?.type === 'ReturnStatement' ? 2 : 1);
-    if (fn.body.body[loopPosition]?.type !== 'ForStatement' ||
-        fn.body.body.slice(0, loopPosition).some(node => node.type !== 'VariableDeclaration')) continue;
+    const loops = fn.body.body.filter(node => node.type === 'ForStatement');
+    // Candidate discovery is not admission: every pass and intervening statement
+    // must compile before any call is rewritten. An unsafe later pass retains
+    // the entire original function, not a partially specialized prefix.
+    if (loops.length < 2 && (fn.body.body[loopPosition]?.type !== 'ForStatement' ||
+        fn.body.body.slice(0, loopPosition).some(node => node.type !== 'VariableDeclaration'))) continue;
     const item = { functionName: fn.id.name, sourceSpan: span(fn), route: 'retained-js', reason: null, calls: [] };
     report.candidates.push(item);
     // Rebinding before this module's evaluation is possible through an ESM
@@ -181,7 +185,13 @@ export function specializeNumericModule(source, {
     }
     item.route = 'guarded-numeric-wasm';
     item.parameterTypes = parameterTypes;
-    item.loopStride = artifact.manifest.loopStride ?? 1;
+    if (artifact.manifest.version === 6) {
+      item.loopCount = artifact.manifest.loops.length;
+      item.boundParameters = [...artifact.manifest.boundParameters];
+      item.loops = artifact.manifest.loops.map((pass, index) => ({ ...pass, sourceSpan: span(loops[index]) }));
+    } else {
+      item.loopStride = artifact.manifest.loopStride ?? 1;
+    }
     item.resultType = artifact.manifest.resultType ?? 'void';
     if (artifact.manifest.iterationSemantics) item.iterationSemantics = artifact.manifest.iterationSemantics;
     item.variants = [

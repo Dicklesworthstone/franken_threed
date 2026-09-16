@@ -81,11 +81,21 @@ function loaderSource(artifact) {
   // browser import-map changes, a Node Buffer dependency, or an async frame API.
   // kernel.wasm is also emitted for hosts that prefer explicit binary loading.
   const base64 = Buffer.from(artifact.wasm).toString('base64');
+  // The no-Wasm fallback exposes the same immutable ABI as the native runtime.
+  // Emit this only for pipelines, preserving legacy generated loader bytes.
+  const pipelineFreeze = artifact.manifest.version === 6 ? `
+Object.freeze(manifest.boundParameters);
+manifest.loops.forEach(Object.freeze);
+Object.freeze(manifest.loops);
+for (const parameter of manifest.parameters) {
+  if (parameter.access) Object.freeze(parameter.access.loopBounds);
+}
+` : '';
   return `/** Generated numeric-kernel package: explicit opt-in, no speedup claim. */
 import { instantiateNumericKernel, NumericKernelGuardError } from './runtime.mjs';
 import retained from './retained.mjs';
 export { retained };
-const manifest = ${JSON.stringify(artifact.manifest, null, 2)};
+const manifest = ${JSON.stringify(artifact.manifest, null, 2)};${pipelineFreeze}
 for (const parameter of manifest.parameters) {
   if (parameter.access) Object.freeze(parameter.access);
   Object.freeze(parameter);
@@ -127,7 +137,7 @@ export function createKernel() {
 }
 
 /**
- * Build a closed loop and its scalar helper declarations into a fresh directory. All compile and
+ * Build a closed loop/pipeline and its scalar helper declarations into a fresh directory. All compile and
  * source-read errors occur before creating output. Existing directories/files
  * and leaf symlinks are never overwritten. A failed filesystem write is
  * reported rather than deleting or replacing anything owned by the caller.
