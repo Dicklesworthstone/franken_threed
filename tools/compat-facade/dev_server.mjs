@@ -15,6 +15,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { resolveStaticFile, serveStaticFile, sendFileError } from './static-files.mjs';
 
 import {
   FACADE_NO_CLAIM_ATTESTATION,
@@ -184,7 +185,7 @@ export * from '${modulePath}';
  * @returns {http.Server} Configured Node HTTP server
  */
 export function createCompatDevServer(options = {}) {
-  const repoRoot = options.repoRoot || REPO_ROOT;
+  const repoRoot = path.resolve(options.repoRoot || REPO_ROOT);
   const h1RelPath = options.h1RelativePath || 'upstream/three.js/examples/webgpu_performance_renderbundle.html';
   const h1AbsPath = path.resolve(repoRoot, h1RelPath);
 
@@ -202,8 +203,25 @@ export function createCompatDevServer(options = {}) {
       return;
     }
 
-    const urlObj = new URL(req.url, 'http://127.0.0.1');
-    const pathname = decodeURIComponent(urlObj.pathname);
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      res.writeHead(405, { Allow: 'GET, HEAD, OPTIONS', 'Content-Type': 'text/plain' });
+      res.end('Method not allowed');
+      return;
+    }
+
+    let pathname;
+    try {
+      const urlObj = new URL(req.url, 'http://127.0.0.1');
+      pathname = decodeURIComponent(urlObj.pathname);
+      // Reject invalid filesystem characters and platform-dependent separators.
+      if (pathname.includes('\\') || /[\u0000-\u001f\u007f]/.test(pathname)) throw new URIError('Invalid path');
+    } catch {
+      res.writeHead(400, { 'Content-Type': 'text/plain' });
+      res.end('Invalid request URL');
+      return;
+    }
+    const serve = (filePath, root = repoRoot, settings = {}) =>
+      serveStaticFile(req, res, filePath, root, repoRoot, MIME_TYPES, settings);
 
     // 1. Root & H1 Example Page
     if (
@@ -211,14 +229,21 @@ export function createCompatDevServer(options = {}) {
       pathname === '/examples/webgpu_performance_renderbundle.html' ||
       pathname === '/webgpu_performance_renderbundle.html'
     ) {
-      if (!fs.existsSync(h1AbsPath)) {
+      let h1File;
+      try {
+        h1File = resolveStaticFile(repoRoot, h1AbsPath);
+      } catch (error) {
+        sendFileError(res, error);
+        return;
+      }
+      if (h1File === null) {
         res.writeHead(404, { 'Content-Type': 'text/plain' });
         res.end(`H1 demo file not found at: ${h1AbsPath}`);
         return;
       }
 
       try {
-        const originalHtml = fs.readFileSync(h1AbsPath, 'utf-8');
+        const originalHtml = fs.readFileSync(h1File, 'utf-8');
         const transformedHtml = transformHtmlImportMap(originalHtml);
 
         res.writeHead(200, {
@@ -279,78 +304,41 @@ export function createCompatDevServer(options = {}) {
     // 3. /compat-facade/addons/* -> upstream/three.js/examples/jsm/*
     if (pathname.startsWith('/compat-facade/addons/')) {
       const subpath = pathname.slice('/compat-facade/addons/'.length);
-      const targetPath = path.resolve(repoRoot, 'upstream/three.js/examples/jsm', subpath);
-      if (fs.existsSync(targetPath) && fs.statSync(targetPath).isFile()) {
-        const ext = path.extname(targetPath).toLowerCase();
-        const contentType = MIME_TYPES[ext] || 'application/javascript; charset=utf-8';
-        res.writeHead(200, {
-          'Content-Type': contentType,
-          'X-FrankenThreeD-Attestation': FACADE_NO_CLAIM_ATTESTATION,
-        });
-        fs.createReadStream(targetPath).pipe(res);
-        return;
-      }
+      const addonRoot = path.resolve(repoRoot, 'upstream/three.js/examples/jsm');
+      if (serve(path.resolve(addonRoot, subpath), addonRoot, {
+        fallbackType: 'application/javascript; charset=utf-8',
+        headers: { 'X-FrankenThreeD-Attestation': FACADE_NO_CLAIM_ATTESTATION },
+      })) return;
       res.writeHead(404, { 'Content-Type': 'text/plain' });
       res.end(`Addon not found: ${subpath}`);
       return;
     }
 
     // 4. Convenience route for H1 local relative assets (example.css, jsm/*)
+    const examplesRoot = path.resolve(repoRoot, 'upstream/three.js/examples');
     if (pathname === '/example.css' || pathname === '/examples/example.css') {
-      const cssPath = path.resolve(repoRoot, 'upstream/three.js/examples/example.css');
-      if (fs.existsSync(cssPath)) {
-        res.writeHead(200, { 'Content-Type': 'text/css; charset=utf-8' });
-        fs.createReadStream(cssPath).pipe(res);
-        return;
-      }
+      if (serve(path.resolve(examplesRoot, 'example.css'), examplesRoot)) return;
     }
 
     // 4b. Static alias for /build/* -> upstream/three.js/build/* (source-relative ../build/* from examples)
     if (pathname.startsWith('/build/')) {
       const subpath = pathname.slice('/build/'.length);
-      const targetPath = path.resolve(repoRoot, 'upstream/three.js/build', subpath);
-      if (fs.existsSync(targetPath) && fs.statSync(targetPath).isFile()) {
-        const ext = path.extname(targetPath).toLowerCase();
-        const contentType = MIME_TYPES[ext] || 'application/javascript; charset=utf-8';
-        res.writeHead(200, {
-          'Content-Type': contentType,
-          'X-FrankenThreeD-Attestation': FACADE_NO_CLAIM_ATTESTATION,
-        });
-        fs.createReadStream(targetPath).pipe(res);
-        return;
-      }
+      const buildRoot = path.resolve(repoRoot, 'upstream/three.js/build');
+      if (serve(path.resolve(buildRoot, subpath), buildRoot, {
+        fallbackType: 'application/javascript; charset=utf-8',
+        headers: { 'X-FrankenThreeD-Attestation': FACADE_NO_CLAIM_ATTESTATION },
+      })) return;
     }
 
     // 5. Static file serving from repo root (upstream, tools, tests)
     const sanitizedRelPath = pathname.replace(/^\/+/, '');
     const candidatePath = path.resolve(repoRoot, sanitizedRelPath);
-
-    // Security check: ensure path stays within repoRoot
-    if (!candidatePath.startsWith(repoRoot)) {
-      res.writeHead(403, { 'Content-Type': 'text/plain' });
-      res.end('Access denied');
-      return;
-    }
-
-    if (fs.existsSync(candidatePath) && fs.statSync(candidatePath).isFile()) {
-      const ext = path.extname(candidatePath).toLowerCase();
-      const contentType = MIME_TYPES[ext] || 'application/octet-stream';
-      res.writeHead(200, { 'Content-Type': contentType });
-      fs.createReadStream(candidatePath).pipe(res);
-      return;
-    }
+    if (serve(candidatePath)) return;
 
     // 6. Upstream examples fallback (e.g. textures, fonts, sounds, jsm)
     // Strip leading 'examples/' if present to avoid doubled examples/examples/ resolution
     const examplesRelSubpath = sanitizedRelPath.replace(/^examples\//, '');
-    const examplesFallback = path.resolve(repoRoot, 'upstream/three.js/examples', examplesRelSubpath);
-    if (fs.existsSync(examplesFallback) && fs.statSync(examplesFallback).isFile()) {
-      const ext = path.extname(examplesFallback).toLowerCase();
-      const contentType = MIME_TYPES[ext] || 'application/octet-stream';
-      res.writeHead(200, { 'Content-Type': contentType });
-      fs.createReadStream(examplesFallback).pipe(res);
-      return;
-    }
+    if (serve(path.resolve(examplesRoot, examplesRelSubpath), examplesRoot)) return;
 
     res.writeHead(404, { 'Content-Type': 'text/plain' });
     res.end(`File not found: ${pathname}`);
