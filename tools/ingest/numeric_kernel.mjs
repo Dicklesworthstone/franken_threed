@@ -77,11 +77,17 @@ function member(node, object, property, computed) {
  * specializeNumericModule establishes that proof for linked application code.
  * allowMath additionally requires a runtime resolveMath closure for the actual
  * shared lexical Math binding. Missing/changed bindings retain JavaScript.
+ * checkedIndexing opts into ABI v7: arbitrary numeric subscripts, read-only
+ * u16[]/u32[] topology, and source-ordered float gathers/scatters. Each executed
+ * access checks its own view before conversion. The host packs full accessed
+ * views and publishes no writes if any check traps. No check-elision or SIMD
+ * independence is inferred; colliding scatters must remain ordered.
  */
 export function compileNumericKernel(source, {
   parameterTypes,
   helperSources = new Map(),
   allowMath = false,
+  checkedIndexing = false,
   sourceName = '<numeric-kernel>',
   maxMemoryPages = DEFAULT_MAX_PAGES,
 } = {}) {
@@ -92,6 +98,8 @@ export function compileNumericKernel(source, {
     fail('maxMemoryPages must be between 1 and 16384', null, 'INVALID_KERNEL_ABI');
   }
   if (typeof allowMath !== 'boolean') fail('allowMath must be a boolean', null, 'INVALID_KERNEL_ABI');
+  if (typeof checkedIndexing !== 'boolean') fail('checkedIndexing must be a boolean', null, 'INVALID_KERNEL_ABI');
+  const arrayTypes = checkedIndexing ? ['f32[]', 'f64[]', 'u16[]', 'u32[]'] : ['f32[]', 'f64[]'];
   let ast;
   try {
     ast = acorn.parse(source, { ecmaVersion: 'latest', sourceType: 'module', locations: true });
@@ -106,8 +114,8 @@ export function compileNumericKernel(source, {
   }
   if (!Array.isArray(parameterTypes) || parameterTypes.length !== fn.params.length ||
       parameterTypes.length > 64 ||
-      parameterTypes.some(type => !['f32[]', 'f64[]', 'f64'].includes(type))) {
-    fail('Supply one f32[], f64[] or f64 type per parameter (at most 64)', fn, 'INVALID_KERNEL_ABI');
+      parameterTypes.some(type => type !== 'f64' && !arrayTypes.includes(type))) {
+    fail('Supply one numeric ABI type per parameter (at most 64); integer arrays require checkedIndexing', fn, 'INVALID_KERNEL_ABI');
   }
   const params = new Map();
   fn.params.forEach((param, index) => {
@@ -128,6 +136,12 @@ export function compileNumericKernel(source, {
   }
   if (resultNode && !resultNode.argument) fail('Final return must be a numeric expression', resultNode);
   const bounds = new Map();
+  // v7 appends every array's intrinsic length in parameter order. Unlike the
+  // prefix ABI, an indirect access is checked against its OWN view, not the
+  // loop bound or the shared Wasm allocation. Legacy signatures are unchanged.
+  if (checkedIndexing) for (const param of params.values()) {
+    if (param.type !== 'f64') bounds.set(param.name, params.size + bounds.size);
+  }
   const passes = new Map(loops.map(node => {
     const init = node.init;
     if (init?.type !== 'VariableDeclaration' || init.kind !== 'let' || init.declarations.length !== 1) {
@@ -143,7 +157,7 @@ export function compileNumericKernel(source, {
     const boundParam = params.get(bound?.object?.name);
     if (node.test?.type !== 'BinaryExpression' || node.test.operator !== '<' ||
         node.test.left.type !== 'Identifier' || node.test.left.name !== indexName ||
-        !['f32[]', 'f64[]'].includes(boundParam?.type) || !member(bound, boundParam.name, 'length', false)) {
+        !arrayTypes.includes(boundParam?.type) || !member(bound, boundParam.name, 'length', false)) {
       fail('Loop condition must be index < arrayParameter.length', node.test || node);
     }
     const update = node.update;
@@ -183,11 +197,27 @@ export function compileNumericKernel(source, {
   const indexedBounds = new Map();
   const minimumLengths = new Map();
   let inLoop = false;
-  const arrayParameter = (node, writing = false) => {
+  const arrayParameter = (node, writing = false, depth = 0) => {
     const param = params.get(node?.object?.name);
-    if (!['f32[]', 'f64[]'].includes(param?.type) || node?.type !== 'MemberExpression' ||
+    if (!arrayTypes.includes(param?.type) || node?.type !== 'MemberExpression' ||
         node.optional || !node.computed || node.object.type !== 'Identifier') {
-      fail('Array access must use the current disjoint loop record', node);
+      fail('Array access must use a numeric array parameter', node);
+    }
+    if (checkedIndexing) {
+      if (writing && ['u16[]', 'u32[]'].includes(param.type)) {
+        fail('Integer topology arrays are read-only', node);
+      }
+      const value = expression(node.property, depth + 1);
+      const local = temporaryBase + temporaryCount++;
+      // Numeric -0 becomes the property key "0" in JS. Non-integers, NaN,
+      // infinities and out-of-view indices must take the original JS path, not
+      // be truncated/wrapped or read another parameter's packed memory.
+      const setup = [...value, ...set(local),
+        ...get(local), ...number(0), 0x66,
+        ...get(local), ...get(bounds.get(param.name)), 0xb8, 0x63, 0x71,
+        ...get(local), ...get(local), 0x9d, 0x61, 0x71,
+        0x45, 0x04, 0x40, 0x00, 0x0b]; // if !valid: unreachable (transaction abort)
+      return { ...param, elementOffset: 0, checkedLocal: local, setup };
     }
     if (node.property.type === 'Literal' && Number.isInteger(node.property.value) &&
         node.property.value >= 0 && node.property.value < 65536) {
@@ -213,17 +243,24 @@ export function compileNumericKernel(source, {
     indexedBounds.get(param.name).add(boundParam.index);
     return { ...param, elementOffset, fixed: false };
   };
-  const alignment = param => param.type === 'f32[]' ? 2 : 3;
-  const memoryOffset = param => u32(param.elementOffset * (param.type === 'f32[]' ? 4 : 8));
-  const address = param => param.fixed ? get(param.index)
+  const alignment = param => param.type === 'u16[]' ? 1 : param.type === 'f64[]' ? 3 : 2;
+  const memoryOffset = param => u32(param.elementOffset * (2 ** alignment(param)));
+  const address = param => param.checkedLocal !== undefined
+    ? [...get(param.index), ...get(param.checkedLocal), 0xab, 0x41, alignment(param), 0x74, 0x6a]
+    : param.fixed ? get(param.index)
     : [...get(param.index), ...get(indexLocal), 0x41, alignment(param), 0x74, 0x6a];
-  const load = param => {
+  const load = (param, prepared = false) => {
     reads.add(param.name);
     // JavaScript reads float32 storage as a Number. Promote before arithmetic;
     // using f32 operators here would introduce extra rounding at every operator.
+    const prefix = [...(prepared ? [] : param.setup ?? []), ...address(param)];
+    if (param.type === 'u16[]' || param.type === 'u32[]') {
+      return [...prefix, param.type === 'u16[]' ? 0x2f : 0x28, alignment(param),
+        ...memoryOffset(param), 0xb8]; // i32.load16_u/load; f64.convert_i32_u
+    }
     return param.type === 'f32[]'
-      ? [...address(param), 0x2a, 2, ...memoryOffset(param), 0xbb] // f32.load; f64.promote_f32
-      : [...address(param), 0x2b, 3, ...memoryOffset(param)]; // f64.load
+      ? [...prefix, 0x2a, 2, ...memoryOffset(param), 0xbb] // f32.load; f64.promote_f32
+      : [...prefix, 0x2b, 3, ...memoryOffset(param)]; // f64.load
   };
   function expression(node, depth = 0) {
     if (!node || depth > 128) fail('Expression nesting exceeds the admitted bound', node);
@@ -244,11 +281,11 @@ export function compileNumericKernel(source, {
     }
     // The bound view's intrinsic length is already guarded and cannot change
     // during an import-free call over fixed, unshared buffers.
-    if (pipeline) {
+    if (pipeline || checkedIndexing) {
       const name = node.object?.name;
       if (bounds.has(name) && member(node, name, 'length', false)) return [...get(bounds.get(name)), 0xb8];
     } else if (member(node, boundParam.name, 'length', false)) return [...get(countLocal), 0xb8];
-    if (node.type === 'MemberExpression') return load(arrayParameter(node));
+    if (node.type === 'MemberExpression') return load(arrayParameter(node, false, depth));
     if (node.type === 'UnaryExpression' && (node.operator === '+' || node.operator === '-')) {
       const operand = expression(node.argument, depth + 1);
       return node.operator === '-' ? [...operand, 0x9a] : operand;
@@ -395,8 +432,11 @@ export function compileNumericKernel(source, {
         const target = arrayParameter(assignment.left, true);
         const value = expression(assignment.right);
         const compound = assignment.operator !== '=';
-        bytes.push(...address(target),
-          ...(compound ? load(target) : []), ...value,
+        // Evaluate a scatter destination exactly once, before the RHS. Compound
+        // stores load through that same checked address, preserving collisions
+        // and the Float32 rounding of EACH source-ordered store.
+        bytes.push(...(target.setup ?? []), ...address(target),
+          ...(compound ? load(target, true) : []), ...value,
           ...(compound ? [OPS[assignment.operator[0]]] : []),
           // Round at EACH float32 store, including stores read again in this loop.
           ...(target.type === 'f32[]' ? [0xb6, 0x38, 2] : [0x39, 3]), ...memoryOffset(target));
@@ -406,7 +446,7 @@ export function compileNumericKernel(source, {
         // Strided stores may leave other record channels untouched.
         // A pipeline's accessed prefix may exceed a given pass's write extent.
         // Preserve all untouched channels/tails without guessing full coverage.
-        if (pipeline || conditional || loopStride > 1) reads.add(target.name);
+        if (checkedIndexing || pipeline || conditional || loopStride > 1) reads.add(target.name);
       }
       return bytes;
     } finally {
@@ -446,14 +486,14 @@ export function compileNumericKernel(source, {
   // v5 records ordered scalar state and optional results. Array access extents
   // do not authorize parallelizing or reassociating loop-carried accumulators.
   // v6 is a single transaction over ordered passes, not loop fusion/reassociation.
-  const orderedAbi = pipeline || scalarWrites.size > 0 || resultNode !== null;
+  const orderedAbi = checkedIndexing || pipeline || scalarWrites.size > 0 || resultNode !== null;
   const extentAbi = orderedAbi || prelude.length > 0 || minimumLengths.size > 0;
 
   const mathIntrinsics = intrinsics.requirements();
   const manifest = {
-    version: pipeline ? 6 : orderedAbi ? 5 : extentAbi ? 4 : loopStride > 1 ? 3 : parameterTypes.includes('f32[]') ? 2 : 1,
-    kind: pipeline ? 'closed-numeric-pipeline' : extentAbi || loopStride > 1 || parameterTypes.includes('f32[]') ? 'closed-numeric-loop' : 'closed-f64-loop',
-    ...(!pipeline && (extentAbi || loopStride > 1) ? { loopStride } : {}),
+    version: checkedIndexing ? 7 : pipeline ? 6 : orderedAbi ? 5 : extentAbi ? 4 : loopStride > 1 ? 3 : parameterTypes.includes('f32[]') ? 2 : 1,
+    kind: checkedIndexing ? 'closed-indexed-numeric' : pipeline ? 'closed-numeric-pipeline' : extentAbi || loopStride > 1 || parameterTypes.includes('f32[]') ? 'closed-numeric-loop' : 'closed-f64-loop',
+    ...(!checkedIndexing && !pipeline && (extentAbi || loopStride > 1) ? { loopStride } : {}),
     ...(orderedAbi ? { resultType: resultNode ? 'f64' : 'void', iterationSemantics: 'ordered' } : {}),
     functionName: fn.id.name,
     sourceName: String(sourceName),
@@ -461,12 +501,16 @@ export function compileNumericKernel(source, {
     parameters: [...params.values()].map(param => ({
       name: param.name, type: param.type,
       read: reads.has(param.name), write: writes.has(param.name),
-      ...(extentAbi && param.type !== 'f64' ? { access: {
+      ...(!checkedIndexing && extentAbi && param.type !== 'f64' ? { access: {
         indexed: indexed.has(param.name), minimumLength: minimumLengths.get(param.name) ?? 0,
         ...(pipeline ? { loopBounds: [...(indexedBounds.get(param.name) ?? [])] } : {}),
       } } : {}),
     })),
-    ...(pipeline ? {
+    ...(checkedIndexing ? {
+      indexSemantics: 'checked-integer-full-view-v1',
+      lengthParameters: [...bounds.keys()].map(name => params.get(name).index),
+      loops: [...passes.values()].map(pass => ({ boundParameter: pass.boundParam.index, loopStride: pass.loopStride })),
+    } : pipeline ? {
       boundParameters: [...bounds.keys()].map(name => params.get(name).index),
       loops: [...passes.values()].map(pass => ({ boundParameter: pass.boundParam.index, loopStride: pass.loopStride })),
     } : { boundParameter: boundParam.index }),
@@ -498,8 +542,9 @@ export function compileNumericKernel(source, {
     if (parameter.access) Object.freeze(parameter.access);
     Object.freeze(parameter);
   }
-  if (pipeline) {
-    Object.freeze(manifest.boundParameters);
+  if (checkedIndexing) Object.freeze(manifest.lengthParameters);
+  if (pipeline || checkedIndexing) {
+    if (manifest.boundParameters) Object.freeze(manifest.boundParameters);
     manifest.loops.forEach(Object.freeze);
     Object.freeze(manifest.loops);
   }

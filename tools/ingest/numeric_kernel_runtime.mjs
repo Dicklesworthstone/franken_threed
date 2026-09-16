@@ -13,6 +13,8 @@ const MAX_BYTES = 1024 * 1024 * 1024;
 const F64Array = Float64Array;
 const F32Array = Float32Array;
 const U8Array = Uint8Array;
+const U16Array = Uint16Array;
+const U32Array = Uint32Array;
 const apply = Reflect.apply;
 const descriptor = Object.getOwnPropertyDescriptor;
 const prototype = Object.getPrototypeOf;
@@ -63,6 +65,54 @@ export class NumericKernelGuardError extends Error {
 
 function refuse(code, message) { throw new NumericKernelGuardError(code, message); }
 
+
+// v7 has one length argument for each array, in declaration order. Full-view
+// packing plus checked element addresses supports indirect geometry without
+// pretending that the iteration domain proves the destination's bounds.
+function indexedManifest(manifest) {
+  const arrays = [], names = new Set();
+  if (manifest.kind !== 'closed-indexed-numeric' ||
+      !['f64-operator-order', MATH_SEMANTICS].includes(manifest.numericSemantics) ||
+      manifest.indexSemantics !== 'checked-integer-full-view-v1' ||
+      manifest.automaticRouteAdmission !== false || manifest.iterationSemantics !== 'ordered' ||
+      !['f64', 'void'].includes(manifest.resultType) ||
+      !Number.isInteger(manifest.maxMemoryPages) || manifest.maxMemoryPages < 1 ||
+      manifest.maxMemoryPages > MAX_BYTES / PAGE_BYTES ||
+      !Array.isArray(manifest.parameters) || !manifest.parameters.length || manifest.parameters.length > 64 ||
+      manifest.boundParameter !== undefined || manifest.boundParameters !== undefined || manifest.loopStride !== undefined) {
+    refuse('KERNEL_ABI_MISMATCH', 'Invalid checked-index numeric contract');
+  }
+  let writes = false;
+  manifest.parameters.forEach((param, index) => {
+    if (!param || typeof param.name !== 'string' || names.has(param.name) ||
+        !['f64', 'f32[]', 'f64[]', 'u16[]', 'u32[]'].includes(param.type) ||
+        typeof param.read !== 'boolean' || typeof param.write !== 'boolean' || param.access !== undefined ||
+        (param.type === 'f64' && (param.read || param.write)) ||
+        (param.write && (!param.read || !['f32[]', 'f64[]'].includes(param.type)))) {
+      refuse('KERNEL_ABI_MISMATCH', 'Invalid checked-index parameter');
+    }
+    names.add(param.name);
+    if (param.type !== 'f64') arrays.push(index);
+    writes ||= param.write;
+    Object.freeze(param);
+  });
+  const lengths = manifest.lengthParameters;
+  if (!arrays.length || !Array.isArray(lengths) || lengths.length !== arrays.length ||
+      arrays.some((index, i) => lengths[i] !== index) ||
+      !Array.isArray(manifest.loops) || !manifest.loops.length || manifest.loops.length > 16 ||
+      manifest.loops.some(pass => !pass || !arrays.includes(pass.boundParameter) ||
+        !Number.isInteger(pass.loopStride) || pass.loopStride < 1 || pass.loopStride > 16) ||
+      (!writes && manifest.resultType !== 'f64')) {
+    refuse('KERNEL_ABI_MISMATCH', 'Invalid checked-index lengths, loops or output');
+  }
+  Object.freeze(lengths);
+  manifest.loops.forEach(Object.freeze);
+  Object.freeze(manifest.loops);
+  Object.freeze(manifest.parameters);
+  if (manifest.sourceSpan) Object.freeze(manifest.sourceSpan);
+  return Object.freeze(manifest);
+}
+
 function readManifest(module, wasm) {
   const sections = wasm.Module.customSections(module, SECTION);
   if (sections.length !== 1 || sections[0].byteLength > 65536) {
@@ -79,6 +129,7 @@ function readManifest(module, wasm) {
     refuse('KERNEL_ABI_MISMATCH', 'Invalid guarded Math requirements');
   }
   if (guardedMath) Object.freeze(manifest.mathIntrinsics);
+  if (manifest?.version === 7) return indexedManifest(manifest);
   const pipeline = manifest?.version === 6 && manifest.kind === 'closed-numeric-pipeline';
   const float32Abi = pipeline || ([2, 3, 4, 5].includes(manifest?.version) && manifest.kind === 'closed-numeric-loop');
   if (!manifest || (!float32Abi && (manifest.version !== 1 || manifest.kind !== 'closed-f64-loop')) ||
@@ -164,8 +215,10 @@ function readManifest(module, wasm) {
 
 function arrayInfo(value, param, checkLength) {
   const { name } = param;
-  const ArrayType = param.type === 'f32[]' ? F32Array : F64Array;
-  const tag = param.type === 'f32[]' ? 'Float32Array' : 'Float64Array';
+  const ArrayType = param.type === 'u16[]' ? U16Array : param.type === 'u32[]' ? U32Array
+    : param.type === 'f32[]' ? F32Array : F64Array;
+  const tag = param.type === 'u16[]' ? 'Uint16Array' : param.type === 'u32[]' ? 'Uint32Array'
+    : param.type === 'f32[]' ? 'Float32Array' : 'Float64Array';
   // Native slot access rejects proxies without running their traps or user getters.
   if (apply(typedTag, value, []) !== tag || prototype(value) !== ArrayType.prototype) {
     refuse('KERNEL_ARRAY_TYPE', `${name} must be a genuine, non-subclass ${tag}`);
@@ -187,7 +240,7 @@ function arrayInfo(value, param, checkLength) {
     throw new NumericKernelGuardError('KERNEL_ARRAY_OWNERSHIP', `${name} has shared or detached storage`, { cause });
   }
   return { buffer, offset: apply(typedOffset, value, []), length: apply(typedLength, value, []),
-    ArrayType, elementBytes: param.type === 'f32[]' ? 4 : 8 };
+    ArrayType, elementBytes: param.type === 'u16[]' ? 2 : param.type === 'f64[]' ? 8 : 4 };
 }
 
 /**
@@ -215,9 +268,11 @@ export function instantiateNumericKernel(bytes, { fallback = null, maxMemoryByte
   const module = new wasm.Module(bytes);
   const manifest = readManifest(module, wasm);
   const pipeline = manifest.version === 6;
-  const boundParameters = pipeline ? manifest.boundParameters : [manifest.boundParameter];
+  const checkedIndexing = manifest.version === 7;
+  const boundParameters = checkedIndexing ? manifest.lengthParameters
+    : pipeline ? manifest.boundParameters : [manifest.boundParameter];
   const boundSet = new Set(boundParameters);
-  const passes = pipeline ? manifest.loops : [{ boundParameter: manifest.boundParameter, loopStride: manifest.loopStride ?? 1 }];
+  const passes = pipeline || checkedIndexing ? manifest.loops : [{ boundParameter: manifest.boundParameter, loopStride: manifest.loopStride ?? 1 }];
   const exports = wasm.Module.exports(module);
   if (wasm.Module.imports(module).length !== 0 || exports.length !== 2 ||
       !exports.some(item => item.name === 'run' && item.kind === 'function') ||
@@ -274,7 +329,10 @@ export function instantiateNumericKernel(bytes, { fallback = null, maxMemoryByte
       const access = record.param.access;
       // Pack each parameter once, covering the union of every pass's accessed
       // prefix. Later passes see earlier writes in the same private memory.
-      record.count = pipeline ? access.minimumLength
+      // An indirect view's accessed extent is unknown before execution. Preserve
+      // the full view, including untouched scatter destinations and tails.
+      record.count = checkedIndexing ? (record.param.read || record.param.write ? record.length : 0)
+        : pipeline ? access.minimumLength
         : manifest.version >= 4 ? maximum(access.indexed ? counts[0] : 0, access.minimumLength) : counts[0];
       if (pipeline) for (const index of access.loopBounds) record.count = maximum(record.count, lengths.get(index));
       record.byteLength = record.count * record.elementBytes;
