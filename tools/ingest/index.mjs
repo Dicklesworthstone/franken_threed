@@ -19,3 +19,4 @@ export {
 
 export { compileNumericKernel, NumericKernelCompileError, NUMERIC_KERNEL_SECTION } from './numeric_kernel.mjs';
 export { instantiateNumericKernel, NumericKernelGuardError } from './numeric_kernel_runtime.mjs';
+export { buildNumericKernel } from './numeric_kernel_build.mjs';

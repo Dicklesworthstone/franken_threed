@@ -5,8 +5,6 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { buildModuleGraph } from './module_graph.mjs';
-import { buildApplication } from './build_application.mjs';
 
 function printHelp() {
   console.log(`
@@ -19,6 +17,9 @@ Options:
   --entry <path>        Path to HTML or ESM entry point (required)
   --build-app <dir>     Emit runnable application build to target directory (must be fresh)
   --out-dir <dir>       Alias for --build-app
+  --build-kernel <dir>  Compile one closed numeric function to a fresh Wasm package
+  --parameter-types <csv>  Kernel parameter ABI, for example 'f64[],f64[],f64'
+  --max-memory-pages <n>   Kernel memory ceiling in 64 KiB pages (default: 1024)
   --output <path>       Output JSON file path (default: stdout)
   --package-root <url>  Base URL or directory for Three.js package fallback
   --help, -h            Show this help message
@@ -47,6 +48,9 @@ async function main() {
   let output = null;
   let packageRoot = null;
   let buildAppDir = null;
+  let buildKernelDir = null;
+  let parameterTypes = null;
+  let maxMemoryPages;
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -65,6 +69,15 @@ async function main() {
         process.exit(1);
       }
       buildAppDir = args[++i];
+    } else if (arg === '--build-kernel' || arg === '--parameter-types' || arg === '--max-memory-pages') {
+      if (i + 1 >= args.length || args[i + 1].startsWith('-')) {
+        console.error(`Error: ${arg} requires an argument.`);
+        process.exit(1);
+      }
+      const value = args[++i];
+      if (arg === '--build-kernel') buildKernelDir = value;
+      else if (arg === '--parameter-types') parameterTypes = value.split(',').map(type => type.trim());
+      else maxMemoryPages = Number(value);
     } else if (arg === '--output') {
       if (i + 1 >= args.length || args[i + 1].startsWith('-')) {
         console.error('Error: --output requires a file path argument.');
@@ -89,6 +102,15 @@ async function main() {
   if (!entry) {
     console.error('Error: --entry <path> is required.');
     printHelp();
+    process.exit(1);
+  }
+
+  if (buildKernelDir && (!parameterTypes || buildAppDir || output || packageRoot)) {
+    console.error('Error: --build-kernel requires --parameter-types and cannot be combined with --build-app, --output or --package-root.');
+    process.exit(1);
+  }
+  if (!buildKernelDir && (parameterTypes || maxMemoryPages !== undefined)) {
+    console.error('Error: --parameter-types and --max-memory-pages require --build-kernel.');
     process.exit(1);
   }
 
@@ -149,7 +171,16 @@ async function main() {
   }
 
   try {
+    if (buildKernelDir) {
+      const { buildNumericKernel } = await import('./numeric_kernel_build.mjs');
+      const result = buildNumericKernel(entry, buildKernelDir, { parameterTypes, maxMemoryPages });
+      console.log(`Numeric kernel package emitted to: ${result.outDir}`);
+      console.log(`Entry: ${result.entry}; binary: ${result.binary}`);
+      console.log('Execution: explicit guarded Wasm with original JavaScript fallback; no speedup claim.');
+      return;
+    }
     if (buildAppDir) {
+      const { buildApplication } = await import('./build_application.mjs');
       const appResult = await buildApplication(entry, buildAppDir, {
         packageRootUrl: packageRoot
       });
@@ -175,6 +206,7 @@ async function main() {
       return;
     }
 
+    const { buildModuleGraph } = await import('./module_graph.mjs');
     const bundle = await buildModuleGraph(entry, {
       packageRootUrl: packageRoot
     });
