@@ -26,7 +26,10 @@ function boundNames(pattern, names = []) {
  * Extract local ESM exports without evaluating application code. Resolve stars by
  * binding identity, not by name alone (ECMA-262 GetExportedNames/ResolveExport).
  * Only completed root results enter the public cache: an in-progress cycle is
- * not an empty module. A cache represents one immutable source snapshot.
+ * not an empty module. A cache represents one immutable source/resolver snapshot.
+ * `resolveModule(specifier, importer)` may supply an absolute ESM path for package
+ * exports. Named external exports remain opaque; external stars and conflicting
+ * opaque providers require a resolver rather than an invented export surface.
  */
 export function extractModuleExportSurface(filePath, options = {}) {
   const cache = options.cache || new Map();
@@ -48,9 +51,18 @@ export function extractModuleExportSurface(filePath, options = {}) {
     const target = (source) => {
       const specifier = source.value;
       if (!specifier.startsWith('./') && !specifier.startsWith('../') && !path.isAbsolute(specifier)) {
-        throw new Error(`Cannot statically resolve package re-export ${JSON.stringify(specifier)} in ${file}`);
+        const resolved = options.resolveModule?.(specifier, file);
+        if (resolved != null && !path.isAbsolute(resolved)) {
+          throw new Error(`resolveModule must return an absolute ESM path for ${JSON.stringify(specifier)}`);
+        }
+        return resolved ?? null;
       }
       return path.resolve(path.dirname(file), specifier);
+    };
+    const indirect = (source, name) => {
+      const resolved = target(source);
+      if (resolved !== null) return { file: resolved, name };
+      return { file, name: JSON.stringify([source.value, name === NAMESPACE ? ['namespace'] : name]), external: true };
     };
     for (const node of ast.body) {
       if (node.type === 'ImportDeclaration') {
@@ -75,20 +87,26 @@ export function extractModuleExportSurface(filePath, options = {}) {
         }
         for (const spec of node.specifiers) {
           record.exports.set(exportName(spec.exported), node.source
-            ? { file: target(node.source), name: exportName(spec.local) }
+            ? indirect(node.source, exportName(spec.local))
             : { file, name: exportName(spec.local), local: true });
         }
       } else if (node.type === 'ExportAllDeclaration') {
         if (node.exported) {
-          record.exports.set(exportName(node.exported), { file: target(node.source), name: NAMESPACE });
-        } else if (recursive) record.stars.push(target(node.source));
+          record.exports.set(exportName(node.exported), indirect(node.source, NAMESPACE));
+        } else if (recursive) {
+          const resolved = target(node.source);
+          if (resolved === null) {
+            throw new Error(`Cannot statically resolve export * from ${JSON.stringify(node.source.value)} in ${file}; supply resolveModule`);
+          }
+          record.stars.push(resolved);
+        }
       }
     }
     for (const [name, binding] of record.exports) {
       const imported = binding.local && record.imports.get(binding.name);
       // Namespace imports create local bindings, even when their values are identical.
       if (imported && imported.name !== NAMESPACE) {
-        record.exports.set(name, { file: target(imported.source), name: imported.name });
+        record.exports.set(name, indirect(imported.source, imported.name));
       }
     }
     // Shallow records are deliberately not shared with recursive graph walks.
@@ -115,7 +133,7 @@ export function extractModuleExportSurface(filePath, options = {}) {
     const record = read(file);
     const direct = record.exports.get(name);
     if (direct) {
-      if (direct.local || direct.name === NAMESPACE) return direct;
+      if (direct.local || direct.external || direct.name === NAMESPACE) return direct;
       return resolve(direct.file, direct.name, seen);
     }
     if (name === 'default') return null;
@@ -124,16 +142,23 @@ export function extractModuleExportSurface(filePath, options = {}) {
       const candidate = resolve(star, name, seen);
       if (candidate === AMBIGUOUS) return AMBIGUOUS;
       if (!candidate) continue;
-      if (binding && (binding.file !== candidate.file || binding.name !== candidate.name)) return AMBIGUOUS;
+      if (binding && (binding.file !== candidate.file || binding.name !== candidate.name)) {
+        if (binding.external || candidate.external) {
+          throw new Error(`Cannot statically disambiguate external export ${JSON.stringify(name)} in ${file}; supply resolveModule`);
+        }
+        return AMBIGUOUS;
+      }
       binding = candidate;
     }
     return binding;
   }
 
   const record = read(root);
+  const starOnly = [];
   const exported = [...names(root)].filter((name) => {
     if (!recursive) return true;
     const binding = resolve(root, name);
+    if (binding?.name === NAMESPACE && !record.exports.has(name)) starOnly.push(name);
     return binding !== null && binding !== AMBIGUOUS;
   });
   const hasDefault = exported.includes('default');
@@ -143,6 +168,10 @@ export function extractModuleExportSurface(filePath, options = {}) {
     totalCount: exported.length,
     isCJS: record.isCJS,
   };
+  // Some engines disagree on namespace diamonds. Do not turn a star-only
+  // namespace into an explicit import that can make an otherwise valid module
+  // fail linking; let the host's wildcard semantics decide its runtime presence.
+  if (starOnly.length) result.starOnly = starOnly.sort();
   if (recursive) cache.set(root, result);
   return result;
 }

@@ -15,6 +15,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import * as acorn from 'acorn';
+import { extractModuleExportSurface as resolveExportSurface } from './export-surface.mjs';
 
 /**
  * Standard no-claim attestation for retained upstream compatibility facades (§5.1, §5.12).
@@ -97,103 +98,11 @@ export function enumeratePackageExportEntries(options = {}) {
  * @param {Object} [options]
  * @param {Map<string, Object>} [options.cache] Module export cache
  * @param {boolean} [options.recursive=true] Whether to resolve export * declarations
+ * @param {Function} [options.resolveModule] Resolve package specifiers to absolute ESM paths
  * @returns {{ named: string[], hasDefault: boolean, totalCount: number, isCJS: boolean }}
  */
 export function extractModuleExportSurface(filePath, options = {}) {
-  const cache = options.cache || new Map();
-  const absPath = path.resolve(filePath);
-
-  if (cache.has(absPath)) {
-    return cache.get(absPath);
-  }
-
-  const result = {
-    named: new Set(),
-    hasDefault: false,
-    isCJS: absPath.endsWith('.cjs'),
-  };
-
-  // Guard against circular re-exports
-  cache.set(absPath, {
-    named: [],
-    hasDefault: false,
-    totalCount: 0,
-    isCJS: result.isCJS,
-  });
-
-  if (!fs.existsSync(absPath)) {
-    return { named: [], hasDefault: false, totalCount: 0, isCJS: result.isCJS };
-  }
-
-  const code = fs.readFileSync(absPath, 'utf-8');
-
-  // CommonJS files do not declare static ES exports
-  if (result.isCJS) {
-    const formatted = {
-      named: [],
-      hasDefault: false,
-      totalCount: 0,
-      isCJS: true,
-    };
-    cache.set(absPath, formatted);
-    return formatted;
-  }
-
-  const ast = acorn.parse(code, {
-    ecmaVersion: 'latest',
-    sourceType: 'module',
-  });
-
-  for (const node of ast.body) {
-    if (node.type === 'ExportDefaultDeclaration') {
-      result.hasDefault = true;
-    } else if (node.type === 'ExportNamedDeclaration') {
-      if (node.declaration) {
-        if (node.declaration.id && node.declaration.id.name) {
-          result.named.add(node.declaration.id.name);
-        } else if (node.declaration.declarations) {
-          for (const d of node.declaration.declarations) {
-            if (d.id && d.id.name) {
-              result.named.add(d.id.name);
-            }
-          }
-        }
-      }
-      if (Array.isArray(node.specifiers)) {
-        for (const spec of node.specifiers) {
-          const name = spec.exported ? spec.exported.name : null;
-          if (name === 'default') {
-            result.hasDefault = true;
-          } else if (name) {
-            result.named.add(name);
-          }
-        }
-      }
-    } else if (node.type === 'ExportAllDeclaration') {
-      if (node.exported && node.exported.name) {
-        // export * as namespace from '...'
-        result.named.add(node.exported.name);
-      } else if (options.recursive !== false && node.source && typeof node.source.value === 'string') {
-        // export * from '...'
-        const targetPath = path.resolve(path.dirname(absPath), node.source.value);
-        const sub = extractModuleExportSurface(targetPath, { cache, recursive: true });
-        for (const n of sub.named) {
-          result.named.add(n);
-        }
-      }
-    }
-  }
-
-  const sortedNamed = Array.from(result.named).sort();
-  const formatted = {
-    named: sortedNamed,
-    hasDefault: result.hasDefault,
-    totalCount: sortedNamed.length + (result.hasDefault ? 1 : 0),
-    isCJS: false,
-  };
-
-  cache.set(absPath, formatted);
-  return formatted;
+  return resolveExportSurface(filePath, options);
 }
 
 /**
@@ -209,6 +118,11 @@ export function generateFacadeModule(entry, exportSurface, options = {}) {
   const retainedSpecifier =
     options.retainedSpecifier ||
     `./${entry.retainedRelativePath.split(path.sep).join('/')}`;
+
+  const quotedSpecifier = JSON.stringify(retainedSpecifier);
+  const explicitNamed = exportSurface.named.filter((name) => !exportSurface.starOnly?.includes(name));
+  const exportName = (name) => /^[\p{ID_Start}$_][\p{ID_Continue}$\u200c\u200d]*$/u.test(name)
+    ? name : JSON.stringify(name);
 
   const header = [
     '/**',
@@ -226,7 +140,7 @@ export function generateFacadeModule(entry, exportSurface, options = {}) {
       header,
       "'use strict';",
       '',
-      `module.exports = require('${retainedSpecifier}');`,
+      `module.exports = require(${quotedSpecifier});`,
       '',
     ].join('\n');
   }
@@ -235,7 +149,7 @@ export function generateFacadeModule(entry, exportSurface, options = {}) {
   if (exportSurface.named.length === 0 && !exportSurface.hasDefault) {
     return [
       header,
-      `export * from '${retainedSpecifier}';`,
+      `export * from ${quotedSpecifier};`,
       '',
     ].join('\n');
   }
@@ -243,18 +157,18 @@ export function generateFacadeModule(entry, exportSurface, options = {}) {
   const lines = [header];
 
   // Wildcard re-export for complete library compatibility
-  lines.push(`export * from '${retainedSpecifier}';`);
+  lines.push(`export * from ${quotedSpecifier};`);
 
   // Explicit default re-export if retained target exports default
   if (exportSurface.hasDefault) {
-    lines.push(`export { default } from '${retainedSpecifier}';`);
+    lines.push(`export { default } from ${quotedSpecifier};`);
   }
 
   // Explicit named re-exports for 100% transparent AST inspection and autocomplete
-  if (exportSurface.named.length > 0) {
+  if (explicitNamed.length > 0) {
     lines.push(`export {`);
-    lines.push(`  ${exportSurface.named.join(',\n  ')}`);
-    lines.push(`} from '${retainedSpecifier}';`);
+    lines.push(`  ${explicitNamed.map(exportName).join(',\n  ')}`);
+    lines.push(`} from ${quotedSpecifier};`);
   }
 
   lines.push('');
@@ -333,10 +247,15 @@ export function parseFacadeExportSurface(facadeSource, moduleType = 'esm') {
 
   for (const node of ast.body) {
     if (node.type === 'ExportAllDeclaration') {
-      hasWildcard = true;
+      if (!node.exported) hasWildcard = true;
+      else {
+        const name = node.exported.name ?? node.exported.value;
+        if (name === 'default') hasDefault = true;
+        else named.add(name);
+      }
     } else if (node.type === 'ExportNamedDeclaration') {
       for (const spec of node.specifiers) {
-        const exportedName = spec.exported.name;
+        const exportedName = spec.exported.name ?? spec.exported.value;
         if (exportedName === 'default') {
           hasDefault = true;
         } else {
@@ -370,6 +289,13 @@ export function buildFacadeModuleMap(options = {}) {
   const entries = enumeratePackageExportEntries(options);
   const cache = new Map();
   const facadeMap = new Map();
+  // Use the reconciled import targets for package self-references. Resolving
+  // through require() would select the wrong side of conditional package exports.
+  const packageName = options.packageName || 'three';
+  const packageTargets = new Map(entries.filter((entry) => entry.moduleType === 'esm')
+    .map((entry) => [entry.exportKey === '.' ? packageName : `${packageName}/${entry.exportKey.slice(2)}`, entry.retainedAbsolutePath]));
+  const resolveModule = (specifier, importer) =>
+    options.resolveModule?.(specifier, importer) ?? packageTargets.get(specifier);
 
   const categoryCounts = {};
   let esmCount = 0;
@@ -409,7 +335,7 @@ export function buildFacadeModuleMap(options = {}) {
 
     // ESM module
     esmCount++;
-    const surface = extractModuleExportSurface(entry.retainedAbsolutePath, { cache });
+    const surface = extractModuleExportSurface(entry.retainedAbsolutePath, { cache, resolveModule });
     totalNamedExports += surface.named.length;
     if (surface.hasDefault) defaultCount++;
 
