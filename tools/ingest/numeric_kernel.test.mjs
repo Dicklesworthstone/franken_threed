@@ -141,7 +141,7 @@ test('rejects unclosed and effectful source before producing executable code', a
     'function f(x) { for (let i=0; i<x.length; i++) { const t=later; const later=1; x[i]=t; } }',
     'function f(x) { for (let i=0; i<x.length; i++) { x[i]=this.value; } }',
     'function f(x) { for (let i=0; i<x.length; i++) { x[i]++; } }',
-    'function f(x) { for (let i=0; i<x.length; i++) { if (i) x[i]=1; } }',
+    'function f(x) { for (let i=0; i<x.length; i++) { while (i) x[i]=1; } }',
     'function f(x) { for (let i=0; i<x.length; i++) { x[i]=1; return; } }',
     'function f(x) { sideEffect(); for (let i=0; i<x.length; i++) x[i]=1; }',
     'function f(x) { for (let i=1; i<x.length; i++) x[i]=1; }',

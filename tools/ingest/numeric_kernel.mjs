@@ -2,7 +2,8 @@
  * Closed f64 update-island compiler. This emits executable Wasm, not a route label.
  *
  * Admitted shape: one synchronous function, one counted loop, scalar arithmetic
- * and same-index Float64Array reads/writes. No calls, escapes, implicit numeric
+ * and same-index Float64Array reads/writes, including closed conditionals.
+ * No calls, escapes, implicit numeric
  * conversions, cross-element dependencies, or arithmetic reassociation.
  * Runtime shape/ownership guards live in numeric_kernel_runtime.mjs. This narrow
  * opt-in ABI is not proof of whole-application closure or a speedup claim.
@@ -13,6 +14,7 @@ export const NUMERIC_KERNEL_SECTION = 'f3d.numeric-kernel';
 const F64 = 0x7c;
 const I32 = 0x7f;
 const OPS = Object.freeze({ '+': 0xa0, '-': 0xa1, '*': 0xa2, '/': 0xa3 });
+const COMPARE = Object.freeze({ '===': 0x61, '!==': 0x62, '<': 0x63, '>': 0x64, '<=': 0x65, '>=': 0x66 });
 const DEFAULT_MAX_PAGES = 1024;
 
 export class NumericKernelCompileError extends Error {
@@ -130,7 +132,9 @@ export function compileNumericKernel(source, {
 
   const countLocal = params.size;
   const indexLocal = countLocal + 1;
-  const temporaries = new Map();
+  let temporaries = new Map();
+  let temporaryCount = 0;
+  let statementCount = 0;
   const reads = new Set();
   const writes = new Set();
   const arrayParameter = node => {
@@ -152,7 +156,11 @@ export function compileNumericKernel(source, {
       if (node.name === indexName) return [...get(indexLocal), 0xb8]; // f64.convert_i32_u
       const param = params.get(node.name);
       if (param?.type === 'f64') return get(param.index);
-      if (temporaries.has(node.name)) return get(temporaries.get(node.name));
+      if (temporaries.has(node.name)) {
+        const local = temporaries.get(node.name);
+        if (local === null) fail(`Binding ${node.name} is used before initialization`, node);
+        return get(local);
+      }
       fail(`Unresolved or non-scalar binding ${node.name}`, node);
     }
     if (node.type === 'MemberExpression') return load(arrayParameter(node));
@@ -163,41 +171,113 @@ export function compileNumericKernel(source, {
     if (node.type === 'BinaryExpression' && Object.hasOwn(OPS, node.operator)) {
       return [...expression(node.left, depth + 1), ...expression(node.right, depth + 1), OPS[node.operator]];
     }
+    if (node.type === 'ConditionalExpression') {
+      return [...condition(node.test, depth + 1), 0x04, F64,
+        ...expression(node.consequent, depth + 1), 0x05,
+        ...expression(node.alternate, depth + 1), 0x0b];
+    }
     fail(`Unsupported expression ${node.type}; calls and implicit conversions are not closed`, node);
   }
 
-  const statements = loop.body.type === 'BlockStatement' ? loop.body.body : [loop.body];
-  if (statements.length > 2048) fail('Loop body exceeds the statement limit', loop.body);
-  const instructions = [];
-  for (const statement of statements) {
-    if (statement.type === 'VariableDeclaration' && ['const', 'let'].includes(statement.kind)) {
-      for (const variable of statement.declarations) {
-        const name = variable.id.name;
-        if (variable.id.type !== 'Identifier' || !variable.init || name === indexName ||
-            params.has(name) || temporaries.has(name)) {
-          fail('Temporaries must be distinct initialized scalar bindings', variable);
-        }
-        // Resolve the initializer before publishing the local: no silent TDZ-to-zero lowering.
-        const initializer = expression(variable.init);
-        const local = indexLocal + 1 + temporaries.size;
-        temporaries.set(name, local);
-        instructions.push(...initializer, ...set(local));
-      }
-      continue;
+  // Predicates produce i32, while all numeric expressions stay f64. Keeping
+  // these contexts separate avoids confusing JavaScript booleans with numbers
+  // in strict equality, temporary bindings, and conditional result types.
+  function condition(node, depth = 0) {
+    if (!node || depth > 128) fail('Predicate nesting exceeds the admitted bound', node);
+    if (node.type === 'Literal' && typeof node.value === 'boolean') return [0x41, Number(node.value)];
+    if (node.type === 'BinaryExpression' && Object.hasOwn(COMPARE, node.operator)) {
+      return [...expression(node.left, depth + 1), ...expression(node.right, depth + 1), COMPARE[node.operator]];
     }
-    const assignment = statement.type === 'ExpressionStatement' ? statement.expression : null;
-    if (assignment?.type !== 'AssignmentExpression' ||
-        !['=', '+=', '-=', '*=', '/='].includes(assignment.operator)) {
-      fail('Loop statements must initialize scalars or assign array[index]', statement);
+    if (node.type === 'UnaryExpression' && node.operator === '!') {
+      return [...condition(node.argument, depth + 1), 0x45]; // i32.eqz
     }
-    const target = arrayParameter(assignment.left);
-    const value = expression(assignment.right);
-    const compound = assignment.operator !== '=';
-    instructions.push(...address(target),
-      ...(compound ? load(target) : []), ...value,
-      ...(compound ? [OPS[assignment.operator[0]]] : []), 0x39, 3, 0);
-    writes.add(target.name);
+    if (node.type === 'LogicalExpression' && node.operator === '&&') {
+      return [...condition(node.left, depth + 1), 0x04, I32,
+        ...condition(node.right, depth + 1), 0x05, 0x41, 0, 0x0b];
+    }
+    if (node.type === 'LogicalExpression' && node.operator === '||') {
+      return [...condition(node.left, depth + 1), 0x04, I32, 0x41, 1, 0x05,
+        ...condition(node.right, depth + 1), 0x0b];
+    }
+    if (node.type === 'ConditionalExpression') {
+      return [...condition(node.test, depth + 1), 0x04, I32,
+        ...condition(node.consequent, depth + 1), 0x05,
+        ...condition(node.alternate, depth + 1), 0x0b];
+    }
+    // Numeric truthiness: 0 < abs(value) is false for both zero signs and NaN,
+    // true for every other Number, and evaluates the source expression once.
+    return [...number(0), ...expression(node, depth + 1), 0x99, 0x63];
   }
+
+  function compileBlock(statements, conditional = false, depth = 0) {
+    if (depth > 128) fail('Statement nesting exceeds the admitted bound', loop.body);
+    const parentScope = temporaries;
+    temporaries = new Map(parentScope);
+    const declared = new Set();
+    try {
+      // Install lexical TDZ markers before compiling any statement. A nested
+      // block's later declaration shadows its outer binding even before init.
+      for (const statement of statements) {
+        if (statement.type !== 'VariableDeclaration') continue;
+        if (!['const', 'let'].includes(statement.kind)) fail('Only lexical scalar temporaries are admitted', statement);
+        for (const variable of statement.declarations) {
+          const name = variable.id.name;
+          if (variable.id.type !== 'Identifier' || !variable.init || name === indexName ||
+              params.has(name) || declared.has(name)) {
+            fail('Temporaries must be initialized scalar bindings without parameter/index shadowing', variable);
+          }
+          declared.add(name);
+          temporaries.set(name, null);
+        }
+      }
+      const bytes = [];
+      const child = statement => compileBlock(
+        statement.type === 'BlockStatement' ? statement.body : [statement], true, depth + 1);
+      for (const statement of statements) {
+        if (++statementCount > 2048) fail('Loop body exceeds the statement limit', statement);
+        if (statement.type === 'VariableDeclaration') {
+          for (const variable of statement.declarations) {
+            const initializer = expression(variable.init);
+            const local = indexLocal + 1 + temporaryCount++;
+            temporaries.set(variable.id.name, local);
+            bytes.push(...initializer, ...set(local));
+          }
+          continue;
+        }
+        if (statement.type === 'BlockStatement') {
+          bytes.push(...compileBlock(statement.body, conditional, depth + 1));
+          continue;
+        }
+        if (statement.type === 'IfStatement') {
+          bytes.push(...condition(statement.test), 0x04, 0x40, ...child(statement.consequent));
+          if (statement.alternate) bytes.push(0x05, ...child(statement.alternate));
+          bytes.push(0x0b);
+          continue;
+        }
+        const assignment = statement.type === 'ExpressionStatement' ? statement.expression : null;
+        if (assignment?.type !== 'AssignmentExpression' ||
+            !['=', '+=', '-=', '*=', '/='].includes(assignment.operator)) {
+          fail('Loop statements must initialize scalars, branch, or assign array[index]', statement);
+        }
+        const target = arrayParameter(assignment.left);
+        const value = expression(assignment.right);
+        const compound = assignment.operator !== '=';
+        bytes.push(...address(target),
+          ...(compound ? load(target) : []), ...value,
+          ...(compound ? [OPS[assignment.operator[0]]] : []), 0x39, 3, 0);
+        writes.add(target.name);
+        // A skipped store must preserve the original element, not stale private
+        // Wasm memory from a previous invocation. Mark it as a packing input.
+        if (conditional) reads.add(target.name);
+      }
+      return bytes;
+    } finally {
+      temporaries = parentScope;
+    }
+  }
+
+  const statements = loop.body.type === 'BlockStatement' ? loop.body.body : [loop.body];
+  const instructions = compileBlock(statements);
   if (writes.size === 0) fail('Kernel must produce at least one array output', loop.body);
 
   const manifest = {
@@ -217,7 +297,7 @@ export function compileNumericKernel(source, {
   };
   const types = [...parameterTypes.map(type => type === 'f64[]' ? I32 : F64), I32];
   const locals = [[...u32(1), I32]];
-  if (temporaries.size) locals.push([...u32(temporaries.size), F64]);
+  if (temporaryCount) locals.push([...u32(temporaryCount), F64]);
   const body = [
     ...vector(locals),
     0x02, 0x40, 0x03, 0x40, // block; loop
