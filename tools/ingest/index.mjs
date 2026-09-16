@@ -17,3 +17,5 @@ export {
   evaluateModuleGraphRoutes
 } from "./route_bridge.mjs";
 
+export { compileNumericKernel, NumericKernelCompileError, NUMERIC_KERNEL_SECTION } from './numeric_kernel.mjs';
+export { instantiateNumericKernel, NumericKernelGuardError } from './numeric_kernel_runtime.mjs';
