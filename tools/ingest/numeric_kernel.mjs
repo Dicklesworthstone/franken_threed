@@ -1,7 +1,7 @@
 /**
  * Closed f64 update-island compiler. This emits executable Wasm, not a route label.
  *
- * Admitted shape: pure scalar setup, one counted loop, scalar arithmetic
+ * Admitted shape: scalar setup/state, one or more ordered counted loops, arithmetic
  * and fixed-stride Float32Array/Float64Array updates, including conditionals.
  * Scalar accumulators and a final numeric return execute in source iteration order.
  * Closed scalar helpers execute as private Wasm functions. No host calls,
@@ -112,47 +112,60 @@ export function compileNumericKernel(source, {
     params.set(param.name, { name: param.name, type: parameterTypes[index], index });
   });
   const resultNode = fn.body.body.at(-1)?.type === 'ReturnStatement' ? fn.body.body.at(-1) : null;
+  const loops = fn.body.body.filter(node => node.type === 'ForStatement');
+  if (loops.length > 16) fail('Numeric pipeline exceeds the 16-pass limit', fn.body);
+  const pipeline = loops.length > 1;
   const loopPosition = fn.body.body.length - (resultNode ? 2 : 1);
   const prelude = fn.body.body.slice(0, loopPosition);
-  const loop = fn.body.body[loopPosition];
-  if (loop?.type !== 'ForStatement' || prelude.some(node => node.type !== 'VariableDeclaration')) {
+  const loop = pipeline ? loops[0] : fn.body.body[loopPosition];
+  if (!pipeline && (loop?.type !== 'ForStatement' || prelude.some(node => node.type !== 'VariableDeclaration'))) {
     fail('Function body must contain scalar declarations followed by one counted for loop', fn.body);
   }
   if (resultNode && !resultNode.argument) fail('Final return must be a numeric expression', resultNode);
-  const init = loop.init;
-  if (init?.type !== 'VariableDeclaration' || init.kind !== 'let' || init.declarations.length !== 1) {
-    fail('Loop must initialize a fresh let index to zero', init || loop);
-  }
-  const binding = init.declarations[0];
-  if (binding.id.type !== 'Identifier' || binding.init?.type !== 'Literal' || binding.init.value !== 0) {
-    fail('Loop index must be an identifier initialized to zero', binding);
-  }
-  const indexName = binding.id.name;
-  if (params.has(indexName)) fail('Loop index must not shadow a parameter', binding);
-  const bound = loop.test?.right;
-  const boundParam = params.get(bound?.object?.name);
-  if (loop.test?.type !== 'BinaryExpression' || loop.test.operator !== '<' ||
-      loop.test.left.type !== 'Identifier' || loop.test.left.name !== indexName ||
-      !['f32[]', 'f64[]'].includes(boundParam?.type) || !member(bound, boundParam.name, 'length', false)) {
-    fail('Loop condition must be index < arrayParameter.length', loop.test || loop);
-  }
-  const update = loop.update;
-  let loopStride;
-  if (update?.type === 'UpdateExpression' && update.operator === '++' &&
-      update.argument.type === 'Identifier' && update.argument.name === indexName) {
-    loopStride = 1;
-  } else if (update?.type === 'AssignmentExpression' && update.operator === '+=' &&
-      update.left.type === 'Identifier' && update.left.name === indexName &&
-      update.right.type === 'Literal' && Number.isInteger(update.right.value) &&
-      update.right.value >= 1 && update.right.value <= 16) {
-    loopStride = update.right.value;
-  } else {
-    fail('Loop must increment the index by a constant stride between 1 and 16', update || loop);
-  }
+  const bounds = new Map();
+  const passes = new Map(loops.map(node => {
+    const init = node.init;
+    if (init?.type !== 'VariableDeclaration' || init.kind !== 'let' || init.declarations.length !== 1) {
+      fail('Loop must initialize a fresh let index to zero', init || node);
+    }
+    const binding = init.declarations[0];
+    if (binding.id.type !== 'Identifier' || binding.init?.type !== 'Literal' || binding.init.value !== 0) {
+      fail('Loop index must be an identifier initialized to zero', binding);
+    }
+    const indexName = binding.id.name;
+    if (params.has(indexName)) fail('Loop index must not shadow a parameter', binding);
+    const bound = node.test?.right;
+    const boundParam = params.get(bound?.object?.name);
+    if (node.test?.type !== 'BinaryExpression' || node.test.operator !== '<' ||
+        node.test.left.type !== 'Identifier' || node.test.left.name !== indexName ||
+        !['f32[]', 'f64[]'].includes(boundParam?.type) || !member(bound, boundParam.name, 'length', false)) {
+      fail('Loop condition must be index < arrayParameter.length', node.test || node);
+    }
+    const update = node.update;
+    let loopStride;
+    if (update?.type === 'UpdateExpression' && update.operator === '++' &&
+        update.argument.type === 'Identifier' && update.argument.name === indexName) {
+      loopStride = 1;
+    } else if (update?.type === 'AssignmentExpression' && update.operator === '+=' &&
+        update.left.type === 'Identifier' && update.left.name === indexName &&
+        update.right.type === 'Literal' && Number.isInteger(update.right.value) &&
+        update.right.value >= 1 && update.right.value <= 16) {
+      loopStride = update.right.value;
+    } else {
+      fail('Loop must increment the index by a constant stride between 1 and 16', update || node);
+    }
+    if (!bounds.has(boundParam.name)) bounds.set(boundParam.name, params.size + bounds.size);
+    return [node, { indexName, boundParam, loopStride, countLocal: bounds.get(boundParam.name) }];
+  }));
+  // Lengths are separate guarded arguments; each pass owns a fresh zero-initialized
+  // index local even when the source reuses the same lexical index name.
+  let nextIndex = params.size + bounds.size;
+  for (const pass of passes.values()) pass.indexLocal = nextIndex++;
+  const temporaryBase = nextIndex;
+  let { indexName, boundParam, loopStride, countLocal, indexLocal } = passes.get(loop);
+  if (pipeline) indexName = null;
 
   const helperCompiler = createScalarHelperCompiler(helperSources, fail);
-  const countLocal = params.size;
-  const indexLocal = countLocal + 1;
   let temporaries = new Map();
   let temporaryCount = 0;
   let statementCount = 0;
@@ -161,6 +174,7 @@ export function compileNumericKernel(source, {
   const reads = new Set();
   const writes = new Set();
   const indexed = new Set();
+  const indexedBounds = new Map();
   const minimumLengths = new Map();
   let inLoop = false;
   const arrayParameter = (node, writing = false) => {
@@ -189,6 +203,8 @@ export function compileNumericKernel(source, {
       fail('Array offset must be a constant within the current loop stride', node);
     }
     indexed.add(param.name);
+    if (!indexedBounds.has(param.name)) indexedBounds.set(param.name, new Set());
+    indexedBounds.get(param.name).add(boundParam.index);
     return { ...param, elementOffset, fixed: false };
   };
   const alignment = param => param.type === 'f32[]' ? 2 : 3;
@@ -222,7 +238,10 @@ export function compileNumericKernel(source, {
     }
     // The bound view's intrinsic length is already guarded and cannot change
     // during an import-free call over fixed, unshared buffers.
-    if (member(node, boundParam.name, 'length', false)) return [...get(countLocal), 0xb8];
+    if (pipeline) {
+      const name = node.object?.name;
+      if (bounds.has(name) && member(node, name, 'length', false)) return [...get(bounds.get(name)), 0xb8];
+    } else if (member(node, boundParam.name, 'length', false)) return [...get(countLocal), 0xb8];
     if (node.type === 'MemberExpression') return load(arrayParameter(node));
     if (node.type === 'UnaryExpression' && (node.operator === '+' || node.operator === '-')) {
       const operand = expression(node.argument, depth + 1);
@@ -318,11 +337,21 @@ export function compileNumericKernel(source, {
         if (statement.type === 'VariableDeclaration') {
           for (const variable of statement.declarations) {
             const initializer = expression(variable.init);
-            const local = indexLocal + 1 + temporaryCount++;
+            const local = temporaryBase + temporaryCount++;
             temporaries.set(variable.id.name, local);
             if (statement.kind === 'let') mutableLocals.add(local);
             bytes.push(...initializer, ...set(local));
           }
+          continue;
+        }
+        if (pipeline && statement.type === 'ForStatement' && depth === 0) {
+          ({ indexName, boundParam, loopStride, countLocal, indexLocal } = passes.get(statement));
+          if (temporaries.has(indexName)) fail('Pipeline indices must not shadow function-scope locals', statement.init);
+          inLoop = true;
+          const body = statement.body.type === 'BlockStatement' ? statement.body.body : [statement.body];
+          bytes.push(...emitLoop(compileBlock(body, false, depth + 1)));
+          inLoop = false;
+          indexName = null;
           continue;
         }
         if (statement.type === 'BlockStatement') {
@@ -365,7 +394,9 @@ export function compileNumericKernel(source, {
         // A skipped store must preserve the original element, not stale private
         // Wasm memory from a previous invocation. Mark it as a packing input.
         // Strided stores may leave other record channels untouched.
-        if (conditional || loopStride > 1) reads.add(target.name);
+        // A pipeline's accessed prefix may exceed a given pass's write extent.
+        // Preserve all untouched channels/tails without guessing full coverage.
+        if (pipeline || conditional || loopStride > 1) reads.add(target.name);
       }
       return bytes;
     } finally {
@@ -373,11 +404,28 @@ export function compileNumericKernel(source, {
     }
   }
 
-  const statements = loop.body.type === 'BlockStatement' ? loop.body.body : [loop.body];
-  const setup = compileBlock(prelude, false, 0, true);
-  inLoop = true;
-  const instructions = compileBlock(statements);
-  inLoop = false;
+  function emitLoop(instructions) {
+    return [
+      0x02, 0x40, 0x03, 0x40, // block; loop
+      ...get(indexLocal), ...get(countLocal), 0x4f, 0x0d, 1, // break if i >= count
+      ...instructions,
+      ...get(indexLocal), 0x41, loopStride, 0x6a, ...set(indexLocal), 0x0c, 0,
+      0x0b, 0x0b,
+    ];
+  }
+  let execution;
+  if (pipeline) {
+    // Scan the entire function scope once, including declarations between passes:
+    // a later lexical declaration shadows a helper even in earlier loop bodies.
+    execution = compileBlock(resultNode ? fn.body.body.slice(0, -1) : fn.body.body, false, 0, true);
+  } else {
+    const setup = compileBlock(prelude, false, 0, true);
+    inLoop = true;
+    const statements = loop.body.type === 'BlockStatement' ? loop.body.body : [loop.body];
+    const instructions = compileBlock(statements);
+    inLoop = false;
+    execution = [...setup, ...emitLoop(instructions)];
+  }
   const result = resultNode ? expression(resultNode.argument) : [];
   if (writes.size === 0 && !resultNode) fail('Kernel must produce an array output or numeric return', loop.body);
   for (const name of minimumLengths.keys()) {
@@ -387,13 +435,14 @@ export function compileNumericKernel(source, {
   // keep their original ABI and deterministic bytes when this is not needed.
   // v5 records ordered scalar state and optional results. Array access extents
   // do not authorize parallelizing or reassociating loop-carried accumulators.
-  const orderedAbi = scalarWrites.size > 0 || resultNode !== null;
+  // v6 is a single transaction over ordered passes, not loop fusion/reassociation.
+  const orderedAbi = pipeline || scalarWrites.size > 0 || resultNode !== null;
   const extentAbi = orderedAbi || prelude.length > 0 || minimumLengths.size > 0;
 
   const manifest = {
-    version: orderedAbi ? 5 : extentAbi ? 4 : loopStride > 1 ? 3 : parameterTypes.includes('f32[]') ? 2 : 1,
-    kind: extentAbi || loopStride > 1 || parameterTypes.includes('f32[]') ? 'closed-numeric-loop' : 'closed-f64-loop',
-    ...(extentAbi || loopStride > 1 ? { loopStride } : {}),
+    version: pipeline ? 6 : orderedAbi ? 5 : extentAbi ? 4 : loopStride > 1 ? 3 : parameterTypes.includes('f32[]') ? 2 : 1,
+    kind: pipeline ? 'closed-numeric-pipeline' : extentAbi || loopStride > 1 || parameterTypes.includes('f32[]') ? 'closed-numeric-loop' : 'closed-f64-loop',
+    ...(!pipeline && (extentAbi || loopStride > 1) ? { loopStride } : {}),
     ...(orderedAbi ? { resultType: resultNode ? 'f64' : 'void', iterationSemantics: 'ordered' } : {}),
     functionName: fn.id.name,
     sourceName: String(sourceName),
@@ -403,24 +452,23 @@ export function compileNumericKernel(source, {
       read: reads.has(param.name), write: writes.has(param.name),
       ...(extentAbi && param.type !== 'f64' ? { access: {
         indexed: indexed.has(param.name), minimumLength: minimumLengths.get(param.name) ?? 0,
+        ...(pipeline ? { loopBounds: [...(indexedBounds.get(param.name) ?? [])] } : {}),
       } } : {}),
     })),
-    boundParameter: boundParam.index,
+    ...(pipeline ? {
+      boundParameters: [...bounds.keys()].map(name => params.get(name).index),
+      loops: [...passes.values()].map(pass => ({ boundParameter: pass.boundParam.index, loopStride: pass.loopStride })),
+    } : { boundParameter: boundParam.index }),
     maxMemoryPages,
     numericSemantics: 'f64-operator-order',
     automaticRouteAdmission: false,
   };
-  const types = [...parameterTypes.map(type => type === 'f64' ? F64 : I32), I32];
-  const locals = [[...u32(1), I32]];
+  const types = [...parameterTypes.map(type => type === 'f64' ? F64 : I32), ...Array(bounds.size).fill(I32)];
+  const locals = [[...u32(loops.length), I32]];
   if (temporaryCount) locals.push([...u32(temporaryCount), F64]);
   const body = [
     ...vector(locals),
-    ...setup,
-    0x02, 0x40, 0x03, 0x40, // block; loop
-    ...get(indexLocal), ...get(countLocal), 0x4f, 0x0d, 1, // break if i >= count
-    ...instructions,
-    ...get(indexLocal), 0x41, loopStride, 0x6a, ...set(indexLocal), 0x0c, 0,
-    0x0b, 0x0b, ...result, 0x0b,
+    ...execution, ...result, 0x0b,
   ];
   const helperCode = helperCompiler.finish();
   const wasm = new Uint8Array([
@@ -433,8 +481,14 @@ export function compileNumericKernel(source, {
     ...section(0, [...text(NUMERIC_KERNEL_SECTION), ...new TextEncoder().encode(JSON.stringify(manifest))]),
   ]);
   for (const parameter of manifest.parameters) {
+    if (parameter.access?.loopBounds) Object.freeze(parameter.access.loopBounds);
     if (parameter.access) Object.freeze(parameter.access);
     Object.freeze(parameter);
+  }
+  if (pipeline) {
+    Object.freeze(manifest.boundParameters);
+    manifest.loops.forEach(Object.freeze);
+    Object.freeze(manifest.loops);
   }
   Object.freeze(manifest.parameters);
   Object.freeze(manifest.sourceSpan);

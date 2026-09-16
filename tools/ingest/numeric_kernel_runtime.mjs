@@ -45,23 +45,46 @@ function readManifest(module, wasm) {
   let manifest;
   try { manifest = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(sections[0])); }
   catch (cause) { throw new NumericKernelGuardError('KERNEL_ABI_MISMATCH', 'Invalid ABI metadata', { cause }); }
-  const float32Abi = [2, 3, 4, 5].includes(manifest?.version) && manifest.kind === 'closed-numeric-loop';
+  const pipeline = manifest?.version === 6 && manifest.kind === 'closed-numeric-pipeline';
+  const float32Abi = pipeline || ([2, 3, 4, 5].includes(manifest?.version) && manifest.kind === 'closed-numeric-loop');
   if (!manifest || (!float32Abi && (manifest.version !== 1 || manifest.kind !== 'closed-f64-loop')) ||
       manifest.numericSemantics !== 'f64-operator-order' || manifest.automaticRouteAdmission !== false ||
       !Number.isInteger(manifest.maxMemoryPages) || manifest.maxMemoryPages < 1 ||
       manifest.maxMemoryPages > MAX_BYTES / PAGE_BYTES || !Array.isArray(manifest.parameters) ||
       manifest.parameters.length === 0 || manifest.parameters.length > 64 ||
-      !Number.isInteger(manifest.boundParameter) || manifest.boundParameter < 0 ||
-      manifest.boundParameter >= manifest.parameters.length) {
+      (!pipeline && (!Number.isInteger(manifest.boundParameter) || manifest.boundParameter < 0 ||
+      manifest.boundParameter >= manifest.parameters.length))) {
     refuse('KERNEL_ABI_MISMATCH', 'Unsupported numeric-kernel ABI');
   }
-  if (manifest.version >= 3 && (!Number.isInteger(manifest.loopStride) ||
+  if (!pipeline && manifest.version >= 3 && (!Number.isInteger(manifest.loopStride) ||
       manifest.loopStride < (manifest.version === 3 ? 2 : 1) || manifest.loopStride > 16)) {
     refuse('KERNEL_ABI_MISMATCH', 'Invalid fixed-stride loop ABI');
   }
-  if (manifest.version === 5 && (!['f64', 'void'].includes(manifest.resultType) ||
+  if (manifest.version >= 5 && (!['f64', 'void'].includes(manifest.resultType) ||
       manifest.iterationSemantics !== 'ordered')) {
     refuse('KERNEL_ABI_MISMATCH', 'Invalid ordered-loop result ABI');
+  }
+  if (pipeline) {
+    const bounds = manifest.boundParameters;
+    if (!Array.isArray(bounds) || bounds.length < 1 || bounds.length > 16 ||
+        new Set(bounds).size !== bounds.length || bounds.some(index => !Number.isInteger(index) ||
+          index < 0 || index >= manifest.parameters.length ||
+          !['f32[]', 'f64[]'].includes(manifest.parameters[index]?.type)) ||
+        !Array.isArray(manifest.loops) || manifest.loops.length < 2 || manifest.loops.length > 16 ||
+        manifest.loops.some(pass => !pass || !bounds.includes(pass.boundParameter) ||
+          !Number.isInteger(pass.loopStride) || pass.loopStride < 1 || pass.loopStride > 16) ||
+        manifest.boundParameter !== undefined || manifest.loopStride !== undefined) {
+      refuse('KERNEL_ABI_MISMATCH', 'Invalid ordered-pipeline loop descriptors');
+    }
+    // Counts are appended to the entry signature in first-use order. Refuse
+    // reordered/unused descriptors rather than silently changing the call ABI.
+    const used = [...new Set(manifest.loops.map(pass => pass.boundParameter))];
+    if (used.length !== bounds.length || used.some((index, i) => index !== bounds[i])) {
+      refuse('KERNEL_ABI_MISMATCH', 'Pipeline count arguments are not in first-use order');
+    }
+    Object.freeze(bounds);
+    manifest.loops.forEach(Object.freeze);
+    Object.freeze(manifest.loops);
   }
   const names = new Set();
   let writes = 0;
@@ -82,13 +105,22 @@ function readManifest(module, wasm) {
           (access.indexed && !param.read && !param.write)) {
         refuse('KERNEL_ABI_MISMATCH', 'Invalid streamed/uniform access extent');
       }
+      if (pipeline && access) {
+        if (!Array.isArray(access.loopBounds) || access.loopBounds.length > 16 ||
+            new Set(access.loopBounds).size !== access.loopBounds.length ||
+            access.loopBounds.some(index => !manifest.boundParameters.includes(index)) ||
+            access.indexed !== (access.loopBounds.length > 0) || (param.write && !param.read)) {
+          refuse('KERNEL_ABI_MISMATCH', 'Invalid pipeline array access union');
+        }
+        Object.freeze(access.loopBounds);
+      }
       if (access) Object.freeze(access);
     }
     if (param.write) writes++;
     Object.freeze(param);
   }
-  if ((!writes && !(manifest.version === 5 && manifest.resultType === 'f64')) ||
-      manifest.parameters[manifest.boundParameter].type === 'f64') {
+  if ((!writes && !(manifest.version >= 5 && manifest.resultType === 'f64')) ||
+      (!pipeline && manifest.parameters[manifest.boundParameter].type === 'f64')) {
     refuse('KERNEL_ABI_MISMATCH', 'Missing output or invalid array loop bound');
   }
   Object.freeze(manifest.parameters);
@@ -143,6 +175,10 @@ export function instantiateNumericKernel(bytes, { fallback = null, maxMemoryByte
   if (!wasm) refuse('KERNEL_WASM_UNAVAILABLE', 'WebAssembly is unavailable in this host');
   const module = new wasm.Module(bytes);
   const manifest = readManifest(module, wasm);
+  const pipeline = manifest.version === 6;
+  const boundParameters = pipeline ? manifest.boundParameters : [manifest.boundParameter];
+  const boundSet = new Set(boundParameters);
+  const passes = pipeline ? manifest.loops : [{ boundParameter: manifest.boundParameter, loopStride: manifest.loopStride ?? 1 }];
   const exports = wasm.Module.exports(module);
   if (wasm.Module.imports(module).length !== 0 || exports.length !== 2 ||
       !exports.some(item => item.name === 'run' && item.kind === 'function') ||
@@ -165,19 +201,25 @@ export function instantiateNumericKernel(bytes, { fallback = null, maxMemoryByte
       if (param.type === 'f64') {
         if (typeof args[i] !== 'number') refuse('KERNEL_SCALAR_TYPE', `${param.name} must be a number without coercion`);
       } else {
-        records.push({ ...arrayInfo(args[i], param, i === manifest.boundParameter), param, index: i });
+        records.push({ ...arrayInfo(args[i], param, boundSet.has(i)), param, index: i });
       }
     }
-    const count = records.find(record => record.index === manifest.boundParameter).length;
-    if (count > 0xfffffff0) refuse('KERNEL_LOOP_EXTENT', 'Loop extent exceeds the non-wrapping i32 range');
-    if (manifest.version >= 3 && count % manifest.loopStride !== 0) {
-      refuse('KERNEL_LOOP_EXTENT', 'Incomplete final record requires original JavaScript bounds semantics');
+    const lengths = new Map(records.map(record => [record.index, record.length]));
+    const counts = boundParameters.map(index => lengths.get(index));
+    if (counts.some(count => count > 0xfffffff0)) refuse('KERNEL_LOOP_EXTENT', 'Loop extent exceeds the non-wrapping i32 range');
+    for (const pass of passes) {
+      if (lengths.get(pass.boundParameter) % pass.loopStride !== 0) {
+        refuse('KERNEL_LOOP_EXTENT', 'Incomplete final record requires original JavaScript bounds semantics');
+      }
     }
     let requiredBytes = 0;
     for (const record of records) {
       const access = record.param.access;
-      record.count = manifest.version >= 4
-        ? Math.max(access.indexed ? count : 0, access.minimumLength) : count;
+      // Pack each parameter once, covering the union of every pass's accessed
+      // prefix. Later passes see earlier writes in the same private memory.
+      record.count = pipeline
+        ? Math.max(access.minimumLength, ...access.loopBounds.map(index => lengths.get(index)))
+        : manifest.version >= 4 ? Math.max(access.indexed ? counts[0] : 0, access.minimumLength) : counts[0];
       record.byteLength = record.count * record.elementBytes;
       record.ptr = Math.ceil(requiredBytes / record.elementBytes) * record.elementBytes;
       requiredBytes = record.ptr + record.byteLength;
@@ -215,7 +257,7 @@ export function instantiateNumericKernel(bytes, { fallback = null, maxMemoryByte
       record.source = new record.ArrayType(record.buffer, record.offset, record.count);
       record.scratch = new record.ArrayType(scratchBuffer, record.ptr, record.count);
     });
-    return { records, values, count };
+    return { records, values, counts };
   }
 
   function run(...args) {
@@ -227,8 +269,8 @@ export function instantiateNumericKernel(bytes, { fallback = null, maxMemoryByte
       for (const record of prepared.records) {
         if (record.param.read) apply(typedSet, record.scratch, [record.source]);
       }
-      result = execute(...prepared.values, prepared.count);
-      if (manifest.version === 5 && manifest.resultType === 'f64' && typeof result !== 'number') {
+      result = execute(...prepared.values, ...prepared.counts);
+      if (manifest.version >= 5 && manifest.resultType === 'f64' && typeof result !== 'number') {
         refuse('KERNEL_ABI_MISMATCH', 'Numeric return was not produced before publication');
       }
     } catch (cause) {
@@ -249,7 +291,7 @@ export function instantiateNumericKernel(bytes, { fallback = null, maxMemoryByte
     for (const record of prepared.records) {
       stats.copiedBytes += record.byteLength * (Number(record.param.read) + Number(record.param.write));
     }
-    if (manifest.version === 5 && manifest.resultType === 'f64') return result;
+    if (manifest.version >= 5 && manifest.resultType === 'f64') return result;
   }
 
   return Object.freeze({
