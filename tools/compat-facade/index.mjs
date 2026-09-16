@@ -16,6 +16,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import * as acorn from 'acorn';
 import { extractModuleExportSurface as resolveExportSurface } from './export-surface.mjs';
+import { createDevImportMap as createRoutedImportMap, transformHtmlImportMap as transformRoutedHtml } from './import-map-routing.mjs';
 
 /**
  * Standard no-claim attestation for retained upstream compatibility facades (§5.1, §5.12).
@@ -124,10 +125,12 @@ export function generateFacadeModule(entry, exportSurface, options = {}) {
   const exportName = (name) => /^[\p{ID_Start}$_][\p{ID_Continue}$\u200c\u200d]*$/u.test(name)
     ? name : JSON.stringify(name);
 
+  const commentText = (value) => String(value).replace(/\*\//g, '* /').replace(/[\r\n]/g, ' ');
+
   const header = [
     '/**',
-    ` * FrankenThreeD compatibility facade: ${entry.exportKey} [${entry.condition}]`,
-    ` * Target: ${entry.target}`,
+    ` * FrankenThreeD compatibility facade: ${commentText(entry.exportKey)} [${commentText(entry.condition)}]`,
+    ` * Target: ${commentText(entry.target)}`,
     ' * Pinned Three.js r186 retained export surface',
     ' *',
     ` * Attestation: ${FACADE_NO_CLAIM_ATTESTATION}`,
@@ -434,24 +437,8 @@ export async function emitFacadeFiles(targetDir, options = {}) {
  * @param {boolean} [options.routeThreeToWebgpu=false] Explicitly route 'three' to webgpu.js even without sourceImportMap
  * @returns {{ imports: Record<string, string> }}
  */
-export function createDevImportMap({ baseUrl = '', sourceImportMap = null, routeThreeToWebgpu = false } = {}) {
-  const base = baseUrl.replace(/\/+$/, '');
-  const sourceImports = sourceImportMap?.imports || {};
-
-  // If source import map specifically selected three.webgpu.js for 'three', preserve that selection
-  const threeTarget = sourceImports['three'];
-  const routesThreeToWebgpu =
-    routeThreeToWebgpu ||
-    (typeof threeTarget === 'string' && threeTarget.includes('three.webgpu.js'));
-
-  return {
-    imports: {
-      three: routesThreeToWebgpu ? `${base}/compat-facade/webgpu.js` : `${base}/compat-facade/three.js`,
-      'three/webgpu': `${base}/compat-facade/webgpu.js`,
-      'three/tsl': `${base}/compat-facade/tsl.js`,
-      'three/addons/': `${base}/compat-facade/addons/`,
-    },
-  };
+export function createDevImportMap(options = {}) {
+  return createRoutedImportMap(options);
 }
 
 /**
@@ -467,56 +454,7 @@ export function createDevImportMap({ baseUrl = '', sourceImportMap = null, route
  * @param {string} [options.baseUrl='']
  * @returns {string} Transformed HTML document
  */
-export function transformHtmlImportMap(htmlContent, { baseUrl = '' } = {}) {
-  const importMapRegex = /<script\s+type=["']importmap["']>([\s\S]*?)<\/script>/i;
-  const match = importMapRegex.exec(htmlContent);
-
-  if (!match) {
-    throw new Error('No <script type="importmap"> tag found in HTML document');
-  }
-
-  let sourceImportMap = null;
-  try {
-    sourceImportMap = JSON.parse(match[1]);
-  } catch {}
-
-  const base = baseUrl.replace(/\/+$/, '');
-  const sourceImports = sourceImportMap?.imports || {};
-  const newImports = {};
-
-  for (const [specifier, target] of Object.entries(sourceImports)) {
-    if (typeof target === 'string') {
-      if (target.includes('three.webgpu.js')) {
-        newImports[specifier] = `${base}/compat-facade/webgpu.js`;
-      } else if (target.includes('three.tsl.js')) {
-        newImports[specifier] = `${base}/compat-facade/tsl.js`;
-      } else if (target.includes('three.module.js') || target.endsWith('/three.js')) {
-        newImports[specifier] = `${base}/compat-facade/three.js`;
-      } else if (specifier === 'three/addons/' || target.endsWith('/jsm/') || target === './jsm/') {
-        newImports[specifier] = `${base}/compat-facade/addons/`;
-      } else {
-        newImports[specifier] = target;
-      }
-    } else {
-      newImports[specifier] = target;
-    }
-  }
-
-  // Ensure mandatory three and three/webgpu mappings if missing from source
-  if (!newImports['three/webgpu']) {
-    newImports['three/webgpu'] = `${base}/compat-facade/webgpu.js`;
-  }
-  if (!newImports['three']) {
-    newImports['three'] = newImports['three/webgpu'];
-  }
-
-  const devMap = { imports: newImports };
-  const formattedJson = JSON.stringify(devMap, null, '\t\t\t\t')
-    .split('\n')
-    .map((line, idx) => (idx === 0 ? line : `\t\t\t${line}`))
-    .join('\n');
-
-  const replacementTag = `<script type="importmap">\n\t\t\t${formattedJson}\n\t\t</script>`;
-  return htmlContent.replace(importMapRegex, replacementTag);
+export function transformHtmlImportMap(htmlContent, options = {}) {
+  return transformRoutedHtml(htmlContent, options);
 }
 

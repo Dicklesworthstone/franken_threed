@@ -263,3 +263,27 @@ test('external ambiguity requires a resolver instead of manufacturing binding eq
   });
   assert.throws(() => extract(f('root.mjs')), /disambiguate.*resolveModule/);
 });
+
+test('single namespace providers retain explicit AST-visible re-exports', async () => {
+  const {generateFacadeModule, parseFacadeExportSurface} = await import('./index.mjs');
+  const f = fixture({
+    'leaf.mjs': 'export const x=1;',
+    'provider.mjs': "export * as ns from './leaf.mjs';",
+    'a.mjs': "export * from './provider.mjs';",
+    'b.mjs': "export * from './provider.mjs';",
+    'root.mjs': "export * from './a.mjs'; export * from './b.mjs';",
+  });
+  await matchesNode(f('root.mjs'));
+  const surface = extract(f('root.mjs'));
+  assert.equal(surface.starOnly, undefined);
+  const source = generateFacadeModule({exportKey:'.', condition:'import', target:'root.mjs',moduleType:'esm'}, surface, {retainedSpecifier:'./root.mjs'});
+  assert.deepEqual(parseFacadeExportSurface(source).named, ['ns']);
+});
+
+test('path metadata cannot terminate generated facade comments', async () => {
+  const {generateFacadeModule} = await import('./index.mjs');
+  const f = fixture({'dir*/source.mjs': 'export const value=1;'});
+  const source = generateFacadeModule({exportKey:'./dir*/source', condition:'import', target:'dir*/source.mjs',moduleType:'esm'}, extract(f('dir*/source.mjs')), {retainedSpecifier:'./dir*/source.mjs'});
+  fs.writeFileSync(f('facade.mjs'), source);
+  assert.equal((await import(pathToFileURL(f('facade.mjs')).href)).value, 1);
+});

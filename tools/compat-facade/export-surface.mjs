@@ -59,9 +59,12 @@ export function extractModuleExportSurface(filePath, options = {}) {
       }
       return path.resolve(path.dirname(file), specifier);
     };
-    const indirect = (source, name) => {
+    const indirect = (source, name, origin) => {
       const resolved = target(source);
-      if (resolved !== null) return { file: resolved, name };
+      if (resolved !== null) return {
+        file: resolved, name,
+        ...(name === NAMESPACE ? { namespaceOrigins: new Set([`${file}:${origin}`]) } : {}),
+      };
       return { file, name: JSON.stringify([source.value, name === NAMESPACE ? ['namespace'] : name]), external: true };
     };
     for (const node of ast.body) {
@@ -92,7 +95,7 @@ export function extractModuleExportSurface(filePath, options = {}) {
         }
       } else if (node.type === 'ExportAllDeclaration') {
         if (node.exported) {
-          record.exports.set(exportName(node.exported), indirect(node.source, NAMESPACE));
+          record.exports.set(exportName(node.exported), indirect(node.source, NAMESPACE, node.start));
         } else if (recursive) {
           const resolved = target(node.source);
           if (resolved === null) {
@@ -148,7 +151,9 @@ export function extractModuleExportSurface(filePath, options = {}) {
         }
         return AMBIGUOUS;
       }
-      binding = candidate;
+      binding = binding?.namespaceOrigins && candidate.namespaceOrigins
+        ? { ...binding, namespaceOrigins: new Set([...binding.namespaceOrigins, ...candidate.namespaceOrigins]) }
+        : candidate;
     }
     return binding;
   }
@@ -158,7 +163,7 @@ export function extractModuleExportSurface(filePath, options = {}) {
   const exported = [...names(root)].filter((name) => {
     if (!recursive) return true;
     const binding = resolve(root, name);
-    if (binding?.name === NAMESPACE && !record.exports.has(name)) starOnly.push(name);
+    if (binding?.namespaceOrigins?.size > 1 && !record.exports.has(name)) starOnly.push(name);
     return binding !== null && binding !== AMBIGUOUS;
   });
   const hasDefault = exported.includes('default');
