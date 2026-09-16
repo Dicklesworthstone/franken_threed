@@ -24,12 +24,16 @@ function compileFile(source, sourceName, options) {
   if (!functions.length || functions.some(fn => fn?.type !== 'FunctionDeclaration' || !fn.id)) {
     refuse('Numeric package source must contain only named function declarations and optional named exports');
   }
+  // The emitted loader has the same global Math environment only when the
+  // retained function-only module declares no binding named Math, including
+  // unused or mutable declarations excluded from the helper graph.
+  const allowMath = !functions.some(fn => fn.id.name === 'Math');
   // Preserve the original single-function contract and diagnostics exactly.
   // In particular, mutation of a same-named scalar parameter is not rebinding
   // the function, and there are no external helper bindings to prove here.
   if (functions.length === 1 && (options.functionName === undefined || options.functionName === functions[0].id.name)) {
     return { artifact: compileNumericKernel(source, {
-      parameterTypes: options.parameterTypes, maxMemoryPages: options.maxMemoryPages, sourceName,
+      parameterTypes: options.parameterTypes, maxMemoryPages: options.maxMemoryPages, sourceName, allowMath,
     }), selection: null };
   }
   // A function-only module can still export a setter that rebinds a helper.
@@ -62,6 +66,7 @@ function compileFile(source, sourceName, options) {
   const single = functions.length === 1;
   const artifact = compileNumericKernel(single ? source : source.slice(fn.start, fn.end), {
     parameterTypes: options.parameterTypes,
+    allowMath,
     maxMemoryPages: options.maxMemoryPages,
     sourceName: single ? sourceName : `${sourceName}:${fn.id.name}`,
     helperSources: new Map(functions.filter(helper => !mutations.has(helper.id.name))
@@ -91,11 +96,13 @@ for (const parameter of manifest.parameters) {
   if (parameter.access) Object.freeze(parameter.access.loopBounds);
 }
 ` : '';
+  const mathFreeze = artifact.manifest.mathIntrinsics ? '\nObject.freeze(manifest.mathIntrinsics);\n' : '';
+  const mathOptions = artifact.manifest.mathIntrinsics ? ', resolveMath: () => Math' : '';
   return `/** Generated numeric-kernel package: explicit opt-in, no speedup claim. */
 import { instantiateNumericKernel, NumericKernelGuardError } from './runtime.mjs';
 import retained from './retained.mjs';
 export { retained };
-const manifest = ${JSON.stringify(artifact.manifest, null, 2)};${pipelineFreeze}
+const manifest = ${JSON.stringify(artifact.manifest, null, 2)};${pipelineFreeze}${mathFreeze}
 for (const parameter of manifest.parameters) {
   if (parameter.access) Object.freeze(parameter.access);
   Object.freeze(parameter);
@@ -109,7 +116,7 @@ export function createKernel() {
   try {
     const binary = globalThis.atob(${JSON.stringify(base64)});
     const bytes = Uint8Array.from(binary, character => character.charCodeAt(0));
-    return instantiateNumericKernel(bytes, { fallback: retained });
+    return instantiateNumericKernel(bytes, { fallback: retained${mathOptions} });
   } catch (error) {
     // Wasm may be unavailable or forbidden by host policy. This does not
     // disable the application's original numeric update function.

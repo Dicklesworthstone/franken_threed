@@ -144,7 +144,7 @@ export function specializeNumericModule(source, {
     let artifact;
     try {
       artifact = compileNumericKernel(source.slice(fn.start, fn.end), {
-        parameterTypes, helperSources, sourceName: `${sourceName}:${fn.id.name}`, maxMemoryPages,
+        parameterTypes, helperSources, allowMath: true, sourceName: `${sourceName}:${fn.id.name}`, maxMemoryPages,
       });
     } catch (error) {
       if (!(error instanceof NumericKernelCompileError)) throw error;
@@ -168,14 +168,18 @@ export function specializeNumericModule(source, {
       if (seenLayouts.has(types.join(','))) continue;
       seenLayouts.add(types.join(','));
       const variant = compileNumericKernel(source.slice(fn.start, fn.end), {
-        parameterTypes: types, helperSources, sourceName: `${sourceName}:${fn.id.name}`, maxMemoryPages,
+        parameterTypes: types, helperSources, allowMath: true, sourceName: `${sourceName}:${fn.id.name}`, maxMemoryPages,
       });
       alternatives.push({ parameterTypes: types, bytes: [...variant.wasm] });
     }
     const tokenName = fresh('token'), helperName = fresh('call');
     // var + a hoisted helper preserve calls that occur before module evaluation
     // in a cycle: an undefined token routes to the supplied original callee.
-    registrations.push(`var ${tokenName} = ${createName}(${fn.id.name}, [${artifact.wasm.join(',')}], ${JSON.stringify(alternatives)});`);
+    // The resolver closes over exactly the module environment shared by this
+    // declaration and its top-level helpers. Do not read Math at registration:
+    // imports, mutable lexical bindings and TDZ/ESM-cycle calls need live guards.
+    const mathResolver = artifact.manifest.mathIntrinsics ? ', () => Math' : '';
+    registrations.push(`var ${tokenName} = ${createName}(${fn.id.name}, [${artifact.wasm.join(',')}], ${JSON.stringify(alternatives)}${mathResolver});`);
     helpers.push(`function ${helperName}(callee, ...args) { return ${dispatchName}(${tokenName}, callee, args); }`);
     for (const call of sites) {
       edits.push({ start: call.callee.start, end: call.callee.end, text: helperName });
@@ -185,6 +189,7 @@ export function specializeNumericModule(source, {
     }
     item.route = 'guarded-numeric-wasm';
     item.parameterTypes = parameterTypes;
+    if (artifact.manifest.mathIntrinsics) item.mathIntrinsics = [...artifact.manifest.mathIntrinsics];
     if (artifact.manifest.version === 6) {
       item.loopCount = artifact.manifest.loops.length;
       item.boundParameters = [...artifact.manifest.boundParameters];

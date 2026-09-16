@@ -10,8 +10,8 @@ const U8Array = Uint8Array;
 const typedTag = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Float64Array.prototype), Symbol.toStringTag).get;
 const records = new WeakMap();
 
-function state(target, bytes, parameterTypes = null) {
-  return { target, bytes, parameterTypes, attempted: false, kernel: null,
+function state(target, bytes, parameterTypes = null, resolveMath = null) {
+  return { target, bytes, parameterTypes, resolveMath, attempted: false, kernel: null,
     initializationFailure: null, retainedCalls: 0 };
 }
 
@@ -20,19 +20,22 @@ function state(target, bytes, parameterTypes = null) {
  * Alternatives are trusted ahead-of-time compiler products, never JIT source.
  * Their native slot checks select an ABI; the kernel still performs every
  * ownership, shape, alias, length and scalar guard before executing.
+ * resolveMath is an optional compiler-produced `() => Math` in the target's
+ * lexical environment; creating a token must not evaluate that live binding.
  */
-export function createNumericDispatch(target, bytes, alternatives = []) {
+export function createNumericDispatch(target, bytes, alternatives = [], resolveMath = null) {
   if (typeof target !== 'function') throw new TypeError('Numeric dispatch target must be a function');
+  if (resolveMath !== null && typeof resolveMath !== 'function') throw new TypeError('resolveMath must be a function or null');
   if (!Array.isArray(alternatives) || alternatives.length > 16) throw new TypeError('Expected at most 16 numeric dispatch alternatives');
   const variants = alternatives.map(variant => {
     if (!variant || !Array.isArray(variant.parameterTypes) || variant.parameterTypes.length > 64 ||
         variant.parameterTypes.some(type => !['f32[]', 'f64[]', 'f64'].includes(type))) {
       throw new TypeError('Invalid numeric dispatch alternative ABI');
     }
-    return state(target, variant.bytes, [...variant.parameterTypes]);
+    return state(target, variant.bytes, [...variant.parameterTypes], resolveMath);
   });
   const token = Object.freeze({});
-  const primary = state(target, bytes);
+  const primary = state(target, bytes, null, resolveMath);
   records.set(token, { primary, variants, selected: primary, identityMisses: 0 });
   return token;
 }
@@ -63,7 +66,7 @@ export function dispatchNumericCall(token, callee, args) {
     // Set before initialization: host policy hooks may reenter the application.
     record.attempted = true;
     try {
-      const kernel = instantiateNumericKernel(new U8Array(record.bytes), { fallback: record.target });
+      const kernel = instantiateNumericKernel(new U8Array(record.bytes), { fallback: record.target, resolveMath: record.resolveMath });
       if (record.parameterTypes && (kernel.manifest.parameters.length !== record.parameterTypes.length ||
           kernel.manifest.parameters.some((param, i) => param.type !== record.parameterTypes[i]))) {
         kernel.dispose();
