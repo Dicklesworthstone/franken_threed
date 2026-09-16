@@ -4,7 +4,8 @@
  * Original declarations/exports/identities remain untouched. Only direct calls
  * in this source unit are rewritten, with a runtime callee-identity guard.
  * Applying this after Rollup links a chunk also covers calls across merged
- * source modules. Calls through exports in other chunks remain JavaScript.
+ * source modules. Reachable immutable scalar helpers execute in the same Wasm
+ * module as their loop. Calls through exports in other chunks remain JavaScript.
  *
  * Array types are speculative: native type, ownership, alias and length
  * guards decide each invocation. Unsupported code is retained, never rejected
@@ -75,6 +76,20 @@ export function specializeNumericModule(source, {
     report.refusal = { code: 'DIRECT_EVAL', message: 'Dynamic lexical access requires the original source unit' };
     return unchanged();
   }
+  // Only hoisted declarations have a known initialized binding throughout module
+  // evaluation. Const/arrow helpers need a separate TDZ/initialization proof.
+  // Keep every original declaration/export intact; helper closure is codegen,
+  // not function replacement or source evaluation. The compiler rejects free
+  // variables, shadowed callees, recursion and any unclosed transitive helper.
+  const helperSources = new Map();
+  const helperSpans = new Map();
+  for (const statement of ast.body) {
+    const fn = ['ExportNamedDeclaration', 'ExportDefaultDeclaration'].includes(statement.type)
+      ? statement.declaration : statement;
+    if (fn?.type !== 'FunctionDeclaration' || !fn.id || mutations.has(fn.id.name)) continue;
+    helperSources.set(fn.id.name, source.slice(fn.start, fn.end));
+    helperSpans.set(fn.id.name, span(fn));
+  }
   // Include every identifier token, including binding/property positions skipped
   // by a semantic walker. Generated bindings cannot collide in nested scopes.
   for (const token of tokens) if (token.type.label === 'name') names.add(token.value);
@@ -125,7 +140,7 @@ export function specializeNumericModule(source, {
     let artifact;
     try {
       artifact = compileNumericKernel(source.slice(fn.start, fn.end), {
-        parameterTypes, sourceName: `${sourceName}:${fn.id.name}`, maxMemoryPages,
+        parameterTypes, helperSources, sourceName: `${sourceName}:${fn.id.name}`, maxMemoryPages,
       });
     } catch (error) {
       if (!(error instanceof NumericKernelCompileError)) throw error;
@@ -149,7 +164,7 @@ export function specializeNumericModule(source, {
       if (seenLayouts.has(types.join(','))) continue;
       seenLayouts.add(types.join(','));
       const variant = compileNumericKernel(source.slice(fn.start, fn.end), {
-        parameterTypes: types, sourceName: `${sourceName}:${fn.id.name}`, maxMemoryPages,
+        parameterTypes: types, helperSources, sourceName: `${sourceName}:${fn.id.name}`, maxMemoryPages,
       });
       alternatives.push({ parameterTypes: types, bytes: [...variant.wasm] });
     }
@@ -174,6 +189,9 @@ export function specializeNumericModule(source, {
       ...alternatives.map(variant => ({ parameterTypes: variant.parameterTypes, wasmBytes: variant.bytes.length })),
     ];
     item.wasmBytes = item.variants.reduce((sum, variant) => sum + variant.wasmBytes, 0);
+    if (artifact.helpers.length) {
+      item.scalarHelpers = artifact.helpers.map(helper => ({ ...helper, sourceSpan: helperSpans.get(helper.name) }));
+    }
     item.guardFallback = 'retained-original-js';
     report.compiledKernels++;
     report.rewrittenCalls += sites.length;
