@@ -8,6 +8,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { rollup } from 'rollup';
+import { numericKernelRollupPlugin } from './numeric_rollup.mjs';
 
 import { analyzeModuleAst, classifyDynamicImportArgument } from './ast_analyzer.mjs';
 import * as walk from 'acorn-walk';
@@ -358,6 +359,9 @@ export function f3dRollupPlugin(options = {}) {
  * }>}
  */
 export async function bundleWithRollup(entryPath, options = {}) {
+  const specialization = options.specializeNumeric;
+  const numericPlugin = specialization === undefined || specialization === false
+    ? null : numericKernelRollupPlugin(specialization === true ? {} : specialization);
   const resolvedEntryAbs = path.resolve(entryPath);
   const entryUrl = pathToFileURL(resolvedEntryAbs).href;
   const isHtml = entryPath.endsWith('.html') || entryPath.endsWith('.htm');
@@ -450,7 +454,8 @@ export async function bundleWithRollup(entryPath, options = {}) {
           inlineModules,
           packageRootUrl: options.packageRootUrl,
           retainedModuleUrls: options.retainedModuleUrls
-        })
+        }),
+        ...(numericPlugin ? [numericPlugin] : [])
       ],
       onwarn(warning, warn) {
         // Suppress known non-fatal warnings (e.g. eval in 3rd party libs or circular deps)
@@ -544,7 +549,8 @@ export async function bundleWithRollup(entryPath, options = {}) {
       files,
       outputChunks,
       chunks: outputChunks,
-      assets: outputAssets
+      assets: outputAssets,
+      ...(numericPlugin ? { numericSpecialization: numericPlugin.api.getReport() } : {})
     };
   } finally {
     if (bundle) {

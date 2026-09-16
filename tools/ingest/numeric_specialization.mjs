@@ -31,7 +31,7 @@ function patternNames(node, result) {
 
 /**
  * @param {string} source ESM source (or an ES-format rendered Rollup chunk)
- * @param {{sourceName?: string, runtimeModule?: string, maxKernels?: number, maxMemoryPages?: number}} options
+ * @param {{sourceName?: string, runtimeModule?: string | (() => string), maxKernels?: number, maxMemoryPages?: number}} options
  * @returns {{code: string, changed: boolean, report: object}}
  */
 export function specializeNumericModule(source, {
@@ -39,7 +39,7 @@ export function specializeNumericModule(source, {
   maxKernels = 64, maxMemoryPages = 1024,
 } = {}) {
   if (typeof source !== 'string') throw new TypeError('Numeric specialization requires source text');
-  if (typeof runtimeModule !== 'string' || !runtimeModule) throw new TypeError('runtimeModule must be a nonempty module specifier');
+  if ((typeof runtimeModule !== 'string' || !runtimeModule) && typeof runtimeModule !== 'function') throw new TypeError('runtimeModule must be a nonempty module specifier or a resolver');
   if (!Number.isInteger(maxKernels) || maxKernels < 1 || maxKernels > 256) throw new RangeError('maxKernels must be between 1 and 256');
   if (!Number.isInteger(maxMemoryPages) || maxMemoryPages < 1 || maxMemoryPages > 16384) throw new RangeError('maxMemoryPages must be between 1 and 16384');
   const report = {
@@ -148,6 +148,8 @@ export function specializeNumericModule(source, {
     report.rewrittenCalls += sites.length;
   }
   if (!report.compiledKernels) return unchanged();
+  const runtimeSpecifier = typeof runtimeModule === 'function' ? runtimeModule() : runtimeModule;
+  if (typeof runtimeSpecifier !== 'string' || !runtimeSpecifier) throw new TypeError('Runtime resolver must return a nonempty module specifier');
   // Keep hashbangs and directive prologues intact; imports remain static ESM.
   let preludeEnd = source.startsWith('#!') ? source.indexOf('\n') + 1 : 0;
   for (const statement of ast.body) {
@@ -155,7 +157,7 @@ export function specializeNumericModule(source, {
     preludeEnd = statement.end;
   }
   edits.push({ start: preludeEnd, end: preludeEnd, text:
-    `\nimport { createNumericDispatch as ${createName}, dispatchNumericCall as ${dispatchName} } from ${JSON.stringify(runtimeModule)};\n` +
+    `\nimport { createNumericDispatch as ${createName}, dispatchNumericCall as ${dispatchName} } from ${JSON.stringify(runtimeSpecifier)};\n` +
     registrations.join('\n') + '\n' });
   // Apply disjoint token edits backwards. Nested calls retain their own edits
   // and all original argument expressions, comments, spreads and evaluation order.

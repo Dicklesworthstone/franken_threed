@@ -973,7 +973,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
         }
 
         if (!resolvedUrl.startsWith('file://')) {
-          // Non-file URL (e.g. http://, https://, data:); resolved at runtime by browser
+          // Non-file URL (e.g. http://, https:, data:); resolved at runtime by browser
           continue;
         }
 
@@ -1103,7 +1103,8 @@ export async function buildApplication(entryPath, outDir, options = {}) {
   collectHtmlAssets(null, new Set(htmlFileName ? [htmlFileName] : []), true);
   const bundleResult = await bundleWithRollup(resolvedEntryAbs, {
     packageRootUrl: options.packageRootUrl,
-    retainedModuleUrls
+    retainedModuleUrls,
+    specializeNumeric: options.specializeNumeric
   });
   const emittedChunkNames = new Set(Object.keys(bundleResult.files));
   if (htmlFileName) emittedChunkNames.add(htmlFileName);
@@ -1175,6 +1176,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
     emittedFiles,
     isMultiChunk: bundleResult.isMultiChunk,
     chunks: bundleResult.chunks,
-    packageType: 'module'
+    packageType: 'module',
+    ...(bundleResult.numericSpecialization ? { numericSpecialization: bundleResult.numericSpecialization } : {})
   };
 }

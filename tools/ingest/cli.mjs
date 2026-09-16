@@ -17,6 +17,7 @@ Options:
   --entry <path>        Path to HTML or ESM entry point (required)
   --build-app <dir>     Emit runnable application build to target directory (must be fresh)
   --out-dir <dir>       Alias for --build-app
+  --specialize-numeric Discover and compile guarded numeric updates in --build-app
   --build-kernel <dir>  Compile one closed numeric function to a fresh Wasm package
   --parameter-types <csv>  Kernel parameter ABI, for example 'f64[],f64[],f64'
   --max-memory-pages <n>   Kernel memory ceiling in 64 KiB pages (default: 1024)
@@ -48,6 +49,7 @@ async function main() {
   let output = null;
   let packageRoot = null;
   let buildAppDir = null;
+  let specializeNumeric = false;
   let buildKernelDir = null;
   let parameterTypes = null;
   let maxMemoryPages;
@@ -63,6 +65,8 @@ async function main() {
         process.exit(1);
       }
       entry = args[++i];
+    } else if (arg === '--specialize-numeric') {
+      specializeNumeric = true;
     } else if (arg === '--build-app' || arg === '--out-dir') {
       if (i + 1 >= args.length || args[i + 1].startsWith('-')) {
         console.error(`Error: ${arg} requires a directory path argument.`);
@@ -105,12 +109,17 @@ async function main() {
     process.exit(1);
   }
 
+  if (specializeNumeric && (!buildAppDir || buildKernelDir)) {
+    console.error('Error: --specialize-numeric requires --build-app and cannot be combined with --build-kernel.');
+    process.exit(1);
+  }
   if (buildKernelDir && (!parameterTypes || buildAppDir || output || packageRoot)) {
     console.error('Error: --build-kernel requires --parameter-types and cannot be combined with --build-app, --output or --package-root.');
     process.exit(1);
   }
-  if (!buildKernelDir && (parameterTypes || maxMemoryPages !== undefined)) {
-    console.error('Error: --parameter-types and --max-memory-pages require --build-kernel.');
+  if ((!buildKernelDir && parameterTypes) ||
+      (!buildKernelDir && !specializeNumeric && maxMemoryPages !== undefined)) {
+    console.error('Error: --parameter-types requires --build-kernel; --max-memory-pages requires --build-kernel or --specialize-numeric.');
     process.exit(1);
   }
 
@@ -182,11 +191,17 @@ async function main() {
     if (buildAppDir) {
       const { buildApplication } = await import('./build_application.mjs');
       const appResult = await buildApplication(entry, buildAppDir, {
-        packageRootUrl: packageRoot
+        packageRootUrl: packageRoot,
+        specializeNumeric: specializeNumeric ? { maxMemoryPages } : false
       });
       console.log(`Runnable application build emitted to: ${appResult.outDir}`);
       console.log(`Emitted files (${appResult.emittedFiles.length}): ${appResult.emittedFiles.join(', ')}`);
       console.log(`Entry files: ${appResult.entryFiles.join(', ')} (multi-chunk: ${appResult.isMultiChunk})`);
+      if (appResult.numericSpecialization) {
+        const report = appResult.numericSpecialization;
+        console.log(`Numeric specialization: ${report.compiledKernels} kernels, ${report.rewrittenCalls} guarded call sites; report: ${report.reportFile}`);
+        console.log('Original JavaScript remains the guard/policy fallback; no speedup claim.');
+      }
 
       if (output) {
         if (appResult.emittedFiles) {
