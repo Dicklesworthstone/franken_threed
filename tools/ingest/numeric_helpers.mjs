@@ -30,7 +30,7 @@ function number(value) {
  * and every statically mutable binding. Only reachable helpers are inspected.
  * Function/type index zero belongs to the caller's array-loop entry point.
  */
-export function createScalarHelperCompiler(helperSources, fail) {
+export function createScalarHelperCompiler(helperSources, fail, intrinsics = null) {
   if (!(helperSources instanceof Map)) fail('helperSources must be a Map of immutable function declarations', null, 'INVALID_KERNEL_SOURCE');
   const entries = [];
   const compiled = new Map();
@@ -111,6 +111,9 @@ export function createScalarHelperCompiler(helperSources, fail) {
           ...expression(node.consequent, depth + 1), 0x05, ...expression(node.alternate, depth + 1), 0x0b];
       }
       if (node.type === 'CallExpression') {
+        const intrinsic = intrinsics?.call(node, arg => expression(arg, depth + 1),
+          environment.has('Math') || helperSources.has('Math'), () => fn.params.length + localCount++);
+        if (intrinsic) return intrinsic;
         return call(node, arg => expression(arg, depth + 1), environment.has(node.callee.name), owner);
       }
       fail(`Scalar helper expression ${node.type} is not closed`, node);

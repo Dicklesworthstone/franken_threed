@@ -16,6 +16,32 @@ const U8Array = Uint8Array;
 const apply = Reflect.apply;
 const descriptor = Object.getOwnPropertyDescriptor;
 const prototype = Object.getPrototypeOf;
+const hasOwn = Object.hasOwn;
+const functionSource = Function.prototype.toString;
+const mathHost = globalThis;
+const MATH_SEMANTICS = 'f64-operator-order+guarded-math-v1';
+const MATH_NAMES = Object.freeze(['abs', 'ceil', 'floor', 'fround', 'max', 'min', 'round', 'sign', 'sqrt', 'trunc']);
+function dataValue(object, key) {
+  const entry = descriptor(object, key);
+  return entry && hasOwn(entry, 'value') ? entry.value : undefined;
+}
+// Like the typed-array primordials below, these are captured at trusted module
+// bootstrap, before application code runs. This is not a sandbox for a realm
+// whose platform objects were replaced with proxies before runtime loading.
+// Data descriptors avoid invoking getters, even when Math was already patched.
+const mathObject = dataValue(mathHost, 'Math');
+const mathMethods = new Map(MATH_NAMES.map(name => {
+  const value = mathObject && typeof mathObject === 'object' ? dataValue(mathObject, name) : undefined;
+  // Fail closed for pre-bootstrap ordinary replacements, bound functions and
+  // callable proxies. An unfamiliar native source format merely retains JS.
+  const native = typeof value === 'function' &&
+    apply(functionSource, value, []) === `function ${name}() { [native code] }`;
+  return [name, native ? value : null];
+}));
+// Memory sizing must not call application-overridable Math methods, including
+// while deciding whether an intrinsic-using function needs its original path.
+const maximum = (a, b) => a > b ? a : b;
+const align = (value, unit) => value + (unit - value % unit) % unit;
 const typedPrototype = prototype(F64Array.prototype);
 const typedLength = descriptor(typedPrototype, 'length').get;
 const typedBuffer = descriptor(typedPrototype, 'buffer').get;
@@ -45,10 +71,18 @@ function readManifest(module, wasm) {
   let manifest;
   try { manifest = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(sections[0])); }
   catch (cause) { throw new NumericKernelGuardError('KERNEL_ABI_MISMATCH', 'Invalid ABI metadata', { cause }); }
+  const guardedMath = manifest?.numericSemantics === MATH_SEMANTICS;
+  if (guardedMath ? !Array.isArray(manifest.mathIntrinsics) ||
+      !manifest.mathIntrinsics.length || manifest.mathIntrinsics.length > MATH_NAMES.length ||
+      new Set(manifest.mathIntrinsics).size !== manifest.mathIntrinsics.length ||
+      manifest.mathIntrinsics.some(name => !MATH_NAMES.includes(name)) : manifest?.mathIntrinsics !== undefined) {
+    refuse('KERNEL_ABI_MISMATCH', 'Invalid guarded Math requirements');
+  }
+  if (guardedMath) Object.freeze(manifest.mathIntrinsics);
   const pipeline = manifest?.version === 6 && manifest.kind === 'closed-numeric-pipeline';
   const float32Abi = pipeline || ([2, 3, 4, 5].includes(manifest?.version) && manifest.kind === 'closed-numeric-loop');
   if (!manifest || (!float32Abi && (manifest.version !== 1 || manifest.kind !== 'closed-f64-loop')) ||
-      manifest.numericSemantics !== 'f64-operator-order' || manifest.automaticRouteAdmission !== false ||
+      (!guardedMath && manifest.numericSemantics !== 'f64-operator-order') || manifest.automaticRouteAdmission !== false ||
       !Number.isInteger(manifest.maxMemoryPages) || manifest.maxMemoryPages < 1 ||
       manifest.maxMemoryPages > MAX_BYTES / PAGE_BYTES || !Array.isArray(manifest.parameters) ||
       manifest.parameters.length === 0 || manifest.parameters.length > 64 ||
@@ -164,9 +198,14 @@ function arrayInfo(value, param, checkLength) {
  * fallback must be the original function for conservative execution. It is
  * called with the same arguments and receiver; return values and exceptions
  * propagate unchanged. run() itself remains synchronous.
+ * For guarded Math artifacts, resolveMath must be a compiler-produced, effect-
+ * free closure `() => Math` in the original function/helper lexical environment.
+ * It is not a user callback. Omission conservatively refuses native execution.
+ * Global/property descriptors are checked without calling application getters.
  */
-export function instantiateNumericKernel(bytes, { fallback = null, maxMemoryBytes = null } = {}) {
+export function instantiateNumericKernel(bytes, { fallback = null, maxMemoryBytes = null, resolveMath = null } = {}) {
   if (fallback !== null && typeof fallback !== 'function') throw new TypeError('fallback must be a function or null');
+  if (resolveMath !== null && typeof resolveMath !== 'function') throw new TypeError('resolveMath must be a function or null');
   if (maxMemoryBytes !== null && (!Number.isSafeInteger(maxMemoryBytes) ||
       maxMemoryBytes < PAGE_BYTES || maxMemoryBytes > MAX_BYTES)) {
     throw new RangeError('maxMemoryBytes must be between 65536 and 1073741824');
@@ -185,11 +224,29 @@ export function instantiateNumericKernel(bytes, { fallback = null, maxMemoryByte
       !exports.some(item => item.name === 'memory' && item.kind === 'memory')) {
     refuse('KERNEL_ABI_MISMATCH', 'Kernel must export only run and memory and have no imports');
   }
-  const limit = Math.min(maxMemoryBytes ?? MAX_BYTES, manifest.maxMemoryPages * PAGE_BYTES);
+  const requestedLimit = maxMemoryBytes ?? MAX_BYTES;
+  const declaredLimit = manifest.maxMemoryPages * PAGE_BYTES;
+  const limit = requestedLimit < declaredLimit ? requestedLimit : declaredLimit;
   let { memory, run: execute } = new wasm.Instance(module).exports;
   if (memory.buffer.byteLength > limit) refuse('KERNEL_MEMORY_LIMIT', 'Initial Wasm memory exceeds the configured limit');
   let disposed = false;
   const stats = { wasmCalls: 0, fallbackCalls: 0, copiedBytes: 0, lastGuardFailure: null };
+
+  function checkMath() {
+    if (!manifest.mathIntrinsics) return;
+    if (!resolveMath || !mathObject || dataValue(mathHost, 'Math') !== mathObject) {
+      refuse('KERNEL_MATH_BINDING', 'The original Math binding is not available');
+    }
+    // Compare identity BEFORE inspecting the resolved object: replacement
+    // proxies must never receive extra traps during guards.
+    let binding;
+    try { binding = resolveMath(); }
+    catch { refuse('KERNEL_MATH_BINDING', 'The lexical Math binding is uninitialized or unavailable'); }
+    if (binding !== mathObject || manifest.mathIntrinsics.some(name =>
+        !mathMethods.get(name) || dataValue(mathObject, name) !== mathMethods.get(name))) {
+      refuse('KERNEL_MATH_BINDING', 'A required Math binding or method has changed');
+    }
+  }
 
   function prepare(args) {
     if (args.length !== manifest.parameters.length) refuse('KERNEL_ARGUMENT_COUNT', 'Argument count differs from the ABI');
@@ -217,11 +274,11 @@ export function instantiateNumericKernel(bytes, { fallback = null, maxMemoryByte
       const access = record.param.access;
       // Pack each parameter once, covering the union of every pass's accessed
       // prefix. Later passes see earlier writes in the same private memory.
-      record.count = pipeline
-        ? Math.max(access.minimumLength, ...access.loopBounds.map(index => lengths.get(index)))
-        : manifest.version >= 4 ? Math.max(access.indexed ? counts[0] : 0, access.minimumLength) : counts[0];
+      record.count = pipeline ? access.minimumLength
+        : manifest.version >= 4 ? maximum(access.indexed ? counts[0] : 0, access.minimumLength) : counts[0];
+      if (pipeline) for (const index of access.loopBounds) record.count = maximum(record.count, lengths.get(index));
       record.byteLength = record.count * record.elementBytes;
-      record.ptr = Math.ceil(requiredBytes / record.elementBytes) * record.elementBytes;
+      record.ptr = align(requiredBytes, record.elementBytes);
       requiredBytes = record.ptr + record.byteLength;
     }
     if (!Number.isSafeInteger(requiredBytes) || requiredBytes > limit) {
@@ -244,7 +301,7 @@ export function instantiateNumericKernel(bytes, { fallback = null, maxMemoryByte
         }
       }
     }
-    const pages = Math.max(1, Math.ceil(requiredBytes / PAGE_BYTES));
+    const pages = maximum(1, align(requiredBytes, PAGE_BYTES) / PAGE_BYTES);
     if (pages * PAGE_BYTES > limit) {
       refuse('KERNEL_MEMORY_LIMIT', 'Page-rounded Wasm allocation exceeds the configured limit');
     }
@@ -265,10 +322,14 @@ export function instantiateNumericKernel(bytes, { fallback = null, maxMemoryByte
     let prepared;
     let result;
     try {
+      checkMath();
       prepared = prepare(args);
       for (const record of prepared.records) {
         if (record.param.read) apply(typedSet, record.scratch, [record.source]);
       }
+      // Revalidate after preparation (including a possible host memory.grow).
+      // The import-free Wasm call cannot rebind Math before publication.
+      checkMath();
       result = execute(...prepared.values, ...prepared.counts);
       if (manifest.version >= 5 && manifest.resultType === 'f64' && typeof result !== 'number') {
         refuse('KERNEL_ABI_MISMATCH', 'Numeric return was not produced before publication');

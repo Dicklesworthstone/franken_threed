@@ -11,6 +11,7 @@
  */
 import * as acorn from 'acorn';
 import { createScalarHelperCompiler } from './numeric_helpers.mjs';
+import { createMathIntrinsicCompiler } from './numeric_intrinsics.mjs';
 
 export const NUMERIC_KERNEL_SECTION = 'f3d.numeric-kernel';
 const F64 = 0x7c;
@@ -74,10 +75,13 @@ function member(node, object, property, computed) {
  * function declarations. Only reachable, acyclic, capture-free helpers compile.
  * These sources must match the original function's actual lexical environment;
  * specializeNumericModule establishes that proof for linked application code.
+ * allowMath additionally requires a runtime resolveMath closure for the actual
+ * shared lexical Math binding. Missing/changed bindings retain JavaScript.
  */
 export function compileNumericKernel(source, {
   parameterTypes,
   helperSources = new Map(),
+  allowMath = false,
   sourceName = '<numeric-kernel>',
   maxMemoryPages = DEFAULT_MAX_PAGES,
 } = {}) {
@@ -87,6 +91,7 @@ export function compileNumericKernel(source, {
   if (!Number.isInteger(maxMemoryPages) || maxMemoryPages < 1 || maxMemoryPages > 16384) {
     fail('maxMemoryPages must be between 1 and 16384', null, 'INVALID_KERNEL_ABI');
   }
+  if (typeof allowMath !== 'boolean') fail('allowMath must be a boolean', null, 'INVALID_KERNEL_ABI');
   let ast;
   try {
     ast = acorn.parse(source, { ecmaVersion: 'latest', sourceType: 'module', locations: true });
@@ -165,7 +170,8 @@ export function compileNumericKernel(source, {
   let { indexName, boundParam, loopStride, countLocal, indexLocal } = passes.get(loop);
   if (pipeline) indexName = null;
 
-  const helperCompiler = createScalarHelperCompiler(helperSources, fail);
+  const intrinsics = createMathIntrinsicCompiler(allowMath, fail);
+  const helperCompiler = createScalarHelperCompiler(helperSources, fail, intrinsics);
   let temporaries = new Map();
   let temporaryCount = 0;
   let statementCount = 0;
@@ -256,6 +262,10 @@ export function compileNumericKernel(source, {
         ...expression(node.alternate, depth + 1), 0x0b];
     }
     if (node.type === 'CallExpression') {
+      const intrinsic = intrinsics.call(node, arg => expression(arg, depth + 1),
+        params.has('Math') || temporaries.has('Math') || indexName === 'Math' ||
+        fn.id.name === 'Math' || helperSources.has('Math'), () => temporaryBase + temporaryCount++);
+      if (intrinsic) return intrinsic;
       return helperCompiler.call(node, arg => expression(arg, depth + 1),
         params.has(node.callee.name) || temporaries.has(node.callee.name) ||
         node.callee.name === indexName || node.callee.name === fn.id.name);
@@ -439,6 +449,7 @@ export function compileNumericKernel(source, {
   const orderedAbi = pipeline || scalarWrites.size > 0 || resultNode !== null;
   const extentAbi = orderedAbi || prelude.length > 0 || minimumLengths.size > 0;
 
+  const mathIntrinsics = intrinsics.requirements();
   const manifest = {
     version: pipeline ? 6 : orderedAbi ? 5 : extentAbi ? 4 : loopStride > 1 ? 3 : parameterTypes.includes('f32[]') ? 2 : 1,
     kind: pipeline ? 'closed-numeric-pipeline' : extentAbi || loopStride > 1 || parameterTypes.includes('f32[]') ? 'closed-numeric-loop' : 'closed-f64-loop',
@@ -460,7 +471,9 @@ export function compileNumericKernel(source, {
       loops: [...passes.values()].map(pass => ({ boundParameter: pass.boundParam.index, loopStride: pass.loopStride })),
     } : { boundParameter: boundParam.index }),
     maxMemoryPages,
-    numericSemantics: 'f64-operator-order',
+    // Older hosts reject this semantic contract, rather than skipping guards.
+    numericSemantics: mathIntrinsics.length ? 'f64-operator-order+guarded-math-v1' : 'f64-operator-order',
+    ...(mathIntrinsics.length ? { mathIntrinsics } : {}),
     automaticRouteAdmission: false,
   };
   const types = [...parameterTypes.map(type => type === 'f64' ? F64 : I32), ...Array(bounds.size).fill(I32)];
