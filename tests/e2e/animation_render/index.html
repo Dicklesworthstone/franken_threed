@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>FrankenThreeD animated draw execution checks</title>
+<h1>Animated WebGPU draw checks</h1>
+<p>Serve over localhost or HTTPS. A real WebGPU adapter is required; missing
+support is a failure, not a passing skip. These are functional pixel checks,
+not performance results or a full-material compatibility certification.</p>
+<pre id="result">Running…</pre>
+<script type="module">
+import {runAnimationRenderChecks} from '../../../tools/ingest/animation_render.browser.mjs';
+let device;
+try {
+  const adapter=await navigator.gpu?.requestAdapter();
+  if(!adapter)throw new Error('No WebGPU adapter; checks have not passed.');
+  device=await adapter.requestDevice();
+  globalThis.__f3dAnimationRenderResult=await runAnimationRenderChecks(device);
+} catch(error) {
+  globalThis.__f3dAnimationRenderResult={status:'failed',error:error.stack||String(error)};
+} finally {
+  device?.destroy();
+  document.getElementById('result').textContent=JSON.stringify(globalThis.__f3dAnimationRenderResult,null,2);
+}
+</script>
+</html>

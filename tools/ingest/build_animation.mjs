@@ -56,7 +56,7 @@ function decodeDataUri(uri) {
 /**
  * Output: animation.mjs (sampler), playback.mjs (sampler/controller/deformer),
  * their runtime modules, animation.json and manifest.json.
- * With {webgpu:true}, also emit the opt-in gpu_playback.mjs entry and kernel.
+ * With {webgpu:true}, also emit GPU deformation, unlit drawing and scene playback.
  * The default CPU output and import graph remain unchanged.
  * import { createPlayer } from './animation.mjs'; const p=createPlayer();
  * p.sample(time, {clip:0, loop:true}); // p.worldMatrices / p.jointMatrices / p.morphWeights
@@ -77,6 +77,13 @@ function decodeDataUri(uri) {
  * // control.update(dt); gpu.update(); submit draws using gpu.vertexBuffer;
  * // Submit consumers before the next update; await gpu.whenIdle() to drain.
  * // This is an explicit f32 profile. It does not replace CPU pose sampling.
+ *
+ * Multi-mesh option: import {createGpuAnimationScene} from './gpu_playback.mjs';
+ * const scene=await createGpuAnimationScene(device, pose, decodedDrawables);
+ * scene.controller.createAction(0).play();
+ * // scene.update(dt); scene.render({colorView,depthView,viewProjection});
+ * // Device, pose, decoded geometry and render attachments are caller-supplied.
+ * // Unlit colors/alpha only: this is not a full glTF model/material renderer.
  */
 export function buildAnimation(entryPath,outDir,{rootDir=path.dirname(path.resolve(entryPath)),maxBytes=64*1024*1024,maxComponents=16777216,webgpu=false}={}) {
   if(typeof webgpu!=='boolean')throw new TypeError('webgpu must be boolean');
@@ -122,11 +129,13 @@ export function buildAnimation(entryPath,outDir,{rootDir=path.dirname(path.resol
     outputs.set(name,fs.readFileSync(new URL('./'+name,import.meta.url),'utf8'));
   }
   if(webgpu) {
-    outputs.set('animation_webgpu.mjs',fs.readFileSync(new URL('./animation_webgpu.mjs',import.meta.url),'utf8'));
-    outputs.set('gpu_playback.mjs',`export {createPlayer,createAnimationController,createAnimationDeformer} from './playback.mjs';\nexport {createGpuAnimationDeformer} from './animation_webgpu.mjs';\n`);
+    for(const name of ['animation_webgpu.mjs','animation_render.mjs','animation_scene.mjs']) {
+      outputs.set(name,fs.readFileSync(new URL('./'+name,import.meta.url),'utf8'));
+    }
+    outputs.set('gpu_playback.mjs',`export {createPlayer,createAnimationController,createAnimationDeformer} from './playback.mjs';\nexport {createGpuAnimationDeformer} from './animation_webgpu.mjs';\nexport {createGpuAnimationRenderer} from './animation_render.mjs';\nexport {createGpuAnimationScene} from './animation_scene.mjs';\n`);
   }
   const manifest={format:'f3d-animation-package-v1',entry:'animation.mjs',playbackEntry:'playback.mjs',profile:'core-gltf-animation-pose',
-    ...(webgpu?{gpuEntry:'gpu_playback.mjs',gpuExecution:'webgpu-compute-f32'}:{}),
+    ...(webgpu?{gpuEntry:'gpu_playback.mjs',gpuExecution:'webgpu-compute-f32',gpuRendering:'explicit-unlit-triangle-list; caller-owned geometry, materials and attachments'}:{}),
     source:{file:path.basename(entry),sha256:hash(source)},dependencies:[...dependencies.values()],
     nodeCount:validated.nodeCount,clips:validated.clips,instances:validated.instances,morphWeightCount:validated.morphWeights.length,
     ignoredChannels:definition.ignoredChannels,execution:'javascript-cpu-pose',accelerationClaim:false,
