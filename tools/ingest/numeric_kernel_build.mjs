@@ -9,7 +9,8 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import * as acorn from 'acorn';
 import * as walk from 'acorn-walk';
-import { compileNumericKernel, NumericKernelCompileError } from './numeric_kernel.mjs';
+import { NumericKernelCompileError } from './numeric_kernel.mjs';
+import { compileNumericCandidate } from './numeric_candidate.mjs';
 
 const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
 
@@ -32,8 +33,8 @@ function compileFile(source, sourceName, options) {
   // In particular, mutation of a same-named scalar parameter is not rebinding
   // the function, and there are no external helper bindings to prove here.
   if (functions.length === 1 && (options.functionName === undefined || options.functionName === functions[0].id.name)) {
-    return { artifact: compileNumericKernel(source, {
-      parameterTypes: options.parameterTypes, maxMemoryPages: options.maxMemoryPages, sourceName, allowMath,
+    return { artifact: compileNumericCandidate(source, {
+      parameterTypes: options.parameterTypes, checkedIndexing: options.checkedIndexing, maxMemoryPages: options.maxMemoryPages, sourceName, allowMath,
     }), selection: null };
   }
   // A function-only module can still export a setter that rebinds a helper.
@@ -64,8 +65,9 @@ function compileFile(source, sourceName, options) {
   const fn = roots[0];
   if (mutations.has(fn.id.name)) refuse('Numeric entry binding must be immutable');
   const single = functions.length === 1;
-  const artifact = compileNumericKernel(single ? source : source.slice(fn.start, fn.end), {
+  const artifact = compileNumericCandidate(single ? source : source.slice(fn.start, fn.end), {
     parameterTypes: options.parameterTypes,
+    checkedIndexing: options.checkedIndexing,
     allowMath,
     maxMemoryPages: options.maxMemoryPages,
     sourceName: single ? sourceName : `${sourceName}:${fn.id.name}`,
@@ -87,8 +89,12 @@ function loaderSource(artifact) {
   // kernel.wasm is also emitted for hosts that prefer explicit binary loading.
   const base64 = Buffer.from(artifact.wasm).toString('base64');
   // The no-Wasm fallback exposes the same immutable ABI as the native runtime.
-  // Emit this only for pipelines, preserving legacy generated loader bytes.
-  const pipelineFreeze = artifact.manifest.version === 6 ? `
+  // Keep legacy loaders unchanged; checked indexing has different length metadata.
+  const pipelineFreeze = artifact.manifest.version === 7 ? `
+Object.freeze(manifest.lengthParameters);
+manifest.loops.forEach(Object.freeze);
+Object.freeze(manifest.loops);
+` : artifact.manifest.version === 6 ? `
 Object.freeze(manifest.boundParameters);
 manifest.loops.forEach(Object.freeze);
 Object.freeze(manifest.loops);
@@ -151,7 +157,12 @@ export function createKernel() {
  *
  * @param {string} entry Function-only source file; named exports are preserved.
  * @param {string} outDir Fresh destination directory.
- * @param {{parameterTypes: string[], maxMemoryPages?: number, functionName?: string}} options
+ * Sequential kernels retain their prefix ABI. Indirect accesses or u16[]/u32[]
+ * topology select checked full-view indexing; checkedIndexing can force either
+ * mode. Integer arrays are read-only; runtime guards always retain the original
+ * function when its storage or indexing cannot execute safely in Wasm.
+ *
+ * @param {{parameterTypes: string[], maxMemoryPages?: number, functionName?: string, checkedIndexing?: boolean}} options
  */
 export function buildNumericKernel(entry, outDir, options = {}) {
   const sourcePath = path.resolve(entry);
