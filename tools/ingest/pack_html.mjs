@@ -159,6 +159,7 @@ export function packHtml(entryPath, outputPath, { rootDir = path.dirname(path.re
   catch (error) { if (error.code !== 'ENOENT') throw error; }
   const documentUrl = pathToFileURL(entry).href;
   const files = new Map(), modules = new Map(), assets = new Map(), cssActive = new Set();
+  const workers = new Map(), workerModules = new Map(), workerActive = new Set();
   let inputBytes = 0;
   function read(url) {
     const parsed = new URL(url);
@@ -260,20 +261,112 @@ export function packHtml(entryPath, outputPath, { rootDir = path.dirname(path.re
     const logical = value.protocol === 'file:' ? path.relative(root, fileURLToPath(value)).split(path.sep).join('/') + value.search + value.hash : url;
     return 'f3d-packed/' + digest(logical);
   }
-  function javascript(source, from, sourceType = 'module') {
+  // Workers have their own module map, NOT the document's import map. Resolve
+  // their static graph to absolute data module URLs before creating a same-origin
+  // Blob entry. Native Worker owns messaging, transferable storage and lifetime.
+  function workerModuleFor(url) {
+    if (workerActive.has(url)) fail('WORKER_MODULE_CYCLE', 'Bundle cyclic worker modules before single-file export');
+    if (workerModules.has(url)) return workerModules.get(url);
+    if (workerModules.size + modules.size >= maxFiles || workerActive.size >= 64) fail('PACK_LIMIT', 'Worker graph exceeds the identity/depth limit');
+    if (url.startsWith('data:')) fail('DATA_MODULE', 'Pre-encoded worker module sources require the normal build');
+    workerActive.add(url);
+    const original = read(url), record = { source: null, data: null };
+    workerModules.set(url, record);
+    try {
+      const json = path.extname(new URL(url).pathname).toLowerCase() === '.json';
+      if (json) {
+        record.source = text(original);
+        try { JSON.parse(record.source); } catch { fail('JSON_MODULE', 'Invalid worker JSON module'); }
+      } else record.source = javascript(text(original), url, 'module', true);
+      record.data = dataUrl(record.source, json ? 'application/json' : 'text/javascript') + '#' + keyFor(url).slice(11);
+      if (Buffer.byteLength(record.data) > maxBytes) fail('PACK_LIMIT', 'Encoded worker module exceeds packing limit');
+      return record;
+    } finally { workerActive.delete(url); }
+  }
+  function workerFactory(url) {
+    if (workers.has(url)) return workers.get(url);
+    const entry = workerModuleFor(url);
+    // One cached URL per worker entry per creating realm, not one allocation per
+    // constructor call. Do not revoke on terminate or pagehide: another worker,
+    // a later invocation, or bfcache restoration may still need the same entry.
+    // The File API releases this bounded URL table when the creating global dies.
+    // Factory ESM scope prevents application locals from shadowing Blob or URL.
+    const source = `// ${keyFor(url)}\n` +
+      `const source = ${JSON.stringify(entry.source)};\nlet cached;\n` +
+      `export default function workerURL() {\n` +
+      `  return cached ??= URL.createObjectURL(new Blob([source], {type:'text/javascript'}));\n}\n`;
+    const factory = dataUrl(source, 'text/javascript');
+    if (Buffer.byteLength(factory) > maxBytes) fail('PACK_LIMIT', 'Encoded worker entry exceeds packing limit');
+    workers.set(url, factory);
+    return factory;
+  }
+  function javascript(source, from, sourceType = 'module', worker = false) {
     let ast;
     try { ast = acorn.parse(source, { ecmaVersion: 'latest', sourceType }); }
     catch (error) { fail('SCRIPT_PARSE', `${from}: ${error.message}`); }
-    const replacements = [], allowedMeta = new Set();
+    const replacements = [], allowedMeta = new Set(), workerURLs = new Set(), workerImports = [];
+    const workerSites = [], names = new Set(), bindings = new Set();
     const literal = node => node?.type === 'Literal' && typeof node.value === 'string' ? node.value
       : node?.type === 'TemplateLiteral' && !node.expressions.length ? node.quasis[0].value.cooked : null;
     const add = (node, value) => replacements.push({ start: node.start, end: node.end, value });
+    function bind(node) {
+      if (!node) return;
+      if (node.type === 'Identifier') bindings.add(node.name);
+      else if (node.type === 'RestElement') bind(node.argument);
+      else if (node.type === 'AssignmentPattern') bind(node.left);
+      else if (node.type === 'ArrayPattern') node.elements.forEach(bind);
+      else if (node.type === 'ObjectPattern') node.properties.forEach(p => bind(p.type === 'RestElement' ? p.argument : p.value));
+    }
+    walk.full(ast, node => {
+      if (node.type === 'Identifier') names.add(node.name);
+      if (node.type === 'VariableDeclarator') bind(node.id);
+      if (/^(FunctionDeclaration|FunctionExpression|ArrowFunctionExpression)$/.test(node.type)) { bind(node.id); node.params.forEach(bind); }
+      if (node.type === 'ClassDeclaration' || node.type === 'ClassExpression') bind(node.id);
+      if (/^Import.*Specifier$/.test(node.type)) bind(node.local);
+      if (node.type === 'CatchClause') bind(node.param);
+      if (node.type === 'NewExpression' && node.callee.type === 'Identifier' && node.callee.name === 'Worker') workerSites.push(node);
+      if (worker && ((node.type === 'Identifier' && node.name === 'location') ||
+          (node.type === 'MemberExpression' && (node.property.name ?? node.property.value) === 'location'))) fail('WORKER_LOCATION', 'Worker location observation requires the normal build');
+    });
+    for (const site of workerSites) {
+      if (worker || sourceType !== 'module') fail('WORKER_PARENT', 'Dedicated workers must be constructed by an emitted document module');
+      if (bindings.has('Worker') || bindings.has('URL')) fail('WORKER_BINDING', 'Shadowed Worker/URL bindings require the normal build');
+      if (site.arguments.length !== 2) fail('WORKER_OPTIONS', 'An explicit module Worker options object is required');
+      const [argument, options] = site.arguments;
+      if (options.type !== 'ObjectExpression') fail('WORKER_OPTIONS', 'Worker type must be a static option');
+      let kind = 'classic';
+      for (const prop of options.properties) {
+        if (prop.type !== 'Property' || prop.computed || prop.method || prop.kind !== 'init') fail('WORKER_OPTIONS', 'Worker options must have plain noncomputed properties');
+        if ((prop.key.name ?? prop.key.value) === 'type') kind = literal(prop.value);
+      }
+      if (kind !== 'module') fail('WORKER_OPTIONS', 'Only dedicated module workers are admitted by this path');
+      let value = literal(argument), origin = documentUrl;
+      if (argument.type === 'NewExpression' && argument.callee.type === 'Identifier' && argument.callee.name === 'URL') {
+        const [ref, base] = argument.arguments;
+        if (argument.arguments.length !== 2 || base?.type !== 'MemberExpression' || base.computed ||
+            base.object.type !== 'MetaProperty' || base.property.name !== 'url') fail('WORKER_URL', 'Worker URL must be literal or static module-relative');
+        value = literal(ref); origin = from; allowedMeta.add(base.object);
+      }
+      if (value === null || !value) fail('WORKER_URL', 'Worker URL must be a nonempty static literal');
+      const factory = workerFactory(local(value, origin));
+      let name = `__f3d_packed_worker_${workerImports.length}`;
+      while (names.has(name) || bindings.has(name)) name += '_';
+      names.add(name);
+      workerImports.push(`import ${name} from ${JSON.stringify(factory)};`);
+      workerURLs.add(argument); add(argument, `${name}()`);
+    }
+    const importTarget = value => {
+      if (!worker) return moduleFor(resolveModule(value, from)).key;
+      // A page's import map must not give a bare worker import invented meaning.
+      if (!/^(\.?\.?\/|[a-z][\w+.-]*:)/i.test(value)) fail('WORKER_IMPORT', 'Bare worker imports must be bundled before export');
+      return workerModuleFor(local(value, from)).data;
+    };
     function importSource(node) {
       const value = literal(node);
-      if (value !== null) { add(node, JSON.stringify(moduleFor(resolveModule(value, from)).key)); return; }
+      if (value !== null) { add(node, JSON.stringify(importTarget(value))); return; }
       if (node.type === 'ConditionalExpression') { importSource(node.consequent); importSource(node.alternate); return; }
       const targets = [...finiteImports(node)];
-      const chain = targets.map(target => `v === ${JSON.stringify(target)} ? ${JSON.stringify(moduleFor(resolveModule(target, from)).key)} : `).join('');
+      const chain = targets.map(target => `v === ${JSON.stringify(target)} ? ${JSON.stringify(importTarget(target))} : `).join('');
       // Insert wrappers rather than replace the expression: nested imports in
       // a selector retain their own edits and original evaluation ordering.
       replacements.push({ start: node.start, end: node.start, value: `((v) => ${chain}v)(` });
@@ -285,6 +378,8 @@ export function packHtml(entryPath, outputPath, { rootDir = path.dirname(path.re
       ExportAllDeclaration(node) { importSource(node.source); },
       ImportExpression(node) { importSource(node.source); },
       NewExpression(node) {
+        if (workerURLs.has(node) || workerSites.includes(node)) return;
+        if (node.callee.type === 'MemberExpression' && ['Worker', 'SharedWorker'].includes(node.callee.property.name)) fail('WORKER_BINDING', 'Qualified worker constructors require the normal build');
         if (node.callee.type === 'Identifier' && ['Worker', 'SharedWorker', 'XMLHttpRequest', 'WebSocket', 'EventSource'].includes(node.callee.name)) {
           fail('HOST_RESOURCE', `${node.callee.name} needs the ordinary application build`);
         }
@@ -306,6 +401,10 @@ export function packHtml(entryPath, outputPath, { rootDir = path.dirname(path.re
       },
     });
     walk.simple(ast, { MetaProperty(node) { if (!allowedMeta.has(node)) fail('MODULE_URL_OBSERVATION', 'Observable import.meta outside a static asset URL requires the normal build'); } });
+    if (workerImports.length) {
+      const offset = source.startsWith('#!') ? source.indexOf('\n') + 1 : 0;
+      replacements.push({ start: offset, end: offset, value: '\n' + workerImports.join('\n') + '\n' });
+    }
     return edits(source, replacements);
   }
   function moduleFor(url, inline = null) {
@@ -447,5 +546,6 @@ export function packHtml(entryPath, outputPath, { rootDir = path.dirname(path.re
   fs.writeFileSync(destination, output, { flag: 'wx' });
   return { entryPoint: entry, outputFile: destination, moduleCount: modules.size, assetCount: assets.size,
     sourceFileCount: files.size, inputBytes, outputBytes: Buffer.byteLength(output),
+    ...(workers.size ? { workerCount: workers.size, workerScriptCount: workerModules.size } : {}),
     staticResourceClosure: 'modules-markup-css-and-static-module-relative-assets', runtimeNetworking: 'unchanged-not-analyzed' };
 }
