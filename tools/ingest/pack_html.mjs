@@ -159,7 +159,7 @@ export function packHtml(entryPath, outputPath, { rootDir = path.dirname(path.re
   catch (error) { if (error.code !== 'ENOENT') throw error; }
   const documentUrl = pathToFileURL(entry).href;
   const files = new Map(), modules = new Map(), assets = new Map(), cssActive = new Set();
-  const workers = new Map(), workerModules = new Map(), workerActive = new Set();
+  const workers = new Map(), workerModules = new Map(), workerClassics = new Map(), workerActive = new Set();
   let inputBytes = 0;
   function read(url) {
     const parsed = new URL(url);
@@ -267,7 +267,7 @@ export function packHtml(entryPath, outputPath, { rootDir = path.dirname(path.re
   function workerModuleFor(url) {
     if (workerActive.has(url)) fail('WORKER_MODULE_CYCLE', 'Bundle cyclic worker modules before single-file export');
     if (workerModules.has(url)) return workerModules.get(url);
-    if (workerModules.size + modules.size >= maxFiles || workerActive.size >= 64) fail('PACK_LIMIT', 'Worker graph exceeds the identity/depth limit');
+    if (workerModules.size + workerClassics.size + modules.size >= maxFiles || workerActive.size >= 64) fail('PACK_LIMIT', 'Worker graph exceeds the identity/depth limit');
     if (url.startsWith('data:')) fail('DATA_MODULE', 'Pre-encoded worker module sources require the normal build');
     workerActive.add(url);
     const original = read(url), record = { source: null, data: null };
@@ -283,21 +283,39 @@ export function packHtml(entryPath, outputPath, { rootDir = path.dirname(path.re
       return record;
     } finally { workerActive.delete(url); }
   }
-  function workerFactory(url) {
-    if (workers.has(url)) return workers.get(url);
-    const entry = workerModuleFor(url);
+  function workerClassicFor(url, entryUrl) {
+    // importScripts and fetch resolve relative to the worker's entry URL even
+    // when the call lives in an imported classic script, NOT relative to that
+    // imported script. The same source can therefore have several closures.
+    const key = `classic:${entryUrl}:${url}`;
+    if (workerActive.has(key)) fail('WORKER_SCRIPT_CYCLE', 'Recursive classic imports require the normal build');
+    if (workerClassics.has(key)) return workerClassics.get(key);
+    if (workerModules.size + workerClassics.size + modules.size >= maxFiles || workerActive.size >= 64) fail('PACK_LIMIT', 'Worker graph exceeds the identity/depth limit');
+    if (url.startsWith('data:')) fail('DATA_MODULE', 'Pre-encoded worker scripts require the normal build');
+    workerActive.add(key);
+    try {
+      const source = javascript(text(read(url)), url, 'script', {entryUrl});
+      const data = dataUrl(source, 'text/javascript') + '#' + digest(keyFor(entryUrl) + keyFor(url));
+      if (Buffer.byteLength(data) > maxBytes) fail('PACK_LIMIT', 'Encoded worker script exceeds packing limit');
+      const record = {source, data}; workerClassics.set(key, record); return record;
+    } finally { workerActive.delete(key); }
+  }
+  function workerFactory(url, kind) {
+    const key = kind + ':' + url;
+    if (workers.has(key)) return workers.get(key);
+    const entry = kind === 'classic' ? workerClassicFor(url, url) : workerModuleFor(url);
     // One cached URL per worker entry per creating realm, not one allocation per
     // constructor call. Do not revoke on terminate or pagehide: another worker,
     // a later invocation, or bfcache restoration may still need the same entry.
     // The File API releases this bounded URL table when the creating global dies.
     // Factory ESM scope prevents application locals from shadowing Blob or URL.
-    const source = `// ${keyFor(url)}\n` +
+    const source = `// ${kind === 'classic' ? 'classic:' : ''}${keyFor(url)}\n` +
       `const source = ${JSON.stringify(entry.source)};\nlet cached;\n` +
       `export default function workerURL() {\n` +
       `  return cached ??= URL.createObjectURL(new Blob([source], {type:'text/javascript'}));\n}\n`;
     const factory = dataUrl(source, 'text/javascript');
     if (Buffer.byteLength(factory) > maxBytes) fail('PACK_LIMIT', 'Encoded worker entry exceeds packing limit');
-    workers.set(url, factory);
+    workers.set(key, factory);
     return factory;
   }
   function javascript(source, from, sourceType = 'module', worker = false) {
@@ -331,15 +349,15 @@ export function packHtml(entryPath, outputPath, { rootDir = path.dirname(path.re
     for (const site of workerSites) {
       if (worker || sourceType !== 'module') fail('WORKER_PARENT', 'Dedicated workers must be constructed by an emitted document module');
       if (bindings.has('Worker') || bindings.has('URL')) fail('WORKER_BINDING', 'Shadowed Worker/URL bindings require the normal build');
-      if (site.arguments.length !== 2) fail('WORKER_OPTIONS', 'An explicit module Worker options object is required');
+      if (site.arguments.length < 1 || site.arguments.length > 2) fail('WORKER_OPTIONS', 'Worker requires a static URL and optional static type');
       const [argument, options] = site.arguments;
-      if (options.type !== 'ObjectExpression') fail('WORKER_OPTIONS', 'Worker type must be a static option');
-      let kind = 'classic';
-      for (const prop of options.properties) {
+      if (options && options.type !== 'ObjectExpression') fail('WORKER_OPTIONS', 'Worker type must be a static option');
+      let kind = options ? null : 'classic';
+      for (const prop of options?.properties ?? []) {
         if (prop.type !== 'Property' || prop.computed || prop.method || prop.kind !== 'init') fail('WORKER_OPTIONS', 'Worker options must have plain noncomputed properties');
         if ((prop.key.name ?? prop.key.value) === 'type') kind = literal(prop.value);
       }
-      if (kind !== 'module') fail('WORKER_OPTIONS', 'Only dedicated module workers are admitted by this path');
+      if (!['classic', 'module'].includes(kind)) fail('WORKER_OPTIONS', 'Explicit Worker options require a literal classic/module type');
       let value = literal(argument), origin = documentUrl;
       if (argument.type === 'NewExpression' && argument.callee.type === 'Identifier' && argument.callee.name === 'URL') {
         const [ref, base] = argument.arguments;
@@ -348,7 +366,7 @@ export function packHtml(entryPath, outputPath, { rootDir = path.dirname(path.re
         value = literal(ref); origin = from; allowedMeta.add(base.object);
       }
       if (value === null || !value) fail('WORKER_URL', 'Worker URL must be a nonempty static literal');
-      const factory = workerFactory(local(value, origin));
+      const factory = workerFactory(local(value, origin), kind);
       let name = `__f3d_packed_worker_${workerImports.length}`;
       while (names.has(name) || bindings.has(name)) name += '_';
       names.add(name);
@@ -393,6 +411,26 @@ export function packHtml(entryPath, outputPath, { rootDir = path.dirname(path.re
         add(node, `new URL(${JSON.stringify(assetFor(local(value, from)))})`);
       },
       CallExpression(node) {
+        const importedScripts = node.callee.type === 'Identifier' && node.callee.name === 'importScripts';
+        const memberScripts = node.callee.type === 'MemberExpression' && !node.callee.computed &&
+          ['self', 'globalThis'].includes(node.callee.object.name) && node.callee.property.name === 'importScripts';
+        if (worker && sourceType === 'script' && (importedScripts || memberScripts)) {
+          if (node.optional || bindings.has('importScripts') || (memberScripts && bindings.has(node.callee.object.name))) {
+            fail('WORKER_BINDING', 'Shadowed/optional importScripts requires the normal build');
+          }
+          for (const argument of node.arguments) {
+            const value = literal(argument);
+            if (value === null || !value) fail('WORKER_SCRIPT_URL', 'importScripts requires nonempty static URL arguments');
+            add(argument, JSON.stringify(workerClassicFor(local(value, worker.entryUrl), worker.entryUrl).data));
+          }
+          return; // Keep the native call, order, repeated evaluation and throws.
+        }
+        if (worker && sourceType === 'script' && node.callee.type === 'Identifier' && node.callee.name === 'fetch' &&
+            literal(node.arguments[0]) !== null) {
+          if (node.arguments.length !== 1 || node.optional || bindings.has('fetch')) fail('WORKER_FETCH', 'Only unshadowed static default GET worker fetches are packaged');
+          add(node.arguments[0], JSON.stringify(assetFor(local(literal(node.arguments[0]), worker.entryUrl))));
+          return;
+        }
         if (node.callee.type === 'Identifier' && ['eval', 'importScripts'].includes(node.callee.name)) fail('DYNAMIC_CODE', 'Dynamic code cannot establish a closed module graph');
         if (node.callee.type === 'Identifier' && node.callee.name === 'fetch' && literal(node.arguments[0]) !== null) {
           const target = literal(node.arguments[0]);
@@ -546,6 +584,6 @@ export function packHtml(entryPath, outputPath, { rootDir = path.dirname(path.re
   fs.writeFileSync(destination, output, { flag: 'wx' });
   return { entryPoint: entry, outputFile: destination, moduleCount: modules.size, assetCount: assets.size,
     sourceFileCount: files.size, inputBytes, outputBytes: Buffer.byteLength(output),
-    ...(workers.size ? { workerCount: workers.size, workerScriptCount: workerModules.size } : {}),
+    ...(workers.size ? { workerCount: workers.size, workerScriptCount: workerModules.size + workerClassics.size } : {}),
     staticResourceClosure: 'modules-markup-css-and-static-module-relative-assets', runtimeNetworking: 'unchanged-not-analyzed' };
 }
