@@ -15,16 +15,14 @@ const widths={SCALAR:1,VEC2:2,VEC3:3,VEC4:4,MAT4:16};
 const jsonArray=(value,label)=>{if(value===undefined)return [];if(!Array.isArray(value))fail('GLTF_ANIMATION_SHAPE',`${label} must be an array`);return value;};
 const extensions=(object,label)=>{if(object?.extensions&&Object.keys(object.extensions).length)fail('GLTF_ANIMATION_EXTENSION',`Extended ${label} requires its source loader`);};
 
-/**
- * Decode typed accessor storage with sparse overlays and explicit little-endian
- * reads. Only referenced animation/inverse-bind accessors consume the component
- * budget. No unchecked read can cross a bufferView or its declared buffer.
+/** Reusable bounded accessor decoder for animation and mesh ingestion.
+ * Returned accessors contain independent Float64 storage; input buffers are
+ * borrowed only while decoding. Cached reads count once toward maxComponents.
+ * This is the scalar/vector/FLOAT-MAT4 profile, not a padded integer-matrix codec.
  */
-export function decodeGltfAnimation(model, suppliedBuffers, {maxComponents=16777216}={}) {
+export function createGltfAccessorReader(model, suppliedBuffers, {maxComponents=16777216}={}) {
   if(model?.asset?.version!=='2.0')fail('GLTF_ANIMATION_VERSION','Expected glTF 2.0');
   uint(maxComponents,'Component budget',1);
-  const nodes=jsonArray(model.nodes,'nodes'),skins=jsonArray(model.skins,'skins'),animations=jsonArray(model.animations,'animations');
-  if(nodes.length>65536||skins.length>65536||animations.length>4096)fail('GLTF_ANIMATION_LIMIT','Scene or clip count exceeds the pose profile');
   const cache=new Map(),buffers=new Map();let consumed=0;
   function buffer(index) {
     if(buffers.has(index))return buffers.get(index);
@@ -84,6 +82,20 @@ export function decodeGltfAnimation(model, suppliedBuffers, {maxComponents=16777
     }
     const result={...a,values};cache.set(index,result);return result;
   }
+  return Object.freeze({read: accessor, get components() { return consumed; }});
+}
+
+/**
+ * Decode typed accessor storage with sparse overlays and explicit little-endian
+ * reads. Only referenced animation/inverse-bind accessors consume the component
+ * budget. No unchecked read can cross a bufferView or its declared buffer.
+ */
+export function decodeGltfAnimation(model, suppliedBuffers, {maxComponents=16777216}={}) {
+  if(model?.asset?.version!=='2.0')fail('GLTF_ANIMATION_VERSION','Expected glTF 2.0');
+  uint(maxComponents,'Component budget',1);
+  const nodes=jsonArray(model.nodes,'nodes'),skins=jsonArray(model.skins,'skins'),animations=jsonArray(model.animations,'animations');
+  if(nodes.length>65536||skins.length>65536||animations.length>4096)fail('GLTF_ANIMATION_LIMIT','Scene or clip count exceeds the pose profile');
+  const accessor=createGltfAccessorReader(model,suppliedBuffers,{maxComponents}).read;
   const parents=new Int32Array(nodes.length).fill(-1),outNodes=nodes.map((node,index)=>{
     if(!node||typeof node!=='object'||Array.isArray(node))fail('GLTF_ANIMATION_NODE','Invalid node');
     // These two extensions define animation or node-transform behavior beyond
