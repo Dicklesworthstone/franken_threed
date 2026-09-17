@@ -251,3 +251,32 @@ test('disposal is idempotent and owns neither the pose nor device',async()=>{
   const next=await createGpuAnimationDeformer(device,pose,geometry());pose.dispose();
   assert.throws(()=>next.update(),code('ANIMATION_DISPOSED'));next.dispose();
 });
+
+
+test('compute shader does not use the reserved WGSL target identifier', () => {
+  // WGSL section 16.2 reserves target even though JavaScript accepts it.
+  // This catches the concrete compile blocker; it is not shader validation.
+  assert.doesNotMatch(ANIMATION_DEFORM_WGSL, /\btarget\b/);
+  assert.match(ANIMATION_DEFORM_WGSL, /var morph_index = 0u/);
+});
+
+test('whenIdle waits for earlier submission error scopes even if later work completes', async () => {
+  const device = deviceSpy(), gpu = await createGpuAnimationDeformer(device, scene(), geometry());
+  const earlier = deferred(), pop = device.popErrorScope.bind(device);
+  let hold = true;
+  device.popErrorScope = () => {
+    const result = pop();
+    if (hold) { hold = false; return earlier.promise; }
+    return result;
+  };
+  gpu.update(); gpu.update();
+  let settled = false;
+  const result = gpu.whenIdle().then(() => { settled = true; return null; }, error => { settled = true; return error; });
+  await new Promise(resolve => setImmediate(resolve));
+  const prematurelySettled = settled;
+  earlier.resolve({message: 'earlier dispatch was invalid'});
+  const error = await result;
+  gpu.dispose();
+  assert.equal(prematurelySettled, false, 'Later completion hid an outstanding earlier error scope');
+  assert.equal(error?.code, 'ANIMATION_GPU_DEVICE');
+});

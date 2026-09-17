@@ -54,10 +54,10 @@ fn deform(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_ind
   var p = vec3<f32>(base[b], base[b+1u], base[b+2u]);
   var n = vec3<f32>(base[b+3u], base[b+4u], base[b+5u]);
   var t = vec3<f32>(base[b+6u], base[b+7u], base[b+8u]);
-  for (var target = 0u; target < config.targets; target++) {
-    let w = weights[target];
+  for (var morph_index = 0u; morph_index < config.targets; morph_index++) {
+    let w = weights[morph_index];
     if (w == 0.0) { continue; }
-    let m = (target * config.vertices + vertex) * 9u;
+    let m = (morph_index * config.vertices + vertex) * 9u;
     p += w * vec3<f32>(morphs[m], morphs[m+1u], morphs[m+2u]);
     n += w * vec3<f32>(morphs[m+3u], morphs[m+4u], morphs[m+5u]);
     t += w * vec3<f32>(morphs[m+6u], morphs[m+7u], morphs[m+8u]);
@@ -285,7 +285,9 @@ export async function createGpuAnimationDeformer(device, pose, geometry, {
       if (submitted.error) {
         submitted.errors.catch(() => {}); terminal ??= submitted.error; throw terminal;
       }
-      completion = Promise.race([Promise.all([submitted.errors, device.queue.onSubmittedWorkDone()]), lost])
+      // A later queue acknowledgement must not hide an earlier unresolved
+      // error scope. Keep completion cumulative across submitted versions.
+      completion = Promise.race([Promise.all([completion, submitted.errors, device.queue.onSubmittedWorkDone()]), lost])
         .then(() => { if (terminal) throw terminal; }, error => { terminal ??= error; throw terminal; });
       completion.catch(() => {});
       worldMatrix.set(nextWorld); poseVersion = nextVersion; version++;
