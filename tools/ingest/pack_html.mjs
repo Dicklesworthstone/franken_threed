@@ -15,6 +15,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createHash } from 'node:crypto';
 import * as acorn from 'acorn';
 import * as walk from 'acorn-walk';
+import { embedGltfAssets } from './pack_gltf.mjs';
 
 export class HtmlPackingError extends Error {
   constructor(code, message) { super(`${code}: ${message}`); this.name = 'HtmlPackingError'; this.code = code; }
@@ -77,6 +78,73 @@ function edits(source, replacements) {
     source = source.slice(0, item.start) + item.value + source.slice(item.end); end = item.start;
   }
   return source;
+}
+
+// Bounded abstract evaluation, never execution of application code. Besides
+// literal choices, admit Rollup's emitted `(s => s === 'a' ? 'chunk-a' : ...)(choice)`
+// dispatch expressions. The original expression still executes once at runtime.
+function finiteImports(node, environment = new Map(), depth = 0) {
+  if (!node || depth > 64) fail('DYNAMIC_IMPORT_OPEN', 'Dynamic import analysis exceeded its bound');
+  if (node.type === 'Literal' && typeof node.value === 'string') return new Set([node.value]);
+  if (node.type === 'TemplateLiteral' && !node.expressions.length) return new Set([node.quasis[0].value.cooked]);
+  if (node.type === 'Identifier' && environment.has(node.name)) return new Set([environment.get(node.name)]);
+  if (node.type === 'SequenceExpression') return finiteImports(node.expressions.at(-1), environment, depth + 1);
+  if (node.type === 'ConditionalExpression') {
+    const test = node.test;
+    let known;
+    if (test.type === 'BinaryExpression' && ['===', '!=='].includes(test.operator)) {
+      const atom = value => value.type === 'Identifier' && environment.has(value.name) ? environment.get(value.name)
+        : value.type === 'Literal' && typeof value.value === 'string' ? value.value : undefined;
+      const a = atom(test.left), b = atom(test.right);
+      if (a !== undefined && b !== undefined) known = test.operator === '===' ? a === b : a !== b;
+    }
+    if (known !== undefined) return finiteImports(known ? node.consequent : node.alternate, environment, depth + 1);
+    const result = new Set([...finiteImports(node.consequent, environment, depth + 1), ...finiteImports(node.alternate, environment, depth + 1)]);
+    if (result.size > 64) fail('DYNAMIC_IMPORT_OPEN', 'Too many dynamic import targets');
+    return result;
+  }
+  if (node.type === 'CallExpression' && !node.optional && node.arguments.length === 1 &&
+      node.callee.type === 'ArrowFunctionExpression' && !node.callee.async && node.callee.expression &&
+      node.callee.params.length === 1 && node.callee.params[0].type === 'Identifier') {
+    const values = finiteImports(node.arguments[0], environment, depth + 1), result = new Set();
+    for (const value of values) {
+      const nested = new Map(environment); nested.set(node.callee.params[0].name, value);
+      for (const target of finiteImports(node.callee.body, nested, depth + 1)) result.add(target);
+      if (result.size > 64) fail('DYNAMIC_IMPORT_OPEN', 'Too many mapped import targets');
+    }
+    return result;
+  }
+  fail('DYNAMIC_IMPORT_OPEN', 'Dynamic import target is not a bounded literal expression');
+}
+
+function rewriteSrcset(source, embed) {
+  // Follow the URL/descriptor separation used by HTML: a data URL's internal
+  // comma is not a candidate separator, and descriptors stay browser-owned.
+  const candidates = [];
+  let offset = 0;
+  while (offset < source.length) {
+    while (offset < source.length && /[\t\n\f\r ,]/.test(source[offset])) offset++;
+    if (offset === source.length) break;
+    const start = offset;
+    while (offset < source.length && !/[\t\n\f\r ]/.test(source[offset])) offset++;
+    let url = source.slice(start, offset), descriptor = '';
+    if (url.endsWith(',')) url = url.replace(/,+$/, '');
+    else {
+      const begin = offset; let parentheses = 0;
+      while (offset < source.length) {
+        const char = source[offset];
+        if (char === ',' && !parentheses) break;
+        if (char === '(') parentheses++;
+        else if (char === ')' && parentheses) parentheses--;
+        offset++;
+      }
+      descriptor = source.slice(begin, offset).trim();
+      if (source[offset] === ',') offset++;
+    }
+    if (!url) fail('SRCSET', 'Empty responsive image candidate');
+    candidates.push(embed(url) + (descriptor ? ' ' + descriptor : ''));
+  }
+  return candidates.join(', ');
 }
 
 /**
@@ -204,7 +272,12 @@ export function packHtml(entryPath, outputPath, { rootDir = path.dirname(path.re
       const value = literal(node);
       if (value !== null) { add(node, JSON.stringify(moduleFor(resolveModule(value, from)).key)); return; }
       if (node.type === 'ConditionalExpression') { importSource(node.consequent); importSource(node.alternate); return; }
-      fail('DYNAMIC_IMPORT_OPEN', `${from}: dynamic import target is not a finite literal set`);
+      const targets = [...finiteImports(node)];
+      const chain = targets.map(target => `v === ${JSON.stringify(target)} ? ${JSON.stringify(moduleFor(resolveModule(target, from)).key)} : `).join('');
+      // Insert wrappers rather than replace the expression: nested imports in
+      // a selector retain their own edits and original evaluation ordering.
+      replacements.push({ start: node.start, end: node.start, value: `((v) => ${chain}v)(` });
+      replacements.push({ start: node.end, end: node.end, value: ')' });
     }
     walk.simple(ast, {
       ImportDeclaration(node) { importSource(node.source); },
@@ -241,9 +314,13 @@ export function packHtml(entryPath, outputPath, { rootDir = path.dirname(path.re
     if (url.startsWith('data:')) fail('DATA_MODULE', 'Pre-encoded module sources require the normal build');
     const record = { key: keyFor(url), source: null, original: inline === null ? read(url) : Buffer.from(inline) };
     modules.set(url, record); // Register before traversal, so cycles close by identity.
-    record.source = javascript(text(record.original), url);
+    const json = inline === null && path.extname(new URL(url).pathname).toLowerCase() === '.json';
+    if (json) {
+      record.source = text(record.original);
+      try { JSON.parse(record.source); } catch { fail('JSON_MODULE', 'Invalid JSON module'); }
+    } else record.source = javascript(text(record.original), url);
     // The suffix prevents same-byte modules at different source URLs coalescing.
-    record.data = dataUrl(record.source, 'text/javascript') + '#' + record.key.slice('f3d-packed/'.length);
+    record.data = dataUrl(record.source, json ? 'application/json' : 'text/javascript') + '#' + record.key.slice('f3d-packed/'.length);
     return record;
   }
   // CSS scanner skips comments and ordinary strings; url() in content text is not an asset.
@@ -261,20 +338,29 @@ export function packHtml(entryPath, outputPath, { rootDir = path.dirname(path.re
     if (url.startsWith('data:')) return url;
     const key = (stylesheet ? 'css:' : 'asset:') + url;
     if (assets.has(key)) return assets.get(key).data;
-    if (cssActive.has(key)) fail('CSS_CYCLE', 'Cyclic stylesheets require the ordinary build');
+    if (cssActive.has(key)) fail(stylesheet ? 'CSS_CYCLE' : 'ASSET_CYCLE', 'Cyclic resources require the ordinary build');
     const parsed = new URL(url), bytes = read(url), ext = path.extname(parsed.pathname).toLowerCase();
-    if (['.gltf', '.svg'].includes(ext)) {
+    if (ext === '.svg') {
       // These formats may contain their own external resource graphs. Retain
       // rather than claim a closed graph after embedding only the outer file.
       const source = text(bytes);
-      if (ext === '.gltf' && /"uri"\s*:\s*"(?!data:)/.test(source)) fail('NESTED_ASSET', 'External glTF buffers/images need the normal build');
       if (ext === '.svg' && /(?:href\s*=\s*["'](?!#|data:)|url\(\s*(?!#|data:))/i.test(source)) fail('NESTED_ASSET', 'External SVG references need the normal build');
     }
     cssActive.add(key);
     let output;
-    try { output = stylesheet || ext === '.css' ? Buffer.from(css(text(bytes), url)) : bytes; }
+    try {
+      output = ext === '.gltf' || ext === '.glb'
+        ? embedGltfAssets(bytes, ext === '.glb', uri => assetFor(local(uri, url)), fail)
+        : stylesheet || ext === '.css' ? Buffer.from(css(text(bytes), url)) : bytes;
+    }
     finally { cssActive.delete(key); }
-    const data = dataUrl(output, stylesheet ? 'text/css' : MIME[ext] ?? 'application/octet-stream') + parsed.hash;
+    // Distinct source URLs must not coalesce solely because their bytes match:
+    // browsers associate image density with the selected srcset resource URL.
+    // A MIME parameter retains identity without altering an SVG fragment target.
+    const mime = stylesheet ? 'text/css' : MIME[ext] ?? 'application/octet-stream';
+    const identity = keyFor(url).slice('f3d-packed/'.length);
+    // Wasm streaming requires the exact application/wasm content type.
+    const data = dataUrl(output, mime.startsWith('image/') ? mime + ';f3d-resource=' + identity : mime) + parsed.hash;
     assets.set(key, { data, original: bytes, output });
     return data;
   }
@@ -342,7 +428,7 @@ export function packHtml(entryPath, outputPath, { rootDir = path.dirname(path.re
         rewriteResource(key);
       }
     }
-    if (attrs.srcset !== undefined) fail('SRCSET', 'Responsive-image source sets require the normal build in this exporter');
+    if (attrs.srcset !== undefined) changes.srcset = rewriteSrcset(get('srcset'), value => assetFor(local(value, base)));
     if (attrs.style !== undefined) changes.style = css(get('style'), base);
     if (Object.keys(changes).length || changedBody) {
       const open = `<${tag[1] ?? tag[4]}${replaceAttributes(raw, changes)}>`;

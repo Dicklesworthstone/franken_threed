@@ -17,6 +17,7 @@ Options:
   --entry <path>        Path to HTML or ESM entry point (required)
   --build-app <dir>     Emit runnable application build to target directory (must be fresh)
   --out-dir <dir>       Alias for --build-app
+  --pack-html <file>    Export emitted HTML as one file, alone or after --build-app
   --specialize-numeric Discover and compile guarded numeric updates in --build-app
   --build-kernel <dir>  Compile one closed numeric function to a fresh Wasm package
   --parameter-types <csv>  Kernel parameter ABI, for example 'f64[],f64[],f64'
@@ -49,6 +50,7 @@ async function main() {
   let output = null;
   let packageRoot = null;
   let buildAppDir = null;
+  let packHtmlFile = null;
   let specializeNumeric = false;
   let buildKernelDir = null;
   let parameterTypes = null;
@@ -65,6 +67,12 @@ async function main() {
         process.exit(1);
       }
       entry = args[++i];
+    } else if (arg === '--pack-html') {
+      if (i + 1 >= args.length || args[i + 1].startsWith('-')) {
+        console.error('Error: --pack-html requires a fresh HTML output path.');
+        process.exit(1);
+      }
+      packHtmlFile = args[++i];
     } else if (arg === '--specialize-numeric') {
       specializeNumeric = true;
     } else if (arg === '--build-app' || arg === '--out-dir') {
@@ -123,6 +131,11 @@ async function main() {
     process.exit(1);
   }
 
+  if (packHtmlFile && (buildKernelDir || !/\.html?$/i.test(entry) || (!buildAppDir && packageRoot))) {
+    console.error('Error: --pack-html requires an HTML entry and cannot be combined with --build-kernel; --package-root requires --build-app.');
+    process.exit(1);
+  }
+
   const resolvedEntry = path.resolve(entry);
   if (!fs.existsSync(resolvedEntry)) {
     console.error(`Error: Entry file "${entry}" does not exist.`);
@@ -134,6 +147,22 @@ async function main() {
 
   if (buildAppDir) {
     resolvedBuildAppDir = path.resolve(buildAppDir);
+  }
+
+  if (packHtmlFile) {
+    const packed = path.resolve(packHtmlFile);
+    if (packed === resolvedEntry || (output && packed === path.resolve(output)) ||
+        (resolvedBuildAppDir && (packed === resolvedBuildAppDir || packed === path.join(resolvedBuildAppDir, path.basename(resolvedEntry))))) {
+      console.error('Error: --pack-html output collides with an input, build entry, or manifest path.');
+      process.exit(1);
+    }
+    try {
+      fs.lstatSync(packed);
+      console.error('Error: --pack-html output already exists; refusing to overwrite it.');
+      process.exit(1);
+    } catch (error) {
+      if (error.code !== 'ENOENT') { console.error(`Error: Cannot inspect HTML output: ${error.message}`); process.exit(1); }
+    }
   }
 
   if (output) {
@@ -179,7 +208,21 @@ async function main() {
     }
   }
 
+  async function exportHtml(htmlEntry) {
+    const { packHtml } = await import('./pack_html.mjs');
+    const packed = packHtml(htmlEntry, packHtmlFile);
+    console.log(`Single HTML exported to: ${packed.outputFile}`);
+    console.log(`Embedded ${packed.moduleCount} modules and ${packed.assetCount} static assets (${packed.outputBytes} bytes).`);
+    console.log('Static resource graph only; application-created networking and host services are unchanged.');
+    return packed;
+  }
+
   try {
+    if (packHtmlFile && !buildAppDir) {
+      const packed = await exportHtml(entry);
+      if (output) writeOutputFile(resolvedOutput, JSON.stringify(packed, null, 2), output);
+      return;
+    }
     if (buildKernelDir) {
       const { buildNumericKernel } = await import('./numeric_kernel_build.mjs');
       const result = buildNumericKernel(entry, buildKernelDir, { parameterTypes, maxMemoryPages });
@@ -201,6 +244,10 @@ async function main() {
         const report = appResult.numericSpecialization;
         console.log(`Numeric specialization: ${report.compiledKernels} kernels, ${report.rewrittenCalls} guarded call sites; report: ${report.reportFile}`);
         console.log('Original JavaScript remains the guard/policy fallback; no speedup claim.');
+      }
+
+      if (packHtmlFile) {
+        appResult.singleHtml = await exportHtml(path.join(appResult.outDir, appResult.htmlFile));
       }
 
       if (output) {

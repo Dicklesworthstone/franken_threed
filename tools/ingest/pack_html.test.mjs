@@ -84,7 +84,7 @@ test('inline module bodies, classic dynamic imports and comments are preserved w
 test('percent-encoded filenames and HTML entities resolve to actual local bytes', () => {
   const f = build({ 'index.html': '<img src="hello%20world.png?q=a&amp;b=c"><script type="module" src="app.mjs"></script>',
     'hello world.png': Buffer.from([1,2]), 'app.mjs': 'export const x=1;' });
-  assert.ok(f.html.includes('data:image/png;base64,AQI='));
+  assert.match(f.html,/data:image\/png;f3d-resource=[0-9a-f]+;base64,AQI=/);
 });
 
 for (const [label, files, code] of [
