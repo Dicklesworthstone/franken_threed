@@ -14,8 +14,9 @@ export async function runAnimationRenderChecks(device) {
   const pose=createAnimationPlayer({format:'f3d-animation-v1',nodes:[{},{}],skins:[{joints:[1]}],instances:[{node:0,skin:0}],
     clips:[{channels:[{node:1,path:'translation',times:[0,1],values:[-0.45,0,0,0.45,0,0]}]}]});
   const geometry={node:0,positions:[-0.35,-0.4,0.5,0.35,-0.4,0.5,0,0.4,0.5],normals:[0,0,1,0,0,1,0,0,1],
+    tangents:[1,0,0,1,1,0,0,1,1,0,0,1],
     joints:[0,0,0,0,0,0,0,0,0,0,0,0],weights:[1,0,0,0,1,0,0,0,1,0,0,0]};
-  const resources=[],errors=[];let gpu,renderer,multisampled,scene;
+  const resources=[],errors=[];let gpu,renderer,multisampled,scene,reversedTangentGpu;
   const onError=event=>errors.push(event.error?.message??String(event));
   device.addEventListener('uncapturederror',onError);
   const own=resource=>{resources.push(resource);return resource;};
@@ -127,16 +128,83 @@ export async function runAnimationRenderChecks(device) {
     }
     results.push('point inverse square/range and spot cones');
 
+    // Analytic map checks: remapped [204,128,230] has normal approximately
+    // (0.5981,0.0039,0.8014). These expected bytes are not renderer output.
+    function constantTexture(rgba,format='rgba8unorm') {
+      const texture=own(device.createTexture({size:[1,1],format,usage:6}));
+      device.queue.writeTexture({texture},new Uint8Array(rgba),{bytesPerRow:4},[1,1]);
+      return {view:texture.createView(),sampler};
+    }
+    const normalX=constantTexture([204,128,230,255]),normalY=constantTexture([128,204,230,255]);
+    const flatNormal=constantTexture([128,128,255,255]);
+    const normalMesh=await renderer.addMesh(gpu,{texCoords,shading:'lambert',baseColor,normalTexture:normalX});
+    renderer.render({...frame([{mesh:normalMesh,worldMatrix:matrix(-0.45)},
+      {mesh:normalMesh,worldMatrix:matrix(0.45),normalScale:0}]),lighting:lights()});
+    await renderer.whenIdle();pixels=await image();
+    pixel(pixels,17,34,[51,102,153,255],'tangent normal',2);
+    pixel(pixels,46,34,[64,128,191,255],'zero normal scale',2);
+    results.push('normal map and per-draw normal scale');
+
+    renderer.render({...frame([{mesh:normalMesh,worldMatrix:shear}]),lighting:lights()});
+    await renderer.whenIdle();pixel(await image(),32,34,[63,125,188,255],'direction-transformed tangent with shear',2);
+    const mappedY={texCoords,shading:'lambert',baseColor,normalTexture:normalY,doubleSided:true};
+    const normalYMesh=await renderer.addMesh(gpu,mappedY);
+    const angled=direction=>punctual({type:'directional',direction,intensity:Math.PI});
+    renderer.render({...frame([{mesh:normalYMesh,worldMatrix:matrix(-0.45)},
+      {mesh:normalYMesh,worldMatrix:matrix(0.45,0,-1)}]),lighting:angled([0,-1,-1])});
+    await renderer.whenIdle();pixels=await image();
+    pixel(pixels,17,34,[63,126,189,255],'positive tangent basis',2);
+    pixel(pixels,46,34,[63,126,189,255],'reflected bitangent handedness',2);
+    reversedTangentGpu=await createGpuAnimationDeformer(device,pose,{...geometry,tangents:[1,0,0,-1,1,0,0,-1,1,0,0,-1]});
+    const negativeTangent=await renderer.addMesh(reversedTangentGpu,mappedY);
+    renderer.render({...frame([negativeTangent]),lighting:angled([0,-1,-1])});
+    await renderer.whenIdle();pixel(await image(),32,34,[9,18,27,255],'negative source tangent handedness',2);
+    const backFace=await renderer.addMesh(gpu,{texCoords,indices:[0,2,1],shading:'lambert',baseColor,normalTexture:normalX,doubleSided:true});
+    renderer.render({...frame([backFace]),lighting:angled([1,0,1])});
+    await renderer.whenIdle();pixel(await image(),32,34,[63,126,189,255],'back-face mapped normal',2);
+    results.push('sheared tangents, reflected worlds, tangent W and back faces');
+
+    const metalAtlas=own(device.createTexture({size:[2,1],format:'rgba8unorm',usage:6}));
+    device.queue.writeTexture({texture:metalAtlas},new Uint8Array([255,255,0,255,255,255,255,255]),{bytesPerRow:8},[2,1]);
+    const mappedMetal=await renderer.addMesh(gpu,{texCoords:[0.25,0.5,0.25,0.5,0.25,0.5],shading:'metallic-roughness',baseColor,
+      metallicRoughnessTexture:{view:metalAtlas.createView(),sampler}});
+    renderer.render({...frame([{mesh:mappedMetal,worldMatrix:matrix(-0.45)},
+      {mesh:mappedMetal,worldMatrix:matrix(0.45),uvTransform:[1,0,0,1,0.5,0]}]),lighting:lights()});
+    await renderer.whenIdle();pixels=await image();
+    pixel(pixels,17,34,[64,125,186,255],'blue-channel dielectric',2);
+    pixel(pixels,46,34,[16,32,48,255],'blue-channel metal',2);
+    const roughMetal=await renderer.addMesh(gpu,{texCoords,shading:'metallic-roughness',baseColor,
+      metallicRoughnessTexture:constantTexture([17,128,255,255])});
+    // At normal incidence pure-metal response is base * L/(4*pi*roughness^4).
+    renderer.render({...frame([roughMetal]),lighting:lights(Math.PI/4)});
+    await renderer.whenIdle();pixel(await image(),32,34,[63,126,188,255],'linear green-channel roughness',2);
+    results.push('linear metallic-roughness channels and UV selection');
+
+    const emissiveTexture={view:srgb.createView(),sampler},emissiveFactor=[0.5,1,0.25];
+    const mappedEmission=await renderer.addMesh(gpu,{texCoords,shading:'lambert',baseColor:[0,0,0,1],vertexColors,
+      emissiveTexture,emissiveFactor});
+    renderer.render({...frame([mappedEmission]),lighting:{viewDirection:[0,0,1],lights:[]}});
+    await renderer.whenIdle();pixel(await image(),32,34,[28,13,64,255],'sRGB emissive map times factor, not vertex color',2);
+    results.push('sRGB emissive map independent of reflectance');
+
     // Execute the composed controller -> deformation -> textured/lit draw path.
     scene=await createGpuAnimationScene(device,pose,[{geometry,...textured,shading:'lambert'}],
       {renderer:{format:'rgba8unorm',depthFormat:'depth32float'}});
     scene.controller.createAction(0,{loop:'once',clampWhenFinished:true}).play();
     scene.update(0.5);scene.render({colorView,depthView,viewProjection:identity(),lighting:lights()});await scene.whenIdle();
     pixel(await image(),32,34,[28,13,128,255],'textured lit scene playback',2);results.push('composed textured/lit scene playback');
+    scene.dispose();
+    scene=await createGpuAnimationScene(device,pose,[{geometry,...textured,shading:'metallic-roughness',
+      normalTexture:flatNormal,normalScale:1,metallicRoughnessTexture:constantTexture([255,255,0,255]),emissiveTexture,emissiveFactor}],
+      {renderer:{format:'rgba8unorm',depthFormat:'depth32float'}});
+    scene.controller.createAction(0,{loop:'once',clampWhenFinished:true}).play();
+    scene.update(0.5);scene.render({colorView,depthView,viewProjection:identity(),lighting:lights()});await scene.whenIdle();
+    pixel(await image(),32,34,[56,28,189,255],'composed four-map scene playback',2);
+    results.push('composed four-map scene playback');
     check(errors.length===0,errors.join('\n'));
     return {status:'passed',checks:results,execution:'actual WebGPU compute and pixel readback',performanceClaim:false};
   } finally {
-    scene?.dispose();multisampled?.dispose();renderer?.dispose();gpu?.dispose();pose.dispose();
+    scene?.dispose();multisampled?.dispose();renderer?.dispose();reversedTangentGpu?.dispose();gpu?.dispose();pose.dispose();
     for(const resource of resources)resource.destroy();device.removeEventListener('uncapturederror',onError);
   }
 }

@@ -24,14 +24,17 @@
  * and deformers, never the borrowed pose/device/attachments. maxBytes bounds
  * owned GPU buffers (not driver pipelines, CPU pose arrays or caller textures).
  * Drawable material fields match renderer.addMesh: texCoords, vertexColors,
- * baseColorTexture, uvTransform, shading, metallicFactor, roughnessFactor and
- * emissiveFactor are optional. Lit scenes pass lighting to render(). Textures
+ * baseColorTexture, metallicRoughnessTexture, normalTexture, emissiveTexture,
+ * uvTransform, shading, metallicFactor, roughnessFactor, normalScale and
+ * emissiveFactor are optional. Normal maps require geometry.tangents (XYZ/W);
+ * every map uses the shared texCoords/uvTransform. Lit scenes pass lighting to render(). Textures
  * stay caller-owned; material arrays/descriptors are snapshotted before awaits.
  */
 import {createAnimationController} from './animation_controller.mjs';
 import {createGpuAnimationDeformer} from './animation_webgpu.mjs';
 import {createGpuAnimationRenderer, AnimationRenderError} from './animation_render.mjs';
 const fail = (code, message) => { throw new AnimationRenderError(code, message); };
+const TEXTURE_FIELDS = ['baseColorTexture', 'metallicRoughnessTexture', 'normalTexture', 'emissiveTexture'];
 
 export async function createGpuAnimationScene(device, pose, drawables, {
   renderer: renderOptions = {}, deformer: deformOptions = {}, maxMeshes = 256, maxBytes = 256 * 1024 * 1024,
@@ -72,7 +75,7 @@ export async function createGpuAnimationScene(device, pose, drawables, {
     const inputs = drawables.map(input => {
       if (!input || typeof input !== 'object') fail('ANIMATION_SCENE_GEOMETRY', 'Expected a drawable descriptor');
       const allowed = ['geometry', 'indices', 'baseColor', 'doubleSided', 'alphaMode', 'alphaCutoff',
-        'texCoords', 'vertexColors', 'baseColorTexture', 'uvTransform', 'shading', 'metallicFactor', 'roughnessFactor', 'emissiveFactor'];
+        'texCoords', 'vertexColors', ...TEXTURE_FIELDS, 'uvTransform', 'shading', 'metallicFactor', 'roughnessFactor', 'emissiveFactor', 'normalScale'];
       for (const key of Object.keys(input)) if (!allowed.includes(key)) fail('ANIMATION_SCENE_GEOMETRY', `Unsupported drawable field: ${key}`);
       const {geometry, indices = null, baseColor = [1,1,1,1], doubleSided = false, alphaMode = 'OPAQUE', alphaCutoff = 0.5} = input;
       if ((!Array.isArray(baseColor) && !ArrayBuffer.isView(baseColor)) || baseColor.length !== 4) fail('ANIMATION_SCENE_GEOMETRY', 'Expected RGBA material color');
@@ -82,15 +85,16 @@ export async function createGpuAnimationScene(device, pose, drawables, {
         const value = input[key];
         if (value !== undefined) material[key] = value === null ? null : copyMaterialArray(value, key);
       }
-      for (const key of ['shading', 'metallicFactor', 'roughnessFactor']) {
+      for (const key of ['shading', 'metallicFactor', 'roughnessFactor', 'normalScale']) {
         const value = input[key]; if (value !== undefined) material[key] = value;
       }
-      const texture = input.baseColorTexture;
-      if (texture !== undefined) {
+      for (const key of TEXTURE_FIELDS) {
+        const texture = input[key];
+        if (texture === undefined) continue;
         if (texture !== null && (typeof texture !== 'object' || Array.isArray(texture))) fail('ANIMATION_SCENE_GEOMETRY', 'Expected a texture descriptor');
         // Preserve unknown descriptor keys so the renderer rejects them; never
         // silently drop a requested flipY, color conversion or unsupported map.
-        material.baseColorTexture = texture === null ? null : {...texture};
+        material[key] = texture === null ? null : {...texture};
       }
       return {geometry, material};
     });
@@ -104,7 +108,7 @@ export async function createGpuAnimationScene(device, pose, drawables, {
       // Reserve the renderer's pending auxiliary buffers before allocating the
       // next deformer. uint32 indices conservatively bound padded uint16 data.
       const vertices = geometry?.positions?.length / 3;
-      const surface = material.texCoords != null || material.vertexColors != null || material.baseColorTexture != null;
+      const surface = material.texCoords != null || material.vertexColors != null || TEXTURE_FIELDS.some(key => material[key] != null);
       if (surface && (!Number.isSafeInteger(vertices) || vertices < 1)) fail('ANIMATION_SCENE_GEOMETRY', 'Surface attributes require XYZ geometry');
       const lit = material.shading === 'lambert' || material.shading === 'metallic-roughness';
       const reserve = (material.indices?.length ?? 0) * 4 + (surface ? vertices * 24 : 0) + (lit && !lightingAllocated ? 544 : 0);
