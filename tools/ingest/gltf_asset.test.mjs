@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {parseGltfAsset,loadGltfAsset,GltfAssetError} from './gltf_asset.mjs';
 const encode=value=>new TextEncoder().encode(JSON.stringify(value));
 const base=()=>({asset:{version:'2.0'}});
-const png=Uint8Array.from(Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==','base64'));
+const png=Uint8Array.from(Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==','base64'));
 const uri=(data,mime='application/octet-stream')=>`data:${mime};base64,${Buffer.from(data).toString('base64')}`;
 function glb(json,bin=null,extra=[]) {
   const text=encode(json),length=Math.ceil(text.length/4)*4,j=new Uint8Array(length);j.fill(32);j.set(text);

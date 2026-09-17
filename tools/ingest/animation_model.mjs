@@ -140,10 +140,19 @@ function materialPlan(model, primitive) {
  * The returned definition and drawables no longer borrow JSON or buffer bytes.
  * Only successfully resolved native texture resources remain caller-owned.
  */
-export function decodeGltfAnimationModel(model, suppliedBuffers, {
-  scene=model?.scene ?? 0,maxComponents=16777216,maxPrimitives=4096,resolveTexture=null,
-} = {}) {
+export function decodeGltfAnimationModel(model, suppliedBuffers, {resolveTexture=null,...options}={}) {
   if (resolveTexture !== null && typeof resolveTexture !== 'function') fail('TEXTURE','resolveTexture must be a function');
+  return prepareGltfAnimationModel(model,suppliedBuffers,options).resolveTextures(resolveTexture);
+}
+
+/** Preflight and decode once, before asynchronous texture loading. Only frozen,
+ * unique texture requests are exposed; no unresolved/fake drawable is published.
+ * resolveTextures(resolver) consumes the plan on success. A failed resolver can
+ * be retried without decoding again; borrowed resolver effects are not rolled back.
+ */
+export function prepareGltfAnimationModel(model,suppliedBuffers,{
+  scene=model?.scene ?? 0,maxComponents=16777216,maxPrimitives=4096,
+}={}) {
   if (!Array.isArray(model?.extensionsRequired ?? [])) fail('SHAPE','extensionsRequired must be an array');
   for (const name of model?.extensionsRequired ?? []) if (!['KHR_materials_unlit','KHR_texture_transform'].includes(name)) fail('UNSUPPORTED',`Required extension needs source route: ${name}`);
   const loaded=new Map();
@@ -153,7 +162,21 @@ export function decodeGltfAnimationModel(model, suppliedBuffers, {
   };
   const definition=decodeGltfAnimation(model,buffer,{maxComponents});
   const geometry=decodeGltfGeometry(model,buffer,{scene,maxComponents,maxPrimitives});
-  const plans=geometry.primitives.map(p=>materialPlan(model,p));
+  const plans=geometry.primitives.map(p=>materialPlan(model,p)),unique=new Map();
+  for(const plan of plans)for(const {request}of plan.requests)unique.set(request.textureIndex+':'+request.colorSpace,request);
+  let busy=false,consumed=false;
+  return Object.freeze({textureRequests:Object.freeze([...unique.values()]),
+    resolveTextures(resolveTexture=null) {
+      if(consumed)fail('PREPARED','Prepared model has already been resolved');
+      if(busy)fail('REENTRANT','Texture resolution cannot be reentered');
+      if(resolveTexture!==null&&typeof resolveTexture!=='function')fail('TEXTURE','resolveTexture must be a function');
+      busy=true;
+      try {const result=resolveModelTextures(definition,geometry,plans,resolveTexture);consumed=true;return result;}
+      finally {busy=false;}
+    },
+  });
+}
+function resolveModelTextures(definition,geometry,plans,resolveTexture) {
   if (plans.some(p=>p.requests.length) && resolveTexture===null) fail('TEXTURE','Textured materials require an explicit loaded-texture resolver');
   const resolved=new Map();
   for (const plan of plans) for (const {field,request} of plan.requests) {

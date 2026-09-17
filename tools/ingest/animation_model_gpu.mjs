@@ -19,7 +19,14 @@ import {createGpuAnimationScene} from './animation_scene.mjs';
  * The API is a core triangle/direct-light material route, not full glTF parity.
  */
 export async function createGpuGltfAnimationScene(device, json, buffers, {decode={},scene:options={}}={}) {
-  const prepared=decodeGltfAnimationModel(json,buffers,decode),pose=createAnimationPlayer(prepared.definition);
+  return createGpuDecodedAnimationScene(device,decodeGltfAnimationModel(json,buffers,decode),options);
+}
+
+/** Consume the real decoded-model output, avoiding a second geometry decode
+ * after asynchronous texture preparation. Texture resources remain borrowed.
+ */
+export async function createGpuDecodedAnimationScene(device,prepared,options={}) {
+  const pose=createAnimationPlayer(prepared.definition);
   let scene;
   try {scene=await createGpuAnimationScene(device,pose,prepared.drawables,options);}
   catch(error){pose.dispose();throw error;}
