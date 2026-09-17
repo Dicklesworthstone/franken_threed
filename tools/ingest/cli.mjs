@@ -14,11 +14,12 @@ Usage:
   node tools/ingest/cli.mjs --entry <path_to_html_or_js> [options]
 
 Options:
-  --entry <path>        Path to HTML or ESM entry point (required)
+  --entry <path>        Path to HTML, ESM, or glTF/GLB entry (required)
   --build-app <dir>     Emit runnable application build to target directory (must be fresh)
   --out-dir <dir>       Alias for --build-app
   --pack-html <file>    Export emitted HTML as one file, alone or after --build-app
   --specialize-numeric Discover and compile guarded numeric updates in --build-app
+  --build-animation <dir>  Export a glTF/GLB pose player to a fresh directory
   --build-kernel <dir>  Compile one closed numeric function to a fresh Wasm package
   --parameter-types <csv>  Kernel parameter ABI, for example 'f64[],f64[],f64'
   --max-memory-pages <n>   Kernel memory ceiling in 64 KiB pages (default: 1024)
@@ -53,6 +54,7 @@ async function main() {
   let packHtmlFile = null;
   let specializeNumeric = false;
   let buildKernelDir = null;
+  let buildAnimationDir = null;
   let parameterTypes = null;
   let maxMemoryPages;
 
@@ -67,6 +69,12 @@ async function main() {
         process.exit(1);
       }
       entry = args[++i];
+    } else if (arg === '--build-animation') {
+      if (i + 1 >= args.length || args[i + 1].startsWith('-')) {
+        console.error('Error: --build-animation requires a fresh output directory.');
+        process.exit(1);
+      }
+      buildAnimationDir = args[++i];
     } else if (arg === '--pack-html') {
       if (i + 1 >= args.length || args[i + 1].startsWith('-')) {
         console.error('Error: --pack-html requires a fresh HTML output path.');
@@ -114,6 +122,12 @@ async function main() {
   if (!entry) {
     console.error('Error: --entry <path> is required.');
     printHelp();
+    process.exit(1);
+  }
+
+  if (buildAnimationDir && (buildAppDir || buildKernelDir || packHtmlFile || specializeNumeric ||
+      parameterTypes || maxMemoryPages !== undefined || output || packageRoot || !/\.gl(?:tf|b)$/i.test(entry))) {
+    console.error('Error: --build-animation requires a glTF/GLB entry and cannot be combined with other build or output options; its manifest is included in the package.');
     process.exit(1);
   }
 
@@ -218,6 +232,14 @@ async function main() {
   }
 
   try {
+    if (buildAnimationDir) {
+      const { buildAnimation } = await import('./build_animation.mjs');
+      const result = buildAnimation(entry, buildAnimationDir);
+      console.log(`Animation pose package emitted to: ${result.outDir}`);
+      console.log(`${result.clips.length} clips, ${result.nodeCount} nodes, ${result.instances.length} skinned mesh instances.`);
+      console.log('Entry: animation.mjs; explicit CPU pose sampling, not an AnimationMixer or renderer replacement.');
+      return;
+    }
     if (packHtmlFile && !buildAppDir) {
       const packed = await exportHtml(entry);
       if (output) writeOutputFile(resolvedOutput, JSON.stringify(packed, null, 2), output);
