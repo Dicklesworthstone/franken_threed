@@ -2,7 +2,7 @@
  * Packed glTF animation poses. No parser, filesystem, DOM, renderer or Wasm
  * initialization is needed at import time. Instances own all mutable storage.
  *
- * This is an explicit single-clip sampler, not an AnimationMixer replacement:
+ * This is an explicit pose sampler, not an AnimationMixer replacement:
  * sample() resets untargeted values to the imported rest pose, and loop timing
  * is an explicit caller choice. Outputs retain identity across samples. Input
  * definitions are copied once; edits to published output arrays are not inputs.
@@ -116,12 +116,35 @@ function sampleChannel(channel, time, destination, offset) {
   }
 }
 
+// Alias-safe quaternion operations for local-pose mixing. Normalize inputs to
+// avoid magnifying the small unit-length error tolerated by glTF accessors.
+function mixQuaternion(out,offset,source,start,t) {
+  const an=Math.hypot(out[offset],out[offset+1],out[offset+2],out[offset+3]);
+  const bn=Math.hypot(source[start],source[start+1],source[start+2],source[start+3]);
+  if(!(an>0)||!(bn>0)||!Number.isFinite(an)||!Number.isFinite(bn))fail('ANIMATION_QUATERNION','Cannot mix invalid rotations');
+  let dot=0;for(let i=0;i<4;i++)dot+=(out[offset+i]/an)*(source[start+i]/bn);
+  const sign=dot<0?-1:1;dot=Math.min(1,Math.abs(dot));
+  let a=1-t,b=t;
+  if(1-dot>Number.EPSILON) {
+    const angle=Math.acos(dot),sin=Math.sin(angle);
+    a=Math.sin((1-t)*angle)/sin;b=Math.sin(t*angle)/sin;
+  }
+  for(let i=0;i<4;i++)out[offset+i]=a*(out[offset+i]/an)+b*sign*(source[start+i]/bn);
+  normalize(out,offset);
+}
+function multiplyQuaternion(out,o,a,ao,b,bo) {
+  const x=a[ao],y=a[ao+1],z=a[ao+2],w=a[ao+3];
+  const X=b[bo],Y=b[bo+1],Z=b[bo+2],W=b[bo+3];
+  out[o]=x*W+w*X+y*Z-z*Y;out[o+1]=y*W+w*Y+z*X-x*Z;
+  out[o+2]=z*W+w*Z+x*Y-y*X;out[o+3]=w*W-x*X-y*Y-z*Z;
+}
+
 /**
  * Create a reusable pose instance from a build-time decoded definition.
  * All indices use original glTF node/skin order. `instances` lists each skinned
  * mesh node, including several mesh nodes referencing the same skin. Palettes
  * are mesh-local, so those instances must NOT accidentally share a palette.
- * No implicit wall-clock, event scheduling, blending or public Three.js mutation.
+ * No implicit wall-clock, event scheduling or public Three.js mutation.
  */
 export function createAnimationPlayer(definition) {
   if(definition?.format!=='f3d-animation-v1'||!Array.isArray(definition.nodes)||definition.nodes.length>65536)fail('ANIMATION_FORMAT','Expected a bounded f3d-animation-v1 definition');
@@ -196,27 +219,145 @@ export function createAnimationPlayer(definition) {
   const restW=new Float64Array(baseWeights);
   const makeState=()=>({translations:baseT.slice(),rotations:baseQ.slice(),scales:baseS.slice(),morphWeights:restW.slice(),worldMatrices:new Float64Array(n*16),jointMatrices:new Float32Array(paletteSize)});
   const published=makeState(),scratch=makeState(),local=new Float64Array(n*16),inverse=new Float64Array(16),product=new Float64Array(16),result=new Float64Array(16);
-  const fields=Object.keys(published);let version=0,currentTime=0,currentClip=-1,disposed=false;
-  function evaluate(time,{clip=0,loop=false,rootMatrix=null}={}) {
-    if(disposed)fail('ANIMATION_DISPOSED','Animation player has been disposed');
-    // Published arrays are reusable player-owned storage. Reject detached buffers
-    // before copying any field, including empty outputs transferred to workers.
+  const fields=Object.keys(published);
+  let version=0,currentTime=0,currentClip=-1,currentMode='rest',disposed=false,busy=false;
+  // One accumulator per property binding, not per clip: a clip that does not
+  // animate a property must not dilute another clip's contribution to it.
+  const paths=['translation','rotation','scale','weights'];
+  const poseFields=['translations','rotations','scales','morphWeights'];
+  const rest=[baseT,baseQ,baseS,restW],bindings=new Map();
+  let maxWidth=4;
+  for(const clip of clips)for(const channel of clip.channels) {
+    const kind=paths.indexOf(channel.path),key=channel.node*4+kind;
+    if(!bindings.has(key))bindings.set(key,{
+      key,kind,width:channel.width,
+      offset:kind===3?morphOffsets[channel.node]:channel.node*channel.width,
+    });
+    channel.binding=bindings.get(key);maxWidth=Math.max(maxWidth,channel.width);
+  }
+  const totals=new Float64Array(n*4),values=new Float64Array(maxWidth);
+  const delta=new Float64Array(4),weightedDelta=new Float64Array(4);
+  const layerScratch=[];
+  function checkStorage() {
     for(const field of fields){
       try{new Uint8Array(published[field].buffer,0,0);if(published[field].length!==scratch[field].length)throw new Error();}
       catch{fail('ANIMATION_OUTPUT_STORAGE','Published pose buffers must not be detached');}
     }
+  }
+  function run(operation,input,options) {
+    if(disposed)fail('ANIMATION_DISPOSED','Animation player has been disposed');
+    if(busy)fail('ANIMATION_REENTRANT','Pose evaluation cannot be reentered');
+    busy=true;
+    try { checkStorage();return operation(input,options); }
+    finally { busy=false; }
+  }
+  function resetScratch() {
+    scratch.translations.set(baseT);scratch.rotations.set(baseQ);
+    scratch.scales.set(baseS);scratch.morphWeights.set(restW);
+  }
+  function clipTime(time,clip,loop) {
+    const remainder=loop&&clip.duration>0?time%clip.duration:time;
+    return loop&&clip.duration>0&&remainder<0?remainder+clip.duration:remainder;
+  }
+  function evaluate(time,{clip=0,loop=false,rootMatrix=null}={}) {
     finite(time,'Sample time');if(typeof loop!=='boolean')fail('ANIMATION_TIME','loop must be boolean');
     if(clip!==-1)integer(clip,clips.length,'Clip');
     const root=rootMatrix===null?null:affine(rootMatrix,'Root matrix');
-    const selected=clip===-1?null:clips[clip];
-    const remainder=loop&&selected?.duration>0?time%selected.duration:time;
-    const sampled=loop&&selected?.duration>0&&remainder<0?remainder+selected.duration:remainder;
-    scratch.translations.set(baseT);scratch.rotations.set(baseQ);scratch.scales.set(baseS);scratch.morphWeights.set(restW);
+    const selected=clip===-1?null:clips[clip],sampled=selected?clipTime(time,selected,loop):time;
+    resetScratch();
     if(selected)for(const channel of selected.channels) {
-      const field=channel.path==='translation'?'translations':channel.path==='rotation'?'rotations':channel.path==='scale'?'scales':'morphWeights';
-      const offset=channel.path==='weights'?morphOffsets[channel.node]:channel.node*channel.width;
-      sampleChannel(channel,sampled,scratch[field],offset);
+      const {kind,offset}=channel.binding;
+      sampleChannel(channel,sampled,scratch[poseFields[kind]],offset);
     }
+    return publishPose(root,sampled,clip,clip===-1?'rest':'sample');
+  }
+  /**
+   * blend([{clip,time,weight=1,loop=false,mode='normal',mask=null}], options)
+   * combines LOCAL TRS/morph channels, then evaluates world/skin matrices once.
+   * Normal weights normalize per binding above one; below one the rest pose
+   * supplies the remainder. Rotations use ordered shortest-path SLERP, not a
+   * matrix average. An optional mask has nodeCount weights in [0,1].
+   *
+   * Additive layers follow all normal layers, in input order. Numeric deltas
+   * (including scale) are sample minus imported rest; quaternion deltas are
+   * inverse(rest) * sample and are post-multiplied at their weighted strength.
+   * This is NOT a preconverted Three.js additive-clip input contract.
+   * No per-layer pose/matrix buffers are allocated while blending.
+   * Descriptor/mask scratch grows only when a new layer slot first needs it.
+   * blend publishes mode='blend', time=0, clip=-1; sample/reset keep their API.
+   */
+  function evaluateBlend(layers,{rootMatrix=null}={}) {
+    if(!Array.isArray(layers)||layers.length>256)fail('ANIMATION_LAYERS','Expected at most 256 layers');
+    const root=rootMatrix===null?null:affine(rootMatrix,'Root matrix');
+    const count=layers.length;
+    // Snapshot caller-owned inputs before touching pose scratch. In particular,
+    // a mask may be a view into published pose storage.
+    for(let i=0;i<count;i++) {
+      const input=layers[i];
+      if(!input||typeof input!=='object')fail('ANIMATION_LAYER','Invalid layer');
+      const clip=integer(input.clip,clips.length,'Layer clip');
+      const time=finite(input.time,'Layer time'),weight=finite(input.weight??1,'Layer weight');
+      const loop=input.loop??false,mode=input.mode??'normal',mask=input.mask??null;
+      if(weight<0)fail('ANIMATION_WEIGHT','Layer weight must be nonnegative');
+      if(typeof loop!=='boolean')fail('ANIMATION_TIME','loop must be boolean');
+      if(mode!=='normal'&&mode!=='additive')fail('ANIMATION_BLEND_MODE','Unknown layer mode');
+      const layer=layerScratch[i]??(layerScratch[i]={mask:null});
+      layer.clip=clips[clip];layer.time=clipTime(time,layer.clip,loop);
+      layer.weight=weight;layer.mode=mode;layer.masked=mask!==null;
+      if(mask!==null) {
+        if((!Array.isArray(mask)&&!ArrayBuffer.isView(mask))||mask.length!==n)fail('ANIMATION_MASK','Mask must have nodeCount weights');
+        layer.mask??=new Float64Array(n);
+        for(let node=0;node<n;node++) {
+          const value=finite(mask[node],'Mask weight');
+          if(value<0||value>1)fail('ANIMATION_MASK','Mask weights must be in [0,1]');
+          layer.mask[node]=value;
+        }
+      }
+    }
+    resetScratch();totals.fill(0);
+    for(let i=0;i<count;i++) {
+      const layer=layerScratch[i];if(layer.mode!=='normal'||layer.weight===0)continue;
+      for(const channel of layer.clip.channels) {
+        const weight=layer.weight*(layer.masked?layer.mask[channel.node]:1);
+        if(weight===0)continue;
+        const {key,kind,offset,width}=channel.binding,destination=scratch[poseFields[kind]];
+        sampleChannel(channel,layer.time,values,0);
+        const previous=totals[key],total=finite(previous+weight,'Accumulated weight');
+        if(previous===0) {
+          for(let j=0;j<width;j++)destination[offset+j]=values[j];
+          if(kind===1)normalize(destination,offset);
+        } else if(kind===1)mixQuaternion(destination,offset,values,0,weight/total);
+        else for(let j=0;j<width;j++)destination[offset+j]=(1-weight/total)*destination[offset+j]+weight/total*values[j];
+        totals[key]=total;
+      }
+    }
+    for(const {key,kind,offset,width} of bindings.values()) {
+      const weight=totals[key];if(weight===0||weight>=1)continue;
+      const destination=scratch[poseFields[kind]],base=rest[kind];
+      if(kind===1)mixQuaternion(destination,offset,base,offset,1-weight);
+      else for(let j=0;j<width;j++)destination[offset+j]=weight*destination[offset+j]+(1-weight)*base[offset+j];
+    }
+    for(let i=0;i<count;i++) {
+      const layer=layerScratch[i];if(layer.mode!=='additive'||layer.weight===0)continue;
+      for(const channel of layer.clip.channels) {
+        const weight=layer.weight*(layer.masked?layer.mask[channel.node]:1);
+        if(weight===0)continue;
+        const {kind,offset,width}=channel.binding,destination=scratch[poseFields[kind]],base=rest[kind];
+        sampleChannel(channel,layer.time,values,0);
+        if(kind===1) {
+          for(let j=0;j<4;j++)delta[j]=base[offset+j]*(j===3?1:-1);
+          normalize(delta,0);normalize(values,0);
+          multiplyQuaternion(delta,0,delta,0,values,0);
+          weightedDelta[0]=weightedDelta[1]=weightedDelta[2]=0;weightedDelta[3]=1;
+          mixQuaternion(weightedDelta,0,delta,0,weight);
+          multiplyQuaternion(destination,offset,destination,offset,weightedDelta,0);
+          normalize(destination,offset);
+        } else for(let j=0;j<width;j++)destination[offset+j]+=weight*(values[j]-base[offset+j]);
+      }
+    }
+    return publishPose(root,0,-1,'blend');
+  }
+  function publishPose(root,sampled,clip,mode) {
     for(const node of order) {
       if(matrices.has(node))local.set(matrices.get(node),node*16);
       else compose(scratch.translations,scratch.rotations,scratch.scales,node,local);
@@ -235,14 +376,17 @@ export function createAnimationPlayer(definition) {
     // A malformed sample, singular mesh or overflowing palette cannot expose a
     // half-updated pose. No callbacks or source effects run during evaluation.
     for(const field of fields)for(const value of scratch[field])if(!Number.isFinite(value))fail('ANIMATION_VALUE',`Non-finite ${field}`);
+    checkStorage();
     for(const field of fields)published[field].set(scratch[field]);
-    version++;currentTime=sampled;currentClip=clip;return player;
+    version++;currentTime=sampled;currentClip=clip;currentMode=mode;return player;
   }
   const player=Object.freeze({ ...published,nodeCount:n,morphOffsets:morphOffsets.slice(),
     clips:Object.freeze(clips.map(({name,duration})=>Object.freeze({name,duration}))),instances:Object.freeze(instances),
-    sample:evaluate,reset(){return evaluate(0,{clip:-1});},
-    get version(){return version;},get time(){return currentTime;},get clip(){return currentClip;},
-    dispose(){disposed=true;},get disposed(){return disposed;},
+    sample(time,options){return run(evaluate,time,options);},
+    blend(layers,options){return run(evaluateBlend,layers,options);},
+    reset(){return run(evaluate,0,{clip:-1});},
+    get version(){return version;},get time(){return currentTime;},get clip(){return currentClip;},get mode(){return currentMode;},
+    dispose(){if(busy)fail('ANIMATION_REENTRANT','Cannot dispose during evaluation');disposed=true;},get disposed(){return disposed;},
   });
   evaluate(0,{clip:-1});version=0;
   return player;
