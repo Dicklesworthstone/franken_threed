@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>FrankenThreeD GPU animation execution checks</title>
+<h1>GPU animation execution checks</h1>
+<p>Serve the repository over localhost or HTTPS. This runs real compute, readback,
+and render comparisons, not a performance benchmark. No adapter is a failure.</p>
+<pre id="result">Running…</pre>
+<script type="module">
+import {runAnimationWebGpuChecks} from '../../../tools/ingest/animation_webgpu.browser.mjs';
+let device;
+try {
+  const adapter=await navigator.gpu?.requestAdapter();
+  if(!adapter)throw new Error('No WebGPU adapter; this test has not passed.');
+  device=await adapter.requestDevice();
+  globalThis.__f3dGpuAnimationResult={...await runAnimationWebGpuChecks(device),
+    adapter:{vendor:adapter.info?.vendor,architecture:adapter.info?.architecture,description:adapter.info?.description}};
+} catch(error) {
+  globalThis.__f3dGpuAnimationResult={status:'failed',error:error.stack||String(error)};
+} finally {
+  device?.destroy();
+  document.getElementById('result').textContent=JSON.stringify(globalThis.__f3dGpuAnimationResult,null,2);
+}
+</script>
+</html>

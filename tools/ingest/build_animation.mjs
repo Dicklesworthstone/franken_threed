@@ -56,6 +56,8 @@ function decodeDataUri(uri) {
 /**
  * Output: animation.mjs (sampler), playback.mjs (sampler/controller/deformer),
  * their runtime modules, animation.json and manifest.json.
+ * With {webgpu:true}, also emit the opt-in gpu_playback.mjs entry and kernel.
+ * The default CPU output and import graph remain unchanged.
  * import { createPlayer } from './animation.mjs'; const p=createPlayer();
  * p.sample(time, {clip:0, loop:true}); // p.worldMatrices / p.jointMatrices / p.morphWeights
  * All decoded tracks are embedded; importing the package makes no fetches and
@@ -69,8 +71,15 @@ function decodeDataUri(uri) {
  * // Each application frame: control.update(deltaSeconds); mesh.update();
  * // Consume mesh.positions/normals/tangents and mesh.worldMatrix without
  * // applying skin/morph a second time. Neither helper owns the borrowed pose.
+ *
+ * GPU option: import {createGpuAnimationDeformer} from './gpu_playback.mjs';
+ * const gpu=await createGpuAnimationDeformer(device, pose, decodedGeometry);
+ * // control.update(dt); gpu.update(); submit draws using gpu.vertexBuffer;
+ * // Submit consumers before the next update; await gpu.whenIdle() to drain.
+ * // This is an explicit f32 profile. It does not replace CPU pose sampling.
  */
-export function buildAnimation(entryPath,outDir,{rootDir=path.dirname(path.resolve(entryPath)),maxBytes=64*1024*1024,maxComponents=16777216}={}) {
+export function buildAnimation(entryPath,outDir,{rootDir=path.dirname(path.resolve(entryPath)),maxBytes=64*1024*1024,maxComponents=16777216,webgpu=false}={}) {
+  if(typeof webgpu!=='boolean')throw new TypeError('webgpu must be boolean');
   if(!Number.isSafeInteger(maxBytes)||maxBytes<1)throw new RangeError('maxBytes must be positive');
   const entry=path.resolve(entryPath),destination=path.resolve(outDir),root=fs.realpathSync(rootDir);
   try{fs.lstatSync(destination);fail('ANIMATION_OUTPUT_EXISTS','Destination must be a fresh directory');}catch(error){if(error.code!=='ENOENT')throw error;}
@@ -112,7 +121,12 @@ export function buildAnimation(entryPath,outDir,{rootDir=path.dirname(path.resol
   for(const name of ['animation_controller.mjs','animation_deformer.mjs']) {
     outputs.set(name,fs.readFileSync(new URL('./'+name,import.meta.url),'utf8'));
   }
+  if(webgpu) {
+    outputs.set('animation_webgpu.mjs',fs.readFileSync(new URL('./animation_webgpu.mjs',import.meta.url),'utf8'));
+    outputs.set('gpu_playback.mjs',`export {createPlayer,createAnimationController,createAnimationDeformer} from './playback.mjs';\nexport {createGpuAnimationDeformer} from './animation_webgpu.mjs';\n`);
+  }
   const manifest={format:'f3d-animation-package-v1',entry:'animation.mjs',playbackEntry:'playback.mjs',profile:'core-gltf-animation-pose',
+    ...(webgpu?{gpuEntry:'gpu_playback.mjs',gpuExecution:'webgpu-compute-f32'}:{}),
     source:{file:path.basename(entry),sha256:hash(source)},dependencies:[...dependencies.values()],
     nodeCount:validated.nodeCount,clips:validated.clips,instances:validated.instances,morphWeightCount:validated.morphWeights.length,
     ignoredChannels:definition.ignoredChannels,execution:'javascript-cpu-pose',accelerationClaim:false,
