@@ -141,3 +141,18 @@ const invalid=[
   {...track('translation',[0],[1,2,3]),nodes:[{matrix:I}]},
 ];
 for(let i=0;i<invalid.length;i++)test(`invalid definition ${i} is refused at construction`,()=>assert.throws(()=>createAnimationPlayer(invalid[i]),AnimationPoseError));
+
+
+test('detached published storage is rejected before any other pose field is changed',()=>{
+  const p=createAnimationPlayer(track('translation',[0,1],[0,0,0,1,2,3]));p.sample(0.25);
+  const before=p.translations.slice(),version=p.version;
+  structuredClone(p.jointMatrices.buffer,{transfer:[p.jointMatrices.buffer]});
+  assert.throws(()=>p.sample(0.75),{code:'ANIMATION_OUTPUT_STORAGE'});
+  assert.deepEqual(p.translations,before);assert.equal(p.version,version);
+});
+
+
+test('positive times already inside the loop interval do not acquire modulo rounding error',()=>{
+  const p=createAnimationPlayer(track('translation',[0,2],[0,0,0,2,4,6]));
+  for(const time of [Number.MIN_VALUE,1e-20,0.1,0.3,1.9]){p.sample(time,{loop:true});assert.equal(p.time,time);}
+});

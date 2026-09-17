@@ -42,9 +42,9 @@ function normalize(q, offset) {
   if (!(length > 0) || !Number.isFinite(length)) fail('ANIMATION_QUATERNION', 'Interpolated rotation is not a finite nonzero quaternion');
   for (let i=0;i<4;i++) q[offset+i] /= length;
 }
-function unit(q, offset, label) {
+function unit(q, offset, label, tolerance=1e-3) {
   const norm = Math.hypot(q[offset],q[offset+1],q[offset+2],q[offset+3]);
-  if (Math.abs(norm-1)>1e-3) fail('ANIMATION_QUATERNION', `${label} must be normalized`);
+  if (Math.abs(norm-1)>tolerance) fail('ANIMATION_QUATERNION', `${label} must be normalized`);
 }
 function compose(t, q, s, node, out) {
   const a=node*3,b=node*4,o=node*16;
@@ -178,6 +178,7 @@ export function createAnimationPlayer(definition) {
       if(path!=='weights'&&matrices.has(node))fail('ANIMATION_CHANNEL','Cannot animate TRS on a matrix node');
       const width=path==='weights'?morphOffsets[node+1]-morphOffsets[node]:path==='rotation'?4:3;
       if(!width||used.has(`${node}:${path}`))fail('ANIMATION_CHANNEL','Empty morph target or duplicate animation target');used.add(`${node}:${path}`);
+      if(channel.quantizedRotation!==undefined&&typeof channel.quantizedRotation!=='boolean')fail('ANIMATION_CHANNEL','Invalid rotation quantization marker');
       const interpolation=channel.interpolation??'LINEAR';
       if(!['LINEAR','STEP','CUBICSPLINE'].includes(interpolation))fail('ANIMATION_INTERPOLATION','Unknown interpolation');
       const count=channel.times?.length;
@@ -186,7 +187,7 @@ export function createAnimationPlayer(definition) {
       components+=expected+count;if(components>16777216)fail('ANIMATION_LIMIT','Keyframe component budget exceeded');
       const times=numbers(channel.times,count,'Keyframe times'),values=numbers(channel.values,expected,'Keyframe values');
       for(let i=0;i<count;i++)if(times[i]<0||(i&&times[i]<=times[i-1]))fail('ANIMATION_KEYS','Times must be nonnegative and strictly increasing');
-      if(path==='rotation')for(let i=0;i<count;i++)unit(values,(i*(interpolation==='CUBICSPLINE'?3:1)+(interpolation==='CUBICSPLINE'?1:0))*4,'Keyframe rotation');
+      if(path==='rotation')for(let i=0;i<count;i++)unit(values,(i*(interpolation==='CUBICSPLINE'?3:1)+(interpolation==='CUBICSPLINE'?1:0))*4,'Keyframe rotation',channel.quantizedRotation?0.01:1e-3);
       duration=Math.max(duration,times[count-1]);
       return {node,path,width,interpolation,times,values,cursor:0};
     });
@@ -198,11 +199,18 @@ export function createAnimationPlayer(definition) {
   const fields=Object.keys(published);let version=0,currentTime=0,currentClip=-1,disposed=false;
   function evaluate(time,{clip=0,loop=false,rootMatrix=null}={}) {
     if(disposed)fail('ANIMATION_DISPOSED','Animation player has been disposed');
+    // Published arrays are reusable player-owned storage. Reject detached buffers
+    // before copying any field, including empty outputs transferred to workers.
+    for(const field of fields){
+      try{new Uint8Array(published[field].buffer,0,0);if(published[field].length!==scratch[field].length)throw new Error();}
+      catch{fail('ANIMATION_OUTPUT_STORAGE','Published pose buffers must not be detached');}
+    }
     finite(time,'Sample time');if(typeof loop!=='boolean')fail('ANIMATION_TIME','loop must be boolean');
     if(clip!==-1)integer(clip,clips.length,'Clip');
     const root=rootMatrix===null?null:affine(rootMatrix,'Root matrix');
     const selected=clip===-1?null:clips[clip];
-    const sampled=loop&&selected?.duration>0?((time%selected.duration)+selected.duration)%selected.duration:time;
+    const remainder=loop&&selected?.duration>0?time%selected.duration:time;
+    const sampled=loop&&selected?.duration>0&&remainder<0?remainder+selected.duration:remainder;
     scratch.translations.set(baseT);scratch.rotations.set(baseQ);scratch.scales.set(baseS);scratch.morphWeights.set(restW);
     if(selected)for(const channel of selected.channels) {
       const field=channel.path==='translation'?'translations':channel.path==='rotation'?'rotations':channel.path==='scale'?'scales':'morphWeights';
