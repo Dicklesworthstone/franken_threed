@@ -20,3 +20,7 @@ export {
 export { compileNumericKernel, NumericKernelCompileError, NUMERIC_KERNEL_SECTION } from './numeric_kernel.mjs';
 export { instantiateNumericKernel, NumericKernelGuardError } from './numeric_kernel_runtime.mjs';
 export { buildNumericKernel } from './numeric_kernel_build.mjs';
+
+export { decodeGltfGeometry } from './animation_geometry.mjs';
+export { decodeGltfAnimationModel, createCpuGltfAnimationModel } from './animation_model.mjs';
+// GPU model construction is an opt-in import from animation_model_gpu.mjs.
