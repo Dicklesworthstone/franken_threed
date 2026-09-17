@@ -24,7 +24,7 @@ for(const kind of ['gltf','glb'])test(`${kind} creates a relocatable player from
   const {createPlayer}=await import(pathToFileURL(path.join(relocated,'animation.mjs')));
   const a=createPlayer(),b=createPlayer();a.sample(1);assert.equal(a.jointMatrices[12],-4);assert.equal(a.jointMatrices[13],1);
   assert.equal(b.jointMatrices[12],-5);assert.equal(a.morphWeights[0],0.5);assert.equal(a.morphWeights[1],0.5);
-  assert.deepEqual(fs.readdirSync(relocated).sort(),['animation.json','animation.mjs','animation_runtime.mjs','manifest.json']);
+  assert.deepEqual(fs.readdirSync(relocated).sort(),['animation.json','animation.mjs','animation_controller.mjs','animation_deformer.mjs','animation_runtime.mjs','manifest.json','playback.mjs']);
   assert.ok(!fs.readFileSync(path.join(relocated,'animation.mjs'),'utf8').includes(f.dir));
 });
 
@@ -79,4 +79,73 @@ test('package generation is deterministic across relocated source roots',()=>{
   const a=files(),b=files();const ar=buildAnimation(a.entry,a.out),br=buildAnimation(b.entry,b.out);
   for(const file of ar.emittedFiles)assert.deepEqual(fs.readFileSync(path.join(a.out,file)),fs.readFileSync(path.join(b.out,file)));
   assert.deepEqual(ar.artifacts,br.artifacts);
+});
+
+for(const kind of ['gltf','glb'])test(`${kind} playback package drives deformed geometry after all source resources move`,async()=>{
+  const f=files(kind),result=buildAnimation(f.entry,f.out),moved=path.join(f.dir,'deployed');
+  assert.equal(result.playbackEntry,'playback.mjs');assert.equal(result.accelerationClaim,false);
+  // The model loader provides decoded geometry; the package must not reload it.
+  const primitive=f.model.meshes[0].primitives[0];
+  function attribute(index) {
+    const a=f.model.accessors[index],v=f.model.bufferViews[a.bufferView];
+    const C=a.componentType===5121?Uint8Array:Float32Array;
+    return new C(f.bytes.buffer,f.bytes.byteOffset+(v.byteOffset??0)+(a.byteOffset??0),a.count*({VEC3:3,VEC4:4}[a.type]));
+  }
+  const geometry={node:0,positions:attribute(primitive.attributes.POSITION),
+    joints:attribute(primitive.attributes.JOINTS_0),weights:attribute(primitive.attributes.WEIGHTS_0),
+    morphTargets:primitive.targets.map(t=>({positions:attribute(t.POSITION)}))};
+  fs.renameSync(f.out,moved);fs.renameSync(f.entry,f.entry+'.unavailable');
+  if(kind==='gltf')fs.renameSync(path.join(f.dir,'clip data.bin'),path.join(f.dir,'clip data.unavailable'));
+  const api=await import(pathToFileURL(path.join(moved,result.playbackEntry)));
+  const sampler=await import(pathToFileURL(path.join(moved,result.entry)));
+  assert.equal(api.createPlayer,sampler.createPlayer);
+  const pose=api.createPlayer(),control=api.createAnimationController(pose),mesh=api.createAnimationDeformer(pose,geometry);
+  const positions=mesh.positions,world=mesh.worldMatrix,bounds=mesh.bounds;
+  const move=control.createAction(0,{loop:'once',clampWhenFinished:true}).play();
+  for(let frame=1;frame<=60;frame++) {
+    control.update(1/30);mesh.update();
+    const t=Math.min(frame/30,2);
+    for(let vertex=0;vertex<3;vertex++) {
+      const i=vertex*3;
+      assert.ok(Math.abs(mesh.positions[i]-(geometry.positions[i]-5+t))<1e-5);
+      assert.ok(Math.abs(mesh.positions[i+1]-(geometry.positions[i+1]+t))<1e-5);
+      assert.equal(mesh.positions[i+2],geometry.positions[i+2]);
+    }
+    assert.equal(mesh.positions,positions);assert.equal(mesh.worldMatrix,world);assert.equal(mesh.bounds,bounds);
+    assert.equal(mesh.poseVersion,pose.version);
+  }
+  assert.equal(move.finished,true);
+  const rotate=control.createAction(1,{loop:'once',clampWhenFinished:true});
+  control.crossFade(move,rotate,1);control.update(0.5);mesh.update();
+  assert.equal(move.weight,0.5);assert.equal(rotate.weight,0.5);
+  // Independently blend the same clips through the sampler-only entry.
+  const reference=sampler.createPlayer();reference.blend([
+    {clip:0,time:2,weight:0.5},{clip:1,time:0.5,weight:0.5},
+  ]);
+  const expected=api.createAnimationDeformer(reference,geometry);
+  assert.deepEqual(mesh.positions,expected.positions);assert.deepEqual(mesh.worldMatrix,expected.worldMatrix);
+  control.update(0.5);mesh.update();assert.equal(move.playing,false);assert.equal(rotate.weight,1);
+  control.dispose();mesh.dispose();assert.equal(pose.disposed,false);pose.sample(0);
+  assert.equal(fs.existsSync(f.entry),false);
+});
+
+test('playback modules are hashed byte-for-byte and included in the output budget',()=>{
+  const f=files(),result=buildAnimation(f.entry,f.out);
+  for(const name of ['animation_controller.mjs','animation_deformer.mjs']) {
+    const expected=fs.readFileSync(new URL('./'+name,import.meta.url));
+    assert.deepEqual(fs.readFileSync(path.join(f.out,name)),expected);
+    const artifact=result.artifacts.find(a=>a.file===name);
+    assert.equal(artifact.bytes,expected.length);assert.equal(artifact.sha256,hash(expected));
+  }
+  const next=files();
+  assert.throws(()=>buildAnimation(next.entry,next.out,{maxBytes:result.outputBytes-1}),{code:'GLTF_ANIMATION_LIMIT'});
+  assert.equal(fs.existsSync(next.out),false);
+  const exact=files();assert.equal(buildAnimation(exact.entry,exact.out,{maxBytes:result.outputBytes}).outputBytes,result.outputBytes);
+});
+
+test('sampler-only module retains its single runtime import',()=>{
+  const f=files();buildAnimation(f.entry,f.out);
+  const source=fs.readFileSync(path.join(f.out,'animation.mjs'),'utf8');
+  assert.match(source,/from '\.\/animation_runtime\.mjs'/);
+  assert.equal(source.includes('animation_controller'),false);assert.equal(source.includes('animation_deformer'),false);
 });

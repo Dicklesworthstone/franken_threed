@@ -54,11 +54,21 @@ function decodeDataUri(uri) {
 }
 
 /**
- * Output: animation.mjs, animation_runtime.mjs, animation.json and manifest.json.
+ * Output: animation.mjs (sampler), playback.mjs (sampler/controller/deformer),
+ * their runtime modules, animation.json and manifest.json.
  * import { createPlayer } from './animation.mjs'; const p=createPlayer();
  * p.sample(time, {clip:0, loop:true}); // p.worldMatrices / p.jointMatrices / p.morphWeights
  * All decoded tracks are embedded; importing the package makes no fetches and
  * initializes no GPU/Wasm services. Caller selects a clip and advances time.
+ *
+ * import {createPlayer, createAnimationController, createAnimationDeformer}
+ *   from './playback.mjs';
+ * const pose=createPlayer(), control=createAnimationController(pose);
+ * const mesh=createAnimationDeformer(pose, loaderDecodedGeometry);
+ * control.createAction(0).play();
+ * // Each application frame: control.update(deltaSeconds); mesh.update();
+ * // Consume mesh.positions/normals/tangents and mesh.worldMatrix without
+ * // applying skin/morph a second time. Neither helper owns the borrowed pose.
  */
 export function buildAnimation(entryPath,outDir,{rootDir=path.dirname(path.resolve(entryPath)),maxBytes=64*1024*1024,maxComponents=16777216}={}) {
   if(!Number.isSafeInteger(maxBytes)||maxBytes<1)throw new RangeError('maxBytes must be positive');
@@ -94,12 +104,20 @@ export function buildAnimation(entryPath,outDir,{rootDir=path.dirname(path.resol
   // Parse JSON, not an object literal: names and special property keys remain
   // data; source-controlled strings can never execute inside the emitted module.
   const module=`import {createAnimationPlayer} from './animation_runtime.mjs';\nconst definition=JSON.parse(${JSON.stringify(encoded)});\nexport function createPlayer(){return createAnimationPlayer(definition);}\n`;
-  const outputs=new Map([['animation.mjs',module],['animation_runtime.mjs',runtime],['animation.json',encoded+'\n']]);
-  const manifest={format:'f3d-animation-package-v1',entry:'animation.mjs',profile:'core-gltf-animation-pose',
+  // Keep the sampling-only entry's dependency graph unchanged. The optional
+  // playback entry composes existing implementations; no second sampler or
+  // independent clock is introduced into a generated application.
+  const playback=`export {createPlayer} from './animation.mjs';\nexport {createAnimationController} from './animation_controller.mjs';\nexport {createAnimationDeformer} from './animation_deformer.mjs';\n`;
+  const outputs=new Map([['animation.mjs',module],['animation_runtime.mjs',runtime],['animation.json',encoded+'\n'],['playback.mjs',playback]]);
+  for(const name of ['animation_controller.mjs','animation_deformer.mjs']) {
+    outputs.set(name,fs.readFileSync(new URL('./'+name,import.meta.url),'utf8'));
+  }
+  const manifest={format:'f3d-animation-package-v1',entry:'animation.mjs',playbackEntry:'playback.mjs',profile:'core-gltf-animation-pose',
     source:{file:path.basename(entry),sha256:hash(source)},dependencies:[...dependencies.values()],
     nodeCount:validated.nodeCount,clips:validated.clips,instances:validated.instances,morphWeightCount:validated.morphWeights.length,
     ignoredChannels:definition.ignoredChannels,execution:'javascript-cpu-pose',accelerationClaim:false,
-    playback:'explicit-single-clip; untargeted values reset to imported rest pose',
+    playback:'explicit sampling, per-binding blending and action controls; imported rest-relative additive layers',
+    deformation:'optional CPU morph-then-skin over loader-decoded geometry; mesh-local outputs and matching world transform',
     artifacts:[...outputs].map(([file,data])=>({file,bytes:Buffer.byteLength(data),sha256:hash(data)}))};
   validated.dispose();outputs.set('manifest.json',JSON.stringify(manifest,null,2)+'\n');
   const outputBytes=[...outputs.values()].reduce((sum,data)=>sum+Buffer.byteLength(data),0);
