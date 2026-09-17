@@ -3,7 +3,7 @@
  * This pass owns an aligned uniform arena and index buffers, not the supplied
  * device, deformers, attachments, camera, frame loop or source scene objects.
  * It is NOT an automatic Three.js renderer replacement: no environment lighting,
- * shadow maps, normal maps, tone mapping, implicit sorting or culling. RGB inputs are linear; an -srgb
+ * shadow maps, tone mapping, implicit sorting or culling. RGB inputs are linear; an -srgb
  * attachment view supplies the display transfer function. Unsupported material
  * fields are rejected rather than silently rendered as unlit.
  *
@@ -36,6 +36,16 @@
  * Metallic-roughness uses GGX/Smith-correlated visibility and Schlick Fresnel,
  * with metallicFactor/roughnessFactor in [0,1] (both default 1) and an explicit
  * perceptual roughness floor of 0.045. Lit materials accept emissiveFactor RGB.
+ * Lit materials also accept normalTexture and emissiveTexture; metallic-roughness
+ * accepts metallicRoughnessTexture. Each is a borrowed {view, sampler}, like
+ * baseColorTexture. All maps use the supplied texCoords and uvTransform. Use
+ * linear views for normals and metallic-roughness (G=roughness, B=metallic),
+ * and an sRGB view for sRGB emissive data. Emission is multiplied by its factor.
+ * Normal mapping requires the deformer's tangent attribute, including its w
+ * handedness. normalScale (default 1, also a per-draw override) scales tangent
+ * X/Y before normalization. Tangents are transformed as directions, not normals;
+ * reflected worlds and back faces preserve the mapped normal's orientation.
+ * Missing tangents are rejected: this path does not invent tangent geometry.
  * These are direct-light materials, not complete Three.js/PBR equivalence.
  *
  * Lit frames require lighting: {cameraPosition:[x,y,z], lights:[...]}, at most
@@ -64,6 +74,12 @@ const COPY_DST = 8, INDEX = 16, VERTEX = 32, UNIFORM = 64, VERTEX_STAGE = 1, FRA
 const UNIFORM_BYTES = 256;
 const MAX_LIGHTS = 8, LIGHT_BYTES = 32 + MAX_LIGHTS * 64;
 const UV_IDENTITY = Object.freeze([1, 0, 0, 1, 0, 0]);
+// Stable sampler/texture pairs. Layouts contain only the maps actually used;
+// absent maps neither allocate placeholders nor consume texture bindings.
+const MAP_FIELDS = Object.freeze(['baseColorTexture', 'metallicRoughnessTexture', 'normalTexture', 'emissiveTexture']);
+const MAP_NAMES = Object.freeze(['color', 'metallic_roughness', 'normal_map', 'emissive']);
+const mapMaskFor = variant => variant.includes('maps-') ? Number(variant.split('maps-')[1]) : variant.endsWith('texture') ? 1 : 0;
+const mapSlots = mask => [0, 1, 2, 3].filter(slot => mask & (1 << slot));
 export const ANIMATION_RENDER_WGSL = /* wgsl */`
 struct DrawInfo { clip_from_local: mat4x4<f32>, color: vec4<f32>, options: vec4<f32> }
 @group(0) @binding(0) var<uniform> draw_info: DrawInfo;
@@ -78,7 +94,12 @@ struct DrawInfo { clip_from_local: mat4x4<f32>, color: vec4<f32>, options: vec4<
 // Equations: glTF 2.0 Appendix B and KHR_lights_punctual (Khronos).
 // https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#appendix-b-brdf-implementation
 // https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_lights_punctual
-function surfaceShader(textured, lit, attributes) {
+function surfaceShader(mapMask, lit, attributes) {
+  const textured = mapMask !== 0, normalMapped = (mapMask & 4) !== 0;
+  const declarations = mapSlots(mapMask).map(slot =>
+    `@group(1) @binding(${slot * 2}) var ${MAP_NAMES[slot]}_sampler: sampler;\n@group(1) @binding(${slot * 2 + 1}) var ${MAP_NAMES[slot]}_texture: texture_2d<f32>;`).join('\n');
+  const samples = mapSlots(mapMask).map(slot =>
+    `let ${MAP_NAMES[slot]}_texel = textureSample(${MAP_NAMES[slot]}_texture, ${MAP_NAMES[slot]}_sampler, input.uv);`).join('\n  ');
   const lighting = lit ? /* wgsl */`
 struct Light { vector: vec4<f32>, radiance: vec4<f32>, direction: vec4<f32>, cone: vec4<f32> }
 struct Lighting { camera: vec4<f32>, meta: vec4<f32>, lights: array<Light, 8> }
@@ -89,11 +110,11 @@ fn unit_vector(v: vec3<f32>) -> vec3<f32> {
   let scaled = v / scale;
   return scaled * inverseSqrt(dot(scaled, scaled));
 }
-fn illuminate(base: vec3<f32>, position: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
+fn illuminate(base: vec3<f32>, position: vec3<f32>, normal: vec3<f32>, metallic: f32, roughness: f32, emission: vec3<f32>) -> vec3<f32> {
   var view = unit_vector(lighting.camera.xyz - position);
   if (lighting.camera.w > 0.0) { view = lighting.camera.xyz; }
   let nv = max(dot(normal, view), 0.0);
-  var result = draw_info.emission_roughness.rgb;
+  var result = emission;
   for (var i = 0u; i < u32(lighting.meta.x); i++) {
     let light = lighting.lights[i];
     var incoming = -light.vector.xyz;
@@ -122,14 +143,13 @@ fn illuminate(base: vec3<f32>, position: vec3<f32>, normal: vec3<f32>) -> vec3<f
       let half_vector = unit_vector(incoming + view);
       let nh = clamp(dot(normal, half_vector), 0.0, 1.0);
       let vh = clamp(dot(view, half_vector), 0.0, 1.0);
-      let roughness = max(draw_info.emission_roughness.w, 0.045);
-      let alpha = roughness * roughness;
+      let perceptual_roughness = max(roughness, 0.045);
+      let alpha = perceptual_roughness * perceptual_roughness;
       let a2 = alpha * alpha;
       let nh2 = nh * nh;
       let denominator = (1.0 - nh2) + a2 * nh2;
       let distribution = a2 / (3.141592653589793 * denominator * denominator);
       let visibility = 0.5 / (nl * sqrt(nv * nv * (1.0 - a2) + a2) + nv * sqrt(nl * nl * (1.0 - a2) + a2));
-      let metallic = draw_info.options.w;
       let f0 = mix(vec3<f32>(0.04), base, metallic);
       let edge = 1.0 - vh;
       let fresnel = f0 + (vec3<f32>(1.0) - f0) * edge * edge * edge * edge * edge;
@@ -146,23 +166,39 @@ struct DrawInfo {
   world_from_local: mat4x4<f32>, normal_from_local: mat3x3<f32>, emission_roughness: vec4<f32>
 }
 @group(0) @binding(0) var<uniform> draw_info: DrawInfo;
-${textured ? '@group(1) @binding(0) var color_sampler: sampler;\n@group(1) @binding(1) var color_texture: texture_2d<f32>;' : ''}
+${declarations}
 ${lighting}
 struct VertexOutput {
   @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) color: vec4<f32>,
   ${lit ? '@location(2) world: vec3<f32>, @location(3) normal: vec3<f32>,' : ''}
+  ${normalMapped ? '@location(4) tangent: vec4<f32>,' : ''}
 }
-@vertex fn vertex_main(@location(0) position: vec3<f32>${lit ? ', @location(1) normal: vec3<f32>' : ''}${attributes ? ', @location(3) uv: vec2<f32>, @location(4) color: vec4<f32>' : ''}) -> VertexOutput {
+@vertex fn vertex_main(@location(0) position: vec3<f32>${lit ? ', @location(1) normal: vec3<f32>' : ''}${normalMapped ? ', @location(2) tangent: vec4<f32>' : ''}${attributes ? ', @location(3) uv: vec2<f32>, @location(4) color: vec4<f32>' : ''}) -> VertexOutput {
   var out: VertexOutput;
   out.position = draw_info.clip_from_local * vec4<f32>(position, 1.0);
   ${attributes ? 'out.uv = vec2<f32>(dot(draw_info.uv_x.xyz, vec3<f32>(uv, 1.0)), dot(draw_info.uv_y.xyz, vec3<f32>(uv, 1.0)));\n  out.color = color;' : 'out.uv = vec2<f32>(0.0); out.color = vec4<f32>(1.0);'}
   ${lit ? 'out.world = (draw_info.world_from_local * vec4<f32>(position, 1.0)).xyz;\n  out.normal = draw_info.normal_from_local * normal;' : ''}
+  ${normalMapped ? 'out.tangent = vec4<f32>((draw_info.world_from_local * vec4<f32>(tangent.xyz, 0.0)).xyz, tangent.w * draw_info.uv_y.w);' : ''}
   return out;
 }
 @fragment fn fragment_main(input: VertexOutput${lit ? ', @builtin(front_facing) front: bool' : ''}) -> @location(0) vec4<f32> {
-  let rgba = draw_info.color * input.color ${textured ? '* textureSample(color_texture, color_sampler, input.uv)' : ''};
+  // Sample every map before discard or nonuniform lighting flow: implicit
+  // derivatives must be evaluated in uniform control flow.
+  ${samples}
+  let rgba = draw_info.color * input.color ${mapMask & 1 ? '* color_texel' : ''};
   if (draw_info.options.x >= 0.0 && rgba.a < draw_info.options.x) { discard; }
-  ${lit ? 'let normal = unit_vector(input.normal) * select(-1.0, 1.0, front);\n  let rgb = illuminate(rgba.rgb, input.world, normal);' : 'let rgb = rgba.rgb;'}
+  ${lit ? `var normal = unit_vector(input.normal);
+  ${normalMapped ? `// Re-orthogonalize after interpolation and nonuniform world transforms.
+  let tangent = unit_vector(input.tangent.xyz - normal * dot(normal, input.tangent.xyz));
+  let bitangent = cross(normal, tangent) * select(-1.0, 1.0, input.tangent.w >= 0.0);
+  var mapped = normal_map_texel.xyz * 2.0 - vec3<f32>(1.0);
+  mapped = vec3<f32>(mapped.xy * draw_info.uv_x.w, mapped.z);
+  normal = unit_vector(tangent * mapped.x + bitangent * mapped.y + normal * mapped.z);` : ''}
+  normal *= select(-1.0, 1.0, front);
+  let metallic = draw_info.options.w ${mapMask & 2 ? '* metallic_roughness_texel.b' : ''};
+  let roughness = draw_info.emission_roughness.w ${mapMask & 2 ? '* metallic_roughness_texel.g' : ''};
+  let emission = draw_info.emission_roughness.rgb ${mapMask & 8 ? '* emissive_texel.rgb' : ''};
+  let rgb = illuminate(rgba.rgb, input.world, normal, metallic, roughness, emission);` : 'let rgb = rgba.rgb;'}
   return vec4<f32>(rgb, select(1.0, rgba.a, draw_info.options.y > 0.0));
 }
 `;
@@ -311,9 +347,9 @@ export async function createGpuAnimationRenderer(device, {
   const staged = new Float32Array(arenaBytes / 4), commands = [];
   const records = new Set(), owned = new WeakMap(), buffers = new Map(), pipelines = new Map();
   let allocatedBytes = 0, pendingMeshes = 0, disposed = false, terminal = null, busy = false;
-  let version = 0, drawCount = 0, completion = Promise.resolve(), uniformBuffer, bindGroup, uniformLayout, textureLayout, lightBuffer, lightLayout, lightGroup, lightingReady;
+  let version = 0, drawCount = 0, completion = Promise.resolve(), uniformBuffer, bindGroup, uniformLayout, lightBuffer, lightLayout, lightGroup, lightingReady;
   const lightWords = new Float32Array(LIGHT_BYTES / 4);
-  const variants = new Map();
+  const variants = new Map(), textureLayouts = new Map();
   function remember(buffer, bytes) { buffers.set(buffer, bytes); allocatedBytes += bytes; return buffer; }
   function forget(buffer) { if (buffers.has(buffer)) { allocatedBytes -= buffers.get(buffer); buffers.delete(buffer); buffer.destroy(); } }
   function release() { for (const buffer of buffers.keys()) forget(buffer); }
@@ -327,21 +363,23 @@ export async function createGpuAnimationRenderer(device, {
     if (terminal) throw terminal;
   }
   function compilePipelines(variant) {
-    const lit = variant.startsWith('lit-'), attributes = !variant.endsWith('plain'), textured = variant.endsWith('texture');
+    const lit = variant.startsWith('lit-'), attributes = !variant.endsWith('plain'), mapMask = mapMaskFor(variant), textured = mapMask !== 0;
     if (attributes) { limit('maxVertexBuffers', 2); limit('maxVertexAttributes', 5); }
     if (textured) {
-      limit('maxBindGroups', 2); limit('maxSamplersPerShaderStage', 1); limit('maxSampledTexturesPerShaderStage', 1);
-      textureLayout ??= device.createBindGroupLayout({label, entries: [
-        {binding: 0, visibility: FRAGMENT_STAGE, sampler: {type: 'filtering'}},
-        {binding: 1, visibility: FRAGMENT_STAGE, texture: {sampleType: 'float', viewDimension: '2d', multisampled: false}},
-      ]});
+      const slots = mapSlots(mapMask);
+      limit('maxBindGroups', lit ? 3 : 2); limit('maxSamplersPerShaderStage', slots.length); limit('maxSampledTexturesPerShaderStage', slots.length);
+      if (!textureLayouts.has(mapMask)) textureLayouts.set(mapMask, device.createBindGroupLayout({label, entries: slots.flatMap(slot => [
+        {binding: slot * 2, visibility: FRAGMENT_STAGE, sampler: {type: 'filtering'}},
+        {binding: slot * 2 + 1, visibility: FRAGMENT_STAGE, texture: {sampleType: 'float', viewDimension: '2d', multisampled: false}},
+      ])}));
     }
-    const bindGroupLayouts = textured ? [uniformLayout, textureLayout] : [uniformLayout];
+    const bindGroupLayouts = textured ? [uniformLayout, textureLayouts.get(mapMask)] : [uniformLayout];
     if (lit) bindGroupLayouts.push(lightLayout);
     const pipelineLayout = device.createPipelineLayout({label, bindGroupLayouts});
-    const module = device.createShaderModule({label, code: lit || attributes ? surfaceShader(textured, lit, attributes) : ANIMATION_RENDER_WGSL});
+    const module = device.createShaderModule({label, code: lit || attributes ? surfaceShader(mapMask, lit, attributes) : ANIMATION_RENDER_WGSL});
     const vertexBuffers = [{arrayStride: 40, stepMode: 'vertex', attributes: [{shaderLocation: 0, offset: 0, format: 'float32x3'}]}];
     if (lit) vertexBuffers[0].attributes.push({shaderLocation: 1, offset: 12, format: 'float32x3'});
+    if (mapMask & 4) vertexBuffers[0].attributes.push({shaderLocation: 2, offset: 24, format: 'float32x4'});
     if (attributes) vertexBuffers.push({arrayStride: 24, stepMode: 'vertex', attributes: [
       {shaderLocation: 3, offset: 0, format: 'float32x2'}, {shaderLocation: 4, offset: 8, format: 'float32x4'},
     ]});
@@ -398,7 +436,7 @@ export async function createGpuAnimationRenderer(device, {
 
   async function addMesh(gpu, options = {}) {
     live(); if (busy) fail('ANIMATION_RENDER_REENTRANT', 'Cannot register a mesh during submission');
-    keys(options, ['indices', 'baseColor', 'doubleSided', 'alphaMode', 'alphaCutoff', 'texCoords', 'vertexColors', 'baseColorTexture', 'uvTransform', 'shading', 'metallicFactor', 'roughnessFactor', 'emissiveFactor'], 'material/geometry');
+    keys(options, ['indices', 'baseColor', 'doubleSided', 'alphaMode', 'alphaCutoff', 'texCoords', 'vertexColors', ...MAP_FIELDS, 'normalScale', 'uvTransform', 'shading', 'metallicFactor', 'roughnessFactor', 'emissiveFactor'], 'material/geometry');
     deformerShape(gpu);
     if (records.size + pendingMeshes >= maxMeshes) fail('ANIMATION_RENDER_LIMIT', 'Mesh capacity exceeded');
     const {indices = null, baseColor = [1, 1, 1, 1], doubleSided = false, alphaMode = 'OPAQUE', alphaCutoff = 0.5} = options;
@@ -406,6 +444,29 @@ export async function createGpuAnimationRenderer(device, {
     const mode = ['unlit', 'lambert', 'metallic-roughness'].indexOf(shading), lit = mode > 0;
     if (mode < 0 || (!lit && options.emissiveFactor !== undefined) ||
         (mode !== 2 && (options.metallicFactor !== undefined || options.roughnessFactor !== undefined))) fail('ANIMATION_RENDER_OPTIONS', 'Material parameters do not apply to shading model');
+    // Snapshot every borrowed resource descriptor before the first await.
+    const textures = MAP_FIELDS.map(field => {
+      const descriptor = options[field];
+      if (descriptor == null) return null;
+      keys(descriptor, ['view', 'sampler'], field);
+      const {view, sampler} = descriptor;
+      if (!view || typeof view !== 'object' || !sampler || typeof sampler !== 'object') fail('ANIMATION_RENDER_OPTIONS', 'Texture requires a borrowed view and sampler');
+      return {view, sampler};
+    });
+    const mapMask = textures.reduce((mask, texture, slot) => mask | (texture ? 1 << slot : 0), 0);
+    if ((!lit && (mapMask & 14)) || (mode !== 2 && (mapMask & 2)) || (!(mapMask & 4) && options.normalScale !== undefined)) {
+      fail('ANIMATION_RENDER_OPTIONS', 'Texture parameters do not apply to shading model');
+    }
+    const normalScale = finite(options.normalScale ?? 1, 'Normal scale');
+    if (!Number.isFinite(Math.fround(normalScale))) fail('ANIMATION_RENDER_VALUE', 'Normal scale exceeds f32');
+    if ((mapMask & 4) && !gpu.vertexLayout.attributes.some(a => a.shaderLocation === 2 && a.offset === 24 && a.format === 'float32x4')) {
+      fail('ANIMATION_RENDER_NORMAL', 'Normal maps require deformed tangent XYZ and handedness W');
+    }
+    if (mapMask) {
+      limit('maxBindGroups', lit ? 3 : 2);
+      limit('maxSamplersPerShaderStage', mapSlots(mapMask).length);
+      limit('maxSampledTexturesPerShaderStage', mapSlots(mapMask).length);
+    }
     const metallic = mode === 2 ? finite(options.metallicFactor ?? 1, 'Metallic factor') : 0;
     const roughness = mode === 2 ? finite(options.roughnessFactor ?? 1, 'Roughness factor') : 1;
     const emission = Float64Array.from(array(options.emissiveFactor ?? [0,0,0], 3, 'Emissive factor'));
@@ -414,7 +475,7 @@ export async function createGpuAnimationRenderer(device, {
       if (rgba.some(v => v > 1)) fail('ANIMATION_RENDER_VALUE', 'Lit reflectance factors must be in [0,1]');
       if (!gpu.vertexLayout.attributes.some(a => a.shaderLocation === 1 && a.offset === 12 && a.format === 'float32x3')) fail('ANIMATION_RENDER_NORMAL', 'Lit meshes require deformed normals');
       limit('maxUniformBuffersPerShaderStage', 2); limit('maxUniformBufferBindingSize', LIGHT_BYTES); limit('maxBufferSize', LIGHT_BYTES);
-      limit('maxBindGroups', options.baseColorTexture != null ? 3 : 2); limit('maxVertexAttributes', 2);
+      limit('maxBindGroups', mapMask ? 3 : 2); limit('maxVertexAttributes', 2);
     }
     if (typeof doubleSided !== 'boolean' || !['OPAQUE', 'MASK', 'BLEND'].includes(alphaMode) ||
         finite(alphaCutoff, 'Alpha cutoff') < 0 || alphaCutoff > 1) fail('ANIMATION_RENDER_OPTIONS', 'Invalid unlit material');
@@ -430,23 +491,16 @@ export async function createGpuAnimationRenderer(device, {
       if (allocatedBytes + bytes > maxBytes) fail('ANIMATION_RENDER_LIMIT', 'Index buffers exceed byte budget');
       data = new C(bytes / C.BYTES_PER_ELEMENT); data.set(indices);
     }
-    const {texCoords = null, vertexColors = null, baseColorTexture = null} = options;
+    const {texCoords = null, vertexColors = null} = options;
     const transform = Float64Array.from(uvTransform(options.uvTransform ?? UV_IDENTITY));
-    const attributeVariant = baseColorTexture !== null ? 'texture' : vertexColors !== null || texCoords !== null ? 'color' : 'plain';
+    const attributeVariant = mapMask ? (mapMask === 1 ? 'texture' : `maps-${mapMask}`) : vertexColors !== null || texCoords !== null ? 'color' : 'plain';
     const variant = (lit ? 'lit-' : '') + attributeVariant;
     const lightReserve = lit && !lightBuffer ? LIGHT_BYTES : 0;
     if (allocatedBytes + (data?.byteLength ?? 0) + lightReserve > maxBytes) fail('ANIMATION_RENDER_LIMIT', 'Material buffers exceed byte budget');
-    let texture = null, surfaceData = null, surfaceBuffer = null, textureGroup = null;
-    if (baseColorTexture !== null) {
-      keys(baseColorTexture, ['view', 'sampler'], 'base-color texture');
-      const {view, sampler} = baseColorTexture;
-      if (!view || typeof view !== 'object' || !sampler || typeof sampler !== 'object') fail('ANIMATION_RENDER_OPTIONS', 'Texture requires a borrowed view and sampler');
-      texture = {view, sampler};
-      if (texCoords === null) fail('ANIMATION_RENDER_GEOMETRY', 'Base-color texture requires UV coordinates');
-    }
+    let surfaceData = null, surfaceBuffer = null, textureGroup = null;
+    if (mapMask && texCoords === null) fail('ANIMATION_RENDER_GEOMETRY', 'Material textures require UV coordinates');
     if (attributeVariant !== 'plain') {
       limit('maxVertexBuffers', 2); limit('maxVertexAttributes', 5);
-      if (texture) { limit('maxBindGroups', 2); limit('maxSamplersPerShaderStage', 1); limit('maxSampledTexturesPerShaderStage', 1); }
       const bytes = gpu.vertexCount * 24;
       limit('maxBufferSize', bytes);
       if (allocatedBytes + (data?.byteLength ?? 0) + lightReserve + bytes > maxBytes) fail('ANIMATION_RENDER_LIMIT', 'Surface/index buffers exceed byte budget');
@@ -480,14 +534,14 @@ export async function createGpuAnimationRenderer(device, {
             if (name === 'indices') indexBuffer = buffer; else surfaceBuffer = buffer;
             new Uint8Array(buffer.getMappedRange()).set(new Uint8Array(values.buffer)); buffer.unmap();
           }
-          if (texture) textureGroup = device.createBindGroup({label, layout: textureLayout, entries: [
-            {binding: 0, resource: texture.sampler}, {binding: 1, resource: texture.view},
-          ]});
+          if (mapMask) textureGroup = device.createBindGroup({label, layout: textureLayouts.get(mapMask), entries: mapSlots(mapMask).flatMap(slot => [
+            {binding: slot * 2, resource: textures[slot].sampler}, {binding: slot * 2 + 1, resource: textures[slot].view},
+          ])});
         });
         await Promise.race([Promise.all([allocated.errors, ready, lightsReady]), lost]);
       }
       live(); deformerShape(gpu);
-      const record = {gpu, rgba, doubleSided, alphaMode, alphaCutoff, extent, indexBuffer, indexFormat, variant, transform, surfaceBuffer, textureGroup, lit, mode, metallic, roughness, emission, disposed: false};
+      const record = {gpu, rgba, doubleSided, alphaMode, alphaCutoff, extent, indexBuffer, indexFormat, variant, transform, surfaceBuffer, textureGroup, lit, mode, metallic, roughness, emission, mapMask, normalScale, disposed: false};
       const mesh = Object.freeze({vertexCount: gpu.vertexCount, indexCount: indices === null ? 0 : extent,
         get disposed() { return record.disposed || disposed; },
         dispose() {
@@ -522,7 +576,7 @@ export async function createGpuAnimationRenderer(device, {
       if (lighting !== null) packLighting(lighting, lightWords);
       for (let i = 0; i < draws.length; i++) {
         const input = owned.has(draws[i]) ? {mesh: draws[i]} : draws[i];
-        keys(input, ['mesh', 'worldMatrix', 'baseColor', 'first', 'count', 'uvTransform', 'metallicFactor', 'roughnessFactor', 'emissiveFactor'], 'draw');
+        keys(input, ['mesh', 'worldMatrix', 'baseColor', 'first', 'count', 'uvTransform', 'normalScale', 'metallicFactor', 'roughnessFactor', 'emissiveFactor'], 'draw');
         const record = owned.get(input.mesh);
         if (!record || record.disposed) fail('ANIMATION_RENDER_MESH', 'Mesh is not live in this renderer');
         const gpu = record.gpu; deformerShape(gpu);
@@ -542,6 +596,13 @@ export async function createGpuAnimationRenderer(device, {
         const determinant = world[0] * (world[5] * world[10] - world[9] * world[6])
           - world[4] * (world[1] * world[10] - world[9] * world[2]) + world[8] * (world[1] * world[6] - world[5] * world[2]);
         finite(determinant, 'World determinant');
+        if (input.normalScale !== undefined && !(record.mapMask & 4)) fail('ANIMATION_RENDER_OPTIONS', 'Normal scale requires a normal map');
+        if (record.mapMask & 4) {
+          const scale = finite(input.normalScale ?? record.normalScale, 'Normal scale');
+          if (!Number.isFinite(Math.fround(scale))) fail('ANIMATION_RENDER_VALUE', 'Normal scale exceeds f32');
+          // Reuse the UV rows' unused W components; the uniform arena stays 256 bytes.
+          staged[offset + 27] = scale; staged[offset + 31] = determinant < 0 ? -1 : 1;
+        }
         if ((!record.lit && input.emissiveFactor !== undefined) || (record.mode !== 2 && (input.metallicFactor !== undefined || input.roughnessFactor !== undefined))) {
           fail('ANIMATION_RENDER_OPTIONS', 'Draw parameters do not apply to shading model');
         }
