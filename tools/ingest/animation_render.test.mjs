@@ -32,12 +32,12 @@ function deviceSpy() {
     createCommandEncoder() {
       const encoded = [];
       return {beginRenderPass(descriptor) {
-        const pass = {descriptor, draws: [], viewport: null, scissor: null}; let pipeline, uniform, vertex, index, surface, texture;
+        const pass = {descriptor, draws: [], viewport: null, scissor: null}; let pipeline, uniform, vertex, index, surface, texture; const groups=new Map();
         passes.push(pass); encoded.push(pass);
-        return {setPipeline(p) {pipeline=p;}, setBindGroup(slot, group, offsets=[]) {if(slot===0)uniform={group,offset:offsets[0]};else texture=group;},
+        return {setPipeline(p) {pipeline=p;}, setBindGroup(slot, group, offsets=[]) {if(slot===0)uniform={group,offset:offsets[0]};else {groups.set(slot,group);if(group.entries.length===2)texture=group;}},
           setVertexBuffer(slot,buffer) {if(slot===0)vertex=buffer;else surface=buffer;}, setIndexBuffer(buffer,format) {index={buffer,format};},
-          draw(...args) {pass.draws.push({args,indexed:false,pipeline,uniform,vertex,surface,texture});},
-          drawIndexed(...args) {pass.draws.push({args,indexed:true,pipeline,uniform,vertex,index,surface,texture});},
+          draw(...args) {pass.draws.push({args,indexed:false,pipeline,uniform,vertex,surface,texture,groups:new Map(groups)});},
+          drawIndexed(...args) {pass.draws.push({args,indexed:true,pipeline,uniform,vertex,index,surface,texture,groups:new Map(groups)});},
           setViewport(...values) {pass.viewport=values;}, setScissorRect(...values) {pass.scissor=values;}, end() {pass.ended=true;}};
       }, finish() {return encoded;}};
     },
@@ -50,7 +50,10 @@ function deviceSpy() {
       submit(commands) {
         for (const passes of commands) for (const pass of passes) for (const draw of pass.draws) {
           const buffer=draw.uniform.group.entries[0].resource.buffer;
-          draw.snapshot=new Float32Array(buffer.data,draw.uniform.offset,32).slice();
+          draw.snapshot=new Float32Array(buffer.data,draw.uniform.offset,64).slice();
+          for(const group of draw.groups.values())if(group.entries[0]?.resource?.buffer) {
+            draw.lights=new Float32Array(group.entries[0].resource.buffer.data).slice();
+          }
         }
         submissions.push(commands);
       },
@@ -69,7 +72,7 @@ test('builds reusable pipelines and aligned bounded uniform storage without brow
     assert.equal(p.vertex.buffers[0].arrayStride,40);assert.equal(p.vertex.buffers[0].attributes.length,1);
     assert.equal(p.depthStencil.depthWriteEnabled,!p.fragment.targets[0].blend);
     assert.equal(p.layout.bindGroupLayouts[0].entries[0].buffer.hasDynamicOffset,true);
-    assert.equal(p.layout.bindGroupLayouts[0].entries[0].buffer.minBindingSize,128);
+    assert.equal(p.layout.bindGroupLayouts[0].entries[0].buffer.minBindingSize,256);
   }
   r.dispose();assert.ok(d.buffers.every(b=>b.destroyed));
 });
@@ -81,7 +84,7 @@ test('per-draw matrix/color snapshots preserve red A and blue B in one submissio
   await r.whenIdle();const draws=d.passes[0].draws;
   assert.deepEqual(draws.map(x=>x.uniform.offset),[0,256]);assert.equal(draws[0].snapshot[12],-0.5);assert.equal(draws[1].snapshot[12],0.5);
   assert.deepEqual([...draws[0].snapshot.slice(16,20)],[1,0,0,1]);assert.deepEqual([...draws[1].snapshot.slice(16,20)],[0,0,1,1]);
-  assert.equal(d.writes.length,1);assert.equal(d.writes[0].bytes.length,384);assert.equal(r.drawCount,2);assert.equal(r.version,1);
+  assert.equal(d.writes.length,1);assert.equal(d.writes[0].bytes.length,512);assert.equal(r.drawCount,2);assert.equal(r.version,1);
   r.render(frame([{mesh,baseColor:[0,1,0,1]}]));assert.deepEqual([...draws[0].snapshot.slice(16,20)],[1,0,0,1]);
   assert.equal(d.buffers.length,1,'No buffers allocated during frames');r.dispose();assert.equal(g.disposed,false);
 });
@@ -264,10 +267,10 @@ test('independent affine UV transforms are snapshotted at each submitted use',as
   const mesh=await r.addMesh(gpu(),{texCoords:uvTriangle(),baseColorTexture:texture(),uvTransform:transform});
   transform.fill(0);r.render(frame([mesh,{mesh,uvTransform:[0,1,-1,0,0.25,0.5]}]));
   const [a,b]=d.passes[0].draws;
-  assert.deepEqual([...a.snapshot.slice(24)],[2,4,6,0,3,5,7,0]);
-  assert.deepEqual([...b.snapshot.slice(24)],[0,-1,0.25,0,1,0,0.5,0]);
+  assert.deepEqual([...a.snapshot.slice(24,32)],[2,4,6,0,3,5,7,0]);
+  assert.deepEqual([...b.snapshot.slice(24,32)],[0,-1,0.25,0,1,0,0.5,0]);
   r.render(frame([{mesh,uvTransform:[1,0,0,1,9,9]}]));
-  assert.deepEqual([...a.snapshot.slice(24)],[2,4,6,0,3,5,7,0]);r.dispose();
+  assert.deepEqual([...a.snapshot.slice(24,32)],[2,4,6,0,3,5,7,0]);r.dispose();
 });
 
 test('invalid surface descriptors and capabilities fail before device allocation',async()=>{
@@ -318,4 +321,116 @@ test('surface bind-group validation errors clean up attributes without owning th
   await assert.rejects(r.addMesh(gpu(),{texCoords:uvTriangle(),baseColorTexture:t}),/invalid texture view/);
   assert.equal(r.meshCount,0);assert.equal(r.allocatedBytes,262144);assert.ok(d.buffers.slice(1).every(b=>b.destroyed));
   assert.deepEqual(t,{view:{},sampler:{}});r.dispose();
+});
+
+function normalGpu() {
+  return gpu({vertexLayout:{arrayStride:40,stepMode:'vertex',attributes:[
+    {shaderLocation:0,offset:0,format:'float32x3'},{shaderLocation:1,offset:12,format:'float32x3'},
+  ]}});
+}
+const lighting = (lights=[]) => ({cameraPosition:[0,0,5],lights});
+test('lit registration reuses deformed normals and creates light storage only on demand',async()=>{
+  const d=deviceSpy(),r=await createGpuAnimationRenderer(d,{maxDraws:2});assert.equal(r.allocatedBytes,512);
+  const g=normalGpu(),a=await r.addMesh(g,{shading:'lambert'}),b=await r.addMesh(g,{shading:'metallic-roughness',metallicFactor:0.25,roughnessFactor:0.5});
+  assert.equal(r.allocatedBytes,512+544);assert.equal(d.buffers.length,2);assert.equal(d.pipelines.length,14);
+  r.render(frame([a,b],{lighting:lighting([{type:'directional',direction:[0,0,-10],color:[0.5,1,0.25],intensity:4}])}));
+  const [first,second]=d.passes[0].draws;assert.equal(first.pipeline,second.pipeline);
+  assert.equal(first.vertex,g.vertexBuffer);assert.equal(first.pipeline.vertex.buffers.length,1);
+  assert.deepEqual(first.pipeline.vertex.buffers[0].attributes.map(a=>[a.offset,a.shaderLocation]),[[0,0],[12,1]]);
+  assert.equal(first.snapshot[22],1);assert.equal(second.snapshot[22],2);assert.equal(second.snapshot[23],0.25);assert.equal(second.snapshot[63],0.5);
+  assert.deepEqual([...first.lights.slice(0,5)],[0,0,5,0,1]);assert.equal(first.lights[10],-1);
+  assert.deepEqual([...first.lights.slice(12,16)],[2,4,1,0]);assert.equal(d.writes.length,2,'one light upload for the whole frame');
+  r.dispose();assert.equal(g.disposed,false);assert.ok(d.buffers.every(b=>b.destroyed));
+});
+
+test('inverse-transpose normal snapshots handle nonuniform scale, shear and reflected double sides',async()=>{
+  const d=deviceSpy(),r=await createGpuAnimationRenderer(d),mesh=await r.addMesh(normalGpu(),{shading:'lambert',doubleSided:true});
+  const world=identity();world[0]=2;world[4]=1;world[5]=3;world[10]=4;world[12]=10;
+  const reflection=world.slice();reflection[0]=-2;
+  r.render(frame([{mesh,worldMatrix:world},{mesh,worldMatrix:reflection}],{lighting:lighting()}));
+  const [a,b]=d.passes[0].draws;
+  assert.deepEqual([...a.snapshot.slice(32,48)],world);
+  const expected=[0.5,-1/6,0,0, 0,1/3,0,0, 0,0,0.25,0];
+  a.snapshot.slice(48,60).forEach((v,i)=>assert.ok(Math.abs(v-expected[i])<1e-6));
+  assert.equal(b.snapshot[48],-0.5);assert.ok(Math.abs(b.snapshot[49]-1/6)<1e-6);
+  assert.equal(a.pipeline.primitive.cullMode,'none');assert.equal(a.pipeline.primitive.frontFace,'ccw');
+  assert.equal(b.pipeline.primitive.cullMode,'none');assert.equal(b.pipeline.primitive.frontFace,'cw');
+  r.dispose();
+});
+
+test('PBR factors and emission may vary per draw without recompilation or buffer replacement',async()=>{
+  const d=deviceSpy(),r=await createGpuAnimationRenderer(d),emission=[0.2,0.1,0];
+  const mesh=await r.addMesh(normalGpu(),{shading:'metallic-roughness',emissiveFactor:emission});emission.fill(100);
+  const count=d.pipelines.length,allocations=d.buffers.length;
+  r.render(frame([mesh,{mesh,metallicFactor:0,roughnessFactor:0.2,emissiveFactor:[0,0,1]}],{lighting:lighting()}));
+  const [a,b]=d.passes[0].draws;
+  assert.equal(a.snapshot[23],1);assert.equal(a.snapshot[63],1);assert.ok(Math.abs(a.snapshot[60]-0.2)<1e-6);
+  assert.equal(b.snapshot[23],0);assert.ok(Math.abs(b.snapshot[63]-0.2)<1e-6);assert.equal(b.snapshot[62],1);
+  assert.equal(count,d.pipelines.length);assert.equal(allocations,d.buffers.length);
+  r.render(frame([{mesh,roughnessFactor:0}],{lighting:lighting()}));assert.equal(a.snapshot[63],1);r.dispose();
+});
+
+test('point/spot lights pack range and cones and later frames retain prior lighting versions',async()=>{
+  const d=deviceSpy(),r=await createGpuAnimationRenderer(d),mesh=await r.addMesh(normalGpu(),{shading:'lambert'});
+  const lights=[{type:'point',position:[1,2,3],intensity:9,range:10},
+    {type:'spot',position:[0,0,4],direction:[0,0,-2],intensity:2,innerConeAngle:0.2,outerConeAngle:0.7}];
+  r.render(frame([mesh],{lighting:lighting(lights)}));const before=d.passes[0].draws[0].lights;
+  assert.equal(before[4],2);assert.deepEqual([...before.slice(8,11)],[1,2,3]);assert.equal(before[15],1);assert.equal(before[19],10);
+  assert.equal(before[31],2);assert.equal(before[34],-1);assert.ok(Math.abs(before[36]-Math.cos(0.2))<1e-6);assert.ok(Math.abs(before[37]-Math.cos(0.7))<1e-6);
+  lights[0].intensity=1;r.render(frame([mesh],{lighting:lighting(lights)}));assert.equal(before[12],9);assert.equal(d.passes[1].draws[0].lights[12],1);
+  r.render(frame([mesh],{lighting:lighting()}));assert.equal(d.passes[2].draws[0].lights[4],0);r.dispose();
+});
+
+test('orthographic lighting explicitly uses parallel view rays',async()=>{
+  const d=deviceSpy(),r=await createGpuAnimationRenderer(d),mesh=await r.addMesh(normalGpu(),{shading:'metallic-roughness'});
+  r.render(frame([mesh],{lighting:{viewDirection:[0,0,10],lights:[]}}));
+  assert.deepEqual([...d.passes[0].draws[0].lights.slice(0,4)],[0,0,1,1]);
+  assert.throws(()=>r.render(frame([mesh],{lighting:{cameraPosition:[0,0,5],viewDirection:[0,0,1]}})),code('ANIMATION_RENDER_LIGHT'));
+  assert.throws(()=>r.render(frame([mesh],{lighting:{viewDirection:[0,0,0]}})),code('ANIMATION_RENDER_LIGHT'));r.dispose();
+});
+
+test('lit textured/colored draws bind both material and lights and retain alpha blending',async()=>{
+  const d=deviceSpy(),r=await createGpuAnimationRenderer(d),t=texture();
+  const mesh=await r.addMesh(normalGpu(),{shading:'metallic-roughness',alphaMode:'BLEND',baseColorTexture:t,texCoords:uvTriangle(),vertexColors:Array(9).fill(0.5)});
+  r.render(frame([mesh],{lighting:lighting()}));const draw=d.passes[0].draws[0];
+  assert.equal(draw.groups.get(1).entries[1].resource,t.view);assert.equal(draw.groups.get(2).entries[0].resource.size,544);
+  assert.equal(draw.pipeline.depthStencil.depthWriteEnabled,false);assert.equal(draw.pipeline.vertex.buffers.length,2);
+  const shader=draw.pipeline.fragment.module.code;
+  assert.match(shader,/normal_from_local \* normal/);assert.match(shader,/@builtin\(front_facing\)/);assert.match(shader,/fresnel \* distribution \* visibility/);
+  assert.ok(shader.indexOf('textureSample(')<shader.indexOf('discard;'));r.dispose();
+});
+
+test('missing normals, unsupported shading and invalid factors fail before light allocation',async()=>{
+  const d=deviceSpy(),r=await createGpuAnimationRenderer(d);
+  await assert.rejects(r.addMesh(gpu(),{shading:'lambert'}),code('ANIMATION_RENDER_NORMAL'));
+  for(const options of [{shading:'phong'},{shading:'lambert',roughnessFactor:0.5},
+    {shading:'metallic-roughness',metallicFactor:-1},{shading:'metallic-roughness',roughnessFactor:2},
+    {shading:'lambert',emissiveFactor:[-1,0,0]},{shading:'lambert',baseColor:[2,1,1,1]},
+    {shading:'lambert',vertexColors:Array(9).fill(2)}]) {
+    await assert.rejects(r.addMesh(normalGpu(),options));assert.equal(d.buffers.length,1);assert.equal(r.meshCount,0);
+  }
+  r.dispose();
+});
+
+test('invalid lighting, normals or final material overrides reject the whole frame before writes',async()=>{
+  const d=deviceSpy(),r=await createGpuAnimationRenderer(d),mesh=await r.addMesh(normalGpu(),{shading:'metallic-roughness'}),singular=identity();singular[0]=0;
+  const malformed=[{type:'area'},{type:'directional',direction:[0,0,0]},{type:'point',position:[0,0,1],range:0},
+    {type:'spot',position:[0,0,1],innerConeAngle:1,outerConeAngle:0.5},{type:'directional',intensity:-1}];
+  const frames=[frame([mesh]),frame([{mesh,worldMatrix:singular}],{lighting:lighting()}),
+    frame([mesh,{mesh,roughnessFactor:NaN}],{lighting:lighting()}),
+    frame([mesh],{lighting:lighting(Array.from({length:9},()=>({type:'directional'})))}),
+    ...malformed.map(light=>frame([mesh],{lighting:lighting([light])}))];
+  for(const input of frames) {
+    assert.throws(()=>r.render(input));assert.equal(d.writes.length,0);assert.equal(d.passes.length,0);assert.equal(r.version,0);
+  }
+  r.render(frame([mesh],{lighting:lighting()}));await r.whenIdle();r.dispose();
+});
+
+test('lighting buffers count toward budgets and insufficient lighting capabilities allocate nothing',async()=>{
+  const d=deviceSpy(),r=await createGpuAnimationRenderer(d,{maxDraws:1,maxBytes:799});
+  await assert.rejects(r.addMesh(normalGpu(),{shading:'lambert'}),code('ANIMATION_RENDER_LIMIT'));assert.equal(r.allocatedBytes,256);r.dispose();
+  const next=deviceSpy(),ready=await createGpuAnimationRenderer(next,{maxDraws:1,maxBytes:800});
+  const mesh=await ready.addMesh(normalGpu(),{shading:'lambert'});assert.equal(ready.allocatedBytes,800);mesh.dispose();ready.dispose();assert.equal(ready.allocatedBytes,0);
+  const limited=deviceSpy(),other=await createGpuAnimationRenderer(limited);limited.limits.maxUniformBuffersPerShaderStage=1;
+  await assert.rejects(other.addMesh(normalGpu(),{shading:'lambert'}),code('ANIMATION_RENDER_LIMIT'));assert.equal(limited.buffers.length,1);other.dispose();
 });
