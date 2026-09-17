@@ -14,7 +14,8 @@ function deviceSpy() {
   const device = {loss, buffers, pipelines, passes, writes, submissions, scopes, lost: loss.promise,
     limits: {minUniformBufferOffsetAlignment: 256, maxBufferSize: 64 * 1024 * 1024, maxUniformBufferBindingSize: 65536,
       maxDynamicUniformBuffersPerPipelineLayout: 8, maxBindGroups: 4, maxUniformBuffersPerShaderStage: 12,
-      maxVertexBuffers: 8, maxVertexAttributes: 16, maxVertexBufferArrayStride: 2048},
+      maxVertexBuffers: 8, maxVertexAttributes: 16, maxVertexBufferArrayStride: 2048,
+      maxSamplersPerShaderStage: 16, maxSampledTexturesPerShaderStage: 16},
     pushErrorScope(filter) { scopes.push(filter); },
     popErrorScope() { assert.ok(scopes.pop()); return Promise.resolve(null); },
     createBuffer(descriptor) {
@@ -31,12 +32,12 @@ function deviceSpy() {
     createCommandEncoder() {
       const encoded = [];
       return {beginRenderPass(descriptor) {
-        const pass = {descriptor, draws: [], viewport: null, scissor: null}; let pipeline, uniform, vertex, index;
+        const pass = {descriptor, draws: [], viewport: null, scissor: null}; let pipeline, uniform, vertex, index, surface, texture;
         passes.push(pass); encoded.push(pass);
-        return {setPipeline(p) {pipeline=p;}, setBindGroup(slot, group, offsets) {uniform={group,offset:offsets[0]};},
-          setVertexBuffer(slot,buffer) {vertex=buffer;}, setIndexBuffer(buffer,format) {index={buffer,format};},
-          draw(...args) {pass.draws.push({args,indexed:false,pipeline,uniform,vertex});},
-          drawIndexed(...args) {pass.draws.push({args,indexed:true,pipeline,uniform,vertex,index});},
+        return {setPipeline(p) {pipeline=p;}, setBindGroup(slot, group, offsets=[]) {if(slot===0)uniform={group,offset:offsets[0]};else texture=group;},
+          setVertexBuffer(slot,buffer) {if(slot===0)vertex=buffer;else surface=buffer;}, setIndexBuffer(buffer,format) {index={buffer,format};},
+          draw(...args) {pass.draws.push({args,indexed:false,pipeline,uniform,vertex,surface,texture});},
+          drawIndexed(...args) {pass.draws.push({args,indexed:true,pipeline,uniform,vertex,index,surface,texture});},
           setViewport(...values) {pass.viewport=values;}, setScissorRect(...values) {pass.scissor=values;}, end() {pass.ended=true;}};
       }, finish() {return encoded;}};
     },
@@ -49,7 +50,7 @@ function deviceSpy() {
       submit(commands) {
         for (const passes of commands) for (const pass of passes) for (const draw of pass.draws) {
           const buffer=draw.uniform.group.entries[0].resource.buffer;
-          draw.snapshot=new Float32Array(buffer.data,draw.uniform.offset,24).slice();
+          draw.snapshot=new Float32Array(buffer.data,draw.uniform.offset,32).slice();
         }
         submissions.push(commands);
       },
@@ -68,7 +69,7 @@ test('builds reusable pipelines and aligned bounded uniform storage without brow
     assert.equal(p.vertex.buffers[0].arrayStride,40);assert.equal(p.vertex.buffers[0].attributes.length,1);
     assert.equal(p.depthStencil.depthWriteEnabled,!p.fragment.targets[0].blend);
     assert.equal(p.layout.bindGroupLayouts[0].entries[0].buffer.hasDynamicOffset,true);
-    assert.equal(p.layout.bindGroupLayouts[0].entries[0].buffer.minBindingSize,96);
+    assert.equal(p.layout.bindGroupLayouts[0].entries[0].buffer.minBindingSize,128);
   }
   r.dispose();assert.ok(d.buffers.every(b=>b.destroyed));
 });
@@ -80,7 +81,7 @@ test('per-draw matrix/color snapshots preserve red A and blue B in one submissio
   await r.whenIdle();const draws=d.passes[0].draws;
   assert.deepEqual(draws.map(x=>x.uniform.offset),[0,256]);assert.equal(draws[0].snapshot[12],-0.5);assert.equal(draws[1].snapshot[12],0.5);
   assert.deepEqual([...draws[0].snapshot.slice(16,20)],[1,0,0,1]);assert.deepEqual([...draws[1].snapshot.slice(16,20)],[0,0,1,1]);
-  assert.equal(d.writes.length,1);assert.equal(d.writes[0].bytes.length,352);assert.equal(r.drawCount,2);assert.equal(r.version,1);
+  assert.equal(d.writes.length,1);assert.equal(d.writes[0].bytes.length,384);assert.equal(r.drawCount,2);assert.equal(r.version,1);
   r.render(frame([{mesh,baseColor:[0,1,0,1]}]));assert.deepEqual([...draws[0].snapshot.slice(16,20)],[1,0,0,1]);
   assert.equal(d.buffers.length,1,'No buffers allocated during frames');r.dispose();assert.equal(g.disposed,false);
 });
@@ -225,4 +226,96 @@ test('capabilities and initial uniform budget fail before allocating',async()=>{
       [{},d=>{d.limits.maxUniformBufferBindingSize=64;}],[{},d=>{d.limits.maxDynamicUniformBuffersPerPipelineLayout=0;}]]) {
     const d=deviceSpy();change(d);await assert.rejects(createGpuAnimationRenderer(d,options));assert.equal(d.buffers.length,0);
   }
+});
+
+const uvTriangle = () => [0,0, 1,0, 0,1];
+const texture = () => ({view: {}, sampler: {}});
+test('textured draws snapshot UV/RGBA data once and bind each material without dummy textures',async()=>{
+  const d=deviceSpy(),r=await createGpuAnimationRenderer(d),g=gpu();
+  const tex=texture(),uv=uvTriangle(),colors=[1,0,0,0.5, 0,1,0,1, 0,0,1,0.25];
+  const a=await r.addMesh(g,{texCoords:uv,vertexColors:colors,baseColorTexture:tex,alphaMode:'MASK'});
+  const other=texture(),b=await r.addMesh(g,{texCoords:uvTriangle(),baseColorTexture:other});
+  uv.fill(9);colors.fill(9);tex.view={replacement:true};
+  r.render(frame([a,b]));await r.whenIdle();const [first,second]=d.passes[0].draws;
+  assert.equal(first.vertex,g.vertexBuffer);assert.equal(first.surface.usage,32);
+  assert.deepEqual([...new Float32Array(first.surface.data)],[0,0,1,0,0,0.5, 1,0,0,1,0,1, 0,1,0,0,1,0.25]);
+  assert.notEqual(first.texture.entries[1].resource,tex.view);assert.equal(second.texture.entries[1].resource,other.view);
+  assert.equal(first.pipeline,second.pipeline);assert.equal(d.pipelines.length,12,'one cached texture pipeline family');
+  assert.deepEqual(first.pipeline.vertex.buffers[1].attributes.map(a=>a.shaderLocation),[3,4]);
+  assert.equal(first.pipeline.layout.bindGroupLayouts[1].entries[1].texture.sampleType,'float');
+  const code=first.pipeline.fragment.module.code;
+  assert.ok(code.indexOf('textureSample(')<code.indexOf('discard;'));
+  assert.match(code,/rgba\.a < draw_info\.options\.x/);assert.match(code,/draw_info\.color \* input\.color/);
+  const count=d.buffers.length;r.render(frame([a,b]));assert.equal(d.buffers.length,count);r.dispose();
+});
+
+test('RGB vertex colors gain opaque alpha and require no sampler or texture capability',async()=>{
+  const d=deviceSpy();d.limits.maxSamplersPerShaderStage=0;d.limits.maxSampledTexturesPerShaderStage=0;
+  const r=await createGpuAnimationRenderer(d),colors=[1,0,0, 0,1,0, 0,0,1];
+  const mesh=await r.addMesh(gpu(),{vertexColors:colors});r.render(frame([mesh]));
+  const draw=d.passes[0].draws[0],packed=[...new Float32Array(draw.surface.data)];
+  assert.deepEqual(packed,[0,0,1,0,0,1, 0,0,0,1,0,1, 0,0,0,0,1,1]);
+  assert.doesNotMatch(draw.pipeline.fragment.module.code,/textureSample|@group\(1\)/);
+  assert.equal(draw.texture,undefined);r.dispose();
+});
+
+test('independent affine UV transforms are snapshotted at each submitted use',async()=>{
+  const d=deviceSpy(),r=await createGpuAnimationRenderer(d),transform=[2,3,4,5,6,7];
+  const mesh=await r.addMesh(gpu(),{texCoords:uvTriangle(),baseColorTexture:texture(),uvTransform:transform});
+  transform.fill(0);r.render(frame([mesh,{mesh,uvTransform:[0,1,-1,0,0.25,0.5]}]));
+  const [a,b]=d.passes[0].draws;
+  assert.deepEqual([...a.snapshot.slice(24)],[2,4,6,0,3,5,7,0]);
+  assert.deepEqual([...b.snapshot.slice(24)],[0,-1,0.25,0,1,0,0.5,0]);
+  r.render(frame([{mesh,uvTransform:[1,0,0,1,9,9]}]));
+  assert.deepEqual([...a.snapshot.slice(24)],[2,4,6,0,3,5,7,0]);r.dispose();
+});
+
+test('invalid surface descriptors and capabilities fail before device allocation',async()=>{
+  const d=deviceSpy(),r=await createGpuAnimationRenderer(d);
+  for(const options of [{baseColorTexture:texture()},{baseColorTexture:{view:{}},texCoords:uvTriangle()},
+    {baseColorTexture:{...texture(),flipY:true},texCoords:uvTriangle()},{texCoords:[1,2]},
+    {texCoords:[0,0,0,0,0,Infinity]},{texCoords:[0,0,0,0,0,1e300]},
+    {vertexColors:[1,2,3]},{vertexColors:[1,1,1,2,1,1,1,1,1,1,1,1]},
+    {texCoords:uvTriangle(),uvTransform:[1,2]}]) {
+    await assert.rejects(r.addMesh(gpu(),options));assert.equal(d.buffers.length,1);assert.equal(r.meshCount,0);
+  }
+  d.limits.maxSamplersPerShaderStage=0;
+  await assert.rejects(r.addMesh(gpu(),{texCoords:uvTriangle(),baseColorTexture:texture()}),code('ANIMATION_RENDER_LIMIT'));
+  assert.equal(d.buffers.length,1);r.dispose();
+});
+
+test('invalid last UV transform leaves all prior frame work unsubmitted',async()=>{
+  const d=deviceSpy(),r=await createGpuAnimationRenderer(d),mesh=await r.addMesh(gpu(),{vertexColors:Array(9).fill(1)});
+  assert.throws(()=>r.render(frame([mesh,{mesh,uvTransform:[1,0,0,1,NaN,0]}])),code('ANIMATION_RENDER_VALUE'));
+  assert.equal(d.writes.length,0);assert.equal(d.passes.length,0);assert.equal(r.version,0);
+  r.render(frame([mesh]));await r.whenIdle();r.dispose();
+});
+
+test('surface plus index allocations are jointly bounded and reclaimed per mesh',async()=>{
+  const d=deviceSpy(),r=await createGpuAnimationRenderer(d,{maxDraws:1,maxBytes:336}),t=texture();
+  const a=await r.addMesh(gpu(),{indices:[0,1,2],texCoords:uvTriangle(),baseColorTexture:t});
+  assert.equal(r.allocatedBytes,336);
+  await assert.rejects(r.addMesh(gpu(),{vertexColors:Array(9).fill(1)}),code('ANIMATION_RENDER_LIMIT'));
+  a.dispose();assert.equal(r.allocatedBytes,256);assert.ok(d.buffers.slice(1).every(b=>b.destroyed));
+  const b=await r.addMesh(gpu(),{vertexColors:Array(9).fill(1)});assert.equal(r.allocatedBytes,328);
+  r.dispose();assert.equal(b.disposed,true);assert.deepEqual(t,{view:{},sampler:{}});assert.equal(r.allocatedBytes,0);
+});
+
+test('pending surface pipelines reserve mesh/buffer capacity and unwind on failure',async()=>{
+  const d=deviceSpy(),r=await createGpuAnimationRenderer(d,{maxDraws:1,maxBytes:328}),slow=deferred();
+  d.createRenderPipelineAsync=()=>slow.promise;
+  const pending=r.addMesh(gpu(),{vertexColors:Array(9).fill(1)});
+  assert.equal(r.allocatedBytes,328);
+  await assert.rejects(r.addMesh(gpu(),{vertexColors:Array(9).fill(1)}),code('ANIMATION_RENDER_LIMIT'));
+  slow.reject(new Error('surface shader rejected'));await assert.rejects(pending,/surface shader rejected/);
+  assert.equal(r.allocatedBytes,256);assert.equal(r.meshCount,0);assert.ok(d.buffers.slice(1).every(b=>b.destroyed));
+  const plain=await r.addMesh(gpu());r.render(frame([plain]));await r.whenIdle();r.dispose();
+});
+
+test('surface bind-group validation errors clean up attributes without owning the borrowed texture',async()=>{
+  const d=deviceSpy(),r=await createGpuAnimationRenderer(d),bind=d.createBindGroup,t=texture();
+  d.createBindGroup=descriptor=>{if(descriptor.entries.length===2)throw new Error('invalid texture view');return bind(descriptor);};
+  await assert.rejects(r.addMesh(gpu(),{texCoords:uvTriangle(),baseColorTexture:t}),/invalid texture view/);
+  assert.equal(r.meshCount,0);assert.equal(r.allocatedBytes,262144);assert.ok(d.buffers.slice(1).every(b=>b.destroyed));
+  assert.deepEqual(t,{view:{},sampler:{}});r.dispose();
 });
