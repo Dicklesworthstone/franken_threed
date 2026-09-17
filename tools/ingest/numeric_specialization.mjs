@@ -13,7 +13,8 @@
  */
 import * as acorn from 'acorn';
 import * as walk from 'acorn-walk';
-import { compileNumericKernel, NumericKernelCompileError } from './numeric_kernel.mjs';
+import { NumericKernelCompileError } from './numeric_kernel.mjs';
+import { compileNumericCandidate } from './numeric_candidate.mjs';
 
 function span(node) {
   return { start: node.start, end: node.end, line: node.loc.start.line, column: node.loc.start.column };
@@ -28,6 +29,60 @@ function patternNames(node, result) {
   else if (node.type === 'ObjectPattern') {
     node.properties.forEach(item => patternNames(item.type === 'RestElement' ? item.argument : item.value, result));
   }
+}
+
+/**
+ * Storage hints only, never a bounds/alias/closure proof. Follow scalar index
+ * expressions back to read-only parameters (e.g. a = indices[i] * 3). False
+ * positives merely spend an AOT variant; native slot guards decide every call.
+ */
+function indexedLayouts(fn, parameters) {
+  const dependencies = new Map(), required = new Set();
+  const uses = node => {
+    const names = new Set();
+    if (node) walk.simple(node, { Identifier(identifier) { names.add(identifier.name); } });
+    return names;
+  };
+  const define = (binding, value) => {
+    if (binding.type !== 'Identifier') return;
+    if (!dependencies.has(binding.name)) dependencies.set(binding.name, new Set());
+    for (const name of uses(value)) dependencies.get(binding.name).add(name);
+  };
+  walk.simple(fn.body, {
+    VariableDeclarator(node) { define(node.id, node.init); },
+    AssignmentExpression(node) { define(node.left, node.right); },
+    MemberExpression(node) {
+      if (node.computed) for (const name of uses(node.property)) required.add(name);
+    },
+  });
+  const pending = [...required];
+  while (pending.length) {
+    for (const name of dependencies.get(pending.pop()) ?? []) {
+      if (!required.has(name)) { required.add(name); pending.push(name); }
+    }
+  }
+  const topology = parameters.flatMap((param, index) =>
+    param.type !== 'f64' && !param.write && required.has(param.name) ? [index] : []);
+  const bases = [];
+  for (const [read, write] of [['f64[]','f64[]'], ['f32[]','f32[]'], ['f64[]','f32[]'], ['f32[]','f64[]']]) {
+    bases.push(parameters.map(param => param.type === 'f64' ? 'f64' : param.write ? write : read));
+  }
+  const layouts = [], seen = new Set();
+  const add = types => {
+    const key = types.join(',');
+    if (layouts.length < 17 && !seen.has(key)) { seen.add(key); layouts.push(types); }
+  };
+  bases.forEach(add);
+  // Bound compile size, not application functionality. Try shared topology
+  // first, then individual index inputs; unlisted storage combinations retain JS.
+  for (const group of [topology, ...topology.map(index => [index])]) {
+    if (!group.length) continue;
+    for (const integer of ['u16[]', 'u32[]']) for (const base of bases) {
+      add(base.map((type, index) => group.includes(index) ? integer : type));
+    }
+    if (layouts.length === 17) break;
+  }
+  return layouts;
 }
 
 /**
@@ -143,7 +198,7 @@ export function specializeNumericModule(source, {
     const parameterTypes = fn.params.map(param => arrays.has(param.name) ? 'f64[]' : 'f64');
     let artifact;
     try {
-      artifact = compileNumericKernel(source.slice(fn.start, fn.end), {
+      artifact = compileNumericCandidate(source.slice(fn.start, fn.end), {
         parameterTypes, helperSources, allowMath: true, sourceName: `${sourceName}:${fn.id.name}`, maxMemoryPages,
       });
     } catch (error) {
@@ -152,10 +207,11 @@ export function specializeNumericModule(source, {
       item.detail = error.message;
       continue;
     }
-    // At most four AOT variants: homogeneous storage, plus the two combinations
-    // of streamed geometry and uniform storage. Do not enumerate 2^N ABIs.
+    // Keep legacy layouts unchanged. Checked-index kernels additionally cover
+    // topology and mixed input/output precision, within the dispatch AOT budget.
     const float32Types = parameterTypes.map(type => type === 'f64[]' ? 'f32[]' : type);
-    const layouts = [float32Types];
+    const layouts = artifact.manifest.version === 7
+      ? indexedLayouts(fn, artifact.manifest.parameters) : [float32Types];
     if (artifact.manifest.parameters.some(param => param.access?.minimumLength > 0 && !param.access.indexed)) {
       for (const uniformType of ['f64[]', 'f32[]']) {
         layouts.push(artifact.manifest.parameters.map(param => param.type === 'f64' ? 'f64'
@@ -167,7 +223,7 @@ export function specializeNumericModule(source, {
     for (const types of layouts) {
       if (seenLayouts.has(types.join(','))) continue;
       seenLayouts.add(types.join(','));
-      const variant = compileNumericKernel(source.slice(fn.start, fn.end), {
+      const variant = compileNumericCandidate(source.slice(fn.start, fn.end), {
         parameterTypes: types, helperSources, allowMath: true, sourceName: `${sourceName}:${fn.id.name}`, maxMemoryPages,
       });
       alternatives.push({ parameterTypes: types, bytes: [...variant.wasm] });
@@ -190,9 +246,14 @@ export function specializeNumericModule(source, {
     item.route = 'guarded-numeric-wasm';
     item.parameterTypes = parameterTypes;
     if (artifact.manifest.mathIntrinsics) item.mathIntrinsics = [...artifact.manifest.mathIntrinsics];
-    if (artifact.manifest.version === 6) {
+    if (artifact.manifest.version === 6 || artifact.manifest.version === 7) {
       item.loopCount = artifact.manifest.loops.length;
-      item.boundParameters = [...artifact.manifest.boundParameters];
+      if (artifact.manifest.version === 7) {
+        item.lengthParameters = [...artifact.manifest.lengthParameters];
+        item.indexSemantics = artifact.manifest.indexSemantics;
+      } else {
+        item.boundParameters = [...artifact.manifest.boundParameters];
+      }
       item.loops = artifact.manifest.loops.map((pass, index) => ({ ...pass, sourceSpan: span(loops[index]) }));
     } else {
       item.loopStride = artifact.manifest.loopStride ?? 1;

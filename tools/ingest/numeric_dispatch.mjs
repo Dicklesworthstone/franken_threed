@@ -29,7 +29,7 @@ export function createNumericDispatch(target, bytes, alternatives = [], resolveM
   if (!Array.isArray(alternatives) || alternatives.length > 16) throw new TypeError('Expected at most 16 numeric dispatch alternatives');
   const variants = alternatives.map(variant => {
     if (!variant || !Array.isArray(variant.parameterTypes) || variant.parameterTypes.length > 64 ||
-        variant.parameterTypes.some(type => !['f32[]', 'f64[]', 'f64'].includes(type))) {
+        variant.parameterTypes.some(type => !['f32[]', 'f64[]', 'u16[]', 'u32[]', 'f64'].includes(type))) {
       throw new TypeError('Invalid numeric dispatch alternative ABI');
     }
     return state(target, variant.bytes, [...variant.parameterTypes], resolveMath);
@@ -45,7 +45,8 @@ function matches(types, args) {
   try {
     return types.every((type, index) => type === 'f64'
       ? typeof args[index] === 'number'
-      : apply(typedTag, args[index], []) === (type === 'f32[]' ? 'Float32Array' : 'Float64Array'));
+      : apply(typedTag, args[index], []) === (type === 'u16[]' ? 'Uint16Array' : type === 'u32[]' ? 'Uint32Array'
+        : type === 'f32[]' ? 'Float32Array' : 'Float64Array'));
   } catch { return false; }
 }
 
