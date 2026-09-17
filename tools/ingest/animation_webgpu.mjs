@@ -295,6 +295,7 @@ export async function createGpuAnimationDeformer(device, pose, geometry, {
     } finally { busy = false; }
   }
   const result = Object.freeze({vertexBuffer: buffers[5], vertexCount, vertexLayout, worldMatrix, node,
+    bufferBytes: sizes.reduce((a, b) => a + b, 0),
     execution: 'webgpu-compute-f32', update,
     async whenIdle() {
       live();

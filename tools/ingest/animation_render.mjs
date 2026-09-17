@@ -280,6 +280,7 @@ export async function createGpuAnimationRenderer(device, {
     }
   }
   const renderer = Object.freeze({format, depthFormat, sampleCount, addMesh, render,
+    get allocatedBytes() { return allocatedBytes; },
     get version() { return version; }, get drawCount() { return drawCount; }, get meshCount() { return records.size; },
     get disposed() { return disposed; }, get failed() { return terminal !== null; },
     async whenIdle() { live(); await Promise.race([completion, lost]); live(); return renderer; },
