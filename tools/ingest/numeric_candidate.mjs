@@ -1,7 +1,8 @@
-/** Choose the prefix ABI first; use checked full-view indexing only when needed. */
+/** Choose the existing ABI first; expand small fixed loops only on refusal. */
 import { compileNumericKernel, NumericKernelCompileError } from './numeric_kernel.mjs';
+import { expandNumericFixedLoops } from './numeric_fixed_loops.mjs';
 
-export function compileNumericCandidate(source, options = {}) {
+function compileDirect(source, options) {
   // Explicit callers can force either mode. Integer topology requires v7, but
   // neither type guessing nor a failed prefix proof relaxes the source closure.
   const integerAbi = Array.isArray(options.parameterTypes) &&
@@ -18,5 +19,30 @@ export function compileNumericCandidate(source, options = {}) {
       // Unsupported applications retain their original prefix-path diagnostic.
       throw error;
     }
+  }
+}
+
+export function compileNumericCandidate(source, options = {}) {
+  try { return compileDirect(source, options); }
+  catch (error) {
+    if (!(error instanceof NumericKernelCompileError) || error.code !== 'KERNEL_NOT_CLOSED') throw error;
+    const expanded = expandNumericFixedLoops(source);
+    if (!expanded.changed) throw error;
+    let artifact;
+    const sourceName = String(options.sourceName ?? '<numeric-kernel>');
+    try {
+      artifact = compileDirect(expanded.source, { ...options, sourceName: sourceName + '#fixed-loop-expansion' });
+    } catch (expandedError) {
+      if (!(expandedError instanceof NumericKernelCompileError)) throw expandedError;
+      // Expansion is never partial feature admission: every generated statement
+      // must still satisfy numeric closure, bounds and original storage guards.
+      throw error;
+    }
+    for (const loop of expanded.loops) { Object.freeze(loop.sourceSpan); Object.freeze(loop); }
+    // Keep source coordinate spaces explicit. Runtime ABI spans refer to the
+    // expanded source; these build-time spans refer to the supplied original.
+    const fixedLoops = Object.freeze({ sourceName, expandedSourceName: artifact.manifest.sourceName,
+      expandedIterations: expanded.expandedIterations, loops: Object.freeze(expanded.loops) });
+    return Object.freeze({ ...artifact, fixedLoops });
   }
 }
