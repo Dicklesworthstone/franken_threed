@@ -1,6 +1,6 @@
 /**
  * Multi-mesh playback through the existing pose controller, GPU deformation and
- * explicit unlit draw pass. No new frame loop, scheduler, loader or renderer
+ * explicit material/draw pass. No new frame loop, scheduler, loader or renderer
  * routing. The caller supplies decoded geometry, a pose, device and attachments.
  *
  * const scene = await createGpuAnimationScene(device, pose, [
@@ -23,7 +23,10 @@
  * everything created so far. Scene disposal owns its controller, draw resources
  * and deformers, never the borrowed pose/device/attachments. maxBytes bounds
  * owned GPU buffers (not driver pipelines, CPU pose arrays or caller textures).
- * Geometry/material support is exactly the explicitly selected unlit slice.
+ * Drawable material fields match renderer.addMesh: texCoords, vertexColors,
+ * baseColorTexture, uvTransform, shading, metallicFactor, roughnessFactor and
+ * emissiveFactor are optional. Lit scenes pass lighting to render(). Textures
+ * stay caller-owned; material arrays/descriptors are snapshotted before awaits.
  */
 import {createAnimationController} from './animation_controller.mjs';
 import {createGpuAnimationDeformer} from './animation_webgpu.mjs';
@@ -39,6 +42,16 @@ export async function createGpuAnimationScene(device, pose, drawables, {
   const controller = createAnimationController(pose), initialVersion = pose.version;
   const deformers = [], meshes = [];
   let renderer, deformationBytes = 0, poseVersion = initialVersion, disposed = false, terminal = null, busy = false;
+  let lightingAllocated = false, materialComponents = 0;
+  function copyMaterialArray(value, key) {
+    if ((!Array.isArray(value) && !ArrayBuffer.isView(value)) || !Number.isSafeInteger(value.length) ||
+        (materialComponents += value.length) > Math.floor(maxBytes / 4)) fail('ANIMATION_SCENE_LIMIT', `Invalid or excessive ${key} storage`);
+    if (ArrayBuffer.isView(value)) {
+      if (!(value.buffer instanceof ArrayBuffer) || value.buffer.resizable) fail('ANIMATION_SCENE_GEOMETRY', `${key} must have fixed unshared storage`);
+      try { new Uint8Array(value.buffer, 0, 0); } catch { fail('ANIMATION_SCENE_GEOMETRY', `${key} is detached`); }
+    }
+    return Array.from(value);
+  }
   function release() {
     for (const mesh of meshes) mesh.dispose();
     for (const gpu of deformers) gpu.dispose();
@@ -58,14 +71,28 @@ export async function createGpuAnimationScene(device, pose, drawables, {
     // performs its existing bounded geometry snapshot during each creation.
     const inputs = drawables.map(input => {
       if (!input || typeof input !== 'object') fail('ANIMATION_SCENE_GEOMETRY', 'Expected a drawable descriptor');
-      for (const key of Object.keys(input)) if (!['geometry', 'indices', 'baseColor', 'doubleSided', 'alphaMode', 'alphaCutoff'].includes(key)) {
-        fail('ANIMATION_SCENE_GEOMETRY', `Unsupported drawable field: ${key}`);
-      }
+      const allowed = ['geometry', 'indices', 'baseColor', 'doubleSided', 'alphaMode', 'alphaCutoff',
+        'texCoords', 'vertexColors', 'baseColorTexture', 'uvTransform', 'shading', 'metallicFactor', 'roughnessFactor', 'emissiveFactor'];
+      for (const key of Object.keys(input)) if (!allowed.includes(key)) fail('ANIMATION_SCENE_GEOMETRY', `Unsupported drawable field: ${key}`);
       const {geometry, indices = null, baseColor = [1,1,1,1], doubleSided = false, alphaMode = 'OPAQUE', alphaCutoff = 0.5} = input;
-      if (indices !== null && ((!Array.isArray(indices) && !ArrayBuffer.isView(indices)) ||
-          !Number.isSafeInteger(indices.length) || indices.length > Math.floor(maxBytes / 4))) fail('ANIMATION_SCENE_LIMIT', 'Index storage exceeds budget');
       if ((!Array.isArray(baseColor) && !ArrayBuffer.isView(baseColor)) || baseColor.length !== 4) fail('ANIMATION_SCENE_GEOMETRY', 'Expected RGBA material color');
-      return {geometry, material: {indices: indices === null ? null : Array.from(indices), baseColor: Array.from(baseColor), doubleSided, alphaMode, alphaCutoff}};
+      const material = {indices: indices === null ? null : copyMaterialArray(indices, 'indices'),
+        baseColor: copyMaterialArray(baseColor, 'baseColor'), doubleSided, alphaMode, alphaCutoff};
+      for (const key of ['texCoords', 'vertexColors', 'uvTransform', 'emissiveFactor']) {
+        const value = input[key];
+        if (value !== undefined) material[key] = value === null ? null : copyMaterialArray(value, key);
+      }
+      for (const key of ['shading', 'metallicFactor', 'roughnessFactor']) {
+        const value = input[key]; if (value !== undefined) material[key] = value;
+      }
+      const texture = input.baseColorTexture;
+      if (texture !== undefined) {
+        if (texture !== null && (typeof texture !== 'object' || Array.isArray(texture))) fail('ANIMATION_SCENE_GEOMETRY', 'Expected a texture descriptor');
+        // Preserve unknown descriptor keys so the renderer rejects them; never
+        // silently drop a requested flipY, color conversion or unsupported map.
+        material.baseColorTexture = texture === null ? null : {...texture};
+      }
+      return {geometry, material};
     });
     if ((renderOptions.maxDraws ?? drawables.length) < drawables.length || (renderOptions.maxMeshes ?? maxMeshes) < drawables.length) {
       fail('ANIMATION_SCENE_LIMIT', 'Renderer capacity cannot hold the scene');
@@ -74,15 +101,20 @@ export async function createGpuAnimationScene(device, pose, drawables, {
       maxMeshes: renderOptions.maxMeshes ?? maxMeshes, maxBytes: Math.min(maxBytes, renderOptions.maxBytes ?? maxBytes)});
     unchanged();
     for (const {geometry, material} of inputs) {
-      // Reserve a conservative uint32 index allocation before allocating the
-      // next deformer. The renderer may use less (padded uint16) in practice.
-      const indexReserve = (material.indices?.length ?? 0) * 4;
-      const remaining = maxBytes - renderer.allocatedBytes - deformationBytes - indexReserve;
+      // Reserve the renderer's pending auxiliary buffers before allocating the
+      // next deformer. uint32 indices conservatively bound padded uint16 data.
+      const vertices = geometry?.positions?.length / 3;
+      const surface = material.texCoords != null || material.vertexColors != null || material.baseColorTexture != null;
+      if (surface && (!Number.isSafeInteger(vertices) || vertices < 1)) fail('ANIMATION_SCENE_GEOMETRY', 'Surface attributes require XYZ geometry');
+      const lit = material.shading === 'lambert' || material.shading === 'metallic-roughness';
+      const reserve = (material.indices?.length ?? 0) * 4 + (surface ? vertices * 24 : 0) + (lit && !lightingAllocated ? 544 : 0);
+      const remaining = maxBytes - renderer.allocatedBytes - deformationBytes - reserve;
       if (remaining < 1) fail('ANIMATION_SCENE_LIMIT', 'Scene GPU buffer budget exhausted');
       const gpu = await createGpuAnimationDeformer(device, pose, geometry, {...deformOptions,
         maxBytes: Math.min(remaining, deformOptions.maxBytes ?? 128 * 1024 * 1024)});
       deformers.push(gpu); deformationBytes += gpu.bufferBytes; unchanged();
-      meshes.push(await renderer.addMesh(gpu, material)); unchanged();
+      meshes.push(await renderer.addMesh(gpu, material)); lightingAllocated ||= lit; unchanged();
+      if (renderer.allocatedBytes + deformationBytes > maxBytes) fail('ANIMATION_SCENE_LIMIT', 'Scene GPU buffer budget exceeded');
     }
   } catch (error) { release(); throw error; }
   function exclusive(operation) {
