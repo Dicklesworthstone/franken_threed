@@ -8,8 +8,8 @@
  * mesh instances have independent writable output arrays and original node IDs.
  * TRIANGLES/STRIP/FAN become triangle lists with source winding and degenerates
  * preserved. Missing normals produce expanded flat-shaded triangles; source
- * tangents are then ignored as glTF requires. Deforming meshes without normals
- * require a dynamic flat-normal source path and are explicitly refused here.
+ * tangents are then ignored as glTF requires. Skinned/position-morphed flat
+ * meshes request face normals rebuilt AFTER deformation on both CPU and GPU.
  * No MikkTSpace tangents are guessed.
  * Skin sets are combined vertex-major, up to the deformer's 32 influences.
  *
@@ -171,7 +171,7 @@ export function decodeGltfGeometry(model, suppliedBuffers, {
         indices[i*3+2] = at(mode === 5 ? i+2-(i%2) : 0);
       }
       const flat = !Object.hasOwn(attributes, 'NORMAL');
-      if (flat && (skin || targets.some(target => target.POSITION))) fail('NORMAL', 'Deforming meshes without normals require the source dynamic flat-normal path');
+      const dynamicFlat = flat && (skin !== null || targets.some(target => target.POSITION));
       const expand = entry => {
         const length = flat ? indexCount * entry.width : entry.values.length; charge(length);
         if (!flat) return {width: entry.width, values: entry.values.slice()};
@@ -199,6 +199,10 @@ export function decodeGltfGeometry(model, suppliedBuffers, {
         diagnostics.push({node:nodeIndex,primitive:primitiveIndex,reason:'GENERATED_FLAT_NORMALS'});
       }
       const geometry = {node:nodeIndex};
+      if (dynamicFlat) {
+        geometry.flatNormals = true;
+        diagnostics.push({node:nodeIndex,primitive:primitiveIndex,reason:'DYNAMIC_FLAT_NORMALS'});
+      }
       for (const [name, field] of Object.entries(baseNames)) if (attributes[name]) geometry[field] = attributes[name].values;
       geometry.morphTargets = targets.map(target => Object.fromEntries(Object.entries(target).map(([name, entry]) => [baseNames[name], entry.values])));
       const sets = Object.keys(attributes).filter(name => name.startsWith('JOINTS_')).map(name => Number(name.slice(7))).sort((a,b)=>a-b);

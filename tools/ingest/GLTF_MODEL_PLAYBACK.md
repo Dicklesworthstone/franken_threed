@@ -53,8 +53,13 @@ frame loop, clock, scheduler or asset Promise pool. Its pose is factory-owned an
 is released on initialization failure, terminal scene failure or disposal.
 Device, textures, samplers, attachments, camera and lighting remain caller-owned.
 Explicit WebGPU f32 deformation and CPU pose arithmetic retain their existing
-numerical profiles. Source draw order is preserved; sort transparent draws via
-`render({ draws: [...] })` when the application requires it.
+numerical profiles. Implicit draws keep opaque/masked source order, followed by
+blended meshes sorted back-to-front using each uploaded node origin and the current
+view-projection matrix. Equal depths retain source order. `scene: {sortObjects:false}`
+preserves the original implicit list. Explicit `render({draws:[...]})` always
+preserves caller order, including per-draw overrides and empty draw lists. This
+is object-origin ordering, not triangle sorting: intersecting or unusually offset
+transparent meshes can still need an application-supplied draw list.
 
 ## Texture resolution
 
@@ -79,24 +84,50 @@ Core PBR factors, alpha modes, vertex colors and the four supported maps are
 translated into renderer inputs. `KHR_materials_unlit` keeps its unlit behavior
 and ignores its lighting-related fallback fields. `KHR_texture_transform`
 supports scale/rotation/offset and the extension's texture-coordinate override.
+Each map can retain its own UV set and transform. Tangentless normal maps use the
+renderer's derivative frame, reported as `DERIVATIVE_NORMAL_FRAME_NOT_MIKKTSPACE`;
+this is not generated MikkTSpace tangent data.
+
+## Animated meshes without source normals
+
+Missing `NORMAL` expands triangles and all associated attributes, indices, UVs,
+morph deltas and skin influences consistently. Tangents are ignored as required
+by the flat-normal path. Static meshes retain construction-time flat normals.
+Skinned or position-morphed primitives instead carry `geometry.flatNormals:true`
+and report `DYNAMIC_FLAT_NORMALS`, in addition to `GENERATED_FLAT_NORMALS`.
+
+On the CPU, normals are rebuilt from final mesh-local Float32 positions after
+morphing and skinning, and published atomically with positions, bounds, transform
+and version. On WebGPU, a second ordered compute pass writes normals into the
+existing 40-byte-per-vertex output buffer. No extra mesh buffer, GPU readback or
+per-frame CPU vertex deformation is introduced. The scene's existing upload,
+submission, completion and disposal contracts still apply.
+
+Direct deformer callers can request `flatNormals:true` for independent contiguous
+triangles. Vertex count must be divisible by three. Omit tangents and normal/tangent
+morph deltas; position deltas remain supported. Normal storage is optional and is
+charged to the component budget when generated. Degenerate triangles produce zero
+normals; extremely small edges/areas can also become zero in the explicit GPU f32
+profile. Authored smooth normals keep their original deformation semantics.
 
 ## Scope and validation boundaries
 
 Geometry supports triangle lists, strips and fans; normalized, interleaved and
 sparse attributes; multiple primitives/instances; morph deltas; and all eight
-joint/weight sets supported by the deformers. Static meshes without normals are
-expanded for flat shading, with source tangents ignored. Source geometry is
-copied, not rewritten. Decoding uses independent per-stage component limits;
-GPU resource budgets remain enforced by the existing scene/deformer/renderer.
+joint/weight sets supported by the deformers. Source geometry is copied, not
+rewritten. Decoding uses independent per-stage component limits; GPU resource
+budgets remain enforced by the existing scene/deformer/renderer.
 
 The direct-light material route is not full glTF or Three.js parity. Unsupported
-codecs/material extensions, occlusion, nontriangle topology, normal maps without
-source tangents, deforming meshes without normals, and maps using different UV
-sets/transforms fail explicitly. All four maps currently share one UV set and
-transform. Use the source loader/backend for these cases. Camera/light extraction,
-image/GLB/network loading, environment lighting, tone mapping and automatic
-transparent sorting are not supplied by these factories.
+codecs/material extensions, occlusion and nontriangle topology fail explicitly;
+retain the source loader/backend for those cases. Authored cameras and punctual
+lights are available through the model view, but environment lighting and tone
+mapping are not supplied by these factories. Image/GLB/network loading remains
+separate from these parsed-JSON/supplied-buffer entry points.
 
-Host tests exercise decoding, real CPU pose/morph/skin execution and ownership.
-The GPU factory tests replace only the GPU-scene boundary and do not establish
-actual shader execution, pixels, full source equivalence or acceleration.
+Host tests exercise binary decoding, real CPU pose/morph/skin execution, generated
+flat normals, GPU command order, resource ownership and failure cleanup. GPU host
+spies do not execute shaders. The existing `tests/e2e/animation_webgpu/index.html`
+also runs native flat-normal readback checks over multiple scales, workgroups and
+same-frame poses. Those browser checks require a real WebGPU device; a blocked
+browser or missing adapter is not a passed test. No acceleration claim is made.

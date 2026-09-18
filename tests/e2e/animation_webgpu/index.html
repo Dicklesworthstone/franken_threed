@@ -8,12 +8,14 @@ and render comparisons, not a performance benchmark. No adapter is a failure.</p
 <pre id="result">Running…</pre>
 <script type="module">
 import {runAnimationWebGpuChecks} from '../../../tools/ingest/animation_webgpu.browser.mjs';
+import {runFlatNormalWebGpuChecks} from '../../../tools/ingest/animation_flat_normals.browser.mjs';
 let device;
 try {
   const adapter=await navigator.gpu?.requestAdapter();
   if(!adapter)throw new Error('No WebGPU adapter; this test has not passed.');
   device=await adapter.requestDevice();
   globalThis.__f3dGpuAnimationResult={...await runAnimationWebGpuChecks(device),
+    flatNormals:await runFlatNormalWebGpuChecks(device),
     adapter:{vendor:adapter.info?.vendor,architecture:adapter.info?.architecture,description:adapter.info?.description}};
 } catch(error) {
   globalThis.__f3dGpuAnimationResult={status:'failed',error:error.stack||String(error)};

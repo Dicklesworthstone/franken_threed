@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createGltfAccessorReader, decodeGltfAnimation} from './animation_gltf.mjs';
+import {createAnimationDeformer} from './animation_deformer.mjs';
 import {createAnimationPlayer} from './animation_runtime.mjs';
 import {decodeGltfGeometry} from './animation_geometry.mjs';
 const code = code => error => error.code === code;
@@ -166,13 +167,87 @@ test('source custom attributes are retained, not interpreted as rendering featur
 });
 
 test('deforming meshes without normals do not receive incorrectly static flat normals',()=>{
-  const f=skinFixture();delete f.primitive.attributes.NORMAL;assert.throws(()=>f.decode(),code('GLTF_GEOMETRY_NORMAL'));
+  const f=skinFixture();delete f.primitive.attributes.NORMAL;assert.equal(f.decode().primitives[0].geometry.flatNormals,true);
   const g=fixture();delete g.primitive.attributes.NORMAL;g.primitive.targets=[{POSITION:g.accessor(Array(9).fill(0))}];
-  assert.throws(()=>g.decode(),code('GLTF_GEOMETRY_NORMAL'));
+  assert.equal(g.decode().primitives[0].geometry.flatNormals,true);
 });
 
 test('shared accessor cache has one bounded decode and preserves little-endian float values',()=>{
   const f=fixture();let reads=0;const reader=createGltfAccessorReader(f.model,i=>{reads++;return f.buffers[i];},{maxComponents:9});
   const a=reader.read(0);assert.equal(reader.read(0),a);assert.equal(reads,1);assert.equal(reader.components,9);
   assert.throws(()=>reader.read(1),code('GLTF_ANIMATION_LIMIT'));
+});
+
+function animatedFlatFixture({skin=true,morph=true,mode=4,indexed=true}={}) {
+  const f=fixture();delete f.primitive.attributes.NORMAL;
+  f.primitive.mode=mode;
+  if(indexed)f.primitive.indices=f.accessor([0,1,2,0,2,1].slice(0,mode===4?6:4),'SCALAR',5123);
+  f.primitive.attributes.TEXCOORD_1=f.accessor([0,0,1,0,0,1],'VEC2');
+  const times=f.accessor([0,1],'SCALAR',5126,{min:[0],max:[1]}),samplers=[],channels=[];
+  function channel(node,path,values,type){const output=f.accessor(values,type);channels.push({sampler:samplers.length,target:{node,path}});samplers.push({input:times,output});}
+  if(morph){
+    f.primitive.targets=[{POSITION:f.accessor([0,0,0,0,0,0,0,0,1])}];f.model.meshes[0].weights=[0];
+    channel(0,'weights',[0,1],'SCALAR');
+  }
+  if(skin){
+    f.model.nodes.push({},{});f.model.scenes[0].nodes.push(1,2);f.model.skins=[{joints:[1,2]}];f.model.nodes[0].skin=0;
+    f.primitive.attributes.JOINTS_0=f.accessor([0,0,0,0,1,0,0,0,0,0,0,0],'VEC4',5121);
+    f.primitive.attributes.WEIGHTS_0=f.accessor([255,0,0,0,255,0,0,0,255,0,0,0],'VEC4',5121,{normalized:true});
+    channel(2,'translation',[0,0,0,0,0,2],'VEC3');
+  }
+  f.model.animations=[{samplers,channels}];return f;
+}
+
+for(const skin of [false,true])for(const morph of [false,true])test(`binary glTF flat geometry runs with skin=${skin}, morph=${morph}`,()=>{
+  const f=animatedFlatFixture({skin,morph}),before=f.buffers.map(b=>new Uint8Array(b).slice());
+  const decoded=f.decode(),primitive=decoded.primitives[0],pose=createAnimationPlayer(decodeGltfAnimation(f.model,f.buffers));
+  const deformer=createAnimationDeformer(pose,primitive.geometry);
+  assert.equal(primitive.indices,null);assert.equal(primitive.geometry.flatNormals,skin||morph?true:undefined);
+  assert.deepEqual([primitive.node,primitive.mesh,primitive.primitive,primitive.material],[0,0,0,null]);
+  assert.equal(decoded.diagnostics.some(d=>d.reason==='DYNAMIC_FLAT_NORMALS'),skin||morph);
+  const normals=deformer.normals;
+  for(const t of [0,.5,1]){
+    pose.sample(t);deformer.update();assert.equal(deformer.normals,normals);
+    const x=skin?-2*t:0,y=morph?-t:0,length=Math.hypot(x,y,1),n=[x/length,y/length,1/length];
+    for(let v=0;v<6;v++)close([...normals.slice(v*3,v*3+3)],n.map(a=>v<3?a:-a));
+  }
+  close([...primitive.attributes.TEXCOORD_1.values],[0,0,1,0,0,1,0,0,0,1,1,0]);
+  f.buffers.forEach((buffer,i)=>assert.deepEqual(new Uint8Array(buffer),before[i]));
+  deformer.dispose();pose.dispose();
+});
+
+for(const mode of [4,5,6])for(const indexed of [false,true])test(`dynamic flat topology ${mode}, indexed=${indexed}, preserves face winding and pose`,()=>{
+  const f=animatedFlatFixture({mode,indexed}),p=f.decode().primitives[0];
+  const pose=createAnimationPlayer(decodeGltfAnimation(f.model,f.buffers)),d=createAnimationDeformer(pose,p.geometry);
+  pose.sample(1);d.update();assert.equal(p.indices,null);assert.equal(d.positions.length%9,0);
+  for(let i=0;i<d.positions.length;i+=9){
+    const a=[0,1,2].map(k=>d.positions[i+3+k]-d.positions[i+k]);
+    const b=[0,1,2].map(k=>d.positions[i+6+k]-d.positions[i+k]);
+    const n=[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]],length=Math.hypot(...n);
+    for(let v=0;v<3;v++)close([...d.normals.slice(i+v*3,i+v*3+3)],n.map(x=>length?x/length:0));
+  }
+  d.dispose();pose.dispose();
+});
+
+test('dynamic flat expansion is charged fully for streams, weights and repeated instances',()=>{
+  const f=animatedFlatFixture();f.model.nodes.push({mesh:0,skin:0});f.model.scenes[0].nodes.push(3);
+  const result=f.decode(),required=result.outputComponents;
+  assert.equal(result.primitives.length,2);assert.notEqual(result.primitives[0].geometry.positions,result.primitives[1].geometry.positions);
+  assert.equal(f.decode({maxComponents:required}).outputComponents,required);
+  assert.throws(()=>f.decode({maxComponents:required-1}),code('GLTF_GEOMETRY_LIMIT'));
+});
+
+test('authored normals still keep indexed geometry and the original morph-normal contract',()=>{
+  const f=animatedFlatFixture();f.primitive.attributes.NORMAL=f.accessor([0,0,1,0,0,1,0,0,1]);
+  f.primitive.targets[0].NORMAL=f.accessor([0,1,0,0,1,0,0,1,0]);
+  const p=f.decode().primitives[0],pose=createAnimationPlayer(decodeGltfAnimation(f.model,f.buffers)),d=createAnimationDeformer(pose,p.geometry);
+  assert.equal(p.geometry.flatNormals,undefined);assert.deepEqual([...p.indices],[0,1,2,0,2,1]);
+  pose.sample(1);d.update();close([...d.normals],[0,1,1,0,1,1,0,1,1]);d.dispose();pose.dispose();
+});
+
+test('source tangents and tangent deltas are ignored together when flat normals are required',()=>{
+  const f=animatedFlatFixture();f.primitive.attributes.TANGENT=f.accessor([1,0,0,1,1,0,0,1,1,0,0,1],'VEC4');
+  f.primitive.targets[0].TANGENT=f.accessor(Array(9).fill(0));
+  const p=f.decode().primitives[0];assert.equal(p.geometry.tangents,undefined);assert.equal(p.geometry.morphTargets[0].tangents,undefined);
+  assert.equal(p.geometry.flatNormals,true);
 });

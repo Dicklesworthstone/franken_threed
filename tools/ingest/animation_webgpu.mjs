@@ -6,7 +6,9 @@
  * createGpuAnimationDeformer(device, pose, geometry) accepts the CPU deformer's
  * decoded geometry contract. Geometry is snapshotted and uploaded once. Each
  * update uploads only this instance's joint palette and morph weights, then
- * submits a compute pass. There is NO CPU vertex deformation on update.
+ * submits a compute pass. flatNormals:true adds a second, ordered compute pass
+ * that rebuilds face normals from deformed triangles in the same vertex buffer.
+ * There is NO CPU vertex deformation, GPU readback or extra mesh buffer on update.
  *
  * The stable vertexBuffer is interleaved: position XYZ, normal XYZ, tangent
  * XYZW (40 bytes/vertex). vertexLayout describes the attributes actually present
@@ -81,6 +83,41 @@ fn deform(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_ind
 }
 `;
 
+// Each invocation owns all three normals of one deindexed triangle. A distinct
+// compute pass follows deformation, so no workgroup reads another workgroup's
+// unfinished vertex positions. Position/tangent words and the 40-byte ABI stay
+// unchanged. Degenerate or f32-subnormal area receives a deterministic zero.
+export const ANIMATION_FLAT_NORMALS_WGSL = /* wgsl */`
+struct Config { vertices: u32, targets: u32, influences: u32, groups_x: u32 }
+@group(0) @binding(0) var<storage, read_write> output: array<f32>;
+@group(0) @binding(1) var<uniform> config: Config;
+@compute @workgroup_size(64)
+fn flat_normals(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_index) lane: u32) {
+  let triangles = config.vertices / 3u;
+  let groups_x = min((triangles + 63u) / 64u, config.groups_x);
+  let triangle = (group.y * groups_x + group.x) * 64u + lane;
+  if (triangle >= triangles) { return; }
+  let b = triangle * 30u;
+  let p = vec3<f32>(output[b], output[b+1u], output[b+2u]);
+  let a = vec3<f32>(output[b+10u], output[b+11u], output[b+12u]) - p;
+  let c = vec3<f32>(output[b+20u], output[b+21u], output[b+22u]) - p;
+  let extent = max(max(max(abs(a.x), abs(a.y)), abs(a.z)), max(max(abs(c.x), abs(c.y)), abs(c.z)));
+  var normal = vec3<f32>(0.0);
+  if (extent >= 1.17549435e-38) {
+    let area = cross(a / extent, c / extent);
+    let area_extent = max(max(abs(area.x), abs(area.y)), abs(area.z));
+    if (area_extent >= 1.17549435e-38) {
+      let scaled = area / area_extent;
+      normal = scaled * inverseSqrt(dot(scaled, scaled));
+    }
+  }
+  for (var vertex = 0u; vertex < 3u; vertex++) {
+    let n = b + vertex * 10u + 3u;
+    output[n] = normal.x; output[n+1u] = normal.y; output[n+2u] = normal.z;
+  }
+}
+`;
+
 function fixed(array, length) {
   if (!ArrayBuffer.isView(array) || array instanceof DataView ||
       !(array.buffer instanceof ArrayBuffer) || array.buffer.resizable || array.length !== length) {
@@ -108,6 +145,8 @@ function snapshot(geometry, maxComponents) {
     return Float64Array.from(array, value => { f32(value); return value; });
   }
   const result = {node: geometry.node};
+  const flatNormals = geometry.flatNormals;
+  if (flatNormals !== undefined) result.flatNormals = flatNormals;
   for (const field of ['positions', 'normals', 'tangents', 'joints', 'weights']) {
     if (geometry[field] !== undefined) result[field] = copy(geometry[field]);
   }
@@ -146,7 +185,7 @@ export async function createGpuAnimationDeformer(device, pose, geometry, {
   // weight sums, instance ranges, affine matrices and morph target shapes.
   // This initial CPU evaluation is NOT repeated by the GPU update path.
   const checked = createAnimationDeformer(pose, source, {maxComponents});
-  const node = source.node, vertexCount = checked.vertexCount;
+  const node = source.node, vertexCount = checked.vertexCount, flatNormals = source.flatNormals === true;
   checked.dispose();
   const skin = pose.instances.find(instance => instance.node === node);
   const targetCount = source.morphTargets.length, influenceCount = skin ? source.influences ?? 4 : 0;
@@ -164,6 +203,9 @@ export async function createGpuAnimationDeformer(device, pose, geometry, {
   const groups = Math.ceil(vertexCount / WORKGROUP), groupsX = Math.min(groups, limits.maxComputeWorkgroupsPerDimension);
   const groupsY = Math.ceil(groups / groupsX);
   limit('maxComputeWorkgroupsPerDimension', groupsY);
+  const normalGroups = flatNormals ? Math.ceil(vertexCount / 3 / WORKGROUP) : 0;
+  const normalGroupsX = flatNormals ? Math.min(normalGroups, groupsX) : 0;
+  const normalGroupsY = flatNormals ? Math.ceil(normalGroups / normalGroupsX) : 0;
   const sizes = [vertexCount * 40, Math.max(4, vertexCount * targetCount * 36),
     Math.max(8, vertexCount * influenceCount * 8), paletteCount * 4, Math.max(4, targetCount * 4), vertexCount * 40, 16];
   if (sizes.reduce((a, b) => a + b, 0) > maxBytes) fail('ANIMATION_GPU_LIMIT', 'GPU buffers exceed byte budget');
@@ -178,7 +220,8 @@ export async function createGpuAnimationDeformer(device, pose, geometry, {
   for (let v = 0; v < vertexCount; v++) {
     base[v * 10 + 9] = source.tangents ? source.tangents[v * 4 + 3] : 1;
     for (let field = 0; field < 3; field++) for (let axis = 0; axis < 3; axis++) {
-      const value = source[fields[field]]?.[v * (field === 2 ? 4 : 3) + axis] ?? 0;
+      // Flat normals are derived after skinning, never transformed rest normals.
+      const value = flatNormals && field === 1 ? 0 : source[fields[field]]?.[v * (field === 2 ? 4 : 3) + axis] ?? 0;
       base[v * 10 + field * 3 + axis] = value;
       maxima[field] = Math.max(maxima[field], Math.abs(Math.fround(value)));
       for (let target = 0; target < targetCount; target++) {
@@ -242,7 +285,7 @@ export async function createGpuAnimationDeformer(device, pose, geometry, {
     }
     return pose.version;
   }
-  let pipeline, bindGroup;
+  let pipeline, bindGroup, normalPipeline, normalBindGroup;
   try {
     prepare();
     const allocated = scoped(device, () => {
@@ -256,16 +299,28 @@ export async function createGpuAnimationDeformer(device, pose, geometry, {
         if (initial[i]) { new Uint8Array(buffer.getMappedRange()).set(new Uint8Array(initial[i].buffer, initial[i].byteOffset, initial[i].byteLength)); buffer.unmap(); }
       }
       const module = device.createShaderModule({label, code: ANIMATION_DEFORM_WGSL});
-      return device.createComputePipelineAsync({label, layout: 'auto', compute: {module, entryPoint: 'deform'}});
+      const deformReady = device.createComputePipelineAsync({label, layout: 'auto', compute: {module, entryPoint: 'deform'}});
+      // A synchronous failure creating the optional pipeline must not leave the
+      // already-started deformation pipeline rejection unobserved.
+      deformReady.catch(() => {});
+      const normalReady = flatNormals ? device.createComputePipelineAsync({label: `${label}/flat-normals`, layout: 'auto', compute: {
+        module: device.createShaderModule({label: `${label}/flat-normals`, code: ANIMATION_FLAT_NORMALS_WGSL}), entryPoint: 'flat_normals',
+      }}) : null;
+      return Promise.all([deformReady, normalReady]);
     });
-    [pipeline] = await Promise.race([Promise.all([allocated.value, allocated.errors]), lost]);
+    [[pipeline, normalPipeline]] = await Promise.race([Promise.all([allocated.value, allocated.errors]), lost]);
     live();
     const bound = scoped(device, () => device.createBindGroup({label, layout: pipeline.getBindGroupLayout(0),
       entries: buffers.map((buffer, binding) => ({binding, resource: {buffer}}))}));
     bindGroup = bound.value; await Promise.race([bound.errors, lost]); live();
+    if (flatNormals) {
+      const normalsBound = scoped(device, () => device.createBindGroup({label: `${label}/flat-normals`, layout: normalPipeline.getBindGroupLayout(0),
+        entries: [{binding: 0, resource: {buffer: buffers[5]}}, {binding: 1, resource: {buffer: buffers[6]}}]}));
+      normalBindGroup = normalsBound.value; await Promise.race([normalsBound.errors, lost]); live();
+    }
   } catch (error) { release(); throw error; }
   const attributes = [{shaderLocation: 0, offset: 0, format: 'float32x3'}];
-  if (source.normals) attributes.push({shaderLocation: 1, offset: 12, format: 'float32x3'});
+  if (source.normals || flatNormals) attributes.push({shaderLocation: 1, offset: 12, format: 'float32x3'});
   if (source.tangents) attributes.push({shaderLocation: 2, offset: 24, format: 'float32x4'});
   const vertexLayout = Object.freeze({arrayStride: 40, stepMode: 'vertex', attributes: Object.freeze(attributes.map(Object.freeze))});
   function update() {
@@ -277,6 +332,11 @@ export async function createGpuAnimationDeformer(device, pose, geometry, {
         const encoder = device.createCommandEncoder({label});
         const pass = encoder.beginComputePass({label});
         pass.setPipeline(pipeline); pass.setBindGroup(0, bindGroup); pass.dispatchWorkgroups(groupsX, groupsY); pass.end();
+        if (flatNormals) {
+          const normalsPass = encoder.beginComputePass({label: `${label}/flat-normals`});
+          normalsPass.setPipeline(normalPipeline); normalsPass.setBindGroup(0, normalBindGroup);
+          normalsPass.dispatchWorkgroups(normalGroupsX, normalGroupsY); normalsPass.end();
+        }
         const command = encoder.finish();
         if (skin) device.queue.writeBuffer(buffers[3], 0, palette);
         if (targetCount) device.queue.writeBuffer(buffers[4], 0, weights);

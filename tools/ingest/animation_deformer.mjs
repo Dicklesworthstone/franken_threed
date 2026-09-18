@@ -8,6 +8,10 @@
  * indices. Directions use the weighted skin matrix with w=0, as in the pinned
  * Three.js skinnormal_vertex chunk; they are not normalized here. The renderer
  * still applies its normal/model transforms and normalizes. Tangent w survives.
+ * flatNormals:true instead rebuilds unit face normals from the final Float32
+ * positions of independent, contiguous triangles, after morphing and skinning.
+ * Degenerate triangles receive zero normals. Shared/indexed vertex layouts,
+ * tangents and normal/tangent morph deltas cannot represent this flat contract.
  *
  * Outputs are mesh-local Float32 arrays with stable identities. worldMatrix is
  * the matching node-to-world transform; bounds encloses the published positions.
@@ -33,7 +37,7 @@ function storage(value, length, label) {
 /**
  * createAnimationDeformer(pose, {node, positions, normals?, tangents?,
  *   morphTargets?: [{positions?, normals?, tangents?}],
- *   joints?, weights?, influences?: 4}, {maxComponents?: 16777216})
+ *   joints?, weights?, influences?: 4, flatNormals?: false}, {maxComponents?: 16777216})
  *
  * positions/normals and morph deltas are XYZ; base tangents are XYZW. joints
  * and weights are vertex-major, with 1..32 influences per vertex. Weights must
@@ -58,6 +62,10 @@ export function createAnimationDeformer(pose, geometry, {maxComponents = 1677721
     fail('ANIMATION_DEFORM_GEOMETRY', 'Positions must contain a bounded, nonempty XYZ array');
   }
   const vertexCount = length / 3;
+  const {flatNormals = false} = geometry;
+  if (typeof flatNormals !== 'boolean' || (flatNormals && (vertexCount % 3 || geometry.tangents !== undefined))) {
+    fail('ANIMATION_DEFORM_NORMAL', 'flatNormals requires independent triangles without tangents');
+  }
   const palette = pose.jointMatrices, morphWeights = pose.morphWeights, worldMatrices = pose.worldMatrices;
   const paletteLength = palette?.length, morphLength = morphWeights?.length;
   storage(palette, paletteLength, 'Joint palette');
@@ -85,6 +93,11 @@ export function createAnimationDeformer(pose, geometry, {maxComponents = 1677721
   }
   const fields = [{name: 'positions', width: 3, base: copy(geometry.positions, length, 'Positions')}];
   if (geometry.normals !== undefined) fields.push({name: 'normals', width: 3, base: copy(geometry.normals, length, 'Normals')});
+  else if (flatNormals) {
+    consumed += length;
+    if (consumed > maxComponents) fail('ANIMATION_DEFORM_LIMIT', 'Generated normals exceed component budget');
+    fields.push({name: 'normals', width: 3, base: new Float64Array(length)});
+  }
   if (geometry.tangents !== undefined) {
     const base = copy(geometry.tangents, vertexCount * 4, 'Tangents');
     for (let vertex = 0; vertex < vertexCount; vertex++) {
@@ -97,6 +110,7 @@ export function createAnimationDeformer(pose, geometry, {maxComponents = 1677721
     if (!target || typeof target !== 'object' || Array.isArray(target)) fail('ANIMATION_DEFORM_MORPH', 'Invalid morph target');
     const result = {};
     for (const name of Object.keys(target)) {
+      if (flatNormals && name !== 'positions') fail('ANIMATION_DEFORM_NORMAL', 'Flat normals require position-only morph targets');
       if (!fieldNames.has(name)) fail('ANIMATION_DEFORM_MORPH', `Morph target ${name} lacks a supported base attribute`);
       result[name] = copy(target[name], length, `Morph ${name}`);
     }
@@ -134,6 +148,7 @@ export function createAnimationDeformer(pose, geometry, {maxComponents = 1677721
     field.scratch = new Float32Array(field.base.length);
     field.output = output[field.name] = new Float32Array(field.base.length);
   }
+  const flatNormalField = flatNormals ? fields.find(field => field.name === 'normals') : null;
   const worldMatrix = new Float64Array(16), nextWorld = new Float64Array(16);
   const minimum = new Float32Array(3), maximum = new Float32Array(3);
   const nextMin = new Float32Array(3), nextMax = new Float32Array(3);
@@ -163,34 +178,54 @@ export function createAnimationDeformer(pose, geometry, {maxComponents = 1677721
         if (palette[o + 3] !== 0 || palette[o + 7] !== 0 || palette[o + 11] !== 0 || palette[o + 15] !== 1) fail('ANIMATION_DEFORM_SKIN', 'Joint matrices must be affine');
       }
       nextMin.fill(Infinity); nextMax.fill(-Infinity);
-      for (const field of fields) for (let vertex = 0; vertex < vertexCount; vertex++) {
-        const a = vertex * field.width, d = vertex * 3;
-        let x = field.base[a], y = field.base[a + 1], z = field.base[a + 2];
-        for (let target = 0; target < deltas.length; target++) {
-          const values = deltas[target][field.name], weight = morphWeights[morphStart + target];
-          if (!values || weight === 0) continue;
-          x += weight * values[d]; y += weight * values[d + 1]; z += weight * values[d + 2];
-        }
-        if (skin) {
-          let sx = 0, sy = 0, sz = 0;
-          const w = field.name === 'positions' ? 1 : 0;
-          for (let k = 0; k < influences; k++) {
-            const i = vertex * influences + k, weight = weights[i];
-            if (weight === 0) continue;
-            const o = skin.offset + joints[i] * 16;
-            sx += weight * (palette[o] * x + palette[o + 4] * y + palette[o + 8] * z + w * palette[o + 12]);
-            sy += weight * (palette[o + 1] * x + palette[o + 5] * y + palette[o + 9] * z + w * palette[o + 13]);
-            sz += weight * (palette[o + 2] * x + palette[o + 6] * y + palette[o + 10] * z + w * palette[o + 14]);
+      for (const field of fields) {
+        if (field === flatNormalField) continue;
+        for (let vertex = 0; vertex < vertexCount; vertex++) {
+          const a = vertex * field.width, d = vertex * 3;
+          let x = field.base[a], y = field.base[a + 1], z = field.base[a + 2];
+          for (let target = 0; target < deltas.length; target++) {
+            const values = deltas[target][field.name], weight = morphWeights[morphStart + target];
+            if (!values || weight === 0) continue;
+            x += weight * values[d]; y += weight * values[d + 1]; z += weight * values[d + 2];
           }
-          x = sx; y = sy; z = sz;
+          if (skin) {
+            let sx = 0, sy = 0, sz = 0;
+            const w = field.name === 'positions' ? 1 : 0;
+            for (let k = 0; k < influences; k++) {
+              const i = vertex * influences + k, weight = weights[i];
+              if (weight === 0) continue;
+              const o = skin.offset + joints[i] * 16;
+              sx += weight * (palette[o] * x + palette[o + 4] * y + palette[o + 8] * z + w * palette[o + 12]);
+              sy += weight * (palette[o + 1] * x + palette[o + 5] * y + palette[o + 9] * z + w * palette[o + 13]);
+              sz += weight * (palette[o + 2] * x + palette[o + 6] * y + palette[o + 10] * z + w * palette[o + 14]);
+            }
+            x = sx; y = sy; z = sz;
+          }
+          field.scratch[a] = x; field.scratch[a + 1] = y; field.scratch[a + 2] = z;
+          if (field.width === 4) field.scratch[a + 3] = field.base[a + 3];
+          for (let axis = 0; axis < 3; axis++) {
+            const value = finite(field.scratch[a + axis], 'Deformed Float32 attribute');
+            if (field.name === 'positions') {
+              nextMin[axis] = Math.min(nextMin[axis], value);
+              nextMax[axis] = Math.max(nextMax[axis], value);
+            }
+          }
         }
-        field.scratch[a] = x; field.scratch[a + 1] = y; field.scratch[a + 2] = z;
-        if (field.width === 4) field.scratch[a + 3] = field.base[a + 3];
-        for (let axis = 0; axis < 3; axis++) {
-          const value = finite(field.scratch[a + axis], 'Deformed Float32 attribute');
-          if (field.name === 'positions') {
-            nextMin[axis] = Math.min(nextMin[axis], value);
-            nextMax[axis] = Math.max(nextMax[axis], value);
+      }
+      if (flatNormalField) {
+        const positions = fields[0].scratch, normals = flatNormalField.scratch;
+        // Final f32 positions bound edge products safely inside f64. Derive
+        // normals from exactly the positions that will be published, not rest
+        // normals transformed independently at three different skin weights.
+        for (let i = 0; i < length; i += 9) {
+          const ax = positions[i+3]-positions[i], ay = positions[i+4]-positions[i+1], az = positions[i+5]-positions[i+2];
+          const bx = positions[i+6]-positions[i], by = positions[i+7]-positions[i+1], bz = positions[i+8]-positions[i+2];
+          const x = ay*bz-az*by, y = az*bx-ax*bz, z = ax*by-ay*bx, magnitude = Math.hypot(x,y,z);
+          for (let vertex = 0; vertex < 3; vertex++) {
+            const offset = i + vertex * 3;
+            normals[offset] = magnitude ? x/magnitude : 0;
+            normals[offset+1] = magnitude ? y/magnitude : 0;
+            normals[offset+2] = magnitude ? z/magnitude : 0;
           }
         }
       }
