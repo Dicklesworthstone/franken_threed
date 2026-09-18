@@ -30,7 +30,15 @@
  * derivative frame. mapCoordinates supplies per-map UVs/local transforms; the
  * shared uvTransform applies afterwards. Lit scenes pass lighting to render(). Textures
  * stay caller-owned; material arrays/descriptors are snapshotted before awaits.
+ *
+ * Implicit scene draws render opaque/masked meshes first, preserving their
+ * relative order, then blended meshes back-to-front by projected node origin.
+ * Sorting is recomputed for each camera and current uploaded pose. Ties retain
+ * source order. An explicit frame.draws list always preserves caller order;
+ * sortObjects:false also preserves the original implicit list. Intersecting or
+ * unusually offset transparent geometry may need an explicit draw list.
  */
+import {createAnimationDrawOrder} from './animation_draw_order.mjs';
 import {createAnimationController} from './animation_controller.mjs';
 import {createGpuAnimationDeformer} from './animation_webgpu.mjs';
 import {createGpuAnimationRenderer, AnimationRenderError} from './animation_render.mjs';
@@ -38,13 +46,15 @@ const fail = (code, message) => { throw new AnimationRenderError(code, message);
 const TEXTURE_FIELDS = ['baseColorTexture', 'metallicRoughnessTexture', 'normalTexture', 'emissiveTexture'];
 
 export async function createGpuAnimationScene(device, pose, drawables, {
-  renderer: renderOptions = {}, deformer: deformOptions = {}, maxMeshes = 256, maxBytes = 256 * 1024 * 1024,
+  sortObjects = true, renderer: renderOptions = {}, deformer: deformOptions = {}, maxMeshes = 256, maxBytes = 256 * 1024 * 1024,
 } = {}) {
   if (!Number.isSafeInteger(maxMeshes) || maxMeshes < 1 || maxMeshes > 4096 ||
       !Number.isSafeInteger(maxBytes) || maxBytes < 1 || !Array.isArray(drawables) ||
       !drawables.length || drawables.length > maxMeshes) fail('ANIMATION_SCENE_LIMIT', 'Invalid mesh count or GPU buffer budget');
+  if (typeof sortObjects !== 'boolean') fail('ANIMATION_SCENE_SORT', 'sortObjects must be boolean');
   const controller = createAnimationController(pose), initialVersion = pose.version;
-  const deformers = [], meshes = [];
+  const deformers = [], meshes = [], ordering = [];
+  let drawOrder;
   let renderer, deformationBytes = 0, poseVersion = initialVersion, disposed = false, terminal = null, busy = false;
   let lightingAllocated = false, materialComponents = 0;
   function copyMaterialArray(value, key) {
@@ -136,8 +146,10 @@ export async function createGpuAnimationScene(device, pose, drawables, {
         maxBytes: Math.min(remaining, deformOptions.maxBytes ?? 128 * 1024 * 1024)});
       deformers.push(gpu); deformationBytes += gpu.bufferBytes; unchanged();
       meshes.push(await renderer.addMesh(gpu, material)); lightingAllocated ||= lit; unchanged();
+      ordering.push({mesh: meshes.at(-1), deformer: gpu, alphaMode: material.alphaMode});
       if (renderer.allocatedBytes + deformationBytes > maxBytes) fail('ANIMATION_SCENE_LIMIT', 'Scene GPU buffer budget exceeded');
     }
+    if (sortObjects) drawOrder = createAnimationDrawOrder(ordering);
   } catch (error) { release(); throw error; }
   function exclusive(operation) {
     live(); if (busy) fail('ANIMATION_SCENE_REENTRANT', 'GPU scene operation cannot be reentered');
@@ -167,7 +179,11 @@ export async function createGpuAnimationScene(device, pose, drawables, {
     upload() { return exclusive(upload); },
     render(frame) { return exclusive(() => {
       synchronized();
-      try { renderer.render({...frame, draws: frame?.draws ?? meshes}); }
+      try {
+        const prepared = {...frame};
+        prepared.draws ??= drawOrder ? drawOrder.order(prepared.viewProjection) : meshes;
+        renderer.render(prepared);
+      }
       catch (error) { if (renderer.failed) failGroup(error); throw error; }
       return scene;
     }); },
