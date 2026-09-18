@@ -1,6 +1,6 @@
 /** URL/GLB -> owned textures + the existing animated WebGPU scene. No second
- * renderer, clock, scheduler or placeholder drawables. Camera, attachments,
- * lighting and the application's frame loop remain explicit and caller-owned.
+ * renderer, clock, scheduler or placeholder drawables. Attachments and the frame
+ * loop remain caller-owned; authored cameras/lights are available explicitly.
  */
 import {loadGltfAsset,GltfAssetError} from './gltf_asset.mjs';
 import {prepareGltfAnimationModel} from './animation_model.mjs';
@@ -41,13 +41,15 @@ export async function loadGpuGltfAnimationScene(device,source,{
     try{operation();return result;}
     catch(error){if(model.failed||resources.failed)release();throw error;}
   }
-  const result=Object.freeze({pose:model.pose,controller:model.controller,draws:model.draws,deformers:model.deformers,
+  const result=Object.freeze({pose:model.pose,view:model.view,cameras:model.cameras,lights:model.lights,
+    controller:model.controller,draws:model.draws,deformers:model.deformers,
     source:model.source,diagnostics:model.diagnostics,assetBytes:asset.bytesLoaded,
     get poseVersion(){return model.poseVersion;},get bufferBytes(){return model.bufferBytes;},
     get textureBytes(){return resources.textureBytes;},get disposed(){return model.disposed;},
     get failed(){return model.failed||resources.failed;},
     update(dt,settings){return invoke(()=>model.update(dt,settings));},
     upload(){return invoke(()=>model.upload());},render(frame){return invoke(()=>model.render(frame));},
+    renderCamera(frame,settings){return invoke(()=>model.renderCamera(frame,settings));},
     async whenIdle(){
       checkTextures();
       try{await model.whenIdle();checkTextures();return result;}

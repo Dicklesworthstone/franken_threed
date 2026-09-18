@@ -113,8 +113,9 @@ background polling or independent task scheduler. Source node/mesh/primitive IDs
 and the existing scene's controller, update/upload/render/whenIdle API are retained.
 `assetBytes`, `textureBytes` and `bufferBytes` expose the separate storage counts.
 
-The returned model owns its newly created pose, scene buffers and uploaded
-textures. It does not own the device, render attachments, camera or lighting.
+The returned model owns its newly created pose, scene buffers, uploaded textures
+and decoded camera/light metadata. It does not own the device, render attachments
+or caller-supplied external cameras and lighting.
 Initialization/upload failures and cooperative construction cancellation release
 all owned resources. A late ImageBitmap or scene initialization result is disposed
 before cancellation rejects. Recoverable frame errors leave resources usable;
@@ -122,6 +123,38 @@ terminal scene/texture failures release them. Device loss immediately releases
 textures and is surfaced on the next model operation. `dispose()` is idempotent,
 and a scene's rejection of reentrant disposal does not prematurely free textures.
 The construction signal does not automatically dispose an already returned model.
+
+## Render through an authored camera
+
+Loaded GPU models expose `cameras`, `lights`, `view` and `renderCamera`:
+
+```js
+// For an asset with a selected-scene camera; choose its original node ID.
+const cameraNode = model.cameras[0].node;
+model.update(deltaSeconds);
+model.renderCamera({ colorView, depthView }, {
+  cameraNode,
+  aspectRatio: width / height,
+});
+```
+
+This uses the current animated camera pose and all selected-scene punctual lights
+without manually constructing projection matrices or copying light transforms.
+Perspective (finite/infinite far) and orthographic projections use WebGPU depth.
+`aspectRatio` supplies a viewport ratio only when the camera does not author one;
+match or letterbox the render target for fixed-aspect/orthographic cameras.
+Models with multiple cameras require explicit `cameraNode` selection. Models
+without cameras continue to use `render(frame)` with an external view. To use
+imported lights with an external camera, call `model.view.sampleLights()` and
+supply that array in the external frame's lighting descriptor.
+
+`renderCamera` supplies both `viewProjection` and `lighting`, and rejects frames
+that also specify either field rather than silently overriding them. After direct
+`model.pose.sample(...)` or `blend(...)`, call `model.upload()` before rendering;
+stale camera/mesh poses are refused. Source camera/light metadata is validated
+before image requests or GPU allocation. The CPU model factory exposes the same
+`view`, `cameras` and `lights` metadata without a GPU or render method. See
+GLTF_SCENE_VIEW.md for the transformation convention, limits and test boundaries.
 
 ## Native images, sampling and mipmaps
 
@@ -173,9 +206,10 @@ The new owning loader inherits the model/renderer route's explicit restrictions:
 triangle geometry, supported core direct-light/unlit materials, one shared UV
 set/transform across maps, source tangents for normal maps, and normals for
 deforming geometry. Unsupported codecs/extensions and occlusion still require
-the source loader/backend. It does not add environment lighting, camera/light
-extraction, tone mapping, automatic transparency sorting or complete glTF/Three.js
-compatibility. HTTP loading still uses the credential-free origin policy above.
+the source loader/backend. Authored cameras and up to eight KHR_lights_punctual
+instances are supported; see GLTF_SCENE_VIEW.md. Environment lighting, shadows,
+tone mapping, automatic transparency sorting and complete glTF/Three.js parity
+remain outside this route. HTTP loading still uses the credential-free origin policy above.
 
 Run the focused host checks with:
 

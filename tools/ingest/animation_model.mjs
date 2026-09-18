@@ -2,8 +2,9 @@
  * glTF JSON + supplied buffers -> ready-to-use animation drawables / CPU meshes.
  * Reuses the pose decoder and mesh decoder; does not fetch assets or decode images.
  * Materials use the explicit direct-light metallic-roughness or KHR_materials_unlit
- * renderer profile, not full Three.js/PBR equivalence. Caller provides camera,
- * lighting, texture uploads/mips and transparent ordering. No IBL/occlusion route.
+ * renderer profile, not full Three.js/PBR equivalence. Authored cameras and punctual
+ * lights are decoded with the model; callers still own texture uploads/mips,
+ * attachments and transparent ordering. No IBL/occlusion route.
  *
  * resolveTexture({textureIndex,imageIndex,image,sampler,colorSpace}) synchronously
  * lends {view,sampler}. It must honor the source image/sampler and 'srgb'/'linear'
@@ -19,6 +20,8 @@ import {decodeGltfAnimation} from './animation_gltf.mjs';
 import {decodeGltfGeometry} from './animation_geometry.mjs';
 import {AnimationPoseError, createAnimationPlayer} from './animation_runtime.mjs';
 import {createAnimationDeformer} from './animation_deformer.mjs';
+import {decodeGltfSceneView,createGltfSceneView} from './gltf_scene_view.mjs';
+export {createGltfSceneView,GltfSceneViewError} from './gltf_scene_view.mjs';
 const fail = (code, message) => { throw new AnimationPoseError('GLTF_MODEL_' + code, message); };
 const object = (v, label) => {
   if (!v || typeof v !== 'object' || Array.isArray(v)) fail('SHAPE', `Expected ${label} object`);
@@ -154,7 +157,8 @@ export function prepareGltfAnimationModel(model,suppliedBuffers,{
   scene=model?.scene ?? 0,maxComponents=16777216,maxPrimitives=4096,
 }={}) {
   if (!Array.isArray(model?.extensionsRequired ?? [])) fail('SHAPE','extensionsRequired must be an array');
-  for (const name of model?.extensionsRequired ?? []) if (!['KHR_materials_unlit','KHR_texture_transform'].includes(name)) fail('UNSUPPORTED',`Required extension needs source route: ${name}`);
+  for (const name of model?.extensionsRequired ?? []) if (!['KHR_materials_unlit','KHR_texture_transform','KHR_lights_punctual'].includes(name)) fail('UNSUPPORTED',`Required extension needs source route: ${name}`);
+  const sceneView=decodeGltfSceneView(model,{scene});
   const loaded=new Map();
   const buffer=i=>{
     if (!loaded.has(i)) loaded.set(i,typeof suppliedBuffers==='function'?suppliedBuffers(i):suppliedBuffers?.[i]);
@@ -165,18 +169,18 @@ export function prepareGltfAnimationModel(model,suppliedBuffers,{
   const plans=geometry.primitives.map(p=>materialPlan(model,p)),unique=new Map();
   for(const plan of plans)for(const {request}of plan.requests)unique.set(request.textureIndex+':'+request.colorSpace,request);
   let busy=false,consumed=false;
-  return Object.freeze({textureRequests:Object.freeze([...unique.values()]),
+  return Object.freeze({sceneView,textureRequests:Object.freeze([...unique.values()]),
     resolveTextures(resolveTexture=null) {
       if(consumed)fail('PREPARED','Prepared model has already been resolved');
       if(busy)fail('REENTRANT','Texture resolution cannot be reentered');
       if(resolveTexture!==null&&typeof resolveTexture!=='function')fail('TEXTURE','resolveTexture must be a function');
       busy=true;
-      try {const result=resolveModelTextures(definition,geometry,plans,resolveTexture);consumed=true;return result;}
+      try {const result=resolveModelTextures(definition,geometry,plans,resolveTexture,sceneView);consumed=true;return result;}
       finally {busy=false;}
     },
   });
 }
-function resolveModelTextures(definition,geometry,plans,resolveTexture) {
+function resolveModelTextures(definition,geometry,plans,resolveTexture,sceneView) {
   if (plans.some(p=>p.requests.length) && resolveTexture===null) fail('TEXTURE','Textured materials require an explicit loaded-texture resolver');
   const resolved=new Map();
   for (const plan of plans) for (const {field,request} of plan.requests) {
@@ -196,7 +200,7 @@ function resolveModelTextures(definition,geometry,plans,resolveTexture) {
     }
     plan.drawable[field]=resolved.get(key);
   }
-  return {definition,drawables:plans.map(p=>p.drawable),
+  return {definition,sceneView,drawables:plans.map(p=>p.drawable),
     source:geometry.primitives.map(p=>({node:p.node,mesh:p.mesh,primitive:p.primitive,material:p.material})),
     diagnostics:geometry.diagnostics,scene:geometry.scene,execution:'javascript-cpu-decode',accelerationClaim:false};
 }
@@ -209,9 +213,12 @@ function resolveModelTextures(definition,geometry,plans,resolveTexture) {
  */
 export function createCpuGltfAnimationModel(model, suppliedBuffers, options={}) {
   const decoded=decodeGltfAnimationModel(model,suppliedBuffers,options), pose=createAnimationPlayer(decoded.definition), deformers=[];
-  let disposed=false,terminal=null,busy=false;
+  let disposed=false,terminal=null,busy=false,view;
   const release=()=>{for(const mesh of deformers)mesh.dispose();pose.dispose();};
-  try {for(const drawable of decoded.drawables)deformers.push(createAnimationDeformer(pose,drawable.geometry,{maxComponents:options.maxComponents}));}
+  try {
+    view=createGltfSceneView(pose,decoded.sceneView);
+    for(const drawable of decoded.drawables)deformers.push(createAnimationDeformer(pose,drawable.geometry,{maxComponents:options.maxComponents}));
+  }
   catch(error){release();throw error;}
   function live() {
     if(disposed)fail('DISPOSED','Model has been disposed');
@@ -227,7 +234,7 @@ export function createCpuGltfAnimationModel(model, suppliedBuffers, options={}) 
     live();if(busy)fail('REENTRANT','Model operation cannot be reentered');busy=true;
     try{return operation();}finally{busy=false;}
   }
-  const result=Object.freeze({pose,drawables:Object.freeze(decoded.drawables),deformers:Object.freeze(deformers),
+  const result=Object.freeze({pose,view,cameras:view.cameras,lights:view.lights,drawables:Object.freeze(decoded.drawables),deformers:Object.freeze(deformers),
     source:Object.freeze(decoded.source),diagnostics:Object.freeze(decoded.diagnostics),
     sample(time,settings){return exclusive(()=>{pose.sample(time,settings);return update();});},
     reset(){return exclusive(()=>{pose.reset();return update();});},update(){return exclusive(update);},

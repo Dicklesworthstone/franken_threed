@@ -73,3 +73,51 @@ These host tests verify source metadata selection, matrices and light descriptor
 against independently known results. They do not execute a native GPU or assert
 pixel parity. The pose boundary is supplied packed world matrices in these tests;
 actual animation/model integration is a separate check.
+
+## Integrated model APIs
+
+Both `createCpuGltfAnimationModel` and the GPU model factories expose `view`,
+`cameras` and `lights`. The owning `loadGpuGltfAnimationScene` URL/GLB entry exposes
+them too. Model preparation snapshots `sceneView` metadata before reading binary
+accessors or invoking texture resolvers; `KHR_lights_punctual` is accepted as a
+required extension only through this validated model route. The existing pose
+sampler still rejects animation-pointer extensions for camera/light properties.
+`animation_model.mjs` also re-exports `createGltfSceneView` and its error type for
+applications binding a decoded model to an existing pose.
+
+GPU models provide the explicit convenience method:
+
+```js
+model.update(deltaSeconds);
+model.renderCamera({ colorView, depthView }, {
+  cameraNode: model.cameras[0].node,
+  aspectRatio: width / height,
+});
+```
+
+This fills the existing renderer's `viewProjection` and `lighting` fields from one
+current pose sample. It does not replace the original `render(frame)` method or
+implicitly choose an external camera. Supplying either generated field to
+`renderCamera` is an error; custom lighting or mixed source/external views can use
+`model.view.sample(...)` / `sampleLights()` and the original `render(frame)`.
+Explicit camera rendering rejects a pose version that has not been uploaded to
+the scene. Camera/frame getters cannot reenter, update or dispose the GPU model
+during frame preparation. Recoverable view errors publish no draw and retain
+resources; existing terminal GPU failures still dispose the model-owned pose.
+A legacy geometry-only decoded payload without `sceneView` still constructs a
+GPU model with empty camera/light lists and uses external rendering as before.
+
+```sh
+node --test tools/ingest/gltf_scene_view.test.mjs \
+  tools/ingest/gltf_scene_view_model.test.mjs \
+  tools/ingest/animation_model.test.mjs
+```
+
+The model integration suite exercises production accessor/material decoding,
+animation sampling/blending, root/parent transforms and CPU deformation. Its GPU
+scene is a test boundary; the two owning-loader seam tests also replace unchanged
+asset transport and native texture preparation. Those tests verify forwarding and
+preflight ordering, not HTTP/image decoding, shader execution or pixel equivalence.
+The original model regression suite runs unchanged, including morph-plus-skin and
+32-influence CPU skinning. Native browser/GPU and full-workspace gates are separate
+from these focused host checks.
