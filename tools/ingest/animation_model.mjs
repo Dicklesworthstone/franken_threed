@@ -20,6 +20,8 @@ import {decodeGltfAnimation} from './animation_gltf.mjs';
 import {decodeGltfGeometry} from './animation_geometry.mjs';
 import {AnimationPoseError, createAnimationPlayer} from './animation_runtime.mjs';
 import {createAnimationDeformer} from './animation_deformer.mjs';
+import {createAnimationModelPicker} from './animation_model_pick.mjs';
+export {createAnimationModelPicker,AnimationRaycastError} from './animation_model_pick.mjs';
 import {decodeGltfSceneView,createGltfSceneView} from './gltf_scene_view.mjs';
 export {createGltfSceneView,GltfSceneViewError} from './gltf_scene_view.mjs';
 const fail = (code, message) => { throw new AnimationPoseError('GLTF_MODEL_' + code, message); };
@@ -210,14 +212,17 @@ function resolveModelTextures(definition,geometry,plans,resolveTexture,sceneView
  * preserve the last model. A later deformation failure is terminal for the group,
  * not a successful partial publication. Original data and textures are never owned.
  * Direct pose edits/sampling require update() before consuming mesh outputs.
+ * Opt in with picking:true (or picking limits) for raycast() and pick().
  */
 export function createCpuGltfAnimationModel(model, suppliedBuffers, options={}) {
-  const decoded=decodeGltfAnimationModel(model,suppliedBuffers,options), pose=createAnimationPlayer(decoded.definition), deformers=[];
-  let disposed=false,terminal=null,busy=false,view;
-  const release=()=>{for(const mesh of deformers)mesh.dispose();pose.dispose();};
+  const {picking=false,...decodeOptions}=options;
+  const decoded=decodeGltfAnimationModel(model,suppliedBuffers,decodeOptions), pose=createAnimationPlayer(decoded.definition), deformers=[];
+  let disposed=false,terminal=null,busy=false,view,picker;
+  const release=()=>{picker?.dispose();for(const mesh of deformers)mesh.dispose();pose.dispose();};
   try {
     view=createGltfSceneView(pose,decoded.sceneView);
-    for(const drawable of decoded.drawables)deformers.push(createAnimationDeformer(pose,drawable.geometry,{maxComponents:options.maxComponents}));
+    for(const drawable of decoded.drawables)deformers.push(createAnimationDeformer(pose,drawable.geometry,{maxComponents:decodeOptions.maxComponents}));
+    picker=createAnimationModelPicker(pose,view,decoded.drawables,decoded.source,picking,deformers);
   }
   catch(error){release();throw error;}
   function live() {
@@ -238,6 +243,9 @@ export function createCpuGltfAnimationModel(model, suppliedBuffers, options={}) 
     source:Object.freeze(decoded.source),diagnostics:Object.freeze(decoded.diagnostics),
     sample(time,settings){return exclusive(()=>{pose.sample(time,settings);return update();});},
     reset(){return exclusive(()=>{pose.reset();return update();});},update(){return exclusive(update);},
+    get pickingEnabled(){return picker.enabled;},get pickingStats(){return picker.lastQuery;},
+    raycast(ray,settings){return exclusive(()=>picker.raycast(ray,settings));},
+    pick(ndc,cameraSettings,querySettings){return exclusive(()=>picker.pick(ndc,cameraSettings,querySettings));},
     get disposed(){return disposed;},get failed(){return terminal!==null;},
     dispose(){if(busy)fail('REENTRANT','Cannot dispose during model operation');if(!disposed){release();disposed=true;}},
   });

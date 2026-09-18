@@ -1,6 +1,7 @@
 /** URL/GLB -> owned textures + the existing animated WebGPU scene. No second
  * renderer, clock, scheduler or placeholder drawables. Attachments and the frame
  * loop remain caller-owned; authored cameras/lights are available explicitly.
+ * picking:true opts in to synchronous current-pose geometric selection.
  */
 import {loadGltfAsset,GltfAssetError} from './gltf_asset.mjs';
 import {prepareGltfAnimationModel} from './animation_model.mjs';
@@ -15,7 +16,7 @@ const abort=signal=>{if(signal?.aborted)throw signal.reason ?? new DOMException(
  * createGpuGltfAnimationScene API, not this owning loader.
  */
 export async function loadGpuGltfAnimationScene(device,source,{
-  assets={},decode={},textures={},scene={},signal=assets.signal ?? textures.signal,
+  assets={},decode={},textures={},scene={},picking=false,signal=assets.signal ?? textures.signal,
 }={}) {
   if(decode.resolveTexture!=null)throw new GltfAssetError('GLTF_MODEL_LOAD_OPTIONS','The owning loader supplies resolveTexture');
   for(const nested of [assets.signal,textures.signal])if(nested!==undefined&&nested!==signal)throw new GltfAssetError('GLTF_MODEL_LOAD_OPTIONS','Use one construction AbortSignal');
@@ -26,7 +27,7 @@ export async function loadGpuGltfAnimationScene(device,source,{
   try {
     resources=await createGltfTextureResources(device,prepared.textureRequests,asset.readImage,{...textures,signal});
     abort(signal);
-    model=await createGpuDecodedAnimationScene(device,prepared.resolveTextures(resources.resolveTexture),scene);
+    model=await createGpuDecodedAnimationScene(device,prepared.resolveTextures(resources.resolveTexture),{...scene,picking});
     abort(signal);
   } catch(error) {
     try{model?.dispose();}finally{resources?.dispose();}
@@ -36,17 +37,21 @@ export async function loadGpuGltfAnimationScene(device,source,{
   function checkTextures(){
     if(resources.failed){release();throw new GltfTextureError('GLTF_TEXTURE_DEVICE_LOST','Model texture device was lost');}
   }
-  function invoke(operation) {
+  function query(operation) {
     checkTextures();
-    try{operation();return result;}
+    try{return operation();}
     catch(error){if(model.failed||resources.failed)release();throw error;}
   }
+  function invoke(operation){query(operation);return result;}
   const result=Object.freeze({pose:model.pose,view:model.view,cameras:model.cameras,lights:model.lights,
     controller:model.controller,draws:model.draws,deformers:model.deformers,
     source:model.source,diagnostics:model.diagnostics,assetBytes:asset.bytesLoaded,
     get poseVersion(){return model.poseVersion;},get bufferBytes(){return model.bufferBytes;},
     get textureBytes(){return resources.textureBytes;},get disposed(){return model.disposed;},
     get failed(){return model.failed||resources.failed;},
+    get pickingEnabled(){return model.pickingEnabled;},get pickingStats(){return model.pickingStats;},
+    raycast(ray,settings){return query(()=>model.raycast(ray,settings));},
+    pick(ndc,cameraSettings,querySettings){return query(()=>model.pick(ndc,cameraSettings,querySettings));},
     update(dt,settings){return invoke(()=>model.update(dt,settings));},
     upload(){return invoke(()=>model.upload());},render(frame){return invoke(()=>model.render(frame));},
     renderCamera(frame,settings){return invoke(()=>model.renderCamera(frame,settings));},

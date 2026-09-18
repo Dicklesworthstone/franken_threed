@@ -86,3 +86,134 @@ lifecycle failures. A deterministic 256-triangle, 100-ray comparison uses an
 independent Moller-Trumbore brute-force oracle rather than the production
 shear-edge intersection routine. The tests supply CPU deformation outputs; they
 do not establish animation-factory integration, GPU execution or pixel parity.
+
+## Pick loaded models
+
+CPU models, decoded GPU models, and the owning URL/GLB loader now provide the
+same `raycast(ray, queryOptions)` and `pick(ndc, cameraOptions, queryOptions)`
+methods. Enable the feature at construction; it is **off by default** so existing
+render-only loads do not acquire extra CPU geometry storage or picking limits.
+
+```js
+import { loadGpuGltfAnimationScene } from './gltf_scene_loader.mjs';
+
+const model = await loadGpuGltfAnimationScene(device, modelURL, {
+  picking: true,
+  // Existing assets/decode/textures/scene options are unchanged.
+  scene: { renderer: { format: 'rgba8unorm-srgb' } },
+});
+
+// Within the application's existing frame loop, advance animated models as usual.
+model.update(deltaSeconds);
+model.renderCamera({ colorView, depthView }, {
+  cameraNode: model.cameras[0].node,
+  aspectRatio: width / height,
+});
+
+// Within an application-owned pointer handler, for a viewport filling the canvas:
+const rect = canvas.getBoundingClientRect();
+const ndc = [
+  2 * (event.clientX - rect.left) / rect.width - 1,
+  1 - 2 * (event.clientY - rect.top) / rect.height,
+];
+const hits = model.pick(ndc, {
+  cameraNode: model.cameras[0].node,
+  aspectRatio: width / height,
+}, { firstHitOnly: true });
+const selected = hits[0]; // undefined on a miss
+// selected.source identifies the original node/mesh/primitive/material.
+// selected.point, normal, barycentric and optional uv are independent snapshots.
+
+model.dispose(); // also releases the model's picking state
+```
+
+For letterboxed/sub-viewports, calculate NDC against the actual rendered viewport,
+not the whole canvas. The library does not register events, capture pointers,
+change focus, own selection state, or add an animation loop. A model without an
+authored camera can use `raycast` with a ray from its application's external camera.
+`pick` consumes the current `view.sample()` camera contract, including its explicit
+camera-node selection and viewport-aspect requirements. Camera clip planes are
+not converted to ray distance filters; use `raycast` with explicit `near`/`far`
+when those are needed. Queries still test geometry rather than alpha-masked pixels.
+
+The CPU factory takes the same opt-in at its top level:
+
+```js
+const cpuModel = createCpuGltfAnimationModel(json, buffers, { picking: true });
+cpuModel.sample(timeSeconds, { clip: 0 });
+const hits = cpuModel.raycast({ origin, direction }, { firstHitOnly: true });
+```
+
+`createGpuGltfAnimationScene(device, json, buffers, { picking: true, ... })` and
+`createGpuDecodedAnimationScene(device, decoded, { picking: true, ... })` also
+support it. `pickingEnabled` reports the construction choice; a disabled query
+throws `ANIMATION_PICK_DISABLED`, not a misleading empty hit list. `pickingStats`
+reports the last successful query's counts and pose version, or null before any
+successful query and after disposal. Query failures do not overwrite those stats.
+The existing fluent update/upload/render methods still return the model; queries
+return hit arrays, including through the owning loader.
+
+### CPU materialization and ownership
+
+CPU models reuse their existing deformer outputs without evaluating them again.
+After direct `cpuModel.pose.sample(...)` or `blend(...)`, call `cpuModel.update()`
+before querying. GPU models require `model.upload()` after direct pose sampling;
+queries against unuploaded CPU poses are refused, just like camera rendering.
+Normal `model.update(...)` already samples and uploads through the existing path.
+
+Enabled GPU models snapshot position-only source geometry, skin attributes, morph
+position deltas, selected material UVs, indices and source IDs before asynchronous
+scene initialization yields. The first query creates private CPU deformers using
+the existing CPU reference implementation; subsequent queries update them only
+when the pose version changes. Normals/tangents, textures and GPU buffers are not
+copied for selection. Morph targets that affect only normals preserve their target
+slot without adding a position delta. No CPU deformation is added to render/update
+calls, and no synchronous or asynchronous GPU readback is performed.
+
+This deliberately uses the CPU reference deformation profile, including Float32
+published positions, **not a promise of bit-identical GPU f32 shader results**.
+Application shader displacement, render-only world/side/index-range overrides and
+alpha coverage remain outside this geometric selection path. Use explicit query
+draw selection where the application renders only some registered meshes.
+
+A picking limits object can replace `true`:
+
+```js
+picking: {
+  maxComponents: 16 * 1024 * 1024,
+  maxTriangles: 1024 * 1024,
+  maxBytes: 128 * 1024 * 1024,
+}
+```
+
+`maxComponents` bounds the aggregate retained source-copy components of an enabled
+GPU model, including position/skin/morph/UV/index snapshots; it is not charged
+against already-owned CPU model deformers. Each private CPU deformer retains its
+existing separate component/output accounting. `maxTriangles` and `maxBytes`
+belong to the BVH/topology layer described above; its allocations are validated
+when that layer is created (the first query for GPU models). A query-time budget
+failure leaves rendering usable. Source copies, CPU deformation scratch/output,
+BVH storage, and JS objects are separate allocations, not one global memory cap.
+
+Disposal releases the picker and its privately owned CPU deformers, never a
+borrowed device, texture or application pose. Model-owned poses still follow the
+existing model lifecycle. Terminal scene/completion failures and owning-loader
+texture loss release picking state too. Recoverable camera/ray/budget errors do
+not destroy the model; getter reentry cannot update or dispose it mid-query.
+
+### Integrated verification
+
+```sh
+node --test tools/ingest/animation_raycast.test.mjs \
+  tools/ingest/animation_model_pick.test.mjs \
+  tools/ingest/animation_model.test.mjs
+```
+
+The model integration tests execute production glTF accessor/geometry/material
+decoding, pose animation/blending, morph-before-skin CPU deformation, camera
+sampling, BVH refits and triangle queries. GPU-scene construction/submission is an
+explicit test boundary. Four owning-loader seam tests also replace unchanged
+asset transport and native texture preparation. They verify forwarding and
+ownership, not native HTTP/image/GPU execution or pixel parity. The original model
+regression suite runs unchanged, including its 32-influence CPU skinning case.
+These focused checks are not a full-workspace/browser certification.
