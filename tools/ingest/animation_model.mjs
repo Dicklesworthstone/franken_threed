@@ -21,6 +21,8 @@ import {decodeGltfAnimation} from './animation_gltf.mjs';
 import {decodeGltfGeometry} from './animation_geometry.mjs';
 import {AnimationPoseError, createAnimationPlayer} from './animation_runtime.mjs';
 import {createAnimationDeformer} from './animation_deformer.mjs';
+import {createAnimationModelExporter} from './animation_model_export.mjs';
+export {createAnimationModelExporter,AnimationExportError} from './animation_model_export.mjs';
 import {createAnimationModelPicker} from './animation_model_pick.mjs';
 export {createAnimationModelPicker,AnimationRaycastError} from './animation_model_pick.mjs';
 import {decodeGltfSceneView,createGltfSceneView} from './gltf_scene_view.mjs';
@@ -170,6 +172,8 @@ export function prepareGltfAnimationModel(model,suppliedBuffers,{
   if (!Array.isArray(model?.extensionsRequired ?? [])) fail('SHAPE','extensionsRequired must be an array');
   for (const name of model?.extensionsRequired ?? []) if (!['KHR_materials_unlit','KHR_texture_transform','KHR_lights_punctual'].includes(name)) fail('UNSUPPORTED',`Required extension needs source route: ${name}`);
   const sceneView=decodeGltfSceneView(model,{scene});
+  const copyright=model.asset?.copyright;
+  if(copyright!==undefined && typeof copyright!=='string')fail('SHAPE','Asset copyright must be text');
   const loaded=new Map();
   const buffer=i=>{
     if (!loaded.has(i)) loaded.set(i,typeof suppliedBuffers==='function'?suppliedBuffers(i):suppliedBuffers?.[i]);
@@ -187,7 +191,7 @@ export function prepareGltfAnimationModel(model,suppliedBuffers,{
       if(busy)fail('REENTRANT','Texture resolution cannot be reentered');
       if(resolveTexture!==null&&typeof resolveTexture!=='function')fail('TEXTURE','resolveTexture must be a function');
       busy=true;
-      try {const result=resolveModelTextures(definition,geometry,plans,resolveTexture,sceneView);consumed=true;return result;}
+      try {const result=resolveModelTextures(definition,geometry,plans,resolveTexture,sceneView);consumed=true;return {...result,copyright};}
       finally {busy=false;}
     },
   });
@@ -223,16 +227,18 @@ function resolveModelTextures(definition,geometry,plans,resolveTexture,sceneView
  * not a successful partial publication. Original data and textures are never owned.
  * Direct pose edits/sampling require update() before consuming mesh outputs.
  * Opt in with picking:true (or picking limits) for raycast() and pick().
+ * exporting:true enables asynchronous static posed GLB export; see ANIMATION_POSE_EXPORT.md.
  */
 export function createCpuGltfAnimationModel(model, suppliedBuffers, options={}) {
-  const {picking=false,...decodeOptions}=options;
+  const {picking=false,exporting=false,...decodeOptions}=options;
   const decoded=decodeGltfAnimationModel(model,suppliedBuffers,decodeOptions), pose=createAnimationPlayer(decoded.definition), deformers=[];
-  let disposed=false,terminal=null,busy=false,view,picker;
-  const release=()=>{picker?.dispose();for(const mesh of deformers)mesh.dispose();pose.dispose();};
+  let disposed=false,terminal=null,busy=false,view,picker,exporter;
+  const release=()=>{exporter?.dispose();picker?.dispose();for(const mesh of deformers)mesh.dispose();pose.dispose();};
   try {
     view=createGltfSceneView(pose,decoded.sceneView);
     for(const drawable of decoded.drawables)deformers.push(createAnimationDeformer(pose,drawable.geometry,{maxComponents:decodeOptions.maxComponents}));
     picker=createAnimationModelPicker(pose,view,decoded.drawables,decoded.source,picking,deformers);
+    exporter=createAnimationModelExporter(pose,decoded.drawables,decoded.source,exporting,deformers,decoded.copyright);
   }
   catch(error){release();throw error;}
   function live() {
@@ -253,6 +259,8 @@ export function createCpuGltfAnimationModel(model, suppliedBuffers, options={}) 
     source:Object.freeze(decoded.source),diagnostics:Object.freeze(decoded.diagnostics),
     sample(time,settings){return exclusive(()=>{pose.sample(time,settings);return update();});},
     reset(){return exclusive(()=>{pose.reset();return update();});},update(){return exclusive(update);},
+    get exportingEnabled(){return exporter.enabled;},
+    exportPoseGLB(settings){return exclusive(()=>exporter.exportPoseGLB(settings));},
     get pickingEnabled(){return picker.enabled;},get pickingStats(){return picker.lastQuery;},
     raycast(ray,settings){return exclusive(()=>picker.raycast(ray,settings));},
     pick(ndc,cameraSettings,querySettings){return exclusive(()=>picker.pick(ndc,cameraSettings,querySettings));},

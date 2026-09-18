@@ -243,7 +243,8 @@ test('coordinate variants do not collide and reuse texture bindings without plac
   r.render(frame([a]));r.render(frame([b]));const [x,y]=d.submissions;
   assert.notEqual(x.pipeline,y.pipeline);assert.equal(x.pipeline.layout.bindGroupLayouts[1],y.pipeline.layout.bindGroupLayouts[1]);
   assert.ok(x.pipeline.fragment.module.code.includes('dpdx(input.uv_2)'));assert.ok(y.pipeline.fragment.module.code.includes('dpdx(input.uv)'));
-  const count=d.pipelines.length;await r.addMesh(geometry(false),{...m,mapCoordinates:{normalTexture:{texCoords:uv()}}});assert.equal(d.pipelines.length,count);r.dispose();
+  const count=d.pipelines.length;await r.addMesh(geometry(false),{...m,mapCoordinates:{normalTexture:{texCoords:uv()}}});assert.equal(d.pipelines.length,count);
+  r.dispose();
 });
 
 test('invalid independent coordinates and capability limits fail before mesh allocation',async()=>{
@@ -286,6 +287,7 @@ const modelBoundaries = {
   'animation_geometry.mjs':moduleURL('export function decodeGltfGeometry(model){return structuredClone(model.fixtureGeometry);}'),
   'animation_runtime.mjs':poseModule,
   'animation_deformer.mjs':moduleURL(unused('createAnimationDeformer')),
+  'animation_model_export.mjs':moduleURL(unused('createAnimationModelExporter')+' export class AnimationExportError extends Error{}'),
   'animation_model_pick.mjs':moduleURL(unused('createAnimationModelPicker')+' export class AnimationRaycastError extends Error{}'),
   'gltf_scene_view.mjs':moduleURL('export function decodeGltfSceneView(){return {};} export class GltfSceneViewError extends Error{} '+unused('createGltfSceneView')),
 };
@@ -295,6 +297,7 @@ const {prepareGltfAnimationModel:prepareMaterials}=await import(moduleURL(modelS
 let sceneSource=readFileSync(new URL('./animation_scene.mjs',import.meta.url),'utf8');
 sceneSource=sceneSource.replace("'./animation_controller.mjs'",JSON.stringify(moduleURL('export function createAnimationController(pose){return {update(){pose.version++;},dispose(){}};}')))
   .replace("'./animation_webgpu.mjs'",JSON.stringify(moduleURL('export async function createGpuAnimationDeformer(device,pose,geometry,options){return device.testDeformer(pose,geometry,options);}')))
+  .replace("'./animation_draw_order.mjs'",JSON.stringify(new URL('./animation_draw_order.mjs',import.meta.url).href))
   .replace("'./animation_render.mjs'",JSON.stringify(new URL('./animation_render.mjs',import.meta.url).href));
 const {createGpuAnimationScene:materialScene}=await import(moduleURL(sceneSource));
 function materialFixture() {

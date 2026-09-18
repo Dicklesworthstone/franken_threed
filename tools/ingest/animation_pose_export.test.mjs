@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {exportAnimationPoseGLB, AnimationExportError} from './animation_pose_export.mjs';
+import {loadGltfAsset} from './gltf_asset.mjs';
 const I = () => [1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1];
 const png = Uint8Array.from(Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==','base64'));
 function fixture() {
@@ -191,4 +192,27 @@ test('repeated export is deterministic and contains no external URI or executabl
 test('copyright is retained as inert JSON text',async()=>{
   const text='Artist "name" <script>not code</script> ☃';
   const r=inspect(await run(fixture(),{copyright:text}));assert.equal(r.json.asset.copyright,text);
+});
+
+test('abort releases a waiting export even when its image provider ignores the signal',async()=>{
+  const f=textured(),c=new AbortController();let rejectLate;
+  const pending=run(f,{signal:c.signal,resolveTexture:()=>new Promise((_,reject)=>{rejectLate=reject;})});
+  c.abort();await assert.rejects(pending,{name:'AbortError'});
+  rejectLate(Error('late provider rejection'));await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(f.pose.disposed,false);
+});
+
+
+test('exported GLB reloads through the production asset loader with embedded textures and no I/O',async()=>{
+  const f=textured();f.deformer.worldMatrix[12]=7;f.deformer.worldMatrix[0]=-1;
+  const encoded=await run(f,{resolveTexture:()=>({bytes:png,mimeType:'image/png',sampler:{minFilter:9728}})});
+  const asset=await loadGltfAsset(encoded,{fetch:()=>assert.fail('A self-contained export must not fetch')});
+  assert.equal(asset.bytesLoaded,encoded.byteLength);assert.equal(asset.buffers.length,1);
+  const model=asset.json,primitive=model.meshes[0].primitives[0],a=model.accessors[primitive.attributes.POSITION];
+  const v=model.bufferViews[a.bufferView],data=new DataView(asset.buffers[0].buffer,asset.buffers[0].byteOffset+v.byteOffset,v.byteLength);
+  close(Array.from({length:a.count*3},(_,i)=>data.getFloat32(i*4,true)),[7,0,1,6,0,1,7,1,1]);
+  assert.deepEqual(a.min,[6,0,1]);assert.deepEqual(a.max,[7,1,1]);
+  assert.deepEqual((await asset.readImage(model.textures[model.materials[0].normalTexture.index].source)).bytes,png);
+  assert.equal(model.samplers[0].minFilter,9728);assert.equal(model.animations,undefined);assert.equal(model.skins,undefined);
+  assert.equal(primitive.targets,undefined);assert.equal(model.nodes[0].matrix,undefined);
 });

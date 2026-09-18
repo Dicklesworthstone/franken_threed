@@ -220,7 +220,17 @@ export async function exportAnimationPoseGLB(pose, entries, options = {}) {
     const images = new Map(), samplers = new Map();
     for (const descriptor of textures) {
       checkAbort(signal);
-      const result = await resolveTexture(descriptor, {signal}); checkAbort(signal);
+      const pending = resolveTexture(descriptor, {signal});
+      // A caller's resolver may ignore cancellation. Reject the export promptly
+      // while still observing late rejection; no native resource is owned here.
+      const result = signal ? await new Promise((resolve, reject) => {
+        const cleanup = () => signal.removeEventListener('abort', onAbort);
+        const onAbort = () => { cleanup(); reject(signal.reason ?? new DOMException('Aborted', 'AbortError')); };
+        signal.addEventListener('abort', onAbort, {once: true});
+        Promise.resolve(pending).then(value => { cleanup(); resolve(value); }, error => { cleanup(); reject(error); });
+        if (signal.aborted) onAbort();
+      }) : await pending;
+      checkAbort(signal);
       fields(result, ['bytes', 'mimeType', 'sampler'], 'encoded texture');
       const {bytes, mimeType, sampler = {}} = result;
       if (!(bytes instanceof Uint8Array) || !['image/png', 'image/jpeg'].includes(mimeType)) fail('TEXTURE', 'Supply encoded core PNG/JPEG bytes');
