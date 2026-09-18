@@ -44,6 +44,19 @@ export async function runDerivativeNormalChecks(device) {
     const backface = await renderer.addMesh(geometry(false),{...material,indices:[0,2,1]});
     const masked = await renderer.addMesh(geometry(false),{...material,alphaMode:'MASK',
       baseColorTexture:{view:transparent.createView(),sampler}});
+    const atlas=own(device.createTexture({size:[2,1],format:'rgba8unorm',usage:6}));
+    device.queue.writeTexture({texture:atlas},new Uint8Array([255,0,0,255,0,0,255,255]),{bytesPerRow:8},[2,1]);
+    const normalAtlas=own(device.createTexture({size:[2,1],format:'rgba8unorm',usage:6}));
+    device.queue.writeTexture({texture:normalAtlas},new Uint8Array([255,128,255,255,0,128,255,255]),{bytesPerRow:8},[2,1]);
+    const atlasTexture={view:atlas.createView(),sampler};
+    const independent=await renderer.addMesh(geometry(false),{shading:'lambert',
+      texCoords:[0.25,0.5,0.25,0.5,0.25,0.5],baseColorTexture:atlasTexture,
+      emissiveTexture:atlasTexture,emissiveFactor:[1,1,1],
+      mapCoordinates:{emissiveTexture:{uvTransform:[1,0,0,1,0.5,0]}}});
+    const normalCoordinates=await renderer.addMesh(geometry(false),{shading:'lambert',
+      texCoords:[0.25,0.5,0.25,0.5,0.25,0.5],baseColorTexture:atlasTexture,
+      normalTexture:{view:normalAtlas.createView(),sampler},
+      mapCoordinates:{normalTexture:{texCoords:[0.6,0,0.9,0,0.75,0.3]}}});
     const colorView=color.createView(),depthView=depth.createView();
     async function check(name,draw,direction,expected) {
       renderer.render({colorView,depthView,viewProjection:identity(),draws:[draw],
@@ -73,6 +86,8 @@ export async function runDerivativeNormalChecks(device) {
     await check('collapsed UV retains geometric normal',collapsed,[0,0,-1],[255,255,255,255]);
     await check('zero normal scale',{mesh:derivative,normalScale:0},[0,0,-1],[255,255,255,255]);
     await check('masked derivative evaluated before discard',masked,[-1,0,-1],[0,0,0,0]);
+    await check('independent emissive UV local transform',independent,[0,0,-1],[255,0,255,255]);
+    await check('normal derivative uses independent UV stream',normalCoordinates,[-1,0,-1],[0,0,0,255]);
     await device.queue.onSubmittedWorkDone();
     if(errors.length)throw new Error(errors.join('\n'));
     return Object.freeze(results);

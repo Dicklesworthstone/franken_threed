@@ -143,10 +143,10 @@ test('embedded image requests carry validated bufferView offsets, length and MIM
 });
 
 for(const [name,mutate]of [
-  ['mixed UV sets',f=>{f.material.normalTexture.texCoord=1;}],
-  ['mixed UV transforms',f=>{f.material.emissiveTexture.extensions={KHR_texture_transform:{offset:[1,0]}};}],
+  ['missing alternate UV',f=>{f.material.normalTexture.texCoord=9;}],
+  ['invalid UV transform',f=>{f.material.emissiveTexture.extensions={KHR_texture_transform:{offset:[Infinity,0]}};}],
   ['missing UV',f=>{delete f.p.attributes.TEXCOORD_0;}],
-  ['missing tangent',f=>{delete f.p.attributes.TANGENT;}],
+  ['invalid tangent',f=>{f.model.accessors[f.p.attributes.TANGENT].type='VEC3';}],
   ['occlusion',f=>{f.material.occlusionTexture={index:0};}],
   ['material extension',f=>{f.material.extensions={KHR_materials_clearcoat:{}};}],
   ['texture codec',f=>{f.model.textures[0].extensions={KHR_texture_basisu:{source:0}};}],
@@ -232,4 +232,17 @@ test('mistaken async texture resolver rejection is observed without starting GPU
     decode:{resolveTexture:async()=>{throw Error('preload failed');}},
   }),code('GLTF_MODEL_TEXTURE'));
   await new Promise(resolve=>setImmediate(resolve));assert.equal(creates,0);
+});
+
+test('real decoded skin/morph model preserves independent material UVs without authored tangents',()=>{
+  const f=maps(fixture({skin:true,morph:true}));delete f.p.attributes.TANGENT;
+  f.material.normalTexture.texCoord=1;
+  f.material.emissiveTexture.extensions={KHR_texture_transform:{offset:[0.25,0.5],scale:[2,3]}};
+  const requests=[],m=createCpuGltfAnimationModel(f.model,f.buffers,{resolveTexture:r=>{requests.push(r);return resources();}}),d=m.drawables[0];
+  assert.equal(requests.length,2);assert.equal(d.baseColorTexture,d.emissiveTexture);assert.equal(d.normalTexture,d.metallicRoughnessTexture);
+  close(d.uvTransform,[1,0,0,1,0,0]);close(d.mapCoordinates.normalTexture.texCoords,[0.25,0.25,0.75,0.25,0.25,0.75]);
+  close(d.mapCoordinates.emissiveTexture.uvTransform,[2,0,0,3,0.25,0.5]);
+  close(d.texCoords,[0,0,1,0,0,1]);assert.equal(d.geometry.tangents,undefined);
+  assert.ok(m.diagnostics.some(item=>item.reason==='DERIVATIVE_NORMAL_FRAME_NOT_MIKKTSPACE'));
+  m.sample(0.5);close(m.deformers[0].positions,[2,2,1,3,2,1,2,3,1]);m.dispose();
 });

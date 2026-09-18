@@ -26,8 +26,9 @@
  * Drawable material fields match renderer.addMesh: texCoords, vertexColors,
  * baseColorTexture, metallicRoughnessTexture, normalTexture, emissiveTexture,
  * uvTransform, shading, metallicFactor, roughnessFactor, normalScale and
- * emissiveFactor are optional. Normal maps require geometry.tangents (XYZ/W);
- * every map uses the shared texCoords/uvTransform. Lit scenes pass lighting to render(). Textures
+ * emissiveFactor are optional. Normal maps use authored tangents or the renderer's
+ * derivative frame. mapCoordinates supplies per-map UVs/local transforms; the
+ * shared uvTransform applies afterwards. Lit scenes pass lighting to render(). Textures
  * stay caller-owned; material arrays/descriptors are snapshotted before awaits.
  */
 import {createAnimationController} from './animation_controller.mjs';
@@ -75,7 +76,7 @@ export async function createGpuAnimationScene(device, pose, drawables, {
     const inputs = drawables.map(input => {
       if (!input || typeof input !== 'object') fail('ANIMATION_SCENE_GEOMETRY', 'Expected a drawable descriptor');
       const allowed = ['geometry', 'indices', 'baseColor', 'doubleSided', 'alphaMode', 'alphaCutoff',
-        'texCoords', 'vertexColors', ...TEXTURE_FIELDS, 'uvTransform', 'shading', 'metallicFactor', 'roughnessFactor', 'emissiveFactor', 'normalScale'];
+        'texCoords', 'vertexColors', 'mapCoordinates', ...TEXTURE_FIELDS, 'uvTransform', 'shading', 'metallicFactor', 'roughnessFactor', 'emissiveFactor', 'normalScale'];
       for (const key of Object.keys(input)) if (!allowed.includes(key)) fail('ANIMATION_SCENE_GEOMETRY', `Unsupported drawable field: ${key}`);
       const {geometry, indices = null, baseColor = [1,1,1,1], doubleSided = false, alphaMode = 'OPAQUE', alphaCutoff = 0.5} = input;
       if ((!Array.isArray(baseColor) && !ArrayBuffer.isView(baseColor)) || baseColor.length !== 4) fail('ANIMATION_SCENE_GEOMETRY', 'Expected RGBA material color');
@@ -96,6 +97,22 @@ export async function createGpuAnimationScene(device, pose, drawables, {
         // silently drop a requested flipY, color conversion or unsupported map.
         material[key] = texture === null ? null : {...texture};
       }
+      const mapCoordinates = input.mapCoordinates;
+      if (mapCoordinates != null) {
+        if (typeof mapCoordinates !== 'object' || Array.isArray(mapCoordinates)) fail('ANIMATION_SCENE_GEOMETRY', 'Expected map coordinates');
+        material.mapCoordinates = {};
+        for (const [field, coordinate] of Object.entries(mapCoordinates)) {
+          if (!TEXTURE_FIELDS.includes(field) || material[field] == null || !coordinate || typeof coordinate !== 'object' || Array.isArray(coordinate)) {
+            fail('ANIMATION_SCENE_GEOMETRY', 'Coordinates require an existing material map');
+          }
+          const copy = {};
+          for (const key of Object.keys(coordinate)) {
+            if (!['texCoords', 'uvTransform'].includes(key)) fail('ANIMATION_SCENE_GEOMETRY', `Unsupported coordinate field: ${key}`);
+            if (coordinate[key] !== undefined) copy[key] = copyMaterialArray(coordinate[key], field + ' ' + key);
+          }
+          material.mapCoordinates[field] = copy;
+        }
+      }
       return {geometry, material};
     });
     if ((renderOptions.maxDraws ?? drawables.length) < drawables.length || (renderOptions.maxMeshes ?? maxMeshes) < drawables.length) {
@@ -111,7 +128,8 @@ export async function createGpuAnimationScene(device, pose, drawables, {
       const surface = material.texCoords != null || material.vertexColors != null || TEXTURE_FIELDS.some(key => material[key] != null);
       if (surface && (!Number.isSafeInteger(vertices) || vertices < 1)) fail('ANIMATION_SCENE_GEOMETRY', 'Surface attributes require XYZ geometry');
       const lit = material.shading === 'lambert' || material.shading === 'metallic-roughness';
-      const reserve = (material.indices?.length ?? 0) * 4 + (surface ? vertices * 24 : 0) + (lit && !lightingAllocated ? 544 : 0);
+      const surfaceStride = 24 + Object.keys(material.mapCoordinates ?? {}).length * 8;
+      const reserve = (material.indices?.length ?? 0) * 4 + (surface ? vertices * surfaceStride : 0) + (lit && !lightingAllocated ? 544 : 0);
       const remaining = maxBytes - renderer.allocatedBytes - deformationBytes - reserve;
       if (remaining < 1) fail('ANIMATION_SCENE_LIMIT', 'Scene GPU buffer budget exhausted');
       const gpu = await createGpuAnimationDeformer(device, pose, geometry, {...deformOptions,

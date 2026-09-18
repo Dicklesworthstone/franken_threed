@@ -9,12 +9,15 @@ not performance results or a full-material compatibility certification.</p>
 <pre id="result">Running…</pre>
 <script type="module">
 import {runAnimationRenderChecks} from '../../../tools/ingest/animation_render.browser.mjs';
+import {runDerivativeNormalChecks} from '../../../tools/ingest/animation_derivative_normals.browser.mjs';
 let device;
 try {
   const adapter=await navigator.gpu?.requestAdapter();
   if(!adapter)throw new Error('No WebGPU adapter; checks have not passed.');
   device=await adapter.requestDevice();
-  globalThis.__f3dAnimationRenderResult=await runAnimationRenderChecks(device);
+  const original=await runAnimationRenderChecks(device);
+  const materialCoordinates=await runDerivativeNormalChecks(device);
+  globalThis.__f3dAnimationRenderResult={...original,materialCoordinates};
 } catch(error) {
   globalThis.__f3dAnimationRenderResult={status:'failed',error:error.stack||String(error)};
 } finally {

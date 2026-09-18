@@ -38,7 +38,11 @@
  * perceptual roughness floor of 0.045. Lit materials accept emissiveFactor RGB.
  * Lit materials also accept normalTexture and emissiveTexture; metallic-roughness
  * accepts metallicRoughnessTexture. Each is a borrowed {view, sampler}, like
- * baseColorTexture. All maps use the supplied texCoords and uvTransform. Use
+ * baseColorTexture. Maps inherit texCoords and uvTransform by default. Optional
+ * mapCoordinates[field]={texCoords?,uvTransform?} selects independent static UVs
+ * for an existing map. Its local transform is baked once into the surface stream;
+ * the shared material/per-draw uvTransform is then applied AFTER that transform.
+ * No extra uniforms, textures or vertex buffers are needed. Use
  * linear views for normals and metallic-roughness (G=roughness, B=metallic),
  * and an sRGB view for sRGB emissive data. Emission is multiplied by its factor.
  * Normal mapping uses authored deformed tangents and their w handedness when
@@ -82,6 +86,7 @@ const UV_IDENTITY = Object.freeze([1, 0, 0, 1, 0, 0]);
 const MAP_FIELDS = Object.freeze(['baseColorTexture', 'metallicRoughnessTexture', 'normalTexture', 'emissiveTexture']);
 const MAP_NAMES = Object.freeze(['color', 'metallic_roughness', 'normal_map', 'emissive']);
 const mapMaskFor = variant => variant.includes('maps-') ? Number(variant.split('maps-')[1]) : variant.endsWith('texture') ? 1 : 0;
+const coordinateMaskFor = variant => Number(/uv-(\d+)-/.exec(variant)?.[1] ?? 0);
 const mapSlots = mask => [0, 1, 2, 3].filter(slot => mask & (1 << slot));
 export const ANIMATION_RENDER_WGSL = /* wgsl */`
 struct DrawInfo { clip_from_local: mat4x4<f32>, color: vec4<f32>, options: vec4<f32> }
@@ -97,12 +102,13 @@ struct DrawInfo { clip_from_local: mat4x4<f32>, color: vec4<f32>, options: vec4<
 // Equations: glTF 2.0 Appendix B and KHR_lights_punctual (Khronos).
 // https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#appendix-b-brdf-implementation
 // https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_lights_punctual
-function surfaceShader(mapMask, lit, attributes, derivative = false) {
+function surfaceShader(mapMask, lit, attributes, derivative = false, coordinateMask = 0) {
   const textured = mapMask !== 0, normalMapped = (mapMask & 4) !== 0, tangentAttribute = normalMapped && !derivative;
   const declarations = mapSlots(mapMask).map(slot =>
     `@group(1) @binding(${slot * 2}) var ${MAP_NAMES[slot]}_sampler: sampler;\n@group(1) @binding(${slot * 2 + 1}) var ${MAP_NAMES[slot]}_texture: texture_2d<f32>;`).join('\n');
+  const coordinates = slot => coordinateMask & (1 << slot) ? `input.uv_${slot}` : 'input.uv';
   const samples = mapSlots(mapMask).map(slot =>
-    `let ${MAP_NAMES[slot]}_texel = textureSample(${MAP_NAMES[slot]}_texture, ${MAP_NAMES[slot]}_sampler, input.uv);`).join('\n  ');
+    `let ${MAP_NAMES[slot]}_texel = textureSample(${MAP_NAMES[slot]}_texture, ${MAP_NAMES[slot]}_sampler, ${coordinates(slot)});`).join('\n  ');
   const lighting = lit ? /* wgsl */`
 struct Light { vector: vec4<f32>, radiance: vec4<f32>, direction: vec4<f32>, cone: vec4<f32> }
 struct Lighting { camera: vec4<f32>, meta: vec4<f32>, lights: array<Light, 8> }
@@ -175,13 +181,15 @@ struct VertexOutput {
   @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) color: vec4<f32>,
   ${lit ? '@location(2) world: vec3<f32>, @location(3) normal: vec3<f32>,' : ''}
   ${tangentAttribute ? '@location(4) tangent: vec4<f32>,' : ''}
+  ${mapSlots(coordinateMask).map(slot => `@location(${5 + slot}) uv_${slot}: vec2<f32>,`).join('\n  ')}
 }
-@vertex fn vertex_main(@location(0) position: vec3<f32>${lit ? ', @location(1) normal: vec3<f32>' : ''}${tangentAttribute ? ', @location(2) tangent: vec4<f32>' : ''}${attributes ? ', @location(3) uv: vec2<f32>, @location(4) color: vec4<f32>' : ''}) -> VertexOutput {
+@vertex fn vertex_main(@location(0) position: vec3<f32>${lit ? ', @location(1) normal: vec3<f32>' : ''}${tangentAttribute ? ', @location(2) tangent: vec4<f32>' : ''}${attributes ? ', @location(3) uv: vec2<f32>, @location(4) color: vec4<f32>' : ''}${mapSlots(coordinateMask).map(slot => `, @location(${5 + slot}) uv_${slot}: vec2<f32>`).join('')}) -> VertexOutput {
   var out: VertexOutput;
   out.position = draw_info.clip_from_local * vec4<f32>(position, 1.0);
   ${attributes ? 'out.uv = vec2<f32>(dot(draw_info.uv_x.xyz, vec3<f32>(uv, 1.0)), dot(draw_info.uv_y.xyz, vec3<f32>(uv, 1.0)));\n  out.color = color;' : 'out.uv = vec2<f32>(0.0); out.color = vec4<f32>(1.0);'}
   ${lit ? 'out.world = (draw_info.world_from_local * vec4<f32>(position, 1.0)).xyz;\n  out.normal = draw_info.normal_from_local * normal;' : ''}
   ${tangentAttribute ? 'out.tangent = vec4<f32>((draw_info.world_from_local * vec4<f32>(tangent.xyz, 0.0)).xyz, tangent.w * draw_info.uv_y.w);' : ''}
+  ${mapSlots(coordinateMask).map(slot => `out.uv_${slot} = vec2<f32>(dot(draw_info.uv_x.xyz, vec3<f32>(uv_${slot}, 1.0)), dot(draw_info.uv_y.xyz, vec3<f32>(uv_${slot}, 1.0)));`).join('\n  ')}
   return out;
 }
 @fragment fn fragment_main(input: VertexOutput${lit ? ', @builtin(front_facing) front: bool' : ''}) -> @location(0) vec4<f32> {
@@ -190,8 +198,8 @@ struct VertexOutput {
   ${samples}
   ${derivative ? `let position_dx = dpdx(input.world);
   let position_dy = dpdy(input.world);
-  let uv_dx = dpdx(input.uv);
-  let uv_dy = dpdy(input.uv);` : ''}
+  let uv_dx = dpdx(${coordinates(2)});
+  let uv_dy = dpdy(${coordinates(2)});` : ''}
   let rgba = draw_info.color * input.color ${mapMask & 1 ? '* color_texel' : ''};
   if (draw_info.options.x >= 0.0 && rgba.a < draw_info.options.x) { discard; }
   ${lit ? `var normal = unit_vector(input.normal);
@@ -389,7 +397,7 @@ export async function createGpuAnimationRenderer(device, {
   }
   function compilePipelines(variant) {
     const lit = variant.startsWith('lit-'), attributes = !variant.endsWith('plain'), mapMask = mapMaskFor(variant), textured = mapMask !== 0;
-    const derivative = variant.includes('derivative-');
+    const derivative = variant.includes('derivative-'), coordinateMask = coordinateMaskFor(variant);
     if (attributes) { limit('maxVertexBuffers', 2); limit('maxVertexAttributes', 5); }
     if (textured) {
       const slots = mapSlots(mapMask);
@@ -402,12 +410,13 @@ export async function createGpuAnimationRenderer(device, {
     const bindGroupLayouts = textured ? [uniformLayout, textureLayouts.get(mapMask)] : [uniformLayout];
     if (lit) bindGroupLayouts.push(lightLayout);
     const pipelineLayout = device.createPipelineLayout({label, bindGroupLayouts});
-    const module = device.createShaderModule({label, code: lit || attributes ? surfaceShader(mapMask, lit, attributes, derivative) : ANIMATION_RENDER_WGSL});
+    const module = device.createShaderModule({label, code: lit || attributes ? surfaceShader(mapMask, lit, attributes, derivative, coordinateMask) : ANIMATION_RENDER_WGSL});
     const vertexBuffers = [{arrayStride: 40, stepMode: 'vertex', attributes: [{shaderLocation: 0, offset: 0, format: 'float32x3'}]}];
     if (lit) vertexBuffers[0].attributes.push({shaderLocation: 1, offset: 12, format: 'float32x3'});
     if ((mapMask & 4) && !derivative) vertexBuffers[0].attributes.push({shaderLocation: 2, offset: 24, format: 'float32x4'});
-    if (attributes) vertexBuffers.push({arrayStride: 24, stepMode: 'vertex', attributes: [
+    if (attributes) vertexBuffers.push({arrayStride: 24 + mapSlots(coordinateMask).length * 8, stepMode: 'vertex', attributes: [
       {shaderLocation: 3, offset: 0, format: 'float32x2'}, {shaderLocation: 4, offset: 8, format: 'float32x4'},
+      ...mapSlots(coordinateMask).map((slot, i) => ({shaderLocation: 5 + slot, offset: 24 + i * 8, format: 'float32x2'})),
     ]});
     const created = [];
     for (const blend of [false, true]) for (const winding of (lit ? ['ccw', 'cw', 'none', 'none-cw'] : ['ccw', 'cw', 'none'])) {
@@ -462,7 +471,7 @@ export async function createGpuAnimationRenderer(device, {
 
   async function addMesh(gpu, options = {}) {
     live(); if (busy) fail('ANIMATION_RENDER_REENTRANT', 'Cannot register a mesh during submission');
-    keys(options, ['indices', 'baseColor', 'doubleSided', 'alphaMode', 'alphaCutoff', 'texCoords', 'vertexColors', ...MAP_FIELDS, 'normalScale', 'uvTransform', 'shading', 'metallicFactor', 'roughnessFactor', 'emissiveFactor'], 'material/geometry');
+    keys(options, ['indices', 'baseColor', 'doubleSided', 'alphaMode', 'alphaCutoff', 'texCoords', 'vertexColors', 'mapCoordinates', ...MAP_FIELDS, 'normalScale', 'uvTransform', 'shading', 'metallicFactor', 'roughnessFactor', 'emissiveFactor'], 'material/geometry');
     deformerShape(gpu);
     if (records.size + pendingMeshes >= maxMeshes) fail('ANIMATION_RENDER_LIMIT', 'Mesh capacity exceeded');
     const {indices = null, baseColor = [1, 1, 1, 1], doubleSided = false, alphaMode = 'OPAQUE', alphaCutoff = 0.5} = options;
@@ -518,14 +527,32 @@ export async function createGpuAnimationRenderer(device, {
     const {texCoords = null, vertexColors = null} = options;
     const transform = Float64Array.from(uvTransform(options.uvTransform ?? UV_IDENTITY));
     const attributeVariant = mapMask ? (mapMask === 1 ? 'texture' : `maps-${mapMask}`) : vertexColors !== null || texCoords !== null ? 'color' : 'plain';
-    const variant = (lit ? 'lit-' : '') + (derivative ? 'derivative-' : '') + attributeVariant;
+    const coordinateInput = options.mapCoordinates ?? {};
+    keys(coordinateInput, MAP_FIELDS, 'map coordinates');
+    const coordinates = [];
+    for (const [slot, field] of MAP_FIELDS.entries()) if (Object.hasOwn(coordinateInput, field)) {
+      if (!(mapMask & (1 << slot))) fail('ANIMATION_RENDER_OPTIONS', `Coordinates require ${field}`);
+      const input = coordinateInput[field]; keys(input, ['texCoords', 'uvTransform'], field + ' coordinates');
+      const values = array(input.texCoords === undefined ? texCoords : input.texCoords, gpu.vertexCount * 2, field + ' UVs');
+      const local = Float64Array.from(uvTransform(input.uvTransform ?? UV_IDENTITY));
+      coordinates.push({slot, values, transform: local});
+    }
+    const coordinateMask = coordinates.reduce((mask, entry) => mask | (1 << entry.slot), 0);
+    if (coordinates.length) {
+      const needed = 6 + coordinates.at(-1).slot;
+      limit('maxVertexAttributes', needed); limit('maxInterStageShaderVariables', needed);
+    }
+    const surfaceWords = 6 + coordinates.length * 2;
+    const variant = (lit ? 'lit-' : '') + (derivative ? 'derivative-' : '') +
+      (coordinateMask ? `uv-${coordinateMask}-` : '') + attributeVariant;
     const lightReserve = lit && !lightBuffer ? LIGHT_BYTES : 0;
     if (allocatedBytes + (data?.byteLength ?? 0) + lightReserve > maxBytes) fail('ANIMATION_RENDER_LIMIT', 'Material buffers exceed byte budget');
     let surfaceData = null, surfaceBuffer = null, textureGroup = null;
-    if (mapMask && texCoords === null) fail('ANIMATION_RENDER_GEOMETRY', 'Material textures require UV coordinates');
+    if ((mapMask & ~coordinateMask) && texCoords === null) fail('ANIMATION_RENDER_GEOMETRY', 'Material textures require UV coordinates');
     if (attributeVariant !== 'plain') {
       limit('maxVertexBuffers', 2); limit('maxVertexAttributes', 5);
-      const bytes = gpu.vertexCount * 24;
+      const bytes = gpu.vertexCount * surfaceWords * 4;
+      limit('maxVertexBufferArrayStride', surfaceWords * 4);
       limit('maxBufferSize', bytes);
       if (allocatedBytes + (data?.byteLength ?? 0) + lightReserve + bytes > maxBytes) fail('ANIMATION_RENDER_LIMIT', 'Surface/index buffers exceed byte budget');
       if (texCoords !== null) array(texCoords, gpu.vertexCount * 2, 'UV coordinates');
@@ -535,13 +562,18 @@ export async function createGpuAnimationRenderer(device, {
         if (width !== 3 && width !== 4) fail('ANIMATION_RENDER_SHAPE', 'Vertex colors require RGB or RGBA per vertex');
         array(vertexColors, gpu.vertexCount * width, 'Vertex colors');
       }
-      surfaceData = new Float32Array(gpu.vertexCount * 6);
+      surfaceData = new Float32Array(gpu.vertexCount * surfaceWords);
       for (let v = 0; v < gpu.vertexCount; v++) {
-        for (let c = 0; c < 2; c++) surfaceData[v * 6 + c] = texCoords?.[v * 2 + c] ?? 0;
+        for (let c = 0; c < 2; c++) surfaceData[v * surfaceWords + c] = texCoords?.[v * 2 + c] ?? 0;
         for (let c = 0; c < 4; c++) {
           const value = c < width ? vertexColors[v * width + c] : 1;
           if (value < 0 || ((c === 3 || lit) && value > 1)) fail('ANIMATION_RENDER_VALUE', 'Invalid linear vertex color');
-          surfaceData[v * 6 + 2 + c] = value;
+          surfaceData[v * surfaceWords + 2 + c] = value;
+        }
+        for (let i = 0; i < coordinates.length; i++) {
+          const {values, transform: t} = coordinates[i], u = values[v * 2], w = values[v * 2 + 1];
+          surfaceData[v * surfaceWords + 6 + i * 2] = t[0] * u + t[2] * w + t[4];
+          surfaceData[v * surfaceWords + 7 + i * 2] = t[1] * u + t[3] * w + t[5];
         }
       }
       for (const v of surfaceData) if (!Number.isFinite(v)) fail('ANIMATION_RENDER_VALUE', 'Surface attributes exceed f32');

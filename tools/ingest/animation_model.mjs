@@ -12,8 +12,9 @@
  * placeholder textures, color-space guesses or ownership transfers. Requests are
  * frozen snapshots, cached per texture index AND color space, not merely image.
  * All source material/UV requirements are checked before invoking the resolver.
- * All four maps must use one UV set/transform, matching the current renderer.
- * Unsupported codecs/material extensions/occlusion/mixed UVs fail explicitly;
+ * Each map preserves its own TEXCOORD_n and KHR_texture_transform. Missing
+ * authored tangents select the renderer's derivative frame (not MikkTSpace),
+ * reported in diagnostics. Unsupported codecs/material extensions/occlusion fail explicitly;
  * retain the source route for them rather than presenting an incomplete model.
  */
 import {decodeGltfAnimation} from './animation_gltf.mjs';
@@ -121,23 +122,31 @@ function materialPlan(model, primitive) {
   const maps = [['baseColorTexture',pbr.baseColorTexture,'srgb']];
   // KHR_materials_unlit explicitly ignores lighting-related PBR fallback fields.
   if (!unlit) maps.push(['metallicRoughnessTexture',pbr.metallicRoughnessTexture,'linear'],['normalTexture',material.normalTexture,'linear'],['emissiveTexture',material.emissiveTexture,'srgb']);
-  const requests=[];let sharedUV=null;
+  const requests=[],coordinates=[],diagnostics=[];let sharedUV=null,mixedUV=false;
   for (const [field,info,colorSpace] of maps) {
     if (info === undefined) continue;
     fields(info,['index','texCoord','extensions','extras',...(field==='normalTexture'?['scale']:[])],field);
     const uv=textureCoordinates(info);
-    if (sharedUV && (uv.texCoord !== sharedUV.texCoord || uv.transform.some((v,i)=>v!==sharedUV.transform[i]))) fail('UNSUPPORTED','Material maps with different UV sets/transforms require the source route');
-    sharedUV=uv;
+    if (sharedUV && (uv.texCoord !== sharedUV.texCoord || uv.transform.some((v,i)=>v!==sharedUV.transform[i]))) mixedUV=true;
+    sharedUV ??= uv;
     const attribute=primitive.attributes['TEXCOORD_'+uv.texCoord];
     if (!attribute) fail('TEXTURE',`Missing TEXCOORD_${uv.texCoord} for ${field}`);
-    drawable.texCoords=attribute.values; drawable.uvTransform=uv.transform;
+    coordinates.push({field,texCoords:attribute.values,uvTransform:uv.transform});
+    if (drawable.texCoords === undefined) { drawable.texCoords=attribute.values; drawable.uvTransform=uv.transform; }
     if (field==='normalTexture') {
-      if (!primitive.geometry.tangents) fail('UNSUPPORTED','Normal mapping needs source tangents; no approximate MikkTSpace substitution');
+      if (!primitive.geometry.tangents) diagnostics.push({node:primitive.node,primitive:primitive.primitive,reason:'DERIVATIVE_NORMAL_FRAME_NOT_MIKKTSPACE'});
       drawable.normalScale=number(info.scale ?? 1,'normal scale');
     }
     requests.push({field,request:textureRequest(model,info,colorSpace)});
   }
-  return {drawable,requests};
+  if (mixedUV) {
+    // Keep the first map's raw coordinates for geometric picking. Each material
+    // map gets its own absolute local transform; the shared transform is identity
+    // so no map accidentally inherits another map's UV transform.
+    drawable.mapCoordinates=Object.fromEntries(coordinates.map(({field,...coordinate})=>[field,coordinate]));
+    drawable.uvTransform=[1,0,0,1,0,0];
+  }
+  return {drawable,requests,diagnostics};
 }
 
 /** Decode without GPU effects. Budgets apply separately to pose/accessor/output
@@ -169,6 +178,7 @@ export function prepareGltfAnimationModel(model,suppliedBuffers,{
   const definition=decodeGltfAnimation(model,buffer,{maxComponents});
   const geometry=decodeGltfGeometry(model,buffer,{scene,maxComponents,maxPrimitives});
   const plans=geometry.primitives.map(p=>materialPlan(model,p)),unique=new Map();
+  for (const plan of plans) geometry.diagnostics.push(...plan.diagnostics);
   for(const plan of plans)for(const {request}of plan.requests)unique.set(request.textureIndex+':'+request.colorSpace,request);
   let busy=false,consumed=false;
   return Object.freeze({sceneView,textureRequests:Object.freeze([...unique.values()]),
