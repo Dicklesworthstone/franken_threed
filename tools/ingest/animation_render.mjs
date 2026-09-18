@@ -41,11 +41,14 @@
  * baseColorTexture. All maps use the supplied texCoords and uvTransform. Use
  * linear views for normals and metallic-roughness (G=roughness, B=metallic),
  * and an sRGB view for sRGB emissive data. Emission is multiplied by its factor.
- * Normal mapping requires the deformer's tangent attribute, including its w
- * handedness. normalScale (default 1, also a per-draw override) scales tangent
+ * Normal mapping uses authored deformed tangents and their w handedness when
+ * present, otherwise a fragment-derivative cotangent frame from current world
+ * positions and normal-map UVs. This is not MikkTSpace tangent generation.
+ * normalScale (default 1, also a per-draw override) scales tangent
  * X/Y before normalization. Tangents are transformed as directions, not normals;
  * reflected worlds and back faces preserve the mapped normal's orientation.
- * Missing tangents are rejected: this path does not invent tangent geometry.
+ * Collapsed UV derivatives retain the unperturbed normal; no tangent buffers
+ * are allocated or synthesized for the derivative path.
  * These are direct-light materials, not complete Three.js/PBR equivalence.
  *
  * Lit frames require lighting: {cameraPosition:[x,y,z], lights:[...]}, at most
@@ -94,8 +97,8 @@ struct DrawInfo { clip_from_local: mat4x4<f32>, color: vec4<f32>, options: vec4<
 // Equations: glTF 2.0 Appendix B and KHR_lights_punctual (Khronos).
 // https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#appendix-b-brdf-implementation
 // https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_lights_punctual
-function surfaceShader(mapMask, lit, attributes) {
-  const textured = mapMask !== 0, normalMapped = (mapMask & 4) !== 0;
+function surfaceShader(mapMask, lit, attributes, derivative = false) {
+  const textured = mapMask !== 0, normalMapped = (mapMask & 4) !== 0, tangentAttribute = normalMapped && !derivative;
   const declarations = mapSlots(mapMask).map(slot =>
     `@group(1) @binding(${slot * 2}) var ${MAP_NAMES[slot]}_sampler: sampler;\n@group(1) @binding(${slot * 2 + 1}) var ${MAP_NAMES[slot]}_texture: texture_2d<f32>;`).join('\n');
   const samples = mapSlots(mapMask).map(slot =>
@@ -171,26 +174,48 @@ ${lighting}
 struct VertexOutput {
   @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) color: vec4<f32>,
   ${lit ? '@location(2) world: vec3<f32>, @location(3) normal: vec3<f32>,' : ''}
-  ${normalMapped ? '@location(4) tangent: vec4<f32>,' : ''}
+  ${tangentAttribute ? '@location(4) tangent: vec4<f32>,' : ''}
 }
-@vertex fn vertex_main(@location(0) position: vec3<f32>${lit ? ', @location(1) normal: vec3<f32>' : ''}${normalMapped ? ', @location(2) tangent: vec4<f32>' : ''}${attributes ? ', @location(3) uv: vec2<f32>, @location(4) color: vec4<f32>' : ''}) -> VertexOutput {
+@vertex fn vertex_main(@location(0) position: vec3<f32>${lit ? ', @location(1) normal: vec3<f32>' : ''}${tangentAttribute ? ', @location(2) tangent: vec4<f32>' : ''}${attributes ? ', @location(3) uv: vec2<f32>, @location(4) color: vec4<f32>' : ''}) -> VertexOutput {
   var out: VertexOutput;
   out.position = draw_info.clip_from_local * vec4<f32>(position, 1.0);
   ${attributes ? 'out.uv = vec2<f32>(dot(draw_info.uv_x.xyz, vec3<f32>(uv, 1.0)), dot(draw_info.uv_y.xyz, vec3<f32>(uv, 1.0)));\n  out.color = color;' : 'out.uv = vec2<f32>(0.0); out.color = vec4<f32>(1.0);'}
   ${lit ? 'out.world = (draw_info.world_from_local * vec4<f32>(position, 1.0)).xyz;\n  out.normal = draw_info.normal_from_local * normal;' : ''}
-  ${normalMapped ? 'out.tangent = vec4<f32>((draw_info.world_from_local * vec4<f32>(tangent.xyz, 0.0)).xyz, tangent.w * draw_info.uv_y.w);' : ''}
+  ${tangentAttribute ? 'out.tangent = vec4<f32>((draw_info.world_from_local * vec4<f32>(tangent.xyz, 0.0)).xyz, tangent.w * draw_info.uv_y.w);' : ''}
   return out;
 }
 @fragment fn fragment_main(input: VertexOutput${lit ? ', @builtin(front_facing) front: bool' : ''}) -> @location(0) vec4<f32> {
   // Sample every map before discard or nonuniform lighting flow: implicit
   // derivatives must be evaluated in uniform control flow.
   ${samples}
+  ${derivative ? `let position_dx = dpdx(input.world);
+  let position_dy = dpdy(input.world);
+  let uv_dx = dpdx(input.uv);
+  let uv_dy = dpdy(input.uv);` : ''}
   let rgba = draw_info.color * input.color ${mapMask & 1 ? '* color_texel' : ''};
   if (draw_info.options.x >= 0.0 && rgba.a < draw_info.options.x) { discard; }
   ${lit ? `var normal = unit_vector(input.normal);
-  ${normalMapped ? `// Re-orthogonalize after interpolation and nonuniform world transforms.
+  ${normalMapped ? `${derivative ? `// Common positive rescaling keeps the cotangent calculation bounded while
+  // preserving its relative T/B lengths. Correct raster Y orientation using
+  // the surface normal rather than assuming one viewport/front-face convention.
+  let position_scale = max(max(max(abs(position_dx.x), abs(position_dx.y)), abs(position_dx.z)), max(max(abs(position_dy.x), abs(position_dy.y)), abs(position_dy.z)));
+  let uv_scale = max(max(abs(uv_dx.x), abs(uv_dx.y)), max(abs(uv_dy.x), abs(uv_dy.y)));
+  let q0 = position_dx / max(position_scale, 1e-20);
+  let q1 = position_dy / max(position_scale, 1e-20);
+  let st0 = uv_dx / max(uv_scale, 1e-20);
+  let st1 = uv_dy / max(uv_scale, 1e-20);
+  let orientation = select(-1.0, 1.0, dot(cross(q0, q1), normal) >= 0.0);
+  let q1perp = cross(q1, normal);
+  let q0perp = cross(normal, q0);
+  let raw_tangent = (q1perp * st0.x + q0perp * st1.x) * orientation;
+  let raw_bitangent = (q1perp * st0.y + q0perp * st1.y) * orientation;
+  let frame_length2 = max(dot(raw_tangent, raw_tangent), dot(raw_bitangent, raw_bitangent));
+  var frame_scale = 0.0;
+  if (frame_length2 > 0.0) { frame_scale = inverseSqrt(frame_length2); }
+  let tangent = raw_tangent * frame_scale;
+  let bitangent = raw_bitangent * frame_scale;` : `// Re-orthogonalize after interpolation and nonuniform world transforms.
   let tangent = unit_vector(input.tangent.xyz - normal * dot(normal, input.tangent.xyz));
-  let bitangent = cross(normal, tangent) * select(-1.0, 1.0, input.tangent.w >= 0.0);
+  let bitangent = cross(normal, tangent) * select(-1.0, 1.0, input.tangent.w >= 0.0);`}
   var mapped = normal_map_texel.xyz * 2.0 - vec3<f32>(1.0);
   mapped = vec3<f32>(mapped.xy * draw_info.uv_x.w, mapped.z);
   normal = unit_vector(tangent * mapped.x + bitangent * mapped.y + normal * mapped.z);` : ''}
@@ -364,6 +389,7 @@ export async function createGpuAnimationRenderer(device, {
   }
   function compilePipelines(variant) {
     const lit = variant.startsWith('lit-'), attributes = !variant.endsWith('plain'), mapMask = mapMaskFor(variant), textured = mapMask !== 0;
+    const derivative = variant.includes('derivative-');
     if (attributes) { limit('maxVertexBuffers', 2); limit('maxVertexAttributes', 5); }
     if (textured) {
       const slots = mapSlots(mapMask);
@@ -376,10 +402,10 @@ export async function createGpuAnimationRenderer(device, {
     const bindGroupLayouts = textured ? [uniformLayout, textureLayouts.get(mapMask)] : [uniformLayout];
     if (lit) bindGroupLayouts.push(lightLayout);
     const pipelineLayout = device.createPipelineLayout({label, bindGroupLayouts});
-    const module = device.createShaderModule({label, code: lit || attributes ? surfaceShader(mapMask, lit, attributes) : ANIMATION_RENDER_WGSL});
+    const module = device.createShaderModule({label, code: lit || attributes ? surfaceShader(mapMask, lit, attributes, derivative) : ANIMATION_RENDER_WGSL});
     const vertexBuffers = [{arrayStride: 40, stepMode: 'vertex', attributes: [{shaderLocation: 0, offset: 0, format: 'float32x3'}]}];
     if (lit) vertexBuffers[0].attributes.push({shaderLocation: 1, offset: 12, format: 'float32x3'});
-    if (mapMask & 4) vertexBuffers[0].attributes.push({shaderLocation: 2, offset: 24, format: 'float32x4'});
+    if ((mapMask & 4) && !derivative) vertexBuffers[0].attributes.push({shaderLocation: 2, offset: 24, format: 'float32x4'});
     if (attributes) vertexBuffers.push({arrayStride: 24, stepMode: 'vertex', attributes: [
       {shaderLocation: 3, offset: 0, format: 'float32x2'}, {shaderLocation: 4, offset: 8, format: 'float32x4'},
     ]});
@@ -459,9 +485,7 @@ export async function createGpuAnimationRenderer(device, {
     }
     const normalScale = finite(options.normalScale ?? 1, 'Normal scale');
     if (!Number.isFinite(Math.fround(normalScale))) fail('ANIMATION_RENDER_VALUE', 'Normal scale exceeds f32');
-    if ((mapMask & 4) && !gpu.vertexLayout.attributes.some(a => a.shaderLocation === 2 && a.offset === 24 && a.format === 'float32x4')) {
-      fail('ANIMATION_RENDER_NORMAL', 'Normal maps require deformed tangent XYZ and handedness W');
-    }
+    const derivative = (mapMask & 4) !== 0 && !gpu.vertexLayout.attributes.some(a => a.shaderLocation === 2 && a.offset === 24 && a.format === 'float32x4');
     if (mapMask) {
       limit('maxBindGroups', lit ? 3 : 2);
       limit('maxSamplersPerShaderStage', mapSlots(mapMask).length);
@@ -494,7 +518,7 @@ export async function createGpuAnimationRenderer(device, {
     const {texCoords = null, vertexColors = null} = options;
     const transform = Float64Array.from(uvTransform(options.uvTransform ?? UV_IDENTITY));
     const attributeVariant = mapMask ? (mapMask === 1 ? 'texture' : `maps-${mapMask}`) : vertexColors !== null || texCoords !== null ? 'color' : 'plain';
-    const variant = (lit ? 'lit-' : '') + attributeVariant;
+    const variant = (lit ? 'lit-' : '') + (derivative ? 'derivative-' : '') + attributeVariant;
     const lightReserve = lit && !lightBuffer ? LIGHT_BYTES : 0;
     if (allocatedBytes + (data?.byteLength ?? 0) + lightReserve > maxBytes) fail('ANIMATION_RENDER_LIMIT', 'Material buffers exceed byte budget');
     let surfaceData = null, surfaceBuffer = null, textureGroup = null;

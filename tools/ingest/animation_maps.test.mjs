@@ -103,7 +103,7 @@ test('descriptors are snapshotted across async initialization, layouts and pipel
 test('all map feature/geometry/capability validation precedes owned GPU allocation',async()=>{
   for(const change of [
     (m,g,d)=>{m.shading='unlit';},(m,g,d)=>{m.shading='lambert';},(m,g,d)=>{delete m.texCoords;},
-    (m,g,d)=>{g.vertexLayout.attributes.pop();},(m,g,d)=>{m.normalScale=Infinity;},
+    (m,g,d)=>{g.vertexLayout.attributes.splice(1,1);},(m,g,d)=>{m.normalScale=Infinity;},
     (m,g,d)=>{m.normalScale=1e300;},(m,g,d)=>{m.normalTexture.sampler=null;},
     (m,g,d)=>{m.emissiveTexture.texCoord=1;},(m,g,d)=>{d.limits.maxSamplersPerShaderStage=3;},
     (m,g,d)=>{d.limits.maxSampledTexturesPerShaderStage=3;},(m,g,d)=>{d.limits.maxBindGroups=2;},
@@ -113,9 +113,8 @@ test('all map feature/geometry/capability validation precedes owned GPU allocati
   }
 });
 
-test('normal mapping cannot silently ignore absent tangent attributes or extraneous scale',async()=>{
+test('normal mapping still rejects scale parameters on materials without normal maps',async()=>{
   const d=deviceSpy(),r=await createGpuAnimationRenderer(d);
-  await assert.rejects(r.addMesh(geometry(false),options(4)),code('ANIMATION_RENDER_NORMAL'));
   await assert.rejects(r.addMesh(geometry(),{...options(8),normalScale:0}),code('ANIMATION_RENDER_OPTIONS'));
   const mesh=await r.addMesh(geometry(),options(8));assert.throws(()=>r.render(frame([{mesh,normalScale:0}])),code('ANIMATION_RENDER_OPTIONS'));
   assert.equal(d.writes.length,0);assert.equal(d.submissions.length,0);r.render(frame([mesh]));r.dispose();
@@ -164,4 +163,20 @@ test('device loss during pending map compilation releases only owned buffers',as
   const g=geometry(),m=options(15),pending=r.addMesh(g,m);d.loss.resolve({message:'lost during maps'});
   await assert.rejects(pending,code('ANIMATION_RENDER_LOST'));assert.equal(r.failed,true);assert.ok(d.buffers.every(b=>b.destroyed));
   assert.equal(g.disposed,false);assert.equal(m.normalTexture.view.destroyed,undefined);wait.resolve({});r.dispose();
+});
+
+for(const mask of [4,5,6,7,12,13,14,15])test(`tangentless map combination ${mask} uses derivative WGSL without tangent input`,async()=>{
+  const d=deviceSpy(),r=await createGpuAnimationRenderer(d,{maxDraws:1}),m=options(mask);
+  const derived=await r.addMesh(geometry(false),m),authored=await r.addMesh(geometry(),m);
+  r.render(frame([derived]));await r.whenIdle();const dp=d.submissions.at(-1).pipeline,shader=dp.fragment.module.code;
+  assert.equal(dp.vertex.buffers[0].attributes.some(a=>a.shaderLocation===2),false);
+  assert.ok(shader.includes('dpdx(input.world)')&&shader.includes('dpdy(input.uv)'));
+  assert.ok(shader.lastIndexOf('dpdy(')<shader.indexOf('discard;'));
+  assert.equal(shader.includes('input.tangent'),false);
+  assert.equal(r.allocatedBytes,256+544+144,'No CPU-generated tangent or extra GPU buffer');
+  r.render(frame([authored]));const tp=d.submissions.at(-1).pipeline;
+  assert.notEqual(dp,tp);assert.equal(tp.vertex.buffers[0].attributes.some(a=>a.shaderLocation===2),true);
+  assert.equal(tp.fragment.module.code.includes('dpdx('),false);
+  const compiled=d.pipelines.length;await r.addMesh(geometry(false),m);assert.equal(d.pipelines.length,compiled);
+  r.dispose();assert.ok(d.buffers.every(b=>b.destroyed));
 });
