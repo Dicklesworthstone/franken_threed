@@ -13,7 +13,11 @@
  * No MikkTSpace tangents are guessed.
  * Skin sets are combined vertex-major, up to the deformer's 32 influences.
  *
- * Extensions/codecs and nontriangle primitives need the source loader/backend:
+ * KHR_mesh_quantization adds integer positions/UVs and signed normalized
+ * normals/tangents, including position/normal/tangent morph deltas. The shared
+ * accessor reader expands to Float64 without adding a dequantization transform;
+ * source node/inverse-bind and texture transforms already carry that operation.
+ * Other extensions/codecs and nontriangle primitives need the source loader/backend:
  * an explicit error is a refusal of this opt-in route, not a compatibility pass.
  * Materials/textures/cameras/lights are NOT interpreted by this geometry layer.
  * Budgets independently bound cached accessor components and emitted components,
@@ -57,6 +61,7 @@ export function decodeGltfGeometry(model, suppliedBuffers, {
   if (model?.asset?.version !== '2.0') fail('VERSION', 'Expected glTF 2.0');
   if (!Number.isSafeInteger(maxComponents) || maxComponents < 1 ||
       !Number.isSafeInteger(maxPrimitives) || maxPrimitives < 1 || maxPrimitives > 65536) fail('LIMIT', 'Invalid decode budgets');
+  const quantized = list(model.extensionsRequired ?? [], 'required extensions').includes('KHR_mesh_quantization');
   const nodes = list(model.nodes ?? [], 'nodes');
   if (nodes.length > 65536) fail('LIMIT', 'Too many nodes');
   const selected = object(index(model.scenes, scene, 'scene'), 'scene'); noExtensions(selected, 'scene');
@@ -92,8 +97,17 @@ export function decodeGltfGeometry(model, suppliedBuffers, {
   function attribute(accessorIndex, name, count, morph = false) {
     const a = reader.read(accessorIndex), type = a.type, component = a.componentType;
     let valid = false;
-    if (Object.hasOwn(baseNames, name)) valid = type === (name === 'TANGENT' && !morph ? 'VEC4' : 'VEC3') && component === 5126 && !a.normalized;
-    else if (!morph && /^TEXCOORD_(0|[1-9]\d*)$/.test(name)) valid = type === 'VEC2' && (component === 5126 ? !a.normalized : unsigned.includes(component) && a.normalized === true);
+    if (Object.hasOwn(baseNames, name)) {
+      const shape = type === (name === 'TANGENT' && !morph ? 'VEC4' : 'VEC3');
+      const signed = component === 5120 || component === 5122;
+      // Quantized morph displacements are signed. Normal/tangent directions
+      // additionally require normalization; position integers keep their literal
+      // values when normalized=false. Never infer scales from accessor min/max.
+      const integer = name === 'POSITION' ? (morph ? signed : integerTypes.includes(component)) : signed && a.normalized === true;
+      valid = shape && (component === 5126 ? !a.normalized : quantized && integer);
+    }
+    else if (!morph && /^TEXCOORD_(0|[1-9]\d*)$/.test(name)) valid = type === 'VEC2' && (component === 5126 ? !a.normalized :
+      (unsigned.includes(component) && a.normalized === true) || (quantized && integerTypes.includes(component)));
     else if (!morph && /^COLOR_(0|[1-9]\d*)$/.test(name)) valid = ['VEC3','VEC4'].includes(type) && (component === 5126 ? !a.normalized : unsigned.includes(component) && a.normalized === true);
     else if (!morph && /^JOINTS_(0|[1-9]\d*)$/.test(name)) valid = type === 'VEC4' && unsigned.includes(component) && !a.normalized;
     else if (!morph && /^WEIGHTS_(0|[1-9]\d*)$/.test(name)) valid = type === 'VEC4' && (component === 5126 ? !a.normalized : unsigned.includes(component) && a.normalized === true);

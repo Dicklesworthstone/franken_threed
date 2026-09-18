@@ -170,7 +170,7 @@ export function prepareGltfAnimationModel(model,suppliedBuffers,{
   scene=model?.scene ?? 0,maxComponents=16777216,maxPrimitives=4096,
 }={}) {
   if (!Array.isArray(model?.extensionsRequired ?? [])) fail('SHAPE','extensionsRequired must be an array');
-  for (const name of model?.extensionsRequired ?? []) if (!['KHR_materials_unlit','KHR_texture_transform','KHR_lights_punctual'].includes(name)) fail('UNSUPPORTED',`Required extension needs source route: ${name}`);
+  for (const name of model?.extensionsRequired ?? []) if (!['KHR_materials_unlit','KHR_texture_transform','KHR_lights_punctual','KHR_mesh_quantization'].includes(name)) fail('UNSUPPORTED',`Required extension needs source route: ${name}`);
   const sceneView=decodeGltfSceneView(model,{scene});
   const copyright=model.asset?.copyright;
   if(copyright!==undefined && typeof copyright!=='string')fail('SHAPE','Asset copyright must be text');
