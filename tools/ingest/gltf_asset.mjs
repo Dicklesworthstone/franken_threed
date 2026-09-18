@@ -1,9 +1,10 @@
-/** Runtime glTF/GLB bytes, buffers and lazy core image loading. No Node, DOM or
+/** Runtime glTF/GLB bytes, meshopt buffers and lazy core image loading. No Node, DOM or
  * GPU dependency and no work at import time. All I/O uses the supplied Fetch API.
  * The byte budget counts unique encoded resources, not decoded meshes/images.
  * Parsed data is owned by the caller; do not mutate it during model construction.
  * https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html
  */
+import {prepareMeshoptBuffers} from './gltf_meshopt.mjs';
 export class GltfAssetError extends Error {
   constructor(code, message) { super(`${code}: ${message}`); this.name='GltfAssetError'; this.code=code; }
 }
@@ -91,7 +92,8 @@ function imageType(data) {
  * and stopped at maxResourceBytes/maxBytes even without Content-Length.
  */
 export async function loadGltfAsset(source,{
-  baseURL,fetch:fetcher=globalThis.fetch,signal,
+  baseURL,fetch:fetcher=globalThis.fetch,signal,meshoptDecoder=null,
+  maxDecodedBytes=128*1024*1024,maxDecodedBufferBytes=64*1024*1024,
   maxBytes=128*1024*1024,maxResourceBytes=64*1024*1024,maxResources=4096,allowedOrigins=[],
 }={}) {
   positive(maxBytes,'total byte limit');positive(maxResourceBytes,'resource byte limit');positive(maxResources,'resource count');
@@ -163,14 +165,24 @@ export async function loadGltfAsset(source,{
   let input;
   if(networkSource)input=(await read(base.href)).bytes;
   else {input=bytes(source);if(input.length>maxResourceBytes)fail('LIMIT','Model file exceeds resource limit');charge(input.length);}
-  const {json,bin}=parseGltfAsset(input,{maxBytes:maxResourceBytes});
-  const definitions=json.buffers ?? [],images=structuredClone(json.images ?? []),views=structuredClone(json.bufferViews ?? []);
+  const parsed=parseGltfAsset(input,{maxBytes:maxResourceBytes}),bin=parsed.bin;
+  let json=parsed.json;
+  const definitions=json.buffers ?? [],images=structuredClone(json.images ?? []);
+  let views=structuredClone(json.bufferViews ?? []);
   if(!Array.isArray(definitions)||!Array.isArray(images)||!Array.isArray(views)||definitions.length>maxResources||images.length>maxResources||views.length>maxResources*16)fail('LIMIT','Invalid or excessive resources');
-  // Validate every declared length before starting dependency I/O.
-  for(const item of definitions)if(!item||!Number.isSafeInteger(item.byteLength)||item.byteLength<1||item.byteLength>maxResourceBytes)fail('BUFFER','Invalid buffer byteLength');
-  const buffers=[];
+  // Expansion and fallback decisions precede dependency I/O, not just decoding.
+  const meshopt=prepareMeshoptBuffers(json,{decoder:meshoptDecoder,binaryBuffer:bin!==null,
+    maxEncodedBytes:maxBytes,maxDecodedBytes,maxDecodedBufferBytes,maxBufferViews:maxResources*16});
+  const skipped=new Set(meshopt.skippedBuffers);
+  // Unused fallback declarations may be large; never allocate/fetch fake bytes.
   for(let i=0;i<definitions.length;i++) {
-    abort(signal);const item=definitions[i];let data;
+    const item=definitions[i];
+    if(!item||!Number.isSafeInteger(item.byteLength)||item.byteLength<1||(!skipped.has(i)&&item.byteLength>maxResourceBytes))fail('BUFFER','Invalid buffer byteLength');
+  }
+  let buffers=[];
+  for(let i=0;i<definitions.length;i++) {
+    abort(signal);if(skipped.has(i)){buffers.push(null);continue;}
+    const item=definitions[i];let data;
     if(item.uri===undefined) {
       if(i!==0||bin===null||bin.length<item.byteLength||bin.length-item.byteLength>3)fail('BUFFER','Missing or invalid GLB BIN buffer');
       for(let j=item.byteLength;j<bin.length;j++)if(bin[j]!==0)fail('BUFFER','Nonzero BIN padding');
@@ -181,6 +193,8 @@ export async function loadGltfAsset(source,{
     }
     buffers.push(data.subarray(0,item.byteLength));
   }
+  const decoded=await meshopt.decode(buffers,{signal});abort(signal);
+  json=decoded.json;buffers=decoded.buffers;views=structuredClone(json.bufferViews ?? []);
   const imageCache=new Map();
   function readImage(index) {
     try {
@@ -210,5 +224,7 @@ export async function loadGltfAsset(source,{
     return imageCache.get(index);
   }
   abort(signal);
-  return Object.freeze({json,buffers:Object.freeze(buffers),readImage,get bytesLoaded(){return total;}});
+  return Object.freeze({json,sourceJson:decoded.sourceJson,buffers:Object.freeze(buffers),readImage,
+    decodedBytes:decoded.decodedBytes,decodedBufferViews:decoded.decodedBufferViews,
+    get bytesLoaded(){return total;}});
 }
