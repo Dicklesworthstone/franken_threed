@@ -25,6 +25,59 @@ const model = createCpuGltfAnimationModel(prepared.json, prepared.buffers);
 // Keep/reuse dracoLoader until all its jobs have drained, then dispose it.
 ```
 
+## Direct URL/GLB loading
+
+The same decoder is now accepted by `loadGltfAsset`, including its existing
+streamed HTTP(S), data-URI and embedded GLB routes:
+
+```js
+import { loadGltfAsset } from './gltf_asset.mjs';
+const asset = await loadGltfAsset(modelURL, {
+  dracoDecoder: dracoLoader,
+  signal,
+  maxDecodedBytes: 128 * 1024 * 1024,
+});
+```
+
+The owning GPU model loader forwards it through the existing `assets` settings:
+
+```js
+import { loadGpuGltfAnimationScene } from './gltf_scene_loader.mjs';
+const model = await loadGpuGltfAnimationScene(device, modelURL, {
+  assets: { dracoDecoder: dracoLoader },
+  signal,
+  picking: true,
+  exporting: true,
+});
+```
+
+No manual geometry/accessor assembly is required between loading and model
+construction. Existing material, scene-view, deformation and rendering restrictions
+still apply. The model does not own or dispose the borrowed Draco loader.
+
+Meshopt and Draco can coexist, even when a meshopt view contains a Draco
+bitstream. Meshopt view decoding precedes Draco geometry decoding, with metadata
+rebound to the resolved views. `maxDecodedBytes` is ONE shared output budget, not
+an independent allowance for each codec. All known allocations are checked before
+dependency I/O; undeclared generated indices are checked before copying them.
+`decodedBytes` reports the sum, `decodedBufferViews` retains its meshopt count,
+and `decodedPrimitives` reports the Draco primitive count. `bytesLoaded` remains
+the encoded-input count. `sourceJson` retains both original codec descriptions.
+
+The loader skips proven-unused Draco fallback files when decoding, or the
+compressed file when using optional fallback. Shared accessor, morph, skin,
+animation, sparse and image references keep their storage live. Opaque extensions
+conservatively disable Draco-specific pruning; meshopt owns its own buffer
+selection. No declared source storage is synthesized. Skipped original buffer
+slots are explicitly `null`, and unused original accessor descriptions may still
+reference them. The normalized primitive references use real appended storage.
+
+Existing credential-free asset fetching, origin allowlists, streaming input
+limits, cancellation and lazy-image caching remain in force. **Decoder code and
+worker requests belong to DRACOLoader's separate configuration**, not the asset
+Fetch policy. Configure/package those resources for your deployment; this adapter
+does not silently put decoder-code requests under an asset-origin guarantee.
+
 ## Data and ownership
 
 The adapter passes unique Draco attribute IDs and the accessor's requested typed
@@ -73,6 +126,7 @@ primitive does not publish a partial asset or rewrite source data.
 
 `prepareDracoMeshes` exposes a one-shot `decode(buffers, {signal})` plan for
 loaders that need metadata/capability/budget preflight before resource I/O.
+Its `skippedBuffers` identifies proven-unused source storage for loaders.
 Its `decodedBytes` is the reservation for declared accessor output; generated
 indices, where no source index accessor exists, are additional checked output.
 
@@ -82,17 +136,22 @@ This adapter consumes DRACOLoader's **triangle-list** output for source
 `TRIANGLES` primitives. Compressed `TRIANGLE_STRIP` requires a topology-aware
 adapter and is explicitly refused rather than guessed. Ordinary uncompressed
 geometry retains its existing topology paths. Optional Draco without a decoder
-uses backed or sparse source fallback accessors; required compression without a
+uses backed or sparse source fallback accessors; point-cloud-like decoder
+outputs without connectivity are refused. Required compression without a
 decoder fails. No missing fallback is turned into zero-filled geometry.
 
 The tests exercise the real adapter against an explicit recording decoder and
 BufferGeometry-shaped outputs. They check typed requests, layouts, ownership,
 shared-accessor isolation, failure and cancellation behavior. They do not decode
 Draco bitstreams, run a native/Wasm decoder, render pixels, establish full
-GLTFLoader parity or measure a speedup.
+GLTFLoader parity or measure a speedup. Asset integration tests execute the
+production asset, meshopt and Draco adapters with explicit codec doubles and
+genuine Node Response/ReadableStream primitives; they do not contact real HTTP
+services, decode bitstreams or construct a GPU scene. The unchanged asset-loader
+regression suite runs alongside them.
 
 ```sh
-node --test tools/ingest/gltf_draco.test.mjs
+node --test tools/ingest/gltf_draco*.test.mjs tools/ingest/gltf_asset.test.mjs
 ```
 
 Interface reference: Three r186 DRACOLoader, source commit

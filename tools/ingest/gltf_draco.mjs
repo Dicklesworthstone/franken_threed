@@ -38,6 +38,46 @@ function byteView(value) {
   try { return ArrayBuffer.isView(value) ? new Uint8Array(buffer, value.byteOffset, value.byteLength) : new Uint8Array(buffer); }
   catch { fail('BUFFER', 'Detached bytes'); }
 }
+// Prune only storage whose ownership is proved by core glTF references. Opaque
+// extensions (including meshopt's extra buffer references) disable this optional
+// pruning; their normalizers/decoders retain control of those dependencies.
+function unusedBuffers(model, records, available) {
+  const safe = new Set([EXT, 'KHR_mesh_quantization', 'KHR_materials_unlit', 'KHR_texture_transform', 'KHR_lights_punctual']);
+  if ([...(model.extensionsUsed ?? []), ...(model.extensionsRequired ?? [])].some(name => !safe.has(name))) return [];
+  const stack = [model], seen = new Set();
+  while (stack.length) {
+    const value = stack.pop();
+    if (!value || typeof value !== 'object' || seen.has(value)) continue;
+    seen.add(value);
+    if (Object.keys(value.extensions ?? {}).some(name => !safe.has(name))) return [];
+    for (const child of Object.values(value)) if (child && typeof child === 'object') stack.push(child);
+  }
+  const accessors = model.accessors ?? [], views = model.bufferViews ?? [];
+  const replaced = new Set(available ? records.flatMap(r => [...r.attributes.map(a => a.at), ...(r.indices ? [r.indices.at] : [])]) : []);
+  const keepAccessors = new Set(accessors.map((_, i) => i).filter(i => !replaced.has(i)));
+  const ignoredViews = new Set(available ? [...replaced].map(i => accessors[i].bufferView).filter(i => i !== undefined) : records.map(r => r.source));
+  for (const mesh of model.meshes ?? []) for (const p of mesh.primitives) {
+    const draco = available && p.extensions?.[EXT];
+    for (const [name, at] of Object.entries(p.attributes ?? {})) if (!draco || !Object.hasOwn(draco.attributes, name)) keepAccessors.add(at);
+    if (p.indices !== undefined && !draco) keepAccessors.add(p.indices);
+    for (const target of p.targets ?? []) for (const at of Object.values(target)) keepAccessors.add(at);
+  }
+  for (const skin of model.skins ?? []) if (skin.inverseBindMatrices !== undefined) keepAccessors.add(skin.inverseBindMatrices);
+  for (const animation of model.animations ?? []) for (const sampler of animation.samplers ?? []) {
+    keepAccessors.add(sampler.input); keepAccessors.add(sampler.output);
+  }
+  const keepViews = new Set(views.map((_, i) => i).filter(i => !ignoredViews.has(i)));
+  for (const at of keepAccessors) {
+    const a = accessors[at]; if (!a) continue;
+    if (a.bufferView !== undefined) keepViews.add(a.bufferView);
+    if (a.sparse) { keepViews.add(a.sparse.indices?.bufferView); keepViews.add(a.sparse.values?.bufferView); }
+  }
+  for (const image of model.images ?? []) if (image.bufferView !== undefined) keepViews.add(image.bufferView);
+  if (available) for (const r of records) keepViews.add(r.source);
+  const needed = new Set([...keepViews].map(i => views[i]?.buffer));
+  return [...new Set([...ignoredViews].map(i => views[i]?.buffer))]
+    .filter(i => Number.isSafeInteger(i) && i >= 0 && !needed.has(i)).sort((a, b) => a - b);
+}
 function attributeLayout(attribute, count, width, Type = null) {
   object(attribute, 'decoded attribute');
   if (attribute.itemSize !== width || attribute.count !== count) fail('DECODE', 'Decoded attribute count/width disagrees with accessor');
@@ -88,7 +128,7 @@ export function prepareDracoMeshes(model, {
   const meshes = list(model.meshes ?? [], 'meshes');
   const hasDraco = meshes.some(mesh => Array.isArray(mesh?.primitives) && mesh.primitives.some(p => Object.hasOwn(p?.extensions ?? {}, EXT)));
   const required = list(model.extensionsRequired ?? [], 'required extensions').includes(EXT);
-  if (!hasDraco && !required) return Object.freeze({decodedBytes: 0, async decode(buffers, {signal} = {}) {
+  if (!hasDraco && !required) return Object.freeze({decodedBytes: 0, skippedBuffers: Object.freeze([]), async decode(buffers, {signal} = {}) {
     abort(signal); return {json: model, sourceJson: model, buffers, decodedBytes: 0, decodedPrimitives: 0};
   }});
   const available = decoder != null && decoder.supported !== false;
@@ -148,10 +188,21 @@ export function prepareDracoMeshes(model, {
       records.push({mesh, primitive, source: ext.bufferView, attributes, indices, count: positions.count});
     }
   }
+  const skipped = unusedBuffers(snapshot, records, available);
   let consumed = false;
-  return Object.freeze({decodedBytes: reservedBytes, async decode(supplied, {signal} = {}) {
+  return Object.freeze({decodedBytes: reservedBytes, skippedBuffers: Object.freeze(skipped), async decode(supplied, {signal} = {}) {
     if (consumed) fail('STATE', 'Draco plan is single-use'); consumed = true; abort(signal);
     if (!Array.isArray(supplied) || supplied.length !== buffers.length) fail('BUFFER', 'Supply buffers in original index order');
+    if (!available) for (const r of records) for (const field of [...r.attributes, ...(r.indices ? [r.indices] : [])]) {
+      const a = accessors[field.at];
+      const references = [a.bufferView, a.sparse?.indices?.bufferView, a.sparse?.values?.bufferView].filter(i => i !== undefined);
+      for (const at of references) {
+        const view = index(views, at, 'fallback view'), declaration = index(buffers, view.buffer, 'fallback buffer');
+        const data = byteView(supplied[view.buffer]), offset = integer(view.byteOffset ?? 0, 'fallback offset');
+        integer(view.byteLength, 'fallback length', 1);
+        if (data.length < declaration.byteLength || view.byteLength > declaration.byteLength - offset) fail('FALLBACK', 'Truncated fallback storage');
+      }
+    }
     const sources = available ? records.map(record => {
       const view = views[record.source];
       if (Object.keys(view.extensions ?? {}).length) fail('LAYOUT', 'Resolve compressed bufferView extensions before Draco decoding');
@@ -203,7 +254,9 @@ export function prepareDracoMeshes(model, {
             p.attributes[a.name] = publish(data, accessors[a.at], a.stride, 34962);
           }
           const declared = record.indices, indexAttribute = geometry.index;
-          if (declared && !indexAttribute) fail('DECODE', 'Decoder omitted required mesh indices');
+          // DRACOLoader supplies an index for every decoded triangular mesh;
+          // point clouds also return BufferGeometry, but cannot stand in for it.
+          if (!indexAttribute) fail('DECODE', 'Decoder did not return triangle connectivity');
           if (indexAttribute) {
             const count = integer(indexAttribute.count, 'decoded index count', 1);
             if (count % 3 || (declared && count !== declared.count)) fail('DECODE', 'Decoded index count disagrees with triangle accessor');
@@ -217,7 +270,7 @@ export function prepareDracoMeshes(model, {
               view[setter](k * size, value, true);
             }
             p.indices = publish(data, declared ? accessors[declared.at] : {type: 'SCALAR', componentType, count}, size, 34963);
-          } else if (record.count % 3) fail('DECODE', 'Nonindexed triangles need complete vertex triples');
+          }
           decodedPrimitives++;
         } catch (error) {
           abort(signal); if (error instanceof GltfDracoError) throw error;
@@ -229,6 +282,7 @@ export function prepareDracoMeshes(model, {
       }
       delete p.extensions[EXT]; if (!Object.keys(p.extensions).length) delete p.extensions;
     }
+    for (const i of skipped) output[i] = null;
     for (const key of ['extensionsRequired', 'extensionsUsed']) if (json[key]) json[key] = json[key].filter(name => name !== EXT);
     abort(signal); return {json, sourceJson: snapshot, buffers: output, decodedBytes, decodedPrimitives};
   }});

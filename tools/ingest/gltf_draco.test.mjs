@@ -99,10 +99,10 @@ test('geometry without an index accessor gains private decoded connectivity, not
   assert.equal(f.primitive.indices,undefined);
 });
 
-test('nonindexed decoder output is accepted only for complete source vertex triples',async()=>{
+test('point-cloud-like decoder output cannot masquerade as triangles even without an index accessor',async()=>{
   const f=fixture({indices:false}),base=f.decoder.decodeGeometry.bind(f.decoder);
   f.decoder.decodeGeometry=(...args)=>base(...args).then(g=>{g.index=null;return g;});
-  const r=await decodeDracoMeshes(f.json,f.buffers,{decoder:f.decoder});assert.equal(r.json.meshes[0].primitives[0].indices,undefined);
+  await assert.rejects(decodeDracoMeshes(f.json,f.buffers,{decoder:f.decoder}),code('DECODE'));assert.equal(f.geometries[0].disposed,1);
   f.primitive.indices=1;await assert.rejects(decodeDracoMeshes(f.json,f.buffers,{decoder:f.decoder}),code('DECODE'));assert.equal(f.geometries[1].disposed,1);
 });
 

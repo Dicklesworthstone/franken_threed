@@ -1,10 +1,11 @@
-/** Runtime glTF/GLB bytes, meshopt buffers and lazy core image loading. No Node, DOM or
+/** Runtime glTF/GLB bytes, meshopt/Draco geometry and lazy core image loading. No Node, DOM or
  * GPU dependency and no work at import time. All I/O uses the supplied Fetch API.
  * The byte budget counts unique encoded resources, not decoded meshes/images.
  * Parsed data is owned by the caller; do not mutate it during model construction.
  * https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html
  */
 import {prepareMeshoptBuffers} from './gltf_meshopt.mjs';
+import {prepareDracoMeshes} from './gltf_draco.mjs';
 export class GltfAssetError extends Error {
   constructor(code, message) { super(`${code}: ${message}`); this.name='GltfAssetError'; this.code=code; }
 }
@@ -92,7 +93,7 @@ function imageType(data) {
  * and stopped at maxResourceBytes/maxBytes even without Content-Length.
  */
 export async function loadGltfAsset(source,{
-  baseURL,fetch:fetcher=globalThis.fetch,signal,meshoptDecoder=null,
+  baseURL,fetch:fetcher=globalThis.fetch,signal,meshoptDecoder=null,dracoDecoder=null,
   maxDecodedBytes=128*1024*1024,maxDecodedBufferBytes=64*1024*1024,
   maxBytes=128*1024*1024,maxResourceBytes=64*1024*1024,maxResources=4096,allowedOrigins=[],
 }={}) {
@@ -173,7 +174,10 @@ export async function loadGltfAsset(source,{
   // Expansion and fallback decisions precede dependency I/O, not just decoding.
   const meshopt=prepareMeshoptBuffers(json,{decoder:meshoptDecoder,binaryBuffer:bin!==null,
     maxEncodedBytes:maxBytes,maxDecodedBytes,maxDecodedBufferBytes,maxBufferViews:maxResources*16});
-  const skipped=new Set(meshopt.skippedBuffers);
+  const dracoOptions={decoder:dracoDecoder,maxEncodedBytes:maxBytes,
+    maxDecodedBytes:maxDecodedBytes-meshopt.decodedBytes,maxDecodedBufferBytes,maxPrimitives:maxResources};
+  const draco=prepareDracoMeshes(json,dracoOptions);
+  const skipped=new Set([...meshopt.skippedBuffers,...draco.skippedBuffers]);
   // Unused fallback declarations may be large; never allocate/fetch fake bytes.
   for(let i=0;i<definitions.length;i++) {
     const item=definitions[i];
@@ -194,7 +198,12 @@ export async function loadGltfAsset(source,{
     buffers.push(data.subarray(0,item.byteLength));
   }
   const decoded=await meshopt.decode(buffers,{signal});abort(signal);
-  json=decoded.json;buffers=decoded.buffers;views=structuredClone(json.bufferViews ?? []);
+  // Meshopt may relocate the very bufferView carrying the Draco bitstream.
+  // Rebind the metadata plan to those decoded views, without decoding twice.
+  const preparedDraco=decoded.json===json?draco:prepareDracoMeshes(decoded.json,dracoOptions);
+  const geometry=await preparedDraco.decode(decoded.buffers,{signal});abort(signal);
+  const sourceJson=parsed.json;
+  json=geometry.json;buffers=geometry.buffers;views=structuredClone(json.bufferViews ?? []);
   const imageCache=new Map();
   function readImage(index) {
     try {
@@ -224,7 +233,8 @@ export async function loadGltfAsset(source,{
     return imageCache.get(index);
   }
   abort(signal);
-  return Object.freeze({json,sourceJson:decoded.sourceJson,buffers:Object.freeze(buffers),readImage,
-    decodedBytes:decoded.decodedBytes,decodedBufferViews:decoded.decodedBufferViews,
+  return Object.freeze({json,sourceJson,buffers:Object.freeze(buffers),readImage,
+    decodedBytes:decoded.decodedBytes+geometry.decodedBytes,decodedBufferViews:decoded.decodedBufferViews,
+    decodedPrimitives:geometry.decodedPrimitives,
     get bytesLoaded(){return total;}});
 }

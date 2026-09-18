@@ -67,7 +67,7 @@ export function prepareMeshoptBuffers(model,{
   const present=inputViews.some(v=>names.some(n=>Object.hasOwn(v?.extensions ?? {},n)))||
     inputBuffers.some(b=>names.some(n=>Object.hasOwn(b?.extensions ?? {},n)))||
     names.some(n=>Array.isArray(model.extensionsRequired)&&model.extensionsRequired.includes(n));
-  if(!present)return Object.freeze({skippedBuffers:Object.freeze([]),async decode(buffers,{signal}={}){
+  if(!present)return Object.freeze({decodedBytes:0,skippedBuffers:Object.freeze([]),async decode(buffers,{signal}={}){
     abort(signal);return {json:model,sourceJson:model,buffers,decodedBytes:0,decodedBufferViews:0};
   }});
   const snapshot=structuredClone(model),views=snapshot.bufferViews ?? [],definitions=snapshot.buffers ?? [];
@@ -131,7 +131,7 @@ export function prepareMeshoptBuffers(model,{
   }
   if(records.some(r=>r.decode)&&typeof decoder.decodeGltfBufferAsync!=='function'&&typeof decoder.decodeGltfBuffer!=='function')fail('DECODER','Invalid MeshoptDecoder interface');
   let consumed=false;
-  return Object.freeze({skippedBuffers:Object.freeze(skipped),async decode(supplied,{signal}={}){
+  return Object.freeze({decodedBytes,skippedBuffers:Object.freeze(skipped),async decode(supplied,{signal}={}){
     if(consumed)fail('STATE','Decode plan has already been consumed');consumed=true;abort(signal);
     if(!Array.isArray(supplied)||supplied.length!==definitions.length)fail('BUFFER','Supply bytes by original buffer index');
     const buffers=supplied.slice(),sources=[];
