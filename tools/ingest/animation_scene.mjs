@@ -37,6 +37,14 @@
  * source order. An explicit frame.draws list always preserves caller order;
  * sortObjects:false also preserves the original implicit list. Intersecting or
  * unusually offset transparent geometry may need an explicit draw list.
+ *
+ * frustumCulling:true opts into conservative current-pose bounds for implicit
+ * draws. Explicit frame.draws bypasses culling, including custom world matrices.
+ * maxBoundsBytes/maxBoundsComponents separately bound CPU summaries/source scans.
+ * Cull decisions do not skip GPU deformation or change update/submit timing.
+ * cullingStats acknowledges the latest successful render submission, not GPU
+ * completion. Overflowed bounds remain visible. No custom shader displacement
+ * or occlusion is assumed; native backend pixel equivalence is not certified.
  */
 import {createAnimationDrawOrder} from './animation_draw_order.mjs';
 import {createAnimationController} from './animation_controller.mjs';
@@ -46,15 +54,16 @@ const fail = (code, message) => { throw new AnimationRenderError(code, message);
 const TEXTURE_FIELDS = ['baseColorTexture', 'metallicRoughnessTexture', 'normalTexture', 'emissiveTexture'];
 
 export async function createGpuAnimationScene(device, pose, drawables, {
-  sortObjects = true, renderer: renderOptions = {}, deformer: deformOptions = {}, maxMeshes = 256, maxBytes = 256 * 1024 * 1024,
+  sortObjects = true, frustumCulling = false, maxBoundsBytes = 16*1024*1024, maxBoundsComponents = 16777216, renderer: renderOptions = {}, deformer: deformOptions = {}, maxMeshes = 256, maxBytes = 256 * 1024 * 1024,
 } = {}) {
   if (!Number.isSafeInteger(maxMeshes) || maxMeshes < 1 || maxMeshes > 4096 ||
       !Number.isSafeInteger(maxBytes) || maxBytes < 1 || !Array.isArray(drawables) ||
       !drawables.length || drawables.length > maxMeshes) fail('ANIMATION_SCENE_LIMIT', 'Invalid mesh count or GPU buffer budget');
   if (typeof sortObjects !== 'boolean') fail('ANIMATION_SCENE_SORT', 'sortObjects must be boolean');
+  if (typeof frustumCulling !== 'boolean' || (frustumCulling && (!Number.isSafeInteger(maxBoundsBytes) || maxBoundsBytes < 1 || !Number.isSafeInteger(maxBoundsComponents) || maxBoundsComponents < 1))) fail('ANIMATION_SCENE_CULL', 'Invalid frustum culling options');
   const controller = createAnimationController(pose), initialVersion = pose.version;
   const deformers = [], meshes = [], ordering = [];
-  let drawOrder;
+  let drawOrder, cullingStats = null;
   let renderer, deformationBytes = 0, poseVersion = initialVersion, disposed = false, terminal = null, busy = false;
   let lightingAllocated = false, materialComponents = 0;
   function copyMaterialArray(value, key) {
@@ -67,6 +76,7 @@ export async function createGpuAnimationScene(device, pose, drawables, {
     return Array.from(value);
   }
   function release() {
+    drawOrder?.dispose();
     for (const mesh of meshes) mesh.dispose();
     for (const gpu of deformers) gpu.dispose();
     renderer?.dispose(); controller.dispose(); deformationBytes = 0;
@@ -146,10 +156,11 @@ export async function createGpuAnimationScene(device, pose, drawables, {
         maxBytes: Math.min(remaining, deformOptions.maxBytes ?? 128 * 1024 * 1024)});
       deformers.push(gpu); deformationBytes += gpu.bufferBytes; unchanged();
       meshes.push(await renderer.addMesh(gpu, material)); lightingAllocated ||= lit; unchanged();
-      ordering.push({mesh: meshes.at(-1), deformer: gpu, alphaMode: material.alphaMode});
+      ordering.push({mesh: meshes.at(-1), deformer: gpu, alphaMode: material.alphaMode, ...(frustumCulling ? {geometry} : {})});
       if (renderer.allocatedBytes + deformationBytes > maxBytes) fail('ANIMATION_SCENE_LIMIT', 'Scene GPU buffer budget exceeded');
     }
-    if (sortObjects) drawOrder = createAnimationDrawOrder(ordering);
+    if (sortObjects || frustumCulling) drawOrder = createAnimationDrawOrder(ordering, {pose, sortObjects, frustumCulling, maxBoundsBytes, maxBoundsComponents});
+    ordering.length = 0;
   } catch (error) { release(); throw error; }
   function exclusive(operation) {
     live(); if (busy) fail('ANIMATION_SCENE_REENTRANT', 'GPU scene operation cannot be reentered');
@@ -159,6 +170,7 @@ export async function createGpuAnimationScene(device, pose, drawables, {
     try {
       const nextVersion = pose.version;
       for (const gpu of deformers) gpu.update();
+      if (frustumCulling) drawOrder.updateBounds();
       if (deformers.some(gpu => gpu.poseVersion !== nextVersion) || pose.version !== nextVersion) {
         fail('ANIMATION_SCENE_CHANGED', 'Pose changed during GPU upload');
       }
@@ -174,15 +186,22 @@ export async function createGpuAnimationScene(device, pose, drawables, {
   const scene = Object.freeze({pose, controller, draws: Object.freeze(meshes), deformers: Object.freeze(deformers),
     get poseVersion() { return poseVersion; },
     get bufferBytes() { return renderer.allocatedBytes + deformationBytes; },
+    get boundsBytes() { return drawOrder?.boundsBytes ?? 0; },
+    get cullingStats() { return cullingStats; },
     get disposed() { return disposed; }, get failed() { return terminal !== null || renderer.failed || deformers.some(gpu => gpu.failed); },
     update(delta, options) { return exclusive(() => { controller.update(delta, options); return upload(); }); },
     upload() { return exclusive(upload); },
     render(frame) { return exclusive(() => {
       synchronized();
       try {
-        const prepared = {...frame};
+        const prepared = {...frame}, implicit = prepared.draws == null;
         prepared.draws ??= drawOrder ? drawOrder.order(prepared.viewProjection) : meshes;
+        // Use the exact camera snapshot tested by culling for shader packing too.
+        if (frustumCulling && implicit) prepared.viewProjection = drawOrder.viewProjection;
         renderer.render(prepared);
+        if (frustumCulling) cullingStats = implicit ? drawOrder.lastCulling : Object.freeze({
+          poseVersion, testedMeshes: 0, culledMeshes: 0, submittedDraws: prepared.draws.length,
+        });
       }
       catch (error) { if (renderer.failed) failGroup(error); throw error; }
       return scene;

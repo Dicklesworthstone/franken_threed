@@ -129,7 +129,7 @@ export function buildAnimation(entryPath,outDir,{rootDir=path.dirname(path.resol
     outputs.set(name,fs.readFileSync(new URL('./'+name,import.meta.url),'utf8'));
   }
   if(webgpu) {
-    for(const name of ['animation_webgpu.mjs','animation_render.mjs','animation_scene.mjs','animation_draw_order.mjs']) {
+    for(const name of ['animation_webgpu.mjs','animation_render.mjs','animation_scene.mjs','animation_draw_order.mjs','animation_bounds.mjs']) {
       outputs.set(name,fs.readFileSync(new URL('./'+name,import.meta.url),'utf8'));
     }
     outputs.set('gpu_playback.mjs',`export {createPlayer,createAnimationController,createAnimationDeformer} from './playback.mjs';\nexport {createGpuAnimationDeformer} from './animation_webgpu.mjs';\nexport {createGpuAnimationRenderer} from './animation_render.mjs';\nexport {createGpuAnimationScene} from './animation_scene.mjs';\n`);

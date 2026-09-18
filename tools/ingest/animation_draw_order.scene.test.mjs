@@ -152,7 +152,7 @@ test('relocated GPU packages include and hash the sorting dependency; CPU output
       'animation_webgpu.mjs':deformerSource,'animation_render.mjs':rendererSource,
       'animation_gltf.mjs':'export function decodeGltfAnimation(model) { return model; }\n',
     };
-    for (const name of ['animation_scene.mjs','animation_draw_order.mjs','build_animation.mjs']) {
+    for (const name of ['animation_scene.mjs','animation_draw_order.mjs','animation_bounds.mjs','build_animation.mjs']) {
       fs.copyFileSync(new URL('./'+name,import.meta.url),path.join(modules,name));
     }
     for (const [name,content] of Object.entries(runtimeModules)) fs.writeFileSync(path.join(modules,name),content);
