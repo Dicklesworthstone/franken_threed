@@ -6,6 +6,8 @@
  * sample() resets untargeted values to the imported rest pose, and loop timing
  * is an explicit caller choice. Outputs retain identity across samples. Input
  * definitions are copied once; edits to published output arrays are not inputs.
+ * edit() publishes transactional local-pose changes; sample/blend/reset replace
+ * those changes on the next call. snapshotLocalPose() returns independent data.
  *
  * Conventions: glTF 2.0 section 3.11 / Appendix C; column-major T*R*S;
  * mesh-local palette = inverse(meshWorld) * jointWorld * inverseBindMatrix.
@@ -15,6 +17,12 @@ export class AnimationPoseError extends Error {
   constructor(code, message) { super(`${code}: ${message}`); this.name = 'AnimationPoseError'; this.code = code; }
 }
 const fail = (code, message) => { throw new AnimationPoseError(code, message); };
+// Capture publication operations before caller-owned output views are exposed.
+const apply = Reflect.apply;
+const typedPrototype = Object.getPrototypeOf(Float64Array.prototype);
+const typedSet = typedPrototype.set;
+const typedLength = Object.getOwnPropertyDescriptor(typedPrototype, 'length').get;
+const typedBuffer = Object.getOwnPropertyDescriptor(typedPrototype, 'buffer').get;
 const identity = () => [1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1];
 const finite = (value, label) => {
   if (typeof value !== 'number' || !Number.isFinite(value)) fail('ANIMATION_VALUE', `${label} must be finite`);
@@ -225,6 +233,11 @@ export function createAnimationPlayer(definition) {
   // animate a property must not dilute another clip's contribution to it.
   const paths=['translation','rotation','scale','weights'];
   const poseFields=['translations','rotations','scales','morphWeights'];
+  // Private double-buffered local state: failed evaluations and caller writes to
+  // exposed arrays must never become the baseline of a subsequent edit. Swap
+  // these four buffers at commit; no extra full-pose copy on sample/blend.
+  const committed=Object.fromEntries(poseFields.map(field=>[field,scratch[field].slice()]));
+  let currentRoot=null,currentMatrices=matrices;
   const rest=[baseT,baseQ,baseS,restW],bindings=new Map();
   let maxWidth=4;
   for(const clip of clips)for(const channel of clip.channels) {
@@ -240,7 +253,7 @@ export function createAnimationPlayer(definition) {
   const layerScratch=[];
   function checkStorage() {
     for(const field of fields){
-      try{new Uint8Array(published[field].buffer,0,0);if(published[field].length!==scratch[field].length)throw new Error();}
+      try{new Uint8Array(apply(typedBuffer,published[field],[]),0,0);if(apply(typedLength,published[field],[])!==scratch[field].length)throw new Error();}
       catch{fail('ANIMATION_OUTPUT_STORAGE','Published pose buffers must not be detached');}
     }
   }
@@ -357,9 +370,67 @@ export function createAnimationPlayer(definition) {
     }
     return publishPose(root,0,-1,'blend');
   }
-  function publishPose(root,sampled,clip,mode) {
+  /** Absolute local edits, evaluated together in hierarchy order. Omitted
+   * fields and rootMatrix preserve the last committed pose, NOT public-array
+   * mutations or dirty scratch from a failed operation. Matrix nodes keep their
+   * representation; edits never silently decompose shear or retarget tracks.
+   */
+  function evaluateEdit(edits,options={}) {
+    if(!options||typeof options!=='object'||Array.isArray(options)||
+       Object.keys(options).some(key=>key!=='rootMatrix'))fail('ANIMATION_EDIT','Invalid edit options');
+    if(!Array.isArray(edits)||edits.length>n)fail('ANIMATION_EDIT','Expected at most one edit per node');
+    const inputRoot=options.rootMatrix;
+    const root=inputRoot===undefined?currentRoot:inputRoot===null?null:affine(inputRoot,'Root matrix');
+    const changes=[],seen=new Set();let nextMatrices=currentMatrices;
+    // Complete validation and snapshotting precedes any scratch writes. Inputs
+    // may explicitly borrow published storage; overlapping reads remain stable.
+    for(const input of edits) {
+      if(!input||typeof input!=='object'||Array.isArray(input)||
+         Object.keys(input).some(key=>!['node','translation','rotation','scale','weights','matrix'].includes(key)))fail('ANIMATION_EDIT','Invalid node edit');
+      const node=integer(input.node,n,'Edited node');
+      if(seen.has(node))fail('ANIMATION_EDIT','Duplicate edited node');seen.add(node);
+      const change={node};let count=0;
+      for(const key of ['translation','rotation','scale','weights','matrix']) {
+        const value=input[key];if(value===undefined)continue;count++;
+        if(key==='matrix') {
+          if(!matrices.has(node))fail('ANIMATION_EDIT','TRS nodes require TRS edits');
+          change.matrix=affine(value,'Edited matrix');
+        } else {
+          if(key!=='weights'&&matrices.has(node))fail('ANIMATION_EDIT','Matrix nodes require matrix edits');
+          const width=key==='weights'?morphOffsets[node+1]-morphOffsets[node]:key==='rotation'?4:3;
+          if(!width)fail('ANIMATION_EDIT','Node has no morph weights');
+          change[key]=numbers(value,width,'Edited '+key);
+          if(key==='rotation'){unit(change[key],0,'Edited rotation');normalize(change[key],0);}
+        }
+      }
+      if(!count)fail('ANIMATION_EDIT','Empty node edit');changes.push(change);
+    }
+    for(const field of poseFields)scratch[field].set(committed[field]);
+    for(const change of changes) {
+      const node=change.node;
+      for(let kind=0;kind<4;kind++) {
+        const value=change[paths[kind]];if(value===undefined)continue;
+        scratch[poseFields[kind]].set(value,kind===3?morphOffsets[node]:node*(kind===1?4:3));
+      }
+      if(change.matrix) {
+        if(nextMatrices===currentMatrices)nextMatrices=new Map(currentMatrices);
+        nextMatrices.set(node,change.matrix);
+      }
+    }
+    return publishPose(root,currentTime,currentClip,'edit',nextMatrices);
+  }
+  // The arrays in this snapshot belong to the caller. In particular, neither
+  // source definitions nor writable published matrices are the solver's truth.
+  function snapshotLocalPose() {
+    return Object.freeze({format:'f3d-local-pose-v1',nodeCount:n,version,
+      ...Object.fromEntries(poseFields.map(field=>[field,committed[field].slice()])),
+      parents:parents.slice(),morphOffsets:morphOffsets.slice(),restRotations:baseQ.slice(),
+      matrices:Object.freeze([...currentMatrices].map(([node,matrix])=>Object.freeze({node,matrix:matrix.slice()}))),
+      rootMatrix:currentRoot===null?null:currentRoot.slice()});
+  }
+  function publishPose(root,sampled,clip,mode,matrixState=matrices) {
     for(const node of order) {
-      if(matrices.has(node))local.set(matrices.get(node),node*16);
+      if(matrixState.has(node))local.set(matrixState.get(node),node*16);
       else compose(scratch.translations,scratch.rotations,scratch.scales,node,local);
       if(parents[node]!==-1)multiply(scratch.worldMatrices,parents[node]*16,local,node*16,scratch.worldMatrices,node*16);
       else if(root)multiply(root,0,local,node*16,scratch.worldMatrices,node*16);
@@ -377,13 +448,17 @@ export function createAnimationPlayer(definition) {
     // half-updated pose. No callbacks or source effects run during evaluation.
     for(const field of fields)for(const value of scratch[field])if(!Number.isFinite(value))fail('ANIMATION_VALUE',`Non-finite ${field}`);
     checkStorage();
-    for(const field of fields)published[field].set(scratch[field]);
+    for(const field of fields)apply(typedSet,published[field],[scratch[field]]);
+    for(const field of poseFields){const previous=committed[field];committed[field]=scratch[field];scratch[field]=previous;}
+    currentRoot=root;currentMatrices=matrixState;
     version++;currentTime=sampled;currentClip=clip;currentMode=mode;return player;
   }
   const player=Object.freeze({ ...published,nodeCount:n,morphOffsets:morphOffsets.slice(),
     clips:Object.freeze(clips.map(({name,duration})=>Object.freeze({name,duration}))),instances:Object.freeze(instances),
     sample(time,options){return run(evaluate,time,options);},
     blend(layers,options){return run(evaluateBlend,layers,options);},
+    edit(edits,options){return run(evaluateEdit,edits,options);},
+    snapshotLocalPose(){return run(snapshotLocalPose);},
     reset(){return run(evaluate,0,{clip:-1});},
     get version(){return version;},get time(){return currentTime;},get clip(){return currentClip;},get mode(){return currentMode;},
     dispose(){if(busy)fail('ANIMATION_REENTRANT','Cannot dispose during evaluation');disposed=true;},get disposed(){return disposed;},
