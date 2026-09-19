@@ -122,6 +122,9 @@ export function animationEnvironmentShader(cube=false){
  * signal promptly rejects preparation; already submitted GPU work is not undone.
  * Source must remain unchanged until this promise resolves. The returned views
  * and sampler are borrowed by renderers; dispose only after those renderers stop.
+ * sample(device) lends an immutable, same-device receiver snapshot. Filtering
+ * finishes before construction resolves; a later construction-signal abort does
+ * not revoke a completed environment. Device loss and explicit disposal do.
  */
 export async function createGpuAnimationEnvironment(device,source,options={}){
   if(!options||typeof options!=='object'||Array.isArray(options))fail('OPTIONS','Expected environment options');
@@ -187,11 +190,25 @@ export async function createGpuAnimationEnvironment(device,source,options={}){
       device.queue.submit([encoder.finish()]);
     });
     await Promise.race([device.queue.onSubmittedWorkDone(),stopped]);live();parameters.destroy();parameters=undefined;
-    const result=await checked(()=>Object.freeze({
+    const snapshot=await checked(()=>Object.freeze({
+      profile:'f3d-animation-environment-v1',version:1,
       diffuseView:diffuse.createView({dimension:'cube'}),specularView:specular.createView({dimension:'cube'}),brdfView:lut.createView(),sampler,
-      mipLevelCount:plan.levels,plan,get disposed(){return disposed;},get failed(){return terminal!==null;},get textureBytes(){return owned.size?plan.textureBytes:0;},
-      dispose(){if(!disposed){disposed=true;release();}},
+      mipLevelCount:plan.levels,
     }));
+    function available(){
+      if(disposed)fail('DISPOSED','Environment is disposed');
+      if(terminal)throw terminal;
+    }
+    const result=Object.freeze({...snapshot,plan,
+      get disposed(){return disposed;},get failed(){return terminal!==null;},get textureBytes(){return owned.size?plan.textureBytes:0;},
+      sample(borrowedDevice){
+        available();
+        if(borrowedDevice!==device)fail('DEVICE','Environment and receiver must use the same GPU device');
+        return snapshot;
+      },
+      async whenIdle(){available();return result;},
+      dispose(){if(!disposed){disposed=true;release();}},
+    });
     return result;
   }catch(error){release();throw error;}
   finally{signal?.removeEventListener('abort',onAbort);}
