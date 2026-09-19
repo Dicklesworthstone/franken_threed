@@ -2,7 +2,8 @@
  * renderer, clock, scheduler or placeholder drawables. Attachments and the frame
  * loop remain caller-owned; authored cameras/lights are available explicitly.
  * picking:true opts in to synchronous current-pose geometric selection.
- * exporting:true enables self-contained posed GLB export with cached source images.
+ * exporting:true enables self-contained posed GLB export with cached source images
+ * and current-pose authored cameras/lights. Export sceneView:null for meshes only.
  */
 import {loadGltfAsset,GltfAssetError} from './gltf_asset.mjs';
 import {prepareGltfAnimationModel} from './animation_model.mjs';
@@ -70,6 +71,9 @@ export async function loadGpuGltfAnimationScene(device,source,{
       // An in-flight snapshot retains its own encoded resources even if the
       // model is disposed while an explicit caller resolver is awaiting I/O.
       const sources=exportSources.slice(),options={...settings};
+      // Borrow the model view, not the decoded preparation plan and its arrays.
+      // An explicit null opts out; an explicit view can choose other instances.
+      if(options.sceneView===undefined)options.sceneView=model.view;
       options.resolveTexture ??= resource=>{
         const found=sources.find(s=>s.resource.view===resource.view&&s.resource.sampler===resource.sampler);
         if(!found)throw new GltfAssetError('GLTF_EXPORT_TEXTURE','Texture was not loaded by this model');

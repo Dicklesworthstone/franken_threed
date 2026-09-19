@@ -10,6 +10,7 @@
  * It has no skins, morph targets or clips, so loading cannot deform it twice.
  */
 import {inspectGltfKtx2} from './gltf_ktx2.mjs';
+import {createGltfSceneView} from './gltf_scene_view.mjs';
 export class AnimationExportError extends Error {
   constructor(code, message) { super(`${code}: ${message}`); this.name = 'AnimationExportError'; this.code = code; }
 }
@@ -57,12 +58,16 @@ function checkAbort(signal) { if (signal?.aborted) throw signal.reason ?? new DO
  * KTX2 uses required KHR_texture_basisu, with no fabricated PNG fallback. Its
  * encoded transfer/primaries must match every material use in colorSpaces.
  * Image validation reads headers only, never invokes a transcoder or GPU.
+ * sceneView accepts the decoded view definition or a model's live view metadata.
+ * Cameras/lights are captured at the same pose as meshes, as world-space roots.
+ * Camera scale/shear removal follows createGltfSceneView, not a second policy.
+ * Omitted perspective aspect/far fields stay omitted; no viewport is baked in.
  * A captured export may finish after the model advances/disposes. signal cancels
  * the export, not the model. maxBytes limits the final file and binary staging;
  * it is not a total process-memory or decoder-allocation limit.
  */
 export async function exportAnimationPoseGLB(pose, entries, options = {}) {
-  fields(options, ['resolveTexture', 'signal', 'maxBytes', 'maxVertices', 'copyright'], 'export option');
+  fields(options, ['resolveTexture', 'signal', 'maxBytes', 'maxVertices', 'copyright', 'sceneView'], 'export option');
   const {resolveTexture, signal, maxBytes = 128 * 1024 * 1024, maxVertices = 4 * 1024 * 1024} = options;
   integer(maxBytes, 64, 0xffffffff, 'GLB byte limit'); integer(maxVertices, 1, 0xfffffffe, 'vertex limit');
   if (resolveTexture !== undefined && typeof resolveTexture !== 'function') fail('TEXTURE', 'resolveTexture must be a function');
@@ -219,6 +224,59 @@ export async function exportAnimationPoseGLB(pose, entries, options = {}) {
     const node = json.nodes.length;
     json.nodes.push({mesh: json.meshes.length, extras: {f3dSource: ids}});
     json.scenes[0].nodes.push(node); json.meshes.push({primitives: [primitive]}); json.materials.push(out);
+  }
+  if (options.sceneView != null) {
+    const input = options.sceneView;
+    if (typeof input !== 'object' || Array.isArray(input)) fail('SHAPE', 'Invalid sceneView');
+    const definition = input.format === undefined ? {format: 'f3d-gltf-scene-view-v1', nodeCount: pose.nodeCount,
+      cameras: input.cameras, lights: input.lights} : input;
+    const view = createGltfSceneView(pose, definition), instances = new Map();
+    const cameras = new Map(), lights = new Map();
+    function instance(source) {
+      if (!instances.has(source.node)) {
+        const node = {extras: {f3dSource: {node: source.node}}, ...(source.nodeName ? {name: source.nodeName} : {})};
+        json.scenes[0].nodes.push(json.nodes.length); json.nodes.push(node); instances.set(source.node, node);
+      }
+      return instances.get(source.node);
+    }
+    for (const camera of view.cameras) {
+      // The temporary aspect is used only to ask the existing evaluator for a
+      // rigid view frame; authored projection metadata is exported unchanged.
+      const frame = view.sample({cameraNode: camera.node, aspectRatio: 1}), v = frame.viewMatrix;
+      const node = instance(camera), description = {type: camera.type, [camera.type]: {...camera.projection},
+        ...(camera.name ? {name: camera.name} : {})}, key = JSON.stringify(description);
+      json.cameras ??= [];
+      if (!cameras.has(key)) { cameras.set(key, json.cameras.length); json.cameras.push(description); }
+      node.camera = cameras.get(key); node.extras.f3dSource.camera = camera.camera;
+      // Invert the rigid view, not the possibly sheared/scaled source matrix.
+      node.matrix = [v[0],v[4],v[8],0, v[1],v[5],v[9],0, v[2],v[6],v[10],0, ...frame.cameraPosition,1];
+    }
+    const evaluated = view.sampleLights();
+    if (evaluated.length) {
+      json.extensions ??= {}; json.extensions.KHR_lights_punctual = {lights: []};
+      for (const key of ['extensionsUsed', 'extensionsRequired']) {
+        json[key] ??= []; if (!json[key].includes('KHR_lights_punctual')) json[key].push('KHR_lights_punctual');
+      }
+    }
+    for (let i = 0; i < view.lights.length; i++) {
+      const source = view.lights[i], value = evaluated[i], node = instance(source);
+      const description = {type: value.type, color: [...value.color], intensity: value.intensity,
+        ...(source.name ? {name: source.name} : {}), ...(value.range === undefined ? {} : {range: value.range}),
+        ...(value.type === 'spot' ? {spot: {innerConeAngle: value.innerConeAngle, outerConeAngle: value.outerConeAngle}} : {})};
+      const key = JSON.stringify(description), output = json.extensions.KHR_lights_punctual.lights;
+      if (!lights.has(key)) { lights.set(key, output.length); output.push(description); }
+      node.extensions = {KHR_lights_punctual: {light: lights.get(key)}}; node.extras.f3dSource.light = source.light;
+      if (!node.matrix) {
+        // Directional positions are not used by lighting, but preserve their
+        // authored world placement as well. Scale never changes photometry.
+        node.translation = Array.from(pose.worldMatrices.subarray(source.node * 16 + 12, source.node * 16 + 15));
+        if (value.direction) {
+          const [x,y,z] = value.direction.map(n => -n), axis = Math.hypot(x,y), angle = Math.atan2(axis,z);
+          const sine = Math.sin(angle/2);
+          node.rotation = axis > 0 ? [-y/axis*sine,x/axis*sine,0,Math.cos(angle/2)] : z < 0 ? [0,1,0,0] : [0,0,0,1];
+        }
+      }
+    }
   }
   if (pose.disposed || pose.version !== poseVersion || entries.some(e => e.deformer.disposed || e.deformer.poseVersion !== poseVersion)) fail('STALE', 'Pose changed while capturing export');
   // Texture callbacks only run after the complete immutable binary/material
