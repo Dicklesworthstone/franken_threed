@@ -20,25 +20,49 @@ const abort=signal=>{if(signal?.aborted)throw signal.reason ?? new DOMException(
  * source selection. decode.basisu:false explicitly chooses optional core
  * fallbacks; required BasisU still fails. A selected transcode failure never
  * retries another source. The loader/device and retained worker pool are borrowed.
+ * output:{format,toneMapping,exposure,...} opts into managed HDR presentation.
+ * The scene renderer then uses rgba16float; output.format is the display target.
+ * render()/renderCamera() take {target:context.getCurrentTexture(),...} instead
+ * of attachment views. Output targets resize to the actual target extent, keep
+ * the requested sampleCount/depthFormat, and are owned until scene disposal.
+ * outputTextureBytes/outputBufferBytes are separate from asset/geometry budgets.
+ * Omit output to retain the original attachment API and allocation behavior.
  */
 export async function loadGpuGltfAnimationScene(device,source,{
-  assets={},decode={},textures={},scene={},picking=false,exporting=false,signal=assets.signal ?? textures.signal,
+  assets={},decode={},textures={},scene={},output=null,picking=false,exporting=false,signal=assets.signal ?? textures.signal ?? output?.signal,
 }={}) {
   if(decode.resolveTexture!=null)throw new GltfAssetError('GLTF_MODEL_LOAD_OPTIONS','The owning loader supplies resolveTexture');
-  for(const nested of [assets.signal,textures.signal])if(nested!==undefined&&nested!==signal)throw new GltfAssetError('GLTF_MODEL_LOAD_OPTIONS','Use one construction AbortSignal');
+  for(const nested of [assets.signal,textures.signal,output?.signal])if(nested!==undefined&&nested!==signal)throw new GltfAssetError('GLTF_MODEL_LOAD_OPTIONS','Use one construction AbortSignal');
   // Freeze the route choice and stage settings before the first I/O await.
   // A caller editing its options while fetching cannot select one image and
   // accidentally supply another decoder policy when uploads begin.
-  const decodeOptions={...decode},textureOptions={...textures,signal};
+  const decodeOptions={...decode},textureOptions={...textures,signal},assetOptions={...assets,signal};
+  const sceneOptions={...scene,renderer:{...scene.renderer}};
+  if(output!==null&&(!output||typeof output!=='object'||Array.isArray(output)))
+    throw new GltfAssetError('GLTF_MODEL_LOAD_OPTIONS','output must be a presentation options object or null');
+  const outputOptions=output===null?null:{...output,signal};
+  if(outputOptions){
+    for(const key of ['sampleCount','depthFormat']){
+      if(outputOptions[key]!==undefined&&sceneOptions.renderer[key]!==undefined&&outputOptions[key]!==sceneOptions.renderer[key])
+        throw new GltfAssetError('GLTF_MODEL_LOAD_OPTIONS','Output and scene attachment settings conflict');
+      if(outputOptions[key]===undefined&&sceneOptions.renderer[key]!==undefined)outputOptions[key]=sceneOptions.renderer[key];
+    }
+  }
   const basisu=decodeOptions.basisu===undefined ? textureOptions.ktx2Loader!=null : decodeOptions.basisu;
   if(typeof basisu!=='boolean'||(basisu&&typeof textureOptions.ktx2Loader?.parse!=='function'))
     throw new GltfAssetError('GLTF_MODEL_LOAD_OPTIONS','BasisU selection requires a configured textures.ktx2Loader; decode.basisu must be boolean');
   decodeOptions.basisu=basisu;
   abort(signal);
-  const asset=await loadGltfAsset(source,{...assets,signal});abort(signal);
-  const prepared=prepareGltfAnimationModel(asset.json,asset.buffers,decodeOptions);
-  let resources,model,exportSources=[];
+  let asset,resources,model,presentation,exportSources=[];
   try {
+    if(outputOptions){
+      // Disabled output neither imports its implementation nor allocates a pass.
+      const {createGpuAnimationPresentation}=await import('./animation_presentation.mjs');abort(signal);
+      presentation=await createGpuAnimationPresentation(device,outputOptions);abort(signal);
+      Object.assign(sceneOptions.renderer,presentation.rendererOptions);
+    }
+    asset=await loadGltfAsset(source,assetOptions);abort(signal);
+    const prepared=prepareGltfAnimationModel(asset.json,asset.buffers,decodeOptions);
     resources=await createGltfTextureResources(device,prepared.textureRequests,asset.readImage,textureOptions);
     abort(signal);
     if(exporting!==false) {
@@ -54,20 +78,21 @@ export async function loadGpuGltfAnimationScene(device,source,{
         exportSources.push({resource,encoded:{bytes:image.bytes,mimeType:image.mimeType,sampler}});
       }
     }
-    model=await createGpuDecodedAnimationScene(device,prepared.resolveTextures(resources.resolveTexture),{...scene,picking,exporting});
+    model=await createGpuDecodedAnimationScene(device,prepared.resolveTextures(resources.resolveTexture),{...sceneOptions,picking,exporting});
     abort(signal);
   } catch(error) {
-    try{model?.dispose();}finally{resources?.dispose();}
+    try{presentation?.dispose();}finally{try{model?.dispose();}finally{resources?.dispose();}}
     throw error;
   }
-  function release(){model.dispose();resources.dispose();exportSources=[];}
+  function release(){try{presentation?.dispose();}finally{try{model.dispose();}finally{resources.dispose();exportSources=[];}}}
   function checkTextures(){
     if(resources.failed){release();throw new GltfTextureError('GLTF_TEXTURE_DEVICE_LOST','Model texture device was lost');}
+    if(presentation?.failed){release();throw new GltfAssetError('GLTF_MODEL_OUTPUT_FAILED','Model presentation failed');}
   }
   function query(operation) {
     checkTextures();
     try{return operation();}
-    catch(error){if(model.failed||resources.failed)release();throw error;}
+    catch(error){if(model.failed||resources.failed||Boolean(presentation?.failed))release();throw error;}
   }
   function invoke(operation){query(operation);return result;}
   const result=Object.freeze({pose:model.pose,view:model.view,cameras:model.cameras,lights:model.lights,
@@ -75,7 +100,9 @@ export async function loadGpuGltfAnimationScene(device,source,{
     source:model.source,diagnostics:model.diagnostics,assetBytes:asset.bytesLoaded,
     get poseVersion(){return model.poseVersion;},get bufferBytes(){return model.bufferBytes;},
     get textureBytes(){return resources.textureBytes;},get disposed(){return model.disposed;},
-    get failed(){return model.failed||resources.failed;},
+    get failed(){return model.failed||resources.failed||Boolean(presentation?.failed);},
+    get outputEnabled(){return presentation!==undefined;},
+    get outputTextureBytes(){return presentation?.textureBytes ?? 0;},get outputBufferBytes(){return presentation?.bufferBytes ?? 0;},
     get exportingEnabled(){return model.exportingEnabled;},
     exportPoseGLB(settings={}){return query(()=>{
       if(!settings||typeof settings!=='object'||Array.isArray(settings))throw new GltfAssetError('GLTF_EXPORT_OPTIONS','Invalid export settings');
@@ -96,12 +123,12 @@ export async function loadGpuGltfAnimationScene(device,source,{
     raycast(ray,settings){return query(()=>model.raycast(ray,settings));},
     pick(ndc,cameraSettings,querySettings){return query(()=>model.pick(ndc,cameraSettings,querySettings));},
     update(dt,settings){return invoke(()=>model.update(dt,settings));},
-    upload(){return invoke(()=>model.upload());},render(frame){return invoke(()=>model.render(frame));},
-    renderCamera(frame,settings){return invoke(()=>model.renderCamera(frame,settings));},
+    upload(){return invoke(()=>model.upload());},render(frame){return invoke(()=>presentation?presentation.render(model,frame):model.render(frame));},
+    renderCamera(frame,settings){return invoke(()=>presentation?presentation.renderCamera(model,frame,settings):model.renderCamera(frame,settings));},
     async whenIdle(){
       checkTextures();
-      try{await model.whenIdle();checkTextures();return result;}
-      catch(error){if(model.failed||resources.failed)release();throw error;}
+      try{await Promise.all([model.whenIdle(),presentation?.whenIdle()]);checkTextures();return result;}
+      catch(error){if(model.failed||resources.failed||Boolean(presentation?.failed))release();throw error;}
     },
     dispose:release,
   });

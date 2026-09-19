@@ -18,7 +18,7 @@ const sourceFormats=['rgba8unorm','bgra8unorm','rgba16float'];
 const alphaModes=['straight','premultiplied','opaque'];
 const object=(v,label)=>{if(!v||typeof v!=='object'||Array.isArray(v))fail('OPTIONS',`Expected ${label}`);return v;};
 const positive=(v,label)=>{if(!Number.isSafeInteger(v)||v<1)fail('TEXTURE',`Invalid ${label}`);return v;};
-function settings(input,defaults){
+export function animationOutputSettings(input,defaults){
   const mode=input.toneMapping ?? defaults.toneMapping, exposure=input.exposure ?? defaults.exposure;
   const inputAlpha=input.inputAlpha ?? defaults.inputAlpha, outputAlpha=input.outputAlpha ?? defaults.outputAlpha;
   if(!ANIMATION_TONE_MAPPINGS.includes(mode))fail('TONE_MAPPING','Unknown tone mapping operator');
@@ -114,7 +114,7 @@ export async function createGpuAnimationOutput(device,options={}) {
   for(const key of Object.keys(options))if(!['format','outputColorSpace','toneMapping','exposure','inputAlpha','outputAlpha','signal'].includes(key))fail('OPTIONS',`Unknown option: ${key}`);
   const format=options.format ?? 'bgra8unorm',outputColorSpace=options.outputColorSpace ?? 'srgb',signal=options.signal;
   if(!formats.includes(format)||!['linear','srgb'].includes(outputColorSpace)||format.endsWith('-srgb')&&outputColorSpace!=='srgb')fail('FORMAT','Unsupported output format/color-space combination');
-  const defaults=Object.freeze(settings(options,{toneMapping:'none',exposure:1,inputAlpha:'premultiplied',outputAlpha:'premultiplied'}));
+  const defaults=Object.freeze(animationOutputSettings(options,{toneMapping:'none',exposure:1,inputAlpha:'premultiplied',outputAlpha:'premultiplied'}));
   if(signal!==undefined&&(!signal||typeof signal.addEventListener!=='function'||typeof signal.removeEventListener!=='function'))fail('OPTIONS','Expected an AbortSignal');
   const abort=()=>{if(signal?.aborted)throw signal.reason ?? new DOMException('Aborted','AbortError');};
   abort();
@@ -172,7 +172,7 @@ export async function createGpuAnimationOutput(device,options={}) {
       try{
         object(frame,'output frame');
         for(const key of Object.keys(frame))if(!['source','target','toneMapping','exposure','inputAlpha','outputAlpha'].includes(key))fail('OPTIONS',`Unknown frame option: ${key}`);
-        const source=texture(frame.source,'source',4),target=texture(frame.target,'target',16),selected=settings(frame,defaults);
+        const source=texture(frame.source,'source',4),target=texture(frame.target,'target',16),selected=animationOutputSettings(frame,defaults);
         if(source.texture===target.texture)fail('FEEDBACK','Source and destination must differ');
         if(!sourceFormats.includes(source.format))fail('FORMAT','Source must contain linear rgba16float/rgba8unorm/bgra8unorm radiance');
         if(target.format!==format&&!(format.endsWith('-srgb')&&target.format===format.slice(0,-5)))fail('FORMAT','Target format differs from the pipeline');
