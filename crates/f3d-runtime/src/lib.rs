@@ -7,6 +7,7 @@
 pub use asupersync::runtime::{BrowserHostServices, RuntimeBuilder};
 
 pub mod burst;
+pub mod deformation;
 pub mod frame;
 pub mod gpu_host;
 pub mod mesh;
@@ -122,3 +123,9 @@ pub use mesh::{
     MESH_DEPTH_TEXTURE_ID, MESH_PIPELINE_ID, MESH_READBACK_BUFFER_ID,
     MESH_TARGET_TEXTURE_ID, MESH_UNIFORM_BUFFER_ID, MESH_VERTEX_BUFFER_ID,
 };
+
+pub use deformation::{
+    build_deformed_mesh_packet, build_deformed_mesh_submission, deform_geometry,
+    DeformedGeometry, DeformedMeshError, GeometryDeformation, MorphTargets,
+};
+pub use deformation::f3d_build_deformed_mesh_packet;
