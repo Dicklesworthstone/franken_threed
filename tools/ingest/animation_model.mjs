@@ -57,13 +57,23 @@ const indexed = (array, i, label) => {
   uint(i,label); if (!Array.isArray(array) || i >= array.length) fail('INDEX', `Invalid ${label}`);
   return object(array[i],label);
 };
-function textureRequest(model, info, colorSpace) {
+function textureRequest(model, info, colorSpace, basisu) {
   const textureIndex = uint(info.index, 'texture index'), texture = indexed(model.textures,textureIndex,'texture');
-  extensions(texture,[],'texture');
-  const imageIndex = uint(texture.source,'image index'), image = indexed(model.images,imageIndex,'image');
+  const ext = extensions(texture,['KHR_texture_basisu'],'texture').KHR_texture_basisu;
+  const compressed = basisu && ext !== undefined;
+  if (compressed) {
+    fields(ext,['source','extensions','extras'],'BasisU texture');
+    extensions(ext,[],'BasisU texture');
+  }
+  // Decide once before I/O. An optional extension uses its authored core source
+  // when the caller has no BasisU route. Never fabricate a fallback or try one
+  // after a selected compressed source fails. Leave the source JSON untouched.
+  if (!compressed && texture.source === undefined) fail('TEXTURE','Texture has no core fallback; enable the BasisU route');
+  const imageIndex = uint(compressed ? ext.source : texture.source,'image index'), image = indexed(model.images,imageIndex,'image');
   extensions(image,[],'image');
   if ((image.uri === undefined) === (image.bufferView === undefined)) fail('TEXTURE','Image requires exactly one URI or bufferView');
-  const source = {};
+  const source = {}, mimeTypes = compressed ? ['image/ktx2'] : ['image/png','image/jpeg'];
+  if (image.mimeType !== undefined && !mimeTypes.includes(image.mimeType)) fail('TEXTURE','Image MIME type disagrees with the selected texture route');
   if (image.uri !== undefined) {
     if (typeof image.uri !== 'string' || !image.uri) fail('TEXTURE','Invalid image URI');
     source.uri = image.uri;
@@ -74,9 +84,12 @@ function textureRequest(model, info, colorSpace) {
     source.byteOffset = uint(view.byteOffset ?? 0,'image byteOffset'); source.byteLength = uint(view.byteLength,'image byteLength');
     const buffer = indexed(model.buffers,source.buffer,'image buffer');
     if (!source.byteLength || !Number.isSafeInteger(buffer.byteLength) || source.byteLength > buffer.byteLength-source.byteOffset) fail('TEXTURE','Image view exceeds buffer');
-    if (!['image/png','image/jpeg'].includes(image.mimeType)) fail('TEXTURE','Buffer-view image requires a core MIME type');
+    if (!mimeTypes.includes(image.mimeType)) fail('TEXTURE','Buffer-view image requires the selected texture MIME type');
   }
-  if (image.mimeType !== undefined) source.mimeType = image.mimeType;
+  // URI images may omit mimeType, but a BasisU source still must contain KTX2.
+  // Carry that requirement to the asynchronous texture loader, not just hints.
+  if (compressed) source.mimeType = 'image/ktx2';
+  else if (image.mimeType !== undefined) source.mimeType = image.mimeType;
   const sampler = texture.sampler === undefined ? {} : indexed(model.samplers,texture.sampler,'sampler');
   extensions(sampler,[],'sampler');
   const sampling = {wrapS:sampler.wrapS ?? 10497, wrapT:sampler.wrapT ?? 10497};
@@ -102,7 +115,7 @@ function textureCoordinates(info) {
   }
   return {texCoord,transform};
 }
-function materialPlan(model, primitive) {
+function materialPlan(model, primitive, basisu) {
   const material = primitive.material === null ? {} : indexed(model.materials,primitive.material,'material');
   fields(material,['name','extras','extensions','pbrMetallicRoughness','normalTexture','occlusionTexture','emissiveTexture','emissiveFactor','alphaMode','alphaCutoff','doubleSided'],'material');
   const ext = extensions(material,['KHR_materials_unlit'],'material'), unlit=ext.KHR_materials_unlit !== undefined;
@@ -139,7 +152,7 @@ function materialPlan(model, primitive) {
       if (!primitive.geometry.tangents) diagnostics.push({node:primitive.node,primitive:primitive.primitive,reason:'DERIVATIVE_NORMAL_FRAME_NOT_MIKKTSPACE'});
       drawable.normalScale=number(info.scale ?? 1,'normal scale');
     }
-    requests.push({field,request:textureRequest(model,info,colorSpace)});
+    requests.push({field,request:textureRequest(model,info,colorSpace,basisu)});
   }
   if (mixedUV) {
     // Keep the first map's raw coordinates for geometric picking. Each material
@@ -165,12 +178,16 @@ export function decodeGltfAnimationModel(model, suppliedBuffers, {resolveTexture
  * unique texture requests are exposed; no unresolved/fake drawable is published.
  * resolveTextures(resolver) consumes the plan on success. A failed resolver can
  * be retried without decoding again; borrowed resolver effects are not rolled back.
+ * basisu:true selects KHR_texture_basisu sources for a preloaded KTX2 resolver.
+ * The default selects authored core fallbacks for optional BasisU textures;
+ * required BasisU needs explicit support. Selection does not transcode or fetch.
  */
 export function prepareGltfAnimationModel(model,suppliedBuffers,{
-  scene=model?.scene ?? 0,maxComponents=16777216,maxPrimitives=4096,
+  scene=model?.scene ?? 0,maxComponents=16777216,maxPrimitives=4096,basisu=false,
 }={}) {
+  if (typeof basisu !== 'boolean') fail('TEXTURE','basisu must be a boolean');
   if (!Array.isArray(model?.extensionsRequired ?? [])) fail('SHAPE','extensionsRequired must be an array');
-  for (const name of model?.extensionsRequired ?? []) if (!['KHR_materials_unlit','KHR_texture_transform','KHR_lights_punctual','KHR_mesh_quantization'].includes(name)) fail('UNSUPPORTED',`Required extension needs source route: ${name}`);
+  for (const name of model?.extensionsRequired ?? []) if (!['KHR_materials_unlit','KHR_texture_transform','KHR_lights_punctual','KHR_mesh_quantization',...(basisu ? ['KHR_texture_basisu'] : [])].includes(name)) fail('UNSUPPORTED',`Required extension needs source route: ${name}`);
   const sceneView=decodeGltfSceneView(model,{scene});
   const copyright=model.asset?.copyright;
   if(copyright!==undefined && typeof copyright!=='string')fail('SHAPE','Asset copyright must be text');
@@ -181,7 +198,7 @@ export function prepareGltfAnimationModel(model,suppliedBuffers,{
   };
   const definition=decodeGltfAnimation(model,buffer,{maxComponents});
   const geometry=decodeGltfGeometry(model,buffer,{scene,maxComponents,maxPrimitives});
-  const plans=geometry.primitives.map(p=>materialPlan(model,p)),unique=new Map();
+  const plans=geometry.primitives.map(p=>materialPlan(model,p,basisu)),unique=new Map();
   for (const plan of plans) geometry.diagnostics.push(...plan.diagnostics);
   for(const plan of plans)for(const {request}of plan.requests)unique.set(request.textureIndex+':'+request.colorSpace,request);
   let busy=false,consumed=false;
