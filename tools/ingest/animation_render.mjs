@@ -3,7 +3,7 @@
  * This pass owns an aligned uniform arena and index buffers, not the supplied
  * device, deformers, attachments, camera, frame loop or source scene objects.
  * It is NOT an automatic Three.js renderer replacement: no environment lighting,
- * shadow maps, tone mapping, implicit sorting or culling. RGB inputs are linear; an -srgb
+ * automatic shadows, tone mapping, implicit sorting or culling. RGB inputs are linear; an -srgb
  * attachment view supplies the display transfer function. Unsupported material
  * fields are rejected rather than silently rendered as unlit.
  *
@@ -21,6 +21,9 @@
  * A draw may override uvTransform; baseColor * vertexColor * sampledColor is
  * evaluated BEFORE alpha masking/blending. Plain meshes need no texture.
  * renderer.render({colorView, depthView, viewProjection, draws: [mesh, ...]});
+ * With format:null the same draw/index/alpha-mask path writes only depth. A
+ * depth attachment is required, color/resolve attachments are forbidden, and
+ * materials must be unlit OPAQUE or MASK (no guessed BLEND shadow policy).
  *
  * A draw may instead be {mesh, worldMatrix?, baseColor?, first?, count?}.
  * viewProjection maps world space to WebGPU clip space (depth 0..1). Each draw
@@ -102,7 +105,7 @@ struct DrawInfo { clip_from_local: mat4x4<f32>, color: vec4<f32>, options: vec4<
 // Equations: glTF 2.0 Appendix B and KHR_lights_punctual (Khronos).
 // https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#appendix-b-brdf-implementation
 // https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_lights_punctual
-function surfaceShader(mapMask, lit, attributes, derivative = false, coordinateMask = 0) {
+function surfaceShader(mapMask, lit, attributes, derivative = false, coordinateMask = 0, depthOnly = false) {
   const textured = mapMask !== 0, normalMapped = (mapMask & 4) !== 0, tangentAttribute = normalMapped && !derivative;
   const declarations = mapSlots(mapMask).map(slot =>
     `@group(1) @binding(${slot * 2}) var ${MAP_NAMES[slot]}_sampler: sampler;\n@group(1) @binding(${slot * 2 + 1}) var ${MAP_NAMES[slot]}_texture: texture_2d<f32>;`).join('\n');
@@ -192,7 +195,7 @@ struct VertexOutput {
   ${mapSlots(coordinateMask).map(slot => `out.uv_${slot} = vec2<f32>(dot(draw_info.uv_x.xyz, vec3<f32>(uv_${slot}, 1.0)), dot(draw_info.uv_y.xyz, vec3<f32>(uv_${slot}, 1.0)));`).join('\n  ')}
   return out;
 }
-@fragment fn fragment_main(input: VertexOutput${lit ? ', @builtin(front_facing) front: bool' : ''}) -> @location(0) vec4<f32> {
+@fragment fn fragment_main(input: VertexOutput${lit ? ', @builtin(front_facing) front: bool' : ''})${depthOnly ? '' : ' -> @location(0) vec4<f32>'} {
   // Sample every map before discard or nonuniform lighting flow: implicit
   // derivatives must be evaluated in uniform control flow.
   ${samples}
@@ -232,7 +235,7 @@ struct VertexOutput {
   let roughness = draw_info.emission_roughness.w ${mapMask & 2 ? '* metallic_roughness_texel.g' : ''};
   let emission = draw_info.emission_roughness.rgb ${mapMask & 8 ? '* emissive_texel.rgb' : ''};
   let rgb = illuminate(rgba.rgb, input.world, normal, metallic, roughness, emission);` : 'let rgb = rgba.rgb;'}
-  return vec4<f32>(rgb, select(1.0, rgba.a, draw_info.options.y > 0.0));
+  ${depthOnly ? '' : 'return vec4<f32>(rgb, select(1.0, rgba.a, draw_info.options.y > 0.0));'}
 }
 `;
 }
@@ -360,9 +363,10 @@ export async function createGpuAnimationRenderer(device, {
 } = {}) {
   if (!device?.queue || !device.limits || typeof device.createRenderPipelineAsync !== 'function' ||
       typeof device.lost?.then !== 'function') fail('ANIMATION_RENDER_DEVICE', 'Lend a live WebGPU device');
-  if (!['rgba8unorm', 'rgba8unorm-srgb', 'bgra8unorm', 'bgra8unorm-srgb', 'rgba16float'].includes(format) ||
+  if (![null, 'rgba8unorm', 'rgba8unorm-srgb', 'bgra8unorm', 'bgra8unorm-srgb', 'rgba16float'].includes(format) ||
       ![null, 'depth24plus', 'depth32float', 'depth16unorm'].includes(depthFormat) ||
       ![1, 4].includes(sampleCount) || typeof label !== 'string') fail('ANIMATION_RENDER_OPTIONS', 'Unsupported attachment configuration');
+  if (format === null && depthFormat === null) fail('ANIMATION_RENDER_OPTIONS', 'Depth-only rendering requires a depth format');
   integer(maxDraws, 1, 65536, 'draw capacity'); integer(maxMeshes, 1, 65536, 'mesh capacity');
   integer(maxBytes, 1, Number.MAX_SAFE_INTEGER, 'byte budget');
   const limits = device.limits;
@@ -410,7 +414,7 @@ export async function createGpuAnimationRenderer(device, {
     const bindGroupLayouts = textured ? [uniformLayout, textureLayouts.get(mapMask)] : [uniformLayout];
     if (lit) bindGroupLayouts.push(lightLayout);
     const pipelineLayout = device.createPipelineLayout({label, bindGroupLayouts});
-    const module = device.createShaderModule({label, code: lit || attributes ? surfaceShader(mapMask, lit, attributes, derivative, coordinateMask) : ANIMATION_RENDER_WGSL});
+    const module = device.createShaderModule({label, code: lit || attributes || format === null ? surfaceShader(mapMask, lit, attributes, derivative, coordinateMask, format === null) : ANIMATION_RENDER_WGSL});
     const vertexBuffers = [{arrayStride: 40, stepMode: 'vertex', attributes: [{shaderLocation: 0, offset: 0, format: 'float32x3'}]}];
     if (lit) vertexBuffers[0].attributes.push({shaderLocation: 1, offset: 12, format: 'float32x3'});
     if ((mapMask & 4) && !derivative) vertexBuffers[0].attributes.push({shaderLocation: 2, offset: 24, format: 'float32x4'});
@@ -419,11 +423,11 @@ export async function createGpuAnimationRenderer(device, {
       ...mapSlots(coordinateMask).map((slot, i) => ({shaderLocation: 5 + slot, offset: 24 + i * 8, format: 'float32x2'})),
     ]});
     const created = [];
-    for (const blend of [false, true]) for (const winding of (lit ? ['ccw', 'cw', 'none', 'none-cw'] : ['ccw', 'cw', 'none'])) {
+    for (const blend of (format === null ? [false] : [false, true])) for (const winding of (lit ? ['ccw', 'cw', 'none', 'none-cw'] : ['ccw', 'cw', 'none'])) {
       const key = `${variant}/${blend}:${winding}`;
       created.push(device.createRenderPipelineAsync({label: `${label}/${key}`, layout: pipelineLayout,
         vertex: {module, entryPoint: 'vertex_main', buffers: vertexBuffers},
-        fragment: {module, entryPoint: 'fragment_main', targets: [{format, ...(blend ? {blend: {
+        fragment: {module, entryPoint: 'fragment_main', targets: format === null ? [] : [{format, ...(blend ? {blend: {
           color: {operation: 'add', srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha'},
           alpha: {operation: 'add', srcFactor: 'one', dstFactor: 'one-minus-src-alpha'},
         }} : {})}]},
@@ -479,6 +483,7 @@ export async function createGpuAnimationRenderer(device, {
     const mode = ['unlit', 'lambert', 'metallic-roughness'].indexOf(shading), lit = mode > 0;
     if (mode < 0 || (!lit && options.emissiveFactor !== undefined) ||
         (mode !== 2 && (options.metallicFactor !== undefined || options.roughnessFactor !== undefined))) fail('ANIMATION_RENDER_OPTIONS', 'Material parameters do not apply to shading model');
+    if (format === null && (lit || alphaMode === 'BLEND')) fail('ANIMATION_RENDER_OPTIONS', 'Depth-only materials must be unlit OPAQUE or MASK');
     // Snapshot every borrowed resource descriptor before the first await.
     const textures = MAP_FIELDS.map(field => {
       const descriptor = options[field];
@@ -616,7 +621,7 @@ export async function createGpuAnimationRenderer(device, {
       keys(frame, ['colorView', 'depthView', 'resolveTarget', 'viewProjection', 'draws', 'loadOp', 'depthLoadOp', 'clearColor', 'clearDepth', 'viewport', 'scissor', 'lighting'], 'frame');
       const {colorView, depthView, resolveTarget, viewProjection, draws, loadOp = 'clear', depthLoadOp = 'clear',
         clearColor = [0, 0, 0, 0], clearDepth = 1, viewport = null, scissor = null, lighting = null} = frame;
-      if (!colorView || (depthFormat && !depthView) || (!depthFormat && depthView) || (sampleCount === 1 && resolveTarget)) fail('ANIMATION_RENDER_ATTACHMENT', 'Attachment configuration differs from pipeline');
+      if ((format === null ? colorView || resolveTarget : !colorView) || (depthFormat && !depthView) || (!depthFormat && depthView) || (sampleCount === 1 && resolveTarget)) fail('ANIMATION_RENDER_ATTACHMENT', 'Attachment configuration differs from pipeline');
       if (!['clear', 'load'].includes(loadOp) || !['clear', 'load'].includes(depthLoadOp)) fail('ANIMATION_RENDER_ATTACHMENT', 'Invalid load operation');
       color(clearColor); finite(clearDepth, 'Clear depth');
       if (clearDepth < 0 || clearDepth > 1) fail('ANIMATION_RENDER_RANGE', 'Clear depth must be in [0,1]');
@@ -685,7 +690,7 @@ export async function createGpuAnimationRenderer(device, {
       }
       const submitted = scoped(device, () => {
         const encoder = device.createCommandEncoder({label});
-        const pass = encoder.beginRenderPass({label, colorAttachments: [{view: colorView, ...(resolveTarget ? {resolveTarget} : {}),
+        const pass = encoder.beginRenderPass({label, colorAttachments: format === null ? [] : [{view: colorView, ...(resolveTarget ? {resolveTarget} : {}),
           loadOp, storeOp: 'store', clearValue: {r: clearColor[0], g: clearColor[1], b: clearColor[2], a: clearColor[3]}}],
           ...(depthFormat ? {depthStencilAttachment: {view: depthView, depthLoadOp, depthStoreOp: 'store', depthClearValue: clearDepth}} : {})});
         if (viewport) pass.setViewport(...viewport);
