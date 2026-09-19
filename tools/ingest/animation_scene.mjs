@@ -24,9 +24,9 @@
  * and deformers, never the borrowed pose/device/attachments. maxBytes bounds
  * owned GPU buffers (not driver pipelines, CPU pose arrays or caller textures).
  * Drawable material fields match renderer.addMesh: texCoords, vertexColors,
- * baseColorTexture, metallicRoughnessTexture, normalTexture, emissiveTexture,
+ * baseColorTexture, metallicRoughnessTexture, normalTexture, emissiveTexture, occlusionTexture,
  * uvTransform, shading, metallicFactor, roughnessFactor, normalScale and
- * emissiveFactor are optional. Normal maps use authored tangents or the renderer's
+ * emissiveFactor and occlusionStrength are optional. Normal maps use authored tangents or the renderer's
  * derivative frame. mapCoordinates supplies per-map UVs/local transforms; the
  * shared uvTransform applies afterwards. Lit scenes pass lighting to render(). Textures
  * stay caller-owned; material arrays/descriptors are snapshotted before awaits.
@@ -67,7 +67,7 @@ import {createAnimationController} from './animation_controller.mjs';
 import {createGpuAnimationDeformer} from './animation_webgpu.mjs';
 import {createGpuAnimationRenderer, AnimationRenderError} from './animation_render.mjs';
 const fail = (code, message) => { throw new AnimationRenderError(code, message); };
-const TEXTURE_FIELDS = ['baseColorTexture', 'metallicRoughnessTexture', 'normalTexture', 'emissiveTexture'];
+const TEXTURE_FIELDS = ['baseColorTexture', 'metallicRoughnessTexture', 'normalTexture', 'emissiveTexture', 'occlusionTexture'];
 
 export async function createGpuAnimationScene(device, pose, drawables, {
   shadow = null, sortObjects = true, frustumCulling = false, maxBoundsBytes = 16*1024*1024, maxBoundsComponents = 16777216, renderer: renderOptions = {}, deformer: deformOptions = {}, maxMeshes = 256, maxBytes = 256 * 1024 * 1024,
@@ -124,7 +124,7 @@ export async function createGpuAnimationScene(device, pose, drawables, {
     const inputs = drawables.map(input => {
       if (!input || typeof input !== 'object') fail('ANIMATION_SCENE_GEOMETRY', 'Expected a drawable descriptor');
       const allowed = ['geometry', 'indices', 'baseColor', 'doubleSided', 'alphaMode', 'alphaCutoff',
-        'texCoords', 'vertexColors', 'mapCoordinates', ...TEXTURE_FIELDS, 'uvTransform', 'shading', 'metallicFactor', 'roughnessFactor', 'emissiveFactor', 'normalScale'];
+        'texCoords', 'vertexColors', 'mapCoordinates', ...TEXTURE_FIELDS, 'uvTransform', 'shading', 'metallicFactor', 'roughnessFactor', 'emissiveFactor', 'normalScale', 'occlusionStrength'];
       for (const key of Object.keys(input)) if (!allowed.includes(key)) fail('ANIMATION_SCENE_GEOMETRY', `Unsupported drawable field: ${key}`);
       const {geometry, indices = null, baseColor = [1,1,1,1], doubleSided = false, alphaMode = 'OPAQUE', alphaCutoff = 0.5} = input;
       if ((!Array.isArray(baseColor) && !ArrayBuffer.isView(baseColor)) || baseColor.length !== 4) fail('ANIMATION_SCENE_GEOMETRY', 'Expected RGBA material color');
@@ -134,7 +134,7 @@ export async function createGpuAnimationScene(device, pose, drawables, {
         const value = input[key];
         if (value !== undefined) material[key] = value === null ? null : copyMaterialArray(value, key);
       }
-      for (const key of ['shading', 'metallicFactor', 'roughnessFactor', 'normalScale']) {
+      for (const key of ['shading', 'metallicFactor', 'roughnessFactor', 'normalScale', 'occlusionStrength']) {
         const value = input[key]; if (value !== undefined) material[key] = value;
       }
       for (const key of TEXTURE_FIELDS) {
