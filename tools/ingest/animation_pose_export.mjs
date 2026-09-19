@@ -8,6 +8,8 @@
  * tangents and reflected winding. This avoids illegal sheared glTF node matrices.
  * The result is one STATIC posed mesh scene, not an editable rig/animation export.
  * It has no skins, morph targets or clips, so loading cannot deform it twice.
+ * HDR emission uses KHR_materials_emissive_strength without clipping or changing
+ * encoded image pixels; ordinary [0,1] emission stays in the core representation.
  */
 import {inspectGltfKtx2} from './gltf_ktx2.mjs';
 import {createGltfSceneView} from './gltf_scene_view.mjs';
@@ -78,6 +80,11 @@ export async function exportAnimationPoseGLB(pose, entries, options = {}) {
   const json = {asset: {version: '2.0', generator: 'FrankenThreeD static pose export'}, scene: 0,
     scenes: [{nodes: []}], nodes: [], meshes: [], materials: [], accessors: [], bufferViews: [],
     extras: {f3d: {kind: 'static-pose', poseVersion, transforms: 'baked-world'}}};
+  function requireExtension(name) {
+    for (const key of ['extensionsUsed', 'extensionsRequired']) {
+      json[key] ??= []; if (!json[key].includes(name)) json[key].push(name);
+    }
+  }
   if (options.copyright !== undefined) {
     if (typeof options.copyright !== 'string' || options.copyright.length > maxBytes / 4) fail('LIMIT', 'Invalid or excessive copyright text');
     json.asset.copyright = options.copyright;
@@ -187,12 +194,20 @@ export async function exportAnimationPoseGLB(pose, entries, options = {}) {
     if (out.alphaMode === 'MASK') out.alphaCutoff = cutoff;
     if (unlit) {
       if (MAPS.slice(1).some(f => material[f] != null)) fail('UNSUPPORTED', 'Unlit export cannot silently discard lit maps');
-      out.extensions = {KHR_materials_unlit: {}}; json.extensionsUsed = ['KHR_materials_unlit'];
-      json.extensionsRequired = ['KHR_materials_unlit'];
+      out.extensions = {KHR_materials_unlit: {}}; requireExtension('KHR_materials_unlit');
     } else {
       out.pbrMetallicRoughness.metallicFactor = vector([material.metallicFactor ?? 1], 1, 'metallic factor', 0, 1)[0];
       out.pbrMetallicRoughness.roughnessFactor = vector([material.roughnessFactor ?? 1], 1, 'roughness factor', 0, 1)[0];
-      out.emissiveFactor = vector(material.emissiveFactor ?? [0,0,0], 3, 'emission', 0, 1);
+      const emission = vector(material.emissiveFactor ?? [0,0,0], 3, 'emission', 0);
+      if (emission.some(value => !Number.isFinite(Math.fround(value)))) fail('VALUE', 'Emission exceeds the renderer Float32 range');
+      const strength = Math.max(...emission);
+      out.emissiveFactor = strength > 1 ? emission.map(value => value / strength) : emission;
+      if (strength > 1) {
+        // Core glTF factors stay in [0,1]; preserve HDR intensity without clipping
+        // or modifying encoded texture pixels. No extension is needed for LDR.
+        out.extensions = {KHR_materials_emissive_strength: {emissiveStrength: strength}};
+        requireExtension('KHR_materials_emissive_strength');
+      }
     }
     if (material.vertexColors != null) {
       const width = material.vertexColors.length / count;

@@ -6,6 +6,7 @@
  * lights are decoded with the model; callers still own texture uploads/mips,
  * attachments and transparent ordering. Occlusion uses the renderer's optional
  * environment lighting; direct light, emission and alpha remain unaffected.
+ * KHR_materials_emissive_strength is folded into the linear HDR emissiveFactor.
  *
  * resolveTexture({textureIndex,imageIndex,image,sampler,colorSpace}) synchronously
  * lends {view,sampler}. It must honor the source image/sampler and 'srgb'/'linear'
@@ -119,8 +120,19 @@ function textureCoordinates(info) {
 function materialPlan(model, primitive, basisu) {
   const material = primitive.material === null ? {} : indexed(model.materials,primitive.material,'material');
   fields(material,['name','extras','extensions','pbrMetallicRoughness','normalTexture','occlusionTexture','emissiveTexture','emissiveFactor','alphaMode','alphaCutoff','doubleSided'],'material');
-  const ext = extensions(material,['KHR_materials_unlit'],'material'), unlit=ext.KHR_materials_unlit !== undefined;
+  const ext = extensions(material,['KHR_materials_unlit','KHR_materials_emissive_strength'],'material'), unlit=ext.KHR_materials_unlit !== undefined;
   if (unlit) object(ext.KHR_materials_unlit,'unlit extension');
+  // This extension scales linear emission, not its texture samples or base color.
+  // https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_materials_emissive_strength
+  const emissionExtension=ext.KHR_materials_emissive_strength;
+  let emissiveStrength=1;
+  if (emissionExtension !== undefined) {
+    if (unlit) fail('MATERIAL','Emissive strength cannot be combined with KHR_materials_unlit');
+    fields(emissionExtension,['emissiveStrength','extensions','extras'],'emissive strength');
+    extensions(emissionExtension,[],'emissive strength');
+    emissiveStrength=emissionExtension.emissiveStrength === undefined ? 1 : emissionExtension.emissiveStrength;
+    if (typeof emissiveStrength !== 'number' || !Number.isFinite(emissiveStrength) || emissiveStrength < 0) fail('VALUE','Invalid emissive strength');
+  }
   const pbr=material.pbrMetallicRoughness ?? {};
   fields(pbr,['baseColorFactor','baseColorTexture','metallicFactor','roughnessFactor','metallicRoughnessTexture','extensions','extras'],'metallic-roughness material');
   extensions(pbr,[],'metallic-roughness material');
@@ -132,7 +144,10 @@ function materialPlan(model, primitive, basisu) {
   if (!unlit) {
     drawable.metallicFactor=number(pbr.metallicFactor ?? 1,'metallic factor',0,1);
     drawable.roughnessFactor=number(pbr.roughnessFactor ?? 1,'roughness factor',0,1);
-    drawable.emissiveFactor=vector(material.emissiveFactor ?? [0,0,0],3,'emissive factor',0,1);
+    // Keep the core factor's [0,1] contract, then fold strength into the
+    // renderer's existing HDR emission vector. No shader variant or per-frame work.
+    drawable.emissiveFactor=vector(material.emissiveFactor ?? [0,0,0],3,'emissive factor',0,1)
+      .map(value=>number(value*emissiveStrength,'scaled emissive factor',0));
   }
   const maps = [['baseColorTexture',pbr.baseColorTexture,'srgb']];
   // KHR_materials_unlit explicitly ignores lighting-related PBR fallback fields.
@@ -188,7 +203,7 @@ export function prepareGltfAnimationModel(model,suppliedBuffers,{
 }={}) {
   if (typeof basisu !== 'boolean') fail('TEXTURE','basisu must be a boolean');
   if (!Array.isArray(model?.extensionsRequired ?? [])) fail('SHAPE','extensionsRequired must be an array');
-  for (const name of model?.extensionsRequired ?? []) if (!['KHR_materials_unlit','KHR_texture_transform','KHR_lights_punctual','KHR_mesh_quantization',...(basisu ? ['KHR_texture_basisu'] : [])].includes(name)) fail('UNSUPPORTED',`Required extension needs source route: ${name}`);
+  for (const name of model?.extensionsRequired ?? []) if (!['KHR_materials_unlit','KHR_materials_emissive_strength','KHR_texture_transform','KHR_lights_punctual','KHR_mesh_quantization',...(basisu ? ['KHR_texture_basisu'] : [])].includes(name)) fail('UNSUPPORTED',`Required extension needs source route: ${name}`);
   const sceneView=decodeGltfSceneView(model,{scene});
   const copyright=model.asset?.copyright;
   if(copyright!==undefined && typeof copyright!=='string')fail('SHAPE','Asset copyright must be text');
