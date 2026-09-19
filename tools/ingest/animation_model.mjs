@@ -7,6 +7,7 @@
  * attachments and transparent ordering. Occlusion uses the renderer's optional
  * environment lighting; direct light, emission and alpha remain unaffected.
  * KHR_materials_emissive_strength is folded into the linear HDR emissiveFactor.
+ * KHR_materials_clearcoat retains its factors and three independent linear maps.
  *
  * resolveTexture({textureIndex,imageIndex,image,sampler,colorSpace}) synchronously
  * lends {view,sampler}. It must honor the source image/sampler and 'srgb'/'linear'
@@ -121,7 +122,7 @@ function textureCoordinates(info) {
 function materialPlan(model, primitive, basisu) {
   const material = primitive.material === null ? {} : indexed(model.materials,primitive.material,'material');
   fields(material,['name','extras','extensions','pbrMetallicRoughness','normalTexture','occlusionTexture','emissiveTexture','emissiveFactor','alphaMode','alphaCutoff','doubleSided'],'material');
-  const ext = extensions(material,['KHR_materials_unlit','KHR_materials_emissive_strength'],'material'), unlit=ext.KHR_materials_unlit !== undefined;
+  const ext = extensions(material,['KHR_materials_unlit','KHR_materials_emissive_strength','KHR_materials_clearcoat'],'material'), unlit=ext.KHR_materials_unlit !== undefined;
   if (unlit) object(ext.KHR_materials_unlit,'unlit extension');
   // This extension scales linear emission, not its texture samples or base color.
   // https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_materials_emissive_strength
@@ -133,6 +134,13 @@ function materialPlan(model, primitive, basisu) {
     extensions(emissionExtension,[],'emissive strength');
     emissiveStrength=emissionExtension.emissiveStrength === undefined ? 1 : emissionExtension.emissiveStrength;
     if (typeof emissiveStrength !== 'number' || !Number.isFinite(emissiveStrength) || emissiveStrength < 0) fail('VALUE','Invalid emissive strength');
+  }
+  const coating=ext.KHR_materials_clearcoat;
+  if (coating !== undefined) {
+    if (unlit) fail('MATERIAL','Clearcoat cannot be combined with KHR_materials_unlit');
+    fields(coating,['clearcoatFactor','clearcoatRoughnessFactor','clearcoatTexture','clearcoatRoughnessTexture',
+      'clearcoatNormalTexture','extensions','extras'],'clearcoat');
+    extensions(coating,[],'clearcoat');
   }
   const pbr=material.pbrMetallicRoughness ?? {};
   fields(pbr,['baseColorFactor','baseColorTexture','metallicFactor','roughnessFactor','metallicRoughnessTexture','extensions','extras'],'metallic-roughness material');
@@ -150,13 +158,20 @@ function materialPlan(model, primitive, basisu) {
     drawable.emissiveFactor=vector(material.emissiveFactor ?? [0,0,0],3,'emissive factor',0,1)
       .map(value=>number(value*emissiveStrength,'scaled emissive factor',0));
   }
+  if (coating !== undefined) {
+    drawable.clearcoatFactor=number(coating.clearcoatFactor === undefined ? 0 : coating.clearcoatFactor,'clearcoat factor',0,1);
+    drawable.clearcoatRoughnessFactor=number(coating.clearcoatRoughnessFactor === undefined ? 0 : coating.clearcoatRoughnessFactor,'clearcoat roughness',0,1);
+  }
   const maps = [['baseColorTexture',pbr.baseColorTexture,'srgb']];
   // KHR_materials_unlit explicitly ignores lighting-related PBR fallback fields.
   if (!unlit) maps.push(['metallicRoughnessTexture',pbr.metallicRoughnessTexture,'linear'],['normalTexture',material.normalTexture,'linear'],['emissiveTexture',material.emissiveTexture,'srgb'],['occlusionTexture',material.occlusionTexture,'linear']);
+  if (coating !== undefined) for (const field of ['clearcoatTexture','clearcoatRoughnessTexture','clearcoatNormalTexture']) {
+    maps.push([field,coating[field],'linear']);
+  }
   const requests=[],coordinates=[],diagnostics=[];let sharedUV=null,mixedUV=false;
   for (const [field,info,colorSpace] of maps) {
     if (info === undefined) continue;
-    fields(info,['index','texCoord','extensions','extras',...(field==='normalTexture'?['scale']:field==='occlusionTexture'?['strength']:[])],field);
+    fields(info,['index','texCoord','extensions','extras',...(['normalTexture','clearcoatNormalTexture'].includes(field)?['scale']:field==='occlusionTexture'?['strength']:[])],field);
     const uv=textureCoordinates(info);
     if (sharedUV && (uv.texCoord !== sharedUV.texCoord || uv.transform.some((v,i)=>v!==sharedUV.transform[i]))) mixedUV=true;
     sharedUV ??= uv;
@@ -167,6 +182,10 @@ function materialPlan(model, primitive, basisu) {
     if (field==='normalTexture') {
       if (!primitive.geometry.tangents) diagnostics.push({node:primitive.node,primitive:primitive.primitive,reason:'DERIVATIVE_NORMAL_FRAME_NOT_MIKKTSPACE'});
       drawable.normalScale=number(info.scale ?? 1,'normal scale');
+    }
+    if (field==='clearcoatNormalTexture') {
+      if (!primitive.geometry.tangents) diagnostics.push({node:primitive.node,primitive:primitive.primitive,reason:'DERIVATIVE_CLEARCOAT_NORMAL_FRAME_NOT_MIKKTSPACE'});
+      drawable.clearcoatNormalScale=number(info.scale === undefined ? 1 : info.scale,'clearcoat normal scale');
     }
     if (field==='occlusionTexture') drawable.occlusionStrength=number(info.strength === undefined ? 1 : info.strength,'occlusion strength',0,1);
     requests.push({field,request:textureRequest(model,info,colorSpace,basisu)});
@@ -207,7 +226,7 @@ export function prepareGltfAnimationModel(model,suppliedBuffers,{
 }={}) {
   if (typeof basisu !== 'boolean') fail('TEXTURE','basisu must be a boolean');
   if (!Array.isArray(model?.extensionsRequired ?? [])) fail('SHAPE','extensionsRequired must be an array');
-  for (const name of model?.extensionsRequired ?? []) if (!['EXT_mesh_gpu_instancing','KHR_materials_unlit','KHR_materials_emissive_strength','KHR_texture_transform','KHR_lights_punctual','KHR_mesh_quantization',...(basisu ? ['KHR_texture_basisu'] : [])].includes(name)) fail('UNSUPPORTED',`Required extension needs source route: ${name}`);
+  for (const name of model?.extensionsRequired ?? []) if (!['EXT_mesh_gpu_instancing','KHR_materials_unlit','KHR_materials_emissive_strength','KHR_materials_clearcoat','KHR_texture_transform','KHR_lights_punctual','KHR_mesh_quantization',...(basisu ? ['KHR_texture_basisu'] : [])].includes(name)) fail('UNSUPPORTED',`Required extension needs source route: ${name}`);
   const copyright=model.asset?.copyright;
   if(copyright!==undefined && typeof copyright!=='string')fail('SHAPE','Asset copyright must be text');
   const loaded=new Map();

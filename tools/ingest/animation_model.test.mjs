@@ -99,8 +99,8 @@ test('four material maps resolve by texture AND color space and preserve sampler
   assert.equal(requests.length,2);assert.deepEqual(requests.map(r=>r.colorSpace),['srgb','linear']);
   assert.equal(d.baseColorTexture,d.emissiveTexture);assert.equal(d.normalTexture,d.metallicRoughnessTexture);assert.notEqual(d.baseColorTexture,d.normalTexture);
   assert.equal(d.baseColorTexture.view,borrowed[0].view);assert.equal(d.normalScale,0.25);
-  assert.deepEqual(requests[0].image,{uri:'model.png'});
   assert.deepEqual(requests[0].sampler,{wrapS:33071,wrapT:33648,magFilter:9728,minFilter:9987});
+  assert.deepEqual(requests[0].image,{uri:'model.png'});
   assert.ok(Object.isFrozen(requests[0])&&Object.isFrozen(requests[0].image)&&Object.isFrozen(requests[0].sampler));
 });
 
@@ -148,7 +148,7 @@ for(const [name,mutate]of [
   ['missing UV',f=>{delete f.p.attributes.TEXCOORD_0;}],
   ['invalid tangent',f=>{f.model.accessors[f.p.attributes.TANGENT].type='VEC3';}],
   ['invalid occlusion strength',f=>{f.material.occlusionTexture={index:0,strength:2};}],
-  ['material extension',f=>{f.material.extensions={KHR_materials_clearcoat:{}};}],
+  ['material extension',f=>{f.material.extensions={KHR_materials_transmission:{}};}],
   ['texture codec without fallback',f=>{delete f.model.textures[0].source;f.model.textures[0].extensions={KHR_texture_basisu:{source:0}};}],
   ['required extension',f=>{f.model.extensionsRequired=['EXT_unknown'];}],
   ['sampler',f=>{f.model.samplers[0].wrapS=123;}],
