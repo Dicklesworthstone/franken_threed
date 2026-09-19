@@ -3,7 +3,8 @@
 The existing environment filter now connects to the existing animated material
 renderer. Lambert materials receive diffuse environment light; metallic-roughness
 materials also receive roughness-dependent reflections. No second renderer,
-animation clock, image decoder or per-frame environment filtering is introduced.
+animation clock or per-frame environment filtering is introduced. Optional HDR
+file loading is available without an application-supplied image decoder.
 
 ```js
 import { createGpuAnimationEnvironment } from './animation_environment.mjs';
@@ -40,13 +41,73 @@ environment.dispose(); // Release only after its consumers have stopped.
 `renderer.environment`; `renderCamera(frame, settings)` accepts the environment
 in `frame` while supplying the authored camera and punctual lights itself.
 For example, use `{scene: {renderer: {environment: true}}}` with
-`loadGpuGltfAnimationScene`. Image loading, HDR decoding and source texture upload
-are still application responsibilities; this does not add an HDR URL loader.
+`loadGpuGltfAnimationScene`. The low-level factory above borrows an existing GPU
+texture; the HDR loader below handles file decoding and upload instead.
+
+## Loading HDR files
+
+```js
+import { loadGpuAnimationEnvironment } from './animation_environment_loader.mjs';
+
+const environment = await loadGpuAnimationEnvironment(device, './studio.hdr', {
+  baseURL: import.meta.url,
+  size: 128,
+  samples: 1024,
+  maxInputBytes: 64 * 1024 * 1024,
+  maxDecodedBytes: 256 * 1024 * 1024,
+  maxTextureBytes: 128 * 1024 * 1024,
+});
+// Use with the same environment-enabled scene/renderer shown above:
+// scene.render({...frame, environment: {map: environment, intensity: 1}});
+```
+
+`source` can instead be an `ArrayBuffer` or `Uint8Array` containing a complete
+Radiance RGBE file. The loader decodes, uploads once, runs the existing IBL
+preparation, waits for filtering completion and destroys the temporary panorama
+before returning the ready receiver map. No application decoder, canvas, manual
+texture upload or second frame loop is required. The caller owns the returned map
+and must dispose it after its consumers stop; the GPU device remains borrowed.
+`sourceInfo` reports dimensions, input bytes, exposure metadata, clamped component
+count, upload texture bytes and peak logical texture bytes.
+
+Only **2:1 Radiance RGBE panoramas** are accepted by this loader, not EXR, XYZE or
+arbitrary image formats. The decoder supports raw pixels, modern planar RLE and
+legacy repeat packets. All eight scan-axis/sign orientations normalize to top-down
+`-Y +X`. Pixels decode directly to tightly packed linear-sRGB RGBA16F with
+nearest-even rounding; component scaling follows Three r186 HDRLoader. Exposure
+header records are reported, not reapplied to already stored radiance. This is an
+explicit linear-sRGB profile, not general Radiance colorimetry: nonunit gamma,
+color correction or pixel aspect, and unsupported primaries, reject. Values above
+65504 reject by default; `overflow: 'clamp'` explicitly permits saturation and
+reports affected components. Neither tone mapping nor automatic exposure is added.
+
+The standalone `decodeAnimationHdr(bytes, options)` also exports the owned
+RGBA16F pixels without any GPU work. Its `maxDecodedBytes` bounds the output plus
+one scanline of scratch storage; encoded bytes and header bytes have separate
+limits. It accepts non-panorama dimensions for callers using decoded pixels directly.
+
+HTTP(S) loading accepts an injected `fetch` and requires streaming response bytes.
+Relative URLs require `baseURL`; embedded credentials and redirects reject, and
+requests use `credentials: 'omit'`. Both declared length and actual streamed bytes
+are bounded, including when Content-Length is absent or inaccurate. Assembly uses
+bounded growing storage rather than retaining a list of chunks; during growth,
+old and new input buffers can briefly coexist (at most twice `maxInputBytes`).
+This is not an SSRF sandbox for a caller-provided transport.
+
+Unlike the low-level factory's output-only texture budget, the loader's
+`maxTextureBytes` counts the **peak panorama plus all filtered maps**. The temporary
+panorama stays live until filtering finishes. Filter uniforms are separately
+checked against device limits. `signal` cancels construction across fetch, reads,
+upload validation, compilation and completion; device loss also aborts pending
+work. Late results are cleaned up. Synchronous decoding is not preemptible, and
+already submitted GPU work is not rolled back. Aborting the construction signal
+after a successful return does not revoke the map; disposal and device loss do.
 
 ## Frame controls and composition
 
 A frame descriptor is `{map, intensity?, rotation?}`. `map` is the completed
-`createGpuAnimationEnvironment` result on the **same GPU device**. Intensity is a
+`createGpuAnimationEnvironment` or `loadGpuAnimationEnvironment` result on the
+**same GPU device**. Intensity is a
 nonnegative finite number (default 1). Rotation defaults to identity and is an
 explicit column-major, right-handed **world-to-environment 3x3** orthonormal
 matrix. It is not an Euler-angle vector or an environment-object world matrix;
@@ -147,7 +208,47 @@ only the emitted environment/material modules, with the original toolkit path
 unavailable. Unrelated decoder/pose/deformer/shadow boundaries in that test are
 explicit substitutes; this is not an end-to-end binary asset or native GPU test.
 
+### Packaging the HDR loader
+
+```js
+const built = buildAnimation(modelPath, outputDirectory, {
+  webgpu: true,
+  environment: true,
+  hdr: true,
+});
+// In the deployed application:
+// import {loadGpuAnimationEnvironment} from './gpu_playback.mjs';
+```
+
+`hdr: true` additionally exports `decodeAnimationHdr` and
+`loadGpuAnimationEnvironment` from the public GPU entry and emits their runtime
+modules. It requires `environment: true` (which requires `webgpu: true`). All added
+bytes participate in the existing exact pre-write output budget. No HDR URL is
+fetched while building or importing the package; loading begins only when called.
+Omitting `hdr` leaves CPU, ordinary GPU and existing GPU-IBL package output bytes
+and file lists unchanged. HDR modules are not required for those default routes.
+
+The HDR relocation tests execute the actual builder, decoder, loader and filter
+from a deployed package after making its source toolkit unavailable. Unrelated
+glTF pose/material/scene dependencies are explicit substitutes in those tests;
+this is not a full binary glTF-to-rendered-scene or native GPU equivalence test.
+
 ## Focused validation
+
+The HDR decoder, loading and packaging tests:
+
+```sh
+node --test tools/ingest/animation_hdr.test.mjs \
+  tools/ingest/animation_environment_loader.test.mjs \
+  tools/ingest/animation_hdr_package.test.mjs
+```
+
+These 76 tests exercise real HDR bytes, scan orientations and packets, bounded
+streaming, exact memory budgets, upload/filter lifetimes, cancellation, device
+loss and relocated package execution. Fetch and GPU boundaries are recording
+interfaces; they do not execute native WGSL or establish rendered-pixel parity.
+
+The existing environment receiver/material tests:
 
 ```sh
 node --test tools/ingest/animation_environment_receiver.test.mjs \
