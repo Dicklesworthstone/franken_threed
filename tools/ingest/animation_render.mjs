@@ -62,6 +62,15 @@
  * 1 + strength * (R - 1), never direct lights, emission or alpha. With no
  * environment it has no lighting effect. Independent UVs use mapCoordinates.
  * The strength occupies named normal-matrix padding: the uniform stays 256 bytes.
+ * Metallic-roughness materials accept KHR_materials_clearcoat's clearcoatFactor,
+ * clearcoatRoughnessFactor and optional clearcoatTexture (linear R),
+ * clearcoatRoughnessTexture (linear G), clearcoatNormalTexture (linear RGB).
+ * clearcoatNormalScale scales the coating normal's XY, independently of the base.
+ * These registration-time settings use a 16-byte material uniform; the existing
+ * 256-byte per-draw packet stays unchanged. No coating draw overrides are implied.
+ * The coating uses Schlick Fresnel at NdotV, IOR 1.5, the existing GGX lobe/
+ * roughness floor, and attenuates the entire base including emission, not alpha.
+ * Its default normal is the geometry normal, NOT the base normal map.
  * These material profiles do not establish complete Three.js/PBR equivalence.
  *
  * Lit frames require lighting: {cameraPosition:[x,y,z], lights:[...]}, at most
@@ -125,11 +134,15 @@ const MAX_LIGHTS = 8, LIGHT_BYTES = 32 + MAX_LIGHTS * 64;
 const UV_IDENTITY = Object.freeze([1, 0, 0, 1, 0, 0]);
 // Stable sampler/texture pairs. Layouts contain only the maps actually used;
 // absent maps neither allocate placeholders nor consume texture bindings.
-const MAP_FIELDS = Object.freeze(['baseColorTexture', 'metallicRoughnessTexture', 'normalTexture', 'emissiveTexture', 'occlusionTexture']);
-const MAP_NAMES = Object.freeze(['color', 'metallic_roughness', 'normal_map', 'emissive', 'occlusion']);
+const MAP_FIELDS = Object.freeze(['baseColorTexture', 'metallicRoughnessTexture', 'normalTexture', 'emissiveTexture', 'occlusionTexture',
+  'clearcoatTexture', 'clearcoatRoughnessTexture', 'clearcoatNormalTexture']);
+const COAT_FIELDS = Object.freeze(['clearcoatFactor', 'clearcoatRoughnessFactor', 'clearcoatNormalScale']);
+const COAT_LAYOUT = 256, COAT_BYTES = 16;
+const MAP_NAMES = Object.freeze(['color', 'metallic_roughness', 'normal_map', 'emissive', 'occlusion',
+  'clearcoat', 'clearcoat_roughness', 'clearcoat_normal']);
 const mapMaskFor = variant => variant.includes('maps-') ? Number(variant.split('maps-')[1]) : variant.endsWith('texture') ? 1 : 0;
 const coordinateMaskFor = variant => Number(/uv-(\d+)-/.exec(variant)?.[1] ?? 0);
-const mapSlots = mask => [0, 1, 2, 3, 4].filter(slot => mask & (1 << slot));
+const mapSlots = mask => [0, 1, 2, 3, 4, 5, 6, 7].filter(slot => mask & (1 << slot));
 const lightingVariant = (variant, shadowed, environmentLit) => variant.replace(/^lit-/,
   `lit-${shadowed ? 'shadow-' : ''}${environmentLit ? 'environment-' : ''}`);
 export const ANIMATION_RENDER_WGSL = /* wgsl */`
@@ -146,8 +159,35 @@ struct DrawInfo { clip_from_local: mat4x4<f32>, color: vec4<f32>, options: vec4<
 // Equations: glTF 2.0 Appendix B and KHR_lights_punctual (Khronos).
 // https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#appendix-b-brdf-implementation
 // https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_lights_punctual
-function surfaceShader(mapMask, lit, attributes, derivative = false, coordinateMask = 0, depthOnly = false, shadowed = false, environmentCode = '', instanceStride = 0) {
-  const textured = mapMask !== 0, normalMapped = (mapMask & 4) !== 0, tangentAttribute = normalMapped && !derivative;
+// Clearcoat has its own tangent-space normal; it never inherits a perturbed
+// base normal. Derivatives are evaluated by the caller before any alpha discard.
+function clearcoatNormalCode(derivative) {
+  return /* wgsl */`
+  {
+    let normal = coat_normal;
+    ${derivative ? `let position_scale = max(max(max(abs(coat_position_dx.x), abs(coat_position_dx.y)), abs(coat_position_dx.z)), max(max(abs(coat_position_dy.x), abs(coat_position_dy.y)), abs(coat_position_dy.z)));
+    let uv_scale = max(max(abs(coat_uv_dx.x), abs(coat_uv_dx.y)), max(abs(coat_uv_dy.x), abs(coat_uv_dy.y)));
+    let q0 = coat_position_dx / max(position_scale, 1e-20);
+    let q1 = coat_position_dy / max(position_scale, 1e-20);
+    let st0 = coat_uv_dx / max(uv_scale, 1e-20);
+    let st1 = coat_uv_dy / max(uv_scale, 1e-20);
+    let orientation = select(-1.0, 1.0, dot(cross(q0, q1), normal) >= 0.0);
+    let raw_tangent = (cross(q1, normal) * st0.x + cross(normal, q0) * st1.x) * orientation;
+    let raw_bitangent = (cross(q1, normal) * st0.y + cross(normal, q0) * st1.y) * orientation;
+    let frame_length2 = max(dot(raw_tangent, raw_tangent), dot(raw_bitangent, raw_bitangent));
+    var frame_scale = 0.0;
+    if (frame_length2 > 0.0) { frame_scale = inverseSqrt(frame_length2); }
+    let tangent = raw_tangent * frame_scale;
+    let bitangent = raw_bitangent * frame_scale;` : `let tangent = unit_vector(input.tangent.xyz - normal * dot(normal, input.tangent.xyz));
+    let bitangent = cross(normal, tangent) * select(-1.0, 1.0, input.tangent.w >= 0.0);`}
+    var mapped = clearcoat_normal_texel.xyz * 2.0 - vec3<f32>(1.0);
+    mapped = vec3<f32>(mapped.xy * clearcoat_info.z, mapped.z);
+    coat_normal = unit_vector(tangent * mapped.x + bitangent * mapped.y + normal * mapped.z);
+  }`;
+}
+function surfaceShader(mapMask, lit, attributes, derivative = false, coordinateMask = 0, depthOnly = false, shadowed = false, environmentCode = '', instanceStride = 0, coated = false) {
+  const textured = mapMask !== 0 || coated, normalMapped = (mapMask & 4) !== 0, coatNormalMapped = (mapMask & 128) !== 0;
+  const tangentAttribute = (normalMapped || coatNormalMapped) && !derivative;
   const occluded = (mapMask & 16) !== 0, ambientOcclusion = occluded && environmentCode !== '';
   const declarations = mapSlots(mapMask).map(slot =>
     `@group(1) @binding(${slot * 2}) var ${MAP_NAMES[slot]}_sampler: sampler;\n@group(1) @binding(${slot * 2 + 1}) var ${MAP_NAMES[slot]}_texture: texture_2d<f32>;`).join('\n');
@@ -225,10 +265,10 @@ ${occluded ? '// Same 48-byte layout as mat3x3; the first column padding holds m
 ${instanceStride ? `struct InstanceDraw { @size(${instanceStride}) info: DrawInfo }
 @group(0) @binding(0) var<storage, read> instance_draws: array<InstanceDraw>;
 var<private> draw_info: DrawInfo;` : '@group(0) @binding(0) var<uniform> draw_info: DrawInfo;'}
-${declarations}
+${declarations}${coated ? '\n@group(1) @binding(16) var<uniform> clearcoat_info: vec4<f32>;' : ''}
 ${lighting}
 struct VertexOutput {
-  @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) color: vec4<f32>,${instanceStride ? '\n  @location(10) @interpolate(flat) draw_index: u32,' : ''}
+  @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) color: vec4<f32>,${instanceStride ? `\n  @location(${coated ? 13 : 10}) @interpolate(flat) draw_index: u32,` : ''}
   ${lit ? '@location(2) world: vec3<f32>, @location(3) normal: vec3<f32>,' : ''}
   ${tangentAttribute ? '@location(4) tangent: vec4<f32>,' : ''}
   ${mapSlots(coordinateMask).map(slot => `@location(${5 + slot}) uv_${slot}: vec2<f32>,`).join('\n  ')}
@@ -246,13 +286,16 @@ struct VertexOutput {
   // Sample every map before discard or nonuniform lighting flow: implicit
   // derivatives must be evaluated in uniform control flow.
   ${samples}
-  ${derivative ? `let position_dx = dpdx(input.world);
+  ${derivative && normalMapped ? `let position_dx = dpdx(input.world);
   let position_dy = dpdy(input.world);
   let uv_dx = dpdx(${coordinates(2)});
-  let uv_dy = dpdy(${coordinates(2)});` : ''}
+  let uv_dy = dpdy(${coordinates(2)});` : ''}${derivative && coatNormalMapped ? `\n  let coat_position_dx = dpdx(input.world);
+  let coat_position_dy = dpdy(input.world);
+  let coat_uv_dx = dpdx(${coordinates(7)});
+  let coat_uv_dy = dpdy(${coordinates(7)});` : ''}
   let rgba = draw_info.color * input.color ${mapMask & 1 ? '* color_texel' : ''};
   if (draw_info.options.x >= 0.0 && rgba.a < draw_info.options.x) { discard; }
-  ${lit ? `var normal = unit_vector(input.normal);
+  ${lit ? `var normal = unit_vector(input.normal);${coated ? '\n  var coat_normal = normal;' : ''}
   ${normalMapped ? `${derivative ? `// Common positive rescaling keeps the cotangent calculation bounded while
   // preserving its relative T/B lengths. Correct raster Y orientation using
   // the surface normal rather than assuming one viewport/front-face convention.
@@ -277,11 +320,24 @@ struct VertexOutput {
   var mapped = normal_map_texel.xyz * 2.0 - vec3<f32>(1.0);
   mapped = vec3<f32>(mapped.xy * draw_info.uv_x.w, mapped.z);
   normal = unit_vector(tangent * mapped.x + bitangent * mapped.y + normal * mapped.z);` : ''}
-  normal *= select(-1.0, 1.0, front);
+  ${coatNormalMapped ? clearcoatNormalCode(derivative) + '\n  ' : ''}normal *= select(-1.0, 1.0, front);${coated ? '\n  coat_normal *= select(-1.0, 1.0, front);' : ''}
   let metallic = draw_info.options.w ${mapMask & 2 ? '* metallic_roughness_texel.b' : ''};
   let roughness = draw_info.emission_roughness.w ${mapMask & 2 ? '* metallic_roughness_texel.g' : ''};
   let emission = draw_info.emission_roughness.rgb ${mapMask & 8 ? '* emissive_texel.rgb' : ''};
-  ${ambientOcclusion ? '// glTF occlusion uses only linear R and affects indirect light, never emission or punctual light.\n  let occlusion = 1.0 + draw_info.normal_from_local.strength * (occlusion_texel.r - 1.0);\n  ' : ''}let rgb = illuminate(rgba.rgb, input.world, normal, metallic, roughness, emission${ambientOcclusion ? ', occlusion' : ''});` : 'let rgb = rgba.rgb;'}
+  ${ambientOcclusion ? '// glTF occlusion uses only linear R and affects indirect light, never emission or punctual light.\n  let occlusion = 1.0 + draw_info.normal_from_local.strength * (occlusion_texel.r - 1.0);\n  ' : ''}${coated ? 'var' : 'let'} rgb = illuminate(rgba.rgb, input.world, normal, metallic, roughness, emission${ambientOcclusion ? ', occlusion' : ''});${coated ? `
+  let coat_factor = clearcoat_info.x${mapMask & 32 ? ' * clearcoat_texel.r' : ''};
+  let coat_roughness = clearcoat_info.y${mapMask & 64 ? ' * clearcoat_roughness_texel.g' : ''};
+  var coat_view = unit_vector(lighting.camera.xyz - input.world);
+  if (lighting.camera.w > 0.0) { coat_view = lighting.camera.xyz; }
+  if (coat_factor > 0.0 && dot(coat_normal, coat_normal) > 0.0 && dot(coat_view, coat_view) > 0.0) {
+    // KHR_materials_clearcoat simple Fresnel layering, fixed coating IOR 1.5.
+    // A white metal is the existing F=1 GGX lobe, including its matching IBL
+    // quadrature. Weight it here once; attenuate the entire base, also emission.
+    let edge = 1.0 - clamp(abs(dot(coat_normal, coat_view)), 0.0, 1.0);
+    let weight = coat_factor * (0.04 + 0.96 * edge * edge * edge * edge * edge);
+    let coat_light = illuminate(vec3<f32>(1.0), input.world, coat_normal, 1.0, coat_roughness, vec3<f32>(0.0)${ambientOcclusion ? ', occlusion' : ''});
+    rgb = rgb * (1.0 - weight) + coat_light * weight;
+  }` : ''}` : 'let rgb = rgba.rgb;'}
   ${depthOnly ? '' : 'return vec4<f32>(rgb, select(1.0, rgba.a, draw_info.options.y > 0.0));'}
 }
 `;
@@ -514,7 +570,10 @@ export async function createGpuAnimationRenderer(device, {
     return textures.map(t => t ? `${id(t.view)}:${id(t.sampler)}` : '-').join('/');
   }
   function releaseGroup(entry) {
-    if (entry && entry.refs > 0 && --entry.refs === 0 && sharedGroups.get(entry.key) === entry) sharedGroups.delete(entry.key);
+    if (entry && entry.refs > 0 && --entry.refs === 0) {
+      forget(entry.coatBuffer);
+      if (sharedGroups.get(entry.key) === entry) sharedGroups.delete(entry.key);
+    }
   }
   function publishGroup(entry) {
     if (!entry || sharedGroups.get(entry.key) === entry) return entry;
@@ -539,25 +598,27 @@ export async function createGpuAnimationRenderer(device, {
     if (terminal) throw terminal;
   }
   function compilePipelines(variant) {
-    const lit = variant.startsWith('lit-'), attributes = !variant.endsWith('plain'), mapMask = mapMaskFor(variant), textured = mapMask !== 0;
+    const coated = variant.includes('coat-');
+    const lit = variant.startsWith('lit-'), attributes = !variant.endsWith('plain'), mapMask = mapMaskFor(variant), textured = mapMask !== 0 || coated;
+    const layoutKey = mapMask | (coated ? COAT_LAYOUT : 0);
     const derivative = variant.includes('derivative-'), coordinateMask = coordinateMaskFor(variant), shadowed = variant.startsWith('lit-shadow-');
     const environmentLit = variant.includes('environment-');
     if (attributes) { limit('maxVertexBuffers', 2); limit('maxVertexAttributes', 5); }
     if (textured) {
       const slots = mapSlots(mapMask);
       limit('maxBindGroups', lit ? 3 : 2); limit('maxSamplersPerShaderStage', slots.length); limit('maxSampledTexturesPerShaderStage', slots.length);
-      if (!textureLayouts.has(mapMask)) textureLayouts.set(mapMask, device.createBindGroupLayout({label, entries: slots.flatMap(slot => [
+      if (!textureLayouts.has(layoutKey)) textureLayouts.set(layoutKey, device.createBindGroupLayout({label, entries: [...slots.flatMap(slot => [
         {binding: slot * 2, visibility: FRAGMENT_STAGE, sampler: {type: 'filtering'}},
         {binding: slot * 2 + 1, visibility: FRAGMENT_STAGE, texture: {sampleType: 'float', viewDimension: '2d', multisampled: false}},
-      ])}));
+      ]), ...(coated ? [{binding: 16, visibility: FRAGMENT_STAGE, buffer: {type: 'uniform', minBindingSize: COAT_BYTES}}] : [])]}));
     }
-    const bindGroupLayouts = textured ? [uniformLayout, textureLayouts.get(mapMask)] : [uniformLayout];
+    const bindGroupLayouts = textured ? [uniformLayout, textureLayouts.get(layoutKey)] : [uniformLayout];
     if (lit) bindGroupLayouts.push(environmentLit ? environmentLayouts.get(shadowed) : shadowed ? shadowLayout : lightLayout);
     const pipelineLayout = device.createPipelineLayout({label, bindGroupLayouts});
-    const module = device.createShaderModule({label, code: instancing || lit || attributes || format === null ? surfaceShader(mapMask, lit, attributes, derivative, coordinateMask, format === null, shadowed, environmentLit ? environmentReceiver.environmentLightingWgsl(textured ? 2 : 1) : '', instancing ? stride : 0) : ANIMATION_RENDER_WGSL});
+    const module = device.createShaderModule({label, code: instancing || lit || attributes || format === null ? surfaceShader(mapMask, lit, attributes, derivative, coordinateMask, format === null, shadowed, environmentLit ? environmentReceiver.environmentLightingWgsl(textured ? 2 : 1) : '', instancing ? stride : 0, coated) : ANIMATION_RENDER_WGSL});
     const vertexBuffers = [{arrayStride: 40, stepMode: 'vertex', attributes: [{shaderLocation: 0, offset: 0, format: 'float32x3'}]}];
     if (lit) vertexBuffers[0].attributes.push({shaderLocation: 1, offset: 12, format: 'float32x3'});
-    if ((mapMask & 4) && !derivative) vertexBuffers[0].attributes.push({shaderLocation: 2, offset: 24, format: 'float32x4'});
+    if ((mapMask & 132) && !derivative) vertexBuffers[0].attributes.push({shaderLocation: 2, offset: 24, format: 'float32x4'});
     if (attributes) vertexBuffers.push({arrayStride: 24 + mapSlots(coordinateMask).length * 8, stepMode: 'vertex', attributes: [
       {shaderLocation: 3, offset: 0, format: 'float32x2'}, {shaderLocation: 4, offset: 8, format: 'float32x4'},
       ...mapSlots(coordinateMask).map((slot, i) => ({shaderLocation: 5 + slot, offset: 24 + i * 8, format: 'float32x2'})),
@@ -642,7 +703,7 @@ export async function createGpuAnimationRenderer(device, {
 
   async function addMesh(gpu, options = {}) {
     live(); if (busy) fail('ANIMATION_RENDER_REENTRANT', 'Cannot register a mesh during submission');
-    keys(options, ['indices', 'baseColor', 'doubleSided', 'alphaMode', 'alphaCutoff', 'texCoords', 'vertexColors', 'mapCoordinates', ...MAP_FIELDS, 'normalScale', 'occlusionStrength', 'uvTransform', 'shading', 'metallicFactor', 'roughnessFactor', 'emissiveFactor'], 'material/geometry');
+    keys(options, ['indices', 'baseColor', 'doubleSided', 'alphaMode', 'alphaCutoff', 'texCoords', 'vertexColors', 'mapCoordinates', ...MAP_FIELDS, ...COAT_FIELDS, 'normalScale', 'occlusionStrength', 'uvTransform', 'shading', 'metallicFactor', 'roughnessFactor', 'emissiveFactor'], 'material/geometry');
     deformerShape(gpu);
     if (records.size + pendingMeshes >= maxMeshes) fail('ANIMATION_RENDER_LIMIT', 'Mesh capacity exceeded');
     const {indices = null, baseColor = [1, 1, 1, 1], doubleSided = false, alphaMode = 'OPAQUE', alphaCutoff = 0.5} = options;
@@ -661,6 +722,20 @@ export async function createGpuAnimationRenderer(device, {
       return {view, sampler};
     });
     const mapMask = textures.reduce((mask, texture, slot) => mask | (texture ? 1 << slot : 0), 0);
+    const coated = COAT_FIELDS.some(field => options[field] !== undefined) || (mapMask & 224) !== 0;
+    if (coated && mode !== 2) fail('ANIMATION_RENDER_OPTIONS', 'Clearcoat requires metallic-roughness shading');
+    if (options.clearcoatNormalScale !== undefined && !(mapMask & 128)) fail('ANIMATION_RENDER_OPTIONS', 'Clearcoat normal scale requires its normal map');
+    const coatValues = coated ? [options.clearcoatFactor === undefined ? 0 : options.clearcoatFactor,
+      options.clearcoatRoughnessFactor === undefined ? 0 : options.clearcoatRoughnessFactor,
+      options.clearcoatNormalScale === undefined ? 1 : options.clearcoatNormalScale, 0] : null;
+    if (coated) {
+      for (const value of coatValues) if (!Number.isFinite(Math.fround(finite(value, 'Clearcoat parameter')))) fail('ANIMATION_RENDER_VALUE', 'Clearcoat parameters must fit f32');
+      if (coatValues[0] < 0 || coatValues[0] > 1 || coatValues[1] < 0 || coatValues[1] > 1) fail('ANIMATION_RENDER_VALUE', 'Clearcoat factors must be in [0,1]');
+      limit('maxBindGroups', 3); limit('maxUniformBuffersPerShaderStage', 3 + Number(shadows) + Number(environment));
+      limit('maxBindingsPerBindGroup', mapSlots(mapMask).length * 2 + 1);
+      if (instancing) limit('maxInterStageShaderVariables', 14);
+    }
+    const coatData = coated ? new Float32Array(coatValues) : null, layoutKey = mapMask | (coated ? COAT_LAYOUT : 0);
     if ((!lit && (mapMask & 30)) || (mode !== 2 && (mapMask & 2)) || (!(mapMask & 4) && options.normalScale !== undefined) ||
         (!(mapMask & 16) && options.occlusionStrength !== undefined)) {
       fail('ANIMATION_RENDER_OPTIONS', 'Texture parameters do not apply to shading model');
@@ -669,7 +744,7 @@ export async function createGpuAnimationRenderer(device, {
     if (occlusionStrength < 0 || occlusionStrength > 1) fail('ANIMATION_RENDER_VALUE', 'Occlusion strength must be in [0,1]');
     const normalScale = finite(options.normalScale ?? 1, 'Normal scale');
     if (!Number.isFinite(Math.fround(normalScale))) fail('ANIMATION_RENDER_VALUE', 'Normal scale exceeds f32');
-    const derivative = (mapMask & 4) !== 0 && !gpu.vertexLayout.attributes.some(a => a.shaderLocation === 2 && a.offset === 24 && a.format === 'float32x4');
+    const derivative = (mapMask & 132) !== 0 && !gpu.vertexLayout.attributes.some(a => a.shaderLocation === 2 && a.offset === 24 && a.format === 'float32x4');
     if (mapMask) {
       limit('maxBindGroups', lit ? 3 : 2);
       limit('maxSamplersPerShaderStage', mapSlots(mapMask).length);
@@ -712,7 +787,7 @@ export async function createGpuAnimationRenderer(device, {
     for (const [slot, field] of MAP_FIELDS.entries()) if (Object.hasOwn(coordinateInput, field)) {
       if (!(mapMask & (1 << slot))) fail('ANIMATION_RENDER_OPTIONS', `Coordinates require ${field}`);
       const input = coordinateInput[field]; keys(input, ['texCoords', 'uvTransform'], field + ' coordinates');
-      const values = array(input.texCoords === undefined ? texCoords : input.texCoords, gpu.vertexCount * 2, field + ' UVs');
+      const values = array(input.texCoords === undefined ? texCoords : input.texCoords, gpu.vertexCount * 2, field + 'UVs');
       const local = Float64Array.from(uvTransform(input.uvTransform ?? UV_IDENTITY));
       coordinates.push({slot, values, transform: local});
     }
@@ -722,18 +797,20 @@ export async function createGpuAnimationRenderer(device, {
       limit('maxVertexAttributes', needed); limit('maxInterStageShaderVariables', needed);
     }
     const surfaceWords = 6 + coordinates.length * 2;
-    const variant = (lit ? 'lit-' : '') + (derivative ? 'derivative-' : '') +
+    const variant = (lit ? 'lit-' : '') + (coated ? 'coat-' : '') + (derivative ? 'derivative-' : '') +
       (coordinateMask ? `uv-${coordinateMask}-` : '') + attributeVariant;
+    const textureKey = instancing && (mapMask || coated) ? groupKey(textures) + (coated ? '/coat:' + [...new Uint32Array(coatData.buffer)].join(',') : '') : null;
+    const coatReserve = coated && !sharedGroups?.has(textureKey) ? COAT_BYTES : 0;
     const lightReserve = lit && !lightBuffer ? LIGHT_BYTES + (shadows ? SHADOW_UNIFORM_BYTES : 0) + environmentBytes : 0;
-    if ((instancing ? 0 : allocatedBytes) + (data?.byteLength ?? 0) + lightReserve > maxBytes) fail('ANIMATION_RENDER_LIMIT', 'Material buffers exceed byte budget');
-    let surfaceData = null, surfaceBuffer = null, textureGroup = null;
+    if ((instancing ? 0 : allocatedBytes) + (data?.byteLength ?? 0) + lightReserve + coatReserve > maxBytes) fail('ANIMATION_RENDER_LIMIT', 'Material buffers exceed byte budget');
+    let surfaceData = null, surfaceBuffer = null, textureGroup = null, coatBuffer = null;
     if ((mapMask & ~coordinateMask) && texCoords === null) fail('ANIMATION_RENDER_GEOMETRY', 'Material textures require UV coordinates');
     if (attributeVariant !== 'plain') {
       limit('maxVertexBuffers', 2); limit('maxVertexAttributes', 5);
       const bytes = gpu.vertexCount * surfaceWords * 4;
       limit('maxVertexBufferArrayStride', surfaceWords * 4);
       limit('maxBufferSize', bytes);
-      if ((instancing ? 0 : allocatedBytes) + (data?.byteLength ?? 0) + lightReserve + bytes > maxBytes) fail('ANIMATION_RENDER_LIMIT', 'Surface/index buffers exceed byte budget');
+      if ((instancing ? 0 : allocatedBytes) + (data?.byteLength ?? 0) + lightReserve + coatReserve + bytes > maxBytes) fail('ANIMATION_RENDER_LIMIT', 'Surface/index buffers exceed byte budget');
       if (texCoords !== null) array(texCoords, gpu.vertexCount * 2, 'UV coordinates');
       let width = 0;
       if (vertexColors !== null) {
@@ -759,13 +836,13 @@ export async function createGpuAnimationRenderer(device, {
     }
     const extent = indices === null ? gpu.vertexCount : indices.length;
     const plans = instancing ? [bufferPlan(data, INDEX), bufferPlan(surfaceData, VERTEX)] : null;
-    if (instancing && allocatedBytes + lightReserve + plans.reduce((sum, p) => sum + (p && !p.existing ? p.bytes.length : 0), 0) > maxBytes) {
+    if (instancing && allocatedBytes + lightReserve + coatReserve + plans.reduce((sum, p) => sum + (p && !p.existing ? p.bytes.length : 0), 0) > maxBytes) {
       fail('ANIMATION_RENDER_LIMIT', 'Unique material buffers exceed byte budget');
     }
     let indexLease = null, surfaceLease = null, textureLease = null;
     const retireMaterial = () => {
       if (instancing) { releaseBuffer(indexLease); releaseBuffer(surfaceLease); releaseGroup(textureLease); }
-      else { forget(indexBuffer); forget(surfaceBuffer); }
+      else { forget(indexBuffer); forget(surfaceBuffer); forget(coatBuffer); }
     };
     pendingMeshes++;
     try {
@@ -785,14 +862,20 @@ export async function createGpuAnimationRenderer(device, {
             if (name === 'indices') indexBuffer = buffer; else surfaceBuffer = buffer;
             new Uint8Array(buffer.getMappedRange()).set(new Uint8Array(values.buffer)); buffer.unmap();
           }
-          if (mapMask) {
-            const key = instancing ? groupKey(textures) : null, existing = sharedGroups?.get(key);
+          if (mapMask || coated) {
+            const key = textureKey, existing = sharedGroups?.get(key);
             if (existing) { textureLease = existing; textureLease.refs++; textureGroup = existing.group; }
             else {
-              textureGroup = device.createBindGroup({label, layout: textureLayouts.get(mapMask), entries: mapSlots(mapMask).flatMap(slot => [
+              if (coated) {
+                if (allocatedBytes + COAT_BYTES > maxBytes) fail('ANIMATION_RENDER_LIMIT', 'Clearcoat buffer exceeds byte budget');
+                coatBuffer = remember(device.createBuffer({label: `${label}/clearcoat`, size: COAT_BYTES, usage: UNIFORM, mappedAtCreation: true}), COAT_BYTES);
+                if (instancing) textureLease = {key, group: null, coatBuffer, refs: 1};
+                new Float32Array(coatBuffer.getMappedRange()).set(coatData); coatBuffer.unmap();
+              }
+              textureGroup = device.createBindGroup({label, layout: textureLayouts.get(layoutKey), entries: [...mapSlots(mapMask).flatMap(slot => [
                 {binding: slot * 2, resource: textures[slot].sampler}, {binding: slot * 2 + 1, resource: textures[slot].view},
-              ])});
-              if (instancing) textureLease = {key, group: textureGroup, refs: 1};
+              ]), ...(coated ? [{binding: 16, resource: {buffer: coatBuffer, size: COAT_BYTES}}] : [])]});
+              if (instancing) textureLease = {key, group: textureGroup, coatBuffer, refs: 1};
             }
           }
         });
@@ -871,6 +954,7 @@ export async function createGpuAnimationRenderer(device, {
         finite(determinant, 'World determinant');
         if (input.occlusionStrength !== undefined && !(record.mapMask & 16)) fail('ANIMATION_RENDER_OPTIONS', 'Occlusion strength requires an occlusion map');
         if (input.normalScale !== undefined && !(record.mapMask & 4)) fail('ANIMATION_RENDER_OPTIONS', 'Normal scale requires a normal map');
+        if ((record.mapMask & 128) && !(record.mapMask & 4)) staged[offset + 31] = determinant < 0 ? -1 : 1;
         if (record.mapMask & 4) {
           const scale = finite(input.normalScale ?? record.normalScale, 'Normal scale');
           if (!Number.isFinite(Math.fround(scale))) fail('ANIMATION_RENDER_VALUE', 'Normal scale exceeds f32');
