@@ -18,6 +18,7 @@ pub mod affine3x4;
 pub mod box3;
 pub mod color;
 pub mod conversion;
+pub mod deformation;
 pub mod euler;
 pub mod frustum;
 pub mod jsnum;
