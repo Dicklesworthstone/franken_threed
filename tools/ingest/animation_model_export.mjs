@@ -7,7 +7,7 @@ import {createAnimationDeformer} from './animation_deformer.mjs';
 import {exportAnimationPoseGLB, AnimationExportError} from './animation_pose_export.mjs';
 export {AnimationExportError} from './animation_pose_export.mjs';
 const fail = (code, text) => { throw new AnimationExportError('ANIMATION_EXPORT_' + code, text); };
-const MAPS = ['baseColorTexture', 'metallicRoughnessTexture', 'normalTexture', 'emissiveTexture'];
+const MAPS = ['baseColorTexture', 'metallicRoughnessTexture', 'normalTexture', 'emissiveTexture', 'occlusionTexture'];
 
 export function createAnimationModelExporter(pose, drawables, source, exporting = false, deformers = null, copyright) {
   if (exporting === false) return Object.freeze({enabled: false, exportPoseGLB() { fail('DISABLED', 'Enable exporting at model construction'); }, dispose() {}});

@@ -15,7 +15,7 @@ export class AnimationExportError extends Error {
   constructor(code, message) { super(`${code}: ${message}`); this.name = 'AnimationExportError'; this.code = code; }
 }
 const fail = (code, message) => { throw new AnimationExportError('ANIMATION_EXPORT_' + code, message); };
-const MAPS = ['baseColorTexture', 'metallicRoughnessTexture', 'normalTexture', 'emissiveTexture'];
+const MAPS = ['baseColorTexture', 'metallicRoughnessTexture', 'normalTexture', 'emissiveTexture', 'occlusionTexture'];
 const IDENTITY_UV = [1, 0, 0, 1, 0, 0];
 const aligned = n => Math.ceil(n / 4) * 4;
 function integer(n, low, high, label) {
@@ -131,7 +131,7 @@ export async function exportAnimationPoseGLB(pose, entries, options = {}) {
     const count = integer(d.vertexCount, 1, maxVertices, 'vertex count');
     vertices += count; if (vertices > maxVertices) fail('LIMIT', 'Aggregate vertex limit exceeded');
     fields(material, ['geometry', 'indices', 'shading', 'baseColor', 'alphaMode', 'alphaCutoff', 'doubleSided',
-      'metallicFactor', 'roughnessFactor', 'emissiveFactor', 'normalScale', 'vertexColors', 'texCoords', 'uvTransform', 'mapCoordinates', ...MAPS], 'material');
+      'metallicFactor', 'roughnessFactor', 'emissiveFactor', 'normalScale', 'occlusionStrength', 'vertexColors', 'texCoords', 'uvTransform', 'mapCoordinates', ...MAPS], 'material');
     const m = vector(d.worldMatrix, 16, 'world matrix');
     if (m[3] !== 0 || m[7] !== 0 || m[11] !== 0 || m[15] !== 1) fail('GEOMETRY', 'World matrix must be affine');
     const positions = array(d.positions, count * 3, 'positions');
@@ -216,6 +216,7 @@ export async function exportAnimationPoseGLB(pose, entries, options = {}) {
       });
       info.texCoord = channel++;
       if (field === 'normalTexture') info.scale = finite(material.normalScale ?? 1, 'normal scale');
+      if (field === 'occlusionTexture') info.strength = vector([material.occlusionStrength === undefined ? 1 : material.occlusionStrength], 1, 'occlusion strength', 0, 1)[0];
       (field === 'baseColorTexture' || field === 'metallicRoughnessTexture' ? out.pbrMetallicRoughness : out)[field] = info;
     }
     fields(source, ['node', 'mesh', 'primitive', 'material'], 'source identity');
