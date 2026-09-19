@@ -30,6 +30,9 @@
  * derivative frame. mapCoordinates supplies per-map UVs/local transforms; the
  * shared uvTransform applies afterwards. Lit scenes pass lighting to render(). Textures
  * stay caller-owned; material arrays/descriptors are snapshotted before awaits.
+ * renderer.environment:true receives a borrowed frame.environment:{map,...}.
+ * Its extra 64-byte receiver uniform is reserved in the scene GPU budget;
+ * environment textures remain caller-owned. See ANIMATION_ENVIRONMENT.md.
  *
  * Implicit scene draws render opaque/masked meshes first, preserving their
  * relative order, then blended meshes back-to-front by projected node origin.
@@ -180,7 +183,7 @@ export async function createGpuAnimationScene(device, pose, drawables, {
       if (surface && (!Number.isSafeInteger(vertices) || vertices < 1)) fail('ANIMATION_SCENE_GEOMETRY', 'Surface attributes require XYZ geometry');
       const lit = material.shading === 'lambert' || material.shading === 'metallic-roughness';
       const surfaceStride = 24 + Object.keys(material.mapCoordinates ?? {}).length * 8;
-      const reserve = (material.indices?.length ?? 0) * 4 + (surface ? vertices * surfaceStride : 0) + (lit && !lightingAllocated ? 544 + (renderOptions.shadows ? 96 : 0) : 0);
+      const reserve = (material.indices?.length ?? 0) * 4 + (surface ? vertices * surfaceStride : 0) + (lit && !lightingAllocated ? 544 + (renderOptions.shadows ? 96 : 0) + (renderOptions.environment ? 64 : 0) : 0);
       const remaining = maxBytes - renderer.allocatedBytes - deformationBytes - reserve;
       if (remaining < 1) fail('ANIMATION_SCENE_LIMIT', 'Scene GPU buffer budget exhausted');
       const gpu = await createGpuAnimationDeformer(device, pose, geometry, {...deformOptions,

@@ -2,8 +2,8 @@
  * Explicit WebGPU material/draw submission for createGpuAnimationDeformer outputs.
  * This pass owns an aligned uniform arena and index buffers, not the supplied
  * device, deformers, attachments, camera, frame loop or source scene objects.
- * It is NOT an automatic Three.js renderer replacement: no environment lighting,
- * automatic shadows, tone mapping, implicit sorting or culling. RGB inputs are linear; an -srgb
+ * It is NOT an automatic Three.js renderer replacement: no automatic shadow
+ * fitting, tone mapping, implicit sorting or culling. RGB inputs are linear; an -srgb
  * attachment view supplies the display transfer function. Unsupported material
  * fields are rejected rather than silently rendered as unlit.
  *
@@ -56,7 +56,7 @@
  * reflected worlds and back faces preserve the mapped normal's orientation.
  * Collapsed UV derivatives retain the unperturbed normal; no tangent buffers
  * are allocated or synthesized for the derivative path.
- * These are direct-light materials, not complete Three.js/PBR equivalence.
+ * These material profiles do not establish complete Three.js/PBR equivalence.
  *
  * Lit frames require lighting: {cameraPosition:[x,y,z], lights:[...]}, at most
  * eight directional/point/spot lights in world space. For orthographic views,
@@ -68,7 +68,7 @@
  * required. Point/spot range, when supplied, is positive. Spot cone angles use
  * radians: 0 <= innerConeAngle < outerConeAngle <= PI/2, defaults 0 and PI/4.
  * Radiance follows KHR_lights_punctual units/attenuation, with a 0.001 distance
- * floor at a punctual singularity. No lights means only material emission.
+ * floor at a punctual singularity. Without an environment, no lights means only emission.
  * Light inputs are snapshotted/uploaded once per submission, not per vertex.
  * No lighting GPU buffer/pipeline is created until a lit mesh is registered.
  *
@@ -79,6 +79,18 @@
  * Bias subtracts clip depth; normalBias offsets world units along the shading
  * normal. Render the map again after changing caster poses or its light camera.
  * No shadow textures/bindings are synthesized for ordinary non-shadow frames.
+ *
+ * environment:true prepares optional image-based lighting variants for lit
+ * materials. A frame may pass environment:{map,intensity:1,rotation:[...]},
+ * borrowing a completed createGpuAnimationEnvironment from the same device.
+ * Rotation is a column-major world-to-environment 3x3; omit it for identity.
+ * Lambert uses diffuse E/pi; metallic-roughness also samples GGX radiance mips
+ * and the matching DFG LUT. Environment intensity never scales direct lights
+ * or emission, and projected shadows never attenuate the environment.
+ * No environment texture is owned, copied or synthesized here. The extra
+ * 64-byte uniform is charged to maxBytes; maps retain their separate budget.
+ * Null/omitted frame.environment selects the original direct-only pipelines.
+ * See ANIMATION_ENVIRONMENT.md for the single-scattering profile and ownership.
  *
  * Host validation finishes before GPU writes. Driver errors are terminal, not
  * rollbackable. version acknowledges submission, not completion: await whenIdle()
@@ -100,6 +112,8 @@ const MAP_NAMES = Object.freeze(['color', 'metallic_roughness', 'normal_map', 'e
 const mapMaskFor = variant => variant.includes('maps-') ? Number(variant.split('maps-')[1]) : variant.endsWith('texture') ? 1 : 0;
 const coordinateMaskFor = variant => Number(/uv-(\d+)-/.exec(variant)?.[1] ?? 0);
 const mapSlots = mask => [0, 1, 2, 3].filter(slot => mask & (1 << slot));
+const lightingVariant = (variant, shadowed, environmentLit) => variant.replace(/^lit-/,
+  `lit-${shadowed ? 'shadow-' : ''}${environmentLit ? 'environment-' : ''}`);
 export const ANIMATION_RENDER_WGSL = /* wgsl */`
 struct DrawInfo { clip_from_local: mat4x4<f32>, color: vec4<f32>, options: vec4<f32> }
 @group(0) @binding(0) var<uniform> draw_info: DrawInfo;
@@ -114,7 +128,7 @@ struct DrawInfo { clip_from_local: mat4x4<f32>, color: vec4<f32>, options: vec4<
 // Equations: glTF 2.0 Appendix B and KHR_lights_punctual (Khronos).
 // https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#appendix-b-brdf-implementation
 // https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_lights_punctual
-function surfaceShader(mapMask, lit, attributes, derivative = false, coordinateMask = 0, depthOnly = false, shadowed = false) {
+function surfaceShader(mapMask, lit, attributes, derivative = false, coordinateMask = 0, depthOnly = false, shadowed = false, environmentCode = '') {
   const textured = mapMask !== 0, normalMapped = (mapMask & 4) !== 0, tangentAttribute = normalMapped && !derivative;
   const declarations = mapSlots(mapMask).map(slot =>
     `@group(1) @binding(${slot * 2}) var ${MAP_NAMES[slot]}_sampler: sampler;\n@group(1) @binding(${slot * 2 + 1}) var ${MAP_NAMES[slot]}_texture: texture_2d<f32>;`).join('\n');
@@ -125,7 +139,7 @@ function surfaceShader(mapMask, lit, attributes, derivative = false, coordinateM
 struct Light { vector: vec4<f32>, radiance: vec4<f32>, direction: vec4<f32>, cone: vec4<f32> }
 struct Lighting { camera: vec4<f32>, meta: vec4<f32>, lights: array<Light, 8> }
 @group(${textured ? 2 : 1}) @binding(0) var<uniform> lighting: Lighting;
-${shadowed ? projectedShadowWgsl(textured ? 2 : 1) : ''}
+${shadowed ? projectedShadowWgsl(textured ? 2 : 1) : ''}${environmentCode ? '\n' + environmentCode : ''}
 fn unit_vector(v: vec3<f32>) -> vec3<f32> {
   let scale = max(max(abs(v.x), abs(v.y)), abs(v.z));
   if (scale == 0.0) { return vec3<f32>(0.0); }
@@ -136,7 +150,7 @@ fn illuminate(base: vec3<f32>, position: vec3<f32>, normal: vec3<f32>, metallic:
   var view = unit_vector(lighting.camera.xyz - position);
   if (lighting.camera.w > 0.0) { view = lighting.camera.xyz; }
   let nv = max(dot(normal, view), 0.0);
-  var result = emission;
+  var result = emission;${environmentCode ? '\n  result += environment_lighting(base, normal, view, metallic, roughness, draw_info.options.z == 2.0);' : ''}
   for (var i = 0u; i < u32(lighting.meta.x); i++) {
     let light = lighting.lights[i];
     var incoming = -light.vector.xyz;
@@ -370,7 +384,7 @@ function deformerShape(gpu) {
 
 /** Create reusable unlit render pipelines; never initializes browser services. */
 export async function createGpuAnimationRenderer(device, {
-  format = 'rgba8unorm', depthFormat = 'depth24plus', sampleCount = 1, shadows = false,
+  format = 'rgba8unorm', depthFormat = 'depth24plus', sampleCount = 1, shadows = false, environment = false,
   maxDraws = 1024, maxMeshes = 1024, maxBytes = 64 * 1024 * 1024, label = 'f3d-animation-draw',
 } = {}) {
   if (!device?.queue || !device.limits || typeof device.createRenderPipelineAsync !== 'function' ||
@@ -380,6 +394,7 @@ export async function createGpuAnimationRenderer(device, {
       ![1, 4].includes(sampleCount) || typeof label !== 'string') fail('ANIMATION_RENDER_OPTIONS', 'Unsupported attachment configuration');
   if (format === null && depthFormat === null) fail('ANIMATION_RENDER_OPTIONS', 'Depth-only rendering requires a depth format');
   if (typeof shadows !== 'boolean' || (shadows && format === null)) fail('ANIMATION_RENDER_OPTIONS', 'Shadows require a color renderer');
+  if (typeof environment !== 'boolean' || (environment && format === null)) fail('ANIMATION_RENDER_OPTIONS', 'Environment lighting requires a color renderer');
   integer(maxDraws, 1, 65536, 'draw capacity'); integer(maxMeshes, 1, 65536, 'mesh capacity');
   integer(maxBytes, 1, Number.MAX_SAFE_INTEGER, 'byte budget');
   const limits = device.limits;
@@ -401,10 +416,14 @@ export async function createGpuAnimationRenderer(device, {
   let version = 0, drawCount = 0, completion = Promise.resolve(), uniformBuffer, bindGroup, uniformLayout, lightBuffer, lightLayout, lightGroup, lightingReady;
   const lightWords = new Float32Array(LIGHT_BYTES / 4), shadowWords = new Float32Array(SHADOW_UNIFORM_BYTES / 4);
   let shadowBuffer, shadowLayout, shadowGroup, shadowView, shadowSampler;
+  let environmentReceiver, environmentBytes = 0, environmentWords, environmentBuffer;
+  // Only the latest bindings for each of the two environment variants survive.
+  // Switching maps cannot accumulate an unbounded cache of borrowed textures.
+  const environmentLayouts = new Map(), environmentGroups = new Map();
   const variants = new Map(), textureLayouts = new Map();
   function remember(buffer, bytes) { buffers.set(buffer, bytes); allocatedBytes += bytes; return buffer; }
   function forget(buffer) { if (buffers.has(buffer)) { allocatedBytes -= buffers.get(buffer); buffers.delete(buffer); buffer.destroy(); } }
-  function release() { for (const buffer of buffers.keys()) forget(buffer); shadowGroup = shadowView = shadowSampler = null; }
+  function release() { for (const buffer of buffers.keys()) forget(buffer); shadowGroup = shadowView = shadowSampler = null; environmentGroups.clear(); }
   const lost = device.lost.then(info => {
     terminal ??= new AnimationRenderError('ANIMATION_RENDER_LOST', info?.message || 'WebGPU device lost');
     release(); throw terminal;
@@ -417,6 +436,7 @@ export async function createGpuAnimationRenderer(device, {
   function compilePipelines(variant) {
     const lit = variant.startsWith('lit-'), attributes = !variant.endsWith('plain'), mapMask = mapMaskFor(variant), textured = mapMask !== 0;
     const derivative = variant.includes('derivative-'), coordinateMask = coordinateMaskFor(variant), shadowed = variant.startsWith('lit-shadow-');
+    const environmentLit = variant.includes('environment-');
     if (attributes) { limit('maxVertexBuffers', 2); limit('maxVertexAttributes', 5); }
     if (textured) {
       const slots = mapSlots(mapMask);
@@ -427,9 +447,9 @@ export async function createGpuAnimationRenderer(device, {
       ])}));
     }
     const bindGroupLayouts = textured ? [uniformLayout, textureLayouts.get(mapMask)] : [uniformLayout];
-    if (lit) bindGroupLayouts.push(shadowed ? shadowLayout : lightLayout);
+    if (lit) bindGroupLayouts.push(environmentLit ? environmentLayouts.get(shadowed) : shadowed ? shadowLayout : lightLayout);
     const pipelineLayout = device.createPipelineLayout({label, bindGroupLayouts});
-    const module = device.createShaderModule({label, code: lit || attributes || format === null ? surfaceShader(mapMask, lit, attributes, derivative, coordinateMask, format === null, shadowed) : ANIMATION_RENDER_WGSL});
+    const module = device.createShaderModule({label, code: lit || attributes || format === null ? surfaceShader(mapMask, lit, attributes, derivative, coordinateMask, format === null, shadowed, environmentLit ? environmentReceiver.environmentLightingWgsl(textured ? 2 : 1) : '') : ANIMATION_RENDER_WGSL});
     const vertexBuffers = [{arrayStride: 40, stepMode: 'vertex', attributes: [{shaderLocation: 0, offset: 0, format: 'float32x3'}]}];
     if (lit) vertexBuffers[0].attributes.push({shaderLocation: 1, offset: 12, format: 'float32x3'});
     if ((mapMask & 4) && !derivative) vertexBuffers[0].attributes.push({shaderLocation: 2, offset: 24, format: 'float32x4'});
@@ -457,21 +477,33 @@ export async function createGpuAnimationRenderer(device, {
     if (!lightingReady) {
       const allocated = scoped(device, () => {
         lightBuffer = remember(device.createBuffer({label: `${label}/lights`, size: LIGHT_BYTES, usage: UNIFORM | COPY_DST}), LIGHT_BYTES);
-        lightLayout = device.createBindGroupLayout({label, entries: [{binding: 0, visibility: FRAGMENT_STAGE,
-          buffer: {type: 'uniform', minBindingSize: LIGHT_BYTES}}]});
+        const lightEntries = [{binding: 0, visibility: FRAGMENT_STAGE, buffer: {type: 'uniform', minBindingSize: LIGHT_BYTES}}];
+        lightLayout = device.createBindGroupLayout({label, entries: lightEntries});
         lightGroup = device.createBindGroup({label, layout: lightLayout, entries: [{binding: 0, resource: {buffer: lightBuffer, size: LIGHT_BYTES}}]});
+        let shadowEntries = [];
         if (shadows) {
           shadowBuffer = remember(device.createBuffer({label: `${label}/shadow`, size: SHADOW_UNIFORM_BYTES, usage: UNIFORM | COPY_DST}), SHADOW_UNIFORM_BYTES);
-          shadowLayout = device.createBindGroupLayout({label, entries: [
-            {binding: 0, visibility: FRAGMENT_STAGE, buffer: {type: 'uniform', minBindingSize: LIGHT_BYTES}},
+          shadowEntries = [
             {binding: 1, visibility: FRAGMENT_STAGE, buffer: {type: 'uniform', minBindingSize: SHADOW_UNIFORM_BYTES}},
             {binding: 2, visibility: FRAGMENT_STAGE, texture: {sampleType: 'depth', viewDimension: '2d', multisampled: false}},
             {binding: 3, visibility: FRAGMENT_STAGE, sampler: {type: 'comparison'}},
-          ]});
+          ];
+          shadowLayout = device.createBindGroupLayout({label, entries: [...lightEntries, ...shadowEntries]});
+        }
+        if (environment) {
+          environmentBuffer = remember(device.createBuffer({label: `${label}/environment`, size: environmentBytes, usage: UNIFORM | COPY_DST}), environmentBytes);
+          const entries = [
+            {binding: 4, visibility: FRAGMENT_STAGE, buffer: {type: 'uniform', minBindingSize: environmentBytes}},
+            {binding: 5, visibility: FRAGMENT_STAGE, sampler: {type: 'filtering'}},
+            ...[6,7,8].map(binding => ({binding, visibility: FRAGMENT_STAGE,
+              texture: {sampleType: 'float', viewDimension: binding === 8 ? '2d' : 'cube', multisampled: false}})),
+          ];
+          for (const shadowed of (shadows ? [false,true] : [false])) environmentLayouts.set(shadowed,
+            device.createBindGroupLayout({label, entries: [...lightEntries, ...(shadowed ? shadowEntries : []), ...entries]}));
         }
       });
       lightingReady = allocated.errors.catch(error => {
-        forget(lightBuffer); forget(shadowBuffer); lightBuffer = shadowBuffer = null; lightingReady = null; throw error;
+        forget(lightBuffer); forget(shadowBuffer); forget(environmentBuffer); lightBuffer = shadowBuffer = environmentBuffer = null; environmentLayouts.clear(); lightingReady = null; throw error;
       });
       lightingReady.catch(() => {});
     }
@@ -487,6 +519,11 @@ export async function createGpuAnimationRenderer(device, {
     return variants.get(variant);
   }
   try {
+    if (environment) {
+      environmentReceiver = await import('./animation_environment_receiver.mjs'); live();
+      environmentBytes = environmentReceiver.ENVIRONMENT_UNIFORM_BYTES;
+      environmentWords = new Float32Array(environmentBytes / 4);
+    }
     const initialized = scoped(device, () => {
       uniformBuffer = remember(device.createBuffer({label, size: arenaBytes, usage: UNIFORM | COPY_DST}), arenaBytes);
       uniformLayout = device.createBindGroupLayout({label, entries: [{binding: 0, visibility: VERTEX_STAGE | FRAGMENT_STAGE,
@@ -536,11 +573,11 @@ export async function createGpuAnimationRenderer(device, {
     if (lit) {
       if (rgba.some(v => v > 1)) fail('ANIMATION_RENDER_VALUE', 'Lit reflectance factors must be in [0,1]');
       if (!gpu.vertexLayout.attributes.some(a => a.shaderLocation === 1 && a.offset === 12 && a.format === 'float32x3')) fail('ANIMATION_RENDER_NORMAL', 'Lit meshes require deformed normals');
-      if (shadows) {
-        limit('maxSamplersPerShaderStage', mapSlots(mapMask).length + 1);
-        limit('maxSampledTexturesPerShaderStage', mapSlots(mapMask).length + 1);
+      if (shadows || environment) {
+        limit('maxSamplersPerShaderStage', mapSlots(mapMask).length + Number(shadows) + Number(environment));
+        limit('maxSampledTexturesPerShaderStage', mapSlots(mapMask).length + Number(shadows) + (environment ? 3 : 0));
       }
-      limit('maxUniformBuffersPerShaderStage', shadows ? 3 : 2); limit('maxUniformBufferBindingSize', LIGHT_BYTES); limit('maxBufferSize', LIGHT_BYTES);
+      limit('maxUniformBuffersPerShaderStage', 2 + Number(shadows) + Number(environment)); limit('maxUniformBufferBindingSize', LIGHT_BYTES); limit('maxBufferSize', LIGHT_BYTES);
       limit('maxBindGroups', mapMask ? 3 : 2); limit('maxVertexAttributes', 2);
     }
     if (typeof doubleSided !== 'boolean' || !['OPAQUE', 'MASK', 'BLEND'].includes(alphaMode) ||
@@ -578,7 +615,7 @@ export async function createGpuAnimationRenderer(device, {
     const surfaceWords = 6 + coordinates.length * 2;
     const variant = (lit ? 'lit-' : '') + (derivative ? 'derivative-' : '') +
       (coordinateMask ? `uv-${coordinateMask}-` : '') + attributeVariant;
-    const lightReserve = lit && !lightBuffer ? LIGHT_BYTES + (shadows ? SHADOW_UNIFORM_BYTES : 0) : 0;
+    const lightReserve = lit && !lightBuffer ? LIGHT_BYTES + (shadows ? SHADOW_UNIFORM_BYTES : 0) + environmentBytes : 0;
     if (allocatedBytes + (data?.byteLength ?? 0) + lightReserve > maxBytes) fail('ANIMATION_RENDER_LIMIT', 'Material buffers exceed byte budget');
     let surfaceData = null, surfaceBuffer = null, textureGroup = null;
     if ((mapMask & ~coordinateMask) && texCoords === null) fail('ANIMATION_RENDER_GEOMETRY', 'Material textures require UV coordinates');
@@ -617,7 +654,9 @@ export async function createGpuAnimationRenderer(device, {
       if (data || surfaceData || lit) {
         const lightsReady = lit ? ensureLighting() : Promise.resolve();
         const ready = variant === 'plain' ? Promise.resolve() : Promise.all([
-          ensureVariant(variant), ...(lit && shadows ? [ensureVariant(variant.replace('lit-', 'lit-shadow-'))] : []),
+          ensureVariant(variant), ...(lit && shadows ? [ensureVariant(lightingVariant(variant, true, false))] : []),
+          ...(lit && environment ? [ensureVariant(lightingVariant(variant, false, true)),
+            ...(shadows ? [ensureVariant(lightingVariant(variant, true, true))] : [])] : []),
         ]);
         const allocated = scoped(device, () => {
           for (const [values, usage, name] of [[data, INDEX, 'indices'], [surfaceData, VERTEX, 'surface']]) if (values) {
@@ -648,9 +687,9 @@ export async function createGpuAnimationRenderer(device, {
     live(); if (busy) fail('ANIMATION_RENDER_REENTRANT', 'Render submission cannot be reentered');
     busy = true;
     try {
-      keys(frame, ['colorView', 'depthView', 'resolveTarget', 'viewProjection', 'draws', 'loadOp', 'depthLoadOp', 'clearColor', 'clearDepth', 'viewport', 'scissor', 'lighting', 'shadow'], 'frame');
+      keys(frame, ['colorView', 'depthView', 'resolveTarget', 'viewProjection', 'draws', 'loadOp', 'depthLoadOp', 'clearColor', 'clearDepth', 'viewport', 'scissor', 'lighting', 'shadow', 'environment'], 'frame');
       const {colorView, depthView, resolveTarget, viewProjection, draws, loadOp = 'clear', depthLoadOp = 'clear',
-        clearColor = [0, 0, 0, 0], clearDepth = 1, viewport = null, scissor = null, lighting = null, shadow = null} = frame;
+        clearColor = [0, 0, 0, 0], clearDepth = 1, viewport = null, scissor = null, lighting = null, shadow = null, environment: environmentInput = null} = frame;
       if ((format === null ? colorView || resolveTarget : !colorView) || (depthFormat && !depthView) || (!depthFormat && depthView) || (sampleCount === 1 && resolveTarget)) fail('ANIMATION_RENDER_ATTACHMENT', 'Attachment configuration differs from pipeline');
       if (!['clear', 'load'].includes(loadOp) || !['clear', 'load'].includes(depthLoadOp)) fail('ANIMATION_RENDER_ATTACHMENT', 'Invalid load operation');
       color(clearColor); finite(clearDepth, 'Clear depth');
@@ -669,6 +708,11 @@ export async function createGpuAnimationRenderer(device, {
       const projected = shadow === null ? null : packProjectedShadow(device, shadow, lightWords, shadowWords, fail);
       if (projected && (projected.snapshot.view === depthView || projected.snapshot.view === colorView || projected.snapshot.view === resolveTarget)) {
         fail('ANIMATION_RENDER_SHADOW', 'A sampled shadow map cannot also be a frame attachment');
+      }
+      if (environmentInput !== null && (!environment || lighting === null)) fail('ANIMATION_RENDER_ENVIRONMENT', 'Enable environment lighting and provide a frame camera');
+      const ambient = environmentInput === null ? null : environmentReceiver.packAnimationEnvironment(device, environmentInput, environmentWords, fail);
+      if (ambient && ['diffuseView','specularView','brdfView'].some(key => [colorView,depthView,resolveTarget].includes(ambient.snapshot[key]))) {
+        fail('ANIMATION_RENDER_ENVIRONMENT', 'Sampled environment views cannot also be frame attachments');
       }
       for (let i = 0; i < draws.length; i++) {
         const input = owned.has(draws[i]) ? {mesh: draws[i]} : draws[i];
@@ -720,12 +764,12 @@ export async function createGpuAnimationRenderer(device, {
         const first = integer(input.first ?? 0, 0, record.extent, 'draw start');
         const count = integer(input.count ?? record.extent - first, 0, record.extent - first, 'draw count');
         const command = commands[i] ?? (commands[i] = {});
-        Object.assign(command, {record, first, count, pipeline: pipelines.get(`${projected && record.lit ? record.variant.replace('lit-', 'lit-shadow-') : record.variant}/${record.alphaMode === 'BLEND'}:${record.doubleSided ? (record.lit && determinant < 0 ? 'none-cw' : 'none') : determinant < 0 ? 'cw' : 'ccw'}`)});
+        Object.assign(command, {record, first, count, pipeline: pipelines.get(`${lightingVariant(record.variant, Boolean(projected), Boolean(ambient))}/${record.alphaMode === 'BLEND'}:${record.doubleSided ? (record.lit && determinant < 0 ? 'none-cw' : 'none') : determinant < 0 ? 'cw' : 'ccw'}`)});
         dependencies.add(gpu);
       }
-      projected?.check();
+      projected?.check(); ambient?.check();
       const submitted = scoped(device, () => {
-        if (usesLighting && projected && (shadowView !== projected.snapshot.view || shadowSampler !== projected.snapshot.sampler)) {
+        if (usesLighting && projected && !ambient && (shadowView !== projected.snapshot.view || shadowSampler !== projected.snapshot.sampler)) {
           const {view, sampler} = projected.snapshot;
           shadowGroup = device.createBindGroup({label, layout: shadowLayout, entries: [
             {binding: 0, resource: {buffer: lightBuffer, size: LIGHT_BYTES}},
@@ -733,6 +777,23 @@ export async function createGpuAnimationRenderer(device, {
             {binding: 2, resource: view}, {binding: 3, resource: sampler},
           ]});
           shadowView = view; shadowSampler = sampler;
+        }
+        let frameLightGroup = projected ? shadowGroup : lightGroup;
+        if (usesLighting && ambient) {
+          const shadowed = Boolean(projected), snapshot = ambient.snapshot, view = projected?.snapshot.view, sampler = projected?.snapshot.sampler;
+          let cached = environmentGroups.get(shadowed);
+          if (!cached || cached.snapshot !== snapshot || cached.view !== view || cached.sampler !== sampler) {
+            const group = device.createBindGroup({label, layout: environmentLayouts.get(shadowed), entries: [
+              {binding: 0, resource: {buffer: lightBuffer, size: LIGHT_BYTES}},
+              ...(shadowed ? [{binding: 1, resource: {buffer: shadowBuffer, size: SHADOW_UNIFORM_BYTES}},
+                {binding: 2, resource: view}, {binding: 3, resource: sampler}] : []),
+              {binding: 4, resource: {buffer: environmentBuffer, size: environmentBytes}},
+              {binding: 5, resource: snapshot.sampler}, {binding: 6, resource: snapshot.diffuseView},
+              {binding: 7, resource: snapshot.specularView}, {binding: 8, resource: snapshot.brdfView},
+            ]});
+            cached = {snapshot, view, sampler, group}; environmentGroups.set(shadowed, cached);
+          }
+          frameLightGroup = cached.group;
         }
         const encoder = device.createCommandEncoder({label});
         const pass = encoder.beginRenderPass({label, colorAttachments: format === null ? [] : [{view: colorView, ...(resolveTarget ? {resolveTarget} : {}),
@@ -746,7 +807,7 @@ export async function createGpuAnimationRenderer(device, {
           pass.setVertexBuffer(0, record.gpu.vertexBuffer);
           if (record.surfaceBuffer) pass.setVertexBuffer(1, record.surfaceBuffer);
           if (record.textureGroup) pass.setBindGroup(1, record.textureGroup);
-          if (record.lit) pass.setBindGroup(record.textureGroup ? 2 : 1, projected ? shadowGroup : lightGroup);
+          if (record.lit) pass.setBindGroup(record.textureGroup ? 2 : 1, frameLightGroup);
           if (record.indexBuffer) { pass.setIndexBuffer(record.indexBuffer, record.indexFormat); pass.drawIndexed(count, 1, first, 0, 0); }
           else pass.draw(count, 1, first, 0);
         }
@@ -754,10 +815,12 @@ export async function createGpuAnimationRenderer(device, {
         if (draws.length) device.queue.writeBuffer(uniformBuffer, 0, staged, 0, (draws.length - 1) * stride / 4 + UNIFORM_BYTES / 4);
         if (usesLighting) device.queue.writeBuffer(lightBuffer, 0, lightWords);
         if (usesLighting && projected) device.queue.writeBuffer(shadowBuffer, 0, shadowWords);
+        if (usesLighting && ambient) device.queue.writeBuffer(environmentBuffer, 0, environmentWords);
         device.queue.submit([command]);
       });
       if (submitted.error) { submitted.errors.catch(() => {}); terminal ??= submitted.error; throw terminal; }
       if (usesLighting && projected) dependencies.add(projected.map);
+      if (usesLighting && ambient) dependencies.add(ambient.map);
       let work;
       try { work = [completion, submitted.errors, device.queue.onSubmittedWorkDone(), ...[...dependencies].map(gpu => gpu.whenIdle())]; }
       catch (error) { submitted.errors.catch(() => {}); terminal ??= error; throw terminal; }
@@ -771,7 +834,7 @@ export async function createGpuAnimationRenderer(device, {
       busy = false;
     }
   }
-  const renderer = Object.freeze({format, depthFormat, sampleCount, shadows, addMesh, render,
+  const renderer = Object.freeze({format, depthFormat, sampleCount, shadows, environment, addMesh, render,
     get allocatedBytes() { return allocatedBytes; },
     get version() { return version; }, get drawCount() { return drawCount; }, get meshCount() { return records.size; },
     get disposed() { return disposed; }, get failed() { return terminal !== null; },
