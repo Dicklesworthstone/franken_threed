@@ -1,10 +1,11 @@
 /**
  * glTF JSON + supplied buffers -> ready-to-use animation drawables / CPU meshes.
  * Reuses the pose decoder and mesh decoder; does not fetch assets or decode images.
- * Materials use the explicit direct-light metallic-roughness or KHR_materials_unlit
+ * Materials use the explicit metallic-roughness or KHR_materials_unlit
  * renderer profile, not full Three.js/PBR equivalence. Authored cameras and punctual
  * lights are decoded with the model; callers still own texture uploads/mips,
- * attachments and transparent ordering. No IBL/occlusion route.
+ * attachments and transparent ordering. Occlusion uses the renderer's optional
+ * environment lighting; direct light, emission and alpha remain unaffected.
  *
  * resolveTexture({textureIndex,imageIndex,image,sampler,colorSpace}) synchronously
  * lends {view,sampler}. It must honor the source image/sampler and 'srgb'/'linear'
@@ -14,7 +15,7 @@
  * All source material/UV requirements are checked before invoking the resolver.
  * Each map preserves its own TEXCOORD_n and KHR_texture_transform. Missing
  * authored tangents select the renderer's derivative frame (not MikkTSpace),
- * reported in diagnostics. Unsupported codecs/material extensions/occlusion fail explicitly;
+ * reported in diagnostics. Unsupported codecs/material extensions fail explicitly;
  * retain the source route for them rather than presenting an incomplete model.
  */
 import {decodeGltfAnimation} from './animation_gltf.mjs';
@@ -129,18 +130,17 @@ function materialPlan(model, primitive, basisu) {
   if (typeof drawable.doubleSided !== 'boolean' || !['OPAQUE','MASK','BLEND'].includes(drawable.alphaMode)) fail('MATERIAL','Invalid alpha mode or double-sided flag');
   if (primitive.attributes.COLOR_0) drawable.vertexColors=primitive.attributes.COLOR_0.values;
   if (!unlit) {
-    if (material.occlusionTexture !== undefined) fail('UNSUPPORTED','Occlusion requires the source material route');
     drawable.metallicFactor=number(pbr.metallicFactor ?? 1,'metallic factor',0,1);
     drawable.roughnessFactor=number(pbr.roughnessFactor ?? 1,'roughness factor',0,1);
     drawable.emissiveFactor=vector(material.emissiveFactor ?? [0,0,0],3,'emissive factor',0,1);
   }
   const maps = [['baseColorTexture',pbr.baseColorTexture,'srgb']];
   // KHR_materials_unlit explicitly ignores lighting-related PBR fallback fields.
-  if (!unlit) maps.push(['metallicRoughnessTexture',pbr.metallicRoughnessTexture,'linear'],['normalTexture',material.normalTexture,'linear'],['emissiveTexture',material.emissiveTexture,'srgb']);
+  if (!unlit) maps.push(['metallicRoughnessTexture',pbr.metallicRoughnessTexture,'linear'],['normalTexture',material.normalTexture,'linear'],['emissiveTexture',material.emissiveTexture,'srgb'],['occlusionTexture',material.occlusionTexture,'linear']);
   const requests=[],coordinates=[],diagnostics=[];let sharedUV=null,mixedUV=false;
   for (const [field,info,colorSpace] of maps) {
     if (info === undefined) continue;
-    fields(info,['index','texCoord','extensions','extras',...(field==='normalTexture'?['scale']:[])],field);
+    fields(info,['index','texCoord','extensions','extras',...(field==='normalTexture'?['scale']:field==='occlusionTexture'?['strength']:[])],field);
     const uv=textureCoordinates(info);
     if (sharedUV && (uv.texCoord !== sharedUV.texCoord || uv.transform.some((v,i)=>v!==sharedUV.transform[i]))) mixedUV=true;
     sharedUV ??= uv;
@@ -152,6 +152,7 @@ function materialPlan(model, primitive, basisu) {
       if (!primitive.geometry.tangents) diagnostics.push({node:primitive.node,primitive:primitive.primitive,reason:'DERIVATIVE_NORMAL_FRAME_NOT_MIKKTSPACE'});
       drawable.normalScale=number(info.scale ?? 1,'normal scale');
     }
+    if (field==='occlusionTexture') drawable.occlusionStrength=number(info.strength === undefined ? 1 : info.strength,'occlusion strength',0,1);
     requests.push({field,request:textureRequest(model,info,colorSpace,basisu)});
   }
   if (mixedUV) {
