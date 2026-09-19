@@ -251,7 +251,7 @@ import path from 'node:path';
 import {pathToFileURL} from 'node:url';
 async function packageFixture() {
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'f3d-shadow-package-')), toolkit=path.join(root,'toolkit'); fs.mkdirSync(toolkit);
-  for(const name of ['build_animation.mjs','animation_render.mjs','animation_shadow.mjs','animation_shadow_receiver.mjs']) {
+  for(const name of ['build_animation.mjs','animation_render.mjs','animation_shadow.mjs','animation_shadow_receiver.mjs','animation_scene_shadow.mjs','animation_shadow_view.mjs']) {
     fs.copyFileSync(new URL('./'+name,import.meta.url),path.join(toolkit,name));
   }
   fs.writeFileSync(path.join(toolkit,'animation_gltf.mjs'),'export function decodeGltfAnimation(model){return model;}');

@@ -11,7 +11,7 @@ const hash=bytes=>createHash('sha256').update(bytes).digest('hex');
 // boundaries isolate emitted dependency closure, not binary import or rendering.
 async function setup() {
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'f3d-culling-package-')),toolkit=path.join(root,'toolkit');fs.mkdirSync(toolkit);
-  for(const name of ['build_animation.mjs','animation_scene.mjs','animation_draw_order.mjs','animation_bounds.mjs','animation_shadow.mjs','animation_shadow_receiver.mjs'])fs.copyFileSync(new URL('./'+name,import.meta.url),path.join(toolkit,name));
+  for(const name of ['build_animation.mjs','animation_scene.mjs','animation_draw_order.mjs','animation_bounds.mjs','animation_shadow.mjs','animation_shadow_receiver.mjs','animation_scene_shadow.mjs','animation_shadow_view.mjs'])fs.copyFileSync(new URL('./'+name,import.meta.url),path.join(toolkit,name));
   const runtime=`export class AnimationPoseError extends Error{constructor(code,message){super(message);this.code=code;}}
 export function createAnimationPlayer(def){const p={nodeCount:def.nodes.length,instances:[],clips:[],version:0,disposed:false,
  morphOffsets:new Uint32Array(def.nodes.length+1),morphWeights:new Float64Array(),jointMatrices:new Float64Array(),
@@ -37,7 +37,7 @@ test('a relocated generated GPU package culls without original source modules',a
   const f=await setup(),out=path.join(f.root,'package'),built=f.buildAnimation(f.entry,out,{webgpu:true});
   const record=built.artifacts.find(x=>x.file==='animation_bounds.mjs');assert.ok(record);
   assert.equal(record.sha256,hash(fs.readFileSync(new URL('./animation_bounds.mjs',import.meta.url))));
-  assert.deepEqual(fs.readFileSync(path.join(out,record.file)),fs.readFileSync(new URL('./animation_bounds.mjs',import.meta.url)));
+  assert.deepEqual(fs.readFileSync(path.join(out,record.file)),fs.readFileSync(new URL('./'+record.file,import.meta.url)));
   const moved=path.join(f.root,'deployed');fs.renameSync(out,moved);fs.renameSync(f.toolkit,f.toolkit+'.unavailable');fs.renameSync(f.entry,f.entry+'.unavailable');
   const api=await import(pathToFileURL(path.join(moved,built.gpuEntry))),p=api.createPlayer(),d=device();
   const items=[0,1].map(node=>({geometry:{node,positions:[0,0,0.5,0.1,0,0.5,0,0.1,0.5]}}));
