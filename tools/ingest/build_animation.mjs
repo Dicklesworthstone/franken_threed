@@ -129,10 +129,10 @@ export function buildAnimation(entryPath,outDir,{rootDir=path.dirname(path.resol
     outputs.set(name,fs.readFileSync(new URL('./'+name,import.meta.url),'utf8'));
   }
   if(webgpu) {
-    for(const name of ['animation_webgpu.mjs','animation_render.mjs','animation_scene.mjs','animation_draw_order.mjs','animation_bounds.mjs']) {
+    for(const name of ['animation_webgpu.mjs','animation_render.mjs','animation_scene.mjs','animation_draw_order.mjs','animation_bounds.mjs','animation_shadow.mjs','animation_shadow_receiver.mjs']) {
       outputs.set(name,fs.readFileSync(new URL('./'+name,import.meta.url),'utf8'));
     }
-    outputs.set('gpu_playback.mjs',`export {createPlayer,createAnimationController,createAnimationDeformer} from './playback.mjs';\nexport {createGpuAnimationDeformer} from './animation_webgpu.mjs';\nexport {createGpuAnimationRenderer} from './animation_render.mjs';\nexport {createGpuAnimationScene} from './animation_scene.mjs';\n`);
+    outputs.set('gpu_playback.mjs',`export {createPlayer,createAnimationController,createAnimationDeformer} from './playback.mjs';\nexport {createGpuAnimationDeformer} from './animation_webgpu.mjs';\nexport {createGpuAnimationRenderer} from './animation_render.mjs';\nexport {createGpuAnimationScene} from './animation_scene.mjs';\nexport {createGpuAnimationShadowMap} from './animation_shadow.mjs';\n`);
   }
   const manifest={format:'f3d-animation-package-v1',entry:'animation.mjs',playbackEntry:'playback.mjs',profile:'core-gltf-animation-pose',
     ...(webgpu?{gpuEntry:'gpu_playback.mjs',gpuExecution:'webgpu-compute-f32',gpuRendering:'explicit-unlit-triangle-list; caller-owned geometry, materials and attachments'}:{}),

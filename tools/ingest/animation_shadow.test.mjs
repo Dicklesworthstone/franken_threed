@@ -157,3 +157,144 @@ test('ordinary color pipelines, blend state, lighting and submission ordering ar
   g.worldMatrix[12]=2; r.render(frame); assert.equal(draw.uniform[12],0); assert.equal(d.passes[1].draws[0].uniform[12],2);
   await r.whenIdle(); r.dispose();
 });
+
+const lighting = () => ({cameraPosition:[0,0,5],lights:[{type:'directional',direction:[0,0,-1]},{type:'point',position:[0,1,2]}]});
+const colorFrame = (draws, shadow) => ({colorView:{},depthView:{},viewProjection:identity(),lighting:lighting(),draws,shadow});
+
+test('shadow receiver binds depth comparison to only the selected direct light', async () => {
+  const d=deviceSpy(), s=await createGpuAnimationShadowMap(d,{width:32,height:16}), r=await createGpuAnimationRenderer(d,{shadows:true,maxDraws:1});
+  const g=gpu(), caster=await s.addMesh(g), receiver=await r.addMesh(g,{shading:'metallic-roughness',emissiveFactor:[0.2,0.1,0]});
+  s.render({viewProjection:identity(),draws:[caster]}); r.render(colorFrame([receiver],{map:s,bias:0.002,normalBias:0.03,strength:0.7}));
+  const draw=d.passes.at(-1).draws[0], group=draw.groups.get(1).group;
+  assert.equal(group.entries[2].resource,s.sample(d).view); assert.equal(group.entries[3].resource.compare,'less-equal');
+  const u=new Float32Array(group.entries[1].resource.buffer.data);
+  assert.deepEqual([...u.slice(0,16)],identity()); assert.deepEqual([...u.slice(16,20)],[0,Math.fround(0.002),Math.fround(0.03),Math.fround(0.7)]);
+  assert.deepEqual([...u.slice(20,22)],[1/32,1/16]);
+  const code=draw.pipeline.fragment.module.code;
+  assert.match(code,/if \(i == u32\(shadow_info.options.x\)\)/); assert.match(code,/var result = emission/);
+  assert.match(code,/textureSampleCompareLevel/); assert.match(code,/0.5 - ndc.y \* 0.5/);
+  assert.match(code,/reference = ndc.z - shadow_info.options.y/); assert.match(code,/visible \/ 9.0/);
+  assert.match(code,/if \(clip.w <= 0.0\) \{ return 1.0/); assert.match(code,/\(nl \* attenuation\) \* visibility/);
+  const allocated=d.buffers.length, groups=d.groups.length;
+  r.render(colorFrame([receiver],{map:s})); assert.equal(d.buffers.length,allocated); assert.equal(d.groups.length,groups);
+  r.render(colorFrame([receiver],null)); assert.equal(d.passes.at(-1).draws[0].groups.get(1).group.entries.length,1);
+  assert.doesNotMatch(d.passes.at(-1).draws[0].pipeline.fragment.module.code,/shadow_depth/);
+  await r.whenIdle(); r.dispose(); assert.equal(s.disposed,false); s.dispose();
+});
+test('all mapped material variants preserve their texture groups alongside shadows', async () => {
+  const d=deviceSpy(), s=await createGpuAnimationShadowMap(d,{width:8}), r=await createGpuAnimationRenderer(d,{shadows:true,maxDraws:1});
+  s.render({viewProjection:identity(),draws:[]});
+  const texture={view:{},sampler:{}}, mesh=await r.addMesh(gpu(),{shading:'metallic-roughness',texCoords:[0,0,1,0,0,1],
+    baseColorTexture:texture,metallicRoughnessTexture:texture,normalTexture:texture,emissiveTexture:texture,alphaMode:'MASK'});
+  r.render(colorFrame([mesh],{map:s})); const draw=d.passes.at(-1).draws[0];
+  assert.equal(draw.groups.get(1).group.entries.length,8); assert.equal(draw.groups.get(2).group.entries.length,4);
+  assert.match(draw.pipeline.fragment.module.code,/@group\(2\) @binding\(2\) var shadow_depth/);
+  assert.match(draw.pipeline.fragment.module.code,/dpdx\(input.world\)/);
+  assert.match(draw.pipeline.fragment.module.code,/rgba.a < draw_info.options.x/);
+  r.dispose(); s.dispose();
+});
+test('directional and spot indices are supported but point/cube shadows are not guessed', async () => {
+  const d=deviceSpy(), s=await createGpuAnimationShadowMap(d,{width:8}), r=await createGpuAnimationRenderer(d,{shadows:true,maxDraws:1});
+  const mesh=await r.addMesh(gpu(),{shading:'lambert'}); s.render({viewProjection:identity(),draws:[]});
+  const f=colorFrame([mesh],{map:s,lightIndex:1});
+  assert.throws(()=>r.render(f),errorCode('ANIMATION_RENDER_SHADOW'));
+  f.lighting.lights[1]={type:'spot',position:[0,0,4],direction:[0,0,-1]}; r.render(f);
+  const group=d.passes.at(-1).draws[0].groups.get(1).group;
+  assert.equal(new Float32Array(group.entries[1].resource.buffer.data)[16],1); r.dispose(); s.dispose();
+});
+test('shadow options and stale/disposed maps fail before receiver GPU side effects', async () => {
+  const d=deviceSpy(), s=await createGpuAnimationShadowMap(d,{width:8}), r=await createGpuAnimationRenderer(d,{shadows:true,maxDraws:1});
+  const g=gpu(), caster=await s.addMesh(g), mesh=await r.addMesh(g,{shading:'lambert'});
+  assert.throws(()=>r.render(colorFrame([mesh],{map:s})),errorCode('ANIMATION_SHADOW_UNRENDERED'));
+  s.render({viewProjection:identity(),draws:[caster]});
+  const counts=()=>[d.writes.length,d.submissions.length,d.groups.length,r.version], before=counts();
+  for (const shadow of [{map:s,bias:Infinity},{map:s,bias:2},{map:s,normalBias:-1},{map:s,strength:1.1},{map:s,lightIndex:2},{map:s,unknown:1},{}]) {
+    assert.throws(()=>r.render(colorFrame([mesh],shadow))); assert.deepEqual(counts(),before);
+  }
+  g.poseVersion++; assert.throws(()=>r.render(colorFrame([mesh],{map:s})),errorCode('ANIMATION_SHADOW_STALE')); assert.deepEqual(counts(),before);
+  s.dispose(); assert.throws(()=>r.render(colorFrame([mesh],{map:s})),errorCode('ANIMATION_SHADOW_DISPOSED')); r.dispose();
+});
+test('shadow receiver detects map redraws during draw getters and attachment feedback', async () => {
+  const d=deviceSpy(), s=await createGpuAnimationShadowMap(d,{width:8}), r=await createGpuAnimationRenderer(d,{shadows:true,maxDraws:1});
+  const mesh=await r.addMesh(gpu(),{shading:'lambert'}); s.render({viewProjection:identity(),draws:[]});
+  const frame=colorFrame([mesh],{map:s}); frame.depthView=s.sample(d).view;
+  assert.throws(()=>r.render(frame),errorCode('ANIMATION_RENDER_SHADOW')); assert.equal(r.version,0);
+  assert.throws(()=>r.render(colorFrame([{mesh,get worldMatrix(){s.render({viewProjection:identity(),draws:[]});return identity();}}],{map:s})),errorCode('ANIMATION_RENDER_SHADOW'));
+  assert.equal(r.version,0); r.dispose(); s.dispose();
+});
+test('shadow resources, limits and pipeline variants remain opt-in and byte bounded', async () => {
+  const d=deviceSpy(), disabled=await createGpuAnimationRenderer(d,{maxDraws:1});
+  const mesh=await disabled.addMesh(gpu(),{shading:'lambert'}); assert.equal(disabled.allocatedBytes,256+544);
+  assert.throws(()=>disabled.render(colorFrame([mesh],{map:{}})),errorCode('ANIMATION_RENDER_SHADOW')); disabled.dispose();
+  const enabled=await createGpuAnimationRenderer(d,{shadows:true,maxDraws:1,maxBytes:256+544+96});
+  assert.equal(enabled.allocatedBytes,256); await enabled.addMesh(gpu(),{shading:'lambert'}); assert.equal(enabled.allocatedBytes,256+544+96); enabled.dispose();
+  const limited=await createGpuAnimationRenderer(d,{shadows:true,maxDraws:1,maxBytes:256+544+95});
+  await assert.rejects(limited.addMesh(gpu(),{shading:'lambert'}),errorCode('ANIMATION_RENDER_LIMIT')); assert.equal(limited.allocatedBytes,256); limited.dispose();
+  d.limits.maxUniformBuffersPerShaderStage=2;
+  const capped=await createGpuAnimationRenderer(d,{shadows:true,maxDraws:1});
+  await assert.rejects(capped.addMesh(gpu(),{shading:'lambert'}),errorCode('ANIMATION_RENDER_LIMIT')); capped.dispose();
+});
+test('shadow completion failures reach the receiving renderer without transferring ownership', async () => {
+  const d=deviceSpy(), s=await createGpuAnimationShadowMap(d,{width:8}), r=await createGpuAnimationRenderer(d,{shadows:true,maxDraws:1});
+  const casterGpu=gpu(), caster=await s.addMesh(casterGpu), mesh=await r.addMesh(gpu(),{shading:'lambert'});
+  let reject; const pending=new Promise((_,b)=>{reject=b;}); casterGpu.whenIdle=()=>pending;
+  s.render({viewProjection:identity(),draws:[caster]}); r.render(colorFrame([mesh],{map:s}));
+  reject(new Error('shadow caster compute failed')); await assert.rejects(r.whenIdle(),/shadow caster compute failed/);
+  assert.ok(r.failed); assert.ok(s.failed); r.dispose(); s.dispose();
+});
+
+// Use the production builder and complete shadow/render modules. Only unrelated
+// pose decoding and scene/deformer creation are substituted at package assembly.
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import {pathToFileURL} from 'node:url';
+async function packageFixture() {
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'f3d-shadow-package-')), toolkit=path.join(root,'toolkit'); fs.mkdirSync(toolkit);
+  for(const name of ['build_animation.mjs','animation_render.mjs','animation_shadow.mjs','animation_shadow_receiver.mjs']) {
+    fs.copyFileSync(new URL('./'+name,import.meta.url),path.join(toolkit,name));
+  }
+  fs.writeFileSync(path.join(toolkit,'animation_gltf.mjs'),'export function decodeGltfAnimation(model){return model;}');
+  fs.writeFileSync(path.join(toolkit,'animation_runtime.mjs'),`export class AnimationPoseError extends Error {constructor(code,message){super(message);this.code=code;}}
+export function createAnimationPlayer(){return {nodeCount:1,clips:[],instances:[],morphWeights:[],dispose(){}};}`);
+  for(const [file,name] of [['animation_controller','createAnimationController'],['animation_deformer','createAnimationDeformer'],
+    ['animation_webgpu','createGpuAnimationDeformer'],['animation_scene','createGpuAnimationScene']]) {
+    fs.writeFileSync(path.join(toolkit,file+'.mjs'),`export function ${name}(){throw Error('unused package boundary');}`);
+  }
+  for(const name of ['animation_draw_order.mjs','animation_bounds.mjs'])fs.writeFileSync(path.join(toolkit,name),'export {};');
+  const entry=path.join(root,'model.gltf'); fs.writeFileSync(entry,JSON.stringify({asset:{version:'2.0'},nodes:[{}]}));
+  const {buildAnimation}=await import(pathToFileURL(path.join(toolkit,'build_animation.mjs')));
+  return {root,toolkit,entry,buildAnimation};
+}
+test('relocated GPU packages execute shadow casting and receiving without source modules',async()=>{
+  const f=await packageFixture(),out=path.join(f.root,'package'),built=f.buildAnimation(f.entry,out,{webgpu:true});
+  for(const name of ['animation_shadow.mjs','animation_shadow_receiver.mjs']) {
+    assert.ok(built.artifacts.some(x=>x.file===name));
+    assert.deepEqual(fs.readFileSync(path.join(out,name)),fs.readFileSync(new URL('./'+name,import.meta.url)));
+  }
+  const moved=path.join(f.root,'deployed');fs.renameSync(out,moved);fs.renameSync(f.toolkit,f.toolkit+'.unavailable');
+  const api=await import(pathToFileURL(path.join(moved,built.gpuEntry))),d=deviceSpy(),g=gpu();
+  const shadow=await api.createGpuAnimationShadowMap(d,{width:8,maxDraws:1}),caster=await shadow.addMesh(g);
+  const r=await api.createGpuAnimationRenderer(d,{shadows:true,maxDraws:1}),mesh=await r.addMesh(g,{shading:'lambert'});
+  shadow.render({viewProjection:identity(),draws:[caster]});
+  r.render({colorView:{},depthView:{},viewProjection:identity(),draws:[mesh],
+    lighting:{cameraPosition:[0,0,5],lights:[{type:'directional'}]},shadow:{map:shadow}});
+  await r.whenIdle();assert.equal(d.submissions.length,2);assert.match(d.passes[1].draws[0].pipeline.label,/lit-shadow/);
+  r.dispose();shadow.dispose();
+});
+test('GPU package budgets include shadow dependencies while CPU packages stay unchanged',async()=>{
+  const f=await packageFixture(),a=f.buildAnimation(f.entry,path.join(f.root,'sized'),{webgpu:true});
+  const short=path.join(f.root,'short');assert.throws(()=>f.buildAnimation(f.entry,short,{webgpu:true,maxBytes:a.outputBytes-1}),errorCode('GLTF_ANIMATION_LIMIT'));
+  assert.equal(fs.existsSync(short),false);
+  assert.equal(f.buildAnimation(f.entry,path.join(f.root,'exact'),{webgpu:true,maxBytes:a.outputBytes}).outputBytes,a.outputBytes);
+  const cpu=f.buildAnimation(f.entry,path.join(f.root,'cpu'));
+  assert.equal(cpu.emittedFiles.includes('animation_shadow.mjs'),false);assert.equal(cpu.emittedFiles.includes('animation_shadow_receiver.mjs'),false);
+  const source=fs.readFileSync(path.join(f.toolkit,'build_animation.mjs'),'utf8');
+  const before=source.replace(",'animation_shadow.mjs','animation_shadow_receiver.mjs'",'')
+    .replace("export {createGpuAnimationShadowMap} from './animation_shadow.mjs';\\n",'');
+  assert.notEqual(before,source);fs.writeFileSync(path.join(f.toolkit,'before.mjs'),before);
+  const {buildAnimation:old}=await import(pathToFileURL(path.join(f.toolkit,'before.mjs')));
+  const prior=old(f.entry,path.join(f.root,'prior'));
+  assert.equal(prior.outputBytes,cpu.outputBytes);
+  for(const name of cpu.emittedFiles)assert.deepEqual(fs.readFileSync(path.join(cpu.outDir,name)),fs.readFileSync(path.join(prior.outDir,name)));
+});

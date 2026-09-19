@@ -11,7 +11,7 @@ const hash=bytes=>createHash('sha256').update(bytes).digest('hex');
 // boundaries isolate emitted dependency closure, not binary import or rendering.
 async function setup() {
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'f3d-culling-package-')),toolkit=path.join(root,'toolkit');fs.mkdirSync(toolkit);
-  for(const name of ['build_animation.mjs','animation_scene.mjs','animation_draw_order.mjs','animation_bounds.mjs'])fs.copyFileSync(new URL('./'+name,import.meta.url),path.join(toolkit,name));
+  for(const name of ['build_animation.mjs','animation_scene.mjs','animation_draw_order.mjs','animation_bounds.mjs','animation_shadow.mjs','animation_shadow_receiver.mjs'])fs.copyFileSync(new URL('./'+name,import.meta.url),path.join(toolkit,name));
   const runtime=`export class AnimationPoseError extends Error{constructor(code,message){super(message);this.code=code;}}
 export function createAnimationPlayer(def){const p={nodeCount:def.nodes.length,instances:[],clips:[],version:0,disposed:false,
  morphOffsets:new Uint32Array(def.nodes.length+1),morphWeights:new Float64Array(),jointMatrices:new Float64Array(),
