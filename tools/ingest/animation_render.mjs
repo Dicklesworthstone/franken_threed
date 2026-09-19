@@ -101,6 +101,10 @@
  * instancing:true replaces the per-draw uniform binding with a read-only storage
  * arena and native instance-index addressing. Consecutive compatible OPAQUE/MASK
  * draws share draw()/drawIndexed(); BLEND and incompatible inputs stay separate.
+ * Identical immutable index and UV/color streams are shared after full byte
+ * comparison; identical borrowed view/sampler tuples share a texture bind group.
+ * Sharing retains one bounded CPU comparison copy per unique GPU stream and
+ * reference-counts mesh ownership. Failed registrations cannot publish aliases.
  * No draw sorting, geometry copying, frame deferral or CPU matrix arithmetic is
  * changed. maxDraws counts logical instances, drawCount retains that meaning, and
  * drawCallCount reports native calls in the last successful submission. The
@@ -454,9 +458,77 @@ export async function createGpuAnimationRenderer(device, {
   // Switching maps cannot accumulate an unbounded cache of borrowed textures.
   const environmentLayouts = new Map(), environmentGroups = new Map();
   const variants = new Map(), textureLayouts = new Map();
+  // Only validated, immutable streams enter these caches. Retain one CPU byte
+  // view per unique GPU buffer for collision-safe equality, bounded by maxBytes.
+  // Pending registrations own private allocations until all error scopes settle.
+  const sharedBuffers = instancing ? new Map() : null, sharedGroups = instancing ? new Map() : null;
+  const textureIds = instancing ? new WeakMap() : null;
+  let nextTextureId = 0;
+  function bufferPlan(values, usage) {
+    if (!values) return null;
+    const bytes = new Uint8Array(values.buffer, values.byteOffset, values.byteLength);
+    let hash = 2166136261;
+    for (const byte of bytes) hash = Math.imul(hash ^ byte, 16777619) >>> 0;
+    const plan = {key: `${usage}/${bytes.length}/${hash}`, bytes, usage};
+    plan.existing = findBuffer(plan);
+    return plan;
+  }
+  function findBuffer(plan) {
+    return sharedBuffers.get(plan.key)?.find(entry => entry.refs > 0 && buffers.has(entry.buffer) &&
+      entry.bytes.every((byte, i) => byte === plan.bytes[i]));
+  }
+  function acquireBuffer(plan, name) {
+    if (!plan) return null;
+    const existing = findBuffer(plan);
+    if (existing) { existing.refs++; return existing; }
+    if (allocatedBytes + plan.bytes.length > maxBytes) fail('ANIMATION_RENDER_LIMIT', 'Shared material buffers exceed byte budget');
+    const buffer = remember(device.createBuffer({label: `${label}/${name}`, size: plan.bytes.length,
+      usage: plan.usage, mappedAtCreation: true}), plan.bytes.length);
+    try {
+      new Uint8Array(buffer.getMappedRange()).set(plan.bytes); buffer.unmap();
+      return {key: plan.key, bytes: plan.bytes, buffer, refs: 1, published: false};
+    } catch (error) { forget(buffer); throw error; }
+  }
+  function releaseBuffer(entry) {
+    if (!entry || entry.refs === 0) return;
+    if (--entry.refs) return;
+    forget(entry.buffer);
+    if (entry.published) {
+      const bucket = sharedBuffers.get(entry.key);
+      if (bucket) { const at = bucket.indexOf(entry); if (at >= 0) bucket.splice(at, 1); if (!bucket.length) sharedBuffers.delete(entry.key); }
+    }
+    entry.bytes = null;
+  }
+  function publishBuffer(entry) {
+    if (!entry || entry.published) return entry;
+    // A concurrently admitted stream may have completed first. Merge now, never
+    // lending another registration an unvalidated buffer or failed allocation.
+    const existing = findBuffer(entry);
+    if (existing) { existing.refs++; releaseBuffer(entry); return existing; }
+    let bucket = sharedBuffers.get(entry.key);
+    if (!bucket) sharedBuffers.set(entry.key, bucket = []);
+    bucket.push(entry); entry.published = true; return entry;
+  }
+  function groupKey(textures) {
+    const id = object => { if (!textureIds.has(object)) textureIds.set(object, ++nextTextureId); return textureIds.get(object); };
+    return textures.map(t => t ? `${id(t.view)}:${id(t.sampler)}` : '-').join('/');
+  }
+  function releaseGroup(entry) {
+    if (entry && entry.refs > 0 && --entry.refs === 0 && sharedGroups.get(entry.key) === entry) sharedGroups.delete(entry.key);
+  }
+  function publishGroup(entry) {
+    if (!entry || sharedGroups.get(entry.key) === entry) return entry;
+    const existing = sharedGroups.get(entry.key);
+    if (existing) { existing.refs++; releaseGroup(entry); return existing; }
+    sharedGroups.set(entry.key, entry); return entry;
+  }
   function remember(buffer, bytes) { buffers.set(buffer, bytes); allocatedBytes += bytes; return buffer; }
   function forget(buffer) { if (buffers.has(buffer)) { allocatedBytes -= buffers.get(buffer); buffers.delete(buffer); buffer.destroy(); } }
-  function release() { for (const buffer of buffers.keys()) forget(buffer); shadowGroup = shadowView = shadowSampler = null; environmentGroups.clear(); }
+  function release() {
+    for (const buffer of buffers.keys()) forget(buffer);
+    if (sharedBuffers) for (const bucket of sharedBuffers.values()) for (const entry of bucket) { entry.bytes = null; entry.refs = 0; }
+    shadowGroup = shadowView = shadowSampler = null; environmentGroups.clear(); sharedBuffers?.clear(); sharedGroups?.clear();
+  }
   const lost = device.lost.then(info => {
     terminal ??= new AnimationRenderError('ANIMATION_RENDER_LOST', info?.message || 'WebGPU device lost');
     release(); throw terminal;
@@ -628,7 +700,7 @@ export async function createGpuAnimationRenderer(device, {
       const C = indexFormat === 'uint16' ? Uint16Array : Uint32Array;
       const bytes = Math.ceil(indices.length * C.BYTES_PER_ELEMENT / 4) * 4;
       limit('maxBufferSize', bytes);
-      if (allocatedBytes + bytes > maxBytes) fail('ANIMATION_RENDER_LIMIT', 'Index buffers exceed byte budget');
+      if ((instancing ? 0 : allocatedBytes) + bytes > maxBytes) fail('ANIMATION_RENDER_LIMIT', 'Index buffers exceed byte budget');
       data = new C(bytes / C.BYTES_PER_ELEMENT); data.set(indices);
     }
     const {texCoords = null, vertexColors = null} = options;
@@ -653,7 +725,7 @@ export async function createGpuAnimationRenderer(device, {
     const variant = (lit ? 'lit-' : '') + (derivative ? 'derivative-' : '') +
       (coordinateMask ? `uv-${coordinateMask}-` : '') + attributeVariant;
     const lightReserve = lit && !lightBuffer ? LIGHT_BYTES + (shadows ? SHADOW_UNIFORM_BYTES : 0) + environmentBytes : 0;
-    if (allocatedBytes + (data?.byteLength ?? 0) + lightReserve > maxBytes) fail('ANIMATION_RENDER_LIMIT', 'Material buffers exceed byte budget');
+    if ((instancing ? 0 : allocatedBytes) + (data?.byteLength ?? 0) + lightReserve > maxBytes) fail('ANIMATION_RENDER_LIMIT', 'Material buffers exceed byte budget');
     let surfaceData = null, surfaceBuffer = null, textureGroup = null;
     if ((mapMask & ~coordinateMask) && texCoords === null) fail('ANIMATION_RENDER_GEOMETRY', 'Material textures require UV coordinates');
     if (attributeVariant !== 'plain') {
@@ -661,7 +733,7 @@ export async function createGpuAnimationRenderer(device, {
       const bytes = gpu.vertexCount * surfaceWords * 4;
       limit('maxVertexBufferArrayStride', surfaceWords * 4);
       limit('maxBufferSize', bytes);
-      if (allocatedBytes + (data?.byteLength ?? 0) + lightReserve + bytes > maxBytes) fail('ANIMATION_RENDER_LIMIT', 'Surface/index buffers exceed byte budget');
+      if ((instancing ? 0 : allocatedBytes) + (data?.byteLength ?? 0) + lightReserve + bytes > maxBytes) fail('ANIMATION_RENDER_LIMIT', 'Surface/index buffers exceed byte budget');
       if (texCoords !== null) array(texCoords, gpu.vertexCount * 2, 'UV coordinates');
       let width = 0;
       if (vertexColors !== null) {
@@ -686,6 +758,15 @@ export async function createGpuAnimationRenderer(device, {
       for (const v of surfaceData) if (!Number.isFinite(v)) fail('ANIMATION_RENDER_VALUE', 'Surface attributes exceed f32');
     }
     const extent = indices === null ? gpu.vertexCount : indices.length;
+    const plans = instancing ? [bufferPlan(data, INDEX), bufferPlan(surfaceData, VERTEX)] : null;
+    if (instancing && allocatedBytes + lightReserve + plans.reduce((sum, p) => sum + (p && !p.existing ? p.bytes.length : 0), 0) > maxBytes) {
+      fail('ANIMATION_RENDER_LIMIT', 'Unique material buffers exceed byte budget');
+    }
+    let indexLease = null, surfaceLease = null, textureLease = null;
+    const retireMaterial = () => {
+      if (instancing) { releaseBuffer(indexLease); releaseBuffer(surfaceLease); releaseGroup(textureLease); }
+      else { forget(indexBuffer); forget(surfaceBuffer); }
+    };
     pendingMeshes++;
     try {
       if (data || surfaceData || lit) {
@@ -696,28 +777,43 @@ export async function createGpuAnimationRenderer(device, {
             ...(shadows ? [ensureVariant(lightingVariant(variant, true, true))] : [])] : []),
         ]);
         const allocated = scoped(device, () => {
-          for (const [values, usage, name] of [[data, INDEX, 'indices'], [surfaceData, VERTEX, 'surface']]) if (values) {
+          if (instancing) {
+            indexLease = acquireBuffer(plans[0], 'indices'); indexBuffer = indexLease?.buffer ?? null;
+            surfaceLease = acquireBuffer(plans[1], 'surface'); surfaceBuffer = surfaceLease?.buffer ?? null;
+          } else for (const [values, usage, name] of [[data, INDEX, 'indices'], [surfaceData, VERTEX, 'surface']]) if (values) {
             const buffer = remember(device.createBuffer({label: `${label}/${name}`, size: values.byteLength, usage, mappedAtCreation: true}), values.byteLength);
             if (name === 'indices') indexBuffer = buffer; else surfaceBuffer = buffer;
             new Uint8Array(buffer.getMappedRange()).set(new Uint8Array(values.buffer)); buffer.unmap();
           }
-          if (mapMask) textureGroup = device.createBindGroup({label, layout: textureLayouts.get(mapMask), entries: mapSlots(mapMask).flatMap(slot => [
-            {binding: slot * 2, resource: textures[slot].sampler}, {binding: slot * 2 + 1, resource: textures[slot].view},
-          ])});
+          if (mapMask) {
+            const key = instancing ? groupKey(textures) : null, existing = sharedGroups?.get(key);
+            if (existing) { textureLease = existing; textureLease.refs++; textureGroup = existing.group; }
+            else {
+              textureGroup = device.createBindGroup({label, layout: textureLayouts.get(mapMask), entries: mapSlots(mapMask).flatMap(slot => [
+                {binding: slot * 2, resource: textures[slot].sampler}, {binding: slot * 2 + 1, resource: textures[slot].view},
+              ])});
+              if (instancing) textureLease = {key, group: textureGroup, refs: 1};
+            }
+          }
         });
         await Promise.race([Promise.all([allocated.errors, ready, lightsReady]), lost]);
       }
       live(); deformerShape(gpu);
+      if (instancing) {
+        indexLease = publishBuffer(indexLease); indexBuffer = indexLease?.buffer ?? null;
+        surfaceLease = publishBuffer(surfaceLease); surfaceBuffer = surfaceLease?.buffer ?? null;
+        textureLease = publishGroup(textureLease); textureGroup = textureLease?.group ?? null;
+      }
       const record = {gpu, rgba, doubleSided, alphaMode, alphaCutoff, extent, indexBuffer, indexFormat, variant, transform, surfaceBuffer, textureGroup, lit, mode, metallic, roughness, emission, mapMask, normalScale, occlusionStrength, disposed: false};
       const mesh = Object.freeze({vertexCount: gpu.vertexCount, indexCount: indices === null ? 0 : extent,
         get disposed() { return record.disposed || disposed; },
         dispose() {
           if (busy) fail('ANIMATION_RENDER_REENTRANT', 'Cannot dispose a mesh during submission');
-          if (!record.disposed) { record.disposed = true; records.delete(record); forget(indexBuffer); forget(surfaceBuffer); }
+          if (!record.disposed) { record.disposed = true; records.delete(record); retireMaterial(); }
         },
       });
       owned.set(mesh, record); records.add(record); return mesh;
-    } catch (error) { forget(indexBuffer); forget(surfaceBuffer); throw error; }
+    } catch (error) { retireMaterial(); throw error; }
     finally { pendingMeshes--; }
   }
   function render(frame) {

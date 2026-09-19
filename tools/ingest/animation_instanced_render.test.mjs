@@ -181,3 +181,151 @@ test('disabled instancing retains separate uniform bindings and ordinary shader 
   assert.doesNotMatch(calls(g)[0].pipeline.vertex.module.code,/instance_index|instance_draws/);assert.equal(g.buffers[0].usage,72);
   assert.equal(r.drawCount,2);assert.equal(r.drawCallCount,2);r.dispose();
 });
+
+// Separate registrations are how decoded glTF instances reach the renderer.
+// Their immutable packed streams must converge too, not just repeated handles.
+test('1000 separately registered indexed textured meshes fit one set of immutable material streams and one draw',async()=>{
+  const g=device(),r=await createGpuAnimationRenderer(g.d,{instancing:true,maxDraws:1000,maxMeshes:1000,maxBytes:256080,label:'arena'});
+  const vertex={},map=texture(),meshes=[];
+  for(let i=0;i<1000;i++)meshes.push(await r.addMesh(gpu(vertex),{
+    indices:[0,1,2],texCoords:[...UV],baseColorTexture:{...map},baseColor:[i/1000,1,1,1],
+  }));
+  assert.equal(r.allocatedBytes,256080);assert.equal(g.buffers.length,3);
+  r.render(frame(meshes));assert.deepEqual(calls(g).map(x=>x.args),[[3,1000,0,0,0]]);
+  assert.equal(g.groups.length,2);assert.equal(r.drawCount,1000);assert.equal(r.drawCallCount,1);
+  meshes[0].dispose();assert.equal(r.allocatedBytes,256080);r.render(frame(meshes.slice(1)));
+  assert.deepEqual(calls(g)[0].args,[3,999,0,0,0]);
+  meshes.slice(1).forEach(m=>m.dispose());assert.equal(r.allocatedBytes,256000);r.dispose();assert.ok(g.buffers.every(b=>b.destroyed===1));
+});
+
+test('all five separately loaded maps and UV streams batch with independent PBR factors',async()=>{
+  const g=device(),r=await createGpuAnimationRenderer(g.d,{instancing:true,maxDraws:2,environment:true,label:'arena'}),vertex={},maps=fields.map(texture);
+  const meshes=[];
+  for(let n=0;n<2;n++) {
+    const material={shading:'metallic-roughness',indices:[0,1,2],texCoords:[...UV],mapCoordinates:{},occlusionStrength:n,metallicFactor:n/2};
+    fields.forEach((name,i)=>{material[name]={...maps[i]};material.mapCoordinates[name]={texCoords:[...UV],uvTransform:[i+1,0,0,1,0.25,0]};});
+    meshes.push(await r.addMesh(gpu(vertex),material));
+  }
+  assert.equal(r.allocatedBytes,512+8+192+608);r.render(frame(meshes,{environment:{map:environment(g.d)}}));
+  assert.equal(r.drawCallCount,1);assert.equal(words(g)[51],0);assert.equal(words(g)[64+51],1);
+  assert.equal(words(g)[23],0);assert.equal(words(g)[64+23],0.5);r.dispose();
+});
+
+test('byte comparison distinguishes signed-zero UVs and different vertex colors',async()=>{
+  const g=device(),r=await createGpuAnimationRenderer(g.d,{instancing:true,maxDraws:3}),vertex={},map=texture(),meshes=[];
+  for(const [zero,color] of [[0,1],[-0,1],[0,0.5]])meshes.push(await r.addMesh(gpu(vertex),{
+    indices:[0,1,2],texCoords:[zero,0,1,0,0,1],vertexColors:Array(9).fill(color),baseColorTexture:map,
+  }));
+  assert.equal(g.buffers.filter(b=>b.label.endsWith('/indices')).length,1);
+  assert.equal(g.buffers.filter(b=>b.label.endsWith('/surface')).length,3);
+  r.render(frame(meshes));assert.equal(r.drawCallCount,3);r.dispose();
+});
+
+test('index order and sampler identity split batches even when other streams agree',async()=>{
+  const g=device(),r=await createGpuAnimationRenderer(g.d,{instancing:true,maxDraws:4}),vertex={},map=texture(),meshes=[];
+  for(const [indices,sampler] of [[[0,1,2],map.sampler],[[0,2,1],map.sampler],[[0,1,2],{}],[[0,1,2],map.sampler]])
+    meshes.push(await r.addMesh(gpu(vertex),{indices,texCoords:[...UV],baseColorTexture:{view:map.view,sampler}}));
+  assert.equal(g.buffers.filter(b=>b.label.endsWith('/surface')).length,1);
+  r.render(frame(meshes));assert.equal(r.drawCallCount,4);assert.deepEqual(calls(g).map(d=>d.args.at(-1)),[0,1,2,3]);r.dispose();
+});
+
+test('material array/descriptor mutation after registration cannot change canonical streams or bindings',async()=>{
+  const g=device(),r=await createGpuAnimationRenderer(g.d,{instancing:true,maxDraws:2}),vertex={},map=texture();
+  const first={indices:[0,1,2],texCoords:[...UV],baseColorTexture:{...map}},a=await r.addMesh(gpu(vertex),first);
+  first.indices.reverse();first.texCoords.fill(99);first.baseColorTexture.view={};
+  const b=await r.addMesh(gpu(vertex),{indices:[0,1,2],texCoords:UV,baseColorTexture:map});
+  r.render(frame([a,b]));assert.equal(r.drawCallCount,1);
+  assert.equal(calls(g)[0].bindings.get(1).group.entries[1].resource,map.view);r.dispose();
+});
+
+test('failed texture-group creation releases only the failing registration, never its successful siblings',async()=>{
+  const g=device(),r=await createGpuAnimationRenderer(g.d,{instancing:true,maxDraws:2}),vertex={},material={indices:[0,1,2],texCoords:UV,baseColorTexture:texture()};
+  const a=await r.addMesh(gpu(vertex),material),bytes=r.allocatedBytes,create=g.d.createBindGroup;
+  g.d.createBindGroup=()=>{throw Error('binding failed');};
+  await assert.rejects(r.addMesh(gpu(vertex),{...material,baseColorTexture:texture()}),/binding failed/);
+  assert.equal(r.allocatedBytes,bytes);assert.equal(r.meshCount,1);assert.ok(g.buffers.every(b=>b.destroyed===0));
+  g.d.createBindGroup=create;r.render(frame([a]));assert.equal(r.failed,false);a.dispose();assert.equal(r.allocatedBytes,512);r.dispose();
+});
+
+test('failed pipeline validation never installs a shared stream for later registrations',async()=>{
+  const g=device(),r=await createGpuAnimationRenderer(g.d,{instancing:true,maxDraws:2}),compile=g.d.createRenderPipelineAsync;
+  g.d.createRenderPipelineAsync=async()=>{throw Error('pipeline failed');};
+  const material={indices:[0,1,2],texCoords:UV,baseColorTexture:texture()};
+  await assert.rejects(r.addMesh(gpu(),material),/pipeline failed/);assert.equal(r.meshCount,0);assert.equal(r.allocatedBytes,512);
+  assert.ok(g.buffers.slice(1).every(b=>b.destroyed===1));g.d.createRenderPipelineAsync=compile;
+  const a=await r.addMesh(gpu(),material);r.render(frame([a,a]));assert.equal(r.drawCallCount,1);r.dispose();
+});
+
+test('concurrent registrations merge only after validation, and retire duplicate private allocations',async()=>{
+  const g=device(),r=await createGpuAnimationRenderer(g.d,{instancing:true,maxDraws:2}),vertex={},material={indices:[0,1,2],texCoords:UV,baseColorTexture:texture()},resolvers=[];
+  g.d.createRenderPipelineAsync=desc=>new Promise(resolve=>resolvers.push(()=>resolve(desc)));
+  const pending=[r.addMesh(gpu(vertex),material),r.addMesh(gpu(vertex),material)];
+  assert.equal(g.buffers.length,5);assert.equal(r.meshCount,0);
+  resolvers.forEach(resolve=>resolve());const meshes=await Promise.all(pending);
+  assert.equal(r.allocatedBytes,592);assert.equal(g.buffers.filter(b=>b.destroyed===1).length,2);
+  r.render(frame(meshes));assert.equal(r.drawCallCount,1);r.dispose();assert.ok(g.buffers.every(b=>b.destroyed===1));
+});
+
+test('an outstanding registration retains a shared stream after its original mesh is disposed',async()=>{
+  const g=device(),r=await createGpuAnimationRenderer(g.d,{instancing:true,maxDraws:2}),vertex={},material={indices:[0,1,2],texCoords:UV},a=await r.addMesh(gpu(vertex),material),resolvers=[];
+  g.d.createRenderPipelineAsync=desc=>new Promise(resolve=>resolvers.push(()=>resolve(desc)));
+  const pending=r.addMesh(gpu(vertex),{...material,shading:'lambert'});a.dispose();
+  assert.ok(g.buffers.filter(b=>b.label.endsWith('/surface')||b.label.endsWith('/indices')).every(b=>b.destroyed===0));
+  resolvers.forEach(resolve=>resolve());const b=await pending;r.render(frame([b,b]));assert.equal(r.drawCallCount,1);r.dispose();
+});
+
+test('disposing the renderer during registration releases published and pending allocations exactly once',async()=>{
+  const g=device(),r=await createGpuAnimationRenderer(g.d,{instancing:true,maxDraws:2}),a=await r.addMesh(gpu(),{indices:[0,1,2]}),resolvers=[];
+  g.d.createRenderPipelineAsync=desc=>new Promise(resolve=>resolvers.push(()=>resolve(desc)));
+  const pending=r.addMesh(gpu(),{indices:[0,1,2],texCoords:UV});r.dispose();resolvers.forEach(resolve=>resolve());
+  await assert.rejects(pending,code('DISPOSED'));assert.equal(r.allocatedBytes,0);a.dispose();
+  assert.ok(g.buffers.every(b=>b.destroyed===1));
+});
+
+test('the exact unique-stream byte budget succeeds and one byte short fails before material allocation',async()=>{
+  const material={indices:[0,1,2],texCoords:UV};
+  for(const budget of [591,592]) {
+    const g=device(),r=await createGpuAnimationRenderer(g.d,{instancing:true,maxDraws:2,maxBytes:budget});
+    if(budget===591){await assert.rejects(r.addMesh(gpu(),material),code('LIMIT'));assert.equal(g.buffers.length,1);}
+    else {await r.addMesh(gpu(),material);await r.addMesh(gpu(),material);assert.equal(r.allocatedBytes,budget);}
+    r.dispose();
+  }
+});
+
+test('a real surface-stream hash collision cannot merge different packed UV coordinates',async()=>{
+  // These two first-UV pairs have the same byte-wise FNV1a hash (4183942755)
+  // after ordinary 72-byte UV/color packing; the remaining coordinates match.
+  const pairs=[[1062715850,1060363805],[1060661827,1064948635]].map(words=>new Float32Array(new Uint32Array(words).buffer));
+  const g=device(),r=await createGpuAnimationRenderer(g.d,{instancing:true,maxDraws:2}),shared={},map=texture(),meshes=[];
+  for(const pair of pairs)meshes.push(await r.addMesh(gpu(shared),{texCoords:[...pair,1,0,0,1],baseColorTexture:map}));
+  r.render(frame(meshes));assert.equal(r.drawCallCount,2);
+  const surfaces=g.buffers.filter(b=>b.label.endsWith('/surface'));assert.equal(surfaces.length,2);
+  const hash=data=>{let h=2166136261;for(const b of new Uint8Array(data))h=Math.imul(h^b,16777619)>>>0;return h;};
+  assert.equal(hash(surfaces[0].data),4183942755);assert.equal(hash(surfaces[1].data),4183942755);
+  assert.notDeepEqual(new Uint8Array(surfaces[0].data),new Uint8Array(surfaces[1].data));r.dispose();
+});
+
+test('the production rigid pool and material renderer batch separately registered textured geometry together',async()=>{
+  const {createGpuRigidGeometryPool}=await import('./animation_rigid_geometry.mjs');
+  const count=64,pose={nodeCount:count,version:0,disposed:false,instances:[],morphOffsets:new Uint32Array(count+1),worldMatrices:new Float64Array(count*16)};
+  for(let i=0;i<count;i++){pose.worldMatrices.set(I(),i*16);pose.worldMatrices[i*16+12]=i;}
+  const g=device(),pool=createGpuRigidGeometryPool(g.d,pose,{maxBytes:120,maxMeshes:count}),
+    r=await createGpuAnimationRenderer(g.d,{instancing:true,maxDraws:count,label:'arena'}),map=texture(),handles=[],meshes=[];
+  for(let i=0;i<count;i++){
+    const handle=await pool.addMesh({node:i,positions:[0,0,0,1,0,0,0,1,0],normals:[0,0,1,0,0,1,0,0,1]});
+    handles.push(handle);meshes.push(await r.addMesh(handle,{shading:'metallic-roughness',indices:[0,1,2],texCoords:UV,baseColorTexture:map}));
+  }
+  assert.equal(pool.uniqueGeometries,1);assert.equal(pool.bufferBytes,120);
+  assert.equal(r.allocatedBytes,count*256+8+72+544);assert.equal(g.buffers.length,5);
+  r.render(frame(meshes));await r.whenIdle();assert.deepEqual(calls(g).map(x=>x.args),[[3,count,0,0,0]]);
+  const previous=words(g).slice(),before=g.counts();pose.version++;
+  for(let i=0;i<count;i++){pose.worldMatrices[i*16+12]+=10;handles[i].update();}
+  assert.deepEqual(g.counts(),before,'rigid pose updates require no vertex upload or submission');
+  r.render(frame(meshes));await r.whenIdle();
+  for(let i=0;i<count;i++){assert.equal(previous[i*64+12],i);assert.equal(words(g)[i*64+12],i+10);}
+  // Each layer owns only its resources: retiring draw records leaves the shared
+  // vertex buffer live until the last actual rigid geometry reference is released.
+  meshes.forEach(m=>m.dispose());assert.equal(pool.bufferBytes,120);
+  assert.equal(handles[0].vertexBuffer.destroyed,0);handles.forEach(h=>h.dispose());assert.equal(pool.bufferBytes,0);
+  r.dispose();pool.dispose();assert.ok(g.buffers.every(b=>b.destroyed===1));assert.equal(pose.disposed,false);
+});
