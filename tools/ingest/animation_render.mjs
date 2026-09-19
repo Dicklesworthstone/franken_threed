@@ -56,6 +56,12 @@
  * reflected worlds and back faces preserve the mapped normal's orientation.
  * Collapsed UV derivatives retain the unperturbed normal; no tangent buffers
  * are allocated or synthesized for the derivative path.
+ * Lit materials accept occlusionTexture with a linear view; only R is used.
+ * occlusionStrength is in [0,1], defaults to 1 and may be overridden per draw.
+ * With environment lighting it multiplies indirect diffuse/specular by
+ * 1 + strength * (R - 1), never direct lights, emission or alpha. With no
+ * environment it has no lighting effect. Independent UVs use mapCoordinates.
+ * The strength occupies named normal-matrix padding: the uniform stays 256 bytes.
  * These material profiles do not establish complete Three.js/PBR equivalence.
  *
  * Lit frames require lighting: {cameraPosition:[x,y,z], lights:[...]}, at most
@@ -107,11 +113,11 @@ const MAX_LIGHTS = 8, LIGHT_BYTES = 32 + MAX_LIGHTS * 64;
 const UV_IDENTITY = Object.freeze([1, 0, 0, 1, 0, 0]);
 // Stable sampler/texture pairs. Layouts contain only the maps actually used;
 // absent maps neither allocate placeholders nor consume texture bindings.
-const MAP_FIELDS = Object.freeze(['baseColorTexture', 'metallicRoughnessTexture', 'normalTexture', 'emissiveTexture']);
-const MAP_NAMES = Object.freeze(['color', 'metallic_roughness', 'normal_map', 'emissive']);
+const MAP_FIELDS = Object.freeze(['baseColorTexture', 'metallicRoughnessTexture', 'normalTexture', 'emissiveTexture', 'occlusionTexture']);
+const MAP_NAMES = Object.freeze(['color', 'metallic_roughness', 'normal_map', 'emissive', 'occlusion']);
 const mapMaskFor = variant => variant.includes('maps-') ? Number(variant.split('maps-')[1]) : variant.endsWith('texture') ? 1 : 0;
 const coordinateMaskFor = variant => Number(/uv-(\d+)-/.exec(variant)?.[1] ?? 0);
-const mapSlots = mask => [0, 1, 2, 3].filter(slot => mask & (1 << slot));
+const mapSlots = mask => [0, 1, 2, 3, 4].filter(slot => mask & (1 << slot));
 const lightingVariant = (variant, shadowed, environmentLit) => variant.replace(/^lit-/,
   `lit-${shadowed ? 'shadow-' : ''}${environmentLit ? 'environment-' : ''}`);
 export const ANIMATION_RENDER_WGSL = /* wgsl */`
@@ -130,6 +136,7 @@ struct DrawInfo { clip_from_local: mat4x4<f32>, color: vec4<f32>, options: vec4<
 // https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_lights_punctual
 function surfaceShader(mapMask, lit, attributes, derivative = false, coordinateMask = 0, depthOnly = false, shadowed = false, environmentCode = '') {
   const textured = mapMask !== 0, normalMapped = (mapMask & 4) !== 0, tangentAttribute = normalMapped && !derivative;
+  const occluded = (mapMask & 16) !== 0, ambientOcclusion = occluded && environmentCode !== '';
   const declarations = mapSlots(mapMask).map(slot =>
     `@group(1) @binding(${slot * 2}) var ${MAP_NAMES[slot]}_sampler: sampler;\n@group(1) @binding(${slot * 2 + 1}) var ${MAP_NAMES[slot]}_texture: texture_2d<f32>;`).join('\n');
   const coordinates = slot => coordinateMask & (1 << slot) ? `input.uv_${slot}` : 'input.uv';
@@ -146,11 +153,11 @@ fn unit_vector(v: vec3<f32>) -> vec3<f32> {
   let scaled = v / scale;
   return scaled * inverseSqrt(dot(scaled, scaled));
 }
-fn illuminate(base: vec3<f32>, position: vec3<f32>, normal: vec3<f32>, metallic: f32, roughness: f32, emission: vec3<f32>) -> vec3<f32> {
+fn illuminate(base: vec3<f32>, position: vec3<f32>, normal: vec3<f32>, metallic: f32, roughness: f32, emission: vec3<f32>${ambientOcclusion ? ', occlusion: f32' : ''}) -> vec3<f32> {
   var view = unit_vector(lighting.camera.xyz - position);
   if (lighting.camera.w > 0.0) { view = lighting.camera.xyz; }
   let nv = max(dot(normal, view), 0.0);
-  var result = emission;${environmentCode ? '\n  result += environment_lighting(base, normal, view, metallic, roughness, draw_info.options.z == 2.0);' : ''}
+  var result = emission;${environmentCode ? '\n  result += environment_lighting(base, normal, view, metallic, roughness, draw_info.options.z == 2.0)' + (ambientOcclusion ? ' * occlusion' : '') + ';' : ''}
   for (var i = 0u; i < u32(lighting.meta.x); i++) {
     let light = lighting.lights[i];
     var incoming = -light.vector.xyz;
@@ -199,9 +206,9 @@ fn illuminate(base: vec3<f32>, position: vec3<f32>, normal: vec3<f32>, metallic:
 }
 ` : '';
   return /* wgsl */`
-struct DrawInfo {
+${occluded ? '// Same 48-byte layout as mat3x3; the first column padding holds material strength.\nstruct OcclusionNormal { x: vec3<f32>, strength: f32, y: vec3<f32>, pad0: f32, z: vec3<f32>, pad1: f32 }\n' : ''}struct DrawInfo {
   clip_from_local: mat4x4<f32>, color: vec4<f32>, options: vec4<f32>, uv_x: vec4<f32>, uv_y: vec4<f32>,
-  world_from_local: mat4x4<f32>, normal_from_local: mat3x3<f32>, emission_roughness: vec4<f32>
+  world_from_local: mat4x4<f32>, normal_from_local: ${occluded ? 'OcclusionNormal' : 'mat3x3<f32>'}, emission_roughness: vec4<f32>
 }
 @group(0) @binding(0) var<uniform> draw_info: DrawInfo;
 ${declarations}
@@ -216,7 +223,7 @@ struct VertexOutput {
   var out: VertexOutput;
   out.position = draw_info.clip_from_local * vec4<f32>(position, 1.0);
   ${attributes ? 'out.uv = vec2<f32>(dot(draw_info.uv_x.xyz, vec3<f32>(uv, 1.0)), dot(draw_info.uv_y.xyz, vec3<f32>(uv, 1.0)));\n  out.color = color;' : 'out.uv = vec2<f32>(0.0); out.color = vec4<f32>(1.0);'}
-  ${lit ? 'out.world = (draw_info.world_from_local * vec4<f32>(position, 1.0)).xyz;\n  out.normal = draw_info.normal_from_local * normal;' : ''}
+  ${lit ? 'out.world = (draw_info.world_from_local * vec4<f32>(position, 1.0)).xyz;\n  out.normal = ' + (occluded ? 'mat3x3<f32>(draw_info.normal_from_local.x, draw_info.normal_from_local.y, draw_info.normal_from_local.z)' : 'draw_info.normal_from_local') + ' * normal;' : ''}
   ${tangentAttribute ? 'out.tangent = vec4<f32>((draw_info.world_from_local * vec4<f32>(tangent.xyz, 0.0)).xyz, tangent.w * draw_info.uv_y.w);' : ''}
   ${mapSlots(coordinateMask).map(slot => `out.uv_${slot} = vec2<f32>(dot(draw_info.uv_x.xyz, vec3<f32>(uv_${slot}, 1.0)), dot(draw_info.uv_y.xyz, vec3<f32>(uv_${slot}, 1.0)));`).join('\n  ')}
   return out;
@@ -260,7 +267,7 @@ struct VertexOutput {
   let metallic = draw_info.options.w ${mapMask & 2 ? '* metallic_roughness_texel.b' : ''};
   let roughness = draw_info.emission_roughness.w ${mapMask & 2 ? '* metallic_roughness_texel.g' : ''};
   let emission = draw_info.emission_roughness.rgb ${mapMask & 8 ? '* emissive_texel.rgb' : ''};
-  let rgb = illuminate(rgba.rgb, input.world, normal, metallic, roughness, emission);` : 'let rgb = rgba.rgb;'}
+  ${ambientOcclusion ? '// glTF occlusion uses only linear R and affects indirect light, never emission or punctual light.\n  let occlusion = 1.0 + draw_info.normal_from_local.strength * (occlusion_texel.r - 1.0);\n  ' : ''}let rgb = illuminate(rgba.rgb, input.world, normal, metallic, roughness, emission${ambientOcclusion ? ', occlusion' : ''});` : 'let rgb = rgba.rgb;'}
   ${depthOnly ? '' : 'return vec4<f32>(rgb, select(1.0, rgba.a, draw_info.options.y > 0.0));'}
 }
 `;
@@ -536,7 +543,7 @@ export async function createGpuAnimationRenderer(device, {
 
   async function addMesh(gpu, options = {}) {
     live(); if (busy) fail('ANIMATION_RENDER_REENTRANT', 'Cannot register a mesh during submission');
-    keys(options, ['indices', 'baseColor', 'doubleSided', 'alphaMode', 'alphaCutoff', 'texCoords', 'vertexColors', 'mapCoordinates', ...MAP_FIELDS, 'normalScale', 'uvTransform', 'shading', 'metallicFactor', 'roughnessFactor', 'emissiveFactor'], 'material/geometry');
+    keys(options, ['indices', 'baseColor', 'doubleSided', 'alphaMode', 'alphaCutoff', 'texCoords', 'vertexColors', 'mapCoordinates', ...MAP_FIELDS, 'normalScale', 'occlusionStrength', 'uvTransform', 'shading', 'metallicFactor', 'roughnessFactor', 'emissiveFactor'], 'material/geometry');
     deformerShape(gpu);
     if (records.size + pendingMeshes >= maxMeshes) fail('ANIMATION_RENDER_LIMIT', 'Mesh capacity exceeded');
     const {indices = null, baseColor = [1, 1, 1, 1], doubleSided = false, alphaMode = 'OPAQUE', alphaCutoff = 0.5} = options;
@@ -555,9 +562,12 @@ export async function createGpuAnimationRenderer(device, {
       return {view, sampler};
     });
     const mapMask = textures.reduce((mask, texture, slot) => mask | (texture ? 1 << slot : 0), 0);
-    if ((!lit && (mapMask & 14)) || (mode !== 2 && (mapMask & 2)) || (!(mapMask & 4) && options.normalScale !== undefined)) {
+    if ((!lit && (mapMask & 30)) || (mode !== 2 && (mapMask & 2)) || (!(mapMask & 4) && options.normalScale !== undefined) ||
+        (!(mapMask & 16) && options.occlusionStrength !== undefined)) {
       fail('ANIMATION_RENDER_OPTIONS', 'Texture parameters do not apply to shading model');
     }
+    const occlusionStrength = finite(options.occlusionStrength ?? 1, 'Occlusion strength');
+    if (occlusionStrength < 0 || occlusionStrength > 1) fail('ANIMATION_RENDER_VALUE', 'Occlusion strength must be in [0,1]');
     const normalScale = finite(options.normalScale ?? 1, 'Normal scale');
     if (!Number.isFinite(Math.fround(normalScale))) fail('ANIMATION_RENDER_VALUE', 'Normal scale exceeds f32');
     const derivative = (mapMask & 4) !== 0 && !gpu.vertexLayout.attributes.some(a => a.shaderLocation === 2 && a.offset === 24 && a.format === 'float32x4');
@@ -671,7 +681,7 @@ export async function createGpuAnimationRenderer(device, {
         await Promise.race([Promise.all([allocated.errors, ready, lightsReady]), lost]);
       }
       live(); deformerShape(gpu);
-      const record = {gpu, rgba, doubleSided, alphaMode, alphaCutoff, extent, indexBuffer, indexFormat, variant, transform, surfaceBuffer, textureGroup, lit, mode, metallic, roughness, emission, mapMask, normalScale, disposed: false};
+      const record = {gpu, rgba, doubleSided, alphaMode, alphaCutoff, extent, indexBuffer, indexFormat, variant, transform, surfaceBuffer, textureGroup, lit, mode, metallic, roughness, emission, mapMask, normalScale, occlusionStrength, disposed: false};
       const mesh = Object.freeze({vertexCount: gpu.vertexCount, indexCount: indices === null ? 0 : extent,
         get disposed() { return record.disposed || disposed; },
         dispose() {
@@ -716,7 +726,7 @@ export async function createGpuAnimationRenderer(device, {
       }
       for (let i = 0; i < draws.length; i++) {
         const input = owned.has(draws[i]) ? {mesh: draws[i]} : draws[i];
-        keys(input, ['mesh', 'worldMatrix', 'baseColor', 'first', 'count', 'uvTransform', 'normalScale', 'metallicFactor', 'roughnessFactor', 'emissiveFactor'], 'draw');
+        keys(input, ['mesh', 'worldMatrix', 'baseColor', 'first', 'count', 'uvTransform', 'normalScale', 'occlusionStrength', 'metallicFactor', 'roughnessFactor', 'emissiveFactor'], 'draw');
         const record = owned.get(input.mesh);
         if (!record || record.disposed) fail('ANIMATION_RENDER_MESH', 'Mesh is not live in this renderer');
         const gpu = record.gpu; deformerShape(gpu);
@@ -736,6 +746,7 @@ export async function createGpuAnimationRenderer(device, {
         const determinant = world[0] * (world[5] * world[10] - world[9] * world[6])
           - world[4] * (world[1] * world[10] - world[9] * world[2]) + world[8] * (world[1] * world[6] - world[5] * world[2]);
         finite(determinant, 'World determinant');
+        if (input.occlusionStrength !== undefined && !(record.mapMask & 16)) fail('ANIMATION_RENDER_OPTIONS', 'Occlusion strength requires an occlusion map');
         if (input.normalScale !== undefined && !(record.mapMask & 4)) fail('ANIMATION_RENDER_OPTIONS', 'Normal scale requires a normal map');
         if (record.mapMask & 4) {
           const scale = finite(input.normalScale ?? record.normalScale, 'Normal scale');
@@ -754,6 +765,11 @@ export async function createGpuAnimationRenderer(device, {
             staged[offset + 32 + k] = world[k];
           }
           packNormal(world, determinant, staged, offset + 48);
+          if (record.mapMask & 16) {
+            const strength = finite(input.occlusionStrength ?? record.occlusionStrength, 'Occlusion strength');
+            if (strength < 0 || strength > 1) fail('ANIMATION_RENDER_VALUE', 'Occlusion strength must be in [0,1]');
+            staged[offset + 51] = strength;
+          }
           const metallic = finite(input.metallicFactor ?? record.metallic, 'Metallic factor'), roughness = finite(input.roughnessFactor ?? record.roughness, 'Roughness factor');
           const emission = array(input.emissiveFactor ?? record.emission, 3, 'Emissive factor');
           if (metallic < 0 || metallic > 1 || roughness < 0 || roughness > 1 || emission.some(v => v < 0 || !Number.isFinite(Math.fround(v)))) fail('ANIMATION_RENDER_VALUE', 'Invalid material factors');
