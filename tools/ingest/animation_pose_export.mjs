@@ -10,6 +10,8 @@
  * It has no skins, morph targets or clips, so loading cannot deform it twice.
  * HDR emission uses KHR_materials_emissive_strength without clipping or changing
  * encoded image pixels; ordinary [0,1] emission stays in the core representation.
+ * Clearcoat factors, all three maps and independently baked UVs are preserved
+ * through KHR_materials_clearcoat; coating and base normal scales stay distinct.
  */
 import {inspectGltfKtx2} from './gltf_ktx2.mjs';
 import {createGltfSceneView} from './gltf_scene_view.mjs';
@@ -17,7 +19,9 @@ export class AnimationExportError extends Error {
   constructor(code, message) { super(`${code}: ${message}`); this.name = 'AnimationExportError'; this.code = code; }
 }
 const fail = (code, message) => { throw new AnimationExportError('ANIMATION_EXPORT_' + code, message); };
-const MAPS = ['baseColorTexture', 'metallicRoughnessTexture', 'normalTexture', 'emissiveTexture', 'occlusionTexture'];
+const COAT_FIELDS = ['clearcoatFactor', 'clearcoatRoughnessFactor', 'clearcoatNormalScale'];
+const COAT_MAPS = ['clearcoatTexture', 'clearcoatRoughnessTexture', 'clearcoatNormalTexture'];
+const MAPS = ['baseColorTexture', 'metallicRoughnessTexture', 'normalTexture', 'emissiveTexture', 'occlusionTexture', ...COAT_MAPS];
 const IDENTITY_UV = [1, 0, 0, 1, 0, 0];
 const aligned = n => Math.ceil(n / 4) * 4;
 function integer(n, low, high, label) {
@@ -138,7 +142,7 @@ export async function exportAnimationPoseGLB(pose, entries, options = {}) {
     const count = integer(d.vertexCount, 1, maxVertices, 'vertex count');
     vertices += count; if (vertices > maxVertices) fail('LIMIT', 'Aggregate vertex limit exceeded');
     fields(material, ['geometry', 'indices', 'shading', 'baseColor', 'alphaMode', 'alphaCutoff', 'doubleSided',
-      'metallicFactor', 'roughnessFactor', 'emissiveFactor', 'normalScale', 'occlusionStrength', 'vertexColors', 'texCoords', 'uvTransform', 'mapCoordinates', ...MAPS], 'material');
+      'metallicFactor', 'roughnessFactor', 'emissiveFactor', 'normalScale', 'occlusionStrength', 'vertexColors', 'texCoords', 'uvTransform', 'mapCoordinates', ...COAT_FIELDS, ...MAPS], 'material');
     const m = vector(d.worldMatrix, 16, 'world matrix');
     if (m[3] !== 0 || m[7] !== 0 || m[11] !== 0 || m[15] !== 1) fail('GEOMETRY', 'World matrix must be affine');
     const positions = array(d.positions, count * 3, 'positions');
@@ -209,6 +213,18 @@ export async function exportAnimationPoseGLB(pose, entries, options = {}) {
         requireExtension('KHR_materials_emissive_strength');
       }
     }
+    const coated = COAT_FIELDS.some(key => material[key] !== undefined) || COAT_MAPS.some(key => material[key] != null);
+    let coating;
+    if (coated) {
+      if (unlit) fail('UNSUPPORTED', 'Unlit export cannot preserve clearcoat');
+      if (material.clearcoatNormalScale !== undefined && material.clearcoatNormalTexture == null) fail('SHAPE', 'Clearcoat normal scale needs its normal map');
+      coating = {
+        clearcoatFactor: vector([material.clearcoatFactor === undefined ? 0 : material.clearcoatFactor], 1, 'clearcoat factor', 0, 1)[0],
+        clearcoatRoughnessFactor: vector([material.clearcoatRoughnessFactor === undefined ? 0 : material.clearcoatRoughnessFactor], 1, 'clearcoat roughness', 0, 1)[0],
+      };
+      out.extensions ??= {}; out.extensions.KHR_materials_clearcoat = coating;
+      requireExtension('KHR_materials_clearcoat');
+    }
     if (material.vertexColors != null) {
       const width = material.vertexColors.length / count;
       if (width !== 3 && width !== 4) fail('SHAPE', 'Vertex colors need RGB/RGBA');
@@ -232,7 +248,11 @@ export async function exportAnimationPoseGLB(pose, entries, options = {}) {
       info.texCoord = channel++;
       if (field === 'normalTexture') info.scale = finite(material.normalScale ?? 1, 'normal scale');
       if (field === 'occlusionTexture') info.strength = vector([material.occlusionStrength === undefined ? 1 : material.occlusionStrength], 1, 'occlusion strength', 0, 1)[0];
-      (field === 'baseColorTexture' || field === 'metallicRoughnessTexture' ? out.pbrMetallicRoughness : out)[field] = info;
+      if (field === 'clearcoatNormalTexture') {
+        info.scale = finite(material.clearcoatNormalScale === undefined ? 1 : material.clearcoatNormalScale, 'clearcoat normal scale');
+        if (!Number.isFinite(Math.fround(info.scale))) fail('VALUE', 'Clearcoat normal scale exceeds the renderer Float32 range');
+      }
+      (COAT_MAPS.includes(field) ? coating : field === 'baseColorTexture' || field === 'metallicRoughnessTexture' ? out.pbrMetallicRoughness : out)[field] = info;
     }
     fields(source, ['node', 'mesh', 'primitive', 'material'], 'source identity');
     const ids = {};
