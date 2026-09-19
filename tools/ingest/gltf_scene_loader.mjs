@@ -4,6 +4,8 @@
  * picking:true opts in to synchronous current-pose geometric selection.
  * exporting:true enables self-contained posed GLB export with cached source images
  * and current-pose authored cameras/lights. Export sceneView:null for meshes only.
+ * sourceExport:true separately retains an offline, rig/clip-preserving GLB of the
+ * loaded asset. This captures authored state, not subsequent live pose edits.
  */
 import {loadGltfAsset,GltfAssetError} from './gltf_asset.mjs';
 import {prepareGltfAnimationModel} from './animation_model.mjs';
@@ -27,12 +29,30 @@ const abort=signal=>{if(signal?.aborted)throw signal.reason ?? new DOMException(
  * the requested sampleCount/depthFormat, and are owned until scene disposal.
  * outputTextureBytes/outputBufferBytes are separate from asset/geometry budgets.
  * Omit output to retain the original attachment API and allocation behavior.
+ * sourceExport:true (or {maxBytes,maxJsonBytes,maxResources}) closes ALL source
+ * scenes/images at construction, before GPU texture/scene allocation. This can
+ * fetch images outside the selected render scene under the existing asset policy.
+ * exportSourceGLB({signal}) returns an independent ArrayBuffer without later I/O,
+ * encoding or GPU readback. sourceExportBytes reports retained file bytes under
+ * a separate default 128 MiB budget; disposal releases that retained snapshot.
+ * Omission neither imports the packer nor loads/retains additional resources.
+ * exporting and sourceExport are independent options: posed vs authored export.
  */
 export async function loadGpuGltfAnimationScene(device,source,{
-  assets={},decode={},textures={},scene={},output=null,picking=false,exporting=false,signal=assets.signal ?? textures.signal ?? output?.signal,
+  assets={},decode={},textures={},scene={},output=null,picking=false,exporting=false,sourceExport=false,signal=assets.signal ?? textures.signal ?? output?.signal,
 }={}) {
   if(decode.resolveTexture!=null)throw new GltfAssetError('GLTF_MODEL_LOAD_OPTIONS','The owning loader supplies resolveTexture');
   for(const nested of [assets.signal,textures.signal,output?.signal])if(nested!==undefined&&nested!==signal)throw new GltfAssetError('GLTF_MODEL_LOAD_OPTIONS','Use one construction AbortSignal');
+  if(sourceExport!==false&&sourceExport!==true&&(!sourceExport||typeof sourceExport!=='object'||Array.isArray(sourceExport)))
+    throw new GltfAssetError('GLTF_MODEL_LOAD_OPTIONS','sourceExport must be false, true or a limits object');
+  const sourceOptions=sourceExport===false?null:sourceExport===true?{}:{...sourceExport};
+  if(sourceOptions) {
+    for(const key of Object.keys(sourceOptions))if(!['maxBytes','maxJsonBytes','maxResources'].includes(key))
+      throw new GltfAssetError('GLTF_MODEL_LOAD_OPTIONS',`Unsupported sourceExport option: ${key}`);
+    for(const [key,min,max]of [['maxBytes',20,0xffffffff],['maxJsonBytes',1,sourceOptions.maxBytes??128*1024*1024],['maxResources',1,65536]])
+      if(sourceOptions[key]!==undefined&&(!Number.isSafeInteger(sourceOptions[key])||sourceOptions[key]<min||sourceOptions[key]>max))
+        throw new GltfAssetError('GLTF_MODEL_LOAD_OPTIONS',`Invalid sourceExport ${key}`);
+  }
   // Freeze the route choice and stage settings before the first I/O await.
   // A caller editing its options while fetching cannot select one image and
   // accidentally supply another decoder policy when uploads begin.
@@ -53,7 +73,7 @@ export async function loadGpuGltfAnimationScene(device,source,{
     throw new GltfAssetError('GLTF_MODEL_LOAD_OPTIONS','BasisU selection requires a configured textures.ktx2Loader; decode.basisu must be boolean');
   decodeOptions.basisu=basisu;
   abort(signal);
-  let asset,resources,model,presentation,exportSources=[];
+  let asset,resources,model,presentation,sourceSnapshot=null,exportSources=[];
   try {
     if(outputOptions){
       // Disabled output neither imports its implementation nor allocates a pass.
@@ -62,6 +82,10 @@ export async function loadGpuGltfAnimationScene(device,source,{
       Object.assign(sceneOptions.renderer,presentation.rendererOptions);
     }
     asset=await loadGltfAsset(source,assetOptions);abort(signal);
+    if(sourceOptions) {
+      const {exportGltfAssetGLB}=await import('./gltf_asset_export.mjs');abort(signal);
+      sourceSnapshot=await exportGltfAssetGLB(asset,{...sourceOptions,signal});abort(signal);
+    }
     const prepared=prepareGltfAnimationModel(asset.json,asset.buffers,decodeOptions);
     resources=await createGltfTextureResources(device,prepared.textureRequests,asset.readImage,textureOptions);
     abort(signal);
@@ -84,7 +108,7 @@ export async function loadGpuGltfAnimationScene(device,source,{
     try{presentation?.dispose();}finally{try{model?.dispose();}finally{resources?.dispose();}}
     throw error;
   }
-  function release(){try{presentation?.dispose();}finally{try{model.dispose();}finally{resources.dispose();exportSources=[];}}}
+  function release(){try{presentation?.dispose();}finally{try{model.dispose();}finally{resources.dispose();exportSources=[];sourceSnapshot=null;}}}
   function checkTextures(){
     if(resources.failed){release();throw new GltfTextureError('GLTF_TEXTURE_DEVICE_LOST','Model texture device was lost');}
     if(presentation?.failed){release();throw new GltfAssetError('GLTF_MODEL_OUTPUT_FAILED','Model presentation failed');}
@@ -104,6 +128,17 @@ export async function loadGpuGltfAnimationScene(device,source,{
     get failed(){return model.failed||resources.failed||Boolean(presentation?.failed);},
     get outputEnabled(){return presentation!==undefined;},
     get outputTextureBytes(){return presentation?.textureBytes ?? 0;},get outputBufferBytes(){return presentation?.bufferBytes ?? 0;},
+    get sourceExportEnabled(){return sourceOptions!==null;},
+    get sourceExportBytes(){return sourceSnapshot?.byteLength??0;},
+    async exportSourceGLB(settings={}){return query(()=>{
+      if(model.disposed)throw new GltfAssetError('GLTF_EXPORT_DISPOSED','Model has been disposed');
+      if(!sourceSnapshot)throw new GltfAssetError('GLTF_EXPORT_DISABLED','Enable sourceExport at model construction');
+      if(!settings||typeof settings!=='object'||Array.isArray(settings)||Object.keys(settings).some(key=>key!=='signal'))
+        throw new GltfAssetError('GLTF_EXPORT_OPTIONS','Source export accepts only an optional AbortSignal');
+      abort(settings.signal);
+      if(model.disposed||!sourceSnapshot)throw new GltfAssetError('GLTF_EXPORT_DISPOSED','Model was disposed during source export');
+      return sourceSnapshot.slice(0);
+    });},
     get exportingEnabled(){return model.exportingEnabled;},
     exportPoseGLB(settings={}){return query(()=>{
       if(!settings||typeof settings!=='object'||Array.isArray(settings))throw new GltfAssetError('GLTF_EXPORT_OPTIONS','Invalid export settings');
@@ -133,5 +168,6 @@ export async function loadGpuGltfAnimationScene(device,source,{
     },
     dispose:release,
   });
+  asset=null; // Only explicitly retained export snapshots/images survive construction.
   return result;
 }
