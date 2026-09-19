@@ -60,6 +60,7 @@ export async function createGpuDecodedAnimationScene(device,prepared,{picking=fa
   const result=Object.freeze({pose,view,cameras:view.cameras,lights:view.lights,
     controller:scene.controller,draws:scene.draws,deformers:scene.deformers,
     source:Object.freeze(prepared.source),diagnostics:Object.freeze(prepared.diagnostics),
+    ...(prepared.instanceOrigins ? {instanceOrigins:prepared.instanceOrigins} : {}),
     get poseVersion(){return scene.poseVersion;},get bufferBytes(){return scene.bufferBytes;},
     get disposed(){return scene.disposed;},get failed(){return scene.failed;},
     get exportingEnabled(){return exporter.enabled;},

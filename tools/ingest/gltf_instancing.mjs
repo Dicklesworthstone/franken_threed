@@ -104,6 +104,17 @@ export function expandGltfInstances(model, suppliedBuffers, {
   if (!plans.length) return Object.freeze({json: Object.keys(declarations).length ? {...model, ...declarations} : model,
     instanceOrigins: Object.freeze({}), instanceCount: 0, accessorComponents: 0, expandedComponents: 0});
 
+  // Appending nodes must never make an originally invalid node reference valid.
+  // Keep every source reference inside the original node domain; generated IDs
+  // are reserved exclusively for this lowering step.
+  const sourceNode = value => integer(value, 'source node reference', 0, original.length - 1);
+  for (const node of original) for (const child of list(node.children ?? [], 'children')) sourceNode(child);
+  for (const scene of list(model.scenes ?? [], 'scenes')) for (const root of list(scene.nodes ?? [], 'scene roots')) sourceNode(root);
+  for (const skin of list(model.skins ?? [], 'skins')) {
+    for (const joint of list(skin.joints, 'skin joints')) sourceNode(joint);
+    if (skin.skeleton !== undefined) sourceNode(skin.skeleton);
+  }
+
   // Morph animation targets the mesh, not its transform-only parent. Duplicate
   // just these channels, preserving clip/sampler identity and channel ordering.
   // Count their eventual decoded arrays now, before the downstream pose decoder
@@ -116,7 +127,9 @@ export function expandGltfInstances(model, suppliedBuffers, {
     let total = 0, changed = false;
     for (const channel of channels) {
       object(channel, 'animation channel');
-      const target = channel.target, plan = target?.path === 'weights' ? byNode.get(target.node) : undefined;
+      const target = channel.target;
+      if (target?.node !== undefined) sourceNode(target.node);
+      const plan = target?.path === 'weights' ? byNode.get(target.node) : undefined;
       total += plan?.count ?? 1;
       if (total > 262144) fail('LIMIT', 'Expanded animation channel budget exceeded');
       if (!plan) continue;

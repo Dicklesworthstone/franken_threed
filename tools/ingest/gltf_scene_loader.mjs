@@ -98,6 +98,7 @@ export async function loadGpuGltfAnimationScene(device,source,{
   const result=Object.freeze({pose:model.pose,view:model.view,cameras:model.cameras,lights:model.lights,
     controller:model.controller,draws:model.draws,deformers:model.deformers,
     source:model.source,diagnostics:model.diagnostics,assetBytes:asset.bytesLoaded,
+    ...(model.instanceOrigins ? {instanceOrigins:model.instanceOrigins} : {}),
     get poseVersion(){return model.poseVersion;},get bufferBytes(){return model.bufferBytes;},
     get textureBytes(){return resources.textureBytes;},get disposed(){return model.disposed;},
     get failed(){return model.failed||resources.failed||Boolean(presentation?.failed);},

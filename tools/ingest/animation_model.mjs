@@ -21,6 +21,7 @@
  */
 import {decodeGltfAnimation} from './animation_gltf.mjs';
 import {decodeGltfGeometry} from './animation_geometry.mjs';
+import {expandGltfInstances} from './gltf_instancing.mjs';
 import {AnimationPoseError, createAnimationPlayer} from './animation_runtime.mjs';
 import {createAnimationDeformer} from './animation_deformer.mjs';
 import {createAnimationModelExporter} from './animation_model_export.mjs';
@@ -184,6 +185,9 @@ function materialPlan(model, primitive, basisu) {
  * stages; renderer/deformer allocation limits remain independently enforced.
  * The returned definition and drawables no longer borrow JSON or buffer bytes.
  * Only successfully resolved native texture resources remain caller-owned.
+ * EXT_mesh_gpu_instancing TRS uses bounded per-instance draws, not GPU batching.
+ * source[].node remains a pose index; instanceOrigins[poseNode] gives the original
+ * glTF {node,instance}. Original node IDs stay fixed; synthetic IDs are appended.
  */
 export function decodeGltfAnimationModel(model, suppliedBuffers, {resolveTexture=null,...options}={}) {
   if (resolveTexture !== null && typeof resolveTexture !== 'function') fail('TEXTURE','resolveTexture must be a function');
@@ -199,12 +203,11 @@ export function decodeGltfAnimationModel(model, suppliedBuffers, {resolveTexture
  * required BasisU needs explicit support. Selection does not transcode or fetch.
  */
 export function prepareGltfAnimationModel(model,suppliedBuffers,{
-  scene=model?.scene ?? 0,maxComponents=16777216,maxPrimitives=4096,basisu=false,
+  scene=model?.scene ?? 0,maxComponents=16777216,maxPrimitives=4096,basisu=false,maxInstances=4096,
 }={}) {
   if (typeof basisu !== 'boolean') fail('TEXTURE','basisu must be a boolean');
   if (!Array.isArray(model?.extensionsRequired ?? [])) fail('SHAPE','extensionsRequired must be an array');
-  for (const name of model?.extensionsRequired ?? []) if (!['KHR_materials_unlit','KHR_materials_emissive_strength','KHR_texture_transform','KHR_lights_punctual','KHR_mesh_quantization',...(basisu ? ['KHR_texture_basisu'] : [])].includes(name)) fail('UNSUPPORTED',`Required extension needs source route: ${name}`);
-  const sceneView=decodeGltfSceneView(model,{scene});
+  for (const name of model?.extensionsRequired ?? []) if (!['EXT_mesh_gpu_instancing','KHR_materials_unlit','KHR_materials_emissive_strength','KHR_texture_transform','KHR_lights_punctual','KHR_mesh_quantization',...(basisu ? ['KHR_texture_basisu'] : [])].includes(name)) fail('UNSUPPORTED',`Required extension needs source route: ${name}`);
   const copyright=model.asset?.copyright;
   if(copyright!==undefined && typeof copyright!=='string')fail('SHAPE','Asset copyright must be text');
   const loaded=new Map();
@@ -212,19 +215,24 @@ export function prepareGltfAnimationModel(model,suppliedBuffers,{
     if (!loaded.has(i)) loaded.set(i,typeof suppliedBuffers==='function'?suppliedBuffers(i):suppliedBuffers?.[i]);
     return loaded.get(i);
   };
+  const expanded=expandGltfInstances(model,buffer,{maxInstances,maxComponents});
+  model=expanded.json;
+  const sceneView=decodeGltfSceneView(model,{scene});
+  const instanceMetadata=expanded.instanceCount ? {instanceOrigins:expanded.instanceOrigins} : {};
   const definition=decodeGltfAnimation(model,buffer,{maxComponents});
   const geometry=decodeGltfGeometry(model,buffer,{scene,maxComponents,maxPrimitives});
+  if(expanded.instanceCount)geometry.diagnostics.push({reason:'EXPANDED_INSTANCE_DRAWS_NOT_GPU_INSTANCING',instances:expanded.instanceCount});
   const plans=geometry.primitives.map(p=>materialPlan(model,p,basisu)),unique=new Map();
   for (const plan of plans) geometry.diagnostics.push(...plan.diagnostics);
   for(const plan of plans)for(const {request}of plan.requests)unique.set(request.textureIndex+':'+request.colorSpace,request);
   let busy=false,consumed=false;
-  return Object.freeze({sceneView,textureRequests:Object.freeze([...unique.values()]),
+  return Object.freeze({sceneView,...instanceMetadata,textureRequests:Object.freeze([...unique.values()]),
     resolveTextures(resolveTexture=null) {
       if(consumed)fail('PREPARED','Prepared model has already been resolved');
       if(busy)fail('REENTRANT','Texture resolution cannot be reentered');
       if(resolveTexture!==null&&typeof resolveTexture!=='function')fail('TEXTURE','resolveTexture must be a function');
       busy=true;
-      try {const result=resolveModelTextures(definition,geometry,plans,resolveTexture,sceneView);consumed=true;return {...result,copyright};}
+      try {const result=resolveModelTextures(definition,geometry,plans,resolveTexture,sceneView);consumed=true;return {...result,copyright,...instanceMetadata};}
       finally {busy=false;}
     },
   });
@@ -290,6 +298,7 @@ export function createCpuGltfAnimationModel(model, suppliedBuffers, options={}) 
   }
   const result=Object.freeze({pose,view,cameras:view.cameras,lights:view.lights,drawables:Object.freeze(decoded.drawables),deformers:Object.freeze(deformers),
     source:Object.freeze(decoded.source),diagnostics:Object.freeze(decoded.diagnostics),
+    ...(decoded.instanceOrigins ? {instanceOrigins:decoded.instanceOrigins} : {}),
     sample(time,settings){return exclusive(()=>{pose.sample(time,settings);return update();});},
     reset(){return exclusive(()=>{pose.reset();return update();});},update(){return exclusive(update);},
     get exportingEnabled(){return exporter.enabled;},

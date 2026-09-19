@@ -147,3 +147,13 @@ test('short, shared and nonfinite instance buffers never publish partial output'
     const f=fixture();f.buffers[0]=buffer;const before=structuredClone(f.model);assert.throws(()=>expand(f));assert.deepEqual(f.model,before);
   }
 });
+
+for(const [name,mutate] of [
+  ['animation target',f=>{animated(f);f.model.animations[0].channels[1].target.node=1;}],
+  ['skin joint',f=>{f.model.skins=[{joints:[1]}];}],
+  ['skin skeleton',f=>{f.model.skins=[{joints:[0],skeleton:1}];}],
+  ['scene root',f=>{f.model.scenes[0].nodes=[1];}],
+  ['child',f=>{f.model.nodes[0].children=[1];}],
+])test(`appended node IDs cannot legalize an invalid source ${name}`,()=>{
+  const f=fixture();mutate(f);unread(f,undefined,{code:'GLTF_INSTANCING_LIMIT'});
+});
