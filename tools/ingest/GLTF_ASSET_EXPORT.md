@@ -82,7 +82,15 @@ The writer merges buffers into one four-byte-aligned BIN chunk and relocates
 bufferView offsets without changing accessor data or animation interpolation.
 STEP, LINEAR and CUBICSPLINE keyframes, including signed quaternion values and
 Hermite tangents, retain their original binary bytes. Core node, accessor,
-texture, image and bufferView indices stay fixed during ordinary packing.
+texture, image and bufferView indices stay fixed during ordinary packing. Codec
+normalization may leave orphan declarations referring to skipped buffer slots.
+Only those inaccessible orphan accessors/views are pruned, after tracing every
+primitive, morph target, skin, animation sampler, image and GPU-instance accessor
+reference across all scenes. The surviving accessor/view references are remapped;
+node, skin, material, texture and image identities are not changed. A missing
+resource that still has a user is an error, never fake zero-initialized geometry.
+Backed unused resources are retained. Consumed, now-empty extension declaration
+arrays are omitted rather than emitted as invalid glTF arrays.
 Original generator, copyright, names and extras remain data; JSON getters,
 `toJSON`, cycles and nonfinite numbers are rejected rather than executed or
 silently erased. Negative zero is preserved. When multiple named/annotated

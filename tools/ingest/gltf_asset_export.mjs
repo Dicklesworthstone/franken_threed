@@ -1,7 +1,8 @@
 /** Self-contained GLB export of a loaded glTF asset, not a sampled pose.
  * Preserve authored scenes, local transforms, skins, morph targets, animations,
  * cameras, lights and materials. Only resource storage is repacked: buffer indices
- * become one BIN buffer, while bufferView/accessor/image/node indices stay fixed.
+ * become one BIN buffer. Ordinary packing keeps other indices fixed; unavailable
+ * codec orphans alone are pruned with all accessor/view references remapped.
  * Use loadGltfAsset's normalized json/buffers after meshopt/Draco decoding, not
  * sourceJson with its original compression references. No GPU or codec executes.
  */
@@ -95,6 +96,71 @@ function extensions(json) {
   }
   inspect(json);
 }
+// Codec normalization deliberately preserves original IDs and may leave orphan
+// declarations backed by skipped fallback/source buffers. Only this export copy
+// may compact them. Trace EVERY source scene's accessor uses, including off-scene
+// primitives, skins, animation samplers and EXT_mesh_gpu_instancing. A missing
+// live input is an error; never serialize it as a zero-initialized accessor.
+function pruneUnavailableStorage(json,views,images,supplied) {
+  const unavailable=new Set(views.flatMap((view,i)=>supplied[view.buffer]==null?[i]:[]));
+  if(!unavailable.size)return views;
+  const list=(value,label)=>{if(!Array.isArray(value))fail('SHAPE',`Expected ${label} array`);return value;};
+  const accessors=list(json.accessors??[],'accessors'),accessorSites=[],viewSites=[],removed=new Set();
+  function accessorSite(owner,key) {
+    integer(owner[key],0,accessors.length-1,'accessor reference');accessorSites.push([owner,key]);
+  }
+  function attributeSites(attributes) {
+    object(attributes,'attribute references');
+    for(const key of Object.keys(attributes))accessorSite(attributes,key);
+  }
+  for(const mesh of list(json.meshes??[],'meshes')) {
+    object(mesh,'mesh');
+    for(const primitive of list(mesh.primitives??[],'primitives')) {
+      object(primitive,'primitive');attributeSites(primitive.attributes??{});
+      if(primitive.indices!==undefined)accessorSite(primitive,'indices');
+      for(const target of list(primitive.targets??[],'morph targets'))attributeSites(target);
+    }
+  }
+  for(const skin of list(json.skins??[],'skins')) {
+    object(skin,'skin');if(skin.inverseBindMatrices!==undefined)accessorSite(skin,'inverseBindMatrices');
+  }
+  for(const animation of list(json.animations??[],'animations')) {
+    object(animation,'animation');
+    for(const sampler of list(animation.samplers??[],'animation samplers')) {
+      object(sampler,'animation sampler');accessorSite(sampler,'input');accessorSite(sampler,'output');
+    }
+  }
+  for(const node of list(json.nodes??[],'nodes')) {
+    object(node,'node');const instances=node.extensions?.EXT_mesh_gpu_instancing;
+    if(instances!==undefined)attributeSites(object(instances,'instancing').attributes);
+  }
+  for(let i=0;i<accessors.length;i++) {
+    const a=object(accessors[i],'accessor'),sites=[];
+    const site=(owner,key)=>{integer(owner[key],0,views.length-1,'accessor bufferView');sites.push([owner,key]);};
+    if(a.bufferView!==undefined)site(a,'bufferView');
+    if(a.sparse!==undefined) {
+      const sparse=object(a.sparse,'sparse accessor');
+      site(object(sparse.indices,'sparse indices'),'bufferView');
+      site(object(sparse.values,'sparse values'),'bufferView');
+    }
+    if(sites.some(([owner,key])=>unavailable.has(owner[key])))removed.add(i);
+    else viewSites.push(...sites);
+  }
+  for(const [owner,key]of accessorSites)if(removed.has(owner[key]))
+    fail('BUFFER',`Referenced accessor ${owner[key]} has no backing bytes`);
+  for(const image of images)if(image.bufferView!==undefined) {
+    if(unavailable.has(image.bufferView))fail('BUFFER','Embedded image has no backing bytes');
+    viewSites.push([image,'bufferView']);
+  }
+  const accessorMap=[],viewMap=[],keptAccessors=[],keptViews=[];
+  for(let i=0;i<accessors.length;i++)if(!removed.has(i)){accessorMap[i]=keptAccessors.length;keptAccessors.push(accessors[i]);}
+  for(let i=0;i<views.length;i++)if(!unavailable.has(i)){viewMap[i]=keptViews.length;keptViews.push(views[i]);}
+  for(const [owner,key]of accessorSites)owner[key]=accessorMap[owner[key]];
+  for(const [owner,key]of viewSites)owner[key]=viewMap[owner[key]];
+  if(keptAccessors.length)json.accessors=keptAccessors;else delete json.accessors;
+  if(keptViews.length)json.bufferViews=keptViews;else delete json.bufferViews;
+  return keptViews;
+}
 function wait(pending,signal) {
   if(!signal)return Promise.resolve(pending);
   return new Promise((resolve,reject)=>{
@@ -118,7 +184,8 @@ function wait(pending,signal) {
  * Images are signature-checked, not decoded or fully validated by a codec.
  * Unknown/compressed extension records fail before I/O. The asset loader removes
  * successfully decoded geometry compression; skipped unused buffer slots may be
- * null, but a referenced buffer must always have real bytes. No zero stand-ins.
+ * null. Inaccessible orphan accessors/views are removed only after checking all
+ * core/instancing references. Live data must have real bytes. No zero stand-ins.
  */
 export async function exportGltfAssetGLB(asset,options={}) {
   fields(options,['signal','maxBytes','maxJsonBytes','maxResources'],'export option');
@@ -131,7 +198,8 @@ export async function exportGltfAssetGLB(asset,options={}) {
   if(new TextEncoder().encode(encodeJson(json)).length>maxJsonBytes)fail('LIMIT','Source JSON exceeds its byte budget');
   extensions(json);
   const table=(field,max)=>{const list=json[field]??[];if(!Array.isArray(list)||list.length>max)fail('LIMIT',`Invalid or excessive ${field}`);return list;};
-  const definitions=table('buffers',maxResources),views=table('bufferViews',maxResources*16),images=table('images',maxResources);
+  const definitions=table('buffers',maxResources),images=table('images',maxResources);
+  let views=table('bufferViews',maxResources*16);
   if(!Array.isArray(asset.buffers)||asset.buffers.length!==definitions.length)fail('BUFFER','Supply the original buffer slots');
   const supplied=asset.buffers.slice(),readImage=asset.readImage,used=new Set(),offsets=[],chunks=[];
   let binaryLength=0;
@@ -150,7 +218,6 @@ export async function exportGltfAssetGLB(asset,options={}) {
     integer(offset,0,0xffffffff,'view offset');integer(length,1,0xffffffff,'view length');
     if(length>definitions[view.buffer].byteLength-offset)fail('BOUNDS','bufferView exceeds the declared buffer');
     if(view.extensions!==undefined&&Object.keys(object(view.extensions,'bufferView extensions')).length)fail('EXTENSION','Decode extended bufferViews before exporting');
-    used.add(view.buffer);
   }
   // Validate all image metadata before reading/copying or invoking a provider.
   const external=new Map();
@@ -171,19 +238,21 @@ export async function exportGltfAssetGLB(asset,options={}) {
   }
   // No supported extension has resource URIs of its own. Reject unknown resource
   // fields even when placed inside an otherwise supported extension record.
-  if(views.length+external.size>maxResources*16)fail('LIMIT','Embedded image views exceed the resource count limit');
   const coreResources=new Set([...definitions,...images]);
   function resourceUris(value,core=false,inExtension=false) {
     if(!value||typeof value!=='object')return;
     for(const [key,child]of Object.entries(value)) {
       if(key==='extras')continue;
       if(key==='uri'&&!core)fail('EXTENSION','Unrecognized resource URI prevents self-contained export');
-      if(inExtension&&key==='buffer')fail('EXTENSION','Opaque extension buffer references cannot be relocated');
+      if(inExtension&&(key==='buffer'||key==='bufferView'))fail('EXTENSION','Opaque extension storage references cannot be relocated');
       if(key==='extensions')resourceUris(child,false,true);
       else if(child&&typeof child==='object')resourceUris(child,coreResources.has(child),inExtension);
     }
   }
   resourceUris(json);
+  views=pruneUnavailableStorage(json,views,images,supplied);
+  if(views.length+external.size>maxResources*16)fail('LIMIT','Embedded image views exceed the resource count limit');
+  for(const view of views)used.add(view.buffer);
   for(let i=0;i<definitions.length;i++) {
     abort(signal);
     if(supplied[i]==null) {if(used.has(i))fail('BUFFER',`Referenced buffer ${i} has no bytes`);continue;}
@@ -223,6 +292,9 @@ export async function exportGltfAssetGLB(asset,options={}) {
     } else if(metadata.some(m=>m.name!==undefined||m.extras!==undefined))buffer.extras={f3dSourceBuffers:metadata};
     json.buffers=[buffer];
   } else delete json.buffers;
+  // Geometry normalizers can consume the last required/used extension. Empty
+  // declaration arrays are not legal glTF; omission has the same semantics.
+  for(const key of ['extensionsUsed','extensionsRequired'])if(json[key]?.length===0)delete json[key];
   abort(signal);
   const text=new TextEncoder().encode(encodeJson(json));
   if(text.length>maxJsonBytes)fail('LIMIT','Output JSON exceeds its byte budget');
