@@ -98,6 +98,14 @@
  * Null/omitted frame.environment selects the original direct-only pipelines.
  * See ANIMATION_ENVIRONMENT.md for the single-scattering profile and ownership.
  *
+ * instancing:true replaces the per-draw uniform binding with a read-only storage
+ * arena and native instance-index addressing. Consecutive compatible OPAQUE/MASK
+ * draws share draw()/drawIndexed(); BLEND and incompatible inputs stay separate.
+ * No draw sorting, geometry copying, frame deferral or CPU matrix arithmetic is
+ * changed. maxDraws counts logical instances, drawCount retains that meaning, and
+ * drawCallCount reports native calls in the last successful submission. The
+ * default false keeps the original uniform/shader path and device requirements.
+ *
  * Host validation finishes before GPU writes. Driver errors are terminal, not
  * rollbackable. version acknowledges submission, not completion: await whenIdle()
  * for cumulative draw/deformation validation, OOM and device-loss errors.
@@ -107,7 +115,7 @@ export class AnimationRenderError extends Error {
   constructor(code, message) { super(`${code}: ${message}`); this.name = 'AnimationRenderError'; this.code = code; }
 }
 const fail = (code, message) => { throw new AnimationRenderError(code, message); };
-const COPY_DST = 8, INDEX = 16, VERTEX = 32, UNIFORM = 64, VERTEX_STAGE = 1, FRAGMENT_STAGE = 2;
+const COPY_DST = 8, INDEX = 16, VERTEX = 32, UNIFORM = 64, STORAGE = 128, VERTEX_STAGE = 1, FRAGMENT_STAGE = 2;
 const UNIFORM_BYTES = 256;
 const MAX_LIGHTS = 8, LIGHT_BYTES = 32 + MAX_LIGHTS * 64;
 const UV_IDENTITY = Object.freeze([1, 0, 0, 1, 0, 0]);
@@ -134,7 +142,7 @@ struct DrawInfo { clip_from_local: mat4x4<f32>, color: vec4<f32>, options: vec4<
 // Equations: glTF 2.0 Appendix B and KHR_lights_punctual (Khronos).
 // https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#appendix-b-brdf-implementation
 // https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_lights_punctual
-function surfaceShader(mapMask, lit, attributes, derivative = false, coordinateMask = 0, depthOnly = false, shadowed = false, environmentCode = '') {
+function surfaceShader(mapMask, lit, attributes, derivative = false, coordinateMask = 0, depthOnly = false, shadowed = false, environmentCode = '', instanceStride = 0) {
   const textured = mapMask !== 0, normalMapped = (mapMask & 4) !== 0, tangentAttribute = normalMapped && !derivative;
   const occluded = (mapMask & 16) !== 0, ambientOcclusion = occluded && environmentCode !== '';
   const declarations = mapSlots(mapMask).map(slot =>
@@ -210,17 +218,19 @@ ${occluded ? '// Same 48-byte layout as mat3x3; the first column padding holds m
   clip_from_local: mat4x4<f32>, color: vec4<f32>, options: vec4<f32>, uv_x: vec4<f32>, uv_y: vec4<f32>,
   world_from_local: mat4x4<f32>, normal_from_local: ${occluded ? 'OcclusionNormal' : 'mat3x3<f32>'}, emission_roughness: vec4<f32>
 }
-@group(0) @binding(0) var<uniform> draw_info: DrawInfo;
+${instanceStride ? `struct InstanceDraw { @size(${instanceStride}) info: DrawInfo }
+@group(0) @binding(0) var<storage, read> instance_draws: array<InstanceDraw>;
+var<private> draw_info: DrawInfo;` : '@group(0) @binding(0) var<uniform> draw_info: DrawInfo;'}
 ${declarations}
 ${lighting}
 struct VertexOutput {
-  @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) color: vec4<f32>,
+  @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) color: vec4<f32>,${instanceStride ? '\n  @location(10) @interpolate(flat) draw_index: u32,' : ''}
   ${lit ? '@location(2) world: vec3<f32>, @location(3) normal: vec3<f32>,' : ''}
   ${tangentAttribute ? '@location(4) tangent: vec4<f32>,' : ''}
   ${mapSlots(coordinateMask).map(slot => `@location(${5 + slot}) uv_${slot}: vec2<f32>,`).join('\n  ')}
 }
-@vertex fn vertex_main(@location(0) position: vec3<f32>${lit ? ', @location(1) normal: vec3<f32>' : ''}${tangentAttribute ? ', @location(2) tangent: vec4<f32>' : ''}${attributes ? ', @location(3) uv: vec2<f32>, @location(4) color: vec4<f32>' : ''}${mapSlots(coordinateMask).map(slot => `, @location(${5 + slot}) uv_${slot}: vec2<f32>`).join('')}) -> VertexOutput {
-  var out: VertexOutput;
+@vertex fn vertex_main(@location(0) position: vec3<f32>${lit ? ', @location(1) normal: vec3<f32>' : ''}${tangentAttribute ? ', @location(2) tangent: vec4<f32>' : ''}${attributes ? ', @location(3) uv: vec2<f32>, @location(4) color: vec4<f32>' : ''}${mapSlots(coordinateMask).map(slot => `, @location(${5 + slot}) uv_${slot}: vec2<f32>`).join('')}${instanceStride ? ', @builtin(instance_index) draw_index: u32' : ''}) -> VertexOutput {
+  var out: VertexOutput;${instanceStride ? '\n  draw_info = instance_draws[draw_index].info;\n  out.draw_index = draw_index;' : ''}
   out.position = draw_info.clip_from_local * vec4<f32>(position, 1.0);
   ${attributes ? 'out.uv = vec2<f32>(dot(draw_info.uv_x.xyz, vec3<f32>(uv, 1.0)), dot(draw_info.uv_y.xyz, vec3<f32>(uv, 1.0)));\n  out.color = color;' : 'out.uv = vec2<f32>(0.0); out.color = vec4<f32>(1.0);'}
   ${lit ? 'out.world = (draw_info.world_from_local * vec4<f32>(position, 1.0)).xyz;\n  out.normal = ' + (occluded ? 'mat3x3<f32>(draw_info.normal_from_local.x, draw_info.normal_from_local.y, draw_info.normal_from_local.z)' : 'draw_info.normal_from_local') + ' * normal;' : ''}
@@ -228,7 +238,7 @@ struct VertexOutput {
   ${mapSlots(coordinateMask).map(slot => `out.uv_${slot} = vec2<f32>(dot(draw_info.uv_x.xyz, vec3<f32>(uv_${slot}, 1.0)), dot(draw_info.uv_y.xyz, vec3<f32>(uv_${slot}, 1.0)));`).join('\n  ')}
   return out;
 }
-@fragment fn fragment_main(input: VertexOutput${lit ? ', @builtin(front_facing) front: bool' : ''})${depthOnly ? '' : ' -> @location(0) vec4<f32>'} {
+@fragment fn fragment_main(input: VertexOutput${lit ? ', @builtin(front_facing) front: bool' : ''})${depthOnly ? '' : ' -> @location(0) vec4<f32>'} {${instanceStride ? '\n  draw_info = instance_draws[input.draw_index].info;' : ''}
   // Sample every map before discard or nonuniform lighting flow: implicit
   // derivatives must be evaluated in uniform control flow.
   ${samples}
@@ -389,9 +399,19 @@ function deformerShape(gpu) {
   if (gpu.disposed || gpu.failed) fail('ANIMATION_RENDER_GEOMETRY', 'GPU deformer is disposed or failed');
 }
 
+// A pipeline fixes layout, winding, culling, alpha blending and attachment state.
+// Per-instance shader parameters may differ; vertex/index/surface/texture inputs
+// may not. BLEND remains separate even when all those inputs happen to match.
+function compatibleInstance(a, b) {
+  const x = a.record, y = b.record;
+  return y.alphaMode !== 'BLEND' && a.pipeline === b.pipeline && a.first === b.first && a.count === b.count &&
+    a.vertexBuffer === b.vertexBuffer && x.indexBuffer === y.indexBuffer && x.indexFormat === y.indexFormat &&
+    x.surfaceBuffer === y.surfaceBuffer && x.textureGroup === y.textureGroup;
+}
+
 /** Create reusable unlit render pipelines; never initializes browser services. */
 export async function createGpuAnimationRenderer(device, {
-  format = 'rgba8unorm', depthFormat = 'depth24plus', sampleCount = 1, shadows = false, environment = false,
+  format = 'rgba8unorm', depthFormat = 'depth24plus', sampleCount = 1, shadows = false, environment = false, instancing = false,
   maxDraws = 1024, maxMeshes = 1024, maxBytes = 64 * 1024 * 1024, label = 'f3d-animation-draw',
 } = {}) {
   if (!device?.queue || !device.limits || typeof device.createRenderPipelineAsync !== 'function' ||
@@ -402,6 +422,7 @@ export async function createGpuAnimationRenderer(device, {
   if (format === null && depthFormat === null) fail('ANIMATION_RENDER_OPTIONS', 'Depth-only rendering requires a depth format');
   if (typeof shadows !== 'boolean' || (shadows && format === null)) fail('ANIMATION_RENDER_OPTIONS', 'Shadows require a color renderer');
   if (typeof environment !== 'boolean' || (environment && format === null)) fail('ANIMATION_RENDER_OPTIONS', 'Environment lighting requires a color renderer');
+  if (typeof instancing !== 'boolean') fail('ANIMATION_RENDER_OPTIONS', 'instancing must be boolean');
   integer(maxDraws, 1, 65536, 'draw capacity'); integer(maxMeshes, 1, 65536, 'mesh capacity');
   integer(maxBytes, 1, Number.MAX_SAFE_INTEGER, 'byte budget');
   const limits = device.limits;
@@ -417,9 +438,14 @@ export async function createGpuAnimationRenderer(device, {
   limit('maxUniformBuffersPerShaderStage', 1); limit('maxVertexBuffers', 1);
   limit('maxVertexAttributes', 1); limit('maxVertexBufferArrayStride', 40);
   if (arenaBytes > maxBytes) fail('ANIMATION_RENDER_LIMIT', 'Uniform arena exceeds byte budget');
+  if (instancing) {
+    limit('maxStorageBuffersPerShaderStage', 1); limit('maxStorageBufferBindingSize', arenaBytes);
+    limit('maxInterStageShaderVariables', 11);
+  }
   const staged = new Float32Array(arenaBytes / 4), commands = [];
   const records = new Set(), owned = new WeakMap(), buffers = new Map(), pipelines = new Map();
   let allocatedBytes = 0, pendingMeshes = 0, disposed = false, terminal = null, busy = false;
+  let drawCallCount = 0;
   let version = 0, drawCount = 0, completion = Promise.resolve(), uniformBuffer, bindGroup, uniformLayout, lightBuffer, lightLayout, lightGroup, lightingReady;
   const lightWords = new Float32Array(LIGHT_BYTES / 4), shadowWords = new Float32Array(SHADOW_UNIFORM_BYTES / 4);
   let shadowBuffer, shadowLayout, shadowGroup, shadowView, shadowSampler;
@@ -456,7 +482,7 @@ export async function createGpuAnimationRenderer(device, {
     const bindGroupLayouts = textured ? [uniformLayout, textureLayouts.get(mapMask)] : [uniformLayout];
     if (lit) bindGroupLayouts.push(environmentLit ? environmentLayouts.get(shadowed) : shadowed ? shadowLayout : lightLayout);
     const pipelineLayout = device.createPipelineLayout({label, bindGroupLayouts});
-    const module = device.createShaderModule({label, code: lit || attributes || format === null ? surfaceShader(mapMask, lit, attributes, derivative, coordinateMask, format === null, shadowed, environmentLit ? environmentReceiver.environmentLightingWgsl(textured ? 2 : 1) : '') : ANIMATION_RENDER_WGSL});
+    const module = device.createShaderModule({label, code: instancing || lit || attributes || format === null ? surfaceShader(mapMask, lit, attributes, derivative, coordinateMask, format === null, shadowed, environmentLit ? environmentReceiver.environmentLightingWgsl(textured ? 2 : 1) : '', instancing ? stride : 0) : ANIMATION_RENDER_WGSL});
     const vertexBuffers = [{arrayStride: 40, stepMode: 'vertex', attributes: [{shaderLocation: 0, offset: 0, format: 'float32x3'}]}];
     if (lit) vertexBuffers[0].attributes.push({shaderLocation: 1, offset: 12, format: 'float32x3'});
     if ((mapMask & 4) && !derivative) vertexBuffers[0].attributes.push({shaderLocation: 2, offset: 24, format: 'float32x4'});
@@ -532,10 +558,11 @@ export async function createGpuAnimationRenderer(device, {
       environmentWords = new Float32Array(environmentBytes / 4);
     }
     const initialized = scoped(device, () => {
-      uniformBuffer = remember(device.createBuffer({label, size: arenaBytes, usage: UNIFORM | COPY_DST}), arenaBytes);
+      uniformBuffer = remember(device.createBuffer({label, size: arenaBytes, usage: (instancing ? STORAGE : UNIFORM) | COPY_DST}), arenaBytes);
       uniformLayout = device.createBindGroupLayout({label, entries: [{binding: 0, visibility: VERTEX_STAGE | FRAGMENT_STAGE,
-        buffer: {type: 'uniform', hasDynamicOffset: true, minBindingSize: UNIFORM_BYTES}}]});
-      bindGroup = device.createBindGroup({label, layout: uniformLayout, entries: [{binding: 0, resource: {buffer: uniformBuffer, size: UNIFORM_BYTES}}]});
+        buffer: instancing ? {type: 'read-only-storage', minBindingSize: stride} :
+          {type: 'uniform', hasDynamicOffset: true, minBindingSize: UNIFORM_BYTES}}]});
+      bindGroup = device.createBindGroup({label, layout: uniformLayout, entries: [{binding: 0, resource: {buffer: uniformBuffer, size: instancing ? arenaBytes : UNIFORM_BYTES}}]});
       return compilePipelines('plain');
     });
     await Promise.race([Promise.all([initialized.value, initialized.errors]), lost]); live();
@@ -780,10 +807,11 @@ export async function createGpuAnimationRenderer(device, {
         const first = integer(input.first ?? 0, 0, record.extent, 'draw start');
         const count = integer(input.count ?? record.extent - first, 0, record.extent - first, 'draw count');
         const command = commands[i] ?? (commands[i] = {});
-        Object.assign(command, {record, first, count, pipeline: pipelines.get(`${lightingVariant(record.variant, Boolean(projected), Boolean(ambient))}/${record.alphaMode === 'BLEND'}:${record.doubleSided ? (record.lit && determinant < 0 ? 'none-cw' : 'none') : determinant < 0 ? 'cw' : 'ccw'}`)});
+        Object.assign(command, {record, first, count, vertexBuffer: instancing ? gpu.vertexBuffer : null, pipeline: pipelines.get(`${lightingVariant(record.variant, Boolean(projected), Boolean(ambient))}/${record.alphaMode === 'BLEND'}:${record.doubleSided ? (record.lit && determinant < 0 ? 'none-cw' : 'none') : determinant < 0 ? 'cw' : 'ccw'}`)});
         dependencies.add(gpu);
       }
       projected?.check(); ambient?.check();
+      let submittedDrawCalls = 0;
       const submitted = scoped(device, () => {
         if (usesLighting && projected && !ambient && (shadowView !== projected.snapshot.view || shadowSampler !== projected.snapshot.sampler)) {
           const {view, sampler} = projected.snapshot;
@@ -817,15 +845,22 @@ export async function createGpuAnimationRenderer(device, {
           ...(depthFormat ? {depthStencilAttachment: {view: depthView, depthLoadOp, depthStoreOp: 'store', depthClearValue: clearDepth}} : {})});
         if (viewport) pass.setViewport(...viewport);
         if (scissor) pass.setScissorRect(...scissor);
-        for (let i = 0; i < draws.length; i++) {
-          const {record, first, count, pipeline} = commands[i];
-          pass.setPipeline(pipeline); pass.setBindGroup(0, bindGroup, [i * stride]);
-          pass.setVertexBuffer(0, record.gpu.vertexBuffer);
+        for (let i = 0; i < draws.length;) {
+          const command = commands[i], {record, first, count, pipeline} = command;
+          // Never reorder. Only a consecutive run with identical native inputs
+          // shares a draw. Each instance retains its original packet at index i.
+          let instances = 1;
+          if (instancing && record.alphaMode !== 'BLEND') {
+            while (i + instances < draws.length && compatibleInstance(command, commands[i + instances])) instances++;
+          }
+          pass.setPipeline(pipeline); pass.setBindGroup(0, bindGroup, instancing ? [] : [i * stride]);
+          pass.setVertexBuffer(0, instancing ? command.vertexBuffer : record.gpu.vertexBuffer);
           if (record.surfaceBuffer) pass.setVertexBuffer(1, record.surfaceBuffer);
           if (record.textureGroup) pass.setBindGroup(1, record.textureGroup);
           if (record.lit) pass.setBindGroup(record.textureGroup ? 2 : 1, frameLightGroup);
-          if (record.indexBuffer) { pass.setIndexBuffer(record.indexBuffer, record.indexFormat); pass.drawIndexed(count, 1, first, 0, 0); }
-          else pass.draw(count, 1, first, 0);
+          if (record.indexBuffer) { pass.setIndexBuffer(record.indexBuffer, record.indexFormat); pass.drawIndexed(count, instances, first, 0, instancing ? i : 0); }
+          else pass.draw(count, instances, first, instancing ? i : 0);
+          submittedDrawCalls++; i += instances;
         }
         pass.end(); const command = encoder.finish();
         if (draws.length) device.queue.writeBuffer(uniformBuffer, 0, staged, 0, (draws.length - 1) * stride / 4 + UNIFORM_BYTES / 4);
@@ -844,13 +879,14 @@ export async function createGpuAnimationRenderer(device, {
         if (terminal) throw terminal;
       }, error => { terminal ??= error; throw terminal; });
       completion.catch(() => {});
-      version++; drawCount = draws.length; return renderer;
+      version++; drawCount = draws.length; drawCallCount = submittedDrawCalls; return renderer;
     } finally {
-      for (const command of commands) command.record = null;
+      for (const command of commands) { command.record = null; command.vertexBuffer = null; }
       busy = false;
     }
   }
-  const renderer = Object.freeze({format, depthFormat, sampleCount, shadows, environment, addMesh, render,
+  const renderer = Object.freeze({format, depthFormat, sampleCount, shadows, environment, instancing, addMesh, render,
+    get drawCallCount() { return drawCallCount; },
     get allocatedBytes() { return allocatedBytes; },
     get version() { return version; }, get drawCount() { return drawCount; }, get meshCount() { return records.size; },
     get disposed() { return disposed; }, get failed() { return terminal !== null; },
