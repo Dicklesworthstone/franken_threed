@@ -30,6 +30,13 @@
  * derivative frame. mapCoordinates supplies per-map UVs/local transforms; the
  * shared uvTransform applies afterwards. Lit scenes pass lighting to render(). Textures
  * stay caller-owned; material arrays/descriptors are snapshotted before awaits.
+ * rigidGeometry:true opts into shared immutable vertex storage for rigid nodes.
+ * Transform-only updates then issue no deformation dispatch. Skinned, morphed
+ * and dynamic-flat meshes retain the existing compute path; materials, draw
+ * order, culling and shadow registration remain per mesh. No draw batching.
+ * Shared GPU bytes count once in maxBytes. The pool retains the same number of
+ * CPU comparison bytes plus one bounded incoming snapshot; rigidGeometryStats
+ * reports unique buffers and mesh handles. Omission preserves the compute path.
  * renderer.environment:true receives a borrowed frame.environment:{map,...}.
  * Its extra 64-byte receiver uniform is reserved in the scene GPU budget;
  * environment textures remain caller-owned. See ANIMATION_ENVIRONMENT.md.
@@ -70,15 +77,18 @@ const fail = (code, message) => { throw new AnimationRenderError(code, message);
 const TEXTURE_FIELDS = ['baseColorTexture', 'metallicRoughnessTexture', 'normalTexture', 'emissiveTexture', 'occlusionTexture'];
 
 export async function createGpuAnimationScene(device, pose, drawables, {
-  shadow = null, sortObjects = true, frustumCulling = false, maxBoundsBytes = 16*1024*1024, maxBoundsComponents = 16777216, renderer: renderOptions = {}, deformer: deformOptions = {}, maxMeshes = 256, maxBytes = 256 * 1024 * 1024,
+  rigidGeometry = false, shadow = null, sortObjects = true, frustumCulling = false, maxBoundsBytes = 16*1024*1024, maxBoundsComponents = 16777216, renderer: renderOptions = {}, deformer: deformOptions = {}, maxMeshes = 256, maxBytes = 256 * 1024 * 1024,
 } = {}) {
   if (!Number.isSafeInteger(maxMeshes) || maxMeshes < 1 || maxMeshes > 4096 ||
       !Number.isSafeInteger(maxBytes) || maxBytes < 1 || !Array.isArray(drawables) ||
       !drawables.length || drawables.length > maxMeshes) fail('ANIMATION_SCENE_LIMIT', 'Invalid mesh count or GPU buffer budget');
+  if (typeof rigidGeometry !== 'boolean') fail('ANIMATION_SCENE_RIGID', 'rigidGeometry must be boolean');
   if (typeof sortObjects !== 'boolean') fail('ANIMATION_SCENE_SORT', 'sortObjects must be boolean');
   if (typeof frustumCulling !== 'boolean' || (frustumCulling && (!Number.isSafeInteger(maxBoundsBytes) || maxBoundsBytes < 1 || !Number.isSafeInteger(maxBoundsComponents) || maxBoundsComponents < 1))) fail('ANIMATION_SCENE_CULL', 'Invalid frustum culling options');
   const controller = createAnimationController(pose), initialVersion = pose.version;
-  const deformers = [], meshes = [], ordering = [];
+  const deformers = [], computeDeformers = [], meshes = [], ordering = [];
+  let rigidApi, rigidPool;
+  const deformationTotal = () => deformationBytes + (rigidPool?.bufferBytes ?? 0);
   let drawOrder, sceneShadows, shadowStats = null, cullingStats = null;
   let renderer, deformationBytes = 0, poseVersion = initialVersion, disposed = false, terminal = null, busy = false;
   let lightingAllocated = false, materialComponents = 0;
@@ -95,7 +105,7 @@ export async function createGpuAnimationScene(device, pose, drawables, {
     sceneShadows?.dispose(); drawOrder?.dispose();
     for (const mesh of meshes) mesh.dispose();
     for (const gpu of deformers) gpu.dispose();
-    renderer?.dispose(); controller.dispose(); deformationBytes = 0;
+    rigidPool?.dispose(); renderer?.dispose(); controller.dispose(); deformationBytes = 0;
   }
   function failGroup(error) { terminal ??= error; release(); throw terminal; }
   function live() {
@@ -172,6 +182,7 @@ export async function createGpuAnimationScene(device, pose, drawables, {
       sceneShadows = prepareAnimationSceneShadows(pose, inputs, shadowOptions);
       unchanged();
     }
+    if (rigidGeometry) { rigidApi = await import('./animation_rigid_geometry.mjs'); unchanged(); }
     renderer = await createGpuAnimationRenderer(device, {...renderOptions, maxDraws: renderOptions.maxDraws ?? drawables.length,
       maxMeshes: renderOptions.maxMeshes ?? maxMeshes, maxBytes: Math.min(maxBytes, renderOptions.maxBytes ?? maxBytes)});
     unchanged();
@@ -184,14 +195,22 @@ export async function createGpuAnimationScene(device, pose, drawables, {
       const lit = material.shading === 'lambert' || material.shading === 'metallic-roughness';
       const surfaceStride = 24 + Object.keys(material.mapCoordinates ?? {}).length * 8;
       const reserve = (material.indices?.length ?? 0) * 4 + (surface ? vertices * surfaceStride : 0) + (lit && !lightingAllocated ? 544 + (renderOptions.shadows ? 96 : 0) + (renderOptions.environment ? 64 : 0) : 0);
-      const remaining = maxBytes - renderer.allocatedBytes - deformationBytes - reserve;
-      if (remaining < 1) fail('ANIMATION_SCENE_LIMIT', 'Scene GPU buffer budget exhausted');
-      const gpu = await createGpuAnimationDeformer(device, pose, geometry, {...deformOptions,
-        maxBytes: Math.min(remaining, deformOptions.maxBytes ?? 128 * 1024 * 1024)});
-      deformers.push(gpu); deformationBytes += gpu.bufferBytes; unchanged();
+      const remaining = maxBytes - renderer.allocatedBytes - deformationTotal() - reserve;
+      let gpu;
+      if (rigidApi?.canUseRigidAnimationGeometry(pose, geometry)) {
+        if (remaining < 0) fail('ANIMATION_SCENE_LIMIT', 'Scene GPU buffer budget exhausted');
+        rigidPool ??= rigidApi.createGpuRigidGeometryPool(device, pose, {...deformOptions, maxBytes, maxMeshes});
+        gpu = await rigidPool.addMesh(geometry, {maxAdditionalBytes: Math.min(remaining, deformOptions.maxBytes ?? 128 * 1024 * 1024)});
+      } else {
+        if (remaining < 1) fail('ANIMATION_SCENE_LIMIT', 'Scene GPU buffer budget exhausted');
+        gpu = await createGpuAnimationDeformer(device, pose, geometry, {...deformOptions,
+          maxBytes: Math.min(remaining, deformOptions.maxBytes ?? 128 * 1024 * 1024)});
+        computeDeformers.push(gpu); deformationBytes += gpu.bufferBytes;
+      }
+      deformers.push(gpu); unchanged();
       meshes.push(await renderer.addMesh(gpu, material)); lightingAllocated ||= lit; unchanged();
       ordering.push({mesh: meshes.at(-1), deformer: gpu, alphaMode: material.alphaMode, ...(frustumCulling ? {geometry} : {})});
-      if (renderer.allocatedBytes + deformationBytes > maxBytes) fail('ANIMATION_SCENE_LIMIT', 'Scene GPU buffer budget exceeded');
+      if (renderer.allocatedBytes + deformationTotal() > maxBytes) fail('ANIMATION_SCENE_LIMIT', 'Scene GPU buffer budget exceeded');
     }
     if (sortObjects || frustumCulling) drawOrder = createAnimationDrawOrder(ordering, {pose, sortObjects, frustumCulling, maxBoundsBytes, maxBoundsComponents});
     if (sceneShadows) { await sceneShadows.initialize(device, deformers); unchanged(); }
@@ -220,14 +239,15 @@ export async function createGpuAnimationScene(device, pose, drawables, {
   }
   const scene = Object.freeze({pose, controller, draws: Object.freeze(meshes), deformers: Object.freeze(deformers),
     get poseVersion() { return poseVersion; },
-    get bufferBytes() { return renderer.allocatedBytes + deformationBytes; },
+    get bufferBytes() { return renderer.allocatedBytes + deformationTotal(); },
+    get rigidGeometryStats() { return Object.freeze({meshes: rigidPool?.meshCount ?? 0, uniqueGeometries: rigidPool?.uniqueGeometries ?? 0, bufferBytes: rigidPool?.bufferBytes ?? 0, computeMeshes: computeDeformers.length}); },
     get boundsBytes() { return drawOrder?.boundsBytes ?? 0; },
     get cullingStats() { return cullingStats; },
     get shadowEnabled() { return sceneShadows !== undefined; },
     get shadowBytes() { return sceneShadows?.allocatedBytes ?? 0; },
     get shadowBoundsBytes() { return sceneShadows?.boundsBytes ?? 0; },
     get shadowStats() { return shadowStats; },
-    get disposed() { return disposed; }, get failed() { return terminal !== null || renderer.failed || !!sceneShadows?.failed || deformers.some(gpu => gpu.failed); },
+    get disposed() { return disposed; }, get failed() { return terminal !== null || renderer.failed || !!rigidPool?.failed || !!sceneShadows?.failed || deformers.some(gpu => gpu.failed); },
     update(delta, options) { return exclusive(() => { controller.update(delta, options); return upload(); }); },
     upload() { return exclusive(upload); },
     render(frame) { return exclusive(() => {
@@ -255,7 +275,7 @@ export async function createGpuAnimationScene(device, pose, drawables, {
     }); },
     async whenIdle() {
       live();
-      try { await Promise.all([renderer.whenIdle(), sceneShadows?.whenIdle(), ...deformers.map(gpu => gpu.whenIdle())]); }
+      try { await Promise.all([renderer.whenIdle(), sceneShadows?.whenIdle(), rigidPool?.whenIdle(), ...computeDeformers.map(gpu => gpu.whenIdle())]); }
       catch (error) { failGroup(error); }
       live(); return scene;
     },

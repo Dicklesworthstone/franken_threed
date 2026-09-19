@@ -14,6 +14,8 @@
  * reference, not its buffer (bufferBytes=0; sharedBufferBytes reports its size).
  * Dispose the last handle or the pool to retire the allocation. Do not write to
  * borrowed vertex buffers. Pose/device/materials and submitted draws are not owned.
+ * Handle whenIdle drains pool initialization; pool.whenIdle also waits the queue.
+ * The material renderer owns draw completion, not each shared geometry handle.
  */
 export class AnimationRigidError extends Error {
   constructor(code, message) { super(`${code}: ${message}`); this.name='AnimationRigidError'; this.code=code; }
@@ -137,7 +139,7 @@ export function createGpuRigidGeometryPool(device,pose,{
         live();if(released)fail('DISPOSED','Rigid mesh was disposed');if(updating)fail('REENTRANT','Rigid mesh update cannot be reentered');
         updating=true;try{fixed(worldMatrix,16,'mesh transform');const next=world(node,scratch);worldMatrix.set(scratch);poseVersion=next;version++;return handle;}finally{updating=false;}
       },
-      async whenIdle(){live();if(released)fail('DISPOSED','Rigid mesh was disposed');await result.whenIdle();return handle;},
+      async whenIdle(){live();if(released)fail('DISPOSED','Rigid mesh was disposed');await Promise.race([pending,stopped]);live();if(released)fail('DISPOSED','Rigid mesh was disposed');return handle;},
       dispose(){if(updating)fail('REENTRANT','Cannot dispose while updating');if(!released){released=true;handles.delete(handle);if(--entry.refs===0)retire(entry);}},
     });
     entry.refs++;handles.add(handle);return handle;

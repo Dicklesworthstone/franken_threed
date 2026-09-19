@@ -55,6 +55,9 @@ function decodeDataUri(uri) {
 }
 
 /**
+ * rigidGeometry:true with webgpu:true includes the optional immutable-geometry
+ * pool. Also enable rigidGeometry:true when constructing a scene at runtime.
+ * Disabled packages do not include the pool; no GPU services run at import.
  * Output: animation.mjs (sampler), playback.mjs (sampler/controller/deformer),
  * their runtime modules, animation.json and manifest.json.
  * With {webgpu:true}, also emit GPU deformation, unlit drawing and scene playback.
@@ -96,7 +99,8 @@ function decodeDataUri(uri) {
  * // Device, pose, decoded geometry and render attachments are caller-supplied.
  * // Unlit colors/alpha only: this is not a full glTF model/material renderer.
  */
-export function buildAnimation(entryPath,outDir,{rootDir=path.dirname(path.resolve(entryPath)),maxBytes=64*1024*1024,maxComponents=16777216,maxInstances=4096,webgpu=false,environment=false,hdr=false}={}) {
+export function buildAnimation(entryPath,outDir,{rootDir=path.dirname(path.resolve(entryPath)),maxBytes=64*1024*1024,maxComponents=16777216,maxInstances=4096,webgpu=false,environment=false,hdr=false,rigidGeometry=false}={}) {
+  if(typeof rigidGeometry!=='boolean'||(rigidGeometry&&!webgpu))throw new TypeError('rigidGeometry must be boolean and requires webgpu:true');
   if(typeof webgpu!=='boolean')throw new TypeError('webgpu must be boolean');
   if(typeof environment!=='boolean'||(environment&&!webgpu))throw new TypeError('environment must be boolean and requires webgpu:true');
   if(typeof hdr!=='boolean'||(hdr&&!environment))throw new TypeError('hdr must be boolean and requires environment:true');
@@ -166,6 +170,11 @@ export {createGpuAnimationShadowMap} from './animation_shadow.mjs';
 export {fitAnimationShadowView,animationShadowWorldBounds} from './animation_shadow_view.mjs';
 `);
   }
+  if(rigidGeometry) {
+    outputs.set('animation_rigid_geometry.mjs',fs.readFileSync(new URL('./animation_rigid_geometry.mjs',import.meta.url),'utf8'));
+    outputs.set('gpu_playback.mjs',outputs.get('gpu_playback.mjs')+
+      "export {createGpuRigidGeometryPool,canUseRigidAnimationGeometry} from './animation_rigid_geometry.mjs';\n");
+  }
   if(environment) {
     for(const name of ['animation_environment.mjs','animation_environment_receiver.mjs']) {
       outputs.set(name,fs.readFileSync(new URL('./'+name,import.meta.url),'utf8'));
@@ -183,6 +192,7 @@ export {fitAnimationShadowView,animationShadowWorldBounds} from './animation_sha
   }
   const manifest={format:'f3d-animation-package-v1',entry:'animation.mjs',playbackEntry:'playback.mjs',profile:'core-gltf-animation-pose',
     ...(webgpu?{gpuEntry:'gpu_playback.mjs',gpuExecution:'webgpu-compute-f32',gpuRendering:'explicit-unlit-triangle-list; caller-owned geometry, materials and attachments'}:{}),
+    ...(rigidGeometry?{gpuRigidGeometry:'shared-immutable-f32-vertices; opt-in scene rigidGeometry:true'}:{}),
     ...(environment?{gpuEnvironment:'f3d-animation-environment-v1'}:{}),
     source:{file:path.basename(entry),sha256:hash(source)},dependencies:[...dependencies.values()],
     nodeCount:validated.nodeCount,clips:validated.clips,instances:validated.instances,morphWeightCount:validated.morphWeights.length,

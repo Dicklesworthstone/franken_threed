@@ -131,3 +131,10 @@ test('registration is sequential and synchronous input getters cannot dispose th
   const g=geometry();Object.defineProperty(g,'positions',{get(){pool.dispose();return new Float32Array(9);}});
   await assert.rejects(pool.addMesh(g),code('REENTRANT'));assert.equal(pool.disposed,false);pool.dispose();
 });
+
+ test('shared handle completion does not request a queue fence per rendered instance',async()=>{
+  const g=device(),p=pose(),pool=createGpuRigidGeometryPool(g.d,p);let drains=0;g.completion(async()=>{drains++;});
+  const a=await pool.addMesh(geometry()),b=await pool.addMesh(geometry(1));
+  await Promise.all([a.whenIdle(),b.whenIdle()]);assert.equal(drains,0);
+  await pool.whenIdle();assert.equal(drains,1);pool.dispose();
+});
