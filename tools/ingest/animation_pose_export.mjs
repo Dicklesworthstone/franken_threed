@@ -9,6 +9,7 @@
  * The result is one STATIC posed mesh scene, not an editable rig/animation export.
  * It has no skins, morph targets or clips, so loading cannot deform it twice.
  */
+import {inspectGltfKtx2} from './gltf_ktx2.mjs';
 export class AnimationExportError extends Error {
   constructor(code, message) { super(`${code}: ${message}`); this.name = 'AnimationExportError'; this.code = code; }
 }
@@ -49,10 +50,13 @@ function unit(x, y, z, label) {
 }
 function checkAbort(signal) { if (signal?.aborted) throw signal.reason ?? new DOMException('Aborted', 'AbortError'); }
 
-/** resolveTexture({view,sampler}, {signal}) may be async and must return
- * {bytes: Uint8Array, mimeType:'image/png'|'image/jpeg', sampler?: glTFSampler}.
+/** resolveTexture({view,sampler}, {signal,colorSpaces}) may be async and must return
+ * {bytes: Uint8Array, mimeType:'image/png'|'image/jpeg'|'image/ktx2', sampler?: glTFSampler}.
  * It supplies ENCODED image bytes, never pixels, URLs or GPU handles in the GLB.
  * Images are preserved, not re-encoded; the provider owns native resources.
+ * KTX2 uses required KHR_texture_basisu, with no fabricated PNG fallback. Its
+ * encoded transfer/primaries must match every material use in colorSpaces.
+ * Image validation reads headers only, never invokes a transcoder or GPU.
  * A captured export may finish after the model advances/disposes. signal cancels
  * the export, not the model. maxBytes limits the final file and binary staging;
  * it is not a total process-memory or decoder-allocation limit.
@@ -73,7 +77,7 @@ export async function exportAnimationPoseGLB(pose, entries, options = {}) {
     if (typeof options.copyright !== 'string' || options.copyright.length > maxBytes / 4) fail('LIMIT', 'Invalid or excessive copyright text');
     json.asset.copyright = options.copyright;
   }
-  const chunks = [], textures = [], textureKeys = new Map();
+  const chunks = [], textures = [], textureUses = [], textureKeys = new Map();
   let byteLength = 0, vertices = 0;
   function reserve(bytes) {
     if (!Number.isSafeInteger(bytes) || bytes < 1 || aligned(byteLength) + aligned(bytes) + 28 > maxBytes) fail('LIMIT', 'Binary data exceeds GLB byte budget');
@@ -99,15 +103,19 @@ export async function exportAnimationPoseGLB(pose, entries, options = {}) {
     return json.accessors.push({bufferView: append(bytes, 34962), componentType: 5126,
       count, type: 'VEC' + width, ...(bounds ? {min, max} : {})}) - 1;
   }
-  function textureInfo(descriptor) {
+  function textureInfo(descriptor, field) {
     fields(descriptor, ['view', 'sampler'], 'borrowed texture');
     const {view, sampler} = descriptor;
     if (!view || typeof view !== 'object' || !sampler || typeof sampler !== 'object') fail('TEXTURE', 'Texture needs a borrowed view and sampler');
     if (!resolveTexture) fail('TEXTURE', 'Textured exports require encoded image resolution');
     if (!textureKeys.has(view)) textureKeys.set(view, new Map());
     const keys = textureKeys.get(view);
-    if (!keys.has(sampler)) { keys.set(sampler, textures.length); textures.push(Object.freeze({view, sampler})); }
-    return {index: keys.get(sampler)};
+    if (!keys.has(sampler)) {
+      keys.set(sampler, textures.length); textures.push(Object.freeze({view, sampler})); textureUses.push(new Set());
+    }
+    const index = keys.get(sampler);
+    textureUses[index].add(field === 'baseColorTexture' || field === 'emissiveTexture' ? 'srgb' : 'linear');
+    return {index};
   }
   // No awaits in this loop: frame data and all material/UV arrays are copied
   // before calling even the first user-supplied image resolver.
@@ -192,7 +200,7 @@ export async function exportAnimationPoseGLB(pose, entries, options = {}) {
     const shared = vector(material.uvTransform ?? IDENTITY_UV, 6, 'shared UV transform');
     let channel = 0;
     for (const field of MAPS) if (material[field] != null) {
-      const info = textureInfo(material[field]), override = overrides[field] ?? {};
+      const info = textureInfo(material[field], field), override = overrides[field] ?? {};
       fields(override, ['texCoords', 'uvTransform'], 'map coordinate');
       const values = array(override.texCoords === undefined ? material.texCoords : override.texCoords, count*2, 'texture coordinates');
       const local = vector(override.uvTransform ?? IDENTITY_UV, 6, 'local UV transform');
@@ -218,9 +226,10 @@ export async function exportAnimationPoseGLB(pose, entries, options = {}) {
   if (textures.length) {
     json.textures = []; json.images = []; json.samplers = [];
     const images = new Map(), samplers = new Map();
-    for (const descriptor of textures) {
+    for (const [textureIndex, descriptor] of textures.entries()) {
       checkAbort(signal);
-      const pending = resolveTexture(descriptor, {signal});
+      const colorSpaces = Object.freeze([...textureUses[textureIndex]]);
+      const pending = resolveTexture(descriptor, {signal, colorSpaces});
       // A caller's resolver may ignore cancellation. Reject the export promptly
       // while still observing late rejection; no native resource is owned here.
       const result = signal ? await new Promise((resolve, reject) => {
@@ -233,11 +242,26 @@ export async function exportAnimationPoseGLB(pose, entries, options = {}) {
       checkAbort(signal);
       fields(result, ['bytes', 'mimeType', 'sampler'], 'encoded texture');
       const {bytes, mimeType, sampler = {}} = result;
-      if (!(bytes instanceof Uint8Array) || !['image/png', 'image/jpeg'].includes(mimeType)) fail('TEXTURE', 'Supply encoded core PNG/JPEG bytes');
+      if (!(bytes instanceof Uint8Array) || !['image/png', 'image/jpeg', 'image/ktx2'].includes(mimeType)) fail('TEXTURE', 'Supply encoded PNG/JPEG or BasisU KTX2 bytes');
       array(bytes, bytes.length, 'image bytes');
       const png = bytes.length >= 8 && [137,80,78,71,13,10,26,10].every((v,i) => bytes[i] === v);
       const jpeg = bytes.length >= 3 && bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255;
       if ((mimeType === 'image/png' && !png) || (mimeType === 'image/jpeg' && !jpeg)) fail('TEXTURE', 'MIME type disagrees with encoded image');
+      if (mimeType === 'image/ktx2') {
+        // No image decode takes place during export. Reuse the container checks,
+        // allowing dimensions beyond the runtime uploader's default pixel limit.
+        // The GLB staging/file byte budget still applies before making a copy.
+        if (bytes.length > maxBytes) fail('LIMIT', 'Encoded image exceeds GLB byte budget');
+        const header = inspectGltfKtx2(bytes, {maxBytes, maxImagePixels: 0xffffffff, maxDimension: 0xffffffff});
+        const dfd = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(48, true);
+        const primaries = bytes[dfd + 13];
+        if (colorSpaces.some(space => space !== header.colorSpace) || primaries !== (header.colorSpace === 'srgb' ? 1 : 0)) {
+          fail('TEXTURE', 'KTX2 color metadata disagrees with a material use');
+        }
+        for (const key of ['extensionsUsed', 'extensionsRequired']) {
+          json[key] ??= []; if (!json[key].includes('KHR_texture_basisu')) json[key].push('KHR_texture_basisu');
+        }
+      }
       fields(sampler, ['wrapS', 'wrapT', 'magFilter', 'minFilter'], 'sampler');
       const s = {wrapS: sampler.wrapS ?? 10497, wrapT: sampler.wrapT ?? 10497};
       if (![33071,33648,10497].includes(s.wrapS) || ![33071,33648,10497].includes(s.wrapT)) fail('TEXTURE', 'Invalid wrapping');
@@ -246,8 +270,19 @@ export async function exportAnimationPoseGLB(pose, entries, options = {}) {
       }
       const key = JSON.stringify(s);
       if (!samplers.has(key)) { samplers.set(key, json.samplers.length); json.samplers.push(s); }
-      if (!images.has(bytes)) { reserve(bytes.length); images.set(bytes, json.images.length); json.images.push({bufferView: append(bytes.slice()), mimeType}); }
-      json.textures.push({source: images.get(bytes), sampler: samplers.get(key)});
+      // A resolver may reuse an encoded arena for several images. Identity alone
+      // cannot deduplicate mutable bytes: preserve each distinct observed value.
+      if (!images.has(bytes)) images.set(bytes, []);
+      const versions = images.get(bytes);
+      let image = versions.find(item => item.mimeType === mimeType && item.bytes.length === bytes.length &&
+        item.bytes.every((value, i) => value === bytes[i]));
+      if (!image) {
+        reserve(bytes.length); const snapshot = bytes.slice();
+        image = {index: json.images.length, mimeType, bytes: snapshot}; versions.push(image);
+        json.images.push({bufferView: append(snapshot), mimeType});
+      }
+      json.textures.push({sampler: samplers.get(key), ...(mimeType === 'image/ktx2' ?
+        {extensions: {KHR_texture_basisu: {source: image.index}}} : {source: image.index})});
     }
   }
   checkAbort(signal); json.buffers = [{byteLength}];
