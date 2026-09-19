@@ -10,9 +10,11 @@ import {fileURLToPath} from 'node:url';
 // The normal test command needs no VM flag; direct flagged runs show each case.
 if (!process.execArgv.includes('--experimental-vm-modules')) {
   test('BasisU model source-selection regressions',()=>{
-    const out=execFileSync(process.execPath,['--experimental-vm-modules','--test',fileURLToPath(import.meta.url)],
-      {encoding:'utf8',timeout:15000,stdio:['ignore','pipe','pipe']});
-    assert.match(out,/# fail 0/);
+    // Do not inherit the parent runner's private IPC/reporting context.
+    const env={...process.env};delete env.NODE_TEST_CONTEXT;
+    const out=execFileSync(process.execPath,['--experimental-vm-modules','--test','--test-reporter=tap',fileURLToPath(import.meta.url)],
+      {env,encoding:'utf8',timeout:15000,stdio:['ignore','pipe','pipe']});
+    assert.match(out,/# fail 0/);assert.match(out,/# pass [1-9]\d*/);
   });
 } else {
   const vm=await import('node:vm');

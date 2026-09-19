@@ -82,9 +82,18 @@ export async function createGltfTextureResources(device,requests,readImage,{
   if(!Array.isArray(requests)||requests.length>maxTextures||typeof readImage!=='function')fail('REQUEST','Invalid texture requests or image provider');
   if(![9728,9729].includes(defaultMagFilter)||!filters.has(defaultMinFilter))fail('SAMPLER','Invalid default filters');
   // Snapshot and validate every request before fetching or allocating anything.
-  const entries=new Map(),images=new Map();
+  const entries=new Map(),images=new Map(),expectedMimeTypes=new Map();
   for(const request of requests) {
     const textureIndex=index(request?.textureIndex,'texture index'),imageIndex=index(request?.imageIndex,'image index');
+    // Selected extension sources are contracts, not content-type hints. Merge
+    // every use before deduplication/I/O so an unspecified use cannot erase a
+    // later explicit requirement, or disguise a PNG as a BasisU source.
+    const mimeType=request.image?.mimeType;
+    if(mimeType!==undefined) {
+      if(!['image/png','image/jpeg','image/ktx2'].includes(mimeType))fail('REQUEST','Unsupported requested image MIME type');
+      if(expectedMimeTypes.has(imageIndex)&&expectedMimeTypes.get(imageIndex)!==mimeType)fail('REQUEST','Conflicting image MIME requirements');
+      expectedMimeTypes.set(imageIndex,mimeType);
+    }
     const colorSpace=request.colorSpace;
     if(colorSpace!=='srgb'&&colorSpace!=='linear')fail('REQUEST','Invalid texture color space');
     const input=request.sampler ?? {},mag=input.magFilter ?? defaultMagFilter,min=input.minFilter ?? defaultMinFilter;
@@ -181,6 +190,7 @@ export async function createGltfTextureResources(device,requests,readImage,{
   try {
     for(const [imageIndex,groups]of images) {
       live();const image=await readImage(imageIndex);live();
+      if(expectedMimeTypes.has(imageIndex)&&image?.mimeType!==expectedMimeTypes.get(imageIndex))fail('IMAGE','Loaded image MIME type disagrees with the selected texture route');
       if(image?.mimeType==='image/ktx2') {await uploadKtx2(image,imageIndex,groups);continue;}
       if(typeof decodeImage!=='function'||typeof device.queue.copyExternalImageToTexture!=='function')fail('DEVICE','PNG/JPEG uploads require ImageBitmap and external image copy');
       const {width,height}=gltfImageDimensions(image?.bytes,image?.mimeType);

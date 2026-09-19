@@ -1,4 +1,4 @@
-/** Runtime glTF/GLB bytes, meshopt/Draco geometry and lazy core image loading. No Node, DOM or
+/** Runtime glTF/GLB bytes, meshopt/Draco geometry and lazy PNG/JPEG/KTX2 image loading. No Node, DOM or
  * GPU dependency and no work at import time. All I/O uses the supplied Fetch API.
  * The byte budget counts unique encoded resources, not decoded meshes/images.
  * Parsed data is owned by the caller; do not mutate it during model construction.
@@ -79,7 +79,10 @@ function dataUri(uri,limit) {
 function imageType(data) {
   if(data.length>=8&&[137,80,78,71,13,10,26,10].every((v,i)=>data[i]===v))return 'image/png';
   if(data.length>=3&&data[0]===255&&data[1]===216&&data[2]===255)return 'image/jpeg';
-  fail('IMAGE','Only core PNG/JPEG images are supported');
+  // Type detection only: the texture stage validates the KTX2 container/profile
+  // and its bounded transcode output. Keep the encoded bytes for export/cache.
+  if(data.length>=12&&[171,75,84,88,32,50,48,187,13,10,26,10].every((v,i)=>data[i]===v))return 'image/ktx2';
+  fail('IMAGE','Only PNG/JPEG/KTX2 images are supported');
 }
 
 /** source: absolute/relative HTTP(S) URL (relative needs baseURL), or complete
@@ -227,7 +230,7 @@ export async function loadGltfAsset(source,{
         data=buffer.subarray(offset,offset+length);
       }
       abort(signal);const mimeType=imageType(data);
-      if(declared!==undefined&&declared!==mimeType)fail('IMAGE','Image MIME type disagrees with core image bytes');
+      if(declared!==undefined&&declared!==mimeType)fail('IMAGE','Image MIME type disagrees with image bytes');
       return Object.freeze({bytes:data,mimeType});
     }));
     return imageCache.get(index);

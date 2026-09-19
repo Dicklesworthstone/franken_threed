@@ -16,17 +16,28 @@ const abort=signal=>{if(signal?.aborted)throw signal.reason ?? new DOMException(
  * disposed before rejection. A returned scene is owned until explicit dispose().
  * The device is never destroyed. Custom borrowed textures use the original
  * createGpuGltfAnimationScene API, not this owning loader.
+ * textures.ktx2Loader lends a configured retained loader and enables BasisU
+ * source selection. decode.basisu:false explicitly chooses optional core
+ * fallbacks; required BasisU still fails. A selected transcode failure never
+ * retries another source. The loader/device and retained worker pool are borrowed.
  */
 export async function loadGpuGltfAnimationScene(device,source,{
   assets={},decode={},textures={},scene={},picking=false,exporting=false,signal=assets.signal ?? textures.signal,
 }={}) {
   if(decode.resolveTexture!=null)throw new GltfAssetError('GLTF_MODEL_LOAD_OPTIONS','The owning loader supplies resolveTexture');
   for(const nested of [assets.signal,textures.signal])if(nested!==undefined&&nested!==signal)throw new GltfAssetError('GLTF_MODEL_LOAD_OPTIONS','Use one construction AbortSignal');
+  // Freeze the route choice and stage settings before the first I/O await.
+  // A caller editing its options while fetching cannot select one image and
+  // accidentally supply another decoder policy when uploads begin.
+  const decodeOptions={...decode},textureOptions={...textures,signal};
+  const basisu=decodeOptions.basisu===undefined ? textureOptions.ktx2Loader!=null : decodeOptions.basisu;
+  if(typeof basisu!=='boolean'||(basisu&&typeof textureOptions.ktx2Loader?.parse!=='function'))
+    throw new GltfAssetError('GLTF_MODEL_LOAD_OPTIONS','BasisU selection requires a configured textures.ktx2Loader; decode.basisu must be boolean');
+  decodeOptions.basisu=basisu;
   abort(signal);
   const asset=await loadGltfAsset(source,{...assets,signal});abort(signal);
-  const prepared=prepareGltfAnimationModel(asset.json,asset.buffers,decode);
+  const prepared=prepareGltfAnimationModel(asset.json,asset.buffers,decodeOptions);
   let resources,model,exportSources=[];
-  const textureOptions={...textures,signal};
   try {
     resources=await createGltfTextureResources(device,prepared.textureRequests,asset.readImage,textureOptions);
     abort(signal);
