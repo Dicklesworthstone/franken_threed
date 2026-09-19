@@ -119,6 +119,34 @@ of the same texture. GPU completion errors join the renderer/scene's existing
 cumulative failure path. Scene cleanup does not dispose borrowed environments,
 devices or the direct scene API's borrowed pose.
 
+## Relocatable generated players
+
+Opt into IBL when calling the existing package builder:
+
+```js
+const built = buildAnimation(modelPath, outputDirectory, {
+  webgpu: true,
+  environment: true,
+});
+```
+
+The generated `gpu_playback.mjs` then also exports
+`createGpuAnimationEnvironment`; the filter and lazily imported receiver are
+copied into the package and charged to the exact pre-write output-byte budget.
+The manifest records `gpuEnvironment: 'f3d-animation-environment-v1'`. Importing
+the package still creates no GPU resources: application code prepares a map and
+enables `renderer.environment` explicitly, as in the examples above. The source
+HDR texture, geometry, device and render attachments remain caller-supplied.
+
+`environment: true` requires `webgpu: true`. It is a build API option, not an
+implicit addition to the default GPU package. Omitting it leaves both the
+CPU-only and ordinary GPU emission paths unchanged by this package feature.
+This keeps applications that do not use IBL from acquiring its modules. The
+relocation test runs preparation, animated scene submission and disposal using
+only the emitted environment/material modules, with the original toolkit path
+unavailable. Unrelated decoder/pose/deformer/shadow boundaries in that test are
+explicit substitutes; this is not an end-to-end binary asset or native GPU test.
+
 ## Focused validation
 
 ```sh
@@ -126,7 +154,7 @@ node --test tools/ingest/animation_environment_receiver.test.mjs \
   tools/ingest/animation_environment_render.test.mjs
 ```
 
-These 21 host tests run production preparation ownership, receiver packing,
+These 24 host tests run production preparation ownership, receiver packing,
 material pipelines and scene submission against recording WebGPU interfaces.
 Scene tests substitute only unrelated controller/deformer/ordering boundaries.
 They establish binding, budget, lifecycle and command behavior, not execution of

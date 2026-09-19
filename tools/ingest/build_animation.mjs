@@ -57,7 +57,9 @@ function decodeDataUri(uri) {
  * Output: animation.mjs (sampler), playback.mjs (sampler/controller/deformer),
  * their runtime modules, animation.json and manifest.json.
  * With {webgpu:true}, also emit GPU deformation, unlit drawing and scene playback.
- * The default CPU output and import graph remain unchanged.
+ * Add environment:true with webgpu:true to emit the optional IBL filter/receiver
+ * and export createGpuAnimationEnvironment. The default CPU output and import
+ * graph remain unchanged; ordinary GPU packages do not acquire IBL dependencies.
  * import { createPlayer } from './animation.mjs'; const p=createPlayer();
  * p.sample(time, {clip:0, loop:true}); // p.worldMatrices / p.jointMatrices / p.morphWeights
  * All decoded tracks are embedded; importing the package makes no fetches and
@@ -85,8 +87,9 @@ function decodeDataUri(uri) {
  * // Device, pose, decoded geometry and render attachments are caller-supplied.
  * // Unlit colors/alpha only: this is not a full glTF model/material renderer.
  */
-export function buildAnimation(entryPath,outDir,{rootDir=path.dirname(path.resolve(entryPath)),maxBytes=64*1024*1024,maxComponents=16777216,webgpu=false}={}) {
+export function buildAnimation(entryPath,outDir,{rootDir=path.dirname(path.resolve(entryPath)),maxBytes=64*1024*1024,maxComponents=16777216,webgpu=false,environment=false}={}) {
   if(typeof webgpu!=='boolean')throw new TypeError('webgpu must be boolean');
+  if(typeof environment!=='boolean'||(environment&&!webgpu))throw new TypeError('environment must be boolean and requires webgpu:true');
   if(!Number.isSafeInteger(maxBytes)||maxBytes<1)throw new RangeError('maxBytes must be positive');
   const entry=path.resolve(entryPath),destination=path.resolve(outDir),root=fs.realpathSync(rootDir);
   try{fs.lstatSync(destination);fail('ANIMATION_OUTPUT_EXISTS','Destination must be a fresh directory');}catch(error){if(error.code!=='ENOENT')throw error;}
@@ -134,8 +137,16 @@ export function buildAnimation(entryPath,outDir,{rootDir=path.dirname(path.resol
     }
     outputs.set('gpu_playback.mjs',`export {createPlayer,createAnimationController,createAnimationDeformer} from './playback.mjs';\nexport {createGpuAnimationDeformer} from './animation_webgpu.mjs';\nexport {createGpuAnimationRenderer} from './animation_render.mjs';\nexport {createGpuAnimationScene} from './animation_scene.mjs';\nexport {createGpuAnimationShadowMap} from './animation_shadow.mjs';\nexport {fitAnimationShadowView,animationShadowWorldBounds} from './animation_shadow_view.mjs';\n`);
   }
+  if(environment) {
+    for(const name of ['animation_environment.mjs','animation_environment_receiver.mjs']) {
+      outputs.set(name,fs.readFileSync(new URL('./'+name,import.meta.url),'utf8'));
+    }
+    outputs.set('gpu_playback.mjs',outputs.get('gpu_playback.mjs')+
+      "export {createGpuAnimationEnvironment} from './animation_environment.mjs';\n");
+  }
   const manifest={format:'f3d-animation-package-v1',entry:'animation.mjs',playbackEntry:'playback.mjs',profile:'core-gltf-animation-pose',
     ...(webgpu?{gpuEntry:'gpu_playback.mjs',gpuExecution:'webgpu-compute-f32',gpuRendering:'explicit-unlit-triangle-list; caller-owned geometry, materials and attachments'}:{}),
+    ...(environment?{gpuEnvironment:'f3d-animation-environment-v1'}:{}),
     source:{file:path.basename(entry),sha256:hash(source)},dependencies:[...dependencies.values()],
     nodeCount:validated.nodeCount,clips:validated.clips,instances:validated.instances,morphWeightCount:validated.morphWeights.length,
     ignoredChannels:definition.ignoredChannels,execution:'javascript-cpu-pose',accelerationClaim:false,

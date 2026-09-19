@@ -189,3 +189,52 @@ test('scene completion failure from a borrowed environment releases only scene-o
   s.render(input);await assert.rejects(s.whenIdle(),/environment completion/);assert.equal(s.failed,true);assert.ok(d.deformers.every(x=>x.disposed));
   assert.equal(map.disposed,false);assert.equal(pose.disposed,false);s.dispose();map.dispose();
 });
+
+async function packageFixture(){
+  const f=await sceneFixture();
+  for(const file of ['build_animation.mjs','animation_environment.mjs'])fs.copyFileSync(new URL('./'+file,import.meta.url),path.join(f.root,file));
+  fs.writeFileSync(path.join(f.root,'animation_gltf.mjs'),'export function decodeGltfAnimation(model){return model;}');
+  fs.writeFileSync(path.join(f.root,'animation_runtime.mjs'),`export class AnimationPoseError extends Error{constructor(code,message){super(message);this.code=code;}}
+export function createAnimationPlayer(def){return {nodeCount:def.nodes.length,clips:[],instances:[],morphWeights:[],version:0,disposed:false,dispose(){this.disposed=true;}};}`);
+  fs.writeFileSync(path.join(f.root,'animation_deformer.mjs'),'export function createAnimationDeformer(){throw Error("unused CPU boundary");}');
+  fs.writeFileSync(path.join(f.root,'animation_shadow.mjs'),'export function createGpuAnimationShadowMap(){throw Error("unused shadow boundary");}');
+  fs.writeFileSync(path.join(f.root,'animation_shadow_view.mjs'),'export function fitAnimationShadowView(){throw Error("unused fit boundary");} export function animationShadowWorldBounds(){throw Error("unused bounds boundary");}');
+  for(const file of ['animation_bounds.mjs','animation_scene_shadow.mjs'])fs.writeFileSync(path.join(f.root,file),'export {};');
+  const entry=path.join(f.root,'asset.gltf');fs.writeFileSync(entry,JSON.stringify({asset:{version:'2.0'},nodes:[{},{}]}));
+  return {...f,entry,...await import(pathToFileURL(path.join(f.root,'build_animation.mjs')))};
+}
+test('relocated environment-enabled packages prepare and receive IBL without the original toolkit',async()=>{
+  const f=await packageFixture(),out=path.join(f.root,'package'),built=f.buildAnimation(f.entry,out,{webgpu:true,environment:true});
+  assert.equal(built.gpuEnvironment,'f3d-animation-environment-v1');
+  for(const file of ['animation_environment.mjs','animation_environment_receiver.mjs']){
+    assert.ok(built.artifacts.some(a=>a.file===file));assert.deepEqual(fs.readFileSync(path.join(out,file)),fs.readFileSync(new URL('./'+file,import.meta.url)));
+  }
+  const deployed=fs.mkdtempSync(path.join(os.tmpdir(),'f3d-ibl-deployed-'));fs.cpSync(out,deployed,{recursive:true});fs.renameSync(f.root,f.root+'.unavailable');
+  const api=await import(pathToFileURL(path.join(deployed,built.gpuEntry))),p=api.createPlayer(),map=await api.createGpuAnimationEnvironment(f.d,source(),small);
+  const s=await api.createGpuAnimationScene(f.d,p,f.items,{sortObjects:false,renderer:{environment:true}}),input=frame(null,map);delete input.draws;
+  s.render(input);s.update(1);s.render(input);await s.whenIdle();assert.equal(s.poseVersion,1);assert.ok(draws(f.d).every(x=>x.pipeline.label.includes('lit-environment')));
+  s.dispose();assert.equal(map.disposed,false);assert.equal(p.disposed,false);map.dispose();p.dispose();
+});
+test('environment package modules count toward exact pre-write budgets and require the GPU route',async()=>{
+  const f=await packageFixture(),built=f.buildAnimation(f.entry,path.join(f.root,'sized'),{webgpu:true,environment:true});
+  const short=path.join(f.root,'short');assert.throws(()=>f.buildAnimation(f.entry,short,{webgpu:true,environment:true,maxBytes:built.outputBytes-1}),code('GLTF_ANIMATION_LIMIT'));
+  assert.equal(fs.existsSync(short),false);
+  assert.equal(f.buildAnimation(f.entry,path.join(f.root,'exact'),{webgpu:true,environment:true,maxBytes:built.outputBytes}).outputBytes,built.outputBytes);
+  for(const options of [{environment:true},{webgpu:true,environment:1}])assert.throws(()=>f.buildAnimation(f.entry,short,options),TypeError);
+  assert.equal(fs.existsSync(short),false);
+});
+test('CPU-only and ordinary GPU packages retain their emitted bytes when IBL is not requested',async()=>{
+  const f=await packageFixture(),source=fs.readFileSync(path.join(f.root,'build_animation.mjs'),'utf8');
+  const prior=source.replace(',environment=false','')
+    .replace("  if(typeof environment!=='boolean'||(environment&&!webgpu))throw new TypeError('environment must be boolean and requires webgpu:true');\n",'')
+    .replace(/  if\(environment\) \{[\s\S]*?\n  \}\n  const manifest/,'  const manifest')
+    .replace("    ...(environment?{gpuEnvironment:'f3d-animation-environment-v1'}:{}),\n",'');
+  assert.notEqual(prior,source);fs.writeFileSync(path.join(f.root,'prior.mjs'),prior);
+  const {buildAnimation:before}=await import(pathToFileURL(path.join(f.root,'prior.mjs')));
+  for(const webgpu of [false,true]){
+    const a=before(f.entry,path.join(f.root,'old-'+webgpu),{webgpu}),b=f.buildAnimation(f.entry,path.join(f.root,'new-'+webgpu),{webgpu});
+    assert.equal(a.outputBytes,b.outputBytes);assert.equal(b.gpuEnvironment,undefined);
+    assert.ok(!b.emittedFiles.includes('animation_environment_receiver.mjs'));assert.ok(!b.emittedFiles.includes('animation_environment.mjs'));
+    for(const file of a.emittedFiles)assert.deepEqual(fs.readFileSync(path.join(a.outDir,file)),fs.readFileSync(path.join(b.outDir,file)));
+  }
+});
