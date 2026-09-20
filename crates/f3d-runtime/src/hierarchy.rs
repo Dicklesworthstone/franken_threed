@@ -141,7 +141,7 @@ pub struct TransformHierarchy {
     world: Vec<Matrix4>,
     automatic_world: Vec<bool>,
     dirty: BTreeSet<usize>,
-    externally_changed: BTreeSet<u32>,
+    world_changed: Vec<bool>,
     changed: Vec<u32>,
     revision: u64,
     solved_revision: Option<u64>,
@@ -193,7 +193,8 @@ impl TransformHierarchy {
             local: matrices(local_matrices),
             world: world_matrices.map_or_else(|| vec![Matrix4::identity(); count], matrices),
             automatic_world: world_auto.map_or_else(|| vec![true; count], |flags| flags.iter().map(|&v| v == 1).collect()),
-            dirty: BTreeSet::new(), externally_changed: BTreeSet::new(), changed: Vec::new(),
+            dirty: BTreeSet::new(), world_changed: vec![false; count],
+            changed: Vec::with_capacity(count),
             revision: 0, solved_revision: None, last_stats: HierarchySolveStats::default(),
         };
         result.dirty_all_roots();
@@ -261,7 +262,7 @@ impl TransformHierarchy {
             let matrix = if external { &mut self.world[node as usize] } else { &mut self.local[node as usize] };
             if !same_bits(matrix, raw) {
                 matrix.elements.copy_from_slice(raw);
-                if external { self.externally_changed.insert(node); }
+                if external { self.world_changed[node as usize] = true; }
                 self.dirty_node(node as usize);
             }
         }
@@ -311,7 +312,7 @@ impl TransformHierarchy {
     /// no premature affine assumption or f32 conversion is made here.
     pub fn solve(&mut self) -> HierarchySolveStats {
         let mut stats = HierarchySolveStats { revision: self.revision, ..HierarchySolveStats::default() };
-        let mut changed = std::mem::take(&mut self.externally_changed);
+        self.changed.clear();
         let mut covered_end = 0;
         for start in std::mem::take(&mut self.dirty) {
             if start < covered_end { continue; }
@@ -319,7 +320,9 @@ impl TransformHierarchy {
             for position in start..covered_end {
                 let node = self.topology.order[position];
                 stats.visited += 1;
+                let external = std::mem::replace(&mut self.world_changed[node], false);
                 if !self.automatic_world[node] {
+                    if external { self.changed.push(node as u32); }
                     stats.preserved_worlds += 1;
                     continue;
                 }
@@ -333,11 +336,16 @@ impl TransformHierarchy {
                     matrix.multiply_matrices(&self.world[parent as usize], &self.local[node]);
                     matrix
                 };
-                if !same_bits(&self.world[node], &next.elements) { changed.insert(node as u32); }
+                if external || !same_bits(&self.world[node], &next.elements) {
+                    self.changed.push(node as u32);
+                }
                 self.world[node] = next;
             }
         }
-        self.changed = changed.into_iter().collect();
+        // Every visited node appears at most once, even after an external
+        // write followed by enabling world-auto. Reuse the capacity allocated
+        // at construction rather than allocating a tree entry for each change.
+        self.changed.sort_unstable();
         stats.changed = self.changed.len();
         self.solved_revision = Some(self.revision);
         self.last_stats = stats;
@@ -619,6 +627,24 @@ mod tests {
         assert_eq!(x(&h, count - 1), count as f64);
         h.set_local_matrices(&[(count - 1) as u32], &translation(2.0, 0.0, 0.0)).unwrap();
         assert_eq!(h.solve().visited, 1);
+    }
+    #[test]
+    fn change_tracking_reuses_capacity_and_deduplicates_external_to_auto_updates() {
+        let mut h = forest(&[-1, 0, 1]); h.solve();
+        let allocation = h.changed.as_ptr();
+        let capacity = h.changed.capacity();
+        h.set_world_auto(&[1], &[0]).unwrap();
+        h.set_world_matrices(&[1], &translation(20.0, 0.0, 0.0)).unwrap();
+        h.set_world_auto(&[1], &[1]).unwrap();
+        assert_eq!(h.solve().visited, 2);
+        assert_eq!(h.changed_indices(h.revision()).unwrap(), &[1]);
+        assert_eq!(x(&h, 1), 2.0);
+        assert_eq!(x(&h, 2), 3.0);
+        assert_eq!(h.changed.as_ptr(), allocation);
+        assert_eq!(h.changed.capacity(), capacity);
+        assert!(h.world_changed.iter().all(|&changed| !changed));
+        assert_eq!(h.solve().changed, 0);
+        assert_eq!(h.changed.as_ptr(), allocation);
     }
     #[test]
     fn revision_exhaustion_does_not_modify_any_bank() {
