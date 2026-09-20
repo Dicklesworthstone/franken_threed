@@ -169,19 +169,22 @@ export function createAnimationRetargeter(source,target,options={}){
         const s=capture(source),t=capture(target);sameRig(sr,s);sameRig(tr,t);
         const current=worldPose(s,so),output=new Map(),edits=[];
         for(const node of to){
-          const value=local(t,node),binding=mapped.get(node);let changed=false;
+          const value=local(t,node),originalQ=value.q,originalT=value.t,binding=mapped.get(node);let changed=false;
           if(binding&&binding.weight>0){
             const desired=multiply(multiply(align,current.get(binding.source).q),corrections.get(node));
             const parent=output.get(t.parents[node])?.q??identity;
-            value.q=slerp(value.q,multiply(inverse(parent),desired),weight*binding.weight);changed=true;
+            value.q=multiply(inverse(parent),desired);changed=true;
           }
-          const edit={node};if(changed)edit.rotation=value.q;
+          const edit={node};if(changed)edit.rotation=slerp(originalQ,value.q,weight*binding.weight);
           if(root?.target===node){
             const delta=rotate(align,current.get(root.source).t.map((v,i)=>(v-sw.get(root.source).t[i])*root.scale));
             const desired=tw.get(node).t.map((v,i)=>v+delta[i]),parent=output.get(t.parents[node]);
             const translation=parent?rotate(inverse(parent.q),desired.map((v,i)=>(v-parent.t[i])/parent.s)):desired;
-            value.t=value.t.map((v,i)=>(1-weight)*v+weight*translation[i]);edit.translation=value.t;changed=true;
+            value.t=translation;edit.translation=originalT.map((v,i)=>(1-weight)*v+weight*translation[i]);changed=true;
           }
+          // Solve descendants against the complete target solution. Blending
+          // an ancestor before solving a child would amplify inherited motion.
+          // Only the eventual local edits are weighted against the input pose.
           append(output,t,node,value);if(changed)edits.push(edit);
         }
         live();if(source.version!==sourceVersion||target.version!==before)fail('STALE','Pose changed before retarget publication');
