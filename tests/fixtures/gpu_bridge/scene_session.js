@@ -90,9 +90,10 @@ export class WebGpuSceneSession {
       const frame = scene?.frame;
       if (!frame) return this.snapshot();
       try {
-        const packet = await waitFor(Promise.resolve().then(() => frame.call(scene, {
-          ...this.sceneContext(token), time,
-        })), token.signal);
+        const packet = await waitFor(Promise.resolve().then(() => {
+          this.check(token);
+          return frame.call(scene, { ...this.sceneContext(token), time });
+        }), token.signal);
         this.check(token);
         if (packet != null) {
           validatePacket(packet);
@@ -209,9 +210,9 @@ export class WebGpuSceneSession {
       this.report(error);
       if (this.state === "closed" || this.generation !== generation) return;
       if (this.recoveryAttempts >= this.maxRecoveryAttempts || !this.factory) {
-        this.controller?.abort();
         this.generation++;
         this.state = "failed";
+        this.controller?.abort();
         this.emit();
         return;
       }
