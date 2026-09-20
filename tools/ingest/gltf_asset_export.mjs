@@ -161,6 +161,129 @@ function pruneUnavailableStorage(json,views,images,supplied) {
   if(keptViews.length)json.bufferViews=keptViews;else delete json.bufferViews;
   return keptViews;
 }
+// Packed runtime clips -> ordinary glTF animation accessors. Targets use the
+// authored glTF node IDs, never synthetic renderer instances. Snapshot descriptors
+// and numeric data before image I/O; do not run getters, iterators or toJSON.
+// No resampling, quaternion sign changes, tangent repair or time rebasing occurs.
+function captureAnimationClips(json,clips,maxBytes,maxJsonBytes,maxChannels) {
+  const own=(value,key)=>{
+    const property=Object.getOwnPropertyDescriptor(value,key);
+    if(!property||!Object.hasOwn(property,'value'))fail('ANIMATION','Expected dense animation data properties');
+    return property.value;
+  };
+  const record=(value,allowed)=>{
+    object(value,'animation record');
+    if(![Object.prototype,null].includes(Object.getPrototypeOf(value)))fail('ANIMATION','Expected a plain animation record');
+    const out=Object.create(null);
+    for(const key of Object.keys(value)) {
+      if(!allowed.includes(key))fail('ANIMATION',`Unsupported animation field: ${key}`);
+      out[key]=own(value,key);
+    }
+    return out;
+  };
+  const list=(value,min,max,label)=>{
+    if(!Array.isArray(value))fail('ANIMATION',`Expected ${label} array`);
+    integer(value.length,min,max,label);return value;
+  };
+  const size=(value,label)=>{
+    if(Array.isArray(value))return integer(value.length,1,16777216,label);
+    if(!ArrayBuffer.isView(value)||value instanceof DataView)fail('ANIMATION',`Expected ${label} numeric array`);
+    bytes(value);return integer(value.length,1,16777216,label);
+  };
+  const read=(value,index)=>Array.isArray(value)?own(value,String(index)):value[index];
+  let componentCount=0,channelCount=0,nameUnits=0;
+  const copied=[];
+  list(clips,0,4096,'clip count');
+  const nodes=json.nodes??[];
+  if(!Array.isArray(nodes))fail('ANIMATION','Expected glTF nodes');
+  for(let ci=0;ci<clips.length;ci++) {
+    const input=record(own(clips,String(ci)),['name','channels']);
+    if(input.name!==undefined) {
+      if(typeof input.name!=='string')fail('ANIMATION','Clip name must be text');
+      nameUnits+=input.name.length;if(nameUnits>maxJsonBytes)fail('LIMIT','Animation names exceed the JSON budget');
+    }
+    const channels=list(input.channels,1,maxChannels,'channel count'),output={channels:[]};
+    if(input.name!==undefined)output.name=input.name;
+    channelCount+=channels.length;if(channelCount>maxChannels)fail('LIMIT','Animation channels exceed the resource limit');
+    const targets=new Set();
+    for(let i=0;i<channels.length;i++) {
+      const channel=record(own(channels,String(i)),['node','path','times','values','interpolation','quantizedRotation']);
+      const {node,path,times,values,interpolation='LINEAR'}=channel;
+      integer(node,0,nodes.length-1,'animation node');object(nodes[node],'animation target');
+      if(!['translation','rotation','scale','weights'].includes(path))fail('ANIMATION','Unsupported animation path');
+      if(!['LINEAR','STEP','CUBICSPLINE'].includes(interpolation))fail('ANIMATION','Unsupported animation interpolation');
+      if(channel.quantizedRotation!==undefined&&typeof channel.quantizedRotation!=='boolean')fail('ANIMATION','Invalid rotation quantization marker');
+      const key=node+':'+path;
+      if(targets.has(key))fail('ANIMATION','Duplicate animation target');targets.add(key);
+      if(path!=='weights'&&nodes[node].matrix!==undefined)fail('ANIMATION','TRS animation cannot target a matrix node');
+      let width=path==='rotation'?4:3;
+      if(path==='weights') {
+        const meshes=json.meshes??[];
+        if(!Array.isArray(meshes))fail('ANIMATION','Expected glTF meshes');
+        const mesh=meshes[integer(nodes[node].mesh,0,meshes.length-1,'morph mesh')];
+        const primitives=list(mesh?.primitives,1,65536,'morph primitives');
+        width=list(primitives[0]?.targets,1,4096,'morph targets').length;
+        for(const primitive of primitives)if(!Array.isArray(primitive?.targets)||primitive.targets.length!==width)
+          fail('ANIMATION','Morph target counts must agree across mesh primitives');
+      }
+      const count=size(times,'keyframe times'),valueCount=size(values,'keyframe values');
+      const multiplier=interpolation==='CUBICSPLINE'?3:1;
+      integer(count,multiplier===3?2:1,1048576,'keyframe count');
+      if(valueCount!==count*width*multiplier)fail('ANIMATION','Animation values do not match keyframes and target width');
+      componentCount+=count+valueCount;
+      if(componentCount>16777216||componentCount*4+28>maxBytes)fail('LIMIT','Animation components exceed the binary budget');
+      // Exact shape/budget admission precedes allocation. Float64 runtime data
+      // has to remain finite and ordered after conversion to glTF FLOAT storage.
+      const timeBytes=new Uint8Array(count*4),valueBytes=new Uint8Array(valueCount*4);
+      const timeView=new DataView(timeBytes.buffer),valueView=new DataView(valueBytes.buffer);
+      let previous=-1,min=0,max=0;
+      for(let k=0;k<count;k++) {
+        const value=read(times,k),rounded=typeof value==='number'?Math.fround(value):NaN;
+        if(!Number.isFinite(rounded)||value<0||rounded<=previous)
+          fail('ANIMATION_TIME','Times must remain finite, nonnegative and strictly increasing as Float32');
+        timeView.setFloat32(k*4,rounded,true);previous=rounded;
+        if(k===0)min=rounded;max=rounded;
+      }
+      for(let k=0;k<valueCount;k++) {
+        const value=read(values,k),rounded=typeof value==='number'?Math.fround(value):NaN;
+        if(!Number.isFinite(rounded))fail('ANIMATION_VALUE','Animation values must remain finite as Float32');
+        valueView.setFloat32(k*4,rounded,true);
+      }
+      if(path==='rotation')for(let k=0;k<count;k++) {
+        const offset=(k*multiplier+(multiplier===3?1:0))*16;
+        const norm=Math.hypot(...[0,4,8,12].map(j=>valueView.getFloat32(offset+j,true)));
+        if(Math.abs(norm-1)>1e-3)fail('ANIMATION_ROTATION','Exported rotation keys must be unit quaternions');
+      }
+      output.channels.push({node,path,interpolation,timeBytes,valueBytes,count,
+        valueCount:path==='weights'?valueCount:count*multiplier,
+        type:path==='weights'?'SCALAR':path==='rotation'?'VEC4':'VEC3',min,max});
+    }
+    copied.push(output);
+  }
+  return {clips:copied,channelCount};
+}
+function appendAnimationClips(json,captured,views,append) {
+  if(!captured.clips.length)return;
+  const accessors=json.accessors??[],animations=json.animations??[];
+  if(!Array.isArray(accessors)||!Array.isArray(animations))fail('ANIMATION','Invalid glTF animation/accessor table');
+  const accessor=(data,count,type,bounds={})=>{
+    const bufferView=views.push({buffer:0,byteOffset:append(data),byteLength:data.length})-1;
+    return accessors.push({bufferView,componentType:5126,count,type,...bounds})-1;
+  };
+  for(const clip of captured.clips) {
+    const animation={samplers:[],channels:[]};
+    if(clip.name!==undefined)animation.name=clip.name;
+    for(const channel of clip.channels) {
+      const input=accessor(channel.timeBytes,channel.count,'SCALAR',{min:[channel.min],max:[channel.max]});
+      const output=accessor(channel.valueBytes,channel.valueCount,channel.type);
+      const sampler=animation.samplers.push({input,output,interpolation:channel.interpolation})-1;
+      animation.channels.push({sampler,target:{node:channel.node,path:channel.path}});
+    }
+    animations.push(animation);
+  }
+  json.accessors=accessors;json.animations=animations;
+}
+
 function wait(pending,signal) {
   if(!signal)return Promise.resolve(pending);
   return new Promise((resolve,reject)=>{
@@ -186,10 +309,14 @@ function wait(pending,signal) {
  * successfully decoded geometry compression; skipped unused buffer slots may be
  * null. Inaccessible orphan accessors/views are removed only after checking all
  * core/instancing references. Live data must have real bytes. No zero stand-ins.
+ * clips optionally appends packed f3d-animation-v1 clip records, using authored
+ * glTF node IDs. animationMode:replace explicitly replaces all authored clips.
+ * New tracks use FLOAT accessors; source tracks remain byte-exact. All supplied
+ * clips are validated/copied before image I/O, with no changes to the live asset.
  */
 export async function exportGltfAssetGLB(asset,options={}) {
-  fields(options,['signal','maxBytes','maxJsonBytes','maxResources'],'export option');
-  const {signal,maxBytes=128*1024*1024,maxJsonBytes=Math.min(maxBytes,16*1024*1024),maxResources=4096}=options;
+  fields(options,['signal','maxBytes','maxJsonBytes','maxResources','clips','animationMode'],'export option');
+  const {signal,maxBytes=128*1024*1024,maxJsonBytes=Math.min(maxBytes,16*1024*1024),maxResources=4096,clips,animationMode='append'}=options;
   integer(maxBytes,20,0xffffffff,'GLB byte limit');integer(maxJsonBytes,1,maxBytes,'JSON byte limit');
   integer(maxResources,1,65536,'resource count limit');abort(signal);object(asset,'loaded asset');
   const json=snapshot(asset.json,maxJsonBytes);
@@ -197,6 +324,10 @@ export async function exportGltfAssetGLB(asset,options={}) {
     (json.asset.minVersion!==undefined&&json.asset.minVersion!=='2.0'))fail('VERSION','Expected glTF 2.0');
   if(new TextEncoder().encode(encodeJson(json)).length>maxJsonBytes)fail('LIMIT','Source JSON exceeds its byte budget');
   extensions(json);
+  if(!['append','replace'].includes(animationMode)||(animationMode==='replace'&&clips===undefined))
+    fail('OPTIONS','animationMode must be append or replace with explicit clips');
+  const captured=captureAnimationClips(json,clips===undefined?[]:clips,maxBytes,maxJsonBytes,maxResources*8);
+  if(animationMode==='replace')delete json.animations;
   const table=(field,max)=>{const list=json[field]??[];if(!Array.isArray(list)||list.length>max)fail('LIMIT',`Invalid or excessive ${field}`);return list;};
   const definitions=table('buffers',maxResources),images=table('images',maxResources);
   let views=table('bufferViews',maxResources*16);
@@ -251,7 +382,7 @@ export async function exportGltfAssetGLB(asset,options={}) {
   }
   resourceUris(json);
   views=pruneUnavailableStorage(json,views,images,supplied);
-  if(views.length+external.size>maxResources*16)fail('LIMIT','Embedded image views exceed the resource count limit');
+  if(views.length+external.size+captured.channelCount*2>maxResources*16)fail('LIMIT','Image/animation views exceed the resource count limit');
   for(const view of views)used.add(view.buffer);
   for(let i=0;i<definitions.length;i++) {
     abort(signal);
@@ -270,6 +401,7 @@ export async function exportGltfAssetGLB(asset,options={}) {
   // are consolidated. Core identities elsewhere in the document are unchanged.
   const metadata=definitions.map((d,i)=>({byteLength:d.byteLength,byteOffset:offsets[i]??null,
     ...(d.name===undefined?{}:{name:d.name}),...(d.extras===undefined?{}:{extras:d.extras})}));
+  appendAnimationClips(json,captured,views,append);
   const uriViews=new Map();
   for(const [uri,request]of external) {
     abort(signal);
