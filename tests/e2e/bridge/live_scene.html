@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FrankenThreeD — live WebGPU scene lifetime</title>
+  <style>
+    :root { color-scheme: dark; font: 16px/1.5 system-ui, sans-serif; }
+    body { max-width: 960px; margin: 2rem auto; padding: 0 1rem; }
+    h1 { font-size: 1.5rem; }
+    canvas { display: block; width: 100%; max-width: 640px; border: 1px solid #888; margin: 1rem 0; }
+    .controls { display: flex; flex-wrap: wrap; gap: .75rem; align-items: center; }
+    button, select { font: inherit; padding: .4rem .7rem; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; padding: 1rem; background: #222; }
+  </style>
+</head>
+<body>
+  <h1>Live Rust/Wasm → WebGPU scene</h1>
+  <p>This page runs the compiled application's real first-frame packet through
+    <code>WebGpuSceneSession</code> and <code>WebGpuBridgeHost</code>.
+    Reload and resize rebuild the scene on the existing device; device loss
+    negotiates a successor and rebuilds from Wasm. No JavaScript rendering fallback is used.</p>
+  <div class="controls">
+    <button id="reload" disabled>Reload / restart</button>
+    <label>Canvas size <select id="size" disabled>
+      <option value="64">64 × 64</option>
+      <option value="256">256 × 256</option>
+      <option value="512">512 × 512</option>
+    </select></label>
+    <button id="loss" disabled>Destroy device and recover</button>
+    <button id="stop" disabled>Stop and release resources</button>
+  </div>
+  <canvas id="scene" width="64" height="64" aria-label="Rust-generated triangle rendered through WebGPU"></canvas>
+  <h2>Lifecycle state</h2>
+  <pre id="state" role="status" aria-live="polite">Loading compiled Wasm…</pre>
+  <h2>Diagnostics</h2>
+  <pre id="errors">No errors.</pre>
+  <p>Serve the repository root using the existing browser harness with the compiled
+    application available at <code>/pkg/f3d_runtime.js</code>. Missing WebGPU, Wasm,
+    or packet-builder exports fail explicitly. The default packet's offscreen
+    readback remains 64 × 64; the canvas size control changes the presentation surface.
+    This interactive fixture is not a performance benchmark or a pixel-equivalence result.</p>
+  <script type="module">
+    import { WebGpuBridgeHost } from "../../fixtures/gpu_bridge/bridge_runtime.js";
+    import { WebGpuSceneSession } from "../../fixtures/gpu_bridge/scene_session.js";
+
+    const canvas = document.getElementById("scene");
+    const output = document.getElementById("state");
+    const errors = document.getElementById("errors");
+    const reloadButton = document.getElementById("reload");
+    const lossButton = document.getElementById("loss");
+    const stopButton = document.getElementById("stop");
+    const sizeInput = document.getElementById("size");
+    const diagnostics = [];
+    let session = null;
+    let host = null;
+    let buildPacket = null;
+    let unloaded = false;
+
+    function report(error) {
+      if (error?.name === "AbortError") return;
+      diagnostics.push(error?.message || String(error));
+      if (diagnostics.length > 20) diagnostics.shift();
+      errors.textContent = diagnostics.join("\n");
+    }
+
+    function show(snapshot) {
+      output.textContent = JSON.stringify(snapshot, null, 2);
+      const active = snapshot.state !== "closed";
+      reloadButton.disabled = !buildPacket || unloaded;
+      sizeInput.disabled = !active || !buildPacket || unloaded;
+      lossButton.disabled = snapshot.state !== "ready" || unloaded;
+      stopButton.disabled = !active || unloaded;
+    }
+
+    function restart() {
+      if (unloaded) throw new Error("The page lifetime has ended");
+      if (session?.state !== "closed" && session) return session.reload();
+      host = new WebGpuBridgeHost();
+      const next = new WebGpuSceneSession({ host, canvas, maxRecoveryAttempts: 1,
+        onState(snapshot) { if (session === next) show(snapshot); }, onError: report });
+      session = next;
+      // This is the same real, zero-argument Rust export used by the oracle
+      // suite, not a JS-authored packet or a cached packet from the lost device.
+      return session.load(({ signal }) => {
+        signal.throwIfAborted();
+        return { packet: buildPacket() };
+      });
+    }
+
+    async function resize(width, height = width) {
+      if (!session) throw new Error("Wasm initialization has not completed");
+      return session.resize(width, height);
+    }
+
+    async function stop() { if (session) return session.close(); }
+
+    function loseDevice() {
+      if (!host?.device || session?.state !== "ready") throw new Error("No ready GPU device to destroy");
+      // Deliberately exercise the actual GPUDevice.lost promise. Do not call
+      // session.close(): that is intentional shutdown and must not recover.
+      host.device.destroy();
+    }
+
+    async function initialize() {
+      if (!navigator.gpu) throw new Error("WebGPU is unavailable in this browser");
+      const wasm = await import("/pkg/f3d_runtime.js");
+      if (typeof wasm.default !== "function") throw new Error("Missing wasm-bindgen initializer");
+      await wasm.default();
+      if (unloaded) return;
+      buildPacket = wasm.f3d_build_first_frame_packet || wasm.gpu_bridge_build_triangle_packet;
+      if (typeof buildPacket !== "function") throw new Error("Compiled application lacks a real first-frame packet builder");
+      return restart();
+    }
+
+    // Actions remain explicit and caller-driven: no renderer-owned RAF loop,
+    // timer scheduler, generated code, or independently running worker.
+    reloadButton.addEventListener("click", () => Promise.resolve().then(restart).catch(report));
+    sizeInput.addEventListener("change", () => resize(Number(sizeInput.value)).catch(report));
+    stopButton.addEventListener("click", () => stop().catch(report));
+    lossButton.addEventListener("click", () => { try { loseDevice(); } catch (error) { report(error); } });
+    window.addEventListener("pagehide", () => {
+      unloaded = true;
+      stop().catch(report);
+    }, { once: true });
+
+    const ready = initialize();
+    ready.catch(error => {
+      report(error);
+      if (!session) output.textContent = `Initialization failed: ${error.message || error}`;
+    });
+    // Stable handles for browser automation; `ready` rejects on missing Wasm or
+    // GPU failures instead of manufacturing a successful smoke-test receipt.
+    window.f3dSceneDemo = Object.freeze({ ready, reload: restart, resize, stop, loseDevice,
+      get session() { return session; }, get host() { return host; } });
+  </script>
+</body>
+</html>
