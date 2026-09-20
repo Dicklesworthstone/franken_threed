@@ -275,3 +275,87 @@ test('device loss recovery can be disabled and intentional shutdown never reacqu
   await g.session.close(); await tick();
   assert.equal(g.devices.length, 1);
 });
+
+test('error observers may close the session without a failure resurrecting it', async () => {
+  const f = fixture(); let close;
+  await f.session.load(() => ({ packet: packet(), frame() { throw new Error('frame failure'); } }));
+  f.session.onError = () => { close = f.session.close(); };
+  await assert.rejects(f.session.render(), /frame failure/);
+  await close;
+  assert.equal(f.session.state, 'closed');
+});
+
+test('a device-loss observer can shut down instead of auto-recovering', async () => {
+  const f = fixture();
+  await f.session.load(() => ({ packet: packet() }));
+  f.session.onError = () => { f.session.close(); };
+  f.devices[0].lose({ message: 'loss handled by application' });
+  await tick(); await tick();
+  assert.equal(f.session.state, 'closed');
+  assert.equal(f.devices.length, 1);
+});
+
+test('error-observer reload is newer than the failing frame', async () => {
+  const f = fixture(); let replacement;
+  await f.session.load(() => ({ packet: packet(1), frame() { throw new Error('retry externally'); } }));
+  f.session.onError = () => { replacement = f.session.load(() => ({ packet: packet(2) })); };
+  await assert.rejects(f.session.render(), /retry externally/);
+  await replacement;
+  assert.equal(f.session.state, 'ready');
+  assert.deepEqual(submissions(f), [1, 2]);
+  await f.session.close();
+});
+
+test('frame methods retain their scene receiver', async () => {
+  const f = fixture();
+  await f.session.load(() => ({ packet: packet(1), value: 11, frame() { return packet(this.value); } }));
+  await f.session.render();
+  assert.deepEqual(submissions(f), [1, 11]);
+  await f.session.close();
+});
+
+test('close waits for already-started disposal after cancelling a reload', async () => {
+  const f = fixture(), disposal = deferred(); let entered = false, closed = false;
+  await f.session.load(() => ({ packet: packet(), dispose() { entered = true; return disposal.promise; } }));
+  const loading = f.session.reload(), rejected = aborts(loading);
+  await until(() => entered);
+  const closing = f.session.close().then(() => { closed = true; });
+  await tick();
+  assert.equal(closed, false, 'close must join existing CPU ownership cleanup');
+  disposal.resolve();
+  await Promise.all([closing, rejected]);
+  assert.equal(closed, true);
+});
+
+test('an abort listener can close during reload without the new operation reopening the session', async () => {
+  const f = fixture();
+  await f.session.load(({ signal }) => {
+    signal.addEventListener('abort', () => { f.session.close(); }, { once: true });
+    return { packet: packet(1) };
+  });
+  await aborts(f.session.reload());
+  assert.equal(f.session.state, 'closed');
+  assert.deepEqual(submissions(f), [1]);
+});
+
+test('terminal device loss cannot overwrite shutdown requested by an abort listener', async () => {
+  const f = fixture({ maxRecoveryAttempts: 0 });
+  await f.session.load(({ signal }) => {
+    signal.addEventListener('abort', () => { f.session.close(); }, { once: true });
+    return { packet: packet() };
+  });
+  f.devices[0].lose({ message: 'terminal loss' });
+  await tick(); await tick();
+  assert.equal(f.session.state, 'closed');
+  assert.equal(f.devices.length, 1);
+});
+
+test('closing in the microtask before a queued frame producer prevents invoking it', async () => {
+  const f = fixture(); let calls = 0;
+  await f.session.load(() => ({ packet: packet(), frame() { calls++; return packet(2); } }));
+  const rendering = f.session.render(), rejected = aborts(rendering);
+  queueMicrotask(() => { f.session.close(); });
+  await rejected;
+  assert.equal(calls, 0);
+  assert.deepEqual(submissions(f), [1]);
+});
