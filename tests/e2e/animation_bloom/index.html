@@ -1,0 +1,25 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>FrankenThreeD native HDR bloom checks</title>
+<h1>Native HDR bloom and composition</h1>
+<p>Requires WebGPU on a secure origin. Missing adapters are blocked, never passed.</p>
+<button id="run">Run native pixel checks</button>
+<pre id="result">Not run</pre>
+<script type="module">
+import { runAnimationBloomBrowserChecks } from '../../../tools/ingest/animation_bloom.browser.mjs';
+const button = document.querySelector('#run'), output = document.querySelector('#result');
+button.addEventListener('click', async () => {
+  button.disabled = true;
+  let device;
+  try {
+    if (!navigator.gpu) { output.textContent = 'BLOCKED: WebGPU is unavailable'; return; }
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) { output.textContent = 'BLOCKED: no WebGPU adapter'; return; }
+    device = await adapter.requestDevice();
+    output.textContent = 'Running native shader, texture and pixel checks';
+    const report = await runAnimationBloomBrowserChecks(device);
+    output.textContent = JSON.stringify(report, null, 2);
+  } catch (error) { output.textContent = `FAILED: ${error.stack ?? error}`; }
+  finally { device?.destroy(); button.disabled = false; }
+});
+</script>
