@@ -154,3 +154,31 @@ test('CLI produces a working package and reports retained execution honestly', (
   const invalid = spawnSync(process.execPath, [cli, '--out'], { encoding: 'utf8' });
   assert.equal(invalid.status, 1); assert.match(invalid.stderr, /Usage/);
 });
+
+test('relocates tree-shaking globs and versioned declaration paths', () => {
+  const source = {
+    exports: './index.js',
+    sideEffects: ['./src/nodes/**/*', '*.css', '**/*.wasm'],
+    typesVersions: { '>=5.0': { '*': ['types/*', 'fallback/*'] } },
+  };
+  const result = portablePackageManifest(source);
+  assert.deepEqual(result.sideEffects, ['./_retained/src/nodes/**/*', './_retained/**/*.css', './_retained/**/*.wasm']);
+  assert.deepEqual(result.typesVersions, { '>=5.0': { '*': ['./_retained/types/*', './_retained/fallback/*'] } });
+  assert.deepEqual(source.sideEffects, ['./src/nodes/**/*', '*.css', '**/*.wasm']);
+  for (const value of [true, false]) assert.equal(portablePackageManifest({ exports: './index.js', sideEffects: value }).sideEffects, value);
+  assert.throws(() => portablePackageManifest({ exports: './index.js', sideEffects: 'invalid' }), /sideEffects/);
+  assert.throws(() => portablePackageManifest({ exports: './index.js', sideEffects: ['!src/*'] }), /sideEffects/);
+});
+
+test('excludes nested packaging controls while leaving source files untouched', (t) => {
+  const f = fixture(t);
+  for (const name of ['.npmignore', '.gitignore', '.npmrc']) f.put(`assets/${name}`, 'original config');
+  f.put('examples/vendor/node_modules/excluded.js', 'not retained');
+  const result = emitPortablePackage(f.out, { packageDir: f.source });
+  for (const name of ['.npmignore', '.gitignore', '.npmrc']) {
+    assert.equal(fs.existsSync(path.join(f.out, '_retained/assets', name)), false);
+    assert.equal(fs.readFileSync(path.join(f.source, 'assets', name), 'utf8'), 'original config');
+  }
+  assert.equal(fs.existsSync(path.join(f.out, '_retained/examples/vendor/node_modules')), false);
+  assert.ok(result.files.includes('_retained/assets/codec.wasm'));
+});

@@ -9,7 +9,9 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const RETAINED = '_retained';
-const OMIT_ROOT = new Set(['.git', 'node_modules']);
+// Checkout and package-manager control files are not runtime assets. In
+// particular, nested ignore files can silently strip decoder WASM from npm pack.
+const OMIT_NAMES = new Set(['.git', 'node_modules', '.gitignore', '.npmignore', '.npmrc']);
 const PACKAGE_NAME = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/;
 
 function exists(file) {
@@ -77,6 +79,20 @@ export function portablePackageManifest(upstream, { packageName = '@franken/thre
       typeof value === 'string' ? retainedTarget(value, { external: true }) : value,
     ]));
   }
+  if (Array.isArray(upstream.sideEffects)) {
+    manifest.sideEffects = upstream.sideEffects.map((pattern) => {
+      if (typeof pattern !== 'string' || pattern.startsWith('!')) {
+        throw new TypeError('Unsupported sideEffects pattern');
+      }
+      // A basename-only pattern applies at every depth, not just at the root.
+      return retainedTarget(pattern.includes('/') ? pattern : `**/${pattern}`, { relative: true });
+    });
+  } else if (upstream.sideEffects !== undefined && typeof upstream.sideEffects !== 'boolean') {
+    throw new TypeError('sideEffects must be a boolean or an array');
+  }
+  if (upstream.typesVersions) {
+    manifest.typesVersions = mapTargets(upstream.typesVersions, (target) => retainedTarget(target, { relative: true }));
+  }
   if (typeof upstream.bin === 'string') manifest.bin = retainedTarget(upstream.bin, { relative: true });
   else if (upstream.bin) manifest.bin = Object.fromEntries(Object.entries(upstream.bin).map(([key, value]) => [key, retainedTarget(value, { relative: true })]));
   // Upstream development/publish hooks must not run when installing this facade.
@@ -88,7 +104,7 @@ export function portablePackageManifest(upstream, { packageName = '@franken/thre
 function packageFiles(root, directory = '') {
   const files = [];
   for (const name of fs.readdirSync(path.join(root, directory)).sort()) {
-    if (directory === '' && OMIT_ROOT.has(name)) continue;
+    if (OMIT_NAMES.has(name)) continue;
     const relative = path.join(directory, name);
     const stat = fs.lstatSync(path.join(root, relative));
     if (stat.isSymbolicLink()) throw new Error(`Package symlinks are not portable: ${relative}`);
@@ -101,7 +117,8 @@ function packageFiles(root, directory = '') {
 
 /**
  * Emit an installable package with no filesystem references to the source tree.
- * All runtime files are retained, including files not exported as JS modules.
+ * Runtime files are retained, including files not exported as JS modules.
+ * Package-manager ignore/config files and checkout metadata are not copied.
  * Existing destinations are never intentionally replaced. The source is not
  * modified and no dependency install, lifecycle script or network request runs.
  *
