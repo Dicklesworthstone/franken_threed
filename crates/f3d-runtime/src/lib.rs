@@ -10,9 +10,14 @@ pub mod burst;
 pub mod deformation;
 pub mod frame;
 pub mod gpu_host;
+pub mod hierarchy;
 pub mod mesh;
 pub mod publication;
 pub mod simd_compose;
+
+pub use hierarchy::{HierarchyError, HierarchySolveStats, TransformHierarchy};
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+pub use hierarchy::WasmTransformHierarchy;
 
 #[cfg(all(feature = "browser", target_arch = "wasm32"))]
 mod probe;
