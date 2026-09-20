@@ -28,6 +28,9 @@ const abort=signal=>{if(signal?.aborted)throw signal.reason ?? new DOMException(
  * of attachment views. Output targets resize to the actual target extent, keep
  * the requested sampleCount/depthFormat, and are owned until scene disposal.
  * outputTextureBytes/outputBufferBytes are separate from asset/geometry budgets.
+ * output.readback:true (or {maxBytes,maxPending,label}) enables readPixels().
+ * Its source defaults to resolved linear HDR; source:'output' captures the last
+ * display target, which must have COPY_SRC usage and still be valid this turn.
  * Omit output to retain the original attachment API and allocation behavior.
  * sourceExport:true (or {maxBytes,maxJsonBytes,maxResources}) closes ALL source
  * scenes/images at construction, before GPU texture/scene allocation. This can
@@ -62,6 +65,7 @@ export async function loadGpuGltfAnimationScene(device,source,{
     throw new GltfAssetError('GLTF_MODEL_LOAD_OPTIONS','output must be a presentation options object or null');
   const outputOptions=output===null?null:{...output,signal};
   if(outputOptions){
+    if(outputOptions.readback&&typeof outputOptions.readback==='object'&&!Array.isArray(outputOptions.readback))outputOptions.readback={...outputOptions.readback};
     for(const key of ['sampleCount','depthFormat']){
       if(outputOptions[key]!==undefined&&sceneOptions.renderer[key]!==undefined&&outputOptions[key]!==sceneOptions.renderer[key])
         throw new GltfAssetError('GLTF_MODEL_LOAD_OPTIONS','Output and scene attachment settings conflict');
@@ -128,6 +132,17 @@ export async function loadGpuGltfAnimationScene(device,source,{
     get failed(){return model.failed||resources.failed||Boolean(presentation?.failed);},
     get outputEnabled(){return presentation!==undefined;},
     get outputTextureBytes(){return presentation?.textureBytes ?? 0;},get outputBufferBytes(){return presentation?.bufferBytes ?? 0;},
+    get readbackEnabled(){return presentation?.readbackEnabled ?? false;},
+    get readbackPending(){return presentation?.readbackPending ?? 0;},
+    get readbackBufferBytes(){return presentation?.readbackBufferBytes ?? 0;},
+    get readbackReservedBytes(){return presentation?.readbackReservedBytes ?? 0;},
+    async readPixels(settings={}){
+      checkTextures();
+      if(model.disposed)throw new GltfAssetError('GLTF_MODEL_DISPOSED','Model has been disposed');
+      if(!presentation)throw new GltfAssetError('GLTF_MODEL_READBACK_DISABLED','Enable output.readback at model construction');
+      try{const pixels=await presentation.readPixels(settings);checkTextures();return pixels;}
+      catch(error){if(model.failed||resources.failed||Boolean(presentation.failed))release();throw error;}
+    },
     get sourceExportEnabled(){return sourceOptions!==null;},
     get sourceExportBytes(){return sourceSnapshot?.byteLength??0;},
     async exportSourceGLB(settings={}){return query(()=>{
