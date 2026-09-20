@@ -42,7 +42,8 @@ export class WebGpuSceneSession {
     this.controller = null;
     this.observedDevice = null;
     this.tail = Promise.resolve();
-    this.disposed = new WeakSet();
+    this.disposed = new WeakMap();
+    this.disposals = new Set();
     this.closePromise = null;
   }
 
@@ -85,10 +86,11 @@ export class WebGpuSceneSession {
     const token = this.token();
     return this.enqueue(async () => {
       this.check(token);
-      const frame = this.scene?.frame;
+      const scene = this.scene;
+      const frame = scene?.frame;
       if (!frame) return this.snapshot();
       try {
-        const packet = await waitFor(Promise.resolve().then(() => frame({
+        const packet = await waitFor(Promise.resolve().then(() => frame.call(scene, {
           ...this.sceneContext(token), time,
         })), token.signal);
         this.check(token);
@@ -106,27 +108,31 @@ export class WebGpuSceneSession {
     });
   }
 
-  /** Cancellation is immediate; resolution also confirms owned scene disposal. */
+  /** Cancel immediately, then join known CPU ownership cleanup. Late factories
+   * are disposed when they settle; an uncooperative producer cannot block close. */
   close() {
     if (this.closePromise) return this.closePromise;
-    this.controller?.abort();
     this.generation++;
     this.state = "closed";
     this.observedDevice = null;
-    try { this.host.destroyDevice(); } catch (error) { this.report(error); }
-    try { this.context.unconfigure(); } catch (error) { this.report(error); }
+    // Publish the close promise before dispatching abort or observer callbacks:
+    // those callbacks may synchronously request close again.
     this.closePromise = this.enqueue(async () => {
       const scene = this.scene;
       this.scene = null;
       await this.dispose(scene);
+      while (this.disposals.size) await Promise.all([...this.disposals]);
       return this.snapshot();
     });
+    this.controller?.abort();
+    try { this.host.destroyDevice(); } catch (error) { this.report(error); }
+    try { this.context.unconfigure(); } catch (error) { this.report(error); }
     this.emit();
     return this.closePromise;
   }
 
   replace(factory, size, state, resetRecovery) {
-    this.controller?.abort();
+    const previousController = this.controller;
     this.controller = new AbortController();
     this.generation++;
     this.factory = factory;
@@ -135,6 +141,9 @@ export class WebGpuSceneSession {
     this.lastError = null;
     if (resetRecovery) this.recoveryAttempts = 0;
     const token = this.token();
+    // Install the new generation before abort listeners run. A listener may
+    // close or replace this operation, and that newer decision must win.
+    previousController?.abort();
     this.emit();
     return this.enqueue(async () => {
       let candidate = null;
@@ -196,7 +205,9 @@ export class WebGpuSceneSession {
       if (this.state === "closed" || this.observedDevice !== device) return;
       this.observedDevice = null;
       const error = new Error(`WebGPU device lost: ${info?.message || info?.reason || "unknown reason"}`);
+      const generation = this.generation;
       this.report(error);
+      if (this.state === "closed" || this.generation !== generation) return;
       if (this.recoveryAttempts >= this.maxRecoveryAttempts || !this.factory) {
         this.controller?.abort();
         this.generation++;
@@ -222,10 +233,15 @@ export class WebGpuSceneSession {
   }
 
   async dispose(scene) {
-    if (!scene || typeof scene !== "object" || this.disposed.has(scene)) return;
-    this.disposed.add(scene);
-    try { if (typeof scene.dispose === "function") await scene.dispose(); }
-    catch (error) { this.report(error); }
+    if (!scene || typeof scene !== "object") return;
+    if (this.disposed.has(scene)) return this.disposed.get(scene);
+    const cleanup = Promise.resolve().then(() => {
+      if (typeof scene.dispose === "function") return scene.dispose();
+    }).catch((error) => this.report(error));
+    this.disposed.set(scene, cleanup);
+    this.disposals.add(cleanup);
+    cleanup.then(() => this.disposals.delete(cleanup));
+    return cleanup;
   }
 
   validateSize(width, height) {
@@ -255,6 +271,7 @@ export class WebGpuSceneSession {
   failCurrent(token, error) {
     if (!token.signal.aborted && token.generation === this.generation && this.state !== "closed") {
       this.report(error);
+      if (token.signal.aborted || token.generation !== this.generation || this.state === "closed") return;
       this.state = "failed";
       this.controller.abort();
       this.emit();
