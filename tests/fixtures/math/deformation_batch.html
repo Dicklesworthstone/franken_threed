@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>FrankenThreeD — retained morph/skin draw conformance</title>
+<h1>Retained geometry → Rust deformation → render packets</h1>
+<p>Requires the compiled runtime in /pkg and pinned Three.js r186 in /upstream/three.js.
+This compares actual Wasm positions against Three.js and builds actual canvas/offscreen packets.
+It does not execute GPU work, certify rendered pixels, or measure performance.</p>
+<pre id="result" role="status">Loading compiled runtime and pinned oracle…</pre>
+<script type="module">
+const output = document.getElementById('result');
+const ready = (async () => {
+  const [wasm, THREE, { captureDeformationBatch, evaluateDeformationBatch }, { prepareDeformedMeshBatchPacket }] = await Promise.all([
+    import('/pkg/f3d_runtime.js'), import('../../../upstream/three.js/build/three.module.js'),
+    import('../../../tools/compat/deformation_inputs.mjs'), import('../../../tools/compat/deformed_mesh_adapter.mjs'),
+  ]);
+  const exports = await wasm.default();
+  function check(value, message) { if (!value) throw new Error(message); }
+  check(exports?.memory instanceof WebAssembly.Memory, 'Real compiled Wasm memory is required');
+  check(String(THREE.REVISION) === '186', 'Pinned Three.js r186 is required');
+  const geometries = [], materials = [];
+  let skeleton;
+  try {
+    function geometry() {
+      const value = new THREE.BufferGeometry(); geometries.push(value);
+      value.setAttribute('position', new THREE.Float32BufferAttribute([0,0,0, .25,0,0, 0,.25,0], 3));
+      value.setAttribute('color', new THREE.Float32BufferAttribute([1,0,0, 0,1,0, 0,0,1], 3));
+      value.setIndex([0,1,2, 2,1,0]); value.setDrawRange(3,3); return value;
+    }
+    const skinnedGeometry = geometry();
+    skinnedGeometry.setAttribute('skinIndex', new THREE.Uint16BufferAttribute([0,0,0,0, 1,0,0,0, 0,0,0,0],4));
+    skinnedGeometry.setAttribute('skinWeight', new THREE.Uint8BufferAttribute([255,0,0,0, 255,0,0,0, 255,0,0,0],4,true));
+    skinnedGeometry.morphTargetsRelative = true;
+    skinnedGeometry.morphAttributes.position = [new THREE.Float32BufferAttribute([.25,0,0, .25,0,0, .25,0,0],3)];
+    // Normal morphs coexist with position morphs; the admitted unlit material
+    // does not consume normals, while color and depth still use the real path.
+    skinnedGeometry.morphAttributes.normal = [new THREE.Float32BufferAttribute([0,1,0, 0,1,0, 0,1,0],3)];
+    const material = new THREE.MeshBasicMaterial({vertexColors:true,side:THREE.DoubleSide}); materials.push(material);
+    const animated = new THREE.SkinnedMesh(skinnedGeometry,material);
+    const rigid = new THREE.Mesh(geometry(),material);
+    const bones = [new THREE.Bone(),new THREE.Bone()];
+    bones[0].matrixWorld.makeTranslation(.25,0,0); bones[1].matrixWorld.makeTranslation(-.25,0,0);
+    skeleton = new THREE.Skeleton(bones,[new THREE.Matrix4(),new THREE.Matrix4()]);
+    animated.bind(skeleton,new THREE.Matrix4().makeTranslation(.5,0,0)); skeleton.computeBoneTexture();
+    const camera = new THREE.OrthographicCamera(-2,2,2,-2,.1,10);
+    camera.position.z = 3; camera.updateMatrixWorld(true);
+    const meshes = [rigid,animated], base = skinnedGeometry.attributes.position.array.slice(), cases = [];
+    const vertex = new THREE.Vector3();
+    for (let pose = 0; pose < 3; pose++) {
+      animated.morphTargetInfluences[0] = [0.5,-0.25,1.5][pose];
+      bones[0].matrixWorld.makeTranslation(.25 * (pose + 1),0,0);
+      if (pose === 2) skeleton.boneInverses[1].makeTranslation(.125,0,0);
+      skeleton.update();
+      const input = captureDeformationBatch(meshes), positions = evaluateDeformationBatch(input,wasm);
+      for (let mesh = 0; mesh < meshes.length; mesh++) for (let i = 0; i < 3; i++) {
+        meshes[mesh].getVertexPosition(i,vertex);
+        for (let axis = 0; axis < 3; axis++) {
+          const actual = positions[mesh * 9 + i * 3 + axis], expected = Math.fround(vertex.getComponent(axis));
+          check(Math.abs(actual - expected) <= 1e-6, `pose ${pose}, mesh ${mesh}, vertex ${i}, axis ${axis}: ${actual} != ${expected}`);
+        }
+      }
+      const target = pose === 1 ? 'canvas' : 'offscreen';
+      const prepared = prepareDeformedMeshBatchPacket(meshes,camera,64,64,wasm,{target,sourceBackend:'webgl'});
+      check(prepared.packetBytes instanceof Uint8Array && String.fromCharCode(...prepared.packetBytes.slice(0,4)) === 'F3DP','Missing real mesh packet');
+      check(prepared.target === target && prepared.skinnedMeshCount === 1,'Wrong render route or counts');
+      check(prepared.snapshots[1].triangleCount === 1,'Draw range was not preserved');
+      const expanded = prepared.snapshots[1].expandedPositions;
+      for (let i = 0; i < 3; i++) for (let axis = 0; axis < 3; axis++) {
+        check(expanded[i * 3 + axis] === positions[9 + [2,1,0][i] * 3 + axis],'Deformed indexed draw did not reach packet snapshot');
+      }
+      check(base.every((value,i) => value === skinnedGeometry.attributes.position.array[i]),'Base geometry was mutated');
+      cases.push({pose,target,packetBytes:prepared.packetBytes.length});
+    }
+    const report = {passed:true,cases,oracle:'Three.js r186',
+      scope:'Real compiled CPU deformation and packet construction; no GPU execution or timing'};
+    output.textContent = JSON.stringify(report,null,2); return report;
+  } finally {
+    skeleton?.dispose(); geometries.forEach(value => value.dispose()); materials.forEach(value => value.dispose());
+  }
+})();
+ready.catch(error => { output.textContent = JSON.stringify({passed:false,error:String(error.stack || error)},null,2); });
+window.f3dDeformationBatchConformance = Object.freeze({ready});
+</script>
+</html>
