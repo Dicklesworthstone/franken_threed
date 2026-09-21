@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FrankenThreeD — hierarchy and skeleton palette conformance</title>
+  <style>
+    body { max-width: 900px; margin: 2rem auto; padding: 0 1rem; font: 16px/1.5 system-ui, sans-serif; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; padding: 1rem; border: 1px solid; }
+  </style>
+</head>
+<body>
+  <h1>Rust/Wasm skeleton palettes</h1>
+  <p>Tests the compiled skeleton and hierarchy kernels against pinned Three.js r186.
+    Requires the existing Wasm build at <code>/pkg/f3d_runtime.js</code> and the
+    pinned upstream build under <code>/upstream/three.js</code>. No GPU is required.</p>
+  <p>This checks numeric bone palettes, shared joints, texture-backed palette storage,
+    precision boundaries and the hierarchy-to-skeleton connection. It does not certify
+    GPU skinning, a rendered image, animation scheduling, or a measured speedup.</p>
+  <pre id="result" role="status">Loading the compiled application and pinned oracle…</pre>
+  <script type="module">
+    const output = document.getElementById('result');
+    const ready = (async () => {
+      const [wasm, THREE, { runSkeletonConformance }] = await Promise.all([
+        import('/pkg/f3d_runtime.js'),
+        import('../../../upstream/three.js/build/three.module.js'),
+        import('./skeleton_conformance.mjs'),
+      ]);
+      const exports = await wasm.default();
+      if (!(exports?.memory instanceof WebAssembly.Memory)) {
+        throw new Error('Application initializer did not return real Wasm memory');
+      }
+      const report = runSkeletonConformance(wasm, THREE);
+      output.textContent = JSON.stringify(report, null, 2);
+      return report;
+    })();
+    ready.catch(error => {
+      output.textContent = JSON.stringify({ passed: false, error: String(error?.stack || error) }, null, 2);
+    });
+    window.f3dSkeletonConformance = Object.freeze({ ready });
+  </script>
+</body>
+</html>
