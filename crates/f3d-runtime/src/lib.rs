@@ -8,6 +8,7 @@ pub use asupersync::runtime::{BrowserHostServices, RuntimeBuilder};
 
 pub mod burst;
 pub mod deformation;
+pub mod deformation_batch;
 pub mod frame;
 pub mod gpu_host;
 pub mod hierarchy;
@@ -15,6 +16,10 @@ pub mod mesh;
 pub mod publication;
 pub mod simd_compose;
 pub mod skeleton;
+
+pub use deformation_batch::{deform_position_batch, DeformationBatch};
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+pub use deformation_batch::f3d_deform_position_batch;
 
 pub use hierarchy::{HierarchyError, HierarchySolveStats, TransformHierarchy};
 #[cfg(all(feature = "browser", target_arch = "wasm32"))]
