@@ -69,15 +69,27 @@ export function createAnimationDrawOrder(entries, {
       live();if(busy)fail('Cannot update bounds during ordering');
       for(const record of records)if(record.bounds){record.bounds.update();synchronized(record);}
     },
-    order(viewProjection) {
+    // drawIndices selects source entries before culling/sorting, never sort order.
+    // Inactive LODs cannot affect camera admission, bounds tests or alpha order.
+    order(viewProjection, drawIndices = null) {
       live();if(busy)fail('Draw ordering cannot be reentered');busy=true;
       try {
+        let active=records;
+        if(drawIndices!==null) {
+          if(!Array.isArray(drawIndices)||drawIndices.length>records.length)fail('Invalid source draw selection');
+          const selected=new Set();
+          for(const index of drawIndices) {
+            if(!Number.isSafeInteger(index)||index<0||index>=records.length||selected.has(index))fail('Invalid or duplicate source draw index');
+            selected.add(index);
+          }
+          active=records.filter(record=>selected.has(record.index));
+        }
         const version=frustumCulling?pose.version:null;
-        const camera=frustumCulling||(sortObjects&&records.some(r=>r.alphaMode==='BLEND'))?matrix(viewProjection):null;
-        const visible=frustumCulling?records.filter(record=>{
+        const camera=frustumCulling||(sortObjects&&active.some(r=>r.alphaMode==='BLEND'))?matrix(viewProjection):null;
+        const visible=frustumCulling?active.filter(record=>{
           synchronized(record);
           return animationBoundsVisible(record.bounds.snapshot,camera,record.deformer.worldMatrix);
-        }):records;
+        }):active;
         let result;
         if(!sortObjects)result=visible.map(record=>record.mesh);
         else {
@@ -98,7 +110,7 @@ export function createAnimationDrawOrder(entries, {
         if(frustumCulling) {
           if(pose.version!==version)fail('Pose changed during culling');
           cameraSnapshot=camera;
-          stats=Object.freeze({poseVersion:version,testedMeshes:records.length,culledMeshes:records.length-visible.length,submittedDraws:visible.length});
+          stats=Object.freeze({poseVersion:version,testedMeshes:active.length,culledMeshes:active.length-visible.length,submittedDraws:visible.length});
         }
         return result;
       }finally{busy=false;}

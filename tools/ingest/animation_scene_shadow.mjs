@@ -92,21 +92,34 @@ export function prepareAnimationSceneShadows(pose, inputs, options) {
           maxMeshes:Math.max(1,materials.filter(Boolean).length),label});
         live();
         for(let i=0;i<materials.length;i++)if(materials[i]) {
-          handles.push(await map.addMesh(deformers[i],materials[i]));live();
+          handles[i]=await map.addMesh(deformers[i],materials[i]);live();
         }
         if(pose.version!==initialVersion||deformers.some(g=>g.poseVersion!==initialVersion||g.disposed||g.failed))fail('Pose changed during shadow binding');
         materials=[];ready=true;return state;
       }catch(error){disposed=true;release();throw error;}
       finally{initializing=false;}
     },
-    render(inputLighting){
+    // Select before fitting; off-camera selected casters still cast shadows.
+    // Color-frustum visibility is intentionally NOT the caster selection.
+    render(inputLighting,drawIndices=null){
       live();if(!ready)fail('Initialize the scene shadow map before rendering');
+      let indices=Array.from({length:meshCount},(_,i)=>i);
+      if(drawIndices!==null) {
+        if(!Array.isArray(drawIndices)||!drawIndices.length||drawIndices.length>meshCount)fail('Invalid active draw selection');
+        const selected=new Set();
+        for(const index of drawIndices) {
+          if(!Number.isSafeInteger(index)||index<0||index>=meshCount||selected.has(index))fail('Invalid or duplicate active draw index');
+          selected.add(index);
+        }
+        indices=indices.filter(index=>selected.has(index));
+      }
+      const activeHandles=indices.map(i=>handles[i]).filter(Boolean);
       const version=pose.version;
       const lighting=snapshotLighting(inputLighting),light=lighting.lights[lightIndex];
       if(!light)fail('Selected lightIndex is absent from frame lighting');
       const versions=deformers.map(g=>g.version);
-      const world=animationShadowWorldBounds(summaries.map((summary,i)=>({
-        bounds:summary.snapshot.poseVersion===version?summary.snapshot:summary.update(),worldMatrix:deformers[i].worldMatrix,
+      const world=animationShadowWorldBounds(indices.map(i=>({
+        bounds:summaries[i].snapshot.poseVersion===version?summaries[i].snapshot:summaries[i].update(),worldMatrix:deformers[i].worldMatrix,
       })));
       const view=fitAnimationShadowView(light,world,{padding,minNear});
       live();
@@ -114,9 +127,9 @@ export function prepareAnimationSceneShadows(pose, inputs, options) {
       // One depth submission always precedes the receiving color submission.
       // Re-render even at the same pose: source alpha textures can change without
       // advancing pose.version, and lighting may change independently as well.
-      map.render({viewProjection:view.viewProjection,draws:handles});
+      map.render({viewProjection:view.viewProjection,draws:activeHandles});
       return {lighting,shadow:{map,lightIndex,bias,normalBias,strength},stats:Object.freeze({
-        poseVersion:version,lightIndex,casterCount:handles.length,mapVersion:map.version,view,
+        poseVersion:version,lightIndex,casterCount:activeHandles.length,mapVersion:map.version,view,
       })};
     },
     async whenIdle(){live();if(map)await map.whenIdle();live();},

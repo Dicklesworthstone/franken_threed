@@ -58,10 +58,18 @@
  * completion. Overflowed bounds remain visible. No custom shader displacement
  * or occlusion is assumed; native backend pixel equivalence is not certified.
  *
+ * lod:{groups:[{node,levels:[{distance:0,drawIndices:[...]},...]}]} selects
+ * whole drawable levels before sorting/culling. Implicit frames then require
+ * lodCamera:{position:[x,y,z],key:'main',zoom:1}; keys isolate bounded hysteresis
+ * histories. lodStats publishes the selection only after successful color
+ * submission. Explicit frame.draws bypasses LOD; resetLodCamera(key) releases a
+ * history slot. All geometry stays resident and deformation still updates every
+ * mesh. This is distance LOD, not screen-error selection or asset streaming.
+ *
  * shadow:{lightIndex:0} owns a fitted directional/spot depth map, registers
  * OPAQUE/MASK materials against these same deformers, and submits depth before
  * each implicit color frame. BLEND requires blend:'skip' or casters exclusions.
- * Fitting uses all current-pose bounds, including off-camera casters. Map GPU
+ * Fitting uses active-LOD current-pose bounds, including off-camera casters. Map GPU
  * storage and CPU summaries have separate shadow.maxBytes/maxBoundsBytes budgets;
  * shadowBytes/shadowBoundsBytes report them. The color receiver's extra 96-byte
  * uniform is charged to this scene's maxBytes. shadowStats reports the last
@@ -81,7 +89,7 @@ const TEXTURE_FIELDS = ['baseColorTexture', 'metallicRoughnessTexture', 'normalT
 const COAT_FIELDS = ['clearcoatFactor', 'clearcoatRoughnessFactor', 'clearcoatNormalScale'];
 
 export async function createGpuAnimationScene(device, pose, drawables, {
-  rigidGeometry = false, shadow = null, sortObjects = true, frustumCulling = false, maxBoundsBytes = 16*1024*1024, maxBoundsComponents = 16777216, renderer: renderOptions = {}, deformer: deformOptions = {}, maxMeshes = 256, maxBytes = 256 * 1024 * 1024,
+  rigidGeometry = false, shadow = null, lod = null, sortObjects = true, frustumCulling = false, maxBoundsBytes = 16*1024*1024, maxBoundsComponents = 16777216, renderer: renderOptions = {}, deformer: deformOptions = {}, maxMeshes = 256, maxBytes = 256 * 1024 * 1024,
 } = {}) {
   if (!Number.isSafeInteger(maxMeshes) || maxMeshes < 1 || maxMeshes > 4096 ||
       !Number.isSafeInteger(maxBytes) || maxBytes < 1 || !Array.isArray(drawables) ||
@@ -93,7 +101,7 @@ export async function createGpuAnimationScene(device, pose, drawables, {
   const deformers = [], computeDeformers = [], meshes = [], ordering = [];
   let rigidApi, rigidPool;
   const deformationTotal = () => deformationBytes + (rigidPool?.bufferBytes ?? 0);
-  let drawOrder, sceneShadows, shadowStats = null, cullingStats = null;
+  let drawOrder, sceneShadows, lodState, shadowStats = null, cullingStats = null, lodStats = null;
   let renderer, deformationBytes = 0, poseVersion = initialVersion, disposed = false, terminal = null, busy = false;
   let lightingAllocated = false, materialComponents = 0;
   function copyMaterialArray(value, key) {
@@ -106,7 +114,7 @@ export async function createGpuAnimationScene(device, pose, drawables, {
     return Array.from(value);
   }
   function release() {
-    sceneShadows?.dispose(); drawOrder?.dispose();
+    sceneShadows?.dispose(); drawOrder?.dispose(); lodState?.dispose(); lodStats = null;
     for (const mesh of meshes) mesh.dispose();
     for (const gpu of deformers) gpu.dispose();
     rigidPool?.dispose(); renderer?.dispose(); controller.dispose(); deformationBytes = 0;
@@ -127,6 +135,24 @@ export async function createGpuAnimationScene(device, pose, drawables, {
     if (shadowOptions?.casters !== undefined) {
       if (!Array.isArray(shadowOptions.casters) || shadowOptions.casters.length !== drawables.length) fail('ANIMATION_SCENE_SHADOW', 'Expected one caster boolean per drawable');
       shadowOptions.casters = Array.from(shadowOptions.casters);
+    }
+    // Bound and copy nested LOD options before any asynchronous construction.
+    // The selector validates values and unknown fields after its lazy import.
+    let lodOptions = null;
+    if (lod !== null) {
+      if (!lod || typeof lod !== 'object' || Array.isArray(lod)) fail('ANIMATION_SCENE_LOD', 'Expected LOD options or null');
+      lodOptions = {...lod};
+      if (!Array.isArray(lodOptions.groups) || !lodOptions.groups.length || lodOptions.groups.length > drawables.length) fail('ANIMATION_SCENE_LOD', 'Invalid LOD groups');
+      let levels = 0, indices = 0;
+      lodOptions.groups = lodOptions.groups.map(group => {
+        if (!group || typeof group !== 'object' || Array.isArray(group) || !Array.isArray(group.levels) || !group.levels.length ||
+            (levels += group.levels.length) > drawables.length) fail('ANIMATION_SCENE_LOD', 'Invalid aggregate LOD levels');
+        return {...group, levels: group.levels.map(level => {
+          if (!level || typeof level !== 'object' || Array.isArray(level) || !Array.isArray(level.drawIndices) || !level.drawIndices.length ||
+              (indices += level.drawIndices.length) > drawables.length) fail('ANIMATION_SCENE_LOD', 'Invalid aggregate LOD indices');
+          return {...level, drawIndices: Array.from(level.drawIndices)};
+        })};
+      });
     }
     renderOptions = {...renderOptions};
     if (shadowOptions) {
@@ -179,6 +205,11 @@ export async function createGpuAnimationScene(device, pose, drawables, {
     });
     if ((renderOptions.maxDraws ?? drawables.length) < drawables.length || (renderOptions.maxMeshes ?? maxMeshes) < drawables.length) {
       fail('ANIMATION_SCENE_LIMIT', 'Renderer capacity cannot hold the scene');
+    }
+    if (lodOptions) {
+      const {createAnimationLod} = await import('./animation_lod.mjs');
+      unchanged();
+      lodState = createAnimationLod(pose, inputs.length, lodOptions);
     }
     if (shadowOptions) {
       const {prepareAnimationSceneShadows} = await import('./animation_scene_shadow.mjs');
@@ -248,6 +279,15 @@ export async function createGpuAnimationScene(device, pose, drawables, {
     get rigidGeometryStats() { return Object.freeze({meshes: rigidPool?.meshCount ?? 0, uniqueGeometries: rigidPool?.uniqueGeometries ?? 0, bufferBytes: rigidPool?.bufferBytes ?? 0, computeMeshes: computeDeformers.length}); },
     get boundsBytes() { return drawOrder?.boundsBytes ?? 0; },
     get cullingStats() { return cullingStats; },
+    get lodEnabled() { return lodState !== undefined; },
+    get lodCameraCount() { return lodState?.cameraCount ?? 0; },
+    get lodStats() { return lodStats; },
+    resetLodCamera(key = 'default') { return exclusive(() => {
+      if (!lodState) fail('ANIMATION_SCENE_LOD', 'This scene has no LOD selection');
+      lodState.resetCamera(key);
+      if (lodStats?.cameraKey === key) lodStats = null;
+      return scene;
+    }); },
     get shadowEnabled() { return sceneShadows !== undefined; },
     get shadowBytes() { return sceneShadows?.allocatedBytes ?? 0; },
     get shadowBoundsBytes() { return sceneShadows?.boundsBytes ?? 0; },
@@ -259,17 +299,25 @@ export async function createGpuAnimationScene(device, pose, drawables, {
       synchronized();
       try {
         const prepared = {...frame}, implicit = prepared.draws == null;
-        prepared.draws ??= drawOrder ? drawOrder.order(prepared.viewProjection) : meshes;
+        const selection = implicit && lodState ? lodState.prepare(prepared.lodCamera) : null;
+        // This is scene metadata, not an extra renderer option or light field.
+        delete prepared.lodCamera;
+        prepared.draws ??= drawOrder ? drawOrder.order(prepared.viewProjection, selection?.drawIndices ?? null)
+          : selection ? selection.drawIndices.map(index => meshes[index]) : meshes;
         // Use the exact camera snapshot tested by culling for shader packing too.
         if (frustumCulling && implicit) prepared.viewProjection = drawOrder.viewProjection;
         let automatic = null;
         if (sceneShadows && prepared.shadow === undefined) {
           if (!implicit) fail('ANIMATION_SCENE_SHADOW', 'Explicit draws require an explicit shadow map or shadow:null');
           synchronized();
-          automatic = sceneShadows.render(prepared.lighting);
+          automatic = sceneShadows.render(prepared.lighting, selection?.drawIndices ?? null);
           prepared.lighting = automatic.lighting; prepared.shadow = automatic.shadow;
         }
         renderer.render(prepared);
+        // No hysteresis publication on a rejected color frame, even if its
+        // automatic depth pass already submitted. GPU work is not rolled back.
+        if (selection) lodState.commit(selection);
+        lodStats = selection;
         if (sceneShadows) shadowStats = automatic?.stats ?? null;
         if (frustumCulling) cullingStats = implicit ? drawOrder.lastCulling : Object.freeze({
           poseVersion, testedMeshes: 0, culledMeshes: 0, submittedDraws: prepared.draws.length,
