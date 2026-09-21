@@ -37,6 +37,71 @@ const F32_BOUND = 3.4028234663852886e38 / 4;
 // WebGPU's stable flag values; no browser globals are needed merely to import.
 const COPY_SRC = 4, COPY_DST = 8, VERTEX = 32, UNIFORM = 64, STORAGE = 128;
 const WORKGROUP = 64;
+// Opaque membership prevents foreign buffers, duplicate writes and caller-made
+// submission hooks from entering a batch. No device/pose ownership is transferred.
+const batchStates = new WeakMap();
+const copyWorld = Function.call.bind(Float64Array.prototype.set);
+
+/** Update 0..4096 distinct deformers on one device in one queue submission.
+ * All pose inputs are validated before encoding or queue writes. Each mesh keeps
+ * its own palette/weights/output buffers and its existing compute pass boundaries,
+ * including the ordered flat-normal pass. Inputs may belong to different poses.
+ * Returns submission work counts, not a completion promise; drain each owner's
+ * whenIdle() as usual. Preflight failures are recoverable and publish nothing;
+ * encoding/queue failures make all participating deformers terminal.
+ */
+export function updateGpuAnimationDeformers(deformers) {
+  if (!Array.isArray(deformers) || deformers.length > 4096) fail('ANIMATION_GPU_BATCH', 'Expected at most 4096 GPU deformers');
+  const count = deformers.length, states = [], seen = new Set();
+  for (let i = 0; i < count; i++) {
+    const state = batchStates.get(deformers[i]);
+    if (!state || seen.has(state) || (i && state.device !== states[0].device)) {
+      fail('ANIMATION_GPU_BATCH', 'Batch members must be distinct owned deformers on one device');
+    }
+    seen.add(state); states.push(state);
+  }
+  let locked = 0;
+  try {
+    for (const state of states) { state.lock(); locked++; }
+    const versions = states.map(state => state.prepare());
+    // A later pose getter must not invalidate an earlier member's snapshot.
+    for (let i = 0; i < count; i++) states[i].check(versions[i]);
+    const stats = Object.freeze({meshes: count, submissions: count ? 1 : 0,
+      dispatches: states.reduce((n, state) => n + state.dispatches, 0),
+      bufferWrites: states.reduce((n, state) => n + state.bufferWrites, 0),
+      uploadedBytes: states.reduce((n, state) => n + state.uploadedBytes, 0)});
+    if (!count) return stats;
+    const device = states[0].device;
+    let submitted;
+    try {
+      submitted = scoped(device, () => {
+        const encoder = device.createCommandEncoder({label: 'f3d-animation/batch'});
+        for (const state of states) state.encode(encoder);
+        const command = encoder.finish();
+        // Finish every pass before the first queue write. No member can overwrite
+        // another's per-mesh inputs; duplicates were rejected before acquisition.
+        for (let i = 0; i < count; i++) states[i].check(versions[i]);
+        for (const state of states) state.write();
+        device.queue.submit([command]);
+      });
+      submitted.errors.catch(() => {});
+      if (submitted.error) throw submitted.error;
+      const completion = Promise.all([submitted.errors, device.queue.onSubmittedWorkDone()]).catch(error => {
+        for (const state of states) state.reject(error);
+        throw error;
+      });
+      completion.catch(() => {});
+      for (let i = 0; i < count; i++) states[i].publish(versions[i], completion);
+    } catch (error) {
+      submitted?.errors.catch(() => {});
+      for (const state of states) state.reject(error);
+      throw error;
+    }
+    return stats;
+  } finally {
+    for (let i = 0; i < locked; i++) states[i].unlock();
+  }
+}
 
 export const ANIMATION_DEFORM_WGSL = /* wgsl */`
 struct Config { vertices: u32, targets: u32, influences: u32, groups_x: u32 }
@@ -255,7 +320,8 @@ export async function createGpuAnimationDeformer(device, pose, geometry, {
   function prepare() {
     live(); fixed(posePalette, paletteLength); fixed(poseMorphs, morphLength); fixed(poseWorld, worldLength);
     fixed(worldMatrix, 16);
-    if (!Number.isSafeInteger(pose.version) || pose.version < 0) fail('ANIMATION_GPU_VALUE', 'Invalid pose version');
+    const nextVersion = pose.version;
+    if (!Number.isSafeInteger(nextVersion) || nextVersion < 0) fail('ANIMATION_GPU_VALUE', 'Invalid pose version');
     for (let i = 0; i < 16; i++) {
       const value = poseWorld[node * 16 + i];
       if (!Number.isFinite(value)) fail('ANIMATION_GPU_VALUE', 'Non-finite world matrix');
@@ -283,7 +349,8 @@ export async function createGpuAnimationDeformer(device, pose, geometry, {
         }
       }
     }
-    return pose.version;
+    if (pose.version !== nextVersion || pose.disposed) fail('ANIMATION_GPU_CHANGED', 'Pose changed during GPU input capture');
+    return nextVersion;
   }
   let pipeline, bindGroup, normalPipeline, normalBindGroup;
   try {
@@ -324,35 +391,7 @@ export async function createGpuAnimationDeformer(device, pose, geometry, {
   if (source.tangents) attributes.push({shaderLocation: 2, offset: 24, format: 'float32x4'});
   const vertexLayout = Object.freeze({arrayStride: 40, stepMode: 'vertex', attributes: Object.freeze(attributes.map(Object.freeze))});
   function update() {
-    live(); if (busy) fail('ANIMATION_REENTRANT', 'GPU deformation cannot be reentered');
-    busy = true;
-    try {
-      const nextVersion = prepare();
-      const submitted = scoped(device, () => {
-        const encoder = device.createCommandEncoder({label});
-        const pass = encoder.beginComputePass({label});
-        pass.setPipeline(pipeline); pass.setBindGroup(0, bindGroup); pass.dispatchWorkgroups(groupsX, groupsY); pass.end();
-        if (flatNormals) {
-          const normalsPass = encoder.beginComputePass({label: `${label}/flat-normals`});
-          normalsPass.setPipeline(normalPipeline); normalsPass.setBindGroup(0, normalBindGroup);
-          normalsPass.dispatchWorkgroups(normalGroupsX, normalGroupsY); normalsPass.end();
-        }
-        const command = encoder.finish();
-        if (skin) device.queue.writeBuffer(buffers[3], 0, palette);
-        if (targetCount) device.queue.writeBuffer(buffers[4], 0, weights);
-        device.queue.submit([command]);
-      });
-      if (submitted.error) {
-        submitted.errors.catch(() => {}); terminal ??= submitted.error; throw terminal;
-      }
-      // A later queue acknowledgement must not hide an earlier unresolved
-      // error scope. Keep completion cumulative across submitted versions.
-      completion = Promise.race([Promise.all([completion, submitted.errors, device.queue.onSubmittedWorkDone()]), lost])
-        .then(() => { if (terminal) throw terminal; }, error => { terminal ??= error; throw terminal; });
-      completion.catch(() => {});
-      worldMatrix.set(nextWorld); poseVersion = nextVersion; version++;
-      return result;
-    } finally { busy = false; }
+    updateGpuAnimationDeformers([result]); return result;
   }
   const result = Object.freeze({vertexBuffer: buffers[5], vertexCount, vertexLayout, worldMatrix, node,
     bufferBytes: sizes.reduce((a, b) => a + b, 0),
@@ -365,6 +404,42 @@ export async function createGpuAnimationDeformer(device, pose, geometry, {
     get version() { return version; }, get poseVersion() { return poseVersion; },
     get disposed() { return disposed; }, get failed() { return terminal !== null; },
     dispose() { if (busy) fail('ANIMATION_REENTRANT', 'Cannot dispose during GPU submission'); if (!disposed) { disposed = true; release(); } },
+  });
+  batchStates.set(result, {
+    device, prepare,
+    dispatches: flatNormals ? 2 : 1,
+    bufferWrites: Number(!!skin) + Number(targetCount > 0),
+    uploadedBytes: (skin ? palette.byteLength : 0) + (targetCount ? weights.byteLength : 0),
+    lock() {
+      if (busy) fail('ANIMATION_REENTRANT', 'GPU deformation cannot be reentered');
+      busy = true; try { live(); } catch (error) { busy = false; throw error; }
+    },
+    unlock() { busy = false; },
+    check(expected) {
+      live(); fixed(worldMatrix, 16);
+      if (pose.version !== expected) fail('ANIMATION_GPU_CHANGED', 'Pose changed during batched GPU input capture');
+    },
+    encode(encoder) {
+      const pass = encoder.beginComputePass({label});
+      pass.setPipeline(pipeline); pass.setBindGroup(0, bindGroup); pass.dispatchWorkgroups(groupsX, groupsY); pass.end();
+      if (flatNormals) {
+        const normalPass = encoder.beginComputePass({label: `${label}/flat-normals`});
+        normalPass.setPipeline(normalPipeline); normalPass.setBindGroup(0, normalBindGroup);
+        normalPass.dispatchWorkgroups(normalGroupsX, normalGroupsY); normalPass.end();
+      }
+    },
+    write() {
+      if (skin) device.queue.writeBuffer(buffers[3], 0, palette);
+      if (targetCount) device.queue.writeBuffer(buffers[4], 0, weights);
+    },
+    publish(nextVersion, submitted) {
+      // A later batch must not hide an earlier unresolved error scope.
+      completion = Promise.race([Promise.all([completion, submitted]), lost])
+        .then(() => { if (terminal) throw terminal; }, error => { terminal ??= error; throw terminal; });
+      completion.catch(() => {});
+      copyWorld(worldMatrix, nextWorld); poseVersion = nextVersion; version++;
+    },
+    reject(error) { terminal ??= error; release(); },
   });
   try { update(); await result.whenIdle(); return result; }
   catch (error) { result.dispose(); throw error; }
