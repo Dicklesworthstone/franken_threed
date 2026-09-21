@@ -39,3 +39,20 @@ export function emitToUint32(operand, allocateLocal) {
       0x05, ...get(x), 0x0b, 0xab,
     0x05, 0x41, 0, 0x0b];
 }
+
+export const BITWISE_OPS = Object.freeze({
+  '&': 0x71, '|': 0x72, '^': 0x73, '<<': 0x74, '>>': 0x75, '>>>': 0x76,
+});
+
+/** Emit a Number result, or null when this is not a bitwise operator. */
+export function emitBitwiseBinary(operator, left, right, allocateLocal) {
+  if (!Object.hasOwn(BITWISE_OPS, operator)) return null;
+  // i32 shifts already mask the converted shift count to its low five bits.
+  // Only >>> promotes unsigned: every other Number bitwise result is signed.
+  return [...emitToUint32(left, allocateLocal), ...emitToUint32(right, allocateLocal),
+    BITWISE_OPS[operator], operator === '>>>' ? 0xb8 : 0xb7];
+}
+
+export function emitBitwiseNot(operand, allocateLocal) {
+  return [...emitToUint32(operand, allocateLocal), 0x41, 0x7f, 0x73, 0xb7];
+}

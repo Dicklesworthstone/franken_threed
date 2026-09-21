@@ -3,8 +3,10 @@
  * functions. No host imports, source evaluation, captures, arrays or implicit
  * conversions are admitted. Each call evaluates arguments once, left to right;
  * a helper owns its scalar parameters and lexical locals, just as in JavaScript.
+ * Number bitwise operations share the kernel's exact modulo-2^32 lowering.
  */
 import * as acorn from 'acorn';
+import { BITWISE_OPS, emitBitwiseBinary, emitBitwiseNot } from './numeric_integer.mjs';
 
 const F64 = 0x7c;
 const I32 = 0x7f;
@@ -96,15 +98,22 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
       if (writing && !binding.mutable) fail(`Cannot assign to constant helper binding ${node.name}`, node);
       return binding.index;
     }
+    function binary(operator, left, right) {
+      return emitBitwiseBinary(operator, left, right, () => fn.params.length + localCount++)
+        ?? [...left, ...right, OPS[operator]];
+    }
     function expression(node, depth = 0) {
       if (!node || depth > 128) fail('Scalar helper expression exceeds the nesting limit', node);
       if (node.type === 'Literal' && typeof node.value === 'number') return number(node.value);
       if (node.type === 'Identifier') return get(lookup(node));
-      if (node.type === 'UnaryExpression' && ['+', '-'].includes(node.operator)) {
-        return [...expression(node.argument, depth + 1), ...(node.operator === '-' ? [0x9a] : [])];
+      if (node.type === 'UnaryExpression' && ['+', '-', '~'].includes(node.operator)) {
+        const operand = expression(node.argument, depth + 1);
+        if (node.operator === '~') return emitBitwiseNot(operand, () => fn.params.length + localCount++);
+        return [...operand, ...(node.operator === '-' ? [0x9a] : [])];
       }
-      if (node.type === 'BinaryExpression' && Object.hasOwn(OPS, node.operator)) {
-        return [...expression(node.left, depth + 1), ...expression(node.right, depth + 1), OPS[node.operator]];
+      if (node.type === 'BinaryExpression' &&
+          (Object.hasOwn(OPS, node.operator) || Object.hasOwn(BITWISE_OPS, node.operator))) {
+        return binary(node.operator, expression(node.left, depth + 1), expression(node.right, depth + 1));
       }
       if (node.type === 'ConditionalExpression') {
         return [...condition(node.test, depth + 1), 0x04, F64,
@@ -187,10 +196,12 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
             if (update?.type === 'UpdateExpression' && ['++', '--'].includes(update.operator)) {
               const local = lookup(update.argument, true);
               bytes.push(...get(local), ...number(1), OPS[update.operator[0]], ...set(local));
-            } else if (update?.type === 'AssignmentExpression' && ['=', '+=', '-=', '*=', '/='].includes(update.operator)) {
+            } else if (update?.type === 'AssignmentExpression' &&
+                ['=', '+=', '-=', '*=', '/=', '&=', '|=', '^=', '<<=', '>>=', '>>>='].includes(update.operator)) {
               const local = lookup(update.left, true);
-              bytes.push(...(update.operator === '=' ? [] : get(local)), ...expression(update.right),
-                ...(update.operator === '=' ? [] : [OPS[update.operator[0]]]), ...set(local));
+              const value = expression(update.right);
+              bytes.push(...(update.operator === '=' ? value
+                : binary(update.operator.slice(0, -1), get(local), value)), ...set(local));
             } else {
               fail(`Scalar helper statement ${statement.type} is not closed`, statement);
             }

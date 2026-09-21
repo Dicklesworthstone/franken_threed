@@ -6,12 +6,14 @@
  * Scalar accumulators and a final numeric return execute in source iteration order.
  * Closed scalar helpers execute as private Wasm functions. No host calls,
  * escapes, implicit numeric conversions or arithmetic reassociation.
+ * Number bitwise operators use explicit modulo-2^32 lowering, returning f64.
  * Runtime shape/ownership guards live in numeric_kernel_runtime.mjs. This narrow
  * opt-in ABI is not proof of whole-application closure or a speedup claim.
  */
 import * as acorn from 'acorn';
 import { createScalarHelperCompiler } from './numeric_helpers.mjs';
 import { createMathIntrinsicCompiler } from './numeric_intrinsics.mjs';
+import { BITWISE_OPS, emitBitwiseBinary, emitBitwiseNot } from './numeric_integer.mjs';
 
 export const NUMERIC_KERNEL_SECTION = 'f3d.numeric-kernel';
 const F64 = 0x7c;
@@ -262,6 +264,10 @@ export function compileNumericKernel(source, {
       ? [...prefix, 0x2a, 2, ...memoryOffset(param), 0xbb] // f32.load; f64.promote_f32
       : [...prefix, 0x2b, 3, ...memoryOffset(param)]; // f64.load
   };
+  function binary(operator, left, right) {
+    return emitBitwiseBinary(operator, left, right, () => temporaryBase + temporaryCount++)
+      ?? [...left, ...right, OPS[operator]];
+  }
   function expression(node, depth = 0) {
     if (!node || depth > 128) fail('Expression nesting exceeds the admitted bound', node);
     if (node.type === 'Literal' && typeof node.value === 'number') return number(node.value);
@@ -286,12 +292,14 @@ export function compileNumericKernel(source, {
       if (bounds.has(name) && member(node, name, 'length', false)) return [...get(bounds.get(name)), 0xb8];
     } else if (member(node, boundParam.name, 'length', false)) return [...get(countLocal), 0xb8];
     if (node.type === 'MemberExpression') return load(arrayParameter(node, false, depth));
-    if (node.type === 'UnaryExpression' && (node.operator === '+' || node.operator === '-')) {
+    if (node.type === 'UnaryExpression' && ['+', '-', '~'].includes(node.operator)) {
       const operand = expression(node.argument, depth + 1);
+      if (node.operator === '~') return emitBitwiseNot(operand, () => temporaryBase + temporaryCount++);
       return node.operator === '-' ? [...operand, 0x9a] : operand;
     }
-    if (node.type === 'BinaryExpression' && Object.hasOwn(OPS, node.operator)) {
-      return [...expression(node.left, depth + 1), ...expression(node.right, depth + 1), OPS[node.operator]];
+    if (node.type === 'BinaryExpression' &&
+        (Object.hasOwn(OPS, node.operator) || Object.hasOwn(BITWISE_OPS, node.operator))) {
+      return binary(node.operator, expression(node.left, depth + 1), expression(node.right, depth + 1));
     }
     if (node.type === 'ConditionalExpression') {
       return [...condition(node.test, depth + 1), 0x04, F64,
@@ -419,13 +427,14 @@ export function compileNumericKernel(source, {
           continue;
         }
         if (assignment?.type !== 'AssignmentExpression' ||
-            !['=', '+=', '-=', '*=', '/='].includes(assignment.operator)) {
+            !['=', '+=', '-=', '*=', '/=', '&=', '|=', '^=', '<<=', '>>=', '>>>='].includes(assignment.operator)) {
           fail('Loop statements must initialize scalars, branch, or assign scalars/array[index]', statement);
         }
         if (assignment.left.type === 'Identifier') {
           const local = mutableScalar(assignment.left);
-          bytes.push(...(assignment.operator === '=' ? [] : get(local)), ...expression(assignment.right),
-            ...(assignment.operator === '=' ? [] : [OPS[assignment.operator[0]]]), ...set(local));
+          const value = expression(assignment.right);
+          bytes.push(...(assignment.operator === '=' ? value
+            : binary(assignment.operator.slice(0, -1), get(local), value)), ...set(local));
           scalarWrites.add(local);
           continue;
         }
@@ -436,8 +445,7 @@ export function compileNumericKernel(source, {
         // stores load through that same checked address, preserving collisions
         // and the Float32 rounding of EACH source-ordered store.
         bytes.push(...(target.setup ?? []), ...address(target),
-          ...(compound ? load(target, true) : []), ...value,
-          ...(compound ? [OPS[assignment.operator[0]]] : []),
+          ...(compound ? binary(assignment.operator.slice(0, -1), load(target, true), value) : value),
           // Round at EACH float32 store, including stores read again in this loop.
           ...(target.type === 'f32[]' ? [0xb6, 0x38, 2] : [0x39, 3]), ...memoryOffset(target));
         writes.add(target.name);
