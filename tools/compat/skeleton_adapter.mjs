@@ -43,7 +43,29 @@ function matrixElements(matrix) {
 function range(view, elements = view.length) {
   return { buffer: view.buffer, start: view.byteOffset, end: view.byteOffset + elements * view.BYTES_PER_ELEMENT };
 }
-function overlaps(a, b) { return a.buffer === b.buffer && a.start < b.end && b.start < a.end; }
+// Group and sweep byte intervals, rather than comparing every rig against all
+// joints. Read/read overlap is legal; any overlap involving a write is not.
+function validateRanges(sources, destinations) {
+  const banks = new Map();
+  for (const [items, write] of [[sources, false], [destinations, true]]) {
+    for (const item of items) {
+      if (item.start === item.end) continue;
+      let bank = banks.get(item.buffer);
+      if (!bank) { bank = []; banks.set(item.buffer, bank); }
+      bank.push({ start: item.start, end: item.end, write });
+    }
+  }
+  for (const bank of banks.values()) {
+    bank.sort((a, b) => a.start - b.start);
+    let readEnd = 0, writeEnd = 0;
+    for (const item of bank) {
+      requireThat(item.start >= writeEnd && (!item.write || item.start >= readEnd),
+        'SKELETON_ALIAS', 'palette writes overlap another palette or matrix input');
+      if (item.write) writeEnd = Math.max(writeEnd, item.end);
+      else readEnd = Math.max(readEnd, item.end);
+    }
+  }
+}
 function same(values, packed, offset, count) {
   if (values.length < count) return false;
   for (let i = 0; i < count; i++) if (!Object.is(values[i], packed[offset + i])) return false;
@@ -121,11 +143,7 @@ export function bindThreeSkeletonPalettes(wasm, skeletons, { maxJoints = 65536 }
         destination, destinationLength: destination.length, previous: copyF32(destination, count * 16),
         texture: skeleton.boneTexture, offset, count });
     }
-    for (let i = 0; i < destinations.length; i++) {
-      requireThat(!destinations.slice(0, i).some(other => overlaps(destinations[i], other)) &&
-        !sources.some(source => overlaps(destinations[i], source)),
-        'SKELETON_ALIAS', 'palette writes overlap another palette or matrix input');
-    }
+    validateRanges(sources, destinations);
     const worlds = new Float64Array(jointCount * 16), inverses = new Float64Array(jointCount * 16);
     for (const row of rows) for (let j = 0; j < row.count; j++) {
       worlds.set(row.worldArrays[j], row.offset + j * 16);
