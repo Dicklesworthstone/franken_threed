@@ -24,6 +24,8 @@
  * within one frame instead of overwriting shared inputs before either dispatch.
  * version/poseVersion acknowledge SUBMISSION, not GPU completion. whenIdle()
  * acknowledges prior work and surfaces validation/OOM/device-loss errors.
+ * An unchanged member of an explicitly input-sensitive batch acknowledges reuse
+ * of its prior submission while publishing its current world/version snapshot.
  *
  * Arithmetic is WGSL f32, not the CPU sampler's f64 intermediate arithmetic;
  * this is an explicit numerical execution profile, never automatic replacement
@@ -49,8 +51,14 @@ const copyWorld = Function.call.bind(Float64Array.prototype.set);
  * Returns submission work counts, not a completion promise; drain each owner's
  * whenIdle() as usual. Preflight failures are recoverable and publish nothing;
  * encoding/queue failures make all participating deformers terminal.
+ * skipUnchanged:true compares exact f32 input words (including signed zero) to
+ * the last submitted palette/morph values, never to an unsubmitted preparation.
+ * Unchanged meshes still validate and publish current world/version snapshots.
+ * Only this module may write the returned vertexBuffer when using this option.
+ * Input shadows cost inputCacheBytes CPU bytes per deformer, not GPU buffers.
  */
-export function updateGpuAnimationDeformers(deformers) {
+export function updateGpuAnimationDeformers(deformers, {skipUnchanged = false} = {}) {
+  if (typeof skipUnchanged !== 'boolean') fail('ANIMATION_GPU_BATCH', 'skipUnchanged must be boolean');
   if (!Array.isArray(deformers) || deformers.length > 4096) fail('ANIMATION_GPU_BATCH', 'Expected at most 4096 GPU deformers');
   const count = deformers.length, states = [], seen = new Set();
   for (let i = 0; i < count; i++) {
@@ -66,22 +74,30 @@ export function updateGpuAnimationDeformers(deformers) {
     const versions = states.map(state => state.prepare());
     // A later pose getter must not invalidate an earlier member's snapshot.
     for (let i = 0; i < count; i++) states[i].check(versions[i]);
-    const stats = Object.freeze({meshes: count, submissions: count ? 1 : 0,
-      dispatches: states.reduce((n, state) => n + state.dispatches, 0),
-      bufferWrites: states.reduce((n, state) => n + state.bufferWrites, 0),
-      uploadedBytes: states.reduce((n, state) => n + state.uploadedBytes, 0)});
-    if (!count) return stats;
+    const pending = skipUnchanged ? states.filter(state => state.changed()) : states;
+    const stats = Object.freeze({meshes: count, dispatchedMeshes: pending.length, skippedMeshes: count - pending.length,
+      submissions: pending.length ? 1 : 0,
+      dispatches: pending.reduce((n, state) => n + state.dispatches, 0),
+      bufferWrites: pending.reduce((n, state) => n + state.bufferWrites, 0),
+      uploadedBytes: pending.reduce((n, state) => n + state.uploadedBytes, 0)});
+    if (!pending.length) {
+      // The shader inputs are bit-identical to the last submitted inputs. Only
+      // world transforms and version acknowledgements change; retain outstanding
+      // completion/error chains rather than inventing a GPU submission.
+      for (let i = 0; i < count; i++) states[i].publish(versions[i], null);
+      return stats;
+    }
     const device = states[0].device;
     let submitted;
     try {
       submitted = scoped(device, () => {
         const encoder = device.createCommandEncoder({label: 'f3d-animation/batch'});
-        for (const state of states) state.encode(encoder);
+        for (const state of pending) state.encode(encoder);
         const command = encoder.finish();
         // Finish every pass before the first queue write. No member can overwrite
         // another's per-mesh inputs; duplicates were rejected before acquisition.
         for (let i = 0; i < count; i++) states[i].check(versions[i]);
-        for (const state of states) state.write();
+        for (const state of pending) state.write();
         device.queue.submit([command]);
       });
       submitted.errors.catch(() => {});
@@ -302,10 +318,15 @@ export async function createGpuAnimationDeformer(device, pose, geometry, {
   }
   const palette = new Float32Array(paletteCount), weights = new Float32Array(sizes[4] / 4);
   if (!skin) palette[0] = palette[5] = palette[10] = palette[15] = 1;
+  // Separate staging and submitted shadows are essential: failed preparation
+  // must not make a later retry appear already resident. Word equality preserves
+  // signed zeros and the actual uploaded f32 rounding, without reading GPU data.
+  const paletteWords = new Uint32Array(palette.buffer), morphWords = new Uint32Array(weights.buffer);
+  let lastPalette = new Uint32Array(skin ? paletteCount : 0), lastMorphs = new Uint32Array(targetCount);
   const worldMatrix = new Float64Array(16), nextWorld = new Float64Array(16), bounds = new Float64Array(3);
   let disposed = false, terminal = null, busy = false, version = -1, poseVersion = -1, completion = Promise.resolve();
   const buffers = [];
-  const release = () => { for (const buffer of buffers) buffer.destroy(); buffers.length = 0; };
+  const release = () => { for (const buffer of buffers) buffer.destroy(); buffers.length = 0; lastPalette = null; lastMorphs = null; };
   const lost = device.lost.then(info => {
     terminal ??= new AnimationPoseError('ANIMATION_GPU_LOST', info?.message || 'WebGPU device lost');
     release(); throw terminal;
@@ -395,6 +416,7 @@ export async function createGpuAnimationDeformer(device, pose, geometry, {
   }
   const result = Object.freeze({vertexBuffer: buffers[5], vertexCount, vertexLayout, worldMatrix, node,
     bufferBytes: sizes.reduce((a, b) => a + b, 0),
+    get inputCacheBytes() { return (lastPalette?.byteLength ?? 0) + (lastMorphs?.byteLength ?? 0); },
     execution: 'webgpu-compute-f32', update,
     async whenIdle() {
       live();
@@ -407,6 +429,12 @@ export async function createGpuAnimationDeformer(device, pose, geometry, {
   });
   batchStates.set(result, {
     device, prepare,
+    changed() {
+      if (version < 0) return true;
+      for (let i = 0; i < lastPalette.length; i++) if (lastPalette[i] !== paletteWords[i]) return true;
+      for (let i = 0; i < lastMorphs.length; i++) if (lastMorphs[i] !== morphWords[i]) return true;
+      return false;
+    },
     dispatches: flatNormals ? 2 : 1,
     bufferWrites: Number(!!skin) + Number(targetCount > 0),
     uploadedBytes: (skin ? palette.byteLength : 0) + (targetCount ? weights.byteLength : 0),
@@ -434,9 +462,13 @@ export async function createGpuAnimationDeformer(device, pose, geometry, {
     },
     publish(nextVersion, submitted) {
       // A later batch must not hide an earlier unresolved error scope.
-      completion = Promise.race([Promise.all([completion, submitted]), lost])
-        .then(() => { if (terminal) throw terminal; }, error => { terminal ??= error; throw terminal; });
-      completion.catch(() => {});
+      if (submitted !== null) {
+        completion = Promise.race([Promise.all([completion, submitted]), lost])
+          .then(() => { if (terminal) throw terminal; }, error => { terminal ??= error; throw terminal; });
+        completion.catch(() => {});
+      }
+      lastPalette.set(paletteWords.subarray(0, lastPalette.length));
+      lastMorphs.set(morphWords.subarray(0, lastMorphs.length));
       copyWorld(worldMatrix, nextWorld); poseVersion = nextVersion; version++;
     },
     reject(error) { terminal ??= error; release(); },

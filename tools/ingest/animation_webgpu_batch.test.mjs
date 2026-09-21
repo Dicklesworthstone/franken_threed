@@ -24,7 +24,7 @@ test('64 deformations use one encoder, submit and acknowledgement with per-mesh 
   p.version++;
   for(let i=0;i<64;i++){p.jointMatrices[i*16+14]=i/2;p.morphWeights[i]=i/64;}
   d.onSubmit=()=>assert.ok(meshes.every(m=>m.poseVersion===0),'publication follows submit');
-  const stats=batch(meshes);assert.deepEqual(stats,{meshes:64,submissions:1,dispatches:64,bufferWrites:128,uploadedBytes:4352});
+  const stats=batch(meshes);assert.deepEqual(stats,{meshes:64,dispatchedMeshes:64,skippedMeshes:0,submissions:1,dispatches:64,bufferWrites:128,uploadedBytes:4352});
   assert.equal(d.submissions.length,1);assert.equal(d.submissions[0].length,64);assert.equal(d.encoders,1);assert.equal(d.acks,1);
   for(let i=0;i<64;i++){
     const command=d.submissions[0][i];assert.equal(new Float32Array(command.palette.buffer)[14],i/2);
@@ -72,7 +72,7 @@ test('duplicate, foreign, mixed-device and oversized batches are refused before 
 });
 
 test('empty batches do not allocate, enqueue or require a device',()=>{
-  assert.deepEqual(batch([]),{meshes:0,submissions:0,dispatches:0,bufferWrites:0,uploadedBytes:0});
+  assert.deepEqual(batch([]),{meshes:0,dispatchedMeshes:0,skippedMeshes:0,submissions:0,dispatches:0,bufferWrites:0,uploadedBytes:0});
 });
 
 test('independent poses on the same device keep independent version stamps',async t=>{
@@ -140,4 +140,65 @@ test('publication does not invoke an overridden setter on an exposed world view'
   const {pose:p,meshes}=await fixture(t,2);p.version++;p.worldMatrices[12]=42;
   for(const m of meshes)m.worldMatrix.set=()=>{throw Error('caller setter invoked');};
   batch(meshes);assert.ok(meshes.every(m=>m.poseVersion===1));assert.equal(meshes[0].worldMatrix[12],42);await drain(meshes);
+});
+
+
+test('unchanged inputs advance all world snapshots without a write, encoder, submit or new acknowledgement',async t=>{
+  const {device:d,pose:p,meshes}=await fixture(t,64);p.version++;
+  for(let i=0;i<64;i++)p.worldMatrices[i*16+12]+=100;
+  const stats=batch(meshes,{skipUnchanged:true});
+  assert.deepEqual(stats,{meshes:64,dispatchedMeshes:0,skippedMeshes:64,submissions:0,dispatches:0,bufferWrites:0,uploadedBytes:0});
+  assert.equal(d.encoders,0);assert.equal(d.acks,0);assert.equal(d.writes.length,0);assert.equal(d.submissions.length,0);
+  assert.ok(meshes.every(m=>m.poseVersion===1&&m.version===1));assert.equal(meshes[63].worldMatrix[12],352);
+  assert.ok(meshes.every(m=>m.inputCacheBytes===68));await drain(meshes);
+});
+
+test('a changed subset alone is dispatched while unchanged members acknowledge the same pose',async t=>{
+  const {device:d,pose:p,meshes}=await fixture(t,64);p.version++;p.jointMatrices[17*16+14]=2;p.morphWeights[49]=0.5;
+  const stats=batch(meshes,{skipUnchanged:true});assert.equal(stats.dispatchedMeshes,2);assert.equal(stats.skippedMeshes,62);
+  assert.equal(stats.submissions,1);assert.equal(stats.uploadedBytes,136);
+  assert.deepEqual(d.submissions[0].map(p=>p.label),['mesh-17','mesh-49']);assert.ok(meshes.every(m=>m.poseVersion===1));
+  d.clear();p.version++;assert.equal(batch(meshes,{skipUnchanged:true}).dispatches,0);await drain(meshes);
+});
+
+test('word comparisons retain signed zero changes but ignore differences lost in f32 conversion',async t=>{
+  const {device:d,pose:p,meshes}=await fixture(t,1);p.morphWeights[0]=-0;
+  assert.equal(batch(meshes,{skipUnchanged:true}).dispatchedMeshes,1);
+  assert.equal(d.submissions[0][0].weights[0],0x80000000);
+  p.morphWeights[0]=1;batch(meshes,{skipUnchanged:true});d.clear();p.morphWeights[0]=1+2**-30;p.version++;
+  assert.equal(batch(meshes,{skipUnchanged:true}).dispatchedMeshes,0);assert.equal(d.encoders,0);
+  p.morphWeights[0]=1+2**-22;assert.equal(batch(meshes,{skipUnchanged:true}).dispatchedMeshes,1);await drain(meshes);
+});
+
+test('preparation failure never updates the submitted input cache or hides a changed mesh on retry',async t=>{
+  const {device:d,pose:p,meshes}=await fixture(t,2);p.version++;p.morphWeights[0]=0.5;p.morphWeights[1]=NaN;
+  assert.throws(()=>batch(meshes,{skipUnchanged:true}),{code:'ANIMATION_GPU_VALUE'});assert.equal(d.submissions.length,0);
+  p.morphWeights[1]=0;const stats=batch(meshes,{skipUnchanged:true});assert.equal(stats.dispatchedMeshes,1);
+  assert.equal(d.submissions[0][0].label,'mesh-0');assert.equal(new Float32Array(d.submissions[0][0].weights.buffer)[0],0.5);await drain(meshes);
+});
+
+test('skipping a later unchanged batch does not hide an earlier pending validation failure',async t=>{
+  const {device:d,meshes}=await fixture(t,2),gate=deferred();d.scopeResult=gate.promise;batch(meshes);
+  d.clear();assert.equal(batch(meshes,{skipUnchanged:true}).submissions,0);gate.resolve({message:'old error'});
+  for(const m of meshes)await assert.rejects(m.whenIdle(),{code:'ANIMATION_GPU_DEVICE'});
+  assert.ok(meshes.every(m=>m.failed));
+});
+
+test('flat normals skip with unchanged deformation and run after changed deformation',async t=>{
+  const {device:d,pose:p,meshes}=await fixture(t,2,{flat:true});
+  assert.equal(batch(meshes,{skipUnchanged:true}).dispatches,0);p.morphWeights[0]=1;
+  assert.equal(batch(meshes,{skipUnchanged:true}).dispatches,2);
+  assert.deepEqual(d.submissions[0].map(p=>p.entryPoint),['deform','flat_normals']);await drain(meshes);
+});
+
+test('unskinned unmorphed geometry requires no further compute after initial creation',async t=>{
+  const d=recordingDevice(),p=packedPose(1,{skin:false,morph:false});
+  const m=await createGpuAnimationDeformer(d,p,geometry(0,{skin:false,morph:false}));t.after(()=>m.dispose());d.clear();
+  p.version++;p.worldMatrices[12]=7;assert.equal(batch([m],{skipUnchanged:true}).dispatches,0);assert.equal(m.worldMatrix[12],7);
+  assert.equal(m.inputCacheBytes,0);assert.equal(d.encoders,0);await m.whenIdle();
+});
+
+test('invalid skip policy is refused without deformer acquisition or queue work',async t=>{
+  const {device:d,meshes}=await fixture(t,1);for(const value of [null,1,'yes'])assert.throws(()=>batch(meshes,{skipUnchanged:value}),{code:'ANIMATION_GPU_BATCH'});
+  assert.equal(d.encoders,0);meshes[0].update();await drain(meshes);
 });

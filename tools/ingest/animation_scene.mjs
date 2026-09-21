@@ -39,6 +39,14 @@
  * Shared GPU bytes count once in maxBytes. The pool retains the same number of
  * CPU comparison bytes plus one bounded incoming snapshot; rigidGeometryStats
  * reports unique buffers and mesh handles. Omission preserves the compute path.
+ * deformationBatch:true validates compute inputs as a group, omits dispatches
+ * with unchanged submitted f32 palette/morph words, and submits changed meshes
+ * once at the existing update/upload boundary. All transforms and pose versions
+ * remain current, including inactive LOD levels and off-camera shadow casters.
+ * No render-time deformation, implicit asynchronous work, or GPU readback.
+ * deformationStats counts the latest successful batch upload, excluding initial
+ * construction. deformationInputCacheBytes reports CPU input shadows separately
+ * from the unchanged GPU buffer budget. Omission retains individual submissions.
  * renderer.environment:true receives a borrowed frame.environment:{map,...}.
  * Its extra 64-byte receiver uniform is reserved in the scene GPU budget;
  * environment textures remain caller-owned. See ANIMATION_ENVIRONMENT.md.
@@ -81,7 +89,8 @@
  */
 import {createAnimationDrawOrder} from './animation_draw_order.mjs';
 import {createAnimationController} from './animation_controller.mjs';
-import {createGpuAnimationDeformer} from './animation_webgpu.mjs';
+import * as gpuDeformation from './animation_webgpu.mjs';
+const {createGpuAnimationDeformer, updateGpuAnimationDeformers} = gpuDeformation;
 import {createGpuAnimationRenderer, AnimationRenderError} from './animation_render.mjs';
 const fail = (code, message) => { throw new AnimationRenderError(code, message); };
 const TEXTURE_FIELDS = ['baseColorTexture', 'metallicRoughnessTexture', 'normalTexture', 'emissiveTexture', 'occlusionTexture',
@@ -89,17 +98,18 @@ const TEXTURE_FIELDS = ['baseColorTexture', 'metallicRoughnessTexture', 'normalT
 const COAT_FIELDS = ['clearcoatFactor', 'clearcoatRoughnessFactor', 'clearcoatNormalScale'];
 
 export async function createGpuAnimationScene(device, pose, drawables, {
-  rigidGeometry = false, shadow = null, lod = null, sortObjects = true, frustumCulling = false, maxBoundsBytes = 16*1024*1024, maxBoundsComponents = 16777216, renderer: renderOptions = {}, deformer: deformOptions = {}, maxMeshes = 256, maxBytes = 256 * 1024 * 1024,
+  deformationBatch = false, rigidGeometry = false, shadow = null, lod = null, sortObjects = true, frustumCulling = false, maxBoundsBytes = 16*1024*1024, maxBoundsComponents = 16777216, renderer: renderOptions = {}, deformer: deformOptions = {}, maxMeshes = 256, maxBytes = 256 * 1024 * 1024,
 } = {}) {
   if (!Number.isSafeInteger(maxMeshes) || maxMeshes < 1 || maxMeshes > 4096 ||
       !Number.isSafeInteger(maxBytes) || maxBytes < 1 || !Array.isArray(drawables) ||
       !drawables.length || drawables.length > maxMeshes) fail('ANIMATION_SCENE_LIMIT', 'Invalid mesh count or GPU buffer budget');
+  if (typeof deformationBatch !== 'boolean') fail('ANIMATION_SCENE_BATCH', 'deformationBatch must be boolean');
   if (typeof rigidGeometry !== 'boolean') fail('ANIMATION_SCENE_RIGID', 'rigidGeometry must be boolean');
   if (typeof sortObjects !== 'boolean') fail('ANIMATION_SCENE_SORT', 'sortObjects must be boolean');
   if (typeof frustumCulling !== 'boolean' || (frustumCulling && (!Number.isSafeInteger(maxBoundsBytes) || maxBoundsBytes < 1 || !Number.isSafeInteger(maxBoundsComponents) || maxBoundsComponents < 1))) fail('ANIMATION_SCENE_CULL', 'Invalid frustum culling options');
   const controller = createAnimationController(pose), initialVersion = pose.version;
-  const deformers = [], computeDeformers = [], meshes = [], ordering = [];
-  let rigidApi, rigidPool;
+  const deformers = [], computeDeformers = [], rigidDeformers = [], meshes = [], ordering = [];
+  let rigidApi, rigidPool, deformationStats = null;
   const deformationTotal = () => deformationBytes + (rigidPool?.bufferBytes ?? 0);
   let drawOrder, sceneShadows, lodState, shadowStats = null, cullingStats = null, lodStats = null;
   let renderer, deformationBytes = 0, poseVersion = initialVersion, disposed = false, terminal = null, busy = false;
@@ -114,7 +124,7 @@ export async function createGpuAnimationScene(device, pose, drawables, {
     return Array.from(value);
   }
   function release() {
-    sceneShadows?.dispose(); drawOrder?.dispose(); lodState?.dispose(); lodStats = null;
+    sceneShadows?.dispose(); drawOrder?.dispose(); lodState?.dispose(); lodStats = null; deformationStats = null;
     for (const mesh of meshes) mesh.dispose();
     for (const gpu of deformers) gpu.dispose();
     rigidPool?.dispose(); renderer?.dispose(); controller.dispose(); deformationBytes = 0;
@@ -237,6 +247,7 @@ export async function createGpuAnimationScene(device, pose, drawables, {
         if (remaining < 0) fail('ANIMATION_SCENE_LIMIT', 'Scene GPU buffer budget exhausted');
         rigidPool ??= rigidApi.createGpuRigidGeometryPool(device, pose, {...deformOptions, maxBytes, maxMeshes});
         gpu = await rigidPool.addMesh(geometry, {maxAdditionalBytes: Math.min(remaining, deformOptions.maxBytes ?? 128 * 1024 * 1024)});
+        rigidDeformers.push(gpu);
       } else {
         if (remaining < 1) fail('ANIMATION_SCENE_LIMIT', 'Scene GPU buffer budget exhausted');
         gpu = await createGpuAnimationDeformer(device, pose, geometry, {...deformOptions,
@@ -259,12 +270,20 @@ export async function createGpuAnimationScene(device, pose, drawables, {
   function upload() {
     try {
       const nextVersion = pose.version;
-      for (const gpu of deformers) gpu.update();
+      let batchStats = null;
+      if (deformationBatch) {
+        // Rigid handles do not belong to the compute batch. They still publish
+        // their current transforms before culling or any color/shadow draw.
+        for (const gpu of rigidDeformers) gpu.update();
+        batchStats = updateGpuAnimationDeformers(computeDeformers, {skipUnchanged: true});
+      } else for (const gpu of deformers) gpu.update();
       if (frustumCulling) drawOrder.updateBounds();
       if (deformers.some(gpu => gpu.poseVersion !== nextVersion) || pose.version !== nextVersion) {
         fail('ANIMATION_SCENE_CHANGED', 'Pose changed during GPU upload');
       }
       poseVersion = nextVersion;
+      if (batchStats) deformationStats = Object.freeze({...batchStats, poseVersion,
+        rigidMeshes: rigidDeformers.length});
     } catch (error) { failGroup(error); }
     return scene;
   }
@@ -275,6 +294,9 @@ export async function createGpuAnimationScene(device, pose, drawables, {
   }
   const scene = Object.freeze({pose, controller, draws: Object.freeze(meshes), deformers: Object.freeze(deformers),
     get poseVersion() { return poseVersion; },
+    get deformationBatchEnabled() { return deformationBatch; },
+    get deformationStats() { return deformationStats; },
+    get deformationInputCacheBytes() { return disposed || terminal ? 0 : computeDeformers.reduce((n, gpu) => n + (gpu.inputCacheBytes ?? 0), 0); },
     get bufferBytes() { return renderer.allocatedBytes + deformationTotal(); },
     get rigidGeometryStats() { return Object.freeze({meshes: rigidPool?.meshCount ?? 0, uniqueGeometries: rigidPool?.uniqueGeometries ?? 0, bufferBytes: rigidPool?.bufferBytes ?? 0, computeMeshes: computeDeformers.length}); },
     get boundsBytes() { return drawOrder?.boundsBytes ?? 0; },
