@@ -89,17 +89,23 @@ function sourceInfo(source, node, drawIndex) {
 const compareHits = (a, b) => a.distance - b.distance || a.drawIndex - b.drawIndex || a.faceIndex - b.faceIndex;
 
 /** descriptors: [{deformer, indices?, texCoords?, doubleSided?, source?}].
- * Borrowed pose/deformers are never updated or disposed. They must all refer to
- * the same current pose version. Treat their output arrays as read-only.
+ * Borrowed pose/deformers are never updated or disposed. Selected deformers must
+ * refer to the current pose; excluded draws are not accessed by a query. Treat
+ * output arrays as read-only and advance deformer.version on every change.
+ * sceneBvh adds a refitted scene hierarchy above the mesh triangle hierarchies
+ * for selections of more than eight nonempty meshes. false is the linear scene
+ * reference route, not a different triangle-intersection implementation.
  * maxBytes charges owned typed storage, including transient BVH build storage;
  * it does not bound borrowed geometry, JS objects, or returned hit snapshots.
  */
 export function createAnimationRaycaster(pose, descriptors, {
-  maxTriangles = 1048576, maxBytes = 128 * 1024 * 1024,
+  maxTriangles = 1048576, maxBytes = 128 * 1024 * 1024, sceneBvh = true,
 } = {}) {
   if (!pose || !Number.isSafeInteger(pose.nodeCount) || pose.nodeCount < 0 || !Array.isArray(descriptors) || descriptors.length > 4096) fail('SHAPE', 'Expected a pose and at most 4096 meshes');
   if (!Number.isSafeInteger(maxTriangles) || maxTriangles < 1 || maxTriangles > 1048576 || !Number.isSafeInteger(maxBytes) || maxBytes < 1) fail('LIMIT', 'Invalid raycaster budget');
+  if (typeof sceneBvh !== 'boolean') fail('OPTION', 'sceneBvh must be boolean');
   let triangles = 0, plannedBytes = 0, disposed = false, busy = false, lastQuery = null;
+  let sceneTree = null, sceneDirty = true;
   const meshes = [];
   for (let drawIndex = 0; drawIndex < descriptors.length; drawIndex++) {
     const descriptor = descriptors[drawIndex];
@@ -129,6 +135,16 @@ export function createAnimationRaycaster(pose, descriptors, {
     meshes.push({d,node,vertexCount,indices,uv,doubleSided,source:sourceInfo(descriptor.source,node,drawIndex),drawIndex,n,capacity,
       tree:null,stamp:-1,valid:false,orientation:1});
   }
+  // Reserve the maximum scene selection once. Storage is allocated lazily and
+  // reused across changing subsets, so camera switches never retain two trees.
+  const sceneMeshCount = meshes.filter(mesh => mesh.n !== 0).length;
+  let sceneCapacity = 0;
+  if (sceneBvh && sceneMeshCount > 8) {
+    let leaves = 1; while (leaves < Math.ceil(sceneMeshCount / 4)) leaves *= 2;
+    sceneCapacity = 2 * leaves - 1;
+    plannedBytes += sceneCapacity * 60 + sceneMeshCount * 4;
+    if (plannedBytes > maxBytes) fail('LIMIT', 'Scene hierarchy exceeds the raycaster typed storage budget');
+  }
   function live() {
     if (disposed) fail('DISPOSED', 'Raycaster has been disposed');
     if (pose.disposed || !Number.isSafeInteger(pose.version) || pose.version < 0) fail('POSE', 'Pose is disposed or invalid');
@@ -136,7 +152,7 @@ export function createAnimationRaycaster(pose, descriptors, {
   function check(mesh, version) {
     const d = mesh.d;
     if (d.disposed || d.failed) fail('MESH', 'Deformer is no longer usable');
-    if (d.poseVersion !== version) fail('STALE', 'Update all mesh deformers to the current pose before querying');
+    if (d.poseVersion !== version) fail('STALE', 'Update selected mesh deformers to the current pose before querying');
     if (!Number.isSafeInteger(d.version) || d.version < 0) fail('MESH', 'Invalid deformation version');
     if (!(d.positions instanceof Float32Array)) fail('STORAGE', 'Expected Float32 deformed positions');
     array(d.positions, mesh.vertexCount * 3, 'deformed positions');
@@ -146,7 +162,7 @@ export function createAnimationRaycaster(pose, descriptors, {
   function refit(mesh, stats) {
     const {d,n,capacity,vertexCount,indices} = mesh;
     if (!n || mesh.valid && mesh.stamp === d.version) return;
-    mesh.valid = false;
+    mesh.valid = false; sceneDirty = true;
     mesh.tree ??= {positions:new Float64Array(vertexCount*3),bounds:new Float64Array(capacity*6),
       right:new Uint32Array(capacity),start:new Uint32Array(capacity),count:new Uint32Array(capacity),order:Uint32Array.from({length:n},(_,i)=>i),used:0};
     const t = mesh.tree, m = vector(d.worldMatrix,16,'world matrix');
@@ -191,8 +207,49 @@ export function createAnimationRaycaster(pose, descriptors, {
     }
     mesh.stamp=d.version;mesh.valid=true;stats.refittedMeshes++;
   }
-  function box(t,node,ray,far,stats) {
-    stats.boxesTested++;
+  function refitScene(active, stats) {
+    sceneTree ??= {bounds:new Float64Array(sceneCapacity*6),right:new Uint32Array(sceneCapacity),
+      start:new Uint32Array(sceneCapacity),count:new Uint32Array(sceneCapacity),
+      order:new Uint32Array(sceneMeshCount),meshes:[],used:0};
+    const t=sceneTree, rebuild=t.meshes.length!==active.length || t.meshes.some((m,i)=>m!==active[i]);
+    if(!rebuild&&!sceneDirty)return t;
+    if(rebuild) {
+      t.meshes=active;t.used=0;
+      for(let i=0;i<active.length;i++)t.order[i]=i;
+      const center=(i,a)=>{const b=active[i].tree.bounds;return (b[a]+b[a+3])/2;};
+      function build(start,count) {
+        const node=t.used++;t.start[node]=start;t.count[node]=0;
+        if(count<=4){t.count[node]=count;return node;}
+        const lo=[Infinity,Infinity,Infinity],hi=[-Infinity,-Infinity,-Infinity];
+        for(let i=start;i<start+count;i++)for(let a=0;a<3;a++) {
+          const v=center(t.order[i],a);lo[a]=Math.min(lo[a],v);hi[a]=Math.max(hi[a],v);
+        }
+        let axis=0;for(let a=1;a<3;a++)if(hi[a]-lo[a]>hi[axis]-lo[axis])axis=a;
+        t.order.subarray(start,start+count).sort((a,b)=>center(a,axis)-center(b,axis)||active[a].drawIndex-active[b].drawIndex);
+        const half=Math.floor(count/2);build(start,half);t.right[node]=build(start+half,count-half);return node;
+      }
+      build(0,active.length);stats.sceneRebuilds++;
+    }
+    for(let node=t.used-1;node>=0;node--) {
+      const offset=node*6;
+      if(t.count[node]) {
+        for(let a=0;a<3;a++){t.bounds[offset+a]=Infinity;t.bounds[offset+3+a]=-Infinity;}
+        for(let i=t.start[node];i<t.start[node]+t.count[node];i++) {
+          const bounds=active[t.order[i]].tree.bounds;
+          for(let a=0;a<3;a++) {
+            t.bounds[offset+a]=Math.min(t.bounds[offset+a],bounds[a]);
+            t.bounds[offset+3+a]=Math.max(t.bounds[offset+3+a],bounds[3+a]);
+          }
+        }
+      }else for(let a=0;a<3;a++) {
+        t.bounds[offset+a]=Math.min(t.bounds[(node+1)*6+a],t.bounds[t.right[node]*6+a]);
+        t.bounds[offset+3+a]=Math.max(t.bounds[(node+1)*6+3+a],t.bounds[t.right[node]*6+3+a]);
+      }
+    }
+    sceneDirty=false;stats.sceneRefits++;return t;
+  }
+  function box(t,node,ray,far,stats,counter='boxesTested') {
+    stats[counter]++;
     let lo=ray.near,hi=far;
     for(let a=0;a<3;a++) {
       const min=t.bounds[node*6+a],max=t.bounds[node*6+3+a],o=ray.origin[a],d=ray.direction[a];
@@ -239,14 +296,19 @@ export function createAnimationRaycaster(pose, descriptors, {
       let selected=null;
       if(options.drawIndices!==undefined){const values=options.drawIndices;if(!Array.isArray(values)||values.length>meshes.length)fail('OPTION','Invalid draw selection');selected=new Set();for(const i of values){if(!Number.isSafeInteger(i)||i<0||i>=meshes.length||selected.has(i))fail('OPTION','Draw indices must be distinct existing meshes');selected.add(i);}}
       live();if(pose.version!==poseVersion)fail('CHANGED','Pose changed during query input capture');
-      const stamps=meshes.map(mesh=>{check(mesh,poseVersion);return mesh.d.version;});
-      const stats={poseVersion,meshesTested:0,boxesTested:0,trianglesTested:0,refittedMeshes:0,hitCount:0},hits=[];
+      const active=selected?meshes.filter(mesh=>selected.has(mesh.drawIndex)):meshes;
+      const stamps=active.map(mesh=>{check(mesh,poseVersion);return mesh.d.version;});
+      const stats={poseVersion,meshesTested:0,boxesTested:0,trianglesTested:0,refittedMeshes:0,hitCount:0,
+        sceneBoxesTested:0,sceneRebuilds:0,sceneRefits:0},hits=[];
       let best=null;
-      for(const mesh of meshes) {
-        if(selected&&!selected.has(mesh.drawIndex)||!mesh.n)continue;
-        refit(mesh,stats);stats.meshesTested++;
+      const nonempty=active.filter(mesh=>mesh.n!==0);
+      // Complete all active refits before any spatial rejection: malformed
+      // selected geometry cannot be hidden by an old bounding volume.
+      for(const mesh of nonempty)refit(mesh,stats);
+      function visitMesh(mesh) {
+        stats.meshesTested++;
         const t=mesh.tree,far=best?.distance ?? ray.far,entry=box(t,0,ray,far,stats);
-        if(entry===Infinity)continue;
+        if(entry===Infinity)return;
         const stack=[[0,entry]];
         while(stack.length) {
           const [node,start]=stack.pop(),limit=best?.distance ?? ray.far;
@@ -265,13 +327,30 @@ export function createAnimationRaycaster(pose, descriptors, {
           }
         }
       }
-      live();if(pose.version!==poseVersion||meshes.some((m,i)=>m.d.version!==stamps[i]||m.d.poseVersion!==poseVersion||m.d.disposed||m.d.failed))fail('CHANGED','Pose or deformation changed during raycasting');
+      if(sceneBvh&&nonempty.length>8) {
+        const t=refitScene(nonempty,stats),entry=box(t,0,ray,ray.far,stats,'sceneBoxesTested');
+        const stack=entry===Infinity?[]:[[0,entry]];
+        while(stack.length) {
+          const [node,start]=stack.pop(),limit=best?.distance ?? ray.far;
+          // Equality must remain visible for stable draw/face tie-breaking.
+          if(start>limit)continue;
+          if(t.count[node]) {
+            for(let i=t.start[node];i<t.start[node]+t.count[node];i++)visitMesh(nonempty[t.order[i]]);
+          }else {
+            const left=node+1,right=t.right[node];
+            const a=box(t,left,ray,limit,stats,'sceneBoxesTested'),b=box(t,right,ray,limit,stats,'sceneBoxesTested');
+            if(a<b){if(b!==Infinity)stack.push([right,b]);if(a!==Infinity)stack.push([left,a]);}
+            else {if(a!==Infinity)stack.push([left,a]);if(b!==Infinity)stack.push([right,b]);}
+          }
+        }
+      }else for(const mesh of nonempty)visitMesh(mesh);
+      live();if(pose.version!==poseVersion||active.some((m,i)=>m.d.version!==stamps[i]||m.d.poseVersion!==poseVersion||m.d.disposed||m.d.failed))fail('CHANGED','Pose or deformation changed during raycasting');
       if(best)hits.push(best);hits.sort(compareHits);stats.hitCount=hits.length;lastQuery=Object.freeze(stats);
       return Object.freeze(hits);
-    }finally{busy=false;}
+    }catch(error){sceneDirty=true;throw error;}finally{busy=false;}
   }
   return Object.freeze({raycast,get lastQuery(){return lastQuery;},get disposed(){return disposed;},
-    get bufferBytes(){return meshes.reduce((sum,m)=>sum+m.indices.byteLength+(m.uv?.byteLength??0)+(m.tree?Object.values(m.tree).reduce((n,x)=>n+(ArrayBuffer.isView(x)?x.byteLength:0),0):0),0);},
-    dispose(){if(busy)fail('REENTRANT','Cannot dispose during raycasting');disposed=true;meshes.length=0;lastQuery=null;},
+    get bufferBytes(){return meshes.reduce((sum,m)=>sum+m.indices.byteLength+(m.uv?.byteLength??0)+(m.tree?Object.values(m.tree).reduce((n,x)=>n+(ArrayBuffer.isView(x)?x.byteLength:0),0):0),0)+(sceneTree?Object.values(sceneTree).reduce((n,x)=>n+(ArrayBuffer.isView(x)?x.byteLength:0),0):0);},
+    dispose(){if(busy)fail('REENTRANT','Cannot dispose during raycasting');disposed=true;sceneTree=null;meshes.length=0;lastQuery=null;},
   });
 }
