@@ -8,6 +8,8 @@
  * https://tc39.es/ecma262/multipage/numbers-and-dates.html#sec-math-object
  * https://webassembly.github.io/spec/core/exec/numerics.html
  */
+import { emitToUint32 } from './numeric_integer.mjs';
+
 const UNARY = Object.freeze({
   abs: [0x99], ceil: [0x9b], floor: [0x9c], trunc: [0x9d], sqrt: [0x9f],
   fround: [0xb6, 0xbb], // round to f32 here, then promote back to a JS Number
@@ -38,11 +40,12 @@ export function createMathIntrinsicCompiler(enabled, fail) {
       }
       const name = callee.property.name;
       const variadic = name === 'min' || name === 'max';
-      if (!variadic && !Object.hasOwn(UNARY, name) && name !== 'round' && name !== 'sign') {
+      if (!variadic && !Object.hasOwn(UNARY, name) &&
+          !['round', 'sign', 'imul', 'clz32'].includes(name)) {
         fail(`Math.${name} has no closed numeric lowering`, node);
       }
-      if (variadic ? node.arguments.length > 64 : node.arguments.length !== 1) {
-        fail('Unary Math calls require one argument; min/max admit at most 64', node);
+      if (variadic ? node.arguments.length > 64 : node.arguments.length !== (name === 'imul' ? 2 : 1)) {
+        fail('Unary Math calls require one argument, imul two; min/max admit at most 64', node);
       }
       used.add(name);
       if (variadic) {
@@ -54,6 +57,11 @@ export function createMathIntrinsicCompiler(enabled, fail) {
         return bytes;
       }
       const value = emitArgument(node.arguments[0]);
+      if (name === 'imul') {
+        return [...emitToUint32(value, allocateLocal),
+          ...emitToUint32(emitArgument(node.arguments[1]), allocateLocal), 0x6c, 0xb7];
+      }
+      if (name === 'clz32') return [...emitToUint32(value, allocateLocal), 0x67, 0xb8];
       if (Object.hasOwn(UNARY, name)) return [...value, ...UNARY[name]];
       const x = allocateLocal();
       if (name === 'sign') {

@@ -22,7 +22,7 @@ const hasOwn = Object.hasOwn;
 const functionSource = Function.prototype.toString;
 const mathHost = globalThis;
 const MATH_SEMANTICS = 'f64-operator-order+guarded-math-v1';
-const MATH_NAMES = Object.freeze(['abs', 'ceil', 'floor', 'fround', 'max', 'min', 'round', 'sign', 'sqrt', 'trunc']);
+const MATH_NAMES = Object.freeze(['abs', 'ceil', 'clz32', 'floor', 'fround', 'imul', 'max', 'min', 'round', 'sign', 'sqrt', 'trunc']);
 function dataValue(object, key) {
   const entry = descriptor(object, key);
   return entry && hasOwn(entry, 'value') ? entry.value : undefined;
@@ -77,7 +77,7 @@ function indexedManifest(manifest) {
       manifest.automaticRouteAdmission !== false || manifest.iterationSemantics !== 'ordered' ||
       !['f64', 'void'].includes(manifest.resultType) ||
       !Number.isInteger(manifest.maxMemoryPages) || manifest.maxMemoryPages < 1 ||
-      manifest.maxMemoryPages > MAX_BYTES / PAGE_BYTES ||
+      manifest.maxMemoryPages > 16384 ||
       !Array.isArray(manifest.parameters) || !manifest.parameters.length || manifest.parameters.length > 64 ||
       manifest.boundParameter !== undefined || manifest.boundParameters !== undefined || manifest.loopStride !== undefined) {
     refuse('KERNEL_ABI_MISMATCH', 'Invalid checked-index numeric contract');
