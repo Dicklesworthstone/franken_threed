@@ -38,10 +38,12 @@ interpolated from the supplied UV set without applying the material UV transform
 
 Triangle indices, UVs, side flags and source IDs are snapshotted at construction.
 The deformer's positions and world matrix are borrowed and must be treated as
-read-only outputs. Every deformer must match the current pose version before a
-query. Direct pose sampling must be followed by deformation updates. Detached,
-shared, resizable, nonfinite or stale output storage is refused, never interpreted
-as an empty scene. Query and disposal reentry is rejected.
+read-only outputs. Every **selected** deformer must match the current pose version
+before a query. Excluded draws are not accessed, so they may remain stale until
+selected again. Direct pose sampling must be followed by updates of the selected
+borrowed deformers. Detached, shared, resizable, nonfinite or stale selected output
+storage is refused, never interpreted as an empty scene. Query and disposal
+reentry is rejected. Deformer versions must advance whenever their outputs change.
 
 The query honors source front-facing triangles and `doubleSided`, including
 reflected world transforms. Nonuniform scale, shear and surviving triangles under
@@ -59,39 +61,63 @@ leaf is built on the first query of each selected mesh. Subsequent deformation
 versions refit its world-space bounds without rebuilding its topology. Repeated
 queries of unchanged outputs reuse both positions and bounds. Nearest-only
 traversal visits nearer boxes first and prunes boxes beyond the best known hit.
-A hierarchy built before extreme deformation can become less efficient, but is
-still refitted rather than using stale bounds. This is a CPU data-structure path,
-not a measured GPU or application-level speedup.
+
+A second, scene-level BVH groups selected mesh bounds when there are more than
+eight nonempty meshes. It visits nearer scene boxes first, enabling nearest-hit
+pruning across meshes, not just within each mesh. Its leaves contain at most four
+meshes. Unchanged queries reuse the hierarchy; changed mesh versions refit it;
+changed selection membership rebuilds it in the same bounded typed storage.
+Reordering the same `drawIndices` does not rebuild or renumber anything. Small
+selections use the linear mesh route without allocating a scene hierarchy.
+`sceneBvh: false` at raycaster construction retains linear scene traversal for
+comparison or to avoid its additional storage reservation.
+
+All selected mesh data is validated/refitted before spatial rejection. Invalid
+new geometry cannot be hidden by stale scene bounds. This still entails checking
+selected version stamps and preparing all newly selected or changed geometry;
+the hierarchy does not make the first full-scene query constant-cost. Extreme
+deformation can reduce hierarchy quality, but bounds remain current. This is a
+CPU data-structure path, not a measured GPU or application-level speedup.
 
 `maxTriangles` bounds the aggregate topology (default and hard maximum 1,048,576).
 `maxBytes` defaults to 128 MiB and bounds the raycaster's owned typed arrays,
-including temporary centroid storage required by construction. Borrowed CPU
-geometry/pose arrays, JS objects and returned hits are not included; it is not a
-hard process-memory ceiling. An all-hit query defaults to `maxHits: 4096` and
-fails rather than silently truncating on overflow. `firstHitOnly: true` selects
-the actual nearest hit, not the first triangle encountered in storage order.
-`bufferBytes` reports retained typed storage, and `lastQuery` reports successful
-query counts and the pose version. Failed queries leave prior hit snapshots and
-statistics intact; a failed refit is retried on the next valid query.
+including temporary centroid storage required by construction and the maximum
+scene-hierarchy reservation when enabled. Borrowed CPU geometry/pose arrays, JS
+objects and returned hits are not included; it is not a hard process-memory
+ceiling. An all-hit query defaults to `maxHits: 4096` and fails rather than silently
+truncating on overflow. `firstHitOnly: true` selects the actual nearest hit, not
+the first triangle encountered in storage order. Equal-distance candidates remain
+eligible for source draw/face tie-breaking.
+
+`bufferBytes` reports retained typed storage. `lastQuery` reports successful-query
+counts and the pose version. `meshesTested` counts mesh-BVH visits; `boxesTested`
+counts boxes inside mesh BVHs. `sceneBoxesTested`, `sceneRebuilds`, and `sceneRefits`
+report the separate scene work. A rebuild includes a refit. Failed queries leave
+prior hit snapshots and statistics intact; a failed refit is retried on the next
+valid query.
 
 ## Focused checks
 
 ```sh
-node --test tools/ingest/animation_raycast.test.mjs
+node --test tools/ingest/animation_raycast.test.mjs \
+  tools/ingest/animation_raycast_scene.test.mjs
 ```
 
 Tests cover independently expected rays/triangles, transformations, source IDs,
 UVs, near/far limits, reflection/sides, hierarchy reuse/refit/pruning, storage and
 lifecycle failures. A deterministic 256-triangle, 100-ray comparison uses an
 independent Moller-Trumbore brute-force oracle rather than the production
-shear-edge intersection routine. The tests supply CPU deformation outputs; they
-do not establish animation-factory integration, GPU execution or pixel parity.
+shear-edge intersection routine. The scene tests compare complete hit snapshots
+against linear traversal across 720 seeded queries and changing poses/subsets.
+The 1,024-mesh grid and reverse-depth fixtures assert reduced mesh visits, not
+wall-time speedups. These tests supply CPU deformation outputs and do not
+establish animation-factory integration, GPU execution or pixel parity.
 
 ## Pick loaded models
 
-CPU models, decoded GPU models, and the owning URL/GLB loader now provide the
-same `raycast(ray, queryOptions)` and `pick(ndc, cameraOptions, queryOptions)`
-methods. Enable the feature at construction; it is **off by default** so existing
+CPU models, decoded GPU models, and the owning URL/GLB loader provide the same
+`raycast(ray, queryOptions)` and `pick(ndc, cameraOptions, queryOptions)` methods.
+Enable the feature at construction; it is **off by default** so existing
 render-only loads do not acquire extra CPU geometry storage or picking limits.
 
 ```js
@@ -163,18 +189,59 @@ Normal `model.update(...)` already samples and uploads through the existing path
 
 Enabled GPU models snapshot position-only source geometry, skin attributes, morph
 position deltas, selected material UVs, indices and source IDs before asynchronous
-scene initialization yields. The first query creates private CPU deformers using
-the existing CPU reference implementation; subsequent queries update them only
-when the pose version changes. Normals/tangents, textures and GPU buffers are not
-copied for selection. Morph targets that affect only normals preserve their target
-slot without adding a position delta. No CPU deformation is added to render/update
-calls, and no synchronous or asynchronous GPU readback is performed.
+scene initialization yields. Queries materialize private CPU deformers **only for
+selected draws**, using the existing reference implementation. A cached deformer
+updates only when selected at a new pose version; inactive cached deformers remain
+untouched. First-time selection after several pose advances uses the current pose,
+not an intermediate frame. Once a private deformer owns its source snapshot, the
+pick preparation layer releases its duplicate geometry copy. Selecting all draws
+still materializes the complete scene; a subset does not remove the initial
+all-draw source snapshot or topology reservation.
+
+Normals/tangents, textures and GPU buffers are not copied for selection. Morph
+targets that affect only normals preserve their target slot without adding a
+position delta. No CPU deformation is added to render/update calls, and no
+synchronous or asynchronous GPU readback is performed. `pickingStats` also exposes
+`materializedMeshes` (currently retained private CPU deformers) and `updatedMeshes`
+(private deformations performed by this successful query, including first-time
+creation). Borrowed CPU-model outputs contribute zero to these two counters.
+Private caches prepared before a later query failure may be reused; published
+statistics still describe the last successful query only.
 
 This deliberately uses the CPU reference deformation profile, including Float32
 published positions, **not a promise of bit-identical GPU f32 shader results**.
 Application shader displacement, render-only world/side/index-range overrides and
 alpha coverage remain outside this geometric selection path. Use explicit query
 draw selection where the application renders only some registered meshes.
+
+### Reuse a submitted LOD selection
+
+Model query options accept `lodSelection` as an alternative to `drawIndices`:
+
+```js
+model.renderCamera(attachments, cameraOptions);
+const selection = model.lodStats;
+const hits = model.pick(ndc, cameraOptions, {
+  lodSelection: selection,
+  firstHitOnly: true,
+});
+// External cameras can use the same subset with model.raycast(ray, options).
+```
+
+This is explicit, not a change to default picking. `lodSelection` must supply the
+current `poseVersion` and a bounded unique `drawIndices` array; the indices are
+captured before ray getters run. Null/absent submitted selections, stale pose
+versions and simultaneous `drawIndices` are rejected. After pose advancement,
+render again before reusing that frame's LOD snapshot. A successful explicit draw
+frame leaves `model.lodStats` null, so use its explicit source indices instead.
+
+This option does not own or advance LOD hysteresis, choose a camera, or certify
+snapshot ownership. The caller must pass a selection from the same model's draw
+mapping and the intended camera/view. Retaining same-pose snapshots for multiple
+cameras is supported; the latest camera is not silently substituted. These are
+pre-frustum LOD members, not raster-visible pixels or custom-draw transforms.
+The lower-level `createAnimationRaycaster` continues to accept `drawIndices`,
+not model-specific `lodSelection` objects.
 
 A picking limits object can replace `true`:
 
@@ -183,6 +250,7 @@ picking: {
   maxComponents: 16 * 1024 * 1024,
   maxTriangles: 1024 * 1024,
   maxBytes: 128 * 1024 * 1024,
+  sceneBvh: true, // default; false retains linear scene traversal
 }
 ```
 
@@ -205,15 +273,22 @@ not destroy the model; getter reentry cannot update or dispose it mid-query.
 
 ```sh
 node --test tools/ingest/animation_raycast.test.mjs \
-  tools/ingest/animation_model_pick.test.mjs \
+  tools/ingest/animation_raycast_scene.test.mjs \
+  tools/ingest/animation_model_pick_lazy.test.mjs
+
+# Broader existing model suites (require the complete repository):
+node --test tools/ingest/animation_model_pick.test.mjs \
   tools/ingest/animation_model.test.mjs
 ```
 
-The model integration tests execute production glTF accessor/geometry/material
-decoding, pose animation/blending, morph-before-skin CPU deformation, camera
-sampling, BVH refits and triangle queries. GPU-scene construction/submission is an
-explicit test boundary. Four owning-loader seam tests also replace unchanged
-asset transport and native texture preparation. They verify forwarding and
-ownership, not native HTTP/image/GPU execution or pixel parity. The original model
-regression suite runs unchanged, including its 32-influence CPU skinning case.
-These focused checks are not a full-workspace/browser certification.
+The lazy-picking tests run the real model picker, CPU morph-before-skin deformer
+and raycaster with packed pose/camera fixtures and an error-class-only runtime
+double. They verify selective preparation, current-pose updates, source snapshots,
+LOD snapshot validation and lifecycle behavior. They do not execute the pose
+sampler, glTF decoder, GPU or browser.
+
+The broader existing model integration suites exercise production glTF decoding,
+pose animation/blending, camera sampling and triangle queries. GPU-scene and
+owning-loader transport/texture boundaries are explicit test substitutions.
+Listing their commands is not evidence of a fresh run. These focused checks are
+not a full-workspace/browser certification.
