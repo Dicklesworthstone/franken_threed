@@ -14,10 +14,18 @@ pub mod hierarchy;
 pub mod mesh;
 pub mod publication;
 pub mod simd_compose;
+pub mod skeleton;
 
 pub use hierarchy::{HierarchyError, HierarchySolveStats, TransformHierarchy};
 #[cfg(all(feature = "browser", target_arch = "wasm32"))]
 pub use hierarchy::WasmTransformHierarchy;
+pub use skeleton::{
+    batch_skeleton_palette_f32, build_hierarchy_mesh_submission,
+    deform_hierarchy_geometry, skeleton_palette_from_hierarchy,
+    HierarchyGeometry, HierarchySkinning, SkeletonError,
+};
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+pub use skeleton::f3d_batch_skeleton_palette;
 
 #[cfg(all(feature = "browser", target_arch = "wasm32"))]
 mod probe;
@@ -71,8 +79,8 @@ pub use gpu_host::{
     clear_borrowed_frame_packet,
     f3d_borrowed_frame_packet_len, f3d_borrowed_frame_packet_ptr,
     f3d_build_affine_rows_batch_frame_packet,
-    f3d_build_affine_rows_batch_frame_packet_borrowed,
     f3d_build_affine_rows_batch_packet,
+    f3d_build_affine_rows_batch_frame_packet_borrowed,
     f3d_build_affine_rows_bundle_packet,
     f3d_build_affine_rows_compute_packet,
     f3d_build_two_dispatch_affine_compute_packet,
