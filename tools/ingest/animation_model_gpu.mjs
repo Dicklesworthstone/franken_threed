@@ -63,6 +63,9 @@ export async function createGpuDecodedAnimationScene(device,prepared,{picking=fa
     ...(prepared.instanceOrigins ? {instanceOrigins:prepared.instanceOrigins} : {}),
     get poseVersion(){return scene.poseVersion;},get bufferBytes(){return scene.bufferBytes;},
     get disposed(){return scene.disposed;},get failed(){return scene.failed;},
+    get lodEnabled(){return scene.lodEnabled;},get lodStats(){return scene.lodStats;},
+    get lodCameraCount(){return scene.lodCameraCount;},
+    resetLodCamera(key){return invoke(()=>scene.resetLodCamera(key));},
     get exportingEnabled(){return exporter.enabled;},
     exportPoseGLB(settings){return read(()=>{
       if(scene.disposed||scene.failed||pose.disposed)throw new AnimationExportError('ANIMATION_EXPORT_DISPOSED','Model is not usable');
@@ -80,6 +83,12 @@ export async function createGpuDecodedAnimationScene(device,prepared,{picking=fa
       if(Object.hasOwn(input,'viewProjection')||Object.hasOwn(input,'lighting'))fail('FRAME','renderCamera supplies viewProjection and lighting; use render for external frames');
       const sample=view.sample(settings);
       if(sample.poseVersion!==scene.poseVersion)fail('STALE','Upload the current pose before camera rendering');
+      // Use the sampled camera NODE identity, not a camera definition shared by
+      // several nodes. Orthographic lighting has no cameraPosition, but the
+      // camera sample does. Authored glTF cameras use distance LOD with zoom 1.
+      if(scene.lodEnabled && input.draws == null && input.lodCamera === undefined) {
+        input.lodCamera={position:sample.cameraPosition,key:`gltf:${sample.cameraNode}`,zoom:1};
+      }
       scene.render({...input,viewProjection:sample.viewProjection,lighting:sample.lighting});
     });},
     async whenIdle(){try{await scene.whenIdle();return result;}catch(error){if(scene.failed){exporter.dispose();picker.dispose();pose.dispose();}throw error;}},

@@ -159,7 +159,7 @@ export {createAnimationDeformer} from './animation_deformer.mjs';
     outputs.set(name,fs.readFileSync(new URL('./'+name,import.meta.url),'utf8'));
   }
   if(webgpu) {
-    for(const name of ['animation_webgpu.mjs','animation_render.mjs','animation_scene.mjs','animation_draw_order.mjs','animation_bounds.mjs','animation_shadow.mjs','animation_shadow_receiver.mjs','animation_scene_shadow.mjs','animation_shadow_view.mjs']) {
+    for(const name of ['animation_webgpu.mjs','animation_render.mjs','animation_scene.mjs','animation_lod.mjs','animation_draw_order.mjs','animation_bounds.mjs','animation_shadow.mjs','animation_shadow_receiver.mjs','animation_scene_shadow.mjs','animation_shadow_view.mjs']) {
       outputs.set(name,fs.readFileSync(new URL('./'+name,import.meta.url),'utf8'));
     }
     outputs.set('gpu_playback.mjs',`export {${playerExports},createAnimationController,createAnimationDeformer} from './playback.mjs';
