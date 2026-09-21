@@ -276,3 +276,22 @@ test('numeric publication bypasses overridden destination set methods', () => {
   const { wasm } = host(); const binding = bindThreeSkeletonPalettes(wasm, [a]); binding.update();
   assert.equal(a.boneMatrices[0], 0.5); binding.dispose();
 });
+
+
+test('nested readonly aliases cannot hide a later overlapping output interval', () => {
+  const a = rig([1]), storage = new ArrayBuffer(160);
+  a.bones[0].matrixWorld.elements = new Float64Array(storage, 0, 16);
+  a.boneInverses[0].elements = new Float32Array(storage, 0, 16);
+  a.boneMatrices = new Float32Array(storage, 96, 16);
+  const { wasm } = host(); const binding = bindThreeSkeletonPalettes(wasm, [a]);
+  assert.throws(() => binding.update(), errorCode('SKELETON_ALIAS')); binding.dispose();
+});
+
+test('large batches retain one compiled call and exact destination segmentation', () => {
+  const skeletons = Array.from({ length: 4096 }, (_, i) => rig([i]));
+  const { wasm, controls } = host(); const binding = bindThreeSkeletonPalettes(wasm, skeletons);
+  const report = binding.update();
+  assert.equal(report.jointCount, 4096); assert.equal(controls.calls.length, 1);
+  for (let i = 0; i < skeletons.length; i++) assert.equal(skeletons[i].boneMatrices[0], i * 16 + 0.5);
+  binding.dispose();
+});
