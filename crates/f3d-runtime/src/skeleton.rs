@@ -271,7 +271,7 @@ mod tests {
         let identity = Matrix4::identity();
         let inverse_bind = [translation(-3.0)];
         let positions = [0.0, 0.0, 0.0, 0.25, 0.0, 0.0, 0.0, 0.25, 0.0];
-        let normals = [0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+        let normals: [f64; 9] = [0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0];
         let delta = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
         let targets: [&[f64]; 1] = [&delta];
         let input = HierarchyGeometry {
