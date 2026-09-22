@@ -2,7 +2,9 @@
  * Post-link numeric specialization for real application bundles. Running after
  * Rollup links each ES chunk exposes closed update functions and their callers
  * across source-module boundaries without replacing public function exports.
- * Static runtime assets are emitted only when a kernel is admitted.
+ * One content-addressed dispatcher connects producer and consumer chunks by
+ * original function identity. Assets are emitted when a kernel or imported
+ * lookup is needed; a rewritten lookup is not a guaranteed native invocation.
  */
 
 import crypto from "node:crypto";
@@ -23,12 +25,15 @@ export function numericKernelRollupPlugin(options = {}) {
   if (!options || typeof options !== "object" || Array.isArray(options))
     throw new TypeError("Numeric specialization options must be an object");
   for (const key of Object.keys(options)) {
-    if (!["maxKernels", "maxMemoryPages"].includes(key))
+    if (!["maxKernels", "maxMemoryPages", "maxIterations", "crossModule"].includes(key))
       throw new TypeError(`Unknown numeric specialization option: ${key}`);
   }
+  // Application specialization is already opt-in. Connect its separate output
+  // chunks by default; explicit false retains the old within-chunk behavior.
+  // The standalone source-transform API keeps its own conservative default.
+  const settings = { ...options, crossModule: options.crossModule === undefined ? true : options.crossModule };
   // Validate budgets even for applications with no candidates.
-  specializeNumericModule("", options);
-  const settings = { ...options };
+  specializeNumericModule("", settings);
   let units, assets, finalReport;
 
   function runtime(context) {
@@ -111,7 +116,18 @@ export function numericKernelRollupPlugin(options = {}) {
       // Rollup explicitly requires renderChunk plugins to update this metadata
       // when adding imports; downstream emitters must see the actual dependency.
       if (!chunk.imports.includes(dispatchName)) chunk.imports.push(dispatchName);
-      chunk.importedBindings[dispatchName] = ["createNumericDispatch", "dispatchNumericCall"];
+      const bindings = [
+        ...(result.report.compiledKernels ? [
+          settings.crossModule ? "registerNumericDispatch" : "createNumericDispatch",
+          "dispatchNumericCall",
+        ] : []),
+        ...(result.report.importedCalls?.length ? ["dispatchImportedNumericCall"] : []),
+      ];
+      // Consumer-only chunks import only the lookup; producer-only chunks do
+      // not pretend to call imports. Preserve any pre-existing runtime binding.
+      chunk.importedBindings[dispatchName] = [...new Set([
+        ...(chunk.importedBindings[dispatchName] ?? []), ...bindings,
+      ])];
       return { code: result.code, map: null };
     },
     generateBundle(_output, bundle) {
@@ -146,7 +162,13 @@ export function numericKernelRollupPlugin(options = {}) {
         version: 1,
         enabled: true,
         accelerated: false,
-        scope: "guarded-direct-calls-within-linked-es-chunks",
+        scope: settings.crossModule ? "guarded-direct-calls-across-linked-es-chunks"
+          : "guarded-direct-calls-within-linked-es-chunks",
+        ...(settings.crossModule ? {
+          dispatchSemantics: "shared-original-function-identity-v1",
+          registeredKernels: reports.reduce((sum, report) => sum + (report.registeredKernels ?? 0), 0),
+          importedCalls: reports.reduce((sum, report) => sum + (report.importedCalls?.length ?? 0), 0),
+        } : {}),
         compiledKernels: reports.reduce((sum, report) => sum + report.compiledKernels, 0),
         rewrittenCalls: reports.reduce((sum, report) => sum + report.rewrittenCalls, 0),
         runtimeAssets: [...assets].map(([fileName, source]) => ({
