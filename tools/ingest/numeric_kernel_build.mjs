@@ -12,6 +12,7 @@ import * as acorn from "acorn";
 import * as walk from "acorn-walk";
 import { compileNumericCandidate } from "./numeric_candidate.mjs";
 import { NumericKernelCompileError } from "./numeric_kernel.mjs";
+import { hasNumericLoop } from "./numeric_loop_discovery.mjs";
 
 const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
 
@@ -40,6 +41,15 @@ function compileFile(source, sourceName, options) {
   // retained function-only module declares no binding named Math, including
   // unused or mutable declarations excluded from the helper graph.
   const allowMath = !functions.some((fn) => fn.id.name === "Math");
+  // Forward explicit control/storage admission and executable work budgets to
+  // both selection paths. Omission keeps the candidate compiler's route order.
+  const controlOptions = {
+    generalControl: options.generalControl,
+    structuredLoops: options.structuredLoops,
+    checkedIndexing: options.checkedIndexing,
+    maxIterations: options.maxIterations,
+    maxNestedIterations: options.maxNestedIterations,
+  };
   // Preserve the original single-function contract and diagnostics exactly.
   // In particular, mutation of a same-named scalar parameter is not rebinding
   // the function, and there are no external helper bindings to prove here.
@@ -50,7 +60,7 @@ function compileFile(source, sourceName, options) {
     return {
       artifact: compileNumericCandidate(source, {
         parameterTypes: options.parameterTypes,
-        checkedIndexing: options.checkedIndexing,
+        ...controlOptions,
         maxMemoryPages: options.maxMemoryPages,
         sourceName,
         allowMath,
@@ -88,18 +98,16 @@ function compileFile(source, sourceName, options) {
   });
   const roots =
     options.functionName === undefined
-      ? functions.filter((fn) =>
-          fn.body.body.some((statement) => statement.type === "ForStatement"),
-        )
+      ? functions.filter((fn) => hasNumericLoop(fn.body))
       : functions.filter((fn) => fn.id.name === options.functionName);
   if (roots.length !== 1)
-    refuse("Select one counted-loop entry using functionName when the source is ambiguous");
+    refuse("Select one numeric-loop entry using functionName when the source is ambiguous");
   const fn = roots[0];
   if (mutations.has(fn.id.name)) refuse("Numeric entry binding must be immutable");
   const single = functions.length === 1;
   const artifact = compileNumericCandidate(single ? source : source.slice(fn.start, fn.end), {
     parameterTypes: options.parameterTypes,
-    checkedIndexing: options.checkedIndexing,
+    ...controlOptions,
     allowMath,
     maxMemoryPages: options.maxMemoryPages,
     sourceName: single ? sourceName : `${sourceName}:${fn.id.name}`,
@@ -132,7 +140,9 @@ function loaderSource(artifact) {
   // The no-Wasm fallback exposes the same immutable ABI as the native runtime.
   // Keep legacy loaders unchanged; checked indexing has different length metadata.
   const pipelineFreeze =
-    artifact.manifest.version === 7
+    artifact.manifest.version === 8
+      ? "\nObject.freeze(manifest.lengthParameters);\n"
+      : artifact.manifest.version === 7
       ? `
 Object.freeze(manifest.lengthParameters);
 manifest.loops.forEach(Object.freeze);
@@ -209,8 +219,11 @@ export function createKernel() {
  * topology select checked full-view indexing; checkedIndexing can force either
  * mode. Integer arrays are read-only; runtime guards always retain the original
  * function when its storage or indexing cannot execute safely in Wasm.
+ * General ranges and while/do-while control select ABI v8 after legacy routes.
+ * maxIterations bounds all v8 loop body entries per invocation; exhaustion
+ * retains the original call instead of publishing a partial computation.
  *
- * @param {{parameterTypes: string[], maxMemoryPages?: number, functionName?: string, checkedIndexing?: boolean}} options
+ * @param {{parameterTypes: string[], maxMemoryPages?: number, functionName?: string, checkedIndexing?: boolean, generalControl?: boolean, structuredLoops?: boolean, maxIterations?: number, maxNestedIterations?: number}} options
  */
 export function buildNumericKernel(entry, outDir, options = {}) {
   const sourcePath = path.resolve(entry);

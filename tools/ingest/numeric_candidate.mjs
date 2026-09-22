@@ -1,4 +1,4 @@
-/** Prefer existing ABIs/unrolling, then try checked native structured loops. */
+/** Prefer legacy ABIs/unrolling, then checked structured and general control. */
 import { compileNumericKernel, NumericKernelCompileError } from './numeric_kernel.mjs';
 import { expandNumericFixedLoops } from './numeric_fixed_loops.mjs';
 
@@ -47,7 +47,7 @@ function compileLegacyCandidate(source, options) {
   }
 }
 
-export function compileNumericCandidate(source, options = {}) {
+function compileStructuredCandidate(source, options) {
   try { return compileLegacyCandidate(source, options); }
   catch (error) {
     if (!(error instanceof NumericKernelCompileError) || error.code !== 'KERNEL_NOT_CLOSED' ||
@@ -60,6 +60,31 @@ export function compileNumericCandidate(source, options = {}) {
       return compileNumericKernel(source, { ...options, checkedIndexing: true, structuredLoops: true });
     } catch (structuredError) {
       if (!(structuredError instanceof NumericKernelCompileError)) throw structuredError;
+      throw error;
+    }
+  }
+}
+
+/**
+ * General control is the last AOT route, never a substitute for source closure.
+ * Keep successful legacy bytecode/route priority and explicit opt-outs intact.
+ * A forced generalControl call skips unrolling and uses the original source.
+ */
+export function compileNumericCandidate(source, options = {}) {
+  if (options.generalControl === true) return compileNumericKernel(source, options);
+  try { return compileStructuredCandidate(source, options); }
+  catch (error) {
+    if (!(error instanceof NumericKernelCompileError) || error.code !== 'KERNEL_NOT_CLOSED' ||
+        options.generalControl === false || options.checkedIndexing === false ||
+        options.structuredLoops === false) throw error;
+    try {
+      return compileNumericKernel(source, {
+        ...options, generalControl: true, checkedIndexing: true, structuredLoops: true,
+      });
+    } catch (controlError) {
+      if (!(controlError instanceof NumericKernelCompileError)) throw controlError;
+      // Preserve the original diagnostic for unsupported source; do not emit a
+      // partially compiled program or turn an application feature into an error.
       throw error;
     }
   }

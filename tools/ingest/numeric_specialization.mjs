@@ -15,6 +15,7 @@ import * as acorn from "acorn";
 import * as walk from "acorn-walk";
 import { compileNumericCandidate } from "./numeric_candidate.mjs";
 import { NumericKernelCompileError } from "./numeric_kernel.mjs";
+import { hasNumericLoop } from "./numeric_loop_discovery.mjs";
 
 function span(node) {
   return {
@@ -121,7 +122,7 @@ function indexedLayouts(fn, parameters) {
 
 /**
  * @param {string} source ESM source (or an ES-format rendered Rollup chunk)
- * @param {{sourceName?: string, runtimeModule?: string | (() => string), maxKernels?: number, maxMemoryPages?: number}} options
+ * @param {{sourceName?: string, runtimeModule?: string | (() => string), maxKernels?: number, maxMemoryPages?: number, maxIterations?: number}} options
  * @returns {{code: string, changed: boolean, report: object}}
  */
 export function specializeNumericModule(
@@ -131,6 +132,7 @@ export function specializeNumericModule(
     runtimeModule = "./numeric_dispatch.mjs",
     maxKernels = 64,
     maxMemoryPages = 1024,
+    maxIterations = 1000000,
   } = {},
 ) {
   if (typeof source !== "string")
@@ -147,6 +149,8 @@ export function specializeNumericModule(
     throw new RangeError("maxKernels must be between 1 and 256");
   if (!Number.isInteger(maxMemoryPages) || maxMemoryPages < 1 || maxMemoryPages > 16384)
     throw new RangeError("maxMemoryPages must be between 1 and 16384");
+  if (!Number.isInteger(maxIterations) || maxIterations < 1 || maxIterations > 1000000000)
+    throw new RangeError("maxIterations must be between 1 and 1000000000");
   const report = {
     version: 1,
     sourceName: String(sourceName),
@@ -246,18 +250,10 @@ export function specializeNumericModule(
       ? statement.declaration
       : statement;
     if (fn?.type !== "FunctionDeclaration" || !fn.id) continue;
-    const loopPosition =
-      fn.body.body.length - (fn.body.body.at(-1)?.type === "ReturnStatement" ? 2 : 1);
+    // Discovery reaches loops under blocks/branches, but never callbacks or
+    // nested declarations. Admission still compiles the WHOLE source function.
+    if (!hasNumericLoop(fn.body)) continue;
     const loops = fn.body.body.filter((node) => node.type === "ForStatement");
-    // Candidate discovery is not admission: every pass and intervening statement
-    // must compile before any call is rewritten. An unsafe later pass retains
-    // the entire original function, not a partially specialized prefix.
-    if (
-      loops.length < 2 &&
-      (fn.body.body[loopPosition]?.type !== "ForStatement" ||
-        fn.body.body.slice(0, loopPosition).some((node) => node.type !== "VariableDeclaration"))
-    )
-      continue;
     const item = {
       functionName: fn.id.name,
       sourceSpan: span(fn),
@@ -296,6 +292,7 @@ export function specializeNumericModule(
         allowMath: true,
         sourceName: `${sourceName}:${fn.id.name}`,
         maxMemoryPages,
+        maxIterations,
       });
     } catch (error) {
       if (!(error instanceof NumericKernelCompileError)) throw error;
@@ -307,7 +304,7 @@ export function specializeNumericModule(
     // topology and mixed input/output precision, within the dispatch AOT budget.
     const float32Types = parameterTypes.map((type) => (type === "f64[]" ? "f32[]" : type));
     const layouts =
-      artifact.manifest.version === 7
+      (artifact.manifest.version === 7 || artifact.manifest.version === 8)
         ? indexedLayouts(fn, artifact.manifest.parameters)
         : [float32Types];
     if (
@@ -340,6 +337,7 @@ export function specializeNumericModule(
         allowMath: true,
         sourceName: `${sourceName}:${fn.id.name}`,
         maxMemoryPages,
+        maxIterations,
       });
       alternatives.push({ parameterTypes: types, bytes: [...variant.wasm] });
     }
@@ -375,7 +373,25 @@ export function specializeNumericModule(
     item.parameterTypes = parameterTypes;
     if (artifact.manifest.mathIntrinsics)
       item.mathIntrinsics = [...artifact.manifest.mathIntrinsics];
-    if (artifact.manifest.version === 6 || artifact.manifest.version === 7) {
+    if (artifact.manifest.version === 8) {
+      item.controlSemantics = artifact.manifest.controlSemantics;
+      item.maxIterations = artifact.manifest.maxIterations;
+      item.loopCount = artifact.manifest.loopCount;
+      item.maxLoopDepth = artifact.manifest.maxLoopDepth;
+      item.lengthParameters = [...artifact.manifest.lengthParameters];
+      item.indexSemantics = artifact.manifest.indexSemantics;
+      // v8 compiles the original function slice. Translate nested loop spans
+      // back into this source unit, not the legacy top-level-pass coordinate set.
+      item.loops = artifact.controlLoops.map(({ kind, depth, sourceSpan }) => ({
+        kind, depth,
+        sourceSpan: {
+          start: fn.start + sourceSpan.start,
+          end: fn.start + sourceSpan.end,
+          line: fn.loc.start.line + sourceSpan.line - 1,
+          column: sourceSpan.column + (sourceSpan.line === 1 ? fn.loc.start.column : 0),
+        },
+      }));
+    } else if (artifact.manifest.version === 6 || artifact.manifest.version === 7) {
       item.loopCount = artifact.manifest.loops.length;
       if (artifact.manifest.version === 7) {
         item.lengthParameters = [...artifact.manifest.lengthParameters];
