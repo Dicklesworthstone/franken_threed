@@ -13,12 +13,13 @@ const typedTag = Object.getOwnPropertyDescriptor(
 ).get;
 const records = new WeakMap();
 
-function state(target, bytes, parameterTypes = null, resolveMath = null) {
+function state(target, bytes, parameterTypes = null, resolveMath = null, preserveAliasing = false) {
   return {
     target,
     bytes,
     parameterTypes,
     resolveMath,
+    preserveAliasing,
     attempted: false,
     kernel: null,
     initializationFailure: null,
@@ -33,8 +34,15 @@ function state(target, bytes, parameterTypes = null, resolveMath = null) {
  * ownership, shape, alias, length and scalar guard before executing.
  * resolveMath is an optional compiler-produced `() => Math` in the target's
  * lexical environment; creating a token must not evaluate that live binding.
+ * preserveAliasing is a producer assertion for ALL variants: their loads/stores
+ * preserve source order without optimizations assuming disjoint parameters.
+ * Storage identity and mixed-type overlap guards still run on each invocation.
  */
-export function createNumericDispatch(target, bytes, alternatives = [], resolveMath = null) {
+export function createNumericDispatch(
+  target, bytes, alternatives = [], resolveMath = null, preserveAliasing = false,
+) {
+  if (typeof preserveAliasing !== "boolean")
+    throw new TypeError("preserveAliasing must be a boolean");
   if (typeof target !== "function")
     throw new TypeError("Numeric dispatch target must be a function");
   if (resolveMath !== null && typeof resolveMath !== "function")
@@ -52,10 +60,10 @@ export function createNumericDispatch(target, bytes, alternatives = [], resolveM
     ) {
       throw new TypeError("Invalid numeric dispatch alternative ABI");
     }
-    return state(target, variant.bytes, [...variant.parameterTypes], resolveMath);
+    return state(target, variant.bytes, [...variant.parameterTypes], resolveMath, preserveAliasing);
   });
   const token = Object.freeze({});
-  const primary = state(target, bytes, null, resolveMath);
+  const primary = state(target, bytes, null, resolveMath, preserveAliasing);
   records.set(token, { primary, variants, selected: primary, identityMisses: 0 });
   return token;
 }
@@ -101,6 +109,7 @@ export function dispatchNumericCall(token, callee, args) {
       const kernel = instantiateNumericKernel(new U8Array(record.bytes), {
         fallback: record.target,
         resolveMath: record.resolveMath,
+        preserveAliasing: record.preserveAliasing,
       });
       if (
         record.parameterTypes &&

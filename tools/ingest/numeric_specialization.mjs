@@ -350,9 +350,13 @@ export function specializeNumericModule(
     // The resolver closes over exactly the module environment shared by this
     // declaration and its top-level helpers. Do not read Math at registration:
     // imports, mutable lexical bindings and TDZ/ESM-cycle calls need live guards.
-    const mathResolver = artifact.manifest.mathIntrinsics ? ", () => Math" : "";
+    // Every current compiler route preserves source-ordered memory operations,
+    // including fixed-loop expansion, helpers and checked structured loops.
+    // Assert that producer contract for all AOT variants, not a guessed lack of
+    // aliases. Future no-alias optimizations must not reuse this assertion.
+    const mathResolver = artifact.manifest.mathIntrinsics ? "() => Math" : "null";
     registrations.push(
-      `var ${tokenName} = ${createName}(${fn.id.name}, [${artifact.wasm.join(",")}], ${JSON.stringify(alternatives)}${mathResolver});`,
+      `var ${tokenName} = ${createName}(${fn.id.name}, [${artifact.wasm.join(",")}], ${JSON.stringify(alternatives)}, ${mathResolver}, true);`,
     );
     helpers.push(
       `function ${helperName}(callee, ...args) { return ${dispatchName}(${tokenName}, callee, args); }`,
@@ -403,6 +407,7 @@ export function specializeNumericModule(
         sourceSpan: helperSpans.get(helper.name),
       }));
     }
+    item.storageSemantics = "same-type-alias-preserving-v1";
     item.guardFallback = "retained-original-js";
     report.compiledKernels++;
     report.rewrittenCalls += sites.length;
