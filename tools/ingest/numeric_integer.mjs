@@ -40,6 +40,32 @@ export function emitToUint32(operand, allocateLocal) {
     0x05, 0x41, 0, 0x0b];
 }
 
+/** Integer element layouts. Narrow stores consume the low bits of ToUint32. */
+export const INTEGER_ARRAY_LAYOUTS = Object.freeze(Object.fromEntries([
+  ['i8[]', 0, 0x2c, 0x3a, true],
+  ['u8[]', 0, 0x2d, 0x3a, false],
+  ['u8c[]', 0, 0x2d, 0x3a, false],
+  ['i16[]', 1, 0x2e, 0x3b, true],
+  ['u16[]', 1, 0x2f, 0x3b, false],
+  ['i32[]', 2, 0x28, 0x36, true],
+  ['u32[]', 2, 0x28, 0x36, false],
+].map(([type, alignment, load, store, signed]) =>
+  [type, Object.freeze({ alignment, load, store, signed })])));
+
+/** ToUint8Clamp: clamp first, then nearest with ties to EVEN (not Math.round). */
+export function emitToUint8Clamp(operand, allocateLocal) {
+  const x = allocateLocal();
+  // !(x > 0) handles NaN, negative values and both zeros without a trap. The
+  // final conversion only sees a finite integer in [0,255], including for
+  // infinite inputs. Each source store clamps before a later load can see it.
+  return [...operand, ...set(x), ...get(x), ...number(0), 0x64,
+    0x04, 0x7f,
+      ...get(x), ...number(255), 0x66,
+      0x04, 0x7f, 0x41, 0xff, 0x01,
+      0x05, ...get(x), 0x9e, 0xab, 0x0b,
+    0x05, 0x41, 0, 0x0b];
+}
+
 export const BITWISE_OPS = Object.freeze({
   '&': 0x71, '|': 0x72, '^': 0x73, '<<': 0x74, '>>': 0x75, '>>>': 0x76,
 });

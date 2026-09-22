@@ -13,7 +13,8 @@
 import * as acorn from 'acorn';
 import { createScalarHelperCompiler } from './numeric_helpers.mjs';
 import { createMathIntrinsicCompiler } from './numeric_intrinsics.mjs';
-import { BITWISE_OPS, emitBitwiseBinary, emitBitwiseNot } from './numeric_integer.mjs';
+import { BITWISE_OPS, INTEGER_ARRAY_LAYOUTS, emitBitwiseBinary, emitBitwiseNot,
+  emitToUint32, emitToUint8Clamp } from './numeric_integer.mjs';
 
 export const NUMERIC_KERNEL_SECTION = 'f3d.numeric-kernel';
 const F64 = 0x7c;
@@ -79,8 +80,11 @@ function member(node, object, property, computed) {
  * specializeNumericModule establishes that proof for linked application code.
  * allowMath additionally requires a runtime resolveMath closure for the actual
  * shared lexical Math binding. Missing/changed bindings retain JavaScript.
- * checkedIndexing opts into ABI v7: arbitrary numeric subscripts, read-only
- * u16[]/u32[] topology, and source-ordered float gathers/scatters. Each executed
+ * checkedIndexing admits arbitrary numeric subscripts and source-ordered
+ * gathers/scatters. ABI v9 adds i8/u8/u8c/i16/i32 arrays and integer outputs;
+ * u8c[] denotes Uint8ClampedArray. Integer stores use ECMAScript conversion,
+ * not trapping or saturating Wasm truncation. Existing v7 artifacts retain
+ * their bytecode when only floats and read-only u16/u32 are used. Each executed
  * access checks its own view before conversion. The host packs full accessed
  * views and publishes no writes if any check traps. No check-elision or SIMD
  * independence is inferred; colliding scatters must remain ordered.
@@ -134,7 +138,7 @@ export function compileNumericKernel(source, {
   if (!Number.isInteger(maxIterations) || maxIterations < 1 || maxIterations > 1000000000) {
     fail('maxIterations must be between 1 and 1000000000', null, 'INVALID_KERNEL_ABI');
   }
-  const arrayTypes = checkedIndexing ? ['f32[]', 'f64[]', 'u16[]', 'u32[]'] : ['f32[]', 'f64[]'];
+  const arrayTypes = checkedIndexing ? ['f32[]', 'f64[]', ...Object.keys(INTEGER_ARRAY_LAYOUTS)] : ['f32[]', 'f64[]'];
   let ast;
   try {
     ast = acorn.parse(source, { ecmaVersion: 'latest', sourceType: 'module', locations: true });
@@ -246,9 +250,6 @@ export function compileNumericKernel(source, {
       fail('Array access must use a numeric array parameter', node);
     }
     if (checkedIndexing) {
-      if (writing && ['u16[]', 'u32[]'].includes(param.type)) {
-        fail('Integer topology arrays are read-only', node);
-      }
       const value = expression(node.property, depth + 1);
       const local = temporaryBase + temporaryCount++;
       // Numeric -0 becomes the property key "0" in JS. Non-integers, NaN,
@@ -285,7 +286,7 @@ export function compileNumericKernel(source, {
     indexedBounds.get(param.name).add(boundParam.index);
     return { ...param, elementOffset, fixed: false };
   };
-  const alignment = param => param.type === 'u16[]' ? 1 : param.type === 'f64[]' ? 3 : 2;
+  const alignment = param => INTEGER_ARRAY_LAYOUTS[param.type]?.alignment ?? (param.type === 'f64[]' ? 3 : 2);
   const memoryOffset = param => u32(param.elementOffset * (2 ** alignment(param)));
   const address = param => param.checkedLocal !== undefined
     ? [...get(param.index), ...get(param.checkedLocal), 0xab, 0x41, alignment(param), 0x74, 0x6a]
@@ -296,14 +297,27 @@ export function compileNumericKernel(source, {
     // JavaScript reads float32 storage as a Number. Promote before arithmetic;
     // using f32 operators here would introduce extra rounding at every operator.
     const prefix = [...(prepared ? [] : param.setup ?? []), ...address(param)];
-    if (param.type === 'u16[]' || param.type === 'u32[]') {
-      return [...prefix, param.type === 'u16[]' ? 0x2f : 0x28, alignment(param),
-        ...memoryOffset(param), 0xb8]; // i32.load16_u/load; f64.convert_i32_u
+    const integer = INTEGER_ARRAY_LAYOUTS[param.type];
+    if (integer) {
+      return [...prefix, integer.load, integer.alignment, ...memoryOffset(param),
+        integer.signed ? 0xb7 : 0xb8]; // Sign/zero extend before Number arithmetic.
     }
     return param.type === 'f32[]'
       ? [...prefix, 0x2a, 2, ...memoryOffset(param), 0xbb] // f32.load; f64.promote_f32
       : [...prefix, 0x2b, 3, ...memoryOffset(param)]; // f64.load
   };
+  function store(target, value, conditional) {
+    const integer = INTEGER_ARRAY_LAYOUTS[target.type];
+    const convert = target.type === 'u8c[]' ? emitToUint8Clamp : emitToUint32;
+    const payload = integer ? convert(value, () => temporaryBase + temporaryCount++) : value;
+    writes.add(target.name);
+    // Checked stores, branches and strided records leave untouched bytes that
+    // must come from this invocation, not a previous private-memory contents.
+    if (checkedIndexing || pipeline || conditional || loopStride > 1) reads.add(target.name);
+    return [...(target.setup ?? []), ...address(target), ...payload,
+      ...(integer ? [integer.store, integer.alignment]
+        : target.type === 'f32[]' ? [0xb6, 0x38, 2] : [0x39, 3]), ...memoryOffset(target)];
+  }
   function binary(operator, left, right) {
     return emitBitwiseBinary(operator, left, right, () => temporaryBase + temporaryCount++)
       ?? [...left, ...right, OPS[operator]];
@@ -611,9 +625,14 @@ export function compileNumericKernel(source, {
           continue;
         }
         if (assignment?.type === 'UpdateExpression' && ['++', '--'].includes(assignment.operator)) {
-          const local = mutableScalar(assignment.argument);
-          bytes.push(...get(local), ...number(1), OPS[assignment.operator[0]], ...set(local));
-          scalarWrites.add(local);
+          if (assignment.argument.type === 'MemberExpression') {
+            const target = arrayParameter(assignment.argument, true);
+            bytes.push(...store(target, binary(assignment.operator[0], load(target, true), number(1)), conditional));
+          } else {
+            const local = mutableScalar(assignment.argument);
+            bytes.push(...get(local), ...number(1), OPS[assignment.operator[0]], ...set(local));
+            scalarWrites.add(local);
+          }
           continue;
         }
         if (assignment?.type !== 'AssignmentExpression' ||
@@ -631,20 +650,10 @@ export function compileNumericKernel(source, {
         const target = arrayParameter(assignment.left, true);
         const value = expression(assignment.right);
         const compound = assignment.operator !== '=';
-        // Evaluate a scatter destination exactly once, before the RHS. Compound
-        // stores load through that same checked address, preserving collisions
-        // and the Float32 rounding of EACH source-ordered store.
-        bytes.push(...(target.setup ?? []), ...address(target),
-          ...(compound ? binary(assignment.operator.slice(0, -1), load(target, true), value) : value),
-          // Round at EACH float32 store, including stores read again in this loop.
-          ...(target.type === 'f32[]' ? [0xb6, 0x38, 2] : [0x39, 3]), ...memoryOffset(target));
-        writes.add(target.name);
-        // A skipped store must preserve the original element, not stale private
-        // Wasm memory from a previous invocation. Mark it as a packing input.
-        // Strided stores may leave other record channels untouched.
-        // A pipeline's accessed prefix may exceed a given pass's write extent.
-        // Preserve all untouched channels/tails without guessing full coverage.
-        if (checkedIndexing || pipeline || conditional || loopStride > 1) reads.add(target.name);
+        // Evaluate a scatter destination once before its RHS, then convert at
+        // EACH store. Later colliding reads see the rounded/wrapped/clamped value.
+        bytes.push(...store(target, compound
+          ? binary(assignment.operator.slice(0, -1), load(target, true), value) : value, conditional));
       }
       return bytes;
     } finally {
@@ -689,8 +698,11 @@ export function compileNumericKernel(source, {
   const extentAbi = orderedAbi || prelude.length > 0 || minimumLengths.size > 0;
 
   const mathIntrinsics = intrinsics.requirements();
+  const integerAbi = checkedIndexing && [...params.values()].some(param =>
+    Object.hasOwn(INTEGER_ARRAY_LAYOUTS, param.type) &&
+    (writes.has(param.name) || !['u16[]', 'u32[]'].includes(param.type)));
   const manifest = {
-    version: generalControl ? 8 : checkedIndexing ? 7 : pipeline ? 6 : orderedAbi ? 5 : extentAbi ? 4 : loopStride > 1 ? 3 : parameterTypes.includes('f32[]') ? 2 : 1,
+    version: integerAbi ? 9 : generalControl ? 8 : checkedIndexing ? 7 : pipeline ? 6 : orderedAbi ? 5 : extentAbi ? 4 : loopStride > 1 ? 3 : parameterTypes.includes('f32[]') ? 2 : 1,
     kind: generalControl ? 'closed-numeric-control' : checkedIndexing ? 'closed-indexed-numeric' : pipeline ? 'closed-numeric-pipeline' : extentAbi || loopStride > 1 || parameterTypes.includes('f32[]') ? 'closed-numeric-loop' : 'closed-f64-loop',
     ...(!checkedIndexing && !pipeline && (extentAbi || loopStride > 1) ? { loopStride } : {}),
     ...(orderedAbi ? { resultType: resultNode ? 'f64' : 'void', iterationSemantics: 'ordered' } : {}),
@@ -724,6 +736,7 @@ export function compileNumericKernel(source, {
     // Older hosts reject this semantic contract, rather than skipping guards.
     numericSemantics: mathIntrinsics.length ? 'f64-operator-order+guarded-math-v1' : 'f64-operator-order',
     ...(mathIntrinsics.length ? { mathIntrinsics } : {}),
+    ...(integerAbi ? { integerSemantics: 'ecmascript-integer-elements-v1' } : {}),
     automaticRouteAdmission: false,
   };
   const types = [...parameterTypes.map(type => type === 'f64' ? F64 : I32), ...Array(bounds.size).fill(I32)];

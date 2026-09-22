@@ -16,6 +16,20 @@ const F32Array = Float32Array;
 const U8Array = Uint8Array;
 const U16Array = Uint16Array;
 const U32Array = Uint32Array;
+// Capture constructors once. The runtime is also emitted as a standalone file,
+// so its native-slot storage table deliberately has no compiler dependency.
+const ARRAY_TYPES = Object.freeze(Object.fromEntries([
+  ['f64[]', F64Array, 'Float64Array', 8],
+  ['f32[]', F32Array, 'Float32Array', 4],
+  ['i8[]', Int8Array, 'Int8Array', 1],
+  ['u8[]', U8Array, 'Uint8Array', 1],
+  ['u8c[]', Uint8ClampedArray, 'Uint8ClampedArray', 1],
+  ['i16[]', Int16Array, 'Int16Array', 2],
+  ['u16[]', U16Array, 'Uint16Array', 2],
+  ['i32[]', Int32Array, 'Int32Array', 4],
+  ['u32[]', U32Array, 'Uint32Array', 4],
+].map(([type, ArrayType, tag, elementBytes]) =>
+  [type, Object.freeze({ ArrayType, tag, elementBytes })])));
 const apply = Reflect.apply;
 const descriptor = Object.getOwnPropertyDescriptor;
 const prototype = Object.getPrototypeOf;
@@ -73,11 +87,15 @@ function refuse(code, message) { throw new NumericKernelGuardError(code, message
 // v8 uses the same checked views but no array-derived trip counts: all source
 // loops are budgeted inside the executable, including scalar-only invocations.
 function indexedManifest(manifest) {
-  const generalControl = manifest.version === 8;
+  const generalControl = manifest.version === 8 ||
+    (manifest.version === 9 && manifest.kind === 'closed-numeric-control');
   const arrays = [], names = new Set();
+  const integerAbi = manifest.version === 9;
   if (manifest.kind !== (generalControl ? 'closed-numeric-control' : 'closed-indexed-numeric') ||
       !['f64-operator-order', MATH_SEMANTICS].includes(manifest.numericSemantics) ||
       manifest.indexSemantics !== 'checked-integer-full-view-v1' ||
+      (integerAbi ? manifest.integerSemantics !== 'ecmascript-integer-elements-v1'
+        : manifest.integerSemantics !== undefined) ||
       manifest.automaticRouteAdmission !== false || manifest.iterationSemantics !== 'ordered' ||
       !['f64', 'void'].includes(manifest.resultType) ||
       !Number.isInteger(manifest.maxMemoryPages) || manifest.maxMemoryPages < 1 ||
@@ -89,10 +107,11 @@ function indexedManifest(manifest) {
   let writes = false;
   manifest.parameters.forEach((param, index) => {
     if (!param || typeof param.name !== 'string' || names.has(param.name) ||
-        !['f64', 'f32[]', 'f64[]', 'u16[]', 'u32[]'].includes(param.type) ||
+        !(integerAbi ? param.type === 'f64' || hasOwn(ARRAY_TYPES, param.type)
+          : ['f64', 'f32[]', 'f64[]', 'u16[]', 'u32[]'].includes(param.type)) ||
         typeof param.read !== 'boolean' || typeof param.write !== 'boolean' || param.access !== undefined ||
         (param.type === 'f64' && (param.read || param.write)) ||
-        (param.write && (!param.read || !['f32[]', 'f64[]'].includes(param.type)))) {
+        (param.write && (!param.read || (!integerAbi && !['f32[]', 'f64[]'].includes(param.type))))) {
       refuse('KERNEL_ABI_MISMATCH', 'Invalid checked-index parameter');
     }
     names.add(param.name);
@@ -141,7 +160,7 @@ function readManifest(module, wasm) {
     refuse('KERNEL_ABI_MISMATCH', 'Invalid guarded Math requirements');
   }
   if (guardedMath) Object.freeze(manifest.mathIntrinsics);
-  if (manifest?.version === 7 || manifest?.version === 8) return indexedManifest(manifest);
+  if ([7, 8, 9].includes(manifest?.version)) return indexedManifest(manifest);
   const pipeline = manifest?.version === 6 && manifest.kind === 'closed-numeric-pipeline';
   const float32Abi = pipeline || ([2, 3, 4, 5].includes(manifest?.version) && manifest.kind === 'closed-numeric-loop');
   if (!manifest || (!float32Abi && (manifest.version !== 1 || manifest.kind !== 'closed-f64-loop')) ||
@@ -227,10 +246,7 @@ function readManifest(module, wasm) {
 
 function arrayInfo(value, param, checkLength) {
   const { name } = param;
-  const ArrayType = param.type === 'u16[]' ? U16Array : param.type === 'u32[]' ? U32Array
-    : param.type === 'f32[]' ? F32Array : F64Array;
-  const tag = param.type === 'u16[]' ? 'Uint16Array' : param.type === 'u32[]' ? 'Uint32Array'
-    : param.type === 'f32[]' ? 'Float32Array' : 'Float64Array';
+  const { ArrayType, tag, elementBytes } = ARRAY_TYPES[param.type];
   // Native slot access rejects proxies without running their traps or user getters.
   if (apply(typedTag, value, []) !== tag || prototype(value) !== ArrayType.prototype) {
     refuse('KERNEL_ARRAY_TYPE', `${name} must be a genuine, non-subclass ${tag}`);
@@ -252,7 +268,7 @@ function arrayInfo(value, param, checkLength) {
     throw new NumericKernelGuardError('KERNEL_ARRAY_OWNERSHIP', `${name} has shared or detached storage`, { cause });
   }
   return { buffer, offset: apply(typedOffset, value, []), length: apply(typedLength, value, []),
-    ArrayType, elementBytes: param.type === 'u16[]' ? 2 : param.type === 'f64[]' ? 8 : 4 };
+    ArrayType, elementBytes };
 }
 
 /**
@@ -350,8 +366,9 @@ export function instantiateNumericKernel(bytes, {
   const module = new wasm.Module(bytes);
   const manifest = readManifest(module, wasm);
   const pipeline = manifest.version === 6;
-  const generalControl = manifest.version === 8;
-  const checkedIndexing = manifest.version === 7 || generalControl;
+  const generalControl = manifest.version === 8 ||
+    (manifest.version === 9 && manifest.kind === 'closed-numeric-control');
+  const checkedIndexing = manifest.version === 7 || manifest.version === 9 || generalControl;
   const boundParameters = checkedIndexing ? manifest.lengthParameters
     : pipeline ? manifest.boundParameters : [manifest.boundParameter];
   const boundSet = new Set(boundParameters);

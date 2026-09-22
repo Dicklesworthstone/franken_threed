@@ -140,13 +140,13 @@ function loaderSource(artifact) {
   // The no-Wasm fallback exposes the same immutable ABI as the native runtime.
   // Keep legacy loaders unchanged; checked indexing has different length metadata.
   const pipelineFreeze =
-    artifact.manifest.version === 8
-      ? "\nObject.freeze(manifest.lengthParameters);\n"
-      : artifact.manifest.version === 7
+    [7, 8, 9].includes(artifact.manifest.version)
       ? `
 Object.freeze(manifest.lengthParameters);
-manifest.loops.forEach(Object.freeze);
-Object.freeze(manifest.loops);
+if (manifest.loops) {
+  manifest.loops.forEach(Object.freeze);
+  Object.freeze(manifest.loops);
+}
 `
       : artifact.manifest.version === 6
         ? `
@@ -215,9 +215,10 @@ export function createKernel() {
  *
  * @param {string} entry Function-only source file; named exports are preserved.
  * @param {string} outDir Fresh destination directory.
- * Sequential kernels retain their prefix ABI. Indirect accesses or u16[]/u32[]
- * topology select checked full-view indexing; checkedIndexing can force either
- * mode. Integer arrays are read-only; runtime guards always retain the original
+ * Sequential float kernels retain their prefix ABI. Indirect access or integer
+ * storage selects checked full-view indexing. Integer inputs/outputs include
+ * i8/u8/u8c/i16/u16/i32/u32 (u8c is clamped); checkedIndexing can force either
+ * mode. Runtime guards always retain the original
  * function when its storage or indexing cannot execute safely in Wasm.
  * General ranges and while/do-while control select ABI v8 after legacy routes.
  * maxIterations bounds all v8 loop body entries per invocation; exhaustion

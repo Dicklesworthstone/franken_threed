@@ -1,12 +1,13 @@
 /** Prefer legacy ABIs/unrolling, then checked structured and general control. */
 import { compileNumericKernel, NumericKernelCompileError } from './numeric_kernel.mjs';
 import { expandNumericFixedLoops } from './numeric_fixed_loops.mjs';
+import { INTEGER_ARRAY_LAYOUTS } from './numeric_integer.mjs';
 
 function compileDirect(source, options) {
-  // Explicit callers can force either mode. Integer topology requires v7, but
+  // Explicit callers can force either mode. Integer storage requires checks, but
   // neither type guessing nor a failed prefix proof relaxes the source closure.
   const integerAbi = Array.isArray(options.parameterTypes) &&
-    options.parameterTypes.some(type => type === 'u16[]' || type === 'u32[]');
+    options.parameterTypes.some(type => Object.hasOwn(INTEGER_ARRAY_LAYOUTS, type));
   if (options.checkedIndexing !== undefined || integerAbi || options.structuredLoops === true) {
     return compileNumericKernel(source, { ...options, checkedIndexing: options.checkedIndexing === undefined ? true : options.checkedIndexing });
   }

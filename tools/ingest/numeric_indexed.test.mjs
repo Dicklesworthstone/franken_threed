@@ -142,8 +142,8 @@ test("loop-carried scatter addresses see earlier writes and evaluate destination
     reference = actual.slice(),
     b = new Uint16Array([2, 0, 1]),
     index = new Uint32Array([1, 2, 0]);
-  nested(reference, b, index);
-  k.run(actual, b, index);
+  nested(actual, b, index);
+  k.run(reference, b, index);
   same(actual, reference);
 });
 
@@ -402,9 +402,8 @@ test("numeric helper indices and Math guards retain the actual lexical environme
   same(a, [1, 2]);
 });
 
-test("refuses integer writes, effectful indices, coercions, captures, shadowing and invalid options", () => {
+test("refuses effectful indices, coercions, captures, shadowing and invalid options", () => {
   const invalid = [
-    ["function f(a){for(let i=0;i<a.length;i++)a[i]=1;}", ["u32[]"]],
     ["function f(a,b){for(let i=0;i<a.length;i++)a[b[i]++]=1;}", ["f64[]", "u16[]"]],
     ['function f(a){for(let i=0;i<a.length;i++)a["x"]=1;}', ["f64[]"]],
     ["function f(a){for(let i=0;i<a.length;i++)a[external(i)]=1;}", ["f64[]"]],
