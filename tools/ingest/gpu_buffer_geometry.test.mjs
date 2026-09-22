@@ -175,3 +175,26 @@ test('queue completion failures are terminal rather than a successful reusable r
   const error=new Error('completion');d.completion=Promise.reject(error);d.completion.catch(()=>{});
   await assert.rejects(gpu.whenIdle(),e=>e===error);assert.equal(gpu.failed,true);assert.equal(gpu.bufferBytes,0);gpu.dispose();
 });
+
+
+test('rejected error scopes terminate residency even before whenIdle is called',async()=>{
+  const d=geometryDevice(),g=geometry(),gpu=createGpuBufferGeometry(d,g);await gpu.whenIdle();
+  const error=new Error('scope rejected');
+  d.popErrorScope=()=>{d.scopes.pop();return Promise.reject(error);};
+  g.attributes.position.needsUpdate=true;gpu.update();
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(gpu.failed,true);assert.equal(gpu.bufferBytes,0);
+  assert.throws(()=>gpu.update(),e=>e===error);gpu.dispose();
+});
+
+test('source counts cannot outgrow stale residency and unsupported deformation inputs are explicit',()=>{
+  const d=geometryDevice(),g=geometry(),gpu=createGpuBufferGeometry(d,g),p=g.attributes.position;
+  p.array=new Float32Array(18);p.count=6;
+  assert.throws(()=>gpu.update(),{code:'GEOMETRY_GPU_SHAPE'});
+  assert.equal(gpu.vertexCount,3);assert.equal(gpu.failed,false);
+  g.setAttribute('position',attribute(18));gpu.update();assert.equal(gpu.vertexCount,6);
+  g.morphAttributes={position:[attribute(18)]};
+  assert.throws(()=>gpu.update(),{code:'GEOMETRY_GPU_SHAPE'});
+  g.morphAttributes={};g.isInstancedBufferGeometry=true;
+  assert.throws(()=>gpu.update(),{code:'GEOMETRY_GPU_SHAPE'});gpu.dispose();
+});

@@ -549,6 +549,7 @@ async function sceneFixture() {
   for (const file of [
     "animation_scene.mjs",
     "animation_render.mjs",
+    "gpu_buffer_geometry.mjs",
     "animation_shadow_receiver.mjs",
     "animation_environment_receiver.mjs",
   ])

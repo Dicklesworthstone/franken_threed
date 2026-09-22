@@ -57,6 +57,14 @@ for (const kind of ["gltf", "glb"])
     assert.equal(api.createAnimationController, cpu.createAnimationController);
     assert.equal(api.createAnimationDeformer, cpu.createAnimationDeformer);
     assert.equal(typeof api.createGpuAnimationDeformer, "function");
+    assert.equal(typeof api.createGpuBufferGeometry, "function");
+    assert.deepEqual(
+      fs.readFileSync(path.join(moved, "gpu_buffer_geometry.mjs")),
+      fs.readFileSync(new URL("./gpu_buffer_geometry.mjs", import.meta.url)),
+    );
+    assert.throws(() => api.createGpuBufferGeometry(undefined, {}), {
+      code: "GEOMETRY_GPU_DEVICE",
+    });
     const pose = api.createPlayer(),
       control = api.createAnimationController(pose);
     control.createAction(0).play();

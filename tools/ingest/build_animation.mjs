@@ -274,6 +274,7 @@ export {createAnimationDeformer} from './animation_deformer.mjs';
     for (const name of [
       "animation_webgpu.mjs",
       "animation_render.mjs",
+      "gpu_buffer_geometry.mjs",
       "animation_scene.mjs",
       "animation_lod.mjs",
       "animation_draw_order.mjs",
@@ -290,6 +291,7 @@ export {createAnimationDeformer} from './animation_deformer.mjs';
       `export {${playerExports},createAnimationController,createAnimationDeformer} from './playback.mjs';
 export {createGpuAnimationDeformer} from './animation_webgpu.mjs';
 export {createGpuAnimationRenderer} from './animation_render.mjs';
+export {createGpuBufferGeometry} from './gpu_buffer_geometry.mjs';
 export {createGpuAnimationScene} from './animation_scene.mjs';
 export {createGpuAnimationShadowMap} from './animation_shadow.mjs';
 export {fitAnimationShadowView,animationShadowWorldBounds} from './animation_shadow_view.mjs';

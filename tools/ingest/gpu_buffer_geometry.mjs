@@ -41,6 +41,8 @@ function storage(array) {
 }
 function ownerOf(attribute) { return attribute.isInterleavedBufferAttribute ? attribute.data : attribute; }
 function describe(geometry) {
+  if (geometry?.isInstancedBufferGeometry || Object.values(geometry?.morphAttributes ?? {}).some(a => a.length))
+    fail('SHAPE', 'Instancing and morph deformation require their existing GPU paths');
   const attributes = geometry?.attributes;
   if (!attributes || !attributes.position) fail('SHAPE', 'Geometry requires a position attribute');
   const owners = new Map();
@@ -50,6 +52,7 @@ function describe(geometry) {
     if (!Object.hasOwn(FIELDS, name)) fail('SHAPE', `Unsupported geometry attribute: ${name}`);
     const attribute = attributes[name], owner = ownerOf(attribute), array = owner?.array;
     storage(array);
+    if (attribute.isInstancedBufferAttribute || owner.isInstancedInterleavedBuffer) fail('SHAPE', 'Instance streams require the instancing path');
     if (!(array instanceof Float32Array) || attribute.normalized || attribute.isFloat16BufferAttribute) {
       fail('FORMAT', 'Vertex streams require non-normalized Float32 attributes');
     }
@@ -61,8 +64,9 @@ function describe(geometry) {
     const count = integer(attribute.count, vertexCount, 0xffffffff, 'attribute count');
     if (count * stride > array.length) fail('SHAPE', 'Attribute count exceeds storage');
     let entry = owners.get(owner);
-    if (!entry) owners.set(owner, entry = {owner, array, stride, attributes: []});
+    if (!entry) owners.set(owner, entry = {owner, array, stride, attributes: [], requiredBytes: 0});
     if (entry.stride !== stride) fail('SHAPE', 'Shared attributes require one stride');
+    entry.requiredBytes = Math.max(entry.requiredBytes, vertexCount ? ((vertexCount - 1) * stride + offset + itemSize) * 4 : 0);
     entry.attributes.push({shaderLocation: location, offset: offset * 4, format: 'float32x' + itemSize});
   }
   const index = geometry.index ?? null;
@@ -75,7 +79,7 @@ function describe(geometry) {
     indexFormat = index.array instanceof Uint16Array ? 'uint16' : 'uint32';
     indexCount = integer(index.count, 0, index.array.length, 'index count');
     if (owners.has(index)) fail('SHAPE', 'Index and vertex source identities must be distinct');
-    owners.set(index, {owner: index, array: index.array, stride: 0, attributes: []});
+    owners.set(index, {owner: index, array: index.array, stride: 0, attributes: [], requiredBytes: indexCount * index.array.BYTES_PER_ELEMENT});
   }
   const streams = [...owners.values()].filter(e => e.stride !== 0);
   // Stable layouts do not depend on object ids, buffer generations or insertion
@@ -149,7 +153,10 @@ export function createGpuBufferGeometry(device, geometry, {
     for (const record of records.values()) record.buffer.destroy();
     records = new Map(); allocatedBytes = 0; current = null; generation++;
   }
-  function stop(error) { terminal ??= error; release(); rejectStopped(terminal); return terminal; }
+  function stop(error) {
+    if (!terminal) { terminal = error; release(); rejectStopped(terminal); }
+    return terminal;
+  }
   function live() {
     if (disposed) fail('DISPOSED', 'Geometry adapter is disposed');
     if (terminal) throw terminal;
@@ -173,11 +180,12 @@ export function createGpuBufferGeometry(device, geometry, {
       let addedBytes = 0, addedCount = 0;
       // Admission completes before any allocation, queue write, range mutation
       // or callback. An invalid later attribute cannot partly upload the frame.
-      for (const {owner, array} of shape.owners.values()) {
+      for (const {owner, array, requiredBytes} of shape.owners.values()) {
         integer(owner.version, 0, Number.MAX_SAFE_INTEGER, 'upload version');
         const existing = records.get(owner), size = Math.max(4, align4(array.byteLength));
         if (typeof owner.onUploadCallback !== 'function') fail('SHAPE', 'Expected onUploadCallback');
         if (existing) {
+          if (existing.version >= owner.version && requiredBytes > existing.logicalBytes) fail('SHAPE', 'Geometry counts exceed resident storage');
           if (existing.elementType !== array.constructor) fail('FORMAT', 'Changing a resident element type requires a new attribute');
           if (existing.version < owner.version) {
             if (existing.logicalBytes !== array.byteLength) fail('RESIZE', 'Resizing a resident attribute is not supported; replace the attribute');
@@ -240,8 +248,8 @@ export function createGpuBufferGeometry(device, geometry, {
         // yielding and preserve the callback's partial-write/version history.
         const errors = Promise.all([device.popErrorScope(), device.popErrorScope()]).then(values => {
           const error = values.find(Boolean);
-          if (error) throw stop(new BufferGeometryGpuError('GEOMETRY_GPU_DEVICE', error.message || 'GPU upload failed'));
-        });
+          if (error) throw new BufferGeometryGpuError('GEOMETRY_GPU_DEVICE', error.message || 'GPU upload failed');
+        }).catch(error => { throw stop(error); });
         pending = Promise.all([pending, errors]).then(() => {}); pending.catch(() => {});
       }
       busy = false;

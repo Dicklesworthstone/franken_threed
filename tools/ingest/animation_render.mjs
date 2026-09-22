@@ -1,7 +1,7 @@
 /**
- * Explicit WebGPU material/draw submission for createGpuAnimationDeformer outputs.
+ * Explicit WebGPU material/draw submission for GPU deformers and BufferGeometry residency.
  * This pass owns an aligned uniform arena and index buffers, not the supplied
- * device, deformers, attachments, camera, frame loop or source scene objects.
+ * device, borrowed geometry buffers, attachments, camera, frame loop or source scene objects.
  * It is NOT an automatic Three.js renderer replacement: no automatic shadow
  * fitting, tone mapping, implicit sorting or culling. RGB inputs are linear; an -srgb
  * attachment view supplies the display transfer function. Unsupported material
@@ -16,7 +16,12 @@
  * view with straight alpha. Use an -srgb view for sRGB-encoded base-color data:
  * hardware sampling decodes RGB, not alpha. No flipY or color conversion is
  * guessed. The caller owns texture creation, mip levels and sampler settings.
- * UV/color arrays are copied and uploaded once, independently of deformation.
+ * UV/color arrays supplied in addMesh options are copied once for deformers.
+ * createGpuBufferGeometry handles instead bind their own versioned source streams
+ * directly. For that path vertexColors is a boolean (default true), index/UV
+ * options must be omitted, and source drawRange intersects each draw. Updates and
+ * residency replacement are explicit; layout changes require a new registration.
+ * See BUFFER_GEOMETRY_GPU.md; no Three.js material conversion is implied.
  * uvTransform=[a,b,c,d,tx,ty] maps (u,v) to (a*u+c*v+tx,b*u+d*v+ty).
  * A draw may override uvTransform; baseColor * vertexColor * sampledColor is
  * evaluated BEFORE alpha masking/blending. Plain meshes need no texture.
@@ -123,6 +128,7 @@
  * rollbackable. version acknowledges submission, not completion: await whenIdle()
  * for cumulative draw/deformation validation, OOM and device-loss errors.
  */
+import {bufferGeometrySnapshot} from "./gpu_buffer_geometry.mjs";
 import {
   packProjectedShadow,
   projectedShadowWgsl,
@@ -246,11 +252,14 @@ function surfaceShader(
   environmentCode = "",
   instanceStride = 0,
   coated = false,
+  geometryChannels = null,
 ) {
   const textured = mapMask !== 0 || coated,
     normalMapped = (mapMask & 4) !== 0,
     coatNormalMapped = (mapMask & 128) !== 0;
   const tangentAttribute = (normalMapped || coatNormalMapped) && !derivative;
+  const uvAttribute = attributes && (geometryChannels?.uv ?? true);
+  const colorWidth = attributes ? (geometryChannels?.colorSize ?? 4) : 0;
   const occluded = (mapMask & 16) !== 0,
     ambientOcclusion = occluded && environmentCode !== "";
   const declarations = mapSlots(mapMask)
@@ -357,7 +366,7 @@ struct VertexOutput {
     .map((slot) => `@location(${5 + slot}) uv_${slot}: vec2<f32>,`)
     .join("\n  ")}
 }
-@vertex fn vertex_main(@location(0) position: vec3<f32>${lit ? ", @location(1) normal: vec3<f32>" : ""}${tangentAttribute ? ", @location(2) tangent: vec4<f32>" : ""}${attributes ? ", @location(3) uv: vec2<f32>, @location(4) color: vec4<f32>" : ""}${mapSlots(
+@vertex fn vertex_main(@location(0) position: vec3<f32>${lit ? ", @location(1) normal: vec3<f32>" : ""}${tangentAttribute ? ", @location(2) tangent: vec4<f32>" : ""}${uvAttribute ? ", @location(3) uv: vec2<f32>" : ""}${colorWidth ? `, @location(4) color: vec${colorWidth}<f32>` : ""}${mapSlots(
     coordinateMask,
   )
     .map((slot) => `, @location(${5 + slot}) uv_${slot}: vec2<f32>`)
@@ -366,7 +375,8 @@ struct VertexOutput {
     )}${instanceStride ? ", @builtin(instance_index) draw_index: u32" : ""}) -> VertexOutput {
   var out: VertexOutput;${instanceStride ? "\n  draw_info = instance_draws[draw_index].info;\n  out.draw_index = draw_index;" : ""}
   out.position = draw_info.clip_from_local * vec4<f32>(position, 1.0);
-  ${attributes ? "out.uv = vec2<f32>(dot(draw_info.uv_x.xyz, vec3<f32>(uv, 1.0)), dot(draw_info.uv_y.xyz, vec3<f32>(uv, 1.0)));\n  out.color = color;" : "out.uv = vec2<f32>(0.0); out.color = vec4<f32>(1.0);"}
+  ${uvAttribute ? "out.uv = vec2<f32>(dot(draw_info.uv_x.xyz, vec3<f32>(uv, 1.0)), dot(draw_info.uv_y.xyz, vec3<f32>(uv, 1.0)));" : "out.uv = vec2<f32>(0.0);"}
+  out.color = ${colorWidth === 3 ? "vec4<f32>(color, 1.0)" : colorWidth === 4 ? "color" : "vec4<f32>(1.0)"};
   ${lit ? "out.world = (draw_info.world_from_local * vec4<f32>(position, 1.0)).xyz;\n  out.normal = " + (occluded ? "mat3x3<f32>(draw_info.normal_from_local.x, draw_info.normal_from_local.y, draw_info.normal_from_local.z)" : "draw_info.normal_from_local") + " * normal;" : ""}
   ${tangentAttribute ? "out.tangent = vec4<f32>((draw_info.world_from_local * vec4<f32>(tangent.xyz, 0.0)).xyz, tangent.w * draw_info.uv_y.w);" : ""}
   ${mapSlots(coordinateMask)
@@ -626,7 +636,9 @@ function scoped(device, operation) {
   });
   return { value, error, errors };
 }
-function deformerShape(gpu) {
+function deformerShape(gpu, device) {
+  const geometry = bufferGeometrySnapshot(gpu, device);
+  if (geometry) return geometry;
   if (
     !gpu ||
     !gpu.vertexBuffer ||
@@ -655,9 +667,10 @@ function compatibleInstance(a, b) {
     a.pipeline === b.pipeline &&
     a.first === b.first &&
     a.count === b.count &&
-    a.vertexBuffer === b.vertexBuffer &&
-    x.indexBuffer === y.indexBuffer &&
-    x.indexFormat === y.indexFormat &&
+    a.vertexBuffers.length === b.vertexBuffers.length &&
+    a.vertexBuffers.every((buffer, i) => buffer === b.vertexBuffers[i]) &&
+    a.indexBuffer === b.indexBuffer &&
+    a.indexFormat === b.indexFormat &&
     x.surfaceBuffer === y.surfaceBuffer &&
     x.textureGroup === y.textureGroup
   );
@@ -771,7 +784,19 @@ export async function createGpuAnimationRenderer(
   const environmentLayouts = new Map(),
     environmentGroups = new Map();
   const variants = new Map(),
-    textureLayouts = new Map();
+    textureLayouts = new Map(), geometryLayouts = new Map(), geometryLayoutIds = new Map();
+  function geometryVariant(geometry, colors) {
+    const key = geometry.signature + ":colors=" + colors;
+    if (!geometryLayoutIds.has(key)) {
+      if (geometryLayoutIds.size >= maxMeshes)
+        fail("ANIMATION_RENDER_LIMIT", "Mutable geometry layout capacity exceeded");
+      const id = String(geometryLayoutIds.size);
+      geometryLayoutIds.set(key, id);
+      geometryLayouts.set(id, {layouts: geometry.layouts,
+        channels: {...geometry.channels, colorSize: colors ? geometry.channels.colorSize : 0}});
+    }
+    return "~" + geometryLayoutIds.get(key);
+  }
   // Only validated, immutable streams enter these caches. Retain one CPU byte
   // view per unique GPU buffer for collision-safe equality, bounded by maxBytes.
   // Pending registrations own private allocations until all error scopes settle.
@@ -917,7 +942,9 @@ export async function createGpuAnimationRenderer(
     if (disposed) fail("ANIMATION_RENDER_DISPOSED", "Animation renderer has been disposed");
     if (terminal) throw terminal;
   }
-  function compilePipelines(variant) {
+  function compilePipelines(variantKey) {
+    const [variant, geometryKey] = variantKey.split("~");
+    const geometry = geometryKey === undefined ? null : geometryLayouts.get(geometryKey);
     const coated = variant.includes("coat-");
     const lit = variant.startsWith("lit-"),
       attributes = !variant.endsWith("plain"),
@@ -928,7 +955,7 @@ export async function createGpuAnimationRenderer(
       coordinateMask = coordinateMaskFor(variant),
       shadowed = variant.startsWith("lit-shadow-");
     const environmentLit = variant.includes("environment-");
-    if (attributes) {
+    if (attributes && !geometry) {
       limit("maxVertexBuffers", 2);
       limit("maxVertexAttributes", 5);
     }
@@ -987,10 +1014,11 @@ export async function createGpuAnimationRenderer(
               environmentLit ? environmentReceiver.environmentLightingWgsl(textured ? 2 : 1) : "",
               instancing ? stride : 0,
               coated,
+              geometry?.channels,
             )
           : ANIMATION_RENDER_WGSL,
     });
-    const vertexBuffers = [
+    let vertexBuffers = [
       {
         arrayStride: 40,
         stepMode: "vertex",
@@ -1015,10 +1043,18 @@ export async function createGpuAnimationRenderer(
           })),
         ],
       });
+    if (geometry) {
+      // The shader consumes source Float32 streams directly. Extra source
+      // attributes may be present without being used by this material variant.
+      vertexBuffers = geometry.layouts;
+      limit("maxVertexBuffers", vertexBuffers.length);
+      limit("maxVertexAttributes", vertexBuffers.reduce((n, layout) => n + layout.attributes.length, 0));
+      for (const layout of vertexBuffers) limit("maxVertexBufferArrayStride", layout.arrayStride);
+    }
     const created = [];
     for (const blend of format === null ? [false] : [false, true])
       for (const winding of lit ? ["ccw", "cw", "none", "none-cw"] : ["ccw", "cw", "none"]) {
-        const key = `${variant}/${blend}:${winding}`;
+        const key = `${variantKey}/${blend}:${winding}`;
         created.push(
           device
             .createRenderPipelineAsync({
@@ -1258,7 +1294,15 @@ export async function createGpuAnimationRenderer(
       ],
       "material/geometry",
     );
-    deformerShape(gpu);
+    const mutable = deformerShape(gpu, device);
+    if (mutable) {
+      for (const field of ["indices", "texCoords", "mapCoordinates"])
+        if (options[field] != null)
+          fail("ANIMATION_RENDER_OPTIONS", "Mutable geometry owns its index/UV streams");
+      if (options.vertexColors !== undefined && typeof options.vertexColors !== "boolean")
+        fail("ANIMATION_RENDER_OPTIONS", "Mutable vertexColors is a boolean, not another CPU stream");
+    }
+    const geometryColors = options.vertexColors !== false;
     if (records.size + pendingMeshes >= maxMeshes)
       fail("ANIMATION_RENDER_LIMIT", "Mesh capacity exceeded");
     const {
@@ -1335,9 +1379,9 @@ export async function createGpuAnimationRenderer(
       fail("ANIMATION_RENDER_VALUE", "Normal scale exceeds f32");
     const derivative =
       (mapMask & 132) !== 0 &&
-      !gpu.vertexLayout.attributes.some(
+      !(mutable ? mutable.channels.tangent : gpu.vertexLayout.attributes.some(
         (a) => a.shaderLocation === 2 && a.offset === 24 && a.format === "float32x4",
-      );
+      ));
     if (mapMask) {
       limit("maxBindGroups", lit ? 3 : 2);
       limit("maxSamplersPerShaderStage", mapSlots(mapMask).length);
@@ -1360,9 +1404,9 @@ export async function createGpuAnimationRenderer(
       if (rgba.some((v) => v > 1))
         fail("ANIMATION_RENDER_VALUE", "Lit reflectance factors must be in [0,1]");
       if (
-        !gpu.vertexLayout.attributes.some(
+        !(mutable ? mutable.channels.normal : gpu.vertexLayout.attributes.some(
           (a) => a.shaderLocation === 1 && a.offset === 12 && a.format === "float32x3",
-        )
+        ))
       )
         fail("ANIMATION_RENDER_NORMAL", "Lit meshes require deformed normals");
       if (shadows || environment) {
@@ -1412,6 +1456,7 @@ export async function createGpuAnimationRenderer(
       ? mapMask === 1
         ? "texture"
         : `maps-${mapMask}`
+      : mutable ? mutable.channels.uv || (geometryColors && mutable.channels.colorSize) ? "color" : "plain"
       : vertexColors !== null || texCoords !== null
         ? "color"
         : "plain";
@@ -1444,7 +1489,7 @@ export async function createGpuAnimationRenderer(
       (coated ? "coat-" : "") +
       (derivative ? "derivative-" : "") +
       (coordinateMask ? `uv-${coordinateMask}-` : "") +
-      attributeVariant;
+      attributeVariant + (mutable ? geometryVariant(mutable, geometryColors) : "");
     const textureKey =
       instancing && (mapMask || coated)
         ? groupKey(textures) +
@@ -1464,9 +1509,9 @@ export async function createGpuAnimationRenderer(
       surfaceBuffer = null,
       textureGroup = null,
       coatBuffer = null;
-    if (mapMask & ~coordinateMask && texCoords === null)
+    if (mapMask & ~coordinateMask && (mutable ? !mutable.channels.uv : texCoords === null))
       fail("ANIMATION_RENDER_GEOMETRY", "Material textures require UV coordinates");
-    if (attributeVariant !== "plain") {
+    if (!mutable && attributeVariant !== "plain") {
       limit("maxVertexBuffers", 2);
       limit("maxVertexAttributes", 5);
       const bytes = gpu.vertexCount * surfaceWords * 4;
@@ -1509,7 +1554,8 @@ export async function createGpuAnimationRenderer(
       for (const v of surfaceData)
         if (!Number.isFinite(v)) fail("ANIMATION_RENDER_VALUE", "Surface attributes exceed f32");
     }
-    const extent = indices === null ? gpu.vertexCount : indices.length;
+    const extent = mutable ? mutable.indexBuffer ? mutable.indexCount : mutable.vertexCount
+      : indices === null ? gpu.vertexCount : indices.length;
     const plans = instancing ? [bufferPlan(data, INDEX), bufferPlan(surfaceData, VERTEX)] : null;
     if (
       instancing &&
@@ -1537,7 +1583,7 @@ export async function createGpuAnimationRenderer(
     };
     pendingMeshes++;
     try {
-      if (data || surfaceData || lit) {
+      if (data || surfaceData || lit || mutable) {
         const lightsReady = lit ? ensureLighting() : Promise.resolve();
         const ready =
           variant === "plain"
@@ -1622,7 +1668,9 @@ export async function createGpuAnimationRenderer(
         await Promise.race([Promise.all([allocated.errors, ready, lightsReady]), lost]);
       }
       live();
-      deformerShape(gpu);
+      const latest = deformerShape(gpu, device);
+      if (mutable && latest.signature !== mutable.signature)
+        fail("ANIMATION_RENDER_GEOMETRY", "Geometry layout changed during material registration");
       if (instancing) {
         indexLease = publishBuffer(indexLease);
         indexBuffer = indexLease?.buffer ?? null;
@@ -1633,6 +1681,7 @@ export async function createGpuAnimationRenderer(
       }
       const record = {
         gpu,
+        geometrySignature: mutable?.signature ?? null,
         rgba,
         doubleSided,
         alphaMode,
@@ -1654,9 +1703,10 @@ export async function createGpuAnimationRenderer(
         occlusionStrength,
         disposed: false,
       };
+      const registeredVertexCount = gpu.vertexCount;
       const mesh = Object.freeze({
-        vertexCount: gpu.vertexCount,
-        indexCount: indices === null ? 0 : extent,
+        get vertexCount() { return mutable ? gpu.vertexCount : registeredVertexCount; },
+        get indexCount() { return mutable ? bufferGeometrySnapshot(gpu, device).indexCount : indices === null ? 0 : extent; },
         get disposed() {
           return record.disposed || disposed;
         },
@@ -1819,7 +1869,9 @@ export async function createGpuAnimationRenderer(
         if (!record || record.disposed)
           fail("ANIMATION_RENDER_MESH", "Mesh is not live in this renderer");
         const gpu = record.gpu;
-        deformerShape(gpu);
+        const geometry = deformerShape(gpu, device);
+        if (geometry && geometry.signature !== record.geometrySignature)
+          fail("ANIMATION_RENDER_GEOMETRY", "Geometry layout changed; register its new material layout");
         const world = array(input.worldMatrix ?? gpu.worldMatrix, 16, "World matrix");
         if (world[3] !== 0 || world[7] !== 0 || world[11] !== 0 || world[15] !== 1)
           fail("ANIMATION_RENDER_VALUE", "World matrix must be affine");
@@ -1904,19 +1956,22 @@ export async function createGpuAnimationRenderer(
           staged[offset + 63] = roughness;
           usesLighting = true;
         }
-        const first = integer(input.first ?? 0, 0, record.extent, "draw start");
-        const count = integer(
-          input.count ?? record.extent - first,
-          0,
-          record.extent - first,
-          "draw count",
-        );
+        const extent = geometry ? geometry.indexBuffer ? geometry.indexCount : geometry.vertexCount : record.extent;
+        let first = integer(input.first ?? 0, 0, extent, "draw start");
+        let count = integer(input.count ?? extent - first, 0, extent - first, "draw count");
+        if (geometry) {
+          const end = Math.min(first + count, geometry.drawRange.first + geometry.drawRange.count);
+          first = Math.max(first, geometry.drawRange.first);
+          count = Math.max(0, end - first);
+        }
         const command = commands[i] ?? (commands[i] = {});
         Object.assign(command, {
           record,
           first,
           count,
-          vertexBuffer: instancing ? gpu.vertexBuffer : null,
+          vertexBuffers: geometry?.vertexBuffers ?? [gpu.vertexBuffer],
+          indexBuffer: geometry ? geometry.indexBuffer : record.indexBuffer,
+          indexFormat: geometry ? geometry.indexFormat : record.indexFormat,
           pipeline: pipelines.get(
             `${lightingVariant(record.variant, Boolean(projected), Boolean(ambient))}/${record.alphaMode === "BLEND"}:${record.doubleSided ? (record.lit && determinant < 0 ? "none-cw" : "none") : determinant < 0 ? "cw" : "ccw"}`,
           ),
@@ -2035,12 +2090,13 @@ export async function createGpuAnimationRenderer(
           }
           pass.setPipeline(pipeline);
           pass.setBindGroup(0, bindGroup, instancing ? [] : [i * stride]);
-          pass.setVertexBuffer(0, instancing ? command.vertexBuffer : record.gpu.vertexBuffer);
+          for (let slot = 0; slot < command.vertexBuffers.length; slot++)
+            pass.setVertexBuffer(slot, command.vertexBuffers[slot]);
           if (record.surfaceBuffer) pass.setVertexBuffer(1, record.surfaceBuffer);
           if (record.textureGroup) pass.setBindGroup(1, record.textureGroup);
           if (record.lit) pass.setBindGroup(record.textureGroup ? 2 : 1, frameLightGroup);
-          if (record.indexBuffer) {
-            pass.setIndexBuffer(record.indexBuffer, record.indexFormat);
+          if (command.indexBuffer) {
+            pass.setIndexBuffer(command.indexBuffer, command.indexFormat);
             pass.drawIndexed(count, instances, first, 0, instancing ? i : 0);
           } else pass.draw(count, instances, first, instancing ? i : 0);
           submittedDrawCalls++;
@@ -2099,7 +2155,9 @@ export async function createGpuAnimationRenderer(
     } finally {
       for (const command of commands) {
         command.record = null;
-        command.vertexBuffer = null;
+        command.vertexBuffers = null;
+        command.indexBuffer = null;
+        command.indexFormat = null;
       }
       busy = false;
     }

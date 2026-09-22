@@ -10,6 +10,7 @@ not performance results or a full-material compatibility certification.</p>
 <script type="module">
 import {runDerivativeNormalChecks} from '../../../tools/ingest/animation_derivative_normals.browser.mjs';
 import {runAnimationRenderChecks} from '../../../tools/ingest/animation_render.browser.mjs';
+import {runBufferGeometryRenderChecks} from '../../../tools/ingest/gpu_buffer_geometry.browser.mjs';
 
 let device;
 try {
@@ -18,7 +19,8 @@ try {
   device=await adapter.requestDevice();
   const original=await runAnimationRenderChecks(device);
   const materialCoordinates=await runDerivativeNormalChecks(device);
-  globalThis.__f3dAnimationRenderResult={...original,materialCoordinates};
+  const bufferGeometry=await runBufferGeometryRenderChecks(device);
+  globalThis.__f3dAnimationRenderResult={...original,materialCoordinates,bufferGeometry};
 } catch(error) {
   globalThis.__f3dAnimationRenderResult={status:'failed',error:error.stack||String(error)};
 } finally {
