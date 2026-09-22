@@ -342,6 +342,12 @@ async function main() {
         console.log(
           `Numeric specialization: ${report.compiledKernels} kernels, ${report.rewrittenCalls} guarded call sites; report: ${report.reportFile}`,
         );
+        const marching = report.libraryKernels?.marchingCubes;
+        if (marching?.compiledAddons) {
+          console.log(
+            `MarchingCubes specialization: ${marching.compiledAddons} pinned addons, ${marching.compiledFieldKernels} field kernels plus polygonization.`,
+          );
+        }
         console.log("Original JavaScript remains the guard/policy fallback; no speedup claim.");
       }
 

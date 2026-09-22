@@ -15,7 +15,7 @@ import {cubeField,sameArrays,readMarchingCubesOracle} from './fixtures/marching_
 const oracleRoot=process.env.F3D_THREE_ROOT ?? fileURLToPath(new URL('../../upstream/three.js/',import.meta.url));
 const packageRootUrl=pathToFileURL(path.resolve(oracleRoot)+path.sep).href;
 const ordinaryEntry=`export {MarchingCubes,edgeTable,triTable} from 'three/addons/objects/MarchingCubes.js';
-export {MeshPhongMaterial,MeshStandardMaterial,MeshNormalMaterial,MeshBasicMaterial,BufferGeometry} from 'three';\n`;
+export {MeshPhongMaterial,MeshStandardMaterial,MeshNormalMaterial,MeshBasicMaterial,BufferGeometry,Color} from 'three';\n`;
 // Test-only import of the same private virtual runtime used by the source pass.
 // No upstream method, table, constructor or public field is replaced by this.
 const diagnosticEntry=ordinaryEntry+`export {marchingCubesDiagnostics as diagnostics} from ${JSON.stringify('\0f3d-marching-cubes-adapter')};\n`;
@@ -66,6 +66,9 @@ test('existing application opt-in emits a real pinned addon and reports it witho
   const report=actualBuild.numericSpecialization;
   const library=report.libraryKernels.marchingCubes;
   assert.equal(library.compiledAddons,1);assert.equal(library.registeredBaseModules,1);
+  assert.equal(library.compiledFieldKernels,6);assert.equal(library.registeredColorModules,1);
+  assert.deepEqual(library.modules.find(m=>m.compiledFieldKernels===6).fieldKernels.map(k=>k.name),
+    ['addBall','addPlaneX','addPlaneY','addPlaneZ','blur','reset']);
   assert.equal(library.accelerationClaim,false);assert.equal(report.accelerated,false);
   assert.equal(library.maxMemoryPages,2048);assert.equal(library.maxIterations,100000000);
   assert.equal(report.compiledKernels,report.units.reduce((sum,unit)=>sum+unit.compiledKernels,0));
@@ -149,19 +152,26 @@ test('caller memory/fuel budgets propagate through the existing build API to who
     const built=await buildApplication(path.join(root,'native-entry.mjs'),path.join(root,suffix),{packageRootUrl,specializeNumeric:settings});
     const m=await executeBuild(built);
     assert.equal(built.numericSpecialization.libraryKernels.marchingCubes[suffix],1);
-    const a=new m.MarchingCubes(8,new m.MeshPhongMaterial(),true,true,2000);
-    const b=new expectedModule.MarchingCubes(8,new expectedModule.MeshPhongMaterial(),true,true,2000);
+    const a=new m.MarchingCubes(18,new m.MeshPhongMaterial(),true,true,2000);
+    const b=new expectedModule.MarchingCubes(18,new expectedModule.MeshPhongMaterial(),true,true,2000);
     for(const effect of [a,b])effect.addBall(0.5,0.5,0.5,1,9);
     update(a,b);assert.equal(m.diagnostics(a).wasmCalls,0);assert.equal(m.diagnostics(a).fallbackCalls,1);
     assert.equal(m.diagnostics(a).lastFailure,suffix==='maxMemoryPages' ? 'KERNEL_MEMORY_LIMIT' : 'KERNEL_EXECUTION_FAILED');
+    assert.equal(m.diagnostics(a).fieldKernels.addBall.wasmCalls,0);
+    assert.equal(m.diagnostics(a).fieldKernels.addBall.fallbackCalls,1);
+    assert.equal(m.diagnostics(a).fieldKernels.addBall.lastFailure,
+      suffix==='maxMemoryPages' ? 'KERNEL_MEMORY_LIMIT' : 'KERNEL_EXECUTION_FAILED');
+    for(const effect of [a,b]) {effect.init(2);effect.addBall(0.5,0.5,0.5,1,9);}
+    compare(a,b);assert.equal(m.diagnostics(a).fieldKernels.addBall.wasmCalls,1);
   }
 });
 
 test('CLI --specialize-numeric reaches the addon, emits matching JSON and preserves the default opt-out',async()=>{
   const cli=fileURLToPath(new URL('./cli.mjs',import.meta.url));
   const out=path.join(root,'cli-out'),manifest=path.join(root,'cli-manifest.json');
-  execFileSync(process.execPath,[cli,'--entry',path.join(root,'retained-entry.mjs'),'--build-app',out,
+  const stdout=execFileSync(process.execPath,[cli,'--entry',path.join(root,'retained-entry.mjs'),'--build-app',out,
     '--specialize-numeric','--package-root',packageRootUrl,'--output',manifest],{encoding:'utf8',timeout:120000});
+  assert.match(stdout,/MarchingCubes specialization: 1 pinned addons, 6 field kernels plus polygonization/);
   const result=JSON.parse(await fs.readFile(manifest,'utf8'));
   assert.equal(result.numericSpecialization.libraryKernels.marchingCubes.compiledAddons,1);
   assert.deepEqual(JSON.parse(await fs.readFile(path.join(out,result.numericSpecialization.reportFile),'utf8')),result.numericSpecialization);
@@ -188,4 +198,166 @@ test('lookalike library code remains retained and is reported as a pin mismatch'
   const report=built.numericSpecialization.libraryKernels.marchingCubes;
   assert.equal(report.compiledAddons,0);assert.equal(report.modules[0].reason,'SOURCE_PIN_MISMATCH');
   const module=await executeBuild(built);assert.equal(new module.MarchingCubes().update(),42);
+});
+
+
+const fieldStats=(object,name)=>actualModule.diagnostics(object).fieldKernels[name];
+function fieldCall(a,b,name,args=[],expectedArgs=args) {
+  assert.equal(a[name](...args),undefined);assert.equal(b[name](...expectedArgs),undefined);compare(a,b);
+}
+
+test('all six field operations actually run native behind unchanged public methods and synchronous storage',()=>{
+  const [a,b]=pair(9),methods=Object.fromEntries(['addBall','addPlaneX','addPlaneY','addPlaneZ','blur','reset'].map(name=>[name,a[name]]));
+  const field=a.field,palette=a.palette;
+  for(const o of [a,b])o.normal_cache.fill(31.25);
+  fieldCall(a,b,'addBall',[0.5,0.5,0.5,0.9,9,[0.2,0.4,0.8]]);
+  assert.ok(a.field.some(value=>value>0));assert.ok(a.palette.some(value=>value>0));
+  assert.equal(a.count,0);assert.equal(a.geometry.getAttribute('position').version,0);
+  for(const axis of ['X','Y','Z'])fieldCall(a,b,'addPlane'+axis,[0.15,8]);
+  fieldCall(a,b,'blur',[0.5]);fieldCall(a,b,'reset');
+  for(const [name,method] of Object.entries(methods)) {
+    assert.equal(a[name],method);assert.equal(a[name].length,b[name].length);
+    assert.equal(fieldStats(a,name).wasmCalls,1,name);assert.equal(fieldStats(a,name).fallbackCalls,0,name);
+  }
+  assert.equal(a.field,field);assert.equal(a.palette,palette);
+  assert.equal(a.normal_cache[0],0);assert.equal(a.normal_cache[1],31.25);
+  assert.equal(actualModule.Color.length,3);
+});
+
+test('metaball color conversion stays upstream for defaults, arrays, CSS, hex and genuine live Colors',()=>{
+  const [a,b]=pair(8),args=[0.47,0.52,0.49,0.8,9];
+  for(const value of [undefined,null,[2,-0.2,0.8],'skyblue','hsl(25, 70%, 60%)',0x52ab73]) {
+    fieldCall(a,b,'addBall',[...args,value]);
+  }
+  const ac=new actualModule.Color(0.1,0.2,0.3),bc=new expectedModule.Color(0.1,0.2,0.3);
+  fieldCall(a,b,'addBall',[...args,ac],[...args,bc]);
+  ac.r=bc.r=0.91;ac.g=bc.g=-0.1;
+  fieldCall(a,b,'addBall',[...args,ac],[...args,bc]);
+  assert.equal(fieldStats(a,'addBall').wasmCalls,8);assert.equal(fieldStats(a,'addBall').fallbackCalls,0);
+  update(a,b);
+});
+
+test('accessor Colors retain per-cell observations and partial JavaScript writes when a getter throws',()=>{
+  const [a,b]=pair(8),ac=new actualModule.Color(),bc=new expectedModule.Color(),args=[0.5,0.5,0.5,0.8,9];
+  let ar=0,br=0;
+  Object.defineProperty(ac,'r',{get(){return 0.1+(++ar)/1000;},configurable:true});
+  Object.defineProperty(bc,'r',{get(){return 0.1+(++br)/1000;},configurable:true});
+  fieldCall(a,b,'addBall',[...args,ac],[...args,bc]);
+  assert.equal(ar,br);assert.ok(ar>1);assert.equal(fieldStats(a,'addBall').wasmCalls,0);
+  const sentinel={};ar=br=0;
+  Object.defineProperty(ac,'r',{get(){if(++ar===3)throw sentinel;return 0.2;},configurable:true});
+  Object.defineProperty(bc,'r',{get(){if(++br===3)throw sentinel;return 0.2;},configurable:true});
+  assert.throws(()=>a.addBall(...args,ac),error=>error===sentinel);
+  assert.throws(()=>b.addBall(...args,bc),error=>error===sentinel);
+  assert.equal(ar,3);assert.equal(br,3);compare(a,b);
+  assert.equal(fieldStats(a,'addBall').fallbackCalls,2);
+});
+
+test('proxy Colors and objects returned by overridden Color.set are never speculatively inspected',()=>{
+  for(const returned of [false,true]) {
+    const [a,b]=pair(8),traces=[[],[]];let descriptors=0;
+    const colors=[actualModule,expectedModule].map((m,i)=>{
+      const wrap=target=>new Proxy(target,{get(target,key){traces[i].push(key);return Reflect.get(target,key);},
+        getOwnPropertyDescriptor(){descriptors++;throw Error('unexpected speculative descriptor');}});
+      if (!returned)return wrap(new m.Color(0.2,0.3,0.4));
+      class ReturningColor extends m.Color {set(...args){return wrap(super.set(...args));}}
+      return new ReturningColor(0.2,0.3,0.4);
+    });
+    const args=[0.5,0.5,0.5,0.8,9];
+    fieldCall(a,b,'addBall',[...args,colors[0]],[...args,colors[1]]);
+    assert.deepEqual(traces[0],traces[1]);assert.equal(descriptors,0);
+    assert.equal(fieldStats(a,'addBall').lastFailure,'MARCHING_CUBES_FIELD_GUARD');
+  }
+});
+
+test('color-conversion exceptions are caught once by original setup, then the recovered default color can run native',()=>{
+  const [a,b]=pair(8);let ar=0,br=0;
+  const ac=[0.2,0.3,0.4],bc=[0.2,0.3,0.4];
+  Object.defineProperty(ac,0,{get(){ar++;throw Error('color input');}});
+  Object.defineProperty(bc,0,{get(){br++;throw Error('color input');}});
+  const args=[0.5,0.5,0.5,0.8,9];fieldCall(a,b,'addBall',[...args,ac],[...args,bc]);
+  assert.equal(ar,1);assert.equal(br,1);assert.equal(fieldStats(a,'addBall').wasmCalls,1);
+});
+
+test('numeric coercions in plane parameters occur only in the original prefix and retained loop',()=>{
+  const [a,b]=pair(8);let ar=0,br=0;
+  const strengthA={valueOf(){ar++;return 0.5;}},strengthB={valueOf(){br++;return 0.5;}};
+  for(const name of ['addPlaneX','addPlaneY','addPlaneZ']) {
+    fieldCall(a,b,name,[strengthA,9],[strengthB,9]);
+    assert.equal(ar,br);assert.equal(fieldStats(a,name).wasmCalls,0);
+    assert.equal(fieldStats(a,name).lastFailure,'KERNEL_SCALAR_TYPE');
+  }
+  assert.ok(ar>3);
+});
+
+test('blur executes an overridden slice once; an alias result retains the original in-place update order',()=>{
+  for(const alias of [false,true]) {
+    const [a,b]=pair(7);let ac=0,bc=0;
+    for(let i=0;i<a.field.length;i++)a.field[i]=b.field[i]=(i%19-7)/9;
+    const slice=Float32Array.prototype.slice;
+    a.field.slice=function(){ac++;return alias?this:Reflect.apply(slice,this,[]);};
+    b.field.slice=function(){bc++;return alias?this:Reflect.apply(slice,this,[]);};
+    fieldCall(a,b,'blur',[0.7]);assert.equal(ac,1);assert.equal(bc,1);
+    assert.equal(fieldStats(a,'blur').wasmCalls,alias?0:1);
+    assert.equal(fieldStats(a,'blur').lastFailure,alias?'KERNEL_ARRAY_ALIAS':null);
+  }
+});
+
+test('changed sqrt accessors select the original loop without speculative getter calls and recover after restoration',()=>{
+  const [a,b]=pair(8),d=Object.getOwnPropertyDescriptor(Math,'sqrt');let reads=0;
+  const args=[0.5,0.5,0.5,0.8,9];let actualReads,expectedReads;
+  try {
+    Object.defineProperty(Math,'sqrt',{configurable:true,get(){reads++;return d.value;}});
+    a.addBall(...args);actualReads=reads;reads=0;b.addBall(...args);expectedReads=reads;
+  } finally {Object.defineProperty(Math,'sqrt',d);}
+  compare(a,b);assert.equal(actualReads,expectedReads);assert.ok(actualReads>1);
+  assert.equal(fieldStats(a,'addBall').lastFailure,'KERNEL_MATH_BINDING');
+  fieldCall(a,b,'addBall',args);assert.equal(fieldStats(a,'addBall').wasmCalls,1);
+});
+
+test('owner accessors and borrowed receivers preserve original field access traces without speculative reads',()=>{
+  const [a,b]=pair(8),af=a.field,bf=b.field;let ar=0,br=0;
+  Object.defineProperty(a,'field',{get(){ar++;return af;},configurable:true});
+  Object.defineProperty(b,'field',{get(){br++;return bf;},configurable:true});
+  a.addBall(0.5,0.5,0.5,0.8,9);b.addBall(0.5,0.5,0.5,0.8,9);
+  assert.equal(ar,br);assert.ok(ar>1);compare(a,b);
+  Object.defineProperty(a,'field',{value:af,writable:true,configurable:true});
+  Object.defineProperty(b,'field',{value:bf,writable:true,configurable:true});
+  let traps=0;
+  const proxy=target=>new Proxy(target,{getOwnPropertyDescriptor(){traps++;throw Error('descriptor');}});
+  a.addPlaneX.call(proxy(a),0.1,8);b.addPlaneX.call(proxy(b),0.1,8);
+  assert.equal(traps,0);compare(a,b);
+  assert.equal(fieldStats(a,'addPlaneX').lastFailure,'MARCHING_CUBES_RECEIVER');
+});
+
+test('late field bounds and alias failures do not publish speculative density before retained palette writes',()=>{
+  const [a,b]=pair(8),args=[0.5,0.5,0.5,0.8,9,[0.2,0.3,0.4]];
+  a.palette=a.field;b.palette=b.field;fieldCall(a,b,'addBall',args);
+  assert.equal(fieldStats(a,'addBall').lastFailure,'KERNEL_ARRAY_ALIAS');
+  a.palette=new Float32Array(7);b.palette=new Float32Array(7);fieldCall(a,b,'addBall',args);
+  assert.equal(fieldStats(a,'addBall').lastFailure,'KERNEL_EXECUTION_FAILED');
+  a.init(8);b.init(8);fieldCall(a,b,'addBall',args);
+  assert.equal(fieldStats(a,'addBall').wasmCalls,1);assert.equal(fieldStats(a,'addBall').fallbackCalls,2);
+});
+
+test('the source-tree import-map route registers Color and EventDispatcher without requiring the built core',async()=>{
+  const map={imports:{three:new URL('src/Three.js',packageRootUrl).href,'three/addons/':new URL('examples/jsm/',packageRootUrl).href}};
+  const entry=await write('source-route.html',`<script type="importmap">${JSON.stringify(map)}</script><script type="module" src="./native-entry.mjs"></script>`);
+  const built=await buildApplication(entry,path.join(root,'source-route'),{specializeNumeric:true});
+  const m=await executeBuild(built),a=new m.MarchingCubes(8,new m.MeshPhongMaterial());
+  a.addBall(0.5,0.5,0.5,0.8,9);a.update();assert.ok(a.count>0);
+  assert.equal(m.diagnostics(a).fieldKernels.addBall.wasmCalls,1);assert.equal(m.diagnostics(a).wasmCalls,1);
+  assert.equal(built.numericSpecialization.libraryKernels.marchingCubes.registeredColorModules,1);
+});
+
+test('dynamic chunks share genuine color ownership and lazy field dispatch with their consumer',async()=>{
+  await write('field-maker.mjs',`import {MarchingCubes} from 'three/addons/objects/MarchingCubes.js';
+    import {Color,MeshPhongMaterial} from 'three';
+    export function make(){const effect=new MarchingCubes(8,new MeshPhongMaterial());
+      effect.addBall(0.5,0.5,0.5,0.8,9,new Color(0.2,0.4,0.7));return effect;}`);
+  const entry=await write('field-consumer.mjs',`export {marchingCubesDiagnostics as diagnostics} from ${JSON.stringify('\0f3d-marching-cubes-adapter')};
+    export async function make(){return (await import('./field-maker.mjs')).make();}`);
+  const built=await buildApplication(entry,path.join(root,'dynamic-fields'),{packageRootUrl,specializeNumeric:true});
+  assert.ok(built.isMultiChunk);const m=await executeBuild(built),a=await m.make();
+  assert.equal(m.diagnostics(a).fieldKernels.addBall.wasmCalls,1);a.update();assert.equal(m.diagnostics(a).wasmCalls,1);
 });

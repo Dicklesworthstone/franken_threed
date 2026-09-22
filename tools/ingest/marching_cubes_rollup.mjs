@@ -19,10 +19,10 @@ export function marchingCubesRollupPlugin(options={}) {
       !Number.isInteger(maxIterations) || maxIterations<1 || maxIterations>1000000000) {
     throw new RangeError('Invalid marching-cubes memory or iteration budget');
   }
-  const reports=[];let registrations=0;
+  const reports=[];let registrations=0,colorRegistrations=0;
   return {
     name:'f3d-marching-cubes',
-    buildStart() {reports.length=0;registrations=0;},
+    buildStart() {reports.length=0;registrations=0;colorRegistrations=0;},
     resolveId(source,importer) {
       if (source===ADAPTER || source===RUNTIME) return source;
       if (importer===ADAPTER && source==='./numeric_kernel_runtime.mjs') return RUNTIME;
@@ -42,13 +42,18 @@ export function marchingCubesRollupPlugin(options={}) {
         reports.push({id,...result.report});
         if (result.changed) return {code:result.code,map:null};
       }
-      if (code.includes('class EventDispatcher')) {
+      if (code.includes('class EventDispatcher') || code.includes('class Color')) {
         const result=specializeMarchingCubesBase(code,{runtimeModule:ADAPTER});
-        if (result.changed) {registrations++;return {code:result.code,map:null};}
+        if (result.changed) {
+          if (result.registeredClasses.includes('EventDispatcher')) registrations++;
+          if (result.registeredClasses.includes('Color')) colorRegistrations++;
+          return {code:result.code,map:null};
+        }
       }
       return null;
     },
     api:{getReport() {return {version:1,maxMemoryPages,maxIterations,compiledAddons:reports.filter(x=>x.route!=='retained-js').length,
-      registeredBaseModules:registrations,accelerationClaim:false,modules:reports.map(x=>({...x}))};}},
+      registeredBaseModules:registrations,registeredColorModules:colorRegistrations,
+      compiledFieldKernels:reports.reduce((sum,report)=>sum+(report.compiledFieldKernels??0),0),accelerationClaim:false,modules:reports.map(x=>({...x}))};}},
   };
 }

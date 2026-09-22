@@ -1,10 +1,10 @@
 /**
  * Compiler-owned bridge for the source-verified MarchingCubes addon. Construct
  * genuine retained objects and keep every original export, prototype and field.
- * Instrument only its numeric update body; the original method identity and
- * publication tail remain in place. All other addon methods stay retained.
+ * Instrument numeric loops; original method identities, field setup and update
+ * publication stay in place. Other addon methods remain entirely retained.
  *
- * Registration is emitted INSIDE the verified base EventDispatcher constructor
+ * Registration is emitted INSIDE verified base EventDispatcher/Color constructors
  * where `this` is freshly allocated, never an arbitrary caller-owned object.
  * Unknown owners/materials, including proxies around known objects, take the
  * original path without property inspection. Bootstrap trusted platform APIs.
@@ -30,7 +30,7 @@ function platformIntact() {
   }
   return true;
 }
-const objects=new WeakSet(),dispatches=new WeakMap(),updates=new WeakMap();
+const objects=new WeakSet(),dispatches=new WeakMap(),updates=new WeakMap(),fieldUpdates=new WeakMap();
 const own=(object,key)=>{
   const d=descriptor(object,key);
   return d && hasOwn(d,'value') ? d : null;
@@ -38,7 +38,7 @@ const own=(object,key)=>{
 const names=['size','size2','size3','halfsize','delta','yd','zd','isolation','field','normal_cache',
   'palette','positionArray','normalArray','material','geometry','enableUvs','enableColors','count'];
 
-/** Called only by the verified base constructor with its genuine fresh `this`. */
+/** Called only by verified base constructors (EventDispatcher/Color) with fresh `this`. */
 export function registerMarchingCubesObject(object) { objects.add(object); }
 
 /** No binary decoding or Wasm allocation until the first admitted update. */
@@ -55,7 +55,7 @@ function kernelFor(record) {
       const binary=apply(decode,globalThis,[record.base64]),bytes=new U8(binary.length);
       for (let k=0;k<binary.length;k++) bytes[k]=apply(charCodeAt,binary,[k]);
       // Independent storage is essential: do NOT enable preserveAliasing.
-      record.kernel=instantiateNumericKernel(bytes);
+      record.kernel=instantiateNumericKernel(bytes,{resolveMath:record.resolveMath??null});
     } catch {
       // Host policy may throw arbitrary values with effectful accessors.
       record.initializationFailure='MARCHING_CUBES_INITIALIZATION';
@@ -126,9 +126,92 @@ export function tryMarchingCubesUpdate(receiver,object,token,edgePositions,edgeN
 
 /** Opt-in diagnostics; the generated Three module gains no new public exports. */
 export function marchingCubesDiagnostics(object) {
-  const stats=updates.get(object);
-  if (!stats) return Object.freeze({wasmCalls:0,fallbackCalls:0,lastFailure:null,initialized:false,kernel:null});
+  const stats=updates.get(object),fieldKernels=fieldDiagnostics(object);
+  if (!stats) return Object.freeze({wasmCalls:0,fallbackCalls:0,lastFailure:null,initialized:false,kernel:null,fieldKernels});
   const dispatch=dispatches.get(stats.token);
   return Object.freeze({wasmCalls:stats.wasmCalls,fallbackCalls:stats.fallbackCalls,lastFailure:stats.lastFailure,
-    initialized:dispatch?.attempted??false,kernel:dispatch?.kernel?.diagnostics??null});
+    initialized:dispatch?.attempted??false,kernel:dispatch?.kernel?.diagnostics??null,fieldKernels});
+}
+
+
+/** Attach compiler-owned ABI recipes, never descriptors supplied by the app. */
+export function attachMarchingCubesFields(token,specifications,resolveMath) {
+  const dispatch=dispatches.get(token);
+  if (!dispatch || dispatch.fields || !Array.isArray(specifications) || specifications.length>6 ||
+      typeof resolveMath!=='function') throw new TypeError('Invalid marching-cubes field dispatch');
+  const fields=new Map();
+  for (const specification of specifications) {
+    const {name,base64,parameters,locals}=specification;
+    if (!['addBall','addPlaneX','addPlaneY','addPlaneZ','blur','reset'].includes(name) || fields.has(name) ||
+        typeof base64!=='string' || base64.length>1024*1024 || !Array.isArray(parameters) ||
+        parameters.length>64 || !Array.isArray(locals)) throw new TypeError('Invalid field kernel recipe');
+    const bindings=parameters.map(parameter=>{
+      if (!parameter || !['local','owner','color'].includes(parameter.kind) ||
+          typeof parameter.name!=='string' || typeof parameter.property!=='string' ||
+          !['f32[]','f64'].includes(parameter.type)) throw new TypeError('Invalid field parameter binding');
+      const index=parameter.kind==='local'?locals.indexOf(parameter.property):-1;
+      if (parameter.kind==='local' && index<0) throw new TypeError('Missing field local binding');
+      return Object.freeze({...parameter,index});
+    });
+    fields.set(name,{base64,parameters:Object.freeze(bindings),localCount:locals.length,
+      color:bindings.some(p=>p.kind==='color'),resolveMath,
+      attempted:false,kernel:null,initializationFailure:null});
+  }
+  dispatch.fields=fields;
+}
+
+function fieldInput(record,object,locals,color) {
+  if (locals.length!==record.localCount || (record.color && !objects.has(color))) return null;
+  const values=[];
+  for (const parameter of record.parameters) {
+    if (parameter.kind==='local') values.push(locals[parameter.index]);
+    else {
+      // Only genuine registered identities are inspected. Proxy wrappers never
+      // pass the WeakSet check, even when their underlying Color is registered.
+      const d=own(parameter.kind==='owner'?object:color,parameter.property);
+      if (!d) return null;
+      values.push(d.value);
+    }
+  }
+  return values;
+}
+
+/**
+ * Runs just the original method's lifted loop. Its scalar/color/slice prefix has
+ * ALREADY executed once in source; refusal resumes that same invocation at its
+ * original loop, not at the method entry. No callback, count or geometry write
+ * is performed here. The shared host publishes all numerical writes or none.
+ */
+export function tryMarchingCubesField(receiver,object,token,name,locals,color) {
+  let methods=fieldUpdates.get(object);
+  if (!methods) {methods=new Map();fieldUpdates.set(object,methods);}
+  let stats=methods.get(name);
+  if (!stats) {stats={wasmCalls:0,fallbackCalls:0,lastFailure:null,token};methods.set(name,stats);}
+  stats.token=token;
+  const fallback=reason=>{stats.fallbackCalls++;stats.lastFailure=reason;return false;};
+  if (receiver!==object || !objects.has(object)) return fallback('MARCHING_CUBES_RECEIVER');
+  const record=dispatches.get(token)?.fields?.get(name);
+  if (!record) return fallback('MARCHING_CUBES_UNREGISTERED');
+  if (!fieldInput(record,object,locals,color)) return fallback('MARCHING_CUBES_FIELD_GUARD');
+  if (!platformIntact()) return fallback('MARCHING_CUBES_PLATFORM');
+  const kernel=kernelFor(record);
+  if (!kernel) return fallback(record.initializationFailure);
+  if (!platformIntact()) return fallback('MARCHING_CUBES_PLATFORM');
+  const values=fieldInput(record,object,locals,color);
+  if (!values) return fallback('MARCHING_CUBES_FIELD_GUARD');
+  try {kernel.run(...values);}
+  catch {return fallback(kernel.diagnostics.lastGuardFailure??'MARCHING_CUBES_EXECUTION');}
+  // Native output publication has completed. There is no source replay below.
+  stats.wasmCalls++;stats.lastFailure=null;
+  return true;
+}
+
+function fieldDiagnostics(object) {
+  const report={};
+  for (const [name,stats] of fieldUpdates.get(object)??[]) {
+    const record=dispatches.get(stats.token)?.fields?.get(name);
+    report[name]=Object.freeze({wasmCalls:stats.wasmCalls,fallbackCalls:stats.fallbackCalls,
+      lastFailure:stats.lastFailure,initialized:record?.attempted??false,kernel:record?.kernel?.diagnostics??null});
+  }
+  return Object.freeze(report);
 }

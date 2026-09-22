@@ -1,15 +1,17 @@
 /**
  * Recognize a source-pinned library kernel, not an application filename/trace.
- * Only the numeric prefix of update is bypassed. The original public method and
- * its publication tail remain source code, with all callbacks/errors in place.
+ * Only verified numeric loops are bypassed. The original public methods and
+ * their prefixes/publication tails retain all callbacks, conversions and errors.
  * Build-time parsing never evaluates the addon or its table initializers.
  */
 import {createHash} from 'node:crypto';
 import * as acorn from 'acorn';
 import {compileMarchingCubesKernel} from './marching_cubes_compile.mjs';
+import {compileMarchingCubesFields} from './marching_cubes_fields.mjs';
 const MARCHING_CUBES_PIN='148ef33ecb6d2502ff796d4554abd1549c95d519';
 export const MARCHING_CUBES_SOURCE_BLOB='29a405be3eae30a7e2b1ff04827068921d31d5dc';
 export const EVENT_DISPATCHER_SOURCE_BLOB='ac793ea9081486b1b1e834c9df2480d18fb90e0c';
+export const COLOR_SOURCE_BLOB='f42d664478a6952dd1889eebc9a16736a2c614ab';
 // Checked-in pinned build, also recorded in evidence/01.1/build_sha256.txt.
 const CORE_BUILD_SHA256='9edde002b066a9a05676a6127f67735b62baf399bdea529f2f7e31657da769e6';
 export function sourceBlob(source) {
@@ -56,22 +58,44 @@ export function specializeMarchingCubesModule(source,{
     throw new TypeError('Missing verified numeric/publication boundary');
   }
   const artifact=compileMarchingCubesKernel({maxMemoryPages,maxIterations});
+  // Fixture-specific expectedBlob overrides do not authorize field lifting.
+  // Its own pin is independent and covers every original loop and prefix.
+  const fields=hash===MARCHING_CUBES_SOURCE_BLOB?compileMarchingCubesFields(source,{maxMemoryPages,maxIterations}):[];
   const tryName=fresh(source,'try'),createName=fresh(source,'create'),token=fresh(source,'dispatch');
+  const fieldTry=fresh(source,'field_try'),attach=fresh(source,'attach_fields');
   const prefix=source.slice(update.body.start+1,body[tail].start);
-  const numeric=`\nif (!${tryName}(this, scope, ${token}, vlist, nlist, clist)) {${prefix}\n}\n`;
-  const transformed=source.slice(0,update.body.start+1)+numeric+source.slice(body[tail].start);
-  const header=`import { tryMarchingCubesUpdate as ${tryName}, createMarchingCubesDispatch as ${createName} } from ${JSON.stringify(runtimeModule)};\nvar ${token};\n`;
+  const edits=[{start:update.body.start+1,end:body[tail].start,
+    text:`\nif (!${tryName}(this, scope, ${token}, vlist, nlist, clist)) {${prefix}\n}\n`}];
+  for (const field of fields) {
+    const {start,end}=field.sourceSpan;
+    edits.push({start,end,text:`if (!${fieldTry}(this, scope, ${token}, ${JSON.stringify(field.name)}, `+
+      `[${field.locals.join(',')}], ${field.color?'ballColor':'null'})) {\n${source.slice(start,end)}\n}`});
+  }
+  let transformed=source;
+  for (const edit of edits.sort((a,b)=>b.start-a.start)) {
+    transformed=transformed.slice(0,edit.start)+edit.text+transformed.slice(edit.end);
+  }
+  const fieldImports=fields.length?`, tryMarchingCubesField as ${fieldTry}, attachMarchingCubesFields as ${attach}`:'';
+  const header=`import { tryMarchingCubesUpdate as ${tryName}, createMarchingCubesDispatch as ${createName}${fieldImports} } from ${JSON.stringify(runtimeModule)};\nvar ${token};\n`;
   // var is initialized before an ESM cycle can call the source method. Before
   // table/dispatch registration the original function supplies its own TDZ/error.
-  const registration=`\n${token}=${createName}(${JSON.stringify(Buffer.from(artifact.wasm).toString('base64'))},edgeTable,triTable);\n`;
+  let registration=`\n${token}=${createName}(${JSON.stringify(Buffer.from(artifact.wasm).toString('base64'))},edgeTable,triTable);\n`;
+  if (fields.length) {
+    const specifications=fields.map(field=>({name:field.name,parameters:field.parameters,locals:field.locals,
+      base64:Buffer.from(field.wasm).toString('base64')}));
+    registration+=`${attach}(${token},${JSON.stringify(specifications)},()=>Math);\n`;
+  }
   return {changed:true,code:header+transformed+registration,wasm:artifact.wasm,report:{...report,
     route:'retained-addon-with-guarded-wasm-polygonizer',wasmBytes:artifact.wasm.length,
+    compiledFieldKernels:fields.length,fieldWasmBytes:fields.reduce((sum,field)=>sum+field.wasm.length,0),
+    fieldKernels:fields.map(field=>({name:field.name,wasmBytes:field.wasm.length,sourceSpan:field.sourceSpan,
+      numericSemantics:field.manifest.numericSemantics})),
     numericSourceSpan:{start:update.body.start+1,end:body[tail].start},
     preservedPublicationSpan:{start:body[tail].start,end:update.body.end-1}}};
 }
 
 /**
- * Register genuine allocations in the verified BASE EventDispatcher. Checking
+ * Register genuine allocations in the verified base EventDispatcher and Color. Checking
  * a constructor chain later is unsound: a derived constructor may return a Proxy
  * or mutate its superclass while executing. A WeakSet records the fresh identity
  * at allocation instead, and misses proxies without triggering their traps.
@@ -82,12 +106,27 @@ export function specializeMarchingCubesBase(source,{
 }={}) {
   if (typeof source!=='string' || typeof runtimeModule!=='string' || !runtimeModule ||
       typeof expectedBlob!=='string' || !/^[a-f0-9]{40}$/.test(expectedBlob)) throw new TypeError('Invalid base source options');
-  const match=sourceBlob(source)===expectedBlob || (expectedBlob===EVENT_DISPATCHER_SOURCE_BLOB &&
-    createHash('sha256').update(source).digest('hex')===CORE_BUILD_SHA256);
-  if (!match) return {changed:false,code:source};
-  const base=parse(source).body.find(node=>node.type==='ClassDeclaration' && node.id?.name==='EventDispatcher');
-  if (!base || base.superClass || base.body.body.some(node=>node.kind==='constructor')) throw new TypeError('Expected verified default base constructor');
-  const register=fresh(source,'register');
-  return {changed:true,code:`import { registerMarchingCubesObject as ${register} } from ${JSON.stringify(runtimeModule)};\n`+
-    source.slice(0,base.body.start+1)+`\nconstructor() { ${register}(this); }\n`+source.slice(base.body.start+1)};
+  const hash=sourceBlob(source),defaultPin=expectedBlob===EVENT_DISPATCHER_SOURCE_BLOB;
+  const core=defaultPin && createHash('sha256').update(source).digest('hex')===CORE_BUILD_SHA256;
+  const colorSource=defaultPin && hash===COLOR_SOURCE_BLOB;
+  if (hash!==expectedBlob && !core && !colorSource) return {changed:false,code:source};
+  const ast=parse(source),register=fresh(source,'register'),edits=[],registeredClasses=[];
+  if (!colorSource) {
+    const base=ast.body.find(node=>node.type==='ClassDeclaration' && node.id?.name==='EventDispatcher');
+    if (!base || base.superClass || base.body.body.some(node=>node.kind==='constructor')) throw new TypeError('Expected verified default base constructor');
+    edits.push({at:base.body.start+1,text:`\nconstructor() { ${register}(this); }\n`});
+    registeredClasses.push('EventDispatcher');
+  }
+  if (core || colorSource) {
+    const color=ast.body.find(node=>node.type==='ClassDeclaration' && node.id?.name==='Color');
+    if (!color || color.superClass) throw new TypeError('Expected verified base Color');
+    const ctor=constructor(ast,'Color');
+    // Color.set can be overridden and return a foreign object or Proxy. Record
+    // the true allocation BEFORE that call, never the returned identity.
+    edits.push({at:ctor.body.start+1,text:`\n${register}(this);\n`});
+    registeredClasses.push('Color');
+  }
+  let code=source;
+  for (const edit of edits.sort((a,b)=>b.at-a.at)) code=code.slice(0,edit.at)+edit.text+code.slice(edit.at);
+  return {changed:true,registeredClasses,code:`import { registerMarchingCubesObject as ${register} } from ${JSON.stringify(runtimeModule)};\n`+code};
 }
