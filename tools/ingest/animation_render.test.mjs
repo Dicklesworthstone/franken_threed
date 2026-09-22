@@ -1050,7 +1050,7 @@ test("missing normals, unsupported shading and invalid factors fail before light
     r = await createGpuAnimationRenderer(d);
   await assert.rejects(r.addMesh(gpu(), { shading: "lambert" }), code("ANIMATION_RENDER_NORMAL"));
   for (const options of [
-    { shading: "phong" },
+    { shading: "unknown-shading-model" },
     { shading: "lambert", roughnessFactor: 0.5 },
     { shading: "metallic-roughness", metallicFactor: -1 },
     { shading: "metallic-roughness", roughnessFactor: 2 },

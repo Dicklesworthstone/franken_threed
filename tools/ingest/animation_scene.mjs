@@ -94,7 +94,7 @@ const {createGpuAnimationDeformer, updateGpuAnimationDeformers} = gpuDeformation
 import {createGpuAnimationRenderer, AnimationRenderError} from './animation_render.mjs';
 const fail = (code, message) => { throw new AnimationRenderError(code, message); };
 const TEXTURE_FIELDS = ['baseColorTexture', 'metallicRoughnessTexture', 'normalTexture', 'emissiveTexture', 'occlusionTexture',
-  'clearcoatTexture', 'clearcoatRoughnessTexture', 'clearcoatNormalTexture'];
+  'clearcoatTexture', 'clearcoatRoughnessTexture', 'clearcoatNormalTexture', 'specularTexture'];
 const COAT_FIELDS = ['clearcoatFactor', 'clearcoatRoughnessFactor', 'clearcoatNormalScale'];
 
 export async function createGpuAnimationScene(device, pose, drawables, {
@@ -174,17 +174,17 @@ export async function createGpuAnimationScene(device, pose, drawables, {
     const inputs = drawables.map(input => {
       if (!input || typeof input !== 'object') fail('ANIMATION_SCENE_GEOMETRY', 'Expected a drawable descriptor');
       const allowed = ['geometry', 'indices', 'baseColor', 'doubleSided', 'alphaMode', 'alphaCutoff',
-        'texCoords', 'vertexColors', 'mapCoordinates', ...TEXTURE_FIELDS, ...COAT_FIELDS, 'uvTransform', 'shading', 'metallicFactor', 'roughnessFactor', 'emissiveFactor', 'normalScale', 'occlusionStrength'];
+        'texCoords', 'vertexColors', 'mapCoordinates', ...TEXTURE_FIELDS, ...COAT_FIELDS, 'uvTransform', 'shading', 'flatShading', 'specularColor', 'shininess', 'metallicFactor', 'roughnessFactor', 'emissiveFactor', 'normalScale', 'occlusionStrength'];
       for (const key of Object.keys(input)) if (!allowed.includes(key)) fail('ANIMATION_SCENE_GEOMETRY', `Unsupported drawable field: ${key}`);
       const {geometry, indices = null, baseColor = [1,1,1,1], doubleSided = false, alphaMode = 'OPAQUE', alphaCutoff = 0.5} = input;
       if ((!Array.isArray(baseColor) && !ArrayBuffer.isView(baseColor)) || baseColor.length !== 4) fail('ANIMATION_SCENE_GEOMETRY', 'Expected RGBA material color');
       const material = {indices: indices === null ? null : copyMaterialArray(indices, 'indices'),
         baseColor: copyMaterialArray(baseColor, 'baseColor'), doubleSided, alphaMode, alphaCutoff};
-      for (const key of ['texCoords', 'vertexColors', 'uvTransform', 'emissiveFactor']) {
+      for (const key of ['texCoords', 'vertexColors', 'uvTransform', 'emissiveFactor', 'specularColor']) {
         const value = input[key];
         if (value !== undefined) material[key] = value === null ? null : copyMaterialArray(value, key);
       }
-      for (const key of ['shading', 'metallicFactor', 'roughnessFactor', 'normalScale', 'occlusionStrength', ...COAT_FIELDS]) {
+      for (const key of ['shading', 'flatShading', 'shininess', 'metallicFactor', 'roughnessFactor', 'normalScale', 'occlusionStrength', ...COAT_FIELDS]) {
         const value = input[key]; if (value !== undefined) material[key] = value;
       }
       for (const key of TEXTURE_FIELDS) {
@@ -237,9 +237,9 @@ export async function createGpuAnimationScene(device, pose, drawables, {
       const vertices = geometry?.positions?.length / 3;
       const surface = material.texCoords != null || material.vertexColors != null || TEXTURE_FIELDS.some(key => material[key] != null);
       if (surface && (!Number.isSafeInteger(vertices) || vertices < 1)) fail('ANIMATION_SCENE_GEOMETRY', 'Surface attributes require XYZ geometry');
-      const lit = material.shading === 'lambert' || material.shading === 'metallic-roughness';
+      const lit = ['lambert', 'metallic-roughness', 'phong'].includes(material.shading);
       const surfaceStride = 24 + Object.keys(material.mapCoordinates ?? {}).length * 8;
-      const coated = COAT_FIELDS.some(key => material[key] !== undefined) || TEXTURE_FIELDS.slice(5).some(key => material[key] != null);
+      const coated = COAT_FIELDS.some(key => material[key] !== undefined) || TEXTURE_FIELDS.slice(5, 8).some(key => material[key] != null);
       const reserve = (coated ? 16 : 0) + (material.indices?.length ?? 0) * 4 + (surface ? vertices * surfaceStride : 0) + (lit && !lightingAllocated ? 544 + (renderOptions.shadows ? 96 : 0) + (renderOptions.environment ? 64 : 0) : 0);
       const remaining = maxBytes - renderer.allocatedBytes - deformationTotal() - reserve;
       let gpu;

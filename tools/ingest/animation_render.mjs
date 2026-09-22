@@ -39,7 +39,7 @@
  * draws. OPAQUE ignores input alpha; MASK discards below its threshold and writes
  * opaque alpha. Negative-determinant world transforms reverse front-face winding.
  *
- * shading is 'unlit' (default), 'lambert', or 'metallic-roughness'. Lit meshes
+ * shading is 'unlit' (default), 'lambert', 'phong', or 'metallic-roughness'. Lit meshes
  * require the deformer's normal attribute and invertible world transforms.
  * Metallic-roughness uses GGX/Smith-correlated visibility and Schlick Fresnel,
  * with metallicFactor/roughnessFactor in [0,1] (both default 1) and an explicit
@@ -77,6 +77,15 @@
  * roughness floor, and attenuates the entire base including emission, not alpha.
  * Its default normal is the geometry normal, NOT the base normal map.
  * These material profiles do not establish complete Three.js/PBR equivalence.
+ * Phong uses the pinned r186 normalized Blinn-Phong lobe and exponential Schlick
+ * approximation, not the metallic-roughness BRDF. specularColor (linear RGB;
+ * default sRGB 0x111111 converted to linear) and shininess (default 30) may vary
+ * per draw. specularTexture uses linear R, with independent mapCoordinates.
+ * Phong punctual falloff uses r186's distance floor, squared range window and
+ * smooth spot penumbra. Its optional prepared environment supplies diffuse IBL,
+ * not a Phong reflection/refraction map. flatShading derives current geometric
+ * normals in the fragment stage before discard, including deformed geometry.
+ * Flat normal mapping uses the derivative tangent frame, not authored tangents.
  *
  * Lit frames require lighting: {cameraPosition:[x,y,z], lights:[...]}, at most
  * eight directional/point/spot lights in world space. For orthographic views,
@@ -178,6 +187,11 @@ const MAP_FIELDS = Object.freeze([
   "clearcoatRoughnessTexture",
   "clearcoatNormalTexture",
 ]);
+// The exclusive Phong specular map shares slot 1 with the PBR parameter map.
+// No dummy textures, additional bindings or larger per-draw arena are needed.
+const PHONG_MAP_FIELDS = Object.freeze(MAP_FIELDS.map((field, slot) =>
+  slot === 1 ? "specularTexture" : field));
+const PHONG_SPECULAR = Object.freeze([0.005605391621829107, 0.005605391621829107, 0.005605391621829107]);
 const COAT_FIELDS = Object.freeze([
   "clearcoatFactor",
   "clearcoatRoughnessFactor",
@@ -264,6 +278,8 @@ function surfaceShader(
   instanceStride = 0,
   coated = false,
   geometryChannels = null,
+  phong = false,
+  flat = false,
 ) {
   const textured = mapMask !== 0 || coated,
     normalMapped = (mapMask & 4) !== 0,
@@ -273,17 +289,18 @@ function surfaceShader(
   const colorWidth = attributes ? (geometryChannels?.colorSize ?? 4) : 0;
   const occluded = (mapMask & 16) !== 0,
     ambientOcclusion = occluded && environmentCode !== "";
+  const names = phong ? MAP_NAMES.map((name, slot) => slot === 1 ? "specular" : name) : MAP_NAMES;
   const declarations = mapSlots(mapMask)
     .map(
       (slot) =>
-        `@group(1) @binding(${slot * 2}) var ${MAP_NAMES[slot]}_sampler: sampler;\n@group(1) @binding(${slot * 2 + 1}) var ${MAP_NAMES[slot]}_texture: texture_2d<f32>;`,
+        `@group(1) @binding(${slot * 2}) var ${names[slot]}_sampler: sampler;\n@group(1) @binding(${slot * 2 + 1}) var ${names[slot]}_texture: texture_2d<f32>;`,
     )
     .join("\n");
   const coordinates = (slot) => (coordinateMask & (1 << slot) ? `input.uv_${slot}` : "input.uv");
   const samples = mapSlots(mapMask)
     .map(
       (slot) =>
-        `let ${MAP_NAMES[slot]}_texel = textureSample(${MAP_NAMES[slot]}_texture, ${MAP_NAMES[slot]}_sampler, ${coordinates(slot)});`,
+        `let ${names[slot]}_texel = textureSample(${names[slot]}_texture, ${names[slot]}_sampler, ${coordinates(slot)});`,
     )
     .join("\n  ");
   const lighting = lit
@@ -298,7 +315,7 @@ fn unit_vector(v: vec3<f32>) -> vec3<f32> {
   let scaled = v / scale;
   return scaled * inverseSqrt(dot(scaled, scaled));
 }
-fn illuminate(base: vec3<f32>, position: vec3<f32>, normal: vec3<f32>, metallic: f32, roughness: f32, emission: vec3<f32>${ambientOcclusion ? ", occlusion: f32" : ""}) -> vec3<f32> {
+fn illuminate(base: vec3<f32>, position: vec3<f32>, normal: vec3<f32>, metallic: f32, roughness: f32, emission: vec3<f32>${ambientOcclusion ? ", occlusion: f32" : ""}${phong ? ", specular_strength: f32" : ""}) -> vec3<f32> {
   var view = unit_vector(lighting.camera.xyz - position);
   if (lighting.camera.w > 0.0) { view = lighting.camera.xyz; }
   let nv = max(dot(normal, view), 0.0);
@@ -311,22 +328,31 @@ fn illuminate(base: vec3<f32>, position: vec3<f32>, normal: vec3<f32>, metallic:
       let delta = light.vector.xyz - position;
       let distance = length(delta);
       incoming = unit_vector(delta);
-      attenuation = 1.0 / max(distance * distance, 0.000001);
+      attenuation = 1.0 / max(distance * distance, ${phong ? "0.01" : "0.000001"});
       if (light.direction.w > 0.0) {
         let ratio = distance / light.direction.w;
-        attenuation *= clamp(1.0 - ratio * ratio * ratio * ratio, 0.0, 1.0);
+        ${phong ? "let window = clamp(1.0 - ratio * ratio * ratio * ratio, 0.0, 1.0);\n        attenuation *= window * window;" : "attenuation *= clamp(1.0 - ratio * ratio * ratio * ratio, 0.0, 1.0);"}
       }
       if (light.radiance.w == 2.0) {
         let cosine = dot(-incoming, light.direction.xyz);
         var angular = select(0.0, 1.0, cosine >= light.cone.y);
         if (light.cone.x > light.cone.y) { angular = clamp((cosine - light.cone.y) / (light.cone.x - light.cone.y), 0.0, 1.0); }
-        attenuation *= angular * angular;
+        attenuation *= ${phong ? "angular * angular * (3.0 - 2.0 * angular)" : "angular * angular"};
       }
     }
     let nl = max(dot(normal, incoming), 0.0);
     if (nl <= 0.0 || attenuation <= 0.0) { continue; }
     var brdf = base / 3.141592653589793;
-    if (draw_info.options.z == 2.0) {
+    ${phong ? `// r186 bsdfs.glsl.js + common.glsl.js: normalized Blinn-Phong,
+    // implicit G=1/4 and the upstream exponential Schlick approximation.
+    let half_vector = unit_vector(incoming + view);
+    let nh = clamp(dot(normal, half_vector), 0.0, 1.0);
+    let vh = clamp(dot(view, half_vector), 0.0, 1.0);
+    let specular = vec3<f32>(draw_info.options.w, draw_info.normal_from_local.specular_g, draw_info.normal_from_local.specular_b);
+    let edge = exp2((-5.55473 * vh - 6.98316) * vh);
+    let fresnel = specular * (1.0 - edge) + vec3<f32>(edge);
+    let distribution = (roughness * 0.5 + 1.0) * pow(nh, roughness) / 3.141592653589793;
+    brdf += fresnel * (0.25 * distribution * specular_strength);` : `if (draw_info.options.z == 2.0) {
       if (nv <= 0.0) { continue; }
       let half_vector = unit_vector(incoming + view);
       let nh = clamp(dot(normal, half_vector), 0.0, 1.0);
@@ -342,7 +368,7 @@ fn illuminate(base: vec3<f32>, position: vec3<f32>, normal: vec3<f32>, metallic:
       let edge = 1.0 - vh;
       let fresnel = f0 + (vec3<f32>(1.0) - f0) * edge * edge * edge * edge * edge;
       brdf = (vec3<f32>(1.0) - fresnel) * (1.0 - metallic) * base / 3.141592653589793 + fresnel * distribution * visibility;
-    }
+    }`}
     ${
       shadowed
         ? `var visibility = 1.0;
@@ -356,9 +382,9 @@ fn illuminate(base: vec3<f32>, position: vec3<f32>, normal: vec3<f32>, metallic:
 `
     : "";
   return /* wgsl */ `
-${occluded ? "// Same 48-byte layout as mat3x3; the first column padding holds material strength.\nstruct OcclusionNormal { x: vec3<f32>, strength: f32, y: vec3<f32>, pad0: f32, z: vec3<f32>, pad1: f32 }\n" : ""}struct DrawInfo {
+${phong ? "// Matrix padding at words 51/55/59: AO strength, specular G, specular B.\nstruct PhongNormal { x: vec3<f32>, strength: f32, y: vec3<f32>, specular_g: f32, z: vec3<f32>, specular_b: f32 }\n" : occluded ? "// Same 48-byte layout as mat3x3; the first column padding holds material strength.\nstruct OcclusionNormal { x: vec3<f32>, strength: f32, y: vec3<f32>, pad0: f32, z: vec3<f32>, pad1: f32 }\n" : ""}struct DrawInfo {
   clip_from_local: mat4x4<f32>, color: vec4<f32>, options: vec4<f32>, uv_x: vec4<f32>, uv_y: vec4<f32>,
-  world_from_local: mat4x4<f32>, normal_from_local: ${occluded ? "OcclusionNormal" : "mat3x3<f32>"}, emission_roughness: vec4<f32>
+  world_from_local: mat4x4<f32>, normal_from_local: ${phong ? "PhongNormal" : occluded ? "OcclusionNormal" : "mat3x3<f32>"}, emission_roughness: vec4<f32>
 }
 ${
   instanceStride
@@ -388,7 +414,7 @@ struct VertexOutput {
   out.position = draw_info.clip_from_local * vec4<f32>(position, 1.0);
   ${uvAttribute ? "out.uv = vec2<f32>(dot(draw_info.uv_x.xyz, vec3<f32>(uv, 1.0)), dot(draw_info.uv_y.xyz, vec3<f32>(uv, 1.0)));" : "out.uv = vec2<f32>(0.0);"}
   out.color = ${colorWidth === 3 ? "vec4<f32>(color, 1.0)" : colorWidth === 4 ? "color" : "vec4<f32>(1.0)"};
-  ${lit ? "out.world = (draw_info.world_from_local * vec4<f32>(position, 1.0)).xyz;\n  out.normal = " + (occluded ? "mat3x3<f32>(draw_info.normal_from_local.x, draw_info.normal_from_local.y, draw_info.normal_from_local.z)" : "draw_info.normal_from_local") + " * normal;" : ""}
+  ${lit ? "out.world = (draw_info.world_from_local * vec4<f32>(position, 1.0)).xyz;\n  out.normal = " + (occluded || phong ? "mat3x3<f32>(draw_info.normal_from_local.x, draw_info.normal_from_local.y, draw_info.normal_from_local.z)" : "draw_info.normal_from_local") + " * normal;" : ""}
   ${tangentAttribute ? "out.tangent = vec4<f32>((draw_info.world_from_local * vec4<f32>(tangent.xyz, 0.0)).xyz, tangent.w * draw_info.uv_y.w);" : ""}
   ${mapSlots(coordinateMask)
     .map(
@@ -401,7 +427,7 @@ struct VertexOutput {
 @fragment fn fragment_main(input: VertexOutput${lit ? ", @builtin(front_facing) front: bool" : ""})${depthOnly ? "" : " -> @location(0) vec4<f32>"} {${instanceStride ? "\n  draw_info = instance_draws[input.draw_index].info;" : ""}
   // Sample every map before discard or nonuniform lighting flow: implicit
   // derivatives must be evaluated in uniform control flow.
-  ${samples}
+  ${samples}${flat ? "\n  // WebGPU framebuffer Y is downward. Flat normals already face the rasterized surface.\n  let flat_normal = unit_vector(cross(dpdy(input.world), dpdx(input.world)));" : ""}
   ${
     derivative && normalMapped
       ? `let position_dx = dpdx(input.world);
@@ -421,7 +447,7 @@ struct VertexOutput {
   if (draw_info.options.x >= 0.0 && rgba.a < draw_info.options.x) { discard; }
   ${
     lit
-      ? `var normal = unit_vector(input.normal);${coated ? "\n  var coat_normal = normal;" : ""}
+      ? `var normal = ${flat ? "flat_normal" : "unit_vector(input.normal)"};${coated ? "\n  var coat_normal = normal;" : ""}
   ${
     normalMapped
       ? `${
@@ -454,11 +480,11 @@ struct VertexOutput {
   normal = unit_vector(tangent * mapped.x + bitangent * mapped.y + normal * mapped.z);`
       : ""
   }
-  ${coatNormalMapped ? clearcoatNormalCode(derivative) + "\n  " : ""}normal *= select(-1.0, 1.0, front);${coated ? "\n  coat_normal *= select(-1.0, 1.0, front);" : ""}
-  let metallic = draw_info.options.w ${mapMask & 2 ? "* metallic_roughness_texel.b" : ""};
-  let roughness = draw_info.emission_roughness.w ${mapMask & 2 ? "* metallic_roughness_texel.g" : ""};
+  ${coatNormalMapped ? clearcoatNormalCode(derivative) + "\n  " : ""}${flat ? "" : "normal *= select(-1.0, 1.0, front);"}${coated && !flat ? "\n  coat_normal *= select(-1.0, 1.0, front);" : ""}
+  let metallic = draw_info.options.w ${!phong && mapMask & 2 ? "* metallic_roughness_texel.b" : ""};
+  let roughness = draw_info.emission_roughness.w ${!phong && mapMask & 2 ? "* metallic_roughness_texel.g" : ""};
   let emission = draw_info.emission_roughness.rgb ${mapMask & 8 ? "* emissive_texel.rgb" : ""};
-  ${ambientOcclusion ? "// glTF occlusion uses only linear R and affects indirect light, never emission or punctual light.\n  let occlusion = 1.0 + draw_info.normal_from_local.strength * (occlusion_texel.r - 1.0);\n  " : ""}${coated ? "var" : "let"} rgb = illuminate(rgba.rgb, input.world, normal, metallic, roughness, emission${ambientOcclusion ? ", occlusion" : ""});${
+  ${ambientOcclusion ? "// glTF occlusion uses only linear R and affects indirect light, never emission or punctual light.\n  let occlusion = 1.0 + draw_info.normal_from_local.strength * (occlusion_texel.r - 1.0);\n  " : ""}${coated ? "var" : "let"} rgb = illuminate(rgba.rgb, input.world, normal, metallic, roughness, emission${ambientOcclusion ? ", occlusion" : ""}${phong ? mapMask & 2 ? ", specular_texel.r" : ", 1.0" : ""});${
     coated
       ? `
   let coat_factor = clearcoat_info.x${mapMask & 32 ? " * clearcoat_texel.r" : ""};
@@ -622,6 +648,18 @@ function color(value) {
       fail("ANIMATION_RENDER_VALUE", "Color must be nonnegative finite f32");
   if (value[3] > 1) fail("ANIMATION_RENDER_VALUE", "Alpha must be in [0,1]");
   return value;
+}
+function specularColor(value) {
+  array(value, 3, "Linear specular color");
+  if (value.some((v) => v < 0 || !Number.isFinite(Math.fround(v))))
+    fail("ANIMATION_RENDER_VALUE", "Specular color must be nonnegative finite f32");
+  return value;
+}
+function phongShininess(value) {
+  if (finite(value, "Shininess") < 0 || !Number.isFinite(Math.fround(value)))
+    fail("ANIMATION_RENDER_VALUE", "Shininess must be nonnegative finite f32");
+  // r186 WebGLMaterials clamps here to prevent the undefined pow(0, 0).
+  return Math.max(value, 1e-4);
 }
 function keys(object, allowed, label) {
   if (!object || typeof object !== "object" || Array.isArray(object))
@@ -945,6 +983,7 @@ export async function createGpuAnimationRenderer(
     const [variant, geometryKey] = variantKey.split("~");
     const geometry = geometryKey === undefined ? null : geometryLayouts.get(geometryKey);
     const coated = variant.includes("coat-");
+    const phong = variant.includes("phong-"), flat = variant.includes("flat-");
     const lit = variant.startsWith("lit-"),
       attributes = !variant.endsWith("plain"),
       mapMask = mapMaskFor(variant),
@@ -1014,6 +1053,8 @@ export async function createGpuAnimationRenderer(
               instancing ? stride : 0,
               coated,
               geometry?.channels,
+              phong,
+              flat,
             )
           : ANIMATION_RENDER_WGSL,
     });
@@ -1291,6 +1332,10 @@ export async function createGpuAnimationRenderer(
         "occlusionStrength",
         "uvTransform",
         "shading",
+        "flatShading",
+        "specularColor",
+        "shininess",
+        "specularTexture",
         "metallicFactor",
         "roughnessFactor",
         "emissiveFactor",
@@ -1317,19 +1362,25 @@ export async function createGpuAnimationRenderer(
     } = options;
     const rgba = Float64Array.from(color(baseColor)),
       shading = options.shading ?? "unlit";
-    const mode = ["unlit", "lambert", "metallic-roughness"].indexOf(shading),
+    const mode = ["unlit", "lambert", "metallic-roughness", "phong"].indexOf(shading),
       lit = mode > 0;
+    const phong = mode === 3, flat = options.flatShading ?? false;
+    if (typeof flat !== "boolean" || (flat && !lit) || options.flatShading === null)
+      fail("ANIMATION_RENDER_OPTIONS", "flatShading requires a lit material and a boolean");
     if (
       mode < 0 ||
       (!lit && options.emissiveFactor !== undefined) ||
       (mode !== 2 &&
-        (options.metallicFactor !== undefined || options.roughnessFactor !== undefined))
+        (options.metallicFactor !== undefined || options.roughnessFactor !== undefined)) ||
+      (!phong && (options.specularColor !== undefined || options.shininess !== undefined || options.specularTexture != null)) ||
+      (phong && options.metallicRoughnessTexture != null)
     )
       fail("ANIMATION_RENDER_OPTIONS", "Material parameters do not apply to shading model");
     if (format === null && (lit || alphaMode === "BLEND"))
       fail("ANIMATION_RENDER_OPTIONS", "Depth-only materials must be unlit OPAQUE or MASK");
     // Snapshot every borrowed resource descriptor before the first await.
-    const textures = MAP_FIELDS.map((field) => {
+    const mapFields = phong ? PHONG_MAP_FIELDS : MAP_FIELDS;
+    const textures = mapFields.map((field) => {
       const descriptor = options[field];
       if (descriptor == null) return null;
       keys(descriptor, ["view", "sampler"], field);
@@ -1368,7 +1419,7 @@ export async function createGpuAnimationRenderer(
       layoutKey = mapMask | (coated ? COAT_LAYOUT : 0);
     if (
       (!lit && mapMask & 30) ||
-      (mode !== 2 && mapMask & 2) ||
+      (mode !== 2 && !phong && mapMask & 2) ||
       (!(mapMask & 4) && options.normalScale !== undefined) ||
       (!(mapMask & 16) && options.occlusionStrength !== undefined)
     ) {
@@ -1382,9 +1433,9 @@ export async function createGpuAnimationRenderer(
       fail("ANIMATION_RENDER_VALUE", "Normal scale exceeds f32");
     const derivative =
       (mapMask & 132) !== 0 &&
-      !(mutable ? mutable.channels.tangent : gpu.vertexLayout.attributes.some(
+      (flat || !(mutable ? mutable.channels.tangent : gpu.vertexLayout.attributes.some(
         (a) => a.shaderLocation === 2 && a.offset === 24 && a.format === "float32x4",
-      ));
+      )));
     if (mapMask) {
       limit("maxBindGroups", lit ? 3 : 2);
       limit("maxSamplersPerShaderStage", mapSlots(mapMask).length);
@@ -1392,6 +1443,8 @@ export async function createGpuAnimationRenderer(
     }
     const metallic = mode === 2 ? finite(options.metallicFactor ?? 1, "Metallic factor") : 0;
     const roughness = mode === 2 ? finite(options.roughnessFactor ?? 1, "Roughness factor") : 1;
+    const specular = phong ? Float64Array.from(specularColor(options.specularColor ?? PHONG_SPECULAR)) : null;
+    const shininess = phong ? phongShininess(options.shininess ?? 30) : 0;
     const emission = Float64Array.from(
       array(options.emissiveFactor ?? [0, 0, 0], 3, "Emissive factor"),
     );
@@ -1464,9 +1517,9 @@ export async function createGpuAnimationRenderer(
         ? "color"
         : "plain";
     const coordinateInput = options.mapCoordinates ?? {};
-    keys(coordinateInput, MAP_FIELDS, "map coordinates");
+    keys(coordinateInput, mapFields, "map coordinates");
     const coordinates = [];
-    for (const [slot, field] of MAP_FIELDS.entries())
+    for (const [slot, field] of mapFields.entries())
       if (Object.hasOwn(coordinateInput, field)) {
         if (!(mapMask & (1 << slot)))
           fail("ANIMATION_RENDER_OPTIONS", `Coordinates require ${field}`);
@@ -1489,6 +1542,8 @@ export async function createGpuAnimationRenderer(
     const surfaceWords = 6 + coordinates.length * 2;
     const variant =
       (lit ? "lit-" : "") +
+      (phong ? "phong-" : "") +
+      (flat ? "flat-" : "") +
       (coated ? "coat-" : "") +
       (derivative ? "derivative-" : "") +
       (coordinateMask ? `uv-${coordinateMask}-` : "") +
@@ -1700,6 +1755,8 @@ export async function createGpuAnimationRenderer(
         mode,
         metallic,
         roughness,
+        specular,
+        shininess,
         emission,
         mapMask,
         normalScale,
@@ -1870,6 +1927,8 @@ export async function createGpuAnimationRenderer(
             "metallicFactor",
             "roughnessFactor",
             "emissiveFactor",
+            "specularColor",
+            "shininess",
           ],
           "draw",
         );
@@ -1923,7 +1982,8 @@ export async function createGpuAnimationRenderer(
         if (
           (!record.lit && input.emissiveFactor !== undefined) ||
           (record.mode !== 2 &&
-            (input.metallicFactor !== undefined || input.roughnessFactor !== undefined))
+            (input.metallicFactor !== undefined || input.roughnessFactor !== undefined)) ||
+          (record.mode !== 3 && (input.specularColor !== undefined || input.shininess !== undefined))
         ) {
           fail("ANIMATION_RENDER_OPTIONS", "Draw parameters do not apply to shading model");
         }
@@ -1962,6 +2022,16 @@ export async function createGpuAnimationRenderer(
           staged[offset + 23] = metallic;
           staged.set(emission, offset + 60);
           staged[offset + 63] = roughness;
+          if (record.mode === 3) {
+            const specular = specularColor(input.specularColor ?? record.specular);
+            // Word 51 remains AO strength. Specular R uses the non-PBR metallic
+            // word; G/B use named matrix padding. Every logical use has its own
+            // 256-byte slice, including instanced and bundled submissions.
+            staged[offset + 23] = specular[0];
+            staged[offset + 55] = specular[1];
+            staged[offset + 59] = specular[2];
+            staged[offset + 63] = phongShininess(input.shininess ?? record.shininess);
+          }
           usesLighting = true;
         }
         const extent = geometry ? geometry.indexBuffer ? geometry.indexCount : geometry.vertexCount : record.extent;
