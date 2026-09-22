@@ -2,8 +2,9 @@
  * Browser/Node host for compileNumericKernel's explicit, closed numeric-array ABI.
  * No parser, DOM, GPU, eval, scheduler, or eager WebAssembly instantiation.
  *
- * Validate all arguments before effects; pack independent array prefixes into
- * private memory, execute one Wasm call, then publish only declared outputs.
+ * Validate all arguments before effects; pack accessed storage into private
+ * memory, execute one Wasm call, then publish only declared outputs. Aliases
+ * require the explicit ordered-storage option; independent packing is default.
  * Guard failure invokes the caller's original function exactly once (or throws).
  * This is a copying baseline, not a zero-copy or measured-speedup claim.
  */
@@ -244,6 +245,69 @@ function arrayInfo(value, param, checkLength) {
 }
 
 /**
+ * Plan already native-slot-guarded intervals, not whole backing buffers. At most
+ * 64 views, no per-element scan. Keep this helper inside the self-contained
+ * runtime: generated applications also load this source as an emitted asset.
+ * The producer must establish ordered loads/stores without no-alias rewrites.
+ */
+/** Set each record's ptr and return disjoint byte-copy spans. */
+function planNumericStorage(records, refuse) {
+  const buffers = new Map();
+  for (const record of records) {
+    record.ptr = 0;
+    if (!record.byteLength || (!record.param.read && !record.param.write)) continue;
+    if (!buffers.has(record.buffer)) buffers.set(record.buffer, []);
+    buffers.get(record.buffer).push(record);
+  }
+  const inputs = [], outputs = [];
+  let requiredBytes = 0;
+  for (const [buffer, views] of buffers) {
+    views.sort((a, b) => a.offset - b.offset || a.index - b.index);
+    const regions = [];
+    for (const view of views) {
+      let region = regions.at(-1);
+      // Adjacent views need not share an allocation; separate components also
+      // avoid copying enormous unused gaps in application-owned buffers.
+      if (!region || view.offset >= region.end) {
+        region = { start: view.offset, end: view.offset + view.byteLength, views: [] };
+        regions.push(region);
+      } else region.end = maximum(region.end, view.offset + view.byteLength);
+      region.views.push(view);
+    }
+    for (const region of regions) {
+      const writing = region.views.some(view => view.param.write);
+      // Cross-type writes expose floating-point bit representations to another
+      // numeric type. That requires a stronger proof than Number/store ordering
+      // (notably for NaN payloads); keep the original function for those cases.
+      if (writing && region.views.some(view => view.param.type !== region.views[0].param.type)) {
+        refuse('KERNEL_ARRAY_ALIAS', 'Overlapping mixed-type writes require original JavaScript');
+      }
+      // Retain offset modulo this component's largest element alignment. Mixed
+      // read-only views may start at a 2-byte/4-byte offset before a Float64 view.
+      const alignment = region.views.reduce((unit, view) => maximum(unit, view.elementBytes), 1);
+      const ptr = align(requiredBytes, alignment) + region.start % alignment;
+      requiredBytes = ptr + region.end - region.start;
+      for (const view of region.views) view.ptr = ptr + view.offset - region.start;
+      // Include write-only bytes: another alias may read them, and copying raw
+      // storage retains untouched NaN payloads, signed zeros and record channels.
+      inputs.push({ buffer, offset: region.start, ptr, byteLength: region.end - region.start });
+      let output = null;
+      for (const view of region.views) {
+        if (!view.param.write) continue;
+        const end = view.offset + view.byteLength;
+        if (output && view.offset <= output.offset + output.byteLength) {
+          output.byteLength = maximum(output.offset + output.byteLength, end) - output.offset;
+        } else {
+          output = { buffer, offset: view.offset, ptr: view.ptr, byteLength: view.byteLength };
+          outputs.push(output);
+        }
+      }
+    }
+  }
+  return { requiredBytes, inputs, outputs };
+}
+
+/**
  * Instantiate a trusted compiler-produced artifact once and reuse it across
  * updates. A custom section is ABI metadata, NOT authentication of arbitrary
  * Wasm supplied by another party. The Wasm module receives no host imports.
@@ -255,8 +319,15 @@ function arrayInfo(value, param, checkLength) {
  * free closure `() => Math` in the original function/helper lexical environment.
  * It is not a user callback. Omission conservatively refuses native execution.
  * Global/property descriptors are checked without calling application getters.
+ * preserveAliasing opts into shared scratch intervals for same-type aliases.
+ * Enable it only for compiler products that preserve ordered memory operations
+ * without assuming disjoint parameters. Mixed-type writable overlaps still
+ * retain JavaScript. The default keeps the existing independent-prefix ABI.
  */
-export function instantiateNumericKernel(bytes, { fallback = null, maxMemoryBytes = null, resolveMath = null } = {}) {
+export function instantiateNumericKernel(bytes, {
+  fallback = null, maxMemoryBytes = null, resolveMath = null, preserveAliasing = false,
+} = {}) {
+  if (typeof preserveAliasing !== 'boolean') throw new TypeError('preserveAliasing must be a boolean');
   if (fallback !== null && typeof fallback !== 'function') throw new TypeError('fallback must be a function or null');
   if (resolveMath !== null && typeof resolveMath !== 'function') throw new TypeError('resolveMath must be a function or null');
   if (maxMemoryBytes !== null && (!Number.isSafeInteger(maxMemoryBytes) ||
@@ -339,7 +410,7 @@ export function instantiateNumericKernel(bytes, { fallback = null, maxMemoryByte
       record.ptr = align(requiredBytes, record.elementBytes);
       requiredBytes = record.ptr + record.byteLength;
     }
-    if (!Number.isSafeInteger(requiredBytes) || requiredBytes > limit) {
+    if (!preserveAliasing && (!Number.isSafeInteger(requiredBytes) || requiredBytes > limit)) {
       refuse('KERNEL_MEMORY_LIMIT', `Packed update requires ${requiredBytes} bytes; limit is ${limit}`);
     }
     for (const record of records) {
@@ -347,7 +418,7 @@ export function instantiateNumericKernel(bytes, { fallback = null, maxMemoryByte
     }
     // At most 64 parameter views: no per-element guard scan or scene traversal.
     // Only accessed prefixes matter; overlapping unused tails are harmless.
-    for (let i = 0; i < records.length; i++) {
+    for (let i = 0; !preserveAliasing && i < records.length; i++) {
       for (let j = 0; j < i; j++) {
         const a = records[i], b = records[j];
         // Ordered reductions can read the same input twice (e.g. dot(a, a)).
@@ -359,6 +430,11 @@ export function instantiateNumericKernel(bytes, { fallback = null, maxMemoryByte
         }
       }
     }
+    const storage = preserveAliasing ? planNumericStorage(records, refuse) : null;
+    if (storage) requiredBytes = storage.requiredBytes;
+    if (!Number.isSafeInteger(requiredBytes) || requiredBytes > limit) {
+      refuse('KERNEL_MEMORY_LIMIT', `Packed update requires ${requiredBytes} bytes; limit is ${limit}`);
+    }
     const pages = maximum(1, align(requiredBytes, PAGE_BYTES) / PAGE_BYTES);
     if (pages * PAGE_BYTES > limit) {
       refuse('KERNEL_MEMORY_LIMIT', 'Page-rounded Wasm allocation exceeds the configured limit');
@@ -367,12 +443,27 @@ export function instantiateNumericKernel(bytes, { fallback = null, maxMemoryByte
     if (pages > currentPages) memory.grow(pages - currentPages);
     // Acquire every view AFTER possible memory.grow; never retain detached views.
     const scratchBuffer = memory.buffer;
-    records.forEach(record => {
-      values[record.index] = record.ptr;
-      record.source = new record.ArrayType(record.buffer, record.offset, record.count);
-      record.scratch = new record.ArrayType(scratchBuffer, record.ptr, record.count);
-    });
-    return { records, values, counts };
+    for (const record of records) values[record.index] = record.ptr;
+    const inputs = [], outputs = [];
+    let copiedBytes = 0;
+    if (storage) {
+      for (const [spans, destination, reverse] of [
+        [storage.inputs, inputs, false], [storage.outputs, outputs, true],
+      ]) for (const span of spans) {
+        const source = new U8Array(span.buffer, span.offset, span.byteLength);
+        const scratch = new U8Array(scratchBuffer, span.ptr, span.byteLength);
+        destination.push({ target: reverse ? source : scratch, args: [reverse ? scratch : source] });
+        copiedBytes += span.byteLength;
+      }
+    } else {
+      for (const record of records) {
+        const source = new record.ArrayType(record.buffer, record.offset, record.count);
+        const scratch = new record.ArrayType(scratchBuffer, record.ptr, record.count);
+        if (record.param.read) { inputs.push({ target: scratch, args: [source] }); copiedBytes += record.byteLength; }
+        if (record.param.write) { outputs.push({ target: source, args: [scratch] }); copiedBytes += record.byteLength; }
+      }
+    }
+    return { inputs, outputs, copiedBytes, values, counts };
   }
 
   function run(...args) {
@@ -382,9 +473,7 @@ export function instantiateNumericKernel(bytes, { fallback = null, maxMemoryByte
     try {
       checkMath();
       prepared = prepare(args);
-      for (const record of prepared.records) {
-        if (record.param.read) apply(typedSet, record.scratch, [record.source]);
-      }
+      for (const copy of prepared.inputs) apply(typedSet, copy.target, copy.args);
       // Revalidate after preparation (including a possible host memory.grow).
       // The import-free Wasm call cannot rebind Math before publication.
       checkMath();
@@ -402,14 +491,10 @@ export function instantiateNumericKernel(bytes, { fallback = null, maxMemoryByte
     }
     // No user code, memory growth, coercion, or allocation between validated
     // execution and publication. Never rerun fallback after publishing outputs.
-    for (const record of prepared.records) {
-      if (record.param.write) apply(typedSet, record.source, [record.scratch]);
-    }
+    for (const copy of prepared.outputs) apply(typedSet, copy.target, copy.args);
     stats.wasmCalls++;
     stats.lastGuardFailure = null;
-    for (const record of prepared.records) {
-      stats.copiedBytes += record.byteLength * (Number(record.param.read) + Number(record.param.write));
-    }
+    stats.copiedBytes += prepared.copiedBytes;
     if (manifest.version >= 5 && manifest.resultType === 'f64') return result;
   }
 
