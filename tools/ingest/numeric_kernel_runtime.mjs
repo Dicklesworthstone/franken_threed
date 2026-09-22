@@ -70,16 +70,19 @@ function refuse(code, message) { throw new NumericKernelGuardError(code, message
 // v7 has one length argument for each array, in declaration order. Full-view
 // packing plus checked element addresses supports indirect geometry without
 // pretending that the iteration domain proves the destination's bounds.
+// v8 uses the same checked views but no array-derived trip counts: all source
+// loops are budgeted inside the executable, including scalar-only invocations.
 function indexedManifest(manifest) {
+  const generalControl = manifest.version === 8;
   const arrays = [], names = new Set();
-  if (manifest.kind !== 'closed-indexed-numeric' ||
+  if (manifest.kind !== (generalControl ? 'closed-numeric-control' : 'closed-indexed-numeric') ||
       !['f64-operator-order', MATH_SEMANTICS].includes(manifest.numericSemantics) ||
       manifest.indexSemantics !== 'checked-integer-full-view-v1' ||
       manifest.automaticRouteAdmission !== false || manifest.iterationSemantics !== 'ordered' ||
       !['f64', 'void'].includes(manifest.resultType) ||
       !Number.isInteger(manifest.maxMemoryPages) || manifest.maxMemoryPages < 1 ||
       manifest.maxMemoryPages > 16384 ||
-      !Array.isArray(manifest.parameters) || !manifest.parameters.length || manifest.parameters.length > 64 ||
+      !Array.isArray(manifest.parameters) || (!generalControl && !manifest.parameters.length) || manifest.parameters.length > 64 ||
       manifest.boundParameter !== undefined || manifest.boundParameters !== undefined || manifest.loopStride !== undefined) {
     refuse('KERNEL_ABI_MISMATCH', 'Invalid checked-index numeric contract');
   }
@@ -98,17 +101,25 @@ function indexedManifest(manifest) {
     Object.freeze(param);
   });
   const lengths = manifest.lengthParameters;
-  if (!arrays.length || !Array.isArray(lengths) || lengths.length !== arrays.length ||
+  if ((!generalControl && !arrays.length) || !Array.isArray(lengths) || lengths.length !== arrays.length ||
       arrays.some((index, i) => lengths[i] !== index) ||
-      !Array.isArray(manifest.loops) || !manifest.loops.length || manifest.loops.length > 16 ||
-      manifest.loops.some(pass => !pass || !arrays.includes(pass.boundParameter) ||
-        !Number.isInteger(pass.loopStride) || pass.loopStride < 1 || pass.loopStride > 16) ||
+      (generalControl ?
+        manifest.controlSemantics !== 'budgeted-source-order-v1' || manifest.loops !== undefined ||
+        !Number.isInteger(manifest.maxIterations) || manifest.maxIterations < 1 || manifest.maxIterations > 1000000000 ||
+        !Number.isInteger(manifest.loopCount) || manifest.loopCount < 1 || manifest.loopCount > 64 ||
+        !Number.isInteger(manifest.maxLoopDepth) || manifest.maxLoopDepth < 1 ||
+        manifest.maxLoopDepth > 8 || manifest.maxLoopDepth > manifest.loopCount
+      : !Array.isArray(manifest.loops) || !manifest.loops.length || manifest.loops.length > 16 ||
+        manifest.loops.some(pass => !pass || !arrays.includes(pass.boundParameter) ||
+          !Number.isInteger(pass.loopStride) || pass.loopStride < 1 || pass.loopStride > 16)) ||
       (!writes && manifest.resultType !== 'f64')) {
     refuse('KERNEL_ABI_MISMATCH', 'Invalid checked-index lengths, loops or output');
   }
   Object.freeze(lengths);
-  manifest.loops.forEach(Object.freeze);
-  Object.freeze(manifest.loops);
+  if (!generalControl) {
+    manifest.loops.forEach(Object.freeze);
+    Object.freeze(manifest.loops);
+  }
   Object.freeze(manifest.parameters);
   if (manifest.sourceSpan) Object.freeze(manifest.sourceSpan);
   return Object.freeze(manifest);
@@ -130,7 +141,7 @@ function readManifest(module, wasm) {
     refuse('KERNEL_ABI_MISMATCH', 'Invalid guarded Math requirements');
   }
   if (guardedMath) Object.freeze(manifest.mathIntrinsics);
-  if (manifest?.version === 7) return indexedManifest(manifest);
+  if (manifest?.version === 7 || manifest?.version === 8) return indexedManifest(manifest);
   const pipeline = manifest?.version === 6 && manifest.kind === 'closed-numeric-pipeline';
   const float32Abi = pipeline || ([2, 3, 4, 5].includes(manifest?.version) && manifest.kind === 'closed-numeric-loop');
   if (!manifest || (!float32Abi && (manifest.version !== 1 || manifest.kind !== 'closed-f64-loop')) ||
@@ -339,11 +350,12 @@ export function instantiateNumericKernel(bytes, {
   const module = new wasm.Module(bytes);
   const manifest = readManifest(module, wasm);
   const pipeline = manifest.version === 6;
-  const checkedIndexing = manifest.version === 7;
+  const generalControl = manifest.version === 8;
+  const checkedIndexing = manifest.version === 7 || generalControl;
   const boundParameters = checkedIndexing ? manifest.lengthParameters
     : pipeline ? manifest.boundParameters : [manifest.boundParameter];
   const boundSet = new Set(boundParameters);
-  const passes = pipeline || checkedIndexing ? manifest.loops : [{ boundParameter: manifest.boundParameter, loopStride: manifest.loopStride ?? 1 }];
+  const passes = generalControl ? [] : pipeline || checkedIndexing ? manifest.loops : [{ boundParameter: manifest.boundParameter, loopStride: manifest.loopStride ?? 1 }];
   const exports = wasm.Module.exports(module);
   if (wasm.Module.imports(module).length !== 0 || exports.length !== 2 ||
       !exports.some(item => item.name === 'run' && item.kind === 'function') ||

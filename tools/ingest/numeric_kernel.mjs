@@ -93,13 +93,23 @@ function member(node, object, property, computed) {
  * This mode also supports unlabeled break/continue and early returns. A
  * numeric-returning kernel needs a final numeric return; a void kernel may
  * return only without a value. Skipped stores retain their original contents.
+ * generalControl opts into ABI v8 and implies both checkedIndexing and
+ * structuredLoops. It admits for/while/do-while anywhere in closed numeric
+ * control flow, including scalar-only functions, dynamic ranges/steps and
+ * loop-variable assignments. ALL loop bodies share maxIterations credits.
+ * Tests, updates, lexical scopes and abrupt completion keep source ordering.
+ * No synthetic array bound, index truncation, source unrolling or partial result
+ * is substituted for the original program. An exhausted call retains the whole
+ * original function (which may itself be nonterminating); this is not a sandbox.
  */
 export function compileNumericKernel(source, {
   parameterTypes,
   helperSources = new Map(),
   allowMath = false,
-  checkedIndexing = false,
-  structuredLoops = false,
+  generalControl = false,
+  checkedIndexing = generalControl,
+  structuredLoops = generalControl,
+  maxIterations = 1000000,
   maxNestedIterations = 1000000,
   sourceName = '<numeric-kernel>',
   maxMemoryPages = DEFAULT_MAX_PAGES,
@@ -117,6 +127,12 @@ export function compileNumericKernel(source, {
   }
   if (!Number.isInteger(maxNestedIterations) || maxNestedIterations < 1 || maxNestedIterations > 1000000000) {
     fail('maxNestedIterations must be between 1 and 1000000000', null, 'INVALID_KERNEL_ABI');
+  }
+  if (typeof generalControl !== 'boolean' || (generalControl && (!checkedIndexing || !structuredLoops))) {
+    fail('generalControl must be a boolean and requires checkedIndexing and structuredLoops', null, 'INVALID_KERNEL_ABI');
+  }
+  if (!Number.isInteger(maxIterations) || maxIterations < 1 || maxIterations > 1000000000) {
+    fail('maxIterations must be between 1 and 1000000000', null, 'INVALID_KERNEL_ABI');
   }
   const arrayTypes = checkedIndexing ? ['f32[]', 'f64[]', 'u16[]', 'u32[]'] : ['f32[]', 'f64[]'];
   let ast;
@@ -143,14 +159,15 @@ export function compileNumericKernel(source, {
     }
     params.set(param.name, { name: param.name, type: parameterTypes[index], index });
   });
-  const resultNode = fn.body.body.at(-1)?.type === 'ReturnStatement' ? fn.body.body.at(-1) : null;
-  const loops = fn.body.body.filter(node => node.type === 'ForStatement');
+  const tailReturn = fn.body.body.at(-1)?.type === 'ReturnStatement' ? fn.body.body.at(-1) : null;
+  const resultNode = generalControl && !tailReturn?.argument ? null : tailReturn;
+  const loops = generalControl ? [] : fn.body.body.filter(node => node.type === 'ForStatement');
   if (loops.length > 16) fail('Numeric pipeline exceeds the 16-pass limit', fn.body);
   const pipeline = loops.length > 1;
   const loopPosition = fn.body.body.length - (resultNode ? 2 : 1);
-  const prelude = fn.body.body.slice(0, loopPosition);
-  const loop = pipeline ? loops[0] : fn.body.body[loopPosition];
-  if (!pipeline && (loop?.type !== 'ForStatement' || prelude.some(node => node.type !== 'VariableDeclaration'))) {
+  const prelude = generalControl ? [] : fn.body.body.slice(0, loopPosition);
+  const loop = generalControl ? { body: fn.body } : pipeline ? loops[0] : fn.body.body[loopPosition];
+  if (!generalControl && !pipeline && (loop?.type !== 'ForStatement' || prelude.some(node => node.type !== 'VariableDeclaration'))) {
     fail('Function body must contain scalar declarations followed by one counted for loop', fn.body);
   }
   if (resultNode && !resultNode.argument) fail('Final return must be a numeric expression', resultNode);
@@ -200,7 +217,7 @@ export function compileNumericKernel(source, {
   let nextIndex = params.size + bounds.size;
   for (const pass of passes.values()) pass.indexLocal = nextIndex++;
   const temporaryBase = nextIndex;
-  let { indexName, boundParam, loopStride, countLocal, indexLocal } = passes.get(loop);
+  let { indexName, boundParam, loopStride, countLocal, indexLocal } = passes.get(loop) ?? { indexName: null };
   if (pipeline) indexName = null;
 
   const intrinsics = createMathIntrinsicCompiler(allowMath, fail);
@@ -211,6 +228,8 @@ export function compileNumericKernel(source, {
   let nestedCount = 0, nestedDepth = 0, maxNestedDepth = 0, nestedFuel = null;
   const nestedIndices = new Set();
   const loopControls = [];
+  const controlLoops = [];
+  let generalDepth = 0, maxGeneralDepth = 0, generalFuel = null;
   let controlDepth = 0;
   const mutableLocals = new Set();
   const scalarWrites = new Set();
@@ -384,6 +403,57 @@ export function compileNumericKernel(source, {
     fail(`Unresolved or non-scalar assignment ${node.name}`, node);
   }
 
+  // Compile effects with discarded values in for initializers/updates and
+  // comma expressions. Never reorder the arms or evaluate an update on break.
+  function compileEffects(node, depth) {
+    if (!node) return [];
+    if (depth > 128) fail('Effect nesting exceeds the admitted bound', node);
+    if (node.type === 'SequenceExpression') {
+      return node.expressions.flatMap(item => compileEffects(item, depth + 1));
+    }
+    return compileBlock([{ type: 'ExpressionStatement', expression: node }], true, depth + 1);
+  }
+
+  function compileGeneralLoop(node, depth) {
+    if (controlLoops.length >= 64 || generalDepth >= 8) {
+      fail('General control exceeds the 64-loop/8-level limit', node);
+    }
+    const parentScope = temporaries;
+    temporaries = new Map(parentScope);
+    generalDepth++;
+    maxGeneralDepth = Math.max(maxGeneralDepth, generalDepth);
+    const postTest = node.type === 'DoWhileStatement';
+    controlLoops.push(Object.freeze({
+      kind: postTest ? 'do-while' : node.type === 'WhileStatement' ? 'while' : 'for',
+      depth: generalDepth,
+      sourceSpan: Object.freeze({ start: node.start, end: node.end,
+        line: node.loc?.start.line, column: node.loc?.start.column }),
+    }));
+    try {
+      // The entire for initializer has a lexical TDZ; these bindings remain
+      // visible in the test, body and update, but never leak after the loop.
+      // Per-iteration environments need no heap identity: captures are refused.
+      const initial = node.init?.type === 'VariableDeclaration'
+        ? compileBlock([node.init], false, depth + 1, true)
+        : compileEffects(node.init, depth + 1);
+      const predicate = node.test ? condition(node.test) : [0x41, 1];
+      if (generalFuel === null) generalFuel = temporaryBase + temporaryCount++;
+      const body = compileLoopBody(node.body.type === 'BlockStatement' ? node.body.body : [node.body], depth + 1);
+      const update = compileEffects(node.update, depth + 1);
+      const test = [...predicate, 0x45, 0x0d, 1];
+      // Every loop, including outer loops and skipped-body continues, shares
+      // one exact f64 body-entry counter. A false pre-test spends no credit.
+      // Do/while enters once before testing; continue reaches its post-test.
+      // Budget exhaustion aborts the transaction, never truncates the program.
+      return [...initial, 0x02, 0x40, 0x03, 0x40,
+        ...(postTest ? [] : test),
+        ...get(generalFuel), ...number(maxIterations), 0x66, 0x04, 0x40, 0x00, 0x0b,
+        ...get(generalFuel), ...number(1), 0xa0, ...set(generalFuel),
+        ...body, ...update, ...(postTest ? test : []),
+        0x0c, 0, 0x0b, 0x0b];
+    } finally { generalDepth--; temporaries = parentScope; }
+  }
+
   function compileNestedLoop(node, depth) {
     if (!structuredLoops || !inLoop) fail('Nested loops require structuredLoops inside an array-bounded pass', node);
     if (++nestedCount > 64 || nestedDepth >= 8) fail('Nested loops exceed the 64-loop/8-level limit', node);
@@ -490,6 +560,11 @@ export function compileNumericKernel(source, {
           }
           continue;
         }
+        if (generalControl && statement.type === 'EmptyStatement') continue;
+        if (generalControl && ['ForStatement', 'WhileStatement', 'DoWhileStatement'].includes(statement.type)) {
+          bytes.push(...compileGeneralLoop(statement, depth));
+          continue;
+        }
         if (pipeline && statement.type === 'ForStatement' && depth === 0) {
           ({ indexName, boundParam, loopStride, countLocal, indexLocal } = passes.get(statement));
           if (temporaries.has(indexName)) fail('Pipeline indices must not shadow function-scope locals', statement.init);
@@ -531,6 +606,10 @@ export function compileNumericKernel(source, {
           continue;
         }
         const assignment = statement.type === 'ExpressionStatement' ? statement.expression : null;
+        if (generalControl && assignment?.type === 'SequenceExpression') {
+          bytes.push(...compileEffects(assignment, depth + 1));
+          continue;
+        }
         if (assignment?.type === 'UpdateExpression' && ['++', '--'].includes(assignment.operator)) {
           const local = mutableScalar(assignment.argument);
           bytes.push(...get(local), ...number(1), OPS[assignment.operator[0]], ...set(local));
@@ -583,7 +662,7 @@ export function compileNumericKernel(source, {
     ];
   }
   let execution;
-  if (pipeline) {
+  if (pipeline || generalControl) {
     // Scan the entire function scope once, including declarations between passes:
     // a later lexical declaration shadows a helper even in earlier loop bodies.
     execution = compileBlock(resultNode ? fn.body.body.slice(0, -1) : fn.body.body, false, 0, true);
@@ -595,6 +674,7 @@ export function compileNumericKernel(source, {
     inLoop = false;
     execution = [...setup, ...emitLoop(instructions)];
   }
+  if (generalControl && !controlLoops.length) fail('General control requires at least one loop', fn.body);
   const result = resultNode ? expression(resultNode.argument) : [];
   if (writes.size === 0 && !resultNode) fail('Kernel must produce an array output or numeric return', loop.body);
   for (const name of minimumLengths.keys()) {
@@ -610,8 +690,8 @@ export function compileNumericKernel(source, {
 
   const mathIntrinsics = intrinsics.requirements();
   const manifest = {
-    version: checkedIndexing ? 7 : pipeline ? 6 : orderedAbi ? 5 : extentAbi ? 4 : loopStride > 1 ? 3 : parameterTypes.includes('f32[]') ? 2 : 1,
-    kind: checkedIndexing ? 'closed-indexed-numeric' : pipeline ? 'closed-numeric-pipeline' : extentAbi || loopStride > 1 || parameterTypes.includes('f32[]') ? 'closed-numeric-loop' : 'closed-f64-loop',
+    version: generalControl ? 8 : checkedIndexing ? 7 : pipeline ? 6 : orderedAbi ? 5 : extentAbi ? 4 : loopStride > 1 ? 3 : parameterTypes.includes('f32[]') ? 2 : 1,
+    kind: generalControl ? 'closed-numeric-control' : checkedIndexing ? 'closed-indexed-numeric' : pipeline ? 'closed-numeric-pipeline' : extentAbi || loopStride > 1 || parameterTypes.includes('f32[]') ? 'closed-numeric-loop' : 'closed-f64-loop',
     ...(!checkedIndexing && !pipeline && (extentAbi || loopStride > 1) ? { loopStride } : {}),
     ...(orderedAbi ? { resultType: resultNode ? 'f64' : 'void', iterationSemantics: 'ordered' } : {}),
     functionName: fn.id.name,
@@ -625,7 +705,14 @@ export function compileNumericKernel(source, {
         ...(pipeline ? { loopBounds: [...(indexedBounds.get(param.name) ?? [])] } : {}),
       } } : {}),
     })),
-    ...(checkedIndexing ? {
+    ...(generalControl ? {
+      controlSemantics: 'budgeted-source-order-v1',
+      maxIterations,
+      loopCount: controlLoops.length,
+      maxLoopDepth: maxGeneralDepth,
+      indexSemantics: 'checked-integer-full-view-v1',
+      lengthParameters: [...bounds.keys()].map(name => params.get(name).index),
+    } : checkedIndexing ? {
       indexSemantics: 'checked-integer-full-view-v1',
       lengthParameters: [...bounds.keys()].map(name => params.get(name).index),
       loops: [...passes.values()].map(pass => ({ boundParameter: pass.boundParam.index, loopStride: pass.loopStride })),
@@ -640,7 +727,7 @@ export function compileNumericKernel(source, {
     automaticRouteAdmission: false,
   };
   const types = [...parameterTypes.map(type => type === 'f64' ? F64 : I32), ...Array(bounds.size).fill(I32)];
-  const locals = [[...u32(loops.length), I32]];
+  const locals = generalControl ? [] : [[...u32(loops.length), I32]];
   if (temporaryCount) locals.push([...u32(temporaryCount), F64]);
   const body = [
     ...vector(locals),
@@ -662,7 +749,7 @@ export function compileNumericKernel(source, {
     Object.freeze(parameter);
   }
   if (checkedIndexing) Object.freeze(manifest.lengthParameters);
-  if (pipeline || checkedIndexing) {
+  if (pipeline || (checkedIndexing && !generalControl)) {
     if (manifest.boundParameters) Object.freeze(manifest.boundParameters);
     manifest.loops.forEach(Object.freeze);
     Object.freeze(manifest.loops);
@@ -670,6 +757,7 @@ export function compileNumericKernel(source, {
   Object.freeze(manifest.parameters);
   Object.freeze(manifest.sourceSpan);
   return Object.freeze({ wasm, manifest: Object.freeze(manifest), helpers: helperCode.helpers,
+    ...(generalControl ? { controlLoops: Object.freeze(controlLoops) } : {}),
     // Build-time description only: the executable enforces the cap itself,
     // including on existing v7 hosts. No extra host argument or guard is needed.
     ...(nestedCount ? { nestedLoops: Object.freeze({ count: nestedCount,
