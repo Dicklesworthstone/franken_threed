@@ -33,7 +33,7 @@ jobs:
         env:
           F3D_THREE_ROOT: ${{ github.workspace }}/oracle-three
         run: |
-          node --test tools/ingest/marching_cubes_numeric.test.mjs tools/ingest/marching_cubes_adapter.test.mjs | tee marching-cubes-tests.log
+          node --test tools/ingest/marching_cubes_numeric.test.mjs tools/ingest/marching_cubes_adapter.test.mjs tools/ingest/marching_cubes_bundle.test.mjs | tee marching-cubes-tests.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:

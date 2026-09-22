@@ -4,8 +4,21 @@
 branch around only the numerical prefix of its original `update` method. It
 calls `compileMarchingCubesKernel` and `instantiateNumericKernel`; it does not
 introduce a second compiler, runtime, table copy, or rewritten Three.js class.
-Use the plugin before a generic module-URL resolver. The build API/CLI opt-in is
-documented alongside the ingestion entry points when enabled there.
+The existing `--specialize-numeric` application opt-in includes this pass:
+
+```sh
+node tools/ingest/cli.mjs --entry app/index.html --build-app dist \
+  --specialize-numeric --package-root /path/to/pinned/three.js
+```
+
+`buildApplication(entry, outDir, {specializeNumeric: true})` and
+`bundleWithRollup(entry, {specializeNumeric: true})` use the same path. An options
+object forwards `maxMemoryPages` and `maxIterations` to both generic and library
+kernels. Without the numeric opt-in, the addon and base modules are unchanged.
+The library report is nested at `numericSpecialization.libraryKernels.marchingCubes`
+in both the returned build manifest and emitted `f3d-numeric-specialization.json`.
+Library counts do not inflate the generic inferred-function counts. Direct
+Rollup users must place `marchingCubesRollupPlugin()` before generic URL resolvers.
 
 The original method, its construction-time geometry and maxPolyCount closures,
 field-building functions, exports and publication statements remain JavaScript.
@@ -51,7 +64,12 @@ private-state isolation, guards, rollback, recovery and fuel forwarding. Its
 explicit fixture hashes are test anchors, not upstream-conformance evidence.
 
 `marching_cubes_numeric.test.mjs` separately checks the actual pinned upstream
-numerics (see `MARCHING_CUBES.md`). The integration workflow runs both suites.
+numerics (see `MARCHING_CUBES.md`). `marching_cubes_bundle.test.mjs` additionally builds and executes the unmodified
+pinned addon and Three.js core through the real Rollup/application/CLI path,
+compares all 256 cube cases in eight output modes, exercises real materials,
+callbacks and fallback recovery, and checks HTML packing and report consistency.
+The integration workflow runs all three suites with locked dependencies and
+the exact upstream checkout; it does not substitute host doubles for build tests.
 The plugin report and runtime diagnostics distinguish compiled source, actual
 Wasm calls and fallback calls. A compiled addon is not a measured acceleration
 claim. Full H2 browser/material/control and performance gates remain open.

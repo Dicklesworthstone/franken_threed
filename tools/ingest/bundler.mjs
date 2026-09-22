@@ -13,6 +13,7 @@ import { rollup } from "rollup";
 import { analyzeModuleAst, classifyDynamicImportArgument } from "./ast_analyzer.mjs";
 import { parseHtmlEntries } from "./html_parser.mjs";
 import { numericKernelRollupPlugin } from "./numeric_rollup.mjs";
+import { marchingCubesRollupPlugin } from "./marching_cubes_rollup.mjs";
 import { resolveModuleSpecifier, urlToFilePath } from "./resolver.mjs";
 
 /**
@@ -381,6 +382,15 @@ export async function bundleWithRollup(entryPath, options = {}) {
     specialization === undefined || specialization === false
       ? null
       : numericKernelRollupPlugin(specialization === true ? {} : specialization);
+  // The existing application opt-in covers source-pinned library kernels too.
+  // Both passes share caller budgets, but retain their own default ceilings.
+  // Library kernels are accounted separately from generic inferred functions.
+  const marchingPlugin = numericPlugin
+    ? marchingCubesRollupPlugin({
+        maxMemoryPages: specialization === true ? undefined : specialization.maxMemoryPages,
+        maxIterations: specialization === true ? undefined : specialization.maxIterations,
+      })
+    : null;
   const resolvedEntryAbs = path.resolve(entryPath);
   const entryUrl = pathToFileURL(resolvedEntryAbs).href;
   const isHtml = entryPath.endsWith(".html") || entryPath.endsWith(".htm");
@@ -469,6 +479,9 @@ export async function bundleWithRollup(entryPath, options = {}) {
     bundle = await rollup({
       input,
       plugins: [
+        // Resolve the compiler-owned virtual modules before the import-map
+        // resolver sees them; they are not application package/asset paths.
+        ...(marchingPlugin ? [marchingPlugin] : []),
         f3dRollupPlugin({
           importMap,
           mapBaseUrl,
@@ -495,6 +508,21 @@ export async function bundleWithRollup(entryPath, options = {}) {
           ? "f3d-entry-[name]-[hash].js"
           : "[name].js",
     });
+
+    let numericReport = numericPlugin?.api.getReport();
+    if (numericReport && marchingPlugin) {
+      numericReport = {
+        ...numericReport,
+        libraryKernels: { marchingCubes: marchingPlugin.api.getReport() },
+      };
+      const reportAsset = output.find(
+        (item) => item.type === "asset" && item.fileName === numericReport.reportFile,
+      );
+      if (!reportAsset) throw new Error("Numeric specialization report asset is missing");
+      // This explicitly named JSON asset is not executable and has no content
+      // hash in its filename. Keep emitted JSON and the build manifest identical.
+      reportAsset.source = JSON.stringify(numericReport, null, 2) + "\n";
+    }
 
     const chunks = output.filter((chunk) => chunk.type === "chunk");
     const assets = output.filter((item) => item.type === "asset");
@@ -575,7 +603,7 @@ export async function bundleWithRollup(entryPath, options = {}) {
       outputChunks,
       chunks: outputChunks,
       assets: outputAssets,
-      ...(numericPlugin ? { numericSpecialization: numericPlugin.api.getReport() } : {}),
+      ...(numericReport ? { numericSpecialization: numericReport } : {}),
     };
   } finally {
     if (bundle) {
