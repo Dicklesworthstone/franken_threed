@@ -1,11 +1,11 @@
 /**
  * counterexample_suite.js - Comprehensive WebGPU Bridge Counterexample Suite
- * 
+ *
  * Bead: f3d-05-ids-layouts-epochs-transport-vqa.7
- * 
+ *
  * Implements the mandatory adversarial browser test suite against ChartreuseFern's
  * real WebGPU bridge runtime, verified with independently issued direct-JS oracle references.
- * 
+ *
  * Every test verifies:
  * 1. Positive implementation: Correct path passes assertions.
  * 2. Explicitly isolated broken fixture/control: Tested with the EXACT SAME assertion
@@ -13,41 +13,41 @@
  */
 
 import {
-  WebGpuBridgeHost,
+  OPCODE_COPY_TEXTURE_TO_BUFFER,
+  OPCODE_CREATE_BUFFER,
+  OPCODE_CREATE_PIPELINE,
+  OPCODE_CREATE_TEXTURE,
+  OPCODE_EXECUTE_BUNDLES,
+  OPCODE_RECORD_BUNDLE,
+  OPCODE_RENDER_PASS,
+  OPCODE_WRITE_BUFFER,
   PACKET_MAGIC,
   PACKET_VERSION,
-  OPCODE_CREATE_BUFFER,
-  OPCODE_WRITE_BUFFER,
-  OPCODE_CREATE_PIPELINE,
-  OPCODE_RENDER_PASS,
-  OPCODE_COPY_TEXTURE_TO_BUFFER,
-  OPCODE_CREATE_TEXTURE,
-  OPCODE_RECORD_BUNDLE,
-  OPCODE_EXECUTE_BUNDLES,
-  TARGET_OFFSCREEN,
   TARGET_CANVAS,
+  TARGET_OFFSCREEN,
+  WebGpuBridgeHost,
 } from "../../fixtures/gpu_bridge/bridge_runtime.js";
 
 import {
-  WGSL_AFFINE_TRIANGLE,
-  WGSL_SOLID_COLOR,
-  WGSL_FLAT_COLOR_BUNDLE,
-  computeAlignedBytesPerRow,
-  readbackGpuBuffer,
-  renderDirectTriangleReference,
-  renderDirectRedABlueBReference,
-  renderDirectBundleDirectReference,
-  renderDirectNestedPassReference,
-  renderDirectBrokenNestedPass,
+  assertAffineRowsLayoutValid,
+  assertAffineRowsTransformMatch,
   assertBundleDirectDrawMatch,
   assertGenerationalHandlePublication,
   assertMemoryGrowthAllowed,
-  assertAffineRowsLayoutValid,
-  assertAffineRowsTransformMatch,
-  assertNestedPassMatch,
-  renderDirectNestedCanvasOffscreenReference,
   assertNestedCanvasPassMatch,
+  assertNestedPassMatch,
+  computeAlignedBytesPerRow,
   evalDirectAffineTransform,
+  readbackGpuBuffer,
+  renderDirectBrokenNestedPass,
+  renderDirectBundleDirectReference,
+  renderDirectNestedCanvasOffscreenReference,
+  renderDirectNestedPassReference,
+  renderDirectRedABlueBReference,
+  renderDirectTriangleReference,
+  WGSL_AFFINE_TRIANGLE,
+  WGSL_FLAT_COLOR_BUNDLE,
+  WGSL_SOLID_COLOR,
 } from "./oracle_reference.js";
 
 /**
@@ -68,30 +68,89 @@ export class BinaryPacketBuilder {
     const dataOffset = this.dataTotalLen;
     this.dataChunks.push(dataUint8);
     this.dataTotalLen += dataUint8.byteLength;
-    this.commands.push({ op: OPCODE_WRITE_BUFFER, bufferId, offset, dataOffset, dataLength: dataUint8.byteLength });
+    this.commands.push({
+      op: OPCODE_WRITE_BUFFER,
+      bufferId,
+      offset,
+      dataOffset,
+      dataLength: dataUint8.byteLength,
+    });
   }
 
   createTexture(textureId, width, height, formatCode, usage) {
     this.commands.push({ op: OPCODE_CREATE_TEXTURE, textureId, width, height, formatCode, usage });
   }
 
-  createPipeline(pipelineId, wgslText, formatCode, hasVB, hasUniform, uniformSize = 0, vertexStride = 0) {
+  createPipeline(
+    pipelineId,
+    wgslText,
+    formatCode,
+    hasVB,
+    hasUniform,
+    uniformSize = 0,
+    vertexStride = 0,
+  ) {
     const codeBytes = new TextEncoder().encode(wgslText);
     const codeOffset = this.dataTotalLen;
     this.dataChunks.push(codeBytes);
     this.dataTotalLen += codeBytes.byteLength;
-    this.commands.push({ op: OPCODE_CREATE_PIPELINE, pipelineId, codeOffset, codeLen: codeBytes.byteLength, formatCode, hasVB, hasUniform, uniformSize, vertexStride });
+    this.commands.push({
+      op: OPCODE_CREATE_PIPELINE,
+      pipelineId,
+      codeOffset,
+      codeLen: codeBytes.byteLength,
+      formatCode,
+      hasVB,
+      hasUniform,
+      uniformSize,
+      vertexStride,
+    });
   }
 
-  renderPass(targetType, targetId, clearColor, pipelineId, vbId, vertexCount, dynamicOffset = 0, uniformBufferId = 1) {
-    this.commands.push({ op: OPCODE_RENDER_PASS, targetType, targetId, clearColor, pipelineId, vbId, vertexCount, dynamicOffset, uniformBufferId });
+  renderPass(
+    targetType,
+    targetId,
+    clearColor,
+    pipelineId,
+    vbId,
+    vertexCount,
+    dynamicOffset = 0,
+    uniformBufferId = 1,
+  ) {
+    this.commands.push({
+      op: OPCODE_RENDER_PASS,
+      targetType,
+      targetId,
+      clearColor,
+      pipelineId,
+      vbId,
+      vertexCount,
+      dynamicOffset,
+      uniformBufferId,
+    });
   }
 
   copyTextureToBuffer(textureId, bufferId, width, height, epochHi = 0, epochLo = 0) {
-    this.commands.push({ op: OPCODE_COPY_TEXTURE_TO_BUFFER, textureId, bufferId, width, height, epochHi, epochLo });
+    this.commands.push({
+      op: OPCODE_COPY_TEXTURE_TO_BUFFER,
+      textureId,
+      bufferId,
+      width,
+      height,
+      epochHi,
+      epochLo,
+    });
   }
 
-  recordBundle(bundleId, pipelineId, vertexBufferId, vertexCount, dynamicOffset = 0, uniformBufferId = 1, targetFormat = 2) {
+  recordBundle(
+    bundleId,
+    pipelineId,
+    vertexBufferId,
+    vertexCount,
+    dynamicOffset = 0,
+    uniformBufferId = 1,
+    targetFormat = 2,
+  ) {
     this.commands.push({
       op: OPCODE_RECORD_BUNDLE,
       bundleId,
@@ -116,14 +175,30 @@ export class BinaryPacketBuilder {
     let commandBytesLen = 0;
     for (const cmd of this.commands) {
       switch (cmd.op) {
-        case OPCODE_CREATE_BUFFER: commandBytesLen += 2 + 12; break;
-        case OPCODE_WRITE_BUFFER: commandBytesLen += 2 + 16; break;
-        case OPCODE_CREATE_TEXTURE: commandBytesLen += 2 + 20; break;
-        case OPCODE_CREATE_PIPELINE: commandBytesLen += 2 + 32; break;
-        case OPCODE_RENDER_PASS: commandBytesLen += 2 + 44; break;
-        case OPCODE_COPY_TEXTURE_TO_BUFFER: commandBytesLen += 2 + 24; break;
-        case OPCODE_RECORD_BUNDLE: commandBytesLen += 2 + 28; break;
-        case OPCODE_EXECUTE_BUNDLES: commandBytesLen += 2 + 4 + cmd.bundleIds.length * 4; break;
+        case OPCODE_CREATE_BUFFER:
+          commandBytesLen += 2 + 12;
+          break;
+        case OPCODE_WRITE_BUFFER:
+          commandBytesLen += 2 + 16;
+          break;
+        case OPCODE_CREATE_TEXTURE:
+          commandBytesLen += 2 + 20;
+          break;
+        case OPCODE_CREATE_PIPELINE:
+          commandBytesLen += 2 + 32;
+          break;
+        case OPCODE_RENDER_PASS:
+          commandBytesLen += 2 + 44;
+          break;
+        case OPCODE_COPY_TEXTURE_TO_BUFFER:
+          commandBytesLen += 2 + 24;
+          break;
+        case OPCODE_RECORD_BUNDLE:
+          commandBytesLen += 2 + 28;
+          break;
+        case OPCODE_EXECUTE_BUNDLES:
+          commandBytesLen += 2 + 4 + cmd.bundleIds.length * 4;
+          break;
       }
     }
 
@@ -233,7 +308,9 @@ export class BinaryPacketBuilder {
  */
 export function assertExactPixelMatch(candidatePixels, oraclePixels, label = "Pixel Comparison") {
   if (candidatePixels.byteLength !== oraclePixels.byteLength) {
-    throw new Error(`${label}: byte length mismatch (candidate=${candidatePixels.byteLength}, oracle=${oraclePixels.byteLength})`);
+    throw new Error(
+      `${label}: byte length mismatch (candidate=${candidatePixels.byteLength}, oracle=${oraclePixels.byteLength})`,
+    );
   }
   let diffCount = 0;
   for (let i = 0; i < candidatePixels.length; i++) {
@@ -242,7 +319,9 @@ export function assertExactPixelMatch(candidatePixels, oraclePixels, label = "Pi
     }
   }
   if (diffCount > 0) {
-    throw new Error(`${label}: detected ${diffCount} mismatched bytes out of ${candidatePixels.length}`);
+    throw new Error(
+      `${label}: detected ${diffCount} mismatched bytes out of ${candidatePixels.length}`,
+    );
   }
 }
 
@@ -256,18 +335,28 @@ export function assertRedABlueB(pixelsA, pixelsB, width = 32, height = 32) {
   const midY = Math.floor(height / 2);
   const midX = Math.floor(width / 2);
   const centerA = midY * bytesPerRow + midX * 4;
-  const rA = pixelsA[centerA], gA = pixelsA[centerA + 1], bA = pixelsA[centerA + 2], aA = pixelsA[centerA + 3];
+  const rA = pixelsA[centerA],
+    gA = pixelsA[centerA + 1],
+    bA = pixelsA[centerA + 2],
+    aA = pixelsA[centerA + 3];
 
   if (rA < 250 || gA > 5 || bA > 5 || aA < 250) {
-    throw new Error(`Target A color violation: expected Red [255, 0, 0, 255], observed [${rA}, ${gA}, ${bA}, ${aA}]`);
+    throw new Error(
+      `Target A color violation: expected Red [255, 0, 0, 255], observed [${rA}, ${gA}, ${bA}, ${aA}]`,
+    );
   }
 
   // Check center pixel of Target B: expected Blue [0, 0, 255, 255]
   const centerB = midY * bytesPerRow + midX * 4;
-  const rB = pixelsB[centerB], gB = pixelsB[centerB + 1], bB = pixelsB[centerB + 2], aB = pixelsB[centerB + 3];
+  const rB = pixelsB[centerB],
+    gB = pixelsB[centerB + 1],
+    bB = pixelsB[centerB + 2],
+    aB = pixelsB[centerB + 3];
 
   if (rB > 5 || gB > 5 || bB < 250 || aB < 250) {
-    throw new Error(`Target B color violation: expected Blue [0, 0, 255, 255], observed [${rB}, ${gB}, ${bB}, ${aB}]`);
+    throw new Error(
+      `Target B color violation: expected Blue [0, 0, 255, 255], observed [${rB}, ${gB}, ${bB}, ${aB}]`,
+    );
   }
 }
 
@@ -277,11 +366,19 @@ export function assertRedABlueB(pixelsA, pixelsB, width = 32, height = 32) {
  * -----------------------------------------------------------------------------
  */
 
-export async function testFirstFramePixelEquivalence(host, device, wasmModule, width = 64, height = 64, canvasContext = null) {
-  const buildTriangleFn = wasmModule?.f3d_build_first_frame_packet || wasmModule?.gpu_bridge_build_triangle_packet;
+export async function testFirstFramePixelEquivalence(
+  host,
+  device,
+  wasmModule,
+  width = 64,
+  height = 64,
+  canvasContext = null,
+) {
+  const buildTriangleFn =
+    wasmModule?.f3d_build_first_frame_packet || wasmModule?.gpu_bridge_build_triangle_packet;
   if (!wasmModule || typeof buildTriangleFn !== "function") {
     throw new Error(
-      "Missing Wasm Export: testFirstFramePixelEquivalence requires compiled application Wasm with export 'gpu_bridge_build_triangle_packet' or 'f3d_build_first_frame_packet'. Silent JS fallback is forbidden."
+      "Missing Wasm Export: testFirstFramePixelEquivalence requires compiled application Wasm with export 'gpu_bridge_build_triangle_packet' or 'f3d_build_first_frame_packet'. Silent JS fallback is forbidden.",
     );
   }
 
@@ -317,7 +414,8 @@ export async function testFirstFramePixelEquivalence(host, device, wasmModule, w
     // Coordinate preferred canvas format with ChartreuseFern (Defect 2):
     // gpu_host.rs creates pipeline 101 for TARGET_CANVAS with format_code = 1 (bgra8unorm).
     // Use the negotiated capability preferredCanvasFormat or navigator.gpu.getPreferredCanvasFormat().
-    const preferredFormat = host.capabilityRecord?.preferredCanvasFormat ||
+    const preferredFormat =
+      host.capabilityRecord?.preferredCanvasFormat ||
       (typeof navigator !== "undefined" && navigator.gpu?.getPreferredCanvasFormat
         ? navigator.gpu.getPreferredCanvasFormat()
         : "bgra8unorm");
@@ -345,7 +443,12 @@ export async function testFirstFramePixelEquivalence(host, device, wasmModule, w
   return { candidatePixels, oraclePixels };
 }
 
-export async function testNegativeBrokenFirstFrameGpuTransform(host, oraclePixels, width = 64, height = 64) {
+export async function testNegativeBrokenFirstFrameGpuTransform(
+  host,
+  oraclePixels,
+  width = 64,
+  height = 64,
+) {
   // Broken Control: An actual faulty GPU packet uploading an out-of-bounds transform matrix.
   // Translation tx=50, ty=50 pushes all 3 vertices completely outside the NDC [-1, 1] clip space.
   // Real GPU execution renders pure clear color [0, 0, 0, 1] with the triangle entirely clipped!
@@ -353,20 +456,22 @@ export async function testNegativeBrokenFirstFrameGpuTransform(host, oraclePixel
   const bytesPerRow = computeAlignedBytesPerRow(width);
   const readbackSize = bytesPerRow * height;
 
-  builder.createTexture(1, width, height, 2, GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC);
+  builder.createTexture(
+    1,
+    width,
+    height,
+    2,
+    GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+  );
   builder.createBuffer(1, 256, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
 
   const brokenAffine = new Float32Array([
-    1.0, 0.0, 0.0, 50.0,
-    0.0, 1.0, 0.0, 50.0,
-    0.0, 0.0, 1.0, 0.0,
+    1.0, 0.0, 0.0, 50.0, 0.0, 1.0, 0.0, 50.0, 0.0, 0.0, 1.0, 0.0,
   ]);
   builder.writeBuffer(1, 0, new Uint8Array(brokenAffine.buffer));
 
   const vertexData = new Float32Array([
-     0.0,  0.5,  0.0, 0.5, 1.0,
-    -0.5, -0.5,  0.0, 0.0, 0.0,
-     0.5, -0.5,  0.0, 1.0, 0.0,
+    0.0, 0.5, 0.0, 0.5, 1.0, -0.5, -0.5, 0.0, 0.0, 0.0, 0.5, -0.5, 0.0, 1.0, 0.0,
   ]);
   builder.createBuffer(2, vertexData.byteLength, GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST);
   builder.writeBuffer(2, 0, new Uint8Array(vertexData.buffer));
@@ -392,7 +497,9 @@ export async function testNegativeBrokenFirstFrameGpuTransform(host, oraclePixel
   }
 
   if (!rejected) {
-    throw new Error("Negative Control Failed: assertExactPixelMatch failed to reject out-of-bounds GPU render output!");
+    throw new Error(
+      "Negative Control Failed: assertExactPixelMatch failed to reject out-of-bounds GPU render output!",
+    );
   }
 }
 
@@ -403,10 +510,11 @@ export async function testNegativeBrokenFirstFrameGpuTransform(host, oraclePixel
  */
 
 export async function testRedABlueBQueueWriteSnapshot(host, wasmModule, width = 64, height = 64) {
-  const buildRedBlueFn = wasmModule?.f3d_build_red_a_blue_b_packet || wasmModule?.gpu_bridge_build_red_blue_packet;
+  const buildRedBlueFn =
+    wasmModule?.f3d_build_red_a_blue_b_packet || wasmModule?.gpu_bridge_build_red_blue_packet;
   if (!wasmModule || typeof buildRedBlueFn !== "function") {
     throw new Error(
-      "Missing Wasm Export: testRedABlueBQueueWriteSnapshot requires compiled application Wasm with export 'gpu_bridge_build_red_blue_packet' or 'f3d_build_red_a_blue_b_packet'. Silent JS fallback is forbidden."
+      "Missing Wasm Export: testRedABlueBQueueWriteSnapshot requires compiled application Wasm with export 'gpu_bridge_build_red_blue_packet' or 'f3d_build_red_a_blue_b_packet'. Silent JS fallback is forbidden.",
     );
   }
 
@@ -431,11 +539,17 @@ export async function testRedABlueBQueueWriteSnapshot(host, wasmModule, width = 
   return { pixelsA, pixelsB };
 }
 
-export async function testNegativeBrokenRedABlueBQueueHazard(host, wasmModule, width = 32, height = 32) {
-  const buildRedBlueFn = wasmModule?.f3d_build_red_a_blue_b_packet || wasmModule?.gpu_bridge_build_red_blue_packet;
+export async function testNegativeBrokenRedABlueBQueueHazard(
+  host,
+  wasmModule,
+  width = 32,
+  height = 32,
+) {
+  const buildRedBlueFn =
+    wasmModule?.f3d_build_red_a_blue_b_packet || wasmModule?.gpu_bridge_build_red_blue_packet;
   if (!wasmModule || typeof buildRedBlueFn !== "function") {
     throw new Error(
-      "Missing Wasm Export: testNegativeBrokenRedABlueBQueueHazard requires compiled application Wasm with export 'gpu_bridge_build_red_blue_packet' or 'f3d_build_red_a_blue_b_packet'."
+      "Missing Wasm Export: testNegativeBrokenRedABlueBQueueHazard requires compiled application Wasm with export 'gpu_bridge_build_red_blue_packet' or 'f3d_build_red_a_blue_b_packet'.",
     );
   }
 
@@ -455,7 +569,9 @@ export async function testNegativeBrokenRedABlueBQueueHazard(host, wasmModule, w
     rejectedWasm = true;
   }
   if (!rejectedWasm) {
-    throw new Error("Negative Control Failed: Unversioned Rust packet was not rejected by assertRedABlueB!");
+    throw new Error(
+      "Negative Control Failed: Unversioned Rust packet was not rejected by assertRedABlueB!",
+    );
   }
 
   // 2. Also test direct GPU in-place uniform overwrite hazard control
@@ -463,8 +579,20 @@ export async function testNegativeBrokenRedABlueBQueueHazard(host, wasmModule, w
   const readbackSize = bytesPerRow * height;
 
   const builder = new BinaryPacketBuilder();
-  builder.createTexture(30, width, height, 2, GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC);
-  builder.createTexture(31, width, height, 2, GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC);
+  builder.createTexture(
+    30,
+    width,
+    height,
+    2,
+    GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+  );
+  builder.createTexture(
+    31,
+    width,
+    height,
+    2,
+    GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+  );
 
   // Single uniform slot at offset 0
   builder.createBuffer(1, 256, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
@@ -500,7 +628,9 @@ export async function testNegativeBrokenRedABlueBQueueHazard(host, wasmModule, w
   }
 
   if (!rejectedJs) {
-    throw new Error("Negative Control Failed: assertRedABlueB did not reject in-place queue-write overwrite hazard!");
+    throw new Error(
+      "Negative Control Failed: assertRedABlueB did not reject in-place queue-write overwrite hazard!",
+    );
   }
 }
 
@@ -522,7 +652,9 @@ export async function testNegativeMissingWasmRejection(host, device) {
     }
   }
   if (!rejectedNull) {
-    throw new Error("Negative Control Failed: testFirstFramePixelEquivalence did not reject null wasmModule!");
+    throw new Error(
+      "Negative Control Failed: testFirstFramePixelEquivalence did not reject null wasmModule!",
+    );
   }
 
   // 2. Missing required export must throw
@@ -535,7 +667,9 @@ export async function testNegativeMissingWasmRejection(host, device) {
     }
   }
   if (!rejectedMissingExport) {
-    throw new Error("Negative Control Failed: testRedABlueBQueueWriteSnapshot did not reject missing export!");
+    throw new Error(
+      "Negative Control Failed: testRedABlueBQueueWriteSnapshot did not reject missing export!",
+    );
   }
 
   // 3. Stale epoch publication gate missing export must throw
@@ -548,7 +682,9 @@ export async function testNegativeMissingWasmRejection(host, device) {
     }
   }
   if (!rejectedPublicationExport) {
-    throw new Error("Negative Control Failed: testStaleEpochReadbackPublicationGate did not reject missing export!");
+    throw new Error(
+      "Negative Control Failed: testStaleEpochReadbackPublicationGate did not reject missing export!",
+    );
   }
 
   // 4. Bundle-then-direct draw state reset missing export must throw
@@ -561,7 +697,9 @@ export async function testNegativeMissingWasmRejection(host, device) {
     }
   }
   if (!rejectedBundleExport) {
-    throw new Error("Negative Control Failed: testBundleThenDirectDrawStateReset did not reject missing export!");
+    throw new Error(
+      "Negative Control Failed: testBundleThenDirectDrawStateReset did not reject missing export!",
+    );
   }
 
   // 5. Generational handle ABA publication missing export must throw
@@ -574,7 +712,9 @@ export async function testNegativeMissingWasmRejection(host, device) {
     }
   }
   if (!rejectedHandleExport) {
-    throw new Error("Negative Control Failed: testGenerationalHandleAbaPublication did not reject missing export!");
+    throw new Error(
+      "Negative Control Failed: testGenerationalHandleAbaPublication did not reject missing export!",
+    );
   }
 
   // 6. Linear memory borrow guards missing export must throw
@@ -587,7 +727,9 @@ export async function testNegativeMissingWasmRejection(host, device) {
     }
   }
   if (!rejectedBorrowExport) {
-    throw new Error("Negative Control Failed: testLinearMemoryBorrowGuards did not reject missing export!");
+    throw new Error(
+      "Negative Control Failed: testLinearMemoryBorrowGuards did not reject missing export!",
+    );
   }
 
   // 7. AffineRows GPU layout validation missing export must throw
@@ -600,7 +742,9 @@ export async function testNegativeMissingWasmRejection(host, device) {
     }
   }
   if (!rejectedAffineExport) {
-    throw new Error("Negative Control Failed: testAffineRowsGpuLayoutValidation did not reject missing export!");
+    throw new Error(
+      "Negative Control Failed: testAffineRowsGpuLayoutValidation did not reject missing export!",
+    );
   }
 }
 
@@ -643,7 +787,9 @@ export async function testNegativeBrokenMalformedPacket(host) {
     }
   }
   if (!rejectedTruncated) {
-    throw new Error("Negative Control Failed: Bridge decoder failed to reject truncated packet fields!");
+    throw new Error(
+      "Negative Control Failed: Bridge decoder failed to reject truncated packet fields!",
+    );
   }
 
   // Sub-test 2: Invalid texture format code
@@ -660,7 +806,9 @@ export async function testNegativeBrokenMalformedPacket(host) {
     }
   }
   if (!rejectedFormat) {
-    throw new Error("Negative Control Failed: Bridge decoder failed to reject invalid texture format code!");
+    throw new Error(
+      "Negative Control Failed: Bridge decoder failed to reject invalid texture format code!",
+    );
   }
 
   // Sub-test 3: Invalid render pass target type
@@ -681,7 +829,9 @@ export async function testNegativeBrokenMalformedPacket(host) {
     }
   }
   if (!rejectedTarget) {
-    throw new Error("Negative Control Failed: Bridge decoder failed to reject invalid render pass target type!");
+    throw new Error(
+      "Negative Control Failed: Bridge decoder failed to reject invalid render pass target type!",
+    );
   }
 }
 
@@ -712,7 +862,7 @@ export async function testNegativeBrokenErrorScopeControl(host) {
   let rejectedPromise = false;
   try {
     await host.withErrorScopes(["validation"], async () => {
-      await new Promise(r => setTimeout(r, 10));
+      await new Promise((r) => setTimeout(r, 10));
     });
   } catch (e) {
     if (e.message && e.message.includes("syncAction returned a Promise")) {
@@ -720,7 +870,9 @@ export async function testNegativeBrokenErrorScopeControl(host) {
     }
   }
   if (!rejectedPromise) {
-    throw new Error("Negative Control Failed: withErrorScopes failed to reject async/Promise return!");
+    throw new Error(
+      "Negative Control Failed: withErrorScopes failed to reject async/Promise return!",
+    );
   }
 
   // Sub-test 2: Concurrent error scope invocation
@@ -728,18 +880,24 @@ export async function testNegativeBrokenErrorScopeControl(host) {
   let innerPromise = null;
   await host.withErrorScopes(["validation"], () => {
     // Re-enter withErrorScopes while active; capture inner async promise rejection
-    innerPromise = host.withErrorScopes(["validation"], () => {}).catch(e => {
-      innerErr = e;
-    });
+    innerPromise = host
+      .withErrorScopes(["validation"], () => {})
+      .catch((e) => {
+        innerErr = e;
+      });
   });
 
   if (innerPromise) {
     await innerPromise;
   }
 
-  if (!innerErr || !innerErr.message || !innerErr.message.includes("Error-scope serialization violation")) {
+  if (
+    !innerErr ||
+    !innerErr.message ||
+    !innerErr.message.includes("Error-scope serialization violation")
+  ) {
     throw new Error(
-      `Negative Control Failed: withErrorScopes failed to reject concurrent interleaved scopes! Observed: ${innerErr ? innerErr.message : "no error"}`
+      `Negative Control Failed: withErrorScopes failed to reject concurrent interleaved scopes! Observed: ${innerErr ? innerErr.message : "no error"}`,
     );
   }
 }
@@ -751,7 +909,7 @@ export async function testNegativeBrokenErrorScopeControl(host) {
  * Per OrangePelican root review and credit rules:
  * Invented mock classes (e.g. test-only handle managers or borrow controllers)
  * must NEVER be presented as passing product tests.
- * 
+ *
  * All bridge capabilities are now backed by real Rust/Wasm exports.
  * The pending capability ledger is ZERO.
  */
@@ -777,10 +935,11 @@ export function getPendingBridgeCapabilities() {
  * Strictly invokes the compiled Rust gate via Wasm export; no test-only JS mock.
  */
 export async function testStaleEpochReadbackPublicationGate(host, wasmModule) {
-  const tryPublishFn = wasmModule?.gpu_bridge_try_publish_readback || wasmModule?.f3d_try_publish_readback;
+  const tryPublishFn =
+    wasmModule?.gpu_bridge_try_publish_readback || wasmModule?.f3d_try_publish_readback;
   if (!wasmModule || typeof tryPublishFn !== "function") {
     throw new Error(
-      "Missing Wasm Export: testStaleEpochReadbackPublicationGate requires compiled application Wasm with export 'gpu_bridge_try_publish_readback' (or 'f3d_try_publish_readback'). Silent JS fallback is forbidden."
+      "Missing Wasm Export: testStaleEpochReadbackPublicationGate requires compiled application Wasm with export 'gpu_bridge_try_publish_readback' (or 'f3d_try_publish_readback'). Silent JS fallback is forbidden.",
     );
   }
 
@@ -791,7 +950,13 @@ export async function testStaleEpochReadbackPublicationGate(host, wasmModule) {
   const readbackSize = bytesPerRow * height;
 
   const builder = new BinaryPacketBuilder();
-  builder.createTexture(50, width, height, 2, GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC);
+  builder.createTexture(
+    50,
+    width,
+    height,
+    2,
+    GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+  );
   builder.createBuffer(51, readbackSize, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
   // Stamped with epochHi = 0, epochLo = 1
   builder.copyTextureToBuffer(50, 51, width, height, 0, 1);
@@ -807,7 +972,7 @@ export async function testStaleEpochReadbackPublicationGate(host, wasmModule) {
   const matchingAccepted = tryPublishFn(readbackEpochHi, readbackEpochLo, 0, 1);
   if (!matchingAccepted) {
     throw new Error(
-      `Positive Control Failed: Rust publication gate rejected matching readback epoch (${readbackEpochHi}, ${readbackEpochLo}) against region epoch (0, 1)!`
+      `Positive Control Failed: Rust publication gate rejected matching readback epoch (${readbackEpochHi}, ${readbackEpochLo}) against region epoch (0, 1)!`,
     );
   }
 
@@ -815,7 +980,7 @@ export async function testStaleEpochReadbackPublicationGate(host, wasmModule) {
   const staleAccepted = tryPublishFn(readbackEpochHi, readbackEpochLo, 0, 2);
   if (staleAccepted) {
     throw new Error(
-      `Negative Control Failed: Rust publication gate falsely accepted stale readback epoch (${readbackEpochHi}, ${readbackEpochLo}) against advanced region epoch (0, 2)!`
+      `Negative Control Failed: Rust publication gate falsely accepted stale readback epoch (${readbackEpochHi}, ${readbackEpochLo}) against advanced region epoch (0, 2)!`,
     );
   }
 
@@ -823,7 +988,7 @@ export async function testStaleEpochReadbackPublicationGate(host, wasmModule) {
   const highMismatchAccepted = tryPublishFn(readbackEpochHi, readbackEpochLo, 1, 1);
   if (highMismatchAccepted) {
     throw new Error(
-      `Negative Control Failed: Rust publication gate falsely accepted high-word mismatch epoch (${readbackEpochHi}, ${readbackEpochLo}) against region epoch (1, 1)!`
+      `Negative Control Failed: Rust publication gate falsely accepted high-word mismatch epoch (${readbackEpochHi}, ${readbackEpochLo}) against region epoch (1, 1)!`,
     );
   }
 
@@ -877,14 +1042,17 @@ export function decodePacketCommandTrace(packetBytes) {
   let cursor = 16;
   for (let i = 0; i < commandCount; i++) {
     if (cursor + 2 > dataBlockStart) {
-      trace.push(`[Cmd ${i}] TRUNCATED: cursor ${cursor} exceeded dataBlockStart ${dataBlockStart}`);
+      trace.push(
+        `[Cmd ${i}] TRUNCATED: cursor ${cursor} exceeded dataBlockStart ${dataBlockStart}`,
+      );
       break;
     }
     const opcode = dataView.getUint16(cursor, true);
     cursor += 2;
 
     switch (opcode) {
-      case 1: { // OPCODE_CREATE_BUFFER
+      case 1: {
+        // OPCODE_CREATE_BUFFER
         if (cursor + 12 > dataBlockStart) {
           trace.push(`[Cmd ${i}] CREATE_BUFFER: truncated`);
           cursor = dataBlockStart;
@@ -894,10 +1062,13 @@ export function decodePacketCommandTrace(packetBytes) {
         const size = dataView.getUint32(cursor + 4, true);
         const usage = dataView.getUint32(cursor + 8, true);
         cursor += 12;
-        trace.push(`[Cmd ${i}] CREATE_BUFFER: bufferId=${bufferId}, size=${size}, usage=0x${usage.toString(16)}`);
+        trace.push(
+          `[Cmd ${i}] CREATE_BUFFER: bufferId=${bufferId}, size=${size}, usage=0x${usage.toString(16)}`,
+        );
         break;
       }
-      case 2: { // OPCODE_WRITE_BUFFER
+      case 2: {
+        // OPCODE_WRITE_BUFFER
         if (cursor + 16 > dataBlockStart) {
           trace.push(`[Cmd ${i}] WRITE_BUFFER: truncated`);
           cursor = dataBlockStart;
@@ -908,10 +1079,13 @@ export function decodePacketCommandTrace(packetBytes) {
         const dataOffset = dataView.getUint32(cursor + 8, true);
         const dataLength = dataView.getUint32(cursor + 12, true);
         cursor += 16;
-        trace.push(`[Cmd ${i}] WRITE_BUFFER: bufferId=${bufferId}, offset=${offset}, dataOffset=${dataOffset}, dataLen=${dataLength}`);
+        trace.push(
+          `[Cmd ${i}] WRITE_BUFFER: bufferId=${bufferId}, offset=${offset}, dataOffset=${dataOffset}, dataLen=${dataLength}`,
+        );
         break;
       }
-      case 3: { // OPCODE_CREATE_PIPELINE
+      case 3: {
+        // OPCODE_CREATE_PIPELINE
         if (cursor + 32 > dataBlockStart) {
           trace.push(`[Cmd ${i}] CREATE_PIPELINE: truncated`);
           cursor = dataBlockStart;
@@ -926,10 +1100,13 @@ export function decodePacketCommandTrace(packetBytes) {
         const uniformSize = dataView.getUint32(cursor + 24, true);
         const vertexStride = dataView.getUint32(cursor + 28, true);
         cursor += 32;
-        trace.push(`[Cmd ${i}] CREATE_PIPELINE: pipelineId=${pipelineId}, codeLen=${codeLen}, format=${formatCode}, hasVB=${hasVB}, hasUB=${hasUB}, uniformSize=${uniformSize}, vertexStride=${vertexStride}`);
+        trace.push(
+          `[Cmd ${i}] CREATE_PIPELINE: pipelineId=${pipelineId}, codeLen=${codeLen}, format=${formatCode}, hasVB=${hasVB}, hasUB=${hasUB}, uniformSize=${uniformSize}, vertexStride=${vertexStride}`,
+        );
         break;
       }
-      case 4: { // OPCODE_RENDER_PASS
+      case 4: {
+        // OPCODE_RENDER_PASS
         if (cursor + 44 > dataBlockStart) {
           trace.push(`[Cmd ${i}] RENDER_PASS: truncated`);
           cursor = dataBlockStart;
@@ -947,10 +1124,13 @@ export function decodePacketCommandTrace(packetBytes) {
         const dynamicOffset = dataView.getUint32(cursor + 36, true);
         const uniformBufferId = dataView.getUint32(cursor + 40, true);
         cursor += 44;
-        trace.push(`[Cmd ${i}] RENDER_PASS: targetType=${targetType === 0 ? "Offscreen" : "Canvas"}, targetId=${targetId}, clear=[${cr},${cg},${cb},${ca}], pipelineId=${pipelineId}, vbId=${vertexBufferId}, vertexCount=${vertexCount}, dynOffset=${dynamicOffset}, ubId=${uniformBufferId}`);
+        trace.push(
+          `[Cmd ${i}] RENDER_PASS: targetType=${targetType === 0 ? "Offscreen" : "Canvas"}, targetId=${targetId}, clear=[${cr},${cg},${cb},${ca}], pipelineId=${pipelineId}, vbId=${vertexBufferId}, vertexCount=${vertexCount}, dynOffset=${dynamicOffset}, ubId=${uniformBufferId}`,
+        );
         break;
       }
-      case 5: { // OPCODE_COPY_TEXTURE_TO_BUFFER
+      case 5: {
+        // OPCODE_COPY_TEXTURE_TO_BUFFER
         if (cursor + 24 > dataBlockStart) {
           trace.push(`[Cmd ${i}] COPY_TEXTURE_TO_BUFFER: truncated`);
           cursor = dataBlockStart;
@@ -963,10 +1143,13 @@ export function decodePacketCommandTrace(packetBytes) {
         const epochHi = dataView.getUint32(cursor + 16, true);
         const epochLo = dataView.getUint32(cursor + 20, true);
         cursor += 24;
-        trace.push(`[Cmd ${i}] COPY_TEXTURE_TO_BUFFER: textureId=${textureId}, bufferId=${bufferId}, dims=${w}x${h}, epoch=(${epochHi},${epochLo})`);
+        trace.push(
+          `[Cmd ${i}] COPY_TEXTURE_TO_BUFFER: textureId=${textureId}, bufferId=${bufferId}, dims=${w}x${h}, epoch=(${epochHi},${epochLo})`,
+        );
         break;
       }
-      case 6: { // OPCODE_CREATE_TEXTURE
+      case 6: {
+        // OPCODE_CREATE_TEXTURE
         if (cursor + 20 > dataBlockStart) {
           trace.push(`[Cmd ${i}] CREATE_TEXTURE: truncated`);
           cursor = dataBlockStart;
@@ -978,10 +1161,13 @@ export function decodePacketCommandTrace(packetBytes) {
         const formatCode = dataView.getUint32(cursor + 12, true);
         const usage = dataView.getUint32(cursor + 16, true);
         cursor += 20;
-        trace.push(`[Cmd ${i}] CREATE_TEXTURE: textureId=${textureId}, dims=${w}x${h}, format=${formatCode}, usage=0x${usage.toString(16)}`);
+        trace.push(
+          `[Cmd ${i}] CREATE_TEXTURE: textureId=${textureId}, dims=${w}x${h}, format=${formatCode}, usage=0x${usage.toString(16)}`,
+        );
         break;
       }
-      case 7: { // OPCODE_RECORD_BUNDLE
+      case 7: {
+        // OPCODE_RECORD_BUNDLE
         if (cursor + 28 > dataBlockStart) {
           trace.push(`[Cmd ${i}] RECORD_BUNDLE: truncated`);
           cursor = dataBlockStart;
@@ -995,10 +1181,13 @@ export function decodePacketCommandTrace(packetBytes) {
         const uniformBufferId = dataView.getUint32(cursor + 20, true);
         const targetFormatCode = dataView.getUint32(cursor + 24, true);
         cursor += 28;
-        trace.push(`[Cmd ${i}] RECORD_BUNDLE: bundleId=${bundleId}, pipelineId=${pipelineId}, vbId=${vertexBufferId}, vertexCount=${vertexCount}, dynOffset=${dynamicOffset}, ubId=${uniformBufferId}, format=${targetFormatCode}`);
+        trace.push(
+          `[Cmd ${i}] RECORD_BUNDLE: bundleId=${bundleId}, pipelineId=${pipelineId}, vbId=${vertexBufferId}, vertexCount=${vertexCount}, dynOffset=${dynamicOffset}, ubId=${uniformBufferId}, format=${targetFormatCode}`,
+        );
         break;
       }
-      case 8: { // OPCODE_EXECUTE_BUNDLES
+      case 8: {
+        // OPCODE_EXECUTE_BUNDLES
         if (cursor + 4 > dataBlockStart) {
           trace.push(`[Cmd ${i}] EXECUTE_BUNDLES: truncated`);
           cursor = dataBlockStart;
@@ -1012,7 +1201,9 @@ export function decodePacketCommandTrace(packetBytes) {
           bundleIds.push(dataView.getUint32(cursor, true));
           cursor += 4;
         }
-        trace.push(`[Cmd ${i}] EXECUTE_BUNDLES: count=${bundleCount}, bundleIds=[${bundleIds.join(", ")}]`);
+        trace.push(
+          `[Cmd ${i}] EXECUTE_BUNDLES: count=${bundleCount}, bundleIds=[${bundleIds.join(", ")}]`,
+        );
         break;
       }
       default:
@@ -1023,11 +1214,19 @@ export function decodePacketCommandTrace(packetBytes) {
   return trace;
 }
 
-export async function testBundleThenDirectDrawStateReset(host, device, wasmModule, width = 64, height = 64) {
-  const buildBundleDirectFn = wasmModule?.f3d_build_bundle_direct_draw_packet || wasmModule?.gpu_bridge_build_bundle_direct_draw_packet;
+export async function testBundleThenDirectDrawStateReset(
+  host,
+  device,
+  wasmModule,
+  width = 64,
+  height = 64,
+) {
+  const buildBundleDirectFn =
+    wasmModule?.f3d_build_bundle_direct_draw_packet ||
+    wasmModule?.gpu_bridge_build_bundle_direct_draw_packet;
   if (!wasmModule || typeof buildBundleDirectFn !== "function") {
     throw new Error(
-      "Missing Wasm Export: testBundleThenDirectDrawStateReset requires compiled application Wasm with export 'gpu_bridge_build_bundle_direct_draw_packet' (or 'f3d_build_bundle_direct_draw_packet'). Silent JS fallback is forbidden."
+      "Missing Wasm Export: testBundleThenDirectDrawStateReset requires compiled application Wasm with export 'gpu_bridge_build_bundle_direct_draw_packet' (or 'f3d_build_bundle_direct_draw_packet'). Silent JS fallback is forbidden.",
     );
   }
 
@@ -1095,7 +1294,9 @@ export async function testBundleThenDirectDrawStateReset(host, device, wasmModul
   // sampled pixels, and validation error status in the thrown error message.
   try {
     if (positiveValidationError) {
-      throw new Error(`WebGPU validation error during positive packet execution: ${positiveValidationError}`);
+      throw new Error(
+        `WebGPU validation error during positive packet execution: ${positiveValidationError}`,
+      );
     }
     if (readbackError) {
       throw new Error(`Buffer readback failed: ${readbackError}`);
@@ -1124,7 +1325,12 @@ export async function testBundleThenDirectDrawStateReset(host, device, wasmModul
   };
 }
 
-export async function testNegativeBrokenBundleDirectDraw(host, oraclePixels, width = 64, height = 64) {
+export async function testNegativeBrokenBundleDirectDraw(
+  host,
+  oraclePixels,
+  width = 64,
+  height = 64,
+) {
   const bytesPerRow = computeAlignedBytesPerRow(width);
   const readbackSize = bytesPerRow * height;
 
@@ -1183,9 +1389,7 @@ export async function testNegativeBrokenBundleDirectDraw(host, oraclePixels, wid
 
   // Vertex buffer 1: Triangle 1 (left side)
   const tri1Data = new Float32Array([
-    -1.0, -1.0, 0.0,  0.0, 0.0,
-     0.0, -1.0, 0.0,  0.5, 0.0,
-     0.0,  1.0, 0.0,  0.5, 1.0,
+    -1.0, -1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.5, 0.0, 0.0, 1.0, 0.0, 0.5, 1.0,
   ]);
   const vb1 = host.device.createBuffer({
     size: tri1Data.byteLength,
@@ -1195,9 +1399,7 @@ export async function testNegativeBrokenBundleDirectDraw(host, oraclePixels, wid
 
   // Vertex buffer 2: Triangle 2 (right side)
   const tri2Data = new Float32Array([
-     0.0, -1.0, 0.0,  0.5, 0.0,
-     1.0, -1.0, 0.0,  1.0, 0.0,
-     1.0,  1.0, 0.0,  1.0, 1.0,
+    0.0, -1.0, 0.0, 0.5, 0.0, 1.0, -1.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0,
   ]);
   const vb2 = host.device.createBuffer({
     size: tri2Data.byteLength,
@@ -1228,12 +1430,14 @@ export async function testNegativeBrokenBundleDirectDraw(host, oraclePixels, wid
     await host.withErrorScopes(["validation", "out-of-memory"], () => {
       const encoder = host.device.createCommandEncoder();
       const pass = encoder.beginRenderPass({
-        colorAttachments: [{
-          view: target.createView(),
-          clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
-          loadOp: "clear",
-          storeOp: "store",
-        }],
+        colorAttachments: [
+          {
+            view: target.createView(),
+            clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
+            loadOp: "clear",
+            storeOp: "store",
+          },
+        ],
       });
 
       // 1. Bundle draws Green left triangle
@@ -1252,7 +1456,7 @@ export async function testNegativeBrokenBundleDirectDraw(host, oraclePixels, wid
       encoder.copyTextureToBuffer(
         { texture: target },
         { buffer: readback, bytesPerRow, rowsPerImage: height },
-        [width, height, 1]
+        [width, height, 1],
       );
 
       const commandBuffer = encoder.finish();
@@ -1266,7 +1470,7 @@ export async function testNegativeBrokenBundleDirectDraw(host, oraclePixels, wid
   const recordedGpuBehavior = {
     behavior: validationError ? "validation_error_captured" : "wrong_geometry_rendered",
     detail: validationError
-      ? (validationError.message || String(validationError))
+      ? validationError.message || String(validationError)
       : "Direct draw issued without rebind; executed with missing/stale pass state on GPU.",
   };
 
@@ -1296,7 +1500,7 @@ export async function testNegativeBrokenBundleDirectDraw(host, oraclePixels, wid
 
   if (!rejected) {
     throw new Error(
-      "Negative Control Failed: assertBundleDirectDrawMatch did not reject GPU output produced without post-bundle rebind!"
+      "Negative Control Failed: assertBundleDirectDrawMatch did not reject GPU output produced without post-bundle rebind!",
     );
   }
 
@@ -1330,13 +1534,22 @@ export async function testNegativeBrokenBundleDirectDraw(host, oraclePixels, wid
  * detection and rejection.
  */
 export async function testGenerationalHandleAbaPublication(host, wasmModule, canvasContext) {
-  const checkFn = wasmModule?.f3d_check_resource_handle || wasmModule?.gpu_bridge_check_resource_handle;
-  const advanceFn = wasmModule?.f3d_advance_resource_generation || wasmModule?.gpu_bridge_advance_resource_generation;
-  const buildTriangleFn = wasmModule?.f3d_build_first_frame_packet || wasmModule?.gpu_bridge_build_triangle_packet;
+  const checkFn =
+    wasmModule?.f3d_check_resource_handle || wasmModule?.gpu_bridge_check_resource_handle;
+  const advanceFn =
+    wasmModule?.f3d_advance_resource_generation ||
+    wasmModule?.gpu_bridge_advance_resource_generation;
+  const buildTriangleFn =
+    wasmModule?.f3d_build_first_frame_packet || wasmModule?.gpu_bridge_build_triangle_packet;
 
-  if (!wasmModule || typeof checkFn !== "function" || typeof advanceFn !== "function" || typeof buildTriangleFn !== "function") {
+  if (
+    !wasmModule ||
+    typeof checkFn !== "function" ||
+    typeof advanceFn !== "function" ||
+    typeof buildTriangleFn !== "function"
+  ) {
     throw new Error(
-      "Missing Wasm Export: testGenerationalHandleAbaPublication requires compiled application Wasm with exports 'gpu_bridge_check_resource_handle', 'gpu_bridge_advance_resource_generation', and 'gpu_bridge_build_triangle_packet' (or aliases). Silent JS fallback is forbidden."
+      "Missing Wasm Export: testGenerationalHandleAbaPublication requires compiled application Wasm with exports 'gpu_bridge_check_resource_handle', 'gpu_bridge_advance_resource_generation', and 'gpu_bridge_build_triangle_packet' (or aliases). Silent JS fallback is forbidden.",
     );
   }
 
@@ -1351,7 +1564,7 @@ export async function testGenerationalHandleAbaPublication(host, wasmModule, can
   for (const id of registeredTriangleIds) {
     if (!checkFn(id, 1)) {
       throw new Error(
-        `Positive Control Failed: Expected resource id ${id} to be registered at generation 1, but check returned false!`
+        `Positive Control Failed: Expected resource id ${id} to be registered at generation 1, but check returned false!`,
       );
     }
   }
@@ -1366,21 +1579,21 @@ export async function testGenerationalHandleAbaPublication(host, wasmModule, can
   const newGen = advanceFn(testId);
   if (newGen !== 2) {
     throw new Error(
-      `Lifecycle Advance Failed: Expected advance_resource_generation(${testId}) to return 2, got ${newGen}!`
+      `Lifecycle Advance Failed: Expected advance_resource_generation(${testId}) to return 2, got ${newGen}!`,
     );
   }
 
   // 4. Assert check(id, 1) is false (stale ABA generation rejected)
   if (checkFn(testId, 1) !== false) {
     throw new Error(
-      `ABA Hazard Failed: Expected check_resource_handle(${testId}, 1) to return false after advance, got true!`
+      `ABA Hazard Failed: Expected check_resource_handle(${testId}, 1) to return false after advance, got true!`,
     );
   }
 
   // 5. Assert check(id, 2) is true (fresh generation after reallocation accepted)
   if (checkFn(testId, 2) !== true) {
     throw new Error(
-      `Positive Control Failed: Expected check_resource_handle(${testId}, 2) to return true after advance, got false!`
+      `Positive Control Failed: Expected check_resource_handle(${testId}, 2) to return true after advance, got false!`,
     );
   }
   assertGenerationalHandlePublication(checkFn, testId, 2);
@@ -1388,7 +1601,7 @@ export async function testGenerationalHandleAbaPublication(host, wasmModule, can
   // 6. Assert check(id, 0) is false (generation zero strictly rejected via HandleError::InvalidGeneration)
   if (checkFn(testId, 0) !== false) {
     throw new Error(
-      `Generation Zero Invariant Failed: Expected check_resource_handle(${testId}, 0) to return false, got true!`
+      `Generation Zero Invariant Failed: Expected check_resource_handle(${testId}, 0) to return false, got true!`,
     );
   }
 
@@ -1401,18 +1614,24 @@ export async function testGenerationalHandleAbaPublication(host, wasmModule, can
   };
 }
 
-export async function testNegativeBrokenGenerationalHandlePublication(host, wasmModule, testId = 10, staleGeneration = 1) {
-  const checkFn = wasmModule?.f3d_check_resource_handle || wasmModule?.gpu_bridge_check_resource_handle;
+export async function testNegativeBrokenGenerationalHandlePublication(
+  host,
+  wasmModule,
+  testId = 10,
+  staleGeneration = 1,
+) {
+  const checkFn =
+    wasmModule?.f3d_check_resource_handle || wasmModule?.gpu_bridge_check_resource_handle;
   if (!wasmModule || typeof checkFn !== "function") {
     throw new Error(
-      "Missing Wasm Export: testNegativeBrokenGenerationalHandlePublication requires 'gpu_bridge_check_resource_handle' (or alias). Silent JS fallback is forbidden."
+      "Missing Wasm Export: testNegativeBrokenGenerationalHandlePublication requires 'gpu_bridge_check_resource_handle' (or alias). Silent JS fallback is forbidden.",
     );
   }
 
   // Verify that the GPU resource was indeed created and executed on the bridge host
   if (!host.textures.has(testId)) {
     throw new Error(
-      `testNegativeBrokenGenerationalHandlePublication: target texture ${testId} not found in bridge host textures`
+      `testNegativeBrokenGenerationalHandlePublication: target texture ${testId} not found in bridge host textures`,
     );
   }
 
@@ -1430,7 +1649,7 @@ export async function testNegativeBrokenGenerationalHandlePublication(host, wasm
 
   if (!rejectedStale) {
     throw new Error(
-      `Negative Control Failed: assertGenerationalHandlePublication did not reject publication attempt with stale generation (${testId}, gen=${staleGeneration})!`
+      `Negative Control Failed: assertGenerationalHandlePublication did not reject publication attempt with stale generation (${testId}, gen=${staleGeneration})!`,
     );
   }
 
@@ -1446,7 +1665,7 @@ export async function testNegativeBrokenGenerationalHandlePublication(host, wasm
 
   if (!rejectedZero) {
     throw new Error(
-      `Negative Control Failed: assertGenerationalHandlePublication did not reject publication attempt with generation zero (${testId}, gen=0)!`
+      `Negative Control Failed: assertGenerationalHandlePublication did not reject publication attempt with generation zero (${testId}, gen=0)!`,
     );
   }
 
@@ -1501,7 +1720,8 @@ export async function testLinearMemoryBorrowGuards(host, wasmModule, wasmMemory)
   const enterFn = wasmModule?.f3d_borrow_enter || wasmModule?.gpu_bridge_borrow_enter;
   const exitFn = wasmModule?.f3d_borrow_exit || wasmModule?.gpu_bridge_borrow_exit;
   const growFn = wasmModule?.f3d_try_grow_memory || wasmModule?.gpu_bridge_try_grow_memory;
-  const buildTriangleFn = wasmModule?.f3d_build_first_frame_packet || wasmModule?.gpu_bridge_build_triangle_packet;
+  const buildTriangleFn =
+    wasmModule?.f3d_build_first_frame_packet || wasmModule?.gpu_bridge_build_triangle_packet;
 
   if (
     !wasmModule ||
@@ -1511,7 +1731,7 @@ export async function testLinearMemoryBorrowGuards(host, wasmModule, wasmMemory)
     typeof buildTriangleFn !== "function"
   ) {
     throw new Error(
-      "Missing Wasm Export: testLinearMemoryBorrowGuards requires compiled application Wasm with exports 'gpu_bridge_borrow_enter', 'gpu_bridge_borrow_exit', 'gpu_bridge_try_grow_memory', and 'gpu_bridge_build_triangle_packet' (or canonical aliases). Silent JS fallback is forbidden."
+      "Missing Wasm Export: testLinearMemoryBorrowGuards requires compiled application Wasm with exports 'gpu_bridge_borrow_enter', 'gpu_bridge_borrow_exit', 'gpu_bridge_try_grow_memory', and 'gpu_bridge_build_triangle_packet' (or canonical aliases). Silent JS fallback is forbidden.",
     );
   }
 
@@ -1520,7 +1740,7 @@ export async function testLinearMemoryBorrowGuards(host, wasmModule, wasmMemory)
   const memory = wasmMemory || wasmModule?.memory;
   if (!memory || !(memory instanceof WebAssembly.Memory) || typeof memory.grow !== "function") {
     throw new Error(
-      "Missing WebAssembly.Memory: testLinearMemoryBorrowGuards strictly requires the WebAssembly.Memory instance captured from await wasm.default(). Optional or missing memory fallbacks are forbidden."
+      "Missing WebAssembly.Memory: testLinearMemoryBorrowGuards strictly requires the WebAssembly.Memory instance captured from await wasm.default(). Optional or missing memory fallbacks are forbidden.",
     );
   }
 
@@ -1529,7 +1749,7 @@ export async function testLinearMemoryBorrowGuards(host, wasmModule, wasmMemory)
   const idleGrow = growFn(1);
   if (idleGrow !== true) {
     throw new Error(
-      "Positive Control Failed: Expected try_grow_memory(1) to return true while idle!"
+      "Positive Control Failed: Expected try_grow_memory(1) to return true while idle!",
     );
   }
   assertMemoryGrowthAllowed(growFn, 1);
@@ -1538,7 +1758,7 @@ export async function testLinearMemoryBorrowGuards(host, wasmModule, wasmMemory)
   const token = enterFn();
   if (typeof token !== "bigint" || token === 0n) {
     throw new Error(
-      `Positive Control Failed: Expected borrow_enter() to return non-zero BigInt BorrowToken (wasm-bindgen u64), got ${typeof token} (${token})!`
+      `Positive Control Failed: Expected borrow_enter() to return non-zero BigInt BorrowToken (wasm-bindgen u64), got ${typeof token} (${token})!`,
     );
   }
 
@@ -1548,7 +1768,7 @@ export async function testLinearMemoryBorrowGuards(host, wasmModule, wasmMemory)
     // Clean up borrow before throwing
     exitFn(token);
     throw new Error(
-      "Safety Hazard: Expected try_grow_memory(1) to return false while an active borrow is held!"
+      "Safety Hazard: Expected try_grow_memory(1) to return false while an active borrow is held!",
     );
   }
 
@@ -1558,7 +1778,7 @@ export async function testLinearMemoryBorrowGuards(host, wasmModule, wasmMemory)
   if (wrongExit !== false) {
     exitFn(token);
     throw new Error(
-      "Token Security Failed: Expected borrow_exit with wrong token to return false!"
+      "Token Security Failed: Expected borrow_exit with wrong token to return false!",
     );
   }
 
@@ -1566,7 +1786,7 @@ export async function testLinearMemoryBorrowGuards(host, wasmModule, wasmMemory)
   const rightExit = exitFn(token);
   if (rightExit !== true) {
     throw new Error(
-      "Positive Control Failed: Expected borrow_exit with valid token to return true!"
+      "Positive Control Failed: Expected borrow_exit with valid token to return true!",
     );
   }
 
@@ -1574,7 +1794,7 @@ export async function testLinearMemoryBorrowGuards(host, wasmModule, wasmMemory)
   const postExitGrow = growFn(1);
   if (postExitGrow !== true) {
     throw new Error(
-      "Positive Control Failed: Expected try_grow_memory(1) to return true after borrow scope exit!"
+      "Positive Control Failed: Expected try_grow_memory(1) to return true after borrow scope exit!",
     );
   }
   assertMemoryGrowthAllowed(growFn, 1);
@@ -1593,7 +1813,7 @@ export async function testLinearMemoryBorrowGuards(host, wasmModule, wasmMemory)
   const preGrowthPacket = buildTriangleFn();
   if (!(preGrowthPacket instanceof Uint8Array) || preGrowthPacket.byteLength < 32) {
     throw new Error(
-      `Pre-growth packet invalid: expected Uint8Array with length >= 32, got ${preGrowthPacket?.constructor?.name} (len=${preGrowthPacket?.byteLength})`
+      `Pre-growth packet invalid: expected Uint8Array with length >= 32, got ${preGrowthPacket?.constructor?.name} (len=${preGrowthPacket?.byteLength})`,
     );
   }
 
@@ -1613,7 +1833,7 @@ export async function testLinearMemoryBorrowGuards(host, wasmModule, wasmMemory)
 
   if (newBytes !== initialBytes + 65536) {
     throw new Error(
-      `Real Memory Growth Failed: Expected buffer byteLength to increase by 65536, got from ${initialBytes} to ${newBytes}`
+      `Real Memory Growth Failed: Expected buffer byteLength to increase by 65536, got from ${initialBytes} to ${newBytes}`,
     );
   }
 
@@ -1625,20 +1845,20 @@ export async function testLinearMemoryBorrowGuards(host, wasmModule, wasmMemory)
 
   if (!isDetachedOrChanged) {
     throw new Error(
-      "Transport Invariant Failed: WebAssembly.Memory.grow(1) did not invalidate previous ArrayBuffer/view reference!"
+      "Transport Invariant Failed: WebAssembly.Memory.grow(1) did not invalidate previous ArrayBuffer/view reference!",
     );
   }
 
   // D. Verify pre-growth owned packet remains completely intact and uncorrupted
   if (preGrowthPacket.byteLength !== preGrowthSnapshot.byteLength) {
     throw new Error(
-      `Owned Copy Invariant Failed: Pre-growth owned packet length changed across memory.grow() (expected ${preGrowthSnapshot.byteLength}, got ${preGrowthPacket.byteLength})`
+      `Owned Copy Invariant Failed: Pre-growth owned packet length changed across memory.grow() (expected ${preGrowthSnapshot.byteLength}, got ${preGrowthPacket.byteLength})`,
     );
   }
   for (let i = 0; i < preGrowthSnapshot.length; i++) {
     if (preGrowthPacket[i] !== preGrowthSnapshot[i]) {
       throw new Error(
-        `Owned Copy Invariant Failed: Pre-growth owned packet byte corrupted at index ${i} across memory.grow() (expected ${preGrowthSnapshot[i]}, got ${preGrowthPacket[i]})`
+        `Owned Copy Invariant Failed: Pre-growth owned packet byte corrupted at index ${i} across memory.grow() (expected ${preGrowthSnapshot[i]}, got ${preGrowthPacket[i]})`,
       );
     }
   }
@@ -1648,18 +1868,18 @@ export async function testLinearMemoryBorrowGuards(host, wasmModule, wasmMemory)
   const postGrowthPacket = buildTriangleFn();
   if (!(postGrowthPacket instanceof Uint8Array)) {
     throw new Error(
-      `Post-growth packet invalid: expected Uint8Array, got ${postGrowthPacket?.constructor?.name}`
+      `Post-growth packet invalid: expected Uint8Array, got ${postGrowthPacket?.constructor?.name}`,
     );
   }
   if (postGrowthPacket.byteLength !== preGrowthSnapshot.byteLength) {
     throw new Error(
-      `Cached View Refresh Failed: Post-growth packet byteLength mismatch (expected ${preGrowthSnapshot.byteLength}, got ${postGrowthPacket.byteLength})`
+      `Cached View Refresh Failed: Post-growth packet byteLength mismatch (expected ${preGrowthSnapshot.byteLength}, got ${postGrowthPacket.byteLength})`,
     );
   }
   for (let i = 0; i < preGrowthSnapshot.length; i++) {
     if (postGrowthPacket[i] !== preGrowthSnapshot[i]) {
       throw new Error(
-        `Cached View Refresh Failed: Post-growth packet byte mismatch at index ${i} (expected ${preGrowthSnapshot[i]}, got ${postGrowthPacket[i]})`
+        `Cached View Refresh Failed: Post-growth packet byte mismatch at index ${i} (expected ${preGrowthSnapshot[i]}, got ${postGrowthPacket[i]})`,
       );
     }
   }
@@ -1668,7 +1888,7 @@ export async function testLinearMemoryBorrowGuards(host, wasmModule, wasmMemory)
   const reentryToken = enterFn();
   if (typeof reentryToken !== "bigint" || reentryToken === 0n) {
     throw new Error(
-      `Reentry Failed: Expected borrow_enter() after growth to return non-zero BigInt token, got ${typeof reentryToken}`
+      `Reentry Failed: Expected borrow_enter() after growth to return non-zero BigInt token, got ${typeof reentryToken}`,
     );
   }
   // While reentered into borrow, verify growth is blocked
@@ -1676,14 +1896,14 @@ export async function testLinearMemoryBorrowGuards(host, wasmModule, wasmMemory)
   if (!reentryGrowBlocked) {
     exitFn(reentryToken);
     throw new Error(
-      "Reentry Safety Failed: Expected try_grow_memory(1) to be blocked during reentered borrow!"
+      "Reentry Safety Failed: Expected try_grow_memory(1) to be blocked during reentered borrow!",
     );
   }
   // Exit the reentered borrow cleanly
   const reentryExitOk = exitFn(reentryToken);
   if (!reentryExitOk) {
     throw new Error(
-      "Reentry Safety Failed: Expected borrow_exit(reentryToken) to succeed after reentered borrow!"
+      "Reentry Safety Failed: Expected borrow_exit(reentryToken) to succeed after reentered borrow!",
     );
   }
 
@@ -1691,7 +1911,7 @@ export async function testLinearMemoryBorrowGuards(host, wasmModule, wasmMemory)
   for (let i = 0; i < preGrowthSnapshot.length; i++) {
     if (preGrowthPacket[i] !== preGrowthSnapshot[i]) {
       throw new Error(
-        `Reentry Invariant Failed: Pre-growth owned packet byte corrupted at index ${i} across Rust callback reentry`
+        `Reentry Invariant Failed: Pre-growth owned packet byte corrupted at index ${i} across Rust callback reentry`,
       );
     }
   }
@@ -1720,9 +1940,14 @@ export async function testNegativeBrokenLinearMemoryBorrowGuard(host, wasmModule
   const exitFn = wasmModule?.f3d_borrow_exit || wasmModule?.gpu_bridge_borrow_exit;
   const growFn = wasmModule?.f3d_try_grow_memory || wasmModule?.gpu_bridge_try_grow_memory;
 
-  if (!wasmModule || typeof enterFn !== "function" || typeof exitFn !== "function" || typeof growFn !== "function") {
+  if (
+    !wasmModule ||
+    typeof enterFn !== "function" ||
+    typeof exitFn !== "function" ||
+    typeof growFn !== "function"
+  ) {
     throw new Error(
-      "Missing Wasm Export: testNegativeBrokenLinearMemoryBorrowGuard requires 'gpu_bridge_borrow_enter' / 'gpu_bridge_try_grow_memory'."
+      "Missing Wasm Export: testNegativeBrokenLinearMemoryBorrowGuard requires 'gpu_bridge_borrow_enter' / 'gpu_bridge_try_grow_memory'.",
     );
   }
 
@@ -1730,7 +1955,7 @@ export async function testNegativeBrokenLinearMemoryBorrowGuard(host, wasmModule
   const token = enterFn();
   if (typeof token !== "bigint" || token === 0n) {
     throw new Error(
-      `Broken Control Setup Failed: borrow_enter did not return valid non-zero BigInt token (got ${typeof token} ${token})`
+      `Broken Control Setup Failed: borrow_enter did not return valid non-zero BigInt token (got ${typeof token} ${token})`,
     );
   }
 
@@ -1750,13 +1975,14 @@ export async function testNegativeBrokenLinearMemoryBorrowGuard(host, wasmModule
 
   if (!rejected) {
     throw new Error(
-      "Negative Control Failed: assertMemoryGrowthAllowed did not reject memory growth attempt inside open borrow scope!"
+      "Negative Control Failed: assertMemoryGrowthAllowed did not reject memory growth attempt inside open borrow scope!",
     );
   }
 
   return {
     behavior: "growth_during_borrow_rejected",
-    detail: "Linear memory growth during open borrow scope was strictly rejected by assertMemoryGrowthAllowed.",
+    detail:
+      "Linear memory growth during open borrow scope was strictly rejected by assertMemoryGrowthAllowed.",
   };
 }
 
@@ -1808,11 +2034,12 @@ export async function testNegativeBrokenLinearMemoryBorrowGuard(host, wasmModule
  * asserting that the packet path refuses before any GPU submission occurs.
  */
 export async function testAffineRowsGpuLayoutValidation(host, wasmModule) {
-  const validateFn = wasmModule?.f3d_validate_affine_rows || wasmModule?.gpu_bridge_validate_affine_rows;
+  const validateFn =
+    wasmModule?.f3d_validate_affine_rows || wasmModule?.gpu_bridge_validate_affine_rows;
 
   if (!wasmModule || typeof validateFn !== "function") {
     throw new Error(
-      "Missing Wasm Export: testAffineRowsGpuLayoutValidation requires compiled application Wasm with export 'gpu_bridge_validate_affine_rows' (or alias 'f3d_validate_affine_rows'). Silent JS fallback is forbidden."
+      "Missing Wasm Export: testAffineRowsGpuLayoutValidation requires compiled application Wasm with export 'gpu_bridge_validate_affine_rows' (or alias 'f3d_validate_affine_rows'). Silent JS fallback is forbidden.",
     );
   }
 
@@ -1828,7 +2055,7 @@ export async function testAffineRowsGpuLayoutValidation(host, wasmModule) {
   const code0 = validateFn(identityBytes);
   if (code0 !== 0) {
     throw new Error(
-      `Positive Control Failed: Expected validate_affine_rows(identity) to return 0, got ${code0}!`
+      `Positive Control Failed: Expected validate_affine_rows(identity) to return 0, got ${code0}!`,
     );
   }
   assertAffineRowsLayoutValid(validateFn, identityBytes);
@@ -1841,14 +2068,14 @@ export async function testAffineRowsGpuLayoutValidation(host, wasmModule) {
   v64Floats[5] = 1.0;
   v64Floats[10] = 1.0;
   v64Floats[15] = 1.0;
-  v64Floats[12] = 12.5;  // tx
-  v64Floats[13] = -4.0;  // ty
+  v64Floats[12] = 12.5; // tx
+  v64Floats[13] = -4.0; // ty
   v64Floats[14] = 100.0; // tz
 
   const code0Trans = validateFn(valid64TransBytes);
   if (code0Trans !== 0) {
     throw new Error(
-      `Positive Control Failed: Expected validate_affine_rows(64-byte translated matrix) to return 0, got ${code0Trans}!`
+      `Positive Control Failed: Expected validate_affine_rows(64-byte translated matrix) to return 0, got ${code0Trans}!`,
     );
   }
   assertAffineRowsLayoutValid(validateFn, valid64TransBytes);
@@ -1866,7 +2093,7 @@ export async function testAffineRowsGpuLayoutValidation(host, wasmModule) {
   const code2 = validateFn(nonAffineBytes);
   if (code2 !== 2) {
     throw new Error(
-      `Non-Affine Rejection Failed: Expected validate_affine_rows(nonAffine) to return 2 (NON_AFFINE_MATRIX), got ${code2}!`
+      `Non-Affine Rejection Failed: Expected validate_affine_rows(nonAffine) to return 2 (NON_AFFINE_MATRIX), got ${code2}!`,
     );
   }
 
@@ -1875,17 +2102,17 @@ export async function testAffineRowsGpuLayoutValidation(host, wasmModule) {
   // Translation is at floats 3, 7, 11.
   const valid48TransBytes = new Uint8Array(48);
   const v48Floats = new Float32Array(valid48TransBytes.buffer);
-  v48Floats[0] = 1.0;  // m00
-  v48Floats[5] = 1.0;  // m11
+  v48Floats[0] = 1.0; // m00
+  v48Floats[5] = 1.0; // m11
   v48Floats[10] = 1.0; // m22
-  v48Floats[3] = 12.5;  // tx
-  v48Floats[7] = -4.0;  // ty
+  v48Floats[3] = 12.5; // tx
+  v48Floats[7] = -4.0; // ty
   v48Floats[11] = 100.0; // tz
 
   const code0AffineTrans = validateFn(valid48TransBytes);
   if (code0AffineTrans !== 0) {
     throw new Error(
-      `Positive Control Failed: Expected validate_affine_rows(48-byte translated AffineRows) to return 0, got ${code0AffineTrans}!`
+      `Positive Control Failed: Expected validate_affine_rows(48-byte translated AffineRows) to return 0, got ${code0AffineTrans}!`,
     );
   }
   assertAffineRowsLayoutValid(validateFn, valid48TransBytes);
@@ -1904,7 +2131,7 @@ export async function testAffineRowsGpuLayoutValidation(host, wasmModule) {
   const code2AffineNan = validateFn(nan48Bytes);
   if (code2AffineNan !== 2) {
     throw new Error(
-      `Non-Affine Rejection Failed: Expected validate_affine_rows(48-byte NaN translation) to return 2 (NON_AFFINE_MATRIX), got ${code2AffineNan}!`
+      `Non-Affine Rejection Failed: Expected validate_affine_rows(48-byte NaN translation) to return 2 (NON_AFFINE_MATRIX), got ${code2AffineNan}!`,
     );
   }
 
@@ -1913,7 +2140,7 @@ export async function testAffineRowsGpuLayoutValidation(host, wasmModule) {
   const code1Small = validateFn(smallBytes);
   if (code1Small !== 1) {
     throw new Error(
-      `Buffer Size Rejection Failed: Expected validate_affine_rows(47-byte) to return 1 (BUFFER_TOO_SMALL), got ${code1Small}!`
+      `Buffer Size Rejection Failed: Expected validate_affine_rows(47-byte) to return 1 (BUFFER_TOO_SMALL), got ${code1Small}!`,
     );
   }
 
@@ -1922,7 +2149,7 @@ export async function testAffineRowsGpuLayoutValidation(host, wasmModule) {
   const code1Mid = validateFn(midLenBytes);
   if (code1Mid !== 1) {
     throw new Error(
-      `Buffer Size Rejection Failed: Expected validate_affine_rows(56-byte) to return 1 (BUFFER_TOO_SMALL), got ${code1Mid}!`
+      `Buffer Size Rejection Failed: Expected validate_affine_rows(56-byte) to return 1 (BUFFER_TOO_SMALL), got ${code1Mid}!`,
     );
   }
 
@@ -1931,13 +2158,15 @@ export async function testAffineRowsGpuLayoutValidation(host, wasmModule) {
   const code4Oversized = validateFn(oversizedBytes);
   if (code4Oversized !== 4) {
     throw new Error(
-      `Buffer Size Rejection Failed: Expected validate_affine_rows(72-byte) to return 4 (INCOMPATIBLE_TARGET), got ${code4Oversized}!`
+      `Buffer Size Rejection Failed: Expected validate_affine_rows(72-byte) to return 4 (INCOMPATIBLE_TARGET), got ${code4Oversized}!`,
     );
   }
 
   // 9. Authoritative Browser Execution: Real AffineRows Transform Packet & WGSL Evaluation
   // Calls Chartreuse's export gpu_bridge_build_affine_rows_transform_packet (§6.1, §6.2, vqa.6)
-  const buildAffineTransformFn = wasmModule?.f3d_build_affine_rows_transform_packet || wasmModule?.gpu_bridge_build_affine_rows_transform_packet;
+  const buildAffineTransformFn =
+    wasmModule?.f3d_build_affine_rows_transform_packet ||
+    wasmModule?.gpu_bridge_build_affine_rows_transform_packet;
   let transformReadbackResult = null;
 
   if (typeof buildAffineTransformFn === "function") {
@@ -1957,7 +2186,12 @@ export async function testAffineRowsGpuLayoutValidation(host, wasmModule) {
     transformReadbackResult = {
       verified: true,
       center_48_32: [pixels[c48_32], pixels[c48_32 + 1], pixels[c48_32 + 2], pixels[c48_32 + 3]],
-      untransformed_32_32: [pixels[c32_32], pixels[c32_32 + 1], pixels[c32_32 + 2], pixels[c32_32 + 3]],
+      untransformed_32_32: [
+        pixels[c32_32],
+        pixels[c32_32 + 1],
+        pixels[c32_32 + 2],
+        pixels[c32_32 + 3],
+      ],
     };
   }
 
@@ -1978,11 +2212,12 @@ export async function testAffineRowsGpuLayoutValidation(host, wasmModule) {
 }
 
 export async function testNegativeBrokenAffineRowsGpuPacketRejection(host, wasmModule) {
-  const validateFn = wasmModule?.f3d_validate_affine_rows || wasmModule?.gpu_bridge_validate_affine_rows;
+  const validateFn =
+    wasmModule?.f3d_validate_affine_rows || wasmModule?.gpu_bridge_validate_affine_rows;
 
   if (!wasmModule || typeof validateFn !== "function") {
     throw new Error(
-      "Missing Wasm Export: testNegativeBrokenAffineRowsGpuPacketRejection requires 'gpu_bridge_validate_affine_rows'."
+      "Missing Wasm Export: testNegativeBrokenAffineRowsGpuPacketRejection requires 'gpu_bridge_validate_affine_rows'.",
     );
   }
 
@@ -2019,19 +2254,21 @@ export async function testNegativeBrokenAffineRowsGpuPacketRejection(host, wasmM
 
   if (submissionAttempted) {
     throw new Error(
-      "Negative Control Failed: Corrupt non-affine transform bypassed validator gate and attempted GPU submission!"
+      "Negative Control Failed: Corrupt non-affine transform bypassed validator gate and attempted GPU submission!",
     );
   }
 
   if (!validatorRejected) {
     throw new Error(
-      "Negative Control Failed: assertAffineRowsLayoutValid did not reject non-affine matrix before GPU submission!"
+      "Negative Control Failed: assertAffineRowsLayoutValid did not reject non-affine matrix before GPU submission!",
     );
   }
 
   // GPU broken transform control: An untransformed triangle (or identity AffineRows without +0.5 translation)
   // renders at (32, 32) instead of (48, 32). The EXACT SAME assertAffineRowsTransformMatch MUST reject it!
-  const buildAffineTransformFn = wasmModule?.f3d_build_affine_rows_transform_packet || wasmModule?.gpu_bridge_build_affine_rows_transform_packet;
+  const buildAffineTransformFn =
+    wasmModule?.f3d_build_affine_rows_transform_packet ||
+    wasmModule?.gpu_bridge_build_affine_rows_transform_packet;
   let transformControlRejected = false;
   if (typeof buildAffineTransformFn === "function") {
     // A 64x64 buffer with center untransformed (32, 32) Green and (48, 32) Black
@@ -2053,7 +2290,7 @@ export async function testNegativeBrokenAffineRowsGpuPacketRejection(host, wasmM
 
     if (!transformControlRejected) {
       throw new Error(
-        "Negative Control Failed: assertAffineRowsTransformMatch did not reject untransformed/corrupt transform output!"
+        "Negative Control Failed: assertAffineRowsTransformMatch did not reject untransformed/corrupt transform output!",
       );
     }
   }
@@ -2061,7 +2298,8 @@ export async function testNegativeBrokenAffineRowsGpuPacketRejection(host, wasmM
   return {
     behavior: "non_affine_gpu_submission_refused",
     transformControlRejected: transformControlRejected || "validator_gate_intercepted",
-    detail: "Validator gate intercepted non-affine matrix (code 2) and refused packet upload before any GPU submission was encoded.",
+    detail:
+      "Validator gate intercepted non-affine matrix (code 2) and refused packet upload before any GPU submission was encoded.",
   };
 }
 
@@ -2087,11 +2325,12 @@ export async function testNegativeBrokenAffineRowsGpuPacketRejection(host, wasmM
  * assertion rejects it.
  */
 export async function testNestedPassProtocol(host, wasmModule, width = 64, height = 64) {
-  const buildNestedPassFn = wasmModule?.f3d_build_nested_pass_packet || wasmModule?.gpu_bridge_build_nested_pass_packet;
+  const buildNestedPassFn =
+    wasmModule?.f3d_build_nested_pass_packet || wasmModule?.gpu_bridge_build_nested_pass_packet;
 
   if (!wasmModule || typeof buildNestedPassFn !== "function") {
     throw new Error(
-      "Missing Wasm Export: testNestedPassProtocol requires compiled application Wasm with export 'gpu_bridge_build_nested_pass_packet' (or canonical alias 'f3d_build_nested_pass_packet'). Silent JS fallback is forbidden."
+      "Missing Wasm Export: testNestedPassProtocol requires compiled application Wasm with export 'gpu_bridge_build_nested_pass_packet' (or canonical alias 'f3d_build_nested_pass_packet'). Silent JS fallback is forbidden.",
     );
   }
 
@@ -2108,7 +2347,7 @@ export async function testNestedPassProtocol(host, wasmModule, width = 64, heigh
   const readbackBuffer = host.buffers.get(20);
   if (!readbackBuffer) {
     throw new Error(
-      "testNestedPassProtocol: expected readback buffer 20 to be registered and populated on host"
+      "testNestedPassProtocol: expected readback buffer 20 to be registered and populated on host",
     );
   }
 
@@ -2121,13 +2360,20 @@ export async function testNestedPassProtocol(host, wasmModule, width = 64, heigh
     status: "PASS",
     oraclePixels,
     candidatePixels,
-    detail: "Verified via real Rust nested pass packet vs independent direct-JS oracle (Red at 24,32 preserved via loadOp load, Blue at 56,32, Black at 2,2).",
+    detail:
+      "Verified via real Rust nested pass packet vs independent direct-JS oracle (Red at 24,32 preserved via loadOp load, Blue at 56,32, Black at 2,2).",
   };
 }
 
-export async function testNegativeBrokenNestedPass(host, oraclePixels = null, width = 64, height = 64) {
+export async function testNegativeBrokenNestedPass(
+  host,
+  oraclePixels = null,
+  width = 64,
+  height = 64,
+) {
   // If oraclePixels was not passed from positive path, run direct oracle to get authoritative reference
-  const referencePixels = oraclePixels || (await renderDirectNestedPassReference(host.device, width, height));
+  const referencePixels =
+    oraclePixels || (await renderDirectNestedPassReference(host.device, width, height));
 
   // Broken control: Resume pass on target 10 issues loadOp clear, wiping out the Red prefix pass
   const brokenPixels = await renderDirectBrokenNestedPass(host.device, width, height);
@@ -2140,8 +2386,8 @@ export async function testNegativeBrokenNestedPass(host, oraclePixels = null, wi
     if (
       err.message &&
       (err.message.includes("Nested Pass sample violation") ||
-       err.message.includes("assertNestedPassMatch") ||
-       err.message.includes("mismatched bytes"))
+        err.message.includes("assertNestedPassMatch") ||
+        err.message.includes("mismatched bytes"))
     ) {
       rejected = true;
     }
@@ -2149,13 +2395,14 @@ export async function testNegativeBrokenNestedPass(host, oraclePixels = null, wi
 
   if (!rejected) {
     throw new Error(
-      "Negative Control Failed: assertNestedPassMatch did not reject broken nested pass using loadOp clear on resume!"
+      "Negative Control Failed: assertNestedPassMatch did not reject broken nested pass using loadOp clear on resume!",
     );
   }
 
   return {
     behavior: "load_op_clear_resume_rejected",
-    detail: "Broken nested pass using loadOp clear on resume instead of loadOp load was strictly rejected by assertNestedPassMatch (red prefix pass cleared to black).",
+    detail:
+      "Broken nested pass using loadOp clear on resume instead of loadOp load was strictly rejected by assertNestedPassMatch (red prefix pass cleared to black).",
   };
 }
 
@@ -2181,10 +2428,15 @@ async function executeNestedCanvasReadback(host, packet, canvasContext, width, h
   const format = navigator.gpu.getPreferredCanvasFormat();
   const bytesPerRow = computeAlignedBytesPerRow(width);
   const size = bytesPerRow * height;
-  const buffer = device.createBuffer({ size, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  const buffer = device.createBuffer({
+    size,
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+  });
   try {
     canvasContext.configure({
-      device, format, alphaMode: "premultiplied",
+      device,
+      format,
+      alphaMode: "premultiplied",
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
     });
     const executed = host.executePacket(packet, canvasContext);
@@ -2193,7 +2445,8 @@ async function executeNestedCanvasReadback(host, packet, canvasContext, width, h
       const encoder = device.createCommandEncoder();
       encoder.copyTextureToBuffer(
         { texture: canvasContext.getCurrentTexture() },
-        { buffer, bytesPerRow }, [width, height, 1],
+        { buffer, bytesPerRow },
+        [width, height, 1],
       );
       device.queue.submit([encoder.finish()]);
     });
@@ -2213,12 +2466,20 @@ async function executeNestedCanvasReadback(host, packet, canvasContext, width, h
   }
 }
 
-export async function testNestedCanvasPassProtocol(host, wasmModule, width = 64, height = 64, canvasContext = null) {
-  const buildNestedCanvasPassFn = wasmModule?.f3d_build_nested_canvas_pass_packet || wasmModule?.gpu_bridge_build_nested_canvas_pass_packet;
+export async function testNestedCanvasPassProtocol(
+  host,
+  wasmModule,
+  width = 64,
+  height = 64,
+  canvasContext = null,
+) {
+  const buildNestedCanvasPassFn =
+    wasmModule?.f3d_build_nested_canvas_pass_packet ||
+    wasmModule?.gpu_bridge_build_nested_canvas_pass_packet;
 
   if (!wasmModule || typeof buildNestedCanvasPassFn !== "function") {
     throw new Error(
-      "Missing Wasm Export: testNestedCanvasPassProtocol requires compiled application Wasm with export 'gpu_bridge_build_nested_canvas_pass_packet' (or canonical alias 'f3d_build_nested_canvas_pass_packet'). Silent JS fallback is forbidden."
+      "Missing Wasm Export: testNestedCanvasPassProtocol requires compiled application Wasm with export 'gpu_bridge_build_nested_canvas_pass_packet' (or canonical alias 'f3d_build_nested_canvas_pass_packet'). Silent JS fallback is forbidden.",
     );
   }
 
@@ -2245,7 +2506,13 @@ export async function testNestedCanvasPassProtocol(host, wasmModule, width = 64,
   // synchronously inside withErrorScopes(["validation", "out-of-memory"]).
   // Any WebGPU validation error causes executePacket to throw.
   const packet = buildNestedCanvasPassFn();
-  const canvasPixels = await executeNestedCanvasReadback(host, packet, activeCanvasContext, width, height);
+  const canvasPixels = await executeNestedCanvasReadback(
+    host,
+    packet,
+    activeCanvasContext,
+    width,
+    height,
+  );
   assertNestedPassMatch(canvasPixels, canvasOraclePixels, width, height);
 
   // 4. Read back target 11 from buffer 20
@@ -2254,7 +2521,7 @@ export async function testNestedCanvasPassProtocol(host, wasmModule, width = 64,
   const readbackBuffer = host.buffers.get(20);
   if (!readbackBuffer) {
     throw new Error(
-      "testNestedCanvasPassProtocol: expected readback buffer 20 to be registered and populated on host"
+      "testNestedCanvasPassProtocol: expected readback buffer 20 to be registered and populated on host",
     );
   }
 
@@ -2269,11 +2536,19 @@ export async function testNestedCanvasPassProtocol(host, wasmModule, width = 64,
     candidatePixels,
     canvasOraclePixels,
     canvasPixels,
-    detail: "Rust FrameSession packet: actual canvas is byte-identical to independent red/blue reference; target 11 is byte-identical to independent green/black reference; native GPU error scopes clean.",
+    detail:
+      "Rust FrameSession packet: actual canvas is byte-identical to independent red/blue reference; target 11 is byte-identical to independent green/black reference; native GPU error scopes clean.",
   };
 }
 
-export async function testNegativeBrokenNestedCanvasPass(host, wasmModule, oraclePixels = null, width = 64, height = 64, canvasContext = null) {
+export async function testNegativeBrokenNestedCanvasPass(
+  host,
+  wasmModule,
+  oraclePixels = null,
+  width = 64,
+  height = 64,
+  canvasContext = null,
+) {
   // 1. Missing-export rejection control: Calling with missing export strictly fails
   let missingExportRejected = false;
   try {
@@ -2285,12 +2560,14 @@ export async function testNegativeBrokenNestedCanvasPass(host, wasmModule, oracl
   }
   if (!missingExportRejected) {
     throw new Error(
-      "Negative Control Failed: testNestedCanvasPassProtocol did not reject missing Wasm export!"
+      "Negative Control Failed: testNestedCanvasPassProtocol did not reject missing Wasm export!",
     );
   }
 
   // 2. Change the actual Rust packet's resumed canvas load operation, then render it.
-  const build = wasmModule.f3d_build_nested_canvas_pass_packet || wasmModule.gpu_bridge_build_nested_canvas_pass_packet;
+  const build =
+    wasmModule.f3d_build_nested_canvas_pass_packet ||
+    wasmModule.gpu_bridge_build_nested_canvas_pass_packet;
   const brokenPacket = build().slice();
   const view = new DataView(brokenPacket.buffer, brokenPacket.byteOffset, brokenPacket.byteLength);
   const fieldSizes = { 1: 12, 2: 16, 3: 32, 4: 44, 5: 24, 6: 20 };
@@ -2310,8 +2587,15 @@ export async function testNegativeBrokenNestedCanvasPass(host, wasmModule, oracl
     cursor += fieldSizes[opcode];
   }
   if (mutations !== 1) throw new Error(`Expected one resumed canvas pass, found ${mutations}`);
-  const referencePixels = oraclePixels || (await renderDirectNestedPassReference(host.device, width, height));
-  const brokenPixels = await executeNestedCanvasReadback(host, brokenPacket, canvasContext, width, height);
+  const referencePixels =
+    oraclePixels || (await renderDirectNestedPassReference(host.device, width, height));
+  const brokenPixels = await executeNestedCanvasReadback(
+    host,
+    brokenPacket,
+    canvasContext,
+    width,
+    height,
+  );
 
   let comparisonRejected = false;
   try {
@@ -2320,15 +2604,15 @@ export async function testNegativeBrokenNestedCanvasPass(host, wasmModule, oracl
     if (
       err.message &&
       (err.message.includes("mismatched bytes") ||
-       err.message.includes("Nested Pass sample violation") ||
-       err.message.includes("assertNestedPassMatch"))
+        err.message.includes("Nested Pass sample violation") ||
+        err.message.includes("assertNestedPassMatch"))
     ) {
       comparisonRejected = true;
     }
   }
   if (!comparisonRejected) {
     throw new Error(
-      "Negative Control Failed: canvas comparison did not reject a real clear-on-resume mutation!"
+      "Negative Control Failed: canvas comparison did not reject a real clear-on-resume mutation!",
     );
   }
 
@@ -2336,6 +2620,7 @@ export async function testNegativeBrokenNestedCanvasPass(host, wasmModule, oracl
     behavior: "gpu_canvas_clear_on_resume_and_missing_export_rejected",
     missingExportRejected,
     comparisonRejected,
-    detail: "Missing Wasm export rejected; a real canvas load-to-clear packet mutation rendered and failed the same independent image assertion.",
+    detail:
+      "Missing Wasm export rejected; a real canvas load-to-clear packet mutation rendered and failed the same independent image assertion.",
   };
 }

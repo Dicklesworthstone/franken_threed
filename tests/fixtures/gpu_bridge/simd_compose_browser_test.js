@@ -44,24 +44,68 @@ export function measureTimerResolution(samples = 60) {
 // Covers normal cases and all required special values
 const SAMPLE_ITEMS = [
   // 0: Identity / unit normal
-  [[0, 0, 0], [0, 0, 0, 1], [1, 1, 1]],
+  [
+    [0, 0, 0],
+    [0, 0, 0, 1],
+    [1, 1, 1],
+  ],
   // 1: General rotation and translation
-  [[1.5, -2.0, 3.25], [0, 0.7071067811865475, 0, 0.7071067811865476], [2, 3, 0.5]],
+  [
+    [1.5, -2.0, 3.25],
+    [0, 0.7071067811865475, 0, 0.7071067811865476],
+    [2, 3, 0.5],
+  ],
   // 2: Signed zero (-0.0) in position, quaternion, and scale
-  [[-0.0, 0.0, -0.0], [0.0, -0.0, 0.0, 1.0], [1.0, -0.0, 2.0]],
+  [
+    [-0.0, 0.0, -0.0],
+    [0.0, -0.0, 0.0, 1.0],
+    [1.0, -0.0, 2.0],
+  ],
   // 3: Quiet NaN (plain NaN) in position, quaternion, scale
-  [[NaN, 1.0, 2.0], [0, NaN, 0, 1], [1, 1, NaN]],
+  [
+    [NaN, 1.0, 2.0],
+    [0, NaN, 0, 1],
+    [1, 1, NaN],
+  ],
   // 4: Positive and negative infinity
-  [[Infinity, -Infinity, 0], [0, 0, 0, 1], [Infinity, 1, -Infinity]],
+  [
+    [Infinity, -Infinity, 0],
+    [0, 0, 0, 1],
+    [Infinity, 1, -Infinity],
+  ],
   // 5: Subnormal floats (5e-324, 1e-315)
-  [[5e-324, -5e-324, 1e-315], [0, 0, 0, 1], [1, 5e-324, 1]],
+  [
+    [5e-324, -5e-324, 1e-315],
+    [0, 0, 0, 1],
+    [1, 5e-324, 1],
+  ],
   // 6: Non-unit quaternions (unnormalized: norm 2, norm 0, arbitrary)
-  [[1, 2, 3], [2, 0, 0, 0], [1, 1, 1]],
-  [[0, 1, 0], [1, 1, 1, 1], [2, 2, 2]],
-  [[-1, 0, 1], [0, 0, 0, 0], [1, 1, 1]],
+  [
+    [1, 2, 3],
+    [2, 0, 0, 0],
+    [1, 1, 1],
+  ],
+  [
+    [0, 1, 0],
+    [1, 1, 1, 1],
+    [2, 2, 2],
+  ],
+  [
+    [-1, 0, 1],
+    [0, 0, 0, 0],
+    [1, 1, 1],
+  ],
   // 7: Negative scales (reflections)
-  [[10, 20, 30], [0, 0, 0, 1], [-1, 1, 1]],
-  [[0, 0, 0], [0, 0.3826834, 0, 0.9238795], [-2.5, 3.0, -0.5]],
+  [
+    [10, 20, 30],
+    [0, 0, 0, 1],
+    [-1, 1, 1],
+  ],
+  [
+    [0, 0, 0],
+    [0, 0.3826834, 0, 0.9238795],
+    [-2.5, 3.0, -0.5],
+  ],
 ];
 
 // Finite sample subset for timing: preserves normal items, signed zero,
@@ -104,7 +148,9 @@ export function buildBatchInputs(n, sampleItems = SAMPLE_ITEMS) {
 // Compare scalar vs SIMD outputs element-by-element with exact bit checking
 export function compareOutputsBitwise(scalarOut, simdOut, n) {
   if (scalarOut.length !== n * 16 || simdOut.length !== n * 16) {
-    throw new Error(`Length mismatch: scalar=${scalarOut.length}, simd=${simdOut.length}, expected=${n * 16}`);
+    throw new Error(
+      `Length mismatch: scalar=${scalarOut.length}, simd=${simdOut.length}, expected=${n * 16}`,
+    );
   }
   const sBits = toU64(scalarOut);
   const vBits = toU64(simdOut);
@@ -161,8 +207,13 @@ export function compareOutputsBitwise(scalarOut, simdOut, n) {
 // Tests exact bit parity across required tails, special values, and larger N
 export function testBitParity(wasmExports) {
   const { f3d_batch_compose_scalar, f3d_batch_compose_simd } = wasmExports;
-  if (typeof f3d_batch_compose_scalar !== "function" || typeof f3d_batch_compose_simd !== "function") {
-    throw new Error("Missing required exports: f3d_batch_compose_scalar and/or f3d_batch_compose_simd");
+  if (
+    typeof f3d_batch_compose_scalar !== "function" ||
+    typeof f3d_batch_compose_simd !== "function"
+  ) {
+    throw new Error(
+      "Missing required exports: f3d_batch_compose_scalar and/or f3d_batch_compose_simd",
+    );
   }
 
   // Requested tails: 0, 1, 2, 3, 7, 8, 9; plus larger sizes covering alignment and unrolling
@@ -214,13 +265,26 @@ export function testInvalidLengthErrors(wasmExports) {
 
     let scalarThrew = false;
     let simdThrew = false;
-    try { f3d_batch_compose_scalar(p, q, s); } catch (_) { scalarThrew = true; }
-    try { f3d_batch_compose_simd(p, q, s); } catch (_) { simdThrew = true; }
+    try {
+      f3d_batch_compose_scalar(p, q, s);
+    } catch (_) {
+      scalarThrew = true;
+    }
+    try {
+      f3d_batch_compose_simd(p, q, s);
+    } catch (_) {
+      simdThrew = true;
+    }
 
-    results.push({ name: c.name, scalar_rejected: scalarThrew, simd_rejected: simdThrew, passed: scalarThrew && simdThrew });
+    results.push({
+      name: c.name,
+      scalar_rejected: scalarThrew,
+      simd_rejected: simdThrew,
+      passed: scalarThrew && simdThrew,
+    });
   }
 
-  return { all_passed: results.every(r => r.passed), cases: results };
+  return { all_passed: results.every((r) => r.passed), cases: results };
 }
 
 // Summary stats without speedup, ratio, or crossover wording
@@ -238,7 +302,14 @@ function calcStats(times, timerRes) {
   const stddev = Math.sqrt(variance);
   const uncertainty = Math.max(timerRes, stddev / Math.sqrt(n));
 
-  return { raw_times_ms: times, min_ms: min, max_ms: max, median_ms: median, spread_ms: spread, uncertainty_ms: uncertainty };
+  return {
+    raw_times_ms: times,
+    min_ms: min,
+    max_ms: max,
+    median_ms: median,
+    spread_ms: spread,
+    uncertainty_ms: uncertainty,
+  };
 }
 
 // Single rotated timing loop over batch sizes with warmup and output consumption
@@ -333,7 +404,8 @@ export function testTimings(wasmExports, options = {}) {
 
   return {
     workload: "finite_input_subset",
-    timing_scope: "flat batch boundary call including input/output conversion, not isolated compute kernel",
+    timing_scope:
+      "flat batch boundary call including input/output conversion, not isolated compute kernel",
     all_passed: allBatchesPassed,
     timer_resolution_ms: timerRes,
     batches,
@@ -356,7 +428,8 @@ export async function testSimdComposeBrowser(wasmExports, options = {}) {
     } else {
       timings = {
         workload: "finite_input_subset",
-        timing_scope: "flat batch boundary call including input/output conversion, not isolated compute kernel",
+        timing_scope:
+          "flat batch boundary call including input/output conversion, not isolated compute kernel",
         all_passed: false,
         skipped: true,
         reason: "Timing run skipped because base parity or invalid-length checks failed",
@@ -376,7 +449,8 @@ export async function testSimdComposeBrowser(wasmExports, options = {}) {
     timings,
     timings_executed: timings !== null && !timings.skipped,
     timer_resolution_ms: timerRes,
-    host_environment: typeof navigator !== "undefined" && navigator.userAgent ? navigator.userAgent : "unknown",
+    host_environment:
+      typeof navigator !== "undefined" && navigator.userAgent ? navigator.userAgent : "unknown",
     notes:
       "M4 development evidence only. No M5/iPhone gate, acceleration, or crossover claims. " +
       "Timing scope is flat batch boundary call including input/output conversion, not isolated compute kernel.",

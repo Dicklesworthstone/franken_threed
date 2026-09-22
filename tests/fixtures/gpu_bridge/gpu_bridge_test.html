@@ -18,46 +18,46 @@
   <div id="output" class="status">Running bridge verification suite...</div>
 
   <script type="module">
+    import * as wasmExports from "/pkg/f3d_runtime.js";
     import init, {
       f3d_build_first_frame_packet,
-      f3d_build_red_a_blue_b_packet,
       f3d_build_nested_viewport_scissor_packet,
-      gpu_bridge_build_triangle_packet,
-      gpu_bridge_build_red_blue_packet,
+      f3d_build_red_a_blue_b_packet,
       gpu_bridge_build_nested_viewport_scissor_packet,
+      gpu_bridge_build_red_blue_packet,
+      gpu_bridge_build_triangle_packet,
     } from "/pkg/f3d_runtime.js";
-    import * as wasmExports from "/pkg/f3d_runtime.js";
     import {
-      WebGpuBridgeHost,
       PACKET_MAGIC,
       PACKET_VERSION,
-      TARGET_OFFSCREEN,
       TARGET_CANVAS,
+      TARGET_OFFSCREEN,
+      WebGpuBridgeHost,
     } from "./bridge_runtime.js";
-    import {
-      renderDirectReferenceTriangle,
-      renderDirectReferenceTexturedTriangle,
-      createDirectReferenceRenderer,
-    } from "./direct_reference.js";
-    import { testReadbackIdReuse } from "./readback_lifetime_test.js";
-    import { testPipelineBindingChange } from "./pipeline_binding_test.js";
-    import { testCanvasSubmissionLifetime } from "./canvas_lifetime_test.js";
-    import { testDeviceReplacement } from "./device_lifetime_test.js";
-    import { testViewportScissor } from "./viewport_scissor_test.js";
-    import { testDrawParameters } from "./draw_parameters_test.js";
-    import { testMultisampleResolve } from "./multisample_resolve_test.js";
-    import { testMeshScene, testVisibleCanvasMeshScene, testMeshDepthScene, testMultiMeshBatchScene, testToonMeshScene } from "./mesh_scene_test.js";
-    import { testDepthScene } from "./depth_test.js";
     import { testBufferCopy } from "./buffer_copy_test.js";
-    import { testWorkloadBStorageCopy, testWorkloadBVariants, testWorkloadBMeasurementMode } from "./workload_b_test.js";
-    import { testWorkloadAMeasurementMode, testWorkloadCMeasurementMode, testBorrowedBulkMeasurementMode } from "./workload_ac_measure.js";
-    import { testVariantPreconditions } from "./variant_preconditions.js";
-    import { testTranscendentalBrowser } from "./transcendental_browser_test.js";
-    import { testSimdComposeBrowser } from "./simd_compose_browser_test.js";
+    import { testCanvasSubmissionLifetime } from "./canvas_lifetime_test.js";
     import { testComputeAffine } from "./compute_affine_test.js";
-    import { testBundleResetCounterexample } from "./counterexample_bundle_reset_test.js";
     import { testAffineLayoutCounterexample } from "./counterexample_affine_layout_test.js";
+    import { testBundleResetCounterexample } from "./counterexample_bundle_reset_test.js";
     import { testStaleReadbackCounterexample } from "./counterexample_stale_readback_test.js";
+    import { testDepthScene } from "./depth_test.js";
+    import { testDeviceReplacement } from "./device_lifetime_test.js";
+    import {
+      createDirectReferenceRenderer,
+      renderDirectReferenceTexturedTriangle,
+      renderDirectReferenceTriangle,
+    } from "./direct_reference.js";
+    import { testDrawParameters } from "./draw_parameters_test.js";
+    import { testMeshDepthScene, testMeshScene, testMultiMeshBatchScene, testToonMeshScene, testVisibleCanvasMeshScene } from "./mesh_scene_test.js";
+    import { testMultisampleResolve } from "./multisample_resolve_test.js";
+    import { testPipelineBindingChange } from "./pipeline_binding_test.js";
+    import { testReadbackIdReuse } from "./readback_lifetime_test.js";
+    import { testSimdComposeBrowser } from "./simd_compose_browser_test.js";
+    import { testTranscendentalBrowser } from "./transcendental_browser_test.js";
+    import { testVariantPreconditions } from "./variant_preconditions.js";
+    import { testViewportScissor } from "./viewport_scissor_test.js";
+    import { testBorrowedBulkMeasurementMode, testWorkloadAMeasurementMode, testWorkloadCMeasurementMode } from "./workload_ac_measure.js";
+    import { testWorkloadBMeasurementMode, testWorkloadBStorageCopy, testWorkloadBVariants } from "./workload_b_test.js";
 
     const outputEl = document.getElementById("output");
     const canvas = document.getElementById("canvas");

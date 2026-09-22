@@ -82,23 +82,25 @@ fn fs_main() -> @location(0) vec4<f32> {
 
 const TRI1_VERTICES = new Float32Array([
   // x,    y,    z,   u,   v
-  -1.0, -1.0,  0.0, 0.0, 0.0,
-   0.0, -1.0,  0.0, 0.5, 0.0,
-   0.0,  1.0,  0.0, 0.5, 1.0,
+  -1.0, -1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.5, 0.0, 0.0, 1.0, 0.0, 0.5, 1.0,
 ]);
 
 const TRI2_VERTICES = new Float32Array([
   // x,    y,    z,   u,   v
-   0.0, -1.0,  0.0, 0.5, 0.0,
-   1.0, -1.0,  0.0, 1.0, 0.0,
-   1.0,  1.0,  0.0, 1.0, 1.0,
+  0.0, -1.0, 0.0, 0.5, 0.0, 1.0, -1.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0,
 ]);
 
 function buildColorUniformData(c0, c1 = null) {
   const buf = new Float32Array(128); // 512 bytes = 2 slots of 256 bytes
-  buf[0] = c0[0]; buf[1] = c0[1]; buf[2] = c0[2]; buf[3] = c0[3];
+  buf[0] = c0[0];
+  buf[1] = c0[1];
+  buf[2] = c0[2];
+  buf[3] = c0[3];
   if (c1) {
-    buf[64] = c1[0]; buf[65] = c1[1]; buf[66] = c1[2]; buf[67] = c1[3];
+    buf[64] = c1[0];
+    buf[65] = c1[1];
+    buf[66] = c1[2];
+    buf[67] = c1[3];
   }
   return buf;
 }
@@ -139,7 +141,13 @@ function executeGeneratedRedBluePass(pass, pipeline, bindGroup, dynamicOffset) {
   executeGeneratedDraw(pass, bindGroup, dynamicOffset);
 }
 
-function executeGeneratedBundleRecord(bundleEncoder, pipeline, vertexBuffer, bindGroup, dynamicOffset) {
+function executeGeneratedBundleRecord(
+  bundleEncoder,
+  pipeline,
+  vertexBuffer,
+  bindGroup,
+  dynamicOffset,
+) {
   bundleEncoder.setPipeline(pipeline);
   bundleEncoder.setVertexBuffer(0, vertexBuffer);
   executeGeneratedDraw(bundleEncoder, bindGroup, dynamicOffset);
@@ -151,7 +159,6 @@ function executeGeneratedBundleDirectPass(pass, pipeline, vertexBuffer, bindGrou
   executeGeneratedDraw(pass, bindGroup, dynamicOffset);
 }
 
-
 /**
  * 1. RED-A / BLUE-B Check Implementation
  */
@@ -161,8 +168,10 @@ async function runRedABlueBForVariant(variantKey, bridge, wasmExports) {
 
   if (variantKey === "bulk") {
     // Bulk packet implementation using canonical Wasm exports
-    const buildRedBlueFn = wasmExports.f3d_build_red_a_blue_b_packet || wasmExports.gpu_bridge_build_red_blue_packet;
-    if (typeof buildRedBlueFn !== "function") throw new Error("Missing f3d_build_red_a_blue_b_packet export");
+    const buildRedBlueFn =
+      wasmExports.f3d_build_red_a_blue_b_packet || wasmExports.gpu_bridge_build_red_blue_packet;
+    if (typeof buildRedBlueFn !== "function")
+      throw new Error("Missing f3d_build_red_a_blue_b_packet export");
 
     // Positive check (versioned = true)
     let colorA, colorB;
@@ -171,8 +180,18 @@ async function runRedABlueBForVariant(variantKey, bridge, wasmExports) {
       await bridge.executePacket(positivePacket);
       const pixelsA = await bridge.readbackBuffer(40, READBACK_SIZE);
       const pixelsB = await bridge.readbackBuffer(41, READBACK_SIZE);
-      colorA = [pixelsA[CENTER_OFFSET], pixelsA[CENTER_OFFSET + 1], pixelsA[CENTER_OFFSET + 2], pixelsA[CENTER_OFFSET + 3]];
-      colorB = [pixelsB[CENTER_OFFSET], pixelsB[CENTER_OFFSET + 1], pixelsB[CENTER_OFFSET + 2], pixelsB[CENTER_OFFSET + 3]];
+      colorA = [
+        pixelsA[CENTER_OFFSET],
+        pixelsA[CENTER_OFFSET + 1],
+        pixelsA[CENTER_OFFSET + 2],
+        pixelsA[CENTER_OFFSET + 3],
+      ];
+      colorB = [
+        pixelsB[CENTER_OFFSET],
+        pixelsB[CENTER_OFFSET + 1],
+        pixelsB[CENTER_OFFSET + 2],
+        pixelsB[CENTER_OFFSET + 3],
+      ];
     } finally {
       for (const id of [1, 40, 41]) {
         bridge.buffers.get(id)?.destroy();
@@ -188,7 +207,9 @@ async function runRedABlueBForVariant(variantKey, bridge, wasmExports) {
 
     const positivePassed = colorA[0] > 200 && colorA[2] < 50 && colorB[2] > 200 && colorB[0] < 50;
     if (!positivePassed) {
-      throw new Error(`Bulk positive isolation failed: Target A was [${colorA}], Target B was [${colorB}]`);
+      throw new Error(
+        `Bulk positive isolation failed: Target A was [${colorA}], Target B was [${colorB}]`,
+      );
     }
 
     // Negative control (versioned = false: unversioned single-slot reuse)
@@ -198,8 +219,18 @@ async function runRedABlueBForVariant(variantKey, bridge, wasmExports) {
       await bridge.executePacket(negativePacket);
       const hazardPixelsA = await bridge.readbackBuffer(40, READBACK_SIZE);
       const hazardPixelsB = await bridge.readbackBuffer(41, READBACK_SIZE);
-      hazardColorA = [hazardPixelsA[CENTER_OFFSET], hazardPixelsA[CENTER_OFFSET + 1], hazardPixelsA[CENTER_OFFSET + 2], hazardPixelsA[CENTER_OFFSET + 3]];
-      hazardColorB = [hazardPixelsB[CENTER_OFFSET], hazardPixelsB[CENTER_OFFSET + 1], hazardPixelsB[CENTER_OFFSET + 2], hazardPixelsB[CENTER_OFFSET + 3]];
+      hazardColorA = [
+        hazardPixelsA[CENTER_OFFSET],
+        hazardPixelsA[CENTER_OFFSET + 1],
+        hazardPixelsA[CENTER_OFFSET + 2],
+        hazardPixelsA[CENTER_OFFSET + 3],
+      ];
+      hazardColorB = [
+        hazardPixelsB[CENTER_OFFSET],
+        hazardPixelsB[CENTER_OFFSET + 1],
+        hazardPixelsB[CENTER_OFFSET + 2],
+        hazardPixelsB[CENTER_OFFSET + 3],
+      ];
     } finally {
       for (const id of [1, 40, 41]) {
         bridge.buffers.get(id)?.destroy();
@@ -215,22 +246,38 @@ async function runRedABlueBForVariant(variantKey, bridge, wasmExports) {
 
     // Require both hazard targets to be opaque (> 200)
     if (hazardColorA[3] <= 200 || hazardColorB[3] <= 200) {
-      throw new Error(`Bulk negative control targets must be opaque (alpha > 200): Target A alpha=${hazardColorA[3]}, Target B alpha=${hazardColorB[3]}`);
+      throw new Error(
+        `Bulk negative control targets must be opaque (alpha > 200): Target A alpha=${hazardColorA[3]}, Target B alpha=${hazardColorB[3]}`,
+      );
     }
 
     // Require hazard A and hazard B to be the SAME color: both Red for bulk
-    const bothRed = hazardColorA[0] > 200 && hazardColorA[2] < 50 && hazardColorB[0] > 200 && hazardColorB[2] < 50;
-    const sameColor = Math.abs(hazardColorA[0] - hazardColorB[0]) < 10 &&
-                      Math.abs(hazardColorA[1] - hazardColorB[1]) < 10 &&
-                      Math.abs(hazardColorA[2] - hazardColorB[2]) < 10 &&
-                      Math.abs(hazardColorA[3] - hazardColorB[3]) < 10;
+    const bothRed =
+      hazardColorA[0] > 200 &&
+      hazardColorA[2] < 50 &&
+      hazardColorB[0] > 200 &&
+      hazardColorB[2] < 50;
+    const sameColor =
+      Math.abs(hazardColorA[0] - hazardColorB[0]) < 10 &&
+      Math.abs(hazardColorA[1] - hazardColorB[1]) < 10 &&
+      Math.abs(hazardColorA[2] - hazardColorB[2]) < 10 &&
+      Math.abs(hazardColorA[3] - hazardColorB[3]) < 10;
     if (!bothRed || !sameColor) {
-      throw new Error(`Bulk negative control failed: expected both targets to be Red (shared-slot offset), got Target A=[${hazardColorA}], Target B=[${hazardColorB}]`);
+      throw new Error(
+        `Bulk negative control failed: expected both targets to be Red (shared-slot offset), got Target A=[${hazardColorA}], Target B=[${hazardColorB}]`,
+      );
     }
 
-    const isolationFailed = !(hazardColorA[0] > 200 && hazardColorA[2] < 50 && hazardColorB[2] > 200 && hazardColorB[0] < 50);
+    const isolationFailed = !(
+      hazardColorA[0] > 200 &&
+      hazardColorA[2] < 50 &&
+      hazardColorB[2] > 200 &&
+      hazardColorB[0] < 50
+    );
     if (!isolationFailed) {
-      throw new Error(`Bulk negative control failed: unversioned packet falsely passed isolation (A=[${hazardColorA}], B=[${hazardColorB}])`);
+      throw new Error(
+        `Bulk negative control failed: unversioned packet falsely passed isolation (A=[${hazardColorA}], B=[${hazardColorB}])`,
+      );
     }
 
     return {
@@ -266,22 +313,33 @@ async function runRedABlueBForVariant(variantKey, bridge, wasmExports) {
   });
 
   const targetA = device.createTexture({
-    size: [WIDTH, HEIGHT, 1], format: "rgba8unorm",
+    size: [WIDTH, HEIGHT, 1],
+    format: "rgba8unorm",
     usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
   });
   const targetB = device.createTexture({
-    size: [WIDTH, HEIGHT, 1], format: "rgba8unorm",
+    size: [WIDTH, HEIGHT, 1],
+    format: "rgba8unorm",
     usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
   });
-  const readbackA = device.createBuffer({ size: READBACK_SIZE, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
-  const readbackB = device.createBuffer({ size: READBACK_SIZE, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+  const readbackA = device.createBuffer({
+    size: READBACK_SIZE,
+    usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+  });
+  const readbackB = device.createBuffer({
+    size: READBACK_SIZE,
+    usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+  });
 
   let colorA, colorB;
   let hazardColorA, hazardColorB;
   let validationError = null;
   try {
     // 1. Positive check: 2-slot versioned buffer (Red at 0, Blue at 256)
-    const versionedBuffer = device.createBuffer({ size: 512, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const versionedBuffer = device.createBuffer({
+      size: 512,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
     try {
       const versionedData = buildColorUniformData([1, 0, 0, 1], [0, 0, 1, 1]);
       device.queue.writeBuffer(versionedBuffer, 0, versionedData);
@@ -294,10 +352,20 @@ async function runRedABlueBForVariant(variantKey, bridge, wasmExports) {
       const encoder = device.createCommandEncoder();
 
       const passA = encoder.beginRenderPass({
-        colorAttachments: [{ view: targetA.createView(), clearValue: [0, 0, 0, 1], loadOp: "clear", storeOp: "store" }],
+        colorAttachments: [
+          {
+            view: targetA.createView(),
+            clearValue: [0, 0, 0, 1],
+            loadOp: "clear",
+            storeOp: "store",
+          },
+        ],
       });
       if (variantKey === "chatty") {
-        const hostObj = typeof window !== "undefined" ? (window.f3dHost = window.f3dHost || {}) : (globalThis.f3dHost = globalThis.f3dHost || {});
+        const hostObj =
+          typeof window !== "undefined"
+            ? (window.f3dHost = window.f3dHost || {})
+            : (globalThis.f3dHost = globalThis.f3dHost || {});
         const prev = hostObj.drawCall;
         try {
           hostObj.drawCall = () => {
@@ -320,10 +388,20 @@ async function runRedABlueBForVariant(variantKey, bridge, wasmExports) {
       passA.end();
 
       const passB = encoder.beginRenderPass({
-        colorAttachments: [{ view: targetB.createView(), clearValue: [0, 0, 0, 1], loadOp: "clear", storeOp: "store" }],
+        colorAttachments: [
+          {
+            view: targetB.createView(),
+            clearValue: [0, 0, 0, 1],
+            loadOp: "clear",
+            storeOp: "store",
+          },
+        ],
       });
       if (variantKey === "chatty") {
-        const hostObj = typeof window !== "undefined" ? (window.f3dHost = window.f3dHost || {}) : (globalThis.f3dHost = globalThis.f3dHost || {});
+        const hostObj =
+          typeof window !== "undefined"
+            ? (window.f3dHost = window.f3dHost || {})
+            : (globalThis.f3dHost = globalThis.f3dHost || {});
         const prev = hostObj.drawCall;
         try {
           hostObj.drawCall = () => {
@@ -345,30 +423,53 @@ async function runRedABlueBForVariant(variantKey, bridge, wasmExports) {
       }
       passB.end();
 
-      encoder.copyTextureToBuffer({ texture: targetA }, { buffer: readbackA, bytesPerRow: BYTES_PER_ROW, rowsPerImage: HEIGHT }, [WIDTH, HEIGHT, 1]);
-      encoder.copyTextureToBuffer({ texture: targetB }, { buffer: readbackB, bytesPerRow: BYTES_PER_ROW, rowsPerImage: HEIGHT }, [WIDTH, HEIGHT, 1]);
+      encoder.copyTextureToBuffer(
+        { texture: targetA },
+        { buffer: readbackA, bytesPerRow: BYTES_PER_ROW, rowsPerImage: HEIGHT },
+        [WIDTH, HEIGHT, 1],
+      );
+      encoder.copyTextureToBuffer(
+        { texture: targetB },
+        { buffer: readbackB, bytesPerRow: BYTES_PER_ROW, rowsPerImage: HEIGHT },
+        [WIDTH, HEIGHT, 1],
+      );
 
       device.queue.submit([encoder.finish()]);
       await device.queue.onSubmittedWorkDone();
 
       const pixelsA = await readbackStagingBuffer(device, readbackA);
       const pixelsB = await readbackStagingBuffer(device, readbackB);
-      colorA = [pixelsA[CENTER_OFFSET], pixelsA[CENTER_OFFSET + 1], pixelsA[CENTER_OFFSET + 2], pixelsA[CENTER_OFFSET + 3]];
-      colorB = [pixelsB[CENTER_OFFSET], pixelsB[CENTER_OFFSET + 1], pixelsB[CENTER_OFFSET + 2], pixelsB[CENTER_OFFSET + 3]];
+      colorA = [
+        pixelsA[CENTER_OFFSET],
+        pixelsA[CENTER_OFFSET + 1],
+        pixelsA[CENTER_OFFSET + 2],
+        pixelsA[CENTER_OFFSET + 3],
+      ];
+      colorB = [
+        pixelsB[CENTER_OFFSET],
+        pixelsB[CENTER_OFFSET + 1],
+        pixelsB[CENTER_OFFSET + 2],
+        pixelsB[CENTER_OFFSET + 3],
+      ];
     } finally {
       versionedBuffer.destroy();
     }
 
     const positivePassed = colorA[0] > 200 && colorA[2] < 50 && colorB[2] > 200 && colorB[0] < 50;
     if (!positivePassed) {
-      throw new Error(`${variantKey} positive isolation failed: Target A was [${colorA}], Target B was [${colorB}]`);
+      throw new Error(
+        `${variantKey} positive isolation failed: Target A was [${colorA}], Target B was [${colorB}]`,
+      );
     }
 
     // 2. Negative control: single-slot unversioned reuse (writes Blue before submission)
     device.pushErrorScope("validation");
     let unversionedBuffer = null;
     try {
-      unversionedBuffer = device.createBuffer({ size: 256, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      unversionedBuffer = device.createBuffer({
+        size: 256,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
       const redData = buildColorUniformData([1, 0, 0, 1]);
       const blueData = buildColorUniformData([0, 0, 1, 1]);
 
@@ -383,10 +484,20 @@ async function runRedABlueBForVariant(variantKey, bridge, wasmExports) {
       const encoder = device.createCommandEncoder();
 
       const passA = encoder.beginRenderPass({
-        colorAttachments: [{ view: targetA.createView(), clearValue: [0, 0, 0, 1], loadOp: "clear", storeOp: "store" }],
+        colorAttachments: [
+          {
+            view: targetA.createView(),
+            clearValue: [0, 0, 0, 1],
+            loadOp: "clear",
+            storeOp: "store",
+          },
+        ],
       });
       if (variantKey === "chatty") {
-        const hostObj = typeof window !== "undefined" ? (window.f3dHost = window.f3dHost || {}) : (globalThis.f3dHost = globalThis.f3dHost || {});
+        const hostObj =
+          typeof window !== "undefined"
+            ? (window.f3dHost = window.f3dHost || {})
+            : (globalThis.f3dHost = globalThis.f3dHost || {});
         const prev = hostObj.drawCall;
         try {
           hostObj.drawCall = () => {
@@ -409,10 +520,20 @@ async function runRedABlueBForVariant(variantKey, bridge, wasmExports) {
       passA.end();
 
       const passB = encoder.beginRenderPass({
-        colorAttachments: [{ view: targetB.createView(), clearValue: [0, 0, 0, 1], loadOp: "clear", storeOp: "store" }],
+        colorAttachments: [
+          {
+            view: targetB.createView(),
+            clearValue: [0, 0, 0, 1],
+            loadOp: "clear",
+            storeOp: "store",
+          },
+        ],
       });
       if (variantKey === "chatty") {
-        const hostObj = typeof window !== "undefined" ? (window.f3dHost = window.f3dHost || {}) : (globalThis.f3dHost = globalThis.f3dHost || {});
+        const hostObj =
+          typeof window !== "undefined"
+            ? (window.f3dHost = window.f3dHost || {})
+            : (globalThis.f3dHost = globalThis.f3dHost || {});
         const prev = hostObj.drawCall;
         try {
           hostObj.drawCall = () => {
@@ -434,8 +555,16 @@ async function runRedABlueBForVariant(variantKey, bridge, wasmExports) {
       }
       passB.end();
 
-      encoder.copyTextureToBuffer({ texture: targetA }, { buffer: readbackA, bytesPerRow: BYTES_PER_ROW, rowsPerImage: HEIGHT }, [WIDTH, HEIGHT, 1]);
-      encoder.copyTextureToBuffer({ texture: targetB }, { buffer: readbackB, bytesPerRow: BYTES_PER_ROW, rowsPerImage: HEIGHT }, [WIDTH, HEIGHT, 1]);
+      encoder.copyTextureToBuffer(
+        { texture: targetA },
+        { buffer: readbackA, bytesPerRow: BYTES_PER_ROW, rowsPerImage: HEIGHT },
+        [WIDTH, HEIGHT, 1],
+      );
+      encoder.copyTextureToBuffer(
+        { texture: targetB },
+        { buffer: readbackB, bytesPerRow: BYTES_PER_ROW, rowsPerImage: HEIGHT },
+        [WIDTH, HEIGHT, 1],
+      );
 
       // Hazard: application writes Blue to the unversioned slot BEFORE submission
       device.queue.writeBuffer(unversionedBuffer, 0, blueData.subarray(0, 64));
@@ -447,8 +576,18 @@ async function runRedABlueBForVariant(variantKey, bridge, wasmExports) {
 
       const hazardPixelsA = await readbackStagingBuffer(device, readbackA);
       const hazardPixelsB = await readbackStagingBuffer(device, readbackB);
-      hazardColorA = [hazardPixelsA[CENTER_OFFSET], hazardPixelsA[CENTER_OFFSET + 1], hazardPixelsA[CENTER_OFFSET + 2], hazardPixelsA[CENTER_OFFSET + 3]];
-      hazardColorB = [hazardPixelsB[CENTER_OFFSET], hazardPixelsB[CENTER_OFFSET + 1], hazardPixelsB[CENTER_OFFSET + 2], hazardPixelsB[CENTER_OFFSET + 3]];
+      hazardColorA = [
+        hazardPixelsA[CENTER_OFFSET],
+        hazardPixelsA[CENTER_OFFSET + 1],
+        hazardPixelsA[CENTER_OFFSET + 2],
+        hazardPixelsA[CENTER_OFFSET + 3],
+      ];
+      hazardColorB = [
+        hazardPixelsB[CENTER_OFFSET],
+        hazardPixelsB[CENTER_OFFSET + 1],
+        hazardPixelsB[CENTER_OFFSET + 2],
+        hazardPixelsB[CENTER_OFFSET + 3],
+      ];
     } catch (err) {
       if (validationError === null) {
         try {
@@ -469,27 +608,42 @@ async function runRedABlueBForVariant(variantKey, bridge, wasmExports) {
   }
 
   if (validationError) {
-    throw new Error(`${variantKey} negative control validation error: ${validationError.message || validationError}`);
+    throw new Error(
+      `${variantKey} negative control validation error: ${validationError.message || validationError}`,
+    );
   }
 
   // Require both hazard targets to be opaque (> 200)
   if (hazardColorA[3] <= 200 || hazardColorB[3] <= 200) {
-    throw new Error(`${variantKey} negative control targets must be opaque (alpha > 200): Target A alpha=${hazardColorA[3]}, Target B alpha=${hazardColorB[3]}`);
+    throw new Error(
+      `${variantKey} negative control targets must be opaque (alpha > 200): Target A alpha=${hazardColorA[3]}, Target B alpha=${hazardColorB[3]}`,
+    );
   }
 
   // Require hazard A and hazard B to be the SAME color: both Blue for non-bulk
-  const bothBlue = hazardColorA[2] > 200 && hazardColorA[0] < 50 && hazardColorB[2] > 200 && hazardColorB[0] < 50;
-  const sameColor = Math.abs(hazardColorA[0] - hazardColorB[0]) < 10 &&
-                    Math.abs(hazardColorA[1] - hazardColorB[1]) < 10 &&
-                    Math.abs(hazardColorA[2] - hazardColorB[2]) < 10 &&
-                    Math.abs(hazardColorA[3] - hazardColorB[3]) < 10;
+  const bothBlue =
+    hazardColorA[2] > 200 && hazardColorA[0] < 50 && hazardColorB[2] > 200 && hazardColorB[0] < 50;
+  const sameColor =
+    Math.abs(hazardColorA[0] - hazardColorB[0]) < 10 &&
+    Math.abs(hazardColorA[1] - hazardColorB[1]) < 10 &&
+    Math.abs(hazardColorA[2] - hazardColorB[2]) < 10 &&
+    Math.abs(hazardColorA[3] - hazardColorB[3]) < 10;
   if (!bothBlue || !sameColor) {
-    throw new Error(`${variantKey} negative control failed: expected both targets to be Blue (shared-slot overwrite), got Target A=[${hazardColorA}], Target B=[${hazardColorB}]`);
+    throw new Error(
+      `${variantKey} negative control failed: expected both targets to be Blue (shared-slot overwrite), got Target A=[${hazardColorA}], Target B=[${hazardColorB}]`,
+    );
   }
 
-  const isolationFailed = !(hazardColorA[0] > 200 && hazardColorA[2] < 50 && hazardColorB[2] > 200 && hazardColorB[0] < 50);
+  const isolationFailed = !(
+    hazardColorA[0] > 200 &&
+    hazardColorA[2] < 50 &&
+    hazardColorB[2] > 200 &&
+    hazardColorB[0] < 50
+  );
   if (!isolationFailed) {
-    throw new Error(`${variantKey} negative control failed: unversioned write falsely passed isolation (A=[${hazardColorA}], B=[${hazardColorB}])`);
+    throw new Error(
+      `${variantKey} negative control failed: unversioned write falsely passed isolation (A=[${hazardColorA}], B=[${hazardColorB}])`,
+    );
   }
 
   return {
@@ -514,17 +668,35 @@ async function runBundleThenDirectForVariant(variantKey, bridge, wasmExports) {
   if (variantKey === "generated") await loadGeneratedDraws();
 
   if (variantKey === "bulk") {
-    const buildBundleDirectFn = wasmExports.f3d_build_bundle_direct_draw_packet || wasmExports.gpu_bridge_build_bundle_direct_draw_packet;
-    if (typeof buildBundleDirectFn !== "function") throw new Error("Missing f3d_build_bundle_direct_draw_packet export");
+    const buildBundleDirectFn =
+      wasmExports.f3d_build_bundle_direct_draw_packet ||
+      wasmExports.gpu_bridge_build_bundle_direct_draw_packet;
+    if (typeof buildBundleDirectFn !== "function")
+      throw new Error("Missing f3d_build_bundle_direct_draw_packet export");
 
     let greenPixel, bluePixel, bgPixel;
     try {
       const packet = buildBundleDirectFn();
       await bridge.executePacket(packet);
       const pixels = await bridge.readbackBuffer(20, READBACK_SIZE);
-      greenPixel = [pixels[LEFT_GREEN_OFFSET], pixels[LEFT_GREEN_OFFSET + 1], pixels[LEFT_GREEN_OFFSET + 2], pixels[LEFT_GREEN_OFFSET + 3]];
-      bluePixel = [pixels[RIGHT_BLUE_OFFSET], pixels[RIGHT_BLUE_OFFSET + 1], pixels[RIGHT_BLUE_OFFSET + 2], pixels[RIGHT_BLUE_OFFSET + 3]];
-      bgPixel = [pixels[BACKGROUND_OFFSET], pixels[BACKGROUND_OFFSET + 1], pixels[BACKGROUND_OFFSET + 2], pixels[BACKGROUND_OFFSET + 3]];
+      greenPixel = [
+        pixels[LEFT_GREEN_OFFSET],
+        pixels[LEFT_GREEN_OFFSET + 1],
+        pixels[LEFT_GREEN_OFFSET + 2],
+        pixels[LEFT_GREEN_OFFSET + 3],
+      ];
+      bluePixel = [
+        pixels[RIGHT_BLUE_OFFSET],
+        pixels[RIGHT_BLUE_OFFSET + 1],
+        pixels[RIGHT_BLUE_OFFSET + 2],
+        pixels[RIGHT_BLUE_OFFSET + 3],
+      ];
+      bgPixel = [
+        pixels[BACKGROUND_OFFSET],
+        pixels[BACKGROUND_OFFSET + 1],
+        pixels[BACKGROUND_OFFSET + 2],
+        pixels[BACKGROUND_OFFSET + 3],
+      ];
     } finally {
       bridge.bundles.delete(1);
       for (const id of [1, 2, 3, 20]) {
@@ -542,7 +714,9 @@ async function runBundleThenDirectForVariant(variantKey, bridge, wasmExports) {
     const bgValid = bgPixel[0] < 50 && bgPixel[1] < 50 && bgPixel[2] < 50;
 
     if (!greenValid || !blueValid || !bgValid) {
-      throw new Error(`Bulk bundle-then-direct check failed: Green=[${greenPixel}], Blue=[${bluePixel}], BG=[${bgPixel}]`);
+      throw new Error(
+        `Bulk bundle-then-direct check failed: Green=[${greenPixel}], Blue=[${bluePixel}], BG=[${bgPixel}]`,
+      );
     }
 
     return {
@@ -583,21 +757,34 @@ async function runBundleThenDirectForVariant(variantKey, bridge, wasmExports) {
     primitive: { topology: "triangle-list" },
   });
 
-  const uniformBuffer = device.createBuffer({ size: 512, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const uniformBuffer = device.createBuffer({
+    size: 512,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
   const uniformData = buildColorUniformData([0, 1, 0, 1], [0, 0, 1, 1]); // 0=Green, 256=Blue
   device.queue.writeBuffer(uniformBuffer, 0, uniformData);
 
-  const vbBundle = device.createBuffer({ size: TRI1_VERTICES.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+  const vbBundle = device.createBuffer({
+    size: TRI1_VERTICES.byteLength,
+    usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+  });
   device.queue.writeBuffer(vbBundle, 0, TRI1_VERTICES);
 
-  const vbDirect = device.createBuffer({ size: TRI2_VERTICES.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+  const vbDirect = device.createBuffer({
+    size: TRI2_VERTICES.byteLength,
+    usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+  });
   device.queue.writeBuffer(vbDirect, 0, TRI2_VERTICES);
 
   const targetTexture = device.createTexture({
-    size: [WIDTH, HEIGHT, 1], format: "rgba8unorm",
+    size: [WIDTH, HEIGHT, 1],
+    format: "rgba8unorm",
     usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
   });
-  const readbackBuffer = device.createBuffer({ size: READBACK_SIZE, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+  const readbackBuffer = device.createBuffer({
+    size: READBACK_SIZE,
+    usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+  });
 
   const bindGroup = device.createBindGroup({
     layout: bindGroupLayout,
@@ -609,7 +796,10 @@ async function runBundleThenDirectForVariant(variantKey, bridge, wasmExports) {
     // 1. Pre-record render bundle: draws Triangle 1 with Green (dynamic offset 0)
     const bundleEncoder = device.createRenderBundleEncoder({ colorFormats: ["rgba8unorm"] });
     if (variantKey === "chatty") {
-      const hostObj = typeof window !== "undefined" ? (window.f3dHost = window.f3dHost || {}) : (globalThis.f3dHost = globalThis.f3dHost || {});
+      const hostObj =
+        typeof window !== "undefined"
+          ? (window.f3dHost = window.f3dHost || {})
+          : (globalThis.f3dHost = globalThis.f3dHost || {});
       const prev = hostObj.drawCall;
       try {
         hostObj.drawCall = () => {
@@ -636,7 +826,14 @@ async function runBundleThenDirectForVariant(variantKey, bridge, wasmExports) {
     // 2. Render pass: execute bundle, clear state via executeBundles, then direct draw
     const encoder = device.createCommandEncoder();
     const pass = encoder.beginRenderPass({
-      colorAttachments: [{ view: targetTexture.createView(), clearValue: [0, 0, 0, 1], loadOp: "clear", storeOp: "store" }],
+      colorAttachments: [
+        {
+          view: targetTexture.createView(),
+          clearValue: [0, 0, 0, 1],
+          loadOp: "clear",
+          storeOp: "store",
+        },
+      ],
     });
 
     // Execute bundle
@@ -647,7 +844,10 @@ async function runBundleThenDirectForVariant(variantKey, bridge, wasmExports) {
 
     // Direct draw in the same pass: MUST re-bind pipeline, vertex buffer, and bind group
     if (variantKey === "chatty") {
-      const hostObj = typeof window !== "undefined" ? (window.f3dHost = window.f3dHost || {}) : (globalThis.f3dHost = globalThis.f3dHost || {});
+      const hostObj =
+        typeof window !== "undefined"
+          ? (window.f3dHost = window.f3dHost || {})
+          : (globalThis.f3dHost = globalThis.f3dHost || {});
       const prev = hostObj.drawCall;
       try {
         hostObj.drawCall = () => {
@@ -671,15 +871,34 @@ async function runBundleThenDirectForVariant(variantKey, bridge, wasmExports) {
     }
     pass.end();
 
-    encoder.copyTextureToBuffer({ texture: targetTexture }, { buffer: readbackBuffer, bytesPerRow: BYTES_PER_ROW, rowsPerImage: HEIGHT }, [WIDTH, HEIGHT, 1]);
+    encoder.copyTextureToBuffer(
+      { texture: targetTexture },
+      { buffer: readbackBuffer, bytesPerRow: BYTES_PER_ROW, rowsPerImage: HEIGHT },
+      [WIDTH, HEIGHT, 1],
+    );
 
     device.queue.submit([encoder.finish()]);
     await device.queue.onSubmittedWorkDone();
 
     const pixels = await readbackStagingBuffer(device, readbackBuffer);
-    greenPixel = [pixels[LEFT_GREEN_OFFSET], pixels[LEFT_GREEN_OFFSET + 1], pixels[LEFT_GREEN_OFFSET + 2], pixels[LEFT_GREEN_OFFSET + 3]];
-    bluePixel = [pixels[RIGHT_BLUE_OFFSET], pixels[RIGHT_BLUE_OFFSET + 1], pixels[RIGHT_BLUE_OFFSET + 2], pixels[RIGHT_BLUE_OFFSET + 3]];
-    bgPixel = [pixels[BACKGROUND_OFFSET], pixels[BACKGROUND_OFFSET + 1], pixels[BACKGROUND_OFFSET + 2], pixels[BACKGROUND_OFFSET + 3]];
+    greenPixel = [
+      pixels[LEFT_GREEN_OFFSET],
+      pixels[LEFT_GREEN_OFFSET + 1],
+      pixels[LEFT_GREEN_OFFSET + 2],
+      pixels[LEFT_GREEN_OFFSET + 3],
+    ];
+    bluePixel = [
+      pixels[RIGHT_BLUE_OFFSET],
+      pixels[RIGHT_BLUE_OFFSET + 1],
+      pixels[RIGHT_BLUE_OFFSET + 2],
+      pixels[RIGHT_BLUE_OFFSET + 3],
+    ];
+    bgPixel = [
+      pixels[BACKGROUND_OFFSET],
+      pixels[BACKGROUND_OFFSET + 1],
+      pixels[BACKGROUND_OFFSET + 2],
+      pixels[BACKGROUND_OFFSET + 3],
+    ];
   } finally {
     uniformBuffer.destroy();
     vbBundle.destroy();
@@ -693,7 +912,9 @@ async function runBundleThenDirectForVariant(variantKey, bridge, wasmExports) {
   const bgValid = bgPixel[0] < 50 && bgPixel[1] < 50 && bgPixel[2] < 50;
 
   if (!greenValid || !blueValid || !bgValid) {
-    throw new Error(`${variantKey} bundle-then-direct check failed: Green=[${greenPixel}], Blue=[${bluePixel}], BG=[${bgPixel}]`);
+    throw new Error(
+      `${variantKey} bundle-then-direct check failed: Green=[${greenPixel}], Blue=[${bluePixel}], BG=[${bgPixel}]`,
+    );
   }
 
   return {
@@ -714,7 +935,10 @@ export async function testVariantPreconditions(bridge, wasmExports) {
     { key: "direct", owner: "Direct JS WebGPU" },
     { key: "bulk", owner: "Rust/Wasm packet encoder; JS WebGPU decoder" },
     { key: "chatty", owner: "Rust/Wasm callback loop; JS WebGPU submission" },
-    { key: "generated", owner: "Generated static draw bindings; JavaScript resource/pass setup, no Wasm data packing" },
+    {
+      key: "generated",
+      owner: "Generated static draw bindings; JavaScript resource/pass setup, no Wasm data packing",
+    },
   ];
 
   const results = {
@@ -768,7 +992,9 @@ export async function testVariantPreconditions(bridge, wasmExports) {
       };
     }
 
-    const passedBoth = variantRecord.red_a_blue_b?.status === "PASS" && variantRecord.bundle_then_direct?.status === "PASS";
+    const passedBoth =
+      variantRecord.red_a_blue_b?.status === "PASS" &&
+      variantRecord.bundle_then_direct?.status === "PASS";
     variantRecord.preconditions_met = passedBoth;
     if (!passedBoth) {
       results.excluded_variants.push(key);

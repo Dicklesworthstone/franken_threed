@@ -19,14 +19,22 @@ export async function testReadbackIdReuse(host) {
     host.buffers.set(id, newBuffer);
     host.bufferEpochs.set(id, { epochHi: 3, epochLo: 9 });
     const oldReadback = await pendingOldReadback;
-    if (oldReadback.epochHi !== 2 || oldReadback.epochLo !== 7 ||
-        !oldReadback.every(byte => byte === 37)) {
-      throw new Error(`Old GPU bytes mislabeled after ID reuse: epoch=${oldReadback.epochHi}:${oldReadback.epochLo}`);
+    if (
+      oldReadback.epochHi !== 2 ||
+      oldReadback.epochLo !== 7 ||
+      !oldReadback.every((byte) => byte === 37)
+    ) {
+      throw new Error(
+        `Old GPU bytes mislabeled after ID reuse: epoch=${oldReadback.epochHi}:${oldReadback.epochLo}`,
+      );
     }
 
     const newReadback = await host.readbackBuffer(id, 16);
-    if (newReadback.epochHi !== 3 || newReadback.epochLo !== 9 ||
-        !newReadback.every(byte => byte === 91)) {
+    if (
+      newReadback.epochHi !== 3 ||
+      newReadback.epochLo !== 9 ||
+      !newReadback.every((byte) => byte === 91)
+    ) {
       throw new Error("Replacement GPU buffer lost its own bytes or epoch");
     }
     if (oldBuffer.mapState !== "unmapped" || newBuffer.mapState !== "unmapped") {

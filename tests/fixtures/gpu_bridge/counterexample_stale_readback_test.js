@@ -21,13 +21,10 @@ const CENTER_OFFSET = 32 * BYTES_PER_ROW + 32 * 4; // 8320
 
 export async function testStaleReadbackCounterexample(wasmExports) {
   const buildPacketFn =
-    wasmExports.f3d_build_red_a_blue_b_packet ||
-    wasmExports.gpu_bridge_build_red_blue_packet;
+    wasmExports.f3d_build_red_a_blue_b_packet || wasmExports.gpu_bridge_build_red_blue_packet;
 
   if (typeof buildPacketFn !== "function") {
-    throw new Error(
-      "Missing required export 'f3d_build_red_a_blue_b_packet' on wasmExports"
-    );
+    throw new Error("Missing required export 'f3d_build_red_a_blue_b_packet' on wasmExports");
   }
 
   const results = {};
@@ -56,23 +53,19 @@ export async function testStaleReadbackCounterexample(wasmExports) {
       oldGen = host.deviceGeneration;
 
       // 5. Start readback buffer 40 asynchronously
-      const pending = host
-        .readbackBuffer(40, READBACK_SIZE)
-        .then(
-          (v) => ({ published: true, v }),
-          (e) => ({ published: false, e })
-        );
+      const pending = host.readbackBuffer(40, READBACK_SIZE).then(
+        (v) => ({ published: true, v }),
+        (e) => ({ published: false, e }),
+      );
 
       // 6. In the same synchronous task, replace device immediately
       host.installDeviceForTest(adapterB, deviceB);
       if (host.device !== deviceB) {
-        throw new Error(
-          "installDeviceForTest failed: host.device does not match deviceB"
-        );
+        throw new Error("installDeviceForTest failed: host.device does not match deviceB");
       }
       if (host.deviceGeneration !== oldGen + 1) {
         throw new Error(
-          `installDeviceForTest failed: host.deviceGeneration is ${host.deviceGeneration}, expected ${oldGen + 1}`
+          `installDeviceForTest failed: host.deviceGeneration is ${host.deviceGeneration}, expected ${oldGen + 1}`,
         );
       }
 
@@ -100,13 +93,13 @@ export async function testStaleReadbackCounterexample(wasmExports) {
       // "device changed before mapping completed". Any other rejection or a publish is a FAIL.
       if (outcome.published !== false) {
         throw new Error(
-          "Correct run (wrongImpl=false) unexpectedly published readback across device replacement"
+          "Correct run (wrongImpl=false) unexpectedly published readback across device replacement",
         );
       }
       const errorMsg = (outcome.e && (outcome.e.message || String(outcome.e))) || "";
       if (!errorMsg.includes("device changed before mapping completed")) {
         throw new Error(
-          `Correct run (wrongImpl=false) rejected with unexpected error: "${errorMsg}" (expected to include "device changed before mapping completed")`
+          `Correct run (wrongImpl=false) rejected with unexpected error: "${errorMsg}" (expected to include "device changed before mapping completed")`,
         );
       }
 
@@ -126,9 +119,7 @@ export async function testStaleReadbackCounterexample(wasmExports) {
       // Anything else is a FAIL.
       if (outcome.published !== true) {
         const err = outcome.e && (outcome.e.message || String(outcome.e));
-        throw new Error(
-          `Wrong-impl run (wrongImpl=true) unexpectedly failed to publish: ${err}`
-        );
+        throw new Error(`Wrong-impl run (wrongImpl=true) unexpectedly failed to publish: ${err}`);
       }
 
       const pixel = [
@@ -137,18 +128,17 @@ export async function testStaleReadbackCounterexample(wasmExports) {
         outcome.v[CENTER_OFFSET + 2],
         outcome.v[CENTER_OFFSET + 3],
       ];
-      const isRed =
-        pixel[0] > 200 && pixel[2] < 50 && pixel[3] === 255;
+      const isRed = pixel[0] > 200 && pixel[2] < 50 && pixel[3] === 255;
 
       if (!isRed) {
         throw new Error(
-          `Wrong-impl run (wrongImpl=true) published corrupted/blank bytes: pixel=[${pixel.join(",")}], expected R>200, B<50, A=255`
+          `Wrong-impl run (wrongImpl=true) published corrupted/blank bytes: pixel=[${pixel.join(",")}], expected R>200, B<50, A=255`,
         );
       }
 
       if (outcome.v.deviceGeneration !== oldGen) {
         throw new Error(
-          `Wrong-impl run (wrongImpl=true) outcome generation is ${outcome.v.deviceGeneration}, expected stale generation ${oldGen}`
+          `Wrong-impl run (wrongImpl=true) outcome generation is ${outcome.v.deviceGeneration}, expected stale generation ${oldGen}`,
         );
       }
 

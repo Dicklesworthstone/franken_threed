@@ -12,9 +12,20 @@
  * `dispose` must release CPU-side scene ownership, not submit more GPU work.
  */
 export class WebGpuSceneSession {
-  constructor({ host, canvas, requiredProfile = {}, maxRecoveryAttempts = 1,
-    onState = () => {}, onError = () => {} }) {
-    for (const method of ["negotiateAndCreateDevice", "executePacket", "clearDeviceResources", "destroyDevice"]) {
+  constructor({
+    host,
+    canvas,
+    requiredProfile = {},
+    maxRecoveryAttempts = 1,
+    onState = () => {},
+    onError = () => {},
+  }) {
+    for (const method of [
+      "negotiateAndCreateDevice",
+      "executePacket",
+      "clearDeviceResources",
+      "destroyDevice",
+    ]) {
       if (typeof host?.[method] !== "function") throw new TypeError(`host.${method} is required`);
     }
     if (!Number.isSafeInteger(maxRecoveryAttempts) || maxRecoveryAttempts < 0) {
@@ -48,11 +59,15 @@ export class WebGpuSceneSession {
   }
 
   snapshot() {
-    return Object.freeze({ state: this.state, generation: this.generation,
+    return Object.freeze({
+      state: this.state,
+      generation: this.generation,
       width: this.size?.width ?? this.canvas.width,
       height: this.size?.height ?? this.canvas.height,
-      submittedFrames: this.submittedFrames, recoveryAttempts: this.recoveryAttempts,
-      lastError: this.lastError });
+      submittedFrames: this.submittedFrames,
+      recoveryAttempts: this.recoveryAttempts,
+      lastError: this.lastError,
+    });
   }
 
   load(factory, { width = this.canvas.width, height = this.canvas.height } = {}) {
@@ -90,10 +105,13 @@ export class WebGpuSceneSession {
       const frame = scene?.frame;
       if (!frame) return this.snapshot();
       try {
-        const packet = await waitFor(Promise.resolve().then(() => {
-          this.check(token);
-          return frame.call(scene, { ...this.sceneContext(token), time });
-        }), token.signal);
+        const packet = await waitFor(
+          Promise.resolve().then(() => {
+            this.check(token);
+            return frame.call(scene, { ...this.sceneContext(token), time });
+          }),
+          token.signal,
+        );
         this.check(token);
         if (packet != null) {
           validatePacket(packet);
@@ -126,8 +144,16 @@ export class WebGpuSceneSession {
       return this.snapshot();
     });
     this.controller?.abort();
-    try { this.host.destroyDevice(); } catch (error) { this.report(error); }
-    try { this.context.unconfigure(); } catch (error) { this.report(error); }
+    try {
+      this.host.destroyDevice();
+    } catch (error) {
+      this.report(error);
+    }
+    try {
+      this.context.unconfigure();
+    } catch (error) {
+      this.report(error);
+    }
     this.emit();
     return this.closePromise;
   }
@@ -162,8 +188,9 @@ export class WebGpuSceneSession {
         await waitFor(disposal, token.signal);
         this.check(token);
         if (!this.host.device) {
-          await waitFor(this.host.negotiateAndCreateDevice(this.profile), token.signal,
-            () => this.host.destroyDevice());
+          await waitFor(this.host.negotiateAndCreateDevice(this.profile), token.signal, () =>
+            this.host.destroyDevice(),
+          );
           this.check(token);
         }
         this.watchDevice();
@@ -174,14 +201,20 @@ export class WebGpuSceneSession {
         });
         candidate = await waitFor(build, token.signal, null, (late) => this.dispose(late));
         this.check(token);
-        if (!candidate || typeof candidate !== "object") throw new TypeError("Scene factory must return a scene object");
-        if (candidate.frame !== undefined && typeof candidate.frame !== "function") throw new TypeError("scene.frame must be a function");
-        if (candidate.dispose !== undefined && typeof candidate.dispose !== "function") throw new TypeError("scene.dispose must be a function");
+        if (!candidate || typeof candidate !== "object")
+          throw new TypeError("Scene factory must return a scene object");
+        if (candidate.frame !== undefined && typeof candidate.frame !== "function")
+          throw new TypeError("scene.frame must be a function");
+        if (candidate.dispose !== undefined && typeof candidate.dispose !== "function")
+          throw new TypeError("scene.dispose must be a function");
         validatePacket(candidate.packet);
         this.canvas.width = size.width;
         this.canvas.height = size.height;
-        this.context.configure({ device: this.host.device,
-          format: this.host.capabilityRecord.preferredCanvasFormat, alphaMode: "premultiplied" });
+        this.context.configure({
+          device: this.host.device,
+          format: this.host.capabilityRecord.preferredCanvasFormat,
+          alphaMode: "premultiplied",
+        });
         await waitFor(this.host.executePacket(candidate.packet, this.context), token.signal);
         this.check(token);
         this.scene = candidate;
@@ -202,25 +235,29 @@ export class WebGpuSceneSession {
     const device = this.host.device;
     if (device === this.observedDevice) return;
     this.observedDevice = device;
-    device.lost.then((info) => {
-      if (this.state === "closed" || this.observedDevice !== device) return;
-      this.observedDevice = null;
-      const error = new Error(`WebGPU device lost: ${info?.message || info?.reason || "unknown reason"}`);
-      const generation = this.generation;
-      this.report(error);
-      if (this.state === "closed" || this.generation !== generation) return;
-      if (this.recoveryAttempts >= this.maxRecoveryAttempts || !this.factory) {
-        this.generation++;
-        this.state = "failed";
-        this.controller?.abort();
-        this.emit();
-        return;
-      }
-      this.recoveryAttempts++;
-      // Recompile/rebuild for negotiated successor capabilities; never replay
-      // old numeric resource IDs or assume a replacement device is identical.
-      this.replace(this.factory, this.size, "recovering", false).catch(() => {});
-    }).catch((error) => this.report(error));
+    device.lost
+      .then((info) => {
+        if (this.state === "closed" || this.observedDevice !== device) return;
+        this.observedDevice = null;
+        const error = new Error(
+          `WebGPU device lost: ${info?.message || info?.reason || "unknown reason"}`,
+        );
+        const generation = this.generation;
+        this.report(error);
+        if (this.state === "closed" || this.generation !== generation) return;
+        if (this.recoveryAttempts >= this.maxRecoveryAttempts || !this.factory) {
+          this.generation++;
+          this.state = "failed";
+          this.controller?.abort();
+          this.emit();
+          return;
+        }
+        this.recoveryAttempts++;
+        // Recompile/rebuild for negotiated successor capabilities; never replay
+        // old numeric resource IDs or assume a replacement device is identical.
+        this.replace(this.factory, this.size, "recovering", false).catch(() => {});
+      })
+      .catch((error) => this.report(error));
   }
 
   clearResidency() {
@@ -228,7 +265,11 @@ export class WebGpuSceneSession {
     for (const value of this.host.buffers?.values() ?? []) resources.add(value.buffer ?? value);
     for (const value of this.host.textures?.values() ?? []) resources.add(value.texture ?? value);
     for (const resource of resources) {
-      try { resource.destroy?.(); } catch (error) { this.report(error); }
+      try {
+        resource.destroy?.();
+      } catch (error) {
+        this.report(error);
+      }
     }
     this.host.clearDeviceResources();
   }
@@ -236,9 +277,11 @@ export class WebGpuSceneSession {
   async dispose(scene) {
     if (!scene || typeof scene !== "object") return;
     if (this.disposed.has(scene)) return this.disposed.get(scene);
-    const cleanup = Promise.resolve().then(() => {
-      if (typeof scene.dispose === "function") return scene.dispose();
-    }).catch((error) => this.report(error));
+    const cleanup = Promise.resolve()
+      .then(() => {
+        if (typeof scene.dispose === "function") return scene.dispose();
+      })
+      .catch((error) => this.report(error));
     this.disposed.set(scene, cleanup);
     this.disposals.add(cleanup);
     cleanup.then(() => this.disposals.delete(cleanup));
@@ -255,15 +298,24 @@ export class WebGpuSceneSession {
   }
 
   sceneContext(token) {
-    return { ...this.size, capabilities: this.host.capabilityRecord,
-      signal: token.signal, generation: token.generation };
+    return {
+      ...this.size,
+      capabilities: this.host.capabilityRecord,
+      signal: token.signal,
+      generation: token.generation,
+    };
   }
 
-  token() { return { generation: this.generation, signal: this.controller.signal }; }
-  check(token) {
-    if (token.signal.aborted || token.generation !== this.generation || this.state === "closed") throw cancelled();
+  token() {
+    return { generation: this.generation, signal: this.controller.signal };
   }
-  assertOpen() { if (this.state === "closed") throw new Error("Scene session is closed"); }
+  check(token) {
+    if (token.signal.aborted || token.generation !== this.generation || this.state === "closed")
+      throw cancelled();
+  }
+  assertOpen() {
+    if (this.state === "closed") throw new Error("Scene session is closed");
+  }
   enqueue(action) {
     const result = this.tail.then(action);
     this.tail = result.catch(() => {});
@@ -272,7 +324,8 @@ export class WebGpuSceneSession {
   failCurrent(token, error) {
     if (!token.signal.aborted && token.generation === this.generation && this.state !== "closed") {
       this.report(error);
-      if (token.signal.aborted || token.generation !== this.generation || this.state === "closed") return;
+      if (token.signal.aborted || token.generation !== this.generation || this.state === "closed")
+        return;
       this.state = "failed";
       this.controller.abort();
       this.emit();
@@ -280,10 +333,18 @@ export class WebGpuSceneSession {
   }
   report(error) {
     this.lastError = error instanceof Error ? error.message : String(error);
-    try { this.onError(error); } catch { /* Observers do not own the renderer. */ }
+    try {
+      this.onError(error);
+    } catch {
+      /* Observers do not own the renderer. */
+    }
   }
   emit() {
-    try { this.onState(this.snapshot()); } catch (error) { this.report(error); }
+    try {
+      this.onState(this.snapshot());
+    } catch (error) {
+      this.report(error);
+    }
   }
 }
 
@@ -294,9 +355,14 @@ function cancelled() {
 }
 
 function validatePacket(packet) {
-  if (!(packet instanceof Uint8Array) || packet.byteLength < 16 ||
-      (typeof SharedArrayBuffer !== "undefined" && packet.buffer instanceof SharedArrayBuffer)) {
-    throw new TypeError("Scene packets must be non-detached, non-shared Uint8Array values with a complete header");
+  if (
+    !(packet instanceof Uint8Array) ||
+    packet.byteLength < 16 ||
+    (typeof SharedArrayBuffer !== "undefined" && packet.buffer instanceof SharedArrayBuffer)
+  ) {
+    throw new TypeError(
+      "Scene packets must be non-detached, non-shared Uint8Array values with a complete header",
+    );
   }
 }
 
@@ -308,21 +374,31 @@ function waitFor(promise, signal, onAbort = null, onLateValue = null) {
       if (settled) return;
       settled = true;
       signal.removeEventListener("abort", abort);
-      try { onAbort?.(); } catch { /* Cancellation must still settle. */ }
+      try {
+        onAbort?.();
+      } catch {
+        /* Cancellation must still settle. */
+      }
       reject(cancelled());
     };
     signal.addEventListener("abort", abort, { once: true });
     if (signal.aborted) abort();
-    Promise.resolve(promise).then((value) => {
-      if (settled) { if (onLateValue) Promise.resolve(onLateValue(value)).catch(() => {}); return; }
-      settled = true;
-      signal.removeEventListener("abort", abort);
-      resolve(value);
-    }, (error) => {
-      if (settled) return;
-      settled = true;
-      signal.removeEventListener("abort", abort);
-      reject(error);
-    });
+    Promise.resolve(promise).then(
+      (value) => {
+        if (settled) {
+          if (onLateValue) Promise.resolve(onLateValue(value)).catch(() => {});
+          return;
+        }
+        settled = true;
+        signal.removeEventListener("abort", abort);
+        resolve(value);
+      },
+      (error) => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener("abort", abort);
+        reject(error);
+      },
+    );
   });
 }

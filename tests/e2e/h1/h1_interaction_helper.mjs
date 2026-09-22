@@ -12,8 +12,8 @@
  */
 
 export const H1_PATHS = Object.freeze({
-  ROUTED: '/examples/webgpu_performance_renderbundle.html',
-  REFERENCE: '/upstream/three.js/examples/webgpu_performance_renderbundle.html',
+  ROUTED: "/examples/webgpu_performance_renderbundle.html",
+  REFERENCE: "/upstream/three.js/examples/webgpu_performance_renderbundle.html",
 });
 
 /**
@@ -28,19 +28,16 @@ export const H1_PATHS = Object.freeze({
  * @param {number} [options.count=4000] Object count query parameter (preserves 0)
  * @returns {string} Fully constructed URL
  */
-export function buildH1Url(baseUrl = '', {
-  isReference = false,
-  backend = 'webgpu',
-  renderBundle = true,
-  count = 4000,
-} = {}) {
-  const base = (baseUrl || '').replace(/\/+$/, '');
+export function buildH1Url(
+  baseUrl = "",
+  { isReference = false, backend = "webgpu", renderBundle = true, count = 4000 } = {},
+) {
+  const base = (baseUrl || "").replace(/\/+$/, "");
   const pathname = isReference ? H1_PATHS.REFERENCE : H1_PATHS.ROUTED;
-  const backendParam = `backend=${backend === 'webgl' ? 'webgl' : 'webgpu'}`;
-  const renderBundleParam = `&renderBundle=${renderBundle ? 'true' : 'false'}`;
-  const parsedCount = count !== undefined && count !== null && Number.isFinite(Number(count))
-    ? Number(count)
-    : 4000;
+  const backendParam = `backend=${backend === "webgl" ? "webgl" : "webgpu"}`;
+  const renderBundleParam = `&renderBundle=${renderBundle ? "true" : "false"}`;
+  const parsedCount =
+    count !== undefined && count !== null && Number.isFinite(Number(count)) ? Number(count) : 4000;
   const countParam = `&count=${parsedCount}`;
 
   return `${base}${pathname}?${backendParam}${renderBundleParam}${countParam}`;
@@ -55,20 +52,20 @@ export function buildH1Url(baseUrl = '', {
  * @param {string} searchStringOrUrl Query string (e.g. '?backend=webgl') or full URL
  * @returns {{ backend: 'webgpu'|'webgl', webgpu: boolean, renderBundle: boolean, count: number }}
  */
-export function parseH1QueryParams(searchStringOrUrl = '') {
-  let search = searchStringOrUrl || '';
-  const queryIndex = search.indexOf('?');
+export function parseH1QueryParams(searchStringOrUrl = "") {
+  let search = searchStringOrUrl || "";
+  const queryIndex = search.indexOf("?");
   if (queryIndex !== -1) {
     search = search.slice(queryIndex);
   }
 
   const params = new URLSearchParams(search);
-  const isWebGPU = params.get('backend') !== 'webgl';
-  const renderBundle = params.get('renderBundle') !== 'false';
-  const count = parseFloat(params.get('count') || 4000);
+  const isWebGPU = params.get("backend") !== "webgl";
+  const renderBundle = params.get("renderBundle") !== "false";
+  const count = parseFloat(params.get("count") || 4000);
 
   return {
-    backend: isWebGPU ? 'webgpu' : 'webgl',
+    backend: isWebGPU ? "webgpu" : "webgl",
     webgpu: isWebGPU,
     renderBundle,
     count,
@@ -87,16 +84,14 @@ export function parseH1QueryParams(searchStringOrUrl = '') {
  * @param {number} [nextState.count=4000]
  * @returns {string} Next URL path + query string
  */
-export function computeH1ReloadUrl(currentPath, {
-  backend = 'webgpu',
-  renderBundle = true,
-  count = 4000,
-} = {}) {
-  const backendParam = `backend=${backend === 'webgl' ? 'webgl' : 'webgpu'}`;
-  const renderBundleParam = `&renderBundle=${renderBundle ? 'true' : 'false'}`;
-  const parsedCount = count !== undefined && count !== null && Number.isFinite(Number(count))
-    ? Number(count)
-    : 4000;
+export function computeH1ReloadUrl(
+  currentPath,
+  { backend = "webgpu", renderBundle = true, count = 4000 } = {},
+) {
+  const backendParam = `backend=${backend === "webgl" ? "webgl" : "webgpu"}`;
+  const renderBundleParam = `&renderBundle=${renderBundle ? "true" : "false"}`;
+  const parsedCount =
+    count !== undefined && count !== null && Number.isFinite(Number(count)) ? Number(count) : 4000;
   const countParam = `&count=${parsedCount}`;
 
   return `${currentPath}?${backendParam}${renderBundleParam}${countParam}`;
@@ -112,22 +107,22 @@ export function computeH1ReloadUrl(currentPath, {
  * @returns {{ found: boolean, row: Element|null, checkbox: HTMLInputElement|null, labelText: string|null }}
  */
 export function findInspectorControl(doc, label) {
-  if (!doc || typeof doc.querySelectorAll !== 'function') {
+  if (!doc || typeof doc.querySelectorAll !== "function") {
     return { found: false, row: null, checkbox: null, labelText: null };
   }
 
-  const normalizedTarget = (label || '').trim().toLowerCase();
-  const rows = doc.querySelectorAll('.list-item-row');
+  const normalizedTarget = (label || "").trim().toLowerCase();
+  const rows = doc.querySelectorAll(".list-item-row");
 
   for (const row of rows) {
-    const text = (row.textContent || '').trim().toLowerCase();
+    const text = (row.textContent || "").trim().toLowerCase();
     if (text.includes(normalizedTarget)) {
       const checkbox = row.querySelector('input[type="checkbox"]');
       return {
         found: true,
         row,
         checkbox,
-        labelText: (row.textContent || '').trim(),
+        labelText: (row.textContent || "").trim(),
       };
     }
   }
@@ -135,14 +130,14 @@ export function findInspectorControl(doc, label) {
   // Fallback: search across all input checkboxes if row structure differs
   const checkboxes = doc.querySelectorAll('input[type="checkbox"]');
   for (const cb of checkboxes) {
-    const parentRow = cb.closest('.list-item-row') || cb.parentElement;
-    const parentText = (parentRow?.textContent || '').trim().toLowerCase();
+    const parentRow = cb.closest(".list-item-row") || cb.parentElement;
+    const parentText = (parentRow?.textContent || "").trim().toLowerCase();
     if (parentText.includes(normalizedTarget)) {
       return {
         found: true,
         row: parentRow,
         checkbox: cb,
-        labelText: (parentRow?.textContent || '').trim(),
+        labelText: (parentRow?.textContent || "").trim(),
       };
     }
   }
@@ -178,11 +173,11 @@ export function toggleInspectorControl(doc, label) {
 
   // Dispatch bubbling change event
   let changeEvent;
-  if (typeof Event === 'function') {
-    changeEvent = new Event('change', { bubbles: true, cancelable: true });
+  if (typeof Event === "function") {
+    changeEvent = new Event("change", { bubbles: true, cancelable: true });
   } else if (doc.createEvent) {
-    changeEvent = doc.createEvent('Event');
-    changeEvent.initEvent('change', true, true);
+    changeEvent = doc.createEvent("Event");
+    changeEvent.initEvent("change", true, true);
   }
 
   if (changeEvent) {
@@ -206,44 +201,50 @@ export function toggleInspectorControl(doc, label) {
  * @returns {'webgpu'|'webgl2'|'webgl'|'2d'|'bitmaprenderer'|'none'}
  */
 export function detectCanvasContext(canvas, targetWindow = null) {
-  if (!canvas || typeof canvas.getContext !== 'function') return 'none';
+  if (!canvas || typeof canvas.getContext !== "function") return "none";
 
-  const win = targetWindow || canvas.ownerDocument?.defaultView || (typeof window !== 'undefined' ? window : null);
+  const win =
+    targetWindow ||
+    canvas.ownerDocument?.defaultView ||
+    (typeof window !== "undefined" ? window : null);
 
   // 1. Check WebGPU context
   try {
-    const gpuCtx = canvas.getContext('webgpu');
+    const gpuCtx = canvas.getContext("webgpu");
     if (gpuCtx) {
-      const isWebGPU = (win?.GPUCanvasContext && gpuCtx instanceof win.GPUCanvasContext) ||
-        gpuCtx.constructor?.name === 'GPUCanvasContext' ||
-        Object.prototype.toString.call(gpuCtx) === '[object GPUCanvasContext]';
-      if (isWebGPU) return 'webgpu';
+      const isWebGPU =
+        (win?.GPUCanvasContext && gpuCtx instanceof win.GPUCanvasContext) ||
+        gpuCtx.constructor?.name === "GPUCanvasContext" ||
+        Object.prototype.toString.call(gpuCtx) === "[object GPUCanvasContext]";
+      if (isWebGPU) return "webgpu";
     }
   } catch (_) {}
 
   // 2. Check WebGL2 context
   try {
-    const gl2 = canvas.getContext('webgl2');
+    const gl2 = canvas.getContext("webgl2");
     if (gl2) {
-      const isWebGL2 = (win?.WebGL2RenderingContext && gl2 instanceof win.WebGL2RenderingContext) ||
-        gl2.constructor?.name === 'WebGL2RenderingContext' ||
-        Object.prototype.toString.call(gl2) === '[object WebGL2RenderingContext]';
-      if (isWebGL2) return 'webgl2';
+      const isWebGL2 =
+        (win?.WebGL2RenderingContext && gl2 instanceof win.WebGL2RenderingContext) ||
+        gl2.constructor?.name === "WebGL2RenderingContext" ||
+        Object.prototype.toString.call(gl2) === "[object WebGL2RenderingContext]";
+      if (isWebGL2) return "webgl2";
     }
   } catch (_) {}
 
   // 3. Check WebGL1 context
   try {
-    const gl1 = canvas.getContext('webgl');
+    const gl1 = canvas.getContext("webgl");
     if (gl1) {
-      const isWebGL = (win?.WebGLRenderingContext && gl1 instanceof win.WebGLRenderingContext) ||
-        gl1.constructor?.name === 'WebGLRenderingContext' ||
-        Object.prototype.toString.call(gl1) === '[object WebGLRenderingContext]';
-      if (isWebGL) return 'webgl';
+      const isWebGL =
+        (win?.WebGLRenderingContext && gl1 instanceof win.WebGLRenderingContext) ||
+        gl1.constructor?.name === "WebGLRenderingContext" ||
+        Object.prototype.toString.call(gl1) === "[object WebGLRenderingContext]";
+      if (isWebGL) return "webgl";
     }
   } catch (_) {}
 
-  return 'none';
+  return "none";
 }
 
 /**
@@ -253,15 +254,17 @@ export function detectCanvasContext(canvas, targetWindow = null) {
  * @returns {{ sign: string, all: string[] }}
  */
 export function extractInspectorLogs(doc) {
-  if (!doc || typeof doc.querySelectorAll !== 'function') {
-    return { sign: '', all: [] };
+  if (!doc || typeof doc.querySelectorAll !== "function") {
+    return { sign: "", all: [] };
   }
 
   const logElements = doc.querySelectorAll(
-    '.three-inspector .console-log .log-message, .log-message, .inspector-log, .log-item, .item-log'
+    ".three-inspector .console-log .log-message, .log-message, .inspector-log, .log-item, .item-log",
   );
-  const all = Array.from(logElements).map(el => (el.textContent || '').trim()).filter(Boolean);
-  const sign = all.find(txt => txt.includes('THREE.WebGPURenderer')) || all[0] || '';
+  const all = Array.from(logElements)
+    .map((el) => (el.textContent || "").trim())
+    .filter(Boolean);
+  const sign = all.find((txt) => txt.includes("THREE.WebGPURenderer")) || all[0] || "";
 
   return { sign, all };
 }
@@ -275,38 +278,37 @@ export function extractInspectorLogs(doc) {
  * @returns {Object} Observable state snapshot
  */
 export function readH1Snapshot(win, doc) {
-  const currentUrl = win.location?.href || '';
-  const pathname = win.location?.pathname || '';
-  const search = win.location?.search || '';
+  const currentUrl = win.location?.href || "";
+  const pathname = win.location?.pathname || "";
+  const search = win.location?.search || "";
   const query = parseH1QueryParams(search);
 
-  const canvas = doc.querySelector ? doc.querySelector('canvas') : null;
+  const canvas = doc.querySelector ? doc.querySelector("canvas") : null;
   const contextType = detectCanvasContext(canvas, win);
 
-  const renderBundleCtrl = findInspectorControl(doc, 'render bundle');
-  const webgpuCtrl = findInspectorControl(doc, 'webgpu');
-  const dynamicCtrl = findInspectorControl(doc, 'dynamic');
+  const renderBundleCtrl = findInspectorControl(doc, "render bundle");
+  const webgpuCtrl = findInspectorControl(doc, "webgpu");
+  const dynamicCtrl = findInspectorControl(doc, "dynamic");
 
   const logs = extractInspectorLogs(doc);
   const router = win.__f3d_router__ || null;
   const isRouted = Boolean(router);
-  const decisionLog = router && typeof router.getDecisionLog === 'function'
-    ? router.getDecisionLog()
-    : [];
+  const decisionLog =
+    router && typeof router.getDecisionLog === "function" ? router.getDecisionLog() : [];
 
-  const activeDecision = decisionLog.find(d => d.site === 'WebGPURenderer') || null;
+  const activeDecision = decisionLog.find((d) => d.site === "WebGPURenderer") || null;
 
   return {
     url: currentUrl,
     pathname,
     search,
     query,
-    title: doc.title || '',
+    title: doc.title || "",
     canvas: {
       exists: Boolean(canvas),
       contextType,
-      width: canvas ? (canvas.width || 0) : 0,
-      height: canvas ? (canvas.height || 0) : 0,
+      width: canvas ? canvas.width || 0 : 0,
+      height: canvas ? canvas.height || 0 : 0,
     },
     controls: {
       renderBundle: {
@@ -329,7 +331,7 @@ export function readH1Snapshot(win, doc) {
     routing: {
       isRouted,
       activeRoute: activeDecision ? activeDecision.route : null,
-      activeReasons: activeDecision ? (activeDecision.reasons || []) : [],
+      activeReasons: activeDecision ? activeDecision.reasons || [] : [],
       decisionCount: decisionLog.length,
     },
   };
@@ -354,117 +356,159 @@ export function compareH1Snapshots(reference, candidate) {
   if (!reference || !candidate) {
     return {
       pass: false,
-      diffs: ['Reference or candidate snapshot is null or undefined'],
+      diffs: ["Reference or candidate snapshot is null or undefined"],
       details: { reference, candidate },
     };
   }
 
   // 0. Query object presence
-  if (!reference.query || typeof reference.query !== 'object') {
-    diffs.push('Reference snapshot missing valid query object');
+  if (!reference.query || typeof reference.query !== "object") {
+    diffs.push("Reference snapshot missing valid query object");
   }
-  if (!candidate.query || typeof candidate.query !== 'object') {
-    diffs.push('Candidate snapshot missing valid query object');
+  if (!candidate.query || typeof candidate.query !== "object") {
+    diffs.push("Candidate snapshot missing valid query object");
   }
 
   // 1. Mandatory Canvas Presence & Valid Context Enum (webgpu, webgl2, webgl)
-  const VALID_CONTEXTS = ['webgpu', 'webgl2', 'webgl'];
+  const VALID_CONTEXTS = ["webgpu", "webgl2", "webgl"];
   if (!reference.canvas?.exists || !VALID_CONTEXTS.includes(reference.canvas.contextType)) {
-    diffs.push(`Reference canvas must be initialized with valid GPU/GL context (${VALID_CONTEXTS.join('/')}, got contextType '${reference.canvas?.contextType || 'none'}', exists: ${Boolean(reference.canvas?.exists)})`);
+    diffs.push(
+      `Reference canvas must be initialized with valid GPU/GL context (${VALID_CONTEXTS.join("/")}, got contextType '${reference.canvas?.contextType || "none"}', exists: ${Boolean(reference.canvas?.exists)})`,
+    );
   }
   if (!candidate.canvas?.exists || !VALID_CONTEXTS.includes(candidate.canvas.contextType)) {
-    diffs.push(`Candidate canvas must be initialized with valid GPU/GL context (${VALID_CONTEXTS.join('/')}, got contextType '${candidate.canvas?.contextType || 'none'}', exists: ${Boolean(candidate.canvas?.exists)})`);
+    diffs.push(
+      `Candidate canvas must be initialized with valid GPU/GL context (${VALID_CONTEXTS.join("/")}, got contextType '${candidate.canvas?.contextType || "none"}', exists: ${Boolean(candidate.canvas?.exists)})`,
+    );
   }
 
   // Canvas context type parity
   if (reference.canvas?.contextType !== candidate.canvas?.contextType) {
-    diffs.push(`Canvas context mismatch: reference '${reference.canvas?.contextType}' vs candidate '${candidate.canvas?.contextType}'`);
+    diffs.push(
+      `Canvas context mismatch: reference '${reference.canvas?.contextType}' vs candidate '${candidate.canvas?.contextType}'`,
+    );
   }
 
   // Context enum must match requested branch (webgpu vs webgl2 for this pinned H1)
   if (candidate.query?.backend) {
-    const expectedContext = candidate.query.backend === 'webgl' ? 'webgl2' : 'webgpu';
+    const expectedContext = candidate.query.backend === "webgl" ? "webgl2" : "webgpu";
     if (candidate.canvas?.contextType && candidate.canvas.contextType !== expectedContext) {
-      diffs.push(`Canvas context '${candidate.canvas.contextType}' does not match requested branch '${expectedContext}' for backend '${candidate.query.backend}'`);
+      diffs.push(
+        `Canvas context '${candidate.canvas.contextType}' does not match requested branch '${expectedContext}' for backend '${candidate.query.backend}'`,
+      );
     }
   }
 
   // 2. Query parameter parity (using Object.is to strictly preserve count comparisons including NaN)
   if (reference.query && candidate.query) {
     if (reference.query.backend !== candidate.query.backend) {
-      diffs.push(`Backend query mismatch: reference '${reference.query.backend}' vs candidate '${candidate.query.backend}'`);
+      diffs.push(
+        `Backend query mismatch: reference '${reference.query.backend}' vs candidate '${candidate.query.backend}'`,
+      );
     }
     if (reference.query.renderBundle !== candidate.query.renderBundle) {
-      diffs.push(`renderBundle query mismatch: reference ${reference.query.renderBundle} vs candidate ${candidate.query.renderBundle}`);
+      diffs.push(
+        `renderBundle query mismatch: reference ${reference.query.renderBundle} vs candidate ${candidate.query.renderBundle}`,
+      );
     }
     if (!Object.is(reference.query.count, candidate.query.count)) {
-      diffs.push(`count query mismatch: reference ${reference.query.count} vs candidate ${candidate.query.count}`);
+      diffs.push(
+        `count query mismatch: reference ${reference.query.count} vs candidate ${candidate.query.count}`,
+      );
     }
   }
 
   // 3. Document title parity
   if (reference.title !== candidate.title) {
-    diffs.push(`Document title mismatch: reference '${reference.title}' vs candidate '${candidate.title}'`);
+    diffs.push(
+      `Document title mismatch: reference '${reference.title}' vs candidate '${candidate.title}'`,
+    );
   }
 
   // 4. Mandatory presence & state parity of Inspector controls (renderBundle, webgpu, dynamic)
   // 4a. renderBundle control
   if (!reference.controls?.renderBundle?.found) {
-    diffs.push('renderBundle control missing from reference Inspector');
+    diffs.push("renderBundle control missing from reference Inspector");
   }
   if (!candidate.controls?.renderBundle?.found) {
-    diffs.push('renderBundle control missing from candidate Inspector');
+    diffs.push("renderBundle control missing from candidate Inspector");
   }
   if (reference.controls?.renderBundle?.found && candidate.controls?.renderBundle?.found) {
-    if (Boolean(reference.controls.renderBundle.checked) !== Boolean(candidate.controls.renderBundle.checked)) {
-      diffs.push(`renderBundle checked state mismatch: reference ${reference.controls.renderBundle.checked} vs candidate ${candidate.controls.renderBundle.checked}`);
+    if (
+      Boolean(reference.controls.renderBundle.checked) !==
+      Boolean(candidate.controls.renderBundle.checked)
+    ) {
+      diffs.push(
+        `renderBundle checked state mismatch: reference ${reference.controls.renderBundle.checked} vs candidate ${candidate.controls.renderBundle.checked}`,
+      );
     }
   }
 
   // 4b. webgpu control
   if (!reference.controls?.webgpu?.found) {
-    diffs.push('webgpu control missing from reference Inspector');
+    diffs.push("webgpu control missing from reference Inspector");
   }
   if (!candidate.controls?.webgpu?.found) {
-    diffs.push('webgpu control missing from candidate Inspector');
+    diffs.push("webgpu control missing from candidate Inspector");
   }
   if (reference.controls?.webgpu?.found && candidate.controls?.webgpu?.found) {
     if (Boolean(reference.controls.webgpu.checked) !== Boolean(candidate.controls.webgpu.checked)) {
-      diffs.push(`webgpu checked state mismatch: reference ${reference.controls.webgpu.checked} vs candidate ${candidate.controls.webgpu.checked}`);
+      diffs.push(
+        `webgpu checked state mismatch: reference ${reference.controls.webgpu.checked} vs candidate ${candidate.controls.webgpu.checked}`,
+      );
     }
   }
 
   // 4c. dynamic control
   if (!reference.controls?.dynamic?.found) {
-    diffs.push('dynamic control missing from reference Inspector');
+    diffs.push("dynamic control missing from reference Inspector");
   }
   if (!candidate.controls?.dynamic?.found) {
-    diffs.push('dynamic control missing from candidate Inspector');
+    diffs.push("dynamic control missing from candidate Inspector");
   }
   if (reference.controls?.dynamic?.found && candidate.controls?.dynamic?.found) {
-    if (Boolean(reference.controls.dynamic.checked) !== Boolean(candidate.controls.dynamic.checked)) {
-      diffs.push(`dynamic checked state mismatch: reference ${reference.controls.dynamic.checked} vs candidate ${candidate.controls.dynamic.checked}`);
+    if (
+      Boolean(reference.controls.dynamic.checked) !== Boolean(candidate.controls.dynamic.checked)
+    ) {
+      diffs.push(
+        `dynamic checked state mismatch: reference ${reference.controls.dynamic.checked} vs candidate ${candidate.controls.dynamic.checked}`,
+      );
     }
   }
 
   // 5. Candidate honest routing attribution
   if (!candidate.routing?.isRouted) {
-    diffs.push('Candidate must be served through routed compatibility facade (__f3d_router__ present)');
+    diffs.push(
+      "Candidate must be served through routed compatibility facade (__f3d_router__ present)",
+    );
   } else {
-    const expectedRoute = candidate.query?.backend === 'webgl' ? 'exact-backend' : 'retained-upstream';
-    const expectedReason = candidate.query?.backend === 'webgl' ? 'explicit-source-selection' : 'specialization-unavailable';
+    const expectedRoute =
+      candidate.query?.backend === "webgl" ? "exact-backend" : "retained-upstream";
+    const expectedReason =
+      candidate.query?.backend === "webgl"
+        ? "explicit-source-selection"
+        : "specialization-unavailable";
 
     if (candidate.routing.activeRoute !== expectedRoute) {
-      diffs.push(`Candidate route dishonest: expected '${expectedRoute}', got '${candidate.routing.activeRoute}'`);
+      diffs.push(
+        `Candidate route dishonest: expected '${expectedRoute}', got '${candidate.routing.activeRoute}'`,
+      );
     }
-    if (!Array.isArray(candidate.routing.activeReasons) || !candidate.routing.activeReasons.includes(expectedReason)) {
-      diffs.push(`Candidate reason missing: expected '${expectedReason}', got [${(candidate.routing.activeReasons || []).join(', ')}]`);
+    if (
+      !Array.isArray(candidate.routing.activeReasons) ||
+      !candidate.routing.activeReasons.includes(expectedReason)
+    ) {
+      diffs.push(
+        `Candidate reason missing: expected '${expectedReason}', got [${(candidate.routing.activeReasons || []).join(", ")}]`,
+      );
     }
   }
 
   // 6. Reference purity assertion: reference must NOT have router
   if (reference.routing?.isRouted) {
-    diffs.push('Reference snapshot unexpectedly contains __f3d_router__ (must be unmodified upstream)');
+    diffs.push(
+      "Reference snapshot unexpectedly contains __f3d_router__ (must be unmodified upstream)",
+    );
   }
 
   return {
@@ -502,10 +546,11 @@ export function compareH1Snapshots(reference, candidate) {
  *   error?: string
  * }}
  */
-export function comparePixelBuffers(refPixels, candPixels, {
-  colorTolerance = 2,
-  maxDiffPixelPercent = 0.1,
-} = {}) {
+export function comparePixelBuffers(
+  refPixels,
+  candPixels,
+  { colorTolerance = 2, maxDiffPixelPercent = 0.1 } = {},
+) {
   if (!refPixels || !candPixels || !refPixels.data || !candPixels.data) {
     return {
       pass: false,
@@ -517,7 +562,7 @@ export function comparePixelBuffers(refPixels, candPixels, {
       rmse: 255,
       colorTolerance,
       maxDiffPixelPercent,
-      error: 'Missing or invalid pixel buffer data',
+      error: "Missing or invalid pixel buffer data",
     };
   }
 
@@ -632,22 +677,22 @@ export function createMismatchedPixelBuffer(pixelBuffer, mutatePercent = 1.0) {
  * @returns {{ width: number, height: number, data: Uint8ClampedArray }}
  */
 export function captureCanvasPixels(canvas, targetWidth, targetHeight) {
-  if (!canvas) throw new Error('Canvas element is required for pixel capture');
+  if (!canvas) throw new Error("Canvas element is required for pixel capture");
 
-  const doc = canvas.ownerDocument || (typeof document !== 'undefined' ? document : null);
-  if (!doc || typeof doc.createElement !== 'function') {
-    throw new Error('Document environment required for canvas pixel capture');
+  const doc = canvas.ownerDocument || (typeof document !== "undefined" ? document : null);
+  if (!doc || typeof doc.createElement !== "function") {
+    throw new Error("Document environment required for canvas pixel capture");
   }
 
   // Use actual native canvas dimensions by default; no downscaling or resampling (ROOT H1 REVIEW)
   const width = targetWidth || canvas.width || 800;
   const height = targetHeight || canvas.height || 600;
 
-  const offscreen = doc.createElement('canvas');
+  const offscreen = doc.createElement("canvas");
   offscreen.width = width;
   offscreen.height = height;
-  const ctx = offscreen.getContext('2d', { willReadFrequently: true });
-  if (!ctx) throw new Error('Failed to acquire 2D rendering context for canvas readback');
+  const ctx = offscreen.getContext("2d", { willReadFrequently: true });
+  if (!ctx) throw new Error("Failed to acquire 2D rendering context for canvas readback");
 
   // Direct 1:1 pixel copy at native resolution
   ctx.drawImage(canvas, 0, 0, width, height, 0, 0, width, height);
@@ -659,7 +704,6 @@ export function captureCanvasPixels(canvas, targetWidth, targetHeight) {
     data: imgData.data,
   };
 }
-
 
 /**
  * Deterministic pseudo-random sequence prelude for matched H1 testing (ROOT H1 REVIEW).
@@ -703,26 +747,29 @@ export const SEEDED_RANDOM_PRELUDE = `
  * @returns {string} Injected HTML
  */
 export function injectSeededRandomPrelude(html) {
-  if (typeof html !== 'string') return html;
+  if (typeof html !== "string") return html;
   if (html.includes('id="f3d-seeded-random-prelude"')) return html;
 
   const importMapIndex = html.indexOf('<script type="importmap">');
   if (importMapIndex !== -1) {
-    const endTag = '</script>';
+    const endTag = "</script>";
     const closeIndex = html.indexOf(endTag, importMapIndex);
     if (closeIndex !== -1) {
       const insertPos = closeIndex + endTag.length;
-      return html.slice(0, insertPos) + '\n\t\t' + SEEDED_RANDOM_PRELUDE + html.slice(insertPos);
+      return html.slice(0, insertPos) + "\n\t\t" + SEEDED_RANDOM_PRELUDE + html.slice(insertPos);
     }
   }
   if (html.includes('<script type="module">')) {
-    return html.replace('<script type="module">', `${SEEDED_RANDOM_PRELUDE}\n\t\t<script type="module">`);
+    return html.replace(
+      '<script type="module">',
+      `${SEEDED_RANDOM_PRELUDE}\n\t\t<script type="module">`,
+    );
   }
-  if (html.includes('<script')) {
-    return html.replace('<script', `${SEEDED_RANDOM_PRELUDE}\n\t\t<script`);
+  if (html.includes("<script")) {
+    return html.replace("<script", `${SEEDED_RANDOM_PRELUDE}\n\t\t<script`);
   }
-  if (html.includes('</head>')) {
-    return html.replace('</head>', `${SEEDED_RANDOM_PRELUDE}\n</head>`);
+  if (html.includes("</head>")) {
+    return html.replace("</head>", `${SEEDED_RANDOM_PRELUDE}\n</head>`);
   }
   return `${SEEDED_RANDOM_PRELUDE}\n${html}`;
 }
@@ -739,19 +786,35 @@ export function extractCheckpointObservations(win, doc) {
   if (!win) return null;
   const scene = win.__f3d_last_scene__;
   const camera = win.__f3d_last_camera__;
-  const group = scene && scene.children ? scene.children.find(c => c.isGroup || c.isBundleGroup) : null;
+  const group =
+    scene && scene.children ? scene.children.find((c) => c.isGroup || c.isBundleGroup) : null;
   const firstMesh = group && group.children ? group.children[0] : null;
 
   let firstMeshObs = null;
   if (firstMesh) {
     firstMeshObs = {
-      position: firstMesh.position ? [firstMesh.position.x, firstMesh.position.y, firstMesh.position.z] : null,
-      quaternion: firstMesh.quaternion ? [firstMesh.quaternion.x, firstMesh.quaternion.y, firstMesh.quaternion.z, firstMesh.quaternion.w] : null,
-      scale: firstMesh.scale ? [firstMesh.scale.x, firstMesh.scale.y, firstMesh.scale.z] : null,
-      colorHex: firstMesh.material && firstMesh.material.color && typeof firstMesh.material.color.getHexString === 'function'
-        ? firstMesh.material.color.getHexString()
+      position: firstMesh.position
+        ? [firstMesh.position.x, firstMesh.position.y, firstMesh.position.z]
         : null,
-      matrix: firstMesh.matrix && firstMesh.matrix.elements ? Array.from(firstMesh.matrix.elements) : null,
+      quaternion: firstMesh.quaternion
+        ? [
+            firstMesh.quaternion.x,
+            firstMesh.quaternion.y,
+            firstMesh.quaternion.z,
+            firstMesh.quaternion.w,
+          ]
+        : null,
+      scale: firstMesh.scale ? [firstMesh.scale.x, firstMesh.scale.y, firstMesh.scale.z] : null,
+      colorHex:
+        firstMesh.material &&
+        firstMesh.material.color &&
+        typeof firstMesh.material.color.getHexString === "function"
+          ? firstMesh.material.color.getHexString()
+          : null,
+      matrix:
+        firstMesh.matrix && firstMesh.matrix.elements
+          ? Array.from(firstMesh.matrix.elements)
+          : null,
     };
   }
 
@@ -759,8 +822,13 @@ export function extractCheckpointObservations(win, doc) {
   if (camera) {
     cameraObs = {
       position: camera.position ? [camera.position.x, camera.position.y, camera.position.z] : null,
-      quaternion: camera.quaternion ? [camera.quaternion.x, camera.quaternion.y, camera.quaternion.z, camera.quaternion.w] : null,
-      projectionMatrix: camera.projectionMatrix && camera.projectionMatrix.elements ? Array.from(camera.projectionMatrix.elements) : null,
+      quaternion: camera.quaternion
+        ? [camera.quaternion.x, camera.quaternion.y, camera.quaternion.z, camera.quaternion.w]
+        : null,
+      projectionMatrix:
+        camera.projectionMatrix && camera.projectionMatrix.elements
+          ? Array.from(camera.projectionMatrix.elements)
+          : null,
       aspect: camera.aspect !== undefined ? camera.aspect : null,
       fov: camera.fov !== undefined ? camera.fov : null,
       near: camera.near !== undefined ? camera.near : null,
@@ -768,8 +836,8 @@ export function extractCheckpointObservations(win, doc) {
     };
   }
 
-  const rngCount = typeof win.__f3d_rng_count__ === 'number' ? win.__f3d_rng_count__ : null;
-  const rngState = typeof win.__f3d_rng_state__ === 'number' ? win.__f3d_rng_state__ : null;
+  const rngCount = typeof win.__f3d_rng_count__ === "number" ? win.__f3d_rng_count__ : null;
+  const rngState = typeof win.__f3d_rng_state__ === "number" ? win.__f3d_rng_state__ : null;
 
   return {
     firstMesh: firstMeshObs,
@@ -791,14 +859,16 @@ export function extractCheckpointObservations(win, doc) {
 export function compareCheckpointObservations(refObs, candObs) {
   const diffs = [];
   if (!refObs || !candObs) {
-    diffs.push('Missing checkpoint observations (ref or cand null)');
+    diffs.push("Missing checkpoint observations (ref or cand null)");
     return { pass: false, diffs };
   }
 
   // 1. RNG invocation count & state agreement
   if (refObs.rng && candObs.rng) {
     if (refObs.rng.count !== candObs.rng.count) {
-      diffs.push(`RNG invocation count mismatch: ref=${refObs.rng.count} vs cand=${candObs.rng.count}`);
+      diffs.push(
+        `RNG invocation count mismatch: ref=${refObs.rng.count} vs cand=${candObs.rng.count}`,
+      );
     }
     if (refObs.rng.state !== candObs.rng.state) {
       diffs.push(`RNG state mismatch: ref=${refObs.rng.state} vs cand=${candObs.rng.state}`);
@@ -808,50 +878,64 @@ export function compareCheckpointObservations(refObs, candObs) {
   // 2. First mesh transform and material color
   if (refObs.firstMesh && candObs.firstMesh) {
     if (refObs.firstMesh.colorHex !== candObs.firstMesh.colorHex) {
-      diffs.push(`First mesh color mismatch: ref=${refObs.firstMesh.colorHex} vs cand=${candObs.firstMesh.colorHex}`);
+      diffs.push(
+        `First mesh color mismatch: ref=${refObs.firstMesh.colorHex} vs cand=${candObs.firstMesh.colorHex}`,
+      );
     }
     if (refObs.firstMesh.position && candObs.firstMesh.position) {
       for (let i = 0; i < 3; i++) {
         if (Math.abs(refObs.firstMesh.position[i] - candObs.firstMesh.position[i]) > 1e-4) {
-          diffs.push(`First mesh position[${i}] mismatch: ref=${refObs.firstMesh.position[i].toFixed(4)} vs cand=${candObs.firstMesh.position[i].toFixed(4)}`);
+          diffs.push(
+            `First mesh position[${i}] mismatch: ref=${refObs.firstMesh.position[i].toFixed(4)} vs cand=${candObs.firstMesh.position[i].toFixed(4)}`,
+          );
         }
       }
     }
     if (refObs.firstMesh.scale && candObs.firstMesh.scale) {
       for (let i = 0; i < 3; i++) {
         if (Math.abs(refObs.firstMesh.scale[i] - candObs.firstMesh.scale[i]) > 1e-4) {
-          diffs.push(`First mesh scale[${i}] mismatch: ref=${refObs.firstMesh.scale[i].toFixed(4)} vs cand=${candObs.firstMesh.scale[i].toFixed(4)}`);
+          diffs.push(
+            `First mesh scale[${i}] mismatch: ref=${refObs.firstMesh.scale[i].toFixed(4)} vs cand=${candObs.firstMesh.scale[i].toFixed(4)}`,
+          );
         }
       }
     }
     if (refObs.firstMesh.quaternion && candObs.firstMesh.quaternion) {
       for (let i = 0; i < 4; i++) {
         if (Math.abs(refObs.firstMesh.quaternion[i] - candObs.firstMesh.quaternion[i]) > 1e-4) {
-          diffs.push(`First mesh quaternion[${i}] mismatch: ref=${refObs.firstMesh.quaternion[i].toFixed(4)} vs cand=${candObs.firstMesh.quaternion[i].toFixed(4)}`);
+          diffs.push(
+            `First mesh quaternion[${i}] mismatch: ref=${refObs.firstMesh.quaternion[i].toFixed(4)} vs cand=${candObs.firstMesh.quaternion[i].toFixed(4)}`,
+          );
         }
       }
     }
   } else {
-    diffs.push('First mesh observation missing in reference or candidate');
+    diffs.push("First mesh observation missing in reference or candidate");
   }
 
   // 3. Camera projection matrix and parameters
   if (refObs.camera && candObs.camera) {
     if (refObs.camera.aspect !== null && candObs.camera.aspect !== null) {
       if (Math.abs(refObs.camera.aspect - candObs.camera.aspect) > 1e-4) {
-        diffs.push(`Camera aspect mismatch: ref=${refObs.camera.aspect} vs cand=${candObs.camera.aspect}`);
+        diffs.push(
+          `Camera aspect mismatch: ref=${refObs.camera.aspect} vs cand=${candObs.camera.aspect}`,
+        );
       }
     }
     if (refObs.camera.projectionMatrix && candObs.camera.projectionMatrix) {
       for (let i = 0; i < 16; i++) {
-        if (Math.abs(refObs.camera.projectionMatrix[i] - candObs.camera.projectionMatrix[i]) > 1e-4) {
-          diffs.push(`Camera projectionMatrix[${i}] mismatch: ref=${refObs.camera.projectionMatrix[i].toFixed(4)} vs cand=${candObs.camera.projectionMatrix[i].toFixed(4)}`);
+        if (
+          Math.abs(refObs.camera.projectionMatrix[i] - candObs.camera.projectionMatrix[i]) > 1e-4
+        ) {
+          diffs.push(
+            `Camera projectionMatrix[${i}] mismatch: ref=${refObs.camera.projectionMatrix[i].toFixed(4)} vs cand=${candObs.camera.projectionMatrix[i].toFixed(4)}`,
+          );
           break;
         }
       }
     }
   } else {
-    diffs.push('Camera observation missing in reference or candidate');
+    diffs.push("Camera observation missing in reference or candidate");
   }
 
   return {

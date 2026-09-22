@@ -5,12 +5,13 @@
   let finished = false;
   let pendingWaits = 0;
   let pendingFetches = 0;
-  const nativeFetch = (typeof window !== 'undefined' && window.__f3dOmitted && window.__f3dOmitted.name === 'fetch')
-    ? window.__f3dOmitted.value
-    : globalThis.fetch;
-  if (typeof globalThis.fetch === 'function') {
+  const nativeFetch =
+    typeof window !== "undefined" && window.__f3dOmitted && window.__f3dOmitted.name === "fetch"
+      ? window.__f3dOmitted.value
+      : globalThis.fetch;
+  if (typeof globalThis.fetch === "function") {
     const origFetch = globalThis.fetch;
-    globalThis.fetch = function(...args) {
+    globalThis.fetch = function (...args) {
       pendingFetches++;
       return origFetch.apply(this, args).finally(() => {
         pendingFetches--;
@@ -21,11 +22,17 @@
   const pendingStream = [];
   let streamTimer = null;
   function flushStream() {
-    if (streamTimer !== null) { clearTimeout(streamTimer); streamTimer = null; }
+    if (streamTimer !== null) {
+      clearTimeout(streamTimer);
+      streamTimer = null;
+    }
     if (pendingStream.length === 0) return;
     const batch = pendingStream.splice(0, pendingStream.length);
-    nativeFetch('/event', { method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(batch) }).catch(() => {});
+    nativeFetch("/event", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(batch),
+    }).catch(() => {});
   }
   const channel = new MessageChannel();
   const pending = new Map();
@@ -95,18 +102,22 @@
     if (burstResultsEmitted) return;
     burstResultsEmitted = true;
     const totalPumpTurns = wasm && wasm.pump_turns ? wasm.pump_turns() - burstStartPumpTurns : 0;
-    globalThis.f3dHost.event('burst-all-turns', 'pump-turns', totalPumpTurns);
-    globalThis.f3dHost.event('burst-all-turns', 'ceil-avg-per-pump-turn', ceilAvgPerPumpTurn);
-    globalThis.f3dHost.event('burst-all-turns', 'max-pump-turns-per-observation', maxPumpTurnsPerObservation);
-    globalThis.f3dHost.event('burst-all-turns', 'max', maxPollsPerTurn);
-    globalThis.f3dHost.event('burst-all-turns', 'turns', turnsObserved);
+    globalThis.f3dHost.event("burst-all-turns", "pump-turns", totalPumpTurns);
+    globalThis.f3dHost.event("burst-all-turns", "ceil-avg-per-pump-turn", ceilAvgPerPumpTurn);
+    globalThis.f3dHost.event(
+      "burst-all-turns",
+      "max-pump-turns-per-observation",
+      maxPumpTurnsPerObservation,
+    );
+    globalThis.f3dHost.event("burst-all-turns", "max", maxPollsPerTurn);
+    globalThis.f3dHost.event("burst-all-turns", "turns", turnsObserved);
     for (const a of anomalies) {
-      globalThis.f3dHost.event('burst-all-turns', 'anomaly-polls', a.pollsDelta);
-      globalThis.f3dHost.event('burst-all-turns', 'anomaly-turns', a.turnsDelta);
-      globalThis.f3dHost.event('burst-all-turns', 'anomaly-index', a.index);
-      globalThis.f3dHost.event('burst-all-turns', 'anomaly-source', a.source);
+      globalThis.f3dHost.event("burst-all-turns", "anomaly-polls", a.pollsDelta);
+      globalThis.f3dHost.event("burst-all-turns", "anomaly-turns", a.turnsDelta);
+      globalThis.f3dHost.event("burst-all-turns", "anomaly-index", a.index);
+      globalThis.f3dHost.event("burst-all-turns", "anomaly-source", a.source);
     }
-    globalThis.f3dHost.event('burst-all-turns', 'anomalies', totalAnomalies);
+    globalThis.f3dHost.event("burst-all-turns", "anomalies", totalAnomalies);
   }
 
   burstChannel.port1.onmessage = () => {
@@ -132,15 +143,23 @@
   };
   // A Rust panic inside a pump microtask surfaces as an uncaught exception, not as a
   // rejected start_probes() call; report it instead of letting the run look like a hang.
-  addEventListener('error', e => globalThis.f3dHost.finish(false, String(e.error?.stack || e.message || e)));
-  addEventListener('unhandledrejection', e => globalThis.f3dHost.finish(false, String(e.reason?.stack || e.reason)));
+  addEventListener("error", (e) =>
+    globalThis.f3dHost.finish(false, String(e.error?.stack || e.message || e)),
+  );
+  addEventListener("unhandledrejection", (e) =>
+    globalThis.f3dHost.finish(false, String(e.reason?.stack || e.reason)),
+  );
   globalThis.f3dHost = {
     attach(exports) {
       wasm = exports;
       // Host liveness diagnostic: if this never streams, the main thread is frozen
       // (synchronous hang in the Wasm); if it streams with 0 polls, the task was never polled.
-      setTimeout(() => this.event('host-diag', 'main-thread-alive-3s', wasm.burst_polls()), 3000);
-      setTimeout(() => this.event('host-diag', 'reenter-probe-says-pump-running', wasm.reenter_probe() ? 1 : 0), 3500);
+      setTimeout(() => this.event("host-diag", "main-thread-alive-3s", wasm.burst_polls()), 3000);
+      setTimeout(
+        () =>
+          this.event("host-diag", "reenter-probe-says-pump-running", wasm.reenter_probe() ? 1 : 0),
+        3500,
+      );
     },
     wait(source, callback) {
       if (source === 0) {
@@ -186,16 +205,22 @@
         throw new Error(`Unknown host callback source ${source}`);
       }
     },
-    reenter() { return wasm.reenter_probe(); },
-    negative() { return (typeof window !== 'undefined' && window.__f3dNegative) || ''; },
-    turns() { return turnsObserved; },
+    reenter() {
+      return wasm.reenter_probe();
+    },
+    negative() {
+      return (typeof window !== "undefined" && window.__f3dNegative) || "";
+    },
+    turns() {
+      return turnsObserved;
+    },
     inflight(kind) {
       if (kind === 0) return pendingWaits;
       if (kind === 1) return pendingFetches;
       return 0;
     },
     event(probe, step, value) {
-      if (probe === 'burst-first-turn-and-completion' && step === 'spawn') {
+      if (probe === "burst-first-turn-and-completion" && step === "spawn") {
         burstActive = true;
         burstDone = false;
         burstResultsEmitted = false;
@@ -209,7 +234,7 @@
         totalAnomalies = 0;
         burstChannel.port2.postMessage(null);
       }
-      if (probe === 'burst-first-turn-and-completion' && step === 'complete') {
+      if (probe === "burst-first-turn-and-completion" && step === "complete") {
         burstDone = true;
         observeTurn(9);
         burstActive = false;
@@ -220,7 +245,14 @@
           cb(ceilAvgPerPumpTurn);
         }
       }
-      const event = { probe, step, value, ts_wall: Date.now(), host_time_ms: performance.now(), host_turn: hostTurn };
+      const event = {
+        probe,
+        step,
+        value,
+        ts_wall: Date.now(),
+        host_time_ms: performance.now(),
+        host_turn: hostTurn,
+      };
       events.push(event);
       // Stream each observation immediately so a hang still shows how far the Rust program got.
       // Batched streaming: the browser keepalive budget (~64 KB in flight) dropped
@@ -234,13 +266,19 @@
       finished = true;
       flushStream();
       const result = {
-        passed, detail, events, owner: 'asupersync-rust-wasm',
+        passed,
+        detail,
+        events,
+        owner: "asupersync-rust-wasm",
         browser: { userAgent: navigator.userAgent, platform: navigator.platform },
       };
       globalThis.__F3D_PROBE_RESULTS__ = result;
-      document.querySelector('#result').textContent = JSON.stringify(result, null, 2);
-      nativeFetch('/result', { method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(result) }).catch(error => console.error('Result delivery failed', error));
+      document.querySelector("#result").textContent = JSON.stringify(result, null, 2);
+      nativeFetch("/result", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(result),
+      }).catch((error) => console.error("Result delivery failed", error));
       channel.port1.close();
       channel.port2.close();
       burstChannel.port1.close();

@@ -26,8 +26,8 @@
  * Zero speedup claims, ratios, or rankings.
  */
 
-import { createDirectReferenceRenderer } from "./direct_reference.js";
 import { currentPacketView } from "./borrowed_view.js";
+import { createDirectReferenceRenderer } from "./direct_reference.js";
 
 export const BATCH_WIDTH = 256;
 export const BATCH_HEIGHT = 256;
@@ -70,9 +70,18 @@ export function buildSharedRows() {
     const tx = -0.95 + (col + 0.5) * (1.9 / cols);
     const ty = -0.95 + (row + 0.5) * (1.9 / rows);
     const off = i * 12;
-    sharedRows[off]     = sx;  sharedRows[off + 1] = 0.0; sharedRows[off + 2]  = 0.0; sharedRows[off + 3]  = tx;
-    sharedRows[off + 4] = 0.0; sharedRows[off + 5] = sy;  sharedRows[off + 6]  = 0.0; sharedRows[off + 7]  = ty;
-    sharedRows[off + 8] = 0.0; sharedRows[off + 9] = 0.0; sharedRows[off + 10] = 1.0; sharedRows[off + 11] = 0.0;
+    sharedRows[off] = sx;
+    sharedRows[off + 1] = 0.0;
+    sharedRows[off + 2] = 0.0;
+    sharedRows[off + 3] = tx;
+    sharedRows[off + 4] = 0.0;
+    sharedRows[off + 5] = sy;
+    sharedRows[off + 6] = 0.0;
+    sharedRows[off + 7] = ty;
+    sharedRows[off + 8] = 0.0;
+    sharedRows[off + 9] = 0.0;
+    sharedRows[off + 10] = 1.0;
+    sharedRows[off + 11] = 0.0;
   }
   return sharedRows;
 }
@@ -135,7 +144,12 @@ function createWorkloadARunner(vKey, bridge, wasmExports, sharedRows, memory = n
         name: "workload_a_direct",
         implementation_owner: "Direct JS WebGPU",
         init: async () => {
-          r = createDirectReferenceRenderer(bridge.device, BATCH_WIDTH, BATCH_HEIGHT, BATCH_DRAW_COUNT);
+          r = createDirectReferenceRenderer(
+            bridge.device,
+            BATCH_WIDTH,
+            BATCH_HEIGHT,
+            BATCH_DRAW_COUNT,
+          );
         },
         submit: (rows) => {
           let donePromise = null;
@@ -149,7 +163,10 @@ function createWorkloadARunner(vKey, bridge, wasmExports, sharedRows, memory = n
           try {
             if (bridge.device?.queue) await bridge.device.queue.onSubmittedWorkDone();
           } finally {
-            if (r) { r.destroy(); r = null; }
+            if (r) {
+              r.destroy();
+              r = null;
+            }
           }
         },
       };
@@ -161,7 +178,8 @@ function createWorkloadARunner(vKey, bridge, wasmExports, sharedRows, memory = n
         implementation_owner: "Rust/Wasm packet encoder; JS WebGPU decoder",
         init: async () => {
           const initFn = wasmExports.f3d_build_affine_rows_batch_packet;
-          if (typeof initFn !== "function") throw new Error("Missing f3d_build_affine_rows_batch_packet");
+          if (typeof initFn !== "function")
+            throw new Error("Missing f3d_build_affine_rows_batch_packet");
           const initBulkPacket = initFn(sharedRows, BATCH_WIDTH, BATCH_HEIGHT);
           if (!(initBulkPacket instanceof Uint8Array) || initBulkPacket.byteLength === 0) {
             throw new Error("Failed to generate initial bulk packet");
@@ -170,7 +188,8 @@ function createWorkloadARunner(vKey, bridge, wasmExports, sharedRows, memory = n
         },
         submit: (rows) => {
           const framePacketFn = wasmExports.f3d_build_affine_rows_batch_frame_packet;
-          if (typeof framePacketFn !== "function") throw new Error("Missing f3d_build_affine_rows_batch_frame_packet");
+          if (typeof framePacketFn !== "function")
+            throw new Error("Missing f3d_build_affine_rows_batch_frame_packet");
           const packet = framePacketFn(rows, BATCH_WIDTH, BATCH_HEIGHT, BATCH_DRAW_COUNT);
           const packetCompletion = bridge.executePacket(packet);
           const queuePromise = bridge.device.queue.onSubmittedWorkDone();
@@ -203,7 +222,8 @@ function createWorkloadARunner(vKey, bridge, wasmExports, sharedRows, memory = n
         getViewRebuilds: () => viewRebuilds,
         init: async () => {
           const initFn = wasmExports.f3d_build_affine_rows_batch_packet;
-          if (typeof initFn !== "function") throw new Error("Missing f3d_build_affine_rows_batch_packet");
+          if (typeof initFn !== "function")
+            throw new Error("Missing f3d_build_affine_rows_batch_packet");
           const initBulkPacket = initFn(sharedRows, BATCH_WIDTH, BATCH_HEIGHT);
           if (!(initBulkPacket instanceof Uint8Array) || initBulkPacket.byteLength === 0) {
             throw new Error("Failed to generate initial bulk packet");
@@ -211,7 +231,8 @@ function createWorkloadARunner(vKey, bridge, wasmExports, sharedRows, memory = n
           await bridge.executePacket(initBulkPacket);
         },
         submit: (rows) => {
-          const framePacketBorrowedFn = wasmExports.f3d_build_affine_rows_batch_frame_packet_borrowed;
+          const framePacketBorrowedFn =
+            wasmExports.f3d_build_affine_rows_batch_frame_packet_borrowed;
           if (typeof framePacketBorrowedFn !== "function") {
             throw new Error("Missing f3d_build_affine_rows_batch_frame_packet_borrowed");
           }
@@ -272,7 +293,10 @@ function createWorkloadARunner(vKey, bridge, wasmExports, sharedRows, memory = n
     case "workload_a_chatty": {
       let r = null;
       const chattyDrawEncoder = (pass, bindGroup, count) => {
-        const hostObj = typeof window !== "undefined" ? (window.f3dHost = window.f3dHost || {}) : (globalThis.f3dHost = globalThis.f3dHost || {});
+        const hostObj =
+          typeof window !== "undefined"
+            ? (window.f3dHost = window.f3dHost || {})
+            : (globalThis.f3dHost = globalThis.f3dHost || {});
         const prevDrawCall = hostObj.drawCall;
         try {
           hostObj.drawCall = (index) => {
@@ -280,7 +304,8 @@ function createWorkloadARunner(vKey, bridge, wasmExports, sharedRows, memory = n
             pass.draw(3, 1, 0, 0);
           };
           const chattyFn = wasmExports.f3d_bridge_chatty_draw_loop;
-          if (typeof chattyFn !== "function") throw new Error("Missing f3d_bridge_chatty_draw_loop");
+          if (typeof chattyFn !== "function")
+            throw new Error("Missing f3d_bridge_chatty_draw_loop");
           chattyFn(count);
         } finally {
           if (prevDrawCall !== undefined) hostObj.drawCall = prevDrawCall;
@@ -292,7 +317,12 @@ function createWorkloadARunner(vKey, bridge, wasmExports, sharedRows, memory = n
         name: "workload_a_chatty",
         implementation_owner: "Rust/Wasm callback loop; JS WebGPU submission",
         init: async () => {
-          r = createDirectReferenceRenderer(bridge.device, BATCH_WIDTH, BATCH_HEIGHT, BATCH_DRAW_COUNT);
+          r = createDirectReferenceRenderer(
+            bridge.device,
+            BATCH_WIDTH,
+            BATCH_HEIGHT,
+            BATCH_DRAW_COUNT,
+          );
         },
         submit: (rows) => {
           let donePromise = null;
@@ -306,7 +336,10 @@ function createWorkloadARunner(vKey, bridge, wasmExports, sharedRows, memory = n
           try {
             if (bridge.device?.queue) await bridge.device.queue.onSubmittedWorkDone();
           } finally {
-            if (r) { r.destroy(); r = null; }
+            if (r) {
+              r.destroy();
+              r = null;
+            }
           }
         },
       };
@@ -323,7 +356,12 @@ function createWorkloadARunner(vKey, bridge, wasmExports, sharedRows, memory = n
           if (typeof genMod.executeStaticSubmission4000 !== "function") {
             throw new Error("Missing executeStaticSubmission4000 in static_submission_4000.js");
           }
-          r = createDirectReferenceRenderer(bridge.device, BATCH_WIDTH, BATCH_HEIGHT, BATCH_DRAW_COUNT);
+          r = createDirectReferenceRenderer(
+            bridge.device,
+            BATCH_WIDTH,
+            BATCH_HEIGHT,
+            BATCH_DRAW_COUNT,
+          );
         },
         submit: (rows) => {
           const packFn = wasmExports.f3d_pack_affine_rows_bytes;
@@ -333,7 +371,7 @@ function createWorkloadARunner(vKey, bridge, wasmExports, sharedRows, memory = n
             donePromise = r.submitFrame(
               null,
               (pass, bg) => genMod.executeStaticSubmission4000(pass, bg),
-              () => packFn(rows)
+              () => packFn(rows),
             );
           });
           return settleAll([scopePromise, donePromise]);
@@ -343,7 +381,10 @@ function createWorkloadARunner(vKey, bridge, wasmExports, sharedRows, memory = n
           try {
             if (bridge.device?.queue) await bridge.device.queue.onSubmittedWorkDone();
           } finally {
-            if (r) { r.destroy(); r = null; }
+            if (r) {
+              r.destroy();
+              r = null;
+            }
           }
         },
       };
@@ -375,7 +416,10 @@ function createWorkloadCRunner(vKey, bridge, wasmExports, sharedRows) {
       if (kind === "generated") {
         tailMod.executeStaticSubmission4(pass, bindGroup);
       } else if (kind === "chatty") {
-        const hostObj = typeof window !== "undefined" ? (window.f3dHost = window.f3dHost || {}) : (globalThis.f3dHost = globalThis.f3dHost || {});
+        const hostObj =
+          typeof window !== "undefined"
+            ? (window.f3dHost = window.f3dHost || {})
+            : (globalThis.f3dHost = globalThis.f3dHost || {});
         const previous = hostObj.drawCall;
         try {
           hostObj.drawCall = (index) => {
@@ -383,7 +427,8 @@ function createWorkloadCRunner(vKey, bridge, wasmExports, sharedRows) {
             pass.draw(3, 1, 0, 0);
           };
           const chattyFn = wasmExports.f3d_bridge_chatty_draw_loop;
-          if (typeof chattyFn !== "function") throw new Error("Missing f3d_bridge_chatty_draw_loop");
+          if (typeof chattyFn !== "function")
+            throw new Error("Missing f3d_bridge_chatty_draw_loop");
           chattyFn(4);
         } finally {
           if (previous === undefined) delete hostObj.drawCall;
@@ -406,7 +451,12 @@ function createWorkloadCRunner(vKey, bridge, wasmExports, sharedRows) {
         name: "workload_c_direct_bundle",
         implementation_owner: "Direct JS WebGPU (render bundle)",
         init: async () => {
-          r = createDirectReferenceRenderer(bridge.device, BATCH_WIDTH, BATCH_HEIGHT, BATCH_DRAW_COUNT);
+          r = createDirectReferenceRenderer(
+            bridge.device,
+            BATCH_WIDTH,
+            BATCH_HEIGHT,
+            BATCH_DRAW_COUNT,
+          );
           bundleEncoder = createBundleEncoder(r, "direct", null);
         },
         submit: (rows) => {
@@ -421,7 +471,10 @@ function createWorkloadCRunner(vKey, bridge, wasmExports, sharedRows) {
           try {
             if (bridge.device?.queue) await bridge.device.queue.onSubmittedWorkDone();
           } finally {
-            if (r) { r.destroy(); r = null; }
+            if (r) {
+              r.destroy();
+              r = null;
+            }
           }
         },
       };
@@ -434,7 +487,8 @@ function createWorkloadCRunner(vKey, bridge, wasmExports, sharedRows) {
         implementation_owner: "Rust/Wasm packet encoder; JS WebGPU decoder (render bundle)",
         init: async () => {
           const initFn = wasmExports.f3d_build_affine_rows_batch_packet;
-          if (typeof initFn !== "function") throw new Error("Missing f3d_build_affine_rows_batch_packet");
+          if (typeof initFn !== "function")
+            throw new Error("Missing f3d_build_affine_rows_batch_packet");
           const initBulkPacket = initFn(sharedRows, BATCH_WIDTH, BATCH_HEIGHT);
           if (!(initBulkPacket instanceof Uint8Array) || initBulkPacket.byteLength === 0) {
             throw new Error("Failed to generate initial bulk packet");
@@ -442,17 +496,29 @@ function createWorkloadCRunner(vKey, bridge, wasmExports, sharedRows) {
           await bridge.executePacket(initBulkPacket);
 
           const bundlePacket = wasmExports.f3d_build_affine_rows_bundle_packet;
-          if (typeof bundlePacket !== "function") throw new Error("Missing f3d_build_affine_rows_bundle_packet");
-          const bundleInitPacket = bundlePacket(sharedRows, BATCH_WIDTH, BATCH_HEIGHT, BATCH_DRAW_COUNT, 4, true);
+          if (typeof bundlePacket !== "function")
+            throw new Error("Missing f3d_build_affine_rows_bundle_packet");
+          const bundleInitPacket = bundlePacket(
+            sharedRows,
+            BATCH_WIDTH,
+            BATCH_HEIGHT,
+            BATCH_DRAW_COUNT,
+            4,
+            true,
+          );
           await bridge.executePacket(bundleInitPacket);
           bulkBundle = bridge.bundles.get(200);
           if (!bulkBundle) throw new Error("Rust bundle packet did not record bundle 200");
         },
         submit: (rows) => {
-          if (bridge.bundles.get(200) !== bulkBundle) throw new Error("Bundle identity changed before replay");
+          if (bridge.bundles.get(200) !== bulkBundle)
+            throw new Error("Bundle identity changed before replay");
           const bundlePacket = wasmExports.f3d_build_affine_rows_bundle_packet;
           const packet = bundlePacket(rows, BATCH_WIDTH, BATCH_HEIGHT, BATCH_DRAW_COUNT, 4, false);
-          return settleAll([bridge.executePacket(packet), bridge.device.queue.onSubmittedWorkDone()]);
+          return settleAll([
+            bridge.executePacket(packet),
+            bridge.device.queue.onSubmittedWorkDone(),
+          ]);
         },
         readback: () => bridge.readbackBuffer(20, BATCH_READBACK_SIZE),
         destroy: async () => {
@@ -480,7 +546,12 @@ function createWorkloadCRunner(vKey, bridge, wasmExports, sharedRows) {
         name: "workload_c_chatty_bundle",
         implementation_owner: "Rust/Wasm callback loop; JS WebGPU submission (render bundle)",
         init: async () => {
-          r = createDirectReferenceRenderer(bridge.device, BATCH_WIDTH, BATCH_HEIGHT, BATCH_DRAW_COUNT);
+          r = createDirectReferenceRenderer(
+            bridge.device,
+            BATCH_WIDTH,
+            BATCH_HEIGHT,
+            BATCH_DRAW_COUNT,
+          );
           bundleEncoder = createBundleEncoder(r, "chatty", null);
         },
         submit: (rows) => {
@@ -495,7 +566,10 @@ function createWorkloadCRunner(vKey, bridge, wasmExports, sharedRows) {
           try {
             if (bridge.device?.queue) await bridge.device.queue.onSubmittedWorkDone();
           } finally {
-            if (r) { r.destroy(); r = null; }
+            if (r) {
+              r.destroy();
+              r = null;
+            }
           }
         },
       };
@@ -507,10 +581,16 @@ function createWorkloadCRunner(vKey, bridge, wasmExports, sharedRows) {
       let tailMod = null;
       return {
         name: "workload_c_generated_bundle",
-        implementation_owner: "Rust/Wasm owned data packing; generated JS submission (render bundle)",
+        implementation_owner:
+          "Rust/Wasm owned data packing; generated JS submission (render bundle)",
         init: async () => {
           tailMod = await getTailModule();
-          r = createDirectReferenceRenderer(bridge.device, BATCH_WIDTH, BATCH_HEIGHT, BATCH_DRAW_COUNT);
+          r = createDirectReferenceRenderer(
+            bridge.device,
+            BATCH_WIDTH,
+            BATCH_HEIGHT,
+            BATCH_DRAW_COUNT,
+          );
           bundleEncoder = createBundleEncoder(r, "generated", tailMod);
         },
         submit: (rows) => {
@@ -527,7 +607,10 @@ function createWorkloadCRunner(vKey, bridge, wasmExports, sharedRows) {
           try {
             if (bridge.device?.queue) await bridge.device.queue.onSubmittedWorkDone();
           } finally {
-            if (r) { r.destroy(); r = null; }
+            if (r) {
+              r.destroy();
+              r = null;
+            }
           }
         },
       };
@@ -575,11 +658,13 @@ async function runWorkloadMeasurement(config) {
     const origSubmit = countedQueue?.submit;
     const origOnSubmittedWorkDone = countedQueue?.onSubmittedWorkDone;
 
-    const hadOwnCreateEncoder = Object.prototype.hasOwnProperty.call(bridge.device, "createCommandEncoder");
-    const hadOwnCreateBundleEncoder = Object.prototype.hasOwnProperty.call(bridge.device, "createRenderBundleEncoder");
-    const hadOwnWriteBuffer = countedQueue ? Object.prototype.hasOwnProperty.call(countedQueue, "writeBuffer") : false;
-    const hadOwnSubmit = countedQueue ? Object.prototype.hasOwnProperty.call(countedQueue, "submit") : false;
-    const hadOwnOnSubmittedWorkDone = countedQueue ? Object.prototype.hasOwnProperty.call(countedQueue, "onSubmittedWorkDone") : false;
+    const hadOwnCreateEncoder = Object.hasOwn(bridge.device, "createCommandEncoder");
+    const hadOwnCreateBundleEncoder = Object.hasOwn(bridge.device, "createRenderBundleEncoder");
+    const hadOwnWriteBuffer = countedQueue ? Object.hasOwn(countedQueue, "writeBuffer") : false;
+    const hadOwnSubmit = countedQueue ? Object.hasOwn(countedQueue, "submit") : false;
+    const hadOwnOnSubmittedWorkDone = countedQueue
+      ? Object.hasOwn(countedQueue, "onSubmittedWorkDone")
+      : false;
 
     const countingWasmExports = { ...wasmExports };
 
@@ -709,7 +794,8 @@ async function runWorkloadMeasurement(config) {
     if (countedQueue) {
       countedQueue.writeBuffer = function (buf, offset, data, ...rest) {
         currentStats.webgpu_api_calls++;
-        const byteLen = data?.byteLength || (data?.length ? data.length * (data.BYTES_PER_ELEMENT || 1) : 0);
+        const byteLen =
+          data?.byteLength || (data?.length ? data.length * (data.BYTES_PER_ELEMENT || 1) : 0);
         currentStats.js_bytes_copied += byteLen;
         return origWriteBuffer.call(this, buf, offset, data, ...rest);
       };
@@ -758,10 +844,13 @@ async function runWorkloadMeasurement(config) {
     if (typeof wasmExports?.f3d_bridge_chatty_draw_loop === "function") {
       countingWasmExports.f3d_bridge_chatty_draw_loop = function (count) {
         currentStats.wasm_boundary_calls++; // JS-to-Wasm export call
-        const hostObj = typeof window !== "undefined" ? (window.f3dHost = window.f3dHost || {}) : (globalThis.f3dHost = globalThis.f3dHost || {});
+        const hostObj =
+          typeof window !== "undefined"
+            ? (window.f3dHost = window.f3dHost || {})
+            : (globalThis.f3dHost = globalThis.f3dHost || {});
         const origDrawCall = hostObj.drawCall;
         if (typeof origDrawCall === "function") {
-          hostObj.drawCall = function (idx) {
+          hostObj.drawCall = (idx) => {
             currentStats.wasm_boundary_calls++; // Wasm-to-JS callback
             return origDrawCall(idx);
           };
@@ -779,7 +868,10 @@ async function runWorkloadMeasurement(config) {
       countingWasmExports.f3d_build_affine_rows_batch_frame_packet_borrowed = function (...args) {
         currentStats.wasm_boundary_calls++;
         currentStats.js_bytes_copied += args[0].byteLength;
-        const ptrLen = wasmExports.f3d_build_affine_rows_batch_frame_packet_borrowed.apply(this, args);
+        const ptrLen = wasmExports.f3d_build_affine_rows_batch_frame_packet_borrowed.apply(
+          this,
+          args,
+        );
         currentStats.js_bytes_copied += 8;
         if (ptrLen && ptrLen.length >= 2) {
           currentStats.js_bytes_viewed = (currentStats.js_bytes_viewed || 0) + ptrLen[1];
@@ -814,9 +906,11 @@ async function runWorkloadMeasurement(config) {
           currentStats.js_bytes_viewed = 0;
         }
 
-        const rebuildsBefore = typeof runner.getViewRebuilds === "function" ? runner.getViewRebuilds() : 0;
+        const rebuildsBefore =
+          typeof runner.getViewRebuilds === "function" ? runner.getViewRebuilds() : 0;
         await runner.submit(repeatedFrames[f]);
-        const rebuildsAfter = typeof runner.getViewRebuilds === "function" ? runner.getViewRebuilds() : 0;
+        const rebuildsAfter =
+          typeof runner.getViewRebuilds === "function" ? runner.getViewRebuilds() : 0;
         const frameRebuilds = rebuildsAfter - rebuildsBefore;
 
         const frameStat = {
@@ -836,7 +930,8 @@ async function runWorkloadMeasurement(config) {
       if (hadOwnCreateEncoder) bridge.device.createCommandEncoder = origCreateCommandEncoder;
       else delete bridge.device.createCommandEncoder;
 
-      if (hadOwnCreateBundleEncoder) bridge.device.createRenderBundleEncoder = origCreateRenderBundleEncoder;
+      if (hadOwnCreateBundleEncoder)
+        bridge.device.createRenderBundleEncoder = origCreateRenderBundleEncoder;
       else delete bridge.device.createRenderBundleEncoder;
 
       if (countedQueue) {
@@ -867,7 +962,7 @@ async function runWorkloadMeasurement(config) {
         f.webgpu_api_calls !== first.webgpu_api_calls ||
         f.js_bytes_copied !== first.js_bytes_copied ||
         (isBorrowedLane &&
-          (f.js_bytes_viewed !== first.js_bytes_viewed || f.view_rebuilds !== first.view_rebuilds))
+          (f.js_bytes_viewed !== first.js_bytes_viewed || f.view_rebuilds !== first.view_rebuilds)),
     );
 
     let viewRebuildsPerFrame = null;
@@ -886,13 +981,16 @@ async function runWorkloadMeasurement(config) {
     let queueUnavailableReason = null;
     if (hasUnstableQueue) {
       const frameNames = unstableFrames.map((f) => f.frame).join(", ");
-      queueUnavailableReason = unstableFrames.length === 1
-        ? `Queue identity unstable on frame ${frameNames} (bridge.device.queue !== countedQueue)`
-        : `Queue identity unstable on frames ${frameNames} (bridge.device.queue !== countedQueue)`;
+      queueUnavailableReason =
+        unstableFrames.length === 1
+          ? `Queue identity unstable on frame ${frameNames} (bridge.device.queue !== countedQueue)`
+          : `Queue identity unstable on frames ${frameNames} (bridge.device.queue !== countedQueue)`;
     }
 
     const countsUnavailableReason = queueUnavailableReason
-      ? (viewRebuildsUnavailableReason ? `${queueUnavailableReason}; ${viewRebuildsUnavailableReason}` : queueUnavailableReason)
+      ? viewRebuildsUnavailableReason
+        ? `${queueUnavailableReason}; ${viewRebuildsUnavailableReason}`
+        : queueUnavailableReason
       : viewRebuildsUnavailableReason;
 
     return {
@@ -986,7 +1084,9 @@ async function runWorkloadMeasurement(config) {
   // Resource-timing entry for f3d_runtime_bg.wasm measures download duration (wasm_fetch_ms).
   let wasmFetchMs = "unavailable";
   if (typeof performance !== "undefined" && typeof performance.getEntriesByType === "function") {
-    const res = performance.getEntriesByType("resource")?.find((e) => e.name?.includes("f3d_runtime_bg.wasm"));
+    const res = performance
+      .getEntriesByType("resource")
+      ?.find((e) => e.name?.includes("f3d_runtime_bg.wasm"));
     if (res?.duration != null) wasmFetchMs = res.duration;
   }
   const wasmInstantiateMs = "unavailable";
@@ -1074,7 +1174,7 @@ async function runWorkloadMeasurement(config) {
             },
             (err) => {
               if (!firstError) firstError = err;
-            }
+            },
           );
           inFlight.push(tracked);
         }
@@ -1090,7 +1190,7 @@ async function runWorkloadMeasurement(config) {
         const finalPixels = await runner.readback();
         if (!finalPixels || finalPixels.byteLength !== BATCH_READBACK_SIZE) {
           throw new Error(
-            `Round ${r} ${vKey} readback length mismatch: got ${finalPixels?.byteLength}, expected ${BATCH_READBACK_SIZE}`
+            `Round ${r} ${vKey} readback length mismatch: got ${finalPixels?.byteLength}, expected ${BATCH_READBACK_SIZE}`,
           );
         }
         roundPixels[vKey] = finalPixels;
@@ -1135,7 +1235,9 @@ async function runWorkloadMeasurement(config) {
         if (i % 4 !== 3 && directPixels[i] !== 0) directNonZeroRgb++;
       }
       if (directNonZeroRgb === 0) {
-        const noRgbErr = new Error(`Direct reference rendered image in round ${r} has no non-zero RGB color channels`);
+        const noRgbErr = new Error(
+          `Direct reference rendered image in round ${r} has no non-zero RGB color channels`,
+        );
         if (!variantErrors[directKey]) variantErrors[directKey] = noRgbErr;
       }
 
@@ -1145,13 +1247,17 @@ async function runWorkloadMeasurement(config) {
         if (vPixels) {
           const diffs = comparePixels(vPixels, directPixels);
           if (diffs > 0) {
-            const mismatchErr = new Error(`Round ${r} ${vKey} pixels mismatch direct reference: ${diffs} differences`);
+            const mismatchErr = new Error(
+              `Round ${r} ${vKey} pixels mismatch direct reference: ${diffs} differences`,
+            );
             if (!variantErrors[vKey]) variantErrors[vKey] = mismatchErr;
           }
         }
       }
     } else if (!variantErrors[directKey]) {
-      variantErrors[directKey] = new Error(`Direct reference missing readback pixels in round ${r}`);
+      variantErrors[directKey] = new Error(
+        `Direct reference missing readback pixels in round ${r}`,
+      );
     }
 
     roundRecords.push(roundData);
@@ -1189,11 +1295,20 @@ async function runWorkloadMeasurement(config) {
 
     let unavailableReason = null;
     if (!countsValid && !initValid) {
-      const countsReason = countsEntry?.unavailable_reason || `Counts pass failed (${countsEntry?.error || "unknown"})`;
+      const countsReason =
+        countsEntry?.unavailable_reason ||
+        `Counts pass failed (${countsEntry?.error || "unknown"})`;
       unavailableReason = `${countsReason}; Init passes failed (${initErrors[vKey] || "unknown"})`;
     } else if (!countsValid) {
-      unavailableReason = countsEntry?.unavailable_reason || `Counts pass failed (${countsEntry?.error || "unknown"})`;
-    } else if (isBorrowedLane && countsValid && countsEntry.view_rebuilds_per_frame == null && countsEntry.unavailable_reason) {
+      unavailableReason =
+        countsEntry?.unavailable_reason ||
+        `Counts pass failed (${countsEntry?.error || "unknown"})`;
+    } else if (
+      isBorrowedLane &&
+      countsValid &&
+      countsEntry.view_rebuilds_per_frame == null &&
+      countsEntry.unavailable_reason
+    ) {
       unavailableReason = countsEntry.unavailable_reason;
     } else if (!initValid) {
       unavailableReason = `Init passes failed (${initErrors[vKey] || "unknown"})`;
@@ -1246,19 +1361,27 @@ async function runWorkloadMeasurement(config) {
         counts: isBorrowedLane
           ? "wasm_boundary_calls (JS-Wasm exports plus Wasm-JS callbacks, including chatty drawCall callbacks and borrow enter/exit), webgpu_api_calls (device, queue, encoder, pass methods), js_bytes_copied (JS-to-Wasm input copies, Wasm-to-JS output copies, and writeBuffer payloads; excludes Rust-internal copies), js_bytes_viewed (direct Wasm memory packet bytes read by JS decoder), and view_rebuilds (Uint8Array view reallocations across frames) measured across 8 untimed frames per runner with counting wrappers removed before timed rounds"
           : "wasm_boundary_calls (JS-Wasm exports plus Wasm-JS callbacks, including chatty drawCall callbacks), webgpu_api_calls (device, queue, encoder, pass methods), js_bytes_copied (JS-to-Wasm input copies, Wasm-to-JS output copies, and writeBuffer payloads; excludes Rust-internal copies) measured across 8 untimed frames per runner with counting wrappers removed before timed rounds",
-        queue_identity_stable: "asserts bridge.device.queue === countedQueue on every counted frame; if false, per-frame counts are reported as null with unavailable_reason naming the frame",
+        queue_identity_stable:
+          "asserts bridge.device.queue === countedQueue on every counted frame; if false, per-frame counts are reported as null with unavailable_reason naming the frame",
         ...(isBorrowedLane
           ? {
-              bytes_viewed: "bytes_viewed is not zero-copy to the GPU (queue.writeBuffer still copies)",
-              borrow_scope: "BorrowScope growth refusal is bookkeeping only (Rust try_grow_memory does not call memory.grow), so allocator growth is caught only by the JS buffer-identity check",
-              view_rebuilds: "frame 0 has no cached view by construction, so rebuilds are counted from frame 1",
+              bytes_viewed:
+                "bytes_viewed is not zero-copy to the GPU (queue.writeBuffer still copies)",
+              borrow_scope:
+                "BorrowScope growth refusal is bookkeeping only (Rust try_grow_memory does not call memory.grow), so allocator growth is caught only by the JS buffer-identity check",
+              view_rebuilds:
+                "frame 0 has no cached view by construction, so rebuilds are counted from frame 1",
             }
           : {}),
-        init_ms: "runner persistent init plus first completed frame across 5 separate passes with rotated runner order; records init_ms_samples (5 values), init_ms_median, init_ms_p95, and the init_order of every pass",
-        wasm_fetch_ms: "resource-timing download duration for f3d_runtime_bg.wasm, or 'unavailable' if no resource timing entry matches",
+        init_ms:
+          "runner persistent init plus first completed frame across 5 separate passes with rotated runner order; records init_ms_samples (5 values), init_ms_median, init_ms_p95, and the init_order of every pass",
+        wasm_fetch_ms:
+          "resource-timing download duration for f3d_runtime_bg.wasm, or 'unavailable' if no resource timing entry matches",
         wasm_instantiate_ms: "unavailable in this lane without html changes",
-        throughput_fps: "measured frames divided by measured-only elapsed seconds (measured_count * 1000 / elapsed_ms) per round",
-        total_wall_time_ms: "total wall clock elapsed time for the measurement lane from lane start to completion",
+        throughput_fps:
+          "measured frames divided by measured-only elapsed seconds (measured_count * 1000 / elapsed_ms) per round",
+        total_wall_time_ms:
+          "total wall clock elapsed time for the measurement lane from lane start to completion",
       },
     },
     wasm_fetch_ms: wasmFetchMs,
@@ -1282,7 +1405,8 @@ async function runWorkloadMeasurement(config) {
         implementation_owner: owner,
       };
     } else {
-      const initStr = summary.init_ms_median != null ? `${summary.init_ms_median.toFixed(3)}ms` : "unavailable";
+      const initStr =
+        summary.init_ms_median != null ? `${summary.init_ms_median.toFixed(3)}ms` : "unavailable";
       let countsStr;
       if (summary.wasm_boundary_calls_per_frame != null) {
         countsStr = `wasm_calls=${summary.wasm_boundary_calls_per_frame}, webgpu_calls=${summary.webgpu_api_calls_per_frame}, bytes_copied=${summary.js_bytes_copied_per_frame}`;
@@ -1382,17 +1506,18 @@ export async function testWorkloadCMeasurementMode(bridge, wasmExports, external
  * Measures workload_a_direct, workload_a_bulk, and workload_a_bulk_borrowed
  * with the exact same rounds, warmup, init passes, and pixel identity.
  */
-export async function testBorrowedBulkMeasurementMode(bridge, wasmExports, memory, externalFactories = null) {
+export async function testBorrowedBulkMeasurementMode(
+  bridge,
+  wasmExports,
+  memory,
+  externalFactories = null,
+) {
   if (!bridge || !bridge.device) throw new Error("WebGpuBridgeHost device not initialized");
 
   const sharedRows = buildSharedRows();
   const repeatedFrames = buildRepeatedFrames(sharedRows, WORKLOAD_AC_MEASURE_TOTAL_FRAMES);
 
-  const variantKeys = [
-    "workload_a_direct",
-    "workload_a_bulk",
-    "workload_a_bulk_borrowed",
-  ];
+  const variantKeys = ["workload_a_direct", "workload_a_bulk", "workload_a_bulk_borrowed"];
 
   const createRunnerFn = (vKey, b, w, s) => {
     if (externalFactories && typeof externalFactories[vKey] === "function") {

@@ -12,14 +12,17 @@
  * - Zero copy ledger recording (globalTransportLedger invariant).
  */
 
-import test from "node:test";
 import assert from "node:assert/strict";
-
-import {
-  validateMemoryView, globalTransportLedger, isDetached, copyFromWasmMemory,
-  ensureSafePacketBytes, TransportCopyLedger,
-} from "./memory_transport.js";
+import test from "node:test";
 import { borrowPacketView, currentPacketView } from "./borrowed_view.js";
+import {
+  copyFromWasmMemory,
+  ensureSafePacketBytes,
+  globalTransportLedger,
+  isDetached,
+  TransportCopyLedger,
+  validateMemoryView,
+} from "./memory_transport.js";
 
 test("live zero-page memory supports zero-byte transport but not empty command packets", () => {
   const memory = new WebAssembly.Memory({ initial: 0, maximum: 1 });

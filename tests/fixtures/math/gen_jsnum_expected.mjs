@@ -9,9 +9,9 @@
  * NaNs, infinities, and full 64-bit precision without JSON serialization distortion.
  */
 
-import fs from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -27,7 +27,7 @@ const u64Buf = new BigUint64Array(f64Buf.buffer);
  */
 export function toF64Hex(val) {
   f64Buf[0] = val;
-  return '0x' + u64Buf[0].toString(16).padStart(16, '0');
+  return "0x" + u64Buf[0].toString(16).padStart(16, "0");
 }
 
 /**
@@ -36,8 +36,8 @@ export function toF64Hex(val) {
  * @returns {number}
  */
 export function fromF64Hex(hex) {
-  const clean = hex.startsWith('0x') ? hex.slice(2) : hex;
-  u64Buf[0] = BigInt('0x' + clean);
+  const clean = hex.startsWith("0x") ? hex.slice(2) : hex;
+  u64Buf[0] = BigInt("0x" + clean);
   return f64Buf[0];
 }
 
@@ -88,15 +88,15 @@ export function generate64PseudoRandomDoubles(seed = 0x202609101337c001n) {
     if (mode === 0) {
       // Wide exponent range: [-100, 100]
       const exp = Number(lcg.nextU64() % 201n) - 100;
-      const sign = (lcg.nextU64() & 1n) ? -1 : 1;
-      val = sign * (1.0 + lcg.nextDouble()) * Math.pow(2, exp);
+      const sign = lcg.nextU64() & 1n ? -1 : 1;
+      val = sign * (1.0 + lcg.nextDouble()) * 2 ** exp;
     } else if (mode === 1) {
       // Moderate range: [-1e9, 1e9]
-      const sign = (lcg.nextU64() & 1n) ? -1 : 1;
+      const sign = lcg.nextU64() & 1n ? -1 : 1;
       val = sign * lcg.nextDouble() * 1e9;
     } else if (mode === 2) {
       // Fractional range around zero: [-50.0, 50.0]
-      const sign = (lcg.nextU64() & 1n) ? -1 : 1;
+      const sign = lcg.nextU64() & 1n ? -1 : 1;
       val = sign * lcg.nextDouble() * 50.0;
     } else {
       // Direct 64-bit float representation (masking out 0x7ff exponent to keep finite)
@@ -127,8 +127,8 @@ export function buildInputsTable(seed = 0x202609101337c001n) {
     -Infinity,
 
     // Subnormals (smallest, largest, arbitrary, positive & negative)
-    Number.MIN_VALUE,              // 5e-324, bits 0x0000000000000001
-    -Number.MIN_VALUE,             // -5e-324, bits 0x8000000000000001
+    Number.MIN_VALUE, // 5e-324, bits 0x0000000000000001
+    -Number.MIN_VALUE, // -5e-324, bits 0x8000000000000001
     floatFromBits(0x000fffffffffffffn), // largest positive subnormal
     floatFromBits(0x800fffffffffffffn), // largest negative subnormal
     floatFromBits(0x00000000deadbeefn), // arbitrary subnormal
@@ -170,31 +170,31 @@ export function buildInputsTable(seed = 0x202609101337c001n) {
     -Number.EPSILON,
 
     // Boundary powers of 2 and overflow thresholds
-    Math.pow(2, 31),          // 2147483648 (i32 boundary)
-    -Math.pow(2, 31),         // -2147483648
-    Math.pow(2, 31) - 1,      // 2147483647
-    -(Math.pow(2, 31) - 1),   // -2147483647
-    Math.pow(2, 32),          // 4294967296 (u32 boundary)
-    -Math.pow(2, 32),
-    Math.pow(2, 32) + 1,      // 4294967297
-    -(Math.pow(2, 32) + 1),
+    2 ** 31, // 2147483648 (i32 boundary)
+    -(2 ** 31), // -2147483648
+    2 ** 31 - 1, // 2147483647
+    -(2 ** 31 - 1), // -2147483647
+    2 ** 32, // 4294967296 (u32 boundary)
+    -(2 ** 32),
+    2 ** 32 + 1, // 4294967297
+    -(2 ** 32 + 1),
 
     // Large doubles with integer / modulo relevance
     1e15,
     -1e15,
-    Math.pow(2, 52),          // 4503599627370496 (exact integer precision limit)
-    -Math.pow(2, 52),
-    Math.pow(2, 53),          // 9007199254740992 (MAX_SAFE_INTEGER + 1)
-    -Math.pow(2, 53),
-    Math.pow(2, 60),          // Multiple of 2^32
-    -Math.pow(2, 60),
-    Math.pow(2, 84),          // 19342813113834066795298816 (2^84: ToUint32 always 0)
-    -Math.pow(2, 84),
-    Math.pow(2, 85),
-    -Math.pow(2, 85),
+    2 ** 52, // 4503599627370496 (exact integer precision limit)
+    -(2 ** 52),
+    2 ** 53, // 9007199254740992 (MAX_SAFE_INTEGER + 1)
+    -(2 ** 53),
+    2 ** 60, // Multiple of 2^32
+    -(2 ** 60),
+    2 ** 84, // 19342813113834066795298816 (2^84: ToUint32 always 0)
+    -(2 ** 84),
+    2 ** 85,
+    -(2 ** 85),
 
     // Maximum representable finite double
-    Number.MAX_VALUE,         // 1.7976931348623157e+308
+    Number.MAX_VALUE, // 1.7976931348623157e+308
     -Number.MAX_VALUE,
   ];
 
@@ -205,15 +205,7 @@ export function buildInputsTable(seed = 0x202609101337c001n) {
 /**
  * Shift amounts table specified by roa.1: s in -1, 0, 1, 31, 32, 33, NaN
  */
-export const SHIFT_AMOUNTS = [
-  -1.0,
-  0.0,
-  1.0,
-  31.0,
-  32.0,
-  33.0,
-  Number.NaN,
-];
+export const SHIFT_AMOUNTS = [-1.0, 0.0, 1.0, 31.0, 32.0, 33.0, Number.NaN];
 
 /**
  * Divisor table (y) for testing x % y across boundary conditions
@@ -311,9 +303,10 @@ export function generateFixtureData(seed = 0x202609101337c001n) {
 
   return {
     metadata: {
-      generator: 'tests/fixtures/math/gen_jsnum_expected.mjs',
-      description: 'ECMAScript numeric semantics expected vectors evaluated in Node (V8) for differential testing against f3d-math (roa.1)',
-      lcg_seed: '0x' + seed.toString(16).padStart(16, '0'),
+      generator: "tests/fixtures/math/gen_jsnum_expected.mjs",
+      description:
+        "ECMAScript numeric semantics expected vectors evaluated in Node (V8) for differential testing against f3d-math (roa.1)",
+      lcg_seed: "0x" + seed.toString(16).padStart(16, "0"),
       generated_at: new Date().toISOString(),
     },
     inputs: inputs.map(toF64Hex),
@@ -340,7 +333,7 @@ export function generateFixtureData(seed = 0x202609101337c001n) {
  */
 export function validateNoJsonNumbers(jsonStr) {
   // Matches any unquoted JSON number pattern after a colon or comma or bracket
-  const jsonNumberRegex = /:\s*(-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*([,\}\]])/g;
+  const jsonNumberRegex = /:\s*(-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*([,}\]])/g;
   let match;
   const violations = [];
   while ((match = jsonNumberRegex.exec(jsonStr)) !== null) {
@@ -348,7 +341,7 @@ export function validateNoJsonNumbers(jsonStr) {
   }
   if (violations.length > 0) {
     throw new Error(
-      `Violation of strict serialization rule: found ${violations.length} raw JSON numbers in output: ${violations.slice(0, 10).join(', ')}`
+      `Violation of strict serialization rule: found ${violations.length} raw JSON numbers in output: ${violations.slice(0, 10).join(", ")}`,
     );
   }
 }
@@ -367,9 +360,9 @@ export function formatFixtureLines(fixtureData) {
   const lines = [];
   const meta = fixtureData.metadata;
 
-  const unaryOps = ['to_int32', 'to_uint32', 'round', 'trunc', 'sign'];
-  const binaryShiftOps = ['shift_left', 'shift_right', 'shift_unsigned_right'];
-  const binaryOps = ['rem', 'min', 'max'];
+  const unaryOps = ["to_int32", "to_uint32", "round", "trunc", "sign"];
+  const binaryShiftOps = ["shift_left", "shift_right", "shift_unsigned_right"];
+  const binaryOps = ["rem", "min", "max"];
 
   let totalCases = 0;
   for (const op of [...unaryOps, ...binaryShiftOps, ...binaryOps]) {
@@ -400,7 +393,7 @@ export function formatFixtureLines(fixtureData) {
     }
   }
 
-  return lines.join('\n') + '\n';
+  return lines.join("\n") + "\n";
 }
 
 /**
@@ -408,25 +401,25 @@ export function formatFixtureLines(fixtureData) {
  */
 export function main() {
   const outputDir = __dirname;
-  const jsonPath = path.join(outputDir, 'jsnum_expected.json');
-  const txtPath = path.join(outputDir, 'jsnum_expected.txt');
+  const jsonPath = path.join(outputDir, "jsnum_expected.json");
+  const txtPath = path.join(outputDir, "jsnum_expected.txt");
 
   if (!fs.existsSync(outputDir)) {
     fs.mkdirSync(outputDir, { recursive: true });
   }
 
-  console.log('[gen_jsnum_expected] Evaluating ECMAScript numeric operations in Node (V8)...');
+  console.log("[gen_jsnum_expected] Evaluating ECMAScript numeric operations in Node (V8)...");
   const fixtureData = generateFixtureData();
   const jsonStr = JSON.stringify(fixtureData, null, 2);
 
-  console.log('[gen_jsnum_expected] Validating zero raw JSON numbers in json fixture...');
+  console.log("[gen_jsnum_expected] Validating zero raw JSON numbers in json fixture...");
   validateNoJsonNumbers(jsonStr);
 
-  fs.writeFileSync(jsonPath, jsonStr, 'utf8');
+  fs.writeFileSync(jsonPath, jsonStr, "utf8");
 
-  console.log('[gen_jsnum_expected] Formatting line-oriented twin text fixture...');
+  console.log("[gen_jsnum_expected] Formatting line-oriented twin text fixture...");
   const txtContent = formatFixtureLines(fixtureData);
-  fs.writeFileSync(txtPath, txtContent, 'utf8');
+  fs.writeFileSync(txtPath, txtContent, "utf8");
 
   const jsonStats = fs.statSync(jsonPath);
   const txtStats = fs.statSync(txtPath);

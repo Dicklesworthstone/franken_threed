@@ -53,13 +53,28 @@ export function cpuComputeAffinePoints(affineRows, inPoints) {
     const py = inPoints[pOff + 1];
     const pz = inPoints[pOff + 2];
 
-    const r0x = affineRows[tOff + 0], r0y = affineRows[tOff + 1], r0z = affineRows[tOff + 2], r0w = affineRows[tOff + 3];
-    const r1x = affineRows[tOff + 4], r1y = affineRows[tOff + 5], r1z = affineRows[tOff + 6], r1w = affineRows[tOff + 7];
-    const r2x = affineRows[tOff + 8], r2y = affineRows[tOff + 9], r2z = affineRows[tOff + 10], r2w = affineRows[tOff + 11];
+    const r0x = affineRows[tOff + 0],
+      r0y = affineRows[tOff + 1],
+      r0z = affineRows[tOff + 2],
+      r0w = affineRows[tOff + 3];
+    const r1x = affineRows[tOff + 4],
+      r1y = affineRows[tOff + 5],
+      r1z = affineRows[tOff + 6],
+      r1w = affineRows[tOff + 7];
+    const r2x = affineRows[tOff + 8],
+      r2y = affineRows[tOff + 9],
+      r2z = affineRows[tOff + 10],
+      r2w = affineRows[tOff + 11];
 
-    expected[pOff + 0] = Math.fround(Math.fround(r0x * px) + Math.fround(r0y * py) + Math.fround(r0z * pz) + r0w);
-    expected[pOff + 1] = Math.fround(Math.fround(r1x * px) + Math.fround(r1y * py) + Math.fround(r1z * pz) + r1w);
-    expected[pOff + 2] = Math.fround(Math.fround(r2x * px) + Math.fround(r2y * py) + Math.fround(r2z * pz) + r2w);
+    expected[pOff + 0] = Math.fround(
+      Math.fround(r0x * px) + Math.fround(r0y * py) + Math.fround(r0z * pz) + r0w,
+    );
+    expected[pOff + 1] = Math.fround(
+      Math.fround(r1x * px) + Math.fround(r1y * py) + Math.fround(r1z * pz) + r1w,
+    );
+    expected[pOff + 2] = Math.fround(
+      Math.fround(r2x * px) + Math.fround(r2y * py) + Math.fround(r2z * pz) + r2w,
+    );
     expected[pOff + 3] = 1.0;
   }
   return expected;
@@ -100,7 +115,9 @@ function cleanupHost(host) {
   if (!host) return;
   if (host.buffers) {
     for (const b of host.buffers.values()) {
-      try { b.destroy(); } catch (_) {}
+      try {
+        b.destroy();
+      } catch (_) {}
     }
   }
   try {
@@ -134,16 +151,9 @@ export const SINGLE_DISPATCH_CASES = [
     key: "compute_affine_broadcast",
     name: "Broadcast Transform",
     description: "1 transform broadcast to all points (with shear/axis-mixing)",
-    affine: new Float32Array([
-      1.0, 0.5, -0.25, 1.5,
-      -0.5, 2.0, 0.25, -2.0,
-      0.25, -0.5, 1.0, 4.0,
-    ]),
+    affine: new Float32Array([1.0, 0.5, -0.25, 1.5, -0.5, 2.0, 0.25, -2.0, 0.25, -0.5, 1.0, 4.0]),
     points: new Float32Array([
-      1.0, 2.0, 4.0, 1.0,
-      -2.0, 0.0, 6.0, 1.0,
-      0.5, -1.0, 2.0, 1.0,
-      3.0, 1.0, -4.0, 1.0,
+      1.0, 2.0, 4.0, 1.0, -2.0, 0.0, 6.0, 1.0, 0.5, -1.0, 2.0, 1.0, 3.0, 1.0, -4.0, 1.0,
     ]),
   },
   {
@@ -152,33 +162,19 @@ export const SINGLE_DISPATCH_CASES = [
     description: "N transforms for N points",
     affine: new Float32Array([
       // T0: Scale 2, Trans x=1
-      2.0, 0.0, 0.0, 1.0,
-      0.0, 2.0, 0.0, 0.0,
-      0.0, 0.0, 2.0, 0.0,
+      2.0, 0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0,
       // T1: Scale 0.5, Trans y=5
-      0.5, 0.0, 0.0, 0.0,
-      0.0, 0.5, 0.0, 5.0,
-      0.0, 0.0, 0.5, 0.0,
+      0.5, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 5.0, 0.0, 0.0, 0.5, 0.0,
       // T2: Trans z=-3
-      1.0, 0.0, 0.0, 0.0,
-      0.0, 1.0, 0.0, 0.0,
-      0.0, 0.0, 1.0, -3.0,
+      1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, -3.0,
     ]),
-    points: new Float32Array([
-      2.0, 2.0, 2.0, 1.0,
-      4.0, 2.0, 6.0, 1.0,
-      1.0, 3.0, 5.0, 1.0,
-    ]),
+    points: new Float32Array([2.0, 2.0, 2.0, 1.0, 4.0, 2.0, 6.0, 1.0, 1.0, 3.0, 5.0, 1.0]),
   },
   {
     key: "compute_affine_non_64_tail",
     name: "Non-64 Tail Workgroup",
     description: "65 points exercising workgroup tail (64 in wg0, 1 in wg1, 63 inactive threads)",
-    affine: new Float32Array([
-      1.5, 0.0, 0.0, 0.5,
-      0.0, 1.5, 0.0, -0.5,
-      0.0, 0.0, 1.5, 1.0,
-    ]),
+    affine: new Float32Array([1.5, 0.0, 0.0, 0.5, 0.0, 1.5, 0.0, -0.5, 0.0, 0.0, 1.5, 1.0]),
     points: generateDeterministicPoints(65),
   },
 ];
@@ -203,7 +199,11 @@ export async function testComputeAffineSingleDispatch(wasmExports, host) {
 
     const readbackId = wasmExports.COMPUTE_READBACK_BUFFER_ID ?? COMPUTE_READBACK_BUFFER_ID;
     const readbackBytes = await host.readbackBuffer(readbackId, points.length * 4);
-    const observed = new Float32Array(readbackBytes.buffer, readbackBytes.byteOffset, points.length);
+    const observed = new Float32Array(
+      readbackBytes.buffer,
+      readbackBytes.byteOffset,
+      points.length,
+    );
 
     const cmp = bitExactCompare(observed, expected);
     if (!cmp.match) {
@@ -253,26 +253,17 @@ export async function testComputeAffineTwoDispatchUnaliased(wasmExports, host) {
     wasmExports.f3d_build_two_dispatch_affine_compute_packet ||
     wasmExports.gpu_bridge_build_two_dispatch_affine_compute_packet;
   if (typeof buildTwoFn !== "function") {
-    throw new Error("Missing required export f3d_build_two_dispatch_affine_compute_packet on wasmExports");
+    throw new Error(
+      "Missing required export f3d_build_two_dispatch_affine_compute_packet on wasmExports",
+    );
   }
 
   // Matrix A: Scale (2, 2, 2), Translation (1, 0, 0)
-  const matrixA = new Float32Array([
-    2.0, 0.0, 0.0, 1.0,
-    0.0, 2.0, 0.0, 0.0,
-    0.0, 0.0, 2.0, 0.0,
-  ]);
+  const matrixA = new Float32Array([2.0, 0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0]);
   // Matrix B: Scale (0.5, 0.5, 0.5), Translation (0, 5, 0)
-  const matrixB = new Float32Array([
-    0.5, 0.0, 0.0, 0.0,
-    0.0, 0.5, 0.0, 5.0,
-    0.0, 0.0, 0.5, 0.0,
-  ]);
+  const matrixB = new Float32Array([0.5, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 5.0, 0.0, 0.0, 0.5, 0.0]);
   // 2 packed vec4 points (8 floats)
-  const points = new Float32Array([
-    2.0, 2.0, 2.0, 1.0,
-    1.0, -4.0, 6.0, 1.0,
-  ]);
+  const points = new Float32Array([2.0, 2.0, 2.0, 1.0, 1.0, -4.0, 6.0, 1.0]);
 
   const expectedA = cpuComputeAffinePoints(matrixA, points);
   const expectedB = cpuComputeAffinePoints(matrixB, points);
@@ -288,7 +279,11 @@ export async function testComputeAffineTwoDispatchUnaliased(wasmExports, host) {
   const readbackBytes = await host.readbackBuffer(readbackId, totalOutputSize);
 
   const observedA = new Float32Array(readbackBytes.buffer, readbackBytes.byteOffset, points.length);
-  const observedB = new Float32Array(readbackBytes.buffer, readbackBytes.byteOffset + outputSliceStride, points.length);
+  const observedB = new Float32Array(
+    readbackBytes.buffer,
+    readbackBytes.byteOffset + outputSliceStride,
+    points.length,
+  );
 
   const cmpA = bitExactCompare(observedA, expectedA);
   if (!cmpA.match) {
@@ -331,23 +326,14 @@ export async function testComputeAffineTwoDispatchAliased(wasmExports, host) {
     wasmExports.f3d_build_two_dispatch_affine_compute_packet ||
     wasmExports.gpu_bridge_build_two_dispatch_affine_compute_packet;
   if (typeof buildTwoFn !== "function") {
-    throw new Error("Missing required export f3d_build_two_dispatch_affine_compute_packet on wasmExports");
+    throw new Error(
+      "Missing required export f3d_build_two_dispatch_affine_compute_packet on wasmExports",
+    );
   }
 
-  const matrixA = new Float32Array([
-    2.0, 0.0, 0.0, 1.0,
-    0.0, 2.0, 0.0, 0.0,
-    0.0, 0.0, 2.0, 0.0,
-  ]);
-  const matrixB = new Float32Array([
-    0.5, 0.0, 0.0, 0.0,
-    0.0, 0.5, 0.0, 5.0,
-    0.0, 0.0, 0.5, 0.0,
-  ]);
-  const points = new Float32Array([
-    2.0, 2.0, 2.0, 1.0,
-    1.0, -4.0, 6.0, 1.0,
-  ]);
+  const matrixA = new Float32Array([2.0, 0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0]);
+  const matrixB = new Float32Array([0.5, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 5.0, 0.0, 0.0, 0.5, 0.0]);
+  const points = new Float32Array([2.0, 2.0, 2.0, 1.0, 1.0, -4.0, 6.0, 1.0]);
 
   const expectedA = cpuComputeAffinePoints(matrixA, points);
   const expectedB = cpuComputeAffinePoints(matrixB, points);
@@ -364,7 +350,11 @@ export async function testComputeAffineTwoDispatchAliased(wasmExports, host) {
   const readbackBytes = await host.readbackBuffer(readbackId, totalOutputSize);
 
   const observedA = new Float32Array(readbackBytes.buffer, readbackBytes.byteOffset, points.length);
-  const observedB = new Float32Array(readbackBytes.buffer, readbackBytes.byteOffset + outputSliceStride, points.length);
+  const observedB = new Float32Array(
+    readbackBytes.buffer,
+    readbackBytes.byteOffset + outputSliceStride,
+    points.length,
+  );
 
   // 1. Output A must match matrix A
   const cmpA = bitExactCompare(observedA, expectedA);
@@ -406,7 +396,7 @@ export async function testComputeAffineTwoDispatchAliased(wasmExports, host) {
   }
 
   // 4. Non-trivial check: outputs must be non-zero and non-trivial
-  const nonTrivial = observedB.some(val => val !== 0 && !Number.isNaN(val));
+  const nonTrivial = observedB.some((val) => val !== 0 && !Number.isNaN(val));
   if (!nonTrivial) {
     return {
       status: "FAIL",
@@ -443,16 +433,21 @@ export function findDispatchComputeBindingTypeOffset(packetBytes, targetBindingI
   for (let i = 0; i < commandCount; i++) {
     const opcode = dataView.getUint16(cursor, true);
     cursor += 2;
-    if (opcode === 1) { // OPCODE_CREATE_BUFFER
+    if (opcode === 1) {
+      // OPCODE_CREATE_BUFFER
       cursor += 12;
-    } else if (opcode === 2) { // OPCODE_WRITE_BUFFER
+    } else if (opcode === 2) {
+      // OPCODE_WRITE_BUFFER
       cursor += 16;
-    } else if (opcode === 20) { // OPCODE_COPY_BUFFER_TO_BUFFER
+    } else if (opcode === 20) {
+      // OPCODE_COPY_BUFFER_TO_BUFFER
       cursor += 40;
-    } else if (opcode === 21) { // OPCODE_CREATE_COMPUTE_PIPELINE
+    } else if (opcode === 21) {
+      // OPCODE_CREATE_COMPUTE_PIPELINE
       const bindingCount = dataView.getUint32(cursor + 22, true);
       cursor += 30 + bindingCount * 16;
-    } else if (opcode === 22) { // OPCODE_DISPATCH_COMPUTE
+    } else if (opcode === 22) {
+      // OPCODE_DISPATCH_COMPUTE
       const bindingCount = dataView.getUint32(cursor + 18, true);
       const bindingsStart = cursor + 22;
       for (let b = 0; b < bindingCount; b++) {
@@ -465,7 +460,9 @@ export function findDispatchComputeBindingTypeOffset(packetBytes, targetBindingI
       }
       cursor += 22 + bindingCount * 48;
     } else {
-      throw new Error(`findDispatchComputeBindingTypeOffset: unhandled opcode ${opcode} at command ${i}`);
+      throw new Error(
+        `findDispatchComputeBindingTypeOffset: unhandled opcode ${opcode} at command ${i}`,
+      );
     }
   }
   return -1;
@@ -538,8 +535,7 @@ export async function testComputeAffineMalformedBindingSpecs(wasmExports, host) 
   }
 
   const isExpectedTypeMismatch =
-    caughtError instanceof TypeError &&
-    /binding index 0 type mismatch/.test(caughtError.message);
+    caughtError instanceof TypeError && /binding index 0 type mismatch/.test(caughtError.message);
 
   if (!isExpectedTypeMismatch) {
     return {
@@ -573,7 +569,8 @@ export async function testComputeAffine(wasmExports, optionalHost = null) {
     ownedHost = true;
   }
 
-  const host_environment = (typeof navigator !== "undefined" && navigator.userAgent) ? navigator.userAgent : "Node/Unknown";
+  const host_environment =
+    typeof navigator !== "undefined" && navigator.userAgent ? navigator.userAgent : "Node/Unknown";
   const cases = {};
 
   try {
@@ -594,7 +591,10 @@ export async function testComputeAffine(wasmExports, optionalHost = null) {
     }
 
     try {
-      cases.compute_affine_two_dispatch_unaliased = await testComputeAffineTwoDispatchUnaliased(wasmExports, host);
+      cases.compute_affine_two_dispatch_unaliased = await testComputeAffineTwoDispatchUnaliased(
+        wasmExports,
+        host,
+      );
     } catch (err) {
       cases.compute_affine_two_dispatch_unaliased = {
         status: "FAIL",
@@ -605,7 +605,10 @@ export async function testComputeAffine(wasmExports, optionalHost = null) {
     }
 
     try {
-      cases.compute_affine_two_dispatch_aliased_control = await testComputeAffineTwoDispatchAliased(wasmExports, host);
+      cases.compute_affine_two_dispatch_aliased_control = await testComputeAffineTwoDispatchAliased(
+        wasmExports,
+        host,
+      );
     } catch (err) {
       cases.compute_affine_two_dispatch_aliased_control = {
         status: "FAIL",
@@ -616,7 +619,10 @@ export async function testComputeAffine(wasmExports, optionalHost = null) {
     }
 
     try {
-      cases.compute_affine_malformed_binding_specs = await testComputeAffineMalformedBindingSpecs(wasmExports, host);
+      cases.compute_affine_malformed_binding_specs = await testComputeAffineMalformedBindingSpecs(
+        wasmExports,
+        host,
+      );
     } catch (err) {
       cases.compute_affine_malformed_binding_specs = {
         status: "FAIL",
@@ -626,13 +632,13 @@ export async function testComputeAffine(wasmExports, optionalHost = null) {
       };
     }
 
-    const allPass = Object.values(cases).every(c => c.status === "PASS");
+    const allPass = Object.values(cases).every((c) => c.status === "PASS");
 
     return {
       status: allPass ? "PASS" : "FAIL",
       host_environment,
       cases,
-      detail: `Compute Affine: ${Object.values(cases).filter(c => c.status === "PASS").length}/${Object.keys(cases).length} checks PASS (broadcast, one-per-point, non-64 tail, two-dispatch unaliased, two-dispatch aliased control, malformed bindingSpecs rejection; owner: new-backend)`,
+      detail: `Compute Affine: ${Object.values(cases).filter((c) => c.status === "PASS").length}/${Object.keys(cases).length} checks PASS (broadcast, one-per-point, non-64 tail, two-dispatch unaliased, two-dispatch aliased control, malformed bindingSpecs rejection; owner: new-backend)`,
       implementation_owner: "new-backend",
     };
   } finally {

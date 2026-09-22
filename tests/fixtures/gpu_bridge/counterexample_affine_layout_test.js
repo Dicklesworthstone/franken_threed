@@ -28,12 +28,16 @@ function cleanupHost(host) {
   if (!host) return;
   if (host.buffers) {
     for (const b of host.buffers.values()) {
-      try { b.destroy(); } catch (_) {}
+      try {
+        b.destroy();
+      } catch (_) {}
     }
   }
   if (host.textures) {
     for (const t of host.textures.values()) {
-      try { t.destroy(); } catch (_) {}
+      try {
+        t.destroy();
+      } catch (_) {}
     }
   }
   try {
@@ -48,7 +52,7 @@ export async function testAffineLayoutCounterexample(wasmExports) {
 
   if (typeof buildPacketFn !== "function") {
     throw new Error(
-      "Missing required export 'f3d_build_affine_rows_layout_counterexample_packet' on wasmExports"
+      "Missing required export 'f3d_build_affine_rows_layout_counterexample_packet' on wasmExports",
     );
   }
 
@@ -88,7 +92,7 @@ export async function testAffineLayoutCounterexample(wasmExports) {
 
   if (!correctP48Valid || !correctP32Valid) {
     throw new Error(
-      `Correct run failed (wrong_mat4x3_layout=false): observed p(48,32)=[${correctP48.join(",")}], p(32,32)=[${correctP32.join(",")}]; expected p(48,32) G>200,R<50,B<50,A=255 and p(32,32) R,G,B<50,A=255`
+      `Correct run failed (wrong_mat4x3_layout=false): observed p(48,32)=[${correctP48.join(",")}], p(32,32)=[${correctP32.join(",")}]; expected p(48,32) G>200,R<50,B<50,A=255 and p(32,32) R,G,B<50,A=255`,
     );
   }
 
@@ -132,7 +136,7 @@ export async function testAffineLayoutCounterexample(wasmExports) {
 
   if (!wrongP32Valid || !wrongP48Valid) {
     throw new Error(
-      `Wrong-layout run failed (wrong_mat4x3_layout=true): observed p(32,32)=[${wrongP32.join(",")}], p(48,32)=[${wrongP48.join(",")}]; expected p(32,32) G>200,R<50,B<50,A=255 and p(48,32) R,G,B<50,A=255 (silent corruption proof)`
+      `Wrong-layout run failed (wrong_mat4x3_layout=true): observed p(32,32)=[${wrongP32.join(",")}], p(48,32)=[${wrongP48.join(",")}]; expected p(32,32) G>200,R<50,B<50,A=255 and p(48,32) R,G,B<50,A=255 (silent corruption proof)`,
     );
   }
 

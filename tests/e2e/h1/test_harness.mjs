@@ -3,42 +3,42 @@
 // Verifies reference-vs-candidate parity, real dynamic toggle and OrbitControls scene/camera observations,
 // Ruby's bundle/backend reload sequence, and planted candidate-only negative mutations.
 
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
-import { resolve, dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { spawn } from 'node:child_process';
-import { startDevServer } from '../../../tools/compat-facade/dev_server.mjs';
-import { injectSeededRandomPrelude } from './h1_interaction_helper.mjs';
+import { spawn } from "node:child_process";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { startDevServer } from "../../../tools/compat-facade/dev_server.mjs";
+import { injectSeededRandomPrelude } from "./h1_interaction_helper.mjs";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
-const repoRoot = resolve(scriptDir, '../../..');
+const repoRoot = resolve(scriptDir, "../../..");
 
 const args = process.argv.slice(2);
-let browser = 'chrome';
+let browser = "chrome";
 let branchArg = null;
 let portArg = 0;
 
 for (let i = 0; i < args.length; i++) {
   const arg = args[i];
-  if (arg === 'chrome' || arg === 'safari') {
+  if (arg === "chrome" || arg === "safari") {
     browser = arg;
-  } else if (arg === 'webgpu' || arg === 'webgl') {
+  } else if (arg === "webgpu" || arg === "webgl") {
     branchArg = arg;
-  } else if (arg === '--port' && args[i + 1]) {
+  } else if (arg === "--port" && args[i + 1]) {
     portArg = parseInt(args[i + 1], 10);
     i++;
   }
 }
-if (process.env.BROWSER === 'safari' || process.env.BROWSER === 'chrome') {
+if (process.env.BROWSER === "safari" || process.env.BROWSER === "chrome") {
   browser = process.env.BROWSER;
 }
 if (process.env.PORT) {
   portArg = parseInt(process.env.PORT, 10);
 }
 
-const runId = new Date().toISOString().replaceAll(':', '-') + '-' + process.pid;
-const archive = resolve(process.env.F3D_EVIDENCE_DIR || join(repoRoot, 'evidence'));
-const runDir = join(archive, '6mv.7', runId);
+const runId = new Date().toISOString().replaceAll(":", "-") + "-" + process.pid;
+const archive = resolve(process.env.F3D_EVIDENCE_DIR || join(repoRoot, "evidence"));
+const runDir = join(archive, "6mv.7", runId);
 mkdirSync(runDir, { recursive: true });
 
 let devServer = null;
@@ -46,10 +46,14 @@ let browserProcess = null;
 
 const shutdown = async (code = 0) => {
   if (browserProcess) {
-    try { browserProcess.kill(); } catch (_) {}
+    try {
+      browserProcess.kill();
+    } catch (_) {}
   }
   if (devServer) {
-    try { await devServer.close(); } catch (_) {}
+    try {
+      await devServer.close();
+    } catch (_) {}
   }
   process.exit(code);
 };
@@ -57,20 +61,21 @@ const shutdown = async (code = 0) => {
 // Start dev server (loads Ruby's served H1 URL + compat-facade routes)
 devServer = await startDevServer({
   port: portArg,
-  host: '127.0.0.1',
+  host: "127.0.0.1",
   repoRoot,
 });
 
-const defaultHandler = devServer.server.listeners('request')[0];
-devServer.server.removeAllListeners('request');
+const defaultHandler = devServer.server.listeners("request")[0];
+devServer.server.removeAllListeners("request");
 
 // Wrap dev server listener with /report endpoint seam and deterministic H1 response wrapper
-devServer.server.on('request', (req, res) => {
-  const url = new URL(req.url, `http://${req.headers.host || '127.0.0.1'}`);
+devServer.server.on("request", (req, res) => {
+  const url = new URL(req.url, `http://${req.headers.host || "127.0.0.1"}`);
 
-  const isH1Page = url.pathname === '/examples/webgpu_performance_renderbundle.html' ||
-                   url.pathname === '/webgpu_performance_renderbundle.html' ||
-                   url.pathname === '/upstream/three.js/examples/webgpu_performance_renderbundle.html';
+  const isH1Page =
+    url.pathname === "/examples/webgpu_performance_renderbundle.html" ||
+    url.pathname === "/webgpu_performance_renderbundle.html" ||
+    url.pathname === "/upstream/three.js/examples/webgpu_performance_renderbundle.html";
 
   if (isH1Page) {
     const origWriteHead = res.writeHead.bind(res);
@@ -78,14 +83,14 @@ devServer.server.on('request', (req, res) => {
     const origEnd = res.end.bind(res);
     const chunks = [];
     let savedStatusCode = 200;
-    let savedStatusMessage = undefined;
+    let savedStatusMessage;
 
-    res.writeHead = function (statusCode, ...args) {
+    res.writeHead = (statusCode, ...args) => {
       savedStatusCode = statusCode;
       for (const arg of args) {
-        if (typeof arg === 'string') {
+        if (typeof arg === "string") {
           savedStatusMessage = arg;
-        } else if (arg && typeof arg === 'object' && !Array.isArray(arg)) {
+        } else if (arg && typeof arg === "object" && !Array.isArray(arg)) {
           for (const [k, v] of Object.entries(arg)) {
             res.setHeader(k, v);
           }
@@ -94,13 +99,13 @@ devServer.server.on('request', (req, res) => {
       return res;
     };
 
-    res.write = function (chunk, ...args) {
+    res.write = (chunk, ...args) => {
       if (chunk) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
       return true;
     };
 
-    res.end = function (chunk, ...args) {
-      if (typeof chunk === 'function') {
+    res.end = (chunk, ...args) => {
+      if (typeof chunk === "function") {
         chunk = null;
       }
       if (chunk) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
@@ -113,7 +118,7 @@ devServer.server.on('request', (req, res) => {
       res.write = origWrite;
       res.end = origEnd;
 
-      if (req.method === 'HEAD') {
+      if (req.method === "HEAD") {
         if (finalStatusMessage) {
           origWriteHead(finalStatusCode, finalStatusMessage);
         } else {
@@ -123,15 +128,17 @@ devServer.server.on('request', (req, res) => {
       }
 
       const fullBuffer = Buffer.concat(chunks);
-      let html = fullBuffer.toString('utf-8');
+      let html = fullBuffer.toString("utf-8");
 
       if (finalStatusCode >= 200 && finalStatusCode < 300) {
         html = injectSeededRandomPrelude(html);
       }
-      const outBuf = Buffer.from(html, 'utf-8');
+      const outBuf = Buffer.from(html, "utf-8");
 
-      try { res.removeHeader('transfer-encoding'); } catch (_) {}
-      res.setHeader('content-length', outBuf.length);
+      try {
+        res.removeHeader("transfer-encoding");
+      } catch (_) {}
+      res.setHeader("content-length", outBuf.length);
 
       if (finalStatusMessage) {
         origWriteHead(finalStatusCode, finalStatusMessage);
@@ -146,132 +153,173 @@ devServer.server.on('request', (req, res) => {
     return;
   }
 
-  if (url.pathname === '/report') {
-    if (req.method === 'OPTIONS') {
+  if (url.pathname === "/report") {
+    if (req.method === "OPTIONS") {
       res.writeHead(204, {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type',
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
       });
       res.end();
       return;
     }
 
-    if (req.method === 'POST') {
-      let body = '';
-      req.on('data', chunk => { body += chunk; });
-      req.on('end', () => {
+    if (req.method === "POST") {
+      let body = "";
+      req.on("data", (chunk) => {
+        body += chunk;
+      });
+      req.on("end", () => {
         res.writeHead(200, {
-          'Content-Type': 'application/json',
-          'Access-Control-Allow-Origin': '*',
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": "*",
         });
         res.end('{"ok":true}');
 
         try {
           const payload = JSON.parse(body);
-          const evidenceFile = join(runDir, 'results.json');
-          writeFileSync(evidenceFile, JSON.stringify(payload, null, 2), 'utf-8');
+          const evidenceFile = join(runDir, "results.json");
+          writeFileSync(evidenceFile, JSON.stringify(payload, null, 2), "utf-8");
           console.log(`[h1-test-harness] Evidence saved to ${evidenceFile}`);
 
           if (payload.decisionLog || payload.decision_log) {
             const decisionLog = payload.decisionLog || payload.decision_log;
-            const decisionFile = join(runDir, 'decision_log.json');
-            writeFileSync(decisionFile, JSON.stringify(decisionLog, null, 2), 'utf-8');
+            const decisionFile = join(runDir, "decision_log.json");
+            writeFileSync(decisionFile, JSON.stringify(decisionLog, null, 2), "utf-8");
             console.log(`[h1-test-harness] Decision log saved to ${decisionFile}`);
           }
 
           if (payload.attributionLog || payload.attribution_log) {
             const attributionLog = payload.attributionLog || payload.attribution_log;
-            const attributionFile = join(runDir, 'attribution_log.json');
-            writeFileSync(attributionFile, JSON.stringify(attributionLog, null, 2), 'utf-8');
+            const attributionFile = join(runDir, "attribution_log.json");
+            writeFileSync(attributionFile, JSON.stringify(attributionLog, null, 2), "utf-8");
             console.log(`[h1-test-harness] Attribution log saved to ${attributionFile}`);
           }
 
-          console.log('[h1-test-harness] Results received from browser:\n', JSON.stringify({
-            passed: payload.passed,
-            errors: payload.errors,
-            branches: Object.fromEntries(
-              Object.entries(payload.branches || {}).map(([k, v]) => [
-                k,
-                {
-                  passed: v.passed,
-                  canvasContext: v.canvasContext,
-                  inspectorSign: v.inspectorSign,
-                  parity: v.comparison?.pass,
-                  interactions: v.interactionCheckpoints,
-                  sceneCamera: v.sceneCameraObservations,
-                  negatives: v.negativeControls?.allRejected,
-                  imageComparison: v.imageComparison?.passed ? `PASS (diff=${(v.imageComparison?.diffPercent || 0).toFixed(4)}%, rmse=${(v.imageComparison?.rmse || 0).toFixed(4)})` : 'FAIL',
-                  imageNegativeRejected: v.imageNegativeRejected,
-                },
-              ])
+          console.log(
+            "[h1-test-harness] Results received from browser:\n",
+            JSON.stringify(
+              {
+                passed: payload.passed,
+                errors: payload.errors,
+                branches: Object.fromEntries(
+                  Object.entries(payload.branches || {}).map(([k, v]) => [
+                    k,
+                    {
+                      passed: v.passed,
+                      canvasContext: v.canvasContext,
+                      inspectorSign: v.inspectorSign,
+                      parity: v.comparison?.pass,
+                      interactions: v.interactionCheckpoints,
+                      sceneCamera: v.sceneCameraObservations,
+                      negatives: v.negativeControls?.allRejected,
+                      imageComparison: v.imageComparison?.passed
+                        ? `PASS (diff=${(v.imageComparison?.diffPercent || 0).toFixed(4)}%, rmse=${(v.imageComparison?.rmse || 0).toFixed(4)})`
+                        : "FAIL",
+                      imageNegativeRejected: v.imageNegativeRejected,
+                    },
+                  ]),
+                ),
+                imageCheckpoint: payload.imageCheckpoint,
+              },
+              null,
+              2,
             ),
-            imageCheckpoint: payload.imageCheckpoint,
-          }, null, 2));
+          );
 
           // Harness asserts expected backend per query branch
           let assertionsPassed = true;
           const assertionErrors = [];
 
           if (!payload.branches || Object.keys(payload.branches).length === 0) {
-            assertionErrors.push('No branch results found in report payload');
+            assertionErrors.push("No branch results found in report payload");
             assertionsPassed = false;
           } else {
             for (const [key, branch] of Object.entries(payload.branches)) {
               if (!branch.passed) {
-                assertionErrors.push(`Branch '${key}' failed execution: ${branch.error || 'Unknown error'}`);
+                assertionErrors.push(
+                  `Branch '${key}' failed execution: ${branch.error || "Unknown error"}`,
+                );
                 assertionsPassed = false;
                 continue;
               }
 
               // Document title assertion
-              if (!branch.title || !branch.title.includes('Render Bundle')) {
-                assertionErrors.push(`Branch '${key}': title does not contain 'Render Bundle' (got: '${branch.title}')`);
+              if (!branch.title || !branch.title.includes("Render Bundle")) {
+                assertionErrors.push(
+                  `Branch '${key}': title does not contain 'Render Bundle' (got: '${branch.title}')`,
+                );
                 assertionsPassed = false;
               }
 
-              if (key === 'webgpu') {
+              if (key === "webgpu") {
                 // First canvas context identity assertion: must be webgpu
-                if (branch.canvasContext !== 'webgpu') {
-                  assertionErrors.push(`Branch 'webgpu': expected canvasContext 'webgpu', got: '${branch.canvasContext}'`);
+                if (branch.canvasContext !== "webgpu") {
+                  assertionErrors.push(
+                    `Branch 'webgpu': expected canvasContext 'webgpu', got: '${branch.canvasContext}'`,
+                  );
                   assertionsPassed = false;
                 }
                 // Inspector startup sign assertion: must indicate WebGPU
-                if (!branch.inspectorSign || !branch.inspectorSign.includes('WebGPU')) {
-                  assertionErrors.push(`Branch 'webgpu': expected Inspector sign containing 'WebGPU', got: '${branch.inspectorSign}'`);
+                if (!branch.inspectorSign || !branch.inspectorSign.includes("WebGPU")) {
+                  assertionErrors.push(
+                    `Branch 'webgpu': expected Inspector sign containing 'WebGPU', got: '${branch.inspectorSign}'`,
+                  );
                   assertionsPassed = false;
                 }
                 // Router decision log assertion: honest retained-upstream route and specialization-unavailable reason
                 const decisionEntry = Array.isArray(branch.decisionLog)
-                  ? branch.decisionLog.find(d => d.site === 'WebGPURenderer' && d.route === 'retained-upstream')
+                  ? branch.decisionLog.find(
+                      (d) => d.site === "WebGPURenderer" && d.route === "retained-upstream",
+                    )
                   : null;
                 if (!decisionEntry) {
-                  assertionErrors.push(`Branch 'webgpu': expected router decision route 'retained-upstream'`);
+                  assertionErrors.push(
+                    `Branch 'webgpu': expected router decision route 'retained-upstream'`,
+                  );
                   assertionsPassed = false;
-                } else if (!Array.isArray(decisionEntry.reasons) || !decisionEntry.reasons.includes('specialization-unavailable')) {
-                  assertionErrors.push(`Branch 'webgpu': expected decision reasons to include 'specialization-unavailable' (got: [${(decisionEntry.reasons || []).join(', ')}])`);
+                } else if (
+                  !Array.isArray(decisionEntry.reasons) ||
+                  !decisionEntry.reasons.includes("specialization-unavailable")
+                ) {
+                  assertionErrors.push(
+                    `Branch 'webgpu': expected decision reasons to include 'specialization-unavailable' (got: [${(decisionEntry.reasons || []).join(", ")}])`,
+                  );
                   assertionsPassed = false;
                 }
-              } else if (key === 'webgl') {
+              } else if (key === "webgl") {
                 // First canvas context identity assertion: must be webgl2
-                if (branch.canvasContext !== 'webgl2') {
-                  assertionErrors.push(`Branch 'webgl': expected canvasContext 'webgl2', got: '${branch.canvasContext}'`);
+                if (branch.canvasContext !== "webgl2") {
+                  assertionErrors.push(
+                    `Branch 'webgl': expected canvasContext 'webgl2', got: '${branch.canvasContext}'`,
+                  );
                   assertionsPassed = false;
                 }
                 // Inspector startup sign assertion: must indicate WebGL2
-                if (!branch.inspectorSign || !branch.inspectorSign.includes('WebGL2')) {
-                  assertionErrors.push(`Branch 'webgl': expected Inspector sign containing 'WebGL2', got: '${branch.inspectorSign}'`);
+                if (!branch.inspectorSign || !branch.inspectorSign.includes("WebGL2")) {
+                  assertionErrors.push(
+                    `Branch 'webgl': expected Inspector sign containing 'WebGL2', got: '${branch.inspectorSign}'`,
+                  );
                   assertionsPassed = false;
                 }
                 // Router decision log assertion: honest exact-backend route and explicit-source-selection reason
                 const decisionEntry = Array.isArray(branch.decisionLog)
-                  ? branch.decisionLog.find(d => d.site === 'WebGPURenderer' && d.route === 'exact-backend')
+                  ? branch.decisionLog.find(
+                      (d) => d.site === "WebGPURenderer" && d.route === "exact-backend",
+                    )
                   : null;
                 if (!decisionEntry) {
-                  assertionErrors.push(`Branch 'webgl': expected router decision route 'exact-backend'`);
+                  assertionErrors.push(
+                    `Branch 'webgl': expected router decision route 'exact-backend'`,
+                  );
                   assertionsPassed = false;
-                } else if (!Array.isArray(decisionEntry.reasons) || !decisionEntry.reasons.includes('explicit-source-selection')) {
-                  assertionErrors.push(`Branch 'webgl': expected decision reasons to include 'explicit-source-selection' (got: [${(decisionEntry.reasons || []).join(', ')}])`);
+                } else if (
+                  !Array.isArray(decisionEntry.reasons) ||
+                  !decisionEntry.reasons.includes("explicit-source-selection")
+                ) {
+                  assertionErrors.push(
+                    `Branch 'webgl': expected decision reasons to include 'explicit-source-selection' (got: [${(decisionEntry.reasons || []).join(", ")}])`,
+                  );
                   assertionsPassed = false;
                 }
               }
@@ -279,7 +327,9 @@ devServer.server.on('request', (req, res) => {
               // Reference vs Candidate parity comparison assertion
               if (!branch.comparison || !branch.comparison.pass) {
                 const diffs = branch.comparison?.diffs || [];
-                assertionErrors.push(`Branch '${key}': reference vs candidate state parity failed: ${diffs.join('; ')}`);
+                assertionErrors.push(
+                  `Branch '${key}': reference vs candidate state parity failed: ${diffs.join("; ")}`,
+                );
                 assertionsPassed = false;
               }
 
@@ -287,7 +337,9 @@ devServer.server.on('request', (req, res) => {
               if (branch.checkpointComparisons) {
                 for (const [stage, comp] of Object.entries(branch.checkpointComparisons)) {
                   if (!comp.pass) {
-                    assertionErrors.push(`Branch '${key}': checkpoint '${stage}' comparison failed: ${(comp.diffs || []).join('; ')}`);
+                    assertionErrors.push(
+                      `Branch '${key}': checkpoint '${stage}' comparison failed: ${(comp.diffs || []).join("; ")}`,
+                    );
                     assertionsPassed = false;
                   }
                 }
@@ -295,128 +347,176 @@ devServer.server.on('request', (req, res) => {
 
               // Interaction checkpoints agreement assertion
               if (!branch.interactionCheckpoints) {
-                assertionErrors.push(`Branch '${key}': missing interactionCheckpoints in report payload`);
+                assertionErrors.push(
+                  `Branch '${key}': missing interactionCheckpoints in report payload`,
+                );
                 assertionsPassed = false;
               } else {
                 const ic = branch.interactionCheckpoints;
                 if (!ic.staticBaseline || !ic.staticBaseline.agreement) {
-                  assertionErrors.push(`Branch '${key}': static baseline interaction agreement failed`);
+                  assertionErrors.push(
+                    `Branch '${key}': static baseline interaction agreement failed`,
+                  );
                   assertionsPassed = false;
                 }
                 if (!ic.dynamicToggle || !ic.dynamicToggle.agreement) {
-                  assertionErrors.push(`Branch '${key}': dynamic toggle interaction agreement failed`);
+                  assertionErrors.push(
+                    `Branch '${key}': dynamic toggle interaction agreement failed`,
+                  );
                   assertionsPassed = false;
                 }
                 if (!ic.orbitControls || !ic.orbitControls.agreement) {
-                  assertionErrors.push(`Branch '${key}': OrbitControls interaction agreement failed`);
+                  assertionErrors.push(
+                    `Branch '${key}': OrbitControls interaction agreement failed`,
+                  );
                   assertionsPassed = false;
                 }
                 if (!ic.renderBundleReload || !ic.renderBundleReload.agreement) {
-                  assertionErrors.push(`Branch '${key}': renderBundle reload sequence agreement failed`);
+                  assertionErrors.push(
+                    `Branch '${key}': renderBundle reload sequence agreement failed`,
+                  );
                   assertionsPassed = false;
                 }
               }
 
               // Scene and camera observations assertion (Mail #7733, #7850)
               if (!branch.sceneCameraObservations) {
-                assertionErrors.push(`Branch '${key}': missing sceneCameraObservations in report payload`);
+                assertionErrors.push(
+                  `Branch '${key}': missing sceneCameraObservations in report payload`,
+                );
                 assertionsPassed = false;
               } else {
                 const sco = branch.sceneCameraObservations;
                 if (!sco.staticBaselineVerified) {
-                  assertionErrors.push(`Branch '${key}': static baseline verification failed (mesh, instanceMatrix, or camera Y moved during static baseline)`);
+                  assertionErrors.push(
+                    `Branch '${key}': static baseline verification failed (mesh, instanceMatrix, or camera Y moved during static baseline)`,
+                  );
                   assertionsPassed = false;
                 }
                 if (!sco.dynamicRotationsObserved) {
-                  assertionErrors.push(`Branch '${key}': dynamic rotation observation failed (mesh or instanceMatrix rotations did not become active on dynamic toggle)`);
+                  assertionErrors.push(
+                    `Branch '${key}': dynamic rotation observation failed (mesh or instanceMatrix rotations did not become active on dynamic toggle)`,
+                  );
                   assertionsPassed = false;
                 }
                 if (!sco.cameraTrajectoryAltered) {
-                  assertionErrors.push(`Branch '${key}': camera trajectory observation failed (OrbitControls vertical drag did not alter camera elevation relative to autoRotate baseline)`);
+                  assertionErrors.push(
+                    `Branch '${key}': camera trajectory observation failed (OrbitControls vertical drag did not alter camera elevation relative to autoRotate baseline)`,
+                  );
                   assertionsPassed = false;
                 }
-                if (sco.groupStaticTransition !== 'true->false') {
-                  assertionErrors.push(`Branch '${key}': BundleGroup.static transition must be 'true->false', got '${sco.groupStaticTransition}'`);
+                if (sco.groupStaticTransition !== "true->false") {
+                  assertionErrors.push(
+                    `Branch '${key}': BundleGroup.static transition must be 'true->false', got '${sco.groupStaticTransition}'`,
+                  );
                   assertionsPassed = false;
                 }
                 if (sco.refStatic && sco.refStatic.meshDelta >= 1e-4) {
-                  assertionErrors.push(`Branch '${key}': reference static mesh moved during baseline (meshDelta=${sco.refStatic.meshDelta})`);
+                  assertionErrors.push(
+                    `Branch '${key}': reference static mesh moved during baseline (meshDelta=${sco.refStatic.meshDelta})`,
+                  );
                   assertionsPassed = false;
                 }
                 if (sco.candStatic && sco.candStatic.meshDelta >= 1e-4) {
-                  assertionErrors.push(`Branch '${key}': candidate static mesh moved during baseline (meshDelta=${sco.candStatic.meshDelta})`);
+                  assertionErrors.push(
+                    `Branch '${key}': candidate static mesh moved during baseline (meshDelta=${sco.candStatic.meshDelta})`,
+                  );
                   assertionsPassed = false;
                 }
                 if (sco.refStatic && sco.refStatic.cameraYDelta >= 1e-4) {
-                  assertionErrors.push(`Branch '${key}': reference camera Y moved during autoRotate baseline (cameraYDelta=${sco.refStatic.cameraYDelta})`);
+                  assertionErrors.push(
+                    `Branch '${key}': reference camera Y moved during autoRotate baseline (cameraYDelta=${sco.refStatic.cameraYDelta})`,
+                  );
                   assertionsPassed = false;
                 }
                 if (sco.candStatic && sco.candStatic.cameraYDelta >= 1e-4) {
-                  assertionErrors.push(`Branch '${key}': candidate camera Y moved during autoRotate baseline (cameraYDelta=${sco.candStatic.cameraYDelta})`);
+                  assertionErrors.push(
+                    `Branch '${key}': candidate camera Y moved during autoRotate baseline (cameraYDelta=${sco.candStatic.cameraYDelta})`,
+                  );
                   assertionsPassed = false;
                 }
                 if (sco.refDynamic && sco.refDynamic.meshDelta <= 0.005) {
-                  assertionErrors.push(`Branch '${key}': reference mesh did not rotate sufficiently under dynamic (meshDelta=${sco.refDynamic.meshDelta})`);
+                  assertionErrors.push(
+                    `Branch '${key}': reference mesh did not rotate sufficiently under dynamic (meshDelta=${sco.refDynamic.meshDelta})`,
+                  );
                   assertionsPassed = false;
                 }
                 if (sco.candDynamic && sco.candDynamic.meshDelta <= 0.005) {
-                  assertionErrors.push(`Branch '${key}': candidate mesh did not rotate sufficiently under dynamic (meshDelta=${sco.candDynamic.meshDelta})`);
+                  assertionErrors.push(
+                    `Branch '${key}': candidate mesh did not rotate sufficiently under dynamic (meshDelta=${sco.candDynamic.meshDelta})`,
+                  );
                   assertionsPassed = false;
                 }
               }
 
               // Broken control negative tests assertion
               if (!branch.negativeControls || !branch.negativeControls.allRejected) {
-                assertionErrors.push(`Branch '${key}': negative control failed (planted mutations were not all rejected)`);
+                assertionErrors.push(
+                  `Branch '${key}': negative control failed (planted mutations were not all rejected)`,
+                );
                 assertionsPassed = false;
               }
             }
           }
 
           // Image checkpoint assertion (Plan §6 / line 1227; Mail #13025)
-          if (!payload.imageCheckpoint || payload.imageCheckpoint.status !== 'passed') {
-            assertionErrors.push(`Image checkpoint status must be 'passed' (got: '${payload.imageCheckpoint?.status}')`);
+          if (!payload.imageCheckpoint || payload.imageCheckpoint.status !== "passed") {
+            assertionErrors.push(
+              `Image checkpoint status must be 'passed' (got: '${payload.imageCheckpoint?.status}')`,
+            );
             assertionsPassed = false;
           }
 
-          for (const key of ['webgpu', 'webgl']) {
+          for (const key of ["webgpu", "webgl"]) {
             const branch = payload.branches?.[key];
             if (branch && branch.passed) {
               if (!branch.imageComparison) {
                 assertionErrors.push(`Branch '${key}': missing imageComparison in report payload`);
                 assertionsPassed = false;
               } else {
-                const passed = Boolean(branch.imageComparison.pass || branch.imageComparison.passed);
+                const passed = Boolean(
+                  branch.imageComparison.pass || branch.imageComparison.passed,
+                );
                 if (!passed) {
-                  assertionErrors.push(`Branch '${key}': image pixel comparison failed (diffPercent=${branch.imageComparison.diffPercent?.toFixed(4)}% > ${branch.imageComparison.maxDiffPixelPercent}%, diffPixels=${branch.imageComparison.diffPixels}/${branch.imageComparison.totalPixels})`);
+                  assertionErrors.push(
+                    `Branch '${key}': image pixel comparison failed (diffPercent=${branch.imageComparison.diffPercent?.toFixed(4)}% > ${branch.imageComparison.maxDiffPixelPercent}%, diffPixels=${branch.imageComparison.diffPixels}/${branch.imageComparison.totalPixels})`,
+                  );
                   assertionsPassed = false;
                 }
                 if (branch.imageComparison.diffPercent > 0.1) {
-                  assertionErrors.push(`Branch '${key}': image pixel difference ${branch.imageComparison.diffPercent}% exceeds Plan §6 limit of 0.1%`);
+                  assertionErrors.push(
+                    `Branch '${key}': image pixel difference ${branch.imageComparison.diffPercent}% exceeds Plan §6 limit of 0.1%`,
+                  );
                   assertionsPassed = false;
                 }
                 if (branch.imageComparison.colorTolerance !== 2) {
-                  assertionErrors.push(`Branch '${key}': colorTolerance must be 2 (got: ${branch.imageComparison.colorTolerance})`);
+                  assertionErrors.push(
+                    `Branch '${key}': colorTolerance must be 2 (got: ${branch.imageComparison.colorTolerance})`,
+                  );
                   assertionsPassed = false;
                 }
               }
 
               if (!branch.imageNegativeRejected) {
-                assertionErrors.push(`Branch '${key}': mismatched-pixel negative control failed (corrupted pixel buffer was not rejected)`);
+                assertionErrors.push(
+                  `Branch '${key}': mismatched-pixel negative control failed (corrupted pixel buffer was not rejected)`,
+                );
                 assertionsPassed = false;
               }
             }
           }
 
           if (assertionsPassed && assertionErrors.length === 0) {
-            console.log(`[h1-test-harness] ALL H1 PARITY, SCENE/CAMERA, AND INTERACTION ASSERTIONS PASSED in ${browser}`);
+            console.log(
+              `[h1-test-harness] ALL H1 PARITY, SCENE/CAMERA, AND INTERACTION ASSERTIONS PASSED in ${browser}`,
+            );
             shutdown(0);
           } else {
-            console.error('[h1-test-harness] H1 ASSERTION FAILURES:\n', assertionErrors.join('\n'));
+            console.error("[h1-test-harness] H1 ASSERTION FAILURES:\n", assertionErrors.join("\n"));
             shutdown(1);
           }
         } catch (err) {
-          console.error('[h1-test-harness] Failed to process /report payload:', err);
+          console.error("[h1-test-harness] Failed to process /report payload:", err);
           shutdown(1);
         }
       });
@@ -436,42 +536,42 @@ console.log(`[h1-test-harness] Server listening on ${devServer.url}`);
 console.log(`[h1-test-harness] Target URL: ${targetUrl}`);
 console.log(`[h1-test-harness] Launching browser: ${browser}...`);
 
-if (browser === 'chrome') {
+if (browser === "chrome") {
   const chromePaths = [
     process.env.CHROME_BIN,
-    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-    '/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary',
-    '/Applications/Chromium.app/Contents/MacOS/Chromium',
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
   ].filter(Boolean);
-  const chromeBin = chromePaths.find(p => existsSync(p));
+  const chromeBin = chromePaths.find((p) => existsSync(p));
   if (!chromeBin) {
-    console.error('Chrome executable not found. Please install Chrome or run with Safari.');
+    console.error("Chrome executable not found. Please install Chrome or run with Safari.");
     shutdown(1);
   }
 
   browserProcess = spawn(chromeBin, [
-    '--enable-unsafe-webgpu',
-    '--headless=new',
-    '--disable-gpu-sandbox',
-    '--no-sandbox',
+    "--enable-unsafe-webgpu",
+    "--headless=new",
+    "--disable-gpu-sandbox",
+    "--no-sandbox",
     targetUrl,
   ]);
-} else if (browser === 'safari') {
-  browserProcess = spawn('/usr/bin/open', ['-a', 'Safari', targetUrl]);
+} else if (browser === "safari") {
+  browserProcess = spawn("/usr/bin/open", ["-a", "Safari", targetUrl]);
 }
 
 if (browserProcess) {
-  browserProcess.on('error', err => {
+  browserProcess.on("error", (err) => {
     console.error(`[h1-test-harness] Failed to spawn ${browser}:`, err);
     shutdown(1);
   });
   if (browserProcess.stdout) {
-    browserProcess.stdout.on('data', chunk => {
+    browserProcess.stdout.on("data", (chunk) => {
       process.stdout.write(`[browser-stdout] ${chunk}`);
     });
   }
   if (browserProcess.stderr) {
-    browserProcess.stderr.on('data', chunk => {
+    browserProcess.stderr.on("data", (chunk) => {
       process.stderr.write(`[browser-stderr] ${chunk}`);
     });
   }
@@ -479,6 +579,6 @@ if (browserProcess) {
 
 // Global timeout: 120s for multi-checkpoint reference-vs-candidate sequence
 setTimeout(() => {
-  console.error('[h1-test-harness] Timeout waiting for H1 test completion (120s)');
+  console.error("[h1-test-harness] Timeout waiting for H1 test completion (120s)");
   shutdown(1);
 }, 120000);

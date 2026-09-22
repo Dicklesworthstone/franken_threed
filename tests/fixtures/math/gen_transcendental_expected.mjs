@@ -19,15 +19,15 @@
  * This preserves signed zeros (-0.0 vs +0.0), NaNs, infinities, and exact bit precision.
  */
 
-import fs from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
-  toF64Hex,
-  fromF64Hex,
   buildInputsTable,
+  fromF64Hex,
+  toF64Hex,
   validateNoJsonNumbers,
-} from './gen_jsnum_expected.mjs';
+} from "./gen_jsnum_expected.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -35,16 +35,16 @@ const __dirname = path.dirname(__filename);
 export const DEFAULT_SEED = 0x202609101337c001n;
 
 export const UNARY_OPS = [
-  { name: 'sin', fn: Math.sin },
-  { name: 'cos', fn: Math.cos },
-  { name: 'tan', fn: Math.tan },
-  { name: 'asin', fn: Math.asin },
-  { name: 'acos', fn: Math.acos },
-  { name: 'atan', fn: Math.atan },
-  { name: 'exp', fn: Math.exp },
-  { name: 'log', fn: Math.log },
-  { name: 'sqrt', fn: Math.sqrt },
-  { name: 'cbrt', fn: Math.cbrt },
+  { name: "sin", fn: Math.sin },
+  { name: "cos", fn: Math.cos },
+  { name: "tan", fn: Math.tan },
+  { name: "asin", fn: Math.asin },
+  { name: "acos", fn: Math.acos },
+  { name: "atan", fn: Math.atan },
+  { name: "exp", fn: Math.exp },
+  { name: "log", fn: Math.log },
+  { name: "sqrt", fn: Math.sqrt },
+  { name: "cbrt", fn: Math.cbrt },
 ];
 
 /**
@@ -93,7 +93,7 @@ export function generateTranscendentalFixtureData(seed = DEFAULT_SEED) {
       powCases.push({
         x: xHex,
         y: yHex,
-        result: toF64Hex(Math.pow(x, y)),
+        result: toF64Hex(x ** y),
       });
     }
   }
@@ -114,9 +114,10 @@ export function generateTranscendentalFixtureData(seed = DEFAULT_SEED) {
 
   return {
     metadata: {
-      generator: 'tests/fixtures/math/gen_transcendental_expected.mjs',
-      description: 'ECMAScript transcendental function expected vectors evaluated in Node (V8) for differential testing against f3d-math (roa.1)',
-      lcg_seed: '0x' + seed.toString(16).padStart(16, '0'),
+      generator: "tests/fixtures/math/gen_transcendental_expected.mjs",
+      description:
+        "ECMAScript transcendental function expected vectors evaluated in Node (V8) for differential testing against f3d-math (roa.1)",
+      lcg_seed: "0x" + seed.toString(16).padStart(16, "0"),
       generated_at: new Date().toISOString(),
     },
     inputs: inputs.map(toF64Hex),
@@ -177,7 +178,7 @@ export function formatTranscendentalFixtureLines(fixtureData) {
     lines.push(`hypot ${c.x} ${c.y} ${c.result}`);
   }
 
-  return lines.join('\n') + '\n';
+  return lines.join("\n") + "\n";
 }
 
 /**
@@ -185,24 +186,28 @@ export function formatTranscendentalFixtureLines(fixtureData) {
  */
 export function main() {
   const outputDir = __dirname;
-  const txtPath = path.join(outputDir, 'transcendental_expected.txt');
-  const jsonPath = path.join(outputDir, 'transcendental_expected.json');
+  const txtPath = path.join(outputDir, "transcendental_expected.txt");
+  const jsonPath = path.join(outputDir, "transcendental_expected.json");
 
   if (!fs.existsSync(outputDir)) {
     fs.mkdirSync(outputDir, { recursive: true });
   }
 
-  console.log('[gen_transcendental_expected] Evaluating ECMAScript transcendental operations in Node (V8)...');
+  console.log(
+    "[gen_transcendental_expected] Evaluating ECMAScript transcendental operations in Node (V8)...",
+  );
   const fixtureData = generateTranscendentalFixtureData();
 
-  console.log('[gen_transcendental_expected] Formatting line-oriented text fixture...');
+  console.log("[gen_transcendental_expected] Formatting line-oriented text fixture...");
   const txtContent = formatTranscendentalFixtureLines(fixtureData);
-  fs.writeFileSync(txtPath, txtContent, 'utf8');
+  fs.writeFileSync(txtPath, txtContent, "utf8");
 
-  console.log('[gen_transcendental_expected] Formatting JSON fixture and validating zero raw numbers...');
+  console.log(
+    "[gen_transcendental_expected] Formatting JSON fixture and validating zero raw numbers...",
+  );
   const jsonStr = JSON.stringify(fixtureData, null, 2);
   validateNoJsonNumbers(jsonStr);
-  fs.writeFileSync(jsonPath, jsonStr, 'utf8');
+  fs.writeFileSync(jsonPath, jsonStr, "utf8");
 
   const txtStats = fs.statSync(txtPath);
   const jsonStats = fs.statSync(jsonPath);

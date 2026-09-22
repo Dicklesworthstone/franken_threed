@@ -24,7 +24,8 @@ async function drainAndCleanup(host, srcId, dstId) {
 }
 
 export async function testBufferCopy(host, wasmExports, canvasContext) {
-  const buildPacket = wasmExports?.f3d_build_buffer_copy_packet ||
+  const buildPacket =
+    wasmExports?.f3d_build_buffer_copy_packet ||
     (typeof wasmExports === "function" ? wasmExports : null);
   if (typeof buildPacket !== "function") {
     throw new Error("Missing required canonical export: f3d_build_buffer_copy_packet");
@@ -44,17 +45,24 @@ export async function testBufferCopy(host, wasmExports, canvasContext) {
 
   // 1. Fill pattern buffer with non-zero bytes so destination zeros are distinct
   const data = new Uint8Array(totalSize);
-  for (let i = 0; i < totalSize; i++) data[i] = ((i * 7 + 13) & 0xff) || 1;
+  for (let i = 0; i < totalSize; i++) data[i] = (i * 7 + 13) & 0xff || 1;
 
   const assertBufferMatches = (readback, label) => {
-    if (readback.byteLength !== totalSize) throw new Error(`${label} length mismatch: got ${readback.byteLength}, expected ${totalSize}`);
+    if (readback.byteLength !== totalSize)
+      throw new Error(
+        `${label} length mismatch: got ${readback.byteLength}, expected ${totalSize}`,
+      );
     for (let i = 0; i < copySize; i++) {
       if (readback[dstOffset + i] !== data[srcOffset + i]) {
-        throw new Error(`${label} mismatch at dst ${dstOffset + i}: got ${readback[dstOffset + i]}, expected ${data[srcOffset + i]}`);
+        throw new Error(
+          `${label} mismatch at dst ${dstOffset + i}: got ${readback[dstOffset + i]}, expected ${data[srcOffset + i]}`,
+        );
       }
     }
-    if (readback.subarray(0, dstOffset).some((b) => b !== 0)) throw new Error(`${label} prefix not zero`);
-    if (readback.subarray(dstOffset + copySize).some((b) => b !== 0)) throw new Error(`${label} suffix not zero`);
+    if (readback.subarray(0, dstOffset).some((b) => b !== 0))
+      throw new Error(`${label} prefix not zero`);
+    if (readback.subarray(dstOffset + copySize).some((b) => b !== 0))
+      throw new Error(`${label} suffix not zero`);
   };
 
   // 2. Build canonical Rust packet and inject opaque 64-bit epoch with high bit set (0x8000000100000002)
@@ -73,8 +81,10 @@ export async function testBufferCopy(host, wasmExports, canvasContext) {
     assertBufferMatches(readback, "Copy");
 
     // Opaque epoch with high bit set survives in epochHi/Lo
-    if ((readback.epochHi >>> 0) !== 0x80000001 || (readback.epochLo >>> 0) !== 2) {
-      throw new Error(`Epoch mismatch: expected hi=0x80000001 lo=2, got hi=${readback.epochHi} lo=${readback.epochLo}`);
+    if (readback.epochHi >>> 0 !== 0x80000001 || readback.epochLo >>> 0 !== 2) {
+      throw new Error(
+        `Epoch mismatch: expected hi=0x80000001 lo=2, got hi=${readback.epochHi} lo=${readback.epochLo}`,
+      );
     }
   } finally {
     await drainAndCleanup(host, srcBufferId, dstBufferId);
@@ -85,7 +95,8 @@ export async function testBufferCopy(host, wasmExports, canvasContext) {
     const zeroPacket = buildPacket(data, 16, 32, 0);
     await host.executePacket(zeroPacket);
     const zeroReadback = await host.readbackBuffer(dstBufferId, totalSize);
-    if (zeroReadback.some((b) => b !== 0)) throw new Error("Zero-size copy modified destination bytes");
+    if (zeroReadback.some((b) => b !== 0))
+      throw new Error("Zero-size copy modified destination bytes");
   } finally {
     await drainAndCleanup(host, srcBufferId, dstBufferId);
   }
@@ -98,7 +109,9 @@ export async function testBufferCopy(host, wasmExports, canvasContext) {
     } catch (err) {
       threw = true;
       if (!errPattern.test(err.message)) {
-        throw new Error(`Decoder rejection mismatch for ${label}: got "${err.message}", expected ${errPattern}`);
+        throw new Error(
+          `Decoder rejection mismatch for ${label}: got "${err.message}", expected ${errPattern}`,
+        );
       }
     } finally {
       await drainAndCleanup(host, srcBufferId, dstBufferId);
@@ -108,10 +121,20 @@ export async function testBufferCopy(host, wasmExports, canvasContext) {
 
   const decoderMutations = [
     { off: 4, val: 15n, pat: /source_offset.*multiple of 4/i, lbl: "unaligned source offset" },
-    { off: 16, val: 15n, pat: /destination_offset.*multiple of 4/i, lbl: "unaligned destination offset" },
+    {
+      off: 16,
+      val: 15n,
+      pat: /destination_offset.*multiple of 4/i,
+      lbl: "unaligned destination offset",
+    },
     { off: 24, val: 15n, pat: /size.*multiple of 4/i, lbl: "unaligned copy size" },
     { off: 4, val: 1024n, pat: /source range out of bounds/i, lbl: "out-of-bounds source range" },
-    { off: 16, val: 1024n, pat: /destination range out of bounds/i, lbl: "out-of-bounds destination range" },
+    {
+      off: 16,
+      val: 1024n,
+      pat: /destination range out of bounds/i,
+      lbl: "out-of-bounds destination range",
+    },
   ];
 
   for (const { off, val, pat, lbl } of decoderMutations) {
@@ -122,7 +145,11 @@ export async function testBufferCopy(host, wasmExports, canvasContext) {
 
   // Same buffer ID rejection: source and destination must be distinct objects
   const sameBufferPacket = packet.slice();
-  new DataView(sameBufferPacket.buffer, sameBufferPacket.byteOffset).setUint32(copyOffset + 12, 610, true);
+  new DataView(sameBufferPacket.buffer, sameBufferPacket.byteOffset).setUint32(
+    copyOffset + 12,
+    610,
+    true,
+  );
   await assertDecoderRejection(sameBufferPacket, /distinct objects/i, "same buffer id");
 
   // Shorten only final 40-byte COPY fields while preserving data payload to test truncation guard
@@ -130,7 +157,11 @@ export async function testBufferCopy(host, wasmExports, canvasContext) {
   const truncatedPacket = new Uint8Array(packet.byteLength - 20);
   truncatedPacket.set(packet.subarray(0, commandEnd - 20), 0);
   truncatedPacket.set(packet.subarray(commandEnd), commandEnd - 20);
-  await assertDecoderRejection(truncatedPacket, /Truncated COPY_BUFFER_TO_BUFFER/i, "truncated COPY_BUFFER_TO_BUFFER command");
+  await assertDecoderRejection(
+    truncatedPacket,
+    /Truncated COPY_BUFFER_TO_BUFFER/i,
+    "truncated COPY_BUFFER_TO_BUFFER command",
+  );
 
   // 6. Rust packet builder argument rejection
   for (const { src, dst, size, desc } of [
@@ -139,8 +170,13 @@ export async function testBufferCopy(host, wasmExports, canvasContext) {
     { src: 16, dst: 32, size: 300, desc: "size > data.len" },
   ]) {
     let rejected = false;
-    try { buildPacket(data, src, dst, size); } catch { rejected = true; }
-    if (!rejected) throw new Error(`f3d_build_buffer_copy_packet failed to reject invalid range: ${desc}`);
+    try {
+      buildPacket(data, src, dst, size);
+    } catch {
+      rejected = true;
+    }
+    if (!rejected)
+      throw new Error(`f3d_build_buffer_copy_packet failed to reject invalid range: ${desc}`);
   }
 
   // 7. Single-packet pass-before-copy execution using real Rust export f3d_build_render_then_copy_packet

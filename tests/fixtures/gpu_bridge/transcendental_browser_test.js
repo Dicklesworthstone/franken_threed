@@ -103,7 +103,7 @@ export function computeUlpDiff(act, exp, actBits, expBits) {
   const expIsInf = exp === Infinity || exp === -Infinity;
 
   if (actIsInf && expIsInf) {
-    if ((actBits >> 63n) === (expBits >> 63n)) {
+    if (actBits >> 63n === expBits >> 63n) {
       return 0n;
     } else {
       return U64_MAX;
@@ -151,7 +151,7 @@ async function fetchTranscendentalFixture() {
   }
 
   throw new Error(
-    `Failed to fetch transcendental fixture: tried [${candidateUrls.join(", ")}], last error: ${lastError ? lastError.message : "not found"}`
+    `Failed to fetch transcendental fixture: tried [${candidateUrls.join(", ")}], last error: ${lastError ? lastError.message : "not found"}`,
   );
 }
 
@@ -183,7 +183,7 @@ export async function testTranscendentalBrowser(fixtureInput = null) {
     }
     if (cases.length !== UNARY_EXPECTED_COUNT) {
       throw new Error(
-        `Unary op '${opName}' case count ${cases.length} does not match expected ${UNARY_EXPECTED_COUNT}`
+        `Unary op '${opName}' case count ${cases.length} does not match expected ${UNARY_EXPECTED_COUNT}`,
       );
     }
 
@@ -242,7 +242,7 @@ export async function testTranscendentalBrowser(fixtureInput = null) {
     }
     if (cases.length !== BINARY_EXPECTED_COUNT) {
       throw new Error(
-        `Binary op '${opName}' case count ${cases.length} does not match expected ${BINARY_EXPECTED_COUNT}`
+        `Binary op '${opName}' case count ${cases.length} does not match expected ${BINARY_EXPECTED_COUNT}`,
       );
     }
 
@@ -301,7 +301,7 @@ export async function testTranscendentalBrowser(fixtureInput = null) {
     }
     if (cases.length !== BINARY_EXPECTED_COUNT) {
       throw new Error(
-        `Binary op '${opName}' case count ${cases.length} does not match expected ${BINARY_EXPECTED_COUNT}`
+        `Binary op '${opName}' case count ${cases.length} does not match expected ${BINARY_EXPECTED_COUNT}`,
       );
     }
 
@@ -314,7 +314,7 @@ export async function testTranscendentalBrowser(fixtureInput = null) {
     for (const c of cases) {
       const { f64: x } = decodeHexToF64AndBits(c.x);
       const { f64: y } = decodeHexToF64AndBits(c.y);
-      const actualF64 = Math.pow(x, y);
+      const actualF64 = x ** y;
       const { bits: actualBits, hex: actualHex } = encodeF64ToBitsAndHex(actualF64);
       const { f64: expF64, bits: expBits } = decodeHexToF64AndBits(c.result);
 
@@ -360,7 +360,7 @@ export async function testTranscendentalBrowser(fixtureInput = null) {
     }
     if (cases.length !== BINARY_EXPECTED_COUNT) {
       throw new Error(
-        `Binary op '${opName}' case count ${cases.length} does not match expected ${BINARY_EXPECTED_COUNT}`
+        `Binary op '${opName}' case count ${cases.length} does not match expected ${BINARY_EXPECTED_COUNT}`,
       );
     }
 
@@ -427,7 +427,7 @@ export async function testTranscendentalBrowser(fixtureInput = null) {
       : BINARY_EXPECTED_COUNT;
     if (stat.total !== expectedOpCount) {
       throw new Error(
-        `Op '${opName}' evaluated count ${stat.total} does not match expected count ${expectedOpCount}`
+        `Op '${opName}' evaluated count ${stat.total} does not match expected count ${expectedOpCount}`,
       );
     }
     grandTotal += stat.total;
@@ -441,14 +441,12 @@ export async function testTranscendentalBrowser(fixtureInput = null) {
 
   if (grandTotal !== EXPECTED_TOTAL_CASES) {
     throw new Error(
-      `Total evaluated cases ${grandTotal} does not match expected ${EXPECTED_TOTAL_CASES}`
+      `Total evaluated cases ${grandTotal} does not match expected ${EXPECTED_TOTAL_CASES}`,
     );
   }
 
   const hostEnvironment =
-    typeof navigator !== "undefined" && navigator.userAgent
-      ? navigator.userAgent
-      : "unknown";
+    typeof navigator !== "undefined" && navigator.userAgent ? navigator.userAgent : "unknown";
 
   const grandTotals = {
     total: grandTotal,

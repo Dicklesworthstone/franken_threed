@@ -3,10 +3,10 @@
 // Spawns tests/fixtures/browser_execution/test_harness.mjs as a child process,
 // parses the JSON summary, and asserts the five 58j.2 probes from events.jsonl.
 
-import { existsSync, readFileSync } from 'node:fs';
-import { resolve, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { spawn } from 'node:child_process';
+import { spawn } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 /**
  * The five mandatory 58j.2 execution probes required by CONTRACT.md & plan §5.8:
@@ -17,35 +17,41 @@ import { spawn } from 'node:child_process';
  * 5. burst-first-turn-and-completion: non-reentrant worker pump burst limits (<= 4 polls/turn)
  */
 export const PROBES_58J2 = [
-  'timer',
-  'channel-join',
-  'host-turn',
-  'reentrancy',
-  'burst-first-turn-and-completion',
+  "timer",
+  "channel-join",
+  "host-turn",
+  "reentrancy",
+  "burst-first-turn-and-completion",
 ];
 
-const HARNESS_PATH = fileURLToPath(new URL('../../fixtures/browser_execution/test_harness.mjs', import.meta.url));
+const HARNESS_PATH = fileURLToPath(
+  new URL("../../fixtures/browser_execution/test_harness.mjs", import.meta.url),
+);
 
 /**
  * Spawns the fixture test harness as a child process and extracts the JSON summary line.
  */
-export function spawnHarness(packagePath, browser = 'chrome', extraArg = null) {
+export function spawnHarness(packagePath, browser = "chrome", extraArg = null) {
   return new Promise((res, rej) => {
     const args = [HARNESS_PATH, packagePath, browser];
     if (extraArg) args.push(extraArg);
 
     const child = spawn(process.execPath, args, {
       env: { ...process.env },
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: ["ignore", "pipe", "pipe"],
     });
 
-    let stdout = '';
-    let stderr = '';
-    child.stdout.on('data', chunk => { stdout += chunk; });
-    child.stderr.on('data', chunk => { stderr += chunk; });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
 
-    child.on('close', code => {
-      const lines = stdout.split('\n');
+    child.on("close", (code) => {
+      const lines = stdout.split("\n");
       let parsed = null;
       for (const line of lines) {
         const trimmed = line.trim();
@@ -61,15 +67,15 @@ export function spawnHarness(packagePath, browser = 'chrome', extraArg = null) {
         return rej(
           new Error(
             `Harness exited with code ${code} without emitting JSON summary.\n` +
-            `Stderr: ${stderr || '(empty)'}\nStdout: ${stdout}`
-          )
+              `Stderr: ${stderr || "(empty)"}\nStdout: ${stdout}`,
+          ),
         );
       }
 
       res({ code, parsed, stdout, stderr });
     });
 
-    child.on('error', rej);
+    child.on("error", rej);
   });
 }
 
@@ -77,11 +83,11 @@ export function spawnHarness(packagePath, browser = 'chrome', extraArg = null) {
  * Reads events from runDir/events.jsonl.
  */
 export function readEvents(runDir) {
-  const eventsPath = join(runDir, 'events.jsonl');
+  const eventsPath = join(runDir, "events.jsonl");
   if (!existsSync(eventsPath)) {
     throw new Error(`Events file missing at: ${eventsPath}`);
   }
-  const lines = readFileSync(eventsPath, 'utf8').split('\n');
+  const lines = readFileSync(eventsPath, "utf8").split("\n");
   const events = [];
   for (const line of lines) {
     const trimmed = line.trim();
@@ -94,9 +100,11 @@ export function readEvents(runDir) {
   return events;
 }
 
-export async function runExecutionSuite(packagePath, browser = 'chrome') {
-  if (!packagePath || !['chrome', 'safari'].includes(browser)) {
-    throw new Error('Usage: runExecutionSuite(packagePath, browser) where browser is "chrome" or "safari"');
+export async function runExecutionSuite(packagePath, browser = "chrome") {
+  if (!packagePath || !["chrome", "safari"].includes(browser)) {
+    throw new Error(
+      'Usage: runExecutionSuite(packagePath, browser) where browser is "chrome" or "safari"',
+    );
   }
 
   console.log(`[f3d-58j.2] Spawning foundation execution harness on ${browser}...`);
@@ -104,42 +112,50 @@ export async function runExecutionSuite(packagePath, browser = 'chrome') {
 
   if (code !== 0 || !parsed.passed) {
     throw new Error(
-      `[f3d-58j.2] Harness run failed (exit code ${code}, passed=${parsed.passed}). Stderr: ${stderr || '(empty)'}`
+      `[f3d-58j.2] Harness run failed (exit code ${code}, passed=${parsed.passed}). Stderr: ${stderr || "(empty)"}`,
     );
   }
 
   const events = readEvents(parsed.runDir);
   const completedProbes = new Set(
-    events
-      .filter(e => e.step === 'complete')
-      .map(e => e.test || e.probe)
+    events.filter((e) => e.step === "complete").map((e) => e.test || e.probe),
   );
 
   // Assert all five 58j.2 probes completed
-  const missing = PROBES_58J2.filter(name => !completedProbes.has(name));
+  const missing = PROBES_58J2.filter((name) => !completedProbes.has(name));
   if (missing.length > 0) {
-    throw new Error(`[f3d-58j.2] Missing required 58j.2 completed probe observations: ${missing.join(', ')}`);
+    throw new Error(
+      `[f3d-58j.2] Missing required 58j.2 completed probe observations: ${missing.join(", ")}`,
+    );
   }
 
   // Assert authoritative Rust burst invariant (rust-max-per-pump-turn <= 4 per CONTRACT.md)
   const rustBurstEvent = events.find(
-    e => (e.test === 'burst-all-turns' || e.probe === 'burst-all-turns') && e.step === 'rust-max-per-pump-turn'
+    (e) =>
+      (e.test === "burst-all-turns" || e.probe === "burst-all-turns") &&
+      e.step === "rust-max-per-pump-turn",
   );
   if (!rustBurstEvent) {
-    throw new Error('[f3d-58j.2] Missing required burst-all-turns step rust-max-per-pump-turn event');
+    throw new Error(
+      "[f3d-58j.2] Missing required burst-all-turns step rust-max-per-pump-turn event",
+    );
   }
   const rustMax = rustBurstEvent?.data?.value ?? rustBurstEvent?.value;
-  if (typeof rustMax !== 'number' || rustMax > 4) {
-    throw new Error(`[f3d-58j.2] Burst limit invariant violated: observed rust-max-per-pump-turn ${rustMax} > 4`);
+  if (typeof rustMax !== "number" || rustMax > 4) {
+    throw new Error(
+      `[f3d-58j.2] Burst limit invariant violated: observed rust-max-per-pump-turn ${rustMax} > 4`,
+    );
   }
 
   // JS observation window max is logged as a diagnostic only per CONTRACT.md
   const jsMaxEvent = events.find(
-    e => (e.test === 'burst-all-turns' || e.probe === 'burst-all-turns') && e.step === 'max'
+    (e) => (e.test === "burst-all-turns" || e.probe === "burst-all-turns") && e.step === "max",
   );
   const jsMax = jsMaxEvent?.data?.value ?? jsMaxEvent?.value;
-  if (typeof jsMax === 'number') {
-    console.log(`[f3d-58j.2] Diagnostic: JS observation window max=${jsMax} (authoritative Rust per-turn max=${rustMax})`);
+  if (typeof jsMax === "number") {
+    console.log(
+      `[f3d-58j.2] Diagnostic: JS observation window max=${jsMax} (authoritative Rust per-turn max=${rustMax})`,
+    );
   }
 
   const outcome = {
@@ -150,16 +166,20 @@ export async function runExecutionSuite(packagePath, browser = 'chrome') {
     summary: parsed.summary,
   };
 
-  console.log(`[f3d-58j.2] PASS: All five 58j.2 probes verified on ${browser}: ${PROBES_58J2.join(', ')}`);
+  console.log(
+    `[f3d-58j.2] PASS: All five 58j.2 probes verified on ${browser}: ${PROBES_58J2.join(", ")}`,
+  );
   console.log(JSON.stringify(outcome));
   return outcome;
 }
 
 // Direct CLI entry point
 if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
-  const [packagePath, browser = 'chrome'] = process.argv.slice(2);
-  if (!packagePath || !['chrome', 'safari'].includes(browser)) {
-    console.error('Usage: node tests/e2e/foundation/execution.mjs <wasm-bindgen-package-directory> [chrome|safari]');
+  const [packagePath, browser = "chrome"] = process.argv.slice(2);
+  if (!packagePath || !["chrome", "safari"].includes(browser)) {
+    console.error(
+      "Usage: node tests/e2e/foundation/execution.mjs <wasm-bindgen-package-directory> [chrome|safari]",
+    );
     process.exit(1);
   }
 

@@ -19,18 +19,18 @@ function generateDistinctAffineRows(recordCount, uploadIndex) {
 
   for (let i = 0; i < recordCount; i++) {
     const base = i * 12;
-    floats[base + 0] = 1.0 + (i * 0.0001) + delta;
+    floats[base + 0] = 1.0 + i * 0.0001 + delta;
     floats[base + 1] = 0.01 * ((i % 7) + 1);
     floats[base + 2] = 0.02 * ((i % 11) + 1);
-    floats[base + 3] = (i * 0.25) + 1.0 + delta;
+    floats[base + 3] = i * 0.25 + 1.0 + delta;
     floats[base + 4] = 0.03 * ((i % 5) + 1);
-    floats[base + 5] = 1.0 + (i * 0.0002) + delta;
+    floats[base + 5] = 1.0 + i * 0.0002 + delta;
     floats[base + 6] = 0.04 * ((i % 13) + 1);
-    floats[base + 7] = (i * 0.5) - 2.0 + delta;
+    floats[base + 7] = i * 0.5 - 2.0 + delta;
     floats[base + 8] = 0.05 * ((i % 9) + 1);
     floats[base + 9] = 0.06 * ((i % 17) + 1);
-    floats[base + 10] = 1.0 + (i * 0.0003) + delta;
-    floats[base + 11] = (i * 0.75) + 3.0 + delta;
+    floats[base + 10] = 1.0 + i * 0.0003 + delta;
+    floats[base + 11] = i * 0.75 + 3.0 + delta;
   }
 
   // Inject -0.0 (0x80000000) and quiet NaN with payload 0x1337 (0x7fc01337) via Uint32Array view
@@ -53,15 +53,19 @@ function buildExpectedBytes(buffer, floatCount) {
 function assertSpecialBits(bytes, label, upload) {
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const negZero = dv.getUint32(4, true);
-  if (negZero !== 0x80000000) throw new Error(`Upload ${upload}: ${label} -0.0 mismatch: 0x${negZero.toString(16)}`);
+  if (negZero !== 0x80000000)
+    throw new Error(`Upload ${upload}: ${label} -0.0 mismatch: 0x${negZero.toString(16)}`);
   const quietNan = dv.getUint32(8, true);
-  if (quietNan !== 0x7fc01337) throw new Error(`Upload ${upload}: ${label} quiet NaN mismatch: 0x${quietNan.toString(16)}`);
+  if (quietNan !== 0x7fc01337)
+    throw new Error(`Upload ${upload}: ${label} quiet NaN mismatch: 0x${quietNan.toString(16)}`);
 }
 
 function assertBytesEqual(actual, expected, label, upload) {
   for (let i = 0; i < expected.length; i++) {
     if (actual[i] !== expected[i]) {
-      throw new Error(`Upload ${upload}: ${label} byte mismatch at ${i}: got ${actual[i]}, expected ${expected[i]}`);
+      throw new Error(
+        `Upload ${upload}: ${label} byte mismatch at ${i}: got ${actual[i]}, expected ${expected[i]}`,
+      );
     }
   }
 }
@@ -106,7 +110,9 @@ export async function testWorkloadBStorageCopy(host, wasmExports) {
 
     const packed = packFn(floats);
     if (!(packed instanceof Uint8Array) || packed.byteLength !== expectedBytes) {
-      throw new Error(`Upload ${upload}: packed length mismatch, got ${packed?.byteLength}, expected ${expectedBytes}`);
+      throw new Error(
+        `Upload ${upload}: packed length mismatch, got ${packed?.byteLength}, expected ${expectedBytes}`,
+      );
     }
 
     // 1. Verify Wasm packer output matches expected bytes independently built from input floats
@@ -117,14 +123,18 @@ export async function testWorkloadBStorageCopy(host, wasmExports) {
     // 3. Build opcode 20 buffer-to-buffer copy packet and execute on real device
     const packet = buildCopyPacket(packed, 0, 0, expectedBytes);
     if (!(packet instanceof Uint8Array) || packet.byteLength === 0) {
-      throw new Error(`Upload ${upload}: f3d_build_buffer_copy_packet returned empty or invalid packet`);
+      throw new Error(
+        `Upload ${upload}: f3d_build_buffer_copy_packet returned empty or invalid packet`,
+      );
     }
 
     try {
       await host.executePacket(packet);
       const readback = await host.readbackBuffer(dstBufferId, expectedBytes);
       if (readback.byteLength !== expectedBytes) {
-        throw new Error(`Upload ${upload}: readback length mismatch: got ${readback.byteLength}, expected ${expectedBytes}`);
+        throw new Error(
+          `Upload ${upload}: readback length mismatch: got ${readback.byteLength}, expected ${expectedBytes}`,
+        );
       }
 
       // 4. Assert readback matches packed bytes byte-for-byte
@@ -132,7 +142,9 @@ export async function testWorkloadBStorageCopy(host, wasmExports) {
       // 5. Assert exact bit patterns survived readback without canonicalization
       assertSpecialBits(readback, "readback", upload);
 
-      uploadReports.push(`upload ${upload}: ${expectedBytes} bytes byte-exact, -0.0/NaN bits verified`);
+      uploadReports.push(
+        `upload ${upload}: ${expectedBytes} bytes byte-exact, -0.0/NaN bits verified`,
+      );
     } finally {
       await drainAndCleanup(host, srcBufferId, dstBufferId);
     }
@@ -145,7 +157,7 @@ function calculateMedian(arr) {
   if (arr.length === 0) return 0;
   const s = [...arr].sort((a, b) => a - b);
   const mid = Math.floor(s.length / 2);
-  return (s.length % 2 !== 0) ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+  return s.length % 2 !== 0 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
 }
 
 function calculateP95(arr) {
@@ -159,7 +171,13 @@ function calculateP95(arr) {
  * Creates an execution wrapper for one of the four workload (b) variants.
  * Handles persistent buffer allocation, per-frame submission, readback, and destruction.
  */
-function createVariant(key, host, wasmExports, recordCount = WORKLOAD_B_RECORD_COUNT, expectedBytes = WORKLOAD_B_EXPECTED_BYTES) {
+function createVariant(
+  key,
+  host,
+  wasmExports,
+  recordCount = WORKLOAD_B_RECORD_COUNT,
+  expectedBytes = WORKLOAD_B_EXPECTED_BYTES,
+) {
   switch (key) {
     case "workload_b_bulk_packet": {
       return {
@@ -168,15 +186,21 @@ function createVariant(key, host, wasmExports, recordCount = WORKLOAD_B_RECORD_C
         init: async () => {
           const initFn = wasmExports?.f3d_build_affine_rows_storage_upload_init_packet;
           if (typeof initFn !== "function") {
-            throw new Error("Missing required canonical export: f3d_build_affine_rows_storage_upload_init_packet");
+            throw new Error(
+              "Missing required canonical export: f3d_build_affine_rows_storage_upload_init_packet",
+            );
           }
           const frameFn = wasmExports?.f3d_build_affine_rows_storage_upload_frame_packet;
           if (typeof frameFn !== "function") {
-            throw new Error("Missing required canonical export: f3d_build_affine_rows_storage_upload_frame_packet");
+            throw new Error(
+              "Missing required canonical export: f3d_build_affine_rows_storage_upload_frame_packet",
+            );
           }
           const initPacket = initFn(recordCount);
           if (!(initPacket instanceof Uint8Array) || initPacket.byteLength === 0) {
-            throw new Error("f3d_build_affine_rows_storage_upload_init_packet returned empty or invalid packet");
+            throw new Error(
+              "f3d_build_affine_rows_storage_upload_init_packet returned empty or invalid packet",
+            );
           }
           await host.executePacket(initPacket);
           for (const id of [610, 611, 612]) {
@@ -186,9 +210,15 @@ function createVariant(key, host, wasmExports, recordCount = WORKLOAD_B_RECORD_C
           }
         },
         submitFrame: (floats, slot) => {
-          const packet = wasmExports.f3d_build_affine_rows_storage_upload_frame_packet(floats, recordCount, slot);
+          const packet = wasmExports.f3d_build_affine_rows_storage_upload_frame_packet(
+            floats,
+            recordCount,
+            slot,
+          );
           if (!(packet instanceof Uint8Array) || packet.byteLength === 0) {
-            throw new Error("f3d_build_affine_rows_storage_upload_frame_packet returned empty or invalid packet");
+            throw new Error(
+              "f3d_build_affine_rows_storage_upload_frame_packet returned empty or invalid packet",
+            );
           }
           const packetPromise = host.executePacket(packet);
           const queuePromise = host.device.queue.onSubmittedWorkDone();
@@ -215,8 +245,8 @@ function createVariant(key, host, wasmExports, recordCount = WORKLOAD_B_RECORD_C
 
     case "workload_b_wasm_callbacks": {
       let cbBuffers = null;
-      let prevWriteBuffer = undefined;
-      let prevCopyBuffer = undefined;
+      let prevWriteBuffer;
+      let prevCopyBuffer;
       const globalScope = typeof window !== "undefined" ? window : globalThis;
       globalScope.f3dHost = globalScope.f3dHost || {};
       const hostObj = globalScope.f3dHost;
@@ -226,7 +256,9 @@ function createVariant(key, host, wasmExports, recordCount = WORKLOAD_B_RECORD_C
         implementation_owner: "Rust/Wasm callback loop; JavaScript WebGPU adapter",
         init: async () => {
           if (typeof wasmExports?.f3d_bridge_callback_storage_upload_frame !== "function") {
-            throw new Error("Missing required canonical export: f3d_bridge_callback_storage_upload_frame");
+            throw new Error(
+              "Missing required canonical export: f3d_bridge_callback_storage_upload_frame",
+            );
           }
           const src = host.device.createBuffer({
             label: "f3d-callback-src-610",
@@ -256,18 +288,26 @@ function createVariant(key, host, wasmExports, recordCount = WORKLOAD_B_RECORD_C
 
           hostObj.copyBufferToBuffer = (srcId, srcOff, dstId, dstOff, size) => {
             const sBuf = cbBuffers?.[srcId];
-            if (!sBuf) throw new Error(`f3dHost.copyBufferToBuffer: unknown source buffer ${srcId}`);
+            if (!sBuf)
+              throw new Error(`f3dHost.copyBufferToBuffer: unknown source buffer ${srcId}`);
             const dBuf = cbBuffers?.[dstId];
-            if (!dBuf) throw new Error(`f3dHost.copyBufferToBuffer: unknown destination buffer ${dstId}`);
+            if (!dBuf)
+              throw new Error(`f3dHost.copyBufferToBuffer: unknown destination buffer ${dstId}`);
             const encoder = host.device.createCommandEncoder();
             encoder.copyBufferToBuffer(sBuf, srcOff, dBuf, dstOff, size);
             host.device.queue.submit([encoder.finish()]);
           };
         },
         submitFrame: (floats, slot) => {
-          const callbackCount = wasmExports.f3d_bridge_callback_storage_upload_frame(floats, recordCount, slot);
+          const callbackCount = wasmExports.f3d_bridge_callback_storage_upload_frame(
+            floats,
+            recordCount,
+            slot,
+          );
           if (callbackCount !== 2) {
-            throw new Error(`f3d_bridge_callback_storage_upload_frame returned ${callbackCount}, expected 2`);
+            throw new Error(
+              `f3d_bridge_callback_storage_upload_frame returned ${callbackCount}, expected 2`,
+            );
           }
           return host.device.queue.onSubmittedWorkDone();
         },
@@ -337,13 +377,19 @@ function createVariant(key, host, wasmExports, recordCount = WORKLOAD_B_RECORD_C
           try {
             genMod = await import("/out/browser-probe/static_packed_upload_4000.js");
           } catch (importErr) {
-            throw new Error(`Failed to load /out/browser-probe/static_packed_upload_4000.js: ${importErr.message}`);
+            throw new Error(
+              `Failed to load /out/browser-probe/static_packed_upload_4000.js: ${importErr.message}`,
+            );
           }
           if (typeof genMod.initStaticPackedBuffers4000 !== "function") {
-            throw new Error("Missing required export initStaticPackedBuffers4000 in static_packed_upload_4000.js");
+            throw new Error(
+              "Missing required export initStaticPackedBuffers4000 in static_packed_upload_4000.js",
+            );
           }
           if (typeof genMod.createStaticPackedUploadRunner4000 !== "function") {
-            throw new Error("Missing required export createStaticPackedUploadRunner4000 in static_packed_upload_4000.js");
+            throw new Error(
+              "Missing required export createStaticPackedUploadRunner4000 in static_packed_upload_4000.js",
+            );
           }
           const buffers = genMod.initStaticPackedBuffers4000(host.device);
           genRunner = genMod.createStaticPackedUploadRunner4000(host.device, buffers);
@@ -398,8 +444,8 @@ async function runVariantCreditLoop(variant, upload0, upload1, expected0, expect
         maxInFlightObserved = inFlight.length + 1;
       }
 
-      const slot = (i % 2 === 0) ? 611 : 612;
-      const upload = (i % 2 === 0) ? upload0 : upload1;
+      const slot = i % 2 === 0 ? 611 : 612;
+      const upload = i % 2 === 0 ? upload0 : upload1;
 
       const tFrameStart = performance.now();
       let framePromise;
@@ -419,7 +465,7 @@ async function runVariantCreditLoop(variant, upload0, upload1, expected0, expect
         },
         (err) => {
           if (!firstError) firstError = err;
-        }
+        },
       );
       inFlight.push(tracked);
     }
@@ -431,14 +477,18 @@ async function runVariantCreditLoop(variant, upload0, upload1, expected0, expect
     // Correctness First: map-read 611 and 612 and compare with independently computed expected bytes
     const readback611 = await variant.readback(611);
     if (!readback611 || readback611.byteLength !== WORKLOAD_B_EXPECTED_BYTES) {
-      throw new Error(`Slot 611 readback length mismatch: got ${readback611?.byteLength}, expected ${WORKLOAD_B_EXPECTED_BYTES}`);
+      throw new Error(
+        `Slot 611 readback length mismatch: got ${readback611?.byteLength}, expected ${WORKLOAD_B_EXPECTED_BYTES}`,
+      );
     }
     assertBytesEqual(readback611, expected0, `${variant.name} readback 611`, 0);
     assertSpecialBits(readback611, `${variant.name} readback 611`, 0);
 
     const readback612 = await variant.readback(612);
     if (!readback612 || readback612.byteLength !== WORKLOAD_B_EXPECTED_BYTES) {
-      throw new Error(`Slot 612 readback length mismatch: got ${readback612?.byteLength}, expected ${WORKLOAD_B_EXPECTED_BYTES}`);
+      throw new Error(
+        `Slot 612 readback length mismatch: got ${readback612?.byteLength}, expected ${WORKLOAD_B_EXPECTED_BYTES}`,
+      );
     }
     assertBytesEqual(readback612, expected1, `${variant.name} readback 612`, 1);
     assertSpecialBits(readback612, `${variant.name} readback 612`, 1);
@@ -498,10 +548,34 @@ export async function testWorkloadBVariants(host, wasmExports) {
   const genVariant = createVariant("workload_b_generated_js", host, wasmExports);
 
   const variants = {
-    workload_b_bulk_packet: await runVariantCreditLoop(bulkVariant, upload0, upload1, expected0, expected1),
-    workload_b_wasm_callbacks: await runVariantCreditLoop(cbVariant, upload0, upload1, expected0, expected1),
-    workload_b_direct_js: await runVariantCreditLoop(directVariant, upload0, upload1, expected0, expected1),
-    workload_b_generated_js: await runVariantCreditLoop(genVariant, upload0, upload1, expected0, expected1),
+    workload_b_bulk_packet: await runVariantCreditLoop(
+      bulkVariant,
+      upload0,
+      upload1,
+      expected0,
+      expected1,
+    ),
+    workload_b_wasm_callbacks: await runVariantCreditLoop(
+      cbVariant,
+      upload0,
+      upload1,
+      expected0,
+      expected1,
+    ),
+    workload_b_direct_js: await runVariantCreditLoop(
+      directVariant,
+      upload0,
+      upload1,
+      expected0,
+      expected1,
+    ),
+    workload_b_generated_js: await runVariantCreditLoop(
+      genVariant,
+      upload0,
+      upload1,
+      expected0,
+      expected1,
+    ),
   };
 
   const measurements = {
@@ -556,10 +630,12 @@ export async function testWorkloadBMeasurementMode(host, wasmExports) {
     const origSubmit = countedQueue?.submit;
     const origOnSubmittedWorkDone = countedQueue?.onSubmittedWorkDone;
 
-    const hadOwnCreateEncoder = Object.prototype.hasOwnProperty.call(host.device, "createCommandEncoder");
-    const hadOwnWriteBuffer = countedQueue ? Object.prototype.hasOwnProperty.call(countedQueue, "writeBuffer") : false;
-    const hadOwnSubmit = countedQueue ? Object.prototype.hasOwnProperty.call(countedQueue, "submit") : false;
-    const hadOwnOnSubmittedWorkDone = countedQueue ? Object.prototype.hasOwnProperty.call(countedQueue, "onSubmittedWorkDone") : false;
+    const hadOwnCreateEncoder = Object.hasOwn(host.device, "createCommandEncoder");
+    const hadOwnWriteBuffer = countedQueue ? Object.hasOwn(countedQueue, "writeBuffer") : false;
+    const hadOwnSubmit = countedQueue ? Object.hasOwn(countedQueue, "submit") : false;
+    const hadOwnOnSubmittedWorkDone = countedQueue
+      ? Object.hasOwn(countedQueue, "onSubmittedWorkDone")
+      : false;
 
     const globalScope = typeof window !== "undefined" ? window : globalThis;
     const hostObj = globalScope.f3dHost || (globalScope.f3dHost = {});
@@ -567,16 +643,16 @@ export async function testWorkloadBMeasurementMode(host, wasmExports) {
     // Create shadow wasmExports so module namespace object is never mutated
     const countingWasmExports = { ...wasmExports };
 
-    host.device.createCommandEncoder = function(...args) {
+    host.device.createCommandEncoder = function (...args) {
       currentStats.webgpu_api_calls++;
       const encoder = origCreateCommandEncoder.apply(this, args);
       const origCopy = encoder.copyBufferToBuffer;
       const origFinish = encoder.finish;
-      encoder.copyBufferToBuffer = function(...cArgs) {
+      encoder.copyBufferToBuffer = function (...cArgs) {
         currentStats.webgpu_api_calls++;
         return origCopy.apply(this, cArgs);
       };
-      encoder.finish = function(...fArgs) {
+      encoder.finish = function (...fArgs) {
         currentStats.webgpu_api_calls++;
         return origFinish.apply(this, fArgs);
       };
@@ -584,29 +660,33 @@ export async function testWorkloadBMeasurementMode(host, wasmExports) {
     };
 
     if (countedQueue) {
-      countedQueue.writeBuffer = function(buf, offset, data, ...rest) {
+      countedQueue.writeBuffer = function (buf, offset, data, ...rest) {
         currentStats.webgpu_api_calls++;
-        const byteLen = data?.byteLength || (data?.length ? data.length * (data.BYTES_PER_ELEMENT || 1) : 0);
+        const byteLen =
+          data?.byteLength || (data?.length ? data.length * (data.BYTES_PER_ELEMENT || 1) : 0);
         currentStats.js_bytes_copied += byteLen;
         return origWriteBuffer.call(this, buf, offset, data, ...rest);
       };
 
-      countedQueue.submit = function(...args) {
+      countedQueue.submit = function (...args) {
         currentStats.webgpu_api_calls++;
         return origSubmit.apply(this, args);
       };
 
-      countedQueue.onSubmittedWorkDone = function(...args) {
+      countedQueue.onSubmittedWorkDone = function (...args) {
         currentStats.webgpu_api_calls++;
         return origOnSubmittedWorkDone.apply(this, args);
       };
     }
 
     if (typeof wasmExports?.f3d_build_affine_rows_storage_upload_frame_packet === "function") {
-      countingWasmExports.f3d_build_affine_rows_storage_upload_frame_packet = function(...args) {
+      countingWasmExports.f3d_build_affine_rows_storage_upload_frame_packet = function (...args) {
         currentStats.wasm_boundary_calls++;
         currentStats.js_bytes_copied += args[0].byteLength; // wasm-bindgen copies affine_rows into Wasm.
-        const packet = wasmExports.f3d_build_affine_rows_storage_upload_frame_packet.apply(this, args);
+        const packet = wasmExports.f3d_build_affine_rows_storage_upload_frame_packet.apply(
+          this,
+          args,
+        );
         if (packet && packet.byteLength) {
           currentStats.js_bytes_copied += packet.byteLength;
         }
@@ -615,7 +695,7 @@ export async function testWorkloadBMeasurementMode(host, wasmExports) {
     }
 
     if (typeof wasmExports?.f3d_bridge_callback_storage_upload_frame === "function") {
-      countingWasmExports.f3d_bridge_callback_storage_upload_frame = function(...args) {
+      countingWasmExports.f3d_bridge_callback_storage_upload_frame = function (...args) {
         currentStats.wasm_boundary_calls++;
         currentStats.js_bytes_copied += args[0].byteLength;
         return wasmExports.f3d_bridge_callback_storage_upload_frame.apply(this, args);
@@ -623,8 +703,8 @@ export async function testWorkloadBMeasurementMode(host, wasmExports) {
     }
 
     const variant = createVariant(vKey, host, countingWasmExports, recordCount, expectedBytes);
-    let origHostWrite = undefined;
-    let origHostCopy = undefined;
+    let origHostWrite;
+    let origHostCopy;
 
     try {
       await variant.init();
@@ -633,7 +713,7 @@ export async function testWorkloadBMeasurementMode(host, wasmExports) {
       origHostCopy = hostObj.copyBufferToBuffer;
       if (vKey === "workload_b_wasm_callbacks") {
         if (typeof origHostWrite === "function") {
-          hostObj.writeBuffer = function(id, offset, bytes) {
+          hostObj.writeBuffer = (id, offset, bytes) => {
             currentStats.wasm_boundary_calls++;
             if (bytes && bytes.byteLength) {
               currentStats.js_bytes_copied += bytes.byteLength;
@@ -642,7 +722,7 @@ export async function testWorkloadBMeasurementMode(host, wasmExports) {
           };
         }
         if (typeof origHostCopy === "function") {
-          hostObj.copyBufferToBuffer = function(...cArgs) {
+          hostObj.copyBufferToBuffer = function (...cArgs) {
             currentStats.wasm_boundary_calls++;
             return origHostCopy.apply(this, cArgs);
           };
@@ -654,14 +734,14 @@ export async function testWorkloadBMeasurementMode(host, wasmExports) {
         currentStats.webgpu_api_calls = 0;
         currentStats.js_bytes_copied = 0;
 
-        const slot = (f % 2 === 0 ? 611 : 612);
-        const upload = (f % 2 === 0 ? upload0 : upload1);
+        const slot = f % 2 === 0 ? 611 : 612;
+        const upload = f % 2 === 0 ? upload0 : upload1;
 
         await variant.submitFrame(upload.floats, slot);
 
         frameStatsList.push({
           frame: f,
-          queue_identity_stable: (host.device.queue === countedQueue),
+          queue_identity_stable: host.device.queue === countedQueue,
           wasm_boundary_calls: currentStats.wasm_boundary_calls,
           webgpu_api_calls: currentStats.webgpu_api_calls,
           js_bytes_copied: currentStats.js_bytes_copied,
@@ -706,21 +786,27 @@ export async function testWorkloadBMeasurementMode(host, wasmExports) {
       } catch (_) {}
     }
 
-    const first = frameStatsList[0] || { wasm_boundary_calls: 0, webgpu_api_calls: 0, js_bytes_copied: 0 };
+    const first = frameStatsList[0] || {
+      wasm_boundary_calls: 0,
+      webgpu_api_calls: 0,
+      js_bytes_copied: 0,
+    };
     const framesDiffer = frameStatsList.some(
-      f => f.wasm_boundary_calls !== first.wasm_boundary_calls ||
-           f.webgpu_api_calls !== first.webgpu_api_calls ||
-           f.js_bytes_copied !== first.js_bytes_copied
+      (f) =>
+        f.wasm_boundary_calls !== first.wasm_boundary_calls ||
+        f.webgpu_api_calls !== first.webgpu_api_calls ||
+        f.js_bytes_copied !== first.js_bytes_copied,
     );
 
-    const unstableFrames = frameStatsList.filter(f => !f.queue_identity_stable);
+    const unstableFrames = frameStatsList.filter((f) => !f.queue_identity_stable);
     const hasUnstableQueue = unstableFrames.length > 0;
     let queueUnavailableReason = null;
     if (hasUnstableQueue) {
-      const frameNames = unstableFrames.map(f => f.frame).join(", ");
-      queueUnavailableReason = unstableFrames.length === 1
-        ? `Queue identity unstable on frame ${frameNames} (host.device.queue !== countedQueue)`
-        : `Queue identity unstable on frames ${frameNames} (host.device.queue !== countedQueue)`;
+      const frameNames = unstableFrames.map((f) => f.frame).join(", ");
+      queueUnavailableReason =
+        unstableFrames.length === 1
+          ? `Queue identity unstable on frame ${frameNames} (host.device.queue !== countedQueue)`
+          : `Queue identity unstable on frames ${frameNames} (host.device.queue !== countedQueue)`;
     }
 
     return {
@@ -801,7 +887,9 @@ export async function testWorkloadBMeasurementMode(host, wasmExports) {
   // Wasm instantiate time is unavailable in this lane without modifying gpu_bridge_test.html.
   let wasmFetchMs = "unavailable";
   if (typeof performance !== "undefined" && typeof performance.getEntriesByType === "function") {
-    const res = performance.getEntriesByType("resource")?.find(e => e.name?.includes("f3d_runtime_bg.wasm"));
+    const res = performance
+      .getEntriesByType("resource")
+      ?.find((e) => e.name?.includes("f3d_runtime_bg.wasm"));
     if (res?.duration != null) wasmFetchMs = res.duration;
   }
   const wasmInstantiateMs = "unavailable";
@@ -865,8 +953,8 @@ export async function testWorkloadBMeasurementMode(host, wasmExports) {
             tMeasuredStart = performance.now();
           }
 
-          const slot = (f % 2 === 0 ? 611 : 612);
-          const upload = (f % 2 === 0 ? upload0 : upload1);
+          const slot = f % 2 === 0 ? 611 : 612;
+          const upload = f % 2 === 0 ? upload0 : upload1;
 
           const isWarmup = f < warmupCount;
           const measuredIndex = f - warmupCount;
@@ -898,16 +986,16 @@ export async function testWorkloadBMeasurementMode(host, wasmExports) {
             },
             (err) => {
               if (!firstError) firstError = err;
-            }
+            },
           );
           inFlight.push(tracked);
         }
 
         await Promise.all(inFlight);
-        const elapsedMs = tMeasuredStart > 0 ? (performance.now() - tMeasuredStart) : 0;
+        const elapsedMs = tMeasuredStart > 0 ? performance.now() - tMeasuredStart : 0;
         if (firstError) throw firstError;
 
-        const throughputFps = (elapsedMs > 0) ? ((measuredCount * 1000) / elapsedMs) : 0;
+        const throughputFps = elapsedMs > 0 ? (measuredCount * 1000) / elapsedMs : 0;
         allThroughputFps[vKey].push(throughputFps);
 
         // Drain GPU queue before readback
@@ -918,14 +1006,18 @@ export async function testWorkloadBMeasurementMode(host, wasmExports) {
         // At end of round: map-read 611 and 612 per variant and compare exact bytes
         const rb611 = await variant.readback(611);
         if (!rb611 || rb611.byteLength !== expectedBytes) {
-          throw new Error(`Round ${r} ${vKey} slot 611 readback length mismatch: got ${rb611?.byteLength}, expected ${expectedBytes}`);
+          throw new Error(
+            `Round ${r} ${vKey} slot 611 readback length mismatch: got ${rb611?.byteLength}, expected ${expectedBytes}`,
+          );
         }
         assertBytesEqual(rb611, expected0, `${vKey} round ${r} readback 611`, 0);
         assertSpecialBits(rb611, `${vKey} round ${r} readback 611`, 0);
 
         const rb612 = await variant.readback(612);
         if (!rb612 || rb612.byteLength !== expectedBytes) {
-          throw new Error(`Round ${r} ${vKey} slot 612 readback length mismatch: got ${rb612?.byteLength}, expected ${expectedBytes}`);
+          throw new Error(
+            `Round ${r} ${vKey} slot 612 readback length mismatch: got ${rb612?.byteLength}, expected ${expectedBytes}`,
+          );
         }
         assertBytesEqual(rb612, expected1, `${vKey} round ${r} readback 612`, 1);
         assertSpecialBits(rb612, `${vKey} round ${r} readback 612`, 1);
@@ -969,8 +1061,8 @@ export async function testWorkloadBMeasurementMode(host, wasmExports) {
   const perVariantSummary = {};
   for (const vKey of variantKeys) {
     const rows = allMeasuredRows[vKey];
-    const cpuVals = rows.map(r => r.cpu_ms);
-    const gpuVals = rows.map(r => r.gpu_elapsed_ms);
+    const cpuVals = rows.map((r) => r.cpu_ms);
+    const gpuVals = rows.map((r) => r.gpu_elapsed_ms);
     const fpsVals = allThroughputFps[vKey];
     const owner = {
       workload_b_bulk_packet: "Rust/Wasm packer and packet encoder; JavaScript WebGPU adapter",
@@ -992,10 +1084,14 @@ export async function testWorkloadBMeasurementMode(host, wasmExports) {
 
     let unavailableReason = null;
     if (!countsValid && !initValid) {
-      const countsReason = countsEntry?.unavailable_reason || `Counts pass failed (${countsEntry?.error || "unknown"})`;
+      const countsReason =
+        countsEntry?.unavailable_reason ||
+        `Counts pass failed (${countsEntry?.error || "unknown"})`;
       unavailableReason = `${countsReason}; Init passes failed (${initErrors[vKey] || "unknown"})`;
     } else if (!countsValid) {
-      unavailableReason = countsEntry?.unavailable_reason || `Counts pass failed (${countsEntry?.error || "unknown"})`;
+      unavailableReason =
+        countsEntry?.unavailable_reason ||
+        `Counts pass failed (${countsEntry?.error || "unknown"})`;
     } else if (!initValid) {
       unavailableReason = `Init passes failed (${initErrors[vKey] || "unknown"})`;
     }
@@ -1007,7 +1103,7 @@ export async function testWorkloadBMeasurementMode(host, wasmExports) {
       init_ms_samples: initValid ? initSamples : null,
       init_ms_median: initMedian,
       init_ms_p95: initP95,
-      init_order: initPasses.map(p => p.variant_order),
+      init_order: initPasses.map((p) => p.variant_order),
       wasm_boundary_calls_per_frame: wasmBoundaryCalls,
       webgpu_api_calls_per_frame: webgpuApiCalls,
       js_bytes_copied_per_frame: jsBytesCopied,
@@ -1029,19 +1125,24 @@ export async function testWorkloadBMeasurementMode(host, wasmExports) {
       record_count: WORKLOAD_B_RECORD_COUNT,
       expected_bytes: WORKLOAD_B_EXPECTED_BYTES,
       init_passes: totalInitPasses,
-      init_orders: initPasses.map(p => p.variant_order),
+      init_orders: initPasses.map((p) => p.variant_order),
       wasm_fetch_ms: wasmFetchMs,
       wasm_instantiate_ms: wasmInstantiateMs,
       timing_notes: {
         cpu_ms: "runs from floats in to queue submitted",
         gpu_elapsed_ms: "runs from submit start to completion callback, including credit-loop wait",
         elapsed_ms: "round wall time over measured frames only",
-        counts: "wasm_boundary_calls (JS-Wasm exports plus Wasm-JS callbacks), webgpu_api_calls (device, queue, command encoder, buffer methods), js_bytes_copied (JS-to-Wasm input copies, Wasm-to-JS output copies, and writeBuffer payloads; excludes Rust-internal copies) measured across 8 untimed frames per variant with counting wrappers removed before timed rounds",
-        queue_identity_stable: "asserts host.device.queue === countedQueue on every counted frame; if false, per-frame counts are reported as null with unavailable_reason naming the frame",
-        init_ms: "variant persistent init plus first completed frame across 5 separate passes with rotated variant order; records init_ms_samples (5 values), init_ms_median, init_ms_p95, and the init_order of every pass",
-        wasm_fetch_ms: "resource-timing download duration for f3d_runtime_bg.wasm, or 'unavailable' if no resource timing entry matches",
+        counts:
+          "wasm_boundary_calls (JS-Wasm exports plus Wasm-JS callbacks), webgpu_api_calls (device, queue, command encoder, buffer methods), js_bytes_copied (JS-to-Wasm input copies, Wasm-to-JS output copies, and writeBuffer payloads; excludes Rust-internal copies) measured across 8 untimed frames per variant with counting wrappers removed before timed rounds",
+        queue_identity_stable:
+          "asserts host.device.queue === countedQueue on every counted frame; if false, per-frame counts are reported as null with unavailable_reason naming the frame",
+        init_ms:
+          "variant persistent init plus first completed frame across 5 separate passes with rotated variant order; records init_ms_samples (5 values), init_ms_median, init_ms_p95, and the init_order of every pass",
+        wasm_fetch_ms:
+          "resource-timing download duration for f3d_runtime_bg.wasm, or 'unavailable' if no resource timing entry matches",
         wasm_instantiate_ms: "unavailable in this lane without html changes",
-        throughput_fps: "measured frames divided by measured-only elapsed seconds (measured_count * 1000 / elapsed_ms) per round",
+        throughput_fps:
+          "measured frames divided by measured-only elapsed seconds (measured_count * 1000 / elapsed_ms) per round",
       },
     },
     wasm_fetch_ms: wasmFetchMs,
@@ -1064,10 +1165,12 @@ export async function testWorkloadBMeasurementMode(host, wasmExports) {
         implementation_owner: owner,
       };
     } else {
-      const initStr = summary.init_ms_median != null ? `${summary.init_ms_median.toFixed(3)}ms` : "unavailable";
-      const countsStr = summary.wasm_boundary_calls_per_frame != null
-        ? `wasm_calls=${summary.wasm_boundary_calls_per_frame}, webgpu_calls=${summary.webgpu_api_calls_per_frame}, bytes_copied=${summary.js_bytes_copied_per_frame}`
-        : `counts unavailable (${summary.unavailable_reason || "unknown"})`;
+      const initStr =
+        summary.init_ms_median != null ? `${summary.init_ms_median.toFixed(3)}ms` : "unavailable";
+      const countsStr =
+        summary.wasm_boundary_calls_per_frame != null
+          ? `wasm_calls=${summary.wasm_boundary_calls_per_frame}, webgpu_calls=${summary.webgpu_api_calls_per_frame}, bytes_copied=${summary.js_bytes_copied_per_frame}`
+          : `counts unavailable (${summary.unavailable_reason || "unknown"})`;
 
       variants[vKey] = {
         status: "PASS",

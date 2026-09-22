@@ -34,11 +34,7 @@ export function differs(a, b) {
  * @returns {Promise<Uint8Array>}
  */
 export async function directDepthReference(device, options = {}) {
-  const {
-    scenario = 0,
-    width = 64,
-    height = 64,
-  } = options;
+  const { scenario = 0, width = 64, height = 64 } = options;
 
   const bytesPerRow = Math.ceil((width * 4) / 256) * 256;
 
@@ -68,16 +64,14 @@ export async function directDepthReference(device, options = {}) {
   // Stride 28 bytes: position vec3<f32> (12B) + color vec4<f32> (16B)
   const farVertices = new Float32Array([
     // x,    y,    z,    r,   g,   b,   a
-     0.0,  0.6,  0.8,  1.0, 0.0, 0.0, 1.0,
-    -0.6, -0.6,  0.8,  1.0, 0.0, 0.0, 1.0,
-     0.6, -0.6,  0.8,  1.0, 0.0, 0.0, 1.0,
+    0.0, 0.6, 0.8, 1.0, 0.0, 0.0, 1.0, -0.6, -0.6, 0.8, 1.0, 0.0, 0.0, 1.0, 0.6, -0.6, 0.8, 1.0,
+    0.0, 0.0, 1.0,
   ]);
 
   const nearVertices = new Float32Array([
     // x,    y,    z,    r,   g,   b,   a
-     0.0,  0.5,  0.2,  0.0, 1.0, 0.0, 1.0,
-    -0.5, -0.5,  0.2,  0.0, 1.0, 0.0, 1.0,
-     0.5, -0.5,  0.2,  0.0, 1.0, 0.0, 1.0,
+    0.0, 0.5, 0.2, 0.0, 1.0, 0.0, 1.0, -0.5, -0.5, 0.2, 0.0, 1.0, 0.0, 1.0, 0.5, -0.5, 0.2, 0.0,
+    1.0, 0.0, 1.0,
   ]);
 
   const farBuffer = device.createBuffer({
@@ -384,7 +378,7 @@ export async function directDepthReference(device, options = {}) {
     encoder.copyTextureToBuffer(
       { texture: colorTexture },
       { buffer: readbackBuffer, bytesPerRow },
-      [width, height, 1]
+      [width, height, 1],
     );
 
     device.queue.submit([encoder.finish()]);
@@ -430,7 +424,7 @@ export async function testDepthScene(bridgeHost, wasmExports) {
 
   if (typeof buildDepthFn !== "function") {
     throw new Error(
-      "Missing required Wasm depth export: f3d_build_overlapping_depth_packet / gpu_bridge_build_overlapping_depth_packet"
+      "Missing required Wasm depth export: f3d_build_overlapping_depth_packet / gpu_bridge_build_overlapping_depth_packet",
     );
   }
 
@@ -449,7 +443,9 @@ export async function testDepthScene(bridgeHost, wasmExports) {
   const refPixels0 = await directDepthReference(device, { scenario: 0, width, height });
 
   if (differs(candidatePixels0, refPixels0)) {
-    throw new Error("Checkpoint 1 failed: candidate Near-then-Far depth pixels differ from independent direct WebGPU reference");
+    throw new Error(
+      "Checkpoint 1 failed: candidate Near-then-Far depth pixels differ from independent direct WebGPU reference",
+    );
   }
 
   const center0 = [
@@ -459,7 +455,9 @@ export async function testDepthScene(bridgeHost, wasmExports) {
     candidatePixels0[centerIdx + 3],
   ];
   if (center0[0] > 50 || center0[1] < 200 || center0[2] > 50 || center0[3] !== 255) {
-    throw new Error(`Checkpoint 1 failed: expected center Green [0, 255, 0, 255], got [${center0}]`);
+    throw new Error(
+      `Checkpoint 1 failed: expected center Green [0, 255, 0, 255], got [${center0}]`,
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -471,12 +469,16 @@ export async function testDepthScene(bridgeHost, wasmExports) {
   const refPixels1 = await directDepthReference(device, { scenario: 1, width, height });
 
   if (differs(candidatePixels1, refPixels1)) {
-    throw new Error("Checkpoint 2 failed: candidate Far-then-Near depth pixels differ from independent direct WebGPU reference");
+    throw new Error(
+      "Checkpoint 2 failed: candidate Far-then-Near depth pixels differ from independent direct WebGPU reference",
+    );
   }
 
   // Draw-order swap must preserve near color: Checkpoint 1 and 2 must match bit-for-bit
   if (differs(candidatePixels1, candidatePixels0)) {
-    throw new Error("Checkpoint 2 failed: draw-order swap produced different pixels; near geometry was not preserved across draw order");
+    throw new Error(
+      "Checkpoint 2 failed: draw-order swap produced different pixels; near geometry was not preserved across draw order",
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -488,12 +490,16 @@ export async function testDepthScene(bridgeHost, wasmExports) {
   const refPixels2 = await directDepthReference(device, { scenario: 2, width, height });
 
   if (differs(candidatePixels2, refPixels2)) {
-    throw new Error("Checkpoint 3 failed: multi-pass depth load candidate pixels differ from independent direct WebGPU reference");
+    throw new Error(
+      "Checkpoint 3 failed: multi-pass depth load candidate pixels differ from independent direct WebGPU reference",
+    );
   }
 
   // Multi-pass depth load must preserve earlier depth: candidatePixels2 must match candidatePixels0
   if (differs(candidatePixels2, candidatePixels0)) {
-    throw new Error("Checkpoint 3 failed: depth load across second pass failed to preserve earlier depth; far draw was not discarded");
+    throw new Error(
+      "Checkpoint 3 failed: depth load across second pass failed to preserve earlier depth; far draw was not discarded",
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -511,12 +517,16 @@ export async function testDepthScene(bridgeHost, wasmExports) {
     candidatePixels3[centerIdx + 3],
   ];
   if (center3[0] < 200 || center3[1] > 50 || center3[2] > 50) {
-    throw new Error(`Checkpoint 4 failed: disabled-depth candidate expected Red [255, 0, 0, 255] at center, got [${center3}]`);
+    throw new Error(
+      `Checkpoint 4 failed: disabled-depth candidate expected Red [255, 0, 0, 255] at center, got [${center3}]`,
+    );
   }
 
   // Planted negative must strictly diverge from depth-enabled reference
   if (!differs(candidatePixels3, refPixels0)) {
-    throw new Error("Checkpoint 4 failed: planted disabled-depth packet falsely matched depth-enabled reference");
+    throw new Error(
+      "Checkpoint 4 failed: planted disabled-depth packet falsely matched depth-enabled reference",
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -528,7 +538,9 @@ export async function testDepthScene(bridgeHost, wasmExports) {
   const refPixels4 = await directDepthReference(device, { scenario: 4, width, height });
 
   if (differs(candidatePixels4, refPixels4)) {
-    throw new Error("Checkpoint 5 failed: candidate read-only depth pixels differ from independent direct WebGPU reference");
+    throw new Error(
+      "Checkpoint 5 failed: candidate read-only depth pixels differ from independent direct WebGPU reference",
+    );
   }
 
   const center4 = [
@@ -542,11 +554,15 @@ export async function testDepthScene(bridgeHost, wasmExports) {
     const diagnosis = isRed
       ? "Far geometry (Red) rendered; prior depth (Green, 0.2) was NOT loaded into read-only pass (behaved as Clear/DontCare instead of Load)"
       : `unexpected center pixel [${center4}]`;
-    throw new Error(`Checkpoint 5 failed: expected center Green [0, 255, 0, 255] in read-only depth pass, got [${center4}]. Diagnosis: ${diagnosis}`);
+    throw new Error(
+      `Checkpoint 5 failed: expected center Green [0, 255, 0, 255] in read-only depth pass, got [${center4}]. Diagnosis: ${diagnosis}`,
+    );
   }
 
   if (differs(candidatePixels4, candidatePixels0)) {
-    throw new Error("Checkpoint 5 failed: read-only depth pass modified depth buffer or failed to preserve near geometry");
+    throw new Error(
+      "Checkpoint 5 failed: read-only depth pass modified depth buffer or failed to preserve near geometry",
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -558,7 +574,9 @@ export async function testDepthScene(bridgeHost, wasmExports) {
   const refPixels5 = await directDepthReference(device, { scenario: 5, width, height });
 
   if (differs(candidatePixels5, refPixels5)) {
-    throw new Error("Checkpoint 6 failed: candidate empty depth clear pass pixels differ from independent direct WebGPU reference");
+    throw new Error(
+      "Checkpoint 6 failed: candidate empty depth clear pass pixels differ from independent direct WebGPU reference",
+    );
   }
 
   const center5 = [
@@ -568,12 +586,16 @@ export async function testDepthScene(bridgeHost, wasmExports) {
     candidatePixels5[centerIdx + 3],
   ];
   if (center5[0] < 200 || center5[1] > 50 || center5[2] > 50) {
-    throw new Error(`Checkpoint 6 failed: expected center Red [255, 0, 0, 255] after empty depth clear pass, got [${center5}]`);
+    throw new Error(
+      `Checkpoint 6 failed: expected center Red [255, 0, 0, 255] after empty depth clear pass, got [${center5}]`,
+    );
   }
 
   // Must strictly diverge from refPixels0 (which is Green)
   if (!differs(candidatePixels5, refPixels0)) {
-    throw new Error("Checkpoint 6 failed: empty depth clear pass falsely matched un-cleared depth reference; depth was not cleared without draws");
+    throw new Error(
+      "Checkpoint 6 failed: empty depth clear pass falsely matched un-cleared depth reference; depth was not cleared without draws",
+    );
   }
 
   return "WebGPU depth regression verified: near/far overlapping triangles lowered from actual Rust graph packet; draw-order swap preserves near color; multi-pass depth load preserves earlier depth; disabled-depth negative strictly diverges; readonly depth descriptor verified; empty depth clear pass verified";

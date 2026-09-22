@@ -297,15 +297,15 @@
 
   <script type="module">
     import {
-      H1_PATHS,
-      findInspectorControl,
-      toggleInspectorControl,
+      captureCanvasPixels,
+      compareCheckpointObservations,
       compareH1Snapshots,
       comparePixelBuffers,
       createMismatchedPixelBuffer,
-      captureCanvasPixels,
       extractCheckpointObservations,
-      compareCheckpointObservations,
+      findInspectorControl,
+      H1_PATHS,
+      toggleInspectorControl,
     } from './h1_interaction_helper.mjs';
 
     const FIXED_CHECKPOINT_CAMERA = Object.freeze({ position: [0, 0, 50], quaternion: [0, 0, 0, 1] });

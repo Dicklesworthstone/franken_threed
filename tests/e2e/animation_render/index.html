@@ -8,8 +8,9 @@ support is a failure, not a passing skip. These are functional pixel checks,
 not performance results or a full-material compatibility certification.</p>
 <pre id="result">Running…</pre>
 <script type="module">
-import {runAnimationRenderChecks} from '../../../tools/ingest/animation_render.browser.mjs';
 import {runDerivativeNormalChecks} from '../../../tools/ingest/animation_derivative_normals.browser.mjs';
+import {runAnimationRenderChecks} from '../../../tools/ingest/animation_render.browser.mjs';
+
 let device;
 try {
   const adapter=await navigator.gpu?.requestAdapter();

@@ -1,20 +1,29 @@
-import { test } from 'node:test';
-import assert from 'node:assert/strict';
+import assert from "node:assert/strict";
 // A data URL lets this Node-only test consume the browser ESM file independently
 // of a repository-wide package.json module-type setting.
-import { readFile } from 'node:fs/promises';
-const source = await readFile(new URL('./scene_session.js', import.meta.url), 'utf8');
-const { WebGpuSceneSession } = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
+import { readFile } from "node:fs/promises";
+import { test } from "node:test";
+
+const source = await readFile(new URL("./scene_session.js", import.meta.url), "utf8");
+const { WebGpuSceneSession } = await import(
+  `data:text/javascript;base64,${Buffer.from(source).toString("base64")}`
+);
 
 function deferred() {
   let resolve, reject;
-  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  const promise = new Promise((yes, no) => {
+    resolve = yes;
+    reject = no;
+  });
   return { promise, resolve, reject };
 }
-const tick = () => new Promise(resolve => setImmediate(resolve));
+const tick = () => new Promise((resolve) => setImmediate(resolve));
 async function until(predicate) {
-  for (let i = 0; i < 50; i++) { if (predicate()) return; await tick(); }
-  assert.fail('Condition did not settle');
+  for (let i = 0; i < 50; i++) {
+    if (predicate()) return;
+    await tick();
+  }
+  assert.fail("Condition did not settle");
 }
 function packet(marker = 1) {
   const bytes = new Uint8Array(17);
@@ -24,52 +33,106 @@ function packet(marker = 1) {
   return bytes;
 }
 function fixture(options = {}) {
-  const log = [], devices = [], errors = [];
-  const context = { configure(config) { log.push(['configure', config.device.id, config.format]); },
-    unconfigure() { log.push(['unconfigure']); } };
-  const canvas = { width: 64, height: 32, getContext: type => type === 'webgpu' ? context : null };
+  const log = [],
+    devices = [],
+    errors = [];
+  const context = {
+    configure(config) {
+      log.push(["configure", config.device.id, config.format]);
+    },
+    unconfigure() {
+      log.push(["unconfigure"]);
+    },
+  };
+  const canvas = {
+    width: 64,
+    height: 32,
+    getContext: (type) => (type === "webgpu" ? context : null),
+  };
   const host = {
-    device: null, buffers: new Map(), textures: new Map(), capabilityRecord: null,
-    request: 0, negotiateGate: null, submitGate: null, queueGate: null,
+    device: null,
+    buffers: new Map(),
+    textures: new Map(),
+    capabilityRecord: null,
+    request: 0,
+    negotiateGate: null,
+    submitGate: null,
+    queueGate: null,
     async negotiateAndCreateDevice(profile) {
       const request = ++this.request;
-      log.push(['negotiate', profile]);
+      log.push(["negotiate", profile]);
       if (this.negotiateGate) await this.negotiateGate.promise;
       const lost = deferred();
-      const device = { id: devices.length + 1, lost: lost.promise, lose: lost.resolve,
+      const device = {
+        id: devices.length + 1,
+        lost: lost.promise,
+        lose: lost.resolve,
         limits: { maxTextureDimension2D: 4096 },
         queue: { onSubmittedWorkDone: () => this.queueGate?.promise ?? Promise.resolve() },
-        destroy() { log.push(['device-destroy', device.id]); lost.resolve({ reason: 'destroyed' }); } };
+        destroy() {
+          log.push(["device-destroy", device.id]);
+          lost.resolve({ reason: "destroyed" });
+        },
+      };
       devices.push(device);
-      if (request !== this.request) { device.destroy(); throw new Error('Device request superseded'); }
+      if (request !== this.request) {
+        device.destroy();
+        throw new Error("Device request superseded");
+      }
       this.device = device;
-      this.capabilityRecord = { preferredCanvasFormat: 'bgra8unorm', deviceId: device.id };
+      this.capabilityRecord = { preferredCanvasFormat: "bgra8unorm", deviceId: device.id };
       lost.promise.then(() => {
         if (this.device !== device) return;
-        this.clearDeviceResources(); this.device = null; this.capabilityRecord = null;
+        this.clearDeviceResources();
+        this.device = null;
+        this.capabilityRecord = null;
       });
       return this.capabilityRecord;
     },
-    clearDeviceResources() { this.buffers.clear(); this.textures.clear(); log.push(['clear']); },
-    destroyDevice() { this.request++; const device = this.device; this.device = null;
-      this.capabilityRecord = null; this.clearDeviceResources(); device?.destroy(); },
+    clearDeviceResources() {
+      this.buffers.clear();
+      this.textures.clear();
+      log.push(["clear"]);
+    },
+    destroyDevice() {
+      this.request++;
+      const device = this.device;
+      this.device = null;
+      this.capabilityRecord = null;
+      this.clearDeviceResources();
+      device?.destroy();
+    },
     async executePacket(bytes) {
-      assert.ok(this.device, 'No submission without a live device');
-      log.push(['submit', bytes[16], this.device.id]);
+      assert.ok(this.device, "No submission without a live device");
+      log.push(["submit", bytes[16], this.device.id]);
       if (this.submitGate) await this.submitGate.promise;
     },
   };
-  const session = new WebGpuSceneSession({ host, canvas, onError: e => errors.push(e), ...options });
+  const session = new WebGpuSceneSession({
+    host,
+    canvas,
+    onError: (e) => errors.push(e),
+    ...options,
+  });
   return { session, host, canvas, context, log, devices, errors };
 }
-const submissions = f => f.log.filter(e => e[0] === 'submit').map(e => e[1]);
-const aborts = promise => assert.rejects(promise, { name: 'AbortError' });
+const submissions = (f) => f.log.filter((e) => e[0] === "submit").map((e) => e[1]);
+const aborts = (promise) => assert.rejects(promise, { name: "AbortError" });
 
-test('initializes a scene and submits explicit frames with negotiated capabilities', async () => {
-  const f = fixture(); let loadContext, frameContext;
-  await f.session.load(ctx => { loadContext = ctx; return { packet: packet(1),
-    frame(ctx) { frameContext = ctx; return packet(2); } }; });
-  assert.equal(f.session.state, 'ready');
+test("initializes a scene and submits explicit frames with negotiated capabilities", async () => {
+  const f = fixture();
+  let loadContext, frameContext;
+  await f.session.load((ctx) => {
+    loadContext = ctx;
+    return {
+      packet: packet(1),
+      frame(ctx) {
+        frameContext = ctx;
+        return packet(2);
+      },
+    };
+  });
+  assert.equal(f.session.state, "ready");
   assert.equal(loadContext.capabilities.deviceId, 1);
   assert.equal(loadContext.width, 64);
   assert.equal(loadContext.height, 32);
@@ -77,59 +140,105 @@ test('initializes a scene and submits explicit frames with negotiated capabiliti
   assert.equal(frameContext.time, 125);
   assert.deepEqual(submissions(f), [1, 2]);
   assert.equal(f.session.snapshot().submittedFrames, 2);
-  assert.ok(f.log.findIndex(e => e[0] === 'configure') < f.log.findIndex(e => e[0] === 'submit'));
+  assert.ok(
+    f.log.findIndex((e) => e[0] === "configure") < f.log.findIndex((e) => e[0] === "submit"),
+  );
   await f.session.close();
 });
 
-test('resize reuses the device and destroys scene resources only after GPU completion', async () => {
-  const f = fixture(); let disposed = 0; const sizes = [];
-  await f.session.load(ctx => { sizes.push([ctx.width, ctx.height]);
-    return { packet: packet(), dispose() { disposed++; } }; });
-  f.host.buffers.set(1, { destroy() { f.log.push(['buffer-destroy']); } });
-  f.host.textures.set(2, { texture: { destroy() { f.log.push(['texture-destroy']); } } });
+test("resize reuses the device and destroys scene resources only after GPU completion", async () => {
+  const f = fixture();
+  let disposed = 0;
+  const sizes = [];
+  await f.session.load((ctx) => {
+    sizes.push([ctx.width, ctx.height]);
+    return {
+      packet: packet(),
+      dispose() {
+        disposed++;
+      },
+    };
+  });
+  f.host.buffers.set(1, {
+    destroy() {
+      f.log.push(["buffer-destroy"]);
+    },
+  });
+  f.host.textures.set(2, {
+    texture: {
+      destroy() {
+        f.log.push(["texture-destroy"]);
+      },
+    },
+  });
   f.host.queueGate = deferred();
   const resizing = f.session.resize(320, 200);
   await tick();
-  assert.equal(f.log.some(e => e[0] === 'buffer-destroy'), false);
+  assert.equal(
+    f.log.some((e) => e[0] === "buffer-destroy"),
+    false,
+  );
   f.host.queueGate.resolve();
   await resizing;
   assert.equal(f.devices.length, 1);
   assert.equal(f.canvas.width, 320);
   assert.equal(f.canvas.height, 200);
-  assert.deepEqual(sizes, [[64, 32], [320, 200]]);
+  assert.deepEqual(sizes, [
+    [64, 32],
+    [320, 200],
+  ]);
   assert.equal(disposed, 1);
-  assert.equal(f.log.filter(e => e[0] === 'buffer-destroy').length, 1);
-  assert.equal(f.log.filter(e => e[0] === 'texture-destroy').length, 1);
+  assert.equal(f.log.filter((e) => e[0] === "buffer-destroy").length, 1);
+  assert.equal(f.log.filter((e) => e[0] === "texture-destroy").length, 1);
   await f.session.resize(320, 200);
-  assert.equal(sizes.length, 2, 'Unchanged dimensions do not rebuild the scene');
+  assert.equal(sizes.length, 2, "Unchanged dimensions do not rebuild the scene");
   await f.session.close();
   assert.equal(disposed, 2);
 });
 
-test('a late uncooperative factory cannot overwrite a successor and is disposed once', async () => {
-  const f = fixture(), late = deferred(); let entered = false, disposed = 0;
-  const loading = f.session.load(() => { entered = true; return late.promise; });
+test("a late uncooperative factory cannot overwrite a successor and is disposed once", async () => {
+  const f = fixture(),
+    late = deferred();
+  let entered = false,
+    disposed = 0;
+  const loading = f.session.load(() => {
+    entered = true;
+    return late.promise;
+  });
   const rejected = aborts(loading);
   await until(() => entered);
   await f.session.load(() => ({ packet: packet(9) }));
   await rejected;
-  late.resolve({ packet: packet(3), dispose() { disposed++; } });
+  late.resolve({
+    packet: packet(3),
+    dispose() {
+      disposed++;
+    },
+  });
   await until(() => disposed === 1);
   assert.deepEqual(submissions(f), [9]);
-  assert.equal(f.session.state, 'ready');
+  assert.equal(f.session.state, "ready");
   await f.session.close();
   assert.equal(disposed, 1);
 });
 
-test('resize supersedes queued sizes and forwards cancellation to the old factory', async () => {
-  const f = fixture(), block = deferred(); let oldSignal;
+test("resize supersedes queued sizes and forwards cancellation to the old factory", async () => {
+  const f = fixture(),
+    block = deferred();
+  let oldSignal;
   await f.session.load(() => ({ packet: packet(1) }));
-  const loading = f.session.load(ctx => { oldSignal = ctx.signal; return block.promise; });
+  const loading = f.session.load((ctx) => {
+    oldSignal = ctx.signal;
+    return block.promise;
+  });
   const rejected = aborts(loading);
   await until(() => oldSignal !== undefined);
   const next = f.session.resize(200, 100);
   const nextRejected = aborts(next);
-  const final = f.session.load(ctx => ({ packet: packet(ctx.width === 400 ? 7 : 8) }), { width: 400, height: 200 });
+  const final = f.session.load((ctx) => ({ packet: packet(ctx.width === 400 ? 7 : 8) }), {
+    width: 400,
+    height: 200,
+  });
   await Promise.all([rejected, nextRejected, final]);
   assert.ok(oldSignal.aborted);
   assert.deepEqual(submissions(f), [1, 7]);
@@ -138,46 +247,64 @@ test('resize supersedes queued sizes and forwards cancellation to the old factor
   await f.session.close();
 });
 
-test('close cancels a pending device request and destroys its late result', async () => {
-  const f = fixture(); f.host.negotiateGate = deferred();
+test("close cancels a pending device request and destroys its late result", async () => {
+  const f = fixture();
+  f.host.negotiateGate = deferred();
   const loading = f.session.load(() => ({ packet: packet() }));
   const rejected = aborts(loading);
-  await until(() => f.log.some(e => e[0] === 'negotiate'));
+  await until(() => f.log.some((e) => e[0] === "negotiate"));
   const close = f.session.close();
   assert.strictEqual(f.session.close(), close);
   await Promise.all([close, rejected]);
   f.host.negotiateGate.resolve();
   await until(() => f.devices.length === 1);
   assert.equal(f.host.device, null);
-  assert.ok(f.log.some(e => e[0] === 'device-destroy'));
+  assert.ok(f.log.some((e) => e[0] === "device-destroy"));
   assert.deepEqual(submissions(f), []);
   assert.throws(() => f.session.reload(), /closed/);
 });
 
-test('device loss rebuilds scene packets with successor capabilities, with a finite retry budget', async () => {
-  const f = fixture(); const capabilities = []; let disposed = 0;
-  await f.session.load(ctx => { capabilities.push(ctx.capabilities.deviceId); return {
-    packet: packet(ctx.capabilities.deviceId), dispose() { disposed++; } }; });
-  f.devices[0].lose({ reason: 'unknown', message: 'simulated loss' });
-  await until(() => f.session.state === 'ready' && f.devices.length === 2);
+test("device loss rebuilds scene packets with successor capabilities, with a finite retry budget", async () => {
+  const f = fixture();
+  const capabilities = [];
+  let disposed = 0;
+  await f.session.load((ctx) => {
+    capabilities.push(ctx.capabilities.deviceId);
+    return {
+      packet: packet(ctx.capabilities.deviceId),
+      dispose() {
+        disposed++;
+      },
+    };
+  });
+  f.devices[0].lose({ reason: "unknown", message: "simulated loss" });
+  await until(() => f.session.state === "ready" && f.devices.length === 2);
   assert.deepEqual(capabilities, [1, 2]);
   assert.deepEqual(submissions(f), [1, 2]);
   assert.equal(disposed, 1);
-  f.devices[1].lose({ reason: 'unknown', message: 'again' });
-  await until(() => f.session.state === 'failed');
+  f.devices[1].lose({ reason: "unknown", message: "again" });
+  await until(() => f.session.state === "failed");
   await tick();
-  assert.equal(f.devices.length, 2, 'Loss recovery must not spin indefinitely');
+  assert.equal(f.devices.length, 2, "Loss recovery must not spin indefinitely");
   assert.match(f.session.lastError, /again/);
   await f.session.reload();
-  assert.equal(f.session.state, 'ready');
+  assert.equal(f.session.state, "ready");
   assert.equal(f.devices.length, 3);
   assert.equal(f.session.recoveryAttempts, 0);
   await f.session.close();
 });
 
-test('a frame producer completing after reload never submits to the new scene', async () => {
-  const f = fixture(), frame = deferred(); let started = false;
-  await f.session.load(() => ({ packet: packet(1), frame() { started = true; return frame.promise; } }));
+test("a frame producer completing after reload never submits to the new scene", async () => {
+  const f = fixture(),
+    frame = deferred();
+  let started = false;
+  await f.session.load(() => ({
+    packet: packet(1),
+    frame() {
+      started = true;
+      return frame.promise;
+    },
+  }));
   const rendering = f.session.render();
   const rejected = aborts(rendering);
   await until(() => started);
@@ -189,13 +316,21 @@ test('a frame producer completing after reload never submits to the new scene', 
   await f.session.close();
 });
 
-test('frame submission is serialized and no-op frames do not inflate GPU counts', async () => {
-  const f = fixture(); let frameCount = 0;
-  await f.session.load(() => ({ packet: packet(1), frame() { return ++frameCount === 3 ? null : packet(2); } }));
+test("frame submission is serialized and no-op frames do not inflate GPU counts", async () => {
+  const f = fixture();
+  let frameCount = 0;
+  await f.session.load(() => ({
+    packet: packet(1),
+    frame() {
+      return ++frameCount === 3 ? null : packet(2);
+    },
+  }));
   f.host.submitGate = deferred();
-  const first = f.session.render(), second = f.session.render();
+  const first = f.session.render(),
+    second = f.session.render();
   await until(() => submissions(f).length === 2);
-  await tick(); assert.equal(frameCount, 1);
+  await tick();
+  assert.equal(frameCount, 1);
   f.host.submitGate.resolve();
   await Promise.all([first, second]);
   await f.session.render();
@@ -203,18 +338,26 @@ test('frame submission is serialized and no-op frames do not inflate GPU counts'
   await f.session.close();
 });
 
-test('a failed frame stops already queued frames until an explicit reload', async () => {
-  const f = fixture(); let calls = 0;
-  await f.session.load(() => ({ packet: packet(1), frame() { calls++; throw new Error('invalid scene state'); } }));
-  const first = f.session.render(), second = f.session.render();
+test("a failed frame stops already queued frames until an explicit reload", async () => {
+  const f = fixture();
+  let calls = 0;
+  await f.session.load(() => ({
+    packet: packet(1),
+    frame() {
+      calls++;
+      throw new Error("invalid scene state");
+    },
+  }));
+  const first = f.session.render(),
+    second = f.session.render();
   await Promise.all([assert.rejects(first, /invalid scene state/), aborts(second)]);
   assert.equal(calls, 1);
-  assert.equal(f.session.state, 'failed');
+  assert.equal(f.session.state, "failed");
   assert.deepEqual(submissions(f), [1]);
   await f.session.close();
 });
 
-test('invalid dimensions leave an existing scene untouched', async () => {
+test("invalid dimensions leave an existing scene untouched", async () => {
   const f = fixture();
   await f.session.load(() => ({ packet: packet() }));
   const before = f.session.snapshot();
@@ -226,21 +369,43 @@ test('invalid dimensions leave an existing scene untouched', async () => {
   await f.session.close();
 });
 
-test('malformed, detached and shared packet objects never reach the host', async () => {
-  const f = fixture(); let disposed = 0;
+test("malformed, detached and shared packet objects never reach the host", async () => {
+  const f = fixture();
+  let disposed = 0;
   const detached = new Uint8Array(20);
   structuredClone(detached.buffer, { transfer: [detached.buffer] });
-  for (const value of [null, new Uint8Array(0), new Uint8Array(15), {}, detached, new Uint8Array(new SharedArrayBuffer(20))]) {
-    await assert.rejects(f.session.load(() => ({ packet: value, dispose() { disposed++; } })), TypeError);
+  for (const value of [
+    null,
+    new Uint8Array(0),
+    new Uint8Array(15),
+    {},
+    detached,
+    new Uint8Array(new SharedArrayBuffer(20)),
+  ]) {
+    await assert.rejects(
+      f.session.load(() => ({
+        packet: value,
+        dispose() {
+          disposed++;
+        },
+      })),
+      TypeError,
+    );
   }
   assert.equal(disposed, 6);
   assert.deepEqual(submissions(f), []);
   await f.session.close();
 });
 
-test('close during a GPU completion wait does not lose CPU scene disposal', async () => {
-  const f = fixture(); let disposed = 0;
-  await f.session.load(() => ({ packet: packet(), dispose() { disposed++; } }));
+test("close during a GPU completion wait does not lose CPU scene disposal", async () => {
+  const f = fixture();
+  let disposed = 0;
+  await f.session.load(() => ({
+    packet: packet(),
+    dispose() {
+      disposed++;
+    },
+  }));
   f.host.queueGate = deferred();
   const loading = f.session.reload();
   const rejected = aborts(loading);
@@ -251,110 +416,181 @@ test('close during a GPU completion wait does not lose CPU scene disposal', asyn
   f.host.queueGate.resolve();
 });
 
-test('observer exceptions do not break ownership, including reentrant close', async () => {
-  const f = fixture({ onState() { throw new Error('observer failure'); }, onError() { throw new Error('error observer failure'); } });
+test("observer exceptions do not break ownership, including reentrant close", async () => {
+  const f = fixture({
+    onState() {
+      throw new Error("observer failure");
+    },
+    onError() {
+      throw new Error("error observer failure");
+    },
+  });
   await f.session.load(() => ({ packet: packet() }));
-  assert.equal(f.session.state, 'ready');
+  assert.equal(f.session.state, "ready");
   let reentrant;
-  f.session.onState = () => { reentrant = f.session.close(); };
+  f.session.onState = () => {
+    reentrant = f.session.close();
+  };
   const closed = f.session.close();
   assert.strictEqual(reentrant, closed);
   await closed;
-  assert.equal(f.log.filter(e => e[0] === 'unconfigure').length, 1);
+  assert.equal(f.log.filter((e) => e[0] === "unconfigure").length, 1);
 });
 
-test('device loss recovery can be disabled and intentional shutdown never reacquires', async () => {
+test("device loss recovery can be disabled and intentional shutdown never reacquires", async () => {
   const f = fixture({ maxRecoveryAttempts: 0 });
   await f.session.load(() => ({ packet: packet() }));
-  f.devices[0].lose({ reason: 'unknown' });
-  await until(() => f.session.state === 'failed');
-  await f.session.close(); await tick();
+  f.devices[0].lose({ reason: "unknown" });
+  await until(() => f.session.state === "failed");
+  await f.session.close();
+  await tick();
   assert.equal(f.devices.length, 1);
   const g = fixture();
   await g.session.load(() => ({ packet: packet() }));
-  await g.session.close(); await tick();
+  await g.session.close();
+  await tick();
   assert.equal(g.devices.length, 1);
 });
 
-test('error observers may close the session without a failure resurrecting it', async () => {
-  const f = fixture(); let close;
-  await f.session.load(() => ({ packet: packet(), frame() { throw new Error('frame failure'); } }));
-  f.session.onError = () => { close = f.session.close(); };
+test("error observers may close the session without a failure resurrecting it", async () => {
+  const f = fixture();
+  let close;
+  await f.session.load(() => ({
+    packet: packet(),
+    frame() {
+      throw new Error("frame failure");
+    },
+  }));
+  f.session.onError = () => {
+    close = f.session.close();
+  };
   await assert.rejects(f.session.render(), /frame failure/);
   await close;
-  assert.equal(f.session.state, 'closed');
+  assert.equal(f.session.state, "closed");
 });
 
-test('a device-loss observer can shut down instead of auto-recovering', async () => {
+test("a device-loss observer can shut down instead of auto-recovering", async () => {
   const f = fixture();
   await f.session.load(() => ({ packet: packet() }));
-  f.session.onError = () => { f.session.close(); };
-  f.devices[0].lose({ message: 'loss handled by application' });
-  await tick(); await tick();
-  assert.equal(f.session.state, 'closed');
+  f.session.onError = () => {
+    f.session.close();
+  };
+  f.devices[0].lose({ message: "loss handled by application" });
+  await tick();
+  await tick();
+  assert.equal(f.session.state, "closed");
   assert.equal(f.devices.length, 1);
 });
 
-test('error-observer reload is newer than the failing frame', async () => {
-  const f = fixture(); let replacement;
-  await f.session.load(() => ({ packet: packet(1), frame() { throw new Error('retry externally'); } }));
-  f.session.onError = () => { replacement = f.session.load(() => ({ packet: packet(2) })); };
+test("error-observer reload is newer than the failing frame", async () => {
+  const f = fixture();
+  let replacement;
+  await f.session.load(() => ({
+    packet: packet(1),
+    frame() {
+      throw new Error("retry externally");
+    },
+  }));
+  f.session.onError = () => {
+    replacement = f.session.load(() => ({ packet: packet(2) }));
+  };
   await assert.rejects(f.session.render(), /retry externally/);
   await replacement;
-  assert.equal(f.session.state, 'ready');
+  assert.equal(f.session.state, "ready");
   assert.deepEqual(submissions(f), [1, 2]);
   await f.session.close();
 });
 
-test('frame methods retain their scene receiver', async () => {
+test("frame methods retain their scene receiver", async () => {
   const f = fixture();
-  await f.session.load(() => ({ packet: packet(1), value: 11, frame() { return packet(this.value); } }));
+  await f.session.load(() => ({
+    packet: packet(1),
+    value: 11,
+    frame() {
+      return packet(this.value);
+    },
+  }));
   await f.session.render();
   assert.deepEqual(submissions(f), [1, 11]);
   await f.session.close();
 });
 
-test('close waits for already-started disposal after cancelling a reload', async () => {
-  const f = fixture(), disposal = deferred(); let entered = false, closed = false;
-  await f.session.load(() => ({ packet: packet(), dispose() { entered = true; return disposal.promise; } }));
-  const loading = f.session.reload(), rejected = aborts(loading);
+test("close waits for already-started disposal after cancelling a reload", async () => {
+  const f = fixture(),
+    disposal = deferred();
+  let entered = false,
+    closed = false;
+  await f.session.load(() => ({
+    packet: packet(),
+    dispose() {
+      entered = true;
+      return disposal.promise;
+    },
+  }));
+  const loading = f.session.reload(),
+    rejected = aborts(loading);
   await until(() => entered);
-  const closing = f.session.close().then(() => { closed = true; });
+  const closing = f.session.close().then(() => {
+    closed = true;
+  });
   await tick();
-  assert.equal(closed, false, 'close must join existing CPU ownership cleanup');
+  assert.equal(closed, false, "close must join existing CPU ownership cleanup");
   disposal.resolve();
   await Promise.all([closing, rejected]);
   assert.equal(closed, true);
 });
 
-test('an abort listener can close during reload without the new operation reopening the session', async () => {
+test("an abort listener can close during reload without the new operation reopening the session", async () => {
   const f = fixture();
   await f.session.load(({ signal }) => {
-    signal.addEventListener('abort', () => { f.session.close(); }, { once: true });
+    signal.addEventListener(
+      "abort",
+      () => {
+        f.session.close();
+      },
+      { once: true },
+    );
     return { packet: packet(1) };
   });
   await aborts(f.session.reload());
-  assert.equal(f.session.state, 'closed');
+  assert.equal(f.session.state, "closed");
   assert.deepEqual(submissions(f), [1]);
 });
 
-test('terminal device loss cannot overwrite shutdown requested by an abort listener', async () => {
+test("terminal device loss cannot overwrite shutdown requested by an abort listener", async () => {
   const f = fixture({ maxRecoveryAttempts: 0 });
   await f.session.load(({ signal }) => {
-    signal.addEventListener('abort', () => { f.session.close(); }, { once: true });
+    signal.addEventListener(
+      "abort",
+      () => {
+        f.session.close();
+      },
+      { once: true },
+    );
     return { packet: packet() };
   });
-  f.devices[0].lose({ message: 'terminal loss' });
-  await tick(); await tick();
-  assert.equal(f.session.state, 'closed');
+  f.devices[0].lose({ message: "terminal loss" });
+  await tick();
+  await tick();
+  assert.equal(f.session.state, "closed");
   assert.equal(f.devices.length, 1);
 });
 
-test('closing in the microtask before a queued frame producer prevents invoking it', async () => {
-  const f = fixture(); let calls = 0;
-  await f.session.load(() => ({ packet: packet(), frame() { calls++; return packet(2); } }));
-  const rendering = f.session.render(), rejected = aborts(rendering);
-  queueMicrotask(() => { f.session.close(); });
+test("closing in the microtask before a queued frame producer prevents invoking it", async () => {
+  const f = fixture();
+  let calls = 0;
+  await f.session.load(() => ({
+    packet: packet(),
+    frame() {
+      calls++;
+      return packet(2);
+    },
+  }));
+  const rendering = f.session.render(),
+    rejected = aborts(rendering);
+  queueMicrotask(() => {
+    f.session.close();
+  });
   await rejected;
   assert.equal(calls, 0);
   assert.deepEqual(submissions(f), [1]);

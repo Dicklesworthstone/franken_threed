@@ -1,6 +1,6 @@
 /**
  * direct_reference.js - Direct-JS WebGPU Oracle Reference
- * 
+ *
  * Executes identical WebGPU rendering work directly without going through
  * the binary bridge packet decoder, for pixel-identical comparison.
  */
@@ -50,9 +50,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
 const DIRECT_TRIANGLE_VERTEX_DATA = new Float32Array([
   // x,    y,    z,   u,   v
-   0.0,  0.5,  0.0, 0.5, 1.0,
-  -0.5, -0.5,  0.0, 0.0, 0.0,
-   0.5, -0.5,  0.0, 1.0, 0.0,
+  0.0, 0.5, 0.0, 0.5, 1.0, -0.5, -0.5, 0.0, 0.0, 0.0, 0.5, -0.5, 0.0, 1.0, 0.0,
 ]);
 
 /**
@@ -161,30 +159,44 @@ export function createDirectReferenceRenderer(device, width = 64, height = 64, d
    * @param {Object|null} [timingRecord=null]
    * @returns {Promise<void>}
    */
-  function submitFrame(affineRows = null, drawEncoder = null, preparedUniformData = null, timingRecord = null) {
+  function submitFrame(
+    affineRows = null,
+    drawEncoder = null,
+    preparedUniformData = null,
+    timingRecord = null,
+  ) {
     if (drawEncoder !== null && typeof drawEncoder !== "function") {
       throw new TypeError("drawEncoder must be a function or null");
     }
 
     let uniformData;
     if (preparedUniformData !== null) {
-      const raw = typeof preparedUniformData === "function" ? preparedUniformData() : preparedUniformData;
+      const raw =
+        typeof preparedUniformData === "function" ? preparedUniformData() : preparedUniformData;
       if (raw instanceof Uint8Array) {
         if (raw.byteLength !== drawCount * 256) {
-          throw new RangeError(`preparedUniformData Uint8Array byteLength (${raw.byteLength}) must equal drawCount * 256 (${drawCount * 256})`);
+          throw new RangeError(
+            `preparedUniformData Uint8Array byteLength (${raw.byteLength}) must equal drawCount * 256 (${drawCount * 256})`,
+          );
         }
         uniformData = raw;
       } else if (raw instanceof Float32Array) {
         if (raw.length !== drawCount * 64) {
-          throw new RangeError(`preparedUniformData Float32Array length (${raw.length}) must equal drawCount * 64 (${drawCount * 64})`);
+          throw new RangeError(
+            `preparedUniformData Float32Array length (${raw.length}) must equal drawCount * 64 (${drawCount * 64})`,
+          );
         }
         uniformData = raw;
       } else {
-        throw new RangeError("preparedUniformData must be a non-empty Uint8Array or Float32Array with 256-byte aligned records");
+        throw new RangeError(
+          "preparedUniformData must be a non-empty Uint8Array or Float32Array with 256-byte aligned records",
+        );
       }
     } else if (affineRows !== null) {
       if (!(affineRows instanceof Float32Array) || affineRows.length !== drawCount * 12) {
-        throw new RangeError(`affineRows must be a Float32Array of length drawCount * 12 (${drawCount * 12})`);
+        throw new RangeError(
+          `affineRows must be a Float32Array of length drawCount * 12 (${drawCount * 12})`,
+        );
       }
       uniformData = new Float32Array(drawCount * 64);
       for (let i = 0; i < drawCount; i++) {
@@ -196,7 +208,9 @@ export function createDirectReferenceRenderer(device, width = 64, height = 64, d
       }
     } else {
       if (drawCount !== 1) {
-        throw new RangeError(`null affineRows requires drawCount = 1, but renderer was initialized with drawCount = ${drawCount}`);
+        throw new RangeError(
+          `null affineRows requires drawCount = 1, but renderer was initialized with drawCount = ${drawCount}`,
+        );
       }
       uniformData = new Float32Array(64);
       uniformData[0] = 1.0;
@@ -234,7 +248,7 @@ export function createDirectReferenceRenderer(device, width = 64, height = 64, d
     encoder.copyTextureToBuffer(
       { texture: targetTexture },
       { buffer: readbackBuffer, bytesPerRow: bytesPerRow, rowsPerImage: height },
-      [width, height, 1]
+      [width, height, 1],
     );
 
     const commandBuffer = encoder.finish();
@@ -290,7 +304,7 @@ export async function renderDirectReferenceTriangle(
   measurementSeam = null,
   affineRows = null,
   drawEncoder = null,
-  preparedUniformData = null
+  preparedUniformData = null,
 ) {
   if (drawEncoder !== null && typeof drawEncoder !== "function") {
     throw new TypeError("drawEncoder must be a function or null");
@@ -303,25 +317,38 @@ export async function renderDirectReferenceTriangle(
   let resolvedUniformData = null;
 
   if (preparedUniformData !== null) {
-    const raw = typeof preparedUniformData === "function" ? preparedUniformData() : preparedUniformData;
+    const raw =
+      typeof preparedUniformData === "function" ? preparedUniformData() : preparedUniformData;
     if (raw instanceof Uint8Array) {
       if (raw.byteLength === 0 || raw.byteLength % 256 !== 0) {
-        throw new RangeError("preparedUniformData Uint8Array byteLength must be non-empty and divisible by 256");
+        throw new RangeError(
+          "preparedUniformData Uint8Array byteLength must be non-empty and divisible by 256",
+        );
       }
       drawCount = raw.byteLength / 256;
       resolvedUniformData = raw;
     } else if (raw instanceof Float32Array) {
       if (raw.length === 0 || raw.length % 64 !== 0) {
-        throw new RangeError("preparedUniformData Float32Array length must be non-empty and divisible by 64");
+        throw new RangeError(
+          "preparedUniformData Float32Array length must be non-empty and divisible by 64",
+        );
       }
       drawCount = raw.length / 64;
       resolvedUniformData = raw;
     } else {
-      throw new RangeError("preparedUniformData must be a non-empty Uint8Array or Float32Array with 256-byte aligned records");
+      throw new RangeError(
+        "preparedUniformData must be a non-empty Uint8Array or Float32Array with 256-byte aligned records",
+      );
     }
   } else if (affineRows !== null) {
-    if (!(affineRows instanceof Float32Array) || affineRows.length === 0 || affineRows.length % 12 !== 0) {
-      throw new RangeError("affineRows must be a non-empty Float32Array with length divisible by 12");
+    if (
+      !(affineRows instanceof Float32Array) ||
+      affineRows.length === 0 ||
+      affineRows.length % 12 !== 0
+    ) {
+      throw new RangeError(
+        "affineRows must be a non-empty Float32Array with length divisible by 12",
+      );
     }
     drawCount = affineRows.length / 12;
   }
@@ -333,14 +360,15 @@ export async function renderDirectReferenceTriangle(
       affineRows,
       drawEncoder,
       resolvedUniformData || preparedUniformData,
-      timingRecord
+      timingRecord,
     );
 
     if (measure) {
       const tSubmitEnd = timingRecord._tSubmitEnd;
       measurementSeam.direct_prepare_ms = timingRecord._tFinish - t0;
       measurementSeam.direct_submit_ms = tSubmitEnd - timingRecord._tSubmitStart;
-      measurementSeam.cpu_prepare_submit_ms = measurementSeam.direct_prepare_ms + measurementSeam.direct_submit_ms;
+      measurementSeam.cpu_prepare_submit_ms =
+        measurementSeam.direct_prepare_ms + measurementSeam.direct_submit_ms;
       await donePromise;
       measurementSeam.gpu_complete_ms = performance.now() - tSubmitEnd;
     } else {
@@ -376,7 +404,7 @@ export async function renderDirectReferenceTexturedTriangle(
   texH = 2,
   affine = null,
   width = 64,
-  height = 64
+  height = 64,
 ) {
   const shaderCode = `
 struct AffineRows {
@@ -442,7 +470,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     { texture: sourceTexture },
     pixels,
     { bytesPerRow: texW * 4, rowsPerImage: texH },
-    [texW, texH, 1]
+    [texW, texH, 1],
   );
 
   // 3. Sampler: nearest filter, clamp-to-edge
@@ -458,9 +486,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
   // Vertex 1: pos (-0.5, -0.5, 0.0), uv (0.0, 0.0)
   // Vertex 2: pos (0.5, -0.5, 0.0), uv (1.0, 0.0)
   const vertexData = new Float32Array([
-     0.0,  0.5,  0.0, 0.5, 1.0,
-    -0.5, -0.5,  0.0, 0.0, 0.0,
-     0.5, -0.5,  0.0, 1.0, 0.0,
+    0.0, 0.5, 0.0, 0.5, 1.0, -0.5, -0.5, 0.0, 0.0, 0.0, 0.5, -0.5, 0.0, 1.0, 0.0,
   ]);
   const vertexBuffer = device.createBuffer({
     size: vertexData.byteLength,
@@ -470,11 +496,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
   // 5. AffineRows uniform buffer (48 bytes: 3 rows of vec4)
   const affineData = new Float32Array(
-    affine || [
-      1.0, 0.0, 0.0, 0.0,
-      0.0, 1.0, 0.0, 0.0,
-      0.0, 0.0, 1.0, 0.0,
-    ]
+    affine || [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
   );
   const uniformBuffer = device.createBuffer({
     size: 256,
@@ -582,7 +604,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
   encoder.copyTextureToBuffer(
     { texture: targetTexture },
     { buffer: readbackBuffer, bytesPerRow, rowsPerImage: height },
-    [width, height, 1]
+    [width, height, 1],
   );
 
   device.queue.submit([encoder.finish()]);
@@ -616,18 +638,18 @@ export function generatePackedAffineRows(recordCount = 4000, uploadIndex = 0) {
 
   for (let i = 0; i < recordCount; i++) {
     const base = i * 12;
-    floats[base + 0] = 1.0 + (i * 0.0001) + delta;
+    floats[base + 0] = 1.0 + i * 0.0001 + delta;
     floats[base + 1] = 0.01 * ((i % 7) + 1);
     floats[base + 2] = 0.02 * ((i % 11) + 1);
-    floats[base + 3] = (i * 0.25) + 1.0 + delta;
+    floats[base + 3] = i * 0.25 + 1.0 + delta;
     floats[base + 4] = 0.03 * ((i % 5) + 1);
-    floats[base + 5] = 1.0 + (i * 0.0002) + delta;
+    floats[base + 5] = 1.0 + i * 0.0002 + delta;
     floats[base + 6] = 0.04 * ((i % 13) + 1);
-    floats[base + 7] = (i * 0.5) - 2.0 + delta;
+    floats[base + 7] = i * 0.5 - 2.0 + delta;
     floats[base + 8] = 0.05 * ((i % 9) + 1);
     floats[base + 9] = 0.06 * ((i % 17) + 1);
-    floats[base + 10] = 1.0 + (i * 0.0003) + delta;
-    floats[base + 11] = (i * 0.75) + 3.0 + delta;
+    floats[base + 10] = 1.0 + i * 0.0003 + delta;
+    floats[base + 11] = i * 0.75 + 3.0 + delta;
   }
 
   // Inject -0.0 (0x80000000) and quiet NaN with payload 0x1337 (0x7fc01337) via Uint32Array view
@@ -718,11 +740,15 @@ export function createDirectPersistentPackedBufferRunner(device, recordCount = 4
     } else if (ArrayBuffer.isView(affineRows)) {
       // Guard: record count must match init N (4000 records = 192,000 bytes)
       if (affineRows.byteLength !== totalBytes) {
-        throw new RangeError(`record count must match the init N (${recordCount} records = ${totalBytes} bytes, got byteLength ${affineRows.byteLength})`);
+        throw new RangeError(
+          `record count must match the init N (${recordCount} records = ${totalBytes} bytes, got byteLength ${affineRows.byteLength})`,
+        );
       }
       uploadData = affineRows;
     } else {
-      throw new TypeError("affineRows must be an ArrayBuffer view (e.g. Float32Array, Uint8Array) or null");
+      throw new TypeError(
+        "affineRows must be an ArrayBuffer view (e.g. Float32Array, Uint8Array) or null",
+      );
     }
 
     // Determine destination slot: must be 611 or 612 (alternating slot per frame if not explicitly specified)
@@ -735,7 +761,7 @@ export function createDirectPersistentPackedBufferRunner(device, recordCount = 4
         throw new RangeError(`destination must be 611 or 612, got ${targetDestinationId}`);
       }
     } else {
-      dstId = (currentFrameIndex % 2 === 0) ? 611 : 612;
+      dstId = currentFrameIndex % 2 === 0 ? 611 : 612;
     }
 
     const dstBuffer = dstBuffers[dstId];
@@ -813,8 +839,12 @@ export function createDirectPersistentPackedBufferRunner(device, recordCount = 4
     dstBuffer611,
     dstBuffer612,
     dstBuffers,
-    get lastDestinationBufferId() { return lastDestinationBufferId; },
-    get currentFrameIndex() { return currentFrameIndex; },
+    get lastDestinationBufferId() {
+      return lastDestinationBufferId;
+    },
+    get currentFrameIndex() {
+      return currentFrameIndex;
+    },
     submitFrame,
     submit,
     readback,
@@ -841,7 +871,7 @@ export async function executeDirectPersistentPackedUpload(
   recordCount = 4000,
   measurementSeam = null,
   affineRows = null,
-  destinationId = 611
+  destinationId = 611,
 ) {
   if (destinationId !== 611 && destinationId !== 612) {
     throw new RangeError(`destination must be 611 or 612, got ${destinationId}`);
@@ -858,7 +888,8 @@ export async function executeDirectPersistentPackedUpload(
       const tSubmitEnd = timingRecord._tSubmitEnd;
       measurementSeam.direct_prepare_ms = timingRecord._tFinish - t0;
       measurementSeam.direct_submit_ms = tSubmitEnd - timingRecord._tSubmitStart;
-      measurementSeam.cpu_prepare_submit_ms = measurementSeam.direct_prepare_ms + measurementSeam.direct_submit_ms;
+      measurementSeam.cpu_prepare_submit_ms =
+        measurementSeam.direct_prepare_ms + measurementSeam.direct_submit_ms;
       await donePromise;
       measurementSeam.gpu_complete_ms = performance.now() - tSubmitEnd;
     } else {
@@ -871,29 +902,28 @@ export async function executeDirectPersistentPackedUpload(
   }
 }
 
-
 import {
+  OPCODE_COPY_BUFFER_TO_BUFFER,
+  OPCODE_COPY_TEXTURE_TO_BUFFER,
+  OPCODE_CREATE_BUFFER,
+  OPCODE_CREATE_PIPELINE,
+  OPCODE_CREATE_TEXTURE,
+  OPCODE_EXECUTE_BUNDLES,
+  OPCODE_RECORD_BUNDLE,
+  OPCODE_RENDER_PASS,
+  OPCODE_WRITE_BUFFER,
   PACKET_MAGIC,
   PACKET_VERSION,
-  OPCODE_CREATE_BUFFER,
-  OPCODE_WRITE_BUFFER,
-  OPCODE_CREATE_TEXTURE,
-  OPCODE_CREATE_PIPELINE,
-  OPCODE_RENDER_PASS,
-  OPCODE_COPY_TEXTURE_TO_BUFFER,
-  OPCODE_RECORD_BUNDLE,
-  OPCODE_EXECUTE_BUNDLES,
-  OPCODE_COPY_BUFFER_TO_BUFFER,
   TEXTURE_USAGE_COPY_SRC,
   TEXTURE_USAGE_RENDER_ATTACHMENT,
 } from "./bridge_runtime.js";
 
 export {
+  OPCODE_COPY_BUFFER_TO_BUFFER,
+  OPCODE_EXECUTE_BUNDLES,
+  OPCODE_RECORD_BUNDLE,
   TEXTURE_USAGE_COPY_SRC,
   TEXTURE_USAGE_RENDER_ATTACHMENT,
-  OPCODE_RECORD_BUNDLE,
-  OPCODE_EXECUTE_BUNDLES,
-  OPCODE_COPY_BUFFER_TO_BUFFER,
 };
 
 /**
@@ -915,30 +945,89 @@ export class PacketBuilder {
     const dataOffset = this.dataTotalLen;
     this.dataChunks.push(dataUint8);
     this.dataTotalLen += dataUint8.byteLength;
-    this.commands.push({ op: OPCODE_WRITE_BUFFER, bufferId, offset, dataOffset, dataLength: dataUint8.byteLength });
+    this.commands.push({
+      op: OPCODE_WRITE_BUFFER,
+      bufferId,
+      offset,
+      dataOffset,
+      dataLength: dataUint8.byteLength,
+    });
   }
 
   createTexture(textureId, width, height, formatCode, usage) {
     this.commands.push({ op: OPCODE_CREATE_TEXTURE, textureId, width, height, formatCode, usage });
   }
 
-  createPipeline(pipelineId, wgslText, formatCode, hasVB, hasUniform, uniformSize = 0, vertexStride = 0) {
+  createPipeline(
+    pipelineId,
+    wgslText,
+    formatCode,
+    hasVB,
+    hasUniform,
+    uniformSize = 0,
+    vertexStride = 0,
+  ) {
     const codeBytes = new TextEncoder().encode(wgslText);
     const codeOffset = this.dataTotalLen;
     this.dataChunks.push(codeBytes);
     this.dataTotalLen += codeBytes.byteLength;
-    this.commands.push({ op: OPCODE_CREATE_PIPELINE, pipelineId, codeOffset, codeLen: codeBytes.byteLength, formatCode, hasVB, hasUniform, uniformSize, vertexStride });
+    this.commands.push({
+      op: OPCODE_CREATE_PIPELINE,
+      pipelineId,
+      codeOffset,
+      codeLen: codeBytes.byteLength,
+      formatCode,
+      hasVB,
+      hasUniform,
+      uniformSize,
+      vertexStride,
+    });
   }
 
-  renderPass(targetType, targetId, clearColor, pipelineId, vbId, vertexCount, dynamicOffset = 0, uniformBufferId = 1) {
-    this.commands.push({ op: OPCODE_RENDER_PASS, targetType, targetId, clearColor, pipelineId, vbId, vertexCount, dynamicOffset, uniformBufferId });
+  renderPass(
+    targetType,
+    targetId,
+    clearColor,
+    pipelineId,
+    vbId,
+    vertexCount,
+    dynamicOffset = 0,
+    uniformBufferId = 1,
+  ) {
+    this.commands.push({
+      op: OPCODE_RENDER_PASS,
+      targetType,
+      targetId,
+      clearColor,
+      pipelineId,
+      vbId,
+      vertexCount,
+      dynamicOffset,
+      uniformBufferId,
+    });
   }
 
   copyTextureToBuffer(textureId, bufferId, width, height, epochHi = 0, epochLo = 0) {
-    this.commands.push({ op: OPCODE_COPY_TEXTURE_TO_BUFFER, textureId, bufferId, width, height, epochHi, epochLo });
+    this.commands.push({
+      op: OPCODE_COPY_TEXTURE_TO_BUFFER,
+      textureId,
+      bufferId,
+      width,
+      height,
+      epochHi,
+      epochLo,
+    });
   }
 
-  recordBundle(bundleId, pipelineId, vertexBufferId, vertexCount, dynamicOffset = 0, uniformBufferId = 1, targetFormat = 2) {
+  recordBundle(
+    bundleId,
+    pipelineId,
+    vertexBufferId,
+    vertexCount,
+    dynamicOffset = 0,
+    uniformBufferId = 1,
+    targetFormat = 2,
+  ) {
     this.commands.push({
       op: OPCODE_RECORD_BUNDLE,
       bundleId,
@@ -958,7 +1047,15 @@ export class PacketBuilder {
     });
   }
 
-  copyBufferToBuffer(sourceBufferId, sourceOffset, destinationBufferId, destinationOffset, size, epochHi = 0, epochLo = 0) {
+  copyBufferToBuffer(
+    sourceBufferId,
+    sourceOffset,
+    destinationBufferId,
+    destinationOffset,
+    size,
+    epochHi = 0,
+    epochLo = 0,
+  ) {
     this.commands.push({
       op: OPCODE_COPY_BUFFER_TO_BUFFER,
       sourceBufferId,
@@ -976,15 +1073,33 @@ export class PacketBuilder {
     let commandBytesLen = 0;
     for (const cmd of this.commands) {
       switch (cmd.op) {
-        case OPCODE_CREATE_BUFFER: commandBytesLen += 2 + 12; break;
-        case OPCODE_WRITE_BUFFER: commandBytesLen += 2 + 16; break;
-        case OPCODE_CREATE_TEXTURE: commandBytesLen += 2 + 20; break;
-        case OPCODE_CREATE_PIPELINE: commandBytesLen += 2 + 32; break;
-        case OPCODE_RENDER_PASS: commandBytesLen += 2 + 44; break;
-        case OPCODE_COPY_TEXTURE_TO_BUFFER: commandBytesLen += 2 + 24; break;
-        case OPCODE_RECORD_BUNDLE: commandBytesLen += 2 + 28; break;
-        case OPCODE_EXECUTE_BUNDLES: commandBytesLen += 2 + 4 + cmd.bundleIds.length * 4; break;
-        case OPCODE_COPY_BUFFER_TO_BUFFER: commandBytesLen += 2 + 40; break;
+        case OPCODE_CREATE_BUFFER:
+          commandBytesLen += 2 + 12;
+          break;
+        case OPCODE_WRITE_BUFFER:
+          commandBytesLen += 2 + 16;
+          break;
+        case OPCODE_CREATE_TEXTURE:
+          commandBytesLen += 2 + 20;
+          break;
+        case OPCODE_CREATE_PIPELINE:
+          commandBytesLen += 2 + 32;
+          break;
+        case OPCODE_RENDER_PASS:
+          commandBytesLen += 2 + 44;
+          break;
+        case OPCODE_COPY_TEXTURE_TO_BUFFER:
+          commandBytesLen += 2 + 24;
+          break;
+        case OPCODE_RECORD_BUNDLE:
+          commandBytesLen += 2 + 28;
+          break;
+        case OPCODE_EXECUTE_BUNDLES:
+          commandBytesLen += 2 + 4 + cmd.bundleIds.length * 4;
+          break;
+        case OPCODE_COPY_BUFFER_TO_BUFFER:
+          commandBytesLen += 2 + 40;
+          break;
       }
     }
 

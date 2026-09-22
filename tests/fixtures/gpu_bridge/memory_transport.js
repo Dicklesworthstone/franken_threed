@@ -45,11 +45,13 @@ export function validateMemoryView(view, wasmMemory = null) {
   }
   if (wasmMemory && wasmMemory instanceof WebAssembly.Memory) {
     if (view.buffer !== wasmMemory.buffer) {
-      throw new Error("validateMemoryView: view references a stale ArrayBuffer after memory growth");
+      throw new Error(
+        "validateMemoryView: view references a stale ArrayBuffer after memory growth",
+      );
     }
     if (view.byteOffset + view.byteLength > wasmMemory.buffer.byteLength) {
       throw new Error(
-        `validateMemoryView: view out of bounds (offset ${view.byteOffset} + length ${view.byteLength} > memory ${wasmMemory.buffer.byteLength})`
+        `validateMemoryView: view out of bounds (offset ${view.byteOffset} + length ${view.byteLength} > memory ${wasmMemory.buffer.byteLength})`,
       );
     }
   }
@@ -100,14 +102,18 @@ export function copyFromWasmMemory(wasmMemory, offset, length, ledger = globalTr
     throw new Error("copyFromWasmMemory: WebAssembly.Memory buffer is detached");
   }
   if (!Number.isSafeInteger(offset) || offset < 0) {
-    throw new Error(`copyFromWasmMemory: offset must be a non-negative safe integer, got ${offset}`);
+    throw new Error(
+      `copyFromWasmMemory: offset must be a non-negative safe integer, got ${offset}`,
+    );
   }
   if (!Number.isSafeInteger(length) || length < 0) {
-    throw new Error(`copyFromWasmMemory: length must be a non-negative safe integer, got ${length}`);
+    throw new Error(
+      `copyFromWasmMemory: length must be a non-negative safe integer, got ${length}`,
+    );
   }
   if (offset + length > wasmMemory.buffer.byteLength) {
     throw new Error(
-      `copyFromWasmMemory: range out of bounds (offset ${offset} + length ${length} > memory ${wasmMemory.buffer.byteLength})`
+      `copyFromWasmMemory: range out of bounds (offset ${offset} + length ${length} > memory ${wasmMemory.buffer.byteLength})`,
     );
   }
 

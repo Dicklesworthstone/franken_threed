@@ -1,36 +1,37 @@
 // Load the browser native identity routing test page in an installed browser and archive results.
-import { createServer } from 'node:http';
-import { readFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
-import { resolve, dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { spawn } from 'node:child_process';
+
+import { spawn } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const fixture = dirname(fileURLToPath(import.meta.url));
-const repoRoot = resolve(fixture, '../../..');
+const repoRoot = resolve(fixture, "../../..");
 
 const args = process.argv.slice(2);
-let browser = 'chrome';
+let browser = "chrome";
 
 for (const arg of args) {
-  if (arg === 'chrome' || arg === 'safari') {
+  if (arg === "chrome" || arg === "safari") {
     browser = arg;
   }
 }
-if (process.env.BROWSER === 'safari' || process.env.BROWSER === 'chrome') {
+if (process.env.BROWSER === "safari" || process.env.BROWSER === "chrome") {
   browser = process.env.BROWSER;
 }
 
-const runId = new Date().toISOString().replaceAll(':', '-') + '-' + process.pid;
-const archive = resolve(process.env.F3D_EVIDENCE_DIR || 'evidence');
-const runDir = join(archive, '04.4', runId);
+const runId = new Date().toISOString().replaceAll(":", "-") + "-" + process.pid;
+const archive = resolve(process.env.F3D_EVIDENCE_DIR || "evidence");
+const runDir = join(archive, "04.4", runId);
 mkdirSync(runDir, { recursive: true });
 
 const mime = {
-  '.html': 'text/html; charset=utf-8',
-  '.js': 'application/javascript; charset=utf-8',
-  '.mjs': 'application/javascript; charset=utf-8',
-  '.wasm': 'application/wasm',
-  '.json': 'application/json; charset=utf-8',
+  ".html": "text/html; charset=utf-8",
+  ".js": "application/javascript; charset=utf-8",
+  ".mjs": "application/javascript; charset=utf-8",
+  ".wasm": "application/wasm",
+  ".json": "application/json; charset=utf-8",
 };
 
 let server;
@@ -38,7 +39,9 @@ let browserProcess = null;
 
 const shutdown = (code = 0) => {
   if (browserProcess) {
-    try { browserProcess.kill(); } catch (_) {}
+    try {
+      browserProcess.kill();
+    } catch (_) {}
   }
   if (server) {
     server.close();
@@ -47,59 +50,64 @@ const shutdown = (code = 0) => {
 };
 
 server = createServer((req, res) => {
-  const url = new URL(req.url, 'http://127.0.0.1');
+  const url = new URL(req.url, "http://127.0.0.1");
 
-  if (url.pathname === '/report' && req.method === 'POST') {
-    let body = '';
-    req.on('data', chunk => { body += chunk; });
-    req.on('end', () => {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
+  if (url.pathname === "/report" && req.method === "POST") {
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk;
+    });
+    req.on("end", () => {
+      res.writeHead(200, { "Content-Type": "application/json" });
       res.end('{"ok":true}');
       try {
         const payload = JSON.parse(body);
-        const evidenceFile = join(runDir, 'results.json');
-        writeFileSync(evidenceFile, JSON.stringify(payload, null, 2), 'utf-8');
+        const evidenceFile = join(runDir, "results.json");
+        writeFileSync(evidenceFile, JSON.stringify(payload, null, 2), "utf-8");
         console.log(`[routing-test-harness] Evidence saved to ${evidenceFile}`);
 
         if (payload.decision_log !== undefined || payload.decisionLog !== undefined) {
           const decisionLog = payload.decision_log ?? payload.decisionLog;
-          const decisionFile = join(runDir, 'decision_log.json');
-          writeFileSync(decisionFile, JSON.stringify(decisionLog, null, 2), 'utf-8');
+          const decisionFile = join(runDir, "decision_log.json");
+          writeFileSync(decisionFile, JSON.stringify(decisionLog, null, 2), "utf-8");
           console.log(`[routing-test-harness] Decision log saved to ${decisionFile}`);
         }
 
         if (payload.attribution_log !== undefined || payload.attributionLog !== undefined) {
           const attributionLog = payload.attribution_log ?? payload.attributionLog;
-          const attributionFile = join(runDir, 'attribution_log.json');
-          writeFileSync(attributionFile, JSON.stringify(attributionLog, null, 2), 'utf-8');
+          const attributionFile = join(runDir, "attribution_log.json");
+          writeFileSync(attributionFile, JSON.stringify(attributionLog, null, 2), "utf-8");
           console.log(`[routing-test-harness] Attribution log saved to ${attributionFile}`);
         }
 
-        console.log('[routing-test-harness] Results received:\n', JSON.stringify(payload, null, 2));
+        console.log("[routing-test-harness] Results received:\n", JSON.stringify(payload, null, 2));
         if (payload.passed) {
-          console.log('[routing-test-harness] ALL TESTS PASSED');
+          console.log("[routing-test-harness] ALL TESTS PASSED");
           shutdown(0);
         } else {
-          console.error('[routing-test-harness] TESTS FAILED:', payload.error || payload.errors || payload.results);
+          console.error(
+            "[routing-test-harness] TESTS FAILED:",
+            payload.error || payload.errors || payload.results,
+          );
           shutdown(1);
         }
       } catch (err) {
-        console.error('[routing-test-harness] Failed to parse test report:', err);
+        console.error("[routing-test-harness] Failed to parse test report:", err);
         shutdown(1);
       }
     });
     return;
   }
 
-  if (url.pathname === '/') {
-    res.writeHead(302, { Location: '/tests/fixtures/routing/browser_native_identity.html' });
+  if (url.pathname === "/") {
+    res.writeHead(302, { Location: "/tests/fixtures/routing/browser_native_identity.html" });
     res.end();
     return;
   }
 
-  let filePath = resolve(repoRoot, '.' + url.pathname);
+  let filePath = resolve(repoRoot, "." + url.pathname);
   if (!existsSync(filePath)) {
-    const fixturePath = join(fixture, url.pathname.replace(/^\/+/, ''));
+    const fixturePath = join(fixture, url.pathname.replace(/^\/+/, ""));
     if (existsSync(fixturePath)) {
       filePath = fixturePath;
     }
@@ -107,60 +115,61 @@ server = createServer((req, res) => {
 
   if (!existsSync(filePath)) {
     res.writeHead(404);
-    res.end('Not found');
+    res.end("Not found");
     return;
   }
 
-  const ext = '.' + filePath.split('.').pop();
+  const ext = "." + filePath.split(".").pop();
   res.writeHead(200, {
-    'Content-Type': mime[ext] || 'application/octet-stream',
-    'Cross-Origin-Opener-Policy': 'same-origin',
-    'Cross-Origin-Embedder-Policy': 'require-corp',
+    "Content-Type": mime[ext] || "application/octet-stream",
+    "Cross-Origin-Opener-Policy": "same-origin",
+    "Cross-Origin-Embedder-Policy": "require-corp",
   });
   res.end(readFileSync(filePath));
 });
 
-server.listen(0, '127.0.0.1', () => {
+server.listen(0, "127.0.0.1", () => {
   const port = server.address().port;
   // Optional repo-relative page override (e.g. an RCH-emitted application dist); default unchanged.
-  const pagePath = process.env.F3D_ROUTING_PAGE || '/tests/fixtures/routing/browser_native_identity.html';
-  const targetUrl = `http://127.0.0.1:${port}${pagePath.startsWith('/') ? pagePath : '/' + pagePath}`;
+  const pagePath =
+    process.env.F3D_ROUTING_PAGE || "/tests/fixtures/routing/browser_native_identity.html";
+  const targetUrl = `http://127.0.0.1:${port}${pagePath.startsWith("/") ? pagePath : "/" + pagePath}`;
   console.log(`[routing-test-harness] Server listening on ${targetUrl}, launching ${browser}...`);
 
-  if (browser === 'chrome') {
+  if (browser === "chrome") {
     const chromePaths = [
       process.env.CHROME_BIN,
-      '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-      '/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary',
-      '/Applications/Chromium.app/Contents/MacOS/Chromium',
+      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+      "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+      "/Applications/Chromium.app/Contents/MacOS/Chromium",
     ].filter(Boolean);
-    const chromeBin = chromePaths.find(p => existsSync(p));
+    const chromeBin = chromePaths.find((p) => existsSync(p));
     if (!chromeBin) {
-      console.error('Chrome executable not found. Please install Chrome or run with Safari.');
+      console.error("Chrome executable not found. Please install Chrome or run with Safari.");
       shutdown(1);
       return;
     }
 
     browserProcess = spawn(chromeBin, [
-      '--enable-unsafe-webgpu',
-      '--headless=new',
-      '--disable-gpu-sandbox',
-      '--no-sandbox',
+      "--enable-unsafe-webgpu",
+      "--headless=new",
+      "--disable-gpu-sandbox",
+      "--no-sandbox",
       targetUrl,
     ]);
-  } else if (browser === 'safari') {
-    browserProcess = spawn('/usr/bin/open', ['-a', 'Safari', targetUrl]);
+  } else if (browser === "safari") {
+    browserProcess = spawn("/usr/bin/open", ["-a", "Safari", targetUrl]);
   }
 
   if (browserProcess) {
-    browserProcess.on('error', err => {
+    browserProcess.on("error", (err) => {
       console.error(`[routing-test-harness] Failed to spawn ${browser}:`, err);
       shutdown(1);
     });
   }
 
   setTimeout(() => {
-    console.error('[routing-test-harness] Timeout waiting for test completion (30s)');
+    console.error("[routing-test-harness] Timeout waiting for test completion (30s)");
     shutdown(1);
   }, 30000);
 });

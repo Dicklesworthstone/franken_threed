@@ -27,12 +27,16 @@ function cleanupHost(host) {
   if (!host) return;
   if (host.buffers) {
     for (const b of host.buffers.values()) {
-      try { b.destroy(); } catch (_) {}
+      try {
+        b.destroy();
+      } catch (_) {}
     }
   }
   if (host.textures) {
     for (const t of host.textures.values()) {
-      try { t.destroy(); } catch (_) {}
+      try {
+        t.destroy();
+      } catch (_) {}
     }
   }
   try {
@@ -47,7 +51,7 @@ export async function testBundleResetCounterexample(wasmExports) {
 
   if (typeof buildPacketFn !== "function") {
     throw new Error(
-      "Missing required export 'f3d_build_bundle_direct_warm_cache_packet' on wasmExports"
+      "Missing required export 'f3d_build_bundle_direct_warm_cache_packet' on wasmExports",
     );
   }
 
@@ -90,26 +94,32 @@ export async function testBundleResetCounterexample(wasmExports) {
     let expectedRanges;
     if (!emptyBundleList) {
       // false: left G>200, R<50, B<50; right B>200, R<50, G<50; background R,G,B<50; alpha 255 on all three.
-      expectedRanges = "left G>200, R<50, B<50, A=255; right B>200, R<50, G<50, A=255; bg R<50, G<50, B<50, A=255";
-      const leftValid = leftPixel[1] > 200 && leftPixel[0] < 50 && leftPixel[2] < 50 && leftPixel[3] === 255;
-      const rightValid = rightPixel[2] > 200 && rightPixel[0] < 50 && rightPixel[1] < 50 && rightPixel[3] === 255;
+      expectedRanges =
+        "left G>200, R<50, B<50, A=255; right B>200, R<50, G<50, A=255; bg R<50, G<50, B<50, A=255";
+      const leftValid =
+        leftPixel[1] > 200 && leftPixel[0] < 50 && leftPixel[2] < 50 && leftPixel[3] === 255;
+      const rightValid =
+        rightPixel[2] > 200 && rightPixel[0] < 50 && rightPixel[1] < 50 && rightPixel[3] === 255;
       const bgValid = bgPixel[0] < 50 && bgPixel[1] < 50 && bgPixel[2] < 50 && bgPixel[3] === 255;
 
       if (!leftValid || !rightValid || !bgValid) {
         throw new Error(
-          `Correct run failed for emptyBundleList=false: observed left=[${leftPixel}], right=[${rightPixel}], bg=[${bgPixel}]; expected: ${expectedRanges}`
+          `Correct run failed for emptyBundleList=false: observed left=[${leftPixel}], right=[${rightPixel}], bg=[${bgPixel}]; expected: ${expectedRanges}`,
         );
       }
     } else {
       // true: right blue as above; left sample R,G,B<50 with alpha 255; background black with alpha 255.
-      expectedRanges = "left R<50, G<50, B<50, A=255; right B>200, R<50, G<50, A=255; bg R<50, G<50, B<50, A=255";
-      const rightValid = rightPixel[2] > 200 && rightPixel[0] < 50 && rightPixel[1] < 50 && rightPixel[3] === 255;
-      const leftValid = leftPixel[0] < 50 && leftPixel[1] < 50 && leftPixel[2] < 50 && leftPixel[3] === 255;
+      expectedRanges =
+        "left R<50, G<50, B<50, A=255; right B>200, R<50, G<50, A=255; bg R<50, G<50, B<50, A=255";
+      const rightValid =
+        rightPixel[2] > 200 && rightPixel[0] < 50 && rightPixel[1] < 50 && rightPixel[3] === 255;
+      const leftValid =
+        leftPixel[0] < 50 && leftPixel[1] < 50 && leftPixel[2] < 50 && leftPixel[3] === 255;
       const bgValid = bgPixel[0] < 50 && bgPixel[1] < 50 && bgPixel[2] < 50 && bgPixel[3] === 255;
 
       if (!leftValid || !rightValid || !bgValid) {
         throw new Error(
-          `Correct run failed for emptyBundleList=true: observed left=[${leftPixel}], right=[${rightPixel}], bg=[${bgPixel}]; expected: ${expectedRanges}`
+          `Correct run failed for emptyBundleList=true: observed left=[${leftPixel}], right=[${rightPixel}], bg=[${bgPixel}]; expected: ${expectedRanges}`,
         );
       }
     }
@@ -139,14 +149,14 @@ export async function testBundleResetCounterexample(wasmExports) {
         ? `sampled=[${wrongPixels[LEFT_GREEN_OFFSET]},${wrongPixels[RIGHT_BLUE_OFFSET]},${wrongPixels[BACKGROUND_OFFSET]}]`
         : "no readback";
       throw new Error(
-        `Wrong-impl run falsely resolved for emptyBundleList=${emptyBundleList}. Expected WebGPU error scope rejection, but execution succeeded (${pSample}).`
+        `Wrong-impl run falsely resolved for emptyBundleList=${emptyBundleList}. Expected WebGPU error scope rejection, but execution succeeded (${pSample}).`,
       );
     }
 
     const wrongErrorMsg = wrongError.message || String(wrongError);
     if (!wrongErrorMsg.startsWith("WebGPU error scope reported error:")) {
       throw new Error(
-        `Wrong-impl run rejected with unexpected error (expected prefix 'WebGPU error scope reported error:'): "${wrongErrorMsg}"`
+        `Wrong-impl run rejected with unexpected error (expected prefix 'WebGPU error scope reported error:'): "${wrongErrorMsg}"`,
       );
     }
 

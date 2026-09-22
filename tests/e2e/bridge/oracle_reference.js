@@ -1,12 +1,12 @@
 /**
  * oracle_reference.js - Independent Direct-JavaScript WebGPU Oracle Reference
- * 
+ *
  * Bead: f3d-05-ids-layouts-epochs-transport-vqa.7
- * 
+ *
  * Provides independent direct-JS WebGPU reference implementations that execute
  * standard WebGPU API calls directly without relying on candidate binary bridge
  * packet decoders, serializers, or higher-level abstractions.
- * 
+ *
  * Used as the ground-truth oracle for differential pixel and state readback.
  */
 
@@ -143,9 +143,7 @@ export async function renderDirectTriangleReference(device, width = 64, height =
   // Vertex buffer: 3 vertices with position (vec3) and uv (vec2)
   const vertexData = new Float32Array([
     // x,    y,    z,   u,   v
-     0.0,  0.5,  0.0, 0.5, 1.0,
-    -0.5, -0.5,  0.0, 0.0, 0.0,
-     0.5, -0.5,  0.0, 1.0, 0.0,
+    0.0, 0.5, 0.0, 0.5, 1.0, -0.5, -0.5, 0.0, 0.0, 0.0, 0.5, -0.5, 0.0, 1.0, 0.0,
   ]);
   const vertexBuffer = device.createBuffer({
     size: vertexData.byteLength,
@@ -154,11 +152,7 @@ export async function renderDirectTriangleReference(device, width = 64, height =
   device.queue.writeBuffer(vertexBuffer, 0, vertexData);
 
   // Identity AffineRows: 48 bytes (3 rows of vec4)
-  const affineData = new Float32Array([
-    1.0, 0.0, 0.0, 0.0,
-    0.0, 1.0, 0.0, 0.0,
-    0.0, 0.0, 1.0, 0.0,
-  ]);
+  const affineData = new Float32Array([1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
   const uniformBuffer = device.createBuffer({
     size: 256, // Aligned to minUniformBufferOffsetAlignment
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -230,7 +224,7 @@ export async function renderDirectTriangleReference(device, width = 64, height =
   encoder.copyTextureToBuffer(
     { texture: targetTexture },
     { buffer: readbackBuffer, bytesPerRow, rowsPerImage: height },
-    [width, height, 1]
+    [width, height, 1],
   );
 
   device.queue.submit([encoder.finish()]);
@@ -310,12 +304,14 @@ export async function renderDirectRedABlueBReference(device, width = 32, height 
 
   // Pass A -> Target A using dynamic offset 0 (Red)
   const passA = encoder.beginRenderPass({
-    colorAttachments: [{
-      view: targetA.createView(),
-      clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
-      loadOp: "clear",
-      storeOp: "store",
-    }],
+    colorAttachments: [
+      {
+        view: targetA.createView(),
+        clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
+        loadOp: "clear",
+        storeOp: "store",
+      },
+    ],
   });
   passA.setPipeline(pipeline);
   passA.setBindGroup(0, bindGroup, [0]);
@@ -324,20 +320,30 @@ export async function renderDirectRedABlueBReference(device, width = 32, height 
 
   // Pass B -> Target B using dynamic offset 256 (Blue)
   const passB = encoder.beginRenderPass({
-    colorAttachments: [{
-      view: targetB.createView(),
-      clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
-      loadOp: "clear",
-      storeOp: "store",
-    }],
+    colorAttachments: [
+      {
+        view: targetB.createView(),
+        clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
+        loadOp: "clear",
+        storeOp: "store",
+      },
+    ],
   });
   passB.setPipeline(pipeline);
   passB.setBindGroup(0, bindGroup, [256]);
   passB.draw(6, 1, 0, 0);
   passB.end();
 
-  encoder.copyTextureToBuffer({ texture: targetA }, { buffer: readbackA, bytesPerRow, rowsPerImage: height }, [width, height, 1]);
-  encoder.copyTextureToBuffer({ texture: targetB }, { buffer: readbackB, bytesPerRow, rowsPerImage: height }, [width, height, 1]);
+  encoder.copyTextureToBuffer(
+    { texture: targetA },
+    { buffer: readbackA, bytesPerRow, rowsPerImage: height },
+    [width, height, 1],
+  );
+  encoder.copyTextureToBuffer(
+    { texture: targetB },
+    { buffer: readbackB, bytesPerRow, rowsPerImage: height },
+    [width, height, 1],
+  );
 
   // Single submission for both passes
   device.queue.submit([encoder.finish()]);
@@ -417,9 +423,7 @@ export async function renderDirectBundleDirectReference(device, width = 64, heig
 
   // Vertex buffer 1: Triangle 1 (left side)
   const tri1Data = new Float32Array([
-    -1.0, -1.0, 0.0,  0.0, 0.0,
-     0.0, -1.0, 0.0,  0.5, 0.0,
-     0.0,  1.0, 0.0,  0.5, 1.0,
+    -1.0, -1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.5, 0.0, 0.0, 1.0, 0.0, 0.5, 1.0,
   ]);
   const vb1 = device.createBuffer({
     size: tri1Data.byteLength,
@@ -429,9 +433,7 @@ export async function renderDirectBundleDirectReference(device, width = 64, heig
 
   // Vertex buffer 2: Triangle 2 (right side)
   const tri2Data = new Float32Array([
-     0.0, -1.0, 0.0,  0.5, 0.0,
-     1.0, -1.0, 0.0,  1.0, 0.0,
-     1.0,  1.0, 0.0,  1.0, 1.0,
+    0.0, -1.0, 0.0, 0.5, 0.0, 1.0, -1.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0,
   ]);
   const vb2 = device.createBuffer({
     size: tri2Data.byteLength,
@@ -457,12 +459,14 @@ export async function renderDirectBundleDirectReference(device, width = 64, heig
 
   const encoder = device.createCommandEncoder();
   const pass = encoder.beginRenderPass({
-    colorAttachments: [{
-      view: target.createView(),
-      clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
-      loadOp: "clear",
-      storeOp: "store",
-    }],
+    colorAttachments: [
+      {
+        view: target.createView(),
+        clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
+        loadOp: "clear",
+        storeOp: "store",
+      },
+    ],
   });
 
   // Step 1: Execute bundle (draws Green left triangle).
@@ -480,7 +484,11 @@ export async function renderDirectBundleDirectReference(device, width = 64, heig
 
   pass.end();
 
-  encoder.copyTextureToBuffer({ texture: target }, { buffer: readback, bytesPerRow, rowsPerImage: height }, [width, height, 1]);
+  encoder.copyTextureToBuffer(
+    { texture: target },
+    { buffer: readback, bytesPerRow, rowsPerImage: height },
+    [width, height, 1],
+  );
   device.queue.submit([encoder.finish()]);
 
   const pixels = await readbackGpuBuffer(device, readback, bytesPerRow * height);
@@ -502,9 +510,16 @@ export async function renderDirectBundleDirectReference(device, width = 64, heig
  * - Right side (x=48, y=32): Blue [0, 0, 255, 255]
  * - Background (x=2, y=2): Black [0, 0, 0, 255]
  */
-export function assertBundleDirectDrawMatch(candidatePixels, oraclePixels, width = 64, height = 64) {
+export function assertBundleDirectDrawMatch(
+  candidatePixels,
+  oraclePixels,
+  width = 64,
+  height = 64,
+) {
   if (candidatePixels.byteLength !== oraclePixels.byteLength) {
-    throw new Error(`assertBundleDirectDrawMatch: byte length mismatch (candidate=${candidatePixels.byteLength}, oracle=${oraclePixels.byteLength})`);
+    throw new Error(
+      `assertBundleDirectDrawMatch: byte length mismatch (candidate=${candidatePixels.byteLength}, oracle=${oraclePixels.byteLength})`,
+    );
   }
   let diffCount = 0;
   for (let i = 0; i < candidatePixels.length; i++) {
@@ -513,7 +528,9 @@ export function assertBundleDirectDrawMatch(candidatePixels, oraclePixels, width
     }
   }
   if (diffCount > 0) {
-    throw new Error(`assertBundleDirectDrawMatch: detected ${diffCount} mismatched bytes out of ${candidatePixels.length}`);
+    throw new Error(
+      `assertBundleDirectDrawMatch: detected ${diffCount} mismatched bytes out of ${candidatePixels.length}`,
+    );
   }
 
   const bytesPerRow = computeAlignedBytesPerRow(width);
@@ -526,7 +543,7 @@ export function assertBundleDirectDrawMatch(candidatePixels, oraclePixels, width
   const ga = candidatePixels[greenIdx + 3];
   if (gr > 5 || gg < 250 || gb > 5 || ga < 250) {
     throw new Error(
-      `Bundle-Then-Direct Draw sample violation at (16, 32): expected Green [0, 255, 0, 255], observed [${gr}, ${gg}, ${gb}, ${ga}]`
+      `Bundle-Then-Direct Draw sample violation at (16, 32): expected Green [0, 255, 0, 255], observed [${gr}, ${gg}, ${gb}, ${ga}]`,
     );
   }
 
@@ -538,7 +555,7 @@ export function assertBundleDirectDrawMatch(candidatePixels, oraclePixels, width
   const ba = candidatePixels[blueIdx + 3];
   if (br > 5 || bg > 5 || bb < 250 || ba < 250) {
     throw new Error(
-      `Bundle-Then-Direct Draw sample violation at (48, 32): expected Blue [0, 0, 255, 255], observed [${br}, ${bg}, ${bb}, ${ba}]`
+      `Bundle-Then-Direct Draw sample violation at (48, 32): expected Blue [0, 0, 255, 255], observed [${br}, ${bg}, ${bb}, ${ba}]`,
     );
   }
 
@@ -550,7 +567,7 @@ export function assertBundleDirectDrawMatch(candidatePixels, oraclePixels, width
   const ka = candidatePixels[blackIdx + 3];
   if (kr > 5 || kg > 5 || kb > 5 || ka < 250) {
     throw new Error(
-      `Bundle-Then-Direct Draw sample violation at (2, 2): expected Black [0, 0, 0, 255], observed [${kr}, ${kg}, ${kb}, ${ka}]`
+      `Bundle-Then-Direct Draw sample violation at (2, 2): expected Black [0, 0, 0, 255], observed [${kr}, ${kg}, ${kb}, ${ka}]`,
     );
   }
 }
@@ -565,8 +582,8 @@ export function evalDirectAffineTransform(matrixColumnMajor, point) {
   // r1: [e1, e5, e9,  e13]
   // r2: [e2, e6, e10, e14]
   const v = [point[0], point[1], point[2], 1.0];
-  const x = e[0] * v[0] + e[4] * v[1] + e[8]  * v[2] + e[12] * v[3];
-  const y = e[1] * v[0] + e[5] * v[1] + e[9]  * v[2] + e[13] * v[3];
+  const x = e[0] * v[0] + e[4] * v[1] + e[8] * v[2] + e[12] * v[3];
+  const y = e[1] * v[0] + e[5] * v[1] + e[9] * v[2] + e[13] * v[3];
   const z = e[2] * v[0] + e[6] * v[1] + e[10] * v[2] + e[14] * v[3];
   return [x, y, z];
 }
@@ -584,7 +601,7 @@ export function assertGenerationalHandlePublication(checkFn, resourceId, generat
   const isValid = checkFn(resourceId, generation);
   if (!isValid) {
     throw new Error(
-      `Generational Handle Publication Rejected: Resource handle (id=${resourceId}, generation=${generation}) is invalid, stale, or revoked!`
+      `Generational Handle Publication Rejected: Resource handle (id=${resourceId}, generation=${generation}) is invalid, stale, or revoked!`,
     );
   }
   return true;
@@ -602,7 +619,7 @@ export function assertMemoryGrowthAllowed(growFn, pages = 1) {
   const allowed = growFn(pages);
   if (!allowed) {
     throw new Error(
-      `Linear Memory Borrow Violation: Attempted linear memory growth (${pages} pages) while an active borrow scope is held!`
+      `Linear Memory Borrow Violation: Attempted linear memory growth (${pages} pages) while an active borrow scope is held!`,
     );
   }
   return true;
@@ -621,13 +638,14 @@ export function assertAffineRowsLayoutValid(validateFn, bytes) {
   }
   const code = validateFn(bytes);
   if (code !== 0) {
-    const reason = code === 1
-      ? "BufferTooSmall (length < 48 or 49..63 bytes)"
-      : code === 2
-      ? "NonAffineMatrix (perspective elements non-zero, invalid scale, or non-finite)"
-      : code === 4
-      ? "IncompatibleTargetLayout (length > 64 bytes)"
-      : `LayoutError code ${code}`;
+    const reason =
+      code === 1
+        ? "BufferTooSmall (length < 48 or 49..63 bytes)"
+        : code === 2
+          ? "NonAffineMatrix (perspective elements non-zero, invalid scale, or non-finite)"
+          : code === 4
+            ? "IncompatibleTargetLayout (length > 64 bytes)"
+            : `LayoutError code ${code}`;
     throw new Error(`AffineRows Layout Validation Rejected: ${reason} (code=${code})`);
   }
   return true;
@@ -652,7 +670,7 @@ export function assertAffineRowsTransformMatch(candidatePixels, width = 64, heig
   const ga = candidatePixels[c48_32 + 3];
   if (gr > 5 || gg < 250 || gb > 5 || ga < 250) {
     throw new Error(
-      `AffineRows WGSL sample violation at transformed center (48, 32): expected Green [0, 255, 0, 255], observed [${gr}, ${gg}, ${gb}, ${ga}]`
+      `AffineRows WGSL sample violation at transformed center (48, 32): expected Green [0, 255, 0, 255], observed [${gr}, ${gg}, ${gb}, ${ga}]`,
     );
   }
 
@@ -664,31 +682,47 @@ export function assertAffineRowsTransformMatch(candidatePixels, width = 64, heig
   const ua = candidatePixels[c32_32 + 3];
   if (ur > 5 || ug > 5 || ub > 5 || ua < 250) {
     throw new Error(
-      `AffineRows WGSL sample violation at untransformed center (32, 32): expected Black [0, 0, 0, 255], observed [${ur}, ${ug}, ${ub}, ${ua}]`
+      `AffineRows WGSL sample violation at untransformed center (32, 32): expected Black [0, 0, 0, 255], observed [${ur}, ${ug}, ${ub}, ${ua}]`,
     );
   }
 
   // 3. Left background (16, 32)
   const c16_32 = 32 * bytesPerRow + 16 * 4;
-  if (candidatePixels[c16_32] > 5 || candidatePixels[c16_32 + 1] > 5 || candidatePixels[c16_32 + 2] > 5) {
+  if (
+    candidatePixels[c16_32] > 5 ||
+    candidatePixels[c16_32 + 1] > 5 ||
+    candidatePixels[c16_32 + 2] > 5
+  ) {
     throw new Error(`AffineRows WGSL sample violation at (16, 32): expected Black background`);
   }
 
   // 4. Right background (60, 32)
   const c60_32 = 32 * bytesPerRow + 60 * 4;
-  if (candidatePixels[c60_32] > 5 || candidatePixels[c60_32 + 1] > 5 || candidatePixels[c60_32 + 2] > 5) {
+  if (
+    candidatePixels[c60_32] > 5 ||
+    candidatePixels[c60_32 + 1] > 5 ||
+    candidatePixels[c60_32 + 2] > 5
+  ) {
     throw new Error(`AffineRows WGSL sample violation at (60, 32): expected Black background`);
   }
 
   // 5. Above top vertex (48, 20)
   const c48_20 = 20 * bytesPerRow + 48 * 4;
-  if (candidatePixels[c48_20] > 5 || candidatePixels[c48_20 + 1] > 5 || candidatePixels[c48_20 + 2] > 5) {
+  if (
+    candidatePixels[c48_20] > 5 ||
+    candidatePixels[c48_20 + 1] > 5 ||
+    candidatePixels[c48_20 + 2] > 5
+  ) {
     throw new Error(`AffineRows WGSL sample violation at (48, 20): expected Black background`);
   }
 
   // 6. Below bottom edge (48, 44)
   const c48_44 = 44 * bytesPerRow + 48 * 4;
-  if (candidatePixels[c48_44] > 5 || candidatePixels[c48_44 + 1] > 5 || candidatePixels[c48_44 + 2] > 5) {
+  if (
+    candidatePixels[c48_44] > 5 ||
+    candidatePixels[c48_44 + 1] > 5 ||
+    candidatePixels[c48_44 + 2] > 5
+  ) {
     throw new Error(`AffineRows WGSL sample violation at (48, 44): expected Black background`);
   }
 
@@ -776,9 +810,7 @@ export async function renderDirectNestedPassReference(device, width = 64, height
 
   // Vertex buffer 1: Triangle 1 (left side, covers x in [-1, 0], samples at (24, 32))
   const tri1Data = new Float32Array([
-    -1.0, -1.0, 0.0,  0.0, 0.0,
-     0.0, -1.0, 0.0,  0.5, 0.0,
-     0.0,  1.0, 0.0,  0.5, 1.0,
+    -1.0, -1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.5, 0.0, 0.0, 1.0, 0.0, 0.5, 1.0,
   ]);
   const vb1 = device.createBuffer({
     size: tri1Data.byteLength,
@@ -788,9 +820,7 @@ export async function renderDirectNestedPassReference(device, width = 64, height
 
   // Vertex buffer 2: Triangle 2 (right side, covers x in [0, 1], samples at (56, 32))
   const tri2Data = new Float32Array([
-     0.0, -1.0, 0.0,  0.5, 0.0,
-     1.0, -1.0, 0.0,  1.0, 0.0,
-     1.0,  1.0, 0.0,  1.0, 1.0,
+    0.0, -1.0, 0.0, 0.5, 0.0, 1.0, -1.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0,
   ]);
   const vb2 = device.createBuffer({
     size: tri2Data.byteLength,
@@ -809,12 +839,14 @@ export async function renderDirectNestedPassReference(device, width = 64, height
 
   // Pass 1 on Target 10: prefix clear to black + draw Red left triangle
   const pass1 = encoder.beginRenderPass({
-    colorAttachments: [{
-      view: target10.createView(),
-      clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
-      loadOp: "clear",
-      storeOp: "store",
-    }],
+    colorAttachments: [
+      {
+        view: target10.createView(),
+        clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
+        loadOp: "clear",
+        storeOp: "store",
+      },
+    ],
   });
   pass1.setPipeline(pipeline);
   pass1.setBindGroup(0, bindGroup, [0]); // Red
@@ -824,12 +856,14 @@ export async function renderDirectNestedPassReference(device, width = 64, height
 
   // Pass 2 on Target 11: nested pass clear to black + draw Green triangle
   const pass2 = encoder.beginRenderPass({
-    colorAttachments: [{
-      view: target11.createView(),
-      clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
-      loadOp: "clear",
-      storeOp: "store",
-    }],
+    colorAttachments: [
+      {
+        view: target11.createView(),
+        clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
+        loadOp: "clear",
+        storeOp: "store",
+      },
+    ],
   });
   pass2.setPipeline(pipeline);
   pass2.setBindGroup(0, bindGroup, [512]); // Green
@@ -839,11 +873,13 @@ export async function renderDirectNestedPassReference(device, width = 64, height
 
   // Pass 3 on Target 10: resume with loadOp: "load" (preserves Red draw) + draw Blue right triangle
   const pass3 = encoder.beginRenderPass({
-    colorAttachments: [{
-      view: target10.createView(),
-      loadOp: "load",
-      storeOp: "store",
-    }],
+    colorAttachments: [
+      {
+        view: target10.createView(),
+        loadOp: "load",
+        storeOp: "store",
+      },
+    ],
   });
   pass3.setPipeline(pipeline);
   pass3.setBindGroup(0, bindGroup, [256]); // Blue
@@ -854,7 +890,7 @@ export async function renderDirectNestedPassReference(device, width = 64, height
   encoder.copyTextureToBuffer(
     { texture: target10 },
     { buffer: readback, bytesPerRow, rowsPerImage: height },
-    [width, height, 1]
+    [width, height, 1],
   );
   device.queue.submit([encoder.finish()]);
 
@@ -936,9 +972,7 @@ export async function renderDirectBrokenNestedPass(device, width = 64, height = 
   });
 
   const tri1Data = new Float32Array([
-    -1.0, -1.0, 0.0,  0.0, 0.0,
-     0.0, -1.0, 0.0,  0.5, 0.0,
-     0.0,  1.0, 0.0,  0.5, 1.0,
+    -1.0, -1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.5, 0.0, 0.0, 1.0, 0.0, 0.5, 1.0,
   ]);
   const vb1 = device.createBuffer({
     size: tri1Data.byteLength,
@@ -947,9 +981,7 @@ export async function renderDirectBrokenNestedPass(device, width = 64, height = 
   device.queue.writeBuffer(vb1, 0, tri1Data);
 
   const tri2Data = new Float32Array([
-     0.0, -1.0, 0.0,  0.5, 0.0,
-     1.0, -1.0, 0.0,  1.0, 0.0,
-     1.0,  1.0, 0.0,  1.0, 1.0,
+    0.0, -1.0, 0.0, 0.5, 0.0, 1.0, -1.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0,
   ]);
   const vb2 = device.createBuffer({
     size: tri2Data.byteLength,
@@ -968,12 +1000,14 @@ export async function renderDirectBrokenNestedPass(device, width = 64, height = 
 
   // Pass 1 on Target 10: prefix clear to black + draw Red left triangle
   const pass1 = encoder.beginRenderPass({
-    colorAttachments: [{
-      view: target10.createView(),
-      clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
-      loadOp: "clear",
-      storeOp: "store",
-    }],
+    colorAttachments: [
+      {
+        view: target10.createView(),
+        clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
+        loadOp: "clear",
+        storeOp: "store",
+      },
+    ],
   });
   pass1.setPipeline(pipeline);
   pass1.setBindGroup(0, bindGroup, [0]); // Red
@@ -983,12 +1017,14 @@ export async function renderDirectBrokenNestedPass(device, width = 64, height = 
 
   // Pass 2 on Target 11: nested pass
   const pass2 = encoder.beginRenderPass({
-    colorAttachments: [{
-      view: target11.createView(),
-      clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
-      loadOp: "clear",
-      storeOp: "store",
-    }],
+    colorAttachments: [
+      {
+        view: target11.createView(),
+        clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
+        loadOp: "clear",
+        storeOp: "store",
+      },
+    ],
   });
   pass2.setPipeline(pipeline);
   pass2.setBindGroup(0, bindGroup, [512]); // Green
@@ -999,12 +1035,14 @@ export async function renderDirectBrokenNestedPass(device, width = 64, height = 
   // Pass 3 on Target 10 - BROKEN CONTROL: Uses loadOp: "clear" instead of "load"!
   // This clears Target 10 to black, losing the Red left triangle from Pass 1.
   const pass3 = encoder.beginRenderPass({
-    colorAttachments: [{
-      view: target10.createView(),
-      clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
-      loadOp: "clear",
-      storeOp: "store",
-    }],
+    colorAttachments: [
+      {
+        view: target10.createView(),
+        clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
+        loadOp: "clear",
+        storeOp: "store",
+      },
+    ],
   });
   pass3.setPipeline(pipeline);
   pass3.setBindGroup(0, bindGroup, [256]); // Blue
@@ -1015,7 +1053,7 @@ export async function renderDirectBrokenNestedPass(device, width = 64, height = 
   encoder.copyTextureToBuffer(
     { texture: target10 },
     { buffer: readback, bytesPerRow, rowsPerImage: height },
-    [width, height, 1]
+    [width, height, 1],
   );
   device.queue.submit([encoder.finish()]);
 
@@ -1042,7 +1080,7 @@ export async function renderDirectBrokenNestedPass(device, width = 64, height = 
 export function assertNestedPassMatch(candidatePixels, oraclePixels, width = 64, height = 64) {
   if (candidatePixels.byteLength !== oraclePixels.byteLength) {
     throw new Error(
-      `assertNestedPassMatch: byte length mismatch (candidate=${candidatePixels.byteLength}, oracle=${oraclePixels.byteLength})`
+      `assertNestedPassMatch: byte length mismatch (candidate=${candidatePixels.byteLength}, oracle=${oraclePixels.byteLength})`,
     );
   }
   let diffCount = 0;
@@ -1053,7 +1091,7 @@ export function assertNestedPassMatch(candidatePixels, oraclePixels, width = 64,
   }
   if (diffCount > 0) {
     throw new Error(
-      `assertNestedPassMatch: detected ${diffCount} mismatched bytes out of ${candidatePixels.length}`
+      `assertNestedPassMatch: detected ${diffCount} mismatched bytes out of ${candidatePixels.length}`,
     );
   }
 
@@ -1067,7 +1105,7 @@ export function assertNestedPassMatch(candidatePixels, oraclePixels, width = 64,
   const ra = candidatePixels[redIdx + 3];
   if (rr < 250 || rg > 5 || rb > 5 || ra < 250) {
     throw new Error(
-      `Nested Pass sample violation at (24, 32): expected Red [255, 0, 0, 255] (preserved across resume with loadOp load), observed [${rr}, ${rg}, ${rb}, ${ra}]`
+      `Nested Pass sample violation at (24, 32): expected Red [255, 0, 0, 255] (preserved across resume with loadOp load), observed [${rr}, ${rg}, ${rb}, ${ra}]`,
     );
   }
 
@@ -1079,7 +1117,7 @@ export function assertNestedPassMatch(candidatePixels, oraclePixels, width = 64,
   const ba = candidatePixels[blueIdx + 3];
   if (br > 5 || bg > 5 || bb < 250 || ba < 250) {
     throw new Error(
-      `Nested Pass sample violation at (56, 32): expected Blue [0, 0, 255, 255], observed [${br}, ${bg}, ${bb}, ${ba}]`
+      `Nested Pass sample violation at (56, 32): expected Blue [0, 0, 255, 255], observed [${br}, ${bg}, ${bb}, ${ba}]`,
     );
   }
 
@@ -1091,7 +1129,7 @@ export function assertNestedPassMatch(candidatePixels, oraclePixels, width = 64,
   const bga = candidatePixels[bgIdx + 3];
   if (bgr > 5 || bgg > 5 || bgb > 5 || bga < 250) {
     throw new Error(
-      `Nested Pass sample violation at (2, 2): expected Black [0, 0, 0, 255], observed [${bgr}, ${bgg}, ${bgb}, ${bga}]`
+      `Nested Pass sample violation at (2, 2): expected Black [0, 0, 0, 255], observed [${bgr}, ${bgg}, ${bgb}, ${bga}]`,
     );
   }
 
@@ -1159,9 +1197,7 @@ export async function renderDirectNestedCanvasOffscreenReference(device, width =
 
   // Triangle 1: left half of viewport, covers x in [-1, 0]
   const tri1Data = new Float32Array([
-    -1.0, -1.0, 0.0,  0.0, 0.0,
-     0.0, -1.0, 0.0,  0.5, 0.0,
-     0.0,  1.0, 0.0,  0.5, 1.0,
+    -1.0, -1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.5, 0.0, 0.0, 1.0, 0.0, 0.5, 1.0,
   ]);
   const vb1 = device.createBuffer({
     size: tri1Data.byteLength,
@@ -1180,12 +1216,14 @@ export async function renderDirectNestedCanvasOffscreenReference(device, width =
 
   // Render pass on Target 11: clear to black + draw Green tri1
   const pass = encoder.beginRenderPass({
-    colorAttachments: [{
-      view: target11.createView(),
-      clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
-      loadOp: "clear",
-      storeOp: "store",
-    }],
+    colorAttachments: [
+      {
+        view: target11.createView(),
+        clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
+        loadOp: "clear",
+        storeOp: "store",
+      },
+    ],
   });
   pass.setPipeline(pipeline);
   pass.setBindGroup(0, bindGroup);
@@ -1196,7 +1234,7 @@ export async function renderDirectNestedCanvasOffscreenReference(device, width =
   encoder.copyTextureToBuffer(
     { texture: target11 },
     { buffer: readback, bytesPerRow, rowsPerImage: height },
-    [width, height, 1]
+    [width, height, 1],
   );
   device.queue.submit([encoder.finish()]);
 
@@ -1218,10 +1256,15 @@ export async function renderDirectNestedCanvasOffscreenReference(device, width =
  * - Right side (x=56, y=32): Black [0, 0, 0, 255] (outside tri1 on target 11)
  * - Background (x=2, y=2): Black [0, 0, 0, 255] (clear background)
  */
-export function assertNestedCanvasPassMatch(candidatePixels, oraclePixels, width = 64, height = 64) {
+export function assertNestedCanvasPassMatch(
+  candidatePixels,
+  oraclePixels,
+  width = 64,
+  height = 64,
+) {
   if (candidatePixels.byteLength !== oraclePixels.byteLength) {
     throw new Error(
-      `assertNestedCanvasPassMatch: byte length mismatch (candidate=${candidatePixels.byteLength}, oracle=${oraclePixels.byteLength})`
+      `assertNestedCanvasPassMatch: byte length mismatch (candidate=${candidatePixels.byteLength}, oracle=${oraclePixels.byteLength})`,
     );
   }
 
@@ -1234,7 +1277,7 @@ export function assertNestedCanvasPassMatch(candidatePixels, oraclePixels, width
   }
   if (diffCount > 0) {
     throw new Error(
-      `assertNestedCanvasPassMatch: detected ${diffCount} mismatched bytes out of ${candidatePixels.length} against direct-JS oracle`
+      `assertNestedCanvasPassMatch: detected ${diffCount} mismatched bytes out of ${candidatePixels.length} against direct-JS oracle`,
     );
   }
 
@@ -1248,7 +1291,7 @@ export function assertNestedCanvasPassMatch(candidatePixels, oraclePixels, width
   const ga = candidatePixels[greenIdx + 3];
   if (gr > 5 || gg < 250 || gb > 5 || ga < 250) {
     throw new Error(
-      `Nested Canvas Pass sample violation at (24, 32): expected Green [0, 255, 0, 255], observed [${gr}, ${gg}, ${gb}, ${ga}]`
+      `Nested Canvas Pass sample violation at (24, 32): expected Green [0, 255, 0, 255], observed [${gr}, ${gg}, ${gb}, ${ga}]`,
     );
   }
 
@@ -1260,7 +1303,7 @@ export function assertNestedCanvasPassMatch(candidatePixels, oraclePixels, width
   const ra = candidatePixels[rightIdx + 3];
   if (rr > 5 || rg > 5 || rb > 5 || ra < 250) {
     throw new Error(
-      `Nested Canvas Pass sample violation at (56, 32): expected Black [0, 0, 0, 255], observed [${rr}, ${rg}, ${rb}, ${ra}]`
+      `Nested Canvas Pass sample violation at (56, 32): expected Black [0, 0, 0, 255], observed [${rr}, ${rg}, ${rb}, ${ra}]`,
     );
   }
 
@@ -1272,7 +1315,7 @@ export function assertNestedCanvasPassMatch(candidatePixels, oraclePixels, width
   const bga = candidatePixels[bgIdx + 3];
   if (bgr > 5 || bgg > 5 || bgb > 5 || bga < 250) {
     throw new Error(
-      `Nested Canvas Pass sample violation at (2, 2): expected Black [0, 0, 0, 255], observed [${bgr}, ${bgg}, ${bgb}, ${bga}]`
+      `Nested Canvas Pass sample violation at (2, 2): expected Black [0, 0, 0, 255], observed [${bgr}, ${bgg}, ${bgb}, ${bga}]`,
     );
   }
 

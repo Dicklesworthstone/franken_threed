@@ -37,7 +37,7 @@ export function borrowPacketView(wasmMemory, ptr, len) {
   }
   if (ptr + len > wasmMemory.buffer.byteLength) {
     throw new RangeError(
-      `borrowPacketView: range out of bounds (ptr ${ptr} + len ${len} > buffer ${wasmMemory.buffer.byteLength})`
+      `borrowPacketView: range out of bounds (ptr ${ptr} + len ${len} > buffer ${wasmMemory.buffer.byteLength})`,
     );
   }
 

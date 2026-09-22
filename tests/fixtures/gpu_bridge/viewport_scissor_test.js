@@ -1,8 +1,8 @@
 import {
+  OPCODE_SET_SCISSOR_RECT,
+  OPCODE_SET_VIEWPORT,
   PACKET_MAGIC,
   PACKET_VERSION,
-  OPCODE_SET_VIEWPORT,
-  OPCODE_SET_SCISSOR_RECT,
   WebGpuBridgeHost,
 } from "./bridge_runtime.js";
 
@@ -57,15 +57,17 @@ async function renderDirectViewportScissorReference(device, width, height) {
   });
 
   const bindGroupLayout = device.createBindGroupLayout({
-    entries: [{
-      binding: 0,
-      visibility: GPUShaderStage.FRAGMENT,
-      buffer: {
-        type: "uniform",
-        hasDynamicOffset: true,
-        minBindingSize: 16,
+    entries: [
+      {
+        binding: 0,
+        visibility: GPUShaderStage.FRAGMENT,
+        buffer: {
+          type: "uniform",
+          hasDynamicOffset: true,
+          minBindingSize: 16,
+        },
       },
-    }],
+    ],
   });
 
   const pipelineLayout = device.createPipelineLayout({
@@ -77,13 +79,15 @@ async function renderDirectViewportScissorReference(device, width, height) {
     vertex: {
       module: shaderModule,
       entryPoint: "vs_main",
-      buffers: [{
-        arrayStride: 20,
-        attributes: [
-          { shaderLocation: 0, offset: 0, format: "float32x3" },
-          { shaderLocation: 1, offset: 12, format: "float32x2" },
-        ],
-      }],
+      buffers: [
+        {
+          arrayStride: 20,
+          attributes: [
+            { shaderLocation: 0, offset: 0, format: "float32x3" },
+            { shaderLocation: 1, offset: 12, format: "float32x2" },
+          ],
+        },
+      ],
     },
     fragment: {
       module: shaderModule,
@@ -97,9 +101,7 @@ async function renderDirectViewportScissorReference(device, width, height) {
 
   // Tri1: covers x in [-1, 0] (left half)
   const vb1Data = new Float32Array([
-    -1.0, -1.0, 0.0, 0.0, 0.0,
-     0.0, -1.0, 0.0, 0.5, 0.0,
-     0.0,  1.0, 0.0, 0.5, 1.0,
+    -1.0, -1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.5, 0.0, 0.0, 1.0, 0.0, 0.5, 1.0,
   ]);
   const vb1 = device.createBuffer({
     size: vb1Data.byteLength,
@@ -109,9 +111,7 @@ async function renderDirectViewportScissorReference(device, width, height) {
 
   // Tri2: covers x in [0, 1] (right half)
   const vb2Data = new Float32Array([
-    0.0, -1.0, 0.0, 0.5, 0.0,
-    1.0, -1.0, 0.0, 1.0, 0.0,
-    1.0,  1.0, 0.0, 1.0, 1.0,
+    0.0, -1.0, 0.0, 0.5, 0.0, 1.0, -1.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0,
   ]);
   const vb2 = device.createBuffer({
     size: vb2Data.byteLength,
@@ -124,9 +124,18 @@ async function renderDirectViewportScissorReference(device, width, height) {
   // Slot 1 (offset 256): Blue [0, 0, 1, 1]
   // Slot 2 (offset 512): Green [0, 1, 0, 1]
   const uniformData = new Float32Array(768 / 4);
-  uniformData[0] = 1.0; uniformData[1] = 0.0; uniformData[2] = 0.0; uniformData[3] = 1.0;
-  uniformData[64] = 0.0; uniformData[65] = 0.0; uniformData[66] = 1.0; uniformData[67] = 1.0;
-  uniformData[128] = 0.0; uniformData[129] = 1.0; uniformData[130] = 0.0; uniformData[131] = 1.0;
+  uniformData[0] = 1.0;
+  uniformData[1] = 0.0;
+  uniformData[2] = 0.0;
+  uniformData[3] = 1.0;
+  uniformData[64] = 0.0;
+  uniformData[65] = 0.0;
+  uniformData[66] = 1.0;
+  uniformData[67] = 1.0;
+  uniformData[128] = 0.0;
+  uniformData[129] = 1.0;
+  uniformData[130] = 0.0;
+  uniformData[131] = 1.0;
 
   const uniformBuf = device.createBuffer({
     size: 768,
@@ -136,26 +145,30 @@ async function renderDirectViewportScissorReference(device, width, height) {
 
   const bindGroup = device.createBindGroup({
     layout: bindGroupLayout,
-    entries: [{
-      binding: 0,
-      resource: {
-        buffer: uniformBuf,
-        offset: 0,
-        size: 16,
+    entries: [
+      {
+        binding: 0,
+        resource: {
+          buffer: uniformBuf,
+          offset: 0,
+          size: 16,
+        },
       },
-    }],
+    ],
   });
 
   const encoder = device.createCommandEncoder();
 
   // Pass 1: Outer prefix on Target 10 (clear to black)
   const pass1 = encoder.beginRenderPass({
-    colorAttachments: [{
-      view: target10.createView(),
-      clearValue: { r: 0, g: 0, b: 0, a: 1 },
-      loadOp: "clear",
-      storeOp: "store",
-    }],
+    colorAttachments: [
+      {
+        view: target10.createView(),
+        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+        loadOp: "clear",
+        storeOp: "store",
+      },
+    ],
   });
   pass1.setPipeline(pipeline);
   pass1.setBindGroup(0, bindGroup, [0]); // dynamic offset 0 = Red
@@ -167,12 +180,14 @@ async function renderDirectViewportScissorReference(device, width, height) {
 
   // Pass 2: Nested inner pass on Target 11 (clear to black)
   const pass2 = encoder.beginRenderPass({
-    colorAttachments: [{
-      view: target11.createView(),
-      clearValue: { r: 0, g: 0, b: 0, a: 1 },
-      loadOp: "clear",
-      storeOp: "store",
-    }],
+    colorAttachments: [
+      {
+        view: target11.createView(),
+        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+        loadOp: "clear",
+        storeOp: "store",
+      },
+    ],
   });
   pass2.setPipeline(pipeline);
   pass2.setBindGroup(0, bindGroup, [512]); // dynamic offset 512 = Green
@@ -184,11 +199,13 @@ async function renderDirectViewportScissorReference(device, width, height) {
 
   // Pass 3: Outer resumed pass on Target 10 (LoadOp::Load)
   const pass3 = encoder.beginRenderPass({
-    colorAttachments: [{
-      view: target10.createView(),
-      loadOp: "load",
-      storeOp: "store",
-    }],
+    colorAttachments: [
+      {
+        view: target10.createView(),
+        loadOp: "load",
+        storeOp: "store",
+      },
+    ],
   });
   pass3.setPipeline(pipeline);
   pass3.setBindGroup(0, bindGroup, [256]); // dynamic offset 256 = Blue
@@ -201,20 +218,17 @@ async function renderDirectViewportScissorReference(device, width, height) {
   encoder.copyTextureToBuffer(
     { texture: target10 },
     { buffer: readback10, bytesPerRow, rowsPerImage: height },
-    [width, height, 1]
+    [width, height, 1],
   );
   encoder.copyTextureToBuffer(
     { texture: target11 },
     { buffer: readback11, bytesPerRow, rowsPerImage: height },
-    [width, height, 1]
+    [width, height, 1],
   );
 
   device.queue.submit([encoder.finish()]);
 
-  await Promise.all([
-    readback10.mapAsync(GPUMapMode.READ),
-    readback11.mapAsync(GPUMapMode.READ),
-  ]);
+  await Promise.all([readback10.mapAsync(GPUMapMode.READ), readback11.mapAsync(GPUMapMode.READ)]);
   const copy10 = new Uint8Array(readback10.getMappedRange(0, bytesPerRow * height).slice(0));
   const copy11 = new Uint8Array(readback11.getMappedRange(0, bytesPerRow * height).slice(0));
   readback10.unmap();
@@ -285,7 +299,9 @@ function mutateRustScissorPacket(originalBytes, scissorIndex, newWidth = 0) {
   }
 
   if (scissorOffsets.length <= scissorIndex) {
-    throw new Error(`Expected at least ${scissorIndex + 1} SET_SCISSOR_RECT commands in Rust packet, found ${scissorOffsets.length}`);
+    throw new Error(
+      `Expected at least ${scissorIndex + 1} SET_SCISSOR_RECT commands in Rust packet, found ${scissorOffsets.length}`,
+    );
   }
 
   // Mutate the requested scissor command: set width
@@ -302,7 +318,9 @@ export async function testViewportScissor(host, wasmPacketFn) {
 
   // 1. Missing Rust packet function is an immediate honest failure
   if (typeof wasmPacketFn !== "function") {
-    throw new Error("testViewportScissor: missing required Rust packet function (gpu_bridge_build_nested_viewport_scissor_packet)");
+    throw new Error(
+      "testViewportScissor: missing required Rust packet function (gpu_bridge_build_nested_viewport_scissor_packet)",
+    );
   }
 
   const width = 64;
@@ -320,7 +338,9 @@ export async function testViewportScissor(host, wasmPacketFn) {
     }
   }
   if (!rejectedViewport) {
-    throw new Error("Negative control failed: SetViewport outside active render pass was not rejected");
+    throw new Error(
+      "Negative control failed: SetViewport outside active render pass was not rejected",
+    );
   }
 
   let rejectedScissor = false;
@@ -332,13 +352,17 @@ export async function testViewportScissor(host, wasmPacketFn) {
     }
   }
   if (!rejectedScissor) {
-    throw new Error("Negative control failed: SetScissorRect outside active render pass was not rejected");
+    throw new Error(
+      "Negative control failed: SetScissorRect outside active render pass was not rejected",
+    );
   }
 
   // 3. Obtain real Rust submission packet
   const rustPacket = wasmPacketFn();
   if (!(rustPacket instanceof Uint8Array) || rustPacket.byteLength === 0) {
-    throw new Error("Rust Wasm viewport/scissor packet generator returned empty or non-Uint8Array packet");
+    throw new Error(
+      "Rust Wasm viewport/scissor packet generator returned empty or non-Uint8Array packet",
+    );
   }
 
   // 4. Render independent direct WebGPU reference (both Target 10 and inner Target 11)
@@ -350,7 +374,9 @@ export async function testViewportScissor(host, wasmPacketFn) {
   // 5a. Verify Target 10 (Buffer 20: outer prefix + resumed pass)
   const bridgePixels10 = await host.readbackBuffer(20, readbackSize);
   if (bridgePixels10.byteLength !== direct.target10Pixels.byteLength) {
-    throw new Error(`Length mismatch on Target 10: bridge ${bridgePixels10.byteLength} vs direct ${direct.target10Pixels.byteLength}`);
+    throw new Error(
+      `Length mismatch on Target 10: bridge ${bridgePixels10.byteLength} vs direct ${direct.target10Pixels.byteLength}`,
+    );
   }
 
   let diffCount10 = 0;
@@ -363,33 +389,49 @@ export async function testViewportScissor(host, wasmPacketFn) {
     throw new Error("Rendered image on Target 10 is completely empty/black");
   }
   if (diffCount10 > 0) {
-    throw new Error(`Pixel mismatch on Target 10 between bridge and direct reference: ${diffCount10} differences`);
+    throw new Error(
+      `Pixel mismatch on Target 10 between bridge and direct reference: ${diffCount10} differences`,
+    );
   }
 
   // Spatial sample points on Target 10:
   // - (24, 32): inside left-half scissor [0, 0, 32, 64] and tri1 -> Red
   const offsetLeft = 32 * bytesPerRow + 24 * 4;
   if (bridgePixels10[offsetLeft] < 200 || bridgePixels10[offsetLeft + 2] > 50) {
-    throw new Error(`Target 10 sample (24, 32) expected Red, got [${bridgePixels10.slice(offsetLeft, offsetLeft + 4)}]`);
+    throw new Error(
+      `Target 10 sample (24, 32) expected Red, got [${bridgePixels10.slice(offsetLeft, offsetLeft + 4)}]`,
+    );
   }
   // - (56, 32): inside resumed right-half scissor [32, 0, 32, 64] and tri2 -> Blue
   const offsetRight = 32 * bytesPerRow + 56 * 4;
   if (bridgePixels10[offsetRight + 2] < 200 || bridgePixels10[offsetRight] > 50) {
-    throw new Error(`Target 10 sample (56, 32) expected Blue, got [${bridgePixels10.slice(offsetRight, offsetRight + 4)}]`);
+    throw new Error(
+      `Target 10 sample (56, 32) expected Blue, got [${bridgePixels10.slice(offsetRight, offsetRight + 4)}]`,
+    );
   }
   // - (2, 2): outside triangles -> Black (clear color)
   const offsetClear = 2 * bytesPerRow + 2 * 4;
-  if (bridgePixels10[offsetClear] !== 0 || bridgePixels10[offsetClear + 1] !== 0 || bridgePixels10[offsetClear + 2] !== 0) {
-    throw new Error(`Target 10 sample (2, 2) expected Black clear, got [${bridgePixels10.slice(offsetClear, offsetClear + 4)}]`);
+  if (
+    bridgePixels10[offsetClear] !== 0 ||
+    bridgePixels10[offsetClear + 1] !== 0 ||
+    bridgePixels10[offsetClear + 2] !== 0
+  ) {
+    throw new Error(
+      `Target 10 sample (2, 2) expected Black clear, got [${bridgePixels10.slice(offsetClear, offsetClear + 4)}]`,
+    );
   }
 
   // 5b. Verify inner Target 11 (Buffer 21: nested inner pass per Mail 7734)
   if (!host.buffers.has(21)) {
-    throw new Error("testViewportScissor: packet does not create readback buffer 21 for inner target 11");
+    throw new Error(
+      "testViewportScissor: packet does not create readback buffer 21 for inner target 11",
+    );
   }
   const bridgePixels11 = await host.readbackBuffer(21, readbackSize);
   if (bridgePixels11.byteLength !== direct.target11Pixels.byteLength) {
-    throw new Error(`Length mismatch on Target 11: bridge ${bridgePixels11.byteLength} vs direct ${direct.target11Pixels.byteLength}`);
+    throw new Error(
+      `Length mismatch on Target 11: bridge ${bridgePixels11.byteLength} vs direct ${direct.target11Pixels.byteLength}`,
+    );
   }
 
   let diffCount11 = 0;
@@ -399,25 +441,47 @@ export async function testViewportScissor(host, wasmPacketFn) {
     if (bridgePixels11[i] !== direct.target11Pixels[i]) diffCount11++;
   }
   if (nonZeroCount11 === 0) {
-    throw new Error("Rendered image on inner Target 11 is completely empty/black (missing green inner rectangle)");
+    throw new Error(
+      "Rendered image on inner Target 11 is completely empty/black (missing green inner rectangle)",
+    );
   }
   if (diffCount11 > 0) {
-    throw new Error(`Pixel mismatch on inner Target 11 between bridge and direct reference: ${diffCount11} differences`);
+    throw new Error(
+      `Pixel mismatch on inner Target 11 between bridge and direct reference: ${diffCount11} differences`,
+    );
   }
 
   // Spatial sample points on Target 11:
   // - (24, 32): inside centered box [16, 16, 32, 32] and tri1 -> Green
-  if (bridgePixels11[offsetLeft + 1] < 200 || bridgePixels11[offsetLeft] > 50 || bridgePixels11[offsetLeft + 2] > 50) {
-    throw new Error(`Target 11 sample (24, 32) expected Green, got [${bridgePixels11.slice(offsetLeft, offsetLeft + 4)}]`);
+  if (
+    bridgePixels11[offsetLeft + 1] < 200 ||
+    bridgePixels11[offsetLeft] > 50 ||
+    bridgePixels11[offsetLeft + 2] > 50
+  ) {
+    throw new Error(
+      `Target 11 sample (24, 32) expected Green, got [${bridgePixels11.slice(offsetLeft, offsetLeft + 4)}]`,
+    );
   }
   // - (8, 8): outside centered box -> Black clear
   const offset8_8 = 8 * bytesPerRow + 8 * 4;
-  if (bridgePixels11[offset8_8] !== 0 || bridgePixels11[offset8_8 + 1] !== 0 || bridgePixels11[offset8_8 + 2] !== 0) {
-    throw new Error(`Target 11 sample (8, 8) expected Black clear, got [${bridgePixels11.slice(offset8_8, offset8_8 + 4)}]`);
+  if (
+    bridgePixels11[offset8_8] !== 0 ||
+    bridgePixels11[offset8_8 + 1] !== 0 ||
+    bridgePixels11[offset8_8 + 2] !== 0
+  ) {
+    throw new Error(
+      `Target 11 sample (8, 8) expected Black clear, got [${bridgePixels11.slice(offset8_8, offset8_8 + 4)}]`,
+    );
   }
   // - (56, 32): outside centered box -> Black clear
-  if (bridgePixels11[offsetRight] !== 0 || bridgePixels11[offsetRight + 1] !== 0 || bridgePixels11[offsetRight + 2] !== 0) {
-    throw new Error(`Target 11 sample (56, 32) expected Black clear, got [${bridgePixels11.slice(offsetRight, offsetRight + 4)}]`);
+  if (
+    bridgePixels11[offsetRight] !== 0 ||
+    bridgePixels11[offsetRight + 1] !== 0 ||
+    bridgePixels11[offsetRight + 2] !== 0
+  ) {
+    throw new Error(
+      `Target 11 sample (56, 32) expected Black clear, got [${bridgePixels11.slice(offsetRight, offsetRight + 4)}]`,
+    );
   }
 
   // 6. Negative controls: Planted mutations in real Rust packet must fail comparison
@@ -432,7 +496,9 @@ export async function testViewportScissor(host, wasmPacketFn) {
     if (negPixels10[i] !== direct.target10Pixels[i]) negDiff10++;
   }
   if (negDiff10 === 0) {
-    throw new Error("Negative control failed: mutated outer scissor packet unexpectedly matched direct reference on Target 10");
+    throw new Error(
+      "Negative control failed: mutated outer scissor packet unexpectedly matched direct reference on Target 10",
+    );
   }
 
   // 6b. Mutate inner nested scissor in Pass 2 (Target 11) -> must fail Target 11 comparison
@@ -446,7 +512,9 @@ export async function testViewportScissor(host, wasmPacketFn) {
     if (negPixels11[i] !== direct.target11Pixels[i]) negDiff11++;
   }
   if (negDiff11 === 0) {
-    throw new Error("Negative control failed: mutated inner scissor packet unexpectedly matched direct reference on Target 11");
+    throw new Error(
+      "Negative control failed: mutated inner scissor packet unexpectedly matched direct reference on Target 11",
+    );
   }
 
   return `Rust nested viewport/scissor packet rendered pixel-identical on outer Target 10 (${bridgePixels10.byteLength}B, verified red-left/blue-right/black-outer) and inner Target 11 (${bridgePixels11.byteLength}B, verified green-center/black-outer); planted outer mutation (${negDiff10} diffs) and inner mutation (${negDiff11} diffs) both detected`;

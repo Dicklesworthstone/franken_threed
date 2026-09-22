@@ -1,5 +1,8 @@
 import {
-  PACKET_MAGIC, PACKET_VERSION, OPCODE_RENDER_PASS, TARGET_CANVAS,
+  OPCODE_RENDER_PASS,
+  PACKET_MAGIC,
+  PACKET_VERSION,
+  TARGET_CANVAS,
 } from "./bridge_runtime.js";
 
 // Hand-authored input to the production JS decoder, not evidence of Rust lowering.
@@ -27,12 +30,16 @@ export async function testCanvasSubmissionLifetime(host) {
   const context = canvas.getContext("webgpu");
   if (!context) throw new Error("Canvas lifetime test requires a real GPUCanvasContext");
   const format = navigator.gpu.getPreferredCanvasFormat();
-  const readback = device.createBuffer({ size: 256, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  const readback = device.createBuffer({
+    size: 256,
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+  });
   const clear = canvasPass(0, 0, [1, 0, 0, 1]);
 
   try {
     await host.withErrorScopes(["validation"], () => {
-      const module = device.createShaderModule({ code: `
+      const module = device.createShaderModule({
+        code: `
         @vertex fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
           let p = array<vec2<f32>, 3>(vec2(-1., -1.), vec2(3., -1.), vec2(-1., 3.));
           return vec4(p[i], 0., 1.);
@@ -41,7 +48,8 @@ export async function testCanvasSubmissionLifetime(host) {
           if (p.x < 1.) { discard; }
           return vec4(0., 0., 1., 1.);
         }
-      ` });
+      `,
+      });
       const pipeline = device.createRenderPipeline({
         layout: "auto",
         vertex: { module, entryPoint: "vs_main" },
@@ -53,7 +61,9 @@ export async function testCanvasSubmissionLifetime(host) {
 
     async function render(load) {
       context.configure({
-        device, format, alphaMode: "opaque",
+        device,
+        format,
+        alphaMode: "opaque",
         usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
       });
       // All acquisition, encoding, submissions and the copy happen in this task.
@@ -64,13 +74,12 @@ export async function testCanvasSubmissionLifetime(host) {
       const sameTexture = texture === context.getCurrentTexture();
       const copied = host.withErrorScopes(["validation"], () => {
         const encoder = device.createCommandEncoder();
-        encoder.copyTextureToBuffer(
-          { texture }, { buffer: readback, bytesPerRow: 256 }, [2, 1, 1],
-        );
+        encoder.copyTextureToBuffer({ texture }, { buffer: readback, bytesPerRow: 256 }, [2, 1, 1]);
         device.queue.submit([encoder.finish()]);
       });
       await Promise.all([first, second, copied]);
-      if (!sameTexture) throw new Error("Canvas texture changed within one synchronous rendering interval");
+      if (!sameTexture)
+        throw new Error("Canvas texture changed within one synchronous rendering interval");
       await readback.mapAsync(GPUMapMode.READ);
       let pixels;
       try {
@@ -93,7 +102,9 @@ export async function testCanvasSubmissionLifetime(host) {
     const broken = await render(0);
     const erased = [0, 0, 0, 255, 0, 0, 255, 255];
     if (broken.some((v, i) => v !== erased[i])) {
-      throw new Error(`Canvas clear mutation did not produce the expected failing image: ${broken}`);
+      throw new Error(
+        `Canvas clear mutation did not produce the expected failing image: ${broken}`,
+      );
     }
 
     let missingRejected = false;
@@ -102,7 +113,8 @@ export async function testCanvasSubmissionLifetime(host) {
     } catch (error) {
       missingRejected = /canvas/i.test(error.message);
     }
-    if (!missingRejected) throw new Error("Canvas packet silently succeeded without a canvas context");
+    if (!missingRejected)
+      throw new Error("Canvas packet silently succeeded without a canvas context");
     return "JS host bridge: two submissions preserve red/blue canvas pixels; real clear mutation erases red; missing canvas rejected";
   } finally {
     host.pipelines.delete(pipelineId);
