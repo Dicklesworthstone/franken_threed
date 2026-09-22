@@ -294,6 +294,9 @@ export async function createGpuAnimationScene(device, pose, drawables, {
   }
   const scene = Object.freeze({pose, controller, draws: Object.freeze(meshes), deformers: Object.freeze(deformers),
     get poseVersion() { return poseVersion; },
+    get renderBundlesEnabled() { return renderer.renderBundles; },
+    get renderBundleStats() { return renderer.bundleDiagnostics; },
+    clearRenderBundles() { return exclusive(() => { renderer.clearRenderBundles(); return scene; }); },
     get deformationBatchEnabled() { return deformationBatch; },
     get deformationStats() { return deformationStats; },
     get deformationInputCacheBytes() { return disposed || terminal ? 0 : computeDeformers.reduce((n, gpu) => n + (gpu.inputCacheBytes ?? 0), 0); },

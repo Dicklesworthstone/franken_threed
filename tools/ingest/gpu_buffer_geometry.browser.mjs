@@ -10,7 +10,7 @@ function attribute(array, itemSize) {
   return {array, itemSize, count: array.length/itemSize, version: 0, updateRanges: [],
     normalized: false, onUploadCallback() {}, clearUpdateRanges() { this.updateRanges.length=0; }};
 }
-export async function runBufferGeometryRenderChecks(device) {
+export async function runBufferGeometryRenderChecks(device, {renderBundles = false} = {}) {
   const results=[], resources=[], errors=[];
   const own = x => { resources.push(x); return x; };
   const onError = event => errors.push(event.error?.message ?? String(event));
@@ -37,7 +37,7 @@ export async function runBufferGeometryRenderChecks(device) {
       const index=attribute(new Uint16Array([0,1,2]),1);
       const geometry={attributes:{position,color:colors},index,drawRange:{start:0,count:3}};
       gpu=createGpuBufferGeometry(device,geometry);
-      renderer=await createGpuAnimationRenderer(device,{instancing,depthFormat:'depth32float'});
+      renderer=await createGpuAnimationRenderer(device,{instancing,renderBundles,depthFormat:'depth32float'});
       const mesh=await renderer.addMesh(gpu), frame=(draws)=>({colorView,depthView,viewProjection:identity(),draws});
       renderer.render(frame([mesh]));await renderer.whenIdle();
       pixel(await image(),32,34,[255,0,0,255],'initial RGB source stream');
@@ -75,11 +75,16 @@ export async function runBufferGeometryRenderChecks(device) {
       geometry.drawRange.count=0;renderer.render(frame([mesh]));await renderer.whenIdle();
       pixel(await image(),32,34,[0,0,0,0],'zero draw range');
       results.push(`live draw range (instancing=${instancing})`);
+      if (renderBundles) {
+        check(renderer.bundleDiagnostics.builds===2,'data-only frames re-recorded bundles');
+        check(renderer.bundleDiagnostics.reuses===4,'stable frames did not reuse their bundle');
+        results.push(`persistent bundle reuse (instancing=${instancing})`);
+      }
       check(gpu.diagnostics.allocations===3,'stable geometry allocated replacement buffers');
       renderer.dispose();renderer=null;gpu.dispose();gpu=null;
     }
     check(errors.length===0,errors.join('\n'));
-    return {status:'passed',checks:results,execution:'actual WebGPU pixel and buffer readback',performanceClaim:false};
+    return {status:'passed',renderBundles,checks:results,execution:'actual WebGPU pixel and buffer readback',performanceClaim:false};
   } finally {
     renderer?.dispose();gpu?.dispose();
     for (const resource of resources) resource.destroy();

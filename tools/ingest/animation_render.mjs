@@ -14,8 +14,8 @@
  * UVs are packed XY; vertex colors are linear RGB or RGBA, decoded from any
  * normalized integer source. The texture is a borrowed filterable 2D float
  * view with straight alpha. Use an -srgb view for sRGB-encoded base-color data:
- * hardware sampling decodes RGB, not alpha. No flipY or color conversion is
- * guessed. The caller owns texture creation, mip levels and sampler settings.
+ * hardware sampling decodes RGB, not alpha. The caller owns texture creation,
+ * mip levels and sampler settings. No flipY or color conversion is guessed.
  * UV/color arrays supplied in addMesh options are copied once for deformers.
  * createGpuBufferGeometry handles instead bind their own versioned source streams
  * directly. For that path vertexColors is a boolean (default true), index/UV
@@ -124,10 +124,21 @@
  * drawCallCount reports native calls in the last successful submission. The
  * default false keeps the original uniform/shader path and device requirements.
  *
+ * renderBundles:true caches bounded, structurally identical draw schedules.
+ * Buffer contents and per-frame uniforms stay live; resources, offsets, order
+ * and draw ranges must match. maxRenderBundles (default 4) caps cached schedules,
+ * each bounded by maxDraws. Set frame.renderBundles:false for direct submission;
+ * returning to true reuses still-valid schedules. clearRenderBundles() releases
+ * cache references explicitly. Mesh retirement, renderer disposal and device
+ * loss invalidate them. drawCallCount still counts actual GPU draws inside the
+ * bundles; bundleDiagnostics reports host builds/reuses separately. Native
+ * command memory is opaque; no exact byte-size or measured speedup is claimed.
+ *
  * Host validation finishes before GPU writes. Driver errors are terminal, not
  * rollbackable. version acknowledges submission, not completion: await whenIdle()
  * for cumulative draw/deformation validation, OOM and device-loss errors.
  */
+import {createAnimationRenderBundleCache, encodeAnimationDraws} from "./animation_render_bundles.mjs";
 import {bufferGeometrySnapshot} from "./gpu_buffer_geometry.mjs";
 import {
   packProjectedShadow,
@@ -656,26 +667,6 @@ function deformerShape(gpu, device) {
     fail("ANIMATION_RENDER_GEOMETRY", "GPU deformer is disposed or failed");
 }
 
-// A pipeline fixes layout, winding, culling, alpha blending and attachment state.
-// Per-instance shader parameters may differ; vertex/index/surface/texture inputs
-// may not. BLEND remains separate even when all those inputs happen to match.
-function compatibleInstance(a, b) {
-  const x = a.record,
-    y = b.record;
-  return (
-    y.alphaMode !== "BLEND" &&
-    a.pipeline === b.pipeline &&
-    a.first === b.first &&
-    a.count === b.count &&
-    a.vertexBuffers.length === b.vertexBuffers.length &&
-    a.vertexBuffers.every((buffer, i) => buffer === b.vertexBuffers[i]) &&
-    a.indexBuffer === b.indexBuffer &&
-    a.indexFormat === b.indexFormat &&
-    x.surfaceBuffer === y.surfaceBuffer &&
-    x.textureGroup === y.textureGroup
-  );
-}
-
 /** Create reusable unlit render pipelines; never initializes browser services. */
 export async function createGpuAnimationRenderer(
   device,
@@ -686,6 +677,8 @@ export async function createGpuAnimationRenderer(
     shadows = false,
     environment = false,
     instancing = false,
+    renderBundles = false,
+    maxRenderBundles = 4,
     maxDraws = 1024,
     maxMeshes = 1024,
     maxBytes = 64 * 1024 * 1024,
@@ -721,6 +714,11 @@ export async function createGpuAnimationRenderer(
     fail("ANIMATION_RENDER_OPTIONS", "Environment lighting requires a color renderer");
   if (typeof instancing !== "boolean")
     fail("ANIMATION_RENDER_OPTIONS", "instancing must be boolean");
+  if (typeof renderBundles !== "boolean")
+    fail("ANIMATION_RENDER_OPTIONS", "renderBundles must be boolean");
+  integer(maxRenderBundles, 1, 64, "render bundle capacity");
+  if (renderBundles && typeof device.createRenderBundleEncoder !== "function")
+    fail("ANIMATION_RENDER_DEVICE", "Render bundles require a WebGPU bundle encoder");
   integer(maxDraws, 1, 65536, "draw capacity");
   integer(maxMeshes, 1, 65536, "mesh capacity");
   integer(maxBytes, 1, Number.MAX_SAFE_INTEGER, "byte budget");
@@ -761,7 +759,7 @@ export async function createGpuAnimationRenderer(
     disposed = false,
     terminal = null,
     busy = false;
-  let drawCallCount = 0;
+  let drawCallCount = 0, bundleCache = null;
   let version = 0,
     drawCount = 0,
     completion = Promise.resolve(),
@@ -917,6 +915,7 @@ export async function createGpuAnimationRenderer(
     }
   }
   function release() {
+    bundleCache?.dispose();
     for (const buffer of buffers.keys()) forget(buffer);
     if (sharedBuffers)
       for (const bucket of sharedBuffers.values())
@@ -1262,6 +1261,10 @@ export async function createGpuAnimationRenderer(
     });
     await Promise.race([Promise.all([initialized.value, initialized.errors]), lost]);
     live();
+    if (renderBundles) bundleCache = createAnimationRenderBundleCache(device, {
+      format, depthFormat, sampleCount, bindGroup, stride, instancing,
+      maxBundles: maxRenderBundles, maxDraws, label: `${label}/bundle`,
+    });
   } catch (error) {
     disposed = true;
     release();
@@ -1715,6 +1718,7 @@ export async function createGpuAnimationRenderer(
           if (!record.disposed) {
             record.disposed = true;
             records.delete(record);
+            bundleCache?.clear();
             retireMaterial();
           }
         },
@@ -1751,6 +1755,7 @@ export async function createGpuAnimationRenderer(
           "lighting",
           "shadow",
           "environment",
+          "renderBundles",
         ],
         "frame",
       );
@@ -1769,7 +1774,10 @@ export async function createGpuAnimationRenderer(
         lighting = null,
         shadow = null,
         environment: environmentInput = null,
+        renderBundles: useBundles = renderBundles,
       } = frame;
+      if (typeof useBundles !== "boolean" || (useBundles && !renderBundles))
+        fail("ANIMATION_RENDER_OPTIONS", "Enable renderer renderBundles before using bundled frames");
       if (
         (format === null ? colorView || resolveTarget : !colorView) ||
         (depthFormat && !depthView) ||
@@ -2075,33 +2083,13 @@ export async function createGpuAnimationRenderer(
         });
         if (viewport) pass.setViewport(...viewport);
         if (scissor) pass.setScissorRect(...scissor);
-        for (let i = 0; i < draws.length; ) {
-          const command = commands[i],
-            { record, first, count, pipeline } = command;
-          // Never reorder. Only a consecutive run with identical native inputs
-          // shares a draw. Each instance retains its original packet at index i.
-          let instances = 1;
-          if (instancing && record.alphaMode !== "BLEND") {
-            while (
-              i + instances < draws.length &&
-              compatibleInstance(command, commands[i + instances])
-            )
-              instances++;
-          }
-          pass.setPipeline(pipeline);
-          pass.setBindGroup(0, bindGroup, instancing ? [] : [i * stride]);
-          for (let slot = 0; slot < command.vertexBuffers.length; slot++)
-            pass.setVertexBuffer(slot, command.vertexBuffers[slot]);
-          if (record.surfaceBuffer) pass.setVertexBuffer(1, record.surfaceBuffer);
-          if (record.textureGroup) pass.setBindGroup(1, record.textureGroup);
-          if (record.lit) pass.setBindGroup(record.textureGroup ? 2 : 1, frameLightGroup);
-          if (command.indexBuffer) {
-            pass.setIndexBuffer(command.indexBuffer, command.indexFormat);
-            pass.drawIndexed(count, instances, first, 0, instancing ? i : 0);
-          } else pass.draw(count, instances, first, instancing ? i : 0);
-          submittedDrawCalls++;
-          i += instances;
-        }
+        // Bundle keys record structural inputs only. All live uniform/geometry
+        // updates and immediate queue submission below remain unchanged.
+        submittedDrawCalls = useBundles
+          ? bundleCache.execute(pass, commands, draws.length, frameLightGroup)
+          : encodeAnimationDraws(pass, commands, draws.length, {
+              bindGroup, lightGroup: frameLightGroup, stride, instancing,
+            });
         pass.end();
         const command = encoder.finish();
         if (draws.length)
@@ -2121,6 +2109,7 @@ export async function createGpuAnimationRenderer(
       if (submitted.error) {
         submitted.errors.catch(() => {});
         terminal ??= submitted.error;
+        bundleCache?.clear();
         throw terminal;
       }
       if (usesLighting && projected) dependencies.add(projected.map);
@@ -2136,6 +2125,7 @@ export async function createGpuAnimationRenderer(
       } catch (error) {
         submitted.errors.catch(() => {});
         terminal ??= error;
+        bundleCache?.clear();
         throw terminal;
       }
       completion = Promise.race([Promise.all(work), lost]).then(
@@ -2144,6 +2134,7 @@ export async function createGpuAnimationRenderer(
         },
         (error) => {
           terminal ??= error;
+          bundleCache?.clear();
           throw terminal;
         },
       );
@@ -2169,6 +2160,14 @@ export async function createGpuAnimationRenderer(
     shadows,
     environment,
     instancing,
+    renderBundles,
+    get bundleDiagnostics() { return bundleCache?.diagnostics ?? null; },
+    clearRenderBundles() {
+      live();
+      if (busy) fail("ANIMATION_RENDER_REENTRANT", "Cannot clear bundles during submission");
+      bundleCache?.clear();
+      return renderer;
+    },
     addMesh,
     render,
     get drawCallCount() {

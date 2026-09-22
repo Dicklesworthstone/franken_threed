@@ -2,7 +2,8 @@
 import assert from 'node:assert/strict';
 export function geometryDevice() {
   let lose;
-  const d = {buffers: [], writes: [], passes: [], pipelines: [], submissions: [], scopes: [],
+  const d = {buffers: [], writes: [], passes: [], pipelines: [], submissions: [], snapshots: [], scopes: [],
+    bundleEncoders: [], encodedDrawCalls: 0,
     lost: new Promise(resolve => { lose = resolve; }), lose: () => lose({message:'removed'}),
     limits: {maxBufferSize: 2**26, minUniformBufferOffsetAlignment: 256, maxUniformBufferBindingSize:65536,
       maxDynamicUniformBuffersPerPipelineLayout:8, maxBindGroups:4, maxUniformBuffersPerShaderStage:12,
@@ -19,15 +20,19 @@ export function geometryDevice() {
     },
     createBindGroupLayout: x=>x, createBindGroup:x=>x, createPipelineLayout:x=>x, createShaderModule:x=>x,
     createRenderPipelineAsync(x) { d.pipelines.push(x); return Promise.resolve(x); },
+    createRenderBundleEncoder(desc) {
+      if (d.bundleError) throw d.bundleError;
+      const bundle={desc,draws:[]}; d.bundleEncoders.push(bundle);
+      return {...drawEncoder(bundle), finish() {
+        if (d.bundleFinishError) throw d.bundleFinishError;
+        return bundle;
+      }};
+    },
     createCommandEncoder() {
       const commands=[];
       return {beginRenderPass(desc) {
-        const p={desc, draws:[]}; commands.push(p); d.passes.push(p);
-        let pipeline, index; const streams=new Map(), groups=new Map();
-        const draw=(indexed,args)=>p.draws.push({indexed,args,pipeline,index,streams:new Map(streams),groups:new Map(groups)});
-        return {setPipeline(x){pipeline=x;}, setBindGroup(slot,group,offsets=[]){groups.set(slot,{group,offsets});},
-          setVertexBuffer(slot,buffer){streams.set(slot,buffer);}, setIndexBuffer(buffer,format){index={buffer,format};},
-          draw(...args){draw(false,args);}, drawIndexed(...args){draw(true,args);}, setViewport(){},setScissorRect(){},end(){}};
+        const p={desc, draws:[], bundles:[]}; commands.push(p); d.passes.push(p);
+        return drawEncoder(p);
       },finish(){return commands;}};
     },
     queue: {writeBuffer(buffer, offset, data, from=0, count=(data.length ?? data.byteLength)-from) {
@@ -37,7 +42,43 @@ export function geometryDevice() {
       assert.equal(offset%4,0); assert.equal(input.byteLength%4,0); assert.ok(!buffer.destroyed);
       assert.ok(offset+input.byteLength<=buffer.size);
       new Uint8Array(buffer.data).set(input,offset); d.writes.push({buffer,offset,input});
-    }, submit(commands){d.submissions.push(commands);}, onSubmittedWorkDone(){return d.completion ?? Promise.resolve();}},
+    }, submit(commands){
+      d.submissions.push(commands);
+      const snapshots=[], submittedContents=new Map();
+      const snapshot=buffer=>{
+        if(!submittedContents.has(buffer))submittedContents.set(buffer,new Uint8Array(buffer.data).slice());
+        return submittedContents.get(buffer);
+      };
+      for (const passes of commands) for (const pass of passes) for (const draw of pass.draws) {
+        const contents=new Map();
+        for (const buffer of draw.streams.values()) if (buffer.data) contents.set(buffer,snapshot(buffer));
+        if (draw.index?.buffer.data) contents.set(draw.index.buffer,snapshot(draw.index.buffer));
+        for (const {group} of draw.groups.values()) for (const entry of group.entries ?? []) {
+          const buffer=entry.resource?.buffer;
+          if (buffer?.data) contents.set(buffer,snapshot(buffer));
+        }
+        snapshots.push({...draw,contents});
+      }
+      d.snapshots.push(snapshots);
+    }, onSubmittedWorkDone(){return d.completion ?? Promise.resolve();}},
   };
+  function drawEncoder(target) {
+    let pipeline, index; const streams=new Map(), groups=new Map();
+    const draw=(indexed,args)=>{
+      d.encodedDrawCalls++;
+      assert.ok(pipeline && groups.has(0) && streams.has(0),'complete draw bindings');
+      if(indexed)assert.ok(index,'index binding');
+      target.draws.push({indexed,args,pipeline,index,streams:new Map(streams),groups:new Map(groups)});
+    };
+    return {setPipeline(x){pipeline=x;}, setBindGroup(slot,group,offsets=[]){groups.set(slot,{group,offsets:[...offsets]});},
+      setVertexBuffer(slot,buffer){streams.set(slot,buffer);}, setIndexBuffer(buffer,format){index={buffer,format};},
+      draw(...args){draw(false,args);}, drawIndexed(...args){draw(true,args);}, setViewport(){},setScissorRect(){},end(){},
+      executeBundles(bundles){
+        if(d.bundleExecuteError)throw d.bundleExecuteError;
+        target.bundles.push(...bundles);
+        for(const bundle of bundles)target.draws.push(...bundle.draws);
+        pipeline=undefined;index=undefined;streams.clear();groups.clear();
+      }};
+  }
   return d;
 }

@@ -274,6 +274,7 @@ export {createAnimationDeformer} from './animation_deformer.mjs';
     for (const name of [
       "animation_webgpu.mjs",
       "animation_render.mjs",
+      "animation_render_bundles.mjs",
       "gpu_buffer_geometry.mjs",
       "animation_scene.mjs",
       "animation_lod.mjs",

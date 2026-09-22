@@ -20,7 +20,8 @@ try {
   const original=await runAnimationRenderChecks(device);
   const materialCoordinates=await runDerivativeNormalChecks(device);
   const bufferGeometry=await runBufferGeometryRenderChecks(device);
-  globalThis.__f3dAnimationRenderResult={...original,materialCoordinates,bufferGeometry};
+  const renderBundles=await runBufferGeometryRenderChecks(device,{renderBundles:true});
+  globalThis.__f3dAnimationRenderResult={...original,materialCoordinates,bufferGeometry,renderBundles};
 } catch(error) {
   globalThis.__f3dAnimationRenderResult={status:'failed',error:error.stack||String(error)};
 } finally {
