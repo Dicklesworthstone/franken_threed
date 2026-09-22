@@ -1,4 +1,4 @@
-/** Choose the existing ABI first; expand small fixed loops only on refusal. */
+/** Prefer existing ABIs/unrolling, then try checked native structured loops. */
 import { compileNumericKernel, NumericKernelCompileError } from './numeric_kernel.mjs';
 import { expandNumericFixedLoops } from './numeric_fixed_loops.mjs';
 
@@ -7,7 +7,7 @@ function compileDirect(source, options) {
   // neither type guessing nor a failed prefix proof relaxes the source closure.
   const integerAbi = Array.isArray(options.parameterTypes) &&
     options.parameterTypes.some(type => type === 'u16[]' || type === 'u32[]');
-  if (options.checkedIndexing !== undefined || integerAbi) {
+  if (options.checkedIndexing !== undefined || integerAbi || options.structuredLoops === true) {
     return compileNumericKernel(source, { ...options, checkedIndexing: options.checkedIndexing === undefined ? true : options.checkedIndexing });
   }
   try { return compileNumericKernel(source, options); }
@@ -22,7 +22,7 @@ function compileDirect(source, options) {
   }
 }
 
-export function compileNumericCandidate(source, options = {}) {
+function compileLegacyCandidate(source, options) {
   try { return compileDirect(source, options); }
   catch (error) {
     if (!(error instanceof NumericKernelCompileError) || error.code !== 'KERNEL_NOT_CLOSED') throw error;
@@ -44,5 +44,23 @@ export function compileNumericCandidate(source, options = {}) {
     const fixedLoops = Object.freeze({ sourceName, expandedSourceName: artifact.manifest.sourceName,
       expandedIterations: expanded.expandedIterations, loops: Object.freeze(expanded.loops) });
     return Object.freeze({ ...artifact, fixedLoops });
+  }
+}
+
+export function compileNumericCandidate(source, options = {}) {
+  try { return compileLegacyCandidate(source, options); }
+  catch (error) {
+    if (!(error instanceof NumericKernelCompileError) || error.code !== 'KERNEL_NOT_CLOSED' ||
+        options.structuredLoops === false || options.checkedIndexing === false) throw error;
+    try {
+      // Compile the ORIGINAL source, not a partly expanded program. Every
+      // access is checked, every nested body shares the embedded work cap,
+      // and the existing dispatch host retains the whole original on a miss.
+      // Existing successful candidates keep their bytecode and route priority.
+      return compileNumericKernel(source, { ...options, checkedIndexing: true, structuredLoops: true });
+    } catch (structuredError) {
+      if (!(structuredError instanceof NumericKernelCompileError)) throw structuredError;
+      throw error;
+    }
   }
 }

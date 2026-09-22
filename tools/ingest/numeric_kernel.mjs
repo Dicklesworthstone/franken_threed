@@ -90,6 +90,9 @@ function member(node, object, property, computed) {
  * Exhaustion traps before publication, so the existing host retains original
  * JavaScript exactly once. This is a native loop, not source unrolling, and
  * neither the array ABI nor the synchronous execution boundary changes.
+ * This mode also supports unlabeled break/continue and early returns. A
+ * numeric-returning kernel needs a final numeric return; a void kernel may
+ * return only without a value. Skipped stores retain their original contents.
  */
 export function compileNumericKernel(source, {
   parameterTypes,
@@ -207,6 +210,8 @@ export function compileNumericKernel(source, {
   let statementCount = 0;
   let nestedCount = 0, nestedDepth = 0, maxNestedDepth = 0, nestedFuel = null;
   const nestedIndices = new Set();
+  const loopControls = [];
+  let controlDepth = 0;
   const mutableLocals = new Set();
   const scalarWrites = new Set();
   const reads = new Set();
@@ -419,7 +424,7 @@ export function compileNumericKernel(source, {
       temporaries.set(name, local);
       if (nestedFuel === null) nestedFuel = temporaryBase + temporaryCount++;
       const predicate = condition(node.test);
-      const body = compileBlock(node.body.type === 'BlockStatement' ? node.body.body : [node.body], true, depth + 1);
+      const body = compileLoopBody(node.body.type === 'BlockStatement' ? node.body.body : [node.body], depth + 1);
       // All nested loops share one zero-initialized f64 counter per call. It
       // stays an exact integer through the configured bound. Check only after
       // a true source predicate: an empty loop spends no body-entry credit.
@@ -435,6 +440,18 @@ export function compileNumericKernel(source, {
     } finally {
       nestedDepth--; nestedIndices.delete(name); temporaries = parentScope;
     }
+  }
+
+  function compileLoopBody(statements, depth) {
+    if (!structuredLoops) return compileBlock(statements, false, depth);
+    // Both loop emitters put this body inside block/loop. A third block makes
+    // continue jump to the update, not directly to the next condition. Source
+    // lexical blocks do not add Wasm labels; source if-statements do.
+    const parentDepth = controlDepth;
+    loopControls.push({breakDepth: parentDepth, continueDepth: parentDepth + 2});
+    controlDepth += 3;
+    try { return [0x02, 0x40, ...compileBlock(statements, true, depth), 0x0b]; }
+    finally { controlDepth = parentDepth; loopControls.pop(); }
   }
 
   function compileBlock(statements, conditional = false, depth = 0, retainScope = false) {
@@ -478,7 +495,7 @@ export function compileNumericKernel(source, {
           if (temporaries.has(indexName)) fail('Pipeline indices must not shadow function-scope locals', statement.init);
           inLoop = true;
           const body = statement.body.type === 'BlockStatement' ? statement.body.body : [statement.body];
-          bytes.push(...emitLoop(compileBlock(body, false, depth + 1)));
+          bytes.push(...emitLoop(compileLoopBody(body, depth + 1)));
           inLoop = false;
           indexName = null;
           continue;
@@ -492,9 +509,25 @@ export function compileNumericKernel(source, {
           continue;
         }
         if (statement.type === 'IfStatement') {
-          bytes.push(...condition(statement.test), 0x04, 0x40, ...child(statement.consequent));
-          if (statement.alternate) bytes.push(0x05, ...child(statement.alternate));
+          bytes.push(...condition(statement.test), 0x04, 0x40);
+          controlDepth++;
+          try {
+            bytes.push(...child(statement.consequent));
+            if (statement.alternate) bytes.push(0x05, ...child(statement.alternate));
+          } finally { controlDepth--; }
           bytes.push(0x0b);
+          continue;
+        }
+        if (structuredLoops && ['BreakStatement', 'ContinueStatement'].includes(statement.type)) {
+          const target = loopControls.at(-1);
+          if (statement.label || !target) fail('Loop control requires an enclosing loop and no label', statement);
+          const label = statement.type === 'BreakStatement' ? target.breakDepth : target.continueDepth;
+          bytes.push(0x0c, ...u32(controlDepth - 1 - label));
+          continue;
+        }
+        if (structuredLoops && statement.type === 'ReturnStatement') {
+          if (!!statement.argument !== !!resultNode) fail('Early return must match the kernel result type', statement);
+          bytes.push(...(statement.argument ? expression(statement.argument) : []), 0x0f);
           continue;
         }
         const assignment = statement.type === 'ExpressionStatement' ? statement.expression : null;
@@ -558,7 +591,7 @@ export function compileNumericKernel(source, {
     const setup = compileBlock(prelude, false, 0, true);
     inLoop = true;
     const statements = loop.body.type === 'BlockStatement' ? loop.body.body : [loop.body];
-    const instructions = compileBlock(statements);
+    const instructions = compileLoopBody(statements, 0);
     inLoop = false;
     execution = [...setup, ...emitLoop(instructions)];
   }
