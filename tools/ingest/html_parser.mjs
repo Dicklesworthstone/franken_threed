@@ -8,7 +8,7 @@
  * and ignores prefixed attributes like data-type / data-src.
  */
 
-import { IngestionParseError } from './types.mjs';
+import { IngestionParseError } from "./types.mjs";
 
 /**
  * Strips HTML comments while preserving characters and newlines
@@ -21,7 +21,8 @@ import { IngestionParseError } from './types.mjs';
  * Matches HTML comments, <script>...</script>, and <style>...</style> tokens contextually
  * so that comment markers (<!--) inside script or style text are never confused with HTML comments.
  */
-export const HTML_CONTEXT_REGEX = /(<!--[\s\S]*?-->)|(<script\b((?:[^"'><]+|"[^"]*"|'[^']*')*)>([\s\S]*?)<\/script\s*>)|(<style\b((?:[^"'><]+|"[^"]*"|'[^']*')*)>([\s\S]*?)<\/style\s*>)/gi;
+export const HTML_CONTEXT_REGEX =
+  /(<!--[\s\S]*?-->)|(<script\b((?:[^"'><]+|"[^"]*"|'[^']*')*)>([\s\S]*?)<\/script\s*>)|(<style\b((?:[^"'><]+|"[^"]*"|'[^']*')*)>([\s\S]*?)<\/style\s*>)/gi;
 
 /**
  * Strips HTML comments while preserving layout coordinates and byte offsets.
@@ -32,15 +33,12 @@ export const HTML_CONTEXT_REGEX = /(<!--[\s\S]*?-->)|(<script\b((?:[^"'><]+|"[^"
  * @returns {string}
  */
 export function stripHtmlComments(html) {
-  return html.replace(
-    HTML_CONTEXT_REGEX,
-    (match, comment) => {
-      if (comment) {
-        return comment.replace(/[^\r\n]/g, ' ');
-      }
-      return match;
+  return html.replace(HTML_CONTEXT_REGEX, (match, comment) => {
+    if (comment) {
+      return comment.replace(/[^\r\n]/g, " ");
     }
-  );
+    return match;
+  });
 }
 
 /**
@@ -56,22 +54,22 @@ export function stripScriptAndStyleBodies(html) {
     HTML_CONTEXT_REGEX,
     (match, comment, scriptBlock, scriptAttrs, scriptBody, styleBlock, styleAttrs, styleBody) => {
       if (comment) {
-        return comment.replace(/[^\r\n]/g, ' ');
+        return comment.replace(/[^\r\n]/g, " ");
       }
       if (scriptBlock) {
         const openTagLen = 7 + scriptAttrs.length + 1;
         const openTag = scriptBlock.slice(0, openTagLen);
         const closeTag = scriptBlock.slice(openTagLen + scriptBody.length);
-        return openTag + scriptBody.replace(/[^\r\n]/g, ' ') + closeTag;
+        return openTag + scriptBody.replace(/[^\r\n]/g, " ") + closeTag;
       }
       if (styleBlock) {
         const openTagLen = 6 + styleAttrs.length + 1;
         const openTag = styleBlock.slice(0, openTagLen);
         const closeTag = styleBlock.slice(openTagLen + styleBody.length);
-        return openTag + styleBody.replace(/[^\r\n]/g, ' ') + closeTag;
+        return openTag + styleBody.replace(/[^\r\n]/g, " ") + closeTag;
       }
       return match;
-    }
+    },
   );
 }
 
@@ -88,9 +86,14 @@ export function parseTagAttributes(attrString) {
   while ((match = attrRegex.exec(attrString)) !== null) {
     const name = match[1].toLowerCase();
     if (attrs[name] === undefined) {
-      const val = match[2] !== undefined
-        ? match[2]
-        : (match[3] !== undefined ? match[3] : (match[4] !== undefined ? match[4] : ''));
+      const val =
+        match[2] !== undefined
+          ? match[2]
+          : match[3] !== undefined
+            ? match[3]
+            : match[4] !== undefined
+              ? match[4]
+              : "";
       attrs[name] = val;
     }
   }
@@ -116,7 +119,7 @@ export function parseTagAttributes(attrString) {
 export function parseHtmlEntries(rawHtmlContent, documentUrl) {
   const importMap = {
     imports: {},
-    scopes: {}
+    scopes: {},
   };
   /** @type {ModuleScriptEntry[]} */
   const moduleScripts = [];
@@ -135,7 +138,7 @@ export function parseHtmlEntries(rawHtmlContent, documentUrl) {
   let baseMatch;
   while ((baseMatch = baseRegex.exec(domHtml)) !== null) {
     const attrs = parseTagAttributes(baseMatch[1]);
-    if (baseHref === null && Object.hasOwn(attrs, 'href')) {
+    if (baseHref === null && Object.hasOwn(attrs, "href")) {
       baseHref = attrs.href;
     }
   }
@@ -146,7 +149,7 @@ export function parseHtmlEntries(rawHtmlContent, documentUrl) {
   let linkMatch;
   while ((linkMatch = linkRegex.exec(domHtml)) !== null) {
     const attrs = parseTagAttributes(linkMatch[1]);
-    if (attrs.rel && attrs.rel.toLowerCase() === 'modulepreload' && attrs.href) {
+    if (attrs.rel && attrs.rel.toLowerCase() === "modulepreload" && attrs.href) {
       preloads.push(attrs.href);
     }
   }
@@ -163,13 +166,13 @@ export function parseHtmlEntries(rawHtmlContent, documentUrl) {
     const matchOffset = scriptMatch.index;
 
     const attrs = parseTagAttributes(attrString);
-    const scriptType = (attrs.type || 'text/javascript').toLowerCase();
+    const scriptType = (attrs.type || "text/javascript").toLowerCase();
 
     // Calculate line and column of script body start using matched attribute length
     // rather than indexOf('>') to prevent corruption when attributes contain quoted '>'
     const openingTagEndIndex = matchOffset + 7 + attrString.length + 1;
     const prefixBeforeBody = rawHtmlContent.slice(0, openingTagEndIndex);
-    const lines = prefixBeforeBody.split('\n');
+    const lines = prefixBeforeBody.split("\n");
     const startLine = lines.length;
     const startColumn = lines[lines.length - 1].length + 1;
 
@@ -177,27 +180,27 @@ export function parseHtmlEntries(rawHtmlContent, documentUrl) {
     // not comment-stripped text (which replaced e.g. "<!-- keep me -->" with spaces)
     const rawScriptBody = rawHtmlContent.slice(
       openingTagEndIndex,
-      openingTagEndIndex + scriptBody.length
+      openingTagEndIndex + scriptBody.length,
     );
 
-    if (scriptType === 'importmap') {
+    if (scriptType === "importmap") {
       try {
         const parsed = JSON.parse(rawScriptBody.trim());
-        if (parsed.imports && typeof parsed.imports === 'object') {
+        if (parsed.imports && typeof parsed.imports === "object") {
           importMap.imports = { ...importMap.imports, ...parsed.imports };
         }
-        if (parsed.scopes && typeof parsed.scopes === 'object') {
+        if (parsed.scopes && typeof parsed.scopes === "object") {
           importMap.scopes = { ...importMap.scopes, ...parsed.scopes };
         }
       } catch (err) {
         throw new IngestionParseError(
           `Failed to parse importmap JSON in ${documentUrl}: ${err.message}`,
           documentUrl,
-          { line: startLine, column: startColumn, offset: openingTagEndIndex }
+          { line: startLine, column: startColumn, offset: openingTagEndIndex },
         );
       }
-    } else if (scriptType === 'module') {
-      if (Object.hasOwn(attrs, 'src')) {
+    } else if (scriptType === "module") {
+      if (Object.hasOwn(attrs, "src")) {
         const externalSrc = attrs.src;
         moduleScripts.push({
           id: new URL(externalSrc, effectiveBaseUrl).href,
@@ -205,7 +208,7 @@ export function parseHtmlEntries(rawHtmlContent, documentUrl) {
           inlineContent: null,
           startLine,
           startColumn,
-          startOffset: openingTagEndIndex
+          startOffset: openingTagEndIndex,
         });
       } else {
         inlineModuleIndex++;
@@ -216,7 +219,7 @@ export function parseHtmlEntries(rawHtmlContent, documentUrl) {
           inlineContent: rawScriptBody,
           startLine,
           startColumn,
-          startOffset: openingTagEndIndex
+          startOffset: openingTagEndIndex,
         });
       }
     }
@@ -234,7 +237,7 @@ export function parseHtmlEntries(rawHtmlContent, documentUrl) {
  * @returns {boolean}
  */
 function isAsciiWhitespace(ch) {
-  return ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' || ch === '\f';
+  return ch === " " || ch === "\t" || ch === "\n" || ch === "\r" || ch === "\f";
 }
 
 /**
@@ -251,7 +254,7 @@ function isAsciiWhitespace(ch) {
  * @returns {string[]} Candidate image URLs extracted in document order
  */
 export function parseSrcsetUrls(srcsetString) {
-  if (!srcsetString || typeof srcsetString !== 'string') {
+  if (!srcsetString || typeof srcsetString !== "string") {
     return [];
   }
 
@@ -262,7 +265,7 @@ export function parseSrcsetUrls(srcsetString) {
 
   while (pos < len) {
     // 1. Skip leading ASCII whitespace and commas
-    while (pos < len && (isAsciiWhitespace(input[pos]) || input[pos] === ',')) {
+    while (pos < len && (isAsciiWhitespace(input[pos]) || input[pos] === ",")) {
       pos++;
     }
     if (pos >= len) break;
@@ -278,9 +281,9 @@ export function parseSrcsetUrls(srcsetString) {
     const descriptors = [];
 
     // 3. If url ends with U+002C COMMA (,), strip all trailing commas
-    if (url.endsWith(',')) {
+    if (url.endsWith(",")) {
       let end = url.length;
-      while (end > 0 && url[end - 1] === ',') {
+      while (end > 0 && url[end - 1] === ",") {
         end--;
       }
       url = url.slice(0, end);
@@ -288,49 +291,49 @@ export function parseSrcsetUrls(srcsetString) {
     } else {
       // 4. Descriptor tokenizer: tokenize descriptors separated by ASCII whitespace
       // until a comma outside parentheses (or EOF) is encountered
-      let currentDescriptor = '';
-      let state = 'in_descriptor';
+      let currentDescriptor = "";
+      let state = "in_descriptor";
 
       while (pos < len) {
         const c = input[pos];
-        if (state === 'in_descriptor') {
+        if (state === "in_descriptor") {
           if (isAsciiWhitespace(c)) {
             if (currentDescriptor.length > 0) {
               descriptors.push(currentDescriptor);
-              currentDescriptor = '';
+              currentDescriptor = "";
             }
-            state = 'after_descriptor';
-          } else if (c === ',') {
+            state = "after_descriptor";
+          } else if (c === ",") {
             pos++; // consume candidate separator comma
             if (currentDescriptor.length > 0) {
               descriptors.push(currentDescriptor);
-              currentDescriptor = '';
+              currentDescriptor = "";
             }
             break;
-          } else if (c === '(') {
+          } else if (c === "(") {
             currentDescriptor += c;
-            state = 'in_parens';
+            state = "in_parens";
           } else {
             currentDescriptor += c;
           }
-        } else if (state === 'in_parens') {
-          if (c === ')') {
+        } else if (state === "in_parens") {
+          if (c === ")") {
             currentDescriptor += c;
-            state = 'in_descriptor';
+            state = "in_descriptor";
           } else {
             currentDescriptor += c;
           }
-        } else if (state === 'after_descriptor') {
+        } else if (state === "after_descriptor") {
           if (isAsciiWhitespace(c)) {
             // stay in after_descriptor
-          } else if (c === ',') {
+          } else if (c === ",") {
             pos++; // consume candidate separator comma
             break;
-          } else if (c === '(') {
+          } else if (c === "(") {
             currentDescriptor += c;
-            state = 'in_parens';
+            state = "in_parens";
           } else {
-            state = 'in_descriptor';
+            state = "in_descriptor";
             currentDescriptor += c;
           }
         }

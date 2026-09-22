@@ -12,7 +12,7 @@
  * do NOT couple backend residency (Plan §3.3; Bead f3d-04.4 review).
  */
 
-import { ExecutionRoute, EscapeReason } from './route_types.mjs';
+import { EscapeReason, ExecutionRoute } from "./route_types.mjs";
 
 export class ConnectedCompatibilityGroups {
   constructor() {
@@ -38,7 +38,7 @@ export class ConnectedCompatibilityGroups {
   registerRenderer(rendererId, preferredRoute = ExecutionRoute.RETAINED_UPSTREAM) {
     if (!this._nodes.has(rendererId)) {
       this._nodes.set(rendererId, {
-        type: 'renderer',
+        type: "renderer",
         preferredRoute,
         forcedRoute: undefined,
         reasons: [],
@@ -65,7 +65,7 @@ export class ConnectedCompatibilityGroups {
   registerResource(resourceId, isMutable = true) {
     if (!this._nodes.has(resourceId)) {
       this._nodes.set(resourceId, {
-        type: 'resource',
+        type: "resource",
         isMutable,
         reasons: [],
       });
@@ -188,7 +188,7 @@ export class ConnectedCompatibilityGroups {
       // recorded decisions, and preferred node routes
       for (const memberId of members) {
         const node = this._nodes.get(memberId);
-        if (node && node.type === 'renderer') {
+        if (node && node.type === "renderer") {
           const committed = this._committedRoutes.get(memberId);
           const decision = this._allDecisions.get(memberId);
           const effectiveRoute = committed || decision?.route || node.preferredRoute;
@@ -210,8 +210,8 @@ export class ConnectedCompatibilityGroups {
           if (committed && committed !== ExecutionRoute.EXACT_BACKEND) {
             throw new Error(
               `Connected group conflict: renderer '${memberId}' is already committed to route '${committed}', ` +
-              `but shared resource connects it to a renderer requiring '${ExecutionRoute.EXACT_BACKEND}'. ` +
-              `Sharing mutable GPU resources across distinct backend residencies without an isolated copy boundary is prohibited.`
+                `but shared resource connects it to a renderer requiring '${ExecutionRoute.EXACT_BACKEND}'. ` +
+                `Sharing mutable GPU resources across distinct backend residencies without an isolated copy boundary is prohibited.`,
             );
           }
         }
@@ -220,11 +220,13 @@ export class ConnectedCompatibilityGroups {
       // Propagate exact requirement to all uncommitted/compatible renderers in the group
       for (const memberId of members) {
         const node = this._nodes.get(memberId);
-        if (node && node.type === 'renderer') {
+        if (node && node.type === "renderer") {
           const committed = this._committedRoutes.get(memberId);
           const decision = this._allDecisions.get(memberId);
-          let finalRoute = committed || (decision ? decision.route : node.preferredRoute || ExecutionRoute.RETAINED_UPSTREAM);
-          const reasons = decision ? [...decision.reasons] : (node.reasons ? [...node.reasons] : []);
+          let finalRoute =
+            committed ||
+            (decision ? decision.route : node.preferredRoute || ExecutionRoute.RETAINED_UPSTREAM);
+          const reasons = decision ? [...decision.reasons] : node.reasons ? [...node.reasons] : [];
 
           if (requiresExact && finalRoute !== ExecutionRoute.EXACT_BACKEND) {
             finalRoute = ExecutionRoute.EXACT_BACKEND;
@@ -272,7 +274,7 @@ export class ConnectedCompatibilityGroups {
   previewRoute(initialDecision, resources = []) {
     let requiresExact = initialDecision.route === ExecutionRoute.EXACT_BACKEND;
     const groupReasons = new Set(initialDecision.reasons || []);
-    let primaryGroupId = undefined;
+    let primaryGroupId;
 
     const checkedRoots = new Set();
     for (const { id: resId, isMutable } of resources) {
@@ -285,7 +287,7 @@ export class ConnectedCompatibilityGroups {
       const members = this.getGroupMembers(root);
       for (const memberId of members) {
         const node = this._nodes.get(memberId);
-        if (node && node.type === 'renderer') {
+        if (node && node.type === "renderer") {
           const committed = this._committedRoutes.get(memberId);
           const decision = this._allDecisions.get(memberId);
           const effectiveRoute = committed || decision?.route || node.preferredRoute;
@@ -307,8 +309,8 @@ export class ConnectedCompatibilityGroups {
           if (committed && committed !== ExecutionRoute.EXACT_BACKEND) {
             throw new Error(
               `Connected group conflict: renderer '${memberId}' is already committed to route '${committed}', ` +
-              `but shared resource connects it to a renderer requiring '${ExecutionRoute.EXACT_BACKEND}'. ` +
-              `Sharing mutable GPU resources across distinct backend residencies without an isolated copy boundary is prohibited.`
+                `but shared resource connects it to a renderer requiring '${ExecutionRoute.EXACT_BACKEND}'. ` +
+                `Sharing mutable GPU resources across distinct backend residencies without an isolated copy boundary is prohibited.`,
             );
           }
         }
@@ -331,4 +333,3 @@ export class ConnectedCompatibilityGroups {
     };
   }
 }
-

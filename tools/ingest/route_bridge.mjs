@@ -98,11 +98,17 @@ export function extractGraphRoutingFacts(bundle, options = {}) {
   }
 
   const includeInternal = options.includeLibraryInternalEscapes ?? false;
-  const packageRootUrl = options.packageRootUrl || options.package_root_url || bundle.package_root_url || bundle.packageRootUrl || null;
+  const packageRootUrl =
+    options.packageRootUrl ||
+    options.package_root_url ||
+    bundle.package_root_url ||
+    bundle.packageRootUrl ||
+    null;
   let hasOpaqueGLEscapes = false;
   let hasNativeContextAccess = false;
   let hasUnresolvedContextAccess = false;
-  const hasUnanalyzedModules = Array.isArray(bundle.external_modules) && bundle.external_modules.length > 0;
+  const hasUnanalyzedModules =
+    Array.isArray(bundle.external_modules) && bundle.external_modules.length > 0;
   const escapes = [];
   const constructionSites = [];
 
@@ -141,9 +147,11 @@ export function extractGraphRoutingFacts(bundle, options = {}) {
     const sites = mod.renderer_construction_sites || mod.rendererConstructionSites || [];
     for (const site of sites) {
       const constructorName = site.constructor_name || site.constructorName || "WebGLRenderer";
-      const rawForceWebGL = site.force_webgl ?? site.forceWebGL ?? site.has_force_webgl ?? site.hasForceWebGL ?? false;
-      const isForceWebGLUnresolved = site.force_webgl_unresolved ?? site.forceWebGLUnresolved ?? (rawForceWebGL === 'unresolved');
-      const forceWebGL = isForceWebGLUnresolved ? 'unresolved' : Boolean(rawForceWebGL);
+      const rawForceWebGL =
+        site.force_webgl ?? site.forceWebGL ?? site.has_force_webgl ?? site.hasForceWebGL ?? false;
+      const isForceWebGLUnresolved =
+        site.force_webgl_unresolved ?? site.forceWebGLUnresolved ?? rawForceWebGL === "unresolved";
+      const forceWebGL = isForceWebGLUnresolved ? "unresolved" : Boolean(rawForceWebGL);
       const canvasOption = site.canvas_option ?? site.canvasOption ?? null;
       const span = site.source_span || site.sourceSpan || `${mod.id}:0:0`;
 
@@ -205,24 +213,26 @@ export function prepareRouteInputs(bundle, defaults = {}) {
   const extracted = extractGraphRoutingFacts(bundle, defaults);
 
   if (extracted.constructionSites.length === 0) {
-    return [{
-      constructorName: defaults.constructorName || "WebGLRenderer",
-      options: defaults.options || {},
-      analysis: {
-        hasOpaqueGLEscapes: extracted.hasOpaqueGLEscapes,
-        has_opaque_gl_escapes: extracted.hasOpaqueGLEscapes,
-        hasNativeContextAccess: extracted.hasNativeContextAccess,
-        has_native_context_access: extracted.hasNativeContextAccess,
-        hasUnresolvedContextAccess: extracted.hasUnresolvedContextAccess,
-        has_unresolved_context_access: extracted.hasUnresolvedContextAccess,
-        hasUnanalyzedModules: extracted.hasUnanalyzedModules,
-        ...defaults.analysis,
+    return [
+      {
+        constructorName: defaults.constructorName || "WebGLRenderer",
+        options: defaults.options || {},
+        analysis: {
+          hasOpaqueGLEscapes: extracted.hasOpaqueGLEscapes,
+          has_opaque_gl_escapes: extracted.hasOpaqueGLEscapes,
+          hasNativeContextAccess: extracted.hasNativeContextAccess,
+          has_native_context_access: extracted.hasNativeContextAccess,
+          hasUnresolvedContextAccess: extracted.hasUnresolvedContextAccess,
+          has_unresolved_context_access: extracted.hasUnresolvedContextAccess,
+          hasUnanalyzedModules: extracted.hasUnanalyzedModules,
+          ...defaults.analysis,
+        },
+        sourceSpan: defaults.sourceSpan || `${bundle.entry_path || "entry"}:0:0`,
       },
-      sourceSpan: defaults.sourceSpan || `${bundle.entry_path || "entry"}:0:0`,
-    }];
+    ];
   }
 
-  return extracted.constructionSites.map(site => ({
+  return extracted.constructionSites.map((site) => ({
     constructorName: site.constructorName,
     options: site.options,
     analysis: site.analysis,
@@ -248,7 +258,7 @@ export function evaluateGraphRoutes(bundle, decideFn, environment = {}) {
   }
 
   const inputs = prepareRouteInputs(bundle, environment);
-  return inputs.map(input => {
+  return inputs.map((input) => {
     const decision = decideFn({
       ...input,
       hostCapabilities: environment.hostCapabilities,

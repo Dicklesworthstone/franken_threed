@@ -28,16 +28,22 @@
  * - Strictly rejects collisions, race overwrites, and symlinks using exclusive 'wx' write flags.
  */
 
-import fs from 'node:fs';
-import path from 'node:path';
-import crypto from 'node:crypto';
-import { fileURLToPath, pathToFileURL } from 'node:url';
-import { bundleWithRollup } from './bundler.mjs';
-import { parseTagAttributes, parseSrcsetUrls, stripHtmlComments, stripScriptAndStyleBodies, parseHtmlEntries } from './html_parser.mjs';
-import { resolveModuleSpecifier, urlToFilePath } from './resolver.mjs';
-import { analyzeModuleAst } from './ast_analyzer.mjs';
-import * as acorn from 'acorn';
-import * as walk from 'acorn-walk';
+import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import * as acorn from "acorn";
+import * as walk from "acorn-walk";
+import { analyzeModuleAst } from "./ast_analyzer.mjs";
+import { bundleWithRollup } from "./bundler.mjs";
+import {
+  parseHtmlEntries,
+  parseSrcsetUrls,
+  parseTagAttributes,
+  stripHtmlComments,
+  stripScriptAndStyleBodies,
+} from "./html_parser.mjs";
+import { resolveModuleSpecifier, urlToFilePath } from "./resolver.mjs";
 
 /**
  * Recomputes Subresource Integrity (SRI) string for modified or bundled content,
@@ -48,27 +54,27 @@ import * as walk from 'acorn-walk';
  * @returns {string}
  */
 export function computeIntegrityForContent(originalIntegrity, content) {
-  if (!originalIntegrity || typeof originalIntegrity !== 'string') {
-    return '';
+  if (!originalIntegrity || typeof originalIntegrity !== "string") {
+    return "";
   }
-  const buffer = typeof content === 'string' ? Buffer.from(content, 'utf-8') : content;
+  const buffer = typeof content === "string" ? Buffer.from(content, "utf-8") : content;
   const tokens = originalIntegrity.trim().split(/\s+/);
   const updatedTokens = [];
 
   for (const token of tokens) {
-    const dashIdx = token.indexOf('-');
+    const dashIdx = token.indexOf("-");
     if (dashIdx === -1) {
       throw new Error(`Invalid integrity attribute token format: "${token}"`);
     }
     const algo = token.slice(0, dashIdx).toLowerCase();
-    if (!['sha256', 'sha384', 'sha512'].includes(algo)) {
+    if (!["sha256", "sha384", "sha512"].includes(algo)) {
       throw new Error(`Unsupported integrity hash algorithm: "${algo}"`);
     }
-    const hash = crypto.createHash(algo).update(buffer).digest('base64');
+    const hash = crypto.createHash(algo).update(buffer).digest("base64");
     updatedTokens.push(`${algo}-${hash}`);
   }
 
-  return updatedTokens.join(' ');
+  return updatedTokens.join(" ");
 }
 
 /**
@@ -80,10 +86,10 @@ export function computeIntegrityForContent(originalIntegrity, content) {
  * @returns {boolean}
  */
 export function isRelativeUrl(url) {
-  if (!url || typeof url !== 'string') return false;
+  if (!url || typeof url !== "string") return false;
   const trimmed = url.trim();
   if (!trimmed) return false;
-  if (trimmed.startsWith('#') || trimmed.startsWith('//') || trimmed.startsWith('/')) {
+  if (trimmed.startsWith("#") || trimmed.startsWith("//") || trimmed.startsWith("/")) {
     return false;
   }
   if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(trimmed)) {
@@ -100,10 +106,10 @@ export function isRelativeUrl(url) {
  * @returns {boolean}
  */
 export function isExternalUrl(url) {
-  if (!url || typeof url !== 'string') return false;
+  if (!url || typeof url !== "string") return false;
   try {
-    const protocol = new URL(url, 'file:///').protocol;
-    return protocol === 'http:' || protocol === 'https:' || protocol === 'data:';
+    const protocol = new URL(url, "file:///").protocol;
+    return protocol === "http:" || protocol === "https:" || protocol === "data:";
   } catch {
     return false;
   }
@@ -117,7 +123,7 @@ export function isExternalUrl(url) {
  * @returns {string | null} Canonical URL string, or null if invalid
  */
 export function toCanonicalPreloadUrl(id) {
-  if (!id || typeof id !== 'string') return null;
+  if (!id || typeof id !== "string") return null;
   if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(id)) {
     return id;
   }
@@ -139,14 +145,14 @@ export function toCanonicalPreloadUrl(id) {
  * @returns {string | null} Emitted chunk file name if matched, else null
  */
 export function findChunkForPreload(rawHref, referrerDir, preloadChunkMap) {
-  if (!rawHref || typeof rawHref !== 'string' || !preloadChunkMap) return null;
+  if (!rawHref || typeof rawHref !== "string" || !preloadChunkMap) return null;
   const trimmed = rawHref.trim();
   if (!trimmed) return null;
 
   // 1. Canonical URL resolution against referrer directory URL (preserving ?query and #fragment)
   if (referrerDir) {
     try {
-      const baseUrl = referrerDir.startsWith('file://')
+      const baseUrl = referrerDir.startsWith("file://")
         ? new URL(referrerDir)
         : pathToFileURL(referrerDir.endsWith(path.sep) ? referrerDir : referrerDir + path.sep);
       const canonicalUrl = new URL(trimmed, baseUrl).href;
@@ -168,7 +174,6 @@ export function findChunkForPreload(rawHref, referrerDir, preloadChunkMap) {
   return null;
 }
 
-
 /**
  * Scans HTML content for relative asset references in attributes (e.g. stylesheets,
  * icons, images, non-module scripts, media, unbundled modulepreloads).
@@ -181,7 +186,12 @@ export function findChunkForPreload(rawHref, referrerDir, preloadChunkMap) {
  * @param {boolean} [skipModulePreloads=false] - Defer preloads until bundle chunks are known
  * @returns {string[]} Deduplicated list of relative resource URLs
  */
-export function extractRelativeAssetUrls(rawHtmlContent, preloadChunkMap = null, referrerDir = '', skipModulePreloads = false) {
+export function extractRelativeAssetUrls(
+  rawHtmlContent,
+  preloadChunkMap = null,
+  referrerDir = "",
+  skipModulePreloads = false,
+) {
   const domHtml = stripScriptAndStyleBodies(rawHtmlContent);
   const assets = new Set();
 
@@ -194,10 +204,9 @@ export function extractRelativeAssetUrls(rawHtmlContent, preloadChunkMap = null,
       // If this is a modulepreload matching an emitted chunk, it is handled by Rollup bundle emission
       if (
         attrs.rel &&
-        attrs.rel.toLowerCase() === 'modulepreload' &&
-        (skipModulePreloads || (
-          preloadChunkMap && findChunkForPreload(attrs.href, referrerDir, preloadChunkMap)
-        ))
+        attrs.rel.toLowerCase() === "modulepreload" &&
+        (skipModulePreloads ||
+          (preloadChunkMap && findChunkForPreload(attrs.href, referrerDir, preloadChunkMap)))
       ) {
         continue;
       }
@@ -226,8 +235,8 @@ export function extractRelativeAssetUrls(rawHtmlContent, preloadChunkMap = null,
   const scriptRegex = /<script\b((?:[^"'><]+|"[^"]*"|'[^']*')*)>/gi;
   while ((match = scriptRegex.exec(domHtml)) !== null) {
     const attrs = parseTagAttributes(match[1]);
-    const type = (attrs.type || 'text/javascript').toLowerCase();
-    if (type !== 'module' && attrs.src && isRelativeUrl(attrs.src)) {
+    const type = (attrs.type || "text/javascript").toLowerCase();
+    if (type !== "module" && attrs.src && isRelativeUrl(attrs.src)) {
       assets.add(attrs.src);
     }
   }
@@ -263,15 +272,15 @@ export function extractRelativeAssetUrls(rawHtmlContent, preloadChunkMap = null,
  * @returns {string}
  */
 export function stripCssComments(css) {
-  if (!css || typeof css !== 'string') return '';
+  if (!css || typeof css !== "string") return "";
   return css.replace(
     /(\/\*[\s\S]*?\*\/)|("(?:[^"\\]|\\.)*")|('(?:[^'\\]|\\.)*')/g,
     (match, comment) => {
       if (comment) {
-        return comment.replace(/[^\r\n]/g, ' ');
+        return comment.replace(/[^\r\n]/g, " ");
       }
       return match;
-    }
+    },
   );
 }
 
@@ -292,13 +301,13 @@ function decodeCssResourceUrl(rawUrl) {
   return rawUrl.replace(
     /\\(?:([0-9a-f]{1,6})(?:\r\n|[ \t\r\n\f])?|(\r\n|[\r\n\f])|([\s\S]))/gi,
     (_escape, hex, continuation, character) => {
-      if (continuation) return '';
+      if (continuation) return "";
       if (!hex) return character;
       const codePoint = Number.parseInt(hex, 16);
       return codePoint === 0 || codePoint > 0x10ffff || (codePoint >= 0xd800 && codePoint <= 0xdfff)
-        ? '\uFFFD'
+        ? "\uFFFD"
         : String.fromCodePoint(codePoint);
-    }
+    },
   );
 }
 
@@ -310,9 +319,9 @@ function decodeCssResourceUrl(rawUrl) {
  * @returns {string[]} Deduplicated list of relative URLs
  */
 export function extractRelativeCssUrls(cssContent) {
-  if (!cssContent || typeof cssContent !== 'string') return [];
+  if (!cssContent || typeof cssContent !== "string") return [];
   const urls = new Set();
-  const regex = new RegExp(CSS_RESOURCE_REGEX.source, 'gi');
+  const regex = new RegExp(CSS_RESOURCE_REGEX.source, "gi");
   let match;
 
   while ((match = regex.exec(cssContent)) !== null) {
@@ -325,8 +334,9 @@ export function extractRelativeCssUrls(cssContent) {
 
     // match[2]: @import statement
     if (match[2]) {
-      const rawUrl = match[3] !== undefined ? match[3] : (match[4] !== undefined ? match[4] : match[5]);
-      const url = rawUrl ? decodeCssResourceUrl(rawUrl) : '';
+      const rawUrl =
+        match[3] !== undefined ? match[3] : match[4] !== undefined ? match[4] : match[5];
+      const url = rawUrl ? decodeCssResourceUrl(rawUrl) : "";
       if (isRelativeUrl(url)) {
         urls.add(url);
       }
@@ -335,8 +345,9 @@ export function extractRelativeCssUrls(cssContent) {
 
     // match[6]: url(...) function
     if (match[6]) {
-      const rawUrl = match[7] !== undefined ? match[7] : (match[8] !== undefined ? match[8] : match[9]);
-      const url = rawUrl ? decodeCssResourceUrl(rawUrl) : '';
+      const rawUrl =
+        match[7] !== undefined ? match[7] : match[8] !== undefined ? match[8] : match[9];
+      const url = rawUrl ? decodeCssResourceUrl(rawUrl) : "";
       if (isRelativeUrl(url)) {
         urls.add(url);
       }
@@ -347,20 +358,20 @@ export function extractRelativeCssUrls(cssContent) {
 }
 
 const CLASSIC_JS_MIME_TYPES = new Set([
-  'text/javascript',
-  'application/javascript',
-  'text/ecmascript',
-  'application/ecmascript',
-  'text/jscript',
-  'text/livescript',
-  'application/x-javascript',
-  'application/x-ecmascript',
-  'text/javascript1.0',
-  'text/javascript1.1',
-  'text/javascript1.2',
-  'text/javascript1.3',
-  'text/javascript1.4',
-  'text/javascript1.5',
+  "text/javascript",
+  "application/javascript",
+  "text/ecmascript",
+  "application/ecmascript",
+  "text/jscript",
+  "text/livescript",
+  "application/x-javascript",
+  "application/x-ecmascript",
+  "text/javascript1.0",
+  "text/javascript1.1",
+  "text/javascript1.2",
+  "text/javascript1.3",
+  "text/javascript1.4",
+  "text/javascript1.5",
 ]);
 
 /**
@@ -372,7 +383,7 @@ const CLASSIC_JS_MIME_TYPES = new Set([
  * @returns {boolean}
  */
 export function isClassicJavaScriptType(typeAttr) {
-  if (!typeAttr || typeof typeAttr !== 'string') {
+  if (!typeAttr || typeof typeAttr !== "string") {
     return true;
   }
   const trimmed = typeAttr.trim().toLowerCase();
@@ -389,17 +400,17 @@ export function isClassicJavaScriptType(typeAttr) {
  */
 function extractConditionalStringLiterals(node) {
   if (!node) return null;
-  if (node.type === 'ConditionalExpression') {
+  if (node.type === "ConditionalExpression") {
     const consequent = extractConditionalStringLiterals(node.consequent);
     const alternate = extractConditionalStringLiterals(node.alternate);
     if (!consequent || !alternate) return null;
     return [...consequent, ...alternate];
   }
-  if (node.type === 'Literal' && typeof node.value === 'string') {
+  if (node.type === "Literal" && typeof node.value === "string") {
     return [node.value];
   }
-  if (node.type === 'TemplateLiteral' && node.expressions.length === 0 && node.quasis.length > 0) {
-    return [node.quasis.map(q => q.value.cooked ?? q.value.raw).join('')];
+  if (node.type === "TemplateLiteral" && node.expressions.length === 0 && node.quasis.length > 0) {
+    return [node.quasis.map((q) => q.value.cooked ?? q.value.raw).join("")];
   }
   return null;
 }
@@ -417,8 +428,8 @@ function extractConditionalStringLiterals(node) {
  * @param {string} [contextUrl='script.js'] - File URL or identifier for error reporting
  * @returns {{ moduleSpecifiers: string[], assetSpecifiers: string[] }}
  */
-export function extractJsModuleDependencies(code, contextUrl = 'script.js') {
-  if (!code || typeof code !== 'string') {
+export function extractJsModuleDependencies(code, contextUrl = "script.js") {
+  if (!code || typeof code !== "string") {
     return { moduleSpecifiers: [], assetSpecifiers: [] };
   }
 
@@ -441,9 +452,9 @@ export function extractJsModuleDependencies(code, contextUrl = 'script.js') {
       }
       if (Array.isArray(analysis.dynamicImports)) {
         for (const dyn of analysis.dynamicImports) {
-          if (dyn.classification === 'literal' && dyn.specifier) {
+          if (dyn.classification === "literal" && dyn.specifier) {
             moduleSpecifiers.add(dyn.specifier);
-          } else if (dyn.classification === 'finite_set' && Array.isArray(dyn.candidates)) {
+          } else if (dyn.classification === "finite_set" && Array.isArray(dyn.candidates)) {
             for (const cand of dyn.candidates) {
               if (cand) moduleSpecifiers.add(cand);
             }
@@ -457,7 +468,7 @@ export function extractJsModuleDependencies(code, contextUrl = 'script.js') {
       }
       return {
         moduleSpecifiers: Array.from(moduleSpecifiers),
-        assetSpecifiers: Array.from(assetSpecifiers)
+        assetSpecifiers: Array.from(assetSpecifiers),
       };
     }
   } catch (err) {
@@ -469,10 +480,10 @@ export function extractJsModuleDependencies(code, contextUrl = 'script.js') {
   let scriptAst;
   try {
     scriptAst = acorn.parse(code, {
-      ecmaVersion: 'latest',
-      sourceType: 'script',
+      ecmaVersion: "latest",
+      sourceType: "script",
       locations: true,
-      ranges: true
+      ranges: true,
     });
   } catch (scriptErr) {
     throw moduleError || scriptErr;
@@ -481,16 +492,16 @@ export function extractJsModuleDependencies(code, contextUrl = 'script.js') {
   walk.simple(scriptAst, {
     ImportExpression(node) {
       if (!node.source) return;
-      if (node.source.type === 'Literal' && typeof node.source.value === 'string') {
+      if (node.source.type === "Literal" && typeof node.source.value === "string") {
         moduleSpecifiers.add(node.source.value);
       } else if (
-        node.source.type === 'TemplateLiteral' &&
+        node.source.type === "TemplateLiteral" &&
         node.source.expressions.length === 0 &&
         node.source.quasis.length > 0
       ) {
-        const spec = node.source.quasis.map(q => q.value.cooked ?? q.value.raw).join('');
+        const spec = node.source.quasis.map((q) => q.value.cooked ?? q.value.raw).join("");
         if (spec) moduleSpecifiers.add(spec);
-      } else if (node.source.type === 'ConditionalExpression') {
+      } else if (node.source.type === "ConditionalExpression") {
         const branches = extractConditionalStringLiterals(node.source);
         if (branches && Array.isArray(branches)) {
           for (const b of branches) {
@@ -498,12 +509,12 @@ export function extractJsModuleDependencies(code, contextUrl = 'script.js') {
           }
         }
       }
-    }
+    },
   });
 
   return {
     moduleSpecifiers: Array.from(moduleSpecifiers),
-    assetSpecifiers: Array.from(assetSpecifiers)
+    assetSpecifiers: Array.from(assetSpecifiers),
   };
 }
 
@@ -519,37 +530,41 @@ export function extractJsModuleDependencies(code, contextUrl = 'script.js') {
  * @param {string} [documentUrl='']
  * @returns {{ effectiveBaseUrl: string, effectiveBaseDir: string, chunkPrefix: string }}
  */
-export function resolveBaseDetails(baseHref, entryDir = '', documentUrl = '') {
-  const effectiveDocUrl = documentUrl || (entryDir ? pathToFileURL(path.join(entryDir, 'index.html')).href : 'file:///app/index.html');
-  const effectiveEntryDir = entryDir ? path.resolve(entryDir) : fileURLToPath(new URL('./', effectiveDocUrl));
+export function resolveBaseDetails(baseHref, entryDir = "", documentUrl = "") {
+  const effectiveDocUrl =
+    documentUrl ||
+    (entryDir ? pathToFileURL(path.join(entryDir, "index.html")).href : "file:///app/index.html");
+  const effectiveEntryDir = entryDir
+    ? path.resolve(entryDir)
+    : fileURLToPath(new URL("./", effectiveDocUrl));
 
-  if (baseHref === null || baseHref === '' || typeof baseHref !== 'string') {
+  if (baseHref === null || baseHref === "" || typeof baseHref !== "string") {
     return {
       effectiveBaseUrl: effectiveDocUrl,
       effectiveBaseDir: effectiveEntryDir,
-      chunkPrefix: './'
+      chunkPrefix: "./",
     };
   }
 
   const trimmed = baseHref.trim();
-  if (trimmed === '') {
+  if (trimmed === "") {
     return {
       effectiveBaseUrl: effectiveDocUrl,
       effectiveBaseDir: effectiveEntryDir,
-      chunkPrefix: './'
+      chunkPrefix: "./",
     };
   }
 
   // Reject explicit URL schemes (e.g. file:, http:, https:), protocol-relative (//),
   // and leading slash/backslash before resolving, to strictly support local relative bases.
   if (
-    trimmed.startsWith('/') ||
-    trimmed.startsWith('\\') ||
-    trimmed.startsWith('//') ||
+    trimmed.startsWith("/") ||
+    trimmed.startsWith("\\") ||
+    trimmed.startsWith("//") ||
     /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(trimmed)
   ) {
     throw new Error(
-      `Explicit rejection: <base href="${baseHref}"> is not currently supported in application build emitter to preserve document.baseURI semantics; base href support remains open.`
+      `Explicit rejection: <base href="${baseHref}"> is not currently supported in application build emitter to preserve document.baseURI semantics; base href support remains open.`,
     );
   }
 
@@ -558,35 +573,39 @@ export function resolveBaseDetails(baseHref, entryDir = '', documentUrl = '') {
     resolvedBaseUrl = new URL(trimmed, effectiveDocUrl);
   } catch {
     throw new Error(
-      `Explicit rejection: <base href="${baseHref}"> is not currently supported in application build emitter to preserve document.baseURI semantics; base href support remains open.`
+      `Explicit rejection: <base href="${baseHref}"> is not currently supported in application build emitter to preserve document.baseURI semantics; base href support remains open.`,
     );
   }
 
-  if (resolvedBaseUrl.protocol !== 'file:') {
+  if (resolvedBaseUrl.protocol !== "file:") {
     throw new Error(
-      `Explicit rejection: <base href="${baseHref}"> is not currently supported in application build emitter to preserve document.baseURI semantics; base href support remains open.`
+      `Explicit rejection: <base href="${baseHref}"> is not currently supported in application build emitter to preserve document.baseURI semantics; base href support remains open.`,
     );
   }
 
-  const baseDir = fileURLToPath(new URL('./', resolvedBaseUrl));
+  const baseDir = fileURLToPath(new URL("./", resolvedBaseUrl));
   const relFromEntry = path.relative(effectiveEntryDir, baseDir);
 
-  if (relFromEntry === '..' || relFromEntry.startsWith('..' + path.sep) || path.isAbsolute(relFromEntry)) {
+  if (
+    relFromEntry === ".." ||
+    relFromEntry.startsWith(".." + path.sep) ||
+    path.isAbsolute(relFromEntry)
+  ) {
     throw new Error(
-      `Explicit rejection: <base href="${baseHref}"> is not currently supported in application build emitter to preserve document.baseURI semantics; base href support remains open.`
+      `Explicit rejection: <base href="${baseHref}"> is not currently supported in application build emitter to preserve document.baseURI semantics; base href support remains open.`,
     );
   }
 
-  const relFromBase = path.relative(baseDir, effectiveEntryDir).split(path.sep).join('/');
-  let chunkPrefix = './';
-  if (relFromBase && relFromBase !== '.') {
-    chunkPrefix = relFromBase.endsWith('/') ? relFromBase : relFromBase + '/';
+  const relFromBase = path.relative(baseDir, effectiveEntryDir).split(path.sep).join("/");
+  let chunkPrefix = "./";
+  if (relFromBase && relFromBase !== ".") {
+    chunkPrefix = relFromBase.endsWith("/") ? relFromBase : relFromBase + "/";
   }
 
   return {
     effectiveBaseUrl: resolvedBaseUrl.href,
     effectiveBaseDir: baseDir,
-    chunkPrefix
+    chunkPrefix,
   };
 }
 
@@ -604,7 +623,12 @@ export function resolveBaseDetails(baseHref, entryDir = '', documentUrl = '') {
  * @param {string} [chunkPrefix='./'] - Relative directory prefix from base to output root
  * @returns {string}
  */
-export function rewriteScriptTagAttributes(attrString, chunkFileName, chunkCode = '', chunkPrefix = './') {
+export function rewriteScriptTagAttributes(
+  attrString,
+  chunkFileName,
+  chunkCode = "",
+  chunkPrefix = "./",
+) {
   const attrRegex = /(?:^|\s+)([a-zA-Z0-9_:-]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
 
   let match;
@@ -615,9 +639,14 @@ export function rewriteScriptTagAttributes(attrString, chunkFileName, chunkCode 
   while ((match = attrRegex.exec(attrString)) !== null) {
     const fullMatch = match[0];
     const name = match[1].toLowerCase();
-    const val = match[2] !== undefined
-      ? match[2]
-      : (match[3] !== undefined ? match[3] : (match[4] !== undefined ? match[4] : ''));
+    const val =
+      match[2] !== undefined
+        ? match[2]
+        : match[3] !== undefined
+          ? match[3]
+          : match[4] !== undefined
+            ? match[4]
+            : "";
 
     // Preserve any whitespace/characters between last token and current match
     if (match.index > lastIndex) {
@@ -625,10 +654,10 @@ export function rewriteScriptTagAttributes(attrString, chunkFileName, chunkCode 
     }
     lastIndex = attrRegex.lastIndex;
 
-    if (name === 'src') {
+    if (name === "src") {
       hasSrc = true;
       pieces.push(` src="${chunkPrefix}${chunkFileName}"`);
-    } else if (name === 'integrity') {
+    } else if (name === "integrity") {
       const newIntegrity = computeIntegrityForContent(val, chunkCode);
       pieces.push(` integrity="${newIntegrity}"`);
     } else {
@@ -647,10 +676,8 @@ export function rewriteScriptTagAttributes(attrString, chunkFileName, chunkCode 
     pieces.push(` src="${chunkPrefix}${chunkFileName}"`);
   }
 
-  return pieces.join('');
+  return pieces.join("");
 }
-
-
 
 /**
  * Rewrites attributes of a <link rel="modulepreload"> tag that matches an emitted chunk.
@@ -663,7 +690,12 @@ export function rewriteScriptTagAttributes(attrString, chunkFileName, chunkCode 
  * @param {string} [chunkPrefix='./']
  * @returns {string}
  */
-export function rewriteLinkTagAttributes(attrString, chunkFileName, chunkCode = '', chunkPrefix = './') {
+export function rewriteLinkTagAttributes(
+  attrString,
+  chunkFileName,
+  chunkCode = "",
+  chunkPrefix = "./",
+) {
   const attrRegex = /(?:^|\s+)([a-zA-Z0-9_:-]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
   let match;
   let lastIndex = 0;
@@ -672,18 +704,23 @@ export function rewriteLinkTagAttributes(attrString, chunkFileName, chunkCode = 
   while ((match = attrRegex.exec(attrString)) !== null) {
     const fullMatch = match[0];
     const name = match[1].toLowerCase();
-    const val = match[2] !== undefined
-      ? match[2]
-      : (match[3] !== undefined ? match[3] : (match[4] !== undefined ? match[4] : ''));
+    const val =
+      match[2] !== undefined
+        ? match[2]
+        : match[3] !== undefined
+          ? match[3]
+          : match[4] !== undefined
+            ? match[4]
+            : "";
 
     if (match.index > lastIndex) {
       pieces.push(attrString.slice(lastIndex, match.index));
     }
     lastIndex = attrRegex.lastIndex;
 
-    if (name === 'href') {
+    if (name === "href") {
       pieces.push(` href="${chunkPrefix}${chunkFileName}"`);
-    } else if (name === 'integrity') {
+    } else if (name === "integrity") {
       if (chunkCode) {
         const newIntegrity = computeIntegrityForContent(val, chunkCode);
         pieces.push(` integrity="${newIntegrity}"`);
@@ -699,7 +736,7 @@ export function rewriteLinkTagAttributes(attrString, chunkFileName, chunkCode = 
     pieces.push(attrString.slice(lastIndex));
   }
 
-  return pieces.join('');
+  return pieces.join("");
 }
 
 /**
@@ -727,20 +764,40 @@ export function rewriteLinkTagAttributes(attrString, chunkFileName, chunkCode = 
 export function rewriteHtmlForBuild(rawHtmlContent, entryFiles, chunkFilesMap = {}, options = {}) {
   let moduleScriptIndex = 0;
   const preloadChunkMap = options.preloadChunkMap || null;
-  const entryDir = options.entryDir || '';
-  const documentUrl = options.documentUrl || (entryDir ? pathToFileURL(path.join(entryDir, 'index.html')).href : 'file:///app/index.html');
+  const entryDir = options.entryDir || "";
+  const documentUrl =
+    options.documentUrl ||
+    (entryDir ? pathToFileURL(path.join(entryDir, "index.html")).href : "file:///app/index.html");
 
   // Discover effective first base href via parseHtmlEntries and validate base containment up front
   const parsedHtml = parseHtmlEntries(rawHtmlContent, documentUrl);
-  const { effectiveBaseDir, chunkPrefix } = resolveBaseDetails(parsedHtml.baseHref, entryDir, documentUrl);
+  const { effectiveBaseDir, chunkPrefix } = resolveBaseDetails(
+    parsedHtml.baseHref,
+    entryDir,
+    documentUrl,
+  );
 
   // Quote-aware tag scanner:
   // Match HTML comments, <script>...</script>, <style>...</style>, <base ...>, or <link ...>
-  const tagRegex = /(<!--[\s\S]*?-->)|(<script\b((?:[^"'><]+|"[^"]*"|'[^']*')*)>([\s\S]*?)<\/script\s*>)|(<style\b((?:[^"'><]+|"[^"]*"|'[^']*')*)>([\s\S]*?)<\/style\s*>)|(<base\b((?:[^"'><]+|"[^"]*"|'[^']*')*)>)|(<link\b((?:[^"'><]+|"[^"]*"|'[^']*')*)>)/gi;
+  const tagRegex =
+    /(<!--[\s\S]*?-->)|(<script\b((?:[^"'><]+|"[^"]*"|'[^']*')*)>([\s\S]*?)<\/script\s*>)|(<style\b((?:[^"'><]+|"[^"]*"|'[^']*')*)>([\s\S]*?)<\/style\s*>)|(<base\b((?:[^"'><]+|"[^"]*"|'[^']*')*)>)|(<link\b((?:[^"'><]+|"[^"]*"|'[^']*')*)>)/gi;
 
   const rewritten = rawHtmlContent.replace(
     tagRegex,
-    (match, isComment, isScript, scriptAttrs, scriptBody, isStyle, styleAttrs, styleBody, isBase, baseAttrs, isLink, linkAttrs) => {
+    (
+      match,
+      isComment,
+      isScript,
+      scriptAttrs,
+      scriptBody,
+      isStyle,
+      styleAttrs,
+      styleBody,
+      isBase,
+      baseAttrs,
+      isLink,
+      linkAttrs,
+    ) => {
       if (isComment || isStyle) {
         return match;
       }
@@ -748,11 +805,11 @@ export function rewriteHtmlForBuild(rawHtmlContent, entryFiles, chunkFilesMap = 
       // Handle <script> tags
       if (isScript) {
         const attrs = parseTagAttributes(scriptAttrs);
-        const scriptType = (attrs.type || 'text/javascript').toLowerCase();
+        const scriptType = (attrs.type || "text/javascript").toLowerCase();
 
-        if (scriptType === 'module') {
+        if (scriptType === "module") {
           // Keep the browser's empty-src error and ignored body, including handlers.
-          if (attrs.src === '') return match;
+          if (attrs.src === "") return match;
           if (attrs.src && isExternalUrl(attrs.src)) {
             // External module root script (http:, https:, data:) preserved verbatim with original attributes
             return match;
@@ -760,18 +817,18 @@ export function rewriteHtmlForBuild(rawHtmlContent, entryFiles, chunkFilesMap = 
 
           if (moduleScriptIndex >= entryFiles.length) {
             throw new Error(
-              `Module script at index ${moduleScriptIndex} exceeds emitted entry chunk count (${entryFiles.length})`
+              `Module script at index ${moduleScriptIndex} exceeds emitted entry chunk count (${entryFiles.length})`,
             );
           }
 
           const chunkFileName = entryFiles[moduleScriptIndex++];
-          const chunkCode = chunkFilesMap[chunkFileName] || '';
+          const chunkCode = chunkFilesMap[chunkFileName] || "";
 
           const updatedAttrString = rewriteScriptTagAttributes(
             scriptAttrs,
             chunkFileName,
             chunkCode,
-            chunkPrefix
+            chunkPrefix,
           );
 
           return `<script${updatedAttrString}></script>`;
@@ -791,14 +848,23 @@ export function rewriteHtmlForBuild(rawHtmlContent, entryFiles, chunkFilesMap = 
         const parsedLink = parseTagAttributes(linkAttrs);
         if (
           parsedLink.rel &&
-          parsedLink.rel.toLowerCase() === 'modulepreload' &&
+          parsedLink.rel.toLowerCase() === "modulepreload" &&
           parsedLink.href &&
           preloadChunkMap
         ) {
-          const chunkFileName = findChunkForPreload(parsedLink.href, effectiveBaseDir, preloadChunkMap);
+          const chunkFileName = findChunkForPreload(
+            parsedLink.href,
+            effectiveBaseDir,
+            preloadChunkMap,
+          );
           if (chunkFileName) {
-            const chunkCode = chunkFilesMap[chunkFileName] || '';
-            const updatedLink = rewriteLinkTagAttributes(linkAttrs, chunkFileName, chunkCode, chunkPrefix);
+            const chunkCode = chunkFilesMap[chunkFileName] || "";
+            const updatedLink = rewriteLinkTagAttributes(
+              linkAttrs,
+              chunkFileName,
+              chunkCode,
+              chunkPrefix,
+            );
             return `<link${updatedLink}>`;
           }
         }
@@ -806,13 +872,13 @@ export function rewriteHtmlForBuild(rawHtmlContent, entryFiles, chunkFilesMap = 
       }
 
       return match;
-    }
+    },
   );
 
   // Enforce entry count equality in both directions
   if (moduleScriptIndex !== entryFiles.length) {
     throw new Error(
-      `Module script count in HTML (${moduleScriptIndex}) does not match emitted entry chunk count (${entryFiles.length})`
+      `Module script count in HTML (${moduleScriptIndex}) does not match emitted entry chunk count (${entryFiles.length})`,
     );
   }
 
@@ -853,11 +919,11 @@ function pathExistsOrSymlink(targetPath) {
  * }>}
  */
 export async function buildApplication(entryPath, outDir, options = {}) {
-  if (!entryPath || typeof entryPath !== 'string') {
-    throw new Error('buildApplication requires a valid entryPath string');
+  if (!entryPath || typeof entryPath !== "string") {
+    throw new Error("buildApplication requires a valid entryPath string");
   }
-  if (!outDir || typeof outDir !== 'string') {
-    throw new Error('buildApplication requires a valid outDir string');
+  if (!outDir || typeof outDir !== "string") {
+    throw new Error("buildApplication requires a valid outDir string");
   }
 
   const resolvedEntryAbs = path.resolve(entryPath);
@@ -866,11 +932,11 @@ export async function buildApplication(entryPath, outDir, options = {}) {
   }
 
   const resolvedOutDir = path.resolve(outDir);
-  const isHtml = entryPath.endsWith('.html') || entryPath.endsWith('.htm');
+  const isHtml = entryPath.endsWith(".html") || entryPath.endsWith(".htm");
   const entryDir = path.dirname(resolvedEntryAbs);
 
   if (isHtml) {
-    const rawHtml = fs.readFileSync(resolvedEntryAbs, 'utf-8');
+    const rawHtml = fs.readFileSync(resolvedEntryAbs, "utf-8");
     const entryBaseUrl = pathToFileURL(resolvedEntryAbs).href;
     const parsedHtml = parseHtmlEntries(rawHtml, entryBaseUrl);
     if (parsedHtml.baseHref !== null) {
@@ -887,7 +953,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
   function collectHtmlAssets(preloadChunkMap, emittedChunkNames, skipModulePreloads = false) {
     if (!isHtml) return;
 
-    const rawHtmlContent = fs.readFileSync(resolvedEntryAbs, 'utf-8');
+    const rawHtmlContent = fs.readFileSync(resolvedEntryAbs, "utf-8");
     const entryBaseUrl = pathToFileURL(resolvedEntryAbs).href;
     const parsedHtml = parseHtmlEntries(rawHtmlContent, entryBaseUrl);
     const importMap = parsedHtml.importMap;
@@ -895,7 +961,12 @@ export async function buildApplication(entryPath, outDir, options = {}) {
 
     // Extract relative assets referenced by the HTML (stylesheets, images, media, non-module scripts)
     // Excludes modulepreloads that map to bundled chunks
-    const relativeAssetUrls = extractRelativeAssetUrls(rawHtmlContent, preloadChunkMap, effectiveBaseDir, skipModulePreloads);
+    const relativeAssetUrls = extractRelativeAssetUrls(
+      rawHtmlContent,
+      preloadChunkMap,
+      effectiveBaseDir,
+      skipModulePreloads,
+    );
 
     // Bounded asset processing queue: handles direct HTML assets, transitive CSS url()/@import children,
     // and literal dynamic imports in retained classic scripts and modules.
@@ -905,7 +976,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
         relUrl,
         referrerDir: effectiveBaseDir,
         referrerPath: resolvedEntryAbs,
-        isModuleSpecifier: false
+        isModuleSpecifier: false,
       });
     }
 
@@ -921,14 +992,17 @@ export async function buildApplication(entryPath, outDir, options = {}) {
       const scriptBody = inlineMatch[2];
       if (!scriptBody || !scriptBody.trim()) continue;
 
-      const { moduleSpecifiers, assetSpecifiers } = extractJsModuleDependencies(scriptBody, parsedHtml.baseUrl);
+      const { moduleSpecifiers, assetSpecifiers } = extractJsModuleDependencies(
+        scriptBody,
+        parsedHtml.baseUrl,
+      );
       for (const spec of moduleSpecifiers) {
         assetQueue.push({
           specifier: spec,
           referrerUrl: parsedHtml.baseUrl,
           referrerDir: effectiveBaseDir,
           referrerPath: resolvedEntryAbs,
-          isModuleSpecifier: true
+          isModuleSpecifier: true,
         });
       }
       for (const assetSpec of assetSpecifiers) {
@@ -936,7 +1010,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
           relUrl: assetSpec,
           referrerDir: effectiveBaseDir,
           referrerPath: resolvedEntryAbs,
-          isModuleSpecifier: false
+          isModuleSpecifier: false,
         });
       }
     }
@@ -952,7 +1026,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
       const referrerPath = item.referrerPath || resolvedEntryAbs;
 
       if (item.isModuleSpecifier) {
-        if (!item.specifier || typeof item.specifier !== 'string') continue;
+        if (!item.specifier || typeof item.specifier !== "string") continue;
         const trimmedSpecifier = item.specifier.trim();
         if (!trimmedSpecifier) continue;
 
@@ -960,19 +1034,21 @@ export async function buildApplication(entryPath, outDir, options = {}) {
         try {
           resolvedUrl = resolveModuleSpecifier(trimmedSpecifier, item.referrerUrl, importMap, {
             mapBaseUrl: parsedHtml.baseUrl,
-            packageRootUrl: options.packageRootUrl
+            packageRootUrl: options.packageRootUrl,
           });
         } catch (err) {
-          let context = '';
+          let context = "";
           if (referrerPath !== resolvedEntryAbs) {
-            context = referrerPath.endsWith('.css')
+            context = referrerPath.endsWith(".css")
               ? ` in CSS referenced from "${referrerPath}"`
               : ` referenced from "${referrerPath}"`;
           }
-          throw new Error(`Unresolved module specifier${context}: "${trimmedSpecifier}" (${err.message})`);
+          throw new Error(
+            `Unresolved module specifier${context}: "${trimmedSpecifier}" (${err.message})`,
+          );
         }
 
-        if (!resolvedUrl.startsWith('file://')) {
+        if (!resolvedUrl.startsWith("file://")) {
           // Non-file URL (e.g. http://, https:, data:); resolved at runtime by browser
           continue;
         }
@@ -981,11 +1057,11 @@ export async function buildApplication(entryPath, outDir, options = {}) {
         relFromEntryDir = path.relative(entryDir, srcAssetAbs);
         moduleUrl = resolvedUrl;
         // File copies share bytes, but query/fragment variants remain distinct modules.
-        const entryDirectoryUrl = new URL('./', entryBaseUrl).href;
-        retainedModuleUrls.set(resolvedUrl, './' + resolvedUrl.slice(entryDirectoryUrl.length));
+        const entryDirectoryUrl = new URL("./", entryBaseUrl).href;
+        retainedModuleUrls.set(resolvedUrl, "./" + resolvedUrl.slice(entryDirectoryUrl.length));
       } else {
         const { relUrl, referrerDir } = item;
-        if (!relUrl || typeof relUrl !== 'string') continue;
+        if (!relUrl || typeof relUrl !== "string") continue;
         const trimmedRelUrl = relUrl.trim();
         if (!trimmedRelUrl) continue;
 
@@ -995,7 +1071,9 @@ export async function buildApplication(entryPath, outDir, options = {}) {
         // Wrapped in try/catch to safely handle asset paths containing unencoded literal '%'
         // not followed by two hex digits (e.g. <img src="./100%_sale.png">).
         try {
-          const referrerDirSlash = referrerDir.endsWith(path.sep) ? referrerDir : referrerDir + path.sep;
+          const referrerDirSlash = referrerDir.endsWith(path.sep)
+            ? referrerDir
+            : referrerDir + path.sep;
           const referrerBaseUrl = pathToFileURL(referrerDirSlash);
           const resolvedUrl = new URL(trimmedRelUrl, referrerBaseUrl);
           srcAssetAbs = fileURLToPath(resolvedUrl);
@@ -1008,41 +1086,45 @@ export async function buildApplication(entryPath, outDir, options = {}) {
       }
 
       // Verify that relative asset or module path does not escape entry directory
-      if (relFromEntryDir.startsWith('..') || path.isAbsolute(relFromEntryDir)) {
+      if (relFromEntryDir.startsWith("..") || path.isAbsolute(relFromEntryDir)) {
         const target = item.isModuleSpecifier ? item.specifier : item.relUrl;
-        let context = '';
+        let context = "";
         if (referrerPath !== resolvedEntryAbs) {
-          context = referrerPath.endsWith('.css') ? ` in CSS "${referrerPath}"` : ` in "${referrerPath}"`;
+          context = referrerPath.endsWith(".css")
+            ? ` in CSS "${referrerPath}"`
+            : ` in "${referrerPath}"`;
         }
-        throw new Error(`Relative resource${context} escapes application root directory: "${target}"`);
+        throw new Error(
+          `Relative resource${context} escapes application root directory: "${target}"`,
+        );
       }
 
       // Pre-emission collision check: a classic script, stylesheet, module, or asset must NOT collide
       // with or silently overwrite/shadow an emitted chunk or the entry HTML file.
       if (emittedChunkNames.has(relFromEntryDir)) {
         const target = item.isModuleSpecifier ? item.specifier : item.relUrl;
-        let context = '';
+        let context = "";
         if (referrerPath !== resolvedEntryAbs) {
-          context = referrerPath.endsWith('.css')
+          context = referrerPath.endsWith(".css")
             ? ` referenced from "${referrerPath}"`
             : ` referenced from "${referrerPath}"`;
         }
         throw new Error(
-          `Collision detected: relative resource "${target}"${context} collides with emitted bundle chunk or entry file "${relFromEntryDir}". Source assets must not collide with emitted chunk names.`
+          `Collision detected: relative resource "${target}"${context} collides with emitted bundle chunk or entry file "${relFromEntryDir}". Source assets must not collide with emitted chunk names.`,
         );
       }
 
       // Explicitly reject unresolved relative resources before output
       if (!fs.existsSync(srcAssetAbs) || !fs.statSync(srcAssetAbs).isFile()) {
         const target = item.isModuleSpecifier ? item.specifier : item.relUrl;
-        let context = '';
+        let context = "";
         if (referrerPath !== resolvedEntryAbs) {
-          context = referrerPath.endsWith('.css')
+          context = referrerPath.endsWith(".css")
             ? ` in CSS referenced from "${referrerPath}"`
             : ` referenced from "${referrerPath}"`;
         }
         throw new Error(
-          `Unresolved relative resource${context}: "${target}" not found at "${srcAssetAbs}"`
+          `Unresolved relative resource${context}: "${target}" not found at "${srcAssetAbs}"`,
         );
       }
 
@@ -1051,9 +1133,9 @@ export async function buildApplication(entryPath, outDir, options = {}) {
       targetFiles.set(relFromEntryDir, assetData);
 
       // If asset is a CSS file, scan for transitive child url() and @import resources
-      if (srcAssetAbs.endsWith('.css') && !visitedCssPaths.has(srcAssetAbs)) {
+      if (srcAssetAbs.endsWith(".css") && !visitedCssPaths.has(srcAssetAbs)) {
         visitedCssPaths.add(srcAssetAbs);
-        const cssContent = assetData.toString('utf-8');
+        const cssContent = assetData.toString("utf-8");
         const childUrls = extractRelativeCssUrls(cssContent);
         const cssDir = path.dirname(srcAssetAbs);
         for (const childUrl of childUrls) {
@@ -1061,7 +1143,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
             relUrl: childUrl,
             referrerDir: cssDir,
             referrerPath: srcAssetAbs,
-            isModuleSpecifier: false
+            isModuleSpecifier: false,
           });
         }
       }
@@ -1069,13 +1151,19 @@ export async function buildApplication(entryPath, outDir, options = {}) {
       // If resource is a module or JS/MJS/CJS file (retained classic script),
       // scan for transitive module dependencies (static/dynamic imports, exports) and asset references
       if (
-        (item.isModuleSpecifier || srcAssetAbs.endsWith('.js') || srcAssetAbs.endsWith('.mjs') || srcAssetAbs.endsWith('.cjs')) &&
+        (item.isModuleSpecifier ||
+          srcAssetAbs.endsWith(".js") ||
+          srcAssetAbs.endsWith(".mjs") ||
+          srcAssetAbs.endsWith(".cjs")) &&
         !visitedJsUrls.has(moduleUrl || pathToFileURL(srcAssetAbs).href)
       ) {
         const fileUrl = moduleUrl || pathToFileURL(srcAssetAbs).href;
         visitedJsUrls.add(fileUrl);
-        const jsContent = assetData.toString('utf-8');
-        const { moduleSpecifiers, assetSpecifiers } = extractJsModuleDependencies(jsContent, fileUrl);
+        const jsContent = assetData.toString("utf-8");
+        const { moduleSpecifiers, assetSpecifiers } = extractJsModuleDependencies(
+          jsContent,
+          fileUrl,
+        );
         const jsDir = path.dirname(srcAssetAbs);
 
         for (const childSpec of moduleSpecifiers) {
@@ -1084,7 +1172,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
             referrerUrl: fileUrl,
             referrerDir: jsDir,
             referrerPath: srcAssetAbs,
-            isModuleSpecifier: true
+            isModuleSpecifier: true,
           });
         }
 
@@ -1093,7 +1181,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
             relUrl: assetSpec,
             referrerDir: jsDir,
             referrerPath: srcAssetAbs,
-            isModuleSpecifier: false
+            isModuleSpecifier: false,
           });
         }
       }
@@ -1104,7 +1192,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
   const bundleResult = await bundleWithRollup(resolvedEntryAbs, {
     packageRootUrl: options.packageRootUrl,
     retainedModuleUrls,
-    specializeNumeric: options.specializeNumeric
+    specializeNumeric: options.specializeNumeric,
   });
   const emittedChunkNames = new Set(Object.keys(bundleResult.files));
   if (htmlFileName) emittedChunkNames.add(htmlFileName);
@@ -1123,12 +1211,15 @@ export async function buildApplication(entryPath, outDir, options = {}) {
   }
   if (isHtml) {
     const entryBaseUrl = pathToFileURL(resolvedEntryAbs).href;
-    targetFiles.set(htmlFileName, rewriteHtmlForBuild(
-      fs.readFileSync(resolvedEntryAbs, 'utf-8'),
-      bundleResult.entryFiles,
-      bundleResult.files,
-      { preloadChunkMap, entryDir, documentUrl: entryBaseUrl }
-    ));
+    targetFiles.set(
+      htmlFileName,
+      rewriteHtmlForBuild(
+        fs.readFileSync(resolvedEntryAbs, "utf-8"),
+        bundleResult.entryFiles,
+        bundleResult.files,
+        { preloadChunkMap, entryDir, documentUrl: entryBaseUrl },
+      ),
+    );
   }
 
   // Safe collision check: fail safely without deleting or overwriting (including symlinks)
@@ -1136,7 +1227,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
     const destPath = path.join(resolvedOutDir, relPath);
     if (pathExistsOrSymlink(destPath)) {
       throw new Error(
-        `Refusing to overwrite existing destination file: ${destPath}. Destination must be fresh; collisions are rejected.`
+        `Refusing to overwrite existing destination file: ${destPath}. Destination must be fresh; collisions are rejected.`,
       );
     }
   }
@@ -1155,11 +1246,11 @@ export async function buildApplication(entryPath, outDir, options = {}) {
       fs.mkdirSync(destDir, { recursive: true });
     }
     try {
-      fs.writeFileSync(destPath, content, { flag: 'wx' });
+      fs.writeFileSync(destPath, content, { flag: "wx" });
     } catch (err) {
-      if (err.code === 'EEXIST') {
+      if (err.code === "EEXIST") {
         throw new Error(
-          `Refusing to overwrite existing destination file: ${destPath}. Destination must be fresh; collisions are rejected.`
+          `Refusing to overwrite existing destination file: ${destPath}. Destination must be fresh; collisions are rejected.`,
         );
       }
       throw err;
@@ -1176,7 +1267,9 @@ export async function buildApplication(entryPath, outDir, options = {}) {
     emittedFiles,
     isMultiChunk: bundleResult.isMultiChunk,
     chunks: bundleResult.chunks,
-    packageType: 'module',
-    ...(bundleResult.numericSpecialization ? { numericSpecialization: bundleResult.numericSpecialization } : {})
+    packageType: "module",
+    ...(bundleResult.numericSpecialization
+      ? { numericSpecialization: bundleResult.numericSpecialization }
+      : {}),
   };
 }

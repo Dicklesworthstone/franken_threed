@@ -12,17 +12,20 @@
  * - Truthful attestations: retained upstream JS execution, no GPU acceleration claim.
  */
 
-import fs from 'node:fs';
-import path from 'node:path';
-import * as acorn from 'acorn';
-import { extractModuleExportSurface as resolveExportSurface } from './export-surface.mjs';
-import { createDevImportMap as createRoutedImportMap, transformHtmlImportMap as transformRoutedHtml } from './import-map-routing.mjs';
+import fs from "node:fs";
+import path from "node:path";
+import * as acorn from "acorn";
+import { extractModuleExportSurface as resolveExportSurface } from "./export-surface.mjs";
+import {
+  createDevImportMap as createRoutedImportMap,
+  transformHtmlImportMap as transformRoutedHtml,
+} from "./import-map-routing.mjs";
 
 /**
  * Standard no-claim attestation for retained upstream compatibility facades (§5.1, §5.12).
  */
 export const FACADE_NO_CLAIM_ATTESTATION =
-  'Retained upstream JS execution preserves full component functionality; not a Rust rewrite and does not claim GPU acceleration (Plan §5.1, §5.12).';
+  "Retained upstream JS execution preserves full component functionality; not a Rust rewrite and does not claim GPU acceleration (Plan §5.1, §5.12).";
 
 /**
  * Categorize a package export entry based on its key and condition.
@@ -32,20 +35,20 @@ export const FACADE_NO_CLAIM_ATTESTATION =
  * @returns {'root_esm' | 'root_cjs' | 'webgpu' | 'tsl' | 'addons' | 'addons_wildcard' | 'src_wildcard' | 'examples_jsm_wildcard' | 'asset'}
  */
 export function categorizeExportEntry(exportKey, condition, target) {
-  const isCode = target.endsWith('.js') || target.endsWith('.cjs');
+  const isCode = target.endsWith(".js") || target.endsWith(".cjs");
   if (!isCode) {
-    return 'asset';
+    return "asset";
   }
-  if (exportKey === '.') {
-    return condition === 'require' ? 'root_cjs' : 'root_esm';
+  if (exportKey === ".") {
+    return condition === "require" ? "root_cjs" : "root_esm";
   }
-  if (exportKey === './webgpu') return 'webgpu';
-  if (exportKey === './tsl') return 'tsl';
-  if (exportKey === './addons') return 'addons';
-  if (exportKey.startsWith('./addons/')) return 'addons_wildcard';
-  if (exportKey.startsWith('./src/')) return 'src_wildcard';
-  if (exportKey.startsWith('./examples/jsm/')) return 'examples_jsm_wildcard';
-  return 'asset';
+  if (exportKey === "./webgpu") return "webgpu";
+  if (exportKey === "./tsl") return "tsl";
+  if (exportKey === "./addons") return "addons";
+  if (exportKey.startsWith("./addons/")) return "addons_wildcard";
+  if (exportKey.startsWith("./src/")) return "src_wildcard";
+  if (exportKey.startsWith("./examples/jsm/")) return "examples_jsm_wildcard";
+  return "asset";
 }
 
 /**
@@ -60,22 +63,26 @@ export function enumeratePackageExportEntries(options = {}) {
   let data = options.reconciliationData;
 
   if (!data) {
-    const jsonPath = options.reconcileJsonPath || path.resolve(process.cwd(), 'evidence/01.1/reconcile.json');
+    const jsonPath =
+      options.reconcileJsonPath || path.resolve(process.cwd(), "evidence/01.1/reconcile.json");
     if (fs.existsSync(jsonPath)) {
-      data = JSON.parse(fs.readFileSync(jsonPath, 'utf-8'));
+      data = JSON.parse(fs.readFileSync(jsonPath, "utf-8"));
     } else {
-      throw new Error(`Reconciliation data not found at: ${jsonPath}. Run reconcile_package.mjs first.`);
+      throw new Error(
+        `Reconciliation data not found at: ${jsonPath}. Run reconcile_package.mjs first.`,
+      );
     }
   }
 
   const rawEntries = data.resolved_exports || [];
-  const packageDir = options.packageDir || 'upstream/three.js';
+  const packageDir = options.packageDir || "upstream/three.js";
 
   return rawEntries.map((e, index) => {
     const category = categorizeExportEntry(e.exportKey, e.condition, e.target);
-    const isCjs = category === 'root_cjs' || e.target.endsWith('.cjs') || e.condition === 'require';
-    const isAsset = category === 'asset' || (!e.target.endsWith('.js') && !e.target.endsWith('.cjs'));
-    const moduleType = isAsset ? 'asset' : isCjs ? 'cjs' : 'esm';
+    const isCjs = category === "root_cjs" || e.target.endsWith(".cjs") || e.condition === "require";
+    const isAsset =
+      category === "asset" || (!e.target.endsWith(".js") && !e.target.endsWith(".cjs"));
+    const moduleType = isAsset ? "asset" : isCjs ? "cjs" : "esm";
 
     return {
       index,
@@ -85,7 +92,7 @@ export function enumeratePackageExportEntries(options = {}) {
       category,
       moduleType,
       isWildcardExpansion: Boolean(e.isWildcardExpansion),
-      retainedRelativePath: path.posix.join(packageDir.replace(/\\/g, '/'), e.target),
+      retainedRelativePath: path.posix.join(packageDir.replace(/\\/g, "/"), e.target),
       retainedAbsolutePath: path.resolve(process.cwd(), packageDir, e.target),
     };
   });
@@ -117,44 +124,40 @@ export function extractModuleExportSurface(filePath, options = {}) {
  */
 export function generateFacadeModule(entry, exportSurface, options = {}) {
   const retainedSpecifier =
-    options.retainedSpecifier ||
-    `./${entry.retainedRelativePath.split(path.sep).join('/')}`;
+    options.retainedSpecifier || `./${entry.retainedRelativePath.split(path.sep).join("/")}`;
 
   const quotedSpecifier = JSON.stringify(retainedSpecifier);
-  const explicitNamed = exportSurface.named.filter((name) => !exportSurface.starOnly?.includes(name));
-  const exportName = (name) => /^[\p{ID_Start}$_][\p{ID_Continue}$\u200c\u200d]*$/u.test(name)
-    ? name : JSON.stringify(name);
+  const explicitNamed = exportSurface.named.filter(
+    (name) => !exportSurface.starOnly?.includes(name),
+  );
+  const exportName = (name) =>
+    /^[\p{ID_Start}$_][\p{ID_Continue}$\u200c\u200d]*$/u.test(name) ? name : JSON.stringify(name);
 
-  const commentText = (value) => String(value).replace(/\*\//g, '* /').replace(/[\r\n]/g, ' ');
+  const commentText = (value) =>
+    String(value)
+      .replace(/\*\//g, "* /")
+      .replace(/[\r\n]/g, " ");
 
   const header = [
-    '/**',
+    "/**",
     ` * FrankenThreeD compatibility facade: ${commentText(entry.exportKey)} [${commentText(entry.condition)}]`,
     ` * Target: ${commentText(entry.target)}`,
-    ' * Pinned Three.js r186 retained export surface',
-    ' *',
+    " * Pinned Three.js r186 retained export surface",
+    " *",
     ` * Attestation: ${FACADE_NO_CLAIM_ATTESTATION}`,
-    ' */',
-  ].join('\n');
+    " */",
+  ].join("\n");
 
   // CommonJS root entry point
-  if (entry.moduleType === 'cjs' || entry.condition === 'require') {
-    return [
-      header,
-      "'use strict';",
-      '',
-      `module.exports = require(${quotedSpecifier});`,
-      '',
-    ].join('\n');
+  if (entry.moduleType === "cjs" || entry.condition === "require") {
+    return [header, "'use strict';", "", `module.exports = require(${quotedSpecifier});`, ""].join(
+      "\n",
+    );
   }
 
   // Pure side-effects module (no exports)
   if (exportSurface.named.length === 0 && !exportSurface.hasDefault) {
-    return [
-      header,
-      `export * from ${quotedSpecifier};`,
-      '',
-    ].join('\n');
+    return [header, `export * from ${quotedSpecifier};`, ""].join("\n");
   }
 
   const lines = [header];
@@ -170,12 +173,12 @@ export function generateFacadeModule(entry, exportSurface, options = {}) {
   // Explicit named re-exports for 100% transparent AST inspection and autocomplete
   if (explicitNamed.length > 0) {
     lines.push(`export {`);
-    lines.push(`  ${explicitNamed.map(exportName).join(',\n  ')}`);
+    lines.push(`  ${explicitNamed.map(exportName).join(",\n  ")}`);
     lines.push(`} from ${quotedSpecifier};`);
   }
 
-  lines.push('');
-  return lines.join('\n');
+  lines.push("");
+  return lines.join("\n");
 }
 
 /**
@@ -186,42 +189,39 @@ export function generateFacadeModule(entry, exportSurface, options = {}) {
  * @param {'esm' | 'cjs'} [moduleType='esm']
  * @returns {{ named: string[], hasDefault: boolean, hasWildcard: boolean, isCJS: boolean }}
  */
-export function parseFacadeExportSurface(facadeSource, moduleType = 'esm') {
-  if (moduleType === 'cjs') {
+export function parseFacadeExportSurface(facadeSource, moduleType = "esm") {
+  if (moduleType === "cjs") {
     const ast = acorn.parse(facadeSource, {
-      ecmaVersion: 'latest',
-      sourceType: 'script',
+      ecmaVersion: "latest",
+      sourceType: "script",
     });
 
     let assignsModuleExports = false;
     let callsRequire = false;
 
     for (const node of ast.body) {
-      if (node.type === 'VariableDeclaration') {
+      if (node.type === "VariableDeclaration") {
         for (const decl of node.declarations) {
           if (
             decl.init &&
-            decl.init.type === 'CallExpression' &&
-            decl.init.callee.name === 'require'
+            decl.init.type === "CallExpression" &&
+            decl.init.callee.name === "require"
           ) {
             callsRequire = true;
           }
         }
       }
-      if (
-        node.type === 'ExpressionStatement' &&
-        node.expression.type === 'AssignmentExpression'
-      ) {
+      if (node.type === "ExpressionStatement" && node.expression.type === "AssignmentExpression") {
         const left = node.expression.left;
         if (
-          left.type === 'MemberExpression' &&
-          left.object.name === 'module' &&
-          left.property.name === 'exports'
+          left.type === "MemberExpression" &&
+          left.object.name === "module" &&
+          left.property.name === "exports"
         ) {
           assignsModuleExports = true;
           if (
-            node.expression.right.type === 'CallExpression' &&
-            node.expression.right.callee.name === 'require'
+            node.expression.right.type === "CallExpression" &&
+            node.expression.right.callee.name === "require"
           ) {
             callsRequire = true;
           }
@@ -240,8 +240,8 @@ export function parseFacadeExportSurface(facadeSource, moduleType = 'esm') {
   }
 
   const ast = acorn.parse(facadeSource, {
-    ecmaVersion: 'latest',
-    sourceType: 'module',
+    ecmaVersion: "latest",
+    sourceType: "module",
   });
 
   const named = new Set();
@@ -249,17 +249,17 @@ export function parseFacadeExportSurface(facadeSource, moduleType = 'esm') {
   let hasWildcard = false;
 
   for (const node of ast.body) {
-    if (node.type === 'ExportAllDeclaration') {
+    if (node.type === "ExportAllDeclaration") {
       if (!node.exported) hasWildcard = true;
       else {
         const name = node.exported.name ?? node.exported.value;
-        if (name === 'default') hasDefault = true;
+        if (name === "default") hasDefault = true;
         else named.add(name);
       }
-    } else if (node.type === 'ExportNamedDeclaration') {
+    } else if (node.type === "ExportNamedDeclaration") {
       for (const spec of node.specifiers) {
         const exportedName = spec.exported.name ?? spec.exported.value;
-        if (exportedName === 'default') {
+        if (exportedName === "default") {
           hasDefault = true;
         } else {
           named.add(exportedName);
@@ -294,9 +294,15 @@ export function buildFacadeModuleMap(options = {}) {
   const facadeMap = new Map();
   // Use the reconciled import targets for package self-references. Resolving
   // through require() would select the wrong side of conditional package exports.
-  const packageName = options.packageName || 'three';
-  const packageTargets = new Map(entries.filter((entry) => entry.moduleType === 'esm')
-    .map((entry) => [entry.exportKey === '.' ? packageName : `${packageName}/${entry.exportKey.slice(2)}`, entry.retainedAbsolutePath]));
+  const packageName = options.packageName || "three";
+  const packageTargets = new Map(
+    entries
+      .filter((entry) => entry.moduleType === "esm")
+      .map((entry) => [
+        entry.exportKey === "." ? packageName : `${packageName}/${entry.exportKey.slice(2)}`,
+        entry.retainedAbsolutePath,
+      ]),
+  );
   const resolveModule = (specifier, importer) =>
     options.resolveModule?.(specifier, importer) ?? packageTargets.get(specifier);
 
@@ -310,7 +316,7 @@ export function buildFacadeModuleMap(options = {}) {
   for (const entry of entries) {
     categoryCounts[entry.category] = (categoryCounts[entry.category] || 0) + 1;
 
-    if (entry.moduleType === 'asset') {
+    if (entry.moduleType === "asset") {
       assetCount++;
       const item = {
         ...entry,
@@ -322,7 +328,7 @@ export function buildFacadeModuleMap(options = {}) {
       continue;
     }
 
-    if (entry.moduleType === 'cjs') {
+    if (entry.moduleType === "cjs") {
       cjsCount++;
       const surface = { named: [], hasDefault: false, totalCount: 0, isCJS: true };
       const facadeSource = generateFacadeModule(entry, surface, options);
@@ -338,7 +344,10 @@ export function buildFacadeModuleMap(options = {}) {
 
     // ESM module
     esmCount++;
-    const surface = extractModuleExportSurface(entry.retainedAbsolutePath, { cache, resolveModule });
+    const surface = extractModuleExportSurface(entry.retainedAbsolutePath, {
+      cache,
+      resolveModule,
+    });
     totalNamedExports += surface.named.length;
     if (surface.hasDefault) defaultCount++;
 
@@ -377,7 +386,9 @@ export function buildFacadeModuleMap(options = {}) {
  * @returns {Promise<{ emittedFiles: string[], count: number, summary: Object }>}
  */
 export async function emitFacadeFiles(targetDir, options = {}) {
-  const resolvedTargetDir = fs.existsSync(targetDir) ? fs.realpathSync(targetDir) : path.resolve(targetDir);
+  const resolvedTargetDir = fs.existsSync(targetDir)
+    ? fs.realpathSync(targetDir)
+    : path.resolve(targetDir);
   const result = buildFacadeModuleMap(options);
   const emittedFiles = [];
 
@@ -385,12 +396,12 @@ export async function emitFacadeFiles(targetDir, options = {}) {
     if (!item.facadeSource) continue;
 
     let subPath;
-    if (item.exportKey === '.') {
-      subPath = item.condition === 'require' ? 'index.cjs' : 'index.js';
+    if (item.exportKey === ".") {
+      subPath = item.condition === "require" ? "index.cjs" : "index.js";
     } else {
-      subPath = item.exportKey.replace(/^\.\//, '');
+      subPath = item.exportKey.replace(/^\.\//, "");
       if (!path.extname(subPath)) {
-        subPath += '.js';
+        subPath += ".js";
       }
     }
 
@@ -401,15 +412,15 @@ export async function emitFacadeFiles(targetDir, options = {}) {
     }
 
     // Adjust relative specifier to retained file from outPath
-    const retainedRel = path.relative(outDir, item.retainedAbsolutePath).split(path.sep).join('/');
-    const retainedSpecifier = retainedRel.startsWith('.') ? retainedRel : `./${retainedRel}`;
+    const retainedRel = path.relative(outDir, item.retainedAbsolutePath).split(path.sep).join("/");
+    const retainedSpecifier = retainedRel.startsWith(".") ? retainedRel : `./${retainedRel}`;
 
     const adjustedSource = generateFacadeModule(item, item.exportSurface, {
       ...options,
       retainedSpecifier,
     });
 
-    fs.writeFileSync(outPath, adjustedSource, 'utf-8');
+    fs.writeFileSync(outPath, adjustedSource, "utf-8");
     emittedFiles.push(outPath);
   }
 
@@ -457,4 +468,3 @@ export function createDevImportMap(options = {}) {
 export function transformHtmlImportMap(htmlContent, options = {}) {
   return transformRoutedHtml(htmlContent, options);
 }
-

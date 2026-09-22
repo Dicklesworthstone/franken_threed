@@ -12,9 +12,9 @@
  * - No-claim boundary: exact-backend execution is honest compatibility, never claimed as WebGPU acceleration.
  */
 
-import { WebGLRenderer as PinnedWebGLRenderer } from '../../upstream/three.js/build/three.module.js';
-import { ExecutionRoute } from './route_types.mjs';
-import { RendererConstructionRouter } from './construction_adapter.mjs';
+import { WebGLRenderer as PinnedWebGLRenderer } from "../../upstream/three.js/build/three.module.js";
+import { RendererConstructionRouter } from "./construction_adapter.mjs";
+import { ExecutionRoute } from "./route_types.mjs";
 
 export { PinnedWebGLRenderer };
 
@@ -34,10 +34,12 @@ export const ExactWebGLRenderer = PinnedWebGLRenderer;
  * @returns {RendererConstructionRouter} The router instance with exact backend registered
  */
 export function registerExactBackend(router, { constructorName } = {}) {
-  if (!router || typeof router.registerImplementation !== 'function') {
-    throw new TypeError('router must be an instance of RendererConstructionRouter');
+  if (!router || typeof router.registerImplementation !== "function") {
+    throw new TypeError("router must be an instance of RendererConstructionRouter");
   }
-  router.registerImplementation(ExecutionRoute.EXACT_BACKEND, PinnedWebGLRenderer, { constructorName });
+  router.registerImplementation(ExecutionRoute.EXACT_BACKEND, PinnedWebGLRenderer, {
+    constructorName,
+  });
   return router;
 }
 
@@ -72,15 +74,16 @@ export function createExactBackendRouter(config = {}) {
  * @returns {PinnedWebGLRenderer} Genuine pinned WebGLRenderer instance (never a wrapper proxy)
  */
 export function createExactWebGLRenderer(options = {}, routerOrConfig) {
-  const router = routerOrConfig instanceof RendererConstructionRouter
-    ? routerOrConfig
-    : createExactBackendRouter(routerOrConfig);
+  const router =
+    routerOrConfig instanceof RendererConstructionRouter
+      ? routerOrConfig
+      : createExactBackendRouter(routerOrConfig);
 
   return router.routeAndConstruct({
     constructorFn: PinnedWebGLRenderer,
-    constructorName: 'WebGLRenderer',
+    constructorName: "WebGLRenderer",
     options,
-    sourceSpan: 'tools/compat/exact_backend.mjs:createExactWebGLRenderer',
+    sourceSpan: "tools/compat/exact_backend.mjs:createExactWebGLRenderer",
   });
 }
 
@@ -92,7 +95,7 @@ export function createExactWebGLRenderer(options = {}, routerOrConfig) {
  * @returns {Promise<Object>} Pinned WebGLBackend instance
  */
 export async function createExactBackendForRenderer(backendOptions = {}) {
-  const { WebGLBackend } = await import('../../upstream/three.js/build/three.webgpu.js');
+  const { WebGLBackend } = await import("../../upstream/three.js/build/three.webgpu.js");
   return new WebGLBackend(backendOptions);
 }
 
@@ -101,6 +104,6 @@ export async function createExactBackendForRenderer(backendOptions = {}) {
  * @returns {Promise<Function>} The pinned WebGLBackend constructor
  */
 export async function getPinnedWebGLBackend() {
-  const { WebGLBackend } = await import('../../upstream/three.js/build/three.webgpu.js');
+  const { WebGLBackend } = await import("../../upstream/three.js/build/three.webgpu.js");
   return WebGLBackend;
 }

@@ -10,27 +10,27 @@
  */
 export const ExecutionRoute = Object.freeze({
   /** Verified accelerated Rust/Wasm/WebGPU execution */
-  SPECIALIZED_WEBGPU: 'specialized-webgpu',
+  SPECIALIZED_WEBGPU: "specialized-webgpu",
   /** Working WebGPU execution when specialization is unavailable */
-  GENERAL_WEBGPU: 'general-webgpu',
+  GENERAL_WEBGPU: "general-webgpu",
   /** Full component functionality through retained JS/host code (e.g. CSS2D/SVG/interim) */
-  RETAINED_UPSTREAM: 'retained-upstream',
+  RETAINED_UPSTREAM: "retained-upstream",
   /** Exact backend component (pinned upstream WebGLRenderer/backend); never credited as acceleration */
-  EXACT_BACKEND: 'exact-backend',
+  EXACT_BACKEND: "exact-backend",
 });
 
 /**
  * Reasons triggering a route decision or fallback.
  */
 export const EscapeReason = Object.freeze({
-  EXPLICIT_SOURCE_SELECTION: 'explicit-source-selection',
-  NATIVE_CONTEXT_ACCESS: 'native-context-access',
-  OPAQUE_GL_ESCAPE: 'opaque-gl-escape',
-  HOST_LIMITATION_FALLBACK: 'host-limitation-fallback',
-  CONNECTED_GROUP_CONSTRAINT: 'connected-group-constraint',
-  SPECIALIZATION_UNAVAILABLE: 'specialization-unavailable',
-  UNRESOLVED_FORCE_WEBGL: 'unresolved-force-webgl',
-  UNRESOLVED_NATIVE_CONTEXT_ACCESS: 'unresolved-native-context-access',
+  EXPLICIT_SOURCE_SELECTION: "explicit-source-selection",
+  NATIVE_CONTEXT_ACCESS: "native-context-access",
+  OPAQUE_GL_ESCAPE: "opaque-gl-escape",
+  HOST_LIMITATION_FALLBACK: "host-limitation-fallback",
+  CONNECTED_GROUP_CONSTRAINT: "connected-group-constraint",
+  SPECIALIZATION_UNAVAILABLE: "specialization-unavailable",
+  UNRESOLVED_FORCE_WEBGL: "unresolved-force-webgl",
+  UNRESOLVED_NATIVE_CONTEXT_ACCESS: "unresolved-native-context-access",
 });
 
 /**
@@ -44,12 +44,12 @@ export class RouteLockError extends Error {
    * @param {string} requestedRoute
    * @param {string} [sourceSpan]
    */
-  constructor(canvasId, existingRoute, requestedRoute, sourceSpan = 'unknown') {
+  constructor(canvasId, existingRoute, requestedRoute, sourceSpan = "unknown") {
     super(
       `Irreversible route lock violation: canvas '${canvasId}' is already bound to route '${existingRoute}'; ` +
-      `cannot switch to route '${requestedRoute}' at ${sourceSpan}.`
+        `cannot switch to route '${requestedRoute}' at ${sourceSpan}.`,
     );
-    this.name = 'RouteLockError';
+    this.name = "RouteLockError";
     this.canvasId = canvasId;
     this.existingRoute = existingRoute;
     this.requestedRoute = requestedRoute;

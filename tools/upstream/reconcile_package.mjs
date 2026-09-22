@@ -18,9 +18,9 @@
  * - Full resolved census (no slicing/omissions).
  */
 
-import { promises as fs } from 'node:fs';
-import path from 'node:path';
-import process from 'node:process';
+import { promises as fs } from "node:fs";
+import path from "node:path";
+import process from "node:process";
 
 /**
  * Standard known/explained aliases in Three.js package.json.
@@ -28,29 +28,29 @@ import process from 'node:process';
  */
 export const KNOWN_EXPLAINED_ALIASES = new Map([
   [
-    './build/three.module.js',
-    'Root ESM build artifact is intentionally mirrored as root package export "." under "import".'
+    "./build/three.module.js",
+    'Root ESM build artifact is intentionally mirrored as root package export "." under "import".',
   ],
   [
-    './build/three.cjs',
-    'Root CommonJS build artifact is intentionally mirrored as root package export "." under "require".'
+    "./build/three.cjs",
+    'Root CommonJS build artifact is intentionally mirrored as root package export "." under "require".',
   ],
   [
-    './build/three.webgpu.js',
-    'WebGPU standalone build artifact is intentionally exposed via convenience subpath "./webgpu".'
+    "./build/three.webgpu.js",
+    'WebGPU standalone build artifact is intentionally exposed via convenience subpath "./webgpu".',
   ],
   [
-    './build/three.tsl.js',
-    'TSL standalone build artifact is intentionally exposed via convenience subpath "./tsl".'
+    "./build/three.tsl.js",
+    'TSL standalone build artifact is intentionally exposed via convenience subpath "./tsl".',
   ],
   [
-    './examples/jsm/*',
-    'Upstream examples/jsm directory is mapped to the canonical "./addons/*" subpath export.'
+    "./examples/jsm/*",
+    'Upstream examples/jsm directory is mapped to the canonical "./addons/*" subpath export.',
   ],
   [
-    './src/*',
-    'Direct source files are mirrored under "./src/*" export subpath for source-level tool imports.'
-  ]
+    "./src/*",
+    'Direct source files are mirrored under "./src/*" export subpath for source-level tool imports.',
+  ],
 ]);
 
 /**
@@ -64,7 +64,7 @@ export async function listFilesRecursive(dir, rootDir = dir) {
   try {
     const entries = await fs.readdir(dir, { withFileTypes: true });
     for (const entry of entries) {
-      if (entry.name.startsWith('._') || entry.name === '.DS_Store') {
+      if (entry.name.startsWith("._") || entry.name === ".DS_Store") {
         continue;
       }
       const fullPath = path.join(dir, entry.name);
@@ -72,12 +72,12 @@ export async function listFilesRecursive(dir, rootDir = dir) {
         const subFiles = await listFilesRecursive(fullPath, rootDir);
         results.push(...subFiles);
       } else if (entry.isFile() || entry.isSymbolicLink()) {
-        const relPath = path.relative(rootDir, fullPath).split(path.sep).join('/');
+        const relPath = path.relative(rootDir, fullPath).split(path.sep).join("/");
         results.push(relPath);
       }
     }
   } catch (err) {
-    if (err.code !== 'ENOENT') {
+    if (err.code !== "ENOENT") {
       throw err;
     }
   }
@@ -95,10 +95,10 @@ export async function checkPathExists(targetPath) {
     return {
       exists: true,
       isDirectory: stat.isDirectory(),
-      isFile: stat.isFile()
+      isFile: stat.isFile(),
     };
   } catch (err) {
-    if (err.code === 'ENOENT') {
+    if (err.code === "ENOENT") {
       return { exists: false, isDirectory: false, isFile: false };
     }
     throw err;
@@ -112,12 +112,12 @@ export async function checkPathExists(targetPath) {
  * @param {string} currentCondition Prefix of conditions
  * @returns {Array<{ condition: string, target: string }>}
  */
-export function flattenExportTarget(targetValue, currentCondition = '') {
+export function flattenExportTarget(targetValue, currentCondition = "") {
   if (targetValue === null || targetValue === undefined) {
     return [];
   }
-  if (typeof targetValue === 'string') {
-    return [{ condition: currentCondition || 'default', target: targetValue }];
+  if (typeof targetValue === "string") {
+    return [{ condition: currentCondition || "default", target: targetValue }];
   }
   if (Array.isArray(targetValue)) {
     const res = [];
@@ -127,7 +127,7 @@ export function flattenExportTarget(targetValue, currentCondition = '') {
     }
     return res;
   }
-  if (typeof targetValue === 'object') {
+  if (typeof targetValue === "object") {
     const res = [];
     for (const [key, value] of Object.entries(targetValue)) {
       const cond = currentCondition ? `${currentCondition}.${key}` : key;
@@ -149,46 +149,44 @@ export function parseExports(exportsField) {
   }
   const entries = [];
 
-  if (typeof exportsField === 'string' || Array.isArray(exportsField)) {
+  if (typeof exportsField === "string" || Array.isArray(exportsField)) {
     const targets = flattenExportTarget(exportsField);
     for (const t of targets) {
       entries.push({
-        exportKey: '.',
+        exportKey: ".",
         condition: t.condition,
         target: t.target,
-        isWildcard: t.target.includes('*')
+        isWildcard: t.target.includes("*"),
       });
     }
     return entries;
   }
 
-  if (typeof exportsField === 'object') {
-    const isDirectConditions = Object.keys(exportsField).some(
-      (k) => !k.startsWith('.')
-    );
+  if (typeof exportsField === "object") {
+    const isDirectConditions = Object.keys(exportsField).some((k) => !k.startsWith("."));
 
     if (isDirectConditions) {
       const targets = flattenExportTarget(exportsField);
       for (const t of targets) {
         entries.push({
-          exportKey: '.',
+          exportKey: ".",
           condition: t.condition,
           target: t.target,
-          isWildcard: t.target.includes('*')
+          isWildcard: t.target.includes("*"),
         });
       }
       return entries;
     }
 
     for (const [exportKey, targetVal] of Object.entries(exportsField)) {
-      const isWildcard = exportKey.includes('*');
+      const isWildcard = exportKey.includes("*");
       const targets = flattenExportTarget(targetVal);
       for (const t of targets) {
         entries.push({
           exportKey,
           condition: t.condition,
           target: t.target,
-          isWildcard: isWildcard || t.target.includes('*')
+          isWildcard: isWildcard || t.target.includes("*"),
         });
       }
     }
@@ -209,14 +207,14 @@ export function parseExports(exportsField) {
  */
 export async function reconcilePackage({
   packageDir,
-  packageJsonPath = path.join(packageDir, 'package.json'),
-  explainedAliases = KNOWN_EXPLAINED_ALIASES
+  packageJsonPath = path.join(packageDir, "package.json"),
+  explainedAliases = KNOWN_EXPLAINED_ALIASES,
 }) {
-  const normalizedPkgDir = packageDir.replace(/\\/g, '/').replace(/\/+$/, '');
+  const normalizedPkgDir = packageDir.replace(/\\/g, "/").replace(/\/+$/, "");
   const absolutePkgDir = path.resolve(packageDir);
   const absolutePkgJson = path.resolve(packageJsonPath);
 
-  const rawJson = await fs.readFile(absolutePkgJson, 'utf8');
+  const rawJson = await fs.readFile(absolutePkgJson, "utf8");
   const pkg = JSON.parse(rawJson);
 
   const parsedExports = parseExports(pkg.exports);
@@ -237,23 +235,23 @@ export async function reconcilePackage({
     if (entry.isWildcard) {
       // E.g. exportKey: "./addons/*" or "./foo/*.js"
       // target: "./examples/jsm/*" or "./dist/*.mjs"
-      const targetStarIdx = entry.target.indexOf('*');
-      const exportStarIdx = entry.exportKey.indexOf('*');
+      const targetStarIdx = entry.target.indexOf("*");
+      const exportStarIdx = entry.exportKey.indexOf("*");
 
       if (targetStarIdx === -1 || exportStarIdx === -1) {
         missingTargets.push({
           exportKey: entry.exportKey,
           condition: entry.condition,
           target: entry.target,
-          resolvedPath: entry.target.replace(/^\.\//, ''),
+          resolvedPath: entry.target.replace(/^\.\//, ""),
           isWildcard: true,
           explained: false,
-          reason: 'Wildcard export mismatch: star (*) missing from exportKey or target'
+          reason: "Wildcard export mismatch: star (*) missing from exportKey or target",
         });
         continue;
       }
 
-      const targetPrefix = entry.target.slice(0, targetStarIdx).replace(/^\.\//, '');
+      const targetPrefix = entry.target.slice(0, targetStarIdx).replace(/^\.\//, "");
       const targetSuffix = entry.target.slice(targetStarIdx + 1);
 
       const exportPrefix = entry.exportKey.slice(0, exportStarIdx);
@@ -270,7 +268,7 @@ export async function reconcilePackage({
           resolvedPath: targetPrefix,
           isWildcard: true,
           explained: false,
-          reason: `Wildcard target base directory '${targetPrefix}' does not exist on disk`
+          reason: `Wildcard target base directory '${targetPrefix}' does not exist on disk`,
         });
       } else {
         // Enumerate files under wildcard target directory
@@ -290,7 +288,7 @@ export async function reconcilePackage({
             targetDir: targetPrefix,
             targetSuffix,
             explained: false,
-            reason: `Wildcard target directory '${targetPrefix}' contains no files matching suffix '${targetSuffix}'`
+            reason: `Wildcard target directory '${targetPrefix}' contains no files matching suffix '${targetSuffix}'`,
           });
         } else {
           for (const file of matchingFiles) {
@@ -303,7 +301,7 @@ export async function reconcilePackage({
               condition: entry.condition,
               target: fullTargetRel,
               isWildcardExpansion: true,
-              exists: true
+              exists: true,
             });
 
             if (!targetUsage.has(fullTargetRel)) {
@@ -311,14 +309,14 @@ export async function reconcilePackage({
             }
             targetUsage.get(fullTargetRel).push({
               exportKey: exportSubpath,
-              condition: entry.condition
+              condition: entry.condition,
             });
           }
         }
       }
     } else {
       // Static export path
-      const targetRel = entry.target.replace(/^\.\//, '');
+      const targetRel = entry.target.replace(/^\.\//, "");
       const targetAbs = path.join(absolutePkgDir, targetRel);
       const check = await checkPathExists(targetAbs);
 
@@ -331,7 +329,7 @@ export async function reconcilePackage({
           resolvedPath: targetRel,
           isWildcard: false,
           explained: false,
-          reason: `Export target file '${targetRel}' does not exist on disk`
+          reason: `Export target file '${targetRel}' does not exist on disk`,
         });
       } else if (!check.isFile) {
         missingTargets.push({
@@ -341,7 +339,7 @@ export async function reconcilePackage({
           resolvedPath: targetRel,
           isWildcard: false,
           explained: false,
-          reason: `Export target '${targetRel}' is a directory, not an executable module file`
+          reason: `Export target '${targetRel}' is a directory, not an executable module file`,
         });
       } else {
         resolvedExports.push({
@@ -349,7 +347,7 @@ export async function reconcilePackage({
           condition: entry.condition,
           target: targetRel,
           isWildcardExpansion: false,
-          exists: true
+          exists: true,
         });
 
         if (!targetUsage.has(targetRel)) {
@@ -357,7 +355,7 @@ export async function reconcilePackage({
         }
         targetUsage.get(targetRel).push({
           exportKey: entry.exportKey,
-          condition: entry.condition
+          condition: entry.condition,
         });
       }
     }
@@ -375,15 +373,13 @@ export async function reconcilePackage({
     if (usages.length > 1) {
       const normalizedTarget = `./${targetRel}`;
       let reason =
-        explainedAliases.get(normalizedTarget) ||
-        explainedAliases.get(targetRel) ||
-        null;
+        explainedAliases.get(normalizedTarget) || explainedAliases.get(targetRel) || null;
 
       if (!reason) {
         for (const [pattern, patReason] of explainedAliases.entries()) {
-          if (pattern.endsWith('/*')) {
-            const prefix = pattern.slice(0, -2).replace(/^\.\//, '');
-            if (targetRel === prefix || targetRel.startsWith(prefix + '/')) {
+          if (pattern.endsWith("/*")) {
+            const prefix = pattern.slice(0, -2).replace(/^\.\//, "");
+            if (targetRel === prefix || targetRel.startsWith(prefix + "/")) {
               reason = patReason;
               break;
             }
@@ -398,7 +394,9 @@ export async function reconcilePackage({
         usages,
         usageCount: usages.length,
         explained: isExplained,
-        reason: isExplained ? reason : 'Unexplained duplicate export target referenced by multiple exports'
+        reason: isExplained
+          ? reason
+          : "Unexplained duplicate export target referenced by multiple exports",
       });
     }
   }
@@ -406,17 +404,17 @@ export async function reconcilePackage({
 
   // 3. Reconcile and expand files entries (packaged inventory)
   for (const fileEntry of filesField) {
-    if (fileEntry.includes('*') || fileEntry.includes('?') || fileEntry.includes('[')) {
+    if (fileEntry.includes("*") || fileEntry.includes("?") || fileEntry.includes("[")) {
       missingFilesEntries.push({
         filesEntry: fileEntry,
-        resolvedPath: fileEntry.replace(/^\.\//, ''),
+        resolvedPath: fileEntry.replace(/^\.\//, ""),
         isGlob: true,
         explained: false,
-        reason: `Package.json 'files' glob pattern '${fileEntry}' is unsupported (literal path expected)`
+        reason: `Package.json 'files' glob pattern '${fileEntry}' is unsupported (literal path expected)`,
       });
       continue;
     }
-    const entryRel = fileEntry.replace(/^\.\//, '');
+    const entryRel = fileEntry.replace(/^\.\//, "");
     const entryAbs = path.join(absolutePkgDir, entryRel);
     const check = await checkPathExists(entryAbs);
 
@@ -425,7 +423,7 @@ export async function reconcilePackage({
         filesEntry: fileEntry,
         resolvedPath: entryRel,
         explained: false,
-        reason: `Package.json 'files' entry '${fileEntry}' does not exist on disk`
+        reason: `Package.json 'files' entry '${fileEntry}' does not exist on disk`,
       });
     } else if (check.isDirectory) {
       // Expand directory into packaged inventory files
@@ -455,12 +453,12 @@ export async function reconcilePackage({
     aliasDuplicates.filter((a) => !a.explained).length;
 
   return {
-    schema_version: '1.0',
+    schema_version: "1.0",
     package_metadata: {
-      name: pkg.name || 'three',
-      version: pkg.version || '0.186.0',
-      type: pkg.type || 'module',
-      package_dir: normalizedPkgDir
+      name: pkg.name || "three",
+      version: pkg.version || "0.186.0",
+      type: pkg.type || "module",
+      package_dir: normalizedPkgDir,
     },
     summary: {
       total_exports_checked: totalExportsChecked,
@@ -473,16 +471,16 @@ export async function reconcilePackage({
       packaged_inventory_files_count: packagedInventoryFiles.length,
       explained_discrepancies: explainedCount,
       unexplained_discrepancies: unexplainedCount,
-      is_clean: unexplainedCount === 0
+      is_clean: unexplainedCount === 0,
     },
     discrepancies: {
       missing_export_targets: missingTargets,
       missing_files_entries: missingFilesEntries,
       wildcard_unmatched: wildcardUnmatched,
-      alias_duplicates: aliasDuplicates
+      alias_duplicates: aliasDuplicates,
     },
     packaged_inventory_files: packagedInventoryFiles,
-    resolved_exports: resolvedExports
+    resolved_exports: resolvedExports,
   };
 }
 
@@ -494,7 +492,7 @@ export async function reconcilePackage({
  */
 export function formatDeterministicJson(obj) {
   function sortKeys(val) {
-    if (val === null || typeof val !== 'object') {
+    if (val === null || typeof val !== "object") {
       return val;
     }
     if (Array.isArray(val)) {
@@ -506,7 +504,7 @@ export function formatDeterministicJson(obj) {
     }
     return sorted;
   }
-  return JSON.stringify(sortKeys(obj), null, 2) + '\n';
+  return JSON.stringify(sortKeys(obj), null, 2) + "\n";
 }
 
 /**
@@ -514,7 +512,7 @@ export function formatDeterministicJson(obj) {
  */
 async function main() {
   const args = process.argv.slice(2);
-  let packageDir = 'upstream/three.js';
+  let packageDir = "upstream/three.js";
   let packageJsonPath = null;
   let outPath = null;
   let failOnUnexplained = false;
@@ -523,19 +521,19 @@ async function main() {
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
-    if ((arg === '--package-dir' || arg === '--upstream-dir') && i + 1 < args.length) {
+    if ((arg === "--package-dir" || arg === "--upstream-dir") && i + 1 < args.length) {
       packageDir = args[++i];
-    } else if (arg === '--package-json' && i + 1 < args.length) {
+    } else if (arg === "--package-json" && i + 1 < args.length) {
       packageJsonPath = args[++i];
-    } else if (arg === '--out' && i + 1 < args.length) {
+    } else if (arg === "--out" && i + 1 < args.length) {
       outPath = args[++i];
-    } else if (arg === '--fail-on-unexplained') {
+    } else if (arg === "--fail-on-unexplained") {
       failOnUnexplained = true;
-    } else if (arg === '--quiet') {
+    } else if (arg === "--quiet") {
       quiet = true;
-    } else if (arg === '--json') {
+    } else if (arg === "--json") {
       printJson = true;
-    } else if (arg === '--help' || arg === '-h') {
+    } else if (arg === "--help" || arg === "-h") {
       console.log(`Three.js Package Reconciliation Tool (r186)
 Usage:
   node tools/upstream/reconcile_package.mjs [options]
@@ -554,7 +552,7 @@ Options:
   }
 
   if (!packageJsonPath) {
-    packageJsonPath = path.join(packageDir, 'package.json');
+    packageJsonPath = path.join(packageDir, "package.json");
   }
 
   if (!quiet && !printJson) {
@@ -564,7 +562,7 @@ Options:
   try {
     const report = await reconcilePackage({
       packageDir,
-      packageJsonPath
+      packageJsonPath,
     });
 
     const formattedJson = formatDeterministicJson(report);
@@ -572,7 +570,7 @@ Options:
     if (outPath) {
       const outDir = path.dirname(path.resolve(outPath));
       await fs.mkdir(outDir, { recursive: true });
-      await fs.writeFile(outPath, formattedJson, 'utf8');
+      await fs.writeFile(outPath, formattedJson, "utf8");
       if (!quiet && !printJson) {
         console.log(`[reconcile_package] Wrote reconciliation report to: ${outPath}`);
       }
@@ -588,14 +586,18 @@ Options:
       console.log(`  Packaged inventory files: ${report.summary.packaged_inventory_files_count}`);
       console.log(`  Missing export targets: ${report.summary.missing_export_targets_count}`);
       console.log(`  Missing files entries: ${report.summary.missing_files_entries_count}`);
-      console.log(`  Alias duplicates: ${report.summary.alias_duplicates_count} (${report.summary.explained_discrepancies} explained)`);
+      console.log(
+        `  Alias duplicates: ${report.summary.alias_duplicates_count} (${report.summary.explained_discrepancies} explained)`,
+      );
       console.log(`  Unexplained discrepancies: ${report.summary.unexplained_discrepancies}`);
-      console.log(`  Clean: ${report.summary.is_clean ? 'YES' : 'NO'}`);
+      console.log(`  Clean: ${report.summary.is_clean ? "YES" : "NO"}`);
     }
 
     if (failOnUnexplained && report.summary.unexplained_discrepancies > 0) {
       if (!quiet) {
-        console.error(`[reconcile_package] Error: ${report.summary.unexplained_discrepancies} unexplained discrepancies found.`);
+        console.error(
+          `[reconcile_package] Error: ${report.summary.unexplained_discrepancies} unexplained discrepancies found.`,
+        );
       }
       process.exit(1);
     }

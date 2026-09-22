@@ -23,44 +23,40 @@
  * 16. Wasm packet preparation with exact 8 typed arguments and truthful retained fallback route.
  */
 
-import test from 'node:test';
-import assert from 'node:assert/strict';
-import * as THREE from '../../upstream/three.js/build/three.module.js';
+import assert from "node:assert/strict";
+import test from "node:test";
+import * as THREE from "../../upstream/three.js/build/three.module.js";
 
 import {
-  canAdmitMesh,
-  extractMeshRenderData,
-  prepareMeshPacket,
-  prepareMeshDepthPacket,
-  prepareCanvasMeshPacket,
-  prepareCanvasMeshDepthPacket,
-  prepareMeshBatchPacket,
-  renderMesh,
-  renderMeshBatch,
-  renderScene,
-  renderRetainedFallback,
-  multiplyMatrices4x4,
-  expandIndexedPositions,
   ADMISSION_REJECTION,
-  createAdmissionError,
   COORDINATE_SYSTEM,
-  THREE_SIDE,
   CULL_MODE_WIRE,
-  FRONT_FACE_WIRE,
-  DEPTH_WIRE_COMPARE,
-  THREE_DEPTH_FUNC_TO_WIRE_COMPARE,
+  canAdmitMesh,
   computeAffineDeterminant,
   convertBackgroundColorToClearColor,
-} from './mesh_adapter.mjs';
+  createAdmissionError,
+  DEPTH_WIRE_COMPARE,
+  expandIndexedPositions,
+  extractMeshRenderData,
+  FRONT_FACE_WIRE,
+  multiplyMatrices4x4,
+  prepareCanvasMeshDepthPacket,
+  prepareCanvasMeshPacket,
+  prepareMeshBatchPacket,
+  prepareMeshDepthPacket,
+  prepareMeshPacket,
+  renderMesh,
+  renderMeshBatch,
+  renderRetainedFallback,
+  renderScene,
+  THREE_DEPTH_FUNC_TO_WIRE_COMPARE,
+  THREE_SIDE,
+} from "./mesh_adapter.mjs";
 
 function createBasicTriangleMesh(materialProps = {}, geomProps = {}) {
   const geometry = new THREE.BufferGeometry();
-  const positions = new Float32Array([
-    0.0,  0.5, 0.0,
-   -0.5, -0.5, 0.0,
-    0.5, -0.5, 0.0,
-  ]);
-  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  const positions = new Float32Array([0.0, 0.5, 0.0, -0.5, -0.5, 0.0, 0.5, -0.5, 0.0]);
+  geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
   const material = new THREE.MeshBasicMaterial({
     color: 0xff0000,
     depthTest: false,
@@ -75,12 +71,8 @@ function createBasicTriangleMesh(materialProps = {}, geomProps = {}) {
 
 function createDepthTriangleMesh(materialProps = {}, geomProps = {}) {
   const geometry = new THREE.BufferGeometry();
-  const positions = new Float32Array([
-    0.0,  0.5, 0.0,
-   -0.5, -0.5, 0.0,
-    0.5, -0.5, 0.0,
-  ]);
-  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  const positions = new Float32Array([0.0, 0.5, 0.0, -0.5, -0.5, 0.0, 0.5, -0.5, 0.0]);
+  geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
   const material = new THREE.MeshBasicMaterial({
     color: 0xff0000,
     side: THREE.DoubleSide, // Mandatory DoubleSide
@@ -102,7 +94,7 @@ function createBasicCamera(coordSystem = undefined) {
   return camera;
 }
 
-test('renderScene preserves layer-filtered group ordering and culls invisible materials', async () => {
+test("renderScene preserves layer-filtered group ordering and culls invisible materials", async () => {
   const scene = new THREE.Scene();
   const camera = createBasicCamera();
   const group = new THREE.Group();
@@ -116,12 +108,18 @@ test('renderScene preserves layer-filtered group ordering and culls invisible ma
   scene.add(hiddenMaterial);
   let submissions = 0;
   let vertexCounts;
-  const host = { executePacket() { submissions++; } };
-  const wasm = { f3d_build_mesh_batch_packet(_positions, counts) {
-    vertexCounts = Array.from(counts);
-    return new Uint8Array();
-  } };
-  const result = await renderScene(host, scene, camera, null, wasm, { sourceBackend: 'webgpu' });
+  const host = {
+    executePacket() {
+      submissions++;
+    },
+  };
+  const wasm = {
+    f3d_build_mesh_batch_packet(_positions, counts) {
+      vertexCounts = Array.from(counts);
+      return new Uint8Array();
+    },
+  };
+  const result = await renderScene(host, scene, camera, null, wasm, { sourceBackend: "webgpu" });
   // The group is outside camera layers, but its child is visible; only the child's id breaks the z tie.
   assert.deepEqual(result.admitted, [first.uuid, second.uuid]);
   assert.deepEqual(result.refused, []);
@@ -129,41 +127,48 @@ test('renderScene preserves layer-filtered group ordering and culls invisible ma
   assert.equal(submissions, 1);
 });
 
-test('renderScene refuses scene hooks before building or submitting a partial result', async () => {
+test("renderScene refuses scene hooks before building or submitting a partial result", async () => {
   const camera = createBasicCamera();
   const scene = new THREE.Scene();
   scene.add(createBasicTriangleMesh());
-  const fail = () => assert.fail('Refused scene must not invoke hooks, build packets, or submit');
+  const fail = () => assert.fail("Refused scene must not invoke hooks, build packets, or submit");
   const host = { executePacket: fail };
   const wasm = { f3d_build_mesh_batch_packet: fail };
-  for (const hook of ['onBeforeRender', 'onAfterRender']) {
+  for (const hook of ["onBeforeRender", "onAfterRender"]) {
     scene[hook] = fail;
     const result = await renderScene(host, scene, camera, null, wasm);
     assert.deepEqual(result.admitted, []);
-    assert.equal(result.refused[0].code, 'UNSUPPORTED_CALLBACK');
+    assert.equal(result.refused[0].code, "UNSUPPORTED_CALLBACK");
     scene[hook] = THREE.Object3D.prototype[hook];
   }
 });
 
-test('Positive: Real default MeshBasicMaterial inherits prototype methods and is admitted without hook deletion', () => {
+test("Positive: Real default MeshBasicMaterial inherits prototype methods and is admitted without hook deletion", () => {
   const geom = new THREE.BufferGeometry();
-  geom.setAttribute('position', new THREE.BufferAttribute(new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]), 3));
-  const mat = new THREE.MeshBasicMaterial({ side: THREE.DoubleSide, depthTest: false, depthWrite: false });
+  geom.setAttribute(
+    "position",
+    new THREE.BufferAttribute(new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]), 3),
+  );
+  const mat = new THREE.MeshBasicMaterial({
+    side: THREE.DoubleSide,
+    depthTest: false,
+    depthWrite: false,
+  });
   const mesh = new THREE.Mesh(geom, mat);
   const camera = createBasicCamera();
 
   // Verify prototype methods are genuinely present and inherited on the real instance
-  assert.equal(typeof mat.onBeforeCompile, 'function');
-  assert.equal(typeof mat.customProgramCacheKey, 'function');
+  assert.equal(typeof mat.onBeforeCompile, "function");
+  assert.equal(typeof mat.customProgramCacheKey, "function");
   assert.equal(mat.onBeforeCompile, THREE.Material.prototype.onBeforeCompile);
   assert.equal(mat.customProgramCacheKey, THREE.Material.prototype.customProgramCacheKey);
 
   // Must be admitted!
   const admission = canAdmitMesh(mesh, camera);
-  assert.equal(admission.admitted, true, 'Default unchanged MeshBasicMaterial must be admitted');
+  assert.equal(admission.admitted, true, "Default unchanged MeshBasicMaterial must be admitted");
 });
 
-test('Negative: material.visible === false is rejected with MATERIAL_NOT_VISIBLE (root 19:47Z point 1)', () => {
+test("Negative: material.visible === false is rejected with MATERIAL_NOT_VISIBLE (root 19:47Z point 1)", () => {
   const mesh = createBasicTriangleMesh({ visible: false });
   const camera = createBasicCamera();
 
@@ -172,12 +177,14 @@ test('Negative: material.visible === false is rejected with MATERIAL_NOT_VISIBLE
   assert.equal(admission.reason, ADMISSION_REJECTION.MATERIAL_NOT_VISIBLE);
 });
 
-test('Negative: mesh.onBeforeRender and onAfterRender callbacks are rejected (root 19:47Z point 2)', () => {
+test("Negative: mesh.onBeforeRender and onAfterRender callbacks are rejected (root 19:47Z point 2)", () => {
   const mesh = createBasicTriangleMesh();
   const camera = createBasicCamera();
 
   // mesh.onBeforeRender override
-  mesh.onBeforeRender = () => { mesh.material.color.setRGB(0, 1, 0); };
+  mesh.onBeforeRender = () => {
+    mesh.material.color.setRGB(0, 1, 0);
+  };
   const beforeAdmission = canAdmitMesh(mesh, camera);
   assert.equal(beforeAdmission.admitted, false);
   assert.equal(beforeAdmission.reason, ADMISSION_REJECTION.UNSUPPORTED_CALLBACK);
@@ -197,7 +204,7 @@ test('Negative: mesh.onBeforeRender and onAfterRender callbacks are rejected (ro
   assert.equal(matBeforeAdmission.reason, ADMISSION_REJECTION.UNSUPPORTED_CALLBACK);
 });
 
-test('Negative: Layer mismatch between camera and mesh is rejected (root 19:47Z)', () => {
+test("Negative: Layer mismatch between camera and mesh is rejected (root 19:47Z)", () => {
   const mesh = createBasicTriangleMesh();
   const camera = createBasicCamera();
 
@@ -210,11 +217,18 @@ test('Negative: Layer mismatch between camera and mesh is rejected (root 19:47Z)
   assert.equal(admission.reason, ADMISSION_REJECTION.LAYER_MISMATCH);
 });
 
-test('Negative: InstancedMesh, SkinnedMesh, and BatchedMesh subclasses are rejected (root 19:47Z)', () => {
+test("Negative: InstancedMesh, SkinnedMesh, and BatchedMesh subclasses are rejected (root 19:47Z)", () => {
   const camera = createBasicCamera();
   const geom = new THREE.BufferGeometry();
-  geom.setAttribute('position', new THREE.BufferAttribute(new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]), 3));
-  const mat = new THREE.MeshBasicMaterial({ side: THREE.DoubleSide, depthTest: false, depthWrite: false });
+  geom.setAttribute(
+    "position",
+    new THREE.BufferAttribute(new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]), 3),
+  );
+  const mat = new THREE.MeshBasicMaterial({
+    side: THREE.DoubleSide,
+    depthTest: false,
+    depthWrite: false,
+  });
 
   // 1. InstancedMesh
   const instMesh = new THREE.InstancedMesh(geom, mat, 2);
@@ -235,25 +249,27 @@ test('Negative: InstancedMesh, SkinnedMesh, and BatchedMesh subclasses are rejec
   assert.equal(batchedAdmission.reason, ADMISSION_REJECTION.UNSUPPORTED_MESH_SUBCLASS);
 });
 
-test('Negative: Custom onBeforeCompile and customProgramCacheKey overrides are rejected', () => {
+test("Negative: Custom onBeforeCompile and customProgramCacheKey overrides are rejected", () => {
   const camera = createBasicCamera();
 
   // Custom onBeforeCompile instance override
   const hookMesh = createBasicTriangleMesh();
-  hookMesh.material.onBeforeCompile = (shader) => { shader.fragmentShader += ''; };
+  hookMesh.material.onBeforeCompile = (shader) => {
+    shader.fragmentShader += "";
+  };
   const hookAdmission = canAdmitMesh(hookMesh, camera);
   assert.equal(hookAdmission.admitted, false);
   assert.equal(hookAdmission.reason, ADMISSION_REJECTION.UNSUPPORTED_MATERIAL_FEATURE);
 
   // Custom customProgramCacheKey instance override
   const cacheMesh = createBasicTriangleMesh();
-  cacheMesh.material.customProgramCacheKey = () => 'custom_cache_key';
+  cacheMesh.material.customProgramCacheKey = () => "custom_cache_key";
   const cacheAdmission = canAdmitMesh(cacheMesh, camera);
   assert.equal(cacheAdmission.admitted, false);
   assert.equal(cacheAdmission.reason, ADMISSION_REJECTION.UNSUPPORTED_MATERIAL_FEATURE);
 });
 
-test('Negative: mesh.visible === false is rejected with NOT_VISIBLE (Chartreuse 13058)', () => {
+test("Negative: mesh.visible === false is rejected with NOT_VISIBLE (Chartreuse 13058)", () => {
   const mesh = createBasicTriangleMesh();
   mesh.visible = false;
   const camera = createBasicCamera();
@@ -263,12 +279,12 @@ test('Negative: mesh.visible === false is rejected with NOT_VISIBLE (Chartreuse 
   assert.equal(admission.reason, ADMISSION_REJECTION.NOT_VISIBLE);
 });
 
-test('Positive: Extracts unindexed Three.js Mesh with correct geometry, color, and matrices', () => {
+test("Positive: Extracts unindexed Three.js Mesh with correct geometry, color, and matrices", () => {
   const mesh = createBasicTriangleMesh();
   const camera = createBasicCamera();
 
   const admission = canAdmitMesh(mesh, camera);
-  assert.equal(admission.admitted, true, 'Real unindexed Mesh must be admitted');
+  assert.equal(admission.admitted, true, "Real unindexed Mesh must be admitted");
 
   const snapshot = extractMeshRenderData(mesh, camera, 64, 64);
 
@@ -277,7 +293,10 @@ test('Positive: Extracts unindexed Three.js Mesh with correct geometry, color, a
   assert.equal(snapshot.isIndexed, false);
   assert.equal(snapshot.indices.length, 0);
   assert.equal(snapshot.positions.length, 9);
-  assert.deepEqual(Array.from(snapshot.positions), [0.0, 0.5, 0.0, -0.5, -0.5, 0.0, 0.5, -0.5, 0.0]);
+  assert.deepEqual(
+    Array.from(snapshot.positions),
+    [0.0, 0.5, 0.0, -0.5, -0.5, 0.0, 0.5, -0.5, 0.0],
+  );
 
   // Color: Red [1, 0, 0, 1]
   assert.equal(snapshot.color.length, 4);
@@ -296,19 +315,14 @@ test('Positive: Extracts unindexed Three.js Mesh with correct geometry, color, a
   // Projection matrix & WebGL depth flag
   assert.equal(snapshot.projection.length, 16);
   assert.ok(snapshot.projection instanceof Float64Array);
-  assert.equal(snapshot.webglDepth, true, 'Default Three.js camera must have webglDepth === true');
+  assert.equal(snapshot.webglDepth, true, "Default Three.js camera must have webglDepth === true");
 });
 
-test('Positive: Extracts indexed Three.js Mesh with strict ordering and expansion', () => {
+test("Positive: Extracts indexed Three.js Mesh with strict ordering and expansion", () => {
   const geometry = new THREE.BufferGeometry();
   // Quad vertices (4 vertices)
-  const vertices = new Float32Array([
-    -1, -1, 0,
-     1, -1, 0,
-     1,  1, 0,
-    -1,  1, 0,
-  ]);
-  geometry.setAttribute('position', new THREE.BufferAttribute(vertices, 3));
+  const vertices = new Float32Array([-1, -1, 0, 1, -1, 0, 1, 1, 0, -1, 1, 0]);
+  geometry.setAttribute("position", new THREE.BufferAttribute(vertices, 3));
   // Two triangles: (0, 1, 2) and (2, 3, 0)
   const indices = new Uint16Array([0, 1, 2, 2, 3, 0]);
   geometry.setIndex(new THREE.BufferAttribute(indices, 1));
@@ -335,30 +349,37 @@ test('Positive: Extracts indexed Three.js Mesh with strict ordering and expansio
   assert.deepEqual(Array.from(snapshot.expandedPositions.slice(15, 18)), [-1, -1, 0]);
 });
 
-test('Indexed snapshots preserve raw element indices when the attribute is normalized', () => {
+test("Indexed snapshots preserve raw element indices when the attribute is normalized", () => {
   const camera = createBasicCamera();
   for (const ArrayType of [Uint16Array, Uint32Array]) {
     const mesh = createBasicTriangleMesh();
     const index = new THREE.BufferAttribute(new ArrayType([2, 2, 2, 0, 1, 2]), 1, true);
     mesh.geometry.setIndex(index);
     mesh.geometry.setDrawRange(3, 3);
-    assert.ok(index.getX(4) < 1, 'the normalized accessor differs from the element buffer');
+    assert.ok(index.getX(4) < 1, "the normalized accessor differs from the element buffer");
 
     const snapshot = extractMeshRenderData(mesh, camera, 64, 64);
     assert.deepEqual(Array.from(snapshot.indices), [0, 1, 2]);
     assert.deepEqual(snapshot.expandedPositions, mesh.geometry.attributes.position.array);
-    assert.equal(index.normalized, true, 'extraction must not mutate the source attribute');
+    assert.equal(index.normalized, true, "extraction must not mutate the source attribute");
 
     index.array[5] = 3;
-    assert.throws(() => extractMeshRenderData(mesh, camera, 64, 64), /Index references vertex out of bounds/);
-    assert.deepEqual(Array.from(snapshot.indices), [0, 1, 2], 'prior snapshots retain their indices');
+    assert.throws(
+      () => extractMeshRenderData(mesh, camera, 64, 64),
+      /Index references vertex out of bounds/,
+    );
+    assert.deepEqual(
+      Array.from(snapshot.indices),
+      [0, 1, 2],
+      "prior snapshots retain their indices",
+    );
   }
 });
 
-test('Positive: Empty indexed drawRange passes empty positions (root review invariant)', () => {
+test("Positive: Empty indexed drawRange passes empty positions (root review invariant)", () => {
   const geometry = new THREE.BufferGeometry();
   const vertices = new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]);
-  geometry.setAttribute('position', new THREE.BufferAttribute(vertices, 3));
+  geometry.setAttribute("position", new THREE.BufferAttribute(vertices, 3));
   geometry.setIndex(new THREE.BufferAttribute(new Uint16Array([0, 1, 2]), 1));
   // Empty drawRange on indexed geometry
   geometry.setDrawRange(0, 0);
@@ -369,22 +390,17 @@ test('Positive: Empty indexed drawRange passes empty positions (root review inva
   const camera = createBasicCamera();
 
   const snapshot = extractMeshRenderData(mesh, camera, 64, 64);
-  assert.equal(snapshot.positions.length, 0, 'Empty indexed range must produce empty positions');
-  assert.equal(snapshot.indices.length, 0, 'Empty indexed range must produce empty indices');
+  assert.equal(snapshot.positions.length, 0, "Empty indexed range must produce empty positions");
+  assert.equal(snapshot.indices.length, 0, "Empty indexed range must produce empty indices");
   assert.equal(snapshot.expandedPositions.length, 0);
   assert.equal(snapshot.triangleCount, 0);
   assert.equal(snapshot.vertexCount, 0);
 });
 
-test('Positive: Incomplete tail indices dropped in triangle expansion per native triangle-list semantics', () => {
+test("Positive: Incomplete tail indices dropped in triangle expansion per native triangle-list semantics", () => {
   const geometry = new THREE.BufferGeometry();
-  const vertices = new Float32Array([
-    0, 0, 0,
-    1, 0, 0,
-    0, 1, 0,
-    1, 1, 0,
-  ]);
-  geometry.setAttribute('position', new THREE.BufferAttribute(vertices, 3));
+  const vertices = new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 1, 0]);
+  geometry.setAttribute("position", new THREE.BufferAttribute(vertices, 3));
   // 5 indices: first 3 make 1 triangle; last 2 (indices 2, 3) form an incomplete tail and must be dropped
   geometry.setIndex(new THREE.BufferAttribute(new Uint16Array([0, 1, 2, 2, 3]), 1));
 
@@ -399,7 +415,7 @@ test('Positive: Incomplete tail indices dropped in triangle expansion per native
   assert.equal(snapshot.expandedPositions.length, 9); // exactly 1 triangle (3 vertices * 3 coords)
 });
 
-test('Side admission: FrontSide (0), BackSide (1), and DoubleSide (2) are admitted; invalid sides rejected', () => {
+test("Side admission: FrontSide (0), BackSide (1), and DoubleSide (2) are admitted; invalid sides rejected", () => {
   const camera = createBasicCamera();
 
   const doubleMesh = createBasicTriangleMesh({ side: THREE.DoubleSide });
@@ -434,26 +450,20 @@ test('Side admission: FrontSide (0), BackSide (1), and DoubleSide (2) are admitt
   const admission99 = canAdmitMesh(invalidMesh99, camera);
   assert.equal(admission99.admitted, false);
   assert.equal(admission99.reason, ADMISSION_REJECTION.UNSUPPORTED_SIDE);
-  assert.throws(
-    () => extractMeshRenderData(invalidMesh99, camera, 64, 64),
-    /UNSUPPORTED_SIDE/
-  );
+  assert.throws(() => extractMeshRenderData(invalidMesh99, camera, 64, 64), /UNSUPPORTED_SIDE/);
 
   const invalidMeshNeg = createBasicTriangleMesh({ side: -1 });
   assert.equal(canAdmitMesh(invalidMeshNeg, camera).admitted, false);
 
-  const invalidMeshStr = createBasicTriangleMesh({ side: 'two-sided' });
+  const invalidMeshStr = createBasicTriangleMesh({ side: "two-sided" });
   assert.equal(canAdmitMesh(invalidMeshStr, camera).admitted, false);
 });
 
-test('drawRange correctness: Clamps Infinity count with nonzero start and preserves empty draw (13062 point 2)', () => {
+test("drawRange correctness: Clamps Infinity count with nonzero start and preserves empty draw (13062 point 2)", () => {
   const geometry = new THREE.BufferGeometry();
   // 6 vertices = 2 triangles
-  const vertices = new Float32Array([
-    0, 0, 0,  1, 0, 0,  0, 1, 0,
-    1, 1, 0,  2, 1, 0,  1, 2, 0,
-  ]);
-  geometry.setAttribute('position', new THREE.BufferAttribute(vertices, 3));
+  const vertices = new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 1, 0, 2, 1, 0, 1, 2, 0]);
+  geometry.setAttribute("position", new THREE.BufferAttribute(vertices, 3));
   // Start at vertex 3, count Infinity: should extract remaining 3 vertices, NOT overrun
   geometry.setDrawRange(3, Infinity);
 
@@ -482,7 +492,7 @@ test('drawRange correctness: Clamps Infinity count with nonzero start and preser
   );
 });
 
-test('Attribute validation: Rejects invalid or normalized position attributes (13062 point 3)', () => {
+test("Attribute validation: Rejects invalid or normalized position attributes (13062 point 3)", () => {
   const camera = createBasicCamera();
   const mesh = createBasicTriangleMesh();
 
@@ -502,10 +512,10 @@ test('Attribute validation: Rejects invalid or normalized position attributes (1
   assert.equal(canAdmitMesh(mesh, camera).reason, ADMISSION_REJECTION.UNSUPPORTED_ATTRIBUTE);
 });
 
-test('Index bounds check: Explicitly rejects out-of-range indices (13062 point 4)', () => {
+test("Index bounds check: Explicitly rejects out-of-range indices (13062 point 4)", () => {
   const geometry = new THREE.BufferGeometry();
   const vertices = new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]); // 3 vertices (indices 0, 1, 2)
-  geometry.setAttribute('position', new THREE.BufferAttribute(vertices, 3));
+  geometry.setAttribute("position", new THREE.BufferAttribute(vertices, 3));
   // Index 5 is out of bounds!
   geometry.setIndex(new THREE.BufferAttribute(new Uint16Array([0, 1, 5]), 1));
 
@@ -520,13 +530,13 @@ test('Index bounds check: Explicitly rejects out-of-range indices (13062 point 4
   );
 });
 
-test('Material features: Rejects advanced and unexercised material features (13062 point 5)', () => {
+test("Material features: Rejects advanced and unexercised material features (13062 point 5)", () => {
   const camera = createBasicCamera();
 
   // vertexColors (admitted in this slice when color attribute present)
   const vcGeom = new THREE.BufferGeometry();
-  vcGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
-  vcGeom.setAttribute('color', new THREE.BufferAttribute(new Float32Array(9), 3));
+  vcGeom.setAttribute("position", new THREE.BufferAttribute(new Float32Array(9), 3));
+  vcGeom.setAttribute("color", new THREE.BufferAttribute(new Float32Array(9), 3));
   const vcMesh = new THREE.Mesh(vcGeom, new THREE.MeshBasicMaterial({ vertexColors: true }));
   assert.equal(canAdmitMesh(vcMesh, camera).admitted, true);
 
@@ -551,7 +561,7 @@ test('Material features: Rejects advanced and unexercised material features (130
   assert.equal(canAdmitMesh(blendMesh, camera).admitted, false);
 });
 
-test('Positive: Explicit matrix update boundary and mutation tracking (13062 point 6)', () => {
+test("Positive: Explicit matrix update boundary and mutation tracking (13062 point 6)", () => {
   const mesh = createBasicTriangleMesh();
   const camera = createBasicCamera();
 
@@ -586,15 +596,15 @@ test('Positive: Explicit matrix update boundary and mutation tracking (13062 poi
   assert.equal(snap1.modelView[12], 0.0);
 });
 
-test('Positive: WebGPUCoordinateSystem camera sets webglDepth = false', () => {
+test("Positive: WebGPUCoordinateSystem camera sets webglDepth = false", () => {
   const mesh = createBasicTriangleMesh();
   const camera = createBasicCamera(COORDINATE_SYSTEM.WEBGPU);
 
   const snapshot = extractMeshRenderData(mesh, camera, 64, 64);
-  assert.equal(snapshot.webglDepth, false, 'WebGPU camera must have webglDepth === false');
+  assert.equal(snapshot.webglDepth, false, "WebGPU camera must have webglDepth === false");
 });
 
-test('Positive: prepareMeshPacket invokes Wasm export with exact 8 typed arguments', () => {
+test("Positive: prepareMeshPacket invokes Wasm export with exact 8 typed arguments", () => {
   const mesh = createBasicTriangleMesh();
   const camera = createBasicCamera();
 
@@ -608,7 +618,7 @@ test('Positive: prepareMeshPacket invokes Wasm export with exact 8 typed argumen
 
   const { packetBytes, snapshot } = prepareMeshPacket(mesh, camera, 320, 240, mockWasm);
 
-  assert.ok(capturedArgs, 'Wasm export must have been called');
+  assert.ok(capturedArgs, "Wasm export must have been called");
   assert.equal(capturedArgs.positions.length, 9);
   assert.equal(capturedArgs.indices.length, 0);
   assert.equal(capturedArgs.mv.length, 16);
@@ -621,7 +631,7 @@ test('Positive: prepareMeshPacket invokes Wasm export with exact 8 typed argumen
   assert.equal(snapshot.vertexCount, 3);
 });
 
-test('Positive: renderRetainedFallback preserves JS ownership and invokes upstream renderer', () => {
+test("Positive: renderRetainedFallback preserves JS ownership and invokes upstream renderer", () => {
   let renderCalled = false;
   let passedScene = null;
   let passedCamera = null;
@@ -642,11 +652,11 @@ test('Positive: renderRetainedFallback preserves JS ownership and invokes upstre
   assert.equal(renderCalled, true);
   assert.equal(passedScene, scene);
   assert.equal(passedCamera, camera);
-  assert.equal(report.implementationOwner, 'retained-js');
+  assert.equal(report.implementationOwner, "retained-js");
   assert.equal(report.rendered, true);
 });
 
-test('Negative: renderMesh rejects canvasContext when wasmModule lacks f3d_build_canvas_mesh_packet (no silent offscreen-as-visible)', async () => {
+test("Negative: renderMesh rejects canvasContext when wasmModule lacks f3d_build_canvas_mesh_packet (no silent offscreen-as-visible)", async () => {
   const mesh = createBasicTriangleMesh();
   const camera = createBasicCamera();
 
@@ -677,17 +687,22 @@ test('Negative: renderMesh rejects canvasContext when wasmModule lacks f3d_build
       await renderMesh(mockBridgeHost, mesh, camera, mockCanvasContext, mockOffscreenWasm);
     },
     {
-      name: 'Error',
-      message: /canvasContext provided for visible canvas rendering, but wasmModule does not export f3d_build_canvas_mesh_packet/,
-    }
+      name: "Error",
+      message:
+        /canvasContext provided for visible canvas rendering, but wasmModule does not export f3d_build_canvas_mesh_packet/,
+    },
   );
 
   // Invariant: Bridge must NEVER have executed and offscreen packet must NEVER have been emitted
-  assert.equal(executeCalled, false, 'Bridge executePacket must not be called on canvas rejection');
-  assert.equal(offscreenCalled, false, 'Silent offscreen packet must not be generated for canvas target');
+  assert.equal(executeCalled, false, "Bridge executePacket must not be called on canvas rejection");
+  assert.equal(
+    offscreenCalled,
+    false,
+    "Silent offscreen packet must not be generated for canvas target",
+  );
 });
 
-test('Negative: prepareCanvasMeshPacket and prepareMeshPacket(target: canvas) reject wasmModule lacking canvas export', () => {
+test("Negative: prepareCanvasMeshPacket and prepareMeshPacket(target: canvas) reject wasmModule lacking canvas export", () => {
   const mesh = createBasicTriangleMesh();
   const camera = createBasicCamera();
 
@@ -701,24 +716,24 @@ test('Negative: prepareCanvasMeshPacket and prepareMeshPacket(target: canvas) re
       prepareCanvasMeshPacket(mesh, camera, 64, 64, mockOffscreenWasm);
     },
     {
-      name: 'Error',
+      name: "Error",
       message: /wasmModule is missing f3d_build_canvas_mesh_packet export/,
-    }
+    },
   );
 
   // 2. prepareMeshPacket with target: 'canvas'
   assert.throws(
     () => {
-      prepareMeshPacket(mesh, camera, 64, 64, mockOffscreenWasm, { target: 'canvas' });
+      prepareMeshPacket(mesh, camera, 64, 64, mockOffscreenWasm, { target: "canvas" });
     },
     {
-      name: 'Error',
+      name: "Error",
       message: /wasmModule is missing f3d_build_canvas_mesh_packet export/,
-    }
+    },
   );
 });
 
-test('Positive: renderMesh routes through f3d_build_canvas_mesh_packet when canvasContext is provided and export exists', async () => {
+test("Positive: renderMesh routes through f3d_build_canvas_mesh_packet when canvasContext is provided and export exists", async () => {
   const mesh = createBasicTriangleMesh();
   const camera = createBasicCamera();
 
@@ -726,7 +741,7 @@ test('Positive: renderMesh routes through f3d_build_canvas_mesh_packet when canv
   let capturedArgs = null;
   const mockCanvasWasm = {
     f3d_build_mesh_packet: () => {
-      throw new Error('Should not call offscreen builder');
+      throw new Error("Should not call offscreen builder");
     },
     f3d_build_canvas_mesh_packet: (positions, indices, mv, proj, color, w, h, webglDepth) => {
       canvasExportCalled = true;
@@ -754,19 +769,19 @@ test('Positive: renderMesh routes through f3d_build_canvas_mesh_packet when canv
     mesh,
     camera,
     mockCanvasContext,
-    mockCanvasWasm
+    mockCanvasWasm,
   );
 
-  assert.equal(canvasExportCalled, true, 'Must call f3d_build_canvas_mesh_packet');
+  assert.equal(canvasExportCalled, true, "Must call f3d_build_canvas_mesh_packet");
   assert.equal(capturedArgs.w, 256);
   assert.equal(capturedArgs.h, 256);
-  assert.equal(target, 'canvas');
+  assert.equal(target, "canvas");
   assert.equal(executedContext, mockCanvasContext);
   assert.deepEqual(Array.from(executedPacket), [0x43, 0x41, 0x4e, 0x56]);
   assert.deepEqual(result, { renderedToCanvas: true });
 });
 
-test('Positive: renderMesh executes honest offscreen rendering when canvasContext is null or undefined', async () => {
+test("Positive: renderMesh executes honest offscreen rendering when canvasContext is null or undefined", async () => {
   const mesh = createBasicTriangleMesh();
   const camera = createBasicCamera();
 
@@ -789,21 +804,27 @@ test('Positive: renderMesh executes honest offscreen rendering when canvasContex
   };
 
   // 1. canvasContext === null
-  const resNull = await renderMesh(mockBridgeHost, mesh, camera, null, mockWasm, { width: 64, height: 64 });
+  const resNull = await renderMesh(mockBridgeHost, mesh, camera, null, mockWasm, {
+    width: 64,
+    height: 64,
+  });
   assert.equal(offscreenExportCalled, true);
-  assert.equal(resNull.target, 'offscreen');
+  assert.equal(resNull.target, "offscreen");
   assert.equal(executedContext, null);
   assert.deepEqual(Array.from(executedPacket), [0x4f, 0x46, 0x46, 0x53]);
 
   // 2. canvasContext === undefined
   offscreenExportCalled = false;
-  const resUndef = await renderMesh(mockBridgeHost, mesh, camera, undefined, mockWasm, { width: 64, height: 64 });
+  const resUndef = await renderMesh(mockBridgeHost, mesh, camera, undefined, mockWasm, {
+    width: 64,
+    height: 64,
+  });
   assert.equal(offscreenExportCalled, true);
-  assert.equal(resUndef.target, 'offscreen');
+  assert.equal(resUndef.target, "offscreen");
   assert.equal(executedContext, null);
 });
 
-test('Positive: Real default MeshBasicMaterial with default depth settings is admitted and extracted', () => {
+test("Positive: Real default MeshBasicMaterial with default depth settings is admitted and extracted", () => {
   const mesh = createDepthTriangleMesh();
   const camera = createBasicCamera();
 
@@ -813,7 +834,11 @@ test('Positive: Real default MeshBasicMaterial with default depth settings is ad
   assert.equal(mesh.material.depthFunc, THREE.LessEqualDepth);
 
   const admission = canAdmitMesh(mesh, camera);
-  assert.equal(admission.admitted, true, 'Default MeshBasicMaterial with depthTest/depthWrite must be admitted');
+  assert.equal(
+    admission.admitted,
+    true,
+    "Default MeshBasicMaterial with depthTest/depthWrite must be admitted",
+  );
 
   const snapshot = extractMeshRenderData(mesh, camera, 64, 64);
   assert.equal(snapshot.depthTest, true);
@@ -822,17 +847,57 @@ test('Positive: Real default MeshBasicMaterial with default depth settings is ad
   assert.equal(snapshot.depthCompare, DEPTH_WIRE_COMPARE.LESS_EQUAL); // wire 4
 });
 
-test('Positive: All 8 Three.js depth functions map faithfully to wire compare codes 1..8', () => {
+test("Positive: All 8 Three.js depth functions map faithfully to wire compare codes 1..8", () => {
   const camera = createBasicCamera();
   const cases = [
-    { name: 'NeverDepth', func: THREE.NeverDepth, expectedWire: DEPTH_WIRE_COMPARE.NEVER, wireCode: 1 },
-    { name: 'AlwaysDepth', func: THREE.AlwaysDepth, expectedWire: DEPTH_WIRE_COMPARE.ALWAYS, wireCode: 8 },
-    { name: 'LessDepth', func: THREE.LessDepth, expectedWire: DEPTH_WIRE_COMPARE.LESS, wireCode: 2 },
-    { name: 'LessEqualDepth', func: THREE.LessEqualDepth, expectedWire: DEPTH_WIRE_COMPARE.LESS_EQUAL, wireCode: 4 },
-    { name: 'EqualDepth', func: THREE.EqualDepth, expectedWire: DEPTH_WIRE_COMPARE.EQUAL, wireCode: 3 },
-    { name: 'GreaterEqualDepth', func: THREE.GreaterEqualDepth, expectedWire: DEPTH_WIRE_COMPARE.GREATER_EQUAL, wireCode: 7 },
-    { name: 'GreaterDepth', func: THREE.GreaterDepth, expectedWire: DEPTH_WIRE_COMPARE.GREATER, wireCode: 5 },
-    { name: 'NotEqualDepth', func: THREE.NotEqualDepth, expectedWire: DEPTH_WIRE_COMPARE.NOT_EQUAL, wireCode: 6 },
+    {
+      name: "NeverDepth",
+      func: THREE.NeverDepth,
+      expectedWire: DEPTH_WIRE_COMPARE.NEVER,
+      wireCode: 1,
+    },
+    {
+      name: "AlwaysDepth",
+      func: THREE.AlwaysDepth,
+      expectedWire: DEPTH_WIRE_COMPARE.ALWAYS,
+      wireCode: 8,
+    },
+    {
+      name: "LessDepth",
+      func: THREE.LessDepth,
+      expectedWire: DEPTH_WIRE_COMPARE.LESS,
+      wireCode: 2,
+    },
+    {
+      name: "LessEqualDepth",
+      func: THREE.LessEqualDepth,
+      expectedWire: DEPTH_WIRE_COMPARE.LESS_EQUAL,
+      wireCode: 4,
+    },
+    {
+      name: "EqualDepth",
+      func: THREE.EqualDepth,
+      expectedWire: DEPTH_WIRE_COMPARE.EQUAL,
+      wireCode: 3,
+    },
+    {
+      name: "GreaterEqualDepth",
+      func: THREE.GreaterEqualDepth,
+      expectedWire: DEPTH_WIRE_COMPARE.GREATER_EQUAL,
+      wireCode: 7,
+    },
+    {
+      name: "GreaterDepth",
+      func: THREE.GreaterDepth,
+      expectedWire: DEPTH_WIRE_COMPARE.GREATER,
+      wireCode: 5,
+    },
+    {
+      name: "NotEqualDepth",
+      func: THREE.NotEqualDepth,
+      expectedWire: DEPTH_WIRE_COMPARE.NOT_EQUAL,
+      wireCode: 6,
+    },
   ];
 
   for (const c of cases) {
@@ -848,17 +913,17 @@ test('Positive: All 8 Three.js depth functions map faithfully to wire compare co
   }
 });
 
-test('Positive: depthTest=false forces depthCompare to ALWAYS (8) and resolves depthWrite via sourceBackend', () => {
+test("Positive: depthTest=false forces depthCompare to ALWAYS (8) and resolves depthWrite via sourceBackend", () => {
   const camera = createBasicCamera();
 
   // 1. When options.sourceBackend === 'webgpu': WebGPU passes depthWrite directly (depthWriteEnabled = true)
   for (const func of [THREE.NeverDepth, THREE.LessDepth, THREE.GreaterDepth, THREE.EqualDepth]) {
     const mesh = createDepthTriangleMesh({ depthTest: false, depthWrite: true, depthFunc: func });
-    assert.equal(canAdmitMesh(mesh, camera, { sourceBackend: 'webgpu' }).admitted, true);
+    assert.equal(canAdmitMesh(mesh, camera, { sourceBackend: "webgpu" }).admitted, true);
 
-    const snapshot = extractMeshRenderData(mesh, camera, 64, 64, { sourceBackend: 'webgpu' });
+    const snapshot = extractMeshRenderData(mesh, camera, 64, 64, { sourceBackend: "webgpu" });
     assert.equal(snapshot.depthTest, false);
-    assert.equal(snapshot.depthWrite, true, 'WebGPU backend must preserve depthWrite=true');
+    assert.equal(snapshot.depthWrite, true, "WebGPU backend must preserve depthWrite=true");
     assert.equal(snapshot.depthFunc, func);
     assert.equal(snapshot.depthCompare, DEPTH_WIRE_COMPARE.ALWAYS); // wire 8
   }
@@ -866,11 +931,15 @@ test('Positive: depthTest=false forces depthCompare to ALWAYS (8) and resolves d
   // 2. When options.sourceBackend === 'webgl': WebGL hardware suppresses writes when depthTest is false
   for (const func of [THREE.NeverDepth, THREE.LessDepth, THREE.GreaterDepth, THREE.EqualDepth]) {
     const mesh = createDepthTriangleMesh({ depthTest: false, depthWrite: true, depthFunc: func });
-    assert.equal(canAdmitMesh(mesh, camera, { sourceBackend: 'webgl' }).admitted, true);
+    assert.equal(canAdmitMesh(mesh, camera, { sourceBackend: "webgl" }).admitted, true);
 
-    const snapshot = extractMeshRenderData(mesh, camera, 64, 64, { sourceBackend: 'webgl' });
+    const snapshot = extractMeshRenderData(mesh, camera, 64, 64, { sourceBackend: "webgl" });
     assert.equal(snapshot.depthTest, false);
-    assert.equal(snapshot.depthWrite, false, 'WebGL backend must suppress depthWrite to false when depthTest is false');
+    assert.equal(
+      snapshot.depthWrite,
+      false,
+      "WebGL backend must suppress depthWrite to false when depthTest is false",
+    );
     assert.equal(snapshot.depthFunc, func);
     assert.equal(snapshot.depthCompare, DEPTH_WIRE_COMPARE.ALWAYS); // wire 8
   }
@@ -894,7 +963,7 @@ test('Positive: depthTest=false forces depthCompare to ALWAYS (8) and resolves d
   assert.equal(noDepthSnap.depthCompare, DEPTH_WIRE_COMPARE.ALWAYS);
 });
 
-test('Positive: Dynamic depth mutations produce fresh isolated snapshots', () => {
+test("Positive: Dynamic depth mutations produce fresh isolated snapshots", () => {
   const mesh = createDepthTriangleMesh(); // Default: depthTest=true, depthWrite=true, depthFunc=LessEqual
   const camera = createBasicCamera();
 
@@ -937,7 +1006,7 @@ test('Positive: Dynamic depth mutations produce fresh isolated snapshots', () =>
   assert.equal(snap2.depthCompare, 5);
 });
 
-test('Negative: Unsupported stencil, polygonOffset, reversedDepth, and invalid depthFunc are rejected', () => {
+test("Negative: Unsupported stencil, polygonOffset, reversedDepth, and invalid depthFunc are rejected", () => {
   const camera = createBasicCamera();
 
   // 1. stencilWrite === true
@@ -979,7 +1048,7 @@ test('Negative: Unsupported stencil, polygonOffset, reversedDepth, and invalid d
   );
 });
 
-test('Explicit Missing-Export Refusal: Mesh requiring depth strictly refuses Wasm lacking depth exports', () => {
+test("Explicit Missing-Export Refusal: Mesh requiring depth strictly refuses Wasm lacking depth exports", () => {
   const mesh = createDepthTriangleMesh(); // depthTest=true, depthWrite=true
   const camera = createBasicCamera();
 
@@ -1001,14 +1070,22 @@ test('Explicit Missing-Export Refusal: Mesh requiring depth strictly refuses Was
     () => prepareMeshPacket(mesh, camera, 64, 64, mockLegacyWasm),
     /Mesh requires depth \(depthTest or depthWrite enabled\), but wasmModule is missing f3d_build_mesh_depth_packet export/,
   );
-  assert.equal(legacyCalled, false, 'Legacy export must NOT be silently called when depth is required');
+  assert.equal(
+    legacyCalled,
+    false,
+    "Legacy export must NOT be silently called when depth is required",
+  );
 
   // 2. prepareCanvasMeshPacket must refuse when mesh requires depth
   assert.throws(
     () => prepareCanvasMeshPacket(mesh, camera, 64, 64, mockLegacyWasm),
     /Visible canvas mesh requires depth \(depthTest or depthWrite enabled\), but wasmModule is missing f3d_build_canvas_mesh_depth_packet export/,
   );
-  assert.equal(legacyCalled, false, 'Canvas legacy export must NOT be silently called when depth is required');
+  assert.equal(
+    legacyCalled,
+    false,
+    "Canvas legacy export must NOT be silently called when depth is required",
+  );
 
   // 3. prepareMeshDepthPacket must refuse when depth export is missing
   assert.throws(
@@ -1023,21 +1100,45 @@ test('Explicit Missing-Export Refusal: Mesh requiring depth strictly refuses Was
   );
 });
 
-test('Positive: prepareMeshDepthPacket and prepareCanvasMeshDepthPacket invoke Wasm with exact 11 typed arguments', () => {
+test("Positive: prepareMeshDepthPacket and prepareCanvasMeshDepthPacket invoke Wasm with exact 11 typed arguments", () => {
   const mesh = createDepthTriangleMesh({ depthFunc: THREE.GreaterDepth, depthWrite: false });
   const camera = createBasicCamera();
 
   // 1. Offscreen depth packet with primary name
   let capturedOffscreen = null;
   const mockDepthWasm = {
-    f3d_build_mesh_depth_packet: (pos, ind, mv, proj, col, w, h, webglDepth, depthTest, depthWrite, depthCompare) => {
-      capturedOffscreen = { pos, ind, mv, proj, col, w, h, webglDepth, depthTest, depthWrite, depthCompare };
+    f3d_build_mesh_depth_packet: (
+      pos,
+      ind,
+      mv,
+      proj,
+      col,
+      w,
+      h,
+      webglDepth,
+      depthTest,
+      depthWrite,
+      depthCompare,
+    ) => {
+      capturedOffscreen = {
+        pos,
+        ind,
+        mv,
+        proj,
+        col,
+        w,
+        h,
+        webglDepth,
+        depthTest,
+        depthWrite,
+        depthCompare,
+      };
       return new Uint8Array([0x44, 0x45, 0x50, 0x54]); // 'DEPT'
     },
   };
 
   const offscreenResult = prepareMeshDepthPacket(mesh, camera, 320, 240, mockDepthWasm);
-  assert.ok(capturedOffscreen, 'f3d_build_mesh_depth_packet must be invoked');
+  assert.ok(capturedOffscreen, "f3d_build_mesh_depth_packet must be invoked");
   assert.equal(capturedOffscreen.pos.length, 9);
   assert.equal(capturedOffscreen.ind.length, 0);
   assert.equal(capturedOffscreen.mv.length, 16);
@@ -1054,14 +1155,38 @@ test('Positive: prepareMeshDepthPacket and prepareCanvasMeshDepthPacket invoke W
   // 2. Canvas depth packet with primary name
   let capturedCanvas = null;
   const mockCanvasDepthWasm = {
-    f3d_build_canvas_mesh_depth_packet: (pos, ind, mv, proj, col, w, h, webglDepth, depthTest, depthWrite, depthCompare) => {
-      capturedCanvas = { pos, ind, mv, proj, col, w, h, webglDepth, depthTest, depthWrite, depthCompare };
+    f3d_build_canvas_mesh_depth_packet: (
+      pos,
+      ind,
+      mv,
+      proj,
+      col,
+      w,
+      h,
+      webglDepth,
+      depthTest,
+      depthWrite,
+      depthCompare,
+    ) => {
+      capturedCanvas = {
+        pos,
+        ind,
+        mv,
+        proj,
+        col,
+        w,
+        h,
+        webglDepth,
+        depthTest,
+        depthWrite,
+        depthCompare,
+      };
       return new Uint8Array([0x43, 0x44, 0x45, 0x50]); // 'CDEP'
     },
   };
 
   const canvasResult = prepareCanvasMeshDepthPacket(mesh, camera, 640, 480, mockCanvasDepthWasm);
-  assert.ok(capturedCanvas, 'f3d_build_canvas_mesh_depth_packet must be invoked');
+  assert.ok(capturedCanvas, "f3d_build_canvas_mesh_depth_packet must be invoked");
   assert.equal(capturedCanvas.w, 640);
   assert.equal(capturedCanvas.h, 480);
   assert.equal(capturedCanvas.depthTest, true);
@@ -1083,7 +1208,7 @@ test('Positive: prepareMeshDepthPacket and prepareCanvasMeshDepthPacket invoke W
   assert.deepEqual(Array.from(aliasResult.packetBytes), [9, 9, 9]);
 });
 
-test('Positive: Legacy no-depth mesh succeeds with 8-arg export when depth export absent, uses 11-arg when available', () => {
+test("Positive: Legacy no-depth mesh succeeds with 8-arg export when depth export absent, uses 11-arg when available", () => {
   const noDepthMesh = createBasicTriangleMesh({ depthTest: false, depthWrite: false });
   const camera = createBasicCamera();
 
@@ -1113,7 +1238,7 @@ test('Positive: Legacy no-depth mesh succeeds with 8-arg export when depth expor
       return new Uint8Array([11, 11, 11]);
     },
     f3d_build_mesh_packet: () => {
-      throw new Error('Should prefer depth export when available');
+      throw new Error("Should prefer depth export when available");
     },
   };
 
@@ -1122,11 +1247,11 @@ test('Positive: Legacy no-depth mesh succeeds with 8-arg export when depth expor
   assert.equal(captured11Args.length, 11);
   assert.equal(captured11Args[8], false); // depthTest
   assert.equal(captured11Args[9], false); // depthWrite
-  assert.equal(captured11Args[10], 8);    // depthCompare ALWAYS
+  assert.equal(captured11Args[10], 8); // depthCompare ALWAYS
   assert.deepEqual(Array.from(resDepth.packetBytes), [11, 11, 11]);
 });
 
-test('Positive: renderMesh routes depth-enabled mesh through depth packet builder to WebGpuBridgeHost', async () => {
+test("Positive: renderMesh routes depth-enabled mesh through depth packet builder to WebGpuBridgeHost", async () => {
   const mesh = createDepthTriangleMesh({ depthFunc: THREE.LessDepth });
   const camera = createBasicCamera();
 
@@ -1156,8 +1281,11 @@ test('Positive: renderMesh routes depth-enabled mesh through depth packet builde
   };
 
   // 1. Offscreen renderMesh with depth
-  const offscreenRes = await renderMesh(mockBridgeHost, mesh, camera, null, mockWasm, { width: 64, height: 64 });
-  assert.equal(offscreenRes.target, 'offscreen');
+  const offscreenRes = await renderMesh(mockBridgeHost, mesh, camera, null, mockWasm, {
+    width: 64,
+    height: 64,
+  });
+  assert.equal(offscreenRes.target, "offscreen");
   assert.equal(executedContext, null);
   assert.deepEqual(Array.from(executedPacket), [0x52, 0x45, 0x4e, 0x44]);
   assert.equal(offscreenRes.snapshot.depthCompare, 2);
@@ -1165,48 +1293,48 @@ test('Positive: renderMesh routes depth-enabled mesh through depth packet builde
   // 2. Canvas renderMesh with depth
   const mockCanvasContext = { canvas: { width: 128, height: 128 } };
   const canvasRes = await renderMesh(mockBridgeHost, mesh, camera, mockCanvasContext, mockWasm);
-  assert.equal(canvasRes.target, 'canvas');
+  assert.equal(canvasRes.target, "canvas");
   assert.equal(executedContext, mockCanvasContext);
   assert.deepEqual(Array.from(executedPacket), [0x43, 0x52, 0x45, 0x4e]);
   assert.equal(canvasRes.snapshot.depthCompare, 2);
 });
 
-test('Negative: prepareMeshBatchPacket rejects empty or non-array mesh inputs with EMPTY_MESH_BATCH', () => {
+test("Negative: prepareMeshBatchPacket rejects empty or non-array mesh inputs with EMPTY_MESH_BATCH", () => {
   const camera = createBasicCamera();
   const mockWasm = { f3d_build_mesh_batch_packet: () => new Uint8Array(0) };
 
   assert.throws(
     () => prepareMeshBatchPacket([], camera, 64, 64, mockWasm),
-    new RegExp(ADMISSION_REJECTION.EMPTY_MESH_BATCH)
+    new RegExp(ADMISSION_REJECTION.EMPTY_MESH_BATCH),
   );
 
   assert.throws(
     () => prepareMeshBatchPacket(null, camera, 64, 64, mockWasm),
-    new RegExp(ADMISSION_REJECTION.EMPTY_MESH_BATCH)
+    new RegExp(ADMISSION_REJECTION.EMPTY_MESH_BATCH),
   );
 
   assert.throws(
-    () => prepareMeshBatchPacket('not-an-array', camera, 64, 64, mockWasm),
-    new RegExp(ADMISSION_REJECTION.EMPTY_MESH_BATCH)
+    () => prepareMeshBatchPacket("not-an-array", camera, 64, 64, mockWasm),
+    new RegExp(ADMISSION_REJECTION.EMPTY_MESH_BATCH),
   );
 });
 
-test('Negative: prepareMeshBatchPacket rejects wasmModule missing f3d_build_mesh_batch_packet export', () => {
+test("Negative: prepareMeshBatchPacket rejects wasmModule missing f3d_build_mesh_batch_packet export", () => {
   const mesh = createBasicTriangleMesh();
   const camera = createBasicCamera();
 
   assert.throws(
     () => prepareMeshBatchPacket([mesh], camera, 64, 64, {}),
-    /missing f3d_build_mesh_batch_packet/
+    /missing f3d_build_mesh_batch_packet/,
   );
 
   assert.throws(
     () => prepareMeshBatchPacket([mesh], camera, 64, 64, null),
-    /missing f3d_build_mesh_batch_packet/
+    /missing f3d_build_mesh_batch_packet/,
   );
 });
 
-test('Negative: prepareMeshBatchPacket refuses incompatible shared depth settings across meshes', () => {
+test("Negative: prepareMeshBatchPacket refuses incompatible shared depth settings across meshes", () => {
   const camera = createBasicCamera();
   const mockWasm = { f3d_build_mesh_batch_packet: () => new Uint8Array(0) };
 
@@ -1215,7 +1343,9 @@ test('Negative: prepareMeshBatchPacket refuses incompatible shared depth setting
   const meshB = createDepthTriangleMesh({ depthTest: false, depthWrite: false });
   assert.throws(
     () => prepareMeshBatchPacket([meshA, meshB], camera, 64, 64, mockWasm),
-    (err) => err.message.includes(ADMISSION_REJECTION.INCOMPATIBLE_BATCH_DEPTH) && err.message.includes('depthTest')
+    (err) =>
+      err.message.includes(ADMISSION_REJECTION.INCOMPATIBLE_BATCH_DEPTH) &&
+      err.message.includes("depthTest"),
   );
 
   // 2. Incompatible depthWrite
@@ -1223,19 +1353,31 @@ test('Negative: prepareMeshBatchPacket refuses incompatible shared depth setting
   const meshD = createDepthTriangleMesh({ depthTest: true, depthWrite: false });
   assert.throws(
     () => prepareMeshBatchPacket([meshC, meshD], camera, 64, 64, mockWasm),
-    (err) => err.message.includes(ADMISSION_REJECTION.INCOMPATIBLE_BATCH_DEPTH) && err.message.includes('depthWrite')
+    (err) =>
+      err.message.includes(ADMISSION_REJECTION.INCOMPATIBLE_BATCH_DEPTH) &&
+      err.message.includes("depthWrite"),
   );
 
   // 3. Incompatible depthCompare (depthFunc)
-  const meshE = createDepthTriangleMesh({ depthTest: true, depthWrite: true, depthFunc: THREE.LessDepth });
-  const meshF = createDepthTriangleMesh({ depthTest: true, depthWrite: true, depthFunc: THREE.GreaterDepth });
+  const meshE = createDepthTriangleMesh({
+    depthTest: true,
+    depthWrite: true,
+    depthFunc: THREE.LessDepth,
+  });
+  const meshF = createDepthTriangleMesh({
+    depthTest: true,
+    depthWrite: true,
+    depthFunc: THREE.GreaterDepth,
+  });
   assert.throws(
     () => prepareMeshBatchPacket([meshE, meshF], camera, 64, 64, mockWasm),
-    (err) => err.message.includes(ADMISSION_REJECTION.INCOMPATIBLE_BATCH_DEPTH) && err.message.includes('depthCompare')
+    (err) =>
+      err.message.includes(ADMISSION_REJECTION.INCOMPATIBLE_BATCH_DEPTH) &&
+      err.message.includes("depthCompare"),
   );
 });
 
-test('Negative: prepareMeshBatchPacket rejects batch containing an inadmissible mesh with exact index', () => {
+test("Negative: prepareMeshBatchPacket rejects batch containing an inadmissible mesh with exact index", () => {
   const camera = createBasicCamera();
   const mockWasm = { f3d_build_mesh_batch_packet: () => new Uint8Array(0) };
 
@@ -1245,17 +1387,21 @@ test('Negative: prepareMeshBatchPacket rejects batch containing an inadmissible 
 
   assert.throws(
     () => prepareMeshBatchPacket([validMesh, invisibleMesh], camera, 64, 64, mockWasm),
-    (err) => err.message.includes('Mesh batch admission rejected at index 1') && err.message.includes(ADMISSION_REJECTION.NOT_VISIBLE)
+    (err) =>
+      err.message.includes("Mesh batch admission rejected at index 1") &&
+      err.message.includes(ADMISSION_REJECTION.NOT_VISIBLE),
   );
 
   const transparentMesh = createBasicTriangleMesh({ transparent: true });
   assert.throws(
     () => prepareMeshBatchPacket([transparentMesh, validMesh], camera, 64, 64, mockWasm),
-    (err) => err.message.includes('Mesh batch admission rejected at index 0') && err.message.includes(ADMISSION_REJECTION.UNSUPPORTED_MATERIAL)
+    (err) =>
+      err.message.includes("Mesh batch admission rejected at index 0") &&
+      err.message.includes(ADMISSION_REJECTION.UNSUPPORTED_MATERIAL),
   );
 });
 
-test('Positive: prepareMeshBatchPacket flattens expanded positions and packs per-draw uniforms for variable-length mesh batch', () => {
+test("Positive: prepareMeshBatchPacket flattens expanded positions and packs per-draw uniforms for variable-length mesh batch", () => {
   const camera = createBasicCamera();
 
   // Mesh 1: Unindexed Triangle (3 vertices)
@@ -1265,12 +1411,10 @@ test('Positive: prepareMeshBatchPacket flattens expanded positions and packs per
 
   // Mesh 2: Indexed Quad (4 vertices, 6 indices -> 6 expanded vertices)
   const quadGeom = new THREE.BufferGeometry();
-  quadGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array([
-    0, 0, 0,
-    1, 0, 0,
-    1, 1, 0,
-    0, 1, 0,
-  ]), 3));
+  quadGeom.setAttribute(
+    "position",
+    new THREE.BufferAttribute(new Float32Array([0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0]), 3),
+  );
   quadGeom.setIndex([0, 1, 2, 0, 2, 3]);
   const quadMat = new THREE.MeshBasicMaterial({
     color: 0x00ff00,
@@ -1284,7 +1428,20 @@ test('Positive: prepareMeshBatchPacket flattens expanded positions and packs per
 
   let capturedArgs = null;
   const mockWasm = {
-    f3d_build_mesh_batch_packet: (flatPos, vCounts, mvs, proj, cols, w, h, webglDepth, dt, dw, dc, canvas) => {
+    f3d_build_mesh_batch_packet: (
+      flatPos,
+      vCounts,
+      mvs,
+      proj,
+      cols,
+      w,
+      h,
+      webglDepth,
+      dt,
+      dw,
+      dc,
+      canvas,
+    ) => {
       capturedArgs = { flatPos, vCounts, mvs, proj, cols, w, h, webglDepth, dt, dw, dc, canvas };
       return new Uint8Array([0x42, 0x41, 0x54, 0x43, 0x48]); // 'BATCH'
     },
@@ -1294,7 +1451,7 @@ test('Positive: prepareMeshBatchPacket flattens expanded positions and packs per
   const batchRes = prepareMeshBatchPacket([mesh1, mesh2], camera, 64, 64, mockWasm);
   assert.equal(batchRes.meshCount, 2);
   assert.equal(batchRes.totalVertices, 3 + 6);
-  assert.equal(batchRes.target, 'offscreen');
+  assert.equal(batchRes.target, "offscreen");
   assert.deepEqual(Array.from(batchRes.packetBytes), [0x42, 0x41, 0x54, 0x43, 0x48]);
 
   // Inspect captured arguments
@@ -1336,14 +1493,16 @@ test('Positive: prepareMeshBatchPacket flattens expanded positions and packs per
   assert.equal(capturedArgs.canvas, false);
 
   // 2. Canvas batch
-  const canvasBatchRes = prepareMeshBatchPacket([mesh1, mesh2], camera, 128, 128, mockWasm, { target: 'canvas' });
-  assert.equal(canvasBatchRes.target, 'canvas');
+  const canvasBatchRes = prepareMeshBatchPacket([mesh1, mesh2], camera, 128, 128, mockWasm, {
+    target: "canvas",
+  });
+  assert.equal(canvasBatchRes.target, "canvas");
   assert.equal(capturedArgs.canvas, true);
   assert.equal(capturedArgs.w, 128);
   assert.equal(capturedArgs.h, 128);
 });
 
-test('Positive: renderMeshBatch routes variable-length batch through WebGpuBridgeHost for canvas and offscreen', async () => {
+test("Positive: renderMeshBatch routes variable-length batch through WebGpuBridgeHost for canvas and offscreen", async () => {
   const camera = createBasicCamera();
   const mesh1 = createBasicTriangleMesh({ color: 0xff0000 });
   const mesh2 = createBasicTriangleMesh({ color: 0x0000ff });
@@ -1354,7 +1513,7 @@ test('Positive: renderMeshBatch routes variable-length batch through WebGpuBridg
     executePacket: async (packet, ctx) => {
       executedPacket = packet;
       executedContext = ctx;
-      return { status: 'BATCH_OK' };
+      return { status: "BATCH_OK" };
     },
   };
 
@@ -1363,29 +1522,55 @@ test('Positive: renderMeshBatch routes variable-length batch through WebGpuBridg
   };
 
   // 1. Offscreen renderMeshBatch
-  const offscreenRes = await renderMeshBatch(mockBridgeHost, [mesh1, mesh2], camera, null, mockWasm, { width: 64, height: 64 });
-  assert.equal(offscreenRes.target, 'offscreen');
+  const offscreenRes = await renderMeshBatch(
+    mockBridgeHost,
+    [mesh1, mesh2],
+    camera,
+    null,
+    mockWasm,
+    { width: 64, height: 64 },
+  );
+  assert.equal(offscreenRes.target, "offscreen");
   assert.equal(offscreenRes.meshCount, 2);
   assert.equal(executedContext, null);
   assert.deepEqual(Array.from(executedPacket), [0x99, 0x88, 0x77]);
 
   // 2. Canvas renderMeshBatch
   const mockCanvasContext = { canvas: { width: 256, height: 256 } };
-  const canvasRes = await renderMeshBatch(mockBridgeHost, [mesh1, mesh2], camera, mockCanvasContext, mockWasm);
-  assert.equal(canvasRes.target, 'canvas');
+  const canvasRes = await renderMeshBatch(
+    mockBridgeHost,
+    [mesh1, mesh2],
+    camera,
+    mockCanvasContext,
+    mockWasm,
+  );
+  assert.equal(canvasRes.target, "canvas");
   assert.equal(canvasRes.meshCount, 2);
   assert.equal(executedContext, mockCanvasContext);
   assert.deepEqual(Array.from(executedPacket), [0x99, 0x88, 0x77]);
 });
 
-test('Regression: prepareMeshBatchPacket and renderMeshBatch honor explicit target and do not let options.canvas leak into offscreen', async () => {
+test("Regression: prepareMeshBatchPacket and renderMeshBatch honor explicit target and do not let options.canvas leak into offscreen", async () => {
   const camera = createBasicCamera();
   const mesh1 = createBasicTriangleMesh({ color: 0xff0000 });
   const mesh2 = createBasicTriangleMesh({ color: 0x00ff00 });
 
   let capturedCanvasFlag = null;
   const mockWasm = {
-    f3d_build_mesh_batch_packet: (flatPos, vCounts, mvs, proj, cols, w, h, webglDepth, dt, dw, dc, canvas) => {
+    f3d_build_mesh_batch_packet: (
+      flatPos,
+      vCounts,
+      mvs,
+      proj,
+      cols,
+      w,
+      h,
+      webglDepth,
+      dt,
+      dw,
+      dc,
+      canvas,
+    ) => {
       capturedCanvasFlag = canvas;
       return new Uint8Array([0x11, 0x22]);
     },
@@ -1393,24 +1578,30 @@ test('Regression: prepareMeshBatchPacket and renderMeshBatch honor explicit targ
 
   // 1. Calling prepareMeshBatchPacket with options = { canvas: true } without target: 'canvas' must emit canvas = false
   const res1 = prepareMeshBatchPacket([mesh1, mesh2], camera, 64, 64, mockWasm, { canvas: true });
-  assert.equal(res1.target, 'offscreen');
-  assert.equal(capturedCanvasFlag, false, 'options.canvas must NOT override target; target must be explicit');
+  assert.equal(res1.target, "offscreen");
+  assert.equal(
+    capturedCanvasFlag,
+    false,
+    "options.canvas must NOT override target; target must be explicit",
+  );
 
   // 2. Calling renderMeshBatch with canvasContext = null and options = { canvas: true } must strictly remain offscreen
-  let executedContext = undefined;
+  let executedContext;
   const mockBridgeHost = {
     executePacket: async (packet, ctx) => {
       executedContext = ctx;
       return { ok: true };
     },
   };
-  const res2 = await renderMeshBatch(mockBridgeHost, [mesh1, mesh2], camera, null, mockWasm, { canvas: true });
-  assert.equal(res2.target, 'offscreen');
+  const res2 = await renderMeshBatch(mockBridgeHost, [mesh1, mesh2], camera, null, mockWasm, {
+    canvas: true,
+  });
+  assert.equal(res2.target, "offscreen");
   assert.equal(capturedCanvasFlag, false);
   assert.equal(executedContext, null);
 });
 
-test('Regression: renderMesh and renderMeshBatch propagate width: 0 and height: 0 to validation via ?? rather than defaulting to 64', async () => {
+test("Regression: renderMesh and renderMeshBatch propagate width: 0 and height: 0 to validation via ?? rather than defaulting to 64", async () => {
   const camera = createBasicCamera();
   const mesh = createBasicTriangleMesh();
   const mockWasm = {
@@ -1422,25 +1613,25 @@ test('Regression: renderMesh and renderMeshBatch propagate width: 0 and height: 
   // 1. renderMesh with width: 0 must reject with INVALID_DIMENSIONS, not silently become 64
   await assert.rejects(
     () => renderMesh(mockBridgeHost, mesh, camera, null, mockWasm, { width: 0, height: 64 }),
-    new RegExp(ADMISSION_REJECTION.INVALID_DIMENSIONS)
+    new RegExp(ADMISSION_REJECTION.INVALID_DIMENSIONS),
   );
   await assert.rejects(
     () => renderMesh(mockBridgeHost, mesh, camera, null, mockWasm, { width: 64, height: 0 }),
-    new RegExp(ADMISSION_REJECTION.INVALID_DIMENSIONS)
+    new RegExp(ADMISSION_REJECTION.INVALID_DIMENSIONS),
   );
 
   // 2. renderMeshBatch with width: 0 must reject with INVALID_DIMENSIONS
   await assert.rejects(
     () => renderMeshBatch(mockBridgeHost, [mesh], camera, null, mockWasm, { width: 0, height: 64 }),
-    new RegExp(ADMISSION_REJECTION.INVALID_DIMENSIONS)
+    new RegExp(ADMISSION_REJECTION.INVALID_DIMENSIONS),
   );
   await assert.rejects(
     () => renderMeshBatch(mockBridgeHost, [mesh], camera, null, mockWasm, { width: 64, height: 0 }),
-    new RegExp(ADMISSION_REJECTION.INVALID_DIMENSIONS)
+    new RegExp(ADMISSION_REJECTION.INVALID_DIMENSIONS),
   );
 });
 
-test('Positive: prepareMeshBatchPacket preserves zero-drawrange mesh without losing or miscounting batch draw slots (empty prefix and middle)', async () => {
+test("Positive: prepareMeshBatchPacket preserves zero-drawrange mesh without losing or miscounting batch draw slots (empty prefix and middle)", async () => {
   const camera = createBasicCamera();
 
   // Mesh 0: Empty unindexed prefix mesh (drawRange count 0)
@@ -1456,12 +1647,10 @@ test('Positive: prepareMeshBatchPacket preserves zero-drawrange mesh without los
 
   // Mesh 2: Empty indexed middle mesh (drawRange count 0)
   const quadGeom = new THREE.BufferGeometry();
-  quadGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array([
-    0, 0, 0,
-    1, 0, 0,
-    1, 1, 0,
-    0, 1, 0,
-  ]), 3));
+  quadGeom.setAttribute(
+    "position",
+    new THREE.BufferAttribute(new Float32Array([0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0]), 3),
+  );
   quadGeom.setIndex([0, 1, 2, 0, 2, 3]);
   quadGeom.setDrawRange(2, 0); // Empty range
   const quadMat = new THREE.MeshBasicMaterial({
@@ -1481,7 +1670,20 @@ test('Positive: prepareMeshBatchPacket preserves zero-drawrange mesh without los
 
   let capturedArgs = null;
   const mockWasm = {
-    f3d_build_mesh_batch_packet: (flatPos, vCounts, mvs, proj, cols, w, h, webglDepth, dt, dw, dc, canvas) => {
+    f3d_build_mesh_batch_packet: (
+      flatPos,
+      vCounts,
+      mvs,
+      proj,
+      cols,
+      w,
+      h,
+      webglDepth,
+      dt,
+      dw,
+      dc,
+      canvas,
+    ) => {
       capturedArgs = { flatPos, vCounts, mvs, proj, cols, w, h, webglDepth, dt, dw, dc, canvas };
       return new Uint8Array([0x5a, 0x45, 0x52, 0x4f]); // 'ZERO'
     },
@@ -1550,16 +1752,19 @@ test('Positive: prepareMeshBatchPacket preserves zero-drawrange mesh without los
   const mockBridgeHost = {
     executePacket: async (packet) => {
       executedPacket = packet;
-      return { status: 'BATCH_ZERO_OK' };
+      return { status: "BATCH_ZERO_OK" };
     },
   };
-  const execRes = await renderMeshBatch(mockBridgeHost, meshes, camera, null, mockWasm, { width: 64, height: 64 });
+  const execRes = await renderMeshBatch(mockBridgeHost, meshes, camera, null, mockWasm, {
+    width: 64,
+    height: 64,
+  });
   assert.equal(execRes.meshCount, 4);
   assert.equal(execRes.totalVertices, 6);
   assert.deepEqual(Array.from(executedPacket), [0x5a, 0x45, 0x52, 0x4f]);
 });
 
-test('Positive: renderScene collects 3 meshes with distinct colors/transforms into one batch with 3 draw ranges and correct MV per mesh', async () => {
+test("Positive: renderScene collects 3 meshes with distinct colors/transforms into one batch with 3 draw ranges and correct MV per mesh", async () => {
   const scene = new THREE.Scene();
   const camera = createBasicCamera();
 
@@ -1583,8 +1788,34 @@ test('Positive: renderScene collects 3 meshes with distinct colors/transforms in
 
   let capturedBatchArgs = null;
   const mockWasm = {
-    f3d_build_mesh_batch_packet: (flatPos, vCounts, mvs, proj, cols, w, h, webglDepth, dt, dw, dc, canvas) => {
-      capturedBatchArgs = { flatPos, vCounts, mvs, proj, cols, w, h, webglDepth, dt, dw, dc, canvas };
+    f3d_build_mesh_batch_packet: (
+      flatPos,
+      vCounts,
+      mvs,
+      proj,
+      cols,
+      w,
+      h,
+      webglDepth,
+      dt,
+      dw,
+      dc,
+      canvas,
+    ) => {
+      capturedBatchArgs = {
+        flatPos,
+        vCounts,
+        mvs,
+        proj,
+        cols,
+        w,
+        h,
+        webglDepth,
+        dt,
+        dw,
+        dc,
+        canvas,
+      };
       return new Uint8Array([0x53, 0x43, 0x45, 0x4e, 0x45]); // 'SCENE'
     },
   };
@@ -1595,7 +1826,7 @@ test('Positive: renderScene collects 3 meshes with distinct colors/transforms in
     executePacket: async (packet, target) => {
       executedPacket = packet;
       executedTarget = target;
-      return { status: 'SCENE_RENDERED' };
+      return { status: "SCENE_RENDERED" };
     },
   };
 
@@ -1604,7 +1835,7 @@ test('Positive: renderScene collects 3 meshes with distinct colors/transforms in
   // 1. Returned shape has admitted and refused
   assert.deepEqual(res.admitted, [mesh1.uuid, mesh2.uuid, mesh3.uuid]);
   assert.deepEqual(res.refused, []);
-  assert.equal(res.result?.status, 'SCENE_RENDERED');
+  assert.equal(res.result?.status, "SCENE_RENDERED");
 
   // 2. Exactly one batch packet executed
   assert.deepEqual(Array.from(executedPacket), [0x53, 0x43, 0x45, 0x4e, 0x45]);
@@ -1641,7 +1872,7 @@ test('Positive: renderScene collects 3 meshes with distinct colors/transforms in
   assert.deepEqual(capturedBatchArgs.mvs.slice(32, 48), expectedMv3);
 });
 
-test('Refusal: renderScene refuses WHOLE submission when visible InstancedMesh or unsupported-side mesh exists (no partial render)', async () => {
+test("Refusal: renderScene refuses WHOLE submission when visible InstancedMesh or unsupported-side mesh exists (no partial render)", async () => {
   const scene = new THREE.Scene();
   const camera = createBasicCamera();
 
@@ -1649,8 +1880,15 @@ test('Refusal: renderScene refuses WHOLE submission when visible InstancedMesh o
 
   // InstancedMesh: unsupported subclass
   const instGeom = new THREE.BufferGeometry();
-  instGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]), 3));
-  const instMat = new THREE.MeshBasicMaterial({ side: THREE.DoubleSide, depthTest: false, depthWrite: false });
+  instGeom.setAttribute(
+    "position",
+    new THREE.BufferAttribute(new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]), 3),
+  );
+  const instMat = new THREE.MeshBasicMaterial({
+    side: THREE.DoubleSide,
+    depthTest: false,
+    depthWrite: false,
+  });
   const instancedMesh = new THREE.InstancedMesh(instGeom, instMat, 2);
 
   // Unsupported side: side 99
@@ -1665,8 +1903,34 @@ test('Refusal: renderScene refuses WHOLE submission when visible InstancedMesh o
 
   let capturedBatchArgs = null;
   const mockWasm = {
-    f3d_build_mesh_batch_packet: (flatPos, vCounts, mvs, proj, cols, w, h, webglDepth, dt, dw, dc, canvas) => {
-      capturedBatchArgs = { flatPos, vCounts, mvs, proj, cols, w, h, webglDepth, dt, dw, dc, canvas };
+    f3d_build_mesh_batch_packet: (
+      flatPos,
+      vCounts,
+      mvs,
+      proj,
+      cols,
+      w,
+      h,
+      webglDepth,
+      dt,
+      dw,
+      dc,
+      canvas,
+    ) => {
+      capturedBatchArgs = {
+        flatPos,
+        vCounts,
+        mvs,
+        proj,
+        cols,
+        w,
+        h,
+        webglDepth,
+        dt,
+        dw,
+        dc,
+        canvas,
+      };
       return new Uint8Array([0x54, 0x57, 0x4f]); // 'TWO'
     },
   };
@@ -1675,7 +1939,7 @@ test('Refusal: renderScene refuses WHOLE submission when visible InstancedMesh o
   const mockBridgeHost = {
     executePacket: async () => {
       executionCount++;
-      return { status: 'PARTIAL_OK' };
+      return { status: "PARTIAL_OK" };
     },
   };
 
@@ -1696,18 +1960,35 @@ test('Refusal: renderScene refuses WHOLE submission when visible InstancedMesh o
   });
 
   // Strict refusal contract: NO batch packet executed, NO batch packet prepared
-  assert.equal(executionCount, 0, 'No packet may be submitted when scene contains visible unsupported items');
-  assert.equal(capturedBatchArgs, null, 'No batch packet builder may be invoked when scene contains refusals');
-  assert.ok(res.reason.includes('UNSUPPORTED_MESH_SUBCLASS') || res.refusalReason.includes('UNSUPPORTED_MESH_SUBCLASS'));
+  assert.equal(
+    executionCount,
+    0,
+    "No packet may be submitted when scene contains visible unsupported items",
+  );
+  assert.equal(
+    capturedBatchArgs,
+    null,
+    "No batch packet builder may be invoked when scene contains refusals",
+  );
+  assert.ok(
+    res.reason.includes("UNSUPPORTED_MESH_SUBCLASS") ||
+      res.refusalReason.includes("UNSUPPORTED_MESH_SUBCLASS"),
+  );
 
   // Retain renderMeshBatch as explicit API for caller-selected subsets
-  const batchRes = await renderMeshBatch(mockBridgeHost, [validMesh1, validMesh2], camera, null, mockWasm);
-  assert.equal(executionCount, 1, 'renderMeshBatch permits caller-selected subset execution');
+  const batchRes = await renderMeshBatch(
+    mockBridgeHost,
+    [validMesh1, validMesh2],
+    camera,
+    null,
+    mockWasm,
+  );
+  assert.equal(executionCount, 1, "renderMeshBatch permits caller-selected subset execution");
   assert.equal(batchRes.meshCount, 2);
   assert.equal(capturedBatchArgs.vCounts.length, 2);
 });
 
-test('Positive: renderScene propagates nested Group transforms into emitted per-mesh model-view matrix via single updateMatrixWorld', async () => {
+test("Positive: renderScene propagates nested Group transforms into emitted per-mesh model-view matrix via single updateMatrixWorld", async () => {
   const scene = new THREE.Scene();
   const camera = createBasicCamera();
 
@@ -1728,14 +2009,40 @@ test('Positive: renderScene propagates nested Group transforms into emitted per-
 
   let capturedBatchArgs = null;
   const mockWasm = {
-    f3d_build_mesh_batch_packet: (flatPos, vCounts, mvs, proj, cols, w, h, webglDepth, dt, dw, dc, canvas) => {
-      capturedBatchArgs = { flatPos, vCounts, mvs, proj, cols, w, h, webglDepth, dt, dw, dc, canvas };
+    f3d_build_mesh_batch_packet: (
+      flatPos,
+      vCounts,
+      mvs,
+      proj,
+      cols,
+      w,
+      h,
+      webglDepth,
+      dt,
+      dw,
+      dc,
+      canvas,
+    ) => {
+      capturedBatchArgs = {
+        flatPos,
+        vCounts,
+        mvs,
+        proj,
+        cols,
+        w,
+        h,
+        webglDepth,
+        dt,
+        dw,
+        dc,
+        canvas,
+      };
       return new Uint8Array([0x47, 0x52, 0x50]); // 'GRP'
     },
   };
 
   const mockBridgeHost = {
-    executePacket: async () => ({ status: 'NESTED_OK' }),
+    executePacket: async () => ({ status: "NESTED_OK" }),
   };
 
   const res = await renderScene(mockBridgeHost, scene, camera, null, mockWasm);
@@ -1755,13 +2062,16 @@ test('Positive: renderScene propagates nested Group transforms into emitted per-
   assert.deepEqual(capturedBatchArgs.mvs, expectedMv);
 });
 
-test('Negative: renderScene with empty admitted set explicitly refuses without submitting', async () => {
+test("Negative: renderScene with empty admitted set explicitly refuses without submitting", async () => {
   const scene = new THREE.Scene();
   const camera = createBasicCamera();
 
   // Add only inadmissible meshes
   const instGeom = new THREE.BufferGeometry();
-  instGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]), 3));
+  instGeom.setAttribute(
+    "position",
+    new THREE.BufferAttribute(new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]), 3),
+  );
   const instMat = new THREE.MeshBasicMaterial({ side: THREE.DoubleSide });
   const instMesh = new THREE.InstancedMesh(instGeom, instMat, 1);
 
@@ -1774,13 +2084,13 @@ test('Negative: renderScene with empty admitted set explicitly refuses without s
   const mockBridgeHost = {
     executePacket: async () => {
       executeCalled = true;
-      return { status: 'SHOULD_NOT_EXECUTE' };
+      return { status: "SHOULD_NOT_EXECUTE" };
     },
   };
 
   const mockWasm = {
     f3d_build_mesh_batch_packet: () => {
-      throw new Error('Should not build batch for empty admitted set');
+      throw new Error("Should not build batch for empty admitted set");
     },
   };
 
@@ -1793,7 +2103,7 @@ test('Negative: renderScene with empty admitted set explicitly refuses without s
   assert.equal(executeCalled, false);
 });
 
-test('Positive: renderScene routes to canvas swapchain when canvasContext is provided', async () => {
+test("Positive: renderScene routes to canvas swapchain when canvasContext is provided", async () => {
   const scene = new THREE.Scene();
   const camera = createBasicCamera();
   const mesh = createBasicTriangleMesh();
@@ -1801,7 +2111,20 @@ test('Positive: renderScene routes to canvas swapchain when canvasContext is pro
 
   let capturedCanvasArg = null;
   const mockWasm = {
-    f3d_build_mesh_batch_packet: (flatPos, vCounts, mvs, proj, cols, w, h, webglDepth, dt, dw, dc, canvas) => {
+    f3d_build_mesh_batch_packet: (
+      flatPos,
+      vCounts,
+      mvs,
+      proj,
+      cols,
+      w,
+      h,
+      webglDepth,
+      dt,
+      dw,
+      dc,
+      canvas,
+    ) => {
       capturedCanvasArg = canvas;
       return new Uint8Array([0x43, 0x41, 0x4e]); // 'CAN'
     },
@@ -1815,7 +2138,7 @@ test('Positive: renderScene routes to canvas swapchain when canvasContext is pro
   const mockBridgeHost = {
     executePacket: async (packet, target) => {
       targetPassed = target;
-      return { status: 'CANVAS_OK' };
+      return { status: "CANVAS_OK" };
     },
   };
 
@@ -1826,33 +2149,27 @@ test('Positive: renderScene routes to canvas swapchain when canvasContext is pro
   assert.equal(targetPassed, fakeCanvasContext);
 });
 
-test('Negative: renderScene validates required arguments (bridgeHost, scene, camera)', async () => {
+test("Negative: renderScene validates required arguments (bridgeHost, scene, camera)", async () => {
   const scene = new THREE.Scene();
   const camera = createBasicCamera();
   const mockBridgeHost = { executePacket: async () => {} };
 
   // Missing bridgeHost
-  await assert.rejects(
-    () => renderScene(null, scene, camera, null, {}),
-    /Invalid bridgeHost/
-  );
+  await assert.rejects(() => renderScene(null, scene, camera, null, {}), /Invalid bridgeHost/);
 
   // Missing scene
-  await assert.rejects(
-    () => renderScene(mockBridgeHost, null, camera, null, {}),
-    /Invalid scene/
-  );
+  await assert.rejects(() => renderScene(mockBridgeHost, null, camera, null, {}), /Invalid scene/);
 
   // Missing camera
   await assert.rejects(
     () => renderScene(mockBridgeHost, scene, null, null, {}),
-    new RegExp(ADMISSION_REJECTION.INVALID_CAMERA)
+    new RegExp(ADMISSION_REJECTION.INVALID_CAMERA),
   );
 });
 
-test('Regression: prepareMeshBatchPacket, renderMeshBatch, and renderScene map empty batch refusals to EMPTY_MESH_BATCH code', async () => {
+test("Regression: prepareMeshBatchPacket, renderMeshBatch, and renderScene map empty batch refusals to EMPTY_MESH_BATCH code", async () => {
   const camera = createBasicCamera();
-  const mockBridgeHost = { executePacket: async () => ({ status: 'OK' }) };
+  const mockBridgeHost = { executePacket: async () => ({ status: "OK" }) };
   let wasmCalled = false;
   const mockWasm = {
     f3d_build_mesh_batch_packet: () => {
@@ -1868,13 +2185,13 @@ test('Regression: prepareMeshBatchPacket, renderMeshBatch, and renderScene map e
   } catch (err) {
     err1 = err;
   }
-  assert.ok(err1, 'prepareMeshBatchPacket must throw on empty batch');
+  assert.ok(err1, "prepareMeshBatchPacket must throw on empty batch");
   assert.ok(
-    err1.message.startsWith('EMPTY_MESH_BATCH:'),
-    `Error message "${err1.message}" must be prefixed with EMPTY_MESH_BATCH:`
+    err1.message.startsWith("EMPTY_MESH_BATCH:"),
+    `Error message "${err1.message}" must be prefixed with EMPTY_MESH_BATCH:`,
   );
-  assert.equal(err1.reason, 'EMPTY_MESH_BATCH', 'err.reason must be set to EMPTY_MESH_BATCH');
-  assert.equal(wasmCalled, false, 'Wasm must not be called on empty batch');
+  assert.equal(err1.reason, "EMPTY_MESH_BATCH", "err.reason must be set to EMPTY_MESH_BATCH");
+  assert.equal(wasmCalled, false, "Wasm must not be called on empty batch");
 
   // 2. renderMeshBatch refuses before calling Wasm or bridgeHost and contains EMPTY_MESH_BATCH code + err.reason
   let err2 = null;
@@ -1883,18 +2200,22 @@ test('Regression: prepareMeshBatchPacket, renderMeshBatch, and renderScene map e
   } catch (err) {
     err2 = err;
   }
-  assert.ok(err2, 'renderMeshBatch must throw on empty batch');
+  assert.ok(err2, "renderMeshBatch must throw on empty batch");
   assert.ok(
-    err2.message.startsWith('EMPTY_MESH_BATCH:'),
-    `renderMeshBatch error message "${err2.message}" must be prefixed with EMPTY_MESH_BATCH:`
+    err2.message.startsWith("EMPTY_MESH_BATCH:"),
+    `renderMeshBatch error message "${err2.message}" must be prefixed with EMPTY_MESH_BATCH:`,
   );
-  assert.equal(err2.reason, 'EMPTY_MESH_BATCH', 'renderMeshBatch err.reason must be EMPTY_MESH_BATCH');
+  assert.equal(
+    err2.reason,
+    "EMPTY_MESH_BATCH",
+    "renderMeshBatch err.reason must be EMPTY_MESH_BATCH",
+  );
 
   // 3. If Wasm itself throws Rust MeshPacketError::EmptyMeshList, prepareMeshBatchPacket maps it to EMPTY_MESH_BATCH
   const mesh = createBasicTriangleMesh();
   const mockWasmEmptyError = {
     f3d_build_mesh_batch_packet: () => {
-      throw new Error('mesh inputs list must contain at least one mesh');
+      throw new Error("mesh inputs list must contain at least one mesh");
     },
   };
   let err3 = null;
@@ -1903,22 +2224,26 @@ test('Regression: prepareMeshBatchPacket, renderMeshBatch, and renderScene map e
   } catch (err) {
     err3 = err;
   }
-  assert.ok(err3, 'prepareMeshBatchPacket must map Wasm empty error');
+  assert.ok(err3, "prepareMeshBatchPacket must map Wasm empty error");
   assert.ok(
-    err3.message.startsWith('EMPTY_MESH_BATCH:'),
-    `Wasm EmptyMeshList must be mapped to EMPTY_MESH_BATCH prefix (got: "${err3.message}")`
+    err3.message.startsWith("EMPTY_MESH_BATCH:"),
+    `Wasm EmptyMeshList must be mapped to EMPTY_MESH_BATCH prefix (got: "${err3.message}")`,
   );
-  assert.equal(err3.reason, 'EMPTY_MESH_BATCH', 'Wasm EmptyMeshList mapped error must have err.reason');
+  assert.equal(
+    err3.reason,
+    "EMPTY_MESH_BATCH",
+    "Wasm EmptyMeshList mapped error must have err.reason",
+  );
 
   // 4. renderScene returns refusal reason containing EMPTY_MESH_BATCH for empty scene
   const emptyScene = new THREE.Scene();
   const res = await renderScene(mockBridgeHost, emptyScene, camera, null, mockWasm);
   assert.deepEqual(res.admitted, []);
-  assert.equal(res.reason, 'EMPTY_MESH_BATCH');
-  assert.equal(res.refusalReason, 'EMPTY_MESH_BATCH');
+  assert.equal(res.reason, "EMPTY_MESH_BATCH");
+  assert.equal(res.refusalReason, "EMPTY_MESH_BATCH");
 });
 
-test('Contract: All ADMISSION_REJECTION thrown errors carry prefix with key code and err.reason = key', () => {
+test("Contract: All ADMISSION_REJECTION thrown errors carry prefix with key code and err.reason = key", () => {
   const camera = createBasicCamera();
   const mesh = createBasicTriangleMesh();
   const mockWasm = { f3d_build_mesh_batch_packet: () => new Uint8Array(0) };
@@ -1927,33 +2252,33 @@ test('Contract: All ADMISSION_REJECTION thrown errors carry prefix with key code
   for (const [key, value] of Object.entries(ADMISSION_REJECTION)) {
     assert(
       value.startsWith(`${key}: `),
-      `ADMISSION_REJECTION.${key} must start with "${key}: ", got: "${value}"`
+      `ADMISSION_REJECTION.${key} must start with "${key}: ", got: "${value}"`,
     );
     const err = createAdmissionError(key);
     assert.equal(err.reason, key);
     assert(
       err.message.startsWith(`${key}: `),
-      `createAdmissionError(${key}).message must start with "${key}: ", got: "${err.message}"`
+      `createAdmissionError(${key}).message must start with "${key}: ", got: "${err.message}"`,
     );
   }
 
   // 2. EMPTY_MESH_BATCH thrown from prepareMeshBatchPacket
   assert.throws(
     () => prepareMeshBatchPacket([], camera, 64, 64, mockWasm),
-    (err) => err.message.startsWith('EMPTY_MESH_BATCH:') && err.reason === 'EMPTY_MESH_BATCH'
+    (err) => err.message.startsWith("EMPTY_MESH_BATCH:") && err.reason === "EMPTY_MESH_BATCH",
   );
 
   // 3. INVALID_DIMENSIONS thrown from extractMeshRenderData
   assert.throws(
     () => extractMeshRenderData(mesh, camera, 0, 64),
-    (err) => err.message.startsWith('INVALID_DIMENSIONS:') && err.reason === 'INVALID_DIMENSIONS'
+    (err) => err.message.startsWith("INVALID_DIMENSIONS:") && err.reason === "INVALID_DIMENSIONS",
   );
 
   // 4. INVALID_DRAWRANGE thrown from extractMeshRenderData
   mesh.geometry.setDrawRange(-1, 3);
   assert.throws(
     () => extractMeshRenderData(mesh, camera, 64, 64),
-    (err) => err.message.startsWith('INVALID_DRAWRANGE:') && err.reason === 'INVALID_DRAWRANGE'
+    (err) => err.message.startsWith("INVALID_DRAWRANGE:") && err.reason === "INVALID_DRAWRANGE",
   );
   mesh.geometry.setDrawRange(0, Infinity); // restore
 
@@ -1962,20 +2287,21 @@ test('Contract: All ADMISSION_REJECTION thrown errors carry prefix with key code
   invisibleSingle.visible = false;
   assert.throws(
     () => extractMeshRenderData(invisibleSingle, camera, 64, 64),
-    (err) => err.message.startsWith('NOT_VISIBLE:') && err.reason === 'NOT_VISIBLE'
+    (err) => err.message.startsWith("NOT_VISIBLE:") && err.reason === "NOT_VISIBLE",
   );
 
   const notAMesh = { isMesh: false, geometry: {}, material: {} };
   assert.throws(
     () => extractMeshRenderData(notAMesh, camera, 64, 64),
-    (err) => err.message.startsWith('NOT_A_MESH:') && err.reason === 'NOT_A_MESH'
+    (err) => err.message.startsWith("NOT_A_MESH:") && err.reason === "NOT_A_MESH",
   );
 
   // 6. AMBIGUOUS_DEPTH_PAIR thrown from extractMeshRenderData
   const ambigMesh = createBasicTriangleMesh({ depthTest: false, depthWrite: true });
   assert.throws(
     () => extractMeshRenderData(ambigMesh, camera, 64, 64),
-    (err) => err.message.startsWith('AMBIGUOUS_DEPTH_PAIR:') && err.reason === 'AMBIGUOUS_DEPTH_PAIR'
+    (err) =>
+      err.message.startsWith("AMBIGUOUS_DEPTH_PAIR:") && err.reason === "AMBIGUOUS_DEPTH_PAIR",
   );
 
   // 7. INCOMPATIBLE_BATCH_DEPTH thrown from prepareMeshBatchPacket
@@ -1983,7 +2309,9 @@ test('Contract: All ADMISSION_REJECTION thrown errors carry prefix with key code
   const meshB = createBasicTriangleMesh({ depthTest: false });
   assert.throws(
     () => prepareMeshBatchPacket([meshA, meshB], camera, 64, 64, mockWasm),
-    (err) => err.message.startsWith('INCOMPATIBLE_BATCH_DEPTH:') && err.reason === 'INCOMPATIBLE_BATCH_DEPTH'
+    (err) =>
+      err.message.startsWith("INCOMPATIBLE_BATCH_DEPTH:") &&
+      err.reason === "INCOMPATIBLE_BATCH_DEPTH",
   );
 
   // 8. Inadmissible mesh wrapped in batch carries child reason code as prefix and reason
@@ -1991,11 +2319,14 @@ test('Contract: All ADMISSION_REJECTION thrown errors carry prefix with key code
   invisibleMesh.visible = false;
   assert.throws(
     () => prepareMeshBatchPacket([mesh, invisibleMesh], camera, 64, 64, mockWasm),
-    (err) => err.message.startsWith('NOT_VISIBLE:') && err.reason === 'NOT_VISIBLE' && err.message.includes('Mesh batch admission rejected at index 1')
+    (err) =>
+      err.message.startsWith("NOT_VISIBLE:") &&
+      err.reason === "NOT_VISIBLE" &&
+      err.message.includes("Mesh batch admission rejected at index 1"),
   );
 });
 
-test('Positive: canAdmitMesh and renderScene refuse mesh when ancestor group has visible === false (Three.js subtree culling parity)', async () => {
+test("Positive: canAdmitMesh and renderScene refuse mesh when ancestor group has visible === false (Three.js subtree culling parity)", async () => {
   const camera = createBasicCamera();
 
   // 1. Direct canAdmitMesh check with invisible ancestor
@@ -2007,7 +2338,7 @@ test('Positive: canAdmitMesh and renderScene refuse mesh when ancestor group has
   const directAdm = canAdmitMesh(childMesh, camera);
   assert.equal(directAdm.admitted, false);
   assert.equal(directAdm.reason, ADMISSION_REJECTION.NOT_VISIBLE);
-  assert.equal(directAdm.code, 'NOT_VISIBLE');
+  assert.equal(directAdm.code, "NOT_VISIBLE");
 
   // Deeply nested ancestor invisible
   const grandParent = new THREE.Group();
@@ -2020,7 +2351,7 @@ test('Positive: canAdmitMesh and renderScene refuse mesh when ancestor group has
 
   const deepAdm = canAdmitMesh(deepMesh, camera);
   assert.equal(deepAdm.admitted, false);
-  assert.equal(deepAdm.code, 'NOT_VISIBLE');
+  assert.equal(deepAdm.code, "NOT_VISIBLE");
 
   // 2. renderScene with mixed visibility hierarchy
   const scene = new THREE.Scene();
@@ -2035,21 +2366,47 @@ test('Positive: canAdmitMesh and renderScene refuse mesh when ancestor group has
 
   let capturedBatchArgs = null;
   const mockWasm = {
-    f3d_build_mesh_batch_packet: (flatPos, vCounts, mvs, proj, cols, w, h, webglDepth, dt, dw, dc, canvas) => {
-      capturedBatchArgs = { flatPos, vCounts, mvs, proj, cols, w, h, webglDepth, dt, dw, dc, canvas };
+    f3d_build_mesh_batch_packet: (
+      flatPos,
+      vCounts,
+      mvs,
+      proj,
+      cols,
+      w,
+      h,
+      webglDepth,
+      dt,
+      dw,
+      dc,
+      canvas,
+    ) => {
+      capturedBatchArgs = {
+        flatPos,
+        vCounts,
+        mvs,
+        proj,
+        cols,
+        w,
+        h,
+        webglDepth,
+        dt,
+        dw,
+        dc,
+        canvas,
+      };
       return new Uint8Array([0x56, 0x49, 0x53]); // 'VIS'
     },
   };
 
   const mockBridgeHost = {
-    executePacket: async () => ({ status: 'RENDERED' }),
+    executePacket: async () => ({ status: "RENDERED" }),
   };
 
   const res = await renderScene(mockBridgeHost, scene, camera, null, mockWasm);
 
   // Visible mesh admitted, hidden mesh legitimately culled without causing scene refusal
   assert.deepEqual(res.admitted, [visibleMesh.uuid]);
-  assert.equal(res.refused.length, 0, 'Hidden nodes are culled and not recorded as scene refusals');
+  assert.equal(res.refused.length, 0, "Hidden nodes are culled and not recorded as scene refusals");
 
   // Batch only contains the 1 visible mesh
   assert.equal(capturedBatchArgs.vCounts.length, 1);
@@ -2074,12 +2431,12 @@ test('Positive: canAdmitMesh and renderScene refuse mesh when ancestor group has
 
   const hiddenRes = await renderScene(mockBridgeHostNoSubmit, hiddenScene, camera, null, mockWasm);
   assert.deepEqual(hiddenRes.admitted, []);
-  assert.equal(hiddenRes.refused.length, 0, 'Hidden meshes are culled, not recorded as refusals');
-  assert.equal(hiddenRes.reason, 'EMPTY_MESH_BATCH');
-  assert.equal(executed, false, 'No execution when admitted set is empty');
+  assert.equal(hiddenRes.refused.length, 0, "Hidden meshes are culled, not recorded as refusals");
+  assert.equal(hiddenRes.reason, "EMPTY_MESH_BATCH");
+  assert.equal(executed, false, "No execution when admitted set is empty");
 });
 
-test('Positive: renderScene sorts admitted meshes ascending by renderOrder (Three.js RenderList parity)', async () => {
+test("Positive: renderScene sorts admitted meshes ascending by renderOrder (Three.js RenderList parity)", async () => {
   const scene = new THREE.Scene();
   const camera = createBasicCamera();
 
@@ -2115,14 +2472,40 @@ test('Positive: renderScene sorts admitted meshes ascending by renderOrder (Thre
 
   let capturedBatchArgs = null;
   const mockWasm = {
-    f3d_build_mesh_batch_packet: (flatPos, vCounts, mvs, proj, cols, w, h, webglDepth, dt, dw, dc, canvas) => {
-      capturedBatchArgs = { flatPos, vCounts, mvs, proj, cols, w, h, webglDepth, dt, dw, dc, canvas };
+    f3d_build_mesh_batch_packet: (
+      flatPos,
+      vCounts,
+      mvs,
+      proj,
+      cols,
+      w,
+      h,
+      webglDepth,
+      dt,
+      dw,
+      dc,
+      canvas,
+    ) => {
+      capturedBatchArgs = {
+        flatPos,
+        vCounts,
+        mvs,
+        proj,
+        cols,
+        w,
+        h,
+        webglDepth,
+        dt,
+        dw,
+        dc,
+        canvas,
+      };
       return new Uint8Array([0x53, 0x4f, 0x52, 0x54]); // 'SORT'
     },
   };
 
   const mockBridgeHost = {
-    executePacket: async () => ({ status: 'SORTED_OK' }),
+    executePacket: async () => ({ status: "SORTED_OK" }),
   };
 
   const res = await renderScene(mockBridgeHost, scene, camera, null, mockWasm);
@@ -2173,17 +2556,28 @@ test('Positive: renderScene sorts admitted meshes ascending by renderOrder (Thre
   assert.deepEqual(capturedBatchArgs.mvs.slice(48, 64), expectedMvA);
 });
 
-test('Counterexample: Concrete depthWrite=false sorting discrepancy between WebGL (material.id) and WebGPU (projected z)', async () => {
+test("Counterexample: Concrete depthWrite=false sorting discrepancy between WebGL (material.id) and WebGPU (projected z)", async () => {
   const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 100);
   camera.position.set(0, 0, 0);
   camera.lookAt(0, 0, -1);
   camera.updateMatrixWorld();
 
   // Create matFar FIRST so it gets a lower material.id
-  const matFar = new THREE.MeshBasicMaterial({ color: 0x0000ff, depthWrite: false, side: THREE.DoubleSide });
+  const matFar = new THREE.MeshBasicMaterial({
+    color: 0x0000ff,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+  });
   // Create matNear SECOND so it gets a higher material.id
-  const matNear = new THREE.MeshBasicMaterial({ color: 0xff0000, depthWrite: false, side: THREE.DoubleSide });
-  assert.ok(matFar.id < matNear.id, `matFar.id (${matFar.id}) must be < matNear.id (${matNear.id})`);
+  const matNear = new THREE.MeshBasicMaterial({
+    color: 0xff0000,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+  });
+  assert.ok(
+    matFar.id < matNear.id,
+    `matFar.id (${matFar.id}) must be < matNear.id (${matNear.id})`,
+  );
 
   // meshNear is closer to camera (z = -2), meshFar is further (z = -10)
   const meshNear = createBasicTriangleMesh();
@@ -2200,21 +2594,36 @@ test('Counterexample: Concrete depthWrite=false sorting discrepancy between WebG
 
   let capturedArgsWebGL = null;
   const mockWasmWebGL = {
-    f3d_build_mesh_batch_packet: (flatPos, vCounts, mvs, proj, cols, w, h, webglDepth, dt, dw, dc, canvas) => {
+    f3d_build_mesh_batch_packet: (
+      flatPos,
+      vCounts,
+      mvs,
+      proj,
+      cols,
+      w,
+      h,
+      webglDepth,
+      dt,
+      dw,
+      dc,
+      canvas,
+    ) => {
       capturedArgsWebGL = { cols: Array.from(cols) };
       return new Uint8Array([0x47, 0x4c]);
     },
   };
-  const mockBridgeHost = { executePacket: async () => ({ status: 'OK' }) };
+  const mockBridgeHost = { executePacket: async () => ({ status: "OK" }) };
 
   // 1. Under sourceBackend: 'webgl' (matching webgl/WebGLRenderLists.js:11)
   // WebGL groups/sorts by material.id BEFORE z.
   // Because matFar.id < matNear.id, meshFar is sorted FIRST, meshNear is sorted SECOND.
-  const resWebGL = await renderScene(mockBridgeHost, scene, camera, null, mockWasmWebGL, { sourceBackend: 'webgl' });
+  const resWebGL = await renderScene(mockBridgeHost, scene, camera, null, mockWasmWebGL, {
+    sourceBackend: "webgl",
+  });
   assert.deepEqual(resWebGL.admitted, [meshFar.uuid, meshNear.uuid]);
   // Slot 0 is meshFar (Blue: [0, 0, 1, 1]), Slot 1 is meshNear (Red: [1, 0, 0, 1])
-  assert.equal(capturedArgsWebGL.cols[2], 1.0, 'Slot 0 is Blue (meshFar)');
-  assert.equal(capturedArgsWebGL.cols[4], 1.0, 'Slot 1 is Red (meshNear)');
+  assert.equal(capturedArgsWebGL.cols[2], 1.0, "Slot 0 is Blue (meshFar)");
+  assert.equal(capturedArgsWebGL.cols[4], 1.0, "Slot 1 is Red (meshNear)");
   // Concrete runtime effect: Because depthWrite=false, the last drawn object wins and is visible on screen.
   // In WebGL, meshNear (Red) is drawn second and overwrites meshFar (Blue).
 
@@ -2224,22 +2633,37 @@ test('Counterexample: Concrete depthWrite=false sorting discrepancy between WebG
   // Therefore, meshNear is sorted FIRST, meshFar is sorted SECOND.
   let capturedArgsWebGPU = null;
   const mockWasmWebGPU = {
-    f3d_build_mesh_batch_packet: (flatPos, vCounts, mvs, proj, cols, w, h, webglDepth, dt, dw, dc, canvas) => {
+    f3d_build_mesh_batch_packet: (
+      flatPos,
+      vCounts,
+      mvs,
+      proj,
+      cols,
+      w,
+      h,
+      webglDepth,
+      dt,
+      dw,
+      dc,
+      canvas,
+    ) => {
       capturedArgsWebGPU = { cols: Array.from(cols) };
       return new Uint8Array([0x47, 0x50, 0x55]);
     },
   };
 
-  const resWebGPU = await renderScene(mockBridgeHost, scene, camera, null, mockWasmWebGPU, { sourceBackend: 'webgpu' });
+  const resWebGPU = await renderScene(mockBridgeHost, scene, camera, null, mockWasmWebGPU, {
+    sourceBackend: "webgpu",
+  });
   assert.deepEqual(resWebGPU.admitted, [meshNear.uuid, meshFar.uuid]);
   // Slot 0 is meshNear (Red), Slot 1 is meshFar (Blue)
-  assert.equal(capturedArgsWebGPU.cols[0], 1.0, 'Slot 0 is Red (meshNear)');
-  assert.equal(capturedArgsWebGPU.cols[6], 1.0, 'Slot 1 is Blue (meshFar)');
+  assert.equal(capturedArgsWebGPU.cols[0], 1.0, "Slot 0 is Red (meshNear)");
+  assert.equal(capturedArgsWebGPU.cols[6], 1.0, "Slot 1 is Blue (meshFar)");
   // Concrete runtime effect: In WebGPU, meshFar (Blue) is drawn second and overwrites meshNear (Red).
   // Demonstrating that a renderOrder-only sort contradicts upstream backend sorting and causes opposite pixel output.
 });
 
-test('Positive: renderScene honors groupOrder over mesh renderOrder matching Three.js PainterSort', async () => {
+test("Positive: renderScene honors groupOrder over mesh renderOrder matching Three.js PainterSort", async () => {
   const scene = new THREE.Scene();
   const camera = createBasicCamera();
 
@@ -2275,7 +2699,7 @@ test('Positive: renderScene honors groupOrder over mesh renderOrder matching Thr
   assert.deepEqual(res.admitted, [meshB.uuid, meshA.uuid]);
 });
 
-test('Positive: renderScene with sortObjects: false preserves scene traversal order', async () => {
+test("Positive: renderScene with sortObjects: false preserves scene traversal order", async () => {
   const camera = createBasicCamera();
 
   const mesh1 = createBasicTriangleMesh();
@@ -2292,19 +2716,31 @@ test('Positive: renderScene with sortObjects: false preserves scene traversal or
   const mockWasm = { f3d_build_mesh_batch_packet: () => new Uint8Array([1]) };
   const mockBridgeHost = { executePacket: async () => ({}) };
 
-  const res1 = await renderScene(mockBridgeHost, scene1, camera, null, mockWasm, { sortObjects: false });
-  assert.deepEqual(res1.admitted, [mesh1.uuid, mesh2.uuid], 'sortObjects=false must preserve traversal order [mesh1, mesh2]');
+  const res1 = await renderScene(mockBridgeHost, scene1, camera, null, mockWasm, {
+    sortObjects: false,
+  });
+  assert.deepEqual(
+    res1.admitted,
+    [mesh1.uuid, mesh2.uuid],
+    "sortObjects=false must preserve traversal order [mesh1, mesh2]",
+  );
 
   // Scene 2: inverted traversal order [mesh2, mesh1]
   const scene2 = new THREE.Scene();
   scene2.add(mesh2);
   scene2.add(mesh1);
 
-  const res2 = await renderScene(mockBridgeHost, scene2, camera, null, mockWasm, { sortObjects: false });
-  assert.deepEqual(res2.admitted, [mesh2.uuid, mesh1.uuid], 'sortObjects=false must preserve traversal order [mesh2, mesh1]');
+  const res2 = await renderScene(mockBridgeHost, scene2, camera, null, mockWasm, {
+    sortObjects: false,
+  });
+  assert.deepEqual(
+    res2.admitted,
+    [mesh2.uuid, mesh1.uuid],
+    "sortObjects=false must preserve traversal order [mesh2, mesh1]",
+  );
 });
 
-test('Positive: renderScene respects matrixWorldAutoUpdate = false on scene and camera (renderer source boundaries)', async () => {
+test("Positive: renderScene respects matrixWorldAutoUpdate = false on scene and camera (renderer source boundaries)", async () => {
   const scene = new THREE.Scene();
   const camera = createBasicCamera();
 
@@ -2334,8 +2770,12 @@ test('Positive: renderScene respects matrixWorldAutoUpdate = false on scene and 
   await renderScene(mockBridgeHost, scene, camera, null, mockWasm);
 
   // Because scene.matrixWorldAutoUpdate === false, scene.updateMatrixWorld() was NOT called
-  assert.equal(mesh.matrixWorld.elements[12], 0, 'mesh.matrixWorld must NOT be force-updated when scene.matrixWorldAutoUpdate is false');
-  assert.equal(capturedMvs[12], 0, 'Emitted MV translation must remain 0');
+  assert.equal(
+    mesh.matrixWorld.elements[12],
+    0,
+    "mesh.matrixWorld must NOT be force-updated when scene.matrixWorldAutoUpdate is false",
+  );
+  assert.equal(capturedMvs[12], 0, "Emitted MV translation must remain 0");
 
   // 2. Disable camera.matrixWorldAutoUpdate
   camera.matrixWorldAutoUpdate = false;
@@ -2343,7 +2783,11 @@ test('Positive: renderScene respects matrixWorldAutoUpdate = false on scene and 
   camera.updateMatrix(); // local only
 
   await renderScene(mockBridgeHost, scene, camera, null, mockWasm);
-  assert.equal(camera.matrixWorld.elements[13], 0, 'camera.matrixWorld must NOT be force-updated when camera.matrixWorldAutoUpdate is false');
+  assert.equal(
+    camera.matrixWorld.elements[13],
+    0,
+    "camera.matrixWorld must NOT be force-updated when camera.matrixWorldAutoUpdate is false",
+  );
 
   // 3. Child mesh with matrixWorldAutoUpdate = false inside scene with matrixWorldAutoUpdate = true
   scene.matrixWorldAutoUpdate = true;
@@ -2353,41 +2797,58 @@ test('Positive: renderScene respects matrixWorldAutoUpdate = false on scene and 
 
   await renderScene(mockBridgeHost, scene, camera, null, mockWasm);
   // scene.updateMatrixWorld() called without force=true honors child.matrixWorldAutoUpdate === false
-  assert.equal(mesh.matrixWorld.elements[12], 0, 'Child mesh with matrixWorldAutoUpdate=false must not be forced by scene update');
+  assert.equal(
+    mesh.matrixWorld.elements[12],
+    0,
+    "Child mesh with matrixWorldAutoUpdate=false must not be forced by scene update",
+  );
 });
 
-test('Refusal & Cull: renderScene refuses visible non-mesh renderables (Line, Points, Sprite, Light) but culls them when hidden/unmatched layer', async () => {
+test("Refusal & Cull: renderScene refuses visible non-mesh renderables (Line, Points, Sprite, Light) but culls them when hidden/unmatched layer", async () => {
   const camera = createBasicCamera();
   const mockWasm = { f3d_build_mesh_batch_packet: () => new Uint8Array([1]) };
 
   // 1. Visible THREE.Line causes whole-scene refusal
   {
     let execCount = 0;
-    const mockBridgeHost = { executePacket: async () => { execCount++; return {}; } };
+    const mockBridgeHost = {
+      executePacket: async () => {
+        execCount++;
+        return {};
+      },
+    };
     const scene = new THREE.Scene();
     const validMesh = createBasicTriangleMesh();
     const lineGeom = new THREE.BufferGeometry();
-    lineGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array([0, 0, 0, 1, 1, 1]), 3));
+    lineGeom.setAttribute(
+      "position",
+      new THREE.BufferAttribute(new Float32Array([0, 0, 0, 1, 1, 1]), 3),
+    );
     const line = new THREE.Line(lineGeom, new THREE.LineBasicMaterial());
     scene.add(validMesh);
     scene.add(line);
 
     const res = await renderScene(mockBridgeHost, scene, camera, null, mockWasm);
-    assert.deepEqual(res.admitted, [], 'Whole submission refused when visible Line exists');
+    assert.deepEqual(res.admitted, [], "Whole submission refused when visible Line exists");
     assert.equal(res.refused.length, 1);
     assert.equal(res.refused[0].uuid, line.uuid);
     assert.ok(res.refused[0].reason.includes(ADMISSION_REJECTION.UNSUPPORTED_RENDERABLE));
-    assert.equal(execCount, 0, 'No packet execution on refusal');
+    assert.equal(execCount, 0, "No packet execution on refusal");
   }
 
   // 2. Visible THREE.Points causes whole-scene refusal
   {
     let execCount = 0;
-    const mockBridgeHost = { executePacket: async () => { execCount++; return {}; } };
+    const mockBridgeHost = {
+      executePacket: async () => {
+        execCount++;
+        return {};
+      },
+    };
     const scene = new THREE.Scene();
     const validMesh = createBasicTriangleMesh();
     const ptsGeom = new THREE.BufferGeometry();
-    ptsGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array([0, 0, 0]), 3));
+    ptsGeom.setAttribute("position", new THREE.BufferAttribute(new Float32Array([0, 0, 0]), 3));
     const pts = new THREE.Points(ptsGeom, new THREE.PointsMaterial());
     scene.add(validMesh);
     scene.add(pts);
@@ -2402,7 +2863,12 @@ test('Refusal & Cull: renderScene refuses visible non-mesh renderables (Line, Po
   // 3. Visible THREE.Sprite causes whole-scene refusal
   {
     let execCount = 0;
-    const mockBridgeHost = { executePacket: async () => { execCount++; return {}; } };
+    const mockBridgeHost = {
+      executePacket: async () => {
+        execCount++;
+        return {};
+      },
+    };
     const scene = new THREE.Scene();
     const validMesh = createBasicTriangleMesh();
     const sprite = new THREE.Sprite(new THREE.SpriteMaterial());
@@ -2419,7 +2885,12 @@ test('Refusal & Cull: renderScene refuses visible non-mesh renderables (Line, Po
   // 4. Visible THREE.DirectionalLight causes whole-scene refusal
   {
     let execCount = 0;
-    const mockBridgeHost = { executePacket: async () => { execCount++; return {}; } };
+    const mockBridgeHost = {
+      executePacket: async () => {
+        execCount++;
+        return {};
+      },
+    };
     const scene = new THREE.Scene();
     const validMesh = createBasicTriangleMesh();
     const light = new THREE.DirectionalLight(0xffffff, 1.0);
@@ -2436,17 +2907,25 @@ test('Refusal & Cull: renderScene refuses visible non-mesh renderables (Line, Po
   // 5. Legitimate culls: Hidden Line and layer-culled Points do NOT block valid mesh
   {
     let execCount = 0;
-    const mockBridgeHost = { executePacket: async () => { execCount++; return { status: 'OK' }; } };
+    const mockBridgeHost = {
+      executePacket: async () => {
+        execCount++;
+        return { status: "OK" };
+      },
+    };
     const scene = new THREE.Scene();
     const validMesh = createBasicTriangleMesh();
 
     const lineGeom = new THREE.BufferGeometry();
-    lineGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array([0, 0, 0, 1, 1, 1]), 3));
+    lineGeom.setAttribute(
+      "position",
+      new THREE.BufferAttribute(new Float32Array([0, 0, 0, 1, 1, 1]), 3),
+    );
     const hiddenLine = new THREE.Line(lineGeom, new THREE.LineBasicMaterial());
     hiddenLine.visible = false; // legitimately hidden
 
     const ptsGeom = new THREE.BufferGeometry();
-    ptsGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array([0, 0, 0]), 3));
+    ptsGeom.setAttribute("position", new THREE.BufferAttribute(new Float32Array([0, 0, 0]), 3));
     const layerPts = new THREE.Points(ptsGeom, new THREE.PointsMaterial());
     layerPts.layers.set(2); // camera is on layer 0; legitimately culled by layer filter
 
@@ -2455,20 +2934,29 @@ test('Refusal & Cull: renderScene refuses visible non-mesh renderables (Line, Po
     scene.add(layerPts);
 
     const res = await renderScene(mockBridgeHost, scene, camera, null, mockWasm);
-    assert.deepEqual(res.admitted, [validMesh.uuid], 'Valid mesh is admitted and rendered');
-    assert.equal(res.refused.length, 0, 'Hidden/layer-culled renderables are legitimately culled without refusal');
-    assert.equal(execCount, 1, 'Scene packet executed successfully');
+    assert.deepEqual(res.admitted, [validMesh.uuid], "Valid mesh is admitted and rendered");
+    assert.equal(
+      res.refused.length,
+      0,
+      "Hidden/layer-culled renderables are legitimately culled without refusal",
+    );
+    assert.equal(execCount, 1, "Scene packet executed successfully");
   }
 });
 
-test('Refusal: renderScene refuses WHOLE submission when scene features (background, fog, overrideMaterial, environment) exist', async () => {
+test("Refusal: renderScene refuses WHOLE submission when scene features (background, fog, overrideMaterial, environment) exist", async () => {
   const camera = createBasicCamera();
   const mockWasm = { f3d_build_mesh_batch_packet: () => new Uint8Array([1]) };
 
   // 1. scene.background (textures refused)
   {
     let execCount = 0;
-    const mockBridgeHost = { executePacket: async () => { execCount++; return {}; } };
+    const mockBridgeHost = {
+      executePacket: async () => {
+        execCount++;
+        return {};
+      },
+    };
     const scene = new THREE.Scene();
     scene.background = new THREE.Texture();
     scene.add(createBasicTriangleMesh());
@@ -2477,14 +2965,19 @@ test('Refusal: renderScene refuses WHOLE submission when scene features (backgro
     assert.deepEqual(res.admitted, []);
     assert.equal(res.refused.length, 1);
     assert.equal(res.refused[0].uuid, scene.uuid);
-    assert.ok(res.refused[0].reason.includes('scene.background is not supported'));
+    assert.ok(res.refused[0].reason.includes("scene.background is not supported"));
     assert.equal(execCount, 0);
   }
 
   // 2. scene.fog
   {
     let execCount = 0;
-    const mockBridgeHost = { executePacket: async () => { execCount++; return {}; } };
+    const mockBridgeHost = {
+      executePacket: async () => {
+        execCount++;
+        return {};
+      },
+    };
     const scene = new THREE.Scene();
     scene.fog = new THREE.Fog(0xffffff, 1, 100);
     scene.add(createBasicTriangleMesh());
@@ -2493,14 +2986,19 @@ test('Refusal: renderScene refuses WHOLE submission when scene features (backgro
     assert.deepEqual(res.admitted, []);
     assert.equal(res.refused.length, 1);
     assert.equal(res.refused[0].uuid, scene.uuid);
-    assert.ok(res.refused[0].reason.includes('scene.fog is not supported'));
+    assert.ok(res.refused[0].reason.includes("scene.fog is not supported"));
     assert.equal(execCount, 0);
   }
 
   // 3. scene.overrideMaterial
   {
     let execCount = 0;
-    const mockBridgeHost = { executePacket: async () => { execCount++; return {}; } };
+    const mockBridgeHost = {
+      executePacket: async () => {
+        execCount++;
+        return {};
+      },
+    };
     const scene = new THREE.Scene();
     scene.overrideMaterial = new THREE.MeshBasicMaterial();
     scene.add(createBasicTriangleMesh());
@@ -2509,14 +3007,19 @@ test('Refusal: renderScene refuses WHOLE submission when scene features (backgro
     assert.deepEqual(res.admitted, []);
     assert.equal(res.refused.length, 1);
     assert.equal(res.refused[0].uuid, scene.uuid);
-    assert.ok(res.refused[0].reason.includes('scene.overrideMaterial is not supported'));
+    assert.ok(res.refused[0].reason.includes("scene.overrideMaterial is not supported"));
     assert.equal(execCount, 0);
   }
 
   // 4. scene.environment
   {
     let execCount = 0;
-    const mockBridgeHost = { executePacket: async () => { execCount++; return {}; } };
+    const mockBridgeHost = {
+      executePacket: async () => {
+        execCount++;
+        return {};
+      },
+    };
     const scene = new THREE.Scene();
     scene.environment = new THREE.Texture();
     scene.add(createBasicTriangleMesh());
@@ -2525,19 +3028,24 @@ test('Refusal: renderScene refuses WHOLE submission when scene features (backgro
     assert.deepEqual(res.admitted, []);
     assert.equal(res.refused.length, 1);
     assert.equal(res.refused[0].uuid, scene.uuid);
-    assert.ok(res.refused[0].reason.includes('scene.environment is not supported'));
+    assert.ok(res.refused[0].reason.includes("scene.environment is not supported"));
     assert.equal(execCount, 0);
   }
 });
 
-test('Refusal: renderScene refuses WHOLE submission when visible scene meshes have conflicting depth settings, but admits when culled', async () => {
+test("Refusal: renderScene refuses WHOLE submission when visible scene meshes have conflicting depth settings, but admits when culled", async () => {
   const camera = createBasicCamera();
   const mockWasm = { f3d_build_mesh_batch_packet: () => new Uint8Array([1]) };
 
   // 1. Conflicting depth settings in visible meshes -> whole-scene refusal
   {
     let execCount = 0;
-    const mockBridgeHost = { executePacket: async () => { execCount++; return {}; } };
+    const mockBridgeHost = {
+      executePacket: async () => {
+        execCount++;
+        return {};
+      },
+    };
     const scene = new THREE.Scene();
     const meshDepthTrue = createBasicTriangleMesh({ depthTest: true });
     const meshDepthFalse = createBasicTriangleMesh({ depthTest: false });
@@ -2555,7 +3063,12 @@ test('Refusal: renderScene refuses WHOLE submission when visible scene meshes ha
   // 2. When the conflicting mesh is hidden -> legitimate cull, visible mesh renders
   {
     let execCount = 0;
-    const mockBridgeHost = { executePacket: async () => { execCount++; return { status: 'OK' }; } };
+    const mockBridgeHost = {
+      executePacket: async () => {
+        execCount++;
+        return { status: "OK" };
+      },
+    };
     const scene = new THREE.Scene();
     const meshDepthTrue = createBasicTriangleMesh({ depthTest: true });
     const meshDepthFalse = createBasicTriangleMesh({ depthTest: false });
@@ -2570,7 +3083,7 @@ test('Refusal: renderScene refuses WHOLE submission when visible scene meshes ha
   }
 });
 
-test('Material Side & Reflected Winding: computeAffineDeterminant and reflection parity table', () => {
+test("Material Side & Reflected Winding: computeAffineDeterminant and reflection parity table", () => {
   const camera = createBasicCamera();
 
   // Helper to test a mesh with specific side and scale
@@ -2653,7 +3166,7 @@ test('Material Side & Reflected Winding: computeAffineDeterminant and reflection
   assert.equal(doubleNeg.frontFace, FRONT_FACE_WIRE.CCW);
 });
 
-test('Single-mesh APIs: Non-DoubleSide meshes route through f3d_build_mesh_batch_cull_packet (N=1)', () => {
+test("Single-mesh APIs: Non-DoubleSide meshes route through f3d_build_mesh_batch_cull_packet (N=1)", () => {
   const camera = createBasicCamera();
   const frontMesh = createBasicTriangleMesh({ side: THREE.FrontSide });
   const backMesh = createBasicTriangleMesh({ side: THREE.BackSide });
@@ -2661,18 +3174,33 @@ test('Single-mesh APIs: Non-DoubleSide meshes route through f3d_build_mesh_batch
 
   let cullCallArgs = null;
   const mockWasm = {
-    f3d_build_mesh_batch_cull_packet: (pos, vCounts, mv, proj, col, cModes, fFaces, w, h, wd, dt, dw, dc, canvas) => {
+    f3d_build_mesh_batch_cull_packet: (
+      pos,
+      vCounts,
+      mv,
+      proj,
+      col,
+      cModes,
+      fFaces,
+      w,
+      h,
+      wd,
+      dt,
+      dw,
+      dc,
+      canvas,
+    ) => {
       cullCallArgs = { pos, vCounts, mv, proj, col, cModes, fFaces, w, h, wd, dt, dw, dc, canvas };
-      return new Uint8Array([0xCA, 0xFE]);
+      return new Uint8Array([0xca, 0xfe]);
     },
-    f3d_build_mesh_depth_packet: () => new Uint8Array([0xDE, 0xAD]),
-    f3d_build_mesh_packet: () => new Uint8Array([0xBE, 0xEF]),
+    f3d_build_mesh_depth_packet: () => new Uint8Array([0xde, 0xad]),
+    f3d_build_mesh_packet: () => new Uint8Array([0xbe, 0xef]),
   };
 
   // 1. prepareMeshPacket with FrontSide routes to f3d_build_mesh_batch_cull_packet
   cullCallArgs = null;
   const resFront = prepareMeshPacket(frontMesh, camera, 64, 64, mockWasm);
-  assert.deepEqual(resFront.packetBytes, new Uint8Array([0xCA, 0xFE]));
+  assert.deepEqual(resFront.packetBytes, new Uint8Array([0xca, 0xfe]));
   assert.equal(cullCallArgs.vCounts.length, 1);
   assert.equal(cullCallArgs.vCounts[0], 3);
   assert.deepEqual(Array.from(cullCallArgs.cModes), [CULL_MODE_WIRE.BACK]);
@@ -2682,20 +3210,20 @@ test('Single-mesh APIs: Non-DoubleSide meshes route through f3d_build_mesh_batch
   // 2. prepareMeshDepthPacket with BackSide routes to f3d_build_mesh_batch_cull_packet
   cullCallArgs = null;
   const resBack = prepareMeshDepthPacket(backMesh, camera, 64, 64, mockWasm);
-  assert.deepEqual(resBack.packetBytes, new Uint8Array([0xCA, 0xFE]));
+  assert.deepEqual(resBack.packetBytes, new Uint8Array([0xca, 0xfe]));
   assert.deepEqual(Array.from(cullCallArgs.cModes), [CULL_MODE_WIRE.BACK]);
   assert.deepEqual(Array.from(cullCallArgs.fFaces), [FRONT_FACE_WIRE.CW]);
 
   // 3. prepareCanvasMeshPacket with FrontSide sets canvas=true
   cullCallArgs = null;
   const resCanvasFront = prepareCanvasMeshPacket(frontMesh, camera, 64, 64, mockWasm);
-  assert.deepEqual(resCanvasFront.packetBytes, new Uint8Array([0xCA, 0xFE]));
+  assert.deepEqual(resCanvasFront.packetBytes, new Uint8Array([0xca, 0xfe]));
   assert.equal(cullCallArgs.canvas, true);
 
   // 4. prepareCanvasMeshDepthPacket with BackSide sets canvas=true
   cullCallArgs = null;
   const resCanvasBack = prepareCanvasMeshDepthPacket(backMesh, camera, 64, 64, mockWasm);
-  assert.deepEqual(resCanvasBack.packetBytes, new Uint8Array([0xCA, 0xFE]));
+  assert.deepEqual(resCanvasBack.packetBytes, new Uint8Array([0xca, 0xfe]));
   assert.equal(cullCallArgs.canvas, true);
   assert.deepEqual(Array.from(cullCallArgs.cModes), [CULL_MODE_WIRE.BACK]);
   assert.deepEqual(Array.from(cullCallArgs.fFaces), [FRONT_FACE_WIRE.CW]);
@@ -2703,8 +3231,12 @@ test('Single-mesh APIs: Non-DoubleSide meshes route through f3d_build_mesh_batch
   // 5. DoubleSide mesh still routes through legacy depth/legacy packet builder
   cullCallArgs = null;
   const resDouble = prepareMeshPacket(doubleMesh, camera, 64, 64, mockWasm);
-  assert.deepEqual(resDouble.packetBytes, new Uint8Array([0xDE, 0xAD]));
-  assert.equal(cullCallArgs, null, 'DoubleSide mesh must not call cull export when legacy export exists');
+  assert.deepEqual(resDouble.packetBytes, new Uint8Array([0xde, 0xad]));
+  assert.equal(
+    cullCallArgs,
+    null,
+    "DoubleSide mesh must not call cull export when legacy export exists",
+  );
 
   // 6. Non-DoubleSide strictly refuses when f3d_build_mesh_batch_cull_packet is missing
   const mockWasmNoCull = {
@@ -2714,26 +3246,26 @@ test('Single-mesh APIs: Non-DoubleSide meshes route through f3d_build_mesh_batch
 
   assert.throws(
     () => prepareMeshPacket(frontMesh, camera, 64, 64, mockWasmNoCull),
-    (err) => err.reason === 'MISSING_CULL_EXPORT' && err.message.includes('MISSING_CULL_EXPORT')
+    (err) => err.reason === "MISSING_CULL_EXPORT" && err.message.includes("MISSING_CULL_EXPORT"),
   );
 
   assert.throws(
     () => prepareMeshDepthPacket(backMesh, camera, 64, 64, mockWasmNoCull),
-    (err) => err.reason === 'MISSING_CULL_EXPORT' && err.message.includes('MISSING_CULL_EXPORT')
+    (err) => err.reason === "MISSING_CULL_EXPORT" && err.message.includes("MISSING_CULL_EXPORT"),
   );
 
   assert.throws(
     () => prepareCanvasMeshPacket(frontMesh, camera, 64, 64, mockWasmNoCull),
-    (err) => err.reason === 'MISSING_CULL_EXPORT' && err.message.includes('MISSING_CULL_EXPORT')
+    (err) => err.reason === "MISSING_CULL_EXPORT" && err.message.includes("MISSING_CULL_EXPORT"),
   );
 
   assert.throws(
     () => prepareCanvasMeshDepthPacket(backMesh, camera, 64, 64, mockWasmNoCull),
-    (err) => err.reason === 'MISSING_CULL_EXPORT' && err.message.includes('MISSING_CULL_EXPORT')
+    (err) => err.reason === "MISSING_CULL_EXPORT" && err.message.includes("MISSING_CULL_EXPORT"),
   );
 });
 
-test('Multi-mesh batch: Mixed-side batch packs cullModes and frontFaces (14 arguments)', () => {
+test("Multi-mesh batch: Mixed-side batch packs cullModes and frontFaces (14 arguments)", () => {
   const camera = createBasicCamera();
 
   const meshDouble = createBasicTriangleMesh({ color: 0x0000ff, side: THREE.DoubleSide });
@@ -2742,8 +3274,38 @@ test('Multi-mesh batch: Mixed-side batch packs cullModes and frontFaces (14 argu
 
   let capturedArgs = null;
   const mockWasmCull = {
-    f3d_build_mesh_batch_cull_packet: (flatPos, vCounts, mvs, proj, cols, cModes, fFaces, w, h, wd, dt, dw, dc, canvas) => {
-      capturedArgs = { flatPos, vCounts, mvs, proj, cols, cModes, fFaces, w, h, wd, dt, dw, dc, canvas };
+    f3d_build_mesh_batch_cull_packet: (
+      flatPos,
+      vCounts,
+      mvs,
+      proj,
+      cols,
+      cModes,
+      fFaces,
+      w,
+      h,
+      wd,
+      dt,
+      dw,
+      dc,
+      canvas,
+    ) => {
+      capturedArgs = {
+        flatPos,
+        vCounts,
+        mvs,
+        proj,
+        cols,
+        cModes,
+        fFaces,
+        w,
+        h,
+        wd,
+        dt,
+        dw,
+        dc,
+        canvas,
+      };
       return new Uint8Array([0x14, 0x00]);
     },
   };
@@ -2754,14 +3316,22 @@ test('Multi-mesh batch: Mixed-side batch packs cullModes and frontFaces (14 argu
     64,
     64,
     mockWasmCull,
-    { target: 'offscreen' }
+    { target: "offscreen" },
   );
 
   assert.equal(batchResult.meshCount, 3);
   assert.equal(capturedArgs.cModes.length, 3);
   assert.equal(capturedArgs.fFaces.length, 3);
-  assert.deepEqual(Array.from(batchResult.cullModes), [CULL_MODE_WIRE.NONE, CULL_MODE_WIRE.BACK, CULL_MODE_WIRE.BACK]);
-  assert.deepEqual(Array.from(batchResult.frontFaces), [FRONT_FACE_WIRE.CCW, FRONT_FACE_WIRE.CCW, FRONT_FACE_WIRE.CW]);
+  assert.deepEqual(Array.from(batchResult.cullModes), [
+    CULL_MODE_WIRE.NONE,
+    CULL_MODE_WIRE.BACK,
+    CULL_MODE_WIRE.BACK,
+  ]);
+  assert.deepEqual(Array.from(batchResult.frontFaces), [
+    FRONT_FACE_WIRE.CCW,
+    FRONT_FACE_WIRE.CCW,
+    FRONT_FACE_WIRE.CW,
+  ]);
   assert.deepEqual(Array.from(capturedArgs.cModes), [0, 2, 2]);
   assert.deepEqual(Array.from(capturedArgs.fFaces), [0, 0, 1]);
   assert.equal(capturedArgs.canvas, false);
@@ -2773,23 +3343,42 @@ test('Multi-mesh batch: Mixed-side batch packs cullModes and frontFaces (14 argu
 
   assert.throws(
     () => prepareMeshBatchPacket([meshDouble, meshFront], camera, 64, 64, mockWasmLegacyOnly),
-    (err) => err.reason === 'MISSING_CULL_EXPORT' && err.message.includes('MISSING_CULL_EXPORT')
+    (err) => err.reason === "MISSING_CULL_EXPORT" && err.message.includes("MISSING_CULL_EXPORT"),
   );
 
   // But all-DoubleSide batch on legacy Wasm succeeds via 12-arg call
   let legacyCalled = false;
   const mockWasmLegacyOnlyDouble = {
-    f3d_build_mesh_batch_packet: (flatPos, vCounts, mvs, proj, cols, w, h, wd, dt, dw, dc, canvas) => {
+    f3d_build_mesh_batch_packet: (
+      flatPos,
+      vCounts,
+      mvs,
+      proj,
+      cols,
+      w,
+      h,
+      wd,
+      dt,
+      dw,
+      dc,
+      canvas,
+    ) => {
       legacyCalled = true;
       return new Uint8Array([12]);
     },
   };
-  const doubleBatchRes = prepareMeshBatchPacket([meshDouble], camera, 64, 64, mockWasmLegacyOnlyDouble);
+  const doubleBatchRes = prepareMeshBatchPacket(
+    [meshDouble],
+    camera,
+    64,
+    64,
+    mockWasmLegacyOnlyDouble,
+  );
   assert.equal(legacyCalled, true);
   assert.equal(doubleBatchRes.meshCount, 1);
 });
 
-test('renderScene: Admits mixed sides and reflected hierarchies into single batch execution', async () => {
+test("renderScene: Admits mixed sides and reflected hierarchies into single batch execution", async () => {
   const scene = new THREE.Scene();
   const camera = createBasicCamera();
 
@@ -2811,9 +3400,28 @@ test('renderScene: Admits mixed sides and reflected hierarchies into single batc
 
   let capturedBatch = null;
   const mockWasm = {
-    f3d_build_mesh_batch_cull_packet: (flatPos, vCounts, mvs, proj, cols, cModes, fFaces, w, h, wd, dt, dw, dc, canvas) => {
-      capturedBatch = { cModes: Array.from(cModes), fFaces: Array.from(fFaces), meshCount: vCounts.length };
-      return new Uint8Array([0xAA, 0xBB]);
+    f3d_build_mesh_batch_cull_packet: (
+      flatPos,
+      vCounts,
+      mvs,
+      proj,
+      cols,
+      cModes,
+      fFaces,
+      w,
+      h,
+      wd,
+      dt,
+      dw,
+      dc,
+      canvas,
+    ) => {
+      capturedBatch = {
+        cModes: Array.from(cModes),
+        fFaces: Array.from(fFaces),
+        meshCount: vCounts.length,
+      };
+      return new Uint8Array([0xaa, 0xbb]);
     },
   };
 
@@ -2821,8 +3429,8 @@ test('renderScene: Admits mixed sides and reflected hierarchies into single batc
   const mockBridgeHost = {
     executePacket: async (bytes) => {
       executed = true;
-      assert.deepEqual(bytes, new Uint8Array([0xAA, 0xBB]));
-      return { status: 'SCENE_OK' };
+      assert.deepEqual(bytes, new Uint8Array([0xaa, 0xbb]));
+      return { status: "SCENE_OK" };
     },
   };
 
@@ -2837,11 +3445,19 @@ test('renderScene: Admits mixed sides and reflected hierarchies into single batc
   // mesh1 (DoubleSide): cull NONE (0), CCW (0)
   // mesh2 (FrontSide, det > 0): cull BACK (2), CCW (0)
   // mesh3 (FrontSide, parent reflected det < 0): cull BACK (2), CW (1)
-  assert.deepEqual(capturedBatch.cModes, [CULL_MODE_WIRE.NONE, CULL_MODE_WIRE.BACK, CULL_MODE_WIRE.BACK]);
-  assert.deepEqual(capturedBatch.fFaces, [FRONT_FACE_WIRE.CCW, FRONT_FACE_WIRE.CCW, FRONT_FACE_WIRE.CW]);
+  assert.deepEqual(capturedBatch.cModes, [
+    CULL_MODE_WIRE.NONE,
+    CULL_MODE_WIRE.BACK,
+    CULL_MODE_WIRE.BACK,
+  ]);
+  assert.deepEqual(capturedBatch.fFaces, [
+    FRONT_FACE_WIRE.CCW,
+    FRONT_FACE_WIRE.CCW,
+    FRONT_FACE_WIRE.CW,
+  ]);
 });
 
-test('Mixed per-mesh depth: prepareMeshBatchPacket routes to f3d_build_mesh_batch_cull_depth_packet with 14 arguments', () => {
+test("Mixed per-mesh depth: prepareMeshBatchPacket routes to f3d_build_mesh_batch_cull_depth_packet with 14 arguments", () => {
   const camera = createBasicCamera();
 
   // Mesh 1: depthTest=true, depthWrite=true, depthFunc=LessDepth (compare 2)
@@ -2881,7 +3497,20 @@ test('Mixed per-mesh depth: prepareMeshBatchPacket routes to f3d_build_mesh_batc
   let capturedArgs = null;
   const mockWasm = {
     f3d_build_mesh_batch_cull_depth_packet: (
-      flatPos, vCounts, mvs, proj, cols, cModes, fFaces, dTests, dWrites, dCompares, w, h, wd, canvas
+      flatPos,
+      vCounts,
+      mvs,
+      proj,
+      cols,
+      cModes,
+      fFaces,
+      dTests,
+      dWrites,
+      dCompares,
+      w,
+      h,
+      wd,
+      canvas,
     ) => {
       capturedArgs = {
         vCounts: Array.from(vCounts),
@@ -2890,25 +3519,34 @@ test('Mixed per-mesh depth: prepareMeshBatchPacket routes to f3d_build_mesh_batc
         dTests: Array.from(dTests),
         dWrites: Array.from(dWrites),
         dCompares: Array.from(dCompares),
-        w, h, wd, canvas,
+        w,
+        h,
+        wd,
+        canvas,
       };
-      return new Uint8Array([0xDE, 0xAD]);
+      return new Uint8Array([0xde, 0xad]);
     },
   };
 
-  const res = prepareMeshBatchPacket(
-    [mesh1, mesh2, mesh3, mesh4],
-    camera,
-    64,
-    64,
-    mockWasm,
-    { sourceBackend: 'webgpu', target: 'offscreen' }
-  );
+  const res = prepareMeshBatchPacket([mesh1, mesh2, mesh3, mesh4], camera, 64, 64, mockWasm, {
+    sourceBackend: "webgpu",
+    target: "offscreen",
+  });
 
   assert.equal(res.meshCount, 4);
   assert.deepEqual(capturedArgs.vCounts, [3, 3, 3, 3]);
-  assert.deepEqual(capturedArgs.cModes, [CULL_MODE_WIRE.NONE, CULL_MODE_WIRE.BACK, CULL_MODE_WIRE.BACK, CULL_MODE_WIRE.BACK]);
-  assert.deepEqual(capturedArgs.fFaces, [FRONT_FACE_WIRE.CCW, FRONT_FACE_WIRE.CCW, FRONT_FACE_WIRE.CW, FRONT_FACE_WIRE.CCW]);
+  assert.deepEqual(capturedArgs.cModes, [
+    CULL_MODE_WIRE.NONE,
+    CULL_MODE_WIRE.BACK,
+    CULL_MODE_WIRE.BACK,
+    CULL_MODE_WIRE.BACK,
+  ]);
+  assert.deepEqual(capturedArgs.fFaces, [
+    FRONT_FACE_WIRE.CCW,
+    FRONT_FACE_WIRE.CCW,
+    FRONT_FACE_WIRE.CW,
+    FRONT_FACE_WIRE.CCW,
+  ]);
   assert.deepEqual(capturedArgs.dTests, [1, 0, 1, 0]);
   assert.deepEqual(capturedArgs.dWrites, [1, 1, 0, 0]);
   assert.deepEqual(capturedArgs.dCompares, [
@@ -2920,7 +3558,7 @@ test('Mixed per-mesh depth: prepareMeshBatchPacket routes to f3d_build_mesh_batc
   assert.equal(capturedArgs.canvas, false);
 });
 
-test('Mixed per-mesh depth: WebGL backend resolves depthWrite=false when depthTest=false', () => {
+test("Mixed per-mesh depth: WebGL backend resolves depthWrite=false when depthTest=false", () => {
   const camera = createBasicCamera();
 
   const mesh1 = createBasicTriangleMesh({
@@ -2937,7 +3575,20 @@ test('Mixed per-mesh depth: WebGL backend resolves depthWrite=false when depthTe
   let capturedArgs = null;
   const mockWasm = {
     f3d_build_mesh_batch_cull_depth_packet: (
-      flatPos, vCounts, mvs, proj, cols, cModes, fFaces, dTests, dWrites, dCompares, w, h, wd, canvas
+      flatPos,
+      vCounts,
+      mvs,
+      proj,
+      cols,
+      cModes,
+      fFaces,
+      dTests,
+      dWrites,
+      dCompares,
+      w,
+      h,
+      wd,
+      canvas,
     ) => {
       capturedArgs = {
         dTests: Array.from(dTests),
@@ -2948,21 +3599,17 @@ test('Mixed per-mesh depth: WebGL backend resolves depthWrite=false when depthTe
     },
   };
 
-  prepareMeshBatchPacket(
-    [mesh1, mesh2],
-    camera,
-    64,
-    64,
-    mockWasm,
-    { sourceBackend: 'webgl' }
-  );
+  prepareMeshBatchPacket([mesh1, mesh2], camera, 64, 64, mockWasm, { sourceBackend: "webgl" });
 
   assert.deepEqual(capturedArgs.dTests, [1, 0]);
   assert.deepEqual(capturedArgs.dWrites, [1, 0]); // Mesh 2 resolved to 0 under WebGL!
-  assert.deepEqual(capturedArgs.dCompares, [DEPTH_WIRE_COMPARE.LESS_EQUAL, DEPTH_WIRE_COMPARE.ALWAYS]);
+  assert.deepEqual(capturedArgs.dCompares, [
+    DEPTH_WIRE_COMPARE.LESS_EQUAL,
+    DEPTH_WIRE_COMPARE.ALWAYS,
+  ]);
 });
 
-test('Mixed per-mesh depth: Safe refusal with INCOMPATIBLE_BATCH_DEPTH when cull_depth export is missing', () => {
+test("Mixed per-mesh depth: Safe refusal with INCOMPATIBLE_BATCH_DEPTH when cull_depth export is missing", () => {
   const camera = createBasicCamera();
 
   const mesh1 = createDepthTriangleMesh({ depthWrite: true });
@@ -2976,7 +3623,8 @@ test('Mixed per-mesh depth: Safe refusal with INCOMPATIBLE_BATCH_DEPTH when cull
 
   assert.throws(
     () => prepareMeshBatchPacket([mesh1, mesh2], camera, 64, 64, mockWasmLegacy),
-    (err) => err.reason === 'INCOMPATIBLE_BATCH_DEPTH' && err.message.includes('INCOMPATIBLE_BATCH_DEPTH')
+    (err) =>
+      err.reason === "INCOMPATIBLE_BATCH_DEPTH" && err.message.includes("INCOMPATIBLE_BATCH_DEPTH"),
   );
 
   // But uniform depth batch succeeds on legacy Wasm
@@ -2992,7 +3640,7 @@ test('Mixed per-mesh depth: Safe refusal with INCOMPATIBLE_BATCH_DEPTH when cull
   assert.equal(res.meshCount, 2);
 });
 
-test('Mixed per-mesh depth: renderScene admits mixed depth meshes when cull_depth export is present', async () => {
+test("Mixed per-mesh depth: renderScene admits mixed depth meshes when cull_depth export is present", async () => {
   const scene = new THREE.Scene();
   const camera = createBasicCamera();
 
@@ -3015,7 +3663,20 @@ test('Mixed per-mesh depth: renderScene admits mixed depth meshes when cull_dept
   let capturedArgs = null;
   const mockWasm = {
     f3d_build_mesh_batch_cull_depth_packet: (
-      flatPos, vCounts, mvs, proj, cols, cModes, fFaces, dTests, dWrites, dCompares, w, h, wd, canvas
+      flatPos,
+      vCounts,
+      mvs,
+      proj,
+      cols,
+      cModes,
+      fFaces,
+      dTests,
+      dWrites,
+      dCompares,
+      w,
+      h,
+      wd,
+      canvas,
     ) => {
       capturedArgs = {
         dTests: Array.from(dTests),
@@ -3031,7 +3692,7 @@ test('Mixed per-mesh depth: renderScene admits mixed depth meshes when cull_dept
     executePacket: async (bytes) => {
       executed = true;
       assert.deepEqual(bytes, new Uint8Array([0x99]));
-      return { status: 'OK' };
+      return { status: "OK" };
     },
   };
 
@@ -3045,7 +3706,7 @@ test('Mixed per-mesh depth: renderScene admits mixed depth meshes when cull_dept
   assert.deepEqual(capturedArgs.dCompares, [DEPTH_WIRE_COMPARE.LESS, DEPTH_WIRE_COMPARE.ALWAYS]);
 });
 
-test('Mixed per-mesh depth: renderScene safely refuses with INCOMPATIBLE_BATCH_DEPTH when cull_depth export is missing', async () => {
+test("Mixed per-mesh depth: renderScene safely refuses with INCOMPATIBLE_BATCH_DEPTH when cull_depth export is missing", async () => {
   const scene = new THREE.Scene();
   const camera = createBasicCamera();
 
@@ -3061,7 +3722,7 @@ test('Mixed per-mesh depth: renderScene safely refuses with INCOMPATIBLE_BATCH_D
 
   const mockBridgeHost = {
     executePacket: async () => {
-      throw new Error('should not be called');
+      throw new Error("should not be called");
     },
   };
 
@@ -3069,10 +3730,10 @@ test('Mixed per-mesh depth: renderScene safely refuses with INCOMPATIBLE_BATCH_D
 
   assert.equal(res.admitted.length, 0);
   assert.equal(res.refused.length, 1);
-  assert.equal(res.reason, 'INCOMPATIBLE_BATCH_DEPTH');
+  assert.equal(res.reason, "INCOMPATIBLE_BATCH_DEPTH");
 });
 
-test('Mixed per-mesh depth: renderScene refuses with AMBIGUOUS_DEPTH_PAIR when mesh has depthTest=false and depthWrite=true without sourceBackend', async () => {
+test("Mixed per-mesh depth: renderScene refuses with AMBIGUOUS_DEPTH_PAIR when mesh has depthTest=false and depthWrite=true without sourceBackend", async () => {
   const scene = new THREE.Scene();
   const camera = createBasicCamera();
 
@@ -3088,7 +3749,7 @@ test('Mixed per-mesh depth: renderScene refuses with AMBIGUOUS_DEPTH_PAIR when m
 
   const mockBridgeHost = {
     executePacket: async () => {
-      throw new Error('should not be called');
+      throw new Error("should not be called");
     },
   };
 
@@ -3096,10 +3757,10 @@ test('Mixed per-mesh depth: renderScene refuses with AMBIGUOUS_DEPTH_PAIR when m
 
   assert.equal(res.admitted.length, 0);
   assert.equal(res.refused.length, 1);
-  assert.equal(res.reason, 'AMBIGUOUS_DEPTH_PAIR');
+  assert.equal(res.reason, "AMBIGUOUS_DEPTH_PAIR");
 });
 
-test('Single-mesh canvas routing: renderMesh admits sided N=1 with cull-depth/cull-only exports without requiring legacy canvas exports', async () => {
+test("Single-mesh canvas routing: renderMesh admits sided N=1 with cull-depth/cull-only exports without requiring legacy canvas exports", async () => {
   const camera = createBasicCamera();
   const frontMesh = createBasicTriangleMesh({ side: THREE.FrontSide });
   const backMesh = createBasicTriangleMesh({ side: THREE.BackSide });
@@ -3115,21 +3776,40 @@ test('Single-mesh canvas routing: renderMesh admits sided N=1 with cull-depth/cu
   const mockBridgeHost = {
     executePacket: async (bytes, ctx) => {
       executedContext = ctx;
-      return { status: 'OK' };
+      return { status: "OK" };
     },
   };
 
   const mockWasmCullDepth = {
     f3d_build_mesh_batch_cull_depth_packet: (
-      flatPos, vCounts, mvs, proj, cols, cModes, fFaces, dTests, dWrites, dCompares, w, h, wd, canvas
+      flatPos,
+      vCounts,
+      mvs,
+      proj,
+      cols,
+      cModes,
+      fFaces,
+      dTests,
+      dWrites,
+      dCompares,
+      w,
+      h,
+      wd,
+      canvas,
     ) => {
       capturedArgs = { vCounts, cModes, fFaces, w, h, canvas };
       return new Uint8Array([0x01, 0x02]);
     },
   };
 
-  const resFrontDepth = await renderMesh(mockBridgeHost, frontMesh, camera, mockCanvasContext, mockWasmCullDepth);
-  assert.equal(resFrontDepth.target, 'canvas');
+  const resFrontDepth = await renderMesh(
+    mockBridgeHost,
+    frontMesh,
+    camera,
+    mockCanvasContext,
+    mockWasmCullDepth,
+  );
+  assert.equal(resFrontDepth.target, "canvas");
   assert.equal(executedContext, mockCanvasContext);
   assert.equal(capturedArgs.canvas, true);
   assert.equal(capturedArgs.vCounts.length, 1);
@@ -3140,15 +3820,34 @@ test('Single-mesh canvas routing: renderMesh admits sided N=1 with cull-depth/cu
   let capturedArgsCull = null;
   const mockWasmCull = {
     f3d_build_mesh_batch_cull_packet: (
-      flatPos, vCounts, mvs, proj, cols, cModes, fFaces, w, h, wd, dt, dw, dc, canvas
+      flatPos,
+      vCounts,
+      mvs,
+      proj,
+      cols,
+      cModes,
+      fFaces,
+      w,
+      h,
+      wd,
+      dt,
+      dw,
+      dc,
+      canvas,
     ) => {
       capturedArgsCull = { vCounts, cModes, fFaces, w, h, canvas };
       return new Uint8Array([0x03, 0x04]);
     },
   };
 
-  const resBackCull = await renderMesh(mockBridgeHost, backMesh, camera, mockCanvasContext, mockWasmCull);
-  assert.equal(resBackCull.target, 'canvas');
+  const resBackCull = await renderMesh(
+    mockBridgeHost,
+    backMesh,
+    camera,
+    mockCanvasContext,
+    mockWasmCull,
+  );
+  assert.equal(resBackCull.target, "canvas");
   assert.equal(capturedArgsCull.canvas, true);
 
   // 3. DoubleSide mesh strictly refuses when only cull exports exist (no legacy canvas export)
@@ -3157,9 +3856,10 @@ test('Single-mesh canvas routing: renderMesh admits sided N=1 with cull-depth/cu
       await renderMesh(mockBridgeHost, doubleMesh, camera, mockCanvasContext, mockWasmCullDepth);
     },
     {
-      name: 'Error',
-      message: /canvasContext provided for visible canvas rendering, but wasmModule does not export f3d_build_canvas_mesh_packet/,
-    }
+      name: "Error",
+      message:
+        /canvasContext provided for visible canvas rendering, but wasmModule does not export f3d_build_canvas_mesh_packet/,
+    },
   );
 
   // 4. Sided mesh strictly refuses when neither cull export nor canvas export exists
@@ -3171,13 +3871,14 @@ test('Single-mesh canvas routing: renderMesh admits sided N=1 with cull-depth/cu
       await renderMesh(mockBridgeHost, frontMesh, camera, mockCanvasContext, mockWasmOffscreenOnly);
     },
     {
-      name: 'Error',
-      message: /canvasContext provided for visible canvas rendering, but wasmModule does not export f3d_build_canvas_mesh_packet/,
-    }
+      name: "Error",
+      message:
+        /canvasContext provided for visible canvas rendering, but wasmModule does not export f3d_build_canvas_mesh_packet/,
+    },
   );
 });
 
-test('colorWrite: prepareMeshBatchPacket admits colorWrite=false when f3d_build_mesh_batch_cull_depth_color_packet is present', () => {
+test("colorWrite: prepareMeshBatchPacket admits colorWrite=false when f3d_build_mesh_batch_cull_depth_color_packet is present", () => {
   const camera = createBasicCamera();
   const occluder = createDepthTriangleMesh({ colorWrite: false, depthWrite: true });
   const visibleMesh = createDepthTriangleMesh({ colorWrite: true, depthWrite: true });
@@ -3185,10 +3886,24 @@ test('colorWrite: prepareMeshBatchPacket admits colorWrite=false when f3d_build_
   let capturedColorWrites = null;
   const mockWasm = {
     f3d_build_mesh_batch_cull_depth_color_packet: (
-      pos, vCounts, mvs, proj, cols, cModes, fFaces, dTests, dWrites, dCompares, cWrites, w, h, wd, canvas
+      pos,
+      vCounts,
+      mvs,
+      proj,
+      cols,
+      cModes,
+      fFaces,
+      dTests,
+      dWrites,
+      dCompares,
+      cWrites,
+      w,
+      h,
+      wd,
+      canvas,
     ) => {
       capturedColorWrites = Array.from(cWrites);
-      return new Uint8Array([0xAA]);
+      return new Uint8Array([0xaa]);
     },
   };
 
@@ -3198,7 +3913,7 @@ test('colorWrite: prepareMeshBatchPacket admits colorWrite=false when f3d_build_
   assert.equal(res.meshCount, 2);
 });
 
-test('colorWrite: prepareMeshBatchPacket refuses with INCOMPATIBLE_COLOR_WRITE when export is missing', () => {
+test("colorWrite: prepareMeshBatchPacket refuses with INCOMPATIBLE_COLOR_WRITE when export is missing", () => {
   const camera = createBasicCamera();
   const occluder = createDepthTriangleMesh({ colorWrite: false });
 
@@ -3209,11 +3924,12 @@ test('colorWrite: prepareMeshBatchPacket refuses with INCOMPATIBLE_COLOR_WRITE w
 
   assert.throws(
     () => prepareMeshBatchPacket([occluder], camera, 64, 64, mockWasmLegacy),
-    (err) => err.reason === 'INCOMPATIBLE_COLOR_WRITE' && err.message.includes('INCOMPATIBLE_COLOR_WRITE')
+    (err) =>
+      err.reason === "INCOMPATIBLE_COLOR_WRITE" && err.message.includes("INCOMPATIBLE_COLOR_WRITE"),
   );
 });
 
-test('colorWrite: renderScene admits mixed colorWrite meshes when export is present', async () => {
+test("colorWrite: renderScene admits mixed colorWrite meshes when export is present", async () => {
   const scene = new THREE.Scene();
   const camera = createBasicCamera();
   const occluder = createDepthTriangleMesh({ colorWrite: false });
@@ -3225,16 +3941,30 @@ test('colorWrite: renderScene admits mixed colorWrite meshes when export is pres
   let capturedColorWrites = null;
   const mockWasm = {
     f3d_build_mesh_batch_cull_depth_color_packet: (
-      pos, vCounts, mvs, proj, cols, cModes, fFaces, dTests, dWrites, dCompares, cWrites, w, h, wd, canvas
+      pos,
+      vCounts,
+      mvs,
+      proj,
+      cols,
+      cModes,
+      fFaces,
+      dTests,
+      dWrites,
+      dCompares,
+      cWrites,
+      w,
+      h,
+      wd,
+      canvas,
     ) => {
       capturedColorWrites = Array.from(cWrites);
-      return new Uint8Array([0xBB]);
+      return new Uint8Array([0xbb]);
     },
   };
   const mockBridgeHost = {
     executePacket: async (bytes) => {
       executed = true;
-      return { status: 'OK' };
+      return { status: "OK" };
     },
   };
 
@@ -3245,7 +3975,7 @@ test('colorWrite: renderScene admits mixed colorWrite meshes when export is pres
   assert.ok(capturedColorWrites !== null);
 });
 
-test('colorWrite: renderScene safely refuses with INCOMPATIBLE_COLOR_WRITE when export is missing', async () => {
+test("colorWrite: renderScene safely refuses with INCOMPATIBLE_COLOR_WRITE when export is missing", async () => {
   const scene = new THREE.Scene();
   const camera = createBasicCamera();
   const occluder = createDepthTriangleMesh({ colorWrite: false });
@@ -3257,25 +3987,43 @@ test('colorWrite: renderScene safely refuses with INCOMPATIBLE_COLOR_WRITE when 
   };
   const mockBridgeHost = {
     executePacket: async () => {
-      throw new Error('should not be called');
+      throw new Error("should not be called");
     },
   };
 
   const res = await renderScene(mockBridgeHost, scene, camera, null, mockWasmLegacy);
   assert.equal(res.admitted.length, 0);
   assert.equal(res.refused.length, 1);
-  assert.equal(res.reason, 'INCOMPATIBLE_COLOR_WRITE');
+  assert.equal(res.reason, "INCOMPATIBLE_COLOR_WRITE");
 });
 
-test('colorWrite: DoubleSide single APIs route colorWrite=false through cull_depth_color export (N=1, cullMode NONE)', () => {
+test("colorWrite: DoubleSide single APIs route colorWrite=false through cull_depth_color export (N=1, cullMode NONE)", () => {
   const camera = createBasicCamera();
-  const doubleOccluder = createDepthTriangleMesh({ side: THREE.DoubleSide, colorWrite: false, depthWrite: true });
+  const doubleOccluder = createDepthTriangleMesh({
+    side: THREE.DoubleSide,
+    colorWrite: false,
+    depthWrite: true,
+  });
 
   let capturedCanvas = null;
   let capturedOffscreen = null;
   const mockWasm = {
     f3d_build_mesh_batch_cull_depth_color_packet: (
-      p, v, m, pr, c, cm, ff, dt, dw, dc, cw, w, h, wd, canvas
+      p,
+      v,
+      m,
+      pr,
+      c,
+      cm,
+      ff,
+      dt,
+      dw,
+      dc,
+      cw,
+      w,
+      h,
+      wd,
+      canvas,
     ) => {
       const info = {
         vertexCount: v[0],
@@ -3296,7 +4044,7 @@ test('colorWrite: DoubleSide single APIs route colorWrite=false through cull_dep
 
   // 1. prepareMeshPacket (offscreen)
   const res1 = prepareMeshPacket(doubleOccluder, camera, 64, 64, mockWasm);
-  assert.equal(res1.target, 'offscreen');
+  assert.equal(res1.target, "offscreen");
   assert.equal(capturedOffscreen.vertexCount, 3);
   assert.equal(capturedOffscreen.cullMode, 0); // NONE
   assert.equal(capturedOffscreen.frontFace, 0); // CCW
@@ -3306,13 +4054,13 @@ test('colorWrite: DoubleSide single APIs route colorWrite=false through cull_dep
   // 2. prepareMeshDepthPacket (offscreen)
   capturedOffscreen = null;
   const res2 = prepareMeshDepthPacket(doubleOccluder, camera, 64, 64, mockWasm);
-  assert.equal(res2.target, 'offscreen');
+  assert.equal(res2.target, "offscreen");
   assert.equal(capturedOffscreen.colorWrite, 0);
   assert.equal(capturedOffscreen.cullMode, 0);
 
   // 3. prepareCanvasMeshPacket (canvas)
   const res3 = prepareCanvasMeshPacket(doubleOccluder, camera, 64, 64, mockWasm);
-  assert.equal(res3.target, 'canvas');
+  assert.equal(res3.target, "canvas");
   assert.equal(capturedCanvas.vertexCount, 3);
   assert.equal(capturedCanvas.cullMode, 0);
   assert.equal(capturedCanvas.colorWrite, 0);
@@ -3321,13 +4069,13 @@ test('colorWrite: DoubleSide single APIs route colorWrite=false through cull_dep
   // 4. prepareCanvasMeshDepthPacket (canvas)
   capturedCanvas = null;
   const res4 = prepareCanvasMeshDepthPacket(doubleOccluder, camera, 64, 64, mockWasm);
-  assert.equal(res4.target, 'canvas');
+  assert.equal(res4.target, "canvas");
   assert.equal(capturedCanvas.colorWrite, 0);
   assert.equal(capturedCanvas.cullMode, 0);
   assert.equal(capturedCanvas.canvas, true);
 });
 
-test('colorWrite: DoubleSide single APIs refuse colorWrite=false when cull_depth_color export is missing', () => {
+test("colorWrite: DoubleSide single APIs refuse colorWrite=false when cull_depth_color export is missing", () => {
   const camera = createBasicCamera();
   const doubleOccluder = createDepthTriangleMesh({ side: THREE.DoubleSide, colorWrite: false });
 
@@ -3343,23 +4091,23 @@ test('colorWrite: DoubleSide single APIs refuse colorWrite=false when cull_depth
 
   assert.throws(
     () => prepareMeshPacket(doubleOccluder, camera, 64, 64, mockWasmLegacy),
-    (err) => err.reason === 'INCOMPATIBLE_COLOR_WRITE'
+    (err) => err.reason === "INCOMPATIBLE_COLOR_WRITE",
   );
   assert.throws(
     () => prepareMeshDepthPacket(doubleOccluder, camera, 64, 64, mockWasmLegacy),
-    (err) => err.reason === 'INCOMPATIBLE_COLOR_WRITE'
+    (err) => err.reason === "INCOMPATIBLE_COLOR_WRITE",
   );
   assert.throws(
     () => prepareCanvasMeshPacket(doubleOccluder, camera, 64, 64, mockWasmLegacy),
-    (err) => err.reason === 'INCOMPATIBLE_COLOR_WRITE'
+    (err) => err.reason === "INCOMPATIBLE_COLOR_WRITE",
   );
   assert.throws(
     () => prepareCanvasMeshDepthPacket(doubleOccluder, camera, 64, 64, mockWasmLegacy),
-    (err) => err.reason === 'INCOMPATIBLE_COLOR_WRITE'
+    (err) => err.reason === "INCOMPATIBLE_COLOR_WRITE",
   );
 });
 
-test('colorWrite: renderMesh canvas preflight admits and executes DoubleSide colorWrite=false with new export', async () => {
+test("colorWrite: renderMesh canvas preflight admits and executes DoubleSide colorWrite=false with new export", async () => {
   const camera = createBasicCamera();
   const doubleOccluder = createDepthTriangleMesh({ side: THREE.DoubleSide, colorWrite: false });
   const mockCanvasContext = { canvas: { width: 64, height: 64 } };
@@ -3367,7 +4115,21 @@ test('colorWrite: renderMesh canvas preflight admits and executes DoubleSide col
   let executedBytes = null;
   const mockWasm = {
     f3d_build_mesh_batch_cull_depth_color_packet: (
-      p, v, m, pr, c, cm, ff, dt, dw, dc, cw, w, h, wd, canvas
+      p,
+      v,
+      m,
+      pr,
+      c,
+      cm,
+      ff,
+      dt,
+      dw,
+      dc,
+      cw,
+      w,
+      h,
+      wd,
+      canvas,
     ) => {
       assert.equal(cm[0], 0);
       assert.equal(cw[0], 0);
@@ -3378,16 +4140,16 @@ test('colorWrite: renderMesh canvas preflight admits and executes DoubleSide col
   const mockBridgeHost = {
     executePacket: async (bytes) => {
       executedBytes = bytes;
-      return { status: 'OK' };
+      return { status: "OK" };
     },
   };
 
   const res = await renderMesh(mockBridgeHost, doubleOccluder, camera, mockCanvasContext, mockWasm);
-  assert.equal(res.target, 'canvas');
+  assert.equal(res.target, "canvas");
   assert.deepEqual(executedBytes, new Uint8Array([0x77]));
 });
 
-test('colorWrite: renderMesh canvas preflight strictly refuses colorWrite=false when cull_depth_color export is missing', async () => {
+test("colorWrite: renderMesh canvas preflight strictly refuses colorWrite=false when cull_depth_color export is missing", async () => {
   const camera = createBasicCamera();
   const doubleOccluder = createDepthTriangleMesh({ side: THREE.DoubleSide, colorWrite: false });
   const sidedOccluder = createDepthTriangleMesh({ side: THREE.FrontSide, colorWrite: false });
@@ -3401,24 +4163,26 @@ test('colorWrite: renderMesh canvas preflight strictly refuses colorWrite=false 
     f3d_build_mesh_batch_cull_packet: () => new Uint8Array(0),
   };
   const mockBridgeHost = {
-    executePacket: async () => { throw new Error('should not execute'); },
+    executePacket: async () => {
+      throw new Error("should not execute");
+    },
   };
 
   await assert.rejects(
     async () => {
       await renderMesh(mockBridgeHost, doubleOccluder, camera, mockCanvasContext, mockWasmLegacy);
     },
-    (err) => err.reason === 'INCOMPATIBLE_COLOR_WRITE'
+    (err) => err.reason === "INCOMPATIBLE_COLOR_WRITE",
   );
   await assert.rejects(
     async () => {
       await renderMesh(mockBridgeHost, sidedOccluder, camera, mockCanvasContext, mockWasmLegacy);
     },
-    (err) => err.reason === 'INCOMPATIBLE_COLOR_WRITE'
+    (err) => err.reason === "INCOMPATIBLE_COLOR_WRITE",
   );
 });
 
-test('colorWrite: default true-color DoubleSide single APIs preserve existing legacy export routing', () => {
+test("colorWrite: default true-color DoubleSide single APIs preserve existing legacy export routing", () => {
   const camera = createBasicCamera();
   const normalDouble = createDepthTriangleMesh({ side: THREE.DoubleSide, colorWrite: true });
 
@@ -3444,7 +4208,7 @@ test('colorWrite: default true-color DoubleSide single APIs preserve existing le
   assert.deepEqual(resCanvas.packetBytes, new Uint8Array([0x22]));
 });
 
-test('Mixed depth + color: prepareMeshBatchPacket admits mixed depth when ONLY cull_depth_color export is present', () => {
+test("Mixed depth + color: prepareMeshBatchPacket admits mixed depth when ONLY cull_depth_color export is present", () => {
   const camera = createBasicCamera();
   const meshA = createDepthTriangleMesh({ depthWrite: true, colorWrite: true });
   const meshB = createDepthTriangleMesh({ depthWrite: false, colorWrite: false });
@@ -3453,7 +4217,21 @@ test('Mixed depth + color: prepareMeshBatchPacket admits mixed depth when ONLY c
   // Wasm has ONLY f3d_build_mesh_batch_cull_depth_color_packet
   const mockWasmNewOnly = {
     f3d_build_mesh_batch_cull_depth_color_packet: (
-      p, v, m, pr, c, cm, ff, dt, dw, dc, cw, w, h, wd, canvas
+      p,
+      v,
+      m,
+      pr,
+      c,
+      cm,
+      ff,
+      dt,
+      dw,
+      dc,
+      cw,
+      w,
+      h,
+      wd,
+      canvas,
     ) => {
       captured = {
         depthWrites: Array.from(dw),
@@ -3469,7 +4247,7 @@ test('Mixed depth + color: prepareMeshBatchPacket admits mixed depth when ONLY c
   assert.deepEqual(captured.colorWrites, [1, 0]);
 });
 
-test('Mixed depth + color: renderScene admits mixed depth when ONLY cull_depth_color export is present', async () => {
+test("Mixed depth + color: renderScene admits mixed depth when ONLY cull_depth_color export is present", async () => {
   const scene = new THREE.Scene();
   const camera = createBasicCamera();
   const meshA = createDepthTriangleMesh({ depthWrite: true, colorWrite: true });
@@ -3480,7 +4258,21 @@ test('Mixed depth + color: renderScene admits mixed depth when ONLY cull_depth_c
   let executed = false;
   const mockWasmNewOnly = {
     f3d_build_mesh_batch_cull_depth_color_packet: (
-      p, v, m, pr, c, cm, ff, dt, dw, dc, cw, w, h, wd, canvas
+      p,
+      v,
+      m,
+      pr,
+      c,
+      cm,
+      ff,
+      dt,
+      dw,
+      dc,
+      cw,
+      w,
+      h,
+      wd,
+      canvas,
     ) => {
       assert.deepEqual(Array.from(dw), [1, 0]);
       assert.deepEqual(Array.from(cw), [1, 1]);
@@ -3491,7 +4283,7 @@ test('Mixed depth + color: renderScene admits mixed depth when ONLY cull_depth_c
     executePacket: async (bytes) => {
       executed = true;
       assert.deepEqual(bytes, new Uint8Array([0x88]));
-      return { status: 'OK' };
+      return { status: "OK" };
     },
   };
 
@@ -3501,15 +4293,20 @@ test('Mixed depth + color: renderScene admits mixed depth when ONLY cull_depth_c
   assert.equal(res.admitted.length, 2);
 });
 
-test('Geometry residency: in-place array mutation without needsUpdate keeps GPU-stale shadow in renderMesh', async () => {
+test("Geometry residency: in-place array mutation without needsUpdate keeps GPU-stale shadow in renderMesh", async () => {
   const camera = createBasicCamera();
   const geometry = new THREE.BufferGeometry();
   const posArray = new Float32Array([-1, -1, -2, 1, -1, -2, 0, 1, -2]);
   const position = new THREE.BufferAttribute(posArray, 3);
-  geometry.setAttribute('position', position);
+  geometry.setAttribute("position", position);
   const mesh = new THREE.Mesh(
     geometry,
-    new THREE.MeshBasicMaterial({ color: 0xff0000, side: THREE.DoubleSide, depthTest: false, depthWrite: false })
+    new THREE.MeshBasicMaterial({
+      color: 0xff0000,
+      side: THREE.DoubleSide,
+      depthTest: false,
+      depthWrite: false,
+    }),
   );
 
   let capturedPositions = null;
@@ -3527,8 +4324,8 @@ test('Geometry residency: in-place array mutation without needsUpdate keeps GPU-
     deviceGeneration: 0,
     device: {},
     executePacket: async (bytes, ctx, onSubmitted) => {
-      if (typeof onSubmitted === 'function') onSubmitted();
-      return { status: 'OK' };
+      if (typeof onSubmitted === "function") onSubmitted();
+      return { status: "OK" };
     },
   };
 
@@ -3552,15 +4349,15 @@ test('Geometry residency: in-place array mutation without needsUpdate keeps GPU-
   assert.deepEqual(capturedPositions, [-1 + 5.0, -1, -2, 1 + 5.0, -1, -2, 5.0, 1, -2]);
 });
 
-test('Geometry residency: partial updateRanges patches only specified components and preserves stale gaps', async () => {
+test("Geometry residency: partial updateRanges patches only specified components and preserves stale gaps", async () => {
   const camera = createBasicCamera();
   const geometry = new THREE.BufferGeometry();
   const posArray = new Float32Array([1, 2, 3, 4, 5, 6, 7, 8, 9]);
   const position = new THREE.BufferAttribute(posArray, 3);
-  geometry.setAttribute('position', position);
+  geometry.setAttribute("position", position);
   const mesh = new THREE.Mesh(
     geometry,
-    new THREE.MeshBasicMaterial({ side: THREE.DoubleSide, depthTest: false, depthWrite: false })
+    new THREE.MeshBasicMaterial({ side: THREE.DoubleSide, depthTest: false, depthWrite: false }),
   );
 
   let captured = null;
@@ -3578,8 +4375,8 @@ test('Geometry residency: partial updateRanges patches only specified components
     deviceGeneration: 0,
     device: {},
     executePacket: async (bytes, ctx, onSubmitted) => {
-      if (typeof onSubmitted === 'function') onSubmitted();
-      return { status: 'OK' };
+      if (typeof onSubmitted === "function") onSubmitted();
+      return { status: "OK" };
     },
   };
 
@@ -3602,16 +4399,16 @@ test('Geometry residency: partial updateRanges patches only specified components
   assert.equal(position.updateRanges.length, 0);
 });
 
-test('Geometry residency: WebGPU DynamicDrawUsage auto-uploads while WebGL strictly requires version bump', async () => {
+test("Geometry residency: WebGPU DynamicDrawUsage auto-uploads while WebGL strictly requires version bump", async () => {
   const camera = createBasicCamera();
   const geometry = new THREE.BufferGeometry();
   const posArray = new Float32Array([1, 1, 1, 2, 2, 2, 3, 3, 3]);
   const position = new THREE.BufferAttribute(posArray, 3);
   position.usage = THREE.DynamicDrawUsage; // 35048
-  geometry.setAttribute('position', position);
+  geometry.setAttribute("position", position);
   const mesh = new THREE.Mesh(
     geometry,
-    new THREE.MeshBasicMaterial({ side: THREE.DoubleSide, depthTest: false, depthWrite: false })
+    new THREE.MeshBasicMaterial({ side: THREE.DoubleSide, depthTest: false, depthWrite: false }),
   );
 
   let captured = null;
@@ -3629,27 +4426,27 @@ test('Geometry residency: WebGPU DynamicDrawUsage auto-uploads while WebGL stric
     deviceGeneration: 0,
     device: {},
     executePacket: async (bytes, ctx, onSubmitted) => {
-      if (typeof onSubmitted === 'function') onSubmitted();
-      return { status: 'OK' };
+      if (typeof onSubmitted === "function") onSubmitted();
+      return { status: "OK" };
     },
   };
 
   // Ambiguous without options.sourceBackend -> must refuse
   assert.equal(canAdmitMesh(mesh, camera).admitted, false);
-  assert.equal(canAdmitMesh(mesh, camera).code, 'AMBIGUOUS_ATTRIBUTE_UPDATE');
+  assert.equal(canAdmitMesh(mesh, camera).code, "AMBIGUOUS_ATTRIBUTE_UPDATE");
   await assert.rejects(
     async () => {
       await renderMesh(mockHost, mesh, camera, null, mockWasm);
     },
-    (err) => err.reason === 'AMBIGUOUS_ATTRIBUTE_UPDATE'
+    (err) => err.reason === "AMBIGUOUS_ATTRIBUTE_UPDATE",
   );
 
   // WebGL source backend: DynamicDrawUsage does NOT bypass version gate
-  await renderMesh(mockHost, mesh, camera, null, mockWasm, { sourceBackend: 'webgl' });
+  await renderMesh(mockHost, mesh, camera, null, mockWasm, { sourceBackend: "webgl" });
   assert.deepEqual(captured, [1, 1, 1, 2, 2, 2, 3, 3, 3]);
 
   posArray[0] = 77;
-  await renderMesh(mockHost, mesh, camera, null, mockWasm, { sourceBackend: 'webgl' });
+  await renderMesh(mockHost, mesh, camera, null, mockWasm, { sourceBackend: "webgl" });
   // Stays stale under WebGL
   assert.equal(captured[0], 1);
 
@@ -3658,27 +4455,27 @@ test('Geometry residency: WebGPU DynamicDrawUsage auto-uploads while WebGL stric
     deviceGeneration: 0,
     device: {},
     executePacket: async (bytes, ctx, onSubmitted) => {
-      if (typeof onSubmitted === 'function') onSubmitted();
-      return { status: 'OK' };
+      if (typeof onSubmitted === "function") onSubmitted();
+      return { status: "OK" };
     },
   };
-  await renderMesh(mockHostWebGPU, mesh, camera, null, mockWasm, { sourceBackend: 'webgpu' });
+  await renderMesh(mockHostWebGPU, mesh, camera, null, mockWasm, { sourceBackend: "webgpu" });
   assert.equal(captured[0], 77);
 
   posArray[0] = 88;
-  await renderMesh(mockHostWebGPU, mesh, camera, null, mockWasm, { sourceBackend: 'webgpu' });
+  await renderMesh(mockHostWebGPU, mesh, camera, null, mockWasm, { sourceBackend: "webgpu" });
   assert.equal(captured[0], 88);
 });
 
-test('Geometry residency: multiple updateRanges deep copies ranges and merges with +1 rule in WebGL', async () => {
+test("Geometry residency: multiple updateRanges deep copies ranges and merges with +1 rule in WebGL", async () => {
   const camera = createBasicCamera();
   const geometry = new THREE.BufferGeometry();
   const posArray = new Float32Array([1, 2, 3, 4, 5, 6, 7, 8, 9]);
   const position = new THREE.BufferAttribute(posArray, 3);
-  geometry.setAttribute('position', position);
+  geometry.setAttribute("position", position);
   const mesh = new THREE.Mesh(
     geometry,
-    new THREE.MeshBasicMaterial({ side: THREE.DoubleSide, depthTest: false, depthWrite: false })
+    new THREE.MeshBasicMaterial({ side: THREE.DoubleSide, depthTest: false, depthWrite: false }),
   );
 
   let captured = null;
@@ -3696,13 +4493,13 @@ test('Geometry residency: multiple updateRanges deep copies ranges and merges wi
     deviceGeneration: 0,
     device: {},
     executePacket: async (bytes, ctx, onSubmitted) => {
-      if (typeof onSubmitted === 'function') onSubmitted();
-      return { status: 'OK' };
+      if (typeof onSubmitted === "function") onSubmitted();
+      return { status: "OK" };
     },
   };
 
   // Initial render
-  await renderMesh(mockHost, mesh, camera, null, mockWasm, { sourceBackend: 'webgl' });
+  await renderMesh(mockHost, mesh, camera, null, mockWasm, { sourceBackend: "webgl" });
   assert.deepEqual(captured, [1, 2, 3, 4, 5, 6, 7, 8, 9]);
 
   // Mutate elements on CPU
@@ -3724,7 +4521,7 @@ test('Geometry residency: multiple updateRanges deep copies ranges and merges wi
     async () => {
       await renderMesh(mockHost, mesh, camera, null, mockWasm);
     },
-    (err) => err.reason === 'AMBIGUOUS_ATTRIBUTE_UPDATE'
+    (err) => err.reason === "AMBIGUOUS_ATTRIBUTE_UPDATE",
   );
 
   // Original range objects were NOT mutated by preflight failure
@@ -3732,34 +4529,34 @@ test('Geometry residency: multiple updateRanges deep copies ranges and merges wi
   assert.equal(position.updateRanges[1].count, range1Original.count);
 
   // Render with WebGL backend: merges across the 1-element gap
-  await renderMesh(mockHost, mesh, camera, null, mockWasm, { sourceBackend: 'webgl' });
+  await renderMesh(mockHost, mesh, camera, null, mockWasm, { sourceBackend: "webgl" });
   // Elements [0..2] updated to [10, 20, 30], element 3+ remains stale [4, 5, 6, 7, 8, 9]
   assert.deepEqual(captured, [10, 20, 30, 4, 5, 6, 7, 8, 9]);
 });
 
-test('Geometry residency: custom onUploadCallback is rejected with UNSUPPORTED_UPLOAD_CALLBACK', async () => {
+test("Geometry residency: custom onUploadCallback is rejected with UNSUPPORTED_UPLOAD_CALLBACK", async () => {
   const camera = createBasicCamera();
   const geometry = new THREE.BufferGeometry();
   const posAttr = new THREE.BufferAttribute(new Float32Array([0, 0, 0, 1, 1, 1, 2, 2, 2]), 3);
   posAttr.onUpload(() => {}); // Custom callback registered
-  geometry.setAttribute('position', posAttr);
+  geometry.setAttribute("position", posAttr);
   const mesh = new THREE.Mesh(
     geometry,
-    new THREE.MeshBasicMaterial({ side: THREE.DoubleSide, depthTest: false, depthWrite: false })
+    new THREE.MeshBasicMaterial({ side: THREE.DoubleSide, depthTest: false, depthWrite: false }),
   );
 
   assert.equal(canAdmitMesh(mesh, camera).admitted, false);
-  assert.equal(canAdmitMesh(mesh, camera).code, 'UNSUPPORTED_UPLOAD_CALLBACK');
+  assert.equal(canAdmitMesh(mesh, camera).code, "UNSUPPORTED_UPLOAD_CALLBACK");
 });
 
-test('Geometry residency: resizing buffer attribute throws INVALID_ATTRIBUTE_RESIZE', async () => {
+test("Geometry residency: resizing buffer attribute throws INVALID_ATTRIBUTE_RESIZE", async () => {
   const camera = createBasicCamera();
   const geometry = new THREE.BufferGeometry();
   const posAttr = new THREE.BufferAttribute(new Float32Array([0, 0, 0, 1, 1, 1, 2, 2, 2]), 3);
-  geometry.setAttribute('position', posAttr);
+  geometry.setAttribute("position", posAttr);
   const mesh = new THREE.Mesh(
     geometry,
-    new THREE.MeshBasicMaterial({ side: THREE.DoubleSide, depthTest: false, depthWrite: false })
+    new THREE.MeshBasicMaterial({ side: THREE.DoubleSide, depthTest: false, depthWrite: false }),
   );
 
   const mockWasm = {
@@ -3770,8 +4567,8 @@ test('Geometry residency: resizing buffer attribute throws INVALID_ATTRIBUTE_RES
     deviceGeneration: 0,
     device: {},
     executePacket: async (bytes, ctx, onSubmitted) => {
-      if (typeof onSubmitted === 'function') onSubmitted();
-      return { status: 'OK' };
+      if (typeof onSubmitted === "function") onSubmitted();
+      return { status: "OK" };
     },
   };
 
@@ -3785,19 +4582,19 @@ test('Geometry residency: resizing buffer attribute throws INVALID_ATTRIBUTE_RES
     async () => {
       await renderMesh(mockHost, mesh, camera, null, mockWasm);
     },
-    (err) => err.reason === 'INVALID_ATTRIBUTE_RESIZE'
+    (err) => err.reason === "INVALID_ATTRIBUTE_RESIZE",
   );
 });
 
-test('Geometry residency: executePacket error does NOT commit shadow or clear updateRanges', async () => {
+test("Geometry residency: executePacket error does NOT commit shadow or clear updateRanges", async () => {
   const camera = createBasicCamera();
   const geometry = new THREE.BufferGeometry();
   const posArray = new Float32Array([1, 2, 3, 4, 5, 6, 7, 8, 9]);
   const posAttr = new THREE.BufferAttribute(posArray, 3);
-  geometry.setAttribute('position', posAttr);
+  geometry.setAttribute("position", posAttr);
   const mesh = new THREE.Mesh(
     geometry,
-    new THREE.MeshBasicMaterial({ side: THREE.DoubleSide, depthTest: false, depthWrite: false })
+    new THREE.MeshBasicMaterial({ side: THREE.DoubleSide, depthTest: false, depthWrite: false }),
   );
 
   let captured = null;
@@ -3817,10 +4614,10 @@ test('Geometry residency: executePacket error does NOT commit shadow or clear up
     device: {},
     executePacket: async (bytes, ctx, onSubmitted) => {
       if (shouldFail) {
-        throw new Error('GPU submission encoder error');
+        throw new Error("GPU submission encoder error");
       }
-      if (typeof onSubmitted === 'function') onSubmitted();
-      return { status: 'OK' };
+      if (typeof onSubmitted === "function") onSubmitted();
+      return { status: "OK" };
     },
   };
 
@@ -3835,12 +4632,9 @@ test('Geometry residency: executePacket error does NOT commit shadow or clear up
 
   // Fail execution before onSubmitted
   shouldFail = true;
-  await assert.rejects(
-    async () => {
-      await renderMesh(mockHost, mesh, camera, null, mockWasm);
-    },
-    /GPU submission encoder error/
-  );
+  await assert.rejects(async () => {
+    await renderMesh(mockHost, mesh, camera, null, mockWasm);
+  }, /GPU submission encoder error/);
 
   // Because execution failed, updateRanges must NOT have been cleared!
   assert.equal(posAttr.updateRanges.length, 1);
@@ -3852,15 +4646,15 @@ test('Geometry residency: executePacket error does NOT commit shadow or clear up
   assert.equal(posAttr.updateRanges.length, 0);
 });
 
-test('Geometry residency: deviceGeneration or device identity change discards shadow and re-uploads', async () => {
+test("Geometry residency: deviceGeneration or device identity change discards shadow and re-uploads", async () => {
   const camera = createBasicCamera();
   const geometry = new THREE.BufferGeometry();
   const posArray = new Float32Array([1, 1, 1, 2, 2, 2, 3, 3, 3]);
   const posAttr = new THREE.BufferAttribute(posArray, 3);
-  geometry.setAttribute('position', posAttr);
+  geometry.setAttribute("position", posAttr);
   const mesh = new THREE.Mesh(
     geometry,
-    new THREE.MeshBasicMaterial({ side: THREE.DoubleSide, depthTest: false, depthWrite: false })
+    new THREE.MeshBasicMaterial({ side: THREE.DoubleSide, depthTest: false, depthWrite: false }),
   );
 
   let captured = null;
@@ -3876,10 +4670,10 @@ test('Geometry residency: deviceGeneration or device identity change discards sh
   };
   const mockHost = {
     deviceGeneration: 0,
-    device: { id: 'device-1' },
+    device: { id: "device-1" },
     executePacket: async (bytes, ctx, onSubmitted) => {
-      if (typeof onSubmitted === 'function') onSubmitted();
-      return { status: 'OK' };
+      if (typeof onSubmitted === "function") onSubmitted();
+      return { status: "OK" };
     },
   };
 
@@ -3893,7 +4687,7 @@ test('Geometry residency: deviceGeneration or device identity change discards sh
   assert.equal(captured[0], 1);
 
   // 1. Device identity changes (new device object, same generation) -> invalidates!
-  mockHost.device = { id: 'device-2' };
+  mockHost.device = { id: "device-2" };
   await renderMesh(mockHost, mesh, camera, null, mockWasm);
   assert.equal(captured[0], 55);
 
@@ -3911,36 +4705,54 @@ test('Geometry residency: deviceGeneration or device identity change discards sh
   assert.equal(geometry._listeners?.dispose?.length, 1);
 });
 
-test('Geometry residency: multi-host geometry disposal evicts shadows without public property mutation', async () => {
+test("Geometry residency: multi-host geometry disposal evicts shadows without public property mutation", async () => {
   const camera = createBasicCamera();
   const geometry = new THREE.BufferGeometry();
   const posArray = new Float32Array([1, 1, 1, 2, 2, 2, 3, 3, 3]);
   const posAttr = new THREE.BufferAttribute(posArray, 3);
-  geometry.setAttribute('position', posAttr);
+  geometry.setAttribute("position", posAttr);
   const mesh = new THREE.Mesh(
     geometry,
-    new THREE.MeshBasicMaterial({ side: THREE.DoubleSide, depthTest: false, depthWrite: false })
+    new THREE.MeshBasicMaterial({ side: THREE.DoubleSide, depthTest: false, depthWrite: false }),
   );
 
   let capturedA = null;
   let capturedB = null;
   const mockWasmA = {
-    f3d_build_mesh_packet: (pos) => { capturedA = Array.from(pos); return new Uint8Array([0x01]); },
-    f3d_build_mesh_depth_packet: (pos) => { capturedA = Array.from(pos); return new Uint8Array([0x01]); },
+    f3d_build_mesh_packet: (pos) => {
+      capturedA = Array.from(pos);
+      return new Uint8Array([0x01]);
+    },
+    f3d_build_mesh_depth_packet: (pos) => {
+      capturedA = Array.from(pos);
+      return new Uint8Array([0x01]);
+    },
   };
   const mockWasmB = {
-    f3d_build_mesh_packet: (pos) => { capturedB = Array.from(pos); return new Uint8Array([0x01]); },
-    f3d_build_mesh_depth_packet: (pos) => { capturedB = Array.from(pos); return new Uint8Array([0x01]); },
+    f3d_build_mesh_packet: (pos) => {
+      capturedB = Array.from(pos);
+      return new Uint8Array([0x01]);
+    },
+    f3d_build_mesh_depth_packet: (pos) => {
+      capturedB = Array.from(pos);
+      return new Uint8Array([0x01]);
+    },
   };
   const mockHostA = {
     deviceGeneration: 0,
     device: {},
-    executePacket: async (bytes, ctx, onSubmitted) => { if (onSubmitted) onSubmitted(); return { status: 'OK' }; },
+    executePacket: async (bytes, ctx, onSubmitted) => {
+      if (onSubmitted) onSubmitted();
+      return { status: "OK" };
+    },
   };
   const mockHostB = {
     deviceGeneration: 0,
     device: {},
-    executePacket: async (bytes, ctx, onSubmitted) => { if (onSubmitted) onSubmitted(); return { status: 'OK' }; },
+    executePacket: async (bytes, ctx, onSubmitted) => {
+      if (onSubmitted) onSubmitted();
+      return { status: "OK" };
+    },
   };
 
   // Render on host A and host B
@@ -3970,15 +4782,15 @@ test('Geometry residency: multi-host geometry disposal evicts shadows without pu
   assert.equal(capturedB[0], 99);
 });
 
-test('Geometry residency: pure prepareMeshPacket does not cache or retain shadow (stateless snapshot)', () => {
+test("Geometry residency: pure prepareMeshPacket does not cache or retain shadow (stateless snapshot)", () => {
   const camera = createBasicCamera();
   const geometry = new THREE.BufferGeometry();
   const posArray = new Float32Array([1, 1, 1, 2, 2, 2, 3, 3, 3]);
   const posAttr = new THREE.BufferAttribute(posArray, 3);
-  geometry.setAttribute('position', posAttr);
+  geometry.setAttribute("position", posAttr);
   const mesh = new THREE.Mesh(
     geometry,
-    new THREE.MeshBasicMaterial({ side: THREE.DoubleSide, depthTest: false, depthWrite: false })
+    new THREE.MeshBasicMaterial({ side: THREE.DoubleSide, depthTest: false, depthWrite: false }),
   );
 
   let captured = null;
@@ -4002,7 +4814,7 @@ test('Geometry residency: pure prepareMeshPacket does not cache or retain shadow
   assert.equal(captured[0], 42);
 });
 
-test('Geometry residency: invalid updateRange refuses with INVALID_UPDATE_RANGE and leaves source state untouched', async () => {
+test("Geometry residency: invalid updateRange refuses with INVALID_UPDATE_RANGE and leaves source state untouched", async () => {
   const camera = createBasicCamera();
   const geometry = new THREE.BufferGeometry();
   const posArray = new Float32Array([1, 2, 3, 4, 5, 6, 7, 8, 9]);
@@ -4010,10 +4822,10 @@ test('Geometry residency: invalid updateRange refuses with INVALID_UPDATE_RANGE 
   // Add invalid range (count 0) BEFORE initial render:
   // Initial upload must ignore and preserve updateRanges per source (root 18546)
   position.addUpdateRange(0, 0);
-  geometry.setAttribute('position', position);
+  geometry.setAttribute("position", position);
   const mesh = new THREE.Mesh(
     geometry,
-    new THREE.MeshBasicMaterial({ side: THREE.DoubleSide, depthTest: false, depthWrite: false })
+    new THREE.MeshBasicMaterial({ side: THREE.DoubleSide, depthTest: false, depthWrite: false }),
   );
 
   let captured = null;
@@ -4031,8 +4843,8 @@ test('Geometry residency: invalid updateRange refuses with INVALID_UPDATE_RANGE 
     deviceGeneration: 0,
     device: {},
     executePacket: async (bytes, ctx, onSubmitted) => {
-      if (typeof onSubmitted === 'function') onSubmitted();
-      return { status: 'OK' };
+      if (typeof onSubmitted === "function") onSubmitted();
+      return { status: "OK" };
     },
   };
 
@@ -4061,7 +4873,7 @@ test('Geometry residency: invalid updateRange refuses with INVALID_UPDATE_RANGE 
       async () => {
         await renderMesh(mockHost, mesh, camera, null, mockWasm);
       },
-      (err) => err.reason === 'INVALID_UPDATE_RANGE'
+      (err) => err.reason === "INVALID_UPDATE_RANGE",
     );
 
     // Source ranges must remain untouched on refusal
@@ -4071,117 +4883,144 @@ test('Geometry residency: invalid updateRange refuses with INVALID_UPDATE_RANGE 
   }
 });
 
-test('vertexColors: canAdmitMesh admits vertexColors=true with Float32 RGB/RGBA and Uint8 normalized RGB/RGBA, refuses missing color attribute', () => {
+test("vertexColors: canAdmitMesh admits vertexColors=true with Float32 RGB/RGBA and Uint8 normalized RGB/RGBA, refuses missing color attribute", () => {
   const camera = createBasicCamera();
 
   // 1. Missing color attribute: refused per Root review (WebGL requires color attribute, no defaultAttributeValues)
   const meshNoColor = createBasicTriangleMesh({ vertexColors: true });
   const resNoColor = canAdmitMesh(meshNoColor, camera);
   assert.equal(resNoColor.admitted, false);
-  assert.equal(resNoColor.code, 'MISSING_COLOR_ATTRIBUTE');
+  assert.equal(resNoColor.code, "MISSING_COLOR_ATTRIBUTE");
 
   // 2. Float32Array RGB (itemSize 3)
   const geomF32Rgb = new THREE.BufferGeometry();
-  geomF32Rgb.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
-  geomF32Rgb.setAttribute('color', new THREE.BufferAttribute(new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]), 3));
-  const meshF32Rgb = new THREE.Mesh(geomF32Rgb, new THREE.MeshBasicMaterial({ vertexColors: true }));
+  geomF32Rgb.setAttribute("position", new THREE.BufferAttribute(new Float32Array(9), 3));
+  geomF32Rgb.setAttribute(
+    "color",
+    new THREE.BufferAttribute(new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]), 3),
+  );
+  const meshF32Rgb = new THREE.Mesh(
+    geomF32Rgb,
+    new THREE.MeshBasicMaterial({ vertexColors: true }),
+  );
   assert.equal(canAdmitMesh(meshF32Rgb, camera).admitted, true);
 
   // 3. Float32Array RGBA (itemSize 4)
   const geomF32Rgba = new THREE.BufferGeometry();
-  geomF32Rgba.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
-  geomF32Rgba.setAttribute('color', new THREE.BufferAttribute(new Float32Array([1, 0, 0, 0.5, 0, 1, 0, 0.8, 0, 0, 1, 1]), 4));
-  const meshF32Rgba = new THREE.Mesh(geomF32Rgba, new THREE.MeshBasicMaterial({ vertexColors: true }));
+  geomF32Rgba.setAttribute("position", new THREE.BufferAttribute(new Float32Array(9), 3));
+  geomF32Rgba.setAttribute(
+    "color",
+    new THREE.BufferAttribute(new Float32Array([1, 0, 0, 0.5, 0, 1, 0, 0.8, 0, 0, 1, 1]), 4),
+  );
+  const meshF32Rgba = new THREE.Mesh(
+    geomF32Rgba,
+    new THREE.MeshBasicMaterial({ vertexColors: true }),
+  );
   assert.equal(canAdmitMesh(meshF32Rgba, camera).admitted, true);
 
   // 4. Uint8Array normalized RGB (itemSize 3)
   const geomU8Rgb = new THREE.BufferGeometry();
-  geomU8Rgb.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
-  geomU8Rgb.setAttribute('color', new THREE.BufferAttribute(new Uint8Array([255, 0, 0, 0, 255, 0, 0, 0, 255]), 3, true));
+  geomU8Rgb.setAttribute("position", new THREE.BufferAttribute(new Float32Array(9), 3));
+  geomU8Rgb.setAttribute(
+    "color",
+    new THREE.BufferAttribute(new Uint8Array([255, 0, 0, 0, 255, 0, 0, 0, 255]), 3, true),
+  );
   const meshU8Rgb = new THREE.Mesh(geomU8Rgb, new THREE.MeshBasicMaterial({ vertexColors: true }));
   assert.equal(canAdmitMesh(meshU8Rgb, camera).admitted, true);
 });
 
-test('vertexColors: canAdmitMesh refuses invalid interleaved, custom upload callback, unnormalized Uint8, and invalid itemSize', () => {
+test("vertexColors: canAdmitMesh refuses invalid interleaved, custom upload callback, unnormalized Uint8, and invalid itemSize", () => {
   const camera = createBasicCamera();
 
   // 1. Invalid interleaved color attribute (missing buffer data)
   const geomInter = new THREE.BufferGeometry();
-  geomInter.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
+  geomInter.setAttribute("position", new THREE.BufferAttribute(new Float32Array(9), 3));
   const interAttr = new THREE.BufferAttribute(new Float32Array(9), 3);
   interAttr.isInterleavedBufferAttribute = true;
-  geomInter.setAttribute('color', interAttr);
+  geomInter.setAttribute("color", interAttr);
   const meshInter = new THREE.Mesh(geomInter, new THREE.MeshBasicMaterial({ vertexColors: true }));
   const resInter = canAdmitMesh(meshInter, camera);
   assert.equal(resInter.admitted, false);
-  assert.equal(resInter.code, 'UNSUPPORTED_ATTRIBUTE');
+  assert.equal(resInter.code, "UNSUPPORTED_ATTRIBUTE");
 
   // 1b. InstancedBufferAttribute on color attribute
   const geomInstColor = new THREE.BufferGeometry();
-  geomInstColor.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
+  geomInstColor.setAttribute("position", new THREE.BufferAttribute(new Float32Array(9), 3));
   const instColorAttr = new THREE.BufferAttribute(new Float32Array(9), 3);
   instColorAttr.isInstancedBufferAttribute = true;
-  geomInstColor.setAttribute('color', instColorAttr);
-  const meshInstColor = new THREE.Mesh(geomInstColor, new THREE.MeshBasicMaterial({ vertexColors: true }));
+  geomInstColor.setAttribute("color", instColorAttr);
+  const meshInstColor = new THREE.Mesh(
+    geomInstColor,
+    new THREE.MeshBasicMaterial({ vertexColors: true }),
+  );
   const resInstColor = canAdmitMesh(meshInstColor, camera);
   assert.equal(resInstColor.admitted, false);
-  assert.equal(resInstColor.code, 'UNSUPPORTED_ATTRIBUTE');
+  assert.equal(resInstColor.code, "UNSUPPORTED_ATTRIBUTE");
 
   // 1c. InstancedBufferAttribute on position attribute
   const geomInstPos = new THREE.BufferGeometry();
   const instPosAttr = new THREE.BufferAttribute(new Float32Array(9), 3);
   instPosAttr.isInstancedBufferAttribute = true;
-  geomInstPos.setAttribute('position', instPosAttr);
-  geomInstPos.setAttribute('color', new THREE.BufferAttribute(new Float32Array(9), 3));
-  const meshInstPos = new THREE.Mesh(geomInstPos, new THREE.MeshBasicMaterial({ vertexColors: true }));
+  geomInstPos.setAttribute("position", instPosAttr);
+  geomInstPos.setAttribute("color", new THREE.BufferAttribute(new Float32Array(9), 3));
+  const meshInstPos = new THREE.Mesh(
+    geomInstPos,
+    new THREE.MeshBasicMaterial({ vertexColors: true }),
+  );
   const resInstPos = canAdmitMesh(meshInstPos, camera);
   assert.equal(resInstPos.admitted, false);
-  assert.equal(resInstPos.code, 'UNSUPPORTED_ATTRIBUTE');
+  assert.equal(resInstPos.code, "UNSUPPORTED_ATTRIBUTE");
 
   // 2. Custom onUploadCallback on color attribute
   const geomCb = new THREE.BufferGeometry();
-  geomCb.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
+  geomCb.setAttribute("position", new THREE.BufferAttribute(new Float32Array(9), 3));
   const cbAttr = new THREE.BufferAttribute(new Float32Array(9), 3);
   cbAttr.onUploadCallback = () => {};
-  geomCb.setAttribute('color', cbAttr);
+  geomCb.setAttribute("color", cbAttr);
   const meshCb = new THREE.Mesh(geomCb, new THREE.MeshBasicMaterial({ vertexColors: true }));
   const resCb = canAdmitMesh(meshCb, camera);
   assert.equal(resCb.admitted, false);
-  assert.equal(resCb.code, 'UNSUPPORTED_UPLOAD_CALLBACK');
+  assert.equal(resCb.code, "UNSUPPORTED_UPLOAD_CALLBACK");
 
   // 3. Unnormalized Uint8Array
   const geomU8Unnorm = new THREE.BufferGeometry();
-  geomU8Unnorm.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
-  geomU8Unnorm.setAttribute('color', new THREE.BufferAttribute(new Uint8Array([255, 0, 0, 0, 255, 0, 0, 0, 255]), 3, false));
-  const meshU8Unnorm = new THREE.Mesh(geomU8Unnorm, new THREE.MeshBasicMaterial({ vertexColors: true }));
+  geomU8Unnorm.setAttribute("position", new THREE.BufferAttribute(new Float32Array(9), 3));
+  geomU8Unnorm.setAttribute(
+    "color",
+    new THREE.BufferAttribute(new Uint8Array([255, 0, 0, 0, 255, 0, 0, 0, 255]), 3, false),
+  );
+  const meshU8Unnorm = new THREE.Mesh(
+    geomU8Unnorm,
+    new THREE.MeshBasicMaterial({ vertexColors: true }),
+  );
   const resU8 = canAdmitMesh(meshU8Unnorm, camera);
   assert.equal(resU8.admitted, false);
-  assert.equal(resU8.code, 'INVALID_COLOR_ATTRIBUTE');
+  assert.equal(resU8.code, "INVALID_COLOR_ATTRIBUTE");
 
   // 4. Invalid itemSize (e.g. 2)
   const geomSize2 = new THREE.BufferGeometry();
-  geomSize2.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
-  geomSize2.setAttribute('color', new THREE.BufferAttribute(new Float32Array(6), 2));
+  geomSize2.setAttribute("position", new THREE.BufferAttribute(new Float32Array(9), 3));
+  geomSize2.setAttribute("color", new THREE.BufferAttribute(new Float32Array(6), 2));
   const meshSize2 = new THREE.Mesh(geomSize2, new THREE.MeshBasicMaterial({ vertexColors: true }));
   const resSize2 = canAdmitMesh(meshSize2, camera);
   assert.equal(resSize2.admitted, false);
-  assert.equal(resSize2.code, 'INVALID_COLOR_ATTRIBUTE');
+  assert.equal(resSize2.code, "INVALID_COLOR_ATTRIBUTE");
 
   // 5. Mismatched vertex count (fewer colors than positions)
   const geomShort = new THREE.BufferGeometry();
-  geomShort.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
-  geomShort.setAttribute('color', new THREE.BufferAttribute(new Float32Array(6), 3));
+  geomShort.setAttribute("position", new THREE.BufferAttribute(new Float32Array(9), 3));
+  geomShort.setAttribute("color", new THREE.BufferAttribute(new Float32Array(6), 3));
   const meshShort = new THREE.Mesh(geomShort, new THREE.MeshBasicMaterial({ vertexColors: true }));
   const resShort = canAdmitMesh(meshShort, camera);
   assert.equal(resShort.admitted, false);
-  assert.equal(resShort.code, 'INVALID_COLOR_ATTRIBUTE');
+  assert.equal(resShort.code, "INVALID_COLOR_ATTRIBUTE");
 });
 
-test('vertexColors: Wasm export missing strictly refuses with INCOMPATIBLE_VERTEX_COLORS', async () => {
+test("vertexColors: Wasm export missing strictly refuses with INCOMPATIBLE_VERTEX_COLORS", async () => {
   const camera = createBasicCamera();
   const geom = new THREE.BufferGeometry();
-  geom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
-  geom.setAttribute('color', new THREE.BufferAttribute(new Float32Array(9), 3));
+  geom.setAttribute("position", new THREE.BufferAttribute(new Float32Array(9), 3));
+  geom.setAttribute("color", new THREE.BufferAttribute(new Float32Array(9), 3));
   const mesh = new THREE.Mesh(geom, new THREE.MeshBasicMaterial({ vertexColors: true }));
   // wasmModule has only cull_depth_color export, missing f3d_build_mesh_batch_vertex_color_packet
   const mockWasm = {
@@ -4190,104 +5029,119 @@ test('vertexColors: Wasm export missing strictly refuses with INCOMPATIBLE_VERTE
 
   assert.throws(
     () => prepareMeshPacket(mesh, camera, 64, 64, mockWasm),
-    (err) => err.reason === 'INCOMPATIBLE_VERTEX_COLORS'
+    (err) => err.reason === "INCOMPATIBLE_VERTEX_COLORS",
   );
 
   assert.throws(
     () => prepareMeshBatchPacket([mesh], camera, 64, 64, mockWasm),
-    (err) => err.reason === 'INCOMPATIBLE_VERTEX_COLORS'
+    (err) => err.reason === "INCOMPATIBLE_VERTEX_COLORS",
   );
 
   const mockHost = {
-    executePacket: async () => ({ status: 'OK' }),
+    executePacket: async () => ({ status: "OK" }),
   };
   await assert.rejects(
     async () => renderMesh(mockHost, mesh, camera, null, mockWasm),
-    (err) => err.reason === 'INCOMPATIBLE_VERTEX_COLORS'
+    (err) => err.reason === "INCOMPATIBLE_VERTEX_COLORS",
   );
 });
 
-test('vertexColors: absent vertexColors flag preserves old exports and packet bytes', () => {
+test("vertexColors: absent vertexColors flag preserves old exports and packet bytes", () => {
   const camera = createBasicCamera();
   const mesh = createBasicTriangleMesh(); // vertexColors absent/false
   let calledExport = null;
   const mockWasm = {
     f3d_build_mesh_batch_cull_depth_color_packet: () => {
-      calledExport = 'cull_depth_color';
+      calledExport = "cull_depth_color";
       return new Uint8Array([0xaa, 0xbb]);
     },
     f3d_build_mesh_batch_vertex_color_packet: () => {
-      calledExport = 'vertex_color';
+      calledExport = "vertex_color";
       return new Uint8Array([0x11, 0x22]);
     },
   };
 
   const res = prepareMeshBatchPacket([mesh], camera, 64, 64, mockWasm);
   // Must call old export and return old bytes
-  assert.equal(calledExport, 'cull_depth_color');
+  assert.equal(calledExport, "cull_depth_color");
   assert.deepEqual(res.packetBytes, new Uint8Array([0xaa, 0xbb]));
 });
 
-test('vertexColors: non-indexed mesh extracts Float32 RGB, RGBA, and normalized Uint8 correctly', () => {
+test("vertexColors: non-indexed mesh extracts Float32 RGB, RGBA, and normalized Uint8 correctly", () => {
   const camera = createBasicCamera();
 
   // 1. Float32 RGB (itemSize 3) -> alpha defaults to 1.0
   const geomRgb = new THREE.BufferGeometry();
-  geomRgb.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
-  geomRgb.setAttribute('color', new THREE.BufferAttribute(new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]), 3));
+  geomRgb.setAttribute("position", new THREE.BufferAttribute(new Float32Array(9), 3));
+  geomRgb.setAttribute(
+    "color",
+    new THREE.BufferAttribute(new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]), 3),
+  );
   const meshRgb = new THREE.Mesh(geomRgb, new THREE.MeshBasicMaterial({ vertexColors: true }));
   const snapRgb = extractMeshRenderData(meshRgb, camera, 64, 64);
   assert.equal(snapRgb.vertexColors, true);
   assert.equal(snapRgb.hasVertexColors, true);
-  assert.deepEqual(Array.from(snapRgb.expandedVertexColors), [
-    1, 0, 0, 1,
-    0, 1, 0, 1,
-    0, 0, 1, 1,
-  ]);
+  assert.deepEqual(Array.from(snapRgb.expandedVertexColors), [1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1]);
 
   // 2. Float32 RGBA (itemSize 4) -> Three.js OPAQUE shader forces output alpha to 1.0
   const geomRgba = new THREE.BufferGeometry();
-  geomRgba.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
-  geomRgba.setAttribute('color', new THREE.BufferAttribute(new Float32Array([1, 0.5, 0.25, 0.75, 0, 1, 0, 0.5, 0.125, 0.25, 0.5, 0.875]), 4));
+  geomRgba.setAttribute("position", new THREE.BufferAttribute(new Float32Array(9), 3));
+  geomRgba.setAttribute(
+    "color",
+    new THREE.BufferAttribute(
+      new Float32Array([1, 0.5, 0.25, 0.75, 0, 1, 0, 0.5, 0.125, 0.25, 0.5, 0.875]),
+      4,
+    ),
+  );
   const meshRgba = new THREE.Mesh(geomRgba, new THREE.MeshBasicMaterial({ vertexColors: true }));
   const snapRgba = extractMeshRenderData(meshRgba, camera, 64, 64);
   assert.equal(snapRgba.hasVertexColors, true);
-  assert.deepEqual(Array.from(snapRgba.expandedVertexColors), [
-    1, 0.5, 0.25, 1,
-    0, 1, 0, 1,
-    0.125, 0.25, 0.5, 1,
-  ]);
+  assert.deepEqual(
+    Array.from(snapRgba.expandedVertexColors),
+    [1, 0.5, 0.25, 1, 0, 1, 0, 1, 0.125, 0.25, 0.5, 1],
+  );
 
   // 3. Uint8 normalized RGB -> normalized via getX/getY/getZ
   const geomU8 = new THREE.BufferGeometry();
-  geomU8.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
-  geomU8.setAttribute('color', new THREE.BufferAttribute(new Uint8Array([255, 0, 0, 0, 255, 0, 0, 0, 255]), 3, true));
+  geomU8.setAttribute("position", new THREE.BufferAttribute(new Float32Array(9), 3));
+  geomU8.setAttribute(
+    "color",
+    new THREE.BufferAttribute(new Uint8Array([255, 0, 0, 0, 255, 0, 0, 0, 255]), 3, true),
+  );
   const meshU8 = new THREE.Mesh(geomU8, new THREE.MeshBasicMaterial({ vertexColors: true }));
   const snapU8 = extractMeshRenderData(meshU8, camera, 64, 64);
   assert.equal(snapU8.hasVertexColors, true);
-  assert.deepEqual(Array.from(snapU8.expandedVertexColors), [
-    1, 0, 0, 1,
-    0, 1, 0, 1,
-    0, 0, 1, 1,
-  ]);
+  assert.deepEqual(Array.from(snapU8.expandedVertexColors), [1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1]);
 });
 
-test('vertexColors: indexed mesh expands colors matching selected vertex indices and drawRange', () => {
+test("vertexColors: indexed mesh expands colors matching selected vertex indices and drawRange", () => {
   const camera = createBasicCamera();
   const geom = new THREE.BufferGeometry();
   // 4 vertices: V0(red), V1(green), V2(blue), V3(yellow)
-  geom.setAttribute('position', new THREE.BufferAttribute(new Float32Array([
-    0, 0, 0,
-    1, 0, 0,
-    1, 1, 0,
-    0, 1, 0,
-  ]), 3));
-  geom.setAttribute('color', new THREE.BufferAttribute(new Float32Array([
-    1, 0, 0, // V0 Red
-    0, 1, 0, // V1 Green
-    0, 0, 1, // V2 Blue
-    1, 1, 0, // V3 Yellow
-  ]), 3));
+  geom.setAttribute(
+    "position",
+    new THREE.BufferAttribute(new Float32Array([0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0]), 3),
+  );
+  geom.setAttribute(
+    "color",
+    new THREE.BufferAttribute(
+      new Float32Array([
+        1,
+        0,
+        0, // V0 Red
+        0,
+        1,
+        0, // V1 Green
+        0,
+        0,
+        1, // V2 Blue
+        1,
+        1,
+        0, // V3 Yellow
+      ]),
+      3,
+    ),
+  );
   // 2 triangles: T1: [0, 1, 2], T2: [0, 2, 3]
   geom.setIndex(new THREE.BufferAttribute(new Uint32Array([0, 1, 2, 0, 2, 3]), 1));
   const mesh = new THREE.Mesh(geom, new THREE.MeshBasicMaterial({ vertexColors: true }));
@@ -4295,56 +5149,110 @@ test('vertexColors: indexed mesh expands colors matching selected vertex indices
   // Full indexed expansion
   const snap = extractMeshRenderData(mesh, camera, 64, 64);
   assert.deepEqual(Array.from(snap.expandedVertexColors), [
-    1, 0, 0, 1, // V0
-    0, 1, 0, 1, // V1
-    0, 0, 1, 1, // V2
-    1, 0, 0, 1, // V0
-    0, 0, 1, 1, // V2
-    1, 1, 0, 1, // V3
+    1,
+    0,
+    0,
+    1, // V0
+    0,
+    1,
+    0,
+    1, // V1
+    0,
+    0,
+    1,
+    1, // V2
+    1,
+    0,
+    0,
+    1, // V0
+    0,
+    0,
+    1,
+    1, // V2
+    1,
+    1,
+    0,
+    1, // V3
   ]);
 
   // With drawRange: start=3, count=3 (second triangle only [0, 2, 3])
   geom.setDrawRange(3, 3);
   const snapRange = extractMeshRenderData(mesh, camera, 64, 64);
   assert.deepEqual(Array.from(snapRange.expandedVertexColors), [
-    1, 0, 0, 1, // V0
-    0, 0, 1, 1, // V2
-    1, 1, 0, 1, // V3
+    1,
+    0,
+    0,
+    1, // V0
+    0,
+    0,
+    1,
+    1, // V2
+    1,
+    1,
+    0,
+    1, // V3
   ]);
 });
 
-test('vertexColors: batch with mixed colored and uncolored meshes fills uncolored with white, refuses missing color attribute', () => {
+test("vertexColors: batch with mixed colored and uncolored meshes fills uncolored with white, refuses missing color attribute", () => {
   const camera = createBasicCamera();
 
   // Mesh 1: vertexColors=true with RGB
   const geom1 = new THREE.BufferGeometry();
-  geom1.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
-  geom1.setAttribute('color', new THREE.BufferAttribute(new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]), 3));
-  const mesh1 = new THREE.Mesh(geom1, new THREE.MeshBasicMaterial({
-    color: 0xff0000,
-    vertexColors: true,
-  }));
+  geom1.setAttribute("position", new THREE.BufferAttribute(new Float32Array(9), 3));
+  geom1.setAttribute(
+    "color",
+    new THREE.BufferAttribute(new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]), 3),
+  );
+  const mesh1 = new THREE.Mesh(
+    geom1,
+    new THREE.MeshBasicMaterial({
+      color: 0xff0000,
+      vertexColors: true,
+    }),
+  );
 
   // Mesh 2: vertexColors=false (uncolored, default white fallback)
   const geom2 = new THREE.BufferGeometry();
-  geom2.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
-  const mesh2 = new THREE.Mesh(geom2, new THREE.MeshBasicMaterial({
-    color: 0x00ff00,
-    vertexColors: false,
-  }));
+  geom2.setAttribute("position", new THREE.BufferAttribute(new Float32Array(9), 3));
+  const mesh2 = new THREE.Mesh(
+    geom2,
+    new THREE.MeshBasicMaterial({
+      color: 0x00ff00,
+      vertexColors: false,
+    }),
+  );
 
   // Mesh 3: vertexColors=false (uncolored blue)
   const geom3 = new THREE.BufferGeometry();
-  geom3.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
-  const mesh3 = new THREE.Mesh(geom3, new THREE.MeshBasicMaterial({
-    color: 0x0000ff,
-    vertexColors: false,
-  }));
+  geom3.setAttribute("position", new THREE.BufferAttribute(new Float32Array(9), 3));
+  const mesh3 = new THREE.Mesh(
+    geom3,
+    new THREE.MeshBasicMaterial({
+      color: 0x0000ff,
+      vertexColors: false,
+    }),
+  );
 
   let capturedArgs = null;
   const mockWasm = {
     f3d_build_mesh_batch_vertex_color_packet: (
-      flatPos, vCounts, mvs, proj, cols, cModes, fFaces, dTests, dWrites, dCompares, cWrites, w, h, sWebglDepth, isCanvas, flatColors
+      flatPos,
+      vCounts,
+      mvs,
+      proj,
+      cols,
+      cModes,
+      fFaces,
+      dTests,
+      dWrites,
+      dCompares,
+      cWrites,
+      w,
+      h,
+      sWebglDepth,
+      isCanvas,
+      flatColors,
     ) => {
       capturedArgs = { flatPos, vCounts, cols, flatColors };
       return new Uint8Array([0x56, 0x43]);
@@ -4356,23 +5264,20 @@ test('vertexColors: batch with mixed colored and uncolored meshes fills uncolore
   assert.equal(capturedArgs.flatColors.length, 36); // 9 vertices total * 4 RGBA = 36 floats
 
   // Mesh 1 (first 12 floats): vertex colors
-  assert.deepEqual(Array.from(capturedArgs.flatColors.slice(0, 12)), [
-    1, 0, 0, 1,
-    0, 1, 0, 1,
-    0, 0, 1, 1,
-  ]);
+  assert.deepEqual(
+    Array.from(capturedArgs.flatColors.slice(0, 12)),
+    [1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1],
+  );
   // Mesh 2 (next 12 floats): all white [1, 1, 1, 1]
-  assert.deepEqual(Array.from(capturedArgs.flatColors.slice(12, 24)), [
-    1, 1, 1, 1,
-    1, 1, 1, 1,
-    1, 1, 1, 1,
-  ]);
+  assert.deepEqual(
+    Array.from(capturedArgs.flatColors.slice(12, 24)),
+    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+  );
   // Mesh 3 (last 12 floats): all white [1, 1, 1, 1]
-  assert.deepEqual(Array.from(capturedArgs.flatColors.slice(24, 36)), [
-    1, 1, 1, 1,
-    1, 1, 1, 1,
-    1, 1, 1, 1,
-  ]);
+  assert.deepEqual(
+    Array.from(capturedArgs.flatColors.slice(24, 36)),
+    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+  );
   // Material colors: 3 meshes * 4 RGBA floats
   assert.equal(capturedArgs.cols.length, 12);
   assert.equal(capturedArgs.cols[0], 1); // mesh 1 red
@@ -4381,32 +5286,38 @@ test('vertexColors: batch with mixed colored and uncolored meshes fills uncolore
 
   // Batch containing mesh with vertexColors=true and missing color attribute is refused
   const geomMissing = new THREE.BufferGeometry();
-  geomMissing.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
-  const meshMissing = new THREE.Mesh(geomMissing, new THREE.MeshBasicMaterial({ vertexColors: true }));
+  geomMissing.setAttribute("position", new THREE.BufferAttribute(new Float32Array(9), 3));
+  const meshMissing = new THREE.Mesh(
+    geomMissing,
+    new THREE.MeshBasicMaterial({ vertexColors: true }),
+  );
   assert.throws(
     () => prepareMeshBatchPacket([mesh1, meshMissing], camera, 64, 64, mockWasm),
-    (err) => err.reason === 'MISSING_COLOR_ATTRIBUTE'
+    (err) => err.reason === "MISSING_COLOR_ATTRIBUTE",
   );
 });
 
-test('vertexColors: renderScene admits mixed vertexColors meshes with export and refuses when missing', async () => {
+test("vertexColors: renderScene admits mixed vertexColors meshes with export and refuses when missing", async () => {
   const scene = new THREE.Scene();
   const camera = createBasicCamera();
 
   const geom1 = new THREE.BufferGeometry();
-  geom1.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
-  geom1.setAttribute('color', new THREE.BufferAttribute(new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]), 3));
+  geom1.setAttribute("position", new THREE.BufferAttribute(new Float32Array(9), 3));
+  geom1.setAttribute(
+    "color",
+    new THREE.BufferAttribute(new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]), 3),
+  );
   const mesh1 = new THREE.Mesh(geom1, new THREE.MeshBasicMaterial({ vertexColors: true }));
 
   const geom2 = new THREE.BufferGeometry();
-  geom2.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
+  geom2.setAttribute("position", new THREE.BufferAttribute(new Float32Array(9), 3));
   const mesh2 = new THREE.Mesh(geom2, new THREE.MeshBasicMaterial({ vertexColors: false }));
 
   scene.add(mesh1);
   scene.add(mesh2);
 
   const mockHost = {
-    executePacket: async () => ({ status: 'OK' }),
+    executePacket: async () => ({ status: "OK" }),
   };
 
   // 1. When export is missing: refuses whole submission
@@ -4416,7 +5327,7 @@ test('vertexColors: renderScene admits mixed vertexColors meshes with export and
   const resMissing = await renderScene(mockHost, scene, camera, null, mockWasmMissing);
   assert.equal(resMissing.admitted.length, 0);
   assert.equal(resMissing.refused.length, 1);
-  assert.equal(resMissing.refused[0].code, 'INCOMPATIBLE_VERTEX_COLORS');
+  assert.equal(resMissing.refused[0].code, "INCOMPATIBLE_VERTEX_COLORS");
 
   // 2. When export is present: admits both meshes
   const mockWasmPresent = {
@@ -4427,23 +5338,37 @@ test('vertexColors: renderScene admits mixed vertexColors meshes with export and
   assert.equal(resPresent.refused.length, 0);
 });
 
-test('vertexColors: color attribute residency keeps GPU-stale shadow without needsUpdate and updates on bump', async () => {
+test("vertexColors: color attribute residency keeps GPU-stale shadow without needsUpdate and updates on bump", async () => {
   const camera = createBasicCamera();
   const geom = new THREE.BufferGeometry();
-  geom.setAttribute('position', new THREE.BufferAttribute(new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]), 3));
-  const colorArray = new Float32Array([
-    1, 0, 0,
-    0, 1, 0,
-    0, 0, 1,
-  ]);
+  geom.setAttribute(
+    "position",
+    new THREE.BufferAttribute(new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]), 3),
+  );
+  const colorArray = new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]);
   const colorAttr = new THREE.BufferAttribute(colorArray, 3);
-  geom.setAttribute('color', colorAttr);
+  geom.setAttribute("color", colorAttr);
   const mesh = new THREE.Mesh(geom, new THREE.MeshBasicMaterial({ vertexColors: true }));
 
   let capturedColors = null;
   const mockWasm = {
     f3d_build_mesh_batch_vertex_color_packet: (
-      flatPos, vCounts, mvs, proj, cols, cModes, fFaces, dTests, dWrites, dCompares, cWrites, w, h, sWebglDepth, isCanvas, flatColors
+      flatPos,
+      vCounts,
+      mvs,
+      proj,
+      cols,
+      cModes,
+      fFaces,
+      dTests,
+      dWrites,
+      dCompares,
+      cWrites,
+      w,
+      h,
+      sWebglDepth,
+      isCanvas,
+      flatColors,
     ) => {
       capturedColors = Array.from(flatColors);
       return new Uint8Array([0x01]);
@@ -4456,8 +5381,8 @@ test('vertexColors: color attribute residency keeps GPU-stale shadow without nee
     device: {},
     executePacket: async (bytes, ctx, onSubmitted) => {
       submitCount++;
-      if (typeof onSubmitted === 'function') onSubmitted();
-      return { status: 'OK' };
+      if (typeof onSubmitted === "function") onSubmitted();
+      return { status: "OK" };
     },
   };
 
@@ -4491,7 +5416,7 @@ test('vertexColors: color attribute residency keeps GPU-stale shadow without nee
   assert.equal(capturedColors[0], 0.5);
 });
 
-test('Regression: new export-only (vertex_color only) uncolored colorWrite/depth must not get admitted then call undefined legacy export', async () => {
+test("Regression: new export-only (vertex_color only) uncolored colorWrite/depth must not get admitted then call undefined legacy export", async () => {
   const camera = createBasicCamera();
   // wasmModule has ONLY f3d_build_mesh_batch_vertex_color_packet
   const mockWasm = {
@@ -4502,7 +5427,7 @@ test('Regression: new export-only (vertex_color only) uncolored colorWrite/depth
   const uncoloredMeshColorWrite = createBasicTriangleMesh({ colorWrite: false });
   assert.throws(
     () => prepareMeshBatchPacket([uncoloredMeshColorWrite], camera, 64, 64, mockWasm),
-    (err) => err.reason === 'INCOMPATIBLE_COLOR_WRITE'
+    (err) => err.reason === "INCOMPATIBLE_COLOR_WRITE",
   );
 
   // 2. Uncolored meshes with mixed depth in prepareMeshBatchPacket
@@ -4510,16 +5435,16 @@ test('Regression: new export-only (vertex_color only) uncolored colorWrite/depth
   const uncoloredDepth2 = createBasicTriangleMesh({ depthTest: false, depthWrite: false });
   assert.throws(
     () => prepareMeshBatchPacket([uncoloredDepth1, uncoloredDepth2], camera, 64, 64, mockWasm),
-    (err) => err.reason === 'INCOMPATIBLE_BATCH_DEPTH'
+    (err) => err.reason === "INCOMPATIBLE_BATCH_DEPTH",
   );
 
   // 3. Uncolored mesh with colorWrite = false in renderMesh canvas preflight
   const mockHost = {
-    executePacket: async () => ({ status: 'OK' }),
+    executePacket: async () => ({ status: "OK" }),
   };
   await assert.rejects(
     async () => renderMesh(mockHost, uncoloredMeshColorWrite, camera, { canvas: {} }, mockWasm),
-    (err) => err.reason === 'INCOMPATIBLE_COLOR_WRITE'
+    (err) => err.reason === "INCOMPATIBLE_COLOR_WRITE",
   );
 
   // 4. Uncolored mesh with colorWrite = false in renderScene
@@ -4528,7 +5453,7 @@ test('Regression: new export-only (vertex_color only) uncolored colorWrite/depth
   const resSceneColor = await renderScene(mockHost, sceneColor, camera, null, mockWasm);
   assert.equal(resSceneColor.admitted.length, 0);
   assert.equal(resSceneColor.refused.length, 1);
-  assert.equal(resSceneColor.refused[0].code, 'INCOMPATIBLE_COLOR_WRITE');
+  assert.equal(resSceneColor.refused[0].code, "INCOMPATIBLE_COLOR_WRITE");
 
   // 5. Uncolored meshes with mixed depth in renderScene
   const sceneDepth = new THREE.Scene();
@@ -4537,22 +5462,20 @@ test('Regression: new export-only (vertex_color only) uncolored colorWrite/depth
   const resSceneDepth = await renderScene(mockHost, sceneDepth, camera, null, mockWasm);
   assert.equal(resSceneDepth.admitted.length, 0);
   assert.equal(resSceneDepth.refused.length, 1);
-  assert.equal(resSceneDepth.refused[0].code, 'INCOMPATIBLE_BATCH_DEPTH');
+  assert.equal(resSceneDepth.refused[0].code, "INCOMPATIBLE_BATCH_DEPTH");
 });
 
-test('Interleaved attributes: (a) interleaved position produces expected vertex floats and identical packet payload under mock Wasm export', () => {
+test("Interleaved attributes: (a) interleaved position produces expected vertex floats and identical packet payload under mock Wasm export", () => {
   const camera = createBasicCamera();
   const interleavedData = new Float32Array([
-    1, 2, 3, 0, 1, 0, 0.1, 0.2,
-    4, 5, 6, 0, 1, 0, 0.3, 0.4,
-    7, 8, 9, 0, 1, 0, 0.5, 0.6,
+    1, 2, 3, 0, 1, 0, 0.1, 0.2, 4, 5, 6, 0, 1, 0, 0.3, 0.4, 7, 8, 9, 0, 1, 0, 0.5, 0.6,
   ]);
   const ib = new THREE.InterleavedBuffer(interleavedData, 8);
   const posAttr = new THREE.InterleavedBufferAttribute(ib, 3, 0, false);
   const normAttr = new THREE.InterleavedBufferAttribute(ib, 3, 3, false);
   const geomInter = new THREE.BufferGeometry();
-  geomInter.setAttribute('position', posAttr);
-  geomInter.setAttribute('normal', normAttr);
+  geomInter.setAttribute("position", posAttr);
+  geomInter.setAttribute("normal", normAttr);
   const matProps = { side: THREE.DoubleSide, depthTest: false, depthWrite: false };
   const meshInter = new THREE.Mesh(geomInter, new THREE.MeshBasicMaterial(matProps));
 
@@ -4563,59 +5486,114 @@ test('Interleaved attributes: (a) interleaved position produces expected vertex 
   assert.deepEqual(snapshot.expandedPositions, expectedPositions);
 
   const geomPlain = new THREE.BufferGeometry();
-  geomPlain.setAttribute('position', new THREE.BufferAttribute(new Float32Array(expectedPositions), 3));
+  geomPlain.setAttribute(
+    "position",
+    new THREE.BufferAttribute(new Float32Array(expectedPositions), 3),
+  );
   const meshPlain = new THREE.Mesh(geomPlain, new THREE.MeshBasicMaterial(matProps));
   // Note: mockWasm verifies that the adapter forwards identical float arrays to the Wasm
   // export function; it tests adapter extraction and export routing, not Rust packet binary equivalence.
   const mockWasm = {
-    f3d_build_mesh_packet: (pos) => new Uint8Array(pos.buffer.slice(pos.byteOffset, pos.byteOffset + pos.byteLength)),
+    f3d_build_mesh_packet: (pos) =>
+      new Uint8Array(pos.buffer.slice(pos.byteOffset, pos.byteOffset + pos.byteLength)),
   };
   const packetInter = prepareMeshPacket(meshInter, camera, 64, 64, mockWasm);
   const packetPlain = prepareMeshPacket(meshPlain, camera, 64, 64, mockWasm);
   assert.deepEqual(packetInter.packetBytes, packetPlain.packetBytes);
 });
 
-test('Interleaved attributes: (b) shared Float32 pos+color and normalized Uint8 color extract expected floats', () => {
+test("Interleaved attributes: (b) shared Float32 pos+color and normalized Uint8 color extract expected floats", () => {
   const camera = createBasicCamera();
-  const sharedData = new Float32Array([0, 1, 2, 1, 0, 0, 0.5, 3, 4, 5, 0, 1, 0, 0.5, 6, 7, 8, 0, 0, 1, 0.5]);
+  const sharedData = new Float32Array([
+    0, 1, 2, 1, 0, 0, 0.5, 3, 4, 5, 0, 1, 0, 0.5, 6, 7, 8, 0, 0, 1, 0.5,
+  ]);
   const sharedIb = new THREE.InterleavedBuffer(sharedData, 7);
   const geomShared = new THREE.BufferGeometry();
-  geomShared.setAttribute('position', new THREE.InterleavedBufferAttribute(sharedIb, 3, 0));
-  geomShared.setAttribute('color', new THREE.InterleavedBufferAttribute(sharedIb, 4, 3));
-  const meshShared = new THREE.Mesh(geomShared, new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide }));
+  geomShared.setAttribute("position", new THREE.InterleavedBufferAttribute(sharedIb, 3, 0));
+  geomShared.setAttribute("color", new THREE.InterleavedBufferAttribute(sharedIb, 4, 3));
+  const meshShared = new THREE.Mesh(
+    geomShared,
+    new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide }),
+  );
   assert.equal(canAdmitMesh(meshShared, camera).admitted, true);
 
   const snapShared = extractMeshRenderData(meshShared, camera, 64, 64);
   assert.deepEqual(snapShared.positions, new Float32Array([0, 1, 2, 3, 4, 5, 6, 7, 8]));
-  assert.deepEqual(snapShared.expandedVertexColors, new Float32Array([1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1]));
+  assert.deepEqual(
+    snapShared.expandedVertexColors,
+    new Float32Array([1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1]),
+  );
 
   const u8Data = new Uint8Array([255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255]);
   const geomU8 = new THREE.BufferGeometry();
-  geomU8.setAttribute('position', new THREE.BufferAttribute(new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]), 3));
-  geomU8.setAttribute('color', new THREE.InterleavedBufferAttribute(new THREE.InterleavedBuffer(u8Data, 4), 4, 0, true));
-  const meshU8 = new THREE.Mesh(geomU8, new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide }));
+  geomU8.setAttribute(
+    "position",
+    new THREE.BufferAttribute(new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]), 3),
+  );
+  geomU8.setAttribute(
+    "color",
+    new THREE.InterleavedBufferAttribute(new THREE.InterleavedBuffer(u8Data, 4), 4, 0, true),
+  );
+  const meshU8 = new THREE.Mesh(
+    geomU8,
+    new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide }),
+  );
   assert.equal(canAdmitMesh(meshU8, camera).admitted, true);
   const snapU8 = extractMeshRenderData(meshU8, camera, 64, 64);
-  assert.deepEqual(snapU8.expandedVertexColors, new Float32Array([1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1]));
+  assert.deepEqual(
+    snapU8.expandedVertexColors,
+    new Float32Array([1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1]),
+  );
 });
 
-test('Interleaved attributes: (c) shared holder residency re-uploads once on needsUpdate and keeps GPU-stale on unbumped edit', async () => {
+test("Interleaved attributes: (c) shared holder residency re-uploads once on needsUpdate and keeps GPU-stale on unbumped edit", async () => {
   const camera = createBasicCamera();
-  const sharedIb = new THREE.InterleavedBuffer(new Float32Array([1, 1, 1, 0.25, 0.25, 0.25, 1, 2, 2, 2, 0.5, 0.5, 0.5, 1, 3, 3, 3, 0.75, 0.75, 0.75, 1]), 7);
+  const sharedIb = new THREE.InterleavedBuffer(
+    new Float32Array([
+      1, 1, 1, 0.25, 0.25, 0.25, 1, 2, 2, 2, 0.5, 0.5, 0.5, 1, 3, 3, 3, 0.75, 0.75, 0.75, 1,
+    ]),
+    7,
+  );
   const geom = new THREE.BufferGeometry();
-  geom.setAttribute('position', new THREE.InterleavedBufferAttribute(sharedIb, 3, 0));
-  geom.setAttribute('color', new THREE.InterleavedBufferAttribute(sharedIb, 4, 3));
-  const mesh = new THREE.Mesh(geom, new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide }));
+  geom.setAttribute("position", new THREE.InterleavedBufferAttribute(sharedIb, 3, 0));
+  geom.setAttribute("color", new THREE.InterleavedBufferAttribute(sharedIb, 4, 3));
+  const mesh = new THREE.Mesh(
+    geom,
+    new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide }),
+  );
 
-  let capturedPos = null, capturedColors = null;
+  let capturedPos = null,
+    capturedColors = null;
   const mockWasm = {
-    f3d_build_mesh_batch_vertex_color_packet: (pos, _c, _mv, _p, _col, _cm, _ff, _dt, _dw, _dc, _cw, _w, _h, _d, _cv, vcol) => {
+    f3d_build_mesh_batch_vertex_color_packet: (
+      pos,
+      _c,
+      _mv,
+      _p,
+      _col,
+      _cm,
+      _ff,
+      _dt,
+      _dw,
+      _dc,
+      _cw,
+      _w,
+      _h,
+      _d,
+      _cv,
+      vcol,
+    ) => {
       capturedPos = pos.slice();
       capturedColors = vcol.slice();
       return new Uint8Array([0x01]);
     },
   };
-  const mockHost = { executePacket: async (_p, _c, onSubmitted) => { onSubmitted?.(); return { status: 'OK' }; } };
+  const mockHost = {
+    executePacket: async (_p, _c, onSubmitted) => {
+      onSubmitted?.();
+      return { status: "OK" };
+    },
+  };
 
   await renderMesh(mockHost, mesh, camera, null, mockWasm);
   assert.equal(capturedPos[0], 1);
@@ -4633,23 +5611,55 @@ test('Interleaved attributes: (c) shared holder residency re-uploads once on nee
   assert.equal(capturedColors[0], 0.5);
 });
 
-test('Interleaved attributes: (d) partial data.updateRanges uploads only modified range on InterleavedBuffer', async () => {
+test("Interleaved attributes: (d) partial data.updateRanges uploads only modified range on InterleavedBuffer", async () => {
   const camera = createBasicCamera();
-  const sharedIb = new THREE.InterleavedBuffer(new Float32Array([10, 20, 30, 0.125, 0.25, 0.375, 1, 40, 50, 60, 0.5, 0.625, 0.75, 1, 70, 80, 90, 0.875, 0.25, 0.5, 1]), 7);
+  const sharedIb = new THREE.InterleavedBuffer(
+    new Float32Array([
+      10, 20, 30, 0.125, 0.25, 0.375, 1, 40, 50, 60, 0.5, 0.625, 0.75, 1, 70, 80, 90, 0.875, 0.25,
+      0.5, 1,
+    ]),
+    7,
+  );
   const geom = new THREE.BufferGeometry();
-  geom.setAttribute('position', new THREE.InterleavedBufferAttribute(sharedIb, 3, 0));
-  geom.setAttribute('color', new THREE.InterleavedBufferAttribute(sharedIb, 4, 3));
-  const mesh = new THREE.Mesh(geom, new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide }));
+  geom.setAttribute("position", new THREE.InterleavedBufferAttribute(sharedIb, 3, 0));
+  geom.setAttribute("color", new THREE.InterleavedBufferAttribute(sharedIb, 4, 3));
+  const mesh = new THREE.Mesh(
+    geom,
+    new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide }),
+  );
 
-  let capturedPos = null, capturedColors = null;
+  let capturedPos = null,
+    capturedColors = null;
   const mockWasm = {
-    f3d_build_mesh_batch_vertex_color_packet: (pos, _c, _mv, _p, _col, _cm, _ff, _dt, _dw, _dc, _cw, _w, _h, _d, _cv, vcol) => {
+    f3d_build_mesh_batch_vertex_color_packet: (
+      pos,
+      _c,
+      _mv,
+      _p,
+      _col,
+      _cm,
+      _ff,
+      _dt,
+      _dw,
+      _dc,
+      _cw,
+      _w,
+      _h,
+      _d,
+      _cv,
+      vcol,
+    ) => {
       capturedPos = pos.slice();
       capturedColors = vcol.slice();
       return new Uint8Array([0x01]);
     },
   };
-  const mockHost = { executePacket: async (_p, _c, onSubmitted) => { onSubmitted?.(); return { status: 'OK' }; } };
+  const mockHost = {
+    executePacket: async (_p, _c, onSubmitted) => {
+      onSubmitted?.();
+      return { status: "OK" };
+    },
+  };
 
   await renderMesh(mockHost, mesh, camera, null, mockWasm);
   assert.equal(capturedPos[0], 10);
@@ -4665,52 +5675,76 @@ test('Interleaved attributes: (d) partial data.updateRanges uploads only modifie
   assert.equal(sharedIb.updateRanges.length, 0);
 });
 
-test('Interleaved attributes: (e) refuses instanced attributes, interleaved index, normalized position, and custom onUpload', () => {
+test("Interleaved attributes: (e) refuses instanced attributes, interleaved index, normalized position, and custom onUpload", () => {
   const camera = createBasicCamera();
   const mat = new THREE.MeshBasicMaterial({ side: THREE.DoubleSide });
 
   // 1. InstancedBufferAttribute
   const g1 = new THREE.BufferGeometry();
-  g1.setAttribute('position', new THREE.InstancedBufferAttribute(new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]), 3));
-  assert.equal(canAdmitMesh(new THREE.Mesh(g1, mat), camera).code, 'UNSUPPORTED_ATTRIBUTE');
+  g1.setAttribute(
+    "position",
+    new THREE.InstancedBufferAttribute(new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]), 3),
+  );
+  assert.equal(canAdmitMesh(new THREE.Mesh(g1, mat), camera).code, "UNSUPPORTED_ATTRIBUTE");
 
   // 2. InstancedInterleavedBuffer
   const g2 = new THREE.BufferGeometry();
-  g2.setAttribute('position', new THREE.InterleavedBufferAttribute(new THREE.InstancedInterleavedBuffer(new Float32Array(9), 3), 3, 0));
-  assert.equal(canAdmitMesh(new THREE.Mesh(g2, mat), camera).code, 'UNSUPPORTED_ATTRIBUTE');
+  g2.setAttribute(
+    "position",
+    new THREE.InterleavedBufferAttribute(
+      new THREE.InstancedInterleavedBuffer(new Float32Array(9), 3),
+      3,
+      0,
+    ),
+  );
+  assert.equal(canAdmitMesh(new THREE.Mesh(g2, mat), camera).code, "UNSUPPORTED_ATTRIBUTE");
 
   // 3. Interleaved index buffer
   const g3 = new THREE.BufferGeometry();
-  g3.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
-  g3.setIndex(new THREE.InterleavedBufferAttribute(new THREE.InterleavedBuffer(new Uint16Array([0, 1, 2]), 1), 1, 0));
-  assert.equal(canAdmitMesh(new THREE.Mesh(g3, mat), camera).code, 'UNSUPPORTED_ATTRIBUTE');
+  g3.setAttribute("position", new THREE.BufferAttribute(new Float32Array(9), 3));
+  g3.setIndex(
+    new THREE.InterleavedBufferAttribute(
+      new THREE.InterleavedBuffer(new Uint16Array([0, 1, 2]), 1),
+      1,
+      0,
+    ),
+  );
+  assert.equal(canAdmitMesh(new THREE.Mesh(g3, mat), camera).code, "UNSUPPORTED_ATTRIBUTE");
 
   // 4. Normalized position on InterleavedBufferAttribute
   const g4 = new THREE.BufferGeometry();
-  g4.setAttribute('position', new THREE.InterleavedBufferAttribute(new THREE.InterleavedBuffer(new Float32Array(9), 3), 3, 0, true));
-  assert.equal(canAdmitMesh(new THREE.Mesh(g4, mat), camera).code, 'UNSUPPORTED_ATTRIBUTE');
+  g4.setAttribute(
+    "position",
+    new THREE.InterleavedBufferAttribute(
+      new THREE.InterleavedBuffer(new Float32Array(9), 3),
+      3,
+      0,
+      true,
+    ),
+  );
+  assert.equal(canAdmitMesh(new THREE.Mesh(g4, mat), camera).code, "UNSUPPORTED_ATTRIBUTE");
 
   // 5. Custom onUpload callback on InterleavedBuffer
   const cbIb = new THREE.InterleavedBuffer(new Float32Array(9), 3);
   cbIb.onUpload(() => {});
   const g5 = new THREE.BufferGeometry();
-  g5.setAttribute('position', new THREE.InterleavedBufferAttribute(cbIb, 3, 0));
-  assert.equal(canAdmitMesh(new THREE.Mesh(g5, mat), camera).code, 'UNSUPPORTED_UPLOAD_CALLBACK');
+  g5.setAttribute("position", new THREE.InterleavedBufferAttribute(cbIb, 3, 0));
+  assert.equal(canAdmitMesh(new THREE.Mesh(g5, mat), camera).code, "UNSUPPORTED_UPLOAD_CALLBACK");
 });
 
-test('Interleaved attributes: (f) mutating attribute.offset on existing instance retains GPU-stale binding until rebind or disposal (Sunny 19802)', async () => {
+test("Interleaved attributes: (f) mutating attribute.offset on existing instance retains GPU-stale binding until rebind or disposal (Sunny 19802)", async () => {
   const camera = createBasicCamera();
   // Stride 6: triangle 1 at offset 0 (centered), triangle 2 at offset 3 (shifted x+5)
-  const sharedData = new Float32Array([
-    0, 1, 0,    5, 6, 7,
-   -1, -1, 0,   4, 4, 7,
-    1, -1, 0,   6, 4, 7,
-  ]);
+  const sharedData = new Float32Array([0, 1, 0, 5, 6, 7, -1, -1, 0, 4, 4, 7, 1, -1, 0, 6, 4, 7]);
   const sharedIb = new THREE.InterleavedBuffer(sharedData, 6);
   const posAttr = new THREE.InterleavedBufferAttribute(sharedIb, 3, 0);
   const geom = new THREE.BufferGeometry();
-  geom.setAttribute('position', posAttr);
-  const mat = new THREE.MeshBasicMaterial({ side: THREE.DoubleSide, depthTest: false, depthWrite: false });
+  geom.setAttribute("position", posAttr);
+  const mat = new THREE.MeshBasicMaterial({
+    side: THREE.DoubleSide,
+    depthTest: false,
+    depthWrite: false,
+  });
   const mesh = new THREE.Mesh(geom, mat);
   mesh.frustumCulled = false;
 
@@ -4733,7 +5767,7 @@ test('Interleaved attributes: (f) mutating attribute.offset on existing instance
     deviceGeneration: 1,
     executePacket: async (_p, _c, onSubmitted) => {
       onSubmitted?.();
-      return { status: 'OK' };
+      return { status: "OK" };
     },
   };
 
@@ -4763,7 +5797,7 @@ test('Interleaved attributes: (f) mutating attribute.offset on existing instance
 
   // 3. Rebind with new attribute instance: WebGLBindingStates detects cached.attribute !== attribute
   const rebindAttr = new THREE.InterleavedBufferAttribute(sharedIb, 3, 3);
-  geom.setAttribute('position', rebindAttr);
+  geom.setAttribute("position", rebindAttr);
   await renderMesh(mockHost, mesh, camera, null, mockWasm);
   assert.deepEqual(capturedPositions, shiftedPositions);
 
@@ -4791,11 +5825,10 @@ test('Interleaved attributes: (f) mutating attribute.offset on existing instance
   await renderMesh(mockHost, mesh, camera, null, mockWasm);
   assert.deepEqual(capturedPositions, shiftedPositions); // still stale
 
-  const newIb = new THREE.InterleavedBuffer(new Float32Array([
-    10, 11, 12, 0, 0, 0,
-    13, 14, 15, 0, 0, 0,
-    16, 17, 18, 0, 0, 0,
-  ]), 6);
+  const newIb = new THREE.InterleavedBuffer(
+    new Float32Array([10, 11, 12, 0, 0, 0, 13, 14, 15, 0, 0, 0, 16, 17, 18, 0, 0, 0]),
+    6,
+  );
   geom.attributes.position.data = newIb; // data identity change triggers needsUpdate
   await renderMesh(mockHost, mesh, camera, null, mockWasm);
   assert.deepEqual(capturedPositions, new Float32Array([10, 11, 12, 13, 14, 15, 16, 17, 18]));
@@ -4803,7 +5836,7 @@ test('Interleaved attributes: (f) mutating attribute.offset on existing instance
   // 8. Pinned WebGLBindingStates.js:149-192: replacing geometry.index with a new attribute
   // holding identical indices triggers needsUpdate and refreshes all vertex pointers (Root review)
   // Rebind to sharedIb with offset 0 and set an index
-  geom.setAttribute('position', new THREE.InterleavedBufferAttribute(sharedIb, 3, 0));
+  geom.setAttribute("position", new THREE.InterleavedBufferAttribute(sharedIb, 3, 0));
   geom.setIndex(new THREE.BufferAttribute(new Uint16Array([0, 1, 2]), 1));
   await renderMesh(mockHost, mesh, camera, null, mockWasm);
   assert.deepEqual(capturedPositions, centeredPositions);
@@ -4820,7 +5853,7 @@ test('Interleaved attributes: (f) mutating attribute.offset on existing instance
 
   // 9. Replacing color attribute also refreshes position binding (Root review)
   mat.vertexColors = true;
-  geom.setAttribute('color', new THREE.BufferAttribute(new Float32Array(12), 4));
+  geom.setAttribute("color", new THREE.BufferAttribute(new Float32Array(12), 4));
   await renderMesh(mockHost, mesh, camera, null, mockWasm);
   assert.deepEqual(capturedPositions, shiftedPositions);
 
@@ -4830,7 +5863,7 @@ test('Interleaved attributes: (f) mutating attribute.offset on existing instance
   assert.deepEqual(capturedPositions, shiftedPositions); // still stale
 
   // Replace color attribute with new BufferAttribute instance: triggers needsUpdate and refreshes position!
-  geom.setAttribute('color', new THREE.BufferAttribute(new Float32Array(12), 4));
+  geom.setAttribute("color", new THREE.BufferAttribute(new Float32Array(12), 4));
   await renderMesh(mockHost, mesh, camera, null, mockWasm);
   assert.deepEqual(capturedPositions, centeredPositions); // refreshed to offset 0!
 
@@ -4839,7 +5872,7 @@ test('Interleaved attributes: (f) mutating attribute.offset on existing instance
   // independent binding state history per program rather than recapturing stale offsets.
   // (a) Render with vertexColors=true at offset 0 (captures offset 0 in program variant 's:2|vc:rgba')
   mat.vertexColors = true;
-  geom.setAttribute('position', new THREE.InterleavedBufferAttribute(sharedIb, 3, 0));
+  geom.setAttribute("position", new THREE.InterleavedBufferAttribute(sharedIb, 3, 0));
   await renderMesh(mockHost, mesh, camera, null, mockWasm);
   assert.deepEqual(capturedPositions, centeredPositions);
 
@@ -4864,7 +5897,7 @@ test('Interleaved attributes: (f) mutating attribute.offset on existing instance
   // Establish FrontSide program binding with offset 0
   mat.side = THREE.FrontSide;
   mat.needsUpdate = true;
-  geom.setAttribute('position', new THREE.InterleavedBufferAttribute(sharedIb, 3, 0));
+  geom.setAttribute("position", new THREE.InterleavedBufferAttribute(sharedIb, 3, 0));
   await renderMesh(mockHost, mesh, camera, null, mockWasm);
   assert.deepEqual(capturedPositions, centeredPositions);
 
@@ -4888,8 +5921,8 @@ test('Interleaved attributes: (f) mutating attribute.offset on existing instance
   const rgbaColorAttr = new THREE.BufferAttribute(new Float32Array(12), 4);
 
   // Establish RGB program binding with offset 0
-  geom.setAttribute('color', rgbColorAttr);
-  geom.setAttribute('position', new THREE.InterleavedBufferAttribute(sharedIb, 3, 0));
+  geom.setAttribute("color", rgbColorAttr);
+  geom.setAttribute("position", new THREE.InterleavedBufferAttribute(sharedIb, 3, 0));
   await renderMesh(mockHost, mesh, camera, null, mockWasm);
   assert.deepEqual(capturedPositions, centeredPositions);
 
@@ -4897,36 +5930,51 @@ test('Interleaved attributes: (f) mutating attribute.offset on existing instance
   geom.attributes.position.offset = 3;
 
   // Switch to RGBA color attribute (program variant 's:0|vc:rgba'): binds fresh with offset 3
-  geom.setAttribute('color', rgbaColorAttr);
+  geom.setAttribute("color", rgbaColorAttr);
   await renderMesh(mockHost, mesh, camera, null, mockWasm);
   assert.deepEqual(capturedPositions, shiftedPositions);
 
   // Switch back to original RGB color attribute: returns to 's:0|vc:rgb' whose cached binding retains offset 0
-  geom.setAttribute('color', rgbColorAttr);
+  geom.setAttribute("color", rgbColorAttr);
   await renderMesh(mockHost, mesh, camera, null, mockWasm);
   assert.deepEqual(capturedPositions, centeredPositions);
 });
 
-test('Interleaved attributes: (g) interleaved color binding invalidation tracks attribute and data identity', async () => {
+test("Interleaved attributes: (g) interleaved color binding invalidation tracks attribute and data identity", async () => {
   const camera = createBasicCamera();
   // Stride 7: position at offset 0 (size 3), color at offset 3 (size 4)
   const sharedData = new Float32Array([
-    0, 0, 0,  1, 0, 0, 1,
-    1, 0, 0,  0, 1, 0, 1,
-    0, 1, 0,  0, 0, 1, 1,
+    0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 1, 1,
   ]);
   const sharedIb = new THREE.InterleavedBuffer(sharedData, 7);
   const posAttr = new THREE.InterleavedBufferAttribute(sharedIb, 3, 0);
   const colorAttr = new THREE.InterleavedBufferAttribute(sharedIb, 4, 3);
   const geom = new THREE.BufferGeometry();
-  geom.setAttribute('position', posAttr);
-  geom.setAttribute('color', colorAttr);
+  geom.setAttribute("position", posAttr);
+  geom.setAttribute("color", colorAttr);
   const mat = new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide });
   const mesh = new THREE.Mesh(geom, mat);
 
   let capturedColors = null;
   const mockWasm = {
-    f3d_build_mesh_batch_vertex_color_packet: (_pos, _c, _mv, _p, _col, _cm, _ff, _dt, _dw, _dc, _cw, _w, _h, _d, _cv, vcol) => {
+    f3d_build_mesh_batch_vertex_color_packet: (
+      _pos,
+      _c,
+      _mv,
+      _p,
+      _col,
+      _cm,
+      _ff,
+      _dt,
+      _dw,
+      _dc,
+      _cw,
+      _w,
+      _h,
+      _d,
+      _cv,
+      vcol,
+    ) => {
       capturedColors = new Float32Array(vcol);
       return new Uint8Array([0x01]);
     },
@@ -4934,7 +5982,7 @@ test('Interleaved attributes: (g) interleaved color binding invalidation tracks 
   const mockHost = {
     executePacket: async (_p, _c, onSubmitted) => {
       onSubmitted?.();
-      return { status: 'OK' };
+      return { status: "OK" };
     },
   };
 
@@ -4950,32 +5998,28 @@ test('Interleaved attributes: (g) interleaved color binding invalidation tracks 
 
   // 3. Rebind color attribute: invalidates binding and picks up offset 0
   const rebindColorAttr = new THREE.InterleavedBufferAttribute(sharedIb, 4, 0);
-  geom.setAttribute('color', rebindColorAttr);
+  geom.setAttribute("color", rebindColorAttr);
   await renderMesh(mockHost, mesh, camera, null, mockWasm);
   assert.notDeepEqual(capturedColors, expectedColors);
 
   // 4. geom.dispose(): invalidates binding cache
   geom.dispose();
-  geom.setAttribute('color', colorAttr); // back to original colorAttr with offset 0
+  geom.setAttribute("color", colorAttr); // back to original colorAttr with offset 0
   await renderMesh(mockHost, mesh, camera, null, mockWasm);
   assert.notDeepEqual(capturedColors, expectedColors);
 });
 
-test('Interleaved attributes: (h) multi-mesh scene with shared geometry preserves independent per-program binding states in single pass', async () => {
+test("Interleaved attributes: (h) multi-mesh scene with shared geometry preserves independent per-program binding states in single pass", async () => {
   const camera = createBasicCamera();
   // Shared interleaved buffer: triangle 1 at offset 0, triangle 2 at offset 3
-  const sharedData = new Float32Array([
-    0, 1, 0,    5, 6, 7,
-   -1, -1, 0,   4, 4, 7,
-    1, -1, 0,   6, 4, 7,
-  ]);
+  const sharedData = new Float32Array([0, 1, 0, 5, 6, 7, -1, -1, 0, 4, 4, 7, 1, -1, 0, 6, 4, 7]);
   const sharedIb = new THREE.InterleavedBuffer(sharedData, 6);
   const posAttr = new THREE.InterleavedBufferAttribute(sharedIb, 3, 0);
   const colorAttr = new THREE.BufferAttribute(new Float32Array(12), 4);
 
   const geom = new THREE.BufferGeometry();
-  geom.setAttribute('position', posAttr);
-  geom.setAttribute('color', colorAttr);
+  geom.setAttribute("position", posAttr);
+  geom.setAttribute("color", colorAttr);
 
   // Mesh A uses FrontSide without vertexColors ('s:0|vc:none')
   const matA = new THREE.MeshBasicMaterial({ side: THREE.FrontSide, vertexColors: false });
@@ -5000,7 +6044,7 @@ test('Interleaved attributes: (h) multi-mesh scene with shared geometry preserve
     deviceGeneration: 1,
     executePacket: async (_p, _c, onSubmitted) => {
       onSubmitted?.();
-      return { status: 'OK' };
+      return { status: "OK" };
     },
   };
 
@@ -5034,7 +6078,7 @@ test('Interleaved attributes: (h) multi-mesh scene with shared geometry preserve
 // SCENE.BACKGROUND COLOR CLEAR-COLOR ADAPTER SLICE
 // ---------------------------------------------------------------------------
 
-test('scene.background: renderScene admits background.isColor and converts through WebGLBackground.js:55 setClearColor path to 4 output floats', async () => {
+test("scene.background: renderScene admits background.isColor and converts through WebGLBackground.js:55 setClearColor path to 4 output floats", async () => {
   const camera = createBasicCamera();
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0.25, 0.5, 0.75);
@@ -5044,10 +6088,10 @@ test('scene.background: renderScene admits background.isColor and converts throu
   const mockWasm = {
     f3d_build_mesh_batch_vertex_color_clear_packet: (...args) => {
       capturedArgs = args;
-      return new Uint8Array([0xCA, 0xFE, 0x01]);
+      return new Uint8Array([0xca, 0xfe, 0x01]);
     },
     f3d_build_mesh_batch_vertex_color_packet: () => {
-      throw new Error('Should not call vertex_color_packet when background color is present');
+      throw new Error("Should not call vertex_color_packet when background color is present");
     },
   };
 
@@ -5060,23 +6104,31 @@ test('scene.background: renderScene admits background.isColor and converts throu
   };
 
   const res = await renderScene(mockBridgeHost, scene, camera, null, mockWasm);
-  assert.equal(res.admitted.length, 1, 'Mesh should be admitted');
-  assert.equal(res.refused.length, 0, 'No refusal for scene.background Color');
-  assert.deepEqual(executedPacket, new Uint8Array([0xCA, 0xFE, 0x01]));
+  assert.equal(res.admitted.length, 1, "Mesh should be admitted");
+  assert.equal(res.refused.length, 0, "No refusal for scene.background Color");
+  assert.deepEqual(executedPacket, new Uint8Array([0xca, 0xfe, 0x01]));
 
-  assert.ok(capturedArgs, 'f3d_build_mesh_batch_vertex_color_clear_packet must be called');
-  assert.equal(capturedArgs.length, 17, 'Must receive exactly 17 arguments (16 existing + clear_color)');
+  assert.ok(capturedArgs, "f3d_build_mesh_batch_vertex_color_clear_packet must be called");
+  assert.equal(
+    capturedArgs.length,
+    17,
+    "Must receive exactly 17 arguments (16 existing + clear_color)",
+  );
 
   const clearColor = capturedArgs[16];
-  assert.ok(clearColor instanceof Float32Array, 'clear_color must be a Float32Array');
-  assert.equal(clearColor.length, 4, 'clear_color must have 4 elements');
+  assert.ok(clearColor instanceof Float32Array, "clear_color must be a Float32Array");
+  assert.equal(clearColor.length, 4, "clear_color must have 4 elements");
 
   const expectedRGB = {};
   scene.background.getRGB(expectedRGB, THREE.SRGBColorSpace);
   assert.equal(clearColor[0], Math.fround(expectedRGB.r));
   assert.equal(clearColor[1], Math.fround(expectedRGB.g));
   assert.equal(clearColor[2], Math.fround(expectedRGB.b));
-  assert.equal(clearColor[3], 1.0, 'alpha must be 1.0 per WebGLBackground.js:55 setClearColor(background, 1)');
+  assert.equal(
+    clearColor[3],
+    1.0,
+    "alpha must be 1.0 per WebGLBackground.js:55 setClearColor(background, 1)",
+  );
 
   // Uncolored mesh should receive white (1.0) vertex colors array
   const vertexColors = capturedArgs[15];
@@ -5086,7 +6138,7 @@ test('scene.background: renderScene admits background.isColor and converts throu
   }
 });
 
-test('scene.background: null or undefined background keeps existing export and produces identical bytes', async () => {
+test("scene.background: null or undefined background keeps existing export and produces identical bytes", async () => {
   const camera = createBasicCamera();
 
   let clearPacketCalls = 0;
@@ -5094,11 +6146,11 @@ test('scene.background: null or undefined background keeps existing export and p
   const mockWasm = {
     f3d_build_mesh_batch_cull_depth_color_packet: (...args) => {
       batchPacketCalls++;
-      return new Uint8Array([0xBE, 0xEF, 0x42]);
+      return new Uint8Array([0xbe, 0xef, 0x42]);
     },
     f3d_build_mesh_batch_vertex_color_clear_packet: () => {
       clearPacketCalls++;
-      return new Uint8Array([0xFF]);
+      return new Uint8Array([0xff]);
     },
   };
 
@@ -5123,11 +6175,15 @@ test('scene.background: null or undefined background keeps existing export and p
   assert.equal(resUndef.refused.length, 0);
 
   // 3. Verify f3d_build_mesh_batch_vertex_color_clear_packet was NEVER called
-  assert.equal(clearPacketCalls, 0, 'Must never invoke clear packet export for null/undefined background');
-  assert.equal(batchPacketCalls, 2, 'Must invoke existing export for null/undefined background');
+  assert.equal(
+    clearPacketCalls,
+    0,
+    "Must never invoke clear packet export for null/undefined background",
+  );
+  assert.equal(batchPacketCalls, 2, "Must invoke existing export for null/undefined background");
 });
 
-test('scene.background: texture backgrounds are strictly refused with UNSUPPORTED_SCENE_FEATURE', async () => {
+test("scene.background: texture backgrounds are strictly refused with UNSUPPORTED_SCENE_FEATURE", async () => {
   const camera = createBasicCamera();
   const mockWasm = {
     f3d_build_mesh_batch_vertex_color_clear_packet: () => new Uint8Array([1]),
@@ -5150,8 +6206,8 @@ test('scene.background: texture backgrounds are strictly refused with UNSUPPORTE
     const res = await renderScene(mockBridgeHost, scene, camera, null, mockWasm);
     assert.deepEqual(res.admitted, []);
     assert.equal(res.refused.length, 1);
-    assert.equal(res.refused[0].code, 'UNSUPPORTED_SCENE_FEATURE');
-    assert.ok(res.refused[0].reason.includes('scene.background is not supported'));
+    assert.equal(res.refused[0].code, "UNSUPPORTED_SCENE_FEATURE");
+    assert.ok(res.refused[0].reason.includes("scene.background is not supported"));
   }
 
   // 2. THREE.CubeTexture
@@ -5162,7 +6218,7 @@ test('scene.background: texture backgrounds are strictly refused with UNSUPPORTE
     const res = await renderScene(mockBridgeHost, scene, camera, null, mockWasm);
     assert.deepEqual(res.admitted, []);
     assert.equal(res.refused.length, 1);
-    assert.equal(res.refused[0].code, 'UNSUPPORTED_SCENE_FEATURE');
+    assert.equal(res.refused[0].code, "UNSUPPORTED_SCENE_FEATURE");
   }
 
   // 3. Duck-typed texture object
@@ -5173,24 +6229,24 @@ test('scene.background: texture backgrounds are strictly refused with UNSUPPORTE
     const res = await renderScene(mockBridgeHost, scene, camera, null, mockWasm);
     assert.deepEqual(res.admitted, []);
     assert.equal(res.refused.length, 1);
-    assert.equal(res.refused[0].code, 'UNSUPPORTED_SCENE_FEATURE');
+    assert.equal(res.refused[0].code, "UNSUPPORTED_SCENE_FEATURE");
   }
 
   // 4. Non-color string
   {
     const scene = new THREE.Scene();
-    scene.background = 'linear-gradient(to right, red, blue)';
+    scene.background = "linear-gradient(to right, red, blue)";
     scene.add(createBasicTriangleMesh());
     const res = await renderScene(mockBridgeHost, scene, camera, null, mockWasm);
     assert.deepEqual(res.admitted, []);
     assert.equal(res.refused.length, 1);
-    assert.equal(res.refused[0].code, 'UNSUPPORTED_SCENE_FEATURE');
+    assert.equal(res.refused[0].code, "UNSUPPORTED_SCENE_FEATURE");
   }
 
-  assert.equal(execCount, 0, 'No packet should be submitted for refused texture backgrounds');
+  assert.equal(execCount, 0, "No packet should be submitted for refused texture backgrounds");
 });
 
-test('scene.background: Color background refuses when wasmModule lacks f3d_build_mesh_batch_vertex_color_clear_packet', async () => {
+test("scene.background: Color background refuses when wasmModule lacks f3d_build_mesh_batch_vertex_color_clear_packet", async () => {
   const camera = createBasicCamera();
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0x00ff00);
@@ -5213,15 +6269,15 @@ test('scene.background: Color background refuses when wasmModule lacks f3d_build
   const res = await renderScene(mockBridgeHost, scene, camera, null, mockWasm);
   assert.deepEqual(res.admitted, []);
   assert.equal(res.refused.length, 1);
-  assert.equal(res.refused[0].code, 'INCOMPATIBLE_BACKGROUND_CLEAR');
+  assert.equal(res.refused[0].code, "INCOMPATIBLE_BACKGROUND_CLEAR");
   assert.ok(
-    res.refused[0].reason.includes('f3d_build_mesh_batch_vertex_color_clear_packet'),
-    `Reason must mention missing export: ${res.refused[0].reason}`
+    res.refused[0].reason.includes("f3d_build_mesh_batch_vertex_color_clear_packet"),
+    `Reason must mention missing export: ${res.refused[0].reason}`,
   );
   assert.equal(execCount, 0);
 });
 
-test('scene.background: convertBackgroundColorToClearColor converts via getRGB(target, SRGBColorSpace) by default and honors options', () => {
+test("scene.background: convertBackgroundColorToClearColor converts via getRGB(target, SRGBColorSpace) by default and honors options", () => {
   // 1. Default conversion converts via THREE.SRGBColorSpace with alpha = 1.0 (non-primary midtone test)
   const col = new THREE.Color(0.25, 0.5, 0.75);
   const expectedRGB = {};
@@ -5237,7 +6293,9 @@ test('scene.background: convertBackgroundColorToClearColor converts via getRGB(t
   // 2. Honors custom colorSpace via options (e.g. LinearSRGBColorSpace)
   const expectedLinear = {};
   col.getRGB(expectedLinear, THREE.LinearSRGBColorSpace);
-  const clearLinear = convertBackgroundColorToClearColor(col, { colorSpace: THREE.LinearSRGBColorSpace });
+  const clearLinear = convertBackgroundColorToClearColor(col, {
+    colorSpace: THREE.LinearSRGBColorSpace,
+  });
   assert.equal(clearLinear[0], Math.fround(expectedLinear.r));
   assert.equal(clearLinear[1], Math.fround(expectedLinear.g));
   assert.equal(clearLinear[2], Math.fround(expectedLinear.b));
@@ -5252,12 +6310,21 @@ test('scene.background: convertBackgroundColorToClearColor converts via getRGB(t
   assert.equal(clear3[3], 1.0);
 
   // 4. Invalid inputs throw UNSUPPORTED_SCENE_FEATURE
-  assert.throws(() => convertBackgroundColorToClearColor(null), (err) => err.reason === 'UNSUPPORTED_SCENE_FEATURE');
-  assert.throws(() => convertBackgroundColorToClearColor({ isTexture: true }), (err) => err.reason === 'UNSUPPORTED_SCENE_FEATURE');
-  assert.throws(() => convertBackgroundColorToClearColor('red'), (err) => err.reason === 'UNSUPPORTED_SCENE_FEATURE');
+  assert.throws(
+    () => convertBackgroundColorToClearColor(null),
+    (err) => err.reason === "UNSUPPORTED_SCENE_FEATURE",
+  );
+  assert.throws(
+    () => convertBackgroundColorToClearColor({ isTexture: true }),
+    (err) => err.reason === "UNSUPPORTED_SCENE_FEATURE",
+  );
+  assert.throws(
+    () => convertBackgroundColorToClearColor("red"),
+    (err) => err.reason === "UNSUPPORTED_SCENE_FEATURE",
+  );
 });
 
-test('scene.background: prepareMeshBatchPacket accepts options.clearColor and routes to clear export', () => {
+test("scene.background: prepareMeshBatchPacket accepts options.clearColor and routes to clear export", () => {
   const camera = createBasicCamera();
   const meshes = [createBasicTriangleMesh(), createBasicTriangleMesh()];
   const clearColor = new Float32Array([0.1, 0.2, 0.3, 1.0]);
@@ -5266,13 +6333,13 @@ test('scene.background: prepareMeshBatchPacket accepts options.clearColor and ro
   const mockWasm = {
     f3d_build_mesh_batch_vertex_color_clear_packet: (...args) => {
       capturedClearColor = args[16];
-      return new Uint8Array([0xAA, 0xBB]);
+      return new Uint8Array([0xaa, 0xbb]);
     },
   };
 
   const prep = prepareMeshBatchPacket(meshes, camera, 64, 64, mockWasm, { clearColor });
   assert.ok(prep.packetBytes);
-  assert.deepEqual(prep.packetBytes, new Uint8Array([0xAA, 0xBB]));
+  assert.deepEqual(prep.packetBytes, new Uint8Array([0xaa, 0xbb]));
   assert.deepEqual(capturedClearColor, clearColor);
 
   // If clearColor is provided but export is missing, throw INCOMPATIBLE_BACKGROUND_CLEAR
@@ -5281,19 +6348,25 @@ test('scene.background: prepareMeshBatchPacket accepts options.clearColor and ro
   };
   assert.throws(
     () => prepareMeshBatchPacket(meshes, camera, 64, 64, missingExportWasm, { clearColor }),
-    (err) => err.reason === 'INCOMPATIBLE_BACKGROUND_CLEAR'
+    (err) => err.reason === "INCOMPATIBLE_BACKGROUND_CLEAR",
   );
 });
 
-test('scene.background: combined vertexColors and scene.background Color pass both to clear packet export', async () => {
+test("scene.background: combined vertexColors and scene.background Color pass both to clear packet export", async () => {
   const camera = createBasicCamera();
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0.9, 0.1, 0.2);
 
   // Create mesh with vertex colors
   const geom = new THREE.BufferGeometry();
-  geom.setAttribute('position', new THREE.BufferAttribute(new Float32Array([0, 1, 0, -1, -1, 0, 1, -1, 0]), 3));
-  geom.setAttribute('color', new THREE.BufferAttribute(new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]), 3));
+  geom.setAttribute(
+    "position",
+    new THREE.BufferAttribute(new Float32Array([0, 1, 0, -1, -1, 0, 1, -1, 0]), 3),
+  );
+  geom.setAttribute(
+    "color",
+    new THREE.BufferAttribute(new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]), 3),
+  );
   const mat = new THREE.MeshBasicMaterial({ vertexColors: true });
   const mesh = new THREE.Mesh(geom, mat);
   scene.add(mesh);
@@ -5320,14 +6393,20 @@ test('scene.background: combined vertexColors and scene.background Color pass bo
   // Arg 15 (index 15) is vertexColors (Float32Array of 3 vertices * 4 components = 12 floats)
   const vertexColors = capturedArgs[15];
   assert.equal(vertexColors.length, 12);
-  assert.deepEqual(
-    Array.from(vertexColors),
-    [
-      1, 0, 0, 1, // vertex 0 (red)
-      0, 1, 0, 1, // vertex 1 (green)
-      0, 0, 1, 1, // vertex 2 (blue)
-    ]
-  );
+  assert.deepEqual(Array.from(vertexColors), [
+    1,
+    0,
+    0,
+    1, // vertex 0 (red)
+    0,
+    1,
+    0,
+    1, // vertex 1 (green)
+    0,
+    0,
+    1,
+    1, // vertex 2 (blue)
+  ]);
 
   // Arg 16 (index 16) is clearColor
   const clearColor = capturedArgs[16];
@@ -5339,23 +6418,40 @@ test('scene.background: combined vertexColors and scene.background Color pass bo
   assert.equal(clearColor[3], 1.0);
 });
 
-test('scene.background: wasmModule offering ONLY vertex_color_clear export satisfies depth, colorWrite, and vertexColors for background scene', async () => {
+test("scene.background: wasmModule offering ONLY vertex_color_clear export satisfies depth, colorWrite, and vertexColors for background scene", async () => {
   const camera = createBasicCamera();
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0.2, 0.4, 0.6);
 
   // Mesh 1: vertexColors=true, depthTest=false
   const geom1 = new THREE.BufferGeometry();
-  geom1.setAttribute('position', new THREE.BufferAttribute(new Float32Array([0, 1, 0, -1, -1, 0, 1, -1, 0]), 3));
-  geom1.setAttribute('color', new THREE.BufferAttribute(new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]), 3));
-  const mat1 = new THREE.MeshBasicMaterial({ vertexColors: true, depthTest: false, depthWrite: false });
+  geom1.setAttribute(
+    "position",
+    new THREE.BufferAttribute(new Float32Array([0, 1, 0, -1, -1, 0, 1, -1, 0]), 3),
+  );
+  geom1.setAttribute(
+    "color",
+    new THREE.BufferAttribute(new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]), 3),
+  );
+  const mat1 = new THREE.MeshBasicMaterial({
+    vertexColors: true,
+    depthTest: false,
+    depthWrite: false,
+  });
   const mesh1 = new THREE.Mesh(geom1, mat1);
   scene.add(mesh1);
 
   // Mesh 2: colorWrite=false, depthTest=true (mixed depth and colorWrite across scene)
   const geom2 = new THREE.BufferGeometry();
-  geom2.setAttribute('position', new THREE.BufferAttribute(new Float32Array([1, 2, 0, 0, 0, 0, 2, 0, 0]), 3));
-  const mat2 = new THREE.MeshBasicMaterial({ colorWrite: false, depthTest: true, depthWrite: true });
+  geom2.setAttribute(
+    "position",
+    new THREE.BufferAttribute(new Float32Array([1, 2, 0, 0, 0, 0, 2, 0, 0]), 3),
+  );
+  const mat2 = new THREE.MeshBasicMaterial({
+    colorWrite: false,
+    depthTest: true,
+    depthWrite: true,
+  });
   const mesh2 = new THREE.Mesh(geom2, mat2);
   scene.add(mesh2);
 
@@ -5364,7 +6460,7 @@ test('scene.background: wasmModule offering ONLY vertex_color_clear export satis
   const mockWasmOnlyClear = {
     f3d_build_mesh_batch_vertex_color_clear_packet: (...args) => {
       capturedArgs = args;
-      return new Uint8Array([0x55, 0xAA]);
+      return new Uint8Array([0x55, 0xaa]);
     },
   };
 
@@ -5373,7 +6469,11 @@ test('scene.background: wasmModule offering ONLY vertex_color_clear export satis
   };
 
   const res = await renderScene(mockBridgeHost, scene, camera, null, mockWasmOnlyClear);
-  assert.equal(res.admitted.length, 2, 'Both meshes should be admitted without being rejected by depth, colorWrite, or vertexColors checks');
+  assert.equal(
+    res.admitted.length,
+    2,
+    "Both meshes should be admitted without being rejected by depth, colorWrite, or vertexColors checks",
+  );
   assert.equal(res.refused.length, 0);
   assert.ok(capturedArgs);
   assert.equal(capturedArgs.length, 17);
@@ -5384,7 +6484,7 @@ test('scene.background: wasmModule offering ONLY vertex_color_clear export satis
   assert.equal(capturedArgs[16].length, 4); // clearColor
 });
 
-test('Frustum culling: renderScene culls mesh outside frustum and emits only visible mesh in batch packet', async () => {
+test("Frustum culling: renderScene culls mesh outside frustum and emits only visible mesh in batch packet", async () => {
   const camera = createBasicCamera();
   const scene = new THREE.Scene();
 
@@ -5400,9 +6500,16 @@ test('Frustum culling: renderScene culls mesh outside frustum and emits only vis
   scene.add(meshOutside);
 
   // Oracle check against pinned Three.js Frustum
-  const projScreenMatrix = new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+  const projScreenMatrix = new THREE.Matrix4().multiplyMatrices(
+    camera.projectionMatrix,
+    camera.matrixWorldInverse,
+  );
   const oracleFrustum = new THREE.Frustum();
-  oracleFrustum.setFromProjectionMatrix(projScreenMatrix, camera.coordinateSystem, Boolean(camera.reversedDepth));
+  oracleFrustum.setFromProjectionMatrix(
+    projScreenMatrix,
+    camera.coordinateSystem,
+    Boolean(camera.reversedDepth),
+  );
   assert.equal(meshInside.intersectsFrustum(oracleFrustum), true);
   assert.equal(meshOutside.intersectsFrustum(oracleFrustum), false);
 
@@ -5411,13 +6518,13 @@ test('Frustum culling: renderScene culls mesh outside frustum and emits only vis
   const mockWasm = {
     f3d_build_mesh_batch_packet: (_pos, vCounts) => {
       capturedVCounts = Array.from(vCounts);
-      return new Uint8Array([0xCA, 0xFE]);
+      return new Uint8Array([0xca, 0xfe]);
     },
   };
   const mockBridgeHost = {
     executePacket: async (packet) => {
       executedPacket = packet;
-      return { status: 'OK' };
+      return { status: "OK" };
     },
   };
 
@@ -5425,12 +6532,12 @@ test('Frustum culling: renderScene culls mesh outside frustum and emits only vis
 
   assert.deepEqual(res.admitted, [meshInside.uuid]);
   assert.deepEqual(res.refused, []);
-  assert.equal(res.result?.status, 'OK');
-  assert.deepEqual(capturedVCounts, [3], 'Only the visible mesh should be packed into batch');
-  assert.deepEqual(Array.from(executedPacket), [0xCA, 0xFE]);
+  assert.equal(res.result?.status, "OK");
+  assert.deepEqual(capturedVCounts, [3], "Only the visible mesh should be packed into batch");
+  assert.deepEqual(Array.from(executedPacket), [0xca, 0xfe]);
 });
 
-test('Frustum culling: mesh.frustumCulled = false bypasses culling for mesh outside frustum', async () => {
+test("Frustum culling: mesh.frustumCulled = false bypasses culling for mesh outside frustum", async () => {
   const camera = createBasicCamera();
   const scene = new THREE.Scene();
 
@@ -5450,17 +6557,17 @@ test('Frustum culling: mesh.frustumCulled = false bypasses culling for mesh outs
     },
   };
   const mockBridgeHost = {
-    executePacket: async () => ({ status: 'OK' }),
+    executePacket: async () => ({ status: "OK" }),
   };
 
   const res = await renderScene(mockBridgeHost, scene, camera, null, mockWasm);
 
   assert.deepEqual(res.admitted, [meshInside.uuid, meshOutside.uuid]);
   assert.deepEqual(res.refused, []);
-  assert.deepEqual(capturedVCounts, [3, 3], 'Both meshes admitted when frustumCulled is false');
+  assert.deepEqual(capturedVCounts, [3, 3], "Both meshes admitted when frustumCulled is false");
 });
 
-test('Frustum culling: mutable geometry.boundingSphere updates culling decision across consecutive frames', async () => {
+test("Frustum culling: mutable geometry.boundingSphere updates culling decision across consecutive frames", async () => {
   const camera = createBasicCamera();
   const scene = new THREE.Scene();
 
@@ -5475,7 +6582,7 @@ test('Frustum culling: mutable geometry.boundingSphere updates culling decision 
     f3d_build_mesh_batch_packet: () => new Uint8Array([1]),
   };
   const mockBridgeHost = {
-    executePacket: async () => ({ status: 'OK' }),
+    executePacket: async () => ({ status: "OK" }),
   };
 
   // Frame 1: meshDynamic is outside frustum -> culled
@@ -5497,7 +6604,7 @@ test('Frustum culling: mutable geometry.boundingSphere updates culling decision 
   assert.deepEqual(res3.admitted, [meshInside.uuid]);
 });
 
-test('Frustum culling: custom intersectsFrustum override is conservatively rejected under frustumCulled=true and bypassed when false', async () => {
+test("Frustum culling: custom intersectsFrustum override is conservatively rejected under frustumCulled=true and bypassed when false", async () => {
   const camera = createBasicCamera();
   const scene = new THREE.Scene();
 
@@ -5518,8 +6625,8 @@ test('Frustum culling: custom intersectsFrustum override is conservatively rejec
   const res1 = await renderScene(mockBridgeHost, scene, camera, null, mockWasm);
   assert.deepEqual(res1.admitted, []);
   assert.equal(res1.refused.length, 1);
-  assert.equal(res1.refused[0].code, 'UNSUPPORTED_CALLBACK');
-  assert.equal(execCount, 0, 'Bridge execution must not occur when callback is unsupported');
+  assert.equal(res1.refused[0].code, "UNSUPPORTED_CALLBACK");
+  assert.equal(execCount, 0, "Bridge execution must not occur when callback is unsupported");
 
   // 2. Subclass prototype override with frustumCulled = true -> refuses with UNSUPPORTED_CALLBACK
   class CustomFrustumMesh extends THREE.Mesh {
@@ -5528,7 +6635,10 @@ test('Frustum culling: custom intersectsFrustum override is conservatively rejec
     }
   }
   const geom = new THREE.BufferGeometry();
-  geom.setAttribute('position', new THREE.BufferAttribute(new Float32Array([0, 0.5, 0, -0.5, -0.5, 0, 0.5, -0.5, 0]), 3));
+  geom.setAttribute(
+    "position",
+    new THREE.BufferAttribute(new Float32Array([0, 0.5, 0, -0.5, -0.5, 0, 0.5, -0.5, 0]), 3),
+  );
   const mat = new THREE.MeshBasicMaterial({ side: THREE.DoubleSide });
   const meshSubclassOverride = new CustomFrustumMesh(geom, mat);
   meshSubclassOverride.updateMatrixWorld();
@@ -5538,7 +6648,7 @@ test('Frustum culling: custom intersectsFrustum override is conservatively rejec
   const resSub = await renderScene(mockBridgeHost, sceneSub, camera, null, mockWasm);
   assert.deepEqual(resSub.admitted, []);
   assert.equal(resSub.refused.length, 1);
-  assert.equal(resSub.refused[0].code, 'UNSUPPORTED_CALLBACK');
+  assert.equal(resSub.refused[0].code, "UNSUPPORTED_CALLBACK");
 
   // 3. Assigning exact baseline Mesh.prototype identity as an own property does NOT fail
   const meshOwnDefault = createBasicTriangleMesh();
@@ -5562,10 +6672,14 @@ test('Frustum culling: custom intersectsFrustum override is conservatively rejec
   const resOptOut = await renderScene(mockBridgeHost, sceneOptOut, camera, null, mockWasm);
   assert.deepEqual(resOptOut.admitted, [meshOptOut.uuid]);
   assert.deepEqual(resOptOut.refused, []);
-  assert.equal(hookCallCount, 0, 'Unobserved intersectsFrustum callback must never be invoked when frustumCulled is false');
+  assert.equal(
+    hookCallCount,
+    0,
+    "Unobserved intersectsFrustum callback must never be invoked when frustumCulled is false",
+  );
 });
 
-test('Frustum culling: WebGPU coordinate system camera correctly evaluates frustum bounds', async () => {
+test("Frustum culling: WebGPU coordinate system camera correctly evaluates frustum bounds", async () => {
   const camera = createBasicCamera(COORDINATE_SYSTEM.WEBGPU);
   camera.updateProjectionMatrix();
   const scene = new THREE.Scene();
@@ -5587,7 +6701,7 @@ test('Frustum culling: WebGPU coordinate system camera correctly evaluates frust
     },
   };
   const mockBridgeHost = {
-    executePacket: async () => ({ status: 'OK' }),
+    executePacket: async () => ({ status: "OK" }),
   };
 
   const res = await renderScene(mockBridgeHost, scene, camera, null, mockWasm);
@@ -5596,7 +6710,7 @@ test('Frustum culling: WebGPU coordinate system camera correctly evaluates frust
   assert.deepEqual(capturedVCounts, [3]);
 });
 
-test('scene.background: empty scene with Color background routes to f3d_build_scene_clear_packet and submits clear', async () => {
+test("scene.background: empty scene with Color background routes to f3d_build_scene_clear_packet and submits clear", async () => {
   const camera = createBasicCamera();
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0.2, 0.4, 0.8);
@@ -5605,7 +6719,7 @@ test('scene.background: empty scene with Color background routes to f3d_build_sc
   const mockWasm = {
     f3d_build_scene_clear_packet: (width, height, clearColor, isCanvas) => {
       capturedArgs = { width, height, clearColor, isCanvas };
-      return new Uint8Array([0xCC, 0x11]);
+      return new Uint8Array([0xcc, 0x11]);
     },
   };
 
@@ -5615,15 +6729,18 @@ test('scene.background: empty scene with Color background routes to f3d_build_sc
     executePacket: async (packet, target) => {
       executedPacket = packet;
       executedTarget = target;
-      return { status: 'CLEARED' };
+      return { status: "CLEARED" };
     },
   };
 
   // 1. Offscreen clear
-  const resOffscreen = await renderScene(mockBridgeHost, scene, camera, null, mockWasm, { width: 128, height: 256 });
+  const resOffscreen = await renderScene(mockBridgeHost, scene, camera, null, mockWasm, {
+    width: 128,
+    height: 256,
+  });
   assert.deepEqual(resOffscreen.admitted, []);
   assert.deepEqual(resOffscreen.refused, []);
-  assert.equal(resOffscreen.result?.status, 'CLEARED');
+  assert.equal(resOffscreen.result?.status, "CLEARED");
   assert.ok(capturedArgs);
   assert.equal(capturedArgs.width, 128);
   assert.equal(capturedArgs.height, 256);
@@ -5634,7 +6751,7 @@ test('scene.background: empty scene with Color background routes to f3d_build_sc
   assert.equal(capturedArgs.clearColor[1], Math.fround(expectedClear.g));
   assert.equal(capturedArgs.clearColor[2], Math.fround(expectedClear.b));
   assert.equal(capturedArgs.clearColor[3], 1.0);
-  assert.deepEqual(Array.from(executedPacket), [0xCC, 0x11]);
+  assert.deepEqual(Array.from(executedPacket), [0xcc, 0x11]);
   assert.equal(executedTarget, null);
 
   // 2. Canvas clear
@@ -5648,7 +6765,7 @@ test('scene.background: empty scene with Color background routes to f3d_build_sc
   assert.equal(executedTarget, fakeCanvasContext);
 });
 
-test('scene.background: scene where all meshes are frustum-culled submits clear and stages zero mesh uploads', async () => {
+test("scene.background: scene where all meshes are frustum-culled submits clear and stages zero mesh uploads", async () => {
   const camera = createBasicCamera();
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0.5, 0.5, 0.5);
@@ -5662,7 +6779,7 @@ test('scene.background: scene where all meshes are frustum-culled submits clear 
   const mockWasm = {
     f3d_build_scene_clear_packet: (w, h, clearColor, isCanvas) => {
       sceneClearCalled = true;
-      return new Uint8Array([0xEE]);
+      return new Uint8Array([0xee]);
     },
   };
 
@@ -5670,19 +6787,19 @@ test('scene.background: scene where all meshes are frustum-culled submits clear 
   const mockBridgeHost = {
     executePacket: async () => {
       execCount++;
-      return { status: 'CULLED_SCENE_CLEARED' };
+      return { status: "CULLED_SCENE_CLEARED" };
     },
   };
 
   const res = await renderScene(mockBridgeHost, scene, camera, null, mockWasm);
   assert.deepEqual(res.admitted, []);
   assert.deepEqual(res.refused, []);
-  assert.equal(res.result?.status, 'CULLED_SCENE_CLEARED');
+  assert.equal(res.result?.status, "CULLED_SCENE_CLEARED");
   assert.equal(sceneClearCalled, true);
   assert.equal(execCount, 1);
 });
 
-test('scene.background: empty Color scene works with wasmModule offering ONLY f3d_build_scene_clear_packet', async () => {
+test("scene.background: empty Color scene works with wasmModule offering ONLY f3d_build_scene_clear_packet", async () => {
   const camera = createBasicCamera();
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(1, 0, 0);
@@ -5706,7 +6823,7 @@ test('scene.background: empty Color scene works with wasmModule offering ONLY f3
   assert.equal(execCount, 1);
 });
 
-test('scene.background: empty Color scene truthfully refuses when f3d_build_scene_clear_packet is missing', async () => {
+test("scene.background: empty Color scene truthfully refuses when f3d_build_scene_clear_packet is missing", async () => {
   const camera = createBasicCamera();
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0, 1, 0);
@@ -5727,22 +6844,25 @@ test('scene.background: empty Color scene truthfully refuses when f3d_build_scen
   const res = await renderScene(mockBridgeHost, scene, camera, null, mockWasmMissing);
   assert.deepEqual(res.admitted, []);
   assert.equal(res.refused.length, 1);
-  assert.equal(res.refused[0].code, 'INCOMPATIBLE_BACKGROUND_CLEAR');
+  assert.equal(res.refused[0].code, "INCOMPATIBLE_BACKGROUND_CLEAR");
   assert.ok(
-    res.refused[0].reason.includes('f3d_build_scene_clear_packet'),
-    `Reason must cite missing f3d_build_scene_clear_packet: ${res.refused[0].reason}`
+    res.refused[0].reason.includes("f3d_build_scene_clear_packet"),
+    `Reason must cite missing f3d_build_scene_clear_packet: ${res.refused[0].reason}`,
   );
-  assert.equal(execCount, 0, 'No packet execution on missing export refusal');
+  assert.equal(execCount, 0, "No packet execution on missing export refusal");
 });
 
-test('scene.background: empty Color scene with unsupported visible content refuses before submission', async () => {
+test("scene.background: empty Color scene with unsupported visible content refuses before submission", async () => {
   const camera = createBasicCamera();
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0, 0, 1);
 
   // Add an unsupported visible renderable (Line)
   const lineGeom = new THREE.BufferGeometry();
-  lineGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array([0, 0, 0, 1, 1, 1]), 3));
+  lineGeom.setAttribute(
+    "position",
+    new THREE.BufferAttribute(new Float32Array([0, 0, 0, 1, 1, 1]), 3),
+  );
   const line = new THREE.Line(lineGeom, new THREE.LineBasicMaterial());
   scene.add(line);
 
@@ -5760,24 +6880,28 @@ test('scene.background: empty Color scene with unsupported visible content refus
   const res = await renderScene(mockBridgeHost, scene, camera, null, mockWasm);
   assert.deepEqual(res.admitted, []);
   assert.equal(res.refused.length, 1);
-  assert.equal(res.refused[0].code, 'UNSUPPORTED_RENDERABLE');
-  assert.equal(execCount, 0, 'Must refuse unsupported visible content before any submission');
+  assert.equal(res.refused[0].code, "UNSUPPORTED_RENDERABLE");
+  assert.equal(execCount, 0, "Must refuse unsupported visible content before any submission");
 });
 
-test('scene.background: empty Color scene rejects invalid dimensions without calling builder or bridge', async () => {
+test("scene.background: empty Color scene rejects invalid dimensions without calling builder or bridge", async () => {
   const cases = [
-    { opts: { width: 0, height: 64 }, ctx: null, desc: 'zero width' },
-    { opts: { width: 64, height: 0 }, ctx: null, desc: 'zero height' },
-    { opts: { width: -1, height: 64 }, ctx: null, desc: 'negative width' },
-    { opts: { width: 64, height: -10 }, ctx: null, desc: 'negative height' },
-    { opts: { width: 64.5, height: 64 }, ctx: null, desc: 'fractional width' },
-    { opts: { width: 64, height: 64.25 }, ctx: null, desc: 'fractional height' },
-    { opts: { width: 0x100000000, height: 64 }, ctx: null, desc: 'width > u32::MAX' },
-    { opts: { width: 64, height: 1e12 }, ctx: null, desc: 'height > u32::MAX' },
-    { opts: { width: NaN, height: 64 }, ctx: null, desc: 'NaN width' },
-    { opts: {}, ctx: { canvas: { width: 0, height: 64 } }, desc: 'canvas zero width' },
-    { opts: {}, ctx: { canvas: { width: 128.5, height: 64 } }, desc: 'canvas fractional width' },
-    { opts: {}, ctx: { canvas: { width: 0x100000000, height: 64 } }, desc: 'canvas width > u32::MAX' },
+    { opts: { width: 0, height: 64 }, ctx: null, desc: "zero width" },
+    { opts: { width: 64, height: 0 }, ctx: null, desc: "zero height" },
+    { opts: { width: -1, height: 64 }, ctx: null, desc: "negative width" },
+    { opts: { width: 64, height: -10 }, ctx: null, desc: "negative height" },
+    { opts: { width: 64.5, height: 64 }, ctx: null, desc: "fractional width" },
+    { opts: { width: 64, height: 64.25 }, ctx: null, desc: "fractional height" },
+    { opts: { width: 0x100000000, height: 64 }, ctx: null, desc: "width > u32::MAX" },
+    { opts: { width: 64, height: 1e12 }, ctx: null, desc: "height > u32::MAX" },
+    { opts: { width: NaN, height: 64 }, ctx: null, desc: "NaN width" },
+    { opts: {}, ctx: { canvas: { width: 0, height: 64 } }, desc: "canvas zero width" },
+    { opts: {}, ctx: { canvas: { width: 128.5, height: 64 } }, desc: "canvas fractional width" },
+    {
+      opts: {},
+      ctx: { canvas: { width: 0x100000000, height: 64 } },
+      desc: "canvas width > u32::MAX",
+    },
   ];
 
   for (const tc of cases) {
@@ -5801,14 +6925,14 @@ test('scene.background: empty Color scene rejects invalid dimensions without cal
 
     await assert.rejects(
       () => renderScene(mockBridgeHost, scene, camera, tc.ctx, mockWasm, tc.opts),
-      (err) => err.code === 'INVALID_DIMENSIONS' || err.reason === 'INVALID_DIMENSIONS'
+      (err) => err.code === "INVALID_DIMENSIONS" || err.reason === "INVALID_DIMENSIONS",
     );
     assert.equal(wasmCalled, false, `builder must not be called for ${tc.desc}`);
     assert.equal(bridgeCalled, false, `bridge must not be called for ${tc.desc}`);
   }
 });
 
-test('Near-plane clip convention: explicit sourceBackend=webgl uses WebGLCoordinateSystem for frustum and sets webglDepth=true', async () => {
+test("Near-plane clip convention: explicit sourceBackend=webgl uses WebGLCoordinateSystem for frustum and sets webglDepth=true", async () => {
   const camera = new THREE.PerspectiveCamera(60, 1, 0.1, 10);
   camera.coordinateSystem = THREE.WebGPUCoordinateSystem;
   camera.updateProjectionMatrix();
@@ -5817,27 +6941,52 @@ test('Near-plane clip convention: explicit sourceBackend=webgl uses WebGLCoordin
 
   // Tiny red triangle around z = -0.075 with x/y in [-0.003, 0.003]
   const geom = new THREE.BufferGeometry();
-  geom.setAttribute('position', new THREE.BufferAttribute(new Float32Array([
-    -0.003, -0.003, -0.075,
-     0.003, -0.003, -0.075,
-     0.000,  0.003, -0.075,
-  ]), 3));
+  geom.setAttribute(
+    "position",
+    new THREE.BufferAttribute(
+      new Float32Array([-0.003, -0.003, -0.075, 0.003, -0.003, -0.075, 0.0, 0.003, -0.075]),
+      3,
+    ),
+  );
   geom.computeBoundingSphere();
-  const mesh = new THREE.Mesh(geom, new THREE.MeshBasicMaterial({ color: 0xff0000, side: THREE.DoubleSide }));
+  const mesh = new THREE.Mesh(
+    geom,
+    new THREE.MeshBasicMaterial({ color: 0xff0000, side: THREE.DoubleSide }),
+  );
   mesh.updateMatrixWorld();
 
   // 1. extractMeshRenderData verification
   const snapDefault = extractMeshRenderData(mesh, camera, 64, 64);
-  assert.equal(snapDefault.webglDepth, false, 'Default must preserve camera.coordinateSystem WebGPU depth (webglDepth=false)');
-  assert.deepEqual(Array.from(camera.projectionMatrix.elements), origElements, 'Matrix elements must not be mutated');
+  assert.equal(
+    snapDefault.webglDepth,
+    false,
+    "Default must preserve camera.coordinateSystem WebGPU depth (webglDepth=false)",
+  );
+  assert.deepEqual(
+    Array.from(camera.projectionMatrix.elements),
+    origElements,
+    "Matrix elements must not be mutated",
+  );
 
-  const snapWebGPU = extractMeshRenderData(mesh, camera, 64, 64, { sourceBackend: 'webgpu' });
-  assert.equal(snapWebGPU.webglDepth, false, 'Explicit sourceBackend=webgpu must keep webglDepth=false');
-  assert.deepEqual(Array.from(camera.projectionMatrix.elements), origElements, 'Matrix elements must not be mutated');
+  const snapWebGPU = extractMeshRenderData(mesh, camera, 64, 64, { sourceBackend: "webgpu" });
+  assert.equal(
+    snapWebGPU.webglDepth,
+    false,
+    "Explicit sourceBackend=webgpu must keep webglDepth=false",
+  );
+  assert.deepEqual(
+    Array.from(camera.projectionMatrix.elements),
+    origElements,
+    "Matrix elements must not be mutated",
+  );
 
-  const snapWebGL = extractMeshRenderData(mesh, camera, 64, 64, { sourceBackend: 'webgl' });
-  assert.equal(snapWebGL.webglDepth, true, 'Explicit sourceBackend=webgl must set webglDepth=true');
-  assert.deepEqual(Array.from(camera.projectionMatrix.elements), origElements, 'Matrix elements must not be mutated');
+  const snapWebGL = extractMeshRenderData(mesh, camera, 64, 64, { sourceBackend: "webgl" });
+  assert.equal(snapWebGL.webglDepth, true, "Explicit sourceBackend=webgl must set webglDepth=true");
+  assert.deepEqual(
+    Array.from(camera.projectionMatrix.elements),
+    origElements,
+    "Matrix elements must not be mutated",
+  );
 
   // 2. renderScene frustum culling verification
   const scene = new THREE.Scene();
@@ -5845,36 +6994,83 @@ test('Near-plane clip convention: explicit sourceBackend=webgl uses WebGLCoordin
 
   let capturedArgs = null;
   const mockWasm = {
-    f3d_build_mesh_batch_packet: (flatPos, vCounts, mvs, proj, cols, w, h, webglDepth, dt, dw, dc, canvas) => {
+    f3d_build_mesh_batch_packet: (
+      flatPos,
+      vCounts,
+      mvs,
+      proj,
+      cols,
+      w,
+      h,
+      webglDepth,
+      dt,
+      dw,
+      dc,
+      canvas,
+    ) => {
       capturedArgs = { flatPos, vCounts, mvs, proj, cols, w, h, webglDepth, dt, dw, dc, canvas };
       return new Uint8Array([1, 2, 3]);
     },
   };
   const mockBridgeHost = {
-    executePacket: async () => ({ status: 'OK' }),
+    executePacket: async () => ({ status: "OK" }),
   };
 
   // Default / WebGPU: near plane is at z = -0.1. Triangle at z = -0.075 is culled!
   const resDefault = await renderScene(mockBridgeHost, scene, camera, null, mockWasm);
-  assert.deepEqual(resDefault.admitted, [], 'Default must cull mesh in front of WebGPU near plane (-0.1)');
+  assert.deepEqual(
+    resDefault.admitted,
+    [],
+    "Default must cull mesh in front of WebGPU near plane (-0.1)",
+  );
 
-  const resWebGPU = await renderScene(mockBridgeHost, scene, camera, null, mockWasm, { sourceBackend: 'webgpu' });
-  assert.deepEqual(resWebGPU.admitted, [], 'Explicit webgpu must cull mesh in front of WebGPU near plane (-0.1)');
+  const resWebGPU = await renderScene(mockBridgeHost, scene, camera, null, mockWasm, {
+    sourceBackend: "webgpu",
+  });
+  assert.deepEqual(
+    resWebGPU.admitted,
+    [],
+    "Explicit webgpu must cull mesh in front of WebGPU near plane (-0.1)",
+  );
 
   // Explicit WebGL: WebGLRenderer uses WebGLCoordinateSystem for frustum, near plane is at z = -0.05025.
   // Triangle at z = -0.075 is inside near plane and admitted!
-  const resWebGL = await renderScene(mockBridgeHost, scene, camera, null, mockWasm, { sourceBackend: 'webgl' });
-  assert.deepEqual(resWebGL.admitted, [mesh.uuid], 'Explicit webgl must admit mesh inside WebGL near plane (-0.05025)');
-  assert.ok(capturedArgs, 'Wasm batch builder must have been called');
-  assert.equal(capturedArgs.webglDepth, true, 'Explicit webgl must pass webglDepth=true to Wasm batch builder');
-  assert.deepEqual(Array.from(capturedArgs.proj), origElements, 'Projection matrix passed to Wasm must equal original camera matrix bytes');
-  assert.deepEqual(Array.from(camera.projectionMatrix.elements), origElements, 'Camera projection matrix must remain unmutated');
+  const resWebGL = await renderScene(mockBridgeHost, scene, camera, null, mockWasm, {
+    sourceBackend: "webgl",
+  });
+  assert.deepEqual(
+    resWebGL.admitted,
+    [mesh.uuid],
+    "Explicit webgl must admit mesh inside WebGL near plane (-0.05025)",
+  );
+  assert.ok(capturedArgs, "Wasm batch builder must have been called");
+  assert.equal(
+    capturedArgs.webglDepth,
+    true,
+    "Explicit webgl must pass webglDepth=true to Wasm batch builder",
+  );
+  assert.deepEqual(
+    Array.from(capturedArgs.proj),
+    origElements,
+    "Projection matrix passed to Wasm must equal original camera matrix bytes",
+  );
+  assert.deepEqual(
+    Array.from(camera.projectionMatrix.elements),
+    origElements,
+    "Camera projection matrix must remain unmutated",
+  );
 });
 
-test('Near-plane clip convention: standard WebGL coordinate camera preserves webglDepth=true across all sourceBackend options', () => {
+test("Near-plane clip convention: standard WebGL coordinate camera preserves webglDepth=true across all sourceBackend options", () => {
   const camera = new THREE.PerspectiveCamera(60, 1, 0.1, 10);
   const mesh = createBasicTriangleMesh({ color: 0x00ff00 });
   assert.equal(extractMeshRenderData(mesh, camera, 64, 64).webglDepth, true);
-  assert.equal(extractMeshRenderData(mesh, camera, 64, 64, { sourceBackend: 'webgl' }).webglDepth, true);
-  assert.equal(extractMeshRenderData(mesh, camera, 64, 64, { sourceBackend: 'webgpu' }).webglDepth, true);
+  assert.equal(
+    extractMeshRenderData(mesh, camera, 64, 64, { sourceBackend: "webgl" }).webglDepth,
+    true,
+  );
+  assert.equal(
+    extractMeshRenderData(mesh, camera, 64, 64, { sourceBackend: "webgpu" }).webglDepth,
+    true,
+  );
 });

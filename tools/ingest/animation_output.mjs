@@ -9,28 +9,65 @@
  * Negative radiance is clamped before mapping. Alpha is not tone mapped.
  */
 export class AnimationOutputError extends Error {
-  constructor(code,message){super(`${code}: ${message}`);this.name='AnimationOutputError';this.code=code;}
+  constructor(code, message) {
+    super(`${code}: ${message}`);
+    this.name = "AnimationOutputError";
+    this.code = code;
+  }
 }
-const fail=(code,message)=>{throw new AnimationOutputError('ANIMATION_OUTPUT_'+code,message);};
-export const ANIMATION_TONE_MAPPINGS=Object.freeze(['none','linear','reinhard','cineon','aces-filmic','agx','neutral']);
-const formats=['rgba8unorm','bgra8unorm','rgba8unorm-srgb','bgra8unorm-srgb','rgba16float','rgba32float'];
-const sourceFormats=['rgba8unorm','bgra8unorm','rgba16float'];
-const alphaModes=['straight','premultiplied','opaque'];
-const object=(v,label)=>{if(!v||typeof v!=='object'||Array.isArray(v))fail('OPTIONS',`Expected ${label}`);return v;};
-const positive=(v,label)=>{if(!Number.isSafeInteger(v)||v<1)fail('TEXTURE',`Invalid ${label}`);return v;};
-export function animationOutputSettings(input,defaults){
-  const mode=input.toneMapping ?? defaults.toneMapping, exposure=input.exposure ?? defaults.exposure;
-  const inputAlpha=input.inputAlpha ?? defaults.inputAlpha, outputAlpha=input.outputAlpha ?? defaults.outputAlpha;
-  if(!ANIMATION_TONE_MAPPINGS.includes(mode))fail('TONE_MAPPING','Unknown tone mapping operator');
+const fail = (code, message) => {
+  throw new AnimationOutputError("ANIMATION_OUTPUT_" + code, message);
+};
+export const ANIMATION_TONE_MAPPINGS = Object.freeze([
+  "none",
+  "linear",
+  "reinhard",
+  "cineon",
+  "aces-filmic",
+  "agx",
+  "neutral",
+]);
+const formats = [
+  "rgba8unorm",
+  "bgra8unorm",
+  "rgba8unorm-srgb",
+  "bgra8unorm-srgb",
+  "rgba16float",
+  "rgba32float",
+];
+const sourceFormats = ["rgba8unorm", "bgra8unorm", "rgba16float"];
+const alphaModes = ["straight", "premultiplied", "opaque"];
+const object = (v, label) => {
+  if (!v || typeof v !== "object" || Array.isArray(v)) fail("OPTIONS", `Expected ${label}`);
+  return v;
+};
+const positive = (v, label) => {
+  if (!Number.isSafeInteger(v) || v < 1) fail("TEXTURE", `Invalid ${label}`);
+  return v;
+};
+export function animationOutputSettings(input, defaults) {
+  const mode = input.toneMapping ?? defaults.toneMapping,
+    exposure = input.exposure ?? defaults.exposure;
+  const inputAlpha = input.inputAlpha ?? defaults.inputAlpha,
+    outputAlpha = input.outputAlpha ?? defaults.outputAlpha;
+  if (!ANIMATION_TONE_MAPPINGS.includes(mode))
+    fail("TONE_MAPPING", "Unknown tone mapping operator");
   // Bounded f32 exposure keeps the admitted half-float radiance domain within
   // the operators' polynomial arithmetic range, including unpremultiplication.
-  if(typeof exposure!=='number'||!Number.isFinite(exposure)||exposure<0||exposure>65504)fail('EXPOSURE','Exposure must be in [0,65504]');
-  if(!['straight','premultiplied'].includes(inputAlpha)||!alphaModes.includes(outputAlpha))fail('ALPHA','Invalid alpha convention');
-  return {toneMapping:mode,exposure,inputAlpha,outputAlpha};
+  if (
+    typeof exposure !== "number" ||
+    !Number.isFinite(exposure) ||
+    exposure < 0 ||
+    exposure > 65504
+  )
+    fail("EXPOSURE", "Exposure must be in [0,65504]");
+  if (!["straight", "premultiplied"].includes(inputAlpha) || !alphaModes.includes(outputAlpha))
+    fail("ALPHA", "Invalid alpha convention");
+  return { toneMapping: mode, exposure, inputAlpha, outputAlpha };
 }
 // Column-major matrices, like the pinned GLSL constructors. Do not transpose
 // these a second time when moving between GLSL, WGSL and scalar test oracles.
-export const ANIMATION_OUTPUT_WGSL=/* wgsl */`
+export const ANIMATION_OUTPUT_WGSL = /* wgsl */ `
 struct OutputInfo { exposure: f32, mode: u32, input_premultiplied: u32, output_alpha: u32 }
 @group(0) @binding(0) var source: texture_2d<f32>;
 @group(0) @binding(1) var<uniform> info: OutputInfo;
@@ -109,100 +146,327 @@ fn tone_map(input_color: vec3<f32>) -> vec3<f32> {
  * otherwise semi-transparent pixels would be double-encoded or darkened.
  * signal cancels initialization, not an already submitted GPU operation.
  */
-export async function createGpuAnimationOutput(device,options={}) {
-  object(options,'output options');
-  for(const key of Object.keys(options))if(!['format','outputColorSpace','toneMapping','exposure','inputAlpha','outputAlpha','signal'].includes(key))fail('OPTIONS',`Unknown option: ${key}`);
-  const format=options.format ?? 'bgra8unorm',outputColorSpace=options.outputColorSpace ?? 'srgb',signal=options.signal;
-  if(!formats.includes(format)||!['linear','srgb'].includes(outputColorSpace)||format.endsWith('-srgb')&&outputColorSpace!=='srgb')fail('FORMAT','Unsupported output format/color-space combination');
-  const defaults=Object.freeze(animationOutputSettings(options,{toneMapping:'none',exposure:1,inputAlpha:'premultiplied',outputAlpha:'premultiplied'}));
-  if(signal!==undefined&&(!signal||typeof signal.addEventListener!=='function'||typeof signal.removeEventListener!=='function'))fail('OPTIONS','Expected an AbortSignal');
-  const abort=()=>{if(signal?.aborted)throw signal.reason ?? new DOMException('Aborted','AbortError');};
+export async function createGpuAnimationOutput(device, options = {}) {
+  object(options, "output options");
+  for (const key of Object.keys(options))
+    if (
+      ![
+        "format",
+        "outputColorSpace",
+        "toneMapping",
+        "exposure",
+        "inputAlpha",
+        "outputAlpha",
+        "signal",
+      ].includes(key)
+    )
+      fail("OPTIONS", `Unknown option: ${key}`);
+  const format = options.format ?? "bgra8unorm",
+    outputColorSpace = options.outputColorSpace ?? "srgb",
+    signal = options.signal;
+  if (
+    !formats.includes(format) ||
+    !["linear", "srgb"].includes(outputColorSpace) ||
+    (format.endsWith("-srgb") && outputColorSpace !== "srgb")
+  )
+    fail("FORMAT", "Unsupported output format/color-space combination");
+  const defaults = Object.freeze(
+    animationOutputSettings(options, {
+      toneMapping: "none",
+      exposure: 1,
+      inputAlpha: "premultiplied",
+      outputAlpha: "premultiplied",
+    }),
+  );
+  if (
+    signal !== undefined &&
+    (!signal ||
+      typeof signal.addEventListener !== "function" ||
+      typeof signal.removeEventListener !== "function")
+  )
+    fail("OPTIONS", "Expected an AbortSignal");
+  const abort = () => {
+    if (signal?.aborted) throw signal.reason ?? new DOMException("Aborted", "AbortError");
+  };
   abort();
-  for(const name of ['createBuffer','createShaderModule','createBindGroupLayout','createPipelineLayout','createRenderPipelineAsync','createBindGroup','createCommandEncoder','pushErrorScope','popErrorScope'])if(typeof device?.[name]!=='function')fail('DEVICE',`Missing WebGPU ${name}`);
-  for(const name of ['writeBuffer','submit','onSubmittedWorkDone'])if(typeof device.queue?.[name]!=='function')fail('DEVICE',`Missing WebGPU queue.${name}`);
-  let disposed=false,terminal=null,busy=false,uniform,pipeline,layout,boundSource,boundGroup,version=0,validation=Promise.resolve();
-  let rejectStop;const stopped=new Promise((_,reject)=>{rejectStop=reject;});stopped.catch(()=>{});
-  function release(){uniform?.destroy();uniform=undefined;boundSource=undefined;boundGroup=undefined;pipeline=undefined;layout=undefined;}
-  function stop(error){if(!terminal&&!disposed){terminal=error;release();rejectStop(error);}}
-  function live(){if(terminal)throw terminal;if(disposed)fail('DISPOSED','Output pass is disposed');}
-  if(device.lost&&typeof device.lost.then==='function')device.lost.then(info=>stop(new AnimationOutputError('ANIMATION_OUTPUT_DEVICE_LOST',info?.message ?? 'Device lost')),stop);
-  function checked(operation){
-    live();device.pushErrorScope('out-of-memory');device.pushErrorScope('validation');
-    let value,error;
-    try{value=operation();}catch(cause){error=cause;}
-    // Pop synchronously: do not capture unrelated work on this borrowed device.
-    const v=device.popErrorScope(),m=device.popErrorScope();
-    const checked=Promise.all([value,v,m]).then(([result,invalid,oom])=>{
-      if(error)throw error;
-      if(invalid||oom)fail('GPU',(invalid||oom).message ?? 'GPU output failure');
-      live();return result;
-    });
-    checked.catch(stop);return checked;
+  for (const name of [
+    "createBuffer",
+    "createShaderModule",
+    "createBindGroupLayout",
+    "createPipelineLayout",
+    "createRenderPipelineAsync",
+    "createBindGroup",
+    "createCommandEncoder",
+    "pushErrorScope",
+    "popErrorScope",
+  ])
+    if (typeof device?.[name] !== "function") fail("DEVICE", `Missing WebGPU ${name}`);
+  for (const name of ["writeBuffer", "submit", "onSubmittedWorkDone"])
+    if (typeof device.queue?.[name] !== "function") fail("DEVICE", `Missing WebGPU queue.${name}`);
+  let disposed = false,
+    terminal = null,
+    busy = false,
+    uniform,
+    pipeline,
+    layout,
+    boundSource,
+    boundGroup,
+    version = 0,
+    validation = Promise.resolve();
+  let rejectStop;
+  const stopped = new Promise((_, reject) => {
+    rejectStop = reject;
+  });
+  stopped.catch(() => {});
+  function release() {
+    uniform?.destroy();
+    uniform = undefined;
+    boundSource = undefined;
+    boundGroup = undefined;
+    pipeline = undefined;
+    layout = undefined;
   }
-  const onAbort=()=>stop(signal.reason ?? new DOMException('Aborted','AbortError'));
-  signal?.addEventListener('abort',onAbort,{once:true});
-  try{
-    abort();
-    const code=ANIMATION_OUTPUT_WGSL
-      .replace('// OUTPUT_TRANSFER',outputColorSpace==='srgb'?'color=linear_to_srgb(color);':'')
-      .replace('// ATTACHMENT_TRANSFER:',format.endsWith('-srgb')?'color=srgb_to_linear(color); //':'//');
-    const compiled=checked(()=>{
-      const module=device.createShaderModule({label:'Animation HDR output',code});
-      layout=device.createBindGroupLayout({entries:[{binding:0,visibility:2,texture:{sampleType:'unfilterable-float',viewDimension:'2d'}},
-        {binding:1,visibility:2,buffer:{type:'uniform',minBindingSize:16}}]});
-      return device.createRenderPipelineAsync({label:'Animation HDR output '+format,layout:device.createPipelineLayout({bindGroupLayouts:[layout]}),
-        vertex:{module,entryPoint:'vertex_main'},fragment:{module,entryPoint:'fragment_main',targets:[{format}]},primitive:{topology:'triangle-list'}});
+  function stop(error) {
+    if (!terminal && !disposed) {
+      terminal = error;
+      release();
+      rejectStop(error);
+    }
+  }
+  function live() {
+    if (terminal) throw terminal;
+    if (disposed) fail("DISPOSED", "Output pass is disposed");
+  }
+  if (device.lost && typeof device.lost.then === "function")
+    device.lost.then(
+      (info) =>
+        stop(
+          new AnimationOutputError("ANIMATION_OUTPUT_DEVICE_LOST", info?.message ?? "Device lost"),
+        ),
+      stop,
+    );
+  function checked(operation) {
+    live();
+    device.pushErrorScope("out-of-memory");
+    device.pushErrorScope("validation");
+    let value, error;
+    try {
+      value = operation();
+    } catch (cause) {
+      error = cause;
+    }
+    // Pop synchronously: do not capture unrelated work on this borrowed device.
+    const v = device.popErrorScope(),
+      m = device.popErrorScope();
+    const checked = Promise.all([value, v, m]).then(([result, invalid, oom]) => {
+      if (error) throw error;
+      if (invalid || oom) fail("GPU", (invalid || oom).message ?? "GPU output failure");
+      live();
+      return result;
     });
-    pipeline=await Promise.race([compiled,stopped]);live();abort();
-    await Promise.race([checked(()=>{uniform=device.createBuffer({label:'Animation output parameters',size:16,usage:8|64});}),stopped]);
-    live();abort();
-  }catch(error){release();throw error;}
-  finally{signal?.removeEventListener('abort',onAbort);}
-  function texture(input,label,usage){
-    object(input,label);
-    const result={texture:input,width:positive(input.width,label+' width'),height:positive(input.height,label+' height'),format:input.format};
-    if(input.dimension!=='2d'||input.depthOrArrayLayers!==1||input.sampleCount!==1||!Number.isInteger(input.usage)||(input.usage&usage)!==usage||typeof input.createView!=='function')fail('TEXTURE',`Invalid ${label} dimension, samples, usage or view`);
+    checked.catch(stop);
+    return checked;
+  }
+  const onAbort = () => stop(signal.reason ?? new DOMException("Aborted", "AbortError"));
+  signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    abort();
+    const code = ANIMATION_OUTPUT_WGSL.replace(
+      "// OUTPUT_TRANSFER",
+      outputColorSpace === "srgb" ? "color=linear_to_srgb(color);" : "",
+    ).replace(
+      "// ATTACHMENT_TRANSFER:",
+      format.endsWith("-srgb") ? "color=srgb_to_linear(color); //" : "//",
+    );
+    const compiled = checked(() => {
+      const module = device.createShaderModule({ label: "Animation HDR output", code });
+      layout = device.createBindGroupLayout({
+        entries: [
+          {
+            binding: 0,
+            visibility: 2,
+            texture: { sampleType: "unfilterable-float", viewDimension: "2d" },
+          },
+          { binding: 1, visibility: 2, buffer: { type: "uniform", minBindingSize: 16 } },
+        ],
+      });
+      return device.createRenderPipelineAsync({
+        label: "Animation HDR output " + format,
+        layout: device.createPipelineLayout({ bindGroupLayouts: [layout] }),
+        vertex: { module, entryPoint: "vertex_main" },
+        fragment: { module, entryPoint: "fragment_main", targets: [{ format }] },
+        primitive: { topology: "triangle-list" },
+      });
+    });
+    pipeline = await Promise.race([compiled, stopped]);
+    live();
+    abort();
+    await Promise.race([
+      checked(() => {
+        uniform = device.createBuffer({
+          label: "Animation output parameters",
+          size: 16,
+          usage: 8 | 64,
+        });
+      }),
+      stopped,
+    ]);
+    live();
+    abort();
+  } catch (error) {
+    release();
+    throw error;
+  } finally {
+    signal?.removeEventListener("abort", onAbort);
+  }
+  function texture(input, label, usage) {
+    object(input, label);
+    const result = {
+      texture: input,
+      width: positive(input.width, label + " width"),
+      height: positive(input.height, label + " height"),
+      format: input.format,
+    };
+    if (
+      input.dimension !== "2d" ||
+      input.depthOrArrayLayers !== 1 ||
+      input.sampleCount !== 1 ||
+      !Number.isInteger(input.usage) ||
+      (input.usage & usage) !== usage ||
+      typeof input.createView !== "function"
+    )
+      fail("TEXTURE", `Invalid ${label} dimension, samples, usage or view`);
     return result;
   }
-  const result=Object.freeze({format,outputColorSpace,defaults,
-    get version(){return version;},get allocatedBytes(){return uniform?16:0;},
-    get disposed(){return disposed;},get failed(){return terminal!==null;},
-    render(frame){
-      live();if(busy)fail('REENTRANT','Output operation cannot be reentered');busy=true;
-      try{
-        object(frame,'output frame');
-        for(const key of Object.keys(frame))if(!['source','target','toneMapping','exposure','inputAlpha','outputAlpha'].includes(key))fail('OPTIONS',`Unknown frame option: ${key}`);
-        const source=texture(frame.source,'source',4),target=texture(frame.target,'target',16),selected=animationOutputSettings(frame,defaults);
-        if(source.texture===target.texture)fail('FEEDBACK','Source and destination must differ');
-        if(!sourceFormats.includes(source.format))fail('FORMAT','Source must contain linear rgba16float/rgba8unorm/bgra8unorm radiance');
-        if(target.format!==format&&!(format.endsWith('-srgb')&&target.format===format.slice(0,-5)))fail('FORMAT','Target format differs from the pipeline');
-        if(source.width!==target.width||source.height!==target.height)fail('EXTENT','Source and target sizes must match');
-        if(version===Number.MAX_SAFE_INTEGER)fail('VERSION','Submission counter exhausted');
-        const bytes=new ArrayBuffer(16),data=new DataView(bytes);
-        data.setFloat32(0,selected.exposure,true);data.setUint32(4,ANIMATION_TONE_MAPPINGS.indexOf(selected.toneMapping),true);
-        data.setUint32(8,selected.inputAlpha==='premultiplied'?1:0,true);data.setUint32(12,alphaModes.indexOf(selected.outputAlpha),true);
-        let syncError;
-        const next=checked(()=>{
-          try{
-            if(boundSource!==source.texture){
-              const view=source.texture.createView({dimension:'2d',baseMipLevel:0,mipLevelCount:1,baseArrayLayer:0,arrayLayerCount:1});
-              boundGroup=device.createBindGroup({layout,entries:[{binding:0,resource:view},{binding:1,resource:{buffer:uniform,size:16}}]});boundSource=source.texture;
-            }
-            const view=target.texture.createView({format,dimension:'2d',baseMipLevel:0,mipLevelCount:1,baseArrayLayer:0,arrayLayerCount:1});
-            device.queue.writeBuffer(uniform,0,bytes);
-            const encoder=device.createCommandEncoder({label:'Animation output'});
-            const pass=encoder.beginRenderPass({colorAttachments:[{view,loadOp:'clear',storeOp:'store',clearValue:[0,0,0,0]}]});
-            pass.setPipeline(pipeline);pass.setBindGroup(0,boundGroup);pass.draw(3);pass.end();
-            device.queue.submit([encoder.finish()]);
-          }catch(error){syncError=error;throw error;}
-        });
-        validation=Promise.all([validation,next]);validation.catch(stop);
-        if(syncError){stop(syncError);throw syncError;}
-        version++;return result;
-      }finally{busy=false;}
+  const result = Object.freeze({
+    format,
+    outputColorSpace,
+    defaults,
+    get version() {
+      return version;
     },
-    async whenIdle(){live();try{await Promise.race([Promise.all([validation,device.queue.onSubmittedWorkDone()]),stopped]);live();return result;}catch(error){stop(error);throw error;}},
-    dispose(){if(busy)fail('REENTRANT','Cannot dispose during output submission');if(!disposed){disposed=true;release();rejectStop(new AnimationOutputError('ANIMATION_OUTPUT_DISPOSED','Output pass disposed'));}},
+    get allocatedBytes() {
+      return uniform ? 16 : 0;
+    },
+    get disposed() {
+      return disposed;
+    },
+    get failed() {
+      return terminal !== null;
+    },
+    render(frame) {
+      live();
+      if (busy) fail("REENTRANT", "Output operation cannot be reentered");
+      busy = true;
+      try {
+        object(frame, "output frame");
+        for (const key of Object.keys(frame))
+          if (
+            !["source", "target", "toneMapping", "exposure", "inputAlpha", "outputAlpha"].includes(
+              key,
+            )
+          )
+            fail("OPTIONS", `Unknown frame option: ${key}`);
+        const source = texture(frame.source, "source", 4),
+          target = texture(frame.target, "target", 16),
+          selected = animationOutputSettings(frame, defaults);
+        if (source.texture === target.texture)
+          fail("FEEDBACK", "Source and destination must differ");
+        if (!sourceFormats.includes(source.format))
+          fail("FORMAT", "Source must contain linear rgba16float/rgba8unorm/bgra8unorm radiance");
+        if (
+          target.format !== format &&
+          !(format.endsWith("-srgb") && target.format === format.slice(0, -5))
+        )
+          fail("FORMAT", "Target format differs from the pipeline");
+        if (source.width !== target.width || source.height !== target.height)
+          fail("EXTENT", "Source and target sizes must match");
+        if (version === Number.MAX_SAFE_INTEGER) fail("VERSION", "Submission counter exhausted");
+        const bytes = new ArrayBuffer(16),
+          data = new DataView(bytes);
+        data.setFloat32(0, selected.exposure, true);
+        data.setUint32(4, ANIMATION_TONE_MAPPINGS.indexOf(selected.toneMapping), true);
+        data.setUint32(8, selected.inputAlpha === "premultiplied" ? 1 : 0, true);
+        data.setUint32(12, alphaModes.indexOf(selected.outputAlpha), true);
+        let syncError;
+        const next = checked(() => {
+          try {
+            if (boundSource !== source.texture) {
+              const view = source.texture.createView({
+                dimension: "2d",
+                baseMipLevel: 0,
+                mipLevelCount: 1,
+                baseArrayLayer: 0,
+                arrayLayerCount: 1,
+              });
+              boundGroup = device.createBindGroup({
+                layout,
+                entries: [
+                  { binding: 0, resource: view },
+                  { binding: 1, resource: { buffer: uniform, size: 16 } },
+                ],
+              });
+              boundSource = source.texture;
+            }
+            const view = target.texture.createView({
+              format,
+              dimension: "2d",
+              baseMipLevel: 0,
+              mipLevelCount: 1,
+              baseArrayLayer: 0,
+              arrayLayerCount: 1,
+            });
+            device.queue.writeBuffer(uniform, 0, bytes);
+            const encoder = device.createCommandEncoder({ label: "Animation output" });
+            const pass = encoder.beginRenderPass({
+              colorAttachments: [
+                { view, loadOp: "clear", storeOp: "store", clearValue: [0, 0, 0, 0] },
+              ],
+            });
+            pass.setPipeline(pipeline);
+            pass.setBindGroup(0, boundGroup);
+            pass.draw(3);
+            pass.end();
+            device.queue.submit([encoder.finish()]);
+          } catch (error) {
+            syncError = error;
+            throw error;
+          }
+        });
+        validation = Promise.all([validation, next]);
+        validation.catch(stop);
+        if (syncError) {
+          stop(syncError);
+          throw syncError;
+        }
+        version++;
+        return result;
+      } finally {
+        busy = false;
+      }
+    },
+    async whenIdle() {
+      live();
+      try {
+        await Promise.race([
+          Promise.all([validation, device.queue.onSubmittedWorkDone()]),
+          stopped,
+        ]);
+        live();
+        return result;
+      } catch (error) {
+        stop(error);
+        throw error;
+      }
+    },
+    dispose() {
+      if (busy) fail("REENTRANT", "Cannot dispose during output submission");
+      if (!disposed) {
+        disposed = true;
+        release();
+        rejectStop(new AnimationOutputError("ANIMATION_OUTPUT_DISPOSED", "Output pass disposed"));
+      }
+    },
   });
   return result;
 }

@@ -5,7 +5,7 @@ export const SHADOW_UNIFORM_BYTES = 96;
 // deliberately has no implicit derivatives: lit branches and alpha discard may
 // be nonuniform. See https://www.w3.org/TR/WGSL/#texturesamplecomparelevel.
 export function projectedShadowWgsl(group) {
-  return /* wgsl */`
+  return /* wgsl */ `
 struct ProjectedShadow { clip_from_world: mat4x4<f32>, options: vec4<f32>, texel: vec4<f32> }
 @group(${group}) @binding(1) var<uniform> shadow_info: ProjectedShadow;
 @group(${group}) @binding(2) var shadow_depth: texture_depth_2d;
@@ -33,24 +33,57 @@ fn projected_shadow(position: vec3<f32>, normal: vec3<f32>) -> f32 {
 
 /** Snapshot a current map before any receiver GPU work, using its owning device. */
 export function packProjectedShadow(device, input, lighting, output, fail) {
-  if (!input || typeof input !== 'object' || Array.isArray(input)) fail('ANIMATION_RENDER_SHADOW', 'Expected a projected shadow descriptor');
-  for (const key of Object.keys(input)) if (!['map', 'lightIndex', 'bias', 'normalBias', 'strength'].includes(key)) fail('ANIMATION_RENDER_SHADOW', `Unsupported shadow field: ${key}`);
-  const {map, lightIndex = 0, bias = 0.0005, normalBias = 0, strength = 1} = input;
-  if (!Number.isSafeInteger(lightIndex) || lightIndex < 0 || lightIndex >= lighting[4] ||
-      ![0,2].includes(lighting[8 + lightIndex * 16 + 7])) fail('ANIMATION_RENDER_SHADOW', 'Select an existing directional or spot light');
-  if (![bias, normalBias, strength].every(v => typeof v === 'number' && Number.isFinite(Math.fround(v))) ||
-      Math.abs(bias) > 1 || normalBias < 0 || strength < 0 || strength > 1) fail('ANIMATION_RENDER_SHADOW', 'Invalid shadow bias or strength');
-  if (typeof map?.sample !== 'function' || typeof map?.whenIdle !== 'function') fail('ANIMATION_RENDER_SHADOW', 'Expected an owned animation shadow map');
+  if (!input || typeof input !== "object" || Array.isArray(input))
+    fail("ANIMATION_RENDER_SHADOW", "Expected a projected shadow descriptor");
+  for (const key of Object.keys(input))
+    if (!["map", "lightIndex", "bias", "normalBias", "strength"].includes(key))
+      fail("ANIMATION_RENDER_SHADOW", `Unsupported shadow field: ${key}`);
+  const { map, lightIndex = 0, bias = 0.0005, normalBias = 0, strength = 1 } = input;
+  if (
+    !Number.isSafeInteger(lightIndex) ||
+    lightIndex < 0 ||
+    lightIndex >= lighting[4] ||
+    ![0, 2].includes(lighting[8 + lightIndex * 16 + 7])
+  )
+    fail("ANIMATION_RENDER_SHADOW", "Select an existing directional or spot light");
+  if (
+    ![bias, normalBias, strength].every(
+      (v) => typeof v === "number" && Number.isFinite(Math.fround(v)),
+    ) ||
+    Math.abs(bias) > 1 ||
+    normalBias < 0 ||
+    strength < 0 ||
+    strength > 1
+  )
+    fail("ANIMATION_RENDER_SHADOW", "Invalid shadow bias or strength");
+  if (typeof map?.sample !== "function" || typeof map?.whenIdle !== "function")
+    fail("ANIMATION_RENDER_SHADOW", "Expected an owned animation shadow map");
   const snapshot = map.sample(device);
-  if (!snapshot || !snapshot.view || !snapshot.sampler || !Object.isFrozen(snapshot) ||
-      !Number.isSafeInteger(snapshot.version) || snapshot.version < 1 ||
-      ![snapshot.width, snapshot.height].every(v => Number.isSafeInteger(v) && v > 0 && v <= device.limits.maxTextureDimension2D) ||
-      !Array.isArray(snapshot.viewProjection) || snapshot.viewProjection.length !== 16 ||
-      snapshot.viewProjection.some(v => typeof v !== 'number' || !Number.isFinite(Math.fround(v)))) fail('ANIMATION_RENDER_SHADOW', 'Invalid shadow map snapshot');
-  output.fill(0); output.set(snapshot.viewProjection);
-  output.set([lightIndex, bias, normalBias, strength],16);
-  output.set([1/snapshot.width,1/snapshot.height],20);
-  return {map, snapshot,
-    check() { if (map.sample(device) !== snapshot) fail('ANIMATION_RENDER_SHADOW', 'Shadow map changed while preparing the receiver'); },
+  if (
+    !snapshot ||
+    !snapshot.view ||
+    !snapshot.sampler ||
+    !Object.isFrozen(snapshot) ||
+    !Number.isSafeInteger(snapshot.version) ||
+    snapshot.version < 1 ||
+    ![snapshot.width, snapshot.height].every(
+      (v) => Number.isSafeInteger(v) && v > 0 && v <= device.limits.maxTextureDimension2D,
+    ) ||
+    !Array.isArray(snapshot.viewProjection) ||
+    snapshot.viewProjection.length !== 16 ||
+    snapshot.viewProjection.some((v) => typeof v !== "number" || !Number.isFinite(Math.fround(v)))
+  )
+    fail("ANIMATION_RENDER_SHADOW", "Invalid shadow map snapshot");
+  output.fill(0);
+  output.set(snapshot.viewProjection);
+  output.set([lightIndex, bias, normalBias, strength], 16);
+  output.set([1 / snapshot.width, 1 / snapshot.height], 20);
+  return {
+    map,
+    snapshot,
+    check() {
+      if (map.sample(device) !== snapshot)
+        fail("ANIMATION_RENDER_SHADOW", "Shadow map changed while preparing the receiver");
+    },
   };
 }

@@ -8,10 +8,10 @@
  * Supports explicit absolute file://, http://, and https:// URLs.
  */
 
-import fs from 'node:fs';
-import { fileURLToPath, pathToFileURL } from 'node:url';
-import path from 'node:path';
-import { IngestionResolutionError } from './types.mjs';
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { IngestionResolutionError } from "./types.mjs";
 
 /**
  * Normalizes a base URL (strips fragment like #inline-module-1).
@@ -19,7 +19,7 @@ import { IngestionResolutionError } from './types.mjs';
  * @returns {string}
  */
 export function getBaseUrl(url) {
-  const hashIdx = url.indexOf('#');
+  const hashIdx = url.indexOf("#");
   return hashIdx !== -1 ? url.slice(0, hashIdx) : url;
 }
 
@@ -30,7 +30,7 @@ export function getBaseUrl(url) {
  */
 export function urlToFilePath(url) {
   const parsed = new URL(url);
-  if (parsed.protocol !== 'file:') {
+  if (parsed.protocol !== "file:") {
     throw new Error(`Cannot convert non-file URL "${url}" to a file system path`);
   }
   return fileURLToPath(parsed);
@@ -44,7 +44,7 @@ export function urlToFilePath(url) {
 export function isAbsoluteUrl(specifier) {
   try {
     const parsed = new URL(specifier);
-    return ['file:', 'http:', 'https:', 'data:'].includes(parsed.protocol);
+    return ["file:", "http:", "https:", "data:"].includes(parsed.protocol);
   } catch {
     return false;
   }
@@ -68,7 +68,7 @@ function matchImportMap(specifier, referrerUrl, importMap, mapBaseUrl) {
   if (!importMap) return null;
 
   // 1. Check scopes
-  if (importMap.scopes && typeof importMap.scopes === 'object') {
+  if (importMap.scopes && typeof importMap.scopes === "object") {
     // WHATWG sorts serialized scope URLs, not their original relative spellings.
     const scopes = new Map();
     for (const [prefix, entries] of Object.entries(importMap.scopes)) {
@@ -81,7 +81,10 @@ function matchImportMap(specifier, referrerUrl, importMap, mapBaseUrl) {
       scopes.set(scopeUrl, entries);
     }
     for (const scopeBase of [...scopes.keys()].sort().reverse()) {
-      if (referrerUrl === scopeBase || (scopeBase.endsWith('/') && referrerUrl.startsWith(scopeBase))) {
+      if (
+        referrerUrl === scopeBase ||
+        (scopeBase.endsWith("/") && referrerUrl.startsWith(scopeBase))
+      ) {
         const match = matchMapEntries(specifier, referrerUrl, scopes.get(scopeBase), mapBaseUrl);
         if (match !== null) return match;
       }
@@ -89,7 +92,7 @@ function matchImportMap(specifier, referrerUrl, importMap, mapBaseUrl) {
   }
 
   // 2. Check top-level imports
-  if (importMap.imports && typeof importMap.imports === 'object') {
+  if (importMap.imports && typeof importMap.imports === "object") {
     return matchMapEntries(specifier, referrerUrl, importMap.imports, mapBaseUrl);
   }
 
@@ -106,8 +109,8 @@ function matchImportMap(specifier, referrerUrl, importMap, mapBaseUrl) {
  * @returns {string | null}
  */
 function normalizeSpecifierKey(key, mapBaseUrl) {
-  if (key === '') return null;
-  if (key.startsWith('/') || key.startsWith('./') || key.startsWith('../')) {
+  if (key === "") return null;
+  if (key.startsWith("/") || key.startsWith("./") || key.startsWith("../")) {
     try {
       return new URL(key, mapBaseUrl).href;
     } catch {
@@ -130,7 +133,7 @@ function normalizeSpecifierKey(key, mapBaseUrl) {
  * @returns {string}
  */
 function normalizeRequestSpecifier(specifier, referrerUrl) {
-  if (specifier.startsWith('/') || specifier.startsWith('./') || specifier.startsWith('../')) {
+  if (specifier.startsWith("/") || specifier.startsWith("./") || specifier.startsWith("../")) {
     try {
       return new URL(specifier, referrerUrl).href;
     } catch {
@@ -146,17 +149,17 @@ function normalizeRequestSpecifier(specifier, referrerUrl) {
 
 /** Resolve a matched address before checking the import-map slash contract. */
 function resolveMapTarget(rawKey, target, mapBaseUrl) {
-  if (typeof target !== 'string') return { blocked: true };
+  if (typeof target !== "string") return { blocked: true };
   let targetUrl;
   try {
-    const relative = target.startsWith('/') || target.startsWith('./') || target.startsWith('../');
+    const relative = target.startsWith("/") || target.startsWith("./") || target.startsWith("../");
     targetUrl = new URL(target, relative ? mapBaseUrl : undefined).href;
   } catch {
     return { blocked: true };
   }
-  if (rawKey.endsWith('/') && !targetUrl.endsWith('/')) {
+  if (rawKey.endsWith("/") && !targetUrl.endsWith("/")) {
     return {
-      error: `Invalid import map prefix mapping: target for prefix "${rawKey}" must end with "/" (got "${target}")`
+      error: `Invalid import map prefix mapping: target for prefix "${rawKey}" must end with "/" (got "${target}")`,
     };
   }
   return targetUrl;
@@ -196,31 +199,34 @@ function matchMapEntries(specifier, referrerUrl, entries, mapBaseUrl) {
   } catch {
     // Bare specifiers still participate in prefix matching.
   }
-  if (requestUrl && !['ftp:', 'file:', 'http:', 'https:', 'ws:', 'wss:'].includes(requestUrl.protocol)) {
+  if (
+    requestUrl &&
+    !["ftp:", "file:", "http:", "https:", "ws:", "wss:"].includes(requestUrl.protocol)
+  ) {
     return null;
   }
 
   // 2. Prefix match uses normalized keys; raw spelling only governs target validation.
   const prefixEntries = [...normalizedEntries.entries()]
-    .filter(([normKey]) => normKey.endsWith('/'))
+    .filter(([normKey]) => normKey.endsWith("/"))
     .sort((a, b) => b[0].length - a[0].length);
 
   for (const [normKey, { rawKey, target }] of prefixEntries) {
     if (normalizedSpecifier.startsWith(normKey)) {
       const targetUrl = resolveMapTarget(rawKey, target, mapBaseUrl);
-      if (typeof targetUrl !== 'string') return targetUrl;
+      if (typeof targetUrl !== "string") return targetUrl;
       const remainder = normalizedSpecifier.slice(normKey.length);
       let resolvedUrl;
       try {
         resolvedUrl = new URL(remainder, targetUrl).href;
       } catch {
         return {
-          error: `Cannot resolve import specifier "${specifier}": suffix cannot be parsed relative to import map prefix "${rawKey}"`
+          error: `Cannot resolve import specifier "${specifier}": suffix cannot be parsed relative to import map prefix "${rawKey}"`,
         };
       }
       if (!resolvedUrl.startsWith(targetUrl)) {
         return {
-          error: `Cannot resolve import specifier "${specifier}": backtracking above import map prefix "${rawKey}"`
+          error: `Cannot resolve import specifier "${specifier}": backtracking above import map prefix "${rawKey}"`,
         };
       }
       return resolvedUrl;
@@ -245,7 +251,7 @@ export function loadPackageJson(packageJsonPath) {
     return null;
   }
   try {
-    const raw = fs.readFileSync(packageJsonPath, 'utf-8');
+    const raw = fs.readFileSync(packageJsonPath, "utf-8");
     const parsed = JSON.parse(raw);
     PACKAGE_JSON_CACHE.set(packageJsonPath, parsed);
     return parsed;
@@ -268,16 +274,16 @@ export function clearPackageJsonCache() {
  * @param {string[]} [conditions=['import', 'default']]
  * @returns {string | null | undefined}
  */
-export function resolveExportTargetValue(target, conditions = ['import', 'default']) {
-  if (typeof target === 'string') {
+export function resolveExportTargetValue(target, conditions = ["import", "default"]) {
+  if (typeof target === "string") {
     return target;
   }
   if (target === null) {
     return null;
   }
-  if (typeof target === 'object') {
+  if (typeof target === "object") {
     for (const key of Object.keys(target)) {
-      if (key === 'default' || conditions.includes(key)) {
+      if (key === "default" || conditions.includes(key)) {
         const val = resolveExportTargetValue(target[key], conditions);
         if (val !== undefined) return val;
       }
@@ -299,71 +305,81 @@ export function resolveExportTargetValue(target, conditions = ['import', 'defaul
  * @param {any} [span] - Source span for error reporting
  * @returns {string} - Relative target path e.g. './build/three.webgpu.js'
  */
-export function resolvePackageExports(subpath, exportsField, packageJsonPath, specifier, referrerUrl, span) {
-  if (!exportsField || typeof exportsField !== 'object') {
+export function resolvePackageExports(
+  subpath,
+  exportsField,
+  packageJsonPath,
+  specifier,
+  referrerUrl,
+  span,
+) {
+  if (!exportsField || typeof exportsField !== "object") {
     throw new IngestionResolutionError(
       `Package "three" at "${packageJsonPath}" does not define a valid "exports" map`,
       specifier,
       referrerUrl,
-      span
+      span,
     );
   }
 
   // 1. Direct / exact match
-  if (Object.prototype.hasOwnProperty.call(exportsField, subpath)) {
+  if (Object.hasOwn(exportsField, subpath)) {
     const targetVal = exportsField[subpath];
-    const resolved = resolveExportTargetValue(targetVal, ['import', 'default']);
+    const resolved = resolveExportTargetValue(targetVal, ["import", "default"]);
     if (resolved === null) {
       throw new IngestionResolutionError(
         `Cannot resolve blocked package export "${specifier}" from "${referrerUrl}": mapped to null in "${packageJsonPath}"`,
         specifier,
         referrerUrl,
-        span
+        span,
       );
     }
-    if (typeof resolved === 'string') {
+    if (typeof resolved === "string") {
       return resolved;
     }
     throw new IngestionResolutionError(
       `Cannot resolve package export "${specifier}" from "${referrerUrl}": no matching condition ('import', 'default') in "${packageJsonPath}"`,
       specifier,
       referrerUrl,
-      span
+      span,
     );
   }
 
   // 2. Pattern matching for keys containing '*'
   // Node spec: longest prefix match before '*' takes precedence
   const patternKeys = Object.keys(exportsField)
-    .filter(k => k.includes('*'))
+    .filter((k) => k.includes("*"))
     .sort((a, b) => {
-      const aPrefix = a.slice(0, a.indexOf('*'));
-      const bPrefix = b.slice(0, b.indexOf('*'));
+      const aPrefix = a.slice(0, a.indexOf("*"));
+      const bPrefix = b.slice(0, b.indexOf("*"));
       return bPrefix.length - aPrefix.length;
     });
 
   for (const patternKey of patternKeys) {
-    const starIdx = patternKey.indexOf('*');
+    const starIdx = patternKey.indexOf("*");
     const prefix = patternKey.slice(0, starIdx);
     const suffix = patternKey.slice(starIdx + 1);
 
-    if (subpath.startsWith(prefix) && (suffix === '' || subpath.endsWith(suffix))) {
-      const wildcardMatch = subpath.slice(prefix.length, suffix ? subpath.length - suffix.length : undefined);
+    if (subpath.startsWith(prefix) && (suffix === "" || subpath.endsWith(suffix))) {
+      const wildcardMatch = subpath.slice(
+        prefix.length,
+        suffix ? subpath.length - suffix.length : undefined,
+      );
       const targetVal = exportsField[patternKey];
-      const resolvedTarget = resolveExportTargetValue(targetVal, ['import', 'default']);
+      const resolvedTarget = resolveExportTargetValue(targetVal, ["import", "default"]);
 
       if (resolvedTarget === null) {
         throw new IngestionResolutionError(
           `Cannot resolve blocked package export "${specifier}" from "${referrerUrl}": pattern "${patternKey}" mapped to null in "${packageJsonPath}"`,
           specifier,
           referrerUrl,
-          span
+          span,
         );
       }
 
-      if (typeof resolvedTarget === 'string') {
-        if (resolvedTarget.includes('*')) {
-          return resolvedTarget.replace('*', wildcardMatch);
+      if (typeof resolvedTarget === "string") {
+        if (resolvedTarget.includes("*")) {
+          return resolvedTarget.replace("*", wildcardMatch);
         }
         return resolvedTarget;
       }
@@ -375,7 +391,7 @@ export function resolvePackageExports(subpath, exportsField, packageJsonPath, sp
     `Cannot resolve package import "${specifier}" from "${referrerUrl}": subpath "${subpath}" is not exported by package.json at "${packageJsonPath}"`,
     specifier,
     referrerUrl,
-    span
+    span,
   );
 }
 
@@ -403,27 +419,26 @@ export function resolveModuleSpecifier(specifier, referrerUrl, importMap = {}, o
   // 1. Try import map
   const mapped = matchImportMap(specifier, referrerUrl, importMap, mapBaseUrl);
   if (mapped) {
-    if (typeof mapped === 'object' && mapped.blocked) {
+    if (typeof mapped === "object" && mapped.blocked) {
       throw new IngestionResolutionError(
         `Cannot resolve blocked import specifier "${specifier}" from "${referrerUrl}": mapped to null in import map`,
         specifier,
         referrerUrl,
-        span
+        span,
       );
     }
-    if (typeof mapped === 'object' && mapped.error) {
-      throw new IngestionResolutionError(
-        mapped.error,
-        specifier,
-        referrerUrl,
-        span
-      );
+    if (typeof mapped === "object" && mapped.error) {
+      throw new IngestionResolutionError(mapped.error, specifier, referrerUrl, span);
     }
     candidateUrl = mapped;
   } else if (isAbsoluteUrl(specifier)) {
     // 2. Explicit absolute URL (file://, http://, https://, data:)
     candidateUrl = new URL(specifier).href;
-  } else if (specifier.startsWith('./') || specifier.startsWith('../') || specifier.startsWith('/')) {
+  } else if (
+    specifier.startsWith("./") ||
+    specifier.startsWith("../") ||
+    specifier.startsWith("/")
+  ) {
     // 3. Relative or pathname specifier
     try {
       candidateUrl = new URL(specifier, referrerBase).href;
@@ -432,45 +447,47 @@ export function resolveModuleSpecifier(specifier, referrerUrl, importMap = {}, o
         `Failed to parse URL for relative specifier "${specifier}" from "${referrerUrl}": ${err.message}`,
         specifier,
         referrerUrl,
-        span
+        span,
       );
     }
-  } else if (specifier === 'three' || specifier.startsWith('three/')) {
+  } else if (specifier === "three" || specifier.startsWith("three/")) {
     // 4. Pinned Three.js package resolution via package.json exports map
     let pkgRootDir;
     let pkgRootUrl;
     if (options.packageRootUrl) {
-      if (options.packageRootUrl.startsWith('file://')) {
-        pkgRootUrl = options.packageRootUrl.endsWith('/') ? options.packageRootUrl : options.packageRootUrl + '/';
+      if (options.packageRootUrl.startsWith("file://")) {
+        pkgRootUrl = options.packageRootUrl.endsWith("/")
+          ? options.packageRootUrl
+          : options.packageRootUrl + "/";
         pkgRootDir = urlToFilePath(pkgRootUrl);
       } else {
         pkgRootDir = path.resolve(options.packageRootUrl);
-        pkgRootUrl = pathToFileURL(pkgRootDir).href + '/';
+        pkgRootUrl = pathToFileURL(pkgRootDir).href + "/";
       }
     } else {
-      pkgRootDir = path.resolve('upstream/three.js');
-      pkgRootUrl = pathToFileURL(pkgRootDir).href + '/';
+      pkgRootDir = path.resolve("upstream/three.js");
+      pkgRootUrl = pathToFileURL(pkgRootDir).href + "/";
     }
 
-    const packageJsonPath = path.join(pkgRootDir, 'package.json');
+    const packageJsonPath = path.join(pkgRootDir, "package.json");
     const pkgJson = loadPackageJson(packageJsonPath);
     if (!pkgJson) {
       throw new IngestionResolutionError(
         `Cannot resolve package import "${specifier}" from "${referrerUrl}": package.json not found at "${packageJsonPath}"`,
         specifier,
         referrerUrl,
-        span
+        span,
       );
     }
 
-    const subpath = specifier === 'three' ? '.' : './' + specifier.slice('three/'.length);
+    const subpath = specifier === "three" ? "." : "./" + specifier.slice("three/".length);
     const relativeTarget = resolvePackageExports(
       subpath,
       pkgJson.exports,
       packageJsonPath,
       specifier,
       referrerUrl,
-      span
+      span,
     );
     candidateUrl = new URL(relativeTarget, pkgRootUrl).href;
   } else {
@@ -478,12 +495,12 @@ export function resolveModuleSpecifier(specifier, referrerUrl, importMap = {}, o
       `Cannot resolve bare specifier "${specifier}" from "${referrerUrl}": no import map match and no package fallback`,
       specifier,
       referrerUrl,
-      span
+      span,
     );
   }
 
   // 5. Verify target exists if file: URL
-  if (candidateUrl.startsWith('file://')) {
+  if (candidateUrl.startsWith("file://")) {
     let filePath;
     try {
       filePath = urlToFilePath(candidateUrl);
@@ -492,7 +509,7 @@ export function resolveModuleSpecifier(specifier, referrerUrl, importMap = {}, o
         `Invalid file URL "${candidateUrl}" for specifier "${specifier}": ${err.message}`,
         specifier,
         referrerUrl,
-        span
+        span,
       );
     }
 
@@ -501,7 +518,7 @@ export function resolveModuleSpecifier(specifier, referrerUrl, importMap = {}, o
         `Cannot resolve import specifier "${specifier}" from "${referrerUrl}": target file "${filePath}" does not exist`,
         specifier,
         referrerUrl,
-        span
+        span,
       );
     }
 

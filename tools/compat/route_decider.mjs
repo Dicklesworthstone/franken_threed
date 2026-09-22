@@ -7,18 +7,18 @@
  * module graph JSON bundles (schema 1.0.0 from RubyCrane).
  */
 
-import { ExecutionRoute, EscapeReason } from './route_types.mjs';
 import {
+  evaluateGraphRoutes,
   extractGraphRoutingFacts,
   isInternalLibraryModule,
-  evaluateGraphRoutes,
   prepareRouteInputs,
-} from '../ingest/route_bridge.mjs';
+} from "../ingest/route_bridge.mjs";
+import { EscapeReason, ExecutionRoute } from "./route_types.mjs";
 
 export {
+  evaluateGraphRoutes,
   extractGraphRoutingFacts,
   isInternalLibraryModule,
-  evaluateGraphRoutes,
   prepareRouteInputs,
 };
 
@@ -56,19 +56,24 @@ export function evaluateModuleGraphRoutes(bundle, environment = {}) {
  */
 export function decideRendererRoute(input = {}) {
   let constructorName = input.constructorName;
-  let options = { ...input.options };
+  const options = { ...input.options };
   let analysis = input.analysis || {};
   let sourceSpan = input.sourceSpan;
-  let hasUnanalyzedModules = Boolean(analysis.hasUnanalyzedModules || analysis.has_unanalyzed_modules);
-
-  // Consume RubyCrane's module graph JSON (schema 1.0.0) if passed as analysis or bundle input
-  const bundle = input.moduleGraph || input.bundle || (
-    analysis && (analysis.schema_version === '1.0.0' || analysis.modules) ? analysis : null
+  let hasUnanalyzedModules = Boolean(
+    analysis.hasUnanalyzedModules || analysis.has_unanalyzed_modules,
   );
 
-  if (bundle && typeof bundle === 'object' && bundle.modules) {
+  // Consume RubyCrane's module graph JSON (schema 1.0.0) if passed as analysis or bundle input
+  const bundle =
+    input.moduleGraph ||
+    input.bundle ||
+    (analysis && (analysis.schema_version === "1.0.0" || analysis.modules) ? analysis : null);
+
+  if (bundle && typeof bundle === "object" && bundle.modules) {
     const graphFacts = extractGraphRoutingFacts(bundle);
-    hasUnanalyzedModules ||= Boolean(graphFacts.hasUnanalyzedModules || bundle.external_modules?.length);
+    hasUnanalyzedModules ||= Boolean(
+      graphFacts.hasUnanalyzedModules || bundle.external_modules?.length,
+    );
     analysis = {
       hasOpaqueGLEscapes: graphFacts.hasOpaqueGLEscapes,
       hasNativeContextAccess: graphFacts.hasNativeContextAccess,
@@ -82,7 +87,10 @@ export function decideRendererRoute(input = {}) {
       if (options.forceWebGL === undefined) {
         options.forceWebGL = site.options.forceWebGL;
       }
-      if (options.forceWebGLUnresolved === undefined && site.options.forceWebGLUnresolved !== undefined) {
+      if (
+        options.forceWebGLUnresolved === undefined &&
+        site.options.forceWebGLUnresolved !== undefined
+      ) {
         options.forceWebGLUnresolved = site.options.forceWebGLUnresolved;
       }
       if (options.canvas === undefined) {
@@ -92,33 +100,38 @@ export function decideRendererRoute(input = {}) {
     }
   }
 
-  constructorName = constructorName || 'WebGLRenderer';
-  sourceSpan = sourceSpan || 'unknown:0:0';
+  constructorName = constructorName || "WebGLRenderer";
+  sourceSpan = sourceSpan || "unknown:0:0";
 
-  const isForceWebGLUnresolved = options.forceWebGL === 'unresolved' ||
-    options.force_webgl === 'unresolved' ||
+  const isForceWebGLUnresolved =
+    options.forceWebGL === "unresolved" ||
+    options.force_webgl === "unresolved" ||
     Boolean(options.forceWebGLUnresolved || options.force_webgl_unresolved);
 
   // Explicit WebGL selection only when options.forceWebGL === true (never coerce 'unresolved' to true or false)
-  const isExplicitForceWebGL = !isForceWebGLUnresolved && Boolean(
-    options.forceWebGL === true ||
-    options.force_webgl === true ||
-    options.hasForceWebGL === true ||
-    options.has_force_webgl === true
-  );
+  const isExplicitForceWebGL =
+    !isForceWebGLUnresolved &&
+    Boolean(
+      options.forceWebGL === true ||
+        options.force_webgl === true ||
+        options.hasForceWebGL === true ||
+        options.has_force_webgl === true,
+    );
 
   const hasOpaqueGLEscapes = Boolean(analysis.hasOpaqueGLEscapes || analysis.has_opaque_gl_escapes);
-  const hasNativeContextAccess = Boolean(analysis.hasNativeContextAccess || analysis.has_native_context_access);
-  const hasUnresolvedContextAccess = Boolean(analysis.hasUnresolvedContextAccess || analysis.has_unresolved_context_access);
+  const hasNativeContextAccess = Boolean(
+    analysis.hasNativeContextAccess || analysis.has_native_context_access,
+  );
+  const hasUnresolvedContextAccess = Boolean(
+    analysis.hasUnresolvedContextAccess || analysis.has_unresolved_context_access,
+  );
 
-  const isBrowser = typeof window !== 'undefined';
+  const isBrowser = typeof window !== "undefined";
   const hostCapabilities = {
     hasWebGPU: isBrowser
-      ? (typeof navigator !== 'undefined' && 'gpu' in navigator)
+      ? typeof navigator !== "undefined" && "gpu" in navigator
       : (input.hostCapabilities?.hasWebGPU ?? true),
-    hasWebGL: isBrowser
-      ? true
-      : (input.hostCapabilities?.hasWebGL ?? true),
+    hasWebGL: isBrowser ? true : (input.hostCapabilities?.hasWebGL ?? true),
     ...input.hostCapabilities,
   };
   const specializationAvailable = input.specializationAvailable ?? false;
@@ -131,7 +144,7 @@ export function decideRendererRoute(input = {}) {
   }
 
   // Non-GPU renderers (CSS2D, CSS3D, SVG) are always retained upstream (Plan §5.1 / Bead AC)
-  if (['CSS2DRenderer', 'CSS3DRenderer', 'SVGRenderer'].includes(constructorName)) {
+  if (["CSS2DRenderer", "CSS3DRenderer", "SVGRenderer"].includes(constructorName)) {
     reasons.push(EscapeReason.EXPLICIT_SOURCE_SELECTION);
     return {
       route: ExecutionRoute.RETAINED_UPSTREAM,
@@ -142,7 +155,7 @@ export function decideRendererRoute(input = {}) {
   }
 
   // Explicit WebGL constructor always maps to exact backend
-  if (constructorName === 'WebGLRenderer') {
+  if (constructorName === "WebGLRenderer") {
     reasons.push(EscapeReason.EXPLICIT_SOURCE_SELECTION);
     return {
       route: ExecutionRoute.EXACT_BACKEND,
@@ -176,9 +189,10 @@ export function decideRendererRoute(input = {}) {
 
   // Synchronous getContext() / native handle exposure
   if (hasNativeContextAccess === true) {
-    const contextReason = hasUnresolvedContextAccess === true
-      ? EscapeReason.UNRESOLVED_NATIVE_CONTEXT_ACCESS
-      : EscapeReason.NATIVE_CONTEXT_ACCESS;
+    const contextReason =
+      hasUnresolvedContextAccess === true
+        ? EscapeReason.UNRESOLVED_NATIVE_CONTEXT_ACCESS
+        : EscapeReason.NATIVE_CONTEXT_ACCESS;
     reasons.push(contextReason);
     return {
       route: ExecutionRoute.EXACT_BACKEND,
@@ -203,11 +217,11 @@ export function decideRendererRoute(input = {}) {
   }
 
   // WebGPURenderer on capable WebGPU host
-  if (constructorName === 'WebGPURenderer') {
+  if (constructorName === "WebGPURenderer") {
     if (hasUnanalyzedModules) {
       return {
         route: ExecutionRoute.RETAINED_UPSTREAM,
-        reasons: [...reasons, 'unanalyzed-external-modules'],
+        reasons: [...reasons, "unanalyzed-external-modules"],
         sourceSpan,
         constructorName,
       };
@@ -215,7 +229,10 @@ export function decideRendererRoute(input = {}) {
     if (specializationAvailable) {
       return {
         route: ExecutionRoute.SPECIALIZED_WEBGPU,
-        reasons: reasons.length > 0 ? [...reasons, 'specialized-island-admitted'] : ['specialized-island-admitted'],
+        reasons:
+          reasons.length > 0
+            ? [...reasons, "specialized-island-admitted"]
+            : ["specialized-island-admitted"],
         sourceSpan,
         constructorName,
       };

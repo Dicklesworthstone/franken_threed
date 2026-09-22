@@ -12,9 +12,9 @@
  * needing that contract must stay on the exact retained route. CPU f64 skinning
  * is not a claim of shader-bitwise equivalence, GPU skinning, or measured speedup.
  */
-import { BufferAttribute } from '../../upstream/three.js/build/three.module.js';
-import { canAdmitMesh, createAdmissionError, prepareMeshBatchPacket } from './mesh_adapter.mjs';
-import { captureDeformationBatch, evaluateDeformationBatch } from './deformation_inputs.mjs';
+import { BufferAttribute } from "../../upstream/three.js/build/three.module.js";
+import { captureDeformationBatch, evaluateDeformationBatch } from "./deformation_inputs.mjs";
+import { canAdmitMesh, createAdmissionError, prepareMeshBatchPacket } from "./mesh_adapter.mjs";
 
 // Copy descriptors, not just values: own callback overrides must remain own
 // properties so existing admission checks cannot be bypassed by the staging view.
@@ -26,13 +26,18 @@ function view(source, replacements) {
   return Object.create(Object.getPrototypeOf(source), descriptors);
 }
 function drawViews(input, positions) {
-  return input.rows.map(row => {
-    const position = new BufferAttribute(positions.subarray(row.positionOffset, row.positionOffset + row.count * 3), 3);
+  return input.rows.map((row) => {
+    const position = new BufferAttribute(
+      positions.subarray(row.positionOffset, row.positionOffset + row.count * 3),
+      3,
+    );
     const geometry = view(row.geometry, {
-      attributes: { ...row.geometry.attributes, position }, morphAttributes: {},
+      attributes: { ...row.geometry.attributes, position },
+      morphAttributes: {},
       // This path does not run frustum traversal. Never expose the old bind-pose
       // bounds on a geometry with changed positions, including returned snapshots.
-      boundingBox: null, boundingSphere: null,
+      boundingBox: null,
+      boundingSphere: null,
     });
     return view(row.mesh, { geometry, isSkinnedMesh: false });
   });
@@ -49,12 +54,23 @@ function drawViews(input, positions) {
  * Returns the existing packet/snapshots plus deformation counts. This is actual
  * packet production, not a substitute JavaScript skinning/rendering algorithm.
  */
-export function prepareDeformedMeshBatchPacket(meshes, camera, width, height, wasmModule, options = {}) {
+export function prepareDeformedMeshBatchPacket(
+  meshes,
+  camera,
+  width,
+  height,
+  wasmModule,
+  options = {},
+) {
   if (options.autoUpdate === true) {
-    throw createAdmissionError('DEFORMATION_UPDATE_BOUNDARY', 'update world matrices, bind state, and skeleton palettes before packet preparation');
+    throw createAdmissionError(
+      "DEFORMATION_UPDATE_BOUNDARY",
+      "update world matrices, bind state, and skeleton palettes before packet preparation",
+    );
   }
   for (const dimension of [width, height]) {
-    if (!Number.isInteger(dimension) || dimension < 1 || dimension > 0xffffffff) throw createAdmissionError('INVALID_DIMENSIONS');
+    if (!Number.isInteger(dimension) || dimension < 1 || dimension > 0xffffffff)
+      throw createAdmissionError("INVALID_DIMENSIONS");
   }
   const input = captureDeformationBatch(meshes, options.deformationLimits);
   // Preflight the actual legacy material/camera/callback contract before entering
@@ -65,10 +81,20 @@ export function prepareDeformedMeshBatchPacket(meshes, camera, width, height, wa
     if (!admission.admitted) throw createAdmissionError(admission.code, `mesh ${index}`);
   }
   const positions = evaluateDeformationBatch(input, wasmModule);
-  const prepared = prepareMeshBatchPacket(drawViews(input, positions), camera, width, height,
-    wasmModule, { ...options, autoUpdate: false });
-  return { ...prepared, deformedMeshCount: input.deformedMeshCount,
-    skinnedMeshCount: input.skinnedCount, deformationVertexCount: input.vertexCount };
+  const prepared = prepareMeshBatchPacket(
+    drawViews(input, positions),
+    camera,
+    width,
+    height,
+    wasmModule,
+    { ...options, autoUpdate: false },
+  );
+  return {
+    ...prepared,
+    deformedMeshCount: input.deformedMeshCount,
+    skinnedMeshCount: input.skinnedCount,
+    deformationVertexCount: input.vertexCount,
+  };
 }
 
 /**
@@ -77,16 +103,28 @@ export function prepareDeformedMeshBatchPacket(meshes, camera, width, height, wa
  * selects honest offscreen execution. Host submission failures propagate intact.
  */
 export async function renderDeformedMeshBatch(
-  meshes, camera, bridgeHost, wasmModule, canvasContext = null, options = {},
+  meshes,
+  camera,
+  bridgeHost,
+  wasmModule,
+  canvasContext = null,
+  options = {},
 ) {
-  if (typeof bridgeHost?.executePacket !== 'function') throw new TypeError('bridgeHost.executePacket is required');
-  const target = canvasContext ? 'canvas' : 'offscreen';
+  if (typeof bridgeHost?.executePacket !== "function")
+    throw new TypeError("bridgeHost.executePacket is required");
+  const target = canvasContext ? "canvas" : "offscreen";
   if (options.target !== undefined && options.target !== target) {
-    throw createAdmissionError('DEFORMATION_TARGET', 'target conflicts with canvasContext presence');
+    throw createAdmissionError(
+      "DEFORMATION_TARGET",
+      "target conflicts with canvasContext presence",
+    );
   }
   const width = canvasContext?.canvas?.width ?? options.width ?? 64;
   const height = canvasContext?.canvas?.height ?? options.height ?? 64;
-  const prepared = prepareDeformedMeshBatchPacket(meshes, camera, width, height, wasmModule, { ...options, target });
+  const prepared = prepareDeformedMeshBatchPacket(meshes, camera, width, height, wasmModule, {
+    ...options,
+    target,
+  });
   const result = await bridgeHost.executePacket(prepared.packetBytes, canvasContext);
   return { ...prepared, result };
 }

@@ -1,13 +1,13 @@
-import fs from 'node:fs';
-import path from 'node:path';
+import fs from "node:fs";
+import path from "node:path";
 
 function isWithin(root, candidate) {
   const relative = path.relative(root, candidate);
-  return relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+  return relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
 }
 
 function accessDenied() {
-  return Object.assign(new Error('Access denied'), { code: 'EACCES' });
+  return Object.assign(new Error("Access denied"), { code: "EACCES" });
 }
 
 /**
@@ -28,7 +28,7 @@ export function resolveStaticFile(root, candidate, repositoryRoot = root) {
     if (!isWithin(realRoot, realFile)) throw accessDenied();
     return fs.statSync(realFile).isFile() ? realFile : null;
   } catch (error) {
-    if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return null;
+    if (error.code === "ENOENT" || error.code === "ENOTDIR") return null;
     throw error;
   }
 }
@@ -39,24 +39,32 @@ export function sendFileError(res, error) {
     res.destroy();
     return;
   }
-  const missing = error.code === 'ENOENT' || error.code === 'ENOTDIR';
-  const denied = error.code === 'EACCES' || error.code === 'EPERM' || error.code === 'ELOOP';
-  res.writeHead(missing ? 404 : denied ? 403 : 500, { 'Content-Type': 'text/plain; charset=utf-8' });
-  res.end(missing ? 'File not found' : denied ? 'Access denied' : 'Unable to read file');
+  const missing = error.code === "ENOENT" || error.code === "ENOTDIR";
+  const denied = error.code === "EACCES" || error.code === "EPERM" || error.code === "ELOOP";
+  res.writeHead(missing ? 404 : denied ? 403 : 500, {
+    "Content-Type": "text/plain; charset=utf-8",
+  });
+  res.end(missing ? "File not found" : denied ? "Access denied" : "Unable to read file");
 }
 
 /** Return false only for absent files/directories, allowing a safe fallback. */
-export function serveStaticFile(req, res, filePath, root, repositoryRoot, mimeTypes, {
-  fallbackType = 'application/octet-stream', headers = {},
-} = {}) {
+export function serveStaticFile(
+  req,
+  res,
+  filePath,
+  root,
+  repositoryRoot,
+  mimeTypes,
+  { fallbackType = "application/octet-stream", headers = {} } = {},
+) {
   try {
     const resolved = resolveStaticFile(root, filePath, repositoryRoot);
     if (resolved === null) return false;
     const responseHeaders = {
-      'Content-Type': mimeTypes[path.extname(filePath).toLowerCase()] || fallbackType,
+      "Content-Type": mimeTypes[path.extname(filePath).toLowerCase()] || fallbackType,
       ...headers,
     };
-    if (req.method === 'HEAD') {
+    if (req.method === "HEAD") {
       res.writeHead(200, responseHeaders);
       res.end();
       return true;
@@ -65,10 +73,10 @@ export function serveStaticFile(req, res, filePath, root, repositoryRoot, mimeTy
     // permission errors and failed reads must not become unhandled events.
     const stream = fs.createReadStream(resolved);
     const stop = () => stream.destroy();
-    res.once('close', stop);
-    stream.once('close', () => res.off('close', stop));
-    stream.once('error', (error) => sendFileError(res, error));
-    stream.once('open', () => {
+    res.once("close", stop);
+    stream.once("close", () => res.off("close", stop));
+    stream.once("error", (error) => sendFileError(res, error));
+    stream.once("open", () => {
       if (res.destroyed) return stream.destroy();
       res.writeHead(200, responseHeaders);
       stream.pipe(res);

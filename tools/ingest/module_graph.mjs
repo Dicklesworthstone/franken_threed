@@ -6,15 +6,14 @@
  * and serializes a versioned structured graph consumed by route analysis.
  */
 
-import fs from 'node:fs';
-import crypto from 'node:crypto';
-import path from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
-
-import { SCHEMA_VERSION, IngestionResolutionError } from './types.mjs';
-import { parseHtmlEntries } from './html_parser.mjs';
-import { resolveModuleSpecifier, getBaseUrl, urlToFilePath } from './resolver.mjs';
-import { analyzeModuleAst } from './ast_analyzer.mjs';
+import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { analyzeModuleAst } from "./ast_analyzer.mjs";
+import { parseHtmlEntries } from "./html_parser.mjs";
+import { getBaseUrl, resolveModuleSpecifier, urlToFilePath } from "./resolver.mjs";
+import { IngestionResolutionError, SCHEMA_VERSION } from "./types.mjs";
 
 /**
  * Computes SHA-256 hash of a string.
@@ -22,7 +21,7 @@ import { analyzeModuleAst } from './ast_analyzer.mjs';
  * @returns {string}
  */
 function sha256(content) {
-  return crypto.createHash('sha256').update(content, 'utf8').digest('hex');
+  return crypto.createHash("sha256").update(content, "utf8").digest("hex");
 }
 
 /**
@@ -31,8 +30,8 @@ function sha256(content) {
  * @returns {boolean}
  */
 function isExternalUrl(url) {
-  if (typeof url !== 'string') return false;
-  return url.startsWith('http://') || url.startsWith('https://') || url.startsWith('data:');
+  if (typeof url !== "string") return false;
+  return url.startsWith("http://") || url.startsWith("https://") || url.startsWith("data:");
 }
 
 /**
@@ -94,7 +93,7 @@ export async function buildModuleGraph(entryPath, options = {}) {
   }
 
   const entryUrl = pathToFileURL(resolvedEntryAbs).href;
-  const isHtml = entryPath.endsWith('.html') || entryPath.endsWith('.htm');
+  const isHtml = entryPath.endsWith(".html") || entryPath.endsWith(".htm");
 
   let importMap = { imports: {}, scopes: {} };
   let mapBaseUrl = entryUrl;
@@ -109,14 +108,14 @@ export async function buildModuleGraph(entryPath, options = {}) {
   const externalModules = new Set();
 
   if (isHtml) {
-    const htmlContent = fs.readFileSync(resolvedEntryAbs, 'utf-8');
+    const htmlContent = fs.readFileSync(resolvedEntryAbs, "utf-8");
     const parsedHtml = parseHtmlEntries(htmlContent, entryUrl);
     importMap = parsedHtml.importMap;
     mapBaseUrl = parsedHtml.baseUrl;
 
     for (const script of parsedHtml.moduleScripts) {
       // Preserve the script element in emitted HTML; it has no executable module.
-      if (script.src === '') continue;
+      if (script.src === "") continue;
       rootEntryIds.push(script.id);
       queue.push({
         id: script.id,
@@ -125,9 +124,9 @@ export async function buildModuleGraph(entryPath, options = {}) {
         offsets: {
           lineOffset: script.startLine - 1,
           columnOffset: script.startColumn - 1,
-          charOffset: script.startOffset
+          charOffset: script.startOffset,
         },
-        referrerUrl: entryUrl
+        referrerUrl: entryUrl,
       });
     }
 
@@ -141,7 +140,7 @@ export async function buildModuleGraph(entryPath, options = {}) {
       isInline: false,
       inlineContent: null,
       offsets: {},
-      referrerUrl: entryUrl
+      referrerUrl: entryUrl,
     });
   }
 
@@ -168,12 +167,12 @@ export async function buildModuleGraph(entryPath, options = {}) {
     } else {
       sourcePath = urlToFilePath(moduleId);
       try {
-        sourceCode = fs.readFileSync(sourcePath, 'utf-8');
+        sourceCode = fs.readFileSync(sourcePath, "utf-8");
       } catch (err) {
         throw new IngestionResolutionError(
           `Failed to read module source file "${sourcePath}": ${err.message}`,
           moduleId,
-          item.referrerUrl
+          item.referrerUrl,
         );
       }
     }
@@ -206,14 +205,14 @@ export async function buildModuleGraph(entryPath, options = {}) {
       const resolvedTarget = resolveModuleSpecifier(imp.specifier, moduleId, importMap, {
         mapBaseUrl,
         packageRootUrl: options.packageRootUrl,
-        span: imp.sourceSpan
+        span: imp.sourceSpan,
       });
 
       resolvedStaticImports.push({
         specifier: imp.specifier,
         resolved_id: resolvedTarget,
         source_span: imp.sourceSpan,
-        imported_bindings: imp.importedBindings
+        imported_bindings: imp.importedBindings,
       });
 
       // Queue target if not already visited
@@ -223,7 +222,7 @@ export async function buildModuleGraph(entryPath, options = {}) {
           isInline: false,
           inlineContent: null,
           offsets: {},
-          referrerUrl: moduleId
+          referrerUrl: moduleId,
         });
       }
     }
@@ -231,18 +230,18 @@ export async function buildModuleGraph(entryPath, options = {}) {
     // Resolve dynamic imports
     const resolvedDynamicImports = [];
     for (const dyn of analysis.dynamicImports) {
-      if (dyn.classification === 'literal' && dyn.specifier) {
+      if (dyn.classification === "literal" && dyn.specifier) {
         let resolvedTarget = null;
         try {
           resolvedTarget = resolveModuleSpecifier(dyn.specifier, moduleId, importMap, {
             mapBaseUrl,
             packageRootUrl: options.packageRootUrl,
-            span: dyn.sourceSpan
+            span: dyn.sourceSpan,
           });
         } catch (err) {
           // If literal dynamic import cannot be resolved, mark unresolved with error
           resolvedDynamicImports.push({
-            classification: 'literal',
+            classification: "literal",
             specifier: dyn.specifier,
             resolved_id: null,
             resolvedId: null,
@@ -251,13 +250,13 @@ export async function buildModuleGraph(entryPath, options = {}) {
             claimsClosure: false,
             error: err.message,
             source_span: dyn.sourceSpan,
-            sourceSpan: dyn.sourceSpan
+            sourceSpan: dyn.sourceSpan,
           });
           continue;
         }
 
         resolvedDynamicImports.push({
-          classification: 'literal',
+          classification: "literal",
           specifier: dyn.specifier,
           resolved_id: resolvedTarget,
           resolvedId: resolvedTarget,
@@ -265,7 +264,7 @@ export async function buildModuleGraph(entryPath, options = {}) {
           claims_closure: true,
           claimsClosure: true,
           source_span: dyn.sourceSpan,
-          sourceSpan: dyn.sourceSpan
+          sourceSpan: dyn.sourceSpan,
         });
 
         if (!modules.has(resolvedTarget)) {
@@ -274,10 +273,10 @@ export async function buildModuleGraph(entryPath, options = {}) {
             isInline: false,
             inlineContent: null,
             offsets: {},
-            referrerUrl: moduleId
+            referrerUrl: moduleId,
           });
         }
-      } else if (dyn.classification === 'finite_set' && (dyn.finite_set || dyn.specifiers)) {
+      } else if (dyn.classification === "finite_set" && (dyn.finite_set || dyn.specifiers)) {
         const candidates = dyn.finite_set || dyn.specifiers;
         const resolvedTargets = [];
         let allResolved = true;
@@ -287,7 +286,7 @@ export async function buildModuleGraph(entryPath, options = {}) {
             const resolvedTarget = resolveModuleSpecifier(cand, moduleId, importMap, {
               mapBaseUrl,
               packageRootUrl: options.packageRootUrl,
-              span: dyn.sourceSpan
+              span: dyn.sourceSpan,
             });
             resolvedTargets.push({
               specifier: cand,
@@ -300,7 +299,7 @@ export async function buildModuleGraph(entryPath, options = {}) {
                 isInline: false,
                 inlineContent: null,
                 offsets: {},
-                referrerUrl: moduleId
+                referrerUrl: moduleId,
               });
             }
           } catch (err) {
@@ -309,13 +308,13 @@ export async function buildModuleGraph(entryPath, options = {}) {
               specifier: cand,
               resolved_id: null,
               resolvedId: null,
-              error: err.message
+              error: err.message,
             });
           }
         }
 
         resolvedDynamicImports.push({
-          classification: 'finite_set',
+          classification: "finite_set",
           specifier: null,
           specifiers: candidates,
           candidates,
@@ -323,13 +322,13 @@ export async function buildModuleGraph(entryPath, options = {}) {
           finiteSet: candidates,
           resolved_targets: resolvedTargets,
           resolvedTargets,
-          resolved_ids: resolvedTargets.map(t => t.resolved_id).filter(Boolean),
-          resolvedIds: resolvedTargets.map(t => t.resolvedId).filter(Boolean),
+          resolved_ids: resolvedTargets.map((t) => t.resolved_id).filter(Boolean),
+          resolvedIds: resolvedTargets.map((t) => t.resolvedId).filter(Boolean),
           unresolved: !allResolved,
           claims_closure: allResolved,
           claimsClosure: allResolved,
           source_span: dyn.sourceSpan,
-          sourceSpan: dyn.sourceSpan
+          sourceSpan: dyn.sourceSpan,
         });
       } else {
         // Nonliteral dynamic import: classify and preserve as unresolved without claiming closure
@@ -342,7 +341,7 @@ export async function buildModuleGraph(entryPath, options = {}) {
           claims_closure: false,
           claimsClosure: false,
           source_span: dyn.sourceSpan,
-          sourceSpan: dyn.sourceSpan
+          sourceSpan: dyn.sourceSpan,
         });
       }
     }
@@ -365,7 +364,7 @@ export async function buildModuleGraph(entryPath, options = {}) {
       renderer_construction_sites: analysis.renderer_construction_sites,
       rendererConstructionSites: analysis.renderer_construction_sites,
       routing_facts: analysis.routing_facts,
-      routingFacts: analysis.routing_facts
+      routingFacts: analysis.routing_facts,
     };
 
     modules.set(moduleId, node);
@@ -382,11 +381,12 @@ export async function buildModuleGraph(entryPath, options = {}) {
   const worklist = [];
 
   for (const [id, node] of modules.entries()) {
-    const hasExternalStatic = node.static_imports.some(imp => isExternalUrl(imp.resolved_id));
-    const hasExternalDyn = node.dynamic_imports.some(dyn => {
+    const hasExternalStatic = node.static_imports.some((imp) => isExternalUrl(imp.resolved_id));
+    const hasExternalDyn = node.dynamic_imports.some((dyn) => {
       if (dyn.unresolved) return true;
       if (dyn.resolved_id && isExternalUrl(dyn.resolved_id)) return true;
-      if (dyn.resolved_targets && dyn.resolved_targets.some(t => isExternalUrl(t.resolved_id))) return true;
+      if (dyn.resolved_targets && dyn.resolved_targets.some((t) => isExternalUrl(t.resolved_id)))
+        return true;
       return false;
     });
 
@@ -432,14 +432,15 @@ export async function buildModuleGraph(entryPath, options = {}) {
         dyn.claimsClosure = false;
         continue;
       }
-      if (dyn.classification === 'literal') {
+      if (dyn.classification === "literal") {
         const target = dyn.resolved_id;
         const claims = Boolean(target && !isExternalUrl(target) && !tainted.has(target));
         dyn.claims_closure = claims;
         dyn.claimsClosure = claims;
-      } else if (dyn.classification === 'finite_set') {
-        const targets = (dyn.resolved_targets || []).map(t => t.resolved_id);
-        const allClosed = targets.length > 0 && targets.every(t => t && !isExternalUrl(t) && !tainted.has(t));
+      } else if (dyn.classification === "finite_set") {
+        const targets = (dyn.resolved_targets || []).map((t) => t.resolved_id);
+        const allClosed =
+          targets.length > 0 && targets.every((t) => t && !isExternalUrl(t) && !tainted.has(t));
         dyn.claims_closure = allClosed;
         dyn.claimsClosure = allClosed;
       }
@@ -449,7 +450,7 @@ export async function buildModuleGraph(entryPath, options = {}) {
   // Build adjacency map for cycle detection
   const adjacency = new Map();
   for (const [id, node] of modules.entries()) {
-    const targets = node.static_imports.map(i => i.resolved_id);
+    const targets = node.static_imports.map((i) => i.resolved_id);
     adjacency.set(id, targets);
   }
 
@@ -467,8 +468,10 @@ export async function buildModuleGraph(entryPath, options = {}) {
   for (const node of modules.values()) {
     totalStaticImports += node.static_imports.length;
     totalDynamicImports += node.dynamic_imports.length;
-    unresolvedDynamicImports += node.dynamic_imports.filter(d => d.unresolved).length;
-    totalRendererConstructionSites += node.renderer_construction_sites ? node.renderer_construction_sites.length : 0;
+    unresolvedDynamicImports += node.dynamic_imports.filter((d) => d.unresolved).length;
+    totalRendererConstructionSites += node.renderer_construction_sites
+      ? node.renderer_construction_sites.length
+      : 0;
     const facts = node.routing_facts || node.routingFacts;
     if (facts && (facts.has_unresolved_context_access || facts.hasUnresolvedContextAccess)) {
       totalUnresolvedNativeContextAccess++;
@@ -476,7 +479,12 @@ export async function buildModuleGraph(entryPath, options = {}) {
     const sites = node.renderer_construction_sites || node.rendererConstructionSites;
     if (sites) {
       for (const site of sites) {
-        if (site.forceWebGL === 'unresolved' || site.force_webgl === 'unresolved' || site.forceWebGLUnresolved || site.force_webgl_unresolved) {
+        if (
+          site.forceWebGL === "unresolved" ||
+          site.force_webgl === "unresolved" ||
+          site.forceWebGLUnresolved ||
+          site.force_webgl_unresolved
+        ) {
           totalUnresolvedForceWebGL++;
         }
       }
@@ -491,7 +499,7 @@ export async function buildModuleGraph(entryPath, options = {}) {
 
   const bundle = {
     schema_version: SCHEMA_VERSION,
-    entry_type: isHtml ? 'html' : 'module',
+    entry_type: isHtml ? "html" : "module",
     entry_path: resolvedEntryAbs,
     root_entries: rootEntryIds,
     import_map: importMap,
@@ -510,8 +518,8 @@ export async function buildModuleGraph(entryPath, options = {}) {
       total_unresolved_native_context_access: totalUnresolvedNativeContextAccess,
       totalUnresolvedNativeContextAccess,
       total_unresolved_force_webgl: totalUnresolvedForceWebGL,
-      totalUnresolvedForceWebGL
-    }
+      totalUnresolvedForceWebGL,
+    },
   };
 
   return bundle;

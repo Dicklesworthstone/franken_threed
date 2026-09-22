@@ -11,40 +11,39 @@
  * - Zero external dependencies; uses node:http, node:fs, node:path.
  */
 
-import http from 'node:http';
-import fs from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { resolveStaticFile, serveStaticFile, sendFileError } from './static-files.mjs';
-
+import fs from "node:fs";
+import http from "node:http";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
+  createDevImportMap,
   FACADE_NO_CLAIM_ATTESTATION,
   transformHtmlImportMap,
-  createDevImportMap,
-} from './index.mjs';
+} from "./index.mjs";
+import { resolveStaticFile, sendFileError, serveStaticFile } from "./static-files.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const REPO_ROOT = path.resolve(__dirname, '../..');
+const REPO_ROOT = path.resolve(__dirname, "../..");
 
 export const DEFAULT_DEV_PORT = 8080;
-export const DEFAULT_DEV_HOST = '127.0.0.1';
+export const DEFAULT_DEV_HOST = "127.0.0.1";
 
 export const MIME_TYPES = {
-  '.html': 'text/html; charset=utf-8',
-  '.js': 'application/javascript; charset=utf-8',
-  '.mjs': 'application/javascript; charset=utf-8',
-  '.css': 'text/css; charset=utf-8',
-  '.json': 'application/json; charset=utf-8',
-  '.wasm': 'application/wasm',
-  '.png': 'image/png',
-  '.jpg': 'image/jpeg',
-  '.jpeg': 'image/jpeg',
-  '.svg': 'image/svg+xml',
-  '.hdr': 'application/octet-stream',
-  '.bin': 'application/octet-stream',
-  '.glb': 'model/gltf-binary',
-  '.gltf': 'model/gltf+json',
+  ".html": "text/html; charset=utf-8",
+  ".js": "application/javascript; charset=utf-8",
+  ".mjs": "application/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".wasm": "application/wasm",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".svg": "image/svg+xml",
+  ".hdr": "application/octet-stream",
+  ".bin": "application/octet-stream",
+  ".glb": "model/gltf-binary",
+  ".gltf": "model/gltf+json",
 };
 
 /**
@@ -61,7 +60,7 @@ export const MIME_TYPES = {
  * @returns {string} JavaScript module source
  */
 export function generateRoutedWebGPUSource(options = {}) {
-  const importBase = (options.importBase || '').replace(/\/+$/, '');
+  const importBase = (options.importBase || "").replace(/\/+$/, "");
   const webgpuModulePath = `${importBase}/upstream/three.js/build/three.webgpu.js`;
   const routeTypesModulePath = `${importBase}/tools/compat/route_types.mjs`;
   const constructionAdapterModulePath = `${importBase}/tools/compat/construction_adapter.mjs`;
@@ -142,7 +141,7 @@ export const WebGPURenderer = new Proxy(UpstreamThreeWebGPU.WebGPURenderer, {
  * @returns {string} JavaScript module source
  */
 export function generateRoutedThreeRootSource(options = {}) {
-  const importBase = (options.importBase || '').replace(/\/+$/, '');
+  const importBase = (options.importBase || "").replace(/\/+$/, "");
   const modulePath = `${importBase}/upstream/three.js/build/three.module.js`;
   return `/**
  * FrankenThreeD Compatibility Facade: three (root ESM)
@@ -163,7 +162,7 @@ export * from '${modulePath}';
  * @returns {string} JavaScript module source
  */
 export function generateRoutedTslSource(options = {}) {
-  const importBase = (options.importBase || '').replace(/\/+$/, '');
+  const importBase = (options.importBase || "").replace(/\/+$/, "");
   const modulePath = `${importBase}/upstream/three.js/build/three.tsl.js`;
   return `/**
  * FrankenThreeD Compatibility Facade: three/tsl
@@ -186,38 +185,40 @@ export * from '${modulePath}';
  */
 export function createCompatDevServer(options = {}) {
   const repoRoot = path.resolve(options.repoRoot || REPO_ROOT);
-  const h1RelPath = options.h1RelativePath || 'upstream/three.js/examples/webgpu_performance_renderbundle.html';
+  const h1RelPath =
+    options.h1RelativePath || "upstream/three.js/examples/webgpu_performance_renderbundle.html";
   const h1AbsPath = path.resolve(repoRoot, h1RelPath);
 
   const server = http.createServer((req, res) => {
     // Enable CORS and headers required for WebGPU / SharedArrayBuffer
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', '*');
-    res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
-    res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "*");
+    res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+    res.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
 
-    if (req.method === 'OPTIONS') {
+    if (req.method === "OPTIONS") {
       res.writeHead(204);
       res.end();
       return;
     }
 
-    if (req.method !== 'GET' && req.method !== 'HEAD') {
-      res.writeHead(405, { Allow: 'GET, HEAD, OPTIONS', 'Content-Type': 'text/plain' });
-      res.end('Method not allowed');
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      res.writeHead(405, { Allow: "GET, HEAD, OPTIONS", "Content-Type": "text/plain" });
+      res.end("Method not allowed");
       return;
     }
 
     let pathname;
     try {
-      const urlObj = new URL(req.url, 'http://127.0.0.1');
+      const urlObj = new URL(req.url, "http://127.0.0.1");
       pathname = decodeURIComponent(urlObj.pathname);
       // Reject invalid filesystem characters and platform-dependent separators.
-      if (pathname.includes('\\') || /[\u0000-\u001f\u007f]/.test(pathname)) throw new URIError('Invalid path');
+      if (pathname.includes("\\") || /[\u0000-\u001f\u007f]/.test(pathname))
+        throw new URIError("Invalid path");
     } catch {
-      res.writeHead(400, { 'Content-Type': 'text/plain' });
-      res.end('Invalid request URL');
+      res.writeHead(400, { "Content-Type": "text/plain" });
+      res.end("Invalid request URL");
       return;
     }
     const serve = (filePath, root = repoRoot, settings = {}) =>
@@ -225,9 +226,9 @@ export function createCompatDevServer(options = {}) {
 
     // 1. Root & H1 Example Page
     if (
-      pathname === '/' ||
-      pathname === '/examples/webgpu_performance_renderbundle.html' ||
-      pathname === '/webgpu_performance_renderbundle.html'
+      pathname === "/" ||
+      pathname === "/examples/webgpu_performance_renderbundle.html" ||
+      pathname === "/webgpu_performance_renderbundle.html"
     ) {
       let h1File;
       try {
@@ -237,110 +238,116 @@ export function createCompatDevServer(options = {}) {
         return;
       }
       if (h1File === null) {
-        res.writeHead(404, { 'Content-Type': 'text/plain' });
+        res.writeHead(404, { "Content-Type": "text/plain" });
         res.end(`H1 demo file not found at: ${h1AbsPath}`);
         return;
       }
 
       try {
-        const originalHtml = fs.readFileSync(h1File, 'utf-8');
+        const originalHtml = fs.readFileSync(h1File, "utf-8");
         const transformedHtml = transformHtmlImportMap(originalHtml);
 
         res.writeHead(200, {
-          'Content-Type': 'text/html; charset=utf-8',
-          'X-FrankenThreeD-Facade': 'development-mode',
-          'X-FrankenThreeD-Attestation': FACADE_NO_CLAIM_ATTESTATION,
+          "Content-Type": "text/html; charset=utf-8",
+          "X-FrankenThreeD-Facade": "development-mode",
+          "X-FrankenThreeD-Attestation": FACADE_NO_CLAIM_ATTESTATION,
         });
         res.end(transformedHtml);
         return;
       } catch (err) {
-        res.writeHead(500, { 'Content-Type': 'text/plain' });
+        res.writeHead(500, { "Content-Type": "text/plain" });
         res.end(`Error transforming H1 HTML: ${err.message}`);
         return;
       }
     }
 
     // 1b. Favicon: return 204 No Content to eliminate error-level browser log entries
-    if (pathname === '/favicon.ico') {
+    if (pathname === "/favicon.ico") {
       res.writeHead(204, {
-        'Content-Type': 'image/x-icon',
-        'Cache-Control': 'public, max-age=86400',
+        "Content-Type": "image/x-icon",
+        "Cache-Control": "public, max-age=86400",
       });
       res.end();
       return;
     }
 
     // 2. Compatibility Facade Endpoints
-    if (pathname === '/compat-facade/webgpu.js') {
+    if (pathname === "/compat-facade/webgpu.js") {
       const source = generateRoutedWebGPUSource();
       res.writeHead(200, {
-        'Content-Type': 'application/javascript; charset=utf-8',
-        'X-FrankenThreeD-Attestation': FACADE_NO_CLAIM_ATTESTATION,
+        "Content-Type": "application/javascript; charset=utf-8",
+        "X-FrankenThreeD-Attestation": FACADE_NO_CLAIM_ATTESTATION,
       });
       res.end(source);
       return;
     }
 
-    if (pathname === '/compat-facade/three.js') {
+    if (pathname === "/compat-facade/three.js") {
       const source = generateRoutedThreeRootSource();
       res.writeHead(200, {
-        'Content-Type': 'application/javascript; charset=utf-8',
-        'X-FrankenThreeD-Attestation': FACADE_NO_CLAIM_ATTESTATION,
+        "Content-Type": "application/javascript; charset=utf-8",
+        "X-FrankenThreeD-Attestation": FACADE_NO_CLAIM_ATTESTATION,
       });
       res.end(source);
       return;
     }
 
-    if (pathname === '/compat-facade/tsl.js') {
+    if (pathname === "/compat-facade/tsl.js") {
       const source = generateRoutedTslSource();
       res.writeHead(200, {
-        'Content-Type': 'application/javascript; charset=utf-8',
-        'X-FrankenThreeD-Attestation': FACADE_NO_CLAIM_ATTESTATION,
+        "Content-Type": "application/javascript; charset=utf-8",
+        "X-FrankenThreeD-Attestation": FACADE_NO_CLAIM_ATTESTATION,
       });
       res.end(source);
       return;
     }
 
     // 3. /compat-facade/addons/* -> upstream/three.js/examples/jsm/*
-    if (pathname.startsWith('/compat-facade/addons/')) {
-      const subpath = pathname.slice('/compat-facade/addons/'.length);
-      const addonRoot = path.resolve(repoRoot, 'upstream/three.js/examples/jsm');
-      if (serve(path.resolve(addonRoot, subpath), addonRoot, {
-        fallbackType: 'application/javascript; charset=utf-8',
-        headers: { 'X-FrankenThreeD-Attestation': FACADE_NO_CLAIM_ATTESTATION },
-      })) return;
-      res.writeHead(404, { 'Content-Type': 'text/plain' });
+    if (pathname.startsWith("/compat-facade/addons/")) {
+      const subpath = pathname.slice("/compat-facade/addons/".length);
+      const addonRoot = path.resolve(repoRoot, "upstream/three.js/examples/jsm");
+      if (
+        serve(path.resolve(addonRoot, subpath), addonRoot, {
+          fallbackType: "application/javascript; charset=utf-8",
+          headers: { "X-FrankenThreeD-Attestation": FACADE_NO_CLAIM_ATTESTATION },
+        })
+      )
+        return;
+      res.writeHead(404, { "Content-Type": "text/plain" });
       res.end(`Addon not found: ${subpath}`);
       return;
     }
 
     // 4. Convenience route for H1 local relative assets (example.css, jsm/*)
-    const examplesRoot = path.resolve(repoRoot, 'upstream/three.js/examples');
-    if (pathname === '/example.css' || pathname === '/examples/example.css') {
-      if (serve(path.resolve(examplesRoot, 'example.css'), examplesRoot)) return;
+    const examplesRoot = path.resolve(repoRoot, "upstream/three.js/examples");
+    if (pathname === "/example.css" || pathname === "/examples/example.css") {
+      if (serve(path.resolve(examplesRoot, "example.css"), examplesRoot)) return;
     }
 
     // 4b. Static alias for /build/* -> upstream/three.js/build/* (source-relative ../build/* from examples)
-    if (pathname.startsWith('/build/')) {
-      const subpath = pathname.slice('/build/'.length);
-      const buildRoot = path.resolve(repoRoot, 'upstream/three.js/build');
-      if (serve(path.resolve(buildRoot, subpath), buildRoot, {
-        fallbackType: 'application/javascript; charset=utf-8',
-        headers: { 'X-FrankenThreeD-Attestation': FACADE_NO_CLAIM_ATTESTATION },
-      })) return;
+    if (pathname.startsWith("/build/")) {
+      const subpath = pathname.slice("/build/".length);
+      const buildRoot = path.resolve(repoRoot, "upstream/three.js/build");
+      if (
+        serve(path.resolve(buildRoot, subpath), buildRoot, {
+          fallbackType: "application/javascript; charset=utf-8",
+          headers: { "X-FrankenThreeD-Attestation": FACADE_NO_CLAIM_ATTESTATION },
+        })
+      )
+        return;
     }
 
     // 5. Static file serving from repo root (upstream, tools, tests)
-    const sanitizedRelPath = pathname.replace(/^\/+/, '');
+    const sanitizedRelPath = pathname.replace(/^\/+/, "");
     const candidatePath = path.resolve(repoRoot, sanitizedRelPath);
     if (serve(candidatePath)) return;
 
     // 6. Upstream examples fallback (e.g. textures, fonts, sounds, jsm)
     // Strip leading 'examples/' if present to avoid doubled examples/examples/ resolution
-    const examplesRelSubpath = sanitizedRelPath.replace(/^examples\//, '');
+    const examplesRelSubpath = sanitizedRelPath.replace(/^examples\//, "");
     if (serve(path.resolve(examplesRoot, examplesRelSubpath), examplesRoot)) return;
 
-    res.writeHead(404, { 'Content-Type': 'text/plain' });
+    res.writeHead(404, { "Content-Type": "text/plain" });
     res.end(`File not found: ${pathname}`);
   });
 
@@ -361,7 +368,7 @@ export function startDevServer(options = {}) {
   const server = createCompatDevServer(options);
 
   return new Promise((resolve, reject) => {
-    server.on('error', reject);
+    server.on("error", reject);
     server.listen(port, host, () => {
       const boundAddress = server.address();
       const actualPort = boundAddress.port;
@@ -372,8 +379,8 @@ export function startDevServer(options = {}) {
         host,
         url,
         close: () =>
-          new Promise(res => {
-            if (typeof server.closeAllConnections === 'function') {
+          new Promise((res) => {
+            if (typeof server.closeAllConnections === "function") {
               server.closeAllConnections();
             }
             server.close(res);
@@ -389,10 +396,10 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
   let host = DEFAULT_DEV_HOST;
 
   for (let i = 2; i < process.argv.length; i++) {
-    if (process.argv[i] === '--port' && process.argv[i + 1]) {
+    if (process.argv[i] === "--port" && process.argv[i + 1]) {
       port = parseInt(process.argv[i + 1], 10);
       i++;
-    } else if (process.argv[i] === '--host' && process.argv[i + 1]) {
+    } else if (process.argv[i] === "--host" && process.argv[i + 1]) {
       host = process.argv[i + 1];
       i++;
     }
@@ -401,13 +408,17 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
   startDevServer({ port, host })
     .then(({ port: actualPort, url }) => {
       console.log(`[f3d-dev-server] FrankenThreeD Compatibility Dev Server running at: ${url}/`);
-      console.log(`[f3d-dev-server] H1 Demo (WebGPU): ${url}/examples/webgpu_performance_renderbundle.html`);
-      console.log(`[f3d-dev-server] H1 Demo (WebGL):  ${url}/examples/webgpu_performance_renderbundle.html?backend=webgl`);
+      console.log(
+        `[f3d-dev-server] H1 Demo (WebGPU): ${url}/examples/webgpu_performance_renderbundle.html`,
+      );
+      console.log(
+        `[f3d-dev-server] H1 Demo (WebGL):  ${url}/examples/webgpu_performance_renderbundle.html?backend=webgl`,
+      );
       console.log(`[f3d-dev-server] Pinned Three.js r186 retained compatibility active.`);
       console.log(`[f3d-dev-server] Press Ctrl+C to terminate.`);
     })
-    .catch(err => {
-      console.error('[f3d-dev-server] Failed to start server:', err);
+    .catch((err) => {
+      console.error("[f3d-dev-server] Failed to start server:", err);
       process.exit(1);
     });
 }

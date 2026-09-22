@@ -4,22 +4,42 @@
  * hosts can use CDP document injection. Production source and definitions run
  * unchanged; this does not certify direct file navigation or a Three.js mixer.
  */
-import assert from 'node:assert/strict';
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
-import {spawn,spawnSync} from 'node:child_process';
-import {fileURLToPath} from 'node:url';
-import {hierarchyAnimationFixture,glbFixture} from './fixtures/animation/gltf_fixture.mjs';
-const browser=process.env.F3D_CHROMIUM;if(!browser)throw new Error('Set F3D_CHROMIUM to an installed Chromium executable');
-const dir=fs.mkdtempSync(path.join(os.tmpdir(),'f3d-pose-browser-')),entry=path.join(dir,'actor.glb'),out=path.join(dir,'player');
-const fixture=hierarchyAnimationFixture(64);fs.writeFileSync(entry,glbFixture(fixture.model,fixture.bytes));
-const built=spawnSync(process.execPath,[fileURLToPath(new URL('./cli.mjs',import.meta.url)),'--entry',entry,'--build-animation',out],{encoding:'utf8'});
-assert.equal(built.status,0,built.stderr);fs.renameSync(entry,entry+'.not-used');
-const encoded=source=>'data:text/javascript;base64,'+Buffer.from(source).toString('base64');
-const runtime=encoded(fs.readFileSync(path.join(out,'animation_runtime.mjs')));
-const module=encoded(fs.readFileSync(path.join(out,'animation.mjs'),'utf8').replace("'./animation_runtime.mjs'",JSON.stringify(runtime)));
-const script=`import {createPlayer} from ${JSON.stringify(module)};
+import assert from "node:assert/strict";
+import { spawn, spawnSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { glbFixture, hierarchyAnimationFixture } from "./fixtures/animation/gltf_fixture.mjs";
+
+const browser = process.env.F3D_CHROMIUM;
+if (!browser) throw new Error("Set F3D_CHROMIUM to an installed Chromium executable");
+const dir = fs.mkdtempSync(path.join(os.tmpdir(), "f3d-pose-browser-")),
+  entry = path.join(dir, "actor.glb"),
+  out = path.join(dir, "player");
+const fixture = hierarchyAnimationFixture(64);
+fs.writeFileSync(entry, glbFixture(fixture.model, fixture.bytes));
+const built = spawnSync(
+  process.execPath,
+  [
+    fileURLToPath(new URL("./cli.mjs", import.meta.url)),
+    "--entry",
+    entry,
+    "--build-animation",
+    out,
+  ],
+  { encoding: "utf8" },
+);
+assert.equal(built.status, 0, built.stderr);
+fs.renameSync(entry, entry + ".not-used");
+const encoded = (source) => "data:text/javascript;base64," + Buffer.from(source).toString("base64");
+const runtime = encoded(fs.readFileSync(path.join(out, "animation_runtime.mjs")));
+const module = encoded(
+  fs
+    .readFileSync(path.join(out, "animation.mjs"), "utf8")
+    .replace("'./animation_runtime.mjs'", JSON.stringify(runtime)),
+);
+const script = `import {createPlayer} from ${JSON.stringify(module)};
   const fail=message=>{throw new Error(message);};
   const player=createPlayer(),other=createPlayer(),palette=player.jointMatrices,world=player.worldMatrices;
   let checks=0,vertexChecks=0;
@@ -55,23 +75,113 @@ const script=`import {createPlayer} from ${JSON.stringify(module)};
   player.dispose();threw=false;try{player.sample(0);}catch{threw=true;}if(!threw)fail('Disposed player ran');
   globalThis.result={frames:60,joints:64,paletteChecks:checks,weightedVertexChecks:vertexChecks,
     morphTracks:true,quaternionTracks:true,independentPlayers:true,stableOutputs:true,reverseAndLoop:true,transactionalFailure:true,disposed:true};`;
-const html='<!doctype html><meta charset="utf-8"><title>glTF pose test</title><script>globalThis.WebAssembly=undefined;</script><script type="module" src="'+encoded(script)+'"></script>';
-if(process.env.F3D_HTML_SAMPLE)fs.writeFileSync(process.env.F3D_HTML_SAMPLE,html);
-const child=spawn(browser,['--headless=new','--no-sandbox','--disable-gpu','--disable-dev-shm-usage','--no-proxy-server','--host-resolver-rules=MAP * ~NOTFOUND','--disable-background-networking','--user-data-dir='+path.join(dir,'profile'),'--remote-debugging-port=0','about:blank']);
-let socket,timer;
-try{
-  const address=await new Promise((resolve,reject)=>{let log='';timer=setTimeout(()=>reject(new Error(log)),10000);child.on('error',reject);child.on('exit',code=>reject(new Error('Browser exited: '+code+' '+log)));child.stderr.on('data',bytes=>{log+=bytes;const match=/DevTools listening on (ws:\/\/[^\s]+)/.exec(log);if(match){clearTimeout(timer);resolve(match[1]);}});});
-  socket=new WebSocket(address);await new Promise((resolve,reject)=>{socket.addEventListener('open',resolve,{once:true});socket.addEventListener('error',reject,{once:true});});
-  let sequence=0;const pending=new Map(),errors=[],network=[];
-  socket.addEventListener('message',event=>{const m=JSON.parse(event.data);if(m.id){const p=pending.get(m.id);if(!p)return;pending.delete(m.id);clearTimeout(p.timer);m.error?p.reject(new Error(JSON.stringify(m.error))):p.resolve(m.result);}else if(m.method==='Runtime.exceptionThrown')errors.push(m.params.exceptionDetails);else if(m.method==='Network.requestWillBeSent')network.push(m.params.request.url);});
-  function command(method,params={},sessionId){const id=++sequence;return new Promise((resolve,reject)=>{const timer=setTimeout(()=>{pending.delete(id);reject(new Error('CDP timeout: '+method));},15000);pending.set(id,{resolve,reject,timer});socket.send(JSON.stringify({id,method,params,sessionId}));});}
-  const {targetId}=await command('Target.createTarget',{url:'about:blank'}),{sessionId}=await command('Target.attachToTarget',{targetId,flatten:true});
-  for(const domain of ['Page','Runtime','Network'])await command(domain+'.enable',{},sessionId);
-  await command('Network.emulateNetworkConditions',{offline:true,latency:0,downloadThroughput:0,uploadThroughput:0},sessionId);
-  const {frameTree}=await command('Page.getFrameTree',{},sessionId);await command('Page.setDocumentContent',{frameId:frameTree.frame.id,html},sessionId);
-  let result;for(let tries=0;tries<200;tries++){result=(await command('Runtime.evaluate',{expression:'globalThis.result',returnByValue:true},sessionId)).result.value;if(result||errors.length)break;await new Promise(resolve=>setTimeout(resolve,50));}
-  assert.deepEqual(errors,[],JSON.stringify(errors));assert.equal(result?.paletteChecks,3840);assert.equal(result?.weightedVertexChecks,600000);
-  const external=network.filter(url=>!url.startsWith('data:')&&url!=='about:blank');assert.deepEqual(external,[]);
-  console.log(JSON.stringify({browser:spawnSync(browser,['--version'],{encoding:'utf8'}).stdout.trim(),transport:'offline CDP document injection; source model relocated; Wasm unavailable',result,externalRequests:external},null,2));
-  await command('Browser.close');
-}finally{clearTimeout(timer);socket?.close();child.kill();}
+const html =
+  '<!doctype html><meta charset="utf-8"><title>glTF pose test</title><script>globalThis.WebAssembly=undefined;</script><script type="module" src="' +
+  encoded(script) +
+  '"></script>';
+if (process.env.F3D_HTML_SAMPLE) fs.writeFileSync(process.env.F3D_HTML_SAMPLE, html);
+const child = spawn(browser, [
+  "--headless=new",
+  "--no-sandbox",
+  "--disable-gpu",
+  "--disable-dev-shm-usage",
+  "--no-proxy-server",
+  "--host-resolver-rules=MAP * ~NOTFOUND",
+  "--disable-background-networking",
+  "--user-data-dir=" + path.join(dir, "profile"),
+  "--remote-debugging-port=0",
+  "about:blank",
+]);
+let socket, timer;
+try {
+  const address = await new Promise((resolve, reject) => {
+    let log = "";
+    timer = setTimeout(() => reject(new Error(log)), 10000);
+    child.on("error", reject);
+    child.on("exit", (code) => reject(new Error("Browser exited: " + code + " " + log)));
+    child.stderr.on("data", (bytes) => {
+      log += bytes;
+      const match = /DevTools listening on (ws:\/\/[^\s]+)/.exec(log);
+      if (match) {
+        clearTimeout(timer);
+        resolve(match[1]);
+      }
+    });
+  });
+  socket = new WebSocket(address);
+  await new Promise((resolve, reject) => {
+    socket.addEventListener("open", resolve, { once: true });
+    socket.addEventListener("error", reject, { once: true });
+  });
+  let sequence = 0;
+  const pending = new Map(),
+    errors = [],
+    network = [];
+  socket.addEventListener("message", (event) => {
+    const m = JSON.parse(event.data);
+    if (m.id) {
+      const p = pending.get(m.id);
+      if (!p) return;
+      pending.delete(m.id);
+      clearTimeout(p.timer);
+      m.error ? p.reject(new Error(JSON.stringify(m.error))) : p.resolve(m.result);
+    } else if (m.method === "Runtime.exceptionThrown") errors.push(m.params.exceptionDetails);
+    else if (m.method === "Network.requestWillBeSent") network.push(m.params.request.url);
+  });
+  function command(method, params = {}, sessionId) {
+    const id = ++sequence;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pending.delete(id);
+        reject(new Error("CDP timeout: " + method));
+      }, 15000);
+      pending.set(id, { resolve, reject, timer });
+      socket.send(JSON.stringify({ id, method, params, sessionId }));
+    });
+  }
+  const { targetId } = await command("Target.createTarget", { url: "about:blank" }),
+    { sessionId } = await command("Target.attachToTarget", { targetId, flatten: true });
+  for (const domain of ["Page", "Runtime", "Network"])
+    await command(domain + ".enable", {}, sessionId);
+  await command(
+    "Network.emulateNetworkConditions",
+    { offline: true, latency: 0, downloadThroughput: 0, uploadThroughput: 0 },
+    sessionId,
+  );
+  const { frameTree } = await command("Page.getFrameTree", {}, sessionId);
+  await command("Page.setDocumentContent", { frameId: frameTree.frame.id, html }, sessionId);
+  let result;
+  for (let tries = 0; tries < 200; tries++) {
+    result = (
+      await command(
+        "Runtime.evaluate",
+        { expression: "globalThis.result", returnByValue: true },
+        sessionId,
+      )
+    ).result.value;
+    if (result || errors.length) break;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.deepEqual(errors, [], JSON.stringify(errors));
+  assert.equal(result?.paletteChecks, 3840);
+  assert.equal(result?.weightedVertexChecks, 600000);
+  const external = network.filter((url) => !url.startsWith("data:") && url !== "about:blank");
+  assert.deepEqual(external, []);
+  console.log(
+    JSON.stringify(
+      {
+        browser: spawnSync(browser, ["--version"], { encoding: "utf8" }).stdout.trim(),
+        transport: "offline CDP document injection; source model relocated; Wasm unavailable",
+        result,
+        externalRequests: external,
+      },
+      null,
+      2,
+    ),
+  );
+  await command("Browser.close");
+} finally {
+  clearTimeout(timer);
+  socket?.close();
+  child.kill();
+}

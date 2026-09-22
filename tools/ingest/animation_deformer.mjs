@@ -19,19 +19,31 @@
  * again would double-deform the geometry. Material/UV/index data stays with the
  * loader. This is CPU execution, not a GPU acceleration or full renderer claim.
  */
-import {AnimationPoseError} from './animation_runtime.mjs';
-const fail = (code, message) => { throw new AnimationPoseError(code, message); };
+import { AnimationPoseError } from "./animation_runtime.mjs";
+
+const fail = (code, message) => {
+  throw new AnimationPoseError(code, message);
+};
 const finite = (value, label) => {
-  if (typeof value !== 'number' || !Number.isFinite(value)) fail('ANIMATION_DEFORM_VALUE', `${label} must be finite`);
+  if (typeof value !== "number" || !Number.isFinite(value))
+    fail("ANIMATION_DEFORM_VALUE", `${label} must be finite`);
   return value;
 };
 function storage(value, length, label) {
-  if (!ArrayBuffer.isView(value) || value instanceof DataView ||
-      !(value.buffer instanceof ArrayBuffer) || value.buffer.resizable || value.length !== length) {
-    fail('ANIMATION_DEFORM_STORAGE', `${label} must have fixed, unshared, attached storage`);
+  if (
+    !ArrayBuffer.isView(value) ||
+    value instanceof DataView ||
+    !(value.buffer instanceof ArrayBuffer) ||
+    value.buffer.resizable ||
+    value.length !== length
+  ) {
+    fail("ANIMATION_DEFORM_STORAGE", `${label} must have fixed, unshared, attached storage`);
   }
-  try { new Uint8Array(value.buffer, 0, 0); }
-  catch { fail('ANIMATION_DEFORM_STORAGE', `${label} is detached`); }
+  try {
+    new Uint8Array(value.buffer, 0, 0);
+  } catch {
+    fail("ANIMATION_DEFORM_STORAGE", `${label} is detached`);
+  }
 }
 
 /**
@@ -48,164 +60,252 @@ function storage(value, length, label) {
  * never advances or disposes it. A failed update publishes nothing. Evaluation
  * reuses construction-time scratch rather than allocating per-vertex objects.
  */
-export function createAnimationDeformer(pose, geometry, {maxComponents = 16777216} = {}) {
-  if (!pose || !Number.isSafeInteger(pose.nodeCount) || pose.nodeCount < 0 ||
-      !Array.isArray(pose.instances) || typeof pose.sample !== 'function') {
-    fail('ANIMATION_DEFORM_PLAYER', 'Expected an animation pose player');
+export function createAnimationDeformer(pose, geometry, { maxComponents = 16777216 } = {}) {
+  if (
+    !pose ||
+    !Number.isSafeInteger(pose.nodeCount) ||
+    pose.nodeCount < 0 ||
+    !Array.isArray(pose.instances) ||
+    typeof pose.sample !== "function"
+  ) {
+    fail("ANIMATION_DEFORM_PLAYER", "Expected an animation pose player");
   }
-  if (!geometry || typeof geometry !== 'object') fail('ANIMATION_DEFORM_GEOMETRY', 'Expected decoded geometry');
-  if (!Number.isSafeInteger(maxComponents) || maxComponents < 1) fail('ANIMATION_DEFORM_LIMIT', 'Invalid component budget');
+  if (!geometry || typeof geometry !== "object")
+    fail("ANIMATION_DEFORM_GEOMETRY", "Expected decoded geometry");
+  if (!Number.isSafeInteger(maxComponents) || maxComponents < 1)
+    fail("ANIMATION_DEFORM_LIMIT", "Invalid component budget");
   const node = geometry.node;
-  if (!Number.isInteger(node) || node < 0 || node >= pose.nodeCount) fail('ANIMATION_DEFORM_NODE', 'Invalid mesh node');
+  if (!Number.isInteger(node) || node < 0 || node >= pose.nodeCount)
+    fail("ANIMATION_DEFORM_NODE", "Invalid mesh node");
   const length = geometry.positions?.length;
   if (!Number.isSafeInteger(length) || length < 3 || length % 3 !== 0 || length > maxComponents) {
-    fail('ANIMATION_DEFORM_GEOMETRY', 'Positions must contain a bounded, nonempty XYZ array');
+    fail("ANIMATION_DEFORM_GEOMETRY", "Positions must contain a bounded, nonempty XYZ array");
   }
   const vertexCount = length / 3;
-  const {flatNormals = false} = geometry;
-  if (typeof flatNormals !== 'boolean' || (flatNormals && (vertexCount % 3 || geometry.tangents !== undefined))) {
-    fail('ANIMATION_DEFORM_NORMAL', 'flatNormals requires independent triangles without tangents');
+  const { flatNormals = false } = geometry;
+  if (
+    typeof flatNormals !== "boolean" ||
+    (flatNormals && (vertexCount % 3 || geometry.tangents !== undefined))
+  ) {
+    fail("ANIMATION_DEFORM_NORMAL", "flatNormals requires independent triangles without tangents");
   }
-  const palette = pose.jointMatrices, morphWeights = pose.morphWeights, worldMatrices = pose.worldMatrices;
-  const paletteLength = palette?.length, morphLength = morphWeights?.length;
-  storage(palette, paletteLength, 'Joint palette');
-  storage(morphWeights, morphLength, 'Morph weights');
-  storage(worldMatrices, pose.nodeCount * 16, 'World matrices');
-  storage(pose.morphOffsets, pose.nodeCount + 1, 'Morph offsets');
-  const morphStart = pose.morphOffsets[node], morphEnd = pose.morphOffsets[node + 1];
-  if (!Number.isSafeInteger(morphStart) || !Number.isSafeInteger(morphEnd) ||
-      morphStart < 0 || morphEnd < morphStart || morphEnd > morphLength) {
-    fail('ANIMATION_DEFORM_MORPH', 'Invalid node morph range');
+  const palette = pose.jointMatrices,
+    morphWeights = pose.morphWeights,
+    worldMatrices = pose.worldMatrices;
+  const paletteLength = palette?.length,
+    morphLength = morphWeights?.length;
+  storage(palette, paletteLength, "Joint palette");
+  storage(morphWeights, morphLength, "Morph weights");
+  storage(worldMatrices, pose.nodeCount * 16, "World matrices");
+  storage(pose.morphOffsets, pose.nodeCount + 1, "Morph offsets");
+  const morphStart = pose.morphOffsets[node],
+    morphEnd = pose.morphOffsets[node + 1];
+  if (
+    !Number.isSafeInteger(morphStart) ||
+    !Number.isSafeInteger(morphEnd) ||
+    morphStart < 0 ||
+    morphEnd < morphStart ||
+    morphEnd > morphLength
+  ) {
+    fail("ANIMATION_DEFORM_MORPH", "Invalid node morph range");
   }
   const targets = geometry.morphTargets ?? [];
   if (!Array.isArray(targets) || targets.length !== morphEnd - morphStart) {
-    fail('ANIMATION_DEFORM_MORPH', 'Geometry must provide every morph target for this node');
+    fail("ANIMATION_DEFORM_MORPH", "Geometry must provide every morph target for this node");
   }
   let consumed = 0;
   function copy(value, count, label) {
     if ((!Array.isArray(value) && !ArrayBuffer.isView(value)) || value.length !== count) {
-      fail('ANIMATION_DEFORM_GEOMETRY', `${label} requires ${count} components`);
+      fail("ANIMATION_DEFORM_GEOMETRY", `${label} requires ${count} components`);
     }
     if (ArrayBuffer.isView(value)) storage(value, count, label);
     consumed += count;
-    if (consumed > maxComponents) fail('ANIMATION_DEFORM_LIMIT', 'Geometry component budget exceeded');
-    return Float64Array.from(value, item => finite(item, label));
+    if (consumed > maxComponents)
+      fail("ANIMATION_DEFORM_LIMIT", "Geometry component budget exceeded");
+    return Float64Array.from(value, (item) => finite(item, label));
   }
-  const fields = [{name: 'positions', width: 3, base: copy(geometry.positions, length, 'Positions')}];
-  if (geometry.normals !== undefined) fields.push({name: 'normals', width: 3, base: copy(geometry.normals, length, 'Normals')});
+  const fields = [
+    { name: "positions", width: 3, base: copy(geometry.positions, length, "Positions") },
+  ];
+  if (geometry.normals !== undefined)
+    fields.push({ name: "normals", width: 3, base: copy(geometry.normals, length, "Normals") });
   else if (flatNormals) {
     consumed += length;
-    if (consumed > maxComponents) fail('ANIMATION_DEFORM_LIMIT', 'Generated normals exceed component budget');
-    fields.push({name: 'normals', width: 3, base: new Float64Array(length)});
+    if (consumed > maxComponents)
+      fail("ANIMATION_DEFORM_LIMIT", "Generated normals exceed component budget");
+    fields.push({ name: "normals", width: 3, base: new Float64Array(length) });
   }
   if (geometry.tangents !== undefined) {
-    const base = copy(geometry.tangents, vertexCount * 4, 'Tangents');
+    const base = copy(geometry.tangents, vertexCount * 4, "Tangents");
     for (let vertex = 0; vertex < vertexCount; vertex++) {
-      if (Math.abs(base[vertex * 4 + 3]) !== 1) fail('ANIMATION_DEFORM_GEOMETRY', 'Tangent handedness must be -1 or 1');
+      if (Math.abs(base[vertex * 4 + 3]) !== 1)
+        fail("ANIMATION_DEFORM_GEOMETRY", "Tangent handedness must be -1 or 1");
     }
-    fields.push({name: 'tangents', width: 4, base});
+    fields.push({ name: "tangents", width: 4, base });
   }
-  const fieldNames = new Set(fields.map(field => field.name));
-  const deltas = targets.map(target => {
-    if (!target || typeof target !== 'object' || Array.isArray(target)) fail('ANIMATION_DEFORM_MORPH', 'Invalid morph target');
+  const fieldNames = new Set(fields.map((field) => field.name));
+  const deltas = targets.map((target) => {
+    if (!target || typeof target !== "object" || Array.isArray(target))
+      fail("ANIMATION_DEFORM_MORPH", "Invalid morph target");
     const result = {};
     for (const name of Object.keys(target)) {
-      if (flatNormals && name !== 'positions') fail('ANIMATION_DEFORM_NORMAL', 'Flat normals require position-only morph targets');
-      if (!fieldNames.has(name)) fail('ANIMATION_DEFORM_MORPH', `Morph target ${name} lacks a supported base attribute`);
+      if (flatNormals && name !== "positions")
+        fail("ANIMATION_DEFORM_NORMAL", "Flat normals require position-only morph targets");
+      if (!fieldNames.has(name))
+        fail("ANIMATION_DEFORM_MORPH", `Morph target ${name} lacks a supported base attribute`);
       result[name] = copy(target[name], length, `Morph ${name}`);
     }
     return result;
   });
-  const found = pose.instances.filter(instance => instance.node === node);
-  if (found.length > 1) fail('ANIMATION_DEFORM_SKIN', 'Duplicate palette instances for mesh node');
-  const skin = found.length ? {...found[0]} : null;
-  let joints = null, weights = null, influences = 0;
+  const found = pose.instances.filter((instance) => instance.node === node);
+  if (found.length > 1) fail("ANIMATION_DEFORM_SKIN", "Duplicate palette instances for mesh node");
+  const skin = found.length ? { ...found[0] } : null;
+  let joints = null,
+    weights = null,
+    influences = 0;
   if (skin) {
-    if (!Number.isSafeInteger(skin.offset) || skin.offset < 0 || skin.offset % 16 ||
-        !Number.isSafeInteger(skin.jointCount) || skin.jointCount < 1 ||
-        skin.offset + skin.jointCount * 16 > paletteLength) fail('ANIMATION_DEFORM_SKIN', 'Invalid instance palette range');
+    if (
+      !Number.isSafeInteger(skin.offset) ||
+      skin.offset < 0 ||
+      skin.offset % 16 ||
+      !Number.isSafeInteger(skin.jointCount) ||
+      skin.jointCount < 1 ||
+      skin.offset + skin.jointCount * 16 > paletteLength
+    )
+      fail("ANIMATION_DEFORM_SKIN", "Invalid instance palette range");
     influences = geometry.influences ?? 4;
-    if (!Number.isInteger(influences) || influences < 1 || influences > 32) fail('ANIMATION_DEFORM_SKIN', 'Expected 1..32 influences per vertex');
-    joints = copy(geometry.joints, vertexCount * influences, 'Joint indices');
-    weights = copy(geometry.weights, vertexCount * influences, 'Skin weights');
+    if (!Number.isInteger(influences) || influences < 1 || influences > 32)
+      fail("ANIMATION_DEFORM_SKIN", "Expected 1..32 influences per vertex");
+    joints = copy(geometry.joints, vertexCount * influences, "Joint indices");
+    weights = copy(geometry.weights, vertexCount * influences, "Skin weights");
     for (let vertex = 0; vertex < vertexCount; vertex++) {
       let total = 0;
       for (let k = 0; k < influences; k++) {
         const i = vertex * influences + k;
-        if (!Number.isInteger(joints[i]) || joints[i] < 0 || joints[i] >= skin.jointCount) fail('ANIMATION_DEFORM_SKIN', 'Joint index exceeds instance palette');
-        if (weights[i] < 0) fail('ANIMATION_DEFORM_SKIN', 'Skin weights must be nonnegative');
+        if (!Number.isInteger(joints[i]) || joints[i] < 0 || joints[i] >= skin.jointCount)
+          fail("ANIMATION_DEFORM_SKIN", "Joint index exceeds instance palette");
+        if (weights[i] < 0) fail("ANIMATION_DEFORM_SKIN", "Skin weights must be nonnegative");
         total += weights[i];
       }
-      if (Math.abs(total - 1) > 1e-4) fail('ANIMATION_DEFORM_SKIN', 'Skin weights must sum to one');
+      if (Math.abs(total - 1) > 1e-4) fail("ANIMATION_DEFORM_SKIN", "Skin weights must sum to one");
     }
-  } else if (geometry.joints !== undefined || geometry.weights !== undefined || geometry.influences !== undefined) {
-    fail('ANIMATION_DEFORM_SKIN', 'Skin attributes require a skinned node instance');
+  } else if (
+    geometry.joints !== undefined ||
+    geometry.weights !== undefined ||
+    geometry.influences !== undefined
+  ) {
+    fail("ANIMATION_DEFORM_SKIN", "Skin attributes require a skinned node instance");
   }
   // Scratch and publication have disjoint storage. Output size is bounded by
   // the already charged base attributes, rather than caller-selected lengths.
-  const output = {positions: null, normals: null, tangents: null};
+  const output = { positions: null, normals: null, tangents: null };
   for (const field of fields) {
     field.scratch = new Float32Array(field.base.length);
     field.output = output[field.name] = new Float32Array(field.base.length);
   }
-  const flatNormalField = flatNormals ? fields.find(field => field.name === 'normals') : null;
-  const worldMatrix = new Float64Array(16), nextWorld = new Float64Array(16);
-  const minimum = new Float32Array(3), maximum = new Float32Array(3);
-  const nextMin = new Float32Array(3), nextMax = new Float32Array(3);
-  const bounds = Object.freeze({min: minimum, max: maximum});
-  let version = -1, poseVersion = -1, disposed = false, busy = false;
+  const flatNormalField = flatNormals ? fields.find((field) => field.name === "normals") : null;
+  const worldMatrix = new Float64Array(16),
+    nextWorld = new Float64Array(16);
+  const minimum = new Float32Array(3),
+    maximum = new Float32Array(3);
+  const nextMin = new Float32Array(3),
+    nextMax = new Float32Array(3);
+  const bounds = Object.freeze({ min: minimum, max: maximum });
+  let version = -1,
+    poseVersion = -1,
+    disposed = false,
+    busy = false;
   function checkOutputs() {
     for (const field of fields) storage(field.output, field.base.length, `Output ${field.name}`);
-    storage(worldMatrix, 16, 'Output world matrix');
-    storage(minimum, 3, 'Output minimum'); storage(maximum, 3, 'Output maximum');
+    storage(worldMatrix, 16, "Output world matrix");
+    storage(minimum, 3, "Output minimum");
+    storage(maximum, 3, "Output maximum");
   }
   function update() {
-    if (disposed) fail('ANIMATION_DEFORM_DISPOSED', 'Mesh deformer has been disposed');
-    if (busy) fail('ANIMATION_REENTRANT', 'Mesh deformation cannot be reentered');
+    if (disposed) fail("ANIMATION_DEFORM_DISPOSED", "Mesh deformer has been disposed");
+    if (busy) fail("ANIMATION_REENTRANT", "Mesh deformation cannot be reentered");
     busy = true;
     try {
-      if (pose.disposed) fail('ANIMATION_DISPOSED', 'Animation player has been disposed');
+      if (pose.disposed) fail("ANIMATION_DISPOSED", "Animation player has been disposed");
       const nextPoseVersion = pose.version;
-      if (!Number.isSafeInteger(nextPoseVersion) || nextPoseVersion < 0) fail('ANIMATION_DEFORM_PLAYER', 'Invalid pose version');
-      storage(palette, paletteLength, 'Joint palette'); storage(morphWeights, morphLength, 'Morph weights');
-      storage(worldMatrices, pose.nodeCount * 16, 'World matrices'); checkOutputs();
-      for (let i = 0; i < 16; i++) nextWorld[i] = finite(worldMatrices[node * 16 + i], 'World matrix');
-      if (nextWorld[3] !== 0 || nextWorld[7] !== 0 || nextWorld[11] !== 0 || nextWorld[15] !== 1) fail('ANIMATION_DEFORM_SKIN', 'World matrix must be affine');
-      for (let i = morphStart; i < morphEnd; i++) finite(morphWeights[i], 'Morph weight');
-      if (skin) for (let joint = 0; joint < skin.jointCount; joint++) {
-        const o = skin.offset + joint * 16;
-        for (let c = 0; c < 16; c++) finite(palette[o + c], 'Joint palette');
-        if (palette[o + 3] !== 0 || palette[o + 7] !== 0 || palette[o + 11] !== 0 || palette[o + 15] !== 1) fail('ANIMATION_DEFORM_SKIN', 'Joint matrices must be affine');
-      }
-      nextMin.fill(Infinity); nextMax.fill(-Infinity);
+      if (!Number.isSafeInteger(nextPoseVersion) || nextPoseVersion < 0)
+        fail("ANIMATION_DEFORM_PLAYER", "Invalid pose version");
+      storage(palette, paletteLength, "Joint palette");
+      storage(morphWeights, morphLength, "Morph weights");
+      storage(worldMatrices, pose.nodeCount * 16, "World matrices");
+      checkOutputs();
+      for (let i = 0; i < 16; i++)
+        nextWorld[i] = finite(worldMatrices[node * 16 + i], "World matrix");
+      if (nextWorld[3] !== 0 || nextWorld[7] !== 0 || nextWorld[11] !== 0 || nextWorld[15] !== 1)
+        fail("ANIMATION_DEFORM_SKIN", "World matrix must be affine");
+      for (let i = morphStart; i < morphEnd; i++) finite(morphWeights[i], "Morph weight");
+      if (skin)
+        for (let joint = 0; joint < skin.jointCount; joint++) {
+          const o = skin.offset + joint * 16;
+          for (let c = 0; c < 16; c++) finite(palette[o + c], "Joint palette");
+          if (
+            palette[o + 3] !== 0 ||
+            palette[o + 7] !== 0 ||
+            palette[o + 11] !== 0 ||
+            palette[o + 15] !== 1
+          )
+            fail("ANIMATION_DEFORM_SKIN", "Joint matrices must be affine");
+        }
+      nextMin.fill(Infinity);
+      nextMax.fill(-Infinity);
       for (const field of fields) {
         if (field === flatNormalField) continue;
         for (let vertex = 0; vertex < vertexCount; vertex++) {
-          const a = vertex * field.width, d = vertex * 3;
-          let x = field.base[a], y = field.base[a + 1], z = field.base[a + 2];
+          const a = vertex * field.width,
+            d = vertex * 3;
+          let x = field.base[a],
+            y = field.base[a + 1],
+            z = field.base[a + 2];
           for (let target = 0; target < deltas.length; target++) {
-            const values = deltas[target][field.name], weight = morphWeights[morphStart + target];
+            const values = deltas[target][field.name],
+              weight = morphWeights[morphStart + target];
             if (!values || weight === 0) continue;
-            x += weight * values[d]; y += weight * values[d + 1]; z += weight * values[d + 2];
+            x += weight * values[d];
+            y += weight * values[d + 1];
+            z += weight * values[d + 2];
           }
           if (skin) {
-            let sx = 0, sy = 0, sz = 0;
-            const w = field.name === 'positions' ? 1 : 0;
+            let sx = 0,
+              sy = 0,
+              sz = 0;
+            const w = field.name === "positions" ? 1 : 0;
             for (let k = 0; k < influences; k++) {
-              const i = vertex * influences + k, weight = weights[i];
+              const i = vertex * influences + k,
+                weight = weights[i];
               if (weight === 0) continue;
               const o = skin.offset + joints[i] * 16;
-              sx += weight * (palette[o] * x + palette[o + 4] * y + palette[o + 8] * z + w * palette[o + 12]);
-              sy += weight * (palette[o + 1] * x + palette[o + 5] * y + palette[o + 9] * z + w * palette[o + 13]);
-              sz += weight * (palette[o + 2] * x + palette[o + 6] * y + palette[o + 10] * z + w * palette[o + 14]);
+              sx +=
+                weight *
+                (palette[o] * x + palette[o + 4] * y + palette[o + 8] * z + w * palette[o + 12]);
+              sy +=
+                weight *
+                (palette[o + 1] * x +
+                  palette[o + 5] * y +
+                  palette[o + 9] * z +
+                  w * palette[o + 13]);
+              sz +=
+                weight *
+                (palette[o + 2] * x +
+                  palette[o + 6] * y +
+                  palette[o + 10] * z +
+                  w * palette[o + 14]);
             }
-            x = sx; y = sy; z = sz;
+            x = sx;
+            y = sy;
+            z = sz;
           }
-          field.scratch[a] = x; field.scratch[a + 1] = y; field.scratch[a + 2] = z;
+          field.scratch[a] = x;
+          field.scratch[a + 1] = y;
+          field.scratch[a + 2] = z;
           if (field.width === 4) field.scratch[a + 3] = field.base[a + 3];
           for (let axis = 0; axis < 3; axis++) {
-            const value = finite(field.scratch[a + axis], 'Deformed Float32 attribute');
-            if (field.name === 'positions') {
+            const value = finite(field.scratch[a + axis], "Deformed Float32 attribute");
+            if (field.name === "positions") {
               nextMin[axis] = Math.min(nextMin[axis], value);
               nextMax[axis] = Math.max(nextMax[axis], value);
             }
@@ -213,34 +313,64 @@ export function createAnimationDeformer(pose, geometry, {maxComponents = 1677721
         }
       }
       if (flatNormalField) {
-        const positions = fields[0].scratch, normals = flatNormalField.scratch;
+        const positions = fields[0].scratch,
+          normals = flatNormalField.scratch;
         // Final f32 positions bound edge products safely inside f64. Derive
         // normals from exactly the positions that will be published, not rest
         // normals transformed independently at three different skin weights.
         for (let i = 0; i < length; i += 9) {
-          const ax = positions[i+3]-positions[i], ay = positions[i+4]-positions[i+1], az = positions[i+5]-positions[i+2];
-          const bx = positions[i+6]-positions[i], by = positions[i+7]-positions[i+1], bz = positions[i+8]-positions[i+2];
-          const x = ay*bz-az*by, y = az*bx-ax*bz, z = ax*by-ay*bx, magnitude = Math.hypot(x,y,z);
+          const ax = positions[i + 3] - positions[i],
+            ay = positions[i + 4] - positions[i + 1],
+            az = positions[i + 5] - positions[i + 2];
+          const bx = positions[i + 6] - positions[i],
+            by = positions[i + 7] - positions[i + 1],
+            bz = positions[i + 8] - positions[i + 2];
+          const x = ay * bz - az * by,
+            y = az * bx - ax * bz,
+            z = ax * by - ay * bx,
+            magnitude = Math.hypot(x, y, z);
           for (let vertex = 0; vertex < 3; vertex++) {
             const offset = i + vertex * 3;
-            normals[offset] = magnitude ? x/magnitude : 0;
-            normals[offset+1] = magnitude ? y/magnitude : 0;
-            normals[offset+2] = magnitude ? z/magnitude : 0;
+            normals[offset] = magnitude ? x / magnitude : 0;
+            normals[offset + 1] = magnitude ? y / magnitude : 0;
+            normals[offset + 2] = magnitude ? z / magnitude : 0;
           }
         }
       }
       // No caller code runs during publication; failure above leaves all
       // published attributes, bounds, transform and version stamps unchanged.
       for (const field of fields) field.output.set(field.scratch);
-      worldMatrix.set(nextWorld); minimum.set(nextMin); maximum.set(nextMax);
-      poseVersion = nextPoseVersion; version++; return deformer;
-    } finally { busy = false; }
+      worldMatrix.set(nextWorld);
+      minimum.set(nextMin);
+      maximum.set(nextMax);
+      poseVersion = nextPoseVersion;
+      version++;
+      return deformer;
+    } finally {
+      busy = false;
+    }
   }
-  const deformer = Object.freeze({...output, node, vertexCount, worldMatrix, bounds,
+  const deformer = Object.freeze({
+    ...output,
+    node,
+    vertexCount,
+    worldMatrix,
+    bounds,
     update,
-    get version() { return version; }, get poseVersion() { return poseVersion; },
-    get disposed() { return disposed; },
-    dispose() { if (busy) fail('ANIMATION_REENTRANT', 'Cannot dispose during deformation'); disposed = true; },
+    get version() {
+      return version;
+    },
+    get poseVersion() {
+      return poseVersion;
+    },
+    get disposed() {
+      return disposed;
+    },
+    dispose() {
+      if (busy) fail("ANIMATION_REENTRANT", "Cannot dispose during deformation");
+      disposed = true;
+    },
   });
-  update(); return deformer;
+  update();
+  return deformer;
 }

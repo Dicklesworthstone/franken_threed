@@ -4,22 +4,21 @@
  * Exercises static fact extraction and routing input preparation without bundling.
  */
 
-import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import test from "node:test";
 import { pathToFileURL } from "node:url";
-
+import { decideRendererRoute, EscapeReason, ExecutionRoute } from "../compat/index.mjs";
 import {
-  isInternalLibraryModule,
-  extractGraphRoutingFacts,
-  prepareRouteInputs,
-  evaluateGraphRoutes,
+  analyzeModuleAst,
   buildModuleGraph,
-  analyzeModuleAst
+  evaluateGraphRoutes,
+  extractGraphRoutingFacts,
+  isInternalLibraryModule,
+  prepareRouteInputs,
 } from "./index.mjs";
-import { decideRendererRoute, ExecutionRoute, EscapeReason } from "../compat/index.mjs";
 
 test("Positive: extractGraphRoutingFacts aggregates application-level escapes and ignores 2D canvas", () => {
   const fakeBundle = {
@@ -33,36 +32,40 @@ test("Positive: extractGraphRoutingFacts aggregates application-level escapes an
             constructor_name: "WebGPURenderer",
             has_force_webgl: false,
             canvas_option: "c1",
-            source_span: "file:///app/main.js:10:5"
-          }
+            source_span: "file:///app/main.js:10:5",
+          },
         ],
         routing_facts: {
           has_opaque_gl_escapes: false,
           has_native_context_access: false,
-          escapes: []
-        }
+          escapes: [],
+        },
       },
       "file:///app/stats_hud.js": {
         id: "file:///app/stats_hud.js",
         routing_facts: {
           has_opaque_gl_escapes: false,
           has_native_context_access: false, // 2D canvas getContext does not trigger native context access
-          escapes: []
-        }
+          escapes: [],
+        },
       },
       "file:///three/build/three.webgpu.js": {
         id: "file:///three/build/three.webgpu.js",
         routing_facts: {
           has_opaque_gl_escapes: true, // internal Three.js fallback
           has_native_context_access: true,
-          escapes: [{ type: "opaque_gl_method_call", method: "getParameter" }]
-        }
-      }
-    }
+          escapes: [{ type: "opaque_gl_method_call", method: "getParameter" }],
+        },
+      },
+    },
   };
 
   const facts = extractGraphRoutingFacts(fakeBundle);
-  assert.equal(facts.hasOpaqueGLEscapes, false, "Internal library escapes must be filtered out by default");
+  assert.equal(
+    facts.hasOpaqueGLEscapes,
+    false,
+    "Internal library escapes must be filtered out by default",
+  );
   assert.equal(facts.hasNativeContextAccess, false);
   assert.equal(facts.constructionSites.length, 1);
   assert.equal(facts.constructionSites[0].constructorName, "WebGPURenderer");
@@ -78,20 +81,20 @@ test("Positive: Application-level GL escapes propagate across graph to all const
             constructor_name: "WebGPURenderer",
             has_force_webgl: false,
             canvas_option: null,
-            source_span: "file:///app/main.js:5:1"
-          }
+            source_span: "file:///app/main.js:5:1",
+          },
         ],
-        routing_facts: { has_opaque_gl_escapes: false, has_native_context_access: false }
+        routing_facts: { has_opaque_gl_escapes: false, has_native_context_access: false },
       },
       "file:///app/custom_shader.js": {
         id: "file:///app/custom_shader.js",
         routing_facts: {
           has_opaque_gl_escapes: true,
           has_native_context_access: false,
-          escapes: [{ type: "opaque_gl_method_call", method: "getExtension" }]
-        }
-      }
-    }
+          escapes: [{ type: "opaque_gl_method_call", method: "getExtension" }],
+        },
+      },
+    },
   };
 
   const facts = extractGraphRoutingFacts(fakeBundle);
@@ -99,7 +102,7 @@ test("Positive: Application-level GL escapes propagate across graph to all const
   assert.equal(facts.constructionSites[0].analysis.hasOpaqueGLEscapes, true);
 
   const decisions = evaluateGraphRoutes(fakeBundle, decideRendererRoute, {
-    hostCapabilities: { hasWebGPU: true, hasWebGL: true }
+    hostCapabilities: { hasWebGPU: true, hasWebGL: true },
   });
   assert.equal(decisions[0].decision.route, ExecutionRoute.EXACT_BACKEND);
   assert.ok(decisions[0].decision.reasons.includes(EscapeReason.OPAQUE_GL_ESCAPE));
@@ -111,9 +114,9 @@ test("Positive: Fallback input generated when no renderer construction site exis
     modules: {
       "file:///app/headless.js": {
         id: "file:///app/headless.js",
-        routing_facts: { has_opaque_gl_escapes: false, has_native_context_access: false }
-      }
-    }
+        routing_facts: { has_opaque_gl_escapes: false, has_native_context_access: false },
+      },
+    },
   };
 
   const inputs = prepareRouteInputs(fakeBundle, { constructorName: "WebGPURenderer" });
@@ -124,17 +127,23 @@ test("Positive: Fallback input generated when no renderer construction site exis
 
 test("Positive: Real H1 and H2 graph route evaluations execute without bundling", async () => {
   // Ingest H1 (AST parse + import map resolution only, no Rollup)
-  const h1 = await buildModuleGraph("upstream/three.js/examples/webgpu_performance_renderbundle.html");
+  const h1 = await buildModuleGraph(
+    "upstream/three.js/examples/webgpu_performance_renderbundle.html",
+  );
   const h1Inputs = prepareRouteInputs(h1);
   assert.equal(h1Inputs.length, 1);
   assert.equal(h1Inputs[0].constructorName, "WebGPURenderer");
-  assert.equal(h1Inputs[0].options.forceWebGL, "unresolved", "H1 !api.webgpu expression must be unresolved");
+  assert.equal(
+    h1Inputs[0].options.forceWebGL,
+    "unresolved",
+    "H1 !api.webgpu expression must be unresolved",
+  );
   assert.equal(h1Inputs[0].options.forceWebGLUnresolved, true);
 
   // Ingest H2
   const h2 = await buildModuleGraph("upstream/three.js/examples/webgl_marchingcubes.html");
   const h2Decision = evaluateGraphRoutes(h2, decideRendererRoute, {
-    hostCapabilities: { hasWebGPU: true, hasWebGL: true }
+    hostCapabilities: { hasWebGPU: true, hasWebGL: true },
   });
   assert.equal(h2Decision[0].decision.route, ExecutionRoute.EXACT_BACKEND);
   assert.equal(h2Decision[0].constructorName, "WebGLRenderer");
@@ -147,10 +156,20 @@ test("Regression (a): getContext with non-literal argument is classified as unre
     const gl = canvas.getContext(ctxType);
   `;
   const resultVar = analyzeModuleAst(codeVar, "test_var.js");
-  assert.equal(resultVar.routingFacts.hasNativeContextAccess, true, "Must be classified as native-context access");
-  assert.equal(resultVar.routingFacts.hasUnresolvedContextAccess, true, "Must be classified as unresolved context access");
+  assert.equal(
+    resultVar.routingFacts.hasNativeContextAccess,
+    true,
+    "Must be classified as native-context access",
+  );
+  assert.equal(
+    resultVar.routingFacts.hasUnresolvedContextAccess,
+    true,
+    "Must be classified as unresolved context access",
+  );
   assert.ok(resultVar.routingFacts.escapes.length > 0);
-  const escapeVar = resultVar.routingFacts.escapes.find(e => e.type === "unresolved_native_context_access");
+  const escapeVar = resultVar.routingFacts.escapes.find(
+    (e) => e.type === "unresolved_native_context_access",
+  );
   assert.ok(escapeVar, "Must record an unresolved_native_context_access escape");
   assert.equal(escapeVar.classification, "nonliteral");
   assert.equal(escapeVar.unresolved, true);
@@ -162,7 +181,9 @@ test("Regression (a): getContext with non-literal argument is classified as unre
   const resultTmpl = analyzeModuleAst(codeTmpl, "test_tmpl.js");
   assert.equal(resultTmpl.routingFacts.hasNativeContextAccess, true);
   assert.equal(resultTmpl.routingFacts.hasUnresolvedContextAccess, true);
-  const escapeTmpl = resultTmpl.routingFacts.escapes.find(e => e.type === "unresolved_native_context_access");
+  const escapeTmpl = resultTmpl.routingFacts.escapes.find(
+    (e) => e.type === "unresolved_native_context_access",
+  );
   assert.ok(escapeTmpl);
   assert.equal(escapeTmpl.classification, "nonliteral");
   assert.equal(escapeTmpl.unresolved, true);
@@ -211,7 +232,9 @@ test("Regression (b): forceWebGL with non-literal value is classified as unresol
 
 test("Regression (c): JSON bundle serialization round-trip preserves unresolved context access, escapes, forceWebGL facts, and summary counters", async () => {
   // 1. Ingest real H1 and verify JSON serialization round-trip
-  const h1 = await buildModuleGraph("upstream/three.js/examples/webgpu_performance_renderbundle.html");
+  const h1 = await buildModuleGraph(
+    "upstream/three.js/examples/webgpu_performance_renderbundle.html",
+  );
   const jsonStrH1 = JSON.stringify(h1, null, 2);
   const roundTrippedH1 = JSON.parse(jsonStrH1);
 
@@ -262,8 +285,8 @@ test("Regression (c): JSON bundle serialization round-trip preserves unresolved 
         renderer_construction_sites: analysis.renderer_construction_sites,
         rendererConstructionSites: analysis.renderer_construction_sites,
         routing_facts: analysis.routing_facts,
-        routingFacts: analysis.routing_facts
-      }
+        routingFacts: analysis.routing_facts,
+      },
     },
     cycles: [],
     summary: {
@@ -277,8 +300,8 @@ test("Regression (c): JSON bundle serialization round-trip preserves unresolved 
       total_unresolved_native_context_access: 1,
       totalUnresolvedNativeContextAccess: 1,
       total_unresolved_force_webgl: 1,
-      totalUnresolvedForceWebGL: 1
-    }
+      totalUnresolvedForceWebGL: 1,
+    },
   };
 
   const jsonStr = JSON.stringify(syntheticBundle, null, 2);
@@ -300,7 +323,9 @@ test("Regression (c): JSON bundle serialization round-trip preserves unresolved 
   assert.equal(node.routing_facts.has_native_context_access, true);
 
   // Assert unresolved_native_context_access escape survived with span and metadata
-  const unresEscape = node.routing_facts.escapes.find(e => e.type === "unresolved_native_context_access");
+  const unresEscape = node.routing_facts.escapes.find(
+    (e) => e.type === "unresolved_native_context_access",
+  );
   assert.ok(unresEscape, "Must preserve unresolved_native_context_access escape in JSON");
   assert.equal(unresEscape.classification, "nonliteral");
   assert.equal(unresEscape.unresolved, true);
@@ -320,7 +345,7 @@ test("Regression (c): JSON bundle serialization round-trip preserves unresolved 
   assert.equal(extractedFacts.hasUnresolvedContextAccess, true);
   assert.equal(extractedFacts.has_unresolved_context_access, true);
   assert.equal(extractedFacts.hasNativeContextAccess, true);
-  assert.ok(extractedFacts.escapes.some(e => e.type === "unresolved_native_context_access"));
+  assert.ok(extractedFacts.escapes.some((e) => e.type === "unresolved_native_context_access"));
 
   assert.equal(extractedFacts.constructionSites.length, 1);
   const extractedSite = extractedFacts.constructionSites[0];
@@ -342,16 +367,48 @@ test("Positive & Unit: isInternalLibraryModule canonical identity checks, lookal
   const internalNodesPath = path.resolve("upstream/three.js/build/three.webgpu.nodes.js");
 
   // 1. Exact existing build filenames recognized under default pinned root
-  assert.equal(isInternalLibraryModule(internalWebgpuPath), true, "Internal webgpu build file must be recognized");
-  assert.equal(isInternalLibraryModule(internalWebgpuUrl), true, "Internal webgpu file URL must be recognized");
-  assert.equal(isInternalLibraryModule(internalModulePath), true, "Internal module build file must be recognized");
-  assert.equal(isInternalLibraryModule(internalCjsPath), true, "Internal cjs build file must be recognized");
-  assert.equal(isInternalLibraryModule(internalTslPath), true, "Internal tsl build file must be recognized");
-  assert.equal(isInternalLibraryModule(internalCorePath), true, "Internal core build file must be recognized");
-  assert.equal(isInternalLibraryModule(internalNodesPath), true, "Internal webgpu.nodes build file must be recognized");
+  assert.equal(
+    isInternalLibraryModule(internalWebgpuPath),
+    true,
+    "Internal webgpu build file must be recognized",
+  );
+  assert.equal(
+    isInternalLibraryModule(internalWebgpuUrl),
+    true,
+    "Internal webgpu file URL must be recognized",
+  );
+  assert.equal(
+    isInternalLibraryModule(internalModulePath),
+    true,
+    "Internal module build file must be recognized",
+  );
+  assert.equal(
+    isInternalLibraryModule(internalCjsPath),
+    true,
+    "Internal cjs build file must be recognized",
+  );
+  assert.equal(
+    isInternalLibraryModule(internalTslPath),
+    true,
+    "Internal tsl build file must be recognized",
+  );
+  assert.equal(
+    isInternalLibraryModule(internalCorePath),
+    true,
+    "Internal core build file must be recognized",
+  );
+  assert.equal(
+    isInternalLibraryModule(internalNodesPath),
+    true,
+    "Internal webgpu.nodes build file must be recognized",
+  );
 
   // URL search query and hash fragments cleared and stripped
-  assert.equal(isInternalLibraryModule(`${internalWebgpuUrl}?v=0.186.0#header`), true, "URL query/hash must be stripped");
+  assert.equal(
+    isInternalLibraryModule(`${internalWebgpuUrl}?v=0.186.0#header`),
+    true,
+    "URL query/hash must be stripped",
+  );
 
   // 2. Broad src/ exemption removed: src/ files are NOT admitted build files
   const internalSrcPath = path.resolve("upstream/three.js/src/renderers/WebGLRenderer.js");
@@ -361,41 +418,119 @@ test("Positive & Unit: isInternalLibraryModule canonical identity checks, lookal
   const traversalPath = path.resolve("upstream/three.js/src/../../app.js");
   const defaultRoot = new URL("../../upstream/three.js/", import.meta.url).href;
   const traversalUrl = new URL("src/../../app.js", defaultRoot).href;
-  assert.equal(isInternalLibraryModule(traversalPath), false, "root/src/../../app.js path must NOT be trusted");
-  assert.equal(isInternalLibraryModule(traversalUrl), false, "root/src/../../app.js URL must NOT be trusted");
-  assert.equal(isInternalLibraryModule("file:///three/src/../../app.js", "file:///three"), false, "fixture root/src/../../app.js must NOT be trusted");
+  assert.equal(
+    isInternalLibraryModule(traversalPath),
+    false,
+    "root/src/../../app.js path must NOT be trusted",
+  );
+  assert.equal(
+    isInternalLibraryModule(traversalUrl),
+    false,
+    "root/src/../../app.js URL must NOT be trusted",
+  );
+  assert.equal(
+    isInternalLibraryModule("file:///three/src/../../app.js", "file:///three"),
+    false,
+    "fixture root/src/../../app.js must NOT be trusted",
+  );
 
   // 4. Invented legacy build names rejected
-  assert.equal(isInternalLibraryModule(path.resolve("upstream/three.js/build/three.js")), false, "Legacy three.js rejected");
-  assert.equal(isInternalLibraryModule(path.resolve("upstream/three.js/build/three.mjs")), false, "Legacy three.mjs rejected");
-  assert.equal(isInternalLibraryModule(path.resolve("upstream/three.js/build/three.core.min.js")), false, "Legacy min.js rejected");
+  assert.equal(
+    isInternalLibraryModule(path.resolve("upstream/three.js/build/three.js")),
+    false,
+    "Legacy three.js rejected",
+  );
+  assert.equal(
+    isInternalLibraryModule(path.resolve("upstream/three.js/build/three.mjs")),
+    false,
+    "Legacy three.mjs rejected",
+  );
+  assert.equal(
+    isInternalLibraryModule(path.resolve("upstream/three.js/build/three.core.min.js")),
+    false,
+    "Legacy min.js rejected",
+  );
 
   // 5. Lookalike build files under upstream root rejected
   const lookalikeUnderUpstream = path.resolve("upstream/three.js/build/three.custom.js");
-  assert.equal(isInternalLibraryModule(lookalikeUnderUpstream), false, "three.custom.js under upstream is not admitted");
+  assert.equal(
+    isInternalLibraryModule(lookalikeUnderUpstream),
+    false,
+    "three.custom.js under upstream is not admitted",
+  );
 
   // 6. Addon files under upstream root are NOT internal library modules
   const addonPath = path.resolve("upstream/three.js/examples/jsm/postprocessing/EffectComposer.js");
-  assert.equal(isInternalLibraryModule(addonPath), false, "Addon files are application/addon code, not internal library");
+  assert.equal(
+    isInternalLibraryModule(addonPath),
+    false,
+    "Addon files are application/addon code, not internal library",
+  );
 
   // 7. External application lookalikes rejected
-  assert.equal(isInternalLibraryModule("/app/build/three.custom.js"), false, "App lookalike /app/build/three.custom.js rejected");
-  assert.equal(isInternalLibraryModule("file:///app/build/three.custom.js"), false, "App lookalike file URL rejected");
-  assert.equal(isInternalLibraryModule("/app/build/three.webgpu.js"), false, "App file with standard name outside package root rejected");
-  assert.equal(isInternalLibraryModule("file:///app/build/three.webgpu.js"), false, "App file with standard name outside package root rejected");
+  assert.equal(
+    isInternalLibraryModule("/app/build/three.custom.js"),
+    false,
+    "App lookalike /app/build/three.custom.js rejected",
+  );
+  assert.equal(
+    isInternalLibraryModule("file:///app/build/three.custom.js"),
+    false,
+    "App lookalike file URL rejected",
+  );
+  assert.equal(
+    isInternalLibraryModule("/app/build/three.webgpu.js"),
+    false,
+    "App file with standard name outside package root rejected",
+  );
+  assert.equal(
+    isInternalLibraryModule("file:///app/build/three.webgpu.js"),
+    false,
+    "App file with standard name outside package root rejected",
+  );
 
   // 8. Explicit packageRootUrl for fixtures
-  assert.equal(isInternalLibraryModule("file:///three/build/three.webgpu.js", "file:///three"), true);
-  assert.equal(isInternalLibraryModule("file:///three/build/three.webgpu.js?bundle=1#entry", "file:///three"), true);
-  assert.equal(isInternalLibraryModule("file:///three/build/three.custom.js", "file:///three"), false);
-  assert.equal(isInternalLibraryModule("file:///other/build/three.webgpu.js", "file:///three"), false);
+  assert.equal(
+    isInternalLibraryModule("file:///three/build/three.webgpu.js", "file:///three"),
+    true,
+  );
+  assert.equal(
+    isInternalLibraryModule("file:///three/build/three.webgpu.js?bundle=1#entry", "file:///three"),
+    true,
+  );
+  assert.equal(
+    isInternalLibraryModule("file:///three/build/three.custom.js", "file:///three"),
+    false,
+  );
+  assert.equal(
+    isInternalLibraryModule("file:///other/build/three.webgpu.js", "file:///three"),
+    false,
+  );
 
   // Browser-hosted package URLs use the same identity check without Node APIs.
-  assert.equal(isInternalLibraryModule("https://example.test/three/build/../build/three.webgpu.js?v=1", "https://example.test/three/"), true);
-  assert.equal(isInternalLibraryModule("https://example.test/app/build/three.webgpu.js", "https://example.test/three/"), false);
-  assert.equal(isInternalLibraryModule("/three%20copy/build/three.module.js", "file:///three%2520copy/"), true);
+  assert.equal(
+    isInternalLibraryModule(
+      "https://example.test/three/build/../build/three.webgpu.js?v=1",
+      "https://example.test/three/",
+    ),
+    true,
+  );
+  assert.equal(
+    isInternalLibraryModule(
+      "https://example.test/app/build/three.webgpu.js",
+      "https://example.test/three/",
+    ),
+    false,
+  );
+  assert.equal(
+    isInternalLibraryModule("/three%20copy/build/three.module.js", "file:///three%2520copy/"),
+    true,
+  );
   assert.equal(isInternalLibraryModule("build/three.module.js", "file:///three/"), false);
-  assert.equal(isInternalLibraryModule("file:///three/build/three.module.js", "relative/root"), false);
+  assert.equal(
+    isInternalLibraryModule("file:///three/build/three.module.js", "relative/root"),
+    false,
+  );
 
   // 9. Invalid inputs
   assert.equal(isInternalLibraryModule(null), false);
@@ -419,7 +554,11 @@ test("f3d-04.4 regression: analyzeModuleAst -> extractGraphRoutingFacts -> evalu
   `;
   const internalPath = path.resolve("upstream/three.js/build/three.webgpu.js");
   const internalAst = analyzeModuleAst(internalCode, internalPath);
-  assert.equal(internalAst.routing_facts.has_opaque_gl_escapes, true, "Internal module has getParameter");
+  assert.equal(
+    internalAst.routing_facts.has_opaque_gl_escapes,
+    true,
+    "Internal module has getParameter",
+  );
 
   // App lookalike module attempting to disguise itself as a Three.js build file
   const lookalikeCode = `
@@ -430,8 +569,16 @@ test("f3d-04.4 regression: analyzeModuleAst -> extractGraphRoutingFacts -> evalu
   `;
   const lookalikePath = "/app/build/three.custom.js";
   const lookalikeAst = analyzeModuleAst(lookalikeCode, lookalikePath);
-  assert.equal(lookalikeAst.routing_facts.has_opaque_gl_escapes, true, "Lookalike module has getParameter");
-  assert.equal(lookalikeAst.routing_facts.has_native_context_access, true, "Lookalike module has getContext");
+  assert.equal(
+    lookalikeAst.routing_facts.has_opaque_gl_escapes,
+    true,
+    "Lookalike module has getParameter",
+  );
+  assert.equal(
+    lookalikeAst.routing_facts.has_native_context_access,
+    true,
+    "Lookalike module has getContext",
+  );
 
   // Scenario 1: Bundle with main + pinned internal module only
   // Internal library escapes must be filtered out; does NOT force exact backend
@@ -452,16 +599,32 @@ test("f3d-04.4 regression: analyzeModuleAst -> extractGraphRoutingFacts -> evalu
   };
 
   const factsInternal = extractGraphRoutingFacts(bundleInternalOnly);
-  assert.equal(factsInternal.hasOpaqueGLEscapes, false, "Internal library escapes must be filtered out");
-  assert.equal(factsInternal.hasNativeContextAccess, false, "Internal library context access must be filtered out");
-  assert.equal(factsInternal.escapes.length, 0, "No application escapes recorded from internal module");
+  assert.equal(
+    factsInternal.hasOpaqueGLEscapes,
+    false,
+    "Internal library escapes must be filtered out",
+  );
+  assert.equal(
+    factsInternal.hasNativeContextAccess,
+    false,
+    "Internal library context access must be filtered out",
+  );
+  assert.equal(
+    factsInternal.escapes.length,
+    0,
+    "No application escapes recorded from internal module",
+  );
 
   const decisionsInternal = evaluateGraphRoutes(bundleInternalOnly, decideRendererRoute, {
     hostCapabilities: { hasWebGPU: true, hasWebGL: true },
     specializationAvailable: true,
   });
   assert.equal(decisionsInternal.length, 1);
-  assert.equal(decisionsInternal[0].decision.route, ExecutionRoute.SPECIALIZED_WEBGPU, "Must route to SPECIALIZED_WEBGPU");
+  assert.equal(
+    decisionsInternal[0].decision.route,
+    ExecutionRoute.SPECIALIZED_WEBGPU,
+    "Must route to SPECIALIZED_WEBGPU",
+  );
   assert.ok(!decisionsInternal[0].decision.reasons.includes(EscapeReason.OPAQUE_GL_ESCAPE));
   assert.ok(!decisionsInternal[0].decision.reasons.includes(EscapeReason.NATIVE_CONTEXT_ACCESS));
 
@@ -484,17 +647,35 @@ test("f3d-04.4 regression: analyzeModuleAst -> extractGraphRoutingFacts -> evalu
   };
 
   const factsLookalike = extractGraphRoutingFacts(bundleLookalike);
-  assert.equal(factsLookalike.hasOpaqueGLEscapes, true, "App lookalike escape must NOT be filtered out");
-  assert.equal(factsLookalike.hasNativeContextAccess, true, "App lookalike context access must NOT be filtered out");
-  assert.ok(factsLookalike.escapes.some(e => e.type === "opaque_gl_method_call"), "Must record opaque_gl_method_call");
-  assert.ok(factsLookalike.escapes.some(e => e.type === "webgl_context_acquisition"), "Must record webgl_context_acquisition");
+  assert.equal(
+    factsLookalike.hasOpaqueGLEscapes,
+    true,
+    "App lookalike escape must NOT be filtered out",
+  );
+  assert.equal(
+    factsLookalike.hasNativeContextAccess,
+    true,
+    "App lookalike context access must NOT be filtered out",
+  );
+  assert.ok(
+    factsLookalike.escapes.some((e) => e.type === "opaque_gl_method_call"),
+    "Must record opaque_gl_method_call",
+  );
+  assert.ok(
+    factsLookalike.escapes.some((e) => e.type === "webgl_context_acquisition"),
+    "Must record webgl_context_acquisition",
+  );
 
   const decisionsLookalike = evaluateGraphRoutes(bundleLookalike, decideRendererRoute, {
     hostCapabilities: { hasWebGPU: true, hasWebGL: true },
     specializationAvailable: true,
   });
   assert.equal(decisionsLookalike.length, 1);
-  assert.equal(decisionsLookalike[0].decision.route, ExecutionRoute.EXACT_BACKEND, "Lookalike escape forces EXACT_BACKEND");
+  assert.equal(
+    decisionsLookalike[0].decision.route,
+    ExecutionRoute.EXACT_BACKEND,
+    "Lookalike escape forces EXACT_BACKEND",
+  );
   assert.ok(decisionsLookalike[0].decision.reasons.includes(EscapeReason.OPAQUE_GL_ESCAPE));
 
   // Scenario 3: Combined bundle (main + pinned internal + app lookalike)
@@ -524,7 +705,7 @@ test("f3d-04.4 regression: analyzeModuleAst -> extractGraphRoutingFacts -> evalu
   assert.equal(factsCombined.hasOpaqueGLEscapes, true);
   assert.equal(factsCombined.hasNativeContextAccess, true);
   // Escapes must only come from the lookalike, not the internal module
-  assert.ok(factsCombined.escapes.every(e => e.moduleId === lookalikePath));
+  assert.ok(factsCombined.escapes.every((e) => e.moduleId === lookalikePath));
 
   const decisionsCombined = evaluateGraphRoutes(bundleCombined, decideRendererRoute, {
     hostCapabilities: { hasWebGPU: true, hasWebGL: true },
@@ -562,19 +743,30 @@ test("f3d-04.4 regression: analyzeModuleAst -> extractGraphRoutingFacts -> evalu
   };
 
   const factsTraversal = extractGraphRoutingFacts(bundleTraversal);
-  assert.equal(factsTraversal.hasOpaqueGLEscapes, true, "Traversal lookalike escapes must NOT be filtered out");
+  assert.equal(
+    factsTraversal.hasOpaqueGLEscapes,
+    true,
+    "Traversal lookalike escapes must NOT be filtered out",
+  );
 
   const decisionsTraversal = evaluateGraphRoutes(bundleTraversal, decideRendererRoute, {
     hostCapabilities: { hasWebGPU: true, hasWebGL: true },
     specializationAvailable: true,
   });
   assert.equal(decisionsTraversal.length, 1);
-  assert.equal(decisionsTraversal[0].decision.route, ExecutionRoute.EXACT_BACKEND, "Traversal lookalike forces EXACT_BACKEND");
+  assert.equal(
+    decisionsTraversal[0].decision.route,
+    ExecutionRoute.EXACT_BACKEND,
+    "Traversal lookalike forces EXACT_BACKEND",
+  );
   assert.ok(decisionsTraversal[0].decision.reasons.includes(EscapeReason.OPAQUE_GL_ESCAPE));
 });
 
 test("Positive: real module graph with external data import routes WebGPURenderer to retained upstream", async () => {
-  const scratch = path.join(tmpdir(), `f3d_route_ext_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
+  const scratch = path.join(
+    tmpdir(),
+    `f3d_route_ext_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+  );
   fs.mkdirSync(scratch, { recursive: true });
 
   const mainPath = path.join(scratch, "main.js");
@@ -585,7 +777,7 @@ export function init() {
   const renderer = new WebGPURenderer();
   return renderer;
 }
-`
+`,
   );
 
   const bundle = await buildModuleGraph(mainPath);
@@ -601,7 +793,7 @@ export function init() {
   assert.equal(decisions[0].decision.route, ExecutionRoute.RETAINED_UPSTREAM);
   assert.ok(
     decisions[0].decision.reasons.includes("unanalyzed-external-modules"),
-    "WebGPURenderer with external modules must include unanalyzed-external-modules reason"
+    "WebGPURenderer with external modules must include unanalyzed-external-modules reason",
   );
 
   // 2. Direct decideRendererRoute call with caller analysis flag=false still retained due to bundle external_modules

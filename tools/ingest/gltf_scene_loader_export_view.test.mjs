@@ -1,14 +1,14 @@
-import test from 'node:test';
-import assert from 'node:assert/strict';
-import {execFileSync} from 'node:child_process';
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import test from "node:test";
 
 // Load the UNMODIFIED production owning-loader source through Node's VM linker.
 // Only its asset, model preparation, texture and GPU construction imports are
 // explicit test doubles. Export and scene-view evaluation use the real modules.
 // Run the experimental linker in a child so normal `node --test` needs no flags.
 // This is orchestration/serialization coverage, not a GPU or asset-codec test.
-test('owning loader includes current-pose scene metadata and honors export overrides',()=>{
-  const child=String.raw`
+test("owning loader includes current-pose scene metadata and honors export overrides", () => {
+  const child = String.raw`
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import {readFile} from 'node:fs/promises';
@@ -63,7 +63,16 @@ model.dispose();pose.disposed=true;deformer.disposed=true;assert.equal(disposals
 const after=parse(await pending);assert.equal(after.cameras.length,1);assert.equal(after.extras.f3d.poseVersion,2);
 console.log('owning loader: default views, current pose, null opt-out, explicit subset, encoded KTX2 and in-flight disposal passed');
 `;
-  const result=execFileSync(process.execPath,['--experimental-vm-modules','--input-type=module','-e',child,new URL('./gltf_scene_loader.mjs',import.meta.url).href],
-    {encoding:'utf8',timeout:10000,stdio:['ignore','pipe','pipe']});
-  assert.match(result,/in-flight disposal passed/);
+  const result = execFileSync(
+    process.execPath,
+    [
+      "--experimental-vm-modules",
+      "--input-type=module",
+      "-e",
+      child,
+      new URL("./gltf_scene_loader.mjs", import.meta.url).href,
+    ],
+    { encoding: "utf8", timeout: 10000, stdio: ["ignore", "pipe", "pipe"] },
+  );
+  assert.match(result, /in-flight disposal passed/);
 });

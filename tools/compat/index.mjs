@@ -3,30 +3,30 @@
  * Main entry point for tools/compat renderer construction routing.
  */
 
-export { ExecutionRoute, EscapeReason, RouteLockError } from './route_types.mjs';
-export { ConnectedCompatibilityGroups } from './connected_groups.mjs';
+export {
+  evaluateGraphRoutes,
+  extractGraphRoutingFacts,
+  isInternalLibraryModule,
+  prepareRouteInputs,
+} from "../ingest/route_bridge.mjs";
+export { ConnectedCompatibilityGroups } from "./connected_groups.mjs";
+export {
+  getRendererDecision,
+  getRendererRoute,
+  RendererConstructionRouter,
+} from "./construction_adapter.mjs";
+export {
+  createExactBackendForRenderer,
+  createExactBackendRouter,
+  createExactWebGLRenderer,
+  ExactWebGLRenderer,
+  getPinnedWebGLBackend,
+  PinnedWebGLRenderer,
+  registerExactBackend,
+} from "./exact_backend.mjs";
 export {
   decideRendererRoute,
   evaluateModuleGraphRoutes,
-} from './route_decider.mjs';
-export {
-  extractGraphRoutingFacts,
-  isInternalLibraryModule,
-  evaluateGraphRoutes,
-  prepareRouteInputs,
-} from '../ingest/route_bridge.mjs';
-export {
-  RendererConstructionRouter,
-  getRendererRoute,
-  getRendererDecision,
-} from './construction_adapter.mjs';
-export {
-  PinnedWebGLRenderer,
-  ExactWebGLRenderer,
-  registerExactBackend,
-  createExactBackendRouter,
-  createExactWebGLRenderer,
-  createExactBackendForRenderer,
-  getPinnedWebGLBackend,
-} from './exact_backend.mjs';
-export { generateRouteReport, formatRouteReport } from './route_report.mjs';
+} from "./route_decider.mjs";
+export { formatRouteReport, generateRouteReport } from "./route_report.mjs";
+export { EscapeReason, ExecutionRoute, RouteLockError } from "./route_types.mjs";

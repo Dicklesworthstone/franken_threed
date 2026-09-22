@@ -5,9 +5,9 @@
  * routing facts with precise source spans.
  */
 
-import * as acorn from 'acorn';
-import * as walk from 'acorn-walk';
-import { IngestionParseError } from './types.mjs';
+import * as acorn from "acorn";
+import * as walk from "acorn-walk";
+import { IngestionParseError } from "./types.mjs";
 
 /**
  * @typedef {Object} SourceLocationPoint
@@ -38,19 +38,23 @@ function toSourceSpan(node, offsets = {}) {
 
   const startLine = node.loc ? node.loc.start.line + lineOffset : 1;
   const startCol = node.loc
-    ? (node.loc.start.line === 1 ? node.loc.start.column + colOffset : node.loc.start.column)
+    ? node.loc.start.line === 1
+      ? node.loc.start.column + colOffset
+      : node.loc.start.column
     : 0;
   const startChar = (node.start !== undefined ? node.start : 0) + charOffset;
 
   const endLine = node.loc ? node.loc.end.line + lineOffset : 1;
   const endCol = node.loc
-    ? (node.loc.end.line === 1 ? node.loc.end.column + colOffset : node.loc.end.column)
+    ? node.loc.end.line === 1
+      ? node.loc.end.column + colOffset
+      : node.loc.end.column
     : 0;
   const endChar = (node.end !== undefined ? node.end : 0) + charOffset;
 
   return {
     start: { line: startLine, column: startCol, offset: startChar },
-    end: { line: endLine, column: endCol, offset: endChar }
+    end: { line: endLine, column: endCol, offset: endChar },
   };
 }
 
@@ -76,19 +80,19 @@ function extractFiniteStringCandidates(node, limit = 128) {
   if (!node) return null;
 
   switch (node.type) {
-    case 'Literal': {
-      if (typeof node.value === 'string') {
+    case "Literal": {
+      if (typeof node.value === "string") {
         return [node.value];
       }
       return null;
     }
 
-    case 'TemplateLiteral': {
+    case "TemplateLiteral": {
       if (node.expressions.length === 0) {
         if (node.quasis.length > 0) {
-          return [node.quasis.map(q => q.value.cooked ?? q.value.raw).join('')];
+          return [node.quasis.map((q) => q.value.cooked ?? q.value.raw).join("")];
         }
-        return [''];
+        return [""];
       }
 
       let current = [node.quasis[0].value.cooked ?? node.quasis[0].value.raw];
@@ -111,8 +115,8 @@ function extractFiniteStringCandidates(node, limit = 128) {
       return current;
     }
 
-    case 'BinaryExpression': {
-      if (node.operator !== '+') return null;
+    case "BinaryExpression": {
+      if (node.operator !== "+") return null;
       const left = extractFiniteStringCandidates(node.left, limit);
       if (!left || left.length === 0) return null;
       const right = extractFiniteStringCandidates(node.right, limit);
@@ -131,7 +135,7 @@ function extractFiniteStringCandidates(node, limit = 128) {
       return unique;
     }
 
-    case 'ConditionalExpression': {
+    case "ConditionalExpression": {
       // Preserve effects in conditional tests by only collecting alternatives and leaving source unchanged
       const consequent = extractFiniteStringCandidates(node.consequent, limit);
       if (!consequent || consequent.length === 0) return null;
@@ -143,7 +147,7 @@ function extractFiniteStringCandidates(node, limit = 128) {
       return unique;
     }
 
-    case 'ParenthesizedExpression':
+    case "ParenthesizedExpression":
       return extractFiniteStringCandidates(node.expression, limit);
 
     default:
@@ -159,24 +163,28 @@ function extractFiniteStringCandidates(node, limit = 128) {
  */
 export function classifyDynamicImportArgument(sourceNode) {
   if (!sourceNode) {
-    return { classification: 'nonliteral', specifier: null };
+    return { classification: "nonliteral", specifier: null };
   }
 
   // Fastpaths: actual literal string or 0-expression template
-  if (sourceNode.type === 'Literal' && typeof sourceNode.value === 'string') {
-    return { classification: 'literal', specifier: sourceNode.value };
+  if (sourceNode.type === "Literal" && typeof sourceNode.value === "string") {
+    return { classification: "literal", specifier: sourceNode.value };
   }
 
-  if (sourceNode.type === 'TemplateLiteral' && sourceNode.expressions.length === 0 && sourceNode.quasis.length > 0) {
-    const specifier = sourceNode.quasis.map(q => q.value.cooked ?? q.value.raw).join('');
-    return { classification: 'literal', specifier };
+  if (
+    sourceNode.type === "TemplateLiteral" &&
+    sourceNode.expressions.length === 0 &&
+    sourceNode.quasis.length > 0
+  ) {
+    const specifier = sourceNode.quasis.map((q) => q.value.cooked ?? q.value.raw).join("");
+    return { classification: "literal", specifier };
   }
 
   // Complex finite expressions (binary '+', template interpolation, conditionals)
   const candidates = extractFiniteStringCandidates(sourceNode, 128);
   if (candidates && candidates.length > 0) {
     return {
-      classification: 'finite_set',
+      classification: "finite_set",
       specifier: null,
       specifiers: candidates,
       candidates,
@@ -185,7 +193,7 @@ export function classifyDynamicImportArgument(sourceNode) {
     };
   }
 
-  return { classification: 'nonliteral', specifier: null };
+  return { classification: "nonliteral", specifier: null };
 }
 
 /**
@@ -198,25 +206,25 @@ export function classifyDynamicImportArgument(sourceNode) {
 function collectPatternIdentifiers(pattern, out = new Set()) {
   if (!pattern) return out;
   switch (pattern.type) {
-    case 'Identifier':
+    case "Identifier":
       out.add(pattern.name);
       break;
-    case 'AssignmentPattern':
+    case "AssignmentPattern":
       collectPatternIdentifiers(pattern.left, out);
       break;
-    case 'RestElement':
+    case "RestElement":
       collectPatternIdentifiers(pattern.argument, out);
       break;
-    case 'ObjectPattern':
+    case "ObjectPattern":
       for (const prop of pattern.properties) {
-        if (prop.type === 'Property') {
+        if (prop.type === "Property") {
           collectPatternIdentifiers(prop.value, out);
-        } else if (prop.type === 'RestElement') {
+        } else if (prop.type === "RestElement") {
           collectPatternIdentifiers(prop.argument, out);
         }
       }
       break;
-    case 'ArrayPattern':
+    case "ArrayPattern":
       for (const elem of pattern.elements) {
         if (elem) collectPatternIdentifiers(elem, out);
       }
@@ -247,7 +255,7 @@ function hasVarBindingInFunctionScope(bodyNode, name, cache = defaultVarBindingC
   let found = false;
   walk.recursive(bodyNode, null, {
     VariableDeclaration(decl, state, c) {
-      if (decl.kind === 'var') {
+      if (decl.kind === "var") {
         for (const d of decl.declarations) {
           if (collectPatternIdentifiers(d.id).has(name)) {
             found = true;
@@ -262,7 +270,7 @@ function hasVarBindingInFunctionScope(bodyNode, name, cache = defaultVarBindingC
     FunctionExpression() {},
     ArrowFunctionExpression() {},
     ClassDeclaration() {},
-    ClassExpression() {}
+    ClassExpression() {},
   });
 
   map.set(name, found);
@@ -286,9 +294,9 @@ function isIdentifierShadowedAtAncestors(name, ancestors, varCache = defaultVarB
 
     // 1. Function boundaries: parameters, function expression / declaration name, hoisted vars
     if (
-      ancestor.type === 'FunctionDeclaration' ||
-      ancestor.type === 'FunctionExpression' ||
-      ancestor.type === 'ArrowFunctionExpression'
+      ancestor.type === "FunctionDeclaration" ||
+      ancestor.type === "FunctionExpression" ||
+      ancestor.type === "ArrowFunctionExpression"
     ) {
       if (ancestor.id && ancestor.id.name === name) return true;
       if (ancestor.params) {
@@ -297,61 +305,69 @@ function isIdentifierShadowedAtAncestors(name, ancestors, varCache = defaultVarB
         }
       }
       // Body var declarations only scope the function body, not default parameter initializers
-      if (child === ancestor.body && hasVarBindingInFunctionScope(ancestor.body, name, varCache)) return true;
+      if (child === ancestor.body && hasVarBindingInFunctionScope(ancestor.body, name, varCache))
+        return true;
     }
 
     // 2. Class declaration / expression self-name in class body
-    if (ancestor.type === 'ClassDeclaration' || ancestor.type === 'ClassExpression') {
+    if (ancestor.type === "ClassDeclaration" || ancestor.type === "ClassExpression") {
       if (ancestor.id && ancestor.id.name === name) return true;
     }
 
     // 3. BlockStatement / StaticBlock / Program body statements
-    if (ancestor.type === 'BlockStatement' || ancestor.type === 'StaticBlock' || ancestor.type === 'Program') {
+    if (
+      ancestor.type === "BlockStatement" ||
+      ancestor.type === "StaticBlock" ||
+      ancestor.type === "Program"
+    ) {
       const body = ancestor.body || [];
       for (const stmt of body) {
-        if (stmt.type === 'VariableDeclaration') {
+        if (stmt.type === "VariableDeclaration") {
           for (const d of stmt.declarations) {
             if (collectPatternIdentifiers(d.id).has(name)) return true;
           }
-        } else if (stmt.type === 'FunctionDeclaration') {
+        } else if (stmt.type === "FunctionDeclaration") {
           if (stmt.id && stmt.id.name === name) return true;
-        } else if (stmt.type === 'ClassDeclaration') {
+        } else if (stmt.type === "ClassDeclaration") {
           if (stmt.id && stmt.id.name === name) return true;
-        } else if (stmt.type === 'ImportDeclaration') {
+        } else if (stmt.type === "ImportDeclaration") {
           for (const spec of stmt.specifiers) {
             if (spec.local && spec.local.name === name) return true;
           }
-        } else if (stmt.type === 'ExportNamedDeclaration' && stmt.declaration) {
+        } else if (stmt.type === "ExportNamedDeclaration" && stmt.declaration) {
           const decl = stmt.declaration;
-          if (decl.type === 'VariableDeclaration') {
+          if (decl.type === "VariableDeclaration") {
             for (const d of decl.declarations) {
               if (collectPatternIdentifiers(d.id).has(name)) return true;
             }
           } else if (decl.id && decl.id.name === name) {
             return true;
           }
-        } else if (stmt.type === 'ExportDefaultDeclaration' && stmt.declaration) {
+        } else if (stmt.type === "ExportDefaultDeclaration" && stmt.declaration) {
           const decl = stmt.declaration;
           if (decl.id && decl.id.name === name) {
             return true;
           }
         }
       }
-      if (ancestor.type === 'Program') {
+      if (ancestor.type === "Program") {
         if (hasVarBindingInFunctionScope(ancestor, name, varCache)) return true;
       }
     }
 
     // 4. Switch statement: cases share a single block scope
-    if (ancestor.type === 'SwitchStatement' && ancestor.cases) {
+    if (ancestor.type === "SwitchStatement" && ancestor.cases) {
       for (const sc of ancestor.cases) {
         if (!sc.consequent) continue;
         for (const stmt of sc.consequent) {
-          if (stmt.type === 'VariableDeclaration' && (stmt.kind === 'let' || stmt.kind === 'const')) {
+          if (
+            stmt.type === "VariableDeclaration" &&
+            (stmt.kind === "let" || stmt.kind === "const")
+          ) {
             for (const d of stmt.declarations) {
               if (collectPatternIdentifiers(d.id).has(name)) return true;
             }
-          } else if (stmt.type === 'FunctionDeclaration' || stmt.type === 'ClassDeclaration') {
+          } else if (stmt.type === "FunctionDeclaration" || stmt.type === "ClassDeclaration") {
             if (stmt.id && stmt.id.name === name) return true;
           }
         }
@@ -359,15 +375,15 @@ function isIdentifierShadowedAtAncestors(name, ancestors, varCache = defaultVarB
     }
 
     // 5. For loop variable declarations
-    if (ancestor.type === 'ForStatement') {
-      if (ancestor.init && ancestor.init.type === 'VariableDeclaration') {
+    if (ancestor.type === "ForStatement") {
+      if (ancestor.init && ancestor.init.type === "VariableDeclaration") {
         for (const d of ancestor.init.declarations) {
           if (collectPatternIdentifiers(d.id).has(name)) return true;
         }
       }
     }
-    if (ancestor.type === 'ForInStatement' || ancestor.type === 'ForOfStatement') {
-      if (ancestor.left && ancestor.left.type === 'VariableDeclaration') {
+    if (ancestor.type === "ForInStatement" || ancestor.type === "ForOfStatement") {
+      if (ancestor.left && ancestor.left.type === "VariableDeclaration") {
         for (const d of ancestor.left.declarations) {
           if (collectPatternIdentifiers(d.id).has(name)) return true;
         }
@@ -375,7 +391,7 @@ function isIdentifierShadowedAtAncestors(name, ancestors, varCache = defaultVarB
     }
 
     // 6. Catch clause parameter
-    if (ancestor.type === 'CatchClause') {
+    if (ancestor.type === "CatchClause") {
       if (ancestor.param && collectPatternIdentifiers(ancestor.param).has(name)) return true;
     }
   }
@@ -390,15 +406,11 @@ function isIdentifierShadowedAtAncestors(name, ancestors, varCache = defaultVarB
  */
 function extractStaticString(node) {
   if (!node) return null;
-  if (node.type === 'Literal' && typeof node.value === 'string') {
+  if (node.type === "Literal" && typeof node.value === "string") {
     return node.value;
   }
-  if (
-    node.type === 'TemplateLiteral' &&
-    node.expressions.length === 0 &&
-    node.quasis.length > 0
-  ) {
-    return node.quasis.map(q => q.value.cooked ?? q.value.raw).join('');
+  if (node.type === "TemplateLiteral" && node.expressions.length === 0 && node.quasis.length > 0) {
+    return node.quasis.map((q) => q.value.cooked ?? q.value.raw).join("");
   }
   return null;
 }
@@ -411,27 +423,29 @@ function extractStaticString(node) {
  * @returns {boolean}
  */
 function isImportMetaUrl(node) {
-  if (!node || node.type !== 'MemberExpression') return false;
+  if (!node || node.type !== "MemberExpression") return false;
 
   const obj = node.object;
-  if (!obj || obj.type !== 'MetaProperty') return false;
-  if (!obj.meta || obj.meta.name !== 'import') return false;
-  if (!obj.property || obj.property.name !== 'meta') return false;
+  if (!obj || obj.type !== "MetaProperty") return false;
+  if (!obj.meta || obj.meta.name !== "import") return false;
+  if (!obj.property || obj.property.name !== "meta") return false;
 
   if (!node.computed) {
-    return Boolean(node.property && node.property.type === 'Identifier' && node.property.name === 'url');
+    return Boolean(
+      node.property && node.property.type === "Identifier" && node.property.name === "url",
+    );
   } else {
     if (!node.property) return false;
-    if (node.property.type === 'Literal') {
-      return node.property.value === 'url';
+    if (node.property.type === "Literal") {
+      return node.property.value === "url";
     }
     if (
-      node.property.type === 'TemplateLiteral' &&
+      node.property.type === "TemplateLiteral" &&
       node.property.expressions.length === 0 &&
       node.property.quasis.length > 0
     ) {
-      const val = node.property.quasis.map(q => q.value.cooked ?? q.value.raw).join('');
-      return val === 'url';
+      const val = node.property.quasis.map((q) => q.value.cooked ?? q.value.raw).join("");
+      return val === "url";
     }
     return false;
   }
@@ -449,30 +463,33 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
   let ast;
   try {
     ast = acorn.parse(code, {
-      ecmaVersion: 'latest',
-      sourceType: 'module',
+      ecmaVersion: "latest",
+      sourceType: "module",
       locations: true,
-      ranges: true
+      ranges: true,
     });
   } catch (err) {
     const span = err.loc
       ? {
           start: {
             line: err.loc.line + (offsets.lineOffset || 0),
-            column: (err.loc.line === 1 ? err.loc.column + (offsets.columnOffset || 0) : err.loc.column),
-            offset: (err.pos || 0) + (offsets.charOffset || 0)
+            column:
+              err.loc.line === 1 ? err.loc.column + (offsets.columnOffset || 0) : err.loc.column,
+            offset: (err.pos || 0) + (offsets.charOffset || 0),
           },
           end: {
             line: err.loc.line + (offsets.lineOffset || 0),
-            column: (err.loc.line === 1 ? err.loc.column + (offsets.columnOffset || 0) : err.loc.column) + 1,
-            offset: (err.pos || 0) + (offsets.charOffset || 0) + 1
-          }
+            column:
+              (err.loc.line === 1 ? err.loc.column + (offsets.columnOffset || 0) : err.loc.column) +
+              1,
+            offset: (err.pos || 0) + (offsets.charOffset || 0) + 1,
+          },
         }
       : null;
     throw new IngestionParseError(
       `Failed to parse module "${moduleUrl}": ${err.message}`,
       moduleUrl,
-      span
+      span,
     );
   }
 
@@ -497,31 +514,31 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
   // Process top-level body statements
   for (const node of ast.body) {
     switch (node.type) {
-      case 'ImportDeclaration': {
+      case "ImportDeclaration": {
         const specifier = node.source.value;
         const importedBindings = [];
         for (const spec of node.specifiers) {
-          if (spec.type === 'ImportDefaultSpecifier') {
+          if (spec.type === "ImportDefaultSpecifier") {
             importedBindings.push({
               local: spec.local.name,
-              imported: 'default',
-              type: 'default'
+              imported: "default",
+              type: "default",
             });
-            topLevelDeclarations.set(spec.local.name, 'import');
-          } else if (spec.type === 'ImportNamespaceSpecifier') {
+            topLevelDeclarations.set(spec.local.name, "import");
+          } else if (spec.type === "ImportNamespaceSpecifier") {
             importedBindings.push({
               local: spec.local.name,
-              imported: '*',
-              type: 'namespace'
+              imported: "*",
+              type: "namespace",
             });
-            topLevelDeclarations.set(spec.local.name, 'import');
-          } else if (spec.type === 'ImportSpecifier') {
+            topLevelDeclarations.set(spec.local.name, "import");
+          } else if (spec.type === "ImportSpecifier") {
             importedBindings.push({
               local: spec.local.name,
               imported: spec.imported.name,
-              type: 'named'
+              type: "named",
             });
-            topLevelDeclarations.set(spec.local.name, 'import');
+            topLevelDeclarations.set(spec.local.name, "import");
           }
         }
         const span = toSourceSpan(node, offsets);
@@ -529,26 +546,26 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
           specifier,
           source_span: span,
           sourceSpan: span,
-          imported_bindings: importedBindings
+          imported_bindings: importedBindings,
         });
         break;
       }
 
-      case 'ExportNamedDeclaration': {
+      case "ExportNamedDeclaration": {
         const reexportSpecifier = node.source ? node.source.value : null;
         const specifiers = [];
         if (node.specifiers && node.specifiers.length > 0) {
           for (const spec of node.specifiers) {
             specifiers.push({
               local: spec.local.name,
-              exported: spec.exported.name
+              exported: spec.exported.name,
             });
             exportedBindingNames.add(spec.local.name);
           }
         }
         if (node.declaration) {
           const decl = node.declaration;
-          if (decl.type === 'VariableDeclaration') {
+          if (decl.type === "VariableDeclaration") {
             for (const d of decl.declarations) {
               for (const name of collectPatternIdentifiers(d.id)) {
                 topLevelDeclarations.set(name, decl.kind);
@@ -556,59 +573,62 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
                 specifiers.push({ local: name, exported: name });
               }
             }
-          } else if (decl.type === 'FunctionDeclaration' && decl.id) {
-            topLevelDeclarations.set(decl.id.name, 'function');
+          } else if (decl.type === "FunctionDeclaration" && decl.id) {
+            topLevelDeclarations.set(decl.id.name, "function");
             exportedBindingNames.add(decl.id.name);
             specifiers.push({ local: decl.id.name, exported: decl.id.name });
-          } else if (decl.type === 'ClassDeclaration' && decl.id) {
-            topLevelDeclarations.set(decl.id.name, 'class');
+          } else if (decl.type === "ClassDeclaration" && decl.id) {
+            topLevelDeclarations.set(decl.id.name, "class");
             exportedBindingNames.add(decl.id.name);
             specifiers.push({ local: decl.id.name, exported: decl.id.name });
           }
         }
         const span = toSourceSpan(node, offsets);
         staticExports.push({
-          type: 'named',
+          type: "named",
           specifier: reexportSpecifier,
           specifiers,
           source_span: span,
-          sourceSpan: span
+          sourceSpan: span,
         });
         break;
       }
 
-      case 'ExportDefaultDeclaration': {
+      case "ExportDefaultDeclaration": {
         let localName = null;
         if (node.declaration) {
           if (node.declaration.id && node.declaration.id.name) {
             localName = node.declaration.id.name;
-            topLevelDeclarations.set(localName, node.declaration.type === 'FunctionDeclaration' ? 'function' : 'class');
+            topLevelDeclarations.set(
+              localName,
+              node.declaration.type === "FunctionDeclaration" ? "function" : "class",
+            );
           }
         }
         const span = toSourceSpan(node, offsets);
         staticExports.push({
-          type: 'default',
+          type: "default",
           local_name: localName,
           localName,
           source_span: span,
-          sourceSpan: span
+          sourceSpan: span,
         });
         break;
       }
 
-      case 'ExportAllDeclaration': {
+      case "ExportAllDeclaration": {
         const span = toSourceSpan(node, offsets);
         staticExports.push({
-          type: 'all',
+          type: "all",
           specifier: node.source.value,
           exported: node.exported ? node.exported.name : null,
           source_span: span,
-          sourceSpan: span
+          sourceSpan: span,
         });
         break;
       }
 
-      case 'VariableDeclaration': {
+      case "VariableDeclaration": {
         for (const d of node.declarations) {
           for (const name of collectPatternIdentifiers(d.id)) {
             topLevelDeclarations.set(name, node.kind);
@@ -617,16 +637,16 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
         break;
       }
 
-      case 'FunctionDeclaration': {
+      case "FunctionDeclaration": {
         if (node.id) {
-          topLevelDeclarations.set(node.id.name, 'function');
+          topLevelDeclarations.set(node.id.name, "function");
         }
         break;
       }
 
-      case 'ClassDeclaration': {
+      case "ClassDeclaration": {
         if (node.id) {
-          topLevelDeclarations.set(node.id.name, 'class');
+          topLevelDeclarations.set(node.id.name, "class");
         }
         break;
       }
@@ -650,23 +670,25 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
       const span = toSourceSpan(node, offsets);
       dynamicImports.push({
         ...classified,
-        unresolved: classified.classification === 'nonliteral',
+        unresolved: classified.classification === "nonliteral",
         source_span: span,
-        sourceSpan: span
+        sourceSpan: span,
       });
     },
 
     AssignmentExpression(node) {
-      if (node.left.type === 'Identifier') {
+      if (node.left.type === "Identifier") {
         mutatedIdentifiers.add(node.left.name);
       } else if (
-        node.left.type === 'MemberExpression' &&
-        node.left.object.type === 'MemberExpression' &&
-        node.left.object.property.name === 'prototype' &&
-        node.left.object.object.type === 'Identifier'
+        node.left.type === "MemberExpression" &&
+        node.left.object.type === "MemberExpression" &&
+        node.left.object.property.name === "prototype" &&
+        node.left.object.object.type === "Identifier"
       ) {
         const className = node.left.object.object.name;
-        const propName = node.left.property.name || (node.left.property.value ? String(node.left.property.value) : null);
+        const propName =
+          node.left.property.name ||
+          (node.left.property.value ? String(node.left.property.value) : null);
         const span = toSourceSpan(node, offsets);
         prototypeWrites.push({
           class_name: className,
@@ -674,24 +696,25 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
           property_name: propName,
           propertyName: propName,
           source_span: span,
-          sourceSpan: span
+          sourceSpan: span,
         });
       }
     },
 
     UpdateExpression(node) {
-      if (node.argument.type === 'Identifier') {
+      if (node.argument.type === "Identifier") {
         mutatedIdentifiers.add(node.argument.name);
       }
     },
 
     ClassDeclaration(node) {
       const className = node.id ? node.id.name : null;
-      const superClass = node.superClass && node.superClass.type === 'Identifier' ? node.superClass.name : null;
+      const superClass =
+        node.superClass && node.superClass.type === "Identifier" ? node.superClass.name : null;
       const methods = [];
       if (node.body && node.body.body) {
         for (const item of node.body.body) {
-          if (item.type === 'MethodDefinition' && item.key && item.key.name) {
+          if (item.type === "MethodDefinition" && item.key && item.key.name) {
             methods.push(item.key.name);
           }
         }
@@ -703,7 +726,7 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
         superClass,
         methods,
         source_span: span,
-        sourceSpan: span
+        sourceSpan: span,
       });
     },
 
@@ -711,10 +734,10 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
       // 1. Check for URL asset references: new URL(relativeLiteral, import.meta.url)
       if (
         node.callee &&
-        node.callee.type === 'Identifier' &&
-        node.callee.name === 'URL' &&
+        node.callee.type === "Identifier" &&
+        node.callee.name === "URL" &&
         node.arguments.length === 2 &&
-        !isIdentifierShadowedAtAncestors('URL', ancestors)
+        !isIdentifierShadowedAtAncestors("URL", ancestors)
       ) {
         const firstArg = node.arguments[0];
         const secondArg = node.arguments[1];
@@ -723,18 +746,18 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
         if (specifier !== null && isImportMetaUrl(secondArg)) {
           const pathPart = specifier.split(/[?#]/)[0];
           const isDirectory =
-            pathPart.endsWith('/') ||
-            pathPart === '.' ||
-            pathPart === '..' ||
-            pathPart.endsWith('/.') ||
-            pathPart.endsWith('/..');
+            pathPart.endsWith("/") ||
+            pathPart === "." ||
+            pathPart === ".." ||
+            pathPart.endsWith("/.") ||
+            pathPart.endsWith("/..");
 
           if (!isDirectory) {
             const span = toSourceSpan(node, offsets);
             assetReferences.push({
               specifier,
               source_span: span,
-              sourceSpan: span
+              sourceSpan: span,
             });
           }
         }
@@ -742,34 +765,45 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
 
       // 2. Check for Renderer construction: new THREE.WebGLRenderer, new WebGPURenderer, etc.
       let constructorName = null;
-      if (node.callee.type === 'Identifier') {
+      if (node.callee.type === "Identifier") {
         constructorName = node.callee.name;
-      } else if (node.callee.type === 'MemberExpression' && node.callee.property.type === 'Identifier') {
+      } else if (
+        node.callee.type === "MemberExpression" &&
+        node.callee.property.type === "Identifier"
+      ) {
         constructorName = node.callee.property.name;
       }
 
-      if (['WebGLRenderer', 'WebGPURenderer', 'CSS2DRenderer', 'CSS3DRenderer', 'SVGRenderer'].includes(constructorName)) {
+      if (
+        [
+          "WebGLRenderer",
+          "WebGPURenderer",
+          "CSS2DRenderer",
+          "CSS3DRenderer",
+          "SVGRenderer",
+        ].includes(constructorName)
+      ) {
         let forceWebGL = false;
         let forceWebGLUnresolved = false;
         let canvasOption = null;
 
-        if (node.arguments.length > 0 && node.arguments[0].type === 'ObjectExpression') {
+        if (node.arguments.length > 0 && node.arguments[0].type === "ObjectExpression") {
           for (const prop of node.arguments[0].properties) {
-            if (prop.type === 'Property') {
+            if (prop.type === "Property") {
               const propKey = prop.key.name || prop.key.value;
-              if (propKey === 'forceWebGL') {
-                if (prop.value.type === 'Literal') {
+              if (propKey === "forceWebGL") {
+                if (prop.value.type === "Literal") {
                   forceWebGL = Boolean(prop.value.value);
                   forceWebGLUnresolved = false;
                 } else {
                   // Non-literal value (variable, template, expression like !api.webgpu):
                   // Must be classified as unresolved, not false
-                  forceWebGL = 'unresolved';
+                  forceWebGL = "unresolved";
                   forceWebGLUnresolved = true;
                 }
-              } else if (propKey === 'canvas') {
-                if (prop.value.type === 'Literal') canvasOption = String(prop.value.value);
-                else if (prop.value.type === 'Identifier') canvasOption = prop.value.name;
+              } else if (propKey === "canvas") {
+                if (prop.value.type === "Literal") canvasOption = String(prop.value.value);
+                else if (prop.value.type === "Identifier") canvasOption = prop.value.name;
               }
             }
           }
@@ -788,7 +822,7 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
           canvas_option: canvasOption,
           canvasOption,
           source_span: span,
-          sourceSpan: span
+          sourceSpan: span,
         });
       }
     },
@@ -796,13 +830,13 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
     CallExpression(node) {
       // Check for native context access: e.g. canvas.getContext('webgl' | 'webgl2')
       if (
-        node.callee.type === 'MemberExpression' &&
-        node.callee.property.type === 'Identifier' &&
-        node.callee.property.name === 'getContext'
+        node.callee.type === "MemberExpression" &&
+        node.callee.property.type === "Identifier" &&
+        node.callee.property.name === "getContext"
       ) {
         const arg = node.arguments[0];
         const span = toSourceSpan(node, offsets);
-        const isLiteralString = arg && arg.type === 'Literal' && typeof arg.value === 'string';
+        const isLiteralString = arg && arg.type === "Literal" && typeof arg.value === "string";
 
         if (!isLiteralString) {
           // getContext with a non-literal argument (variable, template literal, expression, or missing)
@@ -810,34 +844,34 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
           hasNativeContextAccess = true;
           hasUnresolvedContextAccess = true;
           escapes.push({
-            type: 'unresolved_native_context_access',
-            classification: 'nonliteral',
+            type: "unresolved_native_context_access",
+            classification: "nonliteral",
             unresolved: true,
             source_span: span,
-            sourceSpan: span
+            sourceSpan: span,
           });
         } else {
           const ctxType = arg.value;
-          if (ctxType === '2d' || ctxType === 'bitmaprenderer') {
+          if (ctxType === "2d" || ctxType === "bitmaprenderer") {
             // Explicitly non-native 2D canvas context: ignore
           } else {
             hasNativeContextAccess = true;
-            if (ctxType.includes('webgl')) {
+            if (ctxType.includes("webgl")) {
               hasOpaqueGLEscapes = true;
               escapes.push({
-                type: 'webgl_context_acquisition',
+                type: "webgl_context_acquisition",
                 context_type: ctxType,
                 contextType: ctxType,
                 source_span: span,
-                sourceSpan: span
+                sourceSpan: span,
               });
             } else {
               escapes.push({
-                type: 'native_context_acquisition',
+                type: "native_context_acquisition",
                 context_type: ctxType,
                 contextType: ctxType,
                 source_span: span,
-                sourceSpan: span
+                sourceSpan: span,
               });
             }
           }
@@ -845,18 +879,27 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
       }
 
       // Check for direct WebGL method calls / extension queries
-      if (node.callee.type === 'MemberExpression' && node.callee.property.type === 'Identifier') {
+      if (node.callee.type === "MemberExpression" && node.callee.property.type === "Identifier") {
         const propName = node.callee.property.name;
-        if (['getExtension', 'getParameter', 'createBuffer', 'bindBuffer', 'createTexture', 'bindTexture'].includes(propName)) {
+        if (
+          [
+            "getExtension",
+            "getParameter",
+            "createBuffer",
+            "bindBuffer",
+            "createTexture",
+            "bindTexture",
+          ].includes(propName)
+        ) {
           hasOpaqueGLEscapes = true;
           escapes.push({
-            type: 'opaque_gl_method_call',
+            type: "opaque_gl_method_call",
             method: propName,
-            source_span: toSourceSpan(node, offsets)
+            source_span: toSourceSpan(node, offsets),
           });
         }
       }
-    }
+    },
   });
 
   // Calculate live bindings:
@@ -865,7 +908,7 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
   for (const name of exportedBindingNames) {
     const kind = topLevelDeclarations.get(name);
     const isMutated = mutatedIdentifiers.has(name);
-    if (kind === 'let' || kind === 'var' || isMutated) {
+    if (kind === "let" || kind === "var" || isMutated) {
       mutableExportedBindings.push(name);
     }
   }
@@ -879,7 +922,7 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
     hasUnresolvedContextAccess,
     renderer_construction_sites: rendererConstructionSites,
     rendererConstructionSites,
-    escapes
+    escapes,
   };
 
   return {
@@ -896,6 +939,6 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
     routing_facts: routingFacts,
     hasTopLevelSideEffects,
     hasLiveBindings: mutableExportedBindings.length > 0,
-    mutableExportedBindings
+    mutableExportedBindings,
   };
 }

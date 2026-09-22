@@ -9,9 +9,9 @@
  * preserves native object shapes via external diagnostics, and guarantees single execution.
  */
 
-import { ExecutionRoute, EscapeReason, RouteLockError } from './route_types.mjs';
-import { ConnectedCompatibilityGroups } from './connected_groups.mjs';
-import { decideRendererRoute } from './route_decider.mjs';
+import { ConnectedCompatibilityGroups } from "./connected_groups.mjs";
+import { decideRendererRoute } from "./route_decider.mjs";
+import { EscapeReason, ExecutionRoute, RouteLockError } from "./route_types.mjs";
 
 /**
  * Module-level weak lock registry ensuring canvas objects remain irreversibly
@@ -42,15 +42,15 @@ let resourceObjectCounter = 0;
  * @returns {string}
  */
 export function resolveResourceId(res) {
-  if (typeof res === 'string') return res;
-  if (!res || (typeof res !== 'object' && typeof res !== 'function')) return String(res);
+  if (typeof res === "string") return res;
+  if (!res || (typeof res !== "object" && typeof res !== "function")) return String(res);
   const prototype = Object.getPrototypeOf(res);
   if (prototype === Object.prototype || prototype === null) {
     if (res.id !== undefined && res.id !== null) return String(res.id);
     if (res.resourceId !== undefined && res.resourceId !== null) return String(res.resourceId);
-    if (typeof res.name === 'string' && res.name.length > 0) return res.name;
-    if (res.resource && typeof res.resource === 'object') return resolveResourceId(res.resource);
-    if (res.target && typeof res.target === 'object') return resolveResourceId(res.target);
+    if (typeof res.name === "string" && res.name.length > 0) return res.name;
+    if (res.resource && typeof res.resource === "object") return resolveResourceId(res.resource);
+    if (res.target && typeof res.target === "object") return resolveResourceId(res.target);
   }
   let id = RESOURCE_OBJECT_IDS.get(res);
   if (!id) {
@@ -67,7 +67,8 @@ export function resolveResourceId(res) {
  * @returns {string | undefined}
  */
 export function getRendererRoute(instance) {
-  if (!instance || (typeof instance !== 'object' && typeof instance !== 'function')) return undefined;
+  if (!instance || (typeof instance !== "object" && typeof instance !== "function"))
+    return undefined;
   return INSTANCE_DIAGNOSTICS.get(instance)?.route;
 }
 
@@ -78,7 +79,8 @@ export function getRendererRoute(instance) {
  * @returns {Object | undefined}
  */
 export function getRendererDecision(instance) {
-  if (!instance || (typeof instance !== 'object' && typeof instance !== 'function')) return undefined;
+  if (!instance || (typeof instance !== "object" && typeof instance !== "function"))
+    return undefined;
   return INSTANCE_DIAGNOSTICS.get(instance);
 }
 
@@ -121,11 +123,13 @@ export class RendererConstructionRouter {
    * @param {string} [options.constructorName] - optional target constructor name qualifier
    */
   registerImplementation(route, implementation, { constructorName } = {}) {
-    if (typeof implementation !== 'function') {
-      throw new TypeError(`Implementation for route '${route}' must be a constructor function or factory`);
+    if (typeof implementation !== "function") {
+      throw new TypeError(
+        `Implementation for route '${route}' must be a constructor function or factory`,
+      );
     }
     if (constructorName) {
-      if (!this.implementations[route] || typeof this.implementations[route] === 'function') {
+      if (!this.implementations[route] || typeof this.implementations[route] === "function") {
         this.implementations[route] = {};
       }
       this.implementations[route][constructorName] = implementation;
@@ -140,12 +144,12 @@ export class RendererConstructionRouter {
    * @returns {string}
    */
   _canvasKeyString(canvasKey) {
-    if (typeof canvasKey === 'string') return canvasKey;
-    if (canvasKey && typeof canvasKey === 'object') {
+    if (typeof canvasKey === "string") return canvasKey;
+    if (canvasKey && typeof canvasKey === "object") {
       if (canvasKey.id) return `#${canvasKey.id}`;
       if (canvasKey.tagName) return `<${canvasKey.tagName.toLowerCase()}>`;
     }
-    return 'anonymous-canvas';
+    return "anonymous-canvas";
   }
 
   /**
@@ -167,11 +171,11 @@ export class RendererConstructionRouter {
   routeAndConstruct(params = {}) {
     const {
       constructorFn,
-      constructorName = constructorFn?.name || 'WebGLRenderer',
+      constructorName = constructorFn?.name || "WebGLRenderer",
       options = {},
       analysis = {},
       hostCapabilities,
-      sourceSpan = 'unknown:0:0',
+      sourceSpan = "unknown:0:0",
       sharedResources = [],
       targetImplementation,
       implementations: callImplementations,
@@ -179,11 +183,15 @@ export class RendererConstructionRouter {
     } = params;
 
     // 1. Preflight validation: validate constructor arguments upfront before any lock or side effects
-    if (constructorFn !== undefined && typeof constructorFn !== 'function') {
-      throw new TypeError(`Invalid constructorFn: expected a constructor function or factory, got ${typeof constructorFn}`);
+    if (constructorFn !== undefined && typeof constructorFn !== "function") {
+      throw new TypeError(
+        `Invalid constructorFn: expected a constructor function or factory, got ${typeof constructorFn}`,
+      );
     }
-    if (targetImplementation !== undefined && typeof targetImplementation !== 'function') {
-      throw new TypeError(`Invalid targetImplementation: expected a constructor function or factory, got ${typeof targetImplementation}`);
+    if (targetImplementation !== undefined && typeof targetImplementation !== "function") {
+      throw new TypeError(
+        `Invalid targetImplementation: expected a constructor function or factory, got ${typeof targetImplementation}`,
+      );
     }
 
     const rendererId = `renderer-${++this._rendererCounter}`;
@@ -203,13 +211,18 @@ export class RendererConstructionRouter {
     // 3. Parse shared resources once and preview route without mutating connected groups
     const parsedResources = [];
     for (const res of sharedResources) {
-      if (typeof res === 'string') {
+      if (typeof res === "string") {
         parsedResources.push({ id: res, isMutable: true });
       } else if (Array.isArray(res)) {
         parsedResources.push({ id: resolveResourceId(res[0]), isMutable: res[1] ?? true });
-      } else if (res && typeof res === 'object') {
+      } else if (res && typeof res === "object") {
         const resId = resolveResourceId(res);
-        const isMutable = res.isMutable !== undefined ? res.isMutable : (res.mutable !== undefined ? res.mutable : true);
+        const isMutable =
+          res.isMutable !== undefined
+            ? res.isMutable
+            : res.mutable !== undefined
+              ? res.mutable
+              : true;
         parsedResources.push({ id: resId, isMutable });
       }
     }
@@ -222,7 +235,8 @@ export class RendererConstructionRouter {
     // since specialization may fall back to retained once implementations are inspected.
     // Known-incompatible mismatches are rejected immediately before any effectful getters are read.
     const existingLock = this.getCanvasLock(canvasKey);
-    const isPotentiallyCompatible = resolved.route === ExecutionRoute.SPECIALIZED_WEBGPU &&
+    const isPotentiallyCompatible =
+      resolved.route === ExecutionRoute.SPECIALIZED_WEBGPU &&
       existingLock?.route === ExecutionRoute.RETAINED_UPSTREAM;
     if (existingLock && existingLock.route !== resolved.route && !isPotentiallyCompatible) {
       const rejectedEvent = Object.freeze({
@@ -257,9 +271,9 @@ export class RendererConstructionRouter {
     // Four-tier selection order: targetImplementation, route-conforming constructorFn, registered implementation for the resolved route, truthful throw.
     const selectConstructorForRoute = (route) => {
       let ctor = null;
-      if (typeof targetImplementation === 'function') {
+      if (typeof targetImplementation === "function") {
         ctor = targetImplementation;
-      } else if (typeof constructorFn === 'function') {
+      } else if (typeof constructorFn === "function") {
         // An explicitly supplied constructorFn is invoked for the resolved route
         // when it matches the route's contract.
         if (route === ExecutionRoute.EXACT_BACKEND) {
@@ -267,9 +281,15 @@ export class RendererConstructionRouter {
           // Opaque access is not permission to replace WebGPURenderer with the
           // legacy WebGLRenderer, including on hosts where upstream falls back.
           ctor = constructorFn;
-        } else if (route === ExecutionRoute.RETAINED_UPSTREAM && constructorName !== 'WebGLRenderer') {
+        } else if (
+          route === ExecutionRoute.RETAINED_UPSTREAM &&
+          constructorName !== "WebGLRenderer"
+        ) {
           ctor = constructorFn;
-        } else if (route === ExecutionRoute.GENERAL_WEBGPU && constructorName === 'WebGPURenderer') {
+        } else if (
+          route === ExecutionRoute.GENERAL_WEBGPU &&
+          constructorName === "WebGPURenderer"
+        ) {
           ctor = constructorFn;
         }
       }
@@ -278,13 +298,14 @@ export class RendererConstructionRouter {
       // constructor name. The legacy route-level registration is WebGLRenderer only.
       if (!ctor) {
         const routeImpl = getRouteImplementation(route);
-        if (typeof routeImpl === 'function') {
-          if (route !== ExecutionRoute.EXACT_BACKEND || constructorName === 'WebGLRenderer') {
+        if (typeof routeImpl === "function") {
+          if (route !== ExecutionRoute.EXACT_BACKEND || constructorName === "WebGLRenderer") {
             ctor = routeImpl;
           }
-        } else if (routeImpl && typeof routeImpl === 'object') {
-          ctor = routeImpl[constructorName] ||
-            (route !== ExecutionRoute.EXACT_BACKEND ? routeImpl['default'] : null);
+        } else if (routeImpl && typeof routeImpl === "object") {
+          ctor =
+            routeImpl[constructorName] ||
+            (route !== ExecutionRoute.EXACT_BACKEND ? routeImpl["default"] : null);
         }
       }
       return ctor;
@@ -298,7 +319,7 @@ export class RendererConstructionRouter {
     if (resolved.route === ExecutionRoute.SPECIALIZED_WEBGPU && !targetConstructor) {
       const fallbackConstructor = selectConstructorForRoute(ExecutionRoute.RETAINED_UPSTREAM);
       if (fallbackConstructor) {
-        const filteredReasons = resolved.reasons.filter((r) => r !== 'specialized-island-admitted');
+        const filteredReasons = resolved.reasons.filter((r) => r !== "specialized-island-admitted");
         const fallbackReasons = filteredReasons.includes(EscapeReason.SPECIALIZATION_UNAVAILABLE)
           ? Object.freeze([...filteredReasons])
           : Object.freeze([...filteredReasons, EscapeReason.SPECIALIZATION_UNAVAILABLE]);
@@ -326,17 +347,20 @@ export class RendererConstructionRouter {
         resolved = revalidated;
         groupId = resolved.groupId || rendererId;
         targetConstructor = selectConstructorForRoute(resolved.route);
-        const revalidatedAfterEscalation = this.connectedGroups.previewRoute(currentDecision, parsedResources);
+        const revalidatedAfterEscalation = this.connectedGroups.previewRoute(
+          currentDecision,
+          parsedResources,
+        );
         if (revalidatedAfterEscalation.route !== resolved.route) {
           throw new Error(
             `Cannot route construction site '${constructorName}' (${sourceSpan}): ` +
-            `route changed from '${resolved.route}' to '${revalidatedAfterEscalation.route}' during preflight implementation selection due to reentrant connected group constraints.`
+              `route changed from '${resolved.route}' to '${revalidatedAfterEscalation.route}' during preflight implementation selection due to reentrant connected group constraints.`,
           );
         }
       } else if (revalidated.route !== resolved.route) {
         throw new Error(
           `Cannot route construction site '${constructorName}' (${sourceSpan}): ` +
-          `route changed from '${resolved.route}' to '${revalidated.route}' during preflight implementation selection due to reentrant connected group constraints.`
+            `route changed from '${resolved.route}' to '${revalidated.route}' during preflight implementation selection due to reentrant connected group constraints.`,
         );
       }
     }
@@ -346,30 +370,30 @@ export class RendererConstructionRouter {
       if (resolved.route === ExecutionRoute.RETAINED_UPSTREAM) {
         throw new Error(
           `Cannot route construction site '${constructorName}' (${sourceSpan}) to '${resolved.route}': ` +
-          `caller-supplied constructor is not a valid retained upstream implementation, and no admitted implementation is registered.`
+            `caller-supplied constructor is not a valid retained upstream implementation, and no admitted implementation is registered.`,
         );
       } else if (resolved.route === ExecutionRoute.EXACT_BACKEND) {
         throw new Error(
           `Cannot route construction site '${constructorName}' (${sourceSpan}) to '${resolved.route}': ` +
-          `no admitted exact backend implementation registered (supplied constructor '${constructorName}' does not implement exact backend).`
+            `no admitted exact backend implementation registered (supplied constructor '${constructorName}' does not implement exact backend).`,
         );
       } else if (resolved.route === ExecutionRoute.SPECIALIZED_WEBGPU) {
         throw new Error(
           `Cannot route construction site '${constructorName}' (${sourceSpan}) to '${resolved.route}': ` +
-          `no admitted specialized WebGPU implementation registered.`
+            `no admitted specialized WebGPU implementation registered.`,
         );
       } else if (resolved.route === ExecutionRoute.GENERAL_WEBGPU) {
         throw new Error(
           `Cannot route construction site '${constructorName}' (${sourceSpan}) to '${resolved.route}': ` +
-          `no admitted general WebGPU implementation registered.`
+            `no admitted general WebGPU implementation registered.`,
         );
       }
     }
 
     // Final safety check: targetConstructor must be a valid function
-    if (typeof targetConstructor !== 'function') {
+    if (typeof targetConstructor !== "function") {
       throw new TypeError(
-        `Cannot construct renderer: no valid constructor function available for route '${resolved.route}' and constructor '${constructorName}'.`
+        `Cannot construct renderer: no valid constructor function available for route '${resolved.route}' and constructor '${constructorName}'.`,
       );
     }
 
@@ -378,7 +402,7 @@ export class RendererConstructionRouter {
     if (finalRevalidation.route !== resolved.route) {
       throw new Error(
         `Cannot route construction site '${constructorName}' (${sourceSpan}): ` +
-        `route changed from '${resolved.route}' to '${finalRevalidation.route}' during preflight implementation selection due to reentrant connected group constraints.`
+          `route changed from '${resolved.route}' to '${finalRevalidation.route}' during preflight implementation selection due to reentrant connected group constraints.`,
       );
     }
     resolved = finalRevalidation;
@@ -411,7 +435,7 @@ export class RendererConstructionRouter {
         sourceSpan,
       };
       this._canvasLocks.set(canvasKey, lockEntry);
-      if (typeof canvasKey === 'object' && canvasKey !== null) {
+      if (typeof canvasKey === "object" && canvasKey !== null) {
         GLOBAL_CANVAS_OBJECT_LOCKS.set(canvasKey, lockEntry);
       }
     }
@@ -437,9 +461,9 @@ export class RendererConstructionRouter {
       instance = new targetConstructor(options);
     }
 
-    if (!instance || (typeof instance !== 'object' && typeof instance !== 'function')) {
+    if (!instance || (typeof instance !== "object" && typeof instance !== "function")) {
       throw new TypeError(
-        `Renderer constructor for route '${resolved.route}' must return an object, got ${typeof instance}`
+        `Renderer constructor for route '${resolved.route}' must return an object, got ${typeof instance}`,
       );
     }
 
@@ -447,14 +471,29 @@ export class RendererConstructionRouter {
     // For known native result own data properties, inspect descriptor/value directly without invoking
     // observable getters on subclasses or factories, preserving throwing/missing getter contracts.
     let exposedCanvas = null;
-    const ownDomDesc = Object.getOwnPropertyDescriptor(instance, 'domElement');
-    if (ownDomDesc && 'value' in ownDomDesc && typeof ownDomDesc.value === 'object' && ownDomDesc.value !== null) {
+    const ownDomDesc = Object.getOwnPropertyDescriptor(instance, "domElement");
+    if (
+      ownDomDesc &&
+      "value" in ownDomDesc &&
+      typeof ownDomDesc.value === "object" &&
+      ownDomDesc.value !== null
+    ) {
       exposedCanvas = ownDomDesc.value;
     } else {
-      const ownBackendDesc = Object.getOwnPropertyDescriptor(instance, 'backend');
-      if (ownBackendDesc && 'value' in ownBackendDesc && ownBackendDesc.value && typeof ownBackendDesc.value === 'object') {
-        const backendDomDesc = Object.getOwnPropertyDescriptor(ownBackendDesc.value, 'domElement');
-        if (backendDomDesc && 'value' in backendDomDesc && typeof backendDomDesc.value === 'object' && backendDomDesc.value !== null) {
+      const ownBackendDesc = Object.getOwnPropertyDescriptor(instance, "backend");
+      if (
+        ownBackendDesc &&
+        "value" in ownBackendDesc &&
+        ownBackendDesc.value &&
+        typeof ownBackendDesc.value === "object"
+      ) {
+        const backendDomDesc = Object.getOwnPropertyDescriptor(ownBackendDesc.value, "domElement");
+        if (
+          backendDomDesc &&
+          "value" in backendDomDesc &&
+          typeof backendDomDesc.value === "object" &&
+          backendDomDesc.value !== null
+        ) {
           exposedCanvas = backendDomDesc.value;
         }
       }
@@ -501,7 +540,7 @@ export class RendererConstructionRouter {
     if (this._canvasLocks.has(canvasKey)) {
       return this._canvasLocks.get(canvasKey);
     }
-    if (typeof canvasKey === 'object' && canvasKey !== null) {
+    if (typeof canvasKey === "object" && canvasKey !== null) {
       return GLOBAL_CANVAS_OBJECT_LOCKS.get(canvasKey);
     }
     return undefined;
@@ -514,8 +553,11 @@ export class RendererConstructionRouter {
    * @returns {string | undefined}
    */
   getInstanceRoute(instance) {
-    if (!instance || (typeof instance !== 'object' && typeof instance !== 'function')) return undefined;
-    return this._instanceDiagnostics.get(instance)?.route ?? INSTANCE_DIAGNOSTICS.get(instance)?.route;
+    if (!instance || (typeof instance !== "object" && typeof instance !== "function"))
+      return undefined;
+    return (
+      this._instanceDiagnostics.get(instance)?.route ?? INSTANCE_DIAGNOSTICS.get(instance)?.route
+    );
   }
 
   /**
@@ -525,7 +567,8 @@ export class RendererConstructionRouter {
    * @returns {Object | undefined}
    */
   getInstanceDecision(instance) {
-    if (!instance || (typeof instance !== 'object' && typeof instance !== 'function')) return undefined;
+    if (!instance || (typeof instance !== "object" && typeof instance !== "function"))
+      return undefined;
     return this._instanceDiagnostics.get(instance) ?? INSTANCE_DIAGNOSTICS.get(instance);
   }
 
