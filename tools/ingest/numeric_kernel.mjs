@@ -84,12 +84,20 @@ function member(node, object, property, computed) {
  * access checks its own view before conversion. The host packs full accessed
  * views and publishes no writes if any check traps. No check-elision or SIMD
  * independence is inferred; colliding scatters must remain ordered.
+ * structuredLoops additionally admits nested counted loops with Number indices,
+ * runtime bounds and constant positive steps (ascending or descending). Their
+ * combined body entries are capped by maxNestedIterations per invocation.
+ * Exhaustion traps before publication, so the existing host retains original
+ * JavaScript exactly once. This is a native loop, not source unrolling, and
+ * neither the array ABI nor the synchronous execution boundary changes.
  */
 export function compileNumericKernel(source, {
   parameterTypes,
   helperSources = new Map(),
   allowMath = false,
   checkedIndexing = false,
+  structuredLoops = false,
+  maxNestedIterations = 1000000,
   sourceName = '<numeric-kernel>',
   maxMemoryPages = DEFAULT_MAX_PAGES,
 } = {}) {
@@ -101,6 +109,12 @@ export function compileNumericKernel(source, {
   }
   if (typeof allowMath !== 'boolean') fail('allowMath must be a boolean', null, 'INVALID_KERNEL_ABI');
   if (typeof checkedIndexing !== 'boolean') fail('checkedIndexing must be a boolean', null, 'INVALID_KERNEL_ABI');
+  if (typeof structuredLoops !== 'boolean' || (structuredLoops && !checkedIndexing)) {
+    fail('structuredLoops must be a boolean and requires checkedIndexing', null, 'INVALID_KERNEL_ABI');
+  }
+  if (!Number.isInteger(maxNestedIterations) || maxNestedIterations < 1 || maxNestedIterations > 1000000000) {
+    fail('maxNestedIterations must be between 1 and 1000000000', null, 'INVALID_KERNEL_ABI');
+  }
   const arrayTypes = checkedIndexing ? ['f32[]', 'f64[]', 'u16[]', 'u32[]'] : ['f32[]', 'f64[]'];
   let ast;
   try {
@@ -191,6 +205,8 @@ export function compileNumericKernel(source, {
   let temporaries = new Map();
   let temporaryCount = 0;
   let statementCount = 0;
+  let nestedCount = 0, nestedDepth = 0, maxNestedDepth = 0, nestedFuel = null;
+  const nestedIndices = new Set();
   const mutableLocals = new Set();
   const scalarWrites = new Set();
   const reads = new Set();
@@ -349,7 +365,7 @@ export function compileNumericKernel(source, {
   }
 
   function mutableScalar(node) {
-    if (node?.type !== 'Identifier' || node.name === indexName) {
+    if (node?.type !== 'Identifier' || node.name === indexName || nestedIndices.has(node.name)) {
       fail('Scalar updates require a mutable local or scalar parameter, not the loop index', node);
     }
     if (temporaries.has(node.name)) {
@@ -361,6 +377,64 @@ export function compileNumericKernel(source, {
     const param = params.get(node.name);
     if (param?.type === 'f64') return param.index;
     fail(`Unresolved or non-scalar assignment ${node.name}`, node);
+  }
+
+  function compileNestedLoop(node, depth) {
+    if (!structuredLoops || !inLoop) fail('Nested loops require structuredLoops inside an array-bounded pass', node);
+    if (++nestedCount > 64 || nestedDepth >= 8) fail('Nested loops exceed the 64-loop/8-level limit', node);
+    const init = node.init;
+    if (init?.type !== 'VariableDeclaration' || init.kind !== 'let' || init.declarations.length !== 1) {
+      fail('Nested loops require one fresh let index', init || node);
+    }
+    const binding = init.declarations[0], name = binding.id.name;
+    if (binding.id.type !== 'Identifier' || !binding.init || name === indexName ||
+        params.has(name) || temporaries.has(name)) {
+      fail('Nested loop index must not shadow an enclosing binding', binding);
+    }
+    if (node.test?.type !== 'BinaryExpression' || !['<', '<=', '>', '>='].includes(node.test.operator) ||
+        node.test.left.type !== 'Identifier' || node.test.left.name !== name) {
+      fail('Nested loop test must compare its index with a numeric bound', node.test || node);
+    }
+    const update = node.update;
+    let step, operator;
+    if (update?.type === 'UpdateExpression' && ['++', '--'].includes(update.operator) &&
+        update.argument.type === 'Identifier' && update.argument.name === name) {
+      step = 1; operator = update.operator[0];
+    } else if (update?.type === 'AssignmentExpression' && ['+=', '-='].includes(update.operator) &&
+        update.left.type === 'Identifier' && update.left.name === name &&
+        update.right.type === 'Literal' && typeof update.right.value === 'number' &&
+        Number.isFinite(update.right.value) && update.right.value > 0) {
+      step = update.right.value; operator = update.operator[0];
+    } else {
+      fail('Nested loop update must add or subtract a positive numeric constant', update || node);
+    }
+    const parentScope = temporaries;
+    temporaries = new Map(parentScope);
+    temporaries.set(name, null); // The initializer is inside this binding's TDZ.
+    nestedDepth++;
+    maxNestedDepth = Math.max(maxNestedDepth, nestedDepth);
+    nestedIndices.add(name);
+    try {
+      const initial = expression(binding.init), local = temporaryBase + temporaryCount++;
+      temporaries.set(name, local);
+      if (nestedFuel === null) nestedFuel = temporaryBase + temporaryCount++;
+      const predicate = condition(node.test);
+      const body = compileBlock(node.body.type === 'BlockStatement' ? node.body.body : [node.body], true, depth + 1);
+      // All nested loops share one zero-initialized f64 counter per call. It
+      // stays an exact integer through the configured bound. Check only after
+      // a true source predicate: an empty loop spends no body-entry credit.
+      // Reevaluate the source bound on every iteration; never hoist a mutable
+      // local/array read. Number indices also preserve fractional starts and
+      // f64 stagnation, which the budget catches instead of silently wrapping.
+      return [...initial, ...set(local), 0x02, 0x40, 0x03, 0x40,
+        ...predicate, 0x45, 0x0d, 1,
+        ...get(nestedFuel), ...number(maxNestedIterations), 0x66, 0x04, 0x40, 0x00, 0x0b,
+        ...get(nestedFuel), ...number(1), 0xa0, ...set(nestedFuel),
+        ...body, ...get(local), ...number(step), OPS[operator], ...set(local),
+        0x0c, 0, 0x0b, 0x0b];
+    } finally {
+      nestedDepth--; nestedIndices.delete(name); temporaries = parentScope;
+    }
   }
 
   function compileBlock(statements, conditional = false, depth = 0, retainScope = false) {
@@ -376,7 +450,7 @@ export function compileNumericKernel(source, {
         if (!['const', 'let'].includes(statement.kind)) fail('Only lexical scalar temporaries are admitted', statement);
         for (const variable of statement.declarations) {
           const name = variable.id.name;
-          if (variable.id.type !== 'Identifier' || !variable.init || name === indexName ||
+          if (variable.id.type !== 'Identifier' || !variable.init || name === indexName || nestedIndices.has(name) ||
               params.has(name) || declared.has(name)) {
             fail('Temporaries must be initialized scalar bindings without parameter/index shadowing', variable);
           }
@@ -407,6 +481,10 @@ export function compileNumericKernel(source, {
           bytes.push(...emitLoop(compileBlock(body, false, depth + 1)));
           inLoop = false;
           indexName = null;
+          continue;
+        }
+        if (statement.type === 'ForStatement') {
+          bytes.push(...compileNestedLoop(statement, depth));
           continue;
         }
         if (statement.type === 'BlockStatement') {
@@ -558,5 +636,10 @@ export function compileNumericKernel(source, {
   }
   Object.freeze(manifest.parameters);
   Object.freeze(manifest.sourceSpan);
-  return Object.freeze({ wasm, manifest: Object.freeze(manifest), helpers: helperCode.helpers });
+  return Object.freeze({ wasm, manifest: Object.freeze(manifest), helpers: helperCode.helpers,
+    // Build-time description only: the executable enforces the cap itself,
+    // including on existing v7 hosts. No extra host argument or guard is needed.
+    ...(nestedCount ? { nestedLoops: Object.freeze({ count: nestedCount,
+      maxDepth: maxNestedDepth, maxIterations: maxNestedIterations }) } : {}),
+  });
 }
