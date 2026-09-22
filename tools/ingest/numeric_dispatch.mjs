@@ -152,3 +152,42 @@ export function numericDispatchDiagnostics(token) {
     ),
   });
 }
+
+// One registry per emitted dispatcher ESM instance, shared by all linked chunks.
+// Keys are the actual original functions, not export names, URLs or properties.
+// Neither registration nor lookup reads application object properties or keeps
+// otherwise unreachable functions alive. Private dispatch tokens stay private.
+const sharedTargets = new WeakMap();
+
+/**
+ * Compiler-only producer entry point. The target/bytecode pairing must satisfy
+ * the same closure proof as createNumericDispatch; the registry is not a trust
+ * boundary or a way to authenticate third-party Wasm. Registration is lazy and
+ * preserves the target's exports, descriptors, name, length and identity.
+ *
+ * The first registration owns cross-module calls. Re-exporting a target never
+ * needs another registration, and accidentally registering it twice must not
+ * reset an already initialized kernel or switch budgets with evaluation order.
+ */
+export function registerNumericDispatch(...args) {
+  const token = createNumericDispatch(...args);
+  const target = args[0];
+  if (!sharedTargets.has(target)) sharedTargets.set(target, token);
+  return token;
+}
+
+/**
+ * Direct imported calls have an undefined receiver. Evaluate their callee and
+ * arguments BEFORE entering here, just as for local dispatch. Live rebindings,
+ * early ESM-cycle calls, uncompiled dependencies and shadowed names use the
+ * actual callee. A WeakMap miss does not invoke getters or proxy traps.
+ */
+export function dispatchImportedNumericCall(callee, args) {
+  return dispatchNumericCall(sharedTargets.get(callee), callee, args);
+}
+
+/** Opt-in diagnostics without exposing registrations or changing app exports. */
+export function importedNumericDispatchDiagnostics(target) {
+  const token = sharedTargets.get(target);
+  return token ? numericDispatchDiagnostics(token) : null;
+}

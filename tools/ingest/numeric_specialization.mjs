@@ -1,11 +1,13 @@
 /**
  * Discover closed update loops/pipelines and specialize ordinary ESM call sites.
  *
- * Original declarations/exports/identities remain untouched. Only direct calls
+ * Original kernel declarations/exports/identities remain untouched. Only direct calls
  * in this source unit are rewritten, with a runtime callee-identity guard.
  * Applying this after Rollup links a chunk also covers calls across merged
  * source modules. Reachable immutable scalar helpers execute in the same Wasm
- * module as their loop. Calls through exports in other chunks remain JavaScript.
+ * module as their loop. With crossModule, admitted exported functions register
+ * their original identity in the shared dispatcher; imported direct calls can
+ * then select that same lazy Wasm instance across chunk and re-export boundaries.
  *
  * Array types are speculative: native type, ownership, alias and length
  * guards decide each invocation. Unsupported code is retained, never rejected
@@ -123,7 +125,7 @@ function indexedLayouts(fn, parameters) {
 
 /**
  * @param {string} source ESM source (or an ES-format rendered Rollup chunk)
- * @param {{sourceName?: string, runtimeModule?: string | (() => string), maxKernels?: number, maxMemoryPages?: number, maxIterations?: number}} options
+ * @param {{sourceName?: string, runtimeModule?: string | (() => string), maxKernels?: number, maxMemoryPages?: number, maxIterations?: number, crossModule?: boolean}} options
  * @returns {{code: string, changed: boolean, report: object}}
  */
 export function specializeNumericModule(
@@ -134,6 +136,7 @@ export function specializeNumericModule(
     maxKernels = 64,
     maxMemoryPages = 1024,
     maxIterations = 1000000,
+    crossModule = false,
   } = {},
 ) {
   if (typeof source !== "string")
@@ -152,16 +155,19 @@ export function specializeNumericModule(
     throw new RangeError("maxMemoryPages must be between 1 and 16384");
   if (!Number.isInteger(maxIterations) || maxIterations < 1 || maxIterations > 1000000000)
     throw new RangeError("maxIterations must be between 1 and 1000000000");
+  if (typeof crossModule !== "boolean")
+    throw new TypeError("crossModule must be a boolean");
   const report = {
     version: 1,
     sourceName: String(sourceName),
     route: "retained-js",
-    scope: "direct-calls-in-source-unit",
+    scope: crossModule ? "direct-local-and-imported-binding-calls" : "direct-calls-in-source-unit",
     accelerated: false,
     compiledKernels: 0,
     rewrittenCalls: 0,
     candidates: [],
     refusal: null,
+    ...(crossModule ? { registeredKernels: 0, importedCalls: [] } : {}),
   };
   const unchanged = () => ({ code: source, changed: false, report });
   let ast;
@@ -199,6 +205,58 @@ export function specializeNumericModule(
       message: "Dynamic lexical access requires the original source unit",
     };
     return unchanged();
+  }
+  // Imports identify eligible call-site spellings, NOT native targets. The
+  // runtime checks the evaluated function identity, including when a nested
+  // binding shadows that spelling. Namespace/method/optional calls stay intact.
+  const importedBindings = new Map();
+  const exportedBindings = new Set();
+  if (crossModule) {
+    const aliases = new Map();
+    for (const statement of ast.body) {
+      if (statement.type === "ImportDeclaration") {
+        for (const specifier of statement.specifiers) {
+          if (specifier.type === "ImportNamespaceSpecifier") continue;
+          importedBindings.set(specifier.local.name, {
+            moduleSpecifier: statement.source.value,
+            importedName: specifier.type === "ImportDefaultSpecifier"
+              ? "default" : specifier.imported.name ?? specifier.imported.value,
+          });
+        }
+      }
+      const declaration = statement.declaration ?? statement;
+      if (declaration.type === "VariableDeclaration") {
+        for (const variable of declaration.declarations) {
+          if (variable.id.type === "Identifier" && variable.init?.type === "Identifier")
+            aliases.set(variable.id.name, variable.init.name);
+        }
+      }
+      if (statement.type === "ExportNamedDeclaration" && !statement.source) {
+        if (statement.declaration?.type === "FunctionDeclaration")
+          exportedBindings.add(statement.declaration.id.name);
+        if (statement.declaration?.type === "VariableDeclaration") {
+          for (const variable of statement.declaration.declarations)
+            patternNames(variable.id, exportedBindings);
+        }
+        for (const specifier of statement.specifiers) exportedBindings.add(specifier.local.name);
+      }
+      if (statement.type === "ExportDefaultDeclaration") {
+        if (declaration.type === "Identifier") exportedBindings.add(declaration.name);
+        else if (declaration.type === "FunctionDeclaration" && declaration.id)
+          exportedBindings.add(declaration.id.name);
+      }
+    }
+    // Alias discovery may overapproximate reachability, never the target proof.
+    // Only immutable ORIGINAL declarations are registered, not alias values.
+    // A mutable exported alias can change later; lookup then follows its value.
+    const pending = [...exportedBindings];
+    while (pending.length) {
+      const target = aliases.get(pending.pop());
+      if (target && !exportedBindings.has(target)) {
+        exportedBindings.add(target);
+        pending.push(target);
+      }
+    }
   }
   // Only hoisted declarations have a known initialized binding throughout module
   // evaluation. Const/arrow helpers need a separate TDZ/initialization proof.
@@ -247,7 +305,12 @@ export function specializeNumericModule(
     if (!token || token.start >= call.end) throw new Error("Missing call argument delimiter");
     return token.end;
   }
-  for (const statement of ast.body) {
+  // Keep previously eligible local-call kernels ahead of newly discovered
+  // export-only kernels when the unit's compilation budget is small.
+  const calledNames = new Set(calls.map(call => call.callee.name));
+  const priority = statement => calledNames.has((statement.declaration ?? statement).id?.name) ? 0 : 1;
+  const candidates = crossModule ? [...ast.body].sort((a, b) => priority(a) - priority(b)) : ast.body;
+  for (const statement of candidates) {
     const fn = ["ExportNamedDeclaration", "ExportDefaultDeclaration"].includes(statement.type)
       ? statement.declaration
       : statement;
@@ -271,7 +334,7 @@ export function specializeNumericModule(
       continue;
     }
     const sites = calls.filter((call) => call.callee.name === fn.id.name);
-    if (!sites.length) {
+    if (!sites.length && !(crossModule && exportedBindings.has(fn.id.name))) {
       item.reason = "NO_LOCAL_DIRECT_CALLS";
       continue;
     }
@@ -439,10 +502,41 @@ export function specializeNumericModule(
     }
     item.storageSemantics = "same-type-alias-preserving-v1";
     item.guardFallback = "retained-original-js";
+    if (crossModule) {
+      item.dispatchSemantics = "shared-original-function-identity-v1";
+      item.exportReachable = exportedBindings.has(fn.id.name);
+      report.registeredKernels++;
+    }
     report.compiledKernels++;
     report.rewrittenCalls += sites.length;
   }
-  if (!report.compiledKernels) return unchanged();
+  // Consumer-only chunks need no kernel or Wasm bytes of their own. The source
+  // dependency still initializes on the normal ESM schedule; do not import or
+  // evaluate any producer through the registry, and never replace live imports.
+  const runtimeImports = [];
+  if (report.compiledKernels) {
+    runtimeImports.push(`${crossModule ? "registerNumericDispatch" : "createNumericDispatch"} as ${createName}`,
+      `dispatchNumericCall as ${dispatchName}`);
+  }
+  if (crossModule) {
+    const sites = calls.filter(call => importedBindings.has(call.callee.name));
+    if (sites.length) {
+      const importedDispatchName = fresh("imported_dispatch"), helperName = fresh("imported_call");
+      runtimeImports.push(`dispatchImportedNumericCall as ${importedDispatchName}`);
+      helpers.push(`function ${helperName}(callee, ...args) { return ${importedDispatchName}(callee, args); }`);
+      for (const call of sites) {
+        edits.push({ start: call.callee.start, end: call.callee.end, text: helperName });
+        const pos = callParen(call);
+        edits.push({ start: pos, end: pos, text: `${source.slice(call.callee.start, call.callee.end)},` });
+        report.importedCalls.push({
+          ...importedBindings.get(call.callee.name), localName: call.callee.name,
+          sourceSpan: span(call), route: "shared-identity-lookup-with-retained-fallback",
+        });
+      }
+      report.rewrittenCalls += sites.length;
+    }
+  }
+  if (!runtimeImports.length) return unchanged();
   const runtimeSpecifier = typeof runtimeModule === "function" ? runtimeModule() : runtimeModule;
   if (typeof runtimeSpecifier !== "string" || !runtimeSpecifier)
     throw new TypeError("Runtime resolver must return a nonempty module specifier");
@@ -456,7 +550,7 @@ export function specializeNumericModule(
     start: preludeEnd,
     end: preludeEnd,
     text:
-      `\nimport { createNumericDispatch as ${createName}, dispatchNumericCall as ${dispatchName} } from ${JSON.stringify(runtimeSpecifier)};\n` +
+      `\nimport { ${runtimeImports.join(", ")} } from ${JSON.stringify(runtimeSpecifier)};\n` +
       registrations.join("\n") +
       "\n",
   });
@@ -466,6 +560,6 @@ export function specializeNumericModule(
   let code = source;
   for (const edit of edits) code = code.slice(0, edit.start) + edit.text + code.slice(edit.end);
   code += "\n" + helpers.join("\n") + "\n";
-  report.route = "mixed-js-and-guarded-numeric-wasm";
+  report.route = report.compiledKernels ? "mixed-js-and-guarded-numeric-wasm" : "shared-numeric-dispatch-with-retained-fallback";
   return { code, changed: true, report };
 }
