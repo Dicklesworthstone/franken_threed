@@ -6,7 +6,14 @@
 import { instantiateNumericKernel } from "./numeric_kernel_runtime.mjs";
 
 const apply = Reflect.apply;
+const hasOwn = Object.hasOwn;
 const U8Array = Uint8Array;
+const ARRAY_TAGS = Object.freeze({
+  "f32[]": "Float32Array", "f64[]": "Float64Array",
+  "i8[]": "Int8Array", "u8[]": "Uint8Array", "u8c[]": "Uint8ClampedArray",
+  "i16[]": "Int16Array", "u16[]": "Uint16Array",
+  "i32[]": "Int32Array", "u32[]": "Uint32Array",
+});
 const typedTag = Object.getOwnPropertyDescriptor(
   Object.getPrototypeOf(Float64Array.prototype),
   Symbol.toStringTag,
@@ -55,7 +62,7 @@ export function createNumericDispatch(
       !Array.isArray(variant.parameterTypes) ||
       variant.parameterTypes.length > 64 ||
       variant.parameterTypes.some(
-        (type) => !["f32[]", "f64[]", "u16[]", "u32[]", "f64"].includes(type),
+        (type) => type !== "f64" && !hasOwn(ARRAY_TAGS, type),
       )
     ) {
       throw new TypeError("Invalid numeric dispatch alternative ABI");
@@ -74,14 +81,7 @@ function matches(types, args) {
     return types.every((type, index) =>
       type === "f64"
         ? typeof args[index] === "number"
-        : apply(typedTag, args[index], []) ===
-          (type === "u16[]"
-            ? "Uint16Array"
-            : type === "u32[]"
-              ? "Uint32Array"
-              : type === "f32[]"
-                ? "Float32Array"
-                : "Float64Array"),
+        : apply(typedTag, args[index], []) === ARRAY_TAGS[type],
     );
   } catch {
     return false;

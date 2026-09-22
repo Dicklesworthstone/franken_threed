@@ -16,6 +16,7 @@ import * as walk from "acorn-walk";
 import { compileNumericCandidate } from "./numeric_candidate.mjs";
 import { NumericKernelCompileError } from "./numeric_kernel.mjs";
 import { hasNumericLoop } from "./numeric_loop_discovery.mjs";
+import { discoverNumericStorageHints } from "./numeric_storage_hints.mjs";
 
 function span(node) {
   return {
@@ -204,6 +205,7 @@ export function specializeNumericModule(
   // Keep every original declaration/export intact; helper closure is codegen,
   // not function replacement or source evaluation. The compiler rejects free
   // variables, shadowed callees, recursion and any unclosed transitive helper.
+  const storageHints = discoverNumericStorageHints(ast);
   const helperSources = new Map();
   const helperSpans = new Map();
   for (const statement of ast.body) {
@@ -328,18 +330,30 @@ export function specializeNumericModule(
     }
     const seenLayouts = new Set([parameterTypes.join(",")]);
     const alternatives = [];
-    for (const types of layouts) {
+    // Concrete allocation/wrapper hints select additional integer storage ABIs,
+    // never eliminate runtime guards. Prefer observed layouts over speculative
+    // topology combinations, retaining the primary and the 16-alternative cap.
+    // Without integer hints, existing successful output is byte-for-byte stable.
+    const hintedLayouts = storageHints(sites, artifact.manifest.parameters);
+    for (const types of [...hintedLayouts, ...layouts]) {
+      if (alternatives.length === 16) break;
       if (seenLayouts.has(types.join(","))) continue;
       seenLayouts.add(types.join(","));
-      const variant = compileNumericCandidate(source.slice(fn.start, fn.end), {
-        parameterTypes: types,
-        helperSources,
-        allowMath: true,
-        sourceName: `${sourceName}:${fn.id.name}`,
-        maxMemoryPages,
-        maxIterations,
-      });
-      alternatives.push({ parameterTypes: types, bytes: [...variant.wasm] });
+      try {
+        const variant = compileNumericCandidate(source.slice(fn.start, fn.end), {
+          parameterTypes: types,
+          helperSources,
+          allowMath: true,
+          sourceName: `${sourceName}:${fn.id.name}`,
+          maxMemoryPages,
+          maxIterations,
+        });
+        alternatives.push({ parameterTypes: types, bytes: [...variant.wasm] });
+      } catch (error) {
+        // One unsuitable speculative layout must not discard an admitted
+        // primary or reject the application's original JavaScript.
+        if (!(error instanceof NumericKernelCompileError)) throw error;
+      }
     }
     const tokenName = fresh("token"),
       helperName = fresh("call");
