@@ -39,7 +39,7 @@
  * draws. OPAQUE ignores input alpha; MASK discards below its threshold and writes
  * opaque alpha. Negative-determinant world transforms reverse front-face winding.
  *
- * shading is 'unlit' (default), 'lambert', 'phong', or 'metallic-roughness'. Lit meshes
+ * shading is 'unlit' (default), 'lambert', 'phong', 'toon', or 'metallic-roughness'. Lit meshes
  * require the deformer's normal attribute and invertible world transforms.
  * Metallic-roughness uses GGX/Smith-correlated visibility and Schlick Fresnel,
  * with metallicFactor/roughnessFactor in [0,1] (both default 1) and an explicit
@@ -86,6 +86,12 @@
  * not a Phong reflection/refraction map. flatShading derives current geometric
  * normals in the fragment stage before discard, including deformed geometry.
  * Flat normal mapping uses the derivative tangent frame, not authored tangents.
+ * Toon uses r186's signed-angle gradient irradiance, not quantized Lambert.
+ * gradientTexture is a borrowed linear 2D view/sampler whose R channel is
+ * sampled at ((NdotL+1)/2,0); it needs no geometry UVs or mapCoordinates.
+ * Omission selects the derivative-smoothed 0.7/1 ramp. All ramp derivatives and
+ * samples run before alpha discard or per-fragment light exits. Toon shares
+ * Phong's punctual falloff but has no specular lobe; prepared IBL is diffuse.
  *
  * Lit frames require lighting: {cameraPosition:[x,y,z], lights:[...]}, at most
  * eight directional/point/spot lights in world space. For orthographic views,
@@ -191,6 +197,8 @@ const MAP_FIELDS = Object.freeze([
 // No dummy textures, additional bindings or larger per-draw arena are needed.
 const PHONG_MAP_FIELDS = Object.freeze(MAP_FIELDS.map((field, slot) =>
   slot === 1 ? "specularTexture" : field));
+const TOON_MAP_FIELDS = Object.freeze(MAP_FIELDS.map((field, slot) =>
+  slot === 1 ? "gradientTexture" : field));
 const PHONG_SPECULAR = Object.freeze([0.005605391621829107, 0.005605391621829107, 0.005605391621829107]);
 const COAT_FIELDS = Object.freeze([
   "clearcoatFactor",
@@ -280,6 +288,7 @@ function surfaceShader(
   geometryChannels = null,
   phong = false,
   flat = false,
+  toon = false,
 ) {
   const textured = mapMask !== 0 || coated,
     normalMapped = (mapMask & 4) !== 0,
@@ -289,7 +298,8 @@ function surfaceShader(
   const colorWidth = attributes ? (geometryChannels?.colorSize ?? 4) : 0;
   const occluded = (mapMask & 16) !== 0,
     ambientOcclusion = occluded && environmentCode !== "";
-  const names = phong ? MAP_NAMES.map((name, slot) => slot === 1 ? "specular" : name) : MAP_NAMES;
+  const names = phong || toon ? MAP_NAMES.map((name, slot) =>
+    slot === 1 ? toon ? "gradient" : "specular" : name) : MAP_NAMES;
   const declarations = mapSlots(mapMask)
     .map(
       (slot) =>
@@ -297,7 +307,7 @@ function surfaceShader(
     )
     .join("\n");
   const coordinates = (slot) => (coordinateMask & (1 << slot) ? `input.uv_${slot}` : "input.uv");
-  const samples = mapSlots(mapMask)
+  const samples = mapSlots(toon ? mapMask & ~2 : mapMask)
     .map(
       (slot) =>
         `let ${names[slot]}_texel = textureSample(${names[slot]}_texture, ${names[slot]}_sampler, ${coordinates(slot)});`,
@@ -328,19 +338,29 @@ fn illuminate(base: vec3<f32>, position: vec3<f32>, normal: vec3<f32>, metallic:
       let delta = light.vector.xyz - position;
       let distance = length(delta);
       incoming = unit_vector(delta);
-      attenuation = 1.0 / max(distance * distance, ${phong ? "0.01" : "0.000001"});
+      attenuation = 1.0 / max(distance * distance, ${phong || toon ? "0.01" : "0.000001"});
       if (light.direction.w > 0.0) {
         let ratio = distance / light.direction.w;
-        ${phong ? "let window = clamp(1.0 - ratio * ratio * ratio * ratio, 0.0, 1.0);\n        attenuation *= window * window;" : "attenuation *= clamp(1.0 - ratio * ratio * ratio * ratio, 0.0, 1.0);"}
+        ${phong || toon ? "let window = clamp(1.0 - ratio * ratio * ratio * ratio, 0.0, 1.0);\n        attenuation *= window * window;" : "attenuation *= clamp(1.0 - ratio * ratio * ratio * ratio, 0.0, 1.0);"}
       }
       if (light.radiance.w == 2.0) {
         let cosine = dot(-incoming, light.direction.xyz);
         var angular = select(0.0, 1.0, cosine >= light.cone.y);
         if (light.cone.x > light.cone.y) { angular = clamp((cosine - light.cone.y) / (light.cone.x - light.cone.y), 0.0, 1.0); }
-        attenuation *= ${phong ? "angular * angular * (3.0 - 2.0 * angular)" : "angular * angular"};
+        attenuation *= ${phong || toon ? "angular * angular * (3.0 - 2.0 * angular)" : "angular * angular"};
       }
     }
-    let nl = max(dot(normal, incoming), 0.0);
+    ${toon ? `// r186 gradientmap_pars_fragment: signed angle, not clamped Lambert.
+    // No per-fragment continue/discard may precede this derivative or sample.
+    let gradient_coordinate = vec2<f32>(dot(normal, incoming) * 0.5 + 0.5, 0.0);
+    ${mapMask & 2 ? "let nl = textureSample(gradient_texture, gradient_sampler, gradient_coordinate).r;" : `let width = fwidth(gradient_coordinate.x) * 0.5;
+    // A constant ramp coordinate has zero footprint. Take the limiting step
+    // explicitly rather than evaluating smoothstep with equal edges.
+    var nl = select(0.7, 1.0, gradient_coordinate.x >= 0.7);
+    if (width > 0.0) {
+      nl = mix(0.7, 1.0, smoothstep(0.7 - width, 0.7 + width, gradient_coordinate.x));
+    }`}
+    let brdf = base / 3.141592653589793;` : `let nl = max(dot(normal, incoming), 0.0);
     if (nl <= 0.0 || attenuation <= 0.0) { continue; }
     var brdf = base / 3.141592653589793;
     ${phong ? `// r186 bsdfs.glsl.js + common.glsl.js: normalized Blinn-Phong,
@@ -368,7 +388,7 @@ fn illuminate(base: vec3<f32>, position: vec3<f32>, normal: vec3<f32>, metallic:
       let edge = 1.0 - vh;
       let fresnel = f0 + (vec3<f32>(1.0) - f0) * edge * edge * edge * edge * edge;
       brdf = (vec3<f32>(1.0) - fresnel) * (1.0 - metallic) * base / 3.141592653589793 + fresnel * distribution * visibility;
-    }`}
+    }`}`}
     ${
       shadowed
         ? `var visibility = 1.0;
@@ -444,7 +464,7 @@ struct VertexOutput {
       : ""
   }
   let rgba = draw_info.color * input.color ${mapMask & 1 ? "* color_texel" : ""};
-  if (draw_info.options.x >= 0.0 && rgba.a < draw_info.options.x) { discard; }
+  ${toon ? "// Toon derivatives run before alpha discard, including instanced MASK draws." : "if (draw_info.options.x >= 0.0 && rgba.a < draw_info.options.x) { discard; }"}
   ${
     lit
       ? `var normal = ${flat ? "flat_normal" : "unit_vector(input.normal)"};${coated ? "\n  var coat_normal = normal;" : ""}
@@ -481,8 +501,8 @@ struct VertexOutput {
       : ""
   }
   ${coatNormalMapped ? clearcoatNormalCode(derivative) + "\n  " : ""}${flat ? "" : "normal *= select(-1.0, 1.0, front);"}${coated && !flat ? "\n  coat_normal *= select(-1.0, 1.0, front);" : ""}
-  let metallic = draw_info.options.w ${!phong && mapMask & 2 ? "* metallic_roughness_texel.b" : ""};
-  let roughness = draw_info.emission_roughness.w ${!phong && mapMask & 2 ? "* metallic_roughness_texel.g" : ""};
+  let metallic = draw_info.options.w ${!phong && !toon && mapMask & 2 ? "* metallic_roughness_texel.b" : ""};
+  let roughness = draw_info.emission_roughness.w ${!phong && !toon && mapMask & 2 ? "* metallic_roughness_texel.g" : ""};
   let emission = draw_info.emission_roughness.rgb ${mapMask & 8 ? "* emissive_texel.rgb" : ""};
   ${ambientOcclusion ? "// glTF occlusion uses only linear R and affects indirect light, never emission or punctual light.\n  let occlusion = 1.0 + draw_info.normal_from_local.strength * (occlusion_texel.r - 1.0);\n  " : ""}${coated ? "var" : "let"} rgb = illuminate(rgba.rgb, input.world, normal, metallic, roughness, emission${ambientOcclusion ? ", occlusion" : ""}${phong ? mapMask & 2 ? ", specular_texel.r" : ", 1.0" : ""});${
     coated
@@ -504,7 +524,7 @@ struct VertexOutput {
   }`
       : "let rgb = rgba.rgb;"
   }
-  ${depthOnly ? "" : "return vec4<f32>(rgb, select(1.0, rgba.a, draw_info.options.y > 0.0));"}
+  ${toon ? "if (draw_info.options.x >= 0.0 && rgba.a < draw_info.options.x) { discard; }\n  " : ""}${depthOnly ? "" : "return vec4<f32>(rgb, select(1.0, rgba.a, draw_info.options.y > 0.0));"}
 }
 `;
 }
@@ -984,8 +1004,9 @@ export async function createGpuAnimationRenderer(
     const geometry = geometryKey === undefined ? null : geometryLayouts.get(geometryKey);
     const coated = variant.includes("coat-");
     const phong = variant.includes("phong-"), flat = variant.includes("flat-");
+    const toon = variant.includes("toon-");
     const lit = variant.startsWith("lit-"),
-      attributes = !variant.endsWith("plain"),
+      attributes = !variant.endsWith("plain") && !variant.includes("no-surface-"),
       mapMask = mapMaskFor(variant),
       textured = mapMask !== 0 || coated;
     const layoutKey = mapMask | (coated ? COAT_LAYOUT : 0);
@@ -1055,6 +1076,7 @@ export async function createGpuAnimationRenderer(
               geometry?.channels,
               phong,
               flat,
+              toon,
             )
           : ANIMATION_RENDER_WGSL,
     });
@@ -1336,6 +1358,7 @@ export async function createGpuAnimationRenderer(
         "specularColor",
         "shininess",
         "specularTexture",
+        "gradientTexture",
         "metallicFactor",
         "roughnessFactor",
         "emissiveFactor",
@@ -1362,9 +1385,9 @@ export async function createGpuAnimationRenderer(
     } = options;
     const rgba = Float64Array.from(color(baseColor)),
       shading = options.shading ?? "unlit";
-    const mode = ["unlit", "lambert", "metallic-roughness", "phong"].indexOf(shading),
+    const mode = ["unlit", "lambert", "metallic-roughness", "phong", "toon"].indexOf(shading),
       lit = mode > 0;
-    const phong = mode === 3, flat = options.flatShading ?? false;
+    const phong = mode === 3, toon = mode === 4, flat = options.flatShading ?? false;
     if (typeof flat !== "boolean" || (flat && !lit) || options.flatShading === null)
       fail("ANIMATION_RENDER_OPTIONS", "flatShading requires a lit material and a boolean");
     if (
@@ -1373,13 +1396,14 @@ export async function createGpuAnimationRenderer(
       (mode !== 2 &&
         (options.metallicFactor !== undefined || options.roughnessFactor !== undefined)) ||
       (!phong && (options.specularColor !== undefined || options.shininess !== undefined || options.specularTexture != null)) ||
-      (phong && options.metallicRoughnessTexture != null)
+      ((phong || toon) && options.metallicRoughnessTexture != null) ||
+      (!toon && options.gradientTexture != null)
     )
       fail("ANIMATION_RENDER_OPTIONS", "Material parameters do not apply to shading model");
     if (format === null && (lit || alphaMode === "BLEND"))
       fail("ANIMATION_RENDER_OPTIONS", "Depth-only materials must be unlit OPAQUE or MASK");
     // Snapshot every borrowed resource descriptor before the first await.
-    const mapFields = phong ? PHONG_MAP_FIELDS : MAP_FIELDS;
+    const mapFields = toon ? TOON_MAP_FIELDS : phong ? PHONG_MAP_FIELDS : MAP_FIELDS;
     const textures = mapFields.map((field) => {
       const descriptor = options[field];
       if (descriptor == null) return null;
@@ -1419,7 +1443,7 @@ export async function createGpuAnimationRenderer(
       layoutKey = mapMask | (coated ? COAT_LAYOUT : 0);
     if (
       (!lit && mapMask & 30) ||
-      (mode !== 2 && !phong && mapMask & 2) ||
+      (mode !== 2 && !phong && !toon && mapMask & 2) ||
       (!(mapMask & 4) && options.normalScale !== undefined) ||
       (!(mapMask & 16) && options.occlusionStrength !== undefined)
     ) {
@@ -1507,6 +1531,11 @@ export async function createGpuAnimationRenderer(
       data.set(indices);
     }
     const { texCoords = null, vertexColors = null } = options;
+    // The toon ramp is indexed by lighting angle, never a geometry UV. A ramp
+    // alone binds no synthetic UV/color stream, including mutable geometry.
+    const noSurface = toon && mapMask === 2 && (mutable
+      ? !mutable.channels.uv && !(geometryColors && mutable.channels.colorSize)
+      : texCoords === null && vertexColors === null);
     const transform = Float64Array.from(uvTransform(options.uvTransform ?? UV_IDENTITY));
     const attributeVariant = mapMask
       ? mapMask === 1
@@ -1521,6 +1550,8 @@ export async function createGpuAnimationRenderer(
     const coordinates = [];
     for (const [slot, field] of mapFields.entries())
       if (Object.hasOwn(coordinateInput, field)) {
+        if (toon && slot === 1)
+          fail("ANIMATION_RENDER_OPTIONS", "Toon gradient coordinates come from lighting, not UVs");
         if (!(mapMask & (1 << slot)))
           fail("ANIMATION_RENDER_OPTIONS", `Coordinates require ${field}`);
         const input = coordinateInput[field];
@@ -1543,7 +1574,9 @@ export async function createGpuAnimationRenderer(
     const variant =
       (lit ? "lit-" : "") +
       (phong ? "phong-" : "") +
+      (toon ? "toon-" : "") +
       (flat ? "flat-" : "") +
+      (noSurface ? "no-surface-" : "") +
       (coated ? "coat-" : "") +
       (derivative ? "derivative-" : "") +
       (coordinateMask ? `uv-${coordinateMask}-` : "") +
@@ -1567,9 +1600,9 @@ export async function createGpuAnimationRenderer(
       surfaceBuffer = null,
       textureGroup = null,
       coatBuffer = null;
-    if (mapMask & ~coordinateMask && (mutable ? !mutable.channels.uv : texCoords === null))
+    if (mapMask & ~coordinateMask & ~(toon ? 2 : 0) && (mutable ? !mutable.channels.uv : texCoords === null))
       fail("ANIMATION_RENDER_GEOMETRY", "Material textures require UV coordinates");
-    if (!mutable && attributeVariant !== "plain") {
+    if (!mutable && !noSurface && attributeVariant !== "plain") {
       limit("maxVertexBuffers", 2);
       limit("maxVertexAttributes", 5);
       const bytes = gpu.vertexCount * surfaceWords * 4;

@@ -11,6 +11,7 @@ not performance results or a full-material compatibility certification.</p>
 import {runDerivativeNormalChecks} from '../../../tools/ingest/animation_derivative_normals.browser.mjs';
 import {runAnimationRenderChecks} from '../../../tools/ingest/animation_render.browser.mjs';
 import {runBufferGeometryRenderChecks} from '../../../tools/ingest/gpu_buffer_geometry.browser.mjs';
+import {runPhongToonChecks} from '../../../tools/ingest/animation_render_materials.browser.mjs';
 
 let device;
 try {
@@ -21,7 +22,8 @@ try {
   const materialCoordinates=await runDerivativeNormalChecks(device);
   const bufferGeometry=await runBufferGeometryRenderChecks(device);
   const renderBundles=await runBufferGeometryRenderChecks(device,{renderBundles:true});
-  globalThis.__f3dAnimationRenderResult={...original,materialCoordinates,bufferGeometry,renderBundles};
+  const phongToon=await runPhongToonChecks(device);
+  globalThis.__f3dAnimationRenderResult={...original,materialCoordinates,bufferGeometry,renderBundles,phongToon};
 } catch(error) {
   globalThis.__f3dAnimationRenderResult={status:'failed',error:error.stack||String(error)};
 } finally {

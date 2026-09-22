@@ -94,7 +94,7 @@ const {createGpuAnimationDeformer, updateGpuAnimationDeformers} = gpuDeformation
 import {createGpuAnimationRenderer, AnimationRenderError} from './animation_render.mjs';
 const fail = (code, message) => { throw new AnimationRenderError(code, message); };
 const TEXTURE_FIELDS = ['baseColorTexture', 'metallicRoughnessTexture', 'normalTexture', 'emissiveTexture', 'occlusionTexture',
-  'clearcoatTexture', 'clearcoatRoughnessTexture', 'clearcoatNormalTexture', 'specularTexture'];
+  'clearcoatTexture', 'clearcoatRoughnessTexture', 'clearcoatNormalTexture', 'specularTexture', 'gradientTexture'];
 const COAT_FIELDS = ['clearcoatFactor', 'clearcoatRoughnessFactor', 'clearcoatNormalScale'];
 
 export async function createGpuAnimationScene(device, pose, drawables, {
@@ -235,9 +235,9 @@ export async function createGpuAnimationScene(device, pose, drawables, {
       // Reserve the renderer's pending auxiliary buffers before allocating the
       // next deformer. uint32 indices conservatively bound padded uint16 data.
       const vertices = geometry?.positions?.length / 3;
-      const surface = material.texCoords != null || material.vertexColors != null || TEXTURE_FIELDS.some(key => material[key] != null);
+      const surface = material.texCoords != null || material.vertexColors != null || TEXTURE_FIELDS.some(key => key !== 'gradientTexture' && material[key] != null);
       if (surface && (!Number.isSafeInteger(vertices) || vertices < 1)) fail('ANIMATION_SCENE_GEOMETRY', 'Surface attributes require XYZ geometry');
-      const lit = ['lambert', 'metallic-roughness', 'phong'].includes(material.shading);
+      const lit = ['lambert', 'metallic-roughness', 'phong', 'toon'].includes(material.shading);
       const surfaceStride = 24 + Object.keys(material.mapCoordinates ?? {}).length * 8;
       const coated = COAT_FIELDS.some(key => material[key] !== undefined) || TEXTURE_FIELDS.slice(5, 8).some(key => material[key] != null);
       const reserve = (coated ? 16 : 0) + (material.indices?.length ?? 0) * 4 + (surface ? vertices * surfaceStride : 0) + (lit && !lightingAllocated ? 544 + (renderOptions.shadows ? 96 : 0) + (renderOptions.environment ? 64 : 0) : 0);
