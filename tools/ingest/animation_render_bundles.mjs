@@ -9,7 +9,8 @@
  * WebGPU validation/loss handling belongs to that caller's error scopes.
  */
 function compatible(a, b) {
-  return b.record.alphaMode !== 'BLEND' && a.pipeline === b.pipeline &&
+  return a.instanceCount == null && b.instanceCount == null &&
+    b.record.alphaMode !== 'BLEND' && a.pipeline === b.pipeline &&
     a.first === b.first && a.count === b.count &&
     a.vertexBuffers.length === b.vertexBuffers.length &&
     a.vertexBuffers.every((buffer, i) => buffer === b.vertexBuffers[i]) &&
@@ -29,12 +30,14 @@ export function encodeAnimationDraws(encoder, commands, length, {
   let calls = 0;
   for (let i = 0; i < length;) {
     const command = commands[i], {record, first, count, pipeline} = command;
+    const native = command.instanceCount != null;
     let instances = 1;
-    if (instancing && record.alphaMode !== 'BLEND') {
+    if (instancing && !native && record.alphaMode !== 'BLEND') {
       while (i + instances < length && compatible(command, commands[i + instances])) instances++;
     }
     encoder.setPipeline(pipeline);
-    encoder.setBindGroup(0, bindGroup, instancing ? [] : [i * stride]);
+    encoder.setBindGroup(0, native ? command.instanceBindGroup : bindGroup,
+      instancing && !native ? [] : [i * stride]);
     for (let slot = 0; slot < command.vertexBuffers.length; slot++)
       encoder.setVertexBuffer(slot, command.vertexBuffers[slot]);
     if (record.surfaceBuffer) encoder.setVertexBuffer(1, record.surfaceBuffer);
@@ -42,8 +45,8 @@ export function encodeAnimationDraws(encoder, commands, length, {
     if (record.lit) encoder.setBindGroup(record.textureGroup ? 2 : 1, lightGroup);
     if (command.indexBuffer) {
       encoder.setIndexBuffer(command.indexBuffer, command.indexFormat);
-      encoder.drawIndexed(count, instances, first, 0, instancing ? i : 0);
-    } else encoder.draw(count, instances, first, instancing ? i : 0);
+      encoder.drawIndexed(count, native ? command.instanceCount : instances, first, 0, instancing && !native ? i : 0);
+    } else encoder.draw(count, native ? command.instanceCount : instances, first, instancing && !native ? i : 0);
     calls++;
     i += instances;
   }
@@ -51,6 +54,7 @@ export function encodeAnimationDraws(encoder, commands, length, {
 }
 function snapshot(command, lightGroup) {
   return {pipeline: command.pipeline, first: command.first, count: command.count,
+    instanceCount: command.instanceCount, instanceBindGroup: command.instanceBindGroup,
     vertexBuffers: command.vertexBuffers.slice(), indexBuffer: command.indexBuffer,
     indexFormat: command.indexFormat, surfaceBuffer: command.record.surfaceBuffer,
     textureGroup: command.record.textureGroup, lit: command.record.lit,
@@ -62,6 +66,7 @@ function matches(recorded, commands, length, lightGroup) {
   for (let i = 0; i < length; i++) {
     const a = recorded[i], b = commands[i], r = b.record;
     if (a.pipeline !== b.pipeline || a.first !== b.first || a.count !== b.count ||
+        a.instanceCount !== b.instanceCount || a.instanceBindGroup !== b.instanceBindGroup ||
         a.indexBuffer !== b.indexBuffer || a.indexFormat !== b.indexFormat ||
         a.surfaceBuffer !== r.surfaceBuffer || a.textureGroup !== r.textureGroup ||
         a.lit !== r.lit || a.lightGroup !== (r.lit ? lightGroup : null) ||

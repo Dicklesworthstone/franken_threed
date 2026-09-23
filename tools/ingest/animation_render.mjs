@@ -165,7 +165,7 @@
  * for cumulative draw/deformation validation, OOM and device-loss errors.
  */
 import {createAnimationRenderBundleCache, encodeAnimationDraws} from "./animation_render_bundles.mjs";
-import {bufferGeometrySnapshot} from "./gpu_buffer_geometry.mjs";
+import {bufferGeometrySnapshot, instanceAttributesSnapshot} from "./gpu_buffer_geometry.mjs";
 import {
   packProjectedShadow,
   projectedShadowWgsl,
@@ -304,6 +304,11 @@ function surfaceShader(
   indirectLights = false,
   threeLights = false,
 ) {
+  const nativeInstances = geometryChannels?.instanced === true;
+  const instanceColor = geometryChannels?.instanceColor === true;
+  const localPosition = nativeInstances ? "instance_position" : "vec4<f32>(position, 1.0)";
+  const localNormal = nativeInstances ? "instance_normal" : "normal";
+  const localTangent = nativeInstances ? "instance_basis * tangent.xyz" : "tangent.xyz";
   const textured = mapMask !== 0 || coated,
     normalMapped = (mapMask & 4) !== 0,
     coatNormalMapped = (mapMask & 128) !== 0;
@@ -454,13 +459,19 @@ struct VertexOutput {
     .map((slot) => `, @location(${5 + slot}) uv_${slot}: vec2<f32>`)
     .join(
       "",
-    )}${instanceStride ? ", @builtin(instance_index) draw_index: u32" : ""}) -> VertexOutput {
+    )}${nativeInstances ? ", @location(5) instance_0: vec4<f32>, @location(6) instance_1: vec4<f32>, @location(7) instance_2: vec4<f32>, @location(8) instance_3: vec4<f32>" : ""}${instanceColor ? ", @location(9) instance_color: vec3<f32>" : ""}${instanceStride ? ", @builtin(instance_index) draw_index: u32" : ""}) -> VertexOutput {
   var out: VertexOutput;${instanceStride ? "\n  draw_info = instance_draws[draw_index].info;\n  out.draw_index = draw_index;" : ""}
-  out.position = draw_info.clip_from_local * vec4<f32>(position, 1.0);
+  ${nativeInstances ? `let instance_matrix = mat4x4<f32>(instance_0, instance_1, instance_2, instance_3);
+  let instance_position = instance_matrix * vec4<f32>(position, 1.0);
+  ${lit || tangentAttribute ? "let instance_basis = mat3x3<f32>(instance_0.xyz, instance_1.xyz, instance_2.xyz);" : ""}
+  ${lit ? `// Pinned r186 defaultnormal_vertex: supports nonuniform scale, not shear.
+  let instance_normal = instance_basis * (normal / vec3<f32>(dot(instance_0.xyz, instance_0.xyz), dot(instance_1.xyz, instance_1.xyz), dot(instance_2.xyz, instance_2.xyz)));` : ""}` : ""}
+  out.position = draw_info.clip_from_local * ${localPosition};
   ${uvAttribute ? "out.uv = vec2<f32>(dot(draw_info.uv_x.xyz, vec3<f32>(uv, 1.0)), dot(draw_info.uv_y.xyz, vec3<f32>(uv, 1.0)));" : "out.uv = vec2<f32>(0.0);"}
   out.color = ${colorWidth === 3 ? "vec4<f32>(color, 1.0)" : colorWidth === 4 ? "color" : "vec4<f32>(1.0)"};
-  ${lit ? "out.world = (draw_info.world_from_local * vec4<f32>(position, 1.0)).xyz;\n  out.normal = " + (occluded || phong ? "mat3x3<f32>(draw_info.normal_from_local.x, draw_info.normal_from_local.y, draw_info.normal_from_local.z)" : "draw_info.normal_from_local") + " * normal;" : ""}
-  ${tangentAttribute ? "out.tangent = vec4<f32>((draw_info.world_from_local * vec4<f32>(tangent.xyz, 0.0)).xyz, tangent.w * draw_info.uv_y.w);" : ""}
+  ${instanceColor ? "out.color = vec4<f32>(out.color.rgb * instance_color, out.color.a);" : ""}
+  ${lit ? "out.world = (draw_info.world_from_local * " + localPosition + ").xyz;\n  out.normal = " + (occluded || phong ? "mat3x3<f32>(draw_info.normal_from_local.x, draw_info.normal_from_local.y, draw_info.normal_from_local.z)" : "draw_info.normal_from_local") + " * " + localNormal + ";" : ""}
+  ${tangentAttribute ? "out.tangent = vec4<f32>((draw_info.world_from_local * vec4<f32>(" + localTangent + ", 0.0)).xyz, tangent.w * draw_info.uv_y.w);" : ""}
   ${mapSlots(coordinateMask)
     .map(
       (slot) =>
@@ -872,6 +883,8 @@ export async function createGpuAnimationRenderer(
     uniformBuffer,
     bindGroup,
     uniformLayout,
+    instanceUniformLayout,
+    instanceBindGroup,
     lightBuffer,
     lightLayout,
     lightGroup,
@@ -889,15 +902,15 @@ export async function createGpuAnimationRenderer(
     environmentGroups = new Map();
   const variants = new Map(),
     textureLayouts = new Map(), geometryLayouts = new Map(), geometryLayoutIds = new Map();
-  function geometryVariant(geometry, colors) {
-    const key = geometry.signature + ":colors=" + colors;
+  function geometryVariant(geometry, colors, instances = null) {
+    const key = geometry.signature + ":colors=" + colors + ":instances=" + (instances?.signature ?? "none");
     if (!geometryLayoutIds.has(key)) {
       if (geometryLayoutIds.size >= maxMeshes)
         fail("ANIMATION_RENDER_LIMIT", "Mutable geometry layout capacity exceeded");
       const id = String(geometryLayoutIds.size);
       geometryLayoutIds.set(key, id);
-      geometryLayouts.set(id, {layouts: geometry.layouts,
-        channels: {...geometry.channels, colorSize: colors ? geometry.channels.colorSize : 0}});
+      geometryLayouts.set(id, {layouts: instances ? [...geometry.layouts, ...instances.layouts] : geometry.layouts,
+        channels: {...geometry.channels, ...instances?.channels, colorSize: colors ? geometry.channels.colorSize : 0}});
     }
     return "~" + geometryLayoutIds.get(key);
   }
@@ -1030,6 +1043,7 @@ export async function createGpuAnimationRenderer(
           entry.refs = 0;
         }
     shadowGroup = shadowView = shadowSampler = null;
+    instanceBindGroup = instanceUniformLayout = null;
     environmentGroups.clear();
     sharedBuffers?.clear();
     sharedGroups?.clear();
@@ -1050,6 +1064,19 @@ export async function createGpuAnimationRenderer(
   function compilePipelines(variantKey) {
     const [variant, geometryKey] = variantKey.split("~");
     const geometry = geometryKey === undefined ? null : geometryLayouts.get(geometryKey);
+    const nativeInstances = geometry?.channels.instanced === true;
+    // Native instance_index addresses source matrix/color streams, never the
+    // logical draw arena. A dynamic uniform view of that SAME arena supplies
+    // one object/material packet to every hardware instance, without repacking.
+    if (nativeInstances && instancing && !instanceUniformLayout) {
+      const layout = device.createBindGroupLayout({label, entries: [{binding: 0,
+        visibility: VERTEX_STAGE | FRAGMENT_STAGE,
+        buffer: {type: "uniform", hasDynamicOffset: true, minBindingSize: UNIFORM_BYTES}}]});
+      const group = device.createBindGroup({label, layout, entries: [{binding: 0,
+        resource: {buffer: uniformBuffer, size: UNIFORM_BYTES}}]});
+      instanceUniformLayout = layout; instanceBindGroup = group;
+    }
+    const drawLayout = nativeInstances && instancing ? instanceUniformLayout : uniformLayout;
     const coated = variant.includes("coat-");
     const phong = variant.includes("phong-"), flat = variant.includes("flat-");
     const toon = variant.includes("toon-");
@@ -1106,8 +1133,8 @@ export async function createGpuAnimationRenderer(
         );
     }
     const bindGroupLayouts = textured
-      ? [uniformLayout, textureLayouts.get(layoutKey)]
-      : [uniformLayout];
+      ? [drawLayout, textureLayouts.get(layoutKey)]
+      : [drawLayout];
     if (lit)
       bindGroupLayouts.push(
         environmentLit ? environmentLayouts.get(shadowed) : shadowed ? shadowLayout : lightLayout,
@@ -1116,7 +1143,7 @@ export async function createGpuAnimationRenderer(
     const module = device.createShaderModule({
       label,
       code:
-        instancing || lit || attributes || format === null
+        nativeInstances || instancing || lit || attributes || format === null
           ? surfaceShader(
               mapMask,
               lit,
@@ -1126,7 +1153,7 @@ export async function createGpuAnimationRenderer(
               format === null,
               shadowed,
               environmentLit ? environmentReceiver.environmentLightingWgsl(textured ? 2 : 1) : "",
-              instancing ? stride : 0,
+              instancing && !nativeInstances ? stride : 0,
               coated,
               geometry?.channels,
               phong,
@@ -1167,7 +1194,8 @@ export async function createGpuAnimationRenderer(
       // attributes may be present without being used by this material variant.
       vertexBuffers = geometry.layouts;
       limit("maxVertexBuffers", vertexBuffers.length);
-      limit("maxVertexAttributes", vertexBuffers.reduce((n, layout) => n + layout.attributes.length, 0));
+      limit("maxVertexAttributes", Math.max(...vertexBuffers.flatMap(layout =>
+        layout.attributes.map(attribute => attribute.shaderLocation + 1))));
       for (const layout of vertexBuffers) limit("maxVertexBufferArrayStride", layout.arrayStride);
     }
     const created = [];
@@ -1352,7 +1380,7 @@ export async function createGpuAnimationRenderer(
         device.createBuffer({
           label,
           size: arenaBytes,
-          usage: (instancing ? STORAGE : UNIFORM) | COPY_DST,
+          usage: UNIFORM | (instancing ? STORAGE : 0) | COPY_DST,
         }),
         arenaBytes,
       );
@@ -1399,6 +1427,7 @@ export async function createGpuAnimationRenderer(
       options,
       [
         "indices",
+        "instances",
         "baseColor",
         "doubleSided",
         "side",
@@ -1429,6 +1458,10 @@ export async function createGpuAnimationRenderer(
       "material/geometry",
     );
     const mutable = deformerShape(gpu, device);
+    const instanceHandle = options.instances ?? null;
+    if (instanceHandle && !mutable)
+      fail("ANIMATION_RENDER_OPTIONS", "Source instances require source BufferGeometry residency");
+    const instances = instanceHandle === null ? null : instanceAttributesSnapshot(instanceHandle, device);
     if (mutable) {
       for (const field of ["indices", "texCoords", "mapCoordinates"])
         if (options[field] != null)
@@ -1658,7 +1691,7 @@ export async function createGpuAnimationRenderer(
       (coated ? "coat-" : "") +
       (derivative ? "derivative-" : "") +
       (coordinateMask ? `uv-${coordinateMask}-` : "") +
-      attributeVariant + (mutable ? geometryVariant(mutable, geometryColors) : "");
+      attributeVariant + (mutable ? geometryVariant(mutable, geometryColors, instances) : "");
     const textureKey =
       instancing && (mapMask || coated)
         ? groupKey(textures) +
@@ -1840,6 +1873,8 @@ export async function createGpuAnimationRenderer(
       const latest = deformerShape(gpu, device);
       if (mutable && latest.signature !== mutable.signature)
         fail("ANIMATION_RENDER_GEOMETRY", "Geometry layout changed during material registration");
+      if (instances && instanceAttributesSnapshot(instanceHandle, device).signature !== instances.signature)
+        fail("ANIMATION_RENDER_GEOMETRY", "Instance layout changed during material registration");
       if (instancing) {
         indexLease = publishBuffer(indexLease);
         indexBuffer = indexLease?.buffer ?? null;
@@ -1851,6 +1886,8 @@ export async function createGpuAnimationRenderer(
       const record = {
         gpu,
         geometrySignature: mutable?.signature ?? null,
+        instanceHandle,
+        instanceSignature: instances?.signature ?? null,
         rgba,
         doubleSided: side === "double",
         alphaMode,
@@ -1876,6 +1913,7 @@ export async function createGpuAnimationRenderer(
       };
       const registeredVertexCount = gpu.vertexCount;
       const mesh = Object.freeze({
+        get instanceCount() { return instanceHandle === null ? 1 : instanceAttributesSnapshot(instanceHandle, device).instanceCount; },
         get vertexCount() { return mutable ? gpu.vertexCount : registeredVertexCount; },
         get indexCount() { return mutable ? bufferGeometrySnapshot(gpu, device).indexCount : indices === null ? 0 : extent; },
         get disposed() {
@@ -2051,8 +2089,11 @@ export async function createGpuAnimationRenderer(
         const geometry = deformerShape(gpu, device);
         if (geometry && geometry.signature !== record.geometrySignature)
           fail("ANIMATION_RENDER_GEOMETRY", "Geometry layout changed; register its new material layout");
+        const instances = record.instanceHandle === null ? null : instanceAttributesSnapshot(record.instanceHandle, device);
+        if (instances && instances.signature !== record.instanceSignature)
+          fail("ANIMATION_RENDER_GEOMETRY", "Instance layout changed; register its new material layout");
         const world = array(input.worldMatrix ?? gpu.worldMatrix, 16, "World matrix");
-        if (world[3] !== 0 || world[7] !== 0 || world[11] !== 0 || world[15] !== 1)
+        if (world[3] !== 0 || world[7] !== 0 || world[11] !== 1 - 1 || world[15] !== 1)
           fail("ANIMATION_RENDER_VALUE", "World matrix must be affine");
         const rgba = color(input.baseColor ?? record.rgba),
           offset = (i * stride) / 4;
@@ -2163,7 +2204,9 @@ export async function createGpuAnimationRenderer(
           record,
           first,
           count,
-          vertexBuffers: geometry?.vertexBuffers ?? [gpu.vertexBuffer],
+          vertexBuffers: instances ? [...geometry.vertexBuffers, ...instances.vertexBuffers] : geometry?.vertexBuffers ?? [gpu.vertexBuffer],
+          instanceCount: instances?.instanceCount ?? null,
+          instanceBindGroup: instances ? (instancing ? instanceBindGroup : bindGroup) : null,
           indexBuffer: geometry ? geometry.indexBuffer : record.indexBuffer,
           indexFormat: geometry ? geometry.indexFormat : record.indexFormat,
           pipeline: pipelines.get(
@@ -2171,6 +2214,7 @@ export async function createGpuAnimationRenderer(
           ),
         });
         dependencies.add(gpu);
+        if (record.instanceHandle !== null) dependencies.add(record.instanceHandle);
       }
       projected?.check();
       ambient?.check();
@@ -2335,6 +2379,7 @@ export async function createGpuAnimationRenderer(
         command.vertexBuffers = null;
         command.indexBuffer = null;
         command.indexFormat = null;
+        command.instanceBindGroup = null;
       }
       busy = false;
     }
