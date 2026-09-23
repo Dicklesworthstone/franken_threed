@@ -111,6 +111,9 @@ function decodeDataUri(uri) {
  * RGBE decoder and loadGpuAnimationEnvironment URL/byte loader. No HDR file is
  * fetched at build/import time. The default CPU output and import
  * graph remain unchanged; ordinary GPU packages do not acquire IBL dependencies.
+ * threeScene:true with webgpu:true packages the explicit source-owned rigid
+ * Three.js scene bridge. The caller lends its pinned Three module and live
+ * Scene; no upstream component is copied or initialized by this option.
  * import { createPlayer } from './animation.mjs'; const p=createPlayer();
  * p.sample(time, {clip:0, loop:true}); // p.worldMatrices / p.jointMatrices / p.morphWeights
  * All decoded tracks are embedded; importing the package makes no fetches and
@@ -156,11 +159,14 @@ export function buildAnimation(
     environment = false,
     hdr = false,
     rigidGeometry = false,
+    threeScene = false,
   } = {},
 ) {
   if (typeof rigidGeometry !== "boolean" || (rigidGeometry && !webgpu))
     throw new TypeError("rigidGeometry must be boolean and requires webgpu:true");
   if (typeof webgpu !== "boolean") throw new TypeError("webgpu must be boolean");
+  if (typeof threeScene !== "boolean" || (threeScene && !webgpu))
+    throw new TypeError("threeScene must be boolean and requires webgpu:true");
   if (typeof environment !== "boolean" || (environment && !webgpu))
     throw new TypeError("environment must be boolean and requires webgpu:true");
   if (typeof hdr !== "boolean" || (hdr && !environment))
@@ -299,6 +305,11 @@ export {fitAnimationShadowView,animationShadowWorldBounds} from './animation_sha
 `,
     );
   }
+  if (threeScene) {
+    outputs.set("three_scene.mjs", fs.readFileSync(new URL("./three_scene.mjs", import.meta.url), "utf8"));
+    outputs.set("gpu_playback.mjs", outputs.get("gpu_playback.mjs") +
+      "export {createGpuThreeScene,ThreeSceneError} from './three_scene.mjs';\n");
+  }
   if (rigidGeometry) {
     outputs.set(
       "animation_rigid_geometry.mjs",
@@ -348,6 +359,7 @@ export {fitAnimationShadowView,animationShadowWorldBounds} from './animation_sha
       ? { gpuRigidGeometry: "shared-immutable-f32-vertices; opt-in scene rigidGeometry:true" }
       : {}),
     ...(environment ? { gpuEnvironment: "f3d-animation-environment-v1" } : {}),
+    ...(threeScene ? { gpuThreeScene: "explicit-r186-rigid-scene; borrowed source module, textures and attachments" } : {}),
     source: { file: path.basename(entry), sha256: hash(source) },
     dependencies: [...dependencies.values()],
     nodeCount: validated.nodeCount,

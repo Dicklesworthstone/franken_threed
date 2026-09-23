@@ -208,3 +208,47 @@ test("CLI help advertises the opt-in animation GPU flag", () => {
   assert.equal(result.status, 0);
   assert.match(result.stdout, /--animation-webgpu/);
 });
+
+test('optional source-scene package relocates and renders a retained Three scene',async()=>{
+  const f=fixture(),built=buildAnimation(f.entry,f.out,{webgpu:true,threeScene:true});
+  assert.match(built.gpuThreeScene,/explicit-r186-rigid-scene/);
+  const record=built.artifacts.find(a=>a.file==='three_scene.mjs');assert.ok(record);
+  const source=fs.readFileSync(new URL('./three_scene.mjs',import.meta.url));
+  assert.equal(record.sha256,hash(source));assert.equal(record.bytes,source.length);
+  const moved=path.join(f.dir,'relocated');fs.renameSync(f.out,moved);fs.renameSync(f.entry,f.entry+'.unavailable');
+  const api=await import(pathToFileURL(path.join(moved,built.gpuEntry)));
+  const T=await import(pathToFileURL(path.join(process.env.F3D_THREE_ROOT??path.resolve('upstream/three.js'),'build/three.core.js')));
+  const {geometryDevice}=await import('./fixtures/gpu_geometry_device.mjs');
+  const d=geometryDevice(),s=new T.Scene(),c=new T.PerspectiveCamera(60,1,.1,10);c.position.z=3;
+  const mesh=new T.Mesh(new T.BoxGeometry(),new T.MeshPhongMaterial({color:0xff0000}));
+  s.add(mesh,new T.AmbientLight(0xffffff));
+  const bridge=await api.createGpuThreeScene(d,s,{three:T,renderer:{renderBundles:true}});
+  bridge.render(c,{colorView:{},depthView:{}});mesh.rotation.y=.2;bridge.render(c,{colorView:{},depthView:{}});
+  assert.equal(bridge.diagnostics.sourceDraws,1);assert.equal(bridge.diagnostics.bundles.reuses,1);
+  await bridge.whenIdle();bridge.dispose();
+  const plain=fixture(),base=buildAnimation(plain.entry,plain.out,{webgpu:true});
+  assert.equal(base.gpuThreeScene,undefined);assert.equal(base.emittedFiles.includes('three_scene.mjs'),false);
+  assert.doesNotMatch(fs.readFileSync(path.join(plain.out,base.gpuEntry),'utf8'),/three_scene/);
+  for(const artifact of base.artifacts.filter(a=>a.file!=='gpu_playback.mjs'))
+    assert.equal(hash(fs.readFileSync(path.join(moved,artifact.file))),artifact.sha256);
+});
+
+test('source-scene packaging is explicitly gated and included in exact output bounds',()=>{
+  for(const options of [{threeScene:true},{webgpu:true,threeScene:'yes'},{webgpu:true,threeScene:null}]){
+    const f=fixture();assert.throws(()=>buildAnimation(f.entry,f.out,options),/threeScene/);assert.equal(fs.existsSync(f.out),false);
+  }
+  const a=fixture(),built=buildAnimation(a.entry,a.out,{webgpu:true,threeScene:true}),b=fixture(),c=fixture();
+  assert.throws(()=>buildAnimation(b.entry,b.out,{webgpu:true,threeScene:true,maxBytes:built.outputBytes-1}),{code:'GLTF_ANIMATION_LIMIT'});
+  assert.equal(fs.existsSync(b.out),false);
+  assert.equal(buildAnimation(c.entry,c.out,{webgpu:true,threeScene:true,maxBytes:built.outputBytes}).outputBytes,built.outputBytes);
+});
+
+test('CLI source-scene option requires GPU packaging and emits the real implementation',()=>{
+  for(const extra of [[],['--animation-webgpu'],['--build-animation','unused-scene-package']]){
+    const f=fixture(),result=cli('--entry',f.entry,'--animation-three-scene',...extra);
+    assert.notEqual(result.status,0);assert.match(result.stderr,/requires --(?:build-animation|animation-webgpu)/);
+  }
+  const f=fixture(),result=cli('--entry',f.entry,'--build-animation',f.out,'--animation-webgpu','--animation-three-scene');
+  assert.equal(result.status,0,result.stderr);assert.ok(fs.existsSync(path.join(f.out,'three_scene.mjs')));
+  assert.match(fs.readFileSync(path.join(f.out,'gpu_playback.mjs'),'utf8'),/createGpuThreeScene/);
+});

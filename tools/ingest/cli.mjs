@@ -21,6 +21,7 @@ Options:
   --specialize-numeric Discover and compile guarded numeric updates in --build-app
   --build-animation <dir>  Export a glTF/GLB pose player to a fresh directory
   --animation-webgpu   Include opt-in GPU deformation with --build-animation
+  --animation-three-scene  Include explicit r186 scene submission; requires --animation-webgpu
   --build-kernel <dir>  Compile one closed numeric function to a fresh Wasm package
   --parameter-types <csv>  Kernel parameter ABI, for example 'f64[],f64[],f64'
   --max-memory-pages <n>   Kernel memory ceiling in 64 KiB pages (default: 1024)
@@ -57,6 +58,7 @@ async function main() {
   let buildKernelDir = null;
   let buildAnimationDir = null;
   let animationWebGpu = false;
+  let animationThreeScene = false;
   let parameterTypes = null;
   let maxMemoryPages;
 
@@ -79,6 +81,8 @@ async function main() {
       buildAnimationDir = args[++i];
     } else if (arg === "--animation-webgpu") {
       animationWebGpu = true;
+    } else if (arg === "--animation-three-scene") {
+      animationThreeScene = true;
     } else if (arg === "--pack-html") {
       if (i + 1 >= args.length || args[i + 1].startsWith("-")) {
         console.error("Error: --pack-html requires a fresh HTML output path.");
@@ -136,6 +140,10 @@ async function main() {
 
   if (animationWebGpu && !buildAnimationDir) {
     console.error("Error: --animation-webgpu requires --build-animation.");
+    process.exit(1);
+  }
+  if (animationThreeScene && (!animationWebGpu || !buildAnimationDir)) {
+    console.error("Error: --animation-three-scene requires --animation-webgpu and --build-animation.");
     process.exit(1);
   }
 
@@ -295,7 +303,7 @@ async function main() {
   try {
     if (buildAnimationDir) {
       const { buildAnimation } = await import("./build_animation.mjs");
-      const result = buildAnimation(entry, buildAnimationDir, { webgpu: animationWebGpu });
+      const result = buildAnimation(entry, buildAnimationDir, { webgpu: animationWebGpu, threeScene: animationThreeScene });
       console.log(`Animation pose package emitted to: ${result.outDir}`);
       console.log(
         `${result.clips.length} clips, ${result.nodeCount} nodes, ${result.instances.length} skinned mesh instances.`,
