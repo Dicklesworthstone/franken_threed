@@ -46,7 +46,7 @@ ownership is assigned. There is no hidden retained-renderer submission fallback.
 
 ## Source data and preparation
 
-Rigid Mesh/BufferGeometry objects can use MeshBasicMaterial, MeshLambertMaterial,
+Rigid Mesh and InstancedMesh objects with BufferGeometry can use MeshBasicMaterial, MeshLambertMaterial,
 MeshPhongMaterial, MeshToonMaterial and the existing MeshStandardMaterial-style
 metallic-roughness profile. This is not full MeshStandardMaterial multiscattering
 parity. Material uniforms and source world/camera/light matrices are read again
@@ -174,10 +174,61 @@ mapping currently requires equal X/Y scale. Toon gradient maps use lighting
 angle, not geometry UVs. Unsupported combinations remain errors, not ignored
 fields or proof of full material coverage.
 
+## Native source instances
+
+Ordinary `THREE.InstancedMesh` objects now use their source `instanceMatrix` and
+optional `instanceColor` directly. No per-instance mesh expansion, geometry
+copies, matrix repacking, `getMatrixAt()` traversal or compute dispatch is added.
+Each source mesh owns independent instance streams; meshes sharing a geometry
+still share that geometry's single residency. Material groups and two-sided
+transparent passes share the same instance owner.
+
+```js
+const crowd = new THREE.InstancedMesh(geometry, material, 1024);
+scene.add(crowd);
+await bridge.prepare();
+// At the application's existing update/render boundary:
+crowd.setMatrixAt(0, transform);
+crowd.instanceMatrix.needsUpdate = true;
+crowd.count = 700;
+bridge.render(camera, {colorView, depthView});
+```
+
+Initial use uploads the full source buffers. Subsequent uploads follow source
+versions and partial ranges, including GPU-stale unrequested CPU edits. Active
+`count` is live without a version bump and is bounded by matrix/color capacity;
+zero and zero-capacity meshes are admitted. Adding/removing the color stream
+changes the shader layout and requires preparation. Same-layout replacement
+attributes are admitted under the existing retained-identity/peak budget.
+Source instance colors multiply RGB independently of `material.vertexColors`;
+vertex alpha remains independent. The shader uses the pinned scale-correct
+instance normal transform and direction transform for tangents. It does not
+silently repair per-instance shear, singular matrices or negative scaling; the
+source limitations and separate unsupported deformation paths still apply.
+
+`renderer.instancing:true` remains the independent option for batching adjacent
+ordinary draws. Native source instances work with it on or off. They always
+start at source instance zero and use one object/material packet, never index
+past that packet using their instance count. `maxDraws` and `logicalDraws` count
+packets (including expanded transparent/group passes), not hardware instances.
+A single packet can submit 1,024 instances. Native draws are not combined with
+ordinary batches or unrelated native meshes. Buffer-content updates reuse a
+bundle; changing active count or native buffer identity changes its schedule.
+
+Culling uses the source mesh's aggregate bounding sphere and the source camera's
+layers/visibility, not the shared geometry's bounds. As in Three.js, matrix
+changes do not implicitly invalidate cached source bounds: call
+`crowd.computeBoundingSphere()` when the application's bounds need refreshing.
+The retained bounding computation may traverse instances; drawing with current
+bounds does not add its own per-instance traversal.
+
 ## Bounds, failures and ownership
 
 Defaults are 16,384 reachable nodes, 256 geometries, 1,024 material bindings and
-128 MiB of aggregate geometry buffers. `renderer.maxBytes` separately bounds its
+128 MiB of aggregate geometry buffers. Native sources have separate bounds of
+256 meshes (`maxInstanceMeshes`) and 128 MiB of matrix/color allocations
+(`maxInstanceBytes`). `diagnostics.instanceMeshCount` and `instanceBytes` report
+that ownership independently of shared geometry. `renderer.maxBytes` separately bounds its
 owned draw/light/material buffers. Geometry bytes include retained old attribute
 identities and pending new residencies; replacement cannot pretend that old
 storage has already been freed. CPU upload shadows are the same size as geometry
@@ -197,7 +248,13 @@ The underlying uploader exposes `maxInitialBytes` at construction and
 permits existing-buffer updates, but not new buffers; omission restores that
 uploader's ordinary per-residency budget.
 
-Source geometry disposal releases residency but preserves source identity;
+Preparation that prunes whole geometry/instance owners drains outstanding
+submitted dependencies before retirement, then rechecks source structure. This
+avoids turning a successful prior draw into a disposed-dependency failure. It
+does not insert a queue wait into ordinary frame updates. Disposing the bridge
+also ends this retirement wait if native completion stalls.
+
+Source geometry or InstancedMesh disposal releases its residency but preserves source identity;
 subsequent rendering can recreate buffers and record a new bundle. Source
 material disposal invalidates its GPU registrations and requires preparation.
 Bridge disposal releases owned resources/listeners, including late preparation,
@@ -218,7 +275,9 @@ only packages the bridge; it does not turn the input glTF into a source Three.js
 scene. The application lends the same pinned source module and scene at runtime.
 CPU-only and ordinary GPU packages do not acquire these optional modules.
 Source-scene packages include three_textures.mjs and additionally export
-createGpuThreeTextures for explicit texture ownership outside a scene.
+createGpuThreeTextures for explicit texture ownership outside a scene. Generated
+GPU packages also export `createGpuInstanceAttributes` for low-level rendering
+with `renderer.addMesh(geometryOwner, {instances: instanceOwner})`.
 
 Host regressions execute real pinned Three.js scenes and the actual new renderer
 against a byte-accurate queue recorder. They cover state mutation, cameras,
@@ -229,7 +288,8 @@ current position/normal arrays, and submits Phong/toon draws without replacing
 its public geometry. These are not native shader/pixel measurements. The current
 container blocks browser navigation, so native GPU validation is still required.
 
-SkinnedMesh/InstancedMesh/BatchedMesh adoption, lines/points/sprites, source
+SkinnedMesh/BatchedMesh adoption, per-instance morph textures, arbitrary
+InstancedBufferGeometry/divisors, lines/points/sprites, source
 shadow/environment ownership, additional material/map families, fog, clipping,
 stencil, polygon offset, custom shaders/hooks, render targets and complete
 output color/tone-mapping workflows remain required work. The separate explicit
@@ -244,3 +304,13 @@ checks source bytes at each queued use. Native texture pixels, sRGB mip filterin
 flipY, canvas copies and two in-flight texture versions have a separate harness:
 `tests/e2e/three_textures/index.html`. Host command/byte tests do not certify those
 native conversions, which must be run on an available WebGPU adapter.
+
+The native-instance suite also renders the actual Wasm-specialized MarchingCubes
+geometry through 64 source instances, with current source arrays and one logical
+packet. Regressions cover direct/bundled draws, automatic batching on/off, source
+counts/colors, independent ownership, culling, preparation/retirement races and
+relocated package execution. `tests/e2e/three_instances/index.html` separately
+checks actual native pixels and queued matrix/color versions. That browser
+harness is not a substitute for the Node suite, nor is a passing Node suite proof
+that the native shaders executed. Native instance pixels and speed remain
+unverified until the browser harness runs on an available WebGPU adapter.

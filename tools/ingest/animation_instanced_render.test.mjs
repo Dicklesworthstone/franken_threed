@@ -255,7 +255,9 @@ test("1000 independently transformed meshes sharing vertices submit one native i
   const group = calls(g)[0].bindings.get(0);
   assert.deepEqual(group.offsets, []);
   assert.equal(group.group.entries[0].resource.size, 256000);
-  assert.equal(g.buffers[0].usage, 136);
+  // One arena supports both automatic storage indexing and native-instance
+  // dynamic uniform views; adding the usage bit does not allocate more bytes.
+  assert.equal(g.buffers[0].usage, 128 | 64 | 8);
   assert.equal(g.depth, 0);
   await r.whenIdle();
   r.dispose();

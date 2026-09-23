@@ -298,7 +298,7 @@ export {createAnimationDeformer} from './animation_deformer.mjs';
       `export {${playerExports},createAnimationController,createAnimationDeformer} from './playback.mjs';
 export {createGpuAnimationDeformer} from './animation_webgpu.mjs';
 export {createGpuAnimationRenderer} from './animation_render.mjs';
-export {createGpuBufferGeometry} from './gpu_buffer_geometry.mjs';
+export {createGpuBufferGeometry,createGpuInstanceAttributes} from './gpu_buffer_geometry.mjs';
 export {createGpuAnimationScene} from './animation_scene.mjs';
 export {createGpuAnimationShadowMap} from './animation_shadow.mjs';
 export {fitAnimationShadowView,animationShadowWorldBounds} from './animation_shadow_view.mjs';
@@ -360,7 +360,7 @@ export {fitAnimationShadowView,animationShadowWorldBounds} from './animation_sha
       ? { gpuRigidGeometry: "shared-immutable-f32-vertices; opt-in scene rigidGeometry:true" }
       : {}),
     ...(environment ? { gpuEnvironment: "f3d-animation-environment-v1" } : {}),
-    ...(threeScene ? { gpuThreeScene: "explicit-r186-rigid-scene; owned source textures or borrowed bindings; borrowed module and attachments" } : {}),
+    ...(threeScene ? { gpuThreeScene: "explicit-r186-rigid-scene; native source instances; owned source textures or borrowed bindings; borrowed module and attachments" } : {}),
     source: { file: path.basename(entry), sha256: hash(source) },
     dependencies: [...dependencies.values()],
     nodeCount: validated.nodeCount,

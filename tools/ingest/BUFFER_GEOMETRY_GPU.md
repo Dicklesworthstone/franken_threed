@@ -67,6 +67,47 @@ material layout; a stale registration fails before submission. Changes to
 `first`/`count` intersect that range; multi-material groups remain explicit draws,
 not an implicit Three.js material-array traversal.
 
+## Borrowed native instance streams
+
+`createGpuInstanceAttributes(device, sourceInstancedMesh)` owns source Float32
+matrix columns and optional RGB instance colors independently of the geometry.
+It shares the geometry uploader's source version/range/callback semantics,
+failures, disposal/recreation and allocation bounds. Pass its branded,
+device-bound handle as `renderer.addMesh(geometryOwner, {instances: owner})`.
+The renderer borrows it and never disposes it or its source. Generated GPU
+playback packages export this factory alongside `createGpuBufferGeometry`.
+
+```js
+const geometryOwner = createGpuBufferGeometry(device, crowd.geometry);
+const instances = createGpuInstanceAttributes(device, crowd);
+const draw = await renderer.addMesh(geometryOwner, {instances});
+crowd.instanceMatrix.needsUpdate = true;
+instances.update();
+renderer.render({colorView, depthView, viewProjection,
+  draws: [{mesh: draw, worldMatrix: crowd.matrixWorld.elements}]});
+await renderer.whenIdle(); // Drain submitted dependencies before retiring owners.
+draw.dispose(); instances.dispose(); geometryOwner.dispose();
+```
+
+`crowd.count` (also exposed by the registered mesh's `instanceCount`) is read for
+each submission and is independent of upload versions and logical packet count.
+The original instance buffers bind with native instance stepping, starting at
+zero. With automatic ordinary-draw batching enabled, source instances instead
+use a dynamic uniform view of the same draw arena, so native instance indices
+cannot address unrelated object/material packets. No source matrix repacking or
+shared-geometry duplication is introduced. Native count/buffer changes rebuild
+the bundle schedule; byte-only uploads preserve it.
+
+Matrix itemSize 16 and optional RGB itemSize 3 must be non-normalized Float32
+InstancedBufferAttributes with `meshPerAttribute === 1`. Per-instance morph
+textures and other layouts require their separate paths. Instance RGB remains
+active when geometry `vertexColors:false`. Normal and tangent transformations
+follow the pinned source's nonuniform-scale profile, not arbitrary shear repair.
+Adding/removing a color stream requires a new material layout registration.
+`inspectInstanceAttributes(source)` provides the same read-only shape/count
+admission used by the uploader without creating a native handle or uploading.
+For automatic scene ownership and cached source bounds, see `THREE_SCENE.md`.
+
 ## Upload history and lifecycle
 
 The pinned r186 WebGLAttributes algorithm is the source contract, not an

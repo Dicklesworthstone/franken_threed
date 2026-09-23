@@ -336,6 +336,14 @@ function describeInstances(source) {
     channels: Object.freeze({instanced: true, instanceColor: source.instanceColor !== null}),
     vertexCount: capacity, indexOwner: null, indexFormat: null, indexCount: 0};
 }
+/** Read source layout/count metadata without allocation, uploads or callbacks.
+ * Scene admission uses the same description as native residency, before writes.
+ * This is not a GPU handle and cannot be passed to the renderer as one. */
+export function inspectInstanceAttributes(source) {
+  const shape = describeInstances(source);
+  return Object.freeze({signature: shape.signature, capacity: shape.vertexCount,
+    instanceCount: source.count, channels: shape.channels});
+}
 function instanceRange(source, capacity) {
   return {first: 0, count: integer(source.count, 0, capacity, 'active instance count')};
 }

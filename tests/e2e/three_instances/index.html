@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Native source InstancedMesh checks</title>
+<pre id="result">Running native source instance checks…</pre>
+<script type="module">
+import * as THREE from '../../../upstream/three.js/build/three.core.js';
+import {runThreeInstanceSceneChecks} from '../../../tools/ingest/three_instances.browser.mjs';
+let device;
+try {
+  if (!navigator.gpu) throw new Error('WebGPU is required; this is not a passing skip');
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) throw new Error('No WebGPU adapter');
+  device = await adapter.requestDevice();
+  const result = await runThreeInstanceSceneChecks(device, THREE);
+  window.__f3dResult = result;
+  document.querySelector('#result').textContent = JSON.stringify(result, null, 2);
+} catch (error) {
+  window.__f3dResult = {status: 'failed', error: String(error)};
+  document.querySelector('#result').textContent = error.stack || String(error);
+  console.error(error);
+} finally { device?.destroy(); }
+</script>
+</html>
