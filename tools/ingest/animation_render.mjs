@@ -38,6 +38,10 @@
  * BLEND preserves input order and disables depth writes; callers order transparent
  * draws. OPAQUE ignores input alpha; MASK discards below its threshold and writes
  * opaque alpha. Negative-determinant world transforms reverse front-face winding.
+ * side:'front'|'back'|'double' replaces the doubleSided shorthand when supplied.
+ * depthTest/depthWrite/colorWrite select fixed pipeline state. Disabled depth
+ * testing also disables writes. Omitting depthWrite retains the BLEND default.
+ * MASK draws may override alphaCutoff in their own current 256-byte packet.
  *
  * shading is 'unlit' (default), 'lambert', 'phong', 'toon', or 'metallic-roughness'. Lit meshes
  * require the deformer's normal attribute and invertible world transforms.
@@ -65,7 +69,7 @@
  * occlusionStrength is in [0,1], defaults to 1 and may be overridden per draw.
  * With environment lighting it multiplies indirect diffuse/specular by
  * 1 + strength * (R - 1), never direct lights, emission or alpha. With no
- * environment it has no lighting effect. Independent UVs use mapCoordinates.
+ * environment or indirectLights it has no lighting effect. Independent UVs use mapCoordinates.
  * The strength occupies named normal-matrix padding: the uniform stays 256 bytes.
  * Metallic-roughness materials accept KHR_materials_clearcoat's clearcoatFactor,
  * clearcoatRoughnessFactor and optional clearcoatTexture (linear R),
@@ -106,6 +110,10 @@
  * floor at a punctual singularity. Without an environment, no lights means only emission.
  * Light inputs are snapshotted/uploaded once per submission, not per vertex.
  * No lighting GPU buffer/pipeline is created until a lit mesh is registered.
+ * indirectLights:true additionally admits ambient and hemisphere frame lights
+ * within the same eight-light/544-byte bound. Hemisphere direction points toward
+ * the sky; groundColor supplies its lower-hemisphere linear RGB. They affect
+ * diffuse indirect lighting only, including AO, never emission or direct shadows.
  *
  * shadows:true prepares optional projected-shadow variants for lit materials.
  * A frame may pass shadow:{map,lightIndex:0,bias:0.0005,normalBias:0,strength:1},
@@ -289,6 +297,7 @@ function surfaceShader(
   phong = false,
   flat = false,
   toon = false,
+  indirectLights = false,
 ) {
   const textured = mapMask !== 0 || coated,
     normalMapped = (mapMask & 4) !== 0,
@@ -297,7 +306,7 @@ function surfaceShader(
   const uvAttribute = attributes && (geometryChannels?.uv ?? true);
   const colorWidth = attributes ? (geometryChannels?.colorSize ?? 4) : 0;
   const occluded = (mapMask & 16) !== 0,
-    ambientOcclusion = occluded && environmentCode !== "";
+    ambientOcclusion = occluded && (environmentCode !== "" || indirectLights);
   const names = phong || toon ? MAP_NAMES.map((name, slot) =>
     slot === 1 ? toon ? "gradient" : "specular" : name) : MAP_NAMES;
   const declarations = mapSlots(mapMask)
@@ -332,7 +341,18 @@ fn illuminate(base: vec3<f32>, position: vec3<f32>, normal: vec3<f32>, metallic:
   var result = emission;${environmentCode ? "\n  result += environment_lighting(base, normal, view, metallic, roughness, draw_info.options.z == 2.0)" + (ambientOcclusion ? " * occlusion" : "") + ";" : ""}
   for (var i = 0u; i < u32(lighting.meta.x); i++) {
     let light = lighting.lights[i];
-    var incoming = -light.vector.xyz;
+    ${indirectLights ? `// Light kind is frame-uniform. Keep derivative/implicit-sample toon work
+    // inside the uniform direct-light arm, never behind a per-fragment exit.
+    if (light.radiance.w >= 3.0) {
+      var irradiance = light.radiance.rgb;
+      if (light.radiance.w == 4.0) {
+        let weight = dot(normal, light.vector.xyz) * 0.5 + 0.5;
+        irradiance = mix(light.direction.xyz, light.radiance.rgb, weight);
+      }
+      let diffuse = base * select(1.0, 1.0 - metallic, draw_info.options.z == 2.0);
+      result += irradiance * diffuse / 3.141592653589793${ambientOcclusion ? " * occlusion" : ""};
+    } else {
+    ` : ""}var incoming = -light.vector.xyz;
     var attenuation = 1.0;
     if (light.radiance.w > 0.0) {
       let delta = light.vector.xyz - position;
@@ -395,7 +415,7 @@ fn illuminate(base: vec3<f32>, position: vec3<f32>, normal: vec3<f32>, metallic:
     if (i == u32(shadow_info.options.x)) { visibility = projected_shadow(position, normal); }`
         : ""
     }
-    result += light.radiance.rgb * brdf * (nl * attenuation) ${shadowed ? "* visibility" : ""};
+    result += light.radiance.rgb * brdf * (nl * attenuation) ${shadowed ? "* visibility" : ""};${indirectLights ? "\n    }" : ""}
   }
   return result;
 }
@@ -528,7 +548,7 @@ struct VertexOutput {
 }
 `;
 }
-function packLighting(input, output) {
+function packLighting(input, output, indirectLights) {
   keys(input, ["cameraPosition", "viewDirection", "lights"], "lighting");
   const orthographic = input.viewDirection !== undefined;
   if (orthographic && input.cameraPosition !== undefined)
@@ -540,7 +560,7 @@ function packLighting(input, output) {
     ),
     lights = input.lights ?? [];
   if (!Array.isArray(lights) || lights.length > MAX_LIGHTS)
-    fail("ANIMATION_RENDER_LIMIT", "At most eight punctual lights are supported");
+    fail("ANIMATION_RENDER_LIMIT", "At most eight frame lights are supported");
   output.fill(0);
   output.set(camera, 0);
   output[4] = lights.length;
@@ -564,15 +584,19 @@ function packLighting(input, output) {
         "range",
         "innerConeAngle",
         "outerConeAngle",
+        "groundColor",
       ],
       "light",
     );
-    const type = ["directional", "point", "spot"].indexOf(light.type);
+    const type = ["directional", "point", "spot", "ambient", "hemisphere"].indexOf(light.type);
     if (type < 0) fail("ANIMATION_RENDER_LIGHT", "Unknown light type");
+    if (type >= 3 && !indirectLights)
+      fail("ANIMATION_RENDER_LIGHT", "Enable indirectLights before using ambient/hemisphere lights");
     if (
-      (type === 0 && (light.position !== undefined || light.range !== undefined)) ||
-      (type === 1 && light.direction !== undefined) ||
-      (type !== 2 && (light.innerConeAngle !== undefined || light.outerConeAngle !== undefined))
+      (![1, 2].includes(type) && (light.position !== undefined || light.range !== undefined)) ||
+      ([1, 3].includes(type) && light.direction !== undefined) ||
+      (type !== 2 && (light.innerConeAngle !== undefined || light.outerConeAngle !== undefined)) ||
+      (type !== 4 && light.groundColor !== undefined)
     ) {
       fail("ANIMATION_RENDER_LIGHT", "Light fields do not apply to this type");
     }
@@ -583,14 +607,20 @@ function packLighting(input, output) {
       fail("ANIMATION_RENDER_LIGHT", "Invalid light color/intensity");
     for (let c = 0; c < 3; c++) output[at + 4 + c] = rgb[c] * intensity;
     output[at + 7] = type;
-    if (type > 0) output.set(array(light.position, 3, "Light position"), at);
-    if (type !== 1) {
-      const direction = array(light.direction ?? [0, 0, -1], 3, "Light direction");
+    if (type === 1 || type === 2) output.set(array(light.position, 3, "Light position"), at);
+    if (type === 0 || type === 2 || type === 4) {
+      const direction = array(light.direction ?? (type === 4 ? [0, 1, 0] : [0, 0, -1]), 3, "Light direction");
       const scale = Math.max(...direction.map(Math.abs));
       if (scale === 0) fail("ANIMATION_RENDER_LIGHT", "Light direction must be nonzero");
       const length = Math.hypot(direction[0] / scale, direction[1] / scale, direction[2] / scale);
       for (let c = 0; c < 3; c++)
-        output[at + (type === 0 ? 0 : 8) + c] = direction[c] / scale / length;
+        output[at + (type === 2 ? 8 : 0) + c] = direction[c] / scale / length;
+    }
+    if (type === 4) {
+      const ground = array(light.groundColor ?? [0, 0, 0], 3, "Ground color");
+      if (ground.some(v => v < 0 || v > 1))
+        fail("ANIMATION_RENDER_LIGHT", "Invalid hemisphere ground color");
+      for (let c = 0; c < 3; c++) output[at + 8 + c] = ground[c] * intensity;
     }
     if (light.range !== undefined) {
       const range = finite(light.range, "Light range");
@@ -734,6 +764,7 @@ export async function createGpuAnimationRenderer(
     sampleCount = 1,
     shadows = false,
     environment = false,
+    indirectLights = false,
     instancing = false,
     renderBundles = false,
     maxRenderBundles = 4,
@@ -770,6 +801,8 @@ export async function createGpuAnimationRenderer(
     fail("ANIMATION_RENDER_OPTIONS", "Shadows require a color renderer");
   if (typeof environment !== "boolean" || (environment && format === null))
     fail("ANIMATION_RENDER_OPTIONS", "Environment lighting requires a color renderer");
+  if (typeof indirectLights !== "boolean" || (indirectLights && format === null))
+    fail("ANIMATION_RENDER_OPTIONS", "Indirect lights require a color renderer");
   if (typeof instancing !== "boolean")
     fail("ANIMATION_RENDER_OPTIONS", "instancing must be boolean");
   if (typeof renderBundles !== "boolean")
@@ -1005,6 +1038,12 @@ export async function createGpuAnimationRenderer(
     const coated = variant.includes("coat-");
     const phong = variant.includes("phong-"), flat = variant.includes("flat-");
     const toon = variant.includes("toon-");
+    // Defaults preserve the pre-existing direct API (BLEND disables depth
+    // writes). Explicit state is part of the pipeline and therefore bundle key.
+    const state = Number(/state-(\d+)-/.exec(variant)?.[1] ?? 3);
+    const depthTest = (state & 1) !== 0, colorWrite = (state & 2) !== 0;
+    const depthWrite = state & 12 ? (state & 8) !== 0 : null;
+    const backSide = variant.includes("back-");
     const lit = variant.startsWith("lit-"),
       attributes = !variant.endsWith("plain") && !variant.includes("no-surface-"),
       mapMask = mapMaskFor(variant),
@@ -1077,6 +1116,7 @@ export async function createGpuAnimationRenderer(
               phong,
               flat,
               toon,
+              indirectLights,
             )
           : ANIMATION_RENDER_WGSL,
     });
@@ -1132,6 +1172,7 @@ export async function createGpuAnimationRenderer(
                     : [
                         {
                           format,
+                          ...(colorWrite ? {} : {writeMask: 0}),
                           ...(blend
                             ? {
                                 blend: {
@@ -1153,15 +1194,15 @@ export async function createGpuAnimationRenderer(
               },
               primitive: {
                 topology: "triangle-list",
-                cullMode: winding.startsWith("none") ? "none" : "back",
+                cullMode: winding.startsWith("none") ? "none" : backSide ? "front" : "back",
                 frontFace: winding === "cw" || winding === "none-cw" ? "cw" : "ccw",
               },
               ...(depthFormat
                 ? {
                     depthStencil: {
                       format: depthFormat,
-                      depthWriteEnabled: !blend,
-                      depthCompare: "less-equal",
+                      depthWriteEnabled: depthTest && (depthWrite ?? !blend),
+                      depthCompare: depthTest ? "less-equal" : "always",
                     },
                   }
                 : {}),
@@ -1343,6 +1384,10 @@ export async function createGpuAnimationRenderer(
         "indices",
         "baseColor",
         "doubleSided",
+        "side",
+        "depthTest",
+        "depthWrite",
+        "colorWrite",
         "alphaMode",
         "alphaCutoff",
         "texCoords",
@@ -1383,6 +1428,16 @@ export async function createGpuAnimationRenderer(
       alphaMode = "OPAQUE",
       alphaCutoff = 0.5,
     } = options;
+    const side = options.side ?? (doubleSided ? "double" : "front");
+    if (options.side === null || !["front", "back", "double"].includes(side) ||
+        (options.side !== undefined && options.doubleSided !== undefined))
+      fail("ANIMATION_RENDER_OPTIONS", "Choose side or doubleSided, not both");
+    const depthTest = options.depthTest ?? true, colorWrite = options.colorWrite ?? true;
+    for (const field of ["depthTest", "depthWrite", "colorWrite"])
+      if (options[field] !== undefined && typeof options[field] !== "boolean")
+        fail("ANIMATION_RENDER_OPTIONS", `${field} must be boolean`);
+    const state = Number(depthTest) | (Number(colorWrite) << 1) |
+      (options.depthWrite === undefined ? 0 : options.depthWrite ? 8 : 4);
     const rgba = Float64Array.from(color(baseColor)),
       shading = options.shading ?? "unlit";
     const mode = ["unlit", "lambert", "metallic-roughness", "phong", "toon"].indexOf(shading),
@@ -1573,6 +1628,8 @@ export async function createGpuAnimationRenderer(
     const surfaceWords = 6 + coordinates.length * 2;
     const variant =
       (lit ? "lit-" : "") +
+      (state === 3 ? "" : `state-${state}-`) +
+      (side === "back" ? "back-" : "") +
       (phong ? "phong-" : "") +
       (toon ? "toon-" : "") +
       (flat ? "flat-" : "") +
@@ -1674,7 +1731,7 @@ export async function createGpuAnimationRenderer(
     };
     pendingMeshes++;
     try {
-      if (data || surfaceData || lit || mutable) {
+      if (data || surfaceData || lit || mutable || variant !== "plain") {
         const lightsReady = lit ? ensureLighting() : Promise.resolve();
         const ready =
           variant === "plain"
@@ -1774,7 +1831,7 @@ export async function createGpuAnimationRenderer(
         gpu,
         geometrySignature: mutable?.signature ?? null,
         rgba,
-        doubleSided,
+        doubleSided: side === "double",
         alphaMode,
         alphaCutoff,
         extent,
@@ -1903,7 +1960,7 @@ export async function createGpuAnimationRenderer(
       }
       const dependencies = new Set();
       let usesLighting = false;
-      if (lighting !== null) packLighting(lighting, lightWords);
+      if (lighting !== null) packLighting(lighting, lightWords, indirectLights);
       if (shadow !== null && (!shadows || lighting === null))
         fail(
           "ANIMATION_RENDER_SHADOW",
@@ -1962,6 +2019,7 @@ export async function createGpuAnimationRenderer(
             "emissiveFactor",
             "specularColor",
             "shininess",
+            "alphaCutoff",
           ],
           "draw",
         );
@@ -1989,7 +2047,11 @@ export async function createGpuAnimationRenderer(
             staged[offset + column * 4 + row] = value;
           }
         staged.set(rgba, offset + 16);
-        staged[offset + 20] = record.alphaMode === "MASK" ? record.alphaCutoff : -1;
+        if (input.alphaCutoff !== undefined && record.alphaMode !== "MASK")
+          fail("ANIMATION_RENDER_OPTIONS", "Alpha cutoff override requires MASK shading");
+        const cutoff = finite(input.alphaCutoff ?? record.alphaCutoff, "Alpha cutoff");
+        if (cutoff < 0 || cutoff > 1) fail("ANIMATION_RENDER_VALUE", "Alpha cutoff must be in [0,1]");
+        staged[offset + 20] = record.alphaMode === "MASK" ? cutoff : -1;
         staged[offset + 21] = record.alphaMode === "BLEND" ? 1 : 0;
         const uv = uvTransform(input.uvTransform ?? record.transform);
         staged.set([uv[0], uv[2], uv[4], 0, uv[1], uv[3], uv[5], 0], offset + 24);
@@ -2262,6 +2324,7 @@ export async function createGpuAnimationRenderer(
     sampleCount,
     shadows,
     environment,
+    indirectLights,
     instancing,
     renderBundles,
     get bundleDiagnostics() { return bundleCache?.diagnostics ?? null; },

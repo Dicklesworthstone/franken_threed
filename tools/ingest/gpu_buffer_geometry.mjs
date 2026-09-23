@@ -22,6 +22,9 @@
  * maxAttributes bounds retained source identities (including replaced ones).
  * Geometry.dispose() releases residency but permits update() to recreate it;
  * handle.dispose() permanently closes this adapter, never the source or device.
+ * maxInitialBytes and update({maxAdditionalBytes}) let an owner enforce an
+ * aggregate allocation budget. They cap additions before any writes/callbacks;
+ * same-storage uploads need no additional bytes. Per-handle bounds still apply.
  */
 export class BufferGeometryGpuError extends Error {
   constructor(code, message) { super(`${code}: ${message}`); this.name = 'BufferGeometryGpuError'; this.code = code; }
@@ -134,9 +137,10 @@ export function bufferGeometrySnapshot(handle, device) {
 }
 
 export function createGpuBufferGeometry(device, geometry, {
-  maxBytes = 64 * 1024 * 1024, maxAttributes = 128, label = 'f3d-buffer-geometry',
+  maxBytes = 64 * 1024 * 1024, maxInitialBytes = maxBytes, maxAttributes = 128, label = 'f3d-buffer-geometry',
 } = {}) {
   integer(maxBytes, 1, Number.MAX_SAFE_INTEGER, 'byte budget');
+  integer(maxInitialBytes, 0, maxBytes, 'initial allocation budget');
   integer(maxAttributes, 1, 65536, 'attribute budget');
   if (typeof label !== 'string' || !device?.limits || typeof device.createBuffer !== 'function' ||
       typeof device.queue?.writeBuffer !== 'function' || typeof device.queue.onSubmittedWorkDone !== 'function' ||
@@ -170,8 +174,9 @@ export function createGpuBufferGeometry(device, geometry, {
     native(() => device.queue.writeBuffer(record.buffer, offset, record.shadow, offset, limit - offset));
     stats.uploads++; stats.uploadedBytes += limit-offset;
   }
-  function update() {
+  function update({maxAdditionalBytes = maxBytes} = {}) {
     live(); if (busy) fail('REENTRANT', 'Cannot update geometry from an upload callback');
+    integer(maxAdditionalBytes, 0, maxBytes, 'additional allocation budget');
     busy = true;
     let scoped = false;
     try {
@@ -196,7 +201,7 @@ export function createGpuBufferGeometry(device, geometry, {
           addedCount++; addedBytes += size;
         }
       }
-      if (allocatedBytes + addedBytes > maxBytes || records.size + addedCount > maxAttributes) fail('LIMIT', 'Geometry residency budget exceeded');
+      if (addedBytes > maxAdditionalBytes || allocatedBytes + addedBytes > maxBytes || records.size + addedCount > maxAttributes) fail('LIMIT', 'Geometry residency budget exceeded');
       native(() => { device.pushErrorScope('validation'); device.pushErrorScope('out-of-memory'); }); scoped = true;
       for (const entry of shape.owners.values()) {
         const {owner} = entry, array = owner.array;
@@ -289,7 +294,7 @@ export function createGpuBufferGeometry(device, geometry, {
   states.set(handle, {device, geometry, live, current: () => current});
   device.lost.then(info => { if (!disposed) stop(new BufferGeometryGpuError('GEOMETRY_GPU_LOST', info?.message || 'Device lost')); },
     error => { if (!disposed) stop(error); });
-  try { update(); geometry.addEventListener?.('dispose', onDispose); }
+  try { update({maxAdditionalBytes: maxInitialBytes}); geometry.addEventListener?.('dispose', onDispose); }
   catch (error) { handle.dispose(); throw error; }
   return handle;
 }

@@ -173,18 +173,21 @@ export async function createGpuAnimationScene(device, pose, drawables, {
     // performs its existing bounded geometry snapshot during each creation.
     const inputs = drawables.map(input => {
       if (!input || typeof input !== 'object') fail('ANIMATION_SCENE_GEOMETRY', 'Expected a drawable descriptor');
-      const allowed = ['geometry', 'indices', 'baseColor', 'doubleSided', 'alphaMode', 'alphaCutoff',
+      const allowed = ['geometry', 'indices', 'baseColor', 'doubleSided', 'side', 'depthTest', 'depthWrite', 'colorWrite', 'alphaMode', 'alphaCutoff',
         'texCoords', 'vertexColors', 'mapCoordinates', ...TEXTURE_FIELDS, ...COAT_FIELDS, 'uvTransform', 'shading', 'flatShading', 'specularColor', 'shininess', 'metallicFactor', 'roughnessFactor', 'emissiveFactor', 'normalScale', 'occlusionStrength'];
       for (const key of Object.keys(input)) if (!allowed.includes(key)) fail('ANIMATION_SCENE_GEOMETRY', `Unsupported drawable field: ${key}`);
       const {geometry, indices = null, baseColor = [1,1,1,1], doubleSided = false, alphaMode = 'OPAQUE', alphaCutoff = 0.5} = input;
       if ((!Array.isArray(baseColor) && !ArrayBuffer.isView(baseColor)) || baseColor.length !== 4) fail('ANIMATION_SCENE_GEOMETRY', 'Expected RGBA material color');
       const material = {indices: indices === null ? null : copyMaterialArray(indices, 'indices'),
-        baseColor: copyMaterialArray(baseColor, 'baseColor'), doubleSided, alphaMode, alphaCutoff};
+        baseColor: copyMaterialArray(baseColor, 'baseColor'),
+        ...(input.side === undefined ? {doubleSided} : {side: input.side}), alphaMode, alphaCutoff};
+      if (input.side !== undefined && input.doubleSided !== undefined)
+        fail('ANIMATION_SCENE_GEOMETRY', 'Choose side or doubleSided, not both');
       for (const key of ['texCoords', 'vertexColors', 'uvTransform', 'emissiveFactor', 'specularColor']) {
         const value = input[key];
         if (value !== undefined) material[key] = value === null ? null : copyMaterialArray(value, key);
       }
-      for (const key of ['shading', 'flatShading', 'shininess', 'metallicFactor', 'roughnessFactor', 'normalScale', 'occlusionStrength', ...COAT_FIELDS]) {
+      for (const key of ['shading', 'flatShading', 'shininess', 'metallicFactor', 'roughnessFactor', 'normalScale', 'occlusionStrength', 'depthTest', 'depthWrite', 'colorWrite', ...COAT_FIELDS]) {
         const value = input[key]; if (value !== undefined) material[key] = value;
       }
       for (const key of TEXTURE_FIELDS) {

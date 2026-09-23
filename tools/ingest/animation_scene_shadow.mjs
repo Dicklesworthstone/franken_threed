@@ -41,7 +41,7 @@ function snapshotLighting(input) {
   copy.lights = copy.lights.map((source) => {
     if (!source || typeof source !== "object" || Array.isArray(source)) fail("Invalid frame light");
     const light = { ...source };
-    for (const key of ["position", "direction", "color"])
+    for (const key of ["position", "direction", "color", "groundColor"])
       if (light[key] !== undefined) light[key] = array(light[key], 3, key);
     return light;
   });
@@ -135,6 +135,7 @@ export function prepareAnimationSceneShadows(pose, inputs, options) {
       "indices",
       "baseColor",
       "doubleSided",
+      "side",
       "alphaMode",
       "alphaCutoff",
       "texCoords",
