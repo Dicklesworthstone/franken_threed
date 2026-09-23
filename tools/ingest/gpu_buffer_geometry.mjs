@@ -30,7 +30,7 @@ export class BufferGeometryGpuError extends Error {
   constructor(code, message) { super(`${code}: ${message}`); this.name = 'BufferGeometryGpuError'; this.code = code; }
 }
 const fail = (code, message) => { throw new BufferGeometryGpuError('GEOMETRY_GPU_' + code, message); };
-const states = new WeakMap();
+const states = new WeakMap(), instanceStates = new WeakMap();
 const FIELDS = Object.freeze({position: [0, 3], normal: [1, 3], tangent: [2, 4], uv: [3, 2], color: [4, 0]});
 const align4 = n => Math.ceil(n / 4) * 4;
 function integer(n, min, max, name) {
@@ -136,9 +136,9 @@ export function bufferGeometrySnapshot(handle, device) {
   return {...snapshot, drawRange: range(state.geometry, snapshot.indexBuffer ? snapshot.indexCount : snapshot.vertexCount)};
 }
 
-export function createGpuBufferGeometry(device, geometry, {
+function createResidency(device, geometry, {
   maxBytes = 64 * 1024 * 1024, maxInitialBytes = maxBytes, maxAttributes = 128, label = 'f3d-buffer-geometry',
-} = {}) {
+} = {}, describeSource = describe, sourceRange = range, registry = states) {
   integer(maxBytes, 1, Number.MAX_SAFE_INTEGER, 'byte budget');
   integer(maxInitialBytes, 0, maxBytes, 'initial allocation budget');
   integer(maxAttributes, 1, 65536, 'attribute budget');
@@ -180,8 +180,8 @@ export function createGpuBufferGeometry(device, geometry, {
     busy = true;
     let scoped = false;
     try {
-      const shape = describe(geometry);
-      range(geometry, shape.indexOwner ? shape.indexCount : shape.vertexCount);
+      const shape = describeSource(geometry);
+      sourceRange(geometry, shape.indexOwner ? shape.indexCount : shape.vertexCount);
       let addedBytes = 0, addedCount = 0;
       // Admission completes before any allocation, queue write, range mutation
       // or callback. An invalid later attribute cannot partly upload the frame.
@@ -291,10 +291,68 @@ export function createGpuBufferGeometry(device, geometry, {
       }
     },
   });
-  states.set(handle, {device, geometry, live, current: () => current});
+  registry.set(handle, {device, geometry, live, current: () => current});
   device.lost.then(info => { if (!disposed) stop(new BufferGeometryGpuError('GEOMETRY_GPU_LOST', info?.message || 'Device lost')); },
     error => { if (!disposed) stop(error); });
   try { update({maxAdditionalBytes: maxInitialBytes}); geometry.addEventListener?.('dispose', onDispose); }
   catch (error) { handle.dispose(); throw error; }
   return handle;
+}
+
+/** Ordinary vertex/index residency. Instance streams have a separate identity
+ * and budget so many InstancedMeshes may borrow one shared geometry allocation. */
+export function createGpuBufferGeometry(device, geometry, options) {
+  return createResidency(device, geometry, options);
+}
+
+function describeInstances(source) {
+  if (!source?.isInstancedMesh || source.morphTexture != null)
+    fail('SHAPE', 'Expected a rigid InstancedMesh without per-instance morph textures');
+  const owners = new Map(), streams = [];
+  let capacity = 0xffffffff;
+  for (const [name, width, location] of [['instanceMatrix',16,5], ['instanceColor',3,9]]) {
+    const owner = source[name];
+    if (name === 'instanceColor' && owner === null) continue;
+    if (!owner?.isInstancedBufferAttribute || owner.isInterleavedBufferAttribute ||
+        owner.meshPerAttribute !== 1 || owner.itemSize !== width || owner.normalized)
+      fail('SHAPE', `Expected an ordinary ${name} InstancedBufferAttribute`);
+    const array = owner.array;
+    storage(array);
+    if (!(array instanceof Float32Array) || owner.isFloat16BufferAttribute)
+      fail('FORMAT', 'Instance streams require non-normalized Float32 attributes');
+    const count = integer(owner.count, 0, 0xffffffff, 'instance attribute count');
+    if (count * width !== array.length) fail('SHAPE', 'Instance count does not match storage');
+    capacity = Math.min(capacity, count);
+    const attributes = width === 16
+      ? [0,1,2,3].map(i => ({shaderLocation: location+i, offset: i*16, format: 'float32x4'}))
+      : [{shaderLocation: location, offset: 0, format: 'float32x3'}];
+    const entry = {owner, array, stride: width, requiredBytes: array.byteLength, attributes};
+    owners.set(owner, entry); streams.push(entry);
+  }
+  integer(source.count, 0, capacity, 'active instance count');
+  const layouts = Object.freeze(streams.map(e => Object.freeze({arrayStride: e.stride*4,
+    stepMode: 'instance', attributes: Object.freeze(e.attributes.map(Object.freeze))})));
+  return {owners, streams, layouts, signature: JSON.stringify(layouts),
+    channels: Object.freeze({instanced: true, instanceColor: source.instanceColor !== null}),
+    vertexCount: capacity, indexOwner: null, indexFormat: null, indexCount: 0};
+}
+function instanceRange(source, capacity) {
+  return {first: 0, count: integer(source.count, 0, capacity, 'active instance count')};
+}
+/** Own source matrix/RGB buffers, not the mesh, geometry, arrays or device.
+ * The exact geometry uploader also governs first-use, version/range, callback,
+ * failure, disposal and peak-allocation semantics here. No matrix repacking or
+ * per-instance frame traversal is introduced. count is live and independent of
+ * upload versions; changing stream layout requires material re-registration. */
+export function createGpuInstanceAttributes(device, source, options) {
+  return createResidency(device, source, options, describeInstances, instanceRange, instanceStates);
+}
+export function instanceAttributesSnapshot(handle, device) {
+  const state = instanceStates.get(handle);
+  if (!state) fail('SHAPE', 'Expected an instance residency handle');
+  if (state.device !== device) fail('DEVICE', 'Instances belong to a different device');
+  state.live();
+  const snapshot = state.current();
+  if (!snapshot) fail('RELEASED', 'Call instances.update() after releasing residency');
+  return {...snapshot, instanceCount: instanceRange(state.geometry, snapshot.vertexCount).count};
 }
