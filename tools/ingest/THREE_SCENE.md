@@ -103,7 +103,7 @@ sorting use the original projection convention. WebGPU-coordinate cameras use
 their projection directly. Orthographic cameras supply parallel view rays.
 Scene/camera matrixWorldAutoUpdate and parent authority follow the retained
 update boundary. Color backgrounds clear the color attachment with alpha one.
-Textures, fog, environment backgrounds and output postprocessing are not guessed.
+Texture backgrounds, fog, environment backgrounds and output postprocessing are not guessed.
 
 Both renderer `indirectLights` and `threeLights` profiles are enabled. Ambient,
 hemisphere, directional, point and spot lights use current world-space values;
@@ -121,7 +121,32 @@ to immutable native pipeline state. The lower-level renderer also exposes
 users. Disabling depth testing disables depth writes, as in the source WebGL
 pipeline. These fields do not enlarge the 256-byte draw packet or add passes.
 
-Native texture allocation/upload is explicitly borrowed:
+Ready source byte/image/canvas textures now receive owned WebGPU residency by
+default. The bridge uploads requested source versions before each submitted use,
+realizes samplers and mipmaps, shares compatible Source data and prunes unused
+texture ownership after preparation. Image URLs must already be loaded; the
+bridge starts no fetch or decode operation. See `THREE_TEXTURES.md` for the exact
+byte and browser-managed sRGB external-copy profiles and remaining texture types.
+
+```js
+const bridge = await createGpuThreeScene(device, scene, {
+  three: THREE,
+  texture: {maxTextureBytes: 128 * 1024 * 1024, maxTextures: 256},
+});
+// No GPU binding Map is needed for an admitted material.map/normalMap/etc.
+sourceTexture.image.data[0] = 128;
+sourceTexture.needsUpdate = true;
+bridge.render(camera, attachments); // Current bytes; same view, sampler and bundle.
+```
+
+Sampling/storage changes and source texture disposal require `prepare()` before
+another draw. A source-data version update alone requires no new material
+registration. Custom onUpdate callbacks require the lower-level explicit texture
+owner, rather than being removed or hoisted by this bridge. Texture initialization
+and pending native validation participate in bridge disposal/failure handling.
+
+A caller-provided binding Map overrides automatic ownership per texture, and
+`autoTextures:false` preserves exclusively borrowed operation:
 
 ```js
 const textures = new Map([[sourceTexture, {
@@ -137,7 +162,7 @@ These acknowledgements assert that the application has actually realized the
 source upload, orientation, format/color space, mipmaps and sampler state. They
 are not permission to invent a native handle or mark an incomplete upload done.
 The bridge checks both version numbers before using the binding and does not
-own, decode, destroy or silently reupload any texture. Refresh acknowledgements
+own, decode, destroy or silently reupload those borrowed textures. Refresh acknowledgements
 after legitimate data uploads. Updating bytes in the same borrowed GPU texture
 can reuse a bundle; changing its native binding requires preparation.
 
@@ -156,7 +181,10 @@ Defaults are 16,384 reachable nodes, 256 geometries, 1,024 material bindings and
 owned draw/light/material buffers. Geometry bytes include retained old attribute
 identities and pending new residencies; replacement cannot pretend that old
 storage has already been freed. CPU upload shadows are the same size as geometry
-storage and are additional CPU memory, not extra GPU bytes. Borrowed textures
+storage and are additional CPU memory, not extra GPU bytes. `texture.maxTextureBytes`
+separately bounds owned texel/mip storage (128 MiB by default), including transient
+old-plus-new allocations. `diagnostics.textures` reports current ownership and
+physical upload/mipmap counters. Borrowed textures
 and implementation-owned pipeline/bundle memory are not disguised as these exact
 buffer byte counts.
 
@@ -188,7 +216,9 @@ with `buildAnimation(entry, out, {webgpu: true, threeScene: true})`, or the CLI
 flags `--build-animation out --animation-webgpu --animation-three-scene`. This
 only packages the bridge; it does not turn the input glTF into a source Three.js
 scene. The application lends the same pinned source module and scene at runtime.
-CPU-only and ordinary GPU packages do not acquire this optional module.
+CPU-only and ordinary GPU packages do not acquire these optional modules.
+Source-scene packages include three_textures.mjs and additionally export
+createGpuThreeTextures for explicit texture ownership outside a scene.
 
 Host regressions execute real pinned Three.js scenes and the actual new renderer
 against a byte-accurate queue recorder. They cover state mutation, cameras,
@@ -207,3 +237,10 @@ animation, instance, shadow and environment APIs still exist, but are not
 silently substituted for source semantics here. H1/H2 automatic application
 closure and performance gates are not satisfied by this bridge. No measured
 speedup or complete Three.js material/renderer parity is claimed.
+
+The automatic-texture suite also builds the actual pinned Wasm-specialized addon,
+uses source Phong maps and a UV-free toon gradient without a binding Map, and
+checks source bytes at each queued use. Native texture pixels, sRGB mip filtering,
+flipY, canvas copies and two in-flight texture versions have a separate harness:
+`tests/e2e/three_textures/index.html`. Host command/byte tests do not certify those
+native conversions, which must be run on an available WebGPU adapter.

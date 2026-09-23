@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>FrankenThreeD source texture execution</title>
+<h1>Live Three.js texture execution</h1>
+<p>Serve this repository over localhost or HTTPS with the pinned r186 checkout
+at upstream/three.js. A WebGPU adapter is required; missing support fails.</p>
+<pre id="result">Running…</pre>
+<script type="module">
+import * as THREE from '../../../upstream/three.js/build/three.module.js';
+import {runThreeTextureSceneChecks} from '../../../tools/ingest/three_textures.browser.mjs';
+let device;
+try {
+  const adapter=await navigator.gpu?.requestAdapter();
+  if(!adapter)throw Error('No WebGPU adapter; texture checks have not passed.');
+  device=await adapter.requestDevice();
+  globalThis.__f3dThreeTextureResult=await runThreeTextureSceneChecks(device,THREE);
+} catch(error) {
+  globalThis.__f3dThreeTextureResult={status:'failed',error:error.stack||String(error)};
+} finally {
+  device?.destroy();
+  document.getElementById('result').textContent=JSON.stringify(globalThis.__f3dThreeTextureResult,null,2);
+}
+</script>
+</html>

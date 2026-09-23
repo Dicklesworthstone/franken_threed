@@ -7,12 +7,14 @@
  * This admits rigid Mesh/BufferGeometry and the existing material profiles. It
  * is NOT a constructor replacement or complete Three.js renderer compatibility.
  * Unsupported renderable families, shader/render hooks, fog, source environment
- * maps and shadows fail explicitly. Borrowed texture bindings assert completed
- * source uploads; image decoding and texture/sampler realization are not guessed.
+ * maps and shadows fail explicitly. Ready byte/image/canvas textures receive
+ * owned native residency by default; a borrowed binding Map still overrides it.
+ * No network image decoding is started by scene preparation or rendering.
  * See THREE_SCENE.md for the supported source and preparation contract.
  */
 import {createGpuAnimationRenderer} from './animation_render.mjs';
 import {createGpuBufferGeometry, bufferGeometrySnapshot} from './gpu_buffer_geometry.mjs';
+import {createGpuThreeTextures} from './three_textures.mjs';
 export class ThreeSceneError extends Error {
   constructor(code,message){super(`THREE_SCENE_${code}: ${message}`);this.name='ThreeSceneError';this.code='THREE_SCENE_'+code;}
 }
@@ -30,12 +32,14 @@ const MAPS=[['map','baseColorTexture'],['normalMap','normalTexture'],['emissiveM
 const DEPTH=['never','always','less','less-equal','equal','greater-equal','greater','not-equal'];
 
 export async function createGpuThreeScene(device,scene,{
-  three, textures=new Map(), renderer:renderOptions={}, geometry:geometryOptions={},
+  three, textures=new Map(), autoTextures=true, texture:textureOptions={}, renderer:renderOptions={}, geometry:geometryOptions={},
   maxNodes=16384,maxGeometries=256,maxBindings=1024,maxGeometryBytes=128*1024*1024,sortObjects=true,
 }={}) {
   if(three?.REVISION!=='186'||typeof three.Matrix4!=='function'||typeof three.Frustum!=='function'||
       typeof three.Mesh!=='function'||!(scene instanceof three.Scene))fail('SOURCE','Supply the pinned r186 module and its Scene');
-  if(!(textures instanceof Map)||typeof sortObjects!=='boolean')fail('OPTIONS','Expected a texture binding Map and boolean sorting option');
+  if(!(textures instanceof Map)||typeof sortObjects!=='boolean'||typeof autoTextures!=='boolean')fail('OPTIONS','Expected a texture binding Map and boolean texture/sorting options');
+  if(!textureOptions||typeof textureOptions!=='object'||Array.isArray(textureOptions))fail('OPTIONS','Expected texture ownership options');
+  for(const key of Object.keys(textureOptions))if(!['maxTextureBytes','maxTextures','maxPixels','label'].includes(key))fail('OPTIONS',`Unsupported texture option: ${key}`);
   integer(maxNodes,1,1048576,'node capacity');integer(maxGeometries,1,65536,'geometry capacity');
   integer(maxBindings,1,32768,'material binding capacity');integer(maxGeometryBytes,1,Number.MAX_SAFE_INTEGER,'geometry budget');
   if(renderOptions.format===null||renderOptions.indirectLights===false||renderOptions.threeLights===false||
@@ -48,6 +52,9 @@ export async function createGpuThreeScene(device,scene,{
     [three.MeshStandardMaterial.prototype,'metallic-roughness'],
   ]);
   const geometries=new Map(),materials=new Map();
+  let textureOwner=null,textureScan=null,frameTextures=null,retainedTextures=new Set();
+  const ownedTextures=()=>textureOwner??=createGpuThreeTextures(device,{...textureOptions,three});
+  const resourceFailed=()=>!!renderer?.failed||!!textureOwner?.failed||[...geometries.values()].some(g=>g.failed);
   let entries=[],lookup=new Map(),renderer,disposed=false,terminal=null,busy=false,preparing=false,prepareVersion=0,sourceDraws=0;
   // End the owner's wait without claiming to cancel already-issued GPU work.
   // Renderer registration still retires its private resources if it resolves late.
@@ -57,17 +64,17 @@ export async function createGpuThreeScene(device,scene,{
   const geometryBytes=()=>[...geometries.values()].reduce((n,g)=>n+g.bufferBytes,0);
   function live(){
     if(disposed)fail('DISPOSED','Source scene bridge is disposed');if(terminal)throw terminal;
-    if(renderer?.failed||[...geometries.values()].some(g=>g.failed)){
+    if(resourceFailed()){
       terminal=new ThreeSceneError('DEVICE','A source-scene GPU resource failed');release();throw terminal;
     }
   }
   function release(){
     for(const entry of entries)entry.mesh.dispose();entries=[];lookup.clear();
     for(const [m,state] of materials)m.removeEventListener('dispose',state.listener);materials.clear();
-    for(const gpu of geometries.values())gpu.dispose();geometries.clear();renderer?.dispose();
+    for(const gpu of geometries.values())gpu.dispose();geometries.clear();renderer?.dispose();textureOwner?.dispose();
   }
   function failed(error){
-    if(renderer?.failed||[...geometries.values()].some(g=>g.failed)){terminal??=error;release();}
+    if(resourceFailed()){terminal??=error;release();}
     throw error;
   }
   function trackMaterial(m){
@@ -167,9 +174,18 @@ export async function createGpuThreeScene(device,scene,{
     let transform=null;const textureKey=[];
     function texture(t,field){
       if(!(t instanceof three.Texture)||t.isCubeTexture||t.isVideoTexture||t.channel!==0)fail('TEXTURE','Expected a current, ordinary UV0 texture binding');
-      const binding=textures.get(t);
-      if(!binding?.view||!binding.sampler||binding.version!==t.version||binding.sourceVersion!==t.source.version)
-        fail('TEXTURE','Supply a completed texture binding matching both texture and source upload versions');
+      let binding;
+      if(textures.has(t)){
+        binding=textures.get(t);
+        if(!binding?.view||!binding.sampler||binding.version!==t.version||binding.sourceVersion!==t.source.version)
+          fail('TEXTURE','Supply a completed texture binding matching both texture and source upload versions');
+      }else{
+        if(!autoTextures)fail('TEXTURE','Supply an acknowledged binding or enable automatic textures');
+        if(t.onUpdate!==null)fail('HOOK','Custom texture upload callbacks require the explicit texture owner');
+        const owner=ownedTextures();
+        if(textureScan){owner.inspect(t);textureScan.add(t);binding={view:t,sampler:t};}
+        else{binding=owner.binding(t);frameTextures?.add(t);}
+      }
       options[field]={view:binding.view,sampler:binding.sampler};textureKey.push(field,t,binding.view,binding.sampler);
       if(field!=='gradientTexture'){
         if(t.matrixAutoUpdate)t.updateMatrix();const e=t.matrix.elements,next=[e[0],e[1],e[3],e[4],e[6],e[7]];
@@ -225,6 +241,10 @@ export async function createGpuThreeScene(device,scene,{
     if(seen.size>maxGeometries||out.length>maxBindings)fail('LIMIT','Source geometry/material binding capacity exceeded');
     return out;
   }
+  function scanTextures(){
+    textureScan=new Set();
+    try{desired(graph());return textureScan;}finally{textureScan=null;}
+  }
   function sameDesired(a,b){return a.length===b.length&&a.every((item,i)=>item.geometry===b[i].geometry&&item.material===b[i].material&&same(item.desc.structural,b[i].desc.structural));}
   function publish(next){
     for(const entry of entries)if(!next.includes(entry))entry.mesh.dispose();
@@ -240,6 +260,9 @@ export async function createGpuThreeScene(device,scene,{
     live();if(busy)fail('REENTRANT','A source-scene operation is already running');busy=true;preparing=true;
     const created=[],added=[];
     try{
+      // Validate all source materials and texture inputs before allocating any
+      // textures. Temporary inspection placeholders never reach renderer.addMesh.
+      const owned=scanTextures();textureOwner?.prepare(owned);
       const request=desired(graph()),next=[];
       for(const item of request){
         live();let gpu=geometries.get(item.geometry);
@@ -266,10 +289,12 @@ export async function createGpuThreeScene(device,scene,{
         if(bufferGeometrySnapshot(gpu,device).signature!==entry.signature)fail('CHANGED','Geometry layout changed during preparation');
       }
       if(!sameDesired(request,desired(graph())))fail('CHANGED','Source structure changed while pipelines were being prepared');
-      publish(next);prepareVersion++;return bridge;
+      textureOwner?.update(owned);
+      publish(next);retainedTextures=owned;textureOwner?.retain(owned);prepareVersion++;return bridge;
     }catch(error){
       for(const entry of created)entry.mesh.dispose();
       for(const g of added){geometries.get(g)?.dispose();geometries.delete(g);}
+      if(!textureOwner?.disposed&&!textureOwner?.failed)textureOwner?.retain(retainedTextures);
       return failed(error);
     }finally{busy=false;preparing=false;}
   }
@@ -291,6 +316,7 @@ export async function createGpuThreeScene(device,scene,{
     try{
       if(!frame||typeof frame!=='object')fail('FRAME','Supply borrowed render attachments');
       for(const key of ['draws','viewProjection','lighting'])if(Object.hasOwn(frame,key))fail('FRAME',`${key} belongs to the source scene/camera`);
+      frameTextures=new Set();
       graph();const lighting=cameraFrame(camera);lighting.lights=[];
       const opaque=[],transparent=[],stack=[{object:scene,groupOrder:0}],descriptions=new Map();
       const get=m=>{if(!descriptions.has(m))descriptions.set(m,materialDescription(m));return descriptions.get(m);};
@@ -335,6 +361,10 @@ export async function createGpuThreeScene(device,scene,{
       }
       const items=[...opaque,...transparent],draws=[];
       if(items.reduce((n,item)=>n+item.bindings.length,0)>(renderOptions.maxDraws??1024))fail('LIMIT','Expanded source draws exceed capacity');
+      // Complete texture/material preflight first, then publish requested bytes
+      // before this frame's immediate draw submission. Stable views keep bundles
+      // valid; changing a sampler/storage description requires prepare().
+      textureOwner?.update(frameTextures);
       const updated=new Set();
       for(const item of items){
         const gpu=geometries.get(item.geometry);
@@ -362,20 +392,21 @@ export async function createGpuThreeScene(device,scene,{
       const prepared={...frame,viewProjection:clip.elements,lighting,draws};
       if(scene.background!==null){prepared.clearColor=rgba(scene.background);prepared.loadOp='clear';}
       renderer.render(prepared);sourceDraws=items.length;return bridge;
-    }catch(error){return failed(error);}finally{busy=false;}
+    }catch(error){return failed(error);}finally{busy=false;frameTextures=null;}
   }
   const bridge=Object.freeze({scene,prepare,render,
-    get disposed(){return disposed;},get failed(){return terminal!==null||!!renderer?.failed||[...geometries.values()].some(g=>g.failed);},
+    get disposed(){return disposed;},get failed(){return terminal!==null||resourceFailed();},
     get diagnostics(){return Object.freeze({prepareVersion,sourceDraws,logicalDraws:renderer?.drawCount??0,
       drawCalls:renderer?.drawCallCount??0,geometryCount:geometries.size,geometryBytes:geometryBytes(),
       materialBindings:entries.filter(e=>!e.mesh.disposed).length,rendererBytes:renderer?.allocatedBytes??0,
+      textures:textureOwner?.diagnostics??null,
       bundles:renderer?.bundleDiagnostics??null});},
-    async whenIdle(){live();try{await Promise.race([Promise.all([renderer.whenIdle(),...[...geometries.values()].map(g=>g.whenIdle())]),stopped]);live();return bridge;}catch(error){return failed(error);}},
+    async whenIdle(){live();try{await Promise.race([Promise.all([renderer.whenIdle(),textureOwner?.whenIdle(),...[...geometries.values()].map(g=>g.whenIdle())]),stopped]);live();return bridge;}catch(error){return failed(error);}},
     dispose(){if(busy&&!preparing)fail('REENTRANT','Cannot dispose during source submission');if(!disposed){disposed=true;rejectStopped(new ThreeSceneError('DISPOSED','Source scene bridge is disposed'));release();}},
   });
   try{
     // Source validation precedes even the renderer's uniform allocation.
-    desired(graph());
+    scanTextures();
     renderer=await createGpuAnimationRenderer(device,{...renderOptions,indirectLights:true,threeLights:true,maxMeshes:2*maxBindings});
     live();await prepare();return bridge;
   }catch(error){disposed=true;release();throw error;}

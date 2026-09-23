@@ -307,8 +307,9 @@ export {fitAnimationShadowView,animationShadowWorldBounds} from './animation_sha
   }
   if (threeScene) {
     outputs.set("three_scene.mjs", fs.readFileSync(new URL("./three_scene.mjs", import.meta.url), "utf8"));
+    outputs.set("three_textures.mjs", fs.readFileSync(new URL("./three_textures.mjs", import.meta.url), "utf8"));
     outputs.set("gpu_playback.mjs", outputs.get("gpu_playback.mjs") +
-      "export {createGpuThreeScene,ThreeSceneError} from './three_scene.mjs';\n");
+      "export {createGpuThreeScene,ThreeSceneError} from './three_scene.mjs';\nexport {createGpuThreeTextures} from './three_textures.mjs';\n");
   }
   if (rigidGeometry) {
     outputs.set(
@@ -359,7 +360,7 @@ export {fitAnimationShadowView,animationShadowWorldBounds} from './animation_sha
       ? { gpuRigidGeometry: "shared-immutable-f32-vertices; opt-in scene rigidGeometry:true" }
       : {}),
     ...(environment ? { gpuEnvironment: "f3d-animation-environment-v1" } : {}),
-    ...(threeScene ? { gpuThreeScene: "explicit-r186-rigid-scene; borrowed source module, textures and attachments" } : {}),
+    ...(threeScene ? { gpuThreeScene: "explicit-r186-rigid-scene; owned source textures or borrowed bindings; borrowed module and attachments" } : {}),
     source: { file: path.basename(entry), sha256: hash(source) },
     dependencies: [...dependencies.values()],
     nodeCount: validated.nodeCount,

@@ -29,6 +29,17 @@ export function textureDevice(){
     d.externalCopies.push({source,destination,size});
   };
   d.createRenderPipeline=desc=>{if(d.mipError)throw d.mipError;const p={...desc,getBindGroupLayout:()=>({})};d.mipPipelines.push(p);return p;};
+  const submit=d.queue.submit;
+  d.queue.submit=commands=>{
+    submit(commands);
+    for(const draw of d.snapshots.at(-1)){
+      draw.textureContents=new Map();
+      for(const {group} of draw.groups.values())for(const entry of group.entries??[]){
+        const texture=entry.resource?.texture;
+        if(texture?.levels)draw.textureContents.set(texture,texture.levels.map(level=>level.slice()));
+      }
+    }
+  };
   const encode=d.createCommandEncoder;
   d.createCommandEncoder=()=>{
     const e=encode();return {...e,beginRenderPass(desc){
