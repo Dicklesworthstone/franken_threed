@@ -42,6 +42,9 @@
  * depthTest/depthWrite/colorWrite select fixed pipeline state. Disabled depth
  * testing also disables writes. Omitting depthWrite retains the BLEND default.
  * MASK draws may override alphaCutoff in their own current 256-byte packet.
+ * depthCompare selects any native comparison (default 'less-equal').
+ * threeLights:true admits per-light decay (default 2) and hard spot cones and
+ * uses the pinned Three punctual falloff for every material profile.
  *
  * shading is 'unlit' (default), 'lambert', 'phong', 'toon', or 'metallic-roughness'. Lit meshes
  * require the deformer's normal attribute and invertible world transforms.
@@ -186,6 +189,7 @@ const COPY_DST = 8,
   VERTEX_STAGE = 1,
   FRAGMENT_STAGE = 2;
 const UNIFORM_BYTES = 256;
+const DEPTH_COMPARE = Object.freeze(['less-equal', 'never', 'less', 'equal', 'greater', 'not-equal', 'greater-equal', 'always']);
 const MAX_LIGHTS = 8,
   LIGHT_BYTES = 32 + MAX_LIGHTS * 64;
 const UV_IDENTITY = Object.freeze([1, 0, 0, 1, 0, 0]);
@@ -298,6 +302,7 @@ function surfaceShader(
   flat = false,
   toon = false,
   indirectLights = false,
+  threeLights = false,
 ) {
   const textured = mapMask !== 0 || coated,
     normalMapped = (mapMask & 4) !== 0,
@@ -358,16 +363,16 @@ fn illuminate(base: vec3<f32>, position: vec3<f32>, normal: vec3<f32>, metallic:
       let delta = light.vector.xyz - position;
       let distance = length(delta);
       incoming = unit_vector(delta);
-      attenuation = 1.0 / max(distance * distance, ${phong || toon ? "0.01" : "0.000001"});
+      attenuation = 1.0 / max(${threeLights ? "pow(distance, light.cone.z)" : "distance * distance"}, ${phong || toon || threeLights ? "0.01" : "0.000001"});
       if (light.direction.w > 0.0) {
         let ratio = distance / light.direction.w;
-        ${phong || toon ? "let window = clamp(1.0 - ratio * ratio * ratio * ratio, 0.0, 1.0);\n        attenuation *= window * window;" : "attenuation *= clamp(1.0 - ratio * ratio * ratio * ratio, 0.0, 1.0);"}
+        ${phong || toon || threeLights ? "let window = clamp(1.0 - ratio * ratio * ratio * ratio, 0.0, 1.0);\n        attenuation *= window * window;" : "attenuation *= clamp(1.0 - ratio * ratio * ratio * ratio, 0.0, 1.0);"}
       }
       if (light.radiance.w == 2.0) {
         let cosine = dot(-incoming, light.direction.xyz);
         var angular = select(0.0, 1.0, cosine >= light.cone.y);
         if (light.cone.x > light.cone.y) { angular = clamp((cosine - light.cone.y) / (light.cone.x - light.cone.y), 0.0, 1.0); }
-        attenuation *= ${phong || toon ? "angular * angular * (3.0 - 2.0 * angular)" : "angular * angular"};
+        attenuation *= ${phong || toon || threeLights ? "angular * angular * (3.0 - 2.0 * angular)" : "angular * angular"};
       }
     }
     ${toon ? `// r186 gradientmap_pars_fragment: signed angle, not clamped Lambert.
@@ -548,7 +553,7 @@ struct VertexOutput {
 }
 `;
 }
-function packLighting(input, output, indirectLights) {
+function packLighting(input, output, indirectLights, threeLights) {
   keys(input, ["cameraPosition", "viewDirection", "lights"], "lighting");
   const orthographic = input.viewDirection !== undefined;
   if (orthographic && input.cameraPosition !== undefined)
@@ -585,6 +590,7 @@ function packLighting(input, output, indirectLights) {
         "innerConeAngle",
         "outerConeAngle",
         "groundColor",
+        "decay",
       ],
       "light",
     );
@@ -596,7 +602,8 @@ function packLighting(input, output, indirectLights) {
       (![1, 2].includes(type) && (light.position !== undefined || light.range !== undefined)) ||
       ([1, 3].includes(type) && light.direction !== undefined) ||
       (type !== 2 && (light.innerConeAngle !== undefined || light.outerConeAngle !== undefined)) ||
-      (type !== 4 && light.groundColor !== undefined)
+      (type !== 4 && light.groundColor !== undefined) ||
+      (light.decay !== undefined && (!threeLights || (type !== 1 && type !== 2)))
     ) {
       fail("ANIMATION_RENDER_LIGHT", "Light fields do not apply to this type");
     }
@@ -608,6 +615,11 @@ function packLighting(input, output, indirectLights) {
     for (let c = 0; c < 3; c++) output[at + 4 + c] = rgb[c] * intensity;
     output[at + 7] = type;
     if (type === 1 || type === 2) output.set(array(light.position, 3, "Light position"), at);
+    if (threeLights && (type === 1 || type === 2)) {
+      const decay = finite(light.decay ?? 2, "Light decay");
+      if (decay < 0 || !Number.isFinite(Math.fround(decay))) fail("ANIMATION_RENDER_LIGHT", "Invalid light decay");
+      output[at + 14] = decay;
+    }
     if (type === 0 || type === 2 || type === 4) {
       const direction = array(light.direction ?? (type === 4 ? [0, 1, 0] : [0, 0, -1]), 3, "Light direction");
       const scale = Math.max(...direction.map(Math.abs));
@@ -631,7 +643,7 @@ function packLighting(input, output, indirectLights) {
     if (type === 2) {
       const inner = finite(light.innerConeAngle ?? 0, "Inner cone angle"),
         outer = finite(light.outerConeAngle ?? Math.PI / 4, "Outer cone angle");
-      if (inner < 0 || inner >= outer || outer > Math.PI / 2)
+      if (inner < 0 || (threeLights ? inner > outer : inner >= outer) || outer > Math.PI / 2)
         fail("ANIMATION_RENDER_LIGHT", "Invalid spot cone angles");
       output[at + 12] = Math.cos(inner);
       output[at + 13] = Math.cos(outer);
@@ -765,6 +777,7 @@ export async function createGpuAnimationRenderer(
     shadows = false,
     environment = false,
     indirectLights = false,
+    threeLights = false,
     instancing = false,
     renderBundles = false,
     maxRenderBundles = 4,
@@ -803,6 +816,8 @@ export async function createGpuAnimationRenderer(
     fail("ANIMATION_RENDER_OPTIONS", "Environment lighting requires a color renderer");
   if (typeof indirectLights !== "boolean" || (indirectLights && format === null))
     fail("ANIMATION_RENDER_OPTIONS", "Indirect lights require a color renderer");
+  if (typeof threeLights !== "boolean" || (threeLights && format === null))
+    fail("ANIMATION_RENDER_OPTIONS", "Three light falloff requires a color renderer");
   if (typeof instancing !== "boolean")
     fail("ANIMATION_RENDER_OPTIONS", "instancing must be boolean");
   if (typeof renderBundles !== "boolean")
@@ -1043,6 +1058,7 @@ export async function createGpuAnimationRenderer(
     const state = Number(/state-(\d+)-/.exec(variant)?.[1] ?? 3);
     const depthTest = (state & 1) !== 0, colorWrite = (state & 2) !== 0;
     const depthWrite = state & 12 ? (state & 8) !== 0 : null;
+    const depthCompare = DEPTH_COMPARE[Number(/compare-(\d+)-/.exec(variant)?.[1] ?? 0)];
     const backSide = variant.includes("back-");
     const lit = variant.startsWith("lit-"),
       attributes = !variant.endsWith("plain") && !variant.includes("no-surface-"),
@@ -1117,6 +1133,7 @@ export async function createGpuAnimationRenderer(
               flat,
               toon,
               indirectLights,
+              threeLights,
             )
           : ANIMATION_RENDER_WGSL,
     });
@@ -1202,7 +1219,7 @@ export async function createGpuAnimationRenderer(
                     depthStencil: {
                       format: depthFormat,
                       depthWriteEnabled: depthTest && (depthWrite ?? !blend),
-                      depthCompare: depthTest ? "less-equal" : "always",
+                      depthCompare: depthTest ? depthCompare : "always",
                     },
                   }
                 : {}),
@@ -1387,6 +1404,7 @@ export async function createGpuAnimationRenderer(
         "side",
         "depthTest",
         "depthWrite",
+        "depthCompare",
         "colorWrite",
         "alphaMode",
         "alphaCutoff",
@@ -1438,6 +1456,8 @@ export async function createGpuAnimationRenderer(
         fail("ANIMATION_RENDER_OPTIONS", `${field} must be boolean`);
     const state = Number(depthTest) | (Number(colorWrite) << 1) |
       (options.depthWrite === undefined ? 0 : options.depthWrite ? 8 : 4);
+    const comparison = options.depthCompare === undefined ? 0 : DEPTH_COMPARE.indexOf(options.depthCompare);
+    if (comparison < 0) fail("ANIMATION_RENDER_OPTIONS", "Unsupported depth comparison");
     const rgba = Float64Array.from(color(baseColor)),
       shading = options.shading ?? "unlit";
     const mode = ["unlit", "lambert", "metallic-roughness", "phong", "toon"].indexOf(shading),
@@ -1629,6 +1649,7 @@ export async function createGpuAnimationRenderer(
     const variant =
       (lit ? "lit-" : "") +
       (state === 3 ? "" : `state-${state}-`) +
+      (comparison === 0 ? "" : `compare-${comparison}-`) +
       (side === "back" ? "back-" : "") +
       (phong ? "phong-" : "") +
       (toon ? "toon-" : "") +
@@ -1960,7 +1981,7 @@ export async function createGpuAnimationRenderer(
       }
       const dependencies = new Set();
       let usesLighting = false;
-      if (lighting !== null) packLighting(lighting, lightWords, indirectLights);
+      if (lighting !== null) packLighting(lighting, lightWords, indirectLights, threeLights);
       if (shadow !== null && (!shadows || lighting === null))
         fail(
           "ANIMATION_RENDER_SHADOW",
@@ -2325,6 +2346,7 @@ export async function createGpuAnimationRenderer(
     shadows,
     environment,
     indirectLights,
+    threeLights,
     instancing,
     renderBundles,
     get bundleDiagnostics() { return bundleCache?.diagnostics ?? null; },

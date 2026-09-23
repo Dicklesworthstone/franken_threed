@@ -173,7 +173,7 @@ export async function createGpuAnimationScene(device, pose, drawables, {
     // performs its existing bounded geometry snapshot during each creation.
     const inputs = drawables.map(input => {
       if (!input || typeof input !== 'object') fail('ANIMATION_SCENE_GEOMETRY', 'Expected a drawable descriptor');
-      const allowed = ['geometry', 'indices', 'baseColor', 'doubleSided', 'side', 'depthTest', 'depthWrite', 'colorWrite', 'alphaMode', 'alphaCutoff',
+      const allowed = ['geometry', 'indices', 'baseColor', 'doubleSided', 'side', 'depthTest', 'depthWrite', 'depthCompare', 'colorWrite', 'alphaMode', 'alphaCutoff',
         'texCoords', 'vertexColors', 'mapCoordinates', ...TEXTURE_FIELDS, ...COAT_FIELDS, 'uvTransform', 'shading', 'flatShading', 'specularColor', 'shininess', 'metallicFactor', 'roughnessFactor', 'emissiveFactor', 'normalScale', 'occlusionStrength'];
       for (const key of Object.keys(input)) if (!allowed.includes(key)) fail('ANIMATION_SCENE_GEOMETRY', `Unsupported drawable field: ${key}`);
       const {geometry, indices = null, baseColor = [1,1,1,1], doubleSided = false, alphaMode = 'OPAQUE', alphaCutoff = 0.5} = input;
@@ -187,7 +187,7 @@ export async function createGpuAnimationScene(device, pose, drawables, {
         const value = input[key];
         if (value !== undefined) material[key] = value === null ? null : copyMaterialArray(value, key);
       }
-      for (const key of ['shading', 'flatShading', 'shininess', 'metallicFactor', 'roughnessFactor', 'normalScale', 'occlusionStrength', 'depthTest', 'depthWrite', 'colorWrite', ...COAT_FIELDS]) {
+      for (const key of ['shading', 'flatShading', 'shininess', 'metallicFactor', 'roughnessFactor', 'normalScale', 'occlusionStrength', 'depthTest', 'depthWrite', 'depthCompare', 'colorWrite', ...COAT_FIELDS]) {
         const value = input[key]; if (value !== undefined) material[key] = value;
       }
       for (const key of TEXTURE_FIELDS) {

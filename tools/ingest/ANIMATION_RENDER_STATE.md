@@ -18,7 +18,7 @@ renderer.render({...frame, draws: [{mesh, alphaCutoff: 0.3}]});
 
 `side` and the existing `doubleSided` shorthand are mutually exclusive. Negative
 world determinants still reverse winding; back-side materials cull front faces,
-not a fictitious reflected geometry. Depth testing uses less-equal when enabled.
+not a fictitious reflected geometry. Depth testing defaults to less-equal when enabled.
 Disabling it also disables depth writes, following WebGL's disabled-depth-test
 semantics. `colorWrite:false` sets the attachment write mask to zero. Omitting
 `depthWrite` preserves the existing API default: true for OPAQUE/MASK, false for
@@ -29,6 +29,14 @@ Fixed state selects a distinct pipeline and therefore participates in instancing
 and render-bundle identity. Changing only a cutoff does not re-record the native
 schedule. Registration and late-draw errors reject before allocation or frame
 queue effects, respectively. No additional per-material buffer is required.
+
+`depthCompare` can select any native depth function: `never`, `always`, `less`,
+`less-equal`, `equal`, `greater-equal`, `greater` or `not-equal`. It participates
+in pipeline/bundle identity and is forwarded through scene registration.
+`threeLights:true` selects r186 point/spot falloff for all material profiles,
+including Lambert/PBR, and admits nonnegative per-light `decay` (default 2).
+Equal inner/outer spot angles produce a hard cone. Neither option changes the
+default renderer's shader bytes, packet sizes or light capacity.
 
 ## Ambient and hemisphere irradiance
 
