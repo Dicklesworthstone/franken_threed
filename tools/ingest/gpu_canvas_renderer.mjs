@@ -1,5 +1,8 @@
 /** Device negotiation and owned canvas execution for explicit renderer factories.
- * A factory returns {render(input, frame), dispose(), whenIdle(), prepare?()}.
+ * A factory receives (device, rendererOptions, {signal}) and returns
+ * {render(input, frame, presentationTexture), dispose(), whenIdle(), prepare?()}.
+ * Extra arguments are optional for existing factories. The texture must not
+ * escape its synchronous submitted use; signal ends on session teardown.
  * It borrows the device; the session owns the returned renderer. No frame loop.
  */
 import {createGpuCanvasTarget, GpuCanvasError} from './gpu_canvas.mjs';
@@ -37,10 +40,12 @@ export async function createGpuCanvasRenderer(canvas, createRenderer, options = 
   let rejectStopped;
   const stopped = new Promise((_, reject) => { rejectStopped = reject; });
   stopped.catch(() => {});
+  const lifetime = new AbortController();
   const closed = () => disposed || terminal !== null;
   const aborted = () => stop(new GpuCanvasError('ABORTED', 'Canvas renderer initialization or lifetime was aborted'));
   function release() {
     signal?.removeEventListener('abort', aborted);
+    lifetime.abort(terminal ?? new GpuCanvasError('DISPOSED', 'Canvas renderer is disposed'));
     const owned = renderer; renderer = null;
     try { if (typeof owned?.dispose === 'function') owned.dispose(); } finally {
       try { target?.dispose(); } finally {
@@ -100,7 +105,7 @@ export async function createGpuCanvasRenderer(canvas, createRenderer, options = 
         for (const key of ['colorView', 'depthView', 'resolveTarget'])
           if (Object.hasOwn(packet, key)) fail('FRAME', 'Canvas attachments cannot be overridden');
         live();
-        lastFrameRendered = target.withFrame(attachments => renderer.render(input, {...packet, ...attachments}));
+        lastFrameRendered = target.withFrame((attachments, texture) => renderer.render(input, {...packet, ...attachments}, texture));
         live(); return api;
       });
     },
@@ -159,7 +164,7 @@ export async function createGpuCanvasRenderer(canvas, createRenderer, options = 
     targetOptions.format ??= gpu?.getPreferredCanvasFormat?.() ?? 'bgra8unorm';
     target = createGpuCanvasTarget(device, canvas, targetOptions);
     await wait(target.whenIdle()); live();
-    const construction = Promise.resolve(createRenderer(device, target.rendererOptions)).then(value => {
+    const construction = Promise.resolve(createRenderer(device, target.rendererOptions, Object.freeze({signal: lifetime.signal}))).then(value => {
       if (closed()) { value?.dispose?.(); throw terminal; }
       renderer = value;
       if (!value || ['render', 'dispose', 'whenIdle'].some(key => typeof value[key] !== 'function'))

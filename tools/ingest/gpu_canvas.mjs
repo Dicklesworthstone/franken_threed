@@ -1,6 +1,7 @@
 /** Owned WebGPU canvas attachments for the explicit rendering paths.
  * No frame loop, camera mutation, device ownership, or retained renderer.
- * withFrame() lends views only for synchronous, immediately submitted work.
+ * withFrame() lends views and its second-argument presentation texture only
+ * for synchronous, immediately submitted work.
  * Canvas textures are reacquired on every use, never retained across host turns.
  */
 export class GpuCanvasError extends Error {
@@ -141,8 +142,10 @@ export function createGpuCanvasTarget(device, canvas, options = {}) {
     if (canvas.width !== width || canvas.height !== height)
       fail('SIZE_CHANGED', 'Canvas dimensions changed outside the target; call resize() first');
     if (!width || !height) return false;
+    let presentation;
     const attachments = checked(() => {
       const texture = context.getCurrentTexture();
+      presentation = texture;
       const view = texture.createView({format});
       return Object.freeze({colorView: current.colorView ?? view,
         ...(current.depthView ? {depthView: current.depthView} : {}),
@@ -150,7 +153,7 @@ export function createGpuCanvasTarget(device, canvas, options = {}) {
     });
     // A caller can submit before throwing: never retire this target as unused.
     current.used = true;
-    const result = draw(attachments);
+    const result = draw(attachments, presentation);
     if (result && typeof result.then === 'function') {
       Promise.resolve(result).catch(() => {});
       fail('ASYNC_FRAME', 'Frame views must be consumed and submitted synchronously; returned work is not cancelled');
