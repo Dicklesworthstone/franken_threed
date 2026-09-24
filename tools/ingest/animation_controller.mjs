@@ -16,6 +16,11 @@
  * A late start catches up from its deadline. cancelStart resumes without that
  * catch-up; reset/stop cancel pending starts. Only scheduled starts emit a
  * started event, before that action's loop/finish events, on successful update.
+ * setDuration sets seconds per traversal without moving the playhead. syncWith
+ * copies normalized phase and local speed once, including the ping-pong leg;
+ * it does not copy activation, schedules, fades or masks. Crossfades optionally
+ * align phase (sync) and match normalized playback rates (warp). See
+ * ANIMATION_PLAYBACK_CONTROLS.md for timing and compatibility boundaries.
  *
  * repetitions counts traversals (one ping-pong leg is one traversal), not
  * round trips. seek resets that count and the ping-pong orientation. A finite
@@ -163,6 +168,44 @@ export function createAnimationController(pose) {
     state.warpElapsed = 0;
     state.speed = seconds === 0 ? to : from;
   }
+  function positiveDuration(value, label) {
+    nonnegative(value, label);
+    if (value === 0) fail("ANIMATION_ACTION_DURATION", `${label} must be positive`);
+    return value;
+  }
+  function rescale(value, fromDuration, toDuration) {
+    // Try alternative evaluation orders when an intermediate ratio overflows
+    // or underflows even though the final value is representable.
+    if (value === 0) return value;
+    let result = value * (toDuration / fromDuration);
+    if (!Number.isFinite(result) || result === 0) result = (value / fromDuration) * toDuration;
+    if (!Number.isFinite(result) || result === 0) result = (value * toDuration) / fromDuration;
+    return result;
+  }
+  function scaledRate(speed, fromDuration, toDuration) {
+    const result = rescale(speed, fromDuration, toDuration);
+    if (!Number.isFinite(result) || (result === 0 && speed !== 0))
+      fail("ANIMATION_ACTION_DURATION", "Duration-scaled time scale is not representable");
+    return result;
+  }
+  function phaseTime(target, source) {
+    // Local phase is bounded; clamp only a last-bit overshoot at the endpoint.
+    return Math.min(target.duration, finite(rescale(source.time, source.duration, target.duration), "Synchronized time"));
+  }
+  function synchronizedClock(target, source) {
+    positiveDuration(target.duration, "Target clip duration");
+    positiveDuration(source.duration, "Source clip duration");
+    const orientation = target.loop === "pingpong" ? source.orientation : 1;
+    return {
+      time: phaseTime(target, source),
+      speed: scaledRate(source.speed, source.duration, target.duration) * source.orientation / orientation,
+      orientation,
+      completed: 0,
+      finished: false,
+      warpDuration: 0,
+      warpElapsed: 0,
+    };
+  }
   function createAction(clip, options = {}) {
     if (!Number.isInteger(clip) || clip < 0 || clip >= pose.clips.length)
       fail("ANIMATION_INDEX", "Invalid action clip");
@@ -270,6 +313,22 @@ export function createAnimationController(pose) {
           state.warpElapsed = 0;
         });
       },
+      setDuration(seconds) {
+        return mutate(() => {
+          positiveDuration(seconds, "Playback duration");
+          positiveDuration(duration, "Clip duration");
+          const speed = scaledRate(state.speed < 0 ? -1 : 1, seconds, duration);
+          state.speed = speed;
+          state.warpDuration = 0;
+          state.warpElapsed = 0;
+        });
+      },
+      syncWith(other) {
+        return mutate(() => {
+          const source = get(other).state;
+          if (source !== state) Object.assign(state, synchronizedClock(state, source));
+        });
+      },
       warp(from, to, seconds) {
         return mutate(() => warp(state, from, to, seconds));
       },
@@ -322,6 +381,9 @@ export function createAnimationController(pose) {
           record.disposed = true;
           records.splice(records.indexOf(record), 1);
         });
+      },
+      get duration() {
+        return duration;
       },
       get time() {
         return state.time;
@@ -422,19 +484,19 @@ export function createAnimationController(pose) {
     if (state.loop === "pingpong") state.time += (odd ? -direction : direction) * remainder;
     else state.time = (direction > 0 ? 0 : state.duration) + direction * remainder;
   }
+  function integratedDistance(seconds, from, to) {
+    const high = Math.max(Math.abs(from), Math.abs(to));
+    if (high === 0 || seconds === 0) return 0;
+    const factor = (from / high + to / high) * 0.5,
+      product = seconds * high;
+    return finite(Number.isFinite(product) ? product * factor : (high * factor) * seconds, "Playback advance");
+  }
   function advanceSegment(record, state, seconds, from, to = from) {
     if (!state.playing || state.paused || seconds === 0 || (from === 0 && to === 0)) return;
-    // Callers split at a change of sign. Scale the trapezoid before adding
-    // endpoints; do not overflow their sum or halve subnormal speeds first.
-    const high = Math.max(Math.abs(from), Math.abs(to)),
-      low = Math.min(Math.abs(from), Math.abs(to)),
-      factor = (1 + low / high) * 0.5,
-      product = seconds * high,
-      direction = Math.sign(from || to);
-    const distance = state.duration === 0 ? 1 : nonnegative(
-      Number.isFinite(product) ? product * factor : (high * factor) * seconds,
-      "Playback advance",
-    );
+    const distance = state.duration === 0 ? 1 : Math.abs(integratedDistance(seconds, from, to));
+    advanceDistance(record, state, distance, Math.sign(from || to));
+  }
+  function advanceDistance(record, state, distance, direction) {
     advance(state, distance, direction);
     if (state.loopDelta > 0) {
       const previous = pendingEvents.at(-1);
@@ -459,8 +521,22 @@ export function createAnimationController(pose) {
       const a = Math.abs(from), b = Math.abs(to);
       const fraction = a >= b ? 1 / (1 + b / a) : (a / b) / (1 + a / b);
       const first = seconds * fraction;
-      advanceSegment(record, state, first, from, 0);
-      advanceSegment(record, state, seconds - first, 0, to);
+      if (!state.playing || state.paused || seconds === 0) return;
+      if (state.duration === 0) {
+        advanceDistance(record, state, 1, Math.sign(from));
+        return;
+      }
+      const outward = Math.abs(integratedDistance(first, from, 0));
+      advanceDistance(record, state, outward, Math.sign(from));
+      if (!state.playing) return;
+      // Preserve the signed integral across the turn when that subtraction is
+      // well-conditioned. For a tiny return leg use its own triangle instead:
+      // subtracting two nearly equal outward/net areas can erase it or go negative.
+      const returnFraction = a >= b ? (b / a) / (1 + b / a) : 1 / (1 + a / b);
+      const triangle = Math.abs(integratedDistance(seconds * returnFraction, 0, to));
+      const returning = triangle <= 8 * Number.EPSILON * outward ? triangle :
+        nonnegative(outward - Math.sign(from) * integratedDistance(seconds, from, to), "Returning advance");
+      advanceDistance(record, state, returning, Math.sign(to));
     } else advanceSegment(record, state, seconds, from, to);
   }
   function advanceClock(record, state, delta) {
@@ -537,21 +613,49 @@ export function createAnimationController(pose) {
     events = nextEvents;
     return controller;
   }
-  function crossFade(from, to, seconds) {
+  function crossFade(from, to, seconds, options = {}) {
     const a = get(from).state,
       b = get(to).state;
     nonnegative(seconds, "Crossfade duration");
     if (a === b || !active(a))
       fail("ANIMATION_ACTION_FADE", "Crossfade needs distinct actions and an active source");
-    // A crossfade is an immediate transition, not a second scheduled start.
+    if (!options || typeof options !== "object" || Array.isArray(options) ||
+        Object.keys(options).some((key) => key !== "sync" && key !== "warp"))
+      fail("ANIMATION_ACTION_FADE", "Expected crossfade sync/warp options");
+    const { sync = false, warp: matchRates = false } = options;
+    boolean(sync, "Crossfade sync");
+    boolean(matchRates, "Crossfade warp");
+    if (sync || matchRates) {
+      positiveDuration(a.duration, "Source clip duration");
+      positiveDuration(b.duration, "Target clip duration");
+      if (a.loop !== b.loop)
+        fail("ANIMATION_ACTION_FADE", "Synchronized crossfades require matching loop modes");
+    }
+    if (matchRates && (!a.playing || a.paused))
+      fail("ANIMATION_ACTION_FADE", "Warped crossfades require a running source");
+    // Configure copies so invalid ratios/options cannot half-start a target or
+    // discard an existing schedule, fade or warp on either live action.
+    const nextA = { ...a }, nextB = { ...b };
     const targetActive = active(b);
-    b.startTime = null;
-    if (!targetActive) {
-      start(b);
-      b.weight = 0;
-    } else start(b);
-    fade(a, 0, seconds, true);
-    fade(b, 1, seconds, false);
+    nextB.startTime = null; // A crossfade is immediate, not a scheduled start.
+    start(nextB);
+    if (!targetActive) nextB.weight = 0;
+    if (sync) {
+      nextB.time = phaseTime(b, a);
+      nextB.orientation = a.orientation;
+      nextB.completed = 0;
+      nextB.finished = false;
+    }
+    if (matchRates) {
+      const startRate = scaledRate(a.speed, a.duration, b.duration) * a.orientation / nextB.orientation;
+      const endRate = scaledRate(nextB.speed, b.duration, a.duration) * nextB.orientation / a.orientation;
+      warp(nextA, a.speed, endRate, seconds);
+      warp(nextB, startRate, nextB.speed, seconds);
+    }
+    fade(nextA, 0, seconds, true);
+    fade(nextB, 1, seconds, false);
+    Object.assign(a, nextA);
+    Object.assign(b, nextB);
     return controller;
   }
   const controller = Object.freeze({
@@ -562,8 +666,8 @@ export function createAnimationController(pose) {
     update(delta, options) {
       return exclusive(update, delta, options);
     },
-    crossFade(from, to, seconds) {
-      return exclusive(crossFade, from, to, seconds);
+    crossFade(from, to, seconds, options) {
+      return exclusive(crossFade, from, to, seconds, options);
     },
     get time() {
       return time;
