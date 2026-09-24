@@ -5,7 +5,11 @@
  * createAction(clip, options) makes an independent action, even for the same
  * clip. play/stop/seek/configuration take effect on the next update(delta).
  * delta is finite nonnegative wall time in seconds; a signed action timeScale
- * controls playback direction. pause freezes its playhead, not its fade.
+ * controls playback direction. pause freezes its playhead, not fades or warps.
+ * warp/warpTo integrate a linear speed ramp in wall time, including reversals;
+ * halt ramps to zero while retaining the pose. Warps continue after natural
+ * completion, but never restart a finished action. setTimeScale/stopWarping cancel
+ * the ramp at the current speed. reset/stop cancel ramps without restoring speed.
  * Fades change the action weight; play/stop/reset do not restore that weight.
  *
  * repetitions counts traversals (one ping-pong leg is one traversal), not
@@ -14,12 +18,13 @@
  * Zero-duration actions finish once on their first nonzero playback advance.
  *
  * events is the immutable event list for the last SUCCESSFUL update. Loop
- * records aggregate multiple crossings, in action creation order, followed by
- * that action's finish record. Loop direction is the timeScale sign; finished
+ * records aggregate consecutive same-direction crossings, in action creation
+ * order, followed by that action's finish record. A reversing warp can produce
+ * two loop records. Loop direction is the timeScale sign; finished
  * direction is the final local clip direction. Consume events each update.
  * They are not
  * callbacks and are not an unbounded queue. Failed updates change neither
- * clocks, fades, events nor the published pose. No per-action pose is copied.
+ * clocks, fades, warps, events nor the published pose. No per-action pose is copied.
  *
  * This is not a Three.js AnimationMixer adapter: it controls imported TRS and
  * morph tracks, not arbitrary PropertyBindings or preconverted additive clips.
@@ -114,6 +119,8 @@ export function createAnimationController(pose) {
     state.paused = false;
     state.fadeDuration = 0;
     state.stopAfterFade = false;
+    state.warpDuration = 0;
+    state.warpElapsed = 0;
   }
   function start(state) {
     if (state.finished) resetState(state);
@@ -134,6 +141,17 @@ export function createAnimationController(pose) {
       state.weight = target;
       if (stopWhenDone) stop(state);
     }
+  }
+  function warp(state, from, to, seconds) {
+    // Validate everything before changing the currently published controls.
+    finite(from, "Warp start time scale");
+    finite(to, "Warp end time scale");
+    nonnegative(seconds, "Warp duration");
+    state.warpFrom = from;
+    state.warpTo = to;
+    state.warpDuration = seconds;
+    state.warpElapsed = 0;
+    state.speed = seconds === 0 ? to : from;
   }
   function createAction(clip, options = {}) {
     if (!Number.isInteger(clip) || clip < 0 || clip >= pose.clips.length)
@@ -168,6 +186,10 @@ export function createAnimationController(pose) {
       fadeDuration: 0,
       fadeElapsed: 0,
       stopAfterFade: false,
+      warpFrom: 0,
+      warpTo: 0,
+      warpDuration: 0,
+      warpElapsed: 0,
     };
     resetState(state);
     const layer = {
@@ -223,6 +245,23 @@ export function createAnimationController(pose) {
       setTimeScale(value) {
         return mutate(() => {
           state.speed = finite(value, "Time scale");
+          state.warpDuration = 0;
+          state.warpElapsed = 0;
+        });
+      },
+      warp(from, to, seconds) {
+        return mutate(() => warp(state, from, to, seconds));
+      },
+      warpTo(to, seconds) {
+        return mutate(() => warp(state, state.speed, to, seconds));
+      },
+      halt(seconds) {
+        return mutate(() => warp(state, state.speed, 0, seconds));
+      },
+      stopWarping() {
+        return mutate(() => {
+          state.warpDuration = 0;
+          state.warpElapsed = 0;
         });
       },
       setLoop(value, count = Infinity) {
@@ -272,6 +311,12 @@ export function createAnimationController(pose) {
       get timeScale() {
         return state.speed;
       },
+      get warping() {
+        return state.warpDuration > 0;
+      },
+      get effectiveTimeScale() {
+        return state.playing && !state.paused ? state.speed : 0;
+      },
       get playing() {
         return state.playing;
       },
@@ -302,12 +347,12 @@ export function createAnimationController(pose) {
     records.push(record);
     return action;
   }
-  function advance(state, delta) {
+  function advance(state, distance, clockDirection) {
     state.loopDelta = 0;
     state.endEvent = false;
     state.eventDirection = 1;
-    if (!state.playing || state.paused || delta === 0 || state.speed === 0) return;
-    const direction = Math.sign(state.speed) * state.orientation;
+    if (!state.playing || state.paused || distance === 0 || clockDirection === 0) return;
+    const direction = clockDirection * state.orientation;
     state.eventDirection = direction;
     const finish = () => {
       state.playing = false;
@@ -319,8 +364,6 @@ export function createAnimationController(pose) {
       finish();
       return;
     }
-    const distance = nonnegative(delta * Math.abs(state.speed), "Playback advance");
-    if (distance === 0) return;
     const first = direction > 0 ? state.duration - state.time : state.time;
     if (distance < first) {
       state.time += direction * distance;
@@ -352,6 +395,65 @@ export function createAnimationController(pose) {
     if (state.loop === "pingpong") state.time += (odd ? -direction : direction) * remainder;
     else state.time = (direction > 0 ? 0 : state.duration) + direction * remainder;
   }
+  function advanceSegment(record, state, seconds, from, to = from) {
+    if (!state.playing || state.paused || seconds === 0 || (from === 0 && to === 0)) return;
+    // Callers split at a change of sign. Scale the trapezoid before adding
+    // endpoints; do not overflow their sum or halve subnormal speeds first.
+    const high = Math.max(Math.abs(from), Math.abs(to)),
+      low = Math.min(Math.abs(from), Math.abs(to)),
+      factor = (1 + low / high) * 0.5,
+      product = seconds * high,
+      direction = Math.sign(from || to);
+    const distance = state.duration === 0 ? 1 : nonnegative(
+      Number.isFinite(product) ? product * factor : (high * factor) * seconds,
+      "Playback advance",
+    );
+    advance(state, distance, direction);
+    if (state.loopDelta > 0) {
+      const previous = pendingEvents.at(-1);
+      const merge = previous?.type === "loop" && previous.action === record.action && previous.direction === direction;
+      const event = Object.freeze({
+        type: "loop",
+        action: record.action,
+        count: state.loopDelta + (merge ? previous.count : 0),
+        direction,
+      });
+      if (merge) pendingEvents[pendingEvents.length - 1] = event;
+      else pendingEvents.push(event);
+    }
+    if (state.endEvent)
+      pendingEvents.push(Object.freeze({ type: "finished", action: record.action, direction: state.eventDirection }));
+  }
+  function advanceRamp(record, state, seconds, from, to) {
+    if (from !== 0 && to !== 0 && Math.sign(from) !== Math.sign(to)) {
+      // Do not integrate a reversing ramp into one signed displacement: loops
+      // or a finite-action finish before the turning point would disappear.
+      // Ratio form also avoids overflow when |from| + |to| is not finite.
+      const a = Math.abs(from), b = Math.abs(to);
+      const fraction = a >= b ? 1 / (1 + b / a) : (a / b) / (1 + a / b);
+      const first = seconds * fraction;
+      advanceSegment(record, state, first, from, 0);
+      advanceSegment(record, state, seconds - first, 0, to);
+    } else advanceSegment(record, state, seconds, from, to);
+  }
+  function advanceClock(record, state, delta) {
+    if (state.warpDuration === 0) {
+      advanceSegment(record, state, delta, state.speed);
+      return;
+    }
+    const step = Math.min(delta, state.warpDuration - state.warpElapsed),
+      elapsed = state.warpElapsed + step,
+      finished = elapsed >= state.warpDuration,
+      fraction = elapsed / state.warpDuration,
+      speed = finished ? state.warpTo : (1 - fraction) * state.warpFrom + fraction * state.warpTo;
+    advanceRamp(record, state, step, state.speed, speed);
+    state.speed = speed;
+    state.warpElapsed = elapsed;
+    if (finished) {
+      state.warpDuration = 0;
+      advanceSegment(record, state, delta - step, speed);
+    }
+  }
   function update(delta, options) {
     nonnegative(delta, "Update delta");
     const nextTime = finite(time + delta, "Controller time");
@@ -378,30 +480,17 @@ export function createAnimationController(pose) {
             next.fadeDuration = 0;
           }
         }
-        advance(next, clockDelta);
+        advanceClock(record, next, clockDelta);
         if (fadeFinished && state.stopAfterFade) stop(next);
-        if (next.loopDelta > 0)
-          pendingEvents.push(
-            Object.freeze({
-              type: "loop",
-              action: record.action,
-              count: next.loopDelta,
-              direction: Math.sign(state.speed),
-            }),
-          );
-        if (next.endEvent)
-          pendingEvents.push(
-            Object.freeze({
-              type: "finished",
-              action: record.action,
-              direction: next.eventDirection,
-            }),
-          );
         if (active(next) && next.weight > 0) {
           record.layer.time = next.time;
           record.layer.weight = next.weight;
           layers.push(record.layer);
         }
+      } else if (state.finished && state.warpDuration > 0) {
+        // Finish is not stop(): a wall-time ramp still reaches its target even
+        // when an unclamped action completes between two host updates.
+        advanceClock(record, next, delta);
       }
     }
     const nextEvents = pendingEvents.length ? Object.freeze(pendingEvents.slice()) : EMPTY;
