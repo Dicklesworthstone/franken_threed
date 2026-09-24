@@ -114,6 +114,8 @@ function decodeDataUri(uri) {
  * threeScene:true with webgpu:true packages the explicit source-owned rigid
  * Three.js scene bridge. The caller lends its pinned Three module and live
  * Scene; no upstream component is copied or initialized by this option.
+ * The same option exports createGpuThreeCanvas for owned canvas presentation;
+ * device/canvas initialization still happens only when its factory is called.
  * import { createPlayer } from './animation.mjs'; const p=createPlayer();
  * p.sample(time, {clip:0, loop:true}); // p.worldMatrices / p.jointMatrices / p.morphWeights
  * All decoded tracks are embedded; importing the package makes no fetches and
@@ -308,8 +310,14 @@ export {fitAnimationShadowView,animationShadowWorldBounds} from './animation_sha
   if (threeScene) {
     outputs.set("three_scene.mjs", fs.readFileSync(new URL("./three_scene.mjs", import.meta.url), "utf8"));
     outputs.set("three_textures.mjs", fs.readFileSync(new URL("./three_textures.mjs", import.meta.url), "utf8"));
+    for (const name of ["gpu_canvas.mjs", "gpu_canvas_renderer.mjs", "three_canvas.mjs"]) {
+      outputs.set(name, fs.readFileSync(new URL("./" + name, import.meta.url), "utf8"));
+    }
     outputs.set("gpu_playback.mjs", outputs.get("gpu_playback.mjs") +
-      "export {createGpuThreeScene,ThreeSceneError} from './three_scene.mjs';\nexport {createGpuThreeTextures} from './three_textures.mjs';\n");
+      "export {createGpuThreeScene,ThreeSceneError} from './three_scene.mjs';\nexport {createGpuThreeTextures} from './three_textures.mjs';\n" +
+      "export {createGpuThreeCanvas} from './three_canvas.mjs';\n" +
+      "export {createGpuCanvasTarget,GpuCanvasError} from './gpu_canvas.mjs';\n" +
+      "export {createGpuCanvasRenderer} from './gpu_canvas_renderer.mjs';\n");
   }
   if (rigidGeometry) {
     outputs.set(

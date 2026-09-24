@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>FrankenThreeD native canvas rendering</title>
+<style>
+  body { font: 16px system-ui; margin: 2rem; }
+  canvas { border: 1px solid #aaa; margin: 1rem; image-rendering: pixelated; }
+  pre { white-space: pre-wrap; }
+</style>
+<h1>Native source-scene canvas rendering</h1>
+<p>Serve the repository root over localhost or HTTPS after building the pinned
+Three.js oracle. This exercises actual source objects and native WebGPU, not a
+host recorder. Missing WebGPU is blocked, never a pass. Pixel capture is for
+correctness only, not a throughput benchmark.</p>
+<pre id="status">Running…</pre>
+<div id="canvases"></div>
+<script type="module">
+const status = document.querySelector('#status'), log = [];
+const assert = (condition, message) => { if (!condition) throw new Error(message); };
+function pixels(canvas, x, y) {
+  // Capture synchronously in the submitting host turn: a canvas texture is not
+  // preserved across presentation just because queue completion was awaited.
+  const copy = document.createElement('canvas');
+  copy.width = canvas.width; copy.height = canvas.height;
+  const ctx = copy.getContext('2d', {willReadFrequently: true});
+  ctx.drawImage(canvas, 0, 0);
+  return [...ctx.getImageData(x, y, 1, 1).data];
+}
+function expect(canvas, rgb, message) {
+  const value = pixels(canvas, Math.floor(canvas.width / 2), Math.floor(canvas.height / 2));
+  assert(rgb.every((n, i) => Math.abs(n - value[i]) <= 3) && value[3] === 255,
+    `${message}: expected ${rgb}, got ${value}`);
+  log.push({case: message, pixel: value});
+}
+async function run() {
+  if (!navigator.gpu) return {status: 'blocked', reason: 'WebGPU unavailable'};
+  const [THREE, {createGpuThreeCanvas}] = await Promise.all([
+    import('../../../upstream/three.js/build/three.core.js'),
+    import('../../../tools/ingest/three_canvas.mjs'),
+  ]);
+  assert(THREE.REVISION === '186', 'Pinned Three.js r186 is required');
+  for (const sampleCount of [1, 4]) {
+    const canvas = document.createElement('canvas'); canvas.width = canvas.height = 64;
+    document.querySelector('#canvases').append(canvas);
+    const scene = new THREE.Scene(); scene.background = new THREE.Color(0, 0, 0);
+    const material = new THREE.MeshBasicMaterial();
+    material.color.setRGB(0.25, 0.25, 0.25, THREE.LinearSRGBColorSpace);
+    const geometry = new THREE.PlaneGeometry(1, 1), mesh = new THREE.Mesh(geometry, material);
+    scene.add(mesh);
+    const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 10); camera.position.z = 2;
+    let renderer;
+    try {
+      renderer = await createGpuThreeCanvas(canvas, scene, {three: THREE,
+        target: {sampleCount}, scene: {maxBindings: 4, renderer: {maxDraws: 16, renderBundles: true}}});
+      renderer.render(camera);
+      expect(canvas, [137, 137, 137], `${sampleCount}x linear 0.25 gets one sRGB transfer`);
+      await renderer.whenIdle();
+      // Mutable source uniforms, native resized attachments and bundled draws.
+      material.color.setRGB(1, 0, 0, THREE.LinearSRGBColorSpace);
+      renderer.resize(96, 80); renderer.render(camera);
+      expect(canvas, [255, 0, 0], `${sampleCount}x resized red material`);
+      await renderer.whenIdle();
+      renderer.resize(0, 80); renderer.render(camera);
+      assert(renderer.suspended && !renderer.lastFrameRendered, 'Zero width must suspend submission');
+      renderer.setSize(48, 40, 2); renderer.render(camera);
+      expect(canvas, [255, 0, 0], `${sampleCount}x resumed pixel-ratio sizing`);
+      await renderer.whenIdle();
+      material.side = THREE.BackSide; await renderer.prepare(); renderer.render(camera);
+      expect(canvas, [0, 0, 0], `${sampleCount}x re-prepared back-face culling`);
+      await renderer.whenIdle();
+      material.side = THREE.FrontSide; await renderer.prepare(); renderer.render(camera);
+      expect(canvas, [255, 0, 0], `${sampleCount}x front-face re-preparation`);
+      await renderer.whenIdle();
+      assert(renderer.diagnostics.canvas.retiredTargets === 0, 'Idle must retire resized targets');
+      log.push({case: `${sampleCount}x diagnostics`, value: renderer.diagnostics});
+    } finally {
+      renderer?.dispose(); geometry.dispose(); material.dispose();
+    }
+    assert(renderer.disposed, 'Canvas renderer disposal must be observable');
+    // Prove disposal releases this canvas for a fresh device/renderer owner.
+    const replacement = await createGpuThreeCanvas(canvas, new THREE.Scene(), {three: THREE,
+      scene: {maxBindings: 4, renderer: {maxDraws: 16}}});
+    try { replacement.render(camera); await replacement.whenIdle(); }
+    finally { replacement.dispose(); }
+  }
+  return {status: 'passed', log, accelerationClaim: false};
+}
+try {
+  window.__f3dCanvasResult = await run();
+} catch (error) {
+  window.__f3dCanvasResult = {status: error.code === 'GPU_CANVAS_ADAPTER' ? 'blocked' : 'failed',
+    error: String(error.stack ?? error), log};
+}
+status.textContent = JSON.stringify(window.__f3dCanvasResult, null, 2);
+</script>
+</html>

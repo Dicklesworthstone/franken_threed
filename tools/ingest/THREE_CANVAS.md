@@ -104,6 +104,23 @@ delivery during a frame releases ownership after that submission boundary exits.
 A new renderer must be created explicitly after terminal loss; no automatic
 backend migration or replay is performed.
 
+## Deployment
+
+Direct users import `three_canvas.mjs`. The existing `buildAnimation` option
+`{webgpu:true, threeScene:true}` now includes all three canvas modules and exports
+`createGpuThreeCanvas`, `createGpuCanvasTarget`, `createGpuCanvasRenderer` and
+`GpuCanvasError` from `gpu_playback.mjs`. The existing CLI flags are
+`--animation-webgpu --animation-three-scene`. CPU-only and ordinary GPU builds
+do not acquire these optional modules. Importing a generated entry requests no
+device and configures no canvas.
+
+`tests/e2e/three_canvas/index.html` exercises actual source objects, sRGB pixels,
+single/four-sample rendering, resize/suspension/resumption, structural preparation
+and owner replacement. Serve the repository root over localhost or HTTPS with
+the pinned Three.js build present. Its result is exposed as
+`window.__f3dCanvasResult`. Missing WebGPU is blocked, not passed. The synchronous
+pixel captures belong only to this correctness probe, not a production frame loop.
+
 ## Lower-level composition
 
 `createGpuCanvasTarget(device, canvas, options)` from `gpu_canvas.mjs` owns only
