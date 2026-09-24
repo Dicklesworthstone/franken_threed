@@ -11,6 +11,11 @@
  * completion, but never restart a finished action. setTimeScale/stopWarping cancel
  * the ramp at the current speed. reset/stop cancel ramps without restoring speed.
  * Fades change the action weight; play/stop/reset do not restore that weight.
+ * startAt(controllerTime).play() arms an absolute start. Before that time the
+ * action contributes nothing and its playhead, fade and warp remain frozen.
+ * A late start catches up from its deadline. cancelStart resumes without that
+ * catch-up; reset/stop cancel pending starts. Only scheduled starts emit a
+ * started event, before that action's loop/finish events, on successful update.
  *
  * repetitions counts traversals (one ping-pong leg is one traversal), not
  * round trips. seek resets that count and the ping-pong orientation. A finite
@@ -110,7 +115,7 @@ export function createAnimationController(pose) {
     }
     return copied;
   }
-  const active = (state) => state.playing || (state.finished && state.clamp);
+  const active = (state) => state.startTime === null && (state.playing || (state.finished && state.clamp));
   function resetState(state) {
     state.time = state.speed < 0 ? state.duration : 0;
     state.completed = 0;
@@ -121,9 +126,14 @@ export function createAnimationController(pose) {
     state.stopAfterFade = false;
     state.warpDuration = 0;
     state.warpElapsed = 0;
+    state.startTime = null;
   }
   function start(state) {
-    if (state.finished) resetState(state);
+    if (state.finished) {
+      const scheduled = state.startTime;
+      resetState(state);
+      state.startTime = scheduled;
+    }
     state.playing = true;
     state.paused = false;
   }
@@ -190,6 +200,7 @@ export function createAnimationController(pose) {
       warpTo: 0,
       warpDuration: 0,
       warpElapsed: 0,
+      startTime: null,
     };
     resetState(state);
     const layer = {
@@ -214,6 +225,16 @@ export function createAnimationController(pose) {
       },
       stop() {
         return mutate(() => stop(state));
+      },
+      startAt(when) {
+        return mutate(() => {
+          state.startTime = nonnegative(when, "Scheduled start time");
+        });
+      },
+      cancelStart() {
+        return mutate(() => {
+          state.startTime = null;
+        });
       },
       pause() {
         return mutate(() => {
@@ -315,7 +336,13 @@ export function createAnimationController(pose) {
         return state.warpDuration > 0;
       },
       get effectiveTimeScale() {
-        return state.playing && !state.paused ? state.speed : 0;
+        return state.playing && !state.paused && state.startTime === null ? state.speed : 0;
+      },
+      get scheduled() {
+        return state.startTime !== null;
+      },
+      get startTime() {
+        return state.startTime;
       },
       get playing() {
         return state.playing;
@@ -465,13 +492,22 @@ export function createAnimationController(pose) {
       Object.assign(next, state);
       next.loopDelta = 0;
       next.endEvent = false;
-      if (active(state)) {
-        let clockDelta = delta,
+      let actionDelta = delta;
+      if (next.startTime !== null) {
+        // Merely assigning a deadline does not activate an action. A paused
+        // but playing action does start; pause still freezes only its playhead.
+        if (!next.playing || nextTime < next.startTime) continue;
+        actionDelta = nextTime - next.startTime;
+        pendingEvents.push(Object.freeze({ type: "started", action: record.action, time: next.startTime }));
+        next.startTime = null;
+      }
+      if (active(next)) {
+        let clockDelta = actionDelta,
           fadeFinished = false;
         if (state.fadeDuration > 0) {
           const left = state.fadeDuration - state.fadeElapsed;
-          if (state.stopAfterFade) clockDelta = Math.min(delta, left);
-          next.fadeElapsed = state.fadeElapsed + Math.min(delta, left);
+          if (state.stopAfterFade) clockDelta = Math.min(actionDelta, left);
+          next.fadeElapsed = state.fadeElapsed + Math.min(actionDelta, left);
           const fraction = next.fadeElapsed / state.fadeDuration;
           next.weight = (1 - fraction) * state.fadeFrom + fraction * state.fadeTo;
           fadeFinished = next.fadeElapsed >= state.fadeDuration;
@@ -490,7 +526,7 @@ export function createAnimationController(pose) {
       } else if (state.finished && state.warpDuration > 0) {
         // Finish is not stop(): a wall-time ramp still reaches its target even
         // when an unclamped action completes between two host updates.
-        advanceClock(record, next, delta);
+        advanceClock(record, next, actionDelta);
       }
     }
     const nextEvents = pendingEvents.length ? Object.freeze(pendingEvents.slice()) : EMPTY;
@@ -507,7 +543,10 @@ export function createAnimationController(pose) {
     nonnegative(seconds, "Crossfade duration");
     if (a === b || !active(a))
       fail("ANIMATION_ACTION_FADE", "Crossfade needs distinct actions and an active source");
-    if (!active(b)) {
+    // A crossfade is an immediate transition, not a second scheduled start.
+    const targetActive = active(b);
+    b.startTime = null;
+    if (!targetActive) {
       start(b);
       b.weight = 0;
     } else start(b);
