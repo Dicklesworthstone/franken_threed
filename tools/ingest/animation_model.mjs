@@ -8,6 +8,8 @@
  * environment lighting; direct light, emission and alpha remain unaffected.
  * KHR_materials_emissive_strength is folded into the linear HDR emissiveFactor.
  * KHR_materials_clearcoat retains its factors and three independent linear maps.
+ * KHR_materials_variants selects authored/default or named/indexed materials
+ * before geometry/texture preparation, without mutating the source document.
  *
  * resolveTexture({textureIndex,imageIndex,image,sampler,colorSpace}) synchronously
  * lends {view,sampler}. It must honor the source image/sampler and 'srgb'/'linear'
@@ -27,6 +29,9 @@ import { decodeGltfAnimation } from "./animation_gltf.mjs";
 import { createAnimationModelExporter } from "./animation_model_export.mjs";
 import { AnimationPoseError, createAnimationPlayer } from "./animation_runtime.mjs";
 import { expandGltfInstances } from "./gltf_instancing.mjs";
+import { GLTF_MATERIAL_VARIANTS, selectGltfMaterialVariant } from "./gltf_material_variants.mjs";
+
+export { GltfMaterialVariantError, selectGltfMaterialVariant } from "./gltf_material_variants.mjs";
 
 export { AnimationExportError, createAnimationModelExporter } from "./animation_model_export.mjs";
 
@@ -406,6 +411,11 @@ export function decodeGltfAnimationModel(
  * basisu:true selects KHR_texture_basisu sources for a preloaded KTX2 resolver.
  * The default selects authored core fallbacks for optional BasisU textures;
  * required BasisU needs explicit support. Selection does not transcode or fetch.
+ * materialVariant:null (default) uses authored materials; an integer or unique
+ * exact name selects KHR_materials_variants before any buffer/resolver effects.
+ * materialVariantLimits bounds the separate metadata preflight. Returned
+ * materialVariants/materialVariant describe the frozen construction choice;
+ * this does not rebind materials on an already-constructed GPU scene.
  */
 export function prepareGltfAnimationModel(
   model,
@@ -416,9 +426,26 @@ export function prepareGltfAnimationModel(
     maxPrimitives = 4096,
     basisu = false,
     maxInstances = 4096,
+    materialVariant = null,
+    materialVariantLimits,
   } = {},
 ) {
   if (typeof basisu !== "boolean") fail("TEXTURE", "basisu must be a boolean");
+  // Preserve the unextended path's existing scope/budgets: do not scan every
+  // mesh in a plain asset merely to discover that no variant was requested.
+  const hasVariants = Object.hasOwn(model?.extensions ?? {}, GLTF_MATERIAL_VARIANTS) ||
+    [model?.extensionsUsed, model?.extensionsRequired].some(
+      list => Array.isArray(list) && list.includes(GLTF_MATERIAL_VARIANTS),
+    );
+  let variantMetadata = {};
+  if (hasVariants || materialVariant !== null || materialVariantLimits !== undefined) {
+    const selected = selectGltfMaterialVariant(model, materialVariant, materialVariantLimits);
+    model = selected.json;
+    if (selected.variants.length) variantMetadata = {
+      materialVariants: selected.variants,
+      materialVariant: selected.variant,
+    };
+  }
   if (!Array.isArray(model?.extensionsRequired ?? []))
     fail("SHAPE", "extensionsRequired must be an array");
   for (const name of model?.extensionsRequired ?? [])
@@ -471,6 +498,7 @@ export function prepareGltfAnimationModel(
   return Object.freeze({
     sceneView,
     ...instanceMetadata,
+    ...variantMetadata,
     textureRequests: Object.freeze([...unique.values()]),
     resolveTextures(resolveTexture = null) {
       if (consumed) fail("PREPARED", "Prepared model has already been resolved");
@@ -481,7 +509,7 @@ export function prepareGltfAnimationModel(
       try {
         const result = resolveModelTextures(definition, geometry, plans, resolveTexture, sceneView);
         consumed = true;
-        return { ...result, copyright, ...instanceMetadata };
+        return { ...result, copyright, ...instanceMetadata, ...variantMetadata };
       } finally {
         busy = false;
       }
@@ -621,6 +649,10 @@ export function createCpuGltfAnimationModel(model, suppliedBuffers, options = {}
     source: Object.freeze(decoded.source),
     diagnostics: Object.freeze(decoded.diagnostics),
     ...(decoded.instanceOrigins ? { instanceOrigins: decoded.instanceOrigins } : {}),
+    ...(decoded.materialVariants ? {
+      materialVariants: decoded.materialVariants,
+      materialVariant: decoded.materialVariant,
+    } : {}),
     sample(time, settings) {
       return exclusive(() => {
         pose.sample(time, settings);

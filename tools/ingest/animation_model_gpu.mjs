@@ -133,6 +133,10 @@ export async function createGpuDecodedAnimationScene(
     source: Object.freeze(prepared.source),
     diagnostics: Object.freeze(prepared.diagnostics),
     ...(prepared.instanceOrigins ? { instanceOrigins: prepared.instanceOrigins } : {}),
+    ...(prepared.materialVariants ? {
+      materialVariants: prepared.materialVariants,
+      materialVariant: prepared.materialVariant,
+    } : {}),
     get poseVersion() {
       return scene.poseVersion;
     },

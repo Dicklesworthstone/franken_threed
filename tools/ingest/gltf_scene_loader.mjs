@@ -113,6 +113,12 @@ export async function loadGpuGltfAnimationScene(
   const decodeOptions = { ...decode },
     textureOptions = { ...textures, signal },
     assetOptions = { ...assets, signal };
+  if (decodeOptions.materialVariantLimits !== undefined) {
+    const limits = decodeOptions.materialVariantLimits;
+    if (!limits || typeof limits !== "object" || Array.isArray(limits))
+      throw new GltfAssetError("GLTF_MODEL_LOAD_OPTIONS", "Expected materialVariantLimits object");
+    decodeOptions.materialVariantLimits = { ...limits };
+  }
   const sceneOptions = { ...scene, renderer: { ...scene.renderer } };
   if (output !== null && (!output || typeof output !== "object" || Array.isArray(output)))
     throw new GltfAssetError(
@@ -273,6 +279,10 @@ export async function loadGpuGltfAnimationScene(
     diagnostics: model.diagnostics,
     assetBytes: asset.bytesLoaded,
     ...(model.instanceOrigins ? { instanceOrigins: model.instanceOrigins } : {}),
+    ...(model.materialVariants ? {
+      materialVariants: model.materialVariants,
+      materialVariant: model.materialVariant,
+    } : {}),
     get poseVersion() {
       return model.poseVersion;
     },
