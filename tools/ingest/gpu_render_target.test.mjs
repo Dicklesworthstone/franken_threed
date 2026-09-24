@@ -164,6 +164,7 @@ test('borrowed frame/texture operations reject reentry and asynchronous escape',
     for (const op of [() => t.dispose(), () => t.resize(8, 8), () => t.withTexture(() => {})])
       assert.throws(() => t[borrow](op), {code: 'GPU_TARGET_REENTRANT'});
     assert.throws(() => t[borrow](() => Promise.resolve()), {code: 'GPU_TARGET_ASYNC_USE'});
+    assert.throws(() => t[borrow](() => Promise.reject(Error('invalid async callback'))), {code: 'GPU_TARGET_ASYNC_USE'});
     assert.throws(() => t[borrow](null), {code: 'GPU_TARGET_CALLBACK'});
   }
   await t.whenIdle(); t.dispose();

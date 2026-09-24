@@ -5,13 +5,15 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import fs from 'node:fs/promises';
+import {gpuPostprocessFixture} from './fixtures/animation/gpu_postprocess_fixture.mjs';
 const key = '__f3d_three_canvas_factory_test__';
 const stub = 'data:text/javascript,' + encodeURIComponent(`export function createGpuThreeScene(...args) { return globalThis.${key}(...args); }`);
 const source = (await fs.readFile(new URL('./three_canvas.mjs', import.meta.url), 'utf8'))
   .replace("'./three_scene.mjs'", JSON.stringify(stub))
+  .replace("'./gpu_hdr_canvas.mjs'", JSON.stringify(new URL('./gpu_hdr_canvas.mjs', import.meta.url).href))
   .replace("'./gpu_canvas_renderer.mjs'", JSON.stringify(new URL('./gpu_canvas_renderer.mjs', import.meta.url).href))
   .replace("'./gpu_canvas.mjs'", JSON.stringify(new URL('./gpu_canvas.mjs', import.meta.url).href));
-const {createGpuThreeCanvas} = await import('data:text/javascript,' + encodeURIComponent(source));
+const {createGpuThreeCanvas, createGpuThreeHdrCanvas} = await import('data:text/javascript,' + encodeURIComponent(source));
 function fixture() {
   const calls = [], resource = {render(...args) { calls.push(['render', ...args]); },
     prepare() { calls.push(['prepare']); }, whenIdle() {}, dispose() { calls.push(['dispose']); }};
@@ -70,4 +72,42 @@ test('malformed source settings and duplicate module owners fail before native o
     assert.throws(() => createGpuThreeCanvas(f.canvas, f.scene, {three: f.three, device: f.device, scene}), {code: 'GPU_CANVAS_OPTIONS'});
     assert.equal(f.calls.length, 0);
   }
+});
+
+function hdrFixture() {
+  const f = gpuPostprocessFixture(), calls = [], scene = {}, three = {REVISION: '186'};
+  const canvas = {width: 16, height: 8, getContext() { return {
+    configure() {}, unconfigure() { calls.push(['unconfigure']); },
+    getCurrentTexture() { return f.texture(canvas.width, canvas.height, 'bgra8unorm', 16); },
+  }; }};
+  const resource = {render(...args) { calls.push(['render', ...args]); },
+    whenIdle() {}, prepare() { calls.push(['prepare']); }, dispose() { calls.push(['dispose']); }};
+  globalThis[key] = (d, s, o) => { calls.push(['factory', d, s, o]); return resource; };
+  return {...f, calls, nativeCalls: f.calls, canvas, scene, three};
+}
+
+test('source HDR factory preserves scene identities and sends linear HDR/MSAA settings to the existing bridge', async () => {
+  const f = hdrFixture(), textures = new Map();
+  const r = await createGpuThreeHdrCanvas(f.canvas, f.scene, {device: f.device, three: f.three,
+    renderTarget: {sampleCount: 4}, scene: {textures, renderer: {instancing: true}}, output: {toneMapping: 'reinhard'}});
+  const args = f.calls.find(c => c[0] === 'factory');
+  assert.equal(args[1], f.device); assert.equal(args[2], f.scene); assert.equal(args[3].three, f.three);
+  assert.equal(args[3].textures, textures);
+  assert.deepEqual(args[3].renderer, {instancing: true, format: 'rgba16float', depthFormat: 'depth24plus', sampleCount: 4});
+  const camera = {}; r.render(camera, {output: {exposure: 2}});
+  const frame = f.calls.find(c => c[0] === 'render');
+  assert.equal(frame[1], camera); assert.equal(frame[2].output, undefined);
+  assert.equal(frame[2].colorView.texture.format, 'rgba16float');
+  assert.equal(f.nativeCalls.submissions.length, 1); // Recorded scene, actual output submission.
+  await r.prepare(); r.dispose();
+  assert.equal(f.calls.filter(c => c[0] === 'dispose').length, 1);
+});
+
+test('HDR source renderer format conflicts fail without silently switching to LDR', async () => {
+  const f = hdrFixture();
+  await assert.rejects(createGpuThreeHdrCanvas(f.canvas, f.scene, {device: f.device, three: f.three,
+    scene: {renderer: {format: 'bgra8unorm-srgb'}}}), {code: 'GPU_CANVAS_FORMAT'});
+  assert.equal(f.calls.filter(c => c[0] === 'factory').length, 0);
+  assert.ok(f.nativeCalls.textures.every(t => t.destroyed === 1));
+  assert.ok(f.nativeCalls.buffers.every(t => t.destroyed === 1));
 });

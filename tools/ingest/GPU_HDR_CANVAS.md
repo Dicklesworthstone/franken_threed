@@ -108,3 +108,34 @@ The host tests execute the actual target/session/composition/output modules with
 the existing native-call recorder. The source renderer in those tests is explicit
 and recorded, not an executed Three.js renderer. Native shader pixels and browser
 behavior require a separate WebGPU run; no acceleration is claimed.
+
+## Source scenes and deployment
+
+```js
+import {createGpuThreeHdrCanvas} from './three_canvas.mjs';
+const renderer = await createGpuThreeHdrCanvas(canvas, sourceScene, {
+  three: THREE,
+  renderTarget: {sampleCount: 4},
+  output: {toneMapping: 'aces-filmic', exposure: 1},
+  scene: {renderer: {instancing: true, renderBundles: true}},
+});
+renderer.render(sourceCamera);
+```
+
+This uses the existing live-source bridge, with its unchanged rigid-mesh,
+material, texture and callback admission rules. Source scenes and cameras stay
+caller-owned. The whole-image profile above is an explicit postprocessing choice,
+not a claim of honoring source per-material toneMapped flags. The original
+`createGpuThreeCanvas` still selects direct output with no tone-mapping pass.
+
+The existing `{webgpu:true, threeScene:true}` build mode packages both factories,
+`createGpuHdrCanvasRenderer`, `createGpuRenderTarget` and their error classes.
+No new CLI flag is required. CPU-only and ordinary GPU packages do not acquire
+these modules. The existing `hdr:true` build flag retains its separate meaning:
+packaging the RGBE environment loader, not selecting this output path.
+
+`tests/e2e/three_hdr_canvas/index.html` checks native half-float readback above one,
+MSAA resolve, emissive Three.js scene pixels, per-frame exposure, one display
+transfer, resizing and suspension. Serve the repository root with the pinned
+Three.js build. The result is `window.__f3dHdrCanvasResult`; missing GPU/adapter is
+blocked. This probe is not run by the host tests and is not a performance test.

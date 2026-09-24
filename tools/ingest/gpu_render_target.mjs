@@ -140,8 +140,10 @@ export function createGpuRenderTarget(device, options = {}) {
     try {
       current.used = true; // Even a throwing callback may have submitted work.
       const result = render ? callback(current.frame, current.color) : callback(current.color);
-      if (result && typeof result.then === 'function')
+      if (result && typeof result.then === 'function') {
+        Promise.resolve(result).catch(() => {});
         fail('ASYNC_USE', 'Submit all work before returning; borrowed textures cannot cross an await');
+      }
       live();
       return true;
     } finally { busy = false; if (disposed || terminal !== null) release(); }
