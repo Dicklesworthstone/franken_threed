@@ -114,6 +114,9 @@ function decodeDataUri(uri) {
  * threeScene:true with webgpu:true packages the explicit source-owned rigid/skin/morph
  * Three.js scene bridge. The caller lends its pinned Three module and live
  * Scene; no upstream component is copied or initialized by this option.
+ * Source packages include the lazy projected-shadow owner: select shadow:{}
+ * when creating the scene to use authored directional/spot cameras and flags.
+ * CPU-only and ordinary GPU packages do not gain source-shadow dependencies.
  * The same option exports createGpuThreeCanvas and createGpuThreeHdrCanvas
  * for direct or whole-image tone-mapped canvas presentation;
  * device/canvas initialization still happens only when its factory is called.
@@ -313,7 +316,7 @@ export {fitAnimationShadowView,animationShadowWorldBounds} from './animation_sha
     outputs.set("three_textures.mjs", fs.readFileSync(new URL("./three_textures.mjs", import.meta.url), "utf8"));
     for (const name of ["gpu_canvas.mjs", "gpu_canvas_renderer.mjs", "three_canvas.mjs",
       "gpu_hdr_canvas.mjs", "gpu_render_target.mjs", "animation_output.mjs",
-      "three_deformation.mjs", "three_deformation_binding.mjs"]) {
+      "three_deformation.mjs", "three_deformation_binding.mjs", "three_shadows.mjs"]) {
       outputs.set(name, fs.readFileSync(new URL("./" + name, import.meta.url), "utf8"));
     }
     outputs.set("gpu_playback.mjs", outputs.get("gpu_playback.mjs") +
