@@ -8,6 +8,9 @@
  * definitions are copied once; edits to published output arrays are not inputs.
  * edit() publishes transactional local-pose changes; sample/blend/reset replace
  * those changes on the next call. snapshotLocalPose() returns independent data.
+ * addClips() appends copied decoded clips without changing the current pose or
+ * existing clip indices. clips is a frozen metadata snapshot; clipVersion tracks
+ * successful nonempty installations independently of the pose's version.
  *
  * Conventions: glTF 2.0 section 3.11 / Appendix C; column-major T*R*S;
  * mesh-local palette = inverse(meshWorld) * jointWorld * inverseBindMatrix.
@@ -361,63 +364,83 @@ export function createAnimationPlayer(definition) {
     if (paletteSize > 16777216) fail("ANIMATION_LIMIT", "Joint palette exceeds component budget");
     return Object.freeze(result);
   });
-  let components = 0;
-  const clips = rawClips.map((clip, clipIndex) => {
-    if (!clip || !Array.isArray(clip.channels) || clip.channels.length > 262144)
-      fail("ANIMATION_CHANNEL", "Invalid channel list");
-    const used = new Set();
-    let duration = 0;
-    const channels = clip.channels.map((channel) => {
-      const node = integer(channel?.node, n, "Animation target"),
-        path = channel.path;
-      if (!["translation", "rotation", "scale", "weights"].includes(path))
-        fail("ANIMATION_CHANNEL", "Unsupported animation target");
-      if (path !== "weights" && matrices.has(node))
-        fail("ANIMATION_CHANNEL", "Cannot animate TRS on a matrix node");
-      const width =
-        path === "weights"
-          ? morphOffsets[node + 1] - morphOffsets[node]
-          : path === "rotation"
-            ? 4
-            : 3;
-      if (!width || used.has(`${node}:${path}`))
-        fail("ANIMATION_CHANNEL", "Empty morph target or duplicate animation target");
-      used.add(`${node}:${path}`);
-      if (channel.quantizedRotation !== undefined && typeof channel.quantizedRotation !== "boolean")
-        fail("ANIMATION_CHANNEL", "Invalid rotation quantization marker");
-      const interpolation = channel.interpolation ?? "LINEAR";
-      if (!["LINEAR", "STEP", "CUBICSPLINE"].includes(interpolation))
-        fail("ANIMATION_INTERPOLATION", "Unknown interpolation");
-      const count = channel.times?.length;
-      if (
-        !Number.isInteger(count) ||
-        count < (interpolation === "CUBICSPLINE" ? 2 : 1) ||
-        count > 1048576
-      )
-        fail("ANIMATION_KEYS", "Invalid keyframe count");
-      const expected = count * width * (interpolation === "CUBICSPLINE" ? 3 : 1);
-      components += expected + count;
-      if (components > 16777216) fail("ANIMATION_LIMIT", "Keyframe component budget exceeded");
-      const times = numbers(channel.times, count, "Keyframe times"),
-        values = numbers(channel.values, expected, "Keyframe values");
-      for (let i = 0; i < count; i++)
-        if (times[i] < 0 || (i && times[i] <= times[i - 1]))
-          fail("ANIMATION_KEYS", "Times must be nonnegative and strictly increasing");
-      if (path === "rotation")
+  // Construction and late installation share one admission/copy path. The
+  // component counter is local until the entire batch has been validated.
+  function decodeClips(input, start, usedComponents) {
+    if (!Array.isArray(input) || input.length + start > 4096)
+      fail("ANIMATION_LIMIT", "Invalid or excessive clip list");
+    let components = usedComponents;
+    const decoded = [];
+    const count = input.length;
+    for (let clipIndex = 0; clipIndex < count; clipIndex++) {
+      const clip = input[clipIndex], rawChannels = clip?.channels;
+      const channelCount = rawChannels?.length;
+      if (!clip || !Array.isArray(rawChannels) || channelCount > 262144)
+        fail("ANIMATION_CHANNEL", "Invalid channel list");
+      const used = new Set();
+      let duration = 0;
+      const channels = [];
+      for (let channelIndex = 0; channelIndex < channelCount; channelIndex++) {
+        const channel = rawChannels[channelIndex];
+        const node = integer(channel?.node, n, "Animation target"),
+          path = channel.path;
+        if (!["translation", "rotation", "scale", "weights"].includes(path))
+          fail("ANIMATION_CHANNEL", "Unsupported animation target");
+        if (path !== "weights" && matrices.has(node))
+          fail("ANIMATION_CHANNEL", "Cannot animate TRS on a matrix node");
+        const width =
+          path === "weights"
+            ? morphOffsets[node + 1] - morphOffsets[node]
+            : path === "rotation"
+              ? 4
+              : 3;
+        if (!width || used.has(`${node}:${path}`))
+          fail("ANIMATION_CHANNEL", "Empty morph target or duplicate animation target");
+        used.add(`${node}:${path}`);
+        const quantizedRotation = channel.quantizedRotation;
+        if (quantizedRotation !== undefined && typeof quantizedRotation !== "boolean")
+          fail("ANIMATION_CHANNEL", "Invalid rotation quantization marker");
+        const interpolation = channel.interpolation ?? "LINEAR";
+        if (!["LINEAR", "STEP", "CUBICSPLINE"].includes(interpolation))
+          fail("ANIMATION_INTERPOLATION", "Unknown interpolation");
+        const rawTimes = channel.times;
+        const count = rawTimes?.length;
+        if (
+          !Number.isInteger(count) ||
+          count < (interpolation === "CUBICSPLINE" ? 2 : 1) ||
+          count > 1048576
+        )
+          fail("ANIMATION_KEYS", "Invalid keyframe count");
+        const expected = count * width * (interpolation === "CUBICSPLINE" ? 3 : 1);
+        components += expected + count;
+        if (components > 16777216) fail("ANIMATION_LIMIT", "Keyframe component budget exceeded");
+        const times = numbers(rawTimes, count, "Keyframe times"),
+          values = numbers(channel.values, expected, "Keyframe values");
+        if (times.length !== count || values.length !== expected)
+          fail("ANIMATION_SHAPE", "Keyframe iterator extent does not match its declared length");
         for (let i = 0; i < count; i++)
-          unit(
-            values,
-            (i * (interpolation === "CUBICSPLINE" ? 3 : 1) +
-              (interpolation === "CUBICSPLINE" ? 1 : 0)) *
-              4,
-            "Keyframe rotation",
-            channel.quantizedRotation ? 0.01 : 1e-3,
-          );
-      duration = Math.max(duration, times[count - 1]);
-      return { node, path, width, interpolation, times, values, cursor: 0 };
-    });
-    return { name: String(clip.name ?? `animation_${clipIndex}`), duration, channels };
-  });
+          if (times[i] < 0 || (i && times[i] <= times[i - 1]))
+            fail("ANIMATION_KEYS", "Times must be nonnegative and strictly increasing");
+        if (path === "rotation")
+          for (let i = 0; i < count; i++)
+            unit(
+              values,
+              (i * (interpolation === "CUBICSPLINE" ? 3 : 1) +
+                (interpolation === "CUBICSPLINE" ? 1 : 0)) *
+                4,
+              "Keyframe rotation",
+              quantizedRotation ? 0.01 : 1e-3,
+            );
+        duration = Math.max(duration, times[count - 1]);
+        channels.push({ node, path, width, interpolation, times, values, cursor: 0 });
+      }
+      decoded.push({ name: String(clip.name ?? `animation_${start + clipIndex}`), duration, channels });
+    }
+    return { clips: decoded, components };
+  }
+  let { clips, components } = decodeClips(rawClips, 0, 0);
+  const metadata = (list) => list.map(({ name, duration }) => Object.freeze({ name, duration }));
+  let clipMetadata = Object.freeze(metadata(clips)), clipVersion = 0;
   const restW = new Float64Array(baseWeights);
   const makeState = () => ({
     translations: baseT.slice(),
@@ -450,25 +473,28 @@ export function createAnimationPlayer(definition) {
   const committed = Object.fromEntries(poseFields.map((field) => [field, scratch[field].slice()]));
   let currentRoot = null,
     currentMatrices = matrices;
-  const rest = [baseT, baseQ, baseS, restW],
-    bindings = new Map();
-  let maxWidth = 4;
-  for (const clip of clips)
-    for (const channel of clip.channels) {
-      const kind = paths.indexOf(channel.path),
-        key = channel.node * 4 + kind;
-      if (!bindings.has(key))
-        bindings.set(key, {
-          key,
-          kind,
-          width: channel.width,
-          offset: kind === 3 ? morphOffsets[channel.node] : channel.node * channel.width,
-        });
-      channel.binding = bindings.get(key);
-      maxWidth = Math.max(maxWidth, channel.width);
-    }
-  const totals = new Float64Array(n * 4),
-    values = new Float64Array(maxWidth);
+  const rest = [baseT, baseQ, baseS, restW];
+  function bindClips(input, table) {
+    let maxWidth = 4;
+    for (const clip of input)
+      for (const channel of clip.channels) {
+        const kind = paths.indexOf(channel.path),
+          key = channel.node * 4 + kind;
+        if (!table.has(key))
+          table.set(key, {
+            key,
+            kind,
+            width: channel.width,
+            offset: kind === 3 ? morphOffsets[channel.node] : channel.node * channel.width,
+          });
+        channel.binding = table.get(key);
+        maxWidth = Math.max(maxWidth, channel.width);
+      }
+    return maxWidth;
+  }
+  let bindings = new Map();
+  let values = new Float64Array(bindClips(clips, bindings));
+  const totals = new Float64Array(n * 4);
   const delta = new Float64Array(4),
     weightedDelta = new Float64Array(4);
   const layerScratch = [];
@@ -492,6 +518,30 @@ export function createAnimationPlayer(definition) {
     } finally {
       busy = false;
     }
+  }
+  /** Append decoded clips atomically; no pose evaluation or action reset.
+   * Indices are stable for this player's lifetime. Only clipVersion advances.
+   * Source rig/node order must already match; this is not automatic retargeting.
+   */
+  function addClips(input) {
+    const staged = decodeClips(input, clips.length, components);
+    if (!staged.clips.length) return Object.freeze([]);
+    const nextBindings = new Map(bindings);
+    const width = bindClips(staged.clips, nextBindings);
+    const nextValues = width > values.length ? new Float64Array(width) : values;
+    const indices = Object.freeze(staged.clips.map((_, index) => clips.length + index));
+    const nextClips = clips.concat(staged.clips);
+    const nextMetadata = Object.freeze(clipMetadata.concat(metadata(staged.clips)));
+    // Input getters/iterators can throw, reenter, or detach public output
+    // storage. Nothing owned by the live player changes before this boundary.
+    checkStorage();
+    clips = nextClips;
+    components = staged.components;
+    bindings = nextBindings;
+    values = nextValues;
+    clipMetadata = nextMetadata;
+    clipVersion++;
+    return indices;
   }
   function resetScratch() {
     scratch.translations.set(baseT);
@@ -787,7 +837,15 @@ export function createAnimationPlayer(definition) {
     ...published,
     nodeCount: n,
     morphOffsets: morphOffsets.slice(),
-    clips: Object.freeze(clips.map(({ name, duration }) => Object.freeze({ name, duration }))),
+    get clips() {
+      return clipMetadata;
+    },
+    get clipVersion() {
+      return clipVersion;
+    },
+    addClips(clips) {
+      return run(addClips, clips);
+    },
     instances: Object.freeze(instances),
     sample(time, options) {
       return run(evaluate, time, options);
