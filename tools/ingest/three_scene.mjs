@@ -7,7 +7,9 @@
  * This admits rigid/instanced Mesh plus source skin/morph deformation. It
  * is NOT a constructor replacement or complete Three.js renderer compatibility.
  * Unsupported renderable families, shader/render hooks, fog, source environment
- * maps and shadows fail explicitly. Ready byte/image/canvas textures receive
+ * maps fail explicitly. shadow:{} opts into one source directional/spot map,
+ * shared animated casters and selective receivers; it is not filter parity.
+ * Ready byte/image/canvas textures receive
  * owned native residency by default; a borrowed binding Map still overrides it.
  * No network image decoding is started by scene preparation or rendering.
  * See THREE_SCENE.md for the supported source and preparation contract.
@@ -38,7 +40,7 @@ export async function createGpuThreeScene(device,scene,{
   three, textures=new Map(), autoTextures=true, texture:textureOptions={}, renderer:renderOptions={}, geometry:geometryOptions={},
   maxNodes=16384,maxGeometries=256,maxBindings=1024,maxGeometryBytes=128*1024*1024,sortObjects=true,
   maxInstanceMeshes=256,maxInstanceBytes=128*1024*1024,
-  deformation:deformationOptions={},maxDeformedMeshes=256,maxDeformationBytes=128*1024*1024,signal,
+  deformation:deformationOptions={},maxDeformedMeshes=256,maxDeformationBytes=128*1024*1024,shadow=null,signal,
 }={}) {
   if(three?.REVISION!=='186'||typeof three.Matrix4!=='function'||typeof three.Frustum!=='function'||
       typeof three.Mesh!=='function'||!(scene instanceof three.Scene))fail('SOURCE','Supply the pinned r186 module and its Scene');
@@ -58,6 +60,15 @@ export async function createGpuThreeScene(device,scene,{
   integer(maxDeformedMeshes,1,65536,'deformed mesh capacity');integer(maxDeformationBytes,1,Number.MAX_SAFE_INTEGER,'deformation budget');
   if(signal!==undefined&&(!signal||typeof signal.aborted!=='boolean'||typeof signal.addEventListener!=='function'||
       typeof signal.removeEventListener!=='function'))fail('OPTIONS','Expected AbortSignal');
+  if(shadow!==null&&(!shadow||typeof shadow!=='object'||Array.isArray(shadow)))fail('OPTIONS','Expected shadow options or null');
+  for(const key of Object.keys(shadow??{}))if(!['maxBytes','blend'].includes(key))fail('OPTIONS',`Unsupported source shadow option: ${key}`);
+  const shadowEnabled=shadow!==null,shadowBlend=shadow?.blend??'reject',maxShadowBytes=shadow?.maxBytes??64*1024*1024;
+  if(!['reject','skip'].includes(shadowBlend))fail('OPTIONS','Shadow blend policy must be reject or skip');
+  integer(maxShadowBytes,1,Number.MAX_SAFE_INTEGER,'shadow budget');
+  if(shadowEnabled&&renderOptions.shadows===false)fail('OPTIONS','Source shadows require receiver pipelines');
+  // Keep ordinary source-scene packages independent of this optional module.
+  const shadowApi=shadowEnabled?await import('./three_shadows.mjs'):null;
+  let shadowOwner=null,pendingShadow=null,casters=new Map(),shadowStats=null;
   const models=new Map([
     [three.MeshBasicMaterial.prototype,'unlit'],[three.MeshLambertMaterial.prototype,'lambert'],
     [three.MeshPhongMaterial.prototype,'phong'],[three.MeshToonMaterial.prototype,'toon'],
@@ -67,7 +78,7 @@ export async function createGpuThreeScene(device,scene,{
   const pendingDeformations=new Set(),deformationLifetime=new AbortController();
   let textureOwner=null,textureScan=null,frameTextures=null,retainedTextures=new Set();
   const ownedTextures=()=>textureOwner??=createGpuThreeTextures(device,{...textureOptions,three});
-  const resourceFailed=()=>!!renderer?.failed||!!textureOwner?.failed||[...geometries.values(),...instances.values(),...deformations.values(),...pendingDeformations].some(g=>g.failed);
+  const resourceFailed=()=>!!renderer?.failed||!!textureOwner?.failed||!!shadowOwner?.failed||!!pendingShadow?.failed||[...geometries.values(),...instances.values(),...deformations.values(),...pendingDeformations].some(g=>g.failed);
   let entries=[],lookup=new Map(),renderer,disposed=false,terminal=null,busy=false,preparing=false,prepareVersion=0,sourceDraws=0;
   // End the owner's wait without claiming to cancel already-issued GPU work.
   // Renderer registration still retires its private resources if it resolves late.
@@ -86,6 +97,7 @@ export async function createGpuThreeScene(device,scene,{
   function release(){
     signal?.removeEventListener('abort',onAbort);
     deformationLifetime.abort();
+    shadowOwner?.dispose();pendingShadow?.dispose();shadowOwner=null;pendingShadow=null;casters.clear();
     for(const entry of entries)entry.mesh.dispose();entries=[];lookup.clear();
     for(const gpu of [...deformations.values(),...pendingDeformations])gpu.dispose();deformations.clear();pendingDeformations.clear();
     for(const [m,state] of materials)m.removeEventListener('dispose',state.listener);materials.clear();
@@ -143,7 +155,17 @@ export async function createGpuThreeScene(device,scene,{
         if(Array.isArray(object.material)&&object.material.length>maxBindings)fail('LIMIT','Source material array exceeds capacity');
         if(object.isBatchedMesh||object.intersectsFrustum!==(object.isSkinnedMesh?three.SkinnedMesh?.prototype.intersectsFrustum:three.Mesh.prototype.intersectsFrustum))
           fail('OBJECT','Use the explicit animation/instance path for this mesh family');
-        if(object.castShadow||object.receiveShadow)fail('SHADOW','Source shadow ownership is not inferred; use the explicit scene shadow API');
+        if(!shadowEnabled&&(object.castShadow||object.receiveShadow))fail('SHADOW','Enable shadow:{} to own source shadows');
+        if(shadowEnabled){
+          if(typeof object.castShadow!=='boolean'||typeof object.receiveShadow!=='boolean')fail('SHADOW','Expected boolean source shadow flags');
+          if(object.castShadow){
+            if(object.customDepthMaterial!=null||object.customDistanceMaterial!=null||
+                object.onBeforeShadow!==three.Object3D.prototype.onBeforeShadow||object.onAfterShadow!==three.Object3D.prototype.onAfterShadow)
+              fail('HOOK','Custom shadow materials and callbacks need their original renderer');
+            const source=Array.isArray(object.material)?object.material:[object.material];
+            if(shadowBlend==='reject'&&source.some(m=>m?.transparent))fail('SHADOW','BLEND casters require the explicit shadow.blend:skip policy');
+          }
+        }
         geometryAdmission(object.geometry,object);
         if(object.isInstancedMesh)instanceAdmission(object);
       } else if(object.isLine||object.isPoints||object.isSprite||object.isLightProbe||object.isLightProbeGrid)
@@ -153,10 +175,22 @@ export async function createGpuThreeScene(device,scene,{
     }
     if(scene.fog!==null||scene.environment!==null||(scene.background!==null&&!scene.background.isColor))
       fail('SCENE','Fog, source environment maps and texture backgrounds require their own rendering paths');
+    if(shadowEnabled){
+      if(scene.overrideMaterial!==null)fail('SHADOW','Source shadow mode does not infer overrideMaterial depth semantics');
+      shadowLight(nodes);
+    }
     return nodes;
   }
+  function shadowLight(nodes){
+    const lights=nodes.filter(o=>o.isLight&&o.castShadow);
+    if(lights.length>1)fail('SHADOW','Only one source projected shadow light is admitted');
+    return lights[0]??null;
+  }
   function light(source){
-    if(source.castShadow)fail('SHADOW','A source shadow light cannot silently become an unshadowed light');
+    if(source.castShadow){
+      if(!shadowEnabled)fail('SHADOW','A source shadow light cannot silently become an unshadowed light');
+      shadowApi.inspectThreeShadow(source,three);
+    }
     let type;
     if(source.isAmbientLight)type='ambient';else if(source.isHemisphereLight)type='hemisphere';
     else if(source.isDirectionalLight)type='directional';else if(source.isPointLight)type='point';
@@ -195,6 +229,7 @@ export async function createGpuThreeScene(device,scene,{
     for(const key of ['lightMap','bumpMap','displacementMap','alphaMap','envMap'])if(m[key])fail('MATERIAL',`Unsupported source map: ${key}`);
     if(![0,1,2].includes(m.side)||!Number.isInteger(m.depthFunc)||!DEPTH[m.depthFunc])fail('MATERIAL','Unsupported side/depth state');
     if(finite(m.alphaTest,'alpha test')<0||m.alphaTest>1)fail('MATERIAL','Invalid source alpha test');
+    if(shadowEnabled&&m.shadowSide!=null&&![0,1,2].includes(m.shadowSide))fail('SHADOW','Invalid source shadowSide');
     for(const key of ['transparent','vertexColors','depthTest','depthWrite','colorWrite','forceSinglePass'])
       if(typeof m[key]!=='boolean')fail('MATERIAL',`Expected boolean ${key}`);
     const options={shading,vertexColors:m.vertexColors,flatShading:shading==='unlit'?false:m.flatShading===true,
@@ -249,7 +284,7 @@ export async function createGpuThreeScene(device,scene,{
     return sides.map(side=>{
       const config={...options,side};
       const structural=[epoch,shading,side,config.vertexColors,config.flatShading,config.alphaMode,
-        config.depthTest,config.depthWrite,config.depthCompare,config.colorWrite,...textureKey];
+        config.depthTest,config.depthWrite,config.depthCompare,config.colorWrite,...(shadowEnabled?[m.shadowSide??null]:[]),...textureKey];
       return {options:config,values,structural};
     });
   }
@@ -301,12 +336,16 @@ export async function createGpuThreeScene(device,scene,{
   }
   async function prepare(){
     live();if(busy)fail('REENTRANT','A source-scene operation is already running');busy=true;preparing=true;
-    const created=[],added=[],addedInstances=[],createdDeformations=[],nextDeformations=new Map();
+    const created=[],added=[],addedInstances=[],createdDeformations=[],nextDeformations=new Map(),createdCasters=[];
+    let nextShadow=shadowOwner;
+    const nextCasters=new Map();
     try{
       // Validate all source materials and texture inputs before allocating any
       // textures. Temporary inspection placeholders never reach renderer.addMesh.
       const owned=scanTextures();textureOwner?.prepare(owned);
-      const request=desired(graph()),next=[];
+      const nodes=graph(),request=desired(nodes),next=[];
+      const selected=shadowEnabled?shadowLight(nodes):null;
+      const shadowSignature=selected?shadowApi.inspectThreeShadow(selected,three).signature:null;
       for(const item of request){
         live();let gpu,signature,deformation=null;
         if(item.deformationSource){
@@ -353,13 +392,50 @@ export async function createGpuThreeScene(device,scene,{
         }
         next.push(entry);
       }
+      // Reuse a frozen map and existing caster registrations across unrelated
+      // preparation. Only source light/camera/extent replacement allocates a map.
+      // Charge the old map until its last submitted use has drained.
+      if(shadowEnabled){
+        if(!selected)nextShadow=null;
+        else if(!shadowOwner||shadowOwner.source!==selected||!shadowOwner.matches()){
+          const available=maxShadowBytes-(shadowOwner?.allocatedBytes??0);
+          if(available<1)fail('LIMIT','Shadow replacement exceeds the old-plus-new GPU budget');
+          nextShadow=await shadowApi.createGpuThreeShadow(device,selected,{three,maxBytes:available,
+            maxDraws:renderOptions.maxDraws??1024,maxMeshes:2*maxBindings,signal:deformationLifetime.signal});
+          pendingShadow=nextShadow;live();
+        }
+        if(nextShadow)for(let i=0;i<next.length;i++){
+          const entry=next[i],item=request[i],{options,values}=item.desc;
+          // BLEND receivers remain fully rendered, but never acquire a guessed
+          // translucent depth material. Actual BLEND casters reject or skip.
+          if(options.alphaMode==='BLEND')continue;
+          let caster=nextShadow===shadowOwner?casters.get(entry):null;
+          if(!caster||caster.disposed){
+            const gpu=entry.deformation?.deformer??geometries.get(entry.geometry);
+            const surface=entry.deformation?{indices:entry.deformation.surface.indices,
+              texCoords:entry.deformation.surface.texCoords,
+              vertexColors:options.vertexColors?entry.deformation.surface.vertexColors:null}:{};
+            const depth={shading:'unlit',alphaMode:options.alphaMode,alphaCutoff:options.alphaCutoff,
+              vertexColors:options.vertexColors,baseColor:values.baseColor,
+              // Native source profile: explicit shadowSide, otherwise reversed
+              // material side, matching the retained WebGL depth-map default.
+              side:['front','back','double'][item.material.shadowSide??[1,0,2][item.material.side]],
+              ...(options.baseColorTexture?{baseColorTexture:options.baseColorTexture}:{}),
+              ...(values.uvTransform?{uvTransform:values.uvTransform}:{}),...surface,
+              ...(entry.instanceSource?{instances:instances.get(entry.instanceSource)}:{})};
+            caster=await Promise.race([nextShadow.addMesh(gpu,depth),stopped]);createdCasters.push(caster);live();
+          }
+          nextCasters.set(entry,caster);
+        }
+      }
       // Retirement must not reject a preceding submitted draw's dependency
       // wait. Drain only when pruning whole owners (never on ordinary updates),
       // then recheck source structure after this additional asynchronous boundary.
       const usedGeometry=new Set(next.filter(e=>!e.deformation).map(e=>e.geometry)),usedInstances=new Set(next.map(e=>e.instanceSource));
       const usedDeformations=new Set(next.map(e=>e.deformation).filter(Boolean));
       if([...geometries.keys()].some(g=>!usedGeometry.has(g))||[...instances.keys()].some(s=>!usedInstances.has(s))||
-          [...deformations.values()].some(g=>!usedDeformations.has(g))){
+          [...deformations.values()].some(g=>!usedDeformations.has(g))||
+          (shadowOwner&&(shadowOwner!==nextShadow||[...casters.keys()].some(e=>!nextCasters.has(e))))){
         await bridge.whenIdle();live();
       }
       // A layout can change while a pipeline await is outstanding, even when
@@ -381,9 +457,20 @@ export async function createGpuThreeScene(device,scene,{
         }
       }
       if(!sameDesired(request,desired(graph())))fail('CHANGED','Source structure changed while pipelines were being prepared');
+      if(shadowEnabled){
+        const current=shadowLight(graph());
+        if(current!==selected||(current&&!same(shadowSignature,shadowApi.inspectThreeShadow(current,three).signature)))
+          fail('CHANGED','Source shadow light/camera/extent changed during preparation');
+        nextShadow?.check();
+      }
       textureOwner?.update(owned);
+      if(shadowOwner!==nextShadow){shadowOwner?.dispose();shadowStats=null;}
+      else for(const [entry,caster] of casters)if(!nextCasters.has(entry))caster.dispose();
+      shadowOwner=nextShadow;pendingShadow=null;casters=nextCasters;
       publish(next);retainedTextures=owned;textureOwner?.retain(owned);prepareVersion++;return bridge;
     }catch(error){
+      for(const caster of createdCasters)caster.dispose();
+      if(nextShadow!==shadowOwner)nextShadow?.dispose();pendingShadow=null;
       for(const entry of created)entry.mesh.dispose();
       for(const gpu of createdDeformations){gpu.dispose();pendingDeformations.delete(gpu);}
       for(const g of added){geometries.get(g)?.dispose();geometries.delete(g);}
@@ -409,30 +496,25 @@ export async function createGpuThreeScene(device,scene,{
     live();if(busy)fail('REENTRANT','A source-scene operation is already running');busy=true;
     try{
       if(!frame||typeof frame!=='object')fail('FRAME','Supply borrowed render attachments');
-      for(const key of ['draws','viewProjection','lighting'])if(Object.hasOwn(frame,key))fail('FRAME',`${key} belongs to the source scene/camera`);
+      for(const key of ['draws','viewProjection','lighting',...(shadowEnabled?['shadow']:[])])if(Object.hasOwn(frame,key))fail('FRAME',`${key} belongs to the source scene/camera`);
       frameTextures=new Set();
-      graph();const lighting=cameraFrame(camera);lighting.lights=[];
+      const nodes=graph();
+      if(shadowEnabled){
+        if(shadowLight(nodes)!==(shadowOwner?.source??null))fail('PREPARE','Call prepare() after changing the source shadow light');
+        shadowOwner?.check();
+      }
+      const lighting=cameraFrame(camera);lighting.lights=[];
+      const lightSources=[],casterObjects=[],casterItems=[],shadowDraws=[];
       const opaque=[],transparent=[],stack=[{object:scene,groupOrder:0}],descriptions=new Map();
       const get=m=>{if(!descriptions.has(m))descriptions.set(m,materialDescription(m));return descriptions.get(m);};
-      let visited=0;
-      while(stack.length){
-        const item=stack.pop(),object=item.object;let groupOrder=item.groupOrder;
-        if(++visited>maxNodes)fail('LIMIT','Source traversal capacity exceeded');
-        if(object.visible===false)continue;
-        if(object.layers.test(camera.layers)){
-          if(object.isGroup)groupOrder=object.renderOrder;
-          else if(object.isLOD){if(object.autoUpdate)object.update(camera);}
-          else if(object.isLight)lighting.lights.push(light(object));
-          else if(object.isMesh&&(!object.frustumCulled||object.intersectsFrustum(frustum))){
-            const g=object.geometry;
-            let z=0;
-            if(sortObjects){
-              const bounds=object.boundingSphere!==undefined?object:g;
-              if(bounds.boundingSphere===null)bounds.computeBoundingSphere();
-              z=center.copy(bounds.boundingSphere.center).applyMatrix4(object.matrixWorld).applyMatrix4(vp).z;
-            }
-            function push(original,group){
+      function append(object,groupOrder,z,shadowPass=false){
+        const g=object.geometry;
+        function push(original,group){
               if(!original||!original.visible)return;
+              if(shadowPass&&original.transparent){
+                if(shadowBlend==='skip')return;
+                fail('SHADOW','BLEND casters require the explicit skip policy');
+              }
               const material=scene.overrideMaterial&&original.allowOverride===true?scene.overrideMaterial:original;
               const instanceSource=object.isInstancedMesh?object:null;
               const instanceSignature=instanceSource?instanceAdmission(instanceSource).signature:null;
@@ -441,17 +523,46 @@ export async function createGpuThreeScene(device,scene,{
               const bindings=desc.map(d=>records?.find(e=>!e.mesh.disposed&&e.geometry===g&&
                 e.instanceSignature===instanceSignature&&same(e.structural,d.structural)));
               if(bindings.some(e=>!e))fail('PREPARE','Call prepare() after changing geometry, instance layout, material structure or texture bindings');
-              if(opaque.length+transparent.length>=(renderOptions.maxDraws??1024))fail('LIMIT','Source draw list exceeds capacity');
+              if((shadowPass?casterItems.length:opaque.length+transparent.length)>=(renderOptions.maxDraws??1024))fail('LIMIT','Source draw list exceeds capacity');
               // Source list partition and sorting precede the draw-time override.
-              (original.transparent?transparent:opaque).push({object,geometry:g,material,listMaterial:original,group,groupOrder,z,desc,bindings});
+              if(shadowPass&&bindings.some(e=>!casters.has(e)||casters.get(e).disposed))fail('PREPARE','Prepare the source caster material before drawing it');
+              (shadowPass?casterItems:original.transparent?transparent:opaque).push({object,geometry:g,material,listMaterial:original,group,groupOrder,z,desc,bindings,shadowPass});
             }
-            if(Array.isArray(object.material))for(const group of g.groups)push(object.material[group.materialIndex],group);
-            else push(object.material,null);
+        if(Array.isArray(object.material))for(const group of g.groups)push(object.material[group.materialIndex],group);
+        else push(object.material,null);
+      }
+      let visited=0;
+      while(stack.length){
+        const item=stack.pop(),object=item.object;let groupOrder=item.groupOrder;
+        if(++visited>maxNodes)fail('LIMIT','Source traversal capacity exceeded');
+        if(object.visible===false)continue;
+        if(object.layers.test(camera.layers)){
+          if(object.isGroup)groupOrder=object.renderOrder;
+          else if(object.isLOD){if(object.autoUpdate)object.update(camera);}
+          else if(object.isLight){lighting.lights.push(light(object));lightSources.push(object);}
+          else if(object.isMesh){
+            // A caster outside the viewing frustum can still shadow a receiver.
+            // Preserve source visibility/layers/LOD, but use the light frustum.
+            if(shadowOwner&&object.castShadow)casterObjects.push(object);
+            if(!object.frustumCulled||object.intersectsFrustum(frustum)){
+            const g=object.geometry;
+            let z=0;
+            if(sortObjects){
+              const bounds=object.boundingSphere!==undefined?object:g;
+              if(bounds.boundingSphere===null)bounds.computeBoundingSphere();
+              z=center.copy(bounds.boundingSphere.center).applyMatrix4(object.matrixWorld).applyMatrix4(vp).z;
+            }
+            append(object,groupOrder,z);
+            }
           }
         }
         for(let i=object.children.length-1;i>=0;i--)stack.push({object:object.children[i],groupOrder});
       }
       if(lighting.lights.length>8)fail('LIMIT','Visible source lights exceed the renderer capacity');
+      const lightIndex=shadowOwner?lightSources.indexOf(shadowOwner.source):-1;
+      const shadowFrame=lightIndex<0?null:shadowOwner.capture();
+      if(shadowFrame?.update)for(const object of casterObjects)
+        if(!object.frustumCulled||object.intersectsFrustum(shadowFrame.frustum))append(object,0,0,true);
       if(sortObjects){
         const order=(a,b)=>a.groupOrder-b.groupOrder||a.object.renderOrder-b.object.renderOrder;
         opaque.sort((a,b)=>order(a,b)||a.listMaterial.id-b.listMaterial.id||a.z-b.z||a.object.id-b.object.id);
@@ -464,7 +575,7 @@ export async function createGpuThreeScene(device,scene,{
       // valid; changing a sampler/storage description requires prepare().
       textureOwner?.update(frameTextures);
       const updated=new Set(),activeDeformations=new Set();
-      for(const item of items){
+      for(const item of [...casterItems,...items]){
         const deformation=item.bindings[0].deformation;
         let shape;
         if(deformation){
@@ -498,10 +609,17 @@ export async function createGpuThreeScene(device,scene,{
           first=Math.min(Math.max(start,rangeStart),extent);
           count=Math.max(0,Math.min(start+length,rangeStart+rangeCount,extent)-first);
         }
-        item.object.modelViewMatrix.multiplyMatrices(camera.matrixWorldInverse,item.object.matrixWorld);
+        const drawCamera=item.shadowPass?shadowOwner.source.shadow.camera:camera;
+        item.object.modelViewMatrix.multiplyMatrices(drawCamera.matrixWorldInverse,item.object.matrixWorld);
         item.object.normalMatrix.getNormalMatrix(item.object.modelViewMatrix);
-        for(let i=0;i<item.bindings.length;i++)draws.push({mesh:item.bindings[i].mesh,
-          worldMatrix:item.object.matrixWorld.elements,first,count,...item.desc[i].values});
+        for(let i=0;i<item.bindings.length;i++){
+          const values=item.desc[i].values,common={worldMatrix:item.object.matrixWorld.elements,first,count};
+          if(item.shadowPass)shadowDraws.push({mesh:casters.get(item.bindings[i]),...common,baseColor:values.baseColor,
+            ...(values.uvTransform?{uvTransform:values.uvTransform}:{}),
+            ...(values.alphaCutoff!==undefined?{alphaCutoff:values.alphaCutoff}:{})});
+          else draws.push({mesh:item.bindings[i].mesh,...common,...values,
+            ...(shadowEnabled?{receiveShadow:item.object.receiveShadow}:{})});
+        }
       }
       // One fused core batch precedes all consuming material/group draws. No
       // source animation clock or CPU per-vertex deformation runs here.
@@ -516,7 +634,17 @@ export async function createGpuThreeScene(device,scene,{
       }
       const prepared={...frame,viewProjection:clip.elements,lighting,draws};
       if(scene.background!==null){prepared.clearColor=rgba(scene.background);prepared.loadOp='clear';}
-      renderer.render(prepared);live();sourceDraws=items.length;return bridge;
+      if(shadowEnabled){
+        prepared.shadow=null;
+        if(shadowFrame){
+          shadowOwner.render(shadowFrame,shadowDraws);live();
+          prepared.shadow=shadowOwner.descriptor(shadowFrame,lightIndex);
+        }
+      }
+      renderer.render(prepared);live();sourceDraws=items.length;
+      shadowStats=shadowFrame?Object.freeze({lightIndex,casters:shadowDraws.length,
+        mapVersion:shadowOwner.version,updated:shadowFrame.update}):null;
+      return bridge;
     }catch(error){return failed(error);}finally{busy=false;frameTextures=null;if(disposed||terminal)release();}
   }
   const bridge=Object.freeze({scene,prepare,render,
@@ -527,17 +655,19 @@ export async function createGpuThreeScene(device,scene,{
       deformedMeshCount:deformations.size,deformationBytes:deformationBytes(),
       materialBindings:entries.filter(e=>!e.mesh.disposed).length,rendererBytes:renderer?.allocatedBytes??0,
       textures:textureOwner?.diagnostics??null,
+      shadowBytes:(shadowOwner?.allocatedBytes??0)+(pendingShadow?.allocatedBytes??0),shadowStats,
+      colorPasses:shadowEnabled?(renderer?.colorPassCount??0):null,
       bundles:renderer?.bundleDiagnostics??null});},
-    async whenIdle(){live();try{await Promise.race([Promise.all([renderer.whenIdle(),textureOwner?.whenIdle(),...[...geometries.values(),...instances.values(),...deformations.values(),...pendingDeformations].map(g=>g.whenIdle())]),stopped]);live();return bridge;}catch(error){return failed(error);}},
+    async whenIdle(){live();try{await Promise.race([Promise.all([renderer.whenIdle(),textureOwner?.whenIdle(),shadowOwner?.whenIdle(),pendingShadow?.whenIdle(),...[...geometries.values(),...instances.values(),...deformations.values(),...pendingDeformations].map(g=>g.whenIdle())]),stopped]);live();return bridge;}catch(error){return failed(error);}},
     dispose(){if(busy&&!preparing)fail('REENTRANT','Cannot dispose during source submission');if(!disposed){disposed=true;rejectStopped(new ThreeSceneError('DISPOSED','Source scene bridge is disposed'));release();}},
   });
   try{
     // Source validation precedes even the renderer's uniform allocation.
     signal?.addEventListener('abort',onAbort,{once:true});if(signal?.aborted)onAbort();live();
     scanTextures();
-    const construction=createGpuAnimationRenderer(device,{...renderOptions,indirectLights:true,threeLights:true,maxMeshes:2*maxBindings}).then(value=>{
+    const construction=createGpuAnimationRenderer(device,{...renderOptions,...(shadowEnabled?{shadows:true}:{}),indirectLights:true,threeLights:true,maxMeshes:2*maxBindings}).then(value=>{
       if(disposed||terminal){value.dispose();throw terminal??new ThreeSceneError('DISPOSED','Source scene is disposed');}
-      renderer=value;return value;
+      renderer=shadowEnabled?shadowApi.withThreeShadowReceivers(value,renderOptions.maxDraws??1024):value;return renderer;
     });
     await Promise.race([construction,stopped]);live();await prepare();return bridge;
   }catch(error){disposed=true;release();throw error;}
