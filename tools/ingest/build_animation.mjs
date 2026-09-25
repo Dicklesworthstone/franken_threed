@@ -111,7 +111,7 @@ function decodeDataUri(uri) {
  * RGBE decoder and loadGpuAnimationEnvironment URL/byte loader. No HDR file is
  * fetched at build/import time. The default CPU output and import
  * graph remain unchanged; ordinary GPU packages do not acquire IBL dependencies.
- * threeScene:true with webgpu:true packages the explicit source-owned rigid
+ * threeScene:true with webgpu:true packages the explicit source-owned rigid/skin/morph
  * Three.js scene bridge. The caller lends its pinned Three module and live
  * Scene; no upstream component is copied or initialized by this option.
  * The same option exports createGpuThreeCanvas and createGpuThreeHdrCanvas
@@ -312,7 +312,8 @@ export {fitAnimationShadowView,animationShadowWorldBounds} from './animation_sha
     outputs.set("three_scene.mjs", fs.readFileSync(new URL("./three_scene.mjs", import.meta.url), "utf8"));
     outputs.set("three_textures.mjs", fs.readFileSync(new URL("./three_textures.mjs", import.meta.url), "utf8"));
     for (const name of ["gpu_canvas.mjs", "gpu_canvas_renderer.mjs", "three_canvas.mjs",
-      "gpu_hdr_canvas.mjs", "gpu_render_target.mjs", "animation_output.mjs"]) {
+      "gpu_hdr_canvas.mjs", "gpu_render_target.mjs", "animation_output.mjs",
+      "three_deformation.mjs", "three_deformation_binding.mjs"]) {
       outputs.set(name, fs.readFileSync(new URL("./" + name, import.meta.url), "utf8"));
     }
     outputs.set("gpu_playback.mjs", outputs.get("gpu_playback.mjs") +
@@ -321,7 +322,8 @@ export {fitAnimationShadowView,animationShadowWorldBounds} from './animation_sha
       "export {createGpuCanvasTarget,GpuCanvasError} from './gpu_canvas.mjs';\n" +
       "export {createGpuCanvasRenderer} from './gpu_canvas_renderer.mjs';\n" +
       "export {createGpuHdrCanvasRenderer,GpuHdrCanvasError} from './gpu_hdr_canvas.mjs';\n" +
-      "export {createGpuRenderTarget,GpuRenderTargetError} from './gpu_render_target.mjs';\n");
+      "export {createGpuRenderTarget,GpuRenderTargetError} from './gpu_render_target.mjs';\n" +
+      "export {createGpuThreeDeformation,updateGpuThreeDeformations,createThreeDeformationBinding,ThreeDeformationError} from './three_deformation.mjs';\n");
   }
   if (rigidGeometry) {
     outputs.set(
@@ -372,7 +374,7 @@ export {fitAnimationShadowView,animationShadowWorldBounds} from './animation_sha
       ? { gpuRigidGeometry: "shared-immutable-f32-vertices; opt-in scene rigidGeometry:true" }
       : {}),
     ...(environment ? { gpuEnvironment: "f3d-animation-environment-v1" } : {}),
-    ...(threeScene ? { gpuThreeScene: "explicit-r186-rigid-scene; native source instances; owned source textures or borrowed bindings; borrowed module and attachments" } : {}),
+    ...(threeScene ? { gpuThreeScene: "explicit-r186-scene; native source instances and GPU skin/morph deformation; owned source textures or borrowed bindings; borrowed module and attachments" } : {}),
     source: { file: path.basename(entry), sha256: hash(source) },
     dependencies: [...dependencies.values()],
     nodeCount: validated.nodeCount,

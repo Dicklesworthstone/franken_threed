@@ -4,7 +4,7 @@
  * installed. prepare() is the explicit asynchronous structural-edit boundary;
  * render(camera, attachments) remains synchronous and immediately submits.
  *
- * This admits rigid Mesh/InstancedMesh, BufferGeometry and existing materials. It
+ * This admits rigid/instanced Mesh plus source skin/morph deformation. It
  * is NOT a constructor replacement or complete Three.js renderer compatibility.
  * Unsupported renderable families, shader/render hooks, fog, source environment
  * maps and shadows fail explicitly. Ready byte/image/canvas textures receive
@@ -16,6 +16,8 @@ import {createGpuAnimationRenderer} from './animation_render.mjs';
 import {createGpuBufferGeometry, bufferGeometrySnapshot, createGpuInstanceAttributes,
   instanceAttributesSnapshot, inspectInstanceAttributes} from './gpu_buffer_geometry.mjs';
 import {createGpuThreeTextures} from './three_textures.mjs';
+import {hasThreeDeformation, inspectThreeDeformation, createGpuThreeDeformation,
+  updateGpuThreeDeformations} from './three_deformation.mjs';
 export class ThreeSceneError extends Error {
   constructor(code,message){super(`THREE_SCENE_${code}: ${message}`);this.name='ThreeSceneError';this.code='THREE_SCENE_'+code;}
 }
@@ -36,6 +38,7 @@ export async function createGpuThreeScene(device,scene,{
   three, textures=new Map(), autoTextures=true, texture:textureOptions={}, renderer:renderOptions={}, geometry:geometryOptions={},
   maxNodes=16384,maxGeometries=256,maxBindings=1024,maxGeometryBytes=128*1024*1024,sortObjects=true,
   maxInstanceMeshes=256,maxInstanceBytes=128*1024*1024,
+  deformation:deformationOptions={},maxDeformedMeshes=256,maxDeformationBytes=128*1024*1024,signal,
 }={}) {
   if(three?.REVISION!=='186'||typeof three.Matrix4!=='function'||typeof three.Frustum!=='function'||
       typeof three.Mesh!=='function'||!(scene instanceof three.Scene))fail('SOURCE','Supply the pinned r186 module and its Scene');
@@ -49,15 +52,22 @@ export async function createGpuThreeScene(device,scene,{
       (renderOptions.maxMeshes!==undefined&&renderOptions.maxMeshes!==2*maxBindings))
     fail('OPTIONS','Source scenes require color, source light profiles and two preparation slots per binding');
   for(const key of Object.keys(geometryOptions))if(!['maxAttributes','label'].includes(key))fail('OPTIONS',`Unsupported geometry option: ${key}`);
+  if(!deformationOptions||typeof deformationOptions!=='object'||Array.isArray(deformationOptions))fail('OPTIONS','Expected deformation limits');
+  deformationOptions={...deformationOptions};
+  for(const key of Object.keys(deformationOptions))if(!['maxVertices','maxJoints','maxMorphTargets','maxComponents'].includes(key))fail('OPTIONS',`Unsupported deformation option: ${key}`);
+  integer(maxDeformedMeshes,1,65536,'deformed mesh capacity');integer(maxDeformationBytes,1,Number.MAX_SAFE_INTEGER,'deformation budget');
+  if(signal!==undefined&&(!signal||typeof signal.aborted!=='boolean'||typeof signal.addEventListener!=='function'||
+      typeof signal.removeEventListener!=='function'))fail('OPTIONS','Expected AbortSignal');
   const models=new Map([
     [three.MeshBasicMaterial.prototype,'unlit'],[three.MeshLambertMaterial.prototype,'lambert'],
     [three.MeshPhongMaterial.prototype,'phong'],[three.MeshToonMaterial.prototype,'toon'],
     [three.MeshStandardMaterial.prototype,'metallic-roughness'],
   ]);
-  const geometries=new Map(),instances=new Map(),materials=new Map();
+  const geometries=new Map(),instances=new Map(),materials=new Map(),deformations=new Map();
+  const pendingDeformations=new Set(),deformationLifetime=new AbortController();
   let textureOwner=null,textureScan=null,frameTextures=null,retainedTextures=new Set();
   const ownedTextures=()=>textureOwner??=createGpuThreeTextures(device,{...textureOptions,three});
-  const resourceFailed=()=>!!renderer?.failed||!!textureOwner?.failed||[...geometries.values(),...instances.values()].some(g=>g.failed);
+  const resourceFailed=()=>!!renderer?.failed||!!textureOwner?.failed||[...geometries.values(),...instances.values(),...deformations.values(),...pendingDeformations].some(g=>g.failed);
   let entries=[],lookup=new Map(),renderer,disposed=false,terminal=null,busy=false,preparing=false,prepareVersion=0,sourceDraws=0;
   // End the owner's wait without claiming to cancel already-issued GPU work.
   // Renderer registration still retires its private resources if it resolves late.
@@ -66,6 +76,7 @@ export async function createGpuThreeScene(device,scene,{
   const vp=new three.Matrix4(),clip=new three.Matrix4(),frustum=new three.Frustum(),center=new three.Vector3();
   const geometryBytes=()=>[...geometries.values()].reduce((n,g)=>n+g.bufferBytes,0);
   const instanceBytes=()=>[...instances.values()].reduce((n,g)=>n+g.bufferBytes,0);
+  const deformationBytes=()=>[...deformations.values(),...pendingDeformations].reduce((n,g)=>n+g.bufferBytes,0);
   function live(){
     if(disposed)fail('DISPOSED','Source scene bridge is disposed');if(terminal)throw terminal;
     if(resourceFailed()){
@@ -73,10 +84,19 @@ export async function createGpuThreeScene(device,scene,{
     }
   }
   function release(){
+    signal?.removeEventListener('abort',onAbort);
+    deformationLifetime.abort();
     for(const entry of entries)entry.mesh.dispose();entries=[];lookup.clear();
+    for(const gpu of [...deformations.values(),...pendingDeformations])gpu.dispose();deformations.clear();pendingDeformations.clear();
     for(const [m,state] of materials)m.removeEventListener('dispose',state.listener);materials.clear();
     for(const gpu of geometries.values())gpu.dispose();geometries.clear();
     for(const gpu of instances.values())gpu.dispose();instances.clear();renderer?.dispose();textureOwner?.dispose();
+  }
+  function onAbort(){
+    if(disposed||terminal)return;
+    terminal=new ThreeSceneError('ABORTED','Source scene initialization or lifetime was aborted');
+    rejectStopped(terminal);
+    if(!busy||preparing)release();
   }
   function failed(error){
     if(resourceFailed()){terminal??=error;release();}
@@ -91,9 +111,9 @@ export async function createGpuThreeScene(device,scene,{
     }
     return materials.get(m).epoch;
   }
-  function geometryAdmission(g){
-    if(!(g instanceof three.BufferGeometry)||g.isInstancedBufferGeometry||Object.values(g.morphAttributes).some(a=>a.length))
-      fail('GEOMETRY','This bridge requires rigid BufferGeometry; use the existing skin/morph/instance paths');
+  function geometryAdmission(g,object){
+    if(!(g instanceof three.BufferGeometry)||g.isInstancedBufferGeometry)fail('GEOMETRY','Expected source BufferGeometry');
+    if(hasThreeDeformation(object))inspectThreeDeformation(object,{...deformationOptions,three});
     const owners=new Set(Object.values(g.attributes).map(a=>a.isInterleavedBufferAttribute?a.data:a));
     if(g.index)owners.add(g.index);
     if(!Array.isArray(g.groups)||g.groups.length>maxNodes)fail('LIMIT','Geometry group capacity exceeded');
@@ -121,10 +141,10 @@ export async function createGpuThreeScene(device,scene,{
         fail('HOOK','Custom render callbacks are not admitted by this source bridge');
       if(object.isMesh){
         if(Array.isArray(object.material)&&object.material.length>maxBindings)fail('LIMIT','Source material array exceeds capacity');
-        if(object.isSkinnedMesh||object.isBatchedMesh||object.intersectsFrustum!==three.Mesh.prototype.intersectsFrustum)
+        if(object.isBatchedMesh||object.intersectsFrustum!==(object.isSkinnedMesh?three.SkinnedMesh?.prototype.intersectsFrustum:three.Mesh.prototype.intersectsFrustum))
           fail('OBJECT','Use the explicit animation/instance path for this mesh family');
         if(object.castShadow||object.receiveShadow)fail('SHADOW','Source shadow ownership is not inferred; use the explicit scene shadow API');
-        geometryAdmission(object.geometry);
+        geometryAdmission(object.geometry,object);
         if(object.isInstancedMesh)instanceAdmission(object);
       } else if(object.isLine||object.isPoints||object.isSprite||object.isLightProbe||object.isLightProbeGrid)
         fail('OBJECT',`Unsupported source renderable: ${object.type}`);
@@ -234,11 +254,12 @@ export async function createGpuThreeScene(device,scene,{
     });
   }
   function desired(nodes){
-    const out=[],descriptions=new Map(),seen=new Map(),usedGeometry=new Set(),usedInstances=new Set();
+    const out=[],descriptions=new Map(),seen=new Map(),usedGeometry=new Set(),usedInstances=new Set(),usedDeformations=new Set();
     const get=m=>{if(!descriptions.has(m))descriptions.set(m,materialDescription(m));return descriptions.get(m);};
     if(scene.overrideMaterial)get(scene.overrideMaterial);
     for(const object of nodes)if(object.isMesh){
-      const g=object.geometry,instanceSource=object.isInstancedMesh?object:null,key=instanceSource??g;
+      const g=object.geometry,instanceSource=object.isInstancedMesh?object:null;
+      const deformationSource=hasThreeDeformation(object)?object:null,key=deformationSource??instanceSource??g;
       const instanceSignature=instanceSource?instanceAdmission(instanceSource).signature:null;
       const source=Array.isArray(object.material)?object.material:[object.material];
       for(const original of source){
@@ -248,8 +269,10 @@ export async function createGpuThreeScene(device,scene,{
         const m=scene.overrideMaterial&&original.allowOverride===true?scene.overrideMaterial:original;
         let set=seen.get(key);if(!set)seen.set(key,set=new Set());if(set.has(m))continue;set.add(m);
         usedGeometry.add(g);if(instanceSource)usedInstances.add(instanceSource);
+        if(deformationSource)usedDeformations.add(deformationSource);
+        if(usedDeformations.size>maxDeformedMeshes)fail('LIMIT','Source deformed mesh capacity exceeded');
         for(const desc of get(m)){
-          out.push({key,geometry:g,instanceSource,instanceSignature,material:m,desc});
+          out.push({key,geometry:g,instanceSource,instanceSignature,deformationSource,material:m,desc});
           if(out.length>maxBindings||usedGeometry.size>maxGeometries||usedInstances.size>maxInstanceMeshes)fail('LIMIT','Source geometry/material binding capacity exceeded');
         }
       }
@@ -261,34 +284,55 @@ export async function createGpuThreeScene(device,scene,{
     textureScan=new Set();
     try{desired(graph());return textureScan;}finally{textureScan=null;}
   }
-  function sameDesired(a,b){return a.length===b.length&&a.every((item,i)=>item.key===b[i].key&&item.geometry===b[i].geometry&&item.instanceSignature===b[i].instanceSignature&&item.material===b[i].material&&same(item.desc.structural,b[i].desc.structural));}
+  function sameDesired(a,b){return a.length===b.length&&a.every((item,i)=>item.key===b[i].key&&item.geometry===b[i].geometry&&item.deformationSource===b[i].deformationSource&&item.instanceSignature===b[i].instanceSignature&&item.material===b[i].material&&same(item.desc.structural,b[i].desc.structural));}
   function publish(next){
     for(const entry of entries)if(!next.includes(entry))entry.mesh.dispose();
-    entries=next;lookup=new Map();const used=new Set(next.map(e=>e.geometry)),usedInstances=new Set(next.map(e=>e.instanceSource)),usedMaterials=new Set();
+    entries=next;lookup=new Map();const used=new Set(next.filter(e=>!e.deformation).map(e=>e.geometry)),usedInstances=new Set(next.map(e=>e.instanceSource)),usedMaterials=new Set();
     for(const entry of next){
       let byMaterial=lookup.get(entry.key);if(!byMaterial)lookup.set(entry.key,byMaterial=new Map());
       let records=byMaterial.get(entry.material);if(!records)byMaterial.set(entry.material,records=[]);records.push(entry);usedMaterials.add(entry.material);
     }
+    const usedDeformations=new Set(next.map(e=>e.deformation).filter(Boolean));
+    for(const [source,gpu] of deformations)if(!usedDeformations.has(gpu)){gpu.dispose();deformations.delete(source);}
+    for(const gpu of usedDeformations){deformations.set(gpu.source,gpu);pendingDeformations.delete(gpu);}
     for(const [g,gpu] of geometries)if(!used.has(g)){gpu.dispose();geometries.delete(g);}
     for(const [source,gpu] of instances)if(!usedInstances.has(source)){gpu.dispose();instances.delete(source);}
     for(const [m,state] of materials)if(!usedMaterials.has(m)){m.removeEventListener('dispose',state.listener);materials.delete(m);}
   }
   async function prepare(){
     live();if(busy)fail('REENTRANT','A source-scene operation is already running');busy=true;preparing=true;
-    const created=[],added=[],addedInstances=[];
+    const created=[],added=[],addedInstances=[],createdDeformations=[],nextDeformations=new Map();
     try{
       // Validate all source materials and texture inputs before allocating any
       // textures. Temporary inspection placeholders never reach renderer.addMesh.
       const owned=scanTextures();textureOwner?.prepare(owned);
       const request=desired(graph()),next=[];
       for(const item of request){
-        live();let gpu=geometries.get(item.geometry);
-        if(!gpu){
-          gpu=createGpuBufferGeometry(device,item.geometry,{...geometryOptions,maxBytes:maxGeometryBytes,
-            maxInitialBytes:Math.max(0,maxGeometryBytes-geometryBytes())});
-          geometries.set(item.geometry,gpu);added.push(item.geometry);
-        }else gpu.update({maxAdditionalBytes:Math.max(0,maxGeometryBytes-geometryBytes())});
-        const signature=bufferGeometrySnapshot(gpu,device).signature;
+        live();let gpu,signature,deformation=null;
+        if(item.deformationSource){
+          deformation=nextDeformations.get(item.deformationSource);
+          if(!deformation){
+            const old=deformations.get(item.deformationSource);
+            if(old?.matches())deformation=old;
+            else{
+              const available=maxDeformationBytes-deformationBytes();
+              if(available<1)fail('LIMIT','Deformation replacement exceeds the old-plus-new GPU budget');
+              deformation=await createGpuThreeDeformation(device,item.deformationSource,{...deformationOptions,three,
+                maxBytes:available,signal:deformationLifetime.signal});
+              pendingDeformations.add(deformation);createdDeformations.push(deformation);live();
+            }
+            nextDeformations.set(item.deformationSource,deformation);
+          }
+          gpu=deformation.deformer;signature=deformation.signature;
+        }else{
+          gpu=geometries.get(item.geometry);
+          if(!gpu){
+            gpu=createGpuBufferGeometry(device,item.geometry,{...geometryOptions,maxBytes:maxGeometryBytes,
+              maxInitialBytes:Math.max(0,maxGeometryBytes-geometryBytes())});
+            geometries.set(item.geometry,gpu);added.push(item.geometry);
+          }else gpu.update({maxAdditionalBytes:Math.max(0,maxGeometryBytes-geometryBytes())});
+          signature=bufferGeometrySnapshot(gpu,device).signature;
+        }
         let instanceGpu=null;
         if(item.instanceSource){
           instanceGpu=instances.get(item.instanceSource);
@@ -299,19 +343,23 @@ export async function createGpuThreeScene(device,scene,{
           }else instanceGpu.update({maxAdditionalBytes:Math.max(0,maxInstanceBytes-instanceBytes())});
         }
         let entry=lookup.get(item.key)?.get(item.material)?.find(e=>!e.mesh.disposed&&e.geometry===item.geometry&&
-          e.signature===signature&&e.instanceSignature===item.instanceSignature&&same(e.structural,item.desc.structural));
+          e.deformation===deformation&&e.signature===signature&&e.instanceSignature===item.instanceSignature&&same(e.structural,item.desc.structural));
         if(!entry){
-          const mesh=await Promise.race([renderer.addMesh(gpu,{...item.desc.options,...item.desc.values,...(instanceGpu?{instances:instanceGpu}:{})}),stopped]);
+          const surface=deformation?{indices:deformation.surface.indices,texCoords:deformation.surface.texCoords,
+            vertexColors:item.desc.options.vertexColors?deformation.surface.vertexColors:null}:{};
+          const mesh=await Promise.race([renderer.addMesh(gpu,{...item.desc.options,...item.desc.values,...surface,...(instanceGpu?{instances:instanceGpu}:{})}),stopped]);
           entry={key:item.key,geometry:item.geometry,instanceSource:item.instanceSource,instanceSignature:item.instanceSignature,
-            material:item.material,structural:item.desc.structural,signature,mesh};created.push(entry);live();
+            material:item.material,structural:item.desc.structural,signature,deformation,mesh};created.push(entry);live();
         }
         next.push(entry);
       }
       // Retirement must not reject a preceding submitted draw's dependency
       // wait. Drain only when pruning whole owners (never on ordinary updates),
       // then recheck source structure after this additional asynchronous boundary.
-      const usedGeometry=new Set(next.map(e=>e.geometry)),usedInstances=new Set(next.map(e=>e.instanceSource));
-      if([...geometries.keys()].some(g=>!usedGeometry.has(g))||[...instances.keys()].some(s=>!usedInstances.has(s))){
+      const usedGeometry=new Set(next.filter(e=>!e.deformation).map(e=>e.geometry)),usedInstances=new Set(next.map(e=>e.instanceSource));
+      const usedDeformations=new Set(next.map(e=>e.deformation).filter(Boolean));
+      if([...geometries.keys()].some(g=>!usedGeometry.has(g))||[...instances.keys()].some(s=>!usedInstances.has(s))||
+          [...deformations.values()].some(g=>!usedDeformations.has(g))){
         await bridge.whenIdle();live();
       }
       // A layout can change while a pipeline await is outstanding, even when
@@ -319,9 +367,13 @@ export async function createGpuThreeScene(device,scene,{
       // registration; current content versions are uploaded at this boundary.
       const checked=new Set();
       for(const entry of next){
-        const gpu=geometries.get(entry.geometry);
-        if(!checked.has(gpu)){gpu.update({maxAdditionalBytes:Math.max(0,maxGeometryBytes-geometryBytes())});checked.add(gpu);}
-        if(bufferGeometrySnapshot(gpu,device).signature!==entry.signature)fail('CHANGED','Geometry layout changed during preparation');
+        if(entry.deformation){
+          entry.deformation.check();
+        }else{
+          const gpu=geometries.get(entry.geometry);
+          if(!checked.has(gpu)){gpu.update({maxAdditionalBytes:Math.max(0,maxGeometryBytes-geometryBytes())});checked.add(gpu);}
+          if(bufferGeometrySnapshot(gpu,device).signature!==entry.signature)fail('CHANGED','Geometry layout changed during preparation');
+        }
         if(entry.instanceSource){
           const native=instances.get(entry.instanceSource);
           if(!checked.has(native)){native.update({maxAdditionalBytes:Math.max(0,maxInstanceBytes-instanceBytes())});checked.add(native);}
@@ -333,6 +385,7 @@ export async function createGpuThreeScene(device,scene,{
       publish(next);retainedTextures=owned;textureOwner?.retain(owned);prepareVersion++;return bridge;
     }catch(error){
       for(const entry of created)entry.mesh.dispose();
+      for(const gpu of createdDeformations){gpu.dispose();pendingDeformations.delete(gpu);}
       for(const g of added){geometries.get(g)?.dispose();geometries.delete(g);}
       for(const source of addedInstances){instances.get(source)?.dispose();instances.delete(source);}
       if(!textureOwner?.disposed&&!textureOwner?.failed)textureOwner?.retain(retainedTextures);
@@ -383,7 +436,8 @@ export async function createGpuThreeScene(device,scene,{
               const material=scene.overrideMaterial&&original.allowOverride===true?scene.overrideMaterial:original;
               const instanceSource=object.isInstancedMesh?object:null;
               const instanceSignature=instanceSource?instanceAdmission(instanceSource).signature:null;
-              const desc=get(material),records=lookup.get(instanceSource??g)?.get(material);
+              const deformationSource=hasThreeDeformation(object)?object:null;
+              const desc=get(material),records=lookup.get(deformationSource??instanceSource??g)?.get(material);
               const bindings=desc.map(d=>records?.find(e=>!e.mesh.disposed&&e.geometry===g&&
                 e.instanceSignature===instanceSignature&&same(e.structural,d.structural)));
               if(bindings.some(e=>!e))fail('PREPARE','Call prepare() after changing geometry, instance layout, material structure or texture bindings');
@@ -409,11 +463,19 @@ export async function createGpuThreeScene(device,scene,{
       // before this frame's immediate draw submission. Stable views keep bundles
       // valid; changing a sampler/storage description requires prepare().
       textureOwner?.update(frameTextures);
-      const updated=new Set();
+      const updated=new Set(),activeDeformations=new Set();
       for(const item of items){
-        const gpu=geometries.get(item.geometry);
-        if(!updated.has(gpu)){gpu.update({maxAdditionalBytes:Math.max(0,maxGeometryBytes-geometryBytes())});updated.add(gpu);}
-        const shape=bufferGeometrySnapshot(gpu,device);
+        const deformation=item.bindings[0].deformation;
+        let shape;
+        if(deformation){
+          deformation.check();activeDeformations.add(deformation);
+          shape={signature:deformation.signature,indexBuffer:deformation.surface.indices,
+            indexCount:deformation.indexCount,vertexCount:deformation.vertexCount};
+        }else{
+          const gpu=geometries.get(item.geometry);
+          if(!updated.has(gpu)){gpu.update({maxAdditionalBytes:Math.max(0,maxGeometryBytes-geometryBytes())});updated.add(gpu);}
+          shape=bufferGeometrySnapshot(gpu,device);
+        }
         const instanceSource=item.bindings[0].instanceSource;
         if(instanceSource){
           const native=instances.get(instanceSource);
@@ -426,12 +488,24 @@ export async function createGpuThreeScene(device,scene,{
         const start=item.group?integer(item.group.start,0,Number.MAX_SAFE_INTEGER,'group start'):0;
         const length=item.group?.count??Infinity;
         if(length!==Infinity)integer(length,0,Number.MAX_SAFE_INTEGER,'group count');
-        const first=Math.min(start,extent),count=Math.min(length,extent-first);
+        let first=Math.min(start,extent),count=Math.min(length,extent-first);
+        if(deformation){
+          // Mutable BufferGeometry residency applies drawRange internally. The
+          // immutable core deformer instead needs the explicit intersection.
+          const range=item.geometry.drawRange;
+          const rangeStart=integer(range?.start,0,Number.MAX_SAFE_INTEGER,'draw range start'),rangeCount=range.count;
+          if(rangeCount!==Infinity)integer(rangeCount,0,Number.MAX_SAFE_INTEGER,'draw range count');
+          first=Math.min(Math.max(start,rangeStart),extent);
+          count=Math.max(0,Math.min(start+length,rangeStart+rangeCount,extent)-first);
+        }
         item.object.modelViewMatrix.multiplyMatrices(camera.matrixWorldInverse,item.object.matrixWorld);
         item.object.normalMatrix.getNormalMatrix(item.object.modelViewMatrix);
         for(let i=0;i<item.bindings.length;i++)draws.push({mesh:item.bindings[i].mesh,
           worldMatrix:item.object.matrixWorld.elements,first,count,...item.desc[i].values});
       }
+      // One fused core batch precedes all consuming material/group draws. No
+      // source animation clock or CPU per-vertex deformation runs here.
+      live();updateGpuThreeDeformations([...activeDeformations]);live();
       // The retained renderer updates these public versions twice per double-
       // sided transparent item. No source callback is erased or replayed here:
       // custom callbacks were rejected before any frame work.
@@ -442,24 +516,29 @@ export async function createGpuThreeScene(device,scene,{
       }
       const prepared={...frame,viewProjection:clip.elements,lighting,draws};
       if(scene.background!==null){prepared.clearColor=rgba(scene.background);prepared.loadOp='clear';}
-      renderer.render(prepared);sourceDraws=items.length;return bridge;
-    }catch(error){return failed(error);}finally{busy=false;frameTextures=null;}
+      renderer.render(prepared);live();sourceDraws=items.length;return bridge;
+    }catch(error){return failed(error);}finally{busy=false;frameTextures=null;if(disposed||terminal)release();}
   }
   const bridge=Object.freeze({scene,prepare,render,
     get disposed(){return disposed;},get failed(){return terminal!==null||resourceFailed();},
     get diagnostics(){return Object.freeze({prepareVersion,sourceDraws,logicalDraws:renderer?.drawCount??0,
       drawCalls:renderer?.drawCallCount??0,geometryCount:geometries.size,geometryBytes:geometryBytes(),
       instanceMeshCount:instances.size,instanceBytes:instanceBytes(),
+      deformedMeshCount:deformations.size,deformationBytes:deformationBytes(),
       materialBindings:entries.filter(e=>!e.mesh.disposed).length,rendererBytes:renderer?.allocatedBytes??0,
       textures:textureOwner?.diagnostics??null,
       bundles:renderer?.bundleDiagnostics??null});},
-    async whenIdle(){live();try{await Promise.race([Promise.all([renderer.whenIdle(),textureOwner?.whenIdle(),...[...geometries.values(),...instances.values()].map(g=>g.whenIdle())]),stopped]);live();return bridge;}catch(error){return failed(error);}},
+    async whenIdle(){live();try{await Promise.race([Promise.all([renderer.whenIdle(),textureOwner?.whenIdle(),...[...geometries.values(),...instances.values(),...deformations.values(),...pendingDeformations].map(g=>g.whenIdle())]),stopped]);live();return bridge;}catch(error){return failed(error);}},
     dispose(){if(busy&&!preparing)fail('REENTRANT','Cannot dispose during source submission');if(!disposed){disposed=true;rejectStopped(new ThreeSceneError('DISPOSED','Source scene bridge is disposed'));release();}},
   });
   try{
     // Source validation precedes even the renderer's uniform allocation.
+    signal?.addEventListener('abort',onAbort,{once:true});if(signal?.aborted)onAbort();live();
     scanTextures();
-    renderer=await createGpuAnimationRenderer(device,{...renderOptions,indirectLights:true,threeLights:true,maxMeshes:2*maxBindings});
-    live();await prepare();return bridge;
+    const construction=createGpuAnimationRenderer(device,{...renderOptions,indirectLights:true,threeLights:true,maxMeshes:2*maxBindings}).then(value=>{
+      if(disposed||terminal){value.dispose();throw terminal??new ThreeSceneError('DISPOSED','Source scene is disposed');}
+      renderer=value;return value;
+    });
+    await Promise.race([construction,stopped]);live();await prepare();return bridge;
   }catch(error){disposed=true;release();throw error;}
 }

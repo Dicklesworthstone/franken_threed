@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>FrankenThreeD live source deformation</title>
+<style>body { font: 16px system-ui; margin: 2rem; } pre { white-space: pre-wrap; }</style>
+<h1>Native source skin/morph readback</h1>
+<p>Serve the repository root with the pinned Three.js build on localhost or HTTPS.
+This checks native GPU vertices against retained Three.js source evaluation,
+not rendering speed. A missing adapter is blocked, never passed.</p>
+<pre id="status">Running…</pre>
+<script type="module">
+import {createGpuThreeDeformation} from '../../../tools/ingest/three_deformation.mjs';
+import {createGpuThreeScene} from '../../../tools/ingest/three_scene.mjs';
+import {createGpuRenderTarget} from '../../../tools/ingest/gpu_render_target.mjs';
+const log = [], assert = (ok, message) => { if (!ok) throw new Error(message); };
+async function readVertices(device, gpu) {
+  const buffer = device.createBuffer({size: gpu.vertexCount * 40,
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ});
+  try {
+    const encoder = device.createCommandEncoder();
+    encoder.copyBufferToBuffer(gpu.vertexBuffer, 0, buffer, 0, gpu.vertexCount * 40);
+    device.queue.submit([encoder.finish()]);
+    await buffer.mapAsync(GPUMapMode.READ);
+    const values = new Float32Array(buffer.getMappedRange()).slice();
+    buffer.unmap();
+    return values;
+  } finally { buffer.destroy(); }
+}
+async function run() {
+  if (!navigator.gpu) return {status: 'blocked', reason: 'WebGPU unavailable'};
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) return {status: 'blocked', reason: 'No WebGPU adapter'};
+  const device = await adapter.requestDevice(), errors = [];
+  device.addEventListener('uncapturederror', event => errors.push(event.error.message));
+  try {
+    const THREE = await import('../../../upstream/three.js/build/three.core.js');
+    assert(THREE.REVISION === '186', 'Pinned Three.js r186 required');
+    for (const relative of [true, false]) for (const bindMode of ['attached', 'detached']) {
+      const scene = new THREE.Scene(), geometry = new THREE.BufferGeometry();
+      geometry.setAttribute('position', new THREE.Float32BufferAttribute([-0.5,-0.5,0, 0.5,-0.5,0, 0,0.5,0], 3));
+      geometry.setAttribute('normal', new THREE.Float32BufferAttribute([0,0,1, 0,0,1, 0,0,1], 3));
+      geometry.setAttribute('skinIndex', new THREE.Uint16BufferAttribute(new Uint16Array(12), 4));
+      geometry.setAttribute('skinWeight', new THREE.Float32BufferAttribute([1,0,0,0, 1,0,0,0, 1,0,0,0], 4));
+      const targetValues = new Float32Array(9);
+      for (let i = 0; i < 9; i++) targetValues[i] = (relative ? 0 : geometry.attributes.position.array[i]) + (i % 3 === 0 ? 0.25 : 0);
+      geometry.morphTargetsRelative = relative;
+      geometry.morphAttributes.position = [new THREE.Float32BufferAttribute(targetValues, 3)];
+      const material = new THREE.MeshBasicMaterial({color: 0xffffff, side: THREE.DoubleSide});
+      const mesh = new THREE.SkinnedMesh(geometry, material), bone = new THREE.Bone();
+      mesh.add(bone); scene.add(mesh); mesh.position.x = 0.2; scene.updateMatrixWorld(true);
+      const skeleton = new THREE.Skeleton([bone]); mesh.bind(skeleton); mesh.bindMode = bindMode;
+      mesh.frustumCulled = false;
+      let owner, bridge, target;
+      try {
+        owner = await createGpuThreeDeformation(device, mesh, {three: THREE});
+        const reference = new THREE.Vector3();
+        for (const weight of [0, 0.5, -1, 2]) {
+          mesh.morphTargetInfluences[0] = weight;
+          bone.position.x = 0.125 + weight * 0.05; bone.rotation.z = 0.3;
+          mesh.position.x = 0.4; scene.updateMatrixWorld(true); owner.update();
+          const values = await readVertices(device, owner.deformer);
+          for (let vertex = 0; vertex < 3; vertex++) {
+            mesh.getVertexPosition(vertex, reference);
+            const expected = reference.toArray();
+            for (let axis = 0; axis < 3; axis++)
+              assert(Math.abs(values[vertex * 10 + axis] - expected[axis]) < 2e-5,
+                `${bindMode}/${relative}/${weight}: vertex ${vertex}, axis ${axis}`);
+          }
+          log.push({case: 'native vertex readback', bindMode, relative, weight});
+        }
+        // Execute the actual source bridge too: its private core owner must be
+        // accepted by the actual renderer, with one owner for this source mesh.
+        target = createGpuRenderTarget(device, {width: 32, height: 32, format: 'rgba8unorm', depthFormat: null});
+        await target.whenIdle();
+        bridge = await createGpuThreeScene(device, scene, {three: THREE, maxBindings: 4,
+          renderer: {...target.rendererOptions, maxDraws: 8}});
+        const camera = new THREE.OrthographicCamera(-2, 2, 2, -2, 0.1, 10); camera.position.z = 2;
+        for (const weight of [0, 1]) {
+          mesh.morphTargetInfluences[0] = weight;
+          target.withFrame(attachments => bridge.render(camera, attachments));
+          await bridge.whenIdle();
+        }
+        assert(bridge.diagnostics.deformedMeshCount === 1, 'Expected one shared per-mesh deformation owner');
+        log.push({case: 'native source scene submissions', bindMode, relative});
+      } finally { bridge?.dispose(); target?.dispose(); owner?.dispose(); skeleton.dispose(); geometry.dispose(); material.dispose(); }
+    }
+    await device.queue.onSubmittedWorkDone();
+    assert(errors.length === 0, `Uncaptured GPU errors: ${errors.join('; ')}`);
+    return {status: 'passed', log, accelerationClaim: false};
+  } finally { device.destroy(); }
+}
+try { window.__f3dThreeDeformationResult = await run(); }
+catch (error) { window.__f3dThreeDeformationResult = {status: 'failed', error: String(error.stack ?? error), log}; }
+document.querySelector('#status').textContent = JSON.stringify(window.__f3dThreeDeformationResult, null, 2);
+</script>
+</html>

@@ -10,7 +10,8 @@ import {pathToFileURL} from 'node:url';
 import {createHash} from 'node:crypto';
 import {buildAnimation} from './build_animation.mjs';
 const modules = ['gpu_canvas.mjs', 'gpu_canvas_renderer.mjs', 'three_canvas.mjs',
-  'gpu_hdr_canvas.mjs', 'gpu_render_target.mjs', 'animation_output.mjs'];
+  'gpu_hdr_canvas.mjs', 'gpu_render_target.mjs', 'animation_output.mjs',
+  'three_deformation.mjs', 'three_deformation_binding.mjs'];
 function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'f3d-canvas-package-'));
   const entry = path.join(root, 'model.gltf');
@@ -18,7 +19,7 @@ function fixture() {
   return {root, entry};
 }
 
-test('source-scene packages carry hashed canvas modules and retain exports after relocation', async () => {
+test('source-scene packages carry hashed canvas/deformation modules and retain exports after relocation', async () => {
   const {root, entry} = fixture(), output = path.join(root, 'built');
   const result = buildAnimation(entry, output, {webgpu: true, threeScene: true});
   for (const name of modules) {
@@ -32,16 +33,17 @@ test('source-scene packages carry hashed canvas modules and retain exports after
   const relocated = path.join(root, 'relocated'); fs.cpSync(output, relocated, {recursive: true});
   const api = await import(pathToFileURL(path.join(relocated, 'gpu_playback.mjs')));
   for (const name of ['createGpuThreeCanvas', 'createGpuCanvasTarget', 'createGpuCanvasRenderer', 'GpuCanvasError', 'createGpuThreeScene',
-    'createGpuThreeHdrCanvas', 'createGpuHdrCanvasRenderer', 'GpuHdrCanvasError', 'createGpuRenderTarget', 'GpuRenderTargetError'])
+    'createGpuThreeHdrCanvas', 'createGpuHdrCanvasRenderer', 'GpuHdrCanvasError', 'createGpuRenderTarget', 'GpuRenderTargetError',
+    'createGpuThreeDeformation', 'updateGpuThreeDeformations', 'createThreeDeformationBinding', 'ThreeDeformationError'])
     assert.equal(typeof api[name], 'function', name);
   const pose = api.createPlayer(); assert.equal(pose.nodeCount, 1); pose.dispose();
   assert.equal(result.accelerationClaim, false);
 });
 
-for (const webgpu of [false, true]) test(`non-source-scene packages do not acquire canvas modules: webgpu=${webgpu}`, () => {
+for (const webgpu of [false, true]) test(`non-source-scene packages do not acquire canvas/deformation modules: webgpu=${webgpu}`, () => {
   const {root, entry} = fixture(), output = path.join(root, 'built');
   const result = buildAnimation(entry, output, {webgpu});
   for (const name of modules) assert.equal(result.emittedFiles.includes(name), false);
   const entrySource = fs.readFileSync(path.join(output, webgpu ? 'gpu_playback.mjs' : 'playback.mjs'), 'utf8');
-  assert.doesNotMatch(entrySource, /createGpuThreeCanvas|gpu_canvas|gpu_hdr_canvas|gpu_render_target/);
+  assert.doesNotMatch(entrySource, /createGpuThreeCanvas|gpu_canvas|gpu_hdr_canvas|gpu_render_target|three_deformation/);
 });

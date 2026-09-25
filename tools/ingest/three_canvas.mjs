@@ -26,11 +26,12 @@ function createSourceCanvas(createCanvas, canvas, scene, options) {
   if (!sourceOptions || typeof sourceOptions !== 'object' || Array.isArray(sourceOptions))
     throw new GpuCanvasError('OPTIONS', 'Expected source scene options');
   const source = {...sourceOptions};
+  if (Object.hasOwn(source, 'signal')) throw new GpuCanvasError('OPTIONS', 'Supply one top-level canvas lifetime signal');
   if (Object.hasOwn(source, 'three')) throw new GpuCanvasError('OPTIONS', 'Supply one top-level pinned three module');
   if (source.renderer !== undefined && (!source.renderer || typeof source.renderer !== 'object' || Array.isArray(source.renderer)))
     throw new GpuCanvasError('OPTIONS', 'Expected source renderer options');
   const renderer = {...source.renderer};
-  for (const key of ['texture', 'geometry']) {
+  for (const key of ['texture', 'geometry', 'deformation']) {
     if (source[key] === undefined) continue;
     if (!source[key] || typeof source[key] !== 'object' || Array.isArray(source[key]))
       throw new GpuCanvasError('OPTIONS', `Expected source ${key} options`);
@@ -38,10 +39,10 @@ function createSourceCanvas(createCanvas, canvas, scene, options) {
   }
   // Attachment compatibility is fixed by the render target, not caller pipeline
   // state. Reject conflicts instead of silently changing their meaning.
-  return createCanvas(canvas, (device, attachments) => {
+  return createCanvas(canvas, (device, attachments, {signal} = {}) => {
     for (const [key, value] of Object.entries(attachments))
       if (renderer[key] !== undefined && renderer[key] !== value)
         throw new GpuCanvasError('FORMAT', `Source renderer ${key} differs from the render target`);
-    return createGpuThreeScene(device, scene, {...source, three, renderer: {...renderer, ...attachments}});
+    return createGpuThreeScene(device, scene, {...source, three, signal, renderer: {...renderer, ...attachments}});
   }, canvasOptions);
 }
