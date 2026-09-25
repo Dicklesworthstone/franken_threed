@@ -52,6 +52,11 @@ function collect(scene, camera, options) {
           "UNSUPPORTED_CALLBACK", "custom intersectsFrustum is not supported",
         );
       }
+      requireThat(
+        node.getVertexPosition === Mesh.prototype.getVertexPosition ||
+          (node.isSkinnedMesh === true && node.getVertexPosition === SkinnedMesh.prototype.getVertexPosition),
+        "UNSUPPORTED_CALLBACK", "custom getVertexPosition is not supported",
+      );
       meshes.push(node);
     }
     // Bound pending work as well as visited rows before pushing a wide hierarchy.
@@ -86,7 +91,8 @@ function meshView(row, positions, bounds) {
     boundingBox: undefined,
     boundingSphere: undefined,
     intersectsFrustum: Mesh.prototype.intersectsFrustum,
-  }, Mesh.prototype);
+    getVertexPosition: Mesh.prototype.getVertexPosition,
+  });
 }
 
 /**
