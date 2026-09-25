@@ -6,6 +6,7 @@
  * The light camera is explicit, column-major, with WebGPU clip depth 0..1.
  * Directional/spot projections are supported; point-light cubemaps, cascades,
  * automatic fitting and translucent shadow transmission are not synthesized.
+ * MASK draws may override alphaCutoff without rebuilding their caster binding.
  */
 import { AnimationRenderError, createGpuAnimationRenderer } from "./animation_render.mjs";
 
@@ -212,7 +213,7 @@ export async function createGpuAnimationShadowMap(device, options = {}) {
         const nextDependencies = [],
           draws = list.map((value) => {
             const input = owned.has(value) ? { mesh: value } : value;
-            fields(input, ["mesh", "worldMatrix", "baseColor", "first", "count", "uvTransform"]);
+            fields(input, ["mesh", "worldMatrix", "baseColor", "first", "count", "uvTransform", "alphaCutoff"]);
             const record = owned.get(input.mesh);
             if (!record || record.mesh.disposed) fail("Caster does not belong to this live map");
             const { gpu, mesh } = record,
@@ -235,7 +236,10 @@ export async function createGpuAnimationShadowMap(device, options = {}) {
                   fail(`Invalid ${key} storage`);
                 draw[key] = Array.from(values);
               }
-            for (const key of ["first", "count"])
+            // Keep per-draw MASK thresholds live, just like the color pass.
+            // The renderer validates MASK applicability and the [0,1] range
+            // before any GPU writes; do not freeze the registration-time value.
+            for (const key of ["first", "count", "alphaCutoff"])
               if (input[key] !== undefined) draw[key] = input[key];
             return draw;
           });
