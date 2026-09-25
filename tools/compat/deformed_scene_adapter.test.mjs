@@ -18,7 +18,7 @@ export class BufferGeometry {
   computeBoundingBox(){const a=this.attributes.position;this.boundingBox={min:[Infinity,Infinity,Infinity],max:[-Infinity,-Infinity,-Infinity]};for(let i=0;i<a.count;i++)for(let j=0;j<3;j++){const v=a.array[i*3+j];this.boundingBox.min[j]=Math.min(this.boundingBox.min[j],v);this.boundingBox.max[j]=Math.max(this.boundingBox.max[j],v);}}
   computeBoundingSphere(){if(!this.boundingBox)this.computeBoundingBox();const center=this.boundingBox.min.map((v,i)=>(v+this.boundingBox.max[i])/2);let radius=0;for(let i=0;i<this.attributes.position.count;i++)radius=Math.max(radius,Math.hypot(...center.map((v,j)=>v-this.attributes.position.array[i*3+j])));this.boundingSphere={center,radius};}
 }
-export class Mesh { intersectsFrustum(){return true;} }
+export class Mesh { intersectsFrustum(){return true;} getVertexPosition(){return null;} }
 export class SkinnedMesh extends Mesh { intersectsFrustum(){return true;} }
 const state=()=>globalThis[Symbol.for('f3d.deformed-scene-contract')];
 export function canAdmitMesh(...args){return state().admit(...args);}
@@ -75,7 +75,7 @@ function mesh(skinned = true) {
 function setup() {
   const scene = object(), camera = { ...object(), isCamera: true };
   const state = { nativeCalls: 0, renderCalls: 0, submissions: [], shift: 10 };
-  state.admit = (item) => Object.hasOwn(item, "onBeforeRender") || !item.material.isMeshBasicMaterial
+  state.admit = (item) => item.onBeforeRender !== undefined || !item.material.isMeshBasicMaterial
     ? { admitted: false, code: "UNSUPPORTED_CALLBACK", reason: "source hook or material" } : { admitted: true };
   state.render = async (host, staged, stagedCamera, context, wasm, options) => {
     state.renderCalls++; state.staged = staged; state.camera = stagedCamera; state.options = options;
@@ -108,7 +108,8 @@ test("mixed nested scene uses one native evaluation and fresh post-pose bounds",
   assert.deepEqual(staged.geometry.boundingBox.min, [10, 10, 10]);
   assert.deepEqual(staged.geometry.boundingSphere.center, [10.5, 10.5, 10]);
   assert.equal(staged.boundingSphere, undefined);
-  assert.equal(Object.getPrototypeOf(staged), Mesh.prototype);
+  assert.equal(Object.getPrototypeOf(staged), Object.getPrototypeOf(a));
+  assert.equal(staged.getVertexPosition, Mesh.prototype.getVertexPosition);
   assert.equal(staged.intersectsFrustum, Mesh.prototype.intersectsFrustum);
   assert.equal(staged.isSkinnedMesh, false);
   assert.equal(staged.parent, stagedGroup); assert.equal(stagedGroup.parent, result.scene);
@@ -259,4 +260,17 @@ test("renderer failure propagates with source topology and geometry intact", asy
   await assert.rejects(render(host, scene, camera, null, wasm), (e) => e === error);
   assert.equal(state.renderCalls, 1); assert.equal(a.parent, scene);
   assert.equal(a.geometry.attributes.position.getX(0), 0); assert.equal(a.isSkinnedMesh, true);
+});
+
+
+test("inherited render hooks and custom vertex deformation cannot bypass admission", () => {
+  const { scene, camera, wasm, state } = setup(), a = mesh(); add(scene, a);
+  class CustomSkin extends SkinnedMesh { onBeforeRender() {} }
+  Object.setPrototypeOf(a, CustomSkin.prototype);
+  assert.throws(() => prepare(scene, camera, wasm), refuses("UNSUPPORTED_CALLBACK"));
+  assert.equal(state.nativeCalls, 0);
+  Object.setPrototypeOf(a, SkinnedMesh.prototype);
+  a.getVertexPosition = () => { throw new Error("must not execute"); };
+  assert.throws(() => prepare(scene, camera, wasm), refuses("UNSUPPORTED_CALLBACK"));
+  assert.equal(state.nativeCalls, 0);
 });
