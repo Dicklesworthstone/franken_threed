@@ -11,6 +11,8 @@
  * addClips() appends copied decoded clips without changing the current pose or
  * existing clip indices. clips is a frozen metadata snapshot; clipVersion tracks
  * successful nonempty installations independently of the pose's version.
+ * snapshotClips() returns bounded caller-owned copies for reuse or asset export;
+ * it never samples the live pose or rewrites the imported source definition.
  *
  * Conventions: glTF 2.0 section 3.11 / Appendix C; column-major T*R*S;
  * mesh-local palette = inverse(meshWorld) * jointWorld * inverseBindMatrix.
@@ -432,7 +434,8 @@ export function createAnimationPlayer(definition) {
               quantizedRotation ? 0.01 : 1e-3,
             );
         duration = Math.max(duration, times[count - 1]);
-        channels.push({ node, path, width, interpolation, times, values, cursor: 0 });
+        channels.push({ node, path, width, interpolation, times, values, cursor: 0,
+          ...(quantizedRotation === undefined ? {} : { quantizedRotation }) });
       }
       decoded.push({ name: String(clip.name ?? `animation_${start + clipIndex}`), duration, channels });
     }
@@ -542,6 +545,47 @@ export function createAnimationPlayer(definition) {
     clipMetadata = nextMetadata;
     clipVersion++;
     return indices;
+  }
+  /** Copy selected installed clips, in requested order, without evaluating
+   * the pose. Unique IDs keep output keyframe storage within the live budget.
+   * The envelope/indices are immutable; clip records and arrays belong to the
+   * caller. A snapshot cannot become stale when more clips are later installed.
+   */
+  function snapshotClips(input) {
+    const count = input === undefined ? clips.length : input?.length;
+    if ((input !== undefined && !Array.isArray(input)) ||
+        !Number.isSafeInteger(count) || count < 0 || count > clips.length)
+      fail("ANIMATION_CLIPS", "Expected a bounded array of unique clip indices");
+    const indices = [], seen = new Set();
+    for (let i = 0; i < count; i++) {
+      const index = integer(input === undefined ? i : input[i], clips.length, "Snapshot clip");
+      if (seen.has(index)) fail("ANIMATION_CLIPS", "Duplicate snapshot clip");
+      seen.add(index);
+      indices.push(index);
+    }
+    const copied = indices.map((index) => {
+      const clip = clips[index];
+      return {
+        name: clip.name,
+        channels: clip.channels.map((channel) => ({
+          node: channel.node,
+          path: channel.path,
+          interpolation: channel.interpolation,
+          times: Array.from(channel.times),
+          values: Array.from(channel.values),
+          ...(channel.quantizedRotation === undefined ? {} :
+            { quantizedRotation: channel.quantizedRotation }),
+        })),
+      };
+    });
+    checkStorage();
+    return Object.freeze({
+      format: "f3d-animation-clips-v1",
+      nodeCount: n,
+      clipVersion,
+      indices: Object.freeze(indices),
+      clips: copied,
+    });
   }
   function resetScratch() {
     scratch.translations.set(baseT);
@@ -845,6 +889,9 @@ export function createAnimationPlayer(definition) {
     },
     addClips(clips) {
       return run(addClips, clips);
+    },
+    snapshotClips(indices) {
+      return run(snapshotClips, indices);
     },
     instances: Object.freeze(instances),
     sample(time, options) {

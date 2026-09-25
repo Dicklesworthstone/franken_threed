@@ -37,7 +37,23 @@ recorder.dispose();
 
 The same clip can be appended to a decoded definition's `clips` array before
 creating a new player, or passed to `exportGltfAssetGLB(asset, {clips:[take.clip]})`.
-Neither recorder nor exporter changes a running player's immutable clip table.
+Recording and exporting do not automatically change a running player's clip
+table. To install the take into the existing model without replacing its pose,
+use the explicit live-clip API:
+
+```js
+const [clipIndex] = model.pose.addClips([take.clip]);
+const replay = model.controller.createAction(clipIndex);
+// Explicitly play it, or crossfade from the application's current action.
+model.controller.crossFade(currentAction, replay, 0.2);
+```
+
+Existing actions keep contributing until explicitly stopped or crossfaded. A
+live recorder can continue capturing after other clips are installed; registry
+changes alone do not advance the pose version. `model.pose.snapshotClips([clipIndex])`
+returns independent installed keyframes for later reuse/export even after the
+original `take.clip` arrays have been discarded. See `ANIMATION_LIVE_CLIPS.md` for
+stable IDs, cumulative limits, selected snapshots and source-node boundaries.
 A model's `exportSourceGLB()` still returns its original authored snapshot.
 
 ## Track and time semantics

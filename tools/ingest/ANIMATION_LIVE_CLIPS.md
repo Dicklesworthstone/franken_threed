@@ -46,7 +46,60 @@ Input channels and keyframe arrays are copied. Editing, detaching or discarding
 the caller's input after success cannot change the installed motion. The source
 definition used to create the player is not modified, nor are other players made
 from that definition. This API does not mutate an original GLB/source snapshot;
-retain the input clips when exporting them through the asset exporter.
+use `snapshotClips()` to copy installed motion for reuse or asset export.
+
+## Existing controllers and saved clip libraries
+
+A controller created before installation can create actions for the returned IDs.
+Already running, paused or scheduled actions keep their clocks, fades, warps and
+loop/finish state. Installation creates no actions and emits no controller events.
+Existing actions contribute until stopped or crossfaded. Starting a new action
+is explicit; the application still owns its
+usual controller/model update and upload ordering.
+
+```js
+const [index] = model.pose.addClips([take.clip]);
+const action = model.controller.createAction(index, {loop: 'repeat'}).play();
+// Or use model.controller.crossFade(existingAction, action, seconds).
+// Advance and upload through the model's existing frame loop.
+```
+
+`pose.snapshotClips(indices?)` copies installed keyframes without sampling or
+changing the live pose. Omit indices for all clips; pass a unique index array for
+a selected/reordered subset, or `[]` for none. The frozen result has
+`format:'f3d-animation-clips-v1'`, `nodeCount`, `clipVersion`, frozen `indices`,
+and caller-owned `clips`. Each clip, channel and ordinary numeric array is an
+independent copy, not a view into sampler storage. The source indices describe
+the order of `clips`; reinstalling returns new destination indices.
+
+```js
+// Copy one installed take for append-mode export.
+const saved = model.pose.snapshotClips([index]);
+const glb = await model.exportAnimationGLB(saved.clips);
+
+// Or explicitly replace the asset's animations with the runtime's whole library.
+const library = model.pose.snapshotClips();
+const allMotionGLB = await model.exportAnimationGLB(library.clips, {
+  animationMode: 'replace',
+});
+```
+
+The model's source-export facility must have been enabled at construction and
+tracks must still use the corresponding original glTF node IDs. Snapshotting
+preserves admitted Float64 key values, signed zero, cubic tangents, interpolation
+and rotation-quantization admission markers. It does not apply the recorder's
+Float32 conversion, recover decoder-ignored tracks/extensions, copy a rig, or
+serialize action clocks/events. A matching `nodeCount` is not proof of rig
+compatibility. Replacing source animations is explicit and can discard source
+channels that were not admitted into the runtime; `exportSourceGLB()` remains the
+separate original-asset preservation path.
+
+Snapshots remain valid after later installations or player disposal. Editing a
+snapshot cannot modify the installed clips. Unique selection prevents multiplying
+the installed keyframe budget through repeated IDs; copied keyframe components
+are bounded by the live library's limit. Snapshot output and live storage coexist
+as separate bounded stages, not one aggregate process-memory budget. Caller-
+retained historical snapshots remain caller-owned.
 
 ## All-or-nothing batches and lifetime bounds
 
@@ -85,9 +138,16 @@ PropertyBinding tracks. Source model/asset export and live installation are
 separate operations. GPU consumers need their usual update/upload after the
 caller actually samples or blends a new pose, not after a registry-only change.
 
-`node --test tools/ingest/animation_runtime_clips.test.mjs` exercises the real
-runtime, including late first clips, all three interpolation modes, normal and
-additive blending, masks, wider morph channels, shared-skeleton mesh-local
-palettes, cumulative limits and failed-batch recovery. These CPU checks do not
-claim native GPU pixels, Three.js mixer parity, full-repository validation or
-measured speed improvements.
+Run the focused suites:
+
+```sh
+node --test tools/ingest/animation_runtime_clips.test.mjs tools/ingest/animation_live_clips.test.mjs
+```
+
+The suites execute
+the real runtime, controller and recorder: late first clips, interpolation,
+normal/additive blending, masks, wide morphs, shared-skeleton palettes, cumulative
+limits, failed-batch recovery, scheduled/reversing playback, synchronized/warped
+crossfades and record/install/play/snapshot/reinstall round trips. These CPU
+checks do not claim native GPU pixels, a new GLB round-trip test, Three.js mixer
+parity, full-repository validation or measured speed improvements.
