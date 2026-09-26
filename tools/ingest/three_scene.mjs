@@ -8,7 +8,8 @@
  * is NOT a constructor replacement or complete Three.js renderer compatibility.
  * Unsupported renderable families, shader/render hooks and fog fail explicitly.
  * environment:{} filters a ready source HDR panorama for Standard materials;
- * intensity/rotation remain live. shadow:{} opts into one directional/spot map,
+ * intensity/rotation remain live. background:{} draws an unfiltered ready HDR
+ * panorama behind perspective scenes. shadow:{} opts into one directional/spot map,
  * shared animated casters and selective receivers; it is not filter parity.
  * Ready byte/image/canvas textures receive
  * owned native residency by default; a borrowed binding Map still overrides it.
@@ -41,7 +42,7 @@ export async function createGpuThreeScene(device,scene,{
   three, textures=new Map(), autoTextures=true, texture:textureOptions={}, renderer:renderOptions={}, geometry:geometryOptions={},
   maxNodes=16384,maxGeometries=256,maxBindings=1024,maxGeometryBytes=128*1024*1024,sortObjects=true,
   maxInstanceMeshes=256,maxInstanceBytes=128*1024*1024,
-  deformation:deformationOptions={},maxDeformedMeshes=256,maxDeformationBytes=128*1024*1024,shadow=null,environment=null,signal,
+  deformation:deformationOptions={},maxDeformedMeshes=256,maxDeformationBytes=128*1024*1024,shadow=null,environment=null,background=null,signal,
 }={}) {
   if(three?.REVISION!=='186'||typeof three.Matrix4!=='function'||typeof three.Frustum!=='function'||
       typeof three.Mesh!=='function'||!(scene instanceof three.Scene))fail('SOURCE','Supply the pinned r186 module and its Scene');
@@ -79,6 +80,14 @@ export async function createGpuThreeScene(device,scene,{
   if(environmentEnabled&&renderOptions.environment===false)fail('OPTIONS','Source environments require IBL pipelines');
   const environmentApi=environmentEnabled?await import('./three_environment.mjs'):null;
   let environmentOwner=null,pendingEnvironment=null;
+  if(background!==null&&(!background||typeof background!=='object'||Array.isArray(background)))fail('OPTIONS','Expected background options or null');
+  const backgroundOptions=Object.freeze({...background});
+  for(const key of Object.keys(backgroundOptions))if(!['maxBytes','maxPixels','label'].includes(key))fail('OPTIONS',`Unsupported source background option: ${key}`);
+  const backgroundEnabled=background!==null,maxBackgroundBytes=backgroundOptions.maxBytes??128*1024*1024;
+  integer(maxBackgroundBytes,1,Number.MAX_SAFE_INTEGER,'background budget');
+  const backgroundApi=backgroundEnabled?await import('./three_background.mjs'):null;
+  let backgroundOwner=null,pendingBackground=null,backgroundPasses=0,backgroundColorPasses=0;
+  const sourceBackground=()=>scene.background!==null&&!scene.background?.isColor?scene.background:null;
   const models=new Map([
     [three.MeshBasicMaterial.prototype,'unlit'],[three.MeshLambertMaterial.prototype,'lambert'],
     [three.MeshPhongMaterial.prototype,'phong'],[three.MeshToonMaterial.prototype,'toon'],
@@ -88,7 +97,7 @@ export async function createGpuThreeScene(device,scene,{
   const pendingDeformations=new Set(),deformationLifetime=new AbortController();
   let textureOwner=null,textureScan=null,frameTextures=null,retainedTextures=new Set();
   const ownedTextures=()=>textureOwner??=createGpuThreeTextures(device,{...textureOptions,three});
-  const resourceFailed=()=>!!renderer?.failed||!!textureOwner?.failed||!!shadowOwner?.failed||!!pendingShadow?.failed||!!environmentOwner?.failed||!!pendingEnvironment?.failed||[...geometries.values(),...instances.values(),...deformations.values(),...pendingDeformations].some(g=>g.failed);
+  const resourceFailed=()=>!!renderer?.failed||!!textureOwner?.failed||!!shadowOwner?.failed||!!pendingShadow?.failed||!!environmentOwner?.failed||!!pendingEnvironment?.failed||!!backgroundOwner?.failed||!!pendingBackground?.failed||[...geometries.values(),...instances.values(),...deformations.values(),...pendingDeformations].some(g=>g.failed);
   let entries=[],lookup=new Map(),renderer,disposed=false,terminal=null,busy=false,preparing=false,prepareVersion=0,sourceDraws=0;
   // End the owner's wait without claiming to cancel already-issued GPU work.
   // Renderer registration still retires its private resources if it resolves late.
@@ -107,6 +116,7 @@ export async function createGpuThreeScene(device,scene,{
   function release(){
     signal?.removeEventListener('abort',onAbort);
     deformationLifetime.abort();
+    backgroundOwner?.dispose();pendingBackground?.dispose();backgroundOwner=null;pendingBackground=null;
     environmentOwner?.dispose();pendingEnvironment?.dispose();environmentOwner=null;pendingEnvironment=null;
     shadowOwner?.dispose();pendingShadow?.dispose();shadowOwner=null;pendingShadow=null;casters.clear();
     for(const entry of entries)entry.mesh.dispose();entries=[];lookup.clear();
@@ -184,8 +194,12 @@ export async function createGpuThreeScene(device,scene,{
       if(object.isLight)light(object);
       for(let i=object.children.length-1;i>=0;i--)stack.push(object.children[i]);
     }
-    if(scene.fog!==null||(!environmentEnabled&&scene.environment!==null)||(scene.background!==null&&!scene.background.isColor))
-      fail('SCENE','Fog, disabled source environments and texture backgrounds require their own rendering paths');
+    if(scene.fog!==null||(!environmentEnabled&&scene.environment!==null)||(!backgroundEnabled&&sourceBackground()!==null))
+      fail('SCENE','Fog, disabled source environments and disabled texture backgrounds require their own rendering paths');
+    if(backgroundEnabled&&sourceBackground()!==null){
+      backgroundApi.inspectThreeBackground(sourceBackground(),three,backgroundOptions);
+      backgroundApi.inspectThreeBackgroundState(scene);
+    }
     if(environmentEnabled&&scene.environment!==null)environmentApi.inspectThreeEnvironment(scene.environment,three,environmentOptions);
     if(shadowEnabled){
       if(scene.overrideMaterial!==null)fail('SHADOW','Source shadow mode does not infer overrideMaterial depth semantics');
@@ -349,7 +363,7 @@ export async function createGpuThreeScene(device,scene,{
   async function prepare(){
     live();if(busy)fail('REENTRANT','A source-scene operation is already running');busy=true;preparing=true;
     const created=[],added=[],addedInstances=[],createdDeformations=[],nextDeformations=new Map(),createdCasters=[];
-    let nextShadow=shadowOwner,nextEnvironment=environmentOwner;
+    let nextShadow=shadowOwner,nextEnvironment=environmentOwner,nextBackground=backgroundOwner;
     const nextCasters=new Map();
     try{
       // Validate all source materials and texture inputs before allocating any
@@ -358,6 +372,8 @@ export async function createGpuThreeScene(device,scene,{
       const nodes=graph(),request=desired(nodes),next=[];
       const selected=shadowEnabled?shadowLight(nodes):null;
       const shadowSignature=selected?shadowApi.inspectThreeShadow(selected,three).signature:null;
+      const selectedBackground=backgroundEnabled?sourceBackground():null;
+      const backgroundSignature=selectedBackground?backgroundApi.inspectThreeBackground(selectedBackground,three,backgroundOptions).signature:null;
       const selectedEnvironment=environmentEnabled?scene.environment:null;
       const environmentSignature=selectedEnvironment?environmentApi.inspectThreeEnvironment(selectedEnvironment,three,environmentOptions).signature:null;
       for(const item of request){
@@ -457,6 +473,22 @@ export async function createGpuThreeScene(device,scene,{
           nextEnvironment=await Promise.race([construction,stopped]);live();
         }
       }
+      // Keep the original-resolution background separate from the filtered IBL
+      // map. Replacements retain and charge the previous submitted resource.
+      if(backgroundEnabled){
+        if(!selectedBackground)nextBackground=null;
+        else if(!backgroundOwner||backgroundOwner.source!==selectedBackground||!backgroundOwner.matches()){
+          const available=maxBackgroundBytes-(backgroundOwner?.allocatedBytes??0);
+          if(available<1)fail('LIMIT','Background replacement exceeds the old-plus-new GPU budget');
+          const construction=backgroundApi.createGpuThreeBackground(device,selectedBackground,
+            {...backgroundOptions,three,maxBytes:available,format:renderOptions.format??'rgba8unorm',
+              sampleCount:renderOptions.sampleCount??1,signal:deformationLifetime.signal}).then(value=>{
+              if(disposed||terminal){value.dispose();throw terminal??new ThreeSceneError('DISPOSED','Source scene is disposed');}
+              pendingBackground=value;return value;
+            });
+          nextBackground=await Promise.race([construction,stopped]);live();
+        }
+      }
       // Retirement must not reject a preceding submitted draw's dependency
       // wait. Drain only when pruning whole owners (never on ordinary updates),
       // then recheck source structure after this additional asynchronous boundary.
@@ -465,7 +497,7 @@ export async function createGpuThreeScene(device,scene,{
       if([...geometries.keys()].some(g=>!usedGeometry.has(g))||[...instances.keys()].some(s=>!usedInstances.has(s))||
           [...deformations.values()].some(g=>!usedDeformations.has(g))||
           (shadowOwner&&(shadowOwner!==nextShadow||[...casters.keys()].some(e=>!nextCasters.has(e))))||
-          (environmentOwner&&environmentOwner!==nextEnvironment)){
+          (environmentOwner&&environmentOwner!==nextEnvironment)||(backgroundOwner&&backgroundOwner!==nextBackground)){
         await bridge.whenIdle();live();
       }
       // A layout can change while a pipeline await is outstanding, even when
@@ -501,13 +533,24 @@ export async function createGpuThreeScene(device,scene,{
         environmentApi.threeEnvironmentDescriptor(nextEnvironment,scene,three);
       }
       textureOwner?.update(owned);
+      // Material texture callbacks may change the source while acknowledging
+      // uploads. Recheck the background AFTER those callbacks, before publish.
+      if(backgroundEnabled){
+        const current=sourceBackground();
+        if(current!==selectedBackground||(current&&!same(backgroundSignature,backgroundApi.inspectThreeBackground(current,three,backgroundOptions).signature)))
+          fail('CHANGED','Source background changed during preparation');
+        nextBackground?.check();if(current)backgroundApi.inspectThreeBackgroundState(scene);
+      }
       if(shadowOwner!==nextShadow){shadowOwner?.dispose();shadowStats=null;}
       else for(const [entry,caster] of casters)if(!nextCasters.has(entry))caster.dispose();
       shadowOwner=nextShadow;pendingShadow=null;casters=nextCasters;
       if(environmentOwner!==nextEnvironment)environmentOwner?.dispose();
       environmentOwner=nextEnvironment;pendingEnvironment=null;
+      if(backgroundOwner!==nextBackground)backgroundOwner?.dispose();
+      backgroundOwner=nextBackground;pendingBackground=null;
       publish(next);retainedTextures=owned;textureOwner?.retain(owned);prepareVersion++;return bridge;
     }catch(error){
+      if(nextBackground!==backgroundOwner)nextBackground?.dispose();pendingBackground=null;
       if(nextEnvironment!==environmentOwner)nextEnvironment?.dispose();pendingEnvironment=null;
       for(const caster of createdCasters)caster.dispose();
       if(nextShadow!==shadowOwner)nextShadow?.dispose();pendingShadow=null;
@@ -534,9 +577,10 @@ export async function createGpuThreeScene(device,scene,{
   }
   function render(camera,frame){
     live();if(busy)fail('REENTRANT','A source-scene operation is already running');busy=true;
+    let backgroundSubmitted=false;
     try{
       if(!frame||typeof frame!=='object')fail('FRAME','Supply borrowed render attachments');
-      for(const key of ['draws','viewProjection','lighting',...(shadowEnabled?['shadow']:[]),...(environmentEnabled?['environment']:[])])if(Object.hasOwn(frame,key))fail('FRAME',`${key} belongs to the source scene/camera`);
+      for(const key of ['draws','viewProjection','lighting',...(shadowEnabled?['shadow']:[]),...(environmentEnabled?['environment']:[]),...(backgroundEnabled?['background']:[])])if(Object.hasOwn(frame,key))fail('FRAME',`${key} belongs to the source scene/camera`);
       frameTextures=new Set();
       const nodes=graph();
       if(shadowEnabled){
@@ -549,7 +593,12 @@ export async function createGpuThreeScene(device,scene,{
         environmentOwner?.check();
         environmentFrame=environmentApi.threeEnvironmentDescriptor(environmentOwner,scene,three);
       }
+      if(backgroundEnabled){
+        if(sourceBackground()!==(backgroundOwner?.source??null))fail('PREPARE','Call prepare() after changing the source background');
+        backgroundOwner?.check();
+      }
       const lighting=cameraFrame(camera);lighting.lights=[];
+      const backgroundFrame=backgroundOwner?.capture(scene,camera)??null;
       const lightSources=[],casterObjects=[],casterItems=[],shadowDraws=[];
       const opaque=[],transparent=[],stack=[{object:scene,groupOrder:0}],descriptions=new Map();
       const get=m=>{if(!descriptions.has(m))descriptions.set(m,materialDescription(m));return descriptions.get(m);};
@@ -681,7 +730,7 @@ export async function createGpuThreeScene(device,scene,{
       }
       const prepared={...frame,viewProjection:clip.elements,lighting,draws};
       if(environmentEnabled)prepared.environment=environmentFrame;
-      if(scene.background!==null){prepared.clearColor=rgba(scene.background);prepared.loadOp='clear';}
+      if(scene.background?.isColor){prepared.clearColor=rgba(scene.background);prepared.loadOp='clear';}
       if(shadowEnabled){
         prepared.shadow=null;
         if(shadowFrame){
@@ -689,11 +738,26 @@ export async function createGpuThreeScene(device,scene,{
           prepared.shadow=shadowOwner.descriptor(shadowFrame,lightIndex);
         }
       }
+      if(backgroundFrame){
+        if(sourceBackground()!==backgroundOwner.source)fail('PREPARE','Source background changed during frame preparation');
+        backgroundOwner.render(backgroundFrame,{colorView:prepared.colorView,loadOp:prepared.loadOp,clearColor:prepared.clearColor});
+        backgroundSubmitted=true;live();
+        // Only color loads the prefix. The first geometry pass still honors the
+        // original depth clear/load policy; later receiver spans load both.
+        prepared.loadOp='load';
+      }
       renderer.render(prepared);live();sourceDraws=items.length;
+      backgroundPasses=backgroundFrame?1:0;
+      if(backgroundEnabled)backgroundColorPasses=(renderer.colorPassCount??1)+backgroundPasses;
       shadowStats=shadowFrame?Object.freeze({lightIndex,casters:shadowDraws.length,
         mapVersion:shadowOwner.version,updated:shadowFrame.update}):null;
       return bridge;
-    }catch(error){return failed(error);}finally{busy=false;frameTextures=null;if(disposed||terminal)release();}
+    }catch(error){
+      // A successful background prefix cannot be rolled back after color fails.
+      // Do not expose a partially submitted owner as safe for accidental retry.
+      if(backgroundSubmitted){terminal??=error;rejectStopped(terminal);}
+      return failed(error);
+    }finally{busy=false;frameTextures=null;if(disposed||terminal)release();}
   }
   const bridge=Object.freeze({scene,prepare,render,
     get disposed(){return disposed;},get failed(){return terminal!==null||resourceFailed();},
@@ -705,16 +769,17 @@ export async function createGpuThreeScene(device,scene,{
       textures:textureOwner?.diagnostics??null,
       shadowBytes:(shadowOwner?.allocatedBytes??0)+(pendingShadow?.allocatedBytes??0),shadowStats,
       environmentBytes:(environmentOwner?.allocatedBytes??0)+(pendingEnvironment?.allocatedBytes??0),
-      colorPasses:shadowEnabled||environmentEnabled?(renderer?.colorPassCount??0):null,
+      backgroundBytes:(backgroundOwner?.allocatedBytes??0)+(pendingBackground?.allocatedBytes??0),backgroundPasses,
+      colorPasses:backgroundEnabled?backgroundColorPasses:shadowEnabled||environmentEnabled?(renderer?.colorPassCount??0):null,
       bundles:renderer?.bundleDiagnostics??null});},
-    async whenIdle(){live();try{await Promise.race([Promise.all([renderer.whenIdle(),textureOwner?.whenIdle(),shadowOwner?.whenIdle(),pendingShadow?.whenIdle(),environmentOwner?.whenIdle(),pendingEnvironment?.whenIdle(),...[...geometries.values(),...instances.values(),...deformations.values(),...pendingDeformations].map(g=>g.whenIdle())]),stopped]);live();return bridge;}catch(error){return failed(error);}},
+    async whenIdle(){live();try{await Promise.race([Promise.all([renderer.whenIdle(),textureOwner?.whenIdle(),shadowOwner?.whenIdle(),pendingShadow?.whenIdle(),environmentOwner?.whenIdle(),pendingEnvironment?.whenIdle(),backgroundOwner?.whenIdle(),pendingBackground?.whenIdle(),...[...geometries.values(),...instances.values(),...deformations.values(),...pendingDeformations].map(g=>g.whenIdle())]),stopped]);live();return bridge;}catch(error){return failed(error);}},
     dispose(){if(busy&&!preparing)fail('REENTRANT','Cannot dispose during source submission');if(!disposed){disposed=true;rejectStopped(new ThreeSceneError('DISPOSED','Source scene bridge is disposed'));release();}},
   });
   try{
     // Source validation precedes even the renderer's uniform allocation.
     signal?.addEventListener('abort',onAbort,{once:true});if(signal?.aborted)onAbort();live();
     scanTextures();
-    const construction=createGpuAnimationRenderer(device,{...renderOptions,...(shadowEnabled?{shadows:true}:{}),...(environmentEnabled?{environment:true}:{}),indirectLights:true,threeLights:true,maxMeshes:2*maxBindings}).then(value=>{
+    const construction=createGpuAnimationRenderer(device,{...renderOptions,...(backgroundEnabled?{format:renderOptions.format??'rgba8unorm',sampleCount:renderOptions.sampleCount??1}:{}),...(shadowEnabled?{shadows:true}:{}),...(environmentEnabled?{environment:true}:{}),indirectLights:true,threeLights:true,maxMeshes:2*maxBindings}).then(value=>{
       if(disposed||terminal){value.dispose();throw terminal??new ThreeSceneError('DISPOSED','Source scene is disposed');}
       renderer=shadowEnabled?shadowApi.withThreeShadowReceivers(value,renderOptions.maxDraws??1024):value;
       if(environmentEnabled)renderer=environmentApi.withThreeEnvironmentReceivers(renderer,renderOptions.maxDraws??1024);

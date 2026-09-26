@@ -87,6 +87,14 @@ function capture(shape) {
   return pixels;
 }
 
+/** Copy the same bounded, oriented binary16 panorama for raw backgrounds.
+ * No GPU allocation, filtering, source mutation or upload acknowledgement.
+ * Consumers must preflight their own aggregate byte budget before this copy.
+ */
+export function captureThreeEnvironmentPixels(texture, three, options) {
+  return capture(inspectThreeEnvironment(texture, three, options));
+}
+
 /** Own a filtered map, not a source Texture. maxBytes bounds transient panorama,
  * filter uniforms and output maps together; callers charge retained OLD maps
  * separately when replacing an owner. No sampling quality is silently reduced.
