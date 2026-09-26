@@ -6,8 +6,9 @@
  *
  * This admits rigid/instanced Mesh plus source skin/morph deformation. It
  * is NOT a constructor replacement or complete Three.js renderer compatibility.
- * Unsupported renderable families, shader/render hooks, fog, source environment
- * maps fail explicitly. shadow:{} opts into one source directional/spot map,
+ * Unsupported renderable families, shader/render hooks and fog fail explicitly.
+ * environment:{} filters a ready source HDR panorama for Standard materials;
+ * intensity/rotation remain live. shadow:{} opts into one directional/spot map,
  * shared animated casters and selective receivers; it is not filter parity.
  * Ready byte/image/canvas textures receive
  * owned native residency by default; a borrowed binding Map still overrides it.
@@ -40,7 +41,7 @@ export async function createGpuThreeScene(device,scene,{
   three, textures=new Map(), autoTextures=true, texture:textureOptions={}, renderer:renderOptions={}, geometry:geometryOptions={},
   maxNodes=16384,maxGeometries=256,maxBindings=1024,maxGeometryBytes=128*1024*1024,sortObjects=true,
   maxInstanceMeshes=256,maxInstanceBytes=128*1024*1024,
-  deformation:deformationOptions={},maxDeformedMeshes=256,maxDeformationBytes=128*1024*1024,shadow=null,signal,
+  deformation:deformationOptions={},maxDeformedMeshes=256,maxDeformationBytes=128*1024*1024,shadow=null,environment=null,signal,
 }={}) {
   if(three?.REVISION!=='186'||typeof three.Matrix4!=='function'||typeof three.Frustum!=='function'||
       typeof three.Mesh!=='function'||!(scene instanceof three.Scene))fail('SOURCE','Supply the pinned r186 module and its Scene');
@@ -69,6 +70,15 @@ export async function createGpuThreeScene(device,scene,{
   // Keep ordinary source-scene packages independent of this optional module.
   const shadowApi=shadowEnabled?await import('./three_shadows.mjs'):null;
   let shadowOwner=null,pendingShadow=null,casters=new Map(),shadowStats=null;
+  if(environment!==null&&(!environment||typeof environment!=='object'||Array.isArray(environment)))fail('OPTIONS','Expected environment options or null');
+  const environmentOptions=Object.freeze({...environment});
+  for(const key of Object.keys(environmentOptions))if(!['maxBytes','maxPixels','size','diffuseSize','lutSize','samples','maxSampleWork'].includes(key))
+    fail('OPTIONS',`Unsupported source environment option: ${key}`);
+  const environmentEnabled=environment!==null,maxEnvironmentBytes=environmentOptions.maxBytes??128*1024*1024;
+  integer(maxEnvironmentBytes,1,Number.MAX_SAFE_INTEGER,'environment budget');
+  if(environmentEnabled&&renderOptions.environment===false)fail('OPTIONS','Source environments require IBL pipelines');
+  const environmentApi=environmentEnabled?await import('./three_environment.mjs'):null;
+  let environmentOwner=null,pendingEnvironment=null;
   const models=new Map([
     [three.MeshBasicMaterial.prototype,'unlit'],[three.MeshLambertMaterial.prototype,'lambert'],
     [three.MeshPhongMaterial.prototype,'phong'],[three.MeshToonMaterial.prototype,'toon'],
@@ -78,7 +88,7 @@ export async function createGpuThreeScene(device,scene,{
   const pendingDeformations=new Set(),deformationLifetime=new AbortController();
   let textureOwner=null,textureScan=null,frameTextures=null,retainedTextures=new Set();
   const ownedTextures=()=>textureOwner??=createGpuThreeTextures(device,{...textureOptions,three});
-  const resourceFailed=()=>!!renderer?.failed||!!textureOwner?.failed||!!shadowOwner?.failed||!!pendingShadow?.failed||[...geometries.values(),...instances.values(),...deformations.values(),...pendingDeformations].some(g=>g.failed);
+  const resourceFailed=()=>!!renderer?.failed||!!textureOwner?.failed||!!shadowOwner?.failed||!!pendingShadow?.failed||!!environmentOwner?.failed||!!pendingEnvironment?.failed||[...geometries.values(),...instances.values(),...deformations.values(),...pendingDeformations].some(g=>g.failed);
   let entries=[],lookup=new Map(),renderer,disposed=false,terminal=null,busy=false,preparing=false,prepareVersion=0,sourceDraws=0;
   // End the owner's wait without claiming to cancel already-issued GPU work.
   // Renderer registration still retires its private resources if it resolves late.
@@ -97,6 +107,7 @@ export async function createGpuThreeScene(device,scene,{
   function release(){
     signal?.removeEventListener('abort',onAbort);
     deformationLifetime.abort();
+    environmentOwner?.dispose();pendingEnvironment?.dispose();environmentOwner=null;pendingEnvironment=null;
     shadowOwner?.dispose();pendingShadow?.dispose();shadowOwner=null;pendingShadow=null;casters.clear();
     for(const entry of entries)entry.mesh.dispose();entries=[];lookup.clear();
     for(const gpu of [...deformations.values(),...pendingDeformations])gpu.dispose();deformations.clear();pendingDeformations.clear();
@@ -173,8 +184,9 @@ export async function createGpuThreeScene(device,scene,{
       if(object.isLight)light(object);
       for(let i=object.children.length-1;i>=0;i--)stack.push(object.children[i]);
     }
-    if(scene.fog!==null||scene.environment!==null||(scene.background!==null&&!scene.background.isColor))
-      fail('SCENE','Fog, source environment maps and texture backgrounds require their own rendering paths');
+    if(scene.fog!==null||(!environmentEnabled&&scene.environment!==null)||(scene.background!==null&&!scene.background.isColor))
+      fail('SCENE','Fog, disabled source environments and texture backgrounds require their own rendering paths');
+    if(environmentEnabled&&scene.environment!==null)environmentApi.inspectThreeEnvironment(scene.environment,three,environmentOptions);
     if(shadowEnabled){
       if(scene.overrideMaterial!==null)fail('SHADOW','Source shadow mode does not infer overrideMaterial depth semantics');
       shadowLight(nodes);
@@ -337,7 +349,7 @@ export async function createGpuThreeScene(device,scene,{
   async function prepare(){
     live();if(busy)fail('REENTRANT','A source-scene operation is already running');busy=true;preparing=true;
     const created=[],added=[],addedInstances=[],createdDeformations=[],nextDeformations=new Map(),createdCasters=[];
-    let nextShadow=shadowOwner;
+    let nextShadow=shadowOwner,nextEnvironment=environmentOwner;
     const nextCasters=new Map();
     try{
       // Validate all source materials and texture inputs before allocating any
@@ -346,6 +358,8 @@ export async function createGpuThreeScene(device,scene,{
       const nodes=graph(),request=desired(nodes),next=[];
       const selected=shadowEnabled?shadowLight(nodes):null;
       const shadowSignature=selected?shadowApi.inspectThreeShadow(selected,three).signature:null;
+      const selectedEnvironment=environmentEnabled?scene.environment:null;
+      const environmentSignature=selectedEnvironment?environmentApi.inspectThreeEnvironment(selectedEnvironment,three,environmentOptions).signature:null;
       for(const item of request){
         live();let gpu,signature,deformation=null;
         if(item.deformationSource){
@@ -428,6 +442,21 @@ export async function createGpuThreeScene(device,scene,{
           nextCasters.set(entry,caster);
         }
       }
+      // Filter only at an explicit preparation boundary. Keep the old map
+      // usable until the replacement and every preceding draw have completed.
+      if(environmentEnabled){
+        if(!selectedEnvironment)nextEnvironment=null;
+        else if(!environmentOwner||environmentOwner.source!==selectedEnvironment||!environmentOwner.matches()){
+          const available=maxEnvironmentBytes-(environmentOwner?.allocatedBytes??0);
+          if(available<1)fail('LIMIT','Environment replacement exceeds the old-plus-new GPU budget');
+          const construction=environmentApi.createGpuThreeEnvironment(device,selectedEnvironment,
+            {...environmentOptions,three,maxBytes:available,signal:deformationLifetime.signal}).then(value=>{
+              if(disposed||terminal){value.dispose();throw terminal??new ThreeSceneError('DISPOSED','Source scene is disposed');}
+              pendingEnvironment=value;return value;
+            });
+          nextEnvironment=await Promise.race([construction,stopped]);live();
+        }
+      }
       // Retirement must not reject a preceding submitted draw's dependency
       // wait. Drain only when pruning whole owners (never on ordinary updates),
       // then recheck source structure after this additional asynchronous boundary.
@@ -435,7 +464,8 @@ export async function createGpuThreeScene(device,scene,{
       const usedDeformations=new Set(next.map(e=>e.deformation).filter(Boolean));
       if([...geometries.keys()].some(g=>!usedGeometry.has(g))||[...instances.keys()].some(s=>!usedInstances.has(s))||
           [...deformations.values()].some(g=>!usedDeformations.has(g))||
-          (shadowOwner&&(shadowOwner!==nextShadow||[...casters.keys()].some(e=>!nextCasters.has(e))))){
+          (shadowOwner&&(shadowOwner!==nextShadow||[...casters.keys()].some(e=>!nextCasters.has(e))))||
+          (environmentOwner&&environmentOwner!==nextEnvironment)){
         await bridge.whenIdle();live();
       }
       // A layout can change while a pipeline await is outstanding, even when
@@ -463,12 +493,22 @@ export async function createGpuThreeScene(device,scene,{
           fail('CHANGED','Source shadow light/camera/extent changed during preparation');
         nextShadow?.check();
       }
+      if(environmentEnabled){
+        const current=scene.environment;
+        if(current!==selectedEnvironment||(current&&!same(environmentSignature,environmentApi.inspectThreeEnvironment(current,three,environmentOptions).signature)))
+          fail('CHANGED','Source environment changed during preparation');
+        nextEnvironment?.check();
+        environmentApi.threeEnvironmentDescriptor(nextEnvironment,scene,three);
+      }
       textureOwner?.update(owned);
       if(shadowOwner!==nextShadow){shadowOwner?.dispose();shadowStats=null;}
       else for(const [entry,caster] of casters)if(!nextCasters.has(entry))caster.dispose();
       shadowOwner=nextShadow;pendingShadow=null;casters=nextCasters;
+      if(environmentOwner!==nextEnvironment)environmentOwner?.dispose();
+      environmentOwner=nextEnvironment;pendingEnvironment=null;
       publish(next);retainedTextures=owned;textureOwner?.retain(owned);prepareVersion++;return bridge;
     }catch(error){
+      if(nextEnvironment!==environmentOwner)nextEnvironment?.dispose();pendingEnvironment=null;
       for(const caster of createdCasters)caster.dispose();
       if(nextShadow!==shadowOwner)nextShadow?.dispose();pendingShadow=null;
       for(const entry of created)entry.mesh.dispose();
@@ -496,12 +536,18 @@ export async function createGpuThreeScene(device,scene,{
     live();if(busy)fail('REENTRANT','A source-scene operation is already running');busy=true;
     try{
       if(!frame||typeof frame!=='object')fail('FRAME','Supply borrowed render attachments');
-      for(const key of ['draws','viewProjection','lighting',...(shadowEnabled?['shadow']:[])])if(Object.hasOwn(frame,key))fail('FRAME',`${key} belongs to the source scene/camera`);
+      for(const key of ['draws','viewProjection','lighting',...(shadowEnabled?['shadow']:[]),...(environmentEnabled?['environment']:[])])if(Object.hasOwn(frame,key))fail('FRAME',`${key} belongs to the source scene/camera`);
       frameTextures=new Set();
       const nodes=graph();
       if(shadowEnabled){
         if(shadowLight(nodes)!==(shadowOwner?.source??null))fail('PREPARE','Call prepare() after changing the source shadow light');
         shadowOwner?.check();
+      }
+      let environmentFrame=null;
+      if(environmentEnabled){
+        if(scene.environment!==(environmentOwner?.source??null))fail('PREPARE','Call prepare() after changing the source environment');
+        environmentOwner?.check();
+        environmentFrame=environmentApi.threeEnvironmentDescriptor(environmentOwner,scene,three);
       }
       const lighting=cameraFrame(camera);lighting.lights=[];
       const lightSources=[],casterObjects=[],casterItems=[],shadowDraws=[];
@@ -618,7 +664,8 @@ export async function createGpuThreeScene(device,scene,{
             ...(values.uvTransform?{uvTransform:values.uvTransform}:{}),
             ...(values.alphaCutoff!==undefined?{alphaCutoff:values.alphaCutoff}:{})});
           else draws.push({mesh:item.bindings[i].mesh,...common,...values,
-            ...(shadowEnabled?{receiveShadow:item.object.receiveShadow}:{})});
+            ...(shadowEnabled?{receiveShadow:item.object.receiveShadow}:{}),
+            ...(environmentEnabled?{receiveEnvironment:item.desc[i].options.shading==='metallic-roughness'}:{})});
         }
       }
       // One fused core batch precedes all consuming material/group draws. No
@@ -633,6 +680,7 @@ export async function createGpuThreeScene(device,scene,{
         item.material.side=three.DoubleSide;
       }
       const prepared={...frame,viewProjection:clip.elements,lighting,draws};
+      if(environmentEnabled)prepared.environment=environmentFrame;
       if(scene.background!==null){prepared.clearColor=rgba(scene.background);prepared.loadOp='clear';}
       if(shadowEnabled){
         prepared.shadow=null;
@@ -656,18 +704,21 @@ export async function createGpuThreeScene(device,scene,{
       materialBindings:entries.filter(e=>!e.mesh.disposed).length,rendererBytes:renderer?.allocatedBytes??0,
       textures:textureOwner?.diagnostics??null,
       shadowBytes:(shadowOwner?.allocatedBytes??0)+(pendingShadow?.allocatedBytes??0),shadowStats,
-      colorPasses:shadowEnabled?(renderer?.colorPassCount??0):null,
+      environmentBytes:(environmentOwner?.allocatedBytes??0)+(pendingEnvironment?.allocatedBytes??0),
+      colorPasses:shadowEnabled||environmentEnabled?(renderer?.colorPassCount??0):null,
       bundles:renderer?.bundleDiagnostics??null});},
-    async whenIdle(){live();try{await Promise.race([Promise.all([renderer.whenIdle(),textureOwner?.whenIdle(),shadowOwner?.whenIdle(),pendingShadow?.whenIdle(),...[...geometries.values(),...instances.values(),...deformations.values(),...pendingDeformations].map(g=>g.whenIdle())]),stopped]);live();return bridge;}catch(error){return failed(error);}},
+    async whenIdle(){live();try{await Promise.race([Promise.all([renderer.whenIdle(),textureOwner?.whenIdle(),shadowOwner?.whenIdle(),pendingShadow?.whenIdle(),environmentOwner?.whenIdle(),pendingEnvironment?.whenIdle(),...[...geometries.values(),...instances.values(),...deformations.values(),...pendingDeformations].map(g=>g.whenIdle())]),stopped]);live();return bridge;}catch(error){return failed(error);}},
     dispose(){if(busy&&!preparing)fail('REENTRANT','Cannot dispose during source submission');if(!disposed){disposed=true;rejectStopped(new ThreeSceneError('DISPOSED','Source scene bridge is disposed'));release();}},
   });
   try{
     // Source validation precedes even the renderer's uniform allocation.
     signal?.addEventListener('abort',onAbort,{once:true});if(signal?.aborted)onAbort();live();
     scanTextures();
-    const construction=createGpuAnimationRenderer(device,{...renderOptions,...(shadowEnabled?{shadows:true}:{}),indirectLights:true,threeLights:true,maxMeshes:2*maxBindings}).then(value=>{
+    const construction=createGpuAnimationRenderer(device,{...renderOptions,...(shadowEnabled?{shadows:true}:{}),...(environmentEnabled?{environment:true}:{}),indirectLights:true,threeLights:true,maxMeshes:2*maxBindings}).then(value=>{
       if(disposed||terminal){value.dispose();throw terminal??new ThreeSceneError('DISPOSED','Source scene is disposed');}
-      renderer=shadowEnabled?shadowApi.withThreeShadowReceivers(value,renderOptions.maxDraws??1024):value;return renderer;
+      renderer=shadowEnabled?shadowApi.withThreeShadowReceivers(value,renderOptions.maxDraws??1024):value;
+      if(environmentEnabled)renderer=environmentApi.withThreeEnvironmentReceivers(renderer,renderOptions.maxDraws??1024);
+      return renderer;
     });
     await Promise.race([construction,stopped]);live();await prepare();return bridge;
   }catch(error){disposed=true;release();throw error;}
