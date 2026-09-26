@@ -117,6 +117,9 @@ function decodeDataUri(uri) {
  * Source packages include the lazy projected-shadow owner: select shadow:{}
  * when creating the scene to use authored directional/spot cameras and flags.
  * CPU-only and ordinary GPU packages do not gain source-shadow dependencies.
+ * Combine threeScene:true and environment:true to package source HDR environment
+ * ownership and export createGpuThreeEnvironment; select environment:{} at runtime.
+ * See THREE_SCENE_ENVIRONMENT.md for ready pixels, versions and lifetime limits.
  * The same option exports createGpuThreeCanvas and createGpuThreeHdrCanvas
  * for direct or whole-image tone-mapped canvas presentation;
  * device/canvas initialization still happens only when its factory is called.
@@ -279,7 +282,7 @@ export {createAnimationDeformer} from './animation_deformer.mjs';
     ["animation.json", encoded + "\n"],
     ["playback.mjs", playback],
   ]);
-  for (const name of ["animation_controller.mjs", "animation_deformer.mjs"]) {
+  for (const name of ["animation_controller.mjs", "animation_markers.mjs", "animation_deformer.mjs"]) {
     outputs.set(name, fs.readFileSync(new URL("./" + name, import.meta.url), "utf8"));
   }
   if (webgpu) {
@@ -348,6 +351,11 @@ export {fitAnimationShadowView,animationShadowWorldBounds} from './animation_sha
       outputs.get("gpu_playback.mjs") +
         "export {createGpuAnimationEnvironment} from './animation_environment.mjs';\n",
     );
+    if (threeScene) {
+      outputs.set("three_environment.mjs", fs.readFileSync(new URL("./three_environment.mjs", import.meta.url), "utf8"));
+      outputs.set("gpu_playback.mjs", outputs.get("gpu_playback.mjs") +
+        "export {createGpuThreeEnvironment,ThreeEnvironmentError} from './three_environment.mjs';\n");
+    }
   }
   if (hdr) {
     for (const name of ["animation_hdr.mjs", "animation_environment_loader.mjs"]) {

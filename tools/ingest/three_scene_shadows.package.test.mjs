@@ -25,6 +25,7 @@ async function fixture(t){
     'animation_runtime.mjs':`export class AnimationPoseError extends Error{constructor(code,message){super(message);this.code=code;}}
 export const createAnimationPlayer=d=>({nodeCount:d.nodes.length,clips:[],instances:[],morphWeights:[],dispose(){}});`,
     'animation_controller.mjs':exportsSource('createAnimationController'),
+    'animation_markers.mjs':exportsSource('animationMarkerEventLimit createAnimationMarkerTrack'),
     'animation_deformer.mjs':exportsSource('createAnimationDeformer'),
     'animation_webgpu.mjs':exportsSource('createGpuAnimationDeformer'),
     'animation_scene.mjs':exportsSource('createGpuAnimationScene'),
