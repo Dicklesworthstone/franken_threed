@@ -149,10 +149,99 @@ assets are not estimates of this wrapper's owned GPU memory. Repeated attempts
 can temporarily retain unresolved host promises, bounded here by the attempt
 limit rather than a guarantee of host cancellation.
 
+## HDR and source-owned Three.js canvases
+
+`createRecoverableGpuHdrCanvasRenderer(canvas, createRenderer, options)` applies
+this same lifecycle to the existing opaque whole-image HDR canvas stack. Its
+factory receives the linear `rgba16float` scene attachment profile, not the final
+canvas format. `renderTarget` still controls scene depth/MSAA and texture budget;
+`output` still controls the default tone-mapping operator and exposure. Recovery
+recreates the linear color/depth/MSAA targets, output shader pipeline, uniform
+buffer and bind groups on the replacement device. It does not preserve lost HDR
+history, replay previous frame output overrides, or introduce per-material
+`toneMapped` semantics. The HDR module is loaded only when its factory is called.
+
+For the admitted source-owned Three.js scene path, the convenience factories
+`createRecoverableGpuThreeCanvas` and `createRecoverableGpuThreeHdrCanvas` retain
+the exact caller Scene, camera and pinned Three module while rebuilding the
+existing `createGpuThreeScene` owner. They accept the existing source-canvas
+options plus `maxRecoveryAttempts`:
+
+```js
+import {createRecoverableGpuThreeHdrCanvas} from './three_canvas_recovery.mjs';
+
+const view = await createRecoverableGpuThreeHdrCanvas(canvas, scene, {
+  three: THREE, // the pinned r186 source module remains caller-owned
+  scene: {
+    renderer: {maxDraws: 2048, renderBundles: true},
+    texture: {maxTextureBytes: 128 * 1024 * 1024},
+    deformation: {maxJoints: 256},
+  },
+  renderTarget: {sampleCount: 4, depthFormat: 'depth32float'},
+  output: {toneMapping: 'agx', exposure: 1},
+  maxRecoveryAttempts: 3,
+});
+
+// The application retains its existing animation/frame loop and camera.
+view.render(camera);
+await view.whenLost();
+await view.recover(); // pass {device: freshDevice} for a borrowed-device owner
+view.render(camera);
+```
+
+Only source-backed automatic texture ownership is admitted by these convenience
+factories. A supplied `scene.textures` binding map (even an empty map), or
+`autoTextures:false`, is refused before device acquisition. Opaque native views
+and samplers cannot be carried across devices. Applications with custom borrowed
+texture uploads should instead use the generic reconstruction factory, create
+new native resources for its new device, and lend those new bindings to their
+renderer. This is not permission to reuse handles from the lost generation.
+
+Source reconstruction reads the **current** source geometry, attributes, texture
+pixels, poses and scene structure. It does not advance a retained AnimationMixer
+or controller, reload URLs, decode images, clone identities or dispose the
+application's scene. Data must remain available in the existing admitted source
+profiles. CPU-side changes that were never uploaded before loss can consequently
+appear in the reconstructed generation; recovery is not an exact restoration of
+the previous GPU-visible snapshot. GPU-only data, discarded image sources and
+external input effects still require an application-specific reconstruction policy.
+
+Source preparation budgets and feature options are copied before the first
+asynchronous construction; native source objects remain live. Attachment format,
+depth and sample-count conflicts are errors, not silently repaired settings. The
+separate original `three_canvas.mjs` factories retain their existing behavior;
+recovery is explicitly selected, not enabled by a global renderer patch.
+
+## Generated-package deployment
+
+The build API's `canvasRecovery:true` switch requires `webgpu:true`. It exports
+both generic recovery factories from `gpu_playback.mjs` and includes their direct
+and HDR dependencies. With `threeScene:true`, it also exports both source recovery
+factories. The new switch does not itself enable IBL, background rendering,
+external HDR decoding, retained Three components, or native services at import:
+
+```js
+buildAnimation('actor.gltf', 'dist/actor', {
+  webgpu: true,
+  threeScene: true,
+  canvasRecovery: true,
+});
+// import {createRecoverableGpuThreeHdrCanvas} from './dist/actor/gpu_playback.mjs';
+```
+
+Already included source/HDR modules are deduplicated. Every emitted dependency
+participates in manifest hashes and exact byte-budget admission before the output
+directory is created. CPU-only/default GPU output and explicitly disabled recovery
+packages gain no recovery modules or exports. This flag changes available package
+entry points, not how the application starts a canvas or chooses to recover it.
+
 ## Validation
 
 ```sh
-node --test tools/ingest/gpu_canvas_recovery.test.mjs
+node --test tools/ingest/gpu_canvas_recovery.test.mjs \
+  tools/ingest/gpu_hdr_canvas_recovery.test.mjs \
+  tools/ingest/three_canvas_recovery.test.mjs \
+  tools/ingest/gpu_canvas_recovery.package.test.mjs
 ```
 
 Tests execute the production recovery manager, device negotiator and canvas
@@ -161,3 +250,12 @@ submission, capabilities, retirement, cancellation, ownership and failure orderi
 It is not native browser/GPU execution, a pixel-equivalence test, a performance
 measurement, or a guarantee that an arbitrary source factory can reconstruct all
 of its lost data.
+
+HDR tests execute the production intermediate-target and output-pass modules as
+well as the native owners. Source adapter tests substitute the source-scene factory
+boundary to isolate retained identity, current data and option forwarding. Package
+tests execute the actual builder, move its output away from the original toolkit,
+and import its emitted entry to render, lose, reconstruct and resume. Their model
+decoder/pose metadata and unrelated mesh/source factory remain explicit fixtures.
+Artifact hashing, exact/one-byte-short budget admission and feature isolation are
+checked. These tests do not claim native GPU pixels or full Three.js scene coverage.

@@ -35,6 +35,18 @@ export function createRecoverableGpuCanvasRenderer(canvas, createRenderer, optio
   return createRecoverableCanvas(createGpuCanvasRenderer, canvas, createRenderer, options);
 }
 
+
+/** Reconstruct the complete linear-HDR target/output stack, not only the scene.
+ * Snapshot configuration and reserve lifetime ownership before the lazy import.
+ * The direct canvas entry never loads HDR dependencies merely by importing it.
+ */
+export function createRecoverableGpuHdrCanvasRenderer(canvas, createRenderer, options = {}) {
+  return createRecoverableCanvas(async (...args) => {
+    const {createGpuHdrCanvasRenderer} = await import('./gpu_hdr_canvas.mjs');
+    return createGpuHdrCanvasRenderer(...args);
+  }, canvas, createRenderer, options);
+}
+
 async function createRecoverableCanvas(createSession, canvas, createRenderer, input) {
   object(input, 'recoverable canvas options');
   if (!canvas || typeof canvas.getContext !== 'function') fail('OWNERSHIP', 'Expected an exclusively owned canvas');

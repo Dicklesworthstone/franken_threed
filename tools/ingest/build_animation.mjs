@@ -129,6 +129,10 @@ function decodeDataUri(uri) {
  * The same option exports createGpuThreeCanvas and createGpuThreeHdrCanvas
  * for direct or whole-image tone-mapped canvas presentation;
  * device/canvas initialization still happens only when its factory is called.
+ * canvasRecovery:true with webgpu:true packages explicit device-loss reconstruction
+ * for direct/HDR factories. Add threeScene:true for recoverable source canvases.
+ * No retry, device, scene, or animation clock is started by importing a package.
+ * See GPU_CANVAS_RECOVERY.md for retained-source and borrowed-binding constraints.
  * import { createPlayer } from './animation.mjs'; const p=createPlayer();
  * p.sample(time, {clip:0, loop:true}); // p.worldMatrices / p.jointMatrices / p.morphWeights
  * All decoded tracks are embedded; importing the package makes no fetches and
@@ -176,11 +180,14 @@ export function buildAnimation(
     hdr = false,
     rigidGeometry = false,
     threeScene = false,
+    canvasRecovery = false,
   } = {},
 ) {
   if (typeof rigidGeometry !== "boolean" || (rigidGeometry && !webgpu))
     throw new TypeError("rigidGeometry must be boolean and requires webgpu:true");
   if (typeof webgpu !== "boolean") throw new TypeError("webgpu must be boolean");
+  if (typeof canvasRecovery !== "boolean" || (canvasRecovery && !webgpu))
+    throw new TypeError("canvasRecovery must be boolean and requires webgpu:true");
   if (typeof threeScene !== "boolean" || (threeScene && !webgpu))
     throw new TypeError("threeScene must be boolean and requires webgpu:true");
   if (typeof environment !== "boolean" || (environment && !webgpu))
@@ -392,6 +399,21 @@ export {fitAnimationShadowView,animationShadowWorldBounds} from './animation_sha
         "export {createGpuThreeBackground,ThreeBackgroundError} from './three_background.mjs';\n");
     }
   }
+  if (canvasRecovery) {
+    // Direct and HDR reconstruction share the existing owners. Map insertion
+    // deduplicates these modules when threeScene already included them.
+    for (const name of ["gpu_canvas_recovery.mjs", "gpu_canvas.mjs", "gpu_canvas_renderer.mjs",
+      "gpu_hdr_canvas.mjs", "gpu_render_target.mjs", "animation_output.mjs"]) {
+      outputs.set(name, fs.readFileSync(new URL("./" + name, import.meta.url), "utf8"));
+    }
+    outputs.set("gpu_playback.mjs", outputs.get("gpu_playback.mjs") +
+      "export {createRecoverableGpuCanvasRenderer,createRecoverableGpuHdrCanvasRenderer} from './gpu_canvas_recovery.mjs';\n");
+    if (threeScene) {
+      outputs.set("three_canvas_recovery.mjs", fs.readFileSync(new URL("./" + "three_canvas_recovery.mjs", import.meta.url), "utf8"));
+      outputs.set("gpu_playback.mjs", outputs.get("gpu_playback.mjs") +
+        "export {createRecoverableGpuThreeCanvas,createRecoverableGpuThreeHdrCanvas} from './three_canvas_recovery.mjs';\n");
+    }
+  }
   const manifest = {
     format: "f3d-animation-package-v1",
     entry: "animation.mjs",
@@ -411,6 +433,7 @@ export {fitAnimationShadowView,animationShadowWorldBounds} from './animation_sha
     ...(background ? { gpuBackground: "explicit-linear-fullscreen; borrowed native texture; opt-in source HDR panorama" } : {}),
     ...(environment ? { gpuEnvironment: "f3d-animation-environment-v1" } : {}),
     ...(threeScene ? { gpuThreeScene: "explicit-r186-scene; native source instances and GPU skin/morph deformation; owned source textures or borrowed bindings; borrowed module and attachments" } : {}),
+    ...(canvasRecovery ? { gpuCanvasRecovery: "explicit-device-loss-reconstruction; bounded attempts; no frame replay" } : {}),
     source: { file: path.basename(entry), sha256: hash(source) },
     dependencies: [...dependencies.values()],
     nodeCount: validated.nodeCount,

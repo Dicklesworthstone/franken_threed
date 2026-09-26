@@ -43,7 +43,41 @@ export function recoveryFixture() {
       limits: {maxTextureDimension2D: 2048, maxBufferSize: 1048576,
         minUniformBufferOffsetAlignment: 256, ...options.limits},
       lost: lost.promise, isLost: false, destroyCount: 0, textures: [], scopes: [], scopeResults: [],
-      scopePending: [],
+      scopePending: [], buffers: [], shaders: [], pipelines: [], groups: [], passes: [], writes: [], submits: [],
+      pipelineWait: null,
+      createBuffer(descriptor) {
+        const buffer = {device: d, descriptor, destroyed: 0, bytes: new Uint8Array(descriptor.size),
+          destroy() { this.destroyed++; log.push(['buffer.destroy', name]); }};
+        this.buffers.push(buffer); return buffer;
+      },
+      createShaderModule(descriptor) { const module = {device: d, ...descriptor}; this.shaders.push(module); return module; },
+      createBindGroupLayout(descriptor) { return {device: d, descriptor}; },
+      createPipelineLayout(descriptor) { return {device: d, descriptor}; },
+      async createRenderPipelineAsync(descriptor) {
+        if (this.pipelineWait) await this.pipelineWait;
+        const pipeline = {device: d, descriptor}; this.pipelines.push(pipeline); return pipeline;
+      },
+      createBindGroup(descriptor) {
+        for (const entry of descriptor.entries) {
+          const owner = entry.resource.texture?.device ?? entry.resource.buffer?.device;
+          if (owner && owner !== d) throw new Error('Cross-device bind group');
+        }
+        const group = {device: d, descriptor}; this.groups.push(group); return group;
+      },
+      createCommandEncoder(descriptor) {
+        return {device: d, descriptor, passes: [],
+          beginRenderPass(descriptor) {
+            for (const a of descriptor.colorAttachments)
+              if (a.view.texture.device !== d || a.view.texture.destroyed) throw new Error('Stale output attachment');
+            const pass = {descriptor, ended: false,
+              setPipeline(pipeline) { if (pipeline.device !== d) throw new Error('Old pipeline'); this.pipeline = pipeline; },
+              setBindGroup(index, group) { if (group.device !== d) throw new Error('Old bind group'); this.group = group; },
+              draw(...args) { this.drawCall = args; }, end() { this.ended = true; }};
+            d.passes.push(pass); this.passes.push(pass); return pass;
+          },
+          finish() { return this; },
+        };
+      },
       queue: {fence: null, onSubmittedWorkDone() { log.push(['fence', name]); return this.fence ?? Promise.resolve(); }},
       pushErrorScope(kind) { this.scopes.push(kind); },
       popErrorScope() {
@@ -53,7 +87,7 @@ export function recoveryFixture() {
       },
       texture(descriptor, borrowed = false) {
         const size = descriptor.size, texture = {device: d, descriptor, borrowed,
-          width: size[0], height: size[1], depthOrArrayLayers: size[2] ?? 1,
+          width: size[0] ?? size.width, height: size[1] ?? size.height, depthOrArrayLayers: size[2] ?? size.depthOrArrayLayers ?? 1,
           format: descriptor.format, sampleCount: descriptor.sampleCount ?? 1,
           usage: descriptor.usage, dimension: '2d', destroyed: 0,
           createView(view = {}) { return {texture: this, descriptor: view}; },
@@ -66,6 +100,12 @@ export function recoveryFixture() {
       lose(info = {reason: 'unknown', message: `Lost ${name}`}) { this.isLost = true; lost.resolve(info); },
       rejectLoss(error) { lost.reject(error); },
     };
+    d.queue.writeBuffer = (buffer, offset, input) => {
+      if (buffer.device !== d || buffer.destroyed) throw new Error('Old uniform buffer');
+      const bytes = new Uint8Array(input.buffer ?? input, input.byteOffset ?? 0, input.byteLength).slice();
+      buffer.bytes.set(bytes, offset); d.writes.push({buffer, offset, bytes});
+    };
+    d.queue.submit = commands => { d.submits.push(commands); log.push(['submit', name]); };
     devices.push(d); return d;
   }
   function adapter(d, settings = {}) {
