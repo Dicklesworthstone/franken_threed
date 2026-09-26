@@ -36,11 +36,19 @@
  * callbacks and are not an unbounded queue. Failed updates change neither
  * clocks, fades, warps, events nor the published pose. No per-action pose is copied.
  *
+ * Optional action markers are {name,time} clip-local cues. markerEvents is a
+ * separate immutable list for the last successful update, ordered by action
+ * creation and then traversal (not global wall time). It leaves events' legacy
+ * loop aggregation unchanged. Markers never invoke callbacks or drive a second
+ * clock. Overflow rejects the whole update before pose/clock publication.
+ * See ANIMATION_MARKERS.md for endpoints, zero-duration clips and event limits.
+ *
  * This is not a Three.js AnimationMixer adapter: it controls imported TRS and
  * morph tracks, not arbitrary PropertyBindings or preconverted additive clips.
  * Additive layers use player.blend's imported-rest-relative convention.
  */
 import { AnimationPoseError } from "./animation_runtime.mjs";
+import { animationMarkerEventLimit, createAnimationMarkerTrack } from "./animation_markers.mjs";
 
 const fail = (code, message) => {
   throw new AnimationPoseError(code, message);
@@ -73,7 +81,12 @@ function loopOptions(loop, repetitions) {
 }
 const EMPTY = Object.freeze([]);
 
-export function createAnimationController(pose) {
+export function createAnimationController(pose, options = {}) {
+  if (!options || typeof options !== "object" || Array.isArray(options) ||
+      Object.keys(options).some((key) => key !== "maxMarkerEvents"))
+    fail("ANIMATION_ACTION_OPTIONS", "Expected controller maxMarkerEvents options");
+  const { maxMarkerEvents: requestedMarkerLimit = 4096 } = options;
+  let maxMarkerEvents = animationMarkerEventLimit(requestedMarkerLimit);
   if (
     !pose ||
     typeof pose.blend !== "function" ||
@@ -86,9 +99,11 @@ export function createAnimationController(pose) {
   const records = [],
     owned = new WeakMap(),
     layers = [],
-    pendingEvents = [];
+    pendingEvents = [],
+    pendingMarkers = [];
   let time = 0,
     events = EMPTY,
+    markerEvents = EMPTY,
     busy = false,
     disposed = false;
   function exclusive(operation, ...args) {
@@ -219,6 +234,7 @@ export function createAnimationController(pose) {
       clampWhenFinished = false,
       mode = "normal",
       mask = null,
+      markers = EMPTY,
     } = options;
     const timing = loopOptions(loop, repetitions),
       duration = nonnegative(pose.clips[clip].duration, "Clip duration");
@@ -254,7 +270,10 @@ export function createAnimationController(pose) {
       mode: blendMode(mode),
       mask: copyMask(mask),
     };
-    const record = { state, next: { ...state }, layer, disposed: false, action: null };
+    const record = {
+      state, next: { ...state }, layer, disposed: false, action: null,
+      markerTrack: createAnimationMarkerTrack(markers, duration),
+    };
     const mutate = (operation) =>
       exclusive(() => {
         get(action);
@@ -366,6 +385,16 @@ export function createAnimationController(pose) {
         return mutate(() => {
           layer.mask = copyMask(value);
         });
+      },
+      setMarkers(markers) {
+        return mutate(() => {
+          // Copy and validate before replacing the current track. No cue is
+          // synthesized at the current playhead by changing its configuration.
+          record.markerTrack = createAnimationMarkerTrack(markers, duration);
+        });
+      },
+      get markers() {
+        return record.markerTrack.markers;
       },
       fadeTo(target, seconds, options = {}) {
         return mutate(() => {
@@ -497,7 +526,15 @@ export function createAnimationController(pose) {
     advanceDistance(record, state, distance, Math.sign(from || to));
   }
   function advanceDistance(record, state, distance, direction) {
+    const marked = record.markerTrack.markers.length > 0 && state.playing &&
+      !state.paused && distance !== 0 && direction !== 0;
+    const start = state.time, traversal = state.completed,
+      localDirection = direction * state.orientation;
     advance(state, distance, direction);
+    if (marked) record.markerTrack.append(pendingMarkers, record.action, {
+      start, end: state.time, direction: localDirection, loop: state.loop,
+      crossings: state.completed - traversal, finished: state.endEvent, traversal,
+    }, maxMarkerEvents);
     if (state.loopDelta > 0) {
       const previous = pendingEvents.at(-1);
       const merge = previous?.type === "loop" && previous.action === record.action && previous.direction === direction;
@@ -562,6 +599,7 @@ export function createAnimationController(pose) {
     const nextTime = finite(time + delta, "Controller time");
     layers.length = 0;
     pendingEvents.length = 0;
+    pendingMarkers.length = 0;
     for (const record of records) {
       const state = record.state,
         next = record.next;
@@ -606,11 +644,13 @@ export function createAnimationController(pose) {
       }
     }
     const nextEvents = pendingEvents.length ? Object.freeze(pendingEvents.slice()) : EMPTY;
+    const nextMarkers = pendingMarkers.length ? Object.freeze(pendingMarkers.slice()) : EMPTY;
     // Pose publication is the commit point. Nothing below invokes caller code.
     pose.blend(layers, options);
     for (const record of records) Object.assign(record.state, record.next);
     time = nextTime;
     events = nextEvents;
+    markerEvents = nextMarkers;
     return controller;
   }
   function crossFade(from, to, seconds, options = {}) {
@@ -675,6 +715,18 @@ export function createAnimationController(pose) {
     get events() {
       return events;
     },
+    get markerEvents() {
+      return markerEvents;
+    },
+    get maxMarkerEvents() {
+      return maxMarkerEvents;
+    },
+    setMarkerEventLimit(value) {
+      return exclusive(() => {
+        maxMarkerEvents = animationMarkerEventLimit(value);
+        return controller;
+      });
+    },
     get actionCount() {
       return records.length;
     },
@@ -686,6 +738,8 @@ export function createAnimationController(pose) {
       disposed = true;
       records.length = 0;
       events = EMPTY;
+      markerEvents = EMPTY;
+      pendingMarkers.length = 0;
     },
   });
   return controller;
