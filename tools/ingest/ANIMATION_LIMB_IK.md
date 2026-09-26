@@ -98,15 +98,106 @@ disposes the pose is detected before publication; its own external side effects
 are not rolled back. Existing pose errors retain their codes; solver admission
 errors use `ANIMATION_IK_*` codes.
 
+## Atomic multi-limb placement
+
+`solveAnimationLimbIK(pose, limbs)` applies the same positional/orientation solve
+to zero through 32 independent limbs from **one committed snapshot**, then
+publishes **one** pose edit. Both feet, both hands, or independent creature limbs
+can be corrected together without exposing an intermediate half-updated pose:
+
+```js
+import {solveAnimationLimbIK} from './animation_ik.mjs';
+
+controller.update(deltaSeconds);
+const result = solveAnimationLimbIK(pose, [
+  {
+    root: leftHip, joint: leftKnee, effector: leftAnkle,
+    target: leftFootTarget, pole: leftKneeGuide,
+    endRotation: leftFootRotation,
+  },
+  {
+    root: rightHip, joint: rightKnee, effector: rightAnkle,
+    target: rightFootTarget, pole: rightKneeGuide,
+    endRotation: rightFootRotation,
+  },
+]);
+scene.upload(); // Existing explicit upload, after the whole batch is committed.
+```
+
+Each request accepts the single-limb options above. Limbs may share fixed
+ancestors such as a pelvis, but their three-node sets must be disjoint, and no
+node in one requested limb may be an ancestor of another requested limb.
+Overlapping requests fail with `ANIMATION_IK_OVERLAP`; cross-limb ancestry fails
+with `ANIMATION_IK_DEPENDENCY`. These checks do not depend on current influence
+weights. They prevent one limb's edit from invalidating another limb's computed
+result. This is an independent-limb batch, not order-dependent sequential IK,
+a coupled multiple-effector optimizer, or whole-body balance correction.
+
+Every request is admitted and solved before publication. Invalid input in the
+second limb leaves the first unchanged, and final palette failure leaves the
+entire batch unchanged. A caller getter's own side effects remain external and
+are detected as stale rather than undone. Zero requests are valid and return
+`converged:true` without a pose edit. A batch with no effective changes also does
+not advance the version. Nonconverged but valid requests still publish their
+clamped/weighted solutions; convergence is a result, not a transaction failure.
+
+The immutable batch result contains `poseVersion`, `converged`, `changedNodes`,
+and `limbs`. Each immutable limb result contains the single-limb diagnostics,
+its immutable `nodes` tuple `[root,joint,effector]`, its own `changedNodes`, and
+the same final `poseVersion`. All requests therefore refer to one published
+pose, not independently advanced versions. The snapshot/edit work stays bounded
+by the existing player limits plus at most 32 ancestor paths of 256 nodes each.
+The player does not acquire another animation clock or renderer.
+
+## Generated playback packages
+
+The **build API** option `inverseKinematics:true` emits `animation_ik.mjs` and
+exports all three solvers from `playback.mjs`: `solveAnimationIK`,
+`solveAnimationTwoBoneIK`, and `solveAnimationLimbIK`. The option is boolean and
+also works in a CPU-only package; it does not require `webgpu:true`:
+
+```js
+buildAnimation('actor.gltf', 'dist/actor', {
+  inverseKinematics: true,
+});
+// import {createPlayer, solveAnimationLimbIK} from './dist/actor/playback.mjs';
+```
+
+With `webgpu:true`, the same functions are also exported from `gpu_playback.mjs`.
+Their pose arithmetic still executes on the CPU before explicit deformer updates
+or uploads. No GPU services, sampling, network requests or animation clocks are
+started by these exports. The sampling-only `animation.mjs` remains unchanged.
+This option is exposed by the build API; it does not add a command-line flag.
+
+The manifest records the admitted IK profile in `animationIK`. Emitted bytes and
+hashes include the solver, and exact output-budget admission still happens before
+creating the output directory. Default and explicitly disabled packages gain no
+IK module, export or metadata. Shared modules remain deduplicated alongside
+source-scene, environment, background, HDR and canvas-recovery packaging.
+
 ## Validation
 
 ```sh
-node --test tools/ingest/animation_two_bone_ik.test.mjs
+node --test tools/ingest/animation_two_bone_ik.test.mjs \
+  tools/ingest/animation_limb_ik.test.mjs \
+  tools/ingest/animation_limb_ik.package.test.mjs
 ```
 
-The tests execute the actual production pose sampler, transactional editor and
-skin-palette evaluator, not a pose fixture. They include the straight-chain CCD
+The numerical and batch tests execute the actual production pose sampler,
+transactional editor and skin-palette evaluator, not a pose fixture. They include the straight-chain CCD
 regression, opposite/degenerate poles, full folding, unreachable targets, world
 transforms, end orientations, blending, final-publication failure, and randomized
 analytic endpoint/length/pole checks. CPU pose tests are not native GPU pixel or
 performance evidence, and do not establish parity with Three.js CCDIKSolver.
+
+The batch suite checks one-snapshot/one-edit publication, independent branch
+ordering, zero/32-limb boundaries, overlap and ancestry rejection, stale inputs,
+recursive entry, skin palettes and all-limb failure isolation. The package suite
+executes the actual builder and emitted runtime/IK modules, moves output away
+from its original input/toolkit, and solves animated feet from relocated CPU and
+GPU playback entries. Asset decoding and unexercised controller/renderer factories
+are explicit fixtures; those tests do not certify asset decoding or native GPU
+execution. They verify generated module hashes, exact/one-byte-short byte budgets,
+feature isolation, instance-provenance metadata coexistence and combined optional
+dependency deduplication. A 57-test focused run includes 300 deterministic random
+limbs inside one numerical test, not 300 additional tests or a full repository run.

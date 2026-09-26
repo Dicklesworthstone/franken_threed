@@ -606,3 +606,46 @@ export function solveAnimationTwoBoneIK(pose, options) {
       changedNodes: Object.freeze(staged.edits.map(({ node }) => node)) });
   } finally { limbOperations.delete(pose); }
 }
+
+/** Solve up to 32 independent limbs from ONE committed snapshot and publish
+ * ONE pose edit. Shared fixed ancestors are allowed; overlapping limbs or a
+ * limb containing another limb's ancestor are refused, independent of weights.
+ * This is not an order-dependent sequential or whole-body optimization solver.
+ */
+export function solveAnimationLimbIK(pose, limbs) {
+  if (!pose || (typeof pose !== "object" && typeof pose !== "function"))
+    fail("POSE", "Expected an editable animation player");
+  if (limbOperations.has(pose)) fail("REENTRANT", "Limb solve cannot be reentered");
+  limbOperations.add(pose);
+  try {
+    const snapshot = limbSnapshot(pose), count = limbs?.length;
+    if (!Array.isArray(limbs) || !Number.isSafeInteger(count) || count < 0 || count > 32)
+      fail("LIMIT", "Expected at most 32 independent limb requests");
+    const staged = [], owners = new Map();
+    for (let i = 0; i < count; i++) {
+      const limb = stageTwoBoneIK(snapshot, limbs[i]);
+      limbLive(pose, snapshot);
+      for (const node of limb.nodes) {
+        if (owners.has(node)) fail("OVERLAP", "Batch limb nodes must be disjoint");
+        owners.set(node, i);
+      }
+      staged.push(limb);
+    }
+    for (let i = 0; i < staged.length; i++)
+      for (const node of staged[i].chain)
+        if (owners.has(node) && owners.get(node) !== i)
+          fail("DEPENDENCY", "One batch limb cannot be an ancestor of another");
+    const edits = staged.flatMap((limb) => limb.edits);
+    limbLive(pose, snapshot);
+    if (edits.length) pose.edit(edits);
+    const poseVersion = pose.version;
+    return Object.freeze({
+      poseVersion,
+      converged: staged.every((limb) => limb.result.converged),
+      changedNodes: Object.freeze(edits.map(({ node }) => node)),
+      limbs: Object.freeze(staged.map((limb) => Object.freeze({ ...limb.result, poseVersion,
+        nodes: Object.freeze(limb.nodes),
+        changedNodes: Object.freeze(limb.edits.map(({ node }) => node)) }))),
+    });
+  } finally { limbOperations.delete(pose); }
+}

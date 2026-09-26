@@ -107,6 +107,8 @@ function decodeDataUri(uri) {
  * their runtime modules, animation.json and manifest.json.
  * Playback entries also export translation root-motion extraction/composition;
  * their controller dependency is emitted and hashed for every playback package.
+ * inverseKinematics:true adds bounded CCD, analytic two-bone and atomic multi-limb
+ * solvers to playback entries; CPU pose edits run before explicit deformer uploads.
  * With {webgpu:true}, also emit GPU deformation, unlit drawing and scene playback.
  * Add environment:true with webgpu:true to emit the optional IBL filter/receiver
  * and export createGpuAnimationEnvironment. Also set hdr:true to package the
@@ -181,11 +183,14 @@ export function buildAnimation(
     rigidGeometry = false,
     threeScene = false,
     canvasRecovery = false,
+    inverseKinematics = false,
   } = {},
 ) {
   if (typeof rigidGeometry !== "boolean" || (rigidGeometry && !webgpu))
     throw new TypeError("rigidGeometry must be boolean and requires webgpu:true");
   if (typeof webgpu !== "boolean") throw new TypeError("webgpu must be boolean");
+  if (typeof inverseKinematics !== "boolean")
+    throw new TypeError("inverseKinematics must be boolean");
   if (typeof canvasRecovery !== "boolean" || (canvasRecovery && !webgpu))
     throw new TypeError("canvasRecovery must be boolean and requires webgpu:true");
   if (typeof threeScene !== "boolean" || (threeScene && !webgpu))
@@ -414,6 +419,12 @@ export {fitAnimationShadowView,animationShadowWorldBounds} from './animation_sha
         "export {createRecoverableGpuThreeCanvas,createRecoverableGpuThreeHdrCanvas} from './three_canvas_recovery.mjs';\n");
     }
   }
+  if (inverseKinematics) {
+    outputs.set("animation_ik.mjs", fs.readFileSync(new URL("./animation_ik.mjs", import.meta.url), "utf8"));
+    const ikExports = "export {solveAnimationIK,solveAnimationTwoBoneIK,solveAnimationLimbIK} from './animation_ik.mjs';\n";
+    outputs.set("playback.mjs", outputs.get("playback.mjs") + ikExports);
+    if (webgpu) outputs.set("gpu_playback.mjs", outputs.get("gpu_playback.mjs") + ikExports);
+  }
   const manifest = {
     format: "f3d-animation-package-v1",
     entry: "animation.mjs",
@@ -434,6 +445,7 @@ export {fitAnimationShadowView,animationShadowWorldBounds} from './animation_sha
     ...(environment ? { gpuEnvironment: "f3d-animation-environment-v1" } : {}),
     ...(threeScene ? { gpuThreeScene: "explicit-r186-scene; native source instances and GPU skin/morph deformation; owned source textures or borrowed bindings; borrowed module and attachments" } : {}),
     ...(canvasRecovery ? { gpuCanvasRecovery: "explicit-device-loss-reconstruction; bounded attempts; no frame replay" } : {}),
+    ...(inverseKinematics ? { animationIK: "bounded-ccd; analytic-pole-limbs; transactional-local-pose" } : {}),
     source: { file: path.basename(entry), sha256: hash(source) },
     dependencies: [...dependencies.values()],
     nodeCount: validated.nodeCount,
