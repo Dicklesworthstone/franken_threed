@@ -138,6 +138,13 @@
  * Null/omitted frame.environment selects the original direct-only pipelines.
  * See ANIMATION_ENVIRONMENT.md for the single-scattering profile and ownership.
  *
+ * fog:true admits frame.fog as a linear/exp2 descriptor from animation_fog.mjs.
+ * One shared 48-byte uniform fogs final shaded RGB before blending; alpha,
+ * coverage, background and depth-only rendering are unchanged. depthFromClip
+ * recovers positive view depth from homogeneous native clip position in the
+ * vertex stage, before perspective division. Null disables the live effect.
+ * No depth texture, extra draw, or larger per-draw packet is introduced.
+ *
  * instancing:true replaces the per-draw uniform binding with a read-only storage
  * arena and native instance-index addressing. Consecutive compatible OPAQUE/MASK
  * draws share draw()/drawIndexed(); BLEND and incompatible inputs stay separate.
@@ -303,6 +310,7 @@ function surfaceShader(
   toon = false,
   indirectLights = false,
   threeLights = false,
+  fogCode = "",
 ) {
   const nativeInstances = geometryChannels?.instanced === true;
   const instanceColor = geometryChannels?.instanceColor === true;
@@ -444,11 +452,11 @@ var<private> draw_info: DrawInfo;`
     : "@group(0) @binding(0) var<uniform> draw_info: DrawInfo;"
 }
 ${declarations}${coated ? "\n@group(1) @binding(16) var<uniform> clearcoat_info: vec4<f32>;" : ""}
-${lighting}
+${lighting}${fogCode}
 struct VertexOutput {
   @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) color: vec4<f32>,${instanceStride ? `\n  @location(${coated ? 13 : 10}) @interpolate(flat) draw_index: u32,` : ""}
   ${lit ? "@location(2) world: vec3<f32>, @location(3) normal: vec3<f32>," : ""}
-  ${tangentAttribute ? "@location(4) tangent: vec4<f32>," : ""}
+  ${tangentAttribute ? "@location(4) tangent: vec4<f32>," : ""}${fogCode ? "\n  @location(14) fog_depth: f32," : ""}
   ${mapSlots(coordinateMask)
     .map((slot) => `@location(${5 + slot}) uv_${slot}: vec2<f32>,`)
     .join("\n  ")}
@@ -466,7 +474,7 @@ struct VertexOutput {
   ${lit || tangentAttribute ? "let instance_basis = mat3x3<f32>(instance_0.xyz, instance_1.xyz, instance_2.xyz);" : ""}
   ${lit ? `// Pinned r186 defaultnormal_vertex: supports nonuniform scale, not shear.
   let instance_normal = instance_basis * (normal / vec3<f32>(dot(instance_0.xyz, instance_0.xyz), dot(instance_1.xyz, instance_1.xyz), dot(instance_2.xyz, instance_2.xyz)));` : ""}` : ""}
-  out.position = draw_info.clip_from_local * ${localPosition};
+  out.position = draw_info.clip_from_local * ${localPosition};${fogCode ? "\n  out.fog_depth = dot(fog_info.depth_from_clip, out.position);" : ""}
   ${uvAttribute ? "out.uv = vec2<f32>(dot(draw_info.uv_x.xyz, vec3<f32>(uv, 1.0)), dot(draw_info.uv_y.xyz, vec3<f32>(uv, 1.0)));" : "out.uv = vec2<f32>(0.0);"}
   out.color = ${colorWidth === 3 ? "vec4<f32>(color, 1.0)" : colorWidth === 4 ? "color" : "vec4<f32>(1.0)"};
   ${instanceColor ? "out.color = vec4<f32>(out.color.rgb * instance_color, out.color.a);" : ""}
@@ -560,7 +568,7 @@ struct VertexOutput {
   }`
       : "let rgb = rgba.rgb;"
   }
-  ${toon ? "if (draw_info.options.x >= 0.0 && rgba.a < draw_info.options.x) { discard; }\n  " : ""}${depthOnly ? "" : "return vec4<f32>(rgb, select(1.0, rgba.a, draw_info.options.y > 0.0));"}
+  ${toon ? "if (draw_info.options.x >= 0.0 && rgba.a < draw_info.options.x) { discard; }\n  " : ""}${depthOnly ? "" : "return vec4<f32>(" + (fogCode ? "apply_distance_fog(rgb, input.fog_depth)" : "rgb") + ", select(1.0, rgba.a, draw_info.options.y > 0.0));"}
 }
 `;
 }
@@ -787,6 +795,7 @@ export async function createGpuAnimationRenderer(
     sampleCount = 1,
     shadows = false,
     environment = false,
+    fog = false,
     indirectLights = false,
     threeLights = false,
     instancing = false,
@@ -825,6 +834,8 @@ export async function createGpuAnimationRenderer(
     fail("ANIMATION_RENDER_OPTIONS", "Shadows require a color renderer");
   if (typeof environment !== "boolean" || (environment && format === null))
     fail("ANIMATION_RENDER_OPTIONS", "Environment lighting requires a color renderer");
+  if (typeof fog !== "boolean" || (fog && format === null))
+    fail("ANIMATION_RENDER_OPTIONS", "Fog requires a color renderer and a boolean option");
   if (typeof indirectLights !== "boolean" || (indirectLights && format === null))
     fail("ANIMATION_RENDER_OPTIONS", "Indirect lights require a color renderer");
   if (typeof threeLights !== "boolean" || (threeLights && format === null))
@@ -855,7 +866,12 @@ export async function createGpuAnimationRenderer(
   limit("maxUniformBufferBindingSize", UNIFORM_BYTES);
   limit("maxDynamicUniformBuffersPerPipelineLayout", 1);
   limit("maxBindGroups", 1);
-  limit("maxUniformBuffersPerShaderStage", 1);
+  limit("maxUniformBuffersPerShaderStage", 1 + Number(fog));
+  if (fog) {
+    limit("maxBindingsPerBindGroup", 2);
+    // Location 14 does not overlap any authored UV, tangent or instance index.
+    limit("maxInterStageShaderVariables", 15);
+  }
   limit("maxVertexBuffers", 1);
   limit("maxVertexAttributes", 1);
   limit("maxVertexBufferArrayStride", 40);
@@ -892,6 +908,11 @@ export async function createGpuAnimationRenderer(
   const lightWords = new Float32Array(LIGHT_BYTES / 4),
     shadowWords = new Float32Array(SHADOW_UNIFORM_BYTES / 4);
   let shadowBuffer, shadowLayout, shadowGroup, shadowView, shadowSampler;
+  let fogReceiver, fogBuffer, fogCode = "";
+  const fogLayoutEntries = () => fog ? [{binding: 1, visibility: VERTEX_STAGE | FRAGMENT_STAGE,
+    buffer: {type: "uniform", minBindingSize: fogReceiver.FOG_UNIFORM_BYTES}}] : [];
+  const fogBindingEntries = () => fog ? [{binding: 1,
+    resource: {buffer: fogBuffer, size: fogReceiver.FOG_UNIFORM_BYTES}}] : [];
   let environmentReceiver,
     environmentBytes = 0,
     environmentWords,
@@ -1071,9 +1092,9 @@ export async function createGpuAnimationRenderer(
     if (nativeInstances && instancing && !instanceUniformLayout) {
       const layout = device.createBindGroupLayout({label, entries: [{binding: 0,
         visibility: VERTEX_STAGE | FRAGMENT_STAGE,
-        buffer: {type: "uniform", hasDynamicOffset: true, minBindingSize: UNIFORM_BYTES}}]});
+        buffer: {type: "uniform", hasDynamicOffset: true, minBindingSize: UNIFORM_BYTES}}, ...fogLayoutEntries()]});
       const group = device.createBindGroup({label, layout, entries: [{binding: 0,
-        resource: {buffer: uniformBuffer, size: UNIFORM_BYTES}}]});
+        resource: {buffer: uniformBuffer, size: UNIFORM_BYTES}}, ...fogBindingEntries()]});
       instanceUniformLayout = layout; instanceBindGroup = group;
     }
     const drawLayout = nativeInstances && instancing ? instanceUniformLayout : uniformLayout;
@@ -1143,7 +1164,7 @@ export async function createGpuAnimationRenderer(
     const module = device.createShaderModule({
       label,
       code:
-        nativeInstances || instancing || lit || attributes || format === null
+        fog || nativeInstances || instancing || lit || attributes || format === null
           ? surfaceShader(
               mapMask,
               lit,
@@ -1161,6 +1182,7 @@ export async function createGpuAnimationRenderer(
               toon,
               indirectLights,
               threeLights,
+              fogCode,
             )
           : ANIMATION_RENDER_WGSL,
     });
@@ -1369,6 +1391,13 @@ export async function createGpuAnimationRenderer(
     return variants.get(variant);
   }
   try {
+    if (fog) {
+      fogReceiver = await import("./animation_fog.mjs");
+      live();
+      if (arenaBytes + fogReceiver.FOG_UNIFORM_BYTES > maxBytes)
+        fail("ANIMATION_RENDER_LIMIT", "Draw arena and fog uniform exceed byte budget");
+      fogCode = fogReceiver.animationFogWgsl();
+    }
     if (environment) {
       environmentReceiver = await import("./animation_environment_receiver.mjs");
       live();
@@ -1376,6 +1405,8 @@ export async function createGpuAnimationRenderer(
       environmentWords = new Float32Array(environmentBytes / 4);
     }
     const initialized = scoped(device, () => {
+      if (fog) fogBuffer = remember(device.createBuffer({label: `${label}/fog`,
+        size: fogReceiver.FOG_UNIFORM_BYTES, usage: UNIFORM | COPY_DST}), fogReceiver.FOG_UNIFORM_BYTES);
       uniformBuffer = remember(
         device.createBuffer({
           label,
@@ -1394,6 +1425,7 @@ export async function createGpuAnimationRenderer(
               ? { type: "read-only-storage", minBindingSize: stride }
               : { type: "uniform", hasDynamicOffset: true, minBindingSize: UNIFORM_BYTES },
           },
+          ...fogLayoutEntries(),
         ],
       });
       bindGroup = device.createBindGroup({
@@ -1404,6 +1436,7 @@ export async function createGpuAnimationRenderer(
             binding: 0,
             resource: { buffer: uniformBuffer, size: instancing ? arenaBytes : UNIFORM_BYTES },
           },
+          ...fogBindingEntries(),
         ],
       });
       return compilePipelines("plain");
@@ -1543,7 +1576,7 @@ export async function createGpuAnimationRenderer(
       if (coatValues[0] < 0 || coatValues[0] > 1 || coatValues[1] < 0 || coatValues[1] > 1)
         fail("ANIMATION_RENDER_VALUE", "Clearcoat factors must be in [0,1]");
       limit("maxBindGroups", 3);
-      limit("maxUniformBuffersPerShaderStage", 3 + Number(shadows) + Number(environment));
+      limit("maxUniformBuffersPerShaderStage", 3 + Number(shadows) + Number(environment) + Number(fog));
       limit("maxBindingsPerBindGroup", mapSlots(mapMask).length * 2 + 1);
       if (instancing) limit("maxInterStageShaderVariables", 14);
     }
@@ -1607,7 +1640,7 @@ export async function createGpuAnimationRenderer(
           mapSlots(mapMask).length + Number(shadows) + (environment ? 3 : 0),
         );
       }
-      limit("maxUniformBuffersPerShaderStage", 2 + Number(shadows) + Number(environment));
+      limit("maxUniformBuffersPerShaderStage", 2 + Number(shadows) + Number(environment) + Number(fog));
       limit("maxUniformBufferBindingSize", LIGHT_BYTES);
       limit("maxBufferSize", LIGHT_BYTES);
       limit("maxBindGroups", mapMask ? 3 : 2);
@@ -1961,6 +1994,7 @@ export async function createGpuAnimationRenderer(
           "lighting",
           "shadow",
           "environment",
+          "fog",
           "renderBundles",
         ],
         "frame",
@@ -1980,6 +2014,7 @@ export async function createGpuAnimationRenderer(
         lighting = null,
         shadow = null,
         environment: environmentInput = null,
+        fog: fogInput = null,
         renderBundles: useBundles = renderBundles,
       } = frame;
       if (typeof useBundles !== "boolean" || (useBundles && !renderBundles))
@@ -2017,6 +2052,9 @@ export async function createGpuAnimationRenderer(
         array(scissor, 4, "Scissor");
         for (const v of scissor) integer(v, 0, 0xffffffff, "scissor component");
       }
+      if (fogInput !== null && !fog)
+        fail("ANIMATION_RENDER_OPTIONS", "Enable renderer fog before supplying frame fog");
+      const fogWords = fog ? fogReceiver.packAnimationFog(fogInput) : null;
       const dependencies = new Set();
       let usesLighting = false;
       if (lighting !== null) packLighting(lighting, lightWords, indirectLights, threeLights);
@@ -2330,6 +2368,9 @@ export async function createGpuAnimationRenderer(
             0,
             ((draws.length - 1) * stride) / 4 + UNIFORM_BYTES / 4,
           );
+        // Reset disabled frames too: a prior fogged submission must not leak
+        // into a later unfogged span. Queue writes precede their consuming submit.
+        if (fog) device.queue.writeBuffer(fogBuffer, 0, fogWords);
         if (usesLighting) device.queue.writeBuffer(lightBuffer, 0, lightWords);
         if (usesLighting && projected) device.queue.writeBuffer(shadowBuffer, 0, shadowWords);
         if (usesLighting && ambient)
@@ -2390,6 +2431,7 @@ export async function createGpuAnimationRenderer(
     sampleCount,
     shadows,
     environment,
+    fog,
     indirectLights,
     threeLights,
     instancing,
