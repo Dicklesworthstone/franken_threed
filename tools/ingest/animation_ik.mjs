@@ -400,3 +400,209 @@ export function solveAnimationIK(pose, options) {
     changedNodes: Object.freeze(edits.map((edit) => edit.node)),
   });
 }
+
+// Analytic limbs share the CCD module's quaternion and transform admission.
+// They do not change the CCD solver's convergence or hinge-limit contract.
+const limbOperations = new WeakSet();
+const subtract = (a, b) => a.map((v, i) => finite(v - b[i], "Position difference"));
+const positionOf = (entry) => Array.from(entry.world.subarray(12, 15));
+const inverseQuaternion = (q) => q.map((v, i) => i === 3 ? v : -v);
+function limbVector(input, width, label) {
+  if ((!Array.isArray(input) && !ArrayBuffer.isView(input)) || input.length !== width)
+    fail("VALUE", `Invalid ${label}`);
+  // Bounded indexed reads: an array's custom iterator cannot enlarge the work.
+  return Array.from({ length: width }, (_, i) => finite(input[i], label));
+}
+function basisQuaternion(axes) {
+  const [a, b, c] = axes, trace = a[0] + b[1] + c[2];
+  let q, s;
+  if (trace > 0) {
+    s = 2 * Math.sqrt(trace + 1);
+    q = [(b[2] - c[1]) / s, (c[0] - a[2]) / s, (a[1] - b[0]) / s, s / 4];
+  } else if (a[0] > b[1] && a[0] > c[2]) {
+    s = 2 * Math.sqrt(1 + a[0] - b[1] - c[2]);
+    q = [s / 4, (b[0] + a[1]) / s, (c[0] + a[2]) / s, (b[2] - c[1]) / s];
+  } else if (b[1] > c[2]) {
+    s = 2 * Math.sqrt(1 + b[1] - a[0] - c[2]);
+    q = [(b[0] + a[1]) / s, s / 4, (c[1] + b[2]) / s, (c[0] - a[2]) / s];
+  } else {
+    s = 2 * Math.sqrt(1 + c[2] - a[0] - b[1]);
+    q = [(c[0] + a[2]) / s, (c[1] + b[2]) / s, s / 4, (a[1] - b[0]) / s];
+  }
+  return quaternion(q);
+}
+function limbSnapshot(pose) {
+  if (!pose || typeof pose.snapshotLocalPose !== "function" || typeof pose.edit !== "function")
+    fail("POSE", "Expected an editable animation player");
+  const snapshot = pose.snapshotLocalPose(), n = snapshot.nodeCount;
+  if (snapshot.format !== "f3d-local-pose-v1" || !Number.isSafeInteger(n) || n < 1 || n > 65536)
+    fail("POSE", "Invalid pose snapshot");
+  return snapshot;
+}
+function limbLive(pose, snapshot) {
+  if (pose.disposed || pose.version !== snapshot.version)
+    fail("STALE", "Pose changed during limb input evaluation");
+}
+function stageTwoBoneIK(snapshot, input) {
+  record(input, ["root", "joint", "effector", "target", "pole", "weight", "tolerance",
+    "endRotation", "orientationWeight", "orientationTolerance"], "two-bone solver options");
+  const options = { ...input }, n = snapshot.nodeCount;
+  const index = (v) => {
+    if (!Number.isInteger(v) || v < 0 || v >= n) fail("CHAIN", "Invalid limb node");
+    return v;
+  };
+  const root = index(options.root), joint = index(options.joint), effector = index(options.effector);
+  if (root === joint || joint === effector || root === effector ||
+      snapshot.parents[joint] !== root || snapshot.parents[effector] !== joint)
+    fail("CHAIN", "A two-bone limb requires direct root -> joint -> effector parentage");
+  const target = limbVector(options.target, 3, "world target"),
+    pole = limbVector(options.pole, 3, "world pole");
+  const weight = finite(options.weight ?? 1, "weight"),
+    tolerance = finite(options.tolerance ?? 1e-4, "tolerance"),
+    orientationWeight = finite(options.orientationWeight ?? weight, "orientationWeight"),
+    orientationTolerance = finite(options.orientationTolerance ?? 1e-4, "orientationTolerance");
+  const endRotation = options.endRotation === undefined ? null :
+    quaternion(limbVector(options.endRotation, 4, "world end rotation"));
+  if (weight < 0 || weight > 1 || orientationWeight < 0 || orientationWeight > 1 ||
+      tolerance < 0 || orientationTolerance < 0 || orientationTolerance > Math.PI ||
+      (!endRotation && options.orientationWeight !== undefined))
+    fail("OPTIONS", "Invalid limb weights, tolerances or missing orientation target");
+  const matrixNodes = new Map(snapshot.matrices.map(({ node, matrix }) => [node, matrix]));
+  const chain = [], seen = new Set();
+  for (let node = effector; node !== -1; node = snapshot.parents[node]) {
+    index(node);
+    if (seen.has(node) || chain.length >= 256) fail("CHAIN", "Cyclic or excessive limb ancestry");
+    seen.add(node); chain.push(node);
+  }
+  chain.reverse();
+  const path = chain.map((node) => {
+    const translation = limbVector(snapshot.translations.subarray(node * 3, node * 3 + 3), 3, "translation"),
+      rotation = limbVector(snapshot.rotations.subarray(node * 4, node * 4 + 4), 4, "rotation"),
+      scale = limbVector(snapshot.scales.subarray(node * 3, node * 3 + 3), 3, "scale");
+    return { node, translation, rotation, scale,
+      local: matrixNodes.get(node) ?? compose(translation, rotation, scale), world: new Float64Array(16) };
+  });
+  const rootSlot = path.length - 3, a = path[rootSlot], b = path[rootSlot + 1], c = path[rootSlot + 2];
+  const rotatable = endRotation ? [a, b, c] : [a, b];
+  for (const entry of rotatable) {
+    if (matrixNodes.has(entry.node) || entry.scale.some((v) => v <= 0 ||
+        Math.abs(v / entry.scale[0] - 1) > 1e-8))
+      fail("TRANSFORM", "Rotated limb nodes require positive uniform-scale TRS");
+    quaternion(entry.rotation); // Validate without changing the committed baseline.
+  }
+  function propagate(start = 0) {
+    for (let i = start; i < path.length; i++) {
+      const entry = path[i], parent = i ? path[i - 1].world : snapshot.rootMatrix;
+      if (parent) multiply(parent, entry.local, entry.world);
+      else for (let k = 0; k < 16; k++) entry.world[k] = finite(entry.local[k], "World matrix");
+    }
+  }
+  function setRotation(slot, q) {
+    const entry = path[slot];
+    entry.rotation = quaternion(q);
+    entry.local = compose(entry.translation, entry.rotation, entry.scale);
+    propagate(slot);
+  }
+  function align(slot, from, to) {
+    const axes = basis(path[slot].world), u = unit(from), v = unit(to);
+    if (!u || !v) fail("LENGTH", "Limb direction collapsed at working precision");
+    const delta = rotationBetween(axes.map((axis) => dot(axis, u)),
+      axes.map((axis) => dot(axis, v)), Math.PI);
+    if (delta) setRotation(slot, product(path[slot].rotation, delta));
+  }
+  propagate();
+  const rootAxes = basis(a.world);
+  basis(b.world);
+  if (endRotation) basis(c.world);
+  const origin = positionOf(a), upper = subtract(positionOf(b), origin),
+    lower = subtract(positionOf(c), positionOf(b)), toTarget = subtract(target, origin);
+  const l1 = finite(Math.hypot(...upper), "Upper bone length"),
+    l2 = finite(Math.hypot(...lower), "Lower bone length"),
+    targetDistance = finite(Math.hypot(...toTarget), "Root-target distance"),
+    initialDistance = finite(Math.hypot(...subtract(target, positionOf(c))), "Initial target distance");
+  const scale = Math.max(l1, l2);
+  if (!l1 || !l2 || Math.min(l1, l2) / scale < 1e-12)
+    fail("LENGTH", "Two nonzero bones with a length ratio of at least 1e-12 are required");
+  const minReach = Math.abs(l1 - l2), maxReach = finite(l1 + l2, "Limb reach"),
+    reach = clamp(targetDistance, minReach, maxReach);
+  // At the root target, preserve the current root-effector axis when it exists.
+  const direction = unit(toTarget) ?? unit(subtract(positionOf(c), origin)) ?? unit(upper);
+  const perpendicular = (v) => {
+    const u = unit(v);
+    if (!u) return null;
+    const projected = u.map((x, i) => x - direction[i] * dot(u, direction));
+    return Math.hypot(...projected) > 1e-10 ? unit(projected) : null;
+  };
+  let bend = perpendicular(subtract(pole, origin)), poleFallback = "none";
+  if (!bend) { bend = perpendicular(upper); poleFallback = "current"; }
+  if (!bend) {
+    const axis = rootAxes.reduce((best, next) =>
+      Math.abs(dot(next, direction)) < Math.abs(dot(best, direction)) ? next : best);
+    bend = perpendicular(axis); poleFallback = "axis";
+  }
+  // Normalized law of cosines avoids squaring world-scale lengths. Equal
+  // lengths also avoid dividing by a vanishing distance at a fully folded limb.
+  let cosine;
+  if (l1 === l2) cosine = (reach / l1) * 0.5;
+  else {
+    const u = l1 / scale, v = l2 / scale, d = reach / scale;
+    cosine = 0.5 * (d + ((u - v) * (u + v)) / d) / u;
+  }
+  cosine = clamp(finite(cosine, "Limb bend cosine"), -1, 1);
+  const sine = Math.sqrt(Math.max(0, (1 - cosine) * (1 + cosine))),
+    desiredUpper = direction.map((v, i) => v * cosine + bend[i] * sine),
+    endpoint = origin.map((v, i) => finite(v + direction[i] * reach, "Reachable endpoint"));
+  const initialRoot = a.rotation.slice(), initialJoint = b.rotation.slice();
+  if (weight > 0) {
+    align(rootSlot, upper, desiredUpper);
+    align(rootSlot + 1, subtract(positionOf(c), positionOf(b)), subtract(endpoint, positionOf(b)));
+    if (weight < 1) {
+      const solvedRoot = a.rotation.slice(), solvedJoint = b.rotation.slice();
+      setRotation(rootSlot, slerp(initialRoot, solvedRoot, weight));
+      setRotation(rootSlot + 1, slerp(initialJoint, solvedJoint, weight));
+    }
+  }
+  if (endRotation && orientationWeight > 0) {
+    // Blend from the world orientation AFTER the positional solve. Thus zero
+    // orientation influence leaves the end's local rotation alone continuously.
+    const current = basisQuaternion(basis(c.world)), parent = basisQuaternion(basis(b.world));
+    setRotation(rootSlot + 2, product(inverseQuaternion(parent), slerp(current, endRotation, orientationWeight)));
+  }
+  const distance = finite(Math.hypot(...subtract(target, positionOf(c))), "Final target distance");
+  let orientationError = null;
+  if (endRotation) {
+    const delta = product(inverseQuaternion(endRotation), basisQuaternion(basis(c.world)));
+    orientationError = 2 * Math.atan2(Math.hypot(...delta.slice(0, 3)), Math.abs(delta[3]));
+  }
+  const edits = rotatable.filter((entry) => entry.rotation.some((v, i) =>
+    v !== snapshot.rotations[entry.node * 4 + i])).map(({ node, rotation }) => ({ node, rotation }));
+  // Weight-zero requests must not publish normalization-only changes.
+  const selected = edits.filter(({ node }) => node === effector ? orientationWeight > 0 : weight > 0);
+  return { edits: selected, chain, nodes: [root, joint, effector], result: {
+    converged: distance <= tolerance && (orientationError === null || orientationError <= orientationTolerance),
+    positionConverged: distance <= tolerance,
+    orientationConverged: orientationError === null || orientationError <= orientationTolerance,
+    reachable: targetDistance >= minReach && targetDistance <= maxReach,
+    distance, initialDistance, targetDistance, solvedDistance: reach,
+    orientationError, poleFallback,
+  } };
+}
+
+/** Analytic root -> joint -> effector IK, with a world-space pole POINT.
+ * Solve straight/folded limbs, clamp unreachable targets without stretching,
+ * blend local rotations by weight, optionally align endRotation in world space.
+ * See ANIMATION_LIMB_IK.md. This adds no clock, renderer, or contact detection.
+ */
+export function solveAnimationTwoBoneIK(pose, options) {
+  if (!pose || (typeof pose !== "object" && typeof pose !== "function"))
+    fail("POSE", "Expected an editable animation player");
+  if (limbOperations.has(pose)) fail("REENTRANT", "Limb solve cannot be reentered");
+  limbOperations.add(pose);
+  try {
+    const snapshot = limbSnapshot(pose), staged = stageTwoBoneIK(snapshot, options);
+    limbLive(pose, snapshot);
+    if (staged.edits.length) pose.edit(staged.edits);
+    return Object.freeze({ ...staged.result, poseVersion: pose.version,
+      changedNodes: Object.freeze(staged.edits.map(({ node }) => node)) });
+  } finally { limbOperations.delete(pose); }
+}
