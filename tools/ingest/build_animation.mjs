@@ -110,6 +110,9 @@ function decodeDataUri(uri) {
  * inverseKinematics:true adds bounded CCD, analytic two-bone and atomic multi-limb
  * solvers to playback entries; CPU pose edits run before explicit deformer uploads.
  * With {webgpu:true}, also emit GPU deformation, unlit drawing and scene playback.
+ * fog:true packages native linear/exp2 fog and a projection-to-view-depth adapter.
+ * Also select renderer fog:true at runtime; no pipeline is enabled at import.
+ * Without this build option the lazy fog modules are not emitted. See ANIMATION_FOG.md.
  * Add environment:true with webgpu:true to emit the optional IBL filter/receiver
  * and export createGpuAnimationEnvironment. Also set hdr:true to package the
  * RGBE decoder and loadGpuAnimationEnvironment URL/byte loader. No HDR file is
@@ -184,11 +187,14 @@ export function buildAnimation(
     threeScene = false,
     canvasRecovery = false,
     inverseKinematics = false,
+    fog = false,
   } = {},
 ) {
   if (typeof rigidGeometry !== "boolean" || (rigidGeometry && !webgpu))
     throw new TypeError("rigidGeometry must be boolean and requires webgpu:true");
   if (typeof webgpu !== "boolean") throw new TypeError("webgpu must be boolean");
+  if (typeof fog !== "boolean" || (fog && !webgpu))
+    throw new TypeError("fog must be boolean and requires webgpu:true");
   if (typeof inverseKinematics !== "boolean")
     throw new TypeError("inverseKinematics must be boolean");
   if (typeof canvasRecovery !== "boolean" || (canvasRecovery && !webgpu))
@@ -419,6 +425,16 @@ export {fitAnimationShadowView,animationShadowWorldBounds} from './animation_sha
         "export {createRecoverableGpuThreeCanvas,createRecoverableGpuThreeHdrCanvas} from './three_canvas_recovery.mjs';\n");
     }
   }
+  if (fog) {
+    // The renderer imports this helper lazily only when its fog option is true.
+    // Include both it and the camera adapter; never enable a runtime pipeline.
+    for (const name of ["animation_fog.mjs", "animation_fog_camera.mjs"]) {
+      outputs.set(name, fs.readFileSync(new URL("./" + name, import.meta.url), "utf8"));
+    }
+    outputs.set("gpu_playback.mjs", outputs.get("gpu_playback.mjs") +
+      "export {AnimationFogError} from './animation_fog.mjs';\n" +
+      "export {animationFogDepthFromProjection,snapshotAnimationCameraFog} from './animation_fog_camera.mjs';\n");
+  }
   if (inverseKinematics) {
     outputs.set("animation_ik.mjs", fs.readFileSync(new URL("./animation_ik.mjs", import.meta.url), "utf8"));
     const ikExports = "export {solveAnimationIK,solveAnimationTwoBoneIK,solveAnimationLimbIK} from './animation_ik.mjs';\n";
@@ -445,6 +461,7 @@ export {fitAnimationShadowView,animationShadowWorldBounds} from './animation_sha
     ...(environment ? { gpuEnvironment: "f3d-animation-environment-v1" } : {}),
     ...(threeScene ? { gpuThreeScene: "explicit-r186-scene; native source instances and GPU skin/morph deformation; owned source textures or borrowed bindings; borrowed module and attachments" } : {}),
     ...(canvasRecovery ? { gpuCanvasRecovery: "explicit-device-loss-reconstruction; bounded attempts; no frame replay" } : {}),
+    ...(fog ? { gpuFog: "linear-or-exp2; native-view-depth; explicit renderer fog:true; shaded RGB only" } : {}),
     ...(inverseKinematics ? { animationIK: "bounded-ccd; analytic-pole-limbs; transactional-local-pose" } : {}),
     source: { file: path.basename(entry), sha256: hash(source) },
     dependencies: [...dependencies.values()],
