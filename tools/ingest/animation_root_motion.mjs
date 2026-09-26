@@ -40,7 +40,11 @@ const identity = () => [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
  * advance() consumes actual monotone action travel, including repeat seams;
  * ping-pong and once use zero wraps. Work is logarithmic in keys, not loop count.
  */
-export function createAnimationRootMotionTrack(input, duration) {
+export function createAnimationRootMotionTrack(input, duration, options = {}) {
+  fields(options, ["maxComponents"], "root-motion limits");
+  const { maxComponents = 16777216 } = options;
+  if (!Number.isSafeInteger(maxComponents) || maxComponents < 0 || maxComponents > 16777216)
+    fail("LIMIT", "Invalid root-motion component budget");
   fields(input, ["format", "duration", "interpolation", "times", "values"], "root-motion track");
   finite(duration, "clip duration");
   if (duration < 0 || input.format !== "f3d-root-translation-v1" || input.duration !== duration)
@@ -50,6 +54,8 @@ export function createAnimationRootMotionTrack(input, duration) {
   const cubic = interpolation === "CUBICSPLINE", count = input.times?.length;
   if (!Number.isSafeInteger(count) || count < (cubic ? 2 : 1) || count > 1048576)
     fail("LIMIT", "Invalid root-motion key count");
+  const components = count * (cubic ? 10 : 4);
+  if (components > maxComponents) fail("LIMIT", "Root-motion component budget exceeded");
   const times = numbers(input.times, count, "key times"),
     values = numbers(input.values, count * (cubic ? 9 : 3), "key values");
   for (let i = 0; i < count; i++)
@@ -93,7 +99,7 @@ export function createAnimationRootMotionTrack(input, duration) {
     }
     return result;
   }
-  return Object.freeze({ definition, advance });
+  return Object.freeze({ definition, components, advance });
 }
 
 /** Separate one root's selected translation axes from a live player's copied

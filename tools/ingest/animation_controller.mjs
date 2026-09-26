@@ -43,12 +43,21 @@
  * clock. Overflow rejects the whole update before pose/clock publication.
  * See ANIMATION_MARKERS.md for endpoints, zero-duration clips and event limits.
  *
+ * Optional rootMotion tracks publish unweighted per-action rootMotionDelta
+ * from the same travel segments. update(delta, {rootMotionAction, rootMatrix})
+ * explicitly applies one action's displacement to the supplied placement before
+ * the single pose blend. rootMotionMatrix is its immutable successful result;
+ * pass it as the next update's rootMatrix to accumulate placement. No leader,
+ * heading, collision response or fade-weight policy is inferred. See
+ * ANIMATION_ROOT_MOTION.md for clip extraction and placement boundaries.
+ *
  * This is not a Three.js AnimationMixer adapter: it controls imported TRS and
  * morph tracks, not arbitrary PropertyBindings or preconverted additive clips.
  * Additive layers use player.blend's imported-rest-relative convention.
  */
 import { AnimationPoseError } from "./animation_runtime.mjs";
 import { animationMarkerEventLimit, createAnimationMarkerTrack } from "./animation_markers.mjs";
+import { createAnimationRootMotionTrack, applyAnimationRootMotion } from "./animation_root_motion.mjs";
 
 const fail = (code, message) => {
   throw new AnimationPoseError(code, message);
@@ -80,6 +89,8 @@ function loopOptions(loop, repetitions) {
   return { loop, repetitions: loop === "once" ? 1 : repetitions };
 }
 const EMPTY = Object.freeze([]);
+const ZERO_MOTION = Object.freeze([0, 0, 0]);
+const MAX_MOTION_COMPONENTS = 16777216;
 
 export function createAnimationController(pose, options = {}) {
   if (!options || typeof options !== "object" || Array.isArray(options) ||
@@ -104,6 +115,8 @@ export function createAnimationController(pose, options = {}) {
   let time = 0,
     events = EMPTY,
     markerEvents = EMPTY,
+    rootMotionMatrix = null,
+    motionComponents = 0,
     busy = false,
     disposed = false;
   function exclusive(operation, ...args) {
@@ -122,6 +135,11 @@ export function createAnimationController(pose, options = {}) {
     if (!record || record.disposed)
       fail("ANIMATION_ACTION_DISPOSED", "Action is not live in this controller");
     return record;
+  }
+  function copyRootMotion(input, duration, previous = null) {
+    return input === null ? null : createAnimationRootMotionTrack(input, duration, {
+      maxComponents: MAX_MOTION_COMPONENTS - motionComponents + (previous?.components ?? 0),
+    });
   }
   function copyMask(mask) {
     if (mask === null) return null;
@@ -235,6 +253,7 @@ export function createAnimationController(pose, options = {}) {
       mode = "normal",
       mask = null,
       markers = EMPTY,
+      rootMotion = null,
     } = options;
     const timing = loopOptions(loop, repetitions),
       duration = nonnegative(pose.clips[clip].duration, "Clip duration");
@@ -273,6 +292,8 @@ export function createAnimationController(pose, options = {}) {
     const record = {
       state, next: { ...state }, layer, disposed: false, action: null,
       markerTrack: createAnimationMarkerTrack(markers, duration),
+      motionTrack: copyRootMotion(rootMotion, duration),
+      nextMotion: [0, 0, 0], pendingMotion: ZERO_MOTION, motion: ZERO_MOTION,
     };
     const mutate = (operation) =>
       exclusive(() => {
@@ -396,6 +417,19 @@ export function createAnimationController(pose, options = {}) {
       get markers() {
         return record.markerTrack.markers;
       },
+      setRootMotion(input) {
+        return mutate(() => {
+          const next = copyRootMotion(input, duration, record.motionTrack);
+          motionComponents += (next?.components ?? 0) - (record.motionTrack?.components ?? 0);
+          record.motionTrack = next;
+        });
+      },
+      get rootMotionTrack() {
+        return record.motionTrack?.definition ?? null;
+      },
+      get rootMotionDelta() {
+        return record.motion;
+      },
       fadeTo(target, seconds, options = {}) {
         return mutate(() => {
           const { stopWhenDone = false } = options;
@@ -408,6 +442,7 @@ export function createAnimationController(pose, options = {}) {
       dispose() {
         return mutate(() => {
           record.disposed = true;
+          motionComponents -= record.motionTrack?.components ?? 0;
           records.splice(records.indexOf(record), 1);
         });
       },
@@ -463,6 +498,7 @@ export function createAnimationController(pose, options = {}) {
     record.action = action;
     owned.set(action, record);
     records.push(record);
+    motionComponents += record.motionTrack?.components ?? 0;
     return action;
   }
   function advance(state, distance, clockDirection) {
@@ -526,11 +562,19 @@ export function createAnimationController(pose, options = {}) {
     advanceDistance(record, state, distance, Math.sign(from || to));
   }
   function advanceDistance(record, state, distance, direction) {
-    const marked = record.markerTrack.markers.length > 0 && state.playing &&
-      !state.paused && distance !== 0 && direction !== 0;
+    const moving = state.playing && !state.paused && distance !== 0 && direction !== 0;
+    const marked = record.markerTrack.markers.length > 0 && moving;
     const start = state.time, traversal = state.completed,
       localDirection = direction * state.orientation;
     advance(state, distance, direction);
+    if (moving && record.motionTrack) {
+      // loopDelta excludes the terminal seam of a finite repeat. Ping-pong
+      // motion telescopes across reflections; it must not add a repeat stride.
+      const delta = record.motionTrack.advance(start, state.time,
+        state.loop === "repeat" ? state.loopDelta : 0, direction);
+      for (let axis = 0; axis < 3; axis++) record.nextMotion[axis] =
+        finite(record.nextMotion[axis] + delta[axis], "Accumulated root motion");
+    }
     if (marked) record.markerTrack.append(pendingMarkers, record.action, {
       start, end: state.time, direction: localDirection, loop: state.loop,
       crossings: state.completed - traversal, finished: state.endEvent, traversal,
@@ -597,6 +641,10 @@ export function createAnimationController(pose, options = {}) {
   function update(delta, options) {
     nonnegative(delta, "Update delta");
     const nextTime = finite(time + delta, "Controller time");
+    const selectedMotion = options?.rootMotionAction;
+    const mover = selectedMotion == null ? null : get(selectedMotion);
+    if (mover && !mover.motionTrack)
+      fail("ANIMATION_ROOT_MOTION_ACTION", "Selected action has no root-motion track");
     layers.length = 0;
     pendingEvents.length = 0;
     pendingMarkers.length = 0;
@@ -604,6 +652,7 @@ export function createAnimationController(pose, options = {}) {
       const state = record.state,
         next = record.next;
       Object.assign(next, state);
+      record.nextMotion.fill(0);
       next.loopDelta = 0;
       next.endEvent = false;
       let actionDelta = delta;
@@ -645,9 +694,17 @@ export function createAnimationController(pose, options = {}) {
     }
     const nextEvents = pendingEvents.length ? Object.freeze(pendingEvents.slice()) : EMPTY;
     const nextMarkers = pendingMarkers.length ? Object.freeze(pendingMarkers.slice()) : EMPTY;
-    // Pose publication is the commit point. Nothing below invokes caller code.
-    pose.blend(layers, options);
-    for (const record of records) Object.assign(record.state, record.next);
+    const nextRootMatrix = mover ? applyAnimationRootMotion(options.rootMatrix, mover.nextMotion) : null;
+    for (const record of records) record.pendingMotion = record.motionTrack ?
+      Object.freeze(record.nextMotion.slice()) : ZERO_MOTION;
+    // Motion and optional external placement publish with the one pose blend.
+    // No allocation, caller input, extra edit or second sampler follows commit.
+    pose.blend(layers, mover ? { rootMatrix: nextRootMatrix } : options);
+    for (const record of records) {
+      Object.assign(record.state, record.next);
+      record.motion = record.pendingMotion;
+    }
+    rootMotionMatrix = nextRootMatrix;
     time = nextTime;
     events = nextEvents;
     markerEvents = nextMarkers;
@@ -718,6 +775,12 @@ export function createAnimationController(pose, options = {}) {
     get markerEvents() {
       return markerEvents;
     },
+    get rootMotionMatrix() {
+      return rootMotionMatrix;
+    },
+    get rootMotionComponents() {
+      return motionComponents;
+    },
     get maxMarkerEvents() {
       return maxMarkerEvents;
     },
@@ -740,6 +803,8 @@ export function createAnimationController(pose, options = {}) {
       events = EMPTY;
       markerEvents = EMPTY;
       pendingMarkers.length = 0;
+      rootMotionMatrix = null;
+      motionComponents = 0;
     },
   });
   return controller;

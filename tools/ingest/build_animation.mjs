@@ -105,6 +105,8 @@ function decodeDataUri(uri) {
  * Disabled packages do not include the pool; no GPU services run at import.
  * Output: animation.mjs (sampler), playback.mjs (sampler/controller/deformer),
  * their runtime modules, animation.json and manifest.json.
+ * Playback entries also export translation root-motion extraction/composition;
+ * their controller dependency is emitted and hashed for every playback package.
  * With {webgpu:true}, also emit GPU deformation, unlit drawing and scene playback.
  * Add environment:true with webgpu:true to emit the optional IBL filter/receiver
  * and export createGpuAnimationEnvironment. Also set hdr:true to package the
@@ -282,6 +284,7 @@ ${instanceExport}`;
   const playback = `export {${playerExports}} from './animation.mjs';
 export {createAnimationController} from './animation_controller.mjs';
 export {createAnimationDeformer} from './animation_deformer.mjs';
+export {extractAnimationRootMotion,applyAnimationRootMotion,createAnimationRootMotionTrack,AnimationRootMotionError} from './animation_root_motion.mjs';
 `;
   const outputs = new Map([
     ["animation.mjs", module],
@@ -289,7 +292,7 @@ export {createAnimationDeformer} from './animation_deformer.mjs';
     ["animation.json", encoded + "\n"],
     ["playback.mjs", playback],
   ]);
-  for (const name of ["animation_controller.mjs", "animation_markers.mjs", "animation_deformer.mjs"]) {
+  for (const name of ["animation_controller.mjs", "animation_markers.mjs", "animation_root_motion.mjs", "animation_deformer.mjs"]) {
     outputs.set(name, fs.readFileSync(new URL("./" + name, import.meta.url), "utf8"));
   }
   if (webgpu) {
@@ -311,7 +314,7 @@ export {createAnimationDeformer} from './animation_deformer.mjs';
     }
     outputs.set(
       "gpu_playback.mjs",
-      `export {${playerExports},createAnimationController,createAnimationDeformer} from './playback.mjs';
+      `export {${playerExports},createAnimationController,createAnimationDeformer,extractAnimationRootMotion,applyAnimationRootMotion,createAnimationRootMotionTrack,AnimationRootMotionError} from './playback.mjs';
 export {createGpuAnimationDeformer} from './animation_webgpu.mjs';
 export {createGpuAnimationRenderer} from './animation_render.mjs';
 export {createGpuBufferGeometry,createGpuInstanceAttributes} from './gpu_buffer_geometry.mjs';

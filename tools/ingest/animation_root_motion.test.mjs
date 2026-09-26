@@ -187,3 +187,14 @@ test("10000 deterministic periodic paths agree with unwrapped linear motion", ()
       [4 * distance * dir, distance * dir, 2 * distance * dir]);
   }
 });
+
+test("component budgets admit exact storage and reject before copying oversized tracks", () => {
+  const input=track();
+  assert.equal(createAnimationRootMotionTrack(input,2,{maxComponents:8}).components,8);
+  let accessed=false;
+  assert.throws(()=>createAnimationRootMotionTrack({...input,get values(){accessed=true;return input.values;}},2,{maxComponents:7}),error("LIMIT"));
+  assert.equal(accessed,false);
+  for(const maxComponents of [-1,16777217,NaN,Infinity,1.5,null])
+    assert.throws(()=>createAnimationRootMotionTrack(input,2,{maxComponents}),error("LIMIT"));
+  assert.throws(()=>createAnimationRootMotionTrack(input,2,{maxComponents:0}),error("LIMIT"));
+});
