@@ -120,6 +120,10 @@ function decodeDataUri(uri) {
  * Combine threeScene:true and environment:true to package source HDR environment
  * ownership and export createGpuThreeEnvironment; select environment:{} at runtime.
  * See THREE_SCENE_ENVIRONMENT.md for ready pixels, versions and lifetime limits.
+ * background:true with webgpu:true emits the native panorama/cube/screen renderer.
+ * Also enable threeScene:true to package ready source HDR background ownership;
+ * select background:{} at runtime. Backgrounds do not enable IBL or HDR decoding.
+ * See THREE_SCENE_BACKGROUND.md for camera, output and preparation contracts.
  * The same option exports createGpuThreeCanvas and createGpuThreeHdrCanvas
  * for direct or whole-image tone-mapped canvas presentation;
  * device/canvas initialization still happens only when its factory is called.
@@ -166,6 +170,7 @@ export function buildAnimation(
     maxInstances = 4096,
     webgpu = false,
     environment = false,
+    background = false,
     hdr = false,
     rigidGeometry = false,
     threeScene = false,
@@ -178,6 +183,8 @@ export function buildAnimation(
     throw new TypeError("threeScene must be boolean and requires webgpu:true");
   if (typeof environment !== "boolean" || (environment && !webgpu))
     throw new TypeError("environment must be boolean and requires webgpu:true");
+  if (typeof background !== "boolean" || (background && !webgpu))
+    throw new TypeError("background must be boolean and requires webgpu:true");
   if (typeof hdr !== "boolean" || (hdr && !environment))
     throw new TypeError("hdr must be boolean and requires environment:true");
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 1)
@@ -368,6 +375,20 @@ export {fitAnimationShadowView,animationShadowWorldBounds} from './animation_sha
         "export {loadGpuAnimationEnvironment} from './animation_environment_loader.mjs';\n",
     );
   }
+  if (background) {
+    outputs.set("animation_background.mjs", fs.readFileSync(new URL("./animation_background.mjs", import.meta.url), "utf8"));
+    outputs.set("gpu_playback.mjs", outputs.get("gpu_playback.mjs") +
+      "export {createGpuAnimationBackground,AnimationBackgroundError} from './animation_background.mjs';\n");
+    if (threeScene) {
+      // The shared HDR admission/conversion helper lives in three_environment.
+      // Include its static dependency even without IBL; imports do not filter.
+      for (const name of ["three_background.mjs", "three_environment.mjs", "animation_environment.mjs"]) {
+        outputs.set(name, fs.readFileSync(new URL("./" + name, import.meta.url), "utf8"));
+      }
+      outputs.set("gpu_playback.mjs", outputs.get("gpu_playback.mjs") +
+        "export {createGpuThreeBackground,ThreeBackgroundError} from './three_background.mjs';\n");
+    }
+  }
   const manifest = {
     format: "f3d-animation-package-v1",
     entry: "animation.mjs",
@@ -384,6 +405,7 @@ export {fitAnimationShadowView,animationShadowWorldBounds} from './animation_sha
     ...(rigidGeometry
       ? { gpuRigidGeometry: "shared-immutable-f32-vertices; opt-in scene rigidGeometry:true" }
       : {}),
+    ...(background ? { gpuBackground: "explicit-linear-fullscreen; borrowed native texture; opt-in source HDR panorama" } : {}),
     ...(environment ? { gpuEnvironment: "f3d-animation-environment-v1" } : {}),
     ...(threeScene ? { gpuThreeScene: "explicit-r186-scene; native source instances and GPU skin/morph deformation; owned source textures or borrowed bindings; borrowed module and attachments" } : {}),
     source: { file: path.basename(entry), sha256: hash(source) },
