@@ -6,7 +6,10 @@
  *
  * This admits rigid/instanced Mesh plus source skin/morph deformation. It
  * is NOT a constructor replacement or complete Three.js renderer compatibility.
- * Unsupported renderable families, shader/render hooks and fog fail explicitly.
+ * Unsupported renderable families and shader/render hooks fail explicitly.
+ * fog:{} admits live source Fog/FogExp2 and material.fog exclusion without a
+ * new preparation boundary. Mixed receivers preserve order through color spans;
+ * camera depth is derived before GPU work. See THREE_SCENE_FOG.md.
  * environment:{} filters a ready source HDR panorama for Standard materials;
  * intensity/rotation remain live. background:{} draws an unfiltered ready HDR
  * panorama behind perspective scenes. shadow:{} opts into one directional/spot map,
@@ -42,7 +45,7 @@ export async function createGpuThreeScene(device,scene,{
   three, textures=new Map(), autoTextures=true, texture:textureOptions={}, renderer:renderOptions={}, geometry:geometryOptions={},
   maxNodes=16384,maxGeometries=256,maxBindings=1024,maxGeometryBytes=128*1024*1024,sortObjects=true,
   maxInstanceMeshes=256,maxInstanceBytes=128*1024*1024,
-  deformation:deformationOptions={},maxDeformedMeshes=256,maxDeformationBytes=128*1024*1024,shadow=null,environment=null,background=null,signal,
+  deformation:deformationOptions={},maxDeformedMeshes=256,maxDeformationBytes=128*1024*1024,shadow=null,environment=null,background=null,fog=null,signal,
 }={}) {
   if(three?.REVISION!=='186'||typeof three.Matrix4!=='function'||typeof three.Frustum!=='function'||
       typeof three.Mesh!=='function'||!(scene instanceof three.Scene))fail('SOURCE','Supply the pinned r186 module and its Scene');
@@ -62,6 +65,13 @@ export async function createGpuThreeScene(device,scene,{
   integer(maxDeformedMeshes,1,65536,'deformed mesh capacity');integer(maxDeformationBytes,1,Number.MAX_SAFE_INTEGER,'deformation budget');
   if(signal!==undefined&&(!signal||typeof signal.aborted!=='boolean'||typeof signal.addEventListener!=='function'||
       typeof signal.removeEventListener!=='function'))fail('OPTIONS','Expected AbortSignal');
+  if(fog!==null&&(!fog||typeof fog!=='object'||Array.isArray(fog)||Object.keys(fog).length))
+    fail('OPTIONS','Expected empty source fog options or null');
+  const fogEnabled=fog!==null;
+  if(renderOptions.fog!==undefined&&renderOptions.fog!==fogEnabled)
+    fail('OPTIONS','renderer.fog must agree with the source fog:{} option');
+  // Disabled packages do not import the optional native fog dependency graph.
+  const fogApi=fogEnabled?await import('./three_fog.mjs'):null;
   if(shadow!==null&&(!shadow||typeof shadow!=='object'||Array.isArray(shadow)))fail('OPTIONS','Expected shadow options or null');
   for(const key of Object.keys(shadow??{}))if(!['maxBytes','blend'].includes(key))fail('OPTIONS',`Unsupported source shadow option: ${key}`);
   const shadowEnabled=shadow!==null,shadowBlend=shadow?.blend??'reject',maxShadowBytes=shadow?.maxBytes??64*1024*1024;
@@ -164,6 +174,7 @@ export async function createGpuThreeScene(device,scene,{
     return shape;
   }
   function graph(){
+    if(fogEnabled)fogApi.inspectThreeFog(scene.fog,three);
     const nodes=[],seen=new Set(),stack=[scene];
     while(stack.length){
       const object=stack.pop();
@@ -194,8 +205,8 @@ export async function createGpuThreeScene(device,scene,{
       if(object.isLight)light(object);
       for(let i=object.children.length-1;i>=0;i--)stack.push(object.children[i]);
     }
-    if(scene.fog!==null||(!environmentEnabled&&scene.environment!==null)||(!backgroundEnabled&&sourceBackground()!==null))
-      fail('SCENE','Fog, disabled source environments and disabled texture backgrounds require their own rendering paths');
+    if((!fogEnabled&&scene.fog!==null)||(!environmentEnabled&&scene.environment!==null)||(!backgroundEnabled&&sourceBackground()!==null))
+      fail('SCENE','Enable source fog:{}, environment:{} or background:{} for the corresponding source effect');
     if(backgroundEnabled&&sourceBackground()!==null){
       backgroundApi.inspectThreeBackground(sourceBackground(),three,backgroundOptions);
       backgroundApi.inspectThreeBackgroundState(scene);
@@ -258,6 +269,7 @@ export async function createGpuThreeScene(device,scene,{
     if(shadowEnabled&&m.shadowSide!=null&&![0,1,2].includes(m.shadowSide))fail('SHADOW','Invalid source shadowSide');
     for(const key of ['transparent','vertexColors','depthTest','depthWrite','colorWrite','forceSinglePass'])
       if(typeof m[key]!=='boolean')fail('MATERIAL',`Expected boolean ${key}`);
+    if(fogEnabled&&typeof m.fog!=='boolean')fail('MATERIAL','Expected boolean fog');
     const options={shading,vertexColors:m.vertexColors,flatShading:shading==='unlit'?false:m.flatShading===true,
       alphaMode:m.transparent?'BLEND':m.alphaTest>0?'MASK':'OPAQUE',alphaCutoff:m.alphaTest>0?m.alphaTest:0.5,
       depthTest:m.depthTest,depthWrite:m.depthWrite,depthCompare:DEPTH[m.depthFunc],colorWrite:m.colorWrite};
@@ -311,7 +323,7 @@ export async function createGpuThreeScene(device,scene,{
       const config={...options,side};
       const structural=[epoch,shading,side,config.vertexColors,config.flatShading,config.alphaMode,
         config.depthTest,config.depthWrite,config.depthCompare,config.colorWrite,...(shadowEnabled?[m.shadowSide??null]:[]),...textureKey];
-      return {options:config,values,structural};
+      return {options:config,values,structural,...(fogEnabled?{receiveFog:m.fog}:{})};
     });
   }
   function desired(nodes){
@@ -580,7 +592,7 @@ export async function createGpuThreeScene(device,scene,{
     let backgroundSubmitted=false;
     try{
       if(!frame||typeof frame!=='object')fail('FRAME','Supply borrowed render attachments');
-      for(const key of ['draws','viewProjection','lighting',...(shadowEnabled?['shadow']:[]),...(environmentEnabled?['environment']:[]),...(backgroundEnabled?['background']:[])])if(Object.hasOwn(frame,key))fail('FRAME',`${key} belongs to the source scene/camera`);
+      for(const key of ['draws','viewProjection','lighting','fog',...(shadowEnabled?['shadow']:[]),...(environmentEnabled?['environment']:[]),...(backgroundEnabled?['background']:[])])if(Object.hasOwn(frame,key))fail('FRAME',`${key} belongs to the source scene/camera`);
       frameTextures=new Set();
       const nodes=graph();
       if(shadowEnabled){
@@ -598,6 +610,9 @@ export async function createGpuThreeScene(device,scene,{
         backgroundOwner?.check();
       }
       const lighting=cameraFrame(camera);lighting.lights=[];
+      // Capture against this frame's updated camera before texture, geometry,
+      // deformation, shadow or background queue effects. Type/removal is live.
+      const fogFrame=fogEnabled?fogApi.threeFogDescriptor(scene.fog,camera,three):null;
       const backgroundFrame=backgroundOwner?.capture(scene,camera)??null;
       const lightSources=[],casterObjects=[],casterItems=[],shadowDraws=[];
       const opaque=[],transparent=[],stack=[{object:scene,groupOrder:0}],descriptions=new Map();
@@ -713,6 +728,7 @@ export async function createGpuThreeScene(device,scene,{
             ...(values.uvTransform?{uvTransform:values.uvTransform}:{}),
             ...(values.alphaCutoff!==undefined?{alphaCutoff:values.alphaCutoff}:{})});
           else draws.push({mesh:item.bindings[i].mesh,...common,...values,
+            ...(fogEnabled?{receiveFog:item.desc[i].receiveFog}:{}),
             ...(shadowEnabled?{receiveShadow:item.object.receiveShadow}:{}),
             ...(environmentEnabled?{receiveEnvironment:item.desc[i].options.shading==='metallic-roughness'}:{})});
         }
@@ -729,6 +745,7 @@ export async function createGpuThreeScene(device,scene,{
         item.material.side=three.DoubleSide;
       }
       const prepared={...frame,viewProjection:clip.elements,lighting,draws};
+      if(fogEnabled)prepared.fog=fogFrame;
       if(environmentEnabled)prepared.environment=environmentFrame;
       if(scene.background?.isColor){prepared.clearColor=rgba(scene.background);prepared.loadOp='clear';}
       if(shadowEnabled){
@@ -770,7 +787,7 @@ export async function createGpuThreeScene(device,scene,{
       shadowBytes:(shadowOwner?.allocatedBytes??0)+(pendingShadow?.allocatedBytes??0),shadowStats,
       environmentBytes:(environmentOwner?.allocatedBytes??0)+(pendingEnvironment?.allocatedBytes??0),
       backgroundBytes:(backgroundOwner?.allocatedBytes??0)+(pendingBackground?.allocatedBytes??0),backgroundPasses,
-      colorPasses:backgroundEnabled?backgroundColorPasses:shadowEnabled||environmentEnabled?(renderer?.colorPassCount??0):null,
+      colorPasses:backgroundEnabled?backgroundColorPasses:shadowEnabled||environmentEnabled||fogEnabled?(renderer?.colorPassCount??0):null,
       bundles:renderer?.bundleDiagnostics??null});},
     async whenIdle(){live();try{await Promise.race([Promise.all([renderer.whenIdle(),textureOwner?.whenIdle(),shadowOwner?.whenIdle(),pendingShadow?.whenIdle(),environmentOwner?.whenIdle(),pendingEnvironment?.whenIdle(),backgroundOwner?.whenIdle(),pendingBackground?.whenIdle(),...[...geometries.values(),...instances.values(),...deformations.values(),...pendingDeformations].map(g=>g.whenIdle())]),stopped]);live();return bridge;}catch(error){return failed(error);}},
     dispose(){if(busy&&!preparing)fail('REENTRANT','Cannot dispose during source submission');if(!disposed){disposed=true;rejectStopped(new ThreeSceneError('DISPOSED','Source scene bridge is disposed'));release();}},
@@ -779,10 +796,11 @@ export async function createGpuThreeScene(device,scene,{
     // Source validation precedes even the renderer's uniform allocation.
     signal?.addEventListener('abort',onAbort,{once:true});if(signal?.aborted)onAbort();live();
     scanTextures();
-    const construction=createGpuAnimationRenderer(device,{...renderOptions,...(backgroundEnabled?{format:renderOptions.format??'rgba8unorm',sampleCount:renderOptions.sampleCount??1}:{}),...(shadowEnabled?{shadows:true}:{}),...(environmentEnabled?{environment:true}:{}),indirectLights:true,threeLights:true,maxMeshes:2*maxBindings}).then(value=>{
+    const construction=createGpuAnimationRenderer(device,{...renderOptions,...(backgroundEnabled?{format:renderOptions.format??'rgba8unorm',sampleCount:renderOptions.sampleCount??1}:{}),...(shadowEnabled?{shadows:true}:{}),...(environmentEnabled?{environment:true}:{}),...(fogEnabled?{fog:true}:{}),indirectLights:true,threeLights:true,maxMeshes:2*maxBindings}).then(value=>{
       if(disposed||terminal){value.dispose();throw terminal??new ThreeSceneError('DISPOSED','Source scene is disposed');}
       renderer=shadowEnabled?shadowApi.withThreeShadowReceivers(value,renderOptions.maxDraws??1024):value;
       if(environmentEnabled)renderer=environmentApi.withThreeEnvironmentReceivers(renderer,renderOptions.maxDraws??1024);
+      if(fogEnabled)renderer=fogApi.withThreeFogReceivers(renderer,renderOptions.maxDraws??1024);
       return renderer;
     });
     await Promise.race([construction,stopped]);live();await prepare();return bridge;

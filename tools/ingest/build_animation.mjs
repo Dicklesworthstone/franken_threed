@@ -112,6 +112,8 @@ function decodeDataUri(uri) {
  * With {webgpu:true}, also emit GPU deformation, unlit drawing and scene playback.
  * fog:true packages native linear/exp2 fog and a projection-to-view-depth adapter.
  * Also select renderer fog:true at runtime; no pipeline is enabled at import.
+ * With threeScene:true, also package live source Fog/FogExp2 and per-material
+ * receivers; choose source fog:{} at runtime. See THREE_SCENE_FOG.md.
  * Without this build option the lazy fog modules are not emitted. See ANIMATION_FOG.md.
  * Add environment:true with webgpu:true to emit the optional IBL filter/receiver
  * and export createGpuAnimationEnvironment. Also set hdr:true to package the
@@ -434,6 +436,11 @@ export {fitAnimationShadowView,animationShadowWorldBounds} from './animation_sha
     outputs.set("gpu_playback.mjs", outputs.get("gpu_playback.mjs") +
       "export {AnimationFogError} from './animation_fog.mjs';\n" +
       "export {animationFogDepthFromProjection,snapshotAnimationCameraFog} from './animation_fog_camera.mjs';\n");
+    if (threeScene) {
+      outputs.set("three_fog.mjs", fs.readFileSync(new URL("./three_fog.mjs", import.meta.url), "utf8"));
+      outputs.set("gpu_playback.mjs", outputs.get("gpu_playback.mjs") +
+        "export {ThreeFogError,inspectThreeFog,threeFogDescriptor} from './three_fog.mjs';\n");
+    }
   }
   if (inverseKinematics) {
     outputs.set("animation_ik.mjs", fs.readFileSync(new URL("./animation_ik.mjs", import.meta.url), "utf8"));
@@ -462,6 +469,7 @@ export {fitAnimationShadowView,animationShadowWorldBounds} from './animation_sha
     ...(threeScene ? { gpuThreeScene: "explicit-r186-scene; native source instances and GPU skin/morph deformation; owned source textures or borrowed bindings; borrowed module and attachments" } : {}),
     ...(canvasRecovery ? { gpuCanvasRecovery: "explicit-device-loss-reconstruction; bounded attempts; no frame replay" } : {}),
     ...(fog ? { gpuFog: "linear-or-exp2; native-view-depth; explicit renderer fog:true; shaded RGB only" } : {}),
+    ...(fog && threeScene ? { gpuThreeFog: "source Fog/FogExp2; opt-in fog:{}; live material receivers; ordered color spans" } : {}),
     ...(inverseKinematics ? { animationIK: "bounded-ccd; analytic-pole-limbs; transactional-local-pose" } : {}),
     source: { file: path.basename(entry), sha256: hash(source) },
     dependencies: [...dependencies.values()],

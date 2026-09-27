@@ -72,10 +72,13 @@ Calling a renderer with `fog:true` from such an isolated package still requires
 rebuilding with `fog:true`; it does not fetch missing toolkit files. CPU-only
 builds cannot enable fog. This is a build API option, not a new CLI flag.
 
-This adapter is for the explicit frame renderer. Merely packaging it together
-with `threeScene:true` does not make the source-scene bridge admit `scene.fog`,
-nor provide per-material fog exclusion. Those need source-scene integration.
-It does not change shadow, environment/background or output-transform semantics.
+With both `threeScene:true` and `fog:true`, the builder also emits `three_fog.mjs`
+and records `gpuThreeFog`. Select `fog:{}` when creating the source scene bridge
+to own live `scene.fog` and `material.fog` exclusions. Those values are captured
+at its existing render boundary; the caller must not also pass `frame.fog`.
+The explicit adapter above remains available independently of Three.js.
+See `THREE_SCENE_FOG.md` for ordered receiver spans, source admission and limits.
+Neither path changes shadow, environment/background or output-transform semantics.
 
 ## Evidence
 
@@ -90,3 +93,8 @@ optional packages, artifact hashes and exact/one-byte-short output budgets.
 It deliberately uses fixtures for asset decoding, pose creation and unrelated
 renderer/controller services, including a narrow lazy-import renderer fixture.
 These tests do not execute native WGSL, certify pixels, or measure performance.
+
+Source descriptor, material receiver, scene integration and relocated source
+package coverage is in `three_fog.test.mjs`, `three_scene_fog.test.mjs` and
+`build_animation_three_fog.test.mjs`; their fixture boundaries are documented in
+`THREE_SCENE_FOG.md`.
