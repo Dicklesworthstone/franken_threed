@@ -1,8 +1,12 @@
-/** Live r186 Fog/FogExp2 capture and order-preserving material.fog routing.
- * Source scene/camera/color objects remain borrowed. No depth texture, radial
- * approximation, background fogging, source scene clone or frame loop.
+/** Live source Fog/FogExp2 and ordered native color receivers.
+ * No Three.js import, source mutation, camera update, GPU allocation or clock.
+ * The renderer must be constructed with fog:true. Mixed material flags split
+ * adjacent color spans, like source shadow/environment receivers; never reorder
+ * transparent draws, synthesize depth, or fog a background/fullscreen image.
  */
 import {packAnimationFog} from './animation_fog.mjs';
+import {snapshotAnimationCameraFog} from './animation_fog_camera.mjs';
+
 export class ThreeFogError extends Error {
   constructor(code, message) {
     super(`THREE_FOG_${code}: ${message}`);
@@ -10,68 +14,79 @@ export class ThreeFogError extends Error {
   }
 }
 const fail = (code, message) => { throw new ThreeFogError(code, message); };
+const dataFields = object => {
+  for (const descriptor of Object.values(Object.getOwnPropertyDescriptors(object)))
+    if (!Object.hasOwn(descriptor, 'value')) fail('HOOK', 'Accessor-backed fog/color fields are not admitted');
+};
 
-/** Camera-independent source admission, safe before native allocation. */
-export function inspectThreeFog(fog, three) {
-  if (three?.REVISION !== '186' || typeof three.Fog !== 'function' || typeof three.FogExp2 !== 'function')
-    fail('SOURCE', 'Supply the pinned r186 fog classes');
-  if (fog === null) return null;
-  let value;
-  const color = fog?.color;
-  if (!color?.isColor) fail('SOURCE', 'Expected a source fog Color');
-  if (fog instanceof three.Fog && fog.isFog === true && !fog.isFogExp2)
-    value = {type:'linear', color:[color.r,color.g,color.b], near:fog.near, far:fog.far};
-  else if (fog instanceof three.FogExp2 && fog.isFogExp2 === true && !fog.isFog)
-    value = {type:'exp2', color:[color.r,color.g,color.b], density:fog.density};
-  else fail('SOURCE', 'Expected source Fog or FogExp2, not a duck-typed replacement');
-  packAnimationFog({...value, depthFromClip:[0,0,0,0]});
-  return value;
-}
-
-/** Capture -mvPosition.z using a row of the inverse NATIVE projection. The
- * scene bridge converts a WebGL projection's clip Z into [0,1], so perform the
- * same conversion before inversion here. Dot this row with clip position in
- * the vertex stage and interpolate it perspective-correctly; do not divide it
- * by clip W. This works for perspective, orthographic and off-axis projections.
- * The source camera's cached inverse is not trusted, updated or overwritten.
+/** Validate source fog before allocating or updating any scene resources.
+ * Colors already belong to the caller's linear working space. Exact built-in
+ * fog prototypes avoid silently interpreting custom fog subclasses as native.
+ * Return an owned snapshot, not the mutable source Color or fog object.
  */
-export function threeFogDescriptor(scene, camera, three) {
-  const value = inspectThreeFog(scene?.fog, three);
-  if (value === null) return null;
-  if (typeof three.Camera !== 'function' || typeof three.Matrix4 !== 'function' ||
-      !(camera instanceof three.Camera) || (!camera.isPerspectiveCamera && !camera.isOrthographicCamera) ||
-      camera.isArrayCamera || camera.reversedDepth ||
-      ![three.WebGLCoordinateSystem,three.WebGPUCoordinateSystem].includes(camera.coordinateSystem))
-    fail('CAMERA', 'Supply one non-reversed perspective or orthographic source camera');
-  const source = camera.projectionMatrix?.elements;
-  if (source?.length !== 16 || Array.from(source).some(x => typeof x !== 'number' || !Number.isFinite(Math.fround(x))))
-    fail('CAMERA', 'Expected a finite source projection');
-  const projection = new three.Matrix4().copy(camera.projectionMatrix);
-  if (camera.coordinateSystem === three.WebGLCoordinateSystem) {
-    const e = projection.elements;
-    for (let column=0;column<4;column++) e[column*4+2]=.5*(e[column*4+2]+e[column*4+3]);
-  }
-  const determinant = projection.determinant();
-  if (determinant === 0 || !Number.isFinite(determinant)) fail('CAMERA', 'Fog requires an invertible projection');
-  const inverse = projection.invert().elements;
-  const descriptor = {...value, color:Object.freeze(value.color),
-    depthFromClip:Object.freeze([-inverse[2],-inverse[6],-inverse[10],-inverse[14]])};
-  packAnimationFog(descriptor);
-  return Object.freeze(descriptor);
+export function inspectThreeFog(fog, three) {
+  if (fog === null) return null;
+  if (three?.REVISION !== '186' || typeof three.Fog !== 'function' ||
+      typeof three.FogExp2 !== 'function' || typeof three.Color !== 'function' ||
+      !fog || typeof fog !== 'object') fail('SOURCE', 'Supply a built-in r186 Fog/FogExp2 or null');
+  const prototype = Object.getPrototypeOf(fog);
+  const linear = prototype === three.Fog.prototype;
+  if (!linear && prototype !== three.FogExp2.prototype)
+    fail('SOURCE', 'Custom fog profiles need their own renderer');
+  dataFields(fog);
+  const color = fog.color;
+  if (!(color instanceof three.Color)) fail('SOURCE', 'Expected a source Color');
+  dataFields(color);
+  const result = Object.freeze({type: linear ? 'linear' : 'exp2',
+    color: Object.freeze([color.r, color.g, color.b]),
+    ...(linear ? {near: fog.near, far: fog.far} : {density: fog.density})});
+  // The native contract includes f32 quantization, nonnegative color/density
+  // and distinct linear edges. No fake camera or guessed projection is needed.
+  packAnimationFog({...result, depthFromClip: [0, 0, 0, 1]});
+  return result;
 }
 
-/** Split only adjacent fog-receiver spans. A material opting out neither loses
- * its textures/lights/shadows nor changes transparent ordering. No second scene
- * traversal, geometry registration or extra draw is introduced. The first
- * span retains caller clear/load policy; later spans load both attachments.
- * Composes with the existing shadow/environment wrappers and render bundles.
+/** Capture source fog against the SAME projection convention as cameraFrame.
+ * Call after the application's existing camera update, not from a new loop.
+ * Null is an explicit reset and does not require inspecting a camera.
+ */
+export function threeFogDescriptor(fog, camera, three) {
+  const source = inspectThreeFog(fog, three);
+  if (source === null) return null;
+  if (typeof three.Camera !== 'function' || !(camera instanceof three.Camera) ||
+      (!camera.isPerspectiveCamera && !camera.isOrthographicCamera) || camera.isArrayCamera || camera.reversedDepth ||
+      ![three.WebGLCoordinateSystem, three.WebGPUCoordinateSystem].includes(camera.coordinateSystem))
+    fail('CAMERA', 'Supply a non-reversed perspective/orthographic source camera with a known clip convention');
+  return snapshotAnimationCameraFog(source, camera.projectionMatrix?.elements, {
+    clipSpace: camera.coordinateSystem === three.WebGLCoordinateSystem ? 'webgl' : 'webgpu',
+  });
+}
+
+// Canonical immutable native descriptor. Capture once, before any span submits;
+// a caller changing its source arrays cannot give later spans different fog.
+function frameFog(fog) {
+  const data = packAnimationFog(fog);
+  if (data[11] === 0) return null;
+  return Object.freeze({type: data[11] === 1 ? 'linear' : 'exp2',
+    depthFromClip: Object.freeze(Array.from(data.subarray(0, 4))),
+    color: Object.freeze(Array.from(data.subarray(4, 7))),
+    ...(data[11] === 1 ? {near: data[8], far: data[9]} : {density: data[10]})});
+}
+
+/** Apply live material.fog without changing registration or the draw ABI.
+ * Strip only receiveFog; leave receiver flags for nested shadow/IBL owners.
+ * One span with no effect is still submitted to honor attachment clears.
+ * Mixed flags may increase color passes, but each logical draw occurs once.
+ * A failure after a successful prefix is terminal: a partial frame cannot be
+ * rolled back or safely retried. Counts describe the last COMPLETE frame.
  */
 export function withThreeFogReceivers(renderer, maxDraws = 1024) {
-  if (!Number.isSafeInteger(maxDraws) || maxDraws < 1) fail('LIMIT', 'Invalid draw capacity');
-  let busy=false, terminal=null, drawCount=0, drawCallCount=0, colorPassCount=0;
+  if (!Number.isSafeInteger(maxDraws) || maxDraws < 1)
+    fail('LIMIT', 'Expected a positive bounded draw capacity');
+  let busy = false, terminal = null, drawCount = 0, drawCallCount = 0, colorPassCount = 0;
   function live() {
     if (terminal) throw terminal;
-    if (renderer.disposed) fail('DISPOSED', 'Source fog color renderer is disposed');
+    if (renderer.disposed) fail('DISPOSED', 'Source color renderer is disposed');
   }
   const owner = Object.freeze({
     addMesh(gpu, options) { live(); return renderer.addMesh(gpu, options); },
@@ -80,36 +95,37 @@ export function withThreeFogReceivers(renderer, maxDraws = 1024) {
     get drawCount() { return drawCount; }, get drawCallCount() { return drawCallCount; }, get colorPassCount() { return colorPassCount; },
     render(frame) {
       live(); if (busy) fail('REENTRANT', 'Fog color submission cannot be reentered');
-      if (!frame || !Array.isArray(frame.draws) || frame.draws.length > maxDraws) fail('LIMIT', 'Source fog draw list exceeds capacity');
-      // Snapshot all descriptor values and receiver flags before first submit.
-      const packet = packAnimationFog(frame.fog ?? null);
-      const fog = packet[11] === 0 ? null : {type:packet[11] === 1 ? 'linear' : 'exp2',
-        color:Array.from(packet.slice(4,7)), depthFromClip:Array.from(packet.slice(0,4)),
-        ...(packet[11] === 1 ? {near:packet[8],far:packet[9]} : {density:packet[10]})};
-      const spans=[];
-      for (const input of frame.draws) {
-        if (!input || typeof input !== 'object' || typeof input.receiveFog !== 'boolean')
-          fail('FRAME', 'Expected an explicit material fog receiver flag');
-        const {receiveFog, ...draw}=input, enabled=receiveFog && fog !== null;
-        if (!spans.length || spans.at(-1).enabled !== enabled) spans.push({enabled,draws:[]});
-        spans.at(-1).draws.push(draw);
-      }
-      if (!spans.length) spans.push({enabled:false,draws:[]});
-      busy=true; let submitted=0, calls=0, passes=0;
+      busy = true; let submitted = 0, calls = 0, passes = 0;
       try {
-        for (const span of spans) {
-          renderer.render({...frame, draws:span.draws, fog:span.enabled?fog:null,
-            ...(submitted?{loadOp:'load',depthLoadOp:'load'}:{})});
-          submitted++;calls+=renderer.drawCallCount;passes+=renderer.colorPassCount??1;
+        if (!frame || typeof frame !== 'object' || Array.isArray(frame)) fail('FRAME', 'Expected a color frame');
+        const inputs = frame.draws;
+        if (!Array.isArray(inputs) || inputs.length > maxDraws) fail('LIMIT', 'Source color draw list exceeds capacity');
+        const count = inputs.length, fog = frameFog(frame.fog), captured = {...frame, fog}, spans = [];
+        // Indexed iteration fixes the admission bound independently of an
+        // array's iterator. Validate ALL flags before the first queue effect.
+        for (let i = 0; i < count; i++) {
+          const input = inputs[i];
+          if (!input || typeof input !== 'object' || Array.isArray(input)) fail('FRAME', 'Expected an explicit fog receiver draw');
+          const {receiveFog, ...draw} = input;
+          if (typeof receiveFog !== 'boolean') fail('FRAME', 'Expected an explicit boolean fog receiver flag');
+          const enabled = receiveFog && fog !== null;
+          if (!spans.length || spans.at(-1).enabled !== enabled) spans.push({enabled, draws: []});
+          spans.at(-1).draws.push(draw);
         }
-        drawCount=frame.draws.length;drawCallCount=calls;colorPassCount=passes;return owner;
-      } catch(error) {
-        if (submitted || renderer.failed) {terminal=error;renderer.dispose();}
+        if (!spans.length) spans.push({enabled: false, draws: []});
+        for (const span of spans) {
+          renderer.render({...captured, draws: span.draws, fog: span.enabled ? fog : null,
+            ...(submitted ? {loadOp: 'load', depthLoadOp: 'load'} : {})});
+          submitted++; calls += renderer.drawCallCount; passes += renderer.colorPassCount ?? 1;
+        }
+        drawCount = count; drawCallCount = calls; colorPassCount = passes; return owner;
+      } catch (error) {
+        if (submitted || renderer.failed) { terminal = error; renderer.dispose(); }
         throw error;
-      } finally {busy=false;}
+      } finally { busy = false; }
     },
-    async whenIdle() {live();await renderer.whenIdle();live();return owner;},
-    dispose() {if(busy)fail('REENTRANT','Cannot dispose during fog submission');renderer.dispose();},
+    async whenIdle() { live(); await renderer.whenIdle(); live(); return owner; },
+    dispose() { if (busy) fail('REENTRANT', 'Cannot dispose during fog submission'); renderer.dispose(); },
   });
   return owner;
 }
