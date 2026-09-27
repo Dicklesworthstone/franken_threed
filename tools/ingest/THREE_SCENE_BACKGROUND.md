@@ -1,7 +1,7 @@
 # Native backgrounds for source scenes
 
-`createGpuThreeScene(..., { background: {} })` draws a ready source HDR panorama
-behind a perspective scene. It adds a visible background to the separately
+`createGpuThreeScene(..., { background: {} })` draws a ready source 2D
+texture, CubeTexture or HDR panorama behind the scene. It adds a visible background to the separately
 selected `environment: {}` lighting path; one source texture can serve both.
 The background retains original-resolution pixels, not an undersized filtered
 lighting cube. No source scene clone, renderer replacement, image decoding,
@@ -9,9 +9,9 @@ frame loop, PMREM filtering or GPU readback is introduced.
 
 This opt-in background profile extends the default source-scene refusal of
 texture backgrounds described in `THREE_SCENE.md`. It is not complete Three.js
-background compatibility. The native core also accepts caller-owned cube and
-screen textures, but the source-scene adapter currently accepts HDR panoramas
-only. Its camera, sampling, ownership and output contracts are explicit below.
+background compatibility. Ordinary RGBA byte/image UV textures and six-face
+byte/image CubeTextures use source-owned residency and sampling. HDR panoramas
+retain their original profile. Camera and ownership contracts are explicit below.
 
 ## Live source scene
 
@@ -68,7 +68,7 @@ changed. Null and solid-color backgrounds retain their existing behavior and
 allocate no panorama. Diagnostics include completed/pending `backgroundBytes`,
 last-successful-frame `backgroundPasses`, and total `colorPasses`.
 
-## Source and output profile
+## HDR source and common output profile
 
 Supply the same ready, fixed, unshared, attached 2:1 RGBA HDR `DataTexture`
 profile used by `THREE_SCENE_ENVIRONMENT.md`. Half-float input preserves finite
@@ -82,8 +82,9 @@ in environment lighting. Background rendering uses original-resolution base
 pixels with repeat-U/clamp-V linear sampling. Source UV transforms, authored
 mipmaps, sampler preferences, partial uploads and upload hooks do not redefine
 this profile. Unsupported hooks, mip chains and source formats refuse rather
-than being ignored. Refraction mapping, CubeTexture, ordinary image/video
-backgrounds and PMREM/CubeUV textures are outside this source adapter.
+than being ignored. HDR refraction mapping, float CubeTextures, byte panoramas,
+video and PMREM/CubeUV textures remain outside this source adapter. Byte/image
+screen and cube profiles are described below.
 
 Only non-reversed perspective cameras and `backgroundBlurriness === 0` are
 supported for source HDR backgrounds. Orthographic/array cameras and blurred
@@ -98,6 +99,60 @@ attachment and the existing whole-image output compositor for tone mapping.
 An ordinary unorm attachment can clip HDR values; it is not an HDR substitute.
 The background-enabled scene defaults to `rgba8unorm` and one sample unless
 `renderer.format` / `renderer.sampleCount` select another admitted profile.
+
+## Ordinary 2D textures and cubemaps
+
+Use the same `background:{}` scene option and existing preparation boundary.
+No new factory or shader option is required at the source-scene level:
+
+```js
+// A loaded RGBA image/canvas Texture, or an RGBA Uint8Array DataTexture.
+// The application loads/decodes the image and requests its upload as usual.
+scene.background = readyTexture; // UVMapping; not an equirectangular byte map.
+await nativeScene.prepare();
+nativeScene.render(camera, { colorView, depthView });
+
+// Offset/repeat/rotation/center and intensity are live uniform changes.
+readyTexture.offset.x = 0.25;
+scene.backgroundIntensity = 0.8;
+nativeScene.render(camera, { colorView, depthView });
+
+// readyCube has six equal square byte/image faces in Three's face order.
+scene.background = readyCube;
+await nativeScene.prepare();
+nativeScene.render(perspectiveCamera, { colorView, depthView });
+```
+
+Screen textures use the source UV matrix and ignore camera orientation and
+`scene.backgroundRotation`. Both source perspective and orthographic cameras
+work. With `matrixAutoUpdate:true`, the built-in texture `updateMatrix()` runs
+at capture, as in the retained source renderer; otherwise the authored matrix
+is used. Custom matrix/update hooks are rejected. `backgroundBlurriness` must
+remain zero for both screen and directional backgrounds.
+
+CubeTextures use `CubeReflectionMapping` or `CubeRefractionMapping` as direction
+lookups, not material refraction. Their camera contract remains non-reversed
+perspective. Inverse background rotation is followed by the source's X-axis
+lookup reflection for uploaded cubemaps. Camera translation is removed; face
+order is not rewritten. Render-target, compressed and float cubes are not
+silently converted into this byte/image profile.
+
+The shared source texture pool validates all six faces before allocation,
+preserves requested `flipY`, wrapping and filters, and either uploads authored
+mips or generates each face's mip chain. Uncompressed cube `mipmaps` contain
+additional levels (excluding the base); ordinary DataTexture `mipmaps` include
+the base, matching pinned r186 storage conventions. Generated mips use the
+existing native downsample profile, not PMREM or a promised seam-aware filter.
+Source sRGB textures select an sRGB sampling view; there is no guessed gamma
+conversion. Implicit derivatives choose mip levels with the source sampler.
+
+All image readiness, fixed/unshared byte storage, supported browser-image types,
+color and sampler restrictions of `three_textures.mjs` still apply. Each cube
+face must be a DataTexture or all must be decoded images/canvases/ImageData.
+Upload callbacks, ImageBitmap decode-policy inference and partial cube uploads
+are not admitted. Pixel/source/version/sampler changes require `prepare()`;
+UV and intensity edits do not. The background owns separate native residency
+from material textures, even when both refer to the same source object.
 
 ## Preparation, replacement and lifetime
 
@@ -124,7 +179,8 @@ retirement waits is discarded before publication. Failed replacement keeps the
 previous owner; restoring its valid source selection allows it to render.
 
 `background.maxBytes` defaults to 128 MiB and charges the full-resolution
-RGBA16F panorama plus its 128-byte uniform packet. Replacements also charge the
+RGBA16F panorama, or every byte/image face and mip, plus the 128-byte uniform
+packet. For cubes, maxPixels counts all six base faces together. Replacements also charge the
 still-owned previous background until preceding consumers drain. `maxPixels`
 defaults to 16,777,216; device texture limits also apply. Sizes are not silently
 reduced. Optional `label` names native resources. Material-texture and filtered
@@ -147,20 +203,26 @@ sampler override, and a bounded 128-byte frame packet. Panoramas use north-first
 2:1 pixels; cubes use six square native WebGPU faces; screen UV (0,0) is bottom
 left before the explicit six-value `uvTransform`.
 
+`viewFormat` optionally selects a compatible native sampling view; its format
+must already be permitted by the borrowed GPUTexture's creation descriptor.
+`autoLod:true` selects implicit derivatives and sampler-driven mip selection.
+Do not supply `frame.mipLevel` in that mode. The default remains explicit LOD,
+including byte-identical default shader generation for all three mappings.
+
 Panorama/cube frames provide column-major `directionFromClip` mapping clip
 `(x,y,0.5,1)` to environment-space homogeneous directions. Camera translation
 must be removed before composition. Frame intensity, mip level and transforms
 are copied and validated before queue writes. Standalone 4x rendering may use
 `resolveTarget`; a prefix for later scene rendering should omit it. The source
 GPU texture, sampler, device and nonaliasing render attachments stay borrowed.
-`createGpuThreeBackground` separately exposes ready source HDR ownership and
+`createGpuThreeBackground` separately exposes ready source texture ownership and
 capture/render operations; the scene bridge normally owns that coordination.
 
 ```js
 buildAnimation(inputGltfOrGlb, freshOutputDirectory, {
   webgpu: true,
   background: true,
-  threeScene: true,  // Source HDR background owner and live scene adapter.
+  threeScene: true,  // Source texture background owner and live scene adapter.
   environment: true, // Optional, independent IBL filtering/receiver feature.
 });
 ```
@@ -180,3 +242,11 @@ scene/background commands, receiver composition and package generation. Native
 GPU services, lower mesh/filter operations, Three classes and pose decoding are
 recorded or fixture boundaries. These host tests do not establish native WGSL
 pixels, retained-Three renderer equivalence or a measured performance result.
+
+The byte/cube extension has focused command/lifetime/numerical coverage in
+`three_texture_cube.test.mjs` and `three_background_textures.test.mjs`. Run with
+`node --test tools/ingest/animation_background.test.mjs tools/ingest/three_texture_cube.test.mjs tools/ingest/three_background_textures.test.mjs`.
+The original native background suite is unchanged. Source classes and GPU calls
+are fixtures; these tests do not run HDR conversion, retained Three, native GPU
+pixels or the full source-scene/package suite. The existing HDR integration test
+loader also resolves the new shared texture import without replacing assertions.

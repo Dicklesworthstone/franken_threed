@@ -25,18 +25,21 @@ const mappings = ['panorama', 'cube', 'screen'];
 const formats = ['rgba8unorm', 'rgba8unorm-srgb', 'bgra8unorm', 'bgra8unorm-srgb', 'rgba16float'];
 const identity = Object.freeze([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
 
-export function animationBackgroundShader(mapping = 'panorama') {
+export function animationBackgroundShader(mapping = 'panorama', {autoLod = false} = {}) {
   if (!mappings.includes(mapping)) fail('OPTIONS', 'Unknown background mapping');
+  if (typeof autoLod !== 'boolean') fail('OPTIONS', 'autoLod must be boolean');
+  const sample = uv => autoLod ? `textureSample(image, image_sampler, ${uv})` :
+    `textureSampleLevel(image, image_sampler, ${uv}, info.factors.y)`;
   const coordinates = mapping === 'screen' ? `
   let uv = p.ndc * 0.5 + vec2<f32>(0.5);
   let q = info.uv0.xy * uv.x + info.uv1.xy * uv.y + info.uv2.xy;
-  let color = textureSampleLevel(image, image_sampler, q, info.factors.y);` : `
+  let color = ${sample("q")};` : `
   let q = info.direction_from_clip * vec4<f32>(p.ndc, 0.5, 1.0);
   let d = normalize(q.xyz / q.w);
-  ${mapping === 'cube' ? 'let color = textureSampleLevel(image, image_sampler, d, info.factors.y);' : `
+  ${mapping === 'cube' ? `let color = ${sample('d')};` : `
   let uv = vec2<f32>(atan2(d.z, d.x) / 6.283185307179586 + 0.5,
     acos(clamp(d.y, -1.0, 1.0)) / 3.141592653589793);
-  let color = textureSampleLevel(image, image_sampler, uv, info.factors.y);`}`;
+  let color = ${sample("uv")};`}`;
   return /* wgsl */ `
 struct BackgroundInfo {
   direction_from_clip: mat4x4<f32>,
@@ -97,15 +100,19 @@ export function packAnimationBackgroundFrame(frame, mapping = 'panorama', mipLev
  * 1 or 4; multisample storage is ALWAYS stored for later scene color passes.
  * A resolveTarget is optional at 4x (for standalone final presentation), never
  * required for the background prefix of a later resolving scene pass.
+ * viewFormat selects a compatible pre-admitted view (for example sRGB).
+ * autoLod:true uses implicit derivatives and the borrowed sampler mip policy;
+ * the default retains explicit frame.mipLevel and its existing shader bytes.
  */
 export async function createGpuAnimationBackground(device, source, options = {}) {
   if (!options || typeof options !== 'object' || Array.isArray(options)) fail('OPTIONS', 'Expected options');
-  for (const key of Object.keys(options)) if (!['format', 'sampleCount', 'mapping', 'sampler', 'label', 'signal'].includes(key))
+  for (const key of Object.keys(options)) if (!['format', 'sampleCount', 'mapping', 'sampler', 'viewFormat', 'autoLod', 'label', 'signal'].includes(key))
     fail('OPTIONS', `Unknown background option: ${key}`);
   const {format = 'rgba8unorm', sampleCount = 1, mapping = 'panorama', sampler: suppliedSampler,
-    label = 'f3d-background', signal} = options;
+    label = 'f3d-background', signal, viewFormat = source?.format, autoLod = false} = options;
   if (!formats.includes(format) || ![1, 4].includes(sampleCount) || !mappings.includes(mapping) || typeof label !== 'string')
     fail('OPTIONS', 'Unsupported output format, sample count, mapping or label');
+  if (typeof autoLod !== 'boolean') fail('OPTIONS', 'autoLod must be boolean');
   if (signal !== undefined && (!signal || typeof signal.aborted !== 'boolean' ||
       typeof signal.addEventListener !== 'function' || typeof signal.removeEventListener !== 'function')) fail('OPTIONS', 'Expected AbortSignal');
   if (signal?.aborted) fail('ABORTED', 'Background creation was aborted');
@@ -123,6 +130,8 @@ export async function createGpuAnimationBackground(device, source, options = {})
   if ((mapping === 'panorama' && source.width !== 2 * source.height) || (mapping === 'cube' && source.width !== source.height))
     fail('SOURCE', 'Expected a 2:1 panorama or square native cubemap faces');
   if (suppliedSampler !== undefined && (!suppliedSampler || typeof suppliedSampler !== 'object')) fail('SOURCE', 'Expected a borrowed sampler');
+  if (!formats.includes(viewFormat) || viewFormat.replace('-srgb', '') !== source?.format?.replace('-srgb', ''))
+    fail('SOURCE', 'Background view format must be compatible with borrowed storage');
   const levels = source.mipLevelCount;
   let buffer = null, pipeline = null, group = null, disposed = false, terminal = null, busy = false, frames = 0;
   let pending = Promise.resolve(), rejectStop;
@@ -158,7 +167,7 @@ export async function createGpuAnimationBackground(device, source, options = {})
         {binding: 1, visibility: 2, sampler: {type: 'filtering'}},
         {binding: 2, visibility: 2, texture: {sampleType: 'float', viewDimension: mapping === 'cube' ? 'cube' : '2d'}},
       ]});
-      const module = device.createShaderModule({label, code: animationBackgroundShader(mapping)});
+      const module = device.createShaderModule({label, code: animationBackgroundShader(mapping, {autoLod})});
       return device.createRenderPipelineAsync({label, layout: device.createPipelineLayout({bindGroupLayouts: [layout]}),
         vertex: {module, entryPoint: 'vertex_main'}, fragment: {module, entryPoint: 'fragment_main', targets: [{format}]},
         primitive: {topology: 'triangle-list'}, multisample: {count: sampleCount}});
@@ -167,17 +176,18 @@ export async function createGpuAnimationBackground(device, source, options = {})
       buffer = device.createBuffer({label: label + '/uniforms', size: 128, usage: 8 | 64});
       const sampler = suppliedSampler ?? device.createSampler({minFilter: 'linear', magFilter: 'linear', mipmapFilter: 'linear',
         addressModeU: mapping === 'panorama' ? 'repeat' : 'clamp-to-edge', addressModeV: 'clamp-to-edge'});
-      const view = source.createView({dimension: mapping === 'cube' ? 'cube' : '2d', baseArrayLayer: 0,
+      const view = source.createView({...(options.viewFormat === undefined ? {} : {format: viewFormat}), dimension: mapping === 'cube' ? 'cube' : '2d', baseArrayLayer: 0,
         arrayLayerCount: mapping === 'cube' ? 6 : 1, baseMipLevel: 0, mipLevelCount: levels});
       group = device.createBindGroup({layout, entries: [{binding: 0, resource: {buffer, size: 128}},
         {binding: 1, resource: sampler}, {binding: 2, resource: view}]});
     }), stopped]); live();
   } catch (error) { stop(error); release(); throw error; }
-  const renderer = Object.freeze({format, sampleCount, mapping,
+  const renderer = Object.freeze({format, sampleCount, mapping, viewFormat, autoLod,
     get disposed() { return disposed; }, get failed() { return terminal !== null; },
     get allocatedBytes() { return buffer ? 128 : 0; }, get drawCount() { return frames; },
     render(frame) {
       live(); if (busy) fail('REENTRANT', 'Background submission cannot be reentered');
+      if (autoLod && frame?.mipLevel !== undefined) fail('FRAME', 'Automatic LOD does not accept an explicit mip level');
       const packet = packAnimationBackgroundFrame(frame, mapping, levels);
       const {colorView, resolveTarget = null, loadOp = 'clear'} = frame;
       const clearValue = tuple(frame.clearColor ?? [0, 0, 0, 1], 4, 'clear color');
