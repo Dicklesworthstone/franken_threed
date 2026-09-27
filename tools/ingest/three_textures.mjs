@@ -1,13 +1,16 @@
 /** Versioned source Texture residency for the explicit r186 scene bridge.
  * Owns only GPU textures/samplers; never decodes URLs, replaces source images,
- * sets needsUpdate or closes caller images. prepare() admits a whole set before
+ * closes caller images or controls playback. prepare() admits a whole set before
  * allocations; update() uploads only requested texture/source versions. Native
  * failures are terminal, callback exceptions preserve their source upload history.
  *
  * Byte DataTextures: R/RG/RGBA, manual/generated mipmaps and RGBA row ranges.
  * Decoded image/canvas/ImageData: browser external-copy sRGB profile.
  * CubeTextures admit six matching byte/image faces with authored or generated
- * mips. ImageBitmap decode flags, video, compressed/depth/array/float textures remain explicit
+ * mips. VideoTextures copy ready HTMLVideoElement frames into stable 2D residency,
+ * using the source's frame versions and built-in update() fallback. No frame
+ * callbacks, playback controls or frame loop are installed here.
+ * ImageBitmap decode flags and compressed/depth/array/float textures remain explicit
  * errors; applications can keep borrowing bindings for those sources.
  * See THREE_TEXTURES.md for source-state, color, bounds and completion contracts.
  */
@@ -49,17 +52,25 @@ function textureInspector(T,{
   const filters=new Map([[T.NearestFilter,['nearest','nearest',false]],[T.LinearFilter,['linear','nearest',false]],
     [T.NearestMipmapNearestFilter,['nearest','nearest',true]],[T.NearestMipmapLinearFilter,['nearest','linear',true]],
     [T.LinearMipmapNearestFilter,['linear','nearest',true]],[T.LinearMipmapLinearFilter,['linear','linear',true]]]);
-  function dimensions(image,data){
+  function dimensions(image,data,video=false){
     if(!image||image.complete===false)fail('NOT_READY','Source image has not loaded');
-    const width=integer(data?image.width:image.naturalWidth??image.width,1,maxDimension,'image width');
-    const height=integer(data?image.height:image.naturalHeight??image.height,1,maxDimension,'image height');
+    if(video&&(!(image.videoWidth>0)||!(image.videoHeight>0)))fail('NOT_READY','Video has no decoded frame dimensions');
+    const width=integer(video?image.videoWidth:data?image.width:image.naturalWidth??image.width,1,maxDimension,'image width');
+    const height=integer(video?image.videoHeight:data?image.height:image.naturalHeight??image.height,1,maxDimension,'image height');
     if(width*height>maxPixels)fail('LIMIT','Source exceeds pixel budget');return {width,height};
   }
   function describe(t){
-    if(!(t instanceof T.Texture)||t.isVideoTexture||t.isCompressedTexture||t.isDepthTexture||
+    if(!(t instanceof T.Texture)||t.isCompressedTexture||t.isDepthTexture||
       t.isData3DTexture||t.isDataArrayTexture||t.isFramebufferTexture||t.isRenderTargetTexture||t.isExternalTexture)
-      fail('SOURCE','Expected a byte 2D texture or CubeTexture');
-    const cube=t.isCubeTexture===true,layers=cube?6:1;
+      fail('SOURCE','Expected a byte 2D texture, VideoTexture or CubeTexture');
+    const video=t.isVideoTexture===true,cube=t.isCubeTexture===true,layers=cube?6:1;
+    if(video&&(typeof T.VideoTexture!=='function'||!(t instanceof T.VideoTexture)||
+        !instance(t.image,'HTMLVideoElement')||cube||t.isDataTexture||t.isVideoFrameTexture||
+        typeof T.VideoTexture.prototype.update!=='function'||t.update!==T.VideoTexture.prototype.update))
+      fail('SOURCE','Video requires a source VideoTexture, HTMLVideoElement and built-in update hook');
+    // HAVE_CURRENT_DATA is the platform value 2. A resident, temporarily starved
+    // stream retains its last submitted pixels without acknowledging a new frame.
+    const videoReady=video&&integer(t.image.readyState,0,4,'video readyState')>=2;
     if(cube&&(typeof T.CubeTexture!=='function'||!(t instanceof T.CubeTexture)||!Array.isArray(t.image)||t.image.length!==6))
       fail('SOURCE','CubeTexture requires six source faces');
     if(layers>maxLayers)fail('LIMIT','Native texture array-layer limit is too small');
@@ -69,7 +80,7 @@ function textureInspector(T,{
     if(!channels)fail('FORMAT','Expected R, RG or RGBA byte storage');
     if(![T.NoColorSpace,T.LinearSRGBColorSpace,T.SRGBColorSpace].includes(t.colorSpace)||
         (t.colorSpace===T.SRGBColorSpace&&channels!==4))fail('COLOR','Unsupported transfer function or channel format');
-    if(!Number.isSafeInteger(t.version)||t.version<1||!Number.isSafeInteger(t.source?.version)||t.source.version<0||t.source.dataReady!==true)
+    if(!Number.isSafeInteger(t.version)||t.version<(video?0:1)||!Number.isSafeInteger(t.source?.version)||t.source.version<0||t.source.dataReady!==true)
       fail('NOT_READY','Set needsUpdate after providing ready source data');
     if(t.onUpdate!==null&&typeof t.onUpdate!=='function')fail('SOURCE','Invalid upload callback');
     const filter=filters.get(t.minFilter),mag=filters.get(t.magFilter);
@@ -93,11 +104,13 @@ function textureInspector(T,{
       return image;
     };
     const base=cube?t.image.map(unwrap):[t.image];
-    const {width,height}=dimensions(base[0],data),full=1+Math.floor(Math.log2(Math.max(width,height)));
+    const {width,height}=dimensions(base[0],data,video),full=1+Math.floor(Math.log2(Math.max(width,height)));
     if(cube&&width!==height)fail('SOURCE','Cube faces must be square');
     if(width*height*layers>maxPixels)fail('LIMIT','All cube faces together exceed the pixel budget');
     if(!Array.isArray(t.mipmaps))fail('SOURCE','Expected source mipmaps');
     const manual=t.mipmaps.length>0;
+    if(video&&(manual||t.generateMipmaps||filter[2]))
+      fail('MIPS','Live video uses the source single-level, non-mipmapped sampling profile');
     if(manual&&((!cube&&!data)||t.generateMipmaps))fail('MIPS','Authored mips require byte data or cube faces with generation disabled');
     // r186 uncompressed cubes list ADDITIONAL mip levels; ordinary DataTextures
     // include the base level in mipmaps. Do not drop or duplicate either base.
@@ -118,12 +131,12 @@ function textureInspector(T,{
     if(data&&t.premultiplyAlpha)fail('FORMAT','Premultiplied byte data requires an explicit upload profile');
     for(const {image,level} of uploads){
       if(!data){
-        if(!(instance(image,'HTMLImageElement')||instance(image,'HTMLCanvasElement')||instance(image,'OffscreenCanvas')||instance(image,'ImageData')))
+        if(!(video||instance(image,'HTMLImageElement')||instance(image,'HTMLCanvasElement')||instance(image,'OffscreenCanvas')||instance(image,'ImageData')))
           fail('SOURCE','Use decoded images, canvases or ImageData; ImageBitmap decode policy requires a borrowed binding');
         if(channels!==4)fail('FORMAT','External images require RGBA storage');
         if(instance(image,'ImageData')&&image.colorSpace&&image.colorSpace!=='srgb')fail('COLOR','ImageData requires the sRGB copy profile');
       }
-      const extent=dimensions(image,data);
+      const extent=dimensions(image,data,video);
       if(extent.width!==Math.max(1,width>>level)||extent.height!==Math.max(1,height>>level))fail('MIPS','Invalid face or authored mip dimensions');
       if(data){
         const a=image.data;
@@ -146,8 +159,8 @@ function textureInspector(T,{
     const format=channels===4?'rgba8unorm':channels===2?'rg8unorm':'r8unorm',viewFormat=t.colorSpace===T.SRGBColorSpace?'rgba8unorm-srgb':format;
     const sampler={addressModeU:wraps.get(t.wrapS),addressModeV:wraps.get(t.wrapT),magFilter:mag[0],minFilter:filter[0],
       mipmapFilter:filter[1],lodMinClamp:0,lodMaxClamp:filter[2]?levels-1:0,maxAnisotropy};
-    const key=JSON.stringify([width,height,levels,format,viewFormat,sampler,t.flipY,t.premultiplyAlpha,t.unpackAlignment,t.generateMipmaps,manual,data,...(cube?['cube']:[])]);
-    return {source:t.source,width,height,levels,layers,cube,bytes,format,viewFormat,sampler,key,data,images,uploads,manual,channels,
+    const key=JSON.stringify([width,height,levels,format,viewFormat,sampler,t.flipY,t.premultiplyAlpha,t.unpackAlignment,t.generateMipmaps,manual,data,...(cube?['cube']:video?['video']:[])]);
+    return {source:t.source,width,height,levels,layers,cube,video,videoReady,bytes,format,viewFormat,sampler,key,data,images,uploads,manual,channels,
       flipY:t.flipY,premultiplyAlpha:t.premultiplyAlpha,alignment:t.unpackAlignment};
   }
   return describe;
@@ -214,6 +227,13 @@ export function createGpuThreeTextures(device,{
     native(()=>device.queue.submit([encoder.finish()]));
   }
   function upload(t,r,d){
+    if(d.video){
+      if(!d.videoReady)return;
+      // The pinned hook is a no-op with requestVideoFrameCallback. On older
+      // hosts it requests one upload per consuming update, after set admission.
+      // Never subscribe, seek, play, pause or dispose the application's video.
+      t.update();
+    }
     if(r.version===t.version)return;
     const a=r.resource;
     if(a.sourceVersion!==t.source.version){
@@ -250,6 +270,9 @@ export function createGpuThreeTextures(device,{
     try{
       let addedBytes=0,addedCount=0;const newKeys=new Map();
       for(const {t,d} of list){
+        if(d.video&&!d.videoReady&&!match(t,d))fail('NOT_READY','A new video residency requires a current decoded frame');
+        if(!d.data&&typeof device.queue.copyExternalImageToTexture!=='function')
+          fail('DEVICE','External source uploads require GPUQueue.copyExternalImageToTexture');
         if(!records.has(t))addedCount++;
         if(!sources.get(d.source)?.has(d.key)){
           let keys=newKeys.get(d.source);if(!keys)newKeys.set(d.source,keys=new Set());
