@@ -95,6 +95,7 @@ renderer/controller services, including a narrow lazy-import renderer fixture.
 These tests do not execute native WGSL, certify pixels, or measure performance.
 
 Source descriptor, material receiver, scene integration and relocated source
-package coverage is in `three_fog.test.mjs`, `three_scene_fog.test.mjs` and
+package coverage is in `three_fog.test.mjs`, `three_fog_receivers.test.mjs`,
+`three_scene_fog.test.mjs` and
 `build_animation_three_fog.test.mjs`; their fixture boundaries are documented in
 `THREE_SCENE_FOG.md`.

@@ -48,8 +48,8 @@ export function sourceModule() {
     onBeforeRender() {} onAfterRender() {} onBeforeShadow() {} onAfterShadow() {}
   }
   class Color { constructor(r=.1,g=.2,b=.3) { Object.assign(this,{r,g,b,isColor:true}); } }
-  class Fog { constructor() { this.color=new Color();this.near=2;this.far=20; } }
-  class FogExp2 { constructor() { this.color=new Color();this.density=.125; } }
+  class Fog { constructor() { this.isFog=true;this.color=new Color();this.near=2;this.far=20; } }
+  class FogExp2 { constructor() { this.isFogExp2=true;this.color=new Color();this.density=.125; } }
   class Scene extends Object3D { constructor(){super();this.fog=null;this.environment=null;this.background=null;this.overrideMaterial=null;} }
   class Camera extends Object3D {
     constructor(){super();this.isPerspectiveCamera=true;this.isOrthographicCamera=false;this.coordinateSystem=2000;

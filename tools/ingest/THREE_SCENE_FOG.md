@@ -85,7 +85,11 @@ not exposed as safely retryable. Disposal and idle waits forward to the owners.
 ## Packaging and evidence
 
 Only combined `threeScene:true,fog:true` builds emit `three_fog.mjs` and export
-`ThreeFogError`, `inspectThreeFog` and `threeFogDescriptor`. The module and
+`ThreeFogError`, `inspectThreeFog` and `threeFogDescriptor`. The established
+`threeFogDescriptor(scene, camera, three)` call and its `THREE_FOG_CAMERA` error
+namespace remain supported; a direct Fog/FogExp2/null input is also accepted.
+Even a null fog still validates the pinned source module, but never the camera.
+The module and
 manifest participate in existing hashes and output byte budgets. Ordinary GPU
 fog packages do not gain source dependencies. Disabled source packages neither
 emit nor import fog modules. Importing an enabled package starts no GPU work.
@@ -94,12 +98,15 @@ Run from the repository root:
 
 ```sh
 node --test tools/ingest/three_fog.test.mjs \
+  tools/ingest/three_fog_receivers.test.mjs \
   tools/ingest/three_scene_fog.test.mjs \
   tools/ingest/build_animation_three_fog.test.mjs \
   tools/ingest/animation_fog_camera.test.mjs \
   tools/ingest/build_animation_fog.test.mjs
 ```
 
+The original `three_fog.test.mjs` regression suite is retained byte-for-byte;
+`three_fog_receivers.test.mjs` adds the expanded receiver/admission cases.
 The production source bridge, builder, fog receiver, camera adapter and packer
 execute in these tests. Minimal source classes, asset decoder/player and GPU
 renderer/residency/deformation/texture services are explicit fixtures, not the

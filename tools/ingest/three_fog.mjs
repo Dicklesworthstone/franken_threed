@@ -25,18 +25,22 @@ const dataFields = object => {
  * Return an owned snapshot, not the mutable source Color or fog object.
  */
 export function inspectThreeFog(fog, three) {
-  if (fog === null) return null;
   if (three?.REVISION !== '186' || typeof three.Fog !== 'function' ||
-      typeof three.FogExp2 !== 'function' || typeof three.Color !== 'function' ||
-      !fog || typeof fog !== 'object') fail('SOURCE', 'Supply a built-in r186 Fog/FogExp2 or null');
+      typeof three.FogExp2 !== 'function' || typeof three.Color !== 'function')
+    fail('SOURCE', 'Supply the pinned r186 fog and color classes');
+  if (fog === null) return null;
+  if (!fog || typeof fog !== 'object') fail('SOURCE', 'Supply a built-in r186 Fog/FogExp2 or null');
   const prototype = Object.getPrototypeOf(fog);
   const linear = prototype === three.Fog.prototype;
   if (!linear && prototype !== three.FogExp2.prototype)
     fail('SOURCE', 'Custom fog profiles need their own renderer');
   dataFields(fog);
+  if (linear ? fog.isFog !== true || fog.isFogExp2 : fog.isFogExp2 !== true || fog.isFog)
+    fail('SOURCE', 'Expected consistent built-in source fog flags');
   const color = fog.color;
   if (!(color instanceof three.Color)) fail('SOURCE', 'Expected a source Color');
   dataFields(color);
+  if (color.isColor !== true) fail('SOURCE', 'Expected a source Color');
   const result = Object.freeze({type: linear ? 'linear' : 'exp2',
     color: Object.freeze([color.r, color.g, color.b]),
     ...(linear ? {near: fog.near, far: fog.far} : {density: fog.density})});
@@ -48,18 +52,42 @@ export function inspectThreeFog(fog, three) {
 
 /** Capture source fog against the SAME projection convention as cameraFrame.
  * Call after the application's existing camera update, not from a new loop.
- * Null is an explicit reset and does not require inspecting a camera.
+ * The established (scene, camera, three) call remains supported. A direct fog
+ * object/null is also accepted for already-captured scene state. Both routes
+ * keep source camera failures in the THREE_FOG_CAMERA error namespace.
+ * Null fog is an explicit reset and does not inspect a camera.
  */
-export function threeFogDescriptor(fog, camera, three) {
+export function threeFogDescriptor(sceneOrFog, camera, three) {
+  const isFog = sceneOrFog && typeof sceneOrFog === 'object' &&
+    ((typeof three?.Fog === 'function' && sceneOrFog instanceof three.Fog) ||
+     (typeof three?.FogExp2 === 'function' && sceneOrFog instanceof three.FogExp2));
+  const fog = !isFog && sceneOrFog && typeof sceneOrFog === 'object' && 'fog' in sceneOrFog
+    ? sceneOrFog.fog : sceneOrFog;
   const source = inspectThreeFog(fog, three);
   if (source === null) return null;
   if (typeof three.Camera !== 'function' || !(camera instanceof three.Camera) ||
       (!camera.isPerspectiveCamera && !camera.isOrthographicCamera) || camera.isArrayCamera || camera.reversedDepth ||
       ![three.WebGLCoordinateSystem, three.WebGPUCoordinateSystem].includes(camera.coordinateSystem))
     fail('CAMERA', 'Supply a non-reversed perspective/orthographic source camera with a known clip convention');
-  return snapshotAnimationCameraFog(source, camera.projectionMatrix?.elements, {
-    clipSpace: camera.coordinateSystem === three.WebGLCoordinateSystem ? 'webgl' : 'webgpu',
+  const projection = camera.projectionMatrix?.elements;
+  if ((!Array.isArray(projection) && !ArrayBuffer.isView(projection)) || projection.length !== 16)
+    fail('CAMERA', 'Expected a finite source projection');
+  // Preserve the source helper's f32 admission, with fixed indexed reads rather
+  // than trusting a borrowed matrix's iterator or cached inverse.
+  const captured = Array.from({length: 16}, (_, i) => {
+    const value = projection[i];
+    if (typeof value !== 'number' || !Number.isFinite(Math.fround(value)))
+      fail('CAMERA', 'Expected a finite source projection');
+    return value;
   });
+  try {
+    return snapshotAnimationCameraFog(source, captured, {
+      clipSpace: camera.coordinateSystem === three.WebGLCoordinateSystem ? 'webgl' : 'webgpu',
+    });
+  } catch (error) {
+    if (error?.code === 'ANIMATION_FOG_CAMERA') fail('CAMERA', error.message);
+    throw error;
+  }
 }
 
 // Canonical immutable native descriptor. Capture once, before any span submits;

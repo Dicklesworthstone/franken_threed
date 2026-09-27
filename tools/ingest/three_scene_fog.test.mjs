@@ -78,7 +78,7 @@ test('fog validation precedes geometry/instance/deformation updates and any colo
   f.scene.fog.far=f.scene.fog.near;
   assert.throws(()=>bridge.render(f.camera,frame()),{code:'ANIMATION_FOG_VALUE'});assert.equal(f.device.events.length,before);
   f.scene.fog.far=20;f.camera.projectionMatrix.elements.fill(0);
-  assert.throws(()=>bridge.render(f.camera,frame()),{code:'ANIMATION_FOG_CAMERA'});assert.equal(f.device.events.length,before);
+  assert.throws(()=>bridge.render(f.camera,frame()),{code:'THREE_FOG_CAMERA'});assert.equal(f.device.events.length,before);
   f.camera.projectionMatrix=new f.three.Matrix4();
   f.scene.children[1].material.fog='false';
   assert.throws(()=>bridge.render(f.camera,frame()),{code:'THREE_SCENE_MATERIAL'});assert.equal(f.device.events.length,before);
