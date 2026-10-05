@@ -249,3 +249,33 @@ export function numericLoopDispatchDiagnostics(token) {
   return Object.freeze({ ...numericDispatchDiagnostics(record.dispatch),
     captureMisses: record.captureMisses, reentrantMisses: record.reentrantMisses });
 }
+
+// Scalar outputs travel through an owned f64 channel. The compiler publishes
+// these to proven-mutable lexical bindings only AFTER native array publication.
+const LoopStateArray = Float64Array;
+
+/**
+ * Compiler-only variant for loops updating outer numeric counters/reductions.
+ * Captures end with stateCount current primitive Numbers. No coercion, global
+ * property access or state publication is allowed while evaluating captures.
+ * Null means run the original statements; a non-null private f64 result means
+ * the generated caller must assign its scalar outputs without yielding.
+ */
+export function dispatchNumericStateLoop(token, resolveCaptures, stateCount, resolveMath = null) {
+  if (typeof stateCount !== "number" || !(stateCount > 0 && stateCount <= 64 && stateCount % 1 === 0))
+    return null;
+  let state = null;
+  const completed = dispatchNumericLoop(token, () => {
+    const args = resolveCaptures(), start = args.length - stateCount;
+    if (start < 0) throw retainedLoop;
+    for (let i = start; i < args.length; i++)
+      if (typeof args[i] !== "number") throw retainedLoop;
+    state = new LoopStateArray(stateCount);
+    for (let i = 0; i < stateCount; i++) state[i] = args[start + i];
+    // args is a fresh compiler-created literal, never an application array.
+    args.length = start;
+    args[start] = state;
+    return args;
+  }, resolveMath);
+  return completed ? state : null;
+}
