@@ -4,6 +4,9 @@
  * installed. prepare() is the explicit asynchronous structural-edit boundary;
  * render(camera, attachments) remains synchronous and immediately submits.
  *
+ * textureTransforms:true admits independent live source texture matrices and
+ * uv/uv1/uv2/uv3 selection, including skin/morph and masked shadow draws. Channel
+ * edits require prepare(); matrix edits do not. See THREE_SCENE_UV.md.
  * This admits rigid/instanced Mesh plus source skin/morph deformation. It
  * is NOT a constructor replacement or complete Three.js renderer compatibility.
  * Unsupported renderable families and shader/render hooks fail explicitly.
@@ -45,7 +48,7 @@ export async function createGpuThreeScene(device,scene,{
   three, textures=new Map(), autoTextures=true, texture:textureOptions={}, renderer:renderOptions={}, geometry:geometryOptions={},
   maxNodes=16384,maxGeometries=256,maxBindings=1024,maxGeometryBytes=128*1024*1024,sortObjects=true,
   maxInstanceMeshes=256,maxInstanceBytes=128*1024*1024,
-  deformation:deformationOptions={},maxDeformedMeshes=256,maxDeformationBytes=128*1024*1024,shadow=null,environment=null,background=null,fog=null,clipping=null,signal,
+  deformation:deformationOptions={},maxDeformedMeshes=256,maxDeformationBytes=128*1024*1024,shadow=null,environment=null,background=null,fog=null,clipping=null,textureTransforms=false,signal,
 }={}) {
   if(three?.REVISION!=='186'||typeof three.Matrix4!=='function'||typeof three.Frustum!=='function'||
       typeof three.Mesh!=='function'||!(scene instanceof three.Scene))fail('SOURCE','Supply the pinned r186 module and its Scene');
@@ -67,6 +70,9 @@ export async function createGpuThreeScene(device,scene,{
       typeof signal.removeEventListener!=='function'))fail('OPTIONS','Expected AbortSignal');
   if(fog!==null&&(!fog||typeof fog!=='object'||Array.isArray(fog)||Object.keys(fog).length))
     fail('OPTIONS','Expected empty source fog options or null');
+  if(typeof textureTransforms!=='boolean'||(renderOptions.textureTransforms!==undefined&&renderOptions.textureTransforms!==textureTransforms))
+    fail('OPTIONS','renderer.textureTransforms must agree with the boolean source textureTransforms option');
+  const uvApi=textureTransforms?await import('./three_scene_uv.mjs'):null;
   const clippingEnabled=clipping!==null;
   const maxClippingPlanes=integer(renderOptions.maxClippingPlanes??8,1,64,'clipping plane capacity');
   if(renderOptions.clipping!==undefined&&renderOptions.clipping!==clippingEnabled)
@@ -318,9 +324,9 @@ export async function createGpuThreeScene(device,scene,{
     if(shading!=='unlit')values.emissiveFactor=rgb(m.emissive).map(v=>v*m.emissiveIntensity);
     if(shading==='phong'){values.specularColor=rgb(m.specular);values.shininess=m.shininess;}
     if(shading==='metallic-roughness'){values.metallicFactor=m.metalness;values.roughnessFactor=m.roughness;}
-    let transform=null;const textureKey=[];
+    let transform=null;const textureKey=[],mapChannels={},mapTransforms={};
     function texture(t,field){
-      if(!(t instanceof three.Texture)||t.isCubeTexture||t.isVideoTexture||t.channel!==0)fail('TEXTURE','Expected a current, ordinary UV0 texture binding');
+      if(!(t instanceof three.Texture)||t.isCubeTexture||t.isVideoTexture||(!textureTransforms&&t.channel!==0))fail('TEXTURE','Expected a current, ordinary UV0 texture binding');
       let binding;
       if(textures.has(t)){
         binding=textures.get(t);
@@ -334,7 +340,11 @@ export async function createGpuThreeScene(device,scene,{
         else{binding=owner.binding(t);frameTextures?.add(t);}
       }
       options[field]={view:binding.view,sampler:binding.sampler};textureKey.push(field,t,binding.view,binding.sampler);
-      if(field!=='gradientTexture'){
+      if(textureTransforms&&field!=='gradientTexture'){
+        const coordinate=uvApi.threeTextureCoordinates(t,three);
+        mapChannels[field]=coordinate.channel;mapTransforms[field]=coordinate.transform;
+        textureKey.push(coordinate.channel);
+      }else if(field!=='gradientTexture'){
         if(t.matrixAutoUpdate)t.updateMatrix();const e=t.matrix.elements,next=[e[0],e[1],e[3],e[4],e[6],e[7]];
         if(transform&&!same(transform,next))fail('TEXTURE','Independent mutable map transforms require an extended geometry profile');
         transform=next;
@@ -357,6 +367,7 @@ export async function createGpuThreeScene(device,scene,{
         values.emissiveFactor?.some(v=>v<0)||values.specularColor?.some(v=>v<0)||values.shininess<0||
         values.metallicFactor<0||values.metallicFactor>1||values.roughnessFactor<0||values.roughnessFactor>1||
         values.occlusionStrength<0||values.occlusionStrength>1)fail('VALUE','Source material is outside the admitted factor profile');
+    if(textureTransforms){options.mapChannels=mapChannels;values.mapTransforms=mapTransforms;}
     const epoch=trackMaterial(m);
     const sides=m.transparent&&m.side===three.DoubleSide&&!m.forceSinglePass?['back','front']:[['front','back','double'][m.side]];
     return sides.map(side=>{
@@ -386,6 +397,7 @@ export async function createGpuThreeScene(device,scene,{
         if(deformationSource)usedDeformations.add(deformationSource);
         if(usedDeformations.size>maxDeformedMeshes)fail('LIMIT','Source deformed mesh capacity exceeded');
         for(const desc of get(m)){
+          if(textureTransforms)uvApi.checkThreeMapChannels(g,desc.options.mapChannels);
           out.push({key,geometry:g,instanceSource,instanceSignature,deformationSource,material:m,desc});
           if(out.length>maxBindings||usedGeometry.size>maxGeometries||usedInstances.size>maxInstanceMeshes)fail('LIMIT','Source geometry/material binding capacity exceeded');
         }
@@ -468,7 +480,8 @@ export async function createGpuThreeScene(device,scene,{
           e.deformation===deformation&&e.signature===signature&&e.instanceSignature===item.instanceSignature&&same(e.structural,item.desc.structural));
         if(!entry){
           const surface=deformation?{indices:deformation.surface.indices,texCoords:deformation.surface.texCoords,
-            vertexColors:item.desc.options.vertexColors?deformation.surface.vertexColors:null}:{};
+            vertexColors:item.desc.options.vertexColors?deformation.surface.vertexColors:null,
+            ...(textureTransforms?uvApi.threeDeformedMapCoordinates(item.desc.options.mapChannels,deformation.surface):{})}:{};
           const mesh=await Promise.race([renderer.addMesh(gpu,{...item.desc.options,...item.desc.values,...surface,...(instanceGpu?{instances:instanceGpu}:{})}),stopped]);
           entry={key:item.key,geometry:item.geometry,instanceSource:item.instanceSource,instanceSignature:item.instanceSignature,
             material:item.material,structural:item.desc.structural,signature,deformation,mesh};created.push(entry);live();
@@ -483,7 +496,7 @@ export async function createGpuThreeScene(device,scene,{
         else if(!shadowOwner||shadowOwner.source!==selected||!shadowOwner.matches()){
           const available=maxShadowBytes-(shadowOwner?.allocatedBytes??0);
           if(available<1)fail('LIMIT','Shadow replacement exceeds the old-plus-new GPU budget');
-          nextShadow=await shadowApi.createGpuThreeShadow(device,selected,{three,maxBytes:available,clipping:clippingEnabled,maxClippingPlanes,
+          nextShadow=await shadowApi.createGpuThreeShadow(device,selected,{three,maxBytes:available,clipping:clippingEnabled,maxClippingPlanes,textureTransforms,
             maxDraws:renderOptions.maxDraws??1024,maxMeshes:2*maxBindings,signal:deformationLifetime.signal});
           pendingShadow=nextShadow;live();
         }
@@ -498,13 +511,15 @@ export async function createGpuThreeScene(device,scene,{
             const surface=entry.deformation?{indices:entry.deformation.surface.indices,
               texCoords:entry.deformation.surface.texCoords,
               vertexColors:options.vertexColors?entry.deformation.surface.vertexColors:null}:{};
-            const depth={shading:'unlit',alphaMode:options.alphaMode,alphaCutoff:options.alphaCutoff,
+            const baseChannels=textureTransforms&&options.baseColorTexture?{baseColorTexture:options.mapChannels.baseColorTexture}:{};
+            const depth={...(textureTransforms?{mapChannels:baseChannels}:{}),shading:'unlit',alphaMode:options.alphaMode,alphaCutoff:options.alphaCutoff,
               vertexColors:options.vertexColors,baseColor:values.baseColor,
               // Native source profile: explicit shadowSide, otherwise reversed
               // material side, matching the retained WebGL depth-map default.
               side:['front','back','double'][item.material.shadowSide??[1,0,2][item.material.side]],
               ...(options.baseColorTexture?{baseColorTexture:options.baseColorTexture}:{}),
               ...(values.uvTransform?{uvTransform:values.uvTransform}:{}),...surface,
+              ...(textureTransforms&&entry.deformation?uvApi.threeDeformedMapCoordinates(baseChannels,entry.deformation.surface):{}),
               ...(entry.instanceSource?{instances:instances.get(entry.instanceSource)}:{})};
             caster=await Promise.race([nextShadow.addMesh(gpu,depth),stopped]);createdCasters.push(caster);live();
           }
@@ -672,6 +687,7 @@ export async function createGpuThreeScene(device,scene,{
               const instanceSignature=instanceSource?instanceAdmission(instanceSource).signature:null;
               const deformationSource=hasThreeDeformation(object)?object:null;
               const desc=get(material),records=lookup.get(deformationSource??instanceSource??g)?.get(material);
+              if(textureTransforms)for(const d of desc)uvApi.checkThreeMapChannels(g,d.options.mapChannels);
               const bindings=desc.map(d=>records?.find(e=>!e.mesh.disposed&&e.geometry===g&&
                 e.instanceSignature===instanceSignature&&same(e.structural,d.structural)));
               if(bindings.some(e=>!e))fail('PREPARE','Call prepare() after changing geometry, instance layout, material structure or texture bindings');
@@ -767,6 +783,7 @@ export async function createGpuThreeScene(device,scene,{
         for(let i=0;i<item.bindings.length;i++){
           const values=item.desc[i].values,clipped=item.desc[i].clipped,common={worldMatrix:item.object.matrixWorld.elements,first,count};
           if(item.shadowPass)shadowDraws.push({mesh:casters.get(item.bindings[i]),...common,baseColor:values.baseColor,
+            ...(textureTransforms?{mapTransforms:values.mapTransforms.baseColorTexture?{baseColorTexture:values.mapTransforms.baseColorTexture}:{}}:{}),
             ...(clipped?{clippingPlanes:clipped.clipShadows?clipped.clippingPlanes:[],clipIntersection:clipped.clipIntersection}:{}),
             ...(values.uvTransform?{uvTransform:values.uvTransform}:{}),
             ...(values.alphaCutoff!==undefined?{alphaCutoff:values.alphaCutoff}:{})});
@@ -841,7 +858,7 @@ export async function createGpuThreeScene(device,scene,{
     // Source validation precedes even the renderer's uniform allocation.
     signal?.addEventListener('abort',onAbort,{once:true});if(signal?.aborted)onAbort();live();
     scanTextures();
-    const construction=createGpuAnimationRenderer(device,{...renderOptions,clipping:clippingEnabled,...(backgroundEnabled?{format:renderOptions.format??'rgba8unorm',sampleCount:renderOptions.sampleCount??1}:{}),...(shadowEnabled?{shadows:true}:{}),...(environmentEnabled?{environment:true}:{}),...(fogEnabled?{fog:true}:{}),indirectLights:true,threeLights:true,maxMeshes:2*maxBindings}).then(value=>{
+    const construction=createGpuAnimationRenderer(device,{...renderOptions,textureTransforms,clipping:clippingEnabled,...(backgroundEnabled?{format:renderOptions.format??'rgba8unorm',sampleCount:renderOptions.sampleCount??1}:{}),...(shadowEnabled?{shadows:true}:{}),...(environmentEnabled?{environment:true}:{}),...(fogEnabled?{fog:true}:{}),indirectLights:true,threeLights:true,maxMeshes:2*maxBindings}).then(value=>{
       if(disposed||terminal){value.dispose();throw terminal??new ThreeSceneError('DISPOSED','Source scene is disposed');}
       renderer=shadowEnabled?shadowApi.withThreeShadowReceivers(value,renderOptions.maxDraws??1024):value;
       if(environmentEnabled)renderer=environmentApi.withThreeEnvironmentReceivers(renderer,renderOptions.maxDraws??1024);

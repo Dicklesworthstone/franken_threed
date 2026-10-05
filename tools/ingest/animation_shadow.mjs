@@ -35,7 +35,7 @@ function matrix(value) {
 
 /** Create a bounded depth map. OPAQUE/MASK caster material options match addMesh(). */
 export async function createGpuAnimationShadowMap(device, options = {}) {
-  fields(options, ["width", "height", "maxBytes", "maxDraws", "maxMeshes", "label", "clipping", "maxClippingPlanes"]);
+  fields(options, ["width", "height", "maxBytes", "maxDraws", "maxMeshes", "label", "clipping", "maxClippingPlanes", "textureTransforms"]);
   const {
     width = 1024,
     height = width,
@@ -64,6 +64,7 @@ export async function createGpuAnimationShadowMap(device, options = {}) {
     maxDraws,
     maxMeshes,
     label,
+    textureTransforms: options.textureTransforms === undefined ? false : options.textureTransforms,
     clipping: options.clipping === undefined ? false : options.clipping,
     maxClippingPlanes: options.maxClippingPlanes === undefined ? 8 : options.maxClippingPlanes,
   });
@@ -215,7 +216,7 @@ export async function createGpuAnimationShadowMap(device, options = {}) {
         const nextDependencies = [],
           draws = list.map((value) => {
             const input = owned.has(value) ? { mesh: value } : value;
-            fields(input, ["mesh", "worldMatrix", "baseColor", "first", "count", "uvTransform", "alphaCutoff", "clippingPlanes", "clipIntersection"]);
+            fields(input, ["mesh", "worldMatrix", "baseColor", "first", "count", "uvTransform", "alphaCutoff", "clippingPlanes", "clipIntersection", "mapTransforms"]);
             const record = owned.get(input.mesh);
             if (!record || record.mesh.disposed) fail("Caster does not belong to this live map");
             const { gpu, mesh } = record,
@@ -241,7 +242,7 @@ export async function createGpuAnimationShadowMap(device, options = {}) {
             // Keep per-draw MASK thresholds live, just like the color pass.
             // The renderer validates MASK applicability and the [0,1] range
             // before any GPU writes; do not freeze the registration-time value.
-            for (const key of ["first", "count", "alphaCutoff", "clippingPlanes", "clipIntersection"])
+            for (const key of ["first", "count", "alphaCutoff", "clippingPlanes", "clipIntersection", "mapTransforms"])
               if (input[key] !== undefined) draw[key] = input[key];
             return draw;
           });

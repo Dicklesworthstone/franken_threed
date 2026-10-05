@@ -75,7 +75,8 @@ function inspect(source, limits) {
   }
   const position = attribute(g.attributes.position, 3, null, 'position'), count = position.count;
   for (const [name, , width] of fields.slice(1)) if (g.attributes[name]) attribute(g.attributes[name], width, count, name);
-  if (g.attributes.uv) attribute(g.attributes.uv, 2, count, 'uv');
+  for (const name of ['uv', 'uv1', 'uv2', 'uv3'])
+    if (g.attributes[name]) attribute(g.attributes[name], 2, count, name);
   if (g.attributes.color) {
     if (![3, 4].includes(g.attributes.color.itemSize)) fail('GEOMETRY', 'Vertex colors require RGB or RGBA');
     attribute(g.attributes.color, g.attributes.color.itemSize, count, 'color');
@@ -188,7 +189,11 @@ export function createThreeDeformationBinding(source, options) {
     vertexColors = new Float32Array(shape.count * 4);
     for (let i = 0; i < shape.count; i++) { vertexColors.set(colors.subarray(i * 3, i * 3 + 3), i * 4); vertexColors[i * 4 + 3] = 1; }
   }
-  const surface = Object.freeze({indices: indices ? Uint32Array.from(indices) : null, texCoords: read('uv', 2) ?? null, vertexColors: vertexColors ?? null});
+  // UVs do not deform. Capture each admitted stream once at preparation; their
+  // source versions above participate in replacement, never in a frame UV bake.
+  const uvChannels = Object.freeze(['uv', 'uv1', 'uv2', 'uv3'].map(name => read(name, 2) ?? null));
+  const surface = Object.freeze({indices: indices ? Uint32Array.from(indices) : null,
+    texCoords: uvChannels[0], uvChannels, vertexColors: vertexColors ?? null});
   const world = new Float64Array(16), palette = new Float64Array(pose.jointMatrices.length), morphWeights = new Float64Array(shape.targets);
   const bind = new Float64Array(16), inverse = new Float64Array(16), bone = new Float64Array(16), rest = new Float64Array(16);
   const ab = new Float64Array(16), abc = new Float64Array(16), result = new Float64Array(16);

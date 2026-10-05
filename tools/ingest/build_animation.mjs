@@ -351,7 +351,7 @@ export {fitAnimationShadowView,animationShadowWorldBounds} from './animation_sha
     outputs.set("three_textures.mjs", fs.readFileSync(new URL("./three_textures.mjs", import.meta.url), "utf8"));
     for (const name of ["gpu_canvas.mjs", "gpu_canvas_renderer.mjs", "three_canvas.mjs",
       "gpu_hdr_canvas.mjs", "gpu_render_target.mjs", "animation_output.mjs",
-      "three_deformation.mjs", "three_deformation_binding.mjs", "three_shadows.mjs"]) {
+      "three_deformation.mjs", "three_deformation_binding.mjs", "three_shadows.mjs", "three_scene_uv.mjs"]) {
       outputs.set(name, fs.readFileSync(new URL("./" + name, import.meta.url), "utf8"));
     }
     outputs.set("gpu_playback.mjs", outputs.get("gpu_playback.mjs") +
