@@ -77,9 +77,13 @@
  * Metallic-roughness materials accept KHR_materials_clearcoat's clearcoatFactor,
  * clearcoatRoughnessFactor and optional clearcoatTexture (linear R),
  * clearcoatRoughnessTexture (linear G), clearcoatNormalTexture (linear RGB).
- * clearcoatNormalScale scales the coating normal's XY, independently of the base.
- * These registration-time settings use a 16-byte material uniform; the existing
- * 256-byte per-draw packet stays unchanged. No coating draw overrides are implied.
+ * clearcoatNormalScale accepts a scalar or [x,y], independently of the base.
+ * These settings use a 16-byte material uniform; the per-draw packet is unchanged.
+ * mutableClearcoat:true opts into mesh.setClearcoat(partialParameters), preserving
+ * omitted values without recompilation, allocation or bundle invalidation. Each
+ * mutable handle owns its uniform even when instancing shares immutable streams.
+ * Submit every prior use before changing it; there are no coating draw overrides.
+ * Await renderer.whenIdle() for queued upload errors, including frames not drawn.
  * The coating uses Schlick Fresnel at NdotV, IOR 1.5, the existing GGX lobe/
  * roughness floor, and attenuates the entire base including emission, not alpha.
  * Its default normal is the geometry normal, NOT the base normal map.
@@ -309,7 +313,7 @@ function clearcoatNormalCode(derivative) {
     let bitangent = cross(normal, tangent) * select(-1.0, 1.0, input.tangent.w >= 0.0);`
     }
     var mapped = clearcoat_normal_texel.xyz * 2.0 - vec3<f32>(1.0);
-    mapped = vec3<f32>(mapped.xy * clearcoat_info.z, mapped.z);
+    mapped = vec3<f32>(mapped.xy * clearcoat_info.zw, mapped.z);
     coat_normal = unit_vector(tangent * mapped.x + bitangent * mapped.y + normal * mapped.z);
   }`;
 }
@@ -386,7 +390,8 @@ fn illuminate(base: vec3<f32>, position: vec3<f32>, normal: vec3<f32>, metallic:
   var result = emission;${environmentCode ? "\n  result += environment_lighting(base, normal, view, metallic, roughness, draw_info.options.z == 2.0)" + (ambientOcclusion ? " * occlusion" : "") + ";" : ""}
   for (var i = 0u; i < u32(lighting.meta.x); i++) {
     let light = lighting.lights[i];
-    ${indirectLights ? `// Light kind is frame-uniform. Keep derivative/implicit-sample toon work
+    ${indirectLights ? `// Light kind is frame-uniform. Keep derivative/
+    // implicit-sample toon work
     // inside the uniform direct-light arm, never behind a per-fragment exit.
     if (light.radiance.w >= 3.0) {
       var irradiance = light.radiance.rgb;
@@ -776,6 +781,60 @@ function keys(object, allowed, label) {
     if (!allowed.includes(key))
       fail("ANIMATION_RENDER_OPTIONS", `Unsupported ${label} field: ${key}`);
 }
+/** A private 16-byte clearcoat material snapshot. No GPU work or source ownership.
+ * Scalar normal scales remain supported; a pair controls tangent X/Y separately.
+ * The renderer supplies its error factory so existing public error codes survive.
+ */
+const ANIMATION_CLEARCOAT_FIELDS = Object.freeze([
+  'clearcoatFactor', 'clearcoatRoughnessFactor', 'clearcoatNormalScale',
+]);
+const reject = (code, message) => {
+  throw Object.assign(new Error(`${code}: ${message}`), {code});
+};
+export function snapshotAnimationClearcoat(input, normalMapped, previous, fail = reject) {
+  const options = message => fail('ANIMATION_RENDER_OPTIONS', message);
+  const value = message => fail('ANIMATION_RENDER_VALUE', message);
+  if (!input || typeof input !== 'object' || Array.isArray(input))
+    options('Expected clearcoat parameters');
+  const descriptors = Object.getOwnPropertyDescriptors(input), fields = {};
+  for (const key of Reflect.ownKeys(descriptors)) {
+    if (!ANIMATION_CLEARCOAT_FIELDS.includes(key)) options('Unknown clearcoat parameter');
+    const descriptor = descriptors[key];
+    if (!Object.hasOwn(descriptor, 'value')) options('Clearcoat parameters must be ordinary data properties');
+    fields[key] = descriptor.value;
+  }
+  const number = n => {
+    if (typeof n !== 'number' || !Number.isFinite(Math.fround(n)))
+      value('Clearcoat parameters must be finite f32 numbers');
+    return n;
+  };
+  const result = new Float32Array(previous ?? [0, 0, 1, 1]);
+  for (const [i, key] of ANIMATION_CLEARCOAT_FIELDS.slice(0, 2).entries()) {
+    if (fields[key] === undefined) continue;
+    const n = number(fields[key]);
+    if (n < 0 || n > 1) value('Clearcoat factors must be in [0,1]');
+    result[i] = n;
+  }
+  const scale = fields.clearcoatNormalScale;
+  if (scale !== undefined) {
+    if (!normalMapped) options('Clearcoat normal scale requires its normal map');
+    if (typeof scale === 'number') result[2] = result[3] = number(scale);
+    else {
+      if ((!Array.isArray(scale) && !(scale instanceof Float32Array) && !(scale instanceof Float64Array)) || scale.length !== 2)
+        value('Clearcoat normal scale requires a number or two components');
+      if (ArrayBuffer.isView(scale) && (!(scale.buffer instanceof ArrayBuffer) || scale.buffer.resizable))
+        options('Clearcoat normal scale requires fixed unshared storage');
+      for (let i = 0; i < 2; i++) {
+        const descriptor = Object.getOwnPropertyDescriptor(scale, String(i));
+        if (!descriptor || !Object.hasOwn(descriptor, 'value'))
+          options('Clearcoat normal components must be ordinary data properties');
+        result[2 + i] = number(descriptor.value);
+      }
+    }
+  }
+  return result;
+}
+
 function scoped(device, operation) {
   device.pushErrorScope("validation");
   device.pushErrorScope("out-of-memory");
@@ -1518,6 +1577,7 @@ export async function createGpuAnimationRenderer(
         "mapTransforms",
         ...MAP_FIELDS,
         ...COAT_FIELDS,
+        "mutableClearcoat",
         "normalScale",
         "occlusionStrength",
         "uvTransform",
@@ -1598,33 +1658,27 @@ export async function createGpuAnimationRenderer(
       return { view, sampler };
     });
     const mapMask = textures.reduce((mask, texture, slot) => mask | (texture ? 1 << slot : 0), 0);
-    const coated =
-      COAT_FIELDS.some((field) => options[field] !== undefined) || (mapMask & 224) !== 0;
+    const mutableClearcoat = options.mutableClearcoat === undefined ? false : options.mutableClearcoat;
+    if (typeof mutableClearcoat !== "boolean")
+      fail("ANIMATION_RENDER_OPTIONS", "mutableClearcoat must be boolean");
+    // Retain descriptors so accessors are rejected rather than invoked by copying.
+    const coatInput = Object.create(null);
+    for (const field of COAT_FIELDS) {
+      const descriptor = Object.getOwnPropertyDescriptor(options, field);
+      if (descriptor) Object.defineProperty(coatInput, field, descriptor);
+    }
+    const coated = mutableClearcoat || (mapMask & 224) !== 0 ||
+      Object.values(Object.getOwnPropertyDescriptors(coatInput)).some(d => !Object.hasOwn(d, "value") || d.value !== undefined);
     if (coated && mode !== 2)
-      fail("ANIMATION_RENDER_OPTIONS", "Clearcoat requires metallic-roughnessness shading");
-    if (options.clearcoatNormalScale !== undefined && !(mapMask & 128))
-      fail("ANIMATION_RENDER_OPTIONS", "Clearcoat normal scale requires its normal map");
-    const coatValues = coated
-      ? [
-          options.clearcoatFactor === undefined ? 0 : options.clearcoatFactor,
-          options.clearcoatRoughnessFactor === undefined ? 0 : options.clearcoatRoughnessFactor,
-          options.clearcoatNormalScale === undefined ? 1 : options.clearcoatNormalScale,
-          0,
-        ]
-      : null;
+      fail("ANIMATION_RENDER_OPTIONS", "Clearcoat requires metallic-roughness shading");
+    const coatData = coated ? snapshotAnimationClearcoat(coatInput, !!(mapMask & 128), null, fail) : null;
     if (coated) {
-      for (const value of coatValues)
-        if (!Number.isFinite(Math.fround(finite(value, "Clearcoat parameter"))))
-          fail("ANIMATION_RENDER_VALUE", "Clearcoat parameters must fit f32");
-      if (coatValues[0] < 0 || coatValues[0] > 1 || coatValues[1] < 0 || coatValues[1] > 1)
-        fail("ANIMATION_RENDER_VALUE", "Clearcoat factors must be in [0,1]");
       limit("maxBindGroups", 3);
       limit("maxUniformBuffersPerShaderStage", 3 + Number(shadows) + Number(environment) + Number(fog));
       limit("maxBindingsPerBindGroup", mapSlots(mapMask).length * 2 + 1);
       if (instancing) limit("maxInterStageShaderVariables", 14);
     }
-    const coatData = coated ? new Float32Array(coatValues) : null,
-      layoutKey = mapMask | (coated ? COAT_LAYOUT : 0);
+    const layoutKey = mapMask | (coated ? COAT_LAYOUT : 0);
     if (
       (!lit && mapMask & 30) ||
       (mode !== 2 && !phong && !toon && mapMask & 2) ||
@@ -1777,7 +1831,7 @@ export async function createGpuAnimationRenderer(
       attributeVariant + (mutable ? geometryVariant(mutable, geometryColors, instances) : "");
     const textureKey =
       instancing && (mapMask || coated)
-        ? groupKey(textures) +
+        ? mutableClearcoat ? {} : groupKey(textures) +
           (coated ? "/coat:" + [...new Uint32Array(coatData.buffer)].join(",") : "")
         : null;
     const coatReserve = coated && !sharedGroups?.has(textureKey) ? COAT_BYTES : 0;
@@ -1927,7 +1981,7 @@ export async function createGpuAnimationRenderer(
                   device.createBuffer({
                     label: `${label}/clearcoat`,
                     size: COAT_BYTES,
-                    usage: UNIFORM,
+                    usage: UNIFORM | (mutableClearcoat ? COPY_DST : 0),
                     mappedAtCreation: true,
                   }),
                   COAT_BYTES,
@@ -2007,6 +2061,40 @@ export async function createGpuAnimationRenderer(
         get indexCount() { return mutable ? bufferGeometrySnapshot(gpu, device).indexCount : indices === null ? 0 : extent; },
         get disposed() {
           return record.disposed || disposed;
+        },
+        /** Submit all prior uses before changing this handle's material. Cached
+         * bundles retain the binding, never an old copy of its buffer contents.
+         * Partial updates preserve omitted fields; this is not a per-draw override.
+         */
+        setClearcoat(parameters) {
+          live();
+          if (record.disposed) fail("ANIMATION_RENDER_DISPOSED", "Mesh is disposed");
+          if (busy) fail("ANIMATION_RENDER_REENTRANT", "Cannot update clearcoat during submission");
+          if (!mutableClearcoat) fail("ANIMATION_RENDER_OPTIONS", "Enable mutableClearcoat at registration");
+          busy = true;
+          try {
+            // Host input failures leave the renderer reusable and issue no writes.
+            const next = snapshotAnimationClearcoat(parameters, !!(mapMask & 128), coatData, fail);
+            if (next.every((v, i) => Object.is(v, coatData[i]))) return mesh;
+            let issued;
+            try {
+              issued = scoped(device, () => device.queue.writeBuffer(textureLease?.coatBuffer ?? coatBuffer, 0, next));
+              if (issued.error) throw issued.error;
+              const work = [completion, issued.errors, device.queue.onSubmittedWorkDone()];
+              completion = Promise.race([Promise.all(work), lost]).then(
+                () => { if (terminal) throw terminal; },
+                error => { terminal ??= error; bundleCache?.clear(); throw terminal; },
+              );
+              completion.catch(() => {});
+              coatData.set(next);
+            } catch (error) {
+              issued?.errors.catch(() => {});
+              terminal ??= error;
+              bundleCache?.clear();
+              throw terminal;
+            }
+            return mesh;
+          } finally { busy = false; }
         },
         dispose() {
           if (busy) fail("ANIMATION_RENDER_REENTRANT", "Cannot dispose a mesh during submission");

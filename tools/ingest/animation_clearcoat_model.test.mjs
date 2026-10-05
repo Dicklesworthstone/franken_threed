@@ -415,7 +415,7 @@ test("actual model decode -> scene -> renderer preserves all coating bindings an
     pose = { version: 0, disposed: false };
   const scene = await createGpuAnimationScene(g.d, pose, decoded.drawables, { sortObjects: false });
   const b = g.buffers.find((x) => x.label.endsWith("/clearcoat"));
-  close(new Float32Array(b.data), [0.75, 0.25, -0.5, 0]);
+  close(new Float32Array(b.data), [0.75, 0.25, -0.5, -0.5]);
   assert.ok(
     g.shaders.some((s) => s.includes("clearcoat_normal_texel") && s.includes("input.uv_7")),
   );

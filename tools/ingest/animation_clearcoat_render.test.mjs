@@ -236,7 +236,7 @@ for (const instancing of [false, true])
     assert.equal(r.allocatedBytes, 512 + 544 + 16);
     assert.equal(g.buffers.filter((b) => b.label.endsWith("/surface")).length, 0);
     const c = g.buffers.find((b) => b.label.endsWith("/clearcoat"));
-    assert.deepEqual([...new Float32Array(c.data)], [0.75, 0.25, 1, 0]);
+    assert.deepEqual([...new Float32Array(c.data)], [0.75, 0.25, 1, 1]);
     r.render(frame([m, m]));
     const draw = last(g)[0];
     assert.equal(draw.bindings.get(1).group.entries.length, 1);
