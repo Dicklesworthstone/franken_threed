@@ -176,10 +176,19 @@
  * renderers retain their original 256-byte packet. Plane edits/count changes
  * need no material recompilation and remain live inside reused render bundles.
  *
+ * textureTransforms:true gives each draw eight independent affine map transforms.
+ * Material mapChannels selects source uv/uv1/uv2/uv3 (0..3) per texture field;
+ * mapTransforms supplies registration defaults or live per-draw overrides.
+ * An override replaces the shared uvTransform, after static mapCoordinates.
+ * The bounded 256-byte UV tail follows clipping, with no shared mutable map
+ * uniform and no vertex repacking. See ANIMATION_UV.md for the full contract.
+ *
  * Host validation finishes before GPU writes. Driver errors are terminal, not
  * rollbackable. version acknowledges submission, not completion: await whenIdle()
  * for cumulative draw/deformation validation, OOM and device-loss errors.
  */
+import {ANIMATION_UV_BYTES, ANIMATION_UV_FIELDS, snapshotAnimationMapTransforms,
+  animationMapChannelKey, packAnimationMapTransforms} from "./animation_uv.mjs";
 import {animationClippingBytes, animationClippingFields, animationClippingWgsl,
   snapshotAnimationClipping, packAnimationClipping} from "./animation_clipping.mjs";
 import {createAnimationRenderBundleCache, encodeAnimationDraws} from "./animation_render_bundles.mjs";
@@ -323,7 +332,13 @@ function surfaceShader(
   threeLights = false,
   fogCode = "",
   clippingCapacity = 0,
+  textureTransforms = false,
+  channelKey = 0,
 ) {
+  const mappedMask = coordinateMask | (textureTransforms ? mapMask & ~(toon ? 2 : 0) : 0);
+  const channel = slot => (channelKey >>> (slot * 2)) & 3;
+  const sourceUv = slot => coordinateMask & (1 << slot) ? `uv_${slot}` : channel(slot) ? `uv${channel(slot)}` : "uv";
+  const sourceChannels = [1, 2, 3].filter(c => geometryChannels?.['uv' + c]);
   const nativeInstances = geometryChannels?.instanced === true;
   const instanceColor = geometryChannels?.instanceColor === true;
   const localPosition = nativeInstances ? "instance_position" : "vec4<f32>(position, 1.0)";
@@ -345,7 +360,7 @@ function surfaceShader(
         `@group(1) @binding(${slot * 2}) var ${names[slot]}_sampler: sampler;\n@group(1) @binding(${slot * 2 + 1}) var ${names[slot]}_texture: texture_2d<f32>;`,
     )
     .join("\n");
-  const coordinates = (slot) => (coordinateMask & (1 << slot) ? `input.uv_${slot}` : "input.uv");
+  const coordinates = (slot) => (mappedMask & (1 << slot) ? `input.uv_${slot}` : "input.uv");
   const samples = mapSlots(toon ? mapMask & ~2 : mapMask)
     .map(
       (slot) =>
@@ -454,7 +469,7 @@ fn illuminate(base: vec3<f32>, position: vec3<f32>, normal: vec3<f32>, metallic:
   return /* wgsl */ `
 ${phong ? "// Matrix padding at words 51/55/59: AO strength, specular G, specular B.\nstruct PhongNormal { x: vec3<f32>, strength: f32, y: vec3<f32>, specular_g: f32, z: vec3<f32>, specular_b: f32 }\n" : occluded ? "// Same 48-byte layout as mat3x3; the first column padding holds material strength.\nstruct OcclusionNormal { x: vec3<f32>, strength: f32, y: vec3<f32>, pad0: f32, z: vec3<f32>, pad1: f32 }\n" : ""}struct DrawInfo {
   clip_from_local: mat4x4<f32>, color: vec4<f32>, options: vec4<f32>, uv_x: vec4<f32>, uv_y: vec4<f32>,
-  world_from_local: mat4x4<f32>, normal_from_local: ${phong ? "PhongNormal" : occluded ? "OcclusionNormal" : "mat3x3<f32>"}, emission_roughness: vec4<f32>${clippingCapacity ? animationClippingFields(clippingCapacity) : ""}
+  world_from_local: mat4x4<f32>, normal_from_local: ${phong ? "PhongNormal" : occluded ? "OcclusionNormal" : "mat3x3<f32>"}, emission_roughness: vec4<f32>${clippingCapacity ? animationClippingFields(clippingCapacity) : ""}${textureTransforms ? ANIMATION_UV_FIELDS : ""}
 }
 ${
   instanceStride
@@ -469,7 +484,7 @@ struct VertexOutput {
   @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) color: vec4<f32>,${instanceStride ? `\n  @location(${coated ? 13 : 10}) @interpolate(flat) draw_index: u32,` : ""}
   ${lit || clippingCapacity ? "@location(2) world: vec3<f32>," : ""}${lit ? " @location(3) normal: vec3<f32>," : ""}
   ${tangentAttribute ? "@location(4) tangent: vec4<f32>," : ""}${fogCode ? "\n  @location(14) fog_depth: f32," : ""}
-  ${mapSlots(coordinateMask)
+  ${mapSlots(mappedMask)
     .map((slot) => `@location(${5 + slot}) uv_${slot}: vec2<f32>,`)
     .join("\n  ")}
 }
@@ -479,7 +494,7 @@ struct VertexOutput {
     .map((slot) => `, @location(${5 + slot}) uv_${slot}: vec2<f32>`)
     .join(
       "",
-    )}${nativeInstances ? ", @location(5) instance_0: vec4<f32>, @location(6) instance_1: vec4<f32>, @location(7) instance_2: vec4<f32>, @location(8) instance_3: vec4<f32>" : ""}${instanceColor ? ", @location(9) instance_color: vec3<f32>" : ""}${instanceStride ? ", @builtin(instance_index) draw_index: u32" : ""}) -> VertexOutput {
+    )}${sourceChannels.map(c => `, @location(${9 + c}) uv${c}: vec2<f32>`).join("")}${nativeInstances ? ", @location(5) instance_0: vec4<f32>, @location(6) instance_1: vec4<f32>, @location(7) instance_2: vec4<f32>, @location(8) instance_3: vec4<f32>" : ""}${instanceColor ? ", @location(9) instance_color: vec3<f32>" : ""}${instanceStride ? ", @builtin(instance_index) draw_index: u32" : ""}) -> VertexOutput {
   var out: VertexOutput;${instanceStride ? "\n  draw_info = instance_draws[draw_index].info;\n  out.draw_index = draw_index;" : ""}
   ${nativeInstances ? `let instance_matrix = mat4x4<f32>(instance_0, instance_1, instance_2, instance_3);
   let instance_position = instance_matrix * vec4<f32>(position, 1.0);
@@ -493,11 +508,10 @@ struct VertexOutput {
   ${lit || clippingCapacity ? "out.world = (draw_info.world_from_local * " + localPosition + ").xyz;" : ""}
   ${lit ? "out.normal = " + (occluded || phong ? "mat3x3<f32>(draw_info.normal_from_local.x, draw_info.normal_from_local.y, draw_info.normal_from_local.z)" : "draw_info.normal_from_local") + " * " + localNormal + ";" : ""}
   ${tangentAttribute ? "out.tangent = vec4<f32>((draw_info.world_from_local * vec4<f32>(" + localTangent + ", 0.0)).xyz, tangent.w * draw_info.uv_y.w);" : ""}
-  ${mapSlots(coordinateMask)
-    .map(
-      (slot) =>
-        `out.uv_${slot} = vec2<f32>(dot(draw_info.uv_x.xyz, vec3<f32>(uv_${slot}, 1.0)), dot(draw_info.uv_y.xyz, vec3<f32>(uv_${slot}, 1.0)));`,
-    )
+  ${mapSlots(mappedMask)
+    .map(slot => textureTransforms
+      ? `out.uv_${slot} = vec2<f32>(dot(draw_info.map_uv[${slot * 2}].xyz, vec3<f32>(${sourceUv(slot)}, 1.0)), dot(draw_info.map_uv[${slot * 2 + 1}].xyz, vec3<f32>(${sourceUv(slot)}, 1.0)));`
+      : `out.uv_${slot} = vec2<f32>(dot(draw_info.uv_x.xyz, vec3<f32>(uv_${slot}, 1.0)), dot(draw_info.uv_y.xyz, vec3<f32>(uv_${slot}, 1.0)));`)
     .join("\n  ")}
   return out;
 }
@@ -811,6 +825,7 @@ export async function createGpuAnimationRenderer(
     fog = false,
     clipping = false,
     maxClippingPlanes = 8,
+    textureTransforms = false,
     indirectLights = false,
     threeLights = false,
     instancing = false,
@@ -868,7 +883,10 @@ export async function createGpuAnimationRenderer(
   if (typeof clipping !== "boolean")
     fail("ANIMATION_RENDER_OPTIONS", "clipping must be boolean");
   const clippingBytes = animationClippingBytes(maxClippingPlanes);
-  const packetBytes = UNIFORM_BYTES + (clipping ? clippingBytes : 0);
+  if (typeof textureTransforms !== "boolean")
+    fail("ANIMATION_RENDER_OPTIONS", "textureTransforms must be boolean");
+  const uvOffset = UNIFORM_BYTES + (clipping ? clippingBytes : 0);
+  const packetBytes = uvOffset + (textureTransforms ? ANIMATION_UV_BYTES : 0);
   const limits = device.limits;
   const limit = (name, needed) => {
     if (!Number.isSafeInteger(limits[name]) || limits[name] < needed)
@@ -1184,7 +1202,7 @@ export async function createGpuAnimationRenderer(
     const module = device.createShaderModule({
       label,
       code:
-        clipping || fog || nativeInstances || instancing || lit || attributes || format === null
+        textureTransforms || clipping || fog || nativeInstances || instancing || lit || attributes || format === null
           ? surfaceShader(
               mapMask,
               lit,
@@ -1204,6 +1222,8 @@ export async function createGpuAnimationRenderer(
               threeLights,
               fogCode,
               clipping ? maxClippingPlanes : 0,
+              textureTransforms,
+              Number(/channels-(\d+)-/.exec(variant)?.[1] ?? 0),
             )
           : ANIMATION_RENDER_WGSL,
     });
@@ -1494,6 +1514,8 @@ export async function createGpuAnimationRenderer(
         "texCoords",
         "vertexColors",
         "mapCoordinates",
+        "mapChannels",
+        "mapTransforms",
         ...MAP_FIELDS,
         ...COAT_FIELDS,
         "normalScale",
@@ -1579,7 +1601,7 @@ export async function createGpuAnimationRenderer(
     const coated =
       COAT_FIELDS.some((field) => options[field] !== undefined) || (mapMask & 224) !== 0;
     if (coated && mode !== 2)
-      fail("ANIMATION_RENDER_OPTIONS", "Clearcoat requires metallic-roughness shading");
+      fail("ANIMATION_RENDER_OPTIONS", "Clearcoat requires metallic-roughnessness shading");
     if (options.clearcoatNormalScale !== undefined && !(mapMask & 128))
       fail("ANIMATION_RENDER_OPTIONS", "Clearcoat normal scale requires its normal map");
     const coatValues = coated
@@ -1707,6 +1729,10 @@ export async function createGpuAnimationRenderer(
       : vertexColors !== null || texCoords !== null
         ? "color"
         : "plain";
+    if (!textureTransforms && (options.mapTransforms !== undefined || options.mapChannels !== undefined))
+      fail("ANIMATION_RENDER_OPTIONS", "Enable textureTransforms before supplying map transforms/channels");
+    const mapDefaults = textureTransforms ? snapshotAnimationMapTransforms(options.mapTransforms, mapFields, mapMask, toon ? 2 : 0) : null;
+    const channelKey = textureTransforms ? animationMapChannelKey(options.mapChannels, mapFields, mapMask, mutable?.channels, toon ? 2 : 0) : 0;
     const coordinateInput = options.mapCoordinates ?? {};
     keys(coordinateInput, mapFields, "map coordinates");
     const coordinates = [];
@@ -1727,6 +1753,8 @@ export async function createGpuAnimationRenderer(
         coordinates.push({ slot, values, transform: local });
       }
     const coordinateMask = coordinates.reduce((mask, entry) => mask | (1 << entry.slot), 0);
+    if (textureTransforms && (mapMask & ~(toon ? 2 : 0)))
+      limit("maxInterStageShaderVariables", 6 + mapSlots(mapMask & ~(toon ? 2 : 0)).at(-1));
     if (coordinates.length) {
       const needed = 6 + coordinates.at(-1).slot;
       limit("maxVertexAttributes", needed);
@@ -1745,6 +1773,7 @@ export async function createGpuAnimationRenderer(
       (coated ? "coat-" : "") +
       (derivative ? "derivative-" : "") +
       (coordinateMask ? `uv-${coordinateMask}-` : "") +
+      (channelKey ? `channels-${channelKey}-` : "") +
       attributeVariant + (mutable ? geometryVariant(mutable, geometryColors, instances) : "");
     const textureKey =
       instancing && (mapMask || coated)
@@ -1765,8 +1794,11 @@ export async function createGpuAnimationRenderer(
       surfaceBuffer = null,
       textureGroup = null,
       coatBuffer = null;
-    if (mapMask & ~coordinateMask & ~(toon ? 2 : 0) && (mutable ? !mutable.channels.uv : texCoords === null))
-      fail("ANIMATION_RENDER_GEOMETRY", "Material textures require UV coordinates");
+    for (const slot of mapSlots(mapMask & ~coordinateMask & ~(toon ? 2 : 0))) {
+      const channel = (channelKey >>> (slot * 2)) & 3;
+      if (mutable ? !mutable.channels[channel ? 'uv' + channel : 'uv'] : texCoords === null)
+        fail("ANIMATION_RENDER_GEOMETRY", "Material textures require their selected UV coordinates");
+    }
     if (!mutable && !noSurface && attributeVariant !== "plain") {
       limit("maxVertexBuffers", 2);
       limit("maxVertexAttributes", 5);
@@ -1951,6 +1983,9 @@ export async function createGpuAnimationRenderer(
         indexFormat,
         variant,
         transform,
+        mapDefaults,
+        mapFields,
+        uvExcluded: toon ? 2 : 0,
         surfaceBuffer,
         textureGroup,
         lit,
@@ -2134,6 +2169,7 @@ export async function createGpuAnimationRenderer(
             "first",
             "count",
             "uvTransform",
+            "mapTransforms",
             "normalScale",
             "occlusionStrength",
             "metallicFactor",
@@ -2193,6 +2229,12 @@ export async function createGpuAnimationRenderer(
         staged[offset + 21] = record.alphaMode === "BLEND" ? 1 : 0;
         const uv = uvTransform(input.uvTransform ?? record.transform);
         staged.set([uv[0], uv[2], uv[4], 0, uv[1], uv[3], uv[5], 0], offset + 24);
+        if (textureTransforms) {
+          const overrides = snapshotAnimationMapTransforms(input.mapTransforms, record.mapFields, record.mapMask, record.uvExcluded);
+          packAnimationMapTransforms(record.mapDefaults, overrides, uv, staged, offset + uvOffset / 4);
+        } else if (input.mapTransforms !== undefined) {
+          fail("ANIMATION_RENDER_OPTIONS", "Enable textureTransforms before supplying draw map transforms");
+        }
         const determinant =
           world[0] * (world[5] * world[10] - world[9] * world[6]) -
           world[4] * (world[1] * world[10] - world[9] * world[2]) +
@@ -2474,6 +2516,7 @@ export async function createGpuAnimationRenderer(
     threeLights,
     instancing,
     renderBundles,
+    textureTransforms,
     get bundleDiagnostics() { return bundleCache?.diagnostics ?? null; },
     clearRenderBundles() {
       live();

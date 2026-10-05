@@ -320,6 +320,7 @@ export {extractAnimationRootMotion,applyAnimationRootMotion,createAnimationRootM
       "animation_webgpu.mjs",
       "animation_render.mjs",
       "animation_clipping.mjs",
+      "animation_uv.mjs",
       "animation_render_bundles.mjs",
       "gpu_buffer_geometry.mjs",
       "animation_scene.mjs",

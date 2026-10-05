@@ -31,7 +31,7 @@ export class BufferGeometryGpuError extends Error {
 }
 const fail = (code, message) => { throw new BufferGeometryGpuError('GEOMETRY_GPU_' + code, message); };
 const states = new WeakMap(), instanceStates = new WeakMap();
-const FIELDS = Object.freeze({position: [0, 3], normal: [1, 3], tangent: [2, 4], uv: [3, 2], color: [4, 0]});
+const FIELDS = Object.freeze({position: [0, 3], normal: [1, 3], tangent: [2, 4], uv: [3, 2], color: [4, 0], uv1: [10, 2], uv2: [11, 2], uv3: [12, 2]});
 const align4 = n => Math.ceil(n / 4) * 4;
 function integer(n, min, max, name) {
   if (!Number.isSafeInteger(n) || n < min || n > max) fail('SHAPE', `Invalid ${name}`);
@@ -91,7 +91,8 @@ function describe(geometry) {
   const layouts = streams.map(e => Object.freeze({arrayStride: e.stride * 4, stepMode: 'vertex',
     attributes: Object.freeze(e.attributes.sort((a,b) => a.shaderLocation-b.shaderLocation).map(Object.freeze))}));
   const channels = Object.freeze({normal: !!attributes.normal, tangent: !!attributes.tangent,
-    uv: !!attributes.uv, colorSize: attributes.color?.itemSize ?? 0});
+    uv: !!attributes.uv, colorSize: attributes.color?.itemSize ?? 0,
+    ...Object.fromEntries(['uv1', 'uv2', 'uv3'].filter(name => attributes[name]).map(name => [name, true]))});
   return {owners, streams, layouts: Object.freeze(layouts), signature: JSON.stringify(layouts), channels,
     vertexCount, indexOwner, indexFormat, indexCount};
 }
