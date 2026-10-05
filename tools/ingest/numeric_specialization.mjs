@@ -5,7 +5,8 @@
  * in this source unit are rewritten, with a runtime callee-identity guard.
  * Applying this after Rollup links a chunk also covers calls across merged
  * source modules. Reachable immutable scalar helpers execute in the same Wasm
- * module as their loop. With crossModule, admitted exported functions register
+ * module as their loop. Loop-bearing helper graphs and scalar delegating roots
+ * are discovered transitively, but still need whole-function closure. With crossModule, admitted exported functions register
  * their original identity in the shared dispatcher; imported direct calls can
  * then select that same lazy Wasm instance across chunk and re-export boundaries.
  *
@@ -276,6 +277,7 @@ export function specializeNumericModule(
   const storageHints = discoverNumericStorageHints(ast);
   const helperSources = new Map();
   const helperSpans = new Map();
+  const helperDeclarations = new Map();
   for (const statement of ast.body) {
     const fn = ["ExportNamedDeclaration", "ExportDefaultDeclaration"].includes(statement.type)
       ? statement.declaration
@@ -283,6 +285,7 @@ export function specializeNumericModule(
     if (fn?.type !== "FunctionDeclaration" || !fn.id || mutations.has(fn.id.name)) continue;
     helperSources.set(fn.id.name, source.slice(fn.start, fn.end));
     helperSpans.set(fn.id.name, span(fn));
+    helperDeclarations.set(fn.id.name, fn);
   }
   // Include every identifier token, including binding/property positions skipped
   // by a semantic walker. Generated bindings cannot collide in nested scopes.
@@ -319,15 +322,27 @@ export function specializeNumericModule(
   // export-only kernels when the unit's compilation budget is small.
   const calledNames = new Set(calls.map(call => call.callee.name));
   const priority = statement => calledNames.has((statement.declaration ?? statement).id?.name) ? 0 : 1;
-  const candidates = crossModule ? [...ast.body].sort((a, b) => priority(a) - priority(b)) : ast.body;
+  const orderedCandidates = crossModule ? [...ast.body].sort((a, b) => priority(a) - priority(b)) : ast.body;
+  const directLoops = new Set(orderedCandidates.filter(statement => {
+    const fn = statement.declaration ?? statement;
+    return fn.type === "FunctionDeclaration" && hasNumericLoop(fn.body);
+  }));
+  // Do not let a new delegating root consume the last slot before a previously
+  // eligible loop function. Within both groups, retain the prior call priority.
+  const candidates = [...orderedCandidates.filter(statement => directLoops.has(statement)),
+    ...orderedCandidates.filter(statement => !directLoops.has(statement))];
   for (const statement of candidates) {
     const fn = ["ExportNamedDeclaration", "ExportDefaultDeclaration"].includes(statement.type)
       ? statement.declaration
       : statement;
     if (fn?.type !== "FunctionDeclaration" || !fn.id) continue;
-    // Discovery reaches loops under blocks/branches, but never callbacks or
-    // nested declarations. Admission still compiles the WHOLE source function.
-    if (!hasNumericLoop(fn.body)) continue;
+    // Include roots whose only iteration lives in reachable immutable helpers.
+    // Discovery never substitutes for scalar closure or callee-identity guards.
+    if (!directLoops.has(statement) && !hasNumericLoop(fn.body, helperDeclarations)) continue;
+    const sites = calls.filter((call) => call.callee.name === fn.id.name);
+    // Uncalled delegating wrappers offer no route in local-call mode. Avoid
+    // adding irrelevant candidates solely because one of their callees loops.
+    if (!directLoops.has(statement) && !sites.length && !(crossModule && exportedBindings.has(fn.id.name))) continue;
     const loops = fn.body.body.filter((node) => node.type === "ForStatement");
     const item = {
       functionName: fn.id.name,
@@ -343,7 +358,6 @@ export function specializeNumericModule(
       item.reason = "MUTABLE_FUNCTION_BINDING";
       continue;
     }
-    const sites = calls.filter((call) => call.callee.name === fn.id.name);
     if (!sites.length && !(crossModule && exportedBindings.has(fn.id.name))) {
       item.reason = "NO_LOCAL_DIRECT_CALLS";
       continue;
@@ -467,17 +481,20 @@ export function specializeNumericModule(
       item.maxLoopDepth = artifact.manifest.maxLoopDepth;
       item.lengthParameters = [...artifact.manifest.lengthParameters];
       item.indexSemantics = artifact.manifest.indexSemantics;
-      // v8 compiles the original function slice. Translate nested loop spans
-      // back into this source unit, not the legacy top-level-pass coordinate set.
-      item.loops = artifact.controlLoops.map(({ kind, depth, sourceSpan }) => ({
-        kind, depth,
-        sourceSpan: {
-          start: fn.start + sourceSpan.start,
-          end: fn.start + sourceSpan.end,
-          line: fn.loc.start.line + sourceSpan.line - 1,
-          column: sourceSpan.column + (sourceSpan.line === 1 ? fn.loc.start.column : 0),
-        },
-      }));
+      // Each helper was parsed in its OWN source slice. Never attribute its
+      // loops to the root's coordinates; keep helper identity in the report.
+      item.loops = artifact.controlLoops.map(({ kind, depth, sourceSpan, functionName }) => {
+        const owner = functionName ? helperSpans.get(functionName) : span(fn);
+        return {
+          kind, depth, ...(functionName ? { functionName } : {}),
+          sourceSpan: {
+            start: owner.start + sourceSpan.start,
+            end: owner.start + sourceSpan.end,
+            line: owner.line + sourceSpan.line - 1,
+            column: sourceSpan.column + (sourceSpan.line === 1 ? owner.column : 0),
+          },
+        };
+      });
     } else if (artifact.manifest.version === 6 || artifact.manifest.version === 7) {
       item.loopCount = artifact.manifest.loops.length;
       if (artifact.manifest.version === 7) {
