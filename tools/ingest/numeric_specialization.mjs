@@ -4,8 +4,10 @@
  * Original kernel declarations/exports/identities remain untouched. Only direct calls
  * in this source unit are rewritten, with a runtime callee-identity guard.
  * Applying this after Rollup links a chunk also covers calls across merged
- * source modules. Reachable immutable scalar helpers execute in the same Wasm
- * module as their loop. Loop-bearing helper graphs and scalar delegating roots
+ * source modules. Reachable immutable numeric helpers execute in the same Wasm
+ * module as their loop, sharing typed-array storage and per-view bounds. Array
+ * slots propagate through wrappers; no host adapter or per-helper copy is used.
+ * Loop-bearing helper graphs and scalar delegating roots
  * are discovered transitively, but still need whole-function closure. With crossModule, admitted exported functions register
  * their original identity in the shared dispatcher; imported direct calls can
  * then select that same lazy Wasm instance across chunk and re-export boundaries.
@@ -24,7 +26,7 @@ import * as acorn from "acorn";
 import * as walk from "acorn-walk";
 import { compileNumericCandidate } from "./numeric_candidate.mjs";
 import { NumericKernelCompileError } from "./numeric_kernel.mjs";
-import { hasNumericLoop } from "./numeric_loop_discovery.mjs";
+import { hasNumericLoop, discoverNumericArrayParameters } from "./numeric_loop_discovery.mjs";
 import { discoverNumericStorageHints } from "./numeric_storage_hints.mjs";
 import { planNumericLoopIslands } from "./numeric_loop_islands.mjs";
 
@@ -366,12 +368,10 @@ export function specializeNumericModule(
       item.reason = "KERNEL_BUDGET";
       continue;
     }
-    const arrays = new Set();
-    walk.simple(fn.body, {
-      MemberExpression(node) {
-        if (node.object.type === "Identifier") arrays.add(node.object.name);
-      },
-    });
+    // A source wrapper can pass an array straight to a helper without owning
+    // a subscript itself. Infer those slots across argument positions, then
+    // demand the same whole-graph compiler proof and per-invocation guards.
+    const arrays = discoverNumericArrayParameters(fn, helperDeclarations);
     const parameterTypes = fn.params.map((param) => (arrays.has(param.name) ? "f64[]" : "f64"));
     let artifact;
     try {

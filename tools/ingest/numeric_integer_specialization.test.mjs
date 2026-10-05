@@ -90,7 +90,13 @@ export function frame(count) { return forward(alias, count); }
   assert.equal(f.actual.frame(3), f.reference.frame(3));
   assert.deepEqual(f.actual.storage, f.reference.storage);
   assert.deepEqual([...f.actual.storage], [90, 2, 4, 255, 90]);
-  assert.equal(f.diagnostics()[0].kernel.wasmCalls, 1);
+  // Forwarding now executes paint privately inside its own native transaction,
+  // so the previously observed paint dispatch should never initialize.
+  assert.equal(f.diagnostics()[0].initialized, false);
+  const forwarded = f.result.report.candidates.findIndex(item => item.functionName === 'forward');
+  assert.equal(f.diagnostics()[forwarded].kernel.wasmCalls, 1);
+  assert.equal(f.diagnostics()[forwarded].kernel.fallbackCalls, 0);
+  assert.deepEqual(f.result.report.candidates[forwarded].scalarHelpers[0].parameterTypes, ['f64[]', 'f64']);
   assert.equal(f.result.report.candidates[0].controlSemantics, 'budgeted-source-order-v1');
 });
 

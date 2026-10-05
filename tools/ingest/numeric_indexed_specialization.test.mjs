@@ -244,7 +244,11 @@ test("post-link plugin emits executable indexed chunks and relocatable productio
   bundle[chunk.fileName] = chunk;
   plugin.generateBundle.call(context, { format: "es" }, bundle);
   const report = plugin.api.getReport();
-  assert.equal(report.compiledKernels, 1);
+  // The exported wrapper now closes the typed-array helper graph as well.
+  // Original direct-loop admission keeps priority; both routes stay available.
+  assert.equal(report.compiledKernels, 2);
+  assert.deepEqual(report.units[0].candidates.filter(item => item.route === "guarded-numeric-wasm")
+    .map(item => item.functionName), ["recomputeNormals", "frame"]);
   assert.equal(report.runtimeAssets.length, 2);
   assert.equal(report.units[0].candidates[0].indexSemantics, "checked-integer-full-view-v1");
   assert.equal(chunk.imports.length, 1);
