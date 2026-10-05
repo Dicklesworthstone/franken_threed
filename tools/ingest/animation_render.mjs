@@ -167,10 +167,21 @@
  * bundles; bundleDiagnostics reports host builds/reuses separately. Native
  * command memory is opaque; no exact byte-size or measured speedup is claimed.
  *
+ * clipping:true enables world-space half-space clipping for color and depth.
+ * frame.clippingPlanes and draw.clippingPlanes contain [nx,ny,nz,constant]
+ * tuples; negative signed distances are removed. draw.clipIntersection:true
+ * intersects the local removed half-spaces; global planes always union.
+ * maxClippingPlanes (default 8, maximum 64) bounds their combined count per draw.
+ * Every use snapshots planes into its own expanded draw packet; default-off
+ * renderers retain their original 256-byte packet. Plane edits/count changes
+ * need no material recompilation and remain live inside reused render bundles.
+ *
  * Host validation finishes before GPU writes. Driver errors are terminal, not
  * rollbackable. version acknowledges submission, not completion: await whenIdle()
  * for cumulative draw/deformation validation, OOM and device-loss errors.
  */
+import {animationClippingBytes, animationClippingFields, animationClippingWgsl,
+  snapshotAnimationClipping, packAnimationClipping} from "./animation_clipping.mjs";
 import {createAnimationRenderBundleCache, encodeAnimationDraws} from "./animation_render_bundles.mjs";
 import {bufferGeometrySnapshot, instanceAttributesSnapshot} from "./gpu_buffer_geometry.mjs";
 import {
@@ -311,6 +322,7 @@ function surfaceShader(
   indirectLights = false,
   threeLights = false,
   fogCode = "",
+  clippingCapacity = 0,
 ) {
   const nativeInstances = geometryChannels?.instanced === true;
   const instanceColor = geometryChannels?.instanceColor === true;
@@ -442,7 +454,7 @@ fn illuminate(base: vec3<f32>, position: vec3<f32>, normal: vec3<f32>, metallic:
   return /* wgsl */ `
 ${phong ? "// Matrix padding at words 51/55/59: AO strength, specular G, specular B.\nstruct PhongNormal { x: vec3<f32>, strength: f32, y: vec3<f32>, specular_g: f32, z: vec3<f32>, specular_b: f32 }\n" : occluded ? "// Same 48-byte layout as mat3x3; the first column padding holds material strength.\nstruct OcclusionNormal { x: vec3<f32>, strength: f32, y: vec3<f32>, pad0: f32, z: vec3<f32>, pad1: f32 }\n" : ""}struct DrawInfo {
   clip_from_local: mat4x4<f32>, color: vec4<f32>, options: vec4<f32>, uv_x: vec4<f32>, uv_y: vec4<f32>,
-  world_from_local: mat4x4<f32>, normal_from_local: ${phong ? "PhongNormal" : occluded ? "OcclusionNormal" : "mat3x3<f32>"}, emission_roughness: vec4<f32>
+  world_from_local: mat4x4<f32>, normal_from_local: ${phong ? "PhongNormal" : occluded ? "OcclusionNormal" : "mat3x3<f32>"}, emission_roughness: vec4<f32>${clippingCapacity ? animationClippingFields(clippingCapacity) : ""}
 }
 ${
   instanceStride
@@ -452,10 +464,10 @@ var<private> draw_info: DrawInfo;`
     : "@group(0) @binding(0) var<uniform> draw_info: DrawInfo;"
 }
 ${declarations}${coated ? "\n@group(1) @binding(16) var<uniform> clearcoat_info: vec4<f32>;" : ""}
-${lighting}${fogCode}
+${lighting}${fogCode}${clippingCapacity ? animationClippingWgsl() : ""}
 struct VertexOutput {
   @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) color: vec4<f32>,${instanceStride ? `\n  @location(${coated ? 13 : 10}) @interpolate(flat) draw_index: u32,` : ""}
-  ${lit ? "@location(2) world: vec3<f32>, @location(3) normal: vec3<f32>," : ""}
+  ${lit || clippingCapacity ? "@location(2) world: vec3<f32>," : ""}${lit ? " @location(3) normal: vec3<f32>," : ""}
   ${tangentAttribute ? "@location(4) tangent: vec4<f32>," : ""}${fogCode ? "\n  @location(14) fog_depth: f32," : ""}
   ${mapSlots(coordinateMask)
     .map((slot) => `@location(${5 + slot}) uv_${slot}: vec2<f32>,`)
@@ -478,7 +490,8 @@ struct VertexOutput {
   ${uvAttribute ? "out.uv = vec2<f32>(dot(draw_info.uv_x.xyz, vec3<f32>(uv, 1.0)), dot(draw_info.uv_y.xyz, vec3<f32>(uv, 1.0)));" : "out.uv = vec2<f32>(0.0);"}
   out.color = ${colorWidth === 3 ? "vec4<f32>(color, 1.0)" : colorWidth === 4 ? "color" : "vec4<f32>(1.0)"};
   ${instanceColor ? "out.color = vec4<f32>(out.color.rgb * instance_color, out.color.a);" : ""}
-  ${lit ? "out.world = (draw_info.world_from_local * " + localPosition + ").xyz;\n  out.normal = " + (occluded || phong ? "mat3x3<f32>(draw_info.normal_from_local.x, draw_info.normal_from_local.y, draw_info.normal_from_local.z)" : "draw_info.normal_from_local") + " * " + localNormal + ";" : ""}
+  ${lit || clippingCapacity ? "out.world = (draw_info.world_from_local * " + localPosition + ").xyz;" : ""}
+  ${lit ? "out.normal = " + (occluded || phong ? "mat3x3<f32>(draw_info.normal_from_local.x, draw_info.normal_from_local.y, draw_info.normal_from_local.z)" : "draw_info.normal_from_local") + " * " + localNormal + ";" : ""}
   ${tangentAttribute ? "out.tangent = vec4<f32>((draw_info.world_from_local * vec4<f32>(" + localTangent + ", 0.0)).xyz, tangent.w * draw_info.uv_y.w);" : ""}
   ${mapSlots(coordinateMask)
     .map(
@@ -568,7 +581,7 @@ struct VertexOutput {
   }`
       : "let rgb = rgba.rgb;"
   }
-  ${toon ? "if (draw_info.options.x >= 0.0 && rgba.a < draw_info.options.x) { discard; }\n  " : ""}${depthOnly ? "" : "return vec4<f32>(" + (fogCode ? "apply_distance_fog(rgb, input.fog_depth)" : "rgb") + ", select(1.0, rgba.a, draw_info.options.y > 0.0));"}
+  ${toon ? "if (draw_info.options.x >= 0.0 && rgba.a < draw_info.options.x) { discard; }\n  " : ""}${clippingCapacity ? "if (animation_clipped(input.world)) { discard; }\n  " : ""}${depthOnly ? "" : "return vec4<f32>(" + (fogCode ? "apply_distance_fog(rgb, input.fog_depth)" : "rgb") + ", select(1.0, rgba.a, draw_info.options.y > 0.0));"}
 }
 `;
 }
@@ -796,6 +809,8 @@ export async function createGpuAnimationRenderer(
     shadows = false,
     environment = false,
     fog = false,
+    clipping = false,
+    maxClippingPlanes = 8,
     indirectLights = false,
     threeLights = false,
     instancing = false,
@@ -850,6 +865,10 @@ export async function createGpuAnimationRenderer(
   integer(maxDraws, 1, 65536, "draw capacity");
   integer(maxMeshes, 1, 65536, "mesh capacity");
   integer(maxBytes, 1, Number.MAX_SAFE_INTEGER, "byte budget");
+  if (typeof clipping !== "boolean")
+    fail("ANIMATION_RENDER_OPTIONS", "clipping must be boolean");
+  const clippingBytes = animationClippingBytes(maxClippingPlanes);
+  const packetBytes = UNIFORM_BYTES + (clipping ? clippingBytes : 0);
   const limits = device.limits;
   const limit = (name, needed) => {
     if (!Number.isSafeInteger(limits[name]) || limits[name] < needed)
@@ -860,12 +879,13 @@ export async function createGpuAnimationRenderer(
     fail("ANIMATION_RENDER_LIMIT", "Uniform alignment must be a power of two");
   if ((alignment & (alignment - 1)) !== 0)
     fail("ANIMATION_RENDER_LIMIT", "Uniform alignment must be a power of two");
-  const stride = Math.ceil(UNIFORM_BYTES / alignment) * alignment,
+  const stride = Math.ceil(packetBytes / alignment) * alignment,
     arenaBytes = stride * maxDraws;
   limit("maxBufferSize", arenaBytes);
-  limit("maxUniformBufferBindingSize", UNIFORM_BYTES);
+  limit("maxUniformBufferBindingSize", packetBytes);
   limit("maxDynamicUniformBuffersPerPipelineLayout", 1);
   limit("maxBindGroups", 1);
+  if (clipping) limit("maxInterStageShaderVariables", 3);
   limit("maxUniformBuffersPerShaderStage", 1 + Number(fog));
   if (fog) {
     limit("maxBindingsPerBindGroup", 2);
@@ -1092,9 +1112,9 @@ export async function createGpuAnimationRenderer(
     if (nativeInstances && instancing && !instanceUniformLayout) {
       const layout = device.createBindGroupLayout({label, entries: [{binding: 0,
         visibility: VERTEX_STAGE | FRAGMENT_STAGE,
-        buffer: {type: "uniform", hasDynamicOffset: true, minBindingSize: UNIFORM_BYTES}}, ...fogLayoutEntries()]});
+        buffer: {type: "uniform", hasDynamicOffset: true, minBindingSize: packetBytes}}, ...fogLayoutEntries()]});
       const group = device.createBindGroup({label, layout, entries: [{binding: 0,
-        resource: {buffer: uniformBuffer, size: UNIFORM_BYTES}}, ...fogBindingEntries()]});
+        resource: {buffer: uniformBuffer, size: packetBytes}}, ...fogBindingEntries()]});
       instanceUniformLayout = layout; instanceBindGroup = group;
     }
     const drawLayout = nativeInstances && instancing ? instanceUniformLayout : uniformLayout;
@@ -1164,7 +1184,7 @@ export async function createGpuAnimationRenderer(
     const module = device.createShaderModule({
       label,
       code:
-        fog || nativeInstances || instancing || lit || attributes || format === null
+        clipping || fog || nativeInstances || instancing || lit || attributes || format === null
           ? surfaceShader(
               mapMask,
               lit,
@@ -1183,6 +1203,7 @@ export async function createGpuAnimationRenderer(
               indirectLights,
               threeLights,
               fogCode,
+              clipping ? maxClippingPlanes : 0,
             )
           : ANIMATION_RENDER_WGSL,
     });
@@ -1423,7 +1444,7 @@ export async function createGpuAnimationRenderer(
             visibility: VERTEX_STAGE | FRAGMENT_STAGE,
             buffer: instancing
               ? { type: "read-only-storage", minBindingSize: stride }
-              : { type: "uniform", hasDynamicOffset: true, minBindingSize: UNIFORM_BYTES },
+              : { type: "uniform", hasDynamicOffset: true, minBindingSize: packetBytes },
           },
           ...fogLayoutEntries(),
         ],
@@ -1434,7 +1455,7 @@ export async function createGpuAnimationRenderer(
         entries: [
           {
             binding: 0,
-            resource: { buffer: uniformBuffer, size: instancing ? arenaBytes : UNIFORM_BYTES },
+            resource: { buffer: uniformBuffer, size: instancing ? arenaBytes : packetBytes },
           },
           ...fogBindingEntries(),
         ],
@@ -1996,9 +2017,13 @@ export async function createGpuAnimationRenderer(
           "environment",
           "fog",
           "renderBundles",
+          "clippingPlanes",
         ],
         "frame",
       );
+      const globalPlanes = snapshotAnimationClipping(frame.clippingPlanes, maxClippingPlanes);
+      if (!clipping && globalPlanes.length)
+        fail("ANIMATION_RENDER_OPTIONS", "Enable clipping before supplying planes");
       const {
         colorView,
         depthView,
@@ -2117,6 +2142,8 @@ export async function createGpuAnimationRenderer(
             "specularColor",
             "shininess",
             "alphaCutoff",
+            "clippingPlanes",
+            "clipIntersection",
           ],
           "draw",
         );
@@ -2146,6 +2173,17 @@ export async function createGpuAnimationRenderer(
               fail("ANIMATION_RENDER_VALUE", "Clip matrix overflows f32");
             staged[offset + column * 4 + row] = value;
           }
+        if (clipping) {
+          packAnimationClipping(globalPlanes, input.clippingPlanes, input.clipIntersection === undefined ? false : input.clipIntersection,
+            staged, offset + UNIFORM_BYTES / 4, maxClippingPlanes);
+          for (let k = 0; k < 16; k++) {
+            if (!Number.isFinite(Math.fround(world[k])))
+              fail("ANIMATION_RENDER_VALUE", "World transform exceeds f32");
+            staged[offset + 32 + k] = world[k];
+          }
+        } else if (input.clippingPlanes !== undefined || input.clipIntersection !== undefined) {
+          fail("ANIMATION_RENDER_OPTIONS", "Enable clipping before supplying draw planes");
+        }
         staged.set(rgba, offset + 16);
         if (input.alphaCutoff !== undefined && record.alphaMode !== "MASK")
           fail("ANIMATION_RENDER_OPTIONS", "Alpha cutoff override requires MASK shading");
@@ -2366,7 +2404,7 @@ export async function createGpuAnimationRenderer(
             0,
             staged,
             0,
-            ((draws.length - 1) * stride) / 4 + UNIFORM_BYTES / 4,
+            ((draws.length - 1) * stride) / 4 + packetBytes / 4,
           );
         // Reset disabled frames too: a prior fogged submission must not leak
         // into a later unfogged span. Queue writes precede their consuming submit.
