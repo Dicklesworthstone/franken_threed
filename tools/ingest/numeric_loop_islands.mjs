@@ -30,8 +30,14 @@ function pattern(node, names) {
 // at the source boundary. No initializer values or constness are assumed.
 function scopeBindings() {
   const cache = new WeakMap();
-  return node => {
-    if (cache.has(node)) return cache.get(node);
+  return (node, position) => {
+    // Parameter initializers do not see body var bindings; switch discriminants
+    // do not see case-block lexical bindings. Treating either as a capture could
+    // hoist a global getter out of the original loop and change its effects.
+    const parametersOnly = FUNCTIONS.has(node.type) && !contains(node.body, position);
+    const switchHead = node.type === 'SwitchStatement' && contains(node.discriminant, position);
+    const key = parametersOnly ? node.params : switchHead ? node.discriminant : node;
+    if (cache.has(key)) return cache.get(key);
     const names = new Set();
     function declaration(statement) {
       const value = statement.declaration ?? statement;
@@ -41,7 +47,7 @@ function scopeBindings() {
     }
     if (node.type === 'Program' || node.type === 'BlockStatement' || node.type === 'StaticBlock')
       node.body.forEach(declaration);
-    if (node.type === 'SwitchStatement') node.cases.forEach(c => c.consequent.forEach(declaration));
+    if (node.type === 'SwitchStatement' && !switchHead) node.cases.forEach(c => c.consequent.forEach(declaration));
     if (node.type === 'CatchClause') pattern(node.param, names);
     if (node.type === 'ForStatement' && node.init?.type === 'VariableDeclaration') declaration(node.init);
     if (['ForInStatement', 'ForOfStatement'].includes(node.type) && node.left.type === 'VariableDeclaration')
@@ -51,7 +57,7 @@ function scopeBindings() {
       pattern(node.id, names);
     }
     if (node.type === 'ClassDeclaration' || node.type === 'ClassExpression') pattern(node.id, names);
-    if (node.type === 'Program' || FUNCTIONS.has(node.type) || node.type === 'StaticBlock') {
+    if (node.type === 'Program' || (FUNCTIONS.has(node.type) && !parametersOnly) || node.type === 'StaticBlock') {
       // var may be declared in a different branch/block of this function. Do
       // not borrow declarations from a nested function or class static block.
       walk.recursive(FUNCTIONS.has(node.type) ? node.body : node, null, {
@@ -65,7 +71,7 @@ function scopeBindings() {
         },
       });
     }
-    cache.set(node, names);
+    cache.set(key, names);
     return names;
   };
 }
@@ -104,7 +110,7 @@ function capturesFor(loop, ancestors, bindings) {
   // numeric compiler independently resolves every reference in the whole loop.
   if (captures.some(name => assigned.has(name))) return {refusal:'ISLAND_OUTER_SCALAR_WRITE'};
   if (captures.length > 64) return {refusal:'ISLAND_CAPTURE_BUDGET'};
-  if (captures.some(name => name === 'arguments' || !ancestors.some(node => bindings(node).has(name))))
+  if (captures.some(name => name === 'arguments' || !ancestors.some(node => bindings(node, loop).has(name))))
     return {refusal:'ISLAND_NONLEXICAL_CAPTURE'};
   return {captures, arrays, usesMath};
 }
