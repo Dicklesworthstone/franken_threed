@@ -548,7 +548,7 @@ export function specializeNumericModule(
   if (loopIslands) {
     const planned = planNumericLoopIslands(source, {
       ast, fresh, sourceName, maxKernels: maxKernels - report.compiledKernels,
-      maxMemoryPages, maxIterations, reservedEdits: edits,
+      maxMemoryPages, maxIterations, reservedEdits: edits, helperSources, helperDeclarations,
       excludedSpans: report.candidates.filter(item => item.route === "guarded-numeric-wasm").map(item => item.sourceSpan),
     });
     report.functionKernels = report.compiledKernels;

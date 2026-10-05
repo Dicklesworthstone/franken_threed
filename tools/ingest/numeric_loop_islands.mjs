@@ -8,6 +8,7 @@ import * as walk from 'acorn-walk';
 import {compileNumericCandidate} from './numeric_candidate.mjs';
 import {NumericKernelCompileError} from './numeric_kernel.mjs';
 import {discoverNumericStorageHints} from './numeric_storage_hints.mjs';
+import {discoverNumericArrayParameters} from './numeric_loop_discovery.mjs';
 
 const FUNCTIONS = new Set(['FunctionDeclaration', 'FunctionExpression', 'ArrowFunctionExpression']);
 const LOOPS = new Set(['ForStatement', 'WhileStatement', 'DoWhileStatement']);
@@ -80,10 +81,23 @@ function scopeBindings() {
   };
 }
 
-function capturesFor(loop, ancestors, bindings) {
+function capturesFor(loop, ancestors, bindings, helperDeclarations) {
   const locals = new Set(), references = [], arrays = new Set(), assigned = new Set();
   let refusal = null, usesMath = false;
-  walk.fullAncestor(loop, (node) => {
+  const ownerOf = (name, scopes, position) => [...scopes].reverse()
+    .find(scope => bindings(scope, position).has(name));
+  walk.fullAncestor(loop, (node, _state, innerAncestors) => {
+    if (node.type === 'CallExpression' && node.callee.type === 'Identifier' &&
+        helperDeclarations.has(node.callee.name)) {
+      const owner = ownerOf(node.callee.name, [...ancestors, ...innerAncestors.slice(0, -1)], node);
+      // The compiler resolves bindings INSIDE the extracted region. A helper
+      // outside it must resolve to the proven module declaration, not to a
+      // callback parameter, catch binding, block function, import or body var.
+      // Check EACH call: the union of inner locals below can hide an outer
+      // capture when a disjoint block declares the same spelling.
+      if (owner !== ancestors[0] && (!owner || !contains(loop, owner)))
+        refusal = 'ISLAND_SHADOWED_HELPER';
+    }
     if (node.type === 'VariableDeclaration') {
       if (node.kind === 'var') refusal = 'ISLAND_ESCAPING_DECLARATION';
       for (const d of node.declarations) pattern(d.id, locals);
@@ -108,7 +122,15 @@ function capturesFor(loop, ancestors, bindings) {
   if (refusal) return {refusal};
   if (usesMath && locals.has('Math')) return {refusal:'ISLAND_LOCAL_MATH'};
   const captures = [...new Set(references.sort((a,b) => a.start-b.start).map(n => n.name))]
-    .filter(name => !locals.has(name) && !(usesMath && name === 'Math'));
+    .filter(name => !locals.has(name) && !(usesMath && name === 'Math') &&
+      !(helperDeclarations.has(name) && ownerOf(name, ancestors, loop) === ancestors[0]));
+  // Helpers can be the only code that subscripts a captured view. Slot
+  // discovery proposes types; the closed compiler still proves all accesses.
+  if (helperDeclarations.size) {
+    for (const name of discoverNumericArrayParameters({
+      params:captures.map(name => ({type:'Identifier', name})), body:loop,
+    }, helperDeclarations)) arrays.add(name);
+  }
   // A syntactic union of inner declarations can cause conservative refusals
   // under shadowing; it cannot authorize a missing lexical binding, because the
   // numeric compiler independently resolves every reference in the whole loop.
@@ -132,15 +154,30 @@ function capturesFor(loop, ancestors, bindings) {
  * Called after whole-function discovery so its admitted regions keep priority.
  * maxKernels is the remaining shared unit budget. fresh must reserve names
  * against every original identifier token, including property/binding positions.
+ * helperSources/helperDeclarations must be the matching immutable MODULE
+ * declarations proved by the caller. This planner independently resolves each
+ * root call's lexical owner; the numeric compiler closes the transitive graph.
  */
 export function planNumericLoopIslands(source, {
   ast, fresh, sourceName = '<module>', maxKernels = 64, maxMemoryPages = 1024,
   maxIterations = 1000000, excludedSpans = [], reservedEdits = [],
+  helperSources = new Map(), helperDeclarations = new Map(),
 }) {
   const report = {version:1, scope:'closed-loop-statements-in-original-lexical-environment',
     compiledKernels:0, candidates:[], accelerated:false};
   const edits = [], registrations = [], runtimeImports = [], accepted = [];
   const candidates = [], bindings = scopeBindings(), hints = discoverNumericStorageHints(ast);
+  const helperMath = new Map();
+  function usesHelperMath(name) {
+    if (!helperMath.has(name)) {
+      let uses = false;
+      walk.simple(helperDeclarations.get(name).body, {
+        MemberExpression(node) { if (node.object.type === 'Identifier' && node.object.name === 'Math') uses = true; },
+      });
+      helperMath.set(name, uses);
+    }
+    return helperMath.get(name);
+  }
   walk.fullAncestor(ast, (node, _state, ancestors) => {
     if (LOOPS.has(node.type)) candidates.push({node, ancestors:ancestors.slice(0,-1)});
     // A sequence is closed only if ALL its statements are closed. Combining
@@ -174,7 +211,7 @@ export function planNumericLoopIslands(source, {
     if (report.compiledKernels >= maxKernels) { item.reason='KERNEL_BUDGET'; continue; }
     if (ancestors.at(-1)?.type === 'LabeledStatement') { item.reason='ISLAND_LABELED_LOOP'; continue; }
     if (reservedEdits.some(edit => contains(node,edit))) { item.reason='ISLAND_EXISTING_CALL_ROUTE'; continue; }
-    const closure = capturesFor(node, ancestors, bindings);
+    const closure = capturesFor(node, ancestors, bindings, helperDeclarations);
     if (closure.refusal) { item.reason=closure.refusal; continue; }
     const {captures, arrays, usesMath, scalarOutputs} = closure;
     const inputs = captures.filter(name => !scalarOutputs.includes(name));
@@ -186,7 +223,7 @@ export function planNumericLoopIslands(source, {
     const kernelSource = `function ${functionName}(${parameters.join(',')}) {\n${prologue}\n${source.slice(node.start,node.end)}\n${epilogue}\n}`;
     const parameterTypes = parameters.map(name => arrays.has(name) || name === stateName ? 'f64[]' : 'f64');
     const compile = types => compileNumericCandidate(kernelSource, {
-      parameterTypes:types, allowMath:usesMath, generalControl:true,
+      parameterTypes:types, helperSources, allowMath:usesMath || helperSources.size > 0, generalControl:true,
       maxMemoryPages, maxIterations, sourceName:`${sourceName}:loop@${node.start}`,
     });
     let artifact;
@@ -216,11 +253,15 @@ export function planNumericLoopIslands(source, {
       runtimeImports.push(`createNumericLoopDispatch as ${createName}`);
     }
     const token=fresh('loop_token');
-    registrations.push(`var ${token} = ${createName}([${artifact.wasm.join(',')}], ${JSON.stringify(alternatives)});`);
+    // A helper resolves Math in the MODULE, not in this callback's environment.
+    // Capture that resolver lazily at module registration, without reading its
+    // value during initialization (including ESM cycles and lexical TDZ).
+    const moduleMath = !!artifact.manifest.mathIntrinsics && artifact.helpers.some(helper => usesHelperMath(helper.name));
+    registrations.push(`var ${token} = ${createName}([${artifact.wasm.join(',')}], ${JSON.stringify(alternatives)}${moduleMath ? ', () => Math' : ''});`);
     // An extra block prevents a dangling else from rebinding to our predicate.
     // The original statement (including lexical declarations and comments) is
     // unchanged in the fallback. Capture failures have no source effects.
-    const mathResolver=artifact.manifest.mathIntrinsics ? '() => Math' : 'null';
+    const mathResolver=usesMath && artifact.manifest.mathIntrinsics ? '() => Math' : 'null';
     if (stateName) {
       if (!stateDispatchName) {
         stateDispatchName=fresh('dispatch_state_loop');
@@ -248,6 +289,11 @@ export function planNumericLoopIslands(source, {
       variants:[{parameterTypes,wasmBytes:artifact.wasm.length}, ...alternatives.map(v =>
         ({parameterTypes:v.parameterTypes,wasmBytes:v.bytes.length}))],
       ...(artifact.manifest.mathIntrinsics ? {mathIntrinsics:[...artifact.manifest.mathIntrinsics]} : {}),
+      ...(artifact.helpers.length ? {
+        helperBindingSemantics:'immutable-module-declarations',
+        helpers:artifact.helpers.map(helper => ({...helper, sourceSpan:span(helperDeclarations.get(helper.name))})),
+        ...(moduleMath ? {helperMathBinding:'live-module-lexical-environment'} : {}),
+      } : {}),
     });
     item.wasmBytes=item.variants.reduce((sum,v) => sum+v.wasmBytes,0);
   }

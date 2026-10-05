@@ -204,12 +204,27 @@ const loopRecords = new WeakMap();
  * bindings; no property/global-object access, coercion or application call.
  * The producer must exclude returns, escaping control and outer scalar writes.
  * Registration starts no Wasm/GPU work. Each token owns one bounded AOT family.
+ * resolveHelperMath, when supplied, closes over the immutable helper graph's
+ * module environment. The per-invocation resolver remains in the loop's own
+ * lexical environment; neither binding is read until a guarded native attempt.
  */
-export function createNumericLoopDispatch(bytes, alternatives = []) {
+export function createNumericLoopDispatch(bytes, alternatives = [], resolveHelperMath = null) {
+  if (resolveHelperMath !== null && typeof resolveHelperMath !== "function")
+    throw new TypeError("resolveHelperMath must be a function or null");
   const record = { active: false, resolveMath: null, captureMisses: 0, reentrantMisses: 0 };
   record.fallback = () => retainedLoop;
   record.dispatch = createNumericDispatch(record.fallback, bytes, alternatives,
-    () => record.resolveMath === null ? undefined : record.resolveMath(), true);
+    () => {
+      // The runtime checks the global Math descriptor BEFORE invoking this
+      // resolver. These compiler-produced closures only read lexical bindings.
+      // A helper's module binding and a callback's local binding must BOTH be
+      // the guarded intrinsic object when both are used. Never evaluate a
+      // callback's unrelated/shadowed Math for a helper-only intrinsic call.
+      const local = record.resolveMath === null ? undefined : record.resolveMath();
+      if (resolveHelperMath === null) return local;
+      const helper = resolveHelperMath();
+      return record.resolveMath === null || local === helper ? helper : undefined;
+    }, true);
   const token = Object.freeze({});
   loopRecords.set(token, record);
   return token;
