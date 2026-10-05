@@ -10,9 +10,10 @@
  * then select that same lazy Wasm instance across chunk and re-export boundaries.
  *
  * loopIslands additionally compiles closed for/while/do-while statements inside
- * retained callbacks, closures and methods. Only array outputs may escape; outer
- * scalar writes, property captures, returns and yielding control remain in JS.
- * The original loop stays at the same source boundary as its guarded fallback.
+ * retained callbacks, closures and methods. Adjacent closed loops share one
+ * native transaction. Array outputs and mutable numeric lexical bindings are
+ * published at the original boundary; property access, escaping returns and
+ * yielding control stay in JS. The original statements remain the fallback.
  *
  * Array types are speculative: native type, ownership, alias and length
  * guards decide each invocation. Unsupported code is retained, never rejected

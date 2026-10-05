@@ -200,7 +200,7 @@ test('replacement blocks preserve dangling else and outer labeled control',async
 });
 
 for(const [name,body,params] of [
-  ['outer scalar writes','let sum=0;for(let i=0;i<a.length;i++){sum+=a[i];a[i]=sum;}return sum;','a'],
+  ['immutable scalar writes','const sum=0;for(let i=0;i<a.length;i++){sum+=a[i];a[i]=sum;}return sum;','a'],
   ['escaping var','for(var i=0;i<a.length;i++)a[i]=i;return i;','a'],
   ['return','for(let i=0;i<a.length;i++){a[i]=i;if(i===1)return a;}','a'],
   ['yield inside loop','for(let i=0;i<a.length;i++){a[i]++;yield i;}','a'],

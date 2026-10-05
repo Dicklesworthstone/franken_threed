@@ -129,7 +129,13 @@ export function numericKernelRollupPlugin(options = {}) {
           "dispatchNumericCall",
         ] : []),
         ...(result.report.importedCalls?.length ? ["dispatchImportedNumericCall"] : []),
-        ...(result.report.loopIslands?.compiledKernels ? ["createNumericLoopDispatch", "dispatchNumericLoop"] : []),
+        ...(result.report.loopIslands?.compiledKernels ? [
+          "createNumericLoopDispatch",
+          ...(result.report.loopIslands.candidates.some(item => item.route === "guarded-loop-wasm" && !item.scalarOutputs)
+            ? ["dispatchNumericLoop"] : []),
+          ...(result.report.loopIslands.candidates.some(item => item.route === "guarded-loop-wasm" && item.scalarOutputs)
+            ? ["dispatchNumericStateLoop"] : []),
+        ] : []),
       ];
       // Consumer-only chunks import only the lookup; producer-only chunks do
       // not pretend to call imports. Preserve any pre-existing runtime binding.
