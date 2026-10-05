@@ -9,6 +9,11 @@
  * their original identity in the shared dispatcher; imported direct calls can
  * then select that same lazy Wasm instance across chunk and re-export boundaries.
  *
+ * loopIslands additionally compiles closed for/while/do-while statements inside
+ * retained callbacks, closures and methods. Only array outputs may escape; outer
+ * scalar writes, property captures, returns and yielding control remain in JS.
+ * The original loop stays at the same source boundary as its guarded fallback.
+ *
  * Array types are speculative: native type, ownership, alias and length
  * guards decide each invocation. Unsupported code is retained, never rejected
  * as an application feature. This is not a whole-application acceleration claim.
@@ -19,6 +24,7 @@ import { compileNumericCandidate } from "./numeric_candidate.mjs";
 import { NumericKernelCompileError } from "./numeric_kernel.mjs";
 import { hasNumericLoop } from "./numeric_loop_discovery.mjs";
 import { discoverNumericStorageHints } from "./numeric_storage_hints.mjs";
+import { planNumericLoopIslands } from "./numeric_loop_islands.mjs";
 
 function span(node) {
   return {
@@ -125,7 +131,7 @@ function indexedLayouts(fn, parameters) {
 
 /**
  * @param {string} source ESM source (or an ES-format rendered Rollup chunk)
- * @param {{sourceName?: string, runtimeModule?: string | (() => string), maxKernels?: number, maxMemoryPages?: number, maxIterations?: number, crossModule?: boolean}} options
+ * @param {{sourceName?: string, runtimeModule?: string | (() => string), maxKernels?: number, maxMemoryPages?: number, maxIterations?: number, crossModule?: boolean, loopIslands?: boolean}} options
  * @returns {{code: string, changed: boolean, report: object}}
  */
 export function specializeNumericModule(
@@ -137,6 +143,7 @@ export function specializeNumericModule(
     maxMemoryPages = 1024,
     maxIterations = 1000000,
     crossModule = false,
+    loopIslands = false,
   } = {},
 ) {
   if (typeof source !== "string")
@@ -157,6 +164,8 @@ export function specializeNumericModule(
     throw new RangeError("maxIterations must be between 1 and 1000000000");
   if (typeof crossModule !== "boolean")
     throw new TypeError("crossModule must be a boolean");
+  if (typeof loopIslands !== "boolean")
+    throw new TypeError("loopIslands must be a boolean");
   const report = {
     version: 1,
     sourceName: String(sourceName),
@@ -517,6 +526,19 @@ export function specializeNumericModule(
   if (report.compiledKernels) {
     runtimeImports.push(`${crossModule ? "registerNumericDispatch" : "createNumericDispatch"} as ${createName}`,
       `dispatchNumericCall as ${dispatchName}`);
+  }
+  if (loopIslands) {
+    const planned = planNumericLoopIslands(source, {
+      ast, fresh, sourceName, maxKernels: maxKernels - report.compiledKernels,
+      maxMemoryPages, maxIterations, reservedEdits: edits,
+      excludedSpans: report.candidates.filter(item => item.route === "guarded-numeric-wasm").map(item => item.sourceSpan),
+    });
+    report.functionKernels = report.compiledKernels;
+    report.loopIslands = planned.report;
+    report.compiledKernels += planned.report.compiledKernels;
+    edits.push(...planned.edits);
+    registrations.push(...planned.registrations);
+    runtimeImports.push(...planned.runtimeImports);
   }
   if (crossModule) {
     const sites = calls.filter(call => importedBindings.has(call.callee.name));
