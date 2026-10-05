@@ -21,6 +21,19 @@ const positive = (v, label) => {
   return v;
 };
 const same = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]);
+// The public r186 build exports lights, but not their shadow constructors.
+// Derive the native class from a fresh public light, never from the inspected
+// shadow (which could carry custom hooks). Cache per source light constructor
+// so ordinary frame inspection creates no temporary source objects.
+const nativeShadowClasses = new WeakMap();
+function nativeShadowClass(C, exported) {
+  if (exported !== undefined) return exported;
+  if (!nativeShadowClasses.has(C)) {
+    const prototype = Object.getPrototypeOf(new C().shadow);
+    nativeShadowClasses.set(C, prototype.constructor);
+  }
+  return nativeShadowClasses.get(C);
+}
 
 /** Metadata admission before any native allocation. Only one projected light
  * is selected by the scene bridge; cubemaps, cascades and node hooks refuse.
@@ -28,8 +41,10 @@ const same = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]);
 export function inspectThreeShadow(light, three) {
   if (three?.REVISION !== '186') fail('SOURCE', 'Supply the pinned r186 module');
   const C = light?.isDirectionalLight ? three.DirectionalLight : light?.isSpotLight ? three.SpotLight : null;
-  const S = light?.isDirectionalLight ? three.DirectionalLightShadow : three.SpotLightShadow;
-  if (typeof C !== 'function' || !(light instanceof C) || typeof S !== 'function' || !(light.shadow instanceof S))
+  if (typeof C !== 'function' || !(light instanceof C))
+    fail('LIGHT', 'Source shadows require a native directional or spot light');
+  const S = nativeShadowClass(C, light.isDirectionalLight ? three.DirectionalLightShadow : three.SpotLightShadow);
+  if (typeof S !== 'function' || !(light.shadow instanceof S))
     fail('LIGHT', 'Source shadows require a native directional or spot light');
   const shadow = light.shadow, camera = shadow.camera;
   if (!(camera instanceof three.Camera) || camera.isArrayCamera || camera.reversedDepth ||
@@ -57,7 +72,9 @@ export function inspectThreeShadow(light, three) {
  * autoUpdate:false deliberately retains the last published map until needsUpdate.
  */
 export async function createGpuThreeShadow(device, light, {three, maxBytes = 64 * 1024 * 1024,
-  maxDraws = 1024, maxMeshes = 1024, label = 'f3d-three-shadow', signal} = {}) {
+  maxDraws = 1024, maxMeshes = 1024, label = 'f3d-three-shadow', signal, clipping = false, maxClippingPlanes = 8} = {}) {
+  if(typeof clipping!=='boolean'||!Number.isSafeInteger(maxClippingPlanes)||maxClippingPlanes<1||maxClippingPlanes>64)
+    fail('OPTIONS','Invalid clipping profile');
   const shape = inspectThreeShadow(light, three);
   positive(maxBytes, 'shadow budget'); positive(maxDraws, 'caster draw capacity'); positive(maxMeshes, 'caster binding capacity');
   if (typeof label !== 'string') fail('OPTIONS', 'Expected a shadow label');
@@ -83,7 +100,7 @@ export async function createGpuThreeShadow(device, light, {three, maxBytes = 64 
   try {
     if (signal?.aborted) onAbort(); live();
     const constructing = createGpuAnimationShadowMap(device, {
-      width: shape.width, height: shape.height, maxBytes, maxDraws, maxMeshes, label,
+      width: shape.width, height: shape.height, maxBytes, maxDraws, maxMeshes, label, ...(clipping?{clipping,maxClippingPlanes}:{}),
     }).then(value => {
       if (disposed || terminal) { value.dispose(); throw terminal ?? new ThreeShadowError('DISPOSED', 'Source shadows are disposed'); }
       map = value; return value;

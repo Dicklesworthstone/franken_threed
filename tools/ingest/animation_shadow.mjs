@@ -35,7 +35,7 @@ function matrix(value) {
 
 /** Create a bounded depth map. OPAQUE/MASK caster material options match addMesh(). */
 export async function createGpuAnimationShadowMap(device, options = {}) {
-  fields(options, ["width", "height", "maxBytes", "maxDraws", "maxMeshes", "label"]);
+  fields(options, ["width", "height", "maxBytes", "maxDraws", "maxMeshes", "label", "clipping", "maxClippingPlanes"]);
   const {
     width = 1024,
     height = width,
@@ -64,6 +64,8 @@ export async function createGpuAnimationShadowMap(device, options = {}) {
     maxDraws,
     maxMeshes,
     label,
+    clipping: options.clipping === undefined ? false : options.clipping,
+    maxClippingPlanes: options.maxClippingPlanes === undefined ? 8 : options.maxClippingPlanes,
   });
   let texture,
     view,
@@ -213,7 +215,7 @@ export async function createGpuAnimationShadowMap(device, options = {}) {
         const nextDependencies = [],
           draws = list.map((value) => {
             const input = owned.has(value) ? { mesh: value } : value;
-            fields(input, ["mesh", "worldMatrix", "baseColor", "first", "count", "uvTransform", "alphaCutoff"]);
+            fields(input, ["mesh", "worldMatrix", "baseColor", "first", "count", "uvTransform", "alphaCutoff", "clippingPlanes", "clipIntersection"]);
             const record = owned.get(input.mesh);
             if (!record || record.mesh.disposed) fail("Caster does not belong to this live map");
             const { gpu, mesh } = record,
@@ -239,7 +241,7 @@ export async function createGpuAnimationShadowMap(device, options = {}) {
             // Keep per-draw MASK thresholds live, just like the color pass.
             // The renderer validates MASK applicability and the [0,1] range
             // before any GPU writes; do not freeze the registration-time value.
-            for (const key of ["first", "count", "alphaCutoff"])
+            for (const key of ["first", "count", "alphaCutoff", "clippingPlanes", "clipIntersection"])
               if (input[key] !== undefined) draw[key] = input[key];
             return draw;
           });
