@@ -191,3 +191,61 @@ export function importedNumericDispatchDiagnostics(target) {
   const token = sharedTargets.get(target);
   return token ? numericDispatchDiagnostics(token) : null;
 }
+
+// Loop islands retain their ORIGINAL statement in the original lexical scope.
+// A private fallback marker means "execute that statement", not replay its
+// enclosing callback. Never catch a failure after kernel output publication.
+const retainedLoop = Object.freeze({});
+const loopRecords = new WeakMap();
+
+/**
+ * Compiler-only token for a void, closed loop with source-ordered array writes.
+ * resolveCaptures passed to dispatchNumericLoop may only read declarative
+ * bindings; no property/global-object access, coercion or application call.
+ * The producer must exclude returns, escaping control and outer scalar writes.
+ * Registration starts no Wasm/GPU work. Each token owns one bounded AOT family.
+ */
+export function createNumericLoopDispatch(bytes, alternatives = []) {
+  const record = { active: false, resolveMath: null, captureMisses: 0, reentrantMisses: 0 };
+  record.fallback = () => retainedLoop;
+  record.dispatch = createNumericDispatch(record.fallback, bytes, alternatives,
+    () => record.resolveMath === null ? undefined : record.resolveMath(), true);
+  const token = Object.freeze({});
+  loopRecords.set(token, record);
+  return token;
+}
+
+/**
+ * Synchronous predicate at the source loop boundary. False means no outputs
+ * were published: execute the original loop there exactly once. This includes
+ * early ESM-cycle calls, unresolved/TDZ captures, no-Wasm hosts, shape/ownership
+ * guard misses, bounds traps and exhausted native iteration budgets.
+ * Captures and the Math resolver are refreshed for EVERY invocation, including
+ * different instances of one closure. No first-call captured state is retained.
+ */
+export function dispatchNumericLoop(token, resolveCaptures, resolveMath = null) {
+  const record = loopRecords.get(token);
+  if (!record) return false;
+  if (record.active) { record.reentrantMisses++; return false; }
+  record.active = true;
+  try {
+    let args;
+    try { args = resolveCaptures(); }
+    catch { record.captureMisses++; return false; }
+    record.resolveMath = resolveMath;
+    // dispatchNumericCall only falls back before publication. In particular,
+    // do not wrap this in a catch that could replay a partially published loop.
+    return dispatchNumericCall(record.dispatch, record.fallback, args) !== retainedLoop;
+  } finally {
+    record.resolveMath = null;
+    record.active = false;
+  }
+}
+
+/** Opt-in inspection; generated applications do not add diagnostic exports. */
+export function numericLoopDispatchDiagnostics(token) {
+  const record = loopRecords.get(token);
+  if (!record) throw new TypeError("Unknown numeric loop dispatch token");
+  return Object.freeze({ ...numericDispatchDiagnostics(record.dispatch),
+    captureMisses: record.captureMisses, reentrantMisses: record.reentrantMisses });
+}
