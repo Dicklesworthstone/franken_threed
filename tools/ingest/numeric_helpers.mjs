@@ -4,6 +4,10 @@
  * conversions are admitted. Each call evaluates arguments once, left to right;
  * a helper owns its scalar parameters and lexical locals, just as in JavaScript.
  * Number bitwise operations share the kernel's exact modulo-2^32 lowering.
+ * With the caller's general-control contract, helper for/while/do-while bodies
+ * spend the SAME private invocation budget as the entry point. Helpers neither
+ * reset that budget nor call the host. Abrupt completion and lexical scopes
+ * remain source ordered; every admitted return path still produces a Number.
  */
 import * as acorn from 'acorn';
 import { BITWISE_OPS, emitBitwiseBinary, emitBitwiseNot } from './numeric_integer.mjs';
@@ -32,7 +36,7 @@ function number(value) {
  * and every statically mutable binding. Only reachable helpers are inspected.
  * Function/type index zero belongs to the caller's array-loop entry point.
  */
-export function createScalarHelperCompiler(helperSources, fail, intrinsics = null) {
+export function createScalarHelperCompiler(helperSources, fail, intrinsics = null, control = null) {
   if (!(helperSources instanceof Map)) fail('helperSources must be a Map of immutable function declarations', null, 'INVALID_KERNEL_SOURCE');
   const entries = [];
   const compiled = new Map();
@@ -67,13 +71,17 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
     return entry;
   }
 
-  function call(node, emitArgument, shadowed = false, owner = null) {
+  function call(node, emitArgument, shadowed = false, owner = null, loopDepth = 0) {
     if (node.optional || node.callee.type !== 'Identifier' || shadowed ||
         node.arguments.some(arg => arg.type === 'SpreadElement')) {
       fail('Scalar calls require an unshadowed direct immutable helper binding and positional numbers', node);
     }
     const entry = requireHelper(node.callee.name, node);
+    // Count lexical loop nesting THROUGH calls, not just within each function.
+    // Acyclic helpers compile once, but every call site's nesting is checked.
+    if (control) control.checkDepth(loopDepth + entry.loopDepth, node);
     if (owner) {
+      owner.loopDepth = Math.max(owner.loopDepth, loopDepth + entry.loopDepth);
       owner.work += entry.work;
       owner.depth = Math.max(owner.depth, entry.depth + 1);
       if (owner.work > 4096 || owner.depth > 32) fail('Scalar helper expanded call graph exceeds the work/depth limit', node);
@@ -85,12 +93,14 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
   function compileFunction(fn, owner) {
     owner.work = 1;
     owner.depth = 1;
+    owner.loopDepth = 0;
     let environment = new Map();
     fn.params.forEach((param, index) => {
       if (environment.has(param.name)) fail('Scalar helper parameters must be distinct', param);
       environment.set(param.name, { index, mutable: true });
     });
-    let localCount = 0;
+    let localCount = 0, loopDepth = 0, controlDepth = 0;
+    const loopControls = [];
     function lookup(node, writing = false) {
       if (node?.type !== 'Identifier' || !environment.has(node.name)) fail('Scalar helpers cannot access captured or non-scalar bindings', node);
       const binding = environment.get(node.name);
@@ -123,7 +133,7 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
         const intrinsic = intrinsics?.call(node, arg => expression(arg, depth + 1),
           environment.has('Math') || helperSources.has('Math'), () => fn.params.length + localCount++);
         if (intrinsic) return intrinsic;
-        return call(node, arg => expression(arg, depth + 1), environment.has(node.callee.name), owner);
+        return call(node, arg => expression(arg, depth + 1), environment.has(node.callee.name), owner, loopDepth);
       }
       fail(`Scalar helper expression ${node.type} is not closed`, node);
     }
@@ -146,13 +156,60 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
       }
       return [...number(0), ...expression(node, depth + 1), 0x99, 0x63];
     }
-    function block(statements, depth = 0) {
+    function effects(node, depth) {
+      if (!node) return [];
+      if (depth > 128) fail('Scalar helper effects exceed the nesting limit', node);
+      if (node.type === 'SequenceExpression') {
+        return node.expressions.flatMap(item => effects(item, depth + 1));
+      }
+      return block([{ type: 'ExpressionStatement', expression: node }], depth + 1).bytes;
+    }
+    function compileLoop(node, depth) {
+      if (!control) fail('Scalar helper loops require generalControl', node);
+      const parent = environment;
+      environment = new Map(parent);
+      loopDepth++;
+      owner.loopDepth = Math.max(owner.loopDepth, loopDepth);
+      try {
+        control.recordLoop(node, loopDepth, fn.id.name);
+        // The initializer's TDZ covers ALL its declarations. Its bindings live
+        // through test/body/update, but a body's shadow cannot leak into update.
+        const initial = node.init?.type === 'VariableDeclaration'
+          ? block([node.init], depth + 1, true).bytes : effects(node.init, depth + 1);
+        const predicate = node.test ? condition(node.test) : [0x41, 1];
+        const parentDepth = controlDepth;
+        loopControls.push({ breakDepth: parentDepth, continueDepth: parentDepth + 2 });
+        controlDepth += 3;
+        let body;
+        try { body = block(node.body.type === 'BlockStatement' ? node.body.body : [node.body], depth + 1); }
+        finally { controlDepth = parentDepth; loopControls.pop(); }
+        const update = effects(node.update, depth + 1);
+        const postTest = node.type === 'DoWhileStatement';
+        const test = [...predicate, 0x45, 0x0d, 1];
+        return {
+          bytes: [...initial, 0x02, 0x40, 0x03, 0x40,
+            ...(postTest ? [] : test), ...control.enterLoop(),
+            0x02, 0x40, ...body.bytes, 0x0b, ...update,
+            ...(postTest ? test : []), 0x0c, 0, 0x0b, 0x0b],
+          // Conservatively allow a loop to exit. A numeric return after the
+          // loop is required unless the surrounding branches already return.
+          // Break/continue are consumed HERE, never treated as function returns.
+          completions: new Set(['normal', ...(body.completions.has('return') ? ['return'] : [])]),
+        };
+      } finally { loopDepth--; environment = parent; }
+    }
+    function block(statements, depth = 0, retainScope = false) {
       if (depth > 128) fail('Scalar helper statements exceed the nesting limit', fn);
       const parent = environment;
       environment = new Map(parent);
       const declared = new Set();
       const bytes = [];
-      let returns = false;
+      // Track abrupt completion through branches. A return syntactically AFTER
+      // an unconditional break/continue does not establish a numeric result.
+      const completions = new Set(['normal']);
+      const advance = next => {
+        if (completions.delete('normal')) for (const kind of next) completions.add(kind);
+      };
       try {
         // Install the whole block's TDZ before compiling any initializer or call.
         for (const statement of statements) {
@@ -178,22 +235,40 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
             }
           } else if (statement.type === 'ReturnStatement') {
             bytes.push(...expression(statement.argument), 0x0f);
-            returns = true;
+            advance(['return']);
           } else if (statement.type === 'BlockStatement') {
             const nested = child(statement);
             bytes.push(...nested.bytes);
-            returns ||= nested.returns;
+            advance(nested.completions);
           } else if (statement.type === 'IfStatement') {
             const predicate = condition(statement.test);
-            const consequent = child(statement.consequent);
-            const alternate = statement.alternate ? child(statement.alternate) : null;
+            controlDepth++;
+            let consequent, alternate;
+            try {
+              consequent = child(statement.consequent);
+              alternate = statement.alternate ? child(statement.alternate) : null;
+            } finally { controlDepth--; }
             bytes.push(...predicate, 0x04, 0x40, ...consequent.bytes);
             if (alternate) bytes.push(0x05, ...alternate.bytes);
             bytes.push(0x0b);
-            returns ||= consequent.returns && !!alternate?.returns;
+            advance([...consequent.completions, ...(alternate?.completions ?? ['normal'])]);
+          } else if (control && ['ForStatement', 'WhileStatement', 'DoWhileStatement'].includes(statement.type)) {
+            const nested = compileLoop(statement, depth);
+            bytes.push(...nested.bytes);
+            advance(nested.completions);
+          } else if (control && ['BreakStatement', 'ContinueStatement'].includes(statement.type)) {
+            const target = loopControls.at(-1);
+            if (statement.label || !target) fail('Helper loop control requires an enclosing loop and no label', statement);
+            const label = statement.type === 'BreakStatement' ? target.breakDepth : target.continueDepth;
+            bytes.push(0x0c, ...u32(controlDepth - 1 - label));
+            advance([statement.type === 'BreakStatement' ? 'break' : 'continue']);
+          } else if (control && statement.type === 'EmptyStatement') {
+            // Empty bodies/for clauses still spend credit at the body boundary.
           } else {
             const update = statement.type === 'ExpressionStatement' ? statement.expression : null;
-            if (update?.type === 'UpdateExpression' && ['++', '--'].includes(update.operator)) {
+            if (control && update?.type === 'SequenceExpression') {
+              bytes.push(...effects(update, depth + 1));
+            } else if (update?.type === 'UpdateExpression' && ['++', '--'].includes(update.operator)) {
               const local = lookup(update.argument, true);
               bytes.push(...get(local), ...number(1), OPS[update.operator[0]], ...set(local));
             } else if (update?.type === 'AssignmentExpression' &&
@@ -207,8 +282,8 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
             }
           }
         }
-        return { bytes, returns };
-      } finally { environment = parent; }
+        return { bytes, completions, returns: completions.size === 1 && completions.has('return') };
+      } finally { if (!retainScope) environment = parent; }
     }
     const body = block(fn.body.body);
     if (!body.returns) fail(`Scalar helper ${fn.id.name} must return a number on every path`, fn);

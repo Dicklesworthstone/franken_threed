@@ -97,6 +97,11 @@ function member(node, object, property, computed) {
  * This mode also supports unlabeled break/continue and early returns. A
  * numeric-returning kernel needs a final numeric return; a void kernel may
  * return only without a value. Skipped stores retain their original contents.
+ * In generalControl, reachable scalar helpers may contain the same native
+ * for/while/do-while control, including early returns and break/continue. Root
+ * and helper bodies share ONE maxIterations counter per run; helper calls do
+ * not reset it. The counter is private Wasm state, reset by the entry prologue.
+ * Calls from predicates, initializers and final returns share the same budget.
  * generalControl opts into ABI v8 and implies both checkedIndexing and
  * structuredLoops. It admits for/while/do-while anywhere in closed numeric
  * control flow, including scalar-only functions, dynamic ranges/steps and
@@ -225,7 +230,47 @@ export function compileNumericKernel(source, {
   if (pipeline) indexName = null;
 
   const intrinsics = createMathIntrinsicCompiler(allowMath, fail);
-  const helperCompiler = createScalarHelperCompiler(helperSources, fail, intrinsics);
+  // A direct scalar call can reach a loop-bearing helper. In that case all
+  // functions share private global 0, reset on EACH entry (also after a trap).
+  // This scan only chooses storage, never proves closure or inspects unused
+  // helper sources. Helper-free programs retain their original local counter,
+  // bytecode and deterministic package hashes; Math member calls need no global.
+  const sharedLoopBudget = generalControl && (() => {
+    const pending = [fn.body];
+    while (pending.length) {
+      const node = pending.pop();
+      if (node.type === 'CallExpression' && node.callee.type === 'Identifier') return true;
+      for (const value of Object.values(node)) {
+        if (Array.isArray(value)) {
+          for (const child of value) if (child && typeof child.type === 'string') pending.push(child);
+        } else if (value && typeof value.type === 'string') pending.push(value);
+      }
+    }
+    return false;
+  })();
+  const control = generalControl ? {
+    enterLoop() {
+      const read = sharedLoopBudget ? [0x23, 0] : get(generalFuel);
+      const write = sharedLoopBudget ? [0x24, 0] : set(generalFuel);
+      return [...read, ...number(maxIterations), 0x66, 0x04, 0x40, 0x00, 0x0b,
+        ...read, ...number(1), 0xa0, ...write];
+    },
+    checkDepth(depth, node) {
+      if (depth > 8) fail('General control exceeds the 8-level loop/call nesting limit', node);
+      maxGeneralDepth = Math.max(maxGeneralDepth, depth);
+    },
+    recordLoop(node, depth, functionName = null) {
+      if (controlLoops.length >= 64) fail('General control exceeds the 64-loop limit', node);
+      this.checkDepth(depth, node);
+      controlLoops.push(Object.freeze({
+        kind: node.type === 'DoWhileStatement' ? 'do-while' : node.type === 'WhileStatement' ? 'while' : 'for',
+        depth, ...(functionName ? { functionName } : {}),
+        sourceSpan: Object.freeze({ start: node.start, end: node.end,
+          line: node.loc?.start.line, column: node.loc?.start.column }),
+      }));
+    },
+  } : null;
+  const helperCompiler = createScalarHelperCompiler(helperSources, fail, intrinsics, control);
   let temporaries = new Map();
   let temporaryCount = 0;
   let statementCount = 0;
@@ -367,7 +412,7 @@ export function compileNumericKernel(source, {
       if (intrinsic) return intrinsic;
       return helperCompiler.call(node, arg => expression(arg, depth + 1),
         params.has(node.callee.name) || temporaries.has(node.callee.name) ||
-        node.callee.name === indexName || node.callee.name === fn.id.name);
+        node.callee.name === indexName || node.callee.name === fn.id.name, null, generalDepth);
     }
     fail(`Unsupported expression ${node.type}; calls and implicit conversions are not closed`, node);
   }
@@ -429,20 +474,11 @@ export function compileNumericKernel(source, {
   }
 
   function compileGeneralLoop(node, depth) {
-    if (controlLoops.length >= 64 || generalDepth >= 8) {
-      fail('General control exceeds the 64-loop/8-level limit', node);
-    }
     const parentScope = temporaries;
     temporaries = new Map(parentScope);
     generalDepth++;
-    maxGeneralDepth = Math.max(maxGeneralDepth, generalDepth);
     const postTest = node.type === 'DoWhileStatement';
-    controlLoops.push(Object.freeze({
-      kind: postTest ? 'do-while' : node.type === 'WhileStatement' ? 'while' : 'for',
-      depth: generalDepth,
-      sourceSpan: Object.freeze({ start: node.start, end: node.end,
-        line: node.loc?.start.line, column: node.loc?.start.column }),
-    }));
+    control.recordLoop(node, generalDepth);
     try {
       // The entire for initializer has a lexical TDZ; these bindings remain
       // visible in the test, body and update, but never leak after the loop.
@@ -451,7 +487,7 @@ export function compileNumericKernel(source, {
         ? compileBlock([node.init], false, depth + 1, true)
         : compileEffects(node.init, depth + 1);
       const predicate = node.test ? condition(node.test) : [0x41, 1];
-      if (generalFuel === null) generalFuel = temporaryBase + temporaryCount++;
+      if (!sharedLoopBudget && generalFuel === null) generalFuel = temporaryBase + temporaryCount++;
       const body = compileLoopBody(node.body.type === 'BlockStatement' ? node.body.body : [node.body], depth + 1);
       const update = compileEffects(node.update, depth + 1);
       const test = [...predicate, 0x45, 0x0d, 1];
@@ -461,8 +497,7 @@ export function compileNumericKernel(source, {
       // Budget exhaustion aborts the transaction, never truncates the program.
       return [...initial, 0x02, 0x40, 0x03, 0x40,
         ...(postTest ? [] : test),
-        ...get(generalFuel), ...number(maxIterations), 0x66, 0x04, 0x40, 0x00, 0x0b,
-        ...get(generalFuel), ...number(1), 0xa0, ...set(generalFuel),
+        ...control.enterLoop(),
         ...body, ...update, ...(postTest ? test : []),
         0x0c, 0, 0x0b, 0x0b];
     } finally { generalDepth--; temporaries = parentScope; }
@@ -683,8 +718,10 @@ export function compileNumericKernel(source, {
     inLoop = false;
     execution = [...setup, ...emitLoop(instructions)];
   }
-  if (generalControl && !controlLoops.length) fail('General control requires at least one loop', fn.body);
   const result = resultNode ? expression(resultNode.argument) : [];
+  // A selected root may delegate all iteration to reachable closed helpers.
+  // Inspect the final result too: its helper call can contain the only loop.
+  if (generalControl && !controlLoops.length) fail('General control requires at least one loop', fn.body);
   if (writes.size === 0 && !resultNode) fail('Kernel must produce an array output or numeric return', loop.body);
   for (const name of minimumLengths.keys()) {
     if (writes.has(name)) fail('Uniform reads must not depend on an array written by the loop', loop.body);
@@ -744,6 +781,7 @@ export function compileNumericKernel(source, {
   if (temporaryCount) locals.push([...u32(temporaryCount), F64]);
   const body = [
     ...vector(locals),
+    ...(sharedLoopBudget ? [...number(0), 0x24, 0] : []),
     ...execution, ...result, 0x0b,
   ];
   const helperCode = helperCompiler.finish();
@@ -752,6 +790,7 @@ export function compileNumericKernel(source, {
     ...section(1, vector([[0x60, ...vector(types.map(type => [type])), ...(resultNode ? [1, F64] : [0])], ...helperCode.types])),
     ...section(3, vector([[0], ...helperCode.functions])),
     ...section(5, vector([[1, ...u32(1), ...u32(maxMemoryPages)]])),
+    ...(sharedLoopBudget ? section(6, vector([[F64, 1, ...number(0), 0x0b]])) : []),
     ...section(7, vector([[...text('run'), 0, 0], [...text('memory'), 2, 0]])),
     ...section(10, vector([[...u32(body.length), ...body], ...helperCode.bodies])),
     ...section(0, [...text(NUMERIC_KERNEL_SECTION), ...new TextEncoder().encode(JSON.stringify(manifest))]),
