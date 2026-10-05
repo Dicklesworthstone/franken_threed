@@ -38,25 +38,29 @@ function scopeBindings() {
     const switchHead = node.type === 'SwitchStatement' && contains(node.discriminant, position);
     const key = parametersOnly ? node.params : switchHead ? node.discriminant : node;
     if (cache.has(key)) return cache.get(key);
-    const names = new Set();
+    const names = new Map();
+    function bind(node, kind) {
+      const found = new Set(); pattern(node, found);
+      for (const name of found) names.set(name, kind);
+    }
     function declaration(statement) {
       const value = statement.declaration ?? statement;
-      if (value.type === 'VariableDeclaration') value.declarations.forEach(d => pattern(d.id, names));
-      else if (value.type === 'FunctionDeclaration' || value.type === 'ClassDeclaration') pattern(value.id, names);
-      else if (value.type === 'ImportDeclaration') value.specifiers.forEach(s => pattern(s.local, names));
+      if (value.type === 'VariableDeclaration') value.declarations.forEach(d => bind(d.id, value.kind));
+      else if (value.type === 'FunctionDeclaration' || value.type === 'ClassDeclaration') bind(value.id, 'declaration');
+      else if (value.type === 'ImportDeclaration') value.specifiers.forEach(s => bind(s.local, 'import'));
     }
     if (node.type === 'Program' || node.type === 'BlockStatement' || node.type === 'StaticBlock')
       node.body.forEach(declaration);
     if (node.type === 'SwitchStatement' && !switchHead) node.cases.forEach(c => c.consequent.forEach(declaration));
-    if (node.type === 'CatchClause') pattern(node.param, names);
+    if (node.type === 'CatchClause') bind(node.param, 'catch');
     if (node.type === 'ForStatement' && node.init?.type === 'VariableDeclaration') declaration(node.init);
     if (['ForInStatement', 'ForOfStatement'].includes(node.type) && node.left.type === 'VariableDeclaration')
       declaration(node.left);
     if (FUNCTIONS.has(node.type)) {
-      node.params.forEach(p => pattern(p, names));
-      pattern(node.id, names);
+      bind(node.id, 'self-name');
+      node.params.forEach(p => bind(p, 'parameter'));
     }
-    if (node.type === 'ClassDeclaration' || node.type === 'ClassExpression') pattern(node.id, names);
+    if (node.type === 'ClassDeclaration' || node.type === 'ClassExpression') bind(node.id, 'self-name');
     if (node.type === 'Program' || (FUNCTIONS.has(node.type) && !parametersOnly) || node.type === 'StaticBlock') {
       // var may be declared in a different branch/block of this function. Do
       // not borrow declarations from a nested function or class static block.
@@ -66,7 +70,7 @@ function scopeBindings() {
           if (value === node) for (const statement of value.body) next(statement, state);
         },
         VariableDeclaration(value, state, next) {
-          if (value.kind === 'var') value.declarations.forEach(d => pattern(d.id, names));
+          if (value.kind === 'var') value.declarations.forEach(d => bind(d.id, value.kind));
           for (const d of value.declarations) if (d.init) next(d.init, state);
         },
       });
@@ -108,11 +112,19 @@ function capturesFor(loop, ancestors, bindings) {
   // A syntactic union of inner declarations can cause conservative refusals
   // under shadowing; it cannot authorize a missing lexical binding, because the
   // numeric compiler independently resolves every reference in the whole loop.
-  if (captures.some(name => assigned.has(name))) return {refusal:'ISLAND_OUTER_SCALAR_WRITE'};
+  const scalarOutputs = captures.filter(name => assigned.has(name));
+  for (const name of scalarOutputs) {
+    if (arrays.has(name)) return {refusal:'ISLAND_REBOUND_ARRAY'};
+    const owner = [...ancestors].reverse().map(node => bindings(node, loop)).find(scope => scope.has(name));
+    // Publishing into const/import/self-name bindings can throw even when a
+    // source loop takes zero trips. Only ordinary mutable environments qualify.
+    if (!['let', 'var', 'parameter', 'catch'].includes(owner?.get(name)))
+      return {refusal:'ISLAND_IMMUTABLE_SCALAR_OUTPUT'};
+  }
   if (captures.length > 64) return {refusal:'ISLAND_CAPTURE_BUDGET'};
   if (captures.some(name => name === 'arguments' || !ancestors.some(node => bindings(node, loop).has(name))))
     return {refusal:'ISLAND_NONLEXICAL_CAPTURE'};
-  return {captures, arrays, usesMath};
+  return {captures, arrays, usesMath, scalarOutputs};
 }
 
 /**
@@ -131,24 +143,48 @@ export function planNumericLoopIslands(source, {
   const candidates = [], bindings = scopeBindings(), hints = discoverNumericStorageHints(ast);
   walk.fullAncestor(ast, (node, _state, ancestors) => {
     if (LOOPS.has(node.type)) candidates.push({node, ancestors:ancestors.slice(0,-1)});
+    // A sequence is closed only if ALL its statements are closed. Combining
+    // adjacent loops removes intermediate copy/publication boundaries without
+    // crossing an application call, declaration, branch or suspension point.
+    // If the larger proof fails, the individual candidates remain available.
+    if (['Program', 'BlockStatement', 'StaticBlock'].includes(node.type)) {
+      for (let first=0; first<node.body.length;) {
+        if (!LOOPS.has(node.body[first].type)) { first++; continue; }
+        let end=first+1;
+        while (end<node.body.length && LOOPS.has(node.body[end].type)) end++;
+        if (end-first>1) {
+          const body=node.body.slice(first,end), start=body[0], last=body.at(-1);
+          candidates.push({kind:'LoopSequence', ancestors:[...ancestors], node:{
+            type:'BlockStatement', body, start:start.start, end:last.end,
+            loc:{start:start.loc.start,end:last.loc.end},
+          }});
+        }
+        first=end;
+      }
+    }
   });
-  // Prefer one whole closed outer loop over many native transitions. If an outer
-  // loop has effects, independently closed inner loops may still be compiled.
+  // Prefer a closed sequence or outer loop over multiple native transitions. If
+  // the larger region has effects, independently closed loops remain eligible.
   candidates.sort((a,b) => a.node.start-b.node.start || b.node.end-a.node.end);
-  let createName, dispatchName;
-  for (const {node, ancestors} of candidates) {
+  let createName, dispatchName, stateDispatchName;
+  for (const {node, ancestors, kind=node.type} of candidates) {
     if ([...excludedSpans, ...accepted].some(range => contains(range,node))) continue;
-    const item = {sourceSpan:span(node), kind:node.type, route:'retained-js', reason:null};
+    const item = {sourceSpan:span(node), kind, route:'retained-js', reason:null};
     report.candidates.push(item);
     if (report.compiledKernels >= maxKernels) { item.reason='KERNEL_BUDGET'; continue; }
     if (ancestors.at(-1)?.type === 'LabeledStatement') { item.reason='ISLAND_LABELED_LOOP'; continue; }
     if (reservedEdits.some(edit => contains(node,edit))) { item.reason='ISLAND_EXISTING_CALL_ROUTE'; continue; }
     const closure = capturesFor(node, ancestors, bindings);
     if (closure.refusal) { item.reason=closure.refusal; continue; }
-    const {captures, arrays, usesMath} = closure;
+    const {captures, arrays, usesMath, scalarOutputs} = closure;
+    const inputs = captures.filter(name => !scalarOutputs.includes(name));
+    const stateName = scalarOutputs.length ? fresh('loop_state') : null;
+    const parameters = stateName ? [...inputs, stateName] : inputs;
+    const prologue = scalarOutputs.map((name, i) => `let ${name} = ${stateName}[${i}];`).join('\n');
+    const epilogue = scalarOutputs.map((name, i) => `${stateName}[${i}] = ${name};`).join('\n');
     const functionName = fresh('loop_kernel');
-    const kernelSource = `function ${functionName}(${captures.join(',')}) {\n${source.slice(node.start,node.end)}\n}`;
-    const parameterTypes = captures.map(name => arrays.has(name) ? 'f64[]' : 'f64');
+    const kernelSource = `function ${functionName}(${parameters.join(',')}) {\n${prologue}\n${source.slice(node.start,node.end)}\n${epilogue}\n}`;
+    const parameterTypes = parameters.map(name => arrays.has(name) || name === stateName ? 'f64[]' : 'f64');
     const compile = types => compileNumericCandidate(kernelSource, {
       parameterTypes:types, allowMath:usesMath, generalControl:true,
       maxMemoryPages, maxIterations, sourceName:`${sourceName}:loop@${node.start}`,
@@ -162,19 +198,22 @@ export function planNumericLoopIslands(source, {
       item.reason=error.code; item.detail=error.message; continue;
     }
     const params=artifact.manifest.parameters;
-    const layouts=hints([{arguments:captures.map(name => ({type:'Identifier',name}))}],params);
+    const layouts=hints([{arguments:parameters.map(name => ({type:'Identifier',name}))}],params);
     for (const [read,write] of [['f32[]','f32[]'],['f64[]','f32[]'],['f32[]','f64[]']])
       layouts.push(params.map(p => p.type==='f64' ? 'f64' : p.write ? write : read));
     const alternatives=[], seen=new Set([parameterTypes.join(',')]);
-    for (const types of layouts) {
+    for (const layout of layouts) {
+      // Scalar observations must never narrow to f32 just because a geometry
+      // output uses that storage. The private output channel is always f64.
+      const types = layout.map((type, i) => parameters[i] === stateName ? 'f64[]' : type);
       if (alternatives.length===16) break;
       const key=types.join(','); if(seen.has(key)) continue; seen.add(key);
       try { alternatives.push({parameterTypes:types,bytes:[...compile(types).wasm]}); }
       catch(error) { if(!(error instanceof NumericKernelCompileError)) throw error; }
     }
     if (!createName) {
-      createName=fresh('create_loop'); dispatchName=fresh('dispatch_loop');
-      runtimeImports.push(`createNumericLoopDispatch as ${createName}`, `dispatchNumericLoop as ${dispatchName}`);
+      createName=fresh('create_loop');
+      runtimeImports.push(`createNumericLoopDispatch as ${createName}`);
     }
     const token=fresh('loop_token');
     registrations.push(`var ${token} = ${createName}([${artifact.wasm.join(',')}], ${JSON.stringify(alternatives)});`);
@@ -182,10 +221,27 @@ export function planNumericLoopIslands(source, {
     // The original statement (including lexical declarations and comments) is
     // unchanged in the fallback. Capture failures have no source effects.
     const mathResolver=artifact.manifest.mathIntrinsics ? '() => Math' : 'null';
-    edits.push({start:node.start,end:node.end,text:
-      `{ if (!${dispatchName}(${token}, () => [${captures.join(',')}], ${mathResolver})) {\n${source.slice(node.start,node.end)}\n} }`});
+    if (stateName) {
+      if (!stateDispatchName) {
+        stateDispatchName=fresh('dispatch_state_loop');
+        runtimeImports.push(`dispatchNumericStateLoop as ${stateDispatchName}`);
+      }
+      const result=fresh('loop_result'), values=[...inputs, ...scalarOutputs].join(',');
+      const publish=scalarOutputs.map((name,i) => `${name} = ${result}[${i}];`).join('\n');
+      edits.push({start:node.start,end:node.end,text:
+        `{ const ${result} = ${stateDispatchName}(${token}, () => [${values}], ${scalarOutputs.length}, ${mathResolver});\n` +
+        `if (${result} === null) {\n${source.slice(node.start,node.end)}\n} else {\n${publish}\n} }`});
+    } else {
+      if (!dispatchName) {
+        dispatchName=fresh('dispatch_loop');
+        runtimeImports.push(`dispatchNumericLoop as ${dispatchName}`);
+      }
+      edits.push({start:node.start,end:node.end,text:
+        `{ if (!${dispatchName}(${token}, () => [${captures.join(',')}], ${mathResolver})) {\n${source.slice(node.start,node.end)}\n} }`});
+    }
     accepted.push(node); report.compiledKernels++;
     Object.assign(item, {route:'guarded-loop-wasm', captures:params.map(p => ({...p})),
+      ...(stateName ? {scalarOutputs:[...scalarOutputs], scalarOutputSemantics:'mutable-lexical-f64-publication'} : {}),
       storageSemantics:'same-type-alias-preserving-v1', guardFallback:'original-loop-in-place',
       controlSemantics:artifact.manifest.controlSemantics, maxIterations:artifact.manifest.maxIterations,
       loopCount:artifact.manifest.loopCount, maxLoopDepth:artifact.manifest.maxLoopDepth,
