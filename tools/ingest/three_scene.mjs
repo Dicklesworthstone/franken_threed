@@ -45,7 +45,7 @@ export async function createGpuThreeScene(device,scene,{
   three, textures=new Map(), autoTextures=true, texture:textureOptions={}, renderer:renderOptions={}, geometry:geometryOptions={},
   maxNodes=16384,maxGeometries=256,maxBindings=1024,maxGeometryBytes=128*1024*1024,sortObjects=true,
   maxInstanceMeshes=256,maxInstanceBytes=128*1024*1024,
-  deformation:deformationOptions={},maxDeformedMeshes=256,maxDeformationBytes=128*1024*1024,shadow=null,environment=null,background=null,fog=null,signal,
+  deformation:deformationOptions={},maxDeformedMeshes=256,maxDeformationBytes=128*1024*1024,shadow=null,environment=null,background=null,fog=null,clipping=null,signal,
 }={}) {
   if(three?.REVISION!=='186'||typeof three.Matrix4!=='function'||typeof three.Frustum!=='function'||
       typeof three.Mesh!=='function'||!(scene instanceof three.Scene))fail('SOURCE','Supply the pinned r186 module and its Scene');
@@ -67,6 +67,13 @@ export async function createGpuThreeScene(device,scene,{
       typeof signal.removeEventListener!=='function'))fail('OPTIONS','Expected AbortSignal');
   if(fog!==null&&(!fog||typeof fog!=='object'||Array.isArray(fog)||Object.keys(fog).length))
     fail('OPTIONS','Expected empty source fog options or null');
+  const clippingEnabled=clipping!==null;
+  const maxClippingPlanes=integer(renderOptions.maxClippingPlanes??8,1,64,'clipping plane capacity');
+  if(renderOptions.clipping!==undefined&&renderOptions.clipping!==clippingEnabled)
+    fail('OPTIONS','renderer.clipping must agree with the source clipping:{} option');
+  if(clippingEnabled&&(!clipping||typeof clipping!=='object'||Array.isArray(clipping)))
+    fail('OPTIONS','Expected source clipping controls or null');
+  const clippingApi=clippingEnabled?await import('./animation_clipping.mjs'):null;
   const fogEnabled=fog!==null;
   if(renderOptions.fog!==undefined&&renderOptions.fog!==fogEnabled)
     fail('OPTIONS','renderer.fog must agree with the source fog:{} option');
@@ -252,14 +259,38 @@ export async function createGpuThreeScene(device,scene,{
     }
     return result;
   }
-  function materialDescription(m){
+  // Source planes and controls stay borrowed. Snapshot ordinary numeric data
+  // at a use boundary without invoking getters or changing Plane/Vector3 state.
+  function clippingValue(object,name,fallback){
+    const descriptor=Object.getOwnPropertyDescriptor(object,name);
+    if(!descriptor)return fallback;
+    if(!Object.hasOwn(descriptor,'value'))fail('CLIPPING','Clipping fields must be ordinary data properties');
+    return descriptor.value;
+  }
+  function sourcePlanes(planes){
+    if(!Array.isArray(planes)||planes.length>maxClippingPlanes)fail('CLIPPING','Invalid or excessive source clipping planes');
+    return clippingApi.snapshotAnimationClipping(Array.from(planes,plane=>{
+      if(!plane||Object.getPrototypeOf(plane)!==three.Plane?.prototype)fail('CLIPPING','Expected a pinned source Plane');
+      const normal=clippingValue(plane,'normal');
+      if(!normal||Object.getPrototypeOf(normal)!==three.Vector3.prototype)fail('CLIPPING','Expected a source Vector3 plane normal');
+      return ['x','y','z'].map(axis=>clippingValue(normal,axis)).concat(clippingValue(plane,'constant'));
+    }),maxClippingPlanes);
+  }
+  function clippingState(){
+    if(!clippingEnabled)return null;
+    for(const key of Object.keys(clipping))if(!['planes','localClippingEnabled'].includes(key))fail('CLIPPING',`Unsupported clipping control: ${key}`);
+    const localClippingEnabled=clippingValue(clipping,'localClippingEnabled',false);
+    if(typeof localClippingEnabled!=='boolean')fail('CLIPPING','localClippingEnabled must be boolean');
+    return {planes:sourcePlanes(clippingValue(clipping,'planes',[])),localClippingEnabled};
+  }
+  function materialDescription(m,clippingFrame){
     const shading=models.get(Object.getPrototypeOf(m));
     if(!shading)fail('MATERIAL',`Unsupported source material: ${m?.type}`);
     for(const descriptor of Object.values(Object.getOwnPropertyDescriptors(m)))
       if(!Object.hasOwn(descriptor,'value'))fail('HOOK','Accessor-backed material fields are not admitted');
     if(m.onBeforeRender!==three.Material.prototype.onBeforeRender||m.onBeforeCompile!==three.Material.prototype.onBeforeCompile||
         m.customProgramCacheKey!==three.Material.prototype.customProgramCacheKey)fail('HOOK','Custom material shader/render hooks require their original component');
-    if(m.wireframe||m.alphaHash||m.alphaToCoverage||m.premultipliedAlpha||m.stencilWrite||m.polygonOffset||m.clippingPlanes?.length)
+    if(m.wireframe||m.alphaHash||m.alphaToCoverage||m.premultipliedAlpha||m.stencilWrite||m.polygonOffset||(!clippingEnabled&&m.clippingPlanes?.length))
       fail('MATERIAL','Wireframe, hashed/coverage alpha, premultiplication, stencil, polygon offset and clipping are not admitted');
     if(m.blending!==three.NormalBlending&&!(m.blending===three.NoBlending&&!m.transparent))fail('MATERIAL','Unsupported source blending mode');
     if(m.transparent&&m.alphaTest>0)fail('MATERIAL','Combined transparent alpha testing requires an extended material profile');
@@ -270,6 +301,15 @@ export async function createGpuThreeScene(device,scene,{
     for(const key of ['transparent','vertexColors','depthTest','depthWrite','colorWrite','forceSinglePass'])
       if(typeof m[key]!=='boolean')fail('MATERIAL',`Expected boolean ${key}`);
     if(fogEnabled&&typeof m.fog!=='boolean')fail('MATERIAL','Expected boolean fog');
+    let clipped=null;
+    if(clippingEnabled){
+      const clipIntersection=m.clipIntersection,clipShadows=m.clipShadows;
+      if(typeof clipIntersection!=='boolean'||typeof clipShadows!=='boolean')fail('CLIPPING','Material clipping flags must be boolean');
+      const planes=clippingFrame.localClippingEnabled?m.clippingPlanes:null;
+      const clippingPlanes=planes===null?[]:sourcePlanes(planes);
+      if(clippingFrame.planes.length+clippingPlanes.length>maxClippingPlanes)fail('CLIPPING','Combined global and material planes exceed capacity');
+      clipped={clippingPlanes,clipIntersection,clipShadows};
+    }
     const options={shading,vertexColors:m.vertexColors,flatShading:shading==='unlit'?false:m.flatShading===true,
       alphaMode:m.transparent?'BLEND':m.alphaTest>0?'MASK':'OPAQUE',alphaCutoff:m.alphaTest>0?m.alphaTest:0.5,
       depthTest:m.depthTest,depthWrite:m.depthWrite,depthCompare:DEPTH[m.depthFunc],colorWrite:m.colorWrite};
@@ -323,12 +363,13 @@ export async function createGpuThreeScene(device,scene,{
       const config={...options,side};
       const structural=[epoch,shading,side,config.vertexColors,config.flatShading,config.alphaMode,
         config.depthTest,config.depthWrite,config.depthCompare,config.colorWrite,...(shadowEnabled?[m.shadowSide??null]:[]),...textureKey];
-      return {options:config,values,structural,...(fogEnabled?{receiveFog:m.fog}:{})};
+      return {options:config,values,structural,clipped,...(fogEnabled?{receiveFog:m.fog}:{})};
     });
   }
   function desired(nodes){
+    const clippingFrame=clippingState();
     const out=[],descriptions=new Map(),seen=new Map(),usedGeometry=new Set(),usedInstances=new Set(),usedDeformations=new Set();
-    const get=m=>{if(!descriptions.has(m))descriptions.set(m,materialDescription(m));return descriptions.get(m);};
+    const get=m=>{if(!descriptions.has(m))descriptions.set(m,materialDescription(m,clippingFrame));return descriptions.get(m);};
     if(scene.overrideMaterial)get(scene.overrideMaterial);
     for(const object of nodes)if(object.isMesh){
       const g=object.geometry,instanceSource=object.isInstancedMesh?object:null;
@@ -442,7 +483,7 @@ export async function createGpuThreeScene(device,scene,{
         else if(!shadowOwner||shadowOwner.source!==selected||!shadowOwner.matches()){
           const available=maxShadowBytes-(shadowOwner?.allocatedBytes??0);
           if(available<1)fail('LIMIT','Shadow replacement exceeds the old-plus-new GPU budget');
-          nextShadow=await shadowApi.createGpuThreeShadow(device,selected,{three,maxBytes:available,
+          nextShadow=await shadowApi.createGpuThreeShadow(device,selected,{three,maxBytes:available,clipping:clippingEnabled,maxClippingPlanes,
             maxDraws:renderOptions.maxDraws??1024,maxMeshes:2*maxBindings,signal:deformationLifetime.signal});
           pendingShadow=nextShadow;live();
         }
@@ -592,7 +633,8 @@ export async function createGpuThreeScene(device,scene,{
     let backgroundSubmitted=false;
     try{
       if(!frame||typeof frame!=='object')fail('FRAME','Supply borrowed render attachments');
-      for(const key of ['draws','viewProjection','lighting','fog',...(shadowEnabled?['shadow']:[]),...(environmentEnabled?['environment']:[]),...(backgroundEnabled?['background']:[])])if(Object.hasOwn(frame,key))fail('FRAME',`${key} belongs to the source scene/camera`);
+      for(const key of ['draws','viewProjection','lighting','fog','clippingPlanes',...(shadowEnabled?['shadow']:[]),...(environmentEnabled?['environment']:[]),...(backgroundEnabled?['background']:[])])if(Object.hasOwn(frame,key))fail('FRAME',`${key} belongs to the source scene/camera`);
+      const clippingFrame=clippingState();
       frameTextures=new Set();
       const nodes=graph();
       if(shadowEnabled){
@@ -616,7 +658,7 @@ export async function createGpuThreeScene(device,scene,{
       const backgroundFrame=backgroundOwner?.capture(scene,camera)??null;
       const lightSources=[],casterObjects=[],casterItems=[],shadowDraws=[];
       const opaque=[],transparent=[],stack=[{object:scene,groupOrder:0}],descriptions=new Map();
-      const get=m=>{if(!descriptions.has(m))descriptions.set(m,materialDescription(m));return descriptions.get(m);};
+      const get=m=>{if(!descriptions.has(m))descriptions.set(m,materialDescription(m,clippingFrame));return descriptions.get(m);};
       function append(object,groupOrder,z,shadowPass=false){
         const g=object.geometry;
         function push(original,group){
@@ -723,11 +765,13 @@ export async function createGpuThreeScene(device,scene,{
         item.object.modelViewMatrix.multiplyMatrices(drawCamera.matrixWorldInverse,item.object.matrixWorld);
         item.object.normalMatrix.getNormalMatrix(item.object.modelViewMatrix);
         for(let i=0;i<item.bindings.length;i++){
-          const values=item.desc[i].values,common={worldMatrix:item.object.matrixWorld.elements,first,count};
+          const values=item.desc[i].values,clipped=item.desc[i].clipped,common={worldMatrix:item.object.matrixWorld.elements,first,count};
           if(item.shadowPass)shadowDraws.push({mesh:casters.get(item.bindings[i]),...common,baseColor:values.baseColor,
+            ...(clipped?{clippingPlanes:clipped.clipShadows?clipped.clippingPlanes:[],clipIntersection:clipped.clipIntersection}:{}),
             ...(values.uvTransform?{uvTransform:values.uvTransform}:{}),
             ...(values.alphaCutoff!==undefined?{alphaCutoff:values.alphaCutoff}:{})});
           else draws.push({mesh:item.bindings[i].mesh,...common,...values,
+            ...(clipped?{clippingPlanes:clipped.clippingPlanes,clipIntersection:clipped.clipIntersection}:{}),
             ...(fogEnabled?{receiveFog:item.desc[i].receiveFog}:{}),
             ...(shadowEnabled?{receiveShadow:item.object.receiveShadow}:{}),
             ...(environmentEnabled?{receiveEnvironment:item.desc[i].options.shading==='metallic-roughness'}:{})});
@@ -744,7 +788,8 @@ export async function createGpuThreeScene(device,scene,{
         item.material.side=three.FrontSide;item.material.needsUpdate=true;
         item.material.side=three.DoubleSide;
       }
-      const prepared={...frame,viewProjection:clip.elements,lighting,draws};
+      const prepared={...frame,viewProjection:clip.elements,lighting,draws,
+        ...(clippingFrame?{clippingPlanes:clippingFrame.planes}:{})};
       if(fogEnabled)prepared.fog=fogFrame;
       if(environmentEnabled)prepared.environment=environmentFrame;
       if(scene.background?.isColor){prepared.clearColor=rgba(scene.background);prepared.loadOp='clear';}
@@ -796,7 +841,7 @@ export async function createGpuThreeScene(device,scene,{
     // Source validation precedes even the renderer's uniform allocation.
     signal?.addEventListener('abort',onAbort,{once:true});if(signal?.aborted)onAbort();live();
     scanTextures();
-    const construction=createGpuAnimationRenderer(device,{...renderOptions,...(backgroundEnabled?{format:renderOptions.format??'rgba8unorm',sampleCount:renderOptions.sampleCount??1}:{}),...(shadowEnabled?{shadows:true}:{}),...(environmentEnabled?{environment:true}:{}),...(fogEnabled?{fog:true}:{}),indirectLights:true,threeLights:true,maxMeshes:2*maxBindings}).then(value=>{
+    const construction=createGpuAnimationRenderer(device,{...renderOptions,clipping:clippingEnabled,...(backgroundEnabled?{format:renderOptions.format??'rgba8unorm',sampleCount:renderOptions.sampleCount??1}:{}),...(shadowEnabled?{shadows:true}:{}),...(environmentEnabled?{environment:true}:{}),...(fogEnabled?{fog:true}:{}),indirectLights:true,threeLights:true,maxMeshes:2*maxBindings}).then(value=>{
       if(disposed||terminal){value.dispose();throw terminal??new ThreeSceneError('DISPOSED','Source scene is disposed');}
       renderer=shadowEnabled?shadowApi.withThreeShadowReceivers(value,renderOptions.maxDraws??1024):value;
       if(environmentEnabled)renderer=environmentApi.withThreeEnvironmentReceivers(renderer,renderOptions.maxDraws??1024);
