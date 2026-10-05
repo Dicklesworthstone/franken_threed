@@ -1,16 +1,20 @@
 /**
- * Close a bounded, acyclic graph of scalar JavaScript helpers into private Wasm
- * functions. No host imports, source evaluation, captures, arrays or implicit
- * conversions are admitted. Each call evaluates arguments once, left to right;
+ * Close a bounded, acyclic graph of numeric JavaScript helpers into private Wasm
+ * functions. No host imports, source evaluation, captures or implicit conversions
+ * are admitted. Checked callers may pass typed-array views by private pointer and
+ * intrinsic length; each storage signature gets a bounded native specialization.
+ * Each call evaluates arguments once, left to right;
  * a helper owns its scalar parameters and lexical locals, just as in JavaScript.
  * Number bitwise operations share the kernel's exact modulo-2^32 lowering.
  * With the caller's general-control contract, helper for/while/do-while bodies
  * spend the SAME private invocation budget as the entry point. Helpers neither
  * reset that budget nor call the host. Abrupt completion and lexical scopes
- * remain source ordered; every admitted return path still produces a Number.
+ * remain source ordered. Numeric calls return a Number on every path; void
+ * helpers are admitted only where the caller discards the result.
  */
 import * as acorn from 'acorn';
-import { BITWISE_OPS, emitBitwiseBinary, emitBitwiseNot } from './numeric_integer.mjs';
+import { BITWISE_OPS, INTEGER_ARRAY_LAYOUTS, emitBitwiseBinary, emitBitwiseNot,
+  emitToUint32, emitToUint8Clamp } from './numeric_integer.mjs';
 
 const F64 = 0x7c;
 const I32 = 0x7f;
@@ -36,7 +40,7 @@ function number(value) {
  * and every statically mutable binding. Only reachable helpers are inspected.
  * Function/type index zero belongs to the caller's array-loop entry point.
  */
-export function createScalarHelperCompiler(helperSources, fail, intrinsics = null, control = null) {
+export function createScalarHelperCompiler(helperSources, fail, intrinsics = null, control = null, checkedArrays = false) {
   if (!(helperSources instanceof Map)) fail('helperSources must be a Map of immutable function declarations', null, 'INVALID_KERNEL_SOURCE');
   const entries = [];
   const compiled = new Map();
@@ -44,9 +48,10 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
   let sourceBytes = 0;
   let statementCount = 0;
 
-  function requireHelper(name, callNode) {
+  function requireHelper(name, callNode, parameterTypes) {
+    const key = JSON.stringify([name, parameterTypes]);
     if (active.has(name)) fail(`Recursive scalar helper ${name} is not closed`, callNode);
-    if (compiled.has(name)) return compiled.get(name);
+    if (compiled.has(key)) return compiled.get(key);
     if (!helperSources.has(name)) fail(`Unresolved scalar helper ${name}`, callNode);
     if (entries.length >= 64 || active.size >= 32) fail('Scalar helper graph exceeds the function/depth limit', callNode);
     const source = helperSources.get(name);
@@ -62,21 +67,44 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
         fn.async || fn.generator || fn.params.length > 64 || fn.params.some(param => param.type !== 'Identifier')) {
       fail(`Helper ${name} must be one named synchronous scalar function without defaults/destructuring`, callNode);
     }
-    const entry = { name, arity: fn.params.length, index: entries.length + 1, body: null };
+    if (parameterTypes.length !== fn.params.length) fail(`Scalar helper ${name} argument count differs from its declaration`, callNode);
+    // Only Number results may enter arithmetic. Void helpers are admitted solely
+    // at discarded-value call sites; numeric/void mixed returns still refuse.
+    const pending = [fn.body];
+    let numericResult = false;
+    while (pending.length) {
+      const node = pending.pop();
+      if (['FunctionDeclaration', 'FunctionExpression', 'ArrowFunctionExpression',
+        'ClassDeclaration', 'ClassExpression'].includes(node.type)) continue;
+      if (node.type === 'ReturnStatement' && node.argument) numericResult = true;
+      for (const value of Object.values(node)) {
+        if (Array.isArray(value)) {
+          for (const child of value) if (child && typeof child.type === 'string') pending.push(child);
+        } else if (value && typeof value.type === 'string') pending.push(value);
+      }
+    }
+    const wasmTypes = parameterTypes.flatMap(type => type === 'f64' ? [F64] : [I32, I32]);
+    const entry = { name, arity: fn.params.length, index: entries.length + 1, body: null,
+      parameterTypes, wasmTypes, resultType: numericResult ? 'f64' : 'void',
+      effects: parameterTypes.map(() => ({ read: false, write: false })) };
     entries.push(entry);
-    compiled.set(name, entry);
+    compiled.set(key, entry);
     active.add(name);
     try { entry.body = compileFunction(fn, entry); }
     finally { active.delete(name); }
     return entry;
   }
 
-  function call(node, emitArgument, shadowed = false, owner = null, loopDepth = 0) {
+  function call(node, emitArgument, shadowed = false, owner = null, loopDepth = 0, resolveArray = null, resultUsed = true) {
     if (node.optional || node.callee.type !== 'Identifier' || shadowed ||
         node.arguments.some(arg => arg.type === 'SpreadElement')) {
       fail('Scalar calls require an unshadowed direct immutable helper binding and positional numbers', node);
     }
-    const entry = requireHelper(node.callee.name, node);
+    const arrays = node.arguments.map(arg => resolveArray?.(arg) ?? null);
+    if (!checkedArrays && arrays.some(Boolean)) fail('Typed-array helpers require checkedIndexing', node);
+    const parameterTypes = arrays.map(array => array?.type ?? 'f64');
+    const entry = requireHelper(node.callee.name, node, parameterTypes);
+    if (resultUsed && entry.resultType === 'void') fail('A void helper call cannot be used as a Number', node);
     // Count lexical loop nesting THROUGH calls, not just within each function.
     // Acyclic helpers compile once, but every call site's nesting is checked.
     if (control) control.checkDepth(loopDepth + entry.loopDepth, node);
@@ -87,7 +115,17 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
       if (owner.work > 4096 || owner.depth > 32) fail('Scalar helper expanded call graph exceeds the work/depth limit', node);
     }
     if (node.arguments.length !== entry.arity) fail(`Scalar helper ${entry.name} argument count differs from its declaration`, node);
-    return [...node.arguments.flatMap(emitArgument), 0x10, ...u32(entry.index)];
+    // Pointer/length pairs refer to the caller's SAME transaction storage.
+    // Never repack a view or publish from a helper. Propagate effects through
+    // every call site, including repeated use of a cached specialization.
+    const argumentsCode = node.arguments.flatMap((arg, index) => {
+      const array = arrays[index];
+      if (!array) return emitArgument(arg);
+      array.mark(entry.effects[index]);
+      return [...get(array.index), ...get(array.lengthIndex)];
+    });
+    return [...argumentsCode, 0x10, ...u32(entry.index),
+      ...(!resultUsed && entry.resultType === 'f64' ? [0x1a] : [])];
   }
 
   function compileFunction(fn, owner) {
@@ -95,9 +133,18 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
     owner.depth = 1;
     owner.loopDepth = 0;
     let environment = new Map();
-    fn.params.forEach((param, index) => {
+    let nextParameter = 0;
+    fn.params.forEach((param, position) => {
       if (environment.has(param.name)) fail('Scalar helper parameters must be distinct', param);
-      environment.set(param.name, { index, mutable: true });
+      const type = owner.parameterTypes[position], index = nextParameter++;
+      if (type === 'f64') environment.set(param.name, { index, mutable: true });
+      else {
+        if (!['f32[]', 'f64[]', ...Object.keys(INTEGER_ARRAY_LAYOUTS)].includes(type))
+          fail('Unsupported helper array storage', param);
+        const effect = owner.effects[position];
+        environment.set(param.name, { type, index, lengthIndex: nextParameter++, mutable: false,
+          mark({ read, write }) { effect.read ||= read || write; effect.write ||= write; } });
+      }
     });
     let localCount = 0, loopDepth = 0, controlDepth = 0;
     const loopControls = [];
@@ -105,20 +152,63 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
       if (node?.type !== 'Identifier' || !environment.has(node.name)) fail('Scalar helpers cannot access captured or non-scalar bindings', node);
       const binding = environment.get(node.name);
       if (binding === null) fail(`Helper binding ${node.name} is used before initialization`, node);
+      if (binding.type) fail('Typed-array references cannot be reassigned, escaped or coerced to Numbers', node);
       if (writing && !binding.mutable) fail(`Cannot assign to constant helper binding ${node.name}`, node);
       return binding.index;
     }
+    const allocateLocal = () => owner.wasmTypes.length + localCount++;
+    function resolveArray(node) {
+      const binding = node?.type === 'Identifier' ? environment.get(node.name) : null;
+      return binding?.type ? binding : null;
+    }
+    function target(node, depth = 0) {
+      const array = node?.type === 'MemberExpression' && !node.optional && node.computed
+        ? resolveArray(node.object) : null;
+      if (!array) fail('Helper array access requires a typed-array parameter', node);
+      const value = expression(node.property, depth + 1), local = allocateLocal();
+      // The check precedes RHS effects, uses THIS view's length, and does not
+      // truncate a fractional/NaN/infinite subscript into a different property.
+      const setup = [...value, ...set(local), ...get(local), ...number(0), 0x66,
+        ...get(local), ...get(array.lengthIndex), 0xb8, 0x63, 0x71,
+        ...get(local), ...get(local), 0x9d, 0x61, 0x71,
+        0x45, 0x04, 0x40, 0x00, 0x0b];
+      const integer = INTEGER_ARRAY_LAYOUTS[array.type];
+      const alignment = integer?.alignment ?? (array.type === 'f64[]' ? 3 : 2);
+      return { array, integer, alignment, setup, address: [...get(array.index),
+        ...get(local), 0xab, 0x41, alignment, 0x74, 0x6a] };
+    }
+    function load(access, prepared = false) {
+      const { array, integer, alignment } = access;
+      array.mark({ read: true });
+      return [...(prepared ? [] : access.setup), ...access.address,
+        ...(integer ? [integer.load, alignment, 0, integer.signed ? 0xb7 : 0xb8]
+          : array.type === 'f32[]' ? [0x2a, 2, 0, 0xbb] : [0x2b, 3, 0])];
+    }
+    function store(access, value) {
+      const { array, integer, alignment } = access;
+      array.mark({ read: true, write: true });
+      const payload = integer ? (array.type === 'u8c[]' ? emitToUint8Clamp : emitToUint32)(value, allocateLocal) : value;
+      return [...access.setup, ...access.address, ...payload,
+        ...(integer ? [integer.store, alignment, 0]
+          : array.type === 'f32[]' ? [0xb6, 0x38, 2, 0] : [0x39, 3, 0])];
+    }
     function binary(operator, left, right) {
-      return emitBitwiseBinary(operator, left, right, () => fn.params.length + localCount++)
+      return emitBitwiseBinary(operator, left, right, () => owner.wasmTypes.length + localCount++)
         ?? [...left, ...right, OPS[operator]];
     }
     function expression(node, depth = 0) {
       if (!node || depth > 128) fail('Scalar helper expression exceeds the nesting limit', node);
       if (node.type === 'Literal' && typeof node.value === 'number') return number(node.value);
       if (node.type === 'Identifier') return get(lookup(node));
+      if (node.type === 'MemberExpression') {
+        const array = resolveArray(node.object);
+        if (array && !node.optional && !node.computed && node.property.name === 'length')
+          return [...get(array.lengthIndex), 0xb8];
+        return load(target(node, depth));
+      }
       if (node.type === 'UnaryExpression' && ['+', '-', '~'].includes(node.operator)) {
         const operand = expression(node.argument, depth + 1);
-        if (node.operator === '~') return emitBitwiseNot(operand, () => fn.params.length + localCount++);
+        if (node.operator === '~') return emitBitwiseNot(operand, () => owner.wasmTypes.length + localCount++);
         return [...operand, ...(node.operator === '-' ? [0x9a] : [])];
       }
       if (node.type === 'BinaryExpression' &&
@@ -131,9 +221,9 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
       }
       if (node.type === 'CallExpression') {
         const intrinsic = intrinsics?.call(node, arg => expression(arg, depth + 1),
-          environment.has('Math') || helperSources.has('Math'), () => fn.params.length + localCount++);
+          environment.has('Math') || helperSources.has('Math'), () => owner.wasmTypes.length + localCount++);
         if (intrinsic) return intrinsic;
-        return call(node, arg => expression(arg, depth + 1), environment.has(node.callee.name), owner, loopDepth);
+        return call(node, arg => expression(arg, depth + 1), environment.has(node.callee.name), owner, loopDepth, resolveArray);
       }
       fail(`Scalar helper expression ${node.type} is not closed`, node);
     }
@@ -229,12 +319,13 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
           if (statement.type === 'VariableDeclaration') {
             for (const variable of statement.declarations) {
               const value = expression(variable.init);
-              const index = fn.params.length + localCount++;
+              const index = owner.wasmTypes.length + localCount++;
               environment.set(variable.id.name, { index, mutable: statement.kind === 'let' });
               bytes.push(...value, ...set(index));
             }
           } else if (statement.type === 'ReturnStatement') {
-            bytes.push(...expression(statement.argument), 0x0f);
+            if (owner.resultType === 'f64' && !statement.argument) fail('Numeric helper returns cannot mix with void returns', statement);
+            bytes.push(...(statement.argument ? expression(statement.argument) : []), 0x0f);
             advance(['return']);
           } else if (statement.type === 'BlockStatement') {
             const nested = child(statement);
@@ -266,13 +357,26 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
             // Empty bodies/for clauses still spend credit at the body boundary.
           } else {
             const update = statement.type === 'ExpressionStatement' ? statement.expression : null;
-            if (control && update?.type === 'SequenceExpression') {
+            if (update?.type === 'CallExpression' && update.callee.type === 'Identifier') {
+              bytes.push(...call(update, arg => expression(arg), environment.has(update.callee.name), owner, loopDepth, resolveArray, false));
+            } else if (control && update?.type === 'SequenceExpression') {
               bytes.push(...effects(update, depth + 1));
             } else if (update?.type === 'UpdateExpression' && ['++', '--'].includes(update.operator)) {
+              if (update.argument.type === 'MemberExpression') {
+                const access = target(update.argument);
+                bytes.push(...store(access, binary(update.operator[0], load(access, true), number(1))));
+                continue;
+              }
               const local = lookup(update.argument, true);
               bytes.push(...get(local), ...number(1), OPS[update.operator[0]], ...set(local));
             } else if (update?.type === 'AssignmentExpression' &&
                 ['=', '+=', '-=', '*=', '/=', '&=', '|=', '^=', '<<=', '>>=', '>>>='].includes(update.operator)) {
+              if (update.left.type === 'MemberExpression') {
+                const access = target(update.left), value = expression(update.right);
+                bytes.push(...store(access, update.operator === '=' ? value
+                  : binary(update.operator.slice(0, -1), load(access, true), value)));
+                continue;
+              }
               const local = lookup(update.left, true);
               const value = expression(update.right);
               bytes.push(...(update.operator === '=' ? value
@@ -286,21 +390,25 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
       } finally { if (!retainScope) environment = parent; }
     }
     const body = block(fn.body.body);
-    if (!body.returns) fail(`Scalar helper ${fn.id.name} must return a number on every path`, fn);
+    if (owner.resultType === 'f64' && !body.returns) fail(`Scalar helper ${fn.id.name} must return a number on every path`, fn);
     // Every reachable path returns. unreachable makes the result type explicit
     // to the Wasm validator even when all returns occur in nested if branches.
-    return [...(localCount ? [1, ...u32(localCount), F64] : [0]), ...body.bytes, 0x00, 0x0b];
+    return [...(localCount ? [1, ...u32(localCount), F64] : [0]), ...body.bytes, ...(owner.resultType === 'f64' ? [0x00] : []), 0x0b];
   }
 
   return {
     call,
     finish() {
       return {
-        types: entries.map(entry => [0x60, ...u32(entry.arity), ...Array(entry.arity).fill(F64), 1, F64]),
+        types: entries.map(entry => [0x60, ...u32(entry.wasmTypes.length), ...entry.wasmTypes,
+          ...(entry.resultType === 'f64' ? [1, F64] : [0])]),
         functions: entries.map(entry => u32(entry.index)),
         bodies: entries.map(entry => [...u32(entry.body.length), ...entry.body]),
         // Build-time provenance only: internal calls do not change the host ABI.
-        helpers: Object.freeze(entries.map(({ name, arity }) => Object.freeze({ name, arity }))),
+        helpers: Object.freeze(entries.map(({ name, arity, parameterTypes, resultType }) => Object.freeze({
+          name, arity, ...(parameterTypes.some(type => type !== 'f64') || resultType === 'void'
+            ? { parameterTypes: Object.freeze([...parameterTypes]), resultType } : {}),
+        }))),
       };
     },
   };

@@ -4,7 +4,8 @@
  * Admitted shape: scalar setup/state, one or more ordered counted loops, arithmetic
  * and fixed-stride Float32Array/Float64Array updates, including conditionals.
  * Scalar accumulators and a final numeric return execute in source iteration order.
- * Closed scalar helpers execute as private Wasm functions. No host calls,
+ * Closed numeric helpers execute as private Wasm functions. Checked helpers may
+ * take typed arrays, preserving their own view bounds and shared transaction. No host calls,
  * escapes, implicit numeric conversions or arithmetic reassociation.
  * Number bitwise operators use explicit modulo-2^32 lowering, returning f64.
  * Runtime shape/ownership guards live in numeric_kernel_runtime.mjs. This narrow
@@ -76,6 +77,9 @@ function member(node, object, property, computed) {
  * a separately loaded JSON sidecar. The returned bytes are deterministic.
  * helperSources optionally maps proven immutable lexical bindings to scalar
  * function declarations. Only reachable, acyclic, capture-free helpers compile.
+ * checkedIndexing permits typed-array parameters with the same element layouts
+ * as the root, numeric returns and discarded-value void helper calls. Views share
+ * staging/alias order across all calls, and only the root may publish results.
  * These sources must match the original function's actual lexical environment;
  * specializeNumericModule establishes that proof for linked application code.
  * allowMath additionally requires a runtime resolveMath closure for the actual
@@ -270,7 +274,7 @@ export function compileNumericKernel(source, {
       }));
     },
   } : null;
-  const helperCompiler = createScalarHelperCompiler(helperSources, fail, intrinsics, control);
+  const helperCompiler = createScalarHelperCompiler(helperSources, fail, intrinsics, control, checkedIndexing);
   let temporaries = new Map();
   let temporaryCount = 0;
   let statementCount = 0;
@@ -363,6 +367,20 @@ export function compileNumericKernel(source, {
       ...(integer ? [integer.store, integer.alignment]
         : target.type === 'f32[]' ? [0xb6, 0x38, 2] : [0x39, 3]), ...memoryOffset(target)];
   }
+  function helperArray(node) {
+    const param = node?.type === 'Identifier' ? params.get(node.name) : null;
+    if (!param || param.type === 'f64') return null;
+    return { ...param, lengthIndex: bounds.get(param.name), mark(effect) {
+      if (effect.read || effect.write) reads.add(param.name);
+      if (effect.write) writes.add(param.name);
+    } };
+  }
+  function helperCall(node, depth = 0, resultUsed = true) {
+    return helperCompiler.call(node, arg => expression(arg, depth + 1),
+      params.has(node.callee.name) || temporaries.has(node.callee.name) ||
+      node.callee.name === indexName || node.callee.name === fn.id.name,
+      null, generalDepth, helperArray, resultUsed);
+  }
   function binary(operator, left, right) {
     return emitBitwiseBinary(operator, left, right, () => temporaryBase + temporaryCount++)
       ?? [...left, ...right, OPS[operator]];
@@ -410,9 +428,7 @@ export function compileNumericKernel(source, {
         params.has('Math') || temporaries.has('Math') || indexName === 'Math' ||
         fn.id.name === 'Math' || helperSources.has('Math'), () => temporaryBase + temporaryCount++);
       if (intrinsic) return intrinsic;
-      return helperCompiler.call(node, arg => expression(arg, depth + 1),
-        params.has(node.callee.name) || temporaries.has(node.callee.name) ||
-        node.callee.name === indexName || node.callee.name === fn.id.name, null, generalDepth);
+      return helperCall(node, depth);
     }
     fail(`Unsupported expression ${node.type}; calls and implicit conversions are not closed`, node);
   }
@@ -655,6 +671,10 @@ export function compileNumericKernel(source, {
           continue;
         }
         const assignment = statement.type === 'ExpressionStatement' ? statement.expression : null;
+        if (assignment?.type === 'CallExpression' && assignment.callee.type === 'Identifier') {
+          bytes.push(...helperCall(assignment, depth, false));
+          continue;
+        }
         if (generalControl && assignment?.type === 'SequenceExpression') {
           bytes.push(...compileEffects(assignment, depth + 1));
           continue;
