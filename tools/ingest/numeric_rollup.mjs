@@ -25,13 +25,20 @@ export function numericKernelRollupPlugin(options = {}) {
   if (!options || typeof options !== "object" || Array.isArray(options))
     throw new TypeError("Numeric specialization options must be an object");
   for (const key of Object.keys(options)) {
-    if (!["maxKernels", "maxMemoryPages", "maxIterations", "crossModule"].includes(key))
+    if (!["maxKernels", "maxMemoryPages", "maxIterations", "crossModule", "loopIslands"].includes(key))
       throw new TypeError(`Unknown numeric specialization option: ${key}`);
   }
   // Application specialization is already opt-in. Connect its separate output
   // chunks by default; explicit false retains the old within-chunk behavior.
-  // The standalone source-transform API keeps its own conservative default.
-  const settings = { ...options, crossModule: options.crossModule === undefined ? true : options.crossModule };
+  // Explicit legacy crossModule:false also preserves its old defaults unless
+  // loopIslands is independently enabled.
+  // Closed loops inside retained callbacks/methods participate in the same
+  // opt-in application build; users need not extract functions by hand.
+  // The standalone source-transform API keeps its own conservative defaults.
+  const settings = { ...options,
+    crossModule: options.crossModule === undefined ? true : options.crossModule,
+    loopIslands: options.loopIslands === undefined ? options.crossModule !== false : options.loopIslands,
+  };
   // Validate budgets even for applications with no candidates.
   specializeNumericModule("", settings);
   let units, assets, finalReport;
@@ -117,11 +124,12 @@ export function numericKernelRollupPlugin(options = {}) {
       // when adding imports; downstream emitters must see the actual dependency.
       if (!chunk.imports.includes(dispatchName)) chunk.imports.push(dispatchName);
       const bindings = [
-        ...(result.report.compiledKernels ? [
+        ...((result.report.functionKernels ?? result.report.compiledKernels) ? [
           settings.crossModule ? "registerNumericDispatch" : "createNumericDispatch",
           "dispatchNumericCall",
         ] : []),
         ...(result.report.importedCalls?.length ? ["dispatchImportedNumericCall"] : []),
+        ...(result.report.loopIslands?.compiledKernels ? ["createNumericLoopDispatch", "dispatchNumericLoop"] : []),
       ];
       // Consumer-only chunks import only the lookup; producer-only chunks do
       // not pretend to call imports. Preserve any pre-existing runtime binding.
@@ -170,6 +178,10 @@ export function numericKernelRollupPlugin(options = {}) {
           importedCalls: reports.reduce((sum, report) => sum + (report.importedCalls?.length ?? 0), 0),
         } : {}),
         compiledKernels: reports.reduce((sum, report) => sum + report.compiledKernels, 0),
+        ...(settings.loopIslands ? {
+          compiledLoopIslands: reports.reduce((sum, report) => sum + (report.loopIslands?.compiledKernels ?? 0), 0),
+          loopIslandScope: "closed-loop-statements-with-live-lexical-captures",
+        } : {}),
         rewrittenCalls: reports.reduce((sum, report) => sum + report.rewrittenCalls, 0),
         runtimeAssets: [...assets].map(([fileName, source]) => ({
           fileName,
