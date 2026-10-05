@@ -161,11 +161,11 @@ function capturesFor(loop, ancestors, bindings, helperDeclarations) {
 export function planNumericLoopIslands(source, {
   ast, fresh, sourceName = '<module>', maxKernels = 64, maxMemoryPages = 1024,
   maxIterations = 1000000, excludedSpans = [], reservedEdits = [],
-  helperSources = new Map(), helperDeclarations = new Map(),
+  helperSources = new Map(), helperDeclarations = new Map(), replaceableCalls = [],
 }) {
   const report = {version:1, scope:'closed-loop-statements-in-original-lexical-environment',
     compiledKernels:0, candidates:[], accelerated:false};
-  const edits = [], registrations = [], runtimeImports = [], accepted = [];
+  const edits = [], registrations = [], runtimeImports = [], accepted = [], absorbedEdits = new Set();
   const candidates = [], bindings = scopeBindings(), hints = discoverNumericStorageHints(ast);
   const helperMath = new Map();
   function usesHelperMath(name) {
@@ -210,7 +210,15 @@ export function planNumericLoopIslands(source, {
     report.candidates.push(item);
     if (report.compiledKernels >= maxKernels) { item.reason='KERNEL_BUDGET'; continue; }
     if (ancestors.at(-1)?.type === 'LabeledStatement') { item.reason='ISLAND_LABELED_LOOP'; continue; }
-    if (reservedEdits.some(edit => contains(node,edit))) { item.reason='ISLAND_EXISTING_CALL_ROUTE'; continue; }
+    const nestedEdits = reservedEdits.filter(edit => contains(node, edit));
+    const nestedCalls = replaceableCalls.filter(call => contains(node, call));
+    // Previously selected direct-call routes are replaceable ONLY after the
+    // larger ORIGINAL region and all its helper bindings close successfully.
+    // Unknown edits stay reserved. A failed proof/budget never removes an
+    // existing route, and fallback keeps the original statement in place.
+    if (nestedEdits.some(edit => !nestedCalls.some(call => contains(call, edit)))) {
+      item.reason='ISLAND_EXISTING_CALL_ROUTE'; continue;
+    }
     const closure = capturesFor(node, ancestors, bindings, helperDeclarations);
     if (closure.refusal) { item.reason=closure.refusal; continue; }
     const {captures, arrays, usesMath, scalarOutputs} = closure;
@@ -281,6 +289,8 @@ export function planNumericLoopIslands(source, {
         `{ if (!${dispatchName}(${token}, () => [${captures.join(',')}], ${mathResolver})) {\n${source.slice(node.start,node.end)}\n} }`});
     }
     accepted.push(node); report.compiledKernels++;
+    for (const edit of nestedEdits) absorbedEdits.add(edit);
+    if (nestedCalls.length) item.absorbedCalls = nestedCalls.map(call => ({...call}));
     Object.assign(item, {route:'guarded-loop-wasm', captures:params.map(p => ({...p})),
       ...(stateName ? {scalarOutputs:[...scalarOutputs], scalarOutputSemantics:'mutable-lexical-f64-publication'} : {}),
       storageSemantics:'same-type-alias-preserving-v1', guardFallback:'original-loop-in-place',
@@ -297,5 +307,5 @@ export function planNumericLoopIslands(source, {
     });
     item.wasmBytes=item.variants.reduce((sum,v) => sum+v.wasmBytes,0);
   }
-  return {report, edits, registrations, runtimeImports};
+  return {report, edits, registrations, runtimeImports, absorbedEdits};
 }

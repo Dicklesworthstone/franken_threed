@@ -549,8 +549,28 @@ export function specializeNumericModule(
     const planned = planNumericLoopIslands(source, {
       ast, fresh, sourceName, maxKernels: maxKernels - report.compiledKernels,
       maxMemoryPages, maxIterations, reservedEdits: edits, helperSources, helperDeclarations,
+      replaceableCalls: report.candidates.flatMap(item => item.calls),
       excludedSpans: report.candidates.filter(item => item.route === "guarded-numeric-wasm").map(item => item.sourceSpan),
     });
+    // Replace smaller direct-call token edits only after a larger original
+    // statement has passed full closure. Its JS fallback is already embedded
+    // unchanged. Retain standalone registrations for calls elsewhere/exports;
+    // absorbed call sites must not count as separate host dispatch transitions.
+    for (let i = edits.length - 1; i >= 0; i--)
+      if (planned.absorbedEdits.has(edits[i])) edits.splice(i, 1);
+    const absorbed = new Set(planned.report.candidates.flatMap(item =>
+      (item.absorbedCalls ?? []).map(call => call.start)));
+    if (absorbed.size) {
+      for (const item of report.candidates) {
+        const calls = item.calls.filter(call => absorbed.has(call.start));
+        if (calls.length) {
+          item.absorbedCalls = calls;
+          item.calls = item.calls.filter(call => !absorbed.has(call.start));
+        }
+      }
+      report.rewrittenCalls -= absorbed.size;
+      report.absorbedCalls = absorbed.size;
+    }
     report.functionKernels = report.compiledKernels;
     report.loopIslands = planned.report;
     report.compiledKernels += planned.report.compiledKernels;
