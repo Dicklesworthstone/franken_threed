@@ -268,6 +268,29 @@ export const scenarios = {
     scene.add(knot, quad);
     return { scene, camera: camera(THREE) };
   },
+  // ShaderMaterial points: gl_PointSize squares, gl_PointCoord (GL upper-left
+  // origin) with discard, per-point size attribute, and a clipped-center point.
+  shader_points(THREE) {
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0a0a14);
+    const n = 40, pos = new Float32Array(n * 3), size = new Float32Array(n), col = new Float32Array(n * 3);
+    for (let i = 0; i < n; i++) {
+      const a = i / n * Math.PI * 2;
+      pos.set([Math.cos(a) * (0.4 + 0.03 * i), Math.sin(a) * 0.8, (i % 5) * 0.1], i * 3);
+      size[i] = 4 + (i % 7) * 5; col.set([(i % 3) / 2, ((i + 1) % 4) / 3, 1 - i / n], i * 3);
+    }
+    pos.set([1.9, 0, 0], 0); // center outside the frustum edge: GL drops the whole point
+    const g = new THREE.BufferGeometry().setAttribute('position', new THREE.BufferAttribute(pos, 3))
+      .setAttribute('size', new THREE.BufferAttribute(size, 1)).setAttribute('customColor', new THREE.BufferAttribute(col, 3));
+    const points = new THREE.Points(g, new THREE.ShaderMaterial({
+      vertexShader: `attribute float size; attribute vec3 customColor; varying vec3 vColor;
+        void main() { vColor = customColor; gl_PointSize = size; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+      fragmentShader: `varying vec3 vColor;
+        void main() { vec2 d = gl_PointCoord - vec2(0.5); if (dot(d, d) > 0.25) discard; gl_FragColor = vec4(vColor * (0.6 + gl_PointCoord.y * 0.4), 1.0); }`,
+    }));
+    scene.add(points);
+    return { scene, camera: camera(THREE) };
+  },
   // Per-axis normalScale on the derivative tangent frame (GLTFLoader sets y=-1 when
   // geometry has no tangents) and a flat-shaded lit mesh with no normal attribute.
   normal_scale_and_flat(THREE) {

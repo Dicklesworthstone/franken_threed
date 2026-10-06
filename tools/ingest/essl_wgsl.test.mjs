@@ -112,6 +112,18 @@ test('ESSL 1.00 sources: gl_FragColor and texture2D; texture() in vertex stages 
 test('invalid ESSL fails explicitly instead of being dropped', () => {
   assert.match(program(minimalVS, F('color = vec4(1);')).fragment, /vec4<f32>\(f32\(1\)\)/, 'constructors convert');
   assert.throws(() => program(minimalVS, F('float x = 1;')), /Type mismatch/);
-  assert.throws(() => program(minimalVS, F('color = vec4(gl_PointCoord, 0.0, 1.0);')), /point-sprite/);
+  assert.throws(() => program(minimalVS, F('color = vec4(gl_PointCoord, 0.0, 1.0);')), /point primitives/);
   assert.throws(() => compileEsslStage('fragment', F('undefinedCall();')), /Unknown function/);
+});
+
+test('points: each vertex becomes an instanced quad of gl_PointSize pixels; gl_PointCoord has GL upper-left origin', () => {
+  const r = compileEsslProgram(V('gl_PointSize = 8.0; gl_Position = mvp * vec4(position, 1.0);'), F('color = vec4(gl_PointCoord, 0.0, 1.0);'), {points: true, maxPointSize: 64});
+  assert.equal(r.reflection.points, true);
+  assert.equal(typeof r.reflection.targetOffset, 'number', 'viewport size needed for the pixel-to-NDC scale');
+  assert.match(r.vertex, /@builtin\(vertex_index\) f3d_corner_index: u32/);
+  assert.match(r.vertex, /clamp\(f3d_PointSize, 1\.0, 64\.0\)/);
+  assert.match(r.vertex, /f3d_corner \* f3d_size \/ f3d_u\.f3d_target\.zw \* f3d_p\.w/);
+  assert.match(r.vertex, /out\.f3d_point_coord = vec2<f32>\(0\.5 \+ 0\.5 \* f3d_corner\.x, 0\.5 - 0\.5 \* f3d_corner\.y\)/);
+  assert.match(r.vertex, /select\(vec4<f32>\(2\.0, 2\.0, 2\.0, 1\.0\)/, 'a clipped center drops the whole point');
+  assert.match(r.fragment, /f3d_PointCoord = input\.f3d_point_coord;/);
 });

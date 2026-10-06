@@ -432,9 +432,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         clearDepth: this._clearDepth,
       });
       const pr = this._pixelRatio, [bufferWidth, bufferHeight] = this._bufferSize();
-      if (this._shaderEncodedOutput && !this._hdr) frame.targetSize = [bufferWidth, bufferHeight];
       const v = this._viewport, px = this._pixelRound ?? Math.floor;
       const vx = px(v.x * pr), vw = px(v.z * pr), vh = px(v.w * pr);
+      // Program gl_FragCoord (framebuffer) and point-sprite sizes (viewport).
+      if (this._shaderEncodedOutput && !this._hdr) frame.targetSize = [bufferWidth, bufferHeight, vw, vh];
       // WebGL viewports/scissors use a bottom-left origin; WebGPU's is top-left.
       const vy = this._bottomLeftOrigin ? bufferHeight - px(v.y * pr) - vh : px(v.y * pr);
       const [minDepth, maxDepth] = this._viewportDepth;

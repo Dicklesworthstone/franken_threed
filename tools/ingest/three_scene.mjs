@@ -400,7 +400,6 @@ export async function createGpuThreeScene(device,scene,{
     return sides.map(side=>{
       const compiled=programSupport.compile(m,object,{fog:scene.fog,side});
       const reflection=compiled.program.reflection;
-      if(topology==='points'&&reflection.writesPointSize)fail('MATERIAL','Program point sizes need point-sprite expansion, which is not implemented');
       const sourceTextures=[],bindings=[],textureKey=[];
       for(const t of reflection.textures){
         const value=m.uniforms?.[t.name]?.value,texture=t.element===null?value:value?.[t.element];

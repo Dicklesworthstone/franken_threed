@@ -45,7 +45,7 @@ per element/column; integer varyings are flat.
 
 ## Explicit errors (not silently dropped)
 
-`gl_PointCoord` (point sprites need quad expansion), `gl_ClipDistance`,
+`gl_PointCoord` outside point programs, `gl_ClipDistance`,
 filtered sampling of integer textures, true `switch` fallthrough, struct stage
 I/O, `gl_FragData`, token pasting, type mismatches (ESSL has no implicit
 conversions).
@@ -82,12 +82,21 @@ instance step mode; absent attributes read GL's constant `(0, 0, 0, 1)`).
 Admitted on the WebGL-surface route without a renderer tone-mapping pass.
 
 Explicit errors for now: `lights: true`, skinned/morphed/batched objects,
-clipping planes, uniform groups, shadow casting, point sprites (`gl_PointSize`
-/ `gl_PointCoord`), integer attributes, 3D/array/shadow sampler textures,
-texture-uniform swaps without `prepare()`.
+clipping planes, uniform groups, shadow casting, indexed point sprites,
+integer attributes, 3D/array/shadow sampler textures, texture-uniform swaps
+without `prepare()`.
+
+Points: compiled with `points: true`, each vertex is an instanced quad of
+`gl_PointSize` pixels (clamped to [1, 1024], a common ANGLE
+`ALIASED_POINT_SIZE_RANGE`; the true GL maximum is device-dependent), a point
+whose center is outside the clip volume is dropped whole, and `gl_PointCoord`
+has GL's upper-left origin. Scenario `shader_points` matches upstream
+WebGLRenderer (424 of 76,800 pixels differ by ~1 on disc edges).
 
 Evidence: scenario `shader_material` matches upstream WebGLRenderer (total
 absolute channel difference 2 over 320×240). Examples now running:
 `webgl_custom_attributes`, `webgl_custom_attributes_lines`,
 `webgl_buffergeometry_selective_draw`, `webgl_buffergeometry_attributes_none`,
-`webgl_buffergeometry_instancing`, `webgl_buffergeometry_instancing_billboards`.
+`webgl_buffergeometry_instancing`, `webgl_buffergeometry_instancing_billboards`,
+`webgl_custom_attributes_points`, `webgl_custom_attributes_points3`,
+`webgl_buffergeometry_custom_attributes_particles`.

@@ -232,8 +232,8 @@ export function packThreeProgramUniforms(T, reflection, material, object, camera
     write(view, u.node, value, u.name);
   }
   if (reflection.targetOffset !== null) {
-    if (!targetSize) fail('FRAME', 'gl_FragCoord needs the framebuffer size');
-    view.setFloat32(reflection.targetOffset, targetSize[0], true); view.setFloat32(reflection.targetOffset + 4, targetSize[1], true);
+    if (!targetSize || targetSize.length !== 4) fail('FRAME', 'gl_FragCoord and point sprites need the framebuffer and viewport size');
+    for (let i = 0; i < 4; i++) view.setFloat32(reflection.targetOffset + 4 * i, targetSize[i], true);
   }
   return reflection.textures.map(t => {
     const v = material.uniforms?.[t.name]?.value;
@@ -296,17 +296,19 @@ function write(view, node, value, name, base = 0) {
  * state() reports the renderer-level inputs of WebGLPrograms.getParameters:
  * {toneMapping, toneMappingExposure, outputColorSpace}. Compiled programs are
  * cached by their exact assembled source text (bounded). */
-export function createThreeProgramSupport({three: T, state, maxPrograms = 256}) {
+export function createThreeProgramSupport({three: T, state, maxPrograms = 256, maxPointSize = 1024}) {
   const compiled = new Map();
   function compile(material, object, {fog = null, side = material.side} = {}) {
     const s = state();
     const sources = threeProgramSources(T, material, object, {fog, side, toneMapping: s.toneMapping, outputColorSpace: s.outputColorSpace});
-    let entry = compiled.get(sources.key);
+    // GL rasterizes Points as gl_PointSize squares: compile the point-sprite form.
+    const points = object.isPoints === true, key = sources.key + (points ? '\u0000points' : '');
+    let entry = compiled.get(key);
     if (!entry) {
-      const program = compileEsslProgram(sources.vertex, sources.fragment);
-      entry = {key: sources.key, program, attributesKey: JSON.stringify(program.reflection.attributes)};
+      const program = compileEsslProgram(sources.vertex, sources.fragment, {points, maxPointSize});
+      entry = {key, program, attributesKey: JSON.stringify(program.reflection.attributes)};
       if (compiled.size >= maxPrograms) compiled.delete(compiled.keys().next().value);
-      compiled.set(sources.key, entry);
+      compiled.set(key, entry);
     }
     return entry;
   }

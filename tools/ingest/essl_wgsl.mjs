@@ -29,8 +29,11 @@
  *   behavior (derivatives undefined in divergent quads, identical to ESSL) by
  *   disabling WGSL's derivative_uniformity diagnostic. This is the same
  *   semantics, not a hidden approximation.
- * Unsupported constructs (gl_PointCoord, integer-texture filtering, true switch
- * fallthrough, struct/array varyings, ...) throw EsslError; nothing is dropped.
+ * Points (option points:true): each vertex is drawn as an instanced quad of
+ * gl_PointSize pixels (clamped to [1, maxPointSize]), a clipped center drops the
+ * whole point as GL does, and gl_PointCoord uses GL's upper-left origin.
+ * Unsupported constructs (gl_ClipDistance, integer-texture filtering, true switch
+ * fallthrough, struct varyings, ...) throw EsslError; nothing is dropped.
  * No performance claim.
  */
 import {preprocess, EsslError, essError} from './essl_preprocess.mjs';
@@ -106,8 +109,9 @@ const safe = name => (RESERVED.has(name) || name.startsWith('__') || name.starts
 const roundUp = (k, n) => Math.ceil(n / k) * k;
 
 /** Compile one program. Returns {vertex, fragment, reflection}. */
-export function compileEsslProgram(vertexSource, fragmentSource, {defines = {}, clipDepth = 'gl'} = {}) {
+export function compileEsslProgram(vertexSource, fragmentSource, {defines = {}, clipDepth = 'gl', points = false, maxPointSize = 1024} = {}) {
   if (clipDepth !== 'gl' && clipDepth !== 'webgpu') essError('clipDepth must be gl or webgpu');
+  if (typeof points !== 'boolean' || !(maxPointSize >= 1)) essError('Invalid point options');
   const shared = {
     uniforms: new Map(),      // name -> {type, field}
     uniformOrder: [],
@@ -121,6 +125,7 @@ export function compileEsslProgram(vertexSource, fragmentSource, {defines = {}, 
     const source = stage === 'vertex' ? vertexSource : fragmentSource;
     const pre = preprocess(source, {defines});
     units[stage] = new Unit(stage, parse(pre.tokens), shared, esslVersion(pre.version));
+    units[stage].points = points;
     units[stage].declare();
   }
   // Link stage interfaces before emitting either entry point.
@@ -141,9 +146,13 @@ export function compileEsslProgram(vertexSource, fragmentSource, {defines = {}, 
     if (input.builtin) continue;
     if (!varyings.some(v => v.name === input.name)) essError(`Fragment input ${input.name} is not written by the vertex stage`);
   }
-  const vertex = units.vertex.emit({varyings, clipDepth});
-  const fragment = units.fragment.emit({varyings, clipDepth});
-  return {vertex, fragment, reflection: reflect(shared, units, varyings)};
+  // Point sprites: GL rasterizes each vertex as a gl_PointSize square; here an
+  // instanced quad per vertex, with gl_PointCoord as one extra varying.
+  if (points) shared.needsTarget = true;
+  const pointCoordLocation = points ? location : null;
+  const vertex = units.vertex.emit({varyings, clipDepth, pointCoordLocation, maxPointSize});
+  const fragment = units.fragment.emit({varyings, clipDepth, pointCoordLocation});
+  return {vertex, fragment, reflection: {...reflect(shared, units, varyings), points, maxPointSize: points ? maxPointSize : null}};
 }
 
 /** Compile one stage without a partner (corpus validation and diagnostics):
@@ -274,6 +283,7 @@ const BUILTIN_VARS = {
   vertex: {gl_Position: {type: V('float', 4), w: 'f3d_Position', out: true}, gl_PointSize: {type: FLOAT, w: 'f3d_PointSize', out: true},
     gl_VertexID: {type: INT, w: 'f3d_VertexID'}, gl_InstanceID: {type: INT, w: 'f3d_InstanceID'}},
   fragment: {gl_FragCoord: {type: V('float', 4), w: 'f3d_FragCoord'}, gl_FrontFacing: {type: BOOL, w: 'f3d_FrontFacing'},
+    gl_PointCoord: {type: V('float', 2), w: 'f3d_PointCoord'},
     gl_FragDepth: {type: FLOAT, w: 'f3d_FragDepth', out: true}},
 };
 
@@ -464,7 +474,7 @@ class Unit {
     }
   }
   // ---- emission -----------------------------------------------------------
-  emit({varyings, clipDepth}) {
+  emit({varyings, clipDepth, pointCoordLocation = null, maxPointSize = 1024}) {
     const body = [];
     // Functions (user definitions only; prototypes merge into definitions).
     const groups = new Map();
@@ -495,7 +505,7 @@ class Unit {
     }
     const mainList = groups.get('main');
     if (!mainList?.length) essError(`${this.stage} shader has no main()`);
-    const entry = this.stage === 'vertex' ? this.vertexEntry(varyings, initLines, clipDepth) : this.fragmentEntry(varyings, initLines);
+    const entry = this.stage === 'vertex' ? this.vertexEntry(varyings, initLines, clipDepth, pointCoordLocation, maxPointSize) : this.fragmentEntry(varyings, initLines, pointCoordLocation);
     // Structs used by this unit (all known structs; unused ones are harmless).
     for (const [name, s] of this.shared.structs) {
       const fields = s.fields.map((f, i) => `${i === 0 ? '@align(16) ' : ''}${safe(f.name)}: ${this.wgsl(f.type)},`);
@@ -536,7 +546,7 @@ class Unit {
       default: return false;
     }
   }
-  vertexEntry(varyings, initLines, clipDepth) {
+  vertexEntry(varyings, initLines, clipDepth, pointCoordLocation = null, maxPointSize = 1024) {
     const fields = [], copy = [];
     let location = 0;
     for (const i of this.inputs) {
@@ -548,8 +558,18 @@ class Unit {
         location += i.type.c;
       } else { fields.push(`@location(${location}) ${i.w}: ${this.wgsl(i.type)},`); copy.push(`${i.w} = input.${i.w};`); location++; }
     }
-    if (this.used.has('gl_VertexID')) { fields.push('@builtin(vertex_index) f3d_vertex_index: u32,'); copy.push('f3d_VertexID = i32(input.f3d_vertex_index);'); }
-    if (this.used.has('gl_InstanceID')) { fields.push('@builtin(instance_index) f3d_instance_index: u32,'); copy.push('f3d_InstanceID = i32(input.f3d_instance_index);'); }
+    const points = pointCoordLocation !== null;
+    if (points) {
+      // One instance per source vertex; vertex_index selects the quad corner.
+      fields.push('@builtin(vertex_index) f3d_corner_index: u32,', '@builtin(instance_index) f3d_point_index: u32,');
+      if (this.used.has('gl_VertexID')) copy.push('f3d_VertexID = i32(input.f3d_point_index);');
+      if (this.used.has('gl_InstanceID')) copy.push('f3d_InstanceID = 0;');
+      this.builtinPrivate('gl_PointSize', BUILTIN_VARS.vertex.gl_PointSize);
+      copy.push('f3d_PointSize = 1.0;');
+    } else {
+      if (this.used.has('gl_VertexID')) { fields.push('@builtin(vertex_index) f3d_vertex_index: u32,'); copy.push('f3d_VertexID = i32(input.f3d_vertex_index);'); }
+      if (this.used.has('gl_InstanceID')) { fields.push('@builtin(instance_index) f3d_instance_index: u32,'); copy.push('f3d_InstanceID = i32(input.f3d_instance_index);'); }
+    }
     const outFields = ['@builtin(position) f3d_position: vec4<f32>,'], outCopy = [];
     for (const v of varyings) {
       const o = this.outputs.find(x => x.name === v.name);
@@ -559,18 +579,35 @@ class Unit {
         outCopy.push(`out.${o.w}${slot.suffix} = ${o.w}${slot.access};`);
       });
     }
+    if (points) outFields.push(`@location(${pointCoordLocation}) f3d_point_coord: vec2<f32>,`);
     const lines = [];
     if (fields.length) lines.push('struct F3DVertexIn {', ...fields.map(f => '  ' + f), '};');
     lines.push('struct F3DVertexOut {', ...outFields.map(f => '  ' + f), '};');
+    const pointLines = !points ? [] : [
+      // GL clips a point by its vertex: a center outside the clip volume drops the whole point.
+      '  let f3d_p = f3d_Position;',
+      '  let f3d_inside = all(abs(f3d_p.xyz) <= vec3<f32>(f3d_p.w)) && f3d_p.w > 0.0;',
+      `  let f3d_size = clamp(f3d_PointSize, 1.0, ${Number(maxPointSize).toFixed(1)});`,
+      '  let f3d_corner = array<vec2<f32>, 6>(vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(-1.0, 1.0), vec2<f32>(-1.0, 1.0), vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0))[input.f3d_corner_index];',
+      // Half-size in NDC is size / viewport (f3d_target.zw = viewport width/height in pixels).
+      '  let f3d_offset = f3d_corner * f3d_size / f3d_u.f3d_target.zw * f3d_p.w;',
+      '  out.f3d_position = select(vec4<f32>(2.0, 2.0, 2.0, 1.0), vec4<f32>(out.f3d_position.xy + f3d_offset, out.f3d_position.zw), f3d_inside);',
+      // GL gl_PointCoord: origin at the upper-left of the point square.
+      '  out.f3d_point_coord = vec2<f32>(0.5 + 0.5 * f3d_corner.x, 0.5 - 0.5 * f3d_corner.y);'];
     lines.push(`@vertex fn f3d_vertex(${fields.length ? 'input: F3DVertexIn' : ''}) -> F3DVertexOut {`,
       ...copy.map(x => '  ' + x), ...initLines.map(x => '  ' + x), `  ${this.mainName()}();`, '  var out: F3DVertexOut;',
       clipDepth === 'gl' ? '  out.f3d_position = vec4<f32>(f3d_Position.xy, (f3d_Position.z + f3d_Position.w) * 0.5, f3d_Position.w);'
         : '  out.f3d_position = f3d_Position;',
-      ...outCopy.map(x => '  ' + x), '  return out;', '}');
+      ...pointLines, ...outCopy.map(x => '  ' + x), '  return out;', '}');
     return lines;
   }
-  fragmentEntry(varyings, initLines) {
+  fragmentEntry(varyings, initLines, pointCoordLocation = null) {
     const fields = [], copy = [];
+    if (this.used.has('gl_PointCoord')) {
+      if (pointCoordLocation === null) essError('gl_PointCoord is only defined for point primitives');
+      fields.push(`@location(${pointCoordLocation}) f3d_point_coord: vec2<f32>,`);
+      copy.push('f3d_PointCoord = input.f3d_point_coord;');
+    }
     for (const i of this.inputs) {
       const v = varyings.find(x => x.name === i.name);
       i.location = v.location;
@@ -965,7 +1002,7 @@ class Unit {
       return this.essl1FragColor(e.name, e.line);
     const b = BUILTIN_VARS[this.stage][e.name];
     if (b && !this.lookup(e.name, ctx.scope)) { this.used.add(e.name); this.builtinPrivate(e.name, b); return {c: b.w, t: b.type}; }
-    if (e.name === 'gl_PointCoord') essError('gl_PointCoord requires point-sprite expansion, which is not implemented', e.line);
+    if (e.name === 'gl_PointCoord' && !this.points) essError('gl_PointCoord is only defined when drawing points (compile with points: true)', e.line);
     const s = this.lookup(e.name, ctx.scope);
     if (!s) essError(`Undeclared identifier ${e.name}`, e.line);
     switch (s.kind) {

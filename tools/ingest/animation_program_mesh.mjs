@@ -37,7 +37,11 @@ export function createProgramMeshes({device, format, depthFormat, sampleCount, m
     if (reflection.outputs.length > 1 || (reflection.outputs[0] && reflection.outputs[0].location !== 0))
       fail('ANIMATION_RENDER_OPTIONS', 'Multiple program outputs need multiple render targets');
     const geometry = programGeometrySnapshot(gpu, device);
-    const layouts = [...geometry.layouts];
+    const points = reflection.points === true;
+    if (points && topology !== 'points') fail('ANIMATION_RENDER_OPTIONS', 'Point programs draw point primitives');
+    if (points && (geometry.indexBuffer || geometry.instanced)) fail('ANIMATION_RENDER_GEOMETRY', 'Indexed or instanced point sprites are not admitted yet');
+    // Point sprites: one instance per source vertex (6-vertex quad each).
+    const layouts = points ? geometry.layouts.map(l => ({...l, stepMode: 'instance'})) : [...geometry.layouts];
     for (const location of geometry.channels.missing)
       layouts.push({arrayStride: 0, stepMode: 'vertex', attributes: [{shaderLocation: location, offset: 0, format: 'float32x4'}]});
     const a = ensureArena();
@@ -53,7 +57,7 @@ export function createProgramMeshes({device, format, depthFormat, sampleCount, m
         {binding: t.textureBinding, resource: textures[i].view}, {binding: t.samplerBinding, resource: textures[i].sampler}])}) : null;
       const vertexModule = device.createShaderModule({label: `${label}/vertex`, code: program.vertex});
       const fragmentModule = device.createShaderModule({label: `${label}/fragment`, code: program.fragment});
-      const primitiveTopology = {triangles: 'triangle-list', lines: 'line-list', 'line-strip': 'line-strip', points: 'point-list'}[topology];
+      const primitiveTopology = points ? 'triangle-list' : {triangles: 'triangle-list', lines: 'line-list', 'line-strip': 'line-strip', points: 'point-list'}[topology];
       if (!primitiveTopology) fail('ANIMATION_RENDER_OPTIONS', 'Invalid program topology');
       const pipeline = frontFace => device.createRenderPipelineAsync({label, layout,
         vertex: {module: vertexModule, entryPoint: 'f3d_vertex', buffers: layouts},
@@ -72,6 +76,7 @@ export function createProgramMeshes({device, format, depthFormat, sampleCount, m
     return {
       program: true, gpu, reflection, uniformGroup: allocated.value.uniformGroup, textureGroup: allocated.value.textureGroup,
       pipelines: {normal: pipelines[0], flipped: pipelines[1]}, geometrySignature: geometry.signature,
+      points,
       blended: !!raster.blend, alphaMode: raster.blend ? 'BLEND' : 'OPAQUE', blendConstant: raster.blendConstant ?? null,
       surfaceBuffer: null, lit: false, raster: {}, disposed: false,
     };
@@ -91,13 +96,21 @@ export function createProgramMeshes({device, format, depthFormat, sampleCount, m
     const range = geometry.drawRange;
     let first = Math.max(input.first ?? 0, range.first), end = Math.min((input.first ?? 0) + (input.count ?? extent), range.first + range.count, extent);
     const instanceCount = geometry.instanced ? Math.min(input.instanceCount ?? 1, geometry.instanceCapacity) : input.instanceCount ?? 1;
+    if (record.points) {
+      // Point sprites: count points become instances of a 6-vertex quad.
+      Object.assign(command, {record, first: 0, count: 6, firstInstance: first, pointCount: Math.max(0, end - first),
+        pipeline: input.frontFaceCW ? record.pipelines.flipped : record.pipelines.normal, program: {group: record.uniformGroup, offset},
+        vertexBuffers: [...geometry.vertexBuffers, ...geometry.channels.missing.map(() => constant)], indexBuffer: null, indexFormat: null,
+        instanceCount: Math.max(0, end - first), instanceBindGroup: null, blendConstant: record.blendConstant, stencilReference: null});
+      return geometry;
+    }
     Object.assign(command, {
       record, first, count: Math.max(0, end - first),
       pipeline: input.frontFaceCW ? record.pipelines.flipped : record.pipelines.normal,
       program: {group: record.uniformGroup, offset},
       vertexBuffers: [...geometry.vertexBuffers, ...geometry.channels.missing.map(() => constant)],
       indexBuffer: geometry.indexBuffer, indexFormat: geometry.indexFormat,
-      instanceCount, instanceBindGroup: null,
+      instanceCount, firstInstance: 0, instanceBindGroup: null,
       blendConstant: record.blendConstant, stencilReference: null,
     });
     return geometry;

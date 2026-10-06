@@ -42,7 +42,7 @@ export function encodeAnimationDraws(encoder, commands, length, {
       if (command.indexBuffer) {
         encoder.setIndexBuffer(command.indexBuffer, command.indexFormat);
         encoder.drawIndexed(count, command.instanceCount, first, 0, 0);
-      } else encoder.draw(count, command.instanceCount, first, 0);
+      } else encoder.draw(count, command.instanceCount, first, command.firstInstance ?? 0);
       calls++; i++;
       continue;
     }
@@ -76,7 +76,7 @@ function snapshot(command, lightGroup) {
     textureGroup: command.record.textureGroup, lit: command.record.lit,
     lightGroup: command.record.lit ? lightGroup : null,
     blend: blended(command.record),
-    programGroup: command.program?.group ?? null, programOffset: command.program?.offset ?? null};
+    programGroup: command.program?.group ?? null, programOffset: command.program?.offset ?? null, firstInstance: command.firstInstance ?? 0};
 }
 function matches(recorded, commands, length, lightGroup, start) {
   if (recorded.length !== length) return false;
@@ -88,7 +88,8 @@ function matches(recorded, commands, length, lightGroup, start) {
         a.surfaceBuffer !== r.surfaceBuffer || a.textureGroup !== r.textureGroup ||
         a.lit !== r.lit || a.lightGroup !== (r.lit ? lightGroup : null) ||
         a.blend !== blended(r) || a.vertexBuffers.length !== b.vertexBuffers.length ||
-        a.programGroup !== (b.program?.group ?? null) || a.programOffset !== (b.program?.offset ?? null))
+        a.programGroup !== (b.program?.group ?? null) || a.programOffset !== (b.program?.offset ?? null) ||
+        a.firstInstance !== (b.firstInstance ?? 0))
       return false;
     for (let slot = 0; slot < a.vertexBuffers.length; slot++)
       if (a.vertexBuffers[slot] !== b.vertexBuffers[slot]) return false;
