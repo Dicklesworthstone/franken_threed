@@ -47,7 +47,10 @@ function recordingDevice() {
   d.createCommandEncoder = () => {
     const e = encode();
     return {...e, beginRenderPass(desc) {
-      if (!desc.colorAttachments[0]?.view?.texture?.swapchain || desc.depthStencilAttachment) return e.beginRenderPass(desc);
+      if (!desc.colorAttachments[0]?.view?.texture?.swapchain || desc.depthStencilAttachment) {
+        const pass = e.beginRenderPass(desc), record = d.passes.at(-1);
+        return {...pass, setViewport(...v) { record.viewport = v; }, setScissorRect(...r) { record.scissor = r; }};
+      }
       const pass = {desc, draws: []}; d.outputPasses.push(pass);
       return {setPipeline() {}, setBindGroup() {}, draw(n) { pass.draws.push(n); }, end() {}};
     }};
@@ -189,10 +192,53 @@ test('tone mapping selects the HDR output pass at initialization', async () => {
   renderer.render(f.scene, f.camera);
   assert.equal(device.outputPasses.length, 1, 'whole-image output pass');
   assert.ok(!device.passes.at(-1).desc.colorAttachments[0].view.texture?.swapchain, 'scene renders offscreen');
+  // Default alpha:true: the transparent clear reaches a premultiplied output pass.
   f.scene.background = null;
-  assert.throws(() => renderer.render(f.scene, f.camera), {code: 'F3D_RENDERER_UNSUPPORTED'});
-  renderer.setClearAlpha(1);
   renderer.render(f.scene, f.camera);
+  assert.deepEqual(device.passes.at(-1).desc.colorAttachments[0].clearValue, {r: 0, g: 0, b: 0, a: 0});
+  renderer.dispose();
+});
+
+test('tone mapping can change after init: the output path is rebuilt on the same device', async () => {
+  const {renderer, device} = await create();
+  const f = sceneFixture();
+  await renderer.compileAsync(f.scene, f.camera);
+  renderer.render(f.scene, f.camera);
+  assert.equal(device.outputPasses.length, 0);
+  renderer.toneMapping = T.AgXToneMapping;
+  renderer.render(f.scene, f.camera);
+  await flush(renderer);
+  assert.equal(device.outputPasses.length, 1, 'deferred frame presented through the output pass');
+  renderer.toneMapping = T.NoToneMapping;
+  renderer.render(f.scene, f.camera);
+  await flush(renderer);
+  renderer.render(f.scene, f.camera);
+  assert.equal(device.outputPasses.length, 1, 'direct path again');
+  renderer.dispose();
+});
+
+test('viewport, scissor and clear() follow source CanvasTarget semantics', async () => {
+  const {renderer, device} = await create();
+  renderer.setPixelRatio(2); renderer.setSize(100, 50);
+  const f = sceneFixture();
+  await renderer.compileAsync(f.scene, f.camera);
+  renderer.setViewport(10, 5, 40, 20);
+  renderer.setScissor(-5, 0, 200, 20); renderer.setScissorTest(true);
+  renderer.render(f.scene, f.camera);
+  assert.deepEqual(renderer.getViewport(new T.Vector4()).toArray(), [10, 5, 40, 20]);
+  // Pixel-ratio scaling, top-left origin, scissor clamped into the drawing buffer.
+  assert.deepEqual(device.passes.at(-1).viewport, [20, 10, 80, 40, 0, 1]);
+  assert.deepEqual(device.passes.at(-1).scissor, [0, 0, 200, 40]);
+  renderer.setSize(100, 50); // setSize resets the viewport to the full canvas
+  assert.deepEqual(renderer.getViewport(new T.Vector4()).toArray(), [0, 0, 100, 50]);
+  renderer.autoClear = false;
+  renderer.setScissorTest(false);
+  renderer.setClearColor(0x00ff00, 1);
+  renderer.clear();
+  await flush(renderer);
+  const clearPass = device.passes.at(-1).desc;
+  assert.equal(clearPass.colorAttachments[0].loadOp, 'clear');
+  assert.equal(renderer.getMaxAnisotropy(), 16);
   renderer.dispose();
 });
 

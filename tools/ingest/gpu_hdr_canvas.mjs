@@ -34,9 +34,17 @@ export async function createGpuHdrCanvasRenderer(canvas, createRenderer, options
     fail('OPTIONS', 'Expected optional depth24plus/depth32float and one or four scene samples');
   if (!Number.isSafeInteger(hdr.maxBytes) || hdr.maxBytes < 1 || (hdr.label !== undefined && typeof hdr.label !== 'string'))
     fail('OPTIONS', 'Invalid HDR target budget or label');
-  const defaults = Object.freeze(animationOutputSettings(capture(output, OUTPUT_KEYS, 'output'), DEFAULTS));
   const target = capture(session.target ?? {}, ['format', 'depthFormat', 'sampleCount', 'alphaMode',
     'maxBytes', 'width', 'height'], 'presentation target');
+  // A premultiplied canvas composites over the page. The linear scene target is
+  // cleared/blended into premultiplied values (straight-alpha blending over a
+  // premultiplied clear), so the output pass reads premultiplied input and
+  // stores premultiplied output after the transfer function.
+  const transparent = target.alphaMode === 'premultiplied';
+  if (target.alphaMode !== undefined && !['opaque', 'premultiplied'].includes(target.alphaMode))
+    fail('OPTIONS', 'HDR canvas alpha mode must be opaque or premultiplied');
+  const defaults = Object.freeze(animationOutputSettings(capture(output, OUTPUT_KEYS, 'output'),
+    transparent ? {...DEFAULTS, inputAlpha: 'premultiplied', outputAlpha: 'premultiplied'} : DEFAULTS));
   if ((target.depthFormat !== undefined && target.depthFormat !== null) ||
       (target.sampleCount !== undefined && target.sampleCount !== 1))
     fail('OPTIONS', 'Use renderTarget for scene depth/MSAA; the output pass is single-sample and depthless');
@@ -94,7 +102,7 @@ export async function createGpuHdrCanvasRenderer(canvas, createRenderer, options
             fail('FRAME', 'Expected an opaque RGBA clear color');
           sceneFrame.clearColor = Array.from(clear);
           if (sceneFrame.clearColor.some(v => typeof v !== 'number' || !Number.isFinite(v) || v < 0 || v > 1) ||
-              sceneFrame.clearColor[3] !== 1) fail('FRAME', 'HDR canvas clear alpha must be one');
+              (!transparent && sceneFrame.clearColor[3] !== 1)) fail('FRAME', 'Opaque HDR canvas clear alpha must be one');
           live();
           offscreen.resize(texture.width, texture.height);
           offscreen.withFrame((attachments, source) => {

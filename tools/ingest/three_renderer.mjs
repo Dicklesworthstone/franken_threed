@@ -43,7 +43,7 @@ const NOT_INITIALIZED = 'THREE.Renderer: .render() called before the backend is 
 // r186 tone-mapping constants -> explicit output-pass names. CustomToneMapping (5)
 // is a shader hook and has no admitted equivalent.
 const TONE_MAPPINGS = new Map([[0, 'none'], [1, 'linear'], [2, 'reinhard'], [3, 'cineon'], [4, 'aces-filmic'], [6, 'agx'], [7, 'neutral']]);
-const PARAMETERS = new Set(['canvas', 'antialias', 'alpha', 'depth', 'stencil', 'samples', 'forceWebGL',
+const PARAMETERS = new Set(['outputType', 'canvas', 'antialias', 'alpha', 'depth', 'stencil', 'samples', 'forceWebGL',
   'logarithmicDepthBuffer', 'reversedDepthBuffer', 'powerPreference', 'requiredLimits', 'requiredFeatures',
   'device', 'outputBufferType', 'multiview', 'trackTimestamp', 'colorBufferType', 'getFallback', 'context']);
 const MAX_PENDING = 64;
@@ -204,11 +204,22 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._pixelRatio = 1;
       this._width = this.domElement.width;
       this._height = this.domElement.height;
+      // Source CanvasTarget viewport/scissor: logical units, top-left origin on
+      // WebGPU, scaled by the pixel ratio at render time.
+      this._viewport = new THREE.Vector4(0, 0, this._width, this._height);
+      this._viewportDepth = [0, 1];
+      this._scissor = new THREE.Vector4(0, 0, this._width, this._height);
+      this._scissorTest = false;
+      this._clearScene = null;
       this._renderTarget = null;
       this._initialized = false;
       this._initPromise = null;
       this._session = null;
       this._dispatcher = null;
+      this._device = null;
+      this._ownsDevice = false;
+      this._rebuild = false;
+      this._preparing = null;
       this._hdr = false;
       this._wanted = new Map();
       this._pending = [];
@@ -250,30 +261,48 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       if (this._disposed) fail('DISPOSED', 'Renderer is disposed');
       if (this.logarithmicDepthBuffer || this.reversedDepthBuffer) fail('UNSUPPORTED', 'Logarithmic and reversed depth buffers are not admitted');
       if (this.stencil) fail('UNSUPPORTED', 'Stencil framebuffers are not admitted on the default canvas');
-      const tone = this._toneMapping();
       const p = this._parameters;
-      const sampleCount = this.antialias || this.samples > 0 ? 4 : 1;
-      const depthFormat = this.depth ? 'depth24plus' : null;
-      const common = {
-        ...(p.device ? {device: p.device} : {}),
-        ...(p.powerPreference ? {powerPreference: p.powerPreference} : {}),
-        ...(p.requiredLimits ? {requiredLimits: p.requiredLimits} : {}),
-        ...(p.requiredFeatures ? {requiredFeatures: p.requiredFeatures} : {}),
-        ...(defaultGpu ? {gpu: defaultGpu} : {}),
-      };
-      const [width, height] = this._bufferSize();
-      // Tone mapping needs the linear HDR target plus a whole-image output pass;
-      // the direct path renders straight into the sRGB presentation view.
-      this._hdr = tone !== 'none';
-      this._session = this._hdr
-        ? await createGpuHdrCanvasRenderer(this.domElement, createDispatcher(this), {...common,
-          target: {width, height}, renderTarget: {depthFormat, sampleCount},
-          output: {toneMapping: tone, exposure: this.toneMappingExposure}})
-        : await createGpuCanvasRenderer(this.domElement, createDispatcher(this), {...common, lazyAttachments: true,
-          target: {width, height, depthFormat, sampleCount, alphaMode: this.alpha ? 'premultiplied' : 'opaque'}});
-      if (this._disposed) { this._session.dispose(); fail('DISPOSED', 'Renderer was disposed during initialization'); }
+      if (p.outputType !== undefined && p.outputType !== THREE.UnsignedByteType)
+        fail('UNSUPPORTED', 'Extended-range canvas output types are not admitted');
+      // The renderer owns one device for its lifetime so the output path can be
+      // rebuilt (tone mapping on/off) without losing it. A supplied device is borrowed.
+      if (p.device) this._device = p.device;
+      else {
+        const gpu = defaultGpu ?? globalThis.navigator?.gpu;
+        if (!gpu || typeof gpu.requestAdapter !== 'function') fail('UNAVAILABLE', 'WebGPU is unavailable in this host');
+        const adapter = await gpu.requestAdapter(p.powerPreference ? {powerPreference: p.powerPreference} : {});
+        if (!adapter) fail('UNAVAILABLE', 'No WebGPU adapter is available');
+        this._device = await adapter.requestDevice({requiredFeatures: p.requiredFeatures ?? [], requiredLimits: p.requiredLimits ?? {}});
+        this._ownsDevice = true;
+      }
+      this._preferredFormat = (defaultGpu ?? globalThis.navigator?.gpu)?.getPreferredCanvasFormat?.();
+      await this._createSession(this._toneMapping() !== 'none');
+      if (this._disposed) { this._release(); fail('DISPOSED', 'Renderer was disposed during initialization'); }
       this._initialized = true;
       return this;
+    }
+    /** Tone mapping needs the linear HDR target plus a whole-image output pass
+     * (the source renders through a half-float framebuffer target in that case);
+     * otherwise frames go straight into the sRGB presentation view. */
+    async _createSession(hdr) {
+      const sampleCount = this.antialias || this.samples > 0 ? 4 : 1;
+      const depthFormat = this.depth ? 'depth24plus' : null;
+      const [width, height] = this._bufferSize();
+      const common = {device: this._device};
+      const format = this._preferredFormat ? {format: this._preferredFormat} : {};
+      this._hdr = hdr;
+      this._dispatcher = null;
+      this._session = hdr
+        ? await createGpuHdrCanvasRenderer(this.domElement, createDispatcher(this), {...common,
+          target: {width, height, ...format, alphaMode: this.alpha ? 'premultiplied' : 'opaque'}, renderTarget: {depthFormat, sampleCount},
+          output: {toneMapping: this._toneMapping(), exposure: this.toneMappingExposure}})
+        : await createGpuCanvasRenderer(this.domElement, createDispatcher(this), {...common, lazyAttachments: true,
+          target: {width, height, depthFormat, sampleCount, ...format, alphaMode: this.alpha ? 'premultiplied' : 'opaque'}});
+    }
+    _release() {
+      this._session?.dispose();
+      this._session = null;
+      if (this._ownsDevice) { this._ownsDevice = false; this._device?.destroy(); }
     }
 
     _toneMapping() {
@@ -303,6 +332,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._width = width;
       this._height = height;
       this._resize();
+      this.setViewport(0, 0, width, height);
       if (updateStyle === true && this.domElement.style) {
         this.domElement.style.width = width + 'px';
         this.domElement.style.height = height + 'px';
@@ -313,7 +343,38 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._height = height;
       this._pixelRatio = pixelRatio;
       this._resize();
+      this.setViewport(0, 0, width, height);
     }
+    getViewport(target) { return target.copy(this._viewport); }
+    setViewport(x, y, width, height, minDepth = 0, maxDepth = 1) {
+      if (x.isVector4) this._viewport.copy(x); else this._viewport.set(x, y, width, height);
+      this._viewportDepth = [minDepth, maxDepth];
+    }
+    getScissor(target) { return target.copy(this._scissor); }
+    setScissor(x, y, width, height) {
+      if (x.isVector4) this._scissor.copy(x); else this._scissor.set(x, y, width, height);
+    }
+    getScissorTest() { return this._scissorTest; }
+    setScissorTest(value) { this._scissorTest = value; }
+    // WebGPU's maximum sampler anisotropy, as the source WebGPU backend reports.
+    getMaxAnisotropy() { return 16; }
+    getActiveCubeFace() { return 0; }
+    getActiveMipmapLevel() { return 0; }
+    /** Source Renderer.clear(): a clear-only pass on the canvas with the current
+     * clear color/depth, honoring viewport/scissor state like other passes. */
+    clear(color = true, depth = true) {
+      if (this._initialized === false) return;
+      this._clearScene ??= new THREE.Scene();
+      this._clearCamera ??= new THREE.PerspectiveCamera();
+      this._renderFrame(this._clearScene, this._clearCamera, {color, depth});
+    }
+    clearColor() { this.clear(true, false); }
+    clearDepth() { this.clear(false, true); }
+    clearStencil() {}
+    async clearAsync(color = true, depth = true) { await this.init(); this.clear(color, depth); }
+    async clearColorAsync() { await this.clearAsync(true, false); }
+    async clearDepthAsync() { await this.clearAsync(false, true); }
+    async clearStencilAsync() {}
     getClearColor(target) { target.copy(this._clearColor); if ('a' in target) target.a = this._clearAlpha; return target; }
     setClearColor(color, alpha = 1) { this._clearColor.set(color); this._clearAlpha = alpha; }
     getClearAlpha() { return this._clearAlpha; }
@@ -330,29 +391,39 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     getContext() { return this._initialized ? this.domElement.getContext('webgpu') : null; }
 
     // ---- frames ----
-    _frame(scene) {
+    _frame(scene, clearOnly = null) {
       if (this._renderTarget !== null) fail('UNSUPPORTED', 'Offscreen source render targets are not admitted');
       if (this.xr.enabled && this.xr.isPresenting) fail('UNSUPPORTED', 'XR presentation is not admitted');
       if (this.outputColorSpace !== SRGBColorSpace) fail('UNSUPPORTED', 'Only sRGB canvas output is admitted');
       const tone = this._toneMapping();
-      if (!this._hdr && tone !== 'none') fail('UNSUPPORTED', 'Enable tone mapping before init(); the session output path is fixed at initialization');
+      // Switching between direct and tone-mapped output rebuilds the canvas
+      // session (same device) at the next preparation boundary.
+      this._rebuild = (tone !== 'none') !== this._hdr;
       const clear = this.autoClear === true;
       const color = this._clearColor, a = this._clearAlpha;
       // Source Background semantics: the renderer clear color is premultiplied
       // for alpha canvases; an opaque canvas ignores alpha.
       const premultiply = this.alpha === true;
       const frame = {
-        loadOp: clear && this.autoClearColor ? 'clear' : 'load',
-        depthLoadOp: clear && this.autoClearDepth ? 'clear' : 'load',
+        loadOp: (clearOnly ? clearOnly.color : clear && this.autoClearColor) ? 'clear' : 'load',
+        depthLoadOp: (clearOnly ? clearOnly.depth : clear && this.autoClearDepth) ? 'clear' : 'load',
         clearColor: premultiply ? [color.r * a, color.g * a, color.b * a, a] : [color.r, color.g, color.b, 1],
         clearDepth: this._clearDepth,
       };
+      const pr = this._pixelRatio, [bufferWidth, bufferHeight] = this._bufferSize();
+      const v = this._viewport, vx = Math.floor(v.x * pr), vy = Math.floor(v.y * pr), vw = Math.floor(v.z * pr), vh = Math.floor(v.w * pr);
+      const [minDepth, maxDepth] = this._viewportDepth;
+      if (vx !== 0 || vy !== 0 || vw !== bufferWidth || vh !== bufferHeight || minDepth !== 0 || maxDepth !== 1)
+        frame.viewport = [vx, vy, vw, vh, minDepth, maxDepth];
+      if (this._scissorTest) {
+        // Source clamping: non-negative and inside the drawing buffer.
+        const sc = this._scissor;
+        const sx = Math.max(0, Math.floor(sc.x * pr)), sy = Math.max(0, Math.floor(sc.y * pr));
+        const sw = Math.max(0, Math.min(Math.floor(sc.z * pr), bufferWidth - sx)), sh = Math.max(0, Math.min(Math.floor(sc.w * pr), bufferHeight - sy));
+        if (sx !== 0 || sy !== 0 || sw !== bufferWidth || sh !== bufferHeight) frame.scissor = [sx, sy, sw, sh];
+      }
       if (this._hdr) {
-        // The tone-mapped output pass presents an opaque canvas. Only a scene
-        // background or an opaque clear makes that equal to the source result.
-        if (this.alpha === true && a < 1 && frame.loadOp === 'clear' && !scene.background)
-          fail('UNSUPPORTED', 'Transparent canvas clears are not admitted with tone mapping; set an opaque clear alpha or scene background');
-        frame.clearColor[3] = 1;
+        if (this.alpha !== true) frame.clearColor[3] = 1;
         frame.output = {toneMapping: tone, exposure: this.toneMappingExposure};
       }
       return frame;
@@ -370,11 +441,11 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._inspector.beginRender(`render:${++this._renderUid}:f${this.info.frame}`, scene, camera, null);
       try { return this._renderFrame(scene, camera); } finally { this._inspector.finishRender(); }
     }
-    _renderFrame(scene, camera) {
-      const request = {scene, camera, frame: this._frame(scene), key: sceneKey(this, scene)};
+    _renderFrame(scene, camera, clearOnly = null) {
+      const request = {scene, camera, clearOnly, frame: this._frame(scene, clearOnly), key: sceneKey(this, scene)};
       this._wanted.set(scene, request.key);
       const entry = this._dispatcher?.entry(scene);
-      if (this._drain || !entry || entry.key !== request.key) return this._defer(request);
+      if (this._drain || this._rebuild || !entry || entry.key !== request.key) return this._defer(request);
       try {
         this._submit(request);
       } catch (error) {
@@ -409,7 +480,13 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     async _drainPending() {
       for (let rounds = 0; this._pending.length; rounds++) {
         if (rounds > 8) fail('PREPARE', 'Source structure kept changing during preparation');
-        await this._session.prepare();
+        if (this._rebuild) {
+          const hdr = this._toneMapping() !== 'none';
+          this._session.dispose();
+          await this._createSession(hdr);
+          this._rebuild = false;
+        }
+        await this._prepare();
         this.info.f3d.preparations++;
         if (this._disposed) return;
         const batch = this._pending;
@@ -421,6 +498,9 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           this._wanted.set(request.scene, key);
           try {
             if (!entry || entry.key !== key) fail('PREPARE', 'Scene profile changed during preparation');
+            // The output path may have been rebuilt: derive frame state for it now.
+            request.frame = this._frame(request.scene, request.clearOnly);
+            if (this._rebuild) fail('PREPARE', 'Output path changed during preparation');
             this._submit(request);
           } catch (error) {
             if (!isPrepareBoundary(error)) throw error;
@@ -442,8 +522,16 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       if (camera !== undefined && !(camera instanceof THREE.Camera)) fail('SOURCE', 'Expected a source camera');
       this._wanted.set(scene, sceneKey(this, scene));
       while (this._drain) await this._drain;
-      await this._session.prepare();
-      this.info.f3d.preparations++;
+      await this._prepare();
+    }
+    /** Serialized preparation: overlapping compileAsync/deferred frames share one queue. */
+    _prepare() {
+      const run = (this._preparing ?? Promise.resolve()).catch(() => {}).then(async () => {
+        await this._session.prepare();
+        this.info.f3d.preparations++;
+      });
+      this._preparing = run;
+      return run;
     }
     async waitForGPU() { if (this._session) await this._session.whenIdle(); }
 
@@ -477,8 +565,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._disposed = true;
       this._pending = [];
       this._inspector.dispose?.();
-      if (this._session && !this._drain) this._session.dispose();
-      else if (this._drain) this._drain.finally(() => this._session?.dispose()).catch(() => {});
+      if (!this._drain) this._release();
+      else this._drain.finally(() => this._release()).catch(() => {});
     }
   }
   return WebGPURenderer;
