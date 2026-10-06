@@ -37,6 +37,8 @@ const hasOwn = Object.hasOwn;
 const functionSource = Function.prototype.toString;
 const mathHost = globalThis;
 const MATH_SEMANTICS = 'f64-operator-order+guarded-math-v1';
+const ARRAY_METHOD_SEMANTICS = 'f64-operator-order+guarded-array-methods-v1';
+const ARRAY_METHOD_NAMES = Object.freeze(['copyWithin', 'fill', 'set']);
 const MATH_NAMES = Object.freeze(['abs', 'ceil', 'clz32', 'floor', 'fround', 'imul', 'max', 'min', 'round', 'sign', 'sqrt', 'trunc']);
 function dataValue(object, key) {
   const entry = descriptor(object, key);
@@ -65,6 +67,11 @@ const typedBuffer = descriptor(typedPrototype, 'buffer').get;
 const typedOffset = descriptor(typedPrototype, 'byteOffset').get;
 const typedTag = descriptor(typedPrototype, Symbol.toStringTag).get;
 const typedSet = typedPrototype.set;
+const arrayMethods = new Map(ARRAY_METHOD_NAMES.map(name => {
+  const value = dataValue(typedPrototype, name);
+  return [name, typeof value === 'function' &&
+    apply(functionSource, value, []) === `function ${name}() { [native code] }` ? value : null];
+}));
 const bufferLength = descriptor(ArrayBuffer.prototype, 'byteLength').get;
 const resizable = descriptor(ArrayBuffer.prototype, 'resizable')?.get;
 const immutable = descriptor(ArrayBuffer.prototype, 'immutable')?.get;
@@ -92,7 +99,7 @@ function indexedManifest(manifest) {
   const arrays = [], names = new Set();
   const integerAbi = manifest.version === 9;
   if (manifest.kind !== (generalControl ? 'closed-numeric-control' : 'closed-indexed-numeric') ||
-      !['f64-operator-order', MATH_SEMANTICS].includes(manifest.numericSemantics) ||
+      !['f64-operator-order', MATH_SEMANTICS, ARRAY_METHOD_SEMANTICS].includes(manifest.numericSemantics) ||
       manifest.indexSemantics !== 'checked-integer-full-view-v1' ||
       (integerAbi ? manifest.integerSemantics !== 'ecmascript-integer-elements-v1'
         : manifest.integerSemantics !== undefined) ||
@@ -152,7 +159,18 @@ function readManifest(module, wasm) {
   let manifest;
   try { manifest = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(sections[0])); }
   catch (cause) { throw new NumericKernelGuardError('KERNEL_ABI_MISMATCH', 'Invalid ABI metadata', { cause }); }
-  const guardedMath = manifest?.numericSemantics === MATH_SEMANTICS;
+  const guardedArrays = manifest?.numericSemantics === ARRAY_METHOD_SEMANTICS;
+  if (guardedArrays ? ![8, 9].includes(manifest.version) || manifest.kind !== 'closed-numeric-control' ||
+      !Array.isArray(manifest.typedArrayMethods) || !manifest.typedArrayMethods.length ||
+      manifest.typedArrayMethods.length > ARRAY_METHOD_NAMES.length ||
+      new Set(manifest.typedArrayMethods).size !== manifest.typedArrayMethods.length ||
+      manifest.typedArrayMethods.some(name => !ARRAY_METHOD_NAMES.includes(name))
+    : manifest?.typedArrayMethods !== undefined) {
+    refuse('KERNEL_ABI_MISMATCH', 'Invalid guarded typed-array method requirements');
+  }
+  if (guardedArrays) Object.freeze(manifest.typedArrayMethods);
+  const guardedMath = manifest?.numericSemantics === MATH_SEMANTICS ||
+    (guardedArrays && manifest.mathIntrinsics !== undefined);
   if (guardedMath ? !Array.isArray(manifest.mathIntrinsics) ||
       !manifest.mathIntrinsics.length || manifest.mathIntrinsics.length > MATH_NAMES.length ||
       new Set(manifest.mathIntrinsics).size !== manifest.mathIntrinsics.length ||
@@ -244,7 +262,7 @@ function readManifest(module, wasm) {
   return Object.freeze(manifest);
 }
 
-function arrayInfo(value, param, checkLength) {
+function arrayInfo(value, param, checkLength, methods = []) {
   const { name } = param;
   const { ArrayType, tag, elementBytes } = ARRAY_TYPES[param.type];
   // Native slot access rejects proxies without running their traps or user getters.
@@ -254,6 +272,12 @@ function arrayInfo(value, param, checkLength) {
   if (checkLength && (descriptor(value, 'length') || descriptor(ArrayType.prototype, 'length') ||
       prototype(ArrayType.prototype) !== typedPrototype || descriptor(typedPrototype, 'length')?.get !== typedLength)) {
     refuse('KERNEL_MUTABLE_LENGTH', `${name}.length no longer has intrinsic semantics`);
+  }
+  for (const name of methods) {
+    if (!arrayMethods.get(name) || descriptor(value, name) || descriptor(ArrayType.prototype, name) ||
+        prototype(ArrayType.prototype) !== typedPrototype || dataValue(typedPrototype, name) !== arrayMethods.get(name)) {
+      refuse('KERNEL_ARRAY_METHOD', `${name} no longer has intrinsic typed-array semantics`);
+    }
   }
   const buffer = apply(typedBuffer, value, []);
   try {
@@ -413,7 +437,7 @@ export function instantiateNumericKernel(bytes, {
       if (param.type === 'f64') {
         if (typeof args[i] !== 'number') refuse('KERNEL_SCALAR_TYPE', `${param.name} must be a number without coercion`);
       } else {
-        records.push({ ...arrayInfo(args[i], param, boundSet.has(i)), param, index: i });
+        records.push({ ...arrayInfo(args[i], param, boundSet.has(i), manifest.typedArrayMethods), param, index: i });
       }
     }
     const lengths = new Map(records.map(record => [record.index, record.length]));
@@ -506,6 +530,10 @@ export function instantiateNumericKernel(bytes, {
       // Revalidate after preparation (including a possible host memory.grow).
       // The import-free Wasm call cannot rebind Math before publication.
       checkMath();
+      if (manifest.typedArrayMethods) for (let i = 0; i < manifest.parameters.length; i++) {
+        const param = manifest.parameters[i];
+        if (param.type !== 'f64') arrayInfo(args[i], param, boundSet.has(i), manifest.typedArrayMethods);
+      }
       result = execute(...prepared.values, ...prepared.counts);
       if (manifest.version >= 5 && manifest.resultType === 'f64' && typeof result !== 'number') {
         refuse('KERNEL_ABI_MISMATCH', 'Numeric return was not produced before publication');

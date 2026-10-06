@@ -13,6 +13,7 @@
  * helpers are admitted only where the caller discards the result.
  */
 import * as acorn from 'acorn';
+import { compileTypedArrayOperation } from './numeric_typed_array_ops.mjs';
 import { createArrayReferenceCompiler, arrayPointer, arrayLength, reboundArrayParameters } from './numeric_array_references.mjs';
 import { BITWISE_OPS, INTEGER_ARRAY_LAYOUTS, emitBitwiseBinary, emitBitwiseNot,
   emitToUint32, emitToUint8Clamp } from './numeric_integer.mjs';
@@ -371,7 +372,10 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
             // Empty bodies/for clauses still spend credit at the body boundary.
           } else {
             const update = statement.type === 'ExpressionStatement' ? statement.expression : null;
-            if (update?.type === 'CallExpression' && update.callee.type === 'Identifier') {
+            const bulk = compileTypedArrayOperation(update, {resolveArray, expression, allocateLocal,
+              control, fail, loopDepth, owner});
+            if (bulk) { bytes.push(...bulk); }
+            else if (update?.type === 'CallExpression' && update.callee.type === 'Identifier') {
               bytes.push(...call(update, arg => expression(arg), environment.has(update.callee.name), owner, loopDepth, resolveArray, false));
             } else if (control && update?.type === 'SequenceExpression') {
               bytes.push(...effects(update, depth + 1));

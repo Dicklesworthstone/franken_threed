@@ -12,6 +12,7 @@
  * opt-in ABI is not proof of whole-application closure or a speedup claim.
  */
 import * as acorn from 'acorn';
+import { compileTypedArrayOperation } from './numeric_typed_array_ops.mjs';
 import { createArrayReferenceCompiler, arrayPointer, arrayLength, reboundArrayParameters } from './numeric_array_references.mjs';
 import { createScalarHelperCompiler } from './numeric_helpers.mjs';
 import { createMathIntrinsicCompiler } from './numeric_intrinsics.mjs';
@@ -254,6 +255,14 @@ export function compileNumericKernel(source, {
     return false;
   })();
   const control = generalControl ? {
+    methods: new Set(),
+    charge(count) {
+      if (!sharedLoopBudget && generalFuel === null) generalFuel = temporaryBase + temporaryCount++;
+      const read = sharedLoopBudget ? [0x23, 0] : get(generalFuel);
+      const write = sharedLoopBudget ? [0x24, 0] : set(generalFuel);
+      return [...read, ...count, 0xa0, ...number(maxIterations), 0x64, 0x04, 0x40, 0x00, 0x0b,
+        ...read, ...count, 0xa0, ...write];
+    },
     enterLoop() {
       const read = sharedLoopBudget ? [0x23, 0] : get(generalFuel);
       const write = sharedLoopBudget ? [0x24, 0] : set(generalFuel);
@@ -268,7 +277,7 @@ export function compileNumericKernel(source, {
       if (controlLoops.length >= 64) fail('General control exceeds the 64-loop limit', node);
       this.checkDepth(depth, node);
       controlLoops.push(Object.freeze({
-        kind: node.type === 'DoWhileStatement' ? 'do-while' : node.type === 'WhileStatement' ? 'while' : 'for',
+        kind: node.type === 'CallExpression' ? `typed-array-${node.callee.property.name}` : node.type === 'DoWhileStatement' ? 'do-while' : node.type === 'WhileStatement' ? 'while' : 'for',
         depth, ...(functionName ? { functionName } : {}),
         sourceSpan: Object.freeze({ start: node.start, end: node.end,
           line: node.loc?.start.line, column: node.loc?.start.column }),
@@ -697,6 +706,9 @@ export function compileNumericKernel(source, {
           continue;
         }
         const assignment = statement.type === 'ExpressionStatement' ? statement.expression : null;
+        const bulk = compileTypedArrayOperation(assignment, {resolveArray:helperArray, expression,
+          allocateLocal:() => temporaryBase + temporaryCount++, control, fail, loopDepth:generalDepth});
+        if (bulk) { bytes.push(...bulk); continue; }
         if (assignment?.type === 'CallExpression' && assignment.callee.type === 'Identifier') {
           bytes.push(...helperCall(assignment, depth, false));
           continue;
@@ -823,8 +835,9 @@ export function compileNumericKernel(source, {
     } : { boundParameter: boundParam.index }),
     maxMemoryPages,
     // Older hosts reject this semantic contract, rather than skipping guards.
-    numericSemantics: mathIntrinsics.length ? 'f64-operator-order+guarded-math-v1' : 'f64-operator-order',
+    numericSemantics: control?.methods.size ? 'f64-operator-order+guarded-array-methods-v1' : mathIntrinsics.length ? 'f64-operator-order+guarded-math-v1' : 'f64-operator-order',
     ...(mathIntrinsics.length ? { mathIntrinsics } : {}),
+    ...(control?.methods.size ? { typedArrayMethods: [...control.methods].sort() } : {}),
     ...(integerAbi ? { integerSemantics: 'ecmascript-integer-elements-v1' } : {}),
     automaticRouteAdmission: false,
   };
