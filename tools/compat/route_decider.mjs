@@ -135,6 +135,9 @@ export function decideRendererRoute(input = {}) {
     ...input.hostCapabilities,
   };
   const specializationAvailable = input.specializationAvailable ?? false;
+  // A general new-backend WebGPURenderer implementation is admitted only when the
+  // caller (build or runtime router) explicitly supplies it.
+  const generalWebGPUAvailable = input.generalWebGPUAvailable ?? false;
 
   const reasons = [];
 
@@ -237,8 +240,16 @@ export function decideRendererRoute(input = {}) {
         constructorName,
       };
     }
-    // Interim Phase 0/1 or when specialization is not ready: retained upstream WebGPU
     reasons.push(EscapeReason.SPECIALIZATION_UNAVAILABLE);
+    if (generalWebGPUAvailable) {
+      return {
+        route: ExecutionRoute.GENERAL_WEBGPU,
+        reasons: [...reasons, "general-webgpu-admitted"],
+        sourceSpan,
+        constructorName,
+      };
+    }
+    // Interim Phase 0/1 or when no new-backend implementation is supplied: retained upstream WebGPU
     return {
       route: ExecutionRoute.RETAINED_UPSTREAM,
       reasons,

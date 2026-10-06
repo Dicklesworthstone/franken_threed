@@ -280,7 +280,7 @@ test("all material maps, independent UVs, alpha and both normal frames coexist w
     assert.match(shader, /rgba.a < draw_info.options.x/);
     assert.ok(
       shader.indexOf("result += environment_lighting") <
-        shader.indexOf("for (var i = 0u; i < u32(lighting.meta.x)"),
+        shader.indexOf("for (var i = 0u; i < u32(lighting.light_params.x)"),
     );
     assert.equal(shader.includes("dpdx(input.world)"), !tangent);
     assert.match(shader, /projected_shadow\(position, normal\)/);

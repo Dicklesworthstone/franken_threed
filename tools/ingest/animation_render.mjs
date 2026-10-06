@@ -397,7 +397,7 @@ function surfaceShader(
   const lighting = lit
     ? /* wgsl */ `
 struct Light { vector: vec4<f32>, radiance: vec4<f32>, direction: vec4<f32>, cone: vec4<f32> }
-struct Lighting { camera: vec4<f32>, meta: vec4<f32>, lights: array<Light, 8> }
+struct Lighting { camera: vec4<f32>, light_params: vec4<f32>, lights: array<Light, 8> }
 @group(${textured ? 2 : 1}) @binding(0) var<uniform> lighting: Lighting;
 ${shadowed ? projectedShadowWgsl(textured ? 2 : 1) : ""}${environmentCode ? "\n" + environmentCode : ""}
 fn unit_vector(v: vec3<f32>) -> vec3<f32> {
@@ -411,7 +411,7 @@ fn illuminate(base: vec3<f32>, position: vec3<f32>, normal: vec3<f32>, metallic:
   if (lighting.camera.w > 0.0) { view = lighting.camera.xyz; }
   let nv = max(dot(normal, view), 0.0);
   var result = emission;${environmentCode ? "\n  result += environment_lighting(base, normal, view, metallic, roughness, draw_info.options.z == 2.0)" + (ambientOcclusion ? " * occlusion" : "") + ";" : ""}
-  for (var i = 0u; i < u32(lighting.meta.x); i++) {
+  for (var i = 0u; i < u32(lighting.light_params.x); i++) {
     let light = lighting.lights[i];
     ${indirectLights ? `// Light kind is frame-uniform. Keep derivative/
     // implicit-sample toon work
