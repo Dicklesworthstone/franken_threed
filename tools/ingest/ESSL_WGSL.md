@@ -61,3 +61,33 @@ conversions).
   measured per scenario in `tests/e2e/webgpu_renderer`.
 
 No performance claim.
+
+## ShaderMaterial render path
+
+`three_program.mjs` assembles each ShaderMaterial / RawShaderMaterial program
+exactly as r186 `WebGLProgram` does for the parameters it can reach (precision
+block, SHADER_* and material defines, attribute/instancing/fog defines,
+built-in declarations, ESSL 3.00 macros, live `ShaderChunk` includes,
+`unroll_loop` expansion, tone-mapping and output-encoding functions), maps
+material state with `WebGLState` semantics (blend table, BACK culling with
+front-face flips for BackSide and negative determinants), and packs current
+uniform values every frame (built-ins from camera/object, `material.uniforms`
+otherwise; fog uniforms refreshed into the material as WebGLRenderer does).
+
+The scene bridge draws programs in the same passes and source order as other
+materials (`animation_program_mesh.mjs`): each logical draw gets its own
+uniform-arena slice, attributes come from geometry by name at the reflected
+locations (InstancedBufferGeometry / InstancedMesh instance attributes use
+instance step mode; absent attributes read GL's constant `(0, 0, 0, 1)`).
+Admitted on the WebGL-surface route without a renderer tone-mapping pass.
+
+Explicit errors for now: `lights: true`, skinned/morphed/batched objects,
+clipping planes, uniform groups, shadow casting, point sprites (`gl_PointSize`
+/ `gl_PointCoord`), integer attributes, 3D/array/shadow sampler textures,
+texture-uniform swaps without `prepare()`.
+
+Evidence: scenario `shader_material` matches upstream WebGLRenderer (total
+absolute channel difference 2 over 320×240). Examples now running:
+`webgl_custom_attributes`, `webgl_custom_attributes_lines`,
+`webgl_buffergeometry_selective_draw`, `webgl_buffergeometry_attributes_none`,
+`webgl_buffergeometry_instancing`, `webgl_buffergeometry_instancing_billboards`.

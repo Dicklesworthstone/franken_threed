@@ -211,6 +211,7 @@ import {animationUvBytes, animationUvFields, snapshotAnimationMapTransforms,
 import {animationClippingBytes, animationClippingFields, animationClippingWgsl,
   snapshotAnimationClipping, packAnimationClipping} from "./animation_clipping.mjs";
 import {createAnimationRenderBundleCache, encodeAnimationRenderSpans} from "./animation_render_bundles.mjs";
+import {createProgramMeshes} from "./animation_program_mesh.mjs";
 import {snapshotAnimationRaster, snapshotAnimationRasterUse, hasAnimationStencil,
   ANIMATION_NORMAL_BLEND} from "./animation_raster.mjs";
 import {bufferGeometrySnapshot, instanceAttributesSnapshot} from "./gpu_buffer_geometry.mjs";
@@ -1279,6 +1280,7 @@ export async function createGpuAnimationRenderer(
   }
   function release() {
     bundleCache?.dispose();
+    programs?.dispose();
     for (const buffer of buffers.keys()) forget(buffer);
     if (sharedBuffers)
       for (const bucket of sharedBuffers.values())
@@ -1302,6 +1304,27 @@ export async function createGpuAnimationRenderer(
     throw terminal;
   });
   lost.catch(() => {});
+  // Compiled source programs (ShaderMaterial) share this renderer's passes/order.
+  const programs = createProgramMeshes({device, format, depthFormat, sampleCount, maxDraws, label, fail, scoped, lost});
+  async function addProgramMesh(gpu, options) {
+    keys(options, ["program", "textures", "raster", "topology", "stripIndexFormat"], "program mesh");
+    if (records.size + pendingMeshes >= maxMeshes) fail("ANIMATION_RENDER_LIMIT", "Mesh capacity exceeded");
+    pendingMeshes++;
+    try {
+      const record = await programs.add(gpu, options);
+      live();
+      const mesh = Object.freeze({
+        get disposed() { return record.disposed || disposed; },
+        dispose() {
+          if (busy) fail("ANIMATION_RENDER_REENTRANT", "Cannot dispose a mesh during submission");
+          if (!record.disposed) { record.disposed = true; records.delete(record); bundleCache?.clear(); }
+        },
+      });
+      owned.set(mesh, record);
+      records.add(record);
+      return mesh;
+    } finally { pendingMeshes--; }
+  }
   function live() {
     if (disposed) fail("ANIMATION_RENDER_DISPOSED", "Animation renderer has been disposed");
     if (terminal) throw terminal;
@@ -1682,6 +1705,7 @@ export async function createGpuAnimationRenderer(
   async function addMesh(gpu, options = {}) {
     live();
     if (busy) fail("ANIMATION_RENDER_REENTRANT", "Cannot register a mesh during submission");
+    if (options?.program !== undefined) return addProgramMesh(gpu, options);
     keys(
       options,
       [
@@ -2424,8 +2448,17 @@ export async function createGpuAnimationRenderer(
           "Sampled environment views cannot also be frame attachments",
         );
       }
+      programs.begin();
       for (let i = 0; i < draws.length; i++) {
         const input = owned.has(draws[i]) ? { mesh: draws[i] } : draws[i];
+        const programRecord = owned.get(input?.mesh);
+        if (programRecord?.program) {
+          keys(input, ["mesh", "first", "count", "programUniforms", "frontFaceCW", "instanceCount"], "program draw");
+          if (programRecord.disposed) fail("ANIMATION_RENDER_MESH", "Mesh is not live in this renderer");
+          programs.stage(programRecord, input, commands[i] ?? (commands[i] = {}));
+          dependencies.add(programRecord.gpu);
+          continue;
+        }
         keys(
           input,
           [
@@ -2589,6 +2622,7 @@ export async function createGpuAnimationRenderer(
         const command = commands[i] ?? (commands[i] = {});
         Object.assign(command, {
           record,
+          program: null,
           ...rasterUse,
           first,
           count,
@@ -2720,6 +2754,7 @@ export async function createGpuAnimationRenderer(
         // Reset disabled frames too: a prior fogged submission must not leak
         // into a later unfogged span. Queue writes precede their consuming submit.
         if (fog) device.queue.writeBuffer(fogBuffer, 0, fogWords);
+        programs.write();
         if (usesLighting) device.queue.writeBuffer(lightBuffer, 0, lightWords);
         if (usesLighting && projected) device.queue.writeBuffer(shadowBuffer, 0, shadowWords);
         if (usesLighting && ambient)
@@ -2770,6 +2805,7 @@ export async function createGpuAnimationRenderer(
         command.indexBuffer = null;
         command.indexFormat = null;
         command.instanceBindGroup = null;
+        command.program = null;
       }
       busy = false;
     }

@@ -30,6 +30,7 @@
 import {createGpuCanvasRenderer} from './gpu_canvas_renderer.mjs';
 import {createGpuHdrCanvasRenderer} from './gpu_hdr_canvas.mjs';
 import {createGpuThreeScene} from './three_scene.mjs';
+import {createThreeProgramSupport} from './three_program.mjs';
 
 export class F3DRendererError extends Error {
   constructor(code, message) {
@@ -124,6 +125,9 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
               renderer: {...attachments, instancing: true, renderBundles: true, maxDraws,
                 ...(owner._hdr || !owner._shaderEncodedOutput ? {} : {outputTransfer: 'srgb'})},
               textureTransforms: true, alphaMaps: true,
+              // ShaderMaterial programs (WebGLRenderer semantics) on the WebGL surface.
+              program: owner._shaderEncodedOutput && !owner._hdr ? owner._programSupport ??= createThreeProgramSupport({three: THREE,
+                state: () => ({toneMapping: owner.toneMapping, toneMappingExposure: owner.toneMappingExposure, outputColorSpace: owner.outputColorSpace})}) : null,
               fog: scene.fog ? {} : null, environment: scene.environment ? {} : null,
               background: background ? {} : null,
               shadow: owner.shadowMap.enabled ? {} : null,
@@ -428,6 +432,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         clearDepth: this._clearDepth,
       });
       const pr = this._pixelRatio, [bufferWidth, bufferHeight] = this._bufferSize();
+      if (this._shaderEncodedOutput && !this._hdr) frame.targetSize = [bufferWidth, bufferHeight];
       const v = this._viewport, px = this._pixelRound ?? Math.floor;
       const vx = px(v.x * pr), vw = px(v.z * pr), vh = px(v.w * pr);
       // WebGL viewports/scissors use a bottom-left origin; WebGPU's is top-left.

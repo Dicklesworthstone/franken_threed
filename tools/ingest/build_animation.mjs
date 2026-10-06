@@ -321,6 +321,7 @@ export {extractAnimationRootMotion,applyAnimationRootMotion,createAnimationRootM
       "animation_render.mjs",
       "animation_raster.mjs",
       "animation_dfg.mjs",
+      "animation_program_mesh.mjs",
       "animation_clipping.mjs",
       "animation_uv.mjs",
       "animation_render_bundles.mjs",

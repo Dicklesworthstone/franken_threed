@@ -81,7 +81,9 @@ async function capture(kind, name) {
 
 // Scenarios using WebGPU-build-only classes (node materials, BundleGroup).
 const WEBGPU_ONLY = new Set(["node_materials"]);
-const selected = argv.length ? argv : Object.keys(scenarios).filter((n) => surface === "webgpu" || !WEBGPU_ONLY.has(n));
+// WebGLRenderer-only features (r186 WebGPURenderer does not run ShaderMaterial).
+const WEBGL_ONLY = new Set(["shader_material"]);
+const selected = argv.length ? argv : Object.keys(scenarios).filter((n) => surface === "webgpu" ? !WEBGL_ONLY.has(n) : !WEBGPU_ONLY.has(n));
 const results = [];
 for (const name of selected) {
   const [candidate, reference] = [await capture("candidate", name), await capture("reference", name)];

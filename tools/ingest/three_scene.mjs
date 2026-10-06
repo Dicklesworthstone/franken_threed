@@ -69,6 +69,7 @@ export async function createGpuThreeScene(device,scene,{
   maxNodes=16384,maxGeometries=256,maxBindings=1024,maxGeometryBytes=128*1024*1024,sortObjects=true,
   maxInstanceMeshes=256,maxInstanceBytes=128*1024*1024,
   deformation:deformationOptions={},maxDeformedMeshes=256,maxDeformationBytes=128*1024*1024,shadow=null,environment=null,background=null,fog=null,clipping=null,textureTransforms=false,alphaMaps=false,signal,
+  program:programSupport=null,
 }={}) {
   if(three?.REVISION!=='186'||typeof three.Matrix4!=='function'||typeof three.Frustum!=='function'||
       typeof three.Mesh!=='function'||!(scene instanceof three.Scene))fail('SOURCE','Supply the pinned r186 module and its Scene');
@@ -154,14 +155,18 @@ export async function createGpuThreeScene(device,scene,{
   const pendingDeformations=new Set(),deformationLifetime=new AbortController();
   let textureOwner=null,textureScan=null,frameTextures=null,retainedTextures=new Set();
   const ownedTextures=()=>textureOwner??=createGpuThreeTextures(device,{...textureOptions,three});
-  const resourceFailed=()=>!!renderer?.failed||!!textureOwner?.failed||!!shadowOwner?.failed||!!pendingShadow?.failed||!!environmentOwner?.failed||!!pendingEnvironment?.failed||!!backgroundOwner?.failed||!!pendingBackground?.failed||[...geometries.values(),...instances.values(),...deformations.values(),...pendingDeformations].some(g=>g.failed);
+  const resourceFailed=()=>!!renderer?.failed||!!textureOwner?.failed||!!shadowOwner?.failed||!!pendingShadow?.failed||!!environmentOwner?.failed||!!pendingEnvironment?.failed||!!backgroundOwner?.failed||!!pendingBackground?.failed||[...geometries.values(),...programGpus(),...instances.values(),...deformations.values(),...pendingDeformations].some(g=>g.failed);
+  let programTargetSize=null;
   let entries=[],lookup=new Map(),renderer,disposed=false,terminal=null,busy=false,preparing=false,prepareVersion=0,sourceDraws=0;
   // End the owner's wait without claiming to cancel already-issued GPU work.
   // Renderer registration still retires its private resources if it resolves late.
   let rejectStopped;
   const stopped=new Promise((_,reject)=>{rejectStopped=reject;});stopped.catch(()=>{});
   const vp=new three.Matrix4(),clip=new three.Matrix4(),frustum=new three.Frustum(),center=new three.Vector3();
-  const geometryBytes=()=>[...geometries.values()].reduce((n,g)=>n+g.bufferBytes,0);
+  // Program geometries: source -> attribute-layout key -> residency.
+  const programGeometries=new Map();
+  const programGpus=()=>[...programGeometries.values()].flatMap(m=>[...m.values()]);
+  const geometryBytes=()=>[...geometries.values(),...programGpus()].reduce((n,g)=>n+g.bufferBytes,0);
   const instanceBytes=()=>[...instances.values()].reduce((n,g)=>n+g.bufferBytes,0);
   // Meshes sharing source geometry share immutable deformer inputs; count those once.
   // Meshes sharing source geometry share immutable deformer inputs through this
@@ -207,7 +212,8 @@ export async function createGpuThreeScene(device,scene,{
     return materials.get(m).epoch;
   }
   function geometryAdmission(g,object){
-    if(!(g instanceof three.BufferGeometry)||g.isInstancedBufferGeometry)fail('GEOMETRY','Expected source BufferGeometry');
+    const programs=(Array.isArray(object.material)?object.material:[object.material]).every(m=>m?.isShaderMaterial);
+    if(!(g instanceof three.BufferGeometry)||(g.isInstancedBufferGeometry&&!programs))fail('GEOMETRY','Expected source BufferGeometry');
     if(hasThreeDeformation(object))inspectThreeDeformation(object,{...deformationOptions,three});
     const owners=new Set(Object.values(g.attributes).map(a=>a.isInterleavedBufferAttribute?a.data:a));
     if(g.index)owners.add(g.index);
@@ -339,7 +345,80 @@ export async function createGpuThreeScene(device,scene,{
     if(typeof localClippingEnabled!=='boolean')fail('CLIPPING','localClippingEnabled must be boolean');
     return {planes:sourcePlanes(clippingValue(clipping,'planes',[])),localClippingEnabled};
   }
-  function materialDescription(m,clippingFrame,topology='triangles'){
+  /** Current native binding for a source texture: an acknowledged caller binding,
+   * the owned residency, or r186's zero 1x1 default while the source loads. */
+  function textureBinding(t){
+    let binding;
+    if(textures.has(t)){
+      binding=textures.get(t);
+      if(!binding?.view||!binding.sampler||binding.version!==t.version||binding.sourceVersion!==t.source.version)
+        fail('TEXTURE','Supply a completed texture binding matching both texture and source upload versions');
+    }else{
+      if(!autoTextures)fail('TEXTURE','Supply an acknowledged binding or enable automatic textures');
+      if(t.onUpdate!==null)fail('HOOK','Custom texture upload callbacks require the explicit texture owner');
+      const owner=ownedTextures();
+      // r186 binds a zero-initialized 1x1 default texture until the source
+      // data exists (Textures/createDefaultTexture). The texture owner's own
+      // NOT_READY verdict decides; arrival is a preparation boundary.
+      if((textureScan||pendingTextures.has(t))&&!ownerAccepts(owner,t)){binding=placeholderBinding();pendingTextures.add(t);}
+      else if(pendingTextures.has(t))fail('PREPARE','A source texture finished loading; prepare() binds it');
+      else if(textureScan){textureScan.add(t);binding={view:t,sampler:t};}
+      else{binding=owner.binding(t);frameTextures?.add(t);}
+    }
+    return binding;
+  }
+  // Program variants depend on the object (instancing, geometry streams), not
+  // only the material: WebGLPrograms.getParameters reads both.
+  const programVariant=object=>{
+    const a=object.geometry.attributes;
+    return [object.isInstancedMesh===true,object.isInstancedMesh===true&&object.instanceColor!==null,!!a.normal,a.color?.itemSize??0,!!a.uv1,!!a.uv2,!!a.uv3,
+      object.geometry.index?.array.constructor.name??''].join(',');
+  };
+  // The attribute source a program reads: the geometry, or for InstancedMesh a
+  // per-object view adding instanceMatrix/instanceColor as WebGLRenderer binds them.
+  const programSources=new WeakMap();
+  function programSource(object){
+    if(!object.isInstancedMesh)return object.geometry;
+    let view=programSources.get(object);
+    const g=object.geometry;
+    const attributes={...g.attributes,instanceMatrix:object.instanceMatrix,...(object.instanceColor?{instanceColor:object.instanceColor}:{})};
+    if(!view||view.geometry!==g||Object.keys(attributes).some(k=>view.attributes[k]!==attributes[k])||Object.keys(view.attributes).length!==Object.keys(attributes).length){
+      view={geometry:g,attributes,get index(){return g.index;},get drawRange(){return g.drawRange;},morphAttributes:g.morphAttributes,isInstancedBufferGeometry:false};
+      programSources.set(object,view);
+    }
+    return view;
+  }
+  const programKeyOf=object=>object.isInstancedMesh?object:object.geometry;
+  function programDescription(m,topology,object){
+    if(!programSupport)fail('MATERIAL',`Unsupported source material: ${m?.type}`);
+    if(renderOptions.outputTransfer!=='srgb')fail('MATERIAL','ShaderMaterial runs on the WebGL-surface route with display-referred output (no renderer tone-mapping pass) only');
+    if(!object)fail('MATERIAL','ShaderMaterial needs its object for program assembly');
+    if(shadowEnabled&&object.castShadow)fail('SHADOW','ShaderMaterial shadow casters are not admitted yet');
+    if(scene.overrideMaterial)fail('MATERIAL','overrideMaterial with ShaderMaterial is not admitted yet');
+    const epoch=trackMaterial(m);
+    const sides=m.transparent&&m.side===three.DoubleSide&&!m.forceSinglePass?[three.BackSide,three.FrontSide]:[m.side];
+    return sides.map(side=>{
+      const compiled=programSupport.compile(m,object,{fog:scene.fog,side});
+      const reflection=compiled.program.reflection;
+      if(topology==='points'&&reflection.writesPointSize)fail('MATERIAL','Program point sizes need point-sprite expansion, which is not implemented');
+      const sourceTextures=[],bindings=[],textureKey=[];
+      for(const t of reflection.textures){
+        const value=m.uniforms?.[t.name]?.value,texture=t.element===null?value:value?.[t.element];
+        if(texture!=null&&!(texture instanceof three.Texture))fail('TEXTURE',`Uniform ${t.name} is not a texture`);
+        if(texture&&(t.dimension==='cube')!==(texture.isCubeTexture===true))fail('TEXTURE',`Uniform ${t.name} texture dimension differs from its sampler`);
+        if(texture&&(t.dimension==='3d'||t.dimension==='2d-array'||t.comparison))fail('TEXTURE',`Sampler ${t.glslType} textures are not admitted yet`);
+        const binding=texture?textureBinding(texture):placeholderBinding();
+        sourceTextures.push(texture??null);bindings.push({view:binding.view,sampler:binding.sampler});textureKey.push(texture??null,binding.view,binding.sampler);
+      }
+      const raster=programSupport.raster(m,{side,topology});
+      const options={program:compiled.program,textures:bindings,raster,topology,
+        ...(topology==='line-strip'&&object.geometry.index?{stripIndexFormat:object.geometry.index.array instanceof Uint32Array?'uint32':'uint16'}:{})};
+      const structural=[epoch,'program',compiled.key,topology,side,JSON.stringify(raster),...textureKey];
+      return {options,values:{},structural,clipped:null,program:compiled,programTextures:sourceTextures,programSide:side};
+    });
+  }
+  function materialDescription(m,clippingFrame,topology='triangles',object=null){
+    if(m?.isShaderMaterial)return programDescription(m,topology,object);
     const shading=models.get(Object.getPrototypeOf(m));
     if(!shading)fail('MATERIAL',`Unsupported source material: ${m?.type}`);
     const primitive=m.isLineBasicMaterial?'line':m.isPointsMaterial?'point':'surface';
@@ -411,23 +490,7 @@ export async function createGpuThreeScene(device,scene,{
     let transform=null;const textureKey=[],mapChannels={},mapTransforms={};
     function texture(t,field){
       if(!(t instanceof three.Texture)||t.isCubeTexture||t.isVideoTexture||(!textureTransforms&&t.channel!==0))fail('TEXTURE','Expected a current, ordinary UV0 texture binding');
-      let binding;
-      if(textures.has(t)){
-        binding=textures.get(t);
-        if(!binding?.view||!binding.sampler||binding.version!==t.version||binding.sourceVersion!==t.source.version)
-          fail('TEXTURE','Supply a completed texture binding matching both texture and source upload versions');
-      }else{
-        if(!autoTextures)fail('TEXTURE','Supply an acknowledged binding or enable automatic textures');
-        if(t.onUpdate!==null)fail('HOOK','Custom texture upload callbacks require the explicit texture owner');
-        const owner=ownedTextures();
-        // r186 binds a zero-initialized 1x1 default texture until the source
-        // data exists (Textures/createDefaultTexture). The texture owner's own
-        // NOT_READY verdict decides; arrival is a preparation boundary.
-        if((textureScan||pendingTextures.has(t))&&!ownerAccepts(owner,t)){binding=placeholderBinding();pendingTextures.add(t);}
-        else if(pendingTextures.has(t))fail('PREPARE','A source texture finished loading; prepare() binds it');
-        else if(textureScan){textureScan.add(t);binding={view:t,sampler:t};}
-        else{binding=owner.binding(t);frameTextures?.add(t);}
-      }
+      const binding=textureBinding(t);
       options[field]={view:binding.view,sampler:binding.sampler};textureKey.push(field,t,binding.view,binding.sampler);
       if(textureTransforms&&field!=='gradientTexture'){
         const coordinate=uvApi.threeTextureCoordinates(t,three);
@@ -544,9 +607,10 @@ export async function createGpuThreeScene(device,scene,{
   function desired(nodes){
     const clippingFrame=clippingState();
     const out=[],descriptions=new Map(),seen=new Map(),usedGeometry=new Set(),usedInstances=new Set(),usedDeformations=new Set();
-    const get=(m,topology='triangles')=>{
+    const get=(m,topology='triangles',object=null)=>{
       let byTopology=descriptions.get(m);if(!byTopology)descriptions.set(m,byTopology=new Map());
-      if(!byTopology.has(topology))byTopology.set(topology,materialDescription(m,clippingFrame,topology));return byTopology.get(topology);
+      const key=m?.isShaderMaterial&&object?topology+'|'+programVariant(object):topology;
+      if(!byTopology.has(key))byTopology.set(key,materialDescription(m,clippingFrame,topology,object));return byTopology.get(key);
     };
     if(scene.overrideMaterial)get(scene.overrideMaterial);
     for(const object of nodes)if(drawable(object)){
@@ -558,17 +622,19 @@ export async function createGpuThreeScene(device,scene,{
       for(const original of source){
         if(!original)continue;
         // The original controls visibility/list admission even with an override.
-        get(original,object.isMesh&&original.wireframe===true?'lines':topology);
+        get(original,object.isMesh&&original.wireframe===true?'lines':topology,object);
         const m=scene.overrideMaterial&&original.allowOverride===true?scene.overrideMaterial:original;
         const wire=object.isMesh&&m.wireframe===true;
         if(wire&&(instanceSource||deformationSource))fail('MATERIAL','Wireframe instanced or deformed meshes are not admitted');
-        const t=wire?'lines':topology,geometry=wire?wireframeGeometry(g):g,itemKey=wire?geometry:key;
+        const isProgram=m.isShaderMaterial===true;
+        const t=wire?'lines':topology,geometry=wire?wireframeGeometry(g):g,itemKey=isProgram?programKeyOf(object):wire?geometry:key;
         let set=seen.get(itemKey);if(!set)seen.set(itemKey,set=new Map());
         const topologies=set.get(m)??new Set();if(topologies.has(t))continue;topologies.add(t);set.set(m,topologies);
-        usedGeometry.add(geometry);if(instanceSource)usedInstances.add(instanceSource);
+        usedGeometry.add(geometry);if(instanceSource&&!isProgram)usedInstances.add(instanceSource);
         if(deformationSource)usedDeformations.add(deformationSource);
         if(usedDeformations.size>maxDeformedMeshes)fail('LIMIT','Source deformed mesh capacity exceeded');
-        for(const desc of get(m,t)){
+        for(const desc of get(m,t,object)){
+          if(desc.program){out.push({key:itemKey,geometry,instanceSource:null,instanceSignature:null,deformationSource:null,material:m,desc,programSource:programSource(object)});continue;}
           if(textureTransforms)uvApi.checkThreeMapChannels(g,desc.options.mapChannels);
           out.push({key:itemKey,geometry,instanceSource,instanceSignature,deformationSource,material:m,desc});
           if(out.length>maxBindings||usedGeometry.size>maxGeometries||usedInstances.size>maxInstanceMeshes)fail('LIMIT','Source geometry/material binding capacity exceeded');
@@ -594,6 +660,11 @@ export async function createGpuThreeScene(device,scene,{
     for(const [source,gpu] of deformations)if(!usedDeformations.has(gpu)){gpu.dispose();deformations.delete(source);}
     for(const gpu of usedDeformations){deformations.set(gpu.source,gpu);pendingDeformations.delete(gpu);}
     for(const [g,gpu] of geometries)if(!used.has(g)){gpu.dispose();geometries.delete(g);}
+    const usedProgramGpus=new Set(next.map(e=>e.programGeometry).filter(Boolean));
+    for(const [source,byKey] of programGeometries){
+      for(const [key,gpu] of byKey)if(!usedProgramGpus.has(gpu)){gpu.dispose();byKey.delete(key);}
+      if(!byKey.size)programGeometries.delete(source);
+    }
     for(const [source,gpu] of instances)if(!usedInstances.has(source)){gpu.dispose();instances.delete(source);}
     for(const [m,state] of materials)if(!usedMaterials.has(m)){m.removeEventListener('dispose',state.listener);materials.delete(m);}
   }
@@ -616,6 +687,26 @@ export async function createGpuThreeScene(device,scene,{
       const environmentSignature=selectedEnvironment?environmentApi.inspectThreeEnvironment(selectedEnvironment,three,environmentOptions).signature:null;
       for(const item of request){
         live();let gpu,signature,deformation=null;
+        if(item.desc.program){
+          const compiled=item.desc.program;
+          let byKey=programGeometries.get(item.programSource);
+          if(!byKey)programGeometries.set(item.programSource,byKey=new Map());
+          gpu=byKey.get(compiled.attributesKey);
+          if(!gpu){
+            gpu=programSupport.createGeometry(device,item.programSource,compiled.program.reflection.attributes,{...geometryOptions,maxBytes:maxGeometryBytes,
+              maxInitialBytes:Math.max(0,maxGeometryBytes-geometryBytes())});
+            byKey.set(compiled.attributesKey,gpu);
+          }else gpu.update({maxAdditionalBytes:Math.max(0,maxGeometryBytes-geometryBytes())});
+          signature='program:'+programSupport.geometrySnapshot(gpu,device).signature;
+          let entry=lookup.get(item.key)?.get(item.material)?.find(e=>!e.mesh.disposed&&e.programGeometry===gpu&&e.signature===signature&&same(e.structural,item.desc.structural));
+          if(!entry){
+            const mesh=await Promise.race([renderer.addMesh(gpu,item.desc.options),stopped]);
+            entry={key:item.key,geometry:item.geometry,instanceSource:null,instanceSignature:null,material:item.material,structural:item.desc.structural,
+              topology:item.desc.options.topology,signature,deformation:null,mesh,programGeometry:gpu};created.push(entry);live();
+          }
+          next.push(entry);
+          continue;
+        }
         if(item.deformationSource){
           deformation=nextDeformations.get(item.deformationSource);
           if(!deformation){
@@ -675,6 +766,7 @@ export async function createGpuThreeScene(device,scene,{
         }
         if(nextShadow)for(let i=0;i<next.length;i++){
           const entry=next[i],item=request[i],{options,values}=item.desc;
+          if(item.desc.program)continue;
           // BLEND receivers remain fully rendered, but never acquire a guessed
           // translucent depth material. Actual BLEND casters reject or skip.
           if(options.alphaMode==='BLEND'||options.topology)continue;
@@ -746,6 +838,11 @@ export async function createGpuThreeScene(device,scene,{
       // registration; current content versions are uploaded at this boundary.
       const checked=new Set();
       for(const entry of next){
+        if(entry.programGeometry){
+          if(!checked.has(entry.programGeometry)){entry.programGeometry.update({maxAdditionalBytes:Math.max(0,maxGeometryBytes-geometryBytes())});checked.add(entry.programGeometry);}
+          if('program:'+programSupport.geometrySnapshot(entry.programGeometry,device).signature!==entry.signature)fail('CHANGED','Geometry layout changed during preparation');
+          continue;
+        }
         if(entry.deformation){
           entry.deformation.check();
         }else{
@@ -821,6 +918,9 @@ export async function createGpuThreeScene(device,scene,{
     let backgroundSubmitted=false;
     try{
       if(!frame||typeof frame!=='object')fail('FRAME','Supply borrowed render attachments');
+      // Framebuffer size for program gl_FragCoord; not a core renderer frame key.
+      programTargetSize=frame.targetSize??null;
+      if(Object.hasOwn(frame,'targetSize')){const {targetSize,...rest}=frame;frame=rest;}
       for(const key of ['draws','viewProjection','lighting','fog','clippingPlanes',...(shadowEnabled?['shadow']:[]),...(environmentEnabled?['environment']:[]),...(backgroundEnabled?['background']:[])])if(Object.hasOwn(frame,key))fail('FRAME',`${key} belongs to the source scene/camera`);
       const clippingFrame=clippingState();
       frameTextures=new Set();
@@ -848,9 +948,10 @@ export async function createGpuThreeScene(device,scene,{
       const backgroundFrame=backgroundOwner?.capture(scene,camera)??null;
       const lightSources=[],casterObjects=[],casterItems=[],shadowDraws=[];
       const opaque=[],transparent=[],stack=[{object:scene,groupOrder:0}],descriptions=new Map();
-      const get=(m,topology)=>{
+      const get=(m,topology,object=null)=>{
         let byTopology=descriptions.get(m);if(!byTopology)descriptions.set(m,byTopology=new Map());
-        if(!byTopology.has(topology))byTopology.set(topology,materialDescription(m,clippingFrame,topology));return byTopology.get(topology);
+        const key=m?.isShaderMaterial&&object?topology+'|'+programVariant(object):topology;
+        if(!byTopology.has(key))byTopology.set(key,materialDescription(m,clippingFrame,topology,object));return byTopology.get(key);
       };
       function append(object,groupOrder,z,shadowPass=false){
         const source=object.geometry,topology=topologyOf(object);
@@ -867,6 +968,15 @@ export async function createGpuThreeScene(device,scene,{
               if(wire&&shadowPass)fail('SHADOW','Wireframe shadow casters are not admitted');
               const g=wire?wireframeGeometry(source):source;
               const group=wire&&sourceGroup?{start:sourceGroup.start*2,count:sourceGroup.count*2,materialIndex:sourceGroup.materialIndex}:sourceGroup;
+              if(material.isShaderMaterial){
+                if(shadowPass)return;
+                const desc=get(material,topology,object),records=lookup.get(programKeyOf(object))?.get(material);
+                const bindings=desc.map(d=>records?.find(e=>!e.mesh.disposed&&e.programGeometry&&same(e.structural,d.structural)));
+                if(bindings.some(e=>!e))fail('PREPARE','Call prepare() after changing geometry, program or texture bindings');
+                if(opaque.length+transparent.length>=(renderOptions.maxDraws??1024))fail('LIMIT','Source draw list exceeds capacity');
+                (original.transparent?transparent:opaque).push({object,geometry:g,material,listMaterial:original,group,groupOrder,z,desc,bindings,shadowPass:false,program:true});
+                return;
+              }
               const instanceSource=object.isInstancedMesh?object:null;
               const instanceSignature=instanceSource?instanceAdmission(instanceSource).signature:null;
               const deformationSource=hasThreeDeformation(object)?object:null;
@@ -932,6 +1042,29 @@ export async function createGpuThreeScene(device,scene,{
       textureOwner?.update(frameTextures);
       const updated=new Set(),activeDeformations=new Set();
       for(const item of [...casterItems,...items]){
+        if(item.program){
+          const gpu=item.bindings[0].programGeometry;
+          if(!updated.has(gpu)){gpu.update({maxAdditionalBytes:Math.max(0,maxGeometryBytes-geometryBytes())});updated.add(gpu);}
+          if(item.bindings.some(e=>e.signature!=='program:'+programSupport.geometrySnapshot(gpu,device).signature))
+            fail('PREPARE','Program geometry layout changed; call prepare() before drawing it');
+          const object=item.object,start=item.group?integer(item.group.start,0,Number.MAX_SAFE_INTEGER,'group start'):0;
+          const count=item.group?integer(item.group.count,0,Number.MAX_SAFE_INTEGER,'group count'):Number.MAX_SAFE_INTEGER;
+          object.modelViewMatrix.multiplyMatrices(camera.matrixWorldInverse,object.matrixWorld);
+          object.normalMatrix.getNormalMatrix(object.modelViewMatrix);
+          const frontFaceCW=object.isMesh===true&&object.matrixWorld.determinant()<0;
+          const g=object.geometry;
+          const instanceCount=object.isInstancedMesh?integer(object.count,0,0xffffffff,'instance count'):g.isInstancedBufferGeometry?Math.min(g.instanceCount,0xffffffff):1;
+          for(let i=0;i<item.bindings.length;i++){
+            const d=item.desc[i],reflection=d.program.program.reflection,bytes=new Uint8Array(reflection.uniformBufferSize);
+            const current=programSupport.pack(reflection,item.material,object,camera,bytes,{fog:scene.fog,targetSize:programTargetSize});
+            if(current.some((t,k)=>(t??null)!==d.programTextures[k]))fail('PREPARE','Program texture uniforms changed; call prepare()');
+            for(const t of current)if(t)frameTextures?.add(t);
+            // Programs evaluate fog/lighting in their own source; never core receivers.
+            draws.push({mesh:item.bindings[i].mesh,first:start,count,programUniforms:bytes,frontFaceCW,instanceCount,
+              ...(fogEnabled?{receiveFog:false}:{}),...(shadowEnabled?{receiveShadow:false}:{}),...(environmentEnabled?{receiveEnvironment:false}:{})});
+          }
+          continue;
+        }
         const deformation=item.bindings[0].deformation;
         let shape;
         if(deformation){
@@ -1043,7 +1176,7 @@ export async function createGpuThreeScene(device,scene,{
       backgroundBytes:(backgroundOwner?.allocatedBytes??0)+(pendingBackground?.allocatedBytes??0),backgroundPasses,
       colorPasses:backgroundEnabled?backgroundColorPasses:shadowEnabled||environmentEnabled||fogEnabled?(renderer?.colorPassCount??0):null,
       bundles:renderer?.bundleDiagnostics??null});},
-    async whenIdle(){live();try{await Promise.race([Promise.all([renderer.whenIdle(),textureOwner?.whenIdle(),shadowOwner?.whenIdle(),pendingShadow?.whenIdle(),environmentOwner?.whenIdle(),pendingEnvironment?.whenIdle(),backgroundOwner?.whenIdle(),pendingBackground?.whenIdle(),...[...geometries.values(),...instances.values(),...deformations.values(),...pendingDeformations].map(g=>g.whenIdle())]),stopped]);live();return bridge;}catch(error){return failed(error);}},
+    async whenIdle(){live();try{await Promise.race([Promise.all([renderer.whenIdle(),textureOwner?.whenIdle(),shadowOwner?.whenIdle(),pendingShadow?.whenIdle(),environmentOwner?.whenIdle(),pendingEnvironment?.whenIdle(),backgroundOwner?.whenIdle(),pendingBackground?.whenIdle(),...[...geometries.values(),...programGpus(),...instances.values(),...deformations.values(),...pendingDeformations].map(g=>g.whenIdle())]),stopped]);live();return bridge;}catch(error){return failed(error);}},
     dispose(){if(busy&&!preparing)fail('REENTRANT','Cannot dispose during source submission');if(!disposed){disposed=true;rejectStopped(new ThreeSceneError('DISPOSED','Source scene bridge is disposed'));release();}},
   });
   try{

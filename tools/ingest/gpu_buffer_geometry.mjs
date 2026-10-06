@@ -87,8 +87,7 @@ function describe(geometry) {
     const attribute = attributes[name], owner = ownerOf(attribute), array = owner?.array;
     storage(array);
     if (attribute.isInstancedBufferAttribute || owner.isInstancedInterleavedBuffer) fail('SHAPE', 'Instance streams require the instancing path');
-    if (typeof attribute.normalized !== 'boolean') fail('FORMAT', 'Expected a boolean normalized flag');
-    const conversion = conversionOf(array, attribute.normalized, attribute.isFloat16BufferAttribute === true);
+    const conversion = conversionOf(array, attribute.normalized === true, attribute.isFloat16BufferAttribute === true);
     const [location, width] = FIELDS[name];
     const itemSize = integer(attribute.itemSize, 2, 4, 'item size');
     if (width ? itemSize !== width : itemSize !== 3 && itemSize !== 4) fail('SHAPE', `Invalid ${name} width`);
@@ -287,7 +286,8 @@ function createResidency(device, geometry, {
       current = Object.freeze({layouts: shape.layouts, signature: shape.signature, channels: shape.channels,
         vertexBuffers: Object.freeze(shape.streams.map(e => records.get(e.owner).buffer)),
         vertexCount: shape.vertexCount, indexBuffer: indexRecord?.buffer ?? null,
-        indexFormat: shape.indexFormat, indexCount: shape.indexCount, generation});
+        indexFormat: shape.indexFormat, indexCount: shape.indexCount, generation,
+        ...(shape.instanceCapacity !== undefined ? {instanceCapacity: shape.instanceCapacity, instanced: shape.instanced} : {})});
       version++; stats.updates++;
       return handle;
     } finally {
@@ -340,6 +340,89 @@ function createResidency(device, geometry, {
   try { update({maxAdditionalBytes: maxInitialBytes}); geometry.addEventListener?.('dispose', onDispose); }
   catch (error) { handle.dispose(); throw error; }
   return handle;
+}
+
+/** Source-program attribute residency: every attribute a compiled program reads
+ * (reflection.attributes: {name, location, locations, components}) is taken from
+ * geometry.attributes by name, at the program's location, with the same upload,
+ * version, range and conversion contract as ordinary geometry. Instanced
+ * attributes (meshPerAttribute 1) use stepMode 'instance'; matrix attributes use
+ * one location per column. Attributes the geometry lacks are reported in
+ * `missing` so the renderer binds GL's constant (0, 0, 0, 1) default instead. */
+function describeProgram(program) {
+  return geometry => {
+    const attributes = geometry?.attributes;
+    if (!attributes) fail('SHAPE', 'Expected a BufferGeometry');
+    if (Object.values(geometry.morphAttributes ?? {}).some(a => a.length)) fail('SHAPE', 'Morph attributes need the deformation path');
+    const owners = new Map(), missing = [];
+    const instanced = geometry.isInstancedBufferGeometry === true;
+    let vertexCount = attributes.position ? integer(attributes.position.count, 0, 0xffffffff, 'vertex count') : null, instanceCapacity = Infinity;
+    for (const a of program) {
+      const attribute = attributes[a.name];
+      if (!attribute) { for (let k = 0; k < a.locations; k++) missing.push(a.location + k); continue; }
+      const owner = ownerOf(attribute), array = owner?.array;
+      storage(array);
+      if (a.scalar !== 'float') fail('FORMAT', `Integer attribute ${a.name} needs an integer vertex format, not admitted yet`);
+      const conversion = conversionOf(array, attribute.normalized === true, attribute.isFloat16BufferAttribute === true);
+      const perInstance = attribute.isInstancedBufferAttribute === true || owner.isInstancedInterleavedBuffer === true;
+      if (perInstance && (owner.meshPerAttribute ?? attribute.meshPerAttribute) !== 1) fail('SHAPE', 'meshPerAttribute other than 1 has no WebGPU step rate');
+      const itemSize = integer(attribute.itemSize, 1, 16, 'item size');
+      const columns = a.locations, width = a.locations > 1 ? a.components : Math.min(itemSize, 4);
+      if (columns > 1 && itemSize !== columns * a.components) fail('SHAPE', `Matrix attribute ${a.name} needs itemSize ${columns * a.components}`);
+      if (columns === 1 && itemSize > 4) fail('SHAPE', `Attribute ${a.name} itemSize exceeds a vector`);
+      const stride = attribute.isInterleavedBufferAttribute ? integer(owner.stride, itemSize, 512, 'stride') : itemSize;
+      const offset = attribute.isInterleavedBufferAttribute ? integer(attribute.offset, 0, stride - itemSize, 'attribute offset') : 0;
+      const count = integer(attribute.count, 0, 0xffffffff, 'attribute count');
+      if (count * stride > array.length + (stride - itemSize)) fail('SHAPE', 'Attribute count exceeds storage');
+      if (perInstance) instanceCapacity = Math.min(instanceCapacity, count);
+      else vertexCount = vertexCount === null ? count : Math.min(vertexCount, count);
+      let entry = owners.get(owner);
+      if (!entry) owners.set(owner, entry = {owner, array, stride, attributes: [], requiredBytes: 0, conversion, stepMode: perInstance ? 'instance' : 'vertex'});
+      if (entry.stride !== stride || entry.stepMode !== (perInstance ? 'instance' : 'vertex')) fail('SHAPE', 'Shared attributes require one stride and step mode');
+      if (entry.conversion?.key !== conversion?.key) fail('FORMAT', 'Attributes sharing interleaved storage require one conversion profile');
+      entry.requiredBytes = Math.max(entry.requiredBytes, count ? ((count - 1) * stride + offset + itemSize) * 4 : 0);
+      for (let k = 0; k < columns; k++)
+        entry.attributes.push({shaderLocation: a.location + k, offset: (offset + k * width) * 4, format: width === 1 ? 'float32' : 'float32x' + width});
+    }
+    const index = geometry.index ?? null;
+    let indexOwner = null, indexFormat = null, indexCount = 0;
+    if (index) {
+      if (index.isInterleavedBufferAttribute || index.itemSize !== 1 || index.normalized) fail('SHAPE', 'Expected scalar non-interleaved indices');
+      storage(index.array);
+      if (!(index.array instanceof Uint16Array) && !(index.array instanceof Uint32Array)) fail('FORMAT', 'Indices require Uint16Array or Uint32Array');
+      indexOwner = index; indexFormat = index.array instanceof Uint16Array ? 'uint16' : 'uint32';
+      indexCount = integer(index.count, 0, index.array.length, 'index count');
+      if (owners.has(index)) fail('SHAPE', 'Index and vertex source identities must be distinct');
+      owners.set(index, {owner: index, array: index.array, stride: 0, attributes: [], requiredBytes: indexCount * index.array.BYTES_PER_ELEMENT, conversion: null});
+    }
+    const streams = [...owners.values()].filter(e => e.stride !== 0);
+    streams.sort((x, y) => Math.min(...x.attributes.map(v => v.shaderLocation)) - Math.min(...y.attributes.map(v => v.shaderLocation)));
+    const layouts = Object.freeze(streams.map(e => Object.freeze({arrayStride: e.stride * 4, stepMode: e.stepMode,
+      attributes: Object.freeze(e.attributes.sort((x, y) => x.shaderLocation - y.shaderLocation).map(Object.freeze))})));
+    // r186 renderBufferDirect: without index or position, the draw range alone
+    // bounds the vertex count (an infinite range draws nothing).
+    if (vertexCount === null) {
+      const r = geometry.drawRange;
+      vertexCount = r && Number.isSafeInteger(r.count) ? integer(r.start, 0, 0xffffffff, 'draw-range start') + integer(r.count, 0, 0xffffffff, 'draw-range count') : 0;
+    }
+    return {owners, streams, layouts, signature: JSON.stringify([layouts, missing]), channels: Object.freeze({missing: Object.freeze(missing)}),
+      vertexCount, instanced, instanceCapacity, indexOwner, indexFormat, indexCount};
+  };
+}
+const programStates = new WeakMap();
+export function createGpuProgramGeometry(device, geometry, programAttributes, options) {
+  const handle = createResidency(device, geometry, options, describeProgram(programAttributes), range, programStates);
+  return handle;
+}
+/** Program-geometry snapshot: buffers/layouts plus GL's missing constant locations. */
+export function programGeometrySnapshot(handle, device) {
+  const state = programStates.get(handle);
+  if (!state) fail('SHAPE', 'Expected a program geometry residency');
+  if (state.device !== device) fail('DEVICE', 'Geometry belongs to a different device');
+  state.live();
+  const snapshot = state.current();
+  if (!snapshot) fail('RELEASED', 'Call geometry.update() after releasing residency');
+  return {...snapshot, drawRange: range(state.geometry, snapshot.indexBuffer ? snapshot.indexCount : snapshot.vertexCount)};
 }
 
 /** Ordinary vertex/index residency. Instance streams have a separate identity

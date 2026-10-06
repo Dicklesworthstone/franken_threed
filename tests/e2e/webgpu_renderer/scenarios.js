@@ -231,6 +231,43 @@ export const scenarios = {
     cam.position.set(0, 3, 4); cam.lookAt(0, 0, -6);
     return { scene, camera: cam };
   },
+  // ShaderMaterial / RawShaderMaterial (WebGLRenderer feature): uniforms of several
+  // types, a texture, a custom attribute, varyings, gl_FragCoord, discard,
+  // additive blending, and an ESSL 1.00 raw program.
+  shader_material(THREE) {
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x101820);
+    const size = 8, data = new Uint8Array(size * size * 4);
+    for (let i = 0; i < size * size; i++) data.set([(i * 37) % 256, (i * 91) % 256, ((i >> 3) * 60) % 256, 255], i * 4);
+    const tex = new THREE.DataTexture(data, size, size); tex.needsUpdate = true;
+    const geometry = new THREE.TorusKnotGeometry(0.45, 0.16, 96, 12);
+    const wobble = new Float32Array(geometry.attributes.position.count);
+    for (let i = 0; i < wobble.length; i++) wobble[i] = Math.sin(i * 0.7) * 0.5 + 0.5;
+    geometry.setAttribute('wobble', new THREE.BufferAttribute(wobble, 1));
+    const knot = new THREE.Mesh(geometry, new THREE.ShaderMaterial({
+      uniforms: { tint: { value: new THREE.Color(0.9, 0.5, 0.2) }, amount: { value: 0.08 }, map: { value: tex }, scales: { value: [1, 0.5, 0.25] }, flip: { value: true } },
+      vertexShader: `attribute float wobble; uniform float amount; varying vec2 vUv; varying float vW; varying vec3 vN;
+        void main() { vUv = uv; vW = wobble; vN = normalize(normalMatrix * normal);
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position + normal * wobble * amount, 1.0); }`,
+      fragmentShader: `uniform vec3 tint; uniform sampler2D map; uniform float scales[3]; uniform bool flip; varying vec2 vUv; varying float vW; varying vec3 vN;
+        void main() { vec4 t = texture2D(map, vUv * 4.0); float l = 0.4 + 0.6 * max(dot(vN, normalize(vec3(0.3, 0.6, 1.0))), 0.0);
+          vec3 c = mix(tint, t.rgb, scales[1]) * l * (flip ? 1.0 : 0.2);
+          if (mod(floor(gl_FragCoord.x / 4.0) + floor(gl_FragCoord.y / 4.0), 2.0) < 1.0 && vW > 0.9) discard;
+          gl_FragColor = vec4(c, 1.0); }`,
+    }));
+    knot.position.x = -0.6; knot.rotation.set(0.4, 0.3, 0);
+    const quad = new THREE.Mesh(new THREE.PlaneGeometry(1.1, 1.1), new THREE.RawShaderMaterial({
+      uniforms: { glow: { value: new THREE.Vector4(0.2, 0.8, 0.4, 0.6) } },
+      vertexShader: `precision highp float; uniform mat4 modelViewMatrix; uniform mat4 projectionMatrix; attribute vec3 position; attribute vec2 uv; varying vec2 vUv;
+        void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+      fragmentShader: `precision mediump float; uniform vec4 glow; varying vec2 vUv;
+        void main() { float d = length(vUv - 0.5); gl_FragColor = vec4(glow.rgb * (1.0 - 2.0 * d), glow.a * smoothstep(0.5, 0.1, d)); }`,
+      transparent: true, blending: THREE.AdditiveBlending, depthWrite: false,
+    }));
+    quad.position.set(0.55, 0.1, 0.3);
+    scene.add(knot, quad);
+    return { scene, camera: camera(THREE) };
+  },
   // Per-axis normalScale on the derivative tangent frame (GLTFLoader sets y=-1 when
   // geometry has no tangents) and a flat-shaded lit mesh with no normal attribute.
   normal_scale_and_flat(THREE) {
