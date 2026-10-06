@@ -2,8 +2,13 @@
  *
  * Float32 position/normal/tangent/uv/RGB(A) streams and Uint16/Uint32 indices are
  * borrowed from ordinary Three.js BufferGeometry objects. Interleaved attributes
- * share one upload history, GPU allocation and vertex slot. No vertex repacking,
- * numerical conversion, source-array replacement or compute pass is performed.
+ * share one upload history, GPU allocation and vertex slot. Float32 streams are
+ * uploaded byte-for-byte. Other element types (8/16/32-bit integers, normalized
+ * or not, and Float16BufferAttribute halves) use the GL ES 3.0 float-attribute
+ * conversion at upload: unsigned c/(2^n-1), signed max(c/(2^(n-1)-1), -1),
+ * non-normalized integers as their value, halves decoded exactly; each stays
+ * one f32 per element, so strides/offsets and upload ranges keep element units.
+ * The converted shadow is the GPU-visible history; no source array is replaced.
  *
  * update() observes the pinned WebGLAttributes upload contract, NOT arbitrary
  * CPU edits: first use uploads all bytes without clearing ranges; later uploads
@@ -43,6 +48,32 @@ function storage(array) {
   try { new Uint8Array(array.buffer, 0, 0); } catch { fail('STORAGE', 'Detached attribute storage'); }
 }
 function ownerOf(attribute) { return attribute.isInterleavedBufferAttribute ? attribute.data : attribute; }
+const INTEGER_TYPES = [[Int8Array, 127], [Uint8Array, 255], [Uint8ClampedArray, 255], [Int16Array, 32767], [Uint16Array, 65535],
+  [Int32Array, 2147483647], [Uint32Array, 4294967295]];
+/** Element -> f32 conversion for one source storage, or null for exact Float32 bytes. */
+function conversionOf(array, normalized, half) {
+  if (half) {
+    if (!(array instanceof Uint16Array)) fail('FORMAT', 'Float16 attributes require Uint16Array storage');
+    return {key: 'half', element: halfToFloat};
+  }
+  if (array instanceof Float32Array) return null;
+  // Native Float16Array (r186 uploads it as HALF_FLOAT): elements read as exact numbers.
+  if (typeof Float16Array === 'function' && array instanceof Float16Array) return {key: 'Float16Array', element: v => v};
+  const type = INTEGER_TYPES.find(([C]) => array instanceof C);
+  if (!type) fail('FORMAT', 'Vertex streams require Float32, Float16 or 8/16/32-bit integer storage');
+  const [C, max] = type, signed = C === Int8Array || C === Int16Array || C === Int32Array;
+  // GL ES 3.0 2.1.6: signed normalized uses max(c / (2^(b-1) - 1), -1).
+  const element = !normalized ? (v => v) : signed ? (v => Math.max(v / max, -1)) : (v => v / max);
+  return {key: C.name + (normalized ? '/norm' : ''), element};
+}
+const halfView = new DataView(new ArrayBuffer(4));
+function halfToFloat(h) {
+  const sign = h & 0x8000 ? -1 : 1, exponent = (h >> 10) & 31, mantissa = h & 1023;
+  if (exponent === 0) return sign * mantissa * 2 ** -24;
+  if (exponent === 31) return mantissa ? NaN : sign * Infinity;
+  halfView.setUint32(0, ((h & 0x8000) << 16) | ((exponent + 112) << 23) | (mantissa << 13));
+  return halfView.getFloat32(0);
+}
 function describe(geometry) {
   if (geometry?.isInstancedBufferGeometry || Object.values(geometry?.morphAttributes ?? {}).some(a => a.length))
     fail('SHAPE', 'Instancing and morph deformation require their existing GPU paths');
@@ -56,9 +87,8 @@ function describe(geometry) {
     const attribute = attributes[name], owner = ownerOf(attribute), array = owner?.array;
     storage(array);
     if (attribute.isInstancedBufferAttribute || owner.isInstancedInterleavedBuffer) fail('SHAPE', 'Instance streams require the instancing path');
-    if (!(array instanceof Float32Array) || attribute.normalized || attribute.isFloat16BufferAttribute) {
-      fail('FORMAT', 'Vertex streams require non-normalized Float32 attributes');
-    }
+    if (typeof attribute.normalized !== 'boolean') fail('FORMAT', 'Expected a boolean normalized flag');
+    const conversion = conversionOf(array, attribute.normalized, attribute.isFloat16BufferAttribute === true);
     const [location, width] = FIELDS[name];
     const itemSize = integer(attribute.itemSize, 2, 4, 'item size');
     if (width ? itemSize !== width : itemSize !== 3 && itemSize !== 4) fail('SHAPE', `Invalid ${name} width`);
@@ -67,8 +97,9 @@ function describe(geometry) {
     const count = integer(attribute.count, vertexCount, 0xffffffff, 'attribute count');
     if (count * stride > array.length) fail('SHAPE', 'Attribute count exceeds storage');
     let entry = owners.get(owner);
-    if (!entry) owners.set(owner, entry = {owner, array, stride, attributes: [], requiredBytes: 0});
+    if (!entry) owners.set(owner, entry = {owner, array, stride, attributes: [], requiredBytes: 0, conversion});
     if (entry.stride !== stride) fail('SHAPE', 'Shared attributes require one stride');
+    if (entry.conversion?.key !== conversion?.key) fail('FORMAT', 'Attributes sharing interleaved storage require one conversion profile');
     entry.requiredBytes = Math.max(entry.requiredBytes, vertexCount ? ((vertexCount - 1) * stride + offset + itemSize) * 4 : 0);
     entry.attributes.push({shaderLocation: location, offset: offset * 4, format: 'float32x' + itemSize});
   }
@@ -82,7 +113,7 @@ function describe(geometry) {
     indexFormat = index.array instanceof Uint16Array ? 'uint16' : 'uint32';
     indexCount = integer(index.count, 0, index.array.length, 'index count');
     if (owners.has(index)) fail('SHAPE', 'Index and vertex source identities must be distinct');
-    owners.set(index, {owner: index, array: index.array, stride: 0, attributes: [], requiredBytes: indexCount * index.array.BYTES_PER_ELEMENT});
+    owners.set(index, {owner: index, array: index.array, stride: 0, attributes: [], requiredBytes: indexCount * index.array.BYTES_PER_ELEMENT, conversion: null});
   }
   const streams = [...owners.values()].filter(e => e.stride !== 0);
   // Stable layouts do not depend on object ids, buffer generations or insertion
@@ -168,6 +199,14 @@ function createResidency(device, geometry, {
   }
   function native(fn) { try { return fn(); } catch (error) { throw stop(error); } }
   function write(record, array, start, end) {
+    if (record.conversion) {
+      if (end === start) return;
+      const floats = new Float32Array(record.shadow.buffer, start * 4, end - start), element = record.conversion.element;
+      for (let i = start; i < end; i++) floats[i - start] = element(array[i]);
+      native(() => device.queue.writeBuffer(record.buffer, start * 4, record.shadow, start * 4, (end - start) * 4));
+      stats.uploads++; stats.uploadedBytes += (end - start) * 4;
+      return;
+    }
     const from = start * array.BYTES_PER_ELEMENT, to = end * array.BYTES_PER_ELEMENT;
     if (to === from) return;
     record.shadow.set(new Uint8Array(array.buffer, array.byteOffset + from, to - from), from);
@@ -186,15 +225,18 @@ function createResidency(device, geometry, {
       let addedBytes = 0, addedCount = 0;
       // Admission completes before any allocation, queue write, range mutation
       // or callback. An invalid later attribute cannot partly upload the frame.
-      for (const {owner, array, requiredBytes} of shape.owners.values()) {
+      for (const {owner, array, requiredBytes, conversion} of shape.owners.values()) {
         integer(owner.version, 0, Number.MAX_SAFE_INTEGER, 'upload version');
-        const existing = records.get(owner), size = Math.max(4, align4(array.byteLength));
+        // Converted storage is one f32 per element; compare in resident bytes.
+        const logical = conversion ? array.length * 4 : array.byteLength;
+        const existing = records.get(owner), size = Math.max(4, align4(logical));
         if (typeof owner.onUploadCallback !== 'function') fail('SHAPE', 'Expected onUploadCallback');
         if (existing) {
           if (existing.version >= owner.version && requiredBytes > existing.logicalBytes) fail('SHAPE', 'Geometry counts exceed resident storage');
-          if (existing.elementType !== array.constructor) fail('FORMAT', 'Changing a resident element type requires a new attribute');
+          if (existing.elementType !== array.constructor || existing.conversion?.key !== conversion?.key)
+            fail('FORMAT', 'Changing a resident element type or normalization requires a new attribute');
           if (existing.version < owner.version) {
-            if (existing.logicalBytes !== array.byteLength) fail('RESIZE', 'Resizing a resident attribute is not supported; replace the attribute');
+            if (existing.logicalBytes !== logical) fail('RESIZE', 'Resizing a resident attribute is not supported; replace the attribute');
             if (existing.version !== -1) checkRanges(owner, array.length);
           }
         } else {
@@ -216,10 +258,10 @@ function createResidency(device, geometry, {
         let record = records.get(owner);
         if (record && record.version !== -1 && record.version < owner.version) checkRanges(owner, array.length);
         if (!record) {
-          const size = Math.max(4, align4(array.byteLength));
+          const size = Math.max(4, align4(entry.conversion ? array.length * 4 : array.byteLength));
           const shadow = new Uint8Array(size);
           record = {buffer: native(() => device.createBuffer({label, size, usage: 4|8|16|32})),
-            shadow, logicalBytes: array.byteLength, elementType: array.constructor, version: -1};
+            shadow, logicalBytes: entry.conversion ? array.length * 4 : array.byteLength, elementType: array.constructor, conversion: entry.conversion, version: -1};
           // Own the allocation even when an upload callback throws; retry the
           // initial upload without retaining an orphan native buffer.
           records.set(owner, record); allocatedBytes += size; stats.allocations++;

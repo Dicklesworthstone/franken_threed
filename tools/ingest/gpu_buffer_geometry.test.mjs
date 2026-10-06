@@ -5,7 +5,7 @@ import path from 'node:path';
 import {createGpuBufferGeometry,bufferGeometrySnapshot} from './gpu_buffer_geometry.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
 const root = process.env.F3D_THREE_ROOT ?? path.resolve('upstream/three.js');
-const {BufferAttribute,BufferGeometry,InterleavedBuffer,InterleavedBufferAttribute} = await import(pathToFileURL(path.join(root,'build/three.core.js')));
+const {BufferAttribute,BufferGeometry,InterleavedBuffer,InterleavedBufferAttribute,Float16BufferAttribute} = await import(pathToFileURL(path.join(root,'build/three.core.js')));
 const {WebGLAttributes} = await import(pathToFileURL(path.join(root,'src/renderers/webgl/WebGLAttributes.js')));
 const attribute=(values,width=3,C=Float32Array)=>new BufferAttribute(new C(values),width);
 const geometry=()=>new BufferGeometry().setAttribute('position',attribute([0,0,0, 1,0,0, 0,1,0]));
@@ -197,4 +197,31 @@ test('source counts cannot outgrow stale residency and unsupported deformation i
   assert.throws(()=>gpu.update(),{code:'GEOMETRY_GPU_SHAPE'});
   g.morphAttributes={};g.isInstancedBufferGeometry=true;
   assert.throws(()=>gpu.update(),{code:'GEOMETRY_GPU_SHAPE'});gpu.dispose();
+});
+
+test('normalized/integer/half sources upload the GL float-attribute conversion; ranges stay element-exact',()=>{
+  const d=geometryDevice(), g=geometry(), f32=b=>[...new Float32Array(b.data)];
+  const color=new BufferAttribute(new Uint8Array([255,0,128,255, 0,51,255,0, 1,2,3,4]),4,true);
+  const uv=new BufferAttribute(new Int16Array([-32768,32767, 0,-1, 16384,-16384]),2,true);
+  const normal=new BufferAttribute(new Int8Array([1,-2,3, 4,5,-6, 7,8,9]),3); // not normalized: values as floats
+  g.setAttribute('color',color).setAttribute('uv',uv).setAttribute('normal',normal);
+  const gpu=createGpuBufferGeometry(d,g),snap=bufferGeometrySnapshot(gpu,d);
+  const buffer=name=>snap.vertexBuffers[snap.layouts.findIndex(l=>l.attributes.some(a=>a.shaderLocation===({normal:1,uv:3,color:4})[name]))];
+  assert.deepEqual(f32(buffer('color')),[1,0,128/255,1, 0,0.2,1,0, 1/255,2/255,3/255,4/255].map(Math.fround));
+  assert.deepEqual(f32(buffer('uv')),[-1,1, 0,-1/32767, 16384/32767,-16384/32767].map(Math.fround),'signed: max(c/32767,-1)');
+  assert.deepEqual(f32(buffer('normal')),[1,-2,3,4,5,-6,7,8,9]);
+  for(const l of snap.layouts)for(const a of l.attributes)assert.match(a.format,/^float32x[234]$/);
+  // A source range uploads only its converted elements; GPU-stale edits stay stale.
+  color.array[0]=0;color.array[5]=255;color.addUpdateRange(5,1);color.needsUpdate=true;gpu.update();
+  const c=f32(buffer('color'));assert.equal(c[5],1);assert.equal(c[0],1,'outside the range stays GPU-stale');
+  // Halves decode exactly, including subnormals, infinities and signed zero.
+  const half=new Float16BufferAttribute(new Uint16Array(9),3);
+  half.setXYZ(0,0.5,-2,65504);half.setXYZ(1,2**-24,-0,Infinity);half.setXYZ(2,1/3,0,0);half.array[5]=0x7c00; // toHalfFloat clamps Infinity; store the raw bits
+  const h=new BufferGeometry().setAttribute('position',half);
+  const hs=bufferGeometrySnapshot(createGpuBufferGeometry(d,h),d);
+  const hv=f32(hs.vertexBuffers[0]);
+  assert.deepEqual(hv.slice(0,6),[0.5,-2,65504,2**-24,-0,Infinity]);assert.ok(Object.is(hv[4],-0));
+  assert.equal(hv[6],Math.fround(0.333251953125));
+  // Changing normalization of a resident stream is a new layout, not an in-place patch.
+  color.normalized=false;color.needsUpdate=true;assert.throws(()=>gpu.update(),{code:'GEOMETRY_GPU_FORMAT'});
 });
