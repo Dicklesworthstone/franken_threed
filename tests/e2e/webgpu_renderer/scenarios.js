@@ -133,6 +133,18 @@ export const scenarios = {
     quad(0.9, -0.5, 0xffffff, { polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -4 }).scale.set(0.5, 0.5, 1);
     return { scene, camera: camera(THREE) };
   },
+  physical_neutral(THREE) {
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x202020);
+    const a = new THREE.Mesh(new THREE.SphereGeometry(0.7, 48, 24), new THREE.MeshPhysicalMaterial({ color: 0xcc3355, roughness: 0.35, metalness: 0.1 }));
+    a.position.x = -0.8;
+    const b = new THREE.Mesh(new THREE.TorusGeometry(0.45, 0.18, 24, 48), new THREE.MeshPhysicalMaterial({ color: 0xaaaaaa, roughness: 0.2, metalness: 0.9 }));
+    b.position.x = 0.9;
+    const sun = new THREE.DirectionalLight(0xffffff, 3); sun.position.set(2, 3, 4);
+    const fill = new THREE.PointLight(0x88aaff, 6, 0, 2); fill.position.set(-2, -1, 2);
+    scene.add(a, b, sun, fill, new THREE.HemisphereLight(0xffffff, 0x334455, 0.6));
+    return { scene, camera: camera(THREE) };
+  },
   wireframes(THREE) {
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x101010);

@@ -12,7 +12,10 @@ export async function run(THREE, createRenderer) {
     await renderer.setAnimationLoop(() => {
       try {
         renderer.render(scene, camera); state.frames++;
-        if (state.frames === 30) state.pixels = sample(canvas);
+        // The new backend may defer its first frames to a preparation boundary;
+        // sample only after it has presented for a while.
+        const presented = renderer.info.f3d ? renderer.info.f3d.presentedRenders : state.frames;
+        if (state.frames >= 30 && presented >= 30 && !state.pixels) state.pixels = sample(canvas);
       } catch (e) { state.error ??= String(e?.message ?? e); }
     });
   } catch (e) { state.error = String(e?.message ?? e); }

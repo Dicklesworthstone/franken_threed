@@ -147,7 +147,7 @@ export async function createGpuThreeScene(device,scene,{
     // materials into exactly these classes. Any assigned node fails explicitly.
     ...[['MeshBasicNodeMaterial','unlit'],['MeshLambertNodeMaterial','lambert'],['MeshPhongNodeMaterial','phong'],
       ['MeshToonNodeMaterial','toon'],['MeshStandardNodeMaterial','metallic-roughness'],['LineBasicNodeMaterial','unlit'],
-      ['PointsNodeMaterial','unlit']].filter(([name])=>typeof three[name]==='function').map(([name,model])=>[three[name].prototype,model]),
+      ['PointsNodeMaterial','unlit'],['MeshPhysicalMaterial','metallic-roughness'],['MeshPhysicalNodeMaterial','metallic-roughness']].filter(([name])=>typeof three[name]==='function').map(([name,model])=>[three[name].prototype,model]),
   ]);
   const geometries=new Map(),instances=new Map(),materials=new Map(),deformations=new Map();
   const pendingDeformations=new Set(),deformationLifetime=new AbortController();
@@ -343,8 +343,24 @@ export async function createGpuThreeScene(device,scene,{
       fail('MATERIAL',`Lit ${m.type} on ${topology} primitives is not admitted`);
     if(topology!=='triangles'&&!wire&&(m.map||m.alphaMap))fail('MATERIAL','Textured line/point primitives are not admitted');
     if(wire&&m.flatShading)fail('MATERIAL','Flat-shaded wireframes are not admitted');
-    for(const descriptor of Object.values(Object.getOwnPropertyDescriptors(m)))
-      if(!Object.hasOwn(descriptor,'value'))fail('HOOK','Accessor-backed material fields are not admitted');
+    for(const [key,descriptor] of Object.entries(Object.getOwnPropertyDescriptors(m)))
+      // r186 MeshPhysicalMaterial defines its own `reflectivity` accessor (an
+      // alias of ior, which is read directly); no other accessor is admitted.
+      if(!Object.hasOwn(descriptor,'value')&&!(key==='reflectivity'&&m.isMeshPhysicalMaterial))
+        fail('HOOK','Accessor-backed material fields are not admitted');
+    if(m.isMeshPhysicalMaterial){
+      // With every physical extension neutral, r186 shades Physical exactly as
+      // Standard: f0 = ((ior-1)/(ior+1))^2 * specularColor * specularIntensity = 0.04
+      // and F90 = 1. Any active extension needs its own lobe and fails explicitly.
+      const extension=['clearcoat','sheen','transmission','iridescence','anisotropy','dispersion'].find(k=>m[k]!==0)??
+        ((m._retroreflectivity??0)!==0?'retroreflectivity':null);
+      if(extension)fail('MATERIAL',`MeshPhysicalMaterial ${extension} is not admitted yet`);
+      if(m.ior!==1.5||m.specularIntensity!==1||m.specularColor.r!==1||m.specularColor.g!==1||m.specularColor.b!==1)
+        fail('MATERIAL','MeshPhysicalMaterial non-default ior/specular is not admitted yet');
+      const map=['clearcoatMap','clearcoatRoughnessMap','clearcoatNormalMap','sheenColorMap','sheenRoughnessMap','transmissionMap',
+        'thicknessMap','iridescenceMap','iridescenceThicknessMap','anisotropyMap','specularIntensityMap','specularColorMap'].find(k=>m[k]!=null);
+      if(map)fail('MATERIAL',`MeshPhysicalMaterial ${map} is not admitted yet`);
+    }
     if(m.isNodeMaterial){
       for(const key of Object.keys(m))if(key.endsWith('Node')&&m[key]!==null)fail('MATERIAL',`Custom ${key} on ${m.type} requires the node shader path`);
       if(shading!=='unlit'&&m.lights!==true)fail('MATERIAL','Node materials with lights disabled are not admitted');

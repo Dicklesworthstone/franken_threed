@@ -205,6 +205,7 @@
  * rollbackable. version acknowledges submission, not completion: await whenIdle()
  * for cumulative draw/deformation validation, OOM and device-loss errors.
  */
+import { animationDfgWgsl } from "./animation_dfg.mjs";
 import {animationUvBytes, animationUvFields, snapshotAnimationMapTransforms,
   animationMapChannelKey, packAnimationMapTransforms} from "./animation_uv.mjs";
 import {animationClippingBytes, animationClippingFields, animationClippingWgsl,
@@ -409,7 +410,7 @@ function surfaceShader(
     ? /* wgsl */ `
 struct Light { vector: vec4<f32>, radiance: vec4<f32>, direction: vec4<f32>, cone: vec4<f32> }
 struct Lighting { camera: vec4<f32>, light_params: vec4<f32>, lights: array<Light, 8> }
-@group(${textured ? 2 : 1}) @binding(0) var<uniform> lighting: Lighting;
+@group(${textured ? 2 : 1}) @binding(0) var<uniform> lighting: Lighting;${threeLights ? animationDfgWgsl() : ""}
 ${shadowed ? projectedShadowWgsl(textured ? 2 : 1) : ""}${environmentCode ? "\n" + environmentCode : ""}
 fn unit_vector(v: vec3<f32>) -> vec3<f32> {
   let scale = max(max(abs(v.x), abs(v.y)), abs(v.z));
@@ -420,7 +421,9 @@ fn unit_vector(v: vec3<f32>) -> vec3<f32> {
 fn illuminate(base: vec3<f32>, position: vec3<f32>, normal: vec3<f32>, metallic: f32, roughness: f32, emission: vec3<f32>${ambientOcclusion ? ", occlusion: f32" : ""}${phong ? ", specular_strength: f32" : ""}) -> vec3<f32> {
   var view = unit_vector(lighting.camera.xyz - position);
   if (lighting.camera.w > 0.0) { view = lighting.camera.xyz; }
-  let nv = max(dot(normal, view), 0.0);
+  let nv = max(dot(normal, view), 0.0);${threeLights ? `
+  let dfg = f3d_dfg(roughness, clamp(dot(normal, view), 0.0, 1.0));
+  let dfg_ess = dfg.x + dfg.y;` : ""}
   var result = emission;${environmentCode ? "\n  result += environment_lighting(base, normal, view, metallic, roughness, draw_info.options.z == 2.0)" + (ambientOcclusion ? " * occlusion" : "") + ";" : ""}
   for (var i = 0u; i < u32(lighting.light_params.x); i++) {
     let light = lighting.lights[i];
@@ -433,8 +436,18 @@ fn illuminate(base: vec3<f32>, position: vec3<f32>, normal: vec3<f32>, metallic:
         let weight = dot(normal, light.vector.xyz) * 0.5 + 0.5;
         irradiance = mix(light.direction.xyz, light.radiance.rgb, weight);
       }
-      let diffuse = base * select(1.0, 1.0 - metallic, draw_info.options.z == 2.0);
-      result += irradiance * diffuse / 3.141592653589793${ambientOcclusion ? " * occlusion" : ""};
+      let diffuse = base * select(1.0, 1.0 - metallic, draw_info.options.z == 2.0);${threeLights ? `
+      // r186 indirectDiffuse: energy reflected by the dielectric specular lobe
+      // (F0 0.04, F90 1, multi-scattered) is unavailable to the diffuse layer.
+      var indirect_energy = 1.0;
+      if (draw_info.options.z == 2.0) {
+        let fss_ess = 0.04 * dfg.x + dfg.y;
+        let ems = 1.0 - dfg_ess;
+        let favg = 0.04 + 0.96 * 0.047619;
+        let fms = fss_ess * favg / (1.0 - ems * favg);
+        indirect_energy = 1.0 - (fss_ess + fms * ems);
+      }` : ""}
+      result += irradiance * diffuse / 3.141592653589793${threeLights ? " * indirect_energy" : ""}${ambientOcclusion ? " * occlusion" : ""};
     } else {
     ` : ""}var incoming = -light.vector.xyz;
     var attenuation = 1.0;
@@ -476,7 +489,28 @@ fn illuminate(base: vec3<f32>, position: vec3<f32>, normal: vec3<f32>, metallic:
     let edge = exp2((-5.55473 * vh - 6.98316) * vh);
     let fresnel = specular * (1.0 - edge) + vec3<f32>(edge);
     let distribution = (roughness * 0.5 + 1.0) * pow(nh, roughness) / 3.141592653589793;
-    brdf += fresnel * (0.25 * distribution * specular_strength);` : `if (draw_info.options.z == 2.0) {
+    brdf += fresnel * (0.25 * distribution * specular_strength);` : threeLights ? `if (draw_info.options.z == 2.0) {
+      // r186 PhysicalLightingModel.direct for MeshStandardMaterial: diffuse
+      // weighted by a dielectric (0.04) Schlick term, GGX with the
+      // metal-blended F0, and multi-scattering energy compensation.
+      let half_vector = unit_vector(incoming + view);
+      let nh = clamp(dot(normal, half_vector), 0.0, 1.0);
+      let vh = clamp(dot(view, half_vector), 0.0, 1.0);
+      let alpha = roughness * roughness;
+      let a2 = alpha * alpha;
+      let nh2 = nh * nh;
+      let denominator = nh2 * (a2 - 1.0) + 1.0;
+      let distribution = a2 / (3.141592653589793 * denominator * denominator);
+      let gv = nl * sqrt(a2 + (1.0 - a2) * nv * nv);
+      let gl = nv * sqrt(a2 + (1.0 - a2) * nl * nl);
+      let visibility = 0.5 / max(gv + gl, 1e-6);
+      let schlick = exp2((-5.55473 * vh - 6.98316) * vh);
+      let fresnel_dielectric = 0.04 * (1.0 - schlick) + schlick;
+      let f0 = mix(vec3<f32>(0.04), base, metallic);
+      let fresnel = f0 * (1.0 - schlick) + vec3<f32>(schlick);
+      brdf = (1.0 - fresnel_dielectric) * (1.0 - metallic) * base / 3.141592653589793 +
+        fresnel * distribution * visibility * (f0 * (1.0 / dfg_ess - 1.0) + vec3<f32>(1.0));
+    }` : `if (draw_info.options.z == 2.0) {
       if (nv <= 0.0) { continue; }
       let half_vector = unit_vector(incoming + view);
       let nh = clamp(dot(normal, half_vector), 0.0, 1.0);
@@ -577,7 +611,7 @@ struct VertexOutput {
   ${toon ? "// Toon derivatives run before alpha discard, including instanced MASK draws." : "if (draw_info.options.x >= 0.0 && rgba.a < draw_info.options.x) { discard; }"}
   ${
     lit
-      ? `var normal = ${flat ? "flat_normal" : "unit_vector(input.normal)"};${coated ? "\n  var coat_normal = normal;" : ""}
+      ? `var normal = ${flat ? "flat_normal" : "unit_vector(input.normal)"};${coated ? "\n  var coat_normal = normal;" : ""}${threeLights && !phong && !toon ? "\n  let input_geometry_normal = normal;" : ""}
   ${
     normalMapped
       ? `${
@@ -612,7 +646,12 @@ struct VertexOutput {
   }
   ${coatNormalMapped ? clearcoatNormalCode(derivative) + "\n  " : ""}${flat ? "" : "normal *= select(-1.0, 1.0, front);"}${coated && !flat ? "\n  coat_normal *= select(-1.0, 1.0, front);" : ""}
   let metallic = draw_info.options.w ${!phong && !toon && mapMask & 2 ? "* metallic_roughness_texel.b" : ""};
-  let roughness = draw_info.emission_roughness.w ${!phong && !toon && mapMask & 2 ? "* metallic_roughness_texel.g" : ""};
+  ${threeLights && !phong && !toon ? "let source_roughness" : "let roughness"} = draw_info.emission_roughness.w ${!phong && !toon && mapMask & 2 ? "* metallic_roughness_texel.g" : ""};${threeLights && !phong && !toon ? `
+  // r186 getRoughness: max(roughness, 0.0525) + geometry roughness, clamped to
+  // one. Geometry roughness uses world-space (not view-space) normal
+  // derivatives here: equal footprint, but the per-axis maximum can differ.
+  let normal_dxy = max(abs(dpdx(input_geometry_normal)), abs(dpdy(input_geometry_normal)));
+  let roughness = select(source_roughness, min(max(source_roughness, 0.0525) + max(max(normal_dxy.x, normal_dxy.y), normal_dxy.z), 1.0), draw_info.options.z == 2.0);` : ""}
   let emission = draw_info.emission_roughness.rgb ${mapMask & 8 ? "* emissive_texel.rgb" : ""};
   ${ambientOcclusion ? "// glTF occlusion uses only linear R and affects indirect light, never emission or punctual light.\n  let occlusion = 1.0 + draw_info.normal_from_local.strength * (occlusion_texel.r - 1.0);\n  " : ""}${coated ? "var" : "let"} rgb = illuminate(rgba.rgb, input.world, normal, metallic, roughness, emission${ambientOcclusion ? ", occlusion" : ""}${phong ? mapMask & 2 ? ", specular_texel.r" : ", 1.0" : ""});${
     coated
