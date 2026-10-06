@@ -6,13 +6,23 @@
  * captured, recursive and non-scalar calls must pass the actual compiler.
  * Every discovered function still passes whole-function numeric compilation.
  */
-export function hasNumericLoop(body, immutableHelpers = null) {
+// A method spelling only proposes a candidate. Actual receiver types, method
+// identities, lexical scope and effects must still pass compiler/host guards.
+export function isNumericBulkCall(node) {
+  return node?.type === 'CallExpression' && !node.optional &&
+    node.callee.type === 'MemberExpression' && !node.callee.optional &&
+    !node.callee.computed && ['set', 'fill', 'copyWithin'].includes(node.callee.property.name);
+}
+
+// includeBulk is explicit so legacy single-entry package selection is stable.
+export function hasNumericLoop(body, immutableHelpers = null, includeBulk = false) {
   const pending = [body], visited = new Set();
   while (pending.length) {
     const node = pending.pop();
     if (!node || visited.has(node)) continue;
     visited.add(node);
     if (['ForStatement', 'WhileStatement', 'DoWhileStatement'].includes(node.type)) return true;
+    if (includeBulk && isNumericBulkCall(node.type === 'ExpressionStatement' ? node.expression : node)) return true;
     if (immutableHelpers) {
       // Never treat a nested declaration/callback/class as source execution.
       // Follow only explicitly supplied immutable module helper declarations;
@@ -79,6 +89,10 @@ export function discoverNumericArrayParameters(fn, immutableHelpers = new Map())
       if (node.type === 'AssignmentExpression' && node.operator === '=') depend(node.left, node.right);
       if (node.type === 'MemberExpression' && node.object.type === 'Identifier')
         record.required.add(node.object.name);
+      // set's source may never be subscripted elsewhere, including through
+      // aliases and reordered helper parameters. Treat it as a required view.
+      if (isNumericBulkCall(node) && node.callee.property.name === 'set')
+        for (const name of references(node.arguments[0])) record.required.add(name);
       if (node.type === 'CallExpression' && !node.optional && node.callee.type === 'Identifier') {
         const callee = immutableHelpers.get(node.callee.name);
         if (callee?.type === 'FunctionDeclaration') {

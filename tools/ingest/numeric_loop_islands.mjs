@@ -8,10 +8,12 @@ import * as walk from 'acorn-walk';
 import {compileNumericCandidate} from './numeric_candidate.mjs';
 import {NumericKernelCompileError} from './numeric_kernel.mjs';
 import {discoverNumericStorageHints} from './numeric_storage_hints.mjs';
-import {discoverNumericArrayParameters} from './numeric_loop_discovery.mjs';
+import {discoverNumericArrayParameters, isNumericBulkCall} from './numeric_loop_discovery.mjs';
 
 const FUNCTIONS = new Set(['FunctionDeclaration', 'FunctionExpression', 'ArrowFunctionExpression']);
 const LOOPS = new Set(['ForStatement', 'WhileStatement', 'DoWhileStatement']);
+const bulkStatement = node => node.type === 'ExpressionStatement' && isNumericBulkCall(node.expression);
+const numericWork = node => LOOPS.has(node.type) || bulkStatement(node);
 const span = node => ({start:node.start, end:node.end,
   line:node.loc.start.line, column:node.loc.start.column});
 const contains = (outer, inner) => outer.start <= inner.start && inner.end <= outer.end;
@@ -178,19 +180,22 @@ export function planNumericLoopIslands(source, {
     return helperMath.get(name);
   }
   walk.fullAncestor(ast, (node, _state, ancestors) => {
-    if (LOOPS.has(node.type)) candidates.push({node, ancestors:ancestors.slice(0,-1)});
+    if (numericWork(node)) candidates.push({node, ancestors:ancestors.slice(0,-1),
+      loopPriority:LOOPS.has(node.type), ...(bulkStatement(node) ? {kind:'TypedArrayBulkStatement'} : {})});
     // A sequence is closed only if ALL its statements are closed. Combining
-    // adjacent loops removes intermediate copy/publication boundaries without
-    // crossing an application call, declaration, branch or suspension point.
+    // adjacent numeric work removes intermediate copy/publication boundaries
+    // without crossing arbitrary calls, declarations or suspension points. Bulk
+    // methods join only when their entire original call passes native closure.
     // If the larger proof fails, the individual candidates remain available.
     if (['Program', 'BlockStatement', 'StaticBlock'].includes(node.type)) {
       for (let first=0; first<node.body.length;) {
-        if (!LOOPS.has(node.body[first].type)) { first++; continue; }
+        if (!numericWork(node.body[first])) { first++; continue; }
         let end=first+1;
-        while (end<node.body.length && LOOPS.has(node.body[end].type)) end++;
+        while (end<node.body.length && numericWork(node.body[end])) end++;
         if (end-first>1) {
           const body=node.body.slice(first,end), start=body[0], last=body.at(-1);
-          candidates.push({kind:'LoopSequence', ancestors:[...ancestors], node:{
+          candidates.push({kind:body.every(statement => LOOPS.has(statement.type)) ? 'LoopSequence' : 'NumericWorkSequence',
+            loopPriority:body.some(statement => LOOPS.has(statement.type)), ancestors:[...ancestors], node:{
             type:'BlockStatement', body, start:start.start, end:last.end,
             loc:{start:start.loc.start,end:last.loc.end},
           }});
@@ -201,7 +206,10 @@ export function planNumericLoopIslands(source, {
   });
   // Prefer a closed sequence or outer loop over multiple native transitions. If
   // the larger region has effects, independently closed loops remain eligible.
-  candidates.sort((a,b) => a.node.start-b.node.start || b.node.end-a.node.end);
+  // Newly discovered standalone bulk work must not displace an established
+  // loop when compilation capacity is small. A larger region containing that
+  // loop retains priority, subject to the same full-region closure proof.
+  candidates.sort((a,b) => Number(b.loopPriority)-Number(a.loopPriority) || a.node.start-b.node.start || b.node.end-a.node.end);
   let createName, dispatchName, stateDispatchName;
   for (const {node, ancestors, kind=node.type} of candidates) {
     if ([...excludedSpans, ...accepted].some(range => contains(range,node))) continue;
@@ -297,6 +305,7 @@ export function planNumericLoopIslands(source, {
       loopCount:artifact.manifest.loopCount, maxLoopDepth:artifact.manifest.maxLoopDepth,
       variants:[{parameterTypes,wasmBytes:artifact.wasm.length}, ...alternatives.map(v =>
         ({parameterTypes:v.parameterTypes,wasmBytes:v.bytes.length}))],
+      ...(artifact.manifest.typedArrayMethods ? {typedArrayMethods:[...artifact.manifest.typedArrayMethods]} : {}),
       ...(artifact.manifest.mathIntrinsics ? {mathIntrinsics:[...artifact.manifest.mathIntrinsics]} : {}),
       ...(artifact.helpers.length ? {
         helperBindingSemantics:'immutable-module-declarations',

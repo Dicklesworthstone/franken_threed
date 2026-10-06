@@ -327,7 +327,7 @@ export function specializeNumericModule(
   const orderedCandidates = crossModule ? [...ast.body].sort((a, b) => priority(a) - priority(b)) : ast.body;
   const directLoops = new Set(orderedCandidates.filter(statement => {
     const fn = statement.declaration ?? statement;
-    return fn.type === "FunctionDeclaration" && hasNumericLoop(fn.body);
+    return fn.type === "FunctionDeclaration" && hasNumericLoop(fn.body, null, false);
   }));
   // Do not let a new delegating root consume the last slot before a previously
   // eligible loop function. Within both groups, retain the prior call priority.
@@ -340,7 +340,7 @@ export function specializeNumericModule(
     if (fn?.type !== "FunctionDeclaration" || !fn.id) continue;
     // Include roots whose only iteration lives in reachable immutable helpers.
     // Discovery never substitutes for scalar closure or callee-identity guards.
-    if (!directLoops.has(statement) && !hasNumericLoop(fn.body, helperDeclarations)) continue;
+    if (!directLoops.has(statement) && !hasNumericLoop(fn.body, helperDeclarations, true)) continue;
     const sites = calls.filter((call) => call.callee.name === fn.id.name);
     // Uncalled delegating wrappers offer no route in local-call mode. Avoid
     // adding irrelevant candidates solely because one of their callees loops.
@@ -472,6 +472,8 @@ export function specializeNumericModule(
     }
     item.route = "guarded-numeric-wasm";
     item.parameterTypes = parameterTypes;
+    if (artifact.manifest.typedArrayMethods)
+      item.typedArrayMethods = [...artifact.manifest.typedArrayMethods];
     if (artifact.manifest.mathIntrinsics)
       item.mathIntrinsics = [...artifact.manifest.mathIntrinsics];
     if (artifact.manifest.version === 8) {
