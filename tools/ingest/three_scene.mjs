@@ -50,6 +50,12 @@ const MAPS=[['map','baseColorTexture'],['normalMap','normalTexture'],['emissiveM
 const opacityFields=values=>Object.fromEntries(['baseColorTexture','alphaTexture']
   .filter(key=>values?.[key]!==undefined).map(key=>[key,values[key]]));
 const DEPTH=['never','always','less','less-equal','equal','greater-equal','greater','not-equal'];
+const BLEND_FACTOR_NAMES=[['ZeroFactor','zero'],['OneFactor','one'],['SrcColorFactor','src'],['OneMinusSrcColorFactor','one-minus-src'],
+  ['SrcAlphaFactor','src-alpha'],['OneMinusSrcAlphaFactor','one-minus-src-alpha'],['DstColorFactor','dst'],['OneMinusDstColorFactor','one-minus-dst'],
+  ['DstAlphaFactor','dst-alpha'],['OneMinusDstAlphaFactor','one-minus-dst-alpha'],['SrcAlphaSaturateFactor','src-alpha-saturated'],
+  // WebGPU has no dedicated constant-alpha factors; the source maps both forms.
+  ['ConstantColorFactor','constant'],['ConstantAlphaFactor','constant'],['OneMinusConstantColorFactor','one-minus-constant'],['OneMinusConstantAlphaFactor','one-minus-constant']];
+const BLEND_EQUATION_NAMES=[['AddEquation','add'],['SubtractEquation','subtract'],['ReverseSubtractEquation','reverse-subtract'],['MinEquation','min'],['MaxEquation','max']];
 // Source renderable family -> native primitive topology. LineLoop is excluded:
 // the r186 WebGPU renderer reports it and draws nothing (see render traversal).
 const topologyOf=object=>object.isPoints?'points':object.isLineSegments?'lines':object.isLine?'line-strip':'triangles';
@@ -126,6 +132,9 @@ export async function createGpuThreeScene(device,scene,{
   const backgroundApi=backgroundEnabled?await import('./three_background.mjs'):null;
   let backgroundOwner=null,pendingBackground=null,backgroundPasses=0,backgroundColorPasses=0;
   const sourceBackground=()=>scene.background!==null&&!scene.background?.isColor?scene.background:null;
+  const BLEND_FACTORS=new Map(BLEND_FACTOR_NAMES.map(([k,v])=>[three[k],v]));
+  const BLEND_EQUATIONS=new Map(BLEND_EQUATION_NAMES.map(([k,v])=>[three[k],v]));
+  const stencilAttachment=['depth24plus-stencil8','depth32float-stencil8'].includes(renderOptions.depthFormat);
   const models=new Map([
     [three.MeshBasicMaterial.prototype,'unlit'],[three.MeshLambertMaterial.prototype,'lambert'],
     [three.MeshPhongMaterial.prototype,'phong'],[three.MeshToonMaterial.prototype,'toon'],
@@ -326,9 +335,12 @@ export async function createGpuThreeScene(device,scene,{
       if(!Object.hasOwn(descriptor,'value'))fail('HOOK','Accessor-backed material fields are not admitted');
     if(m.onBeforeRender!==three.Material.prototype.onBeforeRender||m.onBeforeCompile!==three.Material.prototype.onBeforeCompile||
         m.customProgramCacheKey!==three.Material.prototype.customProgramCacheKey)fail('HOOK','Custom material shader/render hooks require their original component');
-    if(m.wireframe||m.alphaHash||m.alphaToCoverage||m.premultipliedAlpha||m.stencilWrite||m.polygonOffset||(!clippingEnabled&&m.clippingPlanes?.length))
-      fail('MATERIAL','Wireframe, hashed/coverage alpha, premultiplication, stencil, polygon offset and clipping are not admitted');
-    if(m.blending!==three.NormalBlending&&!(m.blending===three.NoBlending&&!m.transparent))fail('MATERIAL','Unsupported source blending mode');
+    if(m.wireframe||m.alphaHash||m.alphaToCoverage||(!clippingEnabled&&m.clippingPlanes?.length))
+      fail('MATERIAL','Wireframe, hashed/coverage alpha and clipping are not admitted');
+    // Source r186 WebGPU applies material stencil state only when the target has
+    // a stencil buffer; without one the fields have no rendering effect.
+    if(m.stencilWrite&&stencilAttachment)fail('MATERIAL','Source stencil materials are not admitted on stencil targets yet');
+    const raster=sourceRaster(m,topology);
     if(m.alphaMap&&!alphaMaps)fail('MATERIAL','Enable alphaMaps before drawing source opacity textures');
     for(const key of ['lightMap','bumpMap','displacementMap','envMap'])if(m[key])fail('MATERIAL',`Unsupported source map: ${key}`);
     if(![0,1,2].includes(m.side)||!Number.isInteger(m.depthFunc)||!DEPTH[m.depthFunc])fail('MATERIAL','Unsupported side/depth state');
@@ -347,9 +359,12 @@ export async function createGpuThreeScene(device,scene,{
       clipped={clippingPlanes,clipIntersection,clipShadows};
     }
     const options={shading,...(topology==='triangles'?{}:{topology}),vertexColors:m.vertexColors,flatShading:shading==='unlit'?false:m.flatShading===true,
-      alphaMode:m.transparent?'BLEND':m.alphaTest>0?'MASK':'OPAQUE',alphaCutoff:m.alphaTest>0?m.alphaTest:0.5,alphaTest:m.alphaTest>0,
+      // r186 NodeBuilder.isOpaque(): only non-transparent NormalBlending forces
+      // output alpha to one; every other blending keeps the diffuse alpha.
+      alphaMode:m.transparent||m.blending!==three.NormalBlending?'BLEND':m.alphaTest>0?'MASK':'OPAQUE',alphaCutoff:m.alphaTest>0?m.alphaTest:0.5,alphaTest:m.alphaTest>0,
       depthTest:m.depthTest,depthWrite:m.depthWrite,depthCompare:DEPTH[m.depthFunc],colorWrite:m.colorWrite};
-    const values={baseColor:rgba(m.color,m.opacity)};
+    Object.assign(options,raster.options);
+    const values={baseColor:rgba(m.color,m.opacity),...raster.values};
     if(options.alphaTest)values.alphaCutoff=m.alphaTest;
     if(shading!=='unlit')values.emissiveFactor=rgb(m.emissive).map(v=>v*m.emissiveIntensity);
     if(shading==='phong'){values.specularColor=rgb(m.specular);values.shininess=m.shininess;}
@@ -403,9 +418,46 @@ export async function createGpuThreeScene(device,scene,{
     return sides.map(side=>{
       const config={...options,side};
       const structural=[epoch,shading,topology,side,config.vertexColors,config.flatShading,config.alphaMode,config.alphaTest,
-        config.depthTest,config.depthWrite,config.depthCompare,config.colorWrite,...(shadowEnabled?[m.shadowSide??null]:[]),...textureKey];
+        config.depthTest,config.depthWrite,config.depthCompare,config.colorWrite,raster.key,...(shadowEnabled?[m.shadowSide??null]:[]),...textureKey];
       return {options:config,values,structural,clipped,...(fogEnabled?{receiveFog:m.fog}:{})};
     });
+  }
+  /** Source r186 WebGPUPipelineUtils blend/bias mapping onto native raster state. */
+  function sourceRaster(m,topology){
+    const options={},values={};
+    const blended=m.blending!==three.NoBlending&&(m.blending!==three.NormalBlending||m.transparent!==false);
+    const premultiplied=m.premultipliedAlpha===true;
+    if(m.premultipliedAlpha!==undefined&&typeof m.premultipliedAlpha!=='boolean')fail('MATERIAL','Expected boolean premultipliedAlpha');
+    const set=(src,dst,srcAlpha,dstAlpha)=>({color:{operation:'add',srcFactor:src,dstFactor:dst},alpha:{operation:'add',srcFactor:srcAlpha,dstFactor:dstAlpha}});
+    if(!blended)options.blend=null;
+    else if(m.blending===three.CustomBlending){
+      const factor=f=>{const name=BLEND_FACTORS.get(f);if(!name)fail('MATERIAL','Unsupported source blend factor');return name;};
+      const equation=e=>{const name=BLEND_EQUATIONS.get(e);if(!name)fail('MATERIAL','Unsupported source blend equation');return name;};
+      options.blend={color:{operation:equation(m.blendEquation),srcFactor:factor(m.blendSrc),dstFactor:factor(m.blendDst)},
+        alpha:{operation:equation(m.blendEquationAlpha??m.blendEquation),srcFactor:factor(m.blendSrcAlpha??m.blendSrc),dstFactor:factor(m.blendDstAlpha??m.blendDst)}};
+      if([options.blend.color,options.blend.alpha].some(c=>[c.srcFactor,c.dstFactor].some(f=>f.includes('constant'))))
+        values.blendConstant=[m.blendColor.r,m.blendColor.g,m.blendColor.b,m.blendAlpha];
+    }else if(m.blending===three.NormalBlending)options.blend=premultiplied?set('one','one-minus-src-alpha','one','one-minus-src-alpha'):set('src-alpha','one-minus-src-alpha','one','one-minus-src-alpha');
+    else if(m.blending===three.AdditiveBlending)options.blend=premultiplied?set('one','one','one','one'):set('src-alpha','one','one','one');
+    else if(m.blending===three.SubtractiveBlending||m.blending===three.MultiplyBlending){
+      if(premultiplied)options.blend=m.blending===three.SubtractiveBlending?set('zero','one-minus-src','zero','one'):set('dst','one-minus-src-alpha','zero','one');
+      else{
+        // The source reports this configuration and then draws without blending.
+        (three.error??console.error)(`WebGPURenderer: "${m.blending===three.SubtractiveBlending?'SubtractiveBlending':'MultiplyBlending'}" requires "material.premultipliedAlpha = true".`);
+        options.blend=null;
+      }
+    }else fail('MATERIAL','Unsupported source blending mode');
+    if(premultiplied)options.premultipliedAlpha=true;
+    // Source polygon offset is triangle-only fixed state with a zero clamp.
+    if(m.polygonOffset===true&&topology==='triangles'){
+      for(const key of ['polygonOffsetUnits','polygonOffsetFactor'])finite(m[key],key);
+      if(!Number.isSafeInteger(m.polygonOffsetUnits))fail('MATERIAL','polygonOffsetUnits must be an integer depth bias');
+      Object.assign(options,{depthBias:m.polygonOffsetUnits,depthBiasSlopeScale:m.polygonOffsetFactor,depthBiasClamp:0});
+    }
+    // Ordinary NormalBlending keeps the renderer's established default path.
+    if(m.blending===three.NormalBlending&&!premultiplied)delete options.blend;
+    else if(m.blending===three.NormalBlending&&!m.transparent)options.blend=null;
+    return {options,values,key:JSON.stringify(options)};
   }
   function desired(nodes){
     const clippingFrame=clippingState();

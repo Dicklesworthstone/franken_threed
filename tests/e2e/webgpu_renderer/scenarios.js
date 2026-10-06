@@ -95,6 +95,44 @@ export const scenarios = {
     scene.add(pts);
     return { scene, camera: camera(THREE, [2, 2, 3]) };
   },
+  line_strips_and_loops(THREE) {
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x101820);
+    const pts = [];
+    for (let i = 0; i <= 64; i++) pts.push(new THREE.Vector3(Math.cos(i / 8) * 1.2, (i / 64) * 2 - 1, Math.sin(i / 8) * 0.5));
+    const spiral = new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({ color: 0xffcc00 }));
+    const indexed = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(-1.5, -0.8, 0), new THREE.Vector3(-0.5, 0.9, 0), new THREE.Vector3(0.5, -0.9, 0), new THREE.Vector3(1.5, 0.8, 0)]);
+    indexed.setIndex([0, 1, 2, 3, 1]);
+    const zigzag = new THREE.Line(indexed, new THREE.LineBasicMaterial({ color: 0x33ddff, transparent: true, opacity: 0.6 }));
+    const loop = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(-1, -1, 0.5), new THREE.Vector3(1, -1, 0.5), new THREE.Vector3(0, 1, 0.5)]), new THREE.LineBasicMaterial({ color: 0xff0000 }));
+    scene.add(spiral, zigzag, loop);
+    return { scene, camera: camera(THREE) };
+  },
+  blending_modes(THREE) {
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x406080);
+    const geo = new THREE.PlaneGeometry(0.9, 0.9);
+    const quad = (x, y, color, options) => {
+      const m = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color, ...options }));
+      m.position.set(x, y, 0); scene.add(m); return m;
+    };
+    quad(-1.2, 0.5, 0xff8800, { blending: THREE.AdditiveBlending, transparent: true, opacity: 0.7, depthWrite: false });
+    quad(-0.6, 0.5, 0x0088ff, { blending: THREE.AdditiveBlending, opacity: 0.5 }); // additive without transparent
+    quad(0.0, 0.5, 0x88ff00, { blending: THREE.SubtractiveBlending, premultipliedAlpha: true, transparent: true, opacity: 0.8 });
+    quad(0.6, 0.5, 0xff00ff, { blending: THREE.MultiplyBlending, premultipliedAlpha: true, transparent: true, opacity: 0.9 });
+    quad(1.2, 0.5, 0xffffff, { blending: THREE.NormalBlending, premultipliedAlpha: true, transparent: true, opacity: 0.4 });
+    // Upstream WebGPU passes non-one factors with min/max, which WebGPU rejects
+    // (the object is not drawn); F3D keeps the GL meaning. Use valid factors here.
+    quad(-1.2, -0.5, 0x00ffcc, { blending: THREE.CustomBlending, blendEquation: THREE.MaxEquation, blendSrc: THREE.OneFactor, blendDst: THREE.OneFactor, transparent: true });
+    quad(-0.6, -0.5, 0xffff00, { blending: THREE.CustomBlending, blendSrc: THREE.ConstantColorFactor, blendDst: THREE.OneMinusConstantColorFactor,
+      blendColor: new THREE.Color(0.25, 0.5, 0.75), transparent: true });
+    quad(0.0, -0.5, 0xff0000, { blending: THREE.NoBlending, transparent: true, opacity: 0.3 });
+    // Coplanar decal resolved by polygon offset.
+    const base = quad(0.9, -0.5, 0x222222, {});
+    base.scale.set(1.6, 1, 1);
+    quad(0.9, -0.5, 0xffffff, { polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -4 }).scale.set(0.5, 0.5, 1);
+    return { scene, camera: camera(THREE) };
+  },
 };
 function camera(THREE, position = [0, 0, 3.2]) {
   const c = new THREE.PerspectiveCamera(50, 320 / 240, 0.1, 50);
