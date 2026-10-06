@@ -120,9 +120,21 @@ reflection/refraction with every `combine` op, `lightMap`, `bumpMap`,
 `displacementMap`. Lights are wired from the ported light state (no shadow
 maps yet). ShaderMaterial `lights: true` works through the same wiring.
 
-Not admitted yet (explicit errors): MeshStandard/Physical programs (DFG LUT
-and PMREM inputs), PMREM / equirectangular environments, Sprite / Distance /
-Shadow materials, programs receiving shadow-casting lights.
+MeshStandard/Physical programs get r186's DFG LUT (the same 16×16 RG
+half-float table, as a DataTexture), so Physical extensions the core path
+lacks (clearcoat, sheen, iridescence, specular color/intensity, IOR) render
+through ShaderLib.
 
-Evidence: scenario `shaderlib_maps` vs upstream WebGLRenderer (340 of 76,800
-pixels differ slightly); `helpers_lines_points` now draws real point sizes.
+Not admitted yet (explicit errors): transmission (needs its render target),
+PMREM / equirectangular environments, Sprite / Distance / Shadow materials,
+programs receiving shadow-casting lights.
+
+Textures: the texture owner now admits HalfFloat (`*16float`) and Float
+(`*32float`) DataTextures with byte-exact rows. Float32 linear filtering
+requires the device's `float32-filterable` feature (requested, like r186
+WebGPUBackend, whenever the adapter has it); without it nearest-sampled float
+textures bind as unfilterable and linear ones fail explicitly.
+
+Evidence: scenarios `shaderlib_maps` (340 of 76,800 pixels differ slightly)
+and `shaderlib_physical` (166 differ slightly) vs upstream WebGLRenderer;
+`helpers_lines_points` now draws real point sizes.

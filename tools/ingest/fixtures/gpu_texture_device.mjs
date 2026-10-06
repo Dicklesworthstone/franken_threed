@@ -7,7 +7,8 @@ export function textureDevice(){
   d.limits.maxTextureDimension2D=8192;
   d.createTexture=desc=>{
     if(d.textureError)throw d.textureError;
-    const channels=desc.format.startsWith('rgba')?4:desc.format.startsWith('rg')?2:1;
+    // Bytes per texel component: 8unorm 1, 16float 2, 32float 4 (channels counts bytes).
+    const channels=(desc.format.startsWith('rgba')?4:desc.format.startsWith('rg')?2:1)*(desc.format.includes('32')?4:desc.format.includes('16')?2:1);
     const texture={...desc,channels,destroyed:false,levels:Array.from({length:desc.mipLevelCount??1},(_,i)=>
       new Uint8Array(Math.max(1,desc.size[0]>>i)*Math.max(1,desc.size[1]>>i)*channels)),
       createView(options={}){if(d.viewError)throw d.viewError;return {texture:this,...options};},destroy(){this.destroyed=true;}};

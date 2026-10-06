@@ -29,6 +29,8 @@ function half(bits) {
   return sign * 2 ** (exponent - 15) * (1 + fraction / 1024);
 }
 export const ANIMATION_DFG_LUT = Object.freeze(Array.from(HALVES, half));
+/** The same 16x16 RG half-float data as r186 DFGLUTData (bit patterns, a copy). */
+export const animationDfgHalves = () => HALVES.slice();
 /** WGSL: the table plus a bilinear clamp-to-edge sampler matching texture()
  * on the source LinearFilter DataTexture (texel centers at (i + 0.5) / 16). */
 export function animationDfgWgsl() {

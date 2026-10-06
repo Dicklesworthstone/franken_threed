@@ -44,7 +44,7 @@ export function inspectThreeTexture(texture, three, limits={}) {
   return textureInspector(three,limits)(texture);
 }
 function textureInspector(T,{
-  maxTextureBytes=128*1024*1024,maxPixels=16*1024*1024,maxDimension=32768,maxLayers=6,
+  maxTextureBytes=128*1024*1024,maxPixels=16*1024*1024,maxDimension=32768,maxLayers=6,float32Filterable=false,
 }={}) {
   if(T?.REVISION!=='186'||typeof T.Texture!=='function')fail('SOURCE','Supply the pinned r186 module');
   integer(maxTextureBytes,1,Number.MAX_SAFE_INTEGER,'texture budget');
@@ -76,12 +76,14 @@ function textureInspector(T,{
     if(cube&&(typeof T.CubeTexture!=='function'||!(t instanceof T.CubeTexture)||!Array.isArray(t.image)||t.image.length!==6))
       fail('SOURCE','CubeTexture requires six source faces');
     if(layers>maxLayers)fail('LIMIT','Native texture array-layer limit is too small');
-    if(t.type!==T.UnsignedByteType||t.internalFormat!==null||t.compareFunction!=null)
-      fail('FORMAT','This source path requires unsigned-byte, non-depth storage without internal overrides');
+    // Element storage: bytes, half floats (Uint16 bit patterns) or 32-bit floats.
+    const bpc=t.type===T.UnsignedByteType?1:t.type===T.HalfFloatType?2:t.type===T.FloatType?4:0;
+    if(!bpc||t.internalFormat!==null||t.compareFunction!=null)
+      fail('FORMAT','This source path requires byte, half-float or float non-depth storage without internal overrides');
     const channels=new Map([[T.RedFormat,1],[T.RGFormat,2],[T.RGBAFormat,4]]).get(t.format);
-    if(!channels)fail('FORMAT','Expected R, RG or RGBA byte storage');
+    if(!channels)fail('FORMAT','Expected R, RG or RGBA storage');
     if(![T.NoColorSpace,T.LinearSRGBColorSpace,T.SRGBColorSpace].includes(t.colorSpace)||
-        (t.colorSpace===T.SRGBColorSpace&&channels!==4))fail('COLOR','Unsupported transfer function or channel format');
+        (t.colorSpace===T.SRGBColorSpace&&(channels!==4||bpc!==1)))fail('COLOR','Unsupported transfer function or channel format');
     if(!Number.isSafeInteger(t.version)||t.version<(video?0:1)||!Number.isSafeInteger(t.source?.version)||t.source.version<0||t.source.dataReady!==true)
       fail('NOT_READY','Set needsUpdate after providing ready source data');
     if(t.onUpdate!==null&&typeof t.onUpdate!=='function')fail('SOURCE','Invalid upload callback');
@@ -96,6 +98,13 @@ function textureInspector(T,{
       fail('SAMPLER','Anisotropic nearest minification requires an explicit sampler profile');
     const maxAnisotropy=mag[0]==='linear'&&t.minFilter===T.LinearMipmapLinearFilter?anisotropy:1;
     const data=cube?t.image[0]?.isDataTexture===true:t.isDataTexture===true;
+    if(bpc!==1&&(!data||video))fail('FORMAT','Half-float and float storage is admitted for DataTextures');
+    if(bpc!==1&&t.generateMipmaps)fail('MIPS','Generated mipmaps for float storage are not admitted yet');
+    // Float32 linear filtering needs the device's float32-filterable feature (WebGL
+    // OES_texture_float_linear); never silently degrade to nearest.
+    const filterable=bpc!==4||float32Filterable;
+    if(!filterable&&(mag[0]==='linear'||filter[0]==='linear'||filter[1]==='linear'))
+      fail('SAMPLER','Linear filtering of float32 textures needs the float32-filterable device feature');
     const unwrap=image=>{
       if(!cube)return image;
       if(data){
@@ -128,7 +137,7 @@ function textureInspector(T,{
       }
     }else for(const [level,image] of (manual?t.mipmaps:base).entries())uploads.push({image,level,layer:0});
     let bytes=0;
-    for(let level=0;level<levels;level++)bytes+=Math.max(1,width>>level)*Math.max(1,height>>level)*channels*layers;
+    for(let level=0;level<levels;level++)bytes+=Math.max(1,width>>level)*Math.max(1,height>>level)*channels*bpc*layers;
     if(bytes>maxTextureBytes)fail('LIMIT','Texture exceeds byte budget');
     if(data&&t.premultiplyAlpha)fail('FORMAT','Premultiplied byte data requires an explicit upload profile');
     for(const {image,level} of uploads){
@@ -147,28 +156,30 @@ function textureInspector(T,{
       const extent=dimensions(image,data,video);
       if(extent.width!==Math.max(1,width>>level)||extent.height!==Math.max(1,height>>level))fail('MIPS','Invalid face or authored mip dimensions');
       if(data){
-        const a=image.data;
-        if(!(a instanceof Uint8Array)||!(a.buffer instanceof ArrayBuffer)||a.buffer.resizable)fail('STORAGE','Expected fixed, unshared Uint8Array source');
+        const a=image.data,Kind=bpc===1?Uint8Array:bpc===2?Uint16Array:Float32Array;
+        if(!(a instanceof Kind)||!(a.buffer instanceof ArrayBuffer)||a.buffer.resizable)fail('STORAGE',`Expected fixed, unshared ${Kind.name} source`);
         try{new Uint8Array(a.buffer,0,0);}catch{fail('STORAGE','Source pixels are detached');}
-        const row=image.width*channels,pitch=Math.ceil(row/t.unpackAlignment)*t.unpackAlignment;
+        const row=image.width*channels*bpc,pitch=Math.ceil(row/t.unpackAlignment)*t.unpackAlignment;
         if(a.byteLength<(image.height-1)*pitch+row)fail('STORAGE','Source pixels do not fill the unpacked image');
       }
     }
     const images=uploads.map(entry=>entry.image);
     if(!Array.isArray(t.updateRanges))fail('RANGE','Expected source update ranges');
     if(t.updateRanges.length){
-      if(cube||!data||manual||channels!==4||t.flipY)fail('RANGE','Partial source uploads require unflipped RGBA base pixels');
+      if(cube||!data||manual||channels!==4||t.flipY||bpc!==1)fail('RANGE','Partial source uploads require unflipped RGBA byte base pixels');
       for(const r of t.updateRanges){
         integer(r.start,0,width*height*4,'range start');integer(r.count,0,width*height*4-r.start,'range count');
         const x=Math.floor(r.start/4)%width,count=Math.ceil(r.count/4);
         if(x+count>width)fail('RANGE','Source partial updates must fit one pixel row');
       }
     }
-    const format=channels===4?'rgba8unorm':channels===2?'rg8unorm':'r8unorm',viewFormat=t.colorSpace===T.SRGBColorSpace?'rgba8unorm-srgb':format;
+    const prefix=channels===4?'rgba':channels===2?'rg':'r';
+    const format=bpc===1?prefix+'8unorm':bpc===2?prefix+'16float':prefix+'32float',viewFormat=t.colorSpace===T.SRGBColorSpace?'rgba8unorm-srgb':format;
     const sampler={addressModeU:wraps.get(t.wrapS),addressModeV:wraps.get(t.wrapT),magFilter:mag[0],minFilter:filter[0],
       mipmapFilter:filter[1],lodMinClamp:0,lodMaxClamp:filter[2]?levels-1:0,maxAnisotropy};
     const key=JSON.stringify([width,height,levels,format,viewFormat,sampler,t.flipY,t.premultiplyAlpha,t.unpackAlignment,t.generateMipmaps,manual,data,...(cube?['cube']:video?['video']:[])]);
-    return {source:t.source,width,height,levels,layers,cube,video,videoReady,bytes,format,viewFormat,sampler,key,data,images,uploads,manual,channels,
+    return {source:t.source,width,height,levels,layers,cube,video,videoReady,bytes,format,viewFormat,sampler,key,data,images,uploads,manual,channels,bpc,
+      sampleType:filterable?'float':'unfilterable-float',
       flipY:t.flipY,premultiplyAlpha:t.premultiplyAlpha,alignment:t.unpackAlignment};
   }
   return describe;
@@ -180,7 +191,7 @@ export function createGpuThreeTextures(device,{
   if(T?.REVISION!=='186'||typeof T.Texture!=='function')fail('SOURCE','Supply the pinned r186 module');
   integer(maxTextureBytes,1,Number.MAX_SAFE_INTEGER,'texture budget');integer(maxTextures,1,65536,'texture capacity');
   integer(maxPixels,1,Number.MAX_SAFE_INTEGER,'pixel capacity');if(typeof label!=='string')fail('VALUE','Expected a label');
-  const describe=textureInspector(T,{maxTextureBytes,maxPixels,
+  const describe=textureInspector(T,{maxTextureBytes,maxPixels,float32Filterable:device?.features?.has?.('float32-filterable')===true,
     maxDimension:device?.limits?.maxTextureDimension2D??32768,maxLayers:device?.limits?.maxTextureArrayLayers??1});
   const records=new Map(),sources=new Map(),pipelines=new Map();
   let textureBytes=0,disposed=false,terminal=null,busy=false,pending=Promise.resolve(),mipSampler=null,rejectStop;
@@ -255,9 +266,11 @@ export function createGpuThreeTextures(device,{
           }
           t.clearUpdateRanges();
         }else for(const {level,layer,image} of d.uploads){
-          const row=image.width*d.channels,pitch=Math.ceil(row/d.alignment)*d.alignment;
-          let data=image.data;
-          if(d.flipY){data=new Uint8Array(row*image.height);for(let y=0;y<image.height;y++)data.set(image.data.subarray((image.height-1-y)*pitch,(image.height-1-y)*pitch+row),y*row);}
+          // Rows in bytes: GL UNPACK_ALIGNMENT pads each source row to the alignment.
+          const row=image.width*d.channels*d.bpc,pitch=Math.ceil(row/d.alignment)*d.alignment;
+          const src=new Uint8Array(image.data.buffer,image.data.byteOffset,image.data.byteLength);
+          let data=src;
+          if(d.flipY){data=new Uint8Array(row*image.height);for(let y=0;y<image.height;y++)data.set(src.subarray((image.height-1-y)*pitch,(image.height-1-y)*pitch+row),y*row);}
           native(()=>device.queue.writeTexture({texture:a.texture,mipLevel:level,...(d.cube?{origin:[0,0,layer]}:{})},data,{bytesPerRow:d.flipY?row:pitch},[image.width,image.height,1]));stats.writeCalls++;
         }
       }else for(const {image,level,layer} of d.uploads){
@@ -312,7 +325,8 @@ export function createGpuThreeTextures(device,{
     }finally{busy=false;}
   }
   function check(t){live();const d=describe(t),r=match(t,d);if(!r)fail('PREPARE','Prepare the current texture storage and sampler before drawing');return {r,d};}
-  function binding(t){const {r}=check(t);return Object.freeze({view:r.resource.view,sampler:r.resource.sampler,version:r.version,sourceVersion:r.resource.sourceVersion});}
+  function binding(t){const {r,d}=check(t);return Object.freeze({view:r.resource.view,sampler:r.resource.sampler,version:r.version,sourceVersion:r.resource.sourceVersion,
+    sampleType:d?.sampleType??'float',filtering:(d?.sampleType??'float')==='float'});}
   function update(input){
     const list=plans(input);if(busy)fail('REENTRANT','Cannot update during a texture operation');
     for(const {t,d} of list)if(!match(t,d))fail('PREPARE','Texture structure changed; call prepare');

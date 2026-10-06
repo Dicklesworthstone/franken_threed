@@ -31,6 +31,12 @@ import {createGpuCanvasRenderer} from './gpu_canvas_renderer.mjs';
 import {createGpuHdrCanvasRenderer} from './gpu_hdr_canvas.mjs';
 import {createGpuThreeScene} from './three_scene.mjs';
 import {createThreeProgramSupport} from './three_program.mjs';
+// r186 src/renderers/webgpu/utils/WebGPUConstants.js GPUFeatureName values.
+const R186_GPU_FEATURES = ['core-features-and-limits', 'depth-clip-control', 'depth32float-stencil8', 'texture-compression-bc',
+  'texture-compression-bc-sliced-3d', 'texture-compression-etc2', 'texture-compression-astc', 'texture-compression-astc-sliced-3d',
+  'timestamp-query', 'indirect-first-instance', 'shader-f16', 'rg11b10ufloat-renderable', 'bgra8unorm-storage', 'float32-filterable',
+  'float32-blendable', 'clip-distances', 'dual-source-blending', 'subgroups', 'texture-formats-tier1', 'texture-formats-tier2',
+  'texture-compression-s3tc', 'texture-compression-etc1'];
 
 export class F3DRendererError extends Error {
   constructor(code, message) {
@@ -285,7 +291,9 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         if (!gpu || typeof gpu.requestAdapter !== 'function') fail('UNAVAILABLE', 'WebGPU is unavailable in this host');
         const adapter = await gpu.requestAdapter(p.powerPreference ? {powerPreference: p.powerPreference} : {});
         if (!adapter) fail('UNAVAILABLE', 'No WebGPU adapter is available');
-        this._device = await adapter.requestDevice({requiredFeatures: p.requiredFeatures ?? [], requiredLimits: p.requiredLimits ?? {}});
+        // As r186 WebGPUBackend: request every GPUFeatureName the adapter supports.
+        const requiredFeatures = [...new Set([...R186_GPU_FEATURES.filter(f => adapter.features?.has?.(f)), ...(p.requiredFeatures ?? [])])];
+        this._device = await adapter.requestDevice({requiredFeatures, requiredLimits: p.requiredLimits ?? {}});
         this._ownsDevice = true;
       }
       this._preferredFormat = (defaultGpu ?? globalThis.navigator?.gpu)?.getPreferredCanvasFormat?.();

@@ -213,3 +213,19 @@ test('differential upload histories match the retained r186 WebGLTextures implem
   }
   b.dispose();assert.ok(buffers[0].destroyed);p.dispose();
 });
+
+test('half-float and float DataTextures upload exact bytes; float32 linear filtering needs float32-filterable',()=>{
+  const d=textureDevice(),p=pool(d);
+  const half=new T.DataTexture(new Uint16Array([0x3c00,0x3800,0,0x7bff, 0x3c00,0x3c00,0x3c00,0x3c00]),2,1,T.RGBAFormat,T.HalfFloatType);half.needsUpdate=true;
+  const rg=new T.DataTexture(new Float32Array([1,2,3,4]),2,1,T.RGFormat,T.FloatType);rg.needsUpdate=true;
+  p.prepare([half,rg]);
+  assert.equal(p.binding(half).view.format,'rgba16float');assert.equal(p.binding(rg).view.format,'rg32float');
+  assert.equal(p.binding(rg).sampleType,'unfilterable-float','nearest float32 without the feature');
+  assert.deepEqual([...p.binding(half).view.texture.levels[0]],[0x00,0x3c,0x00,0x38,0,0,0xff,0x7b,0x00,0x3c,0x00,0x3c,0x00,0x3c,0x00,0x3c],'half bit patterns uploaded unchanged');
+  assert.deepEqual([...new Float32Array(p.binding(rg).view.texture.levels[0].buffer)],[1,2,3,4]);
+  const linear=new T.DataTexture(new Float32Array(4),1,1,T.RGBAFormat,T.FloatType);linear.magFilter=T.LinearFilter;linear.needsUpdate=true;
+  assert.throws(()=>p.prepare([linear]),{code:'THREE_TEXTURE_SAMPLER'});
+  const srgb=new T.DataTexture(new Uint16Array(4),1,1,T.RGBAFormat,T.HalfFloatType);srgb.colorSpace=T.SRGBColorSpace;srgb.needsUpdate=true;
+  assert.throws(()=>p.prepare([srgb]),{code:'THREE_TEXTURE_COLOR'});
+  p.dispose();
+});

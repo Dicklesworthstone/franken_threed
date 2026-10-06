@@ -141,7 +141,7 @@ test('external cube faces preserve image identities, layer targets and explicit 
 
 test('ordinary byte uploads preserve partial ranges, authored levels and binding shape',()=>{
   const d=device(),p=pool(d),t=face(1);p.prepare([t]);
-  assert.deepEqual(Object.keys(p.binding(t)),['view','sampler','version','sourceVersion']);
+  assert.deepEqual(Object.keys(p.binding(t)),['view','sampler','version','sourceVersion','sampleType','filtering']);
   assert.deepEqual(d.textures[0].size,[2,2,1]);assert.equal(d.writes[0].destination.origin,undefined);
   t.image.data.fill(7);t.updateRanges.push({start:4,count:4});t.needsUpdate=true;p.update([t]);
   assert.deepEqual(d.writes[1].destination.origin,[1,0,0]);assert.deepEqual(d.writes[1].size,[1,1,1]);

@@ -24,6 +24,7 @@
 import {compileEsslProgram} from './essl_wgsl.mjs';
 import {SHADER_IDS, webglParameters, webglProgramSources, webglLights, webglMaterialUniforms, refreshWebGLMaterialUniforms, materialNeedsLights} from './three_webgl_program.mjs';
 import {createGpuProgramGeometry, programGeometrySnapshot} from './gpu_buffer_geometry.mjs';
+import {animationDfgHalves} from './animation_dfg.mjs';
 
 export class ThreeProgramError extends Error {
   constructor(code, message) { super(`THREE_PROGRAM_${code}: ${message}`); this.name = 'ThreeProgramError'; this.code = 'THREE_PROGRAM_' + code; }
@@ -47,7 +48,7 @@ export function inspectThreeProgram(T, material, object) {
   if (material.alphaToCoverage) fail('MATERIAL', 'alphaToCoverage is not admitted');
   if (material.alphaHash) fail('MATERIAL', 'alphaHash programs are not admitted yet');
   if (material.stencilWrite) fail('MATERIAL', 'Stencil programs are not admitted yet');
-  if (material.isMeshStandardMaterial) fail('MATERIAL', 'ShaderLib physical programs need the DFG LUT and PMREM inputs, not admitted yet');
+  if (material.transmission > 0) fail('MATERIAL', 'Transmission needs the transmission render target, not admitted yet');
   if (material.isMeshDistanceMaterial || material.isSpriteMaterial || material.isShadowMaterial) fail('MATERIAL', `${material.type} programs are not admitted yet`);
 }
 
@@ -189,6 +190,16 @@ function write(view, node, value, name, base = 0) {
  * Compiled programs are cached by their exact assembled source text (bounded). */
 export function createThreeProgramSupport({three: T, state, maxPrograms = 256, maxPointSize = 1024}) {
   const compiled = new Map(), lights = webglLights(T), clones = new WeakMap();
+  let dfgLUT = null;
+  /** r186 getDFGLUT(): the 16x16 RG half-float DFG table, linear, clamped. */
+  function getDFGLUT() {
+    if (dfgLUT === null) {
+      dfgLUT = new T.DataTexture(animationDfgHalves(), 16, 16, T.RGFormat, T.HalfFloatType);
+      dfgLUT.name = 'DFG_LUT'; dfgLUT.minFilter = T.LinearFilter; dfgLUT.magFilter = T.LinearFilter;
+      dfgLUT.wrapS = T.ClampToEdgeWrapping; dfgLUT.wrapT = T.ClampToEdgeWrapping; dfgLUT.generateMipmaps = false; dfgLUT.needsUpdate = true;
+    }
+    return dfgLUT;
+  }
   let lightList = [];
   function compile(material, object, {fog = null, side = material.side, envMap = null} = {}) {
     const s = state();
@@ -216,6 +227,7 @@ export function createThreeProgramSupport({three: T, state, maxPrograms = 256, m
     const uniforms = uniformsFor(material), s = state();
     refreshWebGLMaterialUniforms(T, uniforms, material, {fog, lights: lights.state, envMap, envMapRotation,
       pixelRatio: s.pixelRatio ?? 1, height: s.height ?? 1, unlitColorSpace: s.outputColorSpace});
+    if (uniforms.dfgLUT !== undefined) uniforms.dfgLUT.value = getDFGLUT();
     return uniforms;
   }
   return Object.freeze({

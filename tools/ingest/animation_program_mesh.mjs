@@ -48,9 +48,11 @@ export function createProgramMeshes({device, format, depthFormat, sampleCount, m
     const allocated = scoped(device, () => {
       const uniformLayout = device.createBindGroupLayout({label, entries: [{binding: 0, visibility: VERTEX | FRAGMENT,
         buffer: {type: 'uniform', hasDynamicOffset: true, minBindingSize: reflection.uniformBufferSize}}]});
-      const textureLayout = reflection.textures.length ? device.createBindGroupLayout({label, entries: reflection.textures.flatMap(t => [
-        {binding: t.textureBinding, visibility: VERTEX | FRAGMENT, texture: {sampleType: t.sampleType, viewDimension: t.dimension}},
-        {binding: t.samplerBinding, visibility: VERTEX | FRAGMENT, sampler: {type: t.comparison ? 'comparison' : t.sampleType === 'float' ? 'filtering' : 'non-filtering'}}])}) : null;
+      // Float32 textures without float32-filterable bind as unfilterable (nearest only).
+      const sampleTypeOf = (t, i) => t.sampleType === 'float' && textures[i].sampleType === 'unfilterable-float' ? 'unfilterable-float' : t.sampleType;
+      const textureLayout = reflection.textures.length ? device.createBindGroupLayout({label, entries: reflection.textures.flatMap((t, i) => [
+        {binding: t.textureBinding, visibility: VERTEX | FRAGMENT, texture: {sampleType: sampleTypeOf(t, i), viewDimension: t.dimension}},
+        {binding: t.samplerBinding, visibility: VERTEX | FRAGMENT, sampler: {type: t.comparison ? 'comparison' : sampleTypeOf(t, i) === 'float' ? 'filtering' : 'non-filtering'}}])}) : null;
       const layout = device.createPipelineLayout({label, bindGroupLayouts: textureLayout ? [uniformLayout, textureLayout] : [uniformLayout]});
       const uniformGroup = device.createBindGroup({label, layout: uniformLayout, entries: [{binding: 0, resource: {buffer: a.buffer, size: reflection.uniformBufferSize}}]});
       const textureGroup = textureLayout ? device.createBindGroup({label, layout: textureLayout, entries: reflection.textures.flatMap((t, i) => [

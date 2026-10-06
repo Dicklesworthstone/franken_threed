@@ -432,7 +432,7 @@ export async function createGpuThreeScene(device,scene,{
         if(texture&&(t.dimension==='cube')!==(texture.isCubeTexture===true))fail('TEXTURE',`Uniform ${t.name} texture dimension differs from its sampler`);
         if(texture&&(t.dimension==='3d'||t.dimension==='2d-array'||t.comparison))fail('TEXTURE',`Sampler ${t.glslType} textures are not admitted yet`);
         const binding=texture?textureBinding(texture):placeholderBinding();
-        sourceTextures.push(texture??null);bindings.push({view:binding.view,sampler:binding.sampler});textureKey.push(texture??null,binding.view,binding.sampler);
+        sourceTextures.push(texture??null);bindings.push({view:binding.view,sampler:binding.sampler,sampleType:binding.sampleType??'float'});textureKey.push(texture??null,binding.view,binding.sampler);
       }
       const raster=programSupport.raster(m,{side,topology});
       const options={program:compiled.program,textures:bindings,raster,topology,
@@ -529,6 +529,7 @@ export async function createGpuThreeScene(device,scene,{
     function texture(t,field){
       if(!(t instanceof three.Texture)||t.isCubeTexture||t.isVideoTexture||(!textureTransforms&&t.channel!==0))fail('TEXTURE','Expected a current, ordinary UV0 texture binding');
       const binding=textureBinding(t);
+      if(binding.sampleType&&binding.sampleType!=='float')fail('TEXTURE','Unfilterable float textures need the program route');
       options[field]={view:binding.view,sampler:binding.sampler};textureKey.push(field,t,binding.view,binding.sampler);
       if(textureTransforms&&field!=='gradientTexture'){
         const coordinate=uvApi.threeTextureCoordinates(t,three);

@@ -322,6 +322,33 @@ export const scenarios = {
     scene.add(light, new THREE.AmbientLight(0x404040, 1), new THREE.PointLight(0xff8844, 4, 0, 2));
     return { scene, camera: camera(THREE, [0, 0, 3.4]) };
   },
+  // MeshPhysicalMaterial extensions via ShaderLib programs (WebGL surface), and a
+  // nearest-sampled float32 DataTexture read by a ShaderMaterial.
+  shaderlib_physical(THREE) {
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x181818);
+    const mats = [
+      new THREE.MeshPhysicalMaterial({ color: 0xaa2222, roughness: 0.6, clearcoat: 1, clearcoatRoughness: 0.1 }),
+      new THREE.MeshPhysicalMaterial({ color: 0x223355, roughness: 0.8, sheen: 1, sheenColor: new THREE.Color(0xffaa55), sheenRoughness: 0.4 }),
+      new THREE.MeshPhysicalMaterial({ color: 0xffffff, metalness: 0.2, roughness: 0.3, iridescence: 1, iridescenceIOR: 1.4, iridescenceThicknessRange: [200, 600] }),
+      new THREE.MeshPhysicalMaterial({ color: 0x88cc88, roughness: 0.35, ior: 1.8, specularIntensity: 0.7, specularColor: new THREE.Color(0xff8888) }),
+    ];
+    mats.forEach((m, i) => {
+      const mesh = new THREE.Mesh(new THREE.SphereGeometry(0.4, 40, 20), m);
+      mesh.position.set((i % 2) * 1.0 - 0.5 - (i < 2 ? 0.45 : -0.45), i < 2 ? 0.45 : -0.45, 0);
+      scene.add(mesh);
+    });
+    const data = new Float32Array(4 * 4 * 4);
+    for (let i = 0; i < 16; i++) data.set([i / 15, 1 - i / 15, (i % 3) / 2, 1], i * 4);
+    const ft = new THREE.DataTexture(data, 4, 4, THREE.RGBAFormat, THREE.FloatType); ft.needsUpdate = true;
+    const quad = new THREE.Mesh(new THREE.PlaneGeometry(0.5, 0.5), new THREE.ShaderMaterial({ uniforms: { t: { value: ft } },
+      vertexShader: 'varying vec2 vUv; void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+      fragmentShader: 'uniform sampler2D t; varying vec2 vUv; void main() { gl_FragColor = texture2D(t, vUv); }' }));
+    quad.position.set(1.3, 0.9, 0);
+    const key = new THREE.DirectionalLight(0xffffff, 2.5); key.position.set(2, 3, 4);
+    scene.add(quad, key, new THREE.HemisphereLight(0x8899aa, 0x332211, 0.8), new THREE.PointLight(0x66aaff, 5, 0, 2));
+    return { scene, camera: camera(THREE, [0, 0, 3.4]) };
+  },
   // Per-axis normalScale on the derivative tangent frame (GLTFLoader sets y=-1 when
   // geometry has no tangents) and a flat-shaded lit mesh with no normal attribute.
   normal_scale_and_flat(THREE) {
