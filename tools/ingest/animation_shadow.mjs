@@ -35,7 +35,7 @@ function matrix(value) {
 
 /** Create a bounded depth map. OPAQUE/MASK caster material options match addMesh(). */
 export async function createGpuAnimationShadowMap(device, options = {}) {
-  fields(options, ["width", "height", "maxBytes", "maxDraws", "maxMeshes", "label", "clipping", "maxClippingPlanes", "textureTransforms"]);
+  fields(options, ["width", "height", "maxBytes", "maxDraws", "maxMeshes", "label", "clipping", "maxClippingPlanes", "textureTransforms", "alphaMaps"]);
   const {
     width = 1024,
     height = width,
@@ -65,6 +65,7 @@ export async function createGpuAnimationShadowMap(device, options = {}) {
     maxMeshes,
     label,
     textureTransforms: options.textureTransforms === undefined ? false : options.textureTransforms,
+    alphaMaps: options.alphaMaps === undefined ? false : options.alphaMaps,
     clipping: options.clipping === undefined ? false : options.clipping,
     maxClippingPlanes: options.maxClippingPlanes === undefined ? 8 : options.maxClippingPlanes,
   });

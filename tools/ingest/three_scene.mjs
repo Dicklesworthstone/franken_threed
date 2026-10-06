@@ -4,6 +4,9 @@
  * installed. prepare() is the explicit asynchronous structural-edit boundary;
  * render(camera, attachments) remains synchronous and immediately submits.
  *
+ * alphaMaps:true admits live source alphaMap opacity in color and masked
+ * shadow draws; scalar alpha testing may also coexist with transparent blends.
+ * See THREE_SCENE_ALPHA.md for the explicit profile and retained boundaries.
  * textureTransforms:true admits independent live source texture matrices and
  * uv/uv1/uv2/uv3 selection, including skin/morph and masked shadow draws. Channel
  * edits require prepare(); matrix edits do not. See THREE_SCENE_UV.md.
@@ -41,14 +44,18 @@ const rgba=(color,alpha=1)=>[color.r,color.g,color.b,alpha];
 const rgb=color=>[color.r,color.g,color.b];
 const position=object=>{const e=object.matrixWorld.elements;return [e[12],e[13],e[14]];};
 const MAPS=[['map','baseColorTexture'],['normalMap','normalTexture'],['emissiveMap','emissiveTexture'],
-  ['aoMap','occlusionTexture'],['specularMap','specularTexture'],['gradientMap','gradientTexture']];
+  ['aoMap','occlusionTexture'],['specularMap','specularTexture'],['gradientMap','gradientTexture'],['alphaMap','alphaTexture']];
+// Only opacity-bearing maps belong in depth materials. Never forward unrelated
+// color-map channel/transform keys into a masked shadow binding.
+const opacityFields=values=>Object.fromEntries(['baseColorTexture','alphaTexture']
+  .filter(key=>values?.[key]!==undefined).map(key=>[key,values[key]]));
 const DEPTH=['never','always','less','less-equal','equal','greater-equal','greater','not-equal'];
 
 export async function createGpuThreeScene(device,scene,{
   three, textures=new Map(), autoTextures=true, texture:textureOptions={}, renderer:renderOptions={}, geometry:geometryOptions={},
   maxNodes=16384,maxGeometries=256,maxBindings=1024,maxGeometryBytes=128*1024*1024,sortObjects=true,
   maxInstanceMeshes=256,maxInstanceBytes=128*1024*1024,
-  deformation:deformationOptions={},maxDeformedMeshes=256,maxDeformationBytes=128*1024*1024,shadow=null,environment=null,background=null,fog=null,clipping=null,textureTransforms=false,signal,
+  deformation:deformationOptions={},maxDeformedMeshes=256,maxDeformationBytes=128*1024*1024,shadow=null,environment=null,background=null,fog=null,clipping=null,textureTransforms=false,alphaMaps=false,signal,
 }={}) {
   if(three?.REVISION!=='186'||typeof three.Matrix4!=='function'||typeof three.Frustum!=='function'||
       typeof three.Mesh!=='function'||!(scene instanceof three.Scene))fail('SOURCE','Supply the pinned r186 module and its Scene');
@@ -72,6 +79,8 @@ export async function createGpuThreeScene(device,scene,{
     fail('OPTIONS','Expected empty source fog options or null');
   if(typeof textureTransforms!=='boolean'||(renderOptions.textureTransforms!==undefined&&renderOptions.textureTransforms!==textureTransforms))
     fail('OPTIONS','renderer.textureTransforms must agree with the boolean source textureTransforms option');
+  if(typeof alphaMaps!=='boolean'||(renderOptions.alphaMaps!==undefined&&renderOptions.alphaMaps!==alphaMaps))
+    fail('OPTIONS','renderer.alphaMaps must agree with the boolean source alphaMaps option');
   const uvApi=textureTransforms?await import('./three_scene_uv.mjs'):null;
   const clippingEnabled=clipping!==null;
   const maxClippingPlanes=integer(renderOptions.maxClippingPlanes??8,1,64,'clipping plane capacity');
@@ -299,8 +308,8 @@ export async function createGpuThreeScene(device,scene,{
     if(m.wireframe||m.alphaHash||m.alphaToCoverage||m.premultipliedAlpha||m.stencilWrite||m.polygonOffset||(!clippingEnabled&&m.clippingPlanes?.length))
       fail('MATERIAL','Wireframe, hashed/coverage alpha, premultiplication, stencil, polygon offset and clipping are not admitted');
     if(m.blending!==three.NormalBlending&&!(m.blending===three.NoBlending&&!m.transparent))fail('MATERIAL','Unsupported source blending mode');
-    if(m.transparent&&m.alphaTest>0)fail('MATERIAL','Combined transparent alpha testing requires an extended material profile');
-    for(const key of ['lightMap','bumpMap','displacementMap','alphaMap','envMap'])if(m[key])fail('MATERIAL',`Unsupported source map: ${key}`);
+    if(m.alphaMap&&!alphaMaps)fail('MATERIAL','Enable alphaMaps before drawing source opacity textures');
+    for(const key of ['lightMap','bumpMap','displacementMap','envMap'])if(m[key])fail('MATERIAL',`Unsupported source map: ${key}`);
     if(![0,1,2].includes(m.side)||!Number.isInteger(m.depthFunc)||!DEPTH[m.depthFunc])fail('MATERIAL','Unsupported side/depth state');
     if(finite(m.alphaTest,'alpha test')<0||m.alphaTest>1)fail('MATERIAL','Invalid source alpha test');
     if(shadowEnabled&&m.shadowSide!=null&&![0,1,2].includes(m.shadowSide))fail('SHADOW','Invalid source shadowSide');
@@ -317,10 +326,10 @@ export async function createGpuThreeScene(device,scene,{
       clipped={clippingPlanes,clipIntersection,clipShadows};
     }
     const options={shading,vertexColors:m.vertexColors,flatShading:shading==='unlit'?false:m.flatShading===true,
-      alphaMode:m.transparent?'BLEND':m.alphaTest>0?'MASK':'OPAQUE',alphaCutoff:m.alphaTest>0?m.alphaTest:0.5,
+      alphaMode:m.transparent?'BLEND':m.alphaTest>0?'MASK':'OPAQUE',alphaCutoff:m.alphaTest>0?m.alphaTest:0.5,alphaTest:m.alphaTest>0,
       depthTest:m.depthTest,depthWrite:m.depthWrite,depthCompare:DEPTH[m.depthFunc],colorWrite:m.colorWrite};
     const values={baseColor:rgba(m.color,m.opacity)};
-    if(options.alphaMode==='MASK')values.alphaCutoff=m.alphaTest;
+    if(options.alphaTest)values.alphaCutoff=m.alphaTest;
     if(shading!=='unlit')values.emissiveFactor=rgb(m.emissive).map(v=>v*m.emissiveIntensity);
     if(shading==='phong'){values.specularColor=rgb(m.specular);values.shininess=m.shininess;}
     if(shading==='metallic-roughness'){values.metallicFactor=m.metalness;values.roughnessFactor=m.roughness;}
@@ -372,7 +381,7 @@ export async function createGpuThreeScene(device,scene,{
     const sides=m.transparent&&m.side===three.DoubleSide&&!m.forceSinglePass?['back','front']:[['front','back','double'][m.side]];
     return sides.map(side=>{
       const config={...options,side};
-      const structural=[epoch,shading,side,config.vertexColors,config.flatShading,config.alphaMode,
+      const structural=[epoch,shading,side,config.vertexColors,config.flatShading,config.alphaMode,config.alphaTest,
         config.depthTest,config.depthWrite,config.depthCompare,config.colorWrite,...(shadowEnabled?[m.shadowSide??null]:[]),...textureKey];
       return {options:config,values,structural,clipped,...(fogEnabled?{receiveFog:m.fog}:{})};
     });
@@ -496,7 +505,7 @@ export async function createGpuThreeScene(device,scene,{
         else if(!shadowOwner||shadowOwner.source!==selected||!shadowOwner.matches()){
           const available=maxShadowBytes-(shadowOwner?.allocatedBytes??0);
           if(available<1)fail('LIMIT','Shadow replacement exceeds the old-plus-new GPU budget');
-          nextShadow=await shadowApi.createGpuThreeShadow(device,selected,{three,maxBytes:available,clipping:clippingEnabled,maxClippingPlanes,textureTransforms,
+          nextShadow=await shadowApi.createGpuThreeShadow(device,selected,{three,maxBytes:available,clipping:clippingEnabled,maxClippingPlanes,textureTransforms,alphaMaps,
             maxDraws:renderOptions.maxDraws??1024,maxMeshes:2*maxBindings,signal:deformationLifetime.signal});
           pendingShadow=nextShadow;live();
         }
@@ -511,13 +520,13 @@ export async function createGpuThreeScene(device,scene,{
             const surface=entry.deformation?{indices:entry.deformation.surface.indices,
               texCoords:entry.deformation.surface.texCoords,
               vertexColors:options.vertexColors?entry.deformation.surface.vertexColors:null}:{};
-            const baseChannels=textureTransforms&&options.baseColorTexture?{baseColorTexture:options.mapChannels.baseColorTexture}:{};
-            const depth={...(textureTransforms?{mapChannels:baseChannels}:{}),shading:'unlit',alphaMode:options.alphaMode,alphaCutoff:options.alphaCutoff,
+            const baseChannels=textureTransforms?opacityFields(options.mapChannels):{};
+            const depth={...(textureTransforms?{mapChannels:baseChannels}:{}),shading:'unlit',alphaMode:options.alphaMode,alphaCutoff:options.alphaCutoff,alphaTest:options.alphaTest,
               vertexColors:options.vertexColors,baseColor:values.baseColor,
               // Native source profile: explicit shadowSide, otherwise reversed
               // material side, matching the retained WebGL depth-map default.
               side:['front','back','double'][item.material.shadowSide??[1,0,2][item.material.side]],
-              ...(options.baseColorTexture?{baseColorTexture:options.baseColorTexture}:{}),
+              ...opacityFields(options),
               ...(values.uvTransform?{uvTransform:values.uvTransform}:{}),...surface,
               ...(textureTransforms&&entry.deformation?uvApi.threeDeformedMapCoordinates(baseChannels,entry.deformation.surface):{}),
               ...(entry.instanceSource?{instances:instances.get(entry.instanceSource)}:{})};
@@ -716,7 +725,7 @@ export async function createGpuThreeScene(device,scene,{
             const g=object.geometry;
             let z=0;
             if(sortObjects){
-              const bounds=object.boundingSphere!==undefined?object:g;
+              const bounds=object.boundingSphere!==undefined?object: g;
               if(bounds.boundingSphere===null)bounds.computeBoundingSphere();
               z=center.copy(bounds.boundingSphere.center).applyMatrix4(object.matrixWorld).applyMatrix4(vp).z;
             }
@@ -783,7 +792,7 @@ export async function createGpuThreeScene(device,scene,{
         for(let i=0;i<item.bindings.length;i++){
           const values=item.desc[i].values,clipped=item.desc[i].clipped,common={worldMatrix:item.object.matrixWorld.elements,first,count};
           if(item.shadowPass)shadowDraws.push({mesh:casters.get(item.bindings[i]),...common,baseColor:values.baseColor,
-            ...(textureTransforms?{mapTransforms:values.mapTransforms.baseColorTexture?{baseColorTexture:values.mapTransforms.baseColorTexture}:{}}:{}),
+            ...(textureTransforms?{mapTransforms:opacityFields(values.mapTransforms)}:{}),
             ...(clipped?{clippingPlanes:clipped.clipShadows?clipped.clippingPlanes:[],clipIntersection:clipped.clipIntersection}:{}),
             ...(values.uvTransform?{uvTransform:values.uvTransform}:{}),
             ...(values.alphaCutoff!==undefined?{alphaCutoff:values.alphaCutoff}:{})});
@@ -858,7 +867,7 @@ export async function createGpuThreeScene(device,scene,{
     // Source validation precedes even the renderer's uniform allocation.
     signal?.addEventListener('abort',onAbort,{once:true});if(signal?.aborted)onAbort();live();
     scanTextures();
-    const construction=createGpuAnimationRenderer(device,{...renderOptions,textureTransforms,clipping:clippingEnabled,...(backgroundEnabled?{format:renderOptions.format??'rgba8unorm',sampleCount:renderOptions.sampleCount??1}:{}),...(shadowEnabled?{shadows:true}:{}),...(environmentEnabled?{environment:true}:{}),...(fogEnabled?{fog:true}:{}),indirectLights:true,threeLights:true,maxMeshes:2*maxBindings}).then(value=>{
+    const construction=createGpuAnimationRenderer(device,{...renderOptions,textureTransforms,alphaMaps,clipping:clippingEnabled,...(backgroundEnabled?{format:renderOptions.format??'rgba8unorm',sampleCount:renderOptions.sampleCount??1}:{}),...(shadowEnabled?{shadows:true}:{}),...(environmentEnabled?{environment:true}:{}),...(fogEnabled?{fog:true}:{}),indirectLights:true,threeLights:true,maxMeshes:2*maxBindings}).then(value=>{
       if(disposed||terminal){value.dispose();throw terminal??new ThreeSceneError('DISPOSED','Source scene is disposed');}
       renderer=shadowEnabled?shadowApi.withThreeShadowReceivers(value,renderOptions.maxDraws??1024):value;
       if(environmentEnabled)renderer=environmentApi.withThreeEnvironmentReceivers(renderer,renderOptions.maxDraws??1024);
