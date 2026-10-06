@@ -218,10 +218,9 @@ export async function createGpuThreeScene(device,scene,{
     const owners=new Set(Object.values(g.attributes).map(a=>a.isInterleavedBufferAttribute?a.data:a));
     if(g.index)owners.add(g.index);
     if(!Array.isArray(g.groups)||g.groups.length>maxNodes)fail('LIMIT','Geometry group capacity exceeded');
-    for(const owner of owners){
-      const expected=owner.isInterleavedBuffer?three.InterleavedBuffer.prototype.onUploadCallback:three.BufferAttribute.prototype.onUploadCallback;
-      if(owner.onUploadCallback!==expected)fail('HOOK','Effectful attribute upload callbacks require the explicit geometry API');
-    }
+    // Upload callbacks (e.g. onUpload(disposeArray)) run after each owner's upload,
+    // as WebGLAttributes does, at this bridge's preparation/update boundary.
+    for(const owner of owners)if(typeof owner.onUploadCallback!=='function')fail('HOOK','Expected an attribute upload callback function');
   }
   function instanceAdmission(object){
     if(typeof three.InstancedMesh!=='function'||!(object instanceof three.InstancedMesh))

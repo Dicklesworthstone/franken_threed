@@ -48,6 +48,20 @@ function storage(array) {
   try { new Uint8Array(array.buffer, 0, 0); } catch { fail('STORAGE', 'Detached attribute storage'); }
 }
 function ownerOf(attribute) { return attribute.isInterleavedBufferAttribute ? attribute.data : attribute; }
+// r186 onUpload(disposeArray) may null an owner's array after its upload; upstream
+// never reads it again until the version changes. Remember the uploaded shape so
+// such owners stay drawable, and fail if a newer version arrives without data.
+const RELEASED = new WeakMap();
+// Recorded before the upload callback, which may release the array.
+const remember = (owner, array) => RELEASED.set(owner, {version: owner.version, length: array.length, byteLength: array.byteLength, witness: new array.constructor(0)});
+function sourceArray(owner) {
+  const array = owner?.array;
+  if (array != null) { storage(array); return {array, kind: array, length: array.length, byteLength: array.byteLength, elementType: array.constructor}; }
+  const r = RELEASED.get(owner);
+  if (!r || !Number.isSafeInteger(owner?.version) || owner.version > r.version)
+    fail('STORAGE', 'Attribute array was released before its pending upload');
+  return {array: null, kind: r.witness, length: r.length, byteLength: r.byteLength, elementType: r.witness.constructor};
+}
 const INTEGER_TYPES = [[Int8Array, 127], [Uint8Array, 255], [Uint8ClampedArray, 255], [Int16Array, 32767], [Uint16Array, 65535],
   [Int32Array, 2147483647], [Uint32Array, 4294967295]];
 /** Element -> f32 conversion for one source storage, or null for exact Float32 bytes. */
@@ -84,19 +98,18 @@ function describe(geometry) {
   // Source insertion order is retained for upload callbacks, not shader slots.
   for (const name of Object.keys(attributes)) {
     if (!Object.hasOwn(FIELDS, name)) fail('SHAPE', `Unsupported geometry attribute: ${name}`);
-    const attribute = attributes[name], owner = ownerOf(attribute), array = owner?.array;
-    storage(array);
+    const attribute = attributes[name], owner = ownerOf(attribute), source = sourceArray(owner), array = source.array;
     if (attribute.isInstancedBufferAttribute || owner.isInstancedInterleavedBuffer) fail('SHAPE', 'Instance streams require the instancing path');
-    const conversion = conversionOf(array, attribute.normalized === true, attribute.isFloat16BufferAttribute === true);
+    const conversion = conversionOf(source.kind, attribute.normalized === true, attribute.isFloat16BufferAttribute === true);
     const [location, width] = FIELDS[name];
     const itemSize = integer(attribute.itemSize, 2, 4, 'item size');
     if (width ? itemSize !== width : itemSize !== 3 && itemSize !== 4) fail('SHAPE', `Invalid ${name} width`);
     const stride = attribute.isInterleavedBufferAttribute ? integer(owner.stride, itemSize, 512, 'stride') : itemSize;
     const offset = attribute.isInterleavedBufferAttribute ? integer(attribute.offset, 0, stride - itemSize, 'attribute offset') : 0;
     const count = integer(attribute.count, vertexCount, 0xffffffff, 'attribute count');
-    if (count * stride > array.length) fail('SHAPE', 'Attribute count exceeds storage');
+    if (count * stride > source.length) fail('SHAPE', 'Attribute count exceeds storage');
     let entry = owners.get(owner);
-    if (!entry) owners.set(owner, entry = {owner, array, stride, attributes: [], requiredBytes: 0, conversion});
+    if (!entry) owners.set(owner, entry = {owner, array, source, stride, attributes: [], requiredBytes: 0, conversion});
     if (entry.stride !== stride) fail('SHAPE', 'Shared attributes require one stride');
     if (entry.conversion?.key !== conversion?.key) fail('FORMAT', 'Attributes sharing interleaved storage require one conversion profile');
     entry.requiredBytes = Math.max(entry.requiredBytes, vertexCount ? ((vertexCount - 1) * stride + offset + itemSize) * 4 : 0);
@@ -112,7 +125,7 @@ function describe(geometry) {
     indexFormat = index.array instanceof Uint16Array ? 'uint16' : 'uint32';
     indexCount = integer(index.count, 0, index.array.length, 'index count');
     if (owners.has(index)) fail('SHAPE', 'Index and vertex source identities must be distinct');
-    owners.set(index, {owner: index, array: index.array, stride: 0, attributes: [], requiredBytes: indexCount * index.array.BYTES_PER_ELEMENT, conversion: null});
+    owners.set(index, {owner: index, array: index.array, source: {array: index.array, kind: index.array, length: index.array.length, byteLength: index.array.byteLength, elementType: index.array.constructor}, stride: 0, attributes: [], requiredBytes: indexCount * index.array.BYTES_PER_ELEMENT, conversion: null});
   }
   const streams = [...owners.values()].filter(e => e.stride !== 0);
   // Stable layouts do not depend on object ids, buffer generations or insertion
@@ -224,21 +237,22 @@ function createResidency(device, geometry, {
       let addedBytes = 0, addedCount = 0;
       // Admission completes before any allocation, queue write, range mutation
       // or callback. An invalid later attribute cannot partly upload the frame.
-      for (const {owner, array, requiredBytes, conversion} of shape.owners.values()) {
+      for (const {owner, source, requiredBytes, conversion} of shape.owners.values()) {
         integer(owner.version, 0, Number.MAX_SAFE_INTEGER, 'upload version');
         // Converted storage is one f32 per element; compare in resident bytes.
-        const logical = conversion ? array.length * 4 : array.byteLength;
+        const logical = conversion ? source.length * 4 : source.byteLength;
         const existing = records.get(owner), size = Math.max(4, align4(logical));
         if (typeof owner.onUploadCallback !== 'function') fail('SHAPE', 'Expected onUploadCallback');
         if (existing) {
           if (existing.version >= owner.version && requiredBytes > existing.logicalBytes) fail('SHAPE', 'Geometry counts exceed resident storage');
-          if (existing.elementType !== array.constructor || existing.conversion?.key !== conversion?.key)
+          if (existing.elementType !== source.elementType || existing.conversion?.key !== conversion?.key)
             fail('FORMAT', 'Changing a resident element type or normalization requires a new attribute');
           if (existing.version < owner.version) {
             if (existing.logicalBytes !== logical) fail('RESIZE', 'Resizing a resident attribute is not supported; replace the attribute');
-            if (existing.version !== -1) checkRanges(owner, array.length);
+            if (existing.version !== -1) checkRanges(owner, source.length);
           }
         } else {
+          if (source.array === null) fail('STORAGE', 'A released attribute array cannot create a new residency');
           if (size > maximum) fail('LIMIT', 'Attribute exceeds maxBufferSize');
           addedCount++; addedBytes += size;
         }
@@ -247,10 +261,16 @@ function createResidency(device, geometry, {
       native(() => { device.pushErrorScope('validation'); device.pushErrorScope('out-of-memory'); }); scoped = true;
       for (const entry of shape.owners.values()) {
         const {owner} = entry, array = owner.array;
+        if (array == null) {
+          // Released after an earlier upload (onUpload disposeArray): nothing to read.
+          const r = records.get(owner);
+          if (r && r.version >= owner.version) continue;
+          fail('STORAGE', 'Attribute array was released before its pending upload');
+        }
         // A previous onUpload may replace a later view without changing its
         // shape. Read that current view here, as the source uploader does.
         storage(array);
-        if (array.constructor !== entry.array.constructor || array.length !== entry.array.length) {
+        if (array.constructor !== entry.source.elementType || array.length !== entry.source.length) {
           fail('SHAPE', 'An upload callback changed a later attribute storage shape');
         }
         integer(owner.version, 0, Number.MAX_SAFE_INTEGER, 'upload version');
@@ -265,6 +285,7 @@ function createResidency(device, geometry, {
           // initial upload without retaining an orphan native buffer.
           records.set(owner, record); allocatedBytes += size; stats.allocations++;
           write(record, array, 0, array.length);
+          remember(owner, array);
           owner.onUploadCallback();
           record.version = owner.version;
         } else if (record.version < owner.version) {
@@ -278,6 +299,7 @@ function createResidency(device, geometry, {
             }
             owner.clearUpdateRanges();
           }
+          remember(owner, array);
           owner.onUploadCallback();
           record.version = owner.version;
         }
@@ -360,10 +382,9 @@ function describeProgram(program) {
     for (const a of program) {
       const attribute = attributes[a.name];
       if (!attribute) { for (let k = 0; k < a.locations; k++) missing.push(a.location + k); continue; }
-      const owner = ownerOf(attribute), array = owner?.array;
-      storage(array);
+      const owner = ownerOf(attribute), source = sourceArray(owner), array = source.array;
       if (a.scalar !== 'float') fail('FORMAT', `Integer attribute ${a.name} needs an integer vertex format, not admitted yet`);
-      const conversion = conversionOf(array, attribute.normalized === true, attribute.isFloat16BufferAttribute === true);
+      const conversion = conversionOf(source.kind, attribute.normalized === true, attribute.isFloat16BufferAttribute === true);
       const perInstance = attribute.isInstancedBufferAttribute === true || owner.isInstancedInterleavedBuffer === true;
       if (perInstance && (owner.meshPerAttribute ?? attribute.meshPerAttribute) !== 1) fail('SHAPE', 'meshPerAttribute other than 1 has no WebGPU step rate');
       const itemSize = integer(attribute.itemSize, 1, 16, 'item size');
@@ -373,11 +394,11 @@ function describeProgram(program) {
       const stride = attribute.isInterleavedBufferAttribute ? integer(owner.stride, itemSize, 512, 'stride') : itemSize;
       const offset = attribute.isInterleavedBufferAttribute ? integer(attribute.offset, 0, stride - itemSize, 'attribute offset') : 0;
       const count = integer(attribute.count, 0, 0xffffffff, 'attribute count');
-      if (count * stride > array.length + (stride - itemSize)) fail('SHAPE', 'Attribute count exceeds storage');
+      if (count * stride > source.length + (stride - itemSize)) fail('SHAPE', 'Attribute count exceeds storage');
       if (perInstance) instanceCapacity = Math.min(instanceCapacity, count);
       else vertexCount = vertexCount === null ? count : Math.min(vertexCount, count);
       let entry = owners.get(owner);
-      if (!entry) owners.set(owner, entry = {owner, array, stride, attributes: [], requiredBytes: 0, conversion, stepMode: perInstance ? 'instance' : 'vertex'});
+      if (!entry) owners.set(owner, entry = {owner, array, source, stride, attributes: [], requiredBytes: 0, conversion, stepMode: perInstance ? 'instance' : 'vertex'});
       if (entry.stride !== stride || entry.stepMode !== (perInstance ? 'instance' : 'vertex')) fail('SHAPE', 'Shared attributes require one stride and step mode');
       if (entry.conversion?.key !== conversion?.key) fail('FORMAT', 'Attributes sharing interleaved storage require one conversion profile');
       entry.requiredBytes = Math.max(entry.requiredBytes, count ? ((count - 1) * stride + offset + itemSize) * 4 : 0);
@@ -393,7 +414,7 @@ function describeProgram(program) {
       indexOwner = index; indexFormat = index.array instanceof Uint16Array ? 'uint16' : 'uint32';
       indexCount = integer(index.count, 0, index.array.length, 'index count');
       if (owners.has(index)) fail('SHAPE', 'Index and vertex source identities must be distinct');
-      owners.set(index, {owner: index, array: index.array, stride: 0, attributes: [], requiredBytes: indexCount * index.array.BYTES_PER_ELEMENT, conversion: null});
+      owners.set(index, {owner: index, array: index.array, source: {array: index.array, kind: index.array, length: index.array.length, byteLength: index.array.byteLength, elementType: index.array.constructor}, stride: 0, attributes: [], requiredBytes: indexCount * index.array.BYTES_PER_ELEMENT, conversion: null});
     }
     const streams = [...owners.values()].filter(e => e.stride !== 0);
     streams.sort((x, y) => Math.min(...x.attributes.map(v => v.shaderLocation)) - Math.min(...y.attributes.map(v => v.shaderLocation)));
@@ -452,7 +473,8 @@ function describeInstances(source) {
     const attributes = width === 16
       ? [0,1,2,3].map(i => ({shaderLocation: location+i, offset: i*16, format: 'float32x4'}))
       : [{shaderLocation: location, offset: 0, format: 'float32x3'}];
-    const entry = {owner, array, stride: width, requiredBytes: array.byteLength, attributes};
+    const entry = {owner, array, source: {array, kind: array, length: array.length, byteLength: array.byteLength, elementType: array.constructor},
+      stride: width, requiredBytes: array.byteLength, attributes};
     owners.set(owner, entry); streams.push(entry);
   }
   integer(source.count, 0, capacity, 'active instance count');

@@ -225,3 +225,14 @@ test('normalized/integer/half sources upload the GL float-attribute conversion; 
   // Changing normalization of a resident stream is a new layout, not an in-place patch.
   color.normalized=false;color.needsUpdate=true;assert.throws(()=>gpu.update(),{code:'GEOMETRY_GPU_FORMAT'});
 });
+
+test('onUpload(disposeArray): released arrays stay drawable until a newer version needs data',()=>{
+  const d=geometryDevice(),g=geometry(),position=g.attributes.position;
+  position.onUpload(function(){this.array=null;});
+  const gpu=createGpuBufferGeometry(d,g);
+  assert.equal(position.array,null,'callback ran after the upload');
+  gpu.update();gpu.update();
+  assert.equal(bufferGeometrySnapshot(gpu,d).vertexCount,3);
+  position.needsUpdate=true;
+  assert.throws(()=>gpu.update(),{code:'GEOMETRY_GPU_STORAGE'});
+});
