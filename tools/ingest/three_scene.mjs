@@ -147,7 +147,8 @@ export async function createGpuThreeScene(device,scene,{
     // materials into exactly these classes. Any assigned node fails explicitly.
     ...[['MeshBasicNodeMaterial','unlit'],['MeshLambertNodeMaterial','lambert'],['MeshPhongNodeMaterial','phong'],
       ['MeshToonNodeMaterial','toon'],['MeshStandardNodeMaterial','metallic-roughness'],['LineBasicNodeMaterial','unlit'],
-      ['PointsNodeMaterial','unlit'],['MeshPhysicalMaterial','metallic-roughness'],['MeshPhysicalNodeMaterial','metallic-roughness']].filter(([name])=>typeof three[name]==='function').map(([name,model])=>[three[name].prototype,model]),
+      ['PointsNodeMaterial','unlit'],['MeshPhysicalMaterial','metallic-roughness'],['MeshPhysicalNodeMaterial','metallic-roughness'],
+      ['MeshNormalMaterial','normal'],['MeshNormalNodeMaterial','normal']].filter(([name])=>typeof three[name]==='function').map(([name,model])=>[three[name].prototype,model]),
   ]);
   const geometries=new Map(),instances=new Map(),materials=new Map(),deformations=new Map();
   const pendingDeformations=new Set(),deformationLifetime=new AbortController();
@@ -363,7 +364,7 @@ export async function createGpuThreeScene(device,scene,{
     }
     if(m.isNodeMaterial){
       for(const key of Object.keys(m))if(key.endsWith('Node')&&m[key]!==null)fail('MATERIAL',`Custom ${key} on ${m.type} requires the node shader path`);
-      if(shading!=='unlit'&&m.lights!==true)fail('MATERIAL','Node materials with lights disabled are not admitted');
+      if(shading!=='unlit'&&shading!=='normal'&&m.lights!==true)fail('MATERIAL','Node materials with lights disabled are not admitted');
     }
     if(m.onBeforeRender!==three.Material.prototype.onBeforeRender||m.onBeforeCompile!==three.Material.prototype.onBeforeCompile||
         m.customProgramCacheKey!==(m.isNodeMaterial?three.NodeMaterial:three.Material).prototype.customProgramCacheKey)fail('HOOK','Custom material shader/render hooks require their original component');
@@ -396,9 +397,9 @@ export async function createGpuThreeScene(device,scene,{
       alphaMode:m.transparent||m.blending!==three.NormalBlending?'BLEND':m.alphaTest>0?'MASK':'OPAQUE',alphaCutoff:m.alphaTest>0?m.alphaTest:0.5,alphaTest:m.alphaTest>0,
       depthTest:m.depthTest,depthWrite:m.depthWrite,depthCompare:DEPTH[m.depthFunc],colorWrite:m.colorWrite};
     Object.assign(options,raster.options);
-    const values={baseColor:rgba(m.color,m.opacity),...raster.values};
+    const values={baseColor:m.color?rgba(m.color,m.opacity):[1,1,1,m.opacity],...raster.values};
     if(options.alphaTest)values.alphaCutoff=m.alphaTest;
-    if(shading!=='unlit')values.emissiveFactor=rgb(m.emissive).map(v=>v*m.emissiveIntensity);
+    if(shading!=='unlit'&&shading!=='normal')values.emissiveFactor=rgb(m.emissive).map(v=>v*m.emissiveIntensity);
     if(shading==='phong'){values.specularColor=rgb(m.specular);values.shininess=m.shininess;}
     if(shading==='metallic-roughness'){values.metallicFactor=m.metalness;values.roughnessFactor=m.roughness;}
     let transform=null;const textureKey=[],mapChannels={},mapTransforms={};
@@ -813,6 +814,8 @@ export async function createGpuThreeScene(device,scene,{
         backgroundOwner?.check();
       }
       const lighting=cameraFrame(camera);lighting.lights=[];
+      // View rotation for view-space shading models (MeshNormalMaterial).
+      lighting.viewMatrix=camera.matrixWorldInverse.elements;
       // Capture against this frame's updated camera before texture, geometry,
       // deformation, shadow or background queue effects. Type/removal is live.
       const fogFrame=fogEnabled?fogApi.threeFogDescriptor(scene.fog,camera,three):null;

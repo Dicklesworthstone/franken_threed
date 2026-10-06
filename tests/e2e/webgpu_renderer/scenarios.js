@@ -146,6 +146,16 @@ export const scenarios = {
     quad(0.9, -0.5, 0xffffff, { polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -4 }).scale.set(0.5, 0.5, 1);
     return { scene, camera: camera(THREE) };
   },
+  normal_material(THREE) {
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x000000);
+    const knot = new THREE.Mesh(new THREE.TorusKnotGeometry(0.45, 0.15, 96, 16), new THREE.MeshNormalMaterial());
+    knot.position.x = -0.8; knot.rotation.set(0.3, 0.5, 0);
+    const flat = new THREE.Mesh(new THREE.IcosahedronGeometry(0.6, 0), new THREE.MeshNormalMaterial({ flatShading: true }));
+    flat.position.x = 0.9; flat.rotation.y = 0.4;
+    scene.add(knot, flat);
+    return { scene, camera: camera(THREE, [0.3, 0.4, 3.2]) };
+  },
   physical_neutral(THREE) {
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x202020);

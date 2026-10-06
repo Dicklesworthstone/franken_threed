@@ -409,7 +409,7 @@ function surfaceShader(
   const lighting = lit
     ? /* wgsl */ `
 struct Light { vector: vec4<f32>, radiance: vec4<f32>, direction: vec4<f32>, cone: vec4<f32> }
-struct Lighting { camera: vec4<f32>, light_params: vec4<f32>, lights: array<Light, 8> }
+struct Lighting { camera: vec4<f32>, light_params: vec4<f32>, lights: array<Light, 8>${threeLights ? ", view_x: vec4<f32>, view_y: vec4<f32>, view_z: vec4<f32>" : ""} }
 @group(${textured ? 2 : 1}) @binding(0) var<uniform> lighting: Lighting;${threeLights ? animationDfgWgsl() : ""}
 ${shadowed ? projectedShadowWgsl(textured ? 2 : 1) : ""}${environmentCode ? "\n" + environmentCode : ""}
 fn unit_vector(v: vec3<f32>) -> vec3<f32> {
@@ -653,7 +653,15 @@ struct VertexOutput {
   let normal_dxy = max(abs(dpdx(input_geometry_normal)), abs(dpdy(input_geometry_normal)));
   let roughness = select(source_roughness, min(max(source_roughness, 0.0525) + max(max(normal_dxy.x, normal_dxy.y), normal_dxy.z), 1.0), draw_info.options.z == 2.0);` : ""}
   let emission = draw_info.emission_roughness.rgb ${mapMask & 8 ? "* emissive_texel.rgb" : ""};
-  ${ambientOcclusion ? "// glTF occlusion uses only linear R and affects indirect light, never emission or punctual light.\n  let occlusion = 1.0 + draw_info.normal_from_local.strength * (occlusion_texel.r - 1.0);\n  " : ""}${coated ? "var" : "let"} rgb = illuminate(rgba.rgb, input.world, normal, metallic, roughness, emission${ambientOcclusion ? ", occlusion" : ""}${phong ? mapMask & 2 ? ", specular_texel.r" : ", 1.0" : ""});${
+  ${ambientOcclusion ? "// glTF occlusion uses only linear R and affects indirect light, never emission or punctual light.\n  let occlusion = 1.0 + draw_info.normal_from_local.strength * (occlusion_texel.r - 1.0);\n  " : ""}${threeLights && !toon && !phong && !coated ? `var rgb = vec3<f32>(0.0);
+  if (draw_info.options.z == 5.0) {
+    // r186 MeshNormalMaterial: colorSpaceToWorking(packNormalToRGB(normalView), sRGB).
+    let view_normal = unit_vector(vec3<f32>(dot(lighting.view_x.xyz, normal), dot(lighting.view_y.xyz, normal), dot(lighting.view_z.xyz, normal)));
+    let packed = view_normal * 0.5 + vec3<f32>(0.5);
+    rgb = select(pow(packed * 0.9478672986 + vec3<f32>(0.0521327014), vec3<f32>(2.4)), packed * 0.0773993808, packed <= vec3<f32>(0.04045));
+  } else {
+    rgb = illuminate(rgba.rgb, input.world, normal, metallic, roughness, emission${ambientOcclusion ? ", occlusion" : ""});
+  }` : `${coated ? "var" : "let"} rgb = illuminate(rgba.rgb, input.world, normal, metallic, roughness, emission${ambientOcclusion ? ", occlusion" : ""}${phong ? mapMask & 2 ? ", specular_texel.r" : ", 1.0" : ""});`}${
     coated
       ? `
   let coat_factor = clearcoat_info.x${mapMask & 32 ? " * clearcoat_texel.r" : ""};
@@ -678,7 +686,7 @@ struct VertexOutput {
 `;
 }
 function packLighting(input, output, indirectLights, threeLights) {
-  keys(input, ["cameraPosition", "viewDirection", "lights"], "lighting");
+  keys(input, ["cameraPosition", "viewDirection", "lights", ...(threeLights ? ["viewMatrix"] : [])], "lighting");
   const orthographic = input.viewDirection !== undefined;
   if (orthographic && input.cameraPosition !== undefined)
     fail("ANIMATION_RENDER_LIGHT", "Choose cameraPosition or viewDirection, not both");
@@ -693,6 +701,11 @@ function packLighting(input, output, indirectLights, threeLights) {
   output.fill(0);
   output.set(camera, 0);
   output[4] = lights.length;
+  if (threeLights && input.viewMatrix !== undefined) {
+    // Column-major source matrixWorldInverse -> three row vectors after the lights.
+    const v = array(input.viewMatrix, 16, "View matrix");
+    for (let r = 0; r < 3; r++) output.set([v[r], v[4 + r], v[8 + r], v[12 + r]], 8 + MAX_LIGHTS * 16 + r * 4);
+  }
   if (orthographic) {
     const scale = Math.max(...camera.map(Math.abs));
     if (scale === 0) fail("ANIMATION_RENDER_LIGHT", "View direction must be nonzero");
@@ -977,6 +990,10 @@ export async function createGpuAnimationRenderer(
       (outputTransfer === "srgb" && !["rgba8unorm", "bgra8unorm"].includes(format)))
     fail("ANIMATION_RENDER_OPTIONS", "sRGB output transfer requires a non-sRGB 8-bit color attachment");
   const srgbOutput = outputTransfer === "srgb";
+  // The Three.js light profile appends the camera view rotation (three vec4
+  // rows: view_x/y/z = rows of matrixWorldInverse) used by view-space
+  // shading models such as MeshNormalMaterial. Other profiles keep 544 bytes.
+  const lightBytes = LIGHT_BYTES + (threeLights ? 48 : 0);
   if (
     !device?.queue ||
     !device.limits ||
@@ -1090,7 +1107,7 @@ export async function createGpuAnimationRenderer(
     lightLayout,
     lightGroup,
     lightingReady;
-  const lightWords = new Float32Array(LIGHT_BYTES / 4),
+  const lightWords = new Float32Array(lightBytes / 4),
     shadowWords = new Float32Array(SHADOW_UNIFORM_BYTES / 4);
   let shadowBuffer, shadowLayout, shadowGroup, shadowView, shadowSampler;
   let fogReceiver, fogBuffer, fogCode = "";
@@ -1474,23 +1491,23 @@ export async function createGpuAnimationRenderer(
         lightBuffer = remember(
           device.createBuffer({
             label: `${label}/lights`,
-            size: LIGHT_BYTES,
+            size: lightBytes,
             usage: UNIFORM | COPY_DST,
           }),
-          LIGHT_BYTES,
+          lightBytes,
         );
         const lightEntries = [
           {
             binding: 0,
             visibility: FRAGMENT_STAGE,
-            buffer: { type: "uniform", minBindingSize: LIGHT_BYTES },
+            buffer: { type: "uniform", minBindingSize: lightBytes },
           },
         ];
         lightLayout = device.createBindGroupLayout({ label, entries: lightEntries });
         lightGroup = device.createBindGroup({
           label,
           layout: lightLayout,
-          entries: [{ binding: 0, resource: { buffer: lightBuffer, size: LIGHT_BYTES } }],
+          entries: [{ binding: 0, resource: { buffer: lightBuffer, size: lightBytes } }],
         });
         let shadowEntries = [];
         if (shadows) {
@@ -1745,9 +1762,11 @@ export async function createGpuAnimationRenderer(
     if (comparison < 0) fail("ANIMATION_RENDER_OPTIONS", "Unsupported depth comparison");
     const rgba = Float64Array.from(color(baseColor)),
       shading = options.shading ?? "unlit";
-    const mode = ["unlit", "lambert", "metallic-roughness", "phong", "toon"].indexOf(shading),
+    const mode = ["unlit", "lambert", "metallic-roughness", "phong", "toon", "normal"].indexOf(shading),
       lit = mode > 0;
     const phong = mode === 3, toon = mode === 4, flat = options.flatShading ?? false;
+    if (mode === 5 && !threeLights)
+      fail("ANIMATION_RENDER_OPTIONS", "View-space normal shading requires the Three.js light profile");
     if (typeof flat !== "boolean" || (flat && !lit) || options.flatShading === null)
       fail("ANIMATION_RENDER_OPTIONS", "flatShading requires a lit material and a boolean");
     if (
@@ -1855,8 +1874,8 @@ export async function createGpuAnimationRenderer(
         );
       }
       limit("maxUniformBuffersPerShaderStage", 2 + Number(shadows) + Number(environment) + Number(fog));
-      limit("maxUniformBufferBindingSize", LIGHT_BYTES);
-      limit("maxBufferSize", LIGHT_BYTES);
+      limit("maxUniformBufferBindingSize", lightBytes);
+      limit("maxBufferSize", lightBytes);
       limit("maxBindGroups", mapMask ? 3 : 2);
       limit("maxVertexAttributes", 2);
     }
@@ -1962,7 +1981,7 @@ export async function createGpuAnimationRenderer(
     const coatReserve = coated && !sharedGroups?.has(textureKey) ? COAT_BYTES : 0;
     const lightReserve =
       lit && !lightBuffer
-        ? LIGHT_BYTES + (shadows ? SHADOW_UNIFORM_BYTES : 0) + environmentBytes
+        ? lightBytes + (shadows ? SHADOW_UNIFORM_BYTES : 0) + environmentBytes
         : 0;
     if (
       (instancing ? 0 : allocatedBytes) + (data?.byteLength ?? 0) + lightReserve + coatReserve >
@@ -2577,7 +2596,7 @@ export async function createGpuAnimationRenderer(
             label,
             layout: shadowLayout,
             entries: [
-              { binding: 0, resource: { buffer: lightBuffer, size: LIGHT_BYTES } },
+              { binding: 0, resource: { buffer: lightBuffer, size: lightBytes } },
               { binding: 1, resource: { buffer: shadowBuffer, size: SHADOW_UNIFORM_BYTES } },
               { binding: 2, resource: view },
               { binding: 3, resource: sampler },
@@ -2603,7 +2622,7 @@ export async function createGpuAnimationRenderer(
               label,
               layout: environmentLayouts.get(shadowed),
               entries: [
-                { binding: 0, resource: { buffer: lightBuffer, size: LIGHT_BYTES } },
+                { binding: 0, resource: { buffer: lightBuffer, size: lightBytes } },
                 ...(shadowed
                   ? [
                       {

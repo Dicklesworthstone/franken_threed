@@ -26,7 +26,8 @@ function packets(d,submission=-1){
 }
 const f32=values=>Array.from(values,Math.fround);
 function packedLights(d){
-  const draw=d.snapshots.at(-1)[0],group=[...draw.groups.values()].find(x=>x.group.entries[0]?.resource?.size===544).group;
+  // The Three.js light profile appends three view-rotation rows (48 bytes) to the 544-byte lighting block.
+  const draw=d.snapshots.at(-1)[0],group=[...draw.groups.values()].find(x=>x.group.entries[0]?.resource?.size===592).group;
   return new Float32Array(draw.contents.get(group.entries[0].resource.buffer).buffer);
 }
 for(const instancing of [false,true])for(const renderBundles of [false,true])
