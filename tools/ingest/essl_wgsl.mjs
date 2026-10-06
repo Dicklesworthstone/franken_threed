@@ -109,8 +109,9 @@ const safe = name => (RESERVED.has(name) || name.startsWith('__') || name.starts
 const roundUp = (k, n) => Math.ceil(n / k) * k;
 
 /** Compile one program. Returns {vertex, fragment, reflection}. */
-export function compileEsslProgram(vertexSource, fragmentSource, {defines = {}, clipDepth = 'gl', points = false, maxPointSize = 1024} = {}) {
+export function compileEsslProgram(vertexSource, fragmentSource, {defines = {}, clipDepth = 'gl', points = false, maxPointSize = 1024, rows = 'webgpu'} = {}) {
   if (clipDepth !== 'gl' && clipDepth !== 'webgpu') essError('clipDepth must be gl or webgpu');
+  if (rows !== 'gl' && rows !== 'webgpu') essError('rows must be gl or webgpu');
   if (typeof points !== 'boolean' || !(maxPointSize >= 1)) essError('Invalid point options');
   const shared = {
     uniforms: new Map(),      // name -> {type, field}
@@ -119,6 +120,10 @@ export function compileEsslProgram(vertexSource, fragmentSource, {defines = {}, 
     samplerCount: 0,
     structs: new Map(),       // name -> {fields:[{name, type}], wname}
     needsTarget: false,
+    // rows:'gl' stores framebuffer rows bottom-up as GL does (clip Y negated), so
+    // a texture rendered here is sampled with GL's uv convention. The caller
+    // swaps the pipeline's frontFace to keep GL winding.
+    glRows: rows === 'gl',
   };
   const units = {};
   for (const stage of ['vertex', 'fragment']) {
@@ -150,7 +155,7 @@ export function compileEsslProgram(vertexSource, fragmentSource, {defines = {}, 
   const pointCoordLocation = points ? location : null;
   const vertex = units.vertex.emit({varyings, clipDepth, pointCoordLocation, maxPointSize});
   const fragment = units.fragment.emit({varyings, clipDepth, pointCoordLocation});
-  return {vertex, fragment, reflection: {...reflect(shared, units, varyings), points, maxPointSize: points ? maxPointSize : null}};
+  return {vertex, fragment, reflection: {...reflect(shared, units, varyings), points, maxPointSize: points ? maxPointSize : null, rows}};
 }
 
 /** Compile one stage without a partner (corpus validation and diagnostics):
@@ -597,7 +602,7 @@ class Unit {
       ...copy.map(x => '  ' + x), ...initLines.map(x => '  ' + x), `  ${this.mainName()}();`, '  var out: F3DVertexOut;',
       clipDepth === 'gl' ? '  out.f3d_position = vec4<f32>(f3d_Position.xy, (f3d_Position.z + f3d_Position.w) * 0.5, f3d_Position.w);'
         : '  out.f3d_position = f3d_Position;',
-      ...pointLines, ...outCopy.map(x => '  ' + x), '  return out;', '}');
+      ...pointLines, ...(this.shared.glRows ? ['  out.f3d_position.y = -out.f3d_position.y;'] : []), ...outCopy.map(x => '  ' + x), '  return out;', '}');
     return lines;
   }
   fragmentEntry(varyings, initLines, pointCoordLocation = null) {
@@ -622,7 +627,8 @@ class Unit {
     if (this.used.has('gl_FragCoord')) {
       fields.push('@builtin(position) f3d_frag_position: vec4<f32>,');
       // GL window coordinates: bottom-left origin of the framebuffer.
-      copy.push('f3d_FragCoord = vec4<f32>(input.f3d_frag_position.x, f3d_u.f3d_target.y - input.f3d_frag_position.y, input.f3d_frag_position.z, input.f3d_frag_position.w);');
+      copy.push(this.shared.glRows ? 'f3d_FragCoord = input.f3d_frag_position;'
+        : 'f3d_FragCoord = vec4<f32>(input.f3d_frag_position.x, f3d_u.f3d_target.y - input.f3d_frag_position.y, input.f3d_frag_position.z, input.f3d_frag_position.w);');
     }
     if (this.used.has('gl_FrontFacing')) { fields.push('@builtin(front_facing) f3d_front_facing: bool,'); copy.push('f3d_FrontFacing = input.f3d_front_facing;'); }
     const outFields = [], outCopy = [];
@@ -1393,7 +1399,7 @@ class Unit {
       case 'unpackUnorm2x16': need(1); return {c: `unpack2x16unorm(${args[0].c})`, t: V('float', 2)};
       case 'dFdx': need(1); return {c: `dpdx(${args[0].c})`, t: args[0].t};
       // WebGPU framebuffer Y grows downward; GL's dFdy is with respect to upward Y.
-      case 'dFdy': need(1); return {c: `(-dpdy(${args[0].c}))`, t: args[0].t};
+      case 'dFdy': need(1); return {c: this.shared.glRows ? `dpdy(${args[0].c})` : `(-dpdy(${args[0].c}))`, t: args[0].t};
       case 'fwidth': need(1); return {c: `fwidth(${args[0].c})`, t: args[0].t};
     }
     if (this.version === 100 && ESSL1_TEXTURE[name]) return this.textureCall(ESSL1_TEXTURE[name], args, ctx, line);

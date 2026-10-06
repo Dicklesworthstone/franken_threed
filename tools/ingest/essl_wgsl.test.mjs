@@ -129,3 +129,15 @@ test('points: each vertex becomes an instanced quad of gl_PointSize pixels; gl_P
   assert.match(r.vertex, /select\(vec4<f32>\(2\.0, 2\.0, 2\.0, 1\.0\)/, 'a clipped center drops the whole point');
   assert.match(r.fragment, /f3d_PointCoord = input\.f3d_point_coord;/);
 });
+
+test("rows:'gl' stores GL's bottom-up rows for render targets: clip Y mirrored, gl_FragCoord and dFdy unflipped", () => {
+  const vs = V('gl_Position = mvp * vec4(position, 1.0);'), fs = F('color = vec4(gl_FragCoord.xy, dFdy(gl_FragCoord.y), 1.0);');
+  const gl = compileEsslProgram(vs, fs, {rows: 'gl'}), canvas = compileEsslProgram(vs, fs);
+  assert.match(gl.vertex, /out\.f3d_position\.y = -out\.f3d_position\.y;/);
+  assert.doesNotMatch(canvas.vertex, /out\.f3d_position\.y = -/);
+  assert.match(gl.fragment, /f3d_FragCoord = input\.f3d_frag_position;/);
+  assert.match(canvas.fragment, /f3d_u\.f3d_target\.y - input\.f3d_frag_position\.y/);
+  assert.match(gl.fragment, /[^-]dpdy\(/); assert.match(canvas.fragment, /\(-dpdy\(/);
+  assert.equal(gl.reflection.rows, 'gl');
+  assert.throws(() => compileEsslProgram(vs, fs, {rows: 'up'}), /rows must be/);
+});

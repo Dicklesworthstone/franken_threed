@@ -30,6 +30,9 @@ per element/column; integer varyings are flat.
 
 - Clip depth: `gl_Position.z` remapped from GL `[-w, w]` to WebGPU `[0, w]`
   (`clipDepth: 'webgpu'` disables it for WebGPU-convention projections).
+- `rows: 'gl'` (render targets sampled later by GL-convention shaders): clip Y
+  is mirrored so storage rows are GL's bottom-up rows; `gl_FragCoord` and `dFdy`
+  then need no flip; the caller swaps the pipeline's front face.
 - `gl_FragCoord` in GL window coordinates (bottom-left origin); `dFdy` keeps GL's
   upward sign; `texture()` outside fragment shaders samples level 0.
 - Vector `==`/`!=` reduce with `all`/`any`; `mod` uses `x - y*floor(x/y)`;
@@ -125,9 +128,25 @@ half-float table, as a DataTexture), so Physical extensions the core path
 lacks (clearcoat, sheen, iridescence, specular color/intensity, IOR) render
 through ShaderLib.
 
+PMREM environments (`three_program_pmrem.mjs`): MeshStandard/Physical (and
+Lambert/Phong reading `scene.environment`) get r186's cube-UV map. The
+application's own `PMREMGenerator` runs unchanged (retained JavaScript) against
+a recording host; its CubemapToCubeUV / EquirectToCubeUV / GGX passes are
+compiled with `rows: 'gl'` (render targets keep GL's bottom-up rows, so the
+receiver's `textureCubeUV` reads them with GL's uv convention) and replayed in
+order on rgba16float targets, each draw with its own viewport, scissor and
+uniform slice. Cache semantics follow `WebGLEnvironments.getPMREM`: generated
+once the source is complete (until then the program renders without the
+environment, as r186 does), never regenerated on source edits, released on
+the source's `dispose`. Scenario `shaderlib_pmrem` (cube and equirect sources,
+roughness 0.05–0.8, Physical clearcoat) matches upstream WebGLRenderer (0.01%
+of pixels differ; mean channel difference 0.01). This runs H2
+`webgl_marchingcubes` "shiny".
+
 Not admitted yet (explicit errors): transmission (needs its render target),
-PMREM / equirectangular environments, Sprite / Distance / Shadow materials,
-programs receiving shadow-casting lights.
+render-target PMREM sources (`pmremVersion`), pre-filtered cube-UV textures
+supplied directly, Sprite / Distance / Shadow materials, programs receiving
+shadow-casting lights.
 
 Textures: the texture owner now admits HalfFloat (`*16float`) and Float
 (`*32float`) DataTextures with byte-exact rows. Float32 linear filtering

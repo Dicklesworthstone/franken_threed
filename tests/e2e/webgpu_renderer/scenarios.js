@@ -322,6 +322,39 @@ export const scenarios = {
     scene.add(light, new THREE.AmbientLight(0x404040, 1), new THREE.PointLight(0xff8844, 4, 0, 2));
     return { scene, camera: camera(THREE, [0, 0, 3.4]) };
   },
+  // r186 PMREM (PMREMGenerator cube-UV, GGX mips) for MeshStandard/Physical
+  // envMaps through ShaderLib programs: a cube source and an equirect source.
+  shaderlib_pmrem(THREE) {
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x101010);
+    const face = (r, g, b) => {
+      const n = 64, d = new Uint8Array(n * n * 4);
+      for (let i = 0; i < n * n; i++) {
+        const x = i % n, y = i >> 6, k = ((x >> 3) + (y >> 3)) % 2 ? 1 : 0.35, h = 0.5 + 0.5 * (y / n);
+        d.set([r * k * h, g * k * h, b * k * h, 255], i * 4);
+      }
+      const t = new THREE.DataTexture(d, n, n); t.needsUpdate = true; return t;
+    };
+    const cube = new THREE.CubeTexture([face(255, 80, 80), face(80, 255, 80), face(80, 80, 255), face(255, 255, 80), face(80, 255, 255), face(255, 80, 255)]);
+    cube.needsUpdate = true;
+    const w = 128, h = 64, pano = new Uint8Array(w * h * 4);
+    for (let i = 0; i < w * h; i++) { const x = i % w, y = (i / w) | 0; pano.set([(x * 2) & 255, y * 4, ((x >> 4) + (y >> 4)) % 2 ? 230 : 40, 255], i * 4); }
+    const equirect = new THREE.DataTexture(pano, w, h); equirect.mapping = THREE.EquirectangularReflectionMapping; equirect.needsUpdate = true;
+    const mats = [
+      new THREE.MeshStandardMaterial({ color: 0xffffff, metalness: 1, roughness: 0.05, envMap: cube }),
+      new THREE.MeshStandardMaterial({ color: 0xffffff, metalness: 1, roughness: 0.45, envMap: cube }),
+      new THREE.MeshStandardMaterial({ color: 0xcc8844, metalness: 0.3, roughness: 0.8, envMap: cube, envMapIntensity: 1.5 }),
+      new THREE.MeshPhysicalMaterial({ color: 0xffffff, metalness: 1, roughness: 0.2, envMap: equirect, clearcoat: 1 }),
+    ];
+    mats.forEach((m, i) => {
+      const mesh = new THREE.Mesh(new THREE.SphereGeometry(0.42, 48, 24), m);
+      mesh.position.set((i % 2) - 0.5, i < 2 ? 0.48 : -0.48, 0);
+      scene.add(mesh);
+    });
+    const light = new THREE.DirectionalLight(0xffffff, 1); light.position.set(1, 2, 3);
+    scene.add(light);
+    return { scene, camera: camera(THREE, [0, 0, 3.2]) };
+  },
   // MeshPhysicalMaterial extensions via ShaderLib programs (WebGL surface), and a
   // nearest-sampled float32 DataTexture read by a ShaderMaterial.
   shaderlib_physical(THREE) {

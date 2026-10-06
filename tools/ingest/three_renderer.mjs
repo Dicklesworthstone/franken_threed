@@ -31,6 +31,7 @@ import {createGpuCanvasRenderer} from './gpu_canvas_renderer.mjs';
 import {createGpuHdrCanvasRenderer} from './gpu_hdr_canvas.mjs';
 import {createGpuThreeScene} from './three_scene.mjs';
 import {createThreeProgramSupport} from './three_program.mjs';
+import {createThreeProgramPMREM} from './three_program_pmrem.mjs';
 // r186 src/renderers/webgpu/utils/WebGPUConstants.js GPUFeatureName values.
 const R186_GPU_FEATURES = ['core-features-and-limits', 'depth-clip-control', 'depth32float-stencil8', 'texture-compression-bc',
   'texture-compression-bc-sliced-3d', 'texture-compression-etc2', 'texture-compression-astc', 'texture-compression-astc-sliced-3d',
@@ -132,7 +133,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
                 ...(owner._hdr || !owner._shaderEncodedOutput ? {} : {outputTransfer: 'srgb'})},
               textureTransforms: true, alphaMaps: true,
               // ShaderMaterial programs (WebGLRenderer semantics) on the WebGL surface.
-              program: owner._shaderEncodedOutput && !owner._hdr ? owner._programSupport ??= createThreeProgramSupport({three: THREE,
+              program: owner._shaderEncodedOutput && !owner._hdr ? owner._programSupport ??= createThreeProgramSupport({three: THREE, pmrem: createThreeProgramPMREM,
                 state: () => ({toneMapping: owner.toneMapping, toneMappingExposure: owner.toneMappingExposure, outputColorSpace: owner.outputColorSpace,
                   pixelRatio: owner._pixelRatio, height: owner._height})}) : null,
               fog: scene.fog ? {} : null, environment: scene.environment ? {} : null,

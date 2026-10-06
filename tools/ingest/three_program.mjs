@@ -188,7 +188,7 @@ function write(view, node, value, name, base = 0) {
  * owns one WebGLLights state (setLights/setLightsView per frame, as
  * WebGLRenderer.render does) and per-material ShaderLib uniform clones.
  * Compiled programs are cached by their exact assembled source text (bounded). */
-export function createThreeProgramSupport({three: T, state, maxPrograms = 256, maxPointSize = 1024}) {
+export function createThreeProgramSupport({three: T, state, maxPrograms = 256, maxPointSize = 1024, pmrem = null}) {
   const compiled = new Map(), lights = webglLights(T), clones = new WeakMap();
   let dfgLUT = null;
   /** r186 getDFGLUT(): the 16x16 RG half-float DFG table, linear, clamped. */
@@ -231,7 +231,9 @@ export function createThreeProgramSupport({three: T, state, maxPrograms = 256, m
     return uniforms;
   }
   return Object.freeze({
-    compile, uniformsFor, refresh, needsLights: materialNeedsLights, shaderLibMaterial: m => SHADER_IDS[m?.type] !== undefined,
+    compile, uniformsFor, refresh, needsLights: materialNeedsLights,
+    /** r186 PMREM owner (three_program_pmrem.mjs) when injected. */
+    createPMREM: pmrem ? (device, bindingOf) => pmrem({three: T, device, bindingOf}) : null, shaderLibMaterial: m => SHADER_IDS[m?.type] !== undefined,
     /** WebGLLights.setup for this frame's light list (source traversal order). */
     setLights(list) { lightList = [...list]; lights.setup(lightList); return lights.state.version; },
     setLightsView(camera) { lights.setupView(lightList, camera); },

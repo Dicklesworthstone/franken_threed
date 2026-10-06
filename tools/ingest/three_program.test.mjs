@@ -93,3 +93,23 @@ test('program support caches compiled programs by exact source text', () => {
   assert.notEqual(support.compile(m, a), support.compile(m, new T.Mesh(new T.BufferGeometry().setAttribute('position', new T.BufferAttribute(new Float32Array(9), 3)), m)),
     'HAS_NORMAL differs, so the program differs');
 });
+
+test('PMREM: r186 PMREMGenerator passes record against the host and compile with GL rows', async () => {
+  const {createThreeProgramPMREM, pmremSourceComplete, pmremSourceKind} = await import('./three_program_pmrem.mjs');
+  const cube = new T.CubeTexture([0, 1, 2, 3, 4].map(() => ({width: 32, height: 32})));
+  assert.equal(pmremSourceKind(T, cube), 'cube');
+  assert.equal(pmremSourceComplete(T, cube), false, 'five faces: r186 renders without the environment');
+  cube.images[5] = {width: 32, height: 32};
+  assert.equal(pmremSourceComplete(T, cube), true);
+  const equirect = new T.DataTexture(new Uint8Array(4), 1, 1); equirect.mapping = T.EquirectangularReflectionMapping;
+  assert.equal(pmremSourceKind(T, equirect), 'equirect');
+  assert.equal(pmremSourceKind(T, new T.Texture()), 'direct');
+  // Without a device the generation fails at the GPU step, after recording.
+  const calls = [];
+  const device = new Proxy({}, {get: (_, k) => k === 'pushErrorScope' ? () => {} : k === 'popErrorScope' ? async () => null : k === 'createBuffer' ? () => { throw new Error('no-gpu'); } : (...a) => calls.push(k)});
+  const pmrem = createThreeProgramPMREM({three: T, device, bindingOf: () => null});
+  assert.deepEqual(pmrem.lookup(cube), {state: 'needed'});
+  await assert.rejects(pmrem.generate(cube), /no-gpu/);
+  const rt = new T.WebGLRenderTarget(4, 4); rt.texture.mapping = T.CubeReflectionMapping;
+  assert.throws(() => pmrem.lookup(rt.texture), {code: 'THREE_PMREM_SOURCE'});
+});

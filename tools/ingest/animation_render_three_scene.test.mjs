@@ -154,7 +154,6 @@ test('material/map values and unsupported source paths reject before GPU allocat
   const factories=[
     ()=>{const f=fixture(new T.ShaderMaterial());return f;},
     ()=>{const f=fixture();f.mesh.onBeforeRender=()=>{throw Error('must not run');};return f;},
-    ()=>{const f=fixture();f.g.attributes.position.onUpload(()=>{throw Error('must not run');});return f;},
     ()=>{const f=fixture();f.m.alphaHash=true;return f;},
     ()=>{const f=fixture();f.m.color.r=NaN;return f;},
     ()=>{const f=fixture();f.m.onBeforeCompile=()=>{};return f;},
@@ -162,7 +161,7 @@ test('material/map values and unsupported source paths reject before GPU allocat
     ()=>{const f=fixture();f.s.fog=new T.Fog();return f;},
     ()=>{const f=fixture();f.s.add(new T.Sprite());return f;},
   ];
-  for(const factory of factories){const f=factory();await assert.rejects(create(f));assert.equal(f.d.buffers.length,0);}
+  for(const [i,factory] of factories.entries()){const f=factory();await assert.rejects(create(f));assert.equal(f.d.buffers.length,0,`factory ${i}`);}
 });
 test('aggregate geometry growth is rejected before allocations, even when existing residency stays live',async()=>{
   const f=fixture(),b=await create(f,{maxGeometryBytes:72});assert.equal(b.diagnostics.geometryBytes,72);

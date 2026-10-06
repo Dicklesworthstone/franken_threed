@@ -184,7 +184,7 @@ export async function createGpuThreeScene(device,scene,{
     deformationLifetime.abort();
     backgroundOwner?.dispose();pendingBackground?.dispose();backgroundOwner=null;pendingBackground=null;
     environmentOwner?.dispose();pendingEnvironment?.dispose();environmentOwner=null;pendingEnvironment=null;
-    shadowOwner?.dispose();pendingShadow?.dispose();shadowOwner=null;pendingShadow=null;casters.clear();
+    pmremOwner?.dispose();pmremOwner=null;shadowOwner?.dispose();pendingShadow?.dispose();shadowOwner=null;pendingShadow=null;casters.clear();
     for(const entry of entries)entry.mesh.dispose();entries=[];lookup.clear();
     for(const gpu of [...deformations.values(),...pendingDeformations])gpu.dispose();deformations.clear();pendingDeformations.clear();
     for(const [m,state] of materials)m.removeEventListener('dispose',state.listener);materials.clear();
@@ -348,6 +348,8 @@ export async function createGpuThreeScene(device,scene,{
    * the owned residency, or r186's zero 1x1 default while the source loads. */
   function textureBinding(t){
     let binding;
+    const generated=pmremOwner?.binding(t);
+    if(generated)return generated;
     if(textures.has(t)){
       binding=textures.get(t);
       if(!binding?.view||!binding.sampler||binding.version!==t.version||binding.sourceVersion!==t.source.version)
@@ -405,11 +407,25 @@ export async function createGpuThreeScene(device,scene,{
     const usePMREM=m.isMeshStandardMaterial||(m.isMeshLambertMaterial&&!m.envMap)||(m.isMeshPhongMaterial&&!m.envMap);
     const source=m.isShaderMaterial?null:(m.envMap||environment);
     if(!source)return {envMap:null,envMapRotation:m.envMapRotation};
-    if(usePMREM)fail('MATERIAL','PMREM environments for ShaderLib programs are not admitted yet');
+    const envMapRotation=m.envMap?m.envMapRotation:scene.environmentRotation;
+    if(usePMREM){
+      // WebGLEnvironments.getPMREM: cube-UV target once the source is complete.
+      const r=pmrem().lookup(source);
+      if(r.state==='ready')return {envMap:r.texture,envMapRotation};
+      if(r.state==='direct')fail('TEXTURE','Pre-filtered cube-UV environment textures are not admitted yet');
+      if(r.state==='needed'){
+        if(textureScan){pmremRequests.add(source);textureBinding(source);}
+        else if(!pendingTextures.has(source))fail('PREPARE','A PMREM environment source is complete; prepare() generates it');
+      }
+      // Incomplete or still loading: r186 renders without the environment.
+      return {envMap:null,envMapRotation};
+    }
     if(!source.isCubeTexture||![three.CubeReflectionMapping,three.CubeRefractionMapping].includes(source.mapping))
       fail('TEXTURE','Equirectangular/render-target environment maps need cube conversion, not admitted yet');
-    return {envMap:source,envMapRotation:m.envMap?m.envMapRotation:scene.environmentRotation};
+    return {envMap:source,envMapRotation};
   }
+  let pmremOwner=null,pmremRequests=new Set();
+  const pmrem=()=>pmremOwner??=(programSupport.createPMREM?.(device,t=>textureBinding(t))??fail('MATERIAL','PMREM environments need the program PMREM owner'));
   function programDescription(m,topology,object){
     if(!programRoute())fail('MATERIAL',`Unsupported source material: ${m?.type}`);
     if(!object)fail('MATERIAL','Program materials need their object for program assembly');
@@ -715,8 +731,11 @@ export async function createGpuThreeScene(device,scene,{
     try{
       // Validate all source materials and texture inputs before allocating any
       // textures. Temporary inspection placeholders never reach renderer.addMesh.
-      pendingTextures=new WeakSet();
+      pendingTextures=new WeakSet();pmremRequests=new Set();
       const owned=scanTextures();textureOwner?.prepare(owned);
+      // PMREM sources are owned textures now; generate their cube-UV targets
+      // before the descriptions that bind them.
+      for(const source of pmremRequests)if(!pendingTextures.has(source)){await Promise.race([pmrem().generate(source),stopped]);live();}
       const nodes=graph(),request=desired(nodes),next=[];
       const selected=shadowEnabled?shadowLight(nodes):null;
       const shadowSignature=selected?shadowApi.inspectThreeShadow(selected,three).signature:null;
@@ -920,7 +939,7 @@ export async function createGpuThreeScene(device,scene,{
       }
       if(shadowOwner!==nextShadow){shadowOwner?.dispose();shadowStats=null;}
       else for(const [entry,caster] of casters)if(!nextCasters.has(entry))caster.dispose();
-      shadowOwner=nextShadow;pendingShadow=null;casters=nextCasters;
+      shadowOwner=nextShadow;pendingShadow=null;casters=nextCasters;pmremOwner?.collect();
       if(environmentOwner!==nextEnvironment)environmentOwner?.dispose();
       environmentOwner=nextEnvironment;pendingEnvironment=null;
       if(backgroundOwner!==nextBackground)backgroundOwner?.dispose();
