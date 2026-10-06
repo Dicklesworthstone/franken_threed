@@ -69,7 +69,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
   /** Cheap, per-frame profile of scene-level features that select bridge options. */
   function sceneKey(renderer, scene) {
     const background = scene.background !== null && scene.background !== undefined && !scene.background.isColor;
-    return `${scene.fog ? 1 : 0}${scene.environment ? 1 : 0}${background ? 1 : 0}${renderer.shadowMap.enabled ? 1 : 0}`;
+    return `${scene.fog ? 1 : 0}${scene.environment ? 1 : 0}${background ? 1 : 0}${renderer.shadowMap.enabled ? 1 : 0}${renderer._needsGlobalClipping?.() ? 1 : 0}`;
   }
   /** Preparation-time traversal for options that depend on materials. */
   function needsClipping(scene) {
@@ -107,7 +107,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         },
         async prepare() {
           for (const [scene, key] of owner._wanted) {
-            const clipping = needsClipping(scene);
+            const clipping = needsClipping(scene) || owner._needsGlobalClipping?.() === true;
             const previous = entries.get(scene);
             if (previous && previous.key === key && (previous.clipping || !clipping) && !previous.bridge.failed) {
               await previous.bridge.prepare();
@@ -118,12 +118,13 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
             const background = scene.background && !scene.background.isColor;
             const bridge = await createGpuThreeScene(device, scene, {
               ...sceneLimits, three: THREE, signal, maxBindings,
-              renderer: {...attachments, instancing: true, renderBundles: true, maxDraws},
+              renderer: {...attachments, instancing: true, renderBundles: true, maxDraws,
+                ...(owner._hdr || !owner._shaderEncodedOutput ? {} : {outputTransfer: 'srgb'})},
               textureTransforms: true, alphaMaps: true,
               fog: scene.fog ? {} : null, environment: scene.environment ? {} : null,
               background: background ? {} : null,
               shadow: owner.shadowMap.enabled ? {} : null,
-              clipping: clipping || previous?.clipping ? clippingControls : null,
+              clipping: clipping || previous?.clipping ? owner._clippingControls ?? clippingControls : null,
             });
             if (disposed) { bridge.dispose(); return; }
             entries.set(scene, {bridge, key, clipping: clipping || !!previous?.clipping, lastDiagnostics: null});
@@ -146,7 +147,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
   class WebGPURenderer {
     constructor(parameters = {}) {
       if (!parameters || typeof parameters !== 'object') fail('OPTIONS', 'Expected renderer parameters');
-      for (const key of Object.keys(parameters)) if (!PARAMETERS.has(key)) fail('OPTIONS', `Unknown renderer parameter: ${key}`);
+      for (const key of Object.keys(parameters)) if (!(this._parameterNames?.() ?? PARAMETERS).has(key)) fail('OPTIONS', `Unknown renderer parameter: ${key}`);
       const {
         canvas = null, antialias = false, alpha = true, depth = true, stencil = false, samples = 0,
         forceWebGL = false, logarithmicDepthBuffer = false, reversedDepthBuffer = false,
@@ -297,7 +298,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           target: {width, height, ...format, alphaMode: this.alpha ? 'premultiplied' : 'opaque'}, renderTarget: {depthFormat, sampleCount},
           output: {toneMapping: this._toneMapping(), exposure: this.toneMappingExposure}})
         : await createGpuCanvasRenderer(this.domElement, createDispatcher(this), {...common, lazyAttachments: true,
-          target: {width, height, depthFormat, sampleCount, ...format, alphaMode: this.alpha ? 'premultiplied' : 'opaque'}});
+          target: {width, height, depthFormat, sampleCount, ...format, alphaMode: this.alpha ? 'premultiplied' : 'opaque',
+            ...(this._shaderEncodedOutput ? {srgbView: false} : {})}});
     }
     _release() {
       this._session?.dispose();
@@ -408,18 +410,35 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         loadOp: (clearOnly ? clearOnly.color : clear && this.autoClearColor) ? 'clear' : 'load',
         depthLoadOp: (clearOnly ? clearOnly.depth : clear && this.autoClearDepth) ? 'clear' : 'load',
         clearColor: premultiply ? [color.r * a, color.g * a, color.b * a, a] : [color.r, color.g, color.b, 1],
-        clearDepth: this._clearDepth,
       };
+      // Shader-encoded output stores sRGB values: clear with the encoded color
+      // (source WebGL Background converts the clear color to the output space).
+      if (this._shaderEncodedOutput && !this._hdr) {
+        const encoded = [color.r, color.g, color.b].map(c => c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 0.41666) - 0.055);
+        frame.clearColor = premultiply ? [...encoded.map(c => c * a), a] : [...encoded, 1];
+      }
+      Object.assign(frame, {
+        clearDepth: this._clearDepth,
+      });
       const pr = this._pixelRatio, [bufferWidth, bufferHeight] = this._bufferSize();
-      const v = this._viewport, vx = Math.floor(v.x * pr), vy = Math.floor(v.y * pr), vw = Math.floor(v.z * pr), vh = Math.floor(v.w * pr);
+      const v = this._viewport, px = this._pixelRound ?? Math.floor;
+      const vx = px(v.x * pr), vw = px(v.z * pr), vh = px(v.w * pr);
+      // WebGL viewports/scissors use a bottom-left origin; WebGPU's is top-left.
+      const vy = this._bottomLeftOrigin ? bufferHeight - px(v.y * pr) - vh : px(v.y * pr);
       const [minDepth, maxDepth] = this._viewportDepth;
       if (vx !== 0 || vy !== 0 || vw !== bufferWidth || vh !== bufferHeight || minDepth !== 0 || maxDepth !== 1)
         frame.viewport = [vx, vy, vw, vh, minDepth, maxDepth];
       if (this._scissorTest) {
         // Source clamping: non-negative and inside the drawing buffer.
-        const sc = this._scissor;
-        const sx = Math.max(0, Math.floor(sc.x * pr)), sy = Math.max(0, Math.floor(sc.y * pr));
-        const sw = Math.max(0, Math.min(Math.floor(sc.z * pr), bufferWidth - sx)), sh = Math.max(0, Math.min(Math.floor(sc.w * pr), bufferHeight - sy));
+        const sc = this._scissor, rawH = px(sc.w * pr);
+        const rawY = this._bottomLeftOrigin ? bufferHeight - px(sc.y * pr) - rawH : px(sc.y * pr);
+        const sx = Math.max(0, px(sc.x * pr)), sy = Math.max(0, rawY);
+        // WebGPU source: clamp each component to >= 0, then fit inside the buffer.
+        // WebGL: the GL scissor box is intersected with the buffer, so a negative
+        // origin also shortens the box.
+        const clip = this._bottomLeftOrigin;
+        const sw = Math.max(0, Math.min(px(sc.z * pr) + (clip ? Math.min(0, px(sc.x * pr)) : 0), bufferWidth - sx)),
+          sh = Math.max(0, Math.min(rawH + (clip ? Math.min(0, rawY) : 0), bufferHeight - sy));
         if (sx !== 0 || sy !== 0 || sw !== bufferWidth || sh !== bufferHeight) frame.scissor = [sx, sy, sw, sh];
       }
       if (this._hdr) {
@@ -429,7 +448,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       return frame;
     }
     render(scene, camera) {
-      if (this._initialized === false) throw new Error(NOT_INITIALIZED);
+      if (this._initialized === false && !this._deferUntilInitialized) throw new Error(NOT_INITIALIZED);
       if (this._disposed) fail('DISPOSED', 'Renderer is disposed');
       if (this._deferredError) { const error = this._deferredError; this._deferredError = null; throw error; }
       if (!(scene instanceof THREE.Object3D) || !(camera instanceof THREE.Camera)) fail('SOURCE', 'Expected a source scene and camera');
@@ -478,6 +497,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._drain.catch(error => { this._deferredError ??= error; });
     }
     async _drainPending() {
+      await this.init();
       for (let rounds = 0; this._pending.length; rounds++) {
         if (rounds > 8) fail('PREPARE', 'Source structure kept changing during preparation');
         if (this._rebuild) {
@@ -538,6 +558,9 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     // ---- animation loop (source Animation semantics: callback(time, xrFrame)) ----
     async setAnimationLoop(callback) {
       if (this._initialized === false && callback !== null) await this.init();
+      this._setLoop(callback);
+    }
+    _setLoop(callback) {
       const host = this.domElement.ownerDocument?.defaultView ?? globalThis;
       if (this._animationHandle !== null) { host.cancelAnimationFrame?.(this._animationHandle); this._animationHandle = null; }
       if (this._inspector.isRunning) this._inspector.finish();
@@ -570,4 +593,94 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     }
   }
   return WebGPURenderer;
+}
+
+const WEBGL_PARAMETERS = new Set(['canvas', 'context', 'depth', 'stencil', 'alpha', 'antialias', 'premultipliedAlpha',
+  'preserveDrawingBuffer', 'powerPreference', 'failIfMajorPerformanceCaveat', 'reversedDepthBuffer', 'outputBufferType',
+  'precision', 'logarithmicDepthBuffer', 'device', 'requiredLimits', 'requiredFeatures']);
+
+/** Drop-in r186 `WebGLRenderer` surface over the same new-WebGPU scene path.
+ *
+ * Route/ownership: general new WebGPU, retained-JS command preparation. The build
+ * substitutes it only when the whole application has no GL escape (no context
+ * access, extension/parameter queries or capability reads). It is not a GL
+ * context and does not pretend to be one: getContext(), capabilities,
+ * extensions, properties and state throw F3DRendererError.
+ *
+ * Contract differences from the source WebGL renderer, all explicit:
+ * - Construction is synchronous, as in the source; device negotiation starts
+ *   immediately. Frames requested before it completes (and structural edits)
+ *   are deferred to the preparation boundary and submitted in order; the
+ *   canvas keeps its previous image meanwhile. Callbacks are never skipped.
+ * - Blending happens in linear space on a WebGPU sRGB view, whereas WebGL blends
+ *   sRGB-encoded shader outputs: translucent pixels differ (opaque ones do not).
+ * - Tone mapping is a whole-image output pass, not per-material in the shader;
+ *   toneMapped:false materials and translucent pixels under tone mapping differ.
+ * - preserveDrawingBuffer with autoClear:false accumulation is not admitted.
+ */
+export function createWebGLRendererClass(THREE, classOptions = {}) {
+  const {exactBackend = null, ...options} = classOptions;
+  if (exactBackend !== null && typeof exactBackend !== 'function') fail('OPTIONS', 'exactBackend must be a renderer constructor');
+  const Base = createWebGPURendererClass(THREE, options);
+  const glOnly = name => ({get() { fail('UNSUPPORTED', `WebGLRenderer.${name} describes a GL context; this route has none`); }, configurable: true});
+  class WebGLRenderer extends Base {
+    constructor(parameters = {}) {
+      if (!parameters || typeof parameters !== 'object') fail('OPTIONS', 'Expected renderer parameters');
+      for (const key of Object.keys(parameters)) if (!WEBGL_PARAMETERS.has(key)) fail('OPTIONS', `Unknown renderer parameter: ${key}`);
+      // A supplied GL context is the exact backend by definition.
+      if (parameters.context) {
+        if (exactBackend) return new exactBackend(parameters);
+        fail('ROUTE', 'A supplied rendering context selects the exact WebGL backend');
+      }
+      const {premultipliedAlpha = true, preserveDrawingBuffer = false, powerPreference = 'default',
+        failIfMajorPerformanceCaveat, precision, outputBufferType, context, ...rest} = parameters;
+      super({...rest, alpha: parameters.alpha ?? false,
+        ...(powerPreference === 'default' ? {} : {powerPreference})});
+      this.isWebGPURenderer = false;
+      this.isWebGLRenderer = true;
+      this.premultipliedAlpha = premultipliedAlpha;
+      this.preserveDrawingBuffer = preserveDrawingBuffer;
+      this._outputBufferType = outputBufferType;
+      this.clippingPlanes = [];
+      this.localClippingEnabled = false;
+      this.shadowMap = {enabled: false, autoUpdate: true, needsUpdate: false, type: THREE.PCFShadowMap};
+      this.transmissionResolutionScale = 1;
+      this.debug = {checkShaderErrors: true, onShaderError: null};
+      // Live per-frame controls read by the bridge as ordinary data properties.
+      this._clippingControls = {planes: [], localClippingEnabled: false};
+      this._deferUntilInitialized = true;
+      this._bottomLeftOrigin = true;
+      // WebGL writes sRGB-encoded fragments into an 8-bit framebuffer and blends
+      // those encoded values; reproduce that with shader-side encoding.
+      this._shaderEncodedOutput = true;
+      this._pixelRound = Math.round;
+      // Source construction is synchronous: start device negotiation now.
+      this.init().catch(error => { this._deferredError ??= error; });
+    }
+    _parameterNames() { return WEBGL_PARAMETERS; }
+    async _init() {
+      if (this.alpha && this.premultipliedAlpha === false) fail('UNSUPPORTED', 'Straight-alpha canvas compositing is not admitted');
+      if (this._outputBufferType !== undefined && this._outputBufferType !== THREE.UnsignedByteType)
+        fail('UNSUPPORTED', 'Non-8-bit output buffers are not admitted');
+      return super._init();
+    }
+    _needsGlobalClipping() { return this.clippingPlanes.length > 0; }
+    render(scene, camera) {
+      if (this.preserveDrawingBuffer && this.autoClear === false)
+        fail('UNSUPPORTED', 'preserveDrawingBuffer accumulation across frames is not admitted');
+      this._clippingControls.planes = this.clippingPlanes;
+      this._clippingControls.localClippingEnabled = this.localClippingEnabled;
+      return super.render(scene, camera);
+    }
+    init() { return super.init(); }
+    setAnimationLoop(callback) { this._setLoop(callback); }
+    getContext() { fail('UNSUPPORTED', 'This WebGLRenderer route has no GL context'); }
+    getContextAttributes() { fail('UNSUPPORTED', 'This WebGLRenderer route has no GL context'); }
+    forceContextLoss() { fail('UNSUPPORTED', 'This WebGLRenderer route has no GL context'); }
+    forceContextRestore() { fail('UNSUPPORTED', 'This WebGLRenderer route has no GL context'); }
+    getCurrentViewport(target) { return target.copy(this._viewport).multiplyScalar(this._pixelRatio).round(); }
+  }
+  for (const name of ['capabilities', 'extensions', 'properties', 'state', 'renderLists'])
+    Object.defineProperty(WebGLRenderer.prototype, name, glOnly(name));
+  return WebGLRenderer;
 }

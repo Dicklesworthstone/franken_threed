@@ -21,6 +21,7 @@ Options:
   --specialize-numeric Discover and compile guarded numeric updates in --build-app
   --route-webgpu-renderer Route WebGPURenderer to the general new WebGPU backend in --build-app
                        when the whole-graph route decision admits every construction site
+  --route-webgl-renderer  Route WebGLRenderer likewise when no GL escape or GL-state read exists
   --build-animation <dir>  Export a glTF/GLB pose player to a fresh directory
   --animation-webgpu   Include opt-in GPU deformation with --build-animation
   --animation-three-scene  Include explicit r186 scene submission; requires --animation-webgpu
@@ -58,6 +59,7 @@ async function main() {
   let packHtmlFile = null;
   let specializeNumeric = false;
   let routeWebGPURenderer = false;
+  let routeWebGLRenderer = false;
   let buildKernelDir = null;
   let buildAnimationDir = null;
   let animationWebGpu = false;
@@ -96,6 +98,8 @@ async function main() {
       specializeNumeric = true;
     } else if (arg === "--route-webgpu-renderer") {
       routeWebGPURenderer = true;
+    } else if (arg === "--route-webgl-renderer") {
+      routeWebGLRenderer = true;
     } else if (arg === "--build-app" || arg === "--out-dir") {
       if (i + 1 >= args.length || args[i + 1].startsWith("-")) {
         console.error(`Error: ${arg} requires a directory path argument.`);
@@ -170,8 +174,8 @@ async function main() {
     process.exit(1);
   }
 
-  if (routeWebGPURenderer && !buildAppDir) {
-    console.error("Error: --route-webgpu-renderer requires --build-app.");
+  if ((routeWebGPURenderer || routeWebGLRenderer) && !buildAppDir) {
+    console.error("Error: --route-webgpu-renderer/--route-webgl-renderer require --build-app.");
     process.exit(1);
   }
   if (specializeNumeric && (!buildAppDir || buildKernelDir)) {
@@ -347,13 +351,14 @@ async function main() {
         packageRootUrl: packageRoot,
         specializeNumeric: specializeNumeric ? { maxMemoryPages } : false,
         routeWebGPURenderer,
+        routeWebGLRenderer,
       });
       if (appResult.rendererRoute) {
         const route = appResult.rendererRoute;
         console.log(
           route.routed
-            ? `WebGPURenderer route: general-webgpu (new backend, retained JS command preparation); substituted ${route.substitutedModules.join(", ")}. No speedup claim.`
-            : `WebGPURenderer route: unchanged retained upstream (${route.reason}).`,
+            ? `Renderer route: general-webgpu (new backend, retained JS command preparation) for ${route.targets.map((t) => t.exportName).join(", ")}; substituted ${route.substitutedModules.join(", ")}. No speedup claim.`
+            : `Renderer route: unchanged retained upstream (${route.reason}).`,
         );
       }
       console.log(`Runnable application build emitted to: ${appResult.outDir}`);

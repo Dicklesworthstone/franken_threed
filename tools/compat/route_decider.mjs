@@ -157,7 +157,28 @@ export function decideRendererRoute(input = {}) {
     };
   }
 
-  // Explicit WebGL constructor always maps to exact backend
+  // An explicitly supplied general WebGLRenderer implementation (new WebGPU
+  // backend) is admitted only for applications with no GL escape at all; any
+  // context access, GL call or unanalyzed module keeps the exact backend.
+  if (
+    constructorName === "WebGLRenderer" &&
+    input.generalWebGLAvailable === true &&
+    !hasOpaqueGLEscapes &&
+    !hasNativeContextAccess &&
+    !hasUnresolvedContextAccess &&
+    !hasUnanalyzedModules &&
+    !isExplicitForceWebGL &&
+    (input.hostCapabilities?.hasWebGPU ?? true)
+  ) {
+    return {
+      route: ExecutionRoute.GENERAL_WEBGPU,
+      reasons: [...reasons, "general-webgl-surface-admitted"],
+      sourceSpan,
+      constructorName,
+    };
+  }
+
+  // Explicit WebGL constructor otherwise maps to exact backend
   if (constructorName === "WebGLRenderer") {
     reasons.push(EscapeReason.EXPLICIT_SOURCE_SELECTION);
     return {

@@ -376,46 +376,53 @@ export function f3dRollupPlugin(options = {}) {
  *   chunks: EmittedChunk[]
  * }>}
  */
-const ROUTED_WEBGPU_PREFIX = "\0f3d-webgpu-renderer-route:";
+const ROUTED_RENDERER_PREFIX = "\0f3d-renderer-route:";
 const THREE_RENDERER_URL = new URL("./three_renderer.mjs", import.meta.url).href;
+const RENDERER_FACTORIES = {
+  WebGPURenderer: "createWebGPURendererClass",
+  WebGLRenderer: "createWebGLRendererClass",
+};
 
 /**
  * Renderer-construction route substitution for an already decided build.
  *
- * Every import that resolves to one of `targetUrls` (the admitted pinned
- * `build/three.webgpu.js`) is redirected to a facade module that re-exports the
- * complete upstream namespace -- every class keeps its upstream module identity --
- * and replaces only the `WebGPURenderer` binding with the general new-backend
- * implementation from three_renderer.mjs. The caller must have decided the
- * GENERAL_WEBGPU route for every construction site; this plugin decides nothing.
+ * Every import that resolves to a target URL (an admitted pinned build such as
+ * `build/three.webgpu.js` or `build/three.module.js`) is redirected to a facade
+ * module that re-exports the complete upstream namespace -- every class keeps its
+ * upstream module identity -- and replaces only the named renderer binding with
+ * the general new-backend implementation from three_renderer.mjs. Requests the
+ * new backend cannot own (forceWebGL, a supplied context) construct the unchanged
+ * upstream renderer. The caller decided the route; this plugin decides nothing.
  *
- * @param {{ targetUrls: Iterable<string> }} options
+ * @param {{ targets: Array<{ url: string, exportName: 'WebGPURenderer' | 'WebGLRenderer' }> }} options
  * @returns {import('rollup').Plugin}
  */
-export function webgpuRendererRoutePlugin({ targetUrls }) {
-  const targets = new Set(targetUrls);
-  if (targets.size === 0) throw new Error("webgpuRendererRoutePlugin requires target module URLs");
+export function rendererRoutePlugin({ targets }) {
+  const byUrl = new Map(targets.map((t) => [t.url, t.exportName]));
+  if (byUrl.size === 0) throw new Error("rendererRoutePlugin requires target modules");
+  for (const name of byUrl.values())
+    if (!RENDERER_FACTORIES[name]) throw new Error(`Unsupported routed renderer export: ${name}`);
   const routed = new Set();
   return {
-    name: "f3d-webgpu-renderer-route",
+    name: "f3d-renderer-route",
     async resolveId(source, importer, resolveOptions) {
-      if (source.startsWith(ROUTED_WEBGPU_PREFIX)) return source;
+      if (source.startsWith(ROUTED_RENDERER_PREFIX)) return source;
       // The facade itself must reach the real upstream module.
-      if (importer?.startsWith(ROUTED_WEBGPU_PREFIX)) return null;
+      if (importer?.startsWith(ROUTED_RENDERER_PREFIX)) return null;
       const resolved = await this.resolve(source, importer, { ...resolveOptions, skipSelf: true });
-      if (!resolved || resolved.external || !targets.has(resolved.id)) return null;
+      if (!resolved || resolved.external || !byUrl.has(resolved.id)) return null;
       routed.add(resolved.id);
-      return ROUTED_WEBGPU_PREFIX + resolved.id;
+      return ROUTED_RENDERER_PREFIX + resolved.id;
     },
     load(id) {
-      if (!id.startsWith(ROUTED_WEBGPU_PREFIX)) return null;
-      const upstream = JSON.stringify(id.slice(ROUTED_WEBGPU_PREFIX.length));
+      if (!id.startsWith(ROUTED_RENDERER_PREFIX)) return null;
+      const url = id.slice(ROUTED_RENDERER_PREFIX.length);
+      const upstream = JSON.stringify(url), name = byUrl.get(url), factory = RENDERER_FACTORIES[name];
       return (
         `export * from ${upstream};\n` +
         `import * as F3D_THREE from ${upstream};\n` +
-        `import { createWebGPURendererClass } from ${JSON.stringify(THREE_RENDERER_URL)};\n` +
-        // forceWebGL/context requests construct the unchanged upstream renderer.
-        `export const WebGPURenderer = createWebGPURendererClass(F3D_THREE, { exactBackend: F3D_THREE.WebGPURenderer });\n`
+        `import { ${factory} } from ${JSON.stringify(THREE_RENDERER_URL)};\n` +
+        `export const ${name} = ${factory}(F3D_THREE, { exactBackend: F3D_THREE.${name} });\n`
       );
     },
     api: {
@@ -524,9 +531,7 @@ export async function bundleWithRollup(entryPath, options = {}) {
     orderedEntryIds.push(entryUrl);
   }
 
-  const routePlugin = options.webgpuRendererRoute
-    ? webgpuRendererRoutePlugin(options.webgpuRendererRoute)
-    : null;
+  const routePlugin = options.rendererRoute ? rendererRoutePlugin(options.rendererRoute) : null;
   let bundle;
   try {
     bundle = await rollup({

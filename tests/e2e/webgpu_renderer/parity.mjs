@@ -32,10 +32,15 @@ const PIXEL_BUDGET = 0.02; // fraction of pixels allowed beyond the channel tole
 
 const argv = process.argv.slice(2);
 const refIndex = argv.indexOf("--reference");
-const referenceKind = refIndex >= 0 ? argv.splice(refIndex, 2)[1] : "webgpu";
+const surfaceIndex = argv.indexOf("--surface");
+// --surface webgl: routed WebGLRenderer page vs the unchanged upstream WebGLRenderer page.
+const surface = surfaceIndex >= 0 ? argv.splice(surfaceIndex, 2)[1] : "webgpu";
+if (!["webgpu", "webgl"].includes(surface)) throw new Error("--surface must be webgpu or webgl");
+const referenceKind = refIndex >= 0 ? argv.splice(argv.indexOf("--reference"), 2)[1] : surface;
 if (!["webgpu", "webgl"].includes(referenceKind)) throw new Error("--reference must be webgpu or webgl");
 const out = fs.mkdtempSync(path.join(os.tmpdir(), "f3d_webgpu_parity_"));
-const routed = await buildApplication(path.join(here, "webgpu.html"), path.join(out, "candidate"), { routeWebGPURenderer: true });
+const routed = await buildApplication(path.join(here, `${surface}.html`), path.join(out, "candidate"),
+  surface === "webgl" ? { routeWebGLRenderer: true } : { routeWebGPURenderer: true });
 if (!routed.rendererRoute?.routed) throw new Error(`candidate was not routed: ${routed.rendererRoute?.reason}`);
 await buildApplication(path.join(here, `${referenceKind}.html`), path.join(out, "reference"));
 
@@ -64,7 +69,7 @@ async function capture(kind, name) {
   const errors = [];
   page.on("pageerror", (e) => errors.push(e.message.split("\n")[0]));
   if (kind === "reference" && referenceKind === "webgpu") await page.addInitScript(identitySwizzleShim);
-  const html = kind === "candidate" ? "webgpu.html" : `${referenceKind}.html`;
+  const html = kind === "candidate" ? `${surface}.html` : `${referenceKind}.html`;
   await page.goto(`${base}/${kind}/${html}#${name}`);
   const state = await page
     .waitForFunction(() => window.__f3d && (window.__f3d.pixels || window.__f3d.error) && window.__f3d, null, { timeout: 20000 })
@@ -74,7 +79,9 @@ async function capture(kind, name) {
   return { pixels: state?.pixels ?? null, error: state?.error ?? errors[0] ?? (state?.pixels ? null : "timeout") };
 }
 
-const selected = argv.length ? argv : Object.keys(scenarios);
+// Scenarios using WebGPU-build-only classes (node materials, BundleGroup).
+const WEBGPU_ONLY = new Set(["node_materials"]);
+const selected = argv.length ? argv : Object.keys(scenarios).filter((n) => surface === "webgpu" || !WEBGPU_ONLY.has(n));
 const results = [];
 for (const name of selected) {
   const [candidate, reference] = [await capture("candidate", name), await capture("reference", name)];

@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import path from 'node:path';
 import {pathToFileURL} from 'node:url';
-import {createWebGPURendererClass, F3DRendererError} from './three_renderer.mjs';
+import {createWebGPURendererClass, createWebGLRendererClass, F3DRendererError} from './three_renderer.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
 const root = process.env.F3D_THREE_ROOT ?? path.resolve('upstream/three.js');
 const T = await import(pathToFileURL(path.join(root, 'build/three.webgpu.js')));
@@ -257,5 +257,37 @@ test('setAnimationLoop initializes, drives callbacks each host frame and stops o
   assert.equal(renderer.info.f3d.presentedRenders, 2);
   await renderer.setAnimationLoop(null);
   assert.equal(next, null); assert.equal(renderer.getAnimationLoop(), null);
+  renderer.dispose();
+});
+
+test('WebGLRenderer surface: synchronous construction, frames before init are deferred, GL-only state fails', async () => {
+  const TC = await import(pathToFileURL(path.join(root, 'build/three.module.js')));
+  const WebGLRenderer = createWebGLRendererClass(TC);
+  const device = recordingDevice(), c = canvasFixture();
+  const renderer = new WebGLRenderer({canvas: c.canvas, device, antialias: false, powerPreference: 'default'});
+  assert.equal(renderer.isWebGLRenderer, true); assert.equal(renderer.isWebGPURenderer, false);
+  assert.equal(renderer.getClearAlpha(), 1, 'source WebGL default alpha:false');
+  const scene = new TC.Scene(), mesh = new TC.Mesh(new TC.BoxGeometry(), new TC.MeshBasicMaterial({color: 0xff0000}));
+  scene.add(mesh);
+  const camera = new TC.PerspectiveCamera(50, 2, 0.1, 10); camera.position.z = 3;
+  renderer.render(scene, camera); // before the device exists: no throw, deferred
+  await flush(renderer);
+  assert.equal(c.acquired(), 1);
+  assert.equal(c.calls.find(x => x[0] === 'configure')[1].alphaMode, 'opaque');
+  // Bottom-left viewport origin, rounded like gl.viewport.
+  renderer.setPixelRatio(1); renderer.setSize(100, 50);
+  renderer.setViewport(10, 5, 40, 20);
+  renderer.render(scene, camera);
+  await flush(renderer);
+  renderer.render(scene, camera);
+  assert.deepEqual(device.passes.at(-1).viewport, [10, 25, 40, 20, 0, 1]);
+  // Renderer-level clipping planes enable the bridge clipping profile.
+  renderer.clippingPlanes = [new TC.Plane(new TC.Vector3(1, 0, 0), 0)];
+  renderer.render(scene, camera);
+  await flush(renderer);
+  assert.equal(renderer._dispatcher.entry(scene).clipping, true);
+  for (const name of ['capabilities', 'extensions', 'state', 'properties'])
+    assert.throws(() => renderer[name], {code: 'F3D_RENDERER_UNSUPPORTED'});
+  assert.throws(() => renderer.getContext(), {code: 'F3D_RENDERER_UNSUPPORTED'});
   renderer.dispose();
 });

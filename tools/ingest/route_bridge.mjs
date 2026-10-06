@@ -264,6 +264,7 @@ export function evaluateGraphRoutes(bundle, decideFn, environment = {}) {
       hostCapabilities: environment.hostCapabilities,
       specializationAvailable: environment.specializationAvailable,
       generalWebGPUAvailable: environment.generalWebGPUAvailable,
+      generalWebGLAvailable: environment.generalWebGLAvailable,
     });
     return {
       moduleId: input.moduleId || bundle.entry_path || "entry",

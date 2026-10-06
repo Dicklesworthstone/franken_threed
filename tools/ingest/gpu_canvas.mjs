@@ -19,13 +19,14 @@ export function createGpuCanvasTarget(device, canvas, options = {}) {
   if (!options || typeof options !== 'object' || Array.isArray(options))
     fail('OPTIONS', 'Expected canvas options');
   for (const key of Object.keys(options))
-    if (!['format', 'depthFormat', 'sampleCount', 'alphaMode', 'maxBytes', 'width', 'height'].includes(key))
+    if (!['format', 'depthFormat', 'sampleCount', 'alphaMode', 'maxBytes', 'width', 'height', 'srgbView'].includes(key))
       fail('OPTIONS', `Unknown canvas option: ${key}`);
   const {
     format: canvasFormat = 'bgra8unorm', depthFormat = 'depth24plus', sampleCount = 1,
     alphaMode = 'opaque', maxBytes = 128 * 1024 * 1024,
-    width: initialWidth = canvas?.width, height: initialHeight = canvas?.height,
+    width: initialWidth = canvas?.width, height: initialHeight = canvas?.height, srgbView = true,
   } = options;
+  if (typeof srgbView !== 'boolean') fail('OPTIONS', 'srgbView must be boolean');
   if (!['rgba8unorm', 'bgra8unorm'].includes(canvasFormat))
     fail('FORMAT', 'Canvas format must be rgba8unorm or bgra8unorm');
   if (![null, 'depth24plus', 'depth32float'].includes(depthFormat) || ![1, 4].includes(sampleCount))
@@ -50,7 +51,9 @@ export function createGpuCanvasTarget(device, canvas, options = {}) {
     return value;
   };
   dimension(initialWidth); dimension(initialHeight);
-  const format = `${canvasFormat}-srgb`;
+  // srgbView:false lends the plain 8-bit view; the renderer must then encode
+  // sRGB itself (shader-side transfer, WebGL-style encoded blending).
+  const format = srgbView ? `${canvasFormat}-srgb` : canvasFormat;
   const rendererOptions = Object.freeze({format, depthFormat, sampleCount});
   let context, configured = false, current = null, width = 0, height = 0;
   let disposed = false, terminal = null, busy = false, version = 0, frames = 0;
@@ -219,7 +222,7 @@ export function createGpuCanvasTarget(device, canvas, options = {}) {
       checked(() => {
         configured = true;
         context.configure({device, format: canvasFormat, usage: RENDER_ATTACHMENT,
-          alphaMode, colorSpace: 'srgb', viewFormats: [format]});
+          alphaMode, colorSpace: 'srgb', viewFormats: srgbView ? [format] : []});
       });
       resize(initialWidth, initialHeight);
     });

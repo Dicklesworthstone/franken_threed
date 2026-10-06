@@ -60,6 +60,7 @@ const BLEND_EQUATION_NAMES=[['AddEquation','add'],['SubtractEquation','subtract'
 // the r186 WebGPU renderer reports it and draws nothing (see render traversal).
 const topologyOf=object=>object.isPoints?'points':object.isLineSegments?'lines':object.isLine?'line-strip':'triangles';
 // Indexed line strips fix their index format in the native pipeline.
+const srgbEncode=rgb=>rgb.map(c=>c<=0.0031308?c*12.92:1.055*Math.pow(c,0.41666)-0.055);
 const stripSignature=(shape,topology)=>topology==='line-strip'&&shape.indexFormat?shape.signature+'|'+shape.indexFormat:shape.signature;
 const drawable=object=>object.isMesh||object.isPoints||(object.isLine&&!object.isLineLoop);
 
@@ -129,6 +130,7 @@ export async function createGpuThreeScene(device,scene,{
   for(const key of Object.keys(backgroundOptions))if(!['maxBytes','maxPixels','label'].includes(key))fail('OPTIONS',`Unsupported source background option: ${key}`);
   const backgroundEnabled=background!==null,maxBackgroundBytes=backgroundOptions.maxBytes??128*1024*1024;
   integer(maxBackgroundBytes,1,Number.MAX_SAFE_INTEGER,'background budget');
+  if(backgroundEnabled&&renderOptions.outputTransfer==='srgb')fail('OPTIONS','Texture background passes do not encode shader-side sRGB output');
   const backgroundApi=backgroundEnabled?await import('./three_background.mjs'):null;
   let backgroundOwner=null,pendingBackground=null,backgroundPasses=0,backgroundColorPasses=0;
   const sourceBackground=()=>scene.background!==null&&!scene.background?.isColor?scene.background:null;
@@ -913,7 +915,11 @@ export async function createGpuThreeScene(device,scene,{
         ...(clippingFrame?{clippingPlanes:clippingFrame.planes}:{})};
       if(fogEnabled)prepared.fog=fogFrame;
       if(environmentEnabled)prepared.environment=environmentFrame;
-      if(scene.background?.isColor){prepared.clearColor=rgba(scene.background);prepared.loadOp='clear';}
+      if(scene.background?.isColor){
+        prepared.clearColor=rgba(scene.background);prepared.loadOp='clear';
+        // Shader-side sRGB output: the attachment stores encoded values.
+        if(renderOptions.outputTransfer==='srgb')prepared.clearColor=[...srgbEncode(prepared.clearColor.slice(0,3)),1];
+      }
       if(shadowEnabled){
         prepared.shadow=null;
         if(shadowFrame){

@@ -1192,17 +1192,21 @@ export async function buildApplication(entryPath, outDir, options = {}) {
   }
 
   collectHtmlAssets(null, new Set(htmlFileName ? [htmlFileName] : []), true);
-  const rendererRoute = options.routeWebGPURenderer
-    ? await decideWebGPURendererRoute(resolvedEntryAbs, options.packageRootUrl)
-    : null;
+  const rendererRoute =
+    options.routeWebGPURenderer || options.routeWebGLRenderer
+      ? await decideRendererRoutes(resolvedEntryAbs, options.packageRootUrl, {
+          webgpu: Boolean(options.routeWebGPURenderer),
+          webgl: Boolean(options.routeWebGLRenderer),
+        })
+      : null;
   const bundleResult = await bundleWithRollup(resolvedEntryAbs, {
     packageRootUrl: options.packageRootUrl,
     retainedModuleUrls,
     specializeNumeric: options.specializeNumeric,
-    ...(rendererRoute?.routed ? { webgpuRendererRoute: { targetUrls: rendererRoute.targetUrls } } : {}),
+    ...(rendererRoute?.routed ? { rendererRoute: { targets: rendererRoute.targets } } : {}),
   });
   if (rendererRoute?.routed && bundleResult.routedRendererModules.length === 0) {
-    throw new Error("WebGPURenderer route was decided but no pinned three.webgpu.js import was substituted");
+    throw new Error("A renderer route was decided but no pinned three build import was substituted");
   }
   const emittedChunkNames = new Set(Object.keys(bundleResult.files));
   if (htmlFileName) emittedChunkNames.add(htmlFileName);
@@ -1287,6 +1291,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
             routed: rendererRoute.routed,
             reason: rendererRoute.reason,
             decisions: rendererRoute.decisions,
+            targets: rendererRoute.targets,
             substitutedModules: bundleResult.routedRendererModules ?? [],
           },
         }
@@ -1296,17 +1301,20 @@ export async function buildApplication(entryPath, outDir, options = {}) {
 
 /**
  * Build-time renderer route decision for the opt-in general new-backend
- * WebGPURenderer (three_renderer.mjs). The whole-application module graph and
- * the existing route decider choose; an application is substituted only when
- * every WebGPURenderer construction site routes to GENERAL_WEBGPU, no other
- * renderer constructor needs the exact backend, and every graph import of
- * three.webgpu.js is the admitted pinned build. Anything else keeps the
- * retained upstream components unchanged, with the reason recorded.
+ * renderers (three_renderer.mjs). The whole-application module graph and the
+ * existing route decider choose. A renderer class is substituted only when every
+ * construction site of it routes to GENERAL_WEBGPU, no construction anywhere needs
+ * the exact backend, and every graph import of its build file is the admitted
+ * pinned build. WebGLRenderer additionally requires that no application module
+ * reads GL-context state (capabilities/extensions/context attributes/loss), which
+ * this route cannot provide. Anything else keeps the retained upstream build
+ * unchanged, with the reason recorded.
  */
-async function decideWebGPURendererRoute(entryAbs, packageRootUrl) {
+async function decideRendererRoutes(entryAbs, packageRootUrl, enabled) {
   const graph = await buildModuleGraph(entryAbs, { packageRootUrl });
   const decisions = evaluateGraphRoutes(graph, decideRendererRoute, {
-    generalWebGPUAvailable: true,
+    generalWebGPUAvailable: enabled.webgpu,
+    generalWebGLAvailable: enabled.webgl,
     hostCapabilities: { hasWebGPU: true, hasWebGL: true },
   }).map(({ moduleId, constructorName, decision }) => ({
     moduleId,
@@ -1315,15 +1323,59 @@ async function decideWebGPURendererRoute(entryAbs, packageRootUrl) {
     reasons: [...decision.reasons],
     sourceSpan: decision.sourceSpan,
   }));
-  const targetUrls = Object.keys(graph.modules)
-    .filter((id) => id.startsWith("file:"))
-    .filter((id) => /\/build\/three\.webgpu\.js$/.test(new URL(id).pathname));
-  const webgpu = decisions.filter((d) => d.constructorName === "WebGPURenderer");
-  let reason = "routed";
-  if (webgpu.length === 0) reason = "no-webgpu-renderer-construction";
-  else if (webgpu.some((d) => d.route !== "general-webgpu")) reason = "construction-site-not-general-webgpu";
-  else if (decisions.some((d) => d.route === "exact-backend")) reason = "exact-backend-renderer-present";
-  else if (targetUrls.length === 0) reason = "no-three-webgpu-import";
-  else if (!targetUrls.every((id) => isInternalLibraryModule(id, packageRootUrl))) reason = "unpinned-three-webgpu-module";
-  return { routed: reason === "routed", reason, decisions, targetUrls };
+  const fileIds = Object.keys(graph.modules).filter((id) => id.startsWith("file:"));
+  const buildFile = (name) => fileIds.filter((id) => new URL(id).pathname.endsWith(`/build/${name}`));
+  const candidates = [
+    enabled.webgpu && { exportName: "WebGPURenderer", urls: buildFile("three.webgpu.js") },
+    enabled.webgl && { exportName: "WebGLRenderer", urls: buildFile("three.module.js") },
+  ].filter(Boolean);
+  const targets = [];
+  const reasons = [];
+  for (const { exportName, urls } of candidates) {
+    const gl = exportName === "WebGLRenderer";
+    const sites = decisions.filter((d) => d.constructorName === exportName);
+    let reason = null;
+    if (sites.length === 0) reason = gl ? "no-webgl-renderer-construction" : "no-webgpu-renderer-construction";
+    else if (sites.some((d) => d.route !== "general-webgpu")) reason = "construction-site-not-general-webgpu";
+    else if (decisions.some((d) => d.route === "exact-backend")) reason = "exact-backend-renderer-present";
+    else if (urls.length === 0) reason = gl ? "no-three-module-import" : "no-three-webgpu-import";
+    else if (!urls.every((id) => isInternalLibraryModule(id, packageRootUrl)))
+      reason = gl ? "unpinned-three-module" : "unpinned-three-webgpu-module";
+    else if (gl && readsGlContextState(graph, entryAbs, packageRootUrl)) reason = "gl-context-state-read";
+    if (reason) reasons.push(reason);
+    else for (const url of urls) targets.push({ url, exportName });
+  }
+  return { routed: targets.length > 0, reason: targets.length ? "routed" : reasons.join(","), decisions, targets };
+}
+
+const GL_CONTEXT_STATE = new Set(["capabilities", "extensions", "getContextAttributes", "forceContextLoss", "forceContextRestore"]);
+/** True when an application (non-pinned-library) module reads GL-context state. */
+function readsGlContextState(graph, entryAbs, packageRootUrl) {
+  const inline = new Map();
+  if (/\.html?$/.test(entryAbs)) {
+    const entryUrl = pathToFileURL(entryAbs).href;
+    for (const script of parseHtmlEntries(fs.readFileSync(entryAbs, "utf-8"), entryUrl).moduleScripts)
+      if (script.inlineContent !== null) inline.set(script.id, script.inlineContent);
+  }
+  for (const id of Object.keys(graph.modules)) {
+    if (!id.startsWith("file:") || isInternalLibraryModule(id, packageRootUrl)) continue;
+    // Pinned upstream addons are library code that receives the renderer
+    // explicitly; their own GL-specific paths are guarded inside upstream.
+    if (/\/upstream\/three\.js\/(examples\/jsm|src)\//.test(new URL(id).pathname)) continue;
+    let ast;
+    try {
+      const source = inline.get(id) ?? fs.readFileSync(fileURLToPath(id), "utf8");
+      ast = acorn.parse(source, { ecmaVersion: "latest", sourceType: "module" });
+    } catch {
+      return true; // Unparseable application code cannot be cleared.
+    }
+    let found = false;
+    walk.simple(ast, {
+      MemberExpression(node) {
+        if (!node.computed && GL_CONTEXT_STATE.has(node.property.name)) found = true;
+      },
+    });
+    if (found) return true;
+  }
+  return false;
 }

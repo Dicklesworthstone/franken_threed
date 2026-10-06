@@ -93,3 +93,42 @@ test("the unmodified H1 example (runtime forceWebGL choice) routes to the new ba
   const code = fs.readFileSync(path.join(out, "out", "inline_0.js"), "utf8");
   assert.ok(code.includes("exactBackend"));
 });
+
+const GL_PROGRAM = `import * as THREE from 'three/legacy';
+export const renderer = new THREE.WebGLRenderer({ antialias: false });
+export { THREE };
+`;
+test("WebGLRenderer apps route only when opted in and free of GL escapes or GL-state reads", async () => {
+  const plain = app(GL_PROGRAM);
+  const off = await buildApplication(plain.entry, plain.out, { routeWebGPURenderer: true });
+  assert.equal(off.rendererRoute.routed, false);
+  const on = app(GL_PROGRAM);
+  const r = await buildApplication(on.entry, on.out, { routeWebGLRenderer: true });
+  assert.equal(r.rendererRoute.routed, true);
+  assert.deepEqual(r.rendererRoute.substitutedModules, [pathToFileURL(path.join(upstreamBuild, "three.module.js")).href]);
+  assert.ok(r.rendererRoute.decisions[0].reasons.includes("general-webgl-surface-admitted"));
+  globalThis.document ??= { createElementNS: () => ({ width: 300, height: 150, style: {} }) };
+  const emitted = await import(pathToFileURL(path.join(on.out, "main.js")).href);
+  assert.equal(emitted.renderer.isWebGLRenderer, true);
+  assert.equal(emitted.renderer.isF3DRenderer, true);
+  assert.throws(() => emitted.renderer.capabilities, { code: "F3D_RENDERER_UNSUPPORTED" });
+  assert.throws(() => emitted.renderer.getContext(), { code: "F3D_RENDERER_UNSUPPORTED" });
+
+  for (const [body, reason] of [
+    [GL_PROGRAM + "export const aniso = renderer.capabilities.getMaxAnisotropy();", "gl-context-state-read"],
+    [GL_PROGRAM + "export const gl = renderer.getContext();", "construction-site-not-general-webgpu"],
+    [GL_PROGRAM + "export const ext = document.createElement('canvas').getContext('webgl2').getExtension('x');", "construction-site-not-general-webgpu"],
+  ]) {
+    const a = app(body);
+    const result = await buildApplication(a.entry, a.out, { routeWebGLRenderer: true });
+    assert.equal(result.rendererRoute.routed, false, body);
+    assert.equal(result.rendererRoute.reason, reason);
+  }
+});
+
+test("the unmodified H2 example routes its WebGLRenderer to the new backend", async () => {
+  const out = fs.mkdtempSync(path.join(tmpdir(), "f3d_route_h2_"));
+  const entry = path.resolve(upstreamBuild, "../examples/webgl_marchingcubes.html");
+  const result = await buildApplication(entry, path.join(out, "out"), { routeWebGLRenderer: true });
+  assert.equal(result.rendererRoute.routed, true);
+});

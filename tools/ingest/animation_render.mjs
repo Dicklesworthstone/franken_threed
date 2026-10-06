@@ -305,6 +305,13 @@ struct DrawInfo { clip_from_local: mat4x4<f32>, color: vec4<f32>, options: vec4<
   return vec4<f32>(draw_info.color.rgb, select(1.0, draw_info.color.a, draw_info.options.y > 0.0));
 }
 `;
+// r186 ColorSpaceFunctions sRGBTransferOETF, per component.
+const SRGB_OETF_WGSL = `
+fn f3d_srgb_oetf(c: vec3<f32>) -> vec3<f32> {
+  let low = c * 12.92;
+  let high = pow(max(c, vec3<f32>(0.0)), vec3<f32>(0.41666)) * 1.055 - vec3<f32>(0.055);
+  return select(high, low, c <= vec3<f32>(0.0031308));
+}`;
 // Equations: glTF 2.0 Appendix B and KHR_lights_punctual (Khronos).
 // https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#appendix-b-brdf-implementation
 // https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_lights_punctual
@@ -361,7 +368,11 @@ function surfaceShader(
   channelKey = 0,
   uvSlots = 8,
   premultipliedAlpha = false,
+  srgbOutput = false,
 ) {
+  // srgbOutput: encode in the shader (r186 sRGBTransferOETF) for a non-sRGB
+  // attachment, so fixed-function blending sees encoded values, as WebGL does.
+  const encode = value => srgbOutput ? `f3d_srgb_oetf(${value})` : value;
   const mappedMask = coordinateMask | (textureTransforms ? mapMask & ~(toon ? 2 : 0) : 0);
   const channel = slot => (channelKey >>> (slot * 2)) & 3;
   const sourceUv = slot => coordinateMask & (1 << slot) ? `uv_${slot}` : channel(slot) ? `uv${channel(slot)}` : "uv";
@@ -506,7 +517,7 @@ ${
 var<private> draw_info: DrawInfo;`
     : "@group(0) @binding(0) var<uniform> draw_info: DrawInfo;"
 }
-${declarations}${coated ? "\n@group(1) @binding(16) var<uniform> clearcoat_info: vec4<f32>;" : ""}
+${declarations}${coated ? "\n@group(1) @binding(16) var<uniform> clearcoat_info: vec4<f32>;" : ""}${srgbOutput && !depthOnly ? SRGB_OETF_WGSL : ""}
 ${lighting}${fogCode}${clippingCapacity ? animationClippingWgsl() : ""}
 struct VertexOutput {
   @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) color: vec4<f32>,${instanceStride ? `\n  @location(${mapMask & 256 ? 15 : coated ? 13 : 10}) @interpolate(flat) draw_index: u32,` : ""}
@@ -623,7 +634,7 @@ struct VertexOutput {
   }`
       : "let rgb = rgba.rgb;"
   }
-  ${toon ? "if (draw_info.options.x >= 0.0 && rgba.a < draw_info.options.x) { discard; }\n  " : ""}${clippingCapacity ? "if (animation_clipped(input.world)) { discard; }\n  " : ""}${depthOnly ? "" : (premultipliedAlpha ? "let output_alpha = select(1.0, rgba.a, draw_info.options.y > 0.0);\n  return vec4<f32>(" + (fogCode ? "apply_distance_fog(rgb, input.fog_depth)" : "rgb") + " * output_alpha, output_alpha);" : "return vec4<f32>(" + (fogCode ? "apply_distance_fog(rgb, input.fog_depth)" : "rgb") + ", select(1.0, rgba.a, draw_info.options.y > 0.0));")}
+  ${toon ? "if (draw_info.options.x >= 0.0 && rgba.a < draw_info.options.x) { discard; }\n  " : ""}${clippingCapacity ? "if (animation_clipped(input.world)) { discard; }\n  " : ""}${depthOnly ? "" : (premultipliedAlpha ? "let output_alpha = select(1.0, rgba.a, draw_info.options.y > 0.0);\n  return vec4<f32>(" + encode(fogCode ? "apply_distance_fog(rgb, input.fog_depth)" : "rgb") + " * output_alpha, output_alpha);" : "return vec4<f32>(" + encode(fogCode ? "apply_distance_fog(rgb, input.fog_depth)" : "rgb") + ", select(1.0, rgba.a, draw_info.options.y > 0.0));")}
 }
 `;
 }
@@ -918,8 +929,15 @@ export async function createGpuAnimationRenderer(
     maxMeshes = 1024,
     maxBytes = 64 * 1024 * 1024,
     label = "f3d-animation-draw",
+    outputTransfer = "linear",
   } = {},
 ) {
+  // 'srgb': shaders apply the sRGB OETF and write a non-sRGB 8-bit attachment,
+  // so blending operates on encoded values (the WebGL default-framebuffer model).
+  if (!["linear", "srgb"].includes(outputTransfer) ||
+      (outputTransfer === "srgb" && !["rgba8unorm", "bgra8unorm"].includes(format)))
+    fail("ANIMATION_RENDER_OPTIONS", "sRGB output transfer requires a non-sRGB 8-bit color attachment");
+  const srgbOutput = outputTransfer === "srgb";
   if (
     !device?.queue ||
     !device.limits ||
@@ -1298,7 +1316,7 @@ export async function createGpuAnimationRenderer(
     const module = device.createShaderModule({
       label,
       code:
-        raster?.premultipliedAlpha || textureTransforms || clipping || fog || nativeInstances || instancing || lit || attributes || format === null
+        srgbOutput || raster?.premultipliedAlpha || textureTransforms || clipping || fog || nativeInstances || instancing || lit || attributes || format === null
           ? surfaceShader(
               mapMask,
               lit,
@@ -1322,6 +1340,7 @@ export async function createGpuAnimationRenderer(
               Number(/channels-(\d+)-/.exec(variant)?.[1] ?? 0),
               uvSlots,
               raster?.premultipliedAlpha ?? false,
+              srgbOutput,
             )
           : ANIMATION_RENDER_WGSL,
     });
