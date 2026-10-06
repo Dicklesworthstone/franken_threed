@@ -396,6 +396,32 @@ export const scenarios = {
     scene.add(floor, knot, ball, sun, spot, spot.target, new THREE.AmbientLight(0xffffff, 0.2));
     return { scene, camera: camera(THREE, [0, 1.2, 3.4]) };
   },
+  // r186 WebGLBackground meshes on the program route: a cube background with
+  // rotation/intensity behind an envMapped sphere, and (second scenario) a 2D
+  // texture background with a uv transform.
+  shaderlib_background_cube(THREE) {
+    const scene = new THREE.Scene();
+    const face = (r, g, b) => {
+      const n = 32, d = new Uint8Array(n * n * 4);
+      for (let i = 0; i < n * n; i++) { const k = ((i % n >> 2) + (i >> 7)) % 2 ? 1 : 0.4; d.set([r * k, g * k, b * k, 255], i * 4); }
+      const t = new THREE.DataTexture(d, n, n); t.needsUpdate = true; return t;
+    };
+    const cube = new THREE.CubeTexture([face(255, 90, 90), face(90, 255, 90), face(90, 90, 255), face(255, 255, 90), face(90, 255, 255), face(255, 90, 255)]);
+    cube.colorSpace = THREE.SRGBColorSpace; cube.needsUpdate = true;
+    scene.background = cube; scene.backgroundIntensity = 0.8; scene.backgroundRotation.set(0.2, 0.6, 0);
+    scene.add(new THREE.Mesh(new THREE.SphereGeometry(0.7, 48, 24), new THREE.MeshBasicMaterial({ envMap: cube })));
+    return { scene, camera: camera(THREE, [0.6, 0.4, 3]) };
+  },
+  shaderlib_background_texture(THREE) {
+    const scene = new THREE.Scene();
+    const n = 64, d = new Uint8Array(n * n * 4);
+    for (let i = 0; i < n * n; i++) { const x = i % n, y = i >> 6; d.set([x * 4, y * 4, ((x >> 3) + (y >> 3)) % 2 ? 220 : 40, 255], i * 4); }
+    const t = new THREE.DataTexture(d, n, n); t.colorSpace = THREE.SRGBColorSpace; t.repeat.set(2, 1); t.wrapS = THREE.RepeatWrapping; t.needsUpdate = true;
+    scene.background = t;
+    const box = new THREE.Mesh(new THREE.BoxGeometry(0.8, 0.8, 0.8), new THREE.MeshNormalMaterial()); box.rotation.set(0.4, 0.6, 0);
+    scene.add(box);
+    return { scene, camera: camera(THREE, [0, 0, 3]) };
+  },
   // MeshPhysicalMaterial extensions via ShaderLib programs (WebGL surface), and a
   // nearest-sampled float32 DataTexture read by a ShaderMaterial.
   shaderlib_physical(THREE) {

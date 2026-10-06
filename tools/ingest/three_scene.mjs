@@ -129,7 +129,10 @@ export async function createGpuThreeScene(device,scene,{
   if(background!==null&&(!background||typeof background!=='object'||Array.isArray(background)))fail('OPTIONS','Expected background options or null');
   const backgroundOptions=Object.freeze({...background});
   for(const key of Object.keys(backgroundOptions))if(!['maxBytes','maxPixels','label'].includes(key))fail('OPTIONS',`Unsupported source background option: ${key}`);
-  const backgroundEnabled=background!==null,maxBackgroundBytes=backgroundOptions.maxBytes??128*1024*1024;
+  // WebGL surface (shader-encoded output with program support): texture
+  // backgrounds are r186 WebGLBackground meshes drawn as programs.
+  const programBackgroundOwned=background!==null&&renderOptions.outputTransfer==='srgb'&&!!programSupport;
+  const backgroundEnabled=background!==null&&!programBackgroundOwned,maxBackgroundBytes=backgroundOptions.maxBytes??128*1024*1024;
   integer(maxBackgroundBytes,1,Number.MAX_SAFE_INTEGER,'background budget');
   if(backgroundEnabled&&renderOptions.outputTransfer==='srgb')fail('OPTIONS','Texture background passes do not encode shader-side sRGB output');
   const backgroundApi=backgroundEnabled?await import('./three_background.mjs'):null;
@@ -278,7 +281,7 @@ export async function createGpuThreeScene(device,scene,{
         if(shadowBlend==='reject'&&source.some(m=>m?.transparent))fail('SHADOW','BLEND casters require the explicit shadow.blend:skip policy');
       }
     }
-    if((!fogEnabled&&scene.fog!==null)||(!environmentEnabled&&scene.environment!==null)||(!backgroundEnabled&&sourceBackground()!==null))
+    if((!fogEnabled&&scene.fog!==null)||(!environmentEnabled&&scene.environment!==null)||(!backgroundEnabled&&!programBackgroundOwned&&sourceBackground()!==null))
       fail('SCENE','Enable source fog:{}, environment:{} or background:{} for the corresponding source effect');
     if(backgroundEnabled&&sourceBackground()!==null){
       backgroundApi.inspectThreeBackground(sourceBackground(),three,backgroundOptions);
@@ -420,7 +423,8 @@ export async function createGpuThreeScene(device,scene,{
     // Lambert/Phong carry their own envMap. Admitted: raw cube reflection/refraction maps.
     const environment=(m.isMeshLambertMaterial||m.isMeshPhongMaterial||m.isMeshStandardMaterial)?scene.environment:null;
     const usePMREM=m.isMeshStandardMaterial||(m.isMeshLambertMaterial&&!m.envMap)||(m.isMeshPhongMaterial&&!m.envMap);
-    const source=m.isShaderMaterial?null:(m.envMap||environment);
+    // ShaderMaterial: material.envMap when it defines one (WebGLBackground's box).
+    const source=m.isShaderMaterial?(m.envMap??null):(m.envMap||environment);
     if(!source)return {envMap:null,envMapRotation:m.envMapRotation};
     const envMapRotation=m.envMap?m.envMapRotation:scene.environmentRotation;
     if(usePMREM){
@@ -435,6 +439,7 @@ export async function createGpuThreeScene(device,scene,{
       // Incomplete or still loading: r186 renders without the environment.
       return {envMap:null,envMapRotation};
     }
+    if(source.mapping===three.CubeUVReflectionMapping&&pmremOwner?.binding(source))return {envMap:source,envMapRotation};
     if(!source.isCubeTexture||![three.CubeReflectionMapping,three.CubeRefractionMapping].includes(source.mapping))
       fail('TEXTURE','Equirectangular/render-target environment maps need cube conversion, not admitted yet');
     return {envMap:source,envMapRotation};
@@ -449,6 +454,61 @@ export async function createGpuThreeScene(device,scene,{
   // WebGLClipping inputs for programs: the source Plane objects, not snapshots.
   const programClippingControls=()=>clippingEnabled?{planes:clippingValue(clipping,'planes',[]),localClippingEnabled:clippingValue(clipping,'localClippingEnabled',false)===true}:null;
   const pmrem=()=>pmremOwner??=(programSupport.createPMREM?.(device,t=>textureBinding(t))??fail('MATERIAL','PMREM environments need the program PMREM owner'));
+  // r186 WebGLBackground.addToRenderList on the program route: the same
+  // plane/box meshes and ShaderLib background programs, drawn first.
+  const programBackgroundMeshes={plane:null,box:null};
+  let bgRotation=null,bgFlip=null;
+  function programBackground(){
+    if(!programBackgroundOwned)return null;
+    bgRotation??=new three.Matrix4();bgFlip??=new three.Matrix3().set(-1,0,0,0,1,0,0,0,1);
+    let background=scene.background;
+    if(!background?.isTexture)return null;
+    if(scene.backgroundBlurriness>0){
+      // WebGLEnvironments.get(background, usePMREM = true)
+      const r=pmrem().lookup(background);
+      if(r.state==='ready')background=r.texture;
+      else if(r.state==='direct'){}
+      else{
+        if(r.state==='needed'){
+          if(textureScan){pmremRequests.add(background);textureBinding(background);}
+          else if(!pendingTextures.has(background))fail('PREPARE','A PMREM background source is complete; prepare() generates it');
+        }
+        return null;
+      }
+    }else if(background.mapping===three.EquirectangularReflectionMapping||background.mapping===three.EquirectangularRefractionMapping)
+      fail('TEXTURE','Equirectangular backgrounds need WebGLCubeRenderTarget conversion, not admitted yet');
+    const ShaderLib=three.ShaderLib,toneMapped=three.ColorManagement.getTransfer(background.colorSpace)!==three.SRGBTransfer;
+    if(background.isCubeTexture||background.mapping===three.CubeUVReflectionMapping){
+      let box=programBackgroundMeshes.box;
+      if(!box){
+        box=new three.Mesh(new three.BoxGeometry(1,1,1),new three.ShaderMaterial({name:'BackgroundCubeMaterial',uniforms:three.UniformsUtils.clone(ShaderLib.backgroundCube.uniforms),
+          vertexShader:ShaderLib.backgroundCube.vertexShader,fragmentShader:ShaderLib.backgroundCube.fragmentShader,side:three.BackSide,depthTest:false,depthWrite:false,fog:false,allowOverride:false}));
+        box.geometry.deleteAttribute('normal');box.geometry.deleteAttribute('uv');
+        box.onBeforeRender=function(renderer,scene,camera){this.matrixWorld.copyPosition(camera.matrixWorld);};
+        Object.defineProperty(box.material,'envMap',{get(){return this.uniforms.envMap.value;}});
+        programBackgroundMeshes.box=box;
+      }
+      const u=box.material.uniforms;
+      u.envMap.value=background;u.backgroundBlurriness.value=scene.backgroundBlurriness;u.backgroundIntensity.value=scene.backgroundIntensity;
+      u.backgroundRotation.value.setFromMatrix4(bgRotation.makeRotationFromEuler(scene.backgroundRotation)).transpose();
+      if(background.isCubeTexture&&background.isRenderTargetTexture===false)u.backgroundRotation.value.premultiply(bgFlip);
+      box.material.toneMapped=toneMapped;box.layers.enableAll();
+      return box;
+    }
+    let plane=programBackgroundMeshes.plane;
+    if(!plane){
+      plane=new three.Mesh(new three.PlaneGeometry(2,2),new three.ShaderMaterial({name:'BackgroundMaterial',uniforms:three.UniformsUtils.clone(ShaderLib.background.uniforms),
+        vertexShader:ShaderLib.background.vertexShader,fragmentShader:ShaderLib.background.fragmentShader,side:three.FrontSide,depthTest:false,depthWrite:false,fog:false,allowOverride:false}));
+      plane.geometry.deleteAttribute('normal');
+      Object.defineProperty(plane.material,'map',{get(){return this.uniforms.t2D.value;}});
+      programBackgroundMeshes.plane=plane;
+    }
+    const u=plane.material.uniforms;
+    u.t2D.value=background;u.backgroundIntensity.value=scene.backgroundIntensity;plane.material.toneMapped=toneMapped;
+    if(background.matrixAutoUpdate===true)background.updateMatrix();
+    u.uvTransform.value.copy(background.matrix);plane.layers.enableAll();
+    return plane;
+  }
   function programDescription(m,topology,object){
     if(!programRoute())fail('MATERIAL',`Unsupported source material: ${m?.type}`);
     if(!object)fail('MATERIAL','Program materials need their object for program assembly');
@@ -728,6 +788,8 @@ export async function createGpuThreeScene(device,scene,{
         }
       }
     }
+    const bg=programBackground();
+    if(bg)for(const desc of get(bg.material,'triangles',bg))out.push({key:programKeyOf(bg),geometry:bg.geometry,instanceSource:null,instanceSignature:null,deformationSource:null,material:bg.material,desc,programSource:programSource(bg)});
     if(usedGeometry.size>maxGeometries||usedInstances.size>maxInstanceMeshes||out.length>maxBindings)fail('LIMIT','Source geometry/instance/material binding capacity exceeded');
     return out;
   }
@@ -1138,6 +1200,15 @@ export async function createGpuThreeScene(device,scene,{
         const order=(a,b)=>a.groupOrder-b.groupOrder||a.object.renderOrder-b.object.renderOrder;
         opaque.sort((a,b)=>order(a,b)||a.listMaterial.id-b.listMaterial.id||a.z-b.z||a.object.id-b.object.id);
         transparent.sort((a,b)=>order(a,b)||b.z-a.z||a.object.id-b.object.id);
+      }
+      // WebGLBackground.addToRenderList: after sorting, the background mesh leads.
+      const bg=programBackground();
+      if(bg){
+        const desc=get(bg.material,'triangles',bg),records=lookup.get(programKeyOf(bg))?.get(bg.material);
+        const bindings=desc.map(d=>records?.find(e=>!e.mesh.disposed&&e.programGeometry&&same(e.structural,d.structural)));
+        if(bindings.some(e=>!e))fail('PREPARE','Call prepare() after changing the source background');
+        bg.onBeforeRender(shadowRenderer(),scene,camera,bg.geometry,bg.material,null);
+        opaque.unshift({object:bg,geometry:bg.geometry,material:bg.material,listMaterial:bg.material,group:null,groupOrder:0,z:0,desc,bindings,shadowPass:false,program:true});
       }
       const items=[...opaque,...transparent],draws=[];
       if(items.reduce((n,item)=>n+item.bindings.length,0)>(renderOptions.maxDraws??1024))fail('LIMIT','Expanded source draws exceed capacity');

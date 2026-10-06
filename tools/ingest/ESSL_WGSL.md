@@ -172,6 +172,18 @@ targets (GL ignores it on single-sampled ones). Scenario `shaderlib_clipping`
 matches upstream WebGLRenderer exactly (0 differing pixels);
 `webgl_clipping`, `webgl_clipping_advanced`, `webgl_clipping_intersection` run.
 
+Backgrounds: on the WebGL surface, texture backgrounds are r186
+`WebGLBackground.addToRenderList` meshes drawn as programs (the plane with
+`ShaderLib.background` for 2D textures; the camera-centred box with
+`ShaderLib.backgroundCube` for cube and cube-UV textures, PMREM-blurred when
+`backgroundBlurriness > 0`), unshifted ahead of the sorted opaque list, with
+intensity/rotation/uvTransform and `toneMapped` from the texture's color space.
+Scenarios `shaderlib_background_cube` / `shaderlib_background_texture` match
+upstream WebGLRenderer (0.06% / 0% of pixels differ); `webgl_materials_envmaps`,
+`webgl_materials_cubemap`, `webgl_materials_cubemap_refraction`,
+`webgl_materials_blending`, `webgl_effects_stereo` run. Equirectangular
+backgrounds without blur need `WebGLCubeRenderTarget` conversion (explicit error).
+
 Not admitted yet (explicit errors): transmission (needs its render target),
 render-target PMREM sources (`pmremVersion`), pre-filtered cube-UV textures
 supplied directly, Sprite materials.
