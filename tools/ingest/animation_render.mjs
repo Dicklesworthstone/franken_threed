@@ -187,11 +187,18 @@
  * The bounded 256-byte UV tail follows clipping, with no shared mutable map
  * uniform and no vertex repacking. See ANIMATION_UV.md for the full contract.
  *
+ * alphaMaps:true admits alphaTexture on every shading profile, including depth.
+ * Its GREEN channel multiplies base/color-map/vertex opacity before alpha test
+ * and blending, never RGB. The optional ninth map supports independent UVs and
+ * live transforms; textureTransforms adds 32 packet bytes only in this profile.
+ * alphaTest:true also permits tested BLEND materials; alphaCutoff stays live.
+ * This does not add stochastic alpha, alpha-to-coverage or translucent shadows.
+ *
  * Host validation finishes before GPU writes. Driver errors are terminal, not
  * rollbackable. version acknowledges submission, not completion: await whenIdle()
  * for cumulative draw/deformation validation, OOM and device-loss errors.
  */
-import {ANIMATION_UV_BYTES, ANIMATION_UV_FIELDS, snapshotAnimationMapTransforms,
+import {animationUvBytes, animationUvFields, snapshotAnimationMapTransforms,
   animationMapChannelKey, packAnimationMapTransforms} from "./animation_uv.mjs";
 import {animationClippingBytes, animationClippingFields, animationClippingWgsl,
   snapshotAnimationClipping, packAnimationClipping} from "./animation_clipping.mjs";
@@ -235,6 +242,7 @@ const MAP_FIELDS = Object.freeze([
   "clearcoatTexture",
   "clearcoatRoughnessTexture",
   "clearcoatNormalTexture",
+  "alphaTexture",
 ]);
 // The exclusive Phong specular map shares slot 1 with the PBR parameter map.
 // No dummy textures, additional bindings or larger per-draw arena are needed.
@@ -248,7 +256,7 @@ const COAT_FIELDS = Object.freeze([
   "clearcoatRoughnessFactor",
   "clearcoatNormalScale",
 ]);
-const COAT_LAYOUT = 256,
+const COAT_LAYOUT = 512,
   COAT_BYTES = 16;
 const MAP_NAMES = Object.freeze([
   "color",
@@ -259,6 +267,7 @@ const MAP_NAMES = Object.freeze([
   "clearcoat",
   "clearcoat_roughness",
   "clearcoat_normal",
+  "alpha",
 ]);
 const mapMaskFor = (variant) =>
   variant.includes("maps-")
@@ -267,7 +276,10 @@ const mapMaskFor = (variant) =>
       ? 1
       : 0;
 const coordinateMaskFor = (variant) => Number(/uv-(\d+)-/.exec(variant)?.[1] ?? 0);
-const mapSlots = (mask) => [0, 1, 2, 3, 4, 5, 6, 7].filter((slot) => mask & (1 << slot));
+const mapSlots = (mask) => [0, 1, 2, 3, 4, 5, 6, 7, 8].filter((slot) => mask & (1 << slot));
+// Binding 16 belongs to the existing clearcoat uniform. The optional alpha
+// sampler/view use 17/18, so coating and opacity never alias a resource slot.
+const mapBinding = slot => slot * 2 + Number(slot >= 8);
 const lightingVariant = (variant, shadowed, environmentLit) =>
   variant.replace(
     /^lit-/,
@@ -338,6 +350,7 @@ function surfaceShader(
   clippingCapacity = 0,
   textureTransforms = false,
   channelKey = 0,
+  uvSlots = 8,
 ) {
   const mappedMask = coordinateMask | (textureTransforms ? mapMask & ~(toon ? 2 : 0) : 0);
   const channel = slot => (channelKey >>> (slot * 2)) & 3;
@@ -361,7 +374,7 @@ function surfaceShader(
   const declarations = mapSlots(mapMask)
     .map(
       (slot) =>
-        `@group(1) @binding(${slot * 2}) var ${names[slot]}_sampler: sampler;\n@group(1) @binding(${slot * 2 + 1}) var ${names[slot]}_texture: texture_2d<f32>;`,
+        `@group(1) @binding(${mapBinding(slot)}) var ${names[slot]}_sampler: sampler;\n@group(1) @binding(${mapBinding(slot) + 1}) var ${names[slot]}_texture: texture_2d<f32>;`,
     )
     .join("\n");
   const coordinates = (slot) => (mappedMask & (1 << slot) ? `input.uv_${slot}` : "input.uv");
@@ -474,7 +487,7 @@ fn illuminate(base: vec3<f32>, position: vec3<f32>, normal: vec3<f32>, metallic:
   return /* wgsl */ `
 ${phong ? "// Matrix padding at words 51/55/59: AO strength, specular G, specular B.\nstruct PhongNormal { x: vec3<f32>, strength: f32, y: vec3<f32>, specular_g: f32, z: vec3<f32>, specular_b: f32 }\n" : occluded ? "// Same 48-byte layout as mat3x3; the first column padding holds material strength.\nstruct OcclusionNormal { x: vec3<f32>, strength: f32, y: vec3<f32>, pad0: f32, z: vec3<f32>, pad1: f32 }\n" : ""}struct DrawInfo {
   clip_from_local: mat4x4<f32>, color: vec4<f32>, options: vec4<f32>, uv_x: vec4<f32>, uv_y: vec4<f32>,
-  world_from_local: mat4x4<f32>, normal_from_local: ${phong ? "PhongNormal" : occluded ? "OcclusionNormal" : "mat3x3<f32>"}, emission_roughness: vec4<f32>${clippingCapacity ? animationClippingFields(clippingCapacity) : ""}${textureTransforms ? ANIMATION_UV_FIELDS : ""}
+  world_from_local: mat4x4<f32>, normal_from_local: ${phong ? "PhongNormal" : occluded ? "OcclusionNormal" : "mat3x3<f32>"}, emission_roughness: vec4<f32>${clippingCapacity ? animationClippingFields(clippingCapacity) : ""}${textureTransforms ? animationUvFields(uvSlots) : ""}
 }
 ${
   instanceStride
@@ -486,7 +499,7 @@ var<private> draw_info: DrawInfo;`
 ${declarations}${coated ? "\n@group(1) @binding(16) var<uniform> clearcoat_info: vec4<f32>;" : ""}
 ${lighting}${fogCode}${clippingCapacity ? animationClippingWgsl() : ""}
 struct VertexOutput {
-  @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) color: vec4<f32>,${instanceStride ? `\n  @location(${coated ? 13 : 10}) @interpolate(flat) draw_index: u32,` : ""}
+  @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) color: vec4<f32>,${instanceStride ? `\n  @location(${mapMask & 256 ? 15 : coated ? 13 : 10}) @interpolate(flat) draw_index: u32,` : ""}
   ${lit || clippingCapacity ? "@location(2) world: vec3<f32>," : ""}${lit ? " @location(3) normal: vec3<f32>," : ""}
   ${tangentAttribute ? "@location(4) tangent: vec4<f32>," : ""}${fogCode ? "\n  @location(14) fog_depth: f32," : ""}
   ${mapSlots(mappedMask)
@@ -539,7 +552,7 @@ struct VertexOutput {
   let coat_uv_dy = dpdy(${coordinates(7)});`
       : ""
   }
-  let rgba = draw_info.color * input.color ${mapMask & 1 ? "* color_texel" : ""};
+  ${mapMask & 256 ? "var" : "let"} rgba = draw_info.color * input.color ${mapMask & 1 ? "* color_texel" : ""};${mapMask & 256 ? "\n  // Three r186 alpha maps modulate opacity with GREEN, never RGB or texture alpha.\n  rgba.a *= alpha_texel.g;" : ""}
   ${toon ? "// Toon derivatives run before alpha discard, including instanced MASK draws." : "if (draw_info.options.x >= 0.0 && rgba.a < draw_info.options.x) { discard; }"}
   ${
     lit
@@ -885,6 +898,7 @@ export async function createGpuAnimationRenderer(
     clipping = false,
     maxClippingPlanes = 8,
     textureTransforms = false,
+    alphaMaps = false,
     indirectLights = false,
     threeLights = false,
     instancing = false,
@@ -944,8 +958,11 @@ export async function createGpuAnimationRenderer(
   const clippingBytes = animationClippingBytes(maxClippingPlanes);
   if (typeof textureTransforms !== "boolean")
     fail("ANIMATION_RENDER_OPTIONS", "textureTransforms must be boolean");
+  if (typeof alphaMaps !== "boolean")
+    fail("ANIMATION_RENDER_OPTIONS", "alphaMaps must be boolean");
+  const uvSlots = alphaMaps ? 9 : 8;
   const uvOffset = UNIFORM_BYTES + (clipping ? clippingBytes : 0);
-  const packetBytes = uvOffset + (textureTransforms ? ANIMATION_UV_BYTES : 0);
+  const packetBytes = uvOffset + (textureTransforms ? animationUvBytes(uvSlots) : 0);
   const limits = device.limits;
   const limit = (name, needed) => {
     if (!Number.isSafeInteger(limits[name]) || limits[name] < needed)
@@ -1230,9 +1247,9 @@ export async function createGpuAnimationRenderer(
             label,
             entries: [
               ...slots.flatMap((slot) => [
-                { binding: slot * 2, visibility: FRAGMENT_STAGE, sampler: { type: "filtering" } },
+                { binding: mapBinding(slot), visibility: FRAGMENT_STAGE, sampler: { type: "filtering" } },
                 {
-                  binding: slot * 2 + 1,
+                  binding: mapBinding(slot) + 1,
                   visibility: FRAGMENT_STAGE,
                   texture: { sampleType: "float", viewDimension: "2d", multisampled: false },
                 },
@@ -1283,6 +1300,7 @@ export async function createGpuAnimationRenderer(
               clipping ? maxClippingPlanes : 0,
               textureTransforms,
               Number(/channels-(\d+)-/.exec(variant)?.[1] ?? 0),
+              uvSlots,
             )
           : ANIMATION_RENDER_WGSL,
     });
@@ -1570,6 +1588,7 @@ export async function createGpuAnimationRenderer(
         "colorWrite",
         "alphaMode",
         "alphaCutoff",
+        "alphaTest",
         "texCoords",
         "vertexColors",
         "mapCoordinates",
@@ -1615,6 +1634,11 @@ export async function createGpuAnimationRenderer(
       alphaMode = "OPAQUE",
       alphaCutoff = 0.5,
     } = options;
+    const alphaTest = options.alphaTest === undefined ? alphaMode === "MASK" : options.alphaTest;
+    if (typeof alphaTest !== "boolean" || (alphaMode === "MASK" && !alphaTest))
+      fail("ANIMATION_RENDER_OPTIONS", "MASK requires alpha testing; alphaTest must be boolean");
+    if (options.alphaTexture !== undefined && !alphaMaps)
+      fail("ANIMATION_RENDER_OPTIONS", "Enable alphaMaps before supplying an opacity texture");
     const side = options.side ?? (doubleSided ? "double" : "front");
     if (options.side === null || !["front", "back", "double"].includes(side) ||
         (options.side !== undefined && options.doubleSided !== undefined))
@@ -1698,6 +1722,7 @@ export async function createGpuAnimationRenderer(
       (flat || !(mutable ? mutable.channels.tangent : gpu.vertexLayout.attributes.some(
         (a) => a.shaderLocation === 2 && a.offset === 24 && a.format === "float32x4",
       )));
+    if (mapMask & 256) limit("maxBindingsPerBindGroup", 19);
     if (mapMask) {
       limit("maxBindGroups", lit ? 3 : 2);
       limit("maxSamplersPerShaderStage", mapSlots(mapMask).length);
@@ -1785,8 +1810,8 @@ export async function createGpuAnimationRenderer(
         : "plain";
     if (!textureTransforms && (options.mapTransforms !== undefined || options.mapChannels !== undefined))
       fail("ANIMATION_RENDER_OPTIONS", "Enable textureTransforms before supplying map transforms/channels");
-    const mapDefaults = textureTransforms ? snapshotAnimationMapTransforms(options.mapTransforms, mapFields, mapMask, toon ? 2 : 0) : null;
-    const channelKey = textureTransforms ? animationMapChannelKey(options.mapChannels, mapFields, mapMask, mutable?.channels, toon ? 2 : 0) : 0;
+    const mapDefaults = textureTransforms ? snapshotAnimationMapTransforms(options.mapTransforms, mapFields, mapMask, toon ? 2 : 0, uvSlots) : null;
+    const channelKey = textureTransforms ? animationMapChannelKey(options.mapChannels, mapFields, mapMask, mutable?.channels, toon ? 2 : 0, uvSlots) : 0;
     const coordinateInput = options.mapCoordinates ?? {};
     keys(coordinateInput, mapFields, "map coordinates");
     const coordinates = [];
@@ -1807,6 +1832,7 @@ export async function createGpuAnimationRenderer(
         coordinates.push({ slot, values, transform: local });
       }
     const coordinateMask = coordinates.reduce((mask, entry) => mask | (1 << entry.slot), 0);
+    if (instancing && !instances && (mapMask & 256)) limit("maxInterStageShaderVariables", 16);
     if (textureTransforms && (mapMask & ~(toon ? 2 : 0)))
       limit("maxInterStageShaderVariables", 6 + mapSlots(mapMask & ~(toon ? 2 : 0)).at(-1));
     if (coordinates.length) {
@@ -1857,8 +1883,8 @@ export async function createGpuAnimationRenderer(
       limit("maxVertexBuffers", 2);
       limit("maxVertexAttributes", 5);
       const bytes = gpu.vertexCount * surfaceWords * 4;
-      limit("maxVertexBufferArrayStride", surfaceWords * 4);
       limit("maxBufferSize", bytes);
+      limit("maxVertexBufferArrayStride", surfaceWords * 4);
       if (
         (instancing ? 0 : allocatedBytes) +
           (data?.byteLength ?? 0) +
@@ -1995,8 +2021,8 @@ export async function createGpuAnimationRenderer(
                 layout: textureLayouts.get(layoutKey),
                 entries: [
                   ...mapSlots(mapMask).flatMap((slot) => [
-                    { binding: slot * 2, resource: textures[slot].sampler },
-                    { binding: slot * 2 + 1, resource: textures[slot].view },
+                    { binding: mapBinding(slot), resource: textures[slot].sampler },
+                    { binding: mapBinding(slot) + 1, resource: textures[slot].view },
                   ]),
                   ...(coated
                     ? [{ binding: 16, resource: { buffer: coatBuffer, size: COAT_BYTES } }]
@@ -2032,6 +2058,7 @@ export async function createGpuAnimationRenderer(
         doubleSided: side === "double",
         alphaMode,
         alphaCutoff,
+        alphaTest,
         extent,
         indexBuffer,
         indexFormat,
@@ -2309,16 +2336,16 @@ export async function createGpuAnimationRenderer(
           fail("ANIMATION_RENDER_OPTIONS", "Enable clipping before supplying draw planes");
         }
         staged.set(rgba, offset + 16);
-        if (input.alphaCutoff !== undefined && record.alphaMode !== "MASK")
-          fail("ANIMATION_RENDER_OPTIONS", "Alpha cutoff override requires MASK shading");
+        if (input.alphaCutoff !== undefined && !record.alphaTest)
+          fail("ANIMATION_RENDER_OPTIONS", "Alpha cutoff override requires alpha testing");
         const cutoff = finite(input.alphaCutoff ?? record.alphaCutoff, "Alpha cutoff");
         if (cutoff < 0 || cutoff > 1) fail("ANIMATION_RENDER_VALUE", "Alpha cutoff must be in [0,1]");
-        staged[offset + 20] = record.alphaMode === "MASK" ? cutoff : -1;
+        staged[offset + 20] = record.alphaTest ? cutoff : -1;
         staged[offset + 21] = record.alphaMode === "BLEND" ? 1 : 0;
         const uv = uvTransform(input.uvTransform ?? record.transform);
         staged.set([uv[0], uv[2], uv[4], 0, uv[1], uv[3], uv[5], 0], offset + 24);
         if (textureTransforms) {
-          const overrides = snapshotAnimationMapTransforms(input.mapTransforms, record.mapFields, record.mapMask, record.uvExcluded);
+          const overrides = snapshotAnimationMapTransforms(input.mapTransforms, record.mapFields, record.mapMask, record.uvExcluded, uvSlots);
           packAnimationMapTransforms(record.mapDefaults, overrides, uv, staged, offset + uvOffset / 4);
         } else if (input.mapTransforms !== undefined) {
           fail("ANIMATION_RENDER_OPTIONS", "Enable textureTransforms before supplying draw map transforms");
@@ -2605,6 +2632,7 @@ export async function createGpuAnimationRenderer(
     instancing,
     renderBundles,
     textureTransforms,
+    alphaMaps,
     get bundleDiagnostics() { return bundleCache?.diagnostics ?? null; },
     clearRenderBundles() {
       live();
