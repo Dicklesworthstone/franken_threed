@@ -144,6 +144,22 @@ test('decoded external copies preserve explicit flip, alpha and transfer/view ch
   }finally{if(prior===undefined)delete globalThis.ImageData;else globalThis.ImageData=prior;}
 });
 
+test('ImageBitmaps copy only under the decode-time profile both source renderers agree on',()=>{
+  const prior=globalThis.ImageBitmap;globalThis.ImageBitmap=class {constructor(w=2){this.width=w;this.height=w;}};
+  try{
+    const d=textureDevice(),p=pool(d),image=new ImageBitmap(),t=new T.Texture(image);t.needsUpdate=true;t.flipY=false;
+    p.prepare([t]);const copy=d.externalCopies[0];assert.equal(copy.source.source,image);assert.equal(copy.source.flipY,false);
+    assert.equal(copy.destination.premultipliedAlpha,false);
+    // Default Texture flipY=true is ignored by WebGL for bitmaps but applied by WebGPU: refuse.
+    for(const change of [x=>{x.flipY=true;},x=>{x.premultiplyAlpha=true;}]){
+      const u=new T.Texture(new ImageBitmap());u.flipY=false;change(u);u.needsUpdate=true;
+      assert.throws(()=>p.prepare([u]),{code:'THREE_TEXTURE_SOURCE'});
+    }
+    const closed=new T.Texture(new ImageBitmap(0));closed.flipY=false;closed.needsUpdate=true;assert.throws(()=>p.prepare([closed]));
+    p.dispose();
+  }finally{if(prior===undefined)delete globalThis.ImageBitmap;else globalThis.ImageBitmap=prior;}
+});
+
 for(const stage of ['textureError','viewError','samplerError','textureWriteError','mipError'])test(`native ${stage} retires all allocations`,async()=>{
   const d=textureDevice(),p=pool(d),t=make();t.generateMipmaps=true;const e=Error(stage);d[stage]=e;
   assert.throws(()=>p.prepare([t]),x=>x===e);assert.equal(p.failed,true);assert.equal(p.diagnostics.textureBytes,0);

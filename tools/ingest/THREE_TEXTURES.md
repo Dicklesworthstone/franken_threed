@@ -34,8 +34,12 @@ ImageData use WebGPU external-image copies with the requested flip and alpha
 premultiplication. This is the browser-managed **sRGB external-copy profile**,
 not an assertion of raw embedded-profile equivalence with every WebGL image
 upload. Wide-gamut/raw decode requirements can keep using caller-owned bindings.
-ImageBitmap flags are fixed at bitmap creation in WebGL; this owner refuses
-ImageBitmap rather than guessing those original options. Video, float, depth,
+ImageBitmap flags are fixed at bitmap creation in WebGL (r186 skips the unpack
+flip/premultiply state for bitmaps) while the r186 WebGPU backend applies them at
+copy time. This owner admits ImageBitmap only with `flipY=false` and
+`premultiplyAlpha=false`, the profile where both renderers agree (GLTFLoader's
+ImageBitmapLoader path); other flags are refused rather than guessing which
+renderer's behavior the application expected. Video, float, depth,
 cube/array/3D, render-target, external and compressed textures also retain their
 separate paths. These are implementation boundaries, not removed project goals.
 

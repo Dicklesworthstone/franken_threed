@@ -40,6 +40,7 @@ function nativeShadowClass(C, exported) {
  */
 export function inspectThreeShadow(light, three) {
   if (three?.REVISION !== '186') fail('SOURCE', 'Supply the pinned r186 module');
+  if (light?.isSunLight === true) return inspectSunShadow(light, three);
   const C = light?.isDirectionalLight ? three.DirectionalLight : light?.isSpotLight ? three.SpotLight : null;
   if (typeof C !== 'function' || !(light instanceof C))
     fail('LIGHT', 'Source shadows require a native directional or spot light');
@@ -66,6 +67,27 @@ export function inspectThreeShadow(light, three) {
   if (!Number.isSafeInteger(width * height * 4)) fail('LIMIT', 'Shadow extent overflows its byte budget');
   return Object.freeze({light, shadow, camera, width, height,
     signature: Object.freeze([light, shadow, camera, width, height])});
+}
+
+/** r186 SunLight (examples/jsm/lights): two orthographic cascades in a 2x1
+ * atlas, updated from the viewing camera every frame (SunLightShadow). */
+function inspectSunShadow(light, three) {
+  const shadow = light.shadow;
+  if (!(light instanceof three.Light) || shadow?.isSunLightShadow !== true || !(shadow instanceof three.LightShadow) ||
+      typeof shadow.getCamera !== 'function' || typeof shadow.getMatrix !== 'function' || !Array.isArray(shadow._cascadeData))
+    fail('LIGHT', 'Expected an r186 SunLight with its SunLightShadow');
+  if (shadow.getViewportCount() !== 2 || shadow._cascadeData.length !== 2 || shadow.biasNode != null)
+    fail('PROFILE', 'Expected the two-cascade r186 sun shadow');
+  for (const key of ['autoUpdate', 'needsUpdate']) if (typeof shadow[key] !== 'boolean') fail('VALUE', `Expected boolean shadow.${key}`);
+  if (Math.abs(finite(shadow.bias, 'shadow bias')) > 1 || finite(shadow.normalBias, 'normal bias') < 0 ||
+      finite(shadow.intensity, 'shadow intensity') < 0 || shadow.intensity > 1 || finite(shadow.radius, 'shadow radius') < 0)
+    fail('VALUE', 'Invalid source shadow factors');
+  const extents = shadow.getFrameExtents();
+  const tileWidth = positive(shadow.mapSize?.x, 'map width'), tileHeight = positive(shadow.mapSize?.y, 'map height');
+  const width = positive(tileWidth * extents.x, 'atlas width'), height = positive(tileHeight * extents.y, 'atlas height');
+  if (!Number.isSafeInteger(width * height * 4)) fail('LIMIT', 'Shadow extent overflows its byte budget');
+  return Object.freeze({light, shadow, camera: shadow.camera, width, height, sun: {tileWidth, tileHeight},
+    signature: Object.freeze([light, shadow, width, height])});
 }
 
 /** Borrow source camera/state; own only depth resources and caster bindings.
@@ -124,11 +146,34 @@ export async function createGpuThreeShadow(device, light, {three, maxBytes = 64 
       const mesh = await Promise.race([constructing, stopped]);
       try { check(); return mesh; } catch (error) { mesh.dispose(); throw error; }
     },
-    capture() {
+    capture(viewCamera) {
       check(); if (busy) fail('REENTRANT', 'Cannot capture during shadow submission');
       const {shadow, camera} = shape, update = shadow.autoUpdate || shadow.needsUpdate;
       if (!update && !snapshot) fail('UNRENDERED', 'A manual shadow needs needsUpdate=true before its first frame');
-      let viewProjection = null, frustum = null;
+      let viewProjection = null, frustum = null, cascades;
+      if (shape.sun) {
+        if (!(viewCamera instanceof three.Camera)) fail('CAMERA', 'Sun shadows follow the viewing camera');
+        // Cascades depend on the viewing camera: refit every frame, as upstream.
+        shadow.updateMatrices(light, viewCamera); check();
+        const {tileWidth, tileHeight} = shape.sun;
+        cascades = Object.freeze([0, 1].map(i => {
+          const c = shadow.getCamera(i), v = shadow.getViewport(i);
+          clip.multiplyMatrices(c.projectionMatrix, c.matrixWorldInverse);
+          if (c.coordinateSystem === three.WebGLCoordinateSystem)
+            for (let k = 0; k < 4; k++) clip.elements[k * 4 + 2] = 0.5 * (clip.elements[k * 4 + 2] + clip.elements[k * 4 + 3]);
+          // Top-left pixel rect of the tile, exactly as SunShadowNode.renderShadow.
+          const rect = [tileWidth * v.x, shape.height - tileHeight * (v.y + v.w), tileWidth * v.z, tileHeight * v.w];
+          const d = shadow._cascadeData[i];
+          return Object.freeze({viewProjection: Object.freeze(Array.from(clip.elements, x => finite(x, 'cascade clip matrix'))),
+            viewport: Object.freeze(rect),
+            tile: Object.freeze([rect[0] / shape.width, rect[1] / shape.height, rect[2] / shape.width, rect[3] / shape.height]),
+            cascade: Object.freeze([d.x, d.y, d.z, d.w])});
+        }));
+        viewProjection = cascades[0].viewProjection;
+        const frame = Object.freeze({update: true, viewProjection, frustum: null, cascades, bias: -shadow.bias,
+          normalBias: shadow.normalBias, strength: shadow.intensity, radius: shadow.radius});
+        frames.add(frame); return frame;
+      }
       if (update) {
         shadow.updateMatrices(light); check();
         clip.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
@@ -150,7 +195,8 @@ export async function createGpuThreeShadow(device, light, {three, maxBytes = 64 
       busy = true;
       try {
         if (frame.update) {
-          map.render({viewProjection: frame.viewProjection, draws});
+          if (frame.cascades) map.render({cascades: frame.cascades.map(c => ({viewProjection: c.viewProjection, viewport: c.viewport})), draws});
+          else map.render({viewProjection: frame.viewProjection, draws});
           const next = map.sample(device); live();
           snapshot = next; rendered++;
           shape.shadow.needsUpdate = false;
@@ -171,7 +217,8 @@ export async function createGpuThreeShadow(device, light, {three, maxBytes = 64 
       if (frame !== renderedFrame || !snapshot) fail('FRAME', 'Submit this captured frame before receiving its map');
       if (!Number.isInteger(lightIndex) || lightIndex < 0 || lightIndex > 7) fail('LIGHT', 'Invalid shadow light index');
       return {map: owner, lightIndex, bias: frame.bias, normalBias: frame.normalBias, strength: frame.strength,
-        filter: 'vogel5', radius: frame.radius};
+        filter: 'vogel5', radius: frame.radius,
+        ...(frame.cascades ? {cascades: frame.cascades.map(c => ({viewProjection: c.viewProjection, tile: c.tile, cascade: c.cascade}))} : {})};
     },
     async whenIdle() {
       live();

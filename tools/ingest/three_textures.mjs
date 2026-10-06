@@ -10,7 +10,9 @@
  * mips. VideoTextures copy ready HTMLVideoElement frames into stable 2D residency,
  * using the source's frame versions and built-in update() fallback. No frame
  * callbacks, playback controls or frame loop are installed here.
- * ImageBitmap decode flags and compressed/depth/array/float textures remain explicit
+ * ImageBitmaps are admitted with flipY=false/premultiplyAlpha=false (the decode-time
+ * profile both r186 renderers agree on, e.g. GLTFLoader's ImageBitmapLoader path).
+ * Other ImageBitmap flags and compressed/depth/array/float textures remain explicit
  * errors; applications can keep borrowing bindings for those sources.
  * See THREE_TEXTURES.md for source-state, color, bounds and completion contracts.
  */
@@ -131,8 +133,14 @@ function textureInspector(T,{
     if(data&&t.premultiplyAlpha)fail('FORMAT','Premultiplied byte data requires an explicit upload profile');
     for(const {image,level} of uploads){
       if(!data){
-        if(!(video||instance(image,'HTMLImageElement')||instance(image,'HTMLCanvasElement')||instance(image,'OffscreenCanvas')||instance(image,'ImageData')))
-          fail('SOURCE','Use decoded images, canvases or ImageData; ImageBitmap decode policy requires a borrowed binding');
+        const bitmap=instance(image,'ImageBitmap');
+        if(!(video||bitmap||instance(image,'HTMLImageElement')||instance(image,'HTMLCanvasElement')||instance(image,'OffscreenCanvas')||instance(image,'ImageData')))
+          fail('SOURCE','Use decoded images, ImageBitmaps, canvases or ImageData');
+        // r186 WebGLTextures skips UNPACK_FLIP_Y/PREMULTIPLY for ImageBitmaps (their
+        // decode options already decided both) while WebGPUTextureUtils applies them.
+        // Only the profile where both source renderers agree is admitted.
+        if(bitmap&&(t.flipY||t.premultiplyAlpha))
+          fail('SOURCE','ImageBitmap sources require flipY=false and premultiplyAlpha=false (orientation and alpha are decided at decode)');
         if(channels!==4)fail('FORMAT','External images require RGBA storage');
         if(instance(image,'ImageData')&&image.colorSpace&&image.colorSpace!=='srgb')fail('COLOR','ImageData requires the sRGB copy profile');
       }

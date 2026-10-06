@@ -254,13 +254,58 @@ function scoped(device, operation) {
   return {value, errors, error};
 }
 
+const cacheStates = new WeakMap();
+/** A per-device cache of immutable deformer inputs. Deformers created with
+ * {cache} share the base vertex, morph-delta and skin-influence storage buffers
+ * when their uploaded bytes are identical (hash plus full byte comparison, never
+ * object identity), and share the two compute pipelines. Every deformer keeps
+ * its own palette, morph weights, output vertex buffer and parameters, so
+ * per-mesh poses and queue-ordering rules are unchanged. Shared buffers are
+ * reference counted and destroyed with their last user; `bytes` reports the
+ * live shared GPU bytes once (callers add it to the deformers' private bytes).
+ */
+export function createGpuAnimationDeformerCache(device) {
+  if (!device?.queue || typeof device.createBuffer !== 'function') fail('ANIMATION_GPU_DEVICE', 'Lend a live WebGPU device');
+  const state = {device, entries: new Map(), bytes: 0, pipelines: new Map()};
+  const cache = Object.freeze({get bytes() { return state.bytes; }, get entries() { let n = 0; for (const list of state.entries.values()) n += list.length; return n; }});
+  cacheStates.set(cache, state);
+  return cache;
+}
+function inputHash(views) {
+  let hash = 2166136261;
+  for (const view of views) {
+    const bytes = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+    hash = Math.imul(hash ^ bytes.length, 16777619) >>> 0;
+    for (let i = 0; i < bytes.length; i++) hash = Math.imul(hash ^ bytes[i], 16777619) >>> 0;
+  }
+  return hash;
+}
+const sameBytes = (a, b) => {
+  if (a.byteLength !== b.byteLength) return false;
+  const x = new Uint8Array(a.buffer, a.byteOffset, a.byteLength), y = new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
+  for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return false;
+  return true;
+};
+function sharedPipeline(state, key, create) {
+  let ready = state.pipelines.get(key);
+  if (!ready) {
+    ready = create();
+    state.pipelines.set(key, ready);
+    // A failed creation is not cached: the next deformer retries it.
+    ready.catch(() => { if (state.pipelines.get(key) === ready) state.pipelines.delete(key); });
+  }
+  return ready;
+}
+
 /** See the module contract for queue ordering and the opt-in f32 profile. */
 export async function createGpuAnimationDeformer(device, pose, geometry, {
-  maxComponents = 16777216, maxBytes = 128 * 1024 * 1024, label = 'f3d-animation',
+  maxComponents = 16777216, maxBytes = 128 * 1024 * 1024, label = 'f3d-animation', cache = null,
 } = {}) {
   if (!device?.queue || !device.limits || typeof device.createComputePipelineAsync !== 'function' ||
       typeof device.lost?.then !== 'function') fail('ANIMATION_GPU_DEVICE', 'Lend a live WebGPU device');
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || typeof label !== 'string') fail('ANIMATION_GPU_LIMIT', 'Invalid GPU allocation options');
+  const cacheState = cache === null ? null : cacheStates.get(cache);
+  if (cache !== null && (!cacheState || cacheState.device !== device)) fail('ANIMATION_GPU_DEVICE', 'Deformer caches are created for one device');
   const source = snapshot(geometry, maxComponents);
   // Reuse the existing admission contract, including skin indices, normalized
   // weight sums, instance ranges, affine matrices and morph target shapes.
@@ -289,7 +334,9 @@ export async function createGpuAnimationDeformer(device, pose, geometry, {
   const normalGroupsY = flatNormals ? Math.ceil(normalGroups / normalGroupsX) : 0;
   const sizes = [vertexCount * 40, Math.max(4, vertexCount * targetCount * 36),
     Math.max(8, vertexCount * influenceCount * 8), paletteCount * 4, Math.max(4, targetCount * 4), vertexCount * 40, 16];
-  if (sizes.reduce((a, b) => a + b, 0) > maxBytes) fail('ANIMATION_GPU_LIMIT', 'GPU buffers exceed byte budget');
+  // Buffers 0..2 are immutable inputs (shareable through a cache); 3..6 are per mesh.
+  const privateBytes = sizes[3] + sizes[4] + sizes[5] + sizes[6], inputBytes = sizes[0] + sizes[1] + sizes[2];
+  if ((cacheState ? privateBytes : privateBytes + inputBytes) > maxBytes) fail('ANIMATION_GPU_LIMIT', 'GPU buffers exceed byte budget');
   for (let i = 0; i < sizes.length; i++) {
     limit('maxBufferSize', sizes[i]);
     limit(i === 6 ? 'maxUniformBufferBindingSize' : 'maxStorageBufferBindingSize', sizes[i]);
@@ -316,6 +363,15 @@ export async function createGpuAnimationDeformer(device, pose, geometry, {
       jointWords[i * 2] = source.joints[i]; weightWords[i * 2 + 1] = source.weights[i];
     }
   }
+  // Shared immutable inputs: hit only on identical bytes, never on identity.
+  const inputs = [base, morphs, new Uint8Array(influenceData)];
+  let shared = null, sharedCreated = false;
+  const hash = cacheState ? inputHash(inputs) : 0;
+  if (cacheState) {
+    shared = (cacheState.entries.get(hash) ?? []).find(entry => entry.inputs.every((view, i) => sameBytes(view, inputs[i]))) ?? null;
+    if (shared) shared.refs++;
+    else if (privateBytes + inputBytes > maxBytes) fail('ANIMATION_GPU_LIMIT', 'GPU buffers exceed byte budget');
+  }
   const palette = new Float32Array(paletteCount), weights = new Float32Array(sizes[4] / 4);
   if (!skin) palette[0] = palette[5] = palette[10] = palette[15] = 1;
   // Separate staging and submitted shadows are essential: failed preparation
@@ -326,7 +382,17 @@ export async function createGpuAnimationDeformer(device, pose, geometry, {
   const worldMatrix = new Float64Array(16), nextWorld = new Float64Array(16), bounds = new Float64Array(3);
   let disposed = false, terminal = null, busy = false, version = -1, poseVersion = -1, completion = Promise.resolve();
   const buffers = [];
-  const release = () => { for (const buffer of buffers) buffer.destroy(); buffers.length = 0; lastPalette = null; lastMorphs = null; };
+  const release = () => {
+    for (let i = 0; i < buffers.length; i++) if (!shared || i >= 3) buffers[i].destroy();
+    buffers.length = 0; lastPalette = null; lastMorphs = null;
+    const entry = shared; shared = null;
+    if (entry && --entry.refs === 0) {
+      for (const buffer of entry.buffers) buffer.destroy();
+      const list = cacheState.entries.get(entry.hash) ?? [], at = list.indexOf(entry);
+      if (at >= 0) { list.splice(at, 1); cacheState.bytes -= entry.bytes; }
+      if (!list.length) cacheState.entries.delete(entry.hash);
+    }
+  };
   const lost = device.lost.then(info => {
     terminal ??= new AnimationPoseError('ANIMATION_GPU_LOST', info?.message || 'WebGPU device lost');
     release(); throw terminal;
@@ -377,26 +443,41 @@ export async function createGpuAnimationDeformer(device, pose, geometry, {
   try {
     prepare();
     const allocated = scoped(device, () => {
-      const initial = [base, morphs, new Uint8Array(influenceData), palette, weights, null,
+      const initial = [...inputs, palette, weights, null,
         new Uint32Array([vertexCount, targetCount, influenceCount, groupsX])];
+      if (cacheState && !shared) {
+        shared = {hash, inputs, buffers: [], refs: 1, bytes: inputBytes, ready: null};
+        sharedCreated = true;
+      }
       for (let i = 0; i < sizes.length; i++) {
+        if (shared && i < 3 && !sharedCreated) { buffers.push(shared.buffers[i]); continue; }
         const buffer = device.createBuffer({label: `${label}/${i}`, size: sizes[i],
           usage: i === 6 ? UNIFORM : i === 5 ? STORAGE | VERTEX | COPY_SRC : STORAGE | COPY_DST,
           mappedAtCreation: initial[i] !== null});
         buffers.push(buffer);
+        if (sharedCreated && i < 3) shared.buffers.push(buffer);
         if (initial[i]) { new Uint8Array(buffer.getMappedRange()).set(new Uint8Array(initial[i].buffer, initial[i].byteOffset, initial[i].byteLength)); buffer.unmap(); }
       }
-      const module = device.createShaderModule({label, code: ANIMATION_DEFORM_WGSL});
-      const deformReady = device.createComputePipelineAsync({label, layout: 'auto', compute: {module, entryPoint: 'deform'}});
+      const deformPipeline = () => device.createComputePipelineAsync({label, layout: 'auto',
+        compute: {module: device.createShaderModule({label, code: ANIMATION_DEFORM_WGSL}), entryPoint: 'deform'}});
+      const deformReady = cacheState ? sharedPipeline(cacheState, 'deform', deformPipeline) : deformPipeline();
       // A synchronous failure creating the optional pipeline must not leave the
       // already-started deformation pipeline rejection unobserved.
       deformReady.catch(() => {});
-      const normalReady = flatNormals ? device.createComputePipelineAsync({label: `${label}/flat-normals`, layout: 'auto', compute: {
+      const normalPipelineReady = () => device.createComputePipelineAsync({label: `${label}/flat-normals`, layout: 'auto', compute: {
         module: device.createShaderModule({label: `${label}/flat-normals`, code: ANIMATION_FLAT_NORMALS_WGSL}), entryPoint: 'flat_normals',
-      }}) : null;
+      }});
+      const normalReady = !flatNormals ? null : cacheState ? sharedPipeline(cacheState, 'flat-normals', normalPipelineReady) : normalPipelineReady();
       return Promise.all([deformReady, normalReady]);
     });
-    [[pipeline, normalPipeline]] = await Promise.race([Promise.all([allocated.value, allocated.errors]), lost]);
+    if (sharedCreated) {
+      // Publish only after the creating allocation validated; concurrent users wait on it.
+      shared.ready = allocated.errors;
+      (cacheState.entries.get(hash) ?? cacheState.entries.set(hash, []).get(hash)).push(shared);
+      cacheState.bytes += inputBytes;
+      shared.ready.catch(() => {});
+    }
+    [[pipeline, normalPipeline]] = await Promise.race([Promise.all([allocated.value, allocated.errors, shared?.ready]), lost]);
     live();
     const bound = scoped(device, () => device.createBindGroup({label, layout: pipeline.getBindGroupLayout(0),
       entries: buffers.map((buffer, binding) => ({binding, resource: {buffer}}))}));
@@ -415,7 +496,8 @@ export async function createGpuAnimationDeformer(device, pose, geometry, {
     updateGpuAnimationDeformers([result]); return result;
   }
   const result = Object.freeze({vertexBuffer: buffers[5], vertexCount, vertexLayout, worldMatrix, node,
-    bufferBytes: sizes.reduce((a, b) => a + b, 0),
+    // With a cache, bufferBytes is this mesh's private storage; shared inputs are cache.bytes.
+    bufferBytes: cacheState ? privateBytes : privateBytes + inputBytes, sharedInputBytes: cacheState ? inputBytes : 0,
     get inputCacheBytes() { return (lastPalette?.byteLength ?? 0) + (lastMorphs?.byteLength ?? 0); },
     execution: 'webgpu-compute-f32', update,
     async whenIdle() {

@@ -63,8 +63,8 @@
  * Normal mapping uses authored deformed tangents and their w handedness when
  * present, otherwise a fragment-derivative cotangent frame from current world
  * positions and normal-map UVs. This is not MikkTSpace tangent generation.
- * normalScale (default 1, also a per-draw override) scales tangent
- * X/Y before normalization. Tangents are transformed as directions, not normals;
+ * normalScale (default 1, a number or [x, y] pair, also a per-draw override)
+ * scales tangent X/Y before normalization; Phong requires equal components. Tangents are transformed as directions, not normals;
  * reflected worlds and back faces preserve the mapped normal's orientation.
  * Collapsed UV derivatives retain the unperturbed normal; no tangent buffers
  * are allocated or synthesized for the derivative path.
@@ -218,6 +218,7 @@ import {
   packProjectedShadow,
   projectedShadowWgsl,
   SHADOW_UNIFORM_BYTES,
+  SUN_SHADOW_EXTRA_BYTES,
 } from "./animation_shadow_receiver.mjs";
 export class AnimationRenderError extends Error {
   constructor(code, message) {
@@ -387,6 +388,9 @@ function surfaceShader(
     normalMapped = (mapMask & 4) !== 0,
     coatNormalMapped = (mapMask & 128) !== 0;
   const tangentAttribute = (normalMapped || coatNormalMapped) && !derivative;
+  // Flat shading derives normals from world-position derivatives; geometry
+  // without a normal stream (e.g. GLTFLoader flatShading meshes) binds none.
+  const normalInput = lit && !(flat && geometryChannels?.normal === false);
   const uvAttribute = attributes && (geometryChannels?.uv ?? true);
   const colorWidth = attributes ? (geometryChannels?.colorSize ?? 4) : 0;
   const occluded = (mapMask & 16) !== 0,
@@ -411,7 +415,7 @@ function surfaceShader(
 struct Light { vector: vec4<f32>, radiance: vec4<f32>, direction: vec4<f32>, cone: vec4<f32> }
 struct Lighting { camera: vec4<f32>, light_params: vec4<f32>, lights: array<Light, 8>${threeLights ? ", view_x: vec4<f32>, view_y: vec4<f32>, view_z: vec4<f32>" : ""} }
 @group(${textured ? 2 : 1}) @binding(0) var<uniform> lighting: Lighting;${threeLights ? animationDfgWgsl() : ""}
-${shadowed ? projectedShadowWgsl(textured ? 2 : 1) : ""}${environmentCode ? "\n" + environmentCode : ""}
+${shadowed ? projectedShadowWgsl(textured ? 2 : 1, threeLights) : ""}${environmentCode ? "\n" + environmentCode : ""}
 fn unit_vector(v: vec3<f32>) -> vec3<f32> {
   let scale = max(max(abs(v.x), abs(v.y)), abs(v.z));
   if (scale == 0.0) { return vec3<f32>(0.0); }
@@ -540,9 +544,9 @@ fn illuminate(base: vec3<f32>, position: vec3<f32>, normal: vec3<f32>, metallic:
 `
     : "";
   return /* wgsl */ `
-${phong ? "// Matrix padding at words 51/55/59: AO strength, specular G, specular B.\nstruct PhongNormal { x: vec3<f32>, strength: f32, y: vec3<f32>, specular_g: f32, z: vec3<f32>, specular_b: f32 }\n" : occluded ? "// Same 48-byte layout as mat3x3; the first column padding holds material strength.\nstruct OcclusionNormal { x: vec3<f32>, strength: f32, y: vec3<f32>, pad0: f32, z: vec3<f32>, pad1: f32 }\n" : ""}struct DrawInfo {
+${phong ? "// Matrix padding at words 51/55/59: AO strength, specular G, specular B.\nstruct PhongNormal { x: vec3<f32>, strength: f32, y: vec3<f32>, specular_g: f32, z: vec3<f32>, specular_b: f32 }\n" : occluded || normalMapped ? "// Same 48-byte layout as mat3x3; column paddings hold AO strength (51) and normal scale Y (55).\nstruct OcclusionNormal { x: vec3<f32>, strength: f32, y: vec3<f32>, pad0: f32, z: vec3<f32>, pad1: f32 }\n" : ""}struct DrawInfo {
   clip_from_local: mat4x4<f32>, color: vec4<f32>, options: vec4<f32>, uv_x: vec4<f32>, uv_y: vec4<f32>,
-  world_from_local: mat4x4<f32>, normal_from_local: ${phong ? "PhongNormal" : occluded ? "OcclusionNormal" : "mat3x3<f32>"}, emission_roughness: vec4<f32>${clippingCapacity ? animationClippingFields(clippingCapacity) : ""}${textureTransforms ? animationUvFields(uvSlots) : ""}
+  world_from_local: mat4x4<f32>, normal_from_local: ${phong ? "PhongNormal" : occluded || normalMapped ? "OcclusionNormal" : "mat3x3<f32>"}, emission_roughness: vec4<f32>${clippingCapacity ? animationClippingFields(clippingCapacity) : ""}${textureTransforms ? animationUvFields(uvSlots) : ""}
 }
 ${
   instanceStride
@@ -561,7 +565,7 @@ struct VertexOutput {
     .map((slot) => `@location(${5 + slot}) uv_${slot}: vec2<f32>,`)
     .join("\n  ")}
 }
-@vertex fn vertex_main(@location(0) position: vec3<f32>${lit ? ", @location(1) normal: vec3<f32>" : ""}${tangentAttribute ? ", @location(2) tangent: vec4<f32>" : ""}${uvAttribute ? ", @location(3) uv: vec2<f32>" : ""}${colorWidth ? `, @location(4) color: vec${colorWidth}<f32>` : ""}${mapSlots(
+@vertex fn vertex_main(@location(0) position: vec3<f32>${normalInput ? ", @location(1) normal: vec3<f32>" : ""}${tangentAttribute ? ", @location(2) tangent: vec4<f32>" : ""}${uvAttribute ? ", @location(3) uv: vec2<f32>" : ""}${colorWidth ? `, @location(4) color: vec${colorWidth}<f32>` : ""}${mapSlots(
     coordinateMask,
   )
     .map((slot) => `, @location(${5 + slot}) uv_${slot}: vec2<f32>`)
@@ -572,14 +576,14 @@ struct VertexOutput {
   ${nativeInstances ? `let instance_matrix = mat4x4<f32>(instance_0, instance_1, instance_2, instance_3);
   let instance_position = instance_matrix * vec4<f32>(position, 1.0);
   ${lit || tangentAttribute ? "let instance_basis = mat3x3<f32>(instance_0.xyz, instance_1.xyz, instance_2.xyz);" : ""}
-  ${lit ? `// Pinned r186 defaultnormal_vertex: supports nonuniform scale, not shear.
+  ${normalInput ? `// Pinned r186 defaultnormal_vertex: supports nonuniform scale, not shear.
   let instance_normal = instance_basis * (normal / vec3<f32>(dot(instance_0.xyz, instance_0.xyz), dot(instance_1.xyz, instance_1.xyz), dot(instance_2.xyz, instance_2.xyz)));` : ""}` : ""}
   out.position = draw_info.clip_from_local * ${localPosition};${fogCode ? "\n  out.fog_depth = dot(fog_info.depth_from_clip, out.position);" : ""}
   ${uvAttribute ? "out.uv = vec2<f32>(dot(draw_info.uv_x.xyz, vec3<f32>(uv, 1.0)), dot(draw_info.uv_y.xyz, vec3<f32>(uv, 1.0)));" : "out.uv = vec2<f32>(0.0);"}
   out.color = ${colorWidth === 3 ? "vec4<f32>(color, 1.0)" : colorWidth === 4 ? "color" : "vec4<f32>(1.0)"};
   ${instanceColor ? "out.color = vec4<f32>(out.color.rgb * instance_color, out.color.a);" : ""}
   ${lit || clippingCapacity ? "out.world = (draw_info.world_from_local * " + localPosition + ").xyz;" : ""}
-  ${lit ? "out.normal = " + (occluded || phong ? "mat3x3<f32>(draw_info.normal_from_local.x, draw_info.normal_from_local.y, draw_info.normal_from_local.z)" : "draw_info.normal_from_local") + " * " + localNormal + ";" : ""}
+  ${lit && !normalInput ? "out.normal = vec3<f32>(0.0);" : ""}${normalInput ? "out.normal = " + (occluded || normalMapped || phong ? "mat3x3<f32>(draw_info.normal_from_local.x, draw_info.normal_from_local.y, draw_info.normal_from_local.z)" : "draw_info.normal_from_local") + " * " + localNormal + ";" : ""}
   ${tangentAttribute ? "out.tangent = vec4<f32>((draw_info.world_from_local * vec4<f32>(" + localTangent + ", 0.0)).xyz, tangent.w * draw_info.uv_y.w);" : ""}
   ${mapSlots(mappedMask)
     .map(slot => textureTransforms
@@ -640,7 +644,9 @@ struct VertexOutput {
   let bitangent = cross(normal, tangent) * select(-1.0, 1.0, input.tangent.w >= 0.0);`
         }
   var mapped = normal_map_texel.xyz * 2.0 - vec3<f32>(1.0);
-  mapped = vec3<f32>(mapped.xy * draw_info.uv_x.w, mapped.z);
+  // Source normalScale X in word 27; Y in matrix padding word 55 (Phong keeps
+  // that word for specular G and admits only equal X/Y scales).
+  mapped = vec3<f32>(mapped.xy * vec2<f32>(draw_info.uv_x.w, ${phong ? "draw_info.uv_x.w" : "draw_info.normal_from_local.pad0"}), mapped.z);
   normal = unit_vector(tangent * mapped.x + bitangent * mapped.y + normal * mapped.z);`
       : ""
   }
@@ -789,6 +795,20 @@ function packLighting(input, output, indirectLights, threeLights) {
   for (const v of output)
     if (!Number.isFinite(v)) fail("ANIMATION_RENDER_VALUE", "Lighting exceeds finite f32");
 }
+/** Source normalScale: a number (both axes) or an [x, y] pair, e.g. GLTFLoader's
+ * (1, -1) for derivative tangent frames. Phong reuses word 55 and needs x === y. */
+function normalScalePair(value, phong) {
+  let pair;
+  if (typeof value === "number") pair = [value, value];
+  else if ((Array.isArray(value) || value instanceof Float32Array || value instanceof Float64Array) && value.length === 2) pair = [value[0], value[1]];
+  else fail("ANIMATION_RENDER_VALUE", "Normal scale requires a number or two components");
+  for (const v of pair)
+    if (typeof v !== "number" || !Number.isFinite(Math.fround(v)))
+      fail("ANIMATION_RENDER_VALUE", "Normal scale must be finite f32");
+  if (phong && pair[0] !== pair[1]) fail("ANIMATION_RENDER_OPTIONS", "Phong normal maps require equal X/Y normal scale");
+  return pair;
+}
+
 function packNormal(world, determinant, output, offset) {
   if (determinant === 0) fail("ANIMATION_RENDER_NORMAL", "Lit world matrix must be invertible");
   // Columns of inverse-transpose: cross(b,c), cross(c,a), cross(a,b) / det.
@@ -994,6 +1014,7 @@ export async function createGpuAnimationRenderer(
   // rows: view_x/y/z = rows of matrixWorldInverse) used by view-space
   // shading models such as MeshNormalMaterial. Other profiles keep 544 bytes.
   const lightBytes = LIGHT_BYTES + (threeLights ? 48 : 0);
+  const shadowBytes = SHADOW_UNIFORM_BYTES + (threeLights ? SUN_SHADOW_EXTRA_BYTES : 0);
   if (
     !device?.queue ||
     !device.limits ||
@@ -1108,7 +1129,7 @@ export async function createGpuAnimationRenderer(
     lightGroup,
     lightingReady;
   const lightWords = new Float32Array(lightBytes / 4),
-    shadowWords = new Float32Array(SHADOW_UNIFORM_BYTES / 4);
+    shadowWords = new Float32Array(shadowBytes / 4);
   let shadowBuffer, shadowLayout, shadowGroup, shadowView, shadowSampler;
   let fogReceiver, fogBuffer, fogCode = "";
   const fogLayoutEntries = () => fog ? [{binding: 1, visibility: VERTEX_STAGE | FRAGMENT_STAGE,
@@ -1514,16 +1535,16 @@ export async function createGpuAnimationRenderer(
           shadowBuffer = remember(
             device.createBuffer({
               label: `${label}/shadow`,
-              size: SHADOW_UNIFORM_BYTES,
+              size: shadowBytes,
               usage: UNIFORM | COPY_DST,
             }),
-            SHADOW_UNIFORM_BYTES,
+            shadowBytes,
           );
           shadowEntries = [
             {
               binding: 1,
               visibility: FRAGMENT_STAGE,
-              buffer: { type: "uniform", minBindingSize: SHADOW_UNIFORM_BYTES },
+              buffer: { type: "uniform", minBindingSize: shadowBytes },
             },
             {
               binding: 2,
@@ -1825,9 +1846,7 @@ export async function createGpuAnimationRenderer(
     const occlusionStrength = finite(options.occlusionStrength ?? 1, "Occlusion strength");
     if (occlusionStrength < 0 || occlusionStrength > 1)
       fail("ANIMATION_RENDER_VALUE", "Occlusion strength must be in [0,1]");
-    const normalScale = finite(options.normalScale ?? 1, "Normal scale");
-    if (!Number.isFinite(Math.fround(normalScale)))
-      fail("ANIMATION_RENDER_VALUE", "Normal scale exceeds f32");
+    const normalScale = normalScalePair(options.normalScale ?? 1, phong);
     const derivative =
       (mapMask & 132) !== 0 &&
       (flat || !(mutable ? mutable.channels.tangent : gpu.vertexLayout.attributes.some(
@@ -1857,7 +1876,10 @@ export async function createGpuAnimationRenderer(
     if (lit) {
       if (rgba.some((v) => v > 1))
         fail("ANIMATION_RENDER_VALUE", "Lit reflectance factors must be in [0,1]");
+      // Flat shading never reads vertex normals: mutable geometry omits the
+      // input, and the fixed 40-byte deformer/rigid stride keeps an unread slot.
       if (
+        !flat &&
         !(mutable ? mutable.channels.normal : gpu.vertexLayout.attributes.some(
           (a) => a.shaderLocation === 1 && a.offset === 12 && a.format === "float32x3",
         ))
@@ -1981,7 +2003,7 @@ export async function createGpuAnimationRenderer(
     const coatReserve = coated && !sharedGroups?.has(textureKey) ? COAT_BYTES : 0;
     const lightReserve =
       lit && !lightBuffer
-        ? lightBytes + (shadows ? SHADOW_UNIFORM_BYTES : 0) + environmentBytes
+        ? lightBytes + (shadows ? shadowBytes : 0) + environmentBytes
         : 0;
     if (
       (instancing ? 0 : allocatedBytes) + (data?.byteLength ?? 0) + lightReserve + coatReserve >
@@ -2493,11 +2515,10 @@ export async function createGpuAnimationRenderer(
         if (record.mapMask & 128 && !(record.mapMask & 4))
           staged[offset + 31] = determinant < 0 ? -1 : 1;
         if (record.mapMask & 4) {
-          const scale = finite(input.normalScale ?? record.normalScale, "Normal scale");
-          if (!Number.isFinite(Math.fround(scale)))
-            fail("ANIMATION_RENDER_VALUE", "Normal scale exceeds f32");
+          const scale = input.normalScale === undefined ? record.normalScale : normalScalePair(input.normalScale, record.mode === 3);
           // Reuse the UV rows' unused W components; the uniform arena stays 256 bytes.
-          staged[offset + 27] = scale;
+          // Y is written after the normal matrix below (its padding word 55).
+          staged[offset + 27] = scale[0];
           staged[offset + 31] = determinant < 0 ? -1 : 1;
         }
         if (
@@ -2519,6 +2540,8 @@ export async function createGpuAnimationRenderer(
             staged[offset + 32 + k] = world[k];
           }
           packNormal(world, determinant, staged, offset + 48);
+          if (record.mapMask & 4 && record.mode !== 3)
+            staged[offset + 55] = (input.normalScale === undefined ? record.normalScale : normalScalePair(input.normalScale, false))[1];
           if (record.mapMask & 16) {
             const strength = finite(
               input.occlusionStrength ?? record.occlusionStrength,
@@ -2597,7 +2620,7 @@ export async function createGpuAnimationRenderer(
             layout: shadowLayout,
             entries: [
               { binding: 0, resource: { buffer: lightBuffer, size: lightBytes } },
-              { binding: 1, resource: { buffer: shadowBuffer, size: SHADOW_UNIFORM_BYTES } },
+              { binding: 1, resource: { buffer: shadowBuffer, size: shadowBytes } },
               { binding: 2, resource: view },
               { binding: 3, resource: sampler },
             ],
@@ -2627,7 +2650,7 @@ export async function createGpuAnimationRenderer(
                   ? [
                       {
                         binding: 1,
-                        resource: { buffer: shadowBuffer, size: SHADOW_UNIFORM_BYTES },
+                        resource: { buffer: shadowBuffer, size: shadowBytes },
                       },
                       { binding: 2, resource: view },
                       { binding: 3, resource: sampler },

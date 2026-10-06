@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createAnimationPlayer } from "./animation_runtime.mjs";
-import { ANIMATION_DEFORM_WGSL, createGpuAnimationDeformer } from "./animation_webgpu.mjs";
+import { ANIMATION_DEFORM_WGSL, createGpuAnimationDeformer, createGpuAnimationDeformerCache } from "./animation_webgpu.mjs";
 
 const deferred = () => {
   let resolve, reject;
@@ -564,4 +564,49 @@ test("whenIdle waits for earlier submission error scopes even if later work comp
     "Later completion hid an outstanding earlier error scope",
   );
   assert.equal(error?.code, "ANIMATION_GPU_DEVICE");
+});
+
+test("a cache shares byte-identical inputs and pipelines while poses, outputs and lifetimes stay per mesh", async () => {
+  const device = deviceSpy(),
+    pose = scene(),
+    cache = createGpuAnimationDeformerCache(device);
+  let pipelines = 0;
+  const create = device.createComputePipelineAsync;
+  device.createComputePipelineAsync = (d) => (pipelines++, create(d));
+  const a = await createGpuAnimationDeformer(device, pose, geometry(0), { cache });
+  const b = await createGpuAnimationDeformer(device, pose, geometry(2), { cache });
+  // Equal bytes from distinct objects: 7 buffers, then only the 4 private ones.
+  assert.equal(device.buffers.length, 11);
+  assert.equal(pipelines, 1);
+  assert.equal(cache.entries, 1);
+  assert.equal(cache.bytes, 40 + 36 + 32);
+  assert.equal(a.bufferBytes, 64 + 4 + 40 + 16);
+  assert.notEqual(a.vertexBuffer, b.vertexBuffer);
+  // Different bytes never alias a shared entry.
+  const other = geometry(0);
+  other.morphTargets[0].positions = [3, 0, 0];
+  const c = await createGpuAnimationDeformer(device, pose, other, { cache });
+  assert.equal(cache.entries, 2);
+  assert.equal(device.buffers.length, 18);
+  // Each mesh still submits its own palette/weights and dispatch.
+  pose.sample(1);
+  a.update();
+  b.update();
+  assert.deepEqual(device.submissions.at(-2).weights, device.submissions.at(-1).weights);
+  assert.equal(device.submissions.length, 5);
+  // Shared inputs survive until their last user is disposed.
+  const shared = device.buffers.slice(0, 3);
+  a.dispose();
+  assert.ok(shared.every((buffer) => buffer.destroyed === 0));
+  b.dispose();
+  assert.ok(shared.every((buffer) => buffer.destroyed === 1));
+  assert.equal(cache.entries, 1);
+  c.dispose();
+  assert.equal(cache.bytes, 0);
+  // A budget below private plus new shared bytes refuses before allocation.
+  const before = device.buffers.length;
+  await assert.rejects(createGpuAnimationDeformer(device, pose, geometry(0), { cache, maxBytes: 200 }), code("ANIMATION_GPU_LIMIT"));
+  assert.equal(device.buffers.length, before);
+  assert.equal(cache.bytes, 0);
+  await assert.rejects(createGpuAnimationDeformer(deviceSpy(), pose, geometry(0), { cache }), code("ANIMATION_GPU_DEVICE"));
 });

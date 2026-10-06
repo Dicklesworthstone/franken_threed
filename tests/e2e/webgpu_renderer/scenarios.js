@@ -209,6 +209,54 @@ export const scenarios = {
     scene.add(light, group);
     return { scene, camera: camera(THREE) };
   },
+  // r186 SunLight (examples/jsm/lights): two cascades refit from the camera, with
+  // the near/far fade band, over a long ground plane receding from the viewer.
+  sun_cascades(THREE, renderer) {
+    if (renderer.library && THREE.SunLightNode) renderer.library.addLight(THREE.SunLightNode, THREE.SunLight);
+    renderer.shadowMap.enabled = true;
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x8899aa);
+    const ground = new THREE.Mesh(new THREE.PlaneGeometry(60, 60), new THREE.MeshStandardMaterial({ color: 0xdddddd }));
+    ground.rotation.x = -Math.PI / 2; ground.receiveShadow = true;
+    scene.add(ground);
+    for (let i = 0; i < 8; i++) {
+      const box = new THREE.Mesh(new THREE.BoxGeometry(0.6, 1.5, 0.6), new THREE.MeshStandardMaterial({ color: new THREE.Color().setHSL(i / 8, 0.5, 0.5) }));
+      box.position.set((i % 2 ? 1 : -1) * 1.2, 0.75, 1 - i * 3.5); box.castShadow = true; box.receiveShadow = true;
+      scene.add(box);
+    }
+    const sun = new THREE.SunLight(0xffffff, 3);
+    sun.position.set(-3, 6, 2); sun.castShadow = true; sun.shadow.mapSize.set(512, 512);
+    scene.add(sun, new THREE.HemisphereLight(0xffffff, 0x444444, 0.5));
+    const cam = new THREE.PerspectiveCamera(55, 320 / 240, 0.1, 60);
+    cam.position.set(0, 3, 4); cam.lookAt(0, 0, -6);
+    return { scene, camera: cam };
+  },
+  // Per-axis normalScale on the derivative tangent frame (GLTFLoader sets y=-1 when
+  // geometry has no tangents) and a flat-shaded lit mesh with no normal attribute.
+  normal_scale_and_flat(THREE) {
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x202028);
+    const size = 32, data = new Uint8Array(size * size * 4);
+    for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {
+      const nx = 0.6 * Math.sin((2 * Math.PI * x) / 8), ny = 0.6 * Math.sin((2 * Math.PI * y) / 16);
+      const nz = Math.sqrt(Math.max(0, 1 - nx * nx - ny * ny)), i = (y * size + x) * 4;
+      data.set([(nx * 0.5 + 0.5) * 255, (ny * 0.5 + 0.5) * 255, (nz * 0.5 + 0.5) * 255, 255], i);
+    }
+    const normalMap = new THREE.DataTexture(data, size, size);
+    normalMap.needsUpdate = true;
+    [[1, 1], [1, -1], [0.5, 2]].forEach(([sx, sy], i) => {
+      const plane = new THREE.Mesh(new THREE.PlaneGeometry(0.9, 0.9), new THREE.MeshStandardMaterial({ color: 0xbbbbbb, roughness: 0.5, normalMap, normalScale: new THREE.Vector2(sx, sy) }));
+      plane.position.set((i - 1) * 1.0, 0.45, 0); plane.rotation.x = -0.3;
+      scene.add(plane);
+    });
+    const geometry = new THREE.IcosahedronGeometry(0.4, 0);
+    geometry.deleteAttribute('normal');
+    const flat = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({ color: 0x55aa77, flatShading: true }));
+    flat.position.set(0, -0.6, 0); flat.rotation.set(0.4, 0.6, 0);
+    const light = new THREE.DirectionalLight(0xffffff, 3); light.position.set(-1, 2, 2);
+    scene.add(flat, light, new THREE.AmbientLight(0xffffff, 0.3));
+    return { scene, camera: camera(THREE) };
+  },
 };
 function camera(THREE, position = [0, 0, 3.2]) {
   const c = new THREE.PerspectiveCamera(50, 320 / 240, 0.1, 50);

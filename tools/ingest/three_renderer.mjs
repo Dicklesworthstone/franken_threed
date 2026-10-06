@@ -117,6 +117,9 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
             // Retire the old owner only after the replacement is published.
             const background = scene.background && !scene.background.isColor;
             const bridge = await createGpuThreeScene(device, scene, {
+              // Mesh-count caps follow the binding capacity; the byte budgets
+              // (deformation/instance) stay the scene owner's defaults and bound memory.
+              maxDeformedMeshes: Math.min(maxBindings, 4096), maxInstanceMeshes: Math.min(maxBindings, 4096),
               ...sceneLimits, three: THREE, signal, maxBindings,
               renderer: {...attachments, instancing: true, renderBundles: true, maxDraws,
                 ...(owner._hdr || !owner._shaderEncodedOutput ? {} : {outputTransfer: 'srgb'})},
@@ -180,6 +183,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this.toneMappingExposure = 1;
       this.sortObjects = true;
       this.shadowMap = {enabled: false, transmitted: false, type: THREE.PCFShadowMap};
+      // The source node library instance (registrations such as addLight are
+      // recorded on the real object). The F3D bridge evaluates admitted light
+      // and material classes itself; unadmitted classes still fail explicitly.
+      if (typeof THREE.StandardNodeLibrary === 'function') this.library = new THREE.StandardNodeLibrary();
       this.xr = {enabled: false, isPresenting: false, getEnvironmentBlendMode: () => undefined};
       this.info = {
         autoReset: true, calls: 0, frame: 0,
@@ -638,6 +645,7 @@ export function createWebGLRendererClass(THREE, classOptions = {}) {
         ...(powerPreference === 'default' ? {} : {powerPreference})});
       this.isWebGPURenderer = false;
       this.isWebGLRenderer = true;
+      delete this.library; // WebGLRenderer has no node library.
       this.premultipliedAlpha = premultipliedAlpha;
       this.preserveDrawingBuffer = preserveDrawingBuffer;
       this._outputBufferType = outputBufferType;

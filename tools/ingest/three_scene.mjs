@@ -163,7 +163,11 @@ export async function createGpuThreeScene(device,scene,{
   const vp=new three.Matrix4(),clip=new three.Matrix4(),frustum=new three.Frustum(),center=new three.Vector3();
   const geometryBytes=()=>[...geometries.values()].reduce((n,g)=>n+g.bufferBytes,0);
   const instanceBytes=()=>[...instances.values()].reduce((n,g)=>n+g.bufferBytes,0);
-  const deformationBytes=()=>[...deformations.values(),...pendingDeformations].reduce((n,g)=>n+g.bufferBytes,0);
+  // Meshes sharing source geometry share immutable deformer inputs; count those once.
+  // Meshes sharing source geometry share immutable deformer inputs through this
+  // token (see createGpuThreeDeformation's cache option); count those bytes once.
+  const deformationInputs={};
+  const deformationBytes=()=>(deformationInputs.bytes??0)+[...deformations.values(),...pendingDeformations].reduce((n,g)=>n+g.bufferBytes,0);
   function live(){
     if(disposed)fail('DISPOSED','Source scene bridge is disposed');if(terminal)throw terminal;
     if(resourceFailed()){
@@ -288,7 +292,7 @@ export async function createGpuThreeScene(device,scene,{
     }
     let type;
     if(source.isAmbientLight)type='ambient';else if(source.isHemisphereLight)type='hemisphere';
-    else if(source.isDirectionalLight)type='directional';else if(source.isPointLight)type='point';
+    else if(source.isDirectionalLight||source.isSunLight)type='directional';else if(source.isPointLight)type='point';
     else if(source.isSpotLight)type='spot';else fail('LIGHT',`Unsupported source light: ${source.type}`);
     if(source.map)fail('LIGHT','Projected source light textures are not admitted');
     const result={type,color:rgb(source.color),intensity:source.intensity};
@@ -301,7 +305,8 @@ export async function createGpuThreeScene(device,scene,{
       if(source.distance!==0)result.range=source.distance;
     }
     if(type==='directional'||type==='spot'){
-      const a=position(source),b=position(source.target);result.direction=b.map((v,i)=>v-a[i]);
+      // r186 SunLight shines from its position toward the world origin (no target).
+      const a=position(source),b=source.isSunLight?[0,0,0]:position(source.target);result.direction=b.map((v,i)=>v-a[i]);
     }
     if(type==='spot'){
       if(finite(source.angle,'spot angle')<0||source.angle>Math.PI/2||finite(source.penumbra,'spot penumbra')<0||source.penumbra>1)
@@ -440,8 +445,9 @@ export async function createGpuThreeScene(device,scene,{
       texture(m.metalnessMap,'metallicRoughnessTexture');
     }
     if(m.normalMap){
-      if(m.normalMapType!==three.TangentSpaceNormalMap||m.normalScale.x!==m.normalScale.y)fail('MATERIAL','The current profile requires tangent-space maps and equal XY normal scale');
-      values.normalScale=m.normalScale.x;
+      if(m.normalMapType!==three.TangentSpaceNormalMap)fail('MATERIAL','The current profile requires tangent-space normal maps');
+      if(shading==='phong'&&m.normalScale.x!==m.normalScale.y)fail('MATERIAL','Phong normal maps require equal XY normal scale');
+      values.normalScale=[m.normalScale.x,m.normalScale.y];
     }
     if(m.aoMap)values.occlusionStrength=m.aoMapIntensity;
     if(transform)values.uvTransform=transform;
@@ -619,7 +625,7 @@ export async function createGpuThreeScene(device,scene,{
               const available=maxDeformationBytes-deformationBytes();
               if(available<1)fail('LIMIT','Deformation replacement exceeds the old-plus-new GPU budget');
               deformation=await createGpuThreeDeformation(device,item.deformationSource,{...deformationOptions,three,
-                maxBytes:available,signal:deformationLifetime.signal});
+                maxBytes:available,signal:deformationLifetime.signal,cache:deformationInputs});
               pendingDeformations.add(deformation);createdDeformations.push(deformation);live();
             }
             nextDeformations.set(item.deformationSource,deformation);
@@ -910,9 +916,9 @@ export async function createGpuThreeScene(device,scene,{
       }
       if(lighting.lights.length>8)fail('LIMIT','Visible source lights exceed the renderer capacity');
       const lightIndex=shadowOwner?lightSources.indexOf(shadowOwner.source):-1;
-      const shadowFrame=lightIndex<0?null:shadowOwner.capture();
+      const shadowFrame=lightIndex<0?null:shadowOwner.capture(camera);
       if(shadowFrame?.update)for(const object of casterObjects)
-        if(!object.frustumCulled||object.intersectsFrustum(shadowFrame.frustum))append(object,0,0,true);
+        if(!object.frustumCulled||shadowFrame.frustum===null||object.intersectsFrustum(shadowFrame.frustum))append(object,0,0,true);
       if(sortObjects){
         const order=(a,b)=>a.groupOrder-b.groupOrder||a.object.renderOrder-b.object.renderOrder;
         opaque.sort((a,b)=>order(a,b)||a.listMaterial.id-b.listMaterial.id||a.z-b.z||a.object.id-b.object.id);

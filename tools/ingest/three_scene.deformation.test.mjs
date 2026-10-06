@@ -7,7 +7,7 @@ import fs from 'node:fs/promises';
 import {fixture,THREE,Scene,Camera,Mesh,MeshBasicMaterial,BufferAttribute,attr,deferred} from './fixtures/animation/three_deformation_fixture.mjs';
 const key='__f3d_animated_scene_test__';
 const data=s=>'data:text/javascript,'+encodeURIComponent(s);
-const core=data(`export const createGpuAnimationDeformer=(...a)=>globalThis.${key}.create(...a); export const updateGpuAnimationDeformers=a=>globalThis.${key}.update(a);`);
+const core=data(`export const createGpuAnimationDeformer=(...a)=>globalThis.${key}.create(...a); export const updateGpuAnimationDeformers=a=>globalThis.${key}.update(a); export const createGpuAnimationDeformerCache=()=>({bytes:0});`);
 const deformation=data((await fs.readFile(new URL('./three_deformation.mjs',import.meta.url),'utf8'))
   .replace("'./animation_webgpu.mjs'",JSON.stringify(core))
   .replaceAll("'./three_deformation_binding.mjs'",JSON.stringify(new URL('./three_deformation_binding.mjs',import.meta.url).href)));

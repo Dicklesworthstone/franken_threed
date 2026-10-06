@@ -214,8 +214,17 @@ export async function createGpuAnimationShadowMap(device, options = {}) {
     },
     render(frame) {
       return exclusive(() => {
-        fields(frame, ["viewProjection", "draws"]);
-        const viewProjection = matrix(frame.viewProjection),
+        fields(frame, ["viewProjection", "draws", "cascades"]);
+        // cascades: [{viewProjection, viewport: [x, y, w, h]}] render into tiles of
+        // one atlas (top-left pixel rects); each tile is its own submission.
+        const cascades = frame.cascades === undefined ? null : frame.cascades.map((c) => {
+          fields(c, ["viewProjection", "viewport"]);
+          if (!Array.isArray(c.viewport) || c.viewport.length !== 4 || !c.viewport.every((v) => Number.isFinite(v) && v >= 0))
+            fail("Invalid cascade viewport");
+          return { viewProjection: matrix(c.viewProjection), viewport: [...c.viewport] };
+        });
+        if (cascades && (cascades.length < 1 || cascades.length > 4)) fail("Expected one to four cascades");
+        const viewProjection = matrix(cascades ? cascades[0].viewProjection : frame.viewProjection),
           list = frame.draws;
         if (!Array.isArray(list) || list.length > maxDraws) fail("Invalid caster draw list");
         const nextDependencies = [],
@@ -253,7 +262,9 @@ export async function createGpuAnimationShadowMap(device, options = {}) {
           });
         if (!nextDependencies.every(current))
           fail("Caster changed during shadow preparation", "ANIMATION_SHADOW_STALE");
-        renderer.render({ depthView: view, viewProjection, draws, clearDepth: 1 });
+        if (!cascades) renderer.render({ depthView: view, viewProjection, draws, clearDepth: 1 });
+        else cascades.forEach((c, i) => renderer.render({ depthView: view, viewProjection: c.viewProjection, draws, clearDepth: 1,
+          depthLoadOp: i === 0 ? "clear" : "load", viewport: [...c.viewport, 0, 1] }));
         dependencies = nextDependencies;
         snapshot = Object.freeze({
           view,

@@ -2,15 +2,31 @@
  * The returned deformer is the actual registered core GPU owner, not a facsimile
  * of its public vertex-buffer fields. Submit consumers before the next update.
  */
-import {createGpuAnimationDeformer, updateGpuAnimationDeformers} from './animation_webgpu.mjs';
+import {createGpuAnimationDeformer, createGpuAnimationDeformerCache, updateGpuAnimationDeformers} from './animation_webgpu.mjs';
 import {createThreeDeformationBinding, ThreeDeformationError} from './three_deformation_binding.mjs';
 export {hasThreeDeformation, inspectThreeDeformation, createThreeDeformationBinding, ThreeDeformationError} from './three_deformation_binding.mjs';
-const states = new WeakMap();
+const states = new WeakMap(), inputCaches = new WeakMap();
+/** options.cache: an owner-chosen plain object. Deformations created with the same
+ * token and device share byte-identical immutable inputs (base vertices, morph
+ * deltas, skin influences) and compute pipelines; token.bytes then reports the
+ * live shared GPU bytes, which each deformation's bufferBytes excludes. */
+function inputCache(token, device) {
+  if (token === null) return null;
+  if (!token || typeof token !== 'object') fail('OPTIONS', 'Expected a deformation cache token object');
+  let entry = inputCaches.get(token);
+  if (!entry) {
+    entry = {device, cache: createGpuAnimationDeformerCache(device)};
+    inputCaches.set(token, entry);
+    Object.defineProperty(token, 'bytes', {get: () => entry.cache.bytes, configurable: true});
+  }
+  if (entry.device !== device) fail('OPTIONS', 'A deformation cache token belongs to one device');
+  return entry.cache;
+}
 const fail = (code, message) => { throw new ThreeDeformationError(code, message); };
 
 export async function createGpuThreeDeformation(device, source, options = {}) {
   if (!options || typeof options !== 'object' || Array.isArray(options)) fail('OPTIONS', 'Expected source deformation options');
-  const {signal, maxBytes = 128 * 1024 * 1024, label = 'f3d-three-deformation', ...bindingOptions} = options;
+  const {signal, maxBytes = 128 * 1024 * 1024, label = 'f3d-three-deformation', cache = null, ...bindingOptions} = options;
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || typeof label !== 'string') fail('LIMIT', 'Invalid GPU deformation budget or label');
   if (signal !== undefined && (!signal || typeof signal.aborted !== 'boolean' ||
       typeof signal.addEventListener !== 'function' || typeof signal.removeEventListener !== 'function')) fail('OPTIONS', 'Expected AbortSignal');
@@ -42,7 +58,7 @@ export async function createGpuThreeDeformation(device, source, options = {}) {
   try {
     if (signal?.aborted) onAbort(); live();
     const construction = createGpuAnimationDeformer(device, binding.pose, binding.geometry, {
-      maxBytes, label, ...(bindingOptions.maxComponents === undefined ? {} : {maxComponents: bindingOptions.maxComponents}),
+      maxBytes, label, cache: inputCache(cache, device), ...(bindingOptions.maxComponents === undefined ? {} : {maxComponents: bindingOptions.maxComponents}),
     }).then(value => {
       if (closed()) { value.dispose(); throw terminal ?? new ThreeDeformationError('DISPOSED', 'Source owner is closed'); }
       gpu = value; return value;
