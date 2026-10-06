@@ -319,6 +319,7 @@ export {extractAnimationRootMotion,applyAnimationRootMotion,createAnimationRootM
     for (const name of [
       "animation_webgpu.mjs",
       "animation_render.mjs",
+      "animation_raster.mjs",
       "animation_clipping.mjs",
       "animation_uv.mjs",
       "animation_render_bundles.mjs",

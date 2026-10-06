@@ -194,6 +194,13 @@
  * alphaTest:true also permits tested BLEND materials; alphaCutoff stays live.
  * This does not add stochastic alpha, alpha-to-coverage or translucent shadows.
  *
+ * Materials also accept explicit blend:{color,alpha} equations/factors (null
+ * disables blending), premultipliedAlpha, stencil:{front,back,readMask,writeMask},
+ * and depthBias/depthBiasSlopeScale/depthBiasClamp. blendConstant and
+ * stencilReference are snapshotted per use, including inside cached bundles.
+ * Stencil requires a combined depth-stencil format; frames control its load/clear.
+ * These are native fixed-function paths, not programmable shader-hook support.
+ *
  * Host validation finishes before GPU writes. Driver errors are terminal, not
  * rollbackable. version acknowledges submission, not completion: await whenIdle()
  * for cumulative draw/deformation validation, OOM and device-loss errors.
@@ -202,7 +209,9 @@ import {animationUvBytes, animationUvFields, snapshotAnimationMapTransforms,
   animationMapChannelKey, packAnimationMapTransforms} from "./animation_uv.mjs";
 import {animationClippingBytes, animationClippingFields, animationClippingWgsl,
   snapshotAnimationClipping, packAnimationClipping} from "./animation_clipping.mjs";
-import {createAnimationRenderBundleCache, encodeAnimationDraws} from "./animation_render_bundles.mjs";
+import {createAnimationRenderBundleCache, encodeAnimationRenderSpans} from "./animation_render_bundles.mjs";
+import {snapshotAnimationRaster, snapshotAnimationRasterUse, hasAnimationStencil,
+  ANIMATION_NORMAL_BLEND} from "./animation_raster.mjs";
 import {bufferGeometrySnapshot, instanceAttributesSnapshot} from "./gpu_buffer_geometry.mjs";
 import {
   packProjectedShadow,
@@ -351,6 +360,7 @@ function surfaceShader(
   textureTransforms = false,
   channelKey = 0,
   uvSlots = 8,
+  premultipliedAlpha = false,
 ) {
   const mappedMask = coordinateMask | (textureTransforms ? mapMask & ~(toon ? 2 : 0) : 0);
   const channel = slot => (channelKey >>> (slot * 2)) & 3;
@@ -613,7 +623,7 @@ struct VertexOutput {
   }`
       : "let rgb = rgba.rgb;"
   }
-  ${toon ? "if (draw_info.options.x >= 0.0 && rgba.a < draw_info.options.x) { discard; }\n  " : ""}${clippingCapacity ? "if (animation_clipped(input.world)) { discard; }\n  " : ""}${depthOnly ? "" : "return vec4<f32>(" + (fogCode ? "apply_distance_fog(rgb, input.fog_depth)" : "rgb") + ", select(1.0, rgba.a, draw_info.options.y > 0.0));"}
+  ${toon ? "if (draw_info.options.x >= 0.0 && rgba.a < draw_info.options.x) { discard; }\n  " : ""}${clippingCapacity ? "if (animation_clipped(input.world)) { discard; }\n  " : ""}${depthOnly ? "" : (premultipliedAlpha ? "let output_alpha = select(1.0, rgba.a, draw_info.options.y > 0.0);\n  return vec4<f32>(" + (fogCode ? "apply_distance_fog(rgb, input.fog_depth)" : "rgb") + " * output_alpha, output_alpha);" : "return vec4<f32>(" + (fogCode ? "apply_distance_fog(rgb, input.fog_depth)" : "rgb") + ", select(1.0, rgba.a, draw_info.options.y > 0.0));")}
 }
 `;
 }
@@ -926,11 +936,14 @@ export async function createGpuAnimationRenderer(
       "bgra8unorm-srgb",
       "rgba16float",
     ].includes(format) ||
-    ![null, "depth24plus", "depth32float", "depth16unorm"].includes(depthFormat) ||
+    ![null, "depth24plus", "depth32float", "depth16unorm", "depth24plus-stencil8", "depth32float-stencil8"].includes(depthFormat) ||
     ![1, 4].includes(sampleCount) ||
     typeof label !== "string"
   )
     fail("ANIMATION_RENDER_OPTIONS", "Unsupported attachment configuration");
+  const stencilAttachment = hasAnimationStencil(depthFormat);
+  if (depthFormat === "depth32float-stencil8" && !device.features?.has("depth32float-stencil8"))
+    fail("ANIMATION_RENDER_OPTIONS", "depth32float-stencil8 requires its device feature");
   if (format === null && depthFormat === null)
     fail("ANIMATION_RENDER_OPTIONS", "Depth-only rendering requires a depth format");
   if (typeof shadows !== "boolean" || (shadows && format === null))
@@ -995,6 +1008,7 @@ export async function createGpuAnimationRenderer(
     limit("maxStorageBufferBindingSize", arenaBytes);
     limit("maxInterStageShaderVariables", 11);
   }
+  const rasterStates = new Map(), rasterIds = new Map();
   const staged = new Float32Array(arenaBytes / 4),
     commands = [];
   const records = new Set(),
@@ -1180,6 +1194,7 @@ export async function createGpuAnimationRenderer(
     shadowGroup = shadowView = shadowSampler = null;
     instanceBindGroup = instanceUniformLayout = null;
     environmentGroups.clear();
+    rasterStates.clear(); rasterIds.clear();
     sharedBuffers?.clear();
     sharedGroups?.clear();
   }
@@ -1198,6 +1213,7 @@ export async function createGpuAnimationRenderer(
   }
   function compilePipelines(variantKey) {
     const [variant, geometryKey] = variantKey.split("~");
+    const raster = rasterStates.get(Number(/raster-(\d+)-/.exec(variant)?.[1]));
     const geometry = geometryKey === undefined ? null : geometryLayouts.get(geometryKey);
     const nativeInstances = geometry?.channels.instanced === true;
     // Native instance_index addresses source matrix/color streams, never the
@@ -1278,7 +1294,7 @@ export async function createGpuAnimationRenderer(
     const module = device.createShaderModule({
       label,
       code:
-        textureTransforms || clipping || fog || nativeInstances || instancing || lit || attributes || format === null
+        raster?.premultipliedAlpha || textureTransforms || clipping || fog || nativeInstances || instancing || lit || attributes || format === null
           ? surfaceShader(
               mapMask,
               lit,
@@ -1301,6 +1317,7 @@ export async function createGpuAnimationRenderer(
               textureTransforms,
               Number(/channels-(\d+)-/.exec(variant)?.[1] ?? 0),
               uvSlots,
+              raster?.premultipliedAlpha ?? false,
             )
           : ANIMATION_RENDER_WGSL,
     });
@@ -1342,6 +1359,9 @@ export async function createGpuAnimationRenderer(
     for (const blend of format === null ? [false] : [false, true])
       for (const winding of lit ? ["ccw", "cw", "none", "none-cw"] : ["ccw", "cw", "none"]) {
         const key = `${variantKey}/${blend}:${winding}`;
+        const blendState = raster?.blend !== undefined ? raster.blend : blend
+          ? raster?.premultipliedAlpha ? {color: {...ANIMATION_NORMAL_BLEND.color, srcFactor: "one"}, alpha: ANIMATION_NORMAL_BLEND.alpha}
+            : ANIMATION_NORMAL_BLEND : null;
         created.push(
           device
             .createRenderPipelineAsync({
@@ -1358,22 +1378,7 @@ export async function createGpuAnimationRenderer(
                         {
                           format,
                           ...(colorWrite ? {} : {writeMask: 0}),
-                          ...(blend
-                            ? {
-                                blend: {
-                                  color: {
-                                    operation: "add",
-                                    srcFactor: "src-alpha",
-                                    dstFactor: "one-minus-src-alpha",
-                                  },
-                                  alpha: {
-                                    operation: "add",
-                                    srcFactor: "one",
-                                    dstFactor: "one-minus-src-alpha",
-                                  },
-                                },
-                              }
-                            : {}),
+                          ...(blendState ? {blend: blendState} : {}),
                         },
                       ],
               },
@@ -1388,6 +1393,8 @@ export async function createGpuAnimationRenderer(
                       format: depthFormat,
                       depthWriteEnabled: depthTest && (depthWrite ?? !blend),
                       depthCompare: depthTest ? depthCompare : "always",
+                      ...(raster?.stencil ?? {}),
+                      ...(raster?.bias ?? {}),
                     },
                   }
                 : {}),
@@ -1589,6 +1596,8 @@ export async function createGpuAnimationRenderer(
         "alphaMode",
         "alphaCutoff",
         "alphaTest",
+        "blend", "blendConstant", "premultipliedAlpha", "stencil", "stencilReference",
+        "depthBias", "depthBiasSlopeScale", "depthBiasClamp",
         "texCoords",
         "vertexColors",
         "mapCoordinates",
@@ -1612,6 +1621,7 @@ export async function createGpuAnimationRenderer(
       ],
       "material/geometry",
     );
+    const raster = snapshotAnimationRaster(options, {format, depthFormat});
     const mutable = deformerShape(gpu, device);
     const instanceHandle = options.instances ?? null;
     if (instanceHandle && !mutable)
@@ -1841,8 +1851,14 @@ export async function createGpuAnimationRenderer(
       limit("maxInterStageShaderVariables", needed);
     }
     const surfaceWords = 6 + coordinates.length * 2;
+    let rasterId = rasterIds.get(raster.key);
+    if (raster.key && rasterId === undefined) {
+      if (rasterStates.size >= maxMeshes) fail("ANIMATION_RENDER_LIMIT", "Fixed-function material state capacity exceeded");
+      rasterId = rasterStates.size + 1; rasterIds.set(raster.key, rasterId); rasterStates.set(rasterId, raster);
+    }
     const variant =
       (lit ? "lit-" : "") +
+      (raster.key ? `raster-${rasterId}-` : "") +
       (state === 3 ? "" : `state-${state}-`) +
       (comparison === 0 ? "" : `compare-${comparison}-`) +
       (side === "back" ? "back-" : "") +
@@ -2059,6 +2075,8 @@ export async function createGpuAnimationRenderer(
         alphaMode,
         alphaCutoff,
         alphaTest,
+        raster,
+        blended: raster.blend === undefined ? alphaMode === "BLEND" : raster.blend !== null,
         extent,
         indexBuffer,
         indexFormat,
@@ -2160,6 +2178,7 @@ export async function createGpuAnimationRenderer(
           "depthLoadOp",
           "clearColor",
           "clearDepth",
+          "stencilLoadOp", "clearStencil",
           "viewport",
           "scissor",
           "lighting",
@@ -2184,6 +2203,8 @@ export async function createGpuAnimationRenderer(
         depthLoadOp = "clear",
         clearColor = [0, 0, 0, 0],
         clearDepth = 1,
+        stencilLoadOp = depthLoadOp,
+        clearStencil = 0,
         viewport = null,
         scissor = null,
         lighting = null,
@@ -2203,6 +2224,12 @@ export async function createGpuAnimationRenderer(
         fail("ANIMATION_RENDER_ATTACHMENT", "Attachment configuration differs from pipeline");
       if (!["clear", "load"].includes(loadOp) || !["clear", "load"].includes(depthLoadOp))
         fail("ANIMATION_RENDER_ATTACHMENT", "Invalid load operation");
+      if (!stencilAttachment && (frame.stencilLoadOp !== undefined || frame.clearStencil !== undefined))
+        fail("ANIMATION_RENDER_ATTACHMENT", "Stencil controls require a depth-stencil attachment");
+      if (stencilAttachment) {
+        if (!["clear", "load"].includes(stencilLoadOp)) fail("ANIMATION_RENDER_ATTACHMENT", "Invalid stencil load operation");
+        integer(clearStencil, 0, 255, "clear stencil");
+      }
       color(clearColor);
       finite(clearDepth, "Clear depth");
       if (clearDepth < 0 || clearDepth > 1)
@@ -2295,12 +2322,14 @@ export async function createGpuAnimationRenderer(
             "alphaCutoff",
             "clippingPlanes",
             "clipIntersection",
+            "blendConstant", "stencilReference",
           ],
           "draw",
         );
         const record = owned.get(input.mesh);
         if (!record || record.disposed)
           fail("ANIMATION_RENDER_MESH", "Mesh is not live in this renderer");
+        const rasterUse = snapshotAnimationRasterUse(record.raster, input);
         const gpu = record.gpu;
         const geometry = deformerShape(gpu, device);
         if (geometry && geometry.signature !== record.geometrySignature)
@@ -2435,6 +2464,7 @@ export async function createGpuAnimationRenderer(
         const command = commands[i] ?? (commands[i] = {});
         Object.assign(command, {
           record,
+          ...rasterUse,
           first,
           count,
           vertexBuffers: instances ? [...geometry.vertexBuffers, ...instances.vertexBuffers] : geometry?.vertexBuffers ?? [gpu.vertexBuffer],
@@ -2540,6 +2570,7 @@ export async function createGpuAnimationRenderer(
                   depthLoadOp,
                   depthStoreOp: "store",
                   depthClearValue: clearDepth,
+                  ...(stencilAttachment ? {stencilLoadOp, stencilStoreOp: "store", stencilClearValue: clearStencil} : {}),
                 },
               }
             : {}),
@@ -2548,11 +2579,9 @@ export async function createGpuAnimationRenderer(
         if (scissor) pass.setScissorRect(...scissor);
         // Bundle keys record structural inputs only. All live uniform/geometry
         // updates and immediate queue submission below remain unchanged.
-        submittedDrawCalls = useBundles
-          ? bundleCache.execute(pass, commands, draws.length, frameLightGroup)
-          : encodeAnimationDraws(pass, commands, draws.length, {
-              bindGroup, lightGroup: frameLightGroup, stride, instancing,
-            });
+        submittedDrawCalls = encodeAnimationRenderSpans(pass, commands, draws.length, {
+          bindGroup, lightGroup: frameLightGroup, stride, instancing,
+        }, useBundles ? bundleCache : null);
         pass.end();
         const command = encoder.finish();
         if (draws.length)

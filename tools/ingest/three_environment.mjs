@@ -219,7 +219,8 @@ export function withThreeEnvironmentReceivers(renderer, maxDraws = 1024) {
       try {
         for (const span of spans) {
           renderer.render({...frame, draws: span.draws, environment: span.enabled ? frame.environment : null,
-            ...(submitted ? {loadOp: 'load', depthLoadOp: 'load'} : {})});
+            ...(submitted ? {loadOp: 'load', depthLoadOp: 'load',
+              ...(frame.stencilLoadOp !== undefined ? {stencilLoadOp: 'load'} : {})} : {})});
           submitted++; calls += renderer.drawCallCount; passes += renderer.colorPassCount ?? 1;
         }
         drawCount = frame.draws.length; drawCallCount = calls; colorPassCount = passes; return owner;

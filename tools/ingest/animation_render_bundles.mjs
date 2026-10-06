@@ -8,9 +8,11 @@
  * The caller still validates inputs, writes current data and submits each frame.
  * WebGPU validation/loss handling belongs to that caller's error scopes.
  */
+import {hasAnimationStencil} from './animation_raster.mjs';
+const blended = record => record.alphaMode === 'BLEND' || record.blended === true;
 function compatible(a, b) {
   return a.instanceCount == null && b.instanceCount == null &&
-    b.record.alphaMode !== 'BLEND' && a.pipeline === b.pipeline &&
+    !blended(b.record) && a.pipeline === b.pipeline &&
     a.first === b.first && a.count === b.count &&
     a.vertexBuffers.length === b.vertexBuffers.length &&
     a.vertexBuffers.every((buffer, i) => buffer === b.vertexBuffers[i]) &&
@@ -25,15 +27,16 @@ function compatible(a, b) {
  * offset remains the original logical draw's position in the current arena.
  */
 export function encodeAnimationDraws(encoder, commands, length, {
-  bindGroup, lightGroup, stride, instancing,
+  bindGroup, lightGroup, stride, instancing, start = 0,
 }) {
   let calls = 0;
-  for (let i = 0; i < length;) {
+  const end = start + length;
+  for (let i = start; i < end;) {
     const command = commands[i], {record, first, count, pipeline} = command;
     const native = command.instanceCount != null;
     let instances = 1;
-    if (instancing && !native && record.alphaMode !== 'BLEND') {
-      while (i + instances < length && compatible(command, commands[i + instances])) instances++;
+    if (instancing && !native && !blended(record)) {
+      while (i + instances < end && compatible(command, commands[i + instances])) instances++;
     }
     encoder.setPipeline(pipeline);
     encoder.setBindGroup(0, native ? command.instanceBindGroup : bindGroup,
@@ -59,18 +62,18 @@ function snapshot(command, lightGroup) {
     indexFormat: command.indexFormat, surfaceBuffer: command.record.surfaceBuffer,
     textureGroup: command.record.textureGroup, lit: command.record.lit,
     lightGroup: command.record.lit ? lightGroup : null,
-    blend: command.record.alphaMode === 'BLEND'};
+    blend: blended(command.record)};
 }
-function matches(recorded, commands, length, lightGroup) {
+function matches(recorded, commands, length, lightGroup, start) {
   if (recorded.length !== length) return false;
   for (let i = 0; i < length; i++) {
-    const a = recorded[i], b = commands[i], r = b.record;
+    const a = recorded[i], b = commands[start + i], r = b.record;
     if (a.pipeline !== b.pipeline || a.first !== b.first || a.count !== b.count ||
         a.instanceCount !== b.instanceCount || a.instanceBindGroup !== b.instanceBindGroup ||
         a.indexBuffer !== b.indexBuffer || a.indexFormat !== b.indexFormat ||
         a.surfaceBuffer !== r.surfaceBuffer || a.textureGroup !== r.textureGroup ||
         a.lit !== r.lit || a.lightGroup !== (r.lit ? lightGroup : null) ||
-        a.blend !== (r.alphaMode === 'BLEND') || a.vertexBuffers.length !== b.vertexBuffers.length)
+        a.blend !== blended(r) || a.vertexBuffers.length !== b.vertexBuffers.length)
       return false;
     for (let slot = 0; slot < a.vertexBuffers.length; slot++)
       if (a.vertexBuffers[slot] !== b.vertexBuffers[slot]) return false;
@@ -98,21 +101,22 @@ export function createAnimationRenderBundleCache(device, {
     throw new RangeError('Invalid render bundle cache capacity');
   const descriptor = {label, colorFormats: format === null ? [] : [format], sampleCount,
     ...(depthFormat === null ? {} : {depthStencilFormat: depthFormat}),
-    depthReadOnly: false, stencilReadOnly: true};
+    depthReadOnly: false, stencilReadOnly: !hasAnimationStencil(depthFormat)};
   let entries = [], disposed = false;
   let builds = 0, reuses = 0, executions = 0, evictions = 0, encodedDrawCalls = 0;
   const parameters = {bindGroup, stride, instancing, lightGroup: null};
   return Object.freeze({
-    execute(pass, commands, length, lightGroup) {
+    execute(pass, commands, length, lightGroup, start = 0) {
       if (disposed) throw new Error('Render bundle cache is disposed');
-      if (!Number.isSafeInteger(length) || length < 0 || length > maxDraws || length > commands.length)
+      if (!Number.isSafeInteger(length) || length < 0 || length > maxDraws ||
+          !Number.isSafeInteger(start) || start < 0 || start + length > maxDraws || start + length > commands.length)
         throw new RangeError('Render bundle draw list exceeds capacity');
       // Empty frames still run attachment load/store operations in the caller.
       // They do not allocate a bundle or disturb the pass's binding state.
       if (length === 0) return 0;
       let index = -1;
       for (let i = entries.length - 1; i >= 0; i--) {
-        if (matches(entries[i].commands, commands, length, lightGroup)) { index = i; break; }
+        if (entries[i].start === start && matches(entries[i].commands, commands, length, lightGroup, start)) { index = i; break; }
       }
       if (index >= 0) {
         const entry = entries[index];
@@ -121,7 +125,7 @@ export function createAnimationRenderBundleCache(device, {
         reuses++; executions++;
         return entry.drawCalls;
       }
-      parameters.lightGroup = lightGroup;
+      parameters.lightGroup = lightGroup; parameters.start = start;
       let bundle, drawCalls;
       try {
         const encoder = device.createRenderBundleEncoder(descriptor);
@@ -130,10 +134,10 @@ export function createAnimationRenderBundleCache(device, {
       } finally { parameters.lightGroup = null; }
       // Capture independent data, not the renderer's reused command objects.
       const recorded = [];
-      for (let i = 0; i < length; i++) recorded.push(snapshot(commands[i], lightGroup));
+      for (let i = start; i < start + length; i++) recorded.push(snapshot(commands[i], lightGroup));
       pass.executeBundles([bundle]);
       if (entries.length === maxBundles) { entries.shift(); evictions++; }
-      entries.push({commands: recorded, bundle, drawCalls});
+      entries.push({commands: recorded, bundle, drawCalls, start});
       builds++; executions++; encodedDrawCalls += drawCalls;
       return drawCalls;
     },
@@ -146,4 +150,28 @@ export function createAnimationRenderBundleCache(device, {
         maxBundles, maxDraws});
     },
   });
+}
+
+function samePassState(a, b) {
+  const x = a.blendConstant, y = b.blendConstant;
+  return (a.stencilReference ?? null) === (b.stencilReference ?? null) &&
+    (x == null ? y == null : y != null && x.every((value, index) => value === y[index]));
+}
+/** Pass-only state is live, never recorded into a bundle. Contiguous runs retain
+ * source order and original arena indices. Changing values reuses structurally
+ * identical bundles; changing run boundaries creates bounded new schedules.
+ */
+export function encodeAnimationRenderSpans(pass, commands, length, parameters, cache = null) {
+  let calls = 0;
+  for (let start = 0; start < length;) {
+    const command = commands[start];
+    let end = start + 1;
+    while (end < length && samePassState(command, commands[end])) end++;
+    if (command.blendConstant != null) pass.setBlendConstant(command.blendConstant);
+    if (command.stencilReference != null) pass.setStencilReference(command.stencilReference);
+    calls += cache ? cache.execute(pass, commands, end - start, parameters.lightGroup, start)
+      : encodeAnimationDraws(pass, commands, end - start, {...parameters, start});
+    start = end;
+  }
+  return calls;
 }

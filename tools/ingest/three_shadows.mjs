@@ -215,7 +215,8 @@ export function withThreeShadowReceivers(renderer, maxDraws = 1024) {
       try {
         for (const span of spans) {
           renderer.render({...frame, draws: span.draws, shadow: span.shadowed ? frame.shadow : null,
-            ...(submitted ? {loadOp: 'load', depthLoadOp: 'load'} : {})});
+            ...(submitted ? {loadOp: 'load', depthLoadOp: 'load',
+              ...(frame.stencilLoadOp !== undefined ? {stencilLoadOp: 'load'} : {})} : {})});
           submitted++; calls += renderer.drawCallCount;
         }
         drawCount = frame.draws.length; drawCallCount = calls; colorPassCount = submitted;

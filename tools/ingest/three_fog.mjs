@@ -143,7 +143,8 @@ export function withThreeFogReceivers(renderer, maxDraws = 1024) {
         if (!spans.length) spans.push({enabled: false, draws: []});
         for (const span of spans) {
           renderer.render({...captured, draws: span.draws, fog: span.enabled ? fog : null,
-            ...(submitted ? {loadOp: 'load', depthLoadOp: 'load'} : {})});
+            ...(submitted ? {loadOp: 'load', depthLoadOp: 'load',
+              ...(frame.stencilLoadOp !== undefined ? {stencilLoadOp: 'load'} : {})} : {})});
           submitted++; calls += renderer.drawCallCount; passes += renderer.colorPassCount ?? 1;
         }
         drawCount = count; drawCallCount = calls; colorPassCount = passes; return owner;

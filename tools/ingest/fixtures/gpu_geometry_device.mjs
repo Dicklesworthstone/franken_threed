@@ -23,7 +23,7 @@ export function geometryDevice() {
     createRenderBundleEncoder(desc) {
       if (d.bundleError) throw d.bundleError;
       const bundle={desc,draws:[]}; d.bundleEncoders.push(bundle);
-      return {...drawEncoder(bundle), finish() {
+      return {...drawEncoder(bundle, true), finish() {
         if (d.bundleFinishError) throw d.bundleFinishError;
         return bundle;
       }};
@@ -62,21 +62,27 @@ export function geometryDevice() {
       d.snapshots.push(snapshots);
     }, onSubmittedWorkDone(){return d.completion ?? Promise.resolve();}},
   };
-  function drawEncoder(target) {
+  function drawEncoder(target, isBundle = false) {
+    let blendConstant, stencilReference;
+    const passState = () => ({...(blendConstant ? {blendConstant: [...blendConstant]} : {}),
+      ...(stencilReference !== undefined ? {stencilReference} : {})});
     let pipeline, index; const streams=new Map(), groups=new Map();
     const draw=(indexed,args)=>{
       d.encodedDrawCalls++;
       assert.ok(pipeline && groups.has(0) && streams.has(0),'complete draw bindings');
       if(indexed)assert.ok(index,'index binding');
-      target.draws.push({indexed,args,pipeline,index,streams:new Map(streams),groups:new Map(groups)});
+      target.draws.push({indexed,args,pipeline,index,streams:new Map(streams),groups:new Map(groups),...passState()});
     };
-    return {setPipeline(x){pipeline=x;}, setBindGroup(slot,group,offsets=[]){groups.set(slot,{group,offsets:[...offsets]});},
+    return {...(isBundle ? {} : {
+      setBlendConstant(value){blendConstant=Array.from(value);},
+      setStencilReference(value){stencilReference=value;},
+    }),setPipeline(x){pipeline=x;}, setBindGroup(slot,group,offsets=[]){groups.set(slot,{group,offsets:[...offsets]});},
       setVertexBuffer(slot,buffer){streams.set(slot,buffer);}, setIndexBuffer(buffer,format){index={buffer,format};},
       draw(...args){draw(false,args);}, drawIndexed(...args){draw(true,args);}, setViewport(){},setScissorRect(){},end(){},
       executeBundles(bundles){
         if(d.bundleExecuteError)throw d.bundleExecuteError;
         target.bundles.push(...bundles);
-        for(const bundle of bundles)target.draws.push(...bundle.draws);
+        for(const bundle of bundles)target.draws.push(...bundle.draws.map(draw=>({...draw,...passState()})));
         pipeline=undefined;index=undefined;streams.clear();groups.clear();
       }};
   }
