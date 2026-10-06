@@ -51,11 +51,17 @@ const MAX_PENDING = 64;
 /** True when the error is a recoverable "call prepare()" boundary from the bridge. */
 const isPrepareBoundary = error => error?.code === 'THREE_SCENE_PREPARE' || error?.code === 'F3D_RENDERER_PREPARE';
 
+function inspectorStub() {
+  return {isRunning: false, setRenderer() { return this; }, begin() { this.isRunning = true; }, finish() { this.isRunning = false; },
+    beginRender() {}, finishRender() {}, beginCompute() {}, finishCompute() {}, dispose() {}};
+}
+
 export function createWebGPURendererClass(THREE, classOptions = {}) {
   if (THREE?.REVISION !== '186' || typeof THREE.Scene !== 'function' || typeof THREE.Color !== 'function' ||
       typeof THREE.Vector2 !== 'function') fail('SOURCE', 'Supply the pinned r186 three module namespace');
   if (!classOptions || typeof classOptions !== 'object' || Array.isArray(classOptions)) fail('OPTIONS', 'Expected class options');
-  const {gpu: defaultGpu, maxDraws = 4096, maxBindings = 2048, scene: sceneLimits = {}} = classOptions;
+  const {gpu: defaultGpu, maxDraws = 16384, maxBindings = 16384, scene: sceneLimits = {}, exactBackend = null} = classOptions;
+  if (exactBackend !== null && typeof exactBackend !== 'function') fail('OPTIONS', 'exactBackend must be a renderer constructor');
   if (!Number.isSafeInteger(maxDraws) || maxDraws < 1 || !Number.isSafeInteger(maxBindings) || maxBindings < 1)
     fail('OPTIONS', 'Expected positive draw and binding capacities');
   const {NoToneMapping, SRGBColorSpace} = THREE;
@@ -145,10 +151,14 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         canvas = null, antialias = false, alpha = true, depth = true, stencil = false, samples = 0,
         forceWebGL = false, logarithmicDepthBuffer = false, reversedDepthBuffer = false,
       } = parameters;
-      // Route selection precedes construction: a WebGL request belongs to the
-      // exact-backend route, never to this new-backend implementation.
-      if (forceWebGL) fail('ROUTE', 'forceWebGL selects the exact WebGL backend route, not this renderer');
-      if (parameters.context) fail('ROUTE', 'A supplied rendering context belongs to the exact backend route');
+      // Route selection precedes construction and any canvas binding: a WebGL
+      // request (including a runtime value such as `forceWebGL: !api.webgpu`)
+      // belongs to the exact-backend route. With the pinned upstream renderer
+      // supplied, construct it unchanged; it is never this new backend.
+      if (forceWebGL || parameters.context) {
+        if (exactBackend) return new exactBackend(parameters);
+        fail('ROUTE', 'forceWebGL or a supplied context selects the exact backend route, not this renderer');
+      }
       this.isRenderer = true;
       this.isWebGPURenderer = true;
       this.isF3DRenderer = true;
@@ -174,7 +184,13 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         autoReset: true, calls: 0, frame: 0,
         render: {calls: 0, frameCalls: 0, drawCalls: 0, triangles: 0, points: 0, lines: 0, timestamp: 0},
         compute: {calls: 0, frameCalls: 0, timestamp: 0},
-        memory: {geometries: 0, textures: 0},
+        // Source Info shape. Filled from this backend's owned residency (geometry,
+        // instance/deformation streams, draw/material buffers); fields this
+        // backend does not track stay zero.
+        memory: Object.fromEntries(['attributes', 'attributesSize', 'geometries', 'indexAttributes', 'indexAttributesSize',
+          'indirectStorageAttributes', 'indirectStorageAttributesSize', 'programs', 'programsSize', 'readbackBuffers',
+          'readbackBuffersSize', 'renderTargets', 'storageAttributes', 'storageAttributesSize', 'textures', 'texturesSize',
+          'uniformBuffers', 'uniformBuffersSize', 'total'].map(key => [key, 0])),
         // F3D's own namespace: native submissions are not source draw counts.
         f3d: {route: 'general-webgpu', deferredRenders: 0, presentedRenders: 0, nativeDrawCalls: 0, preparations: 0},
         reset: () => { this.info.render.drawCalls = 0; this.info.render.frameCalls = 0; this.info.compute.frameCalls = 0; },
@@ -201,12 +217,29 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._animationCallback = null;
       this._animationHandle = null;
       this._disposed = false;
+      this._renderUid = 0;
+      // Tooling surface (e.g. the r186 Inspector addon). This backend records no
+      // GPU timestamps: hasTimestamp stays false and no timing is reported.
+      this._backend = {isWebGPUBackend: true, isF3DBackend: true, device: null, trackTimestamp: false, hasTimestamp: false,
+        hasTimestampQuery: () => false, getTimestampUID: () => null, delete() {}};
+      // The source frame clock (Animation advances it once per loop tick).
+      this._nodes = {nodeFrame: typeof THREE.NodeFrame === 'function' ? new THREE.NodeFrame() : {frameId: 0, time: 0, deltaTime: 0, update() { this.frameId++; }}};
+      this._inspector = typeof THREE.InspectorBase === 'function' ? new THREE.InspectorBase() : inspectorStub();
+      this._inspector.setRenderer(this);
     }
+    set inspector(value) {
+      this._inspector?.setRenderer(null);
+      this._inspector = value;
+      this._inspector.setRenderer(this);
+    }
+    get inspector() { return this._inspector; }
+    hasFeature(name) { return !!this._session?.device?.features?.has(name); }
+    async hasFeatureAsync(name) { await this.init(); return this.hasFeature(name); }
 
     get initialized() { return this._initialized; }
     hasInitialized() { return this._initialized; }
     get coordinateSystem() { return THREE.WebGPUCoordinateSystem; }
-    get backend() { return this._session ? {isWebGPUBackend: true, isF3DBackend: true, device: this._session.device} : null; }
+    get backend() { this._backend.device = this._session?.device ?? null; return this._backend; }
 
     init() {
       if (this._initPromise) return this._initPromise;
@@ -330,10 +363,14 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       if (this._deferredError) { const error = this._deferredError; this._deferredError = null; throw error; }
       if (!(scene instanceof THREE.Object3D) || !(camera instanceof THREE.Camera)) fail('SOURCE', 'Expected a source scene and camera');
       if (!scene.isScene) fail('UNSUPPORTED', 'Rendering a non-Scene root object is not admitted');
-      if (this.info.autoReset === true) this.info.reset();
       this.info.calls++;
       this.info.render.calls++;
       this.info.render.frameCalls++;
+      // Source timestamp UID shape `<call id>:f<frame>` (Inspector groups by call id).
+      this._inspector.beginRender(`render:${++this._renderUid}:f${this.info.frame}`, scene, camera, null);
+      try { return this._renderFrame(scene, camera); } finally { this._inspector.finishRender(); }
+    }
+    _renderFrame(scene, camera) {
       const request = {scene, camera, frame: this._frame(scene), key: sceneKey(this, scene)};
       this._wanted.set(scene, request.key);
       const entry = this._dispatcher?.entry(scene);
@@ -352,6 +389,11 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       if (d) {
         this.info.render.drawCalls += d.sourceDraws;
         this.info.f3d.nativeDrawCalls = d.drawCalls;
+        const memory = this.info.memory;
+        memory.geometries = d.geometryCount;
+        memory.attributesSize = d.geometryBytes + d.instanceBytes + d.deformationBytes;
+        memory.uniformBuffersSize = d.rendererBytes;
+        memory.total = memory.attributesSize + memory.uniformBuffersSize;
       }
       this.info.f3d.presentedRenders++;
     }
@@ -410,12 +452,19 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       if (this._initialized === false && callback !== null) await this.init();
       const host = this.domElement.ownerDocument?.defaultView ?? globalThis;
       if (this._animationHandle !== null) { host.cancelAnimationFrame?.(this._animationHandle); this._animationHandle = null; }
+      if (this._inspector.isRunning) this._inspector.finish();
       this._animationCallback = callback;
       if (callback === null || this._disposed) return;
       const tick = time => {
         if (this._animationCallback !== callback || this._disposed) return;
         this._animationHandle = host.requestAnimationFrame(tick);
-        this.info.frame++;
+        // Source Animation order: finish the previous inspected frame, then begin.
+        if (this._inspector.isRunning) this._inspector.finish();
+        if (this.info.autoReset === true) this.info.reset();
+        this._nodes.nodeFrame.update();
+        this._renderUid = 0; // stable per-frame call ids, like source render contexts
+        this.info.frame = this._nodes.nodeFrame.frameId;
+        this._inspector.begin();
         callback(time, null);
       };
       this._animationHandle = host.requestAnimationFrame(tick);
@@ -427,6 +476,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this.setAnimationLoop(null);
       this._disposed = true;
       this._pending = [];
+      this._inspector.dispose?.();
       if (this._session && !this._drain) this._session.dispose();
       else if (this._drain) this._drain.finally(() => this._session?.dispose()).catch(() => {});
     }

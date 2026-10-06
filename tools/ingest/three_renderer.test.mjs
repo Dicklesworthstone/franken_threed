@@ -74,6 +74,12 @@ test('source construction surface: render before init throws the source error', 
   assert.deepEqual(renderer.getSize(new T.Vector2()).toArray(), [200, 100]);
   assert.deepEqual(renderer.getDrawingBufferSize(new T.Vector2()).toArray(), [400, 200]);
   assert.throws(() => new WebGPURenderer({forceWebGL: true}), {code: 'F3D_RENDERER_ROUTE'});
+  // With the pinned upstream class supplied, a runtime WebGL request constructs it unchanged.
+  const Routed = createWebGPURendererClass(T, {exactBackend: T.WebGPURenderer});
+  globalThis.document ??= {createElementNS: () => ({width: 300, height: 150, style: {}, getContext() { return null; }})};
+  const exact = new Routed({canvas: {width: 1, height: 1, style: {}, getContext() { return null; }}, forceWebGL: true});
+  assert.ok(exact instanceof T.WebGPURenderer); assert.equal(exact.isF3DRenderer, undefined);
+  assert.equal(new Routed({canvas: canvasFixture().canvas}).isF3DRenderer, true);
   assert.throws(() => new WebGPURenderer({canvas, bogus: 1}), {code: 'F3D_RENDERER_OPTIONS'});
 });
 
@@ -91,6 +97,7 @@ test('ordinary first frame: render defers to preparation without presenting an e
   // Steady state: immediate synchronous submission with live source values.
   for (let i = 0; i < 3; i++) {
     f.mesh.rotation.y = 0.3 * i; f.material.color.setRGB(0.1 * i, 0.2, 0.3);
+    renderer.info.reset(); // Without setAnimationLoop the source leaves resets to the application.
     renderer.render(f.scene, f.camera);
   }
   assert.equal(acquired(), 4); assert.equal(renderer.info.f3d.deferredRenders, 1);
@@ -136,6 +143,7 @@ test('structural edits defer only the affected frames and preserve application c
   assert.equal(acquired(), 1, 'a frame needing preparation does not present');
   renderer.render(f.scene, f.camera); // Coalesced: a later clearing request supersedes the earlier one.
   assert.equal(renderer.info.f3d.deferredRenders, 2);
+  renderer.info.reset();
   await flush(renderer);
   assert.equal(acquired(), 2); assert.equal(renderer.info.render.drawCalls, 2);
   renderer.render(f.scene, f.camera);

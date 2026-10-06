@@ -414,7 +414,8 @@ export function webgpuRendererRoutePlugin({ targetUrls }) {
         `export * from ${upstream};\n` +
         `import * as F3D_THREE from ${upstream};\n` +
         `import { createWebGPURendererClass } from ${JSON.stringify(THREE_RENDERER_URL)};\n` +
-        `export const WebGPURenderer = createWebGPURendererClass(F3D_THREE);\n`
+        // forceWebGL/context requests construct the unchanged upstream renderer.
+        `export const WebGPURenderer = createWebGPURendererClass(F3D_THREE, { exactBackend: F3D_THREE.WebGPURenderer });\n`
       );
     },
     api: {

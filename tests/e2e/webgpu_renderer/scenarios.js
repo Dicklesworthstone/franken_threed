@@ -133,6 +133,23 @@ export const scenarios = {
     quad(0.9, -0.5, 0xffffff, { polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -4 }).scale.set(0.5, 0.5, 1);
     return { scene, camera: camera(THREE) };
   },
+  // WebGPU-build node-material classes with no assigned nodes (H1 uses MeshToonNodeMaterial).
+  node_materials(THREE) {
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0xc1c1c1);
+    const kinds = ['MeshToonNodeMaterial', 'MeshStandardNodeMaterial', 'MeshPhongNodeMaterial', 'MeshLambertNodeMaterial', 'MeshBasicNodeMaterial'];
+    kinds.forEach((kind, i) => {
+      const mesh = new THREE.Mesh(new THREE.IcosahedronGeometry(0.4, 1), new THREE[kind]({ color: new THREE.Color().setHSL(i / 5, 0.6, 0.5) }));
+      mesh.position.x = (i - 2) * 0.85;
+      scene.add(mesh);
+    });
+    const light = new THREE.DirectionalLight(0xffffff, 3.4); light.position.set(1, 1, 1);
+    const group = new THREE.BundleGroup();
+    const lines = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(3.6, 0.2, 0.2)), new THREE.LineBasicNodeMaterial({ color: 0x000000 }));
+    lines.position.y = -0.8; group.add(lines);
+    scene.add(light, group);
+    return { scene, camera: camera(THREE) };
+  },
 };
 function camera(THREE, position = [0, 0, 3.2]) {
   const c = new THREE.PerspectiveCamera(50, 320 / 240, 0.1, 50);

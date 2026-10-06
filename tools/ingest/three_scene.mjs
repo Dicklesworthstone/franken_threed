@@ -140,6 +140,12 @@ export async function createGpuThreeScene(device,scene,{
     [three.MeshPhongMaterial.prototype,'phong'],[three.MeshToonMaterial.prototype,'toon'],
     [three.MeshStandardMaterial.prototype,'metallic-roughness'],
     ...['LineBasicMaterial','PointsMaterial'].filter(name=>typeof three[name]==='function').map(name=>[three[name].prototype,'unlit']),
+    // Node-material classes of the WebGPU build with every node slot null are the
+    // same shading models: the source WebGPU renderer converts the classic
+    // materials into exactly these classes. Any assigned node fails explicitly.
+    ...[['MeshBasicNodeMaterial','unlit'],['MeshLambertNodeMaterial','lambert'],['MeshPhongNodeMaterial','phong'],
+      ['MeshToonNodeMaterial','toon'],['MeshStandardNodeMaterial','metallic-roughness'],['LineBasicNodeMaterial','unlit'],
+      ['PointsNodeMaterial','unlit']].filter(([name])=>typeof three[name]==='function').map(([name,model])=>[three[name].prototype,model]),
   ]);
   const geometries=new Map(),instances=new Map(),materials=new Map(),deformations=new Map();
   const pendingDeformations=new Set(),deformationLifetime=new AbortController();
@@ -333,8 +339,12 @@ export async function createGpuThreeScene(device,scene,{
     if(topology!=='triangles'&&(m.map||m.alphaMap))fail('MATERIAL','Textured line/point primitives are not admitted');
     for(const descriptor of Object.values(Object.getOwnPropertyDescriptors(m)))
       if(!Object.hasOwn(descriptor,'value'))fail('HOOK','Accessor-backed material fields are not admitted');
+    if(m.isNodeMaterial){
+      for(const key of Object.keys(m))if(key.endsWith('Node')&&m[key]!==null)fail('MATERIAL',`Custom ${key} on ${m.type} requires the node shader path`);
+      if(shading!=='unlit'&&m.lights!==true)fail('MATERIAL','Node materials with lights disabled are not admitted');
+    }
     if(m.onBeforeRender!==three.Material.prototype.onBeforeRender||m.onBeforeCompile!==three.Material.prototype.onBeforeCompile||
-        m.customProgramCacheKey!==three.Material.prototype.customProgramCacheKey)fail('HOOK','Custom material shader/render hooks require their original component');
+        m.customProgramCacheKey!==(m.isNodeMaterial?three.NodeMaterial:three.Material).prototype.customProgramCacheKey)fail('HOOK','Custom material shader/render hooks require their original component');
     if(m.wireframe||m.alphaHash||m.alphaToCoverage||(!clippingEnabled&&m.clippingPlanes?.length))
       fail('MATERIAL','Wireframe, hashed/coverage alpha and clipping are not admitted');
     // Source r186 WebGPU applies material stencil state only when the target has

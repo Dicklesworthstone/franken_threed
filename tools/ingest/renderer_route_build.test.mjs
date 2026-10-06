@@ -82,3 +82,14 @@ export const gl = document.createElement('canvas').getContext('webgl2');`);
   const n = await buildApplication(none.entry, none.out, { routeWebGPURenderer: true });
   assert.equal(n.rendererRoute.reason, "no-webgpu-renderer-construction");
 });
+
+test("the unmodified H1 example (runtime forceWebGL choice) routes to the new backend", async () => {
+  const out = fs.mkdtempSync(path.join(tmpdir(), "f3d_route_h1_"));
+  const entry = path.resolve(upstreamBuild, "../examples/webgpu_performance_renderbundle.html");
+  const result = await buildApplication(entry, path.join(out, "out"), { routeWebGPURenderer: true });
+  assert.equal(result.rendererRoute.routed, true);
+  assert.ok(result.rendererRoute.decisions[0].reasons.includes("unresolved-force-webgl"));
+  // A truthy runtime forceWebGL constructs the unchanged upstream renderer.
+  const code = fs.readFileSync(path.join(out, "out", "inline_0.js"), "utf8");
+  assert.ok(code.includes("exactBackend"));
+});
