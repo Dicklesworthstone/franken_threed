@@ -291,6 +291,37 @@ export const scenarios = {
     scene.add(points);
     return { scene, camera: camera(THREE) };
   },
+  // Built-in materials the WebGL surface draws with ShaderLib programs: cube
+  // envMap reflection/refraction with each combine op, lightMap, bumpMap.
+  shaderlib_maps(THREE) {
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x202020);
+    const face = (r, g, b) => {
+      const n = 8, d = new Uint8Array(n * n * 4);
+      for (let i = 0; i < n * n; i++) { const k = ((i % n) + (i >> 3)) % 2 ? 1 : 0.55; d.set([r * k, g * k, b * k, 255], i * 4); }
+      const t = new THREE.DataTexture(d, n, n); t.needsUpdate = true; return t;
+    };
+    const cube = new THREE.CubeTexture([face(255, 60, 60), face(60, 255, 60), face(60, 60, 255), face(255, 255, 60), face(60, 255, 255), face(255, 60, 255)]);
+    cube.needsUpdate = true;
+    const refract = cube.clone(); refract.mapping = THREE.CubeRefractionMapping; refract.needsUpdate = true;
+    const lightTex = face(255, 200, 120); lightTex.channel = 0;
+    const bump = new THREE.DataTexture(Uint8Array.from({ length: 16 * 16 * 4 }, (_, i) => (i % 4 === 3 ? 255 : ((i >> 2) % 16 < 8 ? 40 : 220))), 16, 16); bump.needsUpdate = true;
+    const mats = [
+      new THREE.MeshBasicMaterial({ color: 0xffffff, envMap: cube }),
+      new THREE.MeshLambertMaterial({ color: 0xdddddd, envMap: cube, combine: THREE.MixOperation, reflectivity: 0.6 }),
+      new THREE.MeshPhongMaterial({ color: 0xffffff, envMap: refract, refractionRatio: 0.85, combine: THREE.AddOperation, reflectivity: 0.4, shininess: 40 }),
+      new THREE.MeshLambertMaterial({ color: 0xffffff, lightMap: lightTex, lightMapIntensity: 1.5 }),
+      new THREE.MeshPhongMaterial({ color: 0x88aaff, bumpMap: bump, bumpScale: 4 }),
+    ];
+    mats.forEach((m, i) => {
+      const mesh = new THREE.Mesh(new THREE.SphereGeometry(0.42, 32, 16), m);
+      mesh.position.set((i % 3 - 1) * 1.0, i < 3 ? 0.45 : -0.5, 0); mesh.rotation.y = 0.5 + i;
+      scene.add(mesh);
+    });
+    const light = new THREE.DirectionalLight(0xffffff, 2); light.position.set(1, 2, 3);
+    scene.add(light, new THREE.AmbientLight(0x404040, 1), new THREE.PointLight(0xff8844, 4, 0, 2));
+    return { scene, camera: camera(THREE, [0, 0, 3.4]) };
+  },
   // Per-axis normalScale on the derivative tangent frame (GLTFLoader sets y=-1 when
   // geometry has no tangents) and a flat-shaded lit mesh with no normal attribute.
   normal_scale_and_flat(THREE) {

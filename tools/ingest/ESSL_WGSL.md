@@ -100,3 +100,29 @@ absolute channel difference 2 over 320×240). Examples now running:
 `webgl_buffergeometry_instancing`, `webgl_buffergeometry_instancing_billboards`,
 `webgl_custom_attributes_points`, `webgl_custom_attributes_points3`,
 `webgl_buffergeometry_custom_attributes_particles`.
+
+## Built-in materials through ShaderLib programs (WebGL surface)
+
+`three_webgl_program.mjs` ports r186 `WebGLPrograms.getParameters` /
+`getUniforms`, `WebGLProgram` source assembly, `WebGLLights` (setup /
+setupView) and `WebGLMaterials` uniform refresh as **retained JavaScript**
+construction components (MIT, three.js authors), taking the application's own
+`THREE` module so runtime `ShaderChunk`/`ShaderLib` edits are honored. The
+assembled programs are byte-identical to what r186 WebGLRenderer hands the
+driver (verified against browser-captured sources); ShaderMaterial now uses
+the same parameter path (fixes `USE_UV1..3`, which upstream derives from map
+channels, not geometry).
+
+On the WebGL surface the scene bridge draws built-in materials with their
+ShaderLib program when the core material path rejects a feature, and always
+for `PointsMaterial` (GL point sizes): e.g. cube `envMap`
+reflection/refraction with every `combine` op, `lightMap`, `bumpMap`,
+`displacementMap`. Lights are wired from the ported light state (no shadow
+maps yet). ShaderMaterial `lights: true` works through the same wiring.
+
+Not admitted yet (explicit errors): MeshStandard/Physical programs (DFG LUT
+and PMREM inputs), PMREM / equirectangular environments, Sprite / Distance /
+Shadow materials, programs receiving shadow-casting lights.
+
+Evidence: scenario `shaderlib_maps` vs upstream WebGLRenderer (340 of 76,800
+pixels differ slightly); `helpers_lines_points` now draws real point sizes.

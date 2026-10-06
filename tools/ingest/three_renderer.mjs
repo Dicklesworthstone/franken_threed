@@ -127,7 +127,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
               textureTransforms: true, alphaMaps: true,
               // ShaderMaterial programs (WebGLRenderer semantics) on the WebGL surface.
               program: owner._shaderEncodedOutput && !owner._hdr ? owner._programSupport ??= createThreeProgramSupport({three: THREE,
-                state: () => ({toneMapping: owner.toneMapping, toneMappingExposure: owner.toneMappingExposure, outputColorSpace: owner.outputColorSpace})}) : null,
+                state: () => ({toneMapping: owner.toneMapping, toneMappingExposure: owner.toneMappingExposure, outputColorSpace: owner.outputColorSpace,
+                  pixelRatio: owner._pixelRatio, height: owner._height})}) : null,
               fog: scene.fog ? {} : null, environment: scene.environment ? {} : null,
               background: background ? {} : null,
               shadow: owner.shadowMap.enabled ? {} : null,

@@ -99,6 +99,8 @@ test('varyings link by name with matching locations; arrays and matrices use one
   assert.match(r.fragment, /@location\(2\) vArr_e1: vec4<f32>/);
   assert.match(r.fragment, /@location\(6\) @interpolate\(flat\) vI: i32/);
   assert.throws(() => program(vs, F('color = vec4(vMissing);', 'in float vMissing;')), /not written/);
+  // Declared but unused (ShaderLib does this): GL links, and so do we.
+  assert.doesNotMatch(program(vs, F('color = vec4(1.0);', 'in float vMissing;')).fragment, /vMissing_|location\(\d+\) vMissing/);
 });
 
 test('ESSL 1.00 sources: gl_FragColor and texture2D; texture() in vertex stages samples level 0', () => {

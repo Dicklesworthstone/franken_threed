@@ -142,10 +142,8 @@ export function compileEsslProgram(vertexSource, fragmentSource, {defines = {}, 
     v.location = location;
     location += ioSlots(v.type).length;
   }
-  for (const input of units.fragment.inputs) {
-    if (input.builtin) continue;
-    if (!varyings.some(v => v.name === input.name)) essError(`Fragment input ${input.name} is not written by the vertex stage`);
-  }
+  // GL links a fragment input without a vertex output only if the input is never
+  // used; fragmentEntry() enforces that after translation (unused inputs vanish).
   // Point sprites: GL rasterizes each vertex as a gl_PointSize square; here an
   // instanced quad per vertex, with gl_PointCoord as one extra varying.
   if (points) shared.needsTarget = true;
@@ -297,6 +295,7 @@ class Unit {
     this.consts = [];             // module-scope const lines
     this.deferredInit = [];       // global initializers evaluated at entry
     this.used = new Set();
+    this.usedGlobals = new Set();
     this.helpers = new Map();
     this.localStructs = [];
     this.temp = 0;
@@ -603,6 +602,8 @@ class Unit {
   }
   fragmentEntry(varyings, initLines, pointCoordLocation = null) {
     const fields = [], copy = [];
+    for (const i of this.inputs) if (!varyings.some(v => v.name === i.name) && this.usedGlobals.has(i.name))
+      essError(`Fragment input ${i.name} is used but not written by the vertex stage`);
     if (this.used.has('gl_PointCoord')) {
       if (pointCoordLocation === null) essError('gl_PointCoord is only defined for point primitives');
       fields.push(`@location(${pointCoordLocation}) f3d_point_coord: vec2<f32>,`);
@@ -610,6 +611,7 @@ class Unit {
     }
     for (const i of this.inputs) {
       const v = varyings.find(x => x.name === i.name);
+      if (!v) continue;
       i.location = v.location;
       const interp = v.flat ? ' @interpolate(flat)' : '';
       ioSlots(i.type).forEach((slot, k) => {
@@ -1011,7 +1013,7 @@ class Unit {
       case 'samplerParam': return {c: null, t: s.type, smp: {kind: 'param', w: s.w}};
       case 'pparam': return {c: `(*${s.w})`, t: s.type};
       case 'ublock': return {c: null, t: {k: 'ublock'}, block: s};
-      default: return {c: s.w, t: s.type};
+      default: if (this.globals.get(e.name) === s) this.usedGlobals.add(e.name); return {c: s.w, t: s.type};
     }
   }
   samplerNames(r, line) {

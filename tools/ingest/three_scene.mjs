@@ -389,20 +389,45 @@ export async function createGpuThreeScene(device,scene,{
     return view;
   }
   const programKeyOf=object=>object.isInstancedMesh?object:object.geometry;
+  const programCapable=m=>m?.isShaderMaterial===true||(programRoute()&&programSupport.shaderLibMaterial(m));
+  // Program route on the WebGL surface: ShaderMaterial, and ShaderLib programs
+  // for built-in materials (WebGLRenderer's own GLSL) where the core lacks a feature.
+  const programRoute=()=>!!programSupport&&renderOptions.outputTransfer==='srgb';
+  let programCamera=null;
+  /** WebGLRenderer light collection order: depth-first, visible, camera layers. */
+  function programLightList(camera){
+    const out=[],walk=o=>{if(!o.visible)return;if(o.isLight&&(!camera||o.layers.test(camera.layers)))out.push(o);for(const c of o.children)walk(c);};
+    walk(scene);return out;
+  }
+  function programEnvironment(m){
+    // WebGLRenderer.getProgram: environment for Lambert/Phong/Standard; PMREM unless
+    // Lambert/Phong carry their own envMap. Admitted: raw cube reflection/refraction maps.
+    const environment=(m.isMeshLambertMaterial||m.isMeshPhongMaterial||m.isMeshStandardMaterial)?scene.environment:null;
+    const usePMREM=m.isMeshStandardMaterial||(m.isMeshLambertMaterial&&!m.envMap)||(m.isMeshPhongMaterial&&!m.envMap);
+    const source=m.isShaderMaterial?null:(m.envMap||environment);
+    if(!source)return {envMap:null,envMapRotation:m.envMapRotation};
+    if(usePMREM)fail('MATERIAL','PMREM environments for ShaderLib programs are not admitted yet');
+    if(!source.isCubeTexture||![three.CubeReflectionMapping,three.CubeRefractionMapping].includes(source.mapping))
+      fail('TEXTURE','Equirectangular/render-target environment maps need cube conversion, not admitted yet');
+    return {envMap:source,envMapRotation:m.envMap?m.envMapRotation:scene.environmentRotation};
+  }
   function programDescription(m,topology,object){
-    if(!programSupport)fail('MATERIAL',`Unsupported source material: ${m?.type}`);
-    if(renderOptions.outputTransfer!=='srgb')fail('MATERIAL','ShaderMaterial runs on the WebGL-surface route with display-referred output (no renderer tone-mapping pass) only');
-    if(!object)fail('MATERIAL','ShaderMaterial needs its object for program assembly');
-    if(shadowEnabled&&object.castShadow)fail('SHADOW','ShaderMaterial shadow casters are not admitted yet');
-    if(scene.overrideMaterial)fail('MATERIAL','overrideMaterial with ShaderMaterial is not admitted yet');
+    if(!programRoute())fail('MATERIAL',`Unsupported source material: ${m?.type}`);
+    if(!object)fail('MATERIAL','Program materials need their object for program assembly');
+    if(shadowEnabled&&object.castShadow)fail('SHADOW','Program shadow casters are not admitted yet');
+    if(scene.overrideMaterial)fail('MATERIAL','overrideMaterial with program materials is not admitted yet');
+    if(programSupport.needsLights(m)&&shadowEnabled&&programLightList(programCamera).some(l=>l.castShadow))
+      fail('SHADOW','Programs receiving lights with shadow maps are not admitted yet');
     const epoch=trackMaterial(m);
+    const {envMap,envMapRotation}=programEnvironment(m);
     const sides=m.transparent&&m.side===three.DoubleSide&&!m.forceSinglePass?[three.BackSide,three.FrontSide]:[m.side];
     return sides.map(side=>{
-      const compiled=programSupport.compile(m,object,{fog:scene.fog,side});
+      const compiled=programSupport.compile(m,object,{fog:scene.fog,side,envMap});
       const reflection=compiled.program.reflection;
+      const uniforms=programSupport.refresh(m,{fog:scene.fog,envMap,envMapRotation});
       const sourceTextures=[],bindings=[],textureKey=[];
       for(const t of reflection.textures){
-        const value=m.uniforms?.[t.name]?.value,texture=t.element===null?value:value?.[t.element];
+        const value=uniforms?.[t.name]?.value,texture=t.element===null?value:value?.[t.element];
         if(texture!=null&&!(texture instanceof three.Texture))fail('TEXTURE',`Uniform ${t.name} is not a texture`);
         if(texture&&(t.dimension==='cube')!==(texture.isCubeTexture===true))fail('TEXTURE',`Uniform ${t.name} texture dimension differs from its sampler`);
         if(texture&&(t.dimension==='3d'||t.dimension==='2d-array'||t.comparison))fail('TEXTURE',`Sampler ${t.glslType} textures are not admitted yet`);
@@ -413,11 +438,25 @@ export async function createGpuThreeScene(device,scene,{
       const options={program:compiled.program,textures:bindings,raster,topology,
         ...(topology==='line-strip'&&object.geometry.index?{stripIndexFormat:object.geometry.index.array instanceof Uint32Array?'uint32':'uint16'}:{})};
       const structural=[epoch,'program',compiled.key,topology,side,JSON.stringify(raster),...textureKey];
-      return {options,values:{},structural,clipped:null,program:compiled,programTextures:sourceTextures,programSide:side};
+      return {options,values:{},structural,clipped:null,program:compiled,programTextures:sourceTextures,programSide:side,programEnv:{envMap,envMapRotation}};
     });
   }
   function materialDescription(m,clippingFrame,topology='triangles',object=null){
     if(m?.isShaderMaterial)return programDescription(m,topology,object);
+    if(object&&programRoute()&&programSupport.shaderLibMaterial(m)){
+      // GL point sizes need the program route; elsewhere the core path renders
+      // what it admits and the ShaderLib program covers what it rejects.
+      if(m.isPointsMaterial)return programDescription(m,topology,object);
+      try{return coreDescription(m,clippingFrame,topology);}
+      catch(error){
+        if(error?.code!=='THREE_SCENE_MATERIAL'&&error?.code!=='THREE_SCENE_TEXTURE')throw error;
+        try{return programDescription(m,topology,object);}
+        catch(programError){throw new ThreeSceneError(programError.code?.replace(/^THREE_(SCENE|PROGRAM|WEBGL_PROGRAM)_/,'')||'MATERIAL',`${error.message}; ShaderLib route: ${programError.message}`);}
+      }
+    }
+    return coreDescription(m,clippingFrame,topology);
+  }
+  function coreDescription(m,clippingFrame,topology='triangles'){
     const shading=models.get(Object.getPrototypeOf(m));
     if(!shading)fail('MATERIAL',`Unsupported source material: ${m?.type}`);
     const primitive=m.isLineBasicMaterial?'line':m.isPointsMaterial?'point':'surface';
@@ -608,9 +647,10 @@ export async function createGpuThreeScene(device,scene,{
     const out=[],descriptions=new Map(),seen=new Map(),usedGeometry=new Set(),usedInstances=new Set(),usedDeformations=new Set();
     const get=(m,topology='triangles',object=null)=>{
       let byTopology=descriptions.get(m);if(!byTopology)descriptions.set(m,byTopology=new Map());
-      const key=m?.isShaderMaterial&&object?topology+'|'+programVariant(object):topology;
+      const key=programCapable(m)&&object?topology+'|'+programVariant(object):topology;
       if(!byTopology.has(key))byTopology.set(key,materialDescription(m,clippingFrame,topology,object));return byTopology.get(key);
     };
+    if(programRoute())programSupport.setLights(programLightList(programCamera));
     if(scene.overrideMaterial)get(scene.overrideMaterial);
     for(const object of nodes)if(drawable(object)){
       const topology=topologyOf(object);
@@ -625,7 +665,7 @@ export async function createGpuThreeScene(device,scene,{
         const m=scene.overrideMaterial&&original.allowOverride===true?scene.overrideMaterial:original;
         const wire=object.isMesh&&m.wireframe===true;
         if(wire&&(instanceSource||deformationSource))fail('MATERIAL','Wireframe instanced or deformed meshes are not admitted');
-        const isProgram=m.isShaderMaterial===true;
+        const isProgram=programCapable(m)&&get(m,wire?'lines':topology,object).some(d=>d.program);
         const t=wire?'lines':topology,geometry=wire?wireframeGeometry(g):g,itemKey=isProgram?programKeyOf(object):wire?geometry:key;
         let set=seen.get(itemKey);if(!set)seen.set(itemKey,set=new Map());
         const topologies=set.get(m)??new Set();if(topologies.has(t))continue;topologies.add(t);set.set(m,topologies);
@@ -939,6 +979,7 @@ export async function createGpuThreeScene(device,scene,{
         backgroundOwner?.check();
       }
       const lighting=cameraFrame(camera);lighting.lights=[];
+      if(programRoute()){programCamera=camera;programSupport.setLights(programLightList(camera));programSupport.setLightsView(camera);}
       // View rotation for view-space shading models (MeshNormalMaterial).
       lighting.viewMatrix=camera.matrixWorldInverse.elements;
       // Capture against this frame's updated camera before texture, geometry,
@@ -949,7 +990,7 @@ export async function createGpuThreeScene(device,scene,{
       const opaque=[],transparent=[],stack=[{object:scene,groupOrder:0}],descriptions=new Map();
       const get=(m,topology,object=null)=>{
         let byTopology=descriptions.get(m);if(!byTopology)descriptions.set(m,byTopology=new Map());
-        const key=m?.isShaderMaterial&&object?topology+'|'+programVariant(object):topology;
+        const key=programCapable(m)&&object?topology+'|'+programVariant(object):topology;
         if(!byTopology.has(key))byTopology.set(key,materialDescription(m,clippingFrame,topology,object));return byTopology.get(key);
       };
       function append(object,groupOrder,z,shadowPass=false){
@@ -967,9 +1008,9 @@ export async function createGpuThreeScene(device,scene,{
               if(wire&&shadowPass)fail('SHADOW','Wireframe shadow casters are not admitted');
               const g=wire?wireframeGeometry(source):source;
               const group=wire&&sourceGroup?{start:sourceGroup.start*2,count:sourceGroup.count*2,materialIndex:sourceGroup.materialIndex}:sourceGroup;
-              if(material.isShaderMaterial){
+              if(programCapable(material)&&get(material,wire?'lines':topology,object).some(d=>d.program)){
                 if(shadowPass)return;
-                const desc=get(material,topology,object),records=lookup.get(programKeyOf(object))?.get(material);
+                const desc=get(material,wire?'lines':topology,object),records=lookup.get(programKeyOf(object))?.get(material);
                 const bindings=desc.map(d=>records?.find(e=>!e.mesh.disposed&&e.programGeometry&&same(e.structural,d.structural)));
                 if(bindings.some(e=>!e))fail('PREPARE','Call prepare() after changing geometry, program or texture bindings');
                 if(opaque.length+transparent.length>=(renderOptions.maxDraws??1024))fail('LIMIT','Source draw list exceeds capacity');
@@ -1055,7 +1096,7 @@ export async function createGpuThreeScene(device,scene,{
           const instanceCount=object.isInstancedMesh?integer(object.count,0,0xffffffff,'instance count'):g.isInstancedBufferGeometry?Math.min(g.instanceCount,0xffffffff):1;
           for(let i=0;i<item.bindings.length;i++){
             const d=item.desc[i],reflection=d.program.program.reflection,bytes=new Uint8Array(reflection.uniformBufferSize);
-            const current=programSupport.pack(reflection,item.material,object,camera,bytes,{fog:scene.fog,targetSize:programTargetSize});
+            const current=programSupport.pack(reflection,programSupport.uniformsFor(item.material),object,camera,bytes,{targetSize:programTargetSize});
             if(current.some((t,k)=>(t??null)!==d.programTextures[k]))fail('PREPARE','Program texture uniforms changed; call prepare()');
             for(const t of current)if(t)frameTextures?.add(t);
             // Programs evaluate fog/lighting in their own source; never core receivers.

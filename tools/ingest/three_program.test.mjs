@@ -21,7 +21,8 @@ const shader = (extra = {}) => new T.ShaderMaterial({
 test('ShaderMaterial sources follow r186 WebGLProgram: version, precision, defines, includes, conversion macros', () => {
   const m = shader({defines: {FOO: 2, OFF: false}}), mesh = new T.Mesh(new T.BoxGeometry(), m);
   const {vertex, fragment} = threeProgramSources(T, m, mesh, state);
-  assert.ok(vertex.startsWith('#version 300 es\n#define attribute in\n#define varying out\n#define texture2D texture\nprecision highp float;'));
+  // Byte-identical to r186 WebGLProgram (empty extension line after #version).
+  assert.ok(vertex.startsWith('#version 300 es\n\n#define attribute in\n#define varying out\n#define texture2D texture\nprecision highp float;\n\tprecision highp int;'));
   assert.match(vertex, /#define SHADER_TYPE ShaderMaterial\n#define SHADER_NAME \n#define FOO 2\n#define HAS_NORMAL/);
   assert.doesNotMatch(vertex, /OFF|#include/);
   assert.match(vertex, /#define PI 3\.141592653589793/, '<common> resolved from the live ShaderChunk');
@@ -33,7 +34,7 @@ test('ShaderMaterial sources follow r186 WebGLProgram: version, precision, defin
   const raw = new T.RawShaderMaterial({vertexShader: 'void main(){}', fragmentShader: 'void main(){}', defines: {A: 1}});
   assert.equal(threeProgramSources(T, raw, new T.Mesh(new T.BufferGeometry(), raw), state).vertex,
     '#define SHADER_TYPE RawShaderMaterial\n#define SHADER_NAME \n#define A 1\nvoid main(){}');
-  assert.throws(() => threeProgramSources(T, shader({lights: true}), mesh, state), {code: 'THREE_PROGRAM_LIGHTS'});
+  assert.throws(() => threeProgramSources(T, shader({wireframe: true}), mesh, state), {code: 'THREE_PROGRAM_MATERIAL'});
 });
 
 test('raster state uses WebGLState: blend table, BACK culling with frontFace flips', () => {
@@ -52,10 +53,10 @@ test('uniform packing: built-ins from camera/object, material values, bools, arr
   const camera = new T.PerspectiveCamera(50, 1, 0.1, 10); camera.position.z = 5; camera.updateMatrixWorld();
   mesh.modelViewMatrix.multiplyMatrices(camera.matrixWorldInverse, mesh.matrixWorld);
   const fog = new T.Fog(0x336699, 1, 9);
-  const {vertex, fragment} = threeProgramSources(T, m, mesh, {...state, fog});
-  const {reflection} = compileEsslProgram(vertex, fragment);
+  const support = createThreeProgramSupport({three: T, state: () => ({...state, pixelRatio: 1, height: 100})});
+  const {program: {reflection}} = support.compile(m, mesh, {fog});
   const bytes = new Uint8Array(reflection.uniformBufferSize), view = new DataView(bytes.buffer);
-  packThreeProgramUniforms(T, reflection, m, mesh, camera, bytes, {fog});
+  support.pack(reflection, support.refresh(m, {fog}), mesh, camera, bytes, {});
   const at = name => reflection.uniforms.find(u => u.name === name);
   const f = (o) => view.getFloat32(o, true);
   assert.deepEqual([12, 13, 14].map(i => f(at('modelMatrix').offset + i * 4)), [1, 2, 3]);
@@ -65,6 +66,24 @@ test('uniform packing: built-ins from camera/object, material values, bools, arr
   assert.equal(view.getUint32(at('on').offset, true), 1);
   assert.equal(view.getUint32(at('isOrthographic').offset, true), 0);
   assert.equal(m.uniforms.fogFar.value, 9, 'fog uniforms refreshed into the material, as WebGLRenderer does');
+  // Unlit fog color is converted to the canvas output space (getUnlitUniformColorSpace).
+  assert.ok(Math.abs(m.uniforms.fogColor.value.r - 0x33 / 255) < 1e-4);
+});
+
+test('ShaderLib materials: refreshed uniform clones, light state wiring, PointsMaterial sizes', () => {
+  const support = createThreeProgramSupport({three: T, state: () => ({...state, pixelRatio: 2, height: 300})});
+  const points = new T.PointsMaterial({size: 6, color: 0x00ff00}), obj = new T.Points(new T.BufferGeometry().setAttribute('position', new T.BufferAttribute(new Float32Array(3), 3)), points);
+  const u = support.refresh(points);
+  assert.notEqual(u, T.ShaderLib.points.uniforms, 'a per-material clone');
+  assert.equal(u.size.value, 12); assert.equal(u.scale.value, 150);
+  assert.equal(support.compile(points, obj).program.reflection.points, true);
+  const lambert = new T.MeshLambertMaterial({color: 0xff0000});
+  const light = new T.DirectionalLight(0xffffff, 2); light.position.set(0, 1, 0); light.updateMatrixWorld(); light.target.updateMatrixWorld();
+  support.setLights([light, new T.AmbientLight(0x404040, 1)]);
+  const {program} = support.compile(lambert, new T.Mesh(new T.BoxGeometry(), lambert));
+  assert.ok(program.reflection.uniforms.some(x => x.name === 'directionalLights' && x.node.n === 1), 'NUM_DIR_LIGHTS = 1');
+  const lu = support.refresh(lambert);
+  assert.equal(lu.directionalLights.value.length, 1); assert.equal(lu.directionalLights.value[0].color.r, 2);
 });
 
 test('program support caches compiled programs by exact source text', () => {

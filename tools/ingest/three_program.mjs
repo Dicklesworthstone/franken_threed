@@ -22,6 +22,7 @@
  * extensions, onBeforeCompile hooks. No performance claim.
  */
 import {compileEsslProgram} from './essl_wgsl.mjs';
+import {SHADER_IDS, webglParameters, webglProgramSources, webglLights, webglMaterialUniforms, refreshWebGLMaterialUniforms, materialNeedsLights} from './three_webgl_program.mjs';
 import {createGpuProgramGeometry, programGeometrySnapshot} from './gpu_buffer_geometry.mjs';
 
 export class ThreeProgramError extends Error {
@@ -29,145 +30,37 @@ export class ThreeProgramError extends Error {
 }
 const fail = (code, message) => { throw new ThreeProgramError(code, message); };
 
-const PRECISION_TYPES = ['float', 'int', 'sampler2D', 'samplerCube', 'sampler3D', 'sampler2DArray', 'sampler2DShadow', 'samplerCubeShadow',
-  'sampler2DArrayShadow', 'isampler2D', 'isampler3D', 'isamplerCube', 'isampler2DArray', 'usampler2D', 'usampler3D', 'usamplerCube', 'usampler2DArray'];
-function precisionBlock(p) {
-  return PRECISION_TYPES.map(t => `precision ${p} ${t};`).join('\n') + `\n#define ${{highp: 'HIGH', mediump: 'MEDIUM', lowp: 'LOW'}[p]}_PRECISION`;
-}
-function defineLines(defines) {
-  const out = [];
-  for (const name in defines) { const v = defines[name]; if (v !== false) out.push(`#define ${name} ${v}`); }
-  return out.join('\n');
-}
-const nonEmpty = s => s !== '';
-const includePattern = /^[ \t]*#include +<([\w\d./]+)>/gm;
-function resolveIncludes(T, s) {
-  return s.replace(includePattern, (m, name) => {
-    const chunk = T.ShaderChunk[name];
-    if (chunk === undefined) fail('SOURCE', `Can not resolve #include <${name}>`);
-    return resolveIncludes(T, chunk);
-  });
-}
-const unrollPattern = /#pragma unroll_loop_start\s+for\s*\(\s*int\s+i\s*=\s*(\d+)\s*;\s*i\s*<\s*(\d+)\s*;\s*i\s*\+\+\s*\)\s*{([\s\S]+?)}\s+#pragma unroll_loop_end/g;
-const unrollLoops = s => s.replace(unrollPattern, (m, start, end, snippet) => {
-  let out = '';
-  for (let i = parseInt(start); i < parseInt(end); i++) out += snippet.replace(/\[\s*i\s*\]/g, '[ ' + i + ' ]').replace(/UNROLLED_LOOP_INDEX/g, i);
-  return out;
-});
-// No admitted ShaderMaterial uses source lights or clipping yet: the counts are zero.
-const replaceCounts = s => s.replace(/NUM_SUN_LIGHTS|NUM_DIR_LIGHTS|NUM_SPOT_LIGHTS|NUM_SPOT_LIGHT_MAPS|NUM_SPOT_LIGHT_COORDS|NUM_RECT_AREA_LIGHTS|NUM_POINT_LIGHTS|NUM_HEMI_LIGHTS|NUM_SUN_LIGHT_SHADOWS|NUM_DIR_LIGHT_SHADOWS|NUM_SPOT_LIGHT_SHADOWS_WITH_MAPS|NUM_SPOT_LIGHT_SHADOWS|NUM_POINT_LIGHT_SHADOWS|NUM_CLIPPING_PLANES|UNION_CLIPPING_PLANES/g, '0');
-
-function encodingFunction(T, name, colorSpace) {
-  const m = new T.Matrix3();
-  T.ColorManagement._getMatrix(m, T.ColorManagement.workingColorSpace, colorSpace);
-  const matrix = `mat3( ${m.elements.map(v => v.toFixed(4))} )`;
-  const transfer = T.ColorManagement.getTransfer(colorSpace) === T.SRGBTransfer ? 'sRGBTransferOETF' : 'LinearTransferOETF';
-  return [`vec4 ${name}( vec4 value ) {`, `\treturn ${transfer}( vec4( value.rgb * ${matrix}, value.a ) );`, '}'].join('\n');
-}
-function toneMappingFunction(T, toneMapping) {
-  const names = {[T.LinearToneMapping]: 'Linear', [T.ReinhardToneMapping]: 'Reinhard', [T.CineonToneMapping]: 'Cineon', [T.ACESFilmicToneMapping]: 'ACESFilmic',
-    [T.AgXToneMapping]: 'AgX', [T.NeutralToneMapping]: 'Neutral', [T.CustomToneMapping]: 'Custom'};
-  return `vec3 toneMapping( vec3 color ) { return ${names[toneMapping] ?? 'Linear'}ToneMapping( color ); }`;
-}
-function luminanceFunction(T) {
-  const v = new T.Vector3(); T.ColorManagement.getLuminanceCoefficients(v);
-  return ['float luminance( const in vec3 rgb ) {', `\tconst vec3 weights = vec3( ${v.x.toFixed(4)}, ${v.y.toFixed(4)}, ${v.z.toFixed(4)} );`, '\treturn dot( weights, rgb );', '}'].join('\n');
-}
-
 /** Admission of a source program material/object pair on this backend. */
 export function inspectThreeProgram(T, material, object) {
-  if (!material?.isShaderMaterial) fail('SOURCE', 'Expected a ShaderMaterial or RawShaderMaterial');
-  if (typeof material.vertexShader !== 'string' || typeof material.fragmentShader !== 'string') fail('SOURCE', 'Program sources must be strings');
-  if (material.lights) fail('LIGHTS', 'ShaderMaterial with lights: true is not admitted yet');
+  const builtin = SHADER_IDS[material?.type] !== undefined;
+  if (!material?.isShaderMaterial && !builtin) fail('SOURCE', 'Expected a ShaderMaterial, RawShaderMaterial or ShaderLib material');
+  if (material.isShaderMaterial && (typeof material.vertexShader !== 'string' || typeof material.fragmentShader !== 'string')) fail('SOURCE', 'Program sources must be strings');
   if (object.isSkinnedMesh || Object.values(object.geometry?.morphAttributes ?? {}).some(a => a?.length) || object.isBatchedMesh)
-    fail('OBJECT', 'Skinned, morphed and batched ShaderMaterial objects are not admitted yet');
+    fail('OBJECT', 'Skinned, morphed and batched program objects are not admitted yet');
   if (object.isInstancedMesh && object.morphTexture != null) fail('OBJECT', 'Instanced morph textures are not admitted');
-  if (material.clipping && material.clippingPlanes?.length) fail('CLIPPING', 'ShaderMaterial clipping planes are not admitted yet');
+  if (material.clippingPlanes?.length && (material.clipping || builtin)) fail('CLIPPING', 'Program clipping planes are not admitted yet');
   if (material.uniformsGroups?.length) fail('UNIFORMS', 'Uniform buffer groups are not admitted yet');
   if (material.onBeforeCompile !== T.Material.prototype.onBeforeCompile || material.onBeforeRender !== T.Material.prototype.onBeforeRender)
     fail('HOOK', 'Program hooks require their original component');
   if (material.extensions?.clipCullDistance || material.extensions?.multiDraw) fail('EXTENSION', 'Program extensions are not admitted');
-  if (material.wireframe) fail('MATERIAL', 'Wireframe ShaderMaterial is not admitted yet');
+  if (material.wireframe) fail('MATERIAL', 'Wireframe programs are not admitted yet');
   if (material.alphaToCoverage) fail('MATERIAL', 'alphaToCoverage is not admitted');
-  if (material.stencilWrite) fail('MATERIAL', 'Stencil ShaderMaterial is not admitted yet');
+  if (material.alphaHash) fail('MATERIAL', 'alphaHash programs are not admitted yet');
+  if (material.stencilWrite) fail('MATERIAL', 'Stencil programs are not admitted yet');
+  if (material.isMeshStandardMaterial) fail('MATERIAL', 'ShaderLib physical programs need the DFG LUT and PMREM inputs, not admitted yet');
+  if (material.isMeshDistanceMaterial || material.isSpriteMaterial || material.isShadowMaterial) fail('MATERIAL', `${material.type} programs are not admitted yet`);
 }
 
-/** r186 WebGLProgram source assembly for ShaderMaterial/RawShaderMaterial. */
-export function threeProgramSources(T, material, object, {fog = null, toneMapping, outputColorSpace, precision = 'highp', shadowMapEnabled = false, shadowMapType = T.PCFShadowMap, side = material.side} = {}) {
+/** The exact GLSL r186 WebGLProgram builds for (material, object) in this context.
+ * ctx: {fog, envMap, lights (webglLights().state), toneMapping, outputColorSpace, side}. */
+export function threeProgramSources(T, material, object, ctx = {}) {
   inspectThreeProgram(T, material, object);
-  const geometry = object.geometry, attributes = geometry.attributes;
-  const p = {
-    shaderType: material.type, shaderName: material.name, defines: material.defines, glslVersion: material.glslVersion,
-    precision: material.precision ?? precision,
-    instancing: object.isInstancedMesh === true, instancingColor: object.isInstancedMesh === true && object.instanceColor !== null,
-    useFog: material.fog === true, fog: !!fog, fogExp2: !!fog && fog.isFogExp2 === true,
-    vertexNormals: !!attributes.normal, vertexColors: material.vertexColors,
-    vertexAlphas: material.vertexColors === true && !!attributes.color && attributes.color.itemSize === 4,
-    vertexUv1s: !!attributes.uv1, vertexUv2s: !!attributes.uv2, vertexUv3s: !!attributes.uv3,
-    flatShading: material.wireframe === false && material.flatShading === true,
-    doubleSided: side === T.DoubleSide, flipSided: side === T.BackSide,
-    shadowMapEnabled, shadowMapType,
-    alphaTest: material.alphaTest > 0, dithering: material.dithering, premultipliedAlpha: material.premultipliedAlpha,
-    opaque: material.transparent === false && material.blending === T.NormalBlending && material.alphaToCoverage === false,
-    toneMapping: material.toneMapped ? toneMapping : T.NoToneMapping,
-    outputColorSpace, useDepthPacking: material.depthPacking >= 0, depthPacking: material.depthPacking || 0,
-  };
-  const customDefines = defineLines(p.defines);
-  let prefixVertex, prefixFragment;
-  let versionString = p.glslVersion ? '#version ' + p.glslVersion + '\n' : '';
-  if (material.isRawShaderMaterial) {
-    prefixVertex = [`#define SHADER_TYPE ${p.shaderType}`, `#define SHADER_NAME ${p.shaderName}`, customDefines].filter(nonEmpty).join('\n');
-    if (prefixVertex.length) prefixVertex += '\n';
-    prefixFragment = prefixVertex;
-  } else {
-    const shadowDefine = {[T.PCFShadowMap]: 'SHADOWMAP_TYPE_PCF', [T.VSMShadowMap]: 'SHADOWMAP_TYPE_VSM'}[p.shadowMapType] || 'SHADOWMAP_TYPE_BASIC';
-    prefixVertex = [precisionBlock(p.precision), `#define SHADER_TYPE ${p.shaderType}`, `#define SHADER_NAME ${p.shaderName}`, customDefines,
-      p.instancing ? '#define USE_INSTANCING' : '', p.instancingColor ? '#define USE_INSTANCING_COLOR' : '',
-      p.useFog && p.fog ? '#define USE_FOG' : '', p.useFog && p.fogExp2 ? '#define FOG_EXP2' : '',
-      p.vertexNormals ? '#define HAS_NORMAL' : '', p.vertexColors ? '#define USE_COLOR' : '', p.vertexAlphas ? '#define USE_COLOR_ALPHA' : '',
-      p.vertexUv1s ? '#define USE_UV1' : '', p.vertexUv2s ? '#define USE_UV2' : '', p.vertexUv3s ? '#define USE_UV3' : '',
-      p.flatShading ? '#define FLAT_SHADED' : '', p.doubleSided ? '#define DOUBLE_SIDED' : '', p.flipSided ? '#define FLIP_SIDED' : '',
-      p.shadowMapEnabled ? '#define USE_SHADOWMAP' : '', p.shadowMapEnabled ? '#define ' + shadowDefine : '',
-      'uniform mat4 modelMatrix;', 'uniform mat4 modelViewMatrix;', 'uniform mat4 projectionMatrix;', 'uniform mat4 viewMatrix;',
-      'uniform mat3 normalMatrix;', 'uniform vec3 cameraPosition;', 'uniform bool isOrthographic;',
-      '#ifdef USE_INSTANCING', '\tattribute mat4 instanceMatrix;', '#endif', '#ifdef USE_INSTANCING_COLOR', '\tattribute vec3 instanceColor;', '#endif',
-      '#ifdef USE_INSTANCING_MORPH', '\tuniform sampler2D morphTexture;', '#endif',
-      'attribute vec3 position;', 'attribute vec3 normal;', 'attribute vec2 uv;',
-      '#ifdef USE_UV1', '\tattribute vec2 uv1;', '#endif', '#ifdef USE_UV2', '\tattribute vec2 uv2;', '#endif', '#ifdef USE_UV3', '\tattribute vec2 uv3;', '#endif',
-      '#ifdef USE_TANGENT', '\tattribute vec4 tangent;', '#endif',
-      '#if defined( USE_COLOR_ALPHA )', '\tattribute vec4 color;', '#elif defined( USE_COLOR )', '\tattribute vec3 color;', '#endif',
-      '#ifdef USE_SKINNING', '\tattribute vec4 skinIndex;', '\tattribute vec4 skinWeight;', '#endif', '\n'].filter(nonEmpty).join('\n');
-    prefixFragment = [precisionBlock(p.precision), `#define SHADER_TYPE ${p.shaderType}`, `#define SHADER_NAME ${p.shaderName}`, customDefines,
-      p.useFog && p.fog ? '#define USE_FOG' : '', p.useFog && p.fogExp2 ? '#define FOG_EXP2' : '',
-      p.alphaTest ? '#define USE_ALPHATEST' : '',
-      p.vertexColors || p.instancingColor ? '#define USE_COLOR' : '', p.vertexAlphas ? '#define USE_COLOR_ALPHA' : '',
-      p.vertexUv1s ? '#define USE_UV1' : '', p.vertexUv2s ? '#define USE_UV2' : '', p.vertexUv3s ? '#define USE_UV3' : '',
-      p.flatShading ? '#define FLAT_SHADED' : '', p.doubleSided ? '#define DOUBLE_SIDED' : '', p.flipSided ? '#define FLIP_SIDED' : '',
-      p.shadowMapEnabled ? '#define USE_SHADOWMAP' : '', p.shadowMapEnabled ? '#define ' + shadowDefine : '',
-      p.premultipliedAlpha ? '#define PREMULTIPLIED_ALPHA' : '',
-      'uniform mat4 viewMatrix;', 'uniform vec3 cameraPosition;', 'uniform bool isOrthographic;',
-      p.toneMapping !== T.NoToneMapping ? '#define TONE_MAPPING' : '',
-      p.toneMapping !== T.NoToneMapping ? T.ShaderChunk.tonemapping_pars_fragment : '',
-      p.toneMapping !== T.NoToneMapping ? toneMappingFunction(T, p.toneMapping) : '',
-      p.dithering ? '#define DITHERING' : '', p.opaque ? '#define OPAQUE' : '',
-      T.ShaderChunk.colorspace_pars_fragment, encodingFunction(T, 'linearToOutputTexel', p.outputColorSpace), luminanceFunction(T),
-      p.useDepthPacking ? '#define DEPTH_PACKING ' + p.depthPacking : '', '\n'].filter(nonEmpty).join('\n');
-  }
-  let vertexShader = unrollLoops(replaceCounts(resolveIncludes(T, material.vertexShader)));
-  let fragmentShader = unrollLoops(replaceCounts(resolveIncludes(T, material.fragmentShader)));
-  if (material.isRawShaderMaterial !== true) {
-    versionString = '#version 300 es\n';
-    prefixVertex = ['#define attribute in', '#define varying out', '#define texture2D texture'].join('\n') + '\n' + prefixVertex;
-    prefixFragment = ['#define varying in',
-      p.glslVersion === T.GLSL3 ? '' : 'layout(location = 0) out highp vec4 pc_fragColor;',
-      p.glslVersion === T.GLSL3 ? '' : '#define gl_FragColor pc_fragColor',
-      '#define gl_FragDepthEXT gl_FragDepth', '#define texture2D texture', '#define textureCube texture', '#define texture2DProj textureProj',
-      '#define texture2DLodEXT textureLod', '#define texture2DProjLodEXT textureProjLod', '#define textureCubeLodEXT textureLod',
-      '#define texture2DGradEXT textureGrad', '#define texture2DProjGradEXT textureProjGrad', '#define textureCubeGradEXT textureGrad'].join('\n') + '\n' + prefixFragment;
-  }
-  const vertex = versionString + prefixVertex + vertexShader, fragment = versionString + prefixFragment + fragmentShader;
-  return {vertex, fragment, key: vertex + '\u0000' + fragment, parameters: p};
+  const lights = ctx.lights ?? EMPTY_LIGHTS;
+  const parameters = webglParameters(T, material, object, {...ctx, lights, shadowMapEnabled: false, clipping: {numPlanes: 0, numIntersection: 0}});
+  return {...webglProgramSources(T, parameters), parameters};
 }
+const EMPTY_LIGHTS = Object.freeze({ambient: [0, 0, 0], probe: [], sun: [], sunShadowMap: [], directional: [], directionalShadowMap: [], point: [],
+  pointShadowMap: [], spot: [], spotShadowMap: [], spotLightMap: [], rectArea: [], hemi: [], numSpotLightShadowsWithMaps: 0, numLightProbes: 0});
 
 /** WebGLState.setMaterial raster state as WebGPU pipeline fragments. */
 export function threeProgramRaster(T, m, {frontFaceCW = false, topology = 'triangles', side = m.side} = {}) {
@@ -215,11 +108,13 @@ export function threeProgramRaster(T, m, {frontFaceCW = false, topology = 'trian
 // ---- uniform values ---------------------------------------------------------
 const BUILTIN = new Set(['modelMatrix', 'modelViewMatrix', 'projectionMatrix', 'viewMatrix', 'normalMatrix', 'cameraPosition', 'isOrthographic', 'toneMappingExposure']);
 
-/** Write one frame's uniform values for one draw. Returns textures to bind. */
-export function packThreeProgramUniforms(T, reflection, material, object, camera, bytes, {toneMappingExposure = 1, fog = null, targetSize = null} = {}) {
+/** Write one frame's uniform values for one draw from a WebGLRenderer-style
+ * uniforms object (material.uniforms, or a refreshed ShaderLib clone). Values
+ * the program declares but nothing sets stay zero, as GL leaves them.
+ * Returns the texture (or null) for each reflected sampler binding. */
+export function packThreeProgramUniforms(T, reflection, uniforms, object, camera, bytes, {toneMappingExposure = 1, targetSize = null} = {}) {
   bytes.fill(0);
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  if (material.fog === true && fog) refreshFog(T, material.uniforms, fog);
   const cameraPosition = new T.Vector3().setFromMatrixPosition(camera.matrixWorld);
   const builtin = {
     modelMatrix: object.matrixWorld, modelViewMatrix: object.modelViewMatrix, projectionMatrix: camera.projectionMatrix,
@@ -227,7 +122,7 @@ export function packThreeProgramUniforms(T, reflection, material, object, camera
     toneMappingExposure,
   };
   for (const u of reflection.uniforms) {
-    const value = BUILTIN.has(u.name) ? builtin[u.name] : material.uniforms?.[u.name]?.value;
+    const value = BUILTIN.has(u.name) ? builtin[u.name] : uniforms?.[u.name]?.value;
     if (value === undefined || value === null) continue;
     write(view, u.node, value, u.name);
   }
@@ -236,15 +131,9 @@ export function packThreeProgramUniforms(T, reflection, material, object, camera
     for (let i = 0; i < 4; i++) view.setFloat32(reflection.targetOffset + 4 * i, targetSize[i], true);
   }
   return reflection.textures.map(t => {
-    const v = material.uniforms?.[t.name]?.value;
+    const v = uniforms?.[t.name]?.value;
     return t.element === null ? v ?? null : v?.[t.element] ?? null;
   });
-}
-function refreshFog(T, uniforms, fog) {
-  if (!uniforms) return;
-  uniforms.fogColor?.value?.copy?.(fog.color);
-  if (fog.isFog) { if (uniforms.fogNear) uniforms.fogNear.value = fog.near; if (uniforms.fogFar) uniforms.fogFar.value = fog.far; }
-  else if (fog.isFogExp2 && uniforms.fogDensity) uniforms.fogDensity.value = fog.density;
 }
 function components(value, n, name) {
   if (typeof value === 'number' || typeof value === 'boolean') return [Number(value)];
@@ -293,14 +182,17 @@ function write(view, node, value, name, base = 0) {
 }
 
 /** Injectable program support for the source-scene bridge (three_scene.mjs).
- * state() reports the renderer-level inputs of WebGLPrograms.getParameters:
- * {toneMapping, toneMappingExposure, outputColorSpace}. Compiled programs are
- * cached by their exact assembled source text (bounded). */
+ * state() reports renderer-level inputs: {toneMapping, toneMappingExposure,
+ * outputColorSpace, pixelRatio, height (drawing-buffer height)}. One instance
+ * owns one WebGLLights state (setLights/setLightsView per frame, as
+ * WebGLRenderer.render does) and per-material ShaderLib uniform clones.
+ * Compiled programs are cached by their exact assembled source text (bounded). */
 export function createThreeProgramSupport({three: T, state, maxPrograms = 256, maxPointSize = 1024}) {
-  const compiled = new Map();
-  function compile(material, object, {fog = null, side = material.side} = {}) {
+  const compiled = new Map(), lights = webglLights(T), clones = new WeakMap();
+  let lightList = [];
+  function compile(material, object, {fog = null, side = material.side, envMap = null} = {}) {
     const s = state();
-    const sources = threeProgramSources(T, material, object, {fog, side, toneMapping: s.toneMapping, outputColorSpace: s.outputColorSpace});
+    const sources = threeProgramSources(T, material, object, {fog, side, envMap, lights: lights.state, toneMapping: s.toneMapping, outputColorSpace: s.outputColorSpace});
     // GL rasterizes Points as gl_PointSize squares: compile the point-sprite form.
     const points = object.isPoints === true, key = sources.key + (points ? '\u0000points' : '');
     let entry = compiled.get(key);
@@ -312,11 +204,29 @@ export function createThreeProgramSupport({three: T, state, maxPrograms = 256, m
     }
     return entry;
   }
+  /** WebGLRenderer.getUniforms: material.uniforms, or this material's ShaderLib clone. */
+  function uniformsFor(material) {
+    if (material.isShaderMaterial) return material.uniforms;
+    let u = clones.get(material);
+    if (!u) clones.set(material, u = webglMaterialUniforms(T, material));
+    return u;
+  }
+  /** setProgram's refreshMaterial work: lights, fog and material values. */
+  function refresh(material, {fog = null, envMap = null, envMapRotation} = {}) {
+    const uniforms = uniformsFor(material), s = state();
+    refreshWebGLMaterialUniforms(T, uniforms, material, {fog, lights: lights.state, envMap, envMapRotation,
+      pixelRatio: s.pixelRatio ?? 1, height: s.height ?? 1, unlitColorSpace: s.outputColorSpace});
+    return uniforms;
+  }
   return Object.freeze({
-    compile,
+    compile, uniformsFor, refresh, needsLights: materialNeedsLights, shaderLibMaterial: m => SHADER_IDS[m?.type] !== undefined,
+    /** WebGLLights.setup for this frame's light list (source traversal order). */
+    setLights(list) { lightList = [...list]; lights.setup(lightList); return lights.state.version; },
+    setLightsView(camera) { lights.setupView(lightList, camera); },
+    get lightsVersion() { return lights.state.version; },
     raster: (material, options) => threeProgramRaster(T, material, options),
-    pack: (reflection, material, object, camera, bytes, options) =>
-      packThreeProgramUniforms(T, reflection, material, object, camera, bytes, {toneMappingExposure: state().toneMappingExposure ?? 1, ...options}),
+    pack: (reflection, uniforms, object, camera, bytes, options) =>
+      packThreeProgramUniforms(T, reflection, uniforms, object, camera, bytes, {toneMappingExposure: state().toneMappingExposure ?? 1, ...options}),
     createGeometry: (device, source, attributes, options) => createGpuProgramGeometry(device, source, attributes, options),
     geometrySnapshot: (gpu, device) => programGeometrySnapshot(gpu, device),
   });
