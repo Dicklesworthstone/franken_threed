@@ -113,3 +113,24 @@ test('PMREM: r186 PMREMGenerator passes record against the host and compile with
   const rt = new T.WebGLRenderTarget(4, 4); rt.texture.mapping = T.CubeReflectionMapping;
   assert.throws(() => pmrem.lookup(rt.texture), {code: 'THREE_PMREM_SOURCE'});
 });
+
+test('WebGLLights shadow state: r186 sorting, shadow uniforms, maps by light type, receiver sources', () => {
+  const support = createThreeProgramSupport({three: T, state: () => ({...state, pixelRatio: 1, height: 1})});
+  const dir = new T.DirectionalLight(), spot = new T.SpotLight(), point = new T.PointLight(), plain = new T.DirectionalLight();
+  for (const l of [dir, spot, point]) l.castShadow = true;
+  dir.shadow.bias = -0.001; point.shadow.camera.far = 42;
+  point.shadow.map = {texture: {format: T.RGBAFormat}, depthTexture: new T.CubeDepthTexture(8)};
+  support.setLights([plain, dir, spot, point]);
+  const lights = support.refresh(new T.MeshStandardMaterial());
+  assert.equal(lights.directionalLights.value.length, 2);
+  assert.equal(lights.directionalLightShadows.value.length, 1, 'only casting lights get shadow uniforms');
+  assert.equal(lights.directionalLightShadows.value[0].shadowBias, -0.001);
+  assert.equal(lights.pointLightShadows.value[0].shadowCameraFar, 42);
+  const samplers = support.shadowSamplers(new T.MeshLambertMaterial());
+  assert.equal(samplers.pointShadowMap[0], point.shadow.map.depthTexture, 'depth texture, as WebGLLights selects it');
+  assert.equal(samplers.directionalShadowMap[0], null, 'not yet rendered');
+  assert.equal(support.shadowSamplers(new T.MeshBasicMaterial()), null, 'unlit materials bind no shadow maps');
+  const {program} = support.compile(new T.MeshLambertMaterial(), new T.Mesh(new T.BoxGeometry()), {shadows: true});
+  assert.ok(program.reflection.textures.some(t => t.name === 'pointShadowMap' && t.comparison && t.dimension === 'cube'));
+  assert.ok(program.reflection.uniforms.some(u => u.name === 'receiveShadow'));
+});

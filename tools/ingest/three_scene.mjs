@@ -154,6 +154,7 @@ export async function createGpuThreeScene(device,scene,{
   const geometries=new Map(),instances=new Map(),materials=new Map(),deformations=new Map();
   const pendingDeformations=new Set(),deformationLifetime=new AbortController();
   let textureOwner=null,textureScan=null,frameTextures=null,retainedTextures=new Set();
+  let programShadowMode=false,programShadowSticky=false,preparedShadowMode=false,programShadowOwner=null;
   const ownedTextures=()=>textureOwner??=createGpuThreeTextures(device,{...textureOptions,three});
   const resourceFailed=()=>!!renderer?.failed||!!textureOwner?.failed||!!shadowOwner?.failed||!!pendingShadow?.failed||!!environmentOwner?.failed||!!pendingEnvironment?.failed||!!backgroundOwner?.failed||!!pendingBackground?.failed||[...geometries.values(),...programGpus(),...instances.values(),...deformations.values(),...pendingDeformations].some(g=>g.failed);
   let programTargetSize=null;
@@ -184,7 +185,7 @@ export async function createGpuThreeScene(device,scene,{
     deformationLifetime.abort();
     backgroundOwner?.dispose();pendingBackground?.dispose();backgroundOwner=null;pendingBackground=null;
     environmentOwner?.dispose();pendingEnvironment?.dispose();environmentOwner=null;pendingEnvironment=null;
-    pmremOwner?.dispose();pmremOwner=null;shadowOwner?.dispose();pendingShadow?.dispose();shadowOwner=null;pendingShadow=null;casters.clear();
+    pmremOwner?.dispose();pmremOwner=null;programShadowOwner?.dispose();programShadowOwner=null;shadowOwner?.dispose();pendingShadow?.dispose();shadowOwner=null;pendingShadow=null;casters.clear();
     for(const entry of entries)entry.mesh.dispose();entries=[];lookup.clear();
     for(const gpu of [...deformations.values(),...pendingDeformations])gpu.dispose();deformations.clear();pendingDeformations.clear();
     for(const [m,state] of materials)m.removeEventListener('dispose',state.listener);materials.clear();
@@ -247,13 +248,6 @@ export async function createGpuThreeScene(device,scene,{
         if(!shadowEnabled&&(object.castShadow||object.receiveShadow))fail('SHADOW','Enable shadow:{} to own source shadows');
         if(shadowEnabled){
           if(typeof object.castShadow!=='boolean'||typeof object.receiveShadow!=='boolean')fail('SHADOW','Expected boolean source shadow flags');
-          if(object.castShadow){
-            if(object.customDepthMaterial!=null||object.customDistanceMaterial!=null||
-                object.onBeforeShadow!==three.Object3D.prototype.onBeforeShadow||object.onAfterShadow!==three.Object3D.prototype.onAfterShadow)
-              fail('HOOK','Custom shadow materials and callbacks need their original renderer');
-            const source=Array.isArray(object.material)?object.material:[object.material];
-            if(shadowBlend==='reject'&&source.some(m=>m?.transparent))fail('SHADOW','BLEND casters require the explicit shadow.blend:skip policy');
-          }
         }
         geometryAdmission(object.geometry,object);
         if(object.isInstancedMesh)instanceAdmission(object);
@@ -269,8 +263,20 @@ export async function createGpuThreeScene(device,scene,{
         }
       } else if(object.isSprite||object.isLightProbe||object.isLightProbeGrid)
         fail('OBJECT',`Unsupported source renderable: ${object.type}`);
-      if(object.isLight)light(object);
       for(let i=object.children.length-1;i>=0;i--)stack.push(object.children[i]);
+    }
+    // Shadow ownership: the core's single projected map, or (WebGL surface) the
+    // r186 WebGLShadowMap port drawing depth/distance programs for every caster.
+    programShadowMode=wantsProgramShadows(nodes);
+    for(const object of nodes){
+      if(object.isLight&&!programShadowMode)light(object);
+      if(shadowEnabled&&object.isMesh&&object.castShadow&&!programShadowMode){
+        if(object.customDepthMaterial!=null||object.customDistanceMaterial!=null||
+            object.onBeforeShadow!==three.Object3D.prototype.onBeforeShadow||object.onAfterShadow!==three.Object3D.prototype.onAfterShadow)
+          fail('HOOK','Custom shadow materials and callbacks need their original renderer');
+        const source=Array.isArray(object.material)?object.material:[object.material];
+        if(shadowBlend==='reject'&&source.some(m=>m?.transparent))fail('SHADOW','BLEND casters require the explicit shadow.blend:skip policy');
+      }
     }
     if((!fogEnabled&&scene.fog!==null)||(!environmentEnabled&&scene.environment!==null)||(!backgroundEnabled&&sourceBackground()!==null))
       fail('SCENE','Enable source fog:{}, environment:{} or background:{} for the corresponding source effect');
@@ -285,7 +291,16 @@ export async function createGpuThreeScene(device,scene,{
     }
     return nodes;
   }
+  function wantsProgramShadows(nodes){
+    if(!shadowEnabled||!programRoute()||!programSupport.createShadows)return false;
+    const lights=nodes.filter(o=>o.isLight&&o.castShadow);
+    if(!lights.length)return false;
+    if(programShadowSticky||lights.length>1)return true;
+    try{shadowApi.inspectThreeShadow(lights[0],three);return false;}
+    catch(error){if(String(error?.code).startsWith('THREE_SHADOW_'))return true;throw error;}
+  }
   function shadowLight(nodes){
+    if(programShadowMode)return null;
     const lights=nodes.filter(o=>o.isLight&&o.castShadow);
     if(lights.length>1)fail('SHADOW','Only one source projected shadow light is admitted');
     return lights[0]??null;
@@ -348,7 +363,7 @@ export async function createGpuThreeScene(device,scene,{
    * the owned residency, or r186's zero 1x1 default while the source loads. */
   function textureBinding(t){
     let binding;
-    const generated=pmremOwner?.binding(t);
+    const generated=pmremOwner?.binding(t)??programShadowOwner?.binding(t);
     if(generated)return generated;
     if(textures.has(t)){
       binding=textures.get(t);
@@ -425,27 +440,38 @@ export async function createGpuThreeScene(device,scene,{
     return {envMap:source,envMapRotation};
   }
   let pmremOwner=null,pmremRequests=new Set();
+  const programShadows=()=>programShadowOwner??=(programSupport.createShadows?.(device,{bindingOf:t=>textureBinding(t),sourceOf:programSource})??
+    fail('SHADOW','Program shadow maps need the program shadow owner'));
+  // The renderer's shadowMap controls and the renderer object passed to shadow callbacks.
+  const shadowControls=()=>programSupport.state?.().shadowMap??{enabled:true,autoUpdate:true,needsUpdate:false,type:three.PCFShadowMap};
+  const shadowRenderer=()=>programSupport.state?.().renderer??null;
+  const castingLights=camera=>programLightList(camera).filter(l=>l.castShadow);
   const pmrem=()=>pmremOwner??=(programSupport.createPMREM?.(device,t=>textureBinding(t))??fail('MATERIAL','PMREM environments need the program PMREM owner'));
   function programDescription(m,topology,object){
     if(!programRoute())fail('MATERIAL',`Unsupported source material: ${m?.type}`);
     if(!object)fail('MATERIAL','Program materials need their object for program assembly');
-    if(shadowEnabled&&object.castShadow)fail('SHADOW','Program shadow casters are not admitted yet');
+    if(shadowEnabled&&object.castShadow&&!programShadowMode)fail('PROGRAM_SHADOW','Program shadow casters draw through the program shadow map');
     if(scene.overrideMaterial)fail('MATERIAL','overrideMaterial with program materials is not admitted yet');
-    if(programSupport.needsLights(m)&&shadowEnabled&&programLightList(programCamera).some(l=>l.castShadow))
-      fail('SHADOW','Programs receiving lights with shadow maps are not admitted yet');
+    const shadows=shadowEnabled&&castingLights(programCamera).length>0;
+    if(programSupport.needsLights(m)&&shadows&&!programShadowMode)
+      fail('PROGRAM_SHADOW','Programs receiving shadow-casting lights read the program shadow map');
     const epoch=trackMaterial(m);
     const {envMap,envMapRotation}=programEnvironment(m);
     const sides=m.transparent&&m.side===three.DoubleSide&&!m.forceSinglePass?[three.BackSide,three.FrontSide]:[m.side];
     return sides.map(side=>{
-      const compiled=programSupport.compile(m,object,{fog:scene.fog,side,envMap});
+      const compiled=programSupport.compile(m,object,{fog:scene.fog,side,envMap,shadows:programShadowMode&&shadows});
       const reflection=compiled.program.reflection;
       const uniforms=programSupport.refresh(m,{fog:scene.fog,envMap,envMapRotation});
       const sourceTextures=[],bindings=[],textureKey=[];
+      const samplers=programSupport.shadowSamplers?.(m)??null;
       for(const t of reflection.textures){
-        const value=uniforms?.[t.name]?.value,texture=t.element===null?value:value?.[t.element];
+        const value=samplers?.[t.name]??uniforms?.[t.name]?.value,texture=t.element===null?value:value?.[t.element];
         if(texture!=null&&!(texture instanceof three.Texture))fail('TEXTURE',`Uniform ${t.name} is not a texture`);
         if(texture&&(t.dimension==='cube')!==(texture.isCubeTexture===true))fail('TEXTURE',`Uniform ${t.name} texture dimension differs from its sampler`);
-        if(texture&&(t.dimension==='3d'||t.dimension==='2d-array'||t.comparison))fail('TEXTURE',`Sampler ${t.glslType} textures are not admitted yet`);
+        const shadowMap=!!texture&&!!programShadowOwner?.binding(texture);
+        if(texture&&(t.dimension==='3d'||t.dimension==='2d-array'||(t.comparison&&!shadowMap)))fail('TEXTURE',`Sampler ${t.glslType} textures are not admitted yet`);
+        // A shadow sampler without a rendered map (r186 binds an incomplete unit).
+        if(!texture&&!textureScan&&/Shadow/.test(t.glslType))fail('SHADOW',`Shadow map ${t.name} was never rendered`);
         const binding=texture?textureBinding(texture):placeholderBinding();
         sourceTextures.push(texture??null);bindings.push({view:binding.view,sampler:binding.sampler,sampleType:binding.sampleType??'float'});textureKey.push(texture??null,binding.view,binding.sampler);
       }
@@ -462,6 +488,8 @@ export async function createGpuThreeScene(device,scene,{
       // GL point sizes need the program route; elsewhere the core path renders
       // what it admits and the ShaderLib program covers what it rejects.
       if(m.isPointsMaterial)return programDescription(m,topology,object);
+      // Program shadow maps are only read by programs: every receiver draws one.
+      if(programShadowMode&&programSupport.needsLights(m))return programDescription(m,topology,object);
       try{return coreDescription(m,clippingFrame,topology);}
       catch(error){
         if(error?.code!=='THREE_SCENE_MATERIAL'&&error?.code!=='THREE_SCENE_TEXTURE')throw error;
@@ -732,7 +760,20 @@ export async function createGpuThreeScene(device,scene,{
       // Validate all source materials and texture inputs before allocating any
       // textures. Temporary inspection placeholders never reach renderer.addMesh.
       pendingTextures=new WeakSet();pmremRequests=new Set();
-      const owned=scanTextures();textureOwner?.prepare(owned);
+      let owned;
+      try{owned=scanTextures();}
+      catch(error){
+        // A program draw needs shadows the core map cannot give it: switch this
+        // bridge to program shadow maps (sticky) and rescan.
+        if(error?.code!=='THREE_SCENE_PROGRAM_SHADOW'||programShadowSticky||!programSupport.createShadows)throw error;
+        programShadowSticky=true;pendingTextures=new WeakSet();pmremRequests=new Set();owned=scanTextures();
+      }
+      textureOwner?.prepare(owned);
+      preparedShadowMode=programShadowMode;
+      if(programShadowMode){
+        const camera=programCamera??new three.Camera();
+        await Promise.race([programShadows().prepare(castingLights(programCamera),scene,camera,shadowControls(),shadowRenderer()),stopped]);live();
+      }
       // PMREM sources are owned textures now; generate their cube-UV targets
       // before the descriptions that bind them.
       for(const source of pmremRequests)if(!pendingTextures.has(source)){await Promise.race([pmrem().generate(source),stopped]);live();}
@@ -983,6 +1024,7 @@ export async function createGpuThreeScene(device,scene,{
       const clippingFrame=clippingState();
       frameTextures=new Set();
       const nodes=graph();
+      if(programShadowMode!==preparedShadowMode)fail('PREPARE','Shadow ownership changed; call prepare()');
       if(shadowEnabled){
         if(shadowLight(nodes)!==(shadowOwner?.source??null))fail('PREPARE','Call prepare() after changing the source shadow light');
         shadowOwner?.check();
@@ -1060,7 +1102,7 @@ export async function createGpuThreeScene(device,scene,{
         if(object.layers.test(camera.layers)){
           if(object.isGroup)groupOrder=object.renderOrder;
           else if(object.isLOD){if(object.autoUpdate)object.update(camera);}
-          else if(object.isLight){lighting.lights.push(light(object));lightSources.push(object);}
+          else if(object.isLight){if(!programShadowMode)lighting.lights.push(light(object));lightSources.push(object);}
           else if(object.isLineLoop){
             // Source r186 WebGPU behavior: report and draw nothing for this object.
             (three.error??console.error)('Renderer: Objects of type THREE.LineLoop are not supported. Please use THREE.Line or THREE.LineSegments.');
@@ -1098,7 +1140,15 @@ export async function createGpuThreeScene(device,scene,{
       // Complete texture/material preflight first, then publish requested bytes
       // before this frame's immediate draw submission. Stable views keep bundles
       // valid; changing a sampler/storage description requires prepare().
+      // WebGLRenderer order: shadow maps render after the render list is built,
+      // then setupLights() reads their state; depth passes submit after uploads.
+      let submitShadows=null;
+      if(programShadowMode){
+        submitShadows=programShadows().render(castingLights(camera),scene,camera,shadowControls(),shadowRenderer());
+        programSupport.setLights(programLightList(camera));programSupport.setLightsView(camera);
+      }
       textureOwner?.update(frameTextures);
+      submitShadows?.();
       const updated=new Set(),activeDeformations=new Set();
       for(const item of [...casterItems,...items]){
         if(item.program){
@@ -1115,7 +1165,7 @@ export async function createGpuThreeScene(device,scene,{
           const instanceCount=object.isInstancedMesh?integer(object.count,0,0xffffffff,'instance count'):g.isInstancedBufferGeometry?Math.min(g.instanceCount,0xffffffff):1;
           for(let i=0;i<item.bindings.length;i++){
             const d=item.desc[i],reflection=d.program.program.reflection,bytes=new Uint8Array(reflection.uniformBufferSize);
-            const current=programSupport.pack(reflection,programSupport.uniformsFor(item.material),object,camera,bytes,{targetSize:programTargetSize});
+            const current=programSupport.pack(reflection,programSupport.uniformsFor(item.material),object,camera,bytes,{targetSize:programTargetSize,material:item.material});
             if(current.some((t,k)=>(t??null)!==d.programTextures[k]))fail('PREPARE','Program texture uniforms changed; call prepare()');
             for(const t of current)if(t)frameTextures?.add(t);
             // Programs evaluate fog/lighting in their own source; never core receivers.

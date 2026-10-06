@@ -49,7 +49,7 @@ export function inspectThreeProgram(T, material, object) {
   if (material.alphaHash) fail('MATERIAL', 'alphaHash programs are not admitted yet');
   if (material.stencilWrite) fail('MATERIAL', 'Stencil programs are not admitted yet');
   if (material.transmission > 0) fail('MATERIAL', 'Transmission needs the transmission render target, not admitted yet');
-  if (material.isMeshDistanceMaterial || material.isSpriteMaterial || material.isShadowMaterial) fail('MATERIAL', `${material.type} programs are not admitted yet`);
+  if (material.isSpriteMaterial) fail('MATERIAL', `${material.type} programs are not admitted yet`);
 }
 
 /** The exact GLSL r186 WebGLProgram builds for (material, object) in this context.
@@ -57,7 +57,7 @@ export function inspectThreeProgram(T, material, object) {
 export function threeProgramSources(T, material, object, ctx = {}) {
   inspectThreeProgram(T, material, object);
   const lights = ctx.lights ?? EMPTY_LIGHTS;
-  const parameters = webglParameters(T, material, object, {...ctx, lights, shadowMapEnabled: false, clipping: {numPlanes: 0, numIntersection: 0}});
+  const parameters = webglParameters(T, material, object, {...ctx, lights, shadowMapEnabled: ctx.shadowMapEnabled === true, clipping: {numPlanes: 0, numIntersection: 0}});
   return {...webglProgramSources(T, parameters), parameters};
 }
 const EMPTY_LIGHTS = Object.freeze({ambient: [0, 0, 0], probe: [], sun: [], sunShadowMap: [], directional: [], directionalShadowMap: [], point: [],
@@ -107,23 +107,25 @@ export function threeProgramRaster(T, m, {frontFaceCW = false, topology = 'trian
 }
 
 // ---- uniform values ---------------------------------------------------------
-const BUILTIN = new Set(['modelMatrix', 'modelViewMatrix', 'projectionMatrix', 'viewMatrix', 'normalMatrix', 'cameraPosition', 'isOrthographic', 'toneMappingExposure']);
+const BUILTIN = new Set(['modelMatrix', 'modelViewMatrix', 'projectionMatrix', 'viewMatrix', 'normalMatrix', 'cameraPosition', 'isOrthographic', 'toneMappingExposure', 'receiveShadow']);
 
 /** Write one frame's uniform values for one draw from a WebGLRenderer-style
  * uniforms object (material.uniforms, or a refreshed ShaderLib clone). Values
  * the program declares but nothing sets stay zero, as GL leaves them.
  * Returns the texture (or null) for each reflected sampler binding. */
-export function packThreeProgramUniforms(T, reflection, uniforms, object, camera, bytes, {toneMappingExposure = 1, targetSize = null} = {}) {
+export function packThreeProgramUniforms(T, reflection, uniforms, object, camera, bytes, {toneMappingExposure = 1, targetSize = null, samplers = null} = {}) {
   bytes.fill(0);
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const cameraPosition = new T.Vector3().setFromMatrixPosition(camera.matrixWorld);
   const builtin = {
     modelMatrix: object.matrixWorld, modelViewMatrix: object.modelViewMatrix, projectionMatrix: camera.projectionMatrix,
     viewMatrix: camera.matrixWorldInverse, normalMatrix: object.normalMatrix, cameraPosition, isOrthographic: camera.isOrthographicCamera === true,
-    toneMappingExposure,
+    toneMappingExposure, receiveShadow: object.receiveShadow === true,
   };
   for (const u of reflection.uniforms) {
-    const value = BUILTIN.has(u.name) ? builtin[u.name] : uniforms?.[u.name]?.value;
+    // receiveShadow: set from the object each draw, then overwritten by a
+    // material uniform of that name when one exists (WebGLRenderer.setProgram order).
+    const value = BUILTIN.has(u.name) && !(u.name === 'receiveShadow' && uniforms?.receiveShadow) ? builtin[u.name] : uniforms?.[u.name]?.value;
     if (value === undefined || value === null) continue;
     write(view, u.node, value, u.name);
   }
@@ -132,7 +134,7 @@ export function packThreeProgramUniforms(T, reflection, uniforms, object, camera
     for (let i = 0; i < 4; i++) view.setFloat32(reflection.targetOffset + 4 * i, targetSize[i], true);
   }
   return reflection.textures.map(t => {
-    const v = uniforms?.[t.name]?.value;
+    const v = samplers?.[t.name] ?? uniforms?.[t.name]?.value;
     return t.element === null ? v ?? null : v?.[t.element] ?? null;
   });
 }
@@ -188,7 +190,7 @@ function write(view, node, value, name, base = 0) {
  * owns one WebGLLights state (setLights/setLightsView per frame, as
  * WebGLRenderer.render does) and per-material ShaderLib uniform clones.
  * Compiled programs are cached by their exact assembled source text (bounded). */
-export function createThreeProgramSupport({three: T, state, maxPrograms = 256, maxPointSize = 1024, pmrem = null}) {
+export function createThreeProgramSupport({three: T, state, maxPrograms = 256, maxPointSize = 1024, pmrem = null, shadows = null}) {
   const compiled = new Map(), lights = webglLights(T), clones = new WeakMap();
   let dfgLUT = null;
   /** r186 getDFGLUT(): the 16x16 RG half-float DFG table, linear, clamped. */
@@ -201,14 +203,19 @@ export function createThreeProgramSupport({three: T, state, maxPrograms = 256, m
     return dfgLUT;
   }
   let lightList = [];
-  function compile(material, object, {fog = null, side = material.side, envMap = null} = {}) {
+  /** shadows: renderer.shadowMap is enabled and this frame has shadow-casting
+   * lights (WebGLPrograms shadowMapEnabled). renderTarget: an offscreen pass
+   * (shadow depth): no tone mapping, linear output, GL row order. */
+  function compile(material, object, {fog = null, side = material.side, envMap = null, shadows = false, renderTarget = false} = {}) {
     const s = state();
-    const sources = threeProgramSources(T, material, object, {fog, side, envMap, lights: lights.state, toneMapping: s.toneMapping, outputColorSpace: s.outputColorSpace});
+    const sources = threeProgramSources(T, material, object, {fog, side, envMap, lights: lights.state,
+      toneMapping: renderTarget ? T.NoToneMapping : s.toneMapping, outputColorSpace: renderTarget ? T.LinearSRGBColorSpace : s.outputColorSpace,
+      shadowMapEnabled: shadows, shadowMapType: s.shadowMapType ?? T.PCFShadowMap});
     // GL rasterizes Points as gl_PointSize squares: compile the point-sprite form.
-    const points = object.isPoints === true, key = sources.key + (points ? '\u0000points' : '');
+    const points = object.isPoints === true, key = sources.key + (points ? '\u0000points' : '') + (renderTarget ? '\u0000gl-rows' : '');
     let entry = compiled.get(key);
     if (!entry) {
-      const program = compileEsslProgram(sources.vertex, sources.fragment, {points, maxPointSize});
+      const program = compileEsslProgram(sources.vertex, sources.fragment, {points, maxPointSize, rows: renderTarget ? 'gl' : 'webgpu'});
       entry = {key, program, attributesKey: JSON.stringify(program.reflection.attributes)};
       if (compiled.size >= maxPrograms) compiled.delete(compiled.keys().next().value);
       compiled.set(key, entry);
@@ -222,26 +229,41 @@ export function createThreeProgramSupport({three: T, state, maxPrograms = 256, m
     if (!u) clones.set(material, u = webglMaterialUniforms(T, material));
     return u;
   }
+  /** WebGLRenderer.setProgram binds shadow maps from the light state by uniform
+   * name for every material that needs lights (not from material uniforms). */
+  function shadowSamplers(material) {
+    if (!materialNeedsLights(material)) return null;
+    const st = lights.state;
+    return {sunShadowMap: st.sunShadowMap, directionalShadowMap: st.directionalShadowMap, spotShadowMap: st.spotShadowMap, pointShadowMap: st.pointShadowMap};
+  }
   /** setProgram's refreshMaterial work: lights, fog and material values. */
-  function refresh(material, {fog = null, envMap = null, envMapRotation} = {}) {
+  function refresh(material, {fog = null, envMap = null, envMapRotation, distanceLight = null} = {}) {
     const uniforms = uniformsFor(material), s = state();
-    refreshWebGLMaterialUniforms(T, uniforms, material, {fog, lights: lights.state, envMap, envMapRotation,
+    refreshWebGLMaterialUniforms(T, uniforms, material, {fog, lights: lights.state, envMap, envMapRotation, distanceLight,
       pixelRatio: s.pixelRatio ?? 1, height: s.height ?? 1, unlitColorSpace: s.outputColorSpace});
     if (uniforms.dfgLUT !== undefined) uniforms.dfgLUT.value = getDFGLUT();
     return uniforms;
   }
-  return Object.freeze({
+  const support = Object.freeze({
     compile, uniformsFor, refresh, needsLights: materialNeedsLights,
     /** r186 PMREM owner (three_program_pmrem.mjs) when injected. */
-    createPMREM: pmrem ? (device, bindingOf) => pmrem({three: T, device, bindingOf}) : null, shaderLibMaterial: m => SHADER_IDS[m?.type] !== undefined,
+    createPMREM: pmrem ? (device, bindingOf) => pmrem({three: T, device, bindingOf}) : null,
+    /** r186 WebGLShadowMap port (three_program_shadows.mjs) when injected. */
+    createShadows: shadows ? (device, options) => shadows({three: T, device, support, ...options}) : null,
+    get lightList() { return lightList; }, shaderLibMaterial: m => SHADER_IDS[m?.type] !== undefined,
     /** WebGLLights.setup for this frame's light list (source traversal order). */
     setLights(list) { lightList = [...list]; lights.setup(lightList); return lights.state.version; },
     setLightsView(camera) { lights.setupView(lightList, camera); },
     get lightsVersion() { return lights.state.version; },
     raster: (material, options) => threeProgramRaster(T, material, options),
-    pack: (reflection, uniforms, object, camera, bytes, options) =>
-      packThreeProgramUniforms(T, reflection, uniforms, object, camera, bytes, {toneMappingExposure: state().toneMappingExposure ?? 1, ...options}),
+    /** options.material: lit materials read shadow maps from the light state. */
+    pack: (reflection, uniforms, object, camera, bytes, {material = null, ...options} = {}) =>
+      packThreeProgramUniforms(T, reflection, uniforms, object, camera, bytes, {toneMappingExposure: state().toneMappingExposure ?? 1,
+        samplers: material ? shadowSamplers(material) : null, ...options}),
+    shadowSamplers,
+    state,
     createGeometry: (device, source, attributes, options) => createGpuProgramGeometry(device, source, attributes, options),
     geometrySnapshot: (gpu, device) => programGeometrySnapshot(gpu, device),
   });
+  return support;
 }

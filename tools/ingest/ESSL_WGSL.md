@@ -143,10 +143,28 @@ roughness 0.05–0.8, Physical clearcoat) matches upstream WebGLRenderer (0.01%
 of pixels differ; mean channel difference 0.01). This runs H2
 `webgl_marchingcubes` "shiny".
 
+Shadow maps (`three_program_shadows.mjs`): a retained-JavaScript port of r186
+`WebGLShadowMap` (map allocation, shadow cameras and per-face frustums, caster
+culling, `getDepthMaterial` with custom depth/distance materials and per-material
+clones, side/shadowSide, onBeforeShadow/onAfterShadow in source order). Caster
+draws are the MeshDepthMaterial / MeshDistanceMaterial ShaderLib programs,
+compiled with `rows: 'gl'` into depth32float maps (point lights: one layer per
+cube face); receivers bind them as `sampler2DShadow` / `samplerCubeShadow`
+(PCF: less-equal comparison, linear) or unfilterable `sampler2D`/`samplerCube`
+(Basic), from the light state by uniform name as `WebGLRenderer.setProgram`
+does. The WebGL surface switches to this owner when the core's single projected
+map cannot own the scene (more than one shadow light, point-light shadows, or a
+program draw that casts/receives); then every lit material draws its ShaderLib
+program. Scenario `shaderlib_shadows` (directional + spot + point cube map,
+Phong/Lambert/Standard receivers) matches upstream WebGLRenderer exactly (0
+differing pixels); `webgl_shadowmap_pointlight` runs. Maps are depth32float
+where r186 allocates 24-bit depth. Explicit errors: VSM, line/point casters,
+wireframe casters; a new light, map-size or type change is a `prepare()`
+boundary.
+
 Not admitted yet (explicit errors): transmission (needs its render target),
 render-target PMREM sources (`pmremVersion`), pre-filtered cube-UV textures
-supplied directly, Sprite / Distance / Shadow materials, programs receiving
-shadow-casting lights.
+supplied directly, Sprite materials, clipping planes on programs.
 
 Textures: the texture owner now admits HalfFloat (`*16float`) and Float
 (`*32float`) DataTextures with byte-exact rows. Float32 linear filtering
