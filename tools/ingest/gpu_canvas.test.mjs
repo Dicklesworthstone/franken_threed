@@ -222,7 +222,33 @@ test('missing WebGPU context releases the reservation and never requests another
 test('unsupported compositing and formats fail before taking canvas ownership', () => {
   const f = fixture();
   for (const options of [{format: 'rgba16float'}, {depthFormat: 'depth24plus-stencil8'},
-    {sampleCount: 8}, {alphaMode: 'premultiplied'}, {maxBytes: -1}, {unknown: true}])
+    {sampleCount: 8}, {alphaMode: 'straight'}, {alphaMode: 'transparent'}, {maxBytes: -1}, {unknown: true}])
     assert.throws(() => createGpuCanvasTarget(f.device, f.canvas, options), GpuCanvasError);
   assert.equal(f.calls.length, 0); assert.equal(f.textures.length, 0);
+});
+
+test('premultiplied compositing configures the canvas for page-transparent output', () => {
+  const f = fixture(), target = createGpuCanvasTarget(f.device, f.canvas, {alphaMode: 'premultiplied'});
+  assert.equal(f.calls.find(c => c[0] === 'configure')[1].alphaMode, 'premultiplied');
+  assert.equal(target.alphaMode, 'premultiplied'); target.dispose();
+});
+
+test('lazy frames acquire the swapchain only when a view is read', () => {
+  const f = fixture(), target = createGpuCanvasTarget(f.device, f.canvas, {sampleCount: 4});
+  // A draw that stops before reading any view presents nothing.
+  assert.throws(() => target.withFrame(() => { throw new Error('needs preparation'); }, {lazy: true}), /needs preparation/);
+  assert.equal(target.withFrame(() => {}, {lazy: true}), false);
+  assert.equal(count(f, 'acquire'), 0); assert.equal(target.diagnostics.frames, 0);
+  let seen;
+  assert.equal(target.withFrame((a, texture) => {
+    assert.equal(count(f, 'acquire'), 0);
+    const copy = Object.defineProperties({}, Object.getOwnPropertyDescriptors(a));
+    assert.equal(count(f, 'acquire'), 0);
+    seen = {color: copy.colorView, resolve: copy.resolveTarget, depth: copy.depthView, texture: texture()};
+  }, {lazy: true}), true);
+  assert.equal(count(f, 'acquire'), 1); assert.equal(target.diagnostics.frames, 1);
+  assert.equal(seen.resolve.texture, seen.texture); assert.notEqual(seen.color.texture, seen.texture);
+  assert.equal(seen.depth.texture.descriptor.format, 'depth24plus');
+  assert.throws(() => target.withFrame(() => {}, {lazy: 1}), GpuCanvasError);
+  target.dispose();
 });

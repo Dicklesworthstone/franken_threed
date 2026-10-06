@@ -16,13 +16,14 @@ const lowerLimits = new Set(['minUniformBufferOffsetAlignment', 'minStorageBuffe
 export async function createGpuCanvasRenderer(canvas, createRenderer, options = {}) {
   object(options, 'renderer options');
   for (const key of Object.keys(options))
-    if (!['device', 'gpu', 'powerPreference', 'requiredFeatures', 'requiredLimits', 'target', 'signal'].includes(key))
+    if (!['device', 'gpu', 'powerPreference', 'requiredFeatures', 'requiredLimits', 'target', 'signal', 'lazyAttachments'].includes(key))
       fail('OPTIONS', `Unknown renderer option: ${key}`);
   if (typeof createRenderer !== 'function') fail('FACTORY', 'Expected an explicit renderer factory');
   const {
     device: suppliedDevice = null, gpu = globalThis.navigator?.gpu,
-    powerPreference, signal,
+    powerPreference, signal, lazyAttachments = false,
   } = options;
+  if (typeof lazyAttachments !== 'boolean') fail('OPTIONS', 'lazyAttachments must be boolean');
   const targetOptions = {...object(options.target ?? {}, 'canvas target options')};
   const features = options.requiredFeatures ?? [];
   if (!Array.isArray(features) || features.length > 64 || features.some(f => typeof f !== 'string' || !f))
@@ -105,7 +106,10 @@ export async function createGpuCanvasRenderer(canvas, createRenderer, options = 
         for (const key of ['colorView', 'depthView', 'resolveTarget'])
           if (Object.hasOwn(packet, key)) fail('FRAME', 'Canvas attachments cannot be overridden');
         live();
-        lastFrameRendered = target.withFrame((attachments, texture) => renderer.render(input, {...packet, ...attachments}, texture));
+        // Copy attachment descriptors rather than values: with lazyAttachments
+        // the presentation texture is acquired only when the renderer reads a view.
+        lastFrameRendered = target.withFrame((attachments, texture) => renderer.render(input,
+          Object.defineProperties(packet, Object.getOwnPropertyDescriptors(attachments)), texture), {lazy: lazyAttachments});
         live(); return api;
       });
     },

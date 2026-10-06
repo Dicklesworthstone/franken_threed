@@ -30,9 +30,12 @@ export function createGpuCanvasTarget(device, canvas, options = {}) {
     fail('FORMAT', 'Canvas format must be rgba8unorm or bgra8unorm');
   if (![null, 'depth24plus', 'depth32float'].includes(depthFormat) || ![1, 4].includes(sampleCount))
     fail('FORMAT', 'Expected optional depth24plus/depth32float and one or four samples');
-  // The existing explicit material renderer produces straight-alpha blending.
-  // Transparent canvas compositing needs a separate output-alpha conversion.
-  if (alphaMode !== 'opaque') fail('ALPHA', 'This direct canvas path requires opaque compositing');
+  // 'premultiplied' composites the canvas over the page. The explicit renderer
+  // blends color with (src-alpha, one-minus-src-alpha) and alpha with (one,
+  // one-minus-src-alpha), so content over a zero-alpha clear is premultiplied in
+  // linear space before the sRGB view encodes it -- the same order as the source
+  // WebGPU output pass. Callers must clear with premultiplied colors.
+  if (!['opaque', 'premultiplied'].includes(alphaMode)) fail('ALPHA', 'Canvas alpha mode must be opaque or premultiplied');
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) fail('BUDGET', 'Invalid attachment budget');
   if (!canvas || typeof canvas.getContext !== 'function' || owners.has(canvas))
     fail('OWNERSHIP', 'Supply an exclusively owned canvas without another live canvas target');
@@ -137,34 +140,54 @@ export function createGpuCanvasTarget(device, canvas, options = {}) {
     } else destroy(previous);
     return target;
   }
-  function withFrame(draw) {
+  function withFrame(draw, {lazy = false} = {}) {
     if (typeof draw !== 'function') fail('FRAME', 'Expected a synchronous draw function');
+    if (typeof lazy !== 'boolean') fail('FRAME', 'Expected a boolean lazy acquisition flag');
     if (canvas.width !== width || canvas.height !== height)
       fail('SIZE_CHANGED', 'Canvas dimensions changed outside the target; call resize() first');
     if (!width || !height) return false;
-    let presentation;
-    const attachments = checked(() => {
-      const texture = context.getCurrentTexture();
-      presentation = texture;
-      const view = texture.createView({format});
-      return Object.freeze({colorView: current.colorView ?? view,
-        ...(current.depthView ? {depthView: current.depthView} : {}),
-        ...(current.colorView ? {resolveTarget: view} : {})});
-    });
-    // A caller can submit before throwing: never retire this target as unused.
-    current.used = true;
-    const result = draw(attachments, presentation);
+    let presentation, views = null;
+    const acquire = () => {
+      views ??= checked(() => {
+        const texture = context.getCurrentTexture();
+        presentation = texture;
+        const view = texture.createView({format});
+        return {colorView: current.colorView ?? view, depthView: current.depthView, resolveTarget: current.colorView ? view : undefined};
+      });
+      // A caller can submit before throwing: never retire this target as unused.
+      current.used = true;
+      return views;
+    };
+    // Lazy attachments acquire the presentation texture only when a renderer
+    // first reads a view. A draw that throws before that point (for example an
+    // explicit preparation boundary) presents nothing, so the canvas keeps its
+    // last presented image instead of compositing an empty swapchain texture.
+    let attachments;
+    if (lazy) {
+      attachments = {get colorView() { return acquire().colorView; }};
+      if (current.depthView) Object.defineProperty(attachments, 'depthView', {enumerable: true, get: () => acquire().depthView});
+      if (current.colorView) Object.defineProperty(attachments, 'resolveTarget', {enumerable: true, get: () => acquire().resolveTarget});
+      Object.freeze(attachments);
+    } else {
+      const v = acquire();
+      attachments = Object.freeze({colorView: v.colorView,
+        ...(v.depthView ? {depthView: v.depthView} : {}),
+        ...(v.resolveTarget ? {resolveTarget: v.resolveTarget} : {})});
+    }
+    const result = draw(attachments, lazy ? () => acquire() && presentation : presentation);
     if (result && typeof result.then === 'function') {
       Promise.resolve(result).catch(() => {});
       fail('ASYNC_FRAME', 'Frame views must be consumed and submitted synchronously; returned work is not cancelled');
     }
+    if (!views) return false;
     frames++;
     return true;
   }
   const target = Object.freeze({
     device, canvas, rendererOptions, format, canvasFormat, depthFormat, sampleCount,
     resize(w, h) { return exclusive(() => resize(w, h)); },
-    withFrame(draw) { return exclusive(() => withFrame(draw)); },
+    withFrame(draw, options) { return exclusive(() => withFrame(draw, options)); },
+    get alphaMode() { return alphaMode; },
     get width() { return width; }, get height() { return height; },
     get suspended() { return !width || !height; },
     get disposed() { return disposed; }, get failed() { return terminal !== null; },
