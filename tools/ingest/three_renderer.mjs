@@ -703,8 +703,20 @@ export function createWebGLRendererClass(THREE, classOptions = {}) {
     forceContextRestore() { fail('UNSUPPORTED', 'This WebGLRenderer route has no GL context'); }
     getCurrentViewport(target) { return target.copy(this._viewport).multiplyScalar(this._pixelRatio).round(); }
   }
-  for (const name of ['capabilities', 'extensions', 'properties', 'state', 'renderLists'])
+  for (const name of ['extensions', 'properties', 'state', 'renderLists'])
     Object.defineProperty(WebGLRenderer.prototype, name, glOnly(name));
+  // Only capabilities that describe THIS renderer's behavior are served: the
+  // sampler anisotropy ceiling it applies (WebGPU clamps maxAnisotropy to 16, as
+  // r186's WebGPU backend reports) and the depth/precision modes it admits.
+  // GL-context limits (texture units, uniform vectors, ...) throw explicitly.
+  Object.defineProperty(WebGLRenderer.prototype, 'capabilities', {configurable: true, get() {
+    const known = {getMaxAnisotropy: () => 16, logarithmicDepthBuffer: false, reversedDepthBuffer: false, precision: 'highp',
+      getMaxPrecision: () => 'highp', isWebGL2: true};
+    return new Proxy(known, {get(target, key) {
+      if (typeof key === 'symbol' || Object.hasOwn(target, key)) return target[key];
+      fail('UNSUPPORTED', `WebGLRenderer.capabilities.${String(key)} describes a GL context; this route has none`);
+    }});
+  }});
   return WebGLRenderer;
 }
 

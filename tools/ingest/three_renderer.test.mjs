@@ -286,8 +286,10 @@ test('WebGLRenderer surface: synchronous construction, frames before init are de
   renderer.render(scene, camera);
   await flush(renderer);
   assert.equal(renderer._dispatcher.entry(scene).clipping, true);
-  for (const name of ['capabilities', 'extensions', 'state', 'properties'])
+  for (const name of ['extensions', 'state', 'properties'])
     assert.throws(() => renderer[name], {code: 'F3D_RENDERER_UNSUPPORTED'});
+  assert.equal(renderer.capabilities.getMaxAnisotropy(), 16);
+  assert.throws(() => renderer.capabilities.maxTextureSize, {code: 'F3D_RENDERER_UNSUPPORTED'});
   assert.throws(() => renderer.getContext(), {code: 'F3D_RENDERER_UNSUPPORTED'});
   renderer.dispose();
 });

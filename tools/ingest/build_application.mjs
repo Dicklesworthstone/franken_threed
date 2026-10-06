@@ -1349,6 +1349,8 @@ async function decideRendererRoutes(entryAbs, packageRootUrl, enabled) {
 }
 
 const GL_CONTEXT_STATE = new Set(["capabilities", "extensions", "getContextAttributes", "forceContextLoss", "forceContextRestore"]);
+// Fields the routed WebGLRenderer serves truthfully (three_renderer.mjs).
+const SERVED_CAPABILITIES = new Set(["getMaxAnisotropy", "logarithmicDepthBuffer", "reversedDepthBuffer", "precision", "getMaxPrecision", "isWebGL2"]);
 /** True when an application (non-pinned-library) module reads GL-context state. */
 function readsGlContextState(graph, entryAbs, packageRootUrl) {
   const inline = new Map();
@@ -1370,9 +1372,14 @@ function readsGlContextState(graph, entryAbs, packageRootUrl) {
       return true; // Unparseable application code cannot be cleared.
     }
     let found = false;
-    walk.simple(ast, {
-      MemberExpression(node) {
-        if (!node.computed && GL_CONTEXT_STATE.has(node.property.name)) found = true;
+    walk.ancestor(ast, {
+      MemberExpression(node, _state, ancestors) {
+        if (node.computed || !GL_CONTEXT_STATE.has(node.property.name)) return;
+        // renderer.capabilities.<served field> describes this route, not a GL context.
+        const parent = ancestors.at(-2);
+        if (node.property.name === "capabilities" && parent?.type === "MemberExpression" && parent.object === node &&
+            !parent.computed && SERVED_CAPABILITIES.has(parent.property.name)) return;
+        found = true;
       },
     });
     if (found) return true;

@@ -111,11 +111,12 @@ test("WebGLRenderer apps route only when opted in and free of GL escapes or GL-s
   const emitted = await import(pathToFileURL(path.join(on.out, "main.js")).href);
   assert.equal(emitted.renderer.isWebGLRenderer, true);
   assert.equal(emitted.renderer.isF3DRenderer, true);
-  assert.throws(() => emitted.renderer.capabilities, { code: "F3D_RENDERER_UNSUPPORTED" });
+  assert.equal(emitted.renderer.capabilities.getMaxAnisotropy(), 16, "served: this route's sampler ceiling");
+  assert.throws(() => emitted.renderer.capabilities.maxTextures, { code: "F3D_RENDERER_UNSUPPORTED" });
   assert.throws(() => emitted.renderer.getContext(), { code: "F3D_RENDERER_UNSUPPORTED" });
 
   for (const [body, reason] of [
-    [GL_PROGRAM + "export const aniso = renderer.capabilities.getMaxAnisotropy();", "gl-context-state-read"],
+    [GL_PROGRAM + "export const units = renderer.capabilities.maxTextures;", "gl-context-state-read"],
     [GL_PROGRAM + "export const gl = renderer.getContext();", "construction-site-not-general-webgpu"],
     [GL_PROGRAM + "export const ext = document.createElement('canvas').getContext('webgl2').getExtension('x');", "construction-site-not-general-webgpu"],
   ]) {
@@ -124,6 +125,12 @@ test("WebGLRenderer apps route only when opted in and free of GL escapes or GL-s
     assert.equal(result.rendererRoute.routed, false, body);
     assert.equal(result.rendererRoute.reason, reason);
   }
+});
+
+test("served capability reads (getMaxAnisotropy) do not veto the WebGL route", async () => {
+  const a = app(GL_PROGRAM + "export const aniso = renderer.capabilities.getMaxAnisotropy();");
+  const r = await buildApplication(a.entry, a.out, { routeWebGLRenderer: true });
+  assert.equal(r.rendererRoute.routed, true);
 });
 
 test("the unmodified H2 example routes its WebGLRenderer to the new backend", async () => {
