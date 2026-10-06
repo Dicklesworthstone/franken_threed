@@ -154,7 +154,7 @@ test('material/map values and unsupported source paths reject before GPU allocat
     ()=>{const f=fixture(new T.ShaderMaterial());return f;},
     ()=>{const f=fixture();f.mesh.onBeforeRender=()=>{throw Error('must not run');};return f;},
     ()=>{const f=fixture();f.g.attributes.position.onUpload(()=>{throw Error('must not run');});return f;},
-    ()=>{const f=fixture();f.m.wireframe=true;return f;},
+    ()=>{const f=fixture();f.m.alphaHash=true;return f;},
     ()=>{const f=fixture();f.m.color.r=NaN;return f;},
     ()=>{const f=fixture();f.m.onBeforeCompile=()=>{};return f;},
     ()=>{const f=fixture();f.mesh.castShadow=true;return f;},

@@ -133,6 +133,17 @@ export const scenarios = {
     quad(0.9, -0.5, 0xffffff, { polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -4 }).scale.set(0.5, 0.5, 1);
     return { scene, camera: camera(THREE) };
   },
+  wireframes(THREE) {
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x101010);
+    const lit = new THREE.Mesh(new THREE.SphereGeometry(0.7, 16, 12), new THREE.MeshStandardMaterial({ color: 0x66ccff, wireframe: true }));
+    lit.position.x = -0.9;
+    const basic = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1).toNonIndexed(), new THREE.MeshBasicMaterial({ color: 0xffaa00, wireframe: true }));
+    basic.position.x = 0.9; basic.rotation.set(0.4, 0.6, 0);
+    const sun = new THREE.DirectionalLight(0xffffff, 3); sun.position.set(1, 2, 3);
+    scene.add(lit, basic, sun, new THREE.AmbientLight(0xffffff, 0.3));
+    return { scene, camera: camera(THREE) };
+  },
   // WebGPU-build node-material classes with no assigned nodes (H1 uses MeshToonNodeMaterial).
   node_materials(THREE) {
     const scene = new THREE.Scene();

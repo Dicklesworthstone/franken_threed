@@ -94,9 +94,9 @@ test('source material coverage includes color, normal, emission, occlusion, spec
 test('bad final material/ranges cannot partly upload earlier dirty textures',async()=>{
   const f=fixture(),a=data(),b=data();f.material.map=a;
   const material=new T.MeshBasicMaterial({map:b}),second=new T.Mesh(f.geometry,material);f.scene.add(second);
-  const bridge=await create(f);a.needsUpdate=true;a.image.data.fill(55);material.wireframe=true;let before=marks(f.d);
+  const bridge=await create(f);a.needsUpdate=true;a.image.data.fill(55);material.alphaHash=true;let before=marks(f.d);
   assert.throws(()=>bridge.render(f.camera,frame()),{code:'THREE_SCENE_MATERIAL'});assert.deepEqual(marks(f.d),before);
-  material.wireframe=false;b.addUpdateRange(7,8);b.needsUpdate=true;
+  material.alphaHash=false;b.addUpdateRange(7,8);b.needsUpdate=true;
   assert.throws(()=>bridge.render(f.camera,frame()),{code:'THREE_TEXTURE_RANGE'});assert.deepEqual(marks(f.d),before);
   b.clearUpdateRanges();bridge.render(f.camera,frame());assert.ok(f.d.textures[0].levels[0].every(x=>x===55));bridge.dispose();
 });

@@ -1657,9 +1657,12 @@ export async function createGpuAnimationRenderer(
     if (topology !== "triangles") {
       if (!mutable || options.instances != null || format === null)
         fail("ANIMATION_RENDER_OPTIONS", "Line/point topologies require color output and source BufferGeometry residency");
-      if ((options.shading ?? "unlit") !== "unlit" || MAP_FIELDS.some((f) => options[f] != null) ||
+      // Line lists (including source wireframes) may be lit and textured: they
+      // carry the same vertex streams. Strips/points stay unlit and untextured.
+      const surfaceLines = topology === "lines";
+      if ((!surfaceLines && ((options.shading ?? "unlit") !== "unlit" || MAP_FIELDS.some((f) => options[f] != null))) ||
           COAT_FIELDS.some((f) => options[f] != null) || options.flatShading)
-        fail("ANIMATION_RENDER_OPTIONS", "Line/point topologies admit unlit untextured materials only");
+        fail("ANIMATION_RENDER_OPTIONS", "Line strips/points admit unlit untextured materials; no line admits clearcoat or flat shading");
     }
     const topologyKey = topology === "triangles" ? "" :
       `topo-${topology}${topology === "line-strip" && mutable.indexFormat ? "-" + mutable.indexFormat : ""}-`;

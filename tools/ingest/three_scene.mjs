@@ -336,9 +336,13 @@ export async function createGpuThreeScene(device,scene,{
     const shading=models.get(Object.getPrototypeOf(m));
     if(!shading)fail('MATERIAL',`Unsupported source material: ${m?.type}`);
     const primitive=m.isLineBasicMaterial?'line':m.isPointsMaterial?'point':'surface';
-    if(topology!=='triangles'&&primitive==='surface'&&shading!=='unlit')
+    // Wireframe meshes keep their full (lit, textured) material on line lists,
+    // as the source WebGPU renderer draws them.
+    const wire=m.wireframe===true&&primitive==='surface'&&topology==='lines';
+    if(topology!=='triangles'&&!wire&&primitive==='surface'&&shading!=='unlit')
       fail('MATERIAL',`Lit ${m.type} on ${topology} primitives is not admitted`);
-    if(topology!=='triangles'&&(m.map||m.alphaMap))fail('MATERIAL','Textured line/point primitives are not admitted');
+    if(topology!=='triangles'&&!wire&&(m.map||m.alphaMap))fail('MATERIAL','Textured line/point primitives are not admitted');
+    if(wire&&m.flatShading)fail('MATERIAL','Flat-shaded wireframes are not admitted');
     for(const descriptor of Object.values(Object.getOwnPropertyDescriptors(m)))
       if(!Object.hasOwn(descriptor,'value'))fail('HOOK','Accessor-backed material fields are not admitted');
     if(m.isNodeMaterial){
@@ -347,7 +351,7 @@ export async function createGpuThreeScene(device,scene,{
     }
     if(m.onBeforeRender!==three.Material.prototype.onBeforeRender||m.onBeforeCompile!==three.Material.prototype.onBeforeCompile||
         m.customProgramCacheKey!==(m.isNodeMaterial?three.NodeMaterial:three.Material).prototype.customProgramCacheKey)fail('HOOK','Custom material shader/render hooks require their original component');
-    if(m.wireframe||m.alphaHash||m.alphaToCoverage||(!clippingEnabled&&m.clippingPlanes?.length))
+    if((m.wireframe&&topology==='triangles')||m.alphaHash||m.alphaToCoverage||(!clippingEnabled&&m.clippingPlanes?.length))
       fail('MATERIAL','Wireframe, hashed/coverage alpha and clipping are not admitted');
     // Source r186 WebGPU applies material stencil state only when the target has
     // a stencil buffer; without one the fields have no rendering effect.
@@ -471,6 +475,30 @@ export async function createGpuThreeScene(device,scene,{
     else if(m.blending===three.NormalBlending&&!m.transparent)options.blend=null;
     return {options,values,key:JSON.stringify(options)};
   }
+  // Derived wireframe geometries share the source attributes; only the edge
+  // index is owned. Rebuilt when the source index/position version or identity
+  // changes (r186 Geometries.getWireframeIndex), with drawRange scaled by two.
+  const wireframes=new WeakMap();
+  function wireframeGeometry(g){
+    const position=g.attributes.position,index=g.index;
+    if(!position)fail('GEOMETRY','Wireframe geometry requires positions');
+    const version=index?index.version:position.version,id=index??position;
+    let w=wireframes.get(g);
+    if(!w)wireframes.set(g,w={geometry:new three.BufferGeometry(),version:-1,id:null});
+    const derived=w.geometry;
+    for(const [name,attribute] of Object.entries(g.attributes))if(derived.attributes[name]!==attribute)derived.setAttribute(name,attribute);
+    for(const name of Object.keys(derived.attributes))if(!g.attributes[name])derived.deleteAttribute(name);
+    if(w.version!==version||w.id!==id){
+      const indices=[];
+      if(index){const a=index.array;for(let i=0;i<a.length;i+=3)indices.push(a[i],a[i+1],a[i+1],a[i+2],a[i+2],a[i]);}
+      else for(let i=0,l=position.array.length/3-1;i<l;i+=3)indices.push(i,i+1,i+1,i+2,i+2,i);
+      derived.setIndex(new (position.count>=65535?three.Uint32BufferAttribute:three.Uint16BufferAttribute)(indices,1));
+      w.version=version;w.id=id;
+    }
+    const range=g.drawRange;
+    derived.setDrawRange(range.start*2,range.count===Infinity?Infinity:range.count*2);
+    return derived;
+  }
   function desired(nodes){
     const clippingFrame=clippingState();
     const out=[],descriptions=new Map(),seen=new Map(),usedGeometry=new Set(),usedInstances=new Set(),usedDeformations=new Set();
@@ -488,16 +516,19 @@ export async function createGpuThreeScene(device,scene,{
       for(const original of source){
         if(!original)continue;
         // The original controls visibility/list admission even with an override.
-        get(original,topology);
+        get(original,object.isMesh&&original.wireframe===true?'lines':topology);
         const m=scene.overrideMaterial&&original.allowOverride===true?scene.overrideMaterial:original;
-        let set=seen.get(key);if(!set)seen.set(key,set=new Map());
-        const topologies=set.get(m)??new Set();if(topologies.has(topology))continue;topologies.add(topology);set.set(m,topologies);
-        usedGeometry.add(g);if(instanceSource)usedInstances.add(instanceSource);
+        const wire=object.isMesh&&m.wireframe===true;
+        if(wire&&(instanceSource||deformationSource))fail('MATERIAL','Wireframe instanced or deformed meshes are not admitted');
+        const t=wire?'lines':topology,geometry=wire?wireframeGeometry(g):g,itemKey=wire?geometry:key;
+        let set=seen.get(itemKey);if(!set)seen.set(itemKey,set=new Map());
+        const topologies=set.get(m)??new Set();if(topologies.has(t))continue;topologies.add(t);set.set(m,topologies);
+        usedGeometry.add(geometry);if(instanceSource)usedInstances.add(instanceSource);
         if(deformationSource)usedDeformations.add(deformationSource);
         if(usedDeformations.size>maxDeformedMeshes)fail('LIMIT','Source deformed mesh capacity exceeded');
-        for(const desc of get(m,topology)){
+        for(const desc of get(m,t)){
           if(textureTransforms)uvApi.checkThreeMapChannels(g,desc.options.mapChannels);
-          out.push({key,geometry:g,instanceSource,instanceSignature,deformationSource,material:m,desc});
+          out.push({key:itemKey,geometry,instanceSource,instanceSignature,deformationSource,material:m,desc});
           if(out.length>maxBindings||usedGeometry.size>maxGeometries||usedInstances.size>maxInstanceMeshes)fail('LIMIT','Source geometry/material binding capacity exceeded');
         }
       }
@@ -777,18 +808,24 @@ export async function createGpuThreeScene(device,scene,{
         if(!byTopology.has(topology))byTopology.set(topology,materialDescription(m,clippingFrame,topology));return byTopology.get(topology);
       };
       function append(object,groupOrder,z,shadowPass=false){
-        const g=object.geometry,topology=topologyOf(object);
-        function push(original,group){
+        const source=object.geometry,topology=topologyOf(object);
+        function push(original,sourceGroup){
               if(!original||!original.visible)return;
               if(shadowPass&&original.transparent){
                 if(shadowBlend==='skip')return;
                 fail('SHADOW','BLEND casters require the explicit skip policy');
               }
               const material=scene.overrideMaterial&&original.allowOverride===true?scene.overrideMaterial:original;
+              // Source WebGPU wireframe: a derived edge index drawn as a line
+              // list, with draw ranges and groups scaled by two.
+              const wire=object.isMesh&&material.wireframe===true;
+              if(wire&&shadowPass)fail('SHADOW','Wireframe shadow casters are not admitted');
+              const g=wire?wireframeGeometry(source):source;
+              const group=wire&&sourceGroup?{start:sourceGroup.start*2,count:sourceGroup.count*2,materialIndex:sourceGroup.materialIndex}:sourceGroup;
               const instanceSource=object.isInstancedMesh?object:null;
               const instanceSignature=instanceSource?instanceAdmission(instanceSource).signature:null;
               const deformationSource=hasThreeDeformation(object)?object:null;
-              const desc=get(material,topology),records=lookup.get(deformationSource??instanceSource??g)?.get(material);
+              const desc=get(material,wire?'lines':topology),records=lookup.get(deformationSource??instanceSource??g)?.get(material);
               if(textureTransforms)for(const d of desc)uvApi.checkThreeMapChannels(g,d.options.mapChannels);
               const bindings=desc.map(d=>records?.find(e=>!e.mesh.disposed&&e.geometry===g&&
                 e.instanceSignature===instanceSignature&&same(e.structural,d.structural)));
@@ -798,7 +835,7 @@ export async function createGpuThreeScene(device,scene,{
               if(shadowPass&&bindings.some(e=>!casters.has(e)||casters.get(e).disposed))fail('PREPARE','Prepare the source caster material before drawing it');
               (shadowPass?casterItems:original.transparent?transparent:opaque).push({object,geometry:g,material,listMaterial:original,group,groupOrder,z,desc,bindings,shadowPass});
             }
-        if(Array.isArray(object.material))for(const group of g.groups)push(object.material[group.materialIndex],group);
+        if(Array.isArray(object.material))for(const group of source.groups)push(object.material[group.materialIndex],group);
         else push(object.material,null);
       }
       let visited=0;

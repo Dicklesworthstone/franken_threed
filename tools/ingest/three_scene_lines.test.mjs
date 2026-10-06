@@ -68,3 +68,28 @@ test('LineLoop reports the source WebGPU error and draws nothing; unadmitted var
     await assert.rejects(createGpuThreeScene(device(), s, {three: T, renderer: {maxDraws: 8}}), {code: 'THREE_SCENE_MATERIAL'});
   }
 });
+
+test('wireframe meshes draw the source edge index as a lit line list with doubled ranges', async () => {
+  const d = device(), scene = new T.Scene();
+  const geometry = new T.BoxGeometry();
+  geometry.clearGroups(); geometry.addGroup(0, 6, 0); geometry.addGroup(6, 30, 1);
+  const lit = new T.MeshStandardMaterial({wireframe: true}), basic = new T.MeshBasicMaterial({wireframe: true});
+  const mesh = new T.Mesh(geometry, lit);
+  scene.add(mesh, new T.AmbientLight());
+  const b = await createGpuThreeScene(d, scene, {three: T, renderer: {maxDraws: 8}});
+  b.render(camera(), {colorView: {}, depthView: {}});
+  const draw = d.snapshots.at(-1)[0];
+  assert.equal(draw.pipeline.primitive.topology, 'line-list');
+  assert.ok(draw.indexed);
+  assert.equal(draw.args[0], geometry.index.count * 2, 'a,b,b,c,c,a per triangle');
+  // Groups and draw ranges scale by two, as in the source getDrawParameters().
+  mesh.material = [lit, basic];
+  await b.prepare();
+  b.render(camera(), {colorView: {}, depthView: {}});
+  const counts = d.snapshots.at(-1).map(x => [x.args[0], x.args[2]]).sort((p, q) => p[1] - q[1]);
+  assert.deepEqual(counts, [[12, 0], [60, 12]]);
+  // A source position/index version change rebuilds the edge index.
+  geometry.index.needsUpdate = true;
+  b.render(camera(), {colorView: {}, depthView: {}});
+  b.dispose();
+});
