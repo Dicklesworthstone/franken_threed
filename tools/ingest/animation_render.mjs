@@ -1238,6 +1238,10 @@ export async function createGpuAnimationRenderer(
     const depthWrite = state & 12 ? (state & 8) !== 0 : null;
     const depthCompare = DEPTH_COMPARE[Number(/compare-(\d+)-/.exec(variant)?.[1] ?? 0)];
     const backSide = variant.includes("back-");
+    const topologyMatch = /topo-(lines|line-strip|points)(?:-(uint16|uint32))?-/.exec(variant);
+    const primitiveTopology = topologyMatch
+      ? { lines: "line-list", "line-strip": "line-strip", points: "point-list" }[topologyMatch[1]]
+      : "triangle-list";
     const lit = variant.startsWith("lit-"),
       attributes = !variant.endsWith("plain") && !variant.includes("no-surface-"),
       mapMask = mapMaskFor(variant),
@@ -1383,8 +1387,9 @@ export async function createGpuAnimationRenderer(
                       ],
               },
               primitive: {
-                topology: "triangle-list",
-                cullMode: winding.startsWith("none") ? "none" : backSide ? "front" : "back",
+                topology: primitiveTopology,
+                ...(topologyMatch?.[2] ? { stripIndexFormat: topologyMatch[2] } : {}),
+                cullMode: winding.startsWith("none") || topologyMatch ? "none" : backSide ? "front" : "back",
                 frontFace: winding === "cw" || winding === "none-cw" ? "cw" : "ccw",
               },
               ...(depthFormat
@@ -1618,11 +1623,27 @@ export async function createGpuAnimationRenderer(
         "metallicFactor",
         "roughnessFactor",
         "emissiveFactor",
+        "topology",
       ],
       "material/geometry",
     );
     const raster = snapshotAnimationRaster(options, {format, depthFormat});
     const mutable = deformerShape(gpu, device);
+    // Line and point primitives are one-pixel WebGPU primitives, as in the
+    // source WebGPU backend: no line width or point size is emulated. Indexed
+    // line strips carry their index format as fixed pipeline state.
+    const topology = options.topology ?? "triangles";
+    if (!["triangles", "lines", "line-strip", "points"].includes(topology))
+      fail("ANIMATION_RENDER_OPTIONS", "Topology must be triangles, lines, line-strip or points");
+    if (topology !== "triangles") {
+      if (!mutable || options.instances != null || format === null)
+        fail("ANIMATION_RENDER_OPTIONS", "Line/point topologies require color output and source BufferGeometry residency");
+      if ((options.shading ?? "unlit") !== "unlit" || MAP_FIELDS.some((f) => options[f] != null) ||
+          COAT_FIELDS.some((f) => options[f] != null) || options.flatShading)
+        fail("ANIMATION_RENDER_OPTIONS", "Line/point topologies admit unlit untextured materials only");
+    }
+    const topologyKey = topology === "triangles" ? "" :
+      `topo-${topology}${topology === "line-strip" && mutable.indexFormat ? "-" + mutable.indexFormat : ""}-`;
     const instanceHandle = options.instances ?? null;
     if (instanceHandle && !mutable)
       fail("ANIMATION_RENDER_OPTIONS", "Source instances require source BufferGeometry residency");
@@ -1858,6 +1879,7 @@ export async function createGpuAnimationRenderer(
     }
     const variant =
       (lit ? "lit-" : "") +
+      topologyKey +
       (raster.key ? `raster-${rasterId}-` : "") +
       (state === 3 ? "" : `state-${state}-`) +
       (comparison === 0 ? "" : `compare-${comparison}-`) +

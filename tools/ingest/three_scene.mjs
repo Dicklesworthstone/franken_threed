@@ -50,6 +50,12 @@ const MAPS=[['map','baseColorTexture'],['normalMap','normalTexture'],['emissiveM
 const opacityFields=values=>Object.fromEntries(['baseColorTexture','alphaTexture']
   .filter(key=>values?.[key]!==undefined).map(key=>[key,values[key]]));
 const DEPTH=['never','always','less','less-equal','equal','greater-equal','greater','not-equal'];
+// Source renderable family -> native primitive topology. LineLoop is excluded:
+// the r186 WebGPU renderer reports it and draws nothing (see render traversal).
+const topologyOf=object=>object.isPoints?'points':object.isLineSegments?'lines':object.isLine?'line-strip':'triangles';
+// Indexed line strips fix their index format in the native pipeline.
+const stripSignature=(shape,topology)=>topology==='line-strip'&&shape.indexFormat?shape.signature+'|'+shape.indexFormat:shape.signature;
+const drawable=object=>object.isMesh||object.isPoints||(object.isLine&&!object.isLineLoop);
 
 export async function createGpuThreeScene(device,scene,{
   three, textures=new Map(), autoTextures=true, texture:textureOptions={}, renderer:renderOptions={}, geometry:geometryOptions={},
@@ -124,6 +130,7 @@ export async function createGpuThreeScene(device,scene,{
     [three.MeshBasicMaterial.prototype,'unlit'],[three.MeshLambertMaterial.prototype,'lambert'],
     [three.MeshPhongMaterial.prototype,'phong'],[three.MeshToonMaterial.prototype,'toon'],
     [three.MeshStandardMaterial.prototype,'metallic-roughness'],
+    ...['LineBasicMaterial','PointsMaterial'].filter(name=>typeof three[name]==='function').map(name=>[three[name].prototype,'unlit']),
   ]);
   const geometries=new Map(),instances=new Map(),materials=new Map(),deformations=new Map();
   const pendingDeformations=new Set(),deformationLifetime=new AbortController();
@@ -222,7 +229,17 @@ export async function createGpuThreeScene(device,scene,{
         }
         geometryAdmission(object.geometry,object);
         if(object.isInstancedMesh)instanceAdmission(object);
-      } else if(object.isLine||object.isPoints||object.isSprite||object.isLightProbe||object.isLightProbeGrid)
+      } else if(object.isLine||object.isPoints){
+        // One-pixel native lines/points with LineBasicMaterial/PointsMaterial.
+        if(object.isLineLoop){}
+        else{
+          if(Array.isArray(object.material)&&object.material.length>maxBindings)fail('LIMIT','Source material array exceeds capacity');
+          if(object.intersectsFrustum!==(object.isPoints?three.Points:three.Line).prototype.intersectsFrustum)
+            fail('OBJECT','Custom frustum tests are not admitted');
+          if(object.castShadow||object.receiveShadow)fail('SHADOW','Line and point shadows are not admitted');
+          geometryAdmission(object.geometry,object);
+        }
+      } else if(object.isSprite||object.isLightProbe||object.isLightProbeGrid)
         fail('OBJECT',`Unsupported source renderable: ${object.type}`);
       if(object.isLight)light(object);
       for(let i=object.children.length-1;i>=0;i--)stack.push(object.children[i]);
@@ -298,9 +315,13 @@ export async function createGpuThreeScene(device,scene,{
     if(typeof localClippingEnabled!=='boolean')fail('CLIPPING','localClippingEnabled must be boolean');
     return {planes:sourcePlanes(clippingValue(clipping,'planes',[])),localClippingEnabled};
   }
-  function materialDescription(m,clippingFrame){
+  function materialDescription(m,clippingFrame,topology='triangles'){
     const shading=models.get(Object.getPrototypeOf(m));
     if(!shading)fail('MATERIAL',`Unsupported source material: ${m?.type}`);
+    const primitive=m.isLineBasicMaterial?'line':m.isPointsMaterial?'point':'surface';
+    if(topology!=='triangles'&&primitive==='surface'&&shading!=='unlit')
+      fail('MATERIAL',`Lit ${m.type} on ${topology} primitives is not admitted`);
+    if(topology!=='triangles'&&(m.map||m.alphaMap))fail('MATERIAL','Textured line/point primitives are not admitted');
     for(const descriptor of Object.values(Object.getOwnPropertyDescriptors(m)))
       if(!Object.hasOwn(descriptor,'value'))fail('HOOK','Accessor-backed material fields are not admitted');
     if(m.onBeforeRender!==three.Material.prototype.onBeforeRender||m.onBeforeCompile!==three.Material.prototype.onBeforeCompile||
@@ -325,7 +346,7 @@ export async function createGpuThreeScene(device,scene,{
       if(clippingFrame.planes.length+clippingPlanes.length>maxClippingPlanes)fail('CLIPPING','Combined global and material planes exceed capacity');
       clipped={clippingPlanes,clipIntersection,clipShadows};
     }
-    const options={shading,vertexColors:m.vertexColors,flatShading:shading==='unlit'?false:m.flatShading===true,
+    const options={shading,...(topology==='triangles'?{}:{topology}),vertexColors:m.vertexColors,flatShading:shading==='unlit'?false:m.flatShading===true,
       alphaMode:m.transparent?'BLEND':m.alphaTest>0?'MASK':'OPAQUE',alphaCutoff:m.alphaTest>0?m.alphaTest:0.5,alphaTest:m.alphaTest>0,
       depthTest:m.depthTest,depthWrite:m.depthWrite,depthCompare:DEPTH[m.depthFunc],colorWrite:m.colorWrite};
     const values={baseColor:rgba(m.color,m.opacity)};
@@ -381,7 +402,7 @@ export async function createGpuThreeScene(device,scene,{
     const sides=m.transparent&&m.side===three.DoubleSide&&!m.forceSinglePass?['back','front']:[['front','back','double'][m.side]];
     return sides.map(side=>{
       const config={...options,side};
-      const structural=[epoch,shading,side,config.vertexColors,config.flatShading,config.alphaMode,config.alphaTest,
+      const structural=[epoch,shading,topology,side,config.vertexColors,config.flatShading,config.alphaMode,config.alphaTest,
         config.depthTest,config.depthWrite,config.depthCompare,config.colorWrite,...(shadowEnabled?[m.shadowSide??null]:[]),...textureKey];
       return {options:config,values,structural,clipped,...(fogEnabled?{receiveFog:m.fog}:{})};
     });
@@ -389,9 +410,13 @@ export async function createGpuThreeScene(device,scene,{
   function desired(nodes){
     const clippingFrame=clippingState();
     const out=[],descriptions=new Map(),seen=new Map(),usedGeometry=new Set(),usedInstances=new Set(),usedDeformations=new Set();
-    const get=m=>{if(!descriptions.has(m))descriptions.set(m,materialDescription(m,clippingFrame));return descriptions.get(m);};
+    const get=(m,topology='triangles')=>{
+      let byTopology=descriptions.get(m);if(!byTopology)descriptions.set(m,byTopology=new Map());
+      if(!byTopology.has(topology))byTopology.set(topology,materialDescription(m,clippingFrame,topology));return byTopology.get(topology);
+    };
     if(scene.overrideMaterial)get(scene.overrideMaterial);
-    for(const object of nodes)if(object.isMesh){
+    for(const object of nodes)if(drawable(object)){
+      const topology=topologyOf(object);
       const g=object.geometry,instanceSource=object.isInstancedMesh?object:null;
       const deformationSource=hasThreeDeformation(object)?object:null,key=deformationSource??instanceSource??g;
       const instanceSignature=instanceSource?instanceAdmission(instanceSource).signature:null;
@@ -399,13 +424,14 @@ export async function createGpuThreeScene(device,scene,{
       for(const original of source){
         if(!original)continue;
         // The original controls visibility/list admission even with an override.
-        get(original);
+        get(original,topology);
         const m=scene.overrideMaterial&&original.allowOverride===true?scene.overrideMaterial:original;
-        let set=seen.get(key);if(!set)seen.set(key,set=new Set());if(set.has(m))continue;set.add(m);
+        let set=seen.get(key);if(!set)seen.set(key,set=new Map());
+        const topologies=set.get(m)??new Set();if(topologies.has(topology))continue;topologies.add(topology);set.set(m,topologies);
         usedGeometry.add(g);if(instanceSource)usedInstances.add(instanceSource);
         if(deformationSource)usedDeformations.add(deformationSource);
         if(usedDeformations.size>maxDeformedMeshes)fail('LIMIT','Source deformed mesh capacity exceeded');
-        for(const desc of get(m)){
+        for(const desc of get(m,topology)){
           if(textureTransforms)uvApi.checkThreeMapChannels(g,desc.options.mapChannels);
           out.push({key,geometry:g,instanceSource,instanceSignature,deformationSource,material:m,desc});
           if(out.length>maxBindings||usedGeometry.size>maxGeometries||usedInstances.size>maxInstanceMeshes)fail('LIMIT','Source geometry/material binding capacity exceeded');
@@ -474,7 +500,7 @@ export async function createGpuThreeScene(device,scene,{
               maxInitialBytes:Math.max(0,maxGeometryBytes-geometryBytes())});
             geometries.set(item.geometry,gpu);added.push(item.geometry);
           }else gpu.update({maxAdditionalBytes:Math.max(0,maxGeometryBytes-geometryBytes())});
-          signature=bufferGeometrySnapshot(gpu,device).signature;
+          signature=stripSignature(bufferGeometrySnapshot(gpu,device),item.desc.options.topology);
         }
         let instanceGpu=null;
         if(item.instanceSource){
@@ -493,7 +519,7 @@ export async function createGpuThreeScene(device,scene,{
             ...(textureTransforms?uvApi.threeDeformedMapCoordinates(item.desc.options.mapChannels,deformation.surface):{})}:{};
           const mesh=await Promise.race([renderer.addMesh(gpu,{...item.desc.options,...item.desc.values,...surface,...(instanceGpu?{instances:instanceGpu}:{})}),stopped]);
           entry={key:item.key,geometry:item.geometry,instanceSource:item.instanceSource,instanceSignature:item.instanceSignature,
-            material:item.material,structural:item.desc.structural,signature,deformation,mesh};created.push(entry);live();
+            material:item.material,structural:item.desc.structural,topology:item.desc.options.topology,signature,deformation,mesh};created.push(entry);live();
         }
         next.push(entry);
       }
@@ -513,7 +539,7 @@ export async function createGpuThreeScene(device,scene,{
           const entry=next[i],item=request[i],{options,values}=item.desc;
           // BLEND receivers remain fully rendered, but never acquire a guessed
           // translucent depth material. Actual BLEND casters reject or skip.
-          if(options.alphaMode==='BLEND')continue;
+          if(options.alphaMode==='BLEND'||options.topology)continue;
           let caster=nextShadow===shadowOwner?casters.get(entry):null;
           if(!caster||caster.disposed){
             const gpu=entry.deformation?.deformer??geometries.get(entry.geometry);
@@ -587,7 +613,7 @@ export async function createGpuThreeScene(device,scene,{
         }else{
           const gpu=geometries.get(entry.geometry);
           if(!checked.has(gpu)){gpu.update({maxAdditionalBytes:Math.max(0,maxGeometryBytes-geometryBytes())});checked.add(gpu);}
-          if(bufferGeometrySnapshot(gpu,device).signature!==entry.signature)fail('CHANGED','Geometry layout changed during preparation');
+          if(stripSignature(bufferGeometrySnapshot(gpu,device),entry.topology)!==entry.signature)fail('CHANGED','Geometry layout changed during preparation');
         }
         if(entry.instanceSource){
           const native=instances.get(entry.instanceSource);
@@ -682,9 +708,12 @@ export async function createGpuThreeScene(device,scene,{
       const backgroundFrame=backgroundOwner?.capture(scene,camera)??null;
       const lightSources=[],casterObjects=[],casterItems=[],shadowDraws=[];
       const opaque=[],transparent=[],stack=[{object:scene,groupOrder:0}],descriptions=new Map();
-      const get=m=>{if(!descriptions.has(m))descriptions.set(m,materialDescription(m,clippingFrame));return descriptions.get(m);};
+      const get=(m,topology)=>{
+        let byTopology=descriptions.get(m);if(!byTopology)descriptions.set(m,byTopology=new Map());
+        if(!byTopology.has(topology))byTopology.set(topology,materialDescription(m,clippingFrame,topology));return byTopology.get(topology);
+      };
       function append(object,groupOrder,z,shadowPass=false){
-        const g=object.geometry;
+        const g=object.geometry,topology=topologyOf(object);
         function push(original,group){
               if(!original||!original.visible)return;
               if(shadowPass&&original.transparent){
@@ -695,7 +724,7 @@ export async function createGpuThreeScene(device,scene,{
               const instanceSource=object.isInstancedMesh?object:null;
               const instanceSignature=instanceSource?instanceAdmission(instanceSource).signature:null;
               const deformationSource=hasThreeDeformation(object)?object:null;
-              const desc=get(material),records=lookup.get(deformationSource??instanceSource??g)?.get(material);
+              const desc=get(material,topology),records=lookup.get(deformationSource??instanceSource??g)?.get(material);
               if(textureTransforms)for(const d of desc)uvApi.checkThreeMapChannels(g,d.options.mapChannels);
               const bindings=desc.map(d=>records?.find(e=>!e.mesh.disposed&&e.geometry===g&&
                 e.instanceSignature===instanceSignature&&same(e.structural,d.structural)));
@@ -717,10 +746,14 @@ export async function createGpuThreeScene(device,scene,{
           if(object.isGroup)groupOrder=object.renderOrder;
           else if(object.isLOD){if(object.autoUpdate)object.update(camera);}
           else if(object.isLight){lighting.lights.push(light(object));lightSources.push(object);}
-          else if(object.isMesh){
+          else if(object.isLineLoop){
+            // Source r186 WebGPU behavior: report and draw nothing for this object.
+            (three.error??console.error)('Renderer: Objects of type THREE.LineLoop are not supported. Please use THREE.Line or THREE.LineSegments.');
+          }
+          else if(drawable(object)){
             // A caster outside the viewing frustum can still shadow a receiver.
             // Preserve source visibility/layers/LOD, but use the light frustum.
-            if(shadowOwner&&object.castShadow)casterObjects.push(object);
+            if(shadowOwner&&object.isMesh&&object.castShadow)casterObjects.push(object);
             if(!object.frustumCulled||object.intersectsFrustum(frustum)){
             const g=object.geometry;
             let z=0;
@@ -771,7 +804,7 @@ export async function createGpuThreeScene(device,scene,{
           if(item.bindings.some(e=>e.instanceSignature!==instanceAttributesSnapshot(native,device).signature))
             fail('PREPARE','Instance layout changed; call prepare() before drawing it');
         }
-        if(item.bindings.some(e=>e.signature!==shape.signature))fail('PREPARE','Geometry layout changed; call prepare() before drawing it');
+        if(item.bindings.some(e=>e.signature!==stripSignature(shape,item.desc[0].options.topology)))fail('PREPARE','Geometry layout changed; call prepare() before drawing it');
         const extent=shape.indexBuffer?shape.indexCount:shape.vertexCount;
         const start=item.group?integer(item.group.start,0,Number.MAX_SAFE_INTEGER,'group start'):0;
         const length=item.group?.count??Infinity;
