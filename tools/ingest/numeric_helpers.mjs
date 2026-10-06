@@ -13,6 +13,7 @@
  * helpers are admitted only where the caller discards the result.
  */
 import * as acorn from 'acorn';
+import { createArrayReferenceCompiler, arrayPointer, arrayLength } from './numeric_array_references.mjs';
 import { BITWISE_OPS, INTEGER_ARRAY_LAYOUTS, emitBitwiseBinary, emitBitwiseNot,
   emitToUint32, emitToUint8Clamp } from './numeric_integer.mjs';
 
@@ -122,7 +123,7 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
       const array = arrays[index];
       if (!array) return emitArgument(arg);
       array.mark(entry.effects[index]);
-      return [...get(array.index), ...get(array.lengthIndex)];
+      return [...arrayPointer(array), ...arrayLength(array)];
     });
     return [...argumentsCode, 0x10, ...u32(entry.index),
       ...(!resultUsed && entry.resultType === 'f64' ? [0x1a] : [])];
@@ -161,6 +162,7 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
       const binding = node?.type === 'Identifier' ? environment.get(node.name) : null;
       return binding?.type ? binding : null;
     }
+    const arrayReferences = createArrayReferenceCompiler({resolveArray, allocateLocal, condition, fail, enabled:checkedArrays});
     function target(node, depth = 0) {
       const array = node?.type === 'MemberExpression' && !node.optional && node.computed
         ? resolveArray(node.object) : null;
@@ -169,12 +171,12 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
       // The check precedes RHS effects, uses THIS view's length, and does not
       // truncate a fractional/NaN/infinite subscript into a different property.
       const setup = [...value, ...set(local), ...get(local), ...number(0), 0x66,
-        ...get(local), ...get(array.lengthIndex), 0xb8, 0x63, 0x71,
+        ...get(local), ...arrayLength(array), 0xb8, 0x63, 0x71,
         ...get(local), ...get(local), 0x9d, 0x61, 0x71,
         0x45, 0x04, 0x40, 0x00, 0x0b];
       const integer = INTEGER_ARRAY_LAYOUTS[array.type];
       const alignment = integer?.alignment ?? (array.type === 'f64[]' ? 3 : 2);
-      return { array, integer, alignment, setup, address: [...get(array.index),
+      return { array, integer, alignment, setup, address: [...arrayPointer(array),
         ...get(local), 0xab, 0x41, alignment, 0x74, 0x6a] };
     }
     function load(access, prepared = false) {
@@ -203,7 +205,7 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
       if (node.type === 'MemberExpression') {
         const array = resolveArray(node.object);
         if (array && !node.optional && !node.computed && node.property.name === 'length')
-          return [...get(array.lengthIndex), 0xb8];
+          return [...arrayLength(array), 0xb8];
         return load(target(node, depth));
       }
       if (node.type === 'UnaryExpression' && ['+', '-', '~'].includes(node.operator)) {
@@ -318,6 +320,12 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
           if (++statementCount > 4096) fail('Reachable scalar helpers exceed the statement limit', statement);
           if (statement.type === 'VariableDeclaration') {
             for (const variable of statement.declarations) {
+              const reference = arrayReferences.declare(variable.init, statement.kind === 'let');
+              if (reference) {
+                environment.set(variable.id.name, reference.binding);
+                bytes.push(...reference.bytes);
+                continue;
+              }
               const value = expression(variable.init);
               const index = owner.wasmTypes.length + localCount++;
               environment.set(variable.id.name, { index, mutable: statement.kind === 'let' });
@@ -377,6 +385,11 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
                   : binary(update.operator.slice(0, -1), load(access, true), value)));
                 continue;
               }
+              const reference = resolveArray(update.left);
+              if (reference) {
+                bytes.push(...arrayReferences.rebind(reference, update));
+                continue;
+              }
               const local = lookup(update.left, true);
               const value = expression(update.right);
               bytes.push(...(update.operator === '=' ? value
@@ -390,6 +403,7 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
       } finally { if (!retainScope) environment = parent; }
     }
     const body = block(fn.body.body);
+    arrayReferences.finish();
     if (owner.resultType === 'f64' && !body.returns) fail(`Scalar helper ${fn.id.name} must return a number on every path`, fn);
     // Every reachable path returns. unreachable makes the result type explicit
     // to the Wasm validator even when all returns occur in nested if branches.

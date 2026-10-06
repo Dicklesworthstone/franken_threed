@@ -12,6 +12,7 @@
  * opt-in ABI is not proof of whole-application closure or a speedup claim.
  */
 import * as acorn from 'acorn';
+import { createArrayReferenceCompiler, arrayPointer, arrayLength } from './numeric_array_references.mjs';
 import { createScalarHelperCompiler } from './numeric_helpers.mjs';
 import { createMathIntrinsicCompiler } from './numeric_intrinsics.mjs';
 import { BITWISE_OPS, INTEGER_ARRAY_LAYOUTS, emitBitwiseBinary, emitBitwiseNot,
@@ -292,8 +293,10 @@ export function compileNumericKernel(source, {
   const indexedBounds = new Map();
   const minimumLengths = new Map();
   let inLoop = false;
+  const arrayReferences = createArrayReferenceCompiler({resolveArray:helperArray,
+    allocateLocal:() => temporaryBase + temporaryCount++, condition, fail, enabled:checkedIndexing});
   const arrayParameter = (node, writing = false, depth = 0) => {
-    const param = params.get(node?.object?.name);
+    const param = helperArray(node?.object);
     if (!arrayTypes.includes(param?.type) || node?.type !== 'MemberExpression' ||
         node.optional || !node.computed || node.object.type !== 'Identifier') {
       fail('Array access must use a numeric array parameter', node);
@@ -306,7 +309,7 @@ export function compileNumericKernel(source, {
       // be truncated/wrapped or read another parameter's packed memory.
       const setup = [...value, ...set(local),
         ...get(local), ...number(0), 0x66,
-        ...get(local), ...get(bounds.get(param.name)), 0xb8, 0x63, 0x71,
+        ...get(local), ...arrayLength(param), 0xb8, 0x63, 0x71,
         ...get(local), ...get(local), 0x9d, 0x61, 0x71,
         0x45, 0x04, 0x40, 0x00, 0x0b]; // if !valid: unreachable (transaction abort)
       return { ...param, elementOffset: 0, checkedLocal: local, setup };
@@ -338,11 +341,12 @@ export function compileNumericKernel(source, {
   const alignment = param => INTEGER_ARRAY_LAYOUTS[param.type]?.alignment ?? (param.type === 'f64[]' ? 3 : 2);
   const memoryOffset = param => u32(param.elementOffset * (2 ** alignment(param)));
   const address = param => param.checkedLocal !== undefined
-    ? [...get(param.index), ...get(param.checkedLocal), 0xab, 0x41, alignment(param), 0x74, 0x6a]
+    ? [...arrayPointer(param), ...get(param.checkedLocal), 0xab, 0x41, alignment(param), 0x74, 0x6a]
     : param.fixed ? get(param.index)
     : [...get(param.index), ...get(indexLocal), 0x41, alignment(param), 0x74, 0x6a];
   const load = (param, prepared = false) => {
-    reads.add(param.name);
+    if (param.reference) param.mark({read:true});
+    else reads.add(param.name);
     // JavaScript reads float32 storage as a Number. Promote before arithmetic;
     // using f32 operators here would introduce extra rounding at every operator.
     const prefix = [...(prepared ? [] : param.setup ?? []), ...address(param)];
@@ -359,17 +363,20 @@ export function compileNumericKernel(source, {
     const integer = INTEGER_ARRAY_LAYOUTS[target.type];
     const convert = target.type === 'u8c[]' ? emitToUint8Clamp : emitToUint32;
     const payload = integer ? convert(value, () => temporaryBase + temporaryCount++) : value;
-    writes.add(target.name);
+    if (target.reference) target.mark({read:true, write:true});
+    else writes.add(target.name);
     // Checked stores, branches and strided records leave untouched bytes that
     // must come from this invocation, not a previous private-memory contents.
-    if (checkedIndexing || pipeline || conditional || loopStride > 1) reads.add(target.name);
+    if (!target.reference && (checkedIndexing || pipeline || conditional || loopStride > 1)) reads.add(target.name);
     return [...(target.setup ?? []), ...address(target), ...payload,
       ...(integer ? [integer.store, integer.alignment]
         : target.type === 'f32[]' ? [0xb6, 0x38, 2] : [0x39, 3]), ...memoryOffset(target)];
   }
   function helperArray(node) {
-    const param = node?.type === 'Identifier' ? params.get(node.name) : null;
-    if (!param || param.type === 'f64') return null;
+    if (node?.type !== 'Identifier') return null;
+    const param = temporaries.has(node.name) ? temporaries.get(node.name) : params.get(node.name);
+    if (!arrayTypes.includes(param?.type)) return null;
+    if (param.reference) return param;
     return { ...param, lengthIndex: bounds.get(param.name), mark(effect) {
       if (effect.read || effect.write) reads.add(param.name);
       if (effect.write) writes.add(param.name);
@@ -398,6 +405,7 @@ export function compileNumericKernel(source, {
       if (temporaries.has(node.name)) {
         const local = temporaries.get(node.name);
         if (local === null) fail(`Binding ${node.name} is used before initialization`, node);
+        if (local.reference) fail('Array references cannot escape or be coerced to Numbers', node);
         return get(local);
       }
       fail(`Unresolved or non-scalar binding ${node.name}`, node);
@@ -406,7 +414,8 @@ export function compileNumericKernel(source, {
     // during an import-free call over fixed, unshared buffers.
     if (pipeline || checkedIndexing) {
       const name = node.object?.name;
-      if (bounds.has(name) && member(node, name, 'length', false)) return [...get(bounds.get(name)), 0xb8];
+      const array = helperArray(node.object);
+      if (array && member(node, name, 'length', false)) return [...arrayLength(array), 0xb8];
     } else if (member(node, boundParam.name, 'length', false)) return [...get(countLocal), 0xb8];
     if (node.type === 'MemberExpression') return load(arrayParameter(node, false, depth));
     if (node.type === 'UnaryExpression' && ['+', '-', '~'].includes(node.operator)) {
@@ -617,6 +626,12 @@ export function compileNumericKernel(source, {
         if (++statementCount > 2048) fail('Loop body exceeds the statement limit', statement);
         if (statement.type === 'VariableDeclaration') {
           for (const variable of statement.declarations) {
+            const reference = arrayReferences.declare(variable.init, statement.kind === 'let');
+            if (reference) {
+              temporaries.set(variable.id.name, reference.binding);
+              bytes.push(...reference.bytes);
+              continue;
+            }
             const initializer = expression(variable.init);
             const local = temporaryBase + temporaryCount++;
             temporaries.set(variable.id.name, local);
@@ -695,6 +710,11 @@ export function compileNumericKernel(source, {
           fail('Loop statements must initialize scalars, branch, or assign scalars/array[index]', statement);
         }
         if (assignment.left.type === 'Identifier') {
+          const reference = helperArray(assignment.left);
+          if (reference) {
+            bytes.push(...arrayReferences.rebind(reference, assignment));
+            continue;
+          }
           const local = mutableScalar(assignment.left);
           const value = expression(assignment.right);
           bytes.push(...(assignment.operator === '=' ? value
@@ -739,6 +759,7 @@ export function compileNumericKernel(source, {
     execution = [...setup, ...emitLoop(instructions)];
   }
   const result = resultNode ? expression(resultNode.argument) : [];
+  arrayReferences.finish();
   // A selected root may delegate all iteration to reachable closed helpers.
   // Inspect the final result too: its helper call can contain the only loop.
   if (generalControl && !controlLoops.length) fail('General control requires at least one loop', fn.body);
