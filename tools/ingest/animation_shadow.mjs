@@ -35,7 +35,7 @@ function matrix(value) {
 
 /** Create a bounded depth map. OPAQUE/MASK caster material options match addMesh(). */
 export async function createGpuAnimationShadowMap(device, options = {}) {
-  fields(options, ["width", "height", "maxBytes", "maxDraws", "maxMeshes", "label", "clipping", "maxClippingPlanes", "textureTransforms", "alphaMaps"]);
+  fields(options, ["width", "height", "maxBytes", "maxDraws", "maxMeshes", "label", "clipping", "maxClippingPlanes", "textureTransforms", "alphaMaps", "filter"]);
   const {
     width = 1024,
     height = width,
@@ -43,7 +43,11 @@ export async function createGpuAnimationShadowMap(device, options = {}) {
     maxDraws = 1024,
     maxMeshes = 1024,
     label = "f3d-animation-shadow",
+    // 'linear' compare filtering is hardware 2x2 PCF per tap, as r186 sets
+    // LinearFilter on PCF shadow depth textures; 'nearest' is the explicit profile.
+    filter = "nearest",
   } = options;
+  if (!["nearest", "linear"].includes(filter)) fail("Shadow filter must be nearest or linear");
   const maximum = device?.limits?.maxTextureDimension2D;
   if (
     !Number.isSafeInteger(maximum) ||
@@ -132,8 +136,8 @@ export async function createGpuAnimationShadowMap(device, options = {}) {
       sampler = device.createSampler({
         label,
         compare: "less-equal",
-        minFilter: "nearest",
-        magFilter: "nearest",
+        minFilter: filter,
+        magFilter: filter,
         addressModeU: "clamp-to-edge",
         addressModeV: "clamp-to-edge",
       });

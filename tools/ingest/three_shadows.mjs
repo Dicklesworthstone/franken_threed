@@ -55,7 +55,8 @@ export function inspectThreeShadow(light, three) {
     if (typeof shadow[key] !== 'function' || shadow[key] !== S.prototype[key]) fail('HOOK', `Custom shadow ${key} is not admitted`);
   if (shadow.getViewportCount() !== 1 || shadow.biasNode != null)
     fail('PROFILE', 'Cascades and shadow shader nodes require a different profile');
-  if (shadow.radius !== 1) fail('PROFILE', 'This projected profile uses fixed radius-one 3x3 PCF');
+  finite(shadow.radius, 'shadow radius');
+  if (shadow.radius < 0) fail('VALUE', 'Invalid source shadow radius');
   for (const key of ['autoUpdate', 'needsUpdate']) if (typeof shadow[key] !== 'boolean') fail('VALUE', `Expected boolean shadow.${key}`);
   if (Math.abs(finite(shadow.bias, 'shadow bias')) > 1 || finite(shadow.normalBias, 'normal bias') < 0 ||
       finite(shadow.intensity, 'shadow intensity') < 0 || shadow.intensity > 1) fail('VALUE', 'Invalid source shadow factors');
@@ -102,7 +103,7 @@ export async function createGpuThreeShadow(device, light, {three, maxBytes = 64 
   try {
     if (signal?.aborted) onAbort(); live();
     const constructing = createGpuAnimationShadowMap(device, {
-      width: shape.width, height: shape.height, maxBytes, maxDraws, maxMeshes, label, ...(alphaMaps?{alphaMaps}:{}), ...(textureTransforms?{textureTransforms}:{}), ...(clipping?{clipping,maxClippingPlanes}:{}),
+      width: shape.width, height: shape.height, maxBytes, maxDraws, maxMeshes, label, filter: 'linear', ...(alphaMaps?{alphaMaps}:{}), ...(textureTransforms?{textureTransforms}:{}), ...(clipping?{clipping,maxClippingPlanes}:{}),
     }).then(value => {
       if (disposed || terminal) { value.dispose(); throw terminal ?? new ThreeShadowError('DISPOSED', 'Source shadows are disposed'); }
       map = value; return value;
@@ -139,7 +140,7 @@ export async function createGpuThreeShadow(device, light, {three, maxBytes = 64 
       }
       // r186 adds source bias to normalized depth; the core subtracts its bias.
       const frame = Object.freeze({update, viewProjection, frustum, bias: -shadow.bias,
-        normalBias: shadow.normalBias, strength: shadow.intensity});
+        normalBias: shadow.normalBias, strength: shadow.intensity, radius: shadow.radius});
       frames.add(frame); return frame;
     },
     render(frame, draws) {
@@ -169,7 +170,8 @@ export async function createGpuThreeShadow(device, light, {three, maxBytes = 64 
       live();
       if (frame !== renderedFrame || !snapshot) fail('FRAME', 'Submit this captured frame before receiving its map');
       if (!Number.isInteger(lightIndex) || lightIndex < 0 || lightIndex > 7) fail('LIGHT', 'Invalid shadow light index');
-      return {map: owner, lightIndex, bias: frame.bias, normalBias: frame.normalBias, strength: frame.strength};
+      return {map: owner, lightIndex, bias: frame.bias, normalBias: frame.normalBias, strength: frame.strength,
+        filter: 'vogel5', radius: frame.radius};
     },
     async whenIdle() {
       live();

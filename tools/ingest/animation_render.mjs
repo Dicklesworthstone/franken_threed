@@ -588,7 +588,7 @@ struct VertexOutput {
     .join("\n  ")}
   return out;
 }
-@fragment fn fragment_main(input: VertexOutput${lit ? ", @builtin(front_facing) front: bool" : ""})${depthOnly ? "" : " -> @location(0) vec4<f32>"} {${instanceStride ? "\n  draw_info = instance_draws[input.draw_index].info;" : ""}
+@fragment fn fragment_main(input: VertexOutput${lit ? ", @builtin(front_facing) front: bool" : ""})${depthOnly ? "" : " -> @location(0) vec4<f32>"} {${instanceStride ? "\n  draw_info = instance_draws[input.draw_index].info;" : ""}${shadowed ? "\n  f3d_frag_coord = input.position.xy;" : ""}
   // Sample every map before discard or nonuniform lighting flow: implicit
   // derivatives must be evaluated in uniform control flow.
   ${samples}${flat ? "\n  // WebGPU framebuffer Y is downward. Flat normals already face the rasterized surface.\n  let flat_normal = unit_vector(cross(dpdy(input.world), dpdx(input.world)));" : ""}

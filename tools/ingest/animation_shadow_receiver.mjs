@@ -7,6 +7,8 @@ export const SHADOW_UNIFORM_BYTES = 96;
 export function projectedShadowWgsl(group) {
   return /* wgsl */ `
 struct ProjectedShadow { clip_from_world: mat4x4<f32>, options: vec4<f32>, texel: vec4<f32> }
+// Fragment framebuffer coordinate (screenCoordinate), set by fragment_main.
+var<private> f3d_frag_coord: vec2<f32>;
 @group(${group}) @binding(1) var<uniform> shadow_info: ProjectedShadow;
 @group(${group}) @binding(2) var shadow_depth: texture_depth_2d;
 @group(${group}) @binding(3) var shadow_sampler: sampler_comparison;
@@ -19,6 +21,18 @@ fn projected_shadow(position: vec3<f32>, normal: vec3<f32>) -> f32 {
   let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
   let reference = ndc.z - shadow_info.options.y;
   var visible = 0.0;
+  if (shadow_info.texel.w == 1.0) {
+    // r186 PCFShadowFilter: five Vogel-disk taps of radius * texelSize.x,
+    // rotated per pixel by interleaved gradient noise; clamp-to-edge taps.
+    let phi = fract(52.9829189 * fract(dot(f3d_frag_coord, vec2<f32>(0.06711056, 0.00583715)))) * 6.28318530718;
+    let radius = shadow_info.texel.z * shadow_info.texel.x;
+    for (var i = 0; i < 5; i++) {
+      let r = sqrt((f32(i) + 0.5) / 5.0);
+      let theta = f32(i) * 2.399963229728653 + phi;
+      visible += textureSampleCompareLevel(shadow_depth, shadow_sampler, uv + vec2<f32>(cos(theta), sin(theta)) * r * radius, reference);
+    }
+    return mix(1.0, visible / 5.0, shadow_info.options.w);
+  }
   for (var y = -1; y <= 1; y++) {
     for (var x = -1; x <= 1; x++) {
       let tap = uv + vec2<f32>(f32(x), f32(y)) * shadow_info.texel.xy;
@@ -36,9 +50,11 @@ export function packProjectedShadow(device, input, lighting, output, fail) {
   if (!input || typeof input !== "object" || Array.isArray(input))
     fail("ANIMATION_RENDER_SHADOW", "Expected a projected shadow descriptor");
   for (const key of Object.keys(input))
-    if (!["map", "lightIndex", "bias", "normalBias", "strength"].includes(key))
+    if (!["map", "lightIndex", "bias", "normalBias", "strength", "filter", "radius"].includes(key))
       fail("ANIMATION_RENDER_SHADOW", `Unsupported shadow field: ${key}`);
-  const { map, lightIndex = 0, bias = 0.0005, normalBias = 0, strength = 1 } = input;
+  const { map, lightIndex = 0, bias = 0.0005, normalBias = 0, strength = 1, filter = "pcf3x3", radius = 1 } = input;
+  if (!["pcf3x3", "vogel5"].includes(filter) || typeof radius !== "number" || !Number.isFinite(Math.fround(radius)) || radius < 0)
+    fail("ANIMATION_RENDER_SHADOW", "Invalid shadow filter or radius");
   if (
     !Number.isSafeInteger(lightIndex) ||
     lightIndex < 0 ||
@@ -77,7 +93,7 @@ export function packProjectedShadow(device, input, lighting, output, fail) {
   output.fill(0);
   output.set(snapshot.viewProjection);
   output.set([lightIndex, bias, normalBias, strength], 16);
-  output.set([1 / snapshot.width, 1 / snapshot.height], 20);
+  output.set([1 / snapshot.width, 1 / snapshot.height, radius, filter === "vogel5" ? 1 : 0], 20);
   return {
     map,
     snapshot,

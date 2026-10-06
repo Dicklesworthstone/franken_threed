@@ -53,7 +53,7 @@ const count=(h,name)=>h.calls.filter(c=>c[0]===name).length;
 test('native projected source metadata and core allocation options are explicit',async()=>{
   const h=setup();assert.deepEqual(inspectThreeShadow(h.light,THREE).signature,[h.light,h.light.shadow,h.light.shadow.camera,32,16]);
   const o=await create(h,{maxBytes:8192,maxDraws:8,maxMeshes:4});
-  assert.deepEqual(h.calls[0][1],{width:32,height:16,maxBytes:8192,maxDraws:8,maxMeshes:4,label:'f3d-three-shadow'});
+  assert.deepEqual(h.calls[0][1],{width:32,height:16,maxBytes:8192,maxDraws:8,maxMeshes:4,label:'f3d-three-shadow',filter:'linear'});
   assert.equal(o.allocatedBytes,4096);o.dispose();assert.equal(o.allocatedBytes,0);
 });
 test('WebGL light depth remaps to zero-to-one while existing WebGPU projections do not',async()=>{
@@ -66,14 +66,14 @@ test('WebGL light depth remaps to zero-to-one while existing WebGPU projections 
 test('source bias sign, intensity and normal bias feed the selected receiver light',async()=>{
   const h=setup();Object.assign(h.light.shadow,{bias:-0.003,normalBias:0.02,intensity:0.4});const o=await create(h),f=o.capture();
   assert.throws(()=>o.descriptor(f,2),code('FRAME'));o.render(f,[]);
-  assert.deepEqual(o.descriptor(f,2),{map:o,lightIndex:2,bias:0.003,normalBias:0.02,strength:0.4});
+  assert.deepEqual(o.descriptor(f,2),{map:o,lightIndex:2,bias:0.003,normalBias:0.02,strength:0.4,filter:'vogel5',radius:1});
   assert.equal(o.sample(h.device).version,1);assert.equal(o.renderCount,1);o.dispose();
 });
 test('spot source cameras use their actual native update hook',async()=>{
   const h=setup(new SpotLight()),o=await create(h),f=o.capture();o.render(f,[]);assert.equal(h.light.shadow.updates,1);o.dispose();
 });
 test('point lights, cascades, shader nodes and custom shadow hooks refuse before allocation',async()=>{
-  const mutations=[h=>h.light={isPointLight:true},h=>h.light.shadow.radius=2,h=>h.light.shadow.biasNode={},
+  const mutations=[h=>h.light={isPointLight:true},h=>h.light.shadow.radius=-1,h=>h.light.shadow.biasNode={},
     h=>h.light.shadow.getViewportCount=()=>6,h=>h.light.shadow.updateMatrices=()=>{}];
   for(const mutate of mutations){const h=setup();mutate(h);await assert.rejects(create(h),e=>e.code?.startsWith('THREE_SHADOW_'));assert.equal(count(h,'create'),0);}
 });

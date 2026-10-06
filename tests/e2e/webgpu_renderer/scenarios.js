@@ -87,6 +87,19 @@ export const scenarios = {
     scene.add(floor, box, sun, new THREE.AmbientLight(0xffffff, 0.3));
     return { scene, camera: camera(THREE, [0, 1.5, 3.5]) };
   },
+  soft_shadows(THREE, renderer) {
+    renderer.shadowMap.enabled = true;
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x222233);
+    const floor = new THREE.Mesh(new THREE.PlaneGeometry(8, 8), new THREE.MeshPhongMaterial({ color: 0xbbbbbb }));
+    floor.rotation.x = -Math.PI / 2; floor.position.y = -0.7; floor.receiveShadow = true;
+    const knot = new THREE.Mesh(new THREE.TorusKnotGeometry(0.4, 0.13, 96, 12), new THREE.MeshStandardMaterial({ color: 0x44aaff, roughness: 0.5 }));
+    knot.castShadow = true; knot.receiveShadow = true;
+    const spot = new THREE.SpotLight(0xffffff, 40, 0, Math.PI / 5, 0.3, 2);
+    spot.position.set(1.5, 3, 1); spot.castShadow = true; spot.shadow.radius = 4; spot.shadow.mapSize.set(512, 512);
+    scene.add(floor, knot, spot, spot.target, new THREE.AmbientLight(0xffffff, 0.25));
+    return { scene, camera: camera(THREE, [0, 1.6, 3.4]) };
+  },
   helpers_lines_points(THREE) {
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x000000);
