@@ -47,7 +47,7 @@ function scoped(device, operation) {
 
 /** support: createThreeProgramSupport(); bindingOf(texture) -> {view, sampler, sampleType};
  * sourceOf(object) -> the attribute source a program reads (geometry or InstancedMesh view). */
-export function createThreeProgramShadows({three: T, device, support, bindingOf, sourceOf = o => o.geometry, label = 'f3d-program-shadows',
+export function createThreeProgramShadows({three: T, device, support, bindingOf, sourceOf = o => o.geometry, clipping = () => null, label = 'f3d-program-shadows',
   maxDraws = 4096, maxGeometryBytes = 256 * 1024 * 1024}) {
   const maxTextureSize = device.limits.maxTextureDimension2D ?? 8192;
   const depthMaterialBase = new T.MeshDepthMaterial(), distanceMaterialBase = new T.MeshDistanceMaterial();
@@ -58,7 +58,7 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
   const projScreenMatrix = new T.Matrix4(), lightPositionWorld = new T.Vector3(), lookTarget = new T.Vector3();
   const shadowMapSize = new T.Vector2(), viewportSize = new T.Vector2(), viewport = new T.Vector4();
   let previousType = T.PCFShadowMap, disposed = false;
-  const maps = new Map(), geometries = new Map(), records = new Map(), lost = new Promise(() => {});
+  const maps = new Map(), geometries = new Map(), records = new Map(), lost = new Promise(() => {}), identityCamera = new T.Camera();
   const meshes = createProgramMeshes({device, format: null, depthFormat: DEPTH_FORMAT, sampleCount: 1, maxDraws, label,
     fail: (code, message) => { throw new ThreeProgramShadowError(code.replace(/^ANIMATION_RENDER_/, ''), message); }, scoped, lost});
 
@@ -89,7 +89,7 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
     if (customMaterial !== undefined) result = customMaterial;
     else {
       result = light.isPointLight === true ? distanceMaterialBase : depthMaterialBase;
-      if ((renderer?.localClippingEnabled && material.clipShadows === true && Array.isArray(material.clippingPlanes) && material.clippingPlanes.length !== 0) ||
+      if ((clipping()?.localClippingEnabled && material.clipShadows === true && Array.isArray(material.clippingPlanes) && material.clippingPlanes.length !== 0) ||
         (material.displacementMap && material.displacementScale !== 0) || (material.alphaMap && material.alphaTest > 0) ||
         (material.map && material.alphaTest > 0) || material.alphaToCoverage === true) {
         const keyA = result.uuid, keyB = material.uuid;
@@ -191,8 +191,9 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
   }
   function compile(depthMaterial, object) {
     if (depthMaterial.wireframe) fail('CASTER', 'Wireframe shadow casters are not admitted yet');
-    const compiled = support.compile(depthMaterial, object, {renderTarget: true});
-    return compiled;
+    // WebGLClipping during shadows: local planes only, and only with clipShadows.
+    const clip = support.clippingState(clipping(), depthMaterial, identityCamera, {shadows: true});
+    return support.compile(depthMaterial, object, {renderTarget: true, clipping: {numPlanes: clip.numPlanes, numIntersection: clip.numIntersection}});
   }
   function geometryFor(object, compiled) {
     const source = sourceOf(object);
@@ -334,7 +335,8 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
     if (!updated.has(entry.gpu)) { entry.gpu.update({maxAdditionalBytes: maxGeometryBytes}); updated.add(entry.gpu); }
     const reflection = entry.record.reflection, bytes = new Uint8Array(reflection.uniformBufferSize);
     const uniforms = refresh(depthMaterial);
-    const current = support.pack(reflection, uniforms, object, shadowCamera, bytes, {});
+    const clip = support.clippingState(clipping(), depthMaterial, shadowCamera, {shadows: true});
+    const current = support.pack(reflection, uniforms, object, shadowCamera, bytes, {values: support.bindsClippingPlanes(depthMaterial) ? {clippingPlanes: clip.planes} : null});
     if (current.some((t, k) => (t ?? null) !== entry.textures[k].texture)) fail('PREPARE', 'Shadow caster textures changed; call prepare()');
     const g = object.geometry;
     const start = group ? group.start : 0, count = group ? group.count : Number.MAX_SAFE_INTEGER;

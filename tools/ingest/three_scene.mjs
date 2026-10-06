@@ -440,12 +440,14 @@ export async function createGpuThreeScene(device,scene,{
     return {envMap:source,envMapRotation};
   }
   let pmremOwner=null,pmremRequests=new Set();
-  const programShadows=()=>programShadowOwner??=(programSupport.createShadows?.(device,{bindingOf:t=>textureBinding(t),sourceOf:programSource})??
+  const programShadows=()=>programShadowOwner??=(programSupport.createShadows?.(device,{bindingOf:t=>textureBinding(t),sourceOf:programSource,clipping:programClippingControls})??
     fail('SHADOW','Program shadow maps need the program shadow owner'));
   // The renderer's shadowMap controls and the renderer object passed to shadow callbacks.
   const shadowControls=()=>programSupport.state?.().shadowMap??{enabled:true,autoUpdate:true,needsUpdate:false,type:three.PCFShadowMap};
   const shadowRenderer=()=>programSupport.state?.().renderer??null;
   const castingLights=camera=>programLightList(camera).filter(l=>l.castShadow);
+  // WebGLClipping inputs for programs: the source Plane objects, not snapshots.
+  const programClippingControls=()=>clippingEnabled?{planes:clippingValue(clipping,'planes',[]),localClippingEnabled:clippingValue(clipping,'localClippingEnabled',false)===true}:null;
   const pmrem=()=>pmremOwner??=(programSupport.createPMREM?.(device,t=>textureBinding(t))??fail('MATERIAL','PMREM environments need the program PMREM owner'));
   function programDescription(m,topology,object){
     if(!programRoute())fail('MATERIAL',`Unsupported source material: ${m?.type}`);
@@ -459,7 +461,9 @@ export async function createGpuThreeScene(device,scene,{
     const {envMap,envMapRotation}=programEnvironment(m);
     const sides=m.transparent&&m.side===three.DoubleSide&&!m.forceSinglePass?[three.BackSide,three.FrontSide]:[m.side];
     return sides.map(side=>{
-      const compiled=programSupport.compile(m,object,{fog:scene.fog,side,envMap,shadows:programShadowMode&&shadows});
+      const clip=programSupport.clippingState(programClippingControls(),m,programCamera??new three.Camera());
+      const compiled=programSupport.compile(m,object,{fog:scene.fog,side,envMap,shadows:programShadowMode&&shadows,
+        clipping:{numPlanes:clip.numPlanes,numIntersection:clip.numIntersection}});
       const reflection=compiled.program.reflection;
       const uniforms=programSupport.refresh(m,{fog:scene.fog,envMap,envMapRotation});
       const sourceTextures=[],bindings=[],textureKey=[];
@@ -1165,7 +1169,9 @@ export async function createGpuThreeScene(device,scene,{
           const instanceCount=object.isInstancedMesh?integer(object.count,0,0xffffffff,'instance count'):g.isInstancedBufferGeometry?Math.min(g.instanceCount,0xffffffff):1;
           for(let i=0;i<item.bindings.length;i++){
             const d=item.desc[i],reflection=d.program.program.reflection,bytes=new Uint8Array(reflection.uniformBufferSize);
-            const current=programSupport.pack(reflection,programSupport.uniformsFor(item.material),object,camera,bytes,{targetSize:programTargetSize,material:item.material});
+            const clip=programSupport.clippingState(programClippingControls(),item.material,camera);
+            const current=programSupport.pack(reflection,programSupport.uniformsFor(item.material),object,camera,bytes,{targetSize:programTargetSize,material:item.material,
+              values:programSupport.bindsClippingPlanes(item.material)?{clippingPlanes:clip.planes}:null});
             if(current.some((t,k)=>(t??null)!==d.programTextures[k]))fail('PREPARE','Program texture uniforms changed; call prepare()');
             for(const t of current)if(t)frameTextures?.add(t);
             // Programs evaluate fog/lighting in their own source; never core receivers.

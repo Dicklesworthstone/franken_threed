@@ -69,7 +69,7 @@ export function createProgramMeshes({device, format, depthFormat, sampleCount, m
           ...(primitiveTopology === 'line-strip' && stripIndexFormat ? {stripIndexFormat} : {})},
         ...(depthFormat ? {depthStencil: {format: depthFormat, depthWriteEnabled: raster.depthWriteEnabled, depthCompare: raster.depthCompare,
           depthBias: raster.depthBias ?? 0, depthBiasSlopeScale: raster.depthBiasSlopeScale ?? 0}} : {}),
-        multisample: {count: sampleCount}});
+        multisample: {count: sampleCount, alphaToCoverageEnabled: raster.alphaToCoverage === true && sampleCount > 1 && format !== null}});
       const ready = Promise.all([pipeline(raster.frontFace), pipeline(raster.frontFace === 'ccw' ? 'cw' : 'ccw')]);
       ready.catch(() => {});
       return {uniformGroup, textureGroup, ready};

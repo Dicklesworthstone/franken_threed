@@ -162,9 +162,19 @@ where r186 allocates 24-bit depth. Explicit errors: VSM, line/point casters,
 wireframe casters; a new light, map-size or type change is a `prepare()`
 boundary.
 
+Clipping planes: r186 `WebGLClipping.setState` per draw (`threeClippingState`):
+renderer planes first, then material planes when `localClippingEnabled`, in the
+draw camera's view space; `clipIntersection` sets UNION/intersection counts;
+shadow passes drop global planes and apply local ones only with `clipShadows`.
+ShaderMaterial gets the uniform only with `clipping: true`, as upstream.
+`alphaToCoverage` enables the pipeline's alpha-to-coverage on multisampled
+targets (GL ignores it on single-sampled ones). Scenario `shaderlib_clipping`
+matches upstream WebGLRenderer exactly (0 differing pixels);
+`webgl_clipping`, `webgl_clipping_advanced`, `webgl_clipping_intersection` run.
+
 Not admitted yet (explicit errors): transmission (needs its render target),
 render-target PMREM sources (`pmremVersion`), pre-filtered cube-UV textures
-supplied directly, Sprite materials, clipping planes on programs.
+supplied directly, Sprite materials.
 
 Textures: the texture owner now admits HalfFloat (`*16float`) and Float
 (`*32float`) DataTextures with byte-exact rows. Float32 linear filtering

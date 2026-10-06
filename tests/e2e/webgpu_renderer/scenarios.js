@@ -375,6 +375,27 @@ export const scenarios = {
     scene.add(floor, wall, box, knot, sun, spot, spot.target, point, new THREE.AmbientLight(0xffffff, 0.15));
     return { scene, camera: camera(THREE, [0, 1.4, 3.6]) };
   },
+  // r186 WebGLClipping on programs: a global plane, local union/intersection
+  // planes, clipShadows into two program shadow maps.
+  shaderlib_clipping(THREE, renderer) {
+    renderer.shadowMap.enabled = true;
+    renderer.localClippingEnabled = true;
+    renderer.clippingPlanes = [new THREE.Plane(new THREE.Vector3(-1, 0, 0), 1.4)];
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x101018);
+    const floor = new THREE.Mesh(new THREE.PlaneGeometry(8, 8), new THREE.MeshPhongMaterial({ color: 0xcccccc }));
+    floor.rotation.x = -Math.PI / 2; floor.position.y = -0.7; floor.receiveShadow = true;
+    const knot = new THREE.Mesh(new THREE.TorusKnotGeometry(0.35, 0.12, 96, 12), new THREE.MeshStandardMaterial({ color: 0xffaa44, roughness: 0.4, side: THREE.DoubleSide,
+      clippingPlanes: [new THREE.Plane(new THREE.Vector3(0, -1, 0), 0.15)], clipShadows: true }));
+    knot.position.set(-0.6, 0.1, 0); knot.castShadow = true; knot.receiveShadow = true;
+    const ball = new THREE.Mesh(new THREE.SphereGeometry(0.45, 48, 24), new THREE.MeshPhongMaterial({ color: 0x44aaff, side: THREE.DoubleSide, clipIntersection: true,
+      clippingPlanes: [new THREE.Plane(new THREE.Vector3(1, 0, 0), -0.7), new THREE.Plane(new THREE.Vector3(0, 1, 0), 0)] }));
+    ball.position.set(0.7, 0, 0.1); ball.castShadow = true; ball.receiveShadow = true;
+    const sun = new THREE.DirectionalLight(0xffffff, 1.5); sun.position.set(2, 4, 2); sun.castShadow = true; sun.shadow.mapSize.set(512, 512);
+    const spot = new THREE.SpotLight(0xffeedd, 20, 0, Math.PI / 5, 0.3, 2); spot.position.set(-2, 3, 1.5); spot.castShadow = true; spot.shadow.mapSize.set(512, 512);
+    scene.add(floor, knot, ball, sun, spot, spot.target, new THREE.AmbientLight(0xffffff, 0.2));
+    return { scene, camera: camera(THREE, [0, 1.2, 3.4]) };
+  },
   // MeshPhysicalMaterial extensions via ShaderLib programs (WebGL surface), and a
   // nearest-sampled float32 DataTexture read by a ShaderMaterial.
   shaderlib_physical(THREE) {

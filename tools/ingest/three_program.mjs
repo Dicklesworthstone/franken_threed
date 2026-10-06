@@ -39,13 +39,11 @@ export function inspectThreeProgram(T, material, object) {
   if (object.isSkinnedMesh || Object.values(object.geometry?.morphAttributes ?? {}).some(a => a?.length) || object.isBatchedMesh)
     fail('OBJECT', 'Skinned, morphed and batched program objects are not admitted yet');
   if (object.isInstancedMesh && object.morphTexture != null) fail('OBJECT', 'Instanced morph textures are not admitted');
-  if (material.clippingPlanes?.length && (material.clipping || builtin)) fail('CLIPPING', 'Program clipping planes are not admitted yet');
   if (material.uniformsGroups?.length) fail('UNIFORMS', 'Uniform buffer groups are not admitted yet');
   if (material.onBeforeCompile !== T.Material.prototype.onBeforeCompile || material.onBeforeRender !== T.Material.prototype.onBeforeRender)
     fail('HOOK', 'Program hooks require their original component');
   if (material.extensions?.clipCullDistance || material.extensions?.multiDraw) fail('EXTENSION', 'Program extensions are not admitted');
   if (material.wireframe) fail('MATERIAL', 'Wireframe programs are not admitted yet');
-  if (material.alphaToCoverage) fail('MATERIAL', 'alphaToCoverage is not admitted');
   if (material.alphaHash) fail('MATERIAL', 'alphaHash programs are not admitted yet');
   if (material.stencilWrite) fail('MATERIAL', 'Stencil programs are not admitted yet');
   if (material.transmission > 0) fail('MATERIAL', 'Transmission needs the transmission render target, not admitted yet');
@@ -57,11 +55,31 @@ export function inspectThreeProgram(T, material, object) {
 export function threeProgramSources(T, material, object, ctx = {}) {
   inspectThreeProgram(T, material, object);
   const lights = ctx.lights ?? EMPTY_LIGHTS;
-  const parameters = webglParameters(T, material, object, {...ctx, lights, shadowMapEnabled: ctx.shadowMapEnabled === true, clipping: {numPlanes: 0, numIntersection: 0}});
+  const parameters = webglParameters(T, material, object, {...ctx, lights, shadowMapEnabled: ctx.shadowMapEnabled === true,
+    clipping: ctx.clipping ?? {numPlanes: 0, numIntersection: 0}});
   return {...webglProgramSources(T, parameters), parameters};
 }
 const EMPTY_LIGHTS = Object.freeze({ambient: [0, 0, 0], probe: [], sun: [], sunShadowMap: [], directional: [], directionalShadowMap: [], point: [],
   pointShadowMap: [], spot: [], spotShadowMap: [], spotLightMap: [], rectArea: [], hemi: [], numSpotLightShadowsWithMaps: 0, numLightProbes: 0});
+
+/** r186 WebGLClipping.setState for one draw: {numPlanes, numIntersection, planes}.
+ * controls: {planes: renderer.clippingPlanes, localClippingEnabled} or null when
+ * clipping is off. Planes are view space for `camera` (global first, then local);
+ * shadow passes (WebGLClipping.beginShadows) drop global planes and apply local
+ * ones only with material.clipShadows. `planes` is null when there are none. */
+export function threeClippingState(T, controls, material, camera, {shadows = false} = {}) {
+  const global = shadows || !controls ? [] : controls.planes ?? [];
+  const local = material.clippingPlanes;
+  const useLocal = !!controls?.localClippingEnabled && local !== null && local !== undefined && local.length !== 0 && !(shadows && !material.clipShadows);
+  const list = useLocal ? [...global, ...local] : global;
+  if (!list.length) return {numPlanes: 0, numIntersection: 0, planes: null};
+  const viewMatrix = camera.matrixWorldInverse, normalMatrix = new T.Matrix3().getNormalMatrix(viewMatrix), plane = new T.Plane();
+  const planes = new Float32Array(list.length * 4);
+  list.forEach((p, i) => { plane.copy(p).applyMatrix4(viewMatrix, normalMatrix); plane.normal.toArray(planes, i * 4); planes[i * 4 + 3] = plane.constant; });
+  return {numPlanes: list.length, numIntersection: useLocal && material.clipIntersection ? local.length : 0, planes};
+}
+/** Whether WebGLRenderer binds the clipping uniform for this material. */
+export const bindsClippingPlanes = m => (!m.isShaderMaterial && !m.isRawShaderMaterial) || m.clipping === true;
 
 /** WebGLState.setMaterial raster state as WebGPU pipeline fragments. */
 export function threeProgramRaster(T, m, {frontFaceCW = false, topology = 'triangles', side = m.side} = {}) {
@@ -103,6 +121,9 @@ export function threeProgramRaster(T, m, {frontFaceCW = false, topology = 'trian
     depthCompare: m.depthTest ? DEPTH[m.depthFunc] : 'always', depthWriteEnabled: m.depthTest ? m.depthWrite : m.depthWrite,
     cullMode: side === T.DoubleSide || !triangles ? 'none' : 'back', frontFace: flip ? 'cw' : 'ccw',
     depthBias: m.polygonOffset && triangles ? m.polygonOffsetUnits : 0, depthBiasSlopeScale: m.polygonOffset && triangles ? m.polygonOffsetFactor : 0,
+    // SAMPLE_ALPHA_TO_COVERAGE: GL ignores it on single-sampled framebuffers;
+    // the pipeline enables it only when its target is multisampled.
+    alphaToCoverage: m.alphaToCoverage === true,
   };
 }
 
@@ -113,7 +134,7 @@ const BUILTIN = new Set(['modelMatrix', 'modelViewMatrix', 'projectionMatrix', '
  * uniforms object (material.uniforms, or a refreshed ShaderLib clone). Values
  * the program declares but nothing sets stay zero, as GL leaves them.
  * Returns the texture (or null) for each reflected sampler binding. */
-export function packThreeProgramUniforms(T, reflection, uniforms, object, camera, bytes, {toneMappingExposure = 1, targetSize = null, samplers = null} = {}) {
+export function packThreeProgramUniforms(T, reflection, uniforms, object, camera, bytes, {toneMappingExposure = 1, targetSize = null, samplers = null, values = null} = {}) {
   bytes.fill(0);
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const cameraPosition = new T.Vector3().setFromMatrixPosition(camera.matrixWorld);
@@ -125,7 +146,8 @@ export function packThreeProgramUniforms(T, reflection, uniforms, object, camera
   for (const u of reflection.uniforms) {
     // receiveShadow: set from the object each draw, then overwritten by a
     // material uniform of that name when one exists (WebGLRenderer.setProgram order).
-    const value = BUILTIN.has(u.name) && !(u.name === 'receiveShadow' && uniforms?.receiveShadow) ? builtin[u.name] : uniforms?.[u.name]?.value;
+    const value = BUILTIN.has(u.name) && !(u.name === 'receiveShadow' && uniforms?.receiveShadow) ? builtin[u.name]
+      : values && Object.hasOwn(values, u.name) ? values[u.name] : uniforms?.[u.name]?.value;
     if (value === undefined || value === null) continue;
     write(view, u.node, value, u.name);
   }
@@ -206,9 +228,9 @@ export function createThreeProgramSupport({three: T, state, maxPrograms = 256, m
   /** shadows: renderer.shadowMap is enabled and this frame has shadow-casting
    * lights (WebGLPrograms shadowMapEnabled). renderTarget: an offscreen pass
    * (shadow depth): no tone mapping, linear output, GL row order. */
-  function compile(material, object, {fog = null, side = material.side, envMap = null, shadows = false, renderTarget = false} = {}) {
+  function compile(material, object, {fog = null, side = material.side, envMap = null, shadows = false, renderTarget = false, clipping = null} = {}) {
     const s = state();
-    const sources = threeProgramSources(T, material, object, {fog, side, envMap, lights: lights.state,
+    const sources = threeProgramSources(T, material, object, {fog, side, envMap, lights: lights.state, clipping,
       toneMapping: renderTarget ? T.NoToneMapping : s.toneMapping, outputColorSpace: renderTarget ? T.LinearSRGBColorSpace : s.outputColorSpace,
       shadowMapEnabled: shadows, shadowMapType: s.shadowMapType ?? T.PCFShadowMap});
     // GL rasterizes Points as gl_PointSize squares: compile the point-sprite form.
@@ -262,6 +284,8 @@ export function createThreeProgramSupport({three: T, state, maxPrograms = 256, m
         samplers: material ? shadowSamplers(material) : null, ...options}),
     shadowSamplers,
     state,
+    clippingState: (controls, material, camera, options) => threeClippingState(T, controls, material, camera, options),
+    bindsClippingPlanes,
     createGeometry: (device, source, attributes, options) => createGpuProgramGeometry(device, source, attributes, options),
     geometrySnapshot: (gpu, device) => programGeometrySnapshot(gpu, device),
   });
