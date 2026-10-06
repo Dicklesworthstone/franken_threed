@@ -194,7 +194,6 @@ for(const source of [
   'function f(a,b){let x=a;for(let i=0;i<1;i++)x=3;return x[0];}',
   'function f(a,b){let x=a;for(let i=0;i<1;i++)x++;return 0;}',
   'function f(a,b){let x=a;for(let i=0;i<1;i++)x+=b;return 0;}',
-  'function f(a,b){for(let i=0;i<1;i++)a=b;return a[0];}',
   'function f(a,b){let x=a;for(let i=0;i<1;i++)x[0]+=1;return x;}',
   'function f(a,b){let x=a;for(let i=0;i<1;i++)x[0]+=1;return x===a?1:0;}',
   'function f(a,b){let x=a?b:1;for(let i=0;i<1;i++)x[0]+=1;return 0;}',
@@ -222,4 +221,84 @@ test('helper TDZ and const/reference-escape errors refuse the whole graph',()=>{
     'function helper(a){const x=a;return x;}',
     'function helper(a){const x=a;return x===a?1:0;}',
   ]) assert.throws(()=>compileNumericKernel(root.toString(),{parameterTypes:['f64[]'],generalControl:true,helperSources:new Map([['helper',source]])}),NumericKernelCompileError);
+});
+
+test('legacy pipelines cannot read an unguarded non-bound array length as a pointer argument',()=>{
+  function root(a,b,extra){let size=extra.length;for(let i=0;i<a.length;i++)a[i]+=1;for(let i=0;i<b.length;i++)b[i]+=2;return size;}
+  assert.throws(()=>compileNumericKernel(root.toString(),{parameterTypes:['f64[]','f64[]','f64[]']}),NumericKernelCompileError);
+  const native=engine(compile(root,['f64[]','f64[]','f64[]']));
+  const a=new Float64Array(2),b=new Float64Array(3),extra=new Float64Array(7);
+  assert.equal(native.run(a,b,extra),7);equal(a,[1,1]);equal(b,[2,2,2]);assert.equal(native.diagnostics.wasmCalls,1);
+});
+
+for(const [Type,type] of layouts) {
+  test(`${Type.name}: array parameters may swap without changing caller reference identities`,()=>{
+    function root(a,b,n){for(let pass=0;pass<n;pass++){for(let i=0;i<a.length;i++)b[i]=a[i]/3+1.5;const old=a;a=b;b=old;}return a[0];}
+    const native=engine(compile(root,[type,type,'f64']));
+    const a=new Type([1,2,3,4]),b=new Type([5,6,7,8]),ea=a.slice(),eb=b.slice();
+    for(const n of [0,1,2,3,8]){assert.ok(Object.is(native.run(a,b,n),root(ea,eb,n)));equal(a,ea);equal(b,eb);}
+    assert.equal(native.diagnostics.wasmCalls,5);
+  });
+}
+
+test('rebound loop-bound parameters re-read the selected view length at every source test',()=>{
+  function root(a,b){for(let i=0;i<a.length;i++){a[0]+=1;a=b;}return a[0];}
+  assert.throws(()=>compileNumericKernel(root.toString(),{parameterTypes:['f64[]','f64[]'],checkedIndexing:true}),NumericKernelCompileError);
+  const artifact=compileNumericCandidate(root.toString(),{parameterTypes:['f64[]','f64[]']});
+  assert.equal(artifact.manifest.controlSemantics,'budgeted-source-order-v1');
+  const native=engine(artifact),a=new Float64Array([1,2,3,4]),b=new Float64Array([9]),ea=a.slice(),eb=b.slice();
+  assert.equal(native.run(a,b),root(ea,eb));equal(a,ea);equal(b,eb);equal(a,[2,2,3,4]);equal(b,[9]);
+});
+
+test('helper-local parameter rebinding changes data targets but not the caller binding',()=>{
+  function redirect(a,b){a=b;a[0]+=10;}
+  function root(a,b){let result=0;for(let i=0;i<3;i++){redirect(a,b);result+=a[0];}return result;}
+  const artifact=compile(root,['f64[]','f64[]'],[redirect]);
+  // The flow-insensitive owner union may stage/publish the initial target too.
+  assert.deepEqual(artifact.manifest.parameters.map(p=>[p.read,p.write]),[[true,true],[true,true]]);
+  const native=engine(artifact),a=new Float64Array([1]),b=new Float64Array([2]),ea=a.slice(),eb=b.slice();
+  assert.equal(native.run(a,b),root(ea,eb));equal(a,ea);equal(b,eb);equal(a,[1]);equal(b,[32]);
+});
+
+
+test('conservative reference-owner publication preserves untouched NaN payload bits',()=>{
+  function redirect(a,b){a=b;a[0]+=1;}
+  function root(a,b){for(let i=0;i<2;i++)redirect(a,b);return b[0];}
+  const artifact=compile(root,['f64[]','f64[]'],[redirect]);
+  for(const preserveAliasing of [false,true]) {
+    const buffer=new ArrayBuffer(16),bits=new BigUint64Array(buffer);
+    bits.set([0x7ff0000000000001n,0xfff8000000000123n]);
+    const before=new Uint8Array(buffer).slice(),a=new Float64Array(buffer),b=new Float64Array([1]);
+    const native=instantiateNumericKernel(artifact.wasm,{preserveAliasing});
+    assert.equal(native.run(a,b),3);assert.deepEqual(new Uint8Array(buffer),before);
+    assert.equal(native.diagnostics.wasmCalls,1);
+  }
+});
+
+test('seeded reference-graph differential: 1,800 native runs over aliased and empty views',()=>{
+  function shuffle(a,b,c,n,flags){
+    let x=a,y=b;const saved=x;
+    for(let i=0;i<n;i++){
+      if((flags>>i)&1)x=c;else x=i&1?y:a;
+      const anchor=saved.length?saved[0]:0;
+      if(x.length)x[0]+=anchor/3+i;
+      const previous=x;x=y;y=previous;
+    }
+    return x.length+y.length+(saved.length?saved[0]:0);
+  }
+  let seed=0x391074ab;
+  const random=max=>{seed=(Math.imul(seed,1664525)+1013904223)>>>0;return seed%max;};
+  const values=[0,-0,1/3,-1.5,2.5,65537,2**32-1,NaN,Infinity,-Infinity];
+  for(const [Type,type] of layouts){
+    const native=engine(compile(shuffle,[type,type,type,'f64','f64']));
+    for(let example=0;example<200;example++){
+      const data=new Type(Array.from({length:12},()=>values[random(values.length)])),expected=data.slice();
+      const ranges=Array.from({length:3},()=>{const start=random(6);return [start,start+random(7)];});
+      const args=ranges.map(([start,end])=>data.subarray(start,end)),reference=ranges.map(([start,end])=>expected.subarray(start,end));
+      const n=random(9),flags=random(256);
+      assert.ok(Object.is(native.run(...args,n,flags),shuffle(...reference,n,flags)),`${Type.name} case ${example}`);
+      equal(data,expected);
+    }
+    assert.equal(native.diagnostics.wasmCalls,200);assert.equal(native.diagnostics.fallbackCalls,0);
+  }
 });

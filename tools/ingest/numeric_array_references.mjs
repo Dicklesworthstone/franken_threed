@@ -65,7 +65,7 @@ export function createArrayReferenceCompiler({resolveArray, allocateLocal, condi
     },
     rebind(target, node) {
       if (!target.reference || !target.mutable || node.operator !== '=')
-        fail('Only mutable local array references may be rebound by simple assignment', node);
+        fail('Only mutable array-reference bindings may be rebound by simple assignment', node);
       return assign(target, choice(node.right), node);
     },
     finish() {
@@ -87,4 +87,27 @@ export function createArrayReferenceCompiler({resolveArray, allocateLocal, condi
       }
     },
   };
+}
+
+/** Find potentially reassigned array parameters without entering another
+ * function's execution scope. Shadowing may overapproximate this set; it only
+ * allocates private parameter snapshots. Actual references are scope-resolved
+ * by the caller and every assignment still passes the closed compiler.
+ */
+export function reboundArrayParameters(fn, parameterTypes) {
+  const arrays = new Set(fn.params.filter((_param, index) => parameterTypes[index] !== 'f64').map(param => param.name));
+  const rebound = new Set(), pending = [fn.body];
+  while (pending.length && arrays.size) {
+    const node = pending.pop();
+    if (!node || ['FunctionDeclaration', 'FunctionExpression', 'ArrowFunctionExpression',
+      'ClassDeclaration', 'ClassExpression'].includes(node.type)) continue;
+    if (node.type === 'AssignmentExpression' && node.operator === '=' &&
+        node.left.type === 'Identifier' && arrays.has(node.left.name)) rebound.add(node.left.name);
+    for (const value of Object.values(node)) {
+      if (Array.isArray(value)) {
+        for (const child of value) if (child && typeof child.type === 'string') pending.push(child);
+      } else if (value && typeof value.type === 'string') pending.push(value);
+    }
+  }
+  return rebound;
 }

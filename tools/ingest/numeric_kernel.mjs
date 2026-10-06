@@ -12,7 +12,7 @@
  * opt-in ABI is not proof of whole-application closure or a speedup claim.
  */
 import * as acorn from 'acorn';
-import { createArrayReferenceCompiler, arrayPointer, arrayLength } from './numeric_array_references.mjs';
+import { createArrayReferenceCompiler, arrayPointer, arrayLength, reboundArrayParameters } from './numeric_array_references.mjs';
 import { createScalarHelperCompiler } from './numeric_helpers.mjs';
 import { createMathIntrinsicCompiler } from './numeric_intrinsics.mjs';
 import { BITWISE_OPS, INTEGER_ARRAY_LAYOUTS, emitBitwiseBinary, emitBitwiseNot,
@@ -295,6 +295,16 @@ export function compileNumericKernel(source, {
   let inLoop = false;
   const arrayReferences = createArrayReferenceCompiler({resolveArray:helperArray,
     allocateLocal:() => temporaryBase + temporaryCount++, condition, fail, enabled:checkedIndexing});
+  const reboundParameters = reboundArrayParameters(fn, parameterTypes), referenceInitializers = [];
+  // Counted-prefix loops cache their bound. Rebinding that parameter can change
+  // the next source test, so only general control may use mutable parameters.
+  if (reboundParameters.size && !generalControl)
+    fail('Array parameter rebinding requires generalControl', fn);
+  for (const param of fn.params) if (reboundParameters.has(param.name)) {
+    const reference = arrayReferences.declare(param, true);
+    temporaries.set(param.name, reference.binding);
+    referenceInitializers.push(...reference.bytes);
+  }
   const arrayParameter = (node, writing = false, depth = 0) => {
     const param = helperArray(node?.object);
     if (!arrayTypes.includes(param?.type) || node?.type !== 'MemberExpression' ||
@@ -415,7 +425,8 @@ export function compileNumericKernel(source, {
     if (pipeline || checkedIndexing) {
       const name = node.object?.name;
       const array = helperArray(node.object);
-      if (array && member(node, name, 'length', false)) return [...arrayLength(array), 0xb8];
+      if (array && (checkedIndexing || bounds.has(name)) && member(node, name, 'length', false))
+        return [...arrayLength(array), 0xb8];
     } else if (member(node, boundParam.name, 'length', false)) return [...get(countLocal), 0xb8];
     if (node.type === 'MemberExpression') return load(arrayParameter(node, false, depth));
     if (node.type === 'UnaryExpression' && ['+', '-', '~'].includes(node.operator)) {
@@ -823,7 +834,7 @@ export function compileNumericKernel(source, {
   const body = [
     ...vector(locals),
     ...(sharedLoopBudget ? [...number(0), 0x24, 0] : []),
-    ...execution, ...result, 0x0b,
+    ...referenceInitializers, ...execution, ...result, 0x0b,
   ];
   const helperCode = helperCompiler.finish();
   const wasm = new Uint8Array([

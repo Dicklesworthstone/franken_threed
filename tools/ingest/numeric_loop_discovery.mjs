@@ -37,34 +37,52 @@ export function hasNumericLoop(body, immutableHelpers = null) {
   return false;
 }
 
-/** Infer speculative array slots through immutable helper argument positions.
- * A wrapper need not subscript a parameter itself: its callee may do so. This
- * only proposes ABI variants; the numeric compiler still proves the entire
- * body and every call binding, and the runtime guards each actual argument.
- * The graph is bounded like native helper compilation. Cycles reach a finite
- * fixed point here but remain an explicit compiler refusal, never native calls.
+/** Infer speculative array slots through local references and helper arguments.
+ * This is a name-based overapproximation, NOT a lexical/type/alias proof. The
+ * compiler independently resolves every binding and rejects invalid reference
+ * flow. Dependencies include every source of a mutable local, including swaps,
+ * conditional selection and assignments syntactically after the first access.
+ * The bounded helper graph and finite local worklists converge even on cycles;
+ * recursive helper execution itself remains a compiler refusal.
  */
 export function discoverNumericArrayParameters(fn, immutableHelpers = new Map()) {
   const graph = new Map(), pending = [fn];
+  // Only branch VALUES propose references. A selector is numeric control, not
+  // another possible array source. Unsupported expression shapes propose none.
+  function references(node) {
+    const names = [], pending = [node];
+    while (pending.length) {
+      const value = pending.pop();
+      if (value?.type === 'Identifier') names.push(value.name);
+      else if (value?.type === 'ConditionalExpression') pending.push(value.consequent, value.alternate);
+    }
+    return names;
+  }
   while (pending.length && graph.size < 65) {
     const current = pending.pop();
     if (graph.has(current)) continue;
     const positions = new Map(current.params.flatMap((param, index) =>
       param.type === 'Identifier' ? [[param.name, index]] : []));
-    const record = { positions, arrays: new Set(), calls: [] };
+    const record = {positions, arrays:new Set(), calls:[], dependencies:new Map(), required:new Set()};
     graph.set(current, record);
+    function depend(binding, value) {
+      if (binding?.type !== 'Identifier') return;
+      if (!record.dependencies.has(binding.name)) record.dependencies.set(binding.name, new Set());
+      for (const name of references(value)) record.dependencies.get(binding.name).add(name);
+    }
     const nodes = [current.body];
     while (nodes.length) {
       const node = nodes.pop();
       if (!node || ['FunctionDeclaration', 'FunctionExpression', 'ArrowFunctionExpression',
         'ClassDeclaration', 'ClassExpression'].includes(node.type)) continue;
-      if (node.type === 'MemberExpression' && node.object.type === 'Identifier' &&
-          positions.has(node.object.name)) record.arrays.add(positions.get(node.object.name));
+      if (node.type === 'VariableDeclarator') depend(node.id, node.init);
+      if (node.type === 'AssignmentExpression' && node.operator === '=') depend(node.left, node.right);
+      if (node.type === 'MemberExpression' && node.object.type === 'Identifier')
+        record.required.add(node.object.name);
       if (node.type === 'CallExpression' && !node.optional && node.callee.type === 'Identifier') {
         const callee = immutableHelpers.get(node.callee.name);
         if (callee?.type === 'FunctionDeclaration') {
-          record.calls.push({ callee, slots: node.arguments.map(argument =>
-            argument.type === 'Identifier' ? positions.get(argument.name) : undefined) });
+          record.calls.push({callee, arguments:node.arguments.map(references)});
           if (!graph.has(callee)) pending.push(callee);
         }
       }
@@ -75,18 +93,33 @@ export function discoverNumericArrayParameters(fn, immutableHelpers = new Map())
       }
     }
   }
+  function require(record, names) {
+    const pending = [...names];
+    let changed = false;
+    while (pending.length) {
+      const name = pending.pop();
+      if (record.required.has(name)) continue;
+      record.required.add(name);
+      const position = record.positions.get(name);
+      if (position !== undefined && !record.arrays.has(position)) {
+        record.arrays.add(position); changed = true;
+      }
+      pending.push(...(record.dependencies.get(name) ?? []));
+    }
+    return changed;
+  }
+  for (const record of graph.values()) {
+    const names = record.required; record.required = new Set();
+    require(record, names);
+  }
   let changed;
   do {
     changed = false;
-    for (const record of graph.values()) for (const { callee, slots } of record.calls) {
-      for (const index of graph.get(callee)?.arrays ?? []) {
-        const slot = slots[index];
-        if (slot !== undefined && !record.arrays.has(slot)) {
-          record.arrays.add(slot); changed = true;
-        }
-      }
+    for (const record of graph.values()) for (const call of record.calls) {
+      for (const index of graph.get(call.callee)?.arrays ?? [])
+        changed = require(record, call.arguments[index] ?? []) || changed;
     }
   } while (changed);
-  const { positions, arrays } = graph.get(fn);
+  const {positions, arrays} = graph.get(fn);
   return new Set([...positions].filter(([, index]) => arrays.has(index)).map(([name]) => name));
 }

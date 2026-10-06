@@ -124,13 +124,12 @@ function capturesFor(loop, ancestors, bindings, helperDeclarations) {
   const captures = [...new Set(references.sort((a,b) => a.start-b.start).map(n => n.name))]
     .filter(name => !locals.has(name) && !(usesMath && name === 'Math') &&
       !(helperDeclarations.has(name) && ownerOf(name, ancestors, loop) === ancestors[0]));
-  // Helpers can be the only code that subscripts a captured view. Slot
-  // discovery proposes types; the closed compiler still proves all accesses.
-  if (helperDeclarations.size) {
-    for (const name of discoverNumericArrayParameters({
-      params:captures.map(name => ({type:'Identifier', name})), body:loop,
-    }, helperDeclarations)) arrays.add(name);
-  }
+  // A captured view can be accessed only through local references or helper
+  // arguments. Discover both, even when the module has no helper declarations.
+  // This proposes types; lexical closure and native slot guards still decide.
+  for (const name of discoverNumericArrayParameters({
+    params:captures.map(name => ({type:'Identifier', name})), body:loop,
+  }, helperDeclarations)) arrays.add(name);
   // A syntactic union of inner declarations can cause conservative refusals
   // under shadowing; it cannot authorize a missing lexical binding, because the
   // numeric compiler independently resolves every reference in the whole loop.

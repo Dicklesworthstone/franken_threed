@@ -13,7 +13,7 @@
  * helpers are admitted only where the caller discards the result.
  */
 import * as acorn from 'acorn';
-import { createArrayReferenceCompiler, arrayPointer, arrayLength } from './numeric_array_references.mjs';
+import { createArrayReferenceCompiler, arrayPointer, arrayLength, reboundArrayParameters } from './numeric_array_references.mjs';
 import { BITWISE_OPS, INTEGER_ARRAY_LAYOUTS, emitBitwiseBinary, emitBitwiseNot,
   emitToUint32, emitToUint8Clamp } from './numeric_integer.mjs';
 
@@ -163,6 +163,12 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
       return binding?.type ? binding : null;
     }
     const arrayReferences = createArrayReferenceCompiler({resolveArray, allocateLocal, condition, fail, enabled:checkedArrays});
+    const reboundParameters = reboundArrayParameters(fn, owner.parameterTypes), referenceInitializers = [];
+    for (const param of fn.params) if (reboundParameters.has(param.name)) {
+      const reference = arrayReferences.declare(param, true);
+      environment.set(param.name, reference.binding);
+      referenceInitializers.push(...reference.bytes);
+    }
     function target(node, depth = 0) {
       const array = node?.type === 'MemberExpression' && !node.optional && node.computed
         ? resolveArray(node.object) : null;
@@ -407,7 +413,7 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
     if (owner.resultType === 'f64' && !body.returns) fail(`Scalar helper ${fn.id.name} must return a number on every path`, fn);
     // Every reachable path returns. unreachable makes the result type explicit
     // to the Wasm validator even when all returns occur in nested if branches.
-    return [...(localCount ? [1, ...u32(localCount), F64] : [0]), ...body.bytes, ...(owner.resultType === 'f64' ? [0x00] : []), 0x0b];
+    return [...(localCount ? [1, ...u32(localCount), F64] : [0]), ...referenceInitializers, ...body.bytes, ...(owner.resultType === 'f64' ? [0x00] : []), 0x0b];
   }
 
   return {
