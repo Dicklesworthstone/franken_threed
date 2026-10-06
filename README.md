@@ -26,7 +26,7 @@ Existing authoring knowledge stays useful. You keep writing Three.js.
 
 ## Honest status
 
-**Phase 0 foundation work has begun; core specializer/renderer functionality is not yet implemented.**
+**Phase 0/1 work is in progress: a general new-WebGPU renderer route runs ordinary Three.js apps for an admitted feature subset; Rust/Wasm specialization is limited to numeric islands; no speedup has been measured.**
 
 | Question | Answer |
 |---|---|
@@ -35,8 +35,9 @@ Existing authoring knowledge stays useful. You keep writing Three.js.
 | Are test evidence conventions in place? | **Yes** — structured event schema and test evidence helper (`3772bbc`) |
 | Does Rust code execute in real browsers? | **Yes** — a real Rust program executes through the Asupersync browser host in HeadlessChrome 152 and Safari 26.5 with eight probes passing (timer wakeups, oneshot join, 1000 host turns, reentry rejection, 10k self-wakes, cooperative cancellation, region drain before close, fetch abort with server-observed disconnect) as of commits `8910299`, `7cd379e`, `8f1ca58` |
 | Is the browser runtime dependency reproducible? | **Yes** — published Asupersync `=0.5.0` with a checked-in registry checksum replaces the developer checkout. The browser results above predate this pin and still require a fresh browser run. |
-| Is the WebGPU bridge implemented? | **No** — WebGPU bridge, device loss handling, and all-turn burst measurement are not done |
-| Is there a compiler, renderer, or CLI? | **No** — compiler, WebGPU renderer, and CLI orchestration do not exist yet |
+| Is the WebGPU bridge implemented? | **Partly** — explicit WebGPU scene/canvas owners (`tools/ingest/three_scene.mjs`, `three_canvas.mjs`) with device-loss handling; all-turn burst measurement is not done |
+| Is there a compiler, renderer, or CLI? | **Partly** — `node tools/ingest/cli.mjs app.html --build-app out --route-webgpu-renderer` routes an ordinary app's `WebGPURenderer` to the new backend (`tools/ingest/three_renderer.mjs`, general-webgpu route, retained-JS command preparation). Unadmitted features fail explicitly; see `tools/ingest/THREE_RENDERER.md` |
+| Does the new renderer match upstream pixels? | **For 10 scenes** — `tests/e2e/webgpu_renderer/parity.mjs` matches pinned r186 `WebGPURenderer` in headless Chromium on SwiftShader (lights, standard/phong/lambert/toon/basic, transparency, fog, instancing, textures, shadows, lines/points/helpers, all blending modes). Software Vulkan only; no hardware evidence |
 | Has the symbol/export census been run? | **No** — the plan defines the census; it has not been executed |
 | Have benchmarks or hardware targets run? | **No** — physical M5 and iPhone runs are not done; **zero speedup has been measured** |
 
