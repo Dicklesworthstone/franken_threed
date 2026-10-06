@@ -181,6 +181,7 @@ export async function createGpuThreeScene(device,scene,{
     for(const [m,state] of materials)m.removeEventListener('dispose',state.listener);materials.clear();
     for(const gpu of geometries.values())gpu.dispose();geometries.clear();
     for(const gpu of instances.values())gpu.dispose();instances.clear();renderer?.dispose();textureOwner?.dispose();
+    placeholder?.texture.destroy();placeholder=null;
   }
   function onAbort(){
     if(disposed||terminal)return;
@@ -414,7 +415,12 @@ export async function createGpuThreeScene(device,scene,{
         if(!autoTextures)fail('TEXTURE','Supply an acknowledged binding or enable automatic textures');
         if(t.onUpdate!==null)fail('HOOK','Custom texture upload callbacks require the explicit texture owner');
         const owner=ownedTextures();
-        if(textureScan){owner.inspect(t);textureScan.add(t);binding={view:t,sampler:t};}
+        // r186 binds a zero-initialized 1x1 default texture until the source
+        // data exists (Textures/createDefaultTexture). The texture owner's own
+        // NOT_READY verdict decides; arrival is a preparation boundary.
+        if((textureScan||pendingTextures.has(t))&&!ownerAccepts(owner,t)){binding=placeholderBinding();pendingTextures.add(t);}
+        else if(pendingTextures.has(t))fail('PREPARE','A source texture finished loading; prepare() binds it');
+        else if(textureScan){textureScan.add(t);binding={view:t,sampler:t};}
         else{binding=owner.binding(t);frameTextures?.add(t);}
       }
       options[field]={view:binding.view,sampler:binding.sampler};textureKey.push(field,t,binding.view,binding.sampler);
@@ -516,6 +522,19 @@ export async function createGpuThreeScene(device,scene,{
     derived.setDrawRange(range.start*2,range.count===Infinity?Infinity:range.count*2);
     return derived;
   }
+  // Textures whose source data is not ready yet (e.g. an image still loading).
+  let pendingTextures=new WeakSet(),placeholder=null;
+  function ownerAccepts(owner,t){
+    try{owner.inspect(t);return true;}
+    catch(error){if(error?.code==='THREE_TEXTURE_NOT_READY')return false;throw error;}
+  }
+  function placeholderBinding(){
+    if(!placeholder){
+      const texture=device.createTexture({label:'f3d-default-texture',size:[1,1,1],format:'rgba8unorm',usage:4|2});
+      placeholder={texture,view:texture.createView(),sampler:device.createSampler({label:'f3d-default-texture'})};
+    }
+    return placeholder;
+  }
   function desired(nodes){
     const clippingFrame=clippingState();
     const out=[],descriptions=new Map(),seen=new Map(),usedGeometry=new Set(),usedInstances=new Set(),usedDeformations=new Set();
@@ -580,6 +599,7 @@ export async function createGpuThreeScene(device,scene,{
     try{
       // Validate all source materials and texture inputs before allocating any
       // textures. Temporary inspection placeholders never reach renderer.addMesh.
+      pendingTextures=new WeakSet();
       const owned=scanTextures();textureOwner?.prepare(owned);
       const nodes=graph(),request=desired(nodes),next=[];
       const selected=shadowEnabled?shadowLight(nodes):null;

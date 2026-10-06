@@ -684,3 +684,56 @@ export function createWebGLRendererClass(THREE, classOptions = {}) {
     Object.defineProperty(WebGLRenderer.prototype, name, glOnly(name));
   return WebGLRenderer;
 }
+
+/** `PMREMGenerator` for renderers on this route. Upstream PMREM renders into
+ * CubeUV render targets with renderer internals this route does not have; here
+ * the result's texture describes the source instead, and the scene bridge's
+ * environment owner prepares it at its preparation boundary:
+ * - fromScene(scene, sigma, near, far, {size, position}): captured into an
+ *   rgba16float cubemap with the native scene bridge when first prepared (not at
+ *   this call; later edits to the captured scene before preparation are seen),
+ *   then GGX/DFG-filtered. sigma pre-blur is not reproduced.
+ * - fromEquirectangular(texture): a clone sharing the source pixels (so the
+ *   application may dispose its original), filtered from the panorama.
+ * Neither is Three PMREM/CubeUV pixel equivalence. fromCubemap and explicit
+ * render targets fail explicitly. Other renderers get the upstream class.
+ */
+export function createPMREMGeneratorClass(THREE, {exactBackend = null} = {}) {
+  class PMREMGenerator {
+    constructor(renderer) {
+      if (!renderer?.isF3DRenderer) {
+        if (exactBackend) return new exactBackend(renderer);
+        fail('ROUTE', 'This PMREMGenerator serves the new-backend renderer route');
+      }
+      this._renderer = renderer;
+    }
+    fromScene(scene, sigma = 0, near = 0.1, far = 100, options = {}) {
+      const {size = 256, position = new THREE.Vector3(), renderTarget = null} = options;
+      if (renderTarget !== null) fail('UNSUPPORTED', 'Explicit PMREM render targets are not admitted');
+      if (!(scene instanceof THREE.Scene)) fail('SOURCE', 'Expected a source Scene');
+      const texture = new THREE.CubeTexture();
+      texture.name = 'PMREM.cubeUv';
+      texture.mapping = THREE.CubeUVReflectionMapping;
+      texture.colorSpace = THREE.LinearSRGBColorSpace;
+      texture.isF3DSceneEnvironment = true;
+      texture.f3dCapture = Object.freeze({scene, sigma, near, far, size, position: position.clone()});
+      texture.needsUpdate = true;
+      return {isRenderTarget: true, texture, dispose() { texture.dispose(); }};
+    }
+    async fromSceneAsync(...args) { return this.fromScene(...args); }
+    fromEquirectangular(equirectangular, renderTarget = null) {
+      if (renderTarget !== null) fail('UNSUPPORTED', 'Explicit PMREM render targets are not admitted');
+      const texture = equirectangular.clone();
+      texture.mapping = THREE.EquirectangularReflectionMapping;
+      texture.needsUpdate = true;
+      return {isRenderTarget: true, texture, dispose() { texture.dispose(); }};
+    }
+    async fromEquirectangularAsync(...args) { return this.fromEquirectangular(...args); }
+    fromCubemap() { fail('UNSUPPORTED', 'PMREM from cube textures is not admitted yet'); }
+    async fromCubemapAsync() { this.fromCubemap(); }
+    compileCubemapShader() {}
+    compileEquirectangularShader() {}
+    dispose() {}
+  }
+  return PMREMGenerator;
+}

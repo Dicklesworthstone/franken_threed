@@ -20,6 +20,7 @@ const same = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]);
 
 /** Metadata-only check: never scan or copy panorama pixels in a render loop. */
 export function inspectThreeEnvironment(texture, three, {maxPixels = 16 * 1024 * 1024} = {}) {
+  if (texture?.isF3DSceneEnvironment === true) return inspectSceneCapture(texture, three, maxPixels);
   if (three?.REVISION !== '186' || typeof three.DataTexture !== 'function' ||
       !(texture instanceof three.DataTexture) || texture.isCubeTexture || texture.isRenderTargetTexture)
     fail('SOURCE', 'Supply a ready r186 DataTexture panorama');
@@ -53,6 +54,91 @@ export function inspectThreeEnvironment(texture, three, {maxPixels = 16 * 1024 *
   return Object.freeze({texture, source, image, data, half, width, height, sourceBytes: width * height * 8,
     signature: Object.freeze([texture, source, image, data, data.buffer, texture.version, source.version,
       texture.type, texture.mapping, texture.colorSpace, texture.flipY, width, height])});
+}
+
+/** A PMREMGenerator.fromScene() request from three_renderer.mjs: the capture
+ * runs at this owner's preparation boundary (not at the source call). */
+function inspectSceneCapture(texture, three, maxPixels) {
+  const c = texture.f3dCapture;
+  if (three?.REVISION !== '186' || !c || !(c.scene instanceof three.Scene) || !(c.position instanceof three.Vector3))
+    fail('SOURCE', 'Expected a captured r186 source scene environment');
+  integer(c.size, 1, 4096, 'capture size');
+  if (![c.near, c.far, c.sigma].every(v => typeof v === 'number' && Number.isFinite(v)) || c.near <= 0 || c.far <= c.near || c.sigma < 0)
+    fail('VALUE', 'Invalid environment capture near/far/sigma');
+  if (c.size * c.size * 6 > maxPixels) fail('LIMIT', 'Environment capture exceeds the pixel budget');
+  return Object.freeze({texture, capture: c, width: c.size, height: c.size, sourceBytes: c.size * c.size * 6 * 8 + c.size * c.size * 4,
+    signature: Object.freeze([texture, c, texture.version])});
+}
+
+// Cube faces as WebGPU samples them: forward and up per layer +X,-X,+Y,-Y,+Z,-Z.
+// A camera with this forward/up sees the face mirrored horizontally (cube maps
+// are left-handed), so each face is blitted with u -> 1 - u into its layer.
+const CUBE_FACES = [[[1, 0, 0], [0, 1, 0]], [[-1, 0, 0], [0, 1, 0]], [[0, 1, 0], [0, 0, -1]],
+  [[0, -1, 0], [0, 0, 1]], [[0, 0, 1], [0, 1, 0]], [[0, 0, -1], [0, 1, 0]]];
+const FLIP_BLIT_WGSL = `
+@group(0) @binding(0) var face_texture: texture_2d<f32>;
+struct Out { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32> }
+@vertex fn vertex_main(@builtin(vertex_index) i: u32) -> Out {
+  let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+  var out: Out; out.position = vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0); out.uv = vec2<f32>(p.x, 1.0 - p.y); return out;
+}
+@fragment fn fragment_main(input: Out) -> @location(0) vec4<f32> {
+  let size = vec2<f32>(textureDimensions(face_texture));
+  let texel = vec2<i32>(i32(size.x - 1.0 - floor(input.uv.x * size.x)), i32(floor(input.uv.y * size.y)));
+  return textureLoad(face_texture, clamp(texel, vec2<i32>(0), vec2<i32>(size) - 1), 0);
+}`;
+
+/** Render the captured source scene into an rgba16float cube texture with the
+ * same native scene bridge (a 90-degree camera per face at the capture
+ * position, black clear unless the scene has a color background), then flip
+ * each face into its cube layer. Upstream's optional sigma pre-blur is not
+ * reproduced; the GGX filter below replaces PMREM's own filtering. */
+async function renderSceneCapture(device, shape, three, signal) {
+  const {scene, near, far, size, position} = shape.capture;
+  const {createGpuThreeScene} = await import('./three_scene.mjs');
+  // The bridge owns its own validation scopes across its asynchronous preparation.
+  const bridge = await createGpuThreeScene(device, scene, {three, signal, maxBindings: 4096,
+    renderer: {format: 'rgba16float', depthFormat: 'depth24plus', sampleCount: 1, maxDraws: 4096},
+    ...(scene.fog ? {fog: {}} : {})});
+  let cube = null, face = null, depth = null, thrown = null;
+  // All capture work below is synchronous: push, issue, pop with no await between.
+  device.pushErrorScope('out-of-memory'); device.pushErrorScope('validation');
+  try {
+    cube = device.createTexture({label: 'f3d-environment-capture', size: [size, size, 6], dimension: '2d',
+      format: 'rgba16float', mipLevelCount: 1, sampleCount: 1, usage: 4 | 16});
+    face = device.createTexture({label: 'f3d-environment-face', size: [size, size, 1], dimension: '2d',
+      format: 'rgba16float', mipLevelCount: 1, sampleCount: 1, usage: 4 | 16});
+    depth = device.createTexture({label: 'f3d-environment-depth', size: [size, size, 1], dimension: '2d',
+      format: 'depth24plus', mipLevelCount: 1, sampleCount: 1, usage: 16});
+    const module = device.createShaderModule({label: 'f3d-environment-flip', code: FLIP_BLIT_WGSL});
+    const pipeline = device.createRenderPipeline({label: 'f3d-environment-flip', layout: 'auto',
+      vertex: {module, entryPoint: 'vertex_main'},
+      fragment: {module, entryPoint: 'fragment_main', targets: [{format: 'rgba16float'}]}, primitive: {topology: 'triangle-list'}});
+    const group = device.createBindGroup({layout: pipeline.getBindGroupLayout(0), entries: [{binding: 0, resource: face.createView()}]});
+    const camera = new three.PerspectiveCamera(90, 1, near, far);
+    const clear = scene.background?.isColor ? [scene.background.r, scene.background.g, scene.background.b, 1] : [0, 0, 0, 1];
+    for (let layer = 0; layer < 6; layer++) {
+      const [forward, up] = CUBE_FACES[layer];
+      camera.position.copy(position); camera.up.set(...up);
+      camera.lookAt(position.x + forward[0], position.y + forward[1], position.z + forward[2]);
+      camera.updateMatrixWorld(true);
+      bridge.render(camera, {colorView: face.createView(), depthView: depth.createView(), loadOp: 'clear', clearColor: clear});
+      const encoder = device.createCommandEncoder({label: 'f3d-environment-flip'});
+      const pass = encoder.beginRenderPass({colorAttachments: [{view: cube.createView({dimension: '2d', baseArrayLayer: layer, arrayLayerCount: 1}),
+        loadOp: 'clear', storeOp: 'store', clearValue: {r: 0, g: 0, b: 0, a: 0}}]});
+      pass.setPipeline(pipeline); pass.setBindGroup(0, group); pass.draw(3); pass.end();
+      device.queue.submit([encoder.finish()]);
+    }
+  } catch (error) { thrown = error; }
+  const validation = device.popErrorScope(), oom = device.popErrorScope();
+  try {
+    const errors = await Promise.all([validation, oom]);
+    if (thrown) throw thrown;
+    if (errors.some(Boolean)) fail('DEVICE', errors.find(Boolean).message ?? 'Environment capture failed');
+    await bridge.whenIdle();
+    return cube;
+  } catch (error) { cube?.destroy(); throw error; }
+  finally { bridge.dispose(); face?.destroy(); depth?.destroy(); }
 }
 
 // Binary32 -> binary16, round-to-nearest/ties-to-even. Overflow rejects rather
@@ -118,7 +204,7 @@ export async function createGpuThreeEnvironment(device, texture, {
   if (shape.sourceBytes + plan.textureBytes + plan.uniformBytes > maxBytes)
     fail('LIMIT', 'Panorama, filter uniforms and output maps exceed the old-plus-new budget');
   if (signal?.aborted) fail('ABORTED', 'Environment preparation was aborted');
-  const pixels = capture(shape), lifetime = new AbortController();
+  const pixels = shape.capture ? null : capture(shape), lifetime = new AbortController();
   let input = null, map = null, terminal = null, disposed = false, rejectStop;
   const stopped = new Promise((_, reject) => { rejectStop = reject; }); stopped.catch(() => {});
   function release() {
@@ -144,15 +230,23 @@ export async function createGpuThreeEnvironment(device, texture, {
   device.lost.then(info => stop(new ThreeEnvironmentError('DEVICE', info?.message ?? 'GPU device lost')), stop);
   try {
     if (signal?.aborted) onAbort(); check();
-    device.pushErrorScope('out-of-memory'); device.pushErrorScope('validation');
-    let error;
-    try {
-      input = device.createTexture({label: 'f3d-source-environment', size: [shape.width, shape.height, 1],
-        dimension: '2d', format: 'rgba16float', mipLevelCount: 1, sampleCount: 1, usage: 2 | 4});
-      device.queue.writeTexture({texture: input}, pixels, {bytesPerRow: shape.width * 8}, [shape.width, shape.height, 1]);
-    } catch (cause) { error = cause; }
-    const validation = device.popErrorScope(), oom = device.popErrorScope();
-    const errors = await Promise.race([Promise.all([validation, oom]), stopped]);
+    let error, errors = [];
+    if (shape.capture) {
+      const capturing = renderSceneCapture(device, shape, three, lifetime.signal).then(value => {
+        if (disposed || terminal) { value.destroy(); throw terminal ?? new ThreeEnvironmentError('DISPOSED', 'Environment is disposed'); }
+        input = value; return value;
+      });
+      await Promise.race([capturing, stopped]);
+    } else {
+      device.pushErrorScope('out-of-memory'); device.pushErrorScope('validation');
+      try {
+        input = device.createTexture({label: 'f3d-source-environment', size: [shape.width, shape.height, 1],
+          dimension: '2d', format: 'rgba16float', mipLevelCount: 1, sampleCount: 1, usage: 2 | 4});
+        device.queue.writeTexture({texture: input}, pixels, {bytesPerRow: shape.width * 8}, [shape.width, shape.height, 1]);
+      } catch (cause) { error = cause; }
+      const validation = device.popErrorScope(), oom = device.popErrorScope();
+      errors = await Promise.race([Promise.all([validation, oom]), stopped]);
+    }
     if (error) throw error;
     if (errors.some(Boolean)) fail('DEVICE', errors.find(Boolean).message ?? 'HDR upload failed');
     check();

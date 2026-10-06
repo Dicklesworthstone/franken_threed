@@ -421,8 +421,11 @@ export function rendererRoutePlugin({ targets }) {
       return (
         `export * from ${upstream};\n` +
         `import * as F3D_THREE from ${upstream};\n` +
-        `import { ${factory} } from ${JSON.stringify(THREE_RENDERER_URL)};\n` +
-        `export const ${name} = ${factory}(F3D_THREE, { exactBackend: F3D_THREE.${name} });\n`
+        `import { ${factory}, createPMREMGeneratorClass } from ${JSON.stringify(THREE_RENDERER_URL)};\n` +
+        `export const ${name} = ${factory}(F3D_THREE, { exactBackend: F3D_THREE.${name} });\n` +
+        // PMREM needs renderer internals; new-backend renderers get the
+        // environment-capture substitute, any other renderer the upstream class.
+        `export const PMREMGenerator = createPMREMGeneratorClass(F3D_THREE, { exactBackend: F3D_THREE.PMREMGenerator });\n`
       );
     },
     api: {

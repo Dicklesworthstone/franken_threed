@@ -8,6 +8,8 @@ export async function run(THREE, createRenderer) {
   try {
     const renderer = createRenderer(canvas);
     renderer.setPixelRatio(1); renderer.setSize(320, 240, false);
+    // WebGPU apps initialize before PMREM/compute work; WebGLRenderer has no init().
+    if (typeof renderer.init === 'function' && !renderer.isWebGLRenderer) await renderer.init();
     const { scene, camera } = scenarios[name](THREE, renderer);
     await renderer.setAnimationLoop(() => {
       try {

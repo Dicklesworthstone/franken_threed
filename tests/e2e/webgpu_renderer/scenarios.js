@@ -1,6 +1,7 @@
 // Deterministic source scenes shared by the routed WebGPURenderer build and the
 // pinned upstream WebGLRenderer reference. Each receives the page's own THREE
 // namespace; nothing here depends on which renderer executes it.
+import { RoomEnvironment } from '../../../upstream/three.js/examples/jsm/environments/RoomEnvironment.js';
 export const scenarios = {
   standard_lights(THREE) {
     const scene = new THREE.Scene();
@@ -144,6 +145,18 @@ export const scenarios = {
     const base = quad(0.9, -0.5, 0x222222, {});
     base.scale.set(1.6, 1, 1);
     quad(0.9, -0.5, 0xffffff, { polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -4 }).scale.set(0.5, 0.5, 1);
+    return { scene, camera: camera(THREE) };
+  },
+  room_environment(THREE, renderer) {
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x303030);
+    const pmrem = new THREE.PMREMGenerator(renderer);
+    scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+    const metal = new THREE.Mesh(new THREE.SphereGeometry(0.6, 48, 24), new THREE.MeshStandardMaterial({ color: 0xffffff, metalness: 1, roughness: 0.3 }));
+    metal.position.x = -0.75;
+    const plastic = new THREE.Mesh(new THREE.TorusKnotGeometry(0.35, 0.12, 96, 16), new THREE.MeshStandardMaterial({ color: 0xcc4422, roughness: 0.6 }));
+    plastic.position.x = 0.8;
+    scene.add(metal, plastic);
     return { scene, camera: camera(THREE) };
   },
   normal_material(THREE) {
