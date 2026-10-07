@@ -422,6 +422,25 @@ export const scenarios = {
     scene.add(box);
     return { scene, camera: camera(THREE, [0, 0, 3]) };
   },
+  // WebGLRenderer in-shader tone mapping (per material, before blending and
+  // sRGB encoding): ACES with a transparent blend and a toneMapped:false draw.
+  shaderlib_tone_mapping(THREE, renderer) {
+    renderer.toneMapping = THREE.ACESFilmicToneMapping; renderer.toneMappingExposure = 1.4;
+    renderer.shadowMap.enabled = true;
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x203040);
+    const floor = new THREE.Mesh(new THREE.PlaneGeometry(6, 6), new THREE.MeshStandardMaterial({ color: 0xbbbbbb, roughness: 0.8 }));
+    floor.rotation.x = -Math.PI / 2; floor.position.y = -0.6; floor.receiveShadow = true;
+    const hot = new THREE.Mesh(new THREE.SphereGeometry(0.4, 40, 20), new THREE.MeshStandardMaterial({ color: 0xff8844, emissive: 0xff4400, emissiveIntensity: 2, roughness: 0.3 }));
+    hot.position.set(-0.7, 0, 0); hot.castShadow = true;
+    const glass = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.7, 0.7), new THREE.MeshPhongMaterial({ color: 0x66aaff, transparent: true, opacity: 0.5, shininess: 80 }));
+    glass.position.set(0.5, 0, 0.3); glass.rotation.set(0.3, 0.5, 0); glass.castShadow = true;
+    const flat = new THREE.Mesh(new THREE.PlaneGeometry(0.6, 0.6), new THREE.MeshBasicMaterial({ color: 0xffffff, toneMapped: false }));
+    flat.position.set(0.9, 0.7, -0.6);
+    const sun = new THREE.DirectionalLight(0xffffff, 3); sun.position.set(1, 3, 2); sun.castShadow = true; sun.shadow.mapSize.set(512, 512);
+    scene.add(floor, hot, glass, flat, sun, new THREE.HemisphereLight(0x8899ff, 0x332211, 1.2));
+    return { scene, camera: camera(THREE, [0, 1, 3.2]) };
+  },
   // MeshPhysicalMaterial extensions via ShaderLib programs (WebGL surface), and a
   // nearest-sampled float32 DataTexture read by a ShaderMaterial.
   shaderlib_physical(THREE) {

@@ -281,13 +281,13 @@ export async function createGpuThreeScene(device,scene,{
         if(shadowBlend==='reject'&&source.some(m=>m?.transparent))fail('SHADOW','BLEND casters require the explicit shadow.blend:skip policy');
       }
     }
-    if((!fogEnabled&&scene.fog!==null)||(!environmentEnabled&&scene.environment!==null)||(!backgroundEnabled&&!programBackgroundOwned&&sourceBackground()!==null))
+    if((!fogEnabled&&scene.fog!==null)||(!environmentEnabled&&scene.environment!==null&&!programEnvironmentOwned())||(!backgroundEnabled&&!programBackgroundOwned&&sourceBackground()!==null))
       fail('SCENE','Enable source fog:{}, environment:{} or background:{} for the corresponding source effect');
     if(backgroundEnabled&&sourceBackground()!==null){
       backgroundApi.inspectThreeBackground(sourceBackground(),three,backgroundOptions);
       backgroundApi.inspectThreeBackgroundState(scene);
     }
-    if(environmentEnabled&&scene.environment!==null)environmentApi.inspectThreeEnvironment(scene.environment,three,environmentOptions);
+    if(coreEnvironment()!==null)environmentApi.inspectThreeEnvironment(scene.environment,three,environmentOptions);
     if(shadowEnabled){
       if(scene.overrideMaterial!==null)fail('SHADOW','Source shadow mode does not infer overrideMaterial depth semantics');
       shadowLight(nodes);
@@ -298,7 +298,7 @@ export async function createGpuThreeScene(device,scene,{
     if(!shadowEnabled||!programRoute()||!programSupport.createShadows)return false;
     const lights=nodes.filter(o=>o.isLight&&o.castShadow);
     if(!lights.length)return false;
-    if(programShadowSticky||lights.length>1)return true;
+    if(programShadowSticky||lights.length>1||programToneMapping())return true;
     try{shadowApi.inspectThreeShadow(lights[0],three);return false;}
     catch(error){if(String(error?.code).startsWith('THREE_SHADOW_'))return true;throw error;}
   }
@@ -412,6 +412,22 @@ export async function createGpuThreeScene(device,scene,{
   // Program route on the WebGL surface: ShaderMaterial, and ShaderLib programs
   // for built-in materials (WebGLRenderer's own GLSL) where the core lacks a feature.
   const programRoute=()=>!!programSupport&&renderOptions.outputTransfer==='srgb';
+  // WebGLRenderer tone-maps inside each material's shader (toneMapped), before
+  // blending and sRGB encoding. With tone mapping on the shader-encoded path,
+  // every draw is its ShaderLib program; anything else is a TONE_MAPPING error
+  // (the facade then keeps its whole-image output pass instead).
+  const programToneMapping=()=>programRoute()&&(programSupport.state?.().toneMapping??three.NoToneMapping)!==three.NoToneMapping;
+  // scene.environment read by programs through r186 PMREM instead of the core's
+  // panorama owner: always under in-shader tone mapping, otherwise when the core
+  // owner cannot take the source.
+  function programEnvironmentOwned(){
+    const env=scene.environment;
+    if(!programRoute()||!env||env.isF3DSceneEnvironment===true)return false;
+    if(programToneMapping()||!environmentEnabled)return true;
+    try{environmentApi.inspectThreeEnvironment(env,three,environmentOptions);return false;}
+    catch(error){if(String(error?.code).startsWith('THREE_ENVIRONMENT_'))return true;throw error;}
+  }
+  const coreEnvironment=()=>environmentEnabled&&!programEnvironmentOwned()?scene.environment:null;
   let programCamera=null;
   /** WebGLRenderer light collection order: depth-first, visible, camera layers. */
   function programLightList(camera){
@@ -451,6 +467,7 @@ export async function createGpuThreeScene(device,scene,{
   const shadowControls=()=>programSupport.state?.().shadowMap??{enabled:true,autoUpdate:true,needsUpdate:false,type:three.PCFShadowMap};
   const shadowRenderer=()=>programSupport.state?.().renderer??null;
   const castingLights=camera=>programLightList(camera).filter(l=>l.castShadow);
+  const shadowBoundary=error=>{if(error?.code==='THREE_PROGRAM_SHADOW_PREPARE')fail('PREPARE',error.message);throw error;};
   // WebGLClipping inputs for programs: the source Plane objects, not snapshots.
   const programClippingControls=()=>clippingEnabled?{planes:clippingValue(clipping,'planes',[]),localClippingEnabled:clippingValue(clipping,'localClippingEnabled',false)===true}:null;
   const pmrem=()=>pmremOwner??=(programSupport.createPMREM?.(device,t=>textureBinding(t))??fail('MATERIAL','PMREM environments need the program PMREM owner'));
@@ -460,6 +477,9 @@ export async function createGpuThreeScene(device,scene,{
   let bgRotation=null,bgFlip=null;
   function programBackground(){
     if(!programBackgroundOwned)return null;
+    return programToneMapping()?toneMappedProgram(programBackgroundMesh):programBackgroundMesh();
+  }
+  function programBackgroundMesh(){
     bgRotation??=new three.Matrix4();bgFlip??=new three.Matrix3().set(-1,0,0,0,1,0,0,0,1);
     let background=scene.background;
     if(!background?.isTexture)return null;
@@ -546,14 +566,25 @@ export async function createGpuThreeScene(device,scene,{
       return {options,values:{},structural,clipped:null,program:compiled,programTextures:sourceTextures,programSide:side,programEnv:{envMap,envMapRotation}};
     });
   }
+  /** Under in-shader tone mapping a draw the program route cannot take is a
+   * TONE_MAPPING error: the facade keeps its whole-image output pass instead. */
+  function toneMappedProgram(build){
+    try{return build();}
+    catch(error){
+      if(error?.code==='THREE_SCENE_PREPARE'||error?.code==='THREE_SCENE_LIMIT'||error?.code==='THREE_SCENE_TONE_MAPPING')throw error;
+      throw new ThreeSceneError('TONE_MAPPING',`In-shader tone mapping needs every draw on the program route: ${error.message}`);
+    }
+  }
   function materialDescription(m,clippingFrame,topology='triangles',object=null){
     if(m?.isShaderMaterial)return programDescription(m,topology,object);
     if(object&&programRoute()&&programSupport.shaderLibMaterial(m)){
       // GL point sizes need the program route; elsewhere the core path renders
       // what it admits and the ShaderLib program covers what it rejects.
       if(m.isPointsMaterial)return programDescription(m,topology,object);
+      if(programToneMapping())return toneMappedProgram(()=>programDescription(m,topology,object));
       // Program shadow maps are only read by programs: every receiver draws one.
       if(programShadowMode&&programSupport.needsLights(m))return programDescription(m,topology,object);
+      if(programEnvironmentOwned()&&(m.isMeshStandardMaterial||m.isMeshLambertMaterial||m.isMeshPhongMaterial))return programDescription(m,topology,object);
       try{return coreDescription(m,clippingFrame,topology);}
       catch(error){
         if(error?.code!=='THREE_SCENE_MATERIAL'&&error?.code!=='THREE_SCENE_TEXTURE')throw error;
@@ -564,6 +595,7 @@ export async function createGpuThreeScene(device,scene,{
     return coreDescription(m,clippingFrame,topology);
   }
   function coreDescription(m,clippingFrame,topology='triangles'){
+    if(programToneMapping())fail('TONE_MAPPING',`In-shader tone mapping needs every draw on the program route: ${m?.type}`);
     const shading=models.get(Object.getPrototypeOf(m));
     if(!shading)fail('MATERIAL',`Unsupported source material: ${m?.type}`);
     const primitive=m.isLineBasicMaterial?'line':m.isPointsMaterial?'point':'surface';
@@ -838,7 +870,7 @@ export async function createGpuThreeScene(device,scene,{
       preparedShadowMode=programShadowMode;
       if(programShadowMode){
         const camera=programCamera??new three.Camera();
-        await Promise.race([programShadows().prepare(castingLights(programCamera),scene,camera,shadowControls(),shadowRenderer()),stopped]);live();
+        await Promise.race([programShadows().prepare(castingLights(programCamera),scene,camera,shadowControls(),shadowRenderer()),stopped]).catch(shadowBoundary);live();
       }
       // PMREM sources are owned textures now; generate their cube-UV targets
       // before the descriptions that bind them.
@@ -848,7 +880,7 @@ export async function createGpuThreeScene(device,scene,{
       const shadowSignature=selected?shadowApi.inspectThreeShadow(selected,three).signature:null;
       const selectedBackground=backgroundEnabled?sourceBackground():null;
       const backgroundSignature=selectedBackground?backgroundApi.inspectThreeBackground(selectedBackground,three,backgroundOptions).signature:null;
-      const selectedEnvironment=environmentEnabled?scene.environment:null;
+      const selectedEnvironment=coreEnvironment();
       const environmentSignature=selectedEnvironment?environmentApi.inspectThreeEnvironment(selectedEnvironment,three,environmentOptions).signature:null;
       for(const item of request){
         live();let gpu,signature,deformation=null;
@@ -1029,7 +1061,7 @@ export async function createGpuThreeScene(device,scene,{
         nextShadow?.check();
       }
       if(environmentEnabled){
-        const current=scene.environment;
+        const current=coreEnvironment();
         if(current!==selectedEnvironment||(current&&!same(environmentSignature,environmentApi.inspectThreeEnvironment(current,three,environmentOptions).signature)))
           fail('CHANGED','Source environment changed during preparation');
         nextEnvironment?.check();
@@ -1097,7 +1129,7 @@ export async function createGpuThreeScene(device,scene,{
       }
       let environmentFrame=null;
       if(environmentEnabled){
-        if(scene.environment!==(environmentOwner?.source??null))fail('PREPARE','Call prepare() after changing the source environment');
+        if(coreEnvironment()!==(environmentOwner?.source??null))fail('PREPARE','Call prepare() after changing the source environment');
         environmentOwner?.check();
         environmentFrame=environmentApi.threeEnvironmentDescriptor(environmentOwner,scene,three);
       }
@@ -1219,7 +1251,7 @@ export async function createGpuThreeScene(device,scene,{
       // then setupLights() reads their state; depth passes submit after uploads.
       let submitShadows=null;
       if(programShadowMode){
-        submitShadows=programShadows().render(castingLights(camera),scene,camera,shadowControls(),shadowRenderer());
+        try{submitShadows=programShadows().render(castingLights(camera),scene,camera,shadowControls(),shadowRenderer());}catch(error){shadowBoundary(error);}
         programSupport.setLights(programLightList(camera));programSupport.setLightsView(camera);
       }
       textureOwner?.update(frameTextures);

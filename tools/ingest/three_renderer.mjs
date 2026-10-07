@@ -299,7 +299,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         this._ownsDevice = true;
       }
       this._preferredFormat = (defaultGpu ?? globalThis.navigator?.gpu)?.getPreferredCanvasFormat?.();
-      await this._createSession(this._toneMapping() !== 'none');
+      await this._createSession(this._wantsHdr(this._toneMapping()));
       if (this._disposed) { this._release(); fail('DISPOSED', 'Renderer was disposed during initialization'); }
       this._initialized = true;
       return this;
@@ -329,6 +329,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       if (this._ownsDevice) { this._ownsDevice = false; this._device?.destroy(); }
     }
 
+    /** The whole-image tone-mapping output pass. WebGLRenderer (shader-encoded
+     * output) tone-maps inside each material's program instead, unless a scene
+     * needed a draw the program route cannot take (sticky fallback). */
+    _wantsHdr(tone) { return tone !== 'none' && (!this._shaderEncodedOutput || this._hdrFallback === true); }
     _toneMapping() {
       const name = TONE_MAPPINGS.get(this.toneMapping);
       if (name === undefined) fail('UNSUPPORTED', `Tone mapping ${this.toneMapping} has no admitted output pass`);
@@ -422,7 +426,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       const tone = this._toneMapping();
       // Switching between direct and tone-mapped output rebuilds the canvas
       // session (same device) at the next preparation boundary.
-      this._rebuild = (tone !== 'none') !== this._hdr;
+      this._rebuild = this._wantsHdr(tone) !== this._hdr;
       const clear = this.autoClear === true;
       const color = this._clearColor, a = this._clearAlpha;
       // Source Background semantics: the renderer clear color is premultiplied
@@ -523,9 +527,9 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     async _drainPending() {
       await this.init();
       for (let rounds = 0; this._pending.length; rounds++) {
-        if (rounds > 8) fail('PREPARE', 'Source structure kept changing during preparation');
+        if (rounds > 8) fail('PREPARE', 'Source structure kept changing during preparation' + (this._lastPrepareError ? ': ' + this._lastPrepareError : ''));
         if (this._rebuild) {
-          const hdr = this._toneMapping() !== 'none';
+          const hdr = this._wantsHdr(this._toneMapping());
           this._session.dispose();
           await this._createSession(hdr);
           this._rebuild = false;
@@ -548,6 +552,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
             this._submit(request);
           } catch (error) {
             if (!isPrepareBoundary(error)) throw error;
+            this._lastPrepareError = error.message;
             // Keep source order: this request and every later one wait again.
             this._pending = [...batch.slice(i), ...this._pending];
             break;
@@ -571,7 +576,17 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     /** Serialized preparation: overlapping compileAsync/deferred frames share one queue. */
     _prepare() {
       const run = (this._preparing ?? Promise.resolve()).catch(() => {}).then(async () => {
-        await this._session.prepare();
+        try { await this._session.prepare(); }
+        catch (error) {
+          // In-shader tone mapping needs every draw on the program route; a scene
+          // with another draw keeps the whole-image output pass from now on.
+          if (error?.code !== 'THREE_SCENE_TONE_MAPPING' || this._hdrFallback === true) throw error;
+          this._hdrFallback = true;
+          this._session.dispose();
+          await this._createSession(this._wantsHdr(this._toneMapping()));
+          this._rebuild = false;
+          await this._session.prepare();
+        }
         this.info.f3d.preparations++;
       });
       this._preparing = run;

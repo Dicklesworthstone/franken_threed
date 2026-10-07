@@ -184,6 +184,20 @@ upstream WebGLRenderer (0.06% / 0% of pixels differ); `webgl_materials_envmaps`,
 `webgl_materials_blending`, `webgl_effects_stereo` run. Equirectangular
 backgrounds without blur need `WebGLCubeRenderTarget` conversion (explicit error).
 
+Tone mapping (WebGL surface): r186 WebGLRenderer tone-maps inside each
+`toneMapped` material's program, before blending and sRGB encoding, not with a
+whole-image pass. With `renderer.toneMapping` set, the WebGL facade now keeps
+its direct shader-encoded canvas and every draw is its ShaderLib program
+(shadows, scene.environment through PMREM, backgrounds included); a scene with
+a draw the program route cannot take (e.g. skinned or morphed meshes) raises
+`THREE_SCENE_TONE_MAPPING` and the renderer falls back, from then on, to the
+previous HDR target plus output pass (an approximation for blended and
+`toneMapped: false` draws). Scenario `shaderlib_tone_mapping` (ACES, exposure,
+transparent blend, `toneMapped: false`, shadows) matches upstream
+WebGLRenderer exactly (0 differing pixels); `webgl_lights_physical`,
+`webgl_loader_gltf_variants`, `webgl_loader_gltf_instancing`,
+`webgl_loader_texture_ultrahdr` now run.
+
 Not admitted yet (explicit errors): transmission (needs its render target),
 render-target PMREM sources (`pmremVersion`), pre-filtered cube-UV textures
 supplied directly, Sprite materials.

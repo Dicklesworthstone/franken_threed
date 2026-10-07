@@ -257,8 +257,10 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
     for (const light of lights) {
       if (light.shadow === undefined || !light.shadow.map) continue;
       const pending = [];
-      casters(scene, camera, light, type, null, (object, material) => pending.push([object, getDepthMaterial(object, material, light, type, renderer)]));
-      for (const [object, depthMaterial] of pending) await recordFor(depthMaterial, object);
+      casters(scene, camera, light, type, null, (object, material) => pending.push([object, material]));
+      // The shared depth/distance material is re-stated per caster (as each
+      // render does) right before its record captures program and bindings.
+      for (const [object, material] of pending) await recordFor(getDepthMaterial(object, material, light, type, renderer), object);
     }
   }
 
@@ -332,7 +334,6 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
   const updated = new Set();
   function draw(object, depthMaterial, group, shadowCamera) {
     const entry = recordForSync(depthMaterial, object);
-    if (!updated.has(entry.gpu)) { entry.gpu.update({maxAdditionalBytes: maxGeometryBytes}); updated.add(entry.gpu); }
     const reflection = entry.record.reflection, bytes = new Uint8Array(reflection.uniformBufferSize);
     const uniforms = refresh(depthMaterial);
     const clip = support.clippingState(clipping(), depthMaterial, shadowCamera, {shadows: true});
@@ -350,6 +351,8 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
     const compiled = compile(depthMaterial, object);
     const source = sourceOf(object), gpu = geometries.get(source)?.get(compiled.attributesKey);
     if (!gpu) fail('PREPARE', 'A shadow caster geometry needs prepare()');
+    // Same state as preparation: current residency before its layout signature.
+    if (!updated.has(gpu)) { gpu.update({maxAdditionalBytes: maxGeometryBytes}); updated.add(gpu); }
     const geometry = support.geometrySnapshot(gpu, device);
     const uniforms = refresh(depthMaterial), textures = textureBindings(compiled.program.reflection, uniforms);
     const raster = support.raster(depthMaterial, {side: depthMaterial.side});
