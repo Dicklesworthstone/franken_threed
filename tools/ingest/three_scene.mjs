@@ -215,12 +215,21 @@ export async function createGpuThreeScene(device,scene,{
     }
     return materials.get(m).epoch;
   }
+  const programDeformed=new WeakSet();
   function geometryAdmission(g,object){
     const programs=(Array.isArray(object.material)?object.material:[object.material]).every(m=>m?.isShaderMaterial);
     if(!(g instanceof three.BufferGeometry)||(g.isInstancedBufferGeometry&&!programs))fail('GEOMETRY','Expected source BufferGeometry');
     // Program-drawn skinned meshes (in-shader tone mapping) skin in their own program.
-    if(hasThreeDeformation(object)&&!programToneMapping())
-      inspectThreeDeformation(object,{...deformationOptions,three});
+    if(hasThreeDeformation(object)&&!programToneMapping()){
+      try{inspectThreeDeformation(object,{...deformationOptions,three});}
+      catch(error){
+        // WebGL surface: what the core deformer refuses, the object's ShaderLib
+        // program skins/morphs itself (r186 shader path).
+        const list=Array.isArray(object.material)?object.material:[object.material];
+        if(!String(error?.code).startsWith('THREE_DEFORMATION_')||!programRoute()||!list.every(m=>!m||programCapable(m)))throw error;
+        programDeformed.add(object);
+      }
+    }
     const owners=new Set(Object.values(g.attributes).map(a=>a.isInterleavedBufferAttribute?a.data:a));
     if(g.index)owners.add(g.index);
     if(!Array.isArray(g.groups)||g.groups.length>maxNodes)fail('LIMIT','Geometry group capacity exceeded');
@@ -370,6 +379,9 @@ export async function createGpuThreeScene(device,scene,{
     let binding;
     const generated=pmremOwner?.binding(t)??programShadowOwner?.binding(t)??morphBinding(t);
     if(generated)return generated;
+    // Shadow-map depth textures belong to the program shadow owner, which binds
+    // them after preparing its maps; a scan only needs a stand-in.
+    if(t?.isDepthTexture&&textureScan)return placeholderBinding();
     if(textures.has(t)){
       binding=textures.get(t);
       if(!binding?.view||!binding.sampler||binding.version!==t.version||binding.sourceVersion!==t.source.version)
@@ -393,7 +405,7 @@ export async function createGpuThreeScene(device,scene,{
   const programVariant=object=>{
     const a=object.geometry.attributes;
     return [object.isInstancedMesh===true,object.isInstancedMesh===true&&object.instanceColor!==null,!!a.normal,a.color?.itemSize??0,!!a.uv1,!!a.uv2,!!a.uv3,
-      object.geometry.index?.array.constructor.name??'',object.isSkinnedMesh===true,
+      object.geometry.index?.array.constructor.name??'',object.isSkinnedMesh===true?'skin:'+object.id:'',
       ...['position','normal','color'].map(k=>a&&object.geometry.morphAttributes[k]?.length||0)].join(',');
   };
   // The attribute source a program reads: the geometry, or for InstancedMesh a
@@ -410,7 +422,9 @@ export async function createGpuThreeScene(device,scene,{
     }
     return view;
   }
-  const programKeyOf=object=>object.isInstancedMesh?object:object.geometry;
+  // Per-object program resources (instance streams, a skeleton's bone texture)
+  // make the object the record key.
+  const programKeyOf=object=>object.isInstancedMesh||object.isSkinnedMesh?object:object.geometry;
   const programCapable=m=>m?.isShaderMaterial===true||(programRoute()&&programSupport.shaderLibMaterial(m));
   // Program route on the WebGL surface: ShaderMaterial, and ShaderLib programs
   // for built-in materials (WebGLRenderer's own GLSL) where the core lacks a feature.
@@ -616,7 +630,7 @@ export async function createGpuThreeScene(device,scene,{
         if(texture!=null&&!(texture instanceof three.Texture))fail('TEXTURE',`Uniform ${t.name} is not a texture`);
         if(texture&&(t.dimension==='cube')!==(texture.isCubeTexture===true))fail('TEXTURE',`Uniform ${t.name} texture dimension differs from its sampler`);
         const shadowMap=!!texture&&!!programShadowOwner?.binding(texture);
-        if(texture&&(t.dimension==='3d'||(t.dimension==='2d-array'&&texture.isF3DMorphTexture!==true)||(t.comparison&&!shadowMap)))fail('TEXTURE',`Sampler ${t.glslType} textures are not admitted yet`);
+        if(texture&&(t.dimension==='3d'||(t.dimension==='2d-array'&&texture.isF3DMorphTexture!==true)||(t.comparison&&!shadowMap&&!textureScan)))fail('TEXTURE',`Sampler ${t.glslType} textures are not admitted yet`);
         // A shadow sampler without a rendered map (r186 binds an incomplete unit).
         if(!texture&&!textureScan&&/Shadow/.test(t.glslType))fail('SHADOW',`Shadow map ${t.name} was never rendered`);
         const binding=texture?textureBinding(texture):placeholderBinding();
@@ -645,6 +659,7 @@ export async function createGpuThreeScene(device,scene,{
       // what it admits and the ShaderLib program covers what it rejects.
       if(m.isPointsMaterial)return programDescription(m,topology,object);
       if(programToneMapping())return toneMappedProgram(()=>programDescription(m,topology,object));
+      if(programDeformed.has(object))return programDescription(m,topology,object);
       // Program shadow maps are only read by programs: every receiver draws one.
       if(programShadowMode&&programSupport.needsLights(m))return programDescription(m,topology,object);
       if(programEnvironmentOwned()&&(m.isMeshStandardMaterial||m.isMeshLambertMaterial||m.isMeshPhongMaterial))return programDescription(m,topology,object);
@@ -912,7 +927,15 @@ export async function createGpuThreeScene(device,scene,{
     for(const [source,gpu] of instances)if(!usedInstances.has(source)){gpu.dispose();instances.delete(source);}
     for(const [m,state] of materials)if(!usedMaterials.has(m)){m.removeEventListener('dispose',state.listener);materials.delete(m);}
   }
+  /** One retry per mesh the core deformer refused at capture: the next pass
+   * describes it as its ShaderLib program. */
   async function prepare(){
+    for(let attempt=0;;attempt++){
+      try{return await prepareOnce();}
+      catch(error){if(error?.code!=='THREE_SCENE_DEFORMATION_ROUTE'||attempt>=8)throw error;}
+    }
+  }
+  async function prepareOnce(){
     live();if(busy)fail('REENTRANT','A source-scene operation is already running');busy=true;preparing=true;
     const created=[],added=[],addedInstances=[],createdDeformations=[],nextDeformations=new Map(),createdCasters=[];
     let nextShadow=shadowOwner,nextEnvironment=environmentOwner,nextBackground=backgroundOwner;
@@ -977,8 +1000,16 @@ export async function createGpuThreeScene(device,scene,{
             else{
               const available=maxDeformationBytes-deformationBytes();
               if(available<1)fail('LIMIT','Deformation replacement exceeds the old-plus-new GPU budget');
-              deformation=await createGpuThreeDeformation(device,item.deformationSource,{...deformationOptions,three,
-                maxBytes:available,signal:deformationLifetime.signal,cache:deformationInputs});
+              try{deformation=await createGpuThreeDeformation(device,item.deformationSource,{...deformationOptions,three,
+                maxBytes:available,signal:deformationLifetime.signal,cache:deformationInputs});}
+              catch(error){
+                // Data the core deformer refuses at capture (e.g. a non-affine
+                // inverse bind): the object's ShaderLib program takes it instead.
+                const object=item.deformationSource,list=Array.isArray(object.material)?object.material:[object.material];
+                if(!String(error?.code).startsWith('THREE_DEFORMATION_')||!programRoute()||!list.every(m=>!m||programCapable(m)))throw error;
+                programDeformed.add(object);
+                fail('DEFORMATION_ROUTE','A deformed mesh moved to its ShaderLib program');
+              }
               pendingDeformations.add(deformation);createdDeformations.push(deformation);live();
             }
             nextDeformations.set(item.deformationSource,deformation);
