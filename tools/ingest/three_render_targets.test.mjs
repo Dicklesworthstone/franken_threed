@@ -128,3 +128,12 @@ test('device loss cannot turn dead native textures into usable sampling bindings
   assert.throws(() => owner.bindingsFor().get(target.texture), {code: 'THREE_TARGET_GPU'});
   await assert.rejects(owner.whenIdle(), /lost device/); owner.dispose();
 });
+
+test('target bindings retain externally owned ordinary texture bindings', () => {
+  const {owner, target} = fixture(), texture = new T.Texture(), borrowed = {view: {}, sampler: {}};
+  const external = new Map([[texture, borrowed]]), bindings = owner.bindingsFor(null, external);
+  assert.equal(bindings.has(texture), true); assert.equal(bindings.get(texture), borrowed);
+  assert.equal(bindings.has(target.texture), true); assert.ok(bindings.get(target.texture).view);
+  assert.equal(external.size, 1); external.delete(texture); assert.equal(bindings.has(texture), false);
+  owner.dispose();
+});

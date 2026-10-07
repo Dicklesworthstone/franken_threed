@@ -85,6 +85,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
   function retire(entry) {
     if (!entry.alive) return;
     entry.alive = false;
+    entry.lifetime.abort(new ThreeRenderTargetError('STALE', 'Source render target disposed or replaced'));
     entry.target.removeEventListener('dispose', entry.onDispose);
     entry.shape.texture.removeEventListener('dispose', entry.onDispose);
     if (entries.get(entry.target) === entry) entries.delete(entry.target);
@@ -98,7 +99,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     if (entry) return entry;
     if (entries.size >= maxTargets) fail('BUDGET', 'Render target count exceeds maxTargets');
     entry = {target, shape, alive: true, released: false, busy: false, charged: 0, storage: null, sample: null,
-      dirty: true, copies: 0, error: null, validation: Promise.resolve(), _wanted: new Map(), _dispatcher: null};
+      dirty: true, copies: 0, error: null, lifetime: new AbortController(), validation: Promise.resolve(), _wanted: new Map(), _dispatcher: null};
     entry.onDispose = () => retire(entry);
     target.addEventListener('dispose', entry.onDispose);
     shape.texture.addEventListener('dispose', entry.onDispose);
@@ -193,11 +194,12 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
   // The existing scene bridge accepts a Map of externally owned bindings. Its
   // has/get calls always resolve the current target generation, so stale views
   // trigger the bridge's normal re-preparation boundary before submission.
-  function bindingsFor(destination = null) {
+  function bindingsFor(destination = null, retained = new Map()) {
+    if (!(retained instanceof Map)) fail('OPTIONS', 'Expected a Map of borrowed texture bindings');
     return new class extends Map {
-      has(texture) { return texture?.isRenderTargetTexture === true && texture.renderTarget != null; }
+      has(texture) { return (texture?.isRenderTargetTexture === true && texture.renderTarget != null) || retained.has(texture); }
       get(texture) {
-        if (!this.has(texture)) return undefined;
+        if (!(texture?.isRenderTargetTexture === true && texture.renderTarget != null)) return retained.get(texture);
         if (texture.renderTarget === destination) fail('FEEDBACK', 'A render pass cannot sample its own color target');
         const entry = capture(texture.renderTarget);
         if (entry.shape.texture !== texture) fail('STALE', 'Texture no longer belongs to its source target');

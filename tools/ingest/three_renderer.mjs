@@ -22,7 +22,7 @@
  *   `compileAsync(scene, camera)` to prepare ahead of the first frame.
  * - Admission failures discovered during deferred preparation are thrown from
  *   the next `render()`/`compileAsync()` call instead of the original call.
- * - Unsupported source state (render targets, XR presentation, custom tone
+ * - Unsupported source state (advanced render targets, XR presentation, custom tone
  *   mapping, logarithmic/reversed depth, stencil buffers, non-sRGB output,
  *   transparent clears with tone mapping) throws `F3DRendererError` rather than
  *   silently rendering something else.
@@ -30,6 +30,8 @@
 import {createGpuCanvasRenderer} from './gpu_canvas_renderer.mjs';
 import {createGpuHdrCanvasRenderer} from './gpu_hdr_canvas.mjs';
 import {createGpuThreeScene} from './three_scene.mjs';
+import {createThreeRenderTargets, inspectThreeRenderTarget} from './three_render_targets.mjs';
+import {readGpuTargetPixels} from './gpu_target_readback.mjs';
 import {createThreeProgramSupport} from './three_program.mjs';
 import {createThreeProgramPMREM} from './three_program_pmrem.mjs';
 import {createThreeProgramShadows} from './three_program_shadows.mjs';
@@ -95,7 +97,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
   const clippingControls = Object.freeze({planes: Object.freeze([]), localClippingEnabled: true});
 
   /** Multi-scene renderer handed to the owned canvas session. */
-  function createDispatcher(owner) {
+  function createDispatcher(owner, destination = owner) {
     return (device, attachments, {signal}) => {
       const entries = new Map();
       let disposed = false;
@@ -115,7 +117,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           return entry;
         },
         async prepare() {
-          for (const [scene, key] of owner._wanted) {
+          for (const [scene, key] of destination._wanted) {
             const clipping = needsClipping(scene) || owner._needsGlobalClipping?.() === true;
             const previous = entries.get(scene);
             if (previous && previous.key === key && (previous.clipping || !clipping) && !previous.bridge.failed) {
@@ -136,14 +138,15 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
               // device-scale default (1 GiB) rather than the bridge's 128 MiB.
               texture: {maxTextureBytes: 1024 * 1024 * 1024},
               ...sceneLimits, three: THREE, signal, maxBindings,
+              textures: owner._targets.bindingsFor(destination === owner ? null : destination.target, sceneLimits.textures),
               renderer: {...attachments, instancing: true, renderBundles: true, maxDraws,
-                ...(owner._hdr || !owner._shaderEncodedOutput ? {} : {outputTransfer: 'srgb'})},
+                ...(destination !== owner || owner._hdr || !owner._shaderEncodedOutput ? {} : {outputTransfer: 'srgb'})},
               textureTransforms: true, alphaMaps: true,
               // ShaderMaterial programs (WebGLRenderer semantics) on the WebGL surface.
-              program: owner._shaderEncodedOutput && !owner._hdr ? owner._programSupport ??= createThreeProgramSupport({three: THREE, pmrem: createThreeProgramPMREM, shadows: createThreeProgramShadows,
+              program: destination === owner && owner._shaderEncodedOutput && !owner._hdr ? owner._programSupport ??= createThreeProgramSupport({three: THREE, pmrem: createThreeProgramPMREM, shadows: createThreeProgramShadows,
                 state: () => ({toneMapping: owner.toneMapping, toneMappingExposure: owner.toneMappingExposure, outputColorSpace: owner.outputColorSpace,
                   pixelRatio: owner._pixelRatio, height: owner._height, shadowMap: owner.shadowMap, shadowMapType: owner.shadowMap.type, renderer: owner,
-                  floatLinear: device.features?.has?.('float32-filterable') === true})}) : null,
+                  floatLinear: device.features?.has?.('float32-filterable') === true, ...owner._programFrame})}) : null,
               fog: scene.fog ? {} : null, environment: scene.environment ? {} : null,
               background: background ? {} : null,
               shadow: owner.shadowMap.enabled ? {} : null,
@@ -167,7 +170,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           entries.clear();
         },
       };
-      owner._dispatcher = dispatcher;
+      destination._dispatcher = dispatcher;
       return dispatcher;
     };
   }
@@ -225,7 +228,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           'readbackBuffersSize', 'renderTargets', 'storageAttributes', 'storageAttributesSize', 'textures', 'texturesSize',
           'uniformBuffers', 'uniformBuffersSize', 'total'].map(key => [key, 0])),
         // F3D's own namespace: native submissions are not source draw counts.
-        f3d: {route: 'general-webgpu', deferredRenders: 0, presentedRenders: 0, nativeDrawCalls: 0, preparations: 0},
+        f3d: {route: 'general-webgpu', deferredRenders: 0, presentedRenders: 0, offscreenRenders: 0, nativeDrawCalls: 0, preparations: 0},
         reset: () => { this.info.render.drawCalls = 0; this.info.render.frameCalls = 0; this.info.compute.frameCalls = 0; },
         dispose: () => {},
       };
@@ -245,6 +248,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._scissorTest = false;
       this._clearScene = null;
       this._renderTarget = null;
+      this._targetLifetime = new AbortController();
+      this._targets = createThreeRenderTargets(THREE, {getDevice: () => this._device});
       this._initialized = false;
       this._initPromise = null;
       this._session = null;
@@ -336,6 +341,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
             ...(this._shaderEncodedOutput ? {srgbView: false} : {})}});
     }
     _release() {
+      this._targets.dispose();
       this._session?.dispose();
       this._session = null;
       if (this._ownsDevice) { this._ownsDevice = false; this._device?.destroy(); }
@@ -424,53 +430,73 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     getClearStencil() { return this._clearStencil; }
     setClearStencil(stencil) { this._clearStencil = stencil; }
     getRenderTarget() { return this._renderTarget; }
-    setRenderTarget(renderTarget) {
-      if (renderTarget !== null) fail('UNSUPPORTED', 'Offscreen source render targets are not admitted by this renderer yet');
-      this._renderTarget = null;
+    setRenderTarget(renderTarget, activeCubeFace = 0, activeMipmapLevel = 0) {
+      if (activeCubeFace !== 0 || activeMipmapLevel !== 0) fail('UNSUPPORTED', 'Cube faces and target mip levels are not admitted');
+      if (renderTarget !== null) this._targets.capture(renderTarget);
+      this._renderTarget = renderTarget;
+    }
+    readRenderTargetPixelsAsync(target, x, y, width, height, textureIndex = 0, faceIndex = 0) {
+      if (textureIndex !== 0 || faceIndex !== 0) return Promise.reject(new F3DRendererError('UNSUPPORTED', 'Only the 2D color attachment is readable'));
+      return this._readTargetPixels(target, {x, y, width, height});
+    }
+    _readTargetPixels(target, options) {
+      try {
+        if (this._disposed) fail('DISPOSED', 'Renderer is disposed');
+        const destination = this._targets.capture(target);
+        const issue = () => {
+          this._targets.ensure(destination);
+          return readGpuTargetPixels(destination.session, {...options, signal: this._targetLifetime.signal});
+        };
+        // The helper submits its copy before returning the mapping promise.
+        if (this._initialized && !this._drain && !this._preparing) return issue();
+        return new Promise((resolve, reject) => this._enqueue({readback: true, issue, resolve, reject}));
+      } catch (error) { return Promise.reject(error); }
     }
     getContext() { return this._initialized ? this.domElement.getContext('webgpu') : null; }
 
     // ---- frames ----
-    _frame(scene, clearOnly = null) {
-      if (this._renderTarget !== null) fail('UNSUPPORTED', 'Offscreen source render targets are not admitted');
+    _frame(scene, clearOnly = null, target = this._renderTarget) {
+      if (target) inspectThreeRenderTarget(target, THREE);
       if (this.xr.enabled && this.xr.isPresenting) fail('UNSUPPORTED', 'XR presentation is not admitted');
-      if (this.outputColorSpace !== SRGBColorSpace) fail('UNSUPPORTED', 'Only sRGB canvas output is admitted');
+      if (!target && this.outputColorSpace !== SRGBColorSpace) fail('UNSUPPORTED', 'Only sRGB canvas output is admitted');
       const tone = this._toneMapping();
       // Switching between direct and tone-mapped output rebuilds the canvas
       // session (same device) at the next preparation boundary.
-      this._rebuild = this._wantsHdr(tone) !== this._hdr;
+      if (!target) this._rebuild = this._wantsHdr(tone) !== this._hdr;
+      const hdr = !target && this._wantsHdr(tone);
       const clear = this.autoClear === true;
       const color = this._clearColor, a = this._clearAlpha;
       // Source Background semantics: the renderer clear color is premultiplied
       // for alpha canvases; an opaque canvas ignores alpha.
-      const premultiply = this.alpha === true;
+      const premultiply = this.alpha === true && (!target || !this._bottomLeftOrigin);
       const frame = {
         loadOp: (clearOnly ? clearOnly.color : clear && this.autoClearColor) ? 'clear' : 'load',
         depthLoadOp: (clearOnly ? clearOnly.depth : clear && this.autoClearDepth) ? 'clear' : 'load',
-        clearColor: premultiply ? [color.r * a, color.g * a, color.b * a, a] : [color.r, color.g, color.b, 1],
+        clearColor: premultiply ? [color.r * a, color.g * a, color.b * a, a] : [color.r, color.g, color.b, target ? a : 1],
       };
       // Shader-encoded output stores sRGB values: clear with the encoded color
       // (source WebGL Background converts the clear color to the output space).
-      if (this._shaderEncodedOutput && !this._hdr) {
+      if (!target && this._shaderEncodedOutput && !hdr) {
         const encoded = [color.r, color.g, color.b].map(c => c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 0.41666) - 0.055);
         frame.clearColor = premultiply ? [...encoded.map(c => c * a), a] : [...encoded, 1];
       }
       Object.assign(frame, {
         clearDepth: this._clearDepth,
       });
-      const pr = this._pixelRatio, [bufferWidth, bufferHeight] = this._bufferSize();
-      const v = this._viewport, px = this._pixelRound ?? Math.floor;
+      const pr = target ? 1 : this._pixelRatio;
+      const [bufferWidth, bufferHeight] = target ? [target.width, target.height] : this._bufferSize();
+      const v = target ? target.viewport : this._viewport, px = this._pixelRound ?? Math.floor;
       const vx = px(v.x * pr), vw = px(v.z * pr), vh = px(v.w * pr);
       // Program gl_FragCoord (framebuffer) and point-sprite sizes (viewport).
-      if (this._shaderEncodedOutput && !this._hdr) frame.targetSize = [bufferWidth, bufferHeight, vw, vh];
+      if (!target && this._shaderEncodedOutput && !hdr) frame.targetSize = [bufferWidth, bufferHeight, vw, vh];
       // WebGL viewports/scissors use a bottom-left origin; WebGPU's is top-left.
       const vy = this._bottomLeftOrigin ? bufferHeight - px(v.y * pr) - vh : px(v.y * pr);
-      const [minDepth, maxDepth] = this._viewportDepth;
+      const [minDepth, maxDepth] = target ? [0, 1] : this._viewportDepth;
       if (vx !== 0 || vy !== 0 || vw !== bufferWidth || vh !== bufferHeight || minDepth !== 0 || maxDepth !== 1)
         frame.viewport = [vx, vy, vw, vh, minDepth, maxDepth];
-      if (this._scissorTest) {
+      if (target ? target.scissorTest : this._scissorTest) {
         // Source clamping: non-negative and inside the drawing buffer.
-        const sc = this._scissor, rawH = px(sc.w * pr);
+        const sc = target ? target.scissor : this._scissor, rawH = px(sc.w * pr);
         const rawY = this._bottomLeftOrigin ? bufferHeight - px(sc.y * pr) - rawH : px(sc.y * pr);
         const sx = Math.max(0, px(sc.x * pr)), sy = Math.max(0, rawY);
         // WebGPU source: clamp each component to >= 0, then fit inside the buffer.
@@ -481,7 +507,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           sh = Math.max(0, Math.min(rawH + (clip ? Math.min(0, rawY) : 0), bufferHeight - sy));
         if (sx !== 0 || sy !== 0 || sw !== bufferWidth || sh !== bufferHeight) frame.scissor = [sx, sy, sw, sh];
       }
-      if (this._hdr) {
+      if (hdr) {
         if (this.alpha !== true) frame.clearColor[3] = 1;
         frame.output = {toneMapping: tone, exposure: this.toneMappingExposure};
       }
@@ -497,25 +523,39 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this.info.render.calls++;
       this.info.render.frameCalls++;
       // Source timestamp UID shape `<call id>:f<frame>` (Inspector groups by call id).
-      this._inspector.beginRender(`render:${++this._renderUid}:f${this.info.frame}`, scene, camera, null);
+      this._inspector.beginRender(`render:${++this._renderUid}:f${this.info.frame}`, scene, camera, this._renderTarget);
       try { return this._renderFrame(scene, camera); } finally { this._inspector.finishRender(); }
     }
     _renderFrame(scene, camera, clearOnly = null) {
-      const request = {scene, camera, clearOnly, frame: this._frame(scene, clearOnly), key: sceneKey(this, scene)};
-      this._wanted.set(scene, request.key);
-      const entry = this._dispatcher?.entry(scene);
-      if (this._drain || this._rebuild || !entry || entry.key !== request.key) return this._defer(request);
-      try {
-        this._submit(request);
-      } catch (error) {
+      const target = this._renderTarget;
+      const destination = target ? this._targets.capture(target) : this;
+      const c = this._clearColor, a = this._clearAlpha;
+      const request = {scene, camera, clearOnly, destination, frame: this._frame(scene, clearOnly, target),
+        linearClearColor: this.alpha ? [c.r * a, c.g * a, c.b * a, a] : [c.r, c.g, c.b, 1],
+        hdr: !target && this._wantsHdr(this._toneMapping()), key: sceneKey(this, scene),
+        programFrame: {toneMapping: this.toneMapping, toneMappingExposure: this.toneMappingExposure,
+          outputColorSpace: this.outputColorSpace, pixelRatio: this._pixelRatio, height: this._height}};
+      destination._wanted.set(scene, request.key);
+      const entry = destination._dispatcher?.entry(scene);
+      if (this._drain || this._preparing || (destination === this && request.hdr !== this._hdr) || !entry || entry.key !== request.key)
+        return this._defer(request);
+      try { this._submit(request); }
+      catch (error) {
         if (isPrepareBoundary(error) || (error?.code === 'THREE_SCENE_MATERIAL' && !entry.clipping && needsClipping(scene)))
           return this._defer(request);
         throw error;
       }
     }
-    _submit({scene, camera, frame}) {
-      this._session.render({scene, camera}, frame);
-      const d = this._dispatcher.entry(scene)?.lastDiagnostics;
+    _submit({scene, camera, frame, destination, programFrame, deferred = false}) {
+      const previous = this._programFrame;
+      // Immediate source callbacks must still be able to change live program
+      // state. Only deferred calls need the queued renderer-state snapshot.
+      this._programFrame = deferred ? programFrame : undefined;
+      try {
+        if (destination === this) this._session.render({scene, camera}, frame);
+        else this._targets.render(destination, attachments => destination._dispatcher.render({scene, camera}, {...frame, ...attachments}));
+      } finally { this._programFrame = previous; }
+      const d = destination._dispatcher.entry(scene)?.lastDiagnostics;
       if (d) {
         this.info.render.drawCalls += d.sourceDraws;
         this.info.f3d.nativeDrawCalls = d.drawCalls;
@@ -523,96 +563,133 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         memory.geometries = d.geometryCount;
         memory.attributesSize = d.geometryBytes + d.instanceBytes + d.deformationBytes;
         memory.uniformBuffersSize = d.rendererBytes;
-        memory.total = memory.attributesSize + memory.uniformBuffersSize;
+        memory.renderTargets = this._targets.size;
+        memory.total = memory.attributesSize + memory.uniformBuffersSize + this._targets.allocatedBytes;
       }
-      this.info.f3d.presentedRenders++;
+      if (destination === this) this.info.f3d.presentedRenders++;
+      else this.info.f3d.offscreenRenders++;
     }
-    _defer(request) {
-      this.info.f3d.deferredRenders++;
-      // A color clear hides every earlier request on this canvas.
-      if (request.frame.loadOp === 'clear') this._pending = [request];
-      else if (this._pending.length >= MAX_PENDING) fail('LIMIT', 'Too many layered render requests are waiting for preparation');
-      else this._pending.push(request);
-      this._drain ??= this._drainPending().finally(() => { this._drain = null; });
-      this._drain.catch(error => { this._deferredError ??= error; });
+    _defer(request) { request.deferred = true; this.info.f3d.deferredRenders++; this._enqueue(request); }
+    _enqueue(request) {
+      // A later clear is NOT a license to discard an earlier target write,
+      // source callback or readback. All destinations share this submission FIFO.
+      if (this._pending.length >= MAX_PENDING) fail('LIMIT', 'Too many render operations are waiting for preparation');
+      this._pending.push(request);
+      this._startDrain();
+    }
+    _startDrain() {
+      if (!this._drain) {
+        this._drain = this._drainPending().catch(error => {
+          for (const pending of this._pending) pending.reject?.(error);
+          this._pending = [];
+          this._deferredError ??= error;
+          throw error;
+        }).finally(() => {
+          this._drain = null;
+          if (this._pending.length && !this._disposed) this._startDrain();
+        });
+        this._drain.catch(() => {});
+      }
     }
     async _drainPending() {
       await this.init();
-      for (let rounds = 0; this._pending.length; rounds++) {
-        if (rounds > 8) fail('PREPARE', 'Source structure kept changing during preparation' + (this._lastPrepareError ? ': ' + this._lastPrepareError : ''));
-        if (this._rebuild) {
-          const hdr = this._wantsHdr(this._toneMapping());
-          this._session.dispose();
-          await this._createSession(hdr);
-          this._rebuild = false;
+      while (this._pending.length && !this._disposed) {
+        const request = this._pending[0];
+        if (request.readback) {
+          // Queue the copy now but do not await mapping: subsequent draws may
+          // submit once the copy has captured this version of the attachment.
+          try { request.resolve(request.issue()); } catch (error) { request.reject(error); }
+          this._pending.shift(); continue;
         }
-        await this._prepare();
-        this.info.f3d.preparations++;
-        if (this._disposed) return;
-        const batch = this._pending;
-        this._pending = [];
-        for (let i = 0; i < batch.length; i++) {
-          const request = batch[i];
-          const entry = this._dispatcher.entry(request.scene);
-          const key = sceneKey(this, request.scene);
-          this._wanted.set(request.scene, key);
+        const {destination, scene} = request;
+        for (let attempts = 0; ; attempts++) {
+          if (attempts > 8) fail('PREPARE', 'Source structure kept changing during preparation');
+          if (destination !== this) this._targets.assertCurrent(destination);
+          destination._wanted.set(scene, sceneKey(this, scene));
+          await this._prepare(destination, request);
+          if (this._disposed) return;
           try {
-            if (!entry || entry.key !== key) fail('PREPARE', 'Scene profile changed during preparation');
-            // The output path may have been rebuilt: derive frame state for it now.
-            request.frame = this._frame(request.scene, request.clearOnly);
-            if (this._rebuild) fail('PREPARE', 'Output path changed during preparation');
-            this._submit(request);
+            const entry = destination._dispatcher?.entry(scene);
+            if (!entry || entry.key !== sceneKey(this, scene)) fail('PREPARE', 'Scene profile changed during preparation');
+            this._submit(request); break;
           } catch (error) {
             if (!isPrepareBoundary(error)) throw error;
-            this._lastPrepareError = error.message;
-            // Keep source order: this request and every later one wait again.
-            this._pending = [...batch.slice(i), ...this._pending];
-            break;
           }
         }
+        this._pending.shift();
       }
     }
     async renderAsync(scene, camera) {
       await this.init();
-      await this.compileAsync(scene, camera);
+      // Capture destination and frame state before preparation can yield.
       this.render(scene, camera);
+      while (this._drain) await this._drain;
     }
     async compileAsync(scene, camera, targetScene = null) {
+      const destination = this._renderTarget ? this._targets.capture(this._renderTarget) : this;
       await this.init();
       if (this._deferredError) { const error = this._deferredError; this._deferredError = null; throw error; }
       if (camera !== undefined && !(camera instanceof THREE.Camera)) fail('SOURCE', 'Expected a source camera');
-      // Source signature compileAsync(object, camera, targetScene): an object is
-      // compiled against the scene whose lights/environment it will render in.
-      // Preparation is per rendered Scene here; an object outside any Scene has
-      // nothing to prepare until it is rendered within one.
       const compiled = targetScene ?? scene;
       if (!compiled?.isScene) return;
-      scene = compiled;
-      this._wanted.set(scene, sceneKey(this, scene));
+      destination._wanted.set(compiled, sceneKey(this, compiled));
       while (this._drain) await this._drain;
-      await this._prepare();
+      await this._prepare(destination);
     }
-    /** Serialized preparation: overlapping compileAsync/deferred frames share one queue. */
-    _prepare() {
+    /** All scene preparations share one queue; targets never rebuild the canvas. */
+    _prepare(destination = this, request = null) {
       const run = (this._preparing ?? Promise.resolve()).catch(() => {}).then(async () => {
-        try { await this._session.prepare(); }
-        catch (error) {
-          // In-shader tone mapping needs every draw on the program route; a scene
-          // with another draw keeps the whole-image output pass from now on.
-          // F3D_NO_FALLBACK: test seam asserting the program route was taken.
-          if (error?.code !== 'THREE_SCENE_TONE_MAPPING' || this._hdrFallback === true || globalThis.F3D_NO_FALLBACK === true) throw error;
-          this._hdrFallback = true;
-          this._session.dispose();
-          await this._createSession(this._wantsHdr(this._toneMapping()));
-          this._rebuild = false;
-          await this._session.prepare();
-        }
-        this.info.f3d.preparations++;
+        if (this._disposed) fail('DISPOSED', 'Renderer is disposed');
+        const previous = this._programFrame;
+        this._programFrame = request?.programFrame;
+        try {
+          if (destination !== this) {
+            this._targets.ensure(destination);
+            if (!destination._dispatcher) createDispatcher(this, destination)(this._device, destination.storage.rendererOptions, {signal: destination.lifetime.signal});
+            await destination._dispatcher.prepare();
+            this._targets.assertCurrent(destination);
+          } else {
+            const tone = request ? TONE_MAPPINGS.get(request.programFrame.toneMapping) : this._toneMapping();
+            const selectOutput = () => {
+              const hdr = this._wantsHdr(tone);
+              if (request) {
+                request.hdr = hdr;
+                // A preceding queued request may have activated sticky HDR
+                // fallback. Keep this request's clear/exposure, not live state.
+                if (hdr) {
+                  request.frame.output = {toneMapping: tone, exposure: request.programFrame.toneMappingExposure};
+                  request.frame.clearColor = request.linearClearColor.slice();
+                  delete request.frame.targetSize;
+                }
+              }
+              return hdr;
+            };
+            const hdr = selectOutput();
+            if (hdr !== this._hdr) { this._session.dispose(); await this._createSession(hdr); }
+            this._rebuild = false;
+            try { await this._session.prepare(); }
+            catch (error) {
+              if (error?.code !== 'THREE_SCENE_TONE_MAPPING' || this._hdrFallback === true || globalThis.F3D_NO_FALLBACK === true) throw error;
+              this._hdrFallback = true;
+              this._session.dispose();
+              await this._createSession(selectOutput());
+              this._rebuild = false;
+              await this._session.prepare();
+            }
+          }
+          this.info.f3d.preparations++;
+        } finally { this._programFrame = previous; }
       });
       this._preparing = run;
+      run.finally(() => { if (this._preparing === run) this._preparing = null; }).catch(() => {});
       return run;
     }
-    async waitForGPU() { if (this._session) await this._session.whenIdle(); }
+    async waitForGPU() {
+      while (this._drain) await this._drain;
+      if (this._preparing) await this._preparing;
+      if (this._session) await this._session.whenIdle();
+      await this._targets.whenIdle();
+    }
 
     // ---- animation loop (source Animation semantics: callback(time, xrFrame)) ----
     async setAnimationLoop(callback) {
@@ -645,6 +722,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       if (this._disposed) return;
       this.setAnimationLoop(null);
       this._disposed = true;
+      const stopped = new F3DRendererError('DISPOSED', 'Renderer is disposed');
+      this._targetLifetime.abort(stopped);
+      this._targets.dispose();
+      for (const request of this._pending) request.reject?.(stopped);
       this._pending = [];
       this._inspector.dispose?.();
       if (!this._drain) this._release();
@@ -726,7 +807,7 @@ export function createWebGLRendererClass(THREE, classOptions = {}) {
     }
     _needsGlobalClipping() { return this.clippingPlanes.length > 0; }
     render(scene, camera) {
-      if (this.preserveDrawingBuffer && this.autoClear === false)
+      if (!this._renderTarget && this.preserveDrawingBuffer && this.autoClear === false)
         fail('UNSUPPORTED', 'preserveDrawingBuffer accumulation across frames is not admitted');
       this._clippingControls.planes = this.clippingPlanes;
       this._clippingControls.localClippingEnabled = this.localClippingEnabled;
@@ -738,7 +819,15 @@ export function createWebGLRendererClass(THREE, classOptions = {}) {
     getContextAttributes() { fail('UNSUPPORTED', 'This WebGLRenderer route has no GL context'); }
     forceContextLoss() { fail('UNSUPPORTED', 'This WebGLRenderer route has no GL context'); }
     forceContextRestore() { fail('UNSUPPORTED', 'This WebGLRenderer route has no GL context'); }
-    getCurrentViewport(target) { return target.copy(this._viewport).multiplyScalar(this._pixelRatio).round(); }
+    readRenderTargetPixelsAsync(target, x, y, width, height, buffer, activeCubeFace = 0, textureIndex = 0) {
+      if (activeCubeFace !== 0 || textureIndex !== 0 || !ArrayBuffer.isView(buffer))
+        return Promise.reject(new F3DRendererError('UNSUPPORTED', 'Supply an output array for the 2D color attachment'));
+      return this._readTargetPixels(target, {x, y, width, height, output: buffer, flipY: true});
+    }
+    readRenderTargetPixels() { fail('ROUTE', 'Synchronous pixel readback requires the exact native backend'); }
+    getCurrentViewport(target) {
+      return this._renderTarget ? target.copy(this._renderTarget.viewport).round() : target.copy(this._viewport).multiplyScalar(this._pixelRatio).round();
+    }
   }
   for (const name of ['extensions', 'properties', 'state', 'renderLists'])
     Object.defineProperty(WebGLRenderer.prototype, name, glOnly(name));

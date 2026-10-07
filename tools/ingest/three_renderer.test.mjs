@@ -144,13 +144,13 @@ test('structural edits defer only the affected frames and preserve application c
   f.scene.add(added);
   renderer.render(f.scene, f.camera);
   assert.equal(acquired(), 1, 'a frame needing preparation does not present');
-  renderer.render(f.scene, f.camera); // Coalesced: a later clearing request supersedes the earlier one.
+  renderer.render(f.scene, f.camera); // Both calls remain observable, including callbacks and target dependencies.
   assert.equal(renderer.info.f3d.deferredRenders, 2);
   renderer.info.reset();
   await flush(renderer);
-  assert.equal(acquired(), 2); assert.equal(renderer.info.render.drawCalls, 2);
+  assert.equal(acquired(), 3); assert.equal(renderer.info.render.drawCalls, 4);
   renderer.render(f.scene, f.camera);
-  assert.equal(acquired(), 3); assert.equal(renderer.info.f3d.deferredRenders, 2);
+  assert.equal(acquired(), 4); assert.equal(renderer.info.f3d.deferredRenders, 2);
   renderer.dispose();
 });
 
@@ -177,7 +177,7 @@ test('unsupported source content surfaces as an explicit error instead of a sile
   await flush(renderer).catch(() => {});
   assert.throws(() => renderer.render(f.scene, f.camera), /Unsupported source material/);
   renderer.setRenderTarget(null);
-  assert.throws(() => renderer.setRenderTarget(new T.RenderTarget(4, 4)), {code: 'F3D_RENDERER_UNSUPPORTED'});
+  assert.throws(() => renderer.setRenderTarget(new T.RenderTarget(4, 4, {stencilBuffer: true})), {code: 'THREE_TARGET_UNSUPPORTED'});
   renderer.outputColorSpace = T.LinearSRGBColorSpace;
   assert.throws(() => renderer.render(f.scene, f.camera), F3DRendererError);
   renderer.dispose();
@@ -254,7 +254,7 @@ test('setAnimationLoop initializes, drives callbacks each host frame and stops o
   assert.deepEqual(frames, [16, 32]); assert.equal(renderer.info.frame, 2);
   await flush(renderer);
   next(48);
-  assert.equal(renderer.info.f3d.presentedRenders, 2);
+  assert.equal(renderer.info.f3d.presentedRenders, 3);
   await renderer.setAnimationLoop(null);
   assert.equal(next, null); assert.equal(renderer.getAnimationLoop(), null);
   renderer.dispose();
@@ -292,4 +292,27 @@ test('WebGLRenderer surface: synchronous construction, frames before init are de
   assert.throws(() => renderer.capabilities.maxTextureSize, {code: 'F3D_RENDERER_UNSUPPORTED'});
   assert.throws(() => renderer.getContext(), {code: 'F3D_RENDERER_UNSUPPORTED'});
   renderer.dispose();
+});
+
+
+test('source RenderTarget rendering and subsequent material sampling share owned GPU residency', async () => {
+  const {renderer, acquired} = await create();
+  const f = sceneFixture(), target = new T.RenderTarget(16, 8, {samples: 4});
+  renderer.setRenderTarget(target);
+  await renderer.compileAsync(f.scene, f.camera);
+  renderer.render(f.scene, f.camera);
+  assert.equal(acquired(), 0);
+  const native = renderer._targets.capture(target);
+  assert.equal(native.storage.rendererOptions.sampleCount, 4);
+  const screen = new T.Scene();
+  screen.add(new T.Mesh(new T.PlaneGeometry(2, 2), new T.MeshBasicMaterial({map: target.texture})));
+  renderer.setRenderTarget(null);
+  await renderer.compileAsync(screen, f.camera);
+  renderer.render(screen, f.camera);
+  assert.equal(acquired(), 1); assert.equal(native.copies, 1);
+  const sampledView = native.view;
+  renderer.setRenderTarget(target); renderer.render(f.scene, f.camera);
+  renderer.setRenderTarget(null); renderer.render(screen, f.camera);
+  assert.equal(native.view, sampledView); assert.equal(native.copies, 2);
+  await renderer.waitForGPU(); target.dispose(); renderer.dispose();
 });
