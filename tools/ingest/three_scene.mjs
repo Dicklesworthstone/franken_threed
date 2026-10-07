@@ -72,7 +72,12 @@ export async function createGpuThreeScene(device,scene,{
   program:programSupport=null,
 }={}) {
   if(three?.REVISION!=='186'||typeof three.Matrix4!=='function'||typeof three.Frustum!=='function'||
-      typeof three.Mesh!=='function'||!(scene instanceof three.Scene))fail('SOURCE','Supply the pinned r186 module and its Scene');
+      typeof three.Mesh!=='function'||!(scene instanceof three.Object3D))fail('SOURCE','Supply the pinned r186 module and an Object3D root');
+  // WebGLRenderer accepts Mesh/Group/Line/Points roots. Its program state uses
+  // an empty Scene in that case, but traversal, matrix updates and callbacks
+  // still refer to the original root. Never clone, reparent or mutate it.
+  const root=scene;
+  if(root.isScene!==true)scene=new three.Scene();
   if(!(textures instanceof Map)||typeof sortObjects!=='boolean'||typeof autoTextures!=='boolean')fail('OPTIONS','Expected a texture binding Map and boolean texture/sorting options');
   if(!textureOptions||typeof textureOptions!=='object'||Array.isArray(textureOptions))fail('OPTIONS','Expected texture ownership options');
   for(const key of Object.keys(textureOptions))if(!['maxTextureBytes','maxTextures','maxPixels','label'].includes(key))fail('OPTIONS',`Unsupported texture option: ${key}`);
@@ -248,7 +253,7 @@ export async function createGpuThreeScene(device,scene,{
   }
   function graph(){
     if(fogEnabled)fogApi.inspectThreeFog(scene.fog,three);
-    const nodes=[],seen=new Set(),stack=[scene];
+    const nodes=[],seen=new Set(),stack=[root];
     while(stack.length){
       const object=stack.pop();
       if(!(object instanceof three.Object3D)||seen.has(object)||!Array.isArray(object.children))fail('GRAPH','Expected an acyclic source hierarchy');
@@ -460,7 +465,7 @@ export async function createGpuThreeScene(device,scene,{
   /** WebGLRenderer light collection order: depth-first, visible, camera layers. */
   function programLightList(camera){
     const out=[],walk=o=>{if(!o.visible)return;if(o.isLight&&(!camera||o.layers.test(camera.layers)))out.push(o);for(const c of o.children)walk(c);};
-    walk(scene);return out;
+    walk(root);return out;
   }
   function programEnvironment(m){
     // WebGLRenderer.getProgram: environment for Lambert/Phong/Standard; PMREM unless
@@ -971,7 +976,7 @@ export async function createGpuThreeScene(device,scene,{
       preparedShadowMode=programShadowMode;
       if(programShadowMode){
         const camera=programCamera??new three.Camera();
-        await Promise.race([programShadows().prepare(castingLights(programCamera),scene,camera,shadowControls(),shadowRenderer()),stopped]).catch(shadowBoundary);live();
+        await Promise.race([programShadows().prepare(castingLights(programCamera),root,camera,shadowControls(),shadowRenderer()),stopped]).catch(shadowBoundary);live();
       }
       // PMREM sources are owned textures now; generate their cube-UV targets
       // before the descriptions that bind them.
@@ -1220,7 +1225,7 @@ export async function createGpuThreeScene(device,scene,{
     if(!(camera instanceof three.Camera)||(!camera.isPerspectiveCamera&&!camera.isOrthographicCamera)||camera.isArrayCamera||camera.reversedDepth)
       fail('CAMERA','Supply one non-reversed perspective or orthographic source camera');
     if(![three.WebGLCoordinateSystem,three.WebGPUCoordinateSystem].includes(camera.coordinateSystem))fail('CAMERA','Unknown source clip convention');
-    if(scene.matrixWorldAutoUpdate===true)scene.updateMatrixWorld();
+    if(root.matrixWorldAutoUpdate===true)root.updateMatrixWorld();
     if(camera.parent===null&&camera.matrixWorldAutoUpdate===true)camera.updateMatrixWorld();
     vp.multiplyMatrices(camera.projectionMatrix,camera.matrixWorldInverse);
     frustum.setFromProjectionMatrix(vp,camera.coordinateSystem,false);clip.copy(vp);
@@ -1265,7 +1270,7 @@ export async function createGpuThreeScene(device,scene,{
       const fogFrame=fogEnabled?fogApi.threeFogDescriptor(scene.fog,camera,three):null;
       const backgroundFrame=backgroundOwner?.capture(scene,camera)??null;
       const lightSources=[],casterObjects=[],casterItems=[],shadowDraws=[];
-      const opaque=[],transparent=[],stack=[{object:scene,groupOrder:0}],descriptions=new Map();
+      const opaque=[],transparent=[],stack=[{object:root,groupOrder:0}],descriptions=new Map();
       const get=(m,topology,object=null)=>{
         let byTopology=descriptions.get(m);if(!byTopology)descriptions.set(m,byTopology=new Map());
         const key=programCapable(m)&&object?topology+'|'+programVariant(object):topology;
@@ -1370,7 +1375,7 @@ export async function createGpuThreeScene(device,scene,{
       // then setupLights() reads their state; depth passes submit after uploads.
       let submitShadows=null;
       if(programShadowMode){
-        try{submitShadows=programShadows().render(castingLights(camera),scene,camera,shadowControls(),shadowRenderer());}catch(error){shadowBoundary(error);}
+        try{submitShadows=programShadows().render(castingLights(camera),root,camera,shadowControls(),shadowRenderer());}catch(error){shadowBoundary(error);}
         programSupport.setLights(programLightList(camera));programSupport.setLightsView(camera);
       }
       textureOwner?.update(frameTextures);
@@ -1386,7 +1391,7 @@ export async function createGpuThreeScene(device,scene,{
           const count=item.group?integer(item.group.count,0,Number.MAX_SAFE_INTEGER,'group count'):Number.MAX_SAFE_INTEGER;
           // renderObject: onBeforeRender, matrices, draw (uniforms packed now), onAfterRender.
           const hooked=object.onBeforeRender!==three.Object3D.prototype.onBeforeRender||object.onAfterRender!==three.Object3D.prototype.onAfterRender;
-          if(hooked)object.onBeforeRender(shadowRenderer(),scene,camera,object.geometry,item.material,item.group);
+          if(hooked)object.onBeforeRender(shadowRenderer(),root,camera,object.geometry,item.material,item.group);
           object.modelViewMatrix.multiplyMatrices(camera.matrixWorldInverse,object.matrixWorld);
           object.normalMatrix.getNormalMatrix(object.modelViewMatrix);
           const frontFaceCW=object.isMesh===true&&object.matrixWorld.determinant()<0;
@@ -1403,7 +1408,7 @@ export async function createGpuThreeScene(device,scene,{
             draws.push({mesh:item.bindings[i].mesh,first:start,count,programUniforms:bytes,frontFaceCW,instanceCount,
               ...(fogEnabled?{receiveFog:false}:{}),...(shadowEnabled?{receiveShadow:false}:{}),...(environmentEnabled?{receiveEnvironment:false}:{})});
           }
-          if(hooked)object.onAfterRender(shadowRenderer(),scene,camera,object.geometry,item.material,item.group);
+          if(hooked)object.onAfterRender(shadowRenderer(),root,camera,object.geometry,item.material,item.group);
           continue;
         }
         const deformation=item.bindings[0].deformation;
@@ -1504,7 +1509,7 @@ export async function createGpuThreeScene(device,scene,{
       return failed(error);
     }finally{busy=false;frameTextures=null;if(disposed||terminal)release();}
   }
-  const bridge=Object.freeze({scene,prepare,render,
+  const bridge=Object.freeze({scene:root,prepare,render,
     get disposed(){return disposed;},get failed(){return terminal!==null||resourceFailed();},
     get diagnostics(){return Object.freeze({prepareVersion,sourceDraws,logicalDraws:renderer?.drawCount??0,
       drawCalls:renderer?.drawCallCount??0,geometryCount:geometries.size,geometryBytes:geometryBytes(),

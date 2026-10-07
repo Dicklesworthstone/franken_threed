@@ -79,8 +79,9 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
 
   /** Cheap, per-frame profile of scene-level features that select bridge options. */
   function sceneKey(renderer, scene) {
-    const background = scene.background !== null && scene.background !== undefined && !scene.background.isColor;
-    return `${scene.fog ? 1 : 0}${scene.environment ? 1 : 0}${background ? 1 : 0}${renderer.shadowMap.enabled ? 1 : 0}${renderer._needsGlobalClipping?.() ? 1 : 0}`;
+    const isScene = scene.isScene === true;
+    const background = isScene && scene.background !== null && scene.background !== undefined && !scene.background.isColor;
+    return `${isScene && scene.fog ? 1 : 0}${isScene && scene.environment ? 1 : 0}${background ? 1 : 0}${renderer.shadowMap.enabled ? 1 : 0}${renderer._needsGlobalClipping?.() ? 1 : 0}`;
   }
   /** Preparation-time traversal for options that depend on materials. */
   function needsClipping(scene) {
@@ -89,7 +90,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       const list = Array.isArray(object.material) ? object.material : object.material ? [object.material] : [];
       if (list.some(m => m?.clippingPlanes?.length)) clipping = true;
     });
-    if (scene.overrideMaterial?.clippingPlanes?.length) clipping = true;
+    if (scene.isScene === true && scene.overrideMaterial?.clippingPlanes?.length) clipping = true;
     return clipping;
   }
   // r186 WebGPURenderer applies material clipping planes without a renderer-level
@@ -126,7 +127,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
             }
             // A changed feature profile selects different bridge pipelines.
             // Retire the old owner only after the replacement is published.
-            const background = scene.background && !scene.background.isColor;
+            const sourceScene = scene.isScene === true;
+            const background = sourceScene && scene.background && !scene.background.isColor;
             // Options and the entry key describe the same live profile.
             const liveKey = sceneKey(owner, scene);
             let bridge;
@@ -143,11 +145,18 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
                 ...(destination !== owner || owner._hdr || !owner._shaderEncodedOutput ? {} : {outputTransfer: 'srgb'})},
               textureTransforms: true, alphaMaps: true,
               // ShaderMaterial programs (WebGLRenderer semantics) on the WebGL surface.
-              program: destination === owner && owner._shaderEncodedOutput && !owner._hdr ? owner._programSupport ??= createThreeProgramSupport({three: THREE, pmrem: createThreeProgramPMREM, shadows: createThreeProgramShadows,
+              program: owner._shaderEncodedOutput && (destination !== owner || !owner._hdr) ? destination._programSupport ??= createThreeProgramSupport({three: THREE, pmrem: createThreeProgramPMREM, shadows: createThreeProgramShadows,
                 state: () => ({toneMapping: owner.toneMapping, toneMappingExposure: owner.toneMappingExposure, outputColorSpace: owner.outputColorSpace,
                   pixelRatio: owner._pixelRatio, height: owner._height, shadowMap: owner.shadowMap, shadowMapType: owner.shadowMap.type, renderer: owner,
-                  floatLinear: device.features?.has?.('float32-filterable') === true, ...owner._programFrame})}) : null,
-              fog: scene.fog ? {} : null, environment: scene.environment ? {} : null,
+                  floatLinear: device.features?.has?.('float32-filterable') === true, ...owner._programFrame,
+                  // Public targets keep top-down native storage (the target owner
+                  // provides UV-oriented sampling). Do not use the compiler's
+                  // renderTarget:true/GL-row profile reserved for shadow/PMREM maps.
+                  // Native sRGB attachments perform their own transfer function.
+                  // Keep source point-material size/scale uniforms tied to the
+                  // renderer's pixel ratio and logical height, even offscreen.
+                  ...(destination === owner ? {} : {toneMapping: NoToneMapping, outputColorSpace: THREE.LinearSRGBColorSpace})})}) : null,
+              fog: sourceScene && scene.fog ? {} : null, environment: sourceScene && scene.environment ? {} : null,
               background: background ? {} : null,
               shadow: owner.shadowMap.enabled ? {} : null,
               clipping: clipping || previous?.clipping ? owner._clippingControls ?? clippingControls : null,
@@ -488,7 +497,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       const v = target ? target.viewport : this._viewport, px = this._pixelRound ?? Math.floor;
       const vx = px(v.x * pr), vw = px(v.z * pr), vh = px(v.w * pr);
       // Program gl_FragCoord (framebuffer) and point-sprite sizes (viewport).
-      if (!target && this._shaderEncodedOutput && !hdr) frame.targetSize = [bufferWidth, bufferHeight, vw, vh];
+      if (this._shaderEncodedOutput && !hdr) frame.targetSize = [bufferWidth, bufferHeight, vw, vh];
       // WebGL viewports/scissors use a bottom-left origin; WebGPU's is top-left.
       const vy = this._bottomLeftOrigin ? bufferHeight - px(v.y * pr) - vh : px(v.y * pr);
       const [minDepth, maxDepth] = target ? [0, 1] : this._viewportDepth;
@@ -518,7 +527,6 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       if (this._disposed) fail('DISPOSED', 'Renderer is disposed');
       if (this._deferredError) { const error = this._deferredError; this._deferredError = null; throw error; }
       if (!(scene instanceof THREE.Object3D) || !(camera instanceof THREE.Camera)) fail('SOURCE', 'Expected a source scene and camera');
-      if (!scene.isScene) fail('UNSUPPORTED', 'Rendering a non-Scene root object is not admitted');
       this.info.calls++;
       this.info.render.calls++;
       this.info.render.frameCalls++;
@@ -631,7 +639,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       if (this._deferredError) { const error = this._deferredError; this._deferredError = null; throw error; }
       if (camera !== undefined && !(camera instanceof THREE.Camera)) fail('SOURCE', 'Expected a source camera');
       const compiled = targetScene ?? scene;
-      if (!compiled?.isScene) return;
+      if (!(compiled instanceof THREE.Object3D)) fail('SOURCE', 'Expected a source Object3D root');
       destination._wanted.set(compiled, sceneKey(this, compiled));
       while (this._drain) await this._drain;
       await this._prepare(destination);
