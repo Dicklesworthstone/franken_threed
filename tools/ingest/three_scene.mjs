@@ -129,9 +129,9 @@ export async function createGpuThreeScene(device,scene,{
   if(background!==null&&(!background||typeof background!=='object'||Array.isArray(background)))fail('OPTIONS','Expected background options or null');
   const backgroundOptions=Object.freeze({...background});
   for(const key of Object.keys(backgroundOptions))if(!['maxBytes','maxPixels','label'].includes(key))fail('OPTIONS',`Unsupported source background option: ${key}`);
-  // WebGL surface (shader-encoded output with program support): texture
-  // backgrounds are r186 WebGLBackground meshes drawn as programs.
-  const programBackgroundOwned=background!==null&&renderOptions.outputTransfer==='srgb'&&!!programSupport;
+  // Source program execution and the output transfer are independent. Offscreen
+  // programs/backgrounds write linear values into their native attachment.
+  const programBackgroundOwned=background!==null&&!!programSupport;
   const backgroundEnabled=background!==null&&!programBackgroundOwned,maxBackgroundBytes=backgroundOptions.maxBytes??128*1024*1024;
   integer(maxBackgroundBytes,1,Number.MAX_SAFE_INTEGER,'background budget');
   if(backgroundEnabled&&renderOptions.outputTransfer==='srgb')fail('OPTIONS','Texture background passes do not encode shader-side sRGB output');
@@ -193,6 +193,7 @@ export async function createGpuThreeScene(device,scene,{
     for(const gpu of [...deformations.values(),...pendingDeformations])gpu.dispose();deformations.clear();pendingDeformations.clear();
     for(const [m,state] of materials)m.removeEventListener('dispose',state.listener);materials.clear();
     for(const gpu of geometries.values())gpu.dispose();geometries.clear();
+    for(const gpu of programGpus())gpu.dispose();programGeometries.clear();
     for(const gpu of instances.values())gpu.dispose();instances.clear();renderer?.dispose();textureOwner?.dispose();
     placeholder?.texture.destroy();placeholder=null;
   }
@@ -437,7 +438,7 @@ export async function createGpuThreeScene(device,scene,{
   const programCapable=m=>m?.isShaderMaterial===true||(programRoute()&&programSupport.shaderLibMaterial(m));
   // Program route on the WebGL surface: ShaderMaterial, and ShaderLib programs
   // for built-in materials (WebGLRenderer's own GLSL) where the core lacks a feature.
-  const programRoute=()=>!!programSupport&&renderOptions.outputTransfer==='srgb';
+  const programRoute=()=>!!programSupport;
   // WebGLRenderer tone-maps inside each material's shader (toneMapped), before
   // blending and sRGB encoding. With tone mapping on the shader-encoded path,
   // every draw is its ShaderLib program; anything else is a TONE_MAPPING error
