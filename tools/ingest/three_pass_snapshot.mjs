@@ -80,7 +80,10 @@ export function createThreePassSnapshots(T, {maxBytes = 32 * 1024 * 1024, maxCap
     const memo = new Map(), textures = new Map();
     function textureState(t) {
       const result = TEXTURE_STATE.map(k => own(t, k));
-      result.push(t.source, t.source?.version, own(t, 'renderTarget'));
+      const target = own(t, 'renderTarget');
+      result.push(t.source, t.source?.version, target);
+      if (target) result.push(target.width, target.height, target.depth, target.samples, target.texture,
+        target.depthBuffer, target.stencilBuffer, target.depthTexture, target.resolveColorBuffer);
       for (const k of ['offset', 'repeat', 'center']) { const v = own(t, k); result.push(v?.x, v?.y); }
       // Auto-updated matrices are derived from the transform fields above; a
       // previous pass may legitimately update that derived matrix during prepare.
@@ -168,9 +171,11 @@ export function createThreePassSnapshots(T, {maxBytes = 32 * 1024 * 1024, maxCap
     }
     const record = {state, data: rootData, camera: cameraData, bytes, pending: true, installed: false, listeners: [], stale: false};
     allocatedBytes += bytes; records.add(record);
-    for (const t of textures.keys()) {
+    const resources = new Set(textures.keys());
+    for (const t of textures.keys()) if (t.renderTarget) resources.add(t.renderTarget);
+    for (const resource of resources) {
       const listener = () => { record.stale = true; };
-      record.listeners.push([t, listener]); t.addEventListener('dispose', listener);
+      record.listeners.push([resource, listener]); resource.addEventListener('dispose', listener);
     }
     function check() {
       live();
@@ -221,6 +226,13 @@ export function createThreePassSnapshots(T, {maxBytes = 32 * 1024 * 1024, maxCap
     dispose() {
       if (disposed) return; disposed = true;
       for (const record of [...records]) { record.pending = record.installed = false; collect(record); }
+      // WeakMap entries and renderer lookup keys may outlive disposal. Leave no
+      // copied uniform/geometry payload reachable through those private views.
+      for (const state of retained) {
+        for (const key of Object.getOwnPropertyNames(state.root)) delete state.root[key];
+        state.record = state.material = state.geometry = state.materialSource = state.geometrySource = null;
+        state.attributeViews.clear();
+      }
       retained.clear();
     },
   });

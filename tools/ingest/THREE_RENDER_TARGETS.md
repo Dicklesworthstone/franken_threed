@@ -49,10 +49,11 @@ and geometry restrictions still apply; this does not admit arbitrary GLSL or TSL
 on the WebGPU public surface.
 
 `render(root, camera)` and `compileAsync(root, camera)` accept source Object3D
-roots as well as Scenes. A fullscreen Mesh is traversed and updated in place:
-its geometry, material, children and parent are not cloned or reparented. A
-non-Scene root uses empty scene-level effects while its object callbacks receive
-the original root, matching the source WebGL renderer's distinction.
+roots as well as Scenes. Ordinary roots are traversed and updated in place,
+without reparenting. A non-Scene root uses empty scene-level effects while its
+object callbacks receive the original root. Callback-free, small fullscreen
+shader roots use the per-call capture described below instead of borrowing
+mutable shader inputs through asynchronous preparation.
 
 Sampling uses a persistent GPU-only vertically oriented replica of resolved
 color, refreshed lazily after writes. This costs an additional color image and
@@ -66,18 +67,57 @@ target being drawn is rejected as feedback. Deferred target/canvas calls retain
 FIFO order and captured renderer frame settings. `draw -> readback -> draw`
 submits the copy before the second draw without waiting for buffer mapping.
 Target reconfiguration/disposal invalidates queued uses; renderer disposal also
-cancels pending readbacks. As before, source scene objects and material uniforms
-remain live during asynchronous preparation: this is **not** a snapshot of all
-scene state. Pre-prepare pass/material bindings before same-turn updates that
-must be observed separately, particularly when reusing a fullscreen mesh.
+cancels pending readbacks.
+
+## Reused fullscreen shader passes
+
+On the WebGL-compatible surface, callback-free `Mesh` roots with a source
+`ShaderMaterial` or `RawShaderMaterial`, no children/instancing/deformation, and
+at most six vertices capture their call-time inputs. This includes the ordinary
+fullscreen triangle shape used by `FullScreenQuad`. Reusing the same mesh or
+changing its material/uniforms in the same turn no longer replaces earlier
+queued pass values. `renderAsync()` enqueues before its first await, so mixed
+synchronous draw, async draw and readback calls retain their submission order
+even during initialization.
+
+Captures copy uniform scalars, arrays, typed-array slices, plain nested structs
+and source math values; shader text/defines and material raster fields; camera
+and world matrices; geometry upload bytes and draw ranges. They install into
+stable private execution views at serialized preparation/submission boundaries,
+never by temporarily rewriting application-owned objects across an await.
+`compileAsync(root, camera)` prepares that same execution view; uniform-only
+steady-state draws do not need a new preparation or material identity. A queued
+pass is prepared by itself, not together with future passes whose inputs have
+not yet been installed.
+
+Texture objects remain borrowed GPU-resource identities, not pixel snapshots.
+Disposal, uploaded source-version changes, sampler/transform edits or a changed
+sampled-target generation fail as `THREE_PASS_STALE` before that pass submits.
+Normal GPU writes to a ping-pong target do not change its identity and remain
+queue ordered. Shared-memory inputs, accessors, custom callable uniform values
+and unsupported mutable classes fail explicitly rather than executing hidden
+copy hooks. This capture path uses additional CPU copying and memory; it is not
+a zero-copy or performance claim. The default capture limits are 2 MiB per call,
+32 MiB total pending plus installed state, and 64 retained pass roots. Captures
+are released on queue failure/disposal; the last installed state is charged until
+replaced or the renderer is disposed.
+
+General scenes, large meshes and callback-bearing roots keep the existing
+live-source path. This is **not** a complete per-call scene-state snapshot. Shader
+compiler and renderer admission restrictions also remain in force.
 
 ## Remaining gaps and verification
 
 MRT, cube/array targets, mip rendering/generation, sampled depth and stencil
 targets are not implemented by this profile. Shader programs retain their
-explicit unsupported-feature errors. Mesh-root and offscreen shader execution
-remove blockers for postprocessing but do not establish complete EffectComposer
-compatibility, effect parity or per-call snapshots during asynchronous preparation.
+explicit unsupported-feature errors. Mesh-root, offscreen shader and small-pass
+capture support remove postprocessing blockers but do not establish complete
+EffectComposer compatibility, effect parity or arbitrary scene snapshots.
+
+`node --test tools/ingest/three_pass_snapshot.test.mjs tools/ingest/three_renderer_pass_snapshot.test.mjs`
+checks per-call data capture and the actual facade/target/readback orchestration
+with source-data, scene/compiler and GPU boundary doubles. These tests do not
+execute WGSL or certify the pinned Three.js implementation or rasterized pixels.
 
 `node --test tools/ingest/three_render_targets.test.mjs tools/ingest/three_renderer_targets.test.mjs`
 checks residency and public renderer ordering using recording devices and

@@ -164,3 +164,11 @@ test('sparse uniform arrays keep length and are included in allocation bounds', 
   c.release(); material.uniforms.data.value = new Array(100000000);
   assert.throws(() => owner.capture(root, camera), {code: 'THREE_PASS_BUDGET'}); owner.dispose();
 });
+
+test('disposal clears installed payloads even when a renderer still holds the execution root', () => {
+  const {owner, root, camera} = setup(), c = owner.capture(root, camera);
+  c.install(); const executionRoot = c.root; c.release();
+  assert.ok(executionRoot.geometry); owner.dispose();
+  assert.equal(executionRoot.geometry, undefined); assert.equal(executionRoot.material, undefined);
+  assert.equal(owner.allocatedBytes, 0); assert.equal(owner.rootCount, 0);
+});
