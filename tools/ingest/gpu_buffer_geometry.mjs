@@ -375,7 +375,7 @@ function describeProgram(program) {
   return geometry => {
     const attributes = geometry?.attributes;
     if (!attributes) fail('SHAPE', 'Expected a BufferGeometry');
-    if (Object.values(geometry.morphAttributes ?? {}).some(a => a.length)) fail('SHAPE', 'Morph attributes need the deformation path');
+    // Programs read morph targets from WebGLMorphtargets' texture, not streams.
     const owners = new Map(), missing = [];
     const instanced = geometry.isInstancedBufferGeometry === true;
     let vertexCount = attributes.position ? integer(attributes.position.count, 0, 0xffffffff, 'vertex count') : null, instanceCapacity = Infinity;

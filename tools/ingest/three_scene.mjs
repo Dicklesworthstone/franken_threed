@@ -219,7 +219,7 @@ export async function createGpuThreeScene(device,scene,{
     const programs=(Array.isArray(object.material)?object.material:[object.material]).every(m=>m?.isShaderMaterial);
     if(!(g instanceof three.BufferGeometry)||(g.isInstancedBufferGeometry&&!programs))fail('GEOMETRY','Expected source BufferGeometry');
     // Program-drawn skinned meshes (in-shader tone mapping) skin in their own program.
-    if(hasThreeDeformation(object)&&!(programToneMapping()&&object.isSkinnedMesh&&!Object.values(g.morphAttributes??{}).some(a=>a?.length)))
+    if(hasThreeDeformation(object)&&!programToneMapping())
       inspectThreeDeformation(object,{...deformationOptions,three});
     const owners=new Set(Object.values(g.attributes).map(a=>a.isInterleavedBufferAttribute?a.data:a));
     if(g.index)owners.add(g.index);
@@ -368,7 +368,7 @@ export async function createGpuThreeScene(device,scene,{
    * the owned residency, or r186's zero 1x1 default while the source loads. */
   function textureBinding(t){
     let binding;
-    const generated=pmremOwner?.binding(t)??programShadowOwner?.binding(t);
+    const generated=pmremOwner?.binding(t)??programShadowOwner?.binding(t)??morphBinding(t);
     if(generated)return generated;
     if(textures.has(t)){
       binding=textures.get(t);
@@ -393,7 +393,8 @@ export async function createGpuThreeScene(device,scene,{
   const programVariant=object=>{
     const a=object.geometry.attributes;
     return [object.isInstancedMesh===true,object.isInstancedMesh===true&&object.instanceColor!==null,!!a.normal,a.color?.itemSize??0,!!a.uv1,!!a.uv2,!!a.uv3,
-      object.geometry.index?.array.constructor.name??''].join(',');
+      object.geometry.index?.array.constructor.name??'',object.isSkinnedMesh===true,
+      ...['position','normal','color'].map(k=>a&&object.geometry.morphAttributes[k]?.length||0)].join(',');
   };
   // The attribute source a program reads: the geometry, or for InstancedMesh a
   // per-object view adding instanceMatrix/instanceColor as WebGLRenderer binds them.
@@ -490,6 +491,23 @@ export async function createGpuThreeScene(device,scene,{
       else if(!pendingTextures.has(source))fail('PREPARE','A PMREM cube source is complete; prepare() generates it');
     }
     return null;
+  }
+  /** WebGLMorphtargets' DataArrayTexture (built by the program support): its own
+   * rgba32float array residency, written once (r186 rebuilds it only when the
+   * target count changes, which makes a new texture). */
+  const morphBindings=new WeakMap();
+  function morphBinding(t){
+    if(t?.isF3DMorphTexture!==true)return undefined;
+    let b=morphBindings.get(t);
+    if(!b){
+      const {width,height,depth,data}=t.image;
+      const texture=device.createTexture({label:'f3d-morph-targets',size:[width,height,depth],format:'rgba32float',usage:4|2});
+      device.queue.writeTexture({texture},data,{bytesPerRow:width*16,rowsPerImage:height},[width,height,depth]);
+      b={texture,view:texture.createView({dimension:'2d-array'}),sampler:device.createSampler({label:'f3d-morph-targets'}),sampleType:'unfilterable-float'};
+      morphBindings.set(t,b);
+      t.addEventListener('dispose',()=>{morphBindings.delete(t);texture.destroy();});
+    }
+    return b;
   }
   function equirectCube(source){
     const r=pmrem().lookupCube(source);
@@ -598,7 +616,7 @@ export async function createGpuThreeScene(device,scene,{
         if(texture!=null&&!(texture instanceof three.Texture))fail('TEXTURE',`Uniform ${t.name} is not a texture`);
         if(texture&&(t.dimension==='cube')!==(texture.isCubeTexture===true))fail('TEXTURE',`Uniform ${t.name} texture dimension differs from its sampler`);
         const shadowMap=!!texture&&!!programShadowOwner?.binding(texture);
-        if(texture&&(t.dimension==='3d'||t.dimension==='2d-array'||(t.comparison&&!shadowMap)))fail('TEXTURE',`Sampler ${t.glslType} textures are not admitted yet`);
+        if(texture&&(t.dimension==='3d'||(t.dimension==='2d-array'&&texture.isF3DMorphTexture!==true)||(t.comparison&&!shadowMap)))fail('TEXTURE',`Sampler ${t.glslType} textures are not admitted yet`);
         // A shadow sampler without a rendered map (r186 binds an incomplete unit).
         if(!texture&&!textureScan&&/Shadow/.test(t.glslType))fail('SHADOW',`Shadow map ${t.name} was never rendered`);
         const binding=texture?textureBinding(texture):placeholderBinding();

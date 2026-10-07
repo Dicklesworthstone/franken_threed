@@ -480,6 +480,30 @@ export const scenarios = {
     scene.add(mesh, floor, sun, new THREE.AmbientLight(0xffffff, 0.4));
     return { scene, camera: camera(THREE, [0, 0.6, 3.2]) };
   },
+  // WebGLMorphtargets on the program route: position/normal morph texture,
+  // influences, relative and absolute targets, under in-shader tone mapping.
+  shaderlib_morph(THREE, renderer) {
+    renderer.toneMapping = THREE.NeutralToneMapping;
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x182030);
+    const geometry = new THREE.BoxGeometry(0.8, 0.8, 0.8, 8, 8, 8), p = geometry.attributes.position;
+    const sphere = [], twist = [], v = new THREE.Vector3();
+    for (let i = 0; i < p.count; i++) {
+      v.fromBufferAttribute(p, i);
+      const s = v.clone().normalize().multiplyScalar(0.55); sphere.push(s.x, s.y, s.z);
+      const a = v.y * 2; twist.push(v.x * Math.cos(a) - v.z * Math.sin(a), v.y * 1.3, v.x * Math.sin(a) + v.z * Math.cos(a));
+    }
+    geometry.morphAttributes.position = [new THREE.Float32BufferAttribute(sphere, 3), new THREE.Float32BufferAttribute(twist, 3)];
+    const mesh = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({ color: 0x66ccff, roughness: 0.35 }));
+    mesh.morphTargetInfluences = [0.55, 0.3]; mesh.rotation.set(0.4, 0.6, 0); mesh.position.x = -0.55;
+    const rel = new THREE.BufferGeometry().copy(geometry); rel.morphTargetsRelative = true;
+    rel.morphAttributes.position = [new THREE.Float32BufferAttribute(sphere.map(x => x * 0.4), 3)];
+    const mesh2 = new THREE.Mesh(rel, new THREE.MeshLambertMaterial({ color: 0xffaa66 }));
+    mesh2.morphTargetInfluences = [0.8]; mesh2.position.x = 0.6; mesh2.rotation.set(0.2, -0.5, 0);
+    const sun = new THREE.DirectionalLight(0xffffff, 2.5); sun.position.set(1, 2, 3);
+    scene.add(mesh, mesh2, sun, new THREE.AmbientLight(0xffffff, 0.4));
+    return { scene, camera: camera(THREE, [0, 0.4, 3]) };
+  },
   // MeshPhysicalMaterial extensions via ShaderLib programs (WebGL surface), and a
   // nearest-sampled float32 DataTexture read by a ShaderMaterial.
   shaderlib_physical(THREE) {

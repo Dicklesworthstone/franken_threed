@@ -229,7 +229,12 @@ shadow casters use skinned depth programs. Programs take skinned meshes under
 in-shader tone mapping (elsewhere the core deformation path still draws them).
 Scenario `shaderlib_skinning` (AgX, program shadow map) matches upstream
 WebGLRenderer exactly (0 differing pixels). Morph targets remain an explicit
-error on programs. Parity now forbids the HDR fallback for program-route
+error on programs only for InstancedMesh morph textures: WebGLMorphtargets is
+ported (per-geometry Float32 DataArrayTexture of position/normal/color deltas,
+`morphTargetBaseInfluence` / `morphTargetInfluences` / texture size per draw,
+texelFetch by gl_VertexID), bound as an rgba32float 2D array; scenario
+`shaderlib_morph` (absolute and relative targets, Neutral tone mapping) matches
+upstream WebGLRenderer exactly. Parity now forbids the HDR fallback for program-route
 scenarios (`F3D_NO_FALLBACK` test seam), so a silent fallback fails them.
 
 Not admitted yet (explicit errors): transmission (needs its render target),

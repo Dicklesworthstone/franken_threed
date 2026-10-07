@@ -36,10 +36,9 @@ export function inspectThreeProgram(T, material, object) {
   const builtin = SHADER_IDS[material?.type] !== undefined;
   if (!material?.isShaderMaterial && !builtin) fail('SOURCE', 'Expected a ShaderMaterial, RawShaderMaterial or ShaderLib material');
   if (material.isShaderMaterial && (typeof material.vertexShader !== 'string' || typeof material.fragmentShader !== 'string')) fail('SOURCE', 'Program sources must be strings');
-  if (Object.values(object.geometry?.morphAttributes ?? {}).some(a => a?.length) || object.isBatchedMesh)
-    fail('OBJECT', 'Morphed and batched program objects are not admitted yet');
+  if (object.isBatchedMesh) fail('OBJECT', 'Batched program objects are not admitted yet');
+  if (object.isInstancedMesh && object.morphTexture != null) fail('OBJECT', 'Instanced morph textures are not admitted yet');
   if (object.isSkinnedMesh && !(object.skeleton instanceof T.Skeleton)) fail('OBJECT', 'Skinned program objects need their skeleton');
-  if (object.isInstancedMesh && object.morphTexture != null) fail('OBJECT', 'Instanced morph textures are not admitted');
   if (material.uniformsGroups?.length) fail('UNIFORMS', 'Uniform buffer groups are not admitted yet');
   if (material.onBeforeCompile !== T.Material.prototype.onBeforeCompile || material.onBeforeRender !== T.Material.prototype.onBeforeRender)
     fail('HOOK', 'Program hooks require their original component');
@@ -130,7 +129,44 @@ export function threeProgramRaster(T, m, {frontFaceCW = false, topology = 'trian
 
 // ---- uniform values ---------------------------------------------------------
 const BUILTIN = new Set(['modelMatrix', 'modelViewMatrix', 'projectionMatrix', 'viewMatrix', 'normalMatrix', 'cameraPosition', 'isOrthographic', 'toneMappingExposure', 'receiveShadow',
-  'bindMatrix', 'bindMatrixInverse']);
+  'bindMatrix', 'bindMatrixInverse', 'morphTargetBaseInfluence', 'morphTargetInfluences', 'morphTargetsTextureSize']);
+
+// ---- WebGLMorphtargets (retained-JS port) -----------------------------------
+const morphCaches = new WeakMap();
+const morphAttributeOf = g => g.morphAttributes.position || g.morphAttributes.normal || g.morphAttributes.color;
+/** The geometry's morph DataArrayTexture (Float32 RGBA texels: position, normal,
+ * color per vertex), built once per geometry and target count, as r186 does. */
+export function threeMorphTargets(T, geometry, maxTextureSize = 8192) {
+  let cache = morphCaches.get(T);
+  if (!cache) morphCaches.set(T, cache = new WeakMap());
+  const morphAttribute = morphAttributeOf(geometry), count = morphAttribute !== undefined ? morphAttribute.length : 0;
+  let entry = cache.get(geometry);
+  if (entry === undefined || entry.count !== count) {
+    if (entry !== undefined) entry.texture.dispose();
+    const hasPosition = geometry.morphAttributes.position !== undefined, hasNormal = geometry.morphAttributes.normal !== undefined, hasColor = geometry.morphAttributes.color !== undefined;
+    const targets = geometry.morphAttributes.position || [], normals = geometry.morphAttributes.normal || [], colors = geometry.morphAttributes.color || [];
+    const vertexDataCount = hasColor ? 3 : hasNormal ? 2 : hasPosition ? 1 : 0;
+    let width = geometry.attributes.position.count * vertexDataCount, height = 1;
+    if (width > maxTextureSize) { height = Math.ceil(width / maxTextureSize); width = maxTextureSize; }
+    const buffer = new Float32Array(width * height * 4 * count), texture = new T.DataArrayTexture(buffer, width, height, count);
+    texture.type = T.FloatType; texture.needsUpdate = true; texture.isF3DMorphTexture = true;
+    const stride = vertexDataCount * 4, v = new T.Vector4();
+    for (let i = 0; i < count; i++) {
+      const offset = width * height * 4 * i, target = targets[i], normal = normals[i], color = colors[i];
+      for (let j = 0; j < (target ?? normal ?? color).count; j++) {
+        const at = offset + j * stride;
+        if (hasPosition) { v.fromBufferAttribute(target, j); buffer[at] = v.x; buffer[at + 1] = v.y; buffer[at + 2] = v.z; buffer[at + 3] = 0; }
+        if (hasNormal) { v.fromBufferAttribute(normal, j); buffer[at + 4] = v.x; buffer[at + 5] = v.y; buffer[at + 6] = v.z; buffer[at + 7] = 0; }
+        if (hasColor) { v.fromBufferAttribute(color, j); buffer[at + 8] = v.x; buffer[at + 9] = v.y; buffer[at + 10] = v.z; buffer[at + 11] = color.itemSize === 4 ? v.w : 1; }
+      }
+    }
+    entry = {count, texture, size: new T.Vector2(width, height)};
+    cache.set(geometry, entry);
+    const disposeTexture = () => { texture.dispose(); cache.delete(geometry); geometry.removeEventListener('dispose', disposeTexture); };
+    geometry.addEventListener('dispose', disposeTexture);
+  }
+  return entry;
+}
 
 /** Write one frame's uniform values for one draw from a WebGLRenderer-style
  * uniforms object (material.uniforms, or a refreshed ShaderLib clone). Values
@@ -146,7 +182,16 @@ export function packThreeProgramUniforms(T, reflection, uniforms, object, camera
     toneMappingExposure, receiveShadow: object.receiveShadow === true,
     // setProgram: setOptional(object, 'bindMatrix' / 'bindMatrixInverse') for skinned meshes.
     bindMatrix: object.isSkinnedMesh ? object.bindMatrix : null, bindMatrixInverse: object.isSkinnedMesh ? object.bindMatrixInverse : null,
+    morphTargetBaseInfluence: null, morphTargetInfluences: null, morphTargetsTextureSize: null,
   };
+  const geometry = object.geometry;
+  if (geometry && morphAttributeOf(geometry) !== undefined) {
+    // WebGLMorphtargets.update: base influence and influences (non-instanced).
+    const influences = object.morphTargetInfluences, sum = influences.reduce((a, b) => a + b, 0);
+    builtin.morphTargetBaseInfluence = geometry.morphTargetsRelative ? 1 : 1 - sum;
+    builtin.morphTargetInfluences = influences;
+    builtin.morphTargetsTextureSize = threeMorphTargets(T, geometry).size;
+  }
   for (const u of reflection.uniforms) {
     // receiveShadow: set from the object each draw, then overwritten by a
     // material uniform of that name when one exists (WebGLRenderer.setProgram order).
@@ -266,11 +311,14 @@ export function createThreeProgramSupport({three: T, state, maxPrograms = 256, m
    * light-state shadow maps, and a skinned mesh's bone texture (computed on
    * first use, as setProgram does). */
   function objectSamplers(material, object) {
-    const shadows = material ? shadowSamplers(material) : null;
-    if (!object?.isSkinnedMesh) return shadows;
-    const skeleton = object.skeleton;
-    if (skeleton.boneTexture === null) skeleton.computeBoneTexture();
-    return {...shadows, boneTexture: skeleton.boneTexture};
+    let out = material ? shadowSamplers(material) : null;
+    if (object?.isSkinnedMesh) {
+      const skeleton = object.skeleton;
+      if (skeleton.boneTexture === null) skeleton.computeBoneTexture();
+      out = {...out, boneTexture: skeleton.boneTexture};
+    }
+    if (object?.geometry && morphAttributeOf(object.geometry) !== undefined) out = {...out, morphTargetsTexture: threeMorphTargets(T, object.geometry).texture};
+    return out;
   }
   /** setProgram's refreshMaterial work: lights, fog and material values. */
   function refresh(material, {fog = null, envMap = null, envMapRotation, distanceLight = null} = {}) {
