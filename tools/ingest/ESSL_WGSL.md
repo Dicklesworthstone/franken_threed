@@ -182,7 +182,16 @@ Scenarios `shaderlib_background_cube` / `shaderlib_background_texture` match
 upstream WebGLRenderer (0.06% / 0% of pixels differ); `webgl_materials_envmaps`,
 `webgl_materials_cubemap`, `webgl_materials_cubemap_refraction`,
 `webgl_materials_blending`, `webgl_effects_stereo` run. Equirectangular
-backgrounds without blur need `WebGLCubeRenderTarget` conversion (explicit error).
+backgrounds without blur, and equirect envMaps on Basic/Lambert/Phong, use
+r186 `WebGLEnvironments.getCube`: the application's own
+`WebGLCubeRenderTarget.fromEquirectangularTexture` (CubeCamera's six face
+renders of the CubemapFromEquirect program, recorded by the same host as PMREM,
+GL rows, sRGB-encoded storage for 8-bit sRGB sources, render-pass box-filtered
+mipmaps when requested). Scenario `shaderlib_equirect_cube` matches upstream
+WebGLRenderer (0 differing pixels beyond tolerance; mean diff 0.01).
+`webgl_loader_gltf` (HDR equirect background + environment, ACES) and
+`webgl_materials_envmaps_exr` run; mipmap filtering is GPU box filtering where
+GL's generateMipmap is implementation-defined.
 
 Tone mapping (WebGL surface): r186 WebGLRenderer tone-maps inside each
 `toneMapped` material's program, before blending and sRGB encoding, not with a

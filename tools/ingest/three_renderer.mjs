@@ -125,10 +125,16 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
             // A changed feature profile selects different bridge pipelines.
             // Retire the old owner only after the replacement is published.
             const background = scene.background && !scene.background.isColor;
-            const bridge = await createGpuThreeScene(device, scene, {
+            // Options and the entry key describe the same live profile.
+            const liveKey = sceneKey(owner, scene);
+            let bridge;
+            try { bridge = await createGpuThreeScene(device, scene, {
               // Mesh-count caps follow the binding capacity; the byte budgets
               // (deformation/instance) stay the scene owner's defaults and bound memory.
               maxDeformedMeshes: Math.min(maxBindings, 4096), maxInstanceMeshes: Math.min(maxBindings, 4096),
+              // Source renderers have no texture budget: bound residency by a
+              // device-scale default (1 GiB) rather than the bridge's 128 MiB.
+              texture: {maxTextureBytes: 1024 * 1024 * 1024},
               ...sceneLimits, three: THREE, signal, maxBindings,
               renderer: {...attachments, instancing: true, renderBundles: true, maxDraws,
                 ...(owner._hdr || !owner._shaderEncodedOutput ? {} : {outputTransfer: 'srgb'})},
@@ -141,9 +147,14 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
               background: background ? {} : null,
               shadow: owner.shadowMap.enabled ? {} : null,
               clipping: clipping || previous?.clipping ? owner._clippingControls ?? clippingControls : null,
-            });
+            }); } catch (error) {
+              // The scene gained/lost fog, environment or background while the
+              // bridge was being created: the next preparation round rebuilds it.
+              if (error?.code === 'THREE_SCENE_SCENE' && sceneKey(owner, scene) !== liveKey) continue;
+              throw error;
+            }
             if (disposed) { bridge.dispose(); return; }
-            entries.set(scene, {bridge, key, clipping: clipping || !!previous?.clipping, lastDiagnostics: null});
+            entries.set(scene, {bridge, key: liveKey, clipping: clipping || !!previous?.clipping, lastDiagnostics: null});
             previous?.bridge.dispose();
           }
         },
@@ -565,10 +576,17 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       await this.compileAsync(scene, camera);
       this.render(scene, camera);
     }
-    async compileAsync(scene, camera) {
+    async compileAsync(scene, camera, targetScene = null) {
       await this.init();
       if (this._deferredError) { const error = this._deferredError; this._deferredError = null; throw error; }
       if (camera !== undefined && !(camera instanceof THREE.Camera)) fail('SOURCE', 'Expected a source camera');
+      // Source signature compileAsync(object, camera, targetScene): an object is
+      // compiled against the scene whose lights/environment it will render in.
+      // Preparation is per rendered Scene here; an object outside any Scene has
+      // nothing to prepare until it is rendered within one.
+      const compiled = targetScene ?? scene;
+      if (!compiled?.isScene) return;
+      scene = compiled;
       this._wanted.set(scene, sceneKey(this, scene));
       while (this._drain) await this._drain;
       await this._prepare();

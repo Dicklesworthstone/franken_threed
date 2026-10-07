@@ -99,7 +99,9 @@ function textureInspector(T,{
     const maxAnisotropy=mag[0]==='linear'&&t.minFilter===T.LinearMipmapLinearFilter?anisotropy:1;
     const data=cube?t.image[0]?.isDataTexture===true:t.isDataTexture===true;
     if(bpc!==1&&(!data||video))fail('FORMAT','Half-float and float storage is admitted for DataTextures');
-    if(bpc!==1&&t.generateMipmaps)fail('MIPS','Generated mipmaps for float storage are not admitted yet');
+    // generateMipmap on half-float/float storage: render-pass box filtering, as for
+    // bytes; float32 needs float32-filterable (WebGL: OES_texture_float_linear).
+    if(bpc===4&&t.generateMipmaps&&!float32Filterable)fail('MIPS','Generated float32 mipmaps need the float32-filterable device feature');
     // Float32 linear filtering needs the device's float32-filterable feature (WebGL
     // OES_texture_float_linear); never silently degrade to nearest.
     const filterable=bpc!==4||float32Filterable;

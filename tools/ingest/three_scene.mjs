@@ -456,11 +456,25 @@ export async function createGpuThreeScene(device,scene,{
       return {envMap:null,envMapRotation};
     }
     if(source.mapping===three.CubeUVReflectionMapping&&pmremOwner?.binding(source))return {envMap:source,envMapRotation};
+    if(source.mapping===three.EquirectangularReflectionMapping||source.mapping===three.EquirectangularRefractionMapping)
+      return {envMap:equirectCube(source),envMapRotation};
     if(!source.isCubeTexture||![three.CubeReflectionMapping,three.CubeRefractionMapping].includes(source.mapping))
       fail('TEXTURE','Equirectangular/render-target environment maps need cube conversion, not admitted yet');
     return {envMap:source,envMapRotation};
   }
-  let pmremOwner=null,pmremRequests=new Set();
+  let pmremOwner=null,pmremRequests=new Set(),cubeRequests=new Set();
+  /** WebGLEnvironments.getCube for an equirect source: the converted cube
+   * render-target texture, or null while incomplete/loading (r186 renders
+   * without it); a complete source is generated at the preparation boundary. */
+  function equirectCube(source){
+    const r=pmrem().lookupCube(source);
+    if(r.state==='ready')return r.texture;
+    if(r.state==='needed'){
+      if(textureScan){cubeRequests.add(source);textureBinding(source);}
+      else if(!pendingTextures.has(source))fail('PREPARE','An equirectangular environment is complete; prepare() converts it');
+    }
+    return null;
+  }
   const programShadows=()=>programShadowOwner??=(programSupport.createShadows?.(device,{bindingOf:t=>textureBinding(t),sourceOf:programSource,clipping:programClippingControls})??
     fail('SHADOW','Program shadow maps need the program shadow owner'));
   // The renderer's shadowMap controls and the renderer object passed to shadow callbacks.
@@ -495,8 +509,11 @@ export async function createGpuThreeScene(device,scene,{
         }
         return null;
       }
-    }else if(background.mapping===three.EquirectangularReflectionMapping||background.mapping===three.EquirectangularRefractionMapping)
-      fail('TEXTURE','Equirectangular backgrounds need WebGLCubeRenderTarget conversion, not admitted yet');
+    }else if(background.mapping===three.EquirectangularReflectionMapping||background.mapping===three.EquirectangularRefractionMapping){
+      // WebGLEnvironments.getCube: the converted cube render target.
+      background=equirectCube(background);
+      if(!background)return null;
+    }
     const ShaderLib=three.ShaderLib,toneMapped=three.ColorManagement.getTransfer(background.colorSpace)!==three.SRGBTransfer;
     if(background.isCubeTexture||background.mapping===three.CubeUVReflectionMapping){
       let box=programBackgroundMeshes.box;
@@ -857,14 +874,14 @@ export async function createGpuThreeScene(device,scene,{
     try{
       // Validate all source materials and texture inputs before allocating any
       // textures. Temporary inspection placeholders never reach renderer.addMesh.
-      pendingTextures=new WeakSet();pmremRequests=new Set();
+      pendingTextures=new WeakSet();pmremRequests=new Set();cubeRequests=new Set();
       let owned;
       try{owned=scanTextures();}
       catch(error){
         // A program draw needs shadows the core map cannot give it: switch this
         // bridge to program shadow maps (sticky) and rescan.
         if(error?.code!=='THREE_SCENE_PROGRAM_SHADOW'||programShadowSticky||!programSupport.createShadows)throw error;
-        programShadowSticky=true;pendingTextures=new WeakSet();pmremRequests=new Set();owned=scanTextures();
+        programShadowSticky=true;pendingTextures=new WeakSet();pmremRequests=new Set();cubeRequests=new Set();owned=scanTextures();
       }
       textureOwner?.prepare(owned);
       preparedShadowMode=programShadowMode;
@@ -875,6 +892,7 @@ export async function createGpuThreeScene(device,scene,{
       // PMREM sources are owned textures now; generate their cube-UV targets
       // before the descriptions that bind them.
       for(const source of pmremRequests)if(!pendingTextures.has(source)){await Promise.race([pmrem().generate(source),stopped]);live();}
+      for(const source of cubeRequests)if(!pendingTextures.has(source)){await Promise.race([pmrem().convert(source),stopped]);live();}
       const nodes=graph(),request=desired(nodes),next=[];
       const selected=shadowEnabled?shadowLight(nodes):null;
       const shadowSignature=selected?shadowApi.inspectThreeShadow(selected,three).signature:null;

@@ -441,6 +441,19 @@ export const scenarios = {
     scene.add(floor, hot, glass, flat, sun, new THREE.HemisphereLight(0x8899ff, 0x332211, 1.2));
     return { scene, camera: camera(THREE, [0, 1, 3.2]) };
   },
+  // r186 WebGLCubeRenderTarget.fromEquirectangularTexture (CubeCamera faces,
+  // generated mips) for an equirect background and a Phong equirect envMap.
+  shaderlib_equirect_cube(THREE) {
+    const scene = new THREE.Scene();
+    const w = 128, h = 64, d = new Uint8Array(w * h * 4);
+    for (let i = 0; i < w * h; i++) { const x = i % w, y = (i / w) | 0; d.set([(x * 2) & 255, 255 - y * 4, ((x >> 3) + (y >> 3)) % 2 ? 220 : 50, 255], i * 4); }
+    const pano = new THREE.DataTexture(d, w, h); pano.mapping = THREE.EquirectangularReflectionMapping; pano.colorSpace = THREE.SRGBColorSpace;
+    pano.magFilter = THREE.LinearFilter; pano.minFilter = THREE.LinearMipmapLinearFilter; pano.generateMipmaps = true; pano.needsUpdate = true;
+    scene.background = pano;
+    const ball = new THREE.Mesh(new THREE.SphereGeometry(0.6, 48, 24), new THREE.MeshPhongMaterial({ color: 0xffffff, envMap: pano, reflectivity: 0.8, shininess: 60 }));
+    scene.add(ball, new THREE.DirectionalLight(0xffffff, 1.5), new THREE.AmbientLight(0xffffff, 0.3));
+    return { scene, camera: camera(THREE, [0.8, 0.3, 2.6]) };
+  },
   // MeshPhysicalMaterial extensions via ShaderLib programs (WebGL surface), and a
   // nearest-sampled float32 DataTexture read by a ShaderMaterial.
   shaderlib_physical(THREE) {
