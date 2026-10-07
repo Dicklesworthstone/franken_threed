@@ -45,5 +45,9 @@ test('PMREMGenerator substitute describes captures for new-backend renderers onl
   const equirect = pmrem.fromEquirectangular(hdr).texture;
   assert.notEqual(equirect, hdr); assert.equal(equirect.source, hdr.source);
   assert.equal(equirect.mapping, T.EquirectangularReflectionMapping);
-  assert.throws(() => pmrem.fromCubemap(new T.CubeTexture()), {code: 'F3D_RENDERER_UNSUPPORTED'});
+  // fromCubemap describes its source; the cube-UV map is generated at preparation.
+  const cube = new T.CubeTexture(), fromCube = pmrem.fromCubemap(cube).texture;
+  assert.equal(fromCube.mapping, T.CubeUVReflectionMapping);
+  assert.equal(fromCube.f3dPMREMSource, cube);
+  assert.throws(() => pmrem.fromCubemap(new T.Texture()), {code: 'F3D_RENDERER_SOURCE'});
 });

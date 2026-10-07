@@ -422,8 +422,9 @@ export async function createGpuThreeScene(device,scene,{
   // owner cannot take the source.
   function programEnvironmentOwned(){
     const env=scene.environment;
-    if(!programRoute()||!env||env.isF3DSceneEnvironment===true)return false;
-    if(programToneMapping()||!environmentEnabled)return true;
+    if(!programRoute()||!env)return false;
+    // Renderer-route PMREMGenerator.fromScene captures: r186 PMREM through programs.
+    if(programToneMapping()||!environmentEnabled||env.isF3DSceneEnvironment===true)return true;
     try{environmentApi.inspectThreeEnvironment(env,three,environmentOptions);return false;}
     catch(error){if(String(error?.code).startsWith('THREE_ENVIRONMENT_'))return true;throw error;}
   }
@@ -443,6 +444,7 @@ export async function createGpuThreeScene(device,scene,{
     const source=m.isShaderMaterial?(m.envMap??null):(m.envMap||environment);
     if(!source)return {envMap:null,envMapRotation:m.envMapRotation};
     const envMapRotation=m.envMap?m.envMapRotation:scene.environmentRotation;
+    if(source.isF3DSceneEnvironment===true||source.isF3DPMREMSource===true)return {envMap:pmremPlaceholder(source),envMapRotation};
     if(usePMREM){
       // WebGLEnvironments.getPMREM: cube-UV target once the source is complete.
       const r=pmrem().lookup(source);
@@ -462,10 +464,28 @@ export async function createGpuThreeScene(device,scene,{
       fail('TEXTURE','Equirectangular/render-target environment maps need cube conversion, not admitted yet');
     return {envMap:source,envMapRotation};
   }
-  let pmremOwner=null,pmremRequests=new Set(),cubeRequests=new Set();
+  let pmremOwner=null,pmremRequests=new Set(),cubeRequests=new Set(),sceneRequests=new Set();
   /** WebGLEnvironments.getCube for an equirect source: the converted cube
    * render-target texture, or null while incomplete/loading (r186 renders
    * without it); a complete source is generated at the preparation boundary. */
+  /** Renderer-route PMREMGenerator results (fromScene captures, fromCubemap
+   * sources): the cube-UV texture generated at preparation, else null. */
+  function pmremPlaceholder(t){
+    if(t.isF3DSceneEnvironment===true){
+      const r=pmrem().lookupScene(t);
+      if(r.state==='ready')return r.texture;
+      if(textureScan)sceneRequests.add(t);
+      else fail('PREPARE','A PMREM scene capture is generated at prepare()');
+      return null;
+    }
+    const source=t.f3dPMREMSource,r=pmrem().lookup(source);
+    if(r.state==='ready')return r.texture;
+    if(r.state==='needed'){
+      if(textureScan){pmremRequests.add(source);textureBinding(source);}
+      else if(!pendingTextures.has(source))fail('PREPARE','A PMREM cube source is complete; prepare() generates it');
+    }
+    return null;
+  }
   function equirectCube(source){
     const r=pmrem().lookupCube(source);
     if(r.state==='ready')return r.texture;
@@ -497,7 +517,10 @@ export async function createGpuThreeScene(device,scene,{
     bgRotation??=new three.Matrix4();bgFlip??=new three.Matrix3().set(-1,0,0,0,1,0,0,0,1);
     let background=scene.background;
     if(!background?.isTexture)return null;
-    if(scene.backgroundBlurriness>0){
+    if(background.isF3DSceneEnvironment===true||background.isF3DPMREMSource===true){
+      background=pmremPlaceholder(background);
+      if(!background)return null;
+    }else if(scene.backgroundBlurriness>0){
       // WebGLEnvironments.get(background, usePMREM = true)
       const r=pmrem().lookup(background);
       if(r.state==='ready')background=r.texture;
@@ -874,14 +897,14 @@ export async function createGpuThreeScene(device,scene,{
     try{
       // Validate all source materials and texture inputs before allocating any
       // textures. Temporary inspection placeholders never reach renderer.addMesh.
-      pendingTextures=new WeakSet();pmremRequests=new Set();cubeRequests=new Set();
+      pendingTextures=new WeakSet();pmremRequests=new Set();cubeRequests=new Set();sceneRequests=new Set();
       let owned;
       try{owned=scanTextures();}
       catch(error){
         // A program draw needs shadows the core map cannot give it: switch this
         // bridge to program shadow maps (sticky) and rescan.
         if(error?.code!=='THREE_SCENE_PROGRAM_SHADOW'||programShadowSticky||!programSupport.createShadows)throw error;
-        programShadowSticky=true;pendingTextures=new WeakSet();pmremRequests=new Set();cubeRequests=new Set();owned=scanTextures();
+        programShadowSticky=true;pendingTextures=new WeakSet();pmremRequests=new Set();cubeRequests=new Set();sceneRequests=new Set();owned=scanTextures();
       }
       textureOwner?.prepare(owned);
       preparedShadowMode=programShadowMode;
@@ -893,6 +916,7 @@ export async function createGpuThreeScene(device,scene,{
       // before the descriptions that bind them.
       for(const source of pmremRequests)if(!pendingTextures.has(source)){await Promise.race([pmrem().generate(source),stopped]);live();}
       for(const source of cubeRequests)if(!pendingTextures.has(source)){await Promise.race([pmrem().convert(source),stopped]);live();}
+      for(const source of sceneRequests){await Promise.race([pmrem().generateScene(source),stopped]);live();}
       const nodes=graph(),request=desired(nodes),next=[];
       const selected=shadowEnabled?shadowLight(nodes):null;
       const shadowSignature=selected?shadowApi.inspectThreeShadow(selected,three).signature:null;

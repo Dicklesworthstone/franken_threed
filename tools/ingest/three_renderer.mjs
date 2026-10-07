@@ -799,8 +799,21 @@ export function createPMREMGeneratorClass(THREE, {exactBackend = null} = {}) {
       return {isRenderTarget: true, texture, dispose() { texture.dispose(); }};
     }
     async fromEquirectangularAsync(...args) { return this.fromEquirectangular(...args); }
-    fromCubemap() { fail('UNSUPPORTED', 'PMREM from cube textures is not admitted yet'); }
-    async fromCubemapAsync() { this.fromCubemap(); }
+    /** The cube-UV result is generated from the source at the scene bridge's
+     * preparation boundary (WebGL surface programs run r186 PMREMGenerator
+     * there); other routes reject the placeholder explicitly when preparing. */
+    fromCubemap(cubemap, renderTarget = null) {
+      if (renderTarget !== null) fail('UNSUPPORTED', 'Explicit PMREM render targets are not admitted');
+      if (!cubemap?.isCubeTexture) fail('SOURCE', 'Expected a source CubeTexture');
+      const texture = new THREE.Texture();
+      texture.name = 'PMREM.cubeUv';
+      texture.mapping = THREE.CubeUVReflectionMapping;
+      texture.colorSpace = THREE.LinearSRGBColorSpace;
+      texture.isF3DPMREMSource = true;
+      texture.f3dPMREMSource = cubemap;
+      return {isRenderTarget: true, texture, dispose() { texture.dispose(); }};
+    }
+    async fromCubemapAsync(...args) { return this.fromCubemap(...args); }
     compileCubemapShader() {}
     compileEquirectangularShader() {}
     dispose() {}

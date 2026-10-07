@@ -20,8 +20,10 @@
  * source's `dispose` event. Render-target sources (pmremVersion) are explicit
  * errors here. No performance claim.
  */
-import {threeProgramSources, threeProgramRaster, packThreeProgramUniforms} from './three_program.mjs';
+import {threeProgramSources, threeProgramRaster, packThreeProgramUniforms, createThreeProgramSupport} from './three_program.mjs';
 import {compileEsslProgram} from './essl_wgsl.mjs';
+import {createGpuProgramGeometry, programGeometrySnapshot} from './gpu_buffer_geometry.mjs';
+import {animationDfgHalves} from './animation_dfg.mjs';
 
 export class ThreeProgramPMREMError extends Error {
   constructor(code, message) { super(`THREE_PMREM_${code}: ${message}`); this.name = 'ThreeProgramPMREMError'; this.code = 'THREE_PMREM_' + code; }
@@ -52,8 +54,9 @@ export function cubeSourceComplete(T, texture) { return pmremSourceKind(T, textu
 export function createThreeProgramPMREM({three: T, device, bindingOf, label = 'f3d-pmrem'}) {
   const host = createHost();
   const generator = new T.PMREMGenerator(host);
-  const done = new Map(), outputs = new Map(), targets = new Map(), programs = new Map(), retired = [], cubes = new Map();
-  let disposed = false, sampler = null, constant = null, mipper = null;
+  const done = new Map(), outputs = new Map(), targets = new Map(), programs = new Map(), retired = [], cubes = new Map(), scenes = new Map();
+  let disposed = false, sampler = null, constant = null, mipper = null, capture = null, dfg = null;
+  const residencies = new Map(), scenePipelines = new Map(), frustum = new T.Frustum(), projScreen = new T.Matrix4(), zVector = new T.Vector3();
 
   /** The renderer calls PMREMGenerator and CubeCamera make, recorded in order. */
   function createHost() {
@@ -71,7 +74,8 @@ export function createThreeProgramPMREM({three: T, device, bindingOf, label = 'f
       render(scene, camera) {
         if (!recording) fail('STATE', 'Offscreen draws outside a generation');
         if (!target) fail('STATE', 'Offscreen draws need a render target');
-        if (!scene?.isMesh) fail('STATE', 'Only single-mesh offscreen renders are admitted');
+        if (scene?.isScene) { for (const d of renderScene(target, face, scene, camera, this.autoClear)) recording.push(d); return; }
+        if (!scene?.isMesh) fail('STATE', 'Only meshes and scenes render offscreen');
         // WebGLRenderer.render: world matrices, then the object's view matrices.
         if (scene.matrixWorldAutoUpdate === true) scene.updateMatrixWorld();
         if (camera.parent === null && camera.matrixWorldAutoUpdate === true) camera.updateMatrixWorld();
@@ -106,6 +110,105 @@ export function createThreeProgramPMREM({three: T, device, bindingOf, label = 'f
     return {target, face, entry, bytes, textures, samplers, geometry: mesh.geometry, raster: threeProgramRaster(T, material),
       viewport: [v.x, v.y, v.z, v.w], scissor: [s.x, s.y, s.z, s.w], clear: autoClear && !target.scissorTest};
   }
+  /** WebGLRenderer.render(scene, camera) into an offscreen target for PMREM
+   * scene captures (PMREMGenerator.fromScene): world matrices, projectObject
+   * (visibility, layers, frustum culling), painter-sorted opaque then
+   * back-to-front transparent lists, WebGLLights setup/setupView for this
+   * camera, each draw the material's ShaderLib program (linear output, no tone
+   * mapping) with uniforms refreshed and packed at the draw. Explicit errors:
+   * shadows, textured backgrounds, environments, overrides, lines/points,
+   * custom render hooks, transmission. */
+  function renderScene(target, face, scene, camera, autoClear) {
+    capture ??= createThreeProgramSupport({three: T, state: () => ({toneMapping: T.NoToneMapping, toneMappingExposure: 1,
+      outputColorSpace: T.LinearSRGBColorSpace, pixelRatio: 1, height: target.height})});
+    if (scene.matrixWorldAutoUpdate === true) scene.updateMatrixWorld();
+    if (camera.parent === null && camera.matrixWorldAutoUpdate === true) camera.updateMatrixWorld();
+    if (scene.background !== null && !scene.background?.isColor) fail('CAPTURE', 'Captured scenes with texture backgrounds are not admitted yet');
+    if (scene.environment !== null || scene.overrideMaterial !== null) fail('CAPTURE', 'Captured scenes with environments or override materials are not admitted yet');
+    if (scene.onBeforeRender !== T.Object3D.prototype.onBeforeRender) fail('CAPTURE', 'Scene render hooks need their original renderer');
+    projScreen.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+    frustum.setFromProjectionMatrix(projScreen, camera.coordinateSystem, camera.reversedDepth);
+    const lights = [], opaque = [], transparent = [];
+    const walk = (object, groupOrder) => {
+      if (object.visible === false) return;
+      if (object.layers.test(camera.layers)) {
+        if (object.isGroup) groupOrder = object.renderOrder;
+        else if (object.isLight) { if (object.castShadow) fail('CAPTURE', 'Shadow-casting lights in captured scenes are not admitted yet'); lights.push(object); }
+        else if (object.isLine || object.isPoints || object.isSprite) fail('CAPTURE', `${object.type} in captured scenes is not admitted yet`);
+        else if (object.isMesh && (!object.frustumCulled || object.intersectsFrustum(frustum))) {
+          if (object.onBeforeRender !== T.Object3D.prototype.onBeforeRender) fail('CAPTURE', 'Object render hooks need their original renderer');
+          const bounds = object.boundingSphere !== undefined ? object : object.geometry;
+          if (bounds.boundingSphere === null) bounds.computeBoundingSphere();
+          const z = zVector.copy(bounds.boundingSphere.center).applyMatrix4(object.matrixWorld).applyMatrix4(projScreen).z;
+          const push = (material, group) => { if (material?.visible) (material.transparent ? transparent : opaque).push({object, material, group, groupOrder, z}); };
+          if (Array.isArray(object.material)) for (const group of object.geometry.groups) push(object.material[group.materialIndex], group);
+          else push(object.material, null);
+        }
+      }
+      for (const child of object.children) walk(child, groupOrder);
+    };
+    walk(scene, 0);
+    const order = (a, b) => a.groupOrder - b.groupOrder || a.object.renderOrder - b.object.renderOrder;
+    opaque.sort((a, b) => order(a, b) || a.material.id - b.material.id || a.z - b.z || a.object.id - b.object.id);
+    transparent.sort((a, b) => order(a, b) || b.z - a.z || a.object.id - b.object.id);
+    capture.setLights(lights); capture.setLightsView(camera);
+    const out = [];
+    let first = autoClear;
+    for (const item of [...opaque, ...transparent]) {
+      const m = item.material, object = item.object;
+      if (m.transmission > 0) fail('CAPTURE', 'Transmission in captured scenes is not admitted yet');
+      object.modelViewMatrix.multiplyMatrices(camera.matrixWorldInverse, object.matrixWorld);
+      object.normalMatrix.getNormalMatrix(object.modelViewMatrix);
+      const sides = m.transparent && m.side === T.DoubleSide && !m.forceSinglePass ? [T.BackSide, T.FrontSide] : [m.side];
+      for (const side of sides) {
+        const compiled = capture.compile(m, object, {fog: scene.fog, side, renderTarget: true});
+        const uniforms = capture.refresh(m, {fog: scene.fog});
+        const {reflection} = compiled.program, bytes = new Uint8Array(reflection.uniformBufferSize);
+        const textures = capture.pack(reflection, uniforms, object, camera, bytes, {material: m});
+        const g = object.geometry, start = item.group ? item.group.start : 0, count = item.group ? item.group.count : Infinity;
+        out.push({kind: 'scene', target, face, compiled, object, bytes, textures, samplers: textures.map(t => t ? samplerFor(t) : null),
+          raster: capture.raster(m, {side, frontFaceCW: object.matrixWorld.determinant() < 0}), start, count,
+          instanceCount: object.isInstancedMesh ? object.count : g.isInstancedBufferGeometry ? g.instanceCount : 1,
+          viewport: [target.viewport.x, target.viewport.y, target.viewport.z, target.viewport.w],
+          scissor: target.scissorTest ? [target.scissor.x, target.scissor.y, target.scissor.z, target.scissor.w] : [target.viewport.x, target.viewport.y, target.viewport.z, target.viewport.w],
+          clear: first && !target.scissorTest});
+        first = false;
+      }
+    }
+    return out;
+  }
+  /** The attribute source a program reads (InstancedMesh adds its instance streams). */
+  const sourceViews = new WeakMap();
+  function sourceOf(object) {
+    if (!object.isInstancedMesh) return object.geometry;
+    let view = sourceViews.get(object);
+    if (!view || view.geometry !== object.geometry) {
+      const g = object.geometry;
+      view = {geometry: g, attributes: {...g.attributes, instanceMatrix: object.instanceMatrix, ...(object.instanceColor ? {instanceColor: object.instanceColor} : {})},
+        get index() { return g.index; }, get drawRange() { return g.drawRange; }, morphAttributes: g.morphAttributes, isInstancedBufferGeometry: false};
+      sourceViews.set(object, view);
+    }
+    return view;
+  }
+  function residencyFor(object, compiled) {
+    const source = sourceOf(object);
+    let byKey = residencies.get(source);
+    if (!byKey) residencies.set(source, byKey = new Map());
+    let gpu = byKey.get(compiled.attributesKey);
+    if (!gpu) byKey.set(compiled.attributesKey, gpu = createGpuProgramGeometry(device, source, compiled.program.reflection.attributes, {label: `${label}/capture`}));
+    else gpu.update();
+    return gpu;
+  }
+  /** Internal textures of captured programs (the DFG LUT) bind their own copy. */
+  function internalBinding(t) {
+    if (!(t.isDataTexture && t.name === 'DFG_LUT')) return null;
+    if (!dfg) {
+      const texture = device.createTexture({label: `${label}/dfg`, size: [16, 16, 1], format: 'rg16float', usage: 4 | 2});
+      device.queue.writeTexture({texture}, animationDfgHalves(), {bytesPerRow: 16 * 4}, [16, 16, 1]);
+      dfg = {texture, view: texture.createView(), sampler: linearSampler()};
+    }
+    return dfg;
+  }
   const FILTER = () => new Map([[T.NearestFilter, ['nearest', null]], [T.NearestMipmapNearestFilter, ['nearest', 'nearest']], [T.NearestMipmapLinearFilter, ['nearest', 'linear']],
     [T.LinearFilter, ['linear', null]], [T.LinearMipmapNearestFilter, ['linear', 'nearest']], [T.LinearMipmapLinearFilter, ['linear', 'linear']]]);
   const WRAP = () => new Map([[T.RepeatWrapping, 'repeat'], [T.ClampToEdgeWrapping, 'clamp-to-edge'], [T.MirroredRepeatWrapping, 'mirror-repeat']]);
@@ -136,8 +239,11 @@ export function createThreeProgramPMREM({three: T, device, bindingOf, label = 'f
       const mips = tex.generateMipmaps && tex.minFilter !== T.NearestFilter && tex.minFilter !== T.LinearFilter ? Math.floor(Math.log2(Math.max(target.width, target.height))) + 1 : 1;
       if (format === 'rgba32float' && !device.features?.has?.('float32-filterable') && tex.minFilter !== T.NearestFilter) fail('FORMAT', 'Linear float32 targets need float32-filterable');
       const texture = device.createTexture({label: `${label}/${tex.name}`, size: [target.width, target.height, cube ? 6 : 1], format, mipLevelCount: mips, usage: 16 | 4});
+      const layers = cube ? 6 : 1, depth = target.depthBuffer === true ? device.createTexture({label: `${label}/${tex.name}-depth`, size: [target.width, target.height, layers], format: 'depth24plus', usage: 16}) : null;
       t = {texture, format, cube, mips, view: texture.createView({dimension: cube ? 'cube' : '2d'}),
-        faces: Array.from({length: cube ? 6 : 1}, (_, f) => texture.createView({dimension: '2d', baseArrayLayer: f, arrayLayerCount: 1, baseMipLevel: 0, mipLevelCount: 1}))};
+        faces: Array.from({length: layers}, (_, f) => texture.createView({dimension: '2d', baseArrayLayer: f, arrayLayerCount: 1, baseMipLevel: 0, mipLevelCount: 1})),
+        depth, depthReady: new Array(layers).fill(false),
+        depthFaces: depth ? Array.from({length: layers}, (_, f) => depth.createView({dimension: '2d', baseArrayLayer: f, arrayLayerCount: 1})) : null};
       targets.set(target, t);
     }
     return t;
@@ -146,9 +252,9 @@ export function createThreeProgramPMREM({three: T, device, bindingOf, label = 'f
     // PMREM targets: LinearFilter min/mag, no mipmaps, ClampToEdge.
     return sampler ??= device.createSampler({label, magFilter: 'linear', minFilter: 'linear', addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge'});
   }
-  async function pipelineOf(entry, raster, geometry, format) {
+  async function pipelineOf(entry, raster, geometry, format, depth = null) {
     entry.pipelines ??= new Map();
-    const key = format + '|' + JSON.stringify(raster);
+    const key = format + '|' + depth + '|' + JSON.stringify(raster);
     if (entry.pipelines.has(key)) {
       if (entry.attributeSet !== entry.compiled.reflection.attributes.map(a => !!geometry.attributes[a.name]).join()) fail('FORMAT', 'PMREM geometry attributes changed');
       return entry.pipelines.get(key);
@@ -168,7 +274,8 @@ export function createThreeProgramPMREM({three: T, device, bindingOf, label = 'f
       fragment: {module: device.createShaderModule({label: `${label}/fragment`, code: entry.compiled.fragment}), entryPoint: 'f3d_fragment',
         targets: [{format, ...(raster.blend ? {blend: raster.blend} : {}), writeMask: raster.writeMask}]},
       // rows:'gl' mirrors clip Y, so GL's counter-clockwise front faces are clockwise here.
-      primitive: {topology: 'triangle-list', cullMode: raster.cullMode, frontFace: raster.frontFace === 'ccw' ? 'cw' : 'ccw'}});
+      primitive: {topology: 'triangle-list', cullMode: raster.cullMode, frontFace: raster.frontFace === 'ccw' ? 'cw' : 'ccw'},
+      ...(depth ? {depthStencil: {format: depth, depthWriteEnabled: raster.depthWriteEnabled, depthCompare: raster.depthCompare}} : {})});
     const built = {pipeline, uniformLayout, textureLayout};
     entry.pipelines.set(key, built);
     return built;
@@ -176,11 +283,7 @@ export function createThreeProgramPMREM({three: T, device, bindingOf, label = 'f
   function vertexBuffers(geometry, attributes, owned) {
     return attributes.map(a => {
       const source = geometry.attributes[a.name];
-      if (!source) return constant ??= (() => {
-        const b = device.createBuffer({label: `${label}/default-attribute`, size: 16, usage: 32 | 8});
-        device.queue.writeBuffer(b, 0, new Float32Array([0, 0, 0, 1]));
-        return b;
-      })();
+      if (!source) return constantBuffer();
       if (!(source.array instanceof Float32Array) || source.itemSize !== a.components || source.isInterleavedBufferAttribute) fail('FORMAT', 'Expected PMREM float attributes');
       const b = device.createBuffer({label: `${label}/${a.name}`, size: Math.max(4, source.array.byteLength), usage: 32 | 8});
       device.queue.writeBuffer(b, 0, source.array);
@@ -189,7 +292,9 @@ export function createThreeProgramPMREM({three: T, device, bindingOf, label = 'f
     });
   }
   /** Replay recorded draws in order as one command buffer, then generate the
-   * mips of targets that ask for them (WebGL generateMipmap; box-filtered). */
+   * mips of targets that ask for them (WebGL generateMipmap; box-filtered).
+   * Targets with a depth buffer get a depth24plus attachment per layer, cleared
+   * to 1.0 on first use (WebGL initializes depth attachments) or by autoClear. */
   async function execute(draws) {
     const owned = [];
     let submitted = false, failure = null;
@@ -202,36 +307,60 @@ export function createThreeProgramPMREM({three: T, device, bindingOf, label = 'f
       draws.forEach((d, i) => staged.set(d.bytes, i * stride));
       device.queue.writeBuffer(uniforms, 0, staged);
       const prepared = [], byTexture = new Map(draws.map(d => [d.target.texture, d.target]));
+      const views = (d, list) => d.textures.map((t, k) => {
+        if (!t) fail('TEXTURE', 'Offscreen pass without its input texture');
+        const rt = byTexture.get(t);
+        if (rt) return {view: targetTexture(rt).view, sampler: linearSampler(), sampleType: 'float'};
+        const internal = internalBinding(t);
+        if (internal) return {view: internal.view, sampler: internal.sampler, sampleType: 'float'};
+        const b = bindingOf(t);
+        if (!b?.view || !b.sampler) fail('TEXTURE', 'Offscreen source texture has no binding');
+        return {view: b.view, sampler: d.samplers[k] ?? b.sampler, sampleType: b.sampleType ?? 'float'};
+      });
       for (const [i, d] of draws.entries()) {
-        const out = targetTexture(d.target);
-        const {pipeline, uniformLayout, textureLayout} = await pipelineOf(d.entry, d.raster, d.geometry, out.format);
-        const views = d.textures.map((t, k) => {
-          if (!t) fail('TEXTURE', 'Offscreen pass without its input texture');
-          const rt = byTexture.get(t);
-          if (rt) return {view: targetTexture(rt).view, sampler: linearSampler()};
-          const b = bindingOf(t);
-          if (!b?.view || !b.sampler) fail('TEXTURE', 'Offscreen source texture has no binding');
-          return {view: b.view, sampler: d.samplers[k] ?? b.sampler};
-        });
-        const reflection = d.entry.compiled.reflection;
-        prepared.push({d, out, pipeline, buffers: vertexBuffers(d.geometry, reflection.attributes, owned),
+        const out = targetTexture(d.target), depth = out.depth ? 'depth24plus' : null;
+        if (d.kind === 'scene') {
+          const gpu = residencyFor(d.object, d.compiled), geometry = programGeometrySnapshot(gpu, device), reflection = d.compiled.program.reflection;
+          const bound = views(d);
+          const built = await scenePipeline(d.compiled, geometry, d.raster, bound, out.format, depth);
+          const range = geometry.drawRange, extent = geometry.indexBuffer ? geometry.indexCount : geometry.vertexCount;
+          const first = Math.max(d.start, range.first), end = Math.min(d.start + d.count, range.first + range.count, extent);
+          prepared.push({d, out, kind: 'scene', pipeline: built.pipeline, first, count: Math.max(0, end - first),
+            instanceCount: geometry.instanced ? Math.min(d.instanceCount, geometry.instanceCapacity) : d.instanceCount,
+            buffers: [...geometry.vertexBuffers, ...geometry.channels.missing.map(() => constantBuffer())], index: geometry.indexBuffer, indexFormat: geometry.indexFormat,
+            uniformGroup: device.createBindGroup({label, layout: built.uniformLayout, entries: [{binding: 0, resource: {buffer: uniforms, offset: i * stride, size: reflection.uniformBufferSize}}]}),
+            textureGroup: built.textureLayout ? device.createBindGroup({label, layout: built.textureLayout, entries: reflection.textures.flatMap((t, k) => [
+              {binding: t.textureBinding, resource: bound[k].view}, {binding: t.samplerBinding, resource: bound[k].sampler}])}) : null});
+          continue;
+        }
+        const {pipeline, uniformLayout, textureLayout} = await pipelineOf(d.entry, d.raster, d.geometry, out.format, depth);
+        const bound = views(d), reflection = d.entry.compiled.reflection;
+        prepared.push({d, out, kind: 'mesh', pipeline, buffers: vertexBuffers(d.geometry, reflection.attributes, owned),
           uniformGroup: device.createBindGroup({label, layout: uniformLayout, entries: [{binding: 0, resource: {buffer: uniforms, offset: i * stride, size: reflection.uniformBufferSize}}]}),
           textureGroup: device.createBindGroup({label, layout: textureLayout, entries: reflection.textures.flatMap((t, k) => [
-            {binding: t.textureBinding, resource: views[k].view}, {binding: t.samplerBinding, resource: views[k].sampler}])}),
-          index: d.geometry.index, count: d.geometry.index ? d.geometry.index.count : d.geometry.attributes.position.count});
+            {binding: t.textureBinding, resource: bound[k].view}, {binding: t.samplerBinding, resource: bound[k].sampler}])}),
+          index: d.geometry.index, first: 0, count: d.geometry.index ? d.geometry.index.count : d.geometry.attributes.position.count, instanceCount: 1});
       }
       const encoder = device.createCommandEncoder({label});
       for (const p of prepared) {
-        const [x, y, w, h] = p.d.viewport, [sx, sy, sw, sh] = p.d.scissor;
-        const pass = encoder.beginRenderPass({label, colorAttachments: [{view: p.out.faces[p.out.cube ? p.d.face : 0],
-          loadOp: p.d.clear ? 'clear' : 'load', clearValue: [0, 0, 0, 0], storeOp: 'store'}]});
+        const [x, y, w, h] = p.d.viewport, [sx, sy, sw, sh] = p.d.scissor, layer = p.out.cube ? p.d.face : 0;
+        const depthClear = p.out.depth && (p.d.clear || !p.out.depthReady[layer]);
+        if (p.out.depth) p.out.depthReady[layer] = true;
+        const pass = encoder.beginRenderPass({label, colorAttachments: [{view: p.out.faces[layer],
+          loadOp: p.d.clear ? 'clear' : 'load', clearValue: [0, 0, 0, 0], storeOp: 'store'}],
+          ...(p.out.depth ? {depthStencilAttachment: {view: p.out.depthFaces[layer], depthLoadOp: depthClear ? 'clear' : 'load', depthClearValue: 1, depthStoreOp: 'store'}} : {})});
         // rows:'gl': WebGPU row index equals GL's bottom-up window y, so GL rectangles apply unchanged.
         pass.setViewport(x, y, w, h, 0, 1);
         pass.setScissorRect(sx, sy, sw, sh);
         pass.setPipeline(p.pipeline);
-        pass.setBindGroup(0, p.uniformGroup); pass.setBindGroup(1, p.textureGroup);
+        pass.setBindGroup(0, p.uniformGroup); if (p.textureGroup) pass.setBindGroup(1, p.textureGroup);
         p.buffers.forEach((b, k) => pass.setVertexBuffer(k, b));
-        if (p.index) {
+        if (p.kind === 'scene') {
+          if (p.count && p.instanceCount) {
+            if (p.index) { pass.setIndexBuffer(p.index, p.indexFormat); pass.drawIndexed(p.count, p.instanceCount, p.first, 0, 0); }
+            else pass.draw(p.count, p.instanceCount, p.first, 0);
+          }
+        } else if (p.index) {
           const array = p.index.array, u32 = array instanceof Uint32Array;
           const ib = device.createBuffer({label: `${label}/index`, size: Math.ceil(array.byteLength / 4) * 4, usage: 16 | 8});
           const data = u32 ? array : new Uint16Array(Math.ceil(array.length / 2) * 2);
@@ -252,6 +381,37 @@ export function createThreeProgramPMREM({three: T, device, bindingOf, label = 'f
     const scoped = await device.popErrorScope();
     if (failure) throw failure;
     if (scoped) fail('GPU', scoped.message);
+  }
+  function constantBuffer() {
+    return constant ??= (() => {
+      const b = device.createBuffer({label: `${label}/default-attribute`, size: 16, usage: 32 | 8});
+      device.queue.writeBuffer(b, 0, new Float32Array([0, 0, 0, 1]));
+      return b;
+    })();
+  }
+  /** Pipelines for captured-scene programs, keyed by everything they bake in. */
+  async function scenePipeline(compiled, geometry, raster, bound, format, depth) {
+    const {reflection} = compiled.program;
+    const sampleTypeOf = (t, i) => t.sampleType === 'float' && bound[i].sampleType === 'unfilterable-float' ? 'unfilterable-float' : t.sampleType;
+    const key = [compiled.key, geometry.signature, JSON.stringify(raster), format, depth, reflection.textures.map(sampleTypeOf).join()].join('\u0001');
+    let built = scenePipelines.get(key);
+    if (built) return built;
+    const layouts = [...geometry.layouts, ...geometry.channels.missing.map(location => ({arrayStride: 0, stepMode: 'vertex', attributes: [{shaderLocation: location, offset: 0, format: 'float32x4'}]}))];
+    const uniformLayout = device.createBindGroupLayout({label, entries: [{binding: 0, visibility: VERTEX | FRAGMENT, buffer: {type: 'uniform'}}]});
+    const textureLayout = reflection.textures.length ? device.createBindGroupLayout({label, entries: reflection.textures.flatMap((t, i) => [
+      {binding: t.textureBinding, visibility: VERTEX | FRAGMENT, texture: {sampleType: sampleTypeOf(t, i), viewDimension: t.dimension}},
+      {binding: t.samplerBinding, visibility: VERTEX | FRAGMENT, sampler: {type: t.comparison ? 'comparison' : sampleTypeOf(t, i) === 'float' ? 'filtering' : 'non-filtering'}}])}) : null;
+    const pipeline = await device.createRenderPipelineAsync({label, layout: device.createPipelineLayout({label, bindGroupLayouts: textureLayout ? [uniformLayout, textureLayout] : [uniformLayout]}),
+      vertex: {module: device.createShaderModule({label: `${label}/capture-vertex`, code: compiled.program.vertex}), entryPoint: 'f3d_vertex', buffers: layouts},
+      fragment: {module: device.createShaderModule({label: `${label}/capture-fragment`, code: compiled.program.fragment}), entryPoint: 'f3d_fragment',
+        targets: [{format, ...(raster.blend ? {blend: raster.blend} : {}), writeMask: raster.writeMask}]},
+      // rows:'gl' mirrors clip Y: GL's front faces flip.
+      primitive: {topology: 'triangle-list', cullMode: raster.cullMode, frontFace: raster.frontFace === 'ccw' ? 'cw' : 'ccw'},
+      ...(depth ? {depthStencil: {format: depth, depthWriteEnabled: raster.depthWriteEnabled, depthCompare: raster.depthCompare,
+        depthBias: raster.depthBias ?? 0, depthBiasSlopeScale: raster.depthBiasSlopeScale ?? 0}} : {})});
+    built = {pipeline, uniformLayout, textureLayout};
+    scenePipelines.set(key, built);
+    return built;
   }
   function generateMips(encoder, out) {
     mipper ??= new Map();
@@ -291,7 +451,7 @@ struct V { @builtin(position) p: vec4<f32>, @location(0) uv: vec2<f32> };
     await execute(draws);
     const out = targetTexture(target);
     // Targets PMREMGenerator no longer holds (a resized ping-pong) are released.
-    for (const [rt, t] of targets) if (rt !== target && rt !== generator._pingPongRenderTarget && ![...done.values(), ...cubes.values()].some(e => e.target === rt)) { t.texture.destroy(); targets.delete(rt); }
+    for (const [rt, t] of targets) if (rt !== target && rt !== generator._pingPongRenderTarget && ![...done.values(), ...cubes.values(), ...scenes.values()].some(e => e.target === rt)) { t.texture.destroy(); t.depth?.destroy(); targets.delete(rt); }
     const entry = {target, binding: {view: out.view, sampler: linearSampler(), sampleType: 'float'}};
     done.set(source, entry); outputs.set(target.texture, entry);
     releaseWith(source, done, entry);
@@ -307,6 +467,25 @@ struct V { @builtin(position) p: vec4<f32>, @location(0) uv: vec2<f32> };
       entry.target.dispose();
     };
     source.addEventListener('dispose', onDispose);
+  }
+  /** PMREMGenerator.fromScene for a renderer-route capture texture
+   * (createPMREMGeneratorClass): the application's own generator renders the
+   * captured scene through the host at this preparation boundary. */
+  async function generateScene(texture) {
+    if (disposed) fail('DISPOSED', 'PMREM owner is disposed');
+    const c = texture.f3dCapture;
+    if (!c?.scene?.isScene) fail('SOURCE', 'Expected a PMREM scene capture');
+    let target, draws;
+    host.begin();
+    try { target = generator.fromScene(c.scene, c.sigma, c.near, c.far, {size: c.size, position: c.position}); }
+    finally { draws = host.end(); }
+    await execute(draws);
+    const out = targetTexture(target);
+    for (const [rt, t] of targets) if (rt !== target && rt !== generator._pingPongRenderTarget && ![...done.values(), ...cubes.values(), ...scenes.values()].some(e => e.target === rt)) { t.texture.destroy(); t.depth?.destroy(); targets.delete(rt); }
+    const entry = {target, binding: {view: out.view, sampler: linearSampler(), sampleType: 'float'}};
+    scenes.set(texture, entry); outputs.set(target.texture, entry);
+    releaseWith(texture, scenes, entry);
+    return target.texture;
   }
   /** WebGLEnvironments.getCube: r186 WebGLCubeRenderTarget(image.height)
    * .fromEquirectangularTexture(renderer, texture), run unchanged against the
@@ -336,7 +515,12 @@ struct V { @builtin(position) p: vec4<f32>, @location(0) uv: vec2<f32> };
       if (source.isRenderTargetTexture) fail('SOURCE', 'Render-target PMREM sources (pmremVersion) are not admitted yet');
       return pmremSourceComplete(T, source) ? {state: 'needed'} : {state: 'incomplete'};
     },
-    generate, convert,
+    generate, convert, generateScene,
+    /** A renderer-route PMREMGenerator.fromScene result: ready once generated. */
+    lookupScene(texture) {
+      const entry = scenes.get(texture);
+      return entry ? {state: 'ready', texture: entry.target.texture} : {state: 'needed'};
+    },
     /** WebGLEnvironments.getCube for equirect sources: {state: 'ready', texture} |
      * {state: 'incomplete'} | {state: 'needed'}; the ready texture's mapping follows
      * the source's reflection/refraction mapping (mapTextureMapping). */
@@ -351,10 +535,12 @@ struct V { @builtin(position) p: vec4<f32>, @location(0) uv: vec2<f32> };
     /** The native binding of a generated cube-UV texture, or undefined. */
     binding: texture => outputs.get(texture)?.binding,
     /** Destroy textures of disposed sources once no published mesh uses them. */
-    collect() { for (const rt of retired.splice(0)) { targets.get(rt)?.texture.destroy(); targets.delete(rt); } },
+    collect() { for (const rt of retired.splice(0)) { targets.get(rt)?.texture.destroy(); targets.get(rt)?.depth?.destroy(); targets.delete(rt); } },
     dispose() {
       disposed = true;
-      for (const t of targets.values()) t.texture.destroy();
+      for (const t of targets.values()) { t.texture.destroy(); t.depth?.destroy(); }
+      for (const byKey of residencies.values()) for (const gpu of byKey.values()) gpu.dispose();
+      residencies.clear(); dfg?.texture.destroy(); dfg = null;
       targets.clear(); done.clear(); outputs.clear(); constant?.destroy(); constant = null; generator.dispose();
     },
   });
