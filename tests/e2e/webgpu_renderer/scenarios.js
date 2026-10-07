@@ -504,6 +504,24 @@ export const scenarios = {
     scene.add(mesh, mesh2, sun, new THREE.AmbientLight(0xffffff, 0.4));
     return { scene, camera: camera(THREE, [0, 0.4, 3]) };
   },
+  // RectAreaLight (LTC tables) and a projected spot-light map: lights only the
+  // r186 programs shade, so lit materials take the program route.
+  shaderlib_area_lights(THREE) {
+    THREE.RectAreaLightUniformsLib.init();
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x050508);
+    const floor = new THREE.Mesh(new THREE.PlaneGeometry(6, 6), new THREE.MeshStandardMaterial({ color: 0x808080, roughness: 0.2, metalness: 0 }));
+    floor.rotation.x = -Math.PI / 2; floor.position.y = -0.6;
+    const knot = new THREE.Mesh(new THREE.TorusKnotGeometry(0.3, 0.1, 96, 12), new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.3, metalness: 0.1 }));
+    const red = new THREE.RectAreaLight(0xff3333, 6, 0.6, 1.4); red.position.set(-0.9, 0.1, -0.6); red.lookAt(0, 0, 0);
+    const blue = new THREE.RectAreaLight(0x3355ff, 6, 0.6, 1.4); blue.position.set(0.9, 0.1, -0.6); blue.lookAt(0, 0, 0);
+    const n = 16, d = new Uint8Array(n * n * 4);
+    for (let i = 0; i < n * n; i++) d.set(((i % n) >> 2) % 2 ^ ((i >> 6) % 2) ? [255, 230, 120, 255] : [40, 60, 255, 255], i * 4);
+    const map = new THREE.DataTexture(d, n, n); map.colorSpace = THREE.SRGBColorSpace; map.needsUpdate = true;
+    const spot = new THREE.SpotLight(0xffffff, 30, 0, Math.PI / 6, 0.2, 2); spot.position.set(0.5, 2.5, 1.2); spot.map = map;
+    scene.add(floor, knot, red, blue, spot, spot.target);
+    return { scene, camera: camera(THREE, [0, 0.9, 2.8]) };
+  },
   // MeshPhysicalMaterial extensions via ShaderLib programs (WebGL surface), and a
   // nearest-sampled float32 DataTexture read by a ShaderMaterial.
   shaderlib_physical(THREE) {

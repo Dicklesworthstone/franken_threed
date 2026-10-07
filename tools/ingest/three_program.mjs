@@ -262,7 +262,7 @@ function write(view, node, value, name, base = 0) {
  * WebGLRenderer.render does) and per-material ShaderLib uniform clones.
  * Compiled programs are cached by their exact assembled source text (bounded). */
 export function createThreeProgramSupport({three: T, state, maxPrograms = 256, maxPointSize = 1024, pmrem = null, shadows = null}) {
-  const compiled = new Map(), lights = webglLights(T), clones = new WeakMap();
+  const compiled = new Map(), lights = webglLights(T, {floatLinear: () => state().floatLinear === true}), clones = new WeakMap();
   let dfgLUT = null;
   /** r186 getDFGLUT(): the 16x16 RG half-float DFG table, linear, clamped. */
   function getDFGLUT() {

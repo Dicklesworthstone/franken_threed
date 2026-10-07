@@ -303,7 +303,9 @@ export function webglProgramSources(T, p) {
 }
 
 // ---- WebGLLights -----------------------------------------------------------
-export function webglLights(T) {
+/** options.floatLinear(): WebGL OES_texture_float_linear (WebGPU float32-filterable)
+ * selects the float LTC tables for rect-area lights, as WebGLLights does. */
+export function webglLights(T, {floatLinear = () => false} = {}) {
   const cache = new Map();
   const uniformsFor = light => {
     let u = cache.get(light.id);
@@ -409,6 +411,12 @@ export function webglLights(T) {
         const u = uniformsFor(light); u.skyColor.copy(light.color).multiplyScalar(intensity); u.groundColor.copy(light.groundColor).multiplyScalar(intensity);
         state.hemi[hemiLength++] = u;
       }
+    }
+    if (rectAreaLength > 0) {
+      if (T.UniformsLib.LTC_FLOAT_1 === undefined) throw new Error('RectAreaLight needs RectAreaLightUniformsLib.init(), as in WebGLRenderer');
+      const float = floatLinear() === true;
+      state.rectAreaLTC1 = float ? T.UniformsLib.LTC_FLOAT_1 : T.UniformsLib.LTC_HALF_1;
+      state.rectAreaLTC2 = float ? T.UniformsLib.LTC_FLOAT_2 : T.UniformsLib.LTC_HALF_2;
     }
     state.ambient[0] = r; state.ambient[1] = g; state.ambient[2] = b;
     state.sun.length = sunLength; state.directional.length = directionalLength; state.spot.length = spotLength; state.rectArea.length = rectAreaLength;

@@ -237,6 +237,14 @@ texelFetch by gl_VertexID), bound as an rgba32float 2D array; scenario
 upstream WebGLRenderer exactly. Parity now forbids the HDR fallback for program-route
 scenarios (`F3D_NO_FALLBACK` test seam), so a silent fallback fails them.
 
+Lights only the programs shade: `RectAreaLight` (WebGLLights picks the float LTC
+tables when the device has float32-filterable, as r186 does with
+OES_texture_float_linear, else the half tables; RectAreaLightUniformsLib.init()
+is required, as upstream) and projected spot-light `map`s put every lit
+material on the program route, as program shadow maps do. Scenario
+`shaderlib_area_lights` matches upstream WebGLRenderer (mean diff 0.02);
+`webgl_lights_rectarealight` and `webgl_lights_spotlight` run.
+
 Not admitted yet (explicit errors): transmission (needs its render target),
 render-target PMREM sources (`pmremVersion`), pre-filtered cube-UV textures
 supplied directly, Sprite materials.

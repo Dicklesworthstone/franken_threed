@@ -157,7 +157,7 @@ export async function createGpuThreeScene(device,scene,{
   const geometries=new Map(),instances=new Map(),materials=new Map(),deformations=new Map();
   const pendingDeformations=new Set(),deformationLifetime=new AbortController();
   let textureOwner=null,textureScan=null,frameTextures=null,retainedTextures=new Set();
-  let programShadowMode=false,programShadowSticky=false,preparedShadowMode=false,programShadowOwner=null;
+  let programShadowMode=false,programShadowSticky=false,preparedShadowMode=false,programShadowOwner=null,programLightMode=false;
   const ownedTextures=()=>textureOwner??=createGpuThreeTextures(device,{...textureOptions,three});
   const resourceFailed=()=>!!renderer?.failed||!!textureOwner?.failed||!!shadowOwner?.failed||!!pendingShadow?.failed||!!environmentOwner?.failed||!!pendingEnvironment?.failed||!!backgroundOwner?.failed||!!pendingBackground?.failed||[...geometries.values(),...programGpus(),...instances.values(),...deformations.values(),...pendingDeformations].some(g=>g.failed);
   let programTargetSize=null;
@@ -282,8 +282,11 @@ export async function createGpuThreeScene(device,scene,{
     // Shadow ownership: the core's single projected map, or (WebGL surface) the
     // r186 WebGLShadowMap port drawing depth/distance programs for every caster.
     programShadowMode=wantsProgramShadows(nodes);
+    // Lights only the r186 programs shade (rect-area LTC, projected spot maps)
+    // put every lit material on the program route, as shadow maps do.
+    programLightMode=programShadowMode||(programRoute()&&nodes.some(o=>o.isLight&&(o.isRectAreaLight||(o.isSpotLight&&!!o.map))));
     for(const object of nodes){
-      if(object.isLight&&!programShadowMode)light(object);
+      if(object.isLight&&!programLightMode)light(object);
       if(shadowEnabled&&object.isMesh&&object.castShadow&&!programShadowMode){
         if(object.customDepthMaterial!=null||object.customDistanceMaterial!=null||
             object.onBeforeShadow!==three.Object3D.prototype.onBeforeShadow||object.onAfterShadow!==three.Object3D.prototype.onAfterShadow)
@@ -661,7 +664,7 @@ export async function createGpuThreeScene(device,scene,{
       if(programToneMapping())return toneMappedProgram(()=>programDescription(m,topology,object));
       if(programDeformed.has(object))return programDescription(m,topology,object);
       // Program shadow maps are only read by programs: every receiver draws one.
-      if(programShadowMode&&programSupport.needsLights(m))return programDescription(m,topology,object);
+      if(programLightMode&&programSupport.needsLights(m))return programDescription(m,topology,object);
       if(programEnvironmentOwned()&&(m.isMeshStandardMaterial||m.isMeshLambertMaterial||m.isMeshPhongMaterial))return programDescription(m,topology,object);
       try{return coreDescription(m,clippingFrame,topology);}
       catch(error){
@@ -1297,7 +1300,7 @@ export async function createGpuThreeScene(device,scene,{
         if(object.layers.test(camera.layers)){
           if(object.isGroup)groupOrder=object.renderOrder;
           else if(object.isLOD){if(object.autoUpdate)object.update(camera);}
-          else if(object.isLight){if(!programShadowMode)lighting.lights.push(light(object));lightSources.push(object);}
+          else if(object.isLight){if(!programLightMode)lighting.lights.push(light(object));lightSources.push(object);}
           else if(object.isLineLoop){
             // Source r186 WebGPU behavior: report and draw nothing for this object.
             (three.error??console.error)('Renderer: Objects of type THREE.LineLoop are not supported. Please use THREE.Line or THREE.LineSegments.');
