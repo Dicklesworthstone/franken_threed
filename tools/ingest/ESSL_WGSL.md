@@ -221,6 +221,17 @@ core panorama owner). `webgl_materials_envmaps_hdr`, `webgl_pmrem_cubemap`,
 run. Captured scenes with shadows, textured backgrounds, environments or
 texture maps other than the DFG LUT are explicit errors.
 
+Skinning: skinned meshes draw their ShaderLib program with r186's bone texture
+(`skeleton.computeBoneTexture()` on first use, texelFetch in the program),
+`bindMatrix`/`bindMatrixInverse` from the object, and `skeleton.update()` once
+per frame on the first visible or shadow-casting draw (WebGLObjects.update);
+shadow casters use skinned depth programs. Programs take skinned meshes under
+in-shader tone mapping (elsewhere the core deformation path still draws them).
+Scenario `shaderlib_skinning` (AgX, program shadow map) matches upstream
+WebGLRenderer exactly (0 differing pixels). Morph targets remain an explicit
+error on programs. Parity now forbids the HDR fallback for program-route
+scenarios (`F3D_NO_FALLBACK` test seam), so a silent fallback fails them.
+
 Not admitted yet (explicit errors): transmission (needs its render target),
 render-target PMREM sources (`pmremVersion`), pre-filtered cube-UV textures
 supplied directly, Sprite materials.

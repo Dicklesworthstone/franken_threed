@@ -47,7 +47,7 @@ function scoped(device, operation) {
 
 /** support: createThreeProgramSupport(); bindingOf(texture) -> {view, sampler, sampleType};
  * sourceOf(object) -> the attribute source a program reads (geometry or InstancedMesh view). */
-export function createThreeProgramShadows({three: T, device, support, bindingOf, sourceOf = o => o.geometry, clipping = () => null, label = 'f3d-program-shadows',
+export function createThreeProgramShadows({three: T, device, support, bindingOf, sourceOf = o => o.geometry, clipping = () => null, updateObject = () => {}, label = 'f3d-program-shadows',
   maxDraws = 4096, maxGeometryBytes = 256 * 1024 * 1024}) {
   const maxTextureSize = device.limits.maxTextureDimension2D ?? 8192;
   const depthMaterialBase = new T.MeshDepthMaterial(), distanceMaterialBase = new T.MeshDistanceMaterial();
@@ -206,9 +206,10 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
     }
     return gpu;
   }
-  function textureBindings(reflection, uniforms) {
+  function textureBindings(reflection, uniforms, object) {
+    const samplers = support.objectSamplers?.(null, object) ?? null;
     return reflection.textures.map(t => {
-      const value = uniforms?.[t.name]?.value, texture = t.element === null ? value : value?.[t.element];
+      const value = samplers?.[t.name] ?? uniforms?.[t.name]?.value, texture = t.element === null ? value : value?.[t.element];
       if (!texture) fail('TEXTURE', `Depth program sampler ${t.name} has no texture`);
       const b = bindingOf(texture);
       return {view: b.view, sampler: b.sampler, sampleType: b.sampleType ?? 'float', texture};
@@ -223,7 +224,7 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
     const gpu = geometryFor(object, compiled);
     gpu.update({maxAdditionalBytes: maxGeometryBytes});
     const geometry = support.geometrySnapshot(gpu, device);
-    const uniforms = refresh(depthMaterial), textures = textureBindings(compiled.program.reflection, uniforms);
+    const uniforms = refresh(depthMaterial), textures = textureBindings(compiled.program.reflection, uniforms, object);
     const raster = support.raster(depthMaterial, {side: depthMaterial.side});
     // rows:'gl' mirrors clip Y: GL's counter-clockwise front faces are clockwise here.
     const glRaster = {...raster, frontFace: raster.frontFace === 'ccw' ? 'cw' : 'ccw', blend: null, writeMask: 0};
@@ -336,6 +337,7 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
     const entry = recordForSync(depthMaterial, object);
     const reflection = entry.record.reflection, bytes = new Uint8Array(reflection.uniformBufferSize);
     const uniforms = refresh(depthMaterial);
+    updateObject(object);
     const clip = support.clippingState(clipping(), depthMaterial, shadowCamera, {shadows: true});
     const current = support.pack(reflection, uniforms, object, shadowCamera, bytes, {values: support.bindsClippingPlanes(depthMaterial) ? {clippingPlanes: clip.planes} : null});
     if (current.some((t, k) => (t ?? null) !== entry.textures[k].texture)) fail('PREPARE', 'Shadow caster textures changed; call prepare()');
@@ -354,7 +356,7 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
     // Same state as preparation: current residency before its layout signature.
     if (!updated.has(gpu)) { gpu.update({maxAdditionalBytes: maxGeometryBytes}); updated.add(gpu); }
     const geometry = support.geometrySnapshot(gpu, device);
-    const uniforms = refresh(depthMaterial), textures = textureBindings(compiled.program.reflection, uniforms);
+    const uniforms = refresh(depthMaterial), textures = textureBindings(compiled.program.reflection, uniforms, object);
     const raster = support.raster(depthMaterial, {side: depthMaterial.side});
     const glRaster = {...raster, frontFace: raster.frontFace === 'ccw' ? 'cw' : 'ccw', blend: null, writeMask: 0};
     const entry = records.get(recordKey(compiled, gpu, geometry, glRaster, textures));

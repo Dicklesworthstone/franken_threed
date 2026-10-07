@@ -454,6 +454,32 @@ export const scenarios = {
     scene.add(ball, new THREE.DirectionalLight(0xffffff, 1.5), new THREE.AmbientLight(0xffffff, 0.3));
     return { scene, camera: camera(THREE, [0.8, 0.3, 2.6]) };
   },
+  // Skinning on the program route (bone texture texelFetch, bindMatrix) under
+  // in-shader tone mapping, casting into a program shadow map.
+  shaderlib_skinning(THREE, renderer) {
+    renderer.toneMapping = THREE.AgXToneMapping; renderer.shadowMap.enabled = true;
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x202028);
+    const height = 1.6, segments = 8, geometry = new THREE.CylinderGeometry(0.15, 0.15, height, 16, segments * 2, false);
+    const position = geometry.attributes.position, skinIndex = [], skinWeight = [], v = new THREE.Vector3();
+    for (let i = 0; i < position.count; i++) {
+      v.fromBufferAttribute(position, i);
+      const y = v.y + height / 2, w = Math.min(1, Math.max(0, y / height));
+      skinIndex.push(0, 1, 0, 0); skinWeight.push(1 - w, w, 0, 0);
+    }
+    geometry.setAttribute('skinIndex', new THREE.Uint16BufferAttribute(skinIndex, 4));
+    geometry.setAttribute('skinWeight', new THREE.Float32BufferAttribute(skinWeight, 4));
+    const root = new THREE.Bone(), tip = new THREE.Bone();
+    root.position.y = -height / 2; tip.position.y = height; root.add(tip);
+    const mesh = new THREE.SkinnedMesh(geometry, new THREE.MeshStandardMaterial({ color: 0xff9955, roughness: 0.5 }));
+    mesh.add(root); mesh.bind(new THREE.Skeleton([root, tip]));
+    tip.rotation.z = 0.9; root.rotation.x = 0.3; mesh.castShadow = true;
+    const floor = new THREE.Mesh(new THREE.PlaneGeometry(5, 5), new THREE.MeshStandardMaterial({ color: 0xaaaaaa }));
+    floor.rotation.x = -Math.PI / 2; floor.position.y = -0.9; floor.receiveShadow = true;
+    const sun = new THREE.DirectionalLight(0xffffff, 3); sun.position.set(1.5, 3, 1); sun.castShadow = true;
+    scene.add(mesh, floor, sun, new THREE.AmbientLight(0xffffff, 0.4));
+    return { scene, camera: camera(THREE, [0, 0.6, 3.2]) };
+  },
   // MeshPhysicalMaterial extensions via ShaderLib programs (WebGL surface), and a
   // nearest-sampled float32 DataTexture read by a ShaderMaterial.
   shaderlib_physical(THREE) {

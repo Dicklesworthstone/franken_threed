@@ -218,7 +218,9 @@ export async function createGpuThreeScene(device,scene,{
   function geometryAdmission(g,object){
     const programs=(Array.isArray(object.material)?object.material:[object.material]).every(m=>m?.isShaderMaterial);
     if(!(g instanceof three.BufferGeometry)||(g.isInstancedBufferGeometry&&!programs))fail('GEOMETRY','Expected source BufferGeometry');
-    if(hasThreeDeformation(object))inspectThreeDeformation(object,{...deformationOptions,three});
+    // Program-drawn skinned meshes (in-shader tone mapping) skin in their own program.
+    if(hasThreeDeformation(object)&&!(programToneMapping()&&object.isSkinnedMesh&&!Object.values(g.morphAttributes??{}).some(a=>a?.length)))
+      inspectThreeDeformation(object,{...deformationOptions,three});
     const owners=new Set(Object.values(g.attributes).map(a=>a.isInterleavedBufferAttribute?a.data:a));
     if(g.index)owners.add(g.index);
     if(!Array.isArray(g.groups)||g.groups.length>maxNodes)fail('LIMIT','Geometry group capacity exceeded');
@@ -464,7 +466,10 @@ export async function createGpuThreeScene(device,scene,{
       fail('TEXTURE','Equirectangular/render-target environment maps need cube conversion, not admitted yet');
     return {envMap:source,envMapRotation};
   }
-  let pmremOwner=null,pmremRequests=new Set(),cubeRequests=new Set(),sceneRequests=new Set();
+  let pmremOwner=null,pmremRequests=new Set(),cubeRequests=new Set(),sceneRequests=new Set(),frameSkeletons=null;
+  /** WebGLObjects.update: a skinned mesh's skeleton updates once per frame, on
+   * its first visible or shadow-casting draw. */
+  const updateObject=o=>{if(o.isSkinnedMesh&&frameSkeletons&&!frameSkeletons.has(o.skeleton)){frameSkeletons.add(o.skeleton);o.skeleton.update();}};
   /** WebGLEnvironments.getCube for an equirect source: the converted cube
    * render-target texture, or null while incomplete/loading (r186 renders
    * without it); a complete source is generated at the preparation boundary. */
@@ -495,7 +500,7 @@ export async function createGpuThreeScene(device,scene,{
     }
     return null;
   }
-  const programShadows=()=>programShadowOwner??=(programSupport.createShadows?.(device,{bindingOf:t=>textureBinding(t),sourceOf:programSource,clipping:programClippingControls})??
+  const programShadows=()=>programShadowOwner??=(programSupport.createShadows?.(device,{bindingOf:t=>textureBinding(t),sourceOf:programSource,clipping:programClippingControls,updateObject})??
     fail('SHADOW','Program shadow maps need the program shadow owner'));
   // The renderer's shadowMap controls and the renderer object passed to shadow callbacks.
   const shadowControls=()=>programSupport.state?.().shadowMap??{enabled:true,autoUpdate:true,needsUpdate:false,type:three.PCFShadowMap};
@@ -587,7 +592,7 @@ export async function createGpuThreeScene(device,scene,{
       const reflection=compiled.program.reflection;
       const uniforms=programSupport.refresh(m,{fog:scene.fog,envMap,envMapRotation});
       const sourceTextures=[],bindings=[],textureKey=[];
-      const samplers=programSupport.shadowSamplers?.(m)??null;
+      const samplers=programSupport.objectSamplers?.(m,object)??null;
       for(const t of reflection.textures){
         const value=samplers?.[t.name]??uniforms?.[t.name]?.value,texture=t.element===null?value:value?.[t.element];
         if(texture!=null&&!(texture instanceof three.Texture))fail('TEXTURE',`Uniform ${t.name} is not a texture`);
@@ -1162,7 +1167,7 @@ export async function createGpuThreeScene(device,scene,{
       if(Object.hasOwn(frame,'targetSize')){const {targetSize,...rest}=frame;frame=rest;}
       for(const key of ['draws','viewProjection','lighting','fog','clippingPlanes',...(shadowEnabled?['shadow']:[]),...(environmentEnabled?['environment']:[]),...(backgroundEnabled?['background']:[])])if(Object.hasOwn(frame,key))fail('FRAME',`${key} belongs to the source scene/camera`);
       const clippingFrame=clippingState();
-      frameTextures=new Set();
+      frameTextures=new Set();frameSkeletons=new Set();
       const nodes=graph();
       if(programShadowMode!==preparedShadowMode)fail('PREPARE','Shadow ownership changed; call prepare()');
       if(shadowEnabled){
@@ -1215,6 +1220,7 @@ export async function createGpuThreeScene(device,scene,{
                 const bindings=desc.map(d=>records?.find(e=>!e.mesh.disposed&&e.programGeometry&&same(e.structural,d.structural)));
                 if(bindings.some(e=>!e))fail('PREPARE','Call prepare() after changing geometry, program or texture bindings');
                 if(opaque.length+transparent.length>=(renderOptions.maxDraws??1024))fail('LIMIT','Source draw list exceeds capacity');
+                updateObject(object);
                 (original.transparent?transparent:opaque).push({object,geometry:g,material,listMaterial:original,group,groupOrder,z,desc,bindings,shadowPass:false,program:true});
                 return;
               }

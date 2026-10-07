@@ -36,8 +36,9 @@ export function inspectThreeProgram(T, material, object) {
   const builtin = SHADER_IDS[material?.type] !== undefined;
   if (!material?.isShaderMaterial && !builtin) fail('SOURCE', 'Expected a ShaderMaterial, RawShaderMaterial or ShaderLib material');
   if (material.isShaderMaterial && (typeof material.vertexShader !== 'string' || typeof material.fragmentShader !== 'string')) fail('SOURCE', 'Program sources must be strings');
-  if (object.isSkinnedMesh || Object.values(object.geometry?.morphAttributes ?? {}).some(a => a?.length) || object.isBatchedMesh)
-    fail('OBJECT', 'Skinned, morphed and batched program objects are not admitted yet');
+  if (Object.values(object.geometry?.morphAttributes ?? {}).some(a => a?.length) || object.isBatchedMesh)
+    fail('OBJECT', 'Morphed and batched program objects are not admitted yet');
+  if (object.isSkinnedMesh && !(object.skeleton instanceof T.Skeleton)) fail('OBJECT', 'Skinned program objects need their skeleton');
   if (object.isInstancedMesh && object.morphTexture != null) fail('OBJECT', 'Instanced morph textures are not admitted');
   if (material.uniformsGroups?.length) fail('UNIFORMS', 'Uniform buffer groups are not admitted yet');
   if (material.onBeforeCompile !== T.Material.prototype.onBeforeCompile || material.onBeforeRender !== T.Material.prototype.onBeforeRender)
@@ -128,7 +129,8 @@ export function threeProgramRaster(T, m, {frontFaceCW = false, topology = 'trian
 }
 
 // ---- uniform values ---------------------------------------------------------
-const BUILTIN = new Set(['modelMatrix', 'modelViewMatrix', 'projectionMatrix', 'viewMatrix', 'normalMatrix', 'cameraPosition', 'isOrthographic', 'toneMappingExposure', 'receiveShadow']);
+const BUILTIN = new Set(['modelMatrix', 'modelViewMatrix', 'projectionMatrix', 'viewMatrix', 'normalMatrix', 'cameraPosition', 'isOrthographic', 'toneMappingExposure', 'receiveShadow',
+  'bindMatrix', 'bindMatrixInverse']);
 
 /** Write one frame's uniform values for one draw from a WebGLRenderer-style
  * uniforms object (material.uniforms, or a refreshed ShaderLib clone). Values
@@ -142,6 +144,8 @@ export function packThreeProgramUniforms(T, reflection, uniforms, object, camera
     modelMatrix: object.matrixWorld, modelViewMatrix: object.modelViewMatrix, projectionMatrix: camera.projectionMatrix,
     viewMatrix: camera.matrixWorldInverse, normalMatrix: object.normalMatrix, cameraPosition, isOrthographic: camera.isOrthographicCamera === true,
     toneMappingExposure, receiveShadow: object.receiveShadow === true,
+    // setProgram: setOptional(object, 'bindMatrix' / 'bindMatrixInverse') for skinned meshes.
+    bindMatrix: object.isSkinnedMesh ? object.bindMatrix : null, bindMatrixInverse: object.isSkinnedMesh ? object.bindMatrixInverse : null,
   };
   for (const u of reflection.uniforms) {
     // receiveShadow: set from the object each draw, then overwritten by a
@@ -258,6 +262,16 @@ export function createThreeProgramSupport({three: T, state, maxPrograms = 256, m
     const st = lights.state;
     return {sunShadowMap: st.sunShadowMap, directionalShadowMap: st.directionalShadowMap, spotShadowMap: st.spotShadowMap, pointShadowMap: st.pointShadowMap};
   }
+  /** Samplers WebGLRenderer.setProgram binds by name outside material uniforms:
+   * light-state shadow maps, and a skinned mesh's bone texture (computed on
+   * first use, as setProgram does). */
+  function objectSamplers(material, object) {
+    const shadows = material ? shadowSamplers(material) : null;
+    if (!object?.isSkinnedMesh) return shadows;
+    const skeleton = object.skeleton;
+    if (skeleton.boneTexture === null) skeleton.computeBoneTexture();
+    return {...shadows, boneTexture: skeleton.boneTexture};
+  }
   /** setProgram's refreshMaterial work: lights, fog and material values. */
   function refresh(material, {fog = null, envMap = null, envMapRotation, distanceLight = null} = {}) {
     const uniforms = uniformsFor(material), s = state();
@@ -281,8 +295,8 @@ export function createThreeProgramSupport({three: T, state, maxPrograms = 256, m
     /** options.material: lit materials read shadow maps from the light state. */
     pack: (reflection, uniforms, object, camera, bytes, {material = null, ...options} = {}) =>
       packThreeProgramUniforms(T, reflection, uniforms, object, camera, bytes, {toneMappingExposure: state().toneMappingExposure ?? 1,
-        samplers: material ? shadowSamplers(material) : null, ...options}),
-    shadowSamplers,
+        samplers: objectSamplers(material, object), ...options}),
+    shadowSamplers, objectSamplers,
     state,
     clippingState: (controls, material, camera, options) => threeClippingState(T, controls, material, camera, options),
     bindsClippingPlanes,

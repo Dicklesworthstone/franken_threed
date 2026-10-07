@@ -598,7 +598,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         catch (error) {
           // In-shader tone mapping needs every draw on the program route; a scene
           // with another draw keeps the whole-image output pass from now on.
-          if (error?.code !== 'THREE_SCENE_TONE_MAPPING' || this._hdrFallback === true) throw error;
+          // F3D_NO_FALLBACK: test seam asserting the program route was taken.
+          if (error?.code !== 'THREE_SCENE_TONE_MAPPING' || this._hdrFallback === true || globalThis.F3D_NO_FALLBACK === true) throw error;
           this._hdrFallback = true;
           this._session.dispose();
           await this._createSession(this._wantsHdr(this._toneMapping()));
