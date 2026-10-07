@@ -69,7 +69,8 @@ export function geometryDevice() {
     let pipeline, index; const streams=new Map(), groups=new Map();
     const draw=(indexed,args)=>{
       d.encodedDrawCalls++;
-      assert.ok(pipeline && groups.has(0) && streams.has(0),'complete draw bindings');
+      // Pipelines without vertex buffers (full-screen passes) draw from vertex_index.
+      assert.ok(pipeline && groups.has(0) && (streams.has(0) || !pipeline.vertex?.buffers?.length),'complete draw bindings');
       if(indexed)assert.ok(index,'index binding');
       target.draws.push({indexed,args,pipeline,index,streams:new Map(streams),groups:new Map(groups),...passState()});
     };

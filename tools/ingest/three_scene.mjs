@@ -215,7 +215,7 @@ export async function createGpuThreeScene(device,scene,{
     }
     return materials.get(m).epoch;
   }
-  const programDeformed=new WeakSet();
+  const programDeformed=new WeakSet(),programHooked=new WeakSet(),programGeometries_=new WeakSet();
   function geometryAdmission(g,object){
     const programs=(Array.isArray(object.material)?object.material:[object.material]).every(m=>m?.isShaderMaterial);
     if(!(g instanceof three.BufferGeometry)||(g.isInstancedBufferGeometry&&!programs))fail('GEOMETRY','Expected source BufferGeometry');
@@ -253,8 +253,14 @@ export async function createGpuThreeScene(device,scene,{
       if(!(object instanceof three.Object3D)||seen.has(object)||!Array.isArray(object.children))fail('GRAPH','Expected an acyclic source hierarchy');
       seen.add(object);nodes.push(object);if(nodes.length>maxNodes)fail('LIMIT','Source node capacity exceeded');
       if(object.children.length+stack.length+nodes.length>maxNodes)fail('LIMIT','Source node capacity exceeded');
-      if(object.onBeforeRender!==three.Object3D.prototype.onBeforeRender||object.onAfterRender!==three.Object3D.prototype.onAfterRender)
-        fail('HOOK','Custom render callbacks are not admitted by this source bridge');
+      if(object.onBeforeRender!==three.Object3D.prototype.onBeforeRender||object.onAfterRender!==three.Object3D.prototype.onAfterRender){
+        // WebGL surface: program draws run the callbacks around each draw, in
+        // draw order, as renderObject does; the core path never could.
+        const list=Array.isArray(object.material)?object.material:[object.material];
+        if(!programRoute()||!(object.isMesh||object.isLine||object.isPoints)||!list.every(m=>!m||programCapable(m)))
+          fail('HOOK','Custom render callbacks are not admitted by this source bridge');
+        programHooked.add(object);
+      }
       if(object.isMesh){
         if(Array.isArray(object.material)&&object.material.length>maxBindings)fail('LIMIT','Source material array exceeds capacity');
         if(object.isBatchedMesh||object.intersectsFrustum!==(object.isSkinnedMesh?three.SkinnedMesh?.prototype.intersectsFrustum:three.Mesh.prototype.intersectsFrustum))
@@ -660,9 +666,10 @@ export async function createGpuThreeScene(device,scene,{
     if(object&&programRoute()&&programSupport.shaderLibMaterial(m)){
       // GL point sizes need the program route; elsewhere the core path renders
       // what it admits and the ShaderLib program covers what it rejects.
-      if(m.isPointsMaterial)return programDescription(m,topology,object);
+      // GL point sizes and dashed lines (lineDistance) need their programs.
+      if(m.isPointsMaterial||m.isLineDashedMaterial)return programDescription(m,topology,object);
       if(programToneMapping())return toneMappedProgram(()=>programDescription(m,topology,object));
-      if(programDeformed.has(object))return programDescription(m,topology,object);
+      if(programDeformed.has(object)||programHooked.has(object)||programGeometries_.has(object.geometry))return programDescription(m,topology,object);
       // Program shadow maps are only read by programs: every receiver draws one.
       if(programLightMode&&programSupport.needsLights(m))return programDescription(m,topology,object);
       if(programEnvironmentOwned()&&(m.isMeshStandardMaterial||m.isMeshLambertMaterial||m.isMeshPhongMaterial))return programDescription(m,topology,object);
@@ -906,6 +913,16 @@ export async function createGpuThreeScene(device,scene,{
     if(usedGeometry.size>maxGeometries||usedInstances.size>maxInstanceMeshes||out.length>maxBindings)fail('LIMIT','Source geometry/instance/material binding capacity exceeded');
     return out;
   }
+  /** Texture scan; a program draw that needs shadows the core map cannot give it
+   * switches this bridge to program shadow maps (sticky) and rescans. */
+  function scanWithShadowRoute(){
+    try{return scanTextures();}
+    catch(error){
+      if(error?.code!=='THREE_SCENE_PROGRAM_SHADOW'||programShadowSticky||!programSupport?.createShadows)throw error;
+      programShadowSticky=true;pendingTextures=new WeakSet();pmremRequests=new Set();cubeRequests=new Set();sceneRequests=new Set();
+      return scanTextures();
+    }
+  }
   function scanTextures(){
     textureScan=new Set();
     try{desired(graph());return textureScan;}finally{textureScan=null;}
@@ -948,13 +965,7 @@ export async function createGpuThreeScene(device,scene,{
       // textures. Temporary inspection placeholders never reach renderer.addMesh.
       pendingTextures=new WeakSet();pmremRequests=new Set();cubeRequests=new Set();sceneRequests=new Set();
       let owned;
-      try{owned=scanTextures();}
-      catch(error){
-        // A program draw needs shadows the core map cannot give it: switch this
-        // bridge to program shadow maps (sticky) and rescan.
-        if(error?.code!=='THREE_SCENE_PROGRAM_SHADOW'||programShadowSticky||!programSupport.createShadows)throw error;
-        programShadowSticky=true;pendingTextures=new WeakSet();pmremRequests=new Set();cubeRequests=new Set();sceneRequests=new Set();owned=scanTextures();
-      }
+      owned=scanWithShadowRoute();
       textureOwner?.prepare(owned);
       preparedShadowMode=programShadowMode;
       if(programShadowMode){
@@ -1021,8 +1032,16 @@ export async function createGpuThreeScene(device,scene,{
         }else{
           gpu=geometries.get(item.geometry);
           if(!gpu){
-            gpu=createGpuBufferGeometry(device,item.geometry,{...geometryOptions,maxBytes:maxGeometryBytes,
-              maxInitialBytes:Math.max(0,maxGeometryBytes-geometryBytes())});
+            try{gpu=createGpuBufferGeometry(device,item.geometry,{...geometryOptions,maxBytes:maxGeometryBytes,
+              maxInitialBytes:Math.max(0,maxGeometryBytes-geometryBytes())});}
+            catch(error){
+              // WebGL surface: a geometry layout the core cannot stream (e.g. an
+              // extra lineDistance attribute) is drawn by its programs, which
+              // bind attributes by name and ignore the rest, as GL does.
+              if(error?.code!=='GEOMETRY_GPU_SHAPE'||!programRoute()||!programCapable(item.material))throw error;
+              programGeometries_.add(item.geometry);
+              fail('DEFORMATION_ROUTE','A geometry moved to its ShaderLib programs');
+            }
             geometries.set(item.geometry,gpu);added.push(item.geometry);
           }else gpu.update({maxAdditionalBytes:Math.max(0,maxGeometryBytes-geometryBytes())});
           signature=stripSignature(bufferGeometrySnapshot(gpu,device),item.desc.options.topology);
@@ -1339,7 +1358,6 @@ export async function createGpuThreeScene(device,scene,{
         const desc=get(bg.material,'triangles',bg),records=lookup.get(programKeyOf(bg))?.get(bg.material);
         const bindings=desc.map(d=>records?.find(e=>!e.mesh.disposed&&e.programGeometry&&same(e.structural,d.structural)));
         if(bindings.some(e=>!e))fail('PREPARE','Call prepare() after changing the source background');
-        bg.onBeforeRender(shadowRenderer(),scene,camera,bg.geometry,bg.material,null);
         opaque.unshift({object:bg,geometry:bg.geometry,material:bg.material,listMaterial:bg.material,group:null,groupOrder:0,z:0,desc,bindings,shadowPass:false,program:true});
       }
       const items=[...opaque,...transparent],draws=[];
@@ -1365,6 +1383,9 @@ export async function createGpuThreeScene(device,scene,{
             fail('PREPARE','Program geometry layout changed; call prepare() before drawing it');
           const object=item.object,start=item.group?integer(item.group.start,0,Number.MAX_SAFE_INTEGER,'group start'):0;
           const count=item.group?integer(item.group.count,0,Number.MAX_SAFE_INTEGER,'group count'):Number.MAX_SAFE_INTEGER;
+          // renderObject: onBeforeRender, matrices, draw (uniforms packed now), onAfterRender.
+          const hooked=object.onBeforeRender!==three.Object3D.prototype.onBeforeRender||object.onAfterRender!==three.Object3D.prototype.onAfterRender;
+          if(hooked)object.onBeforeRender(shadowRenderer(),scene,camera,object.geometry,item.material,item.group);
           object.modelViewMatrix.multiplyMatrices(camera.matrixWorldInverse,object.matrixWorld);
           object.normalMatrix.getNormalMatrix(object.modelViewMatrix);
           const frontFaceCW=object.isMesh===true&&object.matrixWorld.determinant()<0;
@@ -1381,6 +1402,7 @@ export async function createGpuThreeScene(device,scene,{
             draws.push({mesh:item.bindings[i].mesh,first:start,count,programUniforms:bytes,frontFaceCW,instanceCount,
               ...(fogEnabled?{receiveFog:false}:{}),...(shadowEnabled?{receiveShadow:false}:{}),...(environmentEnabled?{receiveEnvironment:false}:{})});
           }
+          if(hooked)object.onAfterRender(shadowRenderer(),scene,camera,object.geometry,item.material,item.group);
           continue;
         }
         const deformation=item.bindings[0].deformation;
@@ -1500,7 +1522,7 @@ export async function createGpuThreeScene(device,scene,{
   try{
     // Source validation precedes even the renderer's uniform allocation.
     signal?.addEventListener('abort',onAbort,{once:true});if(signal?.aborted)onAbort();live();
-    scanTextures();
+    scanWithShadowRoute();
     const construction=createGpuAnimationRenderer(device,{...renderOptions,textureTransforms,alphaMaps,clipping:clippingEnabled,...(backgroundEnabled?{format:renderOptions.format??'rgba8unorm',sampleCount:renderOptions.sampleCount??1}:{}),...(shadowEnabled?{shadows:true}:{}),...(environmentEnabled?{environment:true}:{}),...(fogEnabled?{fog:true}:{}),indirectLights:true,threeLights:true,maxMeshes:2*maxBindings}).then(value=>{
       if(disposed||terminal){value.dispose();throw terminal??new ThreeSceneError('DISPOSED','Source scene is disposed');}
       renderer=shadowEnabled?shadowApi.withThreeShadowReceivers(value,renderOptions.maxDraws??1024):value;

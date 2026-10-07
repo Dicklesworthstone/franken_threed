@@ -1306,6 +1306,46 @@ export async function createGpuAnimationRenderer(
   lost.catch(() => {});
   // Compiled source programs (ShaderMaterial) share this renderer's passes/order.
   const programs = createProgramMeshes({device, format, depthFormat, sampleCount, maxDraws, label, fail, scoped, lost});
+  /** A scissor-limited clear: one full-target triangle (the scissor rect clips
+   * it) writing the clear color, depth (frag_depth) and stencil (replace). */
+  let clearPipelines = null, clearUniform = null;
+  function scissorClear(pass, rectangle, {color, depth, stencil}) {
+    clearPipelines ??= new Map();
+    const key = `${color !== null}|${depth !== null}|${stencil !== null}`;
+    let entry = clearPipelines.get(key);
+    if (!entry) {
+      const module = device.createShaderModule({label: `${label}/scissor-clear`, code: `
+struct ClearInfo { color: vec4<f32>, depth: vec4<f32> };
+@group(0) @binding(0) var<uniform> info: ClearInfo;
+struct Out { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 };
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+  let xy = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+  return vec4<f32>(xy * 2.0 - 1.0, 0.0, 1.0);
+}
+@fragment fn fs() -> Out { return Out(info.color, info.depth.x); }`});
+      const pipeline = device.createRenderPipeline({label: `${label}/scissor-clear`, layout: "auto",
+        vertex: {module, entryPoint: "vs"},
+        fragment: {module, entryPoint: "fs", targets: format === null ? [] : [{format, writeMask: color !== null ? 0xf : 0}]},
+        ...(depthFormat ? {depthStencil: {format: depthFormat, depthWriteEnabled: depth !== null, depthCompare: "always",
+          ...(stencilAttachment ? {stencilFront: {compare: "always", passOp: stencil !== null ? "replace" : "keep"},
+            stencilBack: {compare: "always", passOp: stencil !== null ? "replace" : "keep"}, stencilWriteMask: stencil !== null ? 0xff : 0} : {})}} : {}),
+        multisample: {count: sampleCount}});
+      clearUniform ??= device.createBuffer({label: `${label}/scissor-clear`, size: 32, usage: 64 | 8});
+      entry = {pipeline, group: device.createBindGroup({layout: pipeline.getBindGroupLayout(0), entries: [{binding: 0, resource: {buffer: clearUniform}}]})};
+      clearPipelines.set(key, entry);
+    }
+    // Written before this render's own submission (queue order per frame).
+    device.queue.writeBuffer(clearUniform, 0, new Float32Array([...(color ?? [0, 0, 0, 0]), depth ?? 1, 0, 0, 0]));
+    const [x, y, w, h] = rectangle;
+    if (w === 0 || h === 0) return;
+    // The scissor rectangle as viewport: the triangle covers exactly that area.
+    pass.setViewport(x, y, w, h, 0, 1);
+    pass.setPipeline(entry.pipeline);
+    pass.setBindGroup(0, entry.group);
+    if (stencil !== null) pass.setStencilReference(stencil);
+    pass.draw(3);
+    if (stencil !== null) pass.setStencilReference(0);
+  }
   async function addProgramMesh(gpu, options) {
     keys(options, ["program", "textures", "raster", "topology", "stripIndexFormat"], "program mesh");
     if (records.size + pendingMeshes >= maxMeshes) fail("ANIMATION_RENDER_LIMIT", "Mesh capacity exceeded");
@@ -2703,6 +2743,21 @@ export async function createGpuAnimationRenderer(
           frameLightGroup = cached.group;
         }
         const encoder = device.createCommandEncoder({ label });
+        // GL clears honor the scissor test; a WebGPU load-op clear covers the whole
+        // attachment. With a scissor, load and clear the rectangle with a draw.
+        const scissoredClear = scissor !== null &&
+          ((format !== null && loadOp === "clear") || (depthFormat && depthLoadOp === "clear") || (stencilAttachment && stencilLoadOp === "clear"));
+        if (scissoredClear) {
+          // Its own pass, ahead of the frame's, so no pass state leaks into draws.
+          const clearPass = encoder.beginRenderPass({label: `${label}/scissor-clear`,
+            colorAttachments: format === null ? [] : [{view: colorView, loadOp: "load", storeOp: "store"}],
+            ...(depthFormat ? {depthStencilAttachment: {view: depthView, depthLoadOp: "load", depthStoreOp: "store",
+              ...(stencilAttachment ? {stencilLoadOp: "load", stencilStoreOp: "store"} : {})}} : {})});
+          clearPass.setScissorRect(...scissor);
+          scissorClear(clearPass, scissor, {color: format !== null && loadOp === "clear" ? clearColor : null,
+            depth: depthFormat && depthLoadOp === "clear" ? clearDepth : null, stencil: stencilAttachment && stencilLoadOp === "clear" ? clearStencil : null});
+          clearPass.end();
+        }
         const pass = encoder.beginRenderPass({
           label,
           colorAttachments:
@@ -2712,7 +2767,7 @@ export async function createGpuAnimationRenderer(
                   {
                     view: colorView,
                     ...(resolveTarget ? { resolveTarget } : {}),
-                    loadOp,
+                    loadOp: scissoredClear ? "load" : loadOp,
                     storeOp: "store",
                     clearValue: {
                       r: clearColor[0],
@@ -2726,10 +2781,10 @@ export async function createGpuAnimationRenderer(
             ? {
                 depthStencilAttachment: {
                   view: depthView,
-                  depthLoadOp,
+                  depthLoadOp: scissoredClear ? "load" : depthLoadOp,
                   depthStoreOp: "store",
                   depthClearValue: clearDepth,
-                  ...(stencilAttachment ? {stencilLoadOp, stencilStoreOp: "store", stencilClearValue: clearStencil} : {}),
+                  ...(stencilAttachment ? {stencilLoadOp: scissoredClear ? "load" : stencilLoadOp, stencilStoreOp: "store", stencilClearValue: clearStencil} : {}),
                 },
               }
             : {}),

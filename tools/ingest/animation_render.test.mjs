@@ -96,6 +96,9 @@ function deviceSpy() {
       pipelines.push(descriptor);
       return Promise.resolve(descriptor);
     },
+    createRenderPipeline(descriptor) {
+      return {...descriptor, getBindGroupLayout: () => ({})};
+    },
     createCommandEncoder() {
       const encoded = [];
       return {
@@ -180,6 +183,7 @@ function deviceSpy() {
           for (const pass of passes)
             for (const draw of pass.draws) {
               const buffer = draw.uniform.group.entries[0].resource.buffer;
+              if (draw.uniform.offset === undefined || buffer.data.byteLength < draw.uniform.offset + 256) continue; // scissor-clear info
               draw.snapshot = new Float32Array(buffer.data, draw.uniform.offset, 64).slice();
               for (const group of draw.groups.values())
                 if (group.entries[0]?.resource?.buffer) {
@@ -353,6 +357,24 @@ test("multi-sample render targets, load preservation, viewport and scissor stay 
   r.dispose();
   assert.deepEqual(colorView, {});
   assert.deepEqual(depthView, {});
+});
+
+test("scissored clears follow GL: only the scissor rectangle is cleared", async () => {
+  const d = deviceSpy(),
+    r = await createGpuAnimationRenderer(d, {}),
+    mesh = await r.addMesh(gpu());
+  r.render(frame([mesh], {loadOp: "clear", depthLoadOp: "clear", clearColor: [0.1, 0.2, 0.3, 1], scissor: [4, 5, 6, 7]}));
+  const [clearPass, main] = d.passes;
+  // A load-op clear would wipe the whole attachment; GL clears honor the scissor.
+  assert.equal(clearPass.descriptor.colorAttachments[0].loadOp, "load");
+  assert.deepEqual(clearPass.viewport.slice(0, 4), [4, 5, 6, 7]);
+  assert.deepEqual(clearPass.scissor, [4, 5, 6, 7]);
+  assert.equal(clearPass.draws.length, 1);
+  assert.equal(main.descriptor.colorAttachments[0].loadOp, "load");
+  assert.equal(main.descriptor.depthStencilAttachment.depthLoadOp, "load");
+  r.render(frame([mesh], {loadOp: "clear", depthLoadOp: "clear"}));
+  assert.equal(d.passes.at(-1).descriptor.colorAttachments[0].loadOp, "clear", "no scissor: an ordinary clear");
+  r.dispose();
 });
 
 test("clear-only submissions and explicit no-depth mode require no geometry", async () => {
