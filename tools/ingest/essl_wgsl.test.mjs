@@ -141,3 +141,12 @@ test("rows:'gl' stores GL's bottom-up rows for render targets: clip Y mirrored, 
   assert.equal(gl.reflection.rows, 'gl');
   assert.throws(() => compileEsslProgram(vs, fs, {rows: 'up'}), /rows must be/);
 });
+
+test('gl_DepthRange is the GL default range (near 0, far 1, diff 1) in both stages', () => {
+  const r = program(V('gl_Position = mvp * vec4(position, gl_DepthRange.far);'), F('color = vec4(gl_DepthRange.near, gl_DepthRange.far, gl_DepthRange.diff, 1.0);'));
+  for (const m of [r.vertex, r.fragment]) {
+    assert.match(m, /var<private> f3d_DepthRange: F3DDepthRange = F3DDepthRange\(0\.0, 1\.0, 1\.0\);/);
+    assert.match(m, /struct F3DDepthRange \{/);
+  }
+  assert.match(r.fragment, /f3d_DepthRange\.diff/);
+});

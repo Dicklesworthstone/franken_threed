@@ -898,6 +898,17 @@ class Unit {
     if (!this.privates.includes(line)) this.privates.push(line);
     if (name === 'gl_FragCoord') this.shared.needsTarget = true;
   }
+  /** GLSL's gl_DepthRange: WebGL's depthRange is never set by r186, and WebGPU
+   * viewports are recorded with minDepth 0 / maxDepth 1, so the values are the
+   * GL defaults near=0, far=1, diff=1 (read-only, both stages). */
+  depthRange() {
+    const name = 'gl_DepthRangeParameters';
+    if (!this.shared.structs.has(name))
+      this.shared.structs.set(name, {fields: ['near', 'far', 'diff'].map(n => ({name: n, type: FLOAT})), wname: 'F3DDepthRange'});
+    const line = 'var<private> f3d_DepthRange: F3DDepthRange = F3DDepthRange(0.0, 1.0, 1.0);';
+    if (!this.privates.includes(line)) this.privates.push(line);
+    return {c: 'f3d_DepthRange', t: {k: 'st', name}};
+  }
   tmp() { return `f3d_t${this.temp++}`; }
   indexCode(e, ctx) {
     const r = this.expr(e, ctx);
@@ -1010,6 +1021,7 @@ class Unit {
       return this.essl1FragColor(e.name, e.line);
     const b = BUILTIN_VARS[this.stage][e.name];
     if (b && !this.lookup(e.name, ctx.scope)) { this.used.add(e.name); this.builtinPrivate(e.name, b); return {c: b.w, t: b.type}; }
+    if (e.name === 'gl_DepthRange' && !this.lookup(e.name, ctx.scope)) return this.depthRange();
     if (e.name === 'gl_PointCoord' && !this.points) essError('gl_PointCoord is only defined when drawing points (compile with points: true)', e.line);
     const s = this.lookup(e.name, ctx.scope);
     if (!s) essError(`Undeclared identifier ${e.name}`, e.line);

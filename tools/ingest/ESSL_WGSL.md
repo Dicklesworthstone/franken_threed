@@ -35,6 +35,8 @@ per element/column; integer varyings are flat.
   then need no flip; the caller swaps the pipeline's front face.
 - `gl_FragCoord` in GL window coordinates (bottom-left origin); `dFdy` keeps GL's
   upward sign; `texture()` outside fragment shaders samples level 0.
+- `gl_DepthRange` is the GL default `{near: 0, far: 1, diff: 1}`: r186 never
+  calls `gl.depthRange`, and pipelines record viewports with depth 0..1.
 - Vector `==`/`!=` reduce with `all`/`any`; `mod` uses `x - y*floor(x/y)`;
   shift counts become `u32`; `inverse`, `matrixCompMult`, `outerProduct` are
   generated helpers.
