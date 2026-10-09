@@ -124,7 +124,9 @@ function textureInspector(T,{
     const manual=t.mipmaps.length>0;
     if(video&&(manual||t.generateMipmaps||filter[2]))
       fail('MIPS','Live video uses the source single-level, non-mipmapped sampling profile');
-    if(manual&&((!cube&&!data)||t.generateMipmaps))fail('MIPS','Authored mips require byte data or cube faces with generation disabled');
+    // r186 uploads a 2D texture's authored mips (images, canvases or data) and
+    // then sets texture.generateMipmaps=false itself (see update()).
+    if(manual&&cube&&t.generateMipmaps)fail('MIPS','Authored cube mips require generation disabled');
     // r186 uncompressed cubes list ADDITIONAL mip levels; ordinary DataTextures
     // include the base level in mipmaps. Do not drop or duplicate either base.
     const levels=manual?t.mipmaps.length+Number(cube):t.generateMipmaps?full:1;
@@ -179,7 +181,7 @@ function textureInspector(T,{
     const format=bpc===1?prefix+'8unorm':bpc===2?prefix+'16float':prefix+'32float',viewFormat=t.colorSpace===T.SRGBColorSpace?'rgba8unorm-srgb':format;
     const sampler={addressModeU:wraps.get(t.wrapS),addressModeV:wraps.get(t.wrapT),magFilter:mag[0],minFilter:filter[0],
       mipmapFilter:filter[1],lodMinClamp:0,lodMaxClamp:filter[2]?levels-1:0,maxAnisotropy};
-    const key=JSON.stringify([width,height,levels,format,viewFormat,sampler,t.flipY,t.premultiplyAlpha,t.unpackAlignment,t.generateMipmaps,manual,data,...(cube?['cube']:video?['video']:[])]);
+    const key=JSON.stringify([width,height,levels,format,viewFormat,sampler,t.flipY,t.premultiplyAlpha,t.unpackAlignment,t.generateMipmaps&&!manual,manual,data,...(cube?['cube']:video?['video']:[])]);
     return {source:t.source,width,height,levels,layers,cube,video,videoReady,bytes,format,viewFormat,sampler,key,data,images,uploads,manual,channels,bpc,
       sampleType:filterable?'float':'unfilterable-float',
       flipY:t.flipY,premultiplyAlpha:t.premultiplyAlpha,alignment:t.unpackAlignment};
@@ -277,11 +279,13 @@ export function createGpuThreeTextures(device,{
         }
       }else for(const {image,level,layer} of d.uploads){
         native(()=>device.queue.copyExternalImageToTexture({source:image,flipY:d.flipY},
-          {texture:a.texture,colorSpace:'srgb',premultipliedAlpha:d.premultiplyAlpha,
-            ...(d.cube?{mipLevel:level,origin:[0,0,layer]}:{})},
+          {texture:a.texture,colorSpace:'srgb',premultipliedAlpha:d.premultiplyAlpha,mipLevel:level,
+            ...(d.cube?{origin:[0,0,layer]}:{})},
           [Math.max(1,d.width>>level),Math.max(1,d.height>>level)]));stats.externalCopies++;
       }
       downsample(a,d);stats.uploads++;a.sourceVersion=t.source.version;
+      // WebGLTextures.uploadTexture: authored 2D mips turn generation off.
+      if(d.manual&&!d.cube)t.generateMipmaps=false;
       // Upstream acknowledges the source BEFORE onUpdate, and the texture AFTER.
       // A callback exception is not a driver error and is not replayed on retry.
       if(t.onUpdate)t.onUpdate(t);

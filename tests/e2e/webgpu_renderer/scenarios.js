@@ -397,6 +397,22 @@ export const scenarios = {
     scene.add(mesh, key, new THREE.AmbientLight(0xffffff, 0.4));
     return { scene, camera: camera(THREE) };
   },
+  // Authored canvas mipmaps (r186 uploads each level, then turns generation off):
+  // a receding plane shows the per-level colors.
+  manual_mipmaps(THREE) {
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x000000);
+    const level = (size, color) => { const c = document.createElement('canvas'); c.width = c.height = size; const g = c.getContext('2d');
+      g.fillStyle = color; g.fillRect(0, 0, size, size); g.fillStyle = '#fff'; g.fillRect(0, 0, size / 2, size / 2); return c; };
+    const colors = ['#f00', '#0f0', '#00f', '#ff0', '#f0f', '#0ff', '#888'];
+    const tex = new THREE.CanvasTexture(level(64, colors[0]));
+    tex.mipmaps = colors.map((c, i) => level(64 >> i, c));
+    tex.repeat.set(8, 8); tex.wrapS = tex.wrapT = THREE.RepeatWrapping; tex.colorSpace = THREE.SRGBColorSpace;
+    const plane = new THREE.Mesh(new THREE.PlaneGeometry(6, 6), new THREE.MeshBasicMaterial({ map: tex }));
+    plane.rotation.x = -Math.PI / 2.3; plane.position.y = -0.6;
+    scene.add(plane);
+    return { scene, camera: camera(THREE) };
+  },
   // ShaderMaterial points: gl_PointSize squares, gl_PointCoord (GL upper-left
   // origin) with discard, per-point size attribute, and a clipped-center point.
   shader_points(THREE) {
