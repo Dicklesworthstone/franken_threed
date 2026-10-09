@@ -829,6 +829,21 @@ export const scenarios = {
     scene.add(back, box, key, new THREE.AmbientLight(0xffffff, 0.6));
     return { scene, camera: camera(THREE, [0, 0, 3.2]) };
   },
+  // PMREMGenerator.fromScene with a bare Mesh root (r186 renders any Object3D),
+  // as webgl_animation_keyframes does with its Sky: a BackSide gradient shell.
+  shaderlib_pmrem_mesh_root(THREE, renderer) {
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x101010);
+    const shell = new THREE.Mesh(new THREE.SphereGeometry(10, 32, 16), new THREE.ShaderMaterial({ side: THREE.BackSide, depthWrite: false,
+      vertexShader: 'varying vec3 vDir; void main() { vDir = normalize(position); gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+      fragmentShader: 'varying vec3 vDir; void main() { float h = vDir.y * 0.5 + 0.5; gl_FragColor = vec4(mix(vec3(0.6, 0.3, 0.1), vec3(0.3, 0.6, 1.2), h) + step(0.9, vDir.x) * 2.0, 1.0); }' }));
+    scene.environment = new THREE.PMREMGenerator(renderer).fromScene(shell).texture;
+    [[0.05, -0.5], [0.5, 0.5]].forEach(([roughness, x]) => {
+      const mesh = new THREE.Mesh(new THREE.SphereGeometry(0.45, 48, 24), new THREE.MeshStandardMaterial({ color: 0xffffff, metalness: 1, roughness }));
+      mesh.position.x = x; scene.add(mesh);
+    });
+    return { scene, camera: camera(THREE, [0, 0, 3]) };
+  },
   shaderlib_physical(THREE) {
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x181818);

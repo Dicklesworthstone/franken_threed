@@ -957,7 +957,7 @@ export function createPMREMGeneratorClass(THREE, {exactBackend = null} = {}) {
     fromScene(scene, sigma = 0, near = 0.1, far = 100, options = {}) {
       const {size = 256, position = new THREE.Vector3(), renderTarget = null} = options;
       if (renderTarget !== null) fail('UNSUPPORTED', 'Explicit PMREM render targets are not admitted');
-      if (!(scene instanceof THREE.Scene)) fail('SOURCE', 'Expected a source Scene');
+      if (!(scene instanceof THREE.Object3D)) fail('SOURCE', 'Expected a source Object3D (r186 renders any root)');
       const texture = new THREE.CubeTexture();
       texture.name = 'PMREM.cubeUv';
       texture.mapping = THREE.CubeUVReflectionMapping;

@@ -55,7 +55,7 @@ export function createThreeProgramPMREM({three: T, device, bindingOf, label = 'f
   const host = createHost();
   const generator = new T.PMREMGenerator(host);
   const done = new Map(), outputs = new Map(), targets = new Map(), programs = new Map(), retired = [], cubes = new Map(), scenes = new Map();
-  let disposed = false, sampler = null, constant = null, mipper = null, capture = null, dfg = null;
+  let disposed = false, sampler = null, constant = null, mipper = null, capture = null, dfg = null, captureRoot = null;
   const residencies = new Map(), scenePipelines = new Map(), frustum = new T.Frustum(), projScreen = new T.Matrix4(), zVector = new T.Vector3();
 
   /** The renderer calls PMREMGenerator and CubeCamera make, recorded in order. */
@@ -74,7 +74,8 @@ export function createThreeProgramPMREM({three: T, device, bindingOf, label = 'f
       render(scene, camera) {
         if (!recording) fail('STATE', 'Offscreen draws outside a generation');
         if (!target) fail('STATE', 'Offscreen draws need a render target');
-        if (scene?.isScene) { for (const d of renderScene(target, face, scene, camera, this.autoClear)) recording.push(d); return; }
+        // A scene capture's own root may be any Object3D (fromScene(sky)).
+        if (scene?.isScene || (captureRoot !== null && scene === captureRoot)) { for (const d of renderScene(target, face, scene, camera, this.autoClear)) recording.push(d); return; }
         if (!scene?.isMesh) fail('STATE', 'Only meshes and scenes render offscreen');
         // WebGLRenderer.render: world matrices, then the object's view matrices.
         if (scene.matrixWorldAutoUpdate === true) scene.updateMatrixWorld();
@@ -123,9 +124,12 @@ export function createThreeProgramPMREM({three: T, device, bindingOf, label = 'f
       outputColorSpace: T.LinearSRGBColorSpace, pixelRatio: 1, height: target.height})});
     if (scene.matrixWorldAutoUpdate === true) scene.updateMatrixWorld();
     if (camera.parent === null && camera.matrixWorldAutoUpdate === true) camera.updateMatrixWorld();
-    if (scene.background !== null && !scene.background?.isColor) fail('CAPTURE', 'Captured scenes with texture backgrounds are not admitted yet');
-    if (scene.environment !== null || scene.overrideMaterial !== null) fail('CAPTURE', 'Captured scenes with environments or override materials are not admitted yet');
-    if (scene.onBeforeRender !== T.Object3D.prototype.onBeforeRender) fail('CAPTURE', 'Scene render hooks need their original renderer');
+    // WebGLRenderer.render takes any Object3D root; only a Scene has a background,
+    // environment, override material, fog and scene-level render hooks.
+    const isScene = scene.isScene === true;
+    if (isScene && scene.background !== null && !scene.background?.isColor) fail('CAPTURE', 'Captured scenes with texture backgrounds are not admitted yet');
+    if (isScene && (scene.environment !== null || scene.overrideMaterial !== null)) fail('CAPTURE', 'Captured scenes with environments or override materials are not admitted yet');
+    if (isScene && scene.onBeforeRender !== T.Object3D.prototype.onBeforeRender) fail('CAPTURE', 'Scene render hooks need their original renderer');
     projScreen.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
     frustum.setFromProjectionMatrix(projScreen, camera.coordinateSystem, camera.reversedDepth);
     const lights = [], opaque = [], transparent = [];
@@ -474,11 +478,11 @@ struct V { @builtin(position) p: vec4<f32>, @location(0) uv: vec2<f32> };
   async function generateScene(texture) {
     if (disposed) fail('DISPOSED', 'PMREM owner is disposed');
     const c = texture.f3dCapture;
-    if (!c?.scene?.isScene) fail('SOURCE', 'Expected a PMREM scene capture');
+    if (!c?.scene?.isObject3D) fail('SOURCE', 'Expected a PMREM scene capture');
     let target, draws;
-    host.begin();
+    host.begin(); captureRoot = c.scene;
     try { target = generator.fromScene(c.scene, c.sigma, c.near, c.far, {size: c.size, position: c.position}); }
-    finally { draws = host.end(); }
+    finally { draws = host.end(); captureRoot = null; }
     await execute(draws);
     const out = targetTexture(target);
     for (const [rt, t] of targets) if (rt !== target && rt !== generator._pingPongRenderTarget && ![...done.values(), ...cubes.values(), ...scenes.values()].some(e => e.target === rt)) { t.texture.destroy(); t.depth?.destroy(); targets.delete(rt); }
