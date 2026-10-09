@@ -270,6 +270,9 @@ test('WebGLRenderer surface: synchronous construction, frames before init are de
   const scene = new TC.Scene(), mesh = new TC.Mesh(new TC.BoxGeometry(), new TC.MeshBasicMaterial({color: 0xff0000}));
   scene.add(mesh);
   const camera = new TC.PerspectiveCamera(50, 2, 0.1, 10); camera.position.z = 3;
+  // compile(): the scene's materials, synchronously; preparation starts now.
+  const compiled = renderer.compile(scene, camera);
+  assert.ok(compiled instanceof Set && compiled.size === 1 && compiled.has(mesh.material));
   renderer.render(scene, camera); // before the device exists: no throw, deferred
   await flush(renderer);
   assert.equal(c.acquired(), 1);

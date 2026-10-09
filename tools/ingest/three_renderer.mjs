@@ -879,6 +879,22 @@ export function createWebGLRendererClass(THREE, classOptions = {}) {
       return this._readTargetPixels(target, {x, y, width, height, output: buffer, flipY: true});
     }
     readRenderTargetPixels() { fail('ROUTE', 'Synchronous pixel readback requires the exact native backend'); }
+    /** r186 compile(): returns the Set of the scene's materials synchronously, as
+     * r186 does. Its GL programs are this route's asynchronously built
+     * pipelines: preparation starts now (compileAsync) and a failure surfaces at
+     * the next render()/compileAsync() call. Not a claim that pipelines exist on return. */
+    compile(scene, camera, targetScene = null) {
+      if (this._disposed) fail('DISPOSED', 'Renderer is disposed');
+      if (!(scene instanceof THREE.Object3D)) fail('SOURCE', 'Expected a source Object3D root');
+      const materials = new Set();
+      scene.traverse(object => {
+        if (!(object.isMesh || object.isPoints || object.isLine || object.isSprite)) return;
+        const material = object.material;
+        if (material) { if (Array.isArray(material)) for (const m of material) materials.add(m); else materials.add(material); }
+      });
+      this.compileAsync(scene, camera, targetScene).catch(error => { this._deferredError ??= error; });
+      return materials;
+    }
     getCurrentViewport(target) {
       return this._renderTarget ? target.copy(this._renderTarget.viewport).round() : target.copy(this._viewport).multiplyScalar(this._pixelRatio).round();
     }
