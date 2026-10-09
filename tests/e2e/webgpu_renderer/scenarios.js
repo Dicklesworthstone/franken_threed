@@ -326,6 +326,27 @@ export const scenarios = {
     });
     return { scene, camera: cam };
   },
+  // Program-route wireframes (r186 getWireframeAttribute edge index as gl.LINES)
+  // on a ShaderMaterial and an InstancedMesh, plus alphaHash, under in-shader
+  // tone mapping (every draw on the program route).
+  shaderlib_wireframe_alphahash(THREE, renderer) {
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x101010);
+    const wireShader = new THREE.Mesh(new THREE.TorusKnotGeometry(0.35, 0.12, 48, 8), new THREE.ShaderMaterial({ wireframe: true,
+      vertexShader: 'varying vec3 vN; void main() { vN = normal; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+      fragmentShader: 'varying vec3 vN; void main() { gl_FragColor = vec4(normalize(vN) * 0.5 + 0.5, 1.0); }' }));
+    wireShader.position.set(-0.8, 0.35, 0);
+    const instanced = new THREE.InstancedMesh(new THREE.IcosahedronGeometry(0.2, 1), new THREE.MeshPhongMaterial({ color: 0x66ccff, wireframe: true }), 3);
+    for (let i = 0; i < 3; i++) instanced.setMatrixAt(i, new THREE.Matrix4().makeTranslation(0.5 + i * 0.45, 0.5 - i * 0.2, 0));
+    const hashed = new THREE.Mesh(new THREE.PlaneGeometry(1.4, 0.8), new THREE.MeshStandardMaterial({ color: 0xffaa33, alphaHash: true, opacity: 0.5, roughness: 0.6 }));
+    hashed.position.set(0, -0.45, 0.2);
+    const behind = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.5, 0.5), new THREE.MeshLambertMaterial({ color: 0x3355ff }));
+    behind.position.set(0, -0.45, -0.4);
+    const key = new THREE.DirectionalLight(0xffffff, 2.5); key.position.set(1, 2, 3);
+    scene.add(wireShader, instanced, hashed, behind, key, new THREE.AmbientLight(0xffffff, 0.4));
+    return { scene, camera: camera(THREE) };
+  },
   // ShaderMaterial points: gl_PointSize squares, gl_PointCoord (GL upper-left
   // origin) with discard, per-point size attribute, and a clipped-center point.
   shader_points(THREE) {

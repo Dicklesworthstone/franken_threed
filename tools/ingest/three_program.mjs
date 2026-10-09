@@ -40,8 +40,6 @@ export function inspectThreeProgram(T, material, object) {
   if (object.isInstancedMesh && object.morphTexture != null) fail('OBJECT', 'Instanced morph textures are not admitted yet');
   if (object.isSkinnedMesh && !(object.skeleton instanceof T.Skeleton)) fail('OBJECT', 'Skinned program objects need their skeleton');
   if (material.extensions?.clipCullDistance || material.extensions?.multiDraw) fail('EXTENSION', 'Program extensions are not admitted');
-  if (material.wireframe) fail('MATERIAL', 'Wireframe programs are not admitted yet');
-  if (material.alphaHash) fail('MATERIAL', 'alphaHash programs are not admitted yet');
   if (material.stencilWrite) fail('MATERIAL', 'Stencil programs are not admitted yet');
 }
 

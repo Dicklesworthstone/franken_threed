@@ -435,8 +435,19 @@ export async function createGpuThreeScene(device,scene,{
   };
   // The attribute source a program reads: the geometry, or for InstancedMesh a
   // per-object view adding instanceMatrix/instanceColor as WebGLRenderer binds them.
-  const programSources=new WeakMap();
-  function programSource(object){
+  const programSources=new WeakMap(),wireSources=new WeakMap();
+  function programSource(object,wire=false){
+    // Wireframe: r186 getWireframeAttribute's edge index over the same streams (gl.LINES).
+    if(wire){
+      const base=programSource(object),w=wireframeGeometry(object.geometry);
+      if(base===object.geometry)return w;
+      let view=wireSources.get(object);
+      if(!view||view.base!==base||view.wire!==w){
+        view={base,wire:w,geometry:object.geometry,attributes:base.attributes,get index(){return w.index;},get drawRange(){return w.drawRange;},morphAttributes:base.morphAttributes,isInstancedBufferGeometry:false};
+        wireSources.set(object,view);
+      }
+      return view;
+    }
     if(object.isLineLoop)return loopGeometry(object.geometry);
     if(object.isPoints&&object.geometry.index)return pointsGeometry(object.geometry);
     if(!object.isInstancedMesh)return object.geometry;
@@ -1030,8 +1041,8 @@ export async function createGpuThreeScene(device,scene,{
         get(original,object.isMesh&&original.wireframe===true?'lines':topology,object);
         const m=scene.overrideMaterial&&original.allowOverride===true?scene.overrideMaterial:original;
         const wire=object.isMesh&&m.wireframe===true;
-        if(wire&&(instanceSource||deformationSource))fail('MATERIAL','Wireframe instanced or deformed meshes are not admitted');
         const isProgram=programCapable(m)&&get(m,wire?'lines':topology,object).some(d=>d.program);
+        if(wire&&!isProgram&&(instanceSource||deformationSource))fail('MATERIAL','Wireframe instanced or deformed meshes are not admitted');
         const t=wire?'lines':topology,geometry=wire?wireframeGeometry(g):g,itemKey=isProgram?programKeyOf(object):wire?geometry:key;
         let set=seen.get(itemKey);if(!set)seen.set(itemKey,set=new Map());
         const topologies=set.get(m)??new Set();if(topologies.has(t))continue;topologies.add(t);set.set(m,topologies);
@@ -1039,7 +1050,7 @@ export async function createGpuThreeScene(device,scene,{
         if(deformationSource)usedDeformations.add(deformationSource);
         if(usedDeformations.size>maxDeformedMeshes)fail('LIMIT','Source deformed mesh capacity exceeded');
         for(const desc of get(m,t,object)){
-          if(desc.program){out.push({key:itemKey,geometry,instanceSource:null,instanceSignature:null,deformationSource:null,material:m,desc,programSource:programSource(object)});continue;}
+          if(desc.program){out.push({key:itemKey,geometry,instanceSource:null,instanceSignature:null,deformationSource:null,material:m,desc,programSource:programSource(object,wire)});continue;}
           if(textureTransforms)uvApi.checkThreeMapChannels(g,desc.options.mapChannels);
           out.push({key:itemKey,geometry,instanceSource,instanceSignature,deformationSource,material:m,desc});
           if(out.length>maxBindings||usedGeometry.size>maxGeometries||usedInstances.size>maxInstanceMeshes)fail('LIMIT','Source geometry/material binding capacity exceeded');

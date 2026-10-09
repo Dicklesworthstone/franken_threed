@@ -34,7 +34,9 @@ test('ShaderMaterial sources follow r186 WebGLProgram: version, precision, defin
   const raw = new T.RawShaderMaterial({vertexShader: 'void main(){}', fragmentShader: 'void main(){}', defines: {A: 1}});
   assert.equal(threeProgramSources(T, raw, new T.Mesh(new T.BufferGeometry(), raw), state).vertex,
     '#define SHADER_TYPE RawShaderMaterial\n#define SHADER_NAME \n#define A 1\nvoid main(){}');
-  assert.throws(() => threeProgramSources(T, shader({wireframe: true}), mesh, state), {code: 'THREE_PROGRAM_MATERIAL'});
+  // Wireframe draws the same program over an edge index (the caller's lines topology).
+  assert.equal(threeProgramSources(T, shader({wireframe: true}), mesh, state).fragment, threeProgramSources(T, shader(), mesh, state).fragment);
+  assert.throws(() => threeProgramSources(T, shader({stencilWrite: true}), mesh, state), {code: 'THREE_PROGRAM_MATERIAL'});
 });
 
 test('raster state uses WebGLState: blend table, BACK culling with frontFace flips', () => {
