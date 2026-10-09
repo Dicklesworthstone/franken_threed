@@ -413,6 +413,28 @@ export const scenarios = {
     scene.add(plane);
     return { scene, camera: camera(THREE) };
   },
+  // InstancedBufferGeometry with ShaderLib materials: renderInstances over
+  // instanceCount with an onBeforeCompile instanced offset, and an InstancedMesh
+  // over interleaved InstancedBufferGeometry streams.
+  shaderlib_instanced_buffer_geometry(THREE) {
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x101418);
+    const base = new THREE.IcosahedronGeometry(0.18, 1), geometry = new THREE.InstancedBufferGeometry();
+    geometry.index = base.index; geometry.attributes.position = base.attributes.position; geometry.attributes.normal = base.attributes.normal;
+    geometry.setAttribute('offset', new THREE.InstancedBufferAttribute(new Float32Array([-0.9, 0.4, 0, -0.45, 0.4, 0, 0, 0.4, 0, 0.45, 0.4, 0]), 3));
+    geometry.instanceCount = 3;
+    const lambert = new THREE.MeshLambertMaterial({ color: 0xff8844 });
+    lambert.onBeforeCompile = shader => { shader.vertexShader = shader.vertexShader.replace('#include <common>', '#include <common>\nattribute vec3 offset;')
+      .replace('#include <begin_vertex>', '#include <begin_vertex>\ntransformed += offset;'); };
+    const interleaved = new THREE.InterleavedBuffer(new Float32Array([-0.2, -0.2, 0, 0, 0, 1, 0.2, -0.2, 0, 0, 0, 1, 0, 0.25, 0, 0, 0, 1]), 6);
+    const tri = new THREE.InstancedBufferGeometry();
+    tri.setAttribute('position', new THREE.InterleavedBufferAttribute(interleaved, 3, 0)); tri.setAttribute('normal', new THREE.InterleavedBufferAttribute(interleaved, 3, 3));
+    const mesh = new THREE.InstancedMesh(tri, new THREE.MeshBasicMaterial({ color: 0x44ccff, side: THREE.DoubleSide }), 4);
+    for (let i = 0; i < 4; i++) mesh.setMatrixAt(i, new THREE.Matrix4().makeTranslation(-0.9 + i * 0.6, -0.4, 0));
+    const key = new THREE.DirectionalLight(0xffffff, 2); key.position.set(1, 2, 3);
+    scene.add(new THREE.Mesh(geometry, lambert), mesh, key, new THREE.AmbientLight(0xffffff, 0.3));
+    return { scene, camera: camera(THREE) };
+  },
   // ShaderMaterial points: gl_PointSize squares, gl_PointCoord (GL upper-left
   // origin) with discard, per-point size attribute, and a clipped-center point.
   shader_points(THREE) {

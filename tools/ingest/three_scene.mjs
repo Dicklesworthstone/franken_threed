@@ -227,8 +227,11 @@ export async function createGpuThreeScene(device,scene,{
   // influences (USE_INSTANCING_MORPH); only the program route draws them.
   const instancedMorph=object=>object.isInstancedMesh===true&&object.morphTexture!=null&&programRoute();
   function geometryAdmission(g,object){
-    const programs=(Array.isArray(object.material)?object.material:[object.material]).every(m=>m?.isShaderMaterial);
+    const list=Array.isArray(object.material)?object.material:[object.material];
+    const programs=list.every(m=>m?.isShaderMaterial)||(programRoute()&&list.every(m=>!m||programCapable(m)));
     if(!(g instanceof three.BufferGeometry)||(g.isInstancedBufferGeometry&&!programs))fail('GEOMETRY','Expected source BufferGeometry');
+    // InstancedBufferGeometry (renderInstances over geometry.instanceCount) draws through programs.
+    if(g.isInstancedBufferGeometry)programGeometries_.add(g);
     // Program-drawn skinned meshes (in-shader tone mapping) skin in their own program.
     if(hasThreeDeformation(object)&&!programToneMapping()){
       try{inspectThreeDeformation(object,{...deformationOptions,three});}
