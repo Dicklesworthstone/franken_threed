@@ -36,7 +36,6 @@ export function inspectThreeProgram(T, material, object) {
   const builtin = SHADER_IDS[material?.type] !== undefined;
   if (!material?.isShaderMaterial && !builtin) fail('SOURCE', 'Expected a ShaderMaterial, RawShaderMaterial or ShaderLib material');
   if (material.isShaderMaterial && (typeof material.vertexShader !== 'string' || typeof material.fragmentShader !== 'string')) fail('SOURCE', 'Program sources must be strings');
-  if (object.isBatchedMesh) fail('OBJECT', 'Batched program objects are not admitted yet');
   if (object.isSkinnedMesh && !(object.skeleton instanceof T.Skeleton)) fail('OBJECT', 'Skinned program objects need their skeleton');
   if (material.extensions?.clipCullDistance || material.extensions?.multiDraw) fail('EXTENSION', 'Program extensions are not admitted');
   if (material.stencilWrite) fail('MATERIAL', 'Stencil programs are not admitted yet');
@@ -336,6 +335,9 @@ export function createThreeProgramSupport({three: T, state, maxPrograms = 256, m
       out = {...out, boneTexture: skeleton.boneTexture};
     }
     if (object?.geometry && morphAttributeOf(object.geometry) !== undefined) out = {...out, morphTargetsTexture: threeMorphTargets(T, object.geometry).texture};
+    // setProgram: a BatchedMesh's matrices, indirect ids and optional colors.
+    if (object?.isBatchedMesh) out = {...out, batchingTexture: object._matricesTexture, batchingIdTexture: object._indirectTexture,
+      ...(object._colorsTexture !== null ? {batchingColorTexture: object._colorsTexture} : {})};
     // WebGLMorphtargets.update: an InstancedMesh's per-instance influence texture.
     if (object?.isInstancedMesh && object.morphTexture) out = {...out, morphTexture: object.morphTexture};
     return out;

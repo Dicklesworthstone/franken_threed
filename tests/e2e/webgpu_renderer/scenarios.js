@@ -377,6 +377,26 @@ export const scenarios = {
     scene.add(mesh, floor, sun, new THREE.AmbientLight(0xffffff, 0.3));
     return { scene, camera: camera(THREE, [0, 1, 2.6]) };
   },
+  // BatchedMesh through r186's no-multi-draw path: per-draw _gl_DrawID, the
+  // batching matrix/indirect-id/color textures, per-object culling and sorting
+  // in onBeforeRender, a hidden instance.
+  shaderlib_batched_mesh(THREE) {
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x141820);
+    const box = new THREE.BoxGeometry(0.3, 0.3, 0.3), ball = new THREE.SphereGeometry(0.2, 16, 8);
+    const mesh = new THREE.BatchedMesh(8, 2048, 4096, new THREE.MeshStandardMaterial({ roughness: 0.5 }));
+    const ids = [mesh.addGeometry(box), mesh.addGeometry(ball)];
+    for (let i = 0; i < 7; i++) {
+      const id = mesh.addInstance(ids[i % 2]);
+      mesh.setMatrixAt(id, new THREE.Matrix4().compose(new THREE.Vector3((i % 4) * 0.55 - 0.8, i < 4 ? 0.3 : -0.35, (i % 3) * -0.2),
+        new THREE.Quaternion().setFromEuler(new THREE.Euler(i * 0.4, i * 0.7, 0)), new THREE.Vector3(1, 1, 1)));
+      mesh.setColorAt(id, new THREE.Color().setHSL(i / 7, 0.7, 0.55));
+      if (i === 5) mesh.setVisibleAt(id, false);
+    }
+    const key = new THREE.DirectionalLight(0xffffff, 2.5); key.position.set(1, 2, 3);
+    scene.add(mesh, key, new THREE.AmbientLight(0xffffff, 0.4));
+    return { scene, camera: camera(THREE) };
+  },
   // ShaderMaterial points: gl_PointSize squares, gl_PointCoord (GL upper-left
   // origin) with discard, per-point size attribute, and a clipped-center point.
   shader_points(THREE) {

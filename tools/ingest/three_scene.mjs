@@ -273,8 +273,14 @@ export async function createGpuThreeScene(device,scene,{
       }
       if(object.isMesh){
         if(Array.isArray(object.material)&&object.material.length>maxBindings)fail('LIMIT','Source material array exceeds capacity');
-        if(object.isBatchedMesh||object.intersectsFrustum!==(object.isSkinnedMesh?three.SkinnedMesh?.prototype.intersectsFrustum:three.Mesh.prototype.intersectsFrustum))
+        if((object.isBatchedMesh&&!programRoute())||object.intersectsFrustum!==(object.isSkinnedMesh?three.SkinnedMesh?.prototype.intersectsFrustum:three.Mesh.prototype.intersectsFrustum))
           fail('OBJECT','Use the explicit animation/instance path for this mesh family');
+        // BatchedMesh (WebGL surface): its ShaderLib program with r186's
+        // no-WEBGL_multi_draw path, one draw per multi-draw entry.
+        if(object.isBatchedMesh){
+          if(object.castShadow)fail('SHADOW','BatchedMesh shadow casters are not admitted yet');
+          programDeformed.add(object);
+        }
         if(!shadowEnabled&&(object.castShadow||object.receiveShadow))fail('SHADOW','Enable shadow:{} to own source shadows');
         if(shadowEnabled){
           if(typeof object.castShadow!=='boolean'||typeof object.receiveShadow!=='boolean')fail('SHADOW','Expected boolean source shadow flags');
@@ -406,7 +412,7 @@ export async function createGpuThreeScene(device,scene,{
    * the owned residency, or r186's zero 1x1 default while the source loads. */
   function textureBinding(t){
     let binding;
-    const generated=pmremOwner?.binding(t)??programShadowOwner?.binding(t)??transmissionOwner?.binding(t)??morphBinding(t)??volumeBinding(t);
+    const generated=pmremOwner?.binding(t)??programShadowOwner?.binding(t)??transmissionOwner?.binding(t)??morphBinding(t)??volumeBinding(t)??integerBinding(t);
     if(generated)return generated;
     // Shadow-map depth textures belong to the program shadow owner, which binds
     // them after preparing its maps; a scan only needs a stand-in.
@@ -664,6 +670,34 @@ export async function createGpuThreeScene(device,scene,{
     if(b.version!==t.version){
       const bytes=new Uint8Array(data.buffer,data.byteOffset,data.byteLength);
       device.queue.writeTexture({texture:b.texture},bytes,{bytesPerRow:width*channels*bpc,rowsPerImage:height},[width,height,depth]);
+      b.version=t.version;
+    }
+    return b;
+  }
+  /** Integer DataTextures (usampler2D/isampler2D, e.g. BatchedMesh's
+   * batchingIdTexture): a direct r32uint/r32sint-class residency, rewritten when
+   * the texture version changes; integer textures are never filtered. */
+  const integerBindings=new WeakMap();
+  function integerBinding(t){
+    const channels={[three.RedIntegerFormat]:1,[three.RGIntegerFormat]:2,[three.RGBAIntegerFormat]:4}[t?.format];
+    if(!channels||!t.isDataTexture||!programRoute())return undefined;
+    const {width,height,data}=t.image??{};
+    if(!data)return placeholderBinding();
+    const kind={[three.UnsignedIntType]:['32uint',4,'uint'],[three.IntType]:['32sint',4,'sint'],[three.UnsignedShortType]:['16uint',2,'uint'],
+      [three.ShortType]:['16sint',2,'sint'],[three.UnsignedByteType]:['8uint',1,'uint'],[three.ByteType]:['8sint',1,'sint']}[t.type];
+    if(!kind)fail('TEXTURE','Unsupported integer texture type');
+    const format=['r','rg',null,'rgba'][channels-1]+kind[0];
+    let b=integerBindings.get(t);
+    if(!b||b.width!==width||b.height!==height||b.format!==format){
+      b?.texture.destroy();
+      const texture=device.createTexture({label:'f3d-integer-texture',size:[width,height],format,usage:4|2});
+      b={texture,width,height,format,version:-1,view:texture.createView(),sampler:device.createSampler({label:'f3d-integer-texture'}),sampleType:kind[2]};
+      integerBindings.set(t,b);
+      t.addEventListener('dispose',()=>{if(integerBindings.get(t)===b){integerBindings.delete(t);texture.destroy();}});
+    }
+    if(b.version!==t.version){
+      const bytes=new Uint8Array(data.buffer,data.byteOffset,data.byteLength),row=width*channels*kind[1];
+      device.queue.writeTexture({texture:b.texture},bytes,{bytesPerRow:row,rowsPerImage:height},[width,height]);
       b.version=t.version;
     }
     return b;
@@ -1538,6 +1572,7 @@ export async function createGpuThreeScene(device,scene,{
       if(transmissive.length&&scene.overrideMaterial===null){
         const passItem=(item,d,i,side=d.programSide)=>{
           const gpu=item.bindings[i].programGeometry,m=item.material,object=item.object;
+          if(object.isBatchedMesh)fail('MATERIAL','BatchedMesh draws in transmission passes are not admitted yet');
           if(!updated.has(gpu)){gpu.update({maxAdditionalBytes:Math.max(0,maxGeometryBytes-geometryBytes())});updated.add(gpu);}
           return {object,material:m,group:item.group,side,gpu,sourceObject:programObject(object),topology:d.options.topology,stripIndexFormat:d.options.stripIndexFormat,
             compile:()=>programSupport.compile(m,programObject(object),{...d.compileOptions,side,renderTarget:true}),
@@ -1575,16 +1610,30 @@ export async function createGpuThreeScene(device,scene,{
           const frontFaceCW=object.isMesh===true&&object.matrixWorld.determinant()<0;
           const g=object.geometry;
           const instanceCount=object.isInstancedMesh?integer(object.count,0,0xffffffff,'instance count'):g.isInstancedBufferGeometry?Math.min(g.instanceCount,0xffffffff):1;
+          // BatchedMesh: onBeforeRender just rewrote the indirect ids; upload them
+          // (setProgram binds textures after the callback), then r186's
+          // no-multi-draw loop: _gl_DrawID = i, render(starts[i] / bytes, counts[i]).
+          if(object.isBatchedMesh){
+            const before=integerBindings.get(object._indirectTexture)?.view;
+            if(integerBinding(object._indirectTexture)?.view!==before)fail('PREPARE','BatchedMesh indirect texture changed; call prepare()');
+          }
+          const multi=object.isBatchedMesh?Array.from({length:object._multiDrawCount},(_,k)=>{
+            const index=item.geometry.index,bpe=index?index.array.BYTES_PER_ELEMENT:1;
+            return {id:k,first:object._multiDrawStarts[k]/bpe,count:object._multiDrawCounts[k]};
+          }):null;
           for(let i=0;i<item.bindings.length;i++){
-            const d=item.desc[i],reflection=d.program.program.reflection,bytes=new Uint8Array(reflection.uniformBufferSize);
+            const d=item.desc[i],reflection=d.program.program.reflection;
             const clip=programSupport.clippingState(programClippingControls(),item.material,camera);
-            const current=programSupport.pack(reflection,programSupport.uniformsFor(item.material),programObject(object),camera,bytes,{targetSize:programTargetSize,material:item.material,
-              values:programSupport.bindsClippingPlanes(item.material)?{clippingPlanes:clip.planes}:null});
-            if(current.some((t,k)=>(t??null)!==d.programTextures[k]))fail('PREPARE','Program texture uniforms changed; call prepare()');
-            for(const t of current)if(t)frameTextures?.add(t);
-            // Programs evaluate fog/lighting in their own source; never core receivers.
-            draws.push({mesh:item.bindings[i].mesh,first:start,count,programUniforms:bytes,frontFaceCW,instanceCount,
-              ...(fogEnabled?{receiveFog:false}:{}),...(shadowEnabled?{receiveShadow:false}:{}),...(environmentEnabled?{receiveEnvironment:false}:{})});
+            for(const sub of multi??[null]){
+              const bytes=new Uint8Array(reflection.uniformBufferSize);
+              const values={...(programSupport.bindsClippingPlanes(item.material)?{clippingPlanes:clip.planes}:{}),...(sub?{_gl_DrawID:sub.id}:{})};
+              const current=programSupport.pack(reflection,programSupport.uniformsFor(item.material),programObject(object),camera,bytes,{targetSize:programTargetSize,material:item.material,values});
+              if(current.some((t,k)=>(t??null)!==d.programTextures[k]))fail('PREPARE','Program texture uniforms changed; call prepare()');
+              for(const t of current)if(t)frameTextures?.add(t);
+              // Programs evaluate fog/lighting in their own source; never core receivers.
+              draws.push({mesh:item.bindings[i].mesh,first:sub?sub.first:start,count:sub?sub.count:count,programUniforms:bytes,frontFaceCW,instanceCount,
+                ...(fogEnabled?{receiveFog:false}:{}),...(shadowEnabled?{receiveShadow:false}:{}),...(environmentEnabled?{receiveEnvironment:false}:{})});
+            }
           }
           if(hooked)object.onAfterRender(shadowRenderer(),root,camera,object.geometry,item.material,item.group);
           continue;
