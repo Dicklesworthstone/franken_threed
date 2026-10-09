@@ -541,6 +541,30 @@ export const scenarios = {
     scene.add(floor, box, knot, sun, spot, spot.target, point, new THREE.AmbientLight(0xffffff, 0.15));
     return { scene, camera: camera(THREE, [0, 1.4, 3.6]) };
   },
+  // Line shadow casters (r186 draws gl.LINES / LINE_STRIP / the loop with the
+  // depth material) into directional and spot maps over a lit floor.
+  shaderlib_line_shadows(THREE, renderer) {
+    renderer.shadowMap.enabled = true;
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x101018);
+    const floor = new THREE.Mesh(new THREE.PlaneGeometry(6, 6), new THREE.MeshStandardMaterial({ color: 0xbbbbbb }));
+    floor.rotation.x = -Math.PI / 2; floor.position.y = -0.6; floor.receiveShadow = true;
+    const grid = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(0.8, 0.8, 0.8, 3, 3, 3)), new THREE.LineBasicMaterial({ color: 0xffaa33 }));
+    grid.position.set(-0.6, 0.1, 0); grid.castShadow = true;
+    const pts = []; for (let i = 0; i <= 40; i++) pts.push(new THREE.Vector3(Math.cos(i * 0.5) * 0.4, i / 40 - 0.4, Math.sin(i * 0.5) * 0.4));
+    const helix = new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({ color: 0x33ccff }));
+    helix.position.set(0.6, 0.1, 0); helix.castShadow = true;
+    const ring = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(Array.from({ length: 24 }, (_, i) => new THREE.Vector3(Math.cos(i / 24 * 6.283) * 0.5, 0.6, Math.sin(i / 24 * 6.283) * 0.5))),
+      new THREE.LineBasicMaterial({ color: 0x88ff88 }));
+    ring.castShadow = true;
+    const hatchPoints = []; for (let i = 0; i < 16; i++) hatchPoints.push(new THREE.Vector3(-1 + i * 0.125, 0.25, -1.2), new THREE.Vector3(-1 + i * 0.125, 0.25, 0.9));
+    const hatch = new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints(hatchPoints), new THREE.LineBasicMaterial({ color: 0x444444 }));
+    hatch.castShadow = true;
+    const sun = new THREE.DirectionalLight(0xffffff, 2); sun.position.set(1, 4, 1); sun.castShadow = true; sun.shadow.mapSize.set(1024, 1024);
+    const spot = new THREE.SpotLight(0xffeedd, 20, 0, Math.PI / 4, 0.2, 2); spot.position.set(-1.5, 3, 1); spot.castShadow = true;
+    scene.add(floor, grid, helix, ring, hatch, sun, spot, new THREE.AmbientLight(0xffffff, 0.2));
+    return { scene, camera: camera(THREE, [0, 1.6, 3.2]) };
+  },
   // r186 WebGLClipping on programs: a global plane, local union/intersection
   // planes, clipShadows into two program shadow maps.
   shaderlib_clipping(THREE, renderer) {

@@ -20,7 +20,8 @@
  *
  * Differences stated, not hidden: maps are depth32float where r186 WebGL
  * allocates 24-bit DEPTH_COMPONENT24 (UnsignedIntType); comparisons are at least
- * as precise.
+ * as precise. Line casters draw gl.LINES / gl.LINE_STRIP (a LineLoop's closing
+ * strip) with the depth/distance program.
  *
  * VSM (directional/spot lights, as r186): casters write the depth32float
  * `shadow.map.depthTexture` (r186: FloatType DEPTH_COMPONENT32F), then r186's own
@@ -31,7 +32,7 @@
  * WebGLLights selects. Caster passes skip the RG color writes r186 makes with
  * the depth material: the horizontal pass clears and covers every texel, so the
  * final map contents are the same. VSM point lights warn and are skipped as in
- * r186. Explicit errors: line/point casters, wireframe casters, reversed depth,
+ * r186. Explicit errors: point casters, wireframe casters, reversed depth,
  * a point light whose existing map changes to VSM. A new light, a map-size change or a shadow-type change is a
  * preparation boundary (the map's GPU texture and the receivers' programs change).
  * No performance claim.
@@ -354,7 +355,7 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
     const visible = object.layers.test(camera.layers);
     if (visible && (object.isMesh || object.isLine || object.isPoints)) {
       if ((object.castShadow || (object.receiveShadow && type === T.VSMShadowMap)) && (frustum === null || !object.frustumCulled || object.intersectsFrustum(frustum))) {
-        if (!object.isMesh) fail('CASTER', 'Line and point shadow casters are not admitted yet');
+        if (object.isPoints) fail('CASTER', 'Point shadow casters are not admitted yet');
         const material = object.material;
         if (Array.isArray(material)) {
           for (const group of object.geometry.groups) {
@@ -366,6 +367,9 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
     }
     for (const child of object.children) casters(child, camera, light, type, frustum, visit);
   }
+  // renderBufferDirect's mode: gl.LINES / gl.LINE_STRIP (LineLoop: the source view's closing strip) / gl.TRIANGLES.
+  const topologyOf = object => object.isLineSegments ? 'lines' : object.isLine ? 'line-strip' : 'triangles';
+  const stripFormat = (object, topology) => topology === 'line-strip' && sourceOf(object).index ? (sourceOf(object).index.array instanceof Uint32Array ? 'uint32' : 'uint16') : undefined;
   function compile(depthMaterial, object) {
     if (depthMaterial.wireframe) fail('CASTER', 'Wireframe shadow casters are not admitted yet');
     // WebGLClipping during shadows: local planes only, and only with clipShadows.
@@ -402,13 +406,14 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
     gpu.update({maxAdditionalBytes: maxGeometryBytes});
     const geometry = support.geometrySnapshot(gpu, device);
     const uniforms = refresh(depthMaterial), textures = textureBindings(compiled.program.reflection, uniforms, object);
-    const raster = support.raster(depthMaterial, {side: depthMaterial.side});
+    const topology = topologyOf(object), raster = support.raster(depthMaterial, {side: depthMaterial.side, topology});
     // rows:'gl' mirrors clip Y: GL's counter-clockwise front faces are clockwise here.
     const glRaster = {...raster, frontFace: raster.frontFace === 'ccw' ? 'cw' : 'ccw', blend: null, writeMask: 0};
-    const key = recordKey(compiled, gpu, geometry, glRaster, textures);
+    const key = recordKey(compiled, gpu, geometry, glRaster, textures) + '\u0001' + topology;
     let entry = records.get(key);
     if (entry) return entry;
-    const record = await meshes.add(gpu, {program: compiled.program, textures, raster: glRaster, topology: 'triangles'});
+    const strip = stripFormat(object, topology);
+    const record = await meshes.add(gpu, {program: compiled.program, textures, raster: glRaster, topology, ...(strip ? {stripIndexFormat: strip} : {})});
     entry = {record, textures, gpu};
     records.set(key, entry);
     return entry;
@@ -551,7 +556,7 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
     const start = group ? group.start : 0, count = group ? group.count : Number.MAX_SAFE_INTEGER;
     const instanceCount = object.isInstancedMesh ? object.count : g.isInstancedBufferGeometry ? g.instanceCount : 1;
     const command = {};
-    meshes.stage(entry.record, {programUniforms: bytes, first: start, count, frontFaceCW: object.matrixWorld.determinant() < 0, instanceCount}, command);
+    meshes.stage(entry.record, {programUniforms: bytes, first: start, count, frontFaceCW: object.isMesh === true && object.matrixWorld.determinant() < 0, instanceCount}, command);
     return command;
   }
   function recordForSync(depthMaterial, object) {
@@ -563,9 +568,9 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
     if (!updated.has(gpu)) { gpu.update({maxAdditionalBytes: maxGeometryBytes}); updated.add(gpu); }
     const geometry = support.geometrySnapshot(gpu, device);
     const uniforms = refresh(depthMaterial), textures = textureBindings(compiled.program.reflection, uniforms, object);
-    const raster = support.raster(depthMaterial, {side: depthMaterial.side});
+    const topology = topologyOf(object), raster = support.raster(depthMaterial, {side: depthMaterial.side, topology});
     const glRaster = {...raster, frontFace: raster.frontFace === 'ccw' ? 'cw' : 'ccw', blend: null, writeMask: 0};
-    const entry = records.get(recordKey(compiled, gpu, geometry, glRaster, textures));
+    const entry = records.get(recordKey(compiled, gpu, geometry, glRaster, textures) + '\u0001' + topology);
     if (!entry) fail('PREPARE', 'A shadow caster program or binding changed; call prepare()');
     return entry;
   }

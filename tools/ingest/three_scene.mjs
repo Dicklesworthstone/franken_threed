@@ -297,7 +297,9 @@ export async function createGpuThreeScene(device,scene,{
           if(Array.isArray(object.material)&&object.material.length>maxBindings)fail('LIMIT','Source material array exceeds capacity');
           if(object.intersectsFrustum!==(object.isPoints?three.Points:three.Line).prototype.intersectsFrustum)
             fail('OBJECT','Custom frustum tests are not admitted');
-          if(object.castShadow||object.receiveShadow)fail('SHADOW','Line and point shadows are not admitted');
+          // Line casters draw through the program shadow port (WebGL surface).
+          if(object.isPoints?(object.castShadow||object.receiveShadow):((object.castShadow||object.receiveShadow)&&!(programRoute()&&shadowEnabled)))
+            fail('SHADOW','Line and point shadows are not admitted');
           geometryAdmission(object.geometry,object);
         }
       } else if(object.isSprite&&programRoute()){
@@ -344,7 +346,7 @@ export async function createGpuThreeScene(device,scene,{
     if(!shadowEnabled||!programRoute()||!programSupport.createShadows)return false;
     const lights=nodes.filter(o=>o.isLight&&o.castShadow);
     if(!lights.length)return false;
-    if(programShadowSticky||lights.length>1||programToneMapping())return true;
+    if(programShadowSticky||lights.length>1||programToneMapping()||nodes.some(o=>o.isLine&&o.castShadow))return true;
     try{shadowApi.inspectThreeShadow(lights[0],three);return false;}
     catch(error){if(String(error?.code).startsWith('THREE_SHADOW_'))return true;throw error;}
   }
