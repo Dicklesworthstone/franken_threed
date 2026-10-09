@@ -45,7 +45,6 @@ export function inspectThreeProgram(T, material, object) {
   if (material.alphaHash) fail('MATERIAL', 'alphaHash programs are not admitted yet');
   if (material.stencilWrite) fail('MATERIAL', 'Stencil programs are not admitted yet');
   if (material.transmission > 0) fail('MATERIAL', 'Transmission needs the transmission render target, not admitted yet');
-  if (material.isSpriteMaterial) fail('MATERIAL', `${material.type} programs are not admitted yet`);
 }
 
 /** The exact GLSL r186 WebGLProgram builds for (material, object) in this context.
@@ -130,7 +129,7 @@ export function threeProgramRaster(T, m, {frontFaceCW = false, topology = 'trian
 
 // ---- uniform values ---------------------------------------------------------
 const BUILTIN = new Set(['modelMatrix', 'modelViewMatrix', 'projectionMatrix', 'viewMatrix', 'normalMatrix', 'cameraPosition', 'isOrthographic', 'toneMappingExposure', 'receiveShadow',
-  'bindMatrix', 'bindMatrixInverse', 'morphTargetBaseInfluence', 'morphTargetInfluences', 'morphTargetsTextureSize']);
+  'bindMatrix', 'bindMatrixInverse', 'morphTargetBaseInfluence', 'morphTargetInfluences', 'morphTargetsTextureSize', 'center']);
 
 // ---- WebGLMorphtargets (retained-JS port) -----------------------------------
 const morphCaches = new WeakMap();
@@ -184,6 +183,8 @@ export function packThreeProgramUniforms(T, reflection, uniforms, object, camera
     // setProgram: setOptional(object, 'bindMatrix' / 'bindMatrixInverse') for skinned meshes.
     bindMatrix: object.isSkinnedMesh ? object.bindMatrix : null, bindMatrixInverse: object.isSkinnedMesh ? object.bindMatrixInverse : null,
     morphTargetBaseInfluence: null, morphTargetInfluences: null, morphTargetsTextureSize: null,
+    // setProgram: SpriteMaterial programs read the sprite's center.
+    center: object.isSprite ? object.center : null,
   };
   const geometry = object.geometry;
   if (geometry && morphAttributeOf(geometry) !== undefined) {
@@ -196,8 +197,8 @@ export function packThreeProgramUniforms(T, reflection, uniforms, object, camera
   for (const u of reflection.uniforms) {
     // receiveShadow: set from the object each draw, then overwritten by a
     // material uniform of that name when one exists (WebGLRenderer.setProgram order).
-    const value = BUILTIN.has(u.name) && !(u.name === 'receiveShadow' && uniforms?.receiveShadow) ? builtin[u.name]
-      : values && Object.hasOwn(values, u.name) ? values[u.name] : uniforms?.[u.name]?.value;
+    const own = BUILTIN.has(u.name) && !(u.name === 'receiveShadow' && uniforms?.receiveShadow) ? builtin[u.name] : null;
+    const value = own ?? (values && Object.hasOwn(values, u.name) ? values[u.name] : uniforms?.[u.name]?.value);
     if (value === undefined || value === null) continue;
     write(view, u.node, value, u.name);
   }

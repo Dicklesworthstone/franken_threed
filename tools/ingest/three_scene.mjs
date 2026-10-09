@@ -279,7 +279,9 @@ export async function createGpuThreeScene(device,scene,{
         if(object.isInstancedMesh)instanceAdmission(object);
       } else if(object.isLine||object.isPoints){
         // One-pixel native lines/points with LineBasicMaterial/PointsMaterial.
-        if(object.isLineLoop){}
+        // LineLoop: the WebGL surface draws it (gl.LINE_LOOP) through programs;
+        // elsewhere r186 WebGPU reports and skips it at draw time.
+        if(object.isLineLoop&&!programRoute()){}
         else{
           if(Array.isArray(object.material)&&object.material.length>maxBindings)fail('LIMIT','Source material array exceeds capacity');
           if(object.intersectsFrustum!==(object.isPoints?three.Points:three.Line).prototype.intersectsFrustum)
@@ -287,6 +289,10 @@ export async function createGpuThreeScene(device,scene,{
           if(object.castShadow||object.receiveShadow)fail('SHADOW','Line and point shadows are not admitted');
           geometryAdmission(object.geometry,object);
         }
+      } else if(object.isSprite&&programRoute()){
+        // WebGL surface: sprites draw their SpriteMaterial (or ShaderMaterial) program.
+        const list=Array.isArray(object.material)?object.material:[object.material];
+        if(!list.every(m=>!m||programCapable(m)))fail('OBJECT','Sprites need a program-capable material');
       } else if(object.isSprite||object.isLightProbe||object.isLightProbeGrid)
         fail('OBJECT',`Unsupported source renderable: ${object.type}`);
       for(let i=object.children.length-1;i>=0;i--)stack.push(object.children[i]);
@@ -427,6 +433,7 @@ export async function createGpuThreeScene(device,scene,{
   // per-object view adding instanceMatrix/instanceColor as WebGLRenderer binds them.
   const programSources=new WeakMap();
   function programSource(object){
+    if(object.isLineLoop)return loopGeometry(object.geometry);
     if(!object.isInstancedMesh)return object.geometry;
     let view=programSources.get(object);
     const g=object.geometry;
@@ -439,6 +446,27 @@ export async function createGpuThreeScene(device,scene,{
   }
   // Per-object program resources (instance streams, a skeleton's bone texture)
   // make the object the record key.
+  const loopDrawn=object=>(object.isLineLoop===true||object.isSprite===true)&&programRoute();
+  /** gl.LINE_LOOP over the draw range as a line strip: a derived index that
+   * returns to the first vertex, sharing the source attributes. */
+  const loopViews=new WeakMap(),loopIds=new WeakMap();let loopId=0;
+  const idOfLoop=o=>{let id=loopIds.get(o);if(id===undefined)loopIds.set(o,id=++loopId);return id;};
+  function loopGeometry(g){
+    const index=g.index,count=g.attributes.position?.count??0,total=index?index.count:count,range=g.drawRange;
+    const start=Math.min(range.start,total),end=Math.min(total,range.count===Infinity?total:range.start+range.count);
+    const key=[index?idOfLoop(index)+':'+index.version:'',total,start,end,...Object.entries(g.attributes).map(([k,a])=>k+idOfLoop(a))].join(',');
+    let view=loopViews.get(g);
+    if(!view||view.key!==key){
+      const n=Math.max(0,end-start),indices=new (count>65535?Uint32Array:Uint16Array)(n?n+1:0);
+      for(let i=0;i<n;i++)indices[i]=index?index.array[start+i]:start+i;
+      if(n)indices[n]=indices[0];
+      const derived=new three.BufferGeometry();
+      for(const [name,attribute] of Object.entries(g.attributes))derived.setAttribute(name,attribute);
+      derived.setIndex(new three.BufferAttribute(indices,1));
+      view={key,geometry:derived};loopViews.set(g,view);
+    }
+    return view.geometry;
+  }
   const programKeyOf=object=>object.isInstancedMesh||object.isSkinnedMesh?object:object.geometry;
   const programCapable=m=>m?.isShaderMaterial===true||(programRoute()&&programSupport.shaderLibMaterial(m));
   // Program route on the WebGL surface: ShaderMaterial, and ShaderLib programs
@@ -653,7 +681,7 @@ export async function createGpuThreeScene(device,scene,{
       }
       const raster=programSupport.raster(m,{side,topology});
       const options={program:compiled.program,textures:bindings,raster,topology,
-        ...(topology==='line-strip'&&object.geometry.index?{stripIndexFormat:object.geometry.index.array instanceof Uint32Array?'uint32':'uint16'}:{})};
+        ...(topology==='line-strip'&&programSource(object).index?{stripIndexFormat:programSource(object).index.array instanceof Uint32Array?'uint32':'uint16'}:{})};
       const structural=[epoch,'program',compiled.key,topology,side,JSON.stringify(raster),...textureKey];
       return {options,values:{},structural,clipped:null,program:compiled,programTextures:sourceTextures,programSide:side,programEnv:{envMap,envMapRotation}};
     });
@@ -672,8 +700,8 @@ export async function createGpuThreeScene(device,scene,{
     if(object&&programRoute()&&programSupport.shaderLibMaterial(m)){
       // GL point sizes need the program route; elsewhere the core path renders
       // what it admits and the ShaderLib program covers what it rejects.
-      // GL point sizes and dashed lines (lineDistance) need their programs.
-      if(m.isPointsMaterial||m.isLineDashedMaterial)return programDescription(m,topology,object);
+      // GL point sizes, dashed lines (lineDistance) and line loops need their programs.
+      if(m.isPointsMaterial||m.isLineDashedMaterial||object.isLineLoop)return programDescription(m,topology,object);
       if(programToneMapping())return toneMappedProgram(()=>programDescription(m,topology,object));
       // Shader hooks (onBeforeCompile/onBeforeRender) need the material's own program.
       if(programDeformed.has(object)||programHooked.has(object)||programGeometries_.has(object.geometry)||
@@ -888,7 +916,7 @@ export async function createGpuThreeScene(device,scene,{
     };
     if(programRoute())programSupport.setLights(programLightList(programCamera));
     if(scene.overrideMaterial)get(scene.overrideMaterial);
-    for(const object of nodes)if(drawable(object)){
+    for(const object of nodes)if(drawable(object)||loopDrawn(object)){
       const topology=topologyOf(object);
       const g=object.geometry,instanceSource=object.isInstancedMesh?object:null;
       const deformationSource=hasThreeDeformation(object)?object:null,key=deformationSource??instanceSource??g;
@@ -1328,11 +1356,11 @@ export async function createGpuThreeScene(device,scene,{
           if(object.isGroup)groupOrder=object.renderOrder;
           else if(object.isLOD){if(object.autoUpdate)object.update(camera);}
           else if(object.isLight){if(!programLightMode)lighting.lights.push(light(object));lightSources.push(object);}
-          else if(object.isLineLoop){
+          else if(object.isLineLoop&&!programRoute()){
             // Source r186 WebGPU behavior: report and draw nothing for this object.
             (three.error??console.error)('Renderer: Objects of type THREE.LineLoop are not supported. Please use THREE.Line or THREE.LineSegments.');
           }
-          else if(drawable(object)){
+          else if(drawable(object)||loopDrawn(object)){
             // A caster outside the viewing frustum can still shadow a receiver.
             // Preserve source visibility/layers/LOD, but use the light frustum.
             if(shadowOwner&&object.isMesh&&object.castShadow)casterObjects.push(object);

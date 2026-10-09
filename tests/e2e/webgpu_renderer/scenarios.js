@@ -539,6 +539,20 @@ export const scenarios = {
     scene.add(mesh, sun, new THREE.AmbientLight(0xffffff, 0.3));
     return { scene, camera: camera(THREE, [0, 0.3, 2.8]) };
   },
+  // Sprites through their SpriteMaterial program: map, rotation, center,
+  // screen-space size (sizeAttenuation false), and a LineLoop (gl.LINE_LOOP).
+  shaderlib_sprites(THREE) {
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x203040);
+    const n = 16, d = new Uint8Array(n * n * 4);
+    for (let i = 0; i < n * n; i++) { const x = i % n - 7.5, y = (i >> 4) - 7.5, r = Math.hypot(x, y); d.set([255, 200 - r * 10, 80, r < 7 ? 255 : 0], i * 4); }
+    const map = new THREE.DataTexture(d, n, n); map.colorSpace = THREE.SRGBColorSpace; map.needsUpdate = true;
+    const a = new THREE.Sprite(new THREE.SpriteMaterial({ map, rotation: 0.6 })); a.position.set(-0.6, 0.2, 0); a.scale.set(0.8, 0.5, 1);
+    const b = new THREE.Sprite(new THREE.SpriteMaterial({ color: 0x66ff99, sizeAttenuation: false })); b.position.set(0.6, -0.1, 0.5); b.scale.set(0.15, 0.15, 1); b.center.set(0, 1);
+    const ring = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(Array.from({ length: 12 }, (_, i) => new THREE.Vector3(Math.cos(i / 2) * 0.9, Math.sin(i / 2) * 0.6, -0.3))), new THREE.LineBasicMaterial({ color: 0xffffff }));
+    scene.add(a, b, ring);
+    return { scene, camera: camera(THREE, [0, 0, 2.5]) };
+  },
   // MeshPhysicalMaterial extensions via ShaderLib programs (WebGL surface), and a
   // nearest-sampled float32 DataTexture read by a ShaderMaterial.
   shaderlib_physical(THREE) {
