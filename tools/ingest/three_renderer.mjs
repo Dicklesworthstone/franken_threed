@@ -880,8 +880,24 @@ export function createWebGLRendererClass(THREE, classOptions = {}) {
       return this._renderTarget ? target.copy(this._renderTarget.viewport).round() : target.copy(this._viewport).multiplyScalar(this._pixelRatio).round();
     }
   }
-  for (const name of ['extensions', 'properties', 'state', 'renderLists'])
+  for (const name of ['extensions', 'properties', 'renderLists'])
     Object.defineProperty(WebGLRenderer.prototype, name, glOnly(name));
+  // WebGLState: only facts true of THIS renderer are served. Depth is never
+  // reversed (capabilities.reversedDepthBuffer is false). setMask(true) is what
+  // CubeCamera/Reflector/Water call so the next clear writes depth: this route's
+  // clears always write depth, so it is that behavior, not a dropped call. Any
+  // other GL state access (masks off, stencil, raw viewport) throws explicitly.
+  const glState = (path, known) => new Proxy(known, {get(target, key) {
+    if (typeof key === 'symbol' || Object.hasOwn(target, key)) return target[key];
+    fail('UNSUPPORTED', `WebGLRenderer.state.${path}${String(key)} describes a GL context; this route has none`);
+  }});
+  const depthState = glState('buffers.depth.', {
+    getReversed: () => false,
+    setMask(mask) { if (mask !== true) fail('UNSUPPORTED', 'WebGLRenderer.state.buffers.depth.setMask(false) needs GL depth-mask state; this route has none'); },
+  });
+  const stateBuffers = glState('buffers.', {depth: depthState});
+  const webglState = glState('', {buffers: stateBuffers});
+  Object.defineProperty(WebGLRenderer.prototype, 'state', {configurable: true, get() { return webglState; }});
   // Only capabilities that describe THIS renderer's behavior are served: the
   // sampler anisotropy ceiling it applies (WebGPU clamps maxAnisotropy to 16, as
   // r186's WebGPU backend reports) and the depth/precision modes it admits.
