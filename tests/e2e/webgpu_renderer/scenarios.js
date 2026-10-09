@@ -347,6 +347,36 @@ export const scenarios = {
     scene.add(wireShader, instanced, hashed, behind, key, new THREE.AmbientLight(0xffffff, 0.4));
     return { scene, camera: camera(THREE) };
   },
+  // InstancedMesh.setMorphAt: per-instance morph influences from morphTexture
+  // (USE_INSTANCING_MORPH), with instance colors, casting program shadows.
+  shaderlib_instanced_morph(THREE, renderer) {
+    renderer.shadowMap.enabled = true;
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x151515);
+    const geometry = new THREE.BoxGeometry(0.35, 0.35, 0.35, 4, 4, 4);
+    const p = geometry.attributes.position, spike = new Float32Array(p.count * 3), twist = new Float32Array(p.count * 3);
+    for (let i = 0; i < p.count; i++) {
+      const x = p.getX(i), y = p.getY(i), z = p.getZ(i), l = Math.hypot(x, y, z) || 1;
+      spike.set([x / l * 0.3, y / l * 0.3, z / l * 0.3], i * 3);
+      twist.set([Math.cos(y * 6) * x - Math.sin(y * 6) * z - x, 0, Math.sin(y * 6) * x + Math.cos(y * 6) * z - z], i * 3);
+    }
+    geometry.morphAttributes.position = [new THREE.BufferAttribute(spike, 3), new THREE.BufferAttribute(twist, 3)];
+    geometry.morphTargetsRelative = true;
+    const mesh = new THREE.InstancedMesh(geometry, new THREE.MeshStandardMaterial({ roughness: 0.5 }), 4);
+    const dummy = new THREE.Mesh(geometry);
+    for (let i = 0; i < 4; i++) {
+      mesh.setMatrixAt(i, new THREE.Matrix4().makeTranslation((i - 1.5) * 0.65, 0.15, 0));
+      mesh.setColorAt(i, new THREE.Color().setHSL(i / 4, 0.7, 0.55));
+      dummy.morphTargetInfluences[0] = i / 3; dummy.morphTargetInfluences[1] = 1 - i / 3;
+      mesh.setMorphAt(i, dummy);
+    }
+    mesh.castShadow = true;
+    const floor = new THREE.Mesh(new THREE.PlaneGeometry(4, 3), new THREE.MeshStandardMaterial({ color: 0x777777 }));
+    floor.rotation.x = -Math.PI / 2; floor.position.y = -0.35; floor.receiveShadow = true;
+    const sun = new THREE.DirectionalLight(0xffffff, 2.5); sun.position.set(1, 3, 2); sun.castShadow = true; sun.shadow.mapSize.set(512, 512);
+    scene.add(mesh, floor, sun, new THREE.AmbientLight(0xffffff, 0.3));
+    return { scene, camera: camera(THREE, [0, 1, 2.6]) };
+  },
   // ShaderMaterial points: gl_PointSize squares, gl_PointCoord (GL upper-left
   // origin) with discard, per-point size attribute, and a clipped-center point.
   shader_points(THREE) {

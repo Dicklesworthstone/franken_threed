@@ -223,6 +223,9 @@ export async function createGpuThreeScene(device,scene,{
     return materials.get(m).epoch;
   }
   const programDeformed=new WeakSet(),programHooked=new WeakSet(),programGeometries_=new WeakSet();
+  // InstancedMesh.morphTexture (setMorphAt): r186 programs read per-instance
+  // influences (USE_INSTANCING_MORPH); only the program route draws them.
+  const instancedMorph=object=>object.isInstancedMesh===true&&object.morphTexture!=null&&programRoute();
   function geometryAdmission(g,object){
     const programs=(Array.isArray(object.material)?object.material:[object.material]).every(m=>m?.isShaderMaterial);
     if(!(g instanceof three.BufferGeometry)||(g.isInstancedBufferGeometry&&!programs))fail('GEOMETRY','Expected source BufferGeometry');
@@ -277,7 +280,8 @@ export async function createGpuThreeScene(device,scene,{
           if(typeof object.castShadow!=='boolean'||typeof object.receiveShadow!=='boolean')fail('SHADOW','Expected boolean source shadow flags');
         }
         geometryAdmission(object.geometry,object);
-        if(object.isInstancedMesh)instanceAdmission(object);
+        if(instancedMorph(object))programDeformed.add(object);
+        else if(object.isInstancedMesh)instanceAdmission(object);
       } else if(object.isLine||object.isPoints){
         // One-pixel native lines/points with LineBasicMaterial/PointsMaterial.
         // LineLoop: the WebGL surface draws it (gl.LINE_LOOP) through programs;
@@ -1033,7 +1037,7 @@ export async function createGpuThreeScene(device,scene,{
       const topology=topologyOf(object);
       const g=object.geometry,instanceSource=object.isInstancedMesh?object:null;
       const deformationSource=hasThreeDeformation(object)?object:null,key=deformationSource??instanceSource??g;
-      const instanceSignature=instanceSource?instanceAdmission(instanceSource).signature:null;
+      const instanceSignature=instanceSource&&!instancedMorph(instanceSource)?instanceAdmission(instanceSource).signature:null;
       const source=Array.isArray(object.material)?object.material:[object.material];
       for(const original of source){
         if(!original)continue;

@@ -37,7 +37,6 @@ export function inspectThreeProgram(T, material, object) {
   if (!material?.isShaderMaterial && !builtin) fail('SOURCE', 'Expected a ShaderMaterial, RawShaderMaterial or ShaderLib material');
   if (material.isShaderMaterial && (typeof material.vertexShader !== 'string' || typeof material.fragmentShader !== 'string')) fail('SOURCE', 'Program sources must be strings');
   if (object.isBatchedMesh) fail('OBJECT', 'Batched program objects are not admitted yet');
-  if (object.isInstancedMesh && object.morphTexture != null) fail('OBJECT', 'Instanced morph textures are not admitted yet');
   if (object.isSkinnedMesh && !(object.skeleton instanceof T.Skeleton)) fail('OBJECT', 'Skinned program objects need their skeleton');
   if (material.extensions?.clipCullDistance || material.extensions?.multiDraw) fail('EXTENSION', 'Program extensions are not admitted');
   if (material.stencilWrite) fail('MATERIAL', 'Stencil programs are not admitted yet');
@@ -184,10 +183,13 @@ export function packThreeProgramUniforms(T, reflection, uniforms, object, camera
   };
   const geometry = object.geometry;
   if (geometry && morphAttributeOf(geometry) !== undefined) {
-    // WebGLMorphtargets.update: base influence and influences (non-instanced).
-    const influences = object.morphTargetInfluences, sum = influences.reduce((a, b) => a + b, 0);
-    builtin.morphTargetBaseInfluence = geometry.morphTargetsRelative ? 1 : 1 - sum;
-    builtin.morphTargetInfluences = influences;
+    // WebGLMorphtargets.update: base influence and influences, except for an
+    // InstancedMesh with morphTexture (its program reads them per instance).
+    if (!(object.isInstancedMesh === true && object.morphTexture !== null)) {
+      const influences = object.morphTargetInfluences, sum = influences.reduce((a, b) => a + b, 0);
+      builtin.morphTargetBaseInfluence = geometry.morphTargetsRelative ? 1 : 1 - sum;
+      builtin.morphTargetInfluences = influences;
+    }
     builtin.morphTargetsTextureSize = threeMorphTargets(T, geometry).size;
   }
   for (const u of reflection.uniforms) {
@@ -334,6 +336,8 @@ export function createThreeProgramSupport({three: T, state, maxPrograms = 256, m
       out = {...out, boneTexture: skeleton.boneTexture};
     }
     if (object?.geometry && morphAttributeOf(object.geometry) !== undefined) out = {...out, morphTargetsTexture: threeMorphTargets(T, object.geometry).texture};
+    // WebGLMorphtargets.update: an InstancedMesh's per-instance influence texture.
+    if (object?.isInstancedMesh && object.morphTexture) out = {...out, morphTexture: object.morphTexture};
     return out;
   }
   /** setProgram's refreshMaterial work: lights, fog and material values. */
