@@ -522,6 +522,23 @@ export const scenarios = {
     scene.add(floor, knot, red, blue, spot, spot.target);
     return { scene, camera: camera(THREE, [0, 0.9, 2.8]) };
   },
+  // material.onBeforeCompile on the program route: a chunk rewrite plus an added
+  // uniform, run once per program on the uniforms that are later packed.
+  shaderlib_before_compile(THREE) {
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x101820);
+    const material = new THREE.MeshStandardMaterial({ color: 0x88ddff, roughness: 0.4 });
+    material.onBeforeCompile = (shader) => {
+      shader.uniforms.twist = { value: 1.7 };
+      shader.vertexShader = 'uniform float twist;\n' + shader.vertexShader.replace('#include <begin_vertex>',
+        '#include <begin_vertex>\nfloat a = position.y * twist; transformed.xz = mat2(cos(a), -sin(a), sin(a), cos(a)) * transformed.xz;');
+    };
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(0.6, 1.4, 0.6, 4, 24, 4), material);
+    mesh.rotation.x = 0.3;
+    const sun = new THREE.DirectionalLight(0xffffff, 2.5); sun.position.set(1, 2, 3);
+    scene.add(mesh, sun, new THREE.AmbientLight(0xffffff, 0.3));
+    return { scene, camera: camera(THREE, [0, 0.3, 2.8]) };
+  },
   // MeshPhysicalMaterial extensions via ShaderLib programs (WebGL surface), and a
   // nearest-sampled float32 DataTexture read by a ShaderMaterial.
   shaderlib_physical(THREE) {

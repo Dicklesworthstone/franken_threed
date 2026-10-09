@@ -245,6 +245,16 @@ material on the program route, as program shadow maps do. Scenario
 `shaderlib_area_lights` matches upstream WebGLRenderer (mean diff 0.02);
 `webgl_lights_rectarealight` and `webgl_lights_spotlight` run.
 
+Shader hooks: `material.onBeforeCompile(parameters, renderer)` runs as in
+WebGLRenderer.getProgram, once per program (keyed by the assembled pre-hook
+program and `customProgramCacheKey()`), on parameters whose `uniforms` are the
+material's uniforms object that is later refreshed and packed; added uniforms
+and rewritten chunks reach the program. `material.onBeforeRender` runs at the
+draw. Materials with either hook always draw their program. Scenario
+`shaderlib_before_compile` matches upstream WebGLRenderer;
+`webgl_materials_modified`, `webgl_shadowmap_csm` (CSM chunk rewrites) and
+`webgl_materials_toon` run.
+
 Not admitted yet (explicit errors): transmission (needs its render target),
 render-target PMREM sources (`pmremVersion`), pre-filtered cube-UV textures
 supplied directly, Sprite materials.

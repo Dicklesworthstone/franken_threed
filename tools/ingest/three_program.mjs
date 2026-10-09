@@ -40,8 +40,6 @@ export function inspectThreeProgram(T, material, object) {
   if (object.isInstancedMesh && object.morphTexture != null) fail('OBJECT', 'Instanced morph textures are not admitted yet');
   if (object.isSkinnedMesh && !(object.skeleton instanceof T.Skeleton)) fail('OBJECT', 'Skinned program objects need their skeleton');
   if (material.uniformsGroups?.length) fail('UNIFORMS', 'Uniform buffer groups are not admitted yet');
-  if (material.onBeforeCompile !== T.Material.prototype.onBeforeCompile || material.onBeforeRender !== T.Material.prototype.onBeforeRender)
-    fail('HOOK', 'Program hooks require their original component');
   if (material.extensions?.clipCullDistance || material.extensions?.multiDraw) fail('EXTENSION', 'Program extensions are not admitted');
   if (material.wireframe) fail('MATERIAL', 'Wireframe programs are not admitted yet');
   if (material.alphaHash) fail('MATERIAL', 'alphaHash programs are not admitted yet');
@@ -57,6 +55,9 @@ export function threeProgramSources(T, material, object, ctx = {}) {
   const lights = ctx.lights ?? EMPTY_LIGHTS;
   const parameters = webglParameters(T, material, object, {...ctx, lights, shadowMapEnabled: ctx.shadowMapEnabled === true,
     clipping: ctx.clipping ?? {numPlanes: 0, numIntersection: 0}});
+  // WebGLRenderer.getProgram: material.onBeforeCompile(parameters, renderer) may
+  // rewrite the shader sources and add uniforms before the program is built.
+  if (ctx.beforeCompile && material.onBeforeCompile !== T.Material.prototype.onBeforeCompile) ctx.beforeCompile(parameters);
   return {...webglProgramSources(T, parameters), parameters};
 }
 const EMPTY_LIGHTS = Object.freeze({ambient: [0, 0, 0], probe: [], sun: [], sunShadowMap: [], directional: [], directionalShadowMap: [], point: [],
@@ -277,9 +278,26 @@ export function createThreeProgramSupport({three: T, state, maxPrograms = 256, m
   /** shadows: renderer.shadowMap is enabled and this frame has shadow-casting
    * lights (WebGLPrograms shadowMapEnabled). renderTarget: an offscreen pass
    * (shadow depth): no tone mapping, linear output, GL row order. */
+  /** onBeforeCompile runs once per program (keyed, like WebGLPrograms, by the
+   * assembled pre-hook program and customProgramCacheKey), on parameters whose
+   * `uniforms` are this material's uniforms object, later refreshed and packed. */
+  const hookResults = new WeakMap();
+  function beforeCompile(material, parameters) {
+    const key = webglProgramSources(T, parameters).key + '\u0000' + material.customProgramCacheKey();
+    let byKey = hookResults.get(material);
+    if (!byKey) hookResults.set(material, byKey = new Map());
+    let result = byKey.get(key);
+    if (!result) {
+      parameters.uniforms = uniformsFor(material);
+      material.onBeforeCompile(parameters, state().renderer ?? null);
+      result = {vertexShader: parameters.vertexShader, fragmentShader: parameters.fragmentShader};
+      byKey.set(key, result);
+    }
+    parameters.vertexShader = result.vertexShader; parameters.fragmentShader = result.fragmentShader;
+  }
   function compile(material, object, {fog = null, side = material.side, envMap = null, shadows = false, renderTarget = false, clipping = null} = {}) {
     const s = state();
-    const sources = threeProgramSources(T, material, object, {fog, side, envMap, lights: lights.state, clipping,
+    const sources = threeProgramSources(T, material, object, {fog, side, envMap, lights: lights.state, clipping, beforeCompile: p => beforeCompile(material, p),
       toneMapping: renderTarget ? T.NoToneMapping : s.toneMapping, outputColorSpace: renderTarget ? T.LinearSRGBColorSpace : s.outputColorSpace,
       shadowMapEnabled: shadows, shadowMapType: s.shadowMapType ?? T.PCFShadowMap});
     // GL rasterizes Points as gl_PointSize squares: compile the point-sprite form.

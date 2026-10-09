@@ -675,7 +675,9 @@ export async function createGpuThreeScene(device,scene,{
       // GL point sizes and dashed lines (lineDistance) need their programs.
       if(m.isPointsMaterial||m.isLineDashedMaterial)return programDescription(m,topology,object);
       if(programToneMapping())return toneMappedProgram(()=>programDescription(m,topology,object));
-      if(programDeformed.has(object)||programHooked.has(object)||programGeometries_.has(object.geometry))return programDescription(m,topology,object);
+      // Shader hooks (onBeforeCompile/onBeforeRender) need the material's own program.
+      if(programDeformed.has(object)||programHooked.has(object)||programGeometries_.has(object.geometry)||
+        m.onBeforeCompile!==three.Material.prototype.onBeforeCompile||m.onBeforeRender!==three.Material.prototype.onBeforeRender)return programDescription(m,topology,object);
       // Program shadow maps are only read by programs: every receiver draws one.
       if(programLightMode&&programSupport.needsLights(m))return programDescription(m,topology,object);
       if(programEnvironmentOwned()&&(m.isMeshStandardMaterial||m.isMeshLambertMaterial||m.isMeshPhongMaterial))return programDescription(m,topology,object);
@@ -1392,6 +1394,8 @@ export async function createGpuThreeScene(device,scene,{
           // renderObject: onBeforeRender, matrices, draw (uniforms packed now), onAfterRender.
           const hooked=object.onBeforeRender!==three.Object3D.prototype.onBeforeRender||object.onAfterRender!==three.Object3D.prototype.onAfterRender;
           if(hooked)object.onBeforeRender(shadowRenderer(),root,camera,object.geometry,item.material,item.group);
+          // renderBufferDirect: material.onBeforeRender(renderer, scene, camera, geometry, object, group).
+          if(item.material.onBeforeRender!==three.Material.prototype.onBeforeRender)item.material.onBeforeRender(shadowRenderer(),root,camera,object.geometry,object,item.group);
           object.modelViewMatrix.multiplyMatrices(camera.matrixWorldInverse,object.matrixWorld);
           object.normalMatrix.getNormalMatrix(object.modelViewMatrix);
           const frontFaceCW=object.isMesh===true&&object.matrixWorld.determinant()<0;
