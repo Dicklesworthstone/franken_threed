@@ -80,6 +80,17 @@ function conversionOf(array, normalized, half) {
   const element = !normalized ? (v => v) : signed ? (v => Math.max(v / max, -1)) : (v => v / max);
   return {key: C.name + (normalized ? '/norm' : ''), element};
 }
+/** r186 IntType (constants.js): attributes with this gpuType bind with
+ * vertexAttribIPointer, so integer shader inputs read exact integers. */
+const INT_TYPE = 1013;
+/** Element -> 32-bit integer for an integer program input. GL's IPointer
+ * sign- or zero-extends the source element to 32 bits and the shader reads
+ * those bits as int or uint; Int32Array/Uint32Array stores do the same. */
+function integerConversionOf(array, scalar) {
+  const type = INTEGER_TYPES.find(([C]) => array instanceof C);
+  if (!type || type[0] === Uint8ClampedArray) fail('FORMAT', 'Integer attributes require 8/16/32-bit integer storage');
+  return {key: `int:${type[0].name}:${scalar}`, element: v => v, integer: scalar === 'uint' ? Uint32Array : Int32Array};
+}
 const halfView = new DataView(new ArrayBuffer(4));
 function halfToFloat(h) {
   const sign = h & 0x8000 ? -1 : 1, exponent = (h >> 10) & 31, mantissa = h & 1023;
@@ -177,7 +188,7 @@ export function bufferGeometrySnapshot(handle, device) {
   state.live();
   const snapshot = state.current();
   if (!snapshot) fail('RELEASED', 'Call geometry.update() after releasing residency');
-  return {...snapshot, drawRange: range(state.geometry, snapshot.indexBuffer ? snapshot.indexCount : snapshot.vertexCount)};
+  return {...snapshot, source: state.geometry, drawRange: range(state.geometry, snapshot.indexBuffer ? snapshot.indexCount : snapshot.vertexCount)};
 }
 
 function createResidency(device, geometry, {
@@ -213,7 +224,7 @@ function createResidency(device, geometry, {
   function write(record, array, start, end) {
     if (record.conversion) {
       if (end === start) return;
-      const floats = new Float32Array(record.shadow.buffer, start * 4, end - start), element = record.conversion.element;
+      const floats = new (record.conversion.integer ?? Float32Array)(record.shadow.buffer, start * 4, end - start), element = record.conversion.element;
       for (let i = start; i < end; i++) floats[i - start] = element(array[i]);
       native(() => device.queue.writeBuffer(record.buffer, start * 4, record.shadow, start * 4, (end - start) * 4));
       stats.uploads++; stats.uploadedBytes += (end - start) * 4;
@@ -381,10 +392,20 @@ function describeProgram(program) {
     let vertexCount = attributes.position ? integer(attributes.position.count, 0, 0xffffffff, 'vertex count') : null, instanceCapacity = Infinity;
     for (const a of program) {
       const attribute = attributes[a.name];
-      if (!attribute) { for (let k = 0; k < a.locations; k++) missing.push(a.location + k); continue; }
+      const integerInput = a.scalar !== 'float';
+      if (!attribute) {
+        if (integerInput) fail('FORMAT', `Integer attribute ${a.name} is missing; its GL default has no float constant stream`);
+        for (let k = 0; k < a.locations; k++) missing.push(a.location + k);
+        continue;
+      }
       const owner = ownerOf(attribute), source = sourceArray(owner), array = source.array;
-      if (a.scalar !== 'float') fail('FORMAT', `Integer attribute ${a.name} needs an integer vertex format, not admitted yet`);
-      const conversion = conversionOf(source.kind, attribute.normalized === true, attribute.isFloat16BufferAttribute === true);
+      // r186 WebGLBindingStates: gpuType IntType -> vertexAttribIPointer, else
+      // vertexAttribPointer. A mismatch with the shader input type is a GL error
+      // or undefined value there, so it is explicit here.
+      const intType = attribute.gpuType === INT_TYPE;
+      if (integerInput !== intType) fail('FORMAT', integerInput ? `Integer attribute ${a.name} needs gpuType IntType` : `Attribute ${a.name} has gpuType IntType but the program reads floats`);
+      if (intType && (attribute.normalized === true || attribute.isFloat16BufferAttribute === true)) fail('FORMAT', `Integer attribute ${a.name} cannot be normalized or half-float`);
+      const conversion = intType ? integerConversionOf(source.kind, a.scalar) : conversionOf(source.kind, attribute.normalized === true, attribute.isFloat16BufferAttribute === true);
       const perInstance = attribute.isInstancedBufferAttribute === true || owner.isInstancedInterleavedBuffer === true;
       if (perInstance && (owner.meshPerAttribute ?? attribute.meshPerAttribute) !== 1) fail('SHAPE', 'meshPerAttribute other than 1 has no WebGPU step rate');
       const itemSize = integer(attribute.itemSize, 1, 16, 'item size');
@@ -403,7 +424,8 @@ function describeProgram(program) {
       if (entry.conversion?.key !== conversion?.key) fail('FORMAT', 'Attributes sharing interleaved storage require one conversion profile');
       entry.requiredBytes = Math.max(entry.requiredBytes, count ? ((count - 1) * stride + offset + itemSize) * 4 : 0);
       for (let k = 0; k < columns; k++)
-        entry.attributes.push({shaderLocation: a.location + k, offset: (offset + k * width) * 4, format: width === 1 ? 'float32' : 'float32x' + width});
+        entry.attributes.push({shaderLocation: a.location + k, offset: (offset + k * width) * 4,
+          format: (intType ? (a.scalar === 'uint' ? 'uint32' : 'sint32') : 'float32') + (width === 1 ? '' : 'x' + width)});
     }
     const index = geometry.index ?? null;
     let indexOwner = null, indexFormat = null, indexCount = 0;
@@ -443,7 +465,7 @@ export function programGeometrySnapshot(handle, device) {
   state.live();
   const snapshot = state.current();
   if (!snapshot) fail('RELEASED', 'Call geometry.update() after releasing residency');
-  return {...snapshot, drawRange: range(state.geometry, snapshot.indexBuffer ? snapshot.indexCount : snapshot.vertexCount)};
+  return {...snapshot, source: state.geometry, drawRange: range(state.geometry, snapshot.indexBuffer ? snapshot.indexCount : snapshot.vertexCount)};
 }
 
 /** Ordinary vertex/index residency. Instance streams have a separate identity

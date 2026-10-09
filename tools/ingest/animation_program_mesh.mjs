@@ -10,6 +10,14 @@
  * Geometry comes from createGpuProgramGeometry(); locations the geometry lacks
  * read GL's constant default attribute (0, 0, 0, 1) from a stride-0 buffer.
  * Nothing here interprets source objects or uniform values.
+ *
+ * Provoking vertex: GL takes a flat varying from a primitive's LAST vertex,
+ * WebGPU's @interpolate(flat) from its FIRST. Programs with flat varyings draw
+ * triangle lists through a rotated index buffer (v2, v0, v1: same winding, GL's
+ * provoking vertex first) and line lists through swapped pairs. The rotated
+ * indices are rebuilt from the source index array when its version, identity or
+ * count changes (the residency uploads on the same version rule). Line strips
+ * with flat varyings fail explicitly.
  */
 import {programGeometrySnapshot} from './gpu_buffer_geometry.mjs';
 
@@ -40,6 +48,9 @@ export function createProgramMeshes({device, format, depthFormat, sampleCount, m
     const points = reflection.points === true;
     if (points && topology !== 'points') fail('ANIMATION_RENDER_OPTIONS', 'Point programs draw point primitives');
     if (points && (geometry.indexBuffer || geometry.instanced)) fail('ANIMATION_RENDER_GEOMETRY', 'Indexed or instanced point sprites are not admitted yet');
+    const provoking = !points && reflection.varyings?.some(v => v.flat) ? {triangles: 3, lines: 2}[topology] ?? 0 : 0;
+    if (!points && !provoking && reflection.varyings?.some(v => v.flat) && topology !== 'points')
+      fail('ANIMATION_RENDER_OPTIONS', 'Flat varyings on line strips need GL\'s last-vertex convention; not admitted yet');
     // Point sprites: one instance per source vertex (6-vertex quad each).
     const layouts = points ? geometry.layouts.map(l => ({...l, stepMode: 'instance'})) : [...geometry.layouts];
     for (const location of geometry.channels.missing)
@@ -78,7 +89,7 @@ export function createProgramMeshes({device, format, depthFormat, sampleCount, m
     return {
       program: true, gpu, reflection, uniformGroup: allocated.value.uniformGroup, textureGroup: allocated.value.textureGroup,
       pipelines: {normal: pipelines[0], flipped: pipelines[1]}, geometrySignature: geometry.signature,
-      points,
+      points, provoking,
       blended: !!raster.blend, alphaMode: raster.blend ? 'BLEND' : 'OPAQUE', blendConstant: raster.blendConstant ?? null,
       surfaceBuffer: null, lit: false, raster: {}, disposed: false,
     };
@@ -106,21 +117,48 @@ export function createProgramMeshes({device, format, depthFormat, sampleCount, m
         instanceCount: Math.max(0, end - first), instanceBindGroup: null, blendConstant: record.blendConstant, stencilReference: null});
       return geometry;
     }
+    const rotated = record.provoking ? provokingIndices(record, geometry, first, end) : null;
     Object.assign(command, {
       record, first, count: Math.max(0, end - first),
       pipeline: input.frontFaceCW ? record.pipelines.flipped : record.pipelines.normal,
       program: {group: record.uniformGroup, offset},
       vertexBuffers: [...geometry.vertexBuffers, ...geometry.channels.missing.map(() => constant)],
-      indexBuffer: geometry.indexBuffer, indexFormat: geometry.indexFormat,
+      indexBuffer: rotated ?? geometry.indexBuffer, indexFormat: rotated ? 'uint32' : geometry.indexFormat,
       instanceCount, firstInstance: 0, instanceBindGroup: null,
       blendConstant: record.blendConstant, stencilReference: null,
     });
     return geometry;
   }
+  // gpu residency -> Map(phase -> {key, buffer}); rebuilt only when the source changes.
+  const rotations = new WeakMap(), rotationBuffers = new Set();
+  function provokingIndices(record, geometry, first, end) {
+    const n = record.provoking, phase = first % n, index = geometry.indexBuffer ? geometry.source?.index : null;
+    if (geometry.indexBuffer && !index?.array) fail('ANIMATION_RENDER_GEOMETRY', 'Flat varyings need the source index array');
+    const length = geometry.indexBuffer ? geometry.indexCount : geometry.vertexCount;
+    let byPhase = rotations.get(record.gpu);
+    if (!byPhase) rotations.set(record.gpu, byPhase = new Map());
+    const key = geometry.indexBuffer ? [geometry.indexBuffer, index.version, length] : [null, -1, length];
+    let entry = byPhase.get(phase);
+    if (!entry || entry.key.some((v, i) => v !== key[i])) {
+      const out = new Uint32Array(Math.max(1, length));
+      for (let i = 0; i < length; i++) out[i] = index ? index.array[i] : i;
+      // Rotate every whole primitive that starts at first + k*n.
+      for (let s = phase; s + n <= length; s += n) {
+        if (n === 3) { const a = out[s], b = out[s + 1], c = out[s + 2]; out[s] = c; out[s + 1] = a; out[s + 2] = b; }
+        else { const a = out[s]; out[s] = out[s + 1]; out[s + 1] = a; }
+      }
+      if (entry) { entry.buffer.destroy(); rotationBuffers.delete(entry.buffer); }
+      const buffer = device.createBuffer({label: `${label}/provoking-indices`, size: Math.max(4, out.byteLength), usage: 16 | 8});
+      device.queue.writeBuffer(buffer, 0, out);
+      rotationBuffers.add(buffer);
+      byPhase.set(phase, entry = {key, buffer});
+    }
+    return entry.buffer;
+  }
   return {
     add, stage,
     begin() { cursor = 0; },
     write() { if (arena && cursor) device.queue.writeBuffer(arena.buffer, 0, arena.staged, 0, Math.ceil(cursor / 4) * 4); },
-    dispose() { arena?.buffer.destroy(); constant?.destroy(); arena = null; constant = null; },
+    dispose() { arena?.buffer.destroy(); constant?.destroy(); arena = null; constant = null; for (const b of rotationBuffers) b.destroy(); rotationBuffers.clear(); },
   };
 }
