@@ -530,7 +530,7 @@ export function refreshWebGLMaterialUniforms(T, uniforms, material, ctx) {
     uniforms.roughness.value = m.roughness;
     if (m.roughnessMap) { uniforms.roughnessMap.value = m.roughnessMap; refreshTransform(m.roughnessMap, uniforms.roughnessMapTransform); }
     if (m.envMap) uniforms.envMapIntensity.value = m.envMapIntensity;
-    if (m.isMeshPhysicalMaterial) refreshPhysical(T, uniforms, m, refreshTransform);
+    if (m.isMeshPhysicalMaterial) refreshPhysical(T, uniforms, m, refreshTransform, ctx);
   } else if (m.isMeshMatcapMaterial) { common(); if (m.matcap) uniforms.matcap.value = m.matcap; }
   else if (m.isMeshDepthMaterial) common();
   else if (m.isMeshDistanceMaterial) {
@@ -559,7 +559,7 @@ export function refreshWebGLMaterialUniforms(T, uniforms, material, ctx) {
     if (m.alphaTest > 0) uniforms.alphaTest.value = m.alphaTest;
   }
 }
-function refreshPhysical(T, u, m, refreshTransform) {
+function refreshPhysical(T, u, m, refreshTransform, ctx = {}) {
   u.ior.value = m.ior;
   if (m.sheen > 0) {
     u.sheenColor.value.copy(m.sheenColor).multiplyScalar(m.sheen); u.sheenRoughness.value = m.sheenRoughness;
@@ -586,6 +586,16 @@ function refreshPhysical(T, u, m, refreshTransform) {
   if (m.anisotropy > 0) {
     u.anisotropyVector.value.set(m.anisotropy * Math.cos(m.anisotropyRotation), m.anisotropy * Math.sin(m.anisotropyRotation));
     if (m.anisotropyMap) { u.anisotropyMap.value = m.anisotropyMap; refreshTransform(m.anisotropyMap, u.anisotropyMapTransform); }
+  }
+  if (m.transmission > 0) {
+    // refreshUniformsPhysical: the camera's transmission render target (ctx.transmissionRenderTarget).
+    u.transmission.value = m.transmission;
+    const target = ctx.transmissionRenderTarget;
+    if (target) { u.transmissionSamplerMap.value = target.texture; u.transmissionSamplerSize.value.set(target.width, target.height); }
+    if (m.transmissionMap) { u.transmissionMap.value = m.transmissionMap; refreshTransform(m.transmissionMap, u.transmissionMapTransform); }
+    u.thickness.value = m.thickness;
+    if (m.thicknessMap) { u.thicknessMap.value = m.thicknessMap; refreshTransform(m.thicknessMap, u.thicknessMapTransform); }
+    u.attenuationDistance.value = m.attenuationDistance; u.attenuationColor.value.copy(m.attenuationColor);
   }
   u.specularIntensity.value = m.specularIntensity; u.specularColor.value.copy(m.specularColor);
   if (m.specularColorMap) { u.specularColorMap.value = m.specularColorMap; refreshTransform(m.specularColorMap, u.specularColorMapTransform); }

@@ -163,6 +163,7 @@ export async function createGpuThreeScene(device,scene,{
   const pendingDeformations=new Set(),deformationLifetime=new AbortController();
   let textureOwner=null,textureScan=null,frameTextures=null,retainedTextures=new Set();
   let programShadowMode=false,programShadowSticky=false,preparedShadowMode=false,programShadowOwner=null,programLightMode=false;
+  let programTransmissionMode=false,transmissionOwner=null,programViewportSize=null,transmissionCamera=null;
   const ownedTextures=()=>textureOwner??=createGpuThreeTextures(device,{...textureOptions,three});
   const resourceFailed=()=>!!renderer?.failed||!!textureOwner?.failed||!!shadowOwner?.failed||!!pendingShadow?.failed||!!environmentOwner?.failed||!!pendingEnvironment?.failed||!!backgroundOwner?.failed||!!pendingBackground?.failed||[...geometries.values(),...programGpus(),...instances.values(),...deformations.values(),...pendingDeformations].some(g=>g.failed);
   let programTargetSize=null;
@@ -193,7 +194,7 @@ export async function createGpuThreeScene(device,scene,{
     deformationLifetime.abort();
     backgroundOwner?.dispose();pendingBackground?.dispose();backgroundOwner=null;pendingBackground=null;
     environmentOwner?.dispose();pendingEnvironment?.dispose();environmentOwner=null;pendingEnvironment=null;
-    pmremOwner?.dispose();pmremOwner=null;programShadowOwner?.dispose();programShadowOwner=null;shadowOwner?.dispose();pendingShadow?.dispose();shadowOwner=null;pendingShadow=null;casters.clear();
+    pmremOwner?.dispose();pmremOwner=null;programShadowOwner?.dispose();programShadowOwner=null;transmissionOwner?.dispose();transmissionOwner=null;shadowOwner?.dispose();pendingShadow?.dispose();shadowOwner=null;pendingShadow=null;casters.clear();
     for(const entry of entries)entry.mesh.dispose();entries=[];lookup.clear();
     for(const gpu of [...deformations.values(),...pendingDeformations])gpu.dispose();deformations.clear();pendingDeformations.clear();
     for(const [m,state] of materials)m.removeEventListener('dispose',state.listener);materials.clear();
@@ -303,6 +304,9 @@ export async function createGpuThreeScene(device,scene,{
     // Lights only the r186 programs shade (rect-area LTC, projected spot maps)
     // put every lit material on the program route, as shadow maps do.
     programLightMode=programShadowMode||(programRoute()&&nodes.some(o=>o.isLight&&(o.isRectAreaLight||(o.isSpotLight&&!!o.map))));
+    // Transmissive materials (r186 renderTransmissionPass) re-render the opaque
+    // list offscreen through programs: every draw takes the program route.
+    programTransmissionMode=programRoute()&&!!programSupport.createTransmission&&nodes.some(o=>(Array.isArray(o.material)?o.material:[o.material]).some(m=>m?.transmission>0));
     for(const object of nodes){
       if(object.isLight&&!programLightMode)light(object);
       if(shadowEnabled&&object.isMesh&&object.castShadow&&!programShadowMode){
@@ -398,7 +402,7 @@ export async function createGpuThreeScene(device,scene,{
    * the owned residency, or r186's zero 1x1 default while the source loads. */
   function textureBinding(t){
     let binding;
-    const generated=pmremOwner?.binding(t)??programShadowOwner?.binding(t)??morphBinding(t)??volumeBinding(t);
+    const generated=pmremOwner?.binding(t)??programShadowOwner?.binding(t)??transmissionOwner?.binding(t)??morphBinding(t)??volumeBinding(t);
     if(generated)return generated;
     // Shadow-map depth textures belong to the program shadow owner, which binds
     // them after preparing its maps; a scan only needs a stand-in.
@@ -665,6 +669,18 @@ export async function createGpuThreeScene(device,scene,{
   const shadowRenderer=()=>programSupport.state?.().renderer??null;
   const castingLights=camera=>programLightList(camera).filter(l=>l.castShadow);
   const shadowBoundary=error=>{if(error?.code==='THREE_PROGRAM_SHADOW_PREPARE')fail('PREPARE',error.message);throw error;};
+  const transmission=()=>transmissionOwner??=(programSupport.createTransmission?.(device,{bindingOf:t=>t?textureBinding(t):placeholderBinding()})??
+    fail('MATERIAL','Transmission needs the program transmission owner'));
+  /** r186 transmissionRenderTarget[camera.id]: (camera.viewport || current viewport) x transmissionResolutionScale. */
+  function transmissionSize(camera){
+    const scale=shadowRenderer()?.transmissionResolutionScale??1,v=camera?.viewport;
+    const [w,h]=v?[v.z,v.w]:programViewportSize??[1,1];
+    return [w*scale,h*scale];
+  }
+  const transmissionTarget=()=>{
+    const camera=programCamera??(transmissionCamera??=new three.Camera());
+    return transmission().target(camera,...transmissionSize(camera));
+  };
   // WebGLClipping inputs for programs: the source Plane objects, not snapshots.
   const programClippingControls=()=>clippingEnabled?{planes:clippingValue(clipping,'planes',[]),localClippingEnabled:clippingValue(clipping,'localClippingEnabled',false)===true}:null;
   const pmrem=()=>pmremOwner??=(programSupport.createPMREM?.(device,t=>textureBinding(t))??fail('MATERIAL','PMREM environments need the program PMREM owner'));
@@ -745,10 +761,11 @@ export async function createGpuThreeScene(device,scene,{
     const sides=m.transparent&&m.side===three.DoubleSide&&!m.forceSinglePass?[three.BackSide,three.FrontSide]:[m.side];
     return sides.map(side=>{
       const clip=programSupport.clippingState(programClippingControls(),m,programCamera??new three.Camera());
-      const compiled=programSupport.compile(m,programObject(object),{fog:scene.fog,side,envMap,shadows:programShadowMode&&shadows,
-        clipping:{numPlanes:clip.numPlanes,numIntersection:clip.numIntersection}});
+      const compileOptions={fog:scene.fog,side,envMap,shadows:programShadowMode&&shadows,clipping:{numPlanes:clip.numPlanes,numIntersection:clip.numIntersection}};
+      const compiled=programSupport.compile(m,programObject(object),compileOptions);
       const reflection=compiled.program.reflection;
-      const uniforms=programSupport.refresh(m,{fog:scene.fog,envMap,envMapRotation});
+      const refreshOptions={fog:scene.fog,envMap,envMapRotation,...(m.transmission>0?{transmissionRenderTarget:transmissionTarget()}:{})};
+      const uniforms=programSupport.refresh(m,refreshOptions);
       const sourceTextures=[],bindings=[],textureKey=[];
       const samplers=programSupport.objectSamplers?.(m,programObject(object))??null;
       for(const t of reflection.textures){
@@ -767,7 +784,7 @@ export async function createGpuThreeScene(device,scene,{
       const options={program:compiled.program,textures:bindings,raster,topology,
         ...(topology==='line-strip'&&programSource(object).index?{stripIndexFormat:programSource(object).index.array instanceof Uint32Array?'uint32':'uint16'}:{})};
       const structural=[epoch,'program',compiled.key,topology,side,JSON.stringify(raster),...textureKey];
-      return {options,values:{},structural,clipped:null,program:compiled,programTextures:sourceTextures,programSide:side,programEnv:{envMap,envMapRotation}};
+      return {options,values:{},structural,clipped:null,program:compiled,programTextures:sourceTextures,programSide:side,programEnv:{envMap,envMapRotation},compileOptions,refreshOptions};
     });
   }
   /** Under in-shader tone mapping a draw the program route cannot take is a
@@ -787,6 +804,7 @@ export async function createGpuThreeScene(device,scene,{
       // GL point sizes, dashed lines (lineDistance) and line loops need their programs.
       if(m.isPointsMaterial||m.isLineDashedMaterial||object.isLineLoop)return programDescription(m,topology,object);
       if(programToneMapping())return toneMappedProgram(()=>programDescription(m,topology,object));
+      if(programTransmissionMode)return programDescription(m,topology,object);
       // Shader hooks (onBeforeCompile/onBeforeRender) need the material's own program.
       if(programDeformed.has(object)||programHooked.has(object)||programGeometries_.has(object.geometry)||
         m.onBeforeCompile!==three.Material.prototype.onBeforeCompile||m.onBeforeRender!==three.Material.prototype.onBeforeRender)return programDescription(m,topology,object);
@@ -1187,6 +1205,7 @@ export async function createGpuThreeScene(device,scene,{
         }
         next.push(entry);
       }
+      if(transmissionOwner?.pending){await Promise.race([transmissionOwner.prepare(),stopped]);live();}
       // Reuse a frozen map and existing caster registrations across unrelated
       // preparation. Only source light/camera/extent replacement allocates a map.
       // Charge the old map until its last submitted use has drained.
@@ -1356,6 +1375,8 @@ export async function createGpuThreeScene(device,scene,{
       // Framebuffer size for program gl_FragCoord; not a core renderer frame key.
       programTargetSize=frame.targetSize??null;
       if(Object.hasOwn(frame,'targetSize')){const {targetSize,...rest}=frame;frame=rest;}
+      programViewportSize=frame.viewportSize??null;
+      if(Object.hasOwn(frame,'viewportSize')){const {viewportSize,...rest}=frame;frame=rest;}
       for(const key of ['draws','viewProjection','lighting','fog','clippingPlanes',...(shadowEnabled?['shadow']:[]),...(environmentEnabled?['environment']:[]),...(backgroundEnabled?['background']:[])])if(Object.hasOwn(frame,key))fail('FRAME',`${key} belongs to the source scene/camera`);
       const clippingFrame=clippingState();
       frameTextures=new Set();frameSkeletons=new Set();
@@ -1384,7 +1405,7 @@ export async function createGpuThreeScene(device,scene,{
       const fogFrame=fogEnabled?fogApi.threeFogDescriptor(scene.fog,camera,three):null;
       const backgroundFrame=backgroundOwner?.capture(scene,camera)??null;
       const lightSources=[],casterObjects=[],casterItems=[],shadowDraws=[];
-      const opaque=[],transparent=[],stack=[{object:root,groupOrder:0}],descriptions=new Map();
+      const opaque=[],transmissive=[],transparent=[],stack=[{object:root,groupOrder:0}],descriptions=new Map();
       const get=(m,topology,object=null)=>{
         let byTopology=descriptions.get(m);if(!byTopology)descriptions.set(m,byTopology=new Map());
         const key=programCapable(m)&&object?topology+'|'+programVariant(object):topology;
@@ -1410,9 +1431,10 @@ export async function createGpuThreeScene(device,scene,{
                 const desc=get(material,wire?'lines':topology,object),records=lookup.get(programKeyOf(object))?.get(material);
                 const bindings=desc.map(d=>records?.find(e=>!e.mesh.disposed&&e.programGeometry&&same(e.structural,d.structural)));
                 if(bindings.some(e=>!e))fail('PREPARE','Call prepare() after changing geometry, program or texture bindings');
-                if(opaque.length+transparent.length>=(renderOptions.maxDraws??1024))fail('LIMIT','Source draw list exceeds capacity');
+                if(opaque.length+transmissive.length+transparent.length>=(renderOptions.maxDraws??1024))fail('LIMIT','Source draw list exceeds capacity');
                 updateObject(object);
-                (original.transparent?transparent:opaque).push({object,geometry:g,material,listMaterial:original,group,groupOrder,z,desc,bindings,shadowPass:false,program:true});
+                // WebGLRenderList.push: transmission > 0 joins the transmissive list.
+                (original.transmission>0?transmissive:original.transparent?transparent:opaque).push({object,geometry:g,material,listMaterial:original,group,groupOrder,z,desc,bindings,shadowPass:false,program:true});
                 return;
               }
               const instanceSource=object.isInstancedMesh?object:null;
@@ -1471,6 +1493,7 @@ export async function createGpuThreeScene(device,scene,{
         const order=(a,b)=>a.groupOrder-b.groupOrder||a.object.renderOrder-b.object.renderOrder;
         opaque.sort((a,b)=>order(a,b)||a.listMaterial.id-b.listMaterial.id||a.z-b.z||a.object.id-b.object.id);
         transparent.sort((a,b)=>order(a,b)||b.z-a.z||a.object.id-b.object.id);
+        transmissive.sort((a,b)=>order(a,b)||b.z-a.z||a.object.id-b.object.id);
       }
       // WebGLBackground.addToRenderList: after sorting, the background mesh leads.
       const bg=programBackground();
@@ -1480,7 +1503,7 @@ export async function createGpuThreeScene(device,scene,{
         if(bindings.some(e=>!e))fail('PREPARE','Call prepare() after changing the source background');
         opaque.unshift({object:bg,geometry:bg.geometry,material:bg.material,listMaterial:bg.material,group:null,groupOrder:0,z:0,desc,bindings,shadowPass:false,program:true});
       }
-      const items=[...opaque,...transparent],draws=[];
+      const items=[...opaque,...transmissive,...transparent],draws=[];
       if(items.reduce((n,item)=>n+item.bindings.length,0)>(renderOptions.maxDraws??1024))fail('LIMIT','Expanded source draws exceed capacity');
       // Complete texture/material preflight first, then publish requested bytes
       // before this frame's immediate draw submission. Stable views keep bundles
@@ -1495,6 +1518,30 @@ export async function createGpuThreeScene(device,scene,{
       textureOwner?.update(frameTextures);
       submitShadows?.();
       const updated=new Set(),activeDeformations=new Set();
+      // renderTransmissionPass (skipped under overrideMaterial, as r186 does):
+      // after shadow maps and uploads, before the main opaque draws.
+      if(transmissive.length&&scene.overrideMaterial===null){
+        const passItem=(item,d,i,side=d.programSide)=>{
+          const gpu=item.bindings[i].programGeometry,m=item.material,object=item.object;
+          if(!updated.has(gpu)){gpu.update({maxAdditionalBytes:Math.max(0,maxGeometryBytes-geometryBytes())});updated.add(gpu);}
+          return {object,material:m,group:item.group,side,gpu,sourceObject:programObject(object),topology:d.options.topology,stripIndexFormat:d.options.stripIndexFormat,
+            compile:()=>programSupport.compile(m,programObject(object),{...d.compileOptions,side,renderTarget:true}),
+            refresh:()=>programSupport.uniformsFor(m),
+            pack:(bytes,cam,size,reflection)=>{
+              const clip=programSupport.clippingState(programClippingControls(),m,cam);
+              return programSupport.pack(reflection,programSupport.uniformsFor(m),programObject(object),cam,bytes,{targetSize:size,material:m,
+                values:programSupport.bindsClippingPlanes(m)?{clippingPlanes:clip.planes}:null});
+            }};
+        };
+        const passItems=opaque.flatMap(item=>item.program?item.desc.map((d,i)=>passItem(item,d,i)):fail('MATERIAL','Transmission passes re-render opaque draws through programs'));
+        // r186 refreshes the material for the BackSide draw and again for its next draw.
+        const refreshed=item=>()=>programSupport.refresh(item.material,item.desc[0].refreshOptions);
+        const transmissiveItems=transmissive.map(item=>({object:item.object,material:item.material,
+          backSide:{...passItem(item,item.desc[0],0,three.BackSide),beforeDraw:refreshed(item),afterDraw:refreshed(item)}}));
+        const [width,height]=transmissionSize(camera);
+        try{transmission().render(passItems,transmissiveItems,camera,{width,height,background:scene.background,renderer:shadowRenderer(),sourceScene:root})();}
+        catch(error){if(error?.code==='THREE_PROGRAM_TRANSMISSION_PREPARE')fail('PREPARE',error.message);throw error;}
+      }
       for(const item of [...casterItems,...items]){
         if(item.program){
           const gpu=item.bindings[0].programGeometry;

@@ -268,6 +268,32 @@ export const scenarios = {
     scene.add(knot, quad);
     return { scene, camera: camera(THREE) };
   },
+  // Integer attributes (gpuType IntType -> vertexAttribIPointer): signed Int16
+  // `in int` and Uint8 `in uvec2` select per-face colors through flat varyings
+  // whose values differ per vertex (GL's last-vertex provoking convention).
+  shader_integer_attributes(THREE) {
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x101418);
+    const box = new THREE.BoxGeometry(0.9, 0.9, 0.9), geometries = [box.toNonIndexed(), box];
+    const palette = [0xff4444, 0x44ff44, 0x4488ff, 0xffff44, 0xff44ff, 0x44ffff].map(c => new THREE.Color(c));
+    geometries.forEach((geometry, k) => {
+      const n = geometry.attributes.position.count, faces = new Int16Array(n), pairs = new Uint8Array(n * 2);
+      for (let i = 0; i < n; i++) { faces[i] = Math.floor(i / (k ? 4 : 6)) - 3; pairs.set([i % 3, 250 + (i % 5)], i * 2); }
+      geometry.setAttribute('face', new THREE.Int16BufferAttribute(faces, 1)); geometry.attributes.face.gpuType = THREE.IntType;
+      geometry.setAttribute('pair', new THREE.Uint8BufferAttribute(pairs, 2)); geometry.attributes.pair.gpuType = THREE.IntType;
+      const mesh = new THREE.Mesh(geometry, new THREE.ShaderMaterial({
+        uniforms: { palette: { value: palette } },
+        glslVersion: THREE.GLSL3,
+        vertexShader: `in int face; in uvec2 pair; flat out int vFace; flat out uint vPair;
+          void main() { vFace = face; vPair = pair.x + (pair.y - 250u) * 3u; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+        fragmentShader: `uniform vec3 palette[6]; flat in int vFace; flat in uint vPair; out vec4 outColor;
+          void main() { outColor = vec4(palette[vFace + 3] * (0.4 + 0.6 * float(vPair % 5u) / 4.0), 1.0); }`,
+      }));
+      mesh.position.x = k ? 0.6 : -0.6; mesh.rotation.set(0.5, 0.7, 0);
+      scene.add(mesh);
+    });
+    return { scene, camera: camera(THREE) };
+  },
   // ShaderMaterial points: gl_PointSize squares, gl_PointCoord (GL upper-left
   // origin) with discard, per-point size attribute, and a clipped-center point.
   shader_points(THREE) {
@@ -611,6 +637,33 @@ export const scenarios = {
   },
   // MeshPhysicalMaterial extensions via ShaderLib programs (WebGL surface), and a
   // nearest-sampled float32 DataTexture read by a ShaderMaterial.
+  // r186 renderTransmissionPass: opaque objects and a background color into the
+  // mipmapped HDR transmission target, a DoubleSide transmissive back-face pass,
+  // then rough/smooth/thick transmissive spheres sampling it.
+  shaderlib_transmission(THREE) {
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x203040);
+    const stripes = new Uint8Array(16 * 16 * 4);
+    for (let i = 0; i < 256; i++) stripes.set(((i >> 1) & 1) ^ ((i >> 5) & 1) ? [255, 200, 60, 255] : [40, 90, 200, 255], i * 4);
+    const tex = new THREE.DataTexture(stripes, 16, 16); tex.colorSpace = THREE.SRGBColorSpace; tex.needsUpdate = true;
+    const back = new THREE.Mesh(new THREE.PlaneGeometry(4, 2.4), new THREE.MeshStandardMaterial({ map: tex, roughness: 0.8 }));
+    back.position.z = -1.2;
+    const box = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.5, 0.5), new THREE.MeshLambertMaterial({ color: 0xff3355 }));
+    box.position.set(0, -0.2, -0.6); box.rotation.set(0.4, 0.6, 0);
+    const glass = [
+      new THREE.MeshPhysicalMaterial({ color: 0xffffff, transmission: 1, roughness: 0.05, ior: 1.5, thickness: 0.6 }),
+      new THREE.MeshPhysicalMaterial({ color: 0xccffcc, transmission: 1, roughness: 0.45, ior: 1.3, thickness: 0.3, side: THREE.DoubleSide }),
+      new THREE.MeshPhysicalMaterial({ color: 0xffffff, transmission: 0.9, roughness: 0.15, thickness: 1.2, attenuationColor: new THREE.Color(0xff8844), attenuationDistance: 0.8 }),
+    ];
+    glass.forEach((m, i) => {
+      const mesh = new THREE.Mesh(new THREE.SphereGeometry(0.42, 40, 20), m);
+      mesh.position.set((i - 1) * 1.0, 0.1, 0.2);
+      scene.add(mesh);
+    });
+    const key = new THREE.DirectionalLight(0xffffff, 2); key.position.set(1, 2, 3);
+    scene.add(back, box, key, new THREE.AmbientLight(0xffffff, 0.6));
+    return { scene, camera: camera(THREE, [0, 0, 3.2]) };
+  },
   shaderlib_physical(THREE) {
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x181818);

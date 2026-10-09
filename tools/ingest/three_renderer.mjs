@@ -36,6 +36,7 @@ import {createThreePassSnapshots} from './three_pass_snapshot.mjs';
 import {createThreeProgramSupport} from './three_program.mjs';
 import {createThreeProgramPMREM} from './three_program_pmrem.mjs';
 import {createThreeProgramShadows} from './three_program_shadows.mjs';
+import {createThreeProgramTransmission} from './three_program_transmission.mjs';
 // r186 src/renderers/webgpu/utils/WebGPUConstants.js GPUFeatureName values.
 const R186_GPU_FEATURES = ['core-features-and-limits', 'depth-clip-control', 'depth32float-stencil8', 'texture-compression-bc',
   'texture-compression-bc-sliced-3d', 'texture-compression-etc2', 'texture-compression-astc', 'texture-compression-astc-sliced-3d',
@@ -150,7 +151,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
                 ...(destination !== owner || owner._hdr || !owner._shaderEncodedOutput ? {} : {outputTransfer: 'srgb'})},
               textureTransforms: true, alphaMaps: true,
               // ShaderMaterial programs (WebGLRenderer semantics) on the WebGL surface.
-              program: owner._shaderEncodedOutput && (destination !== owner || !owner._hdr) ? destination._programSupport ??= createThreeProgramSupport({three: THREE, pmrem: createThreeProgramPMREM, shadows: createThreeProgramShadows,
+              program: owner._shaderEncodedOutput && (destination !== owner || !owner._hdr) ? destination._programSupport ??= createThreeProgramSupport({three: THREE, pmrem: createThreeProgramPMREM, shadows: createThreeProgramShadows, transmission: createThreeProgramTransmission,
                 state: () => ({toneMapping: owner.toneMapping, toneMappingExposure: owner.toneMappingExposure, outputColorSpace: owner.outputColorSpace,
                   pixelRatio: owner._pixelRatio, height: owner._height, shadowMap: owner.shadowMap, shadowMapType: owner.shadowMap.type, renderer: owner,
                   floatLinear: device.features?.has?.('float32-filterable') === true, ...owner._programFrame,
@@ -510,6 +511,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       const vx = px(v.x * pr), vw = px(v.z * pr), vh = px(v.w * pr);
       // Program gl_FragCoord (framebuffer) and point-sprite sizes (viewport).
       if (this._shaderEncodedOutput && !hdr) frame.targetSize = [bufferWidth, bufferHeight, vw, vh];
+      // r186 _currentViewport size: the transmission target follows it.
+      if (this._shaderEncodedOutput) frame.viewportSize = [vw, vh];
       // WebGL viewports/scissors use a bottom-left origin; WebGPU's is top-left.
       const vy = this._bottomLeftOrigin ? bufferHeight - px(v.y * pr) - vh : px(v.y * pr);
       const [minDepth, maxDepth] = target ? [0, 1] : this._viewportDepth;

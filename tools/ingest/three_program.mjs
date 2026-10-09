@@ -44,7 +44,6 @@ export function inspectThreeProgram(T, material, object) {
   if (material.wireframe) fail('MATERIAL', 'Wireframe programs are not admitted yet');
   if (material.alphaHash) fail('MATERIAL', 'alphaHash programs are not admitted yet');
   if (material.stencilWrite) fail('MATERIAL', 'Stencil programs are not admitted yet');
-  if (material.transmission > 0) fail('MATERIAL', 'Transmission needs the transmission render target, not admitted yet');
 }
 
 /** The exact GLSL r186 WebGLProgram builds for (material, object) in this context.
@@ -263,7 +262,7 @@ function write(view, node, value, name, base = 0) {
  * owns one WebGLLights state (setLights/setLightsView per frame, as
  * WebGLRenderer.render does) and per-material ShaderLib uniform clones.
  * Compiled programs are cached by their exact assembled source text (bounded). */
-export function createThreeProgramSupport({three: T, state, maxPrograms = 256, maxPointSize = 1024, pmrem = null, shadows = null}) {
+export function createThreeProgramSupport({three: T, state, maxPrograms = 256, maxPointSize = 1024, pmrem = null, shadows = null, transmission = null}) {
   const compiled = new Map(), lights = webglLights(T, {floatLinear: () => state().floatLinear === true}), clones = new WeakMap();
   let dfgLUT = null;
   /** r186 getDFGLUT(): the 16x16 RG half-float DFG table, linear, clamped. */
@@ -340,9 +339,9 @@ export function createThreeProgramSupport({three: T, state, maxPrograms = 256, m
     return out;
   }
   /** setProgram's refreshMaterial work: lights, fog and material values. */
-  function refresh(material, {fog = null, envMap = null, envMapRotation, distanceLight = null} = {}) {
+  function refresh(material, {fog = null, envMap = null, envMapRotation, distanceLight = null, transmissionRenderTarget = null} = {}) {
     const uniforms = uniformsFor(material), s = state();
-    refreshWebGLMaterialUniforms(T, uniforms, material, {fog, lights: lights.state, envMap, envMapRotation, distanceLight,
+    refreshWebGLMaterialUniforms(T, uniforms, material, {fog, lights: lights.state, envMap, envMapRotation, distanceLight, transmissionRenderTarget,
       pixelRatio: s.pixelRatio ?? 1, height: s.height ?? 1, unlitColorSpace: s.outputColorSpace});
     if (uniforms.dfgLUT !== undefined) uniforms.dfgLUT.value = getDFGLUT();
     return uniforms;
@@ -353,6 +352,8 @@ export function createThreeProgramSupport({three: T, state, maxPrograms = 256, m
     createPMREM: pmrem ? (device, bindingOf) => pmrem({three: T, device, bindingOf}) : null,
     /** r186 WebGLShadowMap port (three_program_shadows.mjs) when injected. */
     createShadows: shadows ? (device, options) => shadows({three: T, device, support, ...options}) : null,
+    /** r186 renderTransmissionPass port (three_program_transmission.mjs) when injected. */
+    createTransmission: transmission ? (device, options) => transmission({three: T, device, support, ...options}) : null,
     get lightList() { return lightList; }, shaderLibMaterial: m => SHADER_IDS[m?.type] !== undefined,
     /** WebGLLights.setup for this frame's light list (source traversal order). */
     setLights(list) { lightList = [...list]; lights.setup(lightList); return lights.state.version; },
