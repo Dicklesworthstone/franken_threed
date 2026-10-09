@@ -20,12 +20,76 @@
  *
  * Differences stated, not hidden: maps are depth32float where r186 WebGL
  * allocates 24-bit DEPTH_COMPONENT24 (UnsignedIntType); comparisons are at least
- * as precise. Explicit errors: VSM maps, line/point casters, wireframe casters,
- * reversed depth. A new light, a map-size change or a shadow-type change is a
+ * as precise.
+ *
+ * VSM (directional/spot lights, as r186): casters write the depth32float
+ * `shadow.map.depthTexture` (r186: FloatType DEPTH_COMPONENT32F), then r186's own
+ * `vsm` ShaderMaterial runs as two full-screen passes, vertical (depth ->
+ * `shadow.mapPass`, RG16F) and horizontal (mapPass -> `shadow.map.texture`,
+ * RG16F, with the depth texture still attached), compiled by the same program
+ * route. Receivers sample `shadow.map.texture` (linear filtering) as r186's
+ * WebGLLights selects. Caster passes skip the RG color writes r186 makes with
+ * the depth material: the horizontal pass clears and covers every texel, so the
+ * final map contents are the same. VSM point lights warn and are skipped as in
+ * r186. Explicit errors: line/point casters, wireframe casters, reversed depth,
+ * a point light whose existing map changes to VSM. A new light, a map-size change or a shadow-type change is a
  * preparation boundary (the map's GPU texture and the receivers' programs change).
  * No performance claim.
  */
 import {createProgramMeshes} from './animation_program_mesh.mjs';
+
+// r186 src/renderers/shaders/ShaderLib/vsm.glsl.js (MIT, three.js authors), verbatim;
+// it is not reachable from the public THREE namespace.
+const VSM_VERTEX = /* glsl */`
+void main() {
+
+	gl_Position = vec4( position, 1.0 );
+
+}
+`;
+const VSM_FRAGMENT = /* glsl */`
+uniform sampler2D shadow_pass;
+uniform vec2 resolution;
+uniform float radius;
+
+void main() {
+
+	const float samples = float( VSM_SAMPLES );
+
+	float mean = 0.0;
+	float squared_mean = 0.0;
+
+	float uvStride = samples <= 1.0 ? 0.0 : 2.0 / ( samples - 1.0 );
+	float uvStart = samples <= 1.0 ? 0.0 : - 1.0;
+	for ( float i = 0.0; i < samples; i ++ ) {
+
+		float uvOffset = uvStart + i * uvStride;
+
+		#ifdef HORIZONTAL_PASS
+
+			vec2 distribution = texture2D( shadow_pass, ( gl_FragCoord.xy + vec2( uvOffset, 0.0 ) * radius ) / resolution ).rg;
+			mean += distribution.x;
+			squared_mean += distribution.y * distribution.y + distribution.x * distribution.x;
+
+		#else
+
+			float depth = texture2D( shadow_pass, ( gl_FragCoord.xy + vec2( 0.0, uvOffset ) * radius ) / resolution ).r;
+			mean += depth;
+			squared_mean += depth * depth;
+
+		#endif
+
+	}
+
+	mean = mean / samples;
+	squared_mean = squared_mean / samples;
+
+	float std_dev = sqrt( max( 0.0, squared_mean - mean * mean ) );
+
+	gl_FragColor = vec4( mean, std_dev, 0.0, 1.0 );
+
+}
+`;
 
 export class ThreeProgramShadowError extends Error {
   constructor(code, message) { super(`THREE_PROGRAM_SHADOW_${code}: ${message}`); this.name = 'ThreeProgramShadowError'; this.code = 'THREE_PROGRAM_SHADOW_' + code; }
@@ -59,8 +123,20 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
   const shadowMapSize = new T.Vector2(), viewportSize = new T.Vector2(), viewport = new T.Vector4();
   let previousType = T.PCFShadowMap, disposed = false;
   const maps = new Map(), geometries = new Map(), records = new Map(), lost = new Promise(() => {}), identityCamera = new T.Camera();
-  const meshes = createProgramMeshes({device, format: null, depthFormat: DEPTH_FORMAT, sampleCount: 1, maxDraws, label,
-    fail: (code, message) => { throw new ThreeProgramShadowError(code.replace(/^ANIMATION_RENDER_/, ''), message); }, scoped, lost});
+  const meshFail = (code, message) => { throw new ThreeProgramShadowError(code.replace(/^ANIMATION_RENDER_/, ''), message); };
+  const meshes = createProgramMeshes({device, format: null, depthFormat: DEPTH_FORMAT, sampleCount: 1, maxDraws, label, fail: meshFail, scoped, lost});
+  // ---- VSM blur (WebGLShadowMap's shadowMaterialVertical/Horizontal + VSMPass) --
+  const VSM_FORMAT = 'rg16float';
+  const blurMeshes = createProgramMeshes({device, format: VSM_FORMAT, depthFormat: DEPTH_FORMAT, sampleCount: 1, maxDraws: 64, label: `${label}/vsm`, fail: meshFail, scoped, lost});
+  const shadowMaterialVertical = new T.ShaderMaterial({defines: {VSM_SAMPLES: 8},
+    uniforms: {shadow_pass: {value: null}, resolution: {value: new T.Vector2()}, radius: {value: 4.0}}, vertexShader: VSM_VERTEX, fragmentShader: VSM_FRAGMENT});
+  const shadowMaterialHorizontal = shadowMaterialVertical.clone();
+  shadowMaterialHorizontal.defines.HORIZONTAL_PASS = 1;
+  const fullScreenTri = new T.BufferGeometry();
+  fullScreenTri.setAttribute('position', new T.BufferAttribute(new Float32Array([-1, -1, 0.5, 3, -1, 0.5, -1, 3, 0.5]), 3));
+  const fullScreenMesh = new T.Mesh(fullScreenTri, shadowMaterialVertical);
+  const blurGeometries = new Map(), colorBindings = new Map();
+  const isVSMTarget = target => target.isWebGLCubeRenderTarget !== true && target.texture.format === T.RGFormat;
 
   const ids = new WeakMap();
   let nextId = 0;
@@ -131,14 +207,29 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
         if (shadow.map.depthTexture !== null) { shadow.map.depthTexture.dispose(); shadow.map.depthTexture = null; }
         shadow.map.dispose();
       }
-      if (type === T.VSMShadowMap) fail('TYPE', 'VSM shadow maps are not admitted yet');
-      if (light.isPointLight) {
+      if (type === T.VSMShadowMap) {
+        if (light.isPointLight) {
+          if (shadow.map !== null) fail('TYPE', 'A point light whose shadow map changes to VSM keeps a disposed map in r186; not admitted');
+          return false;
+        }
+        shadow.map = new T.WebGLRenderTarget(shadowMapSize.x, shadowMapSize.y, {format: T.RGFormat, type: T.HalfFloatType,
+          minFilter: T.LinearFilter, magFilter: T.LinearFilter, generateMipmaps: false});
+        shadow.map.texture.name = light.name + '.shadowMap';
+        // Native depth texture for VSM - depth is captured here, then blurred into the color texture.
+        shadow.map.depthTexture = new T.DepthTexture(shadowMapSize.x, shadowMapSize.y, T.FloatType);
+        shadow.map.depthTexture.name = light.name + '.shadowMapDepth';
+        shadow.map.depthTexture.format = T.DepthFormat;
+        shadow.map.depthTexture.compareFunction = null;
+        shadow.map.depthTexture.minFilter = T.NearestFilter; shadow.map.depthTexture.magFilter = T.NearestFilter;
+        shadow.camera.updateProjectionMatrix();
+      } else if (light.isPointLight) {
         shadow.map = new T.WebGLCubeRenderTarget(shadowMapSize.x);
         shadow.map.depthTexture = new T.CubeDepthTexture(shadowMapSize.x, T.UnsignedIntType);
       } else {
         shadow.map = new T.WebGLRenderTarget(shadowMapSize.x, shadowMapSize.y);
         shadow.map.depthTexture = new T.DepthTexture(shadowMapSize.x, shadowMapSize.y, T.UnsignedIntType);
       }
+      if (type !== T.VSMShadowMap) {
       shadow.map.depthTexture.name = light.name + '.shadowMap';
       shadow.map.depthTexture.format = T.DepthFormat;
       if (type === T.PCFShadowMap) {
@@ -149,15 +240,87 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
         shadow.map.depthTexture.minFilter = T.NearestFilter; shadow.map.depthTexture.magFilter = T.NearestFilter;
       }
       shadow.camera.updateProjectionMatrix();
+      }
     }
+    if (light.isPointLight && type === T.VSMShadowMap && shadow.map === null) return false;
     if (shadow.map.isWebGLCubeRenderTarget !== true && (shadow.map.width !== shadowMapSize.x || shadow.map.height !== shadowMapSize.y))
       shadow.map.setSize(shadowMapSize.x, shadowMapSize.y);
+    return true;
+  }
+  function destroyMap(m) {
+    m.texture.destroy();
+    if (m.vsm) { m.vsm.map.destroy(); m.vsm.pass.destroy(); m.vsm.passDepth.destroy(); colorBindings.delete(m.vsm.texture); if (m.vsm.passTexture) colorBindings.delete(m.vsm.passTexture); }
+  }
+  /** shadow.mapPass, created and sized as VSMPass does; it binds the owned RG16F pass texture. */
+  function mapPassOf(shadow, m) {
+    if (shadow.mapPass === null) shadow.mapPass = new T.WebGLRenderTarget(shadowMapSize.x, shadowMapSize.y, {format: T.RGFormat, type: T.HalfFloatType});
+    else if (shadow.mapPass.width !== shadow.map.width || shadow.mapPass.height !== shadow.map.height) shadow.mapPass.setSize(shadow.map.width, shadow.map.height);
+    if (m.vsm.passTexture !== shadow.mapPass.texture) {
+      if (m.vsm.passTexture) colorBindings.delete(m.vsm.passTexture);
+      m.vsm.passTexture = shadow.mapPass.texture;
+      colorBindings.set(m.vsm.passTexture, m.vsm.passBinding);
+    }
+    return shadow.mapPass;
+  }
+  function blurMaterials(shadow) {
+    if (shadowMaterialVertical.defines.VSM_SAMPLES !== shadow.blurSamples) {
+      shadowMaterialVertical.defines.VSM_SAMPLES = shadow.blurSamples;
+      shadowMaterialHorizontal.defines.VSM_SAMPLES = shadow.blurSamples;
+      shadowMaterialVertical.needsUpdate = true;
+      shadowMaterialHorizontal.needsUpdate = true;
+    }
+  }
+  function setBlurUniforms(material, shadow, source) {
+    material.uniforms.shadow_pass.value = source;
+    material.uniforms.resolution.value.set(shadow.map.width, shadow.map.height);
+    material.uniforms.radius.value = shadow.radius;
+  }
+  /** One record per (blur program, source binding); built at preparation, looked up by frames. */
+  function blurLookup(material, create) {
+    fullScreenMesh.material = material;
+    const compiled = support.compile(material, fullScreenMesh, {renderTarget: true});
+    let gpu = blurGeometries.get(compiled.attributesKey);
+    if (!gpu) {
+      if (!create) fail('PREPARE', 'VSM blur geometry needs prepare()');
+      gpu = support.createGeometry(device, fullScreenTri, compiled.program.reflection.attributes, {maxBytes: 4096, label: `${label}/vsm-geometry`});
+      blurGeometries.set(compiled.attributesKey, gpu);
+      gpu.update({maxAdditionalBytes: 4096});
+    }
+    const geometry = support.geometrySnapshot(gpu, device);
+    const uniforms = support.refresh(material);
+    const textures = compiled.program.reflection.textures.map(t => {
+      const texture = uniforms[t.name]?.value, b = texture && (maps.get(texture)?.depthBinding ?? colorBindings.get(texture));
+      if (!b) fail('PREPARE', 'VSM blur source texture is not prepared');
+      return {view: b.view, sampler: b.sampler, sampleType: b.sampleType, texture};
+    });
+    const raster = support.raster(material, {side: material.side});
+    const glRaster = {...raster, frontFace: raster.frontFace === 'ccw' ? 'cw' : 'ccw', blend: null};
+    const key = 'vsm\u0001' + recordKey(compiled, gpu, geometry, glRaster, textures);
+    return {key, compiled, gpu, textures, glRaster, entry: records.get(key)};
+  }
+  async function blurRecord(material) {
+    const {key, compiled, gpu, textures, glRaster, entry} = blurLookup(material, true);
+    if (entry) return entry;
+    const created = {record: await blurMeshes.add(gpu, {program: compiled.program, textures, raster: glRaster, topology: 'triangles'}), textures, gpu};
+    records.set(key, created);
+    return created;
+  }
+  function blurRecordSync(material) {
+    return blurLookup(material, false).entry ?? fail('PREPARE', 'A VSM blur program or binding changed; call prepare()');
+  }
+  function blurCommand(entry, material, camera, width, height) {
+    const reflection = entry.record.reflection, bytes = new Uint8Array(reflection.uniformBufferSize);
+    const current = support.pack(reflection, support.refresh(material), fullScreenMesh, camera, bytes, {targetSize: [width, height, width, height]});
+    if (current.some((t, k) => (t ?? null) !== entry.textures[k].texture)) fail('PREPARE', 'VSM blur textures changed; call prepare()');
+    const command = {};
+    blurMeshes.stage(entry.record, {programUniforms: bytes, first: 0, count: 3, frontFaceCW: false, instanceCount: 1}, command);
+    return command;
   }
   function mapState(target) {
     const depth = target.depthTexture, cube = target.isWebGLCubeRenderTarget === true;
     let m = maps.get(depth);
     if (m && m.width === target.width && m.height === target.height && m.cube === cube) return m;
-    if (m) m.texture.destroy();
+    if (m) destroyMap(m);
     const texture = device.createTexture({label: `${label}/${depth.name}`, size: [target.width, target.height, cube ? 6 : 1], format: DEPTH_FORMAT, usage: 16 | 4});
     const compare = depth.compareFunction != null;
     m = {texture, width: target.width, height: target.height, cube, depth,
@@ -167,6 +330,20 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
           addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge', addressModeW: 'clamp-to-edge'}),
         sampleType: compare ? 'depth' : 'unfilterable-float'}};
     if (compare && depth.compareFunction !== T.LessEqualCompare) fail('MAP', 'Only LessEqual shadow comparisons are produced by r186 WebGLShadowMap');
+    if (isVSMTarget(target)) {
+      // map.texture / mapPass.texture: RG16F with linear filtering (r186 options);
+      // mapPass also owns a depth buffer that VSMPass clears and tests against.
+      const color = name => device.createTexture({label: `${label}/${name}`, size: [target.width, target.height], format: VSM_FORMAT, usage: 16 | 4});
+      const linear = device.createSampler({label, magFilter: 'linear', minFilter: 'linear', addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge'});
+      m.vsm = {map: color(target.texture.name), pass: color(`${target.texture.name}.pass`),
+        passDepth: device.createTexture({label: `${label}/vsm-pass-depth`, size: [target.width, target.height], format: DEPTH_FORMAT, usage: 16})};
+      m.vsm.mapBinding = {view: m.vsm.map.createView(), sampler: linear, sampleType: 'float'};
+      m.vsm.passBinding = {view: m.vsm.pass.createView(), sampler: linear, sampleType: 'float'};
+      m.vsm.texture = target.texture;
+      colorBindings.set(target.texture, m.vsm.mapBinding);
+    }
+    // The VSM vertical pass samples the depth texture as a regular (non-comparison) texture.
+    m.depthBinding = compare ? null : m.binding;
     maps.set(depth, m);
     return m;
   }
@@ -246,7 +423,7 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
     const typeChanged = previousType !== type;
     for (const light of lights) {
       if (light.shadow === undefined || !updates(light)) continue;
-      allocate(light, type, typeChanged);
+      if (allocate(light, type, typeChanged) === false) continue;
       mapState(light.shadow.map);
     }
     if (typeChanged) {
@@ -262,6 +439,14 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
       // The shared depth/distance material is re-stated per caster (as each
       // render does) right before its record captures program and bindings.
       for (const [object, material] of pending) await recordFor(getDepthMaterial(object, material, light, type, renderer), object);
+      if (light.isPointLight !== true && type === T.VSMShadowMap && isVSMTarget(light.shadow.map)) {
+        const shadow = light.shadow, m = mapState(shadow.map);
+        blurMaterials(shadow);
+        setBlurUniforms(shadowMaterialVertical, shadow, shadow.map.depthTexture);
+        await blurRecord(shadowMaterialVertical);
+        setBlurUniforms(shadowMaterialHorizontal, shadow, mapPassOf(shadow, m).texture);
+        await blurRecord(shadowMaterialHorizontal);
+      }
     }
   }
 
@@ -279,12 +464,16 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
     }
     const type = settings.type;
     if (previousType !== type) fail('PREPARE', 'Shadow map type changed; call prepare()');
-    meshes.begin();
+    meshes.begin(); blurMeshes.begin();
     const passes = [];
     for (const light of lights) {
       const shadow = light.shadow;
       if (shadow === undefined) { (T.warn ?? console.warn)('WebGLShadowMap:', light, 'has no shadow.'); continue; }
       if (!updates(light)) continue;
+      if (type === T.VSMShadowMap && light.isPointLight && shadow.map === null) {
+        (T.warn ?? console.warn)('WebGLShadowMap: VSM shadow maps are not supported for PointLights. Use PCF or BasicShadowMap instead.');
+        continue;
+      }
       if (shadow.map === null) fail('PREPARE', 'A new shadow light needs prepare()');
       allocate(light, type, false);
       const map = maps.get(shadow.map.depthTexture);
@@ -326,6 +515,23 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
         });
         passes.push(pass);
       }
+      // do blur pass for VSM
+      if (shadow.isPointLightShadow !== true && type === T.VSMShadowMap) {
+        const m = map.vsm ?? fail('PREPARE', 'VSM shadow map needs prepare()');
+        blurMaterials(shadow);
+        const mapPass = mapPassOf(shadow, map);
+        if (mapPass.width !== map.width || mapPass.height !== map.height) fail('PREPARE', 'VSM pass size changed; call prepare()');
+        // vertical pass - read from native depth texture
+        setBlurUniforms(shadowMaterialVertical, shadow, shadow.map.depthTexture);
+        fullScreenMesh.material = shadowMaterialVertical;
+        passes.push({color: m.pass.createView(), view: m.passDepth.createView(), clear: true, rect: [0, 0, map.width, map.height],
+          commands: [blurCommand(blurRecordSync(shadowMaterialVertical), shadowMaterialVertical, camera, map.width, map.height)]});
+        // horizontal pass
+        setBlurUniforms(shadowMaterialHorizontal, shadow, mapPass.texture);
+        fullScreenMesh.material = shadowMaterialHorizontal;
+        passes.push({color: m.map.createView(), view: map.faces[0], clear: true, rect: [0, 0, map.width, map.height],
+          commands: [blurCommand(blurRecordSync(shadowMaterialHorizontal), shadowMaterialHorizontal, camera, map.width, map.height)]});
+      }
       shadow.needsUpdate = false;
     }
     previousType = type;
@@ -366,10 +572,12 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
   function submit(passes) {
     updated.clear();
     if (!passes.length) return;
-    meshes.write();
+    meshes.write(); blurMeshes.write();
     const encoder = device.createCommandEncoder({label});
     for (const pass of passes) {
-      const p = encoder.beginRenderPass({label, colorAttachments: [],
+      // VSM blur passes: renderer.clear() on an RG16F target with a depth buffer.
+      const colorAttachments = pass.color ? [{view: pass.color, clearValue: {r: 0, g: 0, b: 0, a: 0}, loadOp: 'clear', storeOp: 'store'}] : [];
+      const p = encoder.beginRenderPass({label, colorAttachments,
         depthStencilAttachment: {view: pass.view, depthClearValue: 1, depthLoadOp: pass.clear ? 'clear' : 'load', depthStoreOp: 'store'}});
       // rows:'gl': WebGPU row index equals GL's bottom-up window y.
       const [x, y, w, h] = pass.rect;
@@ -390,11 +598,14 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
   return Object.freeze({
     prepare, render,
     /** Receiver binding of a shadow map's depth texture, or undefined. */
-    binding: texture => maps.get(texture)?.binding,
+    binding: texture => maps.get(texture)?.binding ?? colorBindings.get(texture),
     dispose() {
       disposed = true;
-      for (const m of maps.values()) m.texture.destroy();
+      for (const m of maps.values()) destroyMap(m);
       maps.clear();
+      for (const gpu of blurGeometries.values()) gpu.dispose();
+      blurGeometries.clear(); blurMeshes.dispose(); fullScreenTri.dispose();
+      shadowMaterialVertical.dispose(); shadowMaterialHorizontal.dispose();
       for (const byKey of geometries.values()) for (const gpu of byKey.values()) gpu.dispose();
       geometries.clear(); records.clear(); meshes.dispose();
       depthMaterialBase.dispose(); distanceMaterialBase.dispose();
