@@ -553,6 +553,28 @@ export const scenarios = {
     scene.add(a, b, ring);
     return { scene, camera: camera(THREE, [0, 0, 2.5]) };
   },
+  // sampler3D (Data3DTexture, linear) and sampler2DArray (DataArrayTexture,
+  // nearest) read by GLSL3 ShaderMaterials; texels with alpha < 1 check the
+  // r186 alpha:true canvas compositing.
+  shader_volume_textures(THREE) {
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x101010);
+    const n = 8, vol = new Uint8Array(n * n * n);
+    for (let i = 0; i < vol.length; i++) { const x = i % n, y = (i >> 3) % n, z = i >> 6; vol[i] = ((x ^ y ^ z) & 1) * 200 + z * 7; }
+    const tex3d = new THREE.Data3DTexture(vol, n, n, n); tex3d.format = THREE.RedFormat; tex3d.minFilter = tex3d.magFilter = THREE.LinearFilter; tex3d.needsUpdate = true;
+    const layers = new Uint8Array(4 * 4 * 3 * 4);
+    for (let l = 0; l < 3; l++) for (let i = 0; i < 16; i++) layers.set([l === 0 ? 255 : 30, l === 1 ? 255 : 30, l === 2 ? 255 : 30, 255].map(c => i % 2 ? c : Math.round(c / 3)), (l * 16 + i) * 4);
+    const array = new THREE.DataArrayTexture(layers, 4, 4, 3); array.needsUpdate = true;
+    const vs = 'out vec2 vUv; void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }';
+    const a = new THREE.Mesh(new THREE.PlaneGeometry(1.1, 1.1), new THREE.ShaderMaterial({ glslVersion: THREE.GLSL3, uniforms: { vol: { value: tex3d } }, vertexShader: vs,
+      fragmentShader: 'precision highp sampler3D; uniform sampler3D vol; in vec2 vUv; out vec4 color; void main() { float v = texture(vol, vec3(vUv, 0.6)).r; color = vec4(v, v * 0.6, 1.0 - v, 1.0); }' }));
+    a.position.x = -0.62;
+    const b = new THREE.Mesh(new THREE.PlaneGeometry(1.1, 1.1), new THREE.ShaderMaterial({ glslVersion: THREE.GLSL3, uniforms: { layers: { value: array } }, vertexShader: vs,
+      fragmentShader: 'precision highp sampler2DArray; uniform sampler2DArray layers; in vec2 vUv; out vec4 color; void main() { color = texture(layers, vec3(vUv, floor(vUv.x * 3.0))); }' }));
+    b.position.x = 0.62;
+    scene.add(a, b);
+    return { scene, camera: camera(THREE, [0, 0, 2]) };
+  },
   // MeshPhysicalMaterial extensions via ShaderLib programs (WebGL surface), and a
   // nearest-sampled float32 DataTexture read by a ShaderMaterial.
   shaderlib_physical(THREE) {

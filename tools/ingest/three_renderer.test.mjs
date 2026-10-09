@@ -273,7 +273,8 @@ test('WebGLRenderer surface: synchronous construction, frames before init are de
   renderer.render(scene, camera); // before the device exists: no throw, deferred
   await flush(renderer);
   assert.equal(c.acquired(), 1);
-  assert.equal(c.calls.find(x => x[0] === 'configure')[1].alphaMode, 'opaque');
+  // r186 WebGLRenderer always creates an alpha:true context (alpha only sets the clear alpha).
+  assert.equal(c.calls.find(x => x[0] === 'configure')[1].alphaMode, 'premultiplied');
   // Bottom-left viewport origin, rounded like gl.viewport.
   renderer.setPixelRatio(1); renderer.setSize(100, 50);
   renderer.setViewport(10, 5, 40, 20);

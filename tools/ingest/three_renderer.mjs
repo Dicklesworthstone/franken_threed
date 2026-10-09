@@ -349,10 +349,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._dispatcher = null;
       this._session = hdr
         ? await createGpuHdrCanvasRenderer(this.domElement, createDispatcher(this), {...common,
-          target: {width, height, ...format, alphaMode: this.alpha ? 'premultiplied' : 'opaque'}, renderTarget: {depthFormat, sampleCount},
+          target: {width, height, ...format, alphaMode: this._compositedAlpha() ? 'premultiplied' : 'opaque'}, renderTarget: {depthFormat, sampleCount},
           output: {toneMapping: this._toneMapping(), exposure: this.toneMappingExposure}})
         : await createGpuCanvasRenderer(this.domElement, createDispatcher(this), {...common, lazyAttachments: true,
-          target: {width, height, depthFormat, sampleCount, ...format, alphaMode: this.alpha ? 'premultiplied' : 'opaque',
+          target: {width, height, depthFormat, sampleCount, ...format, alphaMode: this._compositedAlpha() ? 'premultiplied' : 'opaque',
             ...(this._shaderEncodedOutput ? {srgbView: false} : {})}});
     }
     _release() {
@@ -368,6 +368,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
      * output) tone-maps inside each material's program instead, unless a scene
      * needed a draw the program route cannot take (sticky fallback). */
     _wantsHdr(tone) { return tone !== 'none' && (!this._shaderEncodedOutput || this._hdrFallback === true); }
+    /** Whether the canvas composites with the page by alpha. WebGLRenderer (r186)
+     * always creates an alpha:true context; its `alpha` option only sets the
+     * default clear alpha, so shader-written alpha and setClearAlpha show. */
+    _compositedAlpha() { return this.alpha === true || this._contextAlpha === true; }
     _toneMapping() {
       const name = TONE_MAPPINGS.get(this.toneMapping);
       if (name === undefined) fail('UNSUPPORTED', `Tone mapping ${this.toneMapping} has no admitted output pass`);
@@ -485,7 +489,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       const color = this._clearColor, a = this._clearAlpha;
       // Source Background semantics: the renderer clear color is premultiplied
       // for alpha canvases; an opaque canvas ignores alpha.
-      const premultiply = this.alpha === true && (!target || !this._bottomLeftOrigin);
+      const premultiply = this._compositedAlpha() && (!target || !this._bottomLeftOrigin);
       const frame = {
         loadOp: (clearOnly ? clearOnly.color : clear && this.autoClearColor) ? 'clear' : 'load',
         depthLoadOp: (clearOnly ? clearOnly.depth : clear && this.autoClearDepth) ? 'clear' : 'load',
@@ -525,7 +529,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         if (sx !== 0 || sy !== 0 || sw !== bufferWidth || sh !== bufferHeight) frame.scissor = [sx, sy, sw, sh];
       }
       if (hdr) {
-        if (this.alpha !== true) frame.clearColor[3] = 1;
+        if (!this._compositedAlpha()) frame.clearColor[3] = 1;
         frame.output = {toneMapping: tone, exposure: this.toneMappingExposure};
       }
       return frame;
@@ -840,13 +844,15 @@ export function createWebGLRendererClass(THREE, classOptions = {}) {
       // WebGL writes sRGB-encoded fragments into an 8-bit framebuffer and blends
       // those encoded values; reproduce that with shader-side encoding.
       this._shaderEncodedOutput = true;
+      this._contextAlpha = true;
       this._pixelRound = Math.round;
       // Source construction is synchronous: start device negotiation now.
       this.init().catch(error => { this._deferredError ??= error; });
     }
     _parameterNames() { return WEBGL_PARAMETERS; }
     async _init() {
-      if (this.alpha && this.premultipliedAlpha === false) fail('UNSUPPORTED', 'Straight-alpha canvas compositing is not admitted');
+      // r186 always creates an alpha context; straight alpha would need unpremultiplied compositing.
+      if (this.premultipliedAlpha === false) fail('UNSUPPORTED', 'Straight-alpha canvas compositing is not admitted');
       if (this._outputBufferType !== undefined && this._outputBufferType !== THREE.UnsignedByteType)
         fail('UNSUPPORTED', 'Non-8-bit output buffers are not admitted');
       return super._init();

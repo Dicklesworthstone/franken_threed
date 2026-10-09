@@ -398,7 +398,7 @@ export async function createGpuThreeScene(device,scene,{
    * the owned residency, or r186's zero 1x1 default while the source loads. */
   function textureBinding(t){
     let binding;
-    const generated=pmremOwner?.binding(t)??programShadowOwner?.binding(t)??morphBinding(t);
+    const generated=pmremOwner?.binding(t)??programShadowOwner?.binding(t)??morphBinding(t)??volumeBinding(t);
     if(generated)return generated;
     // Shadow-map depth textures belong to the program shadow owner, which binds
     // them after preparing its maps; a scan only needs a stand-in.
@@ -566,6 +566,41 @@ export async function createGpuThreeScene(device,scene,{
     }
     return b;
   }
+  /** Data3DTexture / DataArrayTexture for programs (sampler3D / sampler2DArray):
+   * a direct residency in the texture's storage format, rewritten whole when
+   * the texture version changes (WebGLTextures re-uploads on needsUpdate). */
+  const volumeBindings=new WeakMap();
+  function volumeBinding(t){
+    if(!(t?.isData3DTexture||(t?.isDataArrayTexture&&t.isF3DMorphTexture!==true))||!programRoute())return undefined;
+    const {width,height,depth,data}=t.image??{};
+    if(!data)return placeholderBinding();
+    const bpc=t.type===three.UnsignedByteType?1:t.type===three.HalfFloatType?2:t.type===three.FloatType?4:0;
+    const channels={[three.RedFormat]:1,[three.RGFormat]:2,[three.RGBAFormat]:4}[t.format];
+    if(!bpc||!channels||channels===3)fail('TEXTURE','Unsupported 3D/array texture storage');
+    if(t.generateMipmaps&&t.minFilter!==three.NearestFilter&&t.minFilter!==three.LinearFilter)fail('TEXTURE','Generated mipmaps for 3D/array textures are not admitted yet');
+    const base=['r','rg',null,'rgba'][channels-1],format=bpc===1?base+'8unorm'+(channels===4&&three.ColorManagement.getTransfer(t.colorSpace)===three.SRGBTransfer?'-srgb':''):base+(bpc===2?'16float':'32float');
+    const linear=t.magFilter!==three.NearestFilter||![three.NearestFilter,three.NearestMipmapNearestFilter].includes(t.minFilter);
+    const unfilterable=bpc===4&&!device.features?.has?.('float32-filterable');
+    if(unfilterable&&linear)fail('TEXTURE','Linear float32 3D/array textures need float32-filterable');
+    let b=volumeBindings.get(t);
+    if(!b||b.width!==width||b.height!==height||b.depth!==depth||b.format!==format){
+      b?.texture.destroy();
+      const texture=device.createTexture({label:'f3d-volume',size:[width,height,depth],format,dimension:t.isData3DTexture?'3d':'2d',usage:4|2});
+      const wrap=w=>({[three.RepeatWrapping]:'repeat',[three.MirroredRepeatWrapping]:'mirror-repeat'})[w]??'clamp-to-edge';
+      const mag=t.magFilter===three.NearestFilter?'nearest':'linear',min=[three.NearestFilter,three.NearestMipmapNearestFilter,three.NearestMipmapLinearFilter].includes(t.minFilter)?'nearest':'linear';
+      b={texture,width,height,depth,format,version:-1,view:texture.createView({dimension:t.isData3DTexture?'3d':'2d-array'}),
+        sampler:device.createSampler({label:'f3d-volume',magFilter:mag,minFilter:min,addressModeU:wrap(t.wrapS),addressModeV:wrap(t.wrapT),addressModeW:wrap(t.wrapR)}),
+        sampleType:unfilterable?'unfilterable-float':'float'};
+      volumeBindings.set(t,b);
+      t.addEventListener('dispose',()=>{if(volumeBindings.get(t)===b){volumeBindings.delete(t);texture.destroy();}});
+    }
+    if(b.version!==t.version){
+      const bytes=new Uint8Array(data.buffer,data.byteOffset,data.byteLength);
+      device.queue.writeTexture({texture:b.texture},bytes,{bytesPerRow:width*channels*bpc,rowsPerImage:height},[width,height,depth]);
+      b.version=t.version;
+    }
+    return b;
+  }
   function equirectCube(source){
     const r=pmrem().lookupCube(source);
     if(r.state==='ready')return r.texture;
@@ -673,7 +708,8 @@ export async function createGpuThreeScene(device,scene,{
         if(texture!=null&&!(texture instanceof three.Texture))fail('TEXTURE',`Uniform ${t.name} is not a texture`);
         if(texture&&(t.dimension==='cube')!==(texture.isCubeTexture===true))fail('TEXTURE',`Uniform ${t.name} texture dimension differs from its sampler`);
         const shadowMap=!!texture&&!!programShadowOwner?.binding(texture);
-        if(texture&&(t.dimension==='3d'||(t.dimension==='2d-array'&&texture.isF3DMorphTexture!==true)||(t.comparison&&!shadowMap&&!textureScan)))fail('TEXTURE',`Sampler ${t.glslType} textures are not admitted yet`);
+        const volume=!!texture&&(texture.isData3DTexture===true||texture.isDataArrayTexture===true);
+        if(texture&&(((t.dimension==='3d'||t.dimension==='2d-array')&&!volume)||(t.comparison&&!shadowMap&&!textureScan)))fail('TEXTURE',`Sampler ${t.glslType} textures are not admitted yet`);
         // A shadow sampler without a rendered map (r186 binds an incomplete unit).
         if(!texture&&!textureScan&&/Shadow/.test(t.glslType))fail('SHADOW',`Shadow map ${t.name} was never rendered`);
         const binding=texture?textureBinding(texture):placeholderBinding();
