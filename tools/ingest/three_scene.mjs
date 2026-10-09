@@ -434,6 +434,7 @@ export async function createGpuThreeScene(device,scene,{
   const programSources=new WeakMap();
   function programSource(object){
     if(object.isLineLoop)return loopGeometry(object.geometry);
+    if(object.isPoints&&object.geometry.index)return pointsGeometry(object.geometry);
     if(!object.isInstancedMesh)return object.geometry;
     let view=programSources.get(object);
     const g=object.geometry;
@@ -466,6 +467,53 @@ export async function createGpuThreeScene(device,scene,{
       view={key,geometry:derived};loopViews.set(g,view);
     }
     return view.geometry;
+  }
+  /** Indexed GL points draw one point per index: a de-indexed view gathering
+   * every attribute through the index over the draw range, re-gathered in place
+   * when the index or an attribute changes version (point sprites expand per
+   * vertex, so they cannot share vertices through an index). */
+  const pointViews=new WeakMap();
+  function pointsGeometry(g){
+    const index=g.index,range=g.drawRange,total=index.count;
+    const start=Math.min(range.start,total),end=Math.min(total,range.count===Infinity?total:range.start+range.count),n=Math.max(0,end-start);
+    const morphs=Object.entries(g.morphAttributes).filter(([,list])=>list?.length);
+    const shape=[idOfLoop(index),n,...Object.entries(g.attributes).map(([k,a])=>k+idOfLoop(a)+':'+a.itemSize),
+      ...morphs.map(([k,list])=>k+list.map(a=>idOfLoop(a)).join('/'))].join(',');
+    const versions=[index.version,start,...Object.values(g.attributes).map(a=>(a.isInterleavedBufferAttribute?a.data.version:a.version))].join(',');
+    let view=pointViews.get(g);
+    if(!view||view.shape!==shape){
+      const derived=new three.BufferGeometry();
+      for(const [name,a] of Object.entries(g.attributes)){
+        const Kind=(a.isInterleavedBufferAttribute?a.data.array:a.array).constructor;
+        derived.setAttribute(name,new three.BufferAttribute(new Kind(n*a.itemSize),a.itemSize,a.normalized));
+      }
+      // Morph targets follow the same numbering (gathered once: WebGLMorphtargets
+      // also builds its texture once per geometry and target count).
+      const gather=a=>{const out=new three.BufferAttribute(new Float32Array(n*a.itemSize),a.itemSize);
+        for(let i=0;i<n;i++){const v=index.getX(start+i);for(let c=0;c<a.itemSize;c++)out.array[i*a.itemSize+c]=a.getComponent(v,c);}return out;};
+      for(const [name,list] of morphs)derived.morphAttributes[name]=list.map(gather);
+      derived.morphTargetsRelative=g.morphTargetsRelative;
+      view={shape,versions:null,geometry:derived};pointViews.set(g,view);
+    }
+    if(view.versions!==versions){
+      for(const [name,a] of Object.entries(g.attributes)){
+        const out=view.geometry.attributes[name],size=a.itemSize;
+        for(let i=0;i<n;i++){const v=index.getX(start+i);for(let c=0;c<size;c++)out.array[i*size+c]=a.getComponent(v,c);}
+        out.needsUpdate=true;
+      }
+      view.versions=versions;
+    }
+    return view.geometry;
+  }
+  /** Programs of morphed indexed points read the de-indexed geometry (morph
+   * texture and gl_VertexID agree); a view of the object carries it. */
+  const pointProxies=new WeakMap();
+  function programObject(object){
+    if(!object?.isPoints||!object.geometry.index||!Object.values(object.geometry.morphAttributes).some(a=>a?.length))return object;
+    const derived=pointsGeometry(object.geometry);
+    let proxy=pointProxies.get(object);
+    if(!proxy||proxy.geometry!==derived){proxy=Object.create(object,{geometry:{value:derived,configurable:true}});pointProxies.set(object,proxy);}
+    return proxy;
   }
   const programKeyOf=object=>object.isInstancedMesh||object.isSkinnedMesh?object:object.geometry;
   const programCapable=m=>m?.isShaderMaterial===true||(programRoute()&&programSupport.shaderLibMaterial(m));
@@ -697,12 +745,12 @@ export async function createGpuThreeScene(device,scene,{
     const sides=m.transparent&&m.side===three.DoubleSide&&!m.forceSinglePass?[three.BackSide,three.FrontSide]:[m.side];
     return sides.map(side=>{
       const clip=programSupport.clippingState(programClippingControls(),m,programCamera??new three.Camera());
-      const compiled=programSupport.compile(m,object,{fog:scene.fog,side,envMap,shadows:programShadowMode&&shadows,
+      const compiled=programSupport.compile(m,programObject(object),{fog:scene.fog,side,envMap,shadows:programShadowMode&&shadows,
         clipping:{numPlanes:clip.numPlanes,numIntersection:clip.numIntersection}});
       const reflection=compiled.program.reflection;
       const uniforms=programSupport.refresh(m,{fog:scene.fog,envMap,envMapRotation});
       const sourceTextures=[],bindings=[],textureKey=[];
-      const samplers=programSupport.objectSamplers?.(m,object)??null;
+      const samplers=programSupport.objectSamplers?.(m,programObject(object))??null;
       for(const t of reflection.textures){
         const value=samplers?.[t.name]??uniforms?.[t.name]?.value,texture=t.element===null?value:value?.[t.element];
         if(texture!=null&&!(texture instanceof three.Texture))fail('TEXTURE',`Uniform ${t.name} is not a texture`);
@@ -1468,7 +1516,7 @@ export async function createGpuThreeScene(device,scene,{
           for(let i=0;i<item.bindings.length;i++){
             const d=item.desc[i],reflection=d.program.program.reflection,bytes=new Uint8Array(reflection.uniformBufferSize);
             const clip=programSupport.clippingState(programClippingControls(),item.material,camera);
-            const current=programSupport.pack(reflection,programSupport.uniformsFor(item.material),object,camera,bytes,{targetSize:programTargetSize,material:item.material,
+            const current=programSupport.pack(reflection,programSupport.uniformsFor(item.material),programObject(object),camera,bytes,{targetSize:programTargetSize,material:item.material,
               values:programSupport.bindsClippingPlanes(item.material)?{clippingPlanes:clip.planes}:null});
             if(current.some((t,k)=>(t??null)!==d.programTextures[k]))fail('PREPARE','Program texture uniforms changed; call prepare()');
             for(const t of current)if(t)frameTextures?.add(t);

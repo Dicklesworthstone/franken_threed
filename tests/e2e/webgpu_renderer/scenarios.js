@@ -575,6 +575,19 @@ export const scenarios = {
     scene.add(a, b);
     return { scene, camera: camera(THREE, [0, 0, 2]) };
   },
+  // Indexed GL points (one point per index, draw range) with morph targets.
+  shaderlib_indexed_points(THREE) {
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x101010);
+    const geometry = new THREE.SphereGeometry(0.7, 16, 10), p = geometry.attributes.position, morph = [];
+    for (let i = 0; i < p.count; i++) morph.push(p.getX(i) * 0.6, p.getY(i) * 0.2, p.getZ(i) * 0.6);
+    geometry.morphAttributes.position = [new THREE.Float32BufferAttribute(morph, 3)];
+    geometry.setDrawRange(30, 400);
+    const points = new THREE.Points(geometry, new THREE.PointsMaterial({ color: 0xffcc66, size: 5, sizeAttenuation: false }));
+    points.morphTargetInfluences = [0.7]; points.rotation.set(0.5, 0.3, 0);
+    scene.add(points);
+    return { scene, camera: camera(THREE, [0, 0, 2.2]) };
+  },
   // MeshPhysicalMaterial extensions via ShaderLib programs (WebGL surface), and a
   // nearest-sampled float32 DataTexture read by a ShaderMaterial.
   shaderlib_physical(THREE) {
