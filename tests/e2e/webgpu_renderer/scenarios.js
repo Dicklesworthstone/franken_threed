@@ -294,6 +294,38 @@ export const scenarios = {
     });
     return { scene, camera: camera(THREE) };
   },
+  // r186 UniformsGroup UBOs: an unnamed block (camera matrices), an instanced
+  // block with vec3/mat3/vec4[]/float members, std140 packing, and the
+  // once-per-frame upload (the second draw's onBeforeRender edit stays invisible).
+  shader_uniform_blocks(THREE) {
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x111111);
+    const cam = camera(THREE);
+    const view = new THREE.UniformsGroup(); view.setName('ViewData');
+    view.add(new THREE.Uniform(cam.projectionMatrix)); view.add(new THREE.Uniform(cam.matrixWorldInverse));
+    const look = new THREE.UniformsGroup(); look.setName('Look');
+    const tint = new THREE.Uniform(new THREE.Color(0.9, 0.3, 0.2));
+    look.add(tint); look.add(new THREE.Uniform(new THREE.Matrix3().set(0, 1, 0, 1, 0, 0, 0, 0, 1)));
+    look.add([new THREE.Uniform(new THREE.Vector4(0.2, 0.9, 0.3, 1)), new THREE.Uniform(new THREE.Vector4(0.2, 0.4, 1, 1))]);
+    look.add(new THREE.Uniform(0.75));
+    const material = new THREE.RawShaderMaterial({ glslVersion: THREE.GLSL3, uniformsGroups: [view, look],
+      uniforms: { modelMatrix: { value: new THREE.Matrix4() } },
+      vertexShader: `precision highp float; uniform ViewData { mat4 projectionMatrix; mat4 viewMatrix; };
+        uniform mat4 modelMatrix; in vec3 position; in vec3 normal; out vec3 vN;
+        void main() { vN = normal; gl_Position = projectionMatrix * viewMatrix * modelMatrix * vec4(position, 1.0); }`,
+      fragmentShader: `precision highp float; uniform Look { vec3 tint; mat3 swizzle; vec4 accents[2]; float strength; } L;
+        in vec3 vN; out vec4 outColor;
+        void main() { vec3 n = L.swizzle * normalize(vN); float k = 0.4 + 0.6 * max(n.z, 0.0);
+          outColor = vec4(mix(L.tint, n.x > 0.0 ? L.accents[0].rgb : L.accents[1].rgb, 0.5) * k * L.strength + 0.1, 1.0); }`,
+    });
+    [-0.6, 0.6].forEach((x, i) => {
+      const mesh = new THREE.Mesh(new THREE.IcosahedronGeometry(0.45, 2), material);
+      mesh.position.set(x, 0, i * 0.3);
+      mesh.onBeforeRender = () => { material.uniforms.modelMatrix.value.copy(mesh.matrixWorld); tint.value.setRGB(i ? 0.1 : 0.9, i ? 0.2 : 0.3, i ? 0.9 : 0.2); };
+      scene.add(mesh);
+    });
+    return { scene, camera: cam };
+  },
   // ShaderMaterial points: gl_PointSize squares, gl_PointCoord (GL upper-left
   // origin) with discard, per-point size attribute, and a clipped-center point.
   shader_points(THREE) {

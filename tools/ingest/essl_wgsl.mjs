@@ -118,6 +118,7 @@ export function compileEsslProgram(vertexSource, fragmentSource, {defines = {}, 
     uniformOrder: [],
     samplers: new Map(),      // name -> {type, count, bindings: [k...]}
     samplerCount: 0,
+    blocks: new Map(),        // uniform block name -> flattened member uniform names, in order
     structs: new Map(),       // name -> {fields:[{name, type}], wname}
     needsTarget: false,
     // rows:'gl' stores framebuffer rows bottom-up as GL does (clip Y negated), so
@@ -161,7 +162,7 @@ export function compileEsslProgram(vertexSource, fragmentSource, {defines = {}, 
 /** Compile one stage without a partner (corpus validation and diagnostics):
  * stage I/O locations follow declaration order. */
 export function compileEsslStage(stage, source, {defines = {}, clipDepth = 'gl'} = {}) {
-  const shared = {uniforms: new Map(), uniformOrder: [], samplers: new Map(), samplerCount: 0, structs: new Map(), needsTarget: false};
+  const shared = {uniforms: new Map(), uniformOrder: [], samplers: new Map(), samplerCount: 0, blocks: new Map(), structs: new Map(), needsTarget: false};
   const pre = preprocess(source, {defines});
   const unit = new Unit(stage, parse(pre.tokens), shared, esslVersion(pre.version));
   unit.declare();
@@ -202,6 +203,7 @@ function reflect(shared, units, varyings) {
     comparison: !!s.type.shadow, textureBinding: binding * 2, samplerBinding: binding * 2 + 1}));
   return {
     uniformBufferSize: size, uniforms: fields, targetOffset,
+    blocks: [...shared.blocks].map(([name, members]) => ({name, members: members.map(m => fields.find(f => f.name === m))})),
     textures,
     attributes: units.vertex.inputs.filter(i => !i.builtin).map(i => ({name: i.name, glslType: glslName(i.type), location: i.location,
       locations: i.type.k === 'm' ? i.type.c : 1, components: i.type.k === 'm' ? i.type.r : comps(i.type), scalar: scalarOf(i.type)})),
@@ -383,6 +385,12 @@ class Unit {
     }
   }
   declareBlock(d) {
+    // Block members flatten into the default uniform buffer; the reflection keeps
+    // each block's member order so a caller can fill them from std140 bytes.
+    const members = d.fields.map(f => d.instance ? `${d.instance}_${f.name}` : f.name);
+    const known = this.shared.blocks.get(d.name);
+    if (known && known.join() !== members.join()) essError(`Uniform block ${d.name} differs between stages`, d.line);
+    this.shared.blocks.set(d.name, members);
     if (this.stage && d.instance) {
       const sym = {kind: 'ublock', fields: new Map()};
       for (const f of d.fields) {

@@ -84,7 +84,7 @@ async function capture(kind, name) {
 // Scenarios using WebGPU-build-only classes (node materials, BundleGroup).
 const WEBGPU_ONLY = new Set(["node_materials"]);
 // WebGLRenderer-only features (r186 WebGPURenderer does not run ShaderMaterial).
-const WEBGL_ONLY = new Set(["shader_material", "shader_points", "shader_integer_attributes", "shaderlib_maps", "shaderlib_physical", "shaderlib_transmission", "shaderlib_pmrem", "shaderlib_shadows", "shaderlib_vsm_shadows", "shaderlib_clipping", "shaderlib_background_cube", "shaderlib_background_texture", "shaderlib_tone_mapping", "shaderlib_equirect_cube", "shaderlib_skinning", "shaderlib_morph", "shaderlib_area_lights", "shaderlib_before_compile", "shaderlib_sprites", "shader_volume_textures", "shaderlib_indexed_points"]);
+const WEBGL_ONLY = new Set(["shader_material", "shader_points", "shader_uniform_blocks", "shader_integer_attributes", "shaderlib_maps", "shaderlib_physical", "shaderlib_transmission", "shaderlib_pmrem", "shaderlib_shadows", "shaderlib_vsm_shadows", "shaderlib_clipping", "shaderlib_background_cube", "shaderlib_background_texture", "shaderlib_tone_mapping", "shaderlib_equirect_cube", "shaderlib_skinning", "shaderlib_morph", "shaderlib_area_lights", "shaderlib_before_compile", "shaderlib_sprites", "shader_volume_textures", "shaderlib_indexed_points"]);
 const selected = argv.length ? argv : Object.keys(scenarios).filter((n) => surface === "webgpu" ? !WEBGL_ONLY.has(n) : !WEBGPU_ONLY.has(n));
 const results = [];
 for (const name of selected) {

@@ -39,7 +39,6 @@ export function inspectThreeProgram(T, material, object) {
   if (object.isBatchedMesh) fail('OBJECT', 'Batched program objects are not admitted yet');
   if (object.isInstancedMesh && object.morphTexture != null) fail('OBJECT', 'Instanced morph textures are not admitted yet');
   if (object.isSkinnedMesh && !(object.skeleton instanceof T.Skeleton)) fail('OBJECT', 'Skinned program objects need their skeleton');
-  if (material.uniformsGroups?.length) fail('UNIFORMS', 'Uniform buffer groups are not admitted yet');
   if (material.extensions?.clipCullDistance || material.extensions?.multiDraw) fail('EXTENSION', 'Program extensions are not admitted');
   if (material.wireframe) fail('MATERIAL', 'Wireframe programs are not admitted yet');
   if (material.alphaHash) fail('MATERIAL', 'alphaHash programs are not admitted yet');
@@ -264,6 +263,7 @@ function write(view, node, value, name, base = 0) {
  * Compiled programs are cached by their exact assembled source text (bounded). */
 export function createThreeProgramSupport({three: T, state, maxPrograms = 256, maxPointSize = 1024, pmrem = null, shadows = null, transmission = null}) {
   const compiled = new Map(), lights = webglLights(T, {floatLinear: () => state().floatLinear === true}), clones = new WeakMap();
+  const uniformBlocks = createUniformBlocks();
   let dfgLUT = null;
   /** r186 getDFGLUT(): the 16x16 RG half-float DFG table, linear, clamped. */
   function getDFGLUT() {
@@ -361,9 +361,14 @@ export function createThreeProgramSupport({three: T, state, maxPrograms = 256, m
     get lightsVersion() { return lights.state.version; },
     raster: (material, options) => threeProgramRaster(T, material, options),
     /** options.material: lit materials read shadow maps from the light state. */
-    pack: (reflection, uniforms, object, camera, bytes, {material = null, ...options} = {}) =>
-      packThreeProgramUniforms(T, reflection, uniforms, object, camera, bytes, {toneMappingExposure: state().toneMappingExposure ?? 1,
-        samplers: objectSamplers(material, object), ...options}),
+    pack: (reflection, uniforms, object, camera, bytes, {material = null, ...options} = {}) => {
+      const textures = packThreeProgramUniforms(T, reflection, uniforms, object, camera, bytes, {toneMappingExposure: state().toneMappingExposure ?? 1,
+        samplers: objectSamplers(material, object), ...options});
+      uniformBlocks.pack(reflection, material, bytes);
+      return textures;
+    },
+    /** One renderer.render() call: r186 uploads each UniformsGroup at most once per frame. */
+    beginFrame() { uniformBlocks.frame++; },
     shadowSamplers, objectSamplers,
     state,
     clippingState: (controls, material, camera, options) => threeClippingState(T, controls, material, camera, options),
@@ -372,4 +377,137 @@ export function createThreeProgramSupport({three: T, state, maxPrograms = 256, m
     geometrySnapshot: (gpu, device) => programGeometrySnapshot(gpu, device),
   });
   return support;
+}
+
+/** r186 WebGLUniformsGroups (port, MIT three.js authors): each UniformsGroup owns
+ * one std140 buffer laid out once on first use (prepareUniformsGroup), written
+ * through r186's change cache (updateBufferData) at most once per frame, and
+ * bound to the program block whose name equals group.name. The GL buffer is an
+ * ArrayBuffer here; each draw decodes the block's bytes into the flattened block
+ * members of its own uniform slice (std140 member offsets from the reflection
+ * layout), so mid-frame group edits after the first use stay invisible exactly
+ * as they are in r186. Integer members read the same bytes as int, as GL does. */
+function createUniformBlocks() {
+  const states = new WeakMap();
+  const self = {frame: 0, pack};
+  function uniformSize(value) {
+    if (typeof value === 'number' || typeof value === 'boolean') return {boundary: 4, storage: 4};
+    if (value?.isVector2) return {boundary: 8, storage: 8};
+    if (value?.isVector3 || value?.isColor) return {boundary: 16, storage: 12};
+    if (value?.isVector4) return {boundary: 16, storage: 16};
+    if (value?.isMatrix3) return {boundary: 48, storage: 48};
+    if (value?.isMatrix4) return {boundary: 64, storage: 64};
+    if (ArrayBuffer.isView(value)) return {boundary: 16, storage: value.byteLength};
+    fail('UNIFORMS', value?.isTexture ? 'Texture samplers can not be part of an uniforms group' : 'Unsupported uniforms group value type');
+  }
+  function prepare(group) {
+    let offset = 0;
+    const chunkSize = 16;
+    for (const item of group.uniforms) for (const uniform of Array.isArray(item) ? item : [item]) {
+      for (const value of Array.isArray(uniform.value) ? uniform.value : [uniform.value]) {
+        const info = uniformSize(value);
+        const chunkOffset = offset % chunkSize, chunkPadding = chunkOffset % info.boundary, chunkStart = chunkOffset + chunkPadding;
+        offset += chunkPadding;
+        if (chunkStart !== 0 && (chunkSize - chunkStart) < info.storage) offset += chunkSize - chunkStart;
+        uniform.__data = new Float32Array(info.storage / 4);
+        uniform.__offset = offset;
+        offset += info.storage;
+      }
+    }
+    if (offset % chunkSize > 0) offset += chunkSize - offset % chunkSize;
+    group.__size = offset; group.__cache = {};
+    const buffer = new ArrayBuffer(offset);
+    return {buffer, bytes: new Uint8Array(buffer), view: new DataView(buffer), frame: -1};
+  }
+  function writeValue(value, data, offset) {
+    if (typeof value === 'number' || typeof value === 'boolean') data[0] = value;
+    else if (value.isMatrix3) {
+      const e = value.elements;
+      data.set([e[0], e[1], e[2], 0, e[3], e[4], e[5], 0, e[6], e[7], e[8], 0]);
+    } else if (ArrayBuffer.isView(value)) data.set(new value.constructor(value.buffer, value.byteOffset, data.length));
+    else value.toArray(data, offset);
+  }
+  function changed(uniform, index, indexArray, cache) {
+    const value = uniform.value, key = index + '_' + indexArray, cached = cache[key];
+    if (cached === undefined) {
+      cache[key] = typeof value === 'number' || typeof value === 'boolean' ? value : ArrayBuffer.isView(value) ? value.slice() : value.clone();
+      return true;
+    }
+    if (typeof value === 'number' || typeof value === 'boolean') { if (cached !== value) { cache[key] = value; return true; } return false; }
+    if (ArrayBuffer.isView(value)) return true;
+    if (cached.equals(value) === false) { cached.copy(value); return true; }
+    return false;
+  }
+  function update(state, group) {
+    const write = (uniform, i, j) => {
+      if (!changed(uniform, i, j, group.__cache)) return;
+      const value = uniform.value;
+      if (Array.isArray(value)) {
+        let arrayOffset = 0;
+        for (const v of value) {
+          const info = uniformSize(v);
+          writeValue(v, uniform.__data, arrayOffset);
+          if (typeof v !== 'number' && typeof v !== 'boolean' && !v.isMatrix3 && !ArrayBuffer.isView(v)) arrayOffset += info.storage / 4;
+        }
+      } else writeValue(value, uniform.__data, 0);
+      // gl.bufferSubData: a write past the buffer end is an INVALID_VALUE no-op.
+      const data = new Uint8Array(uniform.__data.buffer, uniform.__data.byteOffset, uniform.__data.byteLength);
+      if (uniform.__offset + data.byteLength <= state.bytes.byteLength) state.bytes.set(data, uniform.__offset);
+    };
+    group.uniforms.forEach((item, i) => { if (Array.isArray(item)) item.forEach((u, j) => write(u, i, j)); else write(item, i, 0); });
+  }
+  function bytesOf(group) {
+    let state = states.get(group);
+    if (!state) states.set(group, state = prepare(group));
+    if (state.frame !== self.frame) { update(state, group); state.frame = self.frame; }
+    return state;
+  }
+  // std140 alignment/size of a reflection layout node.
+  const roundUp = (a, v) => Math.ceil(v / a) * a;
+  function std140(node) {
+    switch (node.k) {
+      case 'num': return node.n === 1 ? {align: 4, size: 4} : node.n === 2 ? {align: 8, size: 8} : {align: 16, size: node.n * 4};
+      case 'mat': return {align: 16, size: 16 * node.c};
+      case 'array': { const e = std140(node.elem); const stride = roundUp(16, e.size); return {align: 16, size: stride * node.n, stride}; }
+      case 'struct': {
+        let end = 0, align = 16;
+        for (const f of node.fields) { const l = std140(f.node); end = roundUp(l.align, end) + l.size; align = Math.max(align, roundUp(16, l.align)); }
+        return {align, size: roundUp(align, end)};
+      }
+    }
+    fail('UNIFORMS', 'Unsupported uniform block member');
+  }
+  function copy(view, node, src, at, base) {
+    const read = (offset, s) => offset + 4 > src.byteLength ? 0 : s === 'float' ? src.getFloat32(offset, true) : s === 'int' ? src.getInt32(offset, true) : src.getUint32(offset, true);
+    switch (node.k) {
+      case 'num': for (let i = 0; i < node.n; i++) writeScalar(view, base + node.offset + i * 4, node.s, read(at + i * 4, node.s === 'bool' ? 'uint' : node.s)); return;
+      case 'mat': for (let c = 0; c < node.c; c++) for (let r = 0; r < node.r; r++) view.setFloat32(base + node.offset + c * node.colStride + r * 4, read(at + c * 16 + r * 4, 'float'), true); return;
+      case 'array': { const {stride} = std140(node); for (let i = 0; i < node.n; i++) copy(view, node.elem, src, at + i * stride, base + node.offset + i * node.stride); return; }
+      case 'struct': {
+        let cursor = 0;
+        for (const f of node.fields) { const l = std140(f.node); cursor = roundUp(l.align, cursor); copy(view, f.node, src, at + cursor, base); cursor += l.size; }
+        return;
+      }
+    }
+  }
+  function pack(reflection, material, bytes) {
+    const groups = material?.uniformsGroups ?? [];
+    // WebGLRenderer.setProgram updates every group the material lists.
+    const updated = new Map(groups.map(g => [g, bytesOf(g)]));
+    if (!reflection.blocks?.length) return;
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    for (const block of reflection.blocks) {
+      const group = groups.find(g => g.name === block.name);
+      if (!group) fail('UNIFORMS', `Uniform block ${block.name} has no uniforms group of that name`);
+      const src = updated.get(group).view;
+      let cursor = 0;
+      for (const member of block.members) {
+        const l = std140(member.node);
+        cursor = roundUp(l.align, cursor);
+        copy(view, member.node, src, cursor, 0);
+        cursor += l.size;
+      }
+    }
+  }
+  return self;
 }

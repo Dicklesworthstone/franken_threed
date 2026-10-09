@@ -1397,7 +1397,7 @@ export async function createGpuThreeScene(device,scene,{
         backgroundOwner?.check();
       }
       const lighting=cameraFrame(camera);lighting.lights=[];
-      if(programRoute()){programCamera=camera;programSupport.setLights(programLightList(camera));programSupport.setLightsView(camera);}
+      if(programRoute()){programCamera=camera;programSupport.beginFrame?.();programSupport.setLights(programLightList(camera));programSupport.setLightsView(camera);}
       // View rotation for view-space shading models (MeshNormalMaterial).
       lighting.viewMatrix=camera.matrixWorldInverse.elements;
       // Capture against this frame's updated camera before texture, geometry,
