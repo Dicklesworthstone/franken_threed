@@ -4,6 +4,8 @@
  * it is refreshed once per written version, never downloaded or re-uploaded.
  * generateMipmaps:true keeps a full native color pyramid and flips each level
  * into the sampling pyramid. Both chains are charged, including NPOT tails.
+ * Single-sample source DepthTexture attachments are sampled through a separate
+ * UV-oriented r32float image: no color conversion or half-float quantization.
  * This is general WebGPU execution, not Rust specialization or a speedup claim.
  */
 import {createGpuRenderTarget} from './gpu_render_target.mjs';
@@ -26,7 +28,7 @@ export function inspectThreeRenderTarget(target, three) {
   if (!(texture instanceof three.Texture) || texture.isCubeTexture || texture.isDataArrayTexture || texture.isData3DTexture ||
       texture.renderTarget !== target || texture.isRenderTargetTexture !== true)
     fail('SOURCE', 'Expected the target-owned 2D color texture');
-  if (target.stencilBuffer || target.depthTexture) fail('UNSUPPORTED', 'Stencil and sampled depth targets are not admitted');
+  if (target.stencilBuffer) fail('UNSUPPORTED', 'Stencil targets are not admitted');
   if (![0, 1, 4].includes(target.samples)) fail('UNSUPPORTED', 'Target samples must be zero, one or four');
   if (target.samples === 4 && target.resolveColorBuffer === false) fail('UNSUPPORTED', 'MSAA targets must resolve their color');
   if (texture.format !== three.RGBAFormat || texture.internalFormat != null)
@@ -38,7 +40,29 @@ export function inspectThreeRenderTarget(target, three) {
     format = linear ? 'rgba8unorm' : 'rgba8unorm-srgb';
   else if (texture.type === three.HalfFloatType && linear) format = 'rgba16float';
   else fail('UNSUPPORTED', 'Target color must be RGBA8 or linear RGBA16F');
-  const sampleCount = target.samples === 4 ? 4 : 1, depthFormat = target.depthBuffer ? 'depth24plus' : null;
+  const sampleCount = target.samples === 4 ? 4 : 1, depthTexture = target.depthTexture ?? null;
+  let depthFormat = target.depthBuffer ? 'depth24plus' : null;
+  if (depthTexture !== null) {
+    if (typeof three.DepthTexture !== 'function' || !(depthTexture instanceof three.DepthTexture) ||
+        depthTexture.isDepthTexture !== true || depthTexture.renderTarget !== target)
+      fail('SOURCE', 'Expected the target-owned source DepthTexture; shared depth attachments are not admitted');
+    if (!target.depthBuffer || sampleCount !== 1 || target.useArrayDepthTexture ||
+        depthTexture.isArrayTexture || depthTexture.isCubeTexture || (depthTexture.image?.depth ?? 1) !== 1)
+      fail('UNSUPPORTED', 'Source depth sampling requires a single-sample 2D depth attachment');
+    if (depthTexture.format !== three.DepthFormat || depthTexture.internalFormat != null ||
+        depthTexture.colorSpace !== three.NoColorSpace || depthTexture.generateMipmaps !== false ||
+        depthTexture.mipmaps?.length || depthTexture.flipY !== false || depthTexture.compareFunction != null)
+      fail('UNSUPPORTED', 'Depth textures require ordinary non-comparison depth, no mipmaps and no color conversion');
+    if (depthTexture.type === three.UnsignedIntType) depthFormat = 'depth24plus';
+    else if (depthTexture.type === three.FloatType) depthFormat = 'depth32float';
+    else fail('UNSUPPORTED', 'Source depth type must be UnsignedIntType or FloatType');
+    // Match the ordinary sampler2D depth-read profile. Do not pretend a missing
+    // float32-filterable device feature can be replaced by lower precision.
+    if (![three.NearestFilter, three.LinearFilter].includes(depthTexture.minFilter) ||
+        ![three.NearestFilter, three.LinearFilter].includes(depthTexture.magFilter) || depthTexture.anisotropy !== 1)
+      fail('SAMPLER', 'Depth textures require nearest/linear filtering and anisotropy one');
+    samplerDescriptor(depthTexture, three, 1);
+  }
   const generateMipmaps = texture.generateMipmaps;
   const mipLevelCount = generateMipmaps ? 1 + Math.floor(Math.log2(Math.max(target.width, target.height))) : 1;
   const texelBytes = format === 'rgba16float' ? 8 : 4;
@@ -52,6 +76,7 @@ export function inspectThreeRenderTarget(target, three) {
     (depthFormat ? target.width * target.height * 4 * sampleCount : 0);
   if (!Number.isSafeInteger(bytes)) fail('BUDGET', 'Target byte size exceeds safe integer precision');
   return {width: target.width, height: target.height, format, depthFormat, sampleCount, bytes, colorBytes, texture, generateMipmaps, mipLevelCount,
+    depthTexture, depthSampleBytes: depthTexture ? target.width * target.height * 4 : 0,
     key: `${target.width}/${target.height}/${format}/${depthFormat}/${sampleCount}/${generateMipmaps}`};
 }
 
@@ -88,6 +113,21 @@ const FLIP_WGSL = `
   return textureLoad(source, vec2i(i32(p.x), i32(size.y) - 1 - i32(p.y)), 0);
 }`;
 
+// A scalar R32F output preserves textureLoad's f32 depth value. Sampling the
+// replica uses the program renderer's existing sampler2D float binding route.
+// Its red channel is depth; G/B are zero and A is one. Never use RGBA8 or half
+// floats here: small depth errors become large reconstructed-distance errors.
+const DEPTH_FLIP_WGSL = `
+@group(0) @binding(0) var source: texture_depth_2d;
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+  let p = array<vec2f, 3>(vec2f(-1, -1), vec2f(3, -1), vec2f(-1, 3));
+  return vec4f(p[i], 0, 1);
+}
+@fragment fn fs(@builtin(position) p: vec4f) -> @location(0) f32 {
+  let size = textureDimensions(source);
+  return textureLoad(source, vec2i(i32(p.x), i32(size.y) - 1 - i32(p.y)), 0);
+}`;
+
 /** getDevice is lazy so selecting a target before renderer.init() performs no GPU work. */
 export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, maxBytes = 512 * 1024 * 1024} = {}) {
   if (typeof getDevice !== 'function' || !positive(maxTargets) || !positive(maxBytes)) fail('OPTIONS', 'Invalid target owner options');
@@ -99,9 +139,10 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     entry.released = true;
     try { entry._dispatcher?.dispose(); }
     finally {
-      entry.storage?.dispose(); entry.sample?.destroy();
+      entry.storage?.dispose(); entry.sample?.destroy(); entry.depthSample?.destroy();
       allocatedBytes -= entry.charged; entry.charged = 0;
       entry.storage = entry.sample = entry.view = entry.group = entry.flipSteps = null;
+      entry.depthSample = entry.depthView = entry.depthGroup = entry.depthSampler = null;
       entry._wanted.clear();
     }
   }
@@ -111,6 +152,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     entry.lifetime.abort(new ThreeRenderTargetError('STALE', 'Source render target disposed or replaced'));
     entry.target.removeEventListener('dispose', entry.onDispose);
     entry.shape.texture.removeEventListener('dispose', entry.onDispose);
+    entry.shape.depthTexture?.removeEventListener('dispose', entry.onDispose);
     if (entries.get(entry.target) === entry) entries.delete(entry.target);
     release(entry);
   }
@@ -118,14 +160,15 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     live();
     const shape = inspectThreeRenderTarget(target, three);
     let entry = entries.get(target);
-    if (entry && (entry.shape.key !== shape.key || entry.shape.texture !== shape.texture)) { retire(entry); entry = null; }
+    if (entry && (entry.shape.key !== shape.key || entry.shape.texture !== shape.texture || entry.shape.depthTexture !== shape.depthTexture)) { retire(entry); entry = null; }
     if (entry) return entry;
     if (entries.size >= maxTargets) fail('BUDGET', 'Render target count exceeds maxTargets');
     entry = {target, shape, alive: true, released: false, busy: false, charged: 0, storage: null, sample: null,
-      dirty: true, copies: 0, error: null, lifetime: new AbortController(), validation: Promise.resolve(), _wanted: new Map(), _dispatcher: null};
+      dirty: true, copies: 0, depthDirty: true, depthCopies: 0, depthSample: null, error: null, lifetime: new AbortController(), validation: Promise.resolve(), _wanted: new Map(), _dispatcher: null};
     entry.onDispose = () => retire(entry);
     target.addEventListener('dispose', entry.onDispose);
     shape.texture.addEventListener('dispose', entry.onDispose);
+    shape.depthTexture?.addEventListener('dispose', entry.onDispose);
     entries.set(target, entry);
     return entry;
   }
@@ -133,7 +176,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     live();
     if (!entry?.alive || entries.get(entry.target) !== entry) fail('STALE', 'Target was disposed or replaced before its queued use');
     const shape = inspectThreeRenderTarget(entry.target, three);
-    if (shape.key !== entry.shape.key || shape.texture !== entry.shape.texture) fail('STALE', 'Target configuration changed before its queued use');
+    if (shape.key !== entry.shape.key || shape.texture !== entry.shape.texture || shape.depthTexture !== entry.shape.depthTexture) fail('STALE', 'Target configuration changed before its queued use');
     if (entry.error) throw entry.error;
     if (entry.storage?.failed) fail('GPU', 'Native target storage failed');
     return entry;
@@ -148,7 +191,8 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     const device = getDevice();
     if (!device) fail('DEVICE', 'Initialize the renderer before acquiring target storage');
     const {width, height, format, depthFormat, sampleCount, generateMipmaps} = entry.shape;
-    entry.storage = createGpuRenderTarget(device, {width, height, format, depthFormat, sampleCount, maxBytes, generateMipmaps});
+    entry.storage = createGpuRenderTarget(device, {width, height, format, depthFormat, sampleCount, maxBytes, generateMipmaps,
+      sampleDepth: entry.shape.depthTexture !== null});
     entry.charged += entry.shape.bytes; allocatedBytes += entry.shape.bytes;
     // The readback helper consumes this session-shaped object. It copies the
     // original attachment, not the UV-oriented sampling replica.
@@ -169,7 +213,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       if (a || b) throw new ThreeRenderTargetError('GPU', (a || b).message ?? 'Target sampling failed');
     });
     entry.validation.catch(cause => { terminal ??= cause; entry.error = cause; retire(entry); });
-    if (error) { entry.error = error; retire(entry); throw error; }
+    if (error) { terminal ??= error; entry.error = error; retire(entry); throw error; }
     return result;
   }
   function sampling(entry, texture) {
@@ -224,17 +268,82 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     return {view: entry.view, sampler: entry.sampler, sampleType: 'float', viewDimension: '2d',
       version: texture.version, sourceVersion: texture.source.version};
   }
+  function depthSampling(entry, texture) {
+    assertCurrent(entry);
+    if (entry.busy) fail('REENTRANT', 'Cannot sample depth during a target submission');
+    const device = getDevice();
+    if (!device) fail('DEVICE', 'Initialize the renderer before sampling target depth');
+    const filterable = device.features?.has?.('float32-filterable') === true;
+    if (!filterable && (texture.minFilter !== three.NearestFilter || texture.magFilter !== three.NearestFilter))
+      fail('SAMPLER', 'Linear depth sampling requires the device float32-filterable feature');
+    const descriptor = {...samplerDescriptor(texture, three, 1), mipmapFilter: 'nearest', maxAnisotropy: 1};
+    const samplerKey = JSON.stringify(descriptor);
+    ensure(entry);
+    // Retirement may be requested by a throwing/reentrant host boundary. Do not
+    // release storage until the native withDepthTexture borrow has unwound.
+    entry.busy = true;
+    try {
+      if (!entry.depthSample) {
+        budget(entry.shape.depthSampleBytes);
+        checked(entry, device => {
+          const {width, height} = entry.shape;
+          entry.depthSample = device.createTexture({label: 'Source target depth UV sampling image',
+            size: {width, height, depthOrArrayLayers: 1}, format: 'r32float', dimension: '2d',
+            sampleCount: 1, mipLevelCount: 1, usage: 4 | 16});
+          entry.charged += entry.shape.depthSampleBytes; allocatedBytes += entry.shape.depthSampleBytes;
+          entry.depthView = entry.depthSample.createView();
+          let pipeline = pipelines.get('depth-to-r32float');
+          if (!pipeline) {
+            const module = device.createShaderModule({label: 'Source target depth UV orientation', code: DEPTH_FLIP_WGSL});
+            pipeline = device.createRenderPipeline({label: 'Source target depth UV orientation', layout: 'auto',
+              vertex: {module, entryPoint: 'vs'}, fragment: {module, entryPoint: 'fs', targets: [{format: 'r32float'}]},
+              primitive: {topology: 'triangle-list'}});
+            pipelines.set('depth-to-r32float', pipeline);
+          }
+          entry.depthPipeline = pipeline;
+          entry.storage.withDepthTexture(source => {
+            entry.depthGroup = device.createBindGroup({layout: pipeline.getBindGroupLayout(0),
+              entries: [{binding: 0, resource: source.createView({aspect: 'depth-only'})}]});
+          });
+        });
+      }
+      if (entry.depthSamplerKey !== samplerKey) {
+        entry.depthSampler = checked(entry, device => device.createSampler(descriptor));
+        entry.depthSamplerKey = samplerKey;
+      }
+      if (entry.depthDirty) {
+        checked(entry, device => entry.storage.withDepthTexture(() => {
+          assertCurrent(entry);
+          const encoder = device.createCommandEncoder({label: 'Source target depth UV orientation'});
+          const pass = encoder.beginRenderPass({colorAttachments: [{view: entry.depthView,
+            loadOp: 'clear', storeOp: 'store', clearValue: {r: 0, g: 0, b: 0, a: 0}}]});
+          pass.setPipeline(entry.depthPipeline); pass.setBindGroup(0, entry.depthGroup); pass.draw(3); pass.end();
+          assertCurrent(entry);
+          device.queue.submit([encoder.finish()]);
+        }));
+        entry.depthDirty = false; entry.depthCopies++;
+      }
+      assertCurrent(entry);
+      return {view: entry.depthView, sampler: entry.depthSampler,
+        sampleType: filterable ? 'float' : 'unfilterable-float', viewDimension: '2d',
+        version: texture.version, sourceVersion: texture.source.version};
+    } finally { entry.busy = false; if (!entry.alive) release(entry); }
+  }
+  // r186 assigns renderTarget on DepthTexture without setting the color-only
+  // isRenderTargetTexture flag. Never mutate source texture flags to route it.
+  const targetTexture = texture => (texture?.isRenderTargetTexture === true || texture?.isDepthTexture === true) && texture.renderTarget != null;
   // The existing scene bridge accepts a Map of externally owned bindings. Its
   // has/get calls always resolve the current target generation, so stale views
   // trigger the bridge's normal re-preparation boundary before submission.
   function bindingsFor(destination = null, retained = new Map()) {
     if (!(retained instanceof Map)) fail('OPTIONS', 'Expected a Map of borrowed texture bindings');
     return new class extends Map {
-      has(texture) { return (texture?.isRenderTargetTexture === true && texture.renderTarget != null) || retained.has(texture); }
+      has(texture) { return targetTexture(texture) || retained.has(texture); }
       get(texture) {
-        if (!(texture?.isRenderTargetTexture === true && texture.renderTarget != null)) return retained.get(texture);
-        if (texture.renderTarget === destination) fail('FEEDBACK', 'A render pass cannot sample its own color target');
+        if (!targetTexture(texture)) return retained.get(texture);
+        if (texture.renderTarget === destination) fail('FEEDBACK', 'A render pass cannot sample its own color or depth target');
         const entry = capture(texture.renderTarget);
+        if (entry.shape.depthTexture === texture) return depthSampling(entry, texture);
         if (entry.shape.texture !== texture) fail('STALE', 'Texture no longer belongs to its source target');
         return sampling(entry, texture);
       }
@@ -246,7 +355,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     render(entry, callback) {
       ensure(entry);
       if (entry.busy) fail('REENTRANT', 'Cannot reenter a target submission');
-      entry.busy = true; entry.dirty = true;
+      entry.busy = true; entry.dirty = true; entry.depthDirty = true;
       try { return entry.storage.withFrame((frame, texture) => { const result = callback(frame, texture); assertCurrent(entry); return result; }); }
       finally { entry.busy = false; if (!entry.alive) release(entry); }
     },
