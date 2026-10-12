@@ -99,7 +99,7 @@ test('allocation-free feedback/format refusals and bounded target count', () => 
   assert.throws(() => owner.bindingsFor(target).get(target.texture), {code: 'THREE_TARGET_FEEDBACK'});
   assert.equal(calls.textures.length, 0);
   owner.capture(target); assert.throws(() => owner.capture(new T.RenderTarget()), {code: 'THREE_TARGET_BUDGET'});
-  for (const mutate of [t => t.stencilBuffer = true, t => t.depthTexture = {}, t => t.samples = 2,
+  for (const mutate of [t => { t.stencilBuffer = true; t.depthBuffer = false; }, t => t.depthTexture = {}, t => t.samples = 2,
     t => t.texture.generateMipmaps = 1, t => t.texture.type = 999, t => t.textures.push(t.texture), t => t.depth = 6]) {
     const t = new T.RenderTarget(); mutate(t); assert.throws(() => inspectThreeRenderTarget(t, T), /THREE_TARGET_/);
   }

@@ -7,6 +7,8 @@
  * sampleDepth:true exposes the actual depth attachment through withDepthTexture.
  * A four-sample depth attachment stays multisampled: no depth resolve, averaging
  * or precision conversion is inferred. Consumers choose their shader sample index.
+ * Combined depth/stencil formats expose both aspects in frame.depthView. Sample
+ * depth with a depth-only view; depth32float-stencil8 requires its device feature.
  * No framebuffer emulation, CPU pixel copies, or frame loop.
  */
 export class GpuRenderTargetError extends Error {
@@ -22,7 +24,10 @@ const COLOR_BYTES = new Map([
   ['bgra8unorm', 4], ['bgra8unorm-srgb', 4], ['rgba16float', 8],
 ]);
 
-const DEPTH_BYTES = new Map([[null, 0], ['depth16unorm', 2], ['depth24plus', 4], ['depth32float', 4]]);
+// Combined formats may use eight bytes per sample on the selected backend.
+// Charge the conservative format footprint, not measured driver overhead.
+const DEPTH_BYTES = new Map([[null, 0], ['depth16unorm', 2], ['depth24plus', 4], ['depth32float', 4],
+  ['depth24plus-stencil8', 8], ['depth32float-stencil8', 8]]);
 
 // One source level per pass keeps sampled/attachment subresources disjoint.
 // sRGB textures decode before bilinear filtering and encode in the attachment.
@@ -61,6 +66,8 @@ export function createGpuRenderTarget(device, options = {}) {
     fail('OPTIONS', 'Expected a positive byte budget and string label');
   if (!device || ['createTexture', 'pushErrorScope', 'popErrorScope'].some(k => typeof device[k] !== 'function') ||
       typeof device.queue?.onSubmittedWorkDone !== 'function') fail('DEVICE', 'Expected a WebGPU device');
+  if (depthFormat === 'depth32float-stencil8' && device.features?.has?.('depth32float-stencil8') !== true)
+    fail('FEATURE', 'depth32float-stencil8 must be enabled on the supplied device');
   const limit = device.limits?.maxTextureDimension2D;
   if (!Number.isSafeInteger(limit) || limit < 1) fail('DEVICE', 'Missing texture dimension limit');
   const dimension = value => {

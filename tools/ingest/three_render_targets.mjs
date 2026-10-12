@@ -6,6 +6,8 @@
  * into the sampling pyramid. Both chains are charged, including NPOT tails.
  * Single-sample source DepthTexture attachments are sampled through a separate
  * UV-oriented r32float image: no color conversion or half-float quantization.
+ * Private stencil buffers and UnsignedInt248 DepthStencilFormat attachments
+ * retain both aspects for rendering; depth sampling selects only the depth aspect.
  * This is general WebGPU execution, not Rust specialization or a speedup claim.
  */
 import {createGpuRenderTarget} from './gpu_render_target.mjs';
@@ -28,7 +30,8 @@ export function inspectThreeRenderTarget(target, three) {
   if (!(texture instanceof three.Texture) || texture.isCubeTexture || texture.isDataArrayTexture || texture.isData3DTexture ||
       texture.renderTarget !== target || texture.isRenderTargetTexture !== true)
     fail('SOURCE', 'Expected the target-owned 2D color texture');
-  if (target.stencilBuffer) fail('UNSUPPORTED', 'Stencil targets are not admitted');
+  if (target.stencilBuffer && !target.depthBuffer)
+    fail('UNSUPPORTED', 'Source stencil targets require depthBuffer');
   if (![0, 1, 4].includes(target.samples)) fail('UNSUPPORTED', 'Target samples must be zero, one or four');
   if (target.samples === 4 && target.resolveColorBuffer === false) fail('UNSUPPORTED', 'MSAA targets must resolve their color');
   if (texture.format !== three.RGBAFormat || texture.internalFormat != null)
@@ -41,7 +44,7 @@ export function inspectThreeRenderTarget(target, three) {
   else if (texture.type === three.HalfFloatType && linear) format = 'rgba16float';
   else fail('UNSUPPORTED', 'Target color must be RGBA8 or linear RGBA16F');
   const sampleCount = target.samples === 4 ? 4 : 1, depthTexture = target.depthTexture ?? null;
-  let depthFormat = target.depthBuffer ? 'depth24plus' : null;
+  let depthFormat = target.depthBuffer ? (target.stencilBuffer ? 'depth24plus-stencil8' : 'depth24plus') : null;
   if (depthTexture !== null) {
     if (typeof three.DepthTexture !== 'function' || !(depthTexture instanceof three.DepthTexture) ||
         depthTexture.isDepthTexture !== true || depthTexture.renderTarget !== target)
@@ -49,11 +52,19 @@ export function inspectThreeRenderTarget(target, three) {
     if (!target.depthBuffer || sampleCount !== 1 || target.useArrayDepthTexture ||
         depthTexture.isArrayTexture || depthTexture.isCubeTexture || (depthTexture.image?.depth ?? 1) !== 1)
       fail('UNSUPPORTED', 'Source depth sampling requires a single-sample 2D depth attachment');
-    if (depthTexture.format !== three.DepthFormat || depthTexture.internalFormat != null ||
+    const combined = three.DepthStencilFormat !== undefined && depthTexture.format === three.DepthStencilFormat;
+    if ((!combined && depthTexture.format !== three.DepthFormat) || depthTexture.internalFormat != null ||
         depthTexture.colorSpace !== three.NoColorSpace || depthTexture.generateMipmaps !== false ||
         depthTexture.mipmaps?.length || depthTexture.flipY !== false || depthTexture.compareFunction != null)
       fail('UNSUPPORTED', 'Depth textures require ordinary non-comparison depth, no mipmaps and no color conversion');
-    if (depthTexture.type === three.UnsignedIntType) depthFormat = 'depth24plus';
+    // WebGLTextures.setupDepthTexture selects the attachment from the texture's
+    // format, not stencilBuffer: a depth-only texture has no stencil aspect,
+    // while DepthStencilFormat attaches both even with stencilBuffer:false.
+    if (combined) {
+      if (three.UnsignedInt248Type === undefined || depthTexture.type !== three.UnsignedInt248Type)
+        fail('UNSUPPORTED', 'Source depth/stencil textures require UnsignedInt248Type');
+      depthFormat = 'depth24plus-stencil8';
+    } else if (depthTexture.type === three.UnsignedIntType) depthFormat = 'depth24plus';
     else if (depthTexture.type === three.FloatType) depthFormat = 'depth32float';
     else fail('UNSUPPORTED', 'Source depth type must be UnsignedIntType or FloatType');
     // Match the ordinary sampler2D depth-read profile. Do not pretend a missing
@@ -73,7 +84,7 @@ export function inspectThreeRenderTarget(target, three) {
     colorBytes += w * h * texelBytes;
   }
   const bytes = colorBytes + (sampleCount === 4 ? baseColorBytes * 4 : 0) +
-    (depthFormat ? target.width * target.height * 4 * sampleCount : 0);
+    (depthFormat ? target.width * target.height * (depthFormat.endsWith('-stencil8') ? 8 : 4) * sampleCount : 0);
   if (!Number.isSafeInteger(bytes)) fail('BUDGET', 'Target byte size exceeds safe integer precision');
   return {width: target.width, height: target.height, format, depthFormat, sampleCount, bytes, colorBytes, texture, generateMipmaps, mipLevelCount,
     depthTexture, depthSampleBytes: depthTexture ? target.width * target.height * 4 : 0,

@@ -173,7 +173,7 @@ test('borrowed frame/texture operations reject reentry and asynchronous escape',
 test('dimensions, format, capacity and options are checked before any native allocation', () => {
   const f = fixture();
   for (const options of [{width: -1}, {height: 8193}, {width: 1.5}, {width: NaN}, {width: Infinity},
-    {format: 'bad'}, {depthFormat: 'depth24plus-stencil8'}, {sampleCount: 2}, {maxBytes: 1},
+    {format: 'bad'}, {depthFormat: 'stencil8'}, {sampleCount: 2}, {maxBytes: 1},
     {maxBytes: Infinity}, {label: 4}, {unknown: true}]) assert.throws(() => make(f, options));
   assert.equal(f.calls.textures.length, 0);
 });

@@ -125,7 +125,7 @@ test('every borrowed handle rejects reentry through the depth API', async () => 
 
 test('sampled-depth option errors are allocation-free, including suspended targets', () => {
   const f = gpuTargetMipmapFixture();
-  for (const options of [{sampleDepth: 1}, {sampleDepth: null}, {depthFormat: null}, {height: 0, depthFormat: null}, {depthFormat: 'depth24plus-stencil8'}])
+  for (const options of [{sampleDepth: 1}, {sampleDepth: null}, {depthFormat: null}, {height: 0, depthFormat: null}, {depthFormat: 'stencil8'}])
     assert.throws(() => make(f, options), /GPU_TARGET_/);
   assert.equal(f.textures.length, 0);
 });
