@@ -117,10 +117,13 @@ The returned model owns its newly created pose, scene buffers, uploaded textures
 and decoded camera/light metadata. It does not own the device, render attachments
 or caller-supplied external cameras and lighting.
 Initialization/upload failures and cooperative construction cancellation release
-all owned resources. A late ImageBitmap or scene initialization result is disposed
-before cancellation rejects. Recoverable frame errors leave resources usable;
+all owned resources. Cancellation during image decoding rejects promptly; a late
+ImageBitmap or raw decoder result is closed when it arrives, without uploading.
+Scene initialization remains cooperative: its late result is disposed before
+construction rejects. Recoverable frame errors leave resources usable;
 terminal scene/texture failures release them. Device loss immediately releases
-textures and is surfaced on the next model operation. `dispose()` is idempotent,
+textures and rejects a pending image decode; after publication it is surfaced on
+the next model operation. `dispose()` is idempotent,
 and a scene's rejection of reentrant disposal does not prematurely free textures.
 The construction signal does not automatically dispose an already returned model.
 
@@ -156,13 +159,14 @@ before image requests or GPU allocation. The CPU model factory exposes the same
 `view`, `cameras` and `lights` metadata without a GPU or render method. See
 GLTF_SCENE_VIEW.md for the transformation convention, limits and test boundaries.
 
-## Native images, sampling and mipmaps
+## Native and raw images, sampling and mipmaps
 
 `createGltfTextureResources(device, requests, readImage, options)` is also available
 from `gltf_textures.mjs`. It returns a synchronous `resolveTexture(request)` callback
-and owns its uploads until `dispose()`. It accepts a `createImageBitmap` override
-for environments providing that API explicitly; otherwise it uses the global
-native decoder. Untextured models do not need an image decoder or texture uploads.
+and owns its uploads until `dispose()`. By default it accepts a `createImageBitmap`
+override or uses the global browser decoder. An explicit `decodeImage` callback
+instead supplies raw RGBA8 for hosts without browser image APIs; see below.
+Untextured models do not need an image decoder or texture uploads.
 
 PNG IHDR and JPEG frame dimensions are checked against `maxImagePixels` and the
 device texture dimension limit **before native decoding**. All color-space copies
@@ -190,6 +194,80 @@ source backend's mip-generation algorithm, particularly for non-power-of-two siz
 GPU error scopes are popped before awaiting: no scopes are held across image,
 network or application callbacks on a shared borrowed device.
 
+### Explicit PNG/JPEG decoders for headless hosts
+
+Supply the callback as `textures.decodeImage` to the owning scene loader, or as
+`options.decodeImage` to `createGltfTextureResources`. The scene loader snapshots
+this option before its first I/O await and forwards it with the construction
+signal; no global decoder registration or browser polyfill is needed.
+
+```js
+import { loadGpuGltfAnimationScene } from './gltf_scene_loader.mjs';
+
+// decodePngOrJpegRgba is an application-owned codec adapter implementing the
+// contract below. This library does not install a PNG/JPEG codec dependency.
+const model = await loadGpuGltfAnimationScene(device, modelBytes, {
+  signal: abortController.signal,
+  textures: {
+    decodeImage: decodePngOrJpegRgba,
+    maxImagePixels: 16 * 1024 * 1024,
+    maxTextureBytes: 256 * 1024 * 1024,
+  },
+});
+```
+
+The callback receives one frozen descriptor:
+
+```js
+{
+  bytes,                 // borrowed encoded Uint8Array; do not mutate/detach
+  mimeType,              // 'image/png' or 'image/jpeg'
+  width, height,         // dimensions already checked against header/budgets
+  signal,                // aborted by caller cancellation or device loss
+  imageOrientation: 'none',
+  premultiplyAlpha: 'none',
+  colorSpaceConversion: 'none',
+}
+```
+
+Return, synchronously or asynchronously, `{width, height, data, bytesPerRow?, close?}`.
+Dimensions must be the actual decoded dimensions, matching the header. `data` must
+be RGBA8 in a fixed, unshared, attached `Uint8Array` or `Uint8ClampedArray`, including
+an offset view. RGB values remain in the file's encoded channel domain and alpha
+is straight, not premultiplied. Do not apply EXIF orientation, flip rows, convert
+RGB to linear light or perform display color management. The callback is
+responsible for honoring those flags; the adapter cannot infer transformations
+from pixel values. An explicitly reported `flipY:true`,
+`premultipliedAlpha:true`, or non-`rgba8unorm` format is rejected.
+
+`bytesPerRow` defaults to `width * 4`. Padded rows are accepted when the safe
+integer stride is at least that width and the last row fits within the byte view.
+The adapter copies only pixel bytes into a tightly packed owned snapshot, then
+calls an optional synchronous `close()` exactly once. A codec may free or overwrite
+its scratch storage during `close()`. Without `close()`, it must not reuse the
+returned storage until construction completes. Shared, resizable, detached,
+nonbyte and truncated storage is rejected before GPU allocation for that image.
+
+Raw uploads use `queue.writeTexture`, not `copyExternalImageToTexture`, and do not
+need `ImageBitmap`, `Blob`, a DOM, or a canvas. Unorm storage preserves encoded RGB
+and alpha; the same material/mipmap view rules above select sRGB versus linear
+interpretation. One source image is decoded once even when several samplers or
+both color spaces use it. Snapshot storage and codec scratch storage can coexist;
+`maxImagePixels` bounds the tight snapshot, not arbitrary codec process memory.
+
+Supplying `decodeImage` is an explicit route choice. Its errors are preserved and
+never retried with ImageBitmap; `null` or another nonfunction is not a decoder.
+Caller abort or device loss rejects a pending decode promptly and releases prior
+owned uploads. A noncooperative codec may keep working; its eventual result is
+closed and never uploaded, and a late rejection is observed. The adapter does
+not terminate the caller's workers or destroy its borrowed GPU device.
+
+A configured `textures.ktx2Loader` can coexist with `textures.decodeImage`.
+BasisU KTX2 sources still use the retained loader, never the PNG/JPEG callback;
+authored compressed mip chains are not regenerated. Both routes contribute to
+the aggregate texture budget, and a failure in either rolls back earlier uploads.
+Browser decoding remains the default when `decodeImage` is omitted.
+
 ## Staged preparation and existing APIs
 
 `prepareGltfAnimationModel(json, buffers, decodeOptions)` in `animation_model.mjs`
@@ -215,7 +293,9 @@ Run the focused host checks with:
 
 ```sh
 node --test tools/ingest/gltf_asset.test.mjs \
+  tools/ingest/gltf_image_decode.test.mjs \
   tools/ingest/gltf_textures.test.mjs \
+  tools/ingest/gltf_raw_ktx2.test.mjs \
   tools/ingest/gltf_scene_loader.test.mjs \
   tools/ingest/animation_model.test.mjs
 ```
@@ -224,5 +304,7 @@ The integration tests execute actual asset/accessor/material decoding, pose
 sampling and CPU deformation. GPU-scene construction, GPU devices and ImageBitmap
 are explicit test doubles; assertions cover upload/mipmap commands, option mapping,
 ownership and failures, not native decoding, compiled shader execution or pixels.
+Raw/BasisU tests likewise use explicit codec/queue doubles and synthetic KTX2
+containers; they verify routing, byte snapshots, budgets and lifetime contracts.
 Native browser verification was blocked by the execution environment's browser
 policy during this implementation. No GPU performance or image-parity claim is made.
