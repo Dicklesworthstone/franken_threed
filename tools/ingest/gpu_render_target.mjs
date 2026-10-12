@@ -4,6 +4,9 @@
  * before returning. generateMipmaps:true allocates a full resolved color pyramid;
  * withTexture refreshes it on the GPU after the last withFrame write, before the
  * consumer runs. Attachments always select level zero; MSAA/depth stay single-level.
+ * sampleDepth:true exposes the actual depth attachment through withDepthTexture.
+ * A four-sample depth attachment stays multisampled: no depth resolve, averaging
+ * or precision conversion is inferred. Consumers choose their shader sample index.
  * No framebuffer emulation, CPU pixel copies, or frame loop.
  */
 export class GpuRenderTargetError extends Error {
@@ -18,6 +21,8 @@ const COLOR_BYTES = new Map([
   ['rgba8unorm', 4], ['rgba8unorm-srgb', 4],
   ['bgra8unorm', 4], ['bgra8unorm-srgb', 4], ['rgba16float', 8],
 ]);
+
+const DEPTH_BYTES = new Map([[null, 0], ['depth16unorm', 2], ['depth24plus', 4], ['depth32float', 4]]);
 
 // One source level per pass keeps sampled/attachment subresources disjoint.
 // sRGB textures decode before bilinear filtering and encode in the attachment.
@@ -39,16 +44,18 @@ export function createGpuRenderTarget(device, options = {}) {
   if (!options || typeof options !== 'object' || Array.isArray(options))
     fail('OPTIONS', 'Expected render target options');
   for (const key of Object.keys(options))
-    if (!['width', 'height', 'format', 'depthFormat', 'sampleCount', 'maxBytes', 'label', 'generateMipmaps'].includes(key))
+    if (!['width', 'height', 'format', 'depthFormat', 'sampleCount', 'maxBytes', 'label', 'generateMipmaps', 'sampleDepth'].includes(key))
       fail('OPTIONS', `Unknown target option: ${key}`);
   const {
     width: initialWidth = 1, height: initialHeight = 1,
     format = 'rgba16float', depthFormat = 'depth24plus', sampleCount = 1,
-    maxBytes = 256 * 1024 * 1024, label = 'Offscreen render target', generateMipmaps = false,
+    maxBytes = 256 * 1024 * 1024, label = 'Offscreen render target', generateMipmaps = false, sampleDepth = false,
   } = options;
-  if (!COLOR_BYTES.has(format) || ![null, 'depth24plus', 'depth32float'].includes(depthFormat))
+  if (!COLOR_BYTES.has(format) || !DEPTH_BYTES.has(depthFormat))
     fail('FORMAT', 'Unsupported color or depth format');
   if (![1, 4].includes(sampleCount)) fail('SAMPLES', 'Expected one or four samples');
+  if (typeof sampleDepth !== 'boolean') fail('OPTIONS', 'sampleDepth must be boolean');
+  if (sampleDepth && depthFormat === null) fail('DEPTH', 'Sampled depth requires a depth attachment');
   if (typeof generateMipmaps !== 'boolean') fail('OPTIONS', 'generateMipmaps must be boolean');
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || typeof label !== 'string')
     fail('OPTIONS', 'Expected a positive byte budget and string label');
@@ -81,7 +88,7 @@ export function createGpuRenderTarget(device, options = {}) {
       texels += mw * mh;
     }
     const bytes = COLOR_BYTES.get(format) * (texels + (sampleCount === 4 ? base * 4 : 0)) +
-      (depthFormat === null ? 0 : base * 4 * sampleCount);
+      base * DEPTH_BYTES.get(depthFormat) * sampleCount;
     if (!Number.isSafeInteger(bytes)) fail('BUDGET', 'Target byte count exceeds safe integer precision');
     return bytes;
   };
@@ -139,7 +146,7 @@ export function createGpuRenderTarget(device, options = {}) {
         }
         if (depthFormat !== null) {
           pair.depth = device.createTexture({label: label + ' depth', size, format: depthFormat,
-            dimension: '2d', sampleCount, mipLevelCount: 1, usage: 16});
+            dimension: '2d', sampleCount, mipLevelCount: 1, usage: 16 | (sampleDepth ? 4 : 0)});
           pair.depthView = pair.depth.createView();
         }
       });
@@ -198,16 +205,17 @@ export function createGpuRenderTarget(device, options = {}) {
     retirement = Promise.all([retirement, fence]);
     retirement.catch(stop);
   }
-  function borrow(callback, render) {
+  function borrow(callback, kind) {
     exclusive();
+    if (kind === 'depth' && !sampleDepth) fail('DEPTH', 'Enable sampleDepth before borrowing the depth texture');
     if (typeof callback !== 'function') fail('CALLBACK', 'Expected a synchronous submitted-use callback');
     if (!current) return false;
     busy = true;
     try {
       current.used = true; // Even a throwing callback may have submitted work.
-      if (render) current.mipsDirty = true;
-      else refreshMips(current);
-      const result = render ? callback(current.frame, current.color) : callback(current.color);
+      if (kind === 'frame') current.mipsDirty = true;
+      else if (kind === 'color') refreshMips(current);
+      const result = kind === 'frame' ? callback(current.frame, current.color) : callback(kind === 'depth' ? current.depth : current.color);
       if (result && typeof result.then === 'function') {
         Promise.resolve(result).catch(() => {});
         fail('ASYNC_USE', 'Submit all work before returning; borrowed textures cannot cross an await');
@@ -223,7 +231,7 @@ export function createGpuRenderTarget(device, options = {}) {
     get suspended() { return width === 0 || height === 0; },
     get version() { return version; }, get disposed() { return disposed; },
     get failed() { return terminal !== null; }, get allocatedBytes() { return allocated(); },
-    get diagnostics() { return Object.freeze({width, height, version, format, depthFormat, sampleCount,
+    get diagnostics() { return Object.freeze({width, height, version, format, depthFormat, sampleCount, sampleDepth,
       allocatedBytes: allocated(), retiredTargets: retired.size, mipLevelCount: current?.mipLevelCount ?? 0, mipGenerations}); },
     resize(w, h) {
       exclusive(); dimension(w); dimension(h);
@@ -244,8 +252,9 @@ export function createGpuRenderTarget(device, options = {}) {
       } catch (error) { destroy(replacement); stop(error); throw error; }
       finally { busy = false; if (terminal !== null) release(); }
     },
-    withFrame(callback) { return borrow(callback, true); },
-    withTexture(callback) { return borrow(callback, false); },
+    withFrame(callback) { return borrow(callback, 'frame'); },
+    withTexture(callback) { return borrow(callback, 'color'); },
+    withDepthTexture(callback) { return borrow(callback, 'depth'); },
     async whenIdle() {
       exclusive();
       try {
