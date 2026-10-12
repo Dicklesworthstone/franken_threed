@@ -6,13 +6,8 @@
  * https://gpuweb.github.io/gpuweb/#dom-gpuqueue-copyexternalimagetotexture
  */
 import { inspectGltfKtx2, transcodeGltfKtx2 } from "./gltf_ktx2.mjs";
-export class GltfTextureError extends Error {
-  constructor(code, message) {
-    super(`${code}: ${message}`);
-    this.name = "GltfTextureError";
-    this.code = code;
-  }
-}
+import { decodeGltfImage, GltfTextureError } from "./gltf_image_decode.mjs";
+export { GltfTextureError } from "./gltf_image_decode.mjs";
 const fail = (code, message) => {
   throw new GltfTextureError("GLTF_TEXTURE_" + code, message);
 };
@@ -112,14 +107,18 @@ const mipShader = `
  * KTX2 uploads keep all authored mip levels, even a partial pyramid; sampling
  * cannot access levels outside the texture. No compressed mip is regenerated.
  * No ImageBitmap or external-image-copy API is needed for KTX2-only requests.
- * Native decode is cooperative: cancellation closes any eventual ImageBitmap.
+ * decodeImage optionally supplies DOM-free, straight-alpha RGBA8 pixels; see
+ * decodeGltfImage for its bounded row-storage and no-conversion contract.
+ * Without it, createImageBitmap remains the browser default. Both routes reject
+ * promptly on cancellation/device loss and close eventual native results.
  */
 export async function createGltfTextureResources(
   device,
   requests,
   readImage,
   {
-    createImageBitmap: decodeImage = globalThis.createImageBitmap,
+    createImageBitmap: createBitmap = globalThis.createImageBitmap,
+    decodeImage,
     ktx2Loader = null,
     signal,
     maxTextureBytes = 256 * 1024 * 1024,
@@ -197,7 +196,7 @@ export async function createGltfTextureResources(
   let disposed = false,
     terminal = null,
     textureBytes = 0,
-    transcodeCancel = null;
+    decodeCancel = null;
   function release() {
     for (const texture of owned) texture.destroy();
     owned.clear();
@@ -229,12 +228,12 @@ export async function createGltfTextureResources(
             info?.message ?? "WebGPU device lost",
           );
           release();
-          transcodeCancel?.abort(terminal);
+          decodeCancel?.abort(terminal);
         },
         (error) => {
           terminal = error;
           release();
-          transcodeCancel?.abort(error);
+          decodeCancel?.abort(error);
         },
       );
   }
@@ -302,7 +301,7 @@ export async function createGltfTextureResources(
     // callback adapter. This does not terminate the borrowed loader or workers;
     // the adapter closes a late native result after rejecting construction.
     const controller = new AbortController();
-    transcodeCancel = controller;
+    decodeCancel = controller;
     const cancel = () => controller.abort(signal.reason);
     signal?.addEventListener("abort", cancel, { once: true });
     let decoded;
@@ -317,7 +316,7 @@ export async function createGltfTextureResources(
       });
     } finally {
       signal?.removeEventListener("abort", cancel);
-      transcodeCancel = null;
+      decodeCancel = null;
     }
     live();
     if (decoded.byteLength > maxTextureBytes - textureBytes)
@@ -359,11 +358,15 @@ export async function createGltfTextureResources(
         await uploadKtx2(image, imageIndex, groups);
         continue;
       }
-      if (
-        typeof decodeImage !== "function" ||
+      if (decodeImage !== undefined) {
+        if (typeof decodeImage !== "function" || typeof device.queue.writeTexture !== "function")
+          fail("DEVICE", "Raw PNG/JPEG uploads require decodeImage and queue.writeTexture");
+      } else if (
+        typeof createBitmap !== "function" ||
         typeof device.queue.copyExternalImageToTexture !== "function"
-      )
+      ) {
         fail("DEVICE", "PNG/JPEG uploads require ImageBitmap and external image copy");
+      }
       const { width, height } = gltfImageDimensions(image?.bytes, image?.mimeType);
       if (
         width > device.limits.maxTextureDimension2D ||
@@ -386,20 +389,23 @@ export async function createGltfTextureResources(
           fail("LIMIT", "Texture mip storage exceeds byte budget");
         textureBytes += bytes;
       }
-      const bitmap = await decodeImage(new Blob([image.bytes], { type: image.mimeType }), {
-        imageOrientation: "none",
-        premultiplyAlpha: "none",
-        colorSpaceConversion: "none",
-      });
+      const controller = new AbortController();
+      decodeCancel = controller;
+      const cancel = () => controller.abort(signal.reason);
+      signal?.addEventListener("abort", cancel, { once: true });
+      let decoded;
       try {
         live();
-        if (
-          !bitmap ||
-          bitmap.width !== width ||
-          bitmap.height !== height ||
-          typeof bitmap.close !== "function"
-        )
-          fail("IMAGE", "Decoded image dimensions disagree with header");
+        decoded = await decodeGltfImage(image, {
+          width, height, decodeImage, createImageBitmap: createBitmap, maxImagePixels,
+          signal: controller.signal,
+        });
+      } finally {
+        signal?.removeEventListener("abort", cancel);
+        decodeCancel = null;
+      }
+      try {
+        live();
         for (const [colorSpace, group] of groups) {
           const format = colorSpace === "srgb" ? "rgba8unorm-srgb" : "rgba8unorm";
           const mipPipeline = group.levels > 1 ? await pipeline(format) : null;
@@ -415,11 +421,20 @@ export async function createGltfTextureResources(
               usage: 2 | 4 | 16,
             });
             owned.add(texture);
-            device.queue.copyExternalImageToTexture(
-              { source: bitmap, flipY: false },
-              { texture, colorSpace: "srgb", premultipliedAlpha: false },
-              [width, height],
-            );
+            if (decoded.data) {
+              // writeTexture accepts tightly packed rows (no 256-byte padding).
+              // Encoded RGB/alpha bytes are copied without transfer conversion;
+              // the material and mip views apply the selected transfer function.
+              device.queue.writeTexture(
+                { texture }, decoded.data, { bytesPerRow: width * 4 }, [width, height, 1],
+              );
+            } else {
+              device.queue.copyExternalImageToTexture(
+                { source: decoded.bitmap, flipY: false },
+                { texture, colorSpace: "srgb", premultipliedAlpha: false },
+                [width, height],
+              );
+            }
             if (mipPipeline) {
               const encoder = device.createCommandEncoder({ label: "glTF mip chain" }),
                 sampler = device.createSampler({ minFilter: "linear", magFilter: "linear" });
@@ -457,7 +472,7 @@ export async function createGltfTextureResources(
           });
         }
       } finally {
-        if (bitmap && typeof bitmap.close === "function") bitmap.close();
+        decoded.close();
       }
     }
     if (entries.size) await device.queue.onSubmittedWorkDone();

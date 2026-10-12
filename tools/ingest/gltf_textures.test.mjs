@@ -434,3 +434,172 @@ test("only prepared texture identities resolve and image decoding runs outside G
   assert.throws(() => r.resolveTexture(request(0, 99)), { code: "GLTF_TEXTURE_REQUEST" });
   r.dispose();
 });
+
+function rawGpu(settings) {
+  const g = gpu(settings), writes = [];
+  // Model a Node WebGPU implementation without external image sources.
+  g.device.queue.copyExternalImageToTexture = undefined;
+  g.device.queue.writeTexture = (destination, data, layout, size) => {
+    assert.equal(g.scopes.length, 2);
+    writes.push({ destination, data: data.slice(), layout, size });
+  };
+  return { ...g, writes };
+}
+const rgba = () => ({ width: 2, height: 2,
+  data: Uint8Array.of(255, 0, 0, 128, 0, 255, 0, 255, 0, 0, 255, 0, 255, 255, 255, 64) });
+const turn = () => new Promise((resolve) => setImmediate(resolve));
+const deferred = () => {
+  let resolve, reject;
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+};
+
+test("raw PNG/JPEG upload works without browser APIs and preserves encoded RGBA", async () => {
+  for (const [bytes, mimeType] of [[png, "image/png"], [jpeg, "image/jpeg"]]) {
+    const g = rawGpu();
+    let closes = 0;
+    const r = await createGltfTextureResources(g.device, [request()], async () => ({ bytes, mimeType }), {
+      createImageBitmap: null,
+      decodeImage(input) {
+        assert.equal(input.bytes, bytes);
+        assert.equal(input.mimeType, mimeType);
+        assert.equal(input.width, 2);
+        assert.equal(input.height, 2);
+        assert.equal(input.imageOrientation, "none");
+        assert.equal(input.premultiplyAlpha, "none");
+        assert.equal(input.colorSpaceConversion, "none");
+        assert.deepEqual(g.scopes, []);
+        return { ...rgba(), close() { closes++; } };
+      },
+    });
+    assert.equal(g.copies.length, 0);
+    assert.equal(g.writes.length, 1);
+    assert.deepEqual(g.writes[0].data, rgba().data);
+    assert.deepEqual(g.writes[0].layout, { bytesPerRow: 8 });
+    assert.deepEqual(g.writes[0].size, [2, 2, 1]);
+    assert.equal(g.writes[0].destination.texture, g.textures[0]);
+    assert.equal(r.textureBytes, 20);
+    assert.equal(g.passes.length, 1);
+    assert.equal(closes, 1);
+    r.dispose();
+    assert.equal(g.textures[0].destroyed, 1);
+  }
+});
+
+test("raw decoding snapshots padded rows once for separate sRGB and linear mip domains", async () => {
+  const g = rawGpu(), a = request(), b = request(0, 0, "linear");
+  let calls = 0, reads = 0;
+  const storage = new Uint8ClampedArray(28).fill(99), data = storage.subarray(4);
+  data.set(rgba().data.subarray(0, 8), 0);
+  data.set(rgba().data.subarray(8), 12);
+  const r = await createGltfTextureResources(g.device, [a, b, a], async () => {
+    reads++;
+    return readImage();
+  }, {
+    decodeImage() {
+      calls++;
+      return { width: 2, height: 2, data, bytesPerRow: 12, close() { storage.fill(0); } };
+    },
+  });
+  assert.equal(calls, 1);
+  assert.equal(reads, 1);
+  assert.equal(g.writes.length, 2);
+  for (const write of g.writes) assert.deepEqual(write.data, rgba().data);
+  assert.equal(r.textureBytes, 40);
+  assert.notEqual(r.resolveTexture(a).view, r.resolveTexture(b).view);
+  assert.deepEqual(g.pipelines.map((p) => p.descriptor.fragment.targets[0].format),
+    ["rgba8unorm-srgb", "rgba8unorm"]);
+  r.dispose();
+});
+
+test("raw route validates budgets, capabilities and output before allocating", async () => {
+  for (const options of [{ maxImagePixels: 3 }, { maxTextureBytes: 39 }]) {
+    const g = rawGpu();
+    await assert.rejects(createGltfTextureResources(g.device,
+      [request(), request(0, 0, "linear")], readImage, {
+        ...options, decodeImage() { assert.fail("Must not decode over budget"); },
+      }), { code: "GLTF_TEXTURE_LIMIT" });
+    assert.equal(g.textures.length, 0);
+  }
+  const g = gpu(); // No writeTexture, despite available external image copying.
+  await assert.rejects(createGltfTextureResources(g.device, [request()], readImage, {
+    decodeImage() { assert.fail("Must validate upload capability first"); },
+  }), { code: "GLTF_TEXTURE_DEVICE" });
+  for (const result of [{ ...rgba(), width: 3 }, { ...rgba(), data: new Uint8Array(15) }]) {
+    const g = rawGpu();
+    let closes = 0;
+    await assert.rejects(createGltfTextureResources(g.device, [request()], readImage, {
+      decodeImage: () => ({ ...result, close() { closes++; } }),
+    }), { code: "GLTF_TEXTURE_IMAGE" });
+    assert.equal(closes, 1);
+    assert.equal(g.textures.length, 0);
+    assert.equal(g.writes.length, 0);
+  }
+});
+
+test("raw decode failures remain authoritative and roll back earlier images", async () => {
+  const g = rawGpu(), failure = new Error("explicit codec failed");
+  let calls = 0, closes = 0;
+  await assert.rejects(createGltfTextureResources(g.device, [request(), request(1, 1)], readImage, {
+    createImageBitmap() { assert.fail("No silent browser fallback"); },
+    decodeImage() {
+      if (++calls === 2) throw failure;
+      return { ...rgba(), close() { closes++; } };
+    },
+  }), (error) => error === failure);
+  assert.equal(closes, 1);
+  assert.equal(g.textures.length, 1);
+  assert.equal(g.textures[0].destroyed, 1);
+  assert.deepEqual(g.scopes, []);
+});
+
+test("raw GPU validation, write failures and queue rejection roll back the upload", async () => {
+  for (const stage of ["validation", "write", "queue"]) {
+    const g = rawGpu(stage === "validation" ? { errorAt: 3 } : {});
+    if (stage === "write") g.device.queue.writeTexture = () => { throw new Error("write failure"); };
+    if (stage === "queue") g.device.queue.onSubmittedWorkDone = () => Promise.reject(new Error("queue failure"));
+    let closes = 0;
+    await assert.rejects(createGltfTextureResources(g.device, [request()], readImage, {
+      decodeImage: () => ({ ...rgba(), close() { closes++; } }),
+    }));
+    assert.equal(g.textures.length, 1);
+    assert.equal(g.textures[0].destroyed, 1);
+    assert.equal(closes, 1);
+    assert.deepEqual(g.scopes, []);
+  }
+});
+
+for (const browser of [false, true]) {
+  for (const loss of [false, true]) {
+    test(`${browser ? "bitmap" : "raw"} decode rejects promptly on ${loss ? "device loss" : "abort"} and closes late results`,
+      { timeout: 2000 }, async () => {
+        const g = browser ? gpu() : rawGpu(), pending = deferred(), started = deferred();
+        const controller = new AbortController(), reason = new Error("cancel image loading");
+        let calls = 0, closes = 0, decoderSignal;
+        const decode = (input) => {
+          if (++calls === 1) return { ...rgba(), close() { closes++; } };
+          decoderSignal = input.signal;
+          started.resolve();
+          return pending.promise;
+        };
+        const load = createGltfTextureResources(g.device, [request(), request(1, 1)], readImage, {
+          signal: controller.signal,
+          ...(browser ? { createImageBitmap: decode } : { decodeImage: decode }),
+        });
+        await started.promise;
+        assert.equal(g.textures.length, 1);
+        if (loss) g.lose({ message: "device went away" });
+        else controller.abort(reason);
+        // Deliberately keep decoder unresolved until public load has rejected.
+        await assert.rejects(load, loss ? { code: "GLTF_TEXTURE_DEVICE_LOST" } : (error) => error === reason);
+        if (!browser) assert.equal(decoderSignal.aborted, true);
+        assert.equal(g.textures[0].destroyed, 1);
+        assert.equal(closes, 1);
+        pending.resolve({ ...rgba(), close() { closes++; } });
+        await turn();
+        assert.equal(closes, 2);
+        assert.equal(g.textures.length, 1);
+        assert.deepEqual(g.scopes, []);
+      });
+  }
+}
