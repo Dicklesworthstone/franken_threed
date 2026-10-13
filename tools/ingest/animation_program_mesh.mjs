@@ -21,6 +21,7 @@
  */
 import {programGeometrySnapshot} from './gpu_buffer_geometry.mjs';
 import {createAnimationColorTargetProfile} from './animation_color_target.mjs';
+import {hasAnimationStencil, snapshotAnimationRaster} from './animation_raster.mjs';
 
 const VERTEX = 1, FRAGMENT = 2;
 const UNIFORM_USAGE = 64 | 8; // UNIFORM | COPY_DST
@@ -48,6 +49,13 @@ export function createProgramMeshes({device, format, depthFormat, sampleCount, m
     if (reflection.outputs.length > 1 || (reflection.outputs[0] && reflection.outputs[0].location !== 0))
       fail('ANIMATION_RENDER_OPTIONS', 'Multiple program outputs need multiple render targets');
     colorTarget.assertBlend(raster?.blend);
+    // GL stencil testing has no effect without a stencil attachment. Otherwise
+    // capture both faces, masks and reference before geometry work or awaiting
+    // pipelines; caller mutations cannot change this registration's state.
+    const {stencil, stencilReference} = snapshotAnimationRaster(
+      hasAnimationStencil(depthFormat) && raster?.stencil != null
+        ? {stencil: raster.stencil, stencilReference: raster.stencilReference}
+        : {}, {format, depthFormat});
     const geometry = programGeometrySnapshot(gpu, device);
     const points = reflection.points === true;
     if (points && topology !== 'points') fail('ANIMATION_RENDER_OPTIONS', 'Point programs draw point primitives');
@@ -83,7 +91,7 @@ export function createProgramMeshes({device, format, depthFormat, sampleCount, m
         primitive: {topology: primitiveTopology, cullMode: raster.cullMode, frontFace,
           ...(primitiveTopology === 'line-strip' && stripIndexFormat ? {stripIndexFormat} : {})},
         ...(depthFormat ? {depthStencil: {format: depthFormat, depthWriteEnabled: raster.depthWriteEnabled, depthCompare: raster.depthCompare,
-          depthBias: raster.depthBias ?? 0, depthBiasSlopeScale: raster.depthBiasSlopeScale ?? 0}} : {}),
+          depthBias: raster.depthBias ?? 0, depthBiasSlopeScale: raster.depthBiasSlopeScale ?? 0, ...stencil}} : {}),
         multisample: {count: sampleCount, alphaToCoverageEnabled: raster.alphaToCoverage === true && sampleCount > 1 && format !== null}});
       const ready = Promise.all([pipeline(raster.frontFace), pipeline(raster.frontFace === 'ccw' ? 'cw' : 'ccw')]);
       ready.catch(() => {});
@@ -94,7 +102,7 @@ export function createProgramMeshes({device, format, depthFormat, sampleCount, m
       program: true, gpu, reflection, uniformGroup: allocated.value.uniformGroup, textureGroup: allocated.value.textureGroup,
       pipelines: {normal: pipelines[0], flipped: pipelines[1]}, geometrySignature: geometry.signature,
       points, provoking,
-      blended: !!raster.blend, alphaMode: raster.blend ? 'BLEND' : 'OPAQUE', blendConstant: raster.blendConstant ?? null,
+      blended: !!raster.blend, alphaMode: raster.blend ? 'BLEND' : 'OPAQUE', blendConstant: raster.blendConstant ?? null, stencilReference,
       surfaceBuffer: null, lit: false, raster: {}, disposed: false,
     };
   }
@@ -118,7 +126,7 @@ export function createProgramMeshes({device, format, depthFormat, sampleCount, m
       Object.assign(command, {record, first: 0, count: 6, firstInstance: first, pointCount: Math.max(0, end - first),
         pipeline: input.frontFaceCW ? record.pipelines.flipped : record.pipelines.normal, program: {group: record.uniformGroup, offset},
         vertexBuffers: [...geometry.vertexBuffers, ...geometry.channels.missing.map(() => constant)], indexBuffer: null, indexFormat: null,
-        instanceCount: Math.max(0, end - first), instanceBindGroup: null, blendConstant: record.blendConstant, stencilReference: null});
+        instanceCount: Math.max(0, end - first), instanceBindGroup: null, blendConstant: record.blendConstant, stencilReference: record.stencilReference});
       return geometry;
     }
     const rotated = record.provoking ? provokingIndices(record, geometry, first, end) : null;
@@ -129,7 +137,7 @@ export function createProgramMeshes({device, format, depthFormat, sampleCount, m
       vertexBuffers: [...geometry.vertexBuffers, ...geometry.channels.missing.map(() => constant)],
       indexBuffer: rotated ?? geometry.indexBuffer, indexFormat: rotated ? 'uint32' : geometry.indexFormat,
       instanceCount, firstInstance: 0, instanceBindGroup: null,
-      blendConstant: record.blendConstant, stencilReference: null,
+      blendConstant: record.blendConstant, stencilReference: record.stencilReference,
     });
     return geometry;
   }
