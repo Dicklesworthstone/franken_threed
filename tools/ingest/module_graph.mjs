@@ -199,9 +199,22 @@ export async function buildModuleGraph(entryPath, options = {}) {
     // Run AST analysis
     const analysis = analyzeModuleAst(sourceCode, moduleId, item.offsets || {});
 
-    // Resolve static imports
+    // Every source-bearing export is also a static module request. Keep it in
+    // the same edge list used by route analysis, closure propagation and cycle
+    // discovery, without inventing a local binding for a reexport.
+    const staticRequests = [
+      ...analysis.staticImports,
+      ...analysis.staticExports
+        .filter(exp => typeof exp.specifier === "string")
+        .map(exp => ({
+          specifier: exp.specifier,
+          sourceSpan: exp.sourceSpan,
+          imported_bindings: [],
+          reexport: exp,
+        })),
+    ].sort((a, b) => a.sourceSpan.start.offset - b.sourceSpan.start.offset);
     const resolvedStaticImports = [];
-    for (const imp of analysis.staticImports) {
+    for (const imp of staticRequests) {
       const resolvedTarget = resolveModuleSpecifier(imp.specifier, moduleId, importMap, {
         mapBaseUrl,
         packageRootUrl: options.packageRootUrl,
@@ -212,8 +225,13 @@ export async function buildModuleGraph(entryPath, options = {}) {
         specifier: imp.specifier,
         resolved_id: resolvedTarget,
         source_span: imp.sourceSpan,
-        imported_bindings: imp.importedBindings,
+        imported_bindings: imp.imported_bindings ?? imp.importedBindings ?? [],
+        ...(imp.reexport ? { is_reexport: true } : {}),
       });
+      if (imp.reexport) {
+        imp.reexport.resolved_id = resolvedTarget;
+        imp.reexport.resolvedId = resolvedTarget;
+      }
 
       // Queue target if not already visited
       if (!modules.has(resolvedTarget)) {
