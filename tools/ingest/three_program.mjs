@@ -25,6 +25,7 @@ import {compileEsslProgram} from './essl_wgsl.mjs';
 import {SHADER_IDS, webglParameters, webglProgramSources, webglLights, webglMaterialUniforms, refreshWebGLMaterialUniforms, materialNeedsLights} from './three_webgl_program.mjs';
 import {createGpuProgramGeometry, programGeometrySnapshot} from './gpu_buffer_geometry.mjs';
 import {animationDfgHalves} from './animation_dfg.mjs';
+import {threeProgramStencil} from './three_program_stencil.mjs';
 
 export class ThreeProgramError extends Error {
   constructor(code, message) { super(`THREE_PROGRAM_${code}: ${message}`); this.name = 'ThreeProgramError'; this.code = 'THREE_PROGRAM_' + code; }
@@ -38,7 +39,6 @@ export function inspectThreeProgram(T, material, object) {
   if (material.isShaderMaterial && (typeof material.vertexShader !== 'string' || typeof material.fragmentShader !== 'string')) fail('SOURCE', 'Program sources must be strings');
   if (object.isSkinnedMesh && !(object.skeleton instanceof T.Skeleton)) fail('OBJECT', 'Skinned program objects need their skeleton');
   if (material.extensions?.clipCullDistance || material.extensions?.multiDraw) fail('EXTENSION', 'Program extensions are not admitted');
-  if (material.stencilWrite) fail('MATERIAL', 'Stencil programs are not admitted yet');
 }
 
 /** The exact GLSL r186 WebGLProgram builds for (material, object) in this context.
@@ -111,6 +111,7 @@ export function threeProgramRaster(T, m, {frontFaceCW = false, topology = 'trian
   if (frontFaceCW) flip = !flip;
   const triangles = topology === 'triangles';
   return {
+    ...threeProgramStencil(T, m, fail),
     blend, blendConstant, writeMask: m.colorWrite ? 0xf : 0,
     depthCompare: m.depthTest ? DEPTH[m.depthFunc] : 'always', depthWriteEnabled: m.depthTest ? m.depthWrite : m.depthWrite,
     cullMode: side === T.DoubleSide || !triangles ? 'none' : 'back', frontFace: flip ? 'cw' : 'ccw',
