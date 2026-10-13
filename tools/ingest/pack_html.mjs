@@ -399,10 +399,16 @@ export function packHtml(
   // Workers have their own module map, NOT the document's import map. Resolve
   // their static graph to absolute data module URLs before creating a same-origin
   // Blob entry. Native Worker owns messaging, transferable storage and lifetime.
-  function workerModuleFor(url) {
-    if (workerActive.has(url))
+  function moduleMime(url) {
+    const mime = MIME[path.extname(new URL(url).pathname).toLowerCase()];
+    if (!mime) fail("MODULE_MIME", `Module needs a known emitted MIME suffix: ${url}`);
+    return mime;
+  }
+  function workerModuleFor(url, kind = "javascript") {
+    const key = JSON.stringify([kind, url]);
+    if (workerActive.has(key))
       fail("WORKER_MODULE_CYCLE", "Bundle cyclic worker modules before single-file export");
-    if (workerModules.has(url)) return workerModules.get(url);
+    if (workerModules.has(key)) return workerModules.get(key);
     if (
       workerModules.size + workerClassics.size + modules.size >= maxFiles ||
       workerActive.size >= 64
@@ -410,29 +416,25 @@ export function packHtml(
       fail("PACK_LIMIT", "Worker graph exceeds the identity/depth limit");
     if (url.startsWith("data:"))
       fail("DATA_MODULE", "Pre-encoded worker module sources require the normal build");
-    workerActive.add(url);
+    workerActive.add(key);
     const original = read(url),
-      record = { source: null, data: null };
-    workerModules.set(url, record);
+      record = { source: null, data: null, mime: moduleMime(url) };
+    workerModules.set(key, record);
     try {
-      const json = path.extname(new URL(url).pathname).toLowerCase() === ".json";
-      if (json) {
-        record.source = text(original);
-        try {
-          JSON.parse(record.source);
-        } catch {
-          fail("JSON_MODULE", "Invalid worker JSON module");
-        }
-      } else record.source = javascript(text(original), url, "module", true);
+      // Requested type and response MIME are separate. Never turn a missing
+      // JSON attribute or a JSON import of JavaScript into a successful load.
+      // JSON and MIME-mismatched resources retain exact bytes and native errors.
+      record.source = kind === "javascript" && JS_TYPES.has(record.mime)
+        ? javascript(text(original), url, "module", true) : original;
       record.data =
-        dataUrl(record.source, json ? "application/json" : "text/javascript") +
+        dataUrl(record.source, record.mime) +
         "#" +
-        keyFor(url).slice(11);
+        keyFor(url).slice(11) + ":" + kind;
       if (Buffer.byteLength(record.data) > maxBytes)
         fail("PACK_LIMIT", "Encoded worker module exceeds packing limit");
       return record;
     } finally {
-      workerActive.delete(url);
+      workerActive.delete(key);
     }
   }
   function workerClassicFor(url, entryUrl) {
@@ -468,6 +470,8 @@ export function packHtml(
     const key = kind + ":" + url;
     if (workers.has(key)) return workers.get(key);
     const entry = kind === "classic" ? workerClassicFor(url, url) : workerModuleFor(url);
+    if (typeof entry.source !== "string")
+      fail("WORKER_MIME", "Module worker entry requires JavaScript MIME");
     // One cached URL per worker entry per creating realm, not one allocation per
     // constructor call. Do not revoke on terminate or pagehide: another worker,
     // a later invocation, or bfcache restoration may still need the same entry.
@@ -505,6 +509,38 @@ export function packHtml(
           ? node.quasis[0].value.cooked
           : null;
     const add = (node, value) => replacements.push({ start: node.start, end: node.end, value });
+    const result = (node) => {
+      let depth = 0;
+      while (node?.type === "SequenceExpression") {
+        if (++depth > 64) fail("IMPORT_ATTRIBUTES", `${from}: attribute analysis exceeds its bound`);
+        node = node.expressions.at(-1);
+      }
+      return node;
+    };
+    function importKind(node) {
+      const invalid = () => fail("IMPORT_ATTRIBUTES", `${from}: imports need a statically known plain type dictionary`);
+      function dictionary(value) {
+        value = result(value);
+        if (value?.type !== "ObjectExpression" || value.properties.some((p) =>
+          p.type !== "Property" || p.computed || p.method || p.kind !== "init" ||
+          (p.key.name ?? p.key.value) === "__proto__")) invalid();
+        return value.properties;
+      }
+      let attributes = node.attributes ?? [];
+      if (node.type === "ImportExpression") {
+        if (!node.options) return "javascript";
+        const options = dictionary(node.options);
+        const maps = options.filter((p) => (p.key.name ?? p.key.value) === "with");
+        if (maps.length > 1) invalid();
+        attributes = maps.length ? dictionary(maps[0].value) : [];
+      }
+      const types = attributes.filter((p) => (p.key.name ?? p.key.value) === "type");
+      if (!types.length) return "javascript";
+      if (types.length !== 1 || literal(result(types[0].value)) !== "json") invalid();
+      // All original options/attribute expressions remain, including side
+      // effects and unsupported extra keys that the native importer rejects.
+      return "json";
+    }
     function bind(node) {
       if (!node) return;
       if (node.type === "Identifier") bindings.add(node.name);
@@ -589,29 +625,51 @@ export function packHtml(
       workerURLs.add(argument);
       add(argument, `${name}()`);
     }
-    const importTarget = (value) => {
-      if (!worker) return moduleFor(resolveModule(value, from)).key;
+    const importTarget = (value, kind, urlSemantics) => {
+      if (!worker) {
+        const record = moduleFor(urlSemantics ? local(value, from) : resolveModule(value, from), null, kind);
+        // A URL constructor needs an absolute alias, not a bare map key. The
+        // map resolves it after traversal, so document cycles still close.
+        return urlSemantics ? (record.urlKey ??= "f3d-packed:" + record.key.slice(11)) : record.key;
+      }
       // A page's import map must not give a bare worker import invented meaning.
-      if (!/^(\.?\.?\/|[a-z][\w+.-]*:)/i.test(value))
+      if (!urlSemantics && !/^(\.?\.?\/|[a-z][\w+.-]*:)/i.test(value))
         fail("WORKER_IMPORT", "Bare worker imports must be bundled before export");
-      return workerModuleFor(local(value, from)).data;
+      return workerModuleFor(local(value, from), kind).data;
     };
-    function importSource(node) {
+    function importSource(node, kind, urlSemantics = false, depth = 0) {
+      if (depth > 64) fail("DYNAMIC_IMPORT_OPEN", `${from}: import analysis exceeds its bound`);
       const value = literal(node);
       if (value !== null) {
-        add(node, JSON.stringify(importTarget(value)));
+        add(node, JSON.stringify(importTarget(value, kind, urlSemantics)));
+        return;
+      }
+      if (node.type === "SequenceExpression") {
+        importSource(node.expressions.at(-1), kind, urlSemantics, depth + 1);
         return;
       }
       if (node.type === "ConditionalExpression") {
-        importSource(node.consequent);
-        importSource(node.alternate);
+        importSource(node.consequent, kind, urlSemantics, depth + 1);
+        importSource(node.alternate, kind, urlSemantics, depth + 1);
+        return;
+      }
+      if (node.type === "NewExpression" && node.callee.type === "Identifier" && node.callee.name === "URL") {
+        const [ref, base] = node.arguments;
+        if (bindings.has("URL") || node.arguments.length !== 2 ||
+            base?.type !== "MemberExpression" || base.computed ||
+            base.object.type !== "MetaProperty" || base.property.name !== "url")
+          fail("IMPORT_URL", `${from}: imports need an unshadowed module-relative URL`);
+        allowedMeta.add(base.object);
+        // Rewrite result leaves to absolute data URLs (workers) or absolute
+        // map aliases (documents), retaining construction and selector effects.
+        importSource(ref, kind, true, depth + 1);
         return;
       }
       const targets = [...finiteImports(node)];
       const chain = targets
         .map(
           (target) =>
-            `v === ${JSON.stringify(target)} ? ${JSON.stringify(importTarget(target))} : `,
+            `v === ${JSON.stringify(target)} ? ${JSON.stringify(importTarget(target, kind, urlSemantics))} : `,
         )
         .join("");
       // Insert wrappers rather than replace the expression: nested imports in
@@ -619,18 +677,30 @@ export function packHtml(
       replacements.push({ start: node.start, end: node.start, value: `((v) => ${chain}v)(` });
       replacements.push({ start: node.end, end: node.end, value: ")" });
     }
+    // Mark executable URL operands before bottom-up traversal can mistake them
+    // for ordinary binary assets. Do not mark URLs in selector side effects.
+    function markImportURLs(node, depth = 0) {
+      if (depth > 64) fail("DYNAMIC_IMPORT_OPEN", `${from}: import analysis exceeds its bound`);
+      if (node.type === "NewExpression" && node.callee.name === "URL") workerURLs.add(node);
+      else if (node.type === "SequenceExpression") markImportURLs(node.expressions.at(-1), depth + 1);
+      else if (node.type === "ConditionalExpression") {
+        markImportURLs(node.consequent, depth + 1);
+        markImportURLs(node.alternate, depth + 1);
+      }
+    }
+    walk.simple(ast, { ImportExpression(node) { markImportURLs(node.source); } });
     walk.simple(ast, {
       ImportDeclaration(node) {
-        importSource(node.source);
+        importSource(node.source, importKind(node));
       },
       ExportNamedDeclaration(node) {
-        if (node.source) importSource(node.source);
+        if (node.source) importSource(node.source, importKind(node));
       },
       ExportAllDeclaration(node) {
-        importSource(node.source);
+        importSource(node.source, importKind(node));
       },
       ImportExpression(node) {
-        importSource(node.source);
+        importSource(node.source, importKind(node));
       },
       NewExpression(node) {
         if (workerURLs.has(node) || workerSites.includes(node)) return;
@@ -741,29 +811,24 @@ export function packHtml(
     }
     return edits(source, replacements);
   }
-  function moduleFor(url, inline = null) {
-    if (modules.has(url)) return modules.get(url);
+  function moduleFor(url, inline = null, kind = "javascript") {
+    const identity = JSON.stringify([kind, url]);
+    if (modules.has(identity)) return modules.get(identity);
     if (modules.size >= maxFiles) fail("PACK_LIMIT", "Module identity count exceeds packing limit");
     if (url.startsWith("data:"))
       fail("DATA_MODULE", "Pre-encoded module sources require the normal build");
     const record = {
-      key: keyFor(url),
+      key: keyFor(url) + (kind === "json" ? "/json" : ""),
       source: null,
       original: inline === null ? read(url) : Buffer.from(inline),
+      mime: inline === null ? moduleMime(url) : "text/javascript",
     };
-    modules.set(url, record); // Register before traversal, so cycles close by identity.
-    const json = inline === null && path.extname(new URL(url).pathname).toLowerCase() === ".json";
-    if (json) {
-      record.source = text(record.original);
-      try {
-        JSON.parse(record.source);
-      } catch {
-        fail("JSON_MODULE", "Invalid JSON module");
-      }
-    } else record.source = javascript(text(record.original), url);
+    modules.set(identity, record); // Register before traversal, so cycles close by identity.
+    record.source = kind === "javascript" && JS_TYPES.has(record.mime)
+      ? javascript(text(record.original), url) : record.original;
     // The suffix prevents same-byte modules at different source URLs coalescing.
     record.data =
-      dataUrl(record.source, json ? "application/json" : "text/javascript") +
+      dataUrl(record.source, record.mime) +
       "#" +
       record.key.slice("f3d-packed/".length);
     return record;
@@ -949,7 +1014,8 @@ export function packHtml(
   }
   // Emit one map before executable code. All identities are now known; circular
   // modules refer to stable keys, never recursively nested data URLs.
-  const map = Object.fromEntries([...modules.values()].map((record) => [record.key, record.data]));
+  const map = Object.fromEntries([...modules.values()].flatMap((record) =>
+    [[record.key, record.data], ...(record.urlKey ? [[record.urlKey, record.data]] : [])]));
   const insertion = mapRanges.length ? Math.min(firstScript, mapRanges[0].start) : firstScript;
   if (modules.size)
     replacements.push({
