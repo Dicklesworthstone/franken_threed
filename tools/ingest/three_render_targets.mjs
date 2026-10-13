@@ -8,6 +8,10 @@
  * UV-oriented r32float image: no color conversion or half-float quantization.
  * Private stencil buffers and UnsignedInt248 DepthStencilFormat attachments
  * retain both aspects for rendering; depth sampling selects only the depth aspect.
+ * Source FloatType R/RG/RGBA attachments retain full precision through storage,
+ * UV replicas and readback. Nearest sampling needs no optional device feature;
+ * linear filtering requires float32-filterable. This owner does not extend the
+ * separate draw renderer's admitted attachment/pipeline formats.
  * This is general WebGPU execution, not Rust specialization or a speedup claim.
  */
 import {createGpuRenderTarget} from './gpu_render_target.mjs';
@@ -34,15 +38,21 @@ export function inspectThreeRenderTarget(target, three) {
     fail('UNSUPPORTED', 'Source stencil targets require depthBuffer');
   if (![0, 1, 4].includes(target.samples)) fail('UNSUPPORTED', 'Target samples must be zero, one or four');
   if (target.samples === 4 && target.resolveColorBuffer === false) fail('UNSUPPORTED', 'MSAA targets must resolve their color');
-  if (texture.format !== three.RGBAFormat || texture.internalFormat != null)
-    fail('UNSUPPORTED', 'Targets require RGBA and no internal format override');
+  const float32 = three.FloatType !== undefined && texture.type === three.FloatType;
+  const floatFormat = texture.format === three.RGBAFormat ? 'rgba32float'
+    : three.RedFormat !== undefined && texture.format === three.RedFormat ? 'r32float'
+    : three.RGFormat !== undefined && texture.format === three.RGFormat ? 'rg32float' : null;
+  if (texture.internalFormat != null || (texture.format !== three.RGBAFormat && !(float32 && floatFormat)))
+    fail('UNSUPPORTED', 'Targets require RGBA, or FloatType R/RG, with no internal format override');
   if (typeof texture.generateMipmaps !== 'boolean') fail('UNSUPPORTED', 'generateMipmaps must be boolean');
   const linear = texture.colorSpace === three.NoColorSpace || texture.colorSpace === three.LinearSRGBColorSpace;
   let format;
   if (texture.type === three.UnsignedByteType && (linear || texture.colorSpace === three.SRGBColorSpace))
     format = linear ? 'rgba8unorm' : 'rgba8unorm-srgb';
   else if (texture.type === three.HalfFloatType && linear) format = 'rgba16float';
-  else fail('UNSUPPORTED', 'Target color must be RGBA8 or linear RGBA16F');
+  else if (float32 && linear) format = floatFormat;
+  else fail('UNSUPPORTED', 'Target color must be RGBA8, linear RGBA16F or linear R/RG/RGBA32F');
+  if (float32 && target.samples === 4) fail('UNSUPPORTED', 'Float32 targets currently require zero or one source samples');
   const sampleCount = target.samples === 4 ? 4 : 1, depthTexture = target.depthTexture ?? null;
   let depthFormat = target.depthBuffer ? (target.stencilBuffer ? 'depth24plus-stencil8' : 'depth24plus') : null;
   if (depthTexture !== null) {
@@ -76,7 +86,7 @@ export function inspectThreeRenderTarget(target, three) {
   }
   const generateMipmaps = texture.generateMipmaps;
   const mipLevelCount = generateMipmaps ? 1 + Math.floor(Math.log2(Math.max(target.width, target.height))) : 1;
-  const texelBytes = format === 'rgba16float' ? 8 : 4;
+  const texelBytes = format === 'rgba32float' ? 16 : ['rgba16float', 'rg32float'].includes(format) ? 8 : 4;
   const baseColorBytes = target.width * target.height * texelBytes;
   let colorBytes = baseColorBytes, w = target.width, h = target.height;
   for (let level = 1; level < mipLevelCount; level++) {
@@ -86,7 +96,7 @@ export function inspectThreeRenderTarget(target, three) {
   const bytes = colorBytes + (sampleCount === 4 ? baseColorBytes * 4 : 0) +
     (depthFormat ? target.width * target.height * (depthFormat.endsWith('-stencil8') ? 8 : 4) * sampleCount : 0);
   if (!Number.isSafeInteger(bytes)) fail('BUDGET', 'Target byte size exceeds safe integer precision');
-  return {width: target.width, height: target.height, format, depthFormat, sampleCount, bytes, colorBytes, texture, generateMipmaps, mipLevelCount,
+  return {width: target.width, height: target.height, format, depthFormat, sampleCount, bytes, colorBytes, texture, generateMipmaps, mipLevelCount, float32,
     depthTexture, depthSampleBytes: depthTexture ? target.width * target.height * 4 : 0,
     key: `${target.width}/${target.height}/${format}/${depthFormat}/${sampleCount}/${generateMipmaps}`};
 }
@@ -228,56 +238,80 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     return result;
   }
   function sampling(entry, texture) {
+    assertCurrent(entry);
+    if (entry.busy) fail('REENTRANT', 'Cannot sample color during a target submission');
+    const device = getDevice();
+    if (!device) fail('DEVICE', 'Initialize the renderer before sampling target color');
+    const filterable = !entry.shape.float32 || device.features?.has?.('float32-filterable') === true;
+    const descriptor = samplerDescriptor(texture, three, entry.shape.mipLevelCount);
+    if (!filterable) {
+      if (texture.magFilter !== three.NearestFilter ||
+          (texture.minFilter !== three.NearestFilter && texture.minFilter !== three.NearestMipmapNearestFilter))
+        fail('SAMPLER', 'Linear float32 color sampling requires the device float32-filterable feature');
+      // A non-filtering sampler must use nearest for all three filters, even
+      // when the mip filter is inactive because lodMaxClamp is zero.
+      descriptor.mipmapFilter = 'nearest'; descriptor.maxAnisotropy = 1;
+    }
+    const samplerKey = JSON.stringify(descriptor);
     ensure(entry);
-    // Validate before allocating any additional native objects.
-    const descriptor = samplerDescriptor(texture, three, entry.shape.mipLevelCount), samplerKey = JSON.stringify(descriptor);
-    if (!entry.sample) {
-      budget(entry.shape.colorBytes);
-      checked(entry, device => {
-        const {width, height, format, mipLevelCount} = entry.shape;
-        entry.sample = device.createTexture({label: 'Source target UV sampling image',
-          size: {width, height, depthOrArrayLayers: 1}, format, dimension: '2d', sampleCount: 1, mipLevelCount, usage: 4 | 16});
-        entry.charged += entry.shape.colorBytes; allocatedBytes += entry.shape.colorBytes;
-        entry.view = entry.sample.createView();
-        let pipeline = pipelines.get(format);
-        if (!pipeline) {
-          const module = device.createShaderModule({label: 'Source target UV orientation', code: FLIP_WGSL});
-          pipeline = device.createRenderPipeline({label: 'Source target UV orientation', layout: 'auto',
-            vertex: {module, entryPoint: 'vs'}, fragment: {module, entryPoint: 'fs', targets: [{format}]},
-            primitive: {topology: 'triangle-list'}});
-          pipelines.set(format, pipeline);
-        }
-        entry.pipeline = pipeline;
-        entry.storage.withTexture(source => {
-          entry.flipSteps = [];
-          for (let level = 0; level < mipLevelCount; level++) {
-            const settings = {baseMipLevel: level, mipLevelCount: 1};
-            const view = entry.sample.createView(settings);
-            const group = device.createBindGroup({layout: pipeline.getBindGroupLayout(0),
-              entries: [{binding: 0, resource: source.createView(settings)}]});
-            entry.flipSteps.push({view, group});
+    entry.busy = true;
+    try {
+      if (!entry.sample) {
+        budget(entry.shape.colorBytes);
+        checked(entry, device => {
+          const {width, height, format, mipLevelCount} = entry.shape;
+          entry.sample = device.createTexture({label: 'Source target UV sampling image',
+            size: {width, height, depthOrArrayLayers: 1}, format, dimension: '2d', sampleCount: 1, mipLevelCount, usage: 4 | 16});
+          entry.charged += entry.shape.colorBytes; allocatedBytes += entry.shape.colorBytes;
+          entry.view = entry.sample.createView();
+          let pipeline = pipelines.get(format);
+          if (!pipeline) {
+            const module = device.createShaderModule({label: 'Source target UV orientation', code: FLIP_WGSL});
+            // textureLoad does not need filtering, but an automatic layout would
+            // still infer sampleType:float and reject a feature-free float32 view.
+            const layout = entry.shape.float32 ? device.createPipelineLayout({bindGroupLayouts: [device.createBindGroupLayout({entries: [
+              {binding: 0, visibility: 2, texture: {sampleType: 'unfilterable-float', viewDimension: '2d', multisampled: false}},
+            ]})]}) : 'auto';
+            pipeline = device.createRenderPipeline({label: 'Source target UV orientation', layout,
+              vertex: {module, entryPoint: 'vs'}, fragment: {module, entryPoint: 'fs', targets: [{format}]},
+              primitive: {topology: 'triangle-list'}});
+            pipelines.set(format, pipeline);
           }
-          entry.group = entry.flipSteps[0].group;
+          entry.pipeline = pipeline;
+          entry.storage.withTexture(source => {
+            entry.flipSteps = [];
+            for (let level = 0; level < mipLevelCount; level++) {
+              const settings = {baseMipLevel: level, mipLevelCount: 1};
+              const view = entry.sample.createView(settings);
+              const group = device.createBindGroup({layout: pipeline.getBindGroupLayout(0),
+                entries: [{binding: 0, resource: source.createView(settings)}]});
+              entry.flipSteps.push({view, group});
+            }
+            entry.group = entry.flipSteps[0].group;
+          });
         });
-      });
-    }
-    if (entry.samplerKey !== samplerKey) {
-      entry.sampler = checked(entry, device => device.createSampler(descriptor));
-      entry.samplerKey = samplerKey;
-    }
-    if (entry.dirty) {
-      checked(entry, device => entry.storage.withTexture(() => {
-        const encoder = device.createCommandEncoder({label: 'Source target UV orientation'});
-        for (const {view, group} of entry.flipSteps) {
-          const pass = encoder.beginRenderPass({colorAttachments: [{view, loadOp: 'clear', storeOp: 'store', clearValue: {r: 0, g: 0, b: 0, a: 0}}]});
-          pass.setPipeline(entry.pipeline); pass.setBindGroup(0, group); pass.draw(3); pass.end();
-        }
-        device.queue.submit([encoder.finish()]);
-      }));
-      entry.dirty = false; entry.copies++;
-    }
-    return {view: entry.view, sampler: entry.sampler, sampleType: 'float', viewDimension: '2d',
-      version: texture.version, sourceVersion: texture.source.version};
+      }
+      if (entry.samplerKey !== samplerKey) {
+        entry.sampler = checked(entry, device => device.createSampler(descriptor));
+        entry.samplerKey = samplerKey;
+      }
+      if (entry.dirty) {
+        checked(entry, device => entry.storage.withTexture(() => {
+          assertCurrent(entry);
+          const encoder = device.createCommandEncoder({label: 'Source target UV orientation'});
+          for (const {view, group} of entry.flipSteps) {
+            const pass = encoder.beginRenderPass({colorAttachments: [{view, loadOp: 'clear', storeOp: 'store', clearValue: {r: 0, g: 0, b: 0, a: 0}}]});
+            pass.setPipeline(entry.pipeline); pass.setBindGroup(0, group); pass.draw(3); pass.end();
+          }
+          assertCurrent(entry);
+          device.queue.submit([encoder.finish()]);
+        }));
+        entry.dirty = false; entry.copies++;
+      }
+      assertCurrent(entry);
+      return {view: entry.view, sampler: entry.sampler, sampleType: filterable ? 'float' : 'unfilterable-float', viewDimension: '2d',
+        version: texture.version, sourceVersion: texture.source.version};
+    } finally { entry.busy = false; if (!entry.alive) release(entry); }
   }
   function depthSampling(entry, texture) {
     assertCurrent(entry);
