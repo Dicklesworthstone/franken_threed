@@ -2,10 +2,13 @@
  *
  * A program mesh owns two render pipelines (ccw/cw front faces, chosen per draw
  * from the object's determinant as WebGLRenderer does), its texture bind group
- * and a bind group over the renderer's shared program-uniform arena. Each
- * logical draw gets its own 256-byte-aligned arena slice written before the
+ * and bind groups over the renderer's bounded program-uniform pages. Each
+ * logical draw gets its own device-aligned slice written before the
  * frame's single submit, so two draws of one material in one submission never
- * share uniform bytes (the queue-write snapshot rule).
+ * share uniform bytes (the queue-write snapshot rule). Registration prepares
+ * pages for reflected block sizes, bounded by maxUniformBytes (default 64 MiB)
+ * independently for GPU storage and CPU shadows. No guessed bytes-per-draw cap
+ * or submission-time allocation is needed; earlier groups survive growth.
  *
  * Geometry comes from createGpuProgramGeometry(); locations the geometry lacks
  * read GL's constant default attribute (0, 0, 0, 1) from a stride-0 buffer.
@@ -28,34 +31,31 @@ import {createAnimationColorTargetProfile} from './animation_color_target.mjs';
 import {hasAnimationStencil, snapshotAnimationRaster} from './animation_raster.mjs';
 import {createProgramIndexLowering} from './animation_program_indices.mjs';
 import {snapshotProgramPointRuns} from './animation_program_points.mjs';
+import {createProgramUniformArena} from './animation_program_uniforms.mjs';
 
 const VERTEX = 1, FRAGMENT = 2;
-const UNIFORM_USAGE = 64 | 8; // UNIFORM | COPY_DST
-const ALIGN = 256;
 
-export function createProgramMeshes({device, format, depthFormat, sampleCount, maxDraws, label, fail, scoped, lost, maxIndexBytes = 64 * 1024 * 1024, maxPointDraws = 65536}) {
+export function createProgramMeshes({device, format, depthFormat, sampleCount, maxDraws, label, fail, scoped, lost, maxIndexBytes = 64 * 1024 * 1024, maxPointDraws = 65536, maxUniformBytes = 64 * 1024 * 1024}) {
   const colorTarget = createAnimationColorTargetProfile(device, {format, sampleCount},
     message => fail('ANIMATION_RENDER_OPTIONS', message));
   if (!Number.isSafeInteger(maxPointDraws) || maxPointDraws < 1 || maxPointDraws > 0xffffffff)
     fail('ANIMATION_RENDER_LIMIT', 'Invalid native point draw budget');
   let pointDraws = 0;
   const indices = createProgramIndexLowering(device, {label, fail, maxBytes: maxIndexBytes, maxEntries: maxDraws});
-  let arena = null, constant = null, cursor = 0;
-  function ensureArena() {
-    if (arena) return arena;
-    const size = Math.min(device.limits.maxBufferSize ?? 268435456, Math.max(65536, maxDraws * 1024));
-    const buffer = device.createBuffer({label: `${label}/program-uniforms`, size, usage: UNIFORM_USAGE});
-    arena = {buffer, size, staged: new Uint8Array(size)};
-    constant = device.createBuffer({label: `${label}/program-default-attribute`, size: 16, usage: 32 | 8, mappedAtCreation: true});
-    new Float32Array(constant.getMappedRange()).set([0, 0, 0, 1]);
-    constant.unmap();
-    return arena;
-  }
+  const uniforms = createProgramUniformArena(device, {maxDraws, label, fail, scoped, lost, maxBytes: maxUniformBytes});
+  let constant = null;
   async function add(gpu, {program, textures = [], raster, topology = 'triangles', stripIndexFormat}) {
-    const {reflection} = program;
-    if (!reflection || typeof program.vertex !== 'string' || typeof program.fragment !== 'string') fail('ANIMATION_RENDER_OPTIONS', 'Expected a compiled program');
+    const source = program?.reflection, vertex = program?.vertex, fragment = program?.fragment;
+    if (!source || typeof vertex !== 'string' || typeof fragment !== 'string') fail('ANIMATION_RENDER_OPTIONS', 'Expected a compiled program');
+    // Uniform growth is asynchronous. Capture every subsequently consumed
+    // program/binding/raster input before yielding, just as for pipeline creation.
+    const reflection = {...source, textures: source.textures.map(t => ({...t})),
+      outputs: source.outputs.map(o => ({...o})), varyings: source.varyings?.map(v => ({...v}))};
+    textures = textures.map(t => ({...t}));
+    raster = {...raster, ...(raster?.blend ? {blend: {color: {...raster.blend.color}, alpha: {...raster.blend.alpha}}} : {}),
+      blendConstant: raster?.blendConstant == null ? null : (Array.isArray(raster.blendConstant) || ArrayBuffer.isView(raster.blendConstant) ? Array.from(raster.blendConstant) : {...raster.blendConstant})};
     if (textures.length !== reflection.textures.length) fail('ANIMATION_RENDER_TEXTURE', 'One texture binding per program sampler is required');
-    if (reflection.uniformBufferSize > (device.limits.maxUniformBufferBindingSize ?? 65536)) fail('ANIMATION_RENDER_LIMIT', 'Program uniforms exceed the binding limit');
+    uniforms.checkSize(reflection.uniformBufferSize);
     if (reflection.outputs.length > 1 || (reflection.outputs[0] && reflection.outputs[0].location !== 0))
       fail('ANIMATION_RENDER_OPTIONS', 'Multiple program outputs need multiple render targets');
     colorTarget.assertBlend(raster?.blend);
@@ -78,21 +78,25 @@ export function createProgramMeshes({device, format, depthFormat, sampleCount, m
     const layouts = points ? geometry.layouts.map(l => ({...l, stepMode: 'instance'})) : [...geometry.layouts];
     for (const location of geometry.channels.missing)
       layouts.push({arrayStride: 0, stepMode: 'vertex', attributes: [{shaderLocation: location, offset: 0, format: 'float32x4'}]});
-    const a = ensureArena();
+    const uniformBinding = await uniforms.register(reflection.uniformBufferSize);
+    uniforms.live();
     const allocated = scoped(device, () => {
-      const uniformLayout = device.createBindGroupLayout({label, entries: [{binding: 0, visibility: VERTEX | FRAGMENT,
-        buffer: {type: 'uniform', hasDynamicOffset: true, minBindingSize: reflection.uniformBufferSize}}]});
+      const uniformLayout = uniformBinding.layout;
+      if (!constant) {
+        constant = device.createBuffer({label: `${label}/program-default-attribute`, size: 16, usage: 32 | 8, mappedAtCreation: true});
+        try { new Float32Array(constant.getMappedRange()).set([0, 0, 0, 1]); constant.unmap(); }
+        catch (error) { constant.destroy(); constant = null; throw error; }
+      }
       // Float32 textures without float32-filterable bind as unfilterable (nearest only).
       const sampleTypeOf = (t, i) => t.sampleType === 'float' && textures[i].sampleType === 'unfilterable-float' ? 'unfilterable-float' : t.sampleType;
       const textureLayout = reflection.textures.length ? device.createBindGroupLayout({label, entries: reflection.textures.flatMap((t, i) => [
         {binding: t.textureBinding, visibility: VERTEX | FRAGMENT, texture: {sampleType: sampleTypeOf(t, i), viewDimension: t.dimension}},
         {binding: t.samplerBinding, visibility: VERTEX | FRAGMENT, sampler: {type: t.comparison ? 'comparison' : sampleTypeOf(t, i) === 'float' ? 'filtering' : 'non-filtering'}}])}) : null;
       const layout = device.createPipelineLayout({label, bindGroupLayouts: textureLayout ? [uniformLayout, textureLayout] : [uniformLayout]});
-      const uniformGroup = device.createBindGroup({label, layout: uniformLayout, entries: [{binding: 0, resource: {buffer: a.buffer, size: reflection.uniformBufferSize}}]});
       const textureGroup = textureLayout ? device.createBindGroup({label, layout: textureLayout, entries: reflection.textures.flatMap((t, i) => [
         {binding: t.textureBinding, resource: textures[i].view}, {binding: t.samplerBinding, resource: textures[i].sampler}])}) : null;
-      const vertexModule = device.createShaderModule({label: `${label}/vertex`, code: program.vertex});
-      const fragmentModule = device.createShaderModule({label: `${label}/fragment`, code: program.fragment});
+      const vertexModule = device.createShaderModule({label: `${label}/vertex`, code: vertex});
+      const fragmentModule = device.createShaderModule({label: `${label}/fragment`, code: fragment});
       const primitiveTopology = points ? 'triangle-list' : provoking === 'line-strip' ? 'line-list' : {triangles: 'triangle-list', lines: 'line-list', 'line-strip': 'line-strip', points: 'point-list'}[topology];
       if (!primitiveTopology) fail('ANIMATION_RENDER_OPTIONS', 'Invalid program topology');
       const pipeline = frontFace => device.createRenderPipelineAsync({label, layout,
@@ -106,11 +110,13 @@ export function createProgramMeshes({device, format, depthFormat, sampleCount, m
         multisample: {count: sampleCount, alphaToCoverageEnabled: raster.alphaToCoverage === true && sampleCount > 1 && format !== null}});
       const ready = Promise.all([pipeline(raster.frontFace), pipeline(raster.frontFace === 'ccw' ? 'cw' : 'ccw')]);
       ready.catch(() => {});
-      return {uniformGroup, textureGroup, ready};
+      return {textureGroup, ready};
     });
-    const [pipelines] = await Promise.race([Promise.all([allocated.value.ready, allocated.errors]), lost]);
+    const [pipelines] = await Promise.race([Promise.all([allocated.value?.ready, allocated.errors]), uniforms.stopped]);
+    if (allocated.error) throw allocated.error;
+    uniforms.live();
     return {
-      program: true, gpu, reflection, uniformGroup: allocated.value.uniformGroup, textureGroup: allocated.value.textureGroup,
+      program: true, gpu, reflection, uniformBinding, textureGroup: allocated.value.textureGroup,
       pipelines: {normal: pipelines[0], flipped: pipelines[1]}, geometrySignature: geometry.signature,
       points, provoking, topology,
       blended: !!raster.blend, alphaMode: raster.blend ? 'BLEND' : 'OPAQUE', blendConstant: raster.blendConstant ?? null, stencilReference,
@@ -127,10 +133,6 @@ export function createProgramMeshes({device, format, depthFormat, sampleCount, m
     // Capture indexed point order before consuming the uniform slice. Rejected
     // expansion/range requests leave both per-frame budgets available for retry.
     const pointPlan = record.points ? snapshotProgramPointRuns(geometry, input, maxPointDraws - pointDraws, fail) : null;
-    const offset = Math.ceil(cursor / ALIGN) * ALIGN;
-    if (offset + size > arena.size) fail('ANIMATION_RENDER_LIMIT', 'Program uniform arena exhausted for this frame');
-    arena.staged.set(bytes, offset);
-    cursor = offset + size;
     const extent = geometry.indexBuffer ? geometry.indexCount : geometry.vertexCount;
     const range = geometry.drawRange;
     let first = Math.max(input.first ?? 0, range.first), end = Math.min((input.first ?? 0) + (input.count ?? extent), range.first + range.count, extent);
@@ -138,9 +140,10 @@ export function createProgramMeshes({device, format, depthFormat, sampleCount, m
     if (record.points) {
       // firstInstance indexes the source vertex and supplies gl_VertexID in
       // the point shader. Ordered runs retain duplicates and restart breaks.
+      const packet = uniforms.stage(record.uniformBinding, bytes);
       pointDraws += pointPlan.runs.length / 2;
       Object.assign(command, {record, first: 0, count: 6, firstInstance: geometry.indexBuffer ? 0 : first, pointCount: pointPlan.count,
-        pipeline: input.frontFaceCW ? record.pipelines.flipped : record.pipelines.normal, program: {group: record.uniformGroup, offset, pointRuns: pointPlan.runs},
+        pipeline: input.frontFaceCW ? record.pipelines.flipped : record.pipelines.normal, program: {...packet, pointRuns: pointPlan.runs},
         vertexBuffers: [...geometry.vertexBuffers, ...geometry.channels.missing.map(() => constant)], indexBuffer: null, indexFormat: null,
         instanceCount: pointPlan.count, instanceBindGroup: null, blendConstant: record.blendConstant, stencilReference: record.stencilReference});
       return geometry;
@@ -149,10 +152,11 @@ export function createProgramMeshes({device, format, depthFormat, sampleCount, m
     // strips. Smooth lists use the original buffer unless markers need removal.
     const lowerTopology = record.provoking ?? (geometry.indexBuffer && ['triangles', 'lines', 'points'].includes(record.topology) ? record.topology : null);
     const rotated = lowerTopology ? indices.prepare(record.gpu, geometry, lowerTopology, first, Math.max(first, end), record.provoking !== null) : null;
+    const packet = uniforms.stage(record.uniformBinding, bytes);
     Object.assign(command, {
       record, first: rotated ? 0 : first, count: rotated ? rotated.count : Math.max(0, end - first),
       pipeline: input.frontFaceCW ? record.pipelines.flipped : record.pipelines.normal,
-      program: {group: record.uniformGroup, offset},
+      program: packet,
       vertexBuffers: [...geometry.vertexBuffers, ...geometry.channels.missing.map(() => constant)],
       indexBuffer: rotated ? rotated.buffer : geometry.indexBuffer, indexFormat: rotated?.buffer ? 'uint32' : geometry.indexFormat,
       instanceCount, firstInstance: 0, instanceBindGroup: null,
@@ -162,8 +166,9 @@ export function createProgramMeshes({device, format, depthFormat, sampleCount, m
   }
   return {
     add, stage,
-    begin() { cursor = 0; pointDraws = 0; indices.begin(); },
-    write() { if (arena && cursor) device.queue.writeBuffer(arena.buffer, 0, arena.staged, 0, Math.ceil(cursor / 4) * 4); },
-    dispose() { arena?.buffer.destroy(); constant?.destroy(); arena = null; constant = null; indices.dispose(); },
+    begin() { uniforms.begin(); pointDraws = 0; indices.begin(); },
+    write() { uniforms.write(); },
+    get uniformDiagnostics() { return uniforms.diagnostics; },
+    dispose() { uniforms.dispose(); constant?.destroy(); constant = null; indices.dispose(); },
   };
 }
