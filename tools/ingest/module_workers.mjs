@@ -30,11 +30,43 @@ const text = node => node?.type === 'Literal' && typeof node.value === 'string' 
   : node?.type === 'TemplateLiteral' && node.expressions.length === 0 ? node.quasis[0].value.cooked : null;
 const metaUrl = node => node?.type === 'MemberExpression' && !node.computed && node.property.name === 'url' &&
   node.object.type === 'MetaProperty' && node.object.meta.name === 'import' && node.object.property.name === 'meta';
-const urlArgument = node => node?.type === 'NewExpression' && node.callee.type === 'Identifier' &&
-  node.callee.name === 'URL' && node.arguments.length === 2 && text(node.arguments[0]) !== null &&
+const urlOperand = node => node?.type === 'NewExpression' && node.callee.type === 'Identifier' &&
+  node.callee.name === 'URL' && node.arguments.length === 2 &&
   metaUrl(node.arguments[1]) ? node.arguments[0] : null;
 const remote = url => ['https:', 'http:', 'data:'].includes(new URL(url).protocol);
 const suffix = url => { const value = new URL(url); return value.search + value.hash; };
+
+// Select only result positions. Conditions and discarded sequence operands stay
+// in place and execute exactly once; a partial set of alternatives is never used.
+function literalChoices(node, result = [], depth = 0) {
+  if (!node || depth > 64) return null;
+  if (text(node) !== null) {
+    if (result.length >= 128) return null;
+    result.push(node); return result;
+  }
+  if (node.type === 'SequenceExpression') return literalChoices(node.expressions.at(-1), result, depth + 1);
+  if (node.type !== 'ConditionalExpression') return null;
+  return literalChoices(node.consequent, result, depth + 1) && literalChoices(node.alternate, result, depth + 1);
+}
+
+function urlChoices(node, changed, relative = true, result = [], depth = 0) {
+  if (!node || depth > 64) return null;
+  const operand = !changed.has('URL') && urlOperand(node);
+  if (operand) {
+    const choices = literalChoices(operand);
+    if (!choices || result.length + choices.length > 128) return null;
+    for (const argument of choices) result.push({urlNode: node, argument, base: 'module'});
+    return result;
+  }
+  if (relative && text(node) !== null) {
+    if (result.length >= 128) return null;
+    result.push({urlNode: node, argument: node, base: 'realm'}); return result;
+  }
+  if (node.type === 'SequenceExpression') return urlChoices(node.expressions.at(-1), changed, relative, result, depth + 1);
+  if (node.type !== 'ConditionalExpression') return null;
+  return urlChoices(node.consequent, changed, relative, result, depth + 1) &&
+    urlChoices(node.alternate, changed, relative, result, depth + 1);
+}
 
 // Conservative admission: a binding or write anywhere in the module prevents
 // treating that spelling as a host constructor. False negatives are preferable
@@ -73,9 +105,8 @@ function sitesIn(ast, changed, {classic = false, relative = false} = {}) {
     if (!['Worker', 'SharedWorker'].includes(kind) || changed.has(kind) ||
         node.arguments.length < 1 || node.arguments.length > 2) return;
     const urlNode = node.arguments[0], options = node.arguments[1];
-    const url = !changed.has('URL') && urlArgument(urlNode);
-    const argument = url || (relative && text(urlNode) !== null ? urlNode : null);
-    if (!argument) return;
+    const choices = urlChoices(urlNode, changed, relative);
+    if (!choices) return;
     let workerType = 'classic';
     if (options && !(options.type === 'Literal' && options.value === null)) {
       if (kind === 'SharedWorker' && text(options) !== null) {
@@ -89,7 +120,8 @@ function sitesIn(ast, changed, {classic = false, relative = false} = {}) {
       }
     }
     if (!['classic', 'module'].includes(workerType) || (!classic && workerType !== 'module')) return;
-    sites.push({kind, workerType, urlNode, argument, specifier: text(argument), base: url ? 'module' : 'realm'});
+    for (const choice of choices)
+      sites.push({kind, workerType, ...choice, specifier: text(choice.argument)});
   }});
   return sites;
 }
@@ -223,12 +255,6 @@ export function buildWorkerGraph(entryUrl, {
     // References retain their suffix without cloning the mutable target record.
     return {asset: record, url};
   }
-  function leaves(node, result = []) {
-    if (result.length >= 128) return null;
-    if (text(node) !== null) { result.push(node); return result; }
-    if (node?.type !== 'ConditionalExpression') return null;
-    return leaves(node.consequent, result) && leaves(node.alternate, result);
-  }
   function staticGet(options) {
     if (!options || (options.type === 'Literal' && options.value === null)) return true;
     if (options.type !== 'ObjectExpression' || options.properties.some(p => p.type !== 'Property' ||
@@ -259,11 +285,12 @@ export function buildWorkerGraph(entryUrl, {
       if (!actual.external) record.edges.add(actual);
       edits.push({start: node.start, end: node.end, target: actual, suffix: target.external ? '' : suffix(target.url), fetch});
     }
-    function dependency(node, declaration) {
+    function dependency(node, declaration, asUrl = false) {
       let resolved;
-      try { resolved = resolveModule(text(node), record.url); }
+      try { resolved = asUrl ? new URL(text(node), record.url).href : resolveModule(text(node), record.url); }
       catch (cause) { fail('RESOLUTION', cause.message, record.url); }
       if (typeof resolved !== 'string') fail('RESOLUTION', 'Worker resolver must return a URL synchronously', record.url);
+      resolved = normalize(resolved);
       // Remote modules keep host-owned attribute handling and require no local
       // format decision, including runtime-computed options.
       const sourceType = remote(resolved) ? 'module' : importSourceType(declaration, record.url);
@@ -281,6 +308,25 @@ export function buildWorkerGraph(entryUrl, {
     }
     const workers = sitesIn(ast, changed, {classic: true, relative: true});
     const workerURLs = new Set(workers.map(site => site.urlNode.start));
+    const imports = new Map(), scriptImports = new Map();
+    // acorn-walk visits new URL before its enclosing import/call. Claim those
+    // operands first so executable dependencies cannot also become raw assets.
+    walk.simple(ast, {
+      ImportExpression(node) {
+        const choices = urlChoices(node.source, changed);
+        if (!choices) fail('DYNAMIC_IMPORT', 'Use bounded literal/URL import choices in a relocated worker', record.url);
+        imports.set(node, choices);
+        for (const choice of choices) if (choice.base === 'module') workerURLs.add(choice.urlNode.start);
+      },
+      CallExpression(node) {
+        if (!hostCall(node.callee, 'importScripts')) return;
+        const choices = node.arguments.map(argument => urlChoices(argument, changed));
+        if (root.workerType === 'classic' && choices.some(choice => !choice))
+          fail('IMPORT_SCRIPTS', 'Classic worker imports require bounded literal/URL script choices', record.url);
+        scriptImports.set(node, choices);
+        for (const choice of choices.flat()) if (choice?.base === 'module') workerURLs.add(choice.urlNode.start);
+      },
+    });
     for (const site of workers) {
       if (site.specifier.trim().startsWith('/')) continue;
       const url = new URL(site.specifier, site.base === 'realm' ? root.url : record.url).href;
@@ -293,31 +339,32 @@ export function buildWorkerGraph(entryUrl, {
       ExportNamedDeclaration: node => { if (node.source) dependency(node.source, node); },
       ExportAllDeclaration: node => dependency(node.source, node),
       ImportExpression(node) {
-        const candidates = leaves(node.source);
-        if (!candidates) fail('DYNAMIC_IMPORT', 'Use literal imports or conditionals with literal module branches in a relocated worker', record.url);
-        candidates.forEach(candidate => dependency(candidate, node));
+        for (const choice of imports.get(node)) {
+          if (choice.base === 'module' && text(choice.argument).trim().startsWith('/')) continue;
+          dependency(choice.argument, node, choice.base === 'module');
+          if (choice.base === 'module') uses('URL');
+        }
       },
       CallExpression(node) {
         if (hostCall(node.callee, 'importScripts')) {
           // The native method throws in a module worker, including zero args.
           // Do not fetch a missing file or turn this into a successful import.
           if (root.workerType !== 'classic') return;
-          for (const argument of node.arguments) {
-            const candidates = leaves(argument);
-            if (!candidates) fail('IMPORT_SCRIPTS', 'Classic worker imports require literal or conditional script URLs', record.url);
-            for (const candidate of candidates) {
-              const value = text(candidate);
+          for (const choices of scriptImports.get(node)) {
+            for (const choice of choices) {
+              const value = text(choice.argument);
               if (value.trim().startsWith('/')) continue;
-              const url = new URL(value, root.url).href;
+              const url = new URL(value, choice.base === 'module' ? record.url : root.url).href;
               if (new URL(url).protocol !== 'file:') continue;
-              replace(candidate, module(url, record.realm, 'script'), true);
+              replace(choice.argument, module(url, record.realm, 'script'), choice.base === 'realm');
               uses('importScripts', node.callee);
+              if (choice.base === 'module') uses('URL');
             }
           }
           return;
         }
         if (!hostCall(node.callee, 'fetch')) return;
-        const candidates = leaves(node.arguments[0]);
+        const candidates = literalChoices(node.arguments[0]);
         if (!candidates) return; // Dynamic networking is not claimed closed.
         for (const candidate of candidates) {
           const value = text(candidate);
@@ -330,13 +377,15 @@ export function buildWorkerGraph(entryUrl, {
       },
       NewExpression(node) {
         if (changed.has('URL') || workerURLs.has(node.start)) return;
-        const argument = urlArgument(node);
-        if (!argument) return;
-        const value = text(argument);
-        if (value.trim().startsWith('/')) return;
-        const url = new URL(value, record.url).href;
-        if (new URL(url).protocol !== 'file:') return;
-        replace(argument, asset(url)); uses('URL');
+        const candidates = literalChoices(urlOperand(node));
+        if (!candidates) return;
+        for (const argument of candidates) {
+          const value = text(argument);
+          if (value.trim().startsWith('/')) continue;
+          const url = new URL(value, record.url).href;
+          if (new URL(url).protocol !== 'file:') continue;
+          replace(argument, asset(url)); uses('URL');
+        }
       },
     });
     record.original = source; record.edits = edits.sort((a, b) => b.start - a.start);
@@ -457,8 +506,8 @@ export function moduleWorkerRollupPlugin(options = {}) {
           referenceId = emitted.get(key);
           totalBytes += graph.outputBytes; totalModules += graph.moduleCount; totalAssets += graph.assetCount;
         }
-        edits.push({start: site.urlNode.start, end: site.urlNode.end,
-          text: `new URL(import.meta.ROLLUP_FILE_URL_${referenceId}, import.meta.url)`});
+        edits.push({start: site.argument.start, end: site.argument.end,
+          text: `import.meta.ROLLUP_FILE_URL_${referenceId}`});
       }
       if (!edits.length) return null;
       let output = code;

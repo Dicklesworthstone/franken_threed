@@ -56,11 +56,64 @@ conservatively rejected when it would make a transformed host call ambiguous.
 This is not whole-program analysis of reflective global mutation or arbitrary
 runtime URL construction.
 
+## Native JSON modules and finite URL choices
+
+Inside a worker module, JSON imports and reexports retain their native module
+goal, rather than becoming JavaScript object-literal wrappers:
+
+```js
+import settings from './settings.json' with { type: 'json' };
+const same = await import(new URL('./settings.json', import.meta.url), {
+  with: { type: 'json' },
+});
+```
+
+The emitted JSON bytes are unchanged. Native parsing preserves default-only
+exports, shared mutable identity for repeated typed imports, duplicate-key and
+signed-zero behavior, and lazy rejection of malformed or unselected JSON.
+Query/fragment variants and different worker realms retain distinct identities.
+The type attribute, not a guessed file extension, selects the module goal.
+Local dynamic import options require a statically known plain attribute
+dictionary; unknown types, spreads, accessors and computed keys are not guessed.
+Options and their admitted sequence-expression side effects remain in place.
+Serve emitted `.json` resources with the appropriate JSON MIME type.
+
+Worker construction, dynamic imports and URL assets can select from bounded
+literal alternatives at runtime:
+
+```js
+const decoder = new Worker(new URL(
+  useFastDecoder ? './fast.mjs' : './portable.mjs', import.meta.url,
+), { type: 'module' });
+```
+
+Both entry graphs are packaged, but only the original selected constructor runs.
+Conditions and comma-expression prefixes execute once in their original order.
+Only result operands are rewritten; no selector evaluation, eager import,
+dispatch wrapper or production loader is added. Analysis is bounded to 128
+alternatives and bounded recursion; a partial set is never treated as closed.
+
+`import(new URL(..., import.meta.url))` uses URL resolution, even for paths
+without a leading `./`, rather than package/import-map resolution. Such imports
+are executable dependencies, not raw asset copies. ESM helpers in classic
+workers can similarly pass URL objects to native `importScripts`; these resolve
+from the helper's module URL, while string arguments still use the worker entry.
+Origin-root/protocol-relative URL operands remain host-owned.
+
+Conditional plain-string child workers are admitted inside known worker realms.
+Plain document-relative worker strings are not relocated: arbitrary document
+base mutations cannot be replaced with a build-time guessed base. Unknown
+constructor bindings, open URL expressions and reflective host changes are not
+claimed closed by this bounded analysis.
+
 ## Validation
 
 ```sh
 node --test tests/unit/classic_workers.test.mjs \
-  tests/unit/classic_workers_execution.test.mjs
+  tests/unit/classic_workers_execution.test.mjs \
+  tests/unit/module_workers.test.mjs \
+  tests/unit/worker_json_modules.test.mjs \
+  tests/unit/worker_url_choices.test.mjs
 ```
 
 The Node execution suite compares original and emitted source in actual worker
@@ -70,6 +123,12 @@ file Responses and browser-style messaging. Tests cover mixed nested threads,
 shared-script entry-relative resources, streaming compilation of real Wasm,
 native transferable ArrayBuffers, lexical redeclaration errors, repeated and
 recursive script evaluation, and a raw-copy failure regression.
+
+The JSON/choice cases additionally compare execution after the source directory
+has been renamed out of reach. They exercise native JSON identity and errors,
+conditional worker selection, URL-object imports, and option/selector ordering.
+The Rollup-plugin checks invoke production hooks and execute the resulting parent
+module; they do not substitute for running the full Rollup bundling engine.
 
 A native Chromium HTTP run was attempted on October 13, but the managed browser
 blocked navigation before either application executed with
