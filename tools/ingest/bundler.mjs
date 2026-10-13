@@ -15,6 +15,7 @@ import { parseHtmlEntries } from "./html_parser.mjs";
 import { numericKernelRollupPlugin } from "./numeric_rollup.mjs";
 import { marchingCubesRollupPlugin } from "./marching_cubes_rollup.mjs";
 import { resolveModuleSpecifier, urlToFilePath } from "./resolver.mjs";
+import { moduleWorkerRollupPlugin } from "./module_workers.mjs";
 
 /**
  * Resolves the directory of a module on disk given its Rollup module ID.
@@ -544,6 +545,13 @@ export async function bundleWithRollup(entryPath, options = {}) {
         // Resolve the compiler-owned virtual modules before the import-map
         // resolver sees them; they are not application package/asset paths.
         ...(marchingPlugin ? [marchingPlugin] : []),
+        // A worker is an independent ESM realm, not a raw URL asset and not a
+        // document chunk. Do not apply the page import map or renderer route.
+        moduleWorkerRollupPlugin({
+          resolveModule: (specifier, from) => resolveModuleSpecifier(specifier, from, {}, {
+            packageRootUrl: options.packageRootUrl,
+          }),
+        }),
         f3dRollupPlugin({
           importMap,
           mapBaseUrl,
