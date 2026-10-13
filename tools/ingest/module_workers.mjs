@@ -108,6 +108,32 @@ export function findWorkerSites(source, {sourceType = 'module', relative = false
 
 const realmKey = (url, workerType) => JSON.stringify([workerType, url]);
 
+// Import attributes choose the host's module goal, not the file's spelling.
+// Inspect only plain dictionaries; keep their original expressions so option
+// getters/side effects are never executed by the build or moved before import().
+function importSourceType(node, url) {
+  const tail = value => {
+    while (value?.type === 'SequenceExpression') value = value.expressions.at(-1);
+    return value;
+  };
+  function property(value, name) {
+    value = tail(value);
+    if (!value || (value.type === 'UnaryExpression' && value.operator === 'void')) return null;
+    if (value.type !== 'ObjectExpression' || value.properties.some(p => p.type !== 'Property' ||
+        p.computed || p.kind !== 'init' || p.method || (p.key.name ?? p.key.value) === '__proto__'))
+      fail('IMPORT_ATTRIBUTES', 'Local imports require statically known plain import-attribute dictionaries', url);
+    const found = value.properties.filter(p => (p.key.name ?? p.key.value) === name);
+    if (found.length > 1) fail('IMPORT_ATTRIBUTES', `Duplicate ${name} in import options`, url);
+    return found[0]?.value ?? null;
+  }
+  const type = node.type === 'ImportExpression'
+    ? property(property(node.options, 'with'), 'type')
+    : node.attributes?.find(a => (a.key.name ?? a.key.value) === 'type')?.value;
+  if (!type) return 'module';
+  if (text(tail(type)) === 'json') return 'json';
+  fail('IMPORT_ATTRIBUTES', 'Only a statically known type: "json" is supported for typed local worker imports', url);
+}
+
 // Browser-native resolution is the standalone default. The application builder
 // supplies its installed-package resolver, with an EMPTY worker import map.
 function resolveLocal(specifier, referrer) {
@@ -144,7 +170,8 @@ export function buildWorkerGraph(entryUrl, {
     let record = modules.get(key);
     if (!record) {
       if (modules.size >= maxModules) fail('BUDGET', 'Worker module count exceeds maxModules', url);
-      const name = sourceType === 'script' ? `c-${digest(url)}.js` : `m-${digest(url)}.mjs`;
+      const name = sourceType === 'script' ? `c-${digest(url)}.js`
+        : sourceType === 'json' ? `j-${digest(url)}.json` : `m-${digest(url)}.mjs`;
       record = {key, url, realm, sourceType, name, edges: new Set(), hostUses: new Set()};
       modules.set(key, record); queue.push(record);
     }
@@ -215,6 +242,14 @@ export function buildWorkerGraph(entryUrl, {
     const record = queue[index], bytes = read(record.url);
     analyzedBytes += bytes.length;
     if (analyzedBytes > maxBytes) fail('BUDGET', 'Realm-expanded worker sources exceed maxBytes', record.url);
+    if (record.sourceType === 'json') {
+      // JSON is a native module, not a JavaScript object-literal wrapper. Keep
+      // bytes (including BOM, duplicate keys and invalid lazy input) untouched;
+      // parsing, default-export identity and rejection timing belong to the host.
+      record.source = bytes;
+      record.signature = digest(JSON.stringify([record.key, digest(bytes)]));
+      continue;
+    }
     const source = bytes.toString('utf8');
     const ast = parse(source, record.url, record.sourceType), changed = changedGlobals(ast), edits = [];
     const root = roots.get(record.realm);
@@ -224,12 +259,15 @@ export function buildWorkerGraph(entryUrl, {
       if (!actual.external) record.edges.add(actual);
       edits.push({start: node.start, end: node.end, target: actual, suffix: target.external ? '' : suffix(target.url), fetch});
     }
-    function dependency(node) {
+    function dependency(node, declaration) {
       let resolved;
       try { resolved = resolveModule(text(node), record.url); }
       catch (cause) { fail('RESOLUTION', cause.message, record.url); }
       if (typeof resolved !== 'string') fail('RESOLUTION', 'Worker resolver must return a URL synchronously', record.url);
-      replace(node, module(resolved, record.realm));
+      // Remote modules keep host-owned attribute handling and require no local
+      // format decision, including runtime-computed options.
+      const sourceType = remote(resolved) ? 'module' : importSourceType(declaration, record.url);
+      replace(node, module(resolved, record.realm, sourceType));
     }
     function uses(name, callee = null) {
       record.hostUses.add(name);
@@ -251,13 +289,13 @@ export function buildWorkerGraph(entryUrl, {
       uses(site.kind); if (site.base === 'module') uses('URL');
     }
     walk.simple(ast, {
-      ImportDeclaration: node => dependency(node.source),
-      ExportNamedDeclaration: node => { if (node.source) dependency(node.source); },
-      ExportAllDeclaration: node => dependency(node.source),
+      ImportDeclaration: node => dependency(node.source, node),
+      ExportNamedDeclaration: node => { if (node.source) dependency(node.source, node); },
+      ExportAllDeclaration: node => dependency(node.source, node),
       ImportExpression(node) {
         const candidates = leaves(node.source);
         if (!candidates) fail('DYNAMIC_IMPORT', 'Use literal imports or conditionals with literal module branches in a relocated worker', record.url);
-        candidates.forEach(dependency);
+        candidates.forEach(candidate => dependency(candidate, node));
       },
       CallExpression(node) {
         if (hostCall(node.callee, 'importScripts')) {
@@ -342,6 +380,11 @@ export function buildWorkerGraph(entryUrl, {
   for (const record of modules.values()) record.fileName = `${directories.get(record.realm)}/${record.name}`;
   let outputBytes = [...assets.values()].reduce((n, record) => n + record.source.length, 0);
   for (const record of modules.values()) {
+    if (record.sourceType === 'json') {
+      outputBytes += record.source.length;
+      if (outputBytes > maxBytes) fail('BUDGET', 'Relocated worker output exceeds maxBytes', entryUrl);
+      continue;
+    }
     const replacements = []; let bytes = Buffer.byteLength(record.original), end = record.original.length;
     for (const edit of record.edits) {
       if (edit.end > end) fail('TRANSFORM', 'Overlapping worker source rewrites', record.url);
