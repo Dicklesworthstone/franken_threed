@@ -20,13 +20,14 @@ const object = value => value !== null && typeof value === "object" && !Array.is
 const arrayIndex = key => String(Number(key)) === key && Number.isInteger(Number(key)) && Number(key) >= 0 && Number(key) < 0xffffffff;
 
 function checkSegments(value, code) {
+  if (/[\u0000-\u001f\u007f]/.test(value)) fail(code, "Control characters are not valid package path text");
   // Check before URL normalization erases traversal. Encoded dot/node_modules
   // segments have the same meaning as their unencoded spellings.
   for (const segment of value.split(/[\\/]/)) {
     let decoded;
     try { decoded = decodeURIComponent(segment).toLowerCase(); }
     catch { fail(code, `Invalid percent encoding in package path "${value}"`); }
-    if (["", ".", "..", "node_modules"].includes(decoded) || /[/\\]/.test(decoded))
+    if (["", ".", "..", "node_modules"].includes(decoded) || /[/\\\u0000-\u001f\u007f]/.test(decoded))
       fail(code, `Invalid package path segment in "${value}"`);
   }
 }

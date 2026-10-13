@@ -1,7 +1,7 @@
 /**
  * Module Specifier Resolver.
  * Implements W3C Import Map resolution, relative URL resolution,
- * package exports fallback for Three.js r186, and canonical URL identity.
+ * pinned Three.js r186 and installed ESM package resolution, and canonical URL identity.
  *
  * Preserves URL queries (?query) and fragments (#hash) for module instance identity.
  * Strictly respects W3C null mappings (blocked imports) and trailing slash prefix contracts.
@@ -13,6 +13,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { IngestionResolutionError } from "./types.mjs";
 import { resolvePackageExports } from "./package_exports.mjs";
+import { resolveInstalledPackage } from "./node_package_resolver.mjs";
 export { resolveExportTargetValue, resolvePackageExports } from "./package_exports.mjs";
 
 /**
@@ -365,12 +366,8 @@ export function resolveModuleSpecifier(specifier, referrerUrl, importMap = {}, o
     );
     candidateUrl = new URL(relativeTarget, pkgRootUrl).href;
   } else {
-    throw new IngestionResolutionError(
-      `Cannot resolve bare specifier "${specifier}" from "${referrerUrl}": no import map match and no package fallback`,
-      specifier,
-      referrerUrl,
-      span,
-    );
+    // 4b. Ordinary installed ESM dependencies; never overrides maps or the pin.
+    candidateUrl = resolveInstalledPackage(specifier, referrerUrl, { span });
   }
 
   // 5. Verify target exists if file: URL
