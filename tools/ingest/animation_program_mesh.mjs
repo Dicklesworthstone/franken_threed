@@ -20,12 +20,15 @@
  * with flat varyings fail explicitly.
  */
 import {programGeometrySnapshot} from './gpu_buffer_geometry.mjs';
+import {createAnimationColorTargetProfile} from './animation_color_target.mjs';
 
 const VERTEX = 1, FRAGMENT = 2;
 const UNIFORM_USAGE = 64 | 8; // UNIFORM | COPY_DST
 const ALIGN = 256;
 
 export function createProgramMeshes({device, format, depthFormat, sampleCount, maxDraws, label, fail, scoped, lost}) {
+  const colorTarget = createAnimationColorTargetProfile(device, {format, sampleCount},
+    message => fail('ANIMATION_RENDER_OPTIONS', message));
   let arena = null, constant = null, cursor = 0;
   function ensureArena() {
     if (arena) return arena;
@@ -44,6 +47,7 @@ export function createProgramMeshes({device, format, depthFormat, sampleCount, m
     if (reflection.uniformBufferSize > (device.limits.maxUniformBufferBindingSize ?? 65536)) fail('ANIMATION_RENDER_LIMIT', 'Program uniforms exceed the binding limit');
     if (reflection.outputs.length > 1 || (reflection.outputs[0] && reflection.outputs[0].location !== 0))
       fail('ANIMATION_RENDER_OPTIONS', 'Multiple program outputs need multiple render targets');
+    colorTarget.assertBlend(raster?.blend);
     const geometry = programGeometrySnapshot(gpu, device);
     const points = reflection.points === true;
     if (points && topology !== 'points') fail('ANIMATION_RENDER_OPTIONS', 'Point programs draw point primitives');
