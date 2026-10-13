@@ -14,9 +14,16 @@
  * targets currently admit one sample only; no precision fallback is inferred.
  * readPixels() submits a bounded copy immediately and returns tightly packed
  * typed color data. Pending reads are cancelled on disposal or terminal failure.
+ * copyDestination:true additionally admits writePixels(data, options) and
+ * copyFrom(sourceTarget, options). These queue-ordered, level-zero writes dirty
+ * the mip chain; copies can read a selected source mip or resolved MSAA color.
+ * Upload/copy destinations must be single-sample. No implicit color conversion.
  * No framebuffer emulation or frame loop.
  */
 import {readGpuTargetPixels} from './gpu_target_readback.mjs';
+import {inspectGpuTargetWrite, gpuTargetWriteData, inspectGpuTargetCopy} from './gpu_target_transfer.mjs';
+// Authenticate target handles and device identity without exposing GPU textures.
+const transferTargets = new WeakMap();
 
 export class GpuRenderTargetError extends Error {
   constructor(code, message) {
@@ -80,18 +87,19 @@ export function createGpuRenderTarget(device, options = {}) {
   if (!options || typeof options !== 'object' || Array.isArray(options))
     fail('OPTIONS', 'Expected render target options');
   for (const key of Object.keys(options))
-    if (!['width', 'height', 'format', 'depthFormat', 'sampleCount', 'maxBytes', 'label', 'generateMipmaps', 'sampleDepth'].includes(key))
+    if (!['width', 'height', 'format', 'depthFormat', 'sampleCount', 'maxBytes', 'label', 'generateMipmaps', 'sampleDepth', 'copyDestination'].includes(key))
       fail('OPTIONS', `Unknown target option: ${key}`);
   const {
     width: initialWidth = 1, height: initialHeight = 1,
     format = 'rgba16float', depthFormat = 'depth24plus', sampleCount = 1,
-    maxBytes = 256 * 1024 * 1024, label = 'Offscreen render target', generateMipmaps = false, sampleDepth = false,
+    maxBytes = 256 * 1024 * 1024, label = 'Offscreen render target', generateMipmaps = false, sampleDepth = false, copyDestination = false,
   } = options;
   if (!COLOR_BYTES.has(format) || !DEPTH_BYTES.has(depthFormat))
     fail('FORMAT', 'Unsupported color or depth format');
   if (![1, 4].includes(sampleCount)) fail('SAMPLES', 'Expected one or four samples');
   const float32 = ['r32float', 'rg32float', 'rgba32float'].includes(format);
   if (float32 && sampleCount !== 1) fail('SAMPLES', 'Float32 color targets currently require one sample');
+  if (typeof copyDestination !== 'boolean') fail('OPTIONS', 'copyDestination must be boolean');
   if (typeof sampleDepth !== 'boolean') fail('OPTIONS', 'sampleDepth must be boolean');
   if (sampleDepth && depthFormat === null) fail('DEPTH', 'Sampled depth requires a depth attachment');
   if (typeof generateMipmaps !== 'boolean') fail('OPTIONS', 'generateMipmaps must be boolean');
@@ -112,8 +120,9 @@ export function createGpuRenderTarget(device, options = {}) {
   const rendererOptions = Object.freeze({format, depthFormat, sampleCount});
   let current = null, disposed = false, terminal = null, busy = false, version = 0;
   let validation = Promise.resolve(), retirement = Promise.resolve();
-  let mipPipeline = null, mipSampler = null, mipGenerations = 0;
+  let mipPipeline = null, mipSampler = null, mipGenerations = 0, colorUploads = 0, colorCopies = 0;
   const levels = (w, h) => generateMipmaps && w && h ? 1 + Math.floor(Math.log2(Math.max(w, h))) : 1;
+  const transferShape = () => ({width, height, format, sampleCount, mipLevelCount: levels(width, height)});
   const retired = new Set(), readbacks = new Set();
   let rejectStopped;
   const stopped = new Promise((_, reject) => { rejectStopped = reject; });
@@ -178,7 +187,7 @@ export function createGpuRenderTarget(device, options = {}) {
       checked(() => {
         const size = {width: w, height: h, depthOrArrayLayers: 1};
         pair.color = device.createTexture({label: label + ' color', size, format,
-          dimension: '2d', sampleCount: 1, mipLevelCount: pair.mipLevelCount, usage: 1 | 4 | 16});
+          dimension: '2d', sampleCount: 1, mipLevelCount: pair.mipLevelCount, usage: 1 | 4 | 16 | (copyDestination ? 2 : 0)});
         pair.view = pair.color.createView({baseMipLevel: 0, mipLevelCount: 1});
         if (sampleCount === 4) {
           pair.multisample = device.createTexture({label: label + ' MSAA', size, format,
@@ -276,7 +285,7 @@ export function createGpuRenderTarget(device, options = {}) {
     get suspended() { return width === 0 || height === 0; },
     get version() { return version; }, get disposed() { return disposed; },
     get failed() { return terminal !== null; }, get allocatedBytes() { return allocated(); },
-    get diagnostics() { return Object.freeze({width, height, version, format, depthFormat, sampleCount, sampleDepth,
+    get diagnostics() { return Object.freeze({width, height, version, format, depthFormat, sampleCount, sampleDepth, copyDestination, colorUploads, colorCopies,
       allocatedBytes: allocated(), retiredTargets: retired.size, mipLevelCount: current?.mipLevelCount ?? 0, mipGenerations, pendingReadbacks: readbacks.size}); },
     resize(w, h) {
       exclusive(); dimension(w); dimension(h);
@@ -300,6 +309,47 @@ export function createGpuRenderTarget(device, options = {}) {
     withFrame(callback) { return borrow(callback, 'frame'); },
     withTexture(callback) { return borrow(callback, 'color'); },
     withDepthTexture(callback) { return borrow(callback, 'depth'); },
+    writePixels(data, options = {}) {
+      exclusive();
+      if (!copyDestination) fail('USAGE', 'Enable copyDestination before uploading target color');
+      const plan = inspectGpuTargetWrite(transferShape(), data, options);
+      if (plan.empty) return false;
+      if (typeof device.queue.writeTexture !== 'function') fail('DEVICE', 'Color uploads require GPUQueue.writeTexture');
+      const upload = gpuTargetWriteData(plan);
+      busy = true;
+      try {
+        current.used = true; current.mipsDirty = true;
+        checked(() => device.queue.writeTexture({texture: current.color, mipLevel: 0, origin: plan.origin},
+          upload.data, upload.layout, plan.size));
+        live(); colorUploads++; return true;
+      } finally { busy = false; if (disposed || terminal !== null) release(); }
+    },
+    copyFrom(source, options = {}) {
+      exclusive();
+      if (!copyDestination) fail('USAGE', 'Enable copyDestination before copying target color');
+      const other = transferTargets.get(source);
+      if (!other) fail('SOURCE', 'Expected a native render target handle');
+      if (other.device !== device) fail('DEVICE', 'Target copies require the same GPUDevice');
+      if (source === api) fail('FEEDBACK', 'In-place target copies are not admitted');
+      other.exclusive();
+      const plan = inspectGpuTargetCopy(other.shape(), transferShape(), options);
+      if (plan.empty) return false;
+      busy = true;
+      try {
+        current.used = true; current.mipsDirty = true;
+        other.borrow(texture => checked(() => {
+          const encoder = device.createCommandEncoder({label: label + ' color copy'});
+          encoder.copyTextureToTexture({texture, mipLevel: plan.sourceMipLevel, origin: plan.sourceOrigin},
+            {texture: current.color, mipLevel: 0, origin: plan.destinationOrigin}, plan.size);
+          device.queue.submit([encoder.finish()]);
+        }));
+        // A source mip-generation/upload error must also fail the dependent
+        // copy, even if its own copy error scope happened to validate first.
+        validation = Promise.all([validation, other.validation()]).then(() => {});
+        validation.catch(stop);
+        live(); colorCopies++; return true;
+      } finally { busy = false; if (disposed || terminal !== null) release(); }
+    },
     async readPixels(options = {}) {
       exclusive();
       if (!options || typeof options !== 'object' || Array.isArray(options)) fail('OPTIONS', 'Expected readback options');
@@ -344,6 +394,8 @@ export function createGpuRenderTarget(device, options = {}) {
     current = allocate(width, height, bytes);
     if (device.lost && typeof device.lost.then === 'function')
       device.lost.then(info => stop(new GpuRenderTargetError('DEVICE_LOST', info?.message ?? 'Device lost')), stop);
+    transferTargets.set(api, {device, exclusive, shape: transferShape,
+      borrow: callback => borrow(callback, 'color'), validation: () => validation});
     return api;
   } catch (error) { disposed = true; release(); throw error; }
 }

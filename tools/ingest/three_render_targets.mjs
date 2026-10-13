@@ -12,9 +12,13 @@
  * UV replicas and readback. Nearest sampling needs no optional device feature;
  * linear filtering requires float32-filterable. This owner does not extend the
  * separate draw renderer's admitted attachment/pipeline formats.
+ * writePixels(entry, data, options) and copyColor(source, destination, options)
+ * update native level-zero color and lazily invalidate only the color replicas.
+ * These explicit owner operations do not enqueue the public renderer's FIFO.
  * This is general WebGPU execution, not Rust specialization or a speedup claim.
  */
 import {createGpuRenderTarget} from './gpu_render_target.mjs';
+import {inspectGpuTargetWrite, inspectGpuTargetCopy} from './gpu_target_transfer.mjs';
 
 export class ThreeRenderTargetError extends Error {
   constructor(code, message) {
@@ -213,7 +217,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     if (!device) fail('DEVICE', 'Initialize the renderer before acquiring target storage');
     const {width, height, format, depthFormat, sampleCount, generateMipmaps} = entry.shape;
     entry.storage = createGpuRenderTarget(device, {width, height, format, depthFormat, sampleCount, maxBytes, generateMipmaps,
-      sampleDepth: entry.shape.depthTexture !== null});
+      sampleDepth: entry.shape.depthTexture !== null, copyDestination: true});
     entry.charged += entry.shape.bytes; allocatedBytes += entry.shape.bytes;
     // The readback helper consumes this session-shaped object. It copies the
     // original attachment, not the UV-oriented sampling replica.
@@ -396,6 +400,32 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
   }
   return {
     capture, ensure, assertCurrent, bindingsFor,
+    writePixels(entry, data, options = {}) {
+      assertCurrent(entry);
+      if (entry.busy) fail('REENTRANT', 'Cannot upload during a target submission');
+      if (inspectGpuTargetWrite(entry.shape, data, options).empty) return false;
+      ensure(entry);
+      entry.busy = true; entry.dirty = true;
+      try { const result = entry.storage.writePixels(data, options); assertCurrent(entry); return result; }
+      finally { entry.busy = false; if (!entry.alive) release(entry); }
+    },
+    copyColor(source, destination, options = {}) {
+      assertCurrent(source); assertCurrent(destination);
+      if (source === destination) fail('FEEDBACK', 'In-place target copies are not admitted');
+      if (source.busy || destination.busy) fail('REENTRANT', 'Cannot copy during a target submission');
+      if (inspectGpuTargetCopy(source.shape, destination.shape, options).empty) return false;
+      budget((source.storage ? 0 : source.shape.bytes) + (destination.storage ? 0 : destination.shape.bytes));
+      ensure(source); ensure(destination);
+      source.busy = destination.busy = true; destination.dirty = true;
+      try {
+        const result = destination.storage.copyFrom(source.storage, options);
+        assertCurrent(source); assertCurrent(destination); return result;
+      } finally {
+        source.busy = destination.busy = false;
+        try { if (!source.alive) release(source); }
+        finally { if (!destination.alive) release(destination); }
+      }
+    },
     get allocatedBytes() { return allocatedBytes; }, get size() { return entries.size; },
     render(entry, callback) {
       ensure(entry);
