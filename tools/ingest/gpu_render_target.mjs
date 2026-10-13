@@ -9,8 +9,15 @@
  * or precision conversion is inferred. Consumers choose their shader sample index.
  * Combined depth/stencil formats expose both aspects in frame.depthView. Sample
  * depth with a depth-only view; depth32float-stencil8 requires its device feature.
- * No framebuffer emulation, CPU pixel copies, or frame loop.
+ * R/RG/RGBA32F storage stays full precision. Its mipmaps use textureLoad-based
+ * bilinear reduction without requiring optional float32 filtering. Float32
+ * targets currently admit one sample only; no precision fallback is inferred.
+ * readPixels() submits a bounded copy immediately and returns tightly packed
+ * typed color data. Pending reads are cancelled on disposal or terminal failure.
+ * No framebuffer emulation or frame loop.
  */
+import {readGpuTargetPixels} from './gpu_target_readback.mjs';
+
 export class GpuRenderTargetError extends Error {
   constructor(code, message) {
     super(`GPU_TARGET_${code}: ${message}`);
@@ -22,6 +29,7 @@ const fail = (code, message) => { throw new GpuRenderTargetError(code, message);
 const COLOR_BYTES = new Map([
   ['rgba8unorm', 4], ['rgba8unorm-srgb', 4],
   ['bgra8unorm', 4], ['bgra8unorm-srgb', 4], ['rgba16float', 8],
+  ['r32float', 4], ['rg32float', 8], ['rgba32float', 16],
 ]);
 
 // Combined formats may use eight bytes per sample on the selected backend.
@@ -45,6 +53,29 @@ const MIP_WGSL = `
   return textureSampleLevel(source, linearSampler, p.xy / vec2f(size), 0.0);
 }`;
 
+// Explicit non-filtering layout plus four textureLoad operations avoids silently
+// depending on float32-filterable. Match the existing bilinear pixel-center
+// convention, including odd extents and 1D tails, at the original f32 precision.
+const FLOAT32_MIP_WGSL = `
+@group(0) @binding(0) var source: texture_2d<f32>;
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+  let p = array<vec2f, 3>(vec2f(-1, -1), vec2f(3, -1), vec2f(-1, 3));
+  return vec4f(p[i], 0, 1);
+}
+@fragment fn fs(@builtin(position) p: vec4f) -> @location(0) vec4f {
+  let size = textureDimensions(source);
+  let nextSize = max(size / 2u, vec2u(1u));
+  let q = p.xy * vec2f(size) / vec2f(nextSize) - vec2f(0.5);
+  let lo = vec2i(floor(q));
+  let hi = vec2i(size) - vec2i(1);
+  let a = textureLoad(source, clamp(lo, vec2i(0), hi), 0);
+  let b = textureLoad(source, clamp(lo + vec2i(1, 0), vec2i(0), hi), 0);
+  let c = textureLoad(source, clamp(lo + vec2i(0, 1), vec2i(0), hi), 0);
+  let d = textureLoad(source, clamp(lo + vec2i(1, 1), vec2i(0), hi), 0);
+  let weight = fract(q);
+  return mix(mix(a, b, weight.x), mix(c, d, weight.x), weight.y);
+}`;
+
 export function createGpuRenderTarget(device, options = {}) {
   if (!options || typeof options !== 'object' || Array.isArray(options))
     fail('OPTIONS', 'Expected render target options');
@@ -59,6 +90,8 @@ export function createGpuRenderTarget(device, options = {}) {
   if (!COLOR_BYTES.has(format) || !DEPTH_BYTES.has(depthFormat))
     fail('FORMAT', 'Unsupported color or depth format');
   if (![1, 4].includes(sampleCount)) fail('SAMPLES', 'Expected one or four samples');
+  const float32 = ['r32float', 'rg32float', 'rgba32float'].includes(format);
+  if (float32 && sampleCount !== 1) fail('SAMPLES', 'Float32 color targets currently require one sample');
   if (typeof sampleDepth !== 'boolean') fail('OPTIONS', 'sampleDepth must be boolean');
   if (sampleDepth && depthFormat === null) fail('DEPTH', 'Sampled depth requires a depth attachment');
   if (typeof generateMipmaps !== 'boolean') fail('OPTIONS', 'generateMipmaps must be boolean');
@@ -81,7 +114,7 @@ export function createGpuRenderTarget(device, options = {}) {
   let validation = Promise.resolve(), retirement = Promise.resolve();
   let mipPipeline = null, mipSampler = null, mipGenerations = 0;
   const levels = (w, h) => generateMipmaps && w && h ? 1 + Math.floor(Math.log2(Math.max(w, h))) : 1;
-  const retired = new Set();
+  const retired = new Set(), readbacks = new Set();
   let rejectStopped;
   const stopped = new Promise((_, reject) => { rejectStopped = reject; });
   stopped.catch(() => {});
@@ -112,6 +145,7 @@ export function createGpuRenderTarget(device, options = {}) {
   function stop(error) {
     if (disposed || terminal !== null) return;
     terminal = error; rejectStopped(error);
+    for (const controller of readbacks) controller.abort(error);
     if (!busy) release();
   }
   function live() {
@@ -166,15 +200,19 @@ export function createGpuRenderTarget(device, options = {}) {
   function refreshMips(pair) {
     if (!pair.mipsDirty || pair.mipLevelCount === 1) return;
     checked(() => {
-      if (['createShaderModule', 'createRenderPipeline', 'createSampler', 'createBindGroup', 'createCommandEncoder']
-        .some(key => typeof device[key] !== 'function') || typeof device.queue.submit !== 'function')
+      const methods = ['createShaderModule', 'createRenderPipeline', 'createBindGroup', 'createCommandEncoder',
+        ...(float32 ? ['createBindGroupLayout', 'createPipelineLayout'] : ['createSampler'])];
+      if (methods.some(key => typeof device[key] !== 'function') || typeof device.queue.submit !== 'function')
         fail('DEVICE', 'Mip generation requires WebGPU render pipelines and queue submission');
       if (!mipPipeline) {
-        const module = device.createShaderModule({label: label + ' mipmap', code: MIP_WGSL});
-        mipPipeline = device.createRenderPipeline({label: label + ' mipmap', layout: 'auto',
+        const module = device.createShaderModule({label: label + ' mipmap', code: float32 ? FLOAT32_MIP_WGSL : MIP_WGSL});
+        const layout = float32 ? device.createPipelineLayout({bindGroupLayouts: [device.createBindGroupLayout({entries: [
+          {binding: 0, visibility: 2, texture: {sampleType: 'unfilterable-float', viewDimension: '2d', multisampled: false}},
+        ]})]}) : 'auto';
+        mipPipeline = device.createRenderPipeline({label: label + ' mipmap', layout,
           vertex: {module, entryPoint: 'vs'}, fragment: {module, entryPoint: 'fs', targets: [{format}]},
           primitive: {topology: 'triangle-list'}});
-        mipSampler = device.createSampler({minFilter: 'linear', magFilter: 'linear',
+        if (!float32) mipSampler = device.createSampler({minFilter: 'linear', magFilter: 'linear',
           addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge'});
       }
       if (!pair.mipSteps) {
@@ -183,7 +221,7 @@ export function createGpuRenderTarget(device, options = {}) {
           const source = pair.color.createView({baseMipLevel: level - 1, mipLevelCount: 1});
           const view = pair.color.createView({baseMipLevel: level, mipLevelCount: 1});
           const group = device.createBindGroup({layout: mipPipeline.getBindGroupLayout(0), entries: [
-            {binding: 0, resource: source}, {binding: 1, resource: mipSampler},
+            {binding: 0, resource: source}, ...(float32 ? [] : [{binding: 1, resource: mipSampler}]),
           ]});
           steps.push({view, group});
         }
@@ -239,7 +277,7 @@ export function createGpuRenderTarget(device, options = {}) {
     get version() { return version; }, get disposed() { return disposed; },
     get failed() { return terminal !== null; }, get allocatedBytes() { return allocated(); },
     get diagnostics() { return Object.freeze({width, height, version, format, depthFormat, sampleCount, sampleDepth,
-      allocatedBytes: allocated(), retiredTargets: retired.size, mipLevelCount: current?.mipLevelCount ?? 0, mipGenerations}); },
+      allocatedBytes: allocated(), retiredTargets: retired.size, mipLevelCount: current?.mipLevelCount ?? 0, mipGenerations, pendingReadbacks: readbacks.size}); },
     resize(w, h) {
       exclusive(); dimension(w); dimension(h);
       if (w === width && h === height) return api;
@@ -262,6 +300,27 @@ export function createGpuRenderTarget(device, options = {}) {
     withFrame(callback) { return borrow(callback, 'frame'); },
     withTexture(callback) { return borrow(callback, 'color'); },
     withDepthTexture(callback) { return borrow(callback, 'depth'); },
+    async readPixels(options = {}) {
+      exclusive();
+      if (!options || typeof options !== 'object' || Array.isArray(options)) fail('OPTIONS', 'Expected readback options');
+      const caller = options.signal;
+      if (caller !== undefined && (!caller || typeof caller.addEventListener !== 'function' || typeof caller.removeEventListener !== 'function'))
+        fail('OPTIONS', 'Expected AbortSignal');
+      const controller = new AbortController(), abort = () => controller.abort(caller.reason);
+      readbacks.add(controller);
+      try {
+        caller?.addEventListener('abort', abort, {once: true});
+        if (caller?.aborted) abort();
+        // Capture the extent and submit before any await: resize and subsequent
+        // draws cannot change which version of the texture this call observes.
+        return await readGpuTargetPixels({device, width, height, diagnostics: {target: {format}},
+          get disposed() { return disposed; }, get failed() { return terminal !== null; },
+          withTexture: api.withTexture}, {x: 0, y: 0, width, height, ...options, signal: controller.signal});
+      } finally {
+        readbacks.delete(controller);
+        caller?.removeEventListener('abort', abort);
+      }
+    },
     async whenIdle() {
       exclusive();
       try {
@@ -272,7 +331,10 @@ export function createGpuRenderTarget(device, options = {}) {
     dispose() {
       if (busy) fail('REENTRANT', 'Cannot dispose during a borrowed target use');
       if (disposed) return;
-      disposed = true; rejectStopped(new GpuRenderTargetError('DISPOSED', 'Render target disposed'));
+      disposed = true;
+      const error = new GpuRenderTargetError('DISPOSED', 'Render target disposed');
+      rejectStopped(error);
+      for (const controller of readbacks) controller.abort(error);
       release();
     },
   });
