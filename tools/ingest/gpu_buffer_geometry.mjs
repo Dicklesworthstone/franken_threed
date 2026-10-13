@@ -131,12 +131,12 @@ function describe(geometry) {
   if (index) {
     if (index.isInterleavedBufferAttribute || index.itemSize !== 1 || index.normalized) fail('SHAPE', 'Expected scalar non-interleaved indices');
     indexOwner = index;
-    storage(index.array);
-    if (!(index.array instanceof Uint16Array) && !(index.array instanceof Uint32Array)) fail('FORMAT', 'Indices require Uint16Array or Uint32Array');
-    indexFormat = index.array instanceof Uint16Array ? 'uint16' : 'uint32';
-    indexCount = integer(index.count, 0, index.array.length, 'index count');
+    const source = sourceArray(index);
+    if (!(source.kind instanceof Uint16Array) && !(source.kind instanceof Uint32Array)) fail('FORMAT', 'Indices require Uint16Array or Uint32Array');
+    indexFormat = source.kind instanceof Uint16Array ? 'uint16' : 'uint32';
+    indexCount = integer(index.count, 0, source.length, 'index count');
     if (owners.has(index)) fail('SHAPE', 'Index and vertex source identities must be distinct');
-    owners.set(index, {owner: index, array: index.array, source: {array: index.array, kind: index.array, length: index.array.length, byteLength: index.array.byteLength, elementType: index.array.constructor}, stride: 0, attributes: [], requiredBytes: indexCount * index.array.BYTES_PER_ELEMENT, conversion: null});
+    owners.set(index, {owner: index, array: source.array, source, stride: 0, attributes: [], requiredBytes: indexCount * source.kind.BYTES_PER_ELEMENT, conversion: null});
   }
   const streams = [...owners.values()].filter(e => e.stride !== 0);
   // Stable layouts do not depend on object ids, buffer generations or insertion
@@ -241,7 +241,7 @@ function createResidency(device, geometry, {
       const from = Math.floor(start / stride) * stride * divisor * 4;
       const to = Math.ceil(end / stride) * stride * divisor * 4;
       native(() => device.queue.writeBuffer(record.buffer, from, shadow, from, to - from));
-      stats.uploads++; stats.uploadedBytes += to - from;
+      record.revision++; stats.uploads++; stats.uploadedBytes += to - from;
       return;
     }
     if (record.conversion) {
@@ -249,7 +249,7 @@ function createResidency(device, geometry, {
       const floats = new (record.conversion.integer ?? Float32Array)(record.shadow.buffer, start * 4, end - start), element = record.conversion.element;
       for (let i = start; i < end; i++) floats[i - start] = element(array[i]);
       native(() => device.queue.writeBuffer(record.buffer, start * 4, record.shadow, start * 4, (end - start) * 4));
-      stats.uploads++; stats.uploadedBytes += (end - start) * 4;
+      record.revision++; stats.uploads++; stats.uploadedBytes += (end - start) * 4;
       return;
     }
     const from = start * array.BYTES_PER_ELEMENT, to = end * array.BYTES_PER_ELEMENT;
@@ -257,7 +257,7 @@ function createResidency(device, geometry, {
     record.shadow.set(new Uint8Array(array.buffer, array.byteOffset + from, to - from), from);
     const offset = Math.floor(from / 4) * 4, limit = align4(to);
     native(() => device.queue.writeBuffer(record.buffer, offset, record.shadow, offset, limit - offset));
-    stats.uploads++; stats.uploadedBytes += limit-offset;
+    record.revision++; stats.uploads++; stats.uploadedBytes += limit-offset;
   }
   function update({maxAdditionalBytes = maxBytes} = {}) {
     live(); if (busy) fail('REENTRANT', 'Cannot update geometry from an upload callback');
@@ -320,7 +320,7 @@ function createResidency(device, geometry, {
           const shadow = new Uint8Array(size);
           record = {buffer: native(() => device.createBuffer({label, size, usage: 4|8|16|32})),
             shadow, logicalBytes: entry.conversion ? array.length * 4 : array.byteLength, elementType: array.constructor,
-            conversion: entry.conversion, divisor, stride: entry.stride, version: -1};
+            conversion: entry.conversion, divisor, stride: entry.stride, version: -1, revision: 0};
           // Own the allocation even when an upload callback throws; retry the
           // initial upload without retaining an orphan native buffer.
           records.set(owner, record); allocatedBytes += size; stats.allocations++;
@@ -345,7 +345,15 @@ function createResidency(device, geometry, {
         }
       }
       const indexRecord = shape.indexOwner ? records.get(shape.indexOwner) : null;
-      current = Object.freeze({layouts: shape.layouts, signature: shape.signature, channels: shape.channels,
+      // Topology lowering reads the uploaded history, never the author's current
+      // array. No mutable shadow view escapes. Revisions advance on actual writes,
+      // including writes followed by a throwing upload callback.
+      const Index = shape.indexFormat === 'uint16' ? Uint16Array : Uint32Array;
+      const indexData = indexRecord ? new Index(indexRecord.shadow.buffer, 0, indexRecord.logicalBytes / Index.BYTES_PER_ELEMENT) : null;
+      current = Object.freeze({
+        get indexRevision() { return indexRecord?.revision ?? 0; },
+        readIndex: indexData ? i => indexData[integer(i, 0, shape.indexCount - 1, 'resident index')] : null,
+        layouts: shape.layouts, signature: shape.signature, channels: shape.channels,
         vertexBuffers: Object.freeze(shape.streams.map(e => records.get(e.owner).buffer)),
         vertexCount: shape.vertexCount, indexBuffer: indexRecord?.buffer ?? null,
         indexFormat: shape.indexFormat, indexCount: shape.indexCount, generation,
@@ -464,12 +472,12 @@ function describeProgram(program) {
     let indexOwner = null, indexFormat = null, indexCount = 0;
     if (index) {
       if (index.isInterleavedBufferAttribute || index.itemSize !== 1 || index.normalized) fail('SHAPE', 'Expected scalar non-interleaved indices');
-      storage(index.array);
-      if (!(index.array instanceof Uint16Array) && !(index.array instanceof Uint32Array)) fail('FORMAT', 'Indices require Uint16Array or Uint32Array');
-      indexOwner = index; indexFormat = index.array instanceof Uint16Array ? 'uint16' : 'uint32';
-      indexCount = integer(index.count, 0, index.array.length, 'index count');
+      const source = sourceArray(index);
+      if (!(source.kind instanceof Uint16Array) && !(source.kind instanceof Uint32Array)) fail('FORMAT', 'Indices require Uint16Array or Uint32Array');
+      indexOwner = index; indexFormat = source.kind instanceof Uint16Array ? 'uint16' : 'uint32';
+      indexCount = integer(index.count, 0, source.length, 'index count');
       if (owners.has(index)) fail('SHAPE', 'Index and vertex source identities must be distinct');
-      owners.set(index, {owner: index, array: index.array, source: {array: index.array, kind: index.array, length: index.array.length, byteLength: index.array.byteLength, elementType: index.array.constructor}, stride: 0, attributes: [], requiredBytes: indexCount * index.array.BYTES_PER_ELEMENT, conversion: null});
+      owners.set(index, {owner: index, array: source.array, source, stride: 0, attributes: [], requiredBytes: indexCount * source.kind.BYTES_PER_ELEMENT, conversion: null});
     }
     const streams = [...owners.values()].filter(e => e.stride !== 0);
     streams.sort((x, y) => Math.min(...x.attributes.map(v => v.shaderLocation)) - Math.min(...y.attributes.map(v => v.shaderLocation)));

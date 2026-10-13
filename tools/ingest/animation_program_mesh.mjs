@@ -15,21 +15,25 @@
  * WebGPU's @interpolate(flat) from its FIRST. Programs with flat varyings draw
  * triangle lists through a rotated index buffer (v2, v0, v1: same winding, GL's
  * provoking vertex first) and line lists through swapped pairs. The rotated
- * indices are rebuilt from the source index array when its version, identity or
- * count changes (the residency uploads on the same version rule). Line strips
- * with flat varyings fail explicitly.
+ * indices are lowered from resident upload history, not live CPU index arrays.
+ * Flat line strips become ordered line-list pairs with each last vertex first.
+ * Restart markers and draw-range boundaries never connect separate primitives.
+ * Immutable index buffers are cached within a separate bounded index budget;
+ * superseded buffers survive all current-frame uses and retire after a fence.
  */
 import {programGeometrySnapshot} from './gpu_buffer_geometry.mjs';
 import {createAnimationColorTargetProfile} from './animation_color_target.mjs';
 import {hasAnimationStencil, snapshotAnimationRaster} from './animation_raster.mjs';
+import {createProgramIndexLowering} from './animation_program_indices.mjs';
 
 const VERTEX = 1, FRAGMENT = 2;
 const UNIFORM_USAGE = 64 | 8; // UNIFORM | COPY_DST
 const ALIGN = 256;
 
-export function createProgramMeshes({device, format, depthFormat, sampleCount, maxDraws, label, fail, scoped, lost}) {
+export function createProgramMeshes({device, format, depthFormat, sampleCount, maxDraws, label, fail, scoped, lost, maxIndexBytes = 64 * 1024 * 1024}) {
   const colorTarget = createAnimationColorTargetProfile(device, {format, sampleCount},
     message => fail('ANIMATION_RENDER_OPTIONS', message));
+  const indices = createProgramIndexLowering(device, {label, fail, maxBytes: maxIndexBytes, maxEntries: maxDraws});
   let arena = null, constant = null, cursor = 0;
   function ensureArena() {
     if (arena) return arena;
@@ -60,9 +64,9 @@ export function createProgramMeshes({device, format, depthFormat, sampleCount, m
     const points = reflection.points === true;
     if (points && topology !== 'points') fail('ANIMATION_RENDER_OPTIONS', 'Point programs draw point primitives');
     if (points && (geometry.indexBuffer || geometry.instanced)) fail('ANIMATION_RENDER_GEOMETRY', 'Indexed or instanced point sprites are not admitted yet');
-    const provoking = !points && reflection.varyings?.some(v => v.flat) ? {triangles: 3, lines: 2}[topology] ?? 0 : 0;
-    if (!points && !provoking && reflection.varyings?.some(v => v.flat) && topology !== 'points')
-      fail('ANIMATION_RENDER_OPTIONS', 'Flat varyings on line strips need GL\'s last-vertex convention; not admitted yet');
+    const provoking = !points && reflection.varyings?.some(v => v.flat) && topology !== 'points' ? topology : null;
+    if (provoking && !['triangles', 'lines', 'line-strip'].includes(provoking))
+      fail('ANIMATION_RENDER_OPTIONS', 'Unsupported flat-varying topology');
     // Point sprites: one instance per source vertex (6-vertex quad each).
     const layouts = points ? geometry.layouts.map(l => ({...l, stepMode: 'instance'})) : [...geometry.layouts];
     for (const location of geometry.channels.missing)
@@ -82,7 +86,7 @@ export function createProgramMeshes({device, format, depthFormat, sampleCount, m
         {binding: t.textureBinding, resource: textures[i].view}, {binding: t.samplerBinding, resource: textures[i].sampler}])}) : null;
       const vertexModule = device.createShaderModule({label: `${label}/vertex`, code: program.vertex});
       const fragmentModule = device.createShaderModule({label: `${label}/fragment`, code: program.fragment});
-      const primitiveTopology = points ? 'triangle-list' : {triangles: 'triangle-list', lines: 'line-list', 'line-strip': 'line-strip', points: 'point-list'}[topology];
+      const primitiveTopology = points ? 'triangle-list' : provoking === 'line-strip' ? 'line-list' : {triangles: 'triangle-list', lines: 'line-list', 'line-strip': 'line-strip', points: 'point-list'}[topology];
       if (!primitiveTopology) fail('ANIMATION_RENDER_OPTIONS', 'Invalid program topology');
       const pipeline = frontFace => device.createRenderPipelineAsync({label, layout,
         vertex: {module: vertexModule, entryPoint: 'f3d_vertex', buffers: layouts},
@@ -129,48 +133,22 @@ export function createProgramMeshes({device, format, depthFormat, sampleCount, m
         instanceCount: Math.max(0, end - first), instanceBindGroup: null, blendConstant: record.blendConstant, stencilReference: record.stencilReference});
       return geometry;
     }
-    const rotated = record.provoking ? provokingIndices(record, geometry, first, end) : null;
+    const rotated = record.provoking ? indices.prepare(record.gpu, geometry, record.provoking, first, Math.max(first, end)) : null;
     Object.assign(command, {
-      record, first, count: Math.max(0, end - first),
+      record, first: rotated ? 0 : first, count: rotated ? rotated.count : Math.max(0, end - first),
       pipeline: input.frontFaceCW ? record.pipelines.flipped : record.pipelines.normal,
       program: {group: record.uniformGroup, offset},
       vertexBuffers: [...geometry.vertexBuffers, ...geometry.channels.missing.map(() => constant)],
-      indexBuffer: rotated ?? geometry.indexBuffer, indexFormat: rotated ? 'uint32' : geometry.indexFormat,
+      indexBuffer: rotated ? rotated.buffer : geometry.indexBuffer, indexFormat: rotated?.buffer ? 'uint32' : geometry.indexFormat,
       instanceCount, firstInstance: 0, instanceBindGroup: null,
       blendConstant: record.blendConstant, stencilReference: record.stencilReference,
     });
     return geometry;
   }
-  // gpu residency -> Map(phase -> {key, buffer}); rebuilt only when the source changes.
-  const rotations = new WeakMap(), rotationBuffers = new Set();
-  function provokingIndices(record, geometry, first, end) {
-    const n = record.provoking, phase = first % n, index = geometry.indexBuffer ? geometry.source?.index : null;
-    if (geometry.indexBuffer && !index?.array) fail('ANIMATION_RENDER_GEOMETRY', 'Flat varyings need the source index array');
-    const length = geometry.indexBuffer ? geometry.indexCount : geometry.vertexCount;
-    let byPhase = rotations.get(record.gpu);
-    if (!byPhase) rotations.set(record.gpu, byPhase = new Map());
-    const key = geometry.indexBuffer ? [geometry.indexBuffer, index.version, length] : [null, -1, length];
-    let entry = byPhase.get(phase);
-    if (!entry || entry.key.some((v, i) => v !== key[i])) {
-      const out = new Uint32Array(Math.max(1, length));
-      for (let i = 0; i < length; i++) out[i] = index ? index.array[i] : i;
-      // Rotate every whole primitive that starts at first + k*n.
-      for (let s = phase; s + n <= length; s += n) {
-        if (n === 3) { const a = out[s], b = out[s + 1], c = out[s + 2]; out[s] = c; out[s + 1] = a; out[s + 2] = b; }
-        else { const a = out[s]; out[s] = out[s + 1]; out[s + 1] = a; }
-      }
-      if (entry) { entry.buffer.destroy(); rotationBuffers.delete(entry.buffer); }
-      const buffer = device.createBuffer({label: `${label}/provoking-indices`, size: Math.max(4, out.byteLength), usage: 16 | 8});
-      device.queue.writeBuffer(buffer, 0, out);
-      rotationBuffers.add(buffer);
-      byPhase.set(phase, entry = {key, buffer});
-    }
-    return entry.buffer;
-  }
   return {
     add, stage,
-    begin() { cursor = 0; },
+    begin() { cursor = 0; indices.begin(); },
     write() { if (arena && cursor) device.queue.writeBuffer(arena.buffer, 0, arena.staged, 0, Math.ceil(cursor / 4) * 4); },
-    dispose() { arena?.buffer.destroy(); constant?.destroy(); arena = null; constant = null; for (const b of rotationBuffers) b.destroy(); rotationBuffers.clear(); },
+    dispose() { arena?.buffer.destroy(); constant?.destroy(); arena = null; constant = null; indices.dispose(); },
   };
 }
