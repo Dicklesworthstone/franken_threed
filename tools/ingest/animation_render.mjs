@@ -48,7 +48,7 @@
  *
  * shading is 'unlit' (default), 'lambert', 'phong', 'toon', or 'metallic-roughness'. Lit meshes
  * require the deformer's normal attribute and invertible world transforms.
- * Metallic-roughness uses GGX/Smith-correlated visibility and Schlick Fresnel,
+ * Metallic-roughnessness uses GGX/Smith-correlated visibility and Schlick Fresnel,
  * with metallicFactor/roughnessFactor in [0,1] (both default 1) and an explicit
  * perceptual roughness floor of 0.045. Lit materials accept emissiveFactor RGB.
  * Lit materials also accept normalTexture and emissiveTexture; metallic-roughness
@@ -212,6 +212,7 @@ import {animationClippingBytes, animationClippingFields, animationClippingWgsl,
   snapshotAnimationClipping, packAnimationClipping} from "./animation_clipping.mjs";
 import {createAnimationRenderBundleCache, encodeAnimationRenderSpans} from "./animation_render_bundles.mjs";
 import {createProgramMeshes} from "./animation_program_mesh.mjs";
+import {createAnimationColorTargetProfile} from "./animation_color_target.mjs";
 import {snapshotAnimationRaster, snapshotAnimationRasterUse, hasAnimationStencil,
   ANIMATION_NORMAL_BLEND} from "./animation_raster.mjs";
 import {bufferGeometrySnapshot, instanceAttributesSnapshot} from "./gpu_buffer_geometry.mjs";
@@ -1023,17 +1024,10 @@ export async function createGpuAnimationRenderer(
     typeof device.lost?.then !== "function"
   )
     fail("ANIMATION_RENDER_DEVICE", "Lend a live WebGPU device");
+  const colorTarget = createAnimationColorTargetProfile(device, {format, sampleCount},
+    message => fail("ANIMATION_RENDER_OPTIONS", message));
   if (
-    ![
-      null,
-      "rgba8unorm",
-      "rgba8unorm-srgb",
-      "bgra8unorm",
-      "bgra8unorm-srgb",
-      "rgba16float",
-    ].includes(format) ||
     ![null, "depth24plus", "depth32float", "depth16unorm", "depth24plus-stencil8", "depth32float-stencil8"].includes(depthFormat) ||
-    ![1, 4].includes(sampleCount) ||
     typeof label !== "string"
   )
     fail("ANIMATION_RENDER_OPTIONS", "Unsupported attachment configuration");
@@ -1372,6 +1366,9 @@ struct Out { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 };
   function compilePipelines(variantKey) {
     const [variant, geometryKey] = variantKey.split("~");
     const raster = rasterStates.get(Number(/raster-(\d+)-/.exec(variant)?.[1]));
+    // Do not eagerly compile illegal BLEND pipelines for an unblended float32
+    // target. Explicit blend:null still has both alpha/depth-write variants.
+    const blendModes = colorTarget.blendModes(raster);
     const geometry = geometryKey === undefined ? null : geometryLayouts.get(geometryKey);
     const nativeInstances = geometry?.channels.instanced === true;
     // Native instance_index addresses source matrix/color streams, never the
@@ -1519,7 +1516,7 @@ struct Out { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 };
       for (const layout of vertexBuffers) limit("maxVertexBufferArrayStride", layout.arrayStride);
     }
     const created = [];
-    for (const blend of format === null ? [false] : [false, true])
+    for (const blend of blendModes)
       for (const winding of lit ? ["ccw", "cw", "none", "none-cw"] : ["ccw", "cw", "none"]) {
         const key = `${variantKey}/${blend}:${winding}`;
         const blendState = raster?.blend !== undefined ? raster.blend : blend
@@ -1788,6 +1785,7 @@ struct Out { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 };
       "material/geometry",
     );
     const raster = snapshotAnimationRaster(options, {format, depthFormat});
+    colorTarget.assertBlend(raster.blend === undefined ? options.alphaMode === "BLEND" : raster.blend);
     const mutable = deformerShape(gpu, device);
     // Line and point primitives are one-pixel WebGPU primitives, as in the
     // source WebGPU backend: no line width or point size is emulated. Indexed
