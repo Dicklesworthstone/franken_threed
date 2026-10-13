@@ -222,6 +222,28 @@ function createResidency(device, geometry, {
   }
   function native(fn) { try { return fn(); } catch (error) { throw stop(error); } }
   function write(record, array, start, end) {
+    if (record.divisor > 1) {
+      if (start === end) return;
+      const {stride, divisor, conversion, shadow} = record;
+      // WebGPU steps once per instance. Repeat the complete source record, not
+      // individual components, without changing the authored array or shader.
+      // Only selected source elements change: neighboring elements in uploaded
+      // rows retain their GPU-visible history, including unversioned CPU edits.
+      const values = new (conversion?.integer ?? (conversion ? Float32Array : Uint32Array))(shadow.buffer);
+      const source = conversion ? array : new Uint32Array(array.buffer, array.byteOffset, array.length);
+      for (let row = Math.floor(start / stride); row < Math.ceil(end / stride); row++) {
+        const from = Math.max(start, row * stride), to = Math.min(end, (row + 1) * stride);
+        const base = row * divisor * stride;
+        for (let i = from; i < to; i++) values[base + i - row * stride] = conversion ? conversion.element(source[i]) : source[i];
+        for (let repeat = 1; repeat < divisor; repeat++)
+          shadow.copyWithin((base + repeat * stride) * 4, base * 4, (base + stride) * 4);
+      }
+      const from = Math.floor(start / stride) * stride * divisor * 4;
+      const to = Math.ceil(end / stride) * stride * divisor * 4;
+      native(() => device.queue.writeBuffer(record.buffer, from, shadow, from, to - from));
+      stats.uploads++; stats.uploadedBytes += to - from;
+      return;
+    }
     if (record.conversion) {
       if (end === start) return;
       const floats = new (record.conversion.integer ?? Float32Array)(record.shadow.buffer, start * 4, end - start), element = record.conversion.element;
@@ -248,14 +270,18 @@ function createResidency(device, geometry, {
       let addedBytes = 0, addedCount = 0;
       // Admission completes before any allocation, queue write, range mutation
       // or callback. An invalid later attribute cannot partly upload the frame.
-      for (const {owner, source, requiredBytes, conversion} of shape.owners.values()) {
+      for (const {owner, source, requiredBytes, conversion, stride, divisor = 1} of shape.owners.values()) {
         integer(owner.version, 0, Number.MAX_SAFE_INTEGER, 'upload version');
         // Converted storage is one f32 per element; compare in resident bytes.
         const logical = conversion ? source.length * 4 : source.byteLength;
-        const existing = records.get(owner), size = Math.max(4, align4(logical));
+        const expanded = divisor > 1 ? Math.ceil(source.length / stride) * stride * divisor * 4 : logical;
+        if (!Number.isSafeInteger(expanded)) fail('LIMIT', 'Expanded attribute size exceeds the safe integer range');
+        const existing = records.get(owner), size = Math.max(4, align4(expanded));
         if (typeof owner.onUploadCallback !== 'function') fail('SHAPE', 'Expected onUploadCallback');
         if (existing) {
           if (existing.version >= owner.version && requiredBytes > existing.logicalBytes) fail('SHAPE', 'Geometry counts exceed resident storage');
+          if (existing.divisor !== divisor || ((divisor > 1 || existing.divisor > 1) && existing.stride !== stride))
+            fail('FORMAT', 'Changing a resident instance divisor or expanded stride requires a new attribute or release()');
           if (existing.elementType !== source.elementType || existing.conversion?.key !== conversion?.key)
             fail('FORMAT', 'Changing a resident element type or normalization requires a new attribute');
           if (existing.version < owner.version) {
@@ -288,10 +314,13 @@ function createResidency(device, geometry, {
         let record = records.get(owner);
         if (record && record.version !== -1 && record.version < owner.version) checkRanges(owner, array.length);
         if (!record) {
-          const size = Math.max(4, align4(entry.conversion ? array.length * 4 : array.byteLength));
+          const divisor = entry.divisor ?? 1;
+          const size = Math.max(4, align4(divisor > 1 ? Math.ceil(array.length / entry.stride) * entry.stride * divisor * 4
+            : entry.conversion ? array.length * 4 : array.byteLength));
           const shadow = new Uint8Array(size);
           record = {buffer: native(() => device.createBuffer({label, size, usage: 4|8|16|32})),
-            shadow, logicalBytes: entry.conversion ? array.length * 4 : array.byteLength, elementType: array.constructor, conversion: entry.conversion, version: -1};
+            shadow, logicalBytes: entry.conversion ? array.length * 4 : array.byteLength, elementType: array.constructor,
+            conversion: entry.conversion, divisor, stride: entry.stride, version: -1};
           // Own the allocation even when an upload callback throws; retry the
           // initial upload without retaining an orphan native buffer.
           records.set(owner, record); allocatedBytes += size; stats.allocations++;
@@ -379,8 +408,12 @@ function createResidency(device, geometry, {
  * (reflection.attributes: {name, location, locations, components}) is taken from
  * geometry.attributes by name, at the program's location, with the same upload,
  * version, range and conversion contract as ordinary geometry. Instanced
- * attributes (meshPerAttribute 1) use stepMode 'instance'; matrix attributes use
- * one location per column. Attributes the geometry lacks are reported in
+ * attributes use stepMode 'instance'. meshPerAttribute > 1 repeats complete
+ * records during versioned uploads, bounded by the existing GPU/shadow budgets;
+ * matrix attributes keep one location per column. Divisors and expanded strides
+ * are residency configuration: replace the attribute or release before changing
+ * them. Released CPU arrays remain usable until the next required upload.
+ * Attributes the geometry lacks are reported in
  * `missing` so the renderer binds GL's constant (0, 0, 0, 1) default instead. */
 function describeProgram(program) {
   return geometry => {
@@ -407,7 +440,7 @@ function describeProgram(program) {
       if (intType && (attribute.normalized === true || attribute.isFloat16BufferAttribute === true)) fail('FORMAT', `Integer attribute ${a.name} cannot be normalized or half-float`);
       const conversion = intType ? integerConversionOf(source.kind, a.scalar) : conversionOf(source.kind, attribute.normalized === true, attribute.isFloat16BufferAttribute === true);
       const perInstance = attribute.isInstancedBufferAttribute === true || owner.isInstancedInterleavedBuffer === true;
-      if (perInstance && (owner.meshPerAttribute ?? attribute.meshPerAttribute) !== 1) fail('SHAPE', 'meshPerAttribute other than 1 has no WebGPU step rate');
+      const divisor = perInstance ? integer(owner.meshPerAttribute ?? attribute.meshPerAttribute, 1, 0xffffffff, 'meshPerAttribute') : 1;
       const itemSize = integer(attribute.itemSize, 1, 16, 'item size');
       const columns = a.locations, width = a.locations > 1 ? a.components : Math.min(itemSize, 4);
       if (columns > 1 && itemSize !== columns * a.components) fail('SHAPE', `Matrix attribute ${a.name} needs itemSize ${columns * a.components}`);
@@ -415,12 +448,12 @@ function describeProgram(program) {
       const stride = attribute.isInterleavedBufferAttribute ? integer(owner.stride, itemSize, 512, 'stride') : itemSize;
       const offset = attribute.isInterleavedBufferAttribute ? integer(attribute.offset, 0, stride - itemSize, 'attribute offset') : 0;
       const count = integer(attribute.count, 0, 0xffffffff, 'attribute count');
-      if (count * stride > source.length + (stride - itemSize)) fail('SHAPE', 'Attribute count exceeds storage');
-      if (perInstance) instanceCapacity = Math.min(instanceCapacity, count);
+      if (count && (count - 1) * stride + offset + itemSize > source.length) fail('SHAPE', 'Attribute count exceeds storage');
+      if (perInstance) instanceCapacity = Math.min(instanceCapacity, integer(count * divisor, 0, 0xffffffff, 'instance capacity'));
       else vertexCount = vertexCount === null ? count : Math.min(vertexCount, count);
       let entry = owners.get(owner);
-      if (!entry) owners.set(owner, entry = {owner, array, source, stride, attributes: [], requiredBytes: 0, conversion, stepMode: perInstance ? 'instance' : 'vertex'});
-      if (entry.stride !== stride || entry.stepMode !== (perInstance ? 'instance' : 'vertex')) fail('SHAPE', 'Shared attributes require one stride and step mode');
+      if (!entry) owners.set(owner, entry = {owner, array, source, stride, divisor, attributes: [], requiredBytes: 0, conversion, stepMode: perInstance ? 'instance' : 'vertex'});
+      if (entry.stride !== stride || entry.divisor !== divisor || entry.stepMode !== (perInstance ? 'instance' : 'vertex')) fail('SHAPE', 'Shared attributes require one stride, divisor and step mode');
       if (entry.conversion?.key !== conversion?.key) fail('FORMAT', 'Attributes sharing interleaved storage require one conversion profile');
       entry.requiredBytes = Math.max(entry.requiredBytes, count ? ((count - 1) * stride + offset + itemSize) * 4 : 0);
       for (let k = 0; k < columns; k++)
