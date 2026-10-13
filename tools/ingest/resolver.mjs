@@ -367,7 +367,12 @@ export function resolveModuleSpecifier(specifier, referrerUrl, importMap = {}, o
     candidateUrl = new URL(relativeTarget, pkgRootUrl).href;
   } else {
     // 4b. Ordinary installed ESM dependencies; never overrides maps or the pin.
-    candidateUrl = resolveInstalledPackage(specifier, referrerUrl, { span });
+    candidateUrl = resolveInstalledPackage(specifier, referrerUrl, {
+      span,
+      // Package #imports dependencies originate at their owning package, but
+      // keep the HTML import-map base and the same pinned Three.js policy.
+      resolveExternal: (target, from) => resolveModuleSpecifier(target, from, importMap, { ...options, mapBaseUrl }),
+    });
   }
 
   // 5. Verify target exists if file: URL

@@ -7,10 +7,10 @@ import fs from "node:fs";
 import path from "node:path";
 import { isBuiltin } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { resolvePackageExports } from "./package_exports.mjs";
+import { resolvePackageExports, resolvePackageImports } from "./package_exports.mjs";
 import { IngestionResolutionError } from "./types.mjs";
 
-export function resolveInstalledPackage(specifier, referrerUrl, { span = null } = {}) {
+export function resolveInstalledPackage(specifier, referrerUrl, { span = null, resolveExternal = null } = {}) {
   const fail = (code, message) => {
     const error = new IngestionResolutionError(
       `Cannot resolve package import "${specifier}" from "${referrerUrl}": ${message}`,
@@ -21,20 +21,11 @@ export function resolveInstalledPackage(specifier, referrerUrl, { span = null } 
   };
   if (typeof specifier !== "string" || !specifier || /[\\\u0000-\u001f\u007f]/.test(specifier))
     fail("ERR_INVALID_MODULE_SPECIFIER", "Invalid bare package specifier");
+  if (specifier.startsWith("#") && (specifier === "#" || specifier.startsWith("#/") || specifier.endsWith("/")))
+    fail("ERR_INVALID_MODULE_SPECIFIER", "Invalid package import name");
   if (isBuiltin(specifier))
     fail("F3D_NODE_BUILTIN", "Node builtins need an explicit import-map host adapter; no browser polyfill is implied");
-  if (specifier.startsWith("#"))
-    fail("F3D_PACKAGE_IMPORTS", "Package-local #imports require an explicit import-map mapping on this route");
-  const parts = specifier.split("/");
-  const scoped = specifier.startsWith("@");
-  const count = scoped ? 2 : 1;
-  const nameParts = parts.slice(0, count);
-  if (nameParts.length !== count || nameParts.some((part, index) => {
-    const name = scoped && index === 0 ? part.slice(1) : part;
-    return !name || name.startsWith(".") || /[\s%:?#@]/.test(name);
-  })) fail("ERR_INVALID_MODULE_SPECIFIER", "Invalid package name");
-  const name = nameParts.join("/");
-  const subpath = parts.length === count ? "." : "./" + parts.slice(count).join("/");
+
   let referrer;
   try { referrer = new URL(referrerUrl); }
   catch { fail("ERR_INVALID_MODULE_SPECIFIER", "Expected an absolute referrer URL"); }
@@ -95,6 +86,11 @@ export function resolveInstalledPackage(specifier, referrerUrl, { span = null } 
       const relative = subpath === "." ? (main.startsWith("./") ? main : "./" + main) : subpath;
       target = resolvePackageExports(".", relative, packageJsonPath, specifier, referrerUrl, span);
     }
+    return finalize(directory, target);
+  }
+
+  function finalize(directory, target) {
+    const packageJsonPath = path.join(directory, "package.json");
     const url = new URL(target, pathToFileURL(directory + path.sep));
     let filename;
     try { filename = fileURLToPath(url); }
@@ -113,6 +109,26 @@ export function resolveInstalledPackage(specifier, referrerUrl, { span = null } 
   }
 
   const own = scope(fromDirectory);
+  if (specifier.startsWith("#")) {
+    if (!own) fail("ERR_PACKAGE_IMPORT_NOT_DEFINED", "No owning package scope defines this import");
+    const packageJsonPath = path.join(own.directory, "package.json");
+    const packageUrl = pathToFileURL(packageJsonPath).href;
+    const external = target => resolveExternal
+      ? resolveExternal(target, packageUrl)
+      : resolveInstalledPackage(target, packageUrl, { span });
+    const target = resolvePackageImports(specifier, own.value.imports, packageJsonPath, referrerUrl, span, external);
+    return target.startsWith("./") ? finalize(own.directory, target) : target;
+  }
+  const parts = specifier.split("/");
+  const scoped = specifier.startsWith("@");
+  const count = scoped ? 2 : 1;
+  const nameParts = parts.slice(0, count);
+  if (nameParts.length !== count || nameParts.some((part, index) => {
+    const name = scoped && index === 0 ? part.slice(1) : part;
+    return !name || name.startsWith(".") || /[\s%:?#@]/.test(name);
+  })) fail("ERR_INVALID_MODULE_SPECIFIER", "Invalid package name");
+  const name = nameParts.join("/");
+  const subpath = parts.length === count ? "." : "./" + parts.slice(count).join("/");
   if (own?.value.name === name && own.value.exports !== null && own.value.exports !== undefined)
     return resolveAt(own.directory, own.value);
   for (let directory = fromDirectory;;) {

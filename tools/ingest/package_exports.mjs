@@ -32,10 +32,18 @@ function checkSegments(value, code) {
   }
 }
 
-function selectTarget(target, conditions, patternMatch, depth = 0) {
+function selectTarget(target, conditions, patternMatch, depth = 0, resolveExternal = null) {
   if (depth > 128) fail("ERR_INVALID_PACKAGE_CONFIG", "Package export nesting exceeds 128 levels");
   if (typeof target === "string") {
-    if (!target.startsWith("./")) invalidTarget(`Package export target "${target}" must start with "./"`);
+    if (!target.startsWith("./")) {
+      if (!resolveExternal || target.startsWith("../") || target.startsWith("/") || URL.canParse(target))
+        invalidTarget(`Invalid package target "${target}": expected a package-relative path or an imports dependency`);
+      // An imports dependency is a bare package, not a second #imports lookup.
+      // Do not invent alias recursion (or allow it to bypass the owning scope).
+      if (target.startsWith("#")) fail("ERR_INVALID_MODULE_SPECIFIER", "An external imports target must name a package, not another #import");
+      if (patternMatch !== null) checkSegments(patternMatch, "ERR_INVALID_MODULE_SPECIFIER");
+      return resolveExternal(patternMatch === null ? target : target.split("*").join(patternMatch));
+    }
     checkSegments(target.slice(2).split(/[?#]/, 1)[0], "ERR_INVALID_PACKAGE_TARGET");
     if (patternMatch === null) return target;
     checkSegments(patternMatch, "ERR_INVALID_MODULE_SPECIFIER");
@@ -47,7 +55,7 @@ function selectTarget(target, conditions, patternMatch, depth = 0) {
     let lastFailure;
     for (const item of target) {
       let resolved;
-      try { resolved = selectTarget(item, conditions, patternMatch, depth + 1); }
+      try { resolved = selectTarget(item, conditions, patternMatch, depth + 1, resolveExternal); }
       catch (error) {
         if (error.code !== "ERR_INVALID_PACKAGE_TARGET") throw error;
         lastFailure = error;
@@ -65,7 +73,7 @@ function selectTarget(target, conditions, patternMatch, depth = 0) {
     if (keys.some(arrayIndex)) fail("ERR_INVALID_PACKAGE_CONFIG", "Package export conditions cannot contain numeric property keys");
     for (const key of keys) {
       if (key === "default" || conditions.includes(key)) {
-        const resolved = selectTarget(target[key], conditions, patternMatch, depth + 1);
+        const resolved = selectTarget(target[key], conditions, patternMatch, depth + 1, resolveExternal);
         if (resolved !== undefined) return resolved;
       }
     }
@@ -73,6 +81,52 @@ function selectTarget(target, conditions, patternMatch, depth = 0) {
   }
   if (target === null) return null;
   invalidTarget(`Invalid package export target of type ${typeof target}`);
+}
+
+/** Exact keys win, then longest prefix/trailer. A selected null or unmatched
+ * conditional never falls through to a broader key, for either map family. */
+function matchSubpath(specifier, entries) {
+  if (specifier.endsWith("/")) return null;
+  if (!specifier.includes("*") && Object.hasOwn(entries, specifier)) return [entries[specifier], null];
+  const patterns = Object.keys(entries)
+    .filter(key => key.indexOf("*") !== -1 && key.indexOf("*") === key.lastIndexOf("*"))
+    .sort((a, b) => b.indexOf("*") - a.indexOf("*") || b.length - a.length);
+  for (const key of patterns) {
+    const star = key.indexOf("*"), prefix = key.slice(0, star), suffix = key.slice(star + 1);
+    if (specifier.startsWith(prefix) && specifier.length > prefix.length &&
+        (suffix === "" || (specifier.endsWith(suffix) && specifier.length >= key.length)))
+      return [entries[key], specifier.slice(prefix.length, specifier.length - suffix.length)];
+  }
+  return null;
+}
+
+/** Select the owning package's private mapping. Relative targets are finalized
+ * by the caller. External dependencies resolve INSIDE target selection, so a
+ * missing/blocked dependency cannot silently activate a different array entry.
+ * The callback must preserve the application's import maps and Three.js pin. */
+export function resolvePackageImports(specifier, importsField, packageJsonPath, referrerUrl, span, resolveExternal) {
+  try {
+    if (typeof specifier !== "string" || !specifier.startsWith("#") || specifier === "#" ||
+        specifier.startsWith("#/") || specifier.endsWith("/"))
+      fail("ERR_INVALID_MODULE_SPECIFIER", `Invalid package import specifier "${specifier}"`);
+    if (importsField !== null && importsField !== undefined && !object(importsField))
+      fail("ERR_INVALID_PACKAGE_CONFIG", "Package imports must be an object");
+    const match = object(importsField) ? matchSubpath(specifier, importsField) : null;
+    if (!match) fail("ERR_PACKAGE_IMPORT_NOT_DEFINED", `Package import "${specifier}" is not defined`);
+    const resolved = selectTarget(match[0], ["import", "default"], match[1], 0, resolveExternal);
+    if (resolved === null || resolved === undefined)
+      fail("ERR_PACKAGE_IMPORT_NOT_DEFINED", `Package import "${specifier}" is blocked or has no matching condition`);
+    return resolved;
+  } catch (cause) {
+    if (!(cause instanceof PackageExportError) && !(cause instanceof IngestionResolutionError)) throw cause;
+    const error = new IngestionResolutionError(
+      `Cannot resolve package import "${specifier}" from "${referrerUrl}" in "${packageJsonPath}": ${cause.message}`,
+      specifier, referrerUrl, span,
+    );
+    error.code = cause.code;
+    error.cause = cause;
+    throw error;
+  }
 }
 
 /** Select a target using the admitted conditions; null and undefined differ. */
@@ -97,22 +151,8 @@ export function resolvePackageExports(subpath, exportsField, packageJsonPath, sp
     if (subpath === "." && !isSubpathMap) {
       target = exportsField; matched = true;
     } else if (isSubpathMap) {
-      if (!subpath.endsWith("/") && !subpath.includes("*") && Object.hasOwn(exportsField, subpath)) {
-        target = exportsField[subpath]; matched = true;
-      } else if (!subpath.endsWith("/")) {
-        const patterns = keys.filter(key => key.indexOf("*") !== -1 && key.indexOf("*") === key.lastIndexOf("*"))
-          .sort((a, b) => b.indexOf("*") - a.indexOf("*") || b.length - a.length);
-        for (const key of patterns) {
-          const star = key.indexOf("*"), prefix = key.slice(0, star), suffix = key.slice(star + 1);
-          if (subpath.startsWith(prefix) && subpath.length > prefix.length &&
-              (suffix === "" || (subpath.endsWith(suffix) && subpath.length >= key.length))) {
-            target = exportsField[key];
-            patternMatch = subpath.slice(prefix.length, subpath.length - suffix.length);
-            matched = true;
-            break; // A selected pattern never falls through to a less specific one.
-          }
-        }
-      }
+      const match = matchSubpath(subpath, exportsField);
+      if (match) { [target, patternMatch] = match; matched = true; }
     }
     if (!matched) fail("ERR_PACKAGE_PATH_NOT_EXPORTED", `Subpath "${subpath}" is not exported`);
     const resolved = selectTarget(target, ["import", "default"], patternMatch);
