@@ -9,6 +9,8 @@
  *
  * Geometry comes from createGpuProgramGeometry(); locations the geometry lacks
  * read GL's constant default attribute (0, 0, 0, 1) from a stride-0 buffer.
+ * Indexed points use bounded, source-ordered quad runs without vertex copying;
+ * maxPointDraws bounds their aggregate native draw expansion per frame.
  * Nothing here interprets source objects or uniform values.
  *
  * Provoking vertex: GL takes a flat varying from a primitive's LAST vertex,
@@ -25,14 +27,18 @@ import {programGeometrySnapshot} from './gpu_buffer_geometry.mjs';
 import {createAnimationColorTargetProfile} from './animation_color_target.mjs';
 import {hasAnimationStencil, snapshotAnimationRaster} from './animation_raster.mjs';
 import {createProgramIndexLowering} from './animation_program_indices.mjs';
+import {snapshotProgramPointRuns} from './animation_program_points.mjs';
 
 const VERTEX = 1, FRAGMENT = 2;
 const UNIFORM_USAGE = 64 | 8; // UNIFORM | COPY_DST
 const ALIGN = 256;
 
-export function createProgramMeshes({device, format, depthFormat, sampleCount, maxDraws, label, fail, scoped, lost, maxIndexBytes = 64 * 1024 * 1024}) {
+export function createProgramMeshes({device, format, depthFormat, sampleCount, maxDraws, label, fail, scoped, lost, maxIndexBytes = 64 * 1024 * 1024, maxPointDraws = 65536}) {
   const colorTarget = createAnimationColorTargetProfile(device, {format, sampleCount},
     message => fail('ANIMATION_RENDER_OPTIONS', message));
+  if (!Number.isSafeInteger(maxPointDraws) || maxPointDraws < 1 || maxPointDraws > 0xffffffff)
+    fail('ANIMATION_RENDER_LIMIT', 'Invalid native point draw budget');
+  let pointDraws = 0;
   const indices = createProgramIndexLowering(device, {label, fail, maxBytes: maxIndexBytes, maxEntries: maxDraws});
   let arena = null, constant = null, cursor = 0;
   function ensureArena() {
@@ -63,7 +69,8 @@ export function createProgramMeshes({device, format, depthFormat, sampleCount, m
     const geometry = programGeometrySnapshot(gpu, device);
     const points = reflection.points === true;
     if (points && topology !== 'points') fail('ANIMATION_RENDER_OPTIONS', 'Point programs draw point primitives');
-    if (points && (geometry.indexBuffer || geometry.instanced)) fail('ANIMATION_RENDER_GEOMETRY', 'Indexed or instanced point sprites are not admitted yet');
+    if (points && (geometry.instanced || geometry.layouts.some(l => l.stepMode === 'instance')))
+      fail('ANIMATION_RENDER_GEOMETRY', 'Instanced point sprites require a separate source-instance shader path');
     const provoking = !points && reflection.varyings?.some(v => v.flat) && topology !== 'points' ? topology : null;
     if (provoking && !['triangles', 'lines', 'line-strip'].includes(provoking))
       fail('ANIMATION_RENDER_OPTIONS', 'Unsupported flat-varying topology');
@@ -117,6 +124,9 @@ export function createProgramMeshes({device, format, depthFormat, sampleCount, m
     if (!(bytes instanceof Uint8Array) || bytes.byteLength !== size) fail('ANIMATION_RENDER_VALUE', 'Program draws need their packed uniform bytes');
     const geometry = programGeometrySnapshot(record.gpu, device);
     if (geometry.signature !== record.geometrySignature) fail('ANIMATION_RENDER_GEOMETRY', 'Program geometry layout changed; register it again');
+    // Capture indexed point order before consuming the uniform slice. Rejected
+    // expansion/range requests leave both per-frame budgets available for retry.
+    const pointPlan = record.points ? snapshotProgramPointRuns(geometry, input, maxPointDraws - pointDraws, fail) : null;
     const offset = Math.ceil(cursor / ALIGN) * ALIGN;
     if (offset + size > arena.size) fail('ANIMATION_RENDER_LIMIT', 'Program uniform arena exhausted for this frame');
     arena.staged.set(bytes, offset);
@@ -126,11 +136,13 @@ export function createProgramMeshes({device, format, depthFormat, sampleCount, m
     let first = Math.max(input.first ?? 0, range.first), end = Math.min((input.first ?? 0) + (input.count ?? extent), range.first + range.count, extent);
     const instanceCount = geometry.instanced ? Math.min(input.instanceCount ?? 1, geometry.instanceCapacity) : input.instanceCount ?? 1;
     if (record.points) {
-      // Point sprites: count points become instances of a 6-vertex quad.
-      Object.assign(command, {record, first: 0, count: 6, firstInstance: first, pointCount: Math.max(0, end - first),
-        pipeline: input.frontFaceCW ? record.pipelines.flipped : record.pipelines.normal, program: {group: record.uniformGroup, offset},
+      // firstInstance indexes the source vertex and supplies gl_VertexID in
+      // the point shader. Ordered runs retain duplicates and restart breaks.
+      pointDraws += pointPlan.runs.length / 2;
+      Object.assign(command, {record, first: 0, count: 6, firstInstance: geometry.indexBuffer ? 0 : first, pointCount: pointPlan.count,
+        pipeline: input.frontFaceCW ? record.pipelines.flipped : record.pipelines.normal, program: {group: record.uniformGroup, offset, pointRuns: pointPlan.runs},
         vertexBuffers: [...geometry.vertexBuffers, ...geometry.channels.missing.map(() => constant)], indexBuffer: null, indexFormat: null,
-        instanceCount: Math.max(0, end - first), instanceBindGroup: null, blendConstant: record.blendConstant, stencilReference: record.stencilReference});
+        instanceCount: pointPlan.count, instanceBindGroup: null, blendConstant: record.blendConstant, stencilReference: record.stencilReference});
       return geometry;
     }
     const rotated = record.provoking ? indices.prepare(record.gpu, geometry, record.provoking, first, Math.max(first, end)) : null;
@@ -147,7 +159,7 @@ export function createProgramMeshes({device, format, depthFormat, sampleCount, m
   }
   return {
     add, stage,
-    begin() { cursor = 0; indices.begin(); },
+    begin() { cursor = 0; pointDraws = 0; indices.begin(); },
     write() { if (arena && cursor) device.queue.writeBuffer(arena.buffer, 0, arena.staged, 0, Math.ceil(cursor / 4) * 4); },
     dispose() { arena?.buffer.destroy(); constant?.destroy(); arena = null; constant = null; indices.dispose(); },
   };

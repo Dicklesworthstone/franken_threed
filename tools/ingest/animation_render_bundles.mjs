@@ -39,6 +39,15 @@ export function encodeAnimationDraws(encoder, commands, length, {
       encoder.setBindGroup(0, command.program.group, [command.program.offset]);
       if (record.textureGroup) encoder.setBindGroup(1, record.textureGroup);
       for (let slot = 0; slot < command.vertexBuffers.length; slot++) encoder.setVertexBuffer(slot, command.vertexBuffers[slot]);
+      const pointRuns = command.program.pointRuns;
+      if (pointRuns != null) {
+        for (let run = 0; run < pointRuns.length; run += 2) {
+          encoder.draw(6, pointRuns[run + 1], 0, pointRuns[run]);
+          calls++;
+        }
+        i++;
+        continue;
+      }
       if (command.indexBuffer) {
         encoder.setIndexBuffer(command.indexBuffer, command.indexFormat);
         encoder.drawIndexed(count, command.instanceCount, first, 0, 0);
@@ -76,7 +85,12 @@ function snapshot(command, lightGroup) {
     textureGroup: command.record.textureGroup, lit: command.record.lit,
     lightGroup: command.record.lit ? lightGroup : null,
     blend: blended(command.record),
+    // Plans are immutable, owned snapshots; never retain a live index reader.
+    pointRuns: command.program?.pointRuns ?? null,
     programGroup: command.program?.group ?? null, programOffset: command.program?.offset ?? null, firstInstance: command.firstInstance ?? 0};
+}
+function samePointRuns(a, b) {
+  return a === b || (a != null && b != null && a.length === b.length && a.every((value, i) => value === b[i]));
 }
 function matches(recorded, commands, length, lightGroup, start) {
   if (recorded.length !== length) return false;
@@ -89,7 +103,8 @@ function matches(recorded, commands, length, lightGroup, start) {
         a.lit !== r.lit || a.lightGroup !== (r.lit ? lightGroup : null) ||
         a.blend !== blended(r) || a.vertexBuffers.length !== b.vertexBuffers.length ||
         a.programGroup !== (b.program?.group ?? null) || a.programOffset !== (b.program?.offset ?? null) ||
-        a.firstInstance !== (b.firstInstance ?? 0))
+        a.firstInstance !== (b.firstInstance ?? 0) ||
+        !samePointRuns(a.pointRuns, b.program?.pointRuns ?? null))
       return false;
     for (let slot = 0; slot < a.vertexBuffers.length; slot++)
       if (a.vertexBuffers[slot] !== b.vertexBuffers[slot]) return false;
