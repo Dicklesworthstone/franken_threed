@@ -76,20 +76,27 @@ export function resolveInstalledPackage(specifier, referrerUrl, { span = null, r
 
   function resolveAt(directory, value) {
     const packageJsonPath = path.join(directory, "package.json");
-    let target;
+    let target, declaredEsmEntry = false;
     if (value?.exports !== null && value?.exports !== undefined) {
       target = resolvePackageExports(subpath, value.exports, packageJsonPath, specifier, referrerUrl, span);
     } else {
-      // Legacy ESM packages may use an explicit main file or exact subpaths.
-      // Extension/directory guessing is deliberately not a CommonJS fallback.
-      const main = typeof value?.main === "string" && value.main ? value.main : "index.js";
-      const relative = subpath === "." ? (main.startsWith("./") ? main : "./" + main) : subpath;
+      // Without exports, legacy browser/module entries precede main. Selection
+      // is metadata-driven: a missing or unsupported selected file must fail,
+      // not switch implementations. Exact subpaths bypass entrypoint fields.
+      const entryField = name => typeof value?.[name] === "string" && value[name] ? value[name] : null;
+      const asTarget = filename => filename.startsWith("./") ? filename : "./" + filename;
+      const moduleEntry = entryField("module");
+      const entry = entryField("browser") || moduleEntry || entryField("main") || "index.js";
+      const relative = subpath === "." ? asTarget(entry) : subpath;
       target = resolvePackageExports(".", relative, packageJsonPath, specifier, referrerUrl, span);
+      // The module field explicitly declares ESM, including .js beside a
+      // CommonJS main. A browser string alone makes no such format promise.
+      declaredEsmEntry = subpath === "." && moduleEntry !== null && relative === asTarget(moduleEntry);
     }
-    return finalize(directory, target);
+    return finalize(directory, target, declaredEsmEntry);
   }
 
-  function finalize(directory, target) {
+  function finalize(directory, target, declaredEsmEntry = false) {
     const packageJsonPath = path.join(directory, "package.json");
     const url = new URL(target, pathToFileURL(directory + path.sep));
     let filename;
@@ -101,8 +108,8 @@ export function resolveInstalledPackage(specifier, referrerUrl, { span = null, r
     try { filename = fs.realpathSync(filename); }
     catch (error) { fail("F3D_PACKAGE_IO", `Cannot canonicalize "${filename}": ${error.message}`); }
     const extension = path.extname(filename);
-    if (extension !== ".mjs" && !(extension === ".js" && scope(path.dirname(filename))?.value.type === "module"))
-      fail("F3D_PACKAGE_FORMAT", `Selected target "${filename}" is not explicit ESM (.mjs or .js in a type:module package); CommonJS and non-JavaScript loaders need a separate route`);
+    if (extension !== ".mjs" && !(extension === ".js" && (declaredEsmEntry || scope(path.dirname(filename))?.value.type === "module")))
+      fail("F3D_PACKAGE_FORMAT", `Selected target "${filename}" is not explicit ESM (.mjs, a declared module entry, or .js in a type:module package); CommonJS and non-JavaScript loaders need a separate route`);
     const canonical = pathToFileURL(filename);
     canonical.search = url.search; canonical.hash = url.hash;
     return canonical.href;
