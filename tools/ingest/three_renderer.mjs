@@ -32,6 +32,7 @@ import {createGpuHdrCanvasRenderer} from './gpu_hdr_canvas.mjs';
 import {createGpuThreeScene} from './three_scene.mjs';
 import {createThreeRenderTargets, inspectThreeRenderTarget} from './three_render_targets.mjs';
 import {readGpuTargetPixels} from './gpu_target_readback.mjs';
+import {createThreeRendererTransfers} from './three_renderer_transfers.mjs';
 import {createThreePassSnapshots} from './three_pass_snapshot.mjs';
 import {createThreeProgramSupport} from './three_program.mjs';
 import {createThreeProgramPMREM} from './three_program_pmrem.mjs';
@@ -73,7 +74,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
   if (THREE?.REVISION !== '186' || typeof THREE.Scene !== 'function' || typeof THREE.Color !== 'function' ||
       typeof THREE.Vector2 !== 'function') fail('SOURCE', 'Supply the pinned r186 three module namespace');
   if (!classOptions || typeof classOptions !== 'object' || Array.isArray(classOptions)) fail('OPTIONS', 'Expected class options');
-  const {gpu: defaultGpu, maxDraws = 16384, maxBindings = 16384, scene: sceneLimits = {}, exactBackend = null} = classOptions;
+  const {gpu: defaultGpu, maxDraws = 16384, maxBindings = 16384, scene: sceneLimits = {}, exactBackend = null,
+    maxTransferBytes = 128 * 1024 * 1024, maxTransfers = 64} = classOptions;
+  if (![maxTransferBytes, maxTransfers].every(n => Number.isSafeInteger(n) && n > 0))
+    fail('OPTIONS', 'Expected positive renderer transfer byte and request limits');
   if (exactBackend !== null && typeof exactBackend !== 'function') fail('OPTIONS', 'exactBackend must be a renderer constructor');
   if (!Number.isSafeInteger(maxDraws) || maxDraws < 1 || !Number.isSafeInteger(maxBindings) || maxBindings < 1)
     fail('OPTIONS', 'Expected positive draw and binding capacities');
@@ -282,6 +286,11 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._animationCallback = null;
       this._animationHandle = null;
       this._disposed = false;
+      this._transfers = createThreeRendererTransfers(this, F3DRendererError, {maxBytes: maxTransferBytes, maxRequests: maxTransfers});
+      Object.defineProperties(this.info.f3d, {
+        pendingTransfers: {enumerable: true, get: () => this._transfers.pendingRequests},
+        pendingTransferBytes: {enumerable: true, get: () => this._transfers.allocatedBytes},
+      });
       this._renderUid = 0;
       // Tooling surface (e.g. the r186 Inspector addon). This backend records no
       // GPU timestamps: hasTimestamp stays false and no timing is reported.
@@ -456,6 +465,15 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       if (activeCubeFace !== 0 || activeMipmapLevel !== 0) fail('UNSUPPORTED', 'Cube faces and target mip levels are not admitted');
       if (renderTarget !== null) this._targets.capture(renderTarget);
       this._renderTarget = renderTarget;
+    }
+    /** F3D extensions: call-time upload snapshots and ordered GPU-only copies.
+     * Regions use this surface's origin (WebGPU top-left, WebGL bottom-left),
+     * overridable with options.flipY. Promises include validation/completion. */
+    writeRenderTargetPixelsAsync(target, data, options = {}) {
+      return this._transfers.writePixels(target, data, options);
+    }
+    copyRenderTargetPixelsAsync(source, destination, options = {}) {
+      return this._transfers.copyColor(source, destination, options);
     }
     readRenderTargetPixelsAsync(target, x, y, width, height, textureIndex = 0, faceIndex = 0) {
       if (textureIndex !== 0 || faceIndex !== 0) return Promise.reject(new F3DRendererError('UNSUPPORTED', 'Only the 2D color attachment is readable'));
@@ -639,9 +657,9 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       await this.init();
       while (this._pending.length && !this._disposed) {
         const request = this._pending[0];
-        if (request.readback) {
-          // Queue the copy now but do not await mapping: subsequent draws may
-          // submit once the copy has captured this version of the attachment.
+        if (request.readback || request.transfer) {
+          // Submit now; do not stall later draws on mapping or transfer fences.
+          // Target content is captured by the submitted operation, not its await.
           try { request.resolve(request.issue()); } catch (error) { request.reject(error); }
           this._pending.shift(); continue;
         }
@@ -741,6 +759,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       while (this._drain) await this._drain;
       if (this._preparing) await this._preparing;
       if (this._session) await this._session.whenIdle();
+      await this._transfers.whenIdle();
       await this._targets.whenIdle();
     }
 
