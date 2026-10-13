@@ -13,7 +13,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { IngestionResolutionError } from "./types.mjs";
 import { resolvePackageExports } from "./package_exports.mjs";
-import { resolveInstalledPackage } from "./node_package_resolver.mjs";
+import { resolveInstalledPackage, resolvePackageBrowserMapping } from "./node_package_resolver.mjs";
 export { resolveExportTargetValue, resolvePackageExports } from "./package_exports.mjs";
 
 /**
@@ -290,9 +290,18 @@ export function resolveModuleSpecifier(specifier, referrerUrl, importMap = {}, o
   const mapBaseUrl = options.mapBaseUrl || referrerBase;
 
   let candidateUrl = null;
+  const packageOptions = {
+    span, browserSkip: options.browserSkip, browserTrail: options.browserTrail,
+    // Replacement dependencies and #imports originate at the owner, but keep
+    // the HTML map base, scoped host adapters and the pinned Three.js policy.
+    resolveExternal: (target, from, state = {}) =>
+      resolveModuleSpecifier(target, from, importMap, { ...options, ...state, mapBaseUrl }),
+  };
 
   // 1. Try import map
   const mapped = matchImportMap(specifier, referrerUrl, importMap, mapBaseUrl);
+  const browserTarget = mapped || specifier === "three" || specifier.startsWith("three/")
+    ? null : resolvePackageBrowserMapping(specifier, referrerUrl, packageOptions);
   if (mapped) {
     if (typeof mapped === "object" && mapped.blocked) {
       throw new IngestionResolutionError(
@@ -306,6 +315,8 @@ export function resolveModuleSpecifier(specifier, referrerUrl, importMap = {}, o
       throw new IngestionResolutionError(mapped.error, specifier, referrerUrl, span);
     }
     candidateUrl = mapped;
+  } else if (browserTarget !== null) {
+    candidateUrl = browserTarget;
   } else if (isAbsoluteUrl(specifier)) {
     // 2. Explicit absolute URL (file://, http://, https://, data:)
     candidateUrl = new URL(specifier).href;
@@ -367,12 +378,7 @@ export function resolveModuleSpecifier(specifier, referrerUrl, importMap = {}, o
     candidateUrl = new URL(relativeTarget, pkgRootUrl).href;
   } else {
     // 4b. Ordinary installed ESM dependencies; never overrides maps or the pin.
-    candidateUrl = resolveInstalledPackage(specifier, referrerUrl, {
-      span,
-      // Package #imports dependencies originate at their owning package, but
-      // keep the HTML import-map base and the same pinned Three.js policy.
-      resolveExternal: (target, from) => resolveModuleSpecifier(target, from, importMap, { ...options, mapBaseUrl }),
-    });
+    candidateUrl = resolveInstalledPackage(specifier, referrerUrl, packageOptions);
   }
 
   // 5. Verify target exists if file: URL
