@@ -26,6 +26,19 @@ function fixture(t, sources) {
   // Node worker threads/native ESM. No simulated module evaluation or linker.
   const bootstrap = write('host.mjs', `
 import {parentPort, workerData, Worker as Thread} from 'node:worker_threads';
+import {readFile} from 'node:fs/promises';
+// Local file-response adapter only, since Node fetch does not serve file URLs.
+// Resolution deliberately uses the entry URL, matching a worker environment.
+const nativeFetch = globalThis.fetch;
+globalThis.fetch = async (input, options) => {
+  const url = new URL(String(input), workerData.entry);
+  if (url.protocol !== 'file:') return nativeFetch(input, options);
+  return new Response(await readFile(url), {headers: {
+    'content-type': url.pathname.endsWith('.wasm') ? 'application/wasm' : 'application/octet-stream',
+  }});
+};
+// Records constructor URLs only; this does not simulate SharedWorker lifetime.
+globalThis.SharedWorker = class { constructor(url) { this.url = String(url); } };
 globalThis.self = globalThis;
 globalThis.postMessage = (value, transfer) => parentPort.postMessage(value, transfer);
 let handler;
@@ -141,7 +154,7 @@ test('copies binary assets referenced by a dependency and retains their URL suff
 test('asset suffixes share bytes, not module instances', t => {
   const f = fixture(t, {'worker.mjs': "new URL('./a.bin?one', import.meta.url); new URL('./a.bin?two', import.meta.url);", 'a.bin': 'bytes'});
   const graph = buildModuleWorkerGraph(f.entry); assert.equal(graph.assetCount, 1);
-  assert.match(graph.files[0].source, /a0.bin\?one/); assert.match(graph.files[0].source, /a0.bin\?two/);
+  assert.match(graph.files[0].source, /resource.bin\?one/); assert.match(graph.files[0].source, /resource.bin\?two/);
 });
 test('nested module workers carry their own transitive dependencies and execute in actual child threads', async t => {
   const f = fixture(t, {
@@ -271,12 +284,186 @@ for (const target of ['https://example.invalid/worker.mjs', '/worker.mjs', '//ex
     assert.equal(plugin.transform.call(r.context, construction('Worker', target), f.entry), null); assert.equal(r.files.length, 0);
   });
 
-test('relative fetch literals are not silently relocated with the wrong worker base', t => {
+test('worker fetch: missing literal resources fail rather than emit a broken fetch', t => {
   const f = fixture(t, {'worker.mjs': "await fetch('./data.bin');"});
-  assert.throws(() => buildModuleWorkerGraph(f.entry), codeIs('FETCH'));
+  assert.throws(() => buildModuleWorkerGraph(f.entry), codeIs('RESOURCE'));
 });
 test('origin-root and non-file asset URLs remain host-owned inside worker modules', t => {
   const source = "new URL('/data.bin', import.meta.url); new URL('blob:https://example.invalid/id', import.meta.url);";
   const f = fixture(t, {'worker.mjs': source});
   const graph = buildModuleWorkerGraph(f.entry); assert.equal(graph.assetCount, 0); assert.equal(graph.files[0].source, source);
+});
+
+
+test('worker fetch: loads text and JSON resources in an actual worker', async t => {
+  const f = fixture(t, {
+    'worker.mjs': `const a = await (await fetch('./message.txt?raw#one')).text();
+      const b = await (await fetch('./settings.json')).json(); postMessage([a, b.answer]);`,
+    'message.txt': 'hello from the packaged worker', 'settings.json': '{"answer":42}',
+  });
+  const graph = buildModuleWorkerGraph(f.entry);
+  assert.equal(graph.assetCount, 2);
+  assert.deepEqual(await f.run(f.emit(graph)), ['hello from the packaged worker', 42]);
+});
+test('worker fetch: imported modules resolve relative requests from the worker entry', async t => {
+  const f = fixture(t, {
+    'worker.mjs': `import {read} from './helpers/read.mjs'; postMessage(await read());`,
+    'helpers/read.mjs': `export async function read() { return (await fetch('./data.txt')).text(); }`,
+    'data.txt': 'entry-relative', 'helpers/data.txt': 'WRONG module-relative',
+  });
+  const graph = buildModuleWorkerGraph(f.entry);
+  assert.deepEqual(graph.watchFiles.filter(p => p.endsWith('data.txt')), [fileURLToPath(new URL('./data.txt', f.entry))]);
+  assert.equal(await f.run(f.emit(graph)), 'entry-relative');
+});
+test('worker fetch: one imported helper is specialized for two different nested worker entry bases', async t => {
+  const f = fixture(t, {
+    'worker.mjs': `const a = ${construction('Worker', './a/entry.mjs')};
+      const b = ${construction('Worker', './b/entry.mjs')};
+      const values = await Promise.all([new Promise(r => a.onmessage = e => r(e.data)), new Promise(r => b.onmessage = e => r(e.data))]);
+      postMessage(values); a.terminate(); b.terminate();`,
+    'a/entry.mjs': `import {read} from '../shared/read.mjs'; postMessage(await read());`,
+    'b/entry.mjs': `import {read} from '../shared/read.mjs'; postMessage(await read());`,
+    'shared/read.mjs': `export async function read() {return (await fetch('./data.txt')).text();}`,
+    'a/data.txt': 'A', 'b/data.txt': 'B', 'shared/data.txt': 'WRONG shared-directory base',
+  });
+  const graph = buildModuleWorkerGraph(f.entry);
+  assert.equal(graph.moduleCount, 5); // Root, two entries, two realm-specific helper instances.
+  assert.equal(graph.assetCount, 2);
+  assert.deepEqual(await f.run(f.emit(graph)), ['A', 'B']);
+});
+test('worker fetch: native WebAssembly streaming compilation consumes a packaged worker binary', async t => {
+  // Minimal real Wasm module exporting answer():i32 -> 42.
+  const wasm = Buffer.from('0061736d010000000105016000017f03020100070a0106616e7377657200000a06010400412a0b', 'hex');
+  assert.equal(WebAssembly.validate(wasm), true);
+  const f = fixture(t, {
+    'worker.mjs': `const {instance} = await WebAssembly.instantiateStreaming(fetch('./answer.wasm')); postMessage(instance.exports.answer());`,
+    'answer.wasm': wasm,
+  });
+  const graph = buildModuleWorkerGraph(f.entry);
+  assert.equal(graph.assetCount, 1); assert.equal(await f.run(f.emit(graph)), 42);
+});
+test('worker fetch: conditional resource selection and options side effects execute once in order', async t => {
+  const f = fixture(t, {
+    'worker.mjs': `let order = ''; const response = await fetch((order += 'selector;', true) ? './yes.txt' : './no.txt',
+      {method:'get', headers: (order += 'headers;', {'x-test':'value'})});
+      postMessage([await response.text(), order]);`,
+    'yes.txt': 'selected', 'no.txt': 'not selected',
+  });
+  const graph = buildModuleWorkerGraph(f.entry);
+  assert.equal(graph.assetCount, 2);
+  assert.deepEqual(await f.run(f.emit(graph)), ['selected', 'selector;headers;']);
+});
+for (const spelling of ['globalThis.fetch', 'self.fetch']) test(`worker fetch: supports ${spelling} without changing its receiver`, async t => {
+  const f = fixture(t, {'worker.mjs': `postMessage(await (await ${spelling}('./data.txt')).text());`, 'data.txt': spelling});
+  assert.equal(await f.run(f.emit(buildModuleWorkerGraph(f.entry))), spelling);
+});
+for (const options of ["{method:'POST'}", "{method:chooseMethod()}", 'options', '{...options}', "{['method']:'GET'}", "{get method(){return 'GET'}}", "{__proto__:options}"])
+  test(`worker fetch: rejects unproved static GET ${options} before graph emission`, t => {
+    const f = fixture(t, {'worker.mjs': `fetch('./data.txt', ${options});`, 'data.txt': 'x'});
+    const r = recorder(), plugin = moduleWorkerRollupPlugin();
+    assert.throws(() => plugin.transform.call(r.context, construction(), f.entry), codeIs('FETCH'));
+    assert.equal(r.files.length, 0);
+  });
+test('worker fetch: leaves external, root-relative and dynamic networking untouched', t => {
+  const source = `fetch('https://example.invalid/api',{method:'POST'}); fetch('/api',{method:'POST'}); export const request = value => fetch(value);`;
+  const f = fixture(t, {'worker.mjs': source});
+  const graph = buildModuleWorkerGraph(f.entry);
+  assert.equal(graph.files[0].source, source); assert.equal(graph.assetCount, 0);
+});
+test('worker fetch: does not rewrite a custom local fetch binding', async t => {
+  const source = `const fetch = async value => ({text:async()=>value}); postMessage(await (await fetch('./does-not-exist')).text());`;
+  const f = fixture(t, {'worker.mjs': source});
+  const graph = buildModuleWorkerGraph(f.entry);
+  assert.equal(graph.assetCount, 0); assert.equal(graph.files[0].source, source);
+  assert.equal(await f.run(f.emit(graph)), './does-not-exist');
+});
+test('worker fetch: source URL shadowing does not affect literal-fetch relocation', async t => {
+  const f = fixture(t, {'worker.mjs': `const URL = null; postMessage(await (await fetch('./data.txt')).text());`, 'data.txt': 'no injected URL helper'});
+  assert.equal(await f.run(f.emit(buildModuleWorkerGraph(f.entry))), 'no injected URL helper');
+});
+test('worker fetch: runtime asset bytes change the content address of every dependent worker realm', t => {
+  const f = fixture(t, {'worker.mjs': `postMessage(await (await fetch('./data.txt')).text());`, 'data.txt': 'one'});
+  const first = buildModuleWorkerGraph(f.entry);
+  f.write('source/data.txt', 'two');
+  const second = buildModuleWorkerGraph(f.entry);
+  assert.notEqual(first.entryFile, second.entryFile);
+  assert.notEqual(first.files.at(-1).fileName, second.files.at(-1).fileName);
+});
+test('worker realm: nested SharedWorker URLs are identical across independently discovered parent graphs', async t => {
+  const f = fixture(t, {
+    'worker.mjs': `postMessage(${construction('SharedWorker', './shared/entry.mjs')}.url);`,
+    'other.mjs': `postMessage(${construction('SharedWorker', './shared/entry.mjs')}.url);`,
+    'shared/entry.mjs': `import './dependency.mjs';`, 'shared/dependency.mjs': 'export const value = 42;',
+  });
+  const a = buildModuleWorkerGraph(f.entry), b = buildModuleWorkerGraph(new URL('./other.mjs', f.entry).href);
+  const aUrl = f.emit(a), bUrl = f.emit(b); // Same served output tree for both parents.
+  const [fromA, fromB] = await Promise.all([f.run(aUrl), f.run(bUrl)]);
+  assert.equal(fromA, fromB);
+  assert.ok(fs.statSync(fileURLToPath(fromA)).isFile());
+});
+test('worker realm: an unrelated parent edit does not change a nested shared entry URL', t => {
+  const f = fixture(t, {'worker.mjs': construction('SharedWorker', './shared.mjs'), 'shared.mjs': 'export {};'});
+  const child = new URL('./shared.mjs', f.entry).href;
+  const first = buildModuleWorkerGraph(f.entry);
+  f.write('source/worker.mjs', `const unrelated = 42; ${construction('SharedWorker', './shared.mjs')}`);
+  const second = buildModuleWorkerGraph(f.entry);
+  assert.notEqual(first.entryFile, second.entryFile);
+  assert.equal(first.entries.find(e => e.url === child).fileName, second.entries.find(e => e.url === child).fileName);
+});
+test('worker realm: transitive shared-worker edits invalidate shared and parent entries', t => {
+  const f = fixture(t, {'worker.mjs': construction('SharedWorker', './shared.mjs'), 'shared.mjs': "import './dependency.mjs';", 'dependency.mjs': 'export const value = 41;'});
+  const child = new URL('./shared.mjs', f.entry).href, first = buildModuleWorkerGraph(f.entry);
+  f.write('source/dependency.mjs', 'export const value = 42;');
+  const second = buildModuleWorkerGraph(f.entry);
+  assert.notEqual(first.entryFile, second.entryFile);
+  assert.notEqual(first.entries.find(e => e.url === child).fileName, second.entries.find(e => e.url === child).fileName);
+});
+test('worker realm: the plugin reuses nested shared entry references on a later direct construction', t => {
+  const f = fixture(t, {'worker.mjs': construction('SharedWorker', './shared.mjs?identity#one'), 'shared.mjs': 'export {};'});
+  const plugin = moduleWorkerRollupPlugin(), r = recorder();
+  plugin.transform.call(r.context, construction(), f.entry);
+  const before = r.files.length;
+  const direct = plugin.transform.call(r.context, construction('SharedWorker', './shared.mjs?identity#one'), f.entry);
+  assert.equal(r.files.length, before);
+  const ref = direct.code.match(/ROLLUP_FILE_URL_(worker\d+)/)[1];
+  assert.match(plugin.resolveFileUrl({referenceId:ref, relativePath:'./shared.mjs'}), /\?identity#one/);
+});
+test('worker realm: two parent graphs emit the same nested files only once', t => {
+  const f = fixture(t, {'worker.mjs': construction('SharedWorker', './shared.mjs'), 'other.mjs': construction('SharedWorker', './shared.mjs'), 'shared.mjs': 'export {};'});
+  const plugin = moduleWorkerRollupPlugin(), r = recorder();
+  plugin.transform.call(r.context, construction(), f.entry);
+  plugin.transform.call(r.context, construction('Worker', './other.mjs'), f.entry);
+  assert.equal(r.files.length, 3); assert.equal(new Set(r.files.map(f => f.fileName)).size, 3);
+});
+test('worker realm: mutual worker construction graphs compile without recursive URL hashing', t => {
+  const f = fixture(t, {'worker.mjs': construction('Worker', './other.mjs'), 'other.mjs': construction('Worker', './worker.mjs')});
+  const graph = buildModuleWorkerGraph(f.entry);
+  assert.equal(graph.moduleCount, 2); assert.equal(graph.entries.length, 2);
+  assert.deepEqual(graph, buildModuleWorkerGraph(f.entry));
+});
+
+
+test('worker realm: expanded source work is bounded even when physical inputs are cached', t => {
+  const sources = {
+    'worker.mjs': construction('Worker', './a.mjs') + ';' + construction('Worker', './b.mjs'),
+    'a.mjs': "import './shared.mjs';", 'b.mjs': "import './shared.mjs';",
+    'shared.mjs': '// ' + 'x'.repeat(700) + '\nexport {};',
+  };
+  const f = fixture(t, sources);
+  const physicalBytes = Object.values(sources).reduce((n, s) => n + Buffer.byteLength(s), 0);
+  assert.throws(() => buildModuleWorkerGraph(f.entry, {maxBytes: physicalBytes + 1}), error =>
+    codeIs('BUDGET')(error) && /Realm-expanded/.test(error.message));
+});
+test('worker realm: output expansion is bounded before constructing relocated sources', t => {
+  const sources = {'worker.mjs': "import './a.mjs';", 'a.mjs': 'export {};'};
+  const f = fixture(t, sources);
+  const maxBytes = Object.values(sources).reduce((n, s) => n + Buffer.byteLength(s), 0) + 1;
+  assert.throws(() => buildModuleWorkerGraph(f.entry, {maxBytes}), error =>
+    codeIs('BUDGET')(error) && /Relocated worker output/.test(error.message));
+});
+test('worker fetch: an unknown global write prevents host-fetch substitution', t => {
+  const source = `globalThis[chooseGlobalName()] = custom; fetch('./possibly-custom');`;
+  const f = fixture(t, {'worker.mjs': source});
+  const graph = buildModuleWorkerGraph(f.entry);
+  assert.equal(graph.assetCount, 0); assert.equal(graph.files[0].source, source);
 });

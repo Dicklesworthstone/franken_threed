@@ -2,6 +2,9 @@
  * Worker modules remain native ESM: cycles, live bindings and top-level await
  * are left to the host linker. No application import map, renderer substitution,
  * numeric specialization, classic-worker conversion or worker execution here.
+ * Relative static GET fetches use the originating worker entry's URL, not an
+ * importing module's directory. Realm-specific closures keep nested entry URLs
+ * stable across discovering parents and bound expanded source/output bytes.
  * Rollup receives a content-addressed, bounded multi-file package as assets.
  */
 import fs from 'node:fs';
@@ -48,7 +51,7 @@ function changedGlobals(ast) {
       ['globalThis', 'self', 'window'].includes(node.object.name)) {
       const name = node.computed ? text(node.property) : node.property.name;
       if (name !== null) changed.add(name);
-      else ['URL', 'Worker', 'SharedWorker'].forEach(n => changed.add(n));
+      else ['URL', 'Worker', 'SharedWorker', 'fetch'].forEach(n => changed.add(n));
     }
   }
   walk.simple(ast, {
@@ -98,27 +101,38 @@ export function buildModuleWorkerGraph(entryUrl, {
 } = {}) {
   if (typeof resolveModule !== 'function' || ![maxModules, maxAssets, maxBytes].every(n => Number.isSafeInteger(n) && n > 0))
     fail('OPTIONS', 'Expected a synchronous resolver and positive graph limits');
-  const modules = new Map(), assets = new Map(), queue = [], watchFiles = new Set();
-  let inputBytes = 0;
+  const modules = new Map(), assets = new Map(), queue = [], inputs = new Map(), roots = new Map();
+  const digest = value => createHash('sha256').update(value).digest('hex');
+  let inputBytes = 0, analyzedBytes = 0;
   const normalize = url => {
     try { return new URL(url).href; }
     catch { fail('RESOLUTION', 'Expected an absolute module URL', String(url)); }
   };
-  function module(url) {
+  function module(url, realm) {
     url = normalize(url);
     if (remote(url)) return {external: url};
     if (new URL(url).protocol !== 'file:') fail('RESOLUTION', 'Only local files and explicit http/https/data imports are supported', url);
-    let record = modules.get(url);
+    const key = JSON.stringify([realm, url]);
+    let record = modules.get(key);
     if (!record) {
       if (modules.size >= maxModules) fail('BUDGET', 'Worker module count exceeds maxModules', url);
-      record = {url, name: `m${modules.size}.mjs`}; modules.set(url, record); queue.push(record);
+      record = {key, url, realm, name: `m-${digest(url)}.mjs`, edges: new Set()};
+      modules.set(key, record); queue.push(record);
     }
+    return record;
+  }
+  function worker(url) {
+    url = normalize(url);
+    const record = module(url, url);
+    if (!record.external) roots.set(url, record);
     return record;
   }
   function read(url) {
     let filename, stat, bytes;
     try {
-      filename = fileURLToPath(url); stat = fs.statSync(filename); watchFiles.add(filename);
+      filename = fileURLToPath(url);
+      if (inputs.has(filename)) return inputs.get(filename);
+      stat = fs.statSync(filename);
       if (!stat.isFile()) fail('RESOURCE', 'Worker resources must be regular files', url);
       if (stat.size > maxBytes - inputBytes) fail('BUDGET', 'Worker inputs exceed maxBytes', url);
       bytes = fs.readFileSync(filename);
@@ -128,23 +142,26 @@ export function buildModuleWorkerGraph(entryUrl, {
     }
     inputBytes += bytes.length;
     if (inputBytes > maxBytes) fail('BUDGET', 'Worker inputs exceed maxBytes', url);
+    inputs.set(filename, bytes);
     return bytes;
   }
   function asset(url) {
     url = normalize(url);
     if (remote(url)) return {external: url};
     if (new URL(url).protocol !== 'file:') fail('RESOURCE', 'Unsupported worker asset URL', url);
-    // Asset bytes are shared across suffix variants, but the references retain
-    // each query/fragment. Module instances never use this physical-file key.
     const plain = new URL(url); plain.search = ''; plain.hash = '';
     let record = assets.get(plain.href);
     if (!record) {
       if (assets.size >= maxAssets) fail('BUDGET', 'Worker asset count exceeds maxAssets', url);
-      const extension = path.extname(fileURLToPath(plain)).replace(/[^.a-zA-Z0-9_-]/g, '_');
-      record = {url: plain.href, name: `a${assets.size}${extension}`, source: read(plain.href)};
+      const extension = path.extname(fileURLToPath(plain)).replace(/[^.a-zA-Z0-9_-]/g, '_').slice(0, 32);
+      const source = read(plain.href), key = JSON.stringify(['asset', plain.href]);
+      const signature = digest(JSON.stringify([key, digest(source)]));
+      record = {key, url: plain.href, source, signature, edges: new Set(),
+        fileName: `f3d-workers/assets/${signature}/resource${extension}`};
       assets.set(plain.href, record);
     }
-    return {...record, url};
+    // References retain their suffix without cloning the mutable target record.
+    return {asset: record, url};
   }
   function leaves(node, result = []) {
     if (result.length >= 128) return null;
@@ -152,19 +169,32 @@ export function buildModuleWorkerGraph(entryUrl, {
     if (node?.type !== 'ConditionalExpression') return null;
     return leaves(node.consequent, result) && leaves(node.alternate, result);
   }
-  const reference = record => record.external ?? `./${record.name}${suffix(record.url)}`;
-  const entry = module(entryUrl);
+  function staticGet(options) {
+    if (!options || (options.type === 'Literal' && options.value === null)) return true;
+    if (options.type !== 'ObjectExpression' || options.properties.some(p => p.type !== 'Property' ||
+        p.computed || p.kind !== 'init' || p.method || (p.key.name ?? p.key.value) === '__proto__')) return false;
+    const methods = options.properties.filter(p => (p.key.name ?? p.key.value) === 'method');
+    return methods.length === 0 || (methods.length === 1 && text(methods[0].value)?.toUpperCase() === 'GET');
+  }
+  const entry = worker(entryUrl);
   if (entry.external) fail('ENTRY', 'Worker graph entry must be a local file', entryUrl);
   for (let index = 0; index < queue.length; index++) {
-    const record = queue[index], source = read(record.url).toString('utf8');
+    const record = queue[index], bytes = read(record.url);
+    analyzedBytes += bytes.length;
+    if (analyzedBytes > maxBytes) fail('BUDGET', 'Realm-expanded worker sources exceed maxBytes', record.url);
+    const source = bytes.toString('utf8');
     const ast = parse(source, record.url), changed = changedGlobals(ast), edits = [];
-    function replace(node, target) { edits.push({start: node.start, end: node.end, text: JSON.stringify(reference(target))}); }
+    function replace(node, target, fetch = false) {
+      const actual = target.asset ?? target;
+      if (!actual.external) record.edges.add(actual);
+      edits.push({start: node.start, end: node.end, target: actual, suffix: target.external ? '' : suffix(target.url), fetch});
+    }
     function dependency(node) {
       let resolved;
       try { resolved = resolveModule(text(node), record.url); }
       catch (cause) { fail('RESOLUTION', cause.message, record.url); }
       if (typeof resolved !== 'string') fail('RESOLUTION', 'Worker resolver must return a URL synchronously', record.url);
-      replace(node, module(resolved));
+      replace(node, module(resolved, record.realm));
     }
     const workers = new Map(sitesIn(ast, changed).map(site => [site.urlNode.start, site]));
     walk.simple(ast, {
@@ -177,10 +207,21 @@ export function buildModuleWorkerGraph(entryUrl, {
         candidates.forEach(dependency);
       },
       CallExpression(node) {
-        if (node.callee.type !== 'Identifier' || node.callee.name !== 'fetch' || changed.has('fetch')) return;
-        const value = text(node.arguments[0]);
-        if (value !== null && !value.trim().startsWith('/') && !URL.canParse(value))
-          fail('FETCH', 'Use new URL(asset, import.meta.url) for local worker fetches before relocation', record.url);
+        if (changed.has('fetch')) return;
+        const callee = node.callee;
+        const direct = callee.type === 'Identifier' && callee.name === 'fetch';
+        const member = callee.type === 'MemberExpression' && !callee.computed && callee.property.name === 'fetch' &&
+          callee.object.type === 'Identifier' && ['globalThis', 'self'].includes(callee.object.name) && !changed.has(callee.object.name);
+        if (!direct && !member) return;
+        const candidates = leaves(node.arguments[0]);
+        if (!candidates) return; // Dynamic networking is not claimed closed.
+        for (const candidate of candidates) {
+          const value = text(candidate);
+          if (value.trim().startsWith('/') || URL.canParse(value)) continue;
+          if (!staticGet(node.arguments[1])) fail('FETCH', 'Relative worker resource fetches require a statically known GET request', record.url);
+          // fetch() uses the worker entry as its base, NOT the importing module.
+          replace(candidate, asset(new URL(value, record.realm).href), true);
+        }
       },
       NewExpression(node) {
         if (changed.has('URL')) return;
@@ -190,38 +231,73 @@ export function buildModuleWorkerGraph(entryUrl, {
         if (value.trim().startsWith('/')) return;
         const url = new URL(value, record.url).href;
         if (new URL(url).protocol !== 'file:') return;
-        replace(argument, workers.has(node.start) ? module(url) : asset(url));
+        replace(argument, workers.has(node.start) ? worker(url) : asset(url));
       },
     });
-    let output = source, end = source.length;
-    for (const edit of edits.sort((a, b) => b.start - a.start)) {
-      if (edit.end > end) fail('TRANSFORM', 'Overlapping worker source rewrites', record.url);
-      output = output.slice(0, edit.start) + edit.text + output.slice(edit.end); end = edit.start;
+    record.original = source; record.edits = edits.sort((a, b) => b.start - a.start);
+    // Hash symbolic links, not final output URLs, so mutually spawning workers
+    // have a finite content address and SharedWorker URLs don't depend on who
+    // happened to discover their graph first.
+    record.signature = digest(JSON.stringify([record.key, source, record.edits.map(e =>
+      [e.start, e.end, e.target.external ?? e.target.key, e.suffix, e.fetch])]));
+  }
+  let visits = 0;
+  const maxVisits = Math.min(Number.MAX_SAFE_INTEGER, 16 * (maxModules + maxAssets));
+  const directories = new Map();
+  for (const [url, root] of roots) {
+    const reached = new Set(), pending = [root];
+    for (let i = 0; i < pending.length; i++) {
+      const record = pending[i];
+      if (reached.has(record)) continue;
+      if (++visits > maxVisits) fail('BUDGET', 'Nested worker closure analysis exceeds its work budget', url);
+      reached.add(record);
+      for (const next of record.edges) if (!reached.has(next)) pending.push(next);
     }
-    record.source = output;
+    const hash = createHash('sha256').update('f3d-module-worker-realms-v1\0').update(url);
+    for (const record of [...reached].sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0))
+      hash.update(record.signature);
+    directories.set(url, `f3d-workers/${hash.digest('hex')}`);
   }
-  const hash = createHash('sha256');
-  for (const record of [...modules.values(), ...assets.values()]) {
-    hash.update(JSON.stringify([record.url, record.name, Buffer.byteLength(record.source)])); hash.update(record.source);
+  for (const record of modules.values()) record.fileName = `${directories.get(record.realm)}/${record.name}`;
+  let outputBytes = [...assets.values()].reduce((n, record) => n + record.source.length, 0);
+  for (const record of modules.values()) {
+    const replacements = []; let bytes = Buffer.byteLength(record.original), end = record.original.length;
+    for (const edit of record.edits) {
+      if (edit.end > end) fail('TRANSFORM', 'Overlapping worker source rewrites', record.url);
+      let value = edit.target.external;
+      if (value === undefined) {
+        const from = edit.fetch ? roots.get(record.realm).fileName : record.fileName;
+        const relative = path.posix.relative(path.posix.dirname(from), edit.target.fileName);
+        value = (relative.startsWith('.') ? relative : './' + relative) + edit.suffix;
+      }
+      value = JSON.stringify(value);
+      bytes += Buffer.byteLength(value) - Buffer.byteLength(record.original.slice(edit.start, edit.end));
+      replacements.push({...edit, value}); end = edit.start;
+    }
+    outputBytes += bytes;
+    if (outputBytes > maxBytes) fail('BUDGET', 'Relocated worker output exceeds maxBytes', entryUrl);
+    const parts = []; let offset = 0;
+    for (const edit of replacements.reverse()) {
+      parts.push(record.original.slice(offset, edit.start), edit.value); offset = edit.end;
+    }
+    parts.push(record.original.slice(offset)); record.source = parts.join('');
   }
-  const directory = `f3d-workers/${hash.digest('hex')}`;
   const files = [...modules.values(), ...assets.values()].map(record => ({
-    type: 'asset', fileName: `${directory}/${record.name}`, source: record.source,
+    type: 'asset', fileName: record.fileName, source: record.source,
   }));
-  const outputBytes = files.reduce((n, file) => n + Buffer.byteLength(file.source), 0);
-  if (outputBytes > maxBytes) fail('BUDGET', 'Relocated worker output exceeds maxBytes', entryUrl);
-  return {entryFile: `${directory}/${entry.name}`, files, moduleCount: modules.size, assetCount: assets.size, outputBytes, watchFiles: [...watchFiles]};
+  return {entryFile: entry.fileName, files, moduleCount: modules.size, assetCount: assets.size, outputBytes,
+    watchFiles: [...inputs.keys()], entries: [...roots].map(([url, root]) => ({url, fileName: root.fileName}))};
 }
 
 /** Run before the ordinary URL-asset transform in bundleWithRollup. */
 export function moduleWorkerRollupPlugin(options = {}) {
-  const emitted = new Map(), references = new Map();
+  const emitted = new Map(), references = new Map(), filesByName = new Map();
   let totalBytes = 0, totalModules = 0, totalAssets = 0;
   const maxBytes = options.maxBytes ?? 64 * 1024 * 1024;
   const maxModules = options.maxModules ?? 4096, maxAssets = options.maxAssets ?? 4096;
   return {
     name: 'f3d-module-workers',
-    buildStart() { emitted.clear(); references.clear(); totalBytes = totalModules = totalAssets = 0; },
+    buildStart() { emitted.clear(); references.clear(); filesByName.clear(); totalBytes = totalModules = totalAssets = 0; },
     resolveFileUrl({referenceId, relativePath}) {
       if (!references.has(referenceId)) return null;
       const relative = relativePath.startsWith('.') ? relativePath : './' + relativePath;
@@ -246,11 +322,15 @@ export function moduleWorkerRollupPlugin(options = {}) {
             fail('BUDGET', 'Module worker graphs exceed the shared build budget', url);
           for (const filename of graph.watchFiles) this.addWatchFile?.(filename);
           for (const file of graph.files) {
-            const ref = this.emitFile(file);
-            if (file.fileName === graph.entryFile) referenceId = ref;
+            let ref = filesByName.get(file.fileName);
+            if (!ref) { ref = this.emitFile(file); filesByName.set(file.fileName, ref); }
           }
+          for (const entry of graph.entries) {
+            const ref = filesByName.get(entry.fileName);
+            emitted.set(entry.url, ref); references.set(ref, suffix(entry.url));
+          }
+          referenceId = emitted.get(url);
           totalBytes += graph.outputBytes; totalModules += graph.moduleCount; totalAssets += graph.assetCount;
-          emitted.set(url, referenceId); references.set(referenceId, suffix(url));
         }
         edits.push({start: site.urlNode.start, end: site.urlNode.end,
           text: `new URL(import.meta.ROLLUP_FILE_URL_${referenceId}, import.meta.url)`});
