@@ -177,7 +177,8 @@ test("leaves non-URL constructor arguments and function/callee identity unchange
     assert.ok(worker instanceof NativeTestSeam);
     assert.deepEqual(events, ["name", "construct"]);
     assert.deepEqual(worker.options, { type: "module", name: "decoder" });
-    assert.ok(worker.url.startsWith("blob:"));
+    assert.ok(worker.url instanceof URL, "the original URL-object argument stays an object");
+    assert.ok(String(worker.url).startsWith("blob:"));
   } finally {
     if (prior) Object.defineProperty(globalThis, "Worker", prior);
     else delete globalThis.Worker;
@@ -220,8 +221,8 @@ for (const [label, files, code] of [
     "WORKER_MODULE_CYCLE",
   ],
   [
-    "nested worker",
-    { "worker.mjs": `new Worker('./child.mjs',{type:'module'});` },
+    "classic document parent",
+    { "index.html": `<script>new Worker('./worker.mjs',{type:'module'});</script>` },
     "WORKER_PARENT",
   ],
   ["location observation", { "worker.mjs": `postMessage(self.location.href);` }, "WORKER_LOCATION"],

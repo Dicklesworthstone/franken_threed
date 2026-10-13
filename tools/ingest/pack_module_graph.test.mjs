@@ -26,13 +26,16 @@ const runner = new URL(data(`
 `));
 async function execute(entry) {
   const thread = new Worker(runner, { workerData: entry });
-  let timer;
+  let timer, result, received = false;
   try {
     return await new Promise((resolve, reject) => {
       timer = setTimeout(() => reject(new Error("Module execution timed out")), 10000);
-      thread.once("message", resolve);
+      thread.once("message", (value) => { result = value; received = true; });
       thread.once("error", reject);
-      thread.once("exit", (code) => reject(new Error(`Exited without a result: ${code}`)));
+      // Let native TLA fulfillment finish before disposing its isolate. Early
+      // terminate() at the result message can race V8's module completion.
+      thread.once("exit", (code) => code === 0 && received ? resolve(result) :
+        reject(new Error(`Exited without a result: ${code}`)));
     });
   } finally {
     clearTimeout(timer);

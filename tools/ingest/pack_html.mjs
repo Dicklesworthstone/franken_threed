@@ -250,7 +250,13 @@ export function packHtml(
     workerModules = new Map(),
     workerClassics = new Map(),
     workerActive = new Set();
-  let inputBytes = 0;
+  let inputBytes = 0, workerBytes = 0;
+  function chargeWorker(encoded) {
+    const size = Buffer.byteLength(encoded);
+    if (size > maxBytes - workerBytes)
+      fail("PACK_LIMIT", "Realm-expanded worker graphs exceed packing limit");
+    workerBytes += size;
+  }
   function read(url) {
     const parsed = new URL(url);
     if (parsed.protocol !== "file:") fail("EXTERNAL_RESOURCE", `A local file is required: ${url}`);
@@ -404,8 +410,8 @@ export function packHtml(
     if (!mime) fail("MODULE_MIME", `Module needs a known emitted MIME suffix: ${url}`);
     return mime;
   }
-  function workerModuleFor(url, kind = "javascript") {
-    const key = JSON.stringify([kind, url]);
+  function workerModuleFor(url, kind, worker) {
+    const key = JSON.stringify([worker.kind, worker.entryUrl, kind, url]);
     if (workerActive.has(key))
       fail("WORKER_MODULE_CYCLE", "Bundle cyclic worker modules before single-file export");
     if (workerModules.has(key)) return workerModules.get(key);
@@ -425,23 +431,22 @@ export function packHtml(
       // JSON attribute or a JSON import of JavaScript into a successful load.
       // JSON and MIME-mismatched resources retain exact bytes and native errors.
       record.source = kind === "javascript" && JS_TYPES.has(record.mime)
-        ? javascript(text(original), url, "module", true) : original;
+        ? javascript(text(original), url, "module", worker) : original;
       record.data =
         dataUrl(record.source, record.mime) +
         "#" +
-        keyFor(url).slice(11) + ":" + kind;
-      if (Buffer.byteLength(record.data) > maxBytes)
-        fail("PACK_LIMIT", "Encoded worker module exceeds packing limit");
+        digest(JSON.stringify([worker.kind, keyFor(worker.entryUrl), kind, keyFor(url)]));
+      chargeWorker(record.data);
       return record;
     } finally {
       workerActive.delete(key);
     }
   }
-  function workerClassicFor(url, entryUrl) {
+  function workerClassicFor(url, worker) {
     // importScripts and fetch resolve relative to the worker's entry URL even
     // when the call lives in an imported classic script, NOT relative to that
     // imported script. The same source can therefore have several closures.
-    const key = `classic:${entryUrl}:${url}`;
+    const key = `classic:${worker.entryUrl}:${url}`;
     if (workerActive.has(key))
       fail("WORKER_SCRIPT_CYCLE", "Recursive classic imports require the normal build");
     if (workerClassics.has(key)) return workerClassics.get(key);
@@ -454,11 +459,10 @@ export function packHtml(
       fail("DATA_MODULE", "Pre-encoded worker scripts require the normal build");
     workerActive.add(key);
     try {
-      const source = javascript(text(read(url)), url, "script", { entryUrl });
+      const source = javascript(text(read(url)), url, "script", worker);
       const data =
-        dataUrl(source, "text/javascript") + "#" + digest(keyFor(entryUrl) + keyFor(url));
-      if (Buffer.byteLength(data) > maxBytes)
-        fail("PACK_LIMIT", "Encoded worker script exceeds packing limit");
+        dataUrl(source, "text/javascript") + "#" + digest(keyFor(worker.entryUrl) + keyFor(url));
+      chargeWorker(data);
       const record = { source, data };
       workerClassics.set(key, record);
       return record;
@@ -469,7 +473,35 @@ export function packHtml(
   function workerFactory(url, kind) {
     const key = kind + ":" + url;
     if (workers.has(key)) return workers.get(key);
-    const entry = kind === "classic" ? workerClassicFor(url, url) : workerModuleFor(url);
+    const active = "worker:" + key;
+    if (workerActive.has(active))
+      fail("WORKER_NESTING_CYCLE", "Cyclic worker construction requires the normal build");
+    if (workerActive.size >= 64) fail("PACK_LIMIT", "Nested workers exceed the depth limit");
+    const worker = {
+      entryUrl: url, kind, factories: new Map(), names: new Set(),
+      bindings: new Set(), hostUses: new Set(), preludeOffset: 0,
+    };
+    workerActive.add(active);
+    let entry;
+    try {
+      entry = kind === "classic" ? workerClassicFor(url, worker) : workerModuleFor(url, "javascript", worker);
+      for (const name of worker.hostUses)
+        if (worker.bindings.has(name))
+          fail("WORKER_BINDING", `Classic worker scripts rebind the host name ${name}`);
+      if (worker.factories.size) {
+        const declarations = [];
+        for (const [name, expression] of worker.factories) {
+          if (worker.names.has(name)) fail("WORKER_BINDING", "Classic worker factory name collision");
+          declarations.push(`const ${name} = ${expression};`);
+        }
+        // Only the entry gets a prelude, after its original directive prologue.
+        // importScripts remains repeatable and shares these private lexical
+        // bindings without wrapping scripts or exposing new global properties.
+        const offset = worker.preludeOffset;
+        entry = { ...entry, source: entry.source.slice(0, offset) + "\n" +
+          declarations.join("\n") + "\n" + entry.source.slice(offset) };
+      }
+    } finally { workerActive.delete(active); }
     if (typeof entry.source !== "string")
       fail("WORKER_MIME", "Module worker entry requires JavaScript MIME");
     // One cached URL per worker entry per creating realm, not one allocation per
@@ -477,16 +509,16 @@ export function packHtml(
     // a later invocation, or bfcache restoration may still need the same entry.
     // The File API releases this bounded URL table when the creating global dies.
     // Factory ESM scope prevents application locals from shadowing Blob or URL.
-    const source =
-      `// ${kind === "classic" ? "classic:" : ""}${keyFor(url)}\n` +
-      `const source = ${JSON.stringify(entry.source)};\nlet cached;\n` +
+    const fields = `const source = ${JSON.stringify(entry.source)};\nlet cached;\n`;
+    const getURL = `return cached ??= URL.createObjectURL(new Blob([source], {type:'text/javascript'}));`;
+    const source = `// ${kind === "classic" ? "classic:" : ""}${keyFor(url)}\n` + fields +
       `export default function workerURL() {\n` +
-      `  return cached ??= URL.createObjectURL(new Blob([source], {type:'text/javascript'}));\n}\n`;
+      `  ${getURL}\n}\n`;
     const factory = dataUrl(source, "text/javascript");
-    if (Buffer.byteLength(factory) > maxBytes)
-      fail("PACK_LIMIT", "Encoded worker entry exceeds packing limit");
-    workers.set(key, factory);
-    return factory;
+    chargeWorker(factory);
+    const record = { factory, classic: `(()=>{${fields}return function workerURL(){${getURL}};})()` };
+    workers.set(key, record);
+    return record;
   }
   function javascript(source, from, sourceType = "module", worker = false) {
     let ast;
@@ -549,6 +581,29 @@ export function packHtml(
       else if (node.type === "ArrayPattern") node.elements.forEach(bind);
       else if (node.type === "ObjectPattern")
         node.properties.forEach((p) => bind(p.type === "RestElement" ? p.argument : p.value));
+      else if (node.type === "MemberExpression" && node.object.type === "Identifier" &&
+          ["globalThis", "self", "window"].includes(node.object.name)) {
+        const name = node.computed ? literal(node.property) : node.property.name;
+        if (name !== null) bindings.add(name);
+        else ["Worker", "URL", "Blob", "fetch", "importScripts"].forEach((n) => bindings.add(n));
+      }
+    }
+    function writtenHost(node) {
+      // Module locals are isolated; direct writes to a classic realm's host
+      // globals are not. Track writes even in ESM helpers of that realm.
+      if (!node || worker?.kind !== "classic") return;
+      if (node.type === "Identifier") {
+        if (["Worker", "URL", "Blob", "fetch", "importScripts", "self", "globalThis"].includes(node.name))
+          worker.bindings.add(node.name);
+      } else if (node.type === "MemberExpression" &&
+          ["globalThis", "self"].includes(node.object.name)) {
+        const name = node.computed ? literal(node.property) : node.property.name;
+        if (name !== null) worker.bindings.add(name);
+        else ["Worker", "URL", "Blob", "fetch", "importScripts"].forEach((n) => worker.bindings.add(n));
+      } else if (node.type === "ArrayPattern") node.elements.forEach(writtenHost);
+      else if (node.type === "ObjectPattern") node.properties.forEach((p) => writtenHost(p.type === "RestElement" ? p.argument : p.value));
+      else if (node.type === "RestElement") writtenHost(node.argument);
+      else if (node.type === "AssignmentPattern") writtenHost(node.left);
     }
     walk.full(ast, (node) => {
       if (node.type === "Identifier") names.add(node.name);
@@ -560,6 +615,11 @@ export function packHtml(
       if (node.type === "ClassDeclaration" || node.type === "ClassExpression") bind(node.id);
       if (/^Import.*Specifier$/.test(node.type)) bind(node.local);
       if (node.type === "CatchClause") bind(node.param);
+      if (node.type === "AssignmentExpression") { bind(node.left); writtenHost(node.left); }
+      if (node.type === "UpdateExpression" || (node.type === "UnaryExpression" && node.operator === "delete")) {
+        bind(node.argument); writtenHost(node.argument);
+      }
+      if (node.type === "ForInStatement" || node.type === "ForOfStatement") { bind(node.left); writtenHost(node.left); }
       if (
         node.type === "NewExpression" &&
         node.callee.type === "Identifier" &&
@@ -574,8 +634,48 @@ export function packHtml(
       )
         fail("WORKER_LOCATION", "Worker location observation requires the normal build");
     });
+    if (worker && sourceType === "script") {
+      for (const name of names) worker.names.add(name);
+      for (const name of bindings) worker.bindings.add(name);
+      if (from === worker.entryUrl) {
+        worker.preludeOffset = source.startsWith("#!") ? source.indexOf("\n") + 1 : 0;
+        for (const node of ast.body) {
+          if (node.type !== "ExpressionStatement" || node.directive === undefined) break;
+          worker.preludeOffset = node.end;
+        }
+      }
+    }
+    function uses(...names) {
+      if (worker?.kind === "classic") for (const name of names) worker.hostUses.add(name);
+    }
+    // Rewrite only finite URL result leaves. Conditions, comma-prefix effects,
+    // native URL construction and caller options keep their execution ordering.
+    function rewriteURLs(node, origin, emit, code, depth = 0, budget = { count: 0 }) {
+      if (!node || depth > 64 || budget.count >= 64) fail(code, `${from}: URL choices exceed their bound`);
+      const value = literal(node);
+      if (value !== null) {
+        if (!value) fail(code, `${from}: URL must be nonempty`);
+        budget.count++;
+        add(node, emit(value, origin));
+      } else if (node.type === "SequenceExpression") {
+        rewriteURLs(node.expressions.at(-1), origin, emit, code, depth + 1, budget);
+      } else if (node.type === "ConditionalExpression") {
+        rewriteURLs(node.consequent, origin, emit, code, depth + 1, budget);
+        rewriteURLs(node.alternate, origin, emit, code, depth + 1, budget);
+      } else if (node.type === "NewExpression" && node.callee.type === "Identifier" && node.callee.name === "URL") {
+        const [ref, base] = node.arguments;
+        if (bindings.has("URL") || node.arguments.length !== 2 ||
+            base?.type !== "MemberExpression" || base.computed ||
+            base.object.type !== "MetaProperty" || base.property.name !== "url")
+          fail(code, `${from}: expected an unshadowed module-relative URL`);
+        uses("URL");
+        allowedMeta.add(base.object);
+        workerURLs.add(node);
+        rewriteURLs(ref, from, emit, code, depth + 1, budget);
+      } else fail(code, `${from}: URL must have finite literal results`);
+    }
     for (const site of workerSites) {
-      if (worker || sourceType !== "module")
+      if (!worker && sourceType !== "module")
         fail(
           "WORKER_PARENT",
           "Dedicated workers must be constructed by an emitted document module",
@@ -584,46 +684,33 @@ export function packHtml(
         fail("WORKER_BINDING", "Shadowed Worker/URL bindings require the normal build");
       if (site.arguments.length < 1 || site.arguments.length > 2)
         fail("WORKER_OPTIONS", "Worker requires a static URL and optional static type");
-      const [argument, options] = site.arguments;
-      if (options && options.type !== "ObjectExpression")
+      const [argument, expression] = site.arguments;
+      const options = result(expression);
+      if (options && !(options.type === "Literal" && options.value === null) && options.type !== "ObjectExpression")
         fail("WORKER_OPTIONS", "Worker type must be a static option");
-      let kind = options ? null : "classic";
+      let kind = "classic";
       for (const prop of options?.properties ?? []) {
-        if (prop.type !== "Property" || prop.computed || prop.method || prop.kind !== "init")
+        if (prop.type !== "Property" || prop.computed || prop.method || prop.kind !== "init" ||
+            (prop.key.name ?? prop.key.value) === "__proto__")
           fail("WORKER_OPTIONS", "Worker options must have plain noncomputed properties");
-        if ((prop.key.name ?? prop.key.value) === "type") kind = literal(prop.value);
+        if ((prop.key.name ?? prop.key.value) === "type") kind = literal(result(prop.value));
       }
       if (!["classic", "module"].includes(kind))
         fail("WORKER_OPTIONS", "Explicit Worker options require a literal classic/module type");
-      let value = literal(argument),
-        origin = documentUrl;
-      if (
-        argument.type === "NewExpression" &&
-        argument.callee.type === "Identifier" &&
-        argument.callee.name === "URL"
-      ) {
-        const [ref, base] = argument.arguments;
-        if (
-          argument.arguments.length !== 2 ||
-          base?.type !== "MemberExpression" ||
-          base.computed ||
-          base.object.type !== "MetaProperty" ||
-          base.property.name !== "url"
-        )
-          fail("WORKER_URL", "Worker URL must be literal or static module-relative");
-        value = literal(ref);
-        origin = from;
-        allowedMeta.add(base.object);
-      }
-      if (value === null || !value)
-        fail("WORKER_URL", "Worker URL must be a nonempty static literal");
-      const factory = workerFactory(local(value, origin), kind);
-      let name = `__f3d_packed_worker_${workerImports.length}`;
-      while (names.has(name) || bindings.has(name)) name += "_";
-      names.add(name);
-      workerImports.push(`import ${name} from ${JSON.stringify(factory)};`);
-      workerURLs.add(argument);
-      add(argument, `${name}()`);
+      uses("Worker", "URL", "Blob");
+      rewriteURLs(argument, worker ? worker.entryUrl : documentUrl, (value, origin) => {
+        const childUrl = local(value, origin), record = workerFactory(childUrl, kind);
+        if (sourceType === "script") {
+          const name = "__f3d_worker_" + digest(kind + ":" + keyFor(childUrl));
+          worker.factories.set(name, record.classic);
+          return `${name}()`;
+        }
+        let name = `__f3d_packed_worker_${workerImports.length}`;
+        while (names.has(name) || bindings.has(name)) name += "_";
+        names.add(name);
+        workerImports.push(`import ${name} from ${JSON.stringify(record.factory)};`);
+        return `${name}()`;
+      }, "WORKER_URL");
     }
     const importTarget = (value, kind, urlSemantics) => {
       if (!worker) {
@@ -635,7 +722,7 @@ export function packHtml(
       // A page's import map must not give a bare worker import invented meaning.
       if (!urlSemantics && !/^(\.?\.?\/|[a-z][\w+.-]*:)/i.test(value))
         fail("WORKER_IMPORT", "Bare worker imports must be bundled before export");
-      return workerModuleFor(local(value, from), kind).data;
+      return workerModuleFor(local(value, from), kind, worker).data;
     };
     function importSource(node, kind, urlSemantics = false, depth = 0) {
       if (depth > 64) fail("DYNAMIC_IMPORT_OPEN", `${from}: import analysis exceeds its bound`);
@@ -659,6 +746,7 @@ export function packHtml(
             base?.type !== "MemberExpression" || base.computed ||
             base.object.type !== "MetaProperty" || base.property.name !== "url")
           fail("IMPORT_URL", `${from}: imports need an unshadowed module-relative URL`);
+        uses("URL");
         allowedMeta.add(base.object);
         // Rewrite result leaves to absolute data URLs (workers) or absolute
         // map aliases (documents), retaining construction and selector effects.
@@ -680,6 +768,7 @@ export function packHtml(
     // Mark executable URL operands before bottom-up traversal can mistake them
     // for ordinary binary assets. Do not mark URLs in selector side effects.
     function markImportURLs(node, depth = 0) {
+      if (!node) return;
       if (depth > 64) fail("DYNAMIC_IMPORT_OPEN", `${from}: import analysis exceeds its bound`);
       if (node.type === "NewExpression" && node.callee.name === "URL") workerURLs.add(node);
       else if (node.type === "SequenceExpression") markImportURLs(node.expressions.at(-1), depth + 1);
@@ -688,7 +777,30 @@ export function packHtml(
         markImportURLs(node.alternate, depth + 1);
       }
     }
-    walk.simple(ast, { ImportExpression(node) { markImportURLs(node.source); } });
+    function hostCall(node, name) {
+      return node.callee.type === "Identifier" && node.callee.name === name ||
+        node.callee.type === "MemberExpression" && !node.callee.computed &&
+        ["self", "globalThis"].includes(node.callee.object.name) && node.callee.property.name === name;
+    }
+    function hostBinding(node, name) {
+      return bindings.has(name) || node.callee.type === "MemberExpression" && bindings.has(node.callee.object.name);
+    }
+    function useHost(node, name) {
+      uses(name);
+      if (node.callee.type === "MemberExpression") uses(node.callee.object.name);
+    }
+    const urlResult = (node) => node && (literal(node) !== null ||
+      ["SequenceExpression", "ConditionalExpression"].includes(node.type) ||
+      node.type === "NewExpression" && node.callee.name === "URL");
+    walk.simple(ast, {
+      ImportExpression(node) { markImportURLs(node.source); },
+      CallExpression(node) {
+        if (worker?.kind === "classic" && hostCall(node, "importScripts"))
+          node.arguments.forEach((argument) => markImportURLs(argument));
+        if (worker && hostCall(node, "fetch") && urlResult(node.arguments[0]))
+          markImportURLs(node.arguments[0]);
+      },
+    });
     walk.simple(ast, {
       ImportDeclaration(node) {
         importSource(node.source, importKind(node));
@@ -728,49 +840,43 @@ export function packHtml(
         const value = literal(ref);
         if (value === null || node.arguments.length !== 2)
           fail("DYNAMIC_ASSET", `${from}: asset URL is not a static literal`);
+        if (bindings.has("URL")) fail("WORKER_BINDING", `${from}: shadowed asset URL constructor`);
+        uses("URL");
         allowedMeta.add(origin.object);
         add(node, `new URL(${JSON.stringify(assetFor(local(value, from)))})`);
       },
       CallExpression(node) {
-        const importedScripts =
-          node.callee.type === "Identifier" && node.callee.name === "importScripts";
-        const memberScripts =
-          node.callee.type === "MemberExpression" &&
-          !node.callee.computed &&
-          ["self", "globalThis"].includes(node.callee.object.name) &&
-          node.callee.property.name === "importScripts";
-        if (worker && sourceType === "script" && (importedScripts || memberScripts)) {
-          if (
-            node.optional ||
-            bindings.has("importScripts") ||
-            (memberScripts && bindings.has(node.callee.object.name))
-          ) {
+        if (worker && hostCall(node, "importScripts")) {
+          if (node.optional || hostBinding(node, "importScripts")) {
             fail("WORKER_BINDING", "Shadowed/optional importScripts requires the normal build");
           }
+          // A module worker's native importScripts throws, even with no args.
+          // Do not read its string targets or turn the call into an ESM import.
+          if (worker.kind !== "classic") return;
+          useHost(node, "importScripts");
           for (const argument of node.arguments) {
-            const value = literal(argument);
-            if (value === null || !value)
-              fail("WORKER_SCRIPT_URL", "importScripts requires nonempty static URL arguments");
-            add(
-              argument,
-              JSON.stringify(workerClassicFor(local(value, worker.entryUrl), worker.entryUrl).data),
-            );
+            rewriteURLs(argument, worker.entryUrl, (value, origin) =>
+              JSON.stringify(workerClassicFor(local(value, origin), worker).data), "WORKER_SCRIPT_URL");
           }
           return; // Keep the native call, order, repeated evaluation and throws.
         }
-        if (
-          worker &&
-          sourceType === "script" &&
-          node.callee.type === "Identifier" &&
-          node.callee.name === "fetch" &&
-          literal(node.arguments[0]) !== null
-        ) {
-          if (node.arguments.length !== 1 || node.optional || bindings.has("fetch"))
-            fail("WORKER_FETCH", "Only unshadowed static default GET worker fetches are packaged");
-          add(
-            node.arguments[0],
-            JSON.stringify(assetFor(local(literal(node.arguments[0]), worker.entryUrl))),
-          );
+        if (worker && hostCall(node, "fetch") && urlResult(node.arguments[0])) {
+          const options = result(node.arguments[1]);
+          if (node.arguments.length > 2 || node.optional || hostBinding(node, "fetch") ||
+              options && !(options.type === "Literal" && options.value === null) &&
+              (options.type !== "ObjectExpression" || options.properties.some((p) =>
+                p.type !== "Property" || p.computed || p.method || p.kind !== "init" ||
+                (p.key.name ?? p.key.value) === "__proto__")))
+            fail("WORKER_FETCH", "Only unshadowed static GET worker fetches are packaged");
+          const methods = options?.properties?.filter((p) => (p.key.name ?? p.key.value) === "method") ?? [];
+          if (methods.length && literal(result(methods.at(-1).value))?.toUpperCase() !== "GET")
+            fail("WORKER_FETCH", "Only static GET worker fetches are packaged");
+          useHost(node, "fetch");
+          rewriteURLs(node.arguments[0], worker.entryUrl, (value, origin) => {
+            if (!value.startsWith("data:") && new URL(value, origin).protocol !== "file:")
+              fail("FETCH_URL", "External worker fetches require the normal networked build");
+            return JSON.stringify(assetFor(local(value, origin)));
+          }, "WORKER_FETCH");
           return;
         }
         if (
