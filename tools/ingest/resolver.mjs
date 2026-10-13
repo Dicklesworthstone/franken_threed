@@ -12,6 +12,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { IngestionResolutionError } from "./types.mjs";
+import { resolvePackageExports } from "./package_exports.mjs";
+export { resolveExportTargetValue, resolvePackageExports } from "./package_exports.mjs";
 
 /**
  * Normalizes a base URL (strips fragment like #inline-module-1).
@@ -265,134 +267,6 @@ export function loadPackageJson(packageJsonPath) {
  */
 export function clearPackageJsonCache() {
   PACKAGE_JSON_CACHE.clear();
-}
-
-/**
- * Resolves an export target value given admitted conditions ('import', 'default').
- * Handles string targets, conditional object targets, and null targets.
- * @param {any} target
- * @param {string[]} [conditions=['import', 'default']]
- * @returns {string | null | undefined}
- */
-export function resolveExportTargetValue(target, conditions = ["import", "default"]) {
-  if (typeof target === "string") {
-    return target;
-  }
-  if (target === null) {
-    return null;
-  }
-  if (typeof target === "object") {
-    for (const key of Object.keys(target)) {
-      if (key === "default" || conditions.includes(key)) {
-        const val = resolveExportTargetValue(target[key], conditions);
-        if (val !== undefined) return val;
-      }
-    }
-  }
-  return undefined;
-}
-
-/**
- * Resolves a package subpath using the package.json exports map.
- * Evaluates exact keys, wildcard pattern keys, and condition priorities ('import', 'default').
- * Throws IngestionResolutionError with package.json path if not exported or blocked.
- *
- * @param {string} subpath - Relative subpath e.g. '.', './webgpu', './addons/controls/OrbitControls.js'
- * @param {any} exportsField - The `exports` field from package.json
- * @param {string} packageJsonPath - Path to package.json for error reporting
- * @param {string} specifier - Full import specifier e.g. 'three/webgpu'
- * @param {string} referrerUrl - Referrer URL for error reporting
- * @param {any} [span] - Source span for error reporting
- * @returns {string} - Relative target path e.g. './build/three.webgpu.js'
- */
-export function resolvePackageExports(
-  subpath,
-  exportsField,
-  packageJsonPath,
-  specifier,
-  referrerUrl,
-  span,
-) {
-  if (!exportsField || typeof exportsField !== "object") {
-    throw new IngestionResolutionError(
-      `Package "three" at "${packageJsonPath}" does not define a valid "exports" map`,
-      specifier,
-      referrerUrl,
-      span,
-    );
-  }
-
-  // 1. Direct / exact match
-  if (Object.hasOwn(exportsField, subpath)) {
-    const targetVal = exportsField[subpath];
-    const resolved = resolveExportTargetValue(targetVal, ["import", "default"]);
-    if (resolved === null) {
-      throw new IngestionResolutionError(
-        `Cannot resolve blocked package export "${specifier}" from "${referrerUrl}": mapped to null in "${packageJsonPath}"`,
-        specifier,
-        referrerUrl,
-        span,
-      );
-    }
-    if (typeof resolved === "string") {
-      return resolved;
-    }
-    throw new IngestionResolutionError(
-      `Cannot resolve package export "${specifier}" from "${referrerUrl}": no matching condition ('import', 'default') in "${packageJsonPath}"`,
-      specifier,
-      referrerUrl,
-      span,
-    );
-  }
-
-  // 2. Pattern matching for keys containing '*'
-  // Node spec: longest prefix match before '*' takes precedence
-  const patternKeys = Object.keys(exportsField)
-    .filter((k) => k.includes("*"))
-    .sort((a, b) => {
-      const aPrefix = a.slice(0, a.indexOf("*"));
-      const bPrefix = b.slice(0, b.indexOf("*"));
-      return bPrefix.length - aPrefix.length;
-    });
-
-  for (const patternKey of patternKeys) {
-    const starIdx = patternKey.indexOf("*");
-    const prefix = patternKey.slice(0, starIdx);
-    const suffix = patternKey.slice(starIdx + 1);
-
-    if (subpath.startsWith(prefix) && (suffix === "" || subpath.endsWith(suffix))) {
-      const wildcardMatch = subpath.slice(
-        prefix.length,
-        suffix ? subpath.length - suffix.length : undefined,
-      );
-      const targetVal = exportsField[patternKey];
-      const resolvedTarget = resolveExportTargetValue(targetVal, ["import", "default"]);
-
-      if (resolvedTarget === null) {
-        throw new IngestionResolutionError(
-          `Cannot resolve blocked package export "${specifier}" from "${referrerUrl}": pattern "${patternKey}" mapped to null in "${packageJsonPath}"`,
-          specifier,
-          referrerUrl,
-          span,
-        );
-      }
-
-      if (typeof resolvedTarget === "string") {
-        if (resolvedTarget.includes("*")) {
-          return resolvedTarget.replace("*", wildcardMatch);
-        }
-        return resolvedTarget;
-      }
-    }
-  }
-
-  // 3. Subpath not exported
-  throw new IngestionResolutionError(
-    `Cannot resolve package import "${specifier}" from "${referrerUrl}": subpath "${subpath}" is not exported by package.json at "${packageJsonPath}"`,
-    specifier,
-    referrerUrl,
-    span,
-  );
 }
 
 /**
