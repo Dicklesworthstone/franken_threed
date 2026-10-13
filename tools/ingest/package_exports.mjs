@@ -1,12 +1,18 @@
 /** Package export selection for ingestion, without filesystem probing.
  *
- * Mirrors PACKAGE_EXPORTS_RESOLVE/PACKAGE_TARGET_RESOLVE for ESM export
- * maps. Conditions are tested in manifest order, not caller-priority order.
+ * Mirrors PACKAGE_EXPORTS_RESOLVE/PACKAGE_TARGET_RESOLVE for browser ESM
+ * export and private-import maps. Conditions are tested in manifest order,
+ * not caller-priority order.
  * Array fallbacks recover only from invalid targets, not invalid manifests.
  * A missing selected file is NOT an invitation to try another export target.
  * Import-map resolution and the pinned Three.js package choice stay separate.
  */
 import { IngestionResolutionError } from "./types.mjs";
+
+// The emitted application runs in a browser, not in the compiler's Node host.
+// Share one condition set across exports, private imports and their dependency
+// targets. Neither require/node nor development/production is implied.
+const ESM_CONDITIONS = Object.freeze(["browser", "import", "default"]);
 
 class PackageExportError extends Error {
   constructor(code, message) {
@@ -113,7 +119,7 @@ export function resolvePackageImports(specifier, importsField, packageJsonPath, 
       fail("ERR_INVALID_PACKAGE_CONFIG", "Package imports must be an object");
     const match = object(importsField) ? matchSubpath(specifier, importsField) : null;
     if (!match) fail("ERR_PACKAGE_IMPORT_NOT_DEFINED", `Package import "${specifier}" is not defined`);
-    const resolved = selectTarget(match[0], ["import", "default"], match[1], 0, resolveExternal);
+    const resolved = selectTarget(match[0], ESM_CONDITIONS, match[1], 0, resolveExternal);
     if (resolved === null || resolved === undefined)
       fail("ERR_PACKAGE_IMPORT_NOT_DEFINED", `Package import "${specifier}" is blocked or has no matching condition`);
     return resolved;
@@ -130,7 +136,7 @@ export function resolvePackageImports(specifier, importsField, packageJsonPath, 
 }
 
 /** Select a target using the admitted conditions; null and undefined differ. */
-export function resolveExportTargetValue(target, conditions = ["import", "default"]) {
+export function resolveExportTargetValue(target, conditions = ESM_CONDITIONS) {
   return selectTarget(target, conditions, null);
 }
 
@@ -155,9 +161,9 @@ export function resolvePackageExports(subpath, exportsField, packageJsonPath, sp
       if (match) { [target, patternMatch] = match; matched = true; }
     }
     if (!matched) fail("ERR_PACKAGE_PATH_NOT_EXPORTED", `Subpath "${subpath}" is not exported`);
-    const resolved = selectTarget(target, ["import", "default"], patternMatch);
+    const resolved = selectTarget(target, ESM_CONDITIONS, patternMatch);
     if (resolved === null) fail("ERR_PACKAGE_PATH_NOT_EXPORTED", `Blocked package export "${specifier}": mapped to null`);
-    if (resolved === undefined) fail("ERR_PACKAGE_PATH_NOT_EXPORTED", "Package export has no matching condition ('import', 'default')");
+    if (resolved === undefined) fail("ERR_PACKAGE_PATH_NOT_EXPORTED", "Package export has no matching condition ('browser', 'import', 'default')");
     return resolved;
   } catch (cause) {
     if (!(cause instanceof PackageExportError)) throw cause;
