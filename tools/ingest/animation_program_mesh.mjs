@@ -112,7 +112,7 @@ export function createProgramMeshes({device, format, depthFormat, sampleCount, m
     return {
       program: true, gpu, reflection, uniformGroup: allocated.value.uniformGroup, textureGroup: allocated.value.textureGroup,
       pipelines: {normal: pipelines[0], flipped: pipelines[1]}, geometrySignature: geometry.signature,
-      points, provoking,
+      points, provoking, topology,
       blended: !!raster.blend, alphaMode: raster.blend ? 'BLEND' : 'OPAQUE', blendConstant: raster.blendConstant ?? null, stencilReference,
       surfaceBuffer: null, lit: false, raster: {}, disposed: false,
     };
@@ -145,7 +145,10 @@ export function createProgramMeshes({device, format, depthFormat, sampleCount, m
         instanceCount: pointPlan.count, instanceBindGroup: null, blendConstant: record.blendConstant, stencilReference: record.stencilReference});
       return geometry;
     }
-    const rotated = record.provoking ? indices.prepare(record.gpu, geometry, record.provoking, first, Math.max(first, end)) : null;
+    // WebGL2 restarts every indexed topology, but native WebGPU only restarts
+    // strips. Smooth lists use the original buffer unless markers need removal.
+    const lowerTopology = record.provoking ?? (geometry.indexBuffer && ['triangles', 'lines', 'points'].includes(record.topology) ? record.topology : null);
+    const rotated = lowerTopology ? indices.prepare(record.gpu, geometry, lowerTopology, first, Math.max(first, end), record.provoking !== null) : null;
     Object.assign(command, {
       record, first: rotated ? 0 : first, count: rotated ? rotated.count : Math.max(0, end - first),
       pipeline: input.frontFaceCW ? record.pipelines.flipped : record.pipelines.normal,

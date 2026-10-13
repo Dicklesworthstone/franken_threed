@@ -1,5 +1,7 @@
 /** GL's last-provoking-vertex convention on first-provoking-vertex WebGPU.
  * Build immutable index buffers from synchronous resident-history readers.
+ * Smooth list programs also use this path when fixed restart markers occur;
+ * preserve their vertex order and cache a no-allocation result otherwise.
  * Line strips become ordered line-list pairs. Lists restart their grouping at
  * each fixed-index marker and at the selected draw's first index. Vertex IDs,
  * triangle winding, primitive order and per-instance streams stay unchanged.
@@ -25,8 +27,15 @@ export function createProgramIndexLowering(device, {label, fail, maxBytes = 64 *
     try { Promise.resolve(device.queue.onSubmittedWorkDone()).then(release, release).catch(() => {}); }
     catch { release(); }
   }
-  function evict(entry) { entries.delete(entry); retired.add(entry); }
-  function visit(geometry, topology, first, end, emit) {
+  function evict(entry) { entries.delete(entry); if (entry.buffer) retired.add(entry); }
+  function hasRestart(geometry, first, end) {
+    if (!geometry.indexBuffer) return false;
+    if (typeof geometry.readIndex !== 'function') fail('ANIMATION_RENDER_GEOMETRY', 'Topology lowering needs resident index history');
+    const restart = geometry.indexFormat === 'uint16' ? 65535 : 4294967295;
+    for (let i = first; i < end; i++) if (geometry.readIndex(i) === restart) return true;
+    return false;
+  }
+  function visit(geometry, topology, first, end, emit, flat) {
     const read = geometry.indexBuffer ? geometry.readIndex : i => i;
     if (typeof read !== 'function') fail('ANIMATION_RENDER_GEOMETRY', 'Topology lowering needs resident index history');
     const restart = geometry.indexBuffer ? geometry.indexFormat === 'uint16' ? 65535 : 4294967295 : null;
@@ -35,39 +44,43 @@ export function createProgramIndexLowering(device, {label, fail, maxBytes = 64 *
     for (let i = first; i < end; i++) {
       const v = read(i);
       if (v === restart) { n = 0; continue; }
-      if (topology === 'line-strip') {
-        if (n) { put(v); put(a); }
+      if (topology === 'points') { put(v); }
+      else if (topology === 'line-strip') {
+        if (n) { put(flat ? v : a); put(flat ? a : v); }
         a = v; n = 1;
       } else if (n === 0) { a = v; n = 1; }
-      else if (topology === 'lines') { put(v); put(a); n = 0; }
+      else if (topology === 'lines') { put(flat ? v : a); put(flat ? a : v); n = 0; }
       else if (n === 1) { b = v; n = 2; }
-      else { put(v); put(a); put(b); n = 0; }
+      else { put(flat ? v : a); put(flat ? a : b); put(flat ? b : v); n = 0; }
       if (count * 4 > maximum) fail('ANIMATION_RENDER_LIMIT', 'Lowered indices exceed the index buffer budget');
     }
     return count;
   }
   return Object.freeze({
     begin() { frame++; drain(); },
-    prepare(gpu, geometry, topology, first, end) {
+    prepare(gpu, geometry, topology, first, end, flat = true) {
       if (disposed) fail('ANIMATION_RENDER_DISPOSED', 'Program index cache is disposed');
       const extent = geometry.indexBuffer ? geometry.indexCount : geometry.vertexCount;
-      if (!['triangles', 'lines', 'line-strip'].includes(topology) ||
+      if (!['triangles', 'lines', 'line-strip', 'points'].includes(topology) || typeof flat !== 'boolean' ||
           !Number.isSafeInteger(first) || !Number.isSafeInteger(end) || first < 0 || end < first || end > extent)
         fail('ANIMATION_RENDER_GEOMETRY', 'Invalid lowered draw topology or range');
       const revision = geometry.indexRevision ?? 0;
       for (const e of entries) {
-        if (e.gpu === gpu && e.topology === topology && e.first === first && e.end === end &&
+        if (e.gpu === gpu && e.topology === topology && e.flat === flat && e.first === first && e.end === end &&
             e.indexBuffer === geometry.indexBuffer && e.revision === revision && e.generation === geometry.generation) {
           e.frame = frame; entries.delete(e); entries.add(e); return e.result;
         }
       }
+      // Unchanged smooth lists keep the original native index buffer. Cache the
+      // negative scan by uploaded revision, so a stable frame never rescans it.
+      const passthrough = !flat && !hasRestart(geometry, first, end);
       // For implicit sequential vertices the exact size is known without a scan.
-      if (!geometry.indexBuffer) {
-        const n = end - first, count = topology === 'line-strip' ? Math.max(0, n - 1) * 2 : Math.floor(n / (topology === 'lines' ? 2 : 3)) * (topology === 'lines' ? 2 : 3);
+      if (!passthrough && !geometry.indexBuffer) {
+        const n = end - first, count = topology === 'line-strip' ? Math.max(0, n - 1) * 2 : Math.floor(n / (topology === 'points' ? 1 : topology === 'lines' ? 2 : 3)) * (topology === 'points' ? 1 : topology === 'lines' ? 2 : 3);
         if (count * 4 > maximum) fail('ANIMATION_RENDER_LIMIT', 'Lowered indices exceed the index buffer budget');
       }
-      const count = visit(geometry, topology, first, end);
-      if (count === 0) return {buffer: null, count: 0};
+      const count = passthrough ? 0 : visit(geometry, topology, first, end, null, flat);
+      if (count === 0 && !passthrough) return {buffer: null, count: 0};
       // Superseded generations and LRU entries are evicted without touching
       // buffers used by other draws in this frame. Retired bytes remain charged.
       for (const e of entries) if (e.gpu === gpu && (e.indexBuffer !== geometry.indexBuffer || e.revision !== revision || e.generation !== geometry.generation)) evict(e);
@@ -77,16 +90,21 @@ export function createProgramIndexLowering(device, {label, fail, maxBytes = 64 *
         evict(candidate);
       }
       drain();
+      if (passthrough) {
+        entries.add({gpu, topology, flat, first, end, indexBuffer: geometry.indexBuffer,
+          revision, generation: geometry.generation, frame, result: null});
+        return null;
+      }
       const size = count * 4;
       if (allocatedBytes + size > maxBytes) fail('ANIMATION_RENDER_LIMIT', 'Program index budget includes unfinished retired buffers');
       const buffer = device.createBuffer({label: `${label}/lowered-indices`, size, usage: 16, mappedAtCreation: true});
       try {
         const out = new Uint32Array(buffer.getMappedRange());
-        visit(geometry, topology, first, end, (i, value) => { out[i] = value; });
+        visit(geometry, topology, first, end, (i, value) => { out[i] = value; }, flat);
         buffer.unmap();
       } catch (error) { buffer.destroy(); throw error; }
       const result = Object.freeze({buffer, count});
-      const entry = {gpu, topology, first, end, indexBuffer: geometry.indexBuffer, revision,
+      const entry = {gpu, topology, flat, first, end, indexBuffer: geometry.indexBuffer, revision,
         generation: geometry.generation, frame, size, buffer, result};
       entries.add(entry); resources.add(entry); allocatedBytes += size;
       return result;
