@@ -29,8 +29,8 @@ export function createGpuCanvasTarget(device, canvas, options = {}) {
   if (typeof srgbView !== 'boolean') fail('OPTIONS', 'srgbView must be boolean');
   if (!['rgba8unorm', 'bgra8unorm'].includes(canvasFormat))
     fail('FORMAT', 'Canvas format must be rgba8unorm or bgra8unorm');
-  if (![null, 'depth24plus', 'depth32float'].includes(depthFormat) || ![1, 4].includes(sampleCount))
-    fail('FORMAT', 'Expected optional depth24plus/depth32float and one or four samples');
+  if (![null, 'depth24plus', 'depth32float', 'depth24plus-stencil8'].includes(depthFormat) || ![1, 4].includes(sampleCount))
+    fail('FORMAT', 'Expected optional depth24plus/depth32float/depth24plus-stencil8 and one or four samples');
   // 'premultiplied' composites the canvas over the page. The explicit renderer
   // blends color with (src-alpha, one-minus-src-alpha) and alpha with (one,
   // one-minus-src-alpha), so content over a zero-alpha clear is premultiplied in
@@ -106,9 +106,11 @@ export function createGpuCanvasTarget(device, canvas, options = {}) {
   function resize(w, h) {
     dimension(w); dimension(h);
     if (version && width === w && height === h && canvas.width === w && canvas.height === h) return target;
-    // depth24plus uses a conservative four-byte texel charge. Swapchain and
-    // driver-private allocations are not part of this owned-attachment budget.
-    const cost = w * h * sampleCount * ((depthFormat ? 4 : 0) + (sampleCount > 1 ? 4 : 0));
+    // Charge combined depth/stencil conservatively at eight bytes, as the
+    // offscreen owner does; depth24plus alone uses four. Swapchain/driver
+    // allocations are outside this owned-attachment budget.
+    const depthBytes = depthFormat === 'depth24plus-stencil8' ? 8 : depthFormat ? 4 : 0;
+    const cost = w * h * sampleCount * (depthBytes + (sampleCount > 1 ? 4 : 0));
     const overlap = bytes();
     if (!Number.isSafeInteger(cost) || cost > maxBytes - overlap)
       fail('BUDGET', 'Resize exceeds the attachment budget including in-flight old targets');

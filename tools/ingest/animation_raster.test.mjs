@@ -144,7 +144,7 @@ test('unsupported format/features and invalid fixed state fail before new resour
 test('invalid late live state leaves prior submission untouched and permits corrected retry',async()=>{
   const d=device(),r=await createGpuAnimationRenderer(d,{depthFormat:'depth24plus-stencil8',maxDraws:2}),g=geometry(d);
   const m=await r.addMesh(g,{stencil:stencil(),blend:constantBlend()});r.render(frame([m]));
-  for(const bad of [{stencilReference:-1},{stencilReference:256},{stencilReference:1.5},
+  for(const bad of [{stencilReference:-1},{stencilReference:0x100000000},{stencilReference:1.5},
     {blendConstant:[0,0,NaN,0]},{blendConstant:[1,2,3,4]},{blendConstant:[0,0,0]}]){
     const before=[d.writes.length,d.submissions.length,d.passes.length];assert.throws(()=>r.render(frame([m,{mesh:m,...bad}])));
     assert.deepEqual([d.writes.length,d.submissions.length,d.passes.length],before);assert.equal(r.failed,false);
@@ -162,4 +162,15 @@ test('fog receiver spans preserve stencil contents after the first explicit clea
     fog:{type:'linear',color:[.1,.2,.3],near:1,far:9,depthFromClip:[0,0,0,1]}});
   assert.deepEqual(d.passes.map(p=>p.desc.depthStencilAttachment.stencilLoadOp),['clear','load','load']);
   assert.equal(d.passes[0].desc.depthStencilAttachment.stencilClearValue,19);await r.whenIdle();r.dispose();
+});
+
+for(const renderBundles of [false,true])test(`native uint32 stencil references survive defaults and cached draw state (${renderBundles})`,async()=>{
+  const d=device(),r=await createGpuAnimationRenderer(d,{depthFormat:'depth24plus-stencil8',renderBundles,maxDraws:2});
+  const m=await r.addMesh(geometry(d),{stencil:stencil(),stencilReference:0xffffffff});
+  r.render(frame([{mesh:m,stencilReference:300},m]));
+  assert.deepEqual(d.snapshots[0].map(s=>s.stencilReference),[300,0xffffffff]);
+  const before=[d.pipelines.length,d.bundleEncoders.length];
+  r.render(frame([{mesh:m,stencilReference:0x80000000},m]));
+  assert.deepEqual(d.snapshots[1].map(s=>s.stencilReference),[0x80000000,0xffffffff]);
+  assert.deepEqual([d.pipelines.length,d.bundleEncoders.length],before);r.dispose();
 });

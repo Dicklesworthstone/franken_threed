@@ -85,7 +85,7 @@ test('stencil reference and face state are captured before awaiting pipelines', 
 });
 test('invalid stencil inputs fail before geometry lookup, scopes, or program allocation', async t => {
   const f = fixture(t); const before = [f.buffers.length, f.scopes.length, f.descriptors.length];
-  for (const patch of [{stencilReference: 256}, {stencilReference: -1}, {stencil: {readMask: -1}},
+  for (const patch of [{stencilReference: 0x100000000}, {stencilReference: -1}, {stencil: {readMask: -1}},
     {stencil: {front: {compare: 'invalid'}}}, {stencil: {back: {passOp: 'invalid'}}}]) {
     await assert.rejects(f.owner.add(null, {program: f.program, raster: {...raster(), ...patch}}), {code: 'ANIMATION_RASTER_INPUT'});
   }

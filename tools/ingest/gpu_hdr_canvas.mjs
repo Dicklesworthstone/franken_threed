@@ -30,8 +30,8 @@ export async function createGpuHdrCanvasRenderer(canvas, createRenderer, options
   const {renderTarget = {}, output = {}, ...session} = all;
   const hdr = {depthFormat: 'depth24plus', sampleCount: 1, maxBytes: 256 * 1024 * 1024,
     ...capture(renderTarget, ['depthFormat', 'sampleCount', 'maxBytes', 'label'], 'HDR target')};
-  if (![null, 'depth24plus', 'depth32float'].includes(hdr.depthFormat) || ![1, 4].includes(hdr.sampleCount))
-    fail('OPTIONS', 'Expected optional depth24plus/depth32float and one or four scene samples');
+  if (![null, 'depth24plus', 'depth32float', 'depth24plus-stencil8'].includes(hdr.depthFormat) || ![1, 4].includes(hdr.sampleCount))
+    fail('OPTIONS', 'Expected optional depth24plus/depth32float/depth24plus-stencil8 and one or four scene samples');
   if (!Number.isSafeInteger(hdr.maxBytes) || hdr.maxBytes < 1 || (hdr.label !== undefined && typeof hdr.label !== 'string'))
     fail('OPTIONS', 'Invalid HDR target budget or label');
   const target = capture(session.target ?? {}, ['format', 'depthFormat', 'sampleCount', 'alphaMode',

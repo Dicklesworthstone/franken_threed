@@ -69,7 +69,7 @@ export function snapshotAnimationRaster(options, {format, depthFormat}) {
       stencilWriteMask: integer(options.stencil.writeMask ?? 0xff, 0, 0xffffffff, 'stencil write mask')});
   }
   if (options.stencilReference !== undefined && !stencil) fail('Stencil references require stencil state');
-  const stencilReference = stencil ? integer(options.stencilReference ?? 0, 0, 0xff, 'stencil reference') : null;
+  const stencilReference = stencil ? integer(options.stencilReference ?? 0, 0, 0xffffffff, 'stencil reference') : null;
   const depthBias = integer(options.depthBias ?? 0, -0x80000000, 0x7fffffff, 'depth bias');
   const depthBiasSlopeScale = f32(options.depthBiasSlopeScale ?? 0, 'depth slope bias');
   const depthBiasClamp = f32(options.depthBiasClamp ?? 0, 'depth bias clamp');
@@ -85,7 +85,7 @@ export function snapshotAnimationRasterUse(raster, input) {
   if (input.blendConstant !== undefined && !raster.usesConstant) fail('Draw blend constant requires constant-factor blending');
   if (input.stencilReference !== undefined && !raster.stencil) fail('Draw stencil reference requires stencil state');
   return {blendConstant: raster.usesConstant ? snapshotAnimationBlendConstant(input.blendConstant ?? raster.blendConstant) : null,
-    stencilReference: raster.stencil ? integer(input.stencilReference ?? raster.stencilReference, 0, 0xff, 'stencil reference') : null};
+    stencilReference: raster.stencil ? integer(input.stencilReference ?? raster.stencilReference, 0, 0xffffffff, 'stencil reference') : null};
 }
 export const ANIMATION_NORMAL_BLEND = Object.freeze({
   color: Object.freeze({operation:'add', srcFactor:'src-alpha', dstFactor:'one-minus-src-alpha'}),

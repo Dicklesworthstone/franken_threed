@@ -221,7 +221,7 @@ test('missing WebGPU context releases the reservation and never requests another
 
 test('unsupported compositing and formats fail before taking canvas ownership', () => {
   const f = fixture();
-  for (const options of [{format: 'rgba16float'}, {depthFormat: 'depth24plus-stencil8'},
+  for (const options of [{format: 'rgba16float'}, {depthFormat: 'invalid-depth'},
     {sampleCount: 8}, {alphaMode: 'straight'}, {alphaMode: 'transparent'}, {maxBytes: -1}, {unknown: true}])
     assert.throws(() => createGpuCanvasTarget(f.device, f.canvas, options), GpuCanvasError);
   assert.equal(f.calls.length, 0); assert.equal(f.textures.length, 0);
@@ -251,4 +251,22 @@ test('lazy frames acquire the swapchain only when a view is read', () => {
   assert.equal(seen.depth.texture.descriptor.format, 'depth24plus');
   assert.throws(() => target.withFrame(() => {}, {lazy: 1}), GpuCanvasError);
   target.dispose();
+});
+
+for (const sampleCount of [1, 4]) test(`combined stencil attachments charge eight bytes per sample (${sampleCount}x)`, async () => {
+  const f = fixture(), cost = 16 * 8 * sampleCount * (8 + (sampleCount > 1 ? 4 : 0));
+  assert.throws(() => createGpuCanvasTarget(f.device, f.canvas, {depthFormat: 'depth24plus-stencil8', sampleCount, maxBytes: cost - 1}), failCode('BUDGET'));
+  assert.equal(f.textures.length, 0);
+  const t = createGpuCanvasTarget(f.device, f.canvas, {depthFormat: 'depth24plus-stencil8', sampleCount, maxBytes: cost * 2});
+  assert.equal(t.diagnostics.attachmentBytes, cost);
+  t.withFrame(frame => {
+    assert.equal(frame.depthView.texture.descriptor.format, 'depth24plus-stencil8');
+    assert.equal(frame.depthView.texture.descriptor.sampleCount, sampleCount);
+  });
+  const old = [...f.textures]; t.resize(8, 16);
+  assert.equal(t.diagnostics.attachmentBytes, cost * 2); assert.ok(old.every(t => !t.destroyed));
+  assert.throws(() => t.resize(16, 8), failCode('BUDGET'));
+  f.fences[0].resolve(); await tick();
+  assert.ok(old.every(t => t.destroyed === 1)); assert.equal(t.diagnostics.attachmentBytes, cost);
+  t.dispose(); assert.ok(f.textures.every(t => t.destroyed === 1));
 });

@@ -6,7 +6,15 @@
  * The program owner omits this state on targets without a stencil attachment,
  * matching GL's disabled-test behavior there. No source mutation or GPU work.
  */
-export function threeProgramStencil(T, material, fail) {
+/** WebIDL [EnforceRange] unsigned long, used by the source WebGPU backend.
+ * GL callers deliberately keep their signed-reference clamping instead. */
+export function threeWebGPUStencilValue(value, fail) {
+  const number = Math.trunc(+value);
+  if (!Number.isFinite(number) || number < 0 || number > 0xffffffff)
+    fail('MATERIAL', 'Stencil values must convert to unsigned 32-bit integers');
+  return number;
+}
+export function threeProgramStencil(T, material, fail, {webgpu = false} = {}) {
   if (!material.stencilWrite) return {};
   const compares = new Map([[T.NeverStencilFunc, 'never'], [T.LessStencilFunc, 'less'],
     [T.EqualStencilFunc, 'equal'], [T.LessEqualStencilFunc, 'less-equal'],
@@ -27,7 +35,8 @@ export function threeProgramStencil(T, material, fail) {
     passOp: select(operations, material.stencilZPass, 'stencil pass operation')});
   return {
     stencil: Object.freeze({front: face, back: face,
-      readMask: material.stencilFuncMask >>> 0, writeMask: material.stencilWriteMask >>> 0}),
-    stencilReference: Math.min(255, Math.max(0, material.stencilRef | 0)),
+      readMask: webgpu ? threeWebGPUStencilValue(material.stencilFuncMask, fail) : material.stencilFuncMask >>> 0,
+      writeMask: webgpu ? threeWebGPUStencilValue(material.stencilWriteMask, fail) : material.stencilWriteMask >>> 0}),
+    stencilReference: webgpu ? threeWebGPUStencilValue(material.stencilRef, fail) : Math.min(255, Math.max(0, material.stencilRef | 0)),
   };
 }
