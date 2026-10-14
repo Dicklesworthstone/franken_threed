@@ -14,8 +14,27 @@ const deferred = () => {
 
 // The actual controller/planners with a target-owner boundary double. No native
 // shader, pixel parity, or GPU performance claims follow from these tests.
-function fixture({initialized = true, fence = Promise.resolve(), maxRequests = 64} = {}) {
-  const entries = new Map(), calls = [];
+function fixture({initialized = true, fence = Promise.resolve(), mapping = Promise.resolve(), maxRequests = 64} = {}) {
+  const entries = new Map(), calls = [], nativeReads = new Set();
+  function read(entry, options, depth) {
+    const captured = entry.value;
+    calls.push({kind: depth ? 'depth-read' : 'color-read', options});
+    return new Promise((resolve, reject) => {
+      const token = {};
+      const cleanup = () => { nativeReads.delete(token); options.signal.removeEventListener('abort', abort); };
+      const abort = () => { cleanup(); reject(options.signal.reason); };
+      nativeReads.add(token);
+      options.signal.addEventListener('abort', abort, {once: true});
+      if (options.signal.aborted) { abort(); return; }
+      mapping.then(() => {
+        if (!nativeReads.has(token)) return;
+        cleanup();
+        const result = options.output ?? new Float32Array([captured]);
+        if (options.output) result[0] = captured;
+        resolve(result);
+      }, error => { cleanup(); reject(error); });
+    });
+  }
   const renderer = {
     _disposed: false, _deferredError: null, _initialized: initialized,
     _pending: [], _preparing: null, _drain: null, _targetLifetime: new AbortController(),
@@ -32,7 +51,9 @@ function fixture({initialized = true, fence = Promise.resolve(), maxRequests = 6
       ensure(entry) {
         this.assertCurrent(entry);
         if (!entry.storage) {
-          entry.storage = {whenIdle: () => fence};
+          entry.storage = {whenIdle: () => fence,
+            readPixels: options => read(entry, options, false),
+            readDepthPixels: options => read(entry, options, true)};
           calls.push({kind: 'initialize', target: entry.target});
         }
       },
@@ -47,11 +68,11 @@ function fixture({initialized = true, fence = Promise.resolve(), maxRequests = 6
     },
   };
   const controller = createThreeRendererTransfers(renderer, RendererError, {maxRequests});
-  function target(width = 8, height = 8, {format = 'rgba8unorm', sampleCount = 1, mipLevelCount = 1} = {}) {
+  function target(width = 8, height = 8, {format = 'rgba8unorm', sampleCount = 1, mipLevelCount = 1, depth = false} = {}) {
     const target = {width, height};
     target.texture = {isTexture: true, isRenderTargetTexture: true, renderTarget: target};
     const entry = {target, current: true, value: 0, lifetime: new AbortController(), validation: Promise.resolve(),
-      shape: {width, height, format, sampleCount, mipLevelCount, texture: target.texture}};
+      shape: {width, height, format, sampleCount, mipLevelCount, texture: target.texture, depthTexture: depth ? {} : null}};
     entries.set(target, entry);
     return target;
   }
@@ -62,7 +83,7 @@ function fixture({initialized = true, fence = Promise.resolve(), maxRequests = 6
       try { const result = request.issue(); request.resolve?.(result); } catch (error) { request.reject?.(error); }
     }
   }
-  return {renderer, controller, target, calls, entries, drain};
+  return {renderer, controller, target, calls, entries, drain, nativeReads};
 }
 
 for (const bottomLeft of [false, true]) test(`source texture copy selects the live ${bottomLeft ? 'WebGL' : 'WebGPU'} origin`, async () => {
@@ -180,4 +201,121 @@ test('source API installation preserves explicit subclass implementations', () =
   assert.equal(subclass.copyTextureToTexture, copy);
   assert.equal(Object.hasOwn(subclass, 'copyTextureToTexture'), false);
   assert.equal(typeof f.renderer.copyTextureToTexture, 'function');
+});
+
+for (const bottomLeft of [false, true]) test(`public mip readback captures mip-local options and ${bottomLeft ? 'WebGL' : 'WebGPU'} rows`, async () => {
+  const f = fixture({initialized: false}), target = f.target(9, 3, {mipLevelCount: 4});
+  f.renderer._bottomLeftOrigin = bottomLeft;
+  const output = new Float32Array(8);
+  const options = {x: 1, output, maxBytes: 4096, maxInFlightBytes: 8192};
+  const result = f.renderer.readRenderTargetMipPixelsAsync(target, 1, options);
+  options.x = 999; options.output = new Float32Array(0);
+  f.drain();
+  assert.equal(await result, output);
+  const submitted = f.calls.at(-1).options;
+  assert.deepEqual([submitted.x, submitted.y, submitted.width, submitted.height, submitted.mipLevel], [1, 0, 3, 1, 1]);
+  assert.equal(submitted.flipY, bottomLeft);
+  assert.equal(submitted.maxBytes, 4096);
+  assert.equal(submitted.maxInFlightBytes, 8192);
+});
+
+test('public depth readback submits in order and does not stall a following copy on mapping', async () => {
+  const map = deferred(), f = fixture({initialized: false, mapping: map.promise});
+  const a = f.target(4, 4, {depth: true}), b = f.target(4, 4);
+  f.renderer._pending.push({issue() { f.entries.get(a).value = 0.375; }});
+  const depth = f.renderer.readRenderTargetDepthPixelsAsync(a, {width: 1, height: 1});
+  f.renderer._pending.push({issue() { f.entries.get(a).value = 0.75; }});
+  const copy = f.renderer.copyTextureToTextureAsync(a.texture, b.texture);
+  f.drain(); await copy;
+  assert.equal(f.entries.get(b).value, 0.75);
+  assert.equal(f.nativeReads.size, 1);
+  assert.equal(f.controller.pendingRequests, 1);
+  map.resolve();
+  assert.deepEqual(await depth, new Float32Array([0.375]));
+  assert.equal(f.controller.pendingRequests, 0);
+});
+
+for (const cancellation of ['caller', 'target', 'renderer']) test(`${cancellation} cancellation reaches an already-submitted native read`, async () => {
+  const map = deferred(), f = fixture({mapping: map.promise}), target = f.target(2, 2, {depth: true});
+  const caller = new AbortController(), output = new Float32Array([-1]);
+  const result = f.renderer.readRenderTargetDepthPixelsAsync(target, {width: 1, height: 1, output, signal: caller.signal});
+  const signal = f.calls.at(-1).options.signal;
+  assert.equal(signal.aborted, false);
+  assert.equal(f.nativeReads.size, 1);
+  const error = new Error(`${cancellation} stopped`);
+  const lifetime = cancellation === 'caller' ? caller : cancellation === 'target'
+    ? f.entries.get(target).lifetime : f.renderer._targetLifetime;
+  lifetime.abort(error);
+  await assert.rejects(result, value => value === error);
+  assert.equal(signal.aborted, true);
+  assert.equal(signal.reason, error);
+  assert.equal(f.nativeReads.size, 0);
+  assert.equal(f.controller.pendingRequests, 0);
+  map.resolve(); await Promise.resolve();
+  assert.deepEqual(output, new Float32Array([-1]));
+});
+
+test('an aborted queued read performs no native allocation and does not cancel a following read', async () => {
+  const f = fixture({initialized: false}), target = f.target(), caller = new AbortController();
+  const aborted = f.renderer.readRenderTargetMipPixelsAsync(target, 0, {signal: caller.signal});
+  const next = f.renderer.readRenderTargetMipPixelsAsync(target);
+  caller.abort(new Error('cancel queued'));
+  await assert.rejects(aborted, /cancel queued/);
+  assert.equal(f.calls.length, 0);
+  f.drain(); await next;
+  assert.equal(f.calls.filter(call => call.kind === 'color-read').length, 1);
+});
+
+test('readbacks share the pending-request limit with source copies and release it after mapping failure', async () => {
+  const map = deferred(), f = fixture({mapping: map.promise, maxRequests: 1}), a = f.target(), b = f.target();
+  const read = f.renderer.readRenderTargetMipPixelsAsync(a);
+  await assert.rejects(f.renderer.copyTextureToTextureAsync(a.texture, b.texture), /budget/);
+  map.reject(new Error('mapping failed'));
+  await assert.rejects(read, /mapping failed/);
+  assert.equal(f.controller.pendingRequests, 0);
+  assert.equal(f.renderer._deferredError, null);
+  await f.renderer.copyTextureToTextureAsync(a.texture, b.texture);
+});
+
+test('depth/mip admission rejects unusable source state and options before storage allocation', async () => {
+  const f = fixture(), a = f.target(), d = f.target(4, 4, {depth: true});
+  await assert.rejects(f.renderer.readRenderTargetDepthPixelsAsync(a), /DepthTexture/);
+  await assert.rejects(f.renderer.readRenderTargetDepthPixelsAsync(d, {sampleIndex: 1}), /sample zero/);
+  await assert.rejects(f.renderer.readRenderTargetMipPixelsAsync(a, 1), /not allocated/);
+  await assert.rejects(f.renderer.readRenderTargetMipPixelsAsync(a, 0, {x: -1}), /bounds/);
+  await assert.rejects(f.renderer.readRenderTargetMipPixelsAsync(a, 0, {width: 9}), /bounds/);
+  await assert.rejects(f.renderer.readRenderTargetMipPixelsAsync(a, 0, {mipLevel: 1}), /Unknown/);
+  await assert.rejects(f.renderer.readRenderTargetMipPixelsAsync(a, 0, {flipY: 1}), /orientation/);
+  await assert.rejects(f.renderer.readRenderTargetMipPixelsAsync(a, 0, {maxBytes: 0}), /budget/);
+  await assert.rejects(f.renderer.readRenderTargetMipPixelsAsync(a, 0, {get x() { throw new Error('must not invoke'); }}), /accessors/);
+  assert.equal(f.calls.length, 0);
+  assert.equal(f.controller.pendingRequests, 0);
+});
+
+test('queued readbacks reject a replaced target generation before invoking native storage', async () => {
+  const f = fixture({initialized: false}), target = f.target(4, 4, {depth: true});
+  const read = f.renderer.readRenderTargetDepthPixelsAsync(target);
+  f.entries.get(target).current = false; f.drain();
+  await assert.rejects(read, /generation changed/);
+  assert.equal(f.calls.length, 0);
+});
+
+test('public readbacks honor preparation and existing FIFO work even on an initialized renderer', async () => {
+  const f = fixture(), a = f.target();
+  f.renderer._preparing = Promise.resolve();
+  const first = f.renderer.readRenderTargetMipPixelsAsync(a);
+  assert.equal(f.calls.length, 0);
+  f.renderer._preparing = null;
+  const second = f.renderer.readRenderTargetMipPixelsAsync(a);
+  assert.equal(f.calls.length, 0);
+  assert.equal(f.renderer._pending.length, 2);
+  f.drain(); await Promise.all([first, second]);
+  assert.equal(f.calls.filter(call => call.kind === 'color-read').length, 2);
+});
+
+test('admitting native readback promises does not admit asynchronous upload/copy submission', async () => {
+  const f = fixture(), a = f.target(), b = f.target();
+  f.renderer._targets.copyColor = () => Promise.resolve(true);
+  await assert.rejects(f.renderer.copyTextureToTextureAsync(a.texture, b.texture), /submission must be synchronous/);
+  assert.equal(f.controller.pendingRequests, 0);
 });

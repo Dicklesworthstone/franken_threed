@@ -7,6 +7,9 @@
  * methods on this renderer instance (never on a global/prototype). Source void
  * calls report asynchronous failures at the next renderer boundary; the Async
  * extensions return the same completion promises. Both use this one owner/FIFO.
+ * Explicit mip/depth readback extensions also use this FIFO and request limit;
+ * native readback owns the shared per-device staging/output byte budget. Pending
+ * reads propagate renderer, target and caller cancellation to native mapping.
  * This is general WebGPU execution, not shader/pixel equivalence evidence.
  */
 import {inspectGpuTargetWrite, inspectGpuTargetCopy} from './gpu_target_transfer.mjs';
@@ -68,7 +71,7 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
       if (signal.aborted) { state.reject(stopped(signal)); break; }
     }
   }
-  function schedule(entries, signal, bytes, makeAction) {
+  function schedule(entries, signal, bytes, makeAction, readback = false) {
     live();
     const signals = [...new Set([renderer._targetLifetime.signal, ...entries.map(entry => entry.lifetime.signal), signal].filter(Boolean))];
     for (const current of signals) if (current.aborted) throw stopped(current);
@@ -76,6 +79,7 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
       fail('LIMIT', 'Pending renderer transfers exceed their shared request or byte budget');
     let resolve, reject;
     const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+    const cancellation = readback ? new AbortController() : null;
     const state = {signals, action: null, done: false, promise, reject: null};
     const finish = (error, result, failed = false) => {
       if (state.done) return;
@@ -83,7 +87,11 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
       active.delete(state); allocatedBytes -= bytes; unwatch(state);
       if (failed) reject(error); else resolve(result);
     };
-    state.reject = error => finish(error, undefined, true);
+    state.reject = error => {
+      if (state.done) return;
+      cancellation?.abort(error);
+      finish(error, undefined, true);
+    };
     active.add(state); allocatedBytes += bytes;
     // Observe internal failures even when callers use fire-and-forget source
     // wrappers. The returned promise still rejects for an awaiting caller.
@@ -91,7 +99,7 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
     try {
       watch(state);
       if (state.done) return promise;
-      state.action = makeAction();
+      state.action = makeAction(cancellation?.signal);
       makeAction = null;
       const request = {
         transfer: true,
@@ -101,14 +109,15 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
           for (const entry of entries) renderer._targets.assertCurrent(entry);
           const action = state.action;
           state.action = null;
-          // Must submit synchronously. Only native completion may cross await.
+          // Native readback submits before returning its mapping promise. No
+          // await here: the next render/copy can submit while mapping is pending.
           const result = action();
           if (result && typeof result.then === 'function') {
             Promise.resolve(result).catch(() => {});
-            fail('TRANSFER', 'Target transfer submission must be synchronous');
+            if (!readback) fail('TRANSFER', 'Target transfer submission must be synchronous');
           }
-          const completion = Promise.all(entries.flatMap(entry => [entry.validation, entry.storage?.whenIdle()]));
-          return completion.then(() => result);
+          const completion = Promise.all([result, ...entries.flatMap(entry => [entry.validation, entry.storage?.whenIdle()])]);
+          return completion.then(([value]) => value);
         },
         resolve(result) { Promise.resolve(result).then(value => finish(null, value), state.reject); },
         reject: state.reject,
@@ -199,6 +208,36 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
     return api.copyColor(source.renderTarget, destination.renderTarget,
       {...value, width: plan.size.width, height: plan.size.height});
   }
+  function readPixels(target, supplied = {}, mipLevel = 0, depth = false) {
+    live();
+    const {value, signal} = options(supplied), entry = renderer._targets.capture(target);
+    const allowed = ['x', 'y', 'width', 'height', 'flipY', 'output', 'maxBytes', 'maxInFlightBytes',
+      ...(depth ? ['sampleIndex'] : [])];
+    for (const name of Object.keys(value))
+      if (!allowed.includes(name)) fail('OPTIONS', `Unknown renderer readback option: ${name}`);
+    if (depth && !entry.shape.depthTexture)
+      fail('UNSUPPORTED', 'Attach a source DepthTexture before requesting depth readback');
+    const levels = depth ? 1 : entry.shape.mipLevelCount;
+    if (!Number.isSafeInteger(mipLevel) || mipLevel < 0 || mipLevel >= levels)
+      fail('REGION', 'Readback mip level is not allocated');
+    const w = Math.max(1, Math.floor(entry.shape.width / 2 ** mipLevel));
+    const h = Math.max(1, Math.floor(entry.shape.height / 2 ** mipLevel));
+    const {x = 0, y = 0, width = w - x, height = h - y} = value;
+    if (![x, y, width, height].every(n => Number.isSafeInteger(n) && n >= 0) || x > w - width || y > h - height)
+      fail('REGION', 'Readback bounds must be non-negative integers inside the selected mip');
+    if (typeof value.flipY !== 'boolean' || ['maxBytes', 'maxInFlightBytes'].some(name =>
+      value[name] !== undefined && (!Number.isSafeInteger(value[name]) || value[name] < 1)))
+      fail('OPTIONS', 'Invalid renderer readback orientation or byte budget');
+    // Source DepthTexture residency currently admits single-sample storage.
+    if (depth && value.sampleIndex !== undefined && value.sampleIndex !== 0)
+      fail('UNSUPPORTED', 'Source depth readback requires sample zero');
+    const captured = Object.freeze({...value, x, y, width, height, mipLevel});
+    return schedule([entry], signal, 0, combinedSignal => () => {
+      renderer._targets.ensure(entry);
+      return depth ? entry.storage.readDepthPixels({...captured, signal: combinedSignal})
+        : entry.storage.readPixels({...captured, signal: combinedSignal});
+    }, true);
+  }
   const deferred = error => { if (!renderer._disposed) renderer._deferredError ??= error; };
   const promised = operation => (...args) => {
     try { return operation(...args); } catch (error) { return Promise.reject(error); }
@@ -210,6 +249,8 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
     initRenderTargetAsync: promised(initialize),
     copyTextureToTexture(...args) { copyTexture(...args).catch(deferred); },
     copyTextureToTextureAsync: promised(copyTexture),
+    readRenderTargetMipPixelsAsync: promised((target, mipLevel = 0, supplied = {}) => readPixels(target, supplied, mipLevel)),
+    readRenderTargetDepthPixelsAsync: promised((target, supplied = {}) => readPixels(target, supplied, 0, true)),
   };
   for (const [name, method] of Object.entries(methods))
     if (typeof renderer[name] !== 'function') renderer[name] = method;
