@@ -7,7 +7,7 @@
  */
 const FLOAT32 = new Set(['r32float', 'rg32float', 'rgba32float']);
 const FORMATS = new Set([null, 'rgba8unorm', 'rgba8unorm-srgb', 'bgra8unorm',
-  'bgra8unorm-srgb', 'rgba16float', ...FLOAT32]);
+  'bgra8unorm-srgb', 'rg16float', 'rgba16float', ...FLOAT32]);
 const UNBLENDED = Object.freeze([false]);
 const BOTH = Object.freeze([false, true]);
 
