@@ -13,7 +13,8 @@
  * bilinear reduction without requiring optional float32 filtering. Float32
  * targets currently admit one sample only; no precision fallback is inferred.
  * readPixels() submits a bounded copy immediately and returns tightly packed
- * typed color data. Pending reads are cancelled on disposal or terminal failure.
+ * typed color data. mipLevel selects an allocated color level, with bounds and
+ * default extents in that level. Pending reads are cancelled on disposal or failure.
  * copyDestination:true additionally admits writePixels(data, options) and
  * copyFrom(sourceTarget, options). These queue-ordered, level-zero writes dirty
  * the mip chain; copies can read a selected source mip or resolved MSAA color.
@@ -363,9 +364,9 @@ export function createGpuRenderTarget(device, options = {}) {
         if (caller?.aborted) abort();
         // Capture the extent and submit before any await: resize and subsequent
         // draws cannot change which version of the texture this call observes.
-        return await readGpuTargetPixels({device, width, height, diagnostics: {target: {format}},
+        return await readGpuTargetPixels({device, width, height, diagnostics: {target: transferShape()},
           get disposed() { return disposed; }, get failed() { return terminal !== null; },
-          withTexture: api.withTexture}, {x: 0, y: 0, width, height, ...options, signal: controller.signal});
+          withTexture: api.withTexture}, {...options, signal: controller.signal});
       } finally {
         readbacks.delete(controller);
         caller?.removeEventListener('abort', abort);

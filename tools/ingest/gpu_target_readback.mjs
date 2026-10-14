@@ -1,5 +1,7 @@
 /** Queue-ordered color readback. The texture copy is submitted synchronously;
  * only buffer mapping waits. Returned rows exclude WebGPU's 256-byte padding.
+ * mipLevel selects an allocated color mip; bounds and omitted extents are local
+ * to that mip, including NPOT and 1D tails. No implicit downsampling is performed.
  * BGRA targets return RGBA bytes; float32 targets preserve full precision and
  * half-float values remain their original Uint16 bit patterns. Scalar/vector
  * targets return one/two components per pixel, without inventing RGBA channels.
@@ -52,18 +54,31 @@ function reserve(state, bytes, limit) {
   };
 }
 
-export async function readGpuTargetPixels(session, {x, y, width, height, flipY = false, output,
+export async function readGpuTargetPixels(session, {x = 0, y = 0, width, height, mipLevel = 0, flipY = false, output,
   signal, maxBytes = 64 * 1024 * 1024, maxInFlightBytes = 128 * 1024 * 1024} = {}) {
   if (!session || typeof session.withTexture !== 'function') fail('SOURCE', 'Expected an offscreen session');
   if (session.disposed || session.failed) fail('SOURCE', 'Offscreen session is no longer usable');
   for (const value of [session.width, session.height])
     if (!Number.isSafeInteger(value) || value < 0) fail('SOURCE', 'Expected finite integer target dimensions');
+  const diagnostics = session.diagnostics;
+  let mipLevelCount = diagnostics?.target?.mipLevelCount ?? diagnostics?.mipLevelCount ?? session.mipLevelCount ?? 1;
+  // Suspended owners have no allocation, but still admit an empty base-level read.
+  if (mipLevelCount === 0 && (session.width === 0 || session.height === 0)) mipLevelCount = 1;
+  const maxMipLevels = session.width && session.height ? 1 + Math.floor(Math.log2(Math.max(session.width, session.height))) : 1;
+  if (!Number.isSafeInteger(mipLevelCount) || mipLevelCount < 1 || mipLevelCount > maxMipLevels)
+    fail('SOURCE', 'Invalid allocated mip count');
+  if (!Number.isSafeInteger(mipLevel) || mipLevel < 0 || mipLevel >= mipLevelCount)
+    fail('REGION', 'Readback mip level is not allocated');
+  const divisor = 2 ** mipLevel;
+  const mipWidth = session.width === 0 ? 0 : Math.max(1, Math.floor(session.width / divisor));
+  const mipHeight = session.height === 0 ? 0 : Math.max(1, Math.floor(session.height / divisor));
+  if (width === undefined) width = mipWidth - x;
+  if (height === undefined) height = mipHeight - y;
   for (const value of [x, y, width, height])
     if (!Number.isSafeInteger(value) || value < 0) fail('REGION', 'Readback bounds must be non-negative integers');
-  if (x > session.width - width || y > session.height - height) fail('REGION', 'Readback region exceeds the target');
+  if (x > mipWidth - width || y > mipHeight - height) fail('REGION', 'Readback region exceeds the target');
   if (typeof flipY !== 'boolean' || ![maxBytes, maxInFlightBytes].every(n => Number.isSafeInteger(n) && n > 0))
     fail('OPTIONS', 'Invalid readback options');
-  const diagnostics = session.diagnostics;
   const layout = FORMATS.get(diagnostics?.target?.format ?? diagnostics?.format);
   if (!layout) fail('FORMAT', 'Readback requires RGBA/BGRA8, RGBA16F, or R/RG/RGBA32F color storage');
   const [Type, components, bgra] = layout;
@@ -101,7 +116,7 @@ export async function readGpuTargetPixels(session, {x, y, width, height, flipY =
       try {
         buffer = device.createBuffer({label: 'Render target pixel readback', size, usage: 1 | 8});
         const encoder = device.createCommandEncoder();
-        encoder.copyTextureToBuffer({texture, origin: {x, y: flipY ? session.height - y - height : y, z: 0}},
+        encoder.copyTextureToBuffer({texture, mipLevel, origin: {x, y: flipY ? mipHeight - y - height : y, z: 0}},
           {buffer, bytesPerRow, rowsPerImage: height}, {width, height, depthOrArrayLayers: 1});
         device.queue.submit([encoder.finish()]);
       } catch (cause) { error = cause; }
