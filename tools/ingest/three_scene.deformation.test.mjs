@@ -14,7 +14,8 @@ const deformation=data((await fs.readFile(new URL('./three_deformation.mjs',impo
 const renderer=data(`export const createGpuAnimationRenderer=(...a)=>globalThis.${key}.renderer(...a);`);
 const geometry=data(`export const createGpuBufferGeometry=(...a)=>globalThis.${key}.geometry(...a);export const bufferGeometrySnapshot=g=>g.shape;
 export const createGpuInstanceAttributes=()=>{throw Error('Unexpected instance');};export const instanceAttributesSnapshot=()=>{};export const inspectInstanceAttributes=()=>{};`);
-const textures=data(`export const createGpuThreeTextures=()=>{throw Error('Unexpected texture');};`);
+const textures=data(`export {createThreeTextureBindings} from ${JSON.stringify(new URL('./three_textures.mjs',import.meta.url).href)};
+export const createGpuThreeTextures=()=>{throw Error('Unexpected texture');};`);
 const sceneModule=data((await fs.readFile(new URL('./three_scene.mjs',import.meta.url),'utf8'))
   .replace("'./animation_render.mjs'",JSON.stringify(renderer)).replace("'./gpu_buffer_geometry.mjs'",JSON.stringify(geometry))
   .replace("'./three_textures.mjs'",JSON.stringify(textures)).replace("'./three_deformation.mjs'",JSON.stringify(deformation)));

@@ -8,6 +8,7 @@ import {test} from 'node:test';
 const key=Symbol.for('f3d-source-scene-environment-integration');
 const url=text=>'data:text/javascript;base64,'+Buffer.from(text).toString('base64');
 const lower=url(`
+export {createThreeTextureBindings} from ${JSON.stringify(new URL('./three_textures.mjs',import.meta.url).href)};
 const state=()=>globalThis[Symbol.for('f3d-source-scene-environment-integration')];
 export const createGpuAnimationRenderer=(...a)=>state().color(...a);
 export const createGpuAnimationShadowMap=(...a)=>state().map(...a);

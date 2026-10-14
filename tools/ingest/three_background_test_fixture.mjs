@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
 const url=text=>'data:text/javascript;base64,'+Buffer.from(text).toString('base64');
 const lower=url(`
+export {createThreeTextureBindings} from ${JSON.stringify(new URL('./three_textures.mjs',import.meta.url).href)};
 export const createGpuAnimationRenderer=(d,o)=>d.testState.color(d,o);
 export const createGpuAnimationShadowMap=(d,o)=>d.testState.map(d,o);
 export const createGpuBufferGeometry=(d,g)=>d.testState.geometry(g);

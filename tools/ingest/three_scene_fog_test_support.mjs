@@ -128,7 +128,8 @@ export const bufferGeometrySnapshot=g=>({signature:g.source.layoutVersion??'fixt
 export const instanceAttributesSnapshot=g=>({signature:g.source.instanceLayout??'fixture-instances'});
 export const inspectInstanceAttributes=s=>({signature:s.instanceLayout??'fixture-instances'});
 `,
-  'three_textures.mjs': `export function createGpuThreeTextures(){throw new Error('Texture residency is outside this fixture');}`,
+  'three_textures.mjs': `export {createThreeTextureBindings} from ${JSON.stringify(new URL('./three_textures.mjs',import.meta.url).href)};
+export function createGpuThreeTextures(){throw new Error('Texture residency is outside this fixture');}`,
   'three_deformation.mjs': `
 export const hasThreeDeformation=o=>!!o.isSkinnedMesh||!!o.hasMorph;
 export const inspectThreeDeformation=()=>({});

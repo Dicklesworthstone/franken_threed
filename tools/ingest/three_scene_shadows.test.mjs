@@ -7,7 +7,7 @@ import test from 'node:test';
 import fs from 'node:fs/promises';
 const key='__f3d_scene_shadow_integration__';
 const data=text=>'data:text/javascript;base64,'+Buffer.from(text).toString('base64');
-const stub=data(['createGpuAnimationRenderer','createGpuBufferGeometry','bufferGeometrySnapshot',
+const stub=data(`export {createThreeTextureBindings} from ${JSON.stringify(new URL('./three_textures.mjs',import.meta.url).href)};\n`+['createGpuAnimationRenderer','createGpuBufferGeometry','bufferGeometrySnapshot',
   'createGpuInstanceAttributes','instanceAttributesSnapshot','inspectInstanceAttributes','createGpuThreeTextures',
   'hasThreeDeformation','inspectThreeDeformation','createGpuThreeDeformation','updateGpuThreeDeformations',
   'createGpuAnimationShadowMap'].map(name=>`export const ${name}=(...a)=>globalThis.${key}.${name}(...a);`).join('\n'));
@@ -117,7 +117,7 @@ function setup(){
         vertexCount:o.geometry.vertexCount,indexCount:0,matches(){return true;},check(){}});residencies.push(g);return g;
     },
     updateGpuThreeDeformations(owners){events.push(['deform',owners]);},
-    createGpuThreeTextures(){const bindings=new Map();return {inspect(){},prepare(set){for(const t of set)if(!bindings.has(t))bindings.set(t,{view:{t},sampler:{t}});},
+    createGpuThreeTextures(){const bindings=new Map();return {inspect(){return {viewDimension:'2d',sampleType:'float'};},prepare(set){for(const t of set)if(!bindings.has(t))bindings.set(t,{view:{t},sampler:{t}});},
       binding:t=>bindings.get(t),update(set){events.push(['textures',[...set]]);},retain(){},dispose(){},whenIdle(){return Promise.resolve();}};},
     async createGpuAnimationShadowMap(d,options){
       assert.equal(d,device);if(options.maxBytes<=1024)throw Error('shadow allocation budget');

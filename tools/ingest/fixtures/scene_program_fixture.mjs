@@ -1,3 +1,4 @@
+export {createThreeTextureBindings} from '../three_textures.mjs';
 // A source-object/GPU boundary double, not a shader or rasterization oracle.
 let nextId = 1;
 class Events {

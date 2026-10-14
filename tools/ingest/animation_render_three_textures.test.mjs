@@ -56,10 +56,10 @@ test('source clones share one native image and sampler across multiple source me
 test('source disposal and sampler changes require prepare and invalidate old schedules',async()=>{
   const f=fixture(),t=data();f.material.map=t;const b=await create(f,{renderer:{renderBundles:true}});
   b.render(f.camera,frame());const old=f.d.textures[0];t.dispose();const before=marks(f.d);
-  assert.throws(()=>b.render(f.camera,frame()),{code:'THREE_TEXTURE_PREPARE'});assert.deepEqual(marks(f.d),before);
+  assert.throws(()=>b.render(f.camera,frame()),{code:'THREE_SCENE_PREPARE'});assert.deepEqual(marks(f.d),before);
   await b.prepare();b.render(f.camera,frame());assert.ok(old.destroyed);assert.equal(f.d.textures.length,2);
   t.wrapS=T.MirroredRepeatWrapping;t.needsUpdate=true;
-  assert.throws(()=>b.render(f.camera,frame()),{code:'THREE_TEXTURE_PREPARE'});
+  assert.throws(()=>b.render(f.camera,frame()),{code:'THREE_SCENE_PREPARE'});
   await b.prepare();b.render(f.camera,frame());assert.equal(f.d.snapshots.at(-1)[0].groups.get(1).group.entries[0].resource.addressModeU,'mirror-repeat');
   assert.equal(b.diagnostics.bundles.builds,3);await b.whenIdle();b.dispose();
 });
@@ -120,7 +120,7 @@ test('texture storage changing during a pipeline wait is not published and can b
   const original=f.d.createRenderPipelineAsync;let resolve;const waiting=new Promise(r=>resolve=r);
   f.d.createRenderPipelineAsync=async x=>{await waiting;return original(x);};
   const preparing=bridge.prepare();t.wrapS=T.RepeatWrapping;t.needsUpdate=true;resolve();
-  await assert.rejects(preparing,{code:'THREE_TEXTURE_PREPARE'});assert.equal(bridge.failed,false);
+  await assert.rejects(preparing,{code:'THREE_SCENE_PREPARE'});assert.equal(bridge.failed,false);
   assert.equal(bridge.diagnostics.textures.textureBytes,0);f.d.createRenderPipelineAsync=original;
   await bridge.prepare();bridge.render(f.camera,frame());await bridge.whenIdle();bridge.dispose();
 });

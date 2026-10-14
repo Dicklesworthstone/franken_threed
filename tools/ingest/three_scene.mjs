@@ -28,7 +28,7 @@
 import {createGpuAnimationRenderer} from './animation_render.mjs';
 import {createGpuBufferGeometry, bufferGeometrySnapshot, createGpuInstanceAttributes,
   instanceAttributesSnapshot, inspectInstanceAttributes} from './gpu_buffer_geometry.mjs';
-import {createGpuThreeTextures} from './three_textures.mjs';
+import {createGpuThreeTextures,createThreeTextureBindings} from './three_textures.mjs';
 import {hasThreeDeformation, inspectThreeDeformation, createGpuThreeDeformation,
   updateGpuThreeDeformations} from './three_deformation.mjs';
 export class ThreeSceneError extends Error {
@@ -165,6 +165,12 @@ export async function createGpuThreeScene(device,scene,{
   let programShadowMode=false,programShadowSticky=false,preparedShadowMode=false,programShadowOwner=null,programLightMode=false;
   let programTransmissionMode=false,transmissionOwner=null,programViewportSize=null,transmissionCamera=null;
   const ownedTextures=()=>textureOwner??=createGpuThreeTextures(device,{...textureOptions,three});
+  const textureBindings=createThreeTextureBindings(device,{
+    three,textures,autoTextures,ownedTextures,fail,
+    get textureScan(){return textureScan;},
+    get frameTextures(){return frameTextures;},
+    get pendingTextures(){return pendingTextures;},
+  });
   const resourceFailed=()=>!!renderer?.failed||!!textureOwner?.failed||!!shadowOwner?.failed||!!pendingShadow?.failed||!!environmentOwner?.failed||!!pendingEnvironment?.failed||!!backgroundOwner?.failed||!!pendingBackground?.failed||[...geometries.values(),...programGpus(),...instances.values(),...deformations.values(),...pendingDeformations].some(g=>g.failed);
   let programTargetSize=null;
   let entries=[],lookup=new Map(),renderer,disposed=false,terminal=null,busy=false,preparing=false,prepareVersion=0,sourceDraws=0;
@@ -201,7 +207,7 @@ export async function createGpuThreeScene(device,scene,{
     for(const gpu of geometries.values())gpu.dispose();geometries.clear();
     for(const gpu of programGpus())gpu.dispose();programGeometries.clear();
     for(const gpu of instances.values())gpu.dispose();instances.clear();renderer?.dispose();textureOwner?.dispose();
-    placeholder?.texture.destroy();placeholder=null;
+    textureBindings.dispose();
   }
   function onAbort(){
     if(disposed||terminal)return;
@@ -414,31 +420,16 @@ export async function createGpuThreeScene(device,scene,{
     return {planes:sourcePlanes(clippingValue(clipping,'planes',[])),localClippingEnabled};
   }
   /** Current native binding for a source texture: an acknowledged caller binding,
-   * the owned residency, or r186's zero 1x1 default while the source loads. */
-  function textureBinding(t){
-    let binding;
-    const generated=pmremOwner?.binding(t)??programShadowOwner?.binding(t)??transmissionOwner?.binding(t)??morphBinding(t)??volumeBinding(t)??integerBinding(t);
+   * the owned residency, or a dimension-matched zero default while it loads.
+   * Program volume and morph arrays follow the same scan/update/retain lifetime
+   * as ordinary maps; they must not allocate or upload during description. */
+  function textureBinding(t,reflection=null,initialize=false){
+    const generated=pmremOwner?.binding(t)??programShadowOwner?.binding(t)??transmissionOwner?.binding(t);
     if(generated)return generated;
     // Shadow-map depth textures belong to the program shadow owner, which binds
     // them after preparing its maps; a scan only needs a stand-in.
     if(t?.isDepthTexture&&textureScan)return placeholderBinding();
-    if(textures.has(t)){
-      binding=textures.get(t);
-      if(!binding?.view||!binding.sampler||binding.version!==t.version||binding.sourceVersion!==t.source.version)
-        fail('TEXTURE','Supply a completed texture binding matching both texture and source upload versions');
-    }else{
-      if(!autoTextures)fail('TEXTURE','Supply an acknowledged binding or enable automatic textures');
-      if(t.onUpdate!==null)fail('HOOK','Custom texture upload callbacks require the explicit texture owner');
-      const owner=ownedTextures();
-      // r186 binds a zero-initialized 1x1 default texture until the source
-      // data exists (Textures/createDefaultTexture). The texture owner's own
-      // NOT_READY verdict decides; arrival is a preparation boundary.
-      if((textureScan||pendingTextures.has(t))&&!ownerAccepts(owner,t)){binding=placeholderBinding();pendingTextures.add(t);}
-      else if(pendingTextures.has(t))fail('PREPARE','A source texture finished loading; prepare() binds it');
-      else if(textureScan){textureScan.add(t);binding={view:t,sampler:t};}
-      else{binding=owner.binding(t);frameTextures?.add(t);}
-    }
-    return binding;
+    return textureBindings.binding(t,reflection,{initialize});
   }
   // Program variants depend on the object (instancing, geometry streams), not
   // only the material: WebGLPrograms.getParameters reads both.
@@ -627,86 +618,6 @@ export async function createGpuThreeScene(device,scene,{
     }
     return null;
   }
-  /** WebGLMorphtargets' DataArrayTexture (built by the program support): its own
-   * rgba32float array residency, written once (r186 rebuilds it only when the
-   * target count changes, which makes a new texture). */
-  const morphBindings=new WeakMap();
-  function morphBinding(t){
-    if(t?.isF3DMorphTexture!==true)return undefined;
-    let b=morphBindings.get(t);
-    if(!b){
-      const {width,height,depth,data}=t.image;
-      const texture=device.createTexture({label:'f3d-morph-targets',size:[width,height,depth],format:'rgba32float',usage:4|2});
-      device.queue.writeTexture({texture},data,{bytesPerRow:width*16,rowsPerImage:height},[width,height,depth]);
-      b={texture,view:texture.createView({dimension:'2d-array'}),sampler:device.createSampler({label:'f3d-morph-targets'}),sampleType:'unfilterable-float'};
-      morphBindings.set(t,b);
-      t.addEventListener('dispose',()=>{morphBindings.delete(t);texture.destroy();});
-    }
-    return b;
-  }
-  /** Data3DTexture / DataArrayTexture for programs (sampler3D / sampler2DArray):
-   * a direct residency in the texture's storage format, rewritten whole when
-   * the texture version changes (WebGLTextures re-uploads on needsUpdate). */
-  const volumeBindings=new WeakMap();
-  function volumeBinding(t){
-    if(!(t?.isData3DTexture||(t?.isDataArrayTexture&&t.isF3DMorphTexture!==true))||!programRoute())return undefined;
-    const {width,height,depth,data}=t.image??{};
-    if(!data)return placeholderBinding();
-    const bpc=t.type===three.UnsignedByteType?1:t.type===three.HalfFloatType?2:t.type===three.FloatType?4:0;
-    const channels={[three.RedFormat]:1,[three.RGFormat]:2,[three.RGBAFormat]:4}[t.format];
-    if(!bpc||!channels||channels===3)fail('TEXTURE','Unsupported 3D/array texture storage');
-    if(t.generateMipmaps&&t.minFilter!==three.NearestFilter&&t.minFilter!==three.LinearFilter)fail('TEXTURE','Generated mipmaps for 3D/array textures are not admitted yet');
-    const base=['r','rg',null,'rgba'][channels-1],format=bpc===1?base+'8unorm'+(channels===4&&three.ColorManagement.getTransfer(t.colorSpace)===three.SRGBTransfer?'-srgb':''):base+(bpc===2?'16float':'32float');
-    const linear=t.magFilter!==three.NearestFilter||![three.NearestFilter,three.NearestMipmapNearestFilter].includes(t.minFilter);
-    const unfilterable=bpc===4&&!device.features?.has?.('float32-filterable');
-    if(unfilterable&&linear)fail('TEXTURE','Linear float32 3D/array textures need float32-filterable');
-    let b=volumeBindings.get(t);
-    if(!b||b.width!==width||b.height!==height||b.depth!==depth||b.format!==format){
-      b?.texture.destroy();
-      const texture=device.createTexture({label:'f3d-volume',size:[width,height,depth],format,dimension:t.isData3DTexture?'3d':'2d',usage:4|2});
-      const wrap=w=>({[three.RepeatWrapping]:'repeat',[three.MirroredRepeatWrapping]:'mirror-repeat'})[w]??'clamp-to-edge';
-      const mag=t.magFilter===three.NearestFilter?'nearest':'linear',min=[three.NearestFilter,three.NearestMipmapNearestFilter,three.NearestMipmapLinearFilter].includes(t.minFilter)?'nearest':'linear';
-      b={texture,width,height,depth,format,version:-1,view:texture.createView({dimension:t.isData3DTexture?'3d':'2d-array'}),
-        sampler:device.createSampler({label:'f3d-volume',magFilter:mag,minFilter:min,addressModeU:wrap(t.wrapS),addressModeV:wrap(t.wrapT),addressModeW:wrap(t.wrapR)}),
-        sampleType:unfilterable?'unfilterable-float':'float'};
-      volumeBindings.set(t,b);
-      t.addEventListener('dispose',()=>{if(volumeBindings.get(t)===b){volumeBindings.delete(t);texture.destroy();}});
-    }
-    if(b.version!==t.version){
-      const bytes=new Uint8Array(data.buffer,data.byteOffset,data.byteLength);
-      device.queue.writeTexture({texture:b.texture},bytes,{bytesPerRow:width*channels*bpc,rowsPerImage:height},[width,height,depth]);
-      b.version=t.version;
-    }
-    return b;
-  }
-  /** Integer DataTextures (usampler2D/isampler2D, e.g. BatchedMesh's
-   * batchingIdTexture): a direct r32uint/r32sint-class residency, rewritten when
-   * the texture version changes; integer textures are never filtered. */
-  const integerBindings=new WeakMap();
-  function integerBinding(t){
-    const channels={[three.RedIntegerFormat]:1,[three.RGIntegerFormat]:2,[three.RGBAIntegerFormat]:4}[t?.format];
-    if(!channels||!t.isDataTexture||!programRoute())return undefined;
-    const {width,height,data}=t.image??{};
-    if(!data)return placeholderBinding();
-    const kind={[three.UnsignedIntType]:['32uint',4,'uint'],[three.IntType]:['32sint',4,'sint'],[three.UnsignedShortType]:['16uint',2,'uint'],
-      [three.ShortType]:['16sint',2,'sint'],[three.UnsignedByteType]:['8uint',1,'uint'],[three.ByteType]:['8sint',1,'sint']}[t.type];
-    if(!kind)fail('TEXTURE','Unsupported integer texture type');
-    const format=['r','rg',null,'rgba'][channels-1]+kind[0];
-    let b=integerBindings.get(t);
-    if(!b||b.width!==width||b.height!==height||b.format!==format){
-      b?.texture.destroy();
-      const texture=device.createTexture({label:'f3d-integer-texture',size:[width,height],format,usage:4|2});
-      b={texture,width,height,format,version:-1,view:texture.createView(),sampler:device.createSampler({label:'f3d-integer-texture'}),sampleType:kind[2]};
-      integerBindings.set(t,b);
-      t.addEventListener('dispose',()=>{if(integerBindings.get(t)===b){integerBindings.delete(t);texture.destroy();}});
-    }
-    if(b.version!==t.version){
-      const bytes=new Uint8Array(data.buffer,data.byteOffset,data.byteLength),row=width*channels*kind[1];
-      device.queue.writeTexture({texture:b.texture},bytes,{bytesPerRow:row,rowsPerImage:height},[width,height]);
-      b.version=t.version;
-    }
-    return b;
-  }
   function equirectCube(source){
     const r=pmrem().lookupCube(source);
     if(r.state==='ready')return r.texture;
@@ -825,13 +736,12 @@ export async function createGpuThreeScene(device,scene,{
       for(const t of reflection.textures){
         const value=samplers?.[t.name]??uniforms?.[t.name]?.value,texture=t.element===null?value:value?.[t.element];
         if(texture!=null&&!(texture instanceof three.Texture))fail('TEXTURE',`Uniform ${t.name} is not a texture`);
-        if(texture&&(t.dimension==='cube')!==(texture.isCubeTexture===true))fail('TEXTURE',`Uniform ${t.name} texture dimension differs from its sampler`);
+        if(texture&&t.dimension!==textureBindings.dimension(texture))fail('TEXTURE',`Uniform ${t.name} texture dimension differs from its sampler`);
         const shadowMap=!!texture&&!!programShadowOwner?.binding(texture);
-        const volume=!!texture&&(texture.isData3DTexture===true||texture.isDataArrayTexture===true);
-        if(texture&&(((t.dimension==='3d'||t.dimension==='2d-array')&&!volume)||(t.comparison&&!shadowMap&&!textureScan)))fail('TEXTURE',`Sampler ${t.glslType} textures are not admitted yet`);
+        if(texture&&t.comparison&&!shadowMap&&!textureScan)fail('TEXTURE',`Sampler ${t.glslType} textures are not admitted yet`);
         // A shadow sampler without a rendered map (r186 binds an incomplete unit).
         if(!texture&&!textureScan&&/Shadow/.test(t.glslType))fail('SHADOW',`Shadow map ${t.name} was never rendered`);
-        const binding=texture?textureBinding(texture):placeholderBinding();
+        const binding=texture?textureBinding(texture,t,object.isBatchedMesh===true&&texture===object._indirectTexture):placeholderBinding(null,t);
         sourceTextures.push(texture??null);bindings.push({view:binding.view,sampler:binding.sampler,sampleType:binding.sampleType??'float'});textureKey.push(texture??null,binding.view,binding.sampler);
       }
       const raster=programSupport.raster(m,{side,topology});
@@ -1050,17 +960,9 @@ export async function createGpuThreeScene(device,scene,{
     return derived;
   }
   // Textures whose source data is not ready yet (e.g. an image still loading).
-  let pendingTextures=new WeakSet(),placeholder=null;
-  function ownerAccepts(owner,t){
-    try{owner.inspect(t);return true;}
-    catch(error){if(error?.code==='THREE_TEXTURE_NOT_READY')return false;throw error;}
-  }
-  function placeholderBinding(){
-    if(!placeholder){
-      const texture=device.createTexture({label:'f3d-default-texture',size:[1,1,1],format:'rgba8unorm',usage:4|2});
-      placeholder={texture,view:texture.createView(),sampler:device.createSampler({label:'f3d-default-texture'})};
-    }
-    return placeholder;
+  let pendingTextures=new WeakSet();
+  function placeholderBinding(texture=null,reflection=null){
+    return textureBindings.placeholder(texture,reflection);
   }
   function desired(nodes){
     const clippingFrame=clippingState();
@@ -1158,7 +1060,9 @@ export async function createGpuThreeScene(device,scene,{
       pendingTextures=new WeakSet();pmremRequests=new Set();cubeRequests=new Set();sceneRequests=new Set();
       let owned;
       owned=scanWithShadowRoute();
-      textureOwner?.prepare(owned);
+      // The scan admits version-zero storage only for the built-in batching ids;
+      // ordinary unrequested sources remain typed defaults. No upload is implied.
+      textureOwner?.prepare(owned,{initialize:true});
       preparedShadowMode=programShadowMode;
       if(programShadowMode){
         const camera=programCamera??new three.Camera();
@@ -1619,8 +1523,10 @@ export async function createGpuThreeScene(device,scene,{
           // (setProgram binds textures after the callback), then r186's
           // no-multi-draw loop: _gl_DrawID = i, render(starts[i] / bytes, counts[i]).
           if(object.isBatchedMesh){
-            const before=integerBindings.get(object._indirectTexture)?.view;
-            if(integerBinding(object._indirectTexture)?.view!==before)fail('PREPARE','BatchedMesh indirect texture changed; call prepare()');
+            // The callback just changed the source version. Keep the prepared
+            // shared residency, validate borrowed versions, then upload ids.
+            textureBinding(object._indirectTexture);
+            if(!textures.has(object._indirectTexture))textureOwner.update([object._indirectTexture]);
           }
           const multi=object.isBatchedMesh?Array.from({length:object._multiDrawCount},(_,k)=>{
             const index=item.geometry.index,bpe=index?index.array.BYTES_PER_ELEMENT:1;

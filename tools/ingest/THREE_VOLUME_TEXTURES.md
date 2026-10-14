@@ -78,18 +78,48 @@ Array/3D `flipY` and `premultiplyAlpha` must be false. Generic 2D `updateRanges`
 are not accepted for layered data. Authored uncompressed array/3D mipmaps are
 rejected: r186's WebGL array/3D upload branches consume only the base image, so
 this owner does not invent a different meaning for their `mipmaps` array.
-Compressed, integer and depth storage retain their separate admission boundaries.
+Compressed and depth storage retain their separate admission boundaries. Integer
+R/RG/RGBA storage uses signed/unsigned 8/16/32-bit arrays and nearest sampling;
+integer color transfer and generated mipmaps are not supported.
 No rendered pixel parity with an upstream renderer is established by this work.
 
-This document describes the shared owner API. The program scene bridge's older
-private volume/morph allocation path is a separate integration boundary; it is
-not automatically replaced merely by adding support to this owner.
+## Scene integration
+
+The scene-program path uses this same pool for DataArrayTexture, Data3DTexture,
+generated morph arrays, and integer textures (including BatchedMesh indirect
+ids). The old private volume/morph/integer allocators have been removed. They
+now participate in the ordinary preparation scan, requested-version uploads,
+aggregate budgets, source sharing, pruning, completion, device-loss and scene
+disposal paths. Array layer updates and generated mipmaps reach consuming draws
+without an additional renderer or texture owner.
+
+Borrowed bindings have priority and must acknowledge both source versions.
+`autoTextures: false` also applies to program volumes, morphs and integers.
+Storage/sampler changes and source disposal raise `THREE_SCENE_PREPARE`, which
+the renderer recognizes as its deferred-preparation boundary. Incompatible
+sampler dimensions and signed/unsigned/float storage fail before allocation.
+
+Loading and null samplers use bounded, zero-initialized defaults matching the
+shader's dimension and sample type, including cube, array, 3D, uint and sint.
+These defaults do not reinterpret integer data as normalized colors. Source
+arrival replaces a default at the preparation boundary.
+
+`textures.prepare(input, {initialize: true})` explicitly permits allocation for
+complete version-zero sources without uploading CPU pixels or changing either
+source version. Ordinary `prepare(input)` keeps its requested-upload admission.
+The scene uses allocation-only preparation for BatchedMesh's indirect ids:
+its built-in `onBeforeRender` requests the first upload, and that upload reaches
+the shared residency before the corresponding draw. Preparation does not invoke
+or replay the callback. Ordinary unrequested textures still use defaults.
 
 ## Validation
 
 ```sh
 node --unhandled-rejections=strict --test \
-  tools/ingest/tests/three_texture_volume.test.mjs
+  tools/ingest/tests/three_texture_volume.test.mjs \
+  tools/ingest/tests/three_texture_integer.test.mjs \
+  tools/ingest/tests/three_scene_texture_binding.test.mjs \
+  tools/ingest/tests/three_scene_shared_textures.test.mjs
 ```
 
 The tests execute the production inspector, allocator, uploader, mip command
@@ -100,3 +130,10 @@ combination, slice padding, layer selection, NPOT/1D pyramids, independent devic
 limits, shared-source identity, peak budgets, callback ordering, disposal and
 injected failures, plus ordinary 2D/cube regressions. Browser pixel equivalence
 and measured performance require separate validation.
+
+The scene integration suite imports the actual pinned Three.js module and executes
+production scene traversal, source program compilation and the native renderer
+against a recording GPU. It covers BatchedMesh first-frame ids, automatic morph
+arrays, upload versions, typed loading defaults, source aliases, partial layers,
+mip-before-draw ordering, budgets, device loss and disposal. This does not execute
+WGSL or establish browser pixel parity.
