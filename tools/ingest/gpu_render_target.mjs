@@ -21,10 +21,16 @@
  * copyFrom(sourceTarget, options). These queue-ordered, level-zero writes dirty
  * the mip chain; copies can read a selected source mip or resolved MSAA color.
  * Upload/copy destinations must be single-sample. No implicit color conversion.
+ * copyDepthFrom(sourceTarget, options) writes only depth, preserving color and
+ * stencil. Equal MSAA counts preserve every sample; MSAA-to-single requires an
+ * explicit sampleIndex. Different depth formats require allowFormatConversion.
+ * Enable sampleDepth on the source and copyDestination on the destination.
+ * Submission is synchronous; whenIdle includes validation and the copy fence.
  * No framebuffer emulation or frame loop.
  */
 import {readGpuTargetPixels, readGpuTargetDepth} from './gpu_target_readback.mjs';
 import {inspectGpuTargetWrite, gpuTargetWriteData, inspectGpuTargetCopy} from './gpu_target_transfer.mjs';
+import {inspectGpuDepthCopy, submitGpuDepthCopy} from './gpu_depth_transfer.mjs';
 // Authenticate target handles and device identity without exposing GPU textures.
 const transferTargets = new WeakMap();
 
@@ -123,9 +129,10 @@ export function createGpuRenderTarget(device, options = {}) {
   const rendererOptions = Object.freeze({format, depthFormat, sampleCount});
   let current = null, disposed = false, terminal = null, busy = false, version = 0;
   let validation = Promise.resolve(), retirement = Promise.resolve();
-  let mipPipeline = null, mipSampler = null, mipGenerations = 0, colorUploads = 0, colorCopies = 0;
+  let mipPipeline = null, mipSampler = null, mipGenerations = 0, colorUploads = 0, colorCopies = 0, depthCopies = 0;
   const levels = (w, h) => generateMipmaps && w && h ? 1 + Math.floor(Math.log2(Math.max(w, h))) : 1;
   const transferShape = () => ({width, height, format, sampleCount, mipLevelCount: levels(width, height)});
+  const depthShape = () => ({width, height, depthFormat, sampleCount, sampleDepth});
   const retired = new Set(), readbacks = new Set();
   let rejectStopped;
   const stopped = new Promise((_, reject) => { rejectStopped = reject; });
@@ -309,7 +316,7 @@ export function createGpuRenderTarget(device, options = {}) {
     get suspended() { return width === 0 || height === 0; },
     get version() { return version; }, get disposed() { return disposed; },
     get failed() { return terminal !== null; }, get allocatedBytes() { return allocated(); },
-    get diagnostics() { return Object.freeze({width, height, version, format, depthFormat, sampleCount, sampleDepth, copyDestination, colorUploads, colorCopies,
+    get diagnostics() { return Object.freeze({width, height, version, format, depthFormat, sampleCount, sampleDepth, copyDestination, colorUploads, colorCopies, depthCopies,
       allocatedBytes: allocated(), retiredTargets: retired.size, mipLevelCount: current?.mipLevelCount ?? 0, mipGenerations, pendingReadbacks: readbacks.size}); },
     resize(w, h) {
       exclusive(); dimension(w); dimension(h);
@@ -374,6 +381,30 @@ export function createGpuRenderTarget(device, options = {}) {
         live(); colorCopies++; return true;
       } finally { busy = false; if (disposed || terminal !== null) release(); }
     },
+    copyDepthFrom(source, options = {}) {
+      exclusive();
+      if (!copyDestination) fail('USAGE', 'Enable copyDestination before copying target depth');
+      const other = transferTargets.get(source);
+      if (!other) fail('SOURCE', 'Expected a native render target handle');
+      if (other.device !== device) fail('DEVICE', 'Depth copies require the same GPUDevice');
+      if (source === api) fail('FEEDBACK', 'In-place depth copies are not admitted');
+      other.exclusive();
+      const plan = inspectGpuDepthCopy(other.depthShape(), depthShape(), options);
+      if (plan.empty) return false;
+      busy = true;
+      try {
+        current.used = true;
+        let completion;
+        other.borrowDepth(texture => {
+          completion = submitGpuDepthCopy(device, texture, current.depthView, plan);
+        });
+        // Depth-only writes must not regenerate color mips. Source validation
+        // remains a dependency even if this pass itself validates successfully.
+        validation = Promise.all([validation, other.validation(), completion]).then(() => {});
+        validation.catch(stop);
+        live(); depthCopies++; return true;
+      } finally { busy = false; if (disposed || terminal !== null) release(); }
+    },
     readPixels(options = {}) { return read(readGpuTargetPixels, options); },
     readDepthPixels(options = {}) { return read(readGpuTargetDepth, options); },
     async whenIdle() {
@@ -399,7 +430,8 @@ export function createGpuRenderTarget(device, options = {}) {
     current = allocate(width, height, bytes);
     if (device.lost && typeof device.lost.then === 'function')
       device.lost.then(info => stop(new GpuRenderTargetError('DEVICE_LOST', info?.message ?? 'Device lost')), stop);
-    transferTargets.set(api, {device, exclusive, shape: transferShape,
+    transferTargets.set(api, {device, exclusive, shape: transferShape, depthShape,
+      borrowDepth: callback => borrow(callback, 'depth'),
       borrow: callback => borrow(callback, 'color'), validation: () => validation});
     return api;
   } catch (error) { disposed = true; release(); throw error; }
