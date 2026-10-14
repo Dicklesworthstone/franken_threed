@@ -15,13 +15,15 @@
  * readPixels() submits a bounded copy immediately and returns tightly packed
  * typed color data. mipLevel selects an allocated color level, with bounds and
  * default extents in that level. Pending reads are cancelled on disposal or failure.
+ * readDepthPixels() reads sampled depth as native-space Float32 values; MSAA
+ * requires an explicit sampleIndex. Depth never travels through RGBA/half floats.
  * copyDestination:true additionally admits writePixels(data, options) and
  * copyFrom(sourceTarget, options). These queue-ordered, level-zero writes dirty
  * the mip chain; copies can read a selected source mip or resolved MSAA color.
  * Upload/copy destinations must be single-sample. No implicit color conversion.
  * No framebuffer emulation or frame loop.
  */
-import {readGpuTargetPixels} from './gpu_target_readback.mjs';
+import {readGpuTargetPixels, readGpuTargetDepth} from './gpu_target_readback.mjs';
 import {inspectGpuTargetWrite, gpuTargetWriteData, inspectGpuTargetCopy} from './gpu_target_transfer.mjs';
 // Authenticate target handles and device identity without exposing GPU textures.
 const transferTargets = new WeakMap();
@@ -279,6 +281,27 @@ export function createGpuRenderTarget(device, options = {}) {
       return true;
     } finally { busy = false; if (disposed || terminal !== null) release(); }
   }
+  async function read(operation, options = {}) {
+    exclusive();
+    if (!options || typeof options !== 'object' || Array.isArray(options)) fail('OPTIONS', 'Expected readback options');
+    const caller = options.signal;
+    if (caller !== undefined && (!caller || typeof caller.addEventListener !== 'function' || typeof caller.removeEventListener !== 'function'))
+      fail('OPTIONS', 'Expected AbortSignal');
+    const controller = new AbortController(), abort = () => controller.abort(caller.reason);
+    readbacks.add(controller);
+    try {
+      caller?.addEventListener('abort', abort, {once: true});
+      if (caller?.aborted) abort();
+      // Capture the extent and submit before any await: resize and subsequent
+      // draws cannot change which version of the texture this call observes.
+      return await operation({device, width, height, diagnostics: {target: {...transferShape(), depthFormat, sampleDepth}},
+        get disposed() { return disposed; }, get failed() { return terminal !== null; },
+        withTexture: api.withTexture, withDepthTexture: api.withDepthTexture}, {...options, signal: controller.signal});
+    } finally {
+      readbacks.delete(controller);
+      caller?.removeEventListener('abort', abort);
+    }
+  }
   const api = Object.freeze({
     rendererOptions,
     get width() { return width; }, get height() { return height; },
@@ -351,27 +374,8 @@ export function createGpuRenderTarget(device, options = {}) {
         live(); colorCopies++; return true;
       } finally { busy = false; if (disposed || terminal !== null) release(); }
     },
-    async readPixels(options = {}) {
-      exclusive();
-      if (!options || typeof options !== 'object' || Array.isArray(options)) fail('OPTIONS', 'Expected readback options');
-      const caller = options.signal;
-      if (caller !== undefined && (!caller || typeof caller.addEventListener !== 'function' || typeof caller.removeEventListener !== 'function'))
-        fail('OPTIONS', 'Expected AbortSignal');
-      const controller = new AbortController(), abort = () => controller.abort(caller.reason);
-      readbacks.add(controller);
-      try {
-        caller?.addEventListener('abort', abort, {once: true});
-        if (caller?.aborted) abort();
-        // Capture the extent and submit before any await: resize and subsequent
-        // draws cannot change which version of the texture this call observes.
-        return await readGpuTargetPixels({device, width, height, diagnostics: {target: transferShape()},
-          get disposed() { return disposed; }, get failed() { return terminal !== null; },
-          withTexture: api.withTexture}, {...options, signal: controller.signal});
-      } finally {
-        readbacks.delete(controller);
-        caller?.removeEventListener('abort', abort);
-      }
-    },
+    readPixels(options = {}) { return read(readGpuTargetPixels, options); },
+    readDepthPixels(options = {}) { return read(readGpuTargetDepth, options); },
     async whenIdle() {
       exclusive();
       try {

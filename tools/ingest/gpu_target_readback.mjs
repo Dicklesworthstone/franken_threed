@@ -35,6 +35,7 @@ function deviceState(device) {
       state.error = cause instanceof Error ? cause : new GpuTargetReadbackError('DEVICE_LOST', cause?.message ?? 'Device lost');
       for (const waiter of state.waiters) waiter(state.error);
       state.waiters.clear();
+      state.depthPipelines?.clear();
     };
     device.lost?.then(info => stop(new GpuTargetReadbackError('DEVICE_LOST', info?.message ?? 'Device lost')), stop);
   }
@@ -159,6 +160,155 @@ export async function readGpuTargetPixels(session, {x = 0, y = 0, width, height,
       try {
         if (buffer) { try { buffer.unmap(); } finally { buffer.destroy(); } }
       } finally { release(); }
+    }
+  }
+}
+
+// Sampling depth into a storage buffer supports rectangular reads of opaque
+// depth24plus formats without COPY_SRC usage, filtering or a color conversion.
+// WebGPU depth/stencil texture-to-buffer copies cannot provide that contract.
+const DEPTH_FORMATS = new Set(['depth16unorm', 'depth24plus', 'depth32float',
+  'depth24plus-stencil8', 'depth32float-stencil8']);
+function depthReadbackPipeline(device, state, multisampled) {
+  const pipelines = state.depthPipelines ??= new Map();
+  if (pipelines.has(multisampled)) return pipelines.get(multisampled);
+  const module = device.createShaderModule({label: 'Depth pixel readback', code: `
+struct Region {
+  origin: vec2u,
+  extent: vec2u,
+  sampleIndex: u32,
+  flipY: u32,
+  padding: vec2u,
+}
+@group(0) @binding(0) var source: ${multisampled ? 'texture_depth_multisampled_2d' : 'texture_depth_2d'};
+@group(0) @binding(1) var<storage, read_write> pixels: array<f32>;
+@group(0) @binding(2) var<uniform> region: Region;
+@compute @workgroup_size(8, 8) fn cs(@builtin(global_invocation_id) id: vec3u) {
+  if (any(id.xy >= region.extent)) { return; }
+  let row = select(id.y, region.extent.y - 1u - id.y, region.flipY != 0u);
+  let coordinate = vec2i(region.origin + vec2u(id.x, row));
+  pixels[id.y * region.extent.x + id.x] = textureLoad(source, coordinate, ${multisampled ? 'i32(region.sampleIndex)' : '0'});
+}`});
+  const pipeline = device.createComputePipeline({label: 'Depth pixel readback', layout: 'auto', compute: {module, entryPoint: 'cs'}});
+  pipelines.set(multisampled, pipeline);
+  return pipeline;
+}
+
+/** Read sampled depth as tightly packed Float32Array values in native depth
+ * space, not linearized distance. Requires sampleDepth on the target. MSAA reads
+ * require an explicit sampleIndex: samples are never averaged or resolved.
+ * Submission captures depth before returning its promise. The same per-device
+ * budgets and cancellation gate as color readback own all temporary buffers;
+ * maxBytes limits each data buffer, maxInFlightBytes also charges the compute
+ * output, 32-byte uniform and any internally allocated host output.
+ */
+export async function readGpuTargetDepth(session, {x = 0, y = 0, width, height, sampleIndex,
+  mipLevel = 0, flipY = false, output, signal, maxBytes = 64 * 1024 * 1024,
+  maxInFlightBytes = 128 * 1024 * 1024} = {}) {
+  if (!session || typeof session.withDepthTexture !== 'function' || session.disposed || session.failed)
+    fail('SOURCE', 'Expected a live sampled-depth session');
+  for (const value of [session.width, session.height])
+    if (!Number.isSafeInteger(value) || value < 0 || value > 0x7fffffff)
+      fail('SOURCE', 'Expected finite integer depth dimensions');
+  const shape = session.diagnostics?.target ?? session.diagnostics;
+  if (!DEPTH_FORMATS.has(shape?.depthFormat)) fail('FORMAT', 'Expected a depth attachment');
+  if (shape.sampleDepth === false) fail('SOURCE', 'Enable sampleDepth before reading depth');
+  const samples = shape.sampleCount;
+  if (![1, 4].includes(samples)) fail('SOURCE', 'Expected one or four depth samples');
+  if (sampleIndex === undefined && samples === 1) sampleIndex = 0;
+  if (!Number.isSafeInteger(sampleIndex) || sampleIndex < 0 || sampleIndex >= samples)
+    fail('SAMPLES', 'Supply a valid explicit sampleIndex for multisampled depth');
+  if (mipLevel !== 0) fail('REGION', 'Depth attachments have only mip level zero');
+  if (width === undefined) width = session.width - x;
+  if (height === undefined) height = session.height - y;
+  for (const value of [x, y, width, height])
+    if (!Number.isSafeInteger(value) || value < 0) fail('REGION', 'Depth readback bounds must be non-negative integers');
+  if (x > session.width - width || y > session.height - height) fail('REGION', 'Depth readback region exceeds the target');
+  if (typeof flipY !== 'boolean' || ![maxBytes, maxInFlightBytes].every(n => Number.isSafeInteger(n) && n > 0))
+    fail('OPTIONS', 'Invalid depth readback options');
+  const device = session.device, elements = width * height, bytes = elements * 4;
+  if (!device || typeof device.createBuffer !== 'function') fail('SOURCE', 'Expected a session device');
+  const groupsX = Math.ceil(width / 8), groupsY = Math.ceil(height / 8);
+  if (!Number.isSafeInteger(bytes) || bytes > maxBytes ||
+      (device.limits?.maxBufferSize !== undefined && Math.max(bytes, 32) > device.limits.maxBufferSize) ||
+      (device.limits?.maxStorageBufferBindingSize !== undefined && bytes > device.limits.maxStorageBufferBindingSize) ||
+      (device.limits?.maxComputeWorkgroupsPerDimension !== undefined &&
+        Math.max(groupsX, groupsY) > device.limits.maxComputeWorkgroupsPerDimension))
+    fail('BUDGET', 'Depth readback exceeds its byte budget or device compute limits');
+  if (output !== undefined && (!(output instanceof Float32Array) || output.length < elements))
+    fail('OUTPUT', 'Depth output must be a Float32Array with sufficient capacity');
+  if (signal !== undefined && (!signal || typeof signal.addEventListener !== 'function' || typeof signal.removeEventListener !== 'function'))
+    fail('OPTIONS', 'Expected AbortSignal');
+  const checkAbort = () => {
+    if (signal?.aborted) throw signal.reason ?? new GpuTargetReadbackError('ABORTED', 'Depth readback cancelled');
+  };
+  checkAbort();
+  if (width === 0 || height === 0) return output ?? new Float32Array(0);
+  if (['createShaderModule', 'createComputePipeline', 'createBindGroup', 'createCommandEncoder', 'pushErrorScope', 'popErrorScope']
+    .some(key => typeof device[key] !== 'function') || typeof device.queue?.writeBuffer !== 'function' || typeof device.queue?.submit !== 'function')
+    fail('SOURCE', 'Depth readback requires WebGPU compute and queue submission');
+  const state = deviceState(device), charged = bytes * (output === undefined ? 3 : 2) + 32;
+  if (!Number.isSafeInteger(charged)) fail('BUDGET', 'Depth readback allocation exceeds safe integer precision');
+  const release = reserve(state, charged, maxInFlightBytes);
+  let staging = null, storage = null, uniform = null, rejectStopped, pipeline;
+  const stopped = new Promise((_, reject) => { rejectStopped = reject; }); stopped.catch(() => {});
+  const abort = () => rejectStopped(signal.reason ?? new GpuTargetReadbackError('ABORTED', 'Depth readback cancelled'));
+  state.waiters.add(rejectStopped);
+  try {
+    signal?.addEventListener('abort', abort, {once: true});
+    checkAbort();
+    const result = output ?? new Float32Array(elements);
+    let validation, error;
+    session.withDepthTexture(texture => {
+      device.pushErrorScope('out-of-memory'); device.pushErrorScope('validation');
+      try {
+        pipeline = depthReadbackPipeline(device, state, samples > 1);
+        storage = device.createBuffer({label: 'Depth readback compute output', size: bytes, usage: 128 | 4});
+        staging = device.createBuffer({label: 'Depth readback mapping', size: bytes, usage: 1 | 8});
+        uniform = device.createBuffer({label: 'Depth readback region', size: 32, usage: 64 | 8});
+        device.queue.writeBuffer(uniform, 0, new Uint32Array([x, flipY ? session.height - y - height : y,
+          width, height, sampleIndex, flipY ? 1 : 0, 0, 0]));
+        const group = device.createBindGroup({layout: pipeline.getBindGroupLayout(0), entries: [
+          {binding: 0, resource: texture.createView({aspect: 'depth-only', baseMipLevel: 0, mipLevelCount: 1})},
+          {binding: 1, resource: {buffer: storage}}, {binding: 2, resource: {buffer: uniform}},
+        ]});
+        const encoder = device.createCommandEncoder({label: 'Depth pixel readback'}), pass = encoder.beginComputePass();
+        pass.setPipeline(pipeline); pass.setBindGroup(0, group);
+        pass.dispatchWorkgroups(groupsX, groupsY); pass.end();
+        encoder.copyBufferToBuffer(storage, 0, staging, 0, bytes);
+        device.queue.submit([encoder.finish()]);
+      } catch (cause) { error = cause; }
+      const invalid = device.popErrorScope(), oom = device.popErrorScope();
+      validation = Promise.all([invalid, oom]).then(errors => {
+        const cause = errors.find(Boolean);
+        if (cause) fail('GPU', cause.message ?? 'GPU rejected depth readback');
+      });
+      validation.catch(() => {});
+    });
+    if (error) throw error;
+    if (!staging) fail('SOURCE', 'Depth storage was suspended before submission');
+    await Promise.race([Promise.all([validation, staging.mapAsync(1)]), stopped]);
+    checkAbort();
+    if (state.error) throw state.error;
+    const mapped = new Uint8Array(staging.getMappedRange());
+    if (mapped.byteLength < bytes) fail('GPU', 'Mapped depth buffer is smaller than the submitted region');
+    new Uint8Array(result.buffer, result.byteOffset, bytes).set(mapped.subarray(0, bytes));
+    return result;
+  } catch (error) {
+    // Do not retain an asynchronously invalid pipeline for later reads.
+    if (pipeline && state.depthPipelines?.get(samples > 1) === pipeline) state.depthPipelines.delete(samples > 1);
+    throw error;
+  } finally {
+    state.waiters.delete(rejectStopped);
+    try {
+      signal?.removeEventListener('abort', abort);
+    } finally {
+      try {
+        if (staging) { try { staging.unmap(); } finally { staging.destroy(); } }
+      } finally {
+        try { storage?.destroy(); }
+        finally { try { uniform?.destroy(); } finally { release(); } }
+      }
     }
   }
 }
