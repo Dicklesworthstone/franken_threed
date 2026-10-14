@@ -97,7 +97,8 @@ function textureInspector(T,{
     const height=integer(video?image.videoHeight:data?image.height:image.naturalHeight??image.height,1,limit,'image height');
     if(width*height>maxPixels)fail('LIMIT','Source exceeds pixel budget');return {width,height};
   }
-  function describe(t){
+  function describe(t,{initialize=false}={}){
+    if(typeof initialize!=='boolean')fail('OPTIONS','initialize must be boolean');
     if(!(t instanceof T.Texture)||t.isCompressedTexture||t.isDepthTexture||
       t.isFramebufferTexture||t.isRenderTargetTexture||t.isExternalTexture)
       fail('SOURCE','Expected a data texture, VideoTexture or CubeTexture');
@@ -107,7 +108,7 @@ function textureInspector(T,{
         typeof T[volume?'Data3DTexture':'DataArrayTexture']!=='function'||
         !(t instanceof T[volume?'Data3DTexture':'DataArrayTexture'])))
       fail('SOURCE','Expected an unambiguous source Data3DTexture or DataArrayTexture');
-    if(layered&&(!t.image||t.image.data==null))fail('NOT_READY','Array or volume source data has not loaded');
+    if((layered||t.isDataTexture)&&(!t.image||t.image.data==null))fail('NOT_READY','Source texture data has not loaded');
     const layers=layered?integer(t.image?.depth,1,volume?maxDimension3D:maxLayers,'image depth'):cube?6:1;
     if(video&&(typeof T.VideoTexture!=='function'||!(t instanceof T.VideoTexture)||
         !instance(t.image,'HTMLVideoElement')||cube||t.isDataTexture||t.isVideoFrameTexture||
@@ -130,7 +131,7 @@ function textureInspector(T,{
     if(integral&&t.colorSpace!==T.NoColorSpace)fail('COLOR','Integer textures carry data, not color-space transfers');
     if(![T.NoColorSpace,T.LinearSRGBColorSpace,T.SRGBColorSpace].includes(t.colorSpace)||
         (t.colorSpace===T.SRGBColorSpace&&(channels!==4||bpc!==1)))fail('COLOR','Unsupported transfer function or channel format');
-    if(!Number.isSafeInteger(t.version)||t.version<(video?0:1)||!Number.isSafeInteger(t.source?.version)||t.source.version<0||t.source.dataReady!==true)
+    if(!Number.isSafeInteger(t.version)||t.version<(video||initialize?0:1)||!Number.isSafeInteger(t.source?.version)||t.source.version<0||t.source.dataReady!==true)
       fail('NOT_READY','Set needsUpdate after providing ready source data');
     if(t.onUpdate!==null&&typeof t.onUpdate!=='function')fail('SOURCE','Invalid upload callback');
     const filter=filters.get(t.minFilter),mag=filters.get(t.magFilter);
@@ -284,9 +285,9 @@ export function createGpuThreeTextures(device,{
       pending=Promise.all([pending,checked]).then(()=>{});pending.catch(()=>{});
     }
   }
-  function plans(input){
+  function plans(input,{initialize=false}={}){
     live();const list=[];for(const t of input){if(list.length>=maxTextures)fail('LIMIT','Requested texture count exceeds capacity');list.push(t);}
-    return [...new Set(list)].map(t=>({t,d:describe(t)}));
+    return [...new Set(list)].map(t=>({t,d:describe(t,{initialize:initialize||records.has(t)})}));
   }
   function match(t,d){const r=records.get(t);return r&&r.resource.source===d.source&&r.resource.key===d.key?r:null;}
   function ranges(t,width){
@@ -326,6 +327,7 @@ export function createGpuThreeTextures(device,{
     native(()=>device.queue.submit([encoder.finish()]));
   }
   function upload(t,r,d){
+    if(!d.video&&t.version===0){r.version=0;return;}
     if(d.video){
       if(!d.videoReady)return;
       // The pinned hook is a no-op with requestVideoFrameCallback. On older
@@ -381,8 +383,12 @@ export function createGpuThreeTextures(device,{
     }
     r.version=t.version;
   }
-  function prepare(input){
-    const list=plans(input);if(busy)fail('REENTRANT','Cannot prepare during a texture operation');busy=true;
+  // initialize:true reserves ready storage for a version-zero source without
+  // uploading its CPU bytes or mutating source versions. Built-in BatchedMesh
+  // requests its first indirect upload inside onBeforeRender, after preparation.
+  function prepare(input,{initialize=false}={}){
+    if(typeof initialize!=='boolean')fail('OPTIONS','initialize must be boolean');
+    const list=plans(input,{initialize});if(busy)fail('REENTRANT','Cannot prepare during a texture operation');busy=true;
     try{
       let addedBytes=0,addedCount=0;const newKeys=new Map();
       for(const {t,d} of list){
@@ -420,7 +426,7 @@ export function createGpuThreeTextures(device,{
       return api;
     }finally{busy=false;}
   }
-  function check(t){live();const d=describe(t),r=match(t,d);if(!r)fail('PREPARE','Prepare the current texture storage and sampler before drawing');return {r,d};}
+  function check(t){live();const d=describe(t,{initialize:records.has(t)}),r=match(t,d);if(!r)fail('PREPARE','Prepare the current texture storage and sampler before drawing');return {r,d};}
   function binding(t){const {r,d}=check(t);return Object.freeze({view:r.resource.view,sampler:r.resource.sampler,version:r.version,sourceVersion:r.resource.sourceVersion,
     ...(d.layered?{viewDimension:d.viewDimension}:{}),sampleType:d?.sampleType??'float',filtering:(d?.sampleType??'float')==='float'});}
   function update(input){
@@ -443,4 +449,86 @@ export function createGpuThreeTextures(device,{
     typeof device.pushErrorScope!=='function'||typeof device.popErrorScope!=='function'||typeof device.lost?.then!=='function')fail('DEVICE','Supply a WebGPU device with texture uploads');
   device.lost.then(info=>{if(!disposed)stop(new ThreeTextureError('LOST',info?.message||'Device lost'));},e=>{if(!disposed)stop(e);});
   return api;
+}
+
+/** Source-scene binding policy over an existing shared texture owner.
+ * `state` exposes the bridge's borrowed bindings, lazy owner, and current scan,
+ * pending and frame sets. Getters keep those sets live across preparation retries.
+ * Real source textures, including program volumes and morph arrays, always use
+ * the same owner. Only bounded zero-initialized sampler defaults are private.
+ */
+export function createThreeTextureBindings(device,state) {
+  const defaults=new Map();let disposed=false;
+  const fail=(code,message)=>state.fail(code,message);
+  const dimension=t=>t?.isData3DTexture===true?'3d':t?.isDataArrayTexture===true?'2d-array':t?.isCubeTexture===true?'cube':'2d';
+  function live(){if(disposed)fail('DISPOSED','Source texture bindings are disposed');}
+  function placeholder(t=null,reflection=null){
+    live();
+    const viewDimension=reflection?.dimension??dimension(t);
+    const glsl=reflection?.glslType??'';
+    const T=state.three;
+    const integral=T&&['RedIntegerFormat','RGIntegerFormat','RGBAIntegerFormat'].some(k=>T[k]!==undefined&&t?.format===T[k]);
+    const signed=integral&&['ByteType','ShortType','IntType'].some(k=>T[k]!==undefined&&t.type===T[k]);
+    const sampleType=reflection?.sampleType??(reflection?.comparison?'depth':glsl.startsWith('u')?'uint':glsl.startsWith('i')?'sint':integral?signed?'sint':'uint':'float');
+    if(!['2d','2d-array','3d','cube'].includes(viewDimension)||!['float','uint','sint','depth'].includes(sampleType)||(sampleType==='depth'&&viewDimension==='3d'))
+      fail('TEXTURE','Unsupported default texture view dimension');
+    const key=viewDimension+'/'+sampleType;
+    let result=defaults.get(key);
+    if(!result){
+      const format=sampleType==='depth'?'depth32float':sampleType==='uint'?'rgba8uint':sampleType==='sint'?'rgba8sint':'rgba8unorm';
+      const texture=device.createTexture({label:'f3d-default-texture',size:[1,1,viewDimension==='cube'?6:1],
+        format,dimension:viewDimension==='3d'?'3d':'2d',usage:4});
+      try{
+        result=Object.freeze({texture,view:texture.createView({dimension:viewDimension}),
+          sampler:device.createSampler({label:'f3d-default-texture',...(sampleType==='depth'?{compare:'less-equal'}:{})}),
+          viewDimension,sampleType,filtering:sampleType==='float'});
+      }catch(error){texture.destroy();throw error;}
+      defaults.set(key,result);
+    }
+    return result;
+  }
+  function binding(t,reflection=null,{initialize=false}={}){
+    live();
+    const checked=b=>{
+      const actual=b.sampleType??'float',expected=reflection?.sampleType;
+      if(expected&&actual!==expected&&!(expected==='float'&&actual==='unfilterable-float'))
+        fail('TEXTURE',`Sampler ${reflection.name??reflection.glslType??''} requires ${expected} storage, not ${actual}`);
+      return b;
+    };
+    if(state.textures.has(t)){
+      const b=state.textures.get(t);
+      if(!b?.view||!b.sampler||b.version!==t.version||b.sourceVersion!==t.source.version)
+        fail('TEXTURE','Supply a completed texture binding matching both texture and source upload versions');
+      return checked(b);
+    }
+    if(!state.autoTextures)fail('TEXTURE','Supply an acknowledged binding or enable automatic textures');
+    if(t.onUpdate!==null)fail('HOOK','Custom texture upload callbacks require the explicit texture owner');
+    const owner=state.ownedTextures(),scan=state.textureScan,pending=state.pendingTextures;
+    if(scan||pending.has(t)){
+      let shape;
+      try{shape=owner.inspect(t,{initialize});}
+      catch(error){
+        if(error?.code!=='THREE_TEXTURE_NOT_READY')throw error;
+        pending.add(t);return placeholder(t,reflection);
+      }
+      if(pending.has(t))fail('PREPARE','A source texture finished loading; prepare() binds it');
+      // Inspection tokens never reach addMesh: prepare() resolves them to the
+      // shared owner's native view/sampler after all real sources are admitted.
+      scan.add(t);
+      return checked({view:t,sampler:t,viewDimension:shape.viewDimension,sampleType:shape.sampleType});
+    }
+    let result;
+    try{result=owner.binding(t);}
+    catch(error){
+      // The renderer's deferred-preparation boundary recognizes scene errors,
+      // not the shared owner's lower-level error namespace.
+      if(error?.code==='THREE_TEXTURE_PREPARE')fail('PREPARE',error.message);
+      throw error;
+    }
+    state.frameTextures?.add(t);
+    return checked(result);
+  }
+  return Object.freeze({binding,placeholder,dimension,
+    dispose(){if(!disposed){disposed=true;for(const b of defaults.values())b.texture.destroy();defaults.clear();}},
+  });
 }
