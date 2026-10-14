@@ -17,7 +17,10 @@
  * arrays also support source layerUpdates. See THREE_VOLUME_TEXTURES.md.
  * Integer data (signed/unsigned 8/16/32-bit R/RG/RGBA) uses the same residency
  * with exact typed storage and nearest sampling, including arrays and volumes.
- * Other ImageBitmap flags and compressed/depth textures remain explicit
+ * Compressed 2D/array/cube sources upload authored BC, ETC/EAC and ASTC blocks
+ * through this same owner; optional device features are checked before allocation.
+ * See THREE_COMPRESSED_TEXTURES.md for block layout and format boundaries.
+ * Other ImageBitmap flags and depth textures remain explicit
  * errors; applications can keep borrowing bindings for those sources.
  * See THREE_TEXTURES.md for source-state, color, bounds and completion contracts.
  */
@@ -69,13 +72,14 @@ export function inspectThreeTexture(texture, three, limits={}) {
   return textureInspector(three,limits)(texture);
 }
 function textureInspector(T,{
-  maxTextureBytes=128*1024*1024,maxPixels=16*1024*1024,maxDimension=32768,maxDimension3D=32768,maxLayers=2048,float32Filterable=false,
+  maxTextureBytes=128*1024*1024,maxPixels=16*1024*1024,maxDimension=32768,maxDimension3D=32768,maxLayers=2048,float32Filterable=false,features=new Set(),
 }={}) {
   if(T?.REVISION!=='186'||typeof T.Texture!=='function')fail('SOURCE','Supply the pinned r186 module');
   integer(maxTextureBytes,1,Number.MAX_SAFE_INTEGER,'texture budget');
   integer(maxPixels,1,Number.MAX_SAFE_INTEGER,'pixel capacity');integer(maxDimension,1,32768,'texture dimension');
   integer(maxDimension3D,1,32768,'3D texture dimension');
   integer(maxLayers,1,Number.MAX_SAFE_INTEGER,'texture layers');
+  if(!features||typeof features.has!=='function')fail('OPTIONS','Expected a device feature set');
   const wraps=new Map([[T.ClampToEdgeWrapping,'clamp-to-edge'],[T.RepeatWrapping,'repeat'],[T.MirroredRepeatWrapping,'mirror-repeat']]);
   const filters=new Map([[T.NearestFilter,['nearest','nearest',false]],[T.LinearFilter,['linear','nearest',false]],
     [T.NearestMipmapNearestFilter,['nearest','nearest',true]],[T.NearestMipmapLinearFilter,['nearest','linear',true]],
@@ -89,6 +93,108 @@ function textureInspector(T,{
     ['ShortType',Int16Array,'16sint','sint'],['UnsignedShortType',Uint16Array,'16uint','uint'],
     ['IntType',Int32Array,'32sint','sint'],['UnsignedIntType',Uint32Array,'32uint','uint'],
   ].filter(([name])=>Number.isInteger(T[name])).map(([name,Kind,suffix,sampleType])=>[T[name],{Kind,suffix,sampleType}]));
+  // Pinned r186 compressed formats. Block geometry belongs to storage, never
+  // to unpackAlignment. BC6H/RGTC/EAC do not have an sRGB view variant.
+  const compressedFormats=new Map([
+    ['RGBA_S3TC_DXT1_Format','bc1-rgba-unorm',4,4,8,'bc',true],
+    ['RGBA_S3TC_DXT3_Format','bc2-rgba-unorm',4,4,16,'bc',true],
+    ['RGBA_S3TC_DXT5_Format','bc3-rgba-unorm',4,4,16,'bc',true],
+    ['RED_RGTC1_Format','bc4-r-unorm',4,4,8,'bc',false],
+    ['SIGNED_RED_RGTC1_Format','bc4-r-snorm',4,4,8,'bc',false],
+    ['RED_GREEN_RGTC2_Format','bc5-rg-unorm',4,4,16,'bc',false],
+    ['SIGNED_RED_GREEN_RGTC2_Format','bc5-rg-snorm',4,4,16,'bc',false],
+    ['RGB_BPTC_SIGNED_Format','bc6h-rgb-float',4,4,16,'bc',false],
+    ['RGB_BPTC_UNSIGNED_Format','bc6h-rgb-ufloat',4,4,16,'bc',false],
+    ['RGBA_BPTC_Format','bc7-rgba-unorm',4,4,16,'bc',true],
+    ['RGB_ETC1_Format','etc2-rgb8unorm',4,4,8,'etc2',true],
+    ['RGB_ETC2_Format','etc2-rgb8unorm',4,4,8,'etc2',true],
+    ['RGBA_ETC2_EAC_Format','etc2-rgba8unorm',4,4,16,'etc2',true],
+    ['R11_EAC_Format','eac-r11unorm',4,4,8,'etc2',false],
+    ['SIGNED_R11_EAC_Format','eac-r11snorm',4,4,8,'etc2',false],
+    ['RG11_EAC_Format','eac-rg11unorm',4,4,16,'etc2',false],
+    ['SIGNED_RG11_EAC_Format','eac-rg11snorm',4,4,16,'etc2',false],
+    ...[[4,4],[5,4],[5,5],[6,5],[6,6],[8,5],[8,6],[8,8],[10,5],[10,6],[10,8],[10,10],[12,10],[12,12]]
+      .map(([w,h])=>[`RGBA_ASTC_${w}x${h}_Format`,`astc-${w}x${h}-unorm`,w,h,16,'astc',true]),
+    // KTX2Loader may return a CompressedTexture with uncompressed RGBA8 mips.
+    ['RGBAFormat','rgba8unorm',1,1,4,null,true],
+  ].filter(([name])=>Number.isInteger(T[name])).map(([name,...profile])=>[T[name],profile]));
+  function describeCompressed(t,initialize){
+    const cube=t.isCubeTexture===true,array=t.isCompressedArrayTexture===true;
+    if(t.isData3DTexture||t.isDataArrayTexture||t.isDataTexture||t.isVideoTexture||t.isDepthTexture||
+        t.isRenderTargetTexture||t.isFramebufferTexture||t.isExternalTexture||cube&&array||
+        (array?typeof T.CompressedArrayTexture!=='function'||!(t instanceof T.CompressedArrayTexture):
+          cube?!(typeof T.CompressedCubeTexture==='function'&&t instanceof T.CompressedCubeTexture)&&
+            !(typeof T.CubeTexture==='function'&&t instanceof T.CubeTexture):
+          typeof T.CompressedTexture!=='function'||!(t instanceof T.CompressedTexture)))
+      fail('SOURCE','Expected a source compressed 2D, array or cube texture');
+    if(!Number.isSafeInteger(t.version)||t.version<(initialize?0:1)||!Number.isSafeInteger(t.source?.version)||
+        t.source.version<0||t.source.dataReady!==true)fail('NOT_READY','Set needsUpdate after providing ready compressed mips');
+    if(cube&&(!Array.isArray(t.image)||t.image.length!==6))fail('SOURCE','Compressed cubes require six faces');
+    const chains=cube?t.image.map(face=>face?.mipmaps):[t.mipmaps];
+    if(chains.some(mips=>!Array.isArray(mips)))fail('MIPS','Expected compressed mip arrays');
+    if(chains.some(mips=>mips.length===0))fail('NOT_READY','Compressed mip data has not loaded');
+    const first=chains[0][0],image=cube?(t.image[0].image??t.image[0]):t.image;
+    const width=integer(image?.width??first?.width,1,maxDimension,'compressed width');
+    const height=integer(image?.height??first?.height,1,maxDimension,'compressed height');
+    const layers=cube?6:array?integer(t.image?.depth,1,maxLayers,'compressed layers'):1;
+    if(layers>maxLayers||width*height*layers>maxPixels)fail('LIMIT','Compressed texture exceeds layer or pixel capacity');
+    if(cube&&width!==height)fail('SOURCE','Compressed cube faces must be square');
+    const profile=compressedFormats.get(t.format);
+    if(!profile)fail('FORMAT','Compressed source has no supported WebGPU block format');
+    const [format,blockWidth,blockHeight,blockBytes,family,srgb]=profile;
+    if(family&&!features.has('texture-compression-'+family))fail('FEATURE',`Device did not enable texture-compression-${family}`);
+    if(family&&(width%blockWidth||height%blockHeight)&&!features.has('texture-compression-unaligned'))
+      fail('FEATURE','Unaligned compressed base extents require texture-compression-unaligned; pixels are never resized');
+    if(!family&&t.type!==T.UnsignedByteType)fail('FORMAT','Uncompressed CompressedTexture mips require RGBA8 bytes');
+    if(![T.NoColorSpace,T.LinearSRGBColorSpace,T.SRGBColorSpace].includes(t.colorSpace)||t.colorSpace===T.SRGBColorSpace&&!srgb)
+      fail('COLOR','Compressed format has no matching color-space view');
+    if(t.internalFormat!==null||t.compareFunction!=null||t.flipY!==false||t.premultiplyAlpha!==false||t.generateMipmaps!==false)
+      fail('FORMAT','Compressed uploads require authored mips, unchanged block orientation/alpha and no internal override');
+    if(t.onUpdate!==null&&typeof t.onUpdate!=='function')fail('SOURCE','Invalid upload callback');
+    if(![1,2,4,8].includes(t.unpackAlignment))fail('SOURCE','Invalid unpack alignment');
+    if(!Array.isArray(t.updateRanges)||t.updateRanges.length)fail('RANGE','Compressed textures do not use pixel updateRanges');
+    const levels=chains[0].length,full=1+Math.floor(Math.log2(Math.max(width,height)));
+    if(levels>full||chains.some(mips=>mips.length!==levels))fail('MIPS','Invalid or inconsistent compressed mip count');
+    const filter=filters.get(t.minFilter),mag=filters.get(t.magFilter);
+    if(!filter||!mag||mag[2]||!wraps.has(t.wrapS)||!wraps.has(t.wrapT)||array&&!wraps.has(t.wrapR))
+      fail('SAMPLER','Unsupported compressed texture sampling');
+    const anisotropy=integer(t.anisotropy,1,16,'anisotropy');
+    if(anisotropy>1&&mag[0]==='linear'&&t.minFilter===T.NearestMipmapLinearFilter)
+      fail('SAMPLER','Anisotropic nearest minification requires an explicit sampler profile');
+    const sampler={addressModeU:wraps.get(t.wrapS),addressModeV:wraps.get(t.wrapT),magFilter:mag[0],minFilter:filter[0],
+      mipmapFilter:filter[1],lodMinClamp:0,lodMaxClamp:filter[2]?levels-1:0,
+      maxAnisotropy:mag[0]==='linear'&&t.minFilter===T.LinearMipmapLinearFilter?anisotropy:1,
+      ...(array?{addressModeW:wraps.get(t.wrapR)}:{})};
+    let bytes=0;const uploads=[];
+    for(const [layer,mips] of chains.entries())for(const [level,mip] of mips.entries()){
+      const w=Math.max(1,width>>level),h=Math.max(1,height>>level);
+      if(mip?.width!==w||mip.height!==h)fail('MIPS','Compressed mip dimensions differ from their source extent');
+      const data=mip.data;
+      if(!(data instanceof Uint8Array)||!(data.buffer instanceof ArrayBuffer)||data.buffer.resizable)
+        fail('STORAGE','Expected fixed unshared compressed Uint8Array blocks');
+      try{new Uint8Array(data.buffer,0,0);}catch{fail('STORAGE','Compressed source blocks are detached');}
+      const row=Math.ceil(w/blockWidth)*blockBytes,rowsPerImage=Math.ceil(h/blockHeight);
+      const bytesPerRow=family?row:Math.ceil(row/t.unpackAlignment)*t.unpackAlignment;
+      const sliceBytes=bytesPerRow*rowsPerImage,depth=array?layers:1,size=row*rowsPerImage*depth;
+      const required=(rowsPerImage*depth-1)*bytesPerRow+row;
+      if(family?data.byteLength!==size:data.byteLength<required||data.byteLength>sliceBytes*depth)
+        fail('STORAGE','Compressed mip blocks do not exactly fill every layer');
+      if(size>maxTextureBytes-bytes)fail('LIMIT','Compressed mip residency exceeds byte capacity');
+      bytes+=size;uploads.push({image:mip,level,layer,depth,bytesPerRow,rowsPerImage,sliceBytes,
+        copyWidth:Math.ceil(w/blockWidth)*blockWidth,copyHeight:rowsPerImage*blockHeight});
+    }
+    let layerUpdates=null;
+    if(array){
+      if(!(t.layerUpdates instanceof Set)||t.layerUpdates.size>layers||typeof t.clearLayerUpdates!=='function')
+        fail('RANGE','Expected a bounded compressed layerUpdates Set');
+      layerUpdates=[...t.layerUpdates];for(const layer of layerUpdates)integer(layer,0,layers-1,'updated layer');
+    }
+    const viewFormat=t.colorSpace===T.SRGBColorSpace?format+'-srgb':format,viewDimension=cube?'cube':array?'2d-array':'2d';
+    const key=JSON.stringify(['compressed',t.format,width,height,layers,levels,format,viewFormat,viewDimension,sampler,family?null:t.unpackAlignment]);
+    return {source:t.source,width,height,layers,levels,cube,array,layered:array,volume:false,blockUploads:true,
+      compressed:family!==null,bytes,format,viewFormat,viewDimension,sampler,key,data:true,manual:true,
+      uploads,images:uploads.map(u=>u.image),layerUpdates,sampleType:'float',blockWidth,blockHeight,blockBytes};
+  }
   function dimensions(image,data,video=false,volume=false){
     if(!image||image.complete===false)fail('NOT_READY','Source image has not loaded');
     if(video&&(!(image.videoWidth>0)||!(image.videoHeight>0)))fail('NOT_READY','Video has no decoded frame dimensions');
@@ -99,7 +205,9 @@ function textureInspector(T,{
   }
   function describe(t,{initialize=false}={}){
     if(typeof initialize!=='boolean')fail('OPTIONS','initialize must be boolean');
-    if(!(t instanceof T.Texture)||t.isCompressedTexture||t.isDepthTexture||
+    if(t instanceof T.Texture&&(t.isCompressedTexture===true||t.isCubeTexture===true&&t.image?.[0]?.isCompressedTexture===true))
+      return describeCompressed(t,initialize);
+    if(!(t instanceof T.Texture)||t.isDepthTexture||
       t.isFramebufferTexture||t.isRenderTargetTexture||t.isExternalTexture)
       fail('SOURCE','Expected a data texture, VideoTexture or CubeTexture');
     const video=t.isVideoTexture===true,cube=t.isCubeTexture===true;
@@ -262,7 +370,7 @@ export function createGpuThreeTextures(device,{
   if(T?.REVISION!=='186'||typeof T.Texture!=='function')fail('SOURCE','Supply the pinned r186 module');
   integer(maxTextureBytes,1,Number.MAX_SAFE_INTEGER,'texture budget');integer(maxTextures,1,65536,'texture capacity');
   integer(maxPixels,1,Number.MAX_SAFE_INTEGER,'pixel capacity');if(typeof label!=='string')fail('VALUE','Expected a label');
-  const describe=textureInspector(T,{maxTextureBytes,maxPixels,float32Filterable:device?.features?.has?.('float32-filterable')===true,
+  const describe=textureInspector(T,{maxTextureBytes,maxPixels,features:device?.features??new Set(),float32Filterable:device?.features?.has?.('float32-filterable')===true,
     maxDimension:device?.limits?.maxTextureDimension2D??32768,maxDimension3D:device?.limits?.maxTextureDimension3D??1,maxLayers:device?.limits?.maxTextureArrayLayers??1});
   const records=new Map(),sources=new Map(),pipelines=new Map();
   let textureBytes=0,disposed=false,terminal=null,busy=false,pending=Promise.resolve(),mipSampler=null,rejectStop;
@@ -339,7 +447,18 @@ export function createGpuThreeTextures(device,{
     const a=r.resource;
     if(a.sourceVersion!==t.source.version){
       if(d.data){
-        if(d.layered){
+        if(d.blockUploads){
+          for(const u of d.uploads){
+            const write=(layer,data,depth)=>{
+              native(()=>device.queue.writeTexture({texture:a.texture,mipLevel:u.level,origin:[0,0,layer]},data,
+                {bytesPerRow:u.bytesPerRow,rowsPerImage:u.rowsPerImage},[u.copyWidth,u.copyHeight,depth]));stats.writeCalls++;
+            };
+            if(d.layerUpdates?.length)for(const layer of d.layerUpdates)
+              write(layer,u.image.data.subarray(layer*u.sliceBytes,(layer+1)*u.sliceBytes),1);
+            else write(u.layer,u.image.data,u.depth);
+          }
+          if(d.layerUpdates?.length)t.clearLayerUpdates();
+        }else if(d.layered){
           const row=d.width*d.channels*d.bpc,pitch=Math.ceil(row/d.alignment)*d.alignment;
           const src=new Uint8Array(t.image.data.buffer,t.image.data.byteOffset,t.image.data.byteLength);
           if(d.layerUpdates?.length){
@@ -409,7 +528,7 @@ export function createGpuThreeTextures(device,{
           if(!resource){
             const texture=native(()=>device.createTexture({label,size:[d.width,d.height,d.layers],format:d.format,
               ...(d.layered?{dimension:d.volume?'3d':'2d'}:{}),
-              viewFormats:d.format===d.viewFormat?[]:[d.viewFormat],mipLevelCount:d.levels,usage:d.integral?2|4:2|4|16}));
+              viewFormats:d.format===d.viewFormat?[]:[d.viewFormat],mipLevelCount:d.levels,usage:d.integral||d.blockUploads?2|4:2|4|16}));
             resource={texture,source:d.source,key:d.key,bytes:d.bytes,sourceVersion:-1,refs:0};
             // Own immediately so a subsequent native view/sampler failure retires it.
             let keys=sources.get(d.source);if(!keys)sources.set(d.source,keys=new Map());keys.set(d.key,resource);textureBytes+=d.bytes;
@@ -460,7 +579,7 @@ export function createGpuThreeTextures(device,{
 export function createThreeTextureBindings(device,state) {
   const defaults=new Map();let disposed=false;
   const fail=(code,message)=>state.fail(code,message);
-  const dimension=t=>t?.isData3DTexture===true?'3d':t?.isDataArrayTexture===true?'2d-array':t?.isCubeTexture===true?'cube':'2d';
+  const dimension=t=>t?.isData3DTexture===true?'3d':(t?.isDataArrayTexture===true||t?.isCompressedArrayTexture===true)?'2d-array':t?.isCubeTexture===true?'cube':'2d';
   function live(){if(disposed)fail('DISPOSED','Source texture bindings are disposed');}
   function placeholder(t=null,reflection=null){
     live();
