@@ -15,7 +15,9 @@
  * DataArrayTexture/Data3DTexture share this owner, its budgets and source versions.
  * Byte/half/float volumes support padded full uploads and GPU-generated mipmaps;
  * arrays also support source layerUpdates. See THREE_VOLUME_TEXTURES.md.
- * Other ImageBitmap flags and compressed/depth/integer textures remain explicit
+ * Integer data (signed/unsigned 8/16/32-bit R/RG/RGBA) uses the same residency
+ * with exact typed storage and nearest sampling, including arrays and volumes.
+ * Other ImageBitmap flags and compressed/depth textures remain explicit
  * errors; applications can keep borrowing bindings for those sources.
  * See THREE_TEXTURES.md for source-state, color, bounds and completion contracts.
  */
@@ -78,6 +80,15 @@ function textureInspector(T,{
   const filters=new Map([[T.NearestFilter,['nearest','nearest',false]],[T.LinearFilter,['linear','nearest',false]],
     [T.NearestMipmapNearestFilter,['nearest','nearest',true]],[T.NearestMipmapLinearFilter,['nearest','linear',true]],
     [T.LinearMipmapNearestFilter,['linear','nearest',true]],[T.LinearMipmapLinearFilter,['linear','linear',true]]]);
+  // Ignore absent constants in descriptor-only clients. Never let an undefined
+  // format/type accidentally select an integer profile.
+  const integerChannels=new Map([['RedIntegerFormat',1],['RGIntegerFormat',2],['RGBAIntegerFormat',4]]
+    .filter(([name])=>Number.isInteger(T[name])).map(([name,n])=>[T[name],n]));
+  const integerTypes=new Map([
+    ['ByteType',Int8Array,'8sint','sint'],['UnsignedByteType',Uint8Array,'8uint','uint'],
+    ['ShortType',Int16Array,'16sint','sint'],['UnsignedShortType',Uint16Array,'16uint','uint'],
+    ['IntType',Int32Array,'32sint','sint'],['UnsignedIntType',Uint32Array,'32uint','uint'],
+  ].filter(([name])=>Number.isInteger(T[name])).map(([name,Kind,suffix,sampleType])=>[T[name],{Kind,suffix,sampleType}]));
   function dimensions(image,data,video=false,volume=false){
     if(!image||image.complete===false)fail('NOT_READY','Source image has not loaded');
     if(video&&(!(image.videoWidth>0)||!(image.videoHeight>0)))fail('NOT_READY','Video has no decoded frame dimensions');
@@ -96,6 +107,7 @@ function textureInspector(T,{
         typeof T[volume?'Data3DTexture':'DataArrayTexture']!=='function'||
         !(t instanceof T[volume?'Data3DTexture':'DataArrayTexture'])))
       fail('SOURCE','Expected an unambiguous source Data3DTexture or DataArrayTexture');
+    if(layered&&(!t.image||t.image.data==null))fail('NOT_READY','Array or volume source data has not loaded');
     const layers=layered?integer(t.image?.depth,1,volume?maxDimension3D:maxLayers,'image depth'):cube?6:1;
     if(video&&(typeof T.VideoTexture!=='function'||!(t instanceof T.VideoTexture)||
         !instance(t.image,'HTMLVideoElement')||cube||t.isDataTexture||t.isVideoFrameTexture||
@@ -107,12 +119,15 @@ function textureInspector(T,{
     if(cube&&(typeof T.CubeTexture!=='function'||!(t instanceof T.CubeTexture)||!Array.isArray(t.image)||t.image.length!==6))
       fail('SOURCE','CubeTexture requires six source faces');
     if(!volume&&layers>maxLayers)fail('LIMIT','Native texture array-layer limit is too small');
-    // Element storage: bytes, half floats (Uint16 bit patterns) or 32-bit floats.
-    const bpc=t.type===T.UnsignedByteType?1:t.type===T.HalfFloatType?2:t.type===T.FloatType?4:0;
+    // Normalized/float and integer formats have distinct shader sample types.
+    // Copy integer bits verbatim; never normalize or cast them through Float32.
+    const integral=integerChannels.has(t.format),kind=integral?integerTypes.get(t.type):null;
+    const bpc=integral?(kind?.Kind.BYTES_PER_ELEMENT??0):t.type===T.UnsignedByteType?1:t.type===T.HalfFloatType?2:t.type===T.FloatType?4:0;
     if(!bpc||t.internalFormat!==null||t.compareFunction!=null)
-      fail('FORMAT','This source path requires byte, half-float or float non-depth storage without internal overrides');
-    const channels=new Map([[T.RedFormat,1],[T.RGFormat,2],[T.RGBAFormat,4]]).get(t.format);
-    if(!channels)fail('FORMAT','Expected R, RG or RGBA storage');
+      fail('FORMAT','Expected supported non-depth storage without internal overrides');
+    const channels=integral?integerChannels.get(t.format):new Map([[T.RedFormat,1],[T.RGFormat,2],[T.RGBAFormat,4]]).get(t.format);
+    if(!channels)fail('FORMAT','Expected R, RG or RGBA normalized, float or integer storage');
+    if(integral&&t.colorSpace!==T.NoColorSpace)fail('COLOR','Integer textures carry data, not color-space transfers');
     if(![T.NoColorSpace,T.LinearSRGBColorSpace,T.SRGBColorSpace].includes(t.colorSpace)||
         (t.colorSpace===T.SRGBColorSpace&&(channels!==4||bpc!==1)))fail('COLOR','Unsupported transfer function or channel format');
     if(!Number.isSafeInteger(t.version)||t.version<(video?0:1)||!Number.isSafeInteger(t.source?.version)||t.source.version<0||t.source.dataReady!==true)
@@ -131,13 +146,16 @@ function textureInspector(T,{
       fail('SAMPLER','Anisotropic nearest minification requires an explicit sampler profile');
     const maxAnisotropy=mag[0]==='linear'&&t.minFilter===T.LinearMipmapLinearFilter?anisotropy:1;
     const data=layered||(cube?t.image[0]?.isDataTexture===true:t.isDataTexture===true);
-    if(bpc!==1&&(!data||video))fail('FORMAT','Half-float and float storage is admitted for DataTextures');
+    if((integral||bpc!==1)&&(!data||video))fail('FORMAT','Integer, half-float and float storage require data textures');
+    if(integral&&(mag[0]!=='nearest'||filter[0]!=='nearest'||filter[1]!=='nearest'||anisotropy!==1))
+      fail('SAMPLER','Integer textures require nearest sampling without anisotropy');
+    if(integral&&t.generateMipmaps)fail('MIPS','Integer textures require authored mip levels, not filtered mip generation');
     // generateMipmap on half-float/float storage: render-pass box filtering, as for
     // bytes; float32 needs float32-filterable (WebGL: OES_texture_float_linear).
-    if(bpc===4&&t.generateMipmaps&&!float32Filterable)fail('MIPS','Generated float32 mipmaps need the float32-filterable device feature');
+    if(!integral&&bpc===4&&t.generateMipmaps&&!float32Filterable)fail('MIPS','Generated float32 mipmaps need the float32-filterable device feature');
     // Float32 linear filtering needs the device's float32-filterable feature (WebGL
     // OES_texture_float_linear); never silently degrade to nearest.
-    const filterable=bpc!==4||float32Filterable;
+    const filterable=!integral&&(bpc!==4||float32Filterable);
     if(!filterable&&(mag[0]==='linear'||filter[0]==='linear'||filter[1]==='linear'))
       fail('SAMPLER','Linear filtering of float32 textures needs the float32-filterable device feature');
     const unwrap=image=>{
@@ -196,7 +214,7 @@ function textureInspector(T,{
       const extent=dimensions(image,data,video,volume);
       if(extent.width!==Math.max(1,width>>level)||extent.height!==Math.max(1,height>>level))fail('MIPS','Invalid face or authored mip dimensions');
       if(data){
-        const a=image.data,Kind=bpc===1?Uint8Array:bpc===2?Uint16Array:Float32Array;
+        const a=image.data,Kind=integral?kind.Kind:bpc===1?Uint8Array:bpc===2?Uint16Array:Float32Array;
         if(!(a instanceof Kind)||!(a.buffer instanceof ArrayBuffer)||a.buffer.resizable)fail('STORAGE',`Expected fixed, unshared ${Kind.name} source`);
         try{new Uint8Array(a.buffer,0,0);}catch{fail('STORAGE','Source pixels are detached');}
         const row=image.width*channels*bpc,pitch=Math.ceil(row/t.unpackAlignment)*t.unpackAlignment;
@@ -206,7 +224,7 @@ function textureInspector(T,{
     const images=uploads.map(entry=>entry.image);
     if(!Array.isArray(t.updateRanges))fail('RANGE','Expected source update ranges');
     if(t.updateRanges.length){
-      if(cube||layered||!data||manual||channels!==4||t.flipY||bpc!==1)fail('RANGE','Partial source uploads require unflipped RGBA byte base pixels');
+      if(integral||cube||layered||!data||manual||channels!==4||t.flipY||bpc!==1)fail('RANGE','Partial source uploads require unflipped RGBA byte base pixels');
       for(const r of t.updateRanges){
         integer(r.start,0,width*height*4,'range start');integer(r.count,0,width*height*4-r.start,'range count');
         const x=Math.floor(r.start/4)%width,count=Math.ceil(r.count/4);
@@ -225,13 +243,13 @@ function textureInspector(T,{
         fail('RANGE','Partial layer uploads require tightly packed source rows');
     }
     const prefix=channels===4?'rgba':channels===2?'rg':'r';
-    const format=bpc===1?prefix+'8unorm':bpc===2?prefix+'16float':prefix+'32float',viewFormat=t.colorSpace===T.SRGBColorSpace?'rgba8unorm-srgb':format;
+    const format=integral?prefix+kind.suffix:bpc===1?prefix+'8unorm':bpc===2?prefix+'16float':prefix+'32float',viewFormat=t.colorSpace===T.SRGBColorSpace?'rgba8unorm-srgb':format;
     const sampler={addressModeU:wraps.get(t.wrapS),addressModeV:wraps.get(t.wrapT),magFilter:mag[0],minFilter:filter[0],
       mipmapFilter:filter[1],lodMinClamp:0,lodMaxClamp:filter[2]?levels-1:0,maxAnisotropy,...(layered?{addressModeW:wraps.get(t.wrapR)}:{})};
     const viewDimension=volume?'3d':array?'2d-array':cube?'cube':'2d';
     const key=JSON.stringify([width,height,levels,format,viewFormat,sampler,t.flipY,t.premultiplyAlpha,t.unpackAlignment,t.generateMipmaps&&!manual,manual,data,...(layered?[viewDimension,layers]:cube?['cube']:video?['video']:[])]);
     return {source:t.source,width,height,levels,layers,cube,volume,array,layered,layerUpdates,viewDimension,video,videoReady,bytes,format,viewFormat,sampler,key,data,images,uploads,manual,channels,bpc,
-      sampleType:filterable?'float':'unfilterable-float',
+      integral,sampleType:integral?kind.sampleType:filterable?'float':'unfilterable-float',
       flipY:t.flipY,premultiplyAlpha:t.premultiplyAlpha,alignment:t.unpackAlignment};
   }
   return describe;
@@ -385,7 +403,7 @@ export function createGpuThreeTextures(device,{
           if(!resource){
             const texture=native(()=>device.createTexture({label,size:[d.width,d.height,d.layers],format:d.format,
               ...(d.layered?{dimension:d.volume?'3d':'2d'}:{}),
-              viewFormats:d.format===d.viewFormat?[]:[d.viewFormat],mipLevelCount:d.levels,usage:2|4|16}));
+              viewFormats:d.format===d.viewFormat?[]:[d.viewFormat],mipLevelCount:d.levels,usage:d.integral?2|4:2|4|16}));
             resource={texture,source:d.source,key:d.key,bytes:d.bytes,sourceVersion:-1,refs:0};
             // Own immediately so a subsequent native view/sampler failure retires it.
             let keys=sources.get(d.source);if(!keys)sources.set(d.source,keys=new Map());keys.set(d.key,resource);textureBytes+=d.bytes;
