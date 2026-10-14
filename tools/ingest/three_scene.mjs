@@ -69,7 +69,7 @@ export async function createGpuThreeScene(device,scene,{
   maxNodes=16384,maxGeometries=256,maxBindings=1024,maxGeometryBytes=128*1024*1024,sortObjects=true,
   maxInstanceMeshes=256,maxInstanceBytes=128*1024*1024,
   deformation:deformationOptions={},maxDeformedMeshes=256,maxDeformationBytes=128*1024*1024,shadow=null,environment=null,background=null,fog=null,clipping=null,textureTransforms=false,alphaMaps=false,signal,
-  program:programSupport=null,
+  program:programSupport=null,overrideMaterial:initialOverride=undefined,
 }={}) {
   if(three?.REVISION!=='186'||typeof three.Matrix4!=='function'||typeof three.Frustum!=='function'||
       typeof three.Mesh!=='function'||!(scene instanceof three.Object3D))fail('SOURCE','Supply the pinned r186 module and an Object3D root');
@@ -78,6 +78,12 @@ export async function createGpuThreeScene(device,scene,{
   // still refer to the original root. Never clone, reparent or mutate it.
   const root=scene;
   if(root.isScene!==true)scene=new three.Scene();
+  // A pass may capture only the override selector while keeping source objects,
+  // callbacks, geometry and textures live. Never rewrite the caller's Scene
+  // across an asynchronous preparation boundary.
+  let passOverride=initialOverride===undefined?scene.overrideMaterial:initialOverride;
+  const colorMaterial=m=>m&&m.allowOverride===true&&passOverride!==null?passOverride:m;
+  const colorMaterials=o=>(Array.isArray(o.material)?o.material:[o.material]).map(colorMaterial);
   if(!(textures instanceof Map)||typeof sortObjects!=='boolean'||typeof autoTextures!=='boolean')fail('OPTIONS','Expected a texture binding Map and boolean texture/sorting options');
   if(!textureOptions||typeof textureOptions!=='object'||Array.isArray(textureOptions))fail('OPTIONS','Expected texture ownership options');
   for(const key of Object.keys(textureOptions))if(!['maxTextureBytes','maxTextures','maxPixels','label'].includes(key))fail('OPTIONS',`Unsupported texture option: ${key}`);
@@ -233,7 +239,7 @@ export async function createGpuThreeScene(device,scene,{
   // influences (USE_INSTANCING_MORPH); only the program route draws them.
   const instancedMorph=object=>object.isInstancedMesh===true&&object.morphTexture!=null&&programRoute();
   function geometryAdmission(g,object){
-    const list=Array.isArray(object.material)?object.material:[object.material];
+    const list=colorMaterials(object);
     const programs=list.every(m=>m?.isShaderMaterial)||(programRoute()&&list.every(m=>!m||programCapable(m)));
     if(!(g instanceof three.BufferGeometry)||(g.isInstancedBufferGeometry&&!programs))fail('GEOMETRY','Expected source BufferGeometry');
     // InstancedBufferGeometry (renderInstances over geometry.instanceCount) draws through programs.
@@ -244,7 +250,7 @@ export async function createGpuThreeScene(device,scene,{
       catch(error){
         // WebGL surface: what the core deformer refuses, the object's ShaderLib
         // program skins/morphs itself (r186 shader path).
-        const list=Array.isArray(object.material)?object.material:[object.material];
+        const list=colorMaterials(object);
         if(!String(error?.code).startsWith('THREE_DEFORMATION_')||!programRoute()||!list.every(m=>!m||programCapable(m)))throw error;
         programDeformed.add(object);
       }
@@ -275,7 +281,7 @@ export async function createGpuThreeScene(device,scene,{
       if(object.onBeforeRender!==three.Object3D.prototype.onBeforeRender||object.onAfterRender!==three.Object3D.prototype.onAfterRender){
         // WebGL surface: program draws run the callbacks around each draw, in
         // draw order, as renderObject does; the core path never could.
-        const list=Array.isArray(object.material)?object.material:[object.material];
+        const list=colorMaterials(object);
         if(!programRoute()||!(object.isMesh||object.isLine||object.isPoints)||!list.every(m=>!m||programCapable(m)))
           fail('HOOK','Custom render callbacks are not admitted by this source bridge');
         programHooked.add(object);
@@ -313,7 +319,7 @@ export async function createGpuThreeScene(device,scene,{
         }
       } else if(object.isSprite&&programRoute()){
         // WebGL surface: sprites draw their SpriteMaterial (or ShaderMaterial) program.
-        const list=Array.isArray(object.material)?object.material:[object.material];
+        const list=colorMaterials(object);
         if(!list.every(m=>!m||programCapable(m)))fail('OBJECT','Sprites need a program-capable material');
       } else if(object.isSprite||object.isLightProbe||object.isLightProbeGrid)
         fail('OBJECT',`Unsupported source renderable: ${object.type}`);
@@ -327,7 +333,7 @@ export async function createGpuThreeScene(device,scene,{
     programLightMode=programShadowMode||(programRoute()&&nodes.some(o=>o.isLight&&(o.isRectAreaLight||(o.isSpotLight&&!!o.map))));
     // Transmissive materials (r186 renderTransmissionPass) re-render the opaque
     // list offscreen through programs: every draw takes the program route.
-    programTransmissionMode=programRoute()&&!!programSupport.createTransmission&&nodes.some(o=>(Array.isArray(o.material)?o.material:[o.material]).some(m=>m?.transmission>0));
+    programTransmissionMode=passOverride===null&&programRoute()&&!!programSupport.createTransmission&&nodes.some(o=>(Array.isArray(o.material)?o.material:[o.material]).some(m=>m?.transmission>0));
     for(const object of nodes){
       if(object.isLight&&!programLightMode)light(object);
       if(shadowEnabled&&object.isMesh&&object.castShadow&&!programShadowMode){
@@ -346,7 +352,7 @@ export async function createGpuThreeScene(device,scene,{
     }
     if(coreEnvironment()!==null)environmentApi.inspectThreeEnvironment(scene.environment,three,environmentOptions);
     if(shadowEnabled){
-      if(scene.overrideMaterial!==null)fail('SHADOW','Source shadow mode does not infer overrideMaterial depth semantics');
+      if(passOverride!==null&&!programRoute())fail('SHADOW','Source shadow mode does not infer overrideMaterial depth semantics');
       shadowLight(nodes);
     }
     return nodes;
@@ -355,7 +361,9 @@ export async function createGpuThreeScene(device,scene,{
     if(!shadowEnabled||!programRoute()||!programSupport.createShadows)return false;
     const lights=nodes.filter(o=>o.isLight&&o.castShadow);
     if(!lights.length)return false;
-    if(programShadowSticky||lights.length>1||programToneMapping()||nodes.some(o=>o.isLine&&o.castShadow))return true;
+    // The native single-map owner derives casters from color bindings. With an
+    // override, preserve the ORIGINAL shadow materials through the program owner.
+    if(passOverride!==null||programShadowSticky||lights.length>1||programToneMapping()||nodes.some(o=>o.isLine&&o.castShadow))return true;
     try{shadowApi.inspectThreeShadow(lights[0],three);return false;}
     catch(error){if(String(error?.code).startsWith('THREE_SHADOW_'))return true;throw error;}
   }
@@ -717,7 +725,6 @@ export async function createGpuThreeScene(device,scene,{
     if(!programRoute())fail('MATERIAL',`Unsupported source material: ${m?.type}`);
     if(!object)fail('MATERIAL','Program materials need their object for program assembly');
     if(shadowEnabled&&object.castShadow&&!programShadowMode)fail('PROGRAM_SHADOW','Program shadow casters draw through the program shadow map');
-    if(scene.overrideMaterial)fail('MATERIAL','overrideMaterial with program materials is not admitted yet');
     const shadows=shadowEnabled&&castingLights(programCamera).length>0;
     if(programSupport.needsLights(m)&&shadows&&!programShadowMode)
       fail('PROGRAM_SHADOW','Programs receiving shadow-casting lights read the program shadow map');
@@ -973,7 +980,6 @@ export async function createGpuThreeScene(device,scene,{
       if(!byTopology.has(key))byTopology.set(key,materialDescription(m,clippingFrame,topology,object));return byTopology.get(key);
     };
     if(programRoute())programSupport.setLights(programLightList(programCamera));
-    if(scene.overrideMaterial)get(scene.overrideMaterial);
     for(const object of nodes)if(drawable(object)||loopDrawn(object)){
       const topology=topologyOf(object);
       const g=object.geometry,instanceSource=object.isInstancedMesh?object:null;
@@ -982,9 +988,9 @@ export async function createGpuThreeScene(device,scene,{
       const source=Array.isArray(object.material)?object.material:[object.material];
       for(const original of source){
         if(!original)continue;
-        // The original controls visibility/list admission even with an override.
-        get(original,object.isMesh&&original.wireframe===true?'lines':topology,object);
-        const m=scene.overrideMaterial&&original.allowOverride===true?scene.overrideMaterial:original;
+        // The original controls list admission, not the selected program. Do not
+        // compile its shader or upload its maps when an override suppresses them.
+        const m=colorMaterial(original);
         const wire=object.isMesh&&m.wireframe===true;
         const isProgram=programCapable(m)&&get(m,wire?'lines':topology,object).some(d=>d.program);
         if(wire&&!isProgram&&(instanceSource||deformationSource))fail('MATERIAL','Wireframe instanced or deformed meshes are not admitted');
@@ -1043,14 +1049,19 @@ export async function createGpuThreeScene(device,scene,{
   }
   /** One retry per mesh the core deformer refused at capture: the next pass
    * describes it as its ShaderLib program. */
-  async function prepare(){
+  async function prepare(options={}){
+    if(!options||typeof options!=='object'||Array.isArray(options)||Object.keys(options).some(k=>k!=='overrideMaterial'))
+      fail('OPTIONS','Expected preparation options with an optional overrideMaterial');
+    const explicit=Object.hasOwn(options,'overrideMaterial');
+    const selected=explicit?options.overrideMaterial:scene.overrideMaterial;
     for(let attempt=0;;attempt++){
-      try{return await prepareOnce();}
+      try{return await prepareOnce(selected,!explicit);}
       catch(error){if(error?.code!=='THREE_SCENE_DEFORMATION_ROUTE'||attempt>=8)throw error;}
     }
   }
-  async function prepareOnce(){
+  async function prepareOnce(selectedOverride,observeLiveOverride){
     live();if(busy)fail('REENTRANT','A source-scene operation is already running');busy=true;preparing=true;
+    passOverride=selectedOverride;
     const created=[],added=[],addedInstances=[],createdDeformations=[],nextDeformations=new Map(),createdCasters=[];
     let nextShadow=shadowOwner,nextEnvironment=environmentOwner,nextBackground=backgroundOwner;
     const nextCasters=new Map();
@@ -1115,7 +1126,7 @@ export async function createGpuThreeScene(device,scene,{
               catch(error){
                 // Data the core deformer refuses at capture (e.g. a non-affine
                 // inverse bind): the object's ShaderLib program takes it instead.
-                const object=item.deformationSource,list=Array.isArray(object.material)?object.material:[object.material];
+                const object=item.deformationSource,list=colorMaterials(object);
                 if(!String(error?.code).startsWith('THREE_DEFORMATION_')||!programRoute()||!list.every(m=>!m||programCapable(m)))throw error;
                 programDeformed.add(object);
                 fail('DEFORMATION_ROUTE','A deformed mesh moved to its ShaderLib program');
@@ -1268,6 +1279,7 @@ export async function createGpuThreeScene(device,scene,{
           if(instanceAttributesSnapshot(native,device).signature!==entry.instanceSignature)fail('CHANGED','Instance layout changed during preparation');
         }
       }
+      if(observeLiveOverride&&scene.overrideMaterial!==selectedOverride)fail('CHANGED','Source override material changed during preparation');
       if(!sameDesired(request,desired(graph())))fail('CHANGED','Source structure changed while pipelines were being prepared');
       if(shadowEnabled){
         const current=shadowLight(graph());
@@ -1325,11 +1337,14 @@ export async function createGpuThreeScene(device,scene,{
     return camera.isOrthographicCamera?{viewDirection:[camera.matrixWorld.elements[8],camera.matrixWorld.elements[9],camera.matrixWorld.elements[10]]}:
       {cameraPosition:position(camera)};
   }
-  function render(camera,frame){
+  function render(camera,frame,options={}){
     live();if(busy)fail('REENTRANT','A source-scene operation is already running');busy=true;
     let backgroundSubmitted=false;
     try{
       if(!frame||typeof frame!=='object')fail('FRAME','Supply borrowed render attachments');
+      if(!options||typeof options!=='object'||Array.isArray(options)||Object.keys(options).some(k=>k!=='overrideMaterial'))
+        fail('OPTIONS','Expected draw options with an optional overrideMaterial');
+      passOverride=Object.hasOwn(options,'overrideMaterial')?options.overrideMaterial:scene.overrideMaterial;
       // Framebuffer size for program gl_FragCoord; not a core renderer frame key.
       programTargetSize=frame.targetSize??null;
       if(Object.hasOwn(frame,'targetSize')){const {targetSize,...rest}=frame;frame=rest;}
@@ -1377,7 +1392,7 @@ export async function createGpuThreeScene(device,scene,{
                 if(shadowBlend==='skip')return;
                 fail('SHADOW','BLEND casters require the explicit skip policy');
               }
-              const material=scene.overrideMaterial&&original.allowOverride===true?scene.overrideMaterial:original;
+              const material=shadowPass?original:colorMaterial(original);
               // Source WebGPU wireframe: a derived edge index drawn as a line
               // list, with draw ranges and groups scaled by two.
               const wire=object.isMesh&&material.wireframe===true;
@@ -1403,10 +1418,10 @@ export async function createGpuThreeScene(device,scene,{
               const bindings=desc.map(d=>records?.find(e=>!e.mesh.disposed&&e.geometry===g&&
                 e.instanceSignature===instanceSignature&&same(e.structural,d.structural)));
               if(bindings.some(e=>!e))fail('PREPARE','Call prepare() after changing geometry, instance layout, material structure or texture bindings');
-              if((shadowPass?casterItems.length:opaque.length+transparent.length)>=(renderOptions.maxDraws??1024))fail('LIMIT','Source draw list exceeds capacity');
+              if((shadowPass?casterItems.length:opaque.length+transmissive.length+transparent.length)>=(renderOptions.maxDraws??1024))fail('LIMIT','Source draw list exceeds capacity');
               // Source list partition and sorting precede the draw-time override.
               if(shadowPass&&bindings.some(e=>!casters.has(e)||casters.get(e).disposed))fail('PREPARE','Prepare the source caster material before drawing it');
-              (shadowPass?casterItems:original.transparent?transparent:opaque).push({object,geometry:g,material,listMaterial:original,group,groupOrder,z,desc,bindings,shadowPass});
+              (shadowPass?casterItems:original.transmission>0?transmissive:original.transparent?transparent:opaque).push({object,geometry:g,material,listMaterial:original,group,groupOrder,z,desc,bindings,shadowPass});
             }
         if(Array.isArray(object.material))for(const group of source.groups)push(object.material[group.materialIndex],group);
         else push(object.material,null);
@@ -1478,7 +1493,7 @@ export async function createGpuThreeScene(device,scene,{
       const updated=new Set(),activeDeformations=new Set();
       // renderTransmissionPass (skipped under overrideMaterial, as r186 does):
       // after shadow maps and uploads, before the main opaque draws.
-      if(transmissive.length&&scene.overrideMaterial===null){
+      if(transmissive.length&&passOverride===null){
         const passItem=(item,d,i,side=d.programSide)=>{
           const gpu=item.bindings[i].programGeometry,m=item.material,object=item.object;
           if(object.isBatchedMesh)fail('MATERIAL','BatchedMesh draws in transmission passes are not admitted yet');
@@ -1674,6 +1689,6 @@ export async function createGpuThreeScene(device,scene,{
       if(fogEnabled)renderer=fogApi.withThreeFogReceivers(renderer,renderOptions.maxDraws??1024);
       return renderer;
     });
-    await Promise.race([construction,stopped]);live();await prepare();return bridge;
+    await Promise.race([construction,stopped]);live();await prepare(initialOverride===undefined?{}:{overrideMaterial:initialOverride});return bridge;
   }catch(error){disposed=true;release();throw error;}
 }

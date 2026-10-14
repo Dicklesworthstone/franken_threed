@@ -90,13 +90,13 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     return `${isScene && scene.fog ? 1 : 0}${isScene && scene.environment ? 1 : 0}${background ? 1 : 0}${renderer.shadowMap.enabled ? 1 : 0}${renderer._needsGlobalClipping?.() ? 1 : 0}`;
   }
   /** Preparation-time traversal for options that depend on materials. */
-  function needsClipping(scene) {
+  function needsClipping(scene, overrideMaterial = scene.isScene === true ? scene.overrideMaterial : null) {
     let clipping = false;
     scene.traverse(object => {
       const list = Array.isArray(object.material) ? object.material : object.material ? [object.material] : [];
       if (list.some(m => m?.clippingPlanes?.length)) clipping = true;
     });
-    if (scene.isScene === true && scene.overrideMaterial?.clippingPlanes?.length) clipping = true;
+    if (overrideMaterial?.clippingPlanes?.length) clipping = true;
     return clipping;
   }
   // r186 WebGPURenderer applies material clipping planes without a renderer-level
@@ -116,10 +116,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
             bridges: [...entries.values()].map(e => e.bridge.diagnostics)});
         },
         entry(scene) { return entries.get(scene) ?? null; },
-        render({scene, camera}, frame) {
+        render({scene, camera, overrideMaterial}, frame) {
           const entry = entries.get(scene);
           if (!entry) fail('PREPARE', 'Scene has not been prepared');
-          entry.bridge.render(camera, frame);
+          entry.bridge.render(camera, frame, {overrideMaterial});
           entry.lastDiagnostics = entry.bridge.diagnostics;
           return entry;
         },
@@ -129,10 +129,12 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           const root = destination._preparationRoot;
           const wanted = root ? [[root, destination._wanted.get(root)]] : destination._wanted;
           for (const [scene, key] of wanted) {
-            const clipping = needsClipping(scene) || owner._needsGlobalClipping?.() === true;
+            const passOptions = root === scene ? destination._preparationOptions : undefined;
+            const overrideMaterial = passOptions ? passOptions.overrideMaterial : scene.isScene === true ? scene.overrideMaterial : null;
+            const clipping = needsClipping(scene, overrideMaterial) || owner._needsGlobalClipping?.() === true;
             const previous = entries.get(scene);
             if (previous && previous.key === key && (previous.clipping || !clipping) && !previous.bridge.failed) {
-              await previous.bridge.prepare();
+              await previous.bridge.prepare(passOptions);
               continue;
             }
             // A changed feature profile selects different bridge pipelines.
@@ -149,7 +151,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
               // Source renderers have no texture budget: bound residency by a
               // device-scale default (1 GiB) rather than the bridge's 128 MiB.
               texture: {maxTextureBytes: 1024 * 1024 * 1024},
-              ...sceneLimits, three: THREE, signal, maxBindings,
+              ...sceneLimits, three: THREE, signal, maxBindings, overrideMaterial,
               textures: owner._targets.bindingsFor(destination === owner ? null : destination.target, sceneLimits.textures),
               renderer: {...attachments, instancing: true, renderBundles: true, maxDraws,
                 ...(destination !== owner || owner._hdr || !owner._shaderEncodedOutput ? {} : {outputTransfer: 'srgb'})},
@@ -576,11 +578,14 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       const target = this._renderTarget;
       const destination = target ? this._targets.capture(target) : this;
       const frame = this._frame(scene, clearOnly, target), key = sceneKey(this, scene);
+      // RenderPass/normal/depth passes restore this property immediately after
+      // render(). Capture its selector now; source objects stay application-owned.
+      const overrideMaterial = scene.isScene === true ? scene.overrideMaterial : null;
       const c = this._clearColor, a = this._clearAlpha;
       // Small callback-free shader passes (FullScreenQuad) are private data views;
       // general scenes and hooked roots retain their established source path.
       const snapshot = this._shaderEncodedOutput ? this._passSnapshots.capture(scene, camera) : null;
-      return {scene: snapshot?.root ?? scene, camera: snapshot?.camera ?? camera, snapshot, clearOnly, destination, frame,
+      return {scene: snapshot?.root ?? scene, camera: snapshot?.camera ?? camera, snapshot, clearOnly, destination, frame, overrideMaterial,
         linearClearColor: this.alpha ? [c.r * a, c.g * a, c.b * a, a] : [c.r, c.g, c.b, 1],
         hdr: !target && this._wantsHdr(this._toneMapping()), key,
         programFrame: {toneMapping: this.toneMapping, toneMappingExposure: this.toneMappingExposure,
@@ -594,25 +599,25 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       const {scene, destination, snapshot} = request;
       destination._wanted.set(scene, request.key);
       const entry = destination._dispatcher?.entry(scene);
-      if (this._drain || this._preparing || (destination === this && request.hdr !== this._hdr) || !entry || entry.key !== request.key)
+      if (this._drain || this._preparing || (destination === this && request.hdr !== this._hdr) || !entry || entry.key !== request.key || (!entry.clipping && request.overrideMaterial?.clippingPlanes?.length))
         return this._defer(request);
       try { this._submit(request); snapshot?.release(); }
       catch (error) {
-        if (isPrepareBoundary(error) || (error?.code === 'THREE_SCENE_MATERIAL' && !entry.clipping && needsClipping(scene)))
+        if (isPrepareBoundary(error) || (error?.code === 'THREE_SCENE_MATERIAL' && !entry.clipping && needsClipping(scene, request.overrideMaterial)))
           return this._defer(request);
         snapshot?.release();
         throw error;
       }
     }
-    _submit({scene, camera, frame, destination, programFrame, snapshot, deferred = false}) {
+    _submit({scene, camera, frame, destination, programFrame, snapshot, overrideMaterial, deferred = false}) {
       snapshot?.install();
       const previous = this._programFrame;
       // Immediate source callbacks must still be able to change live program
       // state. Only deferred calls need the queued renderer-state snapshot.
       this._programFrame = deferred ? programFrame : undefined;
       try {
-        if (destination === this) this._session.render({scene, camera}, frame);
-        else this._targets.render(destination, attachments => destination._dispatcher.render({scene, camera}, {...frame, ...attachments}));
+        if (destination === this) this._session.render({scene, camera, overrideMaterial}, frame);
+        else this._targets.render(destination, attachments => destination._dispatcher.render({scene, camera, overrideMaterial}, {...frame, ...attachments}));
       } finally { this._programFrame = previous; }
       const d = destination._dispatcher.entry(scene)?.lastDiagnostics;
       if (d) {
@@ -710,8 +715,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       const run = (this._preparing ?? Promise.resolve()).catch(() => {}).then(async () => {
         if (this._disposed) fail('DISPOSED', 'Renderer is disposed');
         const previous = this._programFrame, previousRoot = destination._preparationRoot;
+        const previousOptions = destination._preparationOptions;
         this._programFrame = request?.programFrame;
         destination._preparationRoot = request?.scene ?? null;
+        destination._preparationOptions = request ? {overrideMaterial: request.overrideMaterial} : undefined;
         try {
           request?.snapshot?.install();
           if (destination !== this) {
@@ -749,7 +756,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
             }
           }
           this.info.f3d.preparations++;
-        } finally { this._programFrame = previous; destination._preparationRoot = previousRoot; }
+        } finally { this._programFrame = previous; destination._preparationRoot = previousRoot; destination._preparationOptions = previousOptions; }
       });
       this._preparing = run;
       run.finally(() => { if (this._preparing === run) this._preparing = null; }).catch(() => {});
