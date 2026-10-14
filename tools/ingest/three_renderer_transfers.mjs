@@ -3,6 +3,10 @@
  * Copies capture GPU content at their ordered submission, without CPU readback.
  * Completion includes native validation and the submitted-work fence, but never
  * blocks the FIFO on GPU completion. Cancellation cannot undo submitted writes.
+ * The controller also installs the source initRenderTarget/copyTextureToTexture
+ * methods on this renderer instance (never on a global/prototype). Source void
+ * calls report asynchronous failures at the next renderer boundary; the Async
+ * extensions return the same completion promises. Both use this one owner/FIFO.
  * This is general WebGPU execution, not shader/pixel equivalence evidence.
  */
 import {inspectGpuTargetWrite, inspectGpuTargetCopy} from './gpu_target_transfer.mjs';
@@ -117,7 +121,7 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
     finally { makeAction = null; }
     return promise;
   }
-  return Object.freeze({
+  const api = Object.freeze({
     get pendingRequests() { return active.size; },
     get allocatedBytes() { return allocatedBytes; },
     async whenIdle() { await Promise.all([...active].map(state => state.promise)); },
@@ -155,4 +159,59 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
       } catch (error) { return Promise.reject(error); }
     },
   });
+  // Keep source APIs next to the transfer owner, not a second submission path.
+  // The renderer constructor creates this controller after its target owner and
+  // FIFO. WebGL chooses its bottom-left origin later in the subclass constructor,
+  // so sample that flag at the call, never when installing these methods.
+  function textureEntry(texture) {
+    if (texture?.isTexture !== true || texture.isRenderTargetTexture !== true ||
+        !texture.renderTarget || texture.renderTarget.texture !== texture)
+      fail('UNSUPPORTED', 'Texture copies require target-owned 2D color textures');
+    return renderer._targets.capture(texture.renderTarget);
+  }
+  function initialize(target) {
+    live();
+    const entry = renderer._targets.capture(target);
+    return schedule([entry], undefined, 0, () => () => { renderer._targets.ensure(entry); });
+  }
+  function copyTexture(source, destination, sourceRegion = null, destinationPosition = null,
+    sourceLevel = 0, destinationLevel = 0) {
+    live();
+    if (destinationLevel !== 0)
+      fail('UNSUPPORTED', 'Texture copies write destination mip zero and regenerate its derived mips');
+    if (sourceRegion !== null && (!sourceRegion.min || !sourceRegion.max ||
+        (sourceRegion.isBox3 && (sourceRegion.min.z !== 0 || sourceRegion.max.z !== 1))))
+      fail('UNSUPPORTED', 'Expected a 2D source region or a single depth-zero slice');
+    if (destinationPosition !== null && destinationPosition.z !== undefined && destinationPosition.z !== 0)
+      fail('UNSUPPORTED', 'Texture copies require destination depth zero');
+    const from = textureEntry(source), to = textureEntry(destination);
+    if (from === to) fail('TRANSFER', 'In-place render target copies are not admitted');
+    const value = {sourceMipLevel: sourceLevel, flipY: renderer._bottomLeftOrigin === true,
+      sourceX: sourceRegion === null ? 0 : sourceRegion.min.x,
+      sourceY: sourceRegion === null ? 0 : sourceRegion.min.y,
+      x: destinationPosition === null ? 0 : destinationPosition.x,
+      y: destinationPosition === null ? 0 : destinationPosition.y,
+      ...(sourceRegion === null ? {} : {width: sourceRegion.max.x - sourceRegion.min.x,
+        height: sourceRegion.max.y - sourceRegion.min.y})};
+    // Validate before the void source call returns. Copy only scalar options;
+    // later edits to a caller's Box2/Vector2 must not retarget a queued copy.
+    const plan = inspectGpuTargetCopy(from.shape, to.shape, value);
+    return api.copyColor(source.renderTarget, destination.renderTarget,
+      {...value, width: plan.size.width, height: plan.size.height});
+  }
+  const deferred = error => { if (!renderer._disposed) renderer._deferredError ??= error; };
+  const promised = operation => (...args) => {
+    try { return operation(...args); } catch (error) { return Promise.reject(error); }
+  };
+  // Preserve explicit subclass implementations. r186 WebGLRenderer likewise
+  // exposes its source transfer functions as instance methods.
+  const methods = {
+    initRenderTarget(target) { initialize(target).catch(deferred); },
+    initRenderTargetAsync: promised(initialize),
+    copyTextureToTexture(...args) { copyTexture(...args).catch(deferred); },
+    copyTextureToTextureAsync: promised(copyTexture),
+  };
+  for (const [name, method] of Object.entries(methods))
+    if (typeof renderer[name] !== 'function') renderer[name] = method;
+  return api;
 }
