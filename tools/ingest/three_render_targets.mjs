@@ -14,11 +14,15 @@
  * separate draw renderer's admitted attachment/pipeline formats.
  * writePixels(entry, data, options) and copyColor(source, destination, options)
  * update native level-zero color and lazily invalidate only the color replicas.
+ * copyDepth(source, destination, options) instead invalidates only the depth
+ * replica, preserving color mipmaps and stencil. All copies share admission,
+ * allocation budgets, generation checks and nonreentrant native submission.
  * These explicit owner operations do not enqueue the public renderer's FIFO.
  * This is general WebGPU execution, not Rust specialization or a speedup claim.
  */
 import {createGpuRenderTarget} from './gpu_render_target.mjs';
 import {inspectGpuTargetWrite, inspectGpuTargetCopy} from './gpu_target_transfer.mjs';
+import {inspectGpuDepthCopy} from './gpu_depth_transfer.mjs';
 
 export class ThreeRenderTargetError extends Error {
   constructor(code, message) {
@@ -398,6 +402,27 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       }
     }();
   }
+  function copyTarget(source, destination, options, depth = false) {
+    assertCurrent(source); assertCurrent(destination);
+    if (source === destination) fail('FEEDBACK', 'In-place target copies are not admitted');
+    if (source.busy || destination.busy) fail('REENTRANT', 'Cannot copy during a target submission');
+    const plan = depth
+      ? inspectGpuDepthCopy({...source.shape, sampleDepth: source.shape.depthTexture !== null}, destination.shape, options)
+      : inspectGpuTargetCopy(source.shape, destination.shape, options);
+    if (plan.empty) return false;
+    budget((source.storage ? 0 : source.shape.bytes) + (destination.storage ? 0 : destination.shape.bytes));
+    ensure(source); ensure(destination);
+    source.busy = destination.busy = true;
+    if (depth) destination.depthDirty = true; else destination.dirty = true;
+    try {
+      const result = destination.storage[depth ? 'copyDepthFrom' : 'copyFrom'](source.storage, options);
+      assertCurrent(source); assertCurrent(destination); return result;
+    } finally {
+      source.busy = destination.busy = false;
+      try { if (!source.alive) release(source); }
+      finally { if (!destination.alive) release(destination); }
+    }
+  }
   return {
     capture, ensure, assertCurrent, bindingsFor,
     writePixels(entry, data, options = {}) {
@@ -409,23 +434,8 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       try { const result = entry.storage.writePixels(data, options); assertCurrent(entry); return result; }
       finally { entry.busy = false; if (!entry.alive) release(entry); }
     },
-    copyColor(source, destination, options = {}) {
-      assertCurrent(source); assertCurrent(destination);
-      if (source === destination) fail('FEEDBACK', 'In-place target copies are not admitted');
-      if (source.busy || destination.busy) fail('REENTRANT', 'Cannot copy during a target submission');
-      if (inspectGpuTargetCopy(source.shape, destination.shape, options).empty) return false;
-      budget((source.storage ? 0 : source.shape.bytes) + (destination.storage ? 0 : destination.shape.bytes));
-      ensure(source); ensure(destination);
-      source.busy = destination.busy = true; destination.dirty = true;
-      try {
-        const result = destination.storage.copyFrom(source.storage, options);
-        assertCurrent(source); assertCurrent(destination); return result;
-      } finally {
-        source.busy = destination.busy = false;
-        try { if (!source.alive) release(source); }
-        finally { if (!destination.alive) release(destination); }
-      }
-    },
+    copyColor(source, destination, options = {}) { return copyTarget(source, destination, options); },
+    copyDepth(source, destination, options = {}) { return copyTarget(source, destination, options, true); },
     get allocatedBytes() { return allocatedBytes; }, get size() { return entries.size; },
     render(entry, callback) {
       ensure(entry);

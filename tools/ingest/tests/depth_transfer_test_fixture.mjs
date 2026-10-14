@@ -42,6 +42,7 @@ export function depthDevice() {
       const pipeline = {desc, getBindGroupLayout() { return {pipeline}; }};
       pipelines.push(pipeline); return pipeline;
     },
+    createComputePipeline(desc) { return {desc, getBindGroupLayout() { return {}; }}; },
     createSampler(desc) { return desc; },
     createBuffer(desc) {
       trip('buffer');
@@ -59,6 +60,15 @@ export function depthDevice() {
           return {setPipeline(pipeline) { packet.pipeline = pipeline; }, setBindGroup(index, group) { packet.group = group; },
             setScissorRect(...region) { packet.scissor = region; }, draw(count) { trip('draw'); packet.count = count; }, end() { trip('end'); }};
         },
+        beginComputePass() {
+          const packet = {kind: 'depth-read'}; passes.push(packet);
+          return {setPipeline(pipeline) { packet.pipeline = pipeline; }, setBindGroup(index, group) { packet.group = group; },
+            dispatchWorkgroups(...groups) { packet.groups = groups; }, end() {}};
+        },
+        copyBufferToBuffer(source, sourceOffset, destination, destinationOffset, size) {
+          passes.push({kind: 'buffer-copy', source, sourceOffset, destination, destinationOffset, size});
+        },
+        copyTextureToTexture(source, destination, size) { passes.push({kind: 'color-copy', source, destination, size}); },
         finish() { trip('finish'); return passes; },
       };
     },
@@ -68,7 +78,34 @@ export function depthDevice() {
       submit(batches) {
         trip('submit'); submissions.push(batches); events.push('submit');
         for (const passes of batches) for (const packet of passes) {
-          if (packet.desc.colorAttachments.length) continue; // Mip passes are only recorded.
+          if (packet.kind === 'depth-read') {
+            const source = packet.group.entries[0].resource.texture;
+            const output = new Float32Array(packet.group.entries[1].resource.buffer.bytes);
+            const [x, y, w, h, sample, flipY] = new Uint32Array(packet.group.entries[2].resource.buffer.bytes);
+            for (let j = 0; j < h; j++) for (let i = 0; i < w; i++)
+              output[j * w + i] = source.data[((y + (flipY ? h - j - 1 : j)) * source.width + x + i) * source.sampleCount + sample];
+            continue;
+          }
+          if (packet.kind === 'buffer-copy') {
+            new Uint8Array(packet.destination.bytes).set(new Uint8Array(packet.source.bytes, packet.sourceOffset, packet.size), packet.destinationOffset);
+            continue;
+          }
+          if (packet.kind === 'color-copy') {
+            const {source, destination, size} = packet;
+            for (let j = 0; j < size.height; j++) for (let i = 0; i < size.width; i++)
+              destination.texture.data[(destination.origin.y + j) * destination.texture.width + destination.origin.x + i] =
+                source.texture.data[(source.origin.y + j) * source.texture.width + source.origin.x + i];
+            continue;
+          }
+          if (packet.desc.colorAttachments.length) {
+            // Reference only the UV orientation pass. Mip passes stay recorded.
+            if (packet.pipeline.desc.label.includes('UV orientation')) {
+              const source = packet.group.entries[0].resource.texture, destination = packet.desc.colorAttachments[0].view.texture;
+              for (let y = 0; y < destination.height; y++) for (let x = 0; x < destination.width; x++)
+                destination.data[y * destination.width + x] = source.data[(source.height - 1 - y) * source.width + x];
+            }
+            continue;
+          }
           const source = packet.group.entries[0].resource.texture;
           const destination = packet.desc.depthStencilAttachment.view.texture;
           const [sx, sy, dx, dy, selected] = new Uint32Array(packet.group.entries[1].resource.buffer.bytes);

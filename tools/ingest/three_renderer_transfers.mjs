@@ -10,9 +10,12 @@
  * Explicit mip/depth readback extensions also use this FIFO and request limit;
  * native readback owns the shared per-device staging/output byte budget. Pending
  * reads propagate renderer, target and caller cancellation to native mapping.
+ * Target-owned DepthTextures use the same source copy APIs. The depth extension
+ * preserves color/stencil and requires explicit consent for format conversion.
  * This is general WebGPU execution, not shader/pixel equivalence evidence.
  */
 import {inspectGpuTargetWrite, inspectGpuTargetCopy} from './gpu_target_transfer.mjs';
+import {inspectGpuDepthCopy} from './gpu_depth_transfer.mjs';
 
 export function createThreeRendererTransfers(renderer, ErrorType, {
   maxBytes = 128 * 1024 * 1024, maxRequests = 64,
@@ -155,6 +158,17 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
         });
       } catch (error) { return Promise.reject(error); }
     },
+    copyDepth(source, destination, supplied = {}) {
+      try {
+        live();
+        const {value, signal} = options(supplied);
+        const from = renderer._targets.capture(source), to = renderer._targets.capture(destination);
+        if (from === to) fail('TRANSFER', 'In-place render target copies are not admitted');
+        const plan = inspectGpuDepthCopy({...from.shape, sampleDepth: from.shape.depthTexture !== null}, to.shape, value);
+        const copyOptions = Object.freeze({...value, width: plan.width, height: plan.height});
+        return schedule([from, to], signal, 0, () => () => renderer._targets.copyDepth(from, to, copyOptions));
+      } catch (error) { return Promise.reject(error); }
+    },
     copyColor(source, destination, supplied = {}) {
       try {
         live();
@@ -172,11 +186,15 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
   // The renderer constructor creates this controller after its target owner and
   // FIFO. WebGL chooses its bottom-left origin later in the subclass constructor,
   // so sample that flag at the call, never when installing these methods.
-  function textureEntry(texture) {
-    if (texture?.isTexture !== true || texture.isRenderTargetTexture !== true ||
-        !texture.renderTarget || texture.renderTarget.texture !== texture)
-      fail('UNSUPPORTED', 'Texture copies require target-owned 2D color textures');
-    return renderer._targets.capture(texture.renderTarget);
+  function textureEntry(texture, depth = false) {
+    const target = texture?.renderTarget;
+    // Source DepthTexture has its own ownership pointer, not the color-only
+    // isRenderTargetTexture flag. Never mutate a source texture to admit it.
+    if (texture?.isTexture !== true || !target || (depth
+      ? texture.isDepthTexture !== true || target.depthTexture !== texture
+      : texture.isRenderTargetTexture !== true || target.texture !== texture))
+      fail('UNSUPPORTED', 'Texture copies require matching target-owned 2D color or depth textures');
+    return renderer._targets.capture(target);
   }
   function initialize(target) {
     live();
@@ -193,9 +211,11 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
       fail('UNSUPPORTED', 'Expected a 2D source region or a single depth-zero slice');
     if (destinationPosition !== null && destinationPosition.z !== undefined && destinationPosition.z !== 0)
       fail('UNSUPPORTED', 'Texture copies require destination depth zero');
-    const from = textureEntry(source), to = textureEntry(destination);
+    const depth = source?.isDepthTexture === true || destination?.isDepthTexture === true;
+    if (depth && sourceLevel !== 0) fail('UNSUPPORTED', 'Depth textures have only mip level zero');
+    const from = textureEntry(source, depth), to = textureEntry(destination, depth);
     if (from === to) fail('TRANSFER', 'In-place render target copies are not admitted');
-    const value = {sourceMipLevel: sourceLevel, flipY: renderer._bottomLeftOrigin === true,
+    const value = {...(depth ? {} : {sourceMipLevel: sourceLevel}), flipY: renderer._bottomLeftOrigin === true,
       sourceX: sourceRegion === null ? 0 : sourceRegion.min.x,
       sourceY: sourceRegion === null ? 0 : sourceRegion.min.y,
       x: destinationPosition === null ? 0 : destinationPosition.x,
@@ -204,6 +224,11 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
         height: sourceRegion.max.y - sourceRegion.min.y})};
     // Validate before the void source call returns. Copy only scalar options;
     // later edits to a caller's Box2/Vector2 must not retarget a queued copy.
+    if (depth) {
+      const plan = inspectGpuDepthCopy({...from.shape, sampleDepth: from.shape.depthTexture !== null}, to.shape, value);
+      return api.copyDepth(source.renderTarget, destination.renderTarget,
+        {...value, width: plan.width, height: plan.height});
+    }
     const plan = inspectGpuTargetCopy(from.shape, to.shape, value);
     return api.copyColor(source.renderTarget, destination.renderTarget,
       {...value, width: plan.size.width, height: plan.size.height});
@@ -249,6 +274,7 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
     initRenderTargetAsync: promised(initialize),
     copyTextureToTexture(...args) { copyTexture(...args).catch(deferred); },
     copyTextureToTextureAsync: promised(copyTexture),
+    copyRenderTargetDepthPixelsAsync: api.copyDepth,
     readRenderTargetMipPixelsAsync: promised((target, mipLevel = 0, supplied = {}) => readPixels(target, supplied, mipLevel)),
     readRenderTargetDepthPixelsAsync: promised((target, supplied = {}) => readPixels(target, supplied, 0, true)),
   };
