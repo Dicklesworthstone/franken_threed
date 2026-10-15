@@ -30,7 +30,16 @@
  * maxInitialBytes and update({maxAdditionalBytes}) let an owner enforce an
  * aggregate allocation budget. They cap additions before any writes/callbacks;
  * same-storage uploads need no additional bytes. Per-handle bounds still apply.
+ *
+ * Published Float32 StorageBufferAttribute streams borrow compute's allocation
+ * directly, including padded vec3 positions/normals and instance matrices/RGB.
+ * Compute/precompile is their upload boundary; geometry never uploads them.
+ * Borrowed bytes are charged by compute, not duplicated in geometry/shadow
+ * budgets. Provide conservative source bounds or disable frustum culling for
+ * GPU-authored motion: no CPU readback is performed to recompute bounds.
  */
+import {isComputeAttribute, computeAttributeSnapshot} from './gpu_compute_attributes.mjs';
+
 export class BufferGeometryGpuError extends Error {
   constructor(code, message) { super(`${code}: ${message}`); this.name = 'BufferGeometryGpuError'; this.code = code; }
 }
@@ -99,7 +108,7 @@ function halfToFloat(h) {
   halfView.setUint32(0, ((h & 0x8000) << 16) | ((exponent + 112) << 23) | (mantissa << 13));
   return halfView.getFloat32(0);
 }
-function describe(geometry) {
+function describe(geometry, device) {
   if (geometry?.isInstancedBufferGeometry || Object.values(geometry?.morphAttributes ?? {}).some(a => a.length))
     fail('SHAPE', 'Instancing and morph deformation require their existing GPU paths');
   const attributes = geometry?.attributes;
@@ -113,14 +122,17 @@ function describe(geometry) {
     if (attribute.isInstancedBufferAttribute || owner.isInstancedInterleavedBuffer) fail('SHAPE', 'Instance streams require the instancing path');
     const conversion = conversionOf(source.kind, attribute.normalized === true, attribute.isFloat16BufferAttribute === true);
     const [location, width] = FIELDS[name];
-    const itemSize = integer(attribute.itemSize, 2, 4, 'item size');
+    const borrowed = isComputeAttribute(owner) ? computeAttributeSnapshot(device, owner) : null;
+    // WGSL vec3 arrays have a four-component stride. The ordinary vertex
+    // shaders still consume xyz, without binding their padding as a fourth lane.
+    const itemSize = integer(borrowed && width === 3 && attribute.itemSize === 4 ? 3 : attribute.itemSize, 2, 4, 'item size');
     if (width ? itemSize !== width : itemSize !== 3 && itemSize !== 4) fail('SHAPE', `Invalid ${name} width`);
-    const stride = attribute.isInterleavedBufferAttribute ? integer(owner.stride, itemSize, 512, 'stride') : itemSize;
+    const stride = borrowed ? borrowed.arrayStride / 4 : attribute.isInterleavedBufferAttribute ? integer(owner.stride, itemSize, 512, 'stride') : itemSize;
     const offset = attribute.isInterleavedBufferAttribute ? integer(attribute.offset, 0, stride - itemSize, 'attribute offset') : 0;
     const count = integer(attribute.count, vertexCount, 0xffffffff, 'attribute count');
     if (count * stride > source.length) fail('SHAPE', 'Attribute count exceeds storage');
     let entry = owners.get(owner);
-    if (!entry) owners.set(owner, entry = {owner, array, source, stride, attributes: [], requiredBytes: 0, conversion});
+    if (!entry) owners.set(owner, entry = {owner, array, source, stride, attributes: [], requiredBytes: 0, conversion, borrowed});
     if (entry.stride !== stride) fail('SHAPE', 'Shared attributes require one stride');
     if (entry.conversion?.key !== conversion?.key) fail('FORMAT', 'Attributes sharing interleaved storage require one conversion profile');
     entry.requiredBytes = Math.max(entry.requiredBytes, vertexCount ? ((vertexCount - 1) * stride + offset + itemSize) * 4 : 0);
@@ -129,6 +141,7 @@ function describe(geometry) {
   const index = geometry.index ?? null;
   let indexOwner = null, indexFormat = null, indexCount = 0;
   if (index) {
+    if (isComputeAttribute(index)) fail('SHAPE', 'Compute-authored indices require GPU topology handling, not CPU index shadows');
     if (index.isInterleavedBufferAttribute || index.itemSize !== 1 || index.normalized) fail('SHAPE', 'Expected scalar non-interleaved indices');
     indexOwner = index;
     const source = sourceArray(index);
@@ -188,6 +201,7 @@ export function bufferGeometrySnapshot(handle, device) {
   state.live();
   const snapshot = state.current();
   if (!snapshot) fail('RELEASED', 'Call geometry.update() after releasing residency');
+  snapshot.assertCurrent?.();
   return {...snapshot, source: state.geometry, drawRange: range(state.geometry, snapshot.indexBuffer ? snapshot.indexCount : snapshot.vertexCount)};
 }
 
@@ -209,7 +223,7 @@ function createResidency(device, geometry, {
   const stats = {allocations: 0, uploads: 0, uploadedBytes: 0, updates: 0};
   const worldMatrix = new Float64Array([1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]);
   function release() {
-    for (const record of records.values()) record.buffer.destroy();
+    for (const record of records.values()) if (!record.borrowed) record.buffer.destroy();
     records = new Map(); allocatedBytes = 0; current = null; generation++;
   }
   function stop(error) {
@@ -265,13 +279,22 @@ function createResidency(device, geometry, {
     busy = true;
     let scoped = false;
     try {
-      const shape = describeSource(geometry);
+      const shape = describeSource(geometry, device);
       sourceRange(geometry, shape.indexOwner ? shape.indexCount : shape.vertexCount);
       let addedBytes = 0, addedCount = 0;
       // Admission completes before any allocation, queue write, range mutation
       // or callback. An invalid later attribute cannot partly upload the frame.
-      for (const {owner, source, requiredBytes, conversion, stride, divisor = 1} of shape.owners.values()) {
+      for (const {owner, source, requiredBytes, conversion, stride, borrowed, divisor = 1} of shape.owners.values()) {
         integer(owner.version, 0, Number.MAX_SAFE_INTEGER, 'upload version');
+        const previous = records.get(owner);
+        if (previous && !!previous.borrowed !== !!borrowed) fail('SHAPE', 'Replace the attribute when changing its CPU/compute ownership');
+        if (borrowed) {
+          borrowed.assertCurrent();
+          if (conversion || divisor !== 1 || requiredBytes > borrowed.byteLength)
+            fail('SHAPE', 'Shared storage cannot be converted, repeated or read beyond its GPU allocation');
+          if (!previous) addedCount++;
+          continue; // Compute owns allocation, uploads, callbacks and the budget.
+        }
         // Converted storage is one f32 per element; compare in resident bytes.
         const logical = conversion ? source.length * 4 : source.byteLength;
         const expanded = divisor > 1 ? Math.ceil(source.length / stride) * stride * divisor * 4 : logical;
@@ -297,7 +320,13 @@ function createResidency(device, geometry, {
       if (addedBytes > maxAdditionalBytes || allocatedBytes + addedBytes > maxBytes || records.size + addedCount > maxAttributes) fail('LIMIT', 'Geometry residency budget exceeded');
       native(() => { device.pushErrorScope('validation'); device.pushErrorScope('out-of-memory'); }); scoped = true;
       for (const entry of shape.owners.values()) {
-        const {owner} = entry, array = owner.array;
+        const {owner, borrowed} = entry, array = owner.array;
+        if (borrowed) {
+          borrowed.assertCurrent();
+          if (records.get(owner)?.buffer !== borrowed.buffer) generation++;
+          records.set(owner, {buffer: borrowed.buffer, borrowed, logicalBytes: borrowed.byteLength, version: owner.version, revision: 0});
+          continue;
+        }
         if (array == null) {
           // Released after an earlier upload (onUpload disposeArray): nothing to read.
           const r = records.get(owner);
@@ -350,7 +379,12 @@ function createResidency(device, geometry, {
       // including writes followed by a throwing upload callback.
       const Index = shape.indexFormat === 'uint16' ? Uint16Array : Uint32Array;
       const indexData = indexRecord ? new Index(indexRecord.shadow.buffer, 0, indexRecord.logicalBytes / Index.BYTES_PER_ELEMENT) : null;
+      const shared = [...shape.owners.values()].flatMap(entry => entry.borrowed ? [entry.borrowed] : []);
+      // A CPU upload callback may have retired an earlier shared stream.
+      for (const borrowed of shared) borrowed.assertCurrent();
       current = Object.freeze({
+        assertCurrent() { for (const borrowed of shared) borrowed.assertCurrent(); },
+        shared: Object.freeze(shared),
         get indexRevision() { return indexRecord?.revision ?? 0; },
         readIndex: indexData ? i => indexData[integer(i, 0, shape.indexCount - 1, 'resident index')] : null,
         layouts: shape.layouts, signature: shape.signature, channels: shape.channels,
@@ -385,13 +419,13 @@ function createResidency(device, geometry, {
     get poseVersion() { return version; },
     get bufferBytes() { return allocatedBytes; },
     get shadowBytes() { return allocatedBytes; },
-    get diagnostics() { return Object.freeze({...stats, generation, residentAttributes: records.size}); },
+    get diagnostics() { return Object.freeze({...stats, generation, residentAttributes: records.size, sharedAttributes: current?.shared.length ?? 0}); },
     get disposed() { return disposed; },
     get failed() { return terminal !== null; },
     worldMatrix,
     async whenIdle() {
       live(); const uploaded = pending;
-      try { await Promise.race([Promise.all([uploaded, device.queue.onSubmittedWorkDone()]), stopped]); }
+      try { await Promise.race([Promise.all([uploaded, device.queue.onSubmittedWorkDone(), ...(current?.shared ?? []).map(borrowed => borrowed.whenIdle())]), stopped]); }
       catch (error) { if (!disposed && !terminal) stop(error); throw error; }
       live();
     },
@@ -424,7 +458,7 @@ function createResidency(device, geometry, {
  * Attributes the geometry lacks are reported in
  * `missing` so the renderer binds GL's constant (0, 0, 0, 1) default instead. */
 function describeProgram(program) {
-  return geometry => {
+  return (geometry, device) => {
     const attributes = geometry?.attributes;
     if (!attributes) fail('SHAPE', 'Expected a BufferGeometry');
     // Programs read morph targets from WebGLMorphtargets' texture, not streams.
@@ -440,6 +474,7 @@ function describeProgram(program) {
         continue;
       }
       const owner = ownerOf(attribute), source = sourceArray(owner), array = source.array;
+      const borrowed = isComputeAttribute(owner) ? computeAttributeSnapshot(device, owner) : null;
       // r186 WebGLBindingStates: gpuType IntType -> vertexAttribIPointer, else
       // vertexAttribPointer. A mismatch with the shader input type is a GL error
       // or undefined value there, so it is explicit here.
@@ -450,17 +485,19 @@ function describeProgram(program) {
       const perInstance = attribute.isInstancedBufferAttribute === true || owner.isInstancedInterleavedBuffer === true;
       const divisor = perInstance ? integer(owner.meshPerAttribute ?? attribute.meshPerAttribute, 1, 0xffffffff, 'meshPerAttribute') : 1;
       const itemSize = integer(attribute.itemSize, 1, 16, 'item size');
-      const columns = a.locations, width = a.locations > 1 ? a.components : Math.min(itemSize, 4);
+      if (borrowed && (intType || divisor !== 1)) fail('FORMAT', 'Shared program attributes require Float32 data and instance divisor one');
+      const columns = a.locations, width = a.locations > 1 || borrowed ? a.components : Math.min(itemSize, 4);
+      if (borrowed && (!Number.isSafeInteger(width) || width < 1 || width > 4 || width > itemSize)) fail('SHAPE', 'Program input exceeds the shared attribute width');
       if (columns > 1 && itemSize !== columns * a.components) fail('SHAPE', `Matrix attribute ${a.name} needs itemSize ${columns * a.components}`);
       if (columns === 1 && itemSize > 4) fail('SHAPE', `Attribute ${a.name} itemSize exceeds a vector`);
-      const stride = attribute.isInterleavedBufferAttribute ? integer(owner.stride, itemSize, 512, 'stride') : itemSize;
+      const stride = borrowed ? borrowed.arrayStride / 4 : attribute.isInterleavedBufferAttribute ? integer(owner.stride, itemSize, 512, 'stride') : itemSize;
       const offset = attribute.isInterleavedBufferAttribute ? integer(attribute.offset, 0, stride - itemSize, 'attribute offset') : 0;
       const count = integer(attribute.count, 0, 0xffffffff, 'attribute count');
       if (count && (count - 1) * stride + offset + itemSize > source.length) fail('SHAPE', 'Attribute count exceeds storage');
       if (perInstance) instanceCapacity = Math.min(instanceCapacity, integer(count * divisor, 0, 0xffffffff, 'instance capacity'));
       else vertexCount = vertexCount === null ? count : Math.min(vertexCount, count);
       let entry = owners.get(owner);
-      if (!entry) owners.set(owner, entry = {owner, array, source, stride, divisor, attributes: [], requiredBytes: 0, conversion, stepMode: perInstance ? 'instance' : 'vertex'});
+      if (!entry) owners.set(owner, entry = {owner, array, source, stride, divisor, attributes: [], requiredBytes: 0, conversion, borrowed, stepMode: perInstance ? 'instance' : 'vertex'});
       if (entry.stride !== stride || entry.divisor !== divisor || entry.stepMode !== (perInstance ? 'instance' : 'vertex')) fail('SHAPE', 'Shared attributes require one stride, divisor and step mode');
       if (entry.conversion?.key !== conversion?.key) fail('FORMAT', 'Attributes sharing interleaved storage require one conversion profile');
       entry.requiredBytes = Math.max(entry.requiredBytes, count ? ((count - 1) * stride + offset + itemSize) * 4 : 0);
@@ -471,6 +508,7 @@ function describeProgram(program) {
     const index = geometry.index ?? null;
     let indexOwner = null, indexFormat = null, indexCount = 0;
     if (index) {
+      if (isComputeAttribute(index)) fail('SHAPE', 'Compute-authored indices require GPU topology handling, not CPU index shadows');
       if (index.isInterleavedBufferAttribute || index.itemSize !== 1 || index.normalized) fail('SHAPE', 'Expected scalar non-interleaved indices');
       const source = sourceArray(index);
       if (!(source.kind instanceof Uint16Array) && !(source.kind instanceof Uint32Array)) fail('FORMAT', 'Indices require Uint16Array or Uint32Array');
@@ -487,7 +525,7 @@ function describeProgram(program) {
     // bounds the vertex count (an infinite range draws nothing).
     if (vertexCount === null) {
       const r = geometry.drawRange;
-      vertexCount = r && Number.isSafeInteger(r.count) ? integer(r.start, 0, 0xffffffff, 'draw-range start') + integer(r.count, 0, 0xffffffff, 'draw-range count') : 0;
+      vertexCount = r && Number.isSafeInteger(r.count) ? integer(r.count, 0, 0xffffffff, 'draw-range count') + integer(r.start, 0, 0xffffffff, 'draw-range start') : 0;
     }
     return {owners, streams, layouts, signature: JSON.stringify([layouts, missing]), channels: Object.freeze({missing: Object.freeze(missing)}),
       vertexCount, instanced, instanceCapacity, indexOwner, indexFormat, indexCount};
@@ -506,6 +544,7 @@ export function programGeometrySnapshot(handle, device) {
   state.live();
   const snapshot = state.current();
   if (!snapshot) fail('RELEASED', 'Call geometry.update() after releasing residency');
+  snapshot.assertCurrent?.();
   return {...snapshot, source: state.geometry, drawRange: range(state.geometry, snapshot.indexBuffer ? snapshot.indexCount : snapshot.vertexCount)};
 }
 
@@ -515,7 +554,7 @@ export function createGpuBufferGeometry(device, geometry, options) {
   return createResidency(device, geometry, options);
 }
 
-function describeInstances(source) {
+function describeInstances(source, device) {
   if (!source?.isInstancedMesh || source.morphTexture != null)
     fail('SHAPE', 'Expected a rigid InstancedMesh without per-instance morph textures');
   const owners = new Map(), streams = [];
@@ -523,21 +562,23 @@ function describeInstances(source) {
   for (const [name, width, location] of [['instanceMatrix',16,5], ['instanceColor',3,9]]) {
     const owner = source[name];
     if (name === 'instanceColor' && owner === null) continue;
+    const shared = isComputeAttribute(owner), stride = shared ? owner.itemSize : width;
     if (!owner?.isInstancedBufferAttribute || owner.isInterleavedBufferAttribute ||
-        owner.meshPerAttribute !== 1 || owner.itemSize !== width || owner.normalized)
+        owner.meshPerAttribute !== 1 || (owner.itemSize !== width && !(shared && width === 3 && stride === 4)) || owner.normalized)
       fail('SHAPE', `Expected an ordinary ${name} InstancedBufferAttribute`);
     const array = owner.array;
     storage(array);
     if (!(array instanceof Float32Array) || owner.isFloat16BufferAttribute)
       fail('FORMAT', 'Instance streams require non-normalized Float32 attributes');
+    const borrowed = shared && device ? computeAttributeSnapshot(device, owner) : null;
     const count = integer(owner.count, 0, 0xffffffff, 'instance attribute count');
-    if (count * width !== array.length) fail('SHAPE', 'Instance count does not match storage');
+    if (count * stride !== array.length) fail('SHAPE', 'Instance count does not match storage');
     capacity = Math.min(capacity, count);
     const attributes = width === 16
       ? [0,1,2,3].map(i => ({shaderLocation: location+i, offset: i*16, format: 'float32x4'}))
       : [{shaderLocation: location, offset: 0, format: 'float32x3'}];
     const entry = {owner, array, source: {array, kind: array, length: array.length, byteLength: array.byteLength, elementType: array.constructor},
-      stride: width, requiredBytes: array.byteLength, attributes};
+      stride, requiredBytes: array.byteLength, attributes, borrowed};
     owners.set(owner, entry); streams.push(entry);
   }
   integer(source.count, 0, capacity, 'active instance count');
@@ -573,5 +614,6 @@ export function instanceAttributesSnapshot(handle, device) {
   state.live();
   const snapshot = state.current();
   if (!snapshot) fail('RELEASED', 'Call instances.update() after releasing residency');
+  snapshot.assertCurrent?.();
   return {...snapshot, instanceCount: instanceRange(state.geometry, snapshot.vertexCount).count};
 }

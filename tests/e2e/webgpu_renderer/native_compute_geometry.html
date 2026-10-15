@@ -1,0 +1,109 @@
+<!DOCTYPE html><html lang="en"><meta charset="utf-8"><title>Native compute geometry integration</title>
+<body><pre id="result">Running…</pre><script type="module">
+// Serve the repository root over localhost. This executes real WGSL, geometry
+// residency, vertex/instance fetch and pixel readback. The minimal source data
+// objects implement the BufferAttribute contract; this is not a full r186
+// scene-facade/TSL parity test and it is not a benchmark.
+import {createGpuCompute} from '../../../tools/ingest/gpu_compute.mjs';
+import {createGpuBufferGeometry, bufferGeometrySnapshot, createGpuInstanceAttributes,
+  instanceAttributesSnapshot} from '../../../tools/ingest/gpu_buffer_geometry.mjs';
+const state = window.__f3dNativeGeometry = {status:'running', checks:[], error:null};
+const owned = [], own = resource => { owned.push(resource); return resource; };
+function check(name, condition) { if (!condition) throw new Error(name); state.checks.push(name); }
+function attr(array, itemSize, instanced = false) {
+  return {array, itemSize, count:array.length/itemSize, version:0, normalized:false,
+    isStorageBufferAttribute:!instanced, isStorageInstancedBufferAttribute:instanced,
+    isInstancedBufferAttribute:instanced, meshPerAttribute:1, updateRanges:[],
+    clearUpdateRanges() { this.updateRanges.length=0; }, onUploadCallback() { throw new Error('Geometry re-uploaded shared storage'); }};
+}
+let device;
+try {
+  const adapter = await navigator.gpu?.requestAdapter();
+  if (!adapter) throw new Error('No WebGPU adapter');
+  device = await adapter.requestDevice();
+  state.adapter = {vendor:adapter.info?.vendor, architecture:adapter.info?.architecture, device:adapter.info?.device, description:adapter.info?.description};
+  const compute = own(createGpuCompute(device));
+  const position = attr(new Float32Array([-.8,-.8,0,0, .8,-.8,0,0, 0,.8,0,0]),4);
+  const source = {attributes:{position}, index:null, morphAttributes:{}, drawRange:{start:0,count:Infinity}};
+  const storage = compute.upload(position, position.array, 0), params = {};
+  const geometry = own(createGpuBufferGeometry(device,source,{maxBytes:1,maxInitialBytes:0}));
+  const shape = bufferGeometrySnapshot(geometry,device);
+  check('vertex fetch borrows the identical compute buffer',shape.vertexBuffers[0]===storage);
+  check('geometry allocated no GPU buffer or CPU shadow',geometry.bufferBytes===0 && geometry.shadowBytes===0);
+  const kernel = await compute.prepare({code:`
+    @group(0) @binding(0) var<storage,read_write> positions:array<vec4f>;
+    @group(0) @binding(1) var<uniform> delta:vec4f;
+    @compute @workgroup_size(1) fn main(@builtin(global_invocation_id) id:vec3u) { positions[id.x].x += delta.x; }
+  `});
+  let version = 0;
+  function shift(dx) {
+    const uniform=compute.upload(params,new Float32Array([dx,0,0,0]),++version,{uniform:true});
+    compute.dispatch(kernel,[{index:0,entries:[{binding:0,resource:{buffer:storage}},{binding:1,resource:{buffer:uniform}}]}],[3]);
+  }
+  const target=own(device.createTexture({size:[8,8],format:'rgba8unorm',usage:16|1}));
+  const shader=device.createShaderModule({code:`
+    @vertex fn vs(@location(0) p:vec3f) -> @builtin(position) vec4f { return vec4f(p,1); }
+    @fragment fn fs() -> @location(0) vec4f { return vec4f(1,0,0,1); }
+  `});
+  const pipeline=device.createRenderPipeline({layout:'auto',vertex:{module:shader,entryPoint:'vs',buffers:shape.layouts},
+    fragment:{module:shader,entryPoint:'fs',targets:[{format:'rgba8unorm'}]},primitive:{topology:'triangle-list'}});
+  function draw(pipeline, snapshots, count=1) {
+    const encoder=device.createCommandEncoder();
+    const pass=encoder.beginRenderPass({colorAttachments:[{view:target.createView(),loadOp:'clear',storeOp:'store',clearValue:[0,0,0,1]}]});
+    pass.setPipeline(pipeline); let slot=0;
+    for (const snapshot of snapshots) for (const buffer of snapshot.vertexBuffers) pass.setVertexBuffer(slot++,buffer);
+    pass.draw(3,count); pass.end(); device.queue.submit([encoder.finish()]);
+  }
+  async function pixel() {
+    const buffer=device.createBuffer({size:256*8,usage:1|8});
+    try {
+      const encoder=device.createCommandEncoder();
+      encoder.copyTextureToBuffer({texture:target},{buffer,bytesPerRow:256},[8,8,1]);
+      device.queue.submit([encoder.finish()]); await buffer.mapAsync(1);
+      return Array.from(new Uint8Array(buffer.getMappedRange(),4*256+4*4,4));
+    } finally { buffer.unmap(); buffer.destroy(); }
+  }
+  shift(0); geometry.update(); draw(pipeline,[bufferGeometrySnapshot(geometry,device)]);
+  check('initial GPU vertices rasterize red',JSON.stringify(await pixel())==='[255,0,0,255]');
+  shift(4); geometry.update(); draw(pipeline,[bufferGeometrySnapshot(geometry,device)]);
+  check('compute motion changes rendered pixels without a CPU upload',JSON.stringify(await pixel())==='[0,0,0,255]');
+  shift(-4); geometry.update(); draw(pipeline,[bufferGeometrySnapshot(geometry,device)]);
+  check('subsequent compute motion restores the triangle',JSON.stringify(await pixel())==='[255,0,0,255]');
+  check('source CPU positions were never updated by the simulation',position.array[0]===Math.fround(-.8));
+
+  const matrix=attr(new Float32Array([1,0,0,0,0,1,0,0,0,0,1,0,4,0,0,1, 1,0,0,0,0,1,0,0,0,0,1,0,-4,0,0,1]),16,true);
+  const color=attr(new Float32Array([0,1,0,0,0,0,1,0]),4,true);
+  const mb=compute.upload(matrix,matrix.array,0), cb=compute.upload(color,color.array,0);
+  const mesh={isInstancedMesh:true,morphTexture:null,count:2,instanceMatrix:matrix,instanceColor:color};
+  const instances=own(createGpuInstanceAttributes(device,mesh,{maxBytes:1}));
+  const instanceShape=instanceAttributesSnapshot(instances,device);
+  check('instance transforms and colors share their storage allocations',instanceShape.vertexBuffers[0]===mb && instanceShape.vertexBuffers[1]===cb && instances.bufferBytes===0);
+  const instanceShader=device.createShaderModule({code:`
+    struct Out { @builtin(position) position:vec4f, @location(0) color:vec3f }
+    @vertex fn vs(@location(0) p:vec3f,@location(5) a:vec4f,@location(6) b:vec4f,@location(7) c:vec4f,@location(8) d:vec4f,@location(9) color:vec3f) -> Out {
+      var out:Out; out.position=mat4x4f(a,b,c,d)*vec4f(p,1); out.color=color; return out;
+    }
+    @fragment fn fs(in:Out) -> @location(0) vec4f { return vec4f(in.color,1); }
+  `});
+  const instancePipeline=device.createRenderPipeline({layout:'auto',vertex:{module:instanceShader,entryPoint:'vs',buffers:[...shape.layouts,...instanceShape.layouts]},
+    fragment:{module:instanceShader,entryPoint:'fs',targets:[{format:'rgba8unorm'}]},primitive:{topology:'triangle-list'}});
+  draw(instancePipeline,[bufferGeometrySnapshot(geometry,device),instanceShape],2);
+  check('initial instance transforms place both triangles outside the view',JSON.stringify(await pixel())==='[0,0,0,255]');
+  const move=await compute.prepare({code:`
+    @group(0) @binding(0) var<storage,read_write> matrices:array<mat4x4f>;
+    @compute @workgroup_size(1) fn main() { matrices[0][3].x -= 4; }
+  `});
+  compute.dispatch(move,[{index:0,entries:[{binding:0,resource:{buffer:mb}}]}],[1]);
+  instances.update();
+  draw(instancePipeline,[bufferGeometrySnapshot(geometry,device),instanceAttributesSnapshot(instances,device)],2);
+  check('GPU-written instance matrix renders its GPU-resident green color',JSON.stringify(await pixel())==='[0,255,0,255]');
+  check('source CPU instance matrix remains unchanged',matrix.array[12]===4);
+  await compute.whenIdle(); await geometry.whenIdle(); await instances.whenIdle();
+  check('geometry did not perform any vertex or instance uploads',geometry.diagnostics.uploads===0 && instances.diagnostics.uploads===0);
+  state.status='pass';
+} catch(error) { state.status='fail'; state.error=error.stack??String(error); }
+finally {
+  for (const resource of owned.reverse()) { if(resource.dispose) resource.dispose(); else resource.destroy(); }
+  device?.destroy(); document.querySelector('#result').textContent=JSON.stringify(state,null,2);
+}
+</script></body></html>
