@@ -17,7 +17,7 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
   maxPipelines = 256, signal = null} = {}) {
   if (!device?.queue || typeof device.createBuffer !== 'function' ||
       ![maxBytes, maxBuffers, maxPipelines].every(positive)) fail('OPTIONS', 'Expected a GPUDevice and positive resource limits');
-  const buffers = new Map(), pipelines = new Map(), ready = new Set(), staging = new Set(), pending = new Set();
+  const buffers = new Map(), pipelines = new Map(), compiled = new Map(), ready = new Set(), staging = new Set(), pending = new Set();
   const lifetime = new AbortController();
   let terminal = null, allocatedBytes = 0;
   const live = () => { if (terminal) throw terminal; };
@@ -27,7 +27,7 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
     lifetime.abort(terminal);
     for (const entry of buffers.values()) entry.buffer.destroy();
     for (const buffer of staging) buffer.destroy();
-    buffers.clear(); staging.clear(); ready.clear(); pipelines.clear(); allocatedBytes = 0;
+    buffers.clear(); staging.clear(); ready.clear(); pipelines.clear(); compiled.clear(); allocatedBytes = 0;
     signal?.removeEventListener('abort', onAbort);
   }
   const onAbort = () => stop(signal.reason);
@@ -130,11 +130,28 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
       const descriptor = {label, layout: 'auto', compute: {module, entryPoint}};
       const pipeline = await interrupted(checked(() => device.createComputePipelineAsync
         ? device.createComputePipelineAsync(descriptor) : device.createComputePipeline(descriptor)));
-      live(); ready.add(pipeline); return pipeline;
+      live(); ready.add(pipeline); compiled.set(key, pipeline); return pipeline;
     })();
     pipelines.set(key, run);
     run.catch(() => { if (pipelines.get(key) === run) pipelines.delete(key); });
     return run;
+  }
+  /** Source renderer.compute() is synchronous after initialization. This path
+   * compiles before submission; compileComputeAsync() can prewarm the same key.
+   * Validation is still tracked by whenIdle(), never silently discarded. */
+  function prepareSync({code, entryPoint = 'main', label = 'f3d-compute'} = {}) {
+    live();
+    if (typeof code !== 'string' || !code.trim() || typeof entryPoint !== 'string' || !entryPoint)
+      fail('SHADER', 'Expected WGSL source and an entry point');
+    const key = JSON.stringify([code, entryPoint]);
+    if (compiled.has(key)) return compiled.get(key);
+    if (!pipelines.has(key) && pipelines.size >= maxPipelines) fail('BUDGET', 'Compute pipeline count exceeds maxPipelines');
+    const pipeline = checked(() => {
+      const module = device.createShaderModule({label, code});
+      return device.createComputePipeline({label, layout: 'auto', compute: {module, entryPoint}});
+    });
+    ready.add(pipeline); compiled.set(key, pipeline); pipelines.set(key, Promise.resolve(pipeline));
+    return pipeline;
   }
   function dispatch(pipeline, groups, workgroups) {
     live();
@@ -194,7 +211,7 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
     await interrupted(Promise.all([...pending, device.queue.onSubmittedWorkDone()]));
     live();
   }
-  return {upload, release, prepare, dispatch, read, whenIdle,
+  return {upload, release, prepare, prepareSync, dispatch, read, whenIdle,
     getBuffer: key => { live(); return buffers.get(key)?.buffer ?? null; },
     get allocatedBytes() { return allocatedBytes; }, get bufferCount() { return buffers.size; },
     dispose: () => stop(new GpuComputeError('DISPOSED', 'Compute owner is disposed'))};
