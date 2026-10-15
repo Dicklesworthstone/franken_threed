@@ -94,7 +94,7 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
       // Charge both generations until the replacement is successfully created.
       budget(size);
       const buffer = checked(() => device.createBuffer({label: 'f3d-compute-buffer', size,
-        usage: COPY_SRC | COPY_DST | (uniform ? UNIFORM : STORAGE | INDIRECT | VERTEX)}));
+        usage: COPY_SRC | COPY_DST | (uniform ? UNIFORM : STORAGE | INDIRECT | INDEX | VERTEX)}));
       entry = {buffer, size, bytes, uniform, array: null, version: null};
       allocatedBytes += size; buffers.set(key, entry);
       if (old) { old.buffer.destroy(); allocatedBytes -= old.size; }

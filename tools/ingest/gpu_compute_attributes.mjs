@@ -44,10 +44,10 @@ export function createComputeAttributeOwner(device) {
       const stride = attribute.itemSize, count = attribute.count;
       const required = array.byteLength;
       if (!buffer || !Number.isSafeInteger(buffer.size) || buffer.size < required ||
-          !Number.isSafeInteger(buffer.usage) || (buffer.usage & (128 | 32)) !== (128 | 32) ||
+          !Number.isSafeInteger(buffer.usage) || (buffer.usage & (128 | 16 | 32)) !== (128 | 16 | 32) ||
           typeof live !== 'function' || typeof whenIdle !== 'function' ||
           !Number.isSafeInteger(version) || version < 0 || version !== attribute.version)
-        fail('PUBLICATION', 'Shared vertex storage needs a live, sufficiently sized STORAGE|VERTEX buffer at the current source version');
+        fail('PUBLICATION', 'Shared draw storage needs a live, sufficiently sized STORAGE|INDEX|VERTEX buffer at the current source version');
       table.set(attribute, {identity, buffer, stride, count, version, scalar: array.constructor,
         byteLength: array.byteLength, live, whenIdle});
       owned.add(attribute);
@@ -61,7 +61,7 @@ export function createComputeAttributeOwner(device) {
  * needsUpdate remains a compute upload request: execute/precompile that kernel
  * before drawing a newer host version. Never upload stale CPU simulation state
  * from the geometry owner, and never infer current GPU bounds from that array. */
-export function computeAttributeSnapshot(device, attribute) {
+export function computeAttributeSnapshot(device, attribute, {index = false} = {}) {
   const table = devices.get(device), entry = table?.get(attribute);
   if (!isComputeAttribute(attribute) || !entry)
     fail('UNPREPARED', 'Compute or compileComputeAsync must upload this storage attribute on the drawing device first');
@@ -79,7 +79,11 @@ export function computeAttributeSnapshot(device, attribute) {
       fail('UNPREPARED', 'Submit the pending storage attribute version through compute before drawing');
   }
   assertCurrent();
-  if (entry.scalar !== Float32Array) fail('FORMAT', 'Shared ordinary vertex and instance streams require Float32 storage');
+  if (index) {
+    if (entry.scalar !== Uint32Array || entry.stride !== 1)
+      fail('FORMAT', 'Shared index streams require scalar Uint32 storage');
+    if ((entry.buffer.usage & 16) !== 16) fail('FORMAT', 'Shared index storage requires INDEX buffer usage');
+  } else if (entry.scalar !== Float32Array) fail('FORMAT', 'Shared ordinary vertex and instance streams require Float32 storage');
   return Object.freeze({buffer: entry.buffer, arrayStride: entry.stride * 4, count: entry.count,
-    byteLength: entry.byteLength, assertCurrent, whenIdle: entry.whenIdle});
+    byteLength: entry.byteLength, indexFormat: index ? 'uint32' : null, assertCurrent, whenIdle: entry.whenIdle});
 }

@@ -141,15 +141,22 @@ function describe(geometry, device) {
   const index = geometry.index ?? null;
   let indexOwner = null, indexFormat = null, indexCount = 0;
   if (index) {
-    if (isComputeAttribute(index)) fail('SHAPE', 'Compute-authored indices require GPU topology handling, not CPU index shadows');
     if (index.isInterleavedBufferAttribute || index.itemSize !== 1 || index.normalized) fail('SHAPE', 'Expected scalar non-interleaved indices');
     indexOwner = index;
     const source = sourceArray(index);
-    if (!(source.kind instanceof Uint16Array) && !(source.kind instanceof Uint32Array)) fail('FORMAT', 'Indices require Uint16Array or Uint32Array');
-    indexFormat = source.kind instanceof Uint16Array ? 'uint16' : 'uint32';
-    indexCount = integer(index.count, 0, source.length, 'index count');
-    if (owners.has(index)) fail('SHAPE', 'Index and vertex source identities must be distinct');
-    owners.set(index, {owner: index, array: source.array, source, stride: 0, attributes: [], requiredBytes: indexCount * source.kind.BYTES_PER_ELEMENT, conversion: null});
+    const borrowed = isComputeAttribute(index) ? computeAttributeSnapshot(device, index, {index: true}) : null;
+    if (borrowed) {
+      indexFormat = borrowed.indexFormat; indexCount = integer(index.count, 0, borrowed.count, 'index count');
+      if (owners.has(index)) fail('SHAPE', 'Index and vertex source identities must be distinct');
+      owners.set(index, {owner: index, array: source.array, source, stride: 0, attributes: [],
+        requiredBytes: indexCount * 4, conversion: null, borrowed});
+    } else {
+      if (!(source.kind instanceof Uint16Array) && !(source.kind instanceof Uint32Array)) fail('FORMAT', 'Indices require Uint16Array or Uint32Array');
+      indexFormat = source.kind instanceof Uint16Array ? 'uint16' : 'uint32';
+      indexCount = integer(index.count, 0, source.length, 'index count');
+      if (owners.has(index)) fail('SHAPE', 'Index and vertex source identities must be distinct');
+      owners.set(index, {owner: index, array: source.array, source, stride: 0, attributes: [], requiredBytes: indexCount * source.kind.BYTES_PER_ELEMENT, conversion: null});
+    }
   }
   const streams = [...owners.values()].filter(e => e.stride !== 0);
   // Stable layouts do not depend on object ids, buffer generations or insertion
@@ -378,7 +385,7 @@ function createResidency(device, geometry, {
       // array. No mutable shadow view escapes. Revisions advance on actual writes,
       // including writes followed by a throwing upload callback.
       const Index = shape.indexFormat === 'uint16' ? Uint16Array : Uint32Array;
-      const indexData = indexRecord ? new Index(indexRecord.shadow.buffer, 0, indexRecord.logicalBytes / Index.BYTES_PER_ELEMENT) : null;
+      const indexData = indexRecord && !indexRecord.borrowed ? new Index(indexRecord.shadow.buffer, 0, indexRecord.logicalBytes / Index.BYTES_PER_ELEMENT) : null;
       const shared = [...shape.owners.values()].flatMap(entry => entry.borrowed ? [entry.borrowed] : []);
       // A CPU upload callback may have retired an earlier shared stream.
       for (const borrowed of shared) borrowed.assertCurrent();
