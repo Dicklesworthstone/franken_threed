@@ -163,9 +163,9 @@ do_checkout() {
     git -C "${TARGET_DIR}" init -q
     git -C "${TARGET_DIR}" remote add origin "${PINNED_REPO_URL}"
     git -C "${TARGET_DIR}" config http.userAgent "${REQUIRED_USER_AGENT}"
-    git -C "${TARGET_DIR}" fetch --depth 1 origin "${PINNED_SOURCE_COMMIT}"
+    git -C "${TARGET_DIR}" fetch --no-tags --depth 1 origin "${PINNED_SOURCE_COMMIT}"
     git -C "${TARGET_DIR}" checkout -q --detach FETCH_HEAD
-    git -C "${TARGET_DIR}" fetch --depth 1 origin "refs/tags/${PINNED_TAG_NAME}:refs/tags/${PINNED_TAG_NAME}"
+    git -C "${TARGET_DIR}" fetch --no-tags --depth 1 origin "${PINNED_TAG_OBJECT_HASH}:refs/tags/${PINNED_TAG_NAME}"
   fi
 
   if [[ "${BUILD}" -eq 1 ]]; then
