@@ -1,8 +1,9 @@
-/** Renderer-owned 2D/array StorageTexture residency shared by TSL compute and scenes.
+/** Renderer-owned 2D/array/3D StorageTexture residency shared by TSL compute and scenes.
  * No source pixels, readbacks, upload shadows or retained renderer submissions.
  * Views keep native WebGPU orientation. Writes may refresh the mip pyramid on
  * the GPU; ordinary material bindings sample the same allocation. */
 import {submitStorageArrayMips} from './gpu_storage_array_mips.mjs';
+import {submitStorageVolumeMips} from './gpu_storage_volume_mips.mjs';
 
 export class ThreeStorageTextureError extends Error {
   constructor(code, message) {
@@ -17,13 +18,13 @@ const accessNames = new Map([['readOnly', 'read-only'], ['writeOnly', 'write-onl
 export function inspectThreeStorageTexture(texture, three) {
   if (typeof three?.Texture !== 'function' || !(texture instanceof three.Texture) || !texture.isStorageTexture)
     fail('SOURCE', 'Expected a pinned Three StorageTexture');
-  const array = texture.isArrayTexture === true;
-  const depth = array ? texture.image?.depth : 1;
-  if (texture.is3DTexture || texture.isCubeTexture || texture.isRenderTargetTexture ||
+  const array = texture.isArrayTexture === true, volume = texture.is3DTexture === true;
+  const depth = array || volume ? texture.image?.depth : 1;
+  if ((array && volume) || texture.isCubeTexture || texture.isRenderTargetTexture ||
       !positive(texture.image?.width) || !positive(texture.image?.height) || !positive(depth) ||
-      (!array && (texture.image.depth ?? 1) !== 1))
-    fail('SHAPE', 'Storage residency requires positive 2D or array dimensions');
-  const viewDimension = array ? '2d-array' : '2d';
+      (!array && !volume && (texture.image.depth ?? 1) !== 1))
+    fail('SHAPE', 'Storage residency requires positive 2D, array or 3D dimensions');
+  const viewDimension = volume ? '3d' : array ? '2d-array' : '2d';
   if (texture.image.data != null || texture.mipmaps?.length || texture.internalFormat != null ||
       ![three.NoColorSpace, three.LinearSRGBColorSpace].includes(texture.colorSpace))
     fail('FORMAT', 'Storage textures require linear GPU-authored data and no internal-format override');
@@ -36,16 +37,17 @@ export function inspectThreeStorageTexture(texture, three) {
     else if (texture.format === three.RGBAFormat) [format, texelBytes] = ['rgba32float', 16];
   }
   if (!format) fail('FORMAT', 'Storage color must be RGBA8, RGBA16F or R/RG/RGBA32F');
-  // r186 StorageArrayTexture does not initialize mipmapsAutoUpdate. Undefined
+  // r186 StorageArrayTexture/Storage3DTexture omit mipmapsAutoUpdate. Undefined
   // is disabled there; preserve the source object rather than inventing a flag.
   if (typeof texture.generateMipmaps !== 'boolean' ||
-      (typeof texture.mipmapsAutoUpdate !== 'boolean' && !(array && texture.mipmapsAutoUpdate === undefined)))
+      (typeof texture.mipmapsAutoUpdate !== 'boolean' && !((array || volume) && texture.mipmapsAutoUpdate === undefined)))
     fail('MIPS', 'Expected boolean storage mipmap controls');
   const {width, height} = texture.image;
-  const mipLevelCount = texture.generateMipmaps ? 1 + Math.floor(Math.log2(Math.max(width, height))) : 1;
+  const mipLevelCount = texture.generateMipmaps ? 1 + Math.floor(Math.log2(Math.max(width, height, volume ? depth : 1))) : 1;
   let bytes = 0;
   for (let level = 0; level < mipLevelCount; level++)
-    bytes += Math.max(1, Math.floor(width / 2 ** level)) * Math.max(1, Math.floor(height / 2 ** level)) * depth * texelBytes;
+    bytes += Math.max(1, Math.floor(width / 2 ** level)) * Math.max(1, Math.floor(height / 2 ** level)) *
+      (volume ? Math.max(1, Math.floor(depth / 2 ** level)) : depth) * texelBytes;
   if (!Number.isSafeInteger(bytes)) fail('BUDGET', 'Storage texture size exceeds safe integer precision');
   return {width, height, depth, viewDimension, format, texelBytes, mipLevelCount, bytes,
     float32: texture.type === three.FloatType, key: `${viewDimension}/${width}/${height}/${depth}/${format}/${mipLevelCount}`};
@@ -59,13 +61,15 @@ function samplerOf(texture, three, shape, device) {
   const wraps = new Map([[three.ClampToEdgeWrapping, 'clamp-to-edge'], [three.RepeatWrapping, 'repeat'], [three.MirroredRepeatWrapping, 'mirror-repeat']]);
   const magFilter = filters.get(texture.magFilter), min = minFilters.get(texture.minFilter);
   const addressModeU = wraps.get(texture.wrapS), addressModeV = wraps.get(texture.wrapT);
+  const addressModeW = shape.viewDimension === '3d' ? wraps.get(texture.wrapR) : undefined;
+  if (shape.viewDimension === '3d' && !addressModeW) fail('SAMPLER', 'Expected source volume wrapR');
   if (!magFilter || !min || !addressModeU || !addressModeV || !Number.isFinite(texture.anisotropy) || texture.anisotropy < 1 || texture.compareFunction != null)
     fail('SAMPLER', 'Expected ordinary source texture filters and wrapping');
   const [minFilter, mipmapFilter, useMips] = min;
   const filtering = magFilter === 'linear' || minFilter === 'linear' || mipmapFilter === 'linear';
   if (shape.float32 && filtering && !device?.features?.has?.('float32-filterable'))
     fail('SAMPLER', 'Linear float32 sampling requires float32-filterable; use nearest filters');
-  return {magFilter, minFilter, mipmapFilter, addressModeU, addressModeV,
+  return {magFilter, minFilter, mipmapFilter, addressModeU, addressModeV, ...(addressModeW ? {addressModeW} : {}),
     lodMaxClamp: useMips ? shape.mipLevelCount - 1 : 0,
     maxAnisotropy: magFilter === 'linear' && minFilter === 'linear' && mipmapFilter === 'linear' ? Math.min(16, Math.floor(texture.anisotropy)) : 1};
 }
@@ -155,13 +159,16 @@ export function createThreeStorageTextures(three, {getDevice, signal = null, max
     assertCurrent(entry);
     if (entry.native) return entry;
     const d = device(), {width, height, depth, viewDimension, mipLevelCount, format, bytes} = entry.shape;
-    if (width > d.limits.maxTextureDimension2D || height > d.limits.maxTextureDimension2D) fail('LIMIT', 'Storage texture exceeds device dimensions');
-    if (depth > (d.limits.maxTextureArrayLayers ?? 256)) fail('LIMIT', 'Storage texture exceeds device array layers');
+    const volume = viewDimension === '3d';
+    const limit = volume ? (d.limits.maxTextureDimension3D ?? 2048) : d.limits.maxTextureDimension2D;
+    if (width > limit || height > limit || (volume && depth > limit)) fail('LIMIT', 'Storage texture exceeds device dimensions');
+    if (!volume && depth > (d.limits.maxTextureArrayLayers ?? 256)) fail('LIMIT', 'Storage texture exceeds device array layers');
     if (bytes > maxBytes - allocatedBytes) fail('BUDGET', 'Storage texture allocations exceed maxBytes');
-    // All uses share this allocation. RENDER_ATTACHMENT serves GPU mip updates.
+    // All uses share this allocation. Only ordinary 2D mips need render attachments.
     checked(d => {
       entry.native = d.createTexture({label: entry.texture.name || 'f3d-storage-texture',
-        size: [width, height, depth], dimension: '2d', mipLevelCount, sampleCount: 1, format, usage: 1 | 2 | 4 | 8 | 16});
+        size: [width, height, depth], dimension: volume ? '3d' : '2d', mipLevelCount, sampleCount: 1, format,
+        usage: 1 | 2 | 4 | 8 | (viewDimension === '2d' ? 16 : 0)});
       allocatedBytes += bytes; entry.charged = bytes;
       entry.view = entry.native.createView(viewDimension === '2d' ? {} : {dimension: viewDimension});
     });
@@ -186,8 +193,9 @@ export function createThreeStorageTextures(three, {getDevice, signal = null, max
   }
   function refreshMips(entry) {
     if (!entry.mipsDirty || entry.shape.mipLevelCount === 1) return;
-    if (entry.shape.viewDimension === '2d-array') {
-      checked(d => submitStorageArrayMips(d, entry.native, entry.shape, mipPipelines));
+    if (entry.shape.viewDimension !== '2d') {
+      const submit = entry.shape.viewDimension === '3d' ? submitStorageVolumeMips : submitStorageArrayMips;
+      checked(d => submit(d, entry.native, entry.shape, mipPipelines));
       entry.mipsDirty = false; return;
     }
     checked(d => {

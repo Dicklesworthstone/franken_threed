@@ -1,0 +1,92 @@
+<!DOCTYPE html><html lang="en"><meta charset="utf-8"><title>Native storage arrays and volumes</title>
+<body><pre id="result">Running…</pre><script type="module">
+// Serve the repository root over localhost. Actual GPU kernels and readback,
+// using minimal source texture objects: not a full r186 TSL/facade parity test.
+import {createThreeStorageTextures} from '../../../tools/ingest/three_storage_textures.mjs';
+import {THREE} from '../../unit/storage_texture_fixture.mjs';
+const state = window.__f3dStorageDimensions = {status: 'running', checks: [], error: null};
+let device, owner;
+function check(name, actual, expected) {
+  if (actual.length !== expected.length || actual.some((v, i) => !Number.isFinite(v) || Math.abs(v - expected[i]) > 0.0002))
+    throw new Error(`${name}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+  state.checks.push(name);
+}
+// Independent CPU trilinear reference. Array layers are categorical, not a
+// spatial axis: their z coordinate is never filtered or reduced.
+function reduce(input, size, array) {
+  const next = size.map((v, i) => array && i === 2 ? v : Math.max(1, Math.floor(v / 2)));
+  const [w, h, d] = size, out = [];
+  const value = (x, y, z) => input[(Math.min(d-1, Math.max(0,z))*h + Math.min(h-1, Math.max(0,y)))*w + Math.min(w-1, Math.max(0,x))];
+  for (let z = 0; z < next[2]; z++) for (let y = 0; y < next[1]; y++) for (let x = 0; x < next[0]; x++) {
+    const p = [x, y, z].map((v, i) => array && i === 2 ? v : (v+0.5) * size[i]/next[i] - 0.5);
+    const b = p.map(Math.floor), f = p.map((v, i) => v-b[i]); let sum = 0;
+    for (let dz = 0; dz < 2; dz++) for (let dy = 0; dy < 2; dy++) for (let dx = 0; dx < 2; dx++)
+      sum += value(b[0]+dx,b[1]+dy,b[2]+dz) * (dx ? f[0] : 1-f[0]) * (dy ? f[1] : 1-f[1]) * (dz ? f[2] : 1-f[2]);
+    out.push(sum);
+  }
+  return {data: out, size: next};
+}
+async function read(texture, level, size) {
+  const [w,h,d] = size, stride = Math.ceil(w * 4 / 256) * 256;
+  const buffer = device.createBuffer({size: stride*h*d, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST});
+  try {
+    const encoder = device.createCommandEncoder();
+    encoder.copyTextureToBuffer({texture, mipLevel: level}, {buffer, bytesPerRow: stride, rowsPerImage: h}, size);
+    device.queue.submit([encoder.finish()]);
+    await buffer.mapAsync(GPUMapMode.READ);
+    const data = new Float32Array(buffer.getMappedRange()), out = [];
+    for (let z=0;z<d;z++) for(let y=0;y<h;y++) for(let x=0;x<w;x++) out.push(data[(z*h+y)*stride/4+x]);
+    return out;
+  } finally { buffer.unmap(); buffer.destroy(); }
+}
+try {
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) throw new Error('No WebGPU adapter');
+  device = await adapter.requestDevice();
+  state.adapter = adapter.info ? {vendor: adapter.info.vendor, architecture: adapter.info.architecture, device: adapter.info.device} : null;
+  owner = createThreeStorageTextures(THREE, {getDevice: () => device});
+  device.pushErrorScope('validation');
+  for (const array of [true, false]) for (const size of [[7,3,5], [1,1,9], [4,4,1]]) {
+    const [width,height,depth] = size, name = `${array ? 'array' : 'volume'} ${size.join('x')}`;
+    const texture = new THREE.Texture(width,height);
+    Object.assign(texture, {isArrayTexture: array, is3DTexture: !array, wrapR: THREE.ClampToEdgeWrapping,
+      type: THREE.FloatType, format: THREE.RedFormat, minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter, mipmapsAutoUpdate: true});
+    texture.image.depth = depth;
+    const output = owner.captureBinding({texture, isSampledTexture: true, store: true, access: 'writeOnly'});
+    const view = owner.resolve(output), native = output.entry.native;
+    const module = device.createShaderModule({code: `
+      @group(0) @binding(0) var target: texture_storage_${array ? '2d_array' : '3d'}<r32float, write>;
+      @compute @workgroup_size(4,4,4) fn main(@builtin(global_invocation_id) id: vec3u) {
+        let size = textureDimensions(target);
+        if (${array ? 'any(id.xy >= size) || id.z >= textureNumLayers(target)' : 'any(id >= size)'}) { return; }
+        let v = f32(id.x) + 10.0*f32(id.y) + 100.0*f32(id.z);
+        textureStore(target, ${array ? 'vec2i(id.xy), i32(id.z)' : 'vec3i(id)'}, vec4f(v,0,0,1));
+      }`});
+    const info = await module.getCompilationInfo();
+    if (info.messages.some(m => m.type === 'error')) throw new Error(info.messages.map(m => m.message).join('\n'));
+    const pipeline = device.createComputePipeline({layout: 'auto', compute: {module, entryPoint: 'main'}});
+    const group = device.createBindGroup({layout: pipeline.getBindGroupLayout(0), entries: [{binding: 0, resource: view}]});
+    const encoder = device.createCommandEncoder(), pass = encoder.beginComputePass();
+    pass.setPipeline(pipeline); pass.setBindGroup(0, group); pass.dispatchWorkgroups(...size.map(v => Math.ceil(v/4))); pass.end();
+    device.queue.submit([encoder.finish()]);
+    owner.written([output]);
+    let expected = {data: Array.from({length: width*height*depth}, (_, i) => i%width + 10*(Math.floor(i/width)%height) + 100*Math.floor(i/(width*height))), size};
+    for (let level = 0; level < output.entry.shape.mipLevelCount; level++) {
+      check(`${name} level ${level}`, await read(native, level, expected.size), expected.data);
+      expected = reduce(expected.data, expected.size, array);
+    }
+    const binding = owner.bindingsFor().get(texture);
+    if (binding.viewDimension !== (array ? '2d-array' : '3d')) throw new Error(`${name}: incorrect sampler dimension`);
+    texture.dispose();
+  }
+  await owner.whenIdle();
+  const validation = await device.popErrorScope();
+  if (validation) throw new Error(validation.message);
+  state.status = 'pass';
+} catch (error) {
+  state.status = 'fail'; state.error = error.stack ?? String(error);
+} finally {
+  owner?.dispose(); device?.destroy();
+  document.querySelector('#result').textContent = JSON.stringify(state, null, 2);
+}
+</script></body></html>

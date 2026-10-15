@@ -1,0 +1,76 @@
+<!DOCTYPE html><html lang="en"><meta charset="utf-8"><title>TSL storage arrays and volumes</title>
+<body><canvas width="16" height="16"></canvas><pre id="result">Running…</pre>
+<script type="importmap">{"imports":{"three":"../../../upstream/three.js/build/three.webgpu.js","three/webgpu":"../../../upstream/three.js/build/three.webgpu.js","three/tsl":"../../../upstream/three.js/build/three.tsl.js"}}</script>
+<script type="module">
+import * as THREE from 'three/webgpu';
+import {Fn, storage, storageTexture, textureStore, textureLoad, texture3DLoad, instanceIndex, uvec2, uvec3, vec4} from 'three/tsl';
+const state = window.__f3dStorageDimensions = {status: 'running', checks: [], error: null};
+const owned = [], own = resource => { owned.push(resource); return resource; };
+let renderer, field;
+function check(name, actual, expected) {
+  if (actual.length !== expected.length || actual.some((v, i) => !Number.isFinite(v) || Math.abs(v - expected[i]) > 0.0002))
+    throw new Error(`${name}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+  state.checks.push(name);
+}
+try {
+  renderer = new THREE.WebGPURenderer({canvas: document.querySelector('canvas')});
+  if (!renderer.isF3DRenderer) throw new Error('Build with --route-webgpu-renderer; retained renderer submission cannot pass');
+  await renderer.init();
+  const width = 7, height = 3, depth = 5, count = width * height * depth;
+  for (const array of [true, false]) {
+    const image = own(array ? new THREE.StorageArrayTexture(width, height, depth) : new THREE.Storage3DTexture(width, height, depth));
+    image.type = THREE.FloatType; image.format = THREE.RedFormat;
+    image.minFilter = image.magFilter = THREE.NearestFilter;
+    image.generateMipmaps = true; image.mipmapsAutoUpdate = true;
+    const produce = own(Fn(() => {
+      const x = instanceIndex.mod(width), y = instanceIndex.div(width).mod(height), z = instanceIndex.div(width * height);
+      const value = vec4(instanceIndex.toFloat().add(0.25), 0, 0, 1);
+      if (array) textureStore(storageTexture(image).depth(z), uvec2(x, y), value).toWriteOnly();
+      else textureStore(image, uvec3(x, y, z), value).toWriteOnly();
+    })().compute(count, [8]));
+    await renderer.compileComputeAsync(produce);
+    renderer.compute(produce);
+    // Base level preserves each layer/slice; last mip distinguishes categorical
+    // array layers from spatial volume depth and exercises generated GPU mips.
+    for (const level of [0, 2]) {
+      const w = Math.max(1, width >> level), h = Math.max(1, height >> level), d = array ? depth : Math.max(1, depth >> level);
+      const result = new THREE.StorageBufferAttribute(new Float32Array(w*h*d), 1);
+      const values = storage(result, 'float', result.count);
+      const consume = own(Fn(() => {
+        const x = instanceIndex.mod(w), y = instanceIndex.div(w).mod(h), z = instanceIndex.div(w*h);
+        const texel = array ? textureLoad(image, uvec2(x,y), level).depth(z) : texture3DLoad(image, uvec3(x,y,z), level);
+        values.element(instanceIndex).assign(texel.r);
+      })().compute(result.count, [8]));
+      renderer.compute(consume);
+      const actual = Array.from(new Float32Array(await renderer.getArrayBufferAsync(result)));
+      const expected = level === 0 ? Array.from({length: count}, (_, i) => i + 0.25)
+        : array ? Array.from({length: depth}, (_, z) => 10.25 + 21*z) : [52.25];
+      check(`${array ? 'array' : 'volume'} level ${level}`, actual, expected);
+    }
+    if (!array) field = image;
+  }
+  // A volume computation feeds the existing compute-owned vertex-color path.
+  // No texture download or CPU color upload occurs between producer and draw.
+  const colors = new THREE.StorageBufferAttribute(new Float32Array(12), 4);
+  const colorValues = storage(colors, 'vec4', 3);
+  const gather = own(Fn(() => {
+    colorValues.element(instanceIndex).assign(vec4(texture3DLoad(field, uvec3(0)).r, 0, 0, 1));
+  })().compute(3, [4]));
+  await renderer.compileComputeAsync(gather);
+  const geometry = own(new THREE.BufferGeometry());
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute([-1,-1,0, 3,-1,0, -1,3,0], 3));
+  geometry.setAttribute('color', colors);
+  const material = own(new THREE.MeshBasicMaterial({vertexColors: true, side: THREE.DoubleSide}));
+  const scene = new THREE.Scene(), mesh = new THREE.Mesh(geometry, material); mesh.frustumCulled = false; scene.add(mesh);
+  const camera = new THREE.OrthographicCamera(-1,1,1,-1,0.1,10); camera.position.z = 1;
+  const target = own(new THREE.RenderTarget(8,8,{depthBuffer: false})); renderer.setRenderTarget(target);
+  await renderer.compileAsync(scene, camera);
+  renderer.compute(gather); await renderer.renderAsync(scene, camera);
+  check('volume-to-vertex-color-to-render-target', Array.from(await renderer.readRenderTargetPixelsAsync(target,4,4,1,1)), [64,0,0,255]);
+  await renderer.waitForGPU(); state.status = 'pass';
+} catch (error) { state.status = 'fail'; state.error = error.stack ?? String(error); }
+finally {
+  for (const resource of owned) resource.dispose(); renderer?.dispose();
+  document.querySelector('#result').textContent = JSON.stringify(state, null, 2);
+}
+</script></body></html>
