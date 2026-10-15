@@ -6,7 +6,8 @@
 // scene-facade/TSL parity test and it is not a benchmark.
 import {createGpuCompute} from '../../../tools/ingest/gpu_compute.mjs';
 import {createGpuBufferGeometry, bufferGeometrySnapshot, createGpuInstanceAttributes,
-  instanceAttributesSnapshot} from '../../../tools/ingest/gpu_buffer_geometry.mjs';
+  instanceAttributesSnapshot, createGpuProgramGeometry, programGeometrySnapshot} from '../../../tools/ingest/gpu_buffer_geometry.mjs';
+import {createProgramMeshes} from '../../../tools/ingest/animation_program_mesh.mjs';
 const state = window.__f3dNativeGeometry = {status:'running', checks:[], error:null};
 const owned = [], own = resource => { owned.push(resource); return resource; };
 function check(name, condition) { if (!condition) throw new Error(name); state.checks.push(name); }
@@ -98,6 +99,68 @@ try {
   draw(instancePipeline,[bufferGeometrySnapshot(geometry,device),instanceAttributesSnapshot(instances,device)],2);
   check('GPU-written instance matrix renders its GPU-resident green color',JSON.stringify(await pixel())==='[0,255,0,255]');
   check('source CPU instance matrix remains unchanged',matrix.array[12]===4);
+
+  // Exercise compute -> reflected integer geometry -> production program staging.
+  // Smooth strips use native fixed-index restart; lists still need GPU lowering.
+  const ids=Object.assign(attr(new Uint32Array([99,99]),1),{gpuType:1013});
+  const signed=Object.assign(attr(new Int32Array([99,99]),1),{gpuType:1013});
+  const index=attr(new Uint32Array([0,0]),1);
+  const idBuffer=compute.upload(ids,ids.array,0), signedBuffer=compute.upload(signed,signed.array,0);
+  const indexBuffer=compute.upload(index,index.array,0);
+  const integerGeometry=own(createGpuProgramGeometry(device,
+    {attributes:{id:ids,signed},index,morphAttributes:{},drawRange:{start:0,count:Infinity}},
+    [{name:'id',scalar:'uint',components:1,location:0,locations:1},
+      {name:'signed',scalar:'int',components:1,location:1,locations:1}]));
+  function scoped(d,run) {
+    d.pushErrorScope('validation'); let value,error;
+    try { value=run(); } catch(e) { error=e; }
+    const errors=d.popErrorScope().then(e=>{if(e)throw new Error(e.message);});
+    return {value,error,errors};
+  }
+  const meshes=own(createProgramMeshes({device,format:'rgba8unorm',depthFormat:null,sampleCount:1,
+    maxDraws:2,label:'native-shared-index',lost:device.lost,scoped,
+    fail(code,message){throw new Error(`${code}: ${message}`);}}));
+  const record=await meshes.add(integerGeometry,{topology:'line-strip',stripIndexFormat:'uint32',
+    raster:{blend:null,frontFace:'ccw',cullMode:'none',writeMask:15},program:{
+      vertex:`@vertex fn f3d_vertex(@location(0) id:u32,@location(1) signed:i32) -> @builtin(position) vec4f {
+        if (id < 1u || id > 2u || signed != -1) { return vec4f(4,4,0,1); }
+        return vec4f(select(-0.75,0.75,id==2u),-0.125,0,1);
+      }`,fragment:'@fragment fn f3d_fragment() -> @location(0) vec4f { return vec4f(1,0,0,1); }',
+      reflection:{uniformBufferSize:16,textures:[],outputs:[{location:0}],varyings:[]}}});
+  async function drawIntegerStrip() {
+    meshes.begin(); const command={};
+    meshes.stage(record,{programUniforms:new Uint8Array(16)},command); meshes.write();
+    check('program staging retains the compute-owned index allocation',command.indexBuffer===indexBuffer);
+    const issued=scoped(device,()=>{
+      const encoder=device.createCommandEncoder();
+      const pass=encoder.beginRenderPass({colorAttachments:[{view:target.createView(),loadOp:'clear',storeOp:'store',clearValue:[0,0,0,1]}]});
+      pass.setPipeline(command.pipeline); pass.setBindGroup(0,command.program.group,[command.program.offset]);
+      command.vertexBuffers.forEach((buffer,slot)=>pass.setVertexBuffer(slot,buffer));
+      pass.setIndexBuffer(command.indexBuffer,command.indexFormat); pass.drawIndexed(command.count);
+      pass.end(); device.queue.submit([encoder.finish()]);
+    });
+    await issued.errors; if(issued.error)throw issued.error;
+    return pixel();
+  }
+  check('uncomputed integer/index data draws no center pixel',JSON.stringify(await drawIntegerStrip())==='[0,0,0,255]');
+  const writeIntegers=await compute.prepare({code:`
+    @group(0) @binding(0) var<storage,read_write> ids:array<u32>;
+    @group(0) @binding(1) var<storage,read_write> signed:array<i32>;
+    @group(0) @binding(2) var<storage,read_write> indices:array<u32>;
+    @compute @workgroup_size(1) fn main(@builtin(global_invocation_id) id:vec3u) {
+      ids[id.x]=id.x+1u; signed[id.x]=-1; indices[id.x]=id.x;
+    }
+  `});
+  compute.dispatch(writeIntegers,[{index:0,entries:[{binding:0,resource:{buffer:idBuffer}},
+    {binding:1,resource:{buffer:signedBuffer}},{binding:2,resource:{buffer:indexBuffer}}]}],[2]);
+  integerGeometry.update();
+  check('GPU-written indices and signed/unsigned vertex streams rasterize through program staging',
+    JSON.stringify(await drawIntegerStrip())==='[255,0,0,255]');
+  check('integer and index CPU arrays remain unchanged',ids.array[0]===99 && signed.array[0]===99 && index.array[1]===0);
+  check('integer/index geometry owns no duplicate storage or CPU topology shadow',
+    integerGeometry.bufferBytes===0 && integerGeometry.shadowBytes===0 && integerGeometry.diagnostics.uploads===0 &&
+    programGeometrySnapshot(integerGeometry,device).readIndex===null);
+  await integerGeometry.whenIdle();
   await compute.whenIdle(); await geometry.whenIdle(); await instances.whenIdle();
   check('geometry did not perform any vertex or instance uploads',geometry.diagnostics.uploads===0 && instances.diagnostics.uploads===0);
   state.status='pass';

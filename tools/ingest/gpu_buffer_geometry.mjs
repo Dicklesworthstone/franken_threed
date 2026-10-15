@@ -141,15 +141,22 @@ function describe(geometry, device) {
   const index = geometry.index ?? null;
   let indexOwner = null, indexFormat = null, indexCount = 0;
   if (index) {
-    if (isComputeAttribute(index)) fail('SHAPE', 'Compute-authored indices require GPU topology handling, not CPU index shadows');
     if (index.isInterleavedBufferAttribute || index.itemSize !== 1 || index.normalized) fail('SHAPE', 'Expected scalar non-interleaved indices');
     indexOwner = index;
     const source = sourceArray(index);
-    if (!(source.kind instanceof Uint16Array) && !(source.kind instanceof Uint32Array)) fail('FORMAT', 'Indices require Uint16Array or Uint32Array');
-    indexFormat = source.kind instanceof Uint16Array ? 'uint16' : 'uint32';
-    indexCount = integer(index.count, 0, source.length, 'index count');
-    if (owners.has(index)) fail('SHAPE', 'Index and vertex source identities must be distinct');
-    owners.set(index, {owner: index, array: source.array, source, stride: 0, attributes: [], requiredBytes: indexCount * source.kind.BYTES_PER_ELEMENT, conversion: null});
+    const borrowed = isComputeAttribute(index) ? computeAttributeSnapshot(device, index, {index: true}) : null;
+    if (borrowed) {
+      indexFormat = borrowed.indexFormat; indexCount = integer(index.count, 0, borrowed.count, 'index count');
+      if (owners.has(index)) fail('SHAPE', 'Index and vertex source identities must be distinct');
+      owners.set(index, {owner: index, array: source.array, source, stride: 0, attributes: [],
+        requiredBytes: indexCount * 4, conversion: null, borrowed});
+    } else {
+      if (!(source.kind instanceof Uint16Array) && !(source.kind instanceof Uint32Array)) fail('FORMAT', 'Indices require Uint16Array or Uint32Array');
+      indexFormat = source.kind instanceof Uint16Array ? 'uint16' : 'uint32';
+      indexCount = integer(index.count, 0, source.length, 'index count');
+      if (owners.has(index)) fail('SHAPE', 'Index and vertex source identities must be distinct');
+      owners.set(index, {owner: index, array: source.array, source, stride: 0, attributes: [], requiredBytes: indexCount * source.kind.BYTES_PER_ELEMENT, conversion: null});
+    }
   }
   const streams = [...owners.values()].filter(e => e.stride !== 0);
   // Stable layouts do not depend on object ids, buffer generations or insertion
@@ -378,7 +385,7 @@ function createResidency(device, geometry, {
       // array. No mutable shadow view escapes. Revisions advance on actual writes,
       // including writes followed by a throwing upload callback.
       const Index = shape.indexFormat === 'uint16' ? Uint16Array : Uint32Array;
-      const indexData = indexRecord ? new Index(indexRecord.shadow.buffer, 0, indexRecord.logicalBytes / Index.BYTES_PER_ELEMENT) : null;
+      const indexData = indexRecord && !indexRecord.borrowed ? new Index(indexRecord.shadow.buffer, 0, indexRecord.logicalBytes / Index.BYTES_PER_ELEMENT) : null;
       const shared = [...shape.owners.values()].flatMap(entry => entry.borrowed ? [entry.borrowed] : []);
       // A CPU upload callback may have retired an earlier shared stream.
       for (const borrowed of shared) borrowed.assertCurrent();
@@ -474,18 +481,20 @@ function describeProgram(program) {
         continue;
       }
       const owner = ownerOf(attribute), source = sourceArray(owner), array = source.array;
-      const borrowed = isComputeAttribute(owner) ? computeAttributeSnapshot(device, owner) : null;
       // r186 WebGLBindingStates: gpuType IntType -> vertexAttribIPointer, else
       // vertexAttribPointer. A mismatch with the shader input type is a GL error
       // or undefined value there, so it is explicit here.
       const intType = attribute.gpuType === INT_TYPE;
       if (integerInput !== intType) fail('FORMAT', integerInput ? `Integer attribute ${a.name} needs gpuType IntType` : `Attribute ${a.name} has gpuType IntType but the program reads floats`);
       if (intType && (attribute.normalized === true || attribute.isFloat16BufferAttribute === true)) fail('FORMAT', `Integer attribute ${a.name} cannot be normalized or half-float`);
-      const conversion = intType ? integerConversionOf(source.kind, a.scalar) : conversionOf(source.kind, attribute.normalized === true, attribute.isFloat16BufferAttribute === true);
+      const borrowed = isComputeAttribute(owner) ? computeAttributeSnapshot(device, owner, {integer: intType}) : null;
+      const conversion = borrowed ? null : intType ? integerConversionOf(source.kind, a.scalar) : conversionOf(source.kind, attribute.normalized === true, attribute.isFloat16BufferAttribute === true);
       const perInstance = attribute.isInstancedBufferAttribute === true || owner.isInstancedInterleavedBuffer === true;
       const divisor = perInstance ? integer(owner.meshPerAttribute ?? attribute.meshPerAttribute, 1, 0xffffffff, 'meshPerAttribute') : 1;
       const itemSize = integer(attribute.itemSize, 1, 16, 'item size');
-      if (borrowed && (intType || divisor !== 1)) fail('FORMAT', 'Shared program attributes require Float32 data and instance divisor one');
+      if (borrowed && divisor !== 1) fail('FORMAT', 'Shared program attributes require instance divisor one');
+      if (borrowed && intType && ((a.scalar === 'uint' && borrowed.scalar !== Uint32Array) || (a.scalar === 'int' && borrowed.scalar !== Int32Array)))
+        fail('FORMAT', `Shared integer attribute ${a.name} storage signedness must match its shader input`);
       const columns = a.locations, width = a.locations > 1 || borrowed ? a.components : Math.min(itemSize, 4);
       if (borrowed && (!Number.isSafeInteger(width) || width < 1 || width > 4 || width > itemSize)) fail('SHAPE', 'Program input exceeds the shared attribute width');
       if (columns > 1 && itemSize !== columns * a.components) fail('SHAPE', `Matrix attribute ${a.name} needs itemSize ${columns * a.components}`);
@@ -508,14 +517,19 @@ function describeProgram(program) {
     const index = geometry.index ?? null;
     let indexOwner = null, indexFormat = null, indexCount = 0;
     if (index) {
-      if (isComputeAttribute(index)) fail('SHAPE', 'Compute-authored indices require GPU topology handling, not CPU index shadows');
       if (index.isInterleavedBufferAttribute || index.itemSize !== 1 || index.normalized) fail('SHAPE', 'Expected scalar non-interleaved indices');
-      const source = sourceArray(index);
-      if (!(source.kind instanceof Uint16Array) && !(source.kind instanceof Uint32Array)) fail('FORMAT', 'Indices require Uint16Array or Uint32Array');
-      indexOwner = index; indexFormat = source.kind instanceof Uint16Array ? 'uint16' : 'uint32';
-      indexCount = integer(index.count, 0, source.length, 'index count');
-      if (owners.has(index)) fail('SHAPE', 'Index and vertex source identities must be distinct');
-      owners.set(index, {owner: index, array: source.array, source, stride: 0, attributes: [], requiredBytes: indexCount * source.kind.BYTES_PER_ELEMENT, conversion: null});
+      const source = sourceArray(index), borrowed = isComputeAttribute(index) ? computeAttributeSnapshot(device, index, {index: true}) : null;
+      if (borrowed) {
+        indexOwner = index; indexFormat = borrowed.indexFormat; indexCount = integer(index.count, 0, borrowed.count, 'index count');
+        if (owners.has(index)) fail('SHAPE', 'Index and vertex source identities must be distinct');
+        owners.set(index, {owner: index, array: source.array, source, stride: 0, attributes: [], requiredBytes: indexCount * 4, conversion: null, borrowed});
+      } else {
+        if (!(source.kind instanceof Uint16Array) && !(source.kind instanceof Uint32Array)) fail('FORMAT', 'Indices require Uint16Array or Uint32Array');
+        indexOwner = index; indexFormat = source.kind instanceof Uint16Array ? 'uint16' : 'uint32';
+        indexCount = integer(index.count, 0, source.length, 'index count');
+        if (owners.has(index)) fail('SHAPE', 'Index and vertex source identities must be distinct');
+        owners.set(index, {owner: index, array: source.array, source, stride: 0, attributes: [], requiredBytes: indexCount * source.kind.BYTES_PER_ELEMENT, conversion: null});
+      }
     }
     const streams = [...owners.values()].filter(e => e.stride !== 0);
     streams.sort((x, y) => Math.min(...x.attributes.map(v => v.shaderLocation)) - Math.min(...y.attributes.map(v => v.shaderLocation)));

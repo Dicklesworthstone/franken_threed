@@ -171,10 +171,18 @@ test('geometry completion includes compute validation and cancellation', async (
   await assert.rejects(idle, /DISPOSED/); assert.equal(handle.failed, true); handle.dispose();
 });
 
-test('compute-authored indices and non-float vertices fail instead of using stale CPU shadows', () => {
+test('compute indices borrow storage while ordinary non-float vertices still fail', () => {
   const device = gpuDevice(), compute = createGpuCompute(device), position = source(), index = attribute(new Uint32Array([0,1,2]),1);
   upload(compute, position); upload(compute, index);
-  assert.throws(() => createGpuBufferGeometry(device, geometry({position}, index)), /topology/);
+  const before = device.events.length;
+  const handle = createGpuBufferGeometry(device, geometry({position}, index));
+  const snapshot = bufferGeometrySnapshot(handle, device);
+  assert.equal(snapshot.indexBuffer, compute.getBuffer(index));
+  assert.equal(snapshot.readIndex, null);
+  assert.equal(handle.bufferBytes, 0);
+  assert.equal(handle.shadowBytes, 0);
+  assert.equal(device.events.length, before);
+  handle.dispose();
   const integerPosition = attribute(new Uint32Array(12),4); upload(compute, integerPosition);
   assert.throws(() => createGpuBufferGeometry(device, geometry({position:integerPosition})), /FORMAT/); compute.dispose();
 });

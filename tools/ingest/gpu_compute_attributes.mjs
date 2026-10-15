@@ -2,7 +2,8 @@
  * identifies one published allocation per device. Geometry only borrows it:
  * no readback, CPU upload, duplicate allocation or ownership transfer occurs.
  * Publication is after compute upload (including compileComputeAsync). Native
- * buffer usages must include VERTEX as well as STORAGE from creation onward. */
+ * buffer usages must include VERTEX as well as STORAGE from creation onward;
+ * index borrowers additionally require INDEX usage. */
 const devices = new WeakMap();
 export class ComputeAttributeError extends Error {
   constructor(code, message) {
@@ -23,7 +24,7 @@ export function createComputeAttributeOwner(device) {
     if (table.get(attribute)?.identity === identity) table.delete(attribute);
     owned.delete(attribute);
   }
-  function admit(attribute, array) {
+  function admit(attribute, array, version = attribute?.version) {
       if (!isComputeAttribute(attribute)) return;
       if (disposed) fail('DISPOSED', 'Compute attribute owner is disposed');
       const existing = table.get(attribute);
@@ -33,12 +34,14 @@ export function createComputeAttributeOwner(device) {
       if (!Number.isSafeInteger(stride) || stride < 1 || !Number.isSafeInteger(count) || count < 1 ||
           stride * count !== array.length || array.BYTES_PER_ELEMENT !== 4)
         fail('SHAPE', 'Publish the normalized 32-bit storage layout before vertex use');
+      if (!Number.isSafeInteger(version) || version < 0 || version !== attribute.version)
+        fail('PUBLICATION', 'Compute upload must acknowledge the current source version');
   }
   return {
     admit,
     publish(attribute, buffer, array, version, live, whenIdle) {
       if (!isComputeAttribute(attribute)) return;
-      admit(attribute, array);
+      admit(attribute, array, version);
       // A borrowed GPU allocation must actually support vertex fetch. Reject
       // malformed or foreign publications before they become visible to draws.
       const stride = attribute.itemSize, count = attribute.count;
@@ -61,7 +64,7 @@ export function createComputeAttributeOwner(device) {
  * needsUpdate remains a compute upload request: execute/precompile that kernel
  * before drawing a newer host version. Never upload stale CPU simulation state
  * from the geometry owner, and never infer current GPU bounds from that array. */
-export function computeAttributeSnapshot(device, attribute) {
+export function computeAttributeSnapshot(device, attribute, {index = false, integer = false} = {}) {
   const table = devices.get(device), entry = table?.get(attribute);
   if (!isComputeAttribute(attribute) || !entry)
     fail('UNPREPARED', 'Compute or compileComputeAsync must upload this storage attribute on the drawing device first');
@@ -79,7 +82,15 @@ export function computeAttributeSnapshot(device, attribute) {
       fail('UNPREPARED', 'Submit the pending storage attribute version through compute before drawing');
   }
   assertCurrent();
-  if (entry.scalar !== Float32Array) fail('FORMAT', 'Shared ordinary vertex and instance streams require Float32 storage');
+  if (index && integer) fail('FORMAT', 'Index and integer-vertex modes are distinct');
+  if (index) {
+    if (entry.scalar !== Uint32Array || entry.stride !== 1)
+      fail('FORMAT', 'Shared index streams require scalar Uint32 storage');
+    if ((entry.buffer.usage & 16) !== 16) fail('FORMAT', 'Shared index storage requires INDEX buffer usage');
+  } else if (integer) {
+    if (entry.scalar !== Int32Array && entry.scalar !== Uint32Array)
+      fail('FORMAT', 'Shared integer vertex streams require Int32 or Uint32 storage');
+  } else if (entry.scalar !== Float32Array) fail('FORMAT', 'Shared ordinary vertex and instance streams require Float32 storage');
   return Object.freeze({buffer: entry.buffer, arrayStride: entry.stride * 4, count: entry.count,
-    byteLength: entry.byteLength, assertCurrent, whenIdle: entry.whenIdle});
+    byteLength: entry.byteLength, scalar: entry.scalar, indexFormat: index ? 'uint32' : null, assertCurrent, whenIdle: entry.whenIdle});
 }

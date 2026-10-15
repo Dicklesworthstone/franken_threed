@@ -12,7 +12,7 @@ export class GpuComputeError extends Error {
 }
 const fail = (code, message) => { throw new GpuComputeError(code, message); };
 // WebGPU constants are also usable in command-recording Node tests.
-const COPY_SRC = 4, COPY_DST = 8, VERTEX = 32, UNIFORM = 64, STORAGE = 128, INDIRECT = 256, MAP_READ = 1;
+const COPY_SRC = 4, COPY_DST = 8, INDEX = 16, VERTEX = 32, UNIFORM = 64, STORAGE = 128, INDIRECT = 256, MAP_READ = 1;
 const positive = n => Number.isSafeInteger(n) && n > 0;
 
 export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffers = 1024,
@@ -72,7 +72,7 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
     live();
     if (!key || !['object', 'function'].includes(typeof key) || !ArrayBuffer.isView(array) || array instanceof DataView)
       fail('BUFFER', 'Expected an identity key and typed array');
-    if (!uniform) attributeOwner.admit(key, array);
+    if (!uniform) attributeOwner.admit(key, array, version);
     const bytes = array.byteLength, size = Math.max(4, Math.ceil(bytes / 4) * 4);
     const limit = uniform ? device.limits?.maxUniformBufferBindingSize : device.limits?.maxStorageBufferBindingSize;
     if (size > (device.limits?.maxBufferSize ?? Infinity) || size > (limit ?? Infinity))
@@ -94,7 +94,7 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
       // Charge both generations until the replacement is successfully created.
       budget(size);
       const buffer = checked(() => device.createBuffer({label: 'f3d-compute-buffer', size,
-        usage: COPY_SRC | COPY_DST | (uniform ? UNIFORM : STORAGE | INDIRECT | VERTEX)}));
+        usage: COPY_SRC | COPY_DST | (uniform ? UNIFORM : STORAGE | INDIRECT | INDEX | VERTEX)}));
       entry = {buffer, size, bytes, uniform, array: null, version: null};
       allocatedBytes += size; buffers.set(key, entry);
       if (old) { old.buffer.destroy(); allocatedBytes -= old.size; }
