@@ -38,6 +38,7 @@ import {createThreeProgramSupport} from './three_program.mjs';
 import {createThreeProgramPMREM} from './three_program_pmrem.mjs';
 import {createThreeProgramShadows} from './three_program_shadows.mjs';
 import {createThreeProgramTransmission} from './three_program_transmission.mjs';
+import {withThreeCompute} from './three_compute.mjs';
 // r186 src/renderers/webgpu/utils/WebGPUConstants.js GPUFeatureName values.
 const R186_GPU_FEATURES = ['core-features-and-limits', 'depth-clip-control', 'depth32float-stencil8', 'texture-compression-bc',
   'texture-compression-bc-sliced-3d', 'texture-compression-etc2', 'texture-compression-astc', 'texture-compression-astc-sliced-3d',
@@ -811,7 +812,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       else this._drain.finally(() => this._release()).catch(() => {});
     }
   }
-  return WebGPURenderer;
+  return withThreeCompute(WebGPURenderer, THREE);
 }
 
 const WEBGL_PARAMETERS = new Set(['canvas', 'context', 'depth', 'stencil', 'alpha', 'antialias', 'premultipliedAlpha',
