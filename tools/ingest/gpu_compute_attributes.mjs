@@ -39,7 +39,15 @@ export function createComputeAttributeOwner(device) {
     publish(attribute, buffer, array, version, live, whenIdle) {
       if (!isComputeAttribute(attribute)) return;
       admit(attribute, array);
+      // A borrowed GPU allocation must actually support vertex fetch. Reject
+      // malformed or foreign publications before they become visible to draws.
       const stride = attribute.itemSize, count = attribute.count;
+      const required = array.byteLength;
+      if (!buffer || !Number.isSafeInteger(buffer.size) || buffer.size < required ||
+          !Number.isSafeInteger(buffer.usage) || (buffer.usage & (128 | 32)) !== (128 | 32) ||
+          typeof live !== 'function' || typeof whenIdle !== 'function' ||
+          !Number.isSafeInteger(version) || version < 0 || version !== attribute.version)
+        fail('PUBLICATION', 'Shared vertex storage needs a live, sufficiently sized STORAGE|VERTEX buffer at the current source version');
       table.set(attribute, {identity, buffer, stride, count, version, scalar: array.constructor,
         byteLength: array.byteLength, live, whenIdle});
       owned.add(attribute);
