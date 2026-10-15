@@ -112,11 +112,27 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
     if (!entry) return;
     buffers.delete(key); entry.buffer.destroy(); allocatedBytes -= entry.size;
   }
-  function prepare({code, entryPoint = 'main', label = 'f3d-compute'} = {}) {
+  // Explicit layouts are necessary for unfilterable float32 textureLoad inputs:
+  // automatic layouts infer sampleType:float even when no sampler is used.
+  // Snapshot descriptors before yielding and include them in the pipeline key.
+  function captureLayouts(layouts) {
+    if (layouts === null) return null;
+    if (!Array.isArray(layouts) || layouts.length > (device.limits?.maxBindGroups ?? 4) ||
+        layouts.some(group => !group || !Array.isArray(group.entries)))
+      fail('LAYOUT', 'Expected bounded bind group layout descriptors');
+    return structuredClone(layouts);
+  }
+  function pipelineLayout(layouts) {
+    return layouts === null ? 'auto' : device.createPipelineLayout({
+      bindGroupLayouts: layouts.map(group => device.createBindGroupLayout(group)),
+    });
+  }
+  function prepare({code, entryPoint = 'main', label = 'f3d-compute', bindGroupLayouts = null} = {}) {
     live();
     if (typeof code !== 'string' || !code.trim() || typeof entryPoint !== 'string' || !entryPoint)
       fail('SHADER', 'Expected WGSL source and an entry point');
-    const key = JSON.stringify([code, entryPoint]);
+    const layouts = captureLayouts(bindGroupLayouts);
+    const key = JSON.stringify([code, entryPoint, layouts]);
     if (pipelines.has(key)) return pipelines.get(key);
     if (pipelines.size >= maxPipelines) fail('BUDGET', 'Compute pipeline count exceeds maxPipelines');
     const run = (async () => {
@@ -127,7 +143,7 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
         if (errors.length) fail('SHADER', errors.map(e => `${e.lineNum}:${e.linePos} ${e.message}`).join('\n'));
       }
       live();
-      const descriptor = {label, layout: 'auto', compute: {module, entryPoint}};
+      const descriptor = {label, layout: checked(() => pipelineLayout(layouts)), compute: {module, entryPoint}};
       const pipeline = await interrupted(checked(() => device.createComputePipelineAsync
         ? device.createComputePipelineAsync(descriptor) : device.createComputePipeline(descriptor)));
       live(); ready.add(pipeline); compiled.set(key, pipeline); return pipeline;
@@ -139,16 +155,17 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
   /** Source renderer.compute() is synchronous after initialization. This path
    * compiles before submission; compileComputeAsync() can prewarm the same key.
    * Validation is still tracked by whenIdle(), never silently discarded. */
-  function prepareSync({code, entryPoint = 'main', label = 'f3d-compute'} = {}) {
+  function prepareSync({code, entryPoint = 'main', label = 'f3d-compute', bindGroupLayouts = null} = {}) {
     live();
     if (typeof code !== 'string' || !code.trim() || typeof entryPoint !== 'string' || !entryPoint)
       fail('SHADER', 'Expected WGSL source and an entry point');
-    const key = JSON.stringify([code, entryPoint]);
+    const layouts = captureLayouts(bindGroupLayouts);
+    const key = JSON.stringify([code, entryPoint, layouts]);
     if (compiled.has(key)) return compiled.get(key);
     if (!pipelines.has(key) && pipelines.size >= maxPipelines) fail('BUDGET', 'Compute pipeline count exceeds maxPipelines');
     const pipeline = checked(() => {
       const module = device.createShaderModule({label, code});
-      return device.createComputePipeline({label, layout: 'auto', compute: {module, entryPoint}});
+      return device.createComputePipeline({label, layout: pipelineLayout(layouts), compute: {module, entryPoint}});
     });
     ready.add(pipeline); compiled.set(key, pipeline); pipelines.set(key, Promise.resolve(pipeline));
     return pipeline;

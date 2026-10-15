@@ -4,10 +4,12 @@
  * Initialized calls capture their uniforms, storage upload versions and dispatch
  * sizes before joining the renderer FIFO. Deferred GPU submission must not turn
  * distinct application updates into repeated execution of the last state.
- * Buffer/uniform kernels can feed source render-target textures by GPU-only
- * copies. Texture-backed kernels and shared vertex streams remain unsupported. */
+ * Buffer/uniform and 2D StorageTexture kernels share native residency with
+ * scene materials. Shared vertex streams and other texture families remain
+ * unsupported on this path. */
 import {createGpuCompute} from './gpu_compute.mjs';
 import {copyComputeBufferToTarget} from './gpu_compute_texture_copy.mjs';
+import {createThreeStorageTextures, inspectThreeStorageTexture} from './three_storage_textures.mjs';
 
 export class ThreeComputeError extends Error {
   constructor(code, message) {
@@ -27,6 +29,7 @@ function createThreeCompute(renderer, three) {
   if (three.REVISION !== '186' || typeof three.WGSLNodeBuilder !== 'function' || !renderer._nodes?.nodeFrame?.updateNode)
     fail('SOURCE', 'Supply the pinned r186 three/webgpu namespace for TSL compute');
   const device = renderer._device, frame = renderer._nodes.nodeFrame;
+  const textureOwner = renderer._storageTextures;
   const gpu = createGpuCompute(device, {signal: renderer._targetLifetime.signal});
   const programs = new Map(), initialized = new Set(), listeners = new Map(), building = new Set();
   const captured = new WeakMap(), uploaded = new WeakMap(), payloads = new Set(), compiling = new Set();
@@ -125,6 +128,23 @@ function createThreeCompute(renderer, three) {
       fail('DISPATCH', 'Compute workgroup size exceeds device limits');
     return size;
   }
+  function textureBinding(binding) {
+    // NodeSampledTexture/NodeSampler update their cached .texture from .value.
+    // Select the live value even before binding.update() is called for this turn.
+    return {texture: binding.textureNode ? binding.textureNode.value : binding.texture,
+      isSampler: binding.isSampler, isSampledTexture: binding.isSampledTexture,
+      store: binding.store, access: binding.access, mipLevel: binding.mipLevel};
+  }
+  function captureTexture(binding) {
+    const selected = textureBinding(binding);
+    if (!selected.texture?.isStorageTexture) fail('BINDING', 'Texture compute currently requires a 2D StorageTexture');
+    return textureOwner.captureBinding(selected);
+  }
+  function textureSignature(groups) {
+    return JSON.stringify(groups.map(group => group.bindings.map(binding =>
+      binding.isSampledTexture || binding.isSampler
+        ? textureOwner.layout(captureTexture(binding)) : null)));
+  }
   function program(node) {
     live(); workgroupSize(node);
     if (building.has(node)) fail('REENTRY', 'A compute node cannot initialize or compile itself recursively');
@@ -133,16 +153,17 @@ function createThreeCompute(renderer, three) {
       initialize(node);
       const key = `${node.version}/${node.workgroupSize.join(',')}`;
       let entry = programs.get(node);
-      if (entry?.key === key) return entry;
+      if (entry?.key === key && entry.textureSignature === textureSignature(entry.groups)) return entry;
       const builder = new three.WGSLNodeBuilder(null, renderer);
       builder.compute = node; builder.build();
       const groups = builder.getBindings();
       for (const group of groups) for (const binding of group.bindings) {
         if (binding.isStorageBuffer) validateAttribute(binding.attribute);
-        else if (!binding.isUniformBuffer) fail('BINDING', 'TSL compute currently admits storage and uniform buffers, not texture/sampler bindings');
+        else if (binding.isSampledTexture || binding.isSampler) captureTexture(binding);
+        else if (!binding.isUniformBuffer) fail('BINDING', 'Expected storage/uniform buffers or 2D StorageTexture bindings');
       }
       forget(node);
-      entry = {key, builder, groups, uses: 0, retired: false,
+      entry = {key, builder, groups, uses: 0, retired: false, textureSignature: textureSignature(groups),
         shader: {code: builder.computeShader, label: node.name || 'f3d-tsl-compute'}};
       programs.set(node, entry); return entry;
     } finally { building.delete(node); }
@@ -176,7 +197,14 @@ function createThreeCompute(renderer, three) {
       return hold(snapshot(attribute, array, version, false, deferred, ranges));
     }
     try {
+      const textureUses = [];
       const groups = entry.groups.map((group, index) => ({index, entries: group.bindings.map((binding, slot) => {
+        if (binding.isSampledTexture || binding.isSampler) {
+          binding.update?.();
+          const texture = captureTexture(binding);
+          textureUses.push(texture);
+          return {binding: slot, texture, layout: {binding: slot, visibility: 4, ...textureOwner.layout(texture)}};
+        }
         let record;
         if (binding.isStorageBuffer) record = attributeRecord(binding.attribute);
         else {
@@ -185,8 +213,14 @@ function createThreeCompute(renderer, three) {
           record = hold(snapshot(binding, array, ++uniformVersion, true, deferred));
           binding.clearUpdateRanges?.();
         }
-        return {binding: slot, record};
+        return {binding: slot, record, layout: {binding: slot, visibility: 4,
+          buffer: {type: binding.isStorageBuffer ? (binding.access === 'readOnly' ? 'read-only-storage' : 'storage') : 'uniform'}}};
       })}));
+      if (textureSignature(entry.groups) !== entry.textureSignature)
+        fail('PREPARE', 'Texture binding layout changed during node updates; prepare the new node layout before dispatch');
+      textureOwner.validateDispatch(textureUses);
+      const shader = textureUses.length ? {...entry.shader,
+        bindGroupLayouts: groups.map(group => ({entries: group.entries.map(binding => binding.layout)}))} : entry.shader;
       const size = override ?? node.dispatchSize ?? node.count;
       let direct, indirect;
       if (size?.isIndirectStorageBufferAttribute) indirect = attributeRecord(size);
@@ -201,16 +235,21 @@ function createThreeCompute(renderer, three) {
       }
       if (direct && direct.some(n => !Number.isSafeInteger(n) || n < 0 || n > (device.limits?.maxComputeWorkgroupsPerDimension ?? 65535)))
         fail('DISPATCH', 'Workgroup counts must fit the device limits');
-      return {release, issue(dispatch = true) {
+      return {release, shader, validate: () => textureOwner.validateDispatch(textureUses), issue(dispatch = true) {
         live();
         if (listeners.get(node) !== epoch) fail('STALE', 'Compute node was disposed before its queued use');
         if (issuing) fail('REENTRY', 'Cannot submit compute from an upload callback');
+        textureOwner.validateDispatch(textureUses);
         issuing = true;
         try {
-          const bindings = groups.map(group => ({index: group.index, entries: group.entries.map(({binding, record}) =>
-            ({binding, resource: {buffer: upload(record)}}))}));
+          const bindings = groups.map(group => ({index: group.index, entries: group.entries.map(({binding, record, texture}) =>
+            ({binding, resource: texture ? textureOwner.resolve(texture) : {buffer: upload(record)}}))}));
           const dimensions = indirect ? {buffer: upload(indirect), offset: 0} : direct;
-          if (dispatch) gpu.dispatch(gpu.prepareSync(entry.shader), bindings, dimensions);
+          textureOwner.validateDispatch(textureUses);
+          if (dispatch) {
+            gpu.dispatch(gpu.prepareSync(shader), bindings, dimensions);
+            textureOwner.written(textureUses);
+          }
         } finally { issuing = false; }
       }};
     } catch (error) { release(); throw error; }
@@ -253,8 +292,8 @@ function createThreeCompute(renderer, three) {
       });
       try {
         request.issue(false);
-        await gpu.prepare(entry.shader);
-        live();
+        await gpu.prepare(request.shader);
+        live(); request.validate();
         if (programs.get(node) !== entry) fail('STALE', 'Compute node changed during asynchronous compilation');
         withFrame(node, () => update(entry, 'after'));
         if (onProgress) onProgress(typeof ProgressEvent === 'function'
@@ -274,7 +313,7 @@ function createThreeCompute(renderer, three) {
       const buffer = gpu.getBuffer(attribute);
       if (!buffer) fail('STORAGE', 'Compute must upload or produce this storage attribute before copying it');
       const task = copyComputeBufferToTarget(device, buffer, renderer._targets, destination, options,
-        {signal: renderer._targetLifetime.signal, sourceCompletion: () => gpu.whenIdle()});
+        {signal: renderer._targetLifetime.signal, sourceCompletion: () => Promise.all([gpu.whenIdle(), textureOwner.whenIdle()])});
       transfers.add(task);
       task.catch(error => { transferFailure ??= error; }).finally(() => transfers.delete(task)).catch(() => {});
       return task;
@@ -284,7 +323,11 @@ function createThreeCompute(renderer, three) {
       if (transferFailure) throw transferFailure;
       await gpu.whenIdle();
     },
-    read(attribute) { live(); validateAttribute(attribute); return gpu.read(attribute); },
+    read(attribute) {
+      live(); validateAttribute(attribute);
+      // Submit the buffer snapshot before waiting for texture-owner errors.
+      return Promise.all([gpu.read(attribute), textureOwner.whenIdle()]).then(([bytes]) => bytes);
+    },
     dispose() {
       if (disposed) return; disposed = true;
       for (const [node, listener] of listeners) node.removeEventListener?.('dispose', listener);
@@ -316,7 +359,28 @@ export function withThreeCompute(Base, THREE) {
   return class WebGPURenderer extends Base {
     constructor(...args) {
       super(...args);
-      if (this.isF3DRenderer && THREE.TSL?.context && !this.contextNode) this.contextNode = THREE.TSL.context();
+      if (!this.isF3DRenderer) return; // Preserve an exact-backend constructor return.
+      if (THREE.TSL?.context && !this.contextNode) this.contextNode = THREE.TSL.context();
+      this._storageTextures = createThreeStorageTextures(THREE, {
+        getDevice: () => this._device, signal: this._targetLifetime.signal,
+      });
+      // Compose the renderer's existing borrowed-texture seam once, before any
+      // scene dispatcher is prepared. No source objects or GPU APIs are patched.
+      const targets = this._targets;
+      if (targets?.bindingsFor) {
+        const bindingsFor = targets.bindingsFor.bind(targets);
+        targets.bindingsFor = (destination, retained) => bindingsFor(destination, this._storageTextures.bindingsFor(retained));
+      }
+      // The pinned WGSL builder asks its backend for texture sample metadata.
+      // These are facts about this owned, single-sample texture route only.
+      if (this._backend) {
+        this._backend.utils ??= {};
+        this._backend.utils.getTextureSampleData = texture => {
+          inspectThreeStorageTexture(texture, THREE);
+          return {samples: 1, primarySamples: 1, isMSAA: false};
+        };
+        this._backend.hasFeature = name => !!this._device?.features?.has(name);
+      }
     }
     compute(nodes, dispatchSize = null) {
       check(this);
@@ -354,7 +418,8 @@ export function withThreeCompute(Base, THREE) {
     async waitForGPU() {
       await super.waitForGPU();
       const value = owners.get(this); if (value) await value.whenIdle();
+      await this._storageTextures?.whenIdle();
     }
-    dispose() { owners.get(this)?.dispose(); super.dispose(); }
+    dispose() { owners.get(this)?.dispose(); this._storageTextures?.dispose(); super.dispose(); }
   };
 }

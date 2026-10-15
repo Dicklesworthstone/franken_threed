@@ -159,7 +159,8 @@ export function createThreeStorageTextures(three, {getDevice, signal = null, max
   }
   function captureBinding(binding) {
     const entry = capture(binding.texture), d = device();
-    if (binding.isSampler) return {entry, kind: 'sampler', sampler: samplerOf(binding.texture, three, entry.shape, d)};
+    // r186 SampledTexture extends Sampler, so both flags are true.
+    if (binding.isSampler && !binding.isSampledTexture) return {entry, kind: 'sampler', sampler: samplerOf(binding.texture, three, entry.shape, d)};
     if (!binding.isSampledTexture) fail('BINDING', 'Expected a sampled or storage texture binding');
     if (!binding.store) return {entry, kind: 'sampled'};
     const access = accessNames.get(binding.access), mipLevel = binding.mipLevel ?? 0;
@@ -237,6 +238,7 @@ export function createThreeStorageTextures(three, {getDevice, signal = null, max
     for (const entry of dirty) refreshMips(entry);
   }
   function bindingsFor(retained = new Map()) {
+    if (!(retained instanceof Map)) fail('OPTIONS', 'Expected a Map of borrowed texture bindings');
     return new class extends Map {
       has(texture) { return texture?.isStorageTexture === true || retained.has(texture); }
       get(texture) {

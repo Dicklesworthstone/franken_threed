@@ -7,8 +7,8 @@ const setup = (options = {}) => {
   const texture = new THREE.Texture();
   return {device, owner, texture};
 };
-const write = texture => ({texture, isSampledTexture: true, store: true, access: 'writeOnly'});
-const sample = texture => ({texture, isSampledTexture: true});
+const write = texture => ({texture, isSampler: true, isSampledTexture: true, store: true, access: 'writeOnly'});
+const sample = texture => ({texture, isSampler: true, isSampledTexture: true});
 
 test('storage and ordinary scene sampling share one native allocation', async () => {
   const {device, owner, texture} = setup();
