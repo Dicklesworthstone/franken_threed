@@ -1,7 +1,9 @@
-/** Renderer-owned 2D StorageTexture residency shared by TSL compute and scenes.
+/** Renderer-owned 2D/array StorageTexture residency shared by TSL compute and scenes.
  * No source pixels, readbacks, upload shadows or retained renderer submissions.
  * Views keep native WebGPU orientation. Writes may refresh the mip pyramid on
  * the GPU; ordinary material bindings sample the same allocation. */
+import {submitStorageArrayMips} from './gpu_storage_array_mips.mjs';
+
 export class ThreeStorageTextureError extends Error {
   constructor(code, message) {
     super(`THREE_STORAGE_TEXTURE_${code}: ${message}`);
@@ -15,9 +17,13 @@ const accessNames = new Map([['readOnly', 'read-only'], ['writeOnly', 'write-onl
 export function inspectThreeStorageTexture(texture, three) {
   if (typeof three?.Texture !== 'function' || !(texture instanceof three.Texture) || !texture.isStorageTexture)
     fail('SOURCE', 'Expected a pinned Three StorageTexture');
-  if (texture.is3DTexture || texture.isArrayTexture || texture.isCubeTexture || texture.isRenderTargetTexture ||
-      !positive(texture.image?.width) || !positive(texture.image?.height) || (texture.image.depth ?? 1) !== 1)
-    fail('SHAPE', 'Storage residency currently requires a positive, two-dimensional texture');
+  const array = texture.isArrayTexture === true;
+  const depth = array ? texture.image?.depth : 1;
+  if (texture.is3DTexture || texture.isCubeTexture || texture.isRenderTargetTexture ||
+      !positive(texture.image?.width) || !positive(texture.image?.height) || !positive(depth) ||
+      (!array && (texture.image.depth ?? 1) !== 1))
+    fail('SHAPE', 'Storage residency requires positive 2D or array dimensions');
+  const viewDimension = array ? '2d-array' : '2d';
   if (texture.image.data != null || texture.mipmaps?.length || texture.internalFormat != null ||
       ![three.NoColorSpace, three.LinearSRGBColorSpace].includes(texture.colorSpace))
     fail('FORMAT', 'Storage textures require linear GPU-authored data and no internal-format override');
@@ -30,16 +36,19 @@ export function inspectThreeStorageTexture(texture, three) {
     else if (texture.format === three.RGBAFormat) [format, texelBytes] = ['rgba32float', 16];
   }
   if (!format) fail('FORMAT', 'Storage color must be RGBA8, RGBA16F or R/RG/RGBA32F');
-  if (typeof texture.generateMipmaps !== 'boolean' || typeof texture.mipmapsAutoUpdate !== 'boolean')
+  // r186 StorageArrayTexture does not initialize mipmapsAutoUpdate. Undefined
+  // is disabled there; preserve the source object rather than inventing a flag.
+  if (typeof texture.generateMipmaps !== 'boolean' ||
+      (typeof texture.mipmapsAutoUpdate !== 'boolean' && !(array && texture.mipmapsAutoUpdate === undefined)))
     fail('MIPS', 'Expected boolean storage mipmap controls');
   const {width, height} = texture.image;
   const mipLevelCount = texture.generateMipmaps ? 1 + Math.floor(Math.log2(Math.max(width, height))) : 1;
   let bytes = 0;
   for (let level = 0; level < mipLevelCount; level++)
-    bytes += Math.max(1, Math.floor(width / 2 ** level)) * Math.max(1, Math.floor(height / 2 ** level)) * texelBytes;
+    bytes += Math.max(1, Math.floor(width / 2 ** level)) * Math.max(1, Math.floor(height / 2 ** level)) * depth * texelBytes;
   if (!Number.isSafeInteger(bytes)) fail('BUDGET', 'Storage texture size exceeds safe integer precision');
-  return {width, height, format, texelBytes, mipLevelCount, bytes,
-    float32: texture.type === three.FloatType, key: `${width}/${height}/${format}/${mipLevelCount}`};
+  return {width, height, depth, viewDimension, format, texelBytes, mipLevelCount, bytes,
+    float32: texture.type === three.FloatType, key: `${viewDimension}/${width}/${height}/${depth}/${format}/${mipLevelCount}`};
 }
 
 function samplerOf(texture, three, shape, device) {
@@ -145,15 +154,16 @@ export function createThreeStorageTextures(three, {getDevice, signal = null, max
   function ensure(entry) {
     assertCurrent(entry);
     if (entry.native) return entry;
-    const d = device(), {width, height, mipLevelCount, format, bytes} = entry.shape;
+    const d = device(), {width, height, depth, viewDimension, mipLevelCount, format, bytes} = entry.shape;
     if (width > d.limits.maxTextureDimension2D || height > d.limits.maxTextureDimension2D) fail('LIMIT', 'Storage texture exceeds device dimensions');
+    if (depth > (d.limits.maxTextureArrayLayers ?? 256)) fail('LIMIT', 'Storage texture exceeds device array layers');
     if (bytes > maxBytes - allocatedBytes) fail('BUDGET', 'Storage texture allocations exceed maxBytes');
     // All uses share this allocation. RENDER_ATTACHMENT serves GPU mip updates.
     checked(d => {
       entry.native = d.createTexture({label: entry.texture.name || 'f3d-storage-texture',
-        size: [width, height, 1], dimension: '2d', mipLevelCount, sampleCount: 1, format, usage: 1 | 2 | 4 | 8 | 16});
+        size: [width, height, depth], dimension: '2d', mipLevelCount, sampleCount: 1, format, usage: 1 | 2 | 4 | 8 | 16});
       allocatedBytes += bytes; entry.charged = bytes;
-      entry.view = entry.native.createView();
+      entry.view = entry.native.createView(viewDimension === '2d' ? {} : {dimension: viewDimension});
     });
     return entry;
   }
@@ -171,11 +181,15 @@ export function createThreeStorageTextures(three, {getDevice, signal = null, max
   function layout(snapshot) {
     const {entry, kind} = snapshot;
     if (kind === 'sampler') return {sampler: {type: 'filtering'}};
-    if (kind === 'storage') return {storageTexture: {access: snapshot.access, format: entry.shape.format, viewDimension: '2d'}};
-    return {texture: {sampleType: entry.shape.float32 && !device().features?.has?.('float32-filterable') ? 'unfilterable-float' : 'float', viewDimension: '2d', multisampled: false}};
+    if (kind === 'storage') return {storageTexture: {access: snapshot.access, format: entry.shape.format, viewDimension: entry.shape.viewDimension}};
+    return {texture: {sampleType: entry.shape.float32 && !device().features?.has?.('float32-filterable') ? 'unfilterable-float' : 'float', viewDimension: entry.shape.viewDimension, multisampled: false}};
   }
   function refreshMips(entry) {
     if (!entry.mipsDirty || entry.shape.mipLevelCount === 1) return;
+    if (entry.shape.viewDimension === '2d-array') {
+      checked(d => submitStorageArrayMips(d, entry.native, entry.shape, mipPipelines));
+      entry.mipsDirty = false; return;
+    }
     checked(d => {
       let pipeline = mipPipelines.get(entry.shape.format);
       if (!pipeline) {
@@ -208,7 +222,8 @@ export function createThreeStorageTextures(three, {getDevice, signal = null, max
     }
     if (snapshot.kind === 'sampled') { refreshMips(entry); return entry.view; }
     if (!entry.views.has(snapshot.mipLevel)) entry.views.set(snapshot.mipLevel,
-      checked(() => entry.native.createView({baseMipLevel: snapshot.mipLevel, mipLevelCount: 1})));
+      checked(() => entry.native.createView({baseMipLevel: snapshot.mipLevel, mipLevelCount: 1,
+        ...(entry.shape.viewDimension === '2d' ? {} : {dimension: entry.shape.viewDimension})})));
     return entry.views.get(snapshot.mipLevel);
   }
   function validateDispatch(snapshots) {
@@ -245,7 +260,7 @@ export function createThreeStorageTextures(three, {getDevice, signal = null, max
         if (!texture?.isStorageTexture) return retained.get(texture);
         const sample = captureBinding({texture, isSampledTexture: true}), sampler = captureBinding({texture, isSampler: true});
         return {view: resolve(sample), sampler: resolve(sampler), sampleType: layout(sample).texture.sampleType,
-          viewDimension: '2d', version: texture.version, sourceVersion: texture.source.version};
+          viewDimension: sample.entry.shape.viewDimension, version: texture.version, sourceVersion: texture.source.version};
       }
     }();
   }
