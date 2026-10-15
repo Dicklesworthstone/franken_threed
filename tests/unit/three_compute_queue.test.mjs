@@ -21,8 +21,8 @@ function setup({initialization = null, compilation = null, mapping = null} = {})
     createComputePipeline: descriptor => { events.push(['compile']); return pipeline(descriptor); },
     createComputePipelineAsync: async descriptor => { events.push(['compileAsync']); return pipeline(descriptor); },
     createBindGroup: descriptor => descriptor,
-    createBuffer({size}) {
-      const buffer = {data: new Uint8Array(size), destroyed: 0, destroy() { this.destroyed++; }, unmap() {},
+    createBuffer({size, usage}) {
+      const buffer = {size, usage, data: new Uint8Array(size), destroyed: 0, destroy() { this.destroyed++; }, unmap() {},
         mapAsync: () => mapping?.promise ?? Promise.resolve(), getMappedRange() { return this.data.buffer; }};
       buffers.push(buffer); return buffer;
     },
@@ -47,6 +47,16 @@ function setup({initialization = null, compilation = null, mapping = null} = {})
         },
         copyBufferToBuffer(source, from, target, to, size) {
           commands.push(() => { events.push(['read']); target.data.set(source.data.subarray(from, from + size), to); });
+        },
+        copyBufferToTexture(source, target, size) {
+          commands.push(() => {
+            events.push(['texture-copy']);
+            for (let row = 0; row < size[1]; row++) {
+              const start = source.offset + row * (source.bytesPerRow ?? size[0] * 4);
+              const offset = ((target.origin[1] + row) * target.texture.width + target.origin[0]) * 4;
+              target.texture.data.set(source.buffer.data.subarray(start, start + size[0] * 4), offset);
+            }
+          });
         }, finish: () => commands,
       };
     },
@@ -266,4 +276,65 @@ test('preparation started by a before-update hook still snapshots the current ca
   value = 99; uniform.buffer[0] = 99; data.array[0] = 100;
   gate.open(); await run;
   assert.deepEqual(await read(renderer, data), [3]); renderer.dispose();
+});
+
+
+function targetFor(renderer, width = 2, height = 2) {
+  const target = {}, texture = {width, data: new Uint8Array(width * height * 4)};
+  const entry = {target, alive: true, busy: false, depthDirty: false, dirty: false,
+    shape: {format: 'r32float', width, height, sampleCount: 1}, validation: Promise.resolve(),
+    lifetime: new AbortController(), storage: {whenIdle: async () => {}}};
+  renderer._targets = {
+    capture(value) { assert.equal(value, target); return entry; },
+    assertCurrent(value) { assert.equal(value, entry); if (!value.alive) throw new Error('stale target'); if (value.error) throw value.error; },
+    ensure(value) { this.assertCurrent(value); },
+    render(value, callback) {
+      this.assertCurrent(value); value.busy = true; value.dirty = value.depthDirty = true;
+      try { callback({}, texture); } finally { value.busy = false; }
+    },
+  };
+  return {target, entry, values: () => [...new Float32Array(texture.data.buffer)]};
+}
+
+test('public compute-to-target copies preserve compute/copy/draw order without waiting for completion', async () => {
+  const {renderer, device, block, events} = setup(), {target, entry, values} = targetFor(renderer);
+  const data = attribute(new Float32Array([0, 10, 20, 30])), kernel = node([storage(data)]);
+  const gate = block(), fence = deferred();
+  device.queue.onSubmittedWorkDone = () => fence.promise;
+  const a = renderer.computeAsync(kernel), options = {width: 2, height: 2};
+  const copy = renderer.copyStorageBufferToRenderTargetAsync(data, target, options);
+  options.flipY = true; options.width = 1;
+  let drawn;
+  const draw = new Promise((resolve, reject) => renderer._enqueue({resolve, reject, issue() { drawn = values(); events.push(['draw']); }}));
+  const b = renderer.computeAsync(kernel);
+  gate.open(); await Promise.all([a, b, draw]); // Fence still unresolved.
+  assert.deepEqual(drawn, [1, 11, 21, 31]);
+  assert.deepEqual(events.filter(e => ['dispatch', 'texture-copy', 'draw'].includes(e[0])).map(e => e[0]),
+    ['dispatch', 'texture-copy', 'texture-copy', 'draw', 'dispatch']);
+  fence.resolve(); assert.equal(await copy, true);
+  assert.deepEqual(await read(renderer, data), [2, 12, 22, 32]);
+  assert.equal(entry.depthDirty, false); assert.equal(entry.dirty, true); renderer.dispose();
+});
+
+test('copying compute storage never uploads newer CPU values or needsUpdate ranges', async () => {
+  const {renderer, events} = setup(), {target, values} = targetFor(renderer);
+  const data = attribute(new Float32Array([0, 10, 20, 30]));
+  renderer.compute(node([storage(data)]));
+  const uploads = events.filter(e => e[0] === 'upload').length;
+  data.array.fill(999); data.version++; data.updateRanges = [{start: 0, count: 4}];
+  await renderer.copyStorageBufferToRenderTargetAsync(data, target);
+  assert.deepEqual(values(), [1, 11, 21, 31]);
+  assert.equal(events.filter(e => e[0] === 'upload').length, uploads);
+  assert.deepEqual(data.updateRanges, [{start: 0, count: 4}]); renderer.dispose();
+});
+
+test('public copies reject missing GPU storage and stale target generations', async () => {
+  const {renderer, block, events} = setup(), {target, entry} = targetFor(renderer);
+  const data = attribute(new Float32Array(4));
+  await assert.rejects(renderer.copyStorageBufferToRenderTargetAsync(data, target), /before copying/);
+  renderer.compute(node([storage(data)]));
+  const gate = block(), copy = renderer.copyStorageBufferToRenderTargetAsync(data, target);
+  entry.alive = false; gate.open();
+  await assert.rejects(copy, /stale target/);
+  assert.equal(events.some(e => e[0] === 'texture-copy'), false); renderer.dispose();
 });

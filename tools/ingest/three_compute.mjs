@@ -4,9 +4,10 @@
  * Initialized calls capture their uniforms, storage upload versions and dispatch
  * sizes before joining the renderer FIFO. Deferred GPU submission must not turn
  * distinct application updates into repeated execution of the last state.
- * Buffer/uniform kernels are admitted; texture bindings and compute-to-scene
- * vertex-buffer sharing remain explicit unsupported boundaries. */
+ * Buffer/uniform kernels can feed source render-target textures by GPU-only
+ * copies. Texture-backed kernels and shared vertex streams remain unsupported. */
 import {createGpuCompute} from './gpu_compute.mjs';
+import {copyComputeBufferToTarget} from './gpu_compute_texture_copy.mjs';
 
 export class ThreeComputeError extends Error {
   constructor(code, message) {
@@ -29,6 +30,8 @@ function createThreeCompute(renderer, three) {
   const gpu = createGpuCompute(device, {signal: renderer._targetLifetime.signal});
   const programs = new Map(), initialized = new Set(), listeners = new Map(), building = new Set();
   const captured = new WeakMap(), uploaded = new WeakMap(), payloads = new Set(), compiling = new Set();
+  const transfers = new Set();
+  let transferFailure = null;
   const maxSnapshotBytes = 128 * 1024 * 1024;
   let disposed = false, uniformVersion = 0, snapshotBytes = 0, issuing = false;
   function live() {
@@ -265,7 +268,22 @@ function createThreeCompute(renderer, three) {
       const task = compile(...args); compiling.add(task);
       task.finally(() => compiling.delete(task)).catch(() => {}); return task;
     },
-    async whenIdle() { await Promise.all([...compiling]); await gpu.whenIdle(); },
+    copyToTarget(attribute, destination, options) {
+      live();
+      if (transfers.size >= 64) fail('BUDGET', 'Too many compute-to-target copies are awaiting completion');
+      const buffer = gpu.getBuffer(attribute);
+      if (!buffer) fail('STORAGE', 'Compute must upload or produce this storage attribute before copying it');
+      const task = copyComputeBufferToTarget(device, buffer, renderer._targets, destination, options,
+        {signal: renderer._targetLifetime.signal, sourceCompletion: () => gpu.whenIdle()});
+      transfers.add(task);
+      task.catch(error => { transferFailure ??= error; }).finally(() => transfers.delete(task)).catch(() => {});
+      return task;
+    },
+    async whenIdle() {
+      await Promise.all([...compiling, ...transfers]);
+      if (transferFailure) throw transferFailure;
+      await gpu.whenIdle();
+    },
     read(attribute) { live(); validateAttribute(attribute); return gpu.read(attribute); },
     dispose() {
       if (disposed) return; disposed = true;
@@ -319,6 +337,18 @@ export function withThreeCompute(Base, THREE) {
       const list = listOf(nodes);
       if (onProgress !== null && typeof onProgress !== 'function') fail('OPTIONS', 'onProgress must be a function');
       await submit(this, () => owner(this).compile(list, onProgress));
+    }
+    /** F3D extension: copy GPU storage bytes into a normal 2D RenderTarget.
+     * The texture can then be sampled by ordinary scene materials. No CPU
+     * readback/re-upload or format conversion; row layout is expressed in bytes.
+     * x/y are top-left coordinates; flipY reverses rows within the copied region. */
+    async copyStorageBufferToRenderTargetAsync(attribute, target, options = {}) {
+      check(this);
+      if (!attribute || !(attribute.isStorageBufferAttribute || attribute.isStorageInstancedBufferAttribute || attribute.isIndirectStorageBufferAttribute))
+        fail('STORAGE', 'Expected a source storage buffer attribute');
+      if (!options || typeof options !== 'object' || Array.isArray(options)) fail('OPTIONS', 'Expected copy options');
+      const destination = this._targets.capture(target), copiedOptions = {...options};
+      return await submit(this, () => owner(this).copyToTarget(attribute, destination, copiedOptions));
     }
     async getArrayBufferAsync(attribute) { return await submit(this, () => owner(this).read(attribute)); }
     async waitForGPU() {
