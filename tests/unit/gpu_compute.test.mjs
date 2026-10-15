@@ -24,6 +24,7 @@ function gpu(options = {}) {
       buffers.push(buffer); return buffer;
     },
     createShaderModule: ({code}) => ({code, getCompilationInfo: async () => ({messages: options.messages ?? []})}),
+    createComputePipeline: descriptor => { calls.push(['pipeline', descriptor]); return {getBindGroupLayout: index => index}; },
     createComputePipelineAsync: async descriptor => { calls.push(['pipeline', descriptor]); return {getBindGroupLayout: index => index}; },
     createBindGroup: descriptor => descriptor,
     createCommandEncoder() {
@@ -195,4 +196,21 @@ test('device loss and validation errors become terminal rather than reported suc
   invalid.validationError('invalid binding'); other.upload({}, new Uint32Array([1]));
   await assert.rejects(other.whenIdle(), /invalid binding/);
   assert.equal(other.allocatedBytes, 0);
+});
+
+
+test('synchronous source compute preparation submits without yielding and reuses warm pipelines', async () => {
+  const device = gpu(), owner = createGpuCompute(device);
+  const pipeline = owner.prepareSync(shader);
+  owner.dispatch(pipeline, [], [1]);
+  assert.equal(device.calls.filter(c => c[0] === 'dispatch').length, 1);
+  assert.equal(await owner.prepare(shader), pipeline);
+  assert.equal(owner.prepareSync(shader), pipeline);
+  assert.equal(device.calls.filter(c => c[0] === 'pipeline').length, 1);
+  owner.dispose();
+  const otherDevice = gpu(), other = createGpuCompute(otherDevice);
+  const prewarmed = await other.prepare(shader);
+  assert.equal(other.prepareSync(shader), prewarmed);
+  assert.equal(otherDevice.calls.filter(c => c[0] === 'pipeline').length, 1);
+  other.dispose();
 });
