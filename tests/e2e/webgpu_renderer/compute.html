@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>F3D native TSL compute smoke</title></head>
+<body><canvas width="16" height="16"></canvas><pre id="result">Running…</pre>
+<!-- With the pinned upstream checkout and ingest dependencies installed:
+node tools/ingest/cli.mjs tests/e2e/webgpu_renderer/compute.html --build-app /tmp/f3d-compute --route-webgpu-renderer
+Serve that output over localhost and open compute.html in a WebGPU browser.
+This test requires the native route and checks actual mapped GPU results. It is
+not a benchmark. Automation can await window.__f3dCompute.status !== 'running'. -->
+<script type="importmap">{"imports":{"three":"../../../upstream/three.js/build/three.webgpu.js","three/webgpu":"../../../upstream/three.js/build/three.webgpu.js","three/tsl":"../../../upstream/three.js/build/three.tsl.js"}}</script>
+<script type="module">
+import * as THREE from 'three/webgpu';
+import {Fn, storage, instanceIndex, uniform, uint, vec3} from 'three/tsl';
+
+const state = window.__f3dCompute = {status: 'running', checks: [], error: null};
+let renderer;
+const kernels = [];
+const keep = kernel => { kernels.push(kernel); return kernel; };
+function check(name, actual, expected) {
+  if (actual.length !== expected.length || actual.some((value, i) => value !== expected[i]))
+    throw new Error(`${name}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+  state.checks.push(name);
+}
+try {
+  renderer = new THREE.WebGPURenderer({canvas: document.querySelector('canvas')});
+  if (renderer.isF3DRenderer !== true) throw new Error('Build this fixture with --route-webgpu-renderer; retained submission must not pass');
+  await renderer.init();
+  const count = 129; // Partial final workgroup exercises the generated bounds check.
+  const initial = Array.from({length: count}, (_, i) => i);
+  const data = new THREE.StorageBufferAttribute(new Float32Array(initial), 1);
+  const values = storage(data, 'float', count), delta = uniform(2);
+  const add = keep(Fn(() => { values.element(instanceIndex).addAssign(delta); })().compute(count, [64]));
+  const read = async attribute => Array.from(new Float32Array(await renderer.getArrayBufferAsync(attribute)));
+
+  await renderer.compileComputeAsync(add);
+  check('precompilation does not dispatch', await read(data), initial);
+  renderer.compute(add);
+  const first = renderer.getArrayBufferAsync(data);
+  delta.value = 3;
+  renderer.compute(add);
+  check('readback cannot be overtaken by a later dispatch', Array.from(new Float32Array(await first)), initial.map(v => v + 2));
+  check('uniform changes preserve previous GPU storage', await read(data), initial.map(v => v + 5));
+  renderer.compute([add, add]);
+  check('multi-kernel source submission', await read(data), initial.map(v => v + 11));
+
+  data.array[0] = 50;
+  data.addUpdateRange(0, 1); data.needsUpdate = true;
+  renderer.compute(add);
+  check('partial host upload preserves other GPU-written values', await read(data), initial.map((v, i) => i === 0 ? 53 : v + 14));
+
+  const indirect = new THREE.IndirectStorageBufferAttribute(new Uint32Array([0, 0, 0]), 1);
+  const argumentsNode = storage(indirect, 'uint', 3);
+  const producer = keep(Fn(() => {
+    argumentsNode.element(uint(0)).assign(uint(2));
+    argumentsNode.element(uint(1)).assign(uint(1));
+    argumentsNode.element(uint(2)).assign(uint(1));
+  })().compute(1, [1]));
+  const indirectData = new THREE.StorageBufferAttribute(new Float32Array(count), 1);
+  const indirectValues = storage(indirectData, 'float', count);
+  const consumer = keep(Fn(() => { indirectValues.element(instanceIndex).addAssign(1); })().compute(count, [64]));
+  renderer.compute(producer);
+  renderer.compute(consumer, indirect);
+  check('indirect dispatch consumes GPU-generated counts', await read(indirectData), initial.map((_, i) => i < 128 ? 1 : 0));
+  check('indirect dispatch did not read counts back into the CPU array', Array.from(indirect.array), [0, 0, 0]);
+
+  const vectors = new THREE.StorageBufferAttribute(new Float32Array([1, 2, 3, 4, 5, 6]), 3);
+  const vectorValues = storage(vectors, 'vec3', 2);
+  const vectorKernel = keep(Fn(() => { vectorValues.element(instanceIndex).addAssign(vec3(1, 2, 3)); })().compute(2, [2]));
+  await renderer.computeAsync(vectorKernel);
+  check('WGSL vec3 storage has the source four-component stride', await read(vectors), [2, 4, 6, 0, 5, 7, 9, 0]);
+  await renderer.waitForGPU(); // Includes F3D's asynchronous WebGPU validation scopes.
+  state.status = 'pass';
+} catch (error) {
+  state.status = 'fail'; state.error = error.stack ?? String(error);
+} finally {
+  for (const kernel of kernels) kernel.dispose();
+  renderer?.dispose();
+  document.querySelector('#result').textContent = JSON.stringify(state, null, 2);
+}
+</script></body></html>
