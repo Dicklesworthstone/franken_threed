@@ -2,6 +2,8 @@
  * this owner creates pipelines, keeps storage GPU-resident across dispatches,
  * submits real compute passes and performs asynchronous staging-buffer readback.
  * General WebGPU execution, not a Rust specialization or a speedup claim. */
+import {createComputeAttributeOwner} from './gpu_compute_attributes.mjs';
+
 export class GpuComputeError extends Error {
   constructor(code, message) {
     super(`GPU_COMPUTE_${code}: ${message}`);
@@ -10,7 +12,7 @@ export class GpuComputeError extends Error {
 }
 const fail = (code, message) => { throw new GpuComputeError(code, message); };
 // WebGPU constants are also usable in command-recording Node tests.
-const COPY_SRC = 4, COPY_DST = 8, UNIFORM = 64, STORAGE = 128, INDIRECT = 256, MAP_READ = 1;
+const COPY_SRC = 4, COPY_DST = 8, VERTEX = 32, UNIFORM = 64, STORAGE = 128, INDIRECT = 256, MAP_READ = 1;
 const positive = n => Number.isSafeInteger(n) && n > 0;
 
 export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffers = 1024,
@@ -19,12 +21,14 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
       ![maxBytes, maxBuffers, maxPipelines].every(positive)) fail('OPTIONS', 'Expected a GPUDevice and positive resource limits');
   const buffers = new Map(), pipelines = new Map(), compiled = new Map(), ready = new Set(), staging = new Set(), pending = new Set();
   const lifetime = new AbortController();
+  const attributeOwner = createComputeAttributeOwner(device);
   let terminal = null, allocatedBytes = 0;
   const live = () => { if (terminal) throw terminal; };
   function stop(error) {
     if (terminal) return;
     terminal = error instanceof Error ? error : new GpuComputeError('ABORTED', String(error ?? 'Compute execution aborted'));
     lifetime.abort(terminal);
+    attributeOwner.dispose();
     for (const entry of buffers.values()) entry.buffer.destroy();
     for (const buffer of staging) buffer.destroy();
     buffers.clear(); staging.clear(); ready.clear(); pipelines.clear(); compiled.clear(); allocatedBytes = 0;
@@ -68,6 +72,7 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
     live();
     if (!key || !['object', 'function'].includes(typeof key) || !ArrayBuffer.isView(array) || array instanceof DataView)
       fail('BUFFER', 'Expected an identity key and typed array');
+    if (!uniform) attributeOwner.admit(key, array);
     const bytes = array.byteLength, size = Math.max(4, Math.ceil(bytes / 4) * 4);
     const limit = uniform ? device.limits?.maxUniformBufferBindingSize : device.limits?.maxStorageBufferBindingSize;
     if (size > (device.limits?.maxBufferSize ?? Infinity) || size > (limit ?? Infinity))
@@ -89,7 +94,7 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
       // Charge both generations until the replacement is successfully created.
       budget(size);
       const buffer = checked(() => device.createBuffer({label: 'f3d-compute-buffer', size,
-        usage: COPY_SRC | COPY_DST | (uniform ? UNIFORM : STORAGE | INDIRECT)}));
+        usage: COPY_SRC | COPY_DST | (uniform ? UNIFORM : STORAGE | INDIRECT | VERTEX)}));
       entry = {buffer, size, bytes, uniform, array: null, version: null};
       allocatedBytes += size; buffers.set(key, entry);
       if (old) { old.buffer.destroy(); allocatedBytes -= old.size; }
@@ -105,11 +110,14 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
       }
     });
     entry.array = array; entry.version = version; entry.bytes = bytes;
+    if (!uniform) attributeOwner.publish(key, entry.buffer, array, version, live, whenIdle);
+    else attributeOwner.release(key);
     return entry.buffer;
   }
   function release(key) {
     const entry = buffers.get(key);
     if (!entry) return;
+    attributeOwner.release(key);
     buffers.delete(key); entry.buffer.destroy(); allocatedBytes -= entry.size;
   }
   // Explicit layouts are necessary for unfilterable float32 textureLoad inputs:
