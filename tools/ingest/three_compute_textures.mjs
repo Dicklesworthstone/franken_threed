@@ -31,7 +31,8 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
     if (typeof targetFactory !== 'function') fail('SOURCE', 'Native render-target inputs require the renderer target owner');
     return targetInputs ??= targetFactory();
   };
-  const isTarget = binding => binding?.texture?.isRenderTargetTexture === true;
+  const isTarget = binding => binding?.texture?.isRenderTargetTexture === true ||
+    binding?.texture?.isDepthTexture === true && binding.texture.renderTarget != null;
   let pool = null, disposed = false, snapshotBytes = 0, resolving = false, poolDirty = false;
   const live = () => { if (disposed) fail('DISPOSED', 'Compute texture inputs are disposed'); };
   const sourcePool = () => { live(); return pool ??= poolFactory(); };

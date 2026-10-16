@@ -5,6 +5,8 @@
  * withTexture refreshes it on the GPU after the last withFrame write, before the
  * consumer runs. Attachments always select level zero; MSAA/depth stay single-level.
  * sampleDepth:true exposes the actual depth attachment through withDepthTexture.
+ * withSampledTextures borrows resolved color and sampled depth together under
+ * one lifetime guard. Depth-only reads do not refresh or dirty color mipmaps.
  * A four-sample depth attachment stays multisampled: no depth resolve, averaging
  * or precision conversion is inferred. Consumers choose their shader sample index.
  * Combined depth/stencil formats expose both aspects in frame.depthView. Sample
@@ -271,15 +273,17 @@ export function createGpuRenderTarget(device, options = {}) {
   }
   function borrow(callback, kind) {
     exclusive();
-    if (kind === 'depth' && !sampleDepth) fail('DEPTH', 'Enable sampleDepth before borrowing the depth texture');
+    if ((kind === 'depth' || kind === 'sampled') && !sampleDepth) fail('DEPTH', 'Enable sampleDepth before borrowing the depth texture');
     if (typeof callback !== 'function') fail('CALLBACK', 'Expected a synchronous submitted-use callback');
     if (!current) return false;
     busy = true;
     try {
       current.used = true; // Even a throwing callback may have submitted work.
       if (kind === 'frame') current.mipsDirty = true;
-      else if (kind === 'color') refreshMips(current);
-      const result = kind === 'frame' ? callback(current.frame, current.color) : callback(kind === 'depth' ? current.depth : current.color);
+      else if (kind === 'color' || kind === 'sampled') refreshMips(current);
+      const result = kind === 'frame' ? callback(current.frame, current.color)
+        : kind === 'sampled' ? callback(current.color, current.depth)
+        : callback(kind === 'depth' ? current.depth : current.color);
       if (result && typeof result.then === 'function') {
         Promise.resolve(result).catch(() => {});
         fail('ASYNC_USE', 'Submit all work before returning; borrowed textures cannot cross an await');
@@ -340,6 +344,7 @@ export function createGpuRenderTarget(device, options = {}) {
     withFrame(callback) { return borrow(callback, 'frame'); },
     withTexture(callback) { return borrow(callback, 'color'); },
     withDepthTexture(callback) { return borrow(callback, 'depth'); },
+    withSampledTextures(callback) { return borrow(callback, 'sampled'); },
     writePixels(data, options = {}) {
       exclusive();
       if (!copyDestination) fail('USAGE', 'Enable copyDestination before uploading target color');

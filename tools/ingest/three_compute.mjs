@@ -6,9 +6,9 @@
  * distinct application updates into repeated execution of the last state.
  * StorageTexture kernels share native residency with scene materials. Ready
  * CPU data textures also provide read-only, call-time-versioned sampled inputs.
- * Native color RenderTarget inputs borrow resolved attachments through the FIFO
- * submission; no UV replica, readback or CPU upload is introduced. Decoded image
- * and depth-target inputs remain outside this compute input route. */
+ * Native color and depth RenderTarget inputs borrow their attachments through
+ * the FIFO submission, including both aspects of one target. No UV replica,
+ * readback or CPU upload is introduced. Decoded image inputs remain unsupported. */
 import {createGpuCompute} from './gpu_compute.mjs';
 import {copyComputeBufferToTarget} from './gpu_compute_texture_copy.mjs';
 import {createThreeStorageTextures, inspectThreeStorageTexture} from './three_storage_textures.mjs';

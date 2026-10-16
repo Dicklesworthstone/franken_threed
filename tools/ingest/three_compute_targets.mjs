@@ -15,7 +15,7 @@ const positive = n => Number.isSafeInteger(n) && n > 0;
 
 export function createThreeComputeTargets({targets, device, signal = null,
   maxBindings = 4096, maxSamplers = 256, maxPending = 1024} = {}) {
-  if (!targets || !['captureNativeTexture', 'validateNativeTextures', 'withNativeTexture', 'assertCurrent'].every(key => typeof targets[key] === 'function') ||
+  if (!targets || !['captureNativeTexture', 'validateNativeTextures', 'withNativeTextures', 'assertCurrent'].every(key => typeof targets[key] === 'function') ||
       !device?.queue || ![maxBindings, maxSamplers, maxPending].every(positive))
     fail('OPTIONS', 'Expected the renderer target owner, GPUDevice and positive resource limits');
   const records = new Map(), leases = new WeakSet(), samplers = new Map(), views = new WeakMap(), pending = new Set();
@@ -94,12 +94,17 @@ export function createThreeComputeTargets({targets, device, signal = null,
       if (active) fail('REENTRY', 'Cannot reenter a borrowed compute dispatch');
       if (!snapshots.length) return run();
       const sources = new Map();
-      for (const snapshot of snapshots) { const {source} = validate(snapshot); sources.set(source.entry, source); }
+      for (const snapshot of snapshots) {
+        const {source} = validate(snapshot);
+        let group = sources.get(source.entry);
+        if (!group) sources.set(source.entry, group = new Map());
+        group.set(source.texture, source);
+      }
       if (pending.size + sources.size + 1 > maxPending) fail('BUDGET', 'Too many target submissions are awaiting completion');
       // Hold each native owner once, even when the kernel uses several texture
       // and sampler bindings for the same source. No borrow crosses an await.
-      const list = [...sources.values()], borrowed = new Map();
-      targets.validateNativeTextures(list);
+      const list = [...sources.values()].map(group => [...group.values()]), borrowed = new Map();
+      targets.validateNativeTextures(list.flat());
       active = {tokens: new Set(snapshots), textures: new Map()};
       const visit = i => {
         if (i === list.length) {
@@ -111,10 +116,10 @@ export function createThreeComputeTargets({targets, device, signal = null,
           }
           return;
         }
-        const source = list[i];
-        targets.withNativeTexture(source, texture => {
+        const group = list[i], source = group[0];
+        targets.withNativeTextures(group, textures => {
           borrowed.set(source.entry, source.entry.storage);
-          active.textures.set(source.entry, texture);
+          for (const [original, texture] of textures) active.textures.set(original, texture);
           visit(i + 1);
         });
       };
@@ -141,11 +146,12 @@ export function createThreeComputeTargets({targets, device, signal = null,
         } else samplers.delete(key);
         samplers.set(key, value); return value;
       }
-      const texture = active.textures.get(source.entry);
+      const texture = active.textures.get(source.texture);
       if (!texture) fail('BORROW', 'The native source has not been borrowed');
       let view = views.get(texture);
       if (!view) {
-        view = native(() => texture.createView({dimension: '2d', baseMipLevel: 0, mipLevelCount: source.entry.shape.mipLevelCount}));
+        view = native(() => texture.createView({dimension: '2d', baseMipLevel: 0, mipLevelCount: source.depth ? 1 : source.entry.shape.mipLevelCount,
+          ...(source.depth ? {aspect: 'depth-only'} : {})}));
         views.set(texture, view);
       }
       return view;

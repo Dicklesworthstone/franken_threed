@@ -26,7 +26,19 @@ export class RenderTarget extends Events {
   get texture() { return this.textures[0]; }
   setSize(width, height) { this.dispose(); this.width = width; this.height = height; }
 }
-export const THREE = {REVISION: '186', Texture, RenderTarget,
+export class DepthTexture extends Texture {
+  constructor(type = 1015, format = 1026) {
+    super(); Object.assign(this, {isRenderTargetTexture: false, isDepthTexture: true,
+      type, format, flipY: false, compareFunction: null, mipmaps: [], image: {width: 4, height: 4}});
+  }
+}
+export function depthTarget(type = 1015, format = 1026) {
+  const target = new RenderTarget(); target.depthBuffer = true;
+  target.depthTexture = new DepthTexture(type, format); target.depthTexture.renderTarget = target;
+  return target;
+}
+export const THREE = {REVISION: '186', Texture, DepthTexture, RenderTarget,
+  DepthFormat: 1026, DepthStencilFormat: 1027, UnsignedInt248Type: 1020,
   UnsignedByteType: 1009, HalfFloatType: 1016, FloatType: 1015, UnsignedIntType: 1014,
   RGBAFormat: 1023, RedFormat: 1028, RGFormat: 1030, NoColorSpace: '', LinearSRGBColorSpace: 'srgb-linear', SRGBColorSpace: 'srgb',
   NearestFilter: 1003, NearestMipmapNearestFilter: 1004, NearestMipmapLinearFilter: 1005,
@@ -54,8 +66,10 @@ export async function rig({features = [], maxBytes, maxTargets, adapterOptions =
     assert.equal(_device, device);
     const texture = {value: 0, borrowed: false, options,
       createView(descriptor) { const view = {nativeTexture: texture, descriptor: plain(descriptor)}; events.push(['view', view]); return view; }};
+    const depth = {...texture, options: {...options, format: options.depthFormat},
+      createView(descriptor) { const view = {nativeTexture: depth, descriptor: plain(descriptor)}; events.push(['view', view]); return view; }};
     let busy = false, disposed = false, failure = null, completion = null, mipsDirty = true;
-    const storage = {texture,
+    const storage = {texture, depth,
       get failed() { return !!failure; },
       withTexture(run) {
         assert.equal(busy, false); assert.equal(disposed, false); busy = texture.borrowed = true;
@@ -65,9 +79,23 @@ export async function rig({features = [], maxBytes, maxTargets, adapterOptions =
           return true;
         } finally { busy = texture.borrowed = false; }
       },
+      withDepthTexture(run) {
+        assert.equal(options.sampleDepth, true); assert.equal(busy, false); assert.equal(disposed, false);
+        busy = depth.borrowed = true;
+        try { const result = run(depth); assert.equal(!!result?.then, false); return true; }
+        finally { busy = depth.borrowed = false; }
+      },
+      withSampledTextures(run) {
+        assert.equal(options.sampleDepth, true); assert.equal(busy, false); assert.equal(disposed, false);
+        busy = texture.borrowed = depth.borrowed = true;
+        try {
+          if (options.generateMipmaps && mipsDirty) { events.push(['mips', texture.value]); mipsDirty = false; }
+          const result = run(texture, depth); assert.equal(!!result?.then, false); return true;
+        } finally { busy = texture.borrowed = depth.borrowed = false; }
+      },
       withFrame(run) {
         assert.equal(busy, false); assert.equal(disposed, false); busy = true;
-        try { const result = run({}, texture); mipsDirty = true; return result; } finally { busy = false; }
+        try { const result = run({depthView: {nativeTexture: depth}}, texture); mipsDirty = true; return result; } finally { busy = false; }
       },
       async whenIdle() { assert.equal(busy, false, 'completion must start after borrow ends'); if (failure) throw failure; if (completion) await completion; },
       dispose() { assert.equal(busy, false, 'source retirement must wait for borrow unwinding'); disposed = true; events.push(['targetDispose']); },
@@ -141,8 +169,10 @@ export async function rig({features = [], maxBytes, maxTargets, adapterOptions =
       this._backend = {}; this.info = {calls: 0, compute: {calls: 0, frameCalls: 0}}; this.queue = [];
     }
     _enqueue(request) { this.queue.push(request); }
-    produce(target, value) {
-      const entry = targets.capture(target), issue = () => targets.render(entry, (_frame, texture) => { texture.value = value; events.push(['render', value]); });
+    produce(target, value, depth = 0) {
+      const entry = targets.capture(target), issue = () => targets.render(entry, (frame, texture) => {
+        texture.value = value; if (frame.depthView) frame.depthView.nativeTexture.value = depth; events.push(['render', value, depth]);
+      });
       if (!this._preparing && this._initialized) return issue();
       return new Promise((resolve, reject) => this._enqueue({issue, resolve, reject}));
     }

@@ -435,14 +435,20 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     // metadata; GPU contents are observed at the consumer's FIFO submission.
     captureNativeTexture(texture) {
       live();
-      if (!texture?.isRenderTargetTexture || texture.isDepthTexture || !texture.renderTarget)
-        fail('SOURCE', 'Expected a target-owned 2D color texture for native sampling');
+      if (!targetTexture(texture))
+        fail('SOURCE', 'Expected a target-owned 2D color or depth texture for native sampling');
       const entry = capture(texture.renderTarget), device = getDevice();
-      if (entry.shape.texture !== texture) fail('STALE', 'Texture no longer belongs to its source target');
+      const depth = texture.isDepthTexture === true;
+      if ((depth ? entry.shape.depthTexture : entry.shape.texture) !== texture)
+        fail('STALE', 'Texture no longer belongs to its source target');
       if (!device) fail('DEVICE', 'Initialize the renderer before capturing native target inputs');
-      const {descriptor, sampleType} = colorSampler(entry, texture);
+      // Native depth formats are depth bindings, not the WebGL bridge's R32F
+      // replica. Ordinary depth filtering requires no float32-filterable feature.
+      const {descriptor, sampleType} = depth
+        ? {descriptor: {...samplerDescriptor(texture, three, 1), mipmapFilter: 'nearest', maxAnisotropy: 1}, sampleType: 'depth'}
+        : colorSampler(entry, texture);
       const samples = entry.shape.sampleCount;
-      return Object.freeze({entry, texture, device, sampler: Object.freeze(descriptor), sampleType,
+      return Object.freeze({entry, texture, device, depth, sampler: Object.freeze(descriptor), sampleType,
         sampleData: Object.freeze({samples, primarySamples: 1, isMSAA: samples > 1})});
     },
     validateNativeTextures(sources) {
@@ -451,7 +457,8 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       for (const source of sources) {
         const {entry, texture, device} = source;
         assertCurrent(entry);
-        if (entry.shape.texture !== texture) fail('STALE', 'Native texture no longer belongs to its captured target');
+        if ((source.depth ? entry.shape.depthTexture : entry.shape.texture) !== texture)
+          fail('STALE', 'Native texture no longer belongs to its captured target');
         if (device !== getDevice() || entry.session && entry.session.device !== device)
           fail('DEVICE', 'Captured native target belongs to another GPUDevice');
         if (entry.busy) fail('REENTRANT', 'Cannot sample a target during its submission');
@@ -461,17 +468,28 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       budget(bytes);
     },
     withNativeTexture(source, callback) {
-      const {entry, texture, device} = source;
-      assertCurrent(entry);
-      if (entry.shape.texture !== texture) fail('STALE', 'Native texture no longer belongs to its captured target');
-      if (device !== getDevice()) fail('DEVICE', 'Captured native target belongs to another GPUDevice');
       if (typeof callback !== 'function') fail('CALLBACK', 'Expected a synchronous submitted-use callback');
-      if (entry.busy) fail('REENTRANT', 'Cannot sample a target during its submission');
+      return this.withNativeTextures([source], textures => callback(textures.get(source.texture)));
+    },
+    withNativeTextures(sources, callback) {
+      if (!Array.isArray(sources) || !sources.length || typeof callback !== 'function')
+        fail('CALLBACK', 'Expected captured native inputs and a synchronous submitted-use callback');
+      const {entry, device} = sources[0];
+      this.validateNativeTextures(sources);
+      if (sources.some(source => source.entry !== entry)) fail('SOURCE', 'A native borrow group must belong to one target');
+      const color = sources.some(source => !source.depth), depth = sources.some(source => source.depth);
       ensure(entry);
       if (entry.session.device !== device) fail('DEVICE', 'Native target storage belongs to another GPUDevice');
+      const invoke = (nativeColor, nativeDepth) => {
+        const textures = new Map(sources.map(source => [source.texture, source.depth ? nativeDepth : nativeColor]));
+        const result = callback(textures); assertCurrent(entry); return result;
+      };
       entry.busy = true;
-      try { return entry.storage.withTexture(native => { const result = callback(native); assertCurrent(entry); return result; }); }
-      finally { entry.busy = false; if (!entry.alive) release(entry); }
+      try {
+        if (color && depth) return entry.storage.withSampledTextures(invoke);
+        if (depth) return entry.storage.withDepthTexture(native => invoke(null, native));
+        return entry.storage.withTexture(native => invoke(native, null));
+      } finally { entry.busy = false; if (!entry.alive) release(entry); }
     },
     writePixels(entry, data, options = {}) {
       assertCurrent(entry);
