@@ -24,7 +24,7 @@ export function createThreeComputeTextures({storage, poolFactory,
   maxTextures = 256, maxSnapshotBytes = 128 * 1024 * 1024} = {}) {
   if (!storage || typeof poolFactory !== 'function' || !positive(maxTextures) || !positive(maxSnapshotBytes))
     fail('OPTIONS', 'Expected storage, source texture pool and positive texture budgets');
-  const current = new Map(), records = new Set(), watches = new Map();
+  const current = new Map(), records = new Set(), watches = new Map(), sources = new Map();
   const leases = new WeakSet();
   let pool = null, disposed = false, snapshotBytes = 0, resolving = false, poolDirty = false;
   const live = () => { if (disposed) fail('DISPOSED', 'Compute texture inputs are disposed'); };
@@ -33,9 +33,10 @@ export function createThreeComputeTextures({storage, poolFactory,
   function describe(binding) {
     live();
     const t = binding?.texture;
-    if (!t || !(t.isDataTexture || t.isDataArrayTexture || t.isData3DTexture || t.isCompressedTexture) ||
-        t.isCubeTexture || t.isRenderTargetTexture || t.isVideoTexture)
-      fail('SOURCE', 'Compute sampled inputs require ready 2D/array/3D data textures or compressed 2D/array textures');
+    if (!t || !(t.isDataTexture || t.isDataArrayTexture || t.isData3DTexture || t.isCompressedTexture || t.isCubeTexture) ||
+        t.isRenderTargetTexture || t.isVideoTexture ||
+        t.isCubeTexture && (!Array.isArray(t.image) || t.image.length !== 6))
+      fail('SOURCE', 'Compute sampled inputs require ready 2D/array/3D data textures or CPU-backed cube/compressed textures');
     if (binding.store) fail('ACCESS', 'CPU data textures are read-only compute inputs; use StorageTexture for writes');
     if (!binding.isSampler && !binding.isSampledTexture) fail('BINDING', 'Expected a source texture or sampler binding');
     const shape = sourcePool().inspect(t);
@@ -61,7 +62,16 @@ export function createThreeComputeTextures({storage, poolFactory,
   }
   function retire(record) {
     if (!record.alive) return;
-    record.alive = false; records.delete(record); snapshotBytes -= record.bytes;
+    record.alive = false; records.delete(record);
+    if (--record.pixels.refs === 0) {
+      snapshotBytes -= record.pixels.bytes;
+      const variants = sources.get(record.source);
+      variants.delete(record.pixels.key);
+      if (!variants.size) sources.delete(record.source);
+    }
+    // A stale queued lease may survive until a blocked FIFO drains. It must
+    // not keep retired CPU copies alive outside the snapshot byte budget.
+    record.texture = null; record.binding = null; record.pixels = null;
     if (current.get(record.original) === record) current.delete(record.original);
     if (![...records].some(other => other.original === record.original)) {
       const listener = watches.get(record.original);
@@ -79,40 +89,70 @@ export function createThreeComputeTextures({storage, poolFactory,
     };
     original.addEventListener('dispose', listener); watches.set(original, listener);
   }
-  function snapshot(original, shape) {
-    // Copy only the source-owned data records, never arbitrary application
-    // objects. Alias preservation within this capture avoids duplicate copies.
-    const copies = new Map(); let bytes = 0;
-    const copyData = data => {
-      if (data == null) return data;
-      if (!ArrayBuffer.isView(data) || data instanceof DataView) fail('SOURCE', 'Expected typed texture data');
-      if (copies.has(data)) return copies.get(data);
-      if (data.byteLength > maxSnapshotBytes - snapshotBytes - bytes)
-        fail('BUDGET', 'Captured compute texture pixels exceed maxSnapshotBytes');
-      const copy = new data.constructor(data); copies.set(data, copy); bytes += copy.byteLength;
-      return copy;
-    };
-    const copyImage = image => image && ({...image, data: copyData(image.data)});
-    const image = copyImage(original.image);
-    const mipmaps = original.mipmaps.map(copyImage);
-    // Avoid Texture.clone()/Source constructors: those advance public UUID/ID
-    // state. Own listeners, source, ranges and mips must not alias the application.
+  function privateDescriptor(original) {
+    // No Texture.clone()/Source constructors: those advance public UUID/ID
+    // state. Private listener and upload state never aliases the application.
     const descriptors = Object.getOwnPropertyDescriptors(original);
     for (const key of ['source', 'image', 'mipmaps', 'updateRanges', 'layerUpdates', '_listeners', 'onUpdate']) delete descriptors[key];
     const texture = Object.create(Object.getPrototypeOf(original), descriptors);
-    texture.source = {...original.source, data: image};
-    texture.mipmaps = mipmaps; texture.updateRanges = [];
+    texture.updateRanges = []; texture.onUpdate = null;
     if (original.layerUpdates instanceof Set) texture.layerUpdates = new Set();
+    return texture;
+  }
+  function snapshot(original, shape) {
     const source = original.source, version = original.version, sourceVersion = source.version;
+    const key = JSON.stringify([sourceVersion, shape.key]);
+    let pixels = sources.get(source)?.get(key);
+    if (!pixels) {
+      // Source aliases share one immutable upload version and one native
+      // resource, just as the source pool does. Copy only image/mip records;
+      // never traverse arbitrary application objects attached to textures.
+      const copies = new Map(), images = new Map(); let bytes = 0;
+      const copyData = data => {
+        if (data == null) return data;
+        if (!ArrayBuffer.isView(data) || data instanceof DataView) fail('SOURCE', 'Expected typed texture data');
+        if (copies.has(data)) return copies.get(data);
+        if (data.byteLength > maxSnapshotBytes - snapshotBytes - bytes)
+          fail('BUDGET', 'Captured compute texture pixels exceed maxSnapshotBytes');
+        const copy = new data.constructor(data); copies.set(data, copy); bytes += copy.byteLength;
+        return copy;
+      };
+      function copyImage(image) {
+        if (!image) return image;
+        if (images.has(image)) return images.get(image);
+        if (Array.isArray(image)) {
+          const result = []; images.set(image, result);
+          for (const face of image) result.push(copyImage(face));
+          return result;
+        }
+        // Uncompressed CubeTexture faces are DataTextures; authored cube mips
+        // can themselves be CubeTextures. Compressed faces may be plain mip
+        // records or CompressedTextures. Preserve prototypes without public IDs.
+        if (image.isTexture || image.isDataTexture || image.isCompressedTexture || image.isCubeTexture) {
+          const texture = privateDescriptor(image); images.set(image, texture);
+          texture.source = {...image.source, data: copyImage(image.image)};
+          texture.mipmaps = image.mipmaps.map(copyImage);
+          return texture;
+        }
+        const result = {...image}; images.set(image, result);
+        if ('data' in image) result.data = copyData(image.data);
+        if ('image' in image) result.image = copyImage(image.image);
+        if (Array.isArray(image.mipmaps)) result.mipmaps = image.mipmaps.map(copyImage);
+        return result;
+      }
+      const image = copyImage(original.image), mipmaps = original.mipmaps.map(copyImage);
+      pixels = {key, source: {...source, data: image}, mipmaps, bytes, refs: 0};
+    }
+    const texture = privateDescriptor(original);
+    texture.source = pixels.source; texture.mipmaps = pixels.mipmaps;
     texture.onUpdate = () => {
-      // The source pool acknowledges manual mips before onUpdate. A queued old
-      // version must not rewrite a newer application's mip-generation request.
+      // A queued old upload cannot acknowledge a newer source's mip request.
       if (shape.manual && !shape.cube && original.source === source && original.version === version && source.version === sourceVersion)
         original.generateMipmaps = false;
       original.onUpdate?.call(original, original);
     };
-    return {original, texture, key: shape.key, source: original.source, version, sourceVersion,
-      shape, bytes, refs: 0, alive: true, binding: null};
+    return {original, texture, key: shape.key, source, version, sourceVersion,
+      pixels, refs: 0, alive: true, binding: null};
   }
   function captureBinding(binding) {
     live();
@@ -125,7 +165,14 @@ export function createThreeComputeTextures({storage, poolFactory,
       if (record && record.refs === 0) { retire(record); syncPool(); }
       if (records.size >= maxTextures) fail('BUDGET', 'Captured compute texture versions exceed maxTextures');
       const replacement = snapshot(original, shape);
-      watch(original); records.add(replacement); snapshotBytes += replacement.bytes;
+      watch(original);
+      const pixels = replacement.pixels;
+      if (pixels.refs++ === 0) {
+        let variants = sources.get(replacement.source);
+        if (!variants) sources.set(replacement.source, variants = new Map());
+        variants.set(pixels.key, pixels); snapshotBytes += pixels.bytes;
+      }
+      records.add(replacement);
       current.set(original, replacement); record = replacement;
     }
     record.refs++;
