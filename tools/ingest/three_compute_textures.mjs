@@ -4,6 +4,8 @@
  * Private descriptors (not Three constructors/clones) hold call-time pixel and
  * sampler versions while a renderer FIFO is blocked. No source IDs are allocated,
  * no source arrays are replaced, and no retained renderer submits GPU work.
+ * Partial rows/layers compose a complete immutable image from the preceding
+ * captured source version (or zero-initialized storage), not unmarked CPU edits.
  * StorageTexture bindings continue to use the renderer's shared storage owner.
  */
 export class ThreeComputeTextureError extends Error {
@@ -26,6 +28,7 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
     fail('OPTIONS', 'Expected storage, source texture pool and positive texture budgets');
   const current = new Map(), records = new Set(), watches = new Map(), sources = new Map();
   const leases = new WeakSet();
+  let captureState = null;
   let targetInputs = null;
   const targets = () => {
     if (typeof targetFactory !== 'function') fail('SOURCE', 'Native render-target inputs require the renderer target owner');
@@ -48,9 +51,60 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
     if (!binding.isSampler && !binding.isSampledTexture) fail('BINDING', 'Expected a source texture or sampler binding');
     const shape = sourcePool().inspect(t);
     if (!shape.data) fail('SOURCE', 'Expected CPU pixel or compressed-block data');
-    if (t.updateRanges?.length || t.layerUpdates?.size)
-      fail('RANGES', 'Partial compute texture updates require an existing GPU-visible snapshot');
+    updatePlan(t, shape);
     return shape;
+  }
+  // Mirror the source pool's admitted physical upload spans. The pool still
+  // validates formats, row extents and device limits and uploads the completed
+  // private image. Keeping the deltas on the CPU is necessary for queued older
+  // versions; applying them to one mutable native texture would lose FIFO state.
+  function updatePlan(texture, shape) {
+    const ranges = (texture.updateRanges ?? []).map(range => ({...range}));
+    const layers = [...texture.layerUpdates ?? []];
+    if (!ranges.length && !layers.length) return null;
+    const {width, height, channels, bpc, alignment} = shape;
+    if (![width, height, channels, bpc, alignment].every(positive) ||
+        shape.cube || shape.volume || shape.manual || shape.blockUploads ||
+        !ArrayBuffer.isView(texture.image?.data) || texture.image.data instanceof DataView)
+      fail('RANGES', 'Partial snapshots require admitted base-level row or array-layer data');
+    const rowBytes = width * channels * bpc, pitch = Math.ceil(rowBytes / alignment) * alignment;
+    const spans = [];
+    if (ranges.length) {
+      if (layers.length || shape.layered || shape.integral || channels !== 4 || bpc !== 1 || shape.flipY)
+        fail('RANGES', 'Partial rows require unflipped RGBA byte base pixels');
+      for (const {start, count} of ranges) {
+        if (!Number.isSafeInteger(start) || start < 0 || !Number.isSafeInteger(count) || count < 0 ||
+            start + count > width * height * 4 || Math.floor(start / 4) % width + Math.ceil(count / 4) > width)
+          fail('RANGES', 'Partial updates must fit one source pixel row');
+      }
+      ranges.sort((a, b) => a.start - b.start);
+      const row = i => Math.floor(Math.floor(i / 4) / width), merged = [];
+      for (const next of ranges) {
+        const last = merged.at(-1);
+        // Preserve r186's one-component adjacency and pixel rounding. In
+        // particular, start/count need not be multiples of four components.
+        if (last && next.start <= last.start + last.count + 1 && row(next.start) === row(last.start) &&
+            row(next.start + next.count - 1) === row(next.start))
+          last.count = Math.max(last.count, next.start + next.count - last.start);
+        else merged.push({...next});
+      }
+      for (const {start, count} of merged) {
+        const pixel = Math.floor(start / 4), offset = Math.floor(pixel / width) * pitch + pixel % width * 4;
+        if (count) spans.push([offset, Math.ceil(count / 4) * 4]);
+      }
+    } else {
+      if (!shape.array || !positive(shape.layers) || pitch !== rowBytes)
+        fail('RANGES', 'Partial array layers require tightly packed source rows');
+      const slice = pitch * height;
+      for (const layer of layers) {
+        if (!Number.isSafeInteger(layer) || layer < 0 || layer >= shape.layers)
+          fail('RANGES', 'Updated layer must belong to the source array');
+        spans.push([layer * slice, slice]);
+      }
+    }
+    if (spans.some(([offset, size]) => !Number.isSafeInteger(offset + size) || offset + size > texture.image.data.byteLength))
+      fail('RANGES', 'Partial upload span exceeds the source data');
+    return spans;
   }
   function inputLayout(binding, shape) {
     // SampledTexture also has isSampler=true in r186.
@@ -108,10 +162,19 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
     return texture;
   }
   function snapshot(original, shape) {
+    const updates = updatePlan(original, shape), imageAtCapture = original.image;
+    const rangesAtCapture = original.updateRanges, rangeValues = (rangesAtCapture ?? []).map(r => ({ref: r, start: r.start, count: r.count}));
+    const layersAtCapture = original.layerUpdates, layerValues = [...layersAtCapture ?? []];
+    const dataAtCapture = imageAtCapture?.data;
     const source = original.source, version = original.version, sourceVersion = source.version;
     const key = JSON.stringify([sourceVersion, shape.key]);
     let pixels = sources.get(source)?.get(key);
     if (!pixels) {
+      // Residency is keyed by the same complete descriptor as the native pool.
+      // A new source/shape/sampler starts from zero, just like a fresh GPUTexture.
+      let previous = null;
+      if (updates) for (const candidate of sources.get(source)?.values() ?? [])
+        if (candidate.descriptorKey === shape.key) previous = candidate.source.data?.data;
       // Source aliases share one immutable upload version and one native
       // resource, just as the source pool does. Copy only image/mip records;
       // never traverse arbitrary application objects attached to textures.
@@ -122,7 +185,18 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
         if (copies.has(data)) return copies.get(data);
         if (data.byteLength > maxSnapshotBytes - snapshotBytes - bytes)
           fail('BUDGET', 'Captured compute texture pixels exceed maxSnapshotBytes');
-        const copy = new data.constructor(data); copies.set(data, copy); bytes += copy.byteLength;
+        let copy;
+        if (updates && data === dataAtCapture) {
+          copy = new data.constructor(data.length);
+          const destination = new Uint8Array(copy.buffer, copy.byteOffset, copy.byteLength);
+          if (previous) {
+            if (previous.constructor !== data.constructor) fail('RANGES', 'Partial snapshot component type changed');
+            destination.set(new Uint8Array(previous.buffer, previous.byteOffset, Math.min(previous.byteLength, copy.byteLength)));
+          }
+          const incoming = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+          for (const [offset, size] of updates) destination.set(incoming.subarray(offset, offset + size), offset);
+        } else copy = new data.constructor(data);
+        copies.set(data, copy); bytes += copy.byteLength;
         return copy;
       };
       function copyImage(image) {
@@ -149,14 +223,22 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
         return result;
       }
       const image = copyImage(original.image), mipmaps = original.mipmaps.map(copyImage);
-      pixels = {key, source: {...source, data: image}, mipmaps, bytes, refs: 0};
+      pixels = {key, descriptorKey: shape.key, source: {...source, data: image}, mipmaps, bytes, refs: 0};
     }
     const texture = privateDescriptor(original);
     texture.source = pixels.source; texture.mipmaps = pixels.mipmaps;
     texture.onUpdate = () => {
-      // A queued old upload cannot acknowledge a newer source's mip request.
-      if (shape.manual && !shape.cube && original.source === source && original.version === version && source.version === sourceVersion)
-        original.generateMipmaps = false;
+      // Acknowledging an older queued upload must not erase a newer request,
+      // including a request mutated without a version bump inside user code.
+      if (original.source === source && original.version === version && source.version === sourceVersion &&
+          original.image === imageAtCapture && original.image?.data === dataAtCapture) {
+        if (shape.manual && !shape.cube) original.generateMipmaps = false;
+        if (updates && original.updateRanges === rangesAtCapture && rangesAtCapture?.length === rangeValues.length &&
+            rangeValues.every((r, i) => rangesAtCapture[i] === r.ref && r.ref.start === r.start && r.ref.count === r.count))
+          original.clearUpdateRanges?.();
+        if (updates && original.layerUpdates === layersAtCapture && layersAtCapture?.size === layerValues.length &&
+            layerValues.every(layer => layersAtCapture.has(layer))) original.clearLayerUpdates?.();
+      }
       original.onUpdate?.call(original, original);
     };
     return {original, texture, key: shape.key, source, version, sourceVersion,
@@ -171,7 +253,6 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
     let record = current.get(original);
     if (!record || record.key !== shape.key || record.source !== original.source ||
         record.version !== original.version || record.sourceVersion !== original.source.version) {
-      if (record && record.refs === 0) { retire(record); syncPool(); }
       if (records.size >= maxTextures) fail('BUDGET', 'Captured compute texture versions exceed maxTextures');
       const replacement = snapshot(original, shape);
       watch(original);
@@ -182,7 +263,9 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
         variants.set(pixels.key, pixels); snapshotBytes += pixels.bytes;
       }
       records.add(replacement);
-      current.set(original, replacement); record = replacement;
+      current.set(original, replacement);
+      if (record && record.refs === 0 && !captureState?.records.has(record)) { retire(record); syncPool(); }
+      record = replacement;
     }
     record.refs++;
     const lease = {record, layout: inputLayout(binding, shape), sampler: binding.isSampler && !binding.isSampledTexture, released: false};
@@ -194,6 +277,34 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
   }
   return {
     layoutOf, captureBinding,
+    // Public compute validates the whole request and reserves its FIFO slot
+    // inside this synchronous transaction. Rejected requests must not become
+    // the baseline for a later partial upload. Existing versions remain charged
+    // until commit/rollback; no temporary copy is exempt from the byte budget.
+    captureDispatch(run) {
+      live();
+      if (captureState || resolving) fail('REENTRY', 'Cannot nest a compute texture capture transaction');
+      if (typeof run !== 'function') fail('OPTIONS', 'Expected a synchronous capture callback');
+      const before = {current: new Map(current), records: new Set(records)};
+      captureState = before;
+      try {
+        const result = run();
+        if (result?.then) {
+          Promise.resolve(result).catch(() => {});
+          fail('ASYNC_USE', 'Compute texture capture cannot cross an await');
+        }
+        return result;
+      } catch (error) {
+        current.clear();
+        for (const [original, record] of before.current) if (record.alive) current.set(original, record);
+        for (const record of records) if (!before.records.has(record)) retire(record);
+        throw error;
+      } finally {
+        captureState = null;
+        for (const record of records) if (record.refs === 0 && current.get(record.original) !== record) retire(record);
+        syncPool();
+      }
+    },
     sampleData(texture) {
       if (isTarget({texture})) return targets().sampleData(texture);
       layoutOf({texture, isSampledTexture: true});
@@ -237,7 +348,7 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
       if (!leases.has(snapshot) || snapshot.released) return;
       snapshot.released = true;
       const record = snapshot.record;
-      if (--record.refs === 0 && current.get(record.original) !== record) { retire(record); syncPool(); }
+      if (--record.refs === 0 && current.get(record.original) !== record && !captureState?.records.has(record)) { retire(record); syncPool(); }
     },
     async whenIdle() { live(); await Promise.all([storage.whenIdle(), pool?.whenIdle(), targetInputs?.whenIdle()]); live(); },
     get diagnostics() { return {textures: current.size, versions: records.size, snapshotBytes}; },

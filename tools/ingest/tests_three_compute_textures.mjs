@@ -180,13 +180,15 @@ test('bounded queued versions become available again after release', () => {
   r.owner.release(b); r.owner.release(c); r.owner.release(c);
   assert.equal(r.owner.diagnostics.snapshotBytes, 4); r.owner.dispose();
 });
-test('failed replacement does not strand a source listener or partial allocation', () => {
+test('failed replacement retains the previous baseline and releases it on disposal', () => {
   const r = rig({maxSnapshotBytes: 4}), t = new Texture();
   const a = r.owner.captureBinding(sampled(t)); r.owner.release(a);
   t.image = {...t.image, data: new Uint8Array(8)}; t.touch();
   assert.throws(() => r.owner.captureBinding(sampled(t)), {code: 'THREE_COMPUTE_TEXTURE_BUDGET'});
-  assert.equal(t._listeners.dispose.size, 0);
-  assert.deepEqual(r.owner.diagnostics, {textures: 0, versions: 0, snapshotBytes: 0}); r.owner.dispose();
+  assert.equal(t._listeners.dispose.size, 1);
+  assert.deepEqual(r.owner.diagnostics, {textures: 1, versions: 1, snapshotBytes: 4});
+  r.owner.dispose(); assert.equal(t._listeners.dispose.size, 0);
+  assert.deepEqual(r.owner.diagnostics, {textures: 0, versions: 0, snapshotBytes: 0});
 });
 test('asynchronous source upload failures participate in compute completion', async () => {
   const r = rig(), t = new Texture(); r.owner.layoutOf(sampled(t));
@@ -200,11 +202,12 @@ test('existing StorageTexture bindings remain borrowed and delegated', async () 
   assert.equal(r.owner.resolve(a), 'storage-view'); r.owner.validateDispatch([a]); r.owner.written([a]);
   r.owner.release(a); assert.equal(r.factoryCalls, 0); await r.owner.whenIdle(); r.owner.dispose();
 });
-test('unsupported sources, writes, partial updates, and unready data fail explicitly', () => {
+test('unsupported sources, writes, incomplete partial descriptors, and unready data fail explicitly', () => {
   const r = rig();
   for (const flags of [{isRenderTargetTexture: true}, {isVideoTexture: true}, {isCubeTexture: true}, {isDataTexture: false}])
     assert.throws(() => r.owner.captureBinding(sampled(new Texture(undefined, flags))), {code: 'THREE_COMPUTE_TEXTURE_SOURCE'});
   assert.throws(() => r.owner.captureBinding({...sampled(new Texture()), store: true}), {code: 'THREE_COMPUTE_TEXTURE_ACCESS'});
+  // This inspector double does not supply the row/layer geometry required by partial snapshots.
   const ranged = new Texture(); ranged.updateRanges.push({start: 0, count: 4});
   assert.throws(() => r.owner.captureBinding(sampled(ranged)), {code: 'THREE_COMPUTE_TEXTURE_RANGES'});
   const layered = new Texture(undefined, {isDataArrayTexture: true, layerUpdates: new Set([0])});

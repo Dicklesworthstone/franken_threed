@@ -270,15 +270,17 @@ function createThreeCompute(renderer, three) {
         const entry = program(node);
         withFrame(node, () => {
           update(entry, 'before'); update(entry, 'current');
-          const request = capture(node, entry, override, deferred());
-          let result;
-          try { result = schedule(() => request.issue()); }
-          catch (error) { request.release(); throw error; }
-          if (result?.then) {
-            const done = Promise.resolve(result).finally(request.release);
-            // A later source callback may throw before we return this promise.
-            done.catch(() => {}); pending.push(done);
-          } else request.release();
+          textureOwner.captureDispatch(() => {
+            const request = capture(node, entry, override, deferred());
+            let result;
+            try { result = schedule(() => request.issue()); }
+            catch (error) { request.release(); throw error; }
+            if (result?.then) {
+              const done = Promise.resolve(result).finally(request.release);
+              // A later source callback may throw before we return this promise.
+              done.catch(() => {}); pending.push(done);
+            } else request.release();
+          });
           // Schedule first: a compute/readback started by an after-update node
           // must follow this kernel, even while render preparation is pending.
           update(entry, 'after');
@@ -293,10 +295,13 @@ function createThreeCompute(renderer, three) {
       const node = list[i], entry = program(node);
       const request = withFrame(node, () => {
         update(entry, 'before'); update(entry, 'current');
-        return capture(node, entry, null, false);
+        return textureOwner.captureDispatch(() => {
+          const request = capture(node, entry, null, false);
+          try { request.issue(false); return request; }
+          catch (error) { request.release(); throw error; }
+        });
       });
       try {
-        request.issue(false);
         await gpu.prepare(request.shader);
         live(); request.validate();
         if (programs.get(node) !== entry) fail('STALE', 'Compute node changed during asynchronous compilation');
@@ -362,7 +367,12 @@ export function withThreeCompute(Base, THREE) {
   function submit(renderer, issue) {
     check(renderer);
     if (renderer._computeTurn || (renderer._initialized && !renderer._drain && !renderer._preparing)) return issue();
-    return new Promise((resolve, reject) => renderer._enqueue({transfer: true, issue, resolve, reject}));
+    let resolve, reject;
+    const pending = new Promise((a, b) => { resolve = a; reject = b; });
+    // Reserve outside the Promise executor: a full FIFO is a synchronous
+    // capture failure, not an accepted texture version with a rejected promise.
+    renderer._enqueue({transfer: true, issue, resolve, reject});
+    return pending;
   }
   return class WebGPURenderer extends Base {
     constructor(...args) {
