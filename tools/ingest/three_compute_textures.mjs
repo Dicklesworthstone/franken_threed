@@ -26,7 +26,7 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
   maxTextures = 256, maxSnapshotBytes = 128 * 1024 * 1024} = {}) {
   if (!storage || typeof poolFactory !== 'function' || !positive(maxTextures) || !positive(maxSnapshotBytes))
     fail('OPTIONS', 'Expected storage, source texture pool and positive texture budgets');
-  const current = new Map(), records = new Set(), watches = new Map(), sources = new Map();
+  const current = new Map(), records = new Set(), watches = new Map(), sources = new Map(), histories = new Map();
   const leases = new WeakSet();
   let captureState = null;
   let targetInputs = null;
@@ -62,6 +62,29 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
     const ranges = (texture.updateRanges ?? []).map(range => ({...range}));
     const layers = [...texture.layerUpdates ?? []];
     if (!ranges.length && !layers.length) return null;
+    if (shape.blockUploads) {
+      if (ranges.length || !shape.array || !positive(shape.layers) || !positive(shape.levels) ||
+          !Array.isArray(shape.uploads) || shape.uploads.length !== shape.levels)
+        fail('RANGES', 'Compressed partial updates require an admitted array mip chain');
+      for (const layer of layers) if (!Number.isSafeInteger(layer) || layer < 0 || layer >= shape.layers)
+        fail('RANGES', 'Updated compressed layer must belong to the source array');
+      const plans = new Map();
+      for (const [level, upload] of shape.uploads.entries()) {
+        const image = texture.mipmaps[level], data = image?.data;
+        if (upload.image !== image || upload.level !== level || upload.layer !== 0 || upload.depth !== shape.layers ||
+            !positive(upload.sliceBytes) || !(data instanceof Uint8Array) ||
+            upload.sliceBytes * (shape.layers - 1) >= data.byteLength)
+          fail('RANGES', 'Compressed mip metadata does not describe every source layer');
+        // sliceBytes comes from the native inspector's block geometry, not
+        // texel dimensions or UNPACK_ALIGNMENT. RGBA fallback mips may omit
+        // unused trailing padding on the last layer's last row.
+        plans.set(image, {level, spans: layers.map(layer => {
+          const offset = layer * upload.sliceBytes;
+          return [offset, Math.min(upload.sliceBytes, data.byteLength - offset)];
+        })});
+      }
+      return plans;
+    }
     const {width, height, channels, bpc, alignment} = shape;
     if (![width, height, channels, bpc, alignment].every(positive) ||
         shape.cube || shape.volume || shape.manual || shape.blockUploads ||
@@ -104,7 +127,7 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
     }
     if (spans.some(([offset, size]) => !Number.isSafeInteger(offset + size) || offset + size > texture.image.data.byteLength))
       fail('RANGES', 'Partial upload span exceeds the source data');
-    return spans;
+    return new Map([[texture.image, {level: null, spans}]]);
   }
   function inputLayout(binding, shape) {
     // SampledTexture also has isSampler=true in r186.
@@ -122,15 +145,40 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
     poolDirty = false;
     if (pool) { if (disposed) pool.dispose(); else pool.retain([...records].map(record => record.texture)); }
   }
+  function retainPixels(source, pixels) {
+    if (pixels.refs++ !== 0) return;
+    let variants = sources.get(source);
+    if (!variants) sources.set(source, variants = new Map());
+    variants.set(pixels.key, pixels); snapshotBytes += pixels.bytes;
+  }
+  function releasePixels(source, pixels) {
+    if (--pixels.refs !== 0) return;
+    snapshotBytes -= pixels.bytes;
+    const variants = sources.get(source);
+    variants.delete(pixels.key);
+    if (!variants.size) sources.delete(source);
+  }
+  function setHistory(source, key, pixels) {
+    let group = histories.get(source);
+    if (!group) histories.set(source, group = new Map());
+    const previous = group.get(key);
+    if (previous === pixels) return;
+    retainPixels(source, pixels); group.set(key, pixels);
+    if (previous) releasePixels(source, previous);
+  }
+  function pruneHistories() {
+    for (const [source, group] of histories) {
+      for (const [key, pixels] of group) if (![...records].some(record => record.source === source && record.key === key)) {
+        group.delete(key); releasePixels(source, pixels);
+      }
+      if (!group.size) histories.delete(source);
+    }
+  }
   function retire(record) {
     if (!record.alive) return;
     record.alive = false; records.delete(record);
-    if (--record.pixels.refs === 0) {
-      snapshotBytes -= record.pixels.bytes;
-      const variants = sources.get(record.source);
-      variants.delete(record.pixels.key);
-      if (!variants.size) sources.delete(record.source);
-    }
+    releasePixels(record.source, record.pixels);
+    pruneHistories();
     // A stale queued lease may survive until a blocked FIFO drains. It must
     // not keep retired CPU copies alive outside the snapshot byte budget.
     record.texture = null; record.binding = null; record.pixels = null;
@@ -165,28 +213,31 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
     const updates = updatePlan(original, shape), imageAtCapture = original.image;
     const rangesAtCapture = original.updateRanges, rangeValues = (rangesAtCapture ?? []).map(r => ({ref: r, start: r.start, count: r.count}));
     const layersAtCapture = original.layerUpdates, layerValues = [...layersAtCapture ?? []];
-    const dataAtCapture = imageAtCapture?.data;
+    const dataAtCapture = imageAtCapture?.data, mipsAtCapture = original.mipmaps;
+    const mipValues = shape.blockUploads ? mipsAtCapture.map(image => ({image, data: image.data})) : null;
     const source = original.source, version = original.version, sourceVersion = source.version;
     const key = JSON.stringify([sourceVersion, shape.key]);
     let pixels = sources.get(source)?.get(key);
     if (!pixels) {
       // Residency is keyed by the same complete descriptor as the native pool.
       // A new source/shape/sampler starts from zero, just like a fresh GPUTexture.
-      let previous = null;
-      if (updates) for (const candidate of sources.get(source)?.values() ?? [])
-        if (candidate.descriptorKey === shape.key) previous = candidate.source.data?.data;
+      const previousPixels = updates ? histories.get(source)?.get(shape.key) : null;
+      if (updates && shape.blockUploads && !previousPixels)
+        fail('RANGES', 'Upload a complete compressed mip chain before partial layer updates');
       // Source aliases share one immutable upload version and one native
       // resource, just as the source pool does. Copy only image/mip records;
       // never traverse arbitrary application objects attached to textures.
       const copies = new Map(), images = new Map(); let bytes = 0;
-      const copyData = data => {
+      const copyData = (data, image) => {
         if (data == null) return data;
         if (!ArrayBuffer.isView(data) || data instanceof DataView) fail('SOURCE', 'Expected typed texture data');
-        if (copies.has(data)) return copies.get(data);
+        const partial = updates?.get(image), copyKey = partial ?? data;
+        if (copies.has(copyKey)) return copies.get(copyKey);
         if (data.byteLength > maxSnapshotBytes - snapshotBytes - bytes)
           fail('BUDGET', 'Captured compute texture pixels exceed maxSnapshotBytes');
         let copy;
-        if (updates && data === dataAtCapture) {
+        if (partial) {
+          const previous = partial.level === null ? previousPixels?.source.data?.data : previousPixels?.mipmaps[partial.level]?.data;
           copy = new data.constructor(data.length);
           const destination = new Uint8Array(copy.buffer, copy.byteOffset, copy.byteLength);
           if (previous) {
@@ -194,9 +245,9 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
             destination.set(new Uint8Array(previous.buffer, previous.byteOffset, Math.min(previous.byteLength, copy.byteLength)));
           }
           const incoming = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-          for (const [offset, size] of updates) destination.set(incoming.subarray(offset, offset + size), offset);
+          for (const [offset, size] of partial.spans) destination.set(incoming.subarray(offset, offset + size), offset);
         } else copy = new data.constructor(data);
-        copies.set(data, copy); bytes += copy.byteLength;
+        copies.set(copyKey, copy); bytes += copy.byteLength;
         return copy;
       };
       function copyImage(image) {
@@ -217,7 +268,7 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
           return texture;
         }
         const result = {...image}; images.set(image, result);
-        if ('data' in image) result.data = copyData(image.data);
+        if ('data' in image) result.data = copyData(image.data, image);
         if ('image' in image) result.image = copyImage(image.image);
         if (Array.isArray(image.mipmaps)) result.mipmaps = image.mipmaps.map(copyImage);
         return result;
@@ -226,12 +277,20 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
       pixels = {key, descriptorKey: shape.key, source: {...source, data: image}, mipmaps, bytes, refs: 0};
     }
     const texture = privateDescriptor(original);
+    let record;
     texture.source = pixels.source; texture.mipmaps = pixels.mipmaps;
     texture.onUpdate = () => {
+      // A source history can outlive the alias that first uploaded it. Recreate
+      // native residency as needed without replaying that version's callback.
+      if (pixels.uploaded) return;
+      pixels.uploaded = true;
+      captureState?.uploaded.add(record);
       // Acknowledging an older queued upload must not erase a newer request,
       // including a request mutated without a version bump inside user code.
       if (original.source === source && original.version === version && source.version === sourceVersion &&
-          original.image === imageAtCapture && original.image?.data === dataAtCapture) {
+          original.image === imageAtCapture && original.image?.data === dataAtCapture &&
+          (!mipValues || original.mipmaps === mipsAtCapture && original.mipmaps.length === mipValues.length &&
+            mipValues.every((value, i) => original.mipmaps[i] === value.image && value.image.data === value.data))) {
         if (shape.manual && !shape.cube) original.generateMipmaps = false;
         if (updates && original.updateRanges === rangesAtCapture && rangesAtCapture?.length === rangeValues.length &&
             rangeValues.every((r, i) => rangesAtCapture[i] === r.ref && r.ref.start === r.start && r.ref.count === r.count))
@@ -241,7 +300,7 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
       }
       original.onUpdate?.call(original, original);
     };
-    return {original, texture, key: shape.key, source, version, sourceVersion,
+    return record = {original, texture, key: shape.key, source, version, sourceVersion,
       pixels, refs: 0, alive: true, binding: null};
   }
   function captureBinding(binding) {
@@ -257,12 +316,9 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
       const replacement = snapshot(original, shape);
       watch(original);
       const pixels = replacement.pixels;
-      if (pixels.refs++ === 0) {
-        let variants = sources.get(replacement.source);
-        if (!variants) sources.set(replacement.source, variants = new Map());
-        variants.set(pixels.key, pixels); snapshotBytes += pixels.bytes;
-      }
+      retainPixels(replacement.source, pixels);
       records.add(replacement);
+      setHistory(replacement.source, replacement.key, pixels);
       current.set(original, replacement);
       if (record && record.refs === 0 && !captureState?.records.has(record)) { retire(record); syncPool(); }
       record = replacement;
@@ -285,7 +341,11 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
       live();
       if (captureState || resolving) fail('REENTRY', 'Cannot nest a compute texture capture transaction');
       if (typeof run !== 'function') fail('OPTIONS', 'Expected a synchronous capture callback');
-      const before = {current: new Map(current), records: new Set(records)};
+      const before = {current: new Map(current), records: new Set(records), uploaded: new Set(),
+        histories: new Map([...histories].map(([source, group]) => [source, new Map(group)]))};
+      // Pin history-only payloads too: disposing an uploading alias must not
+      // make rollback resurrect an uncharged or already-retired baseline.
+      for (const [source, group] of before.histories) for (const pixels of group.values()) retainPixels(source, pixels);
       captureState = before;
       try {
         const result = run();
@@ -295,14 +355,25 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
         }
         return result;
       } catch (error) {
+        // Admission is reversible; a completed native upload is not. In
+        // particular onUpdate may throw AFTER the pool acknowledges its source.
+        // Preserve those versions without replaying callbacks on a later retry.
+        const uploaded = [...before.uploaded].filter(record => record.alive);
         current.clear();
         for (const [original, record] of before.current) if (record.alive) current.set(original, record);
-        for (const record of records) if (!before.records.has(record)) retire(record);
+        for (const record of uploaded) current.set(record.original, record);
+        for (const record of records) if (!before.records.has(record) && !before.uploaded.has(record)) retire(record);
+        for (const [source, group] of histories) for (const pixels of group.values()) releasePixels(source, pixels);
+        histories.clear();
+        for (const [source, group] of before.histories) for (const [key, pixels] of group)
+          if ([...records].some(record => record.source === source && record.key === key)) setHistory(source, key, pixels);
+        for (const record of uploaded) setHistory(record.source, record.key, record.pixels);
         throw error;
       } finally {
         captureState = null;
         for (const record of records) if (record.refs === 0 && current.get(record.original) !== record) retire(record);
-        syncPool();
+        for (const [source, group] of before.histories) for (const pixels of group.values()) releasePixels(source, pixels);
+        pruneHistories(); syncPool();
       }
     },
     sampleData(texture) {

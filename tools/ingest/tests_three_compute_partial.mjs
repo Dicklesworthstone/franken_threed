@@ -29,6 +29,19 @@ class Texture extends Events {
   clearUpdateRanges() { this.updateRanges.length = 0; }
   clearLayerUpdates() { this.layerUpdates.clear(); }
 }
+class CompressedTexture extends Texture {
+  constructor({width = 8, height = 8, layers = 3, blockWidth = 4, blockHeight = 4, blockBytes = 16} = {}) {
+    super(); this.isDataTexture = false; this.isCompressedTexture = this.isCompressedArrayTexture = true;
+    this.source.data = {width, height, depth: layers}; this.layerUpdates = new Set();
+    Object.assign(this, {blockWidth, blockHeight, blockBytes}); this.mipmaps = [];
+    const levels = 1 + Math.floor(Math.log2(Math.max(width, height)));
+    for (let level = 0; level < levels; level++) {
+      const w = Math.max(1, width >> level), h = Math.max(1, height >> level);
+      const size = Math.ceil(w / blockWidth) * Math.ceil(h / blockHeight) * blockBytes * layers;
+      this.mipmaps.push({width: w, height: h, data: new Uint8Array(size).fill(level + 1)});
+    }
+  }
+}
 const sampled = texture => ({texture, isSampledTexture: true, isSampler: true});
 const sampler = texture => ({texture, isSampler: true});
 const kernel = bindings => Object.assign(new Events(), {isComputeNode: true, version: 0,
@@ -43,6 +56,15 @@ function poolRig(options = {}) {
     async whenIdle() {}, bindingsFor: r => r, dispose() {}};
   const pool = {
     inspect(t) {
+      if (t.isCompressedArrayTexture) {
+        const {width, height, depth: layers} = t.image, levels = t.mipmaps.length;
+        const {blockWidth, blockHeight, blockBytes} = t;
+        return {data: true, blockUploads: true, array: true, manual: true, width, height, layers, levels,
+          sampleType: 'float', viewDimension: '2d-array',
+          key: JSON.stringify(['compressed', width, height, layers, levels, blockWidth, blockHeight, blockBytes, t.wrapS]),
+          uploads: t.mipmaps.map((image, level) => ({image, level, layer: 0, depth: layers,
+            sliceBytes: Math.ceil(image.width / blockWidth) * Math.ceil(image.height / blockHeight) * blockBytes}))};
+      }
       const array = t.isDataArrayTexture, bpc = t.image.data.BYTES_PER_ELEMENT;
       const viewDimension = array ? '2d-array' : '2d', sampleType = t.sampleType ?? 'float';
       const shape = {data: true, width: t.image.width, height: t.image.height, layers: t.image.depth,
@@ -57,7 +79,8 @@ function poolRig(options = {}) {
         assert.equal(t.layerUpdates?.size ?? 0, 0);
         let binding = sourceViews.get(t.source);
         if (!binding) {
-          binding = {view: {data: new t.image.data.constructor(t.image.data), texture: t}, sampler: {wrapS: t.wrapS}};
+          binding = {view: {data: t.image.data ? new t.image.data.constructor(t.image.data) : null,
+            mips: t.mipmaps.map(image => new Uint8Array(image.data)), texture: t}, sampler: {wrapS: t.wrapS}};
           sourceViews.set(t.source, binding); uploads.push(binding.view);
           t.onUpdate?.(t);
         }
@@ -293,4 +316,155 @@ test('a refused public FIFO reservation cannot become a later partial-update bas
   r.renderer.queueFailure = null; r.renderer._deferredError = null; r.renderer._preparing = false;
   t.image.data.fill(9); t.updateRanges = [{start: 16, count: 4}]; t.touch(); r.renderer.compute(node);
   assert.deepEqual(seen(r)[1], [...Array(16).fill(1), ...Array(4).fill(9), ...Array(12).fill(1)]); r.renderer.dispose();
+});
+
+test('source-wide delta history survives disposal of its latest uploading alias', () => {
+  const r = poolRig(), a = new Texture(), b = new Texture(); b.source = a.source; consume(r, a); consume(r, b);
+  b.image.data.fill(8); b.updateRanges = [{start: 0, count: 4}]; b.touch(); consume(r, b); b.dispose();
+  assert.deepEqual(r.owner.diagnostics, {textures: 1, versions: 1, snapshotBytes: 64});
+  a.image.data.fill(9); a.updateRanges = [{start: 16, count: 4}]; a.touch();
+  assert.deepEqual(bytes(consume(r, a)), [...Array(4).fill(8), ...Array(12).fill(1), ...Array(4).fill(9), ...Array(12).fill(1)]);
+  assert.equal(r.owner.diagnostics.snapshotBytes, 32); r.owner.dispose(); assert.equal(r.owner.diagnostics.snapshotBytes, 0);
+});
+test('restoring residency from a shared history does not replay its upload callback', () => {
+  const r = poolRig(), a = new Texture(), b = new Texture(); b.source = a.source; consume(r, a); consume(r, b);
+  let callbacks = 0; a.onUpdate = b.onUpdate = () => callbacks++;
+  b.image.data.fill(8); b.updateRanges = [{start: 0, count: 4}]; b.touch(); consume(r, b); b.dispose();
+  assert.equal(callbacks, 1); assert.equal(r.uploads.length, 2);
+  assert.deepEqual(bytes(consume(r, a)), [...Array(4).fill(8), ...Array(28).fill(1)]);
+  assert.equal(r.uploads.length, 3); assert.equal(callbacks, 1); r.owner.dispose();
+});
+test('rollback preserves a charged history even when no texture record owns that version', () => {
+  const r = poolRig({maxSnapshotBytes: 96}), a = new Texture(), b = new Texture(); b.source = a.source;
+  consume(r, a); consume(r, b); b.image.data.fill(8); b.updateRanges = [{start: 0, count: 4}]; b.touch(); consume(r, b); b.dispose();
+  a.image.data.fill(7); a.updateRanges = [{start: 16, count: 4}]; a.touch();
+  assert.throws(() => r.owner.captureDispatch(() => {
+    const lease = r.owner.captureBinding(sampled(a)); r.owner.release(lease); throw new Error('reservation rejected');
+  }), /reservation rejected/);
+  assert.equal(r.owner.diagnostics.snapshotBytes, 64);
+  a.image.data.fill(9); a.updateRanges = [{start: 24, count: 4}]; a.touch();
+  assert.deepEqual(bytes(consume(r, a)), [...Array(4).fill(8), ...Array(20).fill(1), ...Array(4).fill(9), ...Array(4).fill(1)]);
+  r.owner.dispose(); assert.equal(r.owner.diagnostics.snapshotBytes, 0);
+});
+test('disposing the last source alias releases orphan history bytes and allows a zero-based restart', () => {
+  const r = poolRig(), a = new Texture(), b = new Texture(); b.source = a.source; consume(r, a); consume(r, b);
+  b.updateRanges = [{start: 0, count: 4}]; b.touch(); consume(r, b); b.dispose(); a.dispose();
+  assert.equal(r.owner.diagnostics.snapshotBytes, 0); assert.equal(r.resident.size, 0);
+  a.image.data.fill(9); a.updateRanges = [{start: 16, count: 4}]; a.touch();
+  assert.deepEqual(bytes(consume(r, a)), [...Array(16).fill(0), ...Array(4).fill(9), ...Array(12).fill(0)]); r.owner.dispose();
+});
+test('source disposal during transaction rollback cannot resurrect a baseline or listener', () => {
+  const r = poolRig(), t = new Texture(); consume(r, t);
+  assert.throws(() => r.owner.captureDispatch(() => { t.dispose(); throw new Error('cancelled'); }), /cancelled/);
+  assert.equal(r.owner.diagnostics.snapshotBytes, 0); assert.equal(t.listeners.dispose.size, 0); r.owner.dispose();
+});
+test('compressed array layer updates preserve every unmentioned block at every authored mip', () => {
+  for (const profile of [{blockBytes: 8}, {blockBytes: 16}, {width: 12, height: 12, blockWidth: 6, blockHeight: 6},
+    {width: 4, height: 4, blockWidth: 1, blockHeight: 1, blockBytes: 4}]) {
+    const r = poolRig(), t = new CompressedTexture(profile); consume(r, t);
+    for (const mip of t.mipmaps) mip.data.fill(99); t.layerUpdates.add(1); t.touch();
+    const view = consume(r, t);
+    for (const [level, data] of view.mips.entries()) {
+      const slice = data.length / 3;
+      assert.deepEqual([...data], [...Array(slice).fill(level + 1), ...Array(slice).fill(99), ...Array(slice).fill(level + 1)]);
+    }
+    assert.equal(t.layerUpdates.size, 0); r.owner.dispose();
+  }
+});
+test('queued compressed mip deltas retain each call-time block version and acknowledgment', () => {
+  const r = poolRig(), t = new CompressedTexture(); consume(r, t);
+  for (const mip of t.mipmaps) mip.data.fill(8); t.layerUpdates.add(0); t.touch(); const a = r.owner.captureBinding(sampled(t));
+  for (const mip of t.mipmaps) mip.data.fill(9); t.layerUpdates = new Set([2]); t.touch(); const b = r.owner.captureBinding(sampled(t));
+  for (const mip of t.mipmaps) mip.data.fill(77);
+  const first = r.owner.resolve(a); assert.deepEqual([...t.layerUpdates], [2]); const second = r.owner.resolve(b);
+  for (let level = 0; level < second.mips.length; level++) {
+    const slice = second.mips[level].length / 3;
+    assert.deepEqual([...first.mips[level]], [...Array(slice).fill(8), ...Array(slice * 2).fill(level + 1)]);
+    assert.deepEqual([...second.mips[level]], [...Array(slice).fill(8), ...Array(slice).fill(level + 1), ...Array(slice).fill(9)]);
+  }
+  assert.equal(t.layerUpdates.size, 0); r.owner.release(a); r.owner.release(b); r.owner.dispose();
+});
+test('shared incoming mip arrays do not incorrectly share unequal historical tail blocks', () => {
+  const r = poolRig(), t = new CompressedTexture(); consume(r, t);
+  const shared = new Uint8Array(t.mipmaps[2].data.length).fill(9);
+  t.mipmaps[2].data = t.mipmaps[3].data = shared; t.layerUpdates.add(0); t.touch();
+  const view = consume(r, t), slice = shared.length / 3;
+  assert.deepEqual([...view.mips[2]], [...Array(slice).fill(9), ...Array(slice * 2).fill(3)]);
+  assert.deepEqual([...view.mips[3]], [...Array(slice).fill(9), ...Array(slice * 2).fill(4)]);
+  assert.notEqual(view.texture.mipmaps[2].data, view.texture.mipmaps[3].data); r.owner.dispose();
+});
+test('compressed partial updates require a complete initial version instead of inventing zero block encodings', () => {
+  const r = poolRig(), t = new CompressedTexture(); t.layerUpdates.add(1);
+  assert.throws(() => r.owner.captureBinding(sampled(t)), {code: 'THREE_COMPUTE_TEXTURE_RANGES'});
+  assert.equal(r.uploads.length, 0); assert.equal(r.owner.diagnostics.snapshotBytes, 0);
+  t.layerUpdates.clear(); consume(r, t); t.layerUpdates.add(1); t.touch(); consume(r, t); r.owner.dispose();
+});
+test('replacing a compressed mip array without a version bump prevents stale acknowledgment', () => {
+  const r = poolRig(), t = new CompressedTexture(); consume(r, t); t.layerUpdates.add(1); t.touch();
+  const use = r.owner.captureBinding(sampled(t)); t.mipmaps[0].data = new Uint8Array(t.mipmaps[0].data.length).fill(90);
+  r.owner.resolve(use); assert.deepEqual([...t.layerUpdates], [1]); r.owner.release(use); r.owner.dispose();
+});
+test('compressed deltas recover the correct history after the last uploading alias is disposed', () => {
+  const r = poolRig(), a = new CompressedTexture(), b = new CompressedTexture(); b.source = a.source; b.mipmaps = a.mipmaps;
+  consume(r, a); consume(r, b); b.mipmaps.forEach(m => m.data.fill(8)); b.layerUpdates.add(0); b.touch(); consume(r, b); b.dispose();
+  a.mipmaps.forEach(m => m.data.fill(9)); a.layerUpdates.add(2); a.touch(); const view = consume(r, a);
+  for (const [level, data] of view.mips.entries()) {
+    const slice = data.length / 3;
+    assert.deepEqual([...data], [...Array(slice).fill(8), ...Array(slice).fill(level + 1), ...Array(slice).fill(9)]);
+  }
+  r.owner.dispose(); assert.equal(r.owner.diagnostics.snapshotBytes, 0);
+});
+test('a rejected compressed delta is rolled back across the entire mip chain', () => {
+  const r = poolRig(), t = new CompressedTexture(); consume(r, t); const before = r.owner.diagnostics.snapshotBytes;
+  t.mipmaps.forEach(m => m.data.fill(8)); t.layerUpdates.add(0); t.touch();
+  assert.throws(() => r.owner.captureDispatch(() => { const use = r.owner.captureBinding(sampled(t));
+    r.owner.release(use); throw new Error('invalid dispatch'); }), /invalid dispatch/);
+  assert.equal(r.owner.diagnostics.snapshotBytes, before);
+  t.mipmaps.forEach(m => m.data.fill(9)); t.layerUpdates = new Set([2]); t.touch();
+  for (const [level, data] of consume(r, t).mips.entries()) {
+    const slice = data.length / 3;
+    assert.deepEqual([...data], [...Array(slice * 2).fill(level + 1), ...Array(slice).fill(9)]);
+  }
+  r.owner.dispose();
+});
+test('compressed partial peak budgets count the whole composed pyramid, not only changed layers', () => {
+  const t = new CompressedTexture(), size = t.mipmaps.reduce((total, mip) => total + mip.data.byteLength, 0);
+  const r = poolRig({maxSnapshotBytes: size * 2 - 1}); consume(r, t); t.layerUpdates.add(1); t.touch();
+  assert.throws(() => r.owner.captureBinding(sampled(t)), {code: 'THREE_COMPUTE_TEXTURE_BUDGET'});
+  assert.equal(r.owner.diagnostics.snapshotBytes, size); r.owner.dispose(); assert.equal(r.owner.diagnostics.snapshotBytes, 0);
+});
+test('public compressed-array compute uses captured mip histories through compile and FIFO dispatch', async () => {
+  const r = await publicRig(), t = new CompressedTexture(), node = kernel([sampled(t)]);
+  await r.renderer.compileComputeAsync(node); r.renderer._preparing = true;
+  t.mipmaps.forEach(m => m.data.fill(8)); t.layerUpdates.add(0); t.touch(); const a = r.renderer.computeAsync(node);
+  t.mipmaps.forEach(m => m.data.fill(9)); t.layerUpdates = new Set([2]); t.touch(); const b = r.renderer.computeAsync(node);
+  t.mipmaps.forEach(m => m.data.fill(77)); await r.renderer.flush(); await Promise.all([a, b]);
+  assert.equal(r.events.length, 2);
+  const view = r.events[1].groups[0].entries[0].resource;
+  for (const [level, data] of view.mips.entries()) {
+    const slice = data.length / 3;
+    assert.deepEqual([...data], [...Array(slice).fill(8), ...Array(slice).fill(level + 1), ...Array(slice).fill(9)]);
+  }
+  r.renderer.dispose();
+});
+test('capture transactions reject asynchronous/nested capture without leaking history charges', () => {
+  const r = poolRig(), t = new Texture(); consume(r, t); const before = {...r.owner.diagnostics};
+  assert.throws(() => r.owner.captureDispatch(async () => {}), {code: 'THREE_COMPUTE_TEXTURE_ASYNC_USE'});
+  assert.throws(() => r.owner.captureDispatch(() => r.owner.captureDispatch(() => {})), {code: 'THREE_COMPUTE_TEXTURE_REENTRY'});
+  assert.deepEqual(r.owner.diagnostics, before); r.owner.dispose();
+});
+test('an upload callback exception does not replay the acknowledged source upload on public retry', async () => {
+  const r = await publicRig(), t = new Texture(), node = kernel([sampled(t)]); let calls = 0;
+  const error = new Error('user upload callback failed'); t.onUpdate = () => { calls++; throw error; };
+  assert.throws(() => r.renderer.compute(node), e => e === error);
+  assert.equal(r.events.length, 0); r.renderer.compute(node);
+  assert.equal(calls, 1); assert.equal(r.events.length, 1); assert.equal(r.uploads.length, 1); r.renderer.dispose();
+});
+test('a submitted partial upload remains the next delta baseline even if its callback throws', async () => {
+  const r = await publicRig(), t = new Texture(), node = kernel([sampled(t)]); r.renderer.compute(node);
+  t.image.data.fill(8); t.updateRanges = [{start: 0, count: 4}]; t.touch();
+  const error = new Error('after native upload'); t.onUpdate = () => { throw error; };
+  assert.throws(() => r.renderer.compute(node), e => e === error); assert.equal(t.updateRanges.length, 0);
+  t.onUpdate = null; t.image.data.fill(9); t.updateRanges = [{start: 16, count: 4}]; t.touch(); r.renderer.compute(node);
+  assert.deepEqual(seen(r)[1], [...Array(4).fill(8), ...Array(12).fill(1), ...Array(4).fill(9), ...Array(12).fill(1)]); r.renderer.dispose();
 });
