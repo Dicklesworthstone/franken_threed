@@ -76,6 +76,7 @@ async function rig() {
     }})],
     ['./three_storage_textures.mjs', synthetic({createThreeStorageTextures: () => storage, inspectThreeStorageTexture: () => ({})})],
     ['./three_textures.mjs', synthetic({createGpuThreeTextures: () => pool})],
+    ['./three_compute_targets.mjs', new vm.SourceTextModule(await readFile(new URL('./three_compute_targets.mjs', import.meta.url), 'utf8'), {context})],
     ['./three_compute_textures.mjs', new vm.SourceTextModule(await readFile(new URL('./three_compute_textures.mjs', import.meta.url), 'utf8'), {context})],
   ]);
   const module = new vm.SourceTextModule(await readFile(new URL('./three_compute.mjs', import.meta.url), 'utf8'), {context});

@@ -6,13 +6,15 @@
  * distinct application updates into repeated execution of the last state.
  * StorageTexture kernels share native residency with scene materials. Ready
  * CPU data textures also provide read-only, call-time-versioned sampled inputs.
- * Shared vertex streams, decoded images and render-target inputs remain
- * unsupported on this path. */
+ * Native color RenderTarget inputs borrow resolved attachments through the FIFO
+ * submission; no UV replica, readback or CPU upload is introduced. Decoded image
+ * and depth-target inputs remain outside this compute input route. */
 import {createGpuCompute} from './gpu_compute.mjs';
 import {copyComputeBufferToTarget} from './gpu_compute_texture_copy.mjs';
 import {createThreeStorageTextures, inspectThreeStorageTexture} from './three_storage_textures.mjs';
 import {createGpuThreeTextures} from './three_textures.mjs';
 import {createThreeComputeTextures} from './three_compute_textures.mjs';
+import {createThreeComputeTargets} from './three_compute_targets.mjs';
 
 export class ThreeComputeError extends Error {
   constructor(code, message) {
@@ -33,7 +35,8 @@ function createThreeCompute(renderer, three) {
     fail('SOURCE', 'Supply the pinned r186 three/webgpu namespace for TSL compute');
   const device = renderer._device, frame = renderer._nodes.nodeFrame;
   const textureOwner = createThreeComputeTextures({storage: renderer._storageTextures,
-    poolFactory: () => createGpuThreeTextures(device, {three})});
+    poolFactory: () => createGpuThreeTextures(device, {three}),
+    targetFactory: () => createThreeComputeTargets({targets: renderer._targets, device, signal: renderer._targetLifetime.signal})});
   const gpu = createGpuCompute(device, {signal: renderer._targetLifetime.signal});
   const programs = new Map(), initialized = new Set(), listeners = new Map(), building = new Set();
   const captured = new WeakMap(), uploaded = new WeakMap(), payloads = new Set(), compiling = new Set();
@@ -243,7 +246,7 @@ function createThreeCompute(renderer, three) {
         if (issuing) fail('REENTRY', 'Cannot submit compute from an upload callback');
         textureOwner.validateDispatch(textureUses);
         issuing = true;
-        try {
+        try { textureOwner.withDispatch(textureUses, () => {
           const bindings = groups.map(group => ({index: group.index, entries: group.entries.map(({binding, record, texture}) =>
             ({binding, resource: texture ? textureOwner.resolve(texture) : {buffer: upload(record)}}))}));
           const dimensions = indirect ? {buffer: upload(indirect), offset: 0} : direct;
@@ -252,7 +255,7 @@ function createThreeCompute(renderer, three) {
             gpu.dispatch(gpu.prepareSync(shader), bindings, dimensions);
             textureOwner.written(textureUses);
           }
-        } finally { issuing = false; }
+        }); } finally { issuing = false; }
       }};
     } catch (error) { release(); throw error; }
   }
@@ -306,8 +309,7 @@ function createThreeCompute(renderer, three) {
   }
   return {compute, gpu,
     textureSampleData(texture) {
-      textureOwner.layoutOf({texture, isSampledTexture: true});
-      return {samples: 1, primarySamples: 1, isMSAA: false};
+      return textureOwner.sampleData(texture);
     },
     compile(...args) {
       const task = compile(...args); compiling.add(task);
@@ -378,7 +380,7 @@ export function withThreeCompute(Base, THREE) {
         targets.bindingsFor = (destination, retained) => bindingsFor(destination, this._storageTextures.bindingsFor(retained));
       }
       // The pinned WGSL builder asks its backend for texture sample metadata.
-      // These are facts about this owned, single-sample texture route only.
+      // Report the captured target's MSAA state and its resolved primary view.
       if (this._backend) {
         this._backend.utils ??= {};
         this._backend.utils.getTextureSampleData = texture => {

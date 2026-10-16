@@ -245,11 +245,8 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     if (error) { terminal ??= error; entry.error = error; retire(entry); throw error; }
     return result;
   }
-  function sampling(entry, texture) {
-    assertCurrent(entry);
-    if (entry.busy) fail('REENTRANT', 'Cannot sample color during a target submission');
+  function colorSampler(entry, texture) {
     const device = getDevice();
-    if (!device) fail('DEVICE', 'Initialize the renderer before sampling target color');
     const filterable = !entry.shape.float32 || device.features?.has?.('float32-filterable') === true;
     const descriptor = samplerDescriptor(texture, three, entry.shape.mipLevelCount);
     if (!filterable) {
@@ -260,6 +257,14 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       // when the mip filter is inactive because lodMaxClamp is zero.
       descriptor.mipmapFilter = 'nearest'; descriptor.maxAnisotropy = 1;
     }
+    return {descriptor, sampleType: filterable ? 'float' : 'unfilterable-float'};
+  }
+  function sampling(entry, texture) {
+    assertCurrent(entry);
+    if (entry.busy) fail('REENTRANT', 'Cannot sample color during a target submission');
+    const device = getDevice();
+    if (!device) fail('DEVICE', 'Initialize the renderer before sampling target color');
+    const {descriptor, sampleType} = colorSampler(entry, texture);
     const samplerKey = JSON.stringify(descriptor);
     ensure(entry);
     entry.busy = true;
@@ -317,7 +322,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
         entry.dirty = false; entry.copies++;
       }
       assertCurrent(entry);
-      return {view: entry.view, sampler: entry.sampler, sampleType: filterable ? 'float' : 'unfilterable-float', viewDimension: '2d',
+      return {view: entry.view, sampler: entry.sampler, sampleType, viewDimension: '2d',
         version: texture.version, sourceVersion: texture.source.version};
     } finally { entry.busy = false; if (!entry.alive) release(entry); }
   }
@@ -425,6 +430,49 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
   }
   return {
     capture, ensure, assertCurrent, bindingsFor,
+    // Native WGSL uses the attachment's top-left coordinates, not the WebGL
+    // bridge's UV-flipped sampling replica. Capture only generation and sampler
+    // metadata; GPU contents are observed at the consumer's FIFO submission.
+    captureNativeTexture(texture) {
+      live();
+      if (!texture?.isRenderTargetTexture || texture.isDepthTexture || !texture.renderTarget)
+        fail('SOURCE', 'Expected a target-owned 2D color texture for native sampling');
+      const entry = capture(texture.renderTarget), device = getDevice();
+      if (entry.shape.texture !== texture) fail('STALE', 'Texture no longer belongs to its source target');
+      if (!device) fail('DEVICE', 'Initialize the renderer before capturing native target inputs');
+      const {descriptor, sampleType} = colorSampler(entry, texture);
+      const samples = entry.shape.sampleCount;
+      return Object.freeze({entry, texture, device, sampler: Object.freeze(descriptor), sampleType,
+        sampleData: Object.freeze({samples, primarySamples: 1, isMSAA: samples > 1})});
+    },
+    validateNativeTextures(sources) {
+      live();
+      let bytes = 0; const seen = new Set();
+      for (const source of sources) {
+        const {entry, texture, device} = source;
+        assertCurrent(entry);
+        if (entry.shape.texture !== texture) fail('STALE', 'Native texture no longer belongs to its captured target');
+        if (device !== getDevice() || entry.session && entry.session.device !== device)
+          fail('DEVICE', 'Captured native target belongs to another GPUDevice');
+        if (entry.busy) fail('REENTRANT', 'Cannot sample a target during its submission');
+        if (!seen.has(entry) && !entry.storage) bytes += entry.shape.bytes;
+        seen.add(entry);
+      }
+      budget(bytes);
+    },
+    withNativeTexture(source, callback) {
+      const {entry, texture, device} = source;
+      assertCurrent(entry);
+      if (entry.shape.texture !== texture) fail('STALE', 'Native texture no longer belongs to its captured target');
+      if (device !== getDevice()) fail('DEVICE', 'Captured native target belongs to another GPUDevice');
+      if (typeof callback !== 'function') fail('CALLBACK', 'Expected a synchronous submitted-use callback');
+      if (entry.busy) fail('REENTRANT', 'Cannot sample a target during its submission');
+      ensure(entry);
+      if (entry.session.device !== device) fail('DEVICE', 'Native target storage belongs to another GPUDevice');
+      entry.busy = true;
+      try { return entry.storage.withTexture(native => { const result = callback(native); assertCurrent(entry); return result; }); }
+      finally { entry.busy = false; if (!entry.alive) release(entry); }
+    },
     writePixels(entry, data, options = {}) {
       assertCurrent(entry);
       if (entry.busy) fail('REENTRANT', 'Cannot upload during a target submission');
