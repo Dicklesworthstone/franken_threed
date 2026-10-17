@@ -23,7 +23,7 @@
  * - Admission failures discovered during deferred preparation are thrown from
  *   the next `render()`/`compileAsync()` call instead of the original call.
  * - Unsupported source state (advanced render targets, XR presentation, custom tone
- *   mapping, logarithmic/reversed depth, stencil buffers, non-sRGB output,
+ *   mapping, logarithmic/reversed depth, non-sRGB output,
  *   transparent clears with tone mapping) throws `F3DRendererError` rather than
  *   silently rendering something else.
  */
@@ -34,6 +34,7 @@ import {createThreeRenderTargets, inspectThreeRenderTarget} from './three_render
 import {readGpuTargetPixels} from './gpu_target_readback.mjs';
 import {createThreeRendererTransfers} from './three_renderer_transfers.mjs';
 import {createThreePassSnapshots} from './three_pass_snapshot.mjs';
+import {threeWebGPUStencilValue} from './three_program_stencil.mjs';
 import {createThreeProgramSupport} from './three_program.mjs';
 import {createThreeProgramPMREM} from './three_program_pmrem.mjs';
 import {createThreeProgramShadows} from './three_program_shadows.mjs';
@@ -326,7 +327,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     async _init() {
       if (this._disposed) fail('DISPOSED', 'Renderer is disposed');
       if (this.logarithmicDepthBuffer || this.reversedDepthBuffer) fail('UNSUPPORTED', 'Logarithmic and reversed depth buffers are not admitted');
-      if (this.stencil) fail('UNSUPPORTED', 'Stencil framebuffers are not admitted on the default canvas');
+      if (this.stencil && !this.depth) fail('UNSUPPORTED', 'Stencil framebuffers currently require a depth attachment');
       const p = this._parameters;
       if (p.outputType !== undefined && p.outputType !== THREE.UnsignedByteType)
         fail('UNSUPPORTED', 'Extended-range canvas output types are not admitted');
@@ -354,7 +355,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
      * otherwise frames go straight into the sRGB presentation view. */
     async _createSession(hdr) {
       const sampleCount = this.antialias || this.samples > 0 ? 4 : 1;
-      const depthFormat = this.depth ? 'depth24plus' : null;
+      const depthFormat = this.depth ? (this.stencil ? 'depth24plus-stencil8' : 'depth24plus') : null;
       const [width, height] = this._bufferSize();
       const common = {device: this._device};
       const format = this._preferredFormat ? {format: this._preferredFormat} : {};
@@ -442,19 +443,29 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     getActiveMipmapLevel() { return 0; }
     /** Source Renderer.clear(): a clear-only pass on the canvas with the current
      * clear color/depth, honoring viewport/scissor state like other passes. */
-    clear(color = true, depth = true) {
-      if (this._initialized === false) return;
+    clear(color = true, depth = true, stencil = true) {
+      if (this._disposed) fail('DISPOSED', 'Renderer is disposed');
+      if (this._deferredError) { const error = this._deferredError; this._deferredError = null; throw error; }
+      if (this._initialized === false && !this._deferUntilInitialized)
+        throw new Error('THREE.Renderer: .clear() called before the backend is initialized. Use "await renderer.init();" before using this method.');
+      const targetShape = this._renderTarget ? inspectThreeRenderTarget(this._renderTarget, THREE) : null;
+      const hasDepth = targetShape ? targetShape.depthFormat !== null : this.depth;
+      const hasStencil = targetShape ? targetShape.depthFormat?.endsWith('-stencil8') : this.stencil;
+      if (!color && !(depth && hasDepth) && !(stencil && hasStencil)) return;
       this._clearScene ??= new THREE.Scene();
       this._clearCamera ??= new THREE.PerspectiveCamera();
-      this._renderFrame(this._clearScene, this._clearCamera, {color, depth});
+      this._renderFrame(this._clearScene, this._clearCamera, {color, depth, stencil});
     }
-    clearColor() { this.clear(true, false); }
-    clearDepth() { this.clear(false, true); }
-    clearStencil() {}
-    async clearAsync(color = true, depth = true) { await this.init(); this.clear(color, depth); }
-    async clearColorAsync() { await this.clearAsync(true, false); }
-    async clearDepthAsync() { await this.clearAsync(false, true); }
-    async clearStencilAsync() {}
+    clearColor() { this.clear(true, false, false); }
+    clearDepth() { this.clear(false, true, false); }
+    clearStencil() { this.clear(false, false, true); }
+    async clearAsync(color = true, depth = true, stencil = true) {
+      await this.init(); this.clear(color, depth, stencil);
+      while (this._drain) await this._drain;
+    }
+    async clearColorAsync() { this.clear(true, false, false); while (this._drain) await this._drain; }
+    async clearDepthAsync() { this.clear(false, true, false); while (this._drain) await this._drain; }
+    async clearStencilAsync() { this.clear(false, false, true); while (this._drain) await this._drain; }
     getClearColor(target) { target.copy(this._clearColor); if ('a' in target) target.a = this._clearAlpha; return target; }
     setClearColor(color, alpha = 1) { this._clearColor.set(color); this._clearAlpha = alpha; }
     getClearAlpha() { return this._clearAlpha; }
@@ -499,7 +510,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
 
     // ---- frames ----
     _frame(scene, clearOnly = null, target = this._renderTarget) {
-      if (target) inspectThreeRenderTarget(target, THREE);
+      const targetShape = target ? inspectThreeRenderTarget(target, THREE) : null;
       if (this.xr.enabled && this.xr.isPresenting) fail('UNSUPPORTED', 'XR presentation is not admitted');
       if (!target && this.outputColorSpace !== SRGBColorSpace) fail('UNSUPPORTED', 'Only sRGB canvas output is admitted');
       const tone = this._toneMapping();
@@ -526,6 +537,17 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       Object.assign(frame, {
         clearDepth: this._clearDepth,
       });
+      // Use the actual depth attachment: a target-owned depth-only texture can
+      // override stencilBuffer:true. A stencil clear never clears color/depth.
+      const stencilAttachment = target ? targetShape.depthFormat?.endsWith('-stencil8') : this.stencil;
+      if (stencilAttachment) {
+        const clearStencil = clearOnly ? clearOnly.stencil : clear && this.autoClearStencil;
+        frame.stencilLoadOp = clearStencil ? 'clear' : 'load';
+        // Both native attachment formats have eight stencil bits. GL converts
+        // a signed long and masks it; WebGPU first enforces an unsigned long.
+        frame.clearStencil = clearStencil ? (this._bottomLeftOrigin ? this._clearStencil | 0
+          : threeWebGPUStencilValue(this._clearStencil, fail)) & 0xff : 0;
+      }
       const pr = target ? 1 : this._pixelRatio;
       const [bufferWidth, bufferHeight] = target ? [target.width, target.height] : this._bufferSize();
       const v = target ? target.viewport : this._viewport, px = this._pixelRound ?? Math.floor;

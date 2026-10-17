@@ -31,6 +31,7 @@ import {createGpuBufferGeometry, bufferGeometrySnapshot, createGpuInstanceAttrib
 import {createGpuThreeTextures,createThreeTextureBindings} from './three_textures.mjs';
 import {hasThreeDeformation, inspectThreeDeformation, createGpuThreeDeformation,
   updateGpuThreeDeformations} from './three_deformation.mjs';
+import {threeProgramStencil} from './three_program_stencil.mjs';
 export class ThreeSceneError extends Error {
   constructor(code,message){super(`THREE_SCENE_${code}: ${message}`);this.name='ThreeSceneError';this.code='THREE_SCENE_'+code;}
 }
@@ -774,6 +775,9 @@ export async function createGpuThreeScene(device,scene,{
       // what it admits and the ShaderLib program covers what it rejects.
       // GL point sizes, dashed lines (lineDistance) and line loops need their programs.
       if(m.isPointsMaterial||m.isLineDashedMaterial||object.isLineLoop)return programDescription(m,topology,object);
+      // Keep GL stencil conversion on its existing ShaderLib route. The core
+      // material mapper below follows WebGPU's unsigned reference contract.
+      if(m.stencilWrite&&stencilAttachment)return programDescription(m,topology,object);
       if(programToneMapping())return toneMappedProgram(()=>programDescription(m,topology,object));
       if(programTransmissionMode)return programDescription(m,topology,object);
       // Shader hooks (onBeforeCompile/onBeforeRender) need the material's own program.
@@ -829,9 +833,6 @@ export async function createGpuThreeScene(device,scene,{
         m.customProgramCacheKey!==(m.isNodeMaterial?three.NodeMaterial:three.Material).prototype.customProgramCacheKey)fail('HOOK','Custom material shader/render hooks require their original component');
     if((m.wireframe&&topology==='triangles')||m.alphaHash||m.alphaToCoverage||(!clippingEnabled&&m.clippingPlanes?.length))
       fail('MATERIAL','Wireframe, hashed/coverage alpha and clipping are not admitted');
-    // Source r186 WebGPU applies material stencil state only when the target has
-    // a stencil buffer; without one the fields have no rendering effect.
-    if(m.stencilWrite&&stencilAttachment)fail('MATERIAL','Source stencil materials are not admitted on stencil targets yet');
     const raster=sourceRaster(m,topology);
     if(m.alphaMap&&!alphaMaps)fail('MATERIAL','Enable alphaMaps before drawing source opacity textures');
     for(const key of ['lightMap','bumpMap','displacementMap','envMap'])if(m[key])fail('MATERIAL',`Unsupported source map: ${key}`);
@@ -940,6 +941,13 @@ export async function createGpuThreeScene(device,scene,{
     // Ordinary NormalBlending keeps the renderer's established default path.
     if(m.blending===three.NormalBlending&&!premultiplied)delete options.blend;
     else if(m.blending===three.NormalBlending&&!m.transparent)options.blend=null;
+    // The source applies stencil state only on an attachment with a stencil
+    // aspect. Fixed state belongs in the pipeline key; the reference is captured
+    // per draw, so changing it neither rebuilds pipelines nor stales bundles.
+    if(stencilAttachment){
+      const {stencil,stencilReference}=threeProgramStencil(three,m,fail,{webgpu:true});
+      if(stencil){options.stencil=stencil;values.stencilReference=stencilReference;}
+    }
     return {options,values,key:JSON.stringify(options)};
   }
   // Derived wireframe geometries share the source attributes; only the edge

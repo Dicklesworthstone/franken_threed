@@ -177,7 +177,7 @@ test('unsupported source content surfaces as an explicit error instead of a sile
   await flush(renderer).catch(() => {});
   assert.throws(() => renderer.render(f.scene, f.camera), /Unsupported source material/);
   renderer.setRenderTarget(null);
-  assert.throws(() => renderer.setRenderTarget(new T.RenderTarget(4, 4, {stencilBuffer: true})), {code: 'THREE_TARGET_UNSUPPORTED'});
+  assert.throws(() => renderer.setRenderTarget(new T.RenderTarget(4, 4, {samples: 2})), {code: 'THREE_TARGET_UNSUPPORTED'});
   renderer.outputColorSpace = T.LinearSRGBColorSpace;
   assert.throws(() => renderer.render(f.scene, f.camera), F3DRendererError);
   renderer.dispose();
@@ -325,4 +325,129 @@ test('source RenderTarget rendering and subsequent material sampling share owned
   renderer.setRenderTarget(null); renderer.render(screen, f.camera);
   assert.equal(native.view, sampledView); assert.equal(native.copies, 2);
   await renderer.waitForGPU(); target.dispose(); renderer.dispose();
+});
+
+for (const antialias of [false, true]) test(`canvas stencil supports native materials and independent automatic clears (MSAA ${antialias})`, async () => {
+  const {renderer, device} = await create({stencil: true, antialias}), f = sceneFixture();
+  Object.assign(f.material, {stencilWrite: true, stencilRef: 5, stencilZPass: T.ReplaceStencilOp});
+  try {
+    await renderer.compileAsync(f.scene, f.camera); renderer.setClearStencil(5);
+    renderer.render(f.scene, f.camera);
+    const first = device.passes.at(-1);
+    assert.equal(first.desc.depthStencilAttachment.view.attachment.format, 'depth24plus-stencil8');
+    assert.equal(first.desc.depthStencilAttachment.view.attachment.sampleCount, antialias ? 4 : 1);
+    assert.equal(first.desc.depthStencilAttachment.stencilLoadOp, 'clear');
+    assert.equal(first.desc.depthStencilAttachment.stencilClearValue, 5);
+    assert.equal(device.snapshots.at(-1)[0].stencilReference, 5);
+    renderer.autoClearStencil = false; renderer.render(f.scene, f.camera);
+    const preserved = device.passes.at(-1).desc;
+    assert.equal(preserved.colorAttachments[0].loadOp, 'clear');
+    assert.equal(preserved.depthStencilAttachment.depthLoadOp, 'clear');
+    assert.equal(preserved.depthStencilAttachment.stencilLoadOp, 'load');
+    renderer.autoClear = false; renderer.autoClearStencil = true; renderer.render(f.scene, f.camera);
+    const loaded = device.passes.at(-1).desc;
+    assert.equal(loaded.colorAttachments[0].loadOp, 'load');
+    assert.equal(loaded.depthStencilAttachment.depthLoadOp, 'load');
+    assert.equal(loaded.depthStencilAttachment.stencilLoadOp, 'load');
+  } finally { renderer.dispose(); }
+});
+
+test('manual clear methods independently preserve color, depth and stencil', async () => {
+  const {renderer, device} = await create({stencil: true}); await renderer.init();
+  try {
+    renderer.autoClear = false; renderer.setClearStencil(31);
+    for (const [method, expected] of [['clearStencil', ['load', 'load', 'clear']],
+      ['clearColor', ['clear', 'load', 'load']], ['clearDepth', ['load', 'clear', 'load']],
+      ['clear', ['clear', 'clear', 'clear']], ['clearStencilAsync', ['load', 'load', 'clear']],
+      ['clearColorAsync', ['clear', 'load', 'load']], ['clearDepthAsync', ['load', 'clear', 'load']],
+      ['clearAsync', ['clear', 'clear', 'clear']]]) {
+      await renderer[method](); await flush(renderer);
+      const pass = device.passes.at(-1).desc;
+      assert.deepEqual([pass.colorAttachments[0].loadOp, pass.depthStencilAttachment.depthLoadOp,
+        pass.depthStencilAttachment.stencilLoadOp], expected);
+      if (expected[2] === 'clear') assert.equal(pass.depthStencilAttachment.stencilClearValue, 31);
+    }
+    renderer.clear(true, true, false); await flush(renderer);
+    assert.equal(device.passes.at(-1).desc.depthStencilAttachment.stencilLoadOp, 'load');
+    const before = device.submissions.length; renderer.clear(false, false, false);
+    assert.equal(device.submissions.length, before);
+  } finally { renderer.dispose(); }
+});
+
+for (const method of ['clearStencil', 'clearStencilAsync']) test(`queued ${method} captures destination, value and masks before later calls`, async () => {
+  const {renderer, device, acquired} = await create({stencil: true}); await renderer.init();
+  const a = new T.RenderTarget(16, 8, {stencilBuffer: true}), b = new T.RenderTarget(16, 8, {stencilBuffer: true});
+  try {
+    renderer.setRenderTarget(a); renderer.setClearStencil(11); const first = renderer[method]();
+    renderer.setRenderTarget(b); renderer.setClearStencil(22); const second = renderer[method]();
+    renderer.setRenderTarget(null); renderer.setClearStencil(33); const third = renderer[method]();
+    renderer.setClearStencil(99); await Promise.all([first, second, third]); await flush(renderer);
+    const calls = device.passes.map(p => p.desc);
+    assert.deepEqual(calls.map(p => p.depthStencilAttachment.stencilClearValue), [11, 22, 33]);
+    assert.ok(calls.every(p => p.colorAttachments[0].loadOp === 'load' && p.depthStencilAttachment.depthLoadOp === 'load'));
+    assert.notEqual(calls[0].depthStencilAttachment.view.attachment, calls[1].depthStencilAttachment.view.attachment);
+    assert.equal(acquired(), 1); assert.equal(renderer.getClearStencil(), 99);
+  } finally { a.dispose(); b.dispose(); renderer.dispose(); }
+});
+
+test('scissored stencil clears use a bounded native clear draw and retain other aspects', async () => {
+  const {renderer, device} = await create({stencil: true}); await renderer.init();
+  try {
+    renderer.setScissor(4, 5, 20, 10); renderer.setScissorTest(true); renderer.setClearStencil(17);
+    renderer.clearStencil(); await flush(renderer);
+    const clear = device.passes.at(-2), main = device.passes.at(-1);
+    assert.deepEqual(clear.scissor, [4, 5, 20, 10]);
+    assert.equal(clear.desc.colorAttachments[0].loadOp, 'load');
+    assert.equal(clear.desc.depthStencilAttachment.depthLoadOp, 'load');
+    assert.equal(clear.desc.depthStencilAttachment.stencilLoadOp, 'load');
+    assert.equal(clear.draws[0].pipeline.fragment.targets[0].writeMask, 0);
+    assert.equal(clear.draws[0].pipeline.depthStencil.depthWriteEnabled, false);
+    assert.equal(clear.draws[0].pipeline.depthStencil.stencilFront.passOp, 'replace');
+    assert.equal(clear.draws[0].stencilReference, 17);
+    assert.equal(main.desc.depthStencilAttachment.stencilLoadOp, 'load');
+  } finally { renderer.dispose(); }
+});
+
+test('stencil clear values preserve public state and ignore dormant attachment controls', async () => {
+  const {renderer, device} = await create({stencil: true}); await renderer.init();
+  try {
+    renderer.setClearStencil(300); await renderer.clearStencilAsync();
+    assert.equal(device.passes.at(-1).desc.depthStencilAttachment.stencilClearValue, 44);
+    assert.equal(renderer.getClearStencil(), 300);
+    renderer.setClearStencil(-1); const effects = device.submissions.length;
+    assert.throws(() => renderer.clearStencil(), {code: 'F3D_RENDERER_MATERIAL'});
+    assert.equal(device.submissions.length, effects);
+    const target = new T.RenderTarget(8, 8);
+    renderer.setRenderTarget(target); renderer.clearStencil();
+    assert.equal(device.submissions.length, effects, 'a target without stencil has no stencil clear');
+    renderer.clearDepth(); await flush(renderer);
+    assert.equal(device.passes.at(-1).desc.depthStencilAttachment.stencilLoadOp, undefined);
+    target.dispose();
+  } finally { renderer.dispose(); }
+});
+
+test('clear initialization and asynchronous stencil completion follow the source API', async () => {
+  const {renderer, device} = await create({stencil: true});
+  try {
+    assert.throws(() => renderer.clearStencil(), /clear\(\) called before the backend is initialized/);
+    await assert.rejects(renderer.clearStencilAsync(), /clear\(\) called before the backend is initialized/);
+    await renderer.clearAsync(false, false, true);
+    assert.equal(device.passes.at(-1).desc.depthStencilAttachment.stencilLoadOp, 'clear');
+    assert.equal(renderer._drain, null, 'the async clear resolves after its deferred submission');
+    renderer.setClearStencil(12); await renderer.clearStencilAsync();
+    assert.equal(device.passes.at(-1).desc.depthStencilAttachment.stencilClearValue, 12);
+  } finally { renderer.dispose(); }
+});
+
+test('an asynchronous clear reports a preceding deferred failure before claiming success', async () => {
+  const {renderer, device} = await create({stencil: true}); await renderer.init();
+  try {
+    const f = sceneFixture(); f.mesh.material = new T.MeshMatcapMaterial();
+    renderer.render(f.scene, f.camera); await flush(renderer).catch(() => {});
+    const submissions = device.submissions.length;
+    await assert.rejects(renderer.clearStencilAsync(), /Unsupported source material/);
+    assert.equal(device.submissions.length, submissions);
+    renderer.setClearStencil(19); await renderer.clearStencilAsync();
+    assert.equal(device.passes.at(-1).desc.depthStencilAttachment.stencilClearValue, 19);
+  } finally { renderer.dispose(); }
 });
