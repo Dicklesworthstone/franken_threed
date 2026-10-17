@@ -221,3 +221,71 @@ test('automatic source compilation follows direct parameter swaps and changing l
   for(const n of [0,1,2,3,5]){assert.equal(app.app.run(a,b,n),app.reference.run(ea,eb,n));equal(a,ea);equal(b,eb);}
   assert.equal(count(app),5);assert.equal(count(app,'fallbackCalls'),0);
 });
+
+test('source discovery follows subarray references through conditional views and helper-local windows',async t=>{
+  const app=await application(t,`
+    function edit(data,begin,end){const view=data.subarray(begin,end);let sum=0;for(let i=0;i<view.length;i++){view[i]+=1.5;sum+=view[i];}return sum;}
+    function choose(a,b,flag,begin,end){const source=(flag?a:b).subarray().subarray(begin,end);return edit(source,0,source.length);}
+    export const run=(a,b,flag,begin,end)=>choose(a,b,flag,begin,end);
+  `);
+  const candidate=app.result.report.candidates.find(item=>item.functionName==='choose');
+  assert.equal(candidate.route,'guarded-numeric-wasm');
+  assert.deepEqual(candidate.parameterTypes,['f64[]','f64[]','f64','f64','f64']);
+  assert.deepEqual(candidate.typedArrayMethods,['subarray']);
+  for(const Type of [Float32Array,Float64Array]){
+    const a=new Type([1,2,3,4]),b=new Type([5,6,7,8]),ea=a.slice(),eb=b.slice();
+    for(const [flag,begin,end] of [[0,1,-1],[1,-Infinity,Infinity],[NaN,2.9,3.9]]){
+      assert.equal(app.app.run(a,b,flag,begin,end),app.reference.run(ea,eb,flag,begin,end));equal(a,ea);equal(b,eb);
+    }
+  }
+  assert.equal(count(app),6);assert.equal(count(app,'fallbackCalls'),0);
+});
+
+test('callback window islands publish current buffers before upload and retain custom species in place',async t=>{
+  const app=await application(t,`
+    export const make=(a,b,upload)=>(begin,end)=>{let total=0;
+      for(let pass=0;pass<2;pass++){
+        const from=b.subarray(begin,end),to=a.subarray(begin,end);
+        for(let i=0;i<to.length;i++){to[i]+=from[i]/3;total+=to[i];}
+      }
+      upload([...a],total);return total;
+    };
+  `,{loopIslands:true});
+  assert.equal(app.result.report.loopIslands.compiledKernels,1);
+  const data=new Float32Array([1,2,3,4,5]),expected=data.slice(),uploads=[],referenceUploads=[],hooks=[],referenceHooks=[];
+  const a=data.subarray(1),b=data.subarray(0,4),ea=expected.subarray(1),eb=expected.subarray(0,4);
+  const run=app.app.make(a,b,(...args)=>uploads.push(args)),ref=app.reference.make(ea,eb,(...args)=>referenceUploads.push(args));
+  for(const ranges of [[0,4],[1,-1],[-3,4]]){assert.equal(run(...ranges),ref(...ranges));equal(data,expected);}
+  Object.defineProperty(b,'constructor',{get(){hooks.push('constructor');return Float32Array;}});
+  Object.defineProperty(eb,'constructor',{get(){referenceHooks.push('constructor');return Float32Array;}});
+  assert.equal(run(1,3),ref(1,3));equal(data,expected);assert.deepEqual(hooks,referenceHooks);
+  assert.equal(hooks.length,2);assert.deepEqual(uploads,referenceUploads);assert.equal(count(app),3);
+});
+
+test('linked application packages execute helper subarrays with retained JavaScript available after relocation',async t=>{
+  const files=fixture(t);
+  fs.writeFileSync(path.join(files.src,'solver.mjs'),`export function solve(a,b,passes){
+    let source=a.subarray(0),destination=b.subarray(0);
+    for(let pass=0;pass<passes;pass++){
+      for(let i=0;i<source.length;i++)destination[i]=source[i]/3+1.5;
+      const old=source;source=destination;destination=old;
+    }
+    return source[0];
+  }`);
+  const build=await buildApplication(files.entry,files.out,{specializeNumeric:true});
+  assert.equal(build.numericSpecialization.compiledLoopIslands,1);
+  const moved=path.join(files.root,'relocated');fs.renameSync(files.out,moved);
+  const entry=pathToFileURL(path.join(moved,build.entryFiles[0])).href,reference=pathToFileURL(path.join(files.src,'frame.mjs')).href;
+  for(const wasm of [true,false]){
+    const run=spawnSync(process.execPath,['--input-type=module','--eval',`
+      import assert from 'node:assert/strict';let calls=0;
+      if(${wasm}){const Native=WebAssembly.Instance;WebAssembly.Instance=function(...args){const instance=Reflect.construct(Native,args);return {exports:{...instance.exports,run(...args){const result=instance.exports.run(...args);calls++;return result;}}};};}
+      else globalThis.WebAssembly=undefined;
+      const module=await (await import(${JSON.stringify(entry)})).load(),reference=await import(${JSON.stringify(reference)});
+      const equal=${equal.toString()};${verifyFrames.toString()}
+      verifyFrames(module,reference,Float32Array);verifyFrames(module,reference,Float64Array);assert.equal(calls,${wasm?40:0});
+    `],{encoding:'utf8'});
+    assert.ifError(run.error);
+    assert.equal(run.status,0,run.stderr);
+  }
+});

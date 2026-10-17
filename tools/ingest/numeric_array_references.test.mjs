@@ -200,7 +200,7 @@ for(const source of [
   'function f(a,b){let x=a;for(let i=0;i<1;i++){x[0]+=1;let x=b;}return 0;}',
   'function f(a,b){let x=a;for(let i=0;i<1;i++){const y=x;let x=b;}return 0;}',
   'function f(a,b){let x=a;for(let i=0;i<1;i++)x[0]+=1;return x.byteLength;}',
-  'function f(a,b){let x=a.subarray(0);for(let i=0;i<1;i++)x[0]+=1;return 0;}',
+  'function f(a,b){let x=a.slice(0);for(let i=0;i<1;i++)x[0]+=1;return 0;}',
 ]) {
   test(`refuses reference escape, invalid mutation or TDZ: ${source}`,()=>{
     assert.throws(()=>compileNumericKernel(source,{parameterTypes:['f64[]','f64[]'],generalControl:true}),NumericKernelCompileError);
@@ -258,6 +258,120 @@ test('helper-local parameter rebinding changes data targets but not the caller b
   assert.deepEqual(artifact.manifest.parameters.map(p=>[p.read,p.write]),[[true,true],[true,true]]);
   const native=engine(artifact),a=new Float64Array([1]),b=new Float64Array([2]),ea=a.slice(),eb=b.slice();
   assert.equal(native.run(a,b),root(ea,eb));equal(a,ea);equal(b,eb);equal(a,[1]);equal(b,[32]);
+});
+
+for(const [Type,type] of layouts) {
+  test(`${Type.name}: borrowed subarray ranges preserve intrinsic lengths and source store conversions`,()=>{
+    function root(a,begin,end){const view=a.subarray(begin,end);let total=0;for(let i=0;i<view.length;i++){view[i]+=1.5;total+=view[i];}return total+view.length;}
+    const artifact=compileNumericCandidate(root.toString(),{parameterTypes:[type,'f64','f64']});
+    assert.deepEqual(artifact.manifest.typedArrayMethods,['subarray']);
+    assert.equal(artifact.manifest.controlSemantics,'budgeted-source-order-v1');
+    const native=engine(artifact);
+    const ranges=[[0,8],[1,-1],[-4,-1],[-0,0],[5,2],[2.9,6.9],[-6.9,-1.1],[-99,99],
+      [NaN,NaN],[NaN,Infinity],[-Infinity,Infinity],[Infinity,Infinity],[-Infinity,-Infinity]];
+    for(const [begin,end] of ranges){
+      const a=new Type([0,-0,1/3,-3.5,254,65536,2**32-1,7]),expected=a.slice();
+      assert.ok(Object.is(native.run(a,begin,end),root(expected,begin,end)));equal(a,expected);
+    }
+    assert.equal(native.diagnostics.wasmCalls,ranges.length);assert.equal(native.diagnostics.fallbackCalls,0);
+  });
+}
+
+test('nested borrowed views, conditional receivers and rebinding preserve overlap and helper effects',()=>{
+  function edit(a){const view=a.subarray(1,-1);for(let i=0;i<view.length;i++)view[i]+=a[i];return view.length;}
+  function root(a,b,flag){
+    let view=(flag?a:b).subarray().subarray(1);
+    const first=view;view=view.subarray(1,-1);let total=0;
+    for(let i=0;i<view.length;i++){view[i]+=first[i];total+=edit(first);}
+    return total+view.length;
+  }
+  const artifact=compile(root,['f64[]','f64[]','f64'],[edit]);
+  assert.ok(artifact.manifest.parameters.slice(0,2).every(param=>param.read&&param.write));
+  const native=engine(artifact);
+  for(const flag of [0,1,NaN]){
+    const storage=new Float64Array([1,2,3,4,5,6,7,8]),expected=storage.slice();
+    assert.equal(native.run(storage.subarray(0,7),storage.subarray(1),flag),
+      root(expected.subarray(0,7),expected.subarray(1),flag));equal(storage,expected);
+  }
+  assert.equal(native.diagnostics.wasmCalls,3);
+});
+
+test('subarray range helpers execute once in source argument order and later arguments observe earlier writes',()=>{
+  function begin(a){a[0]+=1;return a[0];}
+  function end(a){a[0]*=2;return a[0]+1;}
+  function root(a){const view=a.subarray(begin(a),end(a));for(let i=0;i<view.length;i++)view[i]+=10;return view.length;}
+  const native=engine(compile(root,['f64[]'],[begin,end]));
+  const a=new Float64Array([1,2,3,4,5,6]),expected=a.slice();
+  assert.equal(native.run(a),root(expected));equal(a,expected);equal(a,[4,2,13,14,15,6]);
+  assert.equal(native.diagnostics.wasmCalls,1);
+});
+
+test('borrowed view bulk copies retain bit patterns and overlapping source snapshot semantics',()=>{
+  function root(a){const from=a.subarray(0,-1),to=a.subarray(1);to.set(from);}
+  const bits=new BigUint64Array([0x7ff8000000000001n,0xfff8000000000123n,0x8000000000000000n,0x3ff0000000000000n]);
+  const expected=bits.slice(),native=engine(compile(root,['f64[]']));
+  native.run(new Float64Array(bits.buffer));root(new Float64Array(expected.buffer));
+  assert.deepEqual(bits,expected);assert.equal(native.diagnostics.wasmCalls,1);
+});
+
+test('bounds and work-limit failures discard subarray writes before one source fallback',()=>{
+  function root(a,n){a[0]+=1;const view=a.subarray(1,3);for(let i=0;i<n;i++)view[i]+=a[0];return a[0];}
+  for(const [n,options] of [[3,{}],[2,{maxIterations:1}]]){
+    const artifact=compile(root,['f64[]','f64'],[],options),a=new Float64Array([1,2,3,4]),expected=a.slice();
+    const native=engine(artifact,{fallback:root});
+    assert.equal(native.run(a,n),root(expected,n));equal(a,expected);
+    assert.equal(native.diagnostics.wasmCalls,0);assert.equal(native.diagnostics.fallbackCalls,1);
+    assert.equal(native.diagnostics.lastGuardFailure,'KERNEL_EXECUTION_FAILED');
+  }
+});
+
+test('subarray descriptor guards preserve custom method, constructor and species hooks exactly once',()=>{
+  function root(a){a[0]+=1;const view=a.subarray(1,-1);for(let i=0;i<view.length;i++)view[i]+=10;return view.length;}
+  const native=engine(compile(root,['f64[]']),{fallback:root});
+  const typedPrototype=Object.getPrototypeOf(Float64Array.prototype),typedConstructor=Object.getPrototypeOf(Float64Array);
+  const method=typedPrototype.subarray;
+  const locations=[['own','subarray'],['prototype','subarray'],['shared','subarray'],
+    ['own','constructor'],['prototype','constructor'],['constructor',Symbol.species],['sharedConstructor',Symbol.species]];
+  for(const [where,key] of locations){
+    const a=new Float64Array([1,2,3,4]),expected=a.slice();let effects=0;
+    const object=where==='own'?a:where==='prototype'?Float64Array.prototype:where==='shared'?typedPrototype:
+      where==='constructor'?Float64Array:typedConstructor;
+    const original=Object.getOwnPropertyDescriptor(object,key);
+    Object.defineProperty(object,key,{configurable:true,get(){effects++;return key==='subarray'?method:Float64Array;}});
+    let result;
+    try{result=native.run(a);}
+    finally{if(original)Object.defineProperty(object,key,original);else delete object[key];}
+    assert.equal(result,root(expected));equal(a,expected);assert.equal(effects,1,`${where} ${String(key)}`);
+    assert.equal(native.diagnostics.lastGuardFailure,key==='subarray'?'KERNEL_ARRAY_METHOD':'KERNEL_ARRAY_SPECIES');
+  }
+  const a=new Float64Array([1,2,3,4]);native.run(a);
+  assert.equal(native.diagnostics.wasmCalls,1);assert.equal(native.diagnostics.fallbackCalls,locations.length);
+});
+
+test('changed species may return disjoint storage or throw after earlier source-visible writes',()=>{
+  function root(a){a[0]+=1;const view=a.subarray(1);for(let i=0;i<view.length;i++)view[i]+=10;return view.length;}
+  const native=engine(compile(root,['f64[]']),{fallback:root});
+  const a=new Float64Array([1,2,3]);let calls=0;
+  Object.defineProperty(a,'constructor',{value:{[Symbol.species]:function(_buffer,_offset,length){calls++;return new Float64Array(length);}}});
+  assert.equal(native.run(a),2);equal(a,[2,2,3]);assert.equal(calls,1);
+  const b=new Float64Array([1,2,3]),error=new Error('species failed');
+  Object.defineProperty(b,'constructor',{get(){calls++;throw error;}});
+  assert.throws(()=>native.run(b),value=>value===error);equal(b,[2,2,3]);assert.equal(calls,2);
+  assert.equal(native.diagnostics.wasmCalls,0);
+});
+
+test('coercive subarray ranges retain original coercions and nonescaping admission stays bounded',()=>{
+  function root(a,start){const view=a.subarray(start);for(let i=0;i<view.length;i++)view[i]+=1;return view.length;}
+  const native=engine(compile(root,['f64[]','f64']),{fallback:root});
+  const a=new Float64Array([1,2,3]);let calls=0;
+  assert.equal(native.run(a,{valueOf(){calls++;return 1;}}),2);equal(a,[1,3,4]);assert.equal(calls,1);
+  assert.equal(native.diagnostics.wasmCalls,0);assert.equal(native.diagnostics.fallbackCalls,1);
+  for(const value of ['a.subarray(0,1,2)','a.subarray(...a)','a?.subarray(0)','a.subarray?.(0)','a["subarray"](0)'])
+    assert.throws(()=>compileNumericCandidate(`function f(a){const view=${value};for(let i=0;i<view.length;i++)view[i]+=1;}`,
+      {parameterTypes:['f64[]']}),NumericKernelCompileError);
+  assert.throws(()=>compile(root,['f64[]','f64'],[],{generalControl:false}),NumericKernelCompileError);
+  assert.throws(()=>compileNumericCandidate('function f(a){const view=a.subarray(0);for(let i=0;i<view.length;i++)view[i]+=1;return view;}',
+    {parameterTypes:['f64[]']}),NumericKernelCompileError);
 });
 
 

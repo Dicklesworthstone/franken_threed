@@ -303,7 +303,7 @@ export function compileNumericKernel(source, {
   const minimumLengths = new Map();
   let inLoop = false;
   const arrayReferences = createArrayReferenceCompiler({resolveArray:helperArray,
-    allocateLocal:() => temporaryBase + temporaryCount++, condition, fail, enabled:checkedIndexing});
+    allocateLocal:() => temporaryBase + temporaryCount++, condition, expression, control, fail, enabled:checkedIndexing});
   const reboundParameters = reboundArrayParameters(fn, parameterTypes), referenceInitializers = [];
   // Counted-prefix loops cache their bound. Rebinding that parameter can change
   // the next source test, so only general control may use mutable parameters.

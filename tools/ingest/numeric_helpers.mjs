@@ -163,7 +163,7 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
       const binding = node?.type === 'Identifier' ? environment.get(node.name) : null;
       return binding?.type ? binding : null;
     }
-    const arrayReferences = createArrayReferenceCompiler({resolveArray, allocateLocal, condition, fail, enabled:checkedArrays});
+    const arrayReferences = createArrayReferenceCompiler({resolveArray, allocateLocal, condition, expression, control, fail, enabled:checkedArrays});
     const reboundParameters = reboundArrayParameters(fn, owner.parameterTypes), referenceInitializers = [];
     for (const param of fn.params) if (reboundParameters.has(param.name)) {
       const reference = arrayReferences.declare(param, true);

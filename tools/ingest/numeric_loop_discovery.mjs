@@ -65,6 +65,9 @@ export function discoverNumericArrayParameters(fn, immutableHelpers = new Map())
       const value = pending.pop();
       if (value?.type === 'Identifier') names.push(value.name);
       else if (value?.type === 'ConditionalExpression') pending.push(value.consequent, value.alternate);
+      else if (value?.type === 'CallExpression' && !value.optional &&
+          value.callee.type === 'MemberExpression' && !value.callee.optional &&
+          !value.callee.computed && value.callee.property.name === 'subarray') pending.push(value.callee.object);
     }
     return names;
   }
@@ -93,6 +96,9 @@ export function discoverNumericArrayParameters(fn, immutableHelpers = new Map())
       // aliases and reordered helper parameters. Treat it as a required view.
       if (isNumericBulkCall(node) && node.callee.property.name === 'set')
         for (const name of references(node.arguments[0])) record.required.add(name);
+      if (node.type === 'CallExpression' && node.callee.type === 'MemberExpression' &&
+          !node.callee.computed && node.callee.property.name === 'subarray')
+        for (const name of references(node.callee.object)) record.required.add(name);
       if (node.type === 'CallExpression' && !node.optional && node.callee.type === 'Identifier') {
         const callee = immutableHelpers.get(node.callee.name);
         if (callee?.type === 'FunctionDeclaration') {

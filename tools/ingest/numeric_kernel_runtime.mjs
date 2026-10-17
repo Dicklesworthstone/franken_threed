@@ -38,7 +38,7 @@ const functionSource = Function.prototype.toString;
 const mathHost = globalThis;
 const MATH_SEMANTICS = 'f64-operator-order+guarded-math-v1';
 const ARRAY_METHOD_SEMANTICS = 'f64-operator-order+guarded-array-methods-v1';
-const ARRAY_METHOD_NAMES = Object.freeze(['copyWithin', 'fill', 'set']);
+const ARRAY_METHOD_NAMES = Object.freeze(['copyWithin', 'fill', 'set', 'subarray']);
 const MATH_NAMES = Object.freeze(['abs', 'ceil', 'clz32', 'floor', 'fround', 'imul', 'max', 'min', 'round', 'sign', 'sqrt', 'trunc']);
 function dataValue(object, key) {
   const entry = descriptor(object, key);
@@ -67,6 +67,11 @@ const typedBuffer = descriptor(typedPrototype, 'buffer').get;
 const typedOffset = descriptor(typedPrototype, 'byteOffset').get;
 const typedTag = descriptor(typedPrototype, Symbol.toStringTag).get;
 const typedSet = typedPrototype.set;
+const typedConstructor = prototype(F64Array);
+const speciesKey = Symbol.species;
+const typedSpecies = descriptor(typedConstructor, speciesKey)?.get;
+const nativeSpecies = typeof typedSpecies === 'function' &&
+  apply(functionSource, typedSpecies, []) === 'function get [Symbol.species]() { [native code] }';
 const arrayMethods = new Map(ARRAY_METHOD_NAMES.map(name => {
   const value = dataValue(typedPrototype, name);
   return [name, typeof value === 'function' &&
@@ -277,6 +282,15 @@ function arrayInfo(value, param, checkLength, methods = []) {
     if (!arrayMethods.get(name) || descriptor(value, name) || descriptor(ArrayType.prototype, name) ||
         prototype(ArrayType.prototype) !== typedPrototype || dataValue(typedPrototype, name) !== arrayMethods.get(name)) {
       refuse('KERNEL_ARRAY_METHOD', `${name} no longer has intrinsic typed-array semantics`);
+    }
+    if (name === 'subarray' && (!nativeSpecies || descriptor(value, 'constructor') ||
+        dataValue(ArrayType.prototype, 'constructor') !== ArrayType ||
+        prototype(ArrayType) !== typedConstructor || descriptor(ArrayType, speciesKey) ||
+        descriptor(typedConstructor, speciesKey)?.get !== typedSpecies)) {
+      // Inspect descriptors only: invoking a constructor/species getter in a
+      // speculative guard would duplicate source effects or exceptions. Derived
+      // views share these same guarded intrinsic prototypes during the call.
+      refuse('KERNEL_ARRAY_SPECIES', `${param.name}.subarray requires the intrinsic constructor and species`);
     }
   }
   const buffer = apply(typedBuffer, value, []);

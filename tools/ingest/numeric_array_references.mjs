@@ -1,3 +1,5 @@
+import {INTEGER_ARRAY_LAYOUTS} from './numeric_integer.mjs';
+
 /**
  * Borrowed local typed-array references, not new arrays or escaping JS objects.
  * Each local snapshots a pointer AND that view's own length at source assignment.
@@ -12,6 +14,10 @@ const u32 = value => {
 };
 const get = index => [0x20, ...u32(index)];
 const set = index => [0x21, ...u32(index)];
+const number = value => {
+  const bytes = new Uint8Array(8); new DataView(bytes.buffer).setFloat64(0, value, true);
+  return [0x44, ...bytes];
+};
 export const arrayPointer = array => [...get(array.index), ...(array.reference ? [0xab] : [])];
 export const arrayLength = array => [...get(array.lengthIndex), ...(array.reference ? [0xab] : [])];
 
@@ -20,7 +26,7 @@ export const arrayLength = array => [...get(array.lengthIndex), ...(array.refere
  * all reference escape/coercion. A fixed storage layout is required per local;
  * incompatible conditional/reassignment layouts retain the original JavaScript.
  */
-export function createArrayReferenceCompiler({resolveArray, allocateLocal, condition, fail, enabled}) {
+export function createArrayReferenceCompiler({resolveArray, allocateLocal, condition, expression, control, fail, enabled}) {
   const aliases = [];
   function choice(node, depth = 0) {
     if (!node || depth > 128) fail('Array reference expression exceeds the nesting limit', node);
@@ -29,6 +35,36 @@ export function createArrayReferenceCompiler({resolveArray, allocateLocal, condi
       return [...arrayPointer(array), 0xb8, ...set(target.index),
         ...arrayLength(array), 0xb8, ...set(target.lengthIndex)];
     }};
+    if (node.type === 'CallExpression' && node.callee.type === 'MemberExpression' &&
+        !node.callee.computed && node.callee.property.name === 'subarray') {
+      if (!control || !enabled) fail('Borrowed subarray views require generalControl', node);
+      if (node.optional || node.callee.optional || node.arguments.length > 2 ||
+          node.arguments.some(arg => arg.type === 'SpreadElement'))
+        fail('Borrowed subarray views require direct calls with positional numeric ranges', node);
+      const receiver = choice(node.callee.object, depth + 1);
+      if (!receiver) fail('Subarray requires a closed typed-array receiver', node);
+      // Species, constructor and method descriptors are guarded before entry.
+      // A nonescaping native view is just a borrowed pointer/length pair. Capture
+      // the receiver before evaluating either argument, and both arguments before
+      // clamping. Range helpers can mutate staged arrays in source order.
+      control.methods.add('subarray');
+      const view = {index:allocateLocal(), lengthIndex:allocateLocal()};
+      const begin = allocateLocal(), end = allocateLocal();
+      const beginCode = node.arguments[0] ? expression(node.arguments[0], depth + 1) : number(0);
+      const endCode = node.arguments[1] ? expression(node.arguments[1], depth + 1) : get(view.lengthIndex);
+      const clamp = local => [...get(local), 0x9d, ...set(local),
+        ...get(local), ...get(local), 0x62, 0x04, 0x40, ...number(0), ...set(local), 0x0b,
+        ...get(local), ...number(0), 0x63, 0x04, 0x7c,
+        ...get(view.lengthIndex), ...get(local), 0xa0, ...number(0), 0xa5,
+        0x05, ...get(local), ...get(view.lengthIndex), 0xa4, 0x0b, ...set(local)];
+      const elementBytes = 2 ** (INTEGER_ARRAY_LAYOUTS[receiver.type]?.alignment ?? (receiver.type === 'f64[]' ? 3 : 2));
+      return {type:receiver.type, sources:receiver.sources, emit(target) {
+        return [...receiver.emit(view), ...beginCode, ...set(begin), ...endCode, ...set(end),
+          ...clamp(begin), ...clamp(end),
+          ...get(view.index), ...get(begin), ...number(elementBytes), 0xa2, 0xa0, ...set(target.index),
+          ...get(end), ...get(begin), 0xa1, ...number(0), 0xa5, ...set(target.lengthIndex)];
+      }};
+    }
     if (node.type !== 'ConditionalExpression') return null;
     const left = choice(node.consequent, depth + 1), right = choice(node.alternate, depth + 1);
     if (!left && !right) return null;
