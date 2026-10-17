@@ -68,11 +68,11 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
   function budget(bytes) {
     if (!positive(bytes) || bytes > maxBytes - allocatedBytes) fail('BUDGET', 'Compute buffers exceed their shared byte budget');
   }
-  function upload(key, array, version = 0, {uniform = false, ranges = []} = {}) {
+  function upload(key, array, version = 0, {uniform = false, ranges = [], admission = null} = {}) {
     live();
     if (!key || !['object', 'function'].includes(typeof key) || !ArrayBuffer.isView(array) || array instanceof DataView)
       fail('BUFFER', 'Expected an identity key and typed array');
-    if (!uniform) attributeOwner.admit(key, array, version);
+    if (!uniform) attributeOwner.admit(key, array, version, admission);
     const bytes = array.byteLength, size = Math.max(4, Math.ceil(bytes / 4) * 4);
     const limit = uniform ? device.limits?.maxUniformBufferBindingSize : device.limits?.maxStorageBufferBindingSize;
     if (size > (device.limits?.maxBufferSize ?? Infinity) || size > (limit ?? Infinity))
@@ -110,7 +110,7 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
       }
     });
     entry.array = array; entry.version = version; entry.bytes = bytes;
-    if (!uniform) attributeOwner.publish(key, entry.buffer, array, version, live, whenIdle);
+    if (!uniform) attributeOwner.publish(key, entry.buffer, array, version, live, whenIdle, admission);
     else attributeOwner.release(key);
     return entry.buffer;
   }
@@ -237,6 +237,8 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
     live();
   }
   return {upload, release, prepare, prepareSync, dispatch, read, whenIdle,
+    captureUpload: (key, array, version) => { live(); return attributeOwner.capture(key, array, version); },
+    releaseUpload: admission => attributeOwner.releaseCapture(admission),
     getBuffer: key => { live(); return buffers.get(key)?.buffer ?? null; },
     get allocatedBytes() { return allocatedBytes; }, get bufferCount() { return buffers.size; },
     dispose: () => stop(new GpuComputeError('DISPOSED', 'Compute owner is disposed'))};

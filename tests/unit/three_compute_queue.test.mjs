@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {withThreeCompute} from '../../tools/ingest/three_compute.mjs';
+import {computeAttributeSnapshot} from '../../tools/ingest/gpu_compute_attributes.mjs';
 
 const deferred = () => {
   let resolve, reject;
@@ -156,18 +157,52 @@ test('queued kernels preserve distinct call-time uniforms, even when prewarmed',
 });
 
 test('queued CPU versions and dirty ranges preserve intermediate simulation state', async () => {
-  const {renderer, block} = setup(), data = attribute(new Float32Array([0, 10])), kernel = node([storage(data)]);
+  const {renderer, device, buffers, block} = setup(), data = attribute(new Float32Array([0, 10])), kernel = node([storage(data)]);
   renderer.compute(kernel); // GPU now [1, 11], CPU still [0, 10].
   const gate = block();
   data.array[1] = 30; data.version++; data.updateRanges = [{start: 1, count: 1}];
   const first = renderer.computeAsync(kernel), middle = renderer.getArrayBufferAsync(data);
+  const oldPublication = new Promise((resolve, reject) => renderer._enqueue({resolve, reject, issue() {
+    assert.throws(() => computeAttributeSnapshot(device, data), /UNPREPARED/);
+  }}));
   data.array[0] = 100; data.version++; data.updateRanges = [{start: 0, count: 1}];
   const second = renderer.computeAsync(kernel);
   data.array.fill(-500); // Unversioned changes cannot contaminate either upload.
-  gate.open(); await Promise.all([first, second, gate.done]);
+  gate.open(); await Promise.all([first, second, oldPublication, gate.done]);
   assert.deepEqual([...new Float32Array(await middle)], [2, 31]);
   assert.deepEqual(await read(renderer, data), [101, 32]);
+  assert.equal(computeAttributeSnapshot(device, data).buffer, buffers[0]);
   assert.equal(data.uploads, 3); renderer.dispose();
+});
+
+test('H8-sized structured storage preserves packed member bytes and matrix padding', async () => {
+  const {renderer, block} = setup();
+  // H8's position:vec3, velocity:vec3, C:mat3 occupy 20 32-bit words.
+  // Include an integer NaN bit pattern: treating fields as JS float values
+  // rather than copying storage bytes must not canonicalize it.
+  const words = new Uint32Array(40);
+  for (let i = 0; i < words.length; i++) words[i] = i % 20 === 3 ? 0x7fc01234 : 0x3f800000 + i;
+  const source = new Float32Array(words.buffer), data = attribute(source, 20);
+  data.isStorageInstancedBufferAttribute = true;
+  const kernel = node([storage(data)], {name: 'packed-struct', count: 2});
+  const expected = [...words], gate = block(), run = renderer.computeAsync(kernel);
+  words.fill(0); // This unversioned CPU edit must not alter the queued copy.
+  gate.open(); await run;
+  assert.deepEqual([...new Uint32Array(await renderer.getArrayBufferAsync(data))], expected);
+  assert.equal(data.array, source); assert.equal(data.itemSize, 20); assert.equal(data.count, 2);
+  assert.equal(data.uploads, 1); renderer.dispose();
+});
+
+test('queued storage replacement retains each captured shape until its own submission', async () => {
+  const {renderer, block} = setup(), data = attribute(new Float32Array(20).fill(1), 20);
+  const kernel = node([storage(data)], {name: 'packed-struct', count: 1});
+  const gate = block(), first = renderer.computeAsync(kernel), before = renderer.getArrayBufferAsync(data);
+  data.array = new Float32Array(40).fill(2); data.count = 2; data.version++;
+  const second = renderer.computeAsync(kernel);
+  gate.open(); await Promise.all([first, second]);
+  assert.deepEqual([...new Float32Array(await before)], Array(20).fill(1));
+  assert.deepEqual(await read(renderer, data), Array(40).fill(2));
+  renderer.dispose();
 });
 
 test('queued dispatch counts and shader generations are captured rather than read at drain', async () => {

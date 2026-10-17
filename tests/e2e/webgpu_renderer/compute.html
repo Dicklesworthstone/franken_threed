@@ -9,7 +9,7 @@ not a benchmark. Automation can await window.__f3dCompute.status !== 'running'. 
 <script type="importmap">{"imports":{"three":"../../../upstream/three.js/build/three.webgpu.js","three/webgpu":"../../../upstream/three.js/build/three.webgpu.js","three/tsl":"../../../upstream/three.js/build/three.tsl.js"}}</script>
 <script type="module">
 import * as THREE from 'three/webgpu';
-import {Fn, storage, instanceIndex, uniform, uint, vec3} from 'three/tsl';
+import {Fn, storage, instanceIndex, uniform, uint, vec3, struct, instancedArray} from 'three/tsl';
 
 const state = window.__f3dCompute = {status: 'running', checks: [], error: null};
 let renderer;
@@ -67,6 +67,23 @@ try {
   const vectorKernel = keep(Fn(() => { vectorValues.element(instanceIndex).addAssign(vec3(1, 2, 3)); })().compute(2, [2]));
   await renderer.computeAsync(vectorKernel);
   check('WGSL vec3 storage has the source four-component stride', await read(vectors), [2, 4, 6, 0, 5, 7, 9, 0]);
+
+  // The H8 particle layout: two padded vec3 members and three padded matrix
+  // columns. These are 80-byte storage records, not vertex-format-sized items.
+  const particleType = struct({position: {type: 'vec3'}, velocity: {type: 'vec3'}, C: {type: 'mat3'}});
+  const particleData = new Float32Array([
+    1, 2, 3, 0, 4, 5, 6, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0,
+    10, 20, 30, 0, 2, 3, 4, 0, 2, 0, 0, 0, 0, 3, 0, 0, 0, 0, 4, 0,
+  ]);
+  const particles = instancedArray(particleData, particleType);
+  const advanceParticles = keep(Fn(() => {
+    const particle = particles.element(instanceIndex);
+    particle.get('position').addAssign(particle.get('C').mul(particle.get('velocity')));
+  })().compute(2, [2]));
+  await renderer.computeAsync(advanceParticles);
+  const expectedParticles = Array.from(particleData);
+  expectedParticles.splice(0, 3, 5, 7, 9); expectedParticles.splice(20, 3, 14, 29, 46);
+  check('structured particle storage preserves matrix layout across records', await read(particles.value), expectedParticles);
   await renderer.waitForGPU(); // Includes F3D's asynchronous WebGPU validation scopes.
   state.status = 'pass';
 } catch (error) {

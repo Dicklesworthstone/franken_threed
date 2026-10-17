@@ -22,8 +22,8 @@ function device({mapping = null, compilation = null} = {}) {
     createComputePipeline: descriptor => { calls.push(['pipeline']); return pipeline(descriptor); },
     createComputePipelineAsync: async descriptor => { calls.push(['pipelineAsync']); return pipeline(descriptor); },
     createBindGroup: descriptor => descriptor,
-    createBuffer({size}) {
-      const buffer = {data: new Uint8Array(size), destroyed: 0, destroy() { this.destroyed++; }, unmap() {},
+    createBuffer({size, usage}) {
+      const buffer = {size, usage, data: new Uint8Array(size), destroyed: 0, destroy() { this.destroyed++; }, unmap() {},
         mapAsync: () => mapping?.promise ?? Promise.resolve(), getMappedRange() { return this.data.buffer; }};
       buffers.push(buffer); return buffer;
     },
@@ -96,6 +96,7 @@ function setup(options = {}) {
       this._device = gpu; this._initialized = !initialization; this._disposed = false;
       this._pending = []; this._drain = this._preparing = null;
       this._targetLifetime = new AbortController();
+      this.debug = options.debug;
       this._nodes = {nodeFrame: {renderId: 17, compute: null, renderer: null,
         updateBeforeNode(value) { updates.push('before'); value(this); },
         updateNode(value) { updates.push('current'); value(this); },
@@ -201,6 +202,15 @@ test('source frame callbacks see the compute renderer and previous frame context
   assert.equal(frame.renderId, 17); assert.equal(frame.compute, null); assert.equal(frame.renderer, null); renderer.dispose();
 });
 
+test('source shader diagnostics preserve an existing debug object and disabled checks', () => {
+  const debug = {checkShaderErrors: false, diagnostics: {keywords: true}};
+  const {renderer} = setup({debug});
+  assert.equal(renderer.debug, debug);
+  assert.equal(renderer.debug.checkShaderErrors, false);
+  assert.equal(renderer.debug.diagnostics.keywords, true);
+  renderer.dispose();
+});
+
 test('source frame and inspector are restored after a callback throws', () => {
   const {renderer, updates} = setup(), frame = renderer._nodes.nodeFrame;
   assert.throws(() => renderer.compute(node([], {updates: [() => { throw new Error('callback failed'); }]})), /callback failed/);
@@ -255,7 +265,7 @@ test('unsupported bindings, invalid nodes and invalid workgroup sizes fail expli
   const {renderer, gpu} = setup(), data = attribute(new Float32Array([0]));
   assert.throws(() => renderer.compute([node(), {}]), /SOURCE/);
   assert.throws(() => renderer.compute([]), /SOURCE/);
-  assert.throws(() => renderer.compute(node([storage(data), {isSampledTexture: true}])), /BINDING/);
+  assert.throws(() => renderer.compute(node([storage(data), {}])), /BINDING/);
   assert.equal(gpu.buffers.length, 0);
   assert.throws(() => renderer.compute(node([], {workgroupSize: [257]})), /DISPATCH/);
   assert.throws(() => renderer.compute(node([], {workgroupSize: [0]})), /DISPATCH/);
@@ -272,7 +282,7 @@ test('disposing during async compilation rejects rather than publishing a stale 
 
 test('ignored queued compute failures are surfaced on the next public compute call', async () => {
   const initialization = deferred(), {renderer} = setup({initialization});
-  renderer.compute(node([{isSampledTexture: true}])); initialization.resolve();
+  renderer.compute(node([{}])); initialization.resolve();
   await renderer.waitForGPU(); await Promise.resolve();
   assert.throws(() => renderer.compute(node()), /BINDING/); renderer.dispose();
 });

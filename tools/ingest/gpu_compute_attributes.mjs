@@ -18,39 +18,56 @@ export const isComputeAttribute = value => value?.isStorageBufferAttribute === t
 export function createComputeAttributeOwner(device) {
   let table = devices.get(device);
   if (!table) devices.set(device, table = new WeakMap());
-  const owned = new Set(), identity = {};
+  const owned = new Set(), identity = {}, captures = new WeakMap();
   let disposed = false;
   function release(attribute) {
     if (table.get(attribute)?.identity === identity) table.delete(attribute);
     owned.delete(attribute);
   }
-  function admit(attribute, array, version = attribute?.version) {
+  function admit(attribute, array, version = attribute?.version, admission = null) {
       if (!isComputeAttribute(attribute)) return;
       if (disposed) fail('DISPOSED', 'Compute attribute owner is disposed');
       const existing = table.get(attribute);
       if (existing && existing.identity !== identity)
         fail('OWNER', 'The same storage attribute cannot have two compute owners on one device');
+      if (admission !== null) {
+        const captured = captures.get(admission);
+        if (!captured || captured.attribute !== attribute || captured.array !== array || captured.version !== version)
+          fail('PUBLICATION', 'Queued upload must use its admitted attribute, array and source version');
+        return captured;
+      }
       const stride = attribute.itemSize, count = attribute.count;
       if (!Number.isSafeInteger(stride) || stride < 1 || !Number.isSafeInteger(count) || count < 1 ||
           stride * count !== array.length || array.BYTES_PER_ELEMENT !== 4)
         fail('SHAPE', 'Publish the normalized 32-bit storage layout before vertex use');
       if (!Number.isSafeInteger(version) || version < 0 || version !== attribute.version)
         fail('PUBLICATION', 'Compute upload must acknowledge the current source version');
+      return {stride, count};
   }
   return {
     admit,
-    publish(attribute, buffer, array, version, live, whenIdle) {
+    // The renderer captures this proof while the source version is current.
+    // Only that exact copied array may later upload after the source advances.
+    // Direct uploads retain their current-version check; a boolean bypass would
+    // let an unadmitted stale CPU array overwrite GPU simulation state.
+    capture(attribute, array, version) {
+      const shape = admit(attribute, array, version);
+      if (!shape) return null;
+      const admission = Object.freeze({});
+      captures.set(admission, {...shape, attribute, array, version});
+      return admission;
+    },
+    releaseCapture(admission) { if (admission) captures.delete(admission); },
+    publish(attribute, buffer, array, version, live, whenIdle, admission = null) {
       if (!isComputeAttribute(attribute)) return;
-      admit(attribute, array, version);
+      const {stride, count} = admit(attribute, array, version, admission);
       // A borrowed GPU allocation must actually support vertex fetch. Reject
       // malformed or foreign publications before they become visible to draws.
-      const stride = attribute.itemSize, count = attribute.count;
       const required = array.byteLength;
       if (!buffer || !Number.isSafeInteger(buffer.size) || buffer.size < required ||
           !Number.isSafeInteger(buffer.usage) || (buffer.usage & (128 | 32)) !== (128 | 32) ||
-          typeof live !== 'function' || typeof whenIdle !== 'function' ||
-          !Number.isSafeInteger(version) || version < 0 || version !== attribute.version)
-        fail('PUBLICATION', 'Shared vertex storage needs a live, sufficiently sized STORAGE|VERTEX buffer at the current source version');
+          typeof live !== 'function' || typeof whenIdle !== 'function')
+        fail('PUBLICATION', 'Shared vertex storage needs a live, sufficiently sized STORAGE|VERTEX buffer at an admitted source version');
       table.set(attribute, {identity, buffer, stride, count, version, scalar: array.constructor,
         byteLength: array.byteLength, live, whenIdle});
       owned.add(attribute);

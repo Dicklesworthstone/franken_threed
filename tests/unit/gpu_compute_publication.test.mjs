@@ -79,3 +79,40 @@ test('rejected compute upload versions cannot mutate an already published buffer
   assert.equal(computeAttributeSnapshot(device, a).buffer, native);
   compute.dispose();
 });
+
+test('only a captured upload may publish a historical source version', () => {
+  const device = gpuDevice(), compute = createGpuCompute(device), a = attribute();
+  a.array.fill(7);
+  const copied = new Float32Array(a.array), admission = compute.captureUpload(a, copied, 0);
+  a.array.fill(42); a.version = 1;
+  assert.throws(() => compute.captureUpload(a, copied, 0), /PUBLICATION/);
+  assert.throws(() => compute.upload(a, copied, 0), /PUBLICATION/);
+  const native = compute.upload(a, copied, 0, {admission});
+  assert.deepEqual([...new Float32Array(native.bytes.buffer)], Array(8).fill(7));
+  assert.throws(() => computeAttributeSnapshot(device, a), /UNPREPARED/);
+  compute.upload(a, a.array, 1);
+  assert.deepEqual([...new Float32Array(native.bytes.buffer)], Array(8).fill(42));
+  assert.equal(computeAttributeSnapshot(device, a).buffer, native);
+  compute.releaseUpload(admission);
+  const before = device.events.length;
+  assert.throws(() => compute.upload(a, copied, 0, {admission}), /PUBLICATION/);
+  assert.equal(device.events.length, before);
+  compute.dispose();
+});
+
+test('queued upload proofs cannot be forged, transferred or applied to different data', () => {
+  const device = gpuDevice(), compute = createGpuCompute(device), other = createGpuCompute(device);
+  const a = attribute(), copied = new Float32Array(a.array);
+  const admission = compute.captureUpload(a, copied, 0);
+  const foreign = other.captureUpload(a, copied, 0);
+  a.version = 1;
+  const before = device.events.length;
+  for (const options of [{admission: {}}, {admission: true}, {admission: foreign}])
+    assert.throws(() => compute.upload(a, copied, 0, options), /PUBLICATION/);
+  assert.throws(() => compute.upload(a, new Float32Array(copied), 0, {admission}), /PUBLICATION/);
+  assert.throws(() => compute.upload(a, copied, 1, {admission}), /PUBLICATION/);
+  assert.throws(() => compute.upload(attribute(), copied, 0, {admission}), /PUBLICATION/);
+  assert.equal(device.events.length, before);
+  compute.releaseUpload(admission); other.releaseUpload(foreign);
+  compute.dispose(); other.dispose();
+});

@@ -50,14 +50,17 @@ function createThreeCompute(renderer, three) {
   function validateAttribute(attribute) {
     if (!(attribute?.isStorageBufferAttribute || attribute?.isStorageInstancedBufferAttribute || attribute?.isIndirectStorageBufferAttribute) ||
         attribute.isInterleavedBufferAttribute || attribute.normalized || !ArrayBuffer.isView(attribute.array) ||
-        ![1, 2, 3, 4, 16].includes(attribute.itemSize) || !Number.isSafeInteger(attribute.count) || attribute.count < 1 ||
+        !Number.isSafeInteger(attribute.itemSize) || attribute.itemSize < 1 || !Number.isSafeInteger(attribute.count) || attribute.count < 1 ||
         attribute.array.length !== attribute.count * attribute.itemSize)
-      fail('STORAGE', 'Expected an unnormalized scalar/vector/mat4 storage attribute with a complete typed array');
+      fail('STORAGE', 'Expected an unnormalized storage attribute with a positive item stride and a complete typed array');
     if (![Float32Array, Int32Array, Uint32Array, Int16Array, Uint16Array, Int8Array, Uint8Array].includes(attribute.array.constructor))
       fail('STORAGE', 'Storage attributes require f32 or integer components');
   }
   function normalize(attribute) {
     live(); validateAttribute(attribute);
+    // r186 StructTypeNode supplies its padded stride in 32-bit words. Preserve
+    // those bytes, including mixed integer fields and matrix-column padding;
+    // a storage item need not be a vertex-sized scalar/vector (H8 uses 20 words).
     let array = attribute.array;
     if (array instanceof Int8Array || array instanceof Int16Array) array = new Int32Array(array);
     else if (array instanceof Uint8Array || array instanceof Uint16Array) array = new Uint32Array(array);
@@ -72,6 +75,7 @@ function createThreeCompute(renderer, three) {
   }
   function free(record) {
     if (!record.data) return;
+    gpu.releaseUpload(record.admission); record.admission = null;
     snapshotBytes -= record.charged; record.charged = 0; record.data = null; payloads.delete(record);
   }
   function snapshot(key, array, version, uniform, deferred, ranges = []) {
@@ -81,7 +85,8 @@ function createThreeCompute(renderer, three) {
     const charged = deferred ? array.byteLength : 0;
     if (charged > maxSnapshotBytes - snapshotBytes) fail('BUDGET', 'Queued compute uploads exceed the snapshot byte budget');
     const data = deferred ? new array.constructor(array) : array;
-    const record = {key, source: array, version, uniform, data, charged, ranges, refs: 0};
+    const admission = !uniform && deferred ? gpu.captureUpload(key, data, version) : null;
+    const record = {key, source: array, version, uniform, data, charged, ranges, admission, refs: 0};
     snapshotBytes += charged; payloads.add(record);
     if (!uniform) captured.set(key, record);
     return record;
@@ -93,7 +98,7 @@ function createThreeCompute(renderer, three) {
       if (buffer) return buffer;
     }
     if (!record.data) fail('STALE', 'A consumed upload snapshot cannot recreate released storage');
-    const buffer = gpu.upload(key, record.data, version, {uniform, ranges});
+    const buffer = gpu.upload(key, record.data, version, {uniform, ranges, admission: record.admission});
     uploaded.set(key, record);
     if (!uniform) {
       // A later application update may already have new ranges. Acknowledging
@@ -379,6 +384,12 @@ export function withThreeCompute(Base, THREE) {
       super(...args);
       if (!this.isF3DRenderer) return; // Preserve an exact-backend constructor return.
       if (THREE.TSL?.context && !this.contextNode) this.contextNode = THREE.TSL.context();
+      // r186's builder reads this configuration for every declaration, even
+      // with keyword diagnostics disabled. Preserve application-supplied flags.
+      this.debug ??= {};
+      this.debug.checkShaderErrors ??= true;
+      this.debug.diagnostics ??= {};
+      this.debug.diagnostics.keywords ??= false;
       this._storageTextures = createThreeStorageTextures(THREE, {
         getDevice: () => this._device, signal: this._targetLifetime.signal,
       });
