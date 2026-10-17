@@ -1,4 +1,4 @@
-/** Read-only CPU data textures at the TSL compute boundary.
+/** Read-only data and decoded bitmap textures at the TSL compute boundary.
  *
  * The existing source texture pool performs format admission and native uploads.
  * Private descriptors (not Three constructors/clones) hold call-time pixel and
@@ -6,6 +6,8 @@
  * no source arrays are replaced, and no retained renderer submits GPU work.
  * Partial rows/layers compose a complete immutable image from the preceding
  * captured source version (or zero-initialized storage), not unmarked CPU edits.
+ * ImageData/ImageBitmap inputs use synchronous structured-clone snapshots. Only
+ * privately cloned bitmaps are closed; application images are never transferred.
  * StorageTexture bindings continue to use the renderer's shared storage owner.
  */
 export class ThreeComputeTextureError extends Error {
@@ -16,6 +18,8 @@ export class ThreeComputeTextureError extends Error {
 }
 const fail = (code, message) => { throw new ThreeComputeTextureError(code, message); };
 const positive = n => Number.isSafeInteger(n) && n > 0;
+const instance = (value, name) => typeof globalThis[name] === 'function' && value instanceof globalThis[name];
+const decodedImage = image => instance(image, 'ImageData') || instance(image, 'ImageBitmap');
 
 /** poolFactory returns the existing createGpuThreeTextures owner, lazily, after
  * renderer initialization. Its inspect/prepare/binding/retain contract is shared
@@ -43,14 +47,15 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
   function describe(binding) {
     live();
     const t = binding?.texture;
-    if (!t || !(t.isDataTexture || t.isDataArrayTexture || t.isData3DTexture || t.isCompressedTexture || t.isCubeTexture) ||
+    if (!t || !(t.isTexture || t.isDataTexture || t.isDataArrayTexture || t.isData3DTexture || t.isCompressedTexture || t.isCubeTexture) ||
         t.isRenderTargetTexture || t.isVideoTexture ||
         t.isCubeTexture && (!Array.isArray(t.image) || t.image.length !== 6))
-      fail('SOURCE', 'Compute sampled inputs require ready 2D/array/3D data textures or CPU-backed cube/compressed textures');
-    if (binding.store) fail('ACCESS', 'CPU data textures are read-only compute inputs; use StorageTexture for writes');
+      fail('SOURCE', 'Compute sampled inputs require ready source data or decoded bitmap textures');
+    if (binding.store) fail('ACCESS', 'Source textures are read-only compute inputs; use StorageTexture for writes');
     if (!binding.isSampler && !binding.isSampledTexture) fail('BINDING', 'Expected a source texture or sampler binding');
     const shape = sourcePool().inspect(t);
-    if (!shape.data) fail('SOURCE', 'Expected CPU pixel or compressed-block data');
+    if (!shape.data && (!Array.isArray(shape.images) || !shape.images.length || !shape.images.every(decodedImage)))
+      fail('SOURCE', 'Decoded compute inputs require ImageData or ImageBitmap sources; mutable DOM images require a capture boundary');
     updatePlan(t, shape);
     return shape;
   }
@@ -153,6 +158,7 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
   }
   function releasePixels(source, pixels) {
     if (--pixels.refs !== 0) return;
+    pixels.disposeImages?.();
     snapshotBytes -= pixels.bytes;
     const variants = sources.get(source);
     variants.delete(pixels.key);
@@ -210,6 +216,7 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
     return texture;
   }
   function snapshot(original, shape) {
+    const texture = privateDescriptor(original);
     const updates = updatePlan(original, shape), imageAtCapture = original.image;
     const rangesAtCapture = original.updateRanges, rangeValues = (rangesAtCapture ?? []).map(r => ({ref: r, start: r.start, count: r.count}));
     const layersAtCapture = original.layerUpdates, layerValues = [...layersAtCapture ?? []];
@@ -227,7 +234,8 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
       // Source aliases share one immutable upload version and one native
       // resource, just as the source pool does. Copy only image/mip records;
       // never traverse arbitrary application objects attached to textures.
-      const copies = new Map(), images = new Map(); let bytes = 0;
+      const copies = new Map(), images = new Map(), bitmaps = new Set(); let bytes = 0;
+      const disposeImages = () => { for (const bitmap of bitmaps) bitmap.close(); bitmaps.clear(); };
       const copyData = (data, image) => {
         if (data == null) return data;
         if (!ArrayBuffer.isView(data) || data instanceof DataView) fail('SOURCE', 'Expected typed texture data');
@@ -253,6 +261,25 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
       function copyImage(image) {
         if (!image) return image;
         if (images.has(image)) return images.get(image);
+        if (decodedImage(image)) {
+          // ImageBitmap and ImageData have platform internal slots; spreading
+          // them produces an invalid external-copy source. Structured cloning
+          // copies the pixels synchronously, without transfer, canvas rasterizing,
+          // a decoder task, source constructors or image ownership changes.
+          // Opaque bitmaps are charged their logical RGBA8 pixel footprint, as
+          // in the source texture pool, not an estimate of browser process RAM.
+          const size = instance(image, 'ImageData') ? image.data.byteLength : image.width * image.height * 4;
+          if (!positive(size) || size > maxSnapshotBytes - snapshotBytes - bytes)
+            fail('BUDGET', 'Captured compute image pixels exceed maxSnapshotBytes');
+          if (typeof globalThis.structuredClone !== 'function')
+            fail('SOURCE', 'Decoded compute inputs require synchronous structuredClone support');
+          const copy = globalThis.structuredClone(image);
+          if (copy !== image && instance(copy, 'ImageBitmap')) bitmaps.add(copy);
+          if (copy === image || !decodedImage(copy) || copy.width !== image.width || copy.height !== image.height)
+            fail('SOURCE', 'The host did not produce an independent decoded image snapshot');
+          images.set(image, copy); bytes += size;
+          return copy;
+        }
         if (Array.isArray(image)) {
           const result = []; images.set(image, result);
           for (const face of image) result.push(copyImage(face));
@@ -273,10 +300,11 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
         if (Array.isArray(image.mipmaps)) result.mipmaps = image.mipmaps.map(copyImage);
         return result;
       }
-      const image = copyImage(original.image), mipmaps = original.mipmaps.map(copyImage);
-      pixels = {key, descriptorKey: shape.key, source: {...source, data: image}, mipmaps, bytes, refs: 0};
+      try {
+        const image = copyImage(original.image), mipmaps = original.mipmaps.map(copyImage);
+        pixels = {key, descriptorKey: shape.key, source: {...source, data: image}, mipmaps, bytes, refs: 0, disposeImages};
+      } catch (error) { disposeImages(); throw error; }
     }
-    const texture = privateDescriptor(original);
     let record;
     texture.source = pixels.source; texture.mipmaps = pixels.mipmaps;
     texture.onUpdate = () => {
@@ -314,8 +342,9 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
         record.version !== original.version || record.sourceVersion !== original.source.version) {
       if (records.size >= maxTextures) fail('BUDGET', 'Captured compute texture versions exceed maxTextures');
       const replacement = snapshot(original, shape);
-      watch(original);
       const pixels = replacement.pixels;
+      try { watch(original); }
+      catch (error) { if (pixels.refs === 0) pixels.disposeImages?.(); throw error; }
       retainPixels(replacement.source, pixels);
       records.add(replacement);
       setHistory(replacement.source, replacement.key, pixels);
