@@ -28,7 +28,7 @@ export function inspectThreeStorageTexture(texture, three) {
   if (texture.image.data != null || texture.mipmaps?.length || texture.internalFormat != null ||
       ![three.NoColorSpace, three.LinearSRGBColorSpace].includes(texture.colorSpace))
     fail('FORMAT', 'Storage textures require linear GPU-authored data and no internal-format override');
-  let format, texelBytes;
+  let format, texelBytes, integerType = null;
   if (texture.type === three.UnsignedByteType && texture.format === three.RGBAFormat) [format, texelBytes] = ['rgba8unorm', 4];
   else if (texture.type === three.HalfFloatType && texture.format === three.RGBAFormat) [format, texelBytes] = ['rgba16float', 8];
   else if (texture.type === three.FloatType) {
@@ -36,7 +36,17 @@ export function inspectThreeStorageTexture(texture, three) {
     else if (texture.format === three.RGFormat) [format, texelBytes] = ['rg32float', 8];
     else if (texture.format === three.RGBAFormat) [format, texelBytes] = ['rgba32float', 16];
   }
-  if (!format) fail('FORMAT', 'Storage color must be RGBA8, RGBA16F or R/RG/RGBA32F');
+  // r186 getFormat admits both the ordinary and explicit integer format names
+  // with IntType/UnsignedIntType. Never lower IDs/bitfields through float texels.
+  if ((three.IntType !== undefined && texture.type === three.IntType) ||
+      (three.UnsignedIntType !== undefined && texture.type === three.UnsignedIntType)) {
+    integerType = texture.type === three.IntType ? 'sint' : 'uint';
+    const channels = [[three.RedFormat, three.RedIntegerFormat, 'r', 4],
+      [three.RGFormat, three.RGIntegerFormat, 'rg', 8], [three.RGBAFormat, three.RGBAIntegerFormat, 'rgba', 16]]
+      .find(([ordinary, explicit]) => texture.format !== undefined && (texture.format === ordinary || texture.format === explicit));
+    if (channels) [format, texelBytes] = [`${channels[2]}32${integerType}`, channels[3]];
+  }
+  if (!format) fail('FORMAT', 'Storage color must be RGBA8, RGBA16F or R/RG/RGBA32 float, sint or uint');
   // r186 StorageArrayTexture/Storage3DTexture omit mipmapsAutoUpdate. Undefined
   // is disabled there; preserve the source object rather than inventing a flag.
   if (typeof texture.generateMipmaps !== 'boolean' ||
@@ -49,7 +59,7 @@ export function inspectThreeStorageTexture(texture, three) {
     bytes += Math.max(1, Math.floor(width / 2 ** level)) * Math.max(1, Math.floor(height / 2 ** level)) *
       (volume ? Math.max(1, Math.floor(depth / 2 ** level)) : depth) * texelBytes;
   if (!Number.isSafeInteger(bytes)) fail('BUDGET', 'Storage texture size exceeds safe integer precision');
-  return {width, height, depth, viewDimension, format, texelBytes, mipLevelCount, bytes,
+  return {width, height, depth, viewDimension, format, texelBytes, mipLevelCount, bytes, integerType,
     float32: texture.type === three.FloatType, key: `${viewDimension}/${width}/${height}/${depth}/${format}/${mipLevelCount}`};
 }
 
@@ -67,6 +77,7 @@ function samplerOf(texture, three, shape, device) {
     fail('SAMPLER', 'Expected ordinary source texture filters and wrapping');
   const [minFilter, mipmapFilter, useMips] = min;
   const filtering = magFilter === 'linear' || minFilter === 'linear' || mipmapFilter === 'linear';
+  if (shape.integerType && filtering) fail('SAMPLER', 'Integer texture bindings require nearest, non-filtering samplers');
   if (shape.float32 && filtering && !device?.features?.has?.('float32-filterable'))
     fail('SAMPLER', 'Linear float32 sampling requires float32-filterable; use nearest filters');
   return {magFilter, minFilter, mipmapFilter, addressModeU, addressModeV, ...(addressModeW ? {addressModeW} : {}),
@@ -183,13 +194,19 @@ export function createThreeStorageTextures(three, {getDevice, signal = null, max
     const access = accessNames.get(binding.access), mipLevel = binding.mipLevel ?? 0;
     if (!access || !Number.isSafeInteger(mipLevel) || mipLevel < 0 || mipLevel >= entry.shape.mipLevelCount)
       fail('BINDING', 'Expected source storage access and an allocated mip level');
+    // Integer labels have no implicit interpolation/reduction policy. Admit
+    // manual mips, but never feed integer storage into float-only mip shaders.
+    // Check the captured write controls, not later changes during a queued use.
+    if (entry.shape.integerType && entry.shape.mipLevelCount > 1 && mipLevel === 0 &&
+        access !== 'read-only' && binding.texture.mipmapsAutoUpdate === true)
+      fail('MIPS', 'Integer storage mipmaps require explicit compute writes; disable mipmapsAutoUpdate');
     return {entry, kind: 'storage', access, mipLevel, autoMips: binding.texture.mipmapsAutoUpdate};
   }
   function layout(snapshot) {
     const {entry, kind} = snapshot;
-    if (kind === 'sampler') return {sampler: {type: 'filtering'}};
+    if (kind === 'sampler') return {sampler: {type: entry.shape.integerType ? 'non-filtering' : 'filtering'}};
     if (kind === 'storage') return {storageTexture: {access: snapshot.access, format: entry.shape.format, viewDimension: entry.shape.viewDimension}};
-    return {texture: {sampleType: entry.shape.float32 && !device().features?.has?.('float32-filterable') ? 'unfilterable-float' : 'float', viewDimension: entry.shape.viewDimension, multisampled: false}};
+    return {texture: {sampleType: entry.shape.integerType ?? (entry.shape.float32 && !device().features?.has?.('float32-filterable') ? 'unfilterable-float' : 'float'), viewDimension: entry.shape.viewDimension, multisampled: false}};
   }
   function refreshMips(entry) {
     if (!entry.mipsDirty || entry.shape.mipLevelCount === 1) return;
