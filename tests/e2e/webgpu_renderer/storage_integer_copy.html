@@ -1,0 +1,65 @@
+<!DOCTYPE html><html lang="en"><meta charset="utf-8"><title>TSL integer texture copies</title>
+<body><canvas width="16" height="16"></canvas><pre id="result">Running…</pre>
+<script type="importmap">{"imports":{"three":"../../../upstream/three.js/build/three.webgpu.js","three/webgpu":"../../../upstream/three.js/build/three.webgpu.js","three/tsl":"../../../upstream/three.js/build/three.tsl.js"}}</script>
+<script type="module">
+// Build with --route-webgpu-renderer. This checks the actual public renderer and
+// pinned TSL builder, not the native-only fixture's minimal source objects.
+import * as THREE from 'three/webgpu';
+import {Fn, storage, textureStore, textureLoad, instanceIndex, uvec2, uvec4, ivec4, uint, uniform} from 'three/tsl';
+const state = window.__f3dIntegerCopy = {status: 'running', checks: [], error: null};
+let renderer; const owned = [];
+const keep = resource => { owned.push(resource); return resource; };
+function check(name, actual, expected) {
+  if (actual.length !== expected.length || actual.some((n, i) => n !== expected[i]))
+    throw new Error(`${name}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+  state.checks.push(name);
+}
+try {
+  renderer = new THREE.WebGPURenderer({canvas: document.querySelector('canvas')});
+  if (!renderer.isF3DRenderer) throw new Error('This fixture requires --route-webgpu-renderer; retained submission cannot pass');
+  await renderer.init();
+  for (const signed of [false, true]) {
+    const type = signed ? THREE.IntType : THREE.UnsignedIntType;
+    const makeTexture = () => {
+      const t = keep(new THREE.StorageTexture(4, 2));
+      t.type = type; t.format = THREE.RGBAIntegerFormat;
+      t.generateMipmaps = false; t.minFilter = t.magFilter = THREE.NearestFilter;
+      return t;
+    };
+    const source = makeTexture(), destination = makeTexture();
+    const values = signed ? [-1, -2147483648, 16777217, 2147483647] : [4294967295, 2147483648, 16777217, 2147483647];
+    const data = new THREE.StorageBufferAttribute(signed ? new Int32Array(32) : new Uint32Array(32), 4);
+    const output = storage(data, signed ? 'ivec4' : 'uvec4', 8);
+    const selected = uniform(0, 'uint');
+    const produce = keep(Fn(() => {
+      const coord = uvec2(instanceIndex.mod(4), instanceIndex.div(4));
+      const vector = signed ? ivec4(...values) : uvec4(...values);
+      // A later producer changes its source; the copied texture must not alias it.
+      textureStore(source, coord, vector.add(signed ? selected.toInt() : selected)).toWriteOnly();
+    })().compute(8, [8]));
+    const consume = keep(Fn(() => {
+      const coord = uvec2(instanceIndex.mod(4), instanceIndex.div(4));
+      output.element(instanceIndex).assign(textureLoad(destination, coord));
+    })().compute(8, [8]));
+    await renderer.compileComputeAsync([produce, consume]);
+    renderer.compute(produce);
+    if (renderer.copyTextureToTexture(source, destination) !== undefined) throw new Error('Initialized source copy must return void');
+    selected.value = 1; renderer.compute(produce);
+    renderer.compute(consume);
+    const read = await renderer.getArrayBufferAsync(data);
+    check(`${signed ? 'signed' : 'unsigned'} exact store/copy/load`,
+      Array.from(signed ? new Int32Array(read) : new Uint32Array(read)), Array.from({length: 8}, () => values).flat());
+    // Copy one original texel to another location in the other texture, using
+    // the unchanged copied image as source and a distinct mip-free target.
+    const region = new THREE.Box2(new THREE.Vector2(0, 0), new THREE.Vector2(1, 1));
+    renderer.copyTextureToTexture(destination, source, region, new THREE.Vector2(3, 1));
+    await renderer.waitForGPU();
+  }
+  state.status = 'pass';
+} catch (error) { state.status = 'fail'; state.error = error.stack ?? String(error); }
+finally {
+  for (const resource of owned) resource.dispose();
+  renderer?.dispose();
+  document.querySelector('#result').textContent = JSON.stringify(state, null, 2);
+}
+</script></body></html>

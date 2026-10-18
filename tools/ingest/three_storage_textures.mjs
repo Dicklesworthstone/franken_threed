@@ -4,6 +4,7 @@
  * the GPU; ordinary material bindings sample the same allocation. */
 import {submitStorageArrayMips} from './gpu_storage_array_mips.mjs';
 import {submitStorageVolumeMips} from './gpu_storage_volume_mips.mjs';
+import {inspectStorageTextureCopy} from './three_storage_texture_copy.mjs';
 
 export class ThreeStorageTextureError extends Error {
   constructor(code, message) {
@@ -166,14 +167,19 @@ export function createThreeStorageTextures(three, {getDevice, signal = null, max
       fail('STALE', 'Storage texture was resized, disposed or reconfigured before its queued use');
     return entry;
   }
-  function ensure(entry) {
-    assertCurrent(entry);
-    if (entry.native) return entry;
-    const d = device(), {width, height, depth, viewDimension, mipLevelCount, format, bytes} = entry.shape;
+  function checkExtent(shape) {
+    const d = device(), {width, height, depth, viewDimension} = shape;
     const volume = viewDimension === '3d';
     const limit = volume ? (d.limits.maxTextureDimension3D ?? 2048) : d.limits.maxTextureDimension2D;
     if (width > limit || height > limit || (volume && depth > limit)) fail('LIMIT', 'Storage texture exceeds device dimensions');
     if (!volume && depth > (d.limits.maxTextureArrayLayers ?? 256)) fail('LIMIT', 'Storage texture exceeds device array layers');
+  }
+  function ensure(entry) {
+    assertCurrent(entry);
+    if (entry.native) return entry;
+    checkExtent(entry.shape);
+    const d = device(), {width, height, depth, viewDimension, mipLevelCount, format, bytes} = entry.shape;
+    const volume = viewDimension === '3d';
     if (bytes > maxBytes - allocatedBytes) fail('BUDGET', 'Storage texture allocations exceed maxBytes');
     // All uses share this allocation. Only ordinary 2D mips need render attachments.
     checked(d => {
@@ -201,6 +207,34 @@ export function createThreeStorageTextures(three, {getDevice, signal = null, max
         access !== 'read-only' && binding.texture.mipmapsAutoUpdate === true)
       fail('MIPS', 'Integer storage mipmaps require explicit compute writes; disable mipmapsAutoUpdate');
     return {entry, kind: 'storage', access, mipLevel, autoMips: binding.texture.mipmapsAutoUpdate};
+  }
+  function captureCopy(sourceTexture, destinationTexture, region = null, position = null, sourceLevel = 0, destinationLevel = 0) {
+    const source = capture(sourceTexture), destination = capture(destinationTexture);
+    const plan = inspectStorageTextureCopy(source.shape, destination.shape, region, position,
+      sourceLevel, destinationLevel, source === destination);
+    // Reuse write admission and capture the mip policy at the source call.
+    const write = plan.empty ? null : captureBinding({texture: destinationTexture, isSampledTexture: true,
+      store: true, access: 'writeOnly', mipLevel: destinationLevel});
+    return Object.freeze({source, destination, plan, write});
+  }
+  function copy({source, destination, plan, write}) {
+    assertCurrent(source); assertCurrent(destination);
+    if (plan.empty) return false;
+    checkExtent(source.shape); checkExtent(destination.shape);
+    const needed = (source.native ? 0 : source.shape.bytes) +
+      (destination.native || destination === source ? 0 : destination.shape.bytes);
+    if (needed > maxBytes - allocatedBytes) fail('BUDGET', 'Storage texture copy endpoints exceed maxBytes');
+    ensure(source); ensure(destination); refreshMips(source);
+    checked(d => {
+      const encoder = d.createCommandEncoder({label: 'f3d-storage-texture-copy'});
+      encoder.copyTextureToTexture({texture: source.native, mipLevel: plan.sourceLevel, origin: plan.sourceOrigin},
+        {texture: destination.native, mipLevel: plan.destinationLevel, origin: plan.destinationOrigin}, plan.size);
+      assertCurrent(source); assertCurrent(destination);
+      d.queue.submit([encoder.finish()]);
+    });
+    // A level-zero copy has the same mip consequences as a compute write;
+    // manual higher-mip copies must not be overwritten by base regeneration.
+    written([write]); return true;
   }
   function layout(snapshot) {
     const {entry, kind} = snapshot;
@@ -296,7 +330,7 @@ export function createThreeStorageTextures(three, {getDevice, signal = null, max
     try { await Promise.race([Promise.all([...pending, watchedDevice.queue.onSubmittedWorkDone()]), cancelled]); live(); }
     finally { stopped.signal.removeEventListener('abort', abort); }
   }
-  return {capture, assertCurrent, ensure, captureBinding, layout, resolve, validateDispatch, written, bindingsFor, whenIdle,
+  return {capture, assertCurrent, ensure, captureBinding, captureCopy, copy, layout, resolve, validateDispatch, written, bindingsFor, whenIdle,
     get allocatedBytes() { return allocatedBytes; }, get size() { return entries.size; },
     dispose: () => stop(new ThreeStorageTextureError('DISPOSED', 'Storage texture owner disposed'))};
 }

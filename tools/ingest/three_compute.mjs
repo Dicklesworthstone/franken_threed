@@ -15,6 +15,7 @@ import {createThreeStorageTextures, inspectThreeStorageTexture} from './three_st
 import {createGpuThreeTextures} from './three_textures.mjs';
 import {createThreeComputeTextures} from './three_compute_textures.mjs';
 import {createThreeComputeTargets} from './three_compute_targets.mjs';
+import {withStorageTextureCopies} from './three_storage_texture_copy.mjs';
 
 export class ThreeComputeError extends Error {
   constructor(code, message) {
@@ -358,6 +359,7 @@ function createThreeCompute(renderer, three) {
  * are taken at the initialized call, not replayed when preparation finishes.
  * Before init(), source preparation follows upstream's asynchronous boundary. */
 export function withThreeCompute(Base, THREE) {
+  Base = withStorageTextureCopies(Base);
   const owners = new WeakMap();
   const owner = renderer => {
     let value = owners.get(renderer);
