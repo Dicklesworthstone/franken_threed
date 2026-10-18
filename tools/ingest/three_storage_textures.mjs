@@ -4,7 +4,7 @@
  * the GPU; ordinary material bindings sample the same allocation. */
 import {submitStorageArrayMips} from './gpu_storage_array_mips.mjs';
 import {submitStorageVolumeMips} from './gpu_storage_volume_mips.mjs';
-import {inspectStorageTextureCopy} from './three_storage_texture_copy.mjs';
+import {inspectStorageTextureCopy} from './three_texture_copy_plan.mjs';
 
 export class ThreeStorageTextureError extends Error {
   constructor(code, message) {
@@ -109,7 +109,7 @@ const MIPS = `
 
 export function createThreeStorageTextures(three, {getDevice, signal = null, maxTextures = 256, maxBytes = 256 * 1024 * 1024} = {}) {
   if (typeof getDevice !== 'function' || !positive(maxTextures) || !positive(maxBytes)) fail('OPTIONS', 'Expected storage texture owner options');
-  const entries = new Map(), mipPipelines = new Map(), pending = new Set();
+  const entries = new Map(), mipPipelines = new Map(), pending = new Set(), borrowed = new Set();
   let allocatedBytes = 0, terminal = null, watchedDevice = null;
   const stopped = new AbortController();
   const live = () => { if (terminal) throw terminal; };
@@ -174,6 +174,38 @@ export function createThreeStorageTextures(three, {getDevice, signal = null, max
     if (width > limit || height > limit || (volume && depth > limit)) fail('LIMIT', 'Storage texture exceeds device dimensions');
     if (!volume && depth > (d.limits.maxTextureArrayLayers ?? 256)) fail('LIMIT', 'Storage texture exceeds device array layers');
   }
+  // Preflight a whole transfer before either resource owner allocates a prefix.
+  function validateAllocations(candidates) {
+    if (!Array.isArray(candidates)) fail('OPTIONS', 'Expected captured storage entries');
+    let needed = 0;
+    for (const entry of new Set(candidates)) {
+      assertCurrent(entry); checkExtent(entry.shape);
+      if (borrowed.has(entry)) fail('REENTRANT', 'Storage texture is already borrowed by a submission');
+      if (!entry.native) needed += entry.shape.bytes;
+    }
+    if (!Number.isSafeInteger(needed) || needed > maxBytes - allocatedBytes)
+      fail('BUDGET', 'Storage texture copy endpoints exceed maxBytes');
+  }
+  // The callback must submit before returning. Other renderer-owned resources
+  // can participate in the same native command without bypassing this owner's
+  // validation, mip policy, disposal checks or completion accounting.
+  function withTexture(entry, callback, write = null) {
+    if (typeof callback !== 'function') fail('CALLBACK', 'Expected a synchronous native texture callback');
+    if (write !== null && (write.entry !== entry || write.kind !== 'storage' || write.access === 'read-only'))
+      fail('ACCESS', 'Expected a captured storage write for the borrowed texture');
+    validateAllocations([entry]); ensure(entry);
+    if (write === null) refreshMips(entry);
+    borrowed.add(entry);
+    try {
+      const result = checked(() => {
+        const value = callback(entry.native);
+        if (value?.then) fail('CALLBACK', 'Native texture callbacks must submit synchronously');
+        assertCurrent(entry); return value;
+      });
+      if (write !== null) written([write]);
+      return result;
+    } finally { borrowed.delete(entry); }
+  }
   function ensure(entry) {
     assertCurrent(entry);
     if (entry.native) return entry;
@@ -220,10 +252,7 @@ export function createThreeStorageTextures(three, {getDevice, signal = null, max
   function copy({source, destination, plan, write}) {
     assertCurrent(source); assertCurrent(destination);
     if (plan.empty) return false;
-    checkExtent(source.shape); checkExtent(destination.shape);
-    const needed = (source.native ? 0 : source.shape.bytes) +
-      (destination.native || destination === source ? 0 : destination.shape.bytes);
-    if (needed > maxBytes - allocatedBytes) fail('BUDGET', 'Storage texture copy endpoints exceed maxBytes');
+    validateAllocations([source, destination]);
     ensure(source); ensure(destination); refreshMips(source);
     checked(d => {
       const encoder = d.createCommandEncoder({label: 'f3d-storage-texture-copy'});
@@ -330,7 +359,7 @@ export function createThreeStorageTextures(three, {getDevice, signal = null, max
     try { await Promise.race([Promise.all([...pending, watchedDevice.queue.onSubmittedWorkDone()]), cancelled]); live(); }
     finally { stopped.signal.removeEventListener('abort', abort); }
   }
-  return {capture, assertCurrent, ensure, captureBinding, captureCopy, copy, layout, resolve, validateDispatch, written, bindingsFor, whenIdle,
+  return {capture, assertCurrent, ensure, validateAllocations, withTexture, captureBinding, captureCopy, copy, layout, resolve, validateDispatch, written, bindingsFor, whenIdle,
     get allocatedBytes() { return allocatedBytes; }, get size() { return entries.size; },
     dispose: () => stop(new ThreeStorageTextureError('DISPOSED', 'Storage texture owner disposed'))};
 }
