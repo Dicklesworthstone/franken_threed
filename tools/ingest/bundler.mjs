@@ -662,6 +662,7 @@ export async function bundleWithRollup(entryPath, options = {}) {
         // A worker is an independent ESM realm, not a raw URL asset and not a
         // document chunk. Do not apply the page import map or renderer route.
         moduleWorkerRollupPlugin({
+          ...(isHtml ? { documentUrl: entryUrl, documentBaseUrl: mapBaseUrl } : {}),
           resolveModule: (specifier, from) => resolveModuleSpecifier(specifier, from, {}, {
             packageRootUrl: options.packageRootUrl,
           }),

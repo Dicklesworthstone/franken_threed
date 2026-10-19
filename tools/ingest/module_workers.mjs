@@ -98,14 +98,77 @@ function changedGlobals(ast) {
   });
   return changed;
 }
-function sitesIn(ast, changed, {classic = false, relative = false} = {}) {
+// Document modules have lexical scopes. A local URL/Worker binding in one
+// factory must not hide the native constructor used by another factory: doing
+// so can split equivalent SharedWorker URLs across different output assets.
+function scopedGlobals(ast) {
+  const ancestorsByNode = new WeakMap(), scopes = new Map(), writes = new Set();
+  const functions = new Set(['FunctionDeclaration', 'FunctionExpression', 'ArrowFunctionExpression']);
+  const lexical = new Set(['Program', 'BlockStatement', 'StaticBlock', 'CatchClause',
+    'ForStatement', 'ForInStatement', 'ForOfStatement', 'SwitchStatement', ...functions]);
+  function names(node, result = []) {
+    if (!node) return result;
+    if (node.type === 'Identifier') result.push(node.name);
+    else if (node.type === 'RestElement') names(node.argument, result);
+    else if (node.type === 'AssignmentPattern') names(node.left, result);
+    else if (node.type === 'ArrayPattern') node.elements.forEach(value => names(value, result));
+    else if (node.type === 'ObjectPattern') node.properties.forEach(value => names(value.type === 'RestElement' ? value.argument : value.value, result));
+    return result;
+  }
+  const put = (scope, values) => {
+    if (!scopes.has(scope)) scopes.set(scope, new Set());
+    for (const name of values) scopes.get(scope).add(name);
+  };
+  walk.fullAncestor(ast, (node, _state, ancestors) => {
+    ancestorsByNode.set(node, ancestors.slice());
+    const parents = ancestors.slice(0, -1), containing = predicate => parents.findLast(predicate);
+    if (node.type === 'VariableDeclaration') {
+      const scope = containing(parent => node.kind === 'var'
+        ? functions.has(parent.type) || ['Program', 'StaticBlock'].includes(parent.type) : lexical.has(parent.type));
+      for (const declaration of node.declarations) put(scope, names(declaration.id));
+    } else if (node.type === 'ImportDeclaration') put(ast, node.specifiers.map(value => value.local.name));
+    else if (functions.has(node.type)) {
+      put(node, node.params.flatMap(value => names(value)));
+      if (node.id) {
+        put(node, [node.id.name]);
+        if (node.type === 'FunctionDeclaration') put(containing(parent => lexical.has(parent.type)), [node.id.name]);
+      }
+    } else if (node.type === 'CatchClause') put(node, names(node.param));
+    else if (['ClassDeclaration', 'ClassExpression'].includes(node.type) && node.id) {
+      put(node, [node.id.name]);
+      if (node.type === 'ClassDeclaration') put(containing(parent => lexical.has(parent.type)), [node.id.name]);
+    }
+  });
+  const bound = (name, node) => (ancestorsByNode.get(node) ?? []).some(parent => scopes.get(parent)?.has(name));
+  function mutation(node) {
+    if (node?.type === 'RestElement') return mutation(node.argument);
+    if (node?.type === 'AssignmentPattern') return mutation(node.left);
+    if (node?.type === 'ArrayPattern') { node.elements.forEach(mutation); return; }
+    if (node?.type === 'ObjectPattern') {
+      node.properties.forEach(value => mutation(value.type === 'RestElement' ? value.argument : value.value)); return;
+    }
+    for (const name of names(node)) if (!bound(name, node)) writes.add(name);
+    if (node?.type !== 'MemberExpression' || node.object.type !== 'Identifier' ||
+        !['globalThis', 'self', 'window'].includes(node.object.name) || bound(node.object.name, node)) return;
+    const name = node.computed ? text(node.property) : node.property.name;
+    if (name !== null) writes.add(name);
+    else ['URL', 'Worker', 'SharedWorker'].forEach(value => writes.add(value));
+  }
+  walk.simple(ast, {
+    AssignmentExpression: node => mutation(node.left), UpdateExpression: node => mutation(node.argument),
+    ForInStatement: node => mutation(node.left), ForOfStatement: node => mutation(node.left),
+  });
+  return node => new Set([...writes, ...(ancestorsByNode.get(node) ?? []).flatMap(parent => [...(scopes.get(parent) ?? [])])]);
+}
+function sitesIn(ast, changed, {classic = false, relative = false, withConstructors = false} = {}) {
   const sites = [];
   walk.simple(ast, {NewExpression(node) {
+    const unavailable = typeof changed === 'function' ? changed(node) : changed;
     const kind = node.callee.type === 'Identifier' ? node.callee.name : null;
-    if (!['Worker', 'SharedWorker'].includes(kind) || changed.has(kind) ||
+    if (!['Worker', 'SharedWorker'].includes(kind) || unavailable.has(kind) ||
         node.arguments.length < 1 || node.arguments.length > 2) return;
     const urlNode = node.arguments[0], options = node.arguments[1];
-    const choices = urlChoices(urlNode, changed, relative);
+    const choices = urlChoices(urlNode, unavailable, relative);
     if (!choices) return;
     let workerType = 'classic';
     if (options && !(options.type === 'Literal' && options.value === null)) {
@@ -121,7 +184,7 @@ function sitesIn(ast, changed, {classic = false, relative = false} = {}) {
     }
     if (!['classic', 'module'].includes(workerType) || (!classic && workerType !== 'module')) return;
     for (const choice of choices)
-      sites.push({kind, workerType, ...choice, specifier: text(choice.argument)});
+      sites.push({kind, workerType, ...(withConstructors ? {constructorNode: node} : {}), ...choice, specifier: text(choice.argument)});
   }});
   return sites;
 }
@@ -132,10 +195,10 @@ export function findModuleWorkerSites(source) {
   return sitesIn(ast, changedGlobals(ast));
 }
 
-/** URL-form workers in document ESM; literal URLs additionally inside workers. */
+/** URL-form workers; literal URLs when their document or worker realm is known. */
 export function findWorkerSites(source, {sourceType = 'module', relative = false} = {}) {
   const ast = typeof source === 'string' ? parse(source, null, sourceType) : source;
-  return sitesIn(ast, changedGlobals(ast), {classic: true, relative});
+  return sitesIn(ast, scopedGlobals(ast), {classic: true, relative});
 }
 
 const realmKey = (url, workerType) => JSON.stringify([workerType, url]);
@@ -183,6 +246,7 @@ export function buildModuleWorkerGraph(entryUrl, options = {}) {
 export function buildWorkerGraph(entryUrl, {
   workerType = 'module',
   resolveModule = resolveLocal, maxModules = 4096, maxAssets = 4096, maxBytes = 64 * 1024 * 1024,
+  requireClosedRuntimeUrls = false,
 } = {}) {
   if (!['classic', 'module'].includes(workerType)) fail('OPTIONS', 'Expected classic or module workerType');
   if (typeof resolveModule !== 'function' || ![maxModules, maxAssets, maxBytes].every(n => Number.isSafeInteger(n) && n > 0))
@@ -196,7 +260,11 @@ export function buildWorkerGraph(entryUrl, {
   };
   function module(url, realm, sourceType = 'module') {
     url = normalize(url);
-    if (remote(url)) return {external: url};
+    if (remote(url)) {
+      if (requireClosedRuntimeUrls)
+        fail('DYNAMIC_RESOURCE', 'Uninspected remote worker code needs the original host route', url);
+      return {external: url};
+    }
     if (new URL(url).protocol !== 'file:') fail('RESOLUTION', 'Only local files and explicit http/https/data imports are supported', url);
     const key = JSON.stringify([realm, sourceType, url]);
     let record = modules.get(key);
@@ -306,8 +374,35 @@ export function buildWorkerGraph(entryUrl, {
         (callee.type === 'MemberExpression' && !callee.computed && callee.property.name === name &&
           callee.object.type === 'Identifier' && ['globalThis', 'self'].includes(callee.object.name) && !changed.has(callee.object.name));
     }
-    const workers = sitesIn(ast, changed, {classic: true, relative: true});
+    const workers = sitesIn(ast, changed, {classic: true, relative: true, withConstructors: true});
+    const workerConstructors = new Set(workers.map(site => site.constructorNode));
     const workerURLs = new Set(workers.map(site => site.urlNode.start));
+    if (requireClosedRuntimeUrls) {
+      // Unrecognized native URL consumers and escaped host functions can still
+      // use relative URLs. Keep those workers at their original document route
+      // rather than relocate only the calls this bounded transform recognizes.
+      const consumers = new Set(['fetch', 'importScripts', 'Worker', 'SharedWorker', 'URL',
+        'XMLHttpRequest', 'Request', 'WebSocket', 'EventSource', 'eval', 'Function']);
+      if ([...consumers, 'globalThis', 'self'].some(name => changed.has(name)))
+        fail('DYNAMIC_RESOURCE', 'Rebound worker URL consumers need the original host route', record.url);
+      walk.fullAncestor(ast, (node, _state, ancestors) => {
+        const parent = ancestors.at(-2);
+        if (node.type === 'Identifier' && ['globalThis', 'self'].includes(node.name)) {
+          if (parent?.type !== 'MemberExpression' || parent.object !== node ||
+              (parent.computed && text(parent.property) === null))
+            fail('DYNAMIC_RESOURCE', 'An escaped worker global needs the original host route', record.url);
+        }
+        const name = node.type === 'Identifier' ? node.name
+          : node.type === 'MemberExpression' && node.object.type === 'Identifier' &&
+            ['globalThis', 'self'].includes(node.object.name) ? node.computed ? text(node.property) : node.property.name : null;
+        if (!consumers.has(name)) return;
+        const direct = parent?.callee === node;
+        if (['fetch', 'importScripts'].includes(name) && direct && parent.type === 'CallExpression' && hostCall(node, name)) return;
+        if (['Worker', 'SharedWorker'].includes(name) && direct && parent.type === 'NewExpression' && workerConstructors.has(parent)) return;
+        if (name === 'URL' && direct && parent.type === 'NewExpression' && urlOperand(parent)) return;
+        fail('DYNAMIC_RESOURCE', `The worker ${name} consumer needs the original host route`, record.url);
+      });
+    }
     const imports = new Map(), scriptImports = new Map();
     // acorn-walk visits new URL before its enclosing import/call. Claim those
     // operands first so executable dependencies cannot also become raw assets.
@@ -365,7 +460,14 @@ export function buildWorkerGraph(entryUrl, {
         }
         if (!hostCall(node.callee, 'fetch')) return;
         const candidates = literalChoices(node.arguments[0]);
-        if (!candidates) return; // Dynamic networking is not claimed closed.
+        if (!candidates) {
+          // A static import.meta URL is closed by the URL-asset visit below.
+          // Otherwise a document Worker string must retain its host route:
+          // relocating an unknown relative request would change its base.
+          if (requireClosedRuntimeUrls && !urlChoices(node.arguments[0], changed, false))
+            fail('DYNAMIC_RESOURCE', 'A dynamic fetch URL needs the original worker host route', record.url);
+          return;
+        }
         for (const candidate of candidates) {
           const value = text(candidate);
           if (value.trim().startsWith('/') || URL.canParse(value)) continue;
@@ -376,8 +478,13 @@ export function buildWorkerGraph(entryUrl, {
         }
       },
       NewExpression(node) {
+        if (requireClosedRuntimeUrls && !workerConstructors.has(node) &&
+            ['Worker', 'SharedWorker'].some(kind => hostCall(node.callee, kind)))
+          fail('DYNAMIC_RESOURCE', 'A dynamic worker URL/options needs the original worker host route', record.url);
         if (changed.has('URL') || workerURLs.has(node.start)) return;
-        const candidates = literalChoices(urlOperand(node));
+        const operand = urlOperand(node), candidates = literalChoices(operand);
+        if (operand && !candidates && requireClosedRuntimeUrls)
+          fail('DYNAMIC_RESOURCE', 'A dynamic module asset URL needs the original worker host route', record.url);
         if (!candidates) return;
         for (const argument of candidates) {
           const value = text(argument);
@@ -465,20 +572,21 @@ export function buildWorkerGraph(entryUrl, {
 /** Run before the ordinary URL-asset transform in bundleWithRollup. */
 export function moduleWorkerRollupPlugin(options = {}) {
   const emitted = new Map(), references = new Map(), filesByName = new Map();
+  const closedRealmEntries = new Set();
   let totalBytes = 0, totalModules = 0, totalAssets = 0;
   const maxBytes = options.maxBytes ?? 64 * 1024 * 1024;
   const maxModules = options.maxModules ?? 4096, maxAssets = options.maxAssets ?? 4096;
   return {
     name: 'f3d-module-workers',
-    buildStart() { emitted.clear(); references.clear(); filesByName.clear(); totalBytes = totalModules = totalAssets = 0; },
+    buildStart() { emitted.clear(); references.clear(); filesByName.clear(); closedRealmEntries.clear(); totalBytes = totalModules = totalAssets = 0; },
     resolveFileUrl({referenceId, relativePath}) {
       if (!references.has(referenceId)) return null;
       const relative = relativePath.startsWith('.') ? relativePath : './' + relativePath;
-      return JSON.stringify(relative + references.get(referenceId));
+      return JSON.stringify(relative + references.get(referenceId).suffix);
     },
     transform(code, id) {
       if (!code.includes('Worker')) return null;
-      const sites = findWorkerSites(code);
+      const sites = findWorkerSites(code, {relative: Boolean(options.documentUrl)});
       if (!sites.length) return null;
       const base = id.startsWith('file:') ? id : path.isAbsolute(id) ? pathToFileURL(id).href : null;
       if (!base) fail('ENTRY', 'A module worker URL needs a local source module', id);
@@ -486,14 +594,38 @@ export function moduleWorkerRollupPlugin(options = {}) {
       for (const site of sites) {
         // Origin-root and protocol-relative workers remain host-owned URLs.
         if (site.specifier.trim().startsWith('/')) continue;
-        const url = new URL(site.specifier, base).href;
+        const sourceBase = site.base === 'realm' ? options.documentBaseUrl ?? options.documentUrl : base;
+        const url = new URL(site.specifier, sourceBase).href;
         if (new URL(url).protocol !== 'file:') continue;
         const key = realmKey(url, site.workerType);
         let referenceId = emitted.get(key);
+        if (referenceId && site.base === 'realm' && !closedRealmEntries.has(key)) {
+          // An earlier import.meta URL site may have used the existing open
+          // network profile. That is not proof for relocating a document string.
+          try {
+            const graph = buildWorkerGraph(url, {...options, workerType: site.workerType, requireClosedRuntimeUrls: true});
+            for (const entry of graph.entries) closedRealmEntries.add(realmKey(entry.url, entry.workerType));
+          } catch (error) {
+            if (error instanceof ModuleWorkerBuildError) continue;
+            throw error;
+          }
+        }
         if (!referenceId) {
-          const graph = buildWorkerGraph(url, {...options, workerType: site.workerType});
-          if (graph.outputBytes > maxBytes - totalBytes || graph.moduleCount > maxModules - totalModules || graph.assetCount > maxAssets - totalAssets)
+          let graph;
+          try {
+            graph = buildWorkerGraph(url, {...options, workerType: site.workerType,
+              requireClosedRuntimeUrls: site.base === 'realm'});
+          } catch (error) {
+            // A document-relative string may name a server-provided worker or
+            // an open runtime graph. Preserve its native request/error behavior
+            // when local closure cannot be established, without partial output.
+            if (site.base === 'realm' && error instanceof ModuleWorkerBuildError) continue;
+            throw error;
+          }
+          if (graph.outputBytes > maxBytes - totalBytes || graph.moduleCount > maxModules - totalModules || graph.assetCount > maxAssets - totalAssets) {
+            if (site.base === 'realm') continue;
             fail('BUDGET', 'Module worker graphs exceed the shared build budget', url);
+          }
           for (const filename of graph.watchFiles) this.addWatchFile?.(filename);
           for (const file of graph.files) {
             let ref = filesByName.get(file.fileName);
@@ -501,13 +633,25 @@ export function moduleWorkerRollupPlugin(options = {}) {
           }
           for (const entry of graph.entries) {
             const ref = filesByName.get(entry.fileName);
-            emitted.set(realmKey(entry.url, entry.workerType), ref); references.set(ref, suffix(entry.url));
+            emitted.set(realmKey(entry.url, entry.workerType), ref);
+            if (site.base === 'realm') closedRealmEntries.add(realmKey(entry.url, entry.workerType));
+            references.set(ref, {suffix: suffix(entry.url), fileName: entry.fileName});
           }
           referenceId = emitted.get(key);
           totalBytes += graph.outputBytes; totalModules += graph.moduleCount; totalAssets += graph.assetCount;
         }
-        edits.push({start: site.argument.start, end: site.argument.end,
-          text: `import.meta.ROLLUP_FILE_URL_${referenceId}`});
+        let replacement = `import.meta.ROLLUP_FILE_URL_${referenceId}`;
+        if (site.base === 'realm') {
+          const target = references.get(referenceId);
+          // A direct Worker string uses document.baseURI, even when its call is
+          // in a nested module or a lazy chunk. Keep it a string so a shadowed
+          // URL constructor cannot change previously valid source behavior.
+          const documentDir = path.dirname(fileURLToPath(options.documentUrl));
+          const baseDir = fileURLToPath(new URL('.', sourceBase));
+          const relative = path.relative(baseDir, path.join(documentDir, target.fileName)).split(path.sep).join('/');
+          replacement = JSON.stringify((relative.startsWith('.') ? relative : './' + relative) + target.suffix);
+        }
+        edits.push({start: site.argument.start, end: site.argument.end, text: replacement});
       }
       if (!edits.length) return null;
       let output = code;
