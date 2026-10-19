@@ -709,9 +709,13 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       while (this._pending.length && !this._disposed) {
         const request = this._pending[0];
         if (request.readback || request.transfer) {
-          // Submit now; do not stall later draws on mapping or transfer fences.
-          // Target content is captured by the submitted operation, not its await.
-          try { request.resolve(request.issue()); } catch (error) { request.reject(error); }
+          // Image compute can await private source readiness before submitting.
+          // Ordinary transfers already submit synchronously; their mapping and
+          // GPU-completion fences must not stall later commands.
+          try {
+            const result = request.issue();
+            request.resolve(request.awaitSubmission ? await result : result);
+          } catch (error) { request.reject(error); }
           this._pending.shift(); continue;
         }
         const {destination, scene} = request;

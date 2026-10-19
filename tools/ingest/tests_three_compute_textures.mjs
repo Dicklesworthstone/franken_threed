@@ -111,6 +111,103 @@ test('CPU edits without an upload version do not change already captured inputs'
   assert.equal(r.owner.resolve(b).pixels[0], 1); assert.equal(uploads(r).length, 1);
   r.owner.release(b); r.owner.dispose();
 });
+test('an unused source alias cannot upload pixels through an unchanged texture', () => {
+  const r = rig(), texture = new Texture(), alias = new Texture(); alias.source = texture.source;
+  const first = r.owner.captureBinding(sampled(texture));
+  const initialView = r.owner.resolve(first); r.owner.release(first);
+  texture.image.data[0] = 99; alias.touch();
+  const unchanged = r.owner.captureBinding(sampled(texture));
+  assert.equal(texture.version, 1); assert.equal(texture.source.version, 2);
+  assert.equal(r.owner.resolve(unchanged), initialView);
+  assert.equal(initialView.pixels[0], 1); assert.equal(uploads(r).length, 1);
+  assert.deepEqual(r.owner.diagnostics, {textures: 1, versions: 1, snapshotBytes: 4});
+  r.owner.release(unchanged);
+  texture.touch(); const requested = r.owner.captureBinding(sampled(texture));
+  assert.equal(r.owner.resolve(requested).pixels[0], 99);
+  r.owner.release(requested); r.owner.dispose();
+});
+test('captured aliases propagate shared pixels before or after FIFO consumption without changing earlier uses', () => {
+  for (const consumeBeforeCapture of [false, true]) {
+    const r = rig(), texture = new Texture(), alias = new Texture(); alias.source = texture.source;
+    const callbacks = []; texture.onUpdate = () => callbacks.push('texture'); alias.onUpdate = () => callbacks.push('alias');
+    const first = r.owner.captureBinding(sampled(texture));
+    texture.image.data[0] = 9; alias.touch();
+    const queued = r.owner.captureDispatch(() => r.owner.captureBinding(sampled(alias)));
+    if (consumeBeforeCapture) { r.owner.resolve(first); r.owner.resolve(queued); }
+    const later = r.owner.captureBinding(sampled(texture)); texture.image.data[0] = 77;
+    assert.equal(r.owner.resolve(first).pixels[0], 1);
+    const aliasView = r.owner.resolve(queued), laterView = r.owner.resolve(later);
+    assert.equal(aliasView.pixels[0], 9); assert.equal(laterView.pixels[0], 9);
+    assert.equal(laterView.texture.source, aliasView.texture.source);
+    assert.equal(laterView.texture.version, 1); assert.equal(laterView.texture.source.version, 2);
+    assert.deepEqual(callbacks, ['texture', 'alias']);
+    [first, queued, later].forEach(use => r.owner.release(use));
+    assert.equal(r.owner.diagnostics.snapshotBytes, 4); r.owner.dispose();
+  }
+});
+test('an uncaptured third alias update does not hide the latest queued shared payload', () => {
+  const r = rig(), texture = new Texture(), alias = new Texture(), unused = new Texture();
+  alias.source = unused.source = texture.source;
+  const first = r.owner.captureBinding(sampled(texture));
+  texture.image.data[0] = 9; alias.touch(); const queued = r.owner.captureBinding(sampled(alias));
+  texture.image.data[0] = 77; unused.touch();
+  const later = r.owner.captureBinding(sampled(texture));
+  assert.equal(texture.source.version, 3); assert.equal(texture.version, 1);
+  assert.equal(r.owner.resolve(first).pixels[0], 1);
+  assert.equal(r.owner.resolve(queued).pixels[0], 9);
+  const view = r.owner.resolve(later);
+  assert.equal(view.pixels[0], 9); assert.equal(view.texture.source.version, 2);
+  assert.equal(r.owner.diagnostics.snapshotBytes, 8, 'the uncaptured version allocates no private pixels');
+  [first, queued, later].forEach(use => r.owner.release(use)); r.owner.dispose();
+});
+test('a captured alias in another sampler domain cannot refresh an unchanged residency', () => {
+  const r = rig(), texture = new Texture(), alias = new Texture();
+  alias.source = texture.source; alias.wrapS = 'clamp-to-edge';
+  const first = r.owner.captureBinding(sampled(texture));
+  const initialView = r.owner.resolve(first); r.owner.release(first);
+  texture.image.data[0] = 9; alias.touch(); const changed = r.owner.captureBinding(sampled(alias));
+  assert.equal(r.owner.resolve(changed).pixels[0], 9);
+  const unchanged = r.owner.captureBinding(sampled(texture));
+  assert.equal(r.owner.resolve(unchanged), initialView); assert.equal(initialView.pixels[0], 1);
+  r.owner.release(changed); r.owner.release(unchanged); r.owner.dispose();
+});
+test('rejected alias admission restores shared histories before an unchanged texture is recaptured', () => {
+  const r = rig(), texture = new Texture(), alias = new Texture(); alias.source = texture.source;
+  const first = r.owner.captureBinding(sampled(texture));
+  const initialView = r.owner.resolve(first); r.owner.release(first);
+  texture.image.data[0] = 9; alias.touch();
+  const failure = new Error('queue full');
+  assert.throws(() => r.owner.captureDispatch(() => {
+    const rejectedAlias = r.owner.captureBinding(sampled(alias));
+    const rejectedDependent = r.owner.captureBinding(sampled(texture));
+    r.owner.release(rejectedAlias); r.owner.release(rejectedDependent); throw failure;
+  }), error => error === failure);
+  assert.deepEqual(r.owner.diagnostics, {textures: 1, versions: 1, snapshotBytes: 4});
+  const unchanged = r.owner.captureBinding(sampled(texture));
+  assert.equal(r.owner.resolve(unchanged), initialView); assert.equal(uploads(r).length, 1);
+  r.owner.release(unchanged);
+  texture.image.data[0] = 12;
+  const retry = r.owner.captureDispatch(() => r.owner.captureBinding(sampled(alias)));
+  const later = r.owner.captureBinding(sampled(texture));
+  assert.equal(r.owner.resolve(retry).pixels[0], 12); assert.equal(r.owner.resolve(later).pixels[0], 12);
+  r.owner.release(retry); r.owner.release(later); r.owner.dispose();
+});
+test('an alias upload remains visible after its callback throws and admission rolls back', () => {
+  const r = rig(), texture = new Texture(), alias = new Texture(); alias.source = texture.source;
+  const first = r.owner.captureBinding(sampled(texture)); r.owner.resolve(first); r.owner.release(first);
+  texture.image.data[0] = 9; alias.touch();
+  const failure = new Error('upload callback'); let callbacks = 0;
+  alias.onUpdate = () => { callbacks++; throw failure; };
+  assert.throws(() => r.owner.captureDispatch(() => {
+    const uploaded = r.owner.captureBinding(sampled(alias));
+    try { r.owner.resolve(uploaded); } finally { r.owner.release(uploaded); }
+  }), error => error === failure);
+  texture.image.data[0] = 77;
+  const later = r.owner.captureBinding(sampled(texture));
+  assert.equal(r.owner.resolve(later).pixels[0], 9); assert.equal(callbacks, 1);
+  assert.equal(texture.version, 1); assert.equal(r.owner.diagnostics.snapshotBytes, 4);
+  r.owner.release(later); r.owner.dispose();
+});
 test('source replacement and sampler edits produce new immutable bindings', () => {
   const r = rig(), t = new Texture();
   const a = r.owner.captureBinding(sampler(t)); t.wrapS = 'clamp-to-edge';

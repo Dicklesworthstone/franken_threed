@@ -73,6 +73,7 @@ export function inspectThreeTexture(texture, three, limits={}) {
 }
 function textureInspector(T,{
   maxTextureBytes=128*1024*1024,maxPixels=16*1024*1024,maxDimension=32768,maxDimension3D=32768,maxLayers=2048,float32Filterable=false,features=new Set(),
+  imageSnapshots=null,
 }={}) {
   if(T?.REVISION!=='186'||typeof T.Texture!=='function')fail('SOURCE','Supply the pinned r186 module');
   integer(maxTextureBytes,1,Number.MAX_SAFE_INTEGER,'texture budget');
@@ -267,7 +268,10 @@ function textureInspector(T,{
     const filterable=!integral&&(bpc!==4||float32Filterable);
     if(!filterable&&(mag[0]==='linear'||filter[0]==='linear'||filter[1]==='linear'))
       fail('SAMPLER','Linear filtering of float32 textures needs the float32-filterable device feature');
+    const capturedImages=new WeakSet();
     const unwrap=image=>{
+      const captured=imageSnapshots?.get(image);
+      if(captured){image=captured;capturedImages.add(image);}
       if(!cube)return image;
       if(data){
         if(typeof T.DataTexture!=='function'||!(image instanceof T.DataTexture)||image.isDataTexture!==true)
@@ -276,7 +280,7 @@ function textureInspector(T,{
       }
       return image;
     };
-    const base=cube?t.image.map(unwrap):[t.image];
+    const base=cube?t.image.map(unwrap):[unwrap(t.image)];
     const {width,height}=dimensions(base[0],data,video,volume),full=1+Math.floor(Math.log2(Math.max(width,height,volume?layers:1)));
     if(cube&&width!==height)fail('SOURCE','Cube faces must be square');
     if(width*height*layers>maxPixels)fail('LIMIT','All texture faces/layers/voxels together exceed the pixel budget');
@@ -302,7 +306,7 @@ function textureInspector(T,{
         if(!Array.isArray(faces)||faces.length!==6)fail('MIPS','Each authored cube mip needs six faces');
         for(let layer=0;layer<6;layer++)uploads.push({image:unwrap(faces[layer]),level:mip+1,layer});
       }
-    }else for(const [level,image] of (manual?t.mipmaps:base).entries())uploads.push({image,level,layer:0});
+    }else for(const [level,image] of (manual?t.mipmaps:base).entries())uploads.push({image:unwrap(image),level,layer:0});
     let bytes=0;
     for(let level=0;level<levels;level++)bytes+=Math.max(1,width>>level)*Math.max(1,height>>level)*channels*bpc*(volume?Math.max(1,layers>>level):layers);
     if(bytes>maxTextureBytes)fail('LIMIT','Texture exceeds byte budget');
@@ -315,7 +319,9 @@ function textureInspector(T,{
         // r186 WebGLTextures skips UNPACK_FLIP_Y/PREMULTIPLY for ImageBitmaps (their
         // decode options already decided both) while WebGPUTextureUtils applies them.
         // Only the profile where both source renderers agree is admitted.
-        if(bitmap&&(t.flipY||t.premultiplyAlpha))
+        // A private bitmap captured from a mutable image/canvas retains that
+        // source's upload contract. It is not an application-authored ImageBitmap.
+        if(bitmap&&!capturedImages.has(image)&&(t.flipY||t.premultiplyAlpha))
           fail('SOURCE','ImageBitmap sources require flipY=false and premultiplyAlpha=false (orientation and alpha are decided at decode)');
         if(channels!==4)fail('FORMAT','External images require RGBA storage');
         if(instance(image,'ImageData')&&image.colorSpace&&image.colorSpace!=='srgb')fail('COLOR','ImageData requires the sRGB copy profile');
@@ -366,11 +372,12 @@ function textureInspector(T,{
 
 export function createGpuThreeTextures(device,{
   three:T,maxTextureBytes=128*1024*1024,maxTextures=256,maxPixels=16*1024*1024,label='f3d-three-textures',
+  imageSnapshots=null,
 }={}) {
   if(T?.REVISION!=='186'||typeof T.Texture!=='function')fail('SOURCE','Supply the pinned r186 module');
   integer(maxTextureBytes,1,Number.MAX_SAFE_INTEGER,'texture budget');integer(maxTextures,1,65536,'texture capacity');
   integer(maxPixels,1,Number.MAX_SAFE_INTEGER,'pixel capacity');if(typeof label!=='string')fail('VALUE','Expected a label');
-  const describe=textureInspector(T,{maxTextureBytes,maxPixels,features:device?.features??new Set(),float32Filterable:device?.features?.has?.('float32-filterable')===true,
+  const describe=textureInspector(T,{maxTextureBytes,maxPixels,imageSnapshots,features:device?.features??new Set(),float32Filterable:device?.features?.has?.('float32-filterable')===true,
     maxDimension:device?.limits?.maxTextureDimension2D??32768,maxDimension3D:device?.limits?.maxTextureDimension3D??1,maxLayers:device?.limits?.maxTextureArrayLayers??1});
   const records=new Map(),sources=new Map(),pipelines=new Map();
   let textureBytes=0,disposed=false,terminal=null,busy=false,pending=Promise.resolve(),mipSampler=null,rejectStop;

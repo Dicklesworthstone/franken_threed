@@ -88,7 +88,8 @@ export function createStorageTextureTransfers(renderer, {maxSnapshotBytes = 128 
     return device;
   }
   function schedule(issue) {
-    if (renderer._computeTurn || (!renderer._drain && !renderer._preparing)) return issue();
+    if (renderer._computeTurn) return renderer._computeTurn.submit(issue);
+    if (!renderer._drain && !renderer._preparing) return issue();
     return new Promise((resolve, reject) => renderer._enqueue({transfer: true, issue, resolve, reject}));
   }
   function track(result) {

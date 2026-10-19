@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {createWebGPURendererClass, createWebGLRendererClass} from './three_renderer.mjs';
 import {inspectGpuTargetWrite, gpuTargetWriteData, inspectGpuTargetCopy} from './gpu_target_transfer.mjs';
+import {textureDevice} from './fixtures/gpu_texture_device.mjs';
 
 function deferred() {
   let resolve, reject;
@@ -30,7 +31,7 @@ function target(format = 'rgba8unorm', width = 3, height = 2) {
   const [Type, components] = layout.get(format), bpp = Type.BYTES_PER_ELEMENT * components;
   return {format, width, height, sampleCount: 1, mipLevelCount: 1, bpp, bytes: new Uint8Array(width * height * bpp)};
 }
-function fixture({gl = false, ...limits} = {}) {
+function fixture({gl = false, three = T, device = null, ...limits} = {}) {
   const init = deferred(), calls = [], entries = new Map(), controls = {fence: null, prepare: null, writeError: null};
   let disposed = false;
   const stale = () => Object.assign(Error('stale generation'), {code: 'THREE_TARGET_STALE'});
@@ -80,7 +81,7 @@ function fixture({gl = false, ...limits} = {}) {
     async whenIdle() { await Promise.all([...entries.values()].flatMap(e => [e.validation, e.storage?.whenIdle()])); },
     dispose() { disposed = true; for (const t of entries.keys()) this.retire(t); },
   };
-  const Base = (gl ? createWebGLRendererClass : createWebGPURendererClass)(T, limits);
+  const Base = (gl ? createWebGLRendererClass : createWebGPURendererClass)(three, limits);
   class Harness extends Base {
     async _init() { await init.promise; if (this._disposed) throw Error('disposed during init'); this._initialized = true; return this; }
     async _prepare(destination) {
@@ -90,6 +91,7 @@ function fixture({gl = false, ...limits} = {}) {
     _submit(request) { calls.push({kind: 'draw'}); request.scene.onSubmit?.(); }
   }
   const renderer = new Harness({canvas: {width: 8, height: 8}});
+  if (device) renderer._device = device;
   renderer._targets.dispose(); renderer._targets = owner;
   return {renderer, init, owner, entries, calls, controls,
     async ready() { init.resolve(); await renderer.init(); },
@@ -101,6 +103,74 @@ const counts = (r, requests, bytes) => {
   assert.equal(r.info.f3d.pendingTransfers, requests);
   assert.equal(r.info.f3d.pendingTransferBytes, bytes);
 };
+
+// Use the actual renderer, compute owner, texture owner and GPU upload path.
+// Only shader construction and host image delivery are controlled here.
+async function computeFixture(t) {
+  const core = await import('../../upstream/three.js/build/three.core.js');
+  class Builder {
+    build() {
+      this.computeShader = `// ${this.compute.name}\n@compute @workgroup_size(1) fn main() {}`;
+      this.updateBeforeNodes = this.compute.before ?? []; this.updateNodes = [];
+      this.updateAfterNodes = this.compute.after ?? [];
+    }
+    getBindings() { return this.compute.groups; }
+  }
+  class NodeFrame {
+    updateNode(run) { run(); } updateBeforeNode(run) { run(); } updateAfterNode(run) { run(); }
+  }
+  class ImageBitmap {
+    constructor(value = 1) { this.width = this.height = 1; this.value = value; this.closeCalls = 0; }
+    close() { this.width = this.height = 0; this.closeCalls++; }
+  }
+  class HTMLImageElement {
+    constructor(value = 1) { this.width = this.height = this.naturalWidth = this.naturalHeight = 1; this.complete = true; this.value = value; }
+  }
+  const deliveries = [], bitmaps = [], saved = new Map(['ImageBitmap', 'HTMLImageElement', 'createImageBitmap', 'structuredClone']
+    .map(key => [key, Object.getOwnPropertyDescriptor(globalThis, key)]));
+  const clone = globalThis.structuredClone;
+  Object.assign(globalThis, {ImageBitmap, HTMLImageElement,
+    structuredClone: value => value instanceof ImageBitmap ? new ImageBitmap(value.value) : clone(value),
+    createImageBitmap(image) {
+      const bitmap = new ImageBitmap(image.value), gate = deferred();
+      bitmaps.push(bitmap);
+      deliveries.push(() => gate.resolve(bitmap)); return gate.promise;
+    }});
+  const device = textureDevice(), mapping = deferred(); device.features = new Set();
+  const f = fixture({three: {...core, WGSLNodeBuilder: Builder, NodeFrame}, device});
+  const allocate = device.createBuffer, encode = device.createCommandEncoder;
+  device.createBuffer = options => Object.assign(allocate(options), {mapAsync: () => mapping.promise});
+  device.createComputePipeline = descriptor => ({...descriptor, getBindGroupLayout: () => ({})});
+  device.createCommandEncoder = () => ({...encode(),
+    copyBufferToBuffer(source, from, destination, to, size) {
+      new Uint8Array(destination.data, to, size).set(new Uint8Array(source.data, from, size));
+      f.calls.push({kind: 'readback'});
+    },
+    beginComputePass() {
+      let pipeline; const groups = new Map();
+      return {setPipeline(value) { pipeline = value; }, setBindGroup(slot, group) { groups.set(slot, group); },
+        dispatchWorkgroups() {
+          const values = [...groups.values()].flatMap(group => group.entries.flatMap(({resource}) =>
+            resource.buffer ? [new Float32Array(resource.buffer.data)[0]] : []));
+          f.calls.push({kind: pipeline.label, values});
+        }, end() {}};
+    }});
+  t.after(() => {
+    f.renderer.dispose(); mapping.resolve(); deliveries.forEach(deliver => deliver());
+    for (const [key, descriptor] of saved) {
+      if (descriptor) Object.defineProperty(globalThis, key, descriptor); else delete globalThis[key];
+    }
+  });
+  const image = new HTMLImageElement(), texture = new core.Texture(image);
+  texture.generateMipmaps = false; texture.minFilter = core.NearestFilter; texture.needsUpdate = true;
+  const attribute = new core.BufferAttribute(new Float32Array([3]), 1); attribute.isStorageBufferAttribute = true;
+  const uniform = {isUniformBuffer: true, buffer: new Float32Array([5, 0, 0, 0])};
+  const sampled = {texture, isSampledTexture: true, isSampler: true};
+  const buffers = [uniform, {isStorageBuffer: true, attribute}];
+  const kernel = (name, bindings = []) => Object.assign(new core.EventDispatcher(),
+    {isComputeNode: true, name, version: 0, workgroupSize: [1], count: 1, groups: [{bindings}]});
+  return {...f, device, mapping, deliveries, bitmaps, image, texture, attribute, uniform, sampled, buffers, kernel, ImageBitmap};
+}
 
 for (const create of [createWebGPURendererClass, createWebGLRendererClass])
   test(`${create.name}: transfer limits are validated before construction`, () => {
@@ -128,6 +198,87 @@ test('public pre-init uploads, draw, copy and readback retain a single submissio
   assert.ok(b.bytes.every(n => n === 17));
   gate.resolve(); assert.ok((await read).every(n => n === 9));
   await Promise.all([upload, draw, copy, next]); counts(r, 0, 0); r.dispose();
+});
+
+test('image submission readiness blocks the real FIFO while later readback fences do not', async () => {
+  const f = fixture(), r = f.renderer, ready = deferred(), mapped = deferred();
+  await f.ready();
+  const image = new Promise((resolve, reject) => r._enqueue({transfer: true, awaitSubmission: true, resolve, reject,
+    issue: () => ready.promise.then(() => { f.calls.push({kind: 'image-compute'}); })}));
+  const read = new Promise((resolve, reject) => r._enqueue({readback: true, resolve, reject,
+    issue() { f.calls.push({kind: 'readback'}); return mapped.promise; }}));
+  const draw = r.renderAsync(new Scene(), new Camera());
+  await flush();
+  assert.deepEqual(f.calls, []); assert.ok(r._drain);
+  ready.resolve(); await f.drain(); await Promise.all([image, draw]);
+  assert.deepEqual(f.calls.map(call => call.kind), ['image-compute', 'readback', 'draw']);
+  let complete = false; read.then(() => { complete = true; });
+  await flush(); assert.equal(complete, false);
+  mapped.resolve(); await read; r.dispose();
+});
+
+test('failed image readiness rejects its FIFO entry before following submissions advance', async () => {
+  const f = fixture(), r = f.renderer, ready = deferred(), failure = new Error('image decode');
+  await f.ready();
+  const image = new Promise((resolve, reject) => r._enqueue({transfer: true, awaitSubmission: true, resolve, reject,
+    issue: () => ready.promise.then(() => { assert.fail('failed image cannot submit'); })}));
+  const rejected = assert.rejects(image, error => error === failure);
+  const following = new Promise((resolve, reject) => r._enqueue({transfer: true, resolve, reject,
+    issue() { f.calls.push({kind: 'following'}); }}));
+  await flush(); assert.equal(f.calls.length, 0);
+  ready.reject(failure); await rejected; await following; await f.drain();
+  assert.deepEqual(f.calls.map(call => call.kind), ['following']); r.dispose();
+});
+
+test('pre-init image kernels serialize nested/list submissions and preserve queued uniform and storage bytes', async t => {
+  const f = await computeFixture(t), r = f.renderer;
+  const initial = f.kernel('initial'), image = f.kernel('image', [f.sampled, ...f.buffers]);
+  const nested = f.kernel('nested', f.buffers), last = f.kernel('last', f.buffers);
+  const original = f.attribute.array; let read;
+  image.onInitFunction = () => r.compute(initial);
+  image.after = [() => {
+    read = r.getArrayBufferAsync(f.attribute);
+    f.uniform.buffer[0] = 9; f.attribute.array[0] = 7; f.attribute.needsUpdate = true;
+    r.compute(nested);
+  }];
+  const compute = r.compute([image, last]);
+  const following = new Promise((resolve, reject) => r._enqueue({transfer: true, resolve, reject,
+    issue() { f.calls.push({kind: 'following'}); }}));
+  await f.ready(); await flush();
+  assert.deepEqual(f.calls.map(call => call.kind), ['initial']); assert.equal(f.deliveries.length, 1);
+  f.uniform.buffer[0] = 77; f.attribute.array[0] = 88; f.attribute.needsUpdate = true; f.image.value = 99;
+  f.deliveries[0](); await Promise.all([compute, following]); await f.drain();
+  assert.deepEqual(f.calls.map(call => call.kind), ['initial', 'image', 'readback', 'nested', 'last', 'following']);
+  assert.deepEqual(f.calls.filter(call => call.values?.length).map(call => call.values), [[5, 3], [9, 7], [9, 7]]);
+  assert.equal(f.attribute.array, original); assert.equal(original[0], 88);
+  assert.equal(f.device.externalCopies[0].source.source.value, 1);
+  let mapped = false; read.then(() => { mapped = true; }); await flush(); assert.equal(mapped, false);
+  f.mapping.resolve(); assert.equal(new Float32Array(await read)[0], 3);
+});
+
+test('pending captured images privatize buffers even when the native upload images are authored bitmaps', async t => {
+  const f = await computeFixture(t), r = f.renderer;
+  f.texture.flipY = false; f.texture.mipmaps = [new f.ImageBitmap(4)];
+  await f.ready();
+  const original = f.attribute.array, compute = r.compute(f.kernel('authored', [f.sampled, ...f.buffers]));
+  f.uniform.buffer[0] = 77; original[0] = 88; f.attribute.needsUpdate = true;
+  await flush(); assert.deepEqual(f.calls, []); assert.equal(f.deliveries.length, 1);
+  f.deliveries[0](); await compute; await f.drain();
+  assert.deepEqual(f.calls, [{kind: 'authored', values: [5, 3]}]);
+  assert.equal(f.attribute.array, original); assert.equal(original[0], 88);
+  assert.equal(f.texture.image, f.image); assert.equal(f.texture.mipmaps[0].closeCalls, 0);
+});
+
+test('renderer disposal rejects unresolved image compute before delivery and closes late private pixels', async t => {
+  const f = await computeFixture(t), r = f.renderer; await f.ready();
+  const original = f.attribute.array, pending = r.compute(f.kernel('disposed', [f.sampled, ...f.buffers]));
+  const rejected = assert.rejects(pending, {code: 'F3D_RENDERER_DISPOSED'});
+  await flush(); assert.equal(f.deliveries.length, 1); assert.equal(f.calls.length, 0);
+  r.dispose(); await rejected;
+  assert.equal(f.calls.length, 0); assert.equal(f.device.externalCopies.length, 0);
+  f.deliveries[0](); await f.drain();
+  assert.equal(f.bitmaps[0].closeCalls, 1); assert.equal(f.calls.length, 0);
+  assert.equal(f.texture.image, f.image); assert.equal(f.image.width, 1); assert.equal(f.attribute.array, original);
 });
 
 for (const [format, [Type, components]] of layout) for (const gl of [false, true])

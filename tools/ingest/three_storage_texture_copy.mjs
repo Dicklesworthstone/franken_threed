@@ -35,11 +35,13 @@ export function withStorageTextureCopies(Base) {
           return super.copyTextureToTexture(source, destination, region, position, sourceLevel, destinationLevel);
         fail('SOURCE', 'Expected storage textures or a render-target color copied into storage');
       }
-      if (this._computeTurn || (!this._drain && !this._preparing)) issue();
-      else this._enqueue({transfer: true, issue, resolve() {}, reject: error => {
+      const rejected = error => {
         if (!failures.has(this)) failures.set(this, error);
         this._deferredError ??= error;
-      }});
+      };
+      if (this._computeTurn) this._computeTurn.submit(issue)?.catch(rejected);
+      else if (!this._drain && !this._preparing) issue();
+      else this._enqueue({transfer: true, issue, resolve() {}, reject: rejected});
       this.inspector?.copyTextureToTexture?.(source, destination);
     }
     /** F3D extension: upload exact raw pixel bytes without a seeding kernel.

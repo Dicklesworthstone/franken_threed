@@ -22,7 +22,8 @@ function check(name, actual, expected) {
 }
 try {
   renderer = new THREE.WebGPURenderer({canvas: document.querySelector('canvas')});
-  if (renderer.isF3DRenderer !== true) throw new Error('Build this fixture with --route-webgpu-renderer');
+  if (renderer.isF3DRenderer !== true && !new URL(location.href).searchParams.has('reference'))
+    throw new Error('Build this fixture with --route-webgpu-renderer (or request the explicit reference run)');
   await renderer.init();
 
   // A non-square extent and partial workgroup exercise integer coordinates and
@@ -75,6 +76,83 @@ try {
   await renderer.renderAsync(scene, camera);
   check('later compute writes and mipmaps are visible without copying',
     Array.from(await renderer.readRenderTargetPixelsAsync(target, 4, 4, 1, 1)), [0, 255, 0, 255]);
+
+  // Ordinary CanvasTexture uploads must remain call-time inputs even while a
+  // new render is preparing asynchronously. Both readbacks join that FIFO.
+  const canvas = document.createElement('canvas'); canvas.width = canvas.height = 2;
+  const context = canvas.getContext('2d', {alpha: true, colorSpace: 'srgb'});
+  const redGreenBlueWhite = [255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255];
+  const cyanYellowMagentaBlack = [0, 255, 255, 255, 255, 255, 0, 255, 255, 0, 255, 255, 0, 0, 0, 255];
+  context.putImageData(new ImageData(new Uint8ClampedArray(redGreenBlueWhite), 2, 2), 0, 0);
+  const encoded = canvas.toDataURL();
+  const sampled = own(new THREE.CanvasTexture(canvas));
+  sampled.minFilter = sampled.magFilter = THREE.NearestFilter; sampled.generateMipmaps = false;
+  const sampledOutput = new THREE.StorageBufferAttribute(new Float32Array(16), 4);
+  const sampledValues = storage(sampledOutput, 'vec4', 4);
+  const sampleGain = uniform(1);
+  const bias = new THREE.StorageBufferAttribute(new Float32Array(4), 1);
+  const biasValues = storage(bias, 'float', 4);
+  const sampleCanvas = own(Fn(() => {
+    sampledValues.element(instanceIndex).assign(textureLoad(sampled, uvec2(instanceIndex.mod(2), instanceIndex.div(2)))
+      .mul(sampleGain).add(vec4(biasValues.element(instanceIndex))));
+  })().compute(4, [4]));
+  const laterScene = new THREE.Scene();
+  laterScene.add(new THREE.Mesh(geometry, own(new THREE.MeshBasicMaterial({color: 0x224466}))));
+  renderer.render(laterScene, camera);
+  renderer.compute(sampleCanvas); const firstCanvasRead = renderer.getArrayBufferAsync(sampledOutput);
+  context.putImageData(new ImageData(new Uint8ClampedArray(cyanYellowMagentaBlack), 2, 2), 0, 0);
+  sampled.needsUpdate = true;
+  renderer.compute(sampleCanvas); const secondCanvasRead = renderer.getArrayBufferAsync(sampledOutput);
+  canvas.width = canvas.height = 1; // neither earlier call may sample the cleared resized canvas
+  const flipped = pixels => [...pixels.slice(8), ...pixels.slice(0, 8)].map(value => value / 255);
+  check('queued CanvasTexture keeps the first call pixels and flipY',
+    Array.from(new Float32Array(await firstCanvasRead)), flipped(redGreenBlueWhite));
+  check('queued CanvasTexture keeps the later upload version across resize',
+    Array.from(new Float32Array(await secondCanvasRead)), flipped(cyanYellowMagentaBlack));
+  check('compute capture leaves the caller canvas resize intact', [canvas.width, canvas.height], [1, 1]);
+
+  // TextureLoader's ready HTMLImageElement source uses the same capture path.
+  const decoded = new Image(); decoded.src = encoded; await decoded.decode();
+  decoded.width = decoded.height = 16; // CSS/display extent is not the texture extent
+  sampled.image = decoded; sampled.needsUpdate = true;
+  renderer.compute(sampleCanvas); const imageRead = renderer.getArrayBufferAsync(sampledOutput);
+  decoded.removeAttribute('src'); sampleGain.value = 0;
+  check('HTML image compute input retains intrinsic pixels after source replacement',
+    Array.from(new Float32Array(await imageRead)), flipped(redGreenBlueWhite));
+
+  // A raw RGBA PNG, rather than a canvas-encoded image, retains hidden RGB at
+  // alpha zero and unpremultiplied values at alpha 1/255. Canvas rasterization
+  // destroys these values even when the intermediate canvas uses float16.
+  const translucentPixels = [179, 64, 38, 0, 179, 64, 38, 1, 179, 64, 38, 16, 50, 120, 200, 128];
+  const translucentPng = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAFklEQVR4nGPY7KDGAMSMIELAqOJEAwAsvgVPkvA65gAAAABJRU5ErkJggg==';
+  decoded.src = translucentPng; await decoded.decode();
+  sampled.needsUpdate = true; sampleGain.value = .5;
+  bias.array.fill(.125); bias.needsUpdate = true;
+  renderer.compute(sampleCanvas); const translucentRead = renderer.getArrayBufferAsync(sampledOutput);
+  decoded.removeAttribute('src'); sampleGain.value = 0; bias.array.fill(.75);
+  check('delayed HTML pixels preserve hidden RGB and call-time uniforms and buffers',
+    Array.from(new Float32Array(await translucentRead)), flipped(translucentPixels).map(value => value * .5 + .125));
+
+  decoded.src = translucentPng; await decoded.decode();
+  sampled.flipY = false; sampled.premultiplyAlpha = true; sampled.needsUpdate = true;
+  sampleGain.value = 1; bias.array.fill(0); bias.needsUpdate = true;
+  renderer.compute(sampleCanvas); const premultipliedRead = renderer.getArrayBufferAsync(sampledOutput);
+  decoded.removeAttribute('src');
+  const premultiplied = translucentPixels.map((value, i) => (i % 4 === 3 ? value
+    : Math.round(value * translucentPixels[i - i % 4 + 3] / 255)) / 255);
+  check('private HTML image bitmaps retain the original premultiplyAlpha and orientation flags',
+    Array.from(new Float32Array(await premultipliedRead)), premultiplied);
+
+  const wideCanvas = document.createElement('canvas'); wideCanvas.width = wideCanvas.height = 2;
+  const wideContext = wideCanvas.getContext('2d', {colorSpace: 'display-p3'});
+  if (wideContext.getContextAttributes().colorSpace !== 'display-p3') throw new Error('This fixture requires Display-P3 canvas support');
+  wideContext.fillStyle = `color(display-p3 0.7 0.25 0.15 / ${16 / 255})`; wideContext.fillRect(0, 0, 2, 2);
+  sampled.image = wideCanvas; sampled.premultiplyAlpha = false; sampled.needsUpdate = true;
+  renderer.compute(sampleCanvas); const wideRead = renderer.getArrayBufferAsync(sampledOutput);
+  wideCanvas.width = 1;
+  check('translucent Display-P3 canvas input keeps the native sRGB upload values',
+    Array.from(new Float32Array(await wideRead)), Array(4).fill([190, 52, 11, 16]).flat().map(value => value / 255));
+
   await renderer.waitForGPU();
   state.status = 'pass';
 } catch (error) {

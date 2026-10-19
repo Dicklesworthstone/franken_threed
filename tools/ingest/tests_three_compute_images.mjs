@@ -1,6 +1,6 @@
 /** Decoded-image snapshot/lifetime tests, with platform and GPU-pool doubles.
  * Browser internal slots and native external-copy pixels are tested separately.
- * Run: node --test tools/ingest/tests_three_compute_images.mjs
+ * Run: node tools/ingest/tests_three_compute_images.mjs
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -27,9 +27,9 @@ const sampled = texture => ({texture, isSampledTexture: true, isSampler: true});
 const sampler = texture => ({texture, isSampler: true});
 const errorCode = code => ({code: `THREE_COMPUTE_TEXTURE_${code}`});
 function platform(t) {
-  const keys = ['ImageData', 'ImageBitmap', 'HTMLCanvasElement', 'structuredClone'];
+  const keys = ['ImageData', 'ImageBitmap', 'HTMLCanvasElement', 'OffscreenCanvas', 'HTMLImageElement', 'document', 'structuredClone', 'createImageBitmap'];
   const saved = new Map(keys.map(key => [key, Object.getOwnPropertyDescriptor(globalThis, key)]));
-  const clones = [];
+  const clones = [], bitmapCaptures = [];
   class ImageData {
     constructor(data = [1, 2, 3, 255], width = 1, height = 1) {
       this.data = new Uint8ClampedArray(data); this.width = width; this.height = height; this.colorSpace = 'srgb';
@@ -41,8 +41,33 @@ function platform(t) {
     }
     close() { this.closeCalls++; this.width = 0; this.height = 0; this.pixels = null; }
   }
-  class HTMLCanvasElement { constructor() { this.width = 1; this.height = 1; } }
-  Object.assign(globalThis, {ImageData, ImageBitmap, HTMLCanvasElement, structuredClone(image, options) {
+  class HTMLCanvasElement {
+    constructor(data = [1, 2, 3, 255], width = 1, height = 1) {
+      this.width = width; this.height = height; this.pixels = [...data]; this.originClean = true;
+    }
+    getContext() { assert.fail('Capture must not request a canvas context or rasterize caller pixels'); }
+  }
+  class OffscreenCanvas extends HTMLCanvasElement {
+    constructor(width, height) { super(Array(width * height * 4).fill(0), width, height); }
+  }
+  class HTMLImageElement {
+    constructor(data = [1, 2, 3, 255], width = 1, height = 1) {
+      this.width = this.naturalWidth = width; this.height = this.naturalHeight = height;
+      this.pixels = [...data]; this.complete = true; this.originClean = true;
+    }
+  }
+  Object.assign(globalThis, {ImageData, ImageBitmap, HTMLCanvasElement, OffscreenCanvas, HTMLImageElement,
+    document: {createElement() { assert.fail('Capture must not create an intermediate DOM canvas'); }},
+    createImageBitmap(image, options) {
+      assert.deepEqual(options, {premultiplyAlpha: image instanceof HTMLImageElement ? 'none' : 'default', colorSpaceConversion: 'default'});
+      if (image.captureError) throw image.captureError;
+      if (!image.originClean) return Promise.reject(new DOMException('tainted image capture', 'SecurityError'));
+      // Pixel capture precedes promise delivery, as the platform API requires.
+      const copy = new ImageBitmap(image.pixels, image.naturalWidth ?? image.width, image.naturalHeight ?? image.height);
+      copy.originClean = image.originClean; bitmapCaptures.push(copy);
+      return Promise.resolve(copy);
+    },
+    structuredClone(image, options) {
     assert.equal(options, undefined, 'snapshot must not transfer the application image');
     if (image instanceof ImageBitmap && !image.originClean) throw new DOMException('tainted', 'DataCloneError');
     const copy = image instanceof ImageBitmap
@@ -55,14 +80,14 @@ function platform(t) {
       if (descriptor) Object.defineProperty(globalThis, key, descriptor); else delete globalThis[key];
     }
   });
-  return {ImageData, ImageBitmap, HTMLCanvasElement, clones};
+  return {ImageData, ImageBitmap, HTMLCanvasElement, OffscreenCanvas, HTMLImageElement, clones, bitmapCaptures};
 }
 function rig(t, options = {}) {
   const host = platform(t), resident = new Map(), resources = new Map(), uploads = [];
-  let busy = false;
-  const imagesOf = texture => texture.isCubeTexture
+  let busy = false, imageSnapshots;
+  const imagesOf = texture => (texture.isCubeTexture
     ? [...texture.image, ...texture.mipmaps.flatMap(mip => mip.image)]
-    : texture.mipmaps.length ? texture.mipmaps : [texture.image];
+    : texture.mipmaps.length ? texture.mipmaps : [texture.image]).map(image => imageSnapshots?.get(image) ?? image);
   const pool = {
     inspect(texture) {
       assert.ok(texture instanceof Texture);
@@ -81,7 +106,10 @@ function rig(t, options = {}) {
           let resource = resources.get(texture.source);
           if (!resource) {
             const images = imagesOf(texture);
-            for (const image of images) assert.ok(image instanceof host.ImageData || image instanceof host.ImageBitmap);
+            for (const image of images) {
+              assert.ok(image instanceof host.ImageData || image instanceof host.ImageBitmap);
+              if (image.originClean === false) throw new DOMException('tainted external image', 'SecurityError');
+            }
             resource = {view: {texture, images, pixels: images.map(image => [...image.data ?? image.pixels])},
               sampler: {wrapS: texture.wrapS}};
             resources.set(texture.source, resource); resident.set(texture, resource); uploads.push(resource.view);
@@ -100,7 +128,7 @@ function rig(t, options = {}) {
     dispose() { assert.equal(busy, false); resident.clear(); resources.clear(); },
   };
   const storage = {validateDispatch(uses) { assert.equal(uses.length, 0); }, async whenIdle() {}};
-  const owner = createThreeComputeTextures({storage, poolFactory: () => pool, ...options});
+  const owner = createThreeComputeTextures({storage, poolFactory: state => {imageSnapshots = state.imageSnapshots; return pool;}, ...options});
   t.after(() => owner.dispose());
   return {...host, owner, uploads, resident, pool};
 }
@@ -248,10 +276,9 @@ test('a source-listener failure does not leak newly cloned bitmaps', t => {
   assert.throws(() => r.owner.captureBinding(sampled(texture)), error => error === failure);
   assert.equal(r.clones[0].closeCalls, 1); assert.equal(image.closeCalls, 0); assert.equal(r.owner.diagnostics.snapshotBytes, 0);
 });
-test('decoded source writes and unsnapshotted canvas inputs fail before any copy', t => {
+test('decoded source writes fail before any copy', t => {
   const r = rig(t), texture = new Texture(new r.ImageData());
   assert.throws(() => r.owner.captureBinding({...sampled(texture), store: true}), errorCode('ACCESS'));
-  assert.throws(() => r.owner.captureBinding(sampled(new Texture(new r.HTMLCanvasElement()))), errorCode('SOURCE'));
   assert.equal(r.clones.length, 0); assert.equal(r.uploads.length, 0);
 });
 test('hosts lacking structuredClone fail explicitly without borrowing the caller image', t => {
@@ -264,4 +291,159 @@ test('a host that returns the caller bitmap is rejected without closing it', t =
   const r = rig(t), image = new r.ImageBitmap(), texture = new Texture(image); globalThis.structuredClone = value => value;
   assert.throws(() => r.owner.captureBinding(sampled(texture)), errorCode('SOURCE'));
   assert.equal(image.closeCalls, 0); assert.equal(r.owner.diagnostics.snapshotBytes, 0);
+});
+
+test('canvas versions keep call-time pixels across redraws and resize without touching source state', async t => {
+  const r = rig(t), image = new r.HTMLCanvasElement(), texture = new Texture(image, {flipY: true, premultiplyAlpha: true});
+  const source = texture.source, before = ids;
+  r.owner.layoutOf(sampled(texture)); assert.equal(r.bitmapCaptures.length, 0);
+  const a = r.owner.captureBinding(sampled(texture)); image.pixels[0] = 37;
+  texture.touch(); const b = r.owner.captureBinding(sampled(texture));
+  image.pixels.fill(99); image.width = 8; image.height = 4;
+  assert.throws(() => r.owner.resolve(a), errorCode('NOT_READY'));
+  await r.owner.preparation([a, b]);
+  assert.deepEqual(r.owner.resolve(a).pixels, [[1, 2, 3, 255]]);
+  assert.deepEqual(r.owner.resolve(b).pixels, [[37, 2, 3, 255]]);
+  assert.equal(r.owner.resolve(a).texture.flipY, true); assert.equal(r.owner.resolve(a).texture.premultiplyAlpha, true);
+  assert.equal(texture.image, image); assert.equal(texture.source, source); assert.equal(ids, before);
+  assert.equal(r.owner.diagnostics.snapshotBytes, 8);
+  r.owner.release(a); assert.equal(r.bitmapCaptures[0].closeCalls, 1);
+  r.owner.release(b); texture.dispose(); assert.equal(r.bitmapCaptures[1].closeCalls, 1);
+  assert.deepEqual([image.width, image.height], [8, 4]);
+});
+test('unversioned canvas redraws retain the prior upload and sampler aliases share one capture', async t => {
+  const r = rig(t), image = new r.OffscreenCanvas(1, 1), texture = new Texture(image);
+  image.pixels = [9, 8, 7, 255]; const alias = new Texture(image); alias.source = texture.source;
+  const a = r.owner.captureBinding(sampled(texture)), b = r.owner.captureBinding(sampler(alias));
+  await r.owner.preparation([a, b]);
+  r.owner.resolve(a); r.owner.resolve(b); r.owner.release(a); r.owner.release(b);
+  image.pixels[0] = 77; const c = r.owner.captureBinding(sampled(texture));
+  assert.deepEqual(r.owner.resolve(c).pixels, [[9, 8, 7, 255]]);
+  assert.equal(r.bitmapCaptures.length, 1); assert.equal(r.uploads.length, 1); assert.equal(r.owner.diagnostics.snapshotBytes, 4);
+  r.owner.release(c); texture.dispose(); assert.equal(r.bitmapCaptures[0].closeCalls, 0);
+  alias.dispose(); assert.equal(r.bitmapCaptures[0].closeCalls, 1); assert.equal(image.width, 1);
+});
+test('HTML image capture uses intrinsic pixels and survives changing the source image', async t => {
+  const r = rig(t), image = new r.HTMLImageElement([7, 8, 9, 255]), texture = new Texture(image);
+  const a = r.owner.captureBinding(sampled(texture));
+  assert.throws(() => r.owner.resolve(a), errorCode('NOT_READY'));
+  image.pixels = [99, 99, 99, 255]; image.naturalWidth = 2; image.width = 20;
+  await r.owner.preparation([a]);
+  assert.deepEqual(r.owner.resolve(a).pixels, [[7, 8, 9, 255]]);
+  assert.equal(r.bitmapCaptures[0].width, 1); assert.equal(r.clones.length, 0);
+  assert.equal(image.width, 20); r.owner.release(a); texture.dispose();
+  assert.equal(r.bitmapCaptures[0].closeCalls, 1);
+});
+test('mutable cube faces and authored mips are captured once per image identity', async t => {
+  const r = rig(t), base = new r.HTMLCanvasElement(Array(16).fill(7), 2, 2), tail = new r.HTMLImageElement();
+  const texture = new Texture(Array(6).fill(base), {isCubeTexture: true}); texture.mipmaps = [{image: Array(6).fill(tail)}];
+  const a = r.owner.captureBinding(sampled(texture)); base.pixels.fill(99); tail.pixels.fill(88);
+  assert.equal(r.bitmapCaptures.length, 2); assert.equal(r.owner.diagnostics.snapshotBytes, 20);
+  await r.owner.preparation([a]);
+  assert.deepEqual(r.owner.resolve(a).pixels.map(pixel => pixel[0]), [...Array(6).fill(7), ...Array(6).fill(1)]);
+  r.owner.release(a); r.owner.dispose(); assert.deepEqual(r.bitmapCaptures.map(bitmap => bitmap.closeCalls), [1, 1]);
+  assert.equal(base.width, 2); assert.equal(tail.width, 1);
+});
+test('HTML canvas capture works without OffscreenCanvas, a document, or structured cloning', async t => {
+  const r = rig(t), image = new r.HTMLCanvasElement(), texture = new Texture(image);
+  globalThis.OffscreenCanvas = undefined; globalThis.structuredClone = undefined; globalThis.document = undefined;
+  const a = r.owner.captureBinding(sampled(texture));
+  await r.owner.preparation([a]);
+  assert.deepEqual(r.owner.resolve(a).pixels, [[1, 2, 3, 255]]);
+  assert.notEqual(r.owner.resolve(a).images[0], image); r.owner.release(a);
+});
+test('synchronous mutable-image capture failure preserves the existing upload and byte charge', async t => {
+  const r = rig(t), image = new r.HTMLCanvasElement(), texture = new Texture(image);
+  const a = r.owner.captureBinding(sampled(texture)); await r.owner.preparation([a]);
+  r.owner.resolve(a); r.owner.release(a);
+  const failure = new Error('image decode changed'); image.captureError = failure; texture.touch();
+  assert.throws(() => r.owner.captureBinding(sampled(texture)), error => error === failure);
+  assert.equal(r.bitmapCaptures.length, 1); assert.equal(r.bitmapCaptures[0].closeCalls, 0);
+  assert.equal(r.owner.diagnostics.snapshotBytes, 4); assert.equal(r.uploads.length, 1); assert.equal(image.width, 1);
+});
+test('tainted canvas capture rejects before uploading or exposing protected pixels', async t => {
+  const r = rig(t), image = new r.HTMLCanvasElement(), texture = new Texture(image); image.originClean = false;
+  const a = r.owner.captureBinding(sampled(texture));
+  await assert.rejects(r.owner.preparation([a]), {name: 'SecurityError'});
+  assert.throws(() => r.owner.resolve(a), {name: 'SecurityError'});
+  assert.equal(r.bitmapCaptures.length, 0); assert.equal(r.uploads.length, 0);
+  r.owner.release(a); texture.dispose(); assert.equal(r.owner.diagnostics.snapshotBytes, 0); assert.equal(image.width, 1);
+});
+test('canvas snapshots obey peak byte budgets and roll back a rejected queued version', async t => {
+  const r = rig(t, {maxSnapshotBytes: 8}), image = new r.HTMLCanvasElement(), texture = new Texture(image);
+  const a = r.owner.captureBinding(sampled(texture)); texture.touch();
+  let rejectedReady;
+  assert.throws(() => r.owner.captureDispatch(() => {
+    const b = r.owner.captureBinding(sampled(texture)); rejectedReady = r.owner.preparation([b]);
+    r.owner.release(b); throw new Error('queue full');
+  }), /queue full/);
+  await rejectedReady;
+  assert.deepEqual(r.bitmapCaptures.map(bitmap => bitmap.closeCalls), [0, 1]); assert.equal(r.owner.diagnostics.snapshotBytes, 4);
+  const b = r.owner.captureBinding(sampled(texture)); texture.touch();
+  assert.throws(() => r.owner.captureBinding(sampled(texture)), errorCode('BUDGET'));
+  assert.equal(r.bitmapCaptures.length, 3); await r.owner.preparation([a, b]);
+  r.owner.release(a); r.owner.release(b); texture.dispose();
+  assert.ok(r.bitmapCaptures.every(bitmap => bitmap.closeCalls === 1)); assert.equal(image.width, 1);
+});
+
+test('HTML image promises capture before readiness and each version retains its own pixels', async t => {
+  const r = rig(t), image = new r.HTMLImageElement([179, 64, 38, 0]), texture = new Texture(image, {flipY: true, premultiplyAlpha: true});
+  const deliveries = [], capture = globalThis.createImageBitmap;
+  globalThis.createImageBitmap = (source, options) => {
+    const immutable = capture(source, options);
+    return new Promise(resolve => deliveries.push(() => resolve(immutable)));
+  };
+  const a = r.owner.captureBinding(sampled(texture));
+  image.pixels = [90, 30, 20, 1]; texture.touch();
+  const b = r.owner.captureBinding(sampled(texture)); image.pixels.fill(0);
+  deliveries[1](); await r.owner.preparation([b]);
+  assert.deepEqual(r.owner.resolve(b).pixels, [[90, 30, 20, 1]]);
+  assert.throws(() => r.owner.resolve(a), errorCode('NOT_READY'));
+  deliveries[0](); await r.owner.preparation([a]);
+  const first = r.owner.resolve(a);
+  assert.deepEqual(first.pixels, [[179, 64, 38, 0]]);
+  assert.equal(first.texture.flipY, true); assert.equal(first.texture.premultiplyAlpha, true);
+  assert.equal(r.clones.length, 0); r.owner.release(a); r.owner.release(b);
+});
+
+test('rejected mutable-image admission and disposal close late bitmap deliveries exactly once', async t => {
+  const r = rig(t), images = [new r.HTMLImageElement(), new r.HTMLCanvasElement(), new r.OffscreenCanvas(1, 1)];
+  const deliveries = [], capture = globalThis.createImageBitmap;
+  globalThis.createImageBitmap = (source, options) => {
+    const immutable = capture(source, options);
+    return new Promise(resolve => deliveries.push(() => resolve(immutable)));
+  };
+  const prepared = [];
+  for (const image of images) {
+    const texture = new Texture(image), before = r.owner.diagnostics.snapshotBytes;
+    assert.throws(() => r.owner.captureDispatch(() => {
+      const a = r.owner.captureBinding(sampled(texture)); r.owner.release(a); throw new Error('queue full');
+    }), /queue full/);
+    assert.equal(r.owner.diagnostics.snapshotBytes, before);
+    const b = r.owner.captureBinding(sampled(texture)); prepared.push(r.owner.preparation([b]));
+  }
+  r.owner.dispose(); deliveries.forEach(deliver => deliver()); await Promise.all(prepared);
+  assert.deepEqual(r.bitmapCaptures.map(bitmap => bitmap.closeCalls), [1, 1, 1, 1, 1, 1]);
+  assert.equal(r.owner.diagnostics.snapshotBytes, 0); assert.ok(images.every(image => image.width === 1));
+});
+
+test('bitmap capture failures propagate without uploading or losing another texture version', async t => {
+  const r = rig(t), existing = new Texture(new r.ImageData()), a = r.owner.captureBinding(sampled(existing));
+  const failure = new DOMException('protected source', 'SecurityError');
+  globalThis.createImageBitmap = () => Promise.reject(failure);
+  const texture = new Texture(new r.HTMLImageElement()), b = r.owner.captureBinding(sampled(texture));
+  await assert.rejects(r.owner.preparation([b]), error => error === failure);
+  assert.throws(() => r.owner.resolve(b), error => error === failure);
+  assert.deepEqual(r.owner.resolve(a).pixels, [[1, 2, 3, 255]]);
+  assert.equal(r.uploads.length, 1); r.owner.release(a); r.owner.release(b);
+});
+
+test('mutable images require bitmap capture support without borrowing or rasterizing caller pixels', t => {
+  const r = rig(t), images = [new r.HTMLImageElement(), new r.HTMLCanvasElement(), new r.OffscreenCanvas(1, 1)];
+  globalThis.createImageBitmap = undefined;
+  for (const image of images) {
+    assert.throws(() => r.owner.captureBinding(sampled(new Texture(image))), errorCode('SOURCE'));
+    assert.equal(image.width, 1);
+  }
+  assert.equal(r.owner.diagnostics.snapshotBytes, 0); assert.equal(r.bitmapCaptures.length, 0); assert.equal(r.uploads.length, 0);
 });

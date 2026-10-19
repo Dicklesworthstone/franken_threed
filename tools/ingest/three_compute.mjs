@@ -8,7 +8,8 @@
  * CPU data textures also provide read-only, call-time-versioned sampled inputs.
  * Native color and depth RenderTarget inputs borrow their attachments through
  * the FIFO submission, including both aspects of one target. No UV replica,
- * readback or CPU upload is introduced. Decoded image inputs remain unsupported. */
+ * readback or CPU upload is introduced. Sampled image/canvas inputs retain
+ * private call-time pixels through the same source texture owner. */
 import {createGpuCompute} from './gpu_compute.mjs';
 import {copyComputeBufferToTarget} from './gpu_compute_texture_copy.mjs';
 import {createThreeStorageTextures, inspectThreeStorageTexture} from './three_storage_textures.mjs';
@@ -36,7 +37,7 @@ function createThreeCompute(renderer, three) {
     fail('SOURCE', 'Supply the pinned r186 three/webgpu namespace for TSL compute');
   const device = renderer._device, frame = renderer._nodes.nodeFrame;
   const textureOwner = createThreeComputeTextures({storage: renderer._storageTextures,
-    poolFactory: () => createGpuThreeTextures(device, {three}),
+    poolFactory: ({imageSnapshots}) => createGpuThreeTextures(device, {three, imageSnapshots}),
     targetFactory: () => createThreeComputeTargets({targets: renderer._targets, device, signal: renderer._targetLifetime.signal})});
   const gpu = createGpuCompute(device, {signal: renderer._targetLifetime.signal});
   const programs = new Map(), initialized = new Set(), listeners = new Map(), building = new Set();
@@ -91,6 +92,15 @@ function createThreeCompute(renderer, three) {
     snapshotBytes += charged; payloads.add(record);
     if (!uniform) captured.set(key, record);
     return record;
+  }
+  function deferUpload(record) {
+    if (!record.data || record.charged) return;
+    const charged = record.data.byteLength;
+    if (charged > maxSnapshotBytes - snapshotBytes) fail('BUDGET', 'Queued compute uploads exceed the snapshot byte budget');
+    const data = new record.data.constructor(record.data);
+    const admission = record.uniform ? null : gpu.captureUpload(record.key, data, record.version);
+    record.data = data; record.admission = admission; record.charged = charged;
+    snapshotBytes += charged;
   }
   function upload(record) {
     const {key, version, uniform, source, ranges} = record;
@@ -246,7 +256,12 @@ function createThreeCompute(renderer, three) {
       }
       if (direct && direct.some(n => !Number.isSafeInteger(n) || n < 0 || n > (device.limits?.maxComputeWorkgroupsPerDimension ?? 65535)))
         fail('DISPATCH', 'Workgroup counts must fit the device limits');
-      return {release, shader, validate: () => textureOwner.validateDispatch(textureUses), issue(dispatch = true) {
+      const preparation = textureOwner.preparation(textureUses);
+      // Decide from the captured payloads: an unchanged alias can retain a
+      // pending HTML snapshot after its live source becomes a canvas. Every
+      // upload in this call must survive the image-readiness boundary too.
+      if (preparation && !deferred) for (const record of held) deferUpload(record);
+      const issue = (dispatch = true) => {
         live();
         if (listeners.get(node) !== epoch) fail('STALE', 'Compute node was disposed before its queued use');
         if (issuing) fail('REENTRY', 'Cannot submit compute from an upload callback');
@@ -262,7 +277,10 @@ function createThreeCompute(renderer, three) {
             textureOwner.written(textureUses);
           }
         }); } finally { issuing = false; }
-      }};
+      };
+      return {release, shader, asynchronous: preparation !== null,
+        validate: () => textureOwner.validateDispatch(textureUses),
+        issue(dispatch = true) { return preparation ? preparation.then(() => issue(dispatch)) : issue(dispatch); }};
     } catch (error) { release(); throw error; }
   }
   function compute(list, override, schedule, deferred) {
@@ -279,7 +297,7 @@ function createThreeCompute(renderer, three) {
           textureOwner.captureDispatch(() => {
             const request = capture(node, entry, override, deferred());
             let result;
-            try { result = schedule(() => request.issue()); }
+            try { result = schedule(() => request.issue(), request.asynchronous); }
             catch (error) { request.release(); throw error; }
             if (result?.then) {
               const done = Promise.resolve(result).finally(request.release);
@@ -301,13 +319,10 @@ function createThreeCompute(renderer, three) {
       const node = list[i], entry = program(node);
       const request = withFrame(node, () => {
         update(entry, 'before'); update(entry, 'current');
-        return textureOwner.captureDispatch(() => {
-          const request = capture(node, entry, null, false);
-          try { request.issue(false); return request; }
-          catch (error) { request.release(); throw error; }
-        });
+        return textureOwner.captureDispatch(() => capture(node, entry, null, false));
       });
       try {
+        await request.issue(false);
         await gpu.prepare(request.shader);
         live(); request.validate();
         if (programs.get(node) !== entry) fail('STALE', 'Compute node changed during asynchronous compilation');
@@ -371,14 +386,36 @@ export function withThreeCompute(Base, THREE) {
     if (!renderer.isWebGPURenderer) fail('ROUTE', 'TSL compute requires the WebGPU renderer surface');
     if (renderer._deferredError) { const error = renderer._deferredError; renderer._deferredError = null; throw error; }
   }
-  function submit(renderer, issue) {
+  function createTurn() {
+    return {pending: null, submit(issue, awaitSubmission = false) {
+      if (!this.pending) {
+        const result = issue();
+        if (awaitSubmission && result?.then) {
+          this.pending = Promise.resolve(result); this.pending.catch(() => {});
+        }
+        return result;
+      }
+      let resolve, reject;
+      const result = new Promise((a, b) => { resolve = a; reject = b; });
+      // Completion can include a readback map or GPU fence. Only readiness
+      // before submission belongs to the turn's ordering chain.
+      this.pending = this.pending.then(() => {
+        const value = issue(); resolve(value);
+        return awaitSubmission ? value : undefined;
+      });
+      this.pending.catch(reject);
+      return result;
+    }};
+  }
+  function submit(renderer, issue, awaitSubmission = false) {
     check(renderer);
-    if (renderer._computeTurn || (renderer._initialized && !renderer._drain && !renderer._preparing)) return issue();
+    if (renderer._computeTurn) return renderer._computeTurn.submit(issue, awaitSubmission);
+    if (!awaitSubmission && renderer._initialized && !renderer._drain && !renderer._preparing) return issue();
     let resolve, reject;
     const pending = new Promise((a, b) => { resolve = a; reject = b; });
     // Reserve outside the Promise executor: a full FIFO is a synchronous
     // capture failure, not an accepted texture version with a rejected promise.
-    renderer._enqueue({transfer: true, issue, resolve, reject});
+    renderer._enqueue({transfer: true, awaitSubmission, issue, resolve, reject});
     return pending;
   }
   return class WebGPURenderer extends Base {
@@ -417,14 +454,22 @@ export function withThreeCompute(Base, THREE) {
     compute(nodes, dispatchSize = null) {
       check(this);
       const list = listOf(nodes), size = Array.isArray(dispatchSize) ? dispatchSize.slice() : dispatchSize;
-      const run = () => owner(this).compute(list, size, issue => submit(this, issue),
-        () => !this._computeTurn && !!(this._drain || this._preparing));
+      const run = () => owner(this).compute(list, size, (issue, asynchronous) => submit(this, issue, asynchronous),
+        () => this._computeTurn ? !!this._computeTurn.pending : !!(this._drain || this._preparing));
       const result = this._initialized ? run() : submit(this, () => {
         // Nested onInit/before/after compute calls belong to this submit slot,
         // ahead of requests already queued after the pre-initialization call.
-        this._computeTurn = (this._computeTurn ?? 0) + 1;
-        try { return run(); } finally { this._computeTurn--; }
-      });
+        const previous = this._computeTurn, turn = this._computeTurn = createTurn();
+        try {
+          const value = run(); value?.catch(() => {});
+          return turn.pending ? turn.pending.then(() => value) : value;
+        } catch (error) {
+          // Earlier accepted kernels still own their submission position when
+          // a later source callback rejects this public call.
+          if (turn.pending) return turn.pending.then(() => { throw error; }, () => { throw error; });
+          throw error;
+        } finally { this._computeTurn = previous; }
+      }, true);
       result?.catch(error => { this._deferredError ??= error; });
       return result;
     }
@@ -432,7 +477,7 @@ export function withThreeCompute(Base, THREE) {
     async compileComputeAsync(nodes, onProgress = null) {
       const list = listOf(nodes);
       if (onProgress !== null && typeof onProgress !== 'function') fail('OPTIONS', 'onProgress must be a function');
-      await submit(this, () => owner(this).compile(list, onProgress));
+      await submit(this, () => owner(this).compile(list, onProgress), true);
     }
     /** F3D extension: copy GPU storage bytes into a normal 2D RenderTarget.
      * The texture can then be sampled by ordinary scene materials. No CPU
