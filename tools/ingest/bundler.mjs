@@ -18,6 +18,7 @@ import { marchingCubesRollupPlugin } from "./marching_cubes_rollup.mjs";
 import { resolveModuleSpecifier, urlToFilePath } from "./resolver.mjs";
 import { moduleWorkerRollupPlugin } from "./module_workers.mjs";
 import { gltfAssetUris } from "./pack_gltf.mjs";
+import { collectThreeLoaderAssets, findThreeLoaderRequests } from "./three_loader_assets.mjs";
 
 /**
  * Resolves the directory of a module on disk given its Rollup module ID.
@@ -90,6 +91,7 @@ function isExternalUrl(url) {
  * @param {Map<string, string>} [options.inlineModules]
  * @param {Map<string, string>} [options.retainedModuleUrls] - Exact source URLs mapped to copied output URLs
  * @param {string} [options.packageRootUrl]
+ * @param {string} [options.documentUrl] - HTML document owning relative loader URLs
  * @returns {import('rollup').Plugin}
  */
 export function f3dRollupPlugin(options = {}) {
@@ -101,6 +103,9 @@ export function f3dRollupPlugin(options = {}) {
   const emittedChunksByUrl = new Map();
   const dynamicChunkRefIds = new Set();
   const gltfAssetRefIds = new Set();
+  const documentAssets = new Map();
+  const documentRequests = [];
+  let defaultManagerExposed = false;
 
   function emitModuleAsset(context, assetPath) {
     if (emittedAssetsByPath.has(assetPath)) return emittedAssetsByPath.get(assetPath);
@@ -174,6 +179,28 @@ export function f3dRollupPlugin(options = {}) {
 
   return {
     name: "f3d-ingest-resolver",
+
+    generateBundle(_outputOptions, bundle) {
+      if (defaultManagerExposed) return;
+      for (const { requests, id } of documentRequests) {
+        for (const [fileName, asset] of collectThreeLoaderAssets(requests, {
+          documentUrl: options.documentUrl,
+          documentBaseUrl: mapBaseUrl,
+          fail: (code, message) => this.error({ code, message: `${message} (loader in ${JSON.stringify(id)})` }),
+        })) documentAssets.set(fileName, asset);
+      }
+      for (const [fileName, asset] of documentAssets) {
+        if (options.documentUrl && fileName === path.basename(fileURLToPath(options.documentUrl))) {
+          this.error(`Loader resource ${JSON.stringify(fileName)} collides with the emitted HTML entry`);
+        }
+        const existing = bundle[fileName];
+        if (existing) {
+          if (existing.type === "asset" && Buffer.from(existing.source).equals(asset.source)) continue;
+          this.error(`Loader resource ${JSON.stringify(fileName)} collides with an emitted bundle file`);
+        }
+        this.emitFile({ type: "asset", fileName, ...asset });
+      }
+    },
 
     resolveFileUrl({ referenceId, relativePath }) {
       if (gltfAssetRefIds.has(referenceId)) {
@@ -327,6 +354,16 @@ export function f3dRollupPlugin(options = {}) {
       }
 
       if (ast) {
+        if (options.documentUrl && (code.includes("load") || code.includes("LoadingManager"))) {
+          const requests = findThreeLoaderRequests(ast, {
+            resolveModule: (specifier) => resolveModuleSpecifier(specifier, referrerUrl, importMap, {
+              mapBaseUrl, packageRootUrl: options.packageRootUrl,
+            }),
+            packageRootUrl: options.packageRootUrl,
+            onDefaultManagerExposure: () => { defaultManagerExposed = true; },
+          });
+          if (requests.length) documentRequests.push({ requests, id });
+        }
         walk.simple(ast, {
           ImportExpression: (node) => {
             if (!node.source) return;
@@ -635,6 +672,7 @@ export async function bundleWithRollup(entryPath, options = {}) {
           inlineModules,
           packageRootUrl: options.packageRootUrl,
           retainedModuleUrls: options.retainedModuleUrls,
+          ...(isHtml ? { documentUrl: entryUrl } : {}),
         }),
         ...(numericPlugin ? [numericPlugin] : []),
       ],

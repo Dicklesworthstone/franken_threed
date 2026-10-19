@@ -1208,7 +1208,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
   if (rendererRoute?.routed && bundleResult.routedRendererModules.length === 0) {
     throw new Error("A renderer route was decided but no pinned three build import was substituted");
   }
-  const emittedChunkNames = new Set(Object.keys(bundleResult.files));
+  const emittedChunkNames = new Set(bundleResult.chunks.map((chunk) => chunk.fileName));
   if (htmlFileName) emittedChunkNames.add(htmlFileName);
 
   const preloadChunkMap = new Map();
@@ -1221,6 +1221,10 @@ export async function buildApplication(entryPath, outDir, options = {}) {
   collectHtmlAssets(preloadChunkMap, emittedChunkNames);
 
   for (const [fileName, code] of Object.entries(bundleResult.files)) {
+    const existing = targetFiles.get(fileName);
+    if (existing !== undefined && !Buffer.from(existing).equals(Buffer.from(code))) {
+      throw new Error(`Collision detected: relative resource ${JSON.stringify(fileName)} differs from an emitted bundle asset`);
+    }
     targetFiles.set(fileName, code);
   }
   if (isHtml) {
