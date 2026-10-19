@@ -5,7 +5,7 @@ extern crate alloc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::error::HazardError;
+use crate::error::{GraphError, HazardError};
 use crate::pass::{Draw, LoadOp, Pass, PassId, PassKind, StoreOp};
 use crate::resource::{ResourceAccess, ResourceKind, SubresourceRange};
 
@@ -338,7 +338,7 @@ fn validate_copy_pass_hazards(pass: &Pass) -> Result<(), HazardError> {
     Ok(())
 }
 
-/// Whether two output-preserving passes can resolve a cross-draw buffer usage conflict.
+/// Whether sequential output-preserving passes can resolve cross-draw buffer usage conflicts.
 ///
 /// Color attachment slots apply to every draw. Without per-draw output declarations,
 /// sampling an attachment cannot justify removing that attachment from a later segment.
@@ -347,98 +347,143 @@ pub fn can_split_pass(pass: &Pass) -> bool {
     output_preserving_split(pass).is_some()
 }
 
-/// Build at most two segments, preserving every output and its attachment location.
-fn output_preserving_split(pass: &Pass) -> Option<(Pass, Pass)> {
+/// Build maximal legal draw groups, preserving every output and its attachment location.
+fn output_preserving_split(pass: &Pass) -> Option<Vec<Pass>> {
     if pass.kind != PassKind::Render
         || !pass.dispatches.is_empty()
-        || !matches!(validate_pass_hazards(pass), Err(HazardError::WholeBufferConflict { .. }))
+        || !matches!(
+            validate_pass_hazards(pass),
+            Err(HazardError::WholeBufferConflict { .. })
+        )
     {
         return None;
     }
 
-    // The first cross-draw conflict determines the boundary. Both halves must
-    // validate independently; within-draw conflicts cannot be repaired by splitting.
-    let split_idx = (1..pass.draws.len()).find(|&idx| {
-        pass.draws[idx].uses.iter().any(|current| {
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    let mut inherited_draw_state = false;
+    for (idx, draw) in pass.draws.iter().enumerate() {
+        let conflicts_with_prefix = draw.uses.iter().any(|current| {
             current.kind == ResourceKind::Buffer
-                && pass.draws[..idx].iter().flat_map(|draw| &draw.uses).any(|prior| {
-                    prior.kind == ResourceKind::Buffer
-                        && prior.resource_id == current.resource_id
-                        && !prior.access.is_compatible_with(&current.access)
-                })
-        })
-    })?;
-
-    // The current graph does not materialize inherited viewport/scissor state.
-    // Refuse a boundary that would reset it or rely on warm bindings from the prefix.
-    if pass.draws[split_idx].assumes_warm_state
-        || pass.draws[..split_idx].iter().any(|draw| {
-            draw.viewport.is_some() || draw.scissor.is_some() || draw.scissor_test_enabled
-        })
-    {
+                && pass.draws[start..idx]
+                    .iter()
+                    .flat_map(|prior| &prior.uses)
+                    .any(|prior| {
+                        prior.kind == ResourceKind::Buffer
+                            && prior.resource_id == current.resource_id
+                            && !prior.access.is_compatible_with(&current.access)
+                    })
+        });
+        if conflicts_with_prefix {
+            // The graph cannot materialize implicit viewport/scissor or binding
+            // state. Every introduced boundary must be safe, including later ones.
+            if draw.assumes_warm_state || inherited_draw_state {
+                return None;
+            }
+            ranges.push(start..idx);
+            start = idx;
+        }
+        inherited_draw_state |=
+            draw.viewport.is_some() || draw.scissor.is_some() || draw.scissor_test_enabled;
+    }
+    if ranges.is_empty() {
         return None;
     }
+    ranges.push(start..pass.draws.len());
 
-    let mut first = pass.clone();
-    first.draws.truncate(split_idx);
-    let mut last = pass.clone();
-    last.draws = pass.draws[split_idx..].to_vec();
-
-    for (intermediate, final_attachment) in first.color_attachments.iter_mut()
-        .zip(&mut last.color_attachments)
-    {
-        intermediate.store_op = StoreOp::Store;
-        // Publish the resolve only at the source pass's final boundary.
-        intermediate.resolve_target = None;
-        final_attachment.load_op = LoadOp::Load;
-    }
-
-    if let (Some(intermediate), Some(final_attachment)) =
-        (&mut first.depth_stencil_attachment, &mut last.depth_stencil_attachment)
-    {
-        if !intermediate.depth_read_only {
-            match (intermediate.depth_load_op, intermediate.depth_store_op) {
-                (Some(_), Some(_)) => {
-                    intermediate.depth_store_op = Some(StoreOp::Store);
-                    final_attachment.depth_load_op = Some(LoadOp::Load);
-                }
-                (None, None) => {}
-                _ => return None,
+    // Clone shared pass metadata once; do not clone the entire draw list once
+    // per segment when a pass changes buffer roles repeatedly.
+    let mut template = pass.clone();
+    template.draws.clear();
+    let mut segments = Vec::with_capacity(ranges.len());
+    let last_index = ranges.len() - 1;
+    for (index, range) in ranges.into_iter().enumerate() {
+        let mut segment = template.clone();
+        segment.draws.extend_from_slice(&pass.draws[range]);
+        for attachment in &mut segment.color_attachments {
+            if index > 0 {
+                attachment.load_op = LoadOp::Load;
+            }
+            if index < last_index {
+                attachment.store_op = StoreOp::Store;
+                // Publish the resolve only at the source pass's final boundary.
+                attachment.resolve_target = None;
             }
         }
-        if !intermediate.stencil_read_only {
-            match (intermediate.stencil_load_op, intermediate.stencil_store_op) {
-                (Some(_), Some(_)) => {
-                    intermediate.stencil_store_op = Some(StoreOp::Store);
-                    final_attachment.stencil_load_op = Some(LoadOp::Load);
+
+        if let Some(attachment) = &mut segment.depth_stencil_attachment {
+            for (read_only, load, store) in [
+                (
+                    attachment.depth_read_only,
+                    &mut attachment.depth_load_op,
+                    &mut attachment.depth_store_op,
+                ),
+                (
+                    attachment.stencil_read_only,
+                    &mut attachment.stencil_load_op,
+                    &mut attachment.stencil_store_op,
+                ),
+            ] {
+                if !read_only {
+                    match (*load, *store) {
+                        (Some(_), Some(_)) => {
+                            if index > 0 {
+                                *load = Some(LoadOp::Load);
+                            }
+                            if index < last_index {
+                                *store = Some(StoreOp::Store);
+                            }
+                        }
+                        (None, None) => {}
+                        _ => return None,
+                    }
                 }
-                (None, None) => {}
-                _ => return None,
             }
         }
-    }
 
-    validate_pass_hazards(&first).ok()?;
-    validate_pass_hazards(&last).ok()?;
-    Some((first, last))
+        // A within-draw conflict, attachment feedback, or other independent
+        // hazard must not disappear just because another usage was split.
+        validate_pass_hazards(&segment).ok()?;
+        segments.push(segment);
+    }
+    Some(segments)
 }
 
-/// Splits a conflicting render pass into two sequential legal passes.
+/// Splits a conflicting render pass into sequential legal passes.
 ///
 /// Invariant: Preserves draw ordering and exact attachment semantics.
 /// Does NOT silently drop sampled outputs or depth/stencil state!
-/// The second pass loads existing contents (`LoadOp::Load`) from the first pass's store (`StoreOp::Store`).
-pub fn split_pass_on_hazard(pass: &Pass, next_pass_id: PassId) -> Result<Vec<Pass>, HazardError> {
+/// Later passes load the preceding pass's stored contents. Additional IDs are
+/// contiguous starting at `next_pass_id`; exhaustion and ID collisions return
+/// structured graph errors rather than wrapping or producing a malformed graph.
+pub fn split_pass_on_hazard(pass: &Pass, next_pass_id: PassId) -> Result<Vec<Pass>, GraphError> {
     let original_error = match validate_pass_hazards(pass) {
         Ok(()) => return Ok(vec![pass.clone()]),
         Err(error) => error,
     };
-    let Some((mut pass1, mut pass2)) = output_preserving_split(pass) else {
-        return Err(original_error);
+    let Some(mut segments) = output_preserving_split(pass) else {
+        return Err(original_error.into());
     };
-    pass1.name = alloc::format!("{}_part1", pass.name);
-    pass2.id = next_pass_id;
-    pass2.name = alloc::format!("{}_part2", pass.name);
-    pass2.dependencies = vec![pass1.id];
-    Ok(vec![pass1, pass2])
+    let additional_count =
+        u32::try_from(segments.len() - 1).map_err(|_| GraphError::PassIdOverflow)?;
+    let last_id = next_pass_id
+        .get()
+        .checked_add(additional_count - 1)
+        .ok_or(GraphError::PassIdOverflow)?;
+    if (next_pass_id.get()..=last_id).contains(&pass.id.get()) {
+        return Err(GraphError::DuplicatePassId {
+            pass_id: pass.id.get(),
+        });
+    }
+    let mut previous_id = pass.id;
+    for (index, segment) in segments.iter_mut().enumerate() {
+        segment.name = alloc::format!("{}_part{}", pass.name, index + 1);
+        if index > 0 {
+            // The complete range was checked above, so every offset fits u32.
+            segment.id = PassId::new(next_pass_id.get() + (index as u32 - 1));
+            segment.dependencies = vec![previous_id];
+            previous_id = segment.id;
+        }
+    }
+    Ok(segments)
 }

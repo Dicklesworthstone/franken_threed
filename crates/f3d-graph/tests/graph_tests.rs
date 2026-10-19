@@ -261,7 +261,7 @@ fn negative_unsupported_feedback_loop_rejected_without_dropping_outputs() {
 
     let split_err = split_pass_on_hazard(&pass, PassId::new(2)).expect_err("must reject feedback loop");
     match split_err {
-        HazardError::AttachmentSamplingConflict { texture_id, .. } => {
+        GraphError::Hazard(HazardError::AttachmentSamplingConflict { texture_id, .. }) => {
             assert_eq!(texture_id, tex_a.get());
         }
         other => panic!("expected AttachmentSamplingConflict, got: {other:?}"),
@@ -332,7 +332,7 @@ fn positive_automatic_pass_splitting_preserves_targets_and_depth_stencil() {
     assert!(!can_split_pass(&pass));
     assert!(matches!(
         split_pass_on_hazard(&pass, PassId::new(2)),
-        Err(HazardError::AttachmentSamplingConflict { texture_id, .. })
+        Err(GraphError::Hazard(HazardError::AttachmentSamplingConflict { texture_id, .. }))
             if texture_id == tex_intermediate.get()
     ));
     let mut conflicting_graph = PassGraph::new();
@@ -474,7 +474,7 @@ fn positive_automatic_pass_splitting_preserves_targets_and_depth_stencil() {
         assert!(!can_split_pass(&variant));
         assert!(matches!(
             split_pass_on_hazard(&variant, PassId::new(2)),
-            Err(HazardError::WholeBufferConflict { .. })
+            Err(GraphError::Hazard(HazardError::WholeBufferConflict { .. }))
         ));
     }
 }
@@ -523,7 +523,7 @@ fn positive_automatic_pass_splitting_preserves_readonly_depth_matrix() {
         assert!(!can_split_pass(&pass));
         assert!(matches!(
             split_pass_on_hazard(&pass, PassId::new(2)),
-            Err(HazardError::AttachmentSamplingConflict { texture_id, .. })
+            Err(GraphError::Hazard(HazardError::AttachmentSamplingConflict { texture_id, .. }))
                 if texture_id == tex_a.get()
         ));
         pass.draws[1].uses.retain(|u| u.resource_id != tex_a && u.resource_id != buf_v);
@@ -648,6 +648,254 @@ fn test_split_rewires_downstream_consumers_to_final_segment() {
     assert_eq!(plan.segments[0].name, "splittable_pass_part1");
     assert_eq!(plan.segments[1].name, "splittable_pass_part2");
     assert_eq!(plan.segments[2].name, "downstream_consumer");
+}
+
+fn pass_with_buffer_roles(id: u32, writable: &[bool]) -> Pass {
+    let mut pass = Pass::new_render(PassId::new(id), format!("roles_{id}")).with_color_attachment(
+        ColorAttachment::new_clear(ResourceId::new(100), [0.1, 0.2, 0.3, 1.0]),
+    );
+    for (index, &write) in writable.iter().enumerate() {
+        let resource = ResourceId::new(55);
+        let version = DataVersion::new(index as u64 + 1);
+        let offset = Some(index as u64 * 256);
+        let usage = if write {
+            ResourceUse::buffer_storage_write(resource, version, offset, Some(256))
+        } else {
+            ResourceUse::buffer_uniform(resource, version, offset, Some(256))
+        };
+        pass.draws.push(Draw::new(
+            index as u32,
+            1,
+            3,
+            index as u32 * 256,
+            vec![usage],
+        ));
+    }
+    pass
+}
+
+#[test]
+fn repeated_buffer_transitions_keep_draw_groups_and_attachment_contents() {
+    let mut pass = pass_with_buffer_roles(10, &[false, false, true, true, false, false]);
+    pass.dependencies.push(PassId::new(1));
+    pass.history_dependencies.push(ResourceId::new(107));
+    pass.color_attachments[0].store_op = StoreOp::Discard;
+    pass.color_attachments[0].resolve_target = Some(ResourceId::new(102));
+    pass.color_attachments
+        .push(ColorAttachment::new_load(ResourceId::new(101)));
+    let mut depth = DepthStencilAttachment::new_depth_clear(ResourceId::new(103), 0.75);
+    depth.depth_store_op = Some(StoreOp::Discard);
+    depth.stencil_read_only = false;
+    depth.stencil_load_op = Some(LoadOp::Clear);
+    depth.stencil_store_op = Some(StoreOp::Discard);
+    depth.stencil_clear_value = 7;
+    pass.depth_stencil_attachment = Some(depth.clone());
+
+    assert!(can_split_pass(&pass));
+    let segments = split_pass_on_hazard(&pass, PassId::new(20)).unwrap();
+    assert_eq!(segments.len(), 3);
+    assert_eq!(
+        segments.iter().map(|p| p.id.get()).collect::<Vec<_>>(),
+        [10, 20, 21]
+    );
+    assert_eq!(
+        segments
+            .iter()
+            .flat_map(|p| p.draws.clone())
+            .collect::<Vec<_>>(),
+        pass.draws
+    );
+    for (index, segment) in segments.iter().enumerate() {
+        validate_pass_hazards(segment).expect("each generated scope must be legal");
+        assert_eq!(
+            segment.draws.len(),
+            2,
+            "compatible adjacent draws stay together"
+        );
+        assert_eq!(segment.history_dependencies, pass.history_dependencies);
+        assert_eq!(
+            segment.dependencies,
+            vec![if index == 0 {
+                PassId::new(1)
+            } else {
+                segments[index - 1].id
+            }]
+        );
+        assert_eq!(segment.color_attachments.len(), 2);
+        for (attachment, original) in segment
+            .color_attachments
+            .iter()
+            .zip(&pass.color_attachments)
+        {
+            assert_eq!(attachment.target_id, original.target_id);
+            assert_eq!(attachment.clear_color, original.clear_color);
+            assert_eq!(
+                attachment.load_op,
+                if index == 0 {
+                    original.load_op
+                } else {
+                    LoadOp::Load
+                }
+            );
+            assert_eq!(
+                attachment.store_op,
+                if index == 2 {
+                    original.store_op
+                } else {
+                    StoreOp::Store
+                }
+            );
+            assert_eq!(
+                attachment.resolve_target,
+                if index == 2 {
+                    original.resolve_target
+                } else {
+                    None
+                }
+            );
+        }
+        let actual_depth = segment.depth_stencil_attachment.as_ref().unwrap();
+        let mut expected_depth = depth.clone();
+        if index > 0 {
+            expected_depth.depth_load_op = Some(LoadOp::Load);
+            expected_depth.stencil_load_op = Some(LoadOp::Load);
+        }
+        if index < 2 {
+            expected_depth.depth_store_op = Some(StoreOp::Store);
+            expected_depth.stencil_store_op = Some(StoreOp::Store);
+        }
+        assert_eq!(actual_depth, &expected_depth);
+    }
+}
+
+#[test]
+fn many_segments_allocate_unique_ids_and_rewire_other_split_families() {
+    let roles: Vec<bool> = (0..24).map(|index| index % 2 == 1).collect();
+    let first = pass_with_buffer_roles(1, &roles);
+    let second = pass_with_buffer_roles(2, &[true, false, true]).with_dependency(first.id);
+    let consumer = Pass::new_copy(PassId::new(3), "read_final_output")
+        .with_dependency(second.id)
+        .with_copy(CopyCommand::TextureToBuffer {
+            texture_id: ResourceId::new(100),
+            buffer_id: ResourceId::new(200),
+            width: 1,
+            height: 1,
+            bytes_per_row: 256,
+        });
+    let mut graph = PassGraph::new();
+    // Deliberately add the consumer first: explicit dependencies determine order.
+    graph.add_pass(consumer).unwrap();
+    graph.add_pass(first.clone()).unwrap();
+    graph.add_pass(second.clone()).unwrap();
+    let plan = graph
+        .compile(None)
+        .expect("all split families and their consumer must schedule");
+    assert_eq!(plan.pass_count, 28);
+    assert_eq!(plan.split_count, 25);
+    let ids: std::collections::BTreeSet<_> = plan.segments.iter().map(|p| p.pass_id).collect();
+    assert_eq!(ids.len(), plan.pass_count);
+    assert_eq!(
+        plan.segments[..24]
+            .iter()
+            .flat_map(|p| p.draws.clone())
+            .collect::<Vec<_>>(),
+        first.draws
+    );
+    assert_eq!(
+        plan.segments[24..27]
+            .iter()
+            .flat_map(|p| p.draws.clone())
+            .collect::<Vec<_>>(),
+        second.draws
+    );
+    assert_eq!(plan.segments[24].pass_id, second.id);
+    assert_eq!(plan.segments[27].name, "read_final_output");
+}
+
+#[test]
+fn later_split_boundaries_still_reject_implicit_state_and_within_draw_conflicts() {
+    let pass = pass_with_buffer_roles(1, &[false, true, false, true]);
+    let mut variants = Vec::new();
+    let mut viewport = pass.clone();
+    viewport.draws[1].viewport = Some([0, 0, 32, 32]);
+    variants.push(viewport);
+    let mut scissor = pass.clone();
+    scissor.draws[1].scissor = Some([0, 0, 16, 16]);
+    scissor.draws[1].scissor_test_enabled = true;
+    variants.push(scissor);
+    let mut warm = pass.clone();
+    warm.draws[2].assumes_warm_state = true;
+    variants.push(warm);
+    let mut within_draw = pass;
+    within_draw.draws[2]
+        .uses
+        .push(ResourceUse::buffer_storage_write(
+            ResourceId::new(55),
+            DataVersion::new(3),
+            Some(1024),
+            Some(256),
+        ));
+    variants.push(within_draw);
+    for variant in variants {
+        assert!(!can_split_pass(&variant));
+        assert!(matches!(
+            split_pass_on_hazard(&variant, PassId::new(2)),
+            Err(GraphError::Hazard(HazardError::WholeBufferConflict { .. }))
+        ));
+    }
+}
+
+#[test]
+fn split_ids_are_checked_at_the_actual_required_capacity() {
+    let pass = pass_with_buffer_roles(1, &[false, true, false]);
+    assert_eq!(
+        split_pass_on_hazard(&pass, PassId::new(u32::MAX)),
+        Err(GraphError::PassIdOverflow)
+    );
+    assert_eq!(
+        split_pass_on_hazard(&pass, PassId::new(1)),
+        Err(GraphError::DuplicatePassId { pass_id: 1 })
+    );
+    let split = split_pass_on_hazard(&pass, PassId::new(u32::MAX - 1)).unwrap();
+    assert_eq!(split[1].id, PassId::new(u32::MAX - 1));
+    assert_eq!(split[2].id, PassId::new(u32::MAX));
+
+    let mut graph = PassGraph::new();
+    graph
+        .add_pass(pass_with_buffer_roles(u32::MAX - 3, &[false, true, false]))
+        .unwrap();
+    graph
+        .add_pass(
+            pass_with_buffer_roles(2, &[true, false]).with_dependency(PassId::new(u32::MAX - 3)),
+        )
+        .unwrap();
+    // A legal, unsplit pass requires no fresh ID even after the last ID was used.
+    graph
+        .add_pass(Pass::new_render(PassId::new(3), "already_has_id"))
+        .unwrap();
+    let plan = graph
+        .compile(None)
+        .expect("exactly enough IDs for both split families");
+    assert!(
+        plan.segments
+            .iter()
+            .any(|segment| segment.pass_id.get() == u32::MAX)
+    );
+    graph
+        .add_pass(pass_with_buffer_roles(4, &[true, false]))
+        .unwrap();
+    assert_eq!(graph.compile(None), Err(GraphError::PassIdOverflow));
+}
+
+#[test]
+fn splitting_keeps_original_self_dependencies_as_cycles() {
+    let pass = pass_with_buffer_roles(1, &[false, true, false]).with_dependency(PassId::new(1));
+    let mut graph = PassGraph::new();
+    graph.add_pass(pass).unwrap();
+    assert!(
+        matches!(graph.compile(None), Err(GraphError::CycleDetected { cycle })
+        if cycle == vec![1, 2, 3])
+    );
 }
 
 #[test]

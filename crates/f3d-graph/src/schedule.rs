@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 
 use crate::canvas::{CanvasEpochTracker, CanvasId};
 use crate::error::GraphError;
-use crate::hazard::{can_split_pass, split_pass_on_hazard, validate_pass_hazards};
+use crate::hazard::{split_pass_on_hazard, validate_pass_hazards};
 use crate::pass::{Pass, PassId};
 use crate::plan::{ExecutionPlan, PlanSegment};
 use crate::resource::ResourceKind;
@@ -117,48 +117,46 @@ impl PassGraph {
         let mut resolved_passes = Vec::new();
         let mut split_count = 0;
         let mut split_reasons = Vec::new();
-        let mut alloc_id = self.next_id;
-        let mut split_rewires = Vec::new();
+        let mut alloc_id = Some(self.next_id);
+        let mut split_rewires = BTreeMap::new();
+        let mut split_origins = BTreeMap::new();
 
         for pass in &self.passes {
             match validate_pass_hazards(pass) {
                 Ok(()) => {
                     resolved_passes.push(pass.clone());
                 }
-                Err(err) => {
-                    if can_split_pass(pass) {
-                        let next_pid = PassId::new(alloc_id);
-                        alloc_id = alloc_id.checked_add(10).ok_or(GraphError::PassIdOverflow)?;
-                        let splits = split_pass_on_hazard(pass, next_pid)?;
-                        let final_split_id = splits.last().unwrap().id;
-                        split_rewires.push((pass.id, final_split_id));
-
-                        split_count += splits.len().saturating_sub(1);
-                        split_reasons.push(alloc::format!(
-                            "Split pass '{}' ({}) into {} segments preserving outputs and load/store state",
-                            pass.name,
-                            pass.id,
-                            splits.len()
-                        ));
-                        resolved_passes.extend(splits);
-                    } else {
-                        return Err(GraphError::Hazard(err));
+                Err(_) => {
+                    let next_pid = PassId::new(alloc_id.ok_or(GraphError::PassIdOverflow)?);
+                    let splits = split_pass_on_hazard(pass, next_pid)?;
+                    let final_split_id = splits.last().unwrap().id;
+                    alloc_id = final_split_id.get().checked_add(1);
+                    split_rewires.insert(pass.id, final_split_id);
+                    for split in &splits {
+                        split_origins.insert(split.id, pass.id);
                     }
+
+                    split_count += splits.len() - 1;
+                    split_reasons.push(alloc::format!(
+                        "Split pass '{}' ({}) into {} segments preserving outputs and load/store state",
+                        pass.name,
+                        pass.id,
+                        splits.len()
+                    ));
+                    resolved_passes.extend(splits);
                 }
             }
         }
 
         // 3. Rewire downstream consumers of split passes to depend on the final split segment
-        for (original_id, final_id) in split_rewires {
-            if original_id != final_id {
-                for p in &mut resolved_passes {
-                    // Do not rewire dependencies inside the split segments themselves
-                    if p.id != original_id && p.id != final_id {
-                        for dep in &mut p.dependencies {
-                            if *dep == original_id {
-                                *dep = final_id;
-                            }
-                        }
+        for pass in &mut resolved_passes {
+            let origin = split_origins.get(&pass.id).copied().unwrap_or(pass.id);
+            for dependency in &mut pass.dependencies {
+                // Internal segment chains and original self-cycles must remain
+                // intact. Only consumers outside this split family are rewired.
+                if *dependency != origin {
+                    if let Some(&final_id) = split_rewires.get(dependency) {
+                        *dependency = final_id;
                     }
                 }
             }
