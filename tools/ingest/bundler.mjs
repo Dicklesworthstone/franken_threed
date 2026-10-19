@@ -478,8 +478,15 @@ export function rendererRoutePlugin({ targets }) {
     name: "f3d-renderer-route",
     async resolveId(source, importer, resolveOptions) {
       if (source.startsWith(ROUTED_RENDERER_PREFIX)) return source;
-      // The facade itself must reach the real upstream module.
-      if (importer?.startsWith(ROUTED_RENDERER_PREFIX)) return null;
+      // Resolve facade imports from the backing module's URL. Passing the
+      // virtual ID to the ingestion resolver turns its NUL prefix into an
+      // invalid filesystem path during package browser-map inspection. Skip
+      // this plugin so the facade reaches the real upstream module once.
+      if (importer?.startsWith(ROUTED_RENDERER_PREFIX)) {
+        return this.resolve(source, importer.slice(ROUTED_RENDERER_PREFIX.length), {
+          ...resolveOptions, skipSelf: true,
+        });
+      }
       const resolved = await this.resolve(source, importer, { ...resolveOptions, skipSelf: true });
       if (!resolved || resolved.external || !byUrl.has(resolved.id)) return null;
       routed.add(resolved.id);
