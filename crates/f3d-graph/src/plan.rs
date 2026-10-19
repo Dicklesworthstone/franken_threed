@@ -37,9 +37,10 @@ pub struct PlanSegment {
     pub dispatches: Vec<Dispatch>,
     /// Copy operations.
     pub copies: Vec<CopyCommand>,
-    /// All versioned resources read by this segment.
+    /// Distinct (resource, version) reads in first-use order. One resource may
+    /// appear more than once when commands consume different snapshots.
     pub versioned_reads: Vec<(ResourceId, DataVersion)>,
-    /// All versioned resources written by this segment.
+    /// Distinct (resource, version) writes in first-use order.
     pub versioned_writes: Vec<(ResourceId, DataVersion)>,
 }
 
@@ -50,12 +51,13 @@ impl PlanSegment {
         let mut versioned_writes = Vec::new();
 
         for u in pass.all_uses() {
+            let versioned_use = (u.resource_id, u.version);
             if u.access.is_write() {
-                if !versioned_writes.iter().any(|&(id, _)| id == u.resource_id) {
-                    versioned_writes.push((u.resource_id, u.version));
+                if !versioned_writes.contains(&versioned_use) {
+                    versioned_writes.push(versioned_use);
                 }
-            } else if !versioned_reads.iter().any(|&(id, _)| id == u.resource_id) {
-                versioned_reads.push((u.resource_id, u.version));
+            } else if !versioned_reads.contains(&versioned_use) {
+                versioned_reads.push(versioned_use);
             }
         }
 

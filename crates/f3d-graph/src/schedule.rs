@@ -2,7 +2,8 @@
 
 extern crate alloc;
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::canvas::{CanvasEpochTracker, CanvasId};
@@ -10,7 +11,7 @@ use crate::error::GraphError;
 use crate::hazard::{split_pass_on_hazard, validate_pass_hazards};
 use crate::pass::{Pass, PassId};
 use crate::plan::{ExecutionPlan, PlanSegment};
-use crate::resource::ResourceKind;
+use crate::resource::{ResourceId, ResourceKind, ResourceUse};
 
 /// Top-level graph of passes and dependencies (§6.1, §6.3).
 #[derive(Default, Clone, Debug)]
@@ -32,12 +33,18 @@ impl PassGraph {
     /// Allocate a fresh unique PassId with checked overflow.
     pub fn alloc_pass_id(&mut self) -> Result<PassId, GraphError> {
         let id = self.next_id;
-        self.next_id = self.next_id.checked_add(1).ok_or(GraphError::PassIdOverflow)?;
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .ok_or(GraphError::PassIdOverflow)?;
         Ok(PassId::new(id))
     }
 
     /// Add a pass to the graph, returning its ID.
     ///
+    /// Insertion order is the source order for otherwise unordered resource
+    /// accesses and the tie-breaker between ready passes. Explicit dependencies
+    /// can establish a different order, including when consumers are added first.
     /// Rejects duplicate PassId BEFORE mutating graph state.
     pub fn add_pass(&mut self, pass: Pass) -> Result<PassId, GraphError> {
         if self.passes.iter().any(|p| p.id == pass.id) {
@@ -69,13 +76,13 @@ impl PassGraph {
                 dependency_id: dependency.get(),
             });
         }
-        let pass = self
-            .passes
-            .iter_mut()
-            .find(|p| p.id == dependent)
-            .ok_or(GraphError::PassNotFound {
-                pass_id: dependent.get(),
-            })?;
+        let pass =
+            self.passes
+                .iter_mut()
+                .find(|p| p.id == dependent)
+                .ok_or(GraphError::PassNotFound {
+                    pass_id: dependent.get(),
+                })?;
 
         if !pass.dependencies.contains(&dependency) {
             pass.dependencies.push(dependency);
@@ -87,7 +94,7 @@ impl PassGraph {
     ///
     /// Pipeline:
     /// 1. Reject empty graph.
-    /// 2. Validate all dependency targets exist.
+    /// 2. Validate explicit dependencies and infer source-ordered resource dependencies.
     /// 3. Usage-scope hazard validation and automatic pass splitting.
     /// 4. Rewire downstream consumers of split passes to depend on the final segment.
     /// 5. Validate canvas usage against the provided `CanvasEpochTracker` (cannot bypass guard).
@@ -101,16 +108,15 @@ impl PassGraph {
             return Err(GraphError::EmptyGraph);
         }
 
-        // 1. Verify all explicit dependencies exist
-        for pass in &self.passes {
-            for &dep in &pass.dependencies {
-                if !self.passes.iter().any(|p| p.id == dep) {
-                    return Err(GraphError::MissingDependency {
-                        pass_id: pass.id.get(),
-                        dependency_id: dep.get(),
-                    });
-                }
+        // Infer ordering before splitting: a use in any segment belongs to the
+        // original source operation, and its consumers must wait for completion.
+        let mut source_passes = self.passes.clone();
+        match infer_resource_dependencies(&mut source_passes) {
+            Ok(()) | Err(GraphError::CycleDetected { .. }) => {
+                // Report cycles after splitting so diagnostics include every
+                // blocked segment, preserving the original compilation contract.
             }
+            Err(error) => return Err(error),
         }
 
         // 2. Perform hazard analysis and automatic pass splitting
@@ -121,14 +127,14 @@ impl PassGraph {
         let mut split_rewires = BTreeMap::new();
         let mut split_origins = BTreeMap::new();
 
-        for pass in &self.passes {
-            match validate_pass_hazards(pass) {
+        for pass in source_passes {
+            match validate_pass_hazards(&pass) {
                 Ok(()) => {
-                    resolved_passes.push(pass.clone());
+                    resolved_passes.push(pass);
                 }
                 Err(_) => {
                     let next_pid = PassId::new(alloc_id.ok_or(GraphError::PassIdOverflow)?);
-                    let splits = split_pass_on_hazard(pass, next_pid)?;
+                    let splits = split_pass_on_hazard(&pass, next_pid)?;
                     let final_split_id = splits.last().unwrap().id;
                     alloc_id = final_split_id.get().checked_add(1);
                     split_rewires.insert(pass.id, final_split_id);
@@ -201,10 +207,13 @@ impl PassGraph {
         }
 
         // 5. Topological sort with cycle detection
-        let ordered_passes = topological_sort(&resolved_passes)?;
+        let ordered_indices = topological_order(&resolved_passes)?;
 
         // 6. Build execution plan segments
-        let segments: Vec<PlanSegment> = ordered_passes.iter().map(PlanSegment::from_pass).collect();
+        let segments: Vec<PlanSegment> = ordered_indices
+            .iter()
+            .map(|&index| PlanSegment::from_pass(&resolved_passes[index]))
+            .collect();
         let pass_count = segments.len();
 
         Ok(ExecutionPlan {
@@ -217,66 +226,119 @@ impl PassGraph {
     }
 }
 
-/// Performs a deterministic topological sort of passes, returning `CycleDetected` if a cycle exists.
-fn topological_sort(passes: &[Pass]) -> Result<Vec<Pass>, GraphError> {
-    let mut pass_map = BTreeMap::new();
-    let mut in_degrees = BTreeMap::new();
-    let mut adj_list: BTreeMap<PassId, Vec<PassId>> = BTreeMap::new();
+/// Preserve RAW, WAR, and WAW order for overlapping resources unless the explicit
+/// DAG already orders the two passes. Versions and buffer offsets do not prove
+/// distinct physical resources; texture mip/layer/aspect ranges can prove independence.
+fn infer_resource_dependencies(passes: &mut [Pass]) -> Result<(), GraphError> {
+    let explicit_order = topological_order(passes)?;
+    let pass_indices: BTreeMap<PassId, usize> = passes
+        .iter()
+        .enumerate()
+        .map(|(index, pass)| (pass.id, index))
+        .collect();
+    let mut explicit_ancestors = vec![BTreeSet::new(); passes.len()];
 
-    for pass in passes {
-        pass_map.insert(pass.id, pass.clone());
-        in_degrees.insert(pass.id, 0);
-        adj_list.insert(pass.id, Vec::new());
-    }
-
-    for pass in passes {
-        for &dep in &pass.dependencies {
-            if let Some(outgoing) = adj_list.get_mut(&dep) {
-                outgoing.push(pass.id);
-            }
-            if let Some(deg) = in_degrees.get_mut(&pass.id) {
-                *deg += 1;
-            }
+    // Use only explicit precedence when interpreting construction order. Inferred
+    // edges must not silently reverse an otherwise source-ordered resource use.
+    for index in explicit_order {
+        let mut ancestors = BTreeSet::new();
+        for dependency in &passes[index].dependencies {
+            let dependency_index = pass_indices[dependency];
+            ancestors.insert(dependency_index);
+            ancestors.extend(explicit_ancestors[dependency_index].iter().copied());
         }
+        explicit_ancestors[index] = ancestors;
     }
 
-    // Worklist of passes with in-degree 0 (stable sorting by PassId)
-    let mut zero_in_degree = Vec::new();
-    for (&id, &deg) in &in_degrees {
-        if deg == 0 {
-            zero_in_degree.push(id);
-        }
-    }
-    zero_in_degree.sort_by(|a, b| b.cmp(a));
-
-    let mut sorted_passes = Vec::new();
-
-    while let Some(current_id) = zero_in_degree.pop() {
-        let pass = pass_map.get(&current_id).unwrap();
-        sorted_passes.push(pass.clone());
-
-        if let Some(neighbors) = adj_list.get(&current_id) {
-            for &next_id in neighbors {
-                let deg = in_degrees.get_mut(&next_id).unwrap();
-                *deg -= 1;
-                if *deg == 0 {
-                    zero_in_degree.push(next_id);
-                    zero_in_degree.sort_by(|a, b| b.cmp(a)); // maintain deterministic lowest-first order
+    let mut previous_uses: BTreeMap<ResourceId, Vec<(usize, ResourceUse)>> = BTreeMap::new();
+    for index in 0..passes.len() {
+        let uses = passes[index].all_uses();
+        let mut dependencies = BTreeSet::new();
+        for usage in &uses {
+            if let Some(previous) = previous_uses.get(&usage.resource_id) {
+                for (previous_index, previous_use) in previous {
+                    if (usage.access.is_write() || previous_use.access.is_write())
+                        && usage.subresource.overlaps(&previous_use.subresource)
+                        && !explicit_ancestors[*previous_index].contains(&index)
+                        && !explicit_ancestors[index].contains(previous_index)
+                    {
+                        dependencies.insert(passes[*previous_index].id);
+                    }
                 }
+            }
+        }
+        passes[index].dependencies.extend(dependencies);
+
+        for usage in uses {
+            let previous = previous_uses.entry(usage.resource_id).or_default();
+            // One scheduling footprint per pass/range/access class is enough.
+            // PlanSegment still retains every distinct per-use data version.
+            if !previous
+                .iter()
+                .rev()
+                .take_while(|(previous_index, _)| *previous_index == index)
+                .any(|(_, previous_use)| {
+                    previous_use.subresource == usage.subresource
+                        && previous_use.access.is_write() == usage.access.is_write()
+                })
+            {
+                previous.push((index, usage));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Deterministic topological order, choosing the earliest source index whenever
+/// several passes are ready. IDs identify passes; their numeric values do not order work.
+fn topological_order(passes: &[Pass]) -> Result<Vec<usize>, GraphError> {
+    let pass_indices: BTreeMap<PassId, usize> = passes
+        .iter()
+        .enumerate()
+        .map(|(index, pass)| (pass.id, index))
+        .collect();
+    let mut in_degrees = vec![0; passes.len()];
+    let mut adj_list = vec![Vec::new(); passes.len()];
+
+    for (index, pass) in passes.iter().enumerate() {
+        for dependency in &pass.dependencies {
+            let &dependency_index =
+                pass_indices
+                    .get(dependency)
+                    .ok_or(GraphError::MissingDependency {
+                        pass_id: pass.id.get(),
+                        dependency_id: dependency.get(),
+                    })?;
+            adj_list[dependency_index].push(index);
+            in_degrees[index] += 1;
+        }
+    }
+
+    let mut ready: BTreeSet<usize> = in_degrees
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &degree)| (degree == 0).then_some(index))
+        .collect();
+    let mut ordered = Vec::with_capacity(passes.len());
+
+    while let Some(index) = ready.pop_first() {
+        ordered.push(index);
+        for &next_index in &adj_list[index] {
+            in_degrees[next_index] -= 1;
+            if in_degrees[next_index] == 0 {
+                ready.insert(next_index);
             }
         }
     }
 
     // If not all passes were visited, there is a cycle
-    if sorted_passes.len() < passes.len() {
-        let mut cycle_nodes = Vec::new();
-        for (&id, &deg) in &in_degrees {
-            if deg > 0 {
-                cycle_nodes.push(id.get());
-            }
-        }
+    if ordered.len() < passes.len() {
+        let cycle_nodes = pass_indices
+            .iter()
+            .filter_map(|(id, &index)| (in_degrees[index] > 0).then_some(id.get()))
+            .collect();
         return Err(GraphError::CycleDetected { cycle: cycle_nodes });
     }
 
-    Ok(sorted_passes)
+    Ok(ordered)
 }

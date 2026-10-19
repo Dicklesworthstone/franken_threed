@@ -33,6 +33,364 @@ use f3d_graph::resource::{
 };
 use f3d_graph::schedule::PassGraph;
 
+fn single_use_compute_pass(id: u32, usage: ResourceUse) -> Pass {
+    Pass::new_compute(PassId::new(id), format!("compute_{id}"))
+        .with_dispatch(Dispatch::new(0, 1, [1, 1, 1], vec![usage]))
+}
+
+#[test]
+fn ready_passes_follow_source_order_instead_of_numeric_ids() {
+    for dependency in [None, Some(PassId::new(20))] {
+        let mut first = Pass::new_copy(PassId::new(30), "first_source_operation");
+        if let Some(dependency) = dependency {
+            first.dependencies.push(dependency);
+        }
+        let mut graph = PassGraph::new();
+        graph.add_pass(first).unwrap();
+        graph
+            .add_pass(Pass::new_copy(PassId::new(20), "second_source_operation"))
+            .unwrap();
+        graph
+            .add_pass(Pass::new_copy(PassId::new(1), "third_source_operation"))
+            .unwrap();
+        let plan = graph.compile(None).unwrap();
+        let expected = if dependency.is_some() {
+            // The earliest source pass regains priority as soon as it is ready.
+            vec![20, 30, 1]
+        } else {
+            vec![30, 20, 1]
+        };
+        assert_eq!(
+            plan.segments
+                .iter()
+                .map(|s| s.pass_id.get())
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn buffer_conflicts_cannot_bypass_a_blocked_source_operation() {
+    for (first_writes, second_writes) in [(true, false), (false, true), (true, true)] {
+        let usage = |writes, version, offset| {
+            if writes {
+                ResourceUse::buffer_storage_write(
+                    ResourceId::new(55),
+                    DataVersion::new(version),
+                    Some(offset),
+                    Some(256),
+                )
+            } else {
+                ResourceUse::buffer_uniform(
+                    ResourceId::new(55),
+                    DataVersion::new(version),
+                    Some(offset),
+                    Some(256),
+                )
+            }
+        };
+        let mut graph = PassGraph::new();
+        graph
+            .add_pass(
+                single_use_compute_pass(30, usage(first_writes, 7, 0))
+                    .with_dependency(PassId::new(50)),
+            )
+            .unwrap();
+        graph
+            .add_pass(single_use_compute_pass(1, usage(second_writes, 8, 256)))
+            .unwrap();
+        graph
+            .add_pass(Pass::new_copy(PassId::new(50), "prerequisite"))
+            .unwrap();
+        let plan = graph.compile(None).unwrap();
+        assert_eq!(
+            plan.segments
+                .iter()
+                .map(|s| s.pass_id.get())
+                .collect::<Vec<_>>(),
+            vec![50, 30, 1],
+            "RAW, WAR and WAW must preserve source order across versions and offsets"
+        );
+        assert_eq!(
+            plan.segments[1].dispatches[0].uses[0].version,
+            DataVersion::new(7)
+        );
+        assert_eq!(
+            plan.segments[2].dispatches[0].uses[0].version,
+            DataVersion::new(8)
+        );
+    }
+}
+
+#[test]
+fn independent_reads_and_texture_subresources_remain_unconstrained() {
+    let read = ResourceUse::buffer_uniform(ResourceId::new(55), DataVersion::INITIAL, None, None);
+    let mut pairs = vec![(read.clone(), read)];
+    for range in [
+        SubresourceRange::single_mip_layer(1, 0, TextureAspect::Color),
+        SubresourceRange::single_mip_layer(0, 1, TextureAspect::Color),
+    ] {
+        let mut write = ResourceUse::texture_sampled(
+            ResourceId::new(60),
+            DataVersion::INITIAL,
+            SubresourceRange::single_mip_layer(0, 0, TextureAspect::Color),
+        );
+        write.access = ResourceAccess::StorageTextureWrite;
+        let read = ResourceUse::texture_sampled(ResourceId::new(60), DataVersion::INITIAL, range);
+        pairs.push((write, read));
+    }
+    for (first_use, second_use) in pairs {
+        let mut graph = PassGraph::new();
+        graph
+            .add_pass(single_use_compute_pass(30, first_use).with_dependency(PassId::new(50)))
+            .unwrap();
+        graph
+            .add_pass(single_use_compute_pass(1, second_use))
+            .unwrap();
+        graph
+            .add_pass(Pass::new_copy(PassId::new(50), "prerequisite"))
+            .unwrap();
+        let plan = graph.compile(None).unwrap();
+        assert_eq!(
+            plan.segments
+                .iter()
+                .map(|s| s.pass_id.get())
+                .collect::<Vec<_>>(),
+            vec![1, 50, 30],
+            "independent accesses need no resource dependency on the blocked pass"
+        );
+    }
+}
+
+#[test]
+fn overlapping_texture_accesses_wait_for_source_production() {
+    let mut write = ResourceUse::texture_sampled(
+        ResourceId::new(60),
+        DataVersion::new(4),
+        SubresourceRange::single_mip_layer(2, 3, TextureAspect::Color),
+    );
+    write.access = ResourceAccess::StorageTextureWrite;
+    let read = ResourceUse::texture_sampled(
+        ResourceId::new(60),
+        DataVersion::new(5),
+        SubresourceRange::full_texture(),
+    );
+    let mut graph = PassGraph::new();
+    graph
+        .add_pass(single_use_compute_pass(30, write).with_dependency(PassId::new(50)))
+        .unwrap();
+    graph.add_pass(single_use_compute_pass(1, read)).unwrap();
+    graph
+        .add_pass(Pass::new_copy(PassId::new(50), "prerequisite"))
+        .unwrap();
+    let plan = graph.compile(None).unwrap();
+    assert_eq!(
+        plan.segments
+            .iter()
+            .map(|s| s.pass_id.get())
+            .collect::<Vec<_>>(),
+        vec![50, 30, 1]
+    );
+}
+
+#[test]
+fn explicit_transitive_precedence_survives_reverse_construction_order() {
+    let mut graph = PassGraph::new();
+    graph
+        .add_pass(
+            single_use_compute_pass(
+                1,
+                ResourceUse::buffer_uniform(ResourceId::new(55), DataVersion::new(7), None, None),
+            )
+            .with_dependency(PassId::new(20)),
+        )
+        .unwrap();
+    graph
+        .add_pass(
+            Pass::new_copy(PassId::new(20), "explicit_middle").with_dependency(PassId::new(30)),
+        )
+        .unwrap();
+    graph
+        .add_pass(single_use_compute_pass(
+            30,
+            ResourceUse::buffer_storage_write(ResourceId::new(55), DataVersion::new(7), None, None),
+        ))
+        .unwrap();
+    let plan = graph.compile(None).unwrap();
+    assert_eq!(
+        plan.segments
+            .iter()
+            .map(|s| s.pass_id.get())
+            .collect::<Vec<_>>(),
+        vec![30, 20, 1],
+        "an explicit dependency path already orders the overlapping accesses"
+    );
+}
+
+#[test]
+fn contradictory_source_resource_order_returns_a_cycle() {
+    let mut first = single_use_compute_pass(
+        10,
+        ResourceUse::buffer_uniform(ResourceId::new(55), DataVersion::INITIAL, None, None),
+    );
+    first.dependencies.push(PassId::new(30));
+    let second =
+        Pass::new_compute(PassId::new(20), "write_x_then_read_y").with_dispatch(Dispatch::new(
+            0,
+            1,
+            [1, 1, 1],
+            vec![
+                ResourceUse::buffer_storage_write(
+                    ResourceId::new(55),
+                    DataVersion::INITIAL,
+                    None,
+                    None,
+                ),
+                ResourceUse::buffer_uniform(ResourceId::new(56), DataVersion::INITIAL, None, None),
+            ],
+        ));
+    let third = single_use_compute_pass(
+        30,
+        ResourceUse::buffer_storage_write(ResourceId::new(56), DataVersion::INITIAL, None, None),
+    );
+    let mut graph = PassGraph::new();
+    for pass in [first, second, third] {
+        graph.add_pass(pass).unwrap();
+    }
+    // Source resource order requires 10 -> 20 -> 30, while the explicit edge
+    // requires 30 -> 10. Reversing either resource use would change its contents.
+    assert_eq!(
+        graph.compile(None).unwrap_err(),
+        GraphError::CycleDetected {
+            cycle: vec![10, 20, 30],
+        }
+    );
+}
+
+#[test]
+fn inferred_copy_consumers_wait_for_the_final_split_segment() {
+    let mut producer = pass_with_buffer_roles(30, &[true, false, true]);
+    producer.dependencies.push(PassId::new(90));
+    producer.draws[0]
+        .uses
+        .push(ResourceUse::buffer_storage_write(
+            ResourceId::new(60),
+            DataVersion::new(7),
+            None,
+            None,
+        ));
+    producer.color_attachments[0].resolve_target = Some(ResourceId::new(101));
+    producer.color_attachments[0].store_op = StoreOp::Discard;
+    let expected_draws = producer.draws.clone();
+    let copy = CopyCommand::BufferToBuffer {
+        src: ResourceId::new(60),
+        src_offset: 0,
+        dst: ResourceId::new(61),
+        dst_offset: 0,
+        size: 256,
+    };
+    let consumer =
+        Pass::new_copy(PassId::new(1), "observe_completed_source_pass").with_copy(copy.clone());
+    let mut graph = PassGraph::new();
+    graph.add_pass(producer).unwrap();
+    graph.add_pass(consumer).unwrap();
+    graph
+        .add_pass(Pass::new_copy(PassId::new(90), "prerequisite"))
+        .unwrap();
+    let plan = graph.compile(None).unwrap();
+    assert_eq!(
+        plan.segments
+            .iter()
+            .map(|s| s.pass_id.get())
+            .collect::<Vec<_>>(),
+        vec![90, 30, 91, 92, 1]
+    );
+    assert_eq!(plan.split_count, 2);
+    assert_eq!(
+        plan.segments[1..4]
+            .iter()
+            .flat_map(|s| s.draws.clone())
+            .collect::<Vec<_>>(),
+        expected_draws
+    );
+    assert_eq!(plan.segments[1].color_attachments[0].resolve_target, None);
+    assert_eq!(plan.segments[2].color_attachments[0].resolve_target, None);
+    assert_eq!(
+        plan.segments[3].color_attachments[0].resolve_target,
+        Some(ResourceId::new(101))
+    );
+    assert_eq!(plan.segments[4].copies, vec![copy]);
+}
+
+#[test]
+fn segment_summaries_retain_distinct_draw_and_dispatch_versions() {
+    let resource = ResourceId::new(55);
+    let mut render = Pass::new_render(PassId::new(30), "per_draw_snapshots")
+        .with_color_attachment(ColorAttachment::new_clear(ResourceId::new(100), [0.0; 4]));
+    let mut compute = Pass::new_compute(PassId::new(1), "per_dispatch_snapshots");
+    for (index, version) in [9, 2, 9].into_iter().enumerate() {
+        let version = DataVersion::new(version);
+        let offset = if version == DataVersion::new(9) {
+            0
+        } else {
+            256
+        };
+        render.draws.push(Draw::new(
+            index as u32,
+            1,
+            3,
+            offset as u32,
+            vec![ResourceUse::buffer_uniform(
+                resource,
+                version,
+                Some(offset),
+                Some(256),
+            )],
+        ));
+        compute.dispatches.push(Dispatch::new(
+            index as u32,
+            1,
+            [1, 1, 1],
+            vec![ResourceUse::buffer_storage_write(
+                resource,
+                version,
+                Some(offset),
+                Some(256),
+            )],
+        ));
+    }
+    compute.dispatches.push(Dispatch::new(
+        3,
+        1,
+        [1, 1, 1],
+        vec![ResourceUse::buffer_storage_read(
+            resource,
+            DataVersion::new(2),
+            Some(256),
+            Some(256),
+        )],
+    ));
+    let expected_draws = render.draws.clone();
+    let expected_dispatches = compute.dispatches.clone();
+    let mut graph = PassGraph::new();
+    graph.add_pass(render).unwrap();
+    graph.add_pass(compute).unwrap();
+    let plan = graph.compile(None).unwrap();
+    let expected_versions = vec![
+        (resource, DataVersion::new(9)),
+        (resource, DataVersion::new(2)),
+    ];
+    assert_eq!(plan.segments[0].versioned_reads, expected_versions);
+    assert_eq!(plan.segments[1].versioned_writes, expected_versions);
+    assert_eq!(
+        plan.segments[1].versioned_reads,
+        vec![(resource, DataVersion::new(2))]
+    );
+    assert_eq!(plan.segments[0].draws, expected_draws);
+    assert_eq!(plan.segments[1].dispatches, expected_dispatches);
+}
+
 #[test]
 fn resolve_destination_is_recorded_as_a_write_before_later_sampling() {
     let multisampled = ResourceId::new(710);
