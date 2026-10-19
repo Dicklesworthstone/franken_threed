@@ -4,6 +4,7 @@
  * enabling real Rollup bundle creation and round-trip re-emission.
  */
 
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -16,6 +17,7 @@ import { numericKernelRollupPlugin } from "./numeric_rollup.mjs";
 import { marchingCubesRollupPlugin } from "./marching_cubes_rollup.mjs";
 import { resolveModuleSpecifier, urlToFilePath } from "./resolver.mjs";
 import { moduleWorkerRollupPlugin } from "./module_workers.mjs";
+import { gltfAssetUris } from "./pack_gltf.mjs";
 
 /**
  * Resolves the directory of a module on disk given its Rollup module ID.
@@ -98,11 +100,88 @@ export function f3dRollupPlugin(options = {}) {
   const emittedAssetsByPath = new Map();
   const emittedChunksByUrl = new Map();
   const dynamicChunkRefIds = new Set();
+  const gltfAssetRefIds = new Set();
+
+  function emitModuleAsset(context, assetPath) {
+    if (emittedAssetsByPath.has(assetPath)) return emittedAssetsByPath.get(assetPath);
+    const source = fs.readFileSync(assetPath);
+    const extension = path.extname(assetPath).toLowerCase();
+    if (extension !== ".gltf" && extension !== ".glb") {
+      const refId = context.emitFile({
+        type: "asset", name: path.basename(assetPath), source, originalFileName: assetPath,
+      });
+      emittedAssetsByPath.set(assetPath, refId);
+      return refId;
+    }
+
+    // A model's resource base is its URL, not the importing module's URL. Keep
+    // the model and local sidecars in one directory tree so original URI strings,
+    // query/fragment suffixes and GLB binary chunks remain byte-identical.
+    const resources = new Map([[assetPath, source]]);
+    const fail = (code, message) => context.error({
+      code, message: `${message} (model ${JSON.stringify(assetPath)})`,
+    });
+    for (const uri of gltfAssetUris(source, extension === ".glb", fail)) {
+      // Network, data and document-root URLs retain their authored host route.
+      // They must not be interpreted as local paths or downloaded during builds.
+      if (!isRelativeUrl(uri)) continue;
+      let dependency;
+      try { dependency = fileURLToPath(new URL(uri, pathToFileURL(assetPath))); }
+      catch { fail("GLTF_RESOURCE_URL", `Invalid local glTF resource URI ${JSON.stringify(uri)}`); }
+      if (resources.has(dependency)) continue;
+      let content;
+      try {
+        if (!fs.statSync(dependency).isFile()) throw new Error("not a regular file");
+        content = fs.readFileSync(dependency);
+      } catch (error) {
+        fail("GLTF_RESOURCE_MISSING", `Cannot read glTF resource ${JSON.stringify(uri)}: ${error.message}`);
+      }
+      resources.set(dependency, content);
+    }
+
+    let resourceRoot = path.dirname(assetPath);
+    for (const filename of resources.keys()) {
+      for (;;) {
+        const relative = path.relative(resourceRoot, filename);
+        if (relative !== ".." && !relative.startsWith(".." + path.sep) && !path.isAbsolute(relative)) break;
+        const parent = path.dirname(resourceRoot);
+        if (parent === resourceRoot) fail("GLTF_RESOURCE_ROOT", "Model resources have no common local root");
+        resourceRoot = parent;
+      }
+    }
+    const localName = (filename) => path.relative(resourceRoot, filename).split(path.sep).join("/");
+    const ordered = [...resources].sort(([a], [b]) => localName(a) < localName(b) ? -1 : localName(a) > localName(b) ? 1 : 0);
+    // Include logical location and every dependency, so identically named models
+    // do not collide and a changed image/buffer invalidates the model URL too.
+    const hash = createHash("sha256");
+    hash.update(path.relative(getModuleDir(mapBaseUrl ?? assetPath), assetPath).split(path.sep).join("/"));
+    for (const [filename, bytes] of ordered) {
+      hash.update("\0" + localName(filename) + "\0" + bytes.length + "\0");
+      hash.update(bytes);
+    }
+    const directory = `assets/gltf-${hash.digest("hex").slice(0, 24)}/`;
+    let modelRefId;
+    for (const [filename, bytes] of ordered) {
+      const refId = context.emitFile({
+        type: "asset", fileName: directory + localName(filename), source: bytes, originalFileName: filename,
+      });
+      if (filename === assetPath) modelRefId = refId;
+    }
+    emittedAssetsByPath.set(assetPath, modelRefId);
+    gltfAssetRefIds.add(modelRefId);
+    return modelRefId;
+  }
 
   return {
     name: "f3d-ingest-resolver",
 
     resolveFileUrl({ referenceId, relativePath }) {
+      if (gltfAssetRefIds.has(referenceId)) {
+        // Explicit filenames preserve decoded source names, including literal
+        // spaces, percent signs, '?' and '#'; encode each path segment as a URL.
+        const url = relativePath.split("/").map(encodeURIComponent).join("/");
+        return `new URL(${JSON.stringify(url)}, import.meta.url).href`;
+      }
       if (dynamicChunkRefIds.has(referenceId)) {
         const rel =
           relativePath.startsWith("./") || relativePath.startsWith("../")
@@ -218,16 +297,7 @@ export function f3dRollupPlugin(options = {}) {
           );
         }
 
-        let refId = emittedAssetsByPath.get(assetAbsPath);
-        if (!refId) {
-          const assetSource = fs.readFileSync(assetAbsPath);
-          refId = this.emitFile({
-            type: "asset",
-            name: path.basename(assetAbsPath),
-            source: assetSource,
-          });
-          emittedAssetsByPath.set(assetAbsPath, refId);
-        }
+        const refId = emitModuleAsset(this, assetAbsPath);
 
         const span = ref.source_span || ref.sourceSpan;
         const start = span.start.offset;

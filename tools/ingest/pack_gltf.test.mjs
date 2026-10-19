@@ -3,6 +3,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { buildApplication } from "./build_application.mjs";
 import { embedGltfAssets } from "./pack_gltf.mjs";
 import { packHtml } from "./pack_html.mjs";
 
@@ -145,4 +147,126 @@ test("repackaging preserves signed zero in transforms instead of JSON-stringifyi
   );
   const model = JSON.parse(embedGltfAssets(original, false, embed, fail));
   assert.ok(Object.is(model.nodes[0].translation[0], -0));
+});
+
+function buildFixture(files, module) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "f3d-build-model-"));
+  for (const [filename, bytes] of Object.entries({
+    "package.json": '{"type":"module"}',
+    "index.html": '<script type="module" src="app.mjs"></script>',
+    "app.mjs": module,
+    ...files,
+  })) {
+    fs.mkdirSync(path.dirname(path.join(root, filename)), { recursive: true });
+    fs.writeFileSync(path.join(root, filename), bytes);
+  }
+  return root;
+}
+
+async function buildAndImport(root, destination = "dist") {
+  const built = await buildApplication(path.join(root, "index.html"), path.join(root, destination));
+  const module = await import(pathToFileURL(path.join(built.outDir, built.entryFiles[0])).href);
+  return { built, module };
+}
+
+test("application build preserves glTF resource bases, encoded filenames and URL suffixes", async () => {
+  const source = Buffer.from('{"asset":{"version":"2.0"},"nodes":[{"translation":[-0,0,1]}],' +
+    '"buffers":[{"uri":"../buffers/geometry%20%231.bin?v=2#mesh","byteLength":4}],' +
+    '"images":[{"uri":"../../textures/wood%20%25%23.png?filter=nearest#sample"}]}');
+  const buffer = Buffer.from([1, 2, 3, 4]), image = Buffer.from([9, 8, 7]);
+  const root = buildFixture({
+    "models/nested/scene #1.gltf": source,
+    "models/buffers/geometry #1.bin": buffer,
+    "textures/wood %#.png": image,
+  }, 'export const model = new URL("./models/nested/scene%20%231.gltf?quality=full#scene", import.meta.url);');
+  const { built, module } = await buildAndImport(root);
+  assert.equal(module.model.search, "?quality=full");
+  assert.equal(module.model.hash, "#scene");
+  assert.ok(fileURLToPath(module.model).startsWith(built.outDir + path.sep));
+  assert.deepEqual(fs.readFileSync(module.model), source, "Networked model JSON stays byte-identical");
+  const model = JSON.parse(fs.readFileSync(module.model));
+  assert.ok(Object.is(model.nodes[0].translation[0], -0));
+  for (const [uri, expected] of [[model.buffers[0].uri, buffer], [model.images[0].uri, image]]) {
+    const emittedUrl = new URL(uri, module.model);
+    assert.ok(fileURLToPath(emittedUrl).startsWith(built.outDir + path.sep));
+    assert.deepEqual(fs.readFileSync(emittedUrl), expected, `Load actual emitted dependency ${uri}`);
+  }
+});
+
+test("built glTF and GLB applications close through the standalone packer with their real resources", async () => {
+  for (const binary of [false, true]) {
+    const extension = binary ? "glb" : "gltf";
+    const model = { asset: { version: "2.0" },
+      buffers: [binary ? { byteLength: 4 } : { uri: "../geometry.bin", byteLength: 4 }],
+      images: [{ uri: "images/pixel.png?v=1#image" }],
+      bufferViews: [{ buffer: 0, byteOffset: 0, byteLength: 4 }],
+    };
+    const buffer = Buffer.from([1, 2, 3, 4]), image = Buffer.from([9, 8, 7]);
+    const source = binary ? glb(model, buffer) : Buffer.from(JSON.stringify(model));
+    const root = buildFixture({
+      ["models/scene." + extension]: source,
+      "geometry.bin": buffer,
+      "models/images/pixel.png": image,
+    }, `export const model = new URL("./models/scene.${extension}", import.meta.url);`);
+    const { built, module } = await buildAndImport(root);
+    assert.deepEqual(fs.readFileSync(module.model), source, "Original model and GLB chunks are retained exactly");
+    assert.deepEqual(fs.readFileSync(new URL(model.images[0].uri, module.model)), image);
+    if (!binary) assert.deepEqual(fs.readFileSync(new URL(model.buffers[0].uri, module.model)), buffer);
+
+    const packedPath = path.join(root, "single.html");
+    packHtml(path.join(built.outDir, built.htmlFile), packedPath);
+    const html = fs.readFileSync(packedPath, "utf8");
+    const map = JSON.parse(/<script type="importmap">(.*?)<\/script>/.exec(html)[1]);
+    const packed = await import(Object.values(map.imports)[0]);
+    const embeddedBytes = Buffer.from(await (await fetch(packed.model)).arrayBuffer());
+    const embedded = JSON.parse(binary
+      ? embeddedBytes.subarray(20, 20 + embeddedBytes.readUInt32LE(12)) : embeddedBytes);
+    assert.deepEqual(Buffer.from(await (await fetch(embedded.images[0].uri)).arrayBuffer()), image);
+    if (binary) {
+      assert.deepEqual(embeddedBytes.subarray(20 + embeddedBytes.readUInt32LE(12)),
+        source.subarray(20 + source.readUInt32LE(12)), "Packing preserves the original GLB BIN chunk");
+    } else assert.deepEqual(Buffer.from(await (await fetch(embedded.buffers[0].uri)).arrayBuffer()), buffer);
+  }
+});
+
+test("identical glTF JSON in separate directories retains the right sidecars and changed content changes its URL", async () => {
+  const source = JSON.stringify({ asset: { version: "2.0" }, buffers: [{ uri: "geometry.bin", byteLength: 4 }] });
+  const first = Buffer.from([1, 2, 3, 4]), second = Buffer.from([5, 6, 7, 8]);
+  const root = buildFixture({
+    "first/scene.gltf": source, "first/geometry.bin": first,
+    "second/scene.gltf": source, "second/geometry.bin": second,
+  }, 'export const first = new URL("./first/scene.gltf", import.meta.url);\n' +
+    'export const second = new URL("./second/scene.gltf", import.meta.url);');
+  const { built, module } = await buildAndImport(root);
+  assert.notEqual(module.first.href, module.second.href);
+  assert.deepEqual(fs.readFileSync(new URL("geometry.bin", module.first)), first);
+  assert.deepEqual(fs.readFileSync(new URL("geometry.bin", module.second)), second);
+  const originalPath = path.relative(built.outDir, fileURLToPath(module.first));
+  fs.writeFileSync(path.join(root, "first/geometry.bin"), second);
+  const rebuilt = await buildAndImport(root, "changed");
+  const changedPath = path.relative(rebuilt.built.outDir, fileURLToPath(rebuilt.module.first));
+  assert.notEqual(changedPath, originalPath, "Sidecar bytes are part of the model's output URL hash");
+  assert.deepEqual(fs.readFileSync(new URL("geometry.bin", rebuilt.module.first)), second);
+});
+
+test("networked model builds retain external, data, root-relative and extension URI routes", async () => {
+  const source = Buffer.from(JSON.stringify({ asset: { version: "2.0" },
+    buffers: [{ uri: "https://cdn.example.invalid/geometry.bin", byteLength: 4 }],
+    images: [{ uri: "//cdn.example.invalid/image.png" }, { uri: "/shared/image.png" },
+      { uri: "data:image/png;base64,AQID" }],
+    extensions: { CUSTOM: { uri: "custom-runtime-resource" } },
+  }));
+  const root = buildFixture({ "scene.gltf": source },
+    'export const model = new URL("./scene.gltf", import.meta.url);');
+  const { module } = await buildAndImport(root);
+  assert.deepEqual(fs.readFileSync(module.model), source, "No remote fetching, metadata rewriting or fake local files");
+});
+
+test("missing glTF sidecars fail before publishing an incomplete application", async () => {
+  const root = buildFixture({ "models/scene.gltf": JSON.stringify({ asset: { version: "2.0" },
+    buffers: [{ uri: "missing.bin", byteLength: 4 }] }) },
+    'export const model = new URL("./models/scene.gltf", import.meta.url);');
+  await assert.rejects(buildApplication(path.join(root, "index.html"), path.join(root, "dist")),
+    (error) => error.pluginCode === "GLTF_RESOURCE_MISSING" && error.message.includes("missing.bin"));
+  assert.equal(fs.existsSync(path.join(root, "dist")), false);
 });

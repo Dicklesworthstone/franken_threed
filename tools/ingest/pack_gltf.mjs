@@ -3,7 +3,7 @@
  * BIN/unknown chunks retain their exact bytes and relative buffer-view offsets.
  * This is packaging, not model decoding or a replacement for GLTFLoader.
  */
-export function embedGltfAssets(bytes, binary, embed, fail) {
+function readGltfAssets(bytes, binary, fail) {
   let jsonBytes = bytes,
     tail = null;
   if (binary) {
@@ -38,8 +38,7 @@ export function embedGltfAssets(bytes, binary, embed, fail) {
   }
   if (!model || Array.isArray(model) || model.asset?.version !== "2.0")
     fail("GLTF_VERSION", "Single-file model packing requires glTF 2.0");
-  const coreReferences = new Set();
-  let changed = false;
+  const resources = [];
   for (const field of ["buffers", "images"]) {
     if (model[field] === undefined) continue;
     if (!Array.isArray(model[field])) fail("GLTF_RESOURCE", `glTF ${field} must be an array`);
@@ -49,11 +48,28 @@ export function embedGltfAssets(bytes, binary, embed, fail) {
       if (!Object.hasOwn(item, "uri")) continue; // BIN/bufferView resources remain in place.
       if (typeof item.uri !== "string" || !item.uri)
         fail("GLTF_RESOURCE", "Invalid glTF resource URI");
-      coreReferences.add(item);
-      if (!item.uri.startsWith("data:")) {
-        item.uri = embed(item.uri);
-        changed = true;
-      }
+      resources.push(item);
+    }
+  }
+  return { model, tail, resources };
+}
+
+/** Core loader dependencies for an ordinary multi-file build. Unlike standalone
+ * embedding, discovery leaves extension/application metadata and model bytes
+ * untouched; external routes keep their normal network behavior.
+ */
+export function gltfAssetUris(bytes, binary, fail) {
+  return readGltfAssets(bytes, binary, fail).resources.map((item) => item.uri);
+}
+
+export function embedGltfAssets(bytes, binary, embed, fail) {
+  const { model, tail, resources } = readGltfAssets(bytes, binary, fail);
+  const coreReferences = new Set(resources);
+  let changed = false;
+  for (const item of resources) {
+    if (!item.uri.startsWith("data:")) {
+      item.uri = embed(item.uri);
+      changed = true;
     }
   }
   function inspect(value, depth = 0) {
