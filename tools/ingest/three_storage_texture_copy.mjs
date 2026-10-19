@@ -1,4 +1,5 @@
 /** Source-shaped, queue-ordered GPU texture copies. */
+import {createStorageTextureTransfers} from './three_storage_texture_transfer.mjs';
 import {ThreeStorageCopyError} from './three_texture_copy_plan.mjs';
 import {captureTargetToStorageCopy} from './three_target_texture_copy.mjs';
 export {ThreeStorageCopyError, inspectStorageTextureCopy} from './three_texture_copy_plan.mjs';
@@ -9,7 +10,12 @@ const fail = (code, message) => { throw new ThreeStorageCopyError(code, message)
  * An initialized source call stays void, including when preparation defers it.
  */
 export function withStorageTextureCopies(Base) {
-  const failures = new WeakMap();
+  const failures = new WeakMap(), transfers = new WeakMap();
+  const pixels = renderer => {
+    let owner = transfers.get(renderer);
+    if (!owner) { owner = createStorageTextureTransfers(renderer); transfers.set(renderer, owner); }
+    return owner;
+  };
   return class StorageCopyRenderer extends Base {
     copyTextureToTexture(source, destination, region = null, position = null, sourceLevel = 0, destinationLevel = 0) {
       if (this._disposed) fail('DISPOSED', 'Renderer is disposed');
@@ -36,9 +42,17 @@ export function withStorageTextureCopies(Base) {
       }});
       this.inspector?.copyTextureToTexture?.(source, destination);
     }
+    /** F3D extension: upload exact raw pixel bytes without a seeding kernel.
+     * Captures bytes/options now; completion includes queued GPU validation.
+     * Byte offsets are relative to the supplied view, not its backing buffer. */
+    writeStorageTexturePixelsAsync(texture, data, options = {}) {
+      return pixels(this).write(texture, data, options);
+    }
+    dispose() { transfers.get(this)?.dispose(); super.dispose(); }
     async waitForGPU() {
       await super.waitForGPU();
       if (failures.has(this)) throw failures.get(this);
+      await transfers.get(this)?.whenIdle();
     }
   };
 }
