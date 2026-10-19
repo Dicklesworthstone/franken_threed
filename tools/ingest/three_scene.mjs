@@ -180,7 +180,7 @@ export async function createGpuThreeScene(device,scene,{
   });
   const resourceFailed=()=>!!renderer?.failed||!!textureOwner?.failed||!!shadowOwner?.failed||!!pendingShadow?.failed||!!environmentOwner?.failed||!!pendingEnvironment?.failed||!!backgroundOwner?.failed||!!pendingBackground?.failed||[...geometries.values(),...programGpus(),...instances.values(),...deformations.values(),...pendingDeformations].some(g=>g.failed);
   let programTargetSize=null;
-  let entries=[],lookup=new Map(),renderer,disposed=false,terminal=null,busy=false,preparing=false,prepareVersion=0,sourceDraws=0;
+  let entries=[],lookup=new Map(),renderer,disposed=false,terminal=null,busy=false,preparing=false,prepareVersion=0,sourceDraws=0,logicalDraws=0,drawCalls=0;
   // End the owner's wait without claiming to cancel already-issued GPU work.
   // Renderer registration still retires its private resources if it resolves late.
   let rejectStopped;
@@ -1332,12 +1332,17 @@ export async function createGpuThreeScene(device,scene,{
       return failed(error);
     }finally{busy=false;preparing=false;}
   }
-  function cameraFrame(camera){
-    if(!(camera instanceof three.Camera)||(!camera.isPerspectiveCamera&&!camera.isOrthographicCamera)||camera.isArrayCamera||camera.reversedDepth)
-      fail('CAMERA','Supply one non-reversed perspective or orthographic source camera');
+  function checkCamera(camera){
+    if(!(camera instanceof three.Camera)||(!camera.isPerspectiveCamera&&!camera.isOrthographicCamera)||camera.reversedDepth)
+      fail('CAMERA','Supply a non-reversed perspective or orthographic source camera');
     if(![three.WebGLCoordinateSystem,three.WebGPUCoordinateSystem].includes(camera.coordinateSystem))fail('CAMERA','Unknown source clip convention');
-    if(root.matrixWorldAutoUpdate===true)root.updateMatrixWorld();
-    if(camera.parent===null&&camera.matrixWorldAutoUpdate===true)camera.updateMatrixWorld();
+  }
+  function cameraFrame(camera,matricesUpdated=false){
+    checkCamera(camera);
+    if(!matricesUpdated){
+      if(root.matrixWorldAutoUpdate===true)root.updateMatrixWorld();
+      if(camera.parent===null&&camera.matrixWorldAutoUpdate===true)camera.updateMatrixWorld();
+    }
     vp.multiplyMatrices(camera.projectionMatrix,camera.matrixWorldInverse);
     frustum.setFromProjectionMatrix(vp,camera.coordinateSystem,false);clip.copy(vp);
     if(camera.coordinateSystem===three.WebGLCoordinateSystem)
@@ -1345,19 +1350,57 @@ export async function createGpuThreeScene(device,scene,{
     return camera.isOrthographicCamera?{viewDirection:[camera.matrixWorld.elements[8],camera.matrixWorld.elements[9],camera.matrixWorld.elements[10]]}:
       {cameraPosition:position(camera)};
   }
+  function arrayCameraViews(camera,profile,frame){
+    if(!camera.isArrayCamera)return null;
+    // WebGL sources draw camera-major and invoke callbacks with each child.
+    // Modern WebGPU sources draw object-major and share the parent's list.
+    if(programRoute()||camera.isMultiViewCamera||!Array.isArray(camera.cameras)||camera.cameras.length>256)
+      fail('CAMERA','Only ordinary ArrayCamera views on the native WebGPU source path are admitted');
+    const pixelRatio=profile.pixelRatio??1;
+    finite(pixelRatio,'array camera pixel ratio');if(pixelRatio<=0)fail('CAMERA','Expected positive camera pixel ratio');
+    return camera.cameras.map(child=>{
+      checkCamera(child);if(child.isArrayCamera)fail('CAMERA','Nested ArrayCamera views are not admitted');
+      const projected=new three.Matrix4().multiplyMatrices(child.projectionMatrix,child.matrixWorldInverse);
+      const childFrustum=new three.Frustum().setFromProjectionMatrix(projected,child.coordinateSystem,false);
+      const viewProjection=projected.elements.slice();
+      if(child.coordinateSystem===three.WebGLCoordinateSystem&&profile.clipSpace!=='webgpu')
+        for(let c=0;c<4;c++)viewProjection[c*4+2]=0.5*(projected.elements[c*4+2]+projected.elements[c*4+3]);
+      if(viewProjection.some(n=>!Number.isFinite(Math.fround(n))))fail('CAMERA','ArrayCamera projection must fit finite f32');
+      // Source culling uses the child's convention, but the native renderer
+      // always uploads its raw matrix. A newly inserted WebGL-convention child
+      // is not reprojected while the parent's convention already matches.
+      const shadingCamera=profile.clipSpace==='webgpu'&&child.coordinateSystem!==three.WebGPUCoordinateSystem?
+        Object.assign(Object.create(child),{coordinateSystem:three.WebGPUCoordinateSystem}):child;
+      let viewport=null;
+      if(child.viewport){
+        const v=child.viewport;
+        viewport=[v.x,v.y,v.z,v.w].map(n=>Math.floor(finite(n,'array camera viewport')*pixelRatio));
+        if(viewport.some(n=>n<0))fail('CAMERA','ArrayCamera viewports must be nonnegative');
+        viewport.push(frame.viewport?.[4]??0,frame.viewport?.[5]??1);
+      }
+      return {camera:child,frustum:childFrustum,viewProjection,viewport,
+        lighting:{...(camera.isOrthographicCamera?{viewDirection:[child.matrixWorld.elements[8],child.matrixWorld.elements[9],child.matrixWorld.elements[10]]}:
+          {cameraPosition:position(child)}),viewMatrix:child.matrixWorldInverse.elements.slice()},
+        fog:fogEnabled?fogApi.threeFogDescriptor(scene.fog,shadingCamera,three):null,
+        // Pinned Background inserts a default-layer mesh after parent culling.
+        background:backgroundOwner&&(child.layers.mask&1)!==0?backgroundOwner.capture(scene,child):null};
+    });
+  }
   function render(camera,frame,options={}){
     live();if(busy)fail('REENTRANT','A source-scene operation is already running');busy=true;
     let backgroundSubmitted=false;
     try{
       if(!frame||typeof frame!=='object')fail('FRAME','Supply borrowed render attachments');
-      if(!options||typeof options!=='object'||Array.isArray(options)||Object.keys(options).some(k=>k!=='overrideMaterial'))
-        fail('OPTIONS','Expected draw options with an optional overrideMaterial');
+      if(!options||typeof options!=='object'||Array.isArray(options)||Object.keys(options).some(k=>!['overrideMaterial','matricesUpdated'].includes(k)))
+        fail('OPTIONS','Expected draw options with an optional overrideMaterial and matrix-update flag');
       passOverride=Object.hasOwn(options,'overrideMaterial')?options.overrideMaterial:scene.overrideMaterial;
       // Framebuffer size for program gl_FragCoord; not a core renderer frame key.
       programTargetSize=frame.targetSize??null;
       if(Object.hasOwn(frame,'targetSize')){const {targetSize,...rest}=frame;frame=rest;}
       programViewportSize=frame.viewportSize??null;
       if(Object.hasOwn(frame,'viewportSize')){const {viewportSize,...rest}=frame;frame=rest;}
+      const arrayProfile=frame.arrayCamera??{};
+      if(Object.hasOwn(frame,'arrayCamera')){const {arrayCamera,...rest}=frame;frame=rest;}
       for(const key of ['draws','viewProjection','lighting','fog','clippingPlanes',...(shadowEnabled?['shadow']:[]),...(environmentEnabled?['environment']:[]),...(backgroundEnabled?['background']:[])])if(Object.hasOwn(frame,key))fail('FRAME',`${key} belongs to the source scene/camera`);
       const clippingFrame=clippingState();
       frameTextures=new Set();frameSkeletons=new Set();
@@ -1377,14 +1420,19 @@ export async function createGpuThreeScene(device,scene,{
         if(sourceBackground()!==(backgroundOwner?.source??null))fail('PREPARE','Call prepare() after changing the source background');
         backgroundOwner?.check();
       }
-      const lighting=cameraFrame(camera);lighting.lights=[];
+      const lighting=cameraFrame(camera,options.matricesUpdated===true);lighting.lights=[];
+      const arrayViews=arrayCameraViews(camera,arrayProfile,frame);
+      const cullingFrustum=arrayViews?{intersectsObject:object=>arrayViews.some(view=>view.frustum.intersectsObject(object))}:frustum;
       if(programRoute()){programCamera=camera;programSupport.beginFrame?.();programSupport.setLights(programLightList(camera));programSupport.setLightsView(camera);}
       // View rotation for view-space shading models (MeshNormalMaterial).
       lighting.viewMatrix=camera.matrixWorldInverse.elements;
       // Capture against this frame's updated camera before texture, geometry,
       // deformation, shadow or background queue effects. Type/removal is live.
-      const fogFrame=fogEnabled?fogApi.threeFogDescriptor(scene.fog,camera,three):null;
-      const backgroundFrame=backgroundOwner?.capture(scene,camera)??null;
+      // An empty ArrayCamera has no culling frustums, but upstream's draw path
+      // falls back to the parent camera for objects with frustumCulled=false.
+      const singleCamera=arrayViews?.length===0?Object.assign(Object.create(camera),{isArrayCamera:false}):camera;
+      const fogFrame=fogEnabled&&!arrayViews?.length?fogApi.threeFogDescriptor(scene.fog,singleCamera,three):null;
+      const backgroundFrame=!arrayViews?.length?backgroundOwner?.capture(scene,singleCamera)??null:null;
       const lightSources=[],casterObjects=[],casterItems=[],shadowDraws=[];
       const opaque=[],transmissive=[],transparent=[],stack=[{object:root,groupOrder:0}],descriptions=new Map();
       const get=(m,topology,object=null)=>{
@@ -1451,7 +1499,7 @@ export async function createGpuThreeScene(device,scene,{
             // A caster outside the viewing frustum can still shadow a receiver.
             // Preserve source visibility/layers/LOD, but use the light frustum.
             if(shadowOwner&&object.isMesh&&object.castShadow)casterObjects.push(object);
-            if(!object.frustumCulled||object.intersectsFrustum(frustum)){
+            if(!object.frustumCulled||object.intersectsFrustum(cullingFrustum)){
             const g=object.geometry;
             let z=0;
             if(sortObjects){
@@ -1472,7 +1520,7 @@ export async function createGpuThreeScene(device,scene,{
         if(!object.frustumCulled||shadowFrame.frustum===null||object.intersectsFrustum(shadowFrame.frustum))append(object,0,0,true);
       if(sortObjects){
         const order=(a,b)=>a.groupOrder-b.groupOrder||a.object.renderOrder-b.object.renderOrder;
-        opaque.sort((a,b)=>order(a,b)||a.listMaterial.id-b.listMaterial.id||a.z-b.z||a.object.id-b.object.id);
+        opaque.sort((a,b)=>order(a,b)||(arrayViews?0:a.listMaterial.id-b.listMaterial.id)||a.z-b.z||a.object.id-b.object.id);
         transparent.sort((a,b)=>order(a,b)||b.z-a.z||a.object.id-b.object.id);
         transmissive.sort((a,b)=>order(a,b)||b.z-a.z||a.object.id-b.object.id);
       }
@@ -1484,8 +1532,9 @@ export async function createGpuThreeScene(device,scene,{
         if(bindings.some(e=>!e))fail('PREPARE','Call prepare() after changing the source background');
         opaque.unshift({object:bg,geometry:bg.geometry,material:bg.material,listMaterial:bg.material,group:null,groupOrder:0,z:0,desc,bindings,shadowPass:false,program:true});
       }
-      const items=[...opaque,...transmissive,...transparent],draws=[];
-      if(items.reduce((n,item)=>n+item.bindings.length,0)>(renderOptions.maxDraws??1024))fail('LIMIT','Expanded source draws exceed capacity');
+      const items=[...opaque,...transmissive,...transparent],draws=[],drawObjects=[];
+      if(items.reduce((n,item)=>n+item.bindings.length*(arrayViews?.length?arrayViews.filter(v=>item.object.layers.test(v.camera.layers)).length:1),0)>(renderOptions.maxDraws??1024))
+        fail('LIMIT','Expanded source draws exceed capacity');
       // Complete texture/material preflight first, then publish requested bytes
       // before this frame's immediate draw submission. Stable views keep bundles
       // valid; changing a sampler/storage description requires prepare().
@@ -1606,8 +1655,12 @@ export async function createGpuThreeScene(device,scene,{
           count=Math.max(0,Math.min(start+length,rangeStart+rangeCount,extent)-first);
         }
         const drawCamera=item.shadowPass?shadowOwner.source.shadow.camera:camera;
-        item.object.modelViewMatrix.multiplyMatrices(drawCamera.matrixWorldInverse,item.object.matrixWorld);
-        item.object.normalMatrix.getNormalMatrix(item.object.modelViewMatrix);
+        // Array-camera nodes use private arrays of model-view/normal matrices;
+        // they do not overwrite the object's public single-camera caches.
+        if(item.shadowPass||!arrayViews?.length){
+          item.object.modelViewMatrix.multiplyMatrices(drawCamera.matrixWorldInverse,item.object.matrixWorld);
+          item.object.normalMatrix.getNormalMatrix(item.object.modelViewMatrix);
+        }
         for(let i=0;i<item.bindings.length;i++){
           const values=item.desc[i].values,clipped=item.desc[i].clipped,common={worldMatrix:item.object.matrixWorld.elements,first,count};
           if(item.shadowPass)shadowDraws.push({mesh:casters.get(item.bindings[i]),...common,baseColor:values.baseColor,
@@ -1615,20 +1668,20 @@ export async function createGpuThreeScene(device,scene,{
             ...(clipped?{clippingPlanes:clipped.clipShadows?clipped.clippingPlanes:[],clipIntersection:clipped.clipIntersection}:{}),
             ...(values.uvTransform?{uvTransform:values.uvTransform}:{}),
             ...(values.alphaCutoff!==undefined?{alphaCutoff:values.alphaCutoff}:{})});
-          else draws.push({mesh:item.bindings[i].mesh,...common,...values,
+          else {drawObjects.push(item.object);draws.push({mesh:item.bindings[i].mesh,...common,...values,
             ...(clipped?{clippingPlanes:clipped.clippingPlanes,clipIntersection:clipped.clipIntersection}:{}),
             ...(fogEnabled?{receiveFog:item.desc[i].receiveFog}:{}),
             ...(shadowEnabled?{receiveShadow:item.object.receiveShadow}:{}),
-            ...(environmentEnabled?{receiveEnvironment:item.desc[i].options.shading==='metallic-roughness'}:{})});
+            ...(environmentEnabled?{receiveEnvironment:item.desc[i].options.shading==='metallic-roughness'}:{})});}
         }
       }
       // One fused core batch precedes all consuming material/group draws. No
       // source animation clock or CPU per-vertex deformation runs here.
       live();updateGpuThreeDeformations([...activeDeformations]);live();
-      // The retained renderer updates these public versions twice per double-
-      // sided transparent item. No source callback is erased or replayed here:
-      // custom callbacks were rejected before any frame work.
-      for(const item of items)if(item.bindings.length===2){
+      // The retained WebGL behavior updates public versions twice per double-
+      // sided transparent item. Native ArrayCamera rendering selects its side
+      // pipelines without incrementing those source material versions.
+      for(const item of items)if(!arrayViews&&item.bindings.length===2){
         item.material.side=three.BackSide;item.material.needsUpdate=true;
         item.material.side=three.FrontSide;item.material.needsUpdate=true;
         item.material.side=three.DoubleSide;
@@ -1649,6 +1702,36 @@ export async function createGpuThreeScene(device,scene,{
           prepared.shadow=shadowOwner.descriptor(shadowFrame,lightIndex);
         }
       }
+      if(arrayViews?.length){
+        // One attachment clear precedes every view. A pass per ordered view span
+        // keeps camera/lighting uniforms immutable until its immediate submit,
+        // including overlapping viewports and transparent double-sided draws.
+        renderer.render({...prepared,draws:[]});backgroundSubmitted=true;live();
+        const loaded={...prepared,loadOp:'load',depthLoadOp:'load',...(prepared.stencilLoadOp!==undefined?{stencilLoadOp:'load'}:{})};
+        let activeViewport=frame.viewport??null,passes=renderer.colorPassCount??1,logical=0,calls=0,backgrounds=0,geometrySubmitted=false;
+        for(const view of arrayViews)if(view.background){
+          activeViewport=view.viewport??activeViewport;
+          if(activeViewport&&(activeViewport[2]===0||activeViewport[3]===0))continue;
+          backgroundOwner.render(view.background,{colorView:prepared.colorView,loadOp:'load',viewport:activeViewport,
+            scissor:frame.scissor??null,screenSize:arrayProfile.targetSize??null});
+          backgrounds++;live();
+        }
+        for(let i=0;i<draws.length;i++)for(const view of arrayViews){
+          if(!drawObjects[i].layers.test(view.camera.layers))continue;
+          activeViewport=view.viewport??activeViewport;
+          if(activeViewport&&(activeViewport[2]===0||activeViewport[3]===0))continue;
+          renderer.render({...loaded,viewport:activeViewport,viewProjection:view.viewProjection,
+            lighting:{...view.lighting,lights:lighting.lights},draws:[draws[i]],...(fogEnabled?{fog:view.fog}:{})});
+          geometrySubmitted=true;logical+=renderer.drawCount;calls+=renderer.drawCallCount;passes+=renderer.colorPassCount??1;live();
+        }
+        // The initial clear resolves before the background writes. If no view
+        // submits geometry afterwards, publish the final multisample image now.
+        if(backgrounds&&!geometrySubmitted&&prepared.resolveTarget){
+          renderer.render({...loaded,draws:[]});passes+=renderer.colorPassCount??1;live();
+        }
+        logicalDraws=logical;drawCalls=calls;sourceDraws=items.reduce((n,item)=>n+arrayViews.filter(v=>item.object.layers.test(v.camera.layers)).length,0);
+        backgroundPasses=backgrounds;backgroundColorPasses=passes+backgrounds;
+      }else{
       if(backgroundFrame){
         if(sourceBackground()!==backgroundOwner.source)fail('PREPARE','Source background changed during frame preparation');
         backgroundOwner.render(backgroundFrame,{colorView:prepared.colorView,loadOp:prepared.loadOp,clearColor:prepared.clearColor});
@@ -1658,8 +1741,10 @@ export async function createGpuThreeScene(device,scene,{
         prepared.loadOp='load';
       }
       renderer.render(prepared);live();sourceDraws=items.length;
+      logicalDraws=renderer.drawCount;drawCalls=renderer.drawCallCount;
       backgroundPasses=backgroundFrame?1:0;
       if(backgroundEnabled)backgroundColorPasses=(renderer.colorPassCount??1)+backgroundPasses;
+      }
       shadowStats=shadowFrame?Object.freeze({lightIndex,casters:shadowDraws.length,
         mapVersion:shadowOwner.version,updated:shadowFrame.update}):null;
       return bridge;
@@ -1672,8 +1757,8 @@ export async function createGpuThreeScene(device,scene,{
   }
   const bridge=Object.freeze({scene:root,prepare,render,
     get disposed(){return disposed;},get failed(){return terminal!==null||resourceFailed();},
-    get diagnostics(){return Object.freeze({prepareVersion,sourceDraws,logicalDraws:renderer?.drawCount??0,
-      drawCalls:renderer?.drawCallCount??0,geometryCount:geometries.size,geometryBytes:geometryBytes(),
+    get diagnostics(){return Object.freeze({prepareVersion,sourceDraws,logicalDraws,
+      drawCalls,geometryCount:geometries.size,geometryBytes:geometryBytes(),
       instanceMeshCount:instances.size,instanceBytes:instanceBytes(),
       deformedMeshCount:deformations.size,deformationBytes:deformationBytes(),
       materialBindings:entries.filter(e=>!e.mesh.disposed).length,rendererBytes:renderer?.allocatedBytes??0,

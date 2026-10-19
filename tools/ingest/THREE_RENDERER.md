@@ -37,18 +37,34 @@ polygon offset; ambient/hemisphere/directional/point/spot lights (up to 8); fog;
 one directional/spot shadow; HDR environment/background panoramas; clipping
 planes; textures with transforms.
 
+Ordinary `ArrayCamera` rendering is admitted on this native WebGPU route, with
+at most 256 non-reversed perspective or orthographic child cameras. The parent
+selects layers and sorting order from the union of child frustums; each object
+then draws through its layer-compatible children in source order. Child
+viewports use top-left coordinates, logical canvas units scaled by DPR, and
+physical pixels on render targets. Color/depth/stencil clear once per render.
+Texture backgrounds respect child viewports and layers; 2D background UVs span
+the full target. Directional backgrounds retain their perspective-camera limit.
+
+Each `render()`/`renderAsync()` captures the array's child identities, matrices,
+layers and viewports at call time, so deferred preparation cannot replace an
+earlier request's views with later camera edits. Public matrix and projection
+updates follow the pinned native renderer. This does not admit nested arrays,
+multiview/XR cameras, or ArrayCamera on the WebGL-authored route. Custom native
+scene/object/material render hooks retain their existing explicit rejection.
+
 ## Explicit differences
 
 - Structural edits (new objects/materials, material structure, enabling fog,
   environment, background or shadows) need asynchronous preparation. `render()`
   then presents nothing (the canvas keeps its last image) and the pending
-  requests are submitted in order when preparation completes. Callbacks are
-  never skipped. Counted in `info.f3d.deferredRenders`; call
+  requests are submitted in order when preparation completes. Counted in
+  `info.f3d.deferredRenders`; call
   `compileAsync(scene, camera)` to prepare ahead of the first frame.
 - Admission errors found during deferred preparation throw from the next
   `render()`/`compileAsync()`.
-- Not admitted (explicit `F3DRendererError`/`ThreeSceneError`): render targets,
-  XR, custom tone mapping, stencil buffers, logarithmic/reversed depth, non-sRGB
+- Not admitted (explicit `F3DRendererError`/`ThreeSceneError`):
+  XR, custom tone mapping, logarithmic/reversed depth, non-sRGB
   output, node materials, MeshPhysical/Normal/Matcap/Depth materials, sprites,
   transparent clears with tone mapping.
 - Upstream passes non-one factors with Min/Max blend equations, which WebGPU
@@ -58,6 +74,9 @@ planes; textures with transforms.
 
 - `node --test tools/ingest/three_renderer.test.mjs tools/ingest/renderer_route_build.test.mjs`
   (recording device: command/queue behavior).
+- `node tools/ingest/three_array_camera.test.mjs` — pinned-source camera state,
+  object/view ordering, layers, DPR/target viewports, deferred snapshots, fog,
+  texture backgrounds and final MSAA resolve on a recording device.
 - `node tests/e2e/webgpu_renderer/parity.mjs` — pixel comparison with pinned
   upstream `WebGPURenderer` in headless Chromium on SwiftShader. In that
   SwiftShader build, MSAA resolves into a reinterpreted `-srgb` canvas view lose

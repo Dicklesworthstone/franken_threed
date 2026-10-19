@@ -3,6 +3,37 @@
 // namespace; nothing here depends on which renderer executes it.
 import { RoomEnvironment } from '../../../upstream/three.js/examples/jsm/environments/RoomEnvironment.js';
 export const scenarios = {
+  array_camera_views(THREE, renderer) {
+    return arrayCameraScene(THREE, renderer, 1);
+  },
+  array_camera_dpr(THREE, renderer) {
+    return arrayCameraScene(THREE, renderer, 2);
+  },
+  array_camera_background(THREE, renderer) {
+    const result = arrayCameraScene(THREE, renderer, 1);
+    const pixels = new Uint8Array(4 * 4 * 4);
+    for (let y = 0; y < 4; y++) for (let x = 0; x < 4; x++) {
+      const i = (y * 4 + x) * 4;
+      pixels.set([40 + x * 60, 30 + y * 60, (x + y) % 2 ? 230 : 60, 255], i);
+    }
+    const texture = new THREE.DataTexture(pixels, 4, 4);
+    texture.colorSpace = THREE.SRGBColorSpace; texture.needsUpdate = true;
+    result.scene.background = texture;
+    for (const child of result.camera.cameras) child.layers.enable(0);
+    renderer.setScissor(12, 18, 290, 184); renderer.setScissorTest(true);
+    return result;
+  },
+  array_camera_overlap(THREE, renderer) {
+    const {scene} = scenarios.transparency_and_sides(THREE);
+    const left = camera(THREE, [-0.4, 0.2, 3.2]);
+    const right = camera(THREE, [0.45, -0.1, 3.2]);
+    left.viewport = new THREE.Vector4(12, 10, 235, 210);
+    right.viewport = new THREE.Vector4(72, 26, 235, 210);
+    left.updateMatrixWorld(); right.updateMatrixWorld();
+    const array = new THREE.ArrayCamera([left, right]);
+    array.position.z = 3.2; array.updateMatrixWorld();
+    return {scene, camera: array};
+  },
   standard_lights(THREE) {
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x202830);
@@ -896,6 +927,39 @@ export const scenarios = {
     return { scene, camera: camera(THREE) };
   },
 };
+// Child frustums see objects outside the parent's view. Asymmetric top-left
+// viewports and different layers make a wrong origin, DPR, camera or clear
+// visible in the unchanged upstream/candidate pixel comparison.
+function arrayCameraScene(THREE, renderer, pixelRatio) {
+  renderer.setPixelRatio(pixelRatio);
+  renderer.setSize(320 / pixelRatio, 240 / pixelRatio, false);
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x172331);
+  const geometry = new THREE.BoxGeometry(0.8, 1.2, 0.6);
+  for (const [x, layer, color] of [[-4, 1, 0xff7733], [4, 2, 0x33aaff]]) {
+    const mesh = new THREE.Mesh(geometry, new THREE.MeshPhongMaterial({color, shininess: 35}));
+    mesh.position.set(x, 0.1, 0); mesh.rotation.set(0.25, 0.6, 0.1);
+    mesh.layers.set(layer); scene.add(mesh);
+    const marker = new THREE.Mesh(new THREE.SphereGeometry(0.25, 24, 12),
+      new THREE.MeshBasicMaterial({color: 0xffdd55}));
+    marker.position.set(x + 0.7, -0.45, 0.25); marker.layers.set(layer); scene.add(marker);
+  }
+  const light = new THREE.DirectionalLight(0xffffff, 2);
+  light.position.set(2, 3, 5); light.layers.enableAll();
+  const ambient = new THREE.AmbientLight(0xffffff, 0.5); ambient.layers.enableAll();
+  scene.add(light, ambient);
+  const left = new THREE.PerspectiveCamera(45, 150 / 180, 0.1, 30);
+  left.position.set(-3.4, 0.8, 3.4); left.lookAt(-4, 0, 0); left.layers.set(1);
+  left.viewport = new THREE.Vector4(8, 12, 150, 180).multiplyScalar(1 / pixelRatio);
+  left.updateMatrixWorld();
+  const right = new THREE.OrthographicCamera(-1.4, 1.4, 1.05, -1.05, 0.1, 30);
+  right.position.set(3.4, -0.3, 3.4); right.lookAt(4, 0, 0); right.layers.set(2);
+  right.viewport = new THREE.Vector4(170, 90, 140, 105).multiplyScalar(1 / pixelRatio);
+  right.updateMatrixWorld();
+  const array = new THREE.ArrayCamera([left, right]);
+  array.layers.enableAll(); array.position.z = 3; array.updateMatrixWorld();
+  return {scene, camera: array};
+}
 function camera(THREE, position = [0, 0, 3.2]) {
   const c = new THREE.PerspectiveCamera(50, 320 / 240, 0.1, 50);
   c.position.set(...position); c.lookAt(0, 0, 0);

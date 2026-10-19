@@ -188,12 +188,30 @@ export async function createGpuAnimationBackground(device, source, options = {})
     render(frame) {
       live(); if (busy) fail('REENTRANT', 'Background submission cannot be reentered');
       if (autoLod && frame?.mipLevel !== undefined) fail('FRAME', 'Automatic LOD does not accept an explicit mip level');
-      const packet = packAnimationBackgroundFrame(frame, mapping, levels);
-      const {colorView, resolveTarget = null, loadOp = 'clear'} = frame;
+      const {colorView, resolveTarget = null, loadOp = 'clear', viewport = null, scissor = null, screenSize = null} = frame;
       const clearValue = tuple(frame.clearColor ?? [0, 0, 0, 1], 4, 'clear color');
       if (!colorView || typeof colorView !== 'object' || !['clear', 'load'].includes(loadOp)) fail('FRAME', 'Expected a color attachment and load policy');
       if (resolveTarget !== null && (sampleCount !== 4 || !resolveTarget || typeof resolveTarget !== 'object'))
         fail('FRAME', 'Resolve requires a multisample output and a texture view');
+      if (viewport !== null) {
+        tuple(viewport, 6, 'viewport');
+        if (viewport[0] < 0 || viewport[1] < 0 || viewport[2] <= 0 || viewport[3] <= 0 ||
+            viewport[4] < 0 || viewport[5] > 1 || viewport[4] > viewport[5]) fail('FRAME', 'Invalid background viewport');
+      }
+      if (scissor !== null && (tuple(scissor, 4, 'scissor').some(n => !Number.isSafeInteger(n) || n < 0)))
+        fail('FRAME', 'Invalid background scissor');
+      let inputs = frame;
+      if (mapping === 'screen' && screenSize !== null) {
+        const [width, height] = tuple(screenSize, 2, 'screen size');
+        if (width <= 0 || height <= 0) fail('FRAME', 'Expected positive background screen dimensions');
+        // Modern source backgrounds sample screenUV.flipY(): coordinates span
+        // the whole target even when an ArrayCamera clips to a child viewport.
+        const [x, y, w, h] = viewport ?? [0, 0, width, height];
+        const [a, b, c, d, e, f] = tuple(frame.uvTransform ?? [1, 0, 0, 1, 0, 0], 6, 'UV transform');
+        const sx = w / width, sy = h / height, ox = x / width, oy = (height - y - h) / height;
+        inputs = {...frame, uvTransform: [a * sx, b * sx, c * sy, d * sy, a * ox + c * oy + e, b * ox + d * oy + f]};
+      }
+      const packet = packAnimationBackgroundFrame(inputs, mapping, levels);
       busy = true;
       try {
         const work = checked(() => {
@@ -201,6 +219,8 @@ export async function createGpuAnimationBackground(device, source, options = {})
           const encoder = device.createCommandEncoder({label});
           const pass = encoder.beginRenderPass({colorAttachments: [{view: colorView, loadOp, clearValue,
             storeOp: 'store', ...(resolveTarget ? {resolveTarget} : {})}]});
+          if (viewport) pass.setViewport(...viewport);
+          if (scissor) pass.setScissorRect(...scissor);
           pass.setPipeline(pipeline); pass.setBindGroup(0, group); pass.draw(3); pass.end();
           device.queue.submit([encoder.finish()]);
         });

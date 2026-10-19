@@ -27,6 +27,38 @@ const MATH = ['Vector2', 'Vector3', 'Vector4', 'Matrix3', 'Matrix4', 'Color', 'Q
 const TEXTURE_STATE = ['version', 'format', 'type', 'colorSpace', 'mapping', 'channel', 'wrapS', 'wrapT', 'magFilter', 'minFilter',
   'anisotropy', 'flipY', 'premultiplyAlpha', 'generateMipmaps', 'rotation', 'matrixAutoUpdate'];
 
+/** An ArrayCamera render may wait for scene preparation. Keep every view's
+ * call-time matrices, layers and viewport in a private data view; later changes
+ * to the cameras array or its children must not retarget an earlier render.
+ * The renderer performs the source matrix updates before calling this helper.
+ * No source clone/copy hook or temporary write to an application camera runs.
+ */
+export function captureThreeArrayCamera(T, camera, maxViews = 256) {
+  if (!(camera instanceof T.Camera) || camera.isArrayCamera !== true ||
+      !Array.isArray(camera.cameras) || camera.cameras.length > maxViews || camera.isMultiViewCamera)
+    fail('CAMERA', 'Expected an ordinary ArrayCamera within the view capacity');
+  const copied = new Map();
+  function capture(source, array = false) {
+    if (!(source instanceof T.Camera) || (!source.isPerspectiveCamera && !source.isOrthographicCamera) ||
+        (!array && source.isArrayCamera) || source.reversedDepth)
+      fail('CAMERA', 'ArrayCamera views require non-reversed perspective or orthographic cameras');
+    if (copied.has(source)) return copied.get(source);
+    const result = view(source); copied.set(source, result);
+    for (const key of ['id', 'uuid', 'name', 'type', 'isCamera', 'isPerspectiveCamera', 'isOrthographicCamera',
+      'isArrayCamera', 'isMultiViewCamera', 'coordinateSystem', 'near', 'far', 'zoom', 'fov', 'aspect', '_reversedDepth'])
+      if (key in source) put(result, key, source[key]);
+    for (const key of ['matrixWorld', 'matrixWorldInverse', 'projectionMatrix', 'projectionMatrixInverse'])
+      put(result, key, new T.Matrix4().copy(source[key]));
+    const layers = new T.Layers(); layers.mask = source.layers.mask; put(result, 'layers', layers);
+    if (source.viewport) put(result, 'viewport', new T.Vector4().copy(source.viewport));
+    put(result, 'parent', null); put(result, 'children', []); put(result, 'matrixWorldAutoUpdate', false);
+    return result;
+  }
+  const result = capture(camera, true);
+  put(result, 'cameras', camera.cameras.map(child => capture(child)));
+  return result;
+}
+
 export function createThreePassSnapshots(T, {maxBytes = 32 * 1024 * 1024, maxCaptureBytes = 2 * 1024 * 1024,
   maxRoots = 64, maxVertices = 6, maxValues = 65536} = {}) {
   if (![maxBytes, maxCaptureBytes, maxRoots, maxVertices, maxValues].every(positive)) fail('OPTIONS', 'Expected positive snapshot limits');

@@ -47,10 +47,12 @@ support and continues to reject non-null `scene.fog`, rather than ignore it.
 
 ## Camera and admission
 
-The existing source bridge admits one non-reversed perspective or orthographic
-camera with the supplied module's WebGL or WebGPU coordinate convention. The
-fog descriptor uses that frame's updated projection and the same private clip
-conversion as the draw path. It recovers positive view depth from homogeneous
+The source bridge admits non-reversed perspective or orthographic cameras with
+the supplied module's WebGL or WebGPU coordinate convention. Native ordinary
+ArrayCamera rendering evaluates fog separately for each of its at most 256
+admitted child views, using the same captured camera projection as that view's
+draws. The standalone fog descriptor still accepts an individual camera. Each
+descriptor follows the draw path's clip convention and recovers positive view depth from homogeneous
 vertex clip coordinates before division, not radial distance or fragment depth.
 The adapter does not rewrite source projection matrices or add camera updates.
 The standalone camera helper supports additional projection families; it does

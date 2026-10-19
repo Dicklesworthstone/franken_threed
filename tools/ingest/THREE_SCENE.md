@@ -92,10 +92,13 @@ Visibility, layers, retained frustum intersection and LOD methods select source
 objects. Opaque and transparent lists preserve the pinned source sorting keys;
 material groups intersect drawRange. `scene.overrideMaterial` applies after the
 original material selects its list and only when its `allowOverride` is true.
-Source modelViewMatrix and normalMatrix observables are updated at the draw
-boundary. Double-sided transparent materials use consecutive back/front draws,
-including the source material version transitions, unless forceSinglePass is
-true. Blended draws are never instanced together or reordered for batching.
+For single-camera rendering, source modelViewMatrix and normalMatrix observables
+are updated at the draw boundary. Double-sided transparent materials use
+consecutive back/front draws, including the retained material version
+transitions, unless forceSinglePass is true. Native ArrayCamera views use private
+matrix packets and preserve the public single-camera caches and material
+versions, matching the native source path. Blended draws are never instanced
+together or reordered for batching.
 
 The source camera's projection matrix is never rewritten. WebGL clip depth is
 converted in the private draw matrix to WebGPU's 0..1 range; source frustum and
@@ -104,6 +107,19 @@ their projection directly. Orthographic cameras supply parallel view rays.
 Scene/camera matrixWorldAutoUpdate and parent authority follow the retained
 update boundary. Color backgrounds clear the color attachment with alpha one.
 Texture backgrounds, fog, environment backgrounds and output postprocessing are not guessed.
+
+The native route also admits ordinary `ArrayCamera` with at most 256
+non-reversed perspective or orthographic children. It culls against the union
+of child frustums, filters and sorts the shared list with the parent, and draws
+each object through its layer-compatible child views in order. Native child
+viewports use top-left coordinates; clears occur once for the whole render.
+The `WebGPURenderer` facade supplies canvas DPR/target dimensions, applies the
+pinned public projection updates, and captures each request's child list,
+matrices, layers and viewports before deferred preparation. See
+[THREE_RENDERER.md](./THREE_RENDERER.md) for that facade contract. Direct bridge
+calls retain the private clip conversion described above. Nested arrays,
+multiview/XR and ArrayCamera on the WebGL-authored program route are not admitted;
+custom native render hooks keep their existing rejection.
 
 Both renderer `indirectLights` and `threeLights` profiles are enabled. Ambient,
 hemisphere, directional, point and spot lights use current world-space values;

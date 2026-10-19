@@ -33,7 +33,7 @@ import {createGpuThreeScene} from './three_scene.mjs';
 import {createThreeRenderTargets, inspectThreeRenderTarget} from './three_render_targets.mjs';
 import {readGpuTargetPixels} from './gpu_target_readback.mjs';
 import {createThreeRendererTransfers} from './three_renderer_transfers.mjs';
-import {createThreePassSnapshots} from './three_pass_snapshot.mjs';
+import {createThreePassSnapshots, captureThreeArrayCamera} from './three_pass_snapshot.mjs';
 import {threeWebGPUStencilValue} from './three_program_stencil.mjs';
 import {createThreeProgramSupport} from './three_program.mjs';
 import {createThreeProgramPMREM} from './three_program_pmrem.mjs';
@@ -118,10 +118,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
             bridges: [...entries.values()].map(e => e.bridge.diagnostics)});
         },
         entry(scene) { return entries.get(scene) ?? null; },
-        render({scene, camera, overrideMaterial}, frame) {
+        render({scene, camera, overrideMaterial, matricesUpdated}, frame) {
           const entry = entries.get(scene);
           if (!entry) fail('PREPARE', 'Scene has not been prepared');
-          entry.bridge.render(camera, frame, {overrideMaterial});
+          entry.bridge.render(camera, frame, {overrideMaterial, matricesUpdated});
           entry.lastDiagnostics = entry.bridge.diagnostics;
           return entry;
         },
@@ -597,7 +597,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._inspector.beginRender(`render:${++this._renderUid}:f${this.info.frame}`, scene, camera, this._renderTarget);
       try { return this._renderFrame(scene, camera); } finally { this._inspector.finishRender(); }
     }
-    _makeRequest(scene, camera, clearOnly = null) {
+    _makeRequest(scene, camera, clearOnly = null, captureCameras = true) {
       const target = this._renderTarget;
       const destination = target ? this._targets.capture(target) : this;
       const frame = this._frame(scene, clearOnly, target), key = sceneKey(this, scene);
@@ -608,7 +608,30 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       // Small callback-free shader passes (FullScreenQuad) are private data views;
       // general scenes and hooked roots retain their established source path.
       const snapshot = this._shaderEncodedOutput ? this._passSnapshots.capture(scene, camera) : null;
-      return {scene: snapshot?.root ?? scene, camera: snapshot?.camera ?? camera, snapshot, clearOnly, destination, frame, overrideMaterial,
+      let matricesUpdated = false;
+      if (camera?.isArrayCamera === true && captureCameras) {
+        // WebGLRenderer has camera-major drawing, physical bottom-left viewports
+        // and per-child callbacks. This slice implements the WebGPU contract.
+        if (this._shaderEncodedOutput) fail('UNSUPPORTED', 'ArrayCamera on the WebGL-authored route is not admitted');
+        if (!Array.isArray(camera.cameras) || camera.cameras.length > 256 || camera.isMultiViewCamera)
+          fail('UNSUPPORTED', 'Expected an ordinary ArrayCamera with at most 256 views');
+        if (scene.matrixWorldAutoUpdate === true) scene.updateMatrixWorld();
+        // Pinned Renderer._updateCamera changes the public projection convention
+        // for all children only when the parent convention changes.
+        if (camera.coordinateSystem !== this.coordinateSystem) {
+          camera.coordinateSystem = this.coordinateSystem;
+          for (const child of camera.cameras) child.coordinateSystem = this.coordinateSystem;
+          camera.updateProjectionMatrix();
+          for (const child of camera.cameras) child.updateProjectionMatrix();
+        }
+        if (camera.parent === null && camera.matrixWorldAutoUpdate === true) camera.updateMatrixWorld();
+        camera = captureThreeArrayCamera(THREE, camera);
+        matricesUpdated = true;
+        // Source WebGPU viewports are logical canvas units, physical target units.
+        frame.arrayCamera = {pixelRatio: target ? 1 : this._pixelRatio, clipSpace: 'webgpu',
+          targetSize: target ? [target.width, target.height] : this._bufferSize()};
+      }
+      return {scene: snapshot?.root ?? scene, camera: snapshot?.camera ?? camera, snapshot, matricesUpdated, clearOnly, destination, frame, overrideMaterial,
         linearClearColor: this.alpha ? [c.r * a, c.g * a, c.b * a, a] : [c.r, c.g, c.b, 1],
         hdr: !target && this._wantsHdr(this._toneMapping()), key,
         programFrame: {toneMapping: this.toneMapping, toneMappingExposure: this.toneMappingExposure,
@@ -632,15 +655,15 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         throw error;
       }
     }
-    _submit({scene, camera, frame, destination, programFrame, snapshot, overrideMaterial, deferred = false}) {
+    _submit({scene, camera, frame, destination, programFrame, snapshot, overrideMaterial, matricesUpdated, deferred = false}) {
       snapshot?.install();
       const previous = this._programFrame;
       // Immediate source callbacks must still be able to change live program
       // state. Only deferred calls need the queued renderer-state snapshot.
       this._programFrame = deferred ? programFrame : undefined;
       try {
-        if (destination === this) this._session.render({scene, camera, overrideMaterial}, frame);
-        else this._targets.render(destination, attachments => destination._dispatcher.render({scene, camera, overrideMaterial}, {...frame, ...attachments}));
+        if (destination === this) this._session.render({scene, camera, overrideMaterial, matricesUpdated}, frame);
+        else this._targets.render(destination, attachments => destination._dispatcher.render({scene, camera, overrideMaterial, matricesUpdated}, {...frame, ...attachments}));
       } finally { this._programFrame = previous; }
       const d = destination._dispatcher.entry(scene)?.lastDiagnostics;
       if (d) {
@@ -723,7 +746,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       if (!(compiled instanceof THREE.Object3D)) fail('SOURCE', 'Expected a source Object3D root');
       // Capture before initialization or another compile can yield. Preparation
       // and later draws address the same stable execution root.
-      const request = this._makeRequest(compiled, camera);
+      const request = this._makeRequest(compiled, camera, null, false);
       const {destination, snapshot} = request;
       try {
         await this.init();

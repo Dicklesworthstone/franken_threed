@@ -86,8 +86,10 @@ than being ignored. HDR refraction mapping, float CubeTextures, byte panoramas,
 video and PMREM/CubeUV textures remain outside this source adapter. Byte/image
 screen and cube profiles are described below.
 
-Only non-reversed perspective cameras and `backgroundBlurriness === 0` are
-supported for source HDR backgrounds. Orthographic/array cameras and blurred
+Only non-reversed perspective views and `backgroundBlurriness === 0` are
+supported for source HDR backgrounds. Ordinary native ArrayCamera rendering
+captures a background for each layer-compatible child; directional backgrounds
+require perspective children. Orthographic directional views and blurred
 backgrounds refuse explicitly; null/solid-color source backgrounds remain
 available with the scene bridge's other admitted cameras. Fog is not added.
 
@@ -129,6 +131,12 @@ work. With `matrixAutoUpdate:true`, the built-in texture `updateMatrix()` runs
 at capture, as in the retained source renderer; otherwise the authored matrix
 is used. Custom matrix/update hooks are rejected. `backgroundBlurriness` must
 remain zero for both screen and directional backgrounds.
+
+Ordinary native ArrayCamera screen backgrounds support perspective and
+orthographic children under the [renderer camera contract](./THREE_RENDERER.md).
+Each layer-0-compatible child draws through its viewport; the screen texture's
+UVs span the full canvas or render target. One attachment clear precedes the
+views, and a background-only multisample render resolves after its final view.
 
 CubeTextures use `CubeReflectionMapping` or `CubeRefractionMapping` as direction
 lookups, not material refraction. Their camera contract remains non-reversed
