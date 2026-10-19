@@ -190,6 +190,26 @@ mapping currently requires equal X/Y scale. Toon gradient maps use lighting
 angle, not geometry UVs. Unsupported combinations remain errors, not ignored
 fields or proof of full material coverage.
 
+### Native physical clearcoat
+
+`MeshPhysicalMaterial` and its null-node-slot `MeshPhysicalNodeMaterial`
+counterpart support native clearcoat on triangle surfaces. `clearcoat` and
+`clearcoatRoughness` accept factors in [0,1]. `clearcoatMap`,
+`clearcoatRoughnessMap` and `clearcoatNormalMap` use independent textures and,
+with `textureTransforms:true`, independent UV channels and live matrices. The
+normal map has its own geometry normal and `clearcoatNormalScale` XY values.
+The native pinned `MaterialNode` reads **red** for coating roughness; the
+separate low-level glTF coating profile keeps its green-channel convention.
+
+The native lobe uses the source dielectric GGX term, view-space geometry
+roughness and exponential Schlick layering. Ambient diffuse illuminates the
+base layer; self-emission is added after coating. Environment lighting retains
+the existing [environment profile](./THREE_SCENE_ENVIRONMENT.md). Live scalar
+and transform changes update existing material storage; zero/nonzero coating
+transitions, map replacement and channel changes require `prepare()` (handled
+by the renderer facade). Sheen, transmission, iridescence, anisotropy, dispersion,
+retroreflection and non-default IOR/specular settings remain explicit gaps.
+
 ## Native source instances
 
 Ordinary `THREE.InstancedMesh` objects now use their source `instanceMatrix` and

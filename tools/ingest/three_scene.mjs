@@ -46,6 +46,8 @@ const rgb=color=>[color.r,color.g,color.b];
 const position=object=>{const e=object.matrixWorld.elements;return [e[12],e[13],e[14]];};
 const MAPS=[['map','baseColorTexture'],['normalMap','normalTexture'],['emissiveMap','emissiveTexture'],
   ['aoMap','occlusionTexture'],['specularMap','specularTexture'],['gradientMap','gradientTexture'],['alphaMap','alphaTexture']];
+const COAT_MAPS=[['clearcoatMap','clearcoatTexture'],['clearcoatRoughnessMap','clearcoatRoughnessTexture'],
+  ['clearcoatNormalMap','clearcoatNormalTexture']];
 // Only opacity-bearing maps belong in depth materials. Never forward unrelated
 // color-map channel/transform keys into a masked shadow binding.
 const opacityFields=values=>Object.fromEntries(['baseColorTexture','alphaTexture']
@@ -812,16 +814,18 @@ export async function createGpuThreeScene(device,scene,{
       // alias of ior, which is read directly); no other accessor is admitted.
       if(!Object.hasOwn(descriptor,'value')&&!(key==='reflectivity'&&m.isMeshPhysicalMaterial))
         fail('HOOK','Accessor-backed material fields are not admitted');
+    const nativePhysical=m.isMeshPhysicalMaterial&&!programRoute();
     if(m.isMeshPhysicalMaterial){
       // With every physical extension neutral, r186 shades Physical exactly as
       // Standard: f0 = ((ior-1)/(ior+1))^2 * specularColor * specularIntensity = 0.04
-      // and F90 = 1. Any active extension needs its own lobe and fails explicitly.
-      const extension=['clearcoat','sheen','transmission','iridescence','anisotropy','dispersion'].find(k=>m[k]!==0)??
+      // and F90 = 1. Native clearcoat adds the pinned dielectric lobe; every
+      // other active physical extension still requires its own implementation.
+      const extension=[...(nativePhysical?[]:['clearcoat']),'sheen','transmission','iridescence','anisotropy','dispersion'].find(k=>m[k]!==0)??
         ((m._retroreflectivity??0)!==0?'retroreflectivity':null);
       if(extension)fail('MATERIAL',`MeshPhysicalMaterial ${extension} is not admitted yet`);
       if(m.ior!==1.5||m.specularIntensity!==1||m.specularColor.r!==1||m.specularColor.g!==1||m.specularColor.b!==1)
         fail('MATERIAL','MeshPhysicalMaterial non-default ior/specular is not admitted yet');
-      const map=['clearcoatMap','clearcoatRoughnessMap','clearcoatNormalMap','sheenColorMap','sheenRoughnessMap','transmissionMap',
+      const map=[...(nativePhysical?[]:COAT_MAPS.map(([key])=>key)),'sheenColorMap','sheenRoughnessMap','transmissionMap',
         'thicknessMap','iridescenceMap','iridescenceThicknessMap','anisotropyMap','specularIntensityMap','specularColorMap'].find(k=>m[k]!=null);
       if(map)fail('MATERIAL',`MeshPhysicalMaterial ${map} is not admitted yet`);
     }
@@ -858,6 +862,19 @@ export async function createGpuThreeScene(device,scene,{
       depthTest:m.depthTest,depthWrite:m.depthWrite,depthCompare:DEPTH[m.depthFunc],colorWrite:m.colorWrite};
     Object.assign(options,raster.options);
     const values={baseColor:m.color?rgba(m.color,m.opacity):[1,1,1,m.opacity],...raster.values};
+    let coat=null;
+    if(nativePhysical){
+      if(finite(m.clearcoat,'clearcoat')<0||m.clearcoat>1)fail('VALUE','Clearcoat must be in [0,1]');
+      if(m.clearcoat>0){
+        if(topology!=='triangles')fail('MATERIAL','Native clearcoat requires triangle surfaces');
+        coat={clearcoatFactor:m.clearcoat,clearcoatRoughnessFactor:finite(m.clearcoatRoughness,'clearcoat roughness'),
+          ...(m.clearcoatNormalMap?{clearcoatNormalScale:[m.clearcoatNormalScale.x,m.clearcoatNormalScale.y]}:{})};
+        if(coat.clearcoatRoughnessFactor<0||coat.clearcoatRoughnessFactor>1||
+          Object.values(coat).flat().some(v=>!Number.isFinite(Math.fround(finite(v,'clearcoat parameter')))))
+          fail('VALUE','Clearcoat parameters must fit finite f32 and roughness must be in [0,1]');
+        options.mutableClearcoat=true;
+      }
+    }
     if(options.alphaTest)values.alphaCutoff=m.alphaTest;
     if(shading!=='unlit'&&shading!=='normal')values.emissiveFactor=rgb(m.emissive).map(v=>v*m.emissiveIntensity);
     if(shading==='phong'){values.specularColor=rgb(m.specular);values.shininess=m.shininess;}
@@ -879,6 +896,7 @@ export async function createGpuThreeScene(device,scene,{
       }
     }
     for(const [source,field] of MAPS)if(m[source])texture(m[source],field);
+    if(coat)for(const [source,field] of COAT_MAPS)if(m[source])texture(m[source],field);
     if(m.metalnessMap||m.roughnessMap){
       if(m.metalnessMap!==m.roughnessMap)fail('TEXTURE','Separate metallic and roughness maps require independent shader bindings');
       texture(m.metalnessMap,'metallicRoughnessTexture');
@@ -901,9 +919,9 @@ export async function createGpuThreeScene(device,scene,{
     const sides=m.transparent&&m.side===three.DoubleSide&&!m.forceSinglePass?['back','front']:[['front','back','double'][m.side]];
     return sides.map(side=>{
       const config={...options,side};
-      const structural=[epoch,shading,topology,side,config.vertexColors,config.flatShading,config.alphaMode,config.alphaTest,
+      const structural=[epoch,shading,topology,side,config.vertexColors,config.flatShading,config.alphaMode,config.alphaTest,!!coat,
         config.depthTest,config.depthWrite,config.depthCompare,config.colorWrite,raster.key,...(shadowEnabled?[m.shadowSide??null]:[]),...textureKey];
-      return {options:config,values,structural,clipped,...(fogEnabled?{receiveFog:m.fog}:{})};
+      return {options:config,values,structural,clipped,coat,...(fogEnabled?{receiveFog:m.fog}:{})};
     });
   }
   /** Source r186 WebGPUPipelineUtils blend/bias mapping onto native raster state. */
@@ -1176,7 +1194,7 @@ export async function createGpuThreeScene(device,scene,{
           const surface=deformation?{indices:deformation.surface.indices,texCoords:deformation.surface.texCoords,
             vertexColors:item.desc.options.vertexColors?deformation.surface.vertexColors:null,
             ...(textureTransforms?uvApi.threeDeformedMapCoordinates(item.desc.options.mapChannels,deformation.surface):{})}:{};
-          const mesh=await Promise.race([renderer.addMesh(gpu,{...item.desc.options,...item.desc.values,...surface,...(instanceGpu?{instances:instanceGpu}:{})}),stopped]);
+          const mesh=await Promise.race([renderer.addMesh(gpu,{...item.desc.options,...item.desc.values,...item.desc.coat,...surface,...(instanceGpu?{instances:instanceGpu}:{})}),stopped]);
           entry={key:item.key,geometry:item.geometry,instanceSource:item.instanceSource,instanceSignature:item.instanceSignature,
             material:item.material,structural:item.desc.structural,topology:item.desc.options.topology,signature,deformation,mesh};created.push(entry);live();
         }
@@ -1663,6 +1681,7 @@ export async function createGpuThreeScene(device,scene,{
         }
         for(let i=0;i<item.bindings.length;i++){
           const values=item.desc[i].values,clipped=item.desc[i].clipped,common={worldMatrix:item.object.matrixWorld.elements,first,count};
+          if(!item.shadowPass&&item.desc[i].coat)item.bindings[i].mesh.setClearcoat(item.desc[i].coat);
           if(item.shadowPass)shadowDraws.push({mesh:casters.get(item.bindings[i]),...common,baseColor:values.baseColor,
             ...(textureTransforms?{mapTransforms:opacityFields(values.mapTransforms)}:{}),
             ...(clipped?{clippingPlanes:clipped.clipShadows?clipped.clippingPlanes:[],clipIntersection:clipped.clipIntersection}:{}),

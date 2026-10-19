@@ -3,6 +3,54 @@
 // namespace; nothing here depends on which renderer executes it.
 import { RoomEnvironment } from '../../../upstream/three.js/examples/jsm/environments/RoomEnvironment.js';
 export const scenarios = {
+  physical_clearcoat_lights(THREE) {
+    const scene = new THREE.Scene(); scene.background = new THREE.Color(0x14191f);
+    const geometry = new THREE.SphereGeometry(.47, 48, 32);
+    for (let i = 0; i < 6; i++) {
+      const material = new THREE.MeshPhysicalMaterial({color: i < 3 ? 0x963f18 : 0x235e9d,
+        roughness: i < 3 ? .65 : .25, metalness: i < 3 ? 0 : .7,
+        clearcoat: [0, .5, 1][i % 3], clearcoatRoughness: i < 3 ? .15 : .5});
+      const object = new THREE.Mesh(geometry, material); object.position.set((i % 3 - 1) * 1.05, i < 3 ? .55 : -.55, 0);
+      scene.add(object);
+    }
+    const sun = new THREE.DirectionalLight(0xffedda, 2.5); sun.position.set(-1.5, 2, 3);
+    const point = new THREE.PointLight(0x87baff, 12, 0, 2); point.position.set(2, -.4, 2);
+    scene.add(sun, point, new THREE.HemisphereLight(0x667799, 0x332211, .7));
+    return {scene, camera: camera(THREE, [0, 0, 4])};
+  },
+  physical_clearcoat_maps(THREE) {
+    const scene = new THREE.Scene(); scene.background = new THREE.Color(0x101010);
+    const texture = (pixels, channel) => {
+      const result = new THREE.DataTexture(new Uint8Array(pixels), 2, 2);
+      result.channel = channel; result.wrapS = result.wrapT = THREE.RepeatWrapping; result.needsUpdate = true; return result;
+    };
+    const coat = texture([255, 0, 0, 255, 80, 255, 255, 255, 160, 0, 0, 255, 255, 255, 255, 255], 1);
+    // Native r186 reads R. Deliberately different G values catch GL/glTF channel substitution.
+    const roughness = texture([40, 230, 0, 255, 210, 30, 0, 255, 110, 250, 0, 255, 180, 50, 0, 255], 2);
+    const normal = texture([160, 110, 250, 255, 90, 165, 240, 255, 140, 175, 245, 255, 105, 95, 250, 255], 3);
+    coat.offset.set(.125, .25); coat.repeat.set(2, 1); roughness.rotation = .3; roughness.repeat.set(1, 2);
+    normal.offset.set(.2, .35); normal.repeat.set(2, 2);
+    const geometry = new THREE.SphereGeometry(.95, 64, 40);
+    for (const name of ['uv1', 'uv2', 'uv3']) geometry.setAttribute(name, geometry.attributes.uv.clone());
+    const material = new THREE.MeshPhysicalMaterial({color: 0x4b2410, roughness: .7, clearcoat: .9, clearcoatRoughness: .8,
+      clearcoatMap: coat, clearcoatRoughnessMap: roughness, clearcoatNormalMap: normal,
+      clearcoatNormalScale: new THREE.Vector2(.6, 1.1)});
+    const object = new THREE.Mesh(geometry, material); scene.add(object);
+    const sun = new THREE.DirectionalLight(0xffffff, 3); sun.position.set(-1, 2, 3);
+    const point = new THREE.PointLight(0x7799ff, 7, 0, 2); point.position.set(2, -1, 2);
+    scene.add(sun, point, new THREE.AmbientLight(0x333333, .5));
+    return {scene, camera: camera(THREE, [0, 0, 3.2])};
+  },
+  physical_clearcoat_emission(THREE) {
+    const scene = new THREE.Scene(); scene.background = new THREE.Color(0x080808);
+    const geometry = new THREE.SphereGeometry(.7, 40, 24);
+    for (let i = 0; i < 2; i++) {
+      const material = new THREE.MeshPhysicalMaterial({color: 0x000000, emissive: 0xb52a61,
+        emissiveIntensity: .8, clearcoat: i, clearcoatRoughness: .3});
+      const object = new THREE.Mesh(geometry, material); object.position.x = i ? .8 : -.8; scene.add(object);
+    }
+    return {scene, camera: camera(THREE, [0, 0, 3.4])};
+  },
   array_camera_views(THREE, renderer) {
     return arrayCameraScene(THREE, renderer, 1);
   },

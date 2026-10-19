@@ -87,6 +87,10 @@
  * The coating uses Schlick Fresnel at NdotV, IOR 1.5, the existing GGX lobe/
  * roughness floor, and attenuates the entire base including emission, not alpha.
  * Its default normal is the geometry normal, NOT the base normal map.
+ * threeLights:true selects the pinned native Three clearcoat lobe instead:
+ * roughness uses R and view-space geometry derivatives; dielectric GGX adds
+ * separately to the attenuated base lighting, with emission added afterwards.
+ * Environment radiance retains the existing explicit environment profile.
  * These material profiles do not establish complete Three.js/PBR equivalence.
  * Phong uses the pinned r186 normalized Blinn-Phong lobe and exponential Schlick
  * approximation, not the metallic-roughness BRDF. specularColor (linear RGB;
@@ -389,6 +393,7 @@ function surfaceShader(
   const textured = mapMask !== 0 || coated,
     normalMapped = (mapMask & 4) !== 0,
     coatNormalMapped = (mapMask & 128) !== 0;
+  const sourceCoat = threeLights && coated;
   const tangentAttribute = (normalMapped || coatNormalMapped) && !derivative;
   // Flat shading derives normals from world-position derivatives; geometry
   // without a normal stream (e.g. GLTFLoader flatShading meshes) binds none.
@@ -424,7 +429,7 @@ fn unit_vector(v: vec3<f32>) -> vec3<f32> {
   let scaled = v / scale;
   return scaled * inverseSqrt(dot(scaled, scaled));
 }
-fn illuminate(base: vec3<f32>, position: vec3<f32>, normal: vec3<f32>, metallic: f32, roughness: f32, emission: vec3<f32>${ambientOcclusion ? ", occlusion: f32" : ""}${phong ? ", specular_strength: f32" : ""}) -> vec3<f32> {
+fn illuminate(base: vec3<f32>, position: vec3<f32>, normal: vec3<f32>, metallic: f32, roughness: f32, emission: vec3<f32>${ambientOcclusion ? ", occlusion: f32" : ""}${phong ? ", specular_strength: f32" : ""}${sourceCoat ? ", specular_lobe: bool, shadow_normal: vec3<f32>" : ""}) -> vec3<f32> {
   var view = unit_vector(lighting.camera.xyz - position);
   if (lighting.camera.w > 0.0) { view = lighting.camera.xyz; }
   let nv = max(dot(normal, view), 0.0);${threeLights ? `
@@ -437,6 +442,7 @@ fn illuminate(base: vec3<f32>, position: vec3<f32>, normal: vec3<f32>, metallic:
     // implicit-sample toon work
     // inside the uniform direct-light arm, never behind a per-fragment exit.
     if (light.radiance.w >= 3.0) {
+      ${sourceCoat ? "// The native clearcoat layer receives specular environment radiance, never ambient diffuse.\n      if (specular_lobe) { continue; }\n      " : ""}
       var irradiance = light.radiance.rgb;
       if (light.radiance.w == 4.0) {
         let weight = dot(normal, light.vector.xyz) * 0.5 + 0.5;
@@ -514,8 +520,13 @@ fn illuminate(base: vec3<f32>, position: vec3<f32>, normal: vec3<f32>, metallic:
       let fresnel_dielectric = 0.04 * (1.0 - schlick) + schlick;
       let f0 = mix(vec3<f32>(0.04), base, metallic);
       let fresnel = f0 * (1.0 - schlick) + vec3<f32>(schlick);
+      ${sourceCoat ? `if (specular_lobe) {
+        // r186 clearcoat BRDF_GGX: F0=0.04, F90=1, no base-layer diffuse
+        // or multi-scattering compensation in this separate dielectric lobe.
+        brdf = fresnel * distribution * visibility;
+      } else {` : ""}
       brdf = (1.0 - fresnel_dielectric) * (1.0 - metallic) * base / 3.141592653589793 +
-        fresnel * distribution * visibility * (f0 * (1.0 / dfg_ess - 1.0) + vec3<f32>(1.0));
+        fresnel * distribution * visibility * (f0 * (1.0 / dfg_ess - 1.0) + vec3<f32>(1.0));${sourceCoat ? "\n      }" : ""}
     }` : `if (draw_info.options.z == 2.0) {
       if (nv <= 0.0) { continue; }
       let half_vector = unit_vector(incoming + view);
@@ -536,7 +547,7 @@ fn illuminate(base: vec3<f32>, position: vec3<f32>, normal: vec3<f32>, metallic:
     ${
       shadowed
         ? `var visibility = 1.0;
-    if (i == u32(shadow_info.options.x)) { visibility = projected_shadow(position, normal); }`
+    if (i == u32(shadow_info.options.x)) { visibility = projected_shadow(position, ${sourceCoat ? "shadow_normal" : "normal"}); }`
         : ""
     }
     result += light.radiance.rgb * brdf * (nl * attenuation) ${shadowed ? "* visibility" : ""};${indirectLights ? "\n    }" : ""}
@@ -669,9 +680,26 @@ struct VertexOutput {
     rgb = select(pow(packed * 0.9478672986 + vec3<f32>(0.0521327014), vec3<f32>(2.4)), packed * 0.0773993808, packed <= vec3<f32>(0.04045));
   } else {
     rgb = illuminate(rgba.rgb, input.world, normal, metallic, roughness, emission${ambientOcclusion ? ", occlusion" : ""});
-  }` : `${coated ? "var" : "let"} rgb = illuminate(rgba.rgb, input.world, normal, metallic, roughness, emission${ambientOcclusion ? ", occlusion" : ""}${phong ? mapMask & 2 ? ", specular_texel.r" : ", 1.0" : ""});`}${
+  }` : `${coated ? "var" : "let"} rgb = illuminate(rgba.rgb, input.world, normal, metallic, roughness, ${sourceCoat ? "vec3<f32>(0.0)" : "emission"}${ambientOcclusion ? ", occlusion" : ""}${phong ? mapMask & 2 ? ", specular_texel.r" : ", 1.0" : ""}${sourceCoat ? ", false, normal" : ""});`}${
     coated
-      ? `
+      ? sourceCoat ? `
+  // r186 MaterialNode uses R for both coating strength and coating roughness.
+  // Its native convention differs from the generic glTF G-channel profile.
+  let coat_factor = clearcoat_info.x${mapMask & 32 ? " * clearcoat_texel.r" : ""};
+  let coat_source_roughness = clearcoat_info.y${mapMask & 64 ? " * clearcoat_roughness_texel.r" : ""};
+  ${geometryChannels?.normal === false ? "let coat_geometry_roughness = 0.0;" : `let coat_geometry_normal = vec3<f32>(dot(lighting.view_x.xyz, input_geometry_normal), dot(lighting.view_y.xyz, input_geometry_normal), dot(lighting.view_z.xyz, input_geometry_normal));
+  let coat_dxy = max(abs(dpdx(coat_geometry_normal)), abs(dpdy(coat_geometry_normal)));
+  let coat_geometry_roughness = max(max(coat_dxy.x, coat_dxy.y), coat_dxy.z);`}
+  let coat_roughness = min(max(coat_source_roughness, 0.0525) + coat_geometry_roughness, 1.0);
+  var coat_view = unit_vector(lighting.camera.xyz - input.world);
+  if (lighting.camera.w > 0.0) { coat_view = lighting.camera.xyz; }
+  let coat_nv = clamp(dot(coat_normal, coat_view), 0.0, 1.0);
+  let coat_schlick = exp2((-5.55473 * coat_nv - 6.98316) * coat_nv);
+  let coat_fresnel = 0.04 * (1.0 - coat_schlick) + coat_schlick;
+  let coat_light = illuminate(vec3<f32>(0.04), input.world, coat_normal, 1.0, coat_roughness, vec3<f32>(0.0)${ambientOcclusion ? ", occlusion" : ""}, true, normal);
+  // PhysicalLightingModel.finish layers reflected light; NodeMaterial adds
+  // emission afterwards. A coating must not dim a self-emitting surface.
+  rgb = rgb * (1.0 - coat_factor * coat_fresnel) + coat_light * coat_factor + emission;` : `
   let coat_factor = clearcoat_info.x${mapMask & 32 ? " * clearcoat_texel.r" : ""};
   let coat_roughness = clearcoat_info.y${mapMask & 64 ? " * clearcoat_roughness_texel.g" : ""};
   var coat_view = unit_vector(lighting.camera.xyz - input.world);
