@@ -47,6 +47,27 @@ export function setup(options = {}) {
     writes.push({destination, layout, size, bytes: bytes.slice()}); events.push('write');
     options.onWrite?.(device);
   };
+  const makeBuffer = device.createBuffer;
+  device.createBuffer = descriptor => {
+    const b = makeBuffer(descriptor); b.destroyed = 0; b.mapped = false;
+    b.mapAsync = async mode => {
+      assert.equal(mode, 1); events.push('map');
+      if (options.mapping) await options.mapping.promise;
+      if (options.mapError) throw new Error(options.mapError);
+      if (b.destroyed) throw new Error('buffer destroyed while mapping');
+      b.mapped = true;
+    };
+    b.getMappedRange = (offset, size) => {
+      assert.equal(offset, 0); assert.equal(size, descriptor.size); assert.ok(b.mapped); assert.equal(b.destroyed, 0);
+      if (options.rangeError) throw new Error(options.rangeError);
+      return b.data.buffer;
+    };
+    b.destroy = () => {
+      b.destroyed++; b.mapped = false;
+      if (b.data.buffer.byteLength) structuredClone(b.data.buffer, {transfer: [b.data.buffer]});
+    };
+    return b;
+  };
   const encoder = device.createCommandEncoder, submit = device.queue.submit;
   device.createCommandEncoder = (...args) => {
     const command = encoder(...args), operations = [];
@@ -58,6 +79,18 @@ export function setup(options = {}) {
       }
       events.push('copy');
     });
+    command.copyTextureToBuffer = (source, destination, size) => {
+      assert.ok(source.texture.descriptor.usage & 1); assert.equal(destination.buffer.usage, 1 | 8);
+      assert.equal(destination.bytesPerRow % 256, 0); assert.equal(destination.rowsPerImage, size[1]);
+      operations.push(() => {
+        const level = source.texture.levels[source.mipLevel];
+        for (let z = 0; z < size[2]; z++) for (let y = 0; y < size[1]; y++) {
+          const from = rowAt(level, source.origin, z, y), to = (z * destination.rowsPerImage + y) * destination.bytesPerRow;
+          destination.buffer.data.set(level.bytes.subarray(from, from + size[0] * level.bpp), to);
+        }
+        events.push('read'); options.onRead?.(device);
+      });
+    };
     command.finish = () => ({operations}); return command;
   };
   device.queue.submit = commands => { for (const c of commands) for (const run of c.operations ?? []) run(); submit(); };

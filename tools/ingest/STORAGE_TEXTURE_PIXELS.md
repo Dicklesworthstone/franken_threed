@@ -48,9 +48,48 @@ Automatic float mip updates reuse the storage owner's existing GPU path.
 Integer base uploads with automatic mip interpolation enabled are rejected;
 disable generation or automatic updates and explicitly author integer mips.
 
-```sh
-node --test tests/unit/three_storage_pixel_upload.test.mjs
+## Read back a simulation snapshot
+
+`readStorageTexturePixelsAsync(texture, options)` is the companion F3D extension.
+It submits a native texture-to-buffer copy at that call's position in the same
+FIFO. Later compute, copies or uploads may change the texture while mapping is
+pending; the result still belongs to the earlier copy point. This explicit API
+introduces a CPU readback only when called; ordinary compute/copies stay on GPU.
+
+```js
+const before = renderer.readStorageTexturePixelsAsync(state);
+renderer.compute(updateState); // Copy already submitted or queued ahead of this.
+const after = renderer.readStorageTexturePixelsAsync(state);
+const [beforeBytes, afterBytes] = await Promise.all([before, after]);
+const beforeIDs = new Uint32Array(beforeBytes.buffer);
+const afterIDs = new Uint32Array(afterBytes.buffer);
 ```
+
+Results are independent, tightly packed `Uint8Array` bytes with the texture's
+native component representation. `x/y/z`, `width/height/depth`, `mipLevel`, and
+`flipY` select/reorient the result. Upload-only `offset`, `bytesPerRow`, and
+`rowsPerImage` options are rejected, not silently ignored. Mapped 256-byte row
+padding and image strides are removed before returning the result.
+
+Each pending read reserves its full padded native staging allocation AND packed
+CPU output against a 128 MiB aggregate budget. The 64-operation incomplete-transfer
+bound is shared with uploads. Staging is destroyed on success, failure, renderer
+cancellation or device loss, including during an unfinished map. Resize/disposal
+before copy submission invalidates the captured source generation; disposal after
+submission does not revoke the independent buffer snapshot. `waitForGPU()` also
+waits for pending pixel transfers and reports asynchronous transfer failures.
+
+```sh
+node --test tests/unit/three_storage_pixel_upload.test.mjs \
+  tests/unit/three_storage_pixel_readback.test.mjs
+```
+
+`tests/e2e/webgpu_renderer/native_storage_pixels.html` exercises upload, native
+copy, ordered readback and overwrite for all 11 formats in 2D/array/3D on a real
+WebGPU device. It exposes `window.__f3dStoragePixels` and uses minimal source
+texture objects, not the retained Three.js shader builder. Run it in a served
+checkout with WebGPU enabled. It is an execution fixture, not evidence of a pass
+unless actually run, and is not an upstream-renderer parity test.
 
 The focused tests use the real storage owner and a byte-accurate GPU transfer
 double. They verify source capture, native allocation identity, region layouts,

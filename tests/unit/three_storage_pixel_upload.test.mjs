@@ -73,7 +73,7 @@ test('integer base upload rejects implicit mip interpolation before allocation',
 
 test('invalid regions, layouts, sources and arithmetic overflow produce no GPU work', async () => {
   const s = setup(), t = texture();
-  for (const options of [{x: -1}, {width: 0}, {depth: 2}, {mipLevel: 1}, {width: 2.5}, {flipY: 1},
+  for (const options of [{x: -1}, {width: 0}, {width: null}, {height: null}, {depth: null}, {depth: 2}, {mipLevel: 1}, {width: 2.5}, {flipY: 1},
     {bytesPerRow: 8}, {bytesPerRow: 13}, {rowsPerImage: 1}, {offset: -1}, {rowsPerImage: Number.MAX_SAFE_INTEGER + 1},
     {offset: Number.MAX_SAFE_INTEGER}, {mip: 1}, null, []])
     await assert.rejects(s.renderer.writeStorageTexturePixelsAsync(t, new Uint8Array(128), options));

@@ -25,7 +25,8 @@ export function inspectStoragePixelRegion(shape, options = {}) {
   if (!natural(mipLevel) || mipLevel >= shape.mipLevelCount) fail('LEVEL', 'Pixel mip level is not allocated');
   const extent = [shape.width, shape.height, shape.depth].map((n, axis) =>
     axis === 2 && shape.viewDimension !== '3d' ? n : Math.max(1, Math.floor(n / 2 ** mipLevel)));
-  const origin = [x, y, z], size = [options.width ?? extent[0] - x, options.height ?? extent[1] - y, options.depth ?? extent[2] - z];
+  const origin = [x, y, z], size = ['width', 'height', 'depth'].map((key, axis) =>
+    options[key] === undefined ? extent[axis] - origin[axis] : options[key]);
   if (typeof flipY !== 'boolean' || !origin.every(natural) || !size.every(positive) ||
       size.some((n, i) => origin[i] > extent[i] || n > extent[i] - origin[i]))
     fail('BOUNDS', 'Pixel region must contain positive integer texels inside the selected mip');
@@ -46,10 +47,10 @@ function sourceBytes(data) {
   catch { fail('DATA', 'Pixel source buffer is detached'); }
 }
 
-export function createStorageTextureTransfers(renderer, {maxSnapshotBytes = 128 * 1024 * 1024, maxPendingTransfers = 64} = {}) {
-  if (!renderer || !positive(maxSnapshotBytes) || !positive(maxPendingTransfers)) fail('OPTIONS', 'Expected renderer and positive transfer budgets');
-  const pending = new Set(), captures = new Set();
-  let snapshotBytes = 0, terminal = null, disposed = false, watched = null;
+export function createStorageTextureTransfers(renderer, {maxSnapshotBytes = 128 * 1024 * 1024, maxReadbackBytes = 128 * 1024 * 1024, maxPendingTransfers = 64} = {}) {
+  if (!renderer || !positive(maxSnapshotBytes) || !positive(maxReadbackBytes) || !positive(maxPendingTransfers)) fail('OPTIONS', 'Expected renderer and positive transfer budgets');
+  const pending = new Set(), captures = new Set(), readbacks = new Set();
+  let snapshotBytes = 0, readbackBytes = 0, terminal = null, disposed = false, watched = null;
   let rejectStopped;
   const stopped = new Promise((_, reject) => { rejectStopped = reject; }); stopped.catch(() => {});
   const signal = renderer._targetLifetime?.signal;
@@ -57,10 +58,16 @@ export function createStorageTextureTransfers(renderer, {maxSnapshotBytes = 128 
     if (!captures.delete(request)) return;
     snapshotBytes -= request.plan.bytes; request.data = null;
   }
+  function releaseReadback(request) {
+    if (!readbacks.delete(request)) return;
+    readbackBytes -= request.charged;
+    request.buffer?.destroy(); request.buffer = null;
+  }
   function stop(error) {
     if (terminal) return;
     terminal = error instanceof Error ? error : new ThreeStorageTransferError('ABORTED', String(error ?? 'Transfers stopped'));
     for (const request of captures) release(request);
+    for (const request of readbacks) releaseReadback(request);
     rejectStopped(terminal); signal?.removeEventListener('abort', abort);
   }
   const abort = () => stop(signal.reason);
@@ -122,8 +129,59 @@ export function createStorageTextureTransfers(renderer, {maxSnapshotBytes = 128 
       return track(result).finally(() => release(request));
     } catch (error) { if (request) release(request); return Promise.reject(error); }
   }
-  return {write,
-    get diagnostics() { return {snapshotBytes, pendingTransfers: pending.size}; },
+  function read(texture, options = {}) {
+    let request;
+    try {
+      const device = live(), owner = renderer._storageTextures;
+      if (pending.size >= maxPendingTransfers) fail('BUDGET', 'Too many storage transfers are awaiting completion');
+      const entry = owner.capture(texture), plan = inspectStoragePixelRegion(entry.shape, options);
+      // Public reads always return packed rows; upload-only layout knobs would
+      // otherwise be silently ignored and make callers misinterpret the bytes.
+      for (const key of ['offset', 'bytesPerRow', 'rowsPerImage'])
+        if (options[key] !== undefined) fail('OPTIONS', 'Readback returns packed bytes; upload layout options do not apply');
+      const [, height, depth] = plan.size, pitch = Math.ceil(plan.rowBytes / 256) * 256;
+      const size = (depth * height - 1) * pitch + plan.rowBytes;
+      // Reserve BOTH the mapped native buffer and the packed result before
+      // admitting a queued request. Large skinny images can have large padding.
+      const charged = size + plan.bytes;
+      if (!positive(size) || !positive(charged) || size > (device.limits.maxBufferSize ?? 256 * 1024 * 1024))
+        fail('LIMIT', 'Storage readback exceeds the device buffer limit');
+      if (charged > maxReadbackBytes - readbackBytes) fail('BUDGET', 'Pending storage readbacks exceed maxReadbackBytes');
+      request = {entry, plan, charged, buffer: null}; readbacks.add(request); readbackBytes += charged;
+      const result = schedule(() => {
+        live(); owner.assertCurrent(entry);
+        let mapping;
+        // The shared owner's read borrow applies preceding dirty mip work and
+        // accounts for native copy validation without requiring a sampler.
+        owner.withTexture(entry, native => {
+          request.buffer = device.createBuffer({label: 'f3d-storage-pixel-readback', size, usage: 1 | 8});
+          const encoder = device.createCommandEncoder({label: 'f3d-storage-pixel-readback'});
+          encoder.copyTextureToBuffer({texture: native, mipLevel: plan.mipLevel, origin: plan.origin},
+            {buffer: request.buffer, bytesPerRow: pitch, rowsPerImage: height}, plan.size);
+          device.queue.submit([encoder.finish()]);
+          // Submit and start mapping NOW, before returning to the renderer FIFO.
+          // A later compute/upload may alter the texture while this buffer maps.
+          mapping = request.buffer.mapAsync(1);
+          // A disposal/reentry hook may make the owner's post-submit check
+          // throw before Promise.all below installs its mapping handler.
+          mapping.catch(() => {});
+        });
+        return Promise.all([mapping, owner.whenIdle()]).then(() => {
+          live();
+          const mapped = new Uint8Array(request.buffer.getMappedRange(0, size));
+          const packed = new Uint8Array(plan.bytes);
+          for (let z = 0; z < depth; z++) for (let y = 0; y < height; y++) {
+            const from = (z * height + (plan.flipY ? height - 1 - y : y)) * pitch;
+            packed.set(mapped.subarray(from, from + plan.rowBytes), (z * height + y) * plan.rowBytes);
+          }
+          return packed;
+        });
+      });
+      return track(result).finally(() => releaseReadback(request));
+    } catch (error) { if (request) releaseReadback(request); return Promise.reject(error); }
+  }
+  return {write, read,
+    get diagnostics() { return {snapshotBytes, readbackBytes, pendingTransfers: pending.size}; },
     async whenIdle() { live(); await Promise.race([Promise.all([...pending]), stopped]); live(); },
     dispose() { if (!disposed) { disposed = true; stop(new ThreeStorageTransferError('DISPOSED', 'Storage pixel transfers disposed')); } },
   };

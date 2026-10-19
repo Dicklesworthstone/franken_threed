@@ -1,0 +1,76 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><title>Native storage pixel transfers</title>
+<body><pre id="result">Running...</pre><script type="module">
+import {createThreeStorageTextures} from '../../../tools/ingest/three_storage_textures.mjs';
+import {withStorageTextureCopies} from '../../../tools/ingest/three_storage_texture_copy.mjs';
+// Minimal source texture objects isolate native WebGPU transfer execution from
+// the retained TSL builder. This is not a Three.js renderer parity benchmark.
+const T = {NoColorSpace: '', LinearSRGBColorSpace: 'srgb-linear', UnsignedByteType: 1009,
+  HalfFloatType: 1016, FloatType: 1015, IntType: 1013, UnsignedIntType: 1014,
+  RGBAFormat: 1023, RedFormat: 1028, RGFormat: 1030};
+T.Texture = class extends EventTarget {
+  constructor(dimension, type, format) {
+    super(); Object.assign(this, {isStorageTexture: true, image: {width: 3, height: 2}, type, format,
+      colorSpace: '', generateMipmaps: false, mipmapsAutoUpdate: false, mipmaps: [], version: 0, source: {version: 0}});
+    if (dimension !== '2d') { this.image.depth = 2; this[dimension === '3d' ? 'is3DTexture' : 'isArrayTexture'] = true; }
+  }
+};
+const formats = [[T.UnsignedByteType, T.RGBAFormat, 'rgba8unorm', 4], [T.HalfFloatType, T.RGBAFormat, 'rgba16float', 8],
+  ...[T.FloatType, T.IntType, T.UnsignedIntType].flatMap(type =>
+    [[T.RedFormat, 'r', 4], [T.RGFormat, 'rg', 8], [T.RGBAFormat, 'rgba', 16]].map(([format, name, bytes]) =>
+      [type, format, name + '32' + (type === T.FloatType ? 'float' : type === T.IntType ? 'sint' : 'uint'), bytes]))];
+const equal = (a, b, label) => { if (a.length !== b.length || a.some((value, i) => value !== b[i])) throw new Error(label + ': byte mismatch'); };
+let renderer, device;
+const report = {ok: false, route: 'native-webgpu-storage-owner', cases: [], errors: []};
+try {
+  const adapter = await navigator.gpu?.requestAdapter();
+  if (!adapter) throw new Error('No WebGPU adapter');
+  device = await adapter.requestDevice();
+  device.addEventListener('uncapturederror', event => report.errors.push(event.error.message));
+  class Base {
+    constructor() {
+      this._device = device; this._initialized = true; this.isWebGPURenderer = true;
+      this._targetLifetime = new AbortController(); this.queue = []; this._drain = false;
+      this._storageTextures = createThreeStorageTextures(T, {getDevice: () => device, signal: this._targetLifetime.signal});
+    }
+    _enqueue(request) { this.queue.push(request); }
+    flush() {
+      this._drain = false;
+      for (const request of this.queue.splice(0)) {
+        try { Promise.resolve(request.issue()).then(request.resolve, request.reject); }
+        catch (error) { request.reject(error); }
+      }
+    }
+    async waitForGPU() { this.flush(); await this._storageTextures.whenIdle(); }
+    dispose() { this._disposed = true; this._targetLifetime.abort(new Error('disposed')); this._storageTextures.dispose(); }
+  }
+  const Renderer = withStorageTextureCopies(Base); renderer = new Renderer();
+  for (const dimension of ['2d', '2d-array', '3d']) for (const [type, format, name, bpp] of formats) {
+    const a = new T.Texture(dimension, type, format), b = new T.Texture(dimension, type, format);
+    const bytes = 6 * (dimension === '2d' ? 1 : 2) * bpp;
+    // Non-NaN finite float/half patterns, and values above the exact f32 integer range.
+    const seed = new Uint8Array(bytes);
+    for (let i = 0; i < seed.length; i += 4) seed.set([1, 0, 128, 63], i);
+    renderer._drain = true;
+    const write = renderer.writeStorageTexturePixelsAsync(a, seed);
+    renderer.copyTextureToTexture(a, b);
+    const first = renderer.readStorageTexturePixelsAsync(a);
+    const second = renderer.readStorageTexturePixelsAsync(b);
+    seed.fill(0);
+    const overwrite = renderer.writeStorageTexturePixelsAsync(a, seed);
+    renderer.flush();
+    const expected = new Uint8Array(bytes);
+    for (let i = 0; i < bytes; i += 4) expected.set([1, 0, 128, 63], i);
+    const [gotA, gotB] = await Promise.all([first, second]); await Promise.all([write, overwrite]);
+    equal(gotA, expected, name + '/' + dimension + '/source'); equal(gotB, expected, name + '/' + dimension + '/copy');
+    equal(await renderer.readStorageTexturePixelsAsync(a), seed, name + '/overwrite');
+    a.dispatchEvent(new Event('dispose')); b.dispatchEvent(new Event('dispose'));
+    report.cases.push({format: name, dimension, bytes});
+  }
+  await renderer.waitForGPU();
+  if (report.errors.length) throw new Error(report.errors.join('\n'));
+  report.ok = true;
+} catch (error) { report.error = String(error.stack ?? error); }
+finally { renderer?.dispose(); device?.destroy(); }
+window.__f3dStoragePixels = report;
+document.getElementById('result').textContent = JSON.stringify(report, null, 2);
+</script></body></html>

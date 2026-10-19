@@ -48,6 +48,11 @@ export function withStorageTextureCopies(Base) {
     writeStorageTexturePixelsAsync(texture, data, options = {}) {
       return pixels(this).write(texture, data, options);
     }
+    /** F3D extension: snapshot a GPU texture region into tightly packed bytes.
+     * Captures the FIFO copy point, not a later texture state at map completion. */
+    readStorageTexturePixelsAsync(texture, options = {}) {
+      return pixels(this).read(texture, options);
+    }
     dispose() { transfers.get(this)?.dispose(); super.dispose(); }
     async waitForGPU() {
       await super.waitForGPU();
