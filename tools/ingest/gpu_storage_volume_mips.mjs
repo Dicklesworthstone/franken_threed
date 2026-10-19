@@ -10,10 +10,10 @@ export function storageVolumeMipShader(format) {
 @group(0) @binding(1) var destination: texture_storage_3d<${format}, write>;
 @compute @workgroup_size(4, 4, 4)
 fn main(@builtin(global_invocation_id) id: vec3u) {
-  let target = textureDimensions(destination);
-  if (any(id >= target)) { return; }
+  let output_size = textureDimensions(destination);
+  if (any(id >= output_size)) { return; }
   let size = vec3i(textureDimensions(source));
-  let uv = (vec3f(id) + 0.5) / vec3f(target) * vec3f(size) - 0.5;
+  let uv = (vec3f(id) + 0.5) / vec3f(output_size) * vec3f(size) - 0.5;
   let base = vec3i(floor(uv)); let f = fract(uv); let hi = size - 1;
   let a = textureLoad(source, clamp(base, vec3i(0), hi), 0);
   let b = textureLoad(source, clamp(base + vec3i(1,0,0), vec3i(0), hi), 0);

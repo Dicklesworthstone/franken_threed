@@ -96,8 +96,8 @@ const MIPS = `
 }
 @fragment fn fs(@builtin(position) p: vec4f) -> @location(0) vec4f {
   let size = vec2i(textureDimensions(source));
-  let target = max(size / 2, vec2i(1));
-  let uv = p.xy / vec2f(target) * vec2f(size) - 0.5;
+  let output_size = max(size / 2, vec2i(1));
+  let uv = p.xy / vec2f(output_size) * vec2f(size) - 0.5;
   let base = vec2i(floor(uv)); let f = fract(uv);
   let hi = size - 1;
   let a = textureLoad(source, clamp(base, vec2i(0), hi), 0);

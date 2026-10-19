@@ -10,6 +10,7 @@ import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import { buildApplication } from "./build_application.mjs";
 import { decideRendererRoute } from "../compat/route_decider.mjs";
+import { geometryDevice } from "./fixtures/gpu_geometry_device.mjs";
 
 const upstreamBuild = path.resolve(process.env.F3D_THREE_ROOT ?? "upstream/three.js", "build");
 
@@ -59,6 +60,66 @@ test("an ordinary WebGPURenderer application is routed and keeps upstream class 
   assert.equal(emitted.THREE.REVISION, "186");
 });
 
+test("top-level native compilation and rendering complete across deferred runtime imports", async () => {
+  const a = app(`import './before.js';
+import * as THREE from 'three/webgpu';
+const host = globalThis.__f3d_top_level_host;
+export const renderer = host.renderer = new THREE.WebGPURenderer({canvas: host.canvas, device: host.device});
+const scene = new THREE.Scene();
+scene.fog = new THREE.Fog(0x112233, 1, 10);
+scene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), new THREE.MeshBasicMaterial({map: new THREE.StorageTexture(2, 2)})));
+const camera = new THREE.PerspectiveCamera(60, 1, 0.1, 10); camera.position.z = 2;
+host.order.push('compile');
+await renderer.compileAsync(scene, camera);
+await renderer.renderAsync(scene, camera);
+host.order.push('rendered');
+export const load = () => import('./lazy.js');
+`);
+  fs.writeFileSync(path.join(a.dir, "before.js"), "globalThis.__f3d_top_level_host.order.push('before');\n");
+  fs.writeFileSync(path.join(a.dir, "lazy.js"), "globalThis.__f3d_top_level_host.order.push('lazy'); export const value = 42;\n");
+  const result = await buildApplication(a.entry, a.out, {routeWebGPURenderer: true});
+  const runtime = result.chunks.find(chunk => chunk.fileName.startsWith("f3d-renderer-runtime-"));
+  assert.ok(runtime, "renderer runtime is separate from the application entry");
+  assert.ok(!runtime.modules.includes(pathToFileURL(path.join(a.dir, "main.js")).href));
+  assert.ok(result.chunks.some(chunk => chunk.isDynamicEntry && chunk.modules.some(id => id.endsWith("/three_scene_uv.mjs"))));
+
+  // Only the native GPU boundary is recorded. The emitted application's TLA,
+  // route facade, scene preparation and deferred modules execute unchanged.
+  const device = geometryDevice();
+  Object.assign(device.limits, {maxTextureDimension2D: 8192, maxBindingsPerBindGroup: 1000});
+  device.features = new Set();
+  device.createSampler = descriptor => descriptor;
+  device.createTexture = descriptor => {
+    const size = descriptor.size;
+    const texture = {...descriptor, dimension: "2d", depthOrArrayLayers: 1, sampleCount: 1,
+      width: size.width ?? size[0], height: size.height ?? size[1], destroy() {},
+      createView(options = {}) {return {texture, ...options};}};
+    return texture;
+  };
+  let configuration;
+  const canvas = {width: 16, height: 16, style: {}, getContext: () => ({
+    configure(value) {configuration = value;}, unconfigure() {},
+    getCurrentTexture: () => device.createTexture({size: [16, 16, 1], format: configuration.format, usage: 16}),
+  })};
+  const host = globalThis.__f3d_top_level_host = {device, canvas, order: []};
+  let timer;
+  try {
+    const emitted = await Promise.race([
+      import(pathToFileURL(path.join(a.out, "main.js")).href),
+      new Promise((_, reject) => {timer = setTimeout(() => reject(new Error("Top-level renderer preparation deadlocked")), 5000);}),
+    ]);
+    assert.equal(emitted.renderer.isF3DRenderer, true);
+    assert.equal(emitted.renderer.info.render.drawCalls, 1);
+    assert.deepEqual(host.order, ["before", "compile", "rendered"], "application effects keep their evaluation order");
+    assert.equal((await emitted.load()).value, 42);
+    assert.deepEqual(host.order, ["before", "compile", "rendered", "lazy"], "application dynamic imports remain deferred");
+  } finally {
+    clearTimeout(timer);
+    host.renderer?.dispose();
+    delete globalThis.__f3d_top_level_host;
+  }
+});
+
 test("default builds are unchanged and exact-backend applications are never substituted", async () => {
   const plain = app(PROGRAM);
   const unrouted = await buildApplication(plain.entry, plain.out);
@@ -90,7 +151,7 @@ test("the unmodified H1 example (runtime forceWebGL choice) routes to the new ba
   assert.equal(result.rendererRoute.routed, true);
   assert.ok(result.rendererRoute.decisions[0].reasons.includes("unresolved-force-webgl"));
   // A truthy runtime forceWebGL constructs the unchanged upstream renderer.
-  const code = fs.readFileSync(path.join(out, "out", "inline_0.js"), "utf8");
+  const code = result.chunks.map(chunk => fs.readFileSync(path.join(out, "out", chunk.fileName), "utf8")).join("\n");
   assert.ok(code.includes("exactBackend"));
 });
 

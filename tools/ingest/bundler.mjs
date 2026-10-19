@@ -688,6 +688,15 @@ export async function bundleWithRollup(entryPath, options = {}) {
 
     const { output } = await bundle.generate({
       format: "es",
+      // An application may await compileAsync/renderAsync at module scope. The
+      // renderer then imports optional UV/fog/background modules, which share
+      // helpers with its static runtime. Keep that runtime (and its static
+      // dependencies) outside the still-evaluating application entry; otherwise
+      // Rollup's shared exports introduce a dynamic-import/TLA deadlock.
+      ...(routePlugin ? {
+        manualChunks: (id) => id.startsWith(ROUTED_RENDERER_PREFIX)
+          ? "f3d-renderer-runtime" : undefined,
+      } : {}),
       entryFileNames: (chunk) =>
         options.retainedModuleUrls?.has(chunk.facadeModuleId)
           ? "f3d-entry-[name]-[hash].js"

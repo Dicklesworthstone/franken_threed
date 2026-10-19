@@ -10,10 +10,10 @@ export function storageArrayMipShader(format) {
 @group(0) @binding(1) var destination: texture_storage_2d_array<${format}, write>;
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) id: vec3u) {
-  let target = textureDimensions(destination);
-  if (any(id.xy >= target) || id.z >= textureNumLayers(destination)) { return; }
+  let output_size = textureDimensions(destination);
+  if (any(id.xy >= output_size) || id.z >= textureNumLayers(destination)) { return; }
   let size = vec2i(textureDimensions(source));
-  let uv = (vec2f(id.xy) + 0.5) / vec2f(target) * vec2f(size) - 0.5;
+  let uv = (vec2f(id.xy) + 0.5) / vec2f(output_size) * vec2f(size) - 0.5;
   let base = vec2i(floor(uv)); let f = fract(uv); let hi = size - 1;
   let layer = i32(id.z);
   let a = textureLoad(source, clamp(base, vec2i(0), hi), layer, 0);
