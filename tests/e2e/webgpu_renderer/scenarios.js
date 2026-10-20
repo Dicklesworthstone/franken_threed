@@ -3,6 +3,67 @@
 // namespace; nothing here depends on which renderer executes it.
 import { RoomEnvironment } from '../../../upstream/three.js/examples/jsm/environments/RoomEnvironment.js';
 export const scenarios = {
+  physical_specular_factors(THREE) {
+    const scene = new THREE.Scene(); scene.background = new THREE.Color(0x14191f);
+    const geometry = new THREE.SphereGeometry(.47, 48, 32);
+    for (let i = 0; i < 6; i++) {
+      const material = new THREE.MeshPhysicalMaterial({color: i < 3 ? 0x985b2e : 0x275d8d,
+        roughness: i < 3 ? .28 : .65, metalness: i < 3 ? 0 : .55,
+        ior: [1, 1.2, 2.33][i % 3], specularIntensity: [0, .25, .85][i % 3],
+        specularColor: new THREE.Color(.25, 8, 1.5)});
+      const object = new THREE.Mesh(geometry, material); object.position.set((i % 3 - 1) * 1.05, i < 3 ? .55 : -.55, 0);
+      scene.add(object);
+    }
+    const sun = new THREE.DirectionalLight(0xffedda, 2.1); sun.position.set(-1.5, 2, 3);
+    const point = new THREE.PointLight(0x87baff, 8, 0, 2); point.position.set(2, -.4, 2);
+    scene.add(sun, point, new THREE.HemisphereLight(0x667799, 0x332211, 1.2));
+    return {scene, camera: camera(THREE, [0, 0, 4])};
+  },
+  physical_specular_maps(THREE) {
+    const scene = new THREE.Scene(); scene.background = new THREE.Color(0x121820);
+    const texture = (pixels, channel, colorSpace = THREE.NoColorSpace) => {
+      const result = new THREE.DataTexture(new Uint8Array(pixels), 2, 2);
+      result.channel = channel; result.colorSpace = colorSpace;
+      result.wrapS = result.wrapT = THREE.RepeatWrapping; result.needsUpdate = true; return result;
+    };
+    // Intensity reads alpha; contradictory RGB catches accidental color/scalar reuse.
+    const intensity = texture([255, 0, 0, 32, 0, 255, 255, 255, 255, 255, 255, 90, 0, 0, 0, 180], 1);
+    const color = texture([220, 80, 30, 255, 40, 210, 110, 20, 90, 60, 250, 80, 245, 210, 40, 140], 2, THREE.SRGBColorSpace);
+    const normal = texture([155, 105, 250, 255, 95, 160, 240, 255, 130, 165, 245, 255, 115, 100, 250, 255], 3);
+    intensity.repeat.set(2, 1); intensity.offset.set(.125, .25);
+    color.repeat.set(1, 2); color.rotation = .35; normal.offset.set(.2, .35);
+    const geometry = new THREE.SphereGeometry(.72, 56, 32);
+    for (const name of ['uv1', 'uv2', 'uv3']) geometry.setAttribute(name, geometry.attributes.uv.clone());
+    for (let i = 0; i < 2; i++) {
+      const material = new THREE.MeshPhysicalMaterial({color: 0x86663a, roughness: .38, metalness: i ? .45 : 0,
+        ior: 2.1, specularIntensity: .9, specularColor: new THREE.Color(1.8, .7, 1.2),
+        specularIntensityMap: intensity, specularColorMap: color, normalMap: normal,
+        normalScale: new THREE.Vector2(.4, .7), clearcoat: i ? .65 : 0, clearcoatRoughness: .22});
+      const object = new THREE.Mesh(geometry, material); object.position.x = i ? .8 : -.8; scene.add(object);
+    }
+    const sun = new THREE.DirectionalLight(0xffffff, 2.5); sun.position.set(-1, 2, 3);
+    const point = new THREE.PointLight(0x7799ff, 6, 0, 2); point.position.set(2, -1, 2);
+    scene.add(sun, point, new THREE.AmbientLight(0x999999, .8));
+    return {scene, camera: camera(THREE, [0, 0, 3.5])};
+  },
+  physical_specular_updates(THREE, renderer) {
+    const result = scenarios.physical_specular_maps(THREE), objects = result.scene.children.filter(o => o.isMesh);
+    const render = renderer.render.bind(renderer); let frame = 0;
+    renderer.render = (...args) => {
+      if (++frame === 8) {
+        for (const [i, object] of objects.entries()) {
+          object.material.ior = i ? 1.1 : 2.33; object.material.specularIntensity = i ? .25 : 1;
+          object.material.specularColor.setRGB(i ? 3 : .2, .8, i ? .1 : 4);
+        }
+        const color = objects[0].material.specularColorMap, intensity = objects[0].material.specularIntensityMap;
+        color.rotation = -.55; color.offset.set(.25, .5); intensity.repeat.set(1, 3);
+        intensity.image.data.set([0, 0, 0, 250, 255, 255, 255, 20, 0, 255, 0, 150, 255, 0, 255, 70]);
+        intensity.needsUpdate = true;
+      }
+      return render(...args);
+    };
+    return result;
+  },
   physical_clearcoat_lights(THREE) {
     const scene = new THREE.Scene(); scene.background = new THREE.Color(0x14191f);
     const geometry = new THREE.SphereGeometry(.47, 48, 32);

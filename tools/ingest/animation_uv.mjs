@@ -1,6 +1,7 @@
 /** Independent per-map affine UV transforms. The draw arena, not a shared
  * material uniform, owns each use. No GPU/source objects or import-time work.
- * Eight legacy slots, or nine with the explicit alpha-map profile.
+ * Eight legacy slots, nine with alpha maps, or eleven in the native Three
+ * physical profile (independent specular intensity/color maps).
  */
 export const ANIMATION_UV_BYTES = 8 * 32;
 export const ANIMATION_UV_FIELDS = ', map_uv: array<vec4<f32>, 16>';
@@ -12,7 +13,7 @@ export class AnimationUvError extends Error {
 }
 const fail = message => { throw new AnimationUvError(message); };
 function capacity(slots) {
-  if (slots !== 8 && slots !== 9) fail('UV capacity must be eight or nine maps');
+  if (slots !== 8 && slots !== 9 && slots !== 11) fail('UV capacity must be eight, nine or eleven maps');
   return slots;
 }
 export const animationUvBytes = (slots = 8) => capacity(slots) * 32;

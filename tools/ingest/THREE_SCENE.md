@@ -190,7 +190,24 @@ mapping currently requires equal X/Y scale. Toon gradient maps use lighting
 angle, not geometry UVs. Unsupported combinations remain errors, not ignored
 fields or proof of full material coverage.
 
-### Native physical clearcoat
+### Native physical specular and clearcoat
+
+`MeshPhysicalMaterial` and its null-node-slot `MeshPhysicalNodeMaterial`
+counterpart support `ior`, `specularIntensity`, `specularColor`,
+`specularIntensityMap` and `specularColorMap`. IOR must be positive finite f32;
+intensity and linear specular RGB must be nonnegative finite f32. The pinned
+native equation applies the color map's RGB before capping dielectric F0 at one,
+then multiplies by intensity and the intensity map's **alpha**. Color textures
+retain their declared transfer function. With `textureTransforms:true`, the two
+maps have independent UV0–UV3 channels and live transforms.
+
+Direct lighting follows r186's dielectric Fresnel weighting of diffuse,
+metal-blended GGX and multiple-scattering compensation. Ambient and hemisphere
+diffuse retain the matching colored specular energy subtraction. Each logical
+draw owns its factor snapshot, including shared geometry and render bundles;
+factor changes do not require material preparation. Map replacement or channel
+changes use ordinary preparation. The existing documented environment profile
+accepts the material's F0/F90; this does not add PMREM filtering or transmission.
 
 `MeshPhysicalMaterial` and its null-node-slot `MeshPhysicalNodeMaterial`
 counterpart support native clearcoat on triangle surfaces. `clearcoat` and
@@ -207,8 +224,9 @@ base layer; self-emission is added after coating. Environment lighting retains
 the existing [environment profile](./THREE_SCENE_ENVIRONMENT.md). Live scalar
 and transform changes update existing material storage; zero/nonzero coating
 transitions, map replacement and channel changes require `prepare()` (handled
-by the renderer facade). Sheen, transmission, iridescence, anisotropy, dispersion,
-retroreflection and non-default IOR/specular settings remain explicit gaps.
+by the renderer facade). The coating keeps its fixed IOR of 1.5 independently
+of the base material's IOR/specular controls. Sheen, transmission, iridescence,
+anisotropy, dispersion and retroreflection remain explicit gaps.
 
 ## Native source instances
 

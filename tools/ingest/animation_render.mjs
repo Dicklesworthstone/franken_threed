@@ -91,6 +91,14 @@
  * roughness uses R and view-space geometry derivatives; dielectric GGX adds
  * separately to the attenuated base lighting, with emission added afterwards.
  * Environment radiance retains the existing explicit environment profile.
+ * The native Three profile also admits positive finite ior, nonnegative finite
+ * specularIntensity/specularColor, and independent specularIntensityTexture
+ * (alpha) / specularColorTexture (RGB with its declared transfer function).
+ * The factors are registration defaults or per-draw overrides. A 32-byte tail
+ * follows clipping/UV data; every logical draw owns its values, also in bundles.
+ * Pinned physical dielectric Fresnel weights diffuse, metal-blended GGX uses
+ * fixed F90=1, and ambient diffuse uses colored multi-scattering energy.
+ * Its UV capacity is eleven maps; the generic profile retains eight/nine.
  * These material profiles do not establish complete Three.js/PBR equivalence.
  * Phong uses the pinned r186 normalized Blinn-Phong lobe and exponential Schlick
  * approximation, not the metallic-roughness BRDF. specularColor (linear RGB;
@@ -260,6 +268,8 @@ const MAP_FIELDS = Object.freeze([
   "clearcoatRoughnessTexture",
   "clearcoatNormalTexture",
   "alphaTexture",
+  "specularIntensityTexture",
+  "specularColorTexture",
 ]);
 // The exclusive Phong specular map shares slot 1 with the PBR parameter map.
 // No dummy textures, additional bindings or larger per-draw arena are needed.
@@ -273,8 +283,11 @@ const COAT_FIELDS = Object.freeze([
   "clearcoatRoughnessFactor",
   "clearcoatNormalScale",
 ]);
-const COAT_LAYOUT = 512,
+const COAT_LAYOUT = 2048,
   COAT_BYTES = 16;
+const PHYSICAL_SPECULAR_MAPS = (1 << 9) | (1 << 10);
+const PHYSICAL_SPECULAR_BYTES = 32;
+const PHYSICAL_SPECULAR_DEFAULT = Object.freeze([1, 1, 1, 0, 1.5, 1, 0, 0]);
 const MAP_NAMES = Object.freeze([
   "color",
   "metallic_roughness",
@@ -285,6 +298,8 @@ const MAP_NAMES = Object.freeze([
   "clearcoat_roughness",
   "clearcoat_normal",
   "alpha",
+  "specular_intensity",
+  "specular_color",
 ]);
 const mapMaskFor = (variant) =>
   variant.includes("maps-")
@@ -293,7 +308,7 @@ const mapMaskFor = (variant) =>
       ? 1
       : 0;
 const coordinateMaskFor = (variant) => Number(/uv-(\d+)-/.exec(variant)?.[1] ?? 0);
-const mapSlots = (mask) => [0, 1, 2, 3, 4, 5, 6, 7, 8].filter((slot) => mask & (1 << slot));
+const mapSlots = (mask) => [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10].filter((slot) => mask & (1 << slot));
 // Binding 16 belongs to the existing clearcoat uniform. The optional alpha
 // sampler/view use 17/18, so coating and opacity never alias a resource slot.
 const mapBinding = slot => slot * 2 + Number(slot >= 8);
@@ -394,6 +409,18 @@ function surfaceShader(
     normalMapped = (mapMask & 4) !== 0,
     coatNormalMapped = (mapMask & 128) !== 0;
   const sourceCoat = threeLights && coated;
+  const sourcePhysical = threeLights && !phong && !toon;
+  // Two independent specular maps must also fit when all coating/opacity maps,
+  // fog and batched draw indices are present. Pack pairs of UVs into vec4
+  // varyings in this profile, without changing the legacy shader interfaces.
+  const packedMapUvs = threeLights && !!(mapMask & PHYSICAL_SPECULAR_MAPS);
+  const varyingMaps = mapSlots(mappedMask);
+  const uvOutput = slot => packedMapUvs
+    ? `map_uv_${Math.floor(varyingMaps.indexOf(slot) / 2)}.${varyingMaps.indexOf(slot) % 2 ? "zw" : "xy"}`
+    : `uv_${slot}`;
+  const varyingTail = 5 + Math.ceil(varyingMaps.length / 2);
+  const fogLocation = packedMapUvs ? varyingTail : 14;
+  const drawLocation = packedMapUvs ? varyingTail + Number(fogCode !== "") : mapMask & 256 ? 15 : coated ? 13 : 10;
   const tangentAttribute = (normalMapped || coatNormalMapped) && !derivative;
   // Flat shading derives normals from world-position derivatives; geometry
   // without a normal stream (e.g. GLTFLoader flatShading meshes) binds none.
@@ -410,7 +437,7 @@ function surfaceShader(
         `@group(1) @binding(${mapBinding(slot)}) var ${names[slot]}_sampler: sampler;\n@group(1) @binding(${mapBinding(slot) + 1}) var ${names[slot]}_texture: texture_2d<f32>;`,
     )
     .join("\n");
-  const coordinates = (slot) => (mappedMask & (1 << slot) ? `input.uv_${slot}` : "input.uv");
+  const coordinates = (slot) => (mappedMask & (1 << slot) ? `input.${uvOutput(slot)}` : "input.uv");
   const samples = mapSlots(toon ? mapMask & ~2 : mapMask)
     .map(
       (slot) =>
@@ -429,13 +456,13 @@ fn unit_vector(v: vec3<f32>) -> vec3<f32> {
   let scaled = v / scale;
   return scaled * inverseSqrt(dot(scaled, scaled));
 }
-fn illuminate(base: vec3<f32>, position: vec3<f32>, normal: vec3<f32>, metallic: f32, roughness: f32, emission: vec3<f32>${ambientOcclusion ? ", occlusion: f32" : ""}${phong ? ", specular_strength: f32" : ""}${sourceCoat ? ", specular_lobe: bool, shadow_normal: vec3<f32>" : ""}) -> vec3<f32> {
+fn illuminate(base: vec3<f32>, position: vec3<f32>, normal: vec3<f32>, metallic: f32, roughness: f32, emission: vec3<f32>${ambientOcclusion ? ", occlusion: f32" : ""}${phong ? ", specular_strength: f32" : ""}${sourcePhysical ? ", specular_color: vec3<f32>, specular_f90: f32" : ""}${sourceCoat ? ", specular_lobe: bool, shadow_normal: vec3<f32>" : ""}) -> vec3<f32> {
   var view = unit_vector(lighting.camera.xyz - position);
   if (lighting.camera.w > 0.0) { view = lighting.camera.xyz; }
   let nv = max(dot(normal, view), 0.0);${threeLights ? `
   let dfg = f3d_dfg(roughness, clamp(dot(normal, view), 0.0, 1.0));
   let dfg_ess = dfg.x + dfg.y;` : ""}
-  var result = emission;${environmentCode ? "\n  result += environment_lighting(base, normal, view, metallic, roughness, draw_info.options.z == 2.0)" + (ambientOcclusion ? " * occlusion" : "") + ";" : ""}
+  var result = emission;${environmentCode ? "\n  result += environment_lighting(base, normal, view, metallic, roughness, draw_info.options.z == 2.0" + (sourcePhysical ? ", specular_color, specular_f90" : "") + ")" + (ambientOcclusion ? " * occlusion" : "") + ";" : ""}
   for (var i = 0u; i < u32(lighting.light_params.x); i++) {
     let light = lighting.lights[i];
     ${indirectLights ? `// Light kind is frame-uniform. Keep derivative/
@@ -450,14 +477,15 @@ fn illuminate(base: vec3<f32>, position: vec3<f32>, normal: vec3<f32>, metallic:
       }
       let diffuse = base * select(1.0, 1.0 - metallic, draw_info.options.z == 2.0);${threeLights ? `
       // r186 indirectDiffuse: energy reflected by the dielectric specular lobe
-      // (F0 0.04, F90 1, multi-scattered) is unavailable to the diffuse layer.
-      var indirect_energy = 1.0;
+      // (including colored IOR/specular controls) is unavailable to diffuse.
+      var indirect_energy = vec3<f32>(1.0);
       if (draw_info.options.z == 2.0) {
-        let fss_ess = 0.04 * dfg.x + dfg.y;
+        let dielectric = ${sourcePhysical ? "specular_color" : "vec3<f32>(0.04)"};
+        let fss_ess = dielectric * dfg.x + vec3<f32>(${sourcePhysical ? "specular_f90 * " : ""}dfg.y);
         let ems = 1.0 - dfg_ess;
-        let favg = 0.04 + 0.96 * 0.047619;
-        let fms = fss_ess * favg / (1.0 - ems * favg);
-        indirect_energy = 1.0 - (fss_ess + fms * ems);
+        let favg = dielectric + (vec3<f32>(1.0) - dielectric) * 0.047619;
+        let fms = fss_ess * favg / (vec3<f32>(1.0) - ems * favg);
+        indirect_energy = vec3<f32>(1.0) - (fss_ess + fms * ems);
       }` : ""}
       result += irradiance * diffuse / 3.141592653589793${threeLights ? " * indirect_energy" : ""}${ambientOcclusion ? " * occlusion" : ""};
     } else {
@@ -502,9 +530,8 @@ fn illuminate(base: vec3<f32>, position: vec3<f32>, normal: vec3<f32>, metallic:
     let fresnel = specular * (1.0 - edge) + vec3<f32>(edge);
     let distribution = (roughness * 0.5 + 1.0) * pow(nh, roughness) / 3.141592653589793;
     brdf += fresnel * (0.25 * distribution * specular_strength);` : threeLights ? `if (draw_info.options.z == 2.0) {
-      // r186 PhysicalLightingModel.direct for MeshStandardMaterial: diffuse
-      // weighted by a dielectric (0.04) Schlick term, GGX with the
-      // metal-blended F0, and multi-scattering energy compensation.
+      // r186 PhysicalLightingModel.direct: dielectric Schlick weights diffuse;
+      // metal-blended F0 and fixed F90=1 drive the compensated GGX lobe.
       let half_vector = unit_vector(incoming + view);
       let nh = clamp(dot(normal, half_vector), 0.0, 1.0);
       let vh = clamp(dot(view, half_vector), 0.0, 1.0);
@@ -517,15 +544,15 @@ fn illuminate(base: vec3<f32>, position: vec3<f32>, normal: vec3<f32>, metallic:
       let gl = nv * sqrt(a2 + (1.0 - a2) * nl * nl);
       let visibility = 0.5 / max(gv + gl, 1e-6);
       let schlick = exp2((-5.55473 * vh - 6.98316) * vh);
-      let fresnel_dielectric = 0.04 * (1.0 - schlick) + schlick;
-      let f0 = mix(vec3<f32>(0.04), base, metallic);
+      let fresnel_dielectric = specular_color * (1.0 - schlick) + vec3<f32>(specular_f90 * schlick);
+      let f0 = mix(specular_color, base, metallic);
       let fresnel = f0 * (1.0 - schlick) + vec3<f32>(schlick);
       ${sourceCoat ? `if (specular_lobe) {
         // r186 clearcoat BRDF_GGX: F0=0.04, F90=1, no base-layer diffuse
         // or multi-scattering compensation in this separate dielectric lobe.
         brdf = fresnel * distribution * visibility;
       } else {` : ""}
-      brdf = (1.0 - fresnel_dielectric) * (1.0 - metallic) * base / 3.141592653589793 +
+      brdf = (vec3<f32>(1.0) - fresnel_dielectric) * (1.0 - metallic) * base / 3.141592653589793 +
         fresnel * distribution * visibility * (f0 * (1.0 / dfg_ess - 1.0) + vec3<f32>(1.0));${sourceCoat ? "\n      }" : ""}
     }` : `if (draw_info.options.z == 2.0) {
       if (nv <= 0.0) { continue; }
@@ -559,7 +586,7 @@ fn illuminate(base: vec3<f32>, position: vec3<f32>, normal: vec3<f32>, metallic:
   return /* wgsl */ `
 ${phong ? "// Matrix padding at words 51/55/59: AO strength, specular G, specular B.\nstruct PhongNormal { x: vec3<f32>, strength: f32, y: vec3<f32>, specular_g: f32, z: vec3<f32>, specular_b: f32 }\n" : occluded || normalMapped ? "// Same 48-byte layout as mat3x3; column paddings hold AO strength (51) and normal scale Y (55).\nstruct OcclusionNormal { x: vec3<f32>, strength: f32, y: vec3<f32>, pad0: f32, z: vec3<f32>, pad1: f32 }\n" : ""}struct DrawInfo {
   clip_from_local: mat4x4<f32>, color: vec4<f32>, options: vec4<f32>, uv_x: vec4<f32>, uv_y: vec4<f32>,
-  world_from_local: mat4x4<f32>, normal_from_local: ${phong ? "PhongNormal" : occluded || normalMapped ? "OcclusionNormal" : "mat3x3<f32>"}, emission_roughness: vec4<f32>${clippingCapacity ? animationClippingFields(clippingCapacity) : ""}${textureTransforms ? animationUvFields(uvSlots) : ""}
+  world_from_local: mat4x4<f32>, normal_from_local: ${phong ? "PhongNormal" : occluded || normalMapped ? "OcclusionNormal" : "mat3x3<f32>"}, emission_roughness: vec4<f32>${clippingCapacity ? animationClippingFields(clippingCapacity) : ""}${textureTransforms ? animationUvFields(uvSlots) : ""}${threeLights ? ", physical_specular_color: vec4<f32>, physical_specular_params: vec4<f32>" : ""}
 }
 ${
   instanceStride
@@ -571,11 +598,11 @@ var<private> draw_info: DrawInfo;`
 ${declarations}${coated ? "\n@group(1) @binding(16) var<uniform> clearcoat_info: vec4<f32>;" : ""}${srgbOutput && !depthOnly ? SRGB_OETF_WGSL : ""}
 ${lighting}${fogCode}${clippingCapacity ? animationClippingWgsl() : ""}
 struct VertexOutput {
-  @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) color: vec4<f32>,${instanceStride ? `\n  @location(${mapMask & 256 ? 15 : coated ? 13 : 10}) @interpolate(flat) draw_index: u32,` : ""}
+  @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) color: vec4<f32>,${instanceStride ? `\n  @location(${drawLocation}) @interpolate(flat) draw_index: u32,` : ""}
   ${lit || clippingCapacity ? "@location(2) world: vec3<f32>," : ""}${lit ? " @location(3) normal: vec3<f32>," : ""}
-  ${tangentAttribute ? "@location(4) tangent: vec4<f32>," : ""}${fogCode ? "\n  @location(14) fog_depth: f32," : ""}
-  ${mapSlots(mappedMask)
-    .map((slot) => `@location(${5 + slot}) uv_${slot}: vec2<f32>,`)
+  ${tangentAttribute ? "@location(4) tangent: vec4<f32>," : ""}${fogCode ? `\n  @location(${fogLocation}) fog_depth: f32,` : ""}
+  ${(packedMapUvs ? Array.from({length: Math.ceil(varyingMaps.length / 2)}, (_, i) => i) : varyingMaps)
+    .map((slot) => packedMapUvs ? `@location(${5 + slot}) map_uv_${slot}: vec4<f32>,` : `@location(${5 + slot}) uv_${slot}: vec2<f32>,`)
     .join("\n  ")}
 }
 @vertex fn vertex_main(@location(0) position: vec3<f32>${normalInput ? ", @location(1) normal: vec3<f32>" : ""}${tangentAttribute ? ", @location(2) tangent: vec4<f32>" : ""}${uvAttribute ? ", @location(3) uv: vec2<f32>" : ""}${colorWidth ? `, @location(4) color: vec${colorWidth}<f32>` : ""}${mapSlots(
@@ -599,9 +626,14 @@ struct VertexOutput {
   ${lit && !normalInput ? "out.normal = vec3<f32>(0.0);" : ""}${normalInput ? "out.normal = " + (occluded || normalMapped || phong ? "mat3x3<f32>(draw_info.normal_from_local.x, draw_info.normal_from_local.y, draw_info.normal_from_local.z)" : "draw_info.normal_from_local") + " * " + localNormal + ";" : ""}
   ${tangentAttribute ? "out.tangent = vec4<f32>((draw_info.world_from_local * vec4<f32>(" + localTangent + ", 0.0)).xyz, tangent.w * draw_info.uv_y.w);" : ""}
   ${mapSlots(mappedMask)
-    .map(slot => textureTransforms
-      ? `out.uv_${slot} = vec2<f32>(dot(draw_info.map_uv[${slot * 2}].xyz, vec3<f32>(${sourceUv(slot)}, 1.0)), dot(draw_info.map_uv[${slot * 2 + 1}].xyz, vec3<f32>(${sourceUv(slot)}, 1.0)));`
-      : `out.uv_${slot} = vec2<f32>(dot(draw_info.uv_x.xyz, vec3<f32>(uv_${slot}, 1.0)), dot(draw_info.uv_y.xyz, vec3<f32>(uv_${slot}, 1.0)));`)
+    .map(slot => {
+      const value = textureTransforms
+        ? `vec2<f32>(dot(draw_info.map_uv[${slot * 2}].xyz, vec3<f32>(${sourceUv(slot)}, 1.0)), dot(draw_info.map_uv[${slot * 2 + 1}].xyz, vec3<f32>(${sourceUv(slot)}, 1.0)))`
+        : `vec2<f32>(dot(draw_info.uv_x.xyz, vec3<f32>(uv_${slot}, 1.0)), dot(draw_info.uv_y.xyz, vec3<f32>(uv_${slot}, 1.0)))`;
+      if (!packedMapUvs) return `out.uv_${slot} = ${value};`;
+      const index = varyingMaps.indexOf(slot), field = `out.map_uv_${Math.floor(index / 2)}`;
+      return `${field} = vec4<f32>(${index % 2 ? `${field}.xy, ${value}` : `${value}, vec2<f32>(0.0)`});`;
+    })
     .join("\n  ")}
   return out;
 }
@@ -665,6 +697,14 @@ struct VertexOutput {
   }
   ${coatNormalMapped ? clearcoatNormalCode(derivative) + "\n  " : ""}${flat ? "" : "normal *= select(-1.0, 1.0, front);"}${coated && !flat ? "\n  coat_normal *= select(-1.0, 1.0, front);" : ""}
   let metallic = draw_info.options.w ${!phong && !toon && mapMask & 2 ? "* metallic_roughness_texel.b" : ""};
+  ${sourcePhysical ? `// r186 MeshPhysicalNodeMaterial.setupSpecular and MaterialNode: color RGB
+  // modulates dielectric F0 before min(1), intensity uses the map's ALPHA.
+  let physical_ratio = (draw_info.physical_specular_params.x - 1.0) / (draw_info.physical_specular_params.x + 1.0);
+  let physical_intensity = draw_info.physical_specular_params.y${mapMask & (1 << 9) ? " * specular_intensity_texel.a" : ""};
+  let physical_color = draw_info.physical_specular_color.rgb${mapMask & (1 << 10) ? " * specular_color_texel.rgb" : ""};
+  let physical_dielectric = select(vec3<f32>(0.04), min(physical_ratio * physical_ratio * physical_color, vec3<f32>(1.0)) * physical_intensity, draw_info.physical_specular_params.z > 0.0);
+  let physical_f90 = mix(physical_intensity, 1.0, metallic);
+  ` : ""}
   ${threeLights && !phong && !toon ? "let source_roughness" : "let roughness"} = draw_info.emission_roughness.w ${!phong && !toon && mapMask & 2 ? "* metallic_roughness_texel.g" : ""};${threeLights && !phong && !toon ? `
   // r186 getRoughness: max(roughness, 0.0525) + geometry roughness, clamped to
   // one. Geometry roughness uses world-space (not view-space) normal
@@ -679,8 +719,8 @@ struct VertexOutput {
     let packed = view_normal * 0.5 + vec3<f32>(0.5);
     rgb = select(pow(packed * 0.9478672986 + vec3<f32>(0.0521327014), vec3<f32>(2.4)), packed * 0.0773993808, packed <= vec3<f32>(0.04045));
   } else {
-    rgb = illuminate(rgba.rgb, input.world, normal, metallic, roughness, emission${ambientOcclusion ? ", occlusion" : ""});
-  }` : `${coated ? "var" : "let"} rgb = illuminate(rgba.rgb, input.world, normal, metallic, roughness, ${sourceCoat ? "vec3<f32>(0.0)" : "emission"}${ambientOcclusion ? ", occlusion" : ""}${phong ? mapMask & 2 ? ", specular_texel.r" : ", 1.0" : ""}${sourceCoat ? ", false, normal" : ""});`}${
+    rgb = illuminate(rgba.rgb, input.world, normal, metallic, roughness, emission${ambientOcclusion ? ", occlusion" : ""}, physical_dielectric, physical_f90);
+  }` : `${coated ? "var" : "let"} rgb = illuminate(rgba.rgb, input.world, normal, metallic, roughness, ${sourceCoat ? "vec3<f32>(0.0)" : "emission"}${ambientOcclusion ? ", occlusion" : ""}${phong ? mapMask & 2 ? ", specular_texel.r" : ", 1.0" : ""}${sourcePhysical ? ", physical_dielectric, physical_f90" : ""}${sourceCoat ? ", false, normal" : ""});`}${
     coated
       ? sourceCoat ? `
   // r186 MaterialNode uses R for both coating strength and coating roughness.
@@ -696,7 +736,7 @@ struct VertexOutput {
   let coat_nv = clamp(dot(coat_normal, coat_view), 0.0, 1.0);
   let coat_schlick = exp2((-5.55473 * coat_nv - 6.98316) * coat_nv);
   let coat_fresnel = 0.04 * (1.0 - coat_schlick) + coat_schlick;
-  let coat_light = illuminate(vec3<f32>(0.04), input.world, coat_normal, 1.0, coat_roughness, vec3<f32>(0.0)${ambientOcclusion ? ", occlusion" : ""}, true, normal);
+  let coat_light = illuminate(vec3<f32>(0.04), input.world, coat_normal, 1.0, coat_roughness, vec3<f32>(0.0)${ambientOcclusion ? ", occlusion" : ""}, vec3<f32>(0.04), 1.0, true, normal);
   // PhysicalLightingModel.finish layers reflected light; NodeMaterial adds
   // emission afterwards. A coating must not dim a self-emitting surface.
   rgb = rgb * (1.0 - coat_factor * coat_fresnel) + coat_light * coat_factor + emission;` : `
@@ -904,6 +944,16 @@ function specularColor(value) {
     fail("ANIMATION_RENDER_VALUE", "Specular color must be nonnegative finite f32");
   return value;
 }
+function physicalSpecular(input, defaults = PHYSICAL_SPECULAR_DEFAULT) {
+  const color = specularColor(input.specularColor === undefined ? defaults.slice(0, 3) : input.specularColor);
+  const ior = finite(input.ior === undefined ? defaults[4] : input.ior, "IOR");
+  const intensity = finite(input.specularIntensity === undefined ? defaults[5] : input.specularIntensity, "Specular intensity");
+  if (ior <= 0 || intensity < 0 || !Number.isFinite(Math.fround(ior)) || !Number.isFinite(Math.fround(intensity)))
+    fail("ANIMATION_RENDER_VALUE", "IOR must be positive finite f32 and specular intensity nonnegative finite f32");
+  const enabled = defaults[6] || ["ior", "specularIntensity", "specularColor"].some(key => input[key] !== undefined) ||
+    input.specularIntensityTexture != null || input.specularColorTexture != null;
+  return Float64Array.from([...color, 0, ior, intensity, Number(enabled), 0]);
+}
 function phongShininess(value) {
   if (finite(value, "Shininess") < 0 || !Number.isFinite(Math.fround(value)))
     fail("ANIMATION_RENDER_VALUE", "Shininess must be nonnegative finite f32");
@@ -1091,9 +1141,10 @@ export async function createGpuAnimationRenderer(
     fail("ANIMATION_RENDER_OPTIONS", "textureTransforms must be boolean");
   if (typeof alphaMaps !== "boolean")
     fail("ANIMATION_RENDER_OPTIONS", "alphaMaps must be boolean");
-  const uvSlots = alphaMaps ? 9 : 8;
+  const uvSlots = threeLights ? 11 : alphaMaps ? 9 : 8;
   const uvOffset = UNIFORM_BYTES + (clipping ? clippingBytes : 0);
-  const packetBytes = uvOffset + (textureTransforms ? animationUvBytes(uvSlots) : 0);
+  const physicalOffset = uvOffset + (textureTransforms ? animationUvBytes(uvSlots) : 0);
+  const packetBytes = physicalOffset + (threeLights ? PHYSICAL_SPECULAR_BYTES : 0);
   const limits = device.limits;
   const limit = (name, needed) => {
     if (!Number.isSafeInteger(limits[name]) || limits[name] < needed)
@@ -1490,7 +1541,7 @@ struct Out { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 };
               coordinateMask,
               format === null,
               shadowed,
-              environmentLit ? environmentReceiver.environmentLightingWgsl(textured ? 2 : 1) : "",
+              environmentLit ? environmentReceiver.environmentLightingWgsl(textured ? 2 : 1, threeLights && !phong && !toon) : "",
               instancing && !nativeInstances ? stride : 0,
               coated,
               geometry?.channels,
@@ -1802,6 +1853,8 @@ struct Out { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 };
         "shading",
         "flatShading",
         "specularColor",
+        "ior",
+        "specularIntensity",
         "shininess",
         "specularTexture",
         "gradientTexture",
@@ -1885,7 +1938,10 @@ struct Out { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 };
       (!lit && options.emissiveFactor !== undefined) ||
       (mode !== 2 &&
         (options.metallicFactor !== undefined || options.roughnessFactor !== undefined)) ||
-      (!phong && (options.specularColor !== undefined || options.shininess !== undefined || options.specularTexture != null)) ||
+      (!phong && (options.shininess !== undefined || options.specularTexture != null)) ||
+      (!(threeLights && mode === 2) && (options.ior !== undefined || options.specularIntensity !== undefined ||
+        options.specularIntensityTexture != null || options.specularColorTexture != null ||
+        (!phong && options.specularColor !== undefined))) ||
       ((phong || toon) && options.metallicRoughnessTexture != null) ||
       (!toon && options.gradientTexture != null)
     )
@@ -1943,6 +1999,7 @@ struct Out { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 };
         (a) => a.shaderLocation === 2 && a.offset === 24 && a.format === "float32x4",
       )));
     if (mapMask & 256) limit("maxBindingsPerBindGroup", 19);
+    if (mapMask & PHYSICAL_SPECULAR_MAPS) limit("maxBindingsPerBindGroup", mapBinding(mapSlots(mapMask).at(-1)) + 2);
     if (mapMask) {
       limit("maxBindGroups", lit ? 3 : 2);
       limit("maxSamplersPerShaderStage", mapSlots(mapMask).length);
@@ -1951,6 +2008,7 @@ struct Out { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 };
     const metallic = mode === 2 ? finite(options.metallicFactor ?? 1, "Metallic factor") : 0;
     const roughness = mode === 2 ? finite(options.roughnessFactor ?? 1, "Roughness factor") : 1;
     const specular = phong ? Float64Array.from(specularColor(options.specularColor ?? PHONG_SPECULAR)) : null;
+    const physical = threeLights && mode === 2 ? physicalSpecular(options) : null;
     const shininess = phong ? phongShininess(options.shininess ?? 30) : 0;
     const emission = Float64Array.from(
       array(options.emissiveFactor ?? [0, 0, 0], 3, "Emissive factor"),
@@ -2055,13 +2113,18 @@ struct Out { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 };
         coordinates.push({ slot, values, transform: local });
       }
     const coordinateMask = coordinates.reduce((mask, entry) => mask | (1 << entry.slot), 0);
-    if (instancing && !instances && (mapMask & 256)) limit("maxInterStageShaderVariables", 16);
-    if (textureTransforms && (mapMask & ~(toon ? 2 : 0)))
+    const packedMapUvs = threeLights && !!(mapMask & PHYSICAL_SPECULAR_MAPS);
+    if (packedMapUvs) {
+      const varyings = mapSlots(coordinateMask | (textureTransforms ? mapMask : 0));
+      limit("maxInterStageShaderVariables", 5 + Math.ceil(varyings.length / 2) + Number(fog) + Number(instancing && !instances));
+    }
+    if (!packedMapUvs && instancing && !instances && (mapMask & 256)) limit("maxInterStageShaderVariables", 16);
+    if (!packedMapUvs && textureTransforms && (mapMask & ~(toon ? 2 : 0)))
       limit("maxInterStageShaderVariables", 6 + mapSlots(mapMask & ~(toon ? 2 : 0)).at(-1));
     if (coordinates.length) {
       const needed = 6 + coordinates.at(-1).slot;
       limit("maxVertexAttributes", needed);
-      limit("maxInterStageShaderVariables", needed);
+      if (!packedMapUvs) limit("maxInterStageShaderVariables", needed);
     }
     const surfaceWords = 6 + coordinates.length * 2;
     let rasterId = rasterIds.get(raster.key);
@@ -2306,6 +2369,7 @@ struct Out { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 };
         metallic,
         roughness,
         specular,
+        physical,
         shininess,
         emission,
         mapMask,
@@ -2541,6 +2605,8 @@ struct Out { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 };
             "roughnessFactor",
             "emissiveFactor",
             "specularColor",
+            "ior",
+            "specularIntensity",
             "shininess",
             "alphaCutoff",
             "clippingPlanes",
@@ -2624,10 +2690,13 @@ struct Out { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 };
           (!record.lit && input.emissiveFactor !== undefined) ||
           (record.mode !== 2 &&
             (input.metallicFactor !== undefined || input.roughnessFactor !== undefined)) ||
-          (record.mode !== 3 && (input.specularColor !== undefined || input.shininess !== undefined))
+          (record.mode !== 3 && input.shininess !== undefined) ||
+          (!record.physical && (input.ior !== undefined || input.specularIntensity !== undefined ||
+            (record.mode !== 3 && input.specularColor !== undefined)))
         ) {
           fail("ANIMATION_RENDER_OPTIONS", "Draw parameters do not apply to shading model");
         }
+        if (threeLights) staged.set(record.physical ? physicalSpecular(input, record.physical) : PHYSICAL_SPECULAR_DEFAULT, offset + physicalOffset / 4);
         if (record.lit) {
           if (lighting === null)
             fail("ANIMATION_RENDER_LIGHT", "Lit draws require explicit frame lighting");

@@ -48,6 +48,7 @@ const MAPS=[['map','baseColorTexture'],['normalMap','normalTexture'],['emissiveM
   ['aoMap','occlusionTexture'],['specularMap','specularTexture'],['gradientMap','gradientTexture'],['alphaMap','alphaTexture']];
 const COAT_MAPS=[['clearcoatMap','clearcoatTexture'],['clearcoatRoughnessMap','clearcoatRoughnessTexture'],
   ['clearcoatNormalMap','clearcoatNormalTexture']];
+const PHYSICAL_SPECULAR_MAPS=[['specularIntensityMap','specularIntensityTexture'],['specularColorMap','specularColorTexture']];
 // Only opacity-bearing maps belong in depth materials. Never forward unrelated
 // color-map channel/transform keys into a masked shadow binding.
 const opacityFields=values=>Object.fromEntries(['baseColorTexture','alphaTexture']
@@ -823,10 +824,10 @@ export async function createGpuThreeScene(device,scene,{
       const extension=[...(nativePhysical?[]:['clearcoat']),'sheen','transmission','iridescence','anisotropy','dispersion'].find(k=>m[k]!==0)??
         ((m._retroreflectivity??0)!==0?'retroreflectivity':null);
       if(extension)fail('MATERIAL',`MeshPhysicalMaterial ${extension} is not admitted yet`);
-      if(m.ior!==1.5||m.specularIntensity!==1||m.specularColor.r!==1||m.specularColor.g!==1||m.specularColor.b!==1)
+      if(!nativePhysical&&(m.ior!==1.5||m.specularIntensity!==1||m.specularColor.r!==1||m.specularColor.g!==1||m.specularColor.b!==1))
         fail('MATERIAL','MeshPhysicalMaterial non-default ior/specular is not admitted yet');
-      const map=[...(nativePhysical?[]:COAT_MAPS.map(([key])=>key)),'sheenColorMap','sheenRoughnessMap','transmissionMap',
-        'thicknessMap','iridescenceMap','iridescenceThicknessMap','anisotropyMap','specularIntensityMap','specularColorMap'].find(k=>m[k]!=null);
+      const map=[...(nativePhysical?[]:[...COAT_MAPS,...PHYSICAL_SPECULAR_MAPS].map(([key])=>key)),'sheenColorMap','sheenRoughnessMap','transmissionMap',
+        'thicknessMap','iridescenceMap','iridescenceThicknessMap','anisotropyMap'].find(k=>m[k]!=null);
       if(map)fail('MATERIAL',`MeshPhysicalMaterial ${map} is not admitted yet`);
     }
     if(m.isNodeMaterial){
@@ -864,6 +865,9 @@ export async function createGpuThreeScene(device,scene,{
     const values={baseColor:m.color?rgba(m.color,m.opacity):[1,1,1,m.opacity],...raster.values};
     let coat=null;
     if(nativePhysical){
+      Object.assign(values,{ior:finite(m.ior,'ior'),specularIntensity:finite(m.specularIntensity,'specular intensity'),
+        specularColor:rgb(m.specularColor)});
+      if(values.ior<=0||values.specularIntensity<0)fail('VALUE','IOR must be positive and specular intensity nonnegative');
       if(finite(m.clearcoat,'clearcoat')<0||m.clearcoat>1)fail('VALUE','Clearcoat must be in [0,1]');
       if(m.clearcoat>0){
         if(topology!=='triangles')fail('MATERIAL','Native clearcoat requires triangle surfaces');
@@ -897,6 +901,7 @@ export async function createGpuThreeScene(device,scene,{
     }
     for(const [source,field] of MAPS)if(m[source])texture(m[source],field);
     if(coat)for(const [source,field] of COAT_MAPS)if(m[source])texture(m[source],field);
+    if(nativePhysical)for(const [source,field] of PHYSICAL_SPECULAR_MAPS)if(m[source])texture(m[source],field);
     if(m.metalnessMap||m.roughnessMap){
       if(m.metalnessMap!==m.roughnessMap)fail('TEXTURE','Separate metallic and roughness maps require independent shader bindings');
       texture(m.metalnessMap,'metallicRoughnessTexture');

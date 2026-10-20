@@ -4,6 +4,8 @@
  * Single-scattering GGX: Fss = F0*A+B, with the remaining fraction assigned to
  * nonmetal diffuse. No PMREM/CubeUV equivalence, multiscatter compensation,
  * ambient occlusion, background rendering, exposure or texture ownership.
+ * The optional native physical seam accepts dielectric F0/F90 from material
+ * controls. It retains this filter/integral profile and does not imply PMREM.
  */
 export const ENVIRONMENT_UNIFORM_BYTES = 64;
 const IDENTITY = Object.freeze([1, 0, 0, 0, 1, 0, 0, 0, 1]);
@@ -11,7 +13,7 @@ const IDENTITY = Object.freeze([1, 0, 0, 0, 1, 0, 0, 0, 1]);
 /** Bindings 4..8 share the lighting group with direct light and optional shadow
  * bindings 0..3. Explicit LOD permits use after alpha discard and lit branches.
  */
-export function environmentLightingWgsl(group) {
+export function environmentLightingWgsl(group, physicalSpecular = false) {
   return /* wgsl */ `
 struct EnvironmentInfo { from_world: mat3x3<f32>, options: vec4<f32> }
 @group(${group}) @binding(4) var<uniform> environment_info: EnvironmentInfo;
@@ -19,7 +21,7 @@ struct EnvironmentInfo { from_world: mat3x3<f32>, options: vec4<f32> }
 @group(${group}) @binding(6) var environment_diffuse: texture_cube<f32>;
 @group(${group}) @binding(7) var environment_specular: texture_cube<f32>;
 @group(${group}) @binding(8) var environment_brdf: texture_2d<f32>;
-fn environment_lighting(base: vec3<f32>, normal: vec3<f32>, view: vec3<f32>, metallic: f32, roughness: f32, pbr: bool) -> vec3<f32> {
+fn environment_lighting(base: vec3<f32>, normal: vec3<f32>, view: vec3<f32>, metallic: f32, roughness: f32, pbr: bool${physicalSpecular ? ", dielectric_f0: vec3<f32>, specular_f90: f32" : ""}) -> vec3<f32> {
   // A zero normal/view is possible at a degenerate surface/camera singularity.
   // Do not ask a cubemap to sample an undefined zero direction.
   if (dot(normal, normal) == 0.0) { return vec3<f32>(0.0); }
@@ -31,8 +33,8 @@ fn environment_lighting(base: vec3<f32>, normal: vec3<f32>, view: vec3<f32>, met
   let reflected = environment_info.from_world * reflect(-view, normal);
   let radiance = textureSampleLevel(environment_specular, environment_sampler, reflected, perceptual * environment_info.options.y).rgb;
   let dfg = textureSampleLevel(environment_brdf, environment_sampler, vec2<f32>(perceptual, nv), 0.0).rg;
-  let f0 = mix(vec3<f32>(0.04), base, metallic);
-  let specular = f0 * dfg.x + vec3<f32>(dfg.y);
+  let f0 = mix(${physicalSpecular ? "dielectric_f0" : "vec3<f32>(0.04)"}, base, metallic);
+  let specular = f0 * dfg.x + vec3<f32>(${physicalSpecular ? "specular_f90 * " : ""}dfg.y);
   // Quadrature/interpolation can overshoot one slightly. Never subtract diffuse
   // light; leave the specular integral itself unchanged.
   let diffuse = max(vec3<f32>(0.0), vec3<f32>(1.0) - specular) * (1.0 - metallic) * base;

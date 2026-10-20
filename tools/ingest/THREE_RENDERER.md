@@ -32,21 +32,24 @@ color/alpha/depth, `autoClear*`, `toneMapping` (fixed at `init()`),
 Scene content is whatever `three_scene.mjs` admits: Mesh/InstancedMesh/skinned and
 morphed meshes; Line/LineSegments/Points (one-pixel, as upstream WebGPU; LineLoop is
 reported and not drawn, as upstream); Basic/Lambert/Phong/Toon/Standard and
-Physical with the clearcoat profile below,
+Physical with the specular and clearcoat profiles below,
 LineBasic and Points materials; all source blending modes, premultiplied alpha,
 polygon offset; ambient/hemisphere/directional/point/spot lights (up to 8); fog;
 one directional/spot shadow; HDR environment/background panoramas; clipping
 planes; textures with transforms.
 
 Native `MeshPhysicalMaterial` and `MeshPhysicalNodeMaterial` with null node slots
-support clearcoat, clearcoat roughness and their three independent factor,
+support IOR, specular intensity/color and their two independent maps, with
+intensity from alpha and color from RGB. Factors remain live per draw; direct
+lighting and ambient diffuse energy use the pinned r186 physical equations.
+They also support clearcoat, clearcoat roughness and their three independent factor,
 roughness and normal maps. Factors, map transforms and XY normal scale remain
 live; changing a map binding/channel or enabling/disabling the coating takes the
 ordinary preparation path. The native r186 roughness map reads its red channel.
 The dielectric coating uses the pinned GGX/Fresnel layering and leaves emission
 unattenuated. The existing environment receiver keeps its documented radiance
-profile. Other physical extensions and non-default IOR/specular controls remain
-outside this implementation; see [THREE_SCENE.md](./THREE_SCENE.md).
+profile. Other physical extensions remain outside this implementation; see
+[THREE_SCENE.md](./THREE_SCENE.md).
 
 Ordinary `ArrayCamera` rendering is admitted on this native WebGPU route, with
 at most 256 non-reversed perspective or orthographic child cameras. The parent

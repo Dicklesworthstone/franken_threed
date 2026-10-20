@@ -52,7 +52,11 @@ does not bypass a device limit. Deformers can use their existing static
 `mapCoordinates` streams; direct nonzero `mapChannels` requires native geometry.
 
 All existing map slots participate, including normal-map derivatives and
-clearcoat normal maps. Toon gradient maps remain indexed by lighting angle;
+clearcoat normal maps. The native `threeLights:true` physical profile also
+admits `specularIntensityTexture` and `specularColorTexture`, in slots 9 and 10
+(the optional alpha texture remains slot 8). Their independent UVs are packed
+in pairs in shader varyings so the complete map set fits with fog and batching.
+Toon gradient maps remain indexed by lighting angle;
 UV channels/transforms for that map are rejected. Unknown fields, absent maps,
 missing channels, accessor-backed map options, non-finite coefficients, and
 shared/resizable typed transform storage are rejected explicitly.
@@ -64,6 +68,10 @@ and reject the new map options. Enabled packets append eight 32-byte transform
 slots after the original 256 bytes and any clipping packet. With clipping off,
 this is 512 bytes; with eight clipping planes it is 656 bytes, normally aligned
 to a 768-byte arena stride. Budgets and binding limits include the entire packet.
+The alpha-map profile uses nine transform slots. The native Three light profile
+uses eleven, then appends 32 bytes of per-draw IOR/specular factors; its existing
+map offsets remain unchanged. With no clipping, that native packet is 640 bytes,
+aligned to a 768-byte stride on devices with 256-byte uniform alignment.
 Native source instances use one object/material packet; generated draw batching
 keeps one packet per logical draw. Frozen render bundles keep the same buffers,
 but read current packet contents at each submission.
