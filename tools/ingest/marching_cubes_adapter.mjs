@@ -10,6 +10,7 @@
  * original path without property inspection. Bootstrap trusted platform APIs.
  */
 import {instantiateNumericKernel} from './numeric_kernel_runtime.mjs';
+import {registerNumericObject,isNumericObject} from './numeric_objects.mjs';
 const apply=Reflect.apply, descriptor=Object.getOwnPropertyDescriptor, hasOwn=Object.hasOwn;
 const isInteger=Number.isInteger, U8=Uint8Array, decode=globalThis.atob, charCodeAt=String.prototype.charCodeAt;
 const empty=new Float32Array(0);
@@ -30,7 +31,7 @@ function platformIntact() {
   }
   return true;
 }
-const objects=new WeakSet(),dispatches=new WeakMap(),updates=new WeakMap(),fieldUpdates=new WeakMap();
+const objects={has:isNumericObject},dispatches=new WeakMap(),updates=new WeakMap(),fieldUpdates=new WeakMap();
 const own=(object,key)=>{
   const d=descriptor(object,key);
   return d && hasOwn(d,'value') ? d : null;
@@ -39,7 +40,7 @@ const names=['size','size2','size3','halfsize','delta','yd','zd','isolation','fi
   'palette','positionArray','normalArray','material','geometry','enableUvs','enableColors','count'];
 
 /** Called only by verified base constructors (EventDispatcher/Color) with fresh `this`. */
-export function registerMarchingCubesObject(object) { objects.add(object); }
+export function registerMarchingCubesObject(object) { registerNumericObject(object); }
 
 /** No binary decoding or Wasm allocation until the first admitted update. */
 export function createMarchingCubesDispatch(base64,edgeTable,triTable) {

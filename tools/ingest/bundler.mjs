@@ -708,7 +708,8 @@ export async function bundleWithRollup(entryPath, options = {}) {
     if (numericReport && marchingPlugin) {
       numericReport = {
         ...numericReport,
-        libraryKernels: { marchingCubes: marchingPlugin.api.getReport() },
+        libraryKernels: { marchingCubes: marchingPlugin.api.getReport(),
+          geometryNormals: marchingPlugin.api.getGeometryNormalsReport() },
       };
       const reportAsset = output.find(
         (item) => item.type === "asset" && item.fileName === numericReport.reportFile,

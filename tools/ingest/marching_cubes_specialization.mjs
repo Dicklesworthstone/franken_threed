@@ -128,5 +128,7 @@ export function specializeMarchingCubesBase(source,{
   }
   let code=source;
   for (const edit of edits.sort((a,b)=>b.at-a.at)) code=code.slice(0,edit.at)+edit.text+code.slice(edit.at);
-  return {changed:true,registeredClasses,code:`import { registerMarchingCubesObject as ${register} } from ${JSON.stringify(runtimeModule)};\n`+code};
+  const header=`import { registerMarchingCubesObject as ${register} } from ${JSON.stringify(runtimeModule)};\n`;
+  return {changed:true,registeredClasses,code:header+code,header,
+    edits:edits.map(edit=>({start:edit.at,end:edit.at,text:edit.text}))};
 }

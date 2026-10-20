@@ -1,7 +1,9 @@
 /** Opt-in library-kernel recognition in the real Rollup module graph. */
 import fs from 'node:fs';
 import {specializeMarchingCubesModule,specializeMarchingCubesBase} from './marching_cubes_specialization.mjs';
+import {geometryNormalSourceRole,specializeGeometryNormals} from './geometry_normals_specialization.mjs';
 const ADAPTER='\0f3d-marching-cubes-adapter',RUNTIME='\0f3d-marching-cubes-runtime';
+const NORMALS='\0f3d-geometry-normals-adapter',OBJECTS='\0f3d-numeric-objects';
 
 /**
  * Place before generic URL resolvers so these private virtual IDs never become
@@ -19,22 +21,25 @@ export function marchingCubesRollupPlugin(options={}) {
       !Number.isInteger(maxIterations) || maxIterations<1 || maxIterations>1000000000) {
     throw new RangeError('Invalid marching-cubes memory or iteration budget');
   }
-  const reports=[];let registrations=0,colorRegistrations=0;
+  const reports=[],normalReports=[];let registrations=0,colorRegistrations=0;
   return {
     name:'f3d-marching-cubes',
-    buildStart() {reports.length=0;registrations=0;colorRegistrations=0;},
+    buildStart() {reports.length=0;normalReports.length=0;registrations=0;colorRegistrations=0;},
     resolveId(source,importer) {
-      if (source===ADAPTER || source===RUNTIME) return source;
-      if (importer===ADAPTER && source==='./numeric_kernel_runtime.mjs') return RUNTIME;
+      if ([ADAPTER,RUNTIME,NORMALS,OBJECTS].includes(source)) return source;
+      if ([ADAPTER,NORMALS].includes(importer) && source==='./numeric_kernel_runtime.mjs') return RUNTIME;
+      if ([ADAPTER,NORMALS].includes(importer) && source==='./numeric_objects.mjs') return OBJECTS;
       return null;
     },
     load(id) {
       if (id===ADAPTER) return fs.readFileSync(new URL('./marching_cubes_adapter.mjs',import.meta.url),'utf8');
       if (id===RUNTIME) return fs.readFileSync(new URL('./numeric_kernel_runtime.mjs',import.meta.url),'utf8');
+      if (id===NORMALS) return fs.readFileSync(new URL('./geometry_normals_adapter.mjs',import.meta.url),'utf8');
+      if (id===OBJECTS) return fs.readFileSync(new URL('./numeric_objects.mjs',import.meta.url),'utf8');
       return null;
     },
     transform(code,id) {
-      if (id===ADAPTER || id===RUNTIME || typeof code!=='string') return null;
+      if ([ADAPTER,RUNTIME,NORMALS,OBJECTS].includes(id) || typeof code!=='string') return null;
       // Cheap discovery only. Complete source hashes, never this spelling or
       // the application's filename, authorize the transformation below.
       if (code.includes('class MarchingCubes')) {
@@ -42,18 +47,42 @@ export function marchingCubesRollupPlugin(options={}) {
         reports.push({id,...result.report});
         if (result.changed) return {code:result.code,map:null};
       }
+      const edits=[],headers=[];let tail='';
       if (code.includes('class EventDispatcher') || code.includes('class Color')) {
-        const result=specializeMarchingCubesBase(code,{runtimeModule:ADAPTER});
-        if (result.changed) {
-          if (result.registeredClasses.includes('EventDispatcher')) registrations++;
-          if (result.registeredClasses.includes('Color')) colorRegistrations++;
-          return {code:result.code,map:null};
+        const base=specializeMarchingCubesBase(code,{runtimeModule:ADAPTER});
+        if (base.changed) {
+          if (base.registeredClasses.includes('EventDispatcher')) registrations++;
+          if (base.registeredClasses.includes('Color')) colorRegistrations++;
+          edits.push(...base.edits);headers.push(base.header);
         }
       }
-      return null;
+      const normalCandidate=code.includes('class BufferGeometry') || code.includes('class BufferAttribute') || code.includes('class Vector3');
+      const finish=(sources={})=>{
+        if(normalCandidate) {
+          const normals=specializeGeometryNormals(code,{...sources,runtimeModule:NORMALS,objectsModule:OBJECTS,maxMemoryPages,maxIterations});
+          if(normals.report)normalReports.push({id,...normals.report});
+          if(normals.changed){edits.push(...normals.edits);headers.push(normals.header);tail=normals.tail;}
+        }
+        if(!headers.length)return null;
+        let transformed=code;
+        for(const edit of edits.sort((a,b)=>b.start-a.start))transformed=transformed.slice(0,edit.start)+edit.text+transformed.slice(edit.end);
+        return {code:headers.join('')+transformed+tail,map:null};
+      };
+      if(normalCandidate && geometryNormalSourceRole(code)==='geometry') {
+        return Promise.all([['vectorSource','../math/Vector3.js'],['attributeSource','./BufferAttribute.js']].map(async([key,specifier])=>{
+          const resolved=await this.resolve(specifier,id,{skipSelf:true});
+          if(resolved && !resolved.external)try {
+            return [key,fs.readFileSync(resolved.id.startsWith('file:')?new URL(resolved.id):resolved.id,'utf8')];
+          }catch{/* An unavailable source retains its normal module route. */}
+          return [key,undefined];
+        })).then(values=>finish(Object.fromEntries(values)));
+      }
+      return finish();
     },
     api:{getReport() {return {version:1,maxMemoryPages,maxIterations,compiledAddons:reports.filter(x=>x.route!=='retained-js').length,
       registeredBaseModules:registrations,registeredColorModules:colorRegistrations,
-      compiledFieldKernels:reports.reduce((sum,report)=>sum+(report.compiledFieldKernels??0),0),accelerationClaim:false,modules:reports.map(x=>({...x}))};}},
+      compiledFieldKernels:reports.reduce((sum,report)=>sum+(report.compiledFieldKernels??0),0),accelerationClaim:false,modules:reports.map(x=>({...x}))};},
+      getGeometryNormalsReport(){return {version:1,accelerationClaim:false,
+        compiledModules:normalReports.filter(report=>report.compiledMethods.length).length,modules:normalReports.map(report=>({...report}))};}},
   };
 }
