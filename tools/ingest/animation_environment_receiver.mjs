@@ -2,8 +2,9 @@
  * Diffuse cube stores E/pi. Specular mip LOD = perceptual roughness*(levels-1).
  * The DFG LUT stores (A,B) at (roughness,NdotV), NOT the opposite axis order.
  * Single-scattering GGX: Fss = F0*A+B, with the remaining fraction assigned to
- * nonmetal diffuse. No PMREM/CubeUV equivalence, multiscatter compensation,
- * ambient occlusion, background rendering, exposure or texture ownership.
+ * nonmetal diffuse. Opt-in multiple scattering uses the same DFG and E/pi maps
+ * to recover repeated microfacet bounces, without refiltering or new resources.
+ * No PMREM/CubeUV equivalence, exposure or texture ownership.
  * The optional native physical seam accepts dielectric F0/F90 from material
  * controls. It retains this filter/integral profile and does not imply PMREM.
  */
@@ -21,6 +22,20 @@ struct EnvironmentInfo { from_world: mat3x3<f32>, options: vec4<f32> }
 @group(${group}) @binding(6) var environment_diffuse: texture_cube<f32>;
 @group(${group}) @binding(7) var environment_specular: texture_cube<f32>;
 @group(${group}) @binding(8) var environment_brdf: texture_2d<f32>;
+// Fdez-Aguera, JCGT 8(1), 2019, repeated-bounce geometric series.
+// Generalized Schlick hemispherical average keeps authored F90 (including zero).
+// dfg is nonnegative and normalized to unit energy by the opt-in caller.
+fn environment_multiple_scattering(f0: vec3<f32>, f90: f32, dfg: vec2<f32>) -> vec3<f32> {
+  let energy = dfg.x + dfg.y;
+  let missing = max(0.0, 1.0 - energy);
+  let average = clamp(f0 + (vec3<f32>(f90) - f0) / 21.0, vec3<f32>(0.0), vec3<f32>(1.0));
+  let single = f0 * dfg.x + vec3<f32>(f90 * dfg.y);
+  // This form avoids cancellation in 1 - average * (1 - energy).
+  let denominator = (vec3<f32>(1.0) - average) + average * energy;
+  let repeated = single * average * missing / max(denominator, vec3<f32>(1e-20));
+  // Exact zero-energy/perfect-reflector limit; never evaluate a 0/0 division.
+  return select(repeated, vec3<f32>(1.0), denominator == vec3<f32>(0.0));
+}
 fn environment_lighting(base: vec3<f32>, normal: vec3<f32>, view: vec3<f32>, metallic: f32, roughness: f32, pbr: bool${physicalSpecular ? ", dielectric_f0: vec3<f32>, specular_f90: f32" : ""}) -> vec3<f32> {
   // A zero normal/view is possible at a degenerate surface/camera singularity.
   // Do not ask a cubemap to sample an undefined zero direction.
@@ -33,6 +48,25 @@ fn environment_lighting(base: vec3<f32>, normal: vec3<f32>, view: vec3<f32>, met
   let reflected = environment_info.from_world * reflect(-view, normal);
   let radiance = textureSampleLevel(environment_specular, environment_sampler, reflected, perceptual * environment_info.options.y).rgb;
   let dfg = textureSampleLevel(environment_brdf, environment_sampler, vec2<f32>(perceptual, nv), 0.0).rg;
+  if (environment_info.options.z == 1.0) {
+    // Finite quadrature and half-float interpolation can overshoot unit energy.
+    // Normalize ONLY the opt-in model; the legacy profile remains unchanged.
+    let positive_dfg = max(dfg, vec2<f32>(0.0));
+    let bounded_dfg = positive_dfg / max(1.0, positive_dfg.x + positive_dfg.y);
+    let dielectric = ${physicalSpecular ? "dielectric_f0" : "vec3<f32>(0.04)"};
+    let f90 = ${physicalSpecular ? "specular_f90" : "1.0"};
+    let single_dielectric = dielectric * bounded_dfg.x + vec3<f32>(f90 * bounded_dfg.y);
+    let single_metal = base * bounded_dfg.x + vec3<f32>(f90 * bounded_dfg.y);
+    let multiple_dielectric = environment_multiple_scattering(dielectric, f90, bounded_dfg);
+    let multiple_metal = environment_multiple_scattering(base, f90, bounded_dfg);
+    // Compensation is nonlinear: mix the completed lobes, not their F0 inputs.
+    // Only the dielectric fraction has a diffuse substrate.
+    let single = mix(single_dielectric, single_metal, metallic);
+    let multiple = mix(multiple_dielectric, multiple_metal, metallic);
+    let diffuse = max(vec3<f32>(0.0), vec3<f32>(1.0) - single_dielectric - multiple_dielectric) * (1.0 - metallic) * base;
+    // Repeated bounces use cosine-weighted irradiance, not the specular mip.
+    return (radiance * single + irradiance * (multiple + diffuse)) * environment_info.options.x;
+  }
   let f0 = mix(${physicalSpecular ? "dielectric_f0" : "vec3<f32>(0.04)"}, base, metallic);
   let specular = f0 * dfg.x + vec3<f32>(${physicalSpecular ? "specular_f90 * " : ""}dfg.y);
   // Quadrature/interpolation can overshoot one slightly. Never subtract diffuse
@@ -46,15 +80,19 @@ fn environment_lighting(base: vec3<f32>, normal: vec3<f32>, view: vec3<f32>, met
 /** CPU-only admission; output is changed only after the entire input validates.
  * rotation is a column-major, right-handed WORLD-TO-ENVIRONMENT 3x3 rotation.
  * Do not pass Euler angles, a world matrix, a scale, or a reflection.
+ * scattering is "single" (default, compatible) or "multiple"; options.z carries
+ * the mode in the existing 64-byte uniform. No map or pipeline is rebuilt.
  */
 export function packAnimationEnvironment(device, input, output, fail) {
   const reject = (message) => fail("ANIMATION_RENDER_ENVIRONMENT", message);
   if (!input || typeof input !== "object" || Array.isArray(input))
     reject("Expected an environment descriptor");
   for (const key of Object.keys(input))
-    if (!["map", "intensity", "rotation"].includes(key))
+    if (!["map", "intensity", "rotation", "scattering"].includes(key))
       reject(`Unsupported environment field: ${key}`);
-  const { map, intensity = 1, rotation = IDENTITY } = input;
+  const { map, intensity = 1, rotation = IDENTITY, scattering = "single" } = input;
+  if (scattering !== "single" && scattering !== "multiple")
+    reject('Scattering must be "single" or "multiple"');
   if (typeof intensity !== "number" || !Number.isFinite(Math.fround(intensity)) || intensity < 0)
     reject("Intensity must be nonnegative finite f32");
   if ((!Array.isArray(rotation) && !ArrayBuffer.isView(rotation)) || rotation.length !== 9)
@@ -107,6 +145,6 @@ export function packAnimationEnvironment(device, input, output, fail) {
   output.fill(0);
   for (let column = 0; column < 3; column++)
     output.set(matrix.slice(column * 3, column * 3 + 3), column * 4);
-  output.set([intensity, snapshot.mipLevelCount - 1], 12);
+  output.set([intensity, snapshot.mipLevelCount - 1, scattering === "multiple" ? 1 : 0], 12);
   return { map, snapshot, check };
 }
