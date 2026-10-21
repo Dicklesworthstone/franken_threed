@@ -7,6 +7,7 @@
 
 import { prepareDracoMeshes } from "./gltf_draco.mjs";
 import { prepareMeshoptBuffers } from "./gltf_meshopt.mjs";
+import { createGltfResourceQueue, waitForGltfResource } from "./gltf_resource_queue.mjs";
 export class GltfAssetError extends Error {
   constructor(code, message) {
     super(`${code}: ${message}`);
@@ -23,6 +24,9 @@ const positive = (n, label) => {
 };
 const abort = (signal) => {
   if (signal?.aborted) throw signal.reason ?? new DOMException("Aborted", "AbortError");
+};
+const cancelStream = (stream, reason) => {
+  try { Promise.resolve(stream?.cancel(reason)).catch(() => {}); } catch {}
 };
 function bytes(value) {
   const buffer = ArrayBuffer.isView(value) ? value.buffer : value;
@@ -148,6 +152,11 @@ function imageType(data) {
  * JSON/GLB bytes. Buffers are loaded before returning; readImage(index) is lazy
  * so unreachable images are never requested. Identical URLs/data URIs share one
  * fetch, including concurrent image requests. Query strings remain significant.
+ * maxConcurrentRequests (default 4, range 1..32) bounds complete resource reads
+ * across buffers and lazy images, not just fetch starts. Buffer order is stable.
+ * Construction failure cancels sibling reads; after publication, an individual
+ * image failure does not cancel other images. Caller abort cancels all work.
+ * Already received bytes remain charged, including failed/partial resources.
  *
  * Dependencies are same-origin by default. Extra origins must be explicitly
  * listed; credentials and redirects are never sent/followed. This is not an
@@ -167,12 +176,15 @@ export async function loadGltfAsset(
     maxBytes = 128 * 1024 * 1024,
     maxResourceBytes = 64 * 1024 * 1024,
     maxResources = 4096,
+    maxConcurrentRequests = 4,
     allowedOrigins = [],
   } = {},
 ) {
   positive(maxBytes, "total byte limit");
   positive(maxResourceBytes, "resource byte limit");
   positive(maxResources, "resource count");
+  positive(maxConcurrentRequests, "concurrent request limit");
+  if (maxConcurrentRequests > 32) fail("LIMIT", "At most 32 concurrent resource requests");
   if (!Array.isArray(allowedOrigins) || allowedOrigins.some((v) => typeof v !== "string"))
     fail("URI", "Invalid allowed origins");
   const origins = new Set(allowedOrigins);
@@ -198,13 +210,15 @@ export async function loadGltfAsset(
       fail("URI", "Use credential-free HTTP(S) URLs");
     origins.add(base.origin);
   }
-  const cache = new Map();
+  const cache = new Map(),
+    requiredLengths = new Map(),
+    queue = createGltfResourceQueue(maxConcurrentRequests, signal);
+  let constructing = true;
   function charge(length) {
     if (length > maxBytes - total) fail("LIMIT", "Total input byte budget exceeded");
     total += length;
   }
-  async function read(uri) {
-    abort(signal);
+  function resourceKey(uri) {
     if (typeof uri !== "string" || !uri) fail("URI", "Expected a resource URI");
     let key = uri;
     if (!/^data:/i.test(uri)) {
@@ -224,25 +238,35 @@ export async function loadGltfAsset(
       url.hash = "";
       key = url.href;
     }
+    return key;
+  }
+  function checkedResource(key, result) {
+    if (result.bytes.length < (requiredLengths.get(key) ?? 0))
+      fail("BUFFER", "Truncated buffer");
+    return result;
+  }
+  async function read(uri) {
+    abort(signal);
+    const key = resourceKey(uri);
     if (!cache.has(key)) {
       if (cache.size >= maxResources) fail("LIMIT", "Too many resource requests");
       // Start after caching so an injected fetch cannot reenter before deduplication.
       cache.set(
         key,
-        Promise.resolve().then(async () => {
+        queue.run(async (signal) => {
           abort(signal);
           if (/^data:/i.test(key)) {
             const result = dataUri(key, Math.min(maxResourceBytes, maxBytes - total));
             charge(result.bytes.length);
-            return result;
+            return checkedResource(key, result);
           }
           if (typeof fetcher !== "function") fail("FETCH", "No Fetch API supplied");
-          const response = await fetcher(key, { signal, credentials: "omit", redirect: "error" });
-          const cancel = () => {
-            try {
-              Promise.resolve(response?.body?.cancel()).catch(() => {});
-            } catch {}
-          };
+          const response = await waitForGltfResource(
+            fetcher(key, { signal, credentials: "omit", redirect: "error" }),
+            signal,
+            late => cancelStream(late?.body, signal.reason),
+          );
+          const cancel = () => cancelStream(response?.body, signal.reason);
           try {
             abort(signal);
             if (!response?.ok || response.redirected)
@@ -274,17 +298,18 @@ export async function loadGltfAsset(
           const reader = response.body.getReader(),
             chunks = [];
           let length = 0,
-            complete = false;
+            complete = false,
+            cancelled = false;
           const onAbort = () => {
-            try {
-              Promise.resolve(reader.cancel(signal.reason)).catch(() => {});
-            } catch {}
+            if (cancelled) return;
+            cancelled = true;
+            cancelStream(reader, signal.reason);
           };
           signal?.addEventListener("abort", onAbort, { once: true });
           try {
             while (true) {
               abort(signal);
-              const chunk = await reader.read();
+              const chunk = await waitForGltfResource(reader.read(), signal);
               abort(signal);
               if (chunk.done) {
                 complete = true;
@@ -303,22 +328,19 @@ export async function loadGltfAsset(
               data.set(chunk, at);
               at += chunk.length;
             }
-            return {
+            return checkedResource(key, {
               bytes: data,
               mimeType: (response.headers?.get("content-type") ?? "")
                 .split(";")[0]
                 .trim()
                 .toLowerCase(),
-            };
+            });
           } finally {
             signal?.removeEventListener("abort", onAbort);
-            if (!complete)
-              try {
-                await reader.cancel();
-              } catch {}
-            reader.releaseLock();
+            if (!complete) onAbort();
+            try { reader.releaseLock(); } catch {}
           }
-        }),
+        }, { failFast: constructing }),
       );
     }
     return cache.get(key);
@@ -375,15 +397,10 @@ export async function loadGltfAsset(
     )
       fail("BUFFER", "Invalid buffer byteLength");
   }
-  let buffers = [];
-  for (let i = 0; i < definitions.length; i++) {
-    abort(signal);
-    if (skipped.has(i)) {
-      buffers.push(null);
-      continue;
-    }
-    const item = definitions[i];
-    let data;
+  // Preflight every selected dependency before starting any of them. Skipped
+  // codec fallbacks stay untouched, and duplicate URLs reserve only one read.
+  const keys = definitions.map((item, i) => {
+    if (skipped.has(i)) return null;
     if (item.uri === undefined) {
       if (
         i !== 0 ||
@@ -394,12 +411,33 @@ export async function loadGltfAsset(
         fail("BUFFER", "Missing or invalid GLB BIN buffer");
       for (let j = item.byteLength; j < bin.length; j++)
         if (bin[j] !== 0) fail("BUFFER", "Nonzero BIN padding");
-      data = bin;
-    } else {
-      data = (await read(item.uri)).bytes;
-      if (data.length < item.byteLength) fail("BUFFER", "Truncated buffer");
+      return null;
     }
-    buffers.push(data.subarray(0, item.byteLength));
+    const key = resourceKey(item.uri);
+    requiredLengths.set(key, Math.max(requiredLengths.get(key) ?? 0, item.byteLength));
+    return key;
+  });
+  if (new Set([...cache.keys(), ...requiredLengths.keys()]).size > maxResources)
+    fail("LIMIT", "Too many resource requests");
+  let minimumBytes = 0;
+  for (const [key, length] of requiredLengths) {
+    if (cache.has(key)) continue;
+    if (length > maxBytes - total - minimumBytes)
+      fail("LIMIT", "Declared buffers exceed remaining byte budget");
+    minimumBytes += length;
+  }
+  let buffers;
+  try {
+    buffers = await Promise.all(definitions.map(async (item, i) => {
+      abort(signal);
+      if (skipped.has(i)) return null;
+      const data = keys[i] === null ? bin : (await read(keys[i])).bytes;
+      if (data.length < item.byteLength) fail("BUFFER", "Truncated buffer");
+      return data.subarray(0, item.byteLength);
+    }));
+  } catch (error) {
+    queue.cancel(error);
+    throw error;
   }
   const decoded = await meshopt.decode(buffers, { signal });
   abort(signal);
@@ -413,6 +451,8 @@ export async function loadGltfAsset(
   json = geometry.json;
   buffers = geometry.buffers;
   views = structuredClone(json.bufferViews ?? []);
+  constructing = false;
+  requiredLengths.clear();
   const imageCache = new Map();
   function readImage(index) {
     try {
