@@ -105,7 +105,8 @@ const environment = await loadGpuAnimationEnvironment(device, './studio.exr', {
 ```
 
 The decoder reads real single-part scanline EXR pixels with NONE, RLE, ZIPS
-(one-row ZIP), or ZIP (16-row blocks) compression. RGB(A) and luminance Y(A)
+(one-row ZIP), ZIP (16-row blocks), PIZ (32-row wavelet/Huffman blocks), or
+PXR24 (16-row delta/deflate blocks) compression. RGB(A) and luminance Y(A)
 channels may independently use HALF, FLOAT or UINT. Finite HALF bits are preserved;
 FLOAT and UINT narrow once to RGBA16F with ties-to-even rounding. Signed radiance
 and alpha are retained, missing alpha becomes one, and Y is replicated to RGB.
@@ -114,9 +115,18 @@ at 65504 and reports the affected output-component count. NaN/Infinity always
 reject. No exposure multiplication, alpha conversion, tone mapping or resampling
 is performed. The existing environment filter retains its own sampling profile.
 
+PIZ reconstructs all source word bits losslessly, including the full 16-bit range
+LUT and independent word planes for FLOAT/UINT. Its canonical Huffman decoder
+supports code lengths through 58 bits without JavaScript integer truncation.
+PXR24 preserves HALF/UINT words; compressed FLOAT samples contain the 24-bit
+precision already chosen by the file encoder. This loader does not recompress or
+introduce an additional PXR24 quality reduction. Raw fallback blocks retain their
+full original FLOAT precision. Both codecs then use the same final RGBA16F
+conversion as the other modes. No caller-provided codec is required.
+
 This is an explicit linear-sRGB/Rec.709 profile. Other declared chromaticities,
 nonunit gamma/pixel aspect, color-adaptation metadata, layered/subsampled channels,
-tiled/deep/multipart images, and other codecs (including PIZ, PXR24 and DWA) reject.
+tiled/deep/multipart images, and other codecs (including B44/B44A and DWA) reject.
 They still require their retained source loader; this is not full EXR compatibility.
 The environment entry additionally rejects cube-map files and cropped data windows
 that differ from the display window. It does not reinterpret missing pixels or
@@ -126,13 +136,14 @@ ordering do not change the top-down output order.
 `animation_exr.mjs` exports `inspectAnimationExr(bytes, options)` for synchronous
 header/chunk-range preflight and `decodeAnimationExr(bytes, options)` for an owned
 RGBA16F image without GPU work. The latter also supports non-panorama dimensions.
-`maxDecodedBytes` bounds the output plus two worst-case decoded blocks;
+`maxDecodedBytes` bounds the output plus two worst-case decoded blocks and,
+for PIZ, bounded typed Huffman/range tables;
 `maxInputBytes` independently bounds the encoded snapshot taken before the first
 asynchronous operation. JavaScript metadata and native decompressor working
-memory are not exact byte-budget claims. ZIP uses the browser's
+memory are not exact byte-budget claims. ZIP and PXR24 use the browser's
 `DecompressionStream('deflate')`; streamed output cannot exceed the declared block.
 Cancellation/device loss aborts pending decode/upload/filter construction without
-publishing a partial map. Synchronous parsing/raw/RLE work is not preemptible.
+publishing a partial map. Synchronous parsing/raw/RLE/PIZ work is not preemptible.
 
 EXR `sourceInfo` adds `format`, `compression`, `channels`, `dataWindow`,
 `displayWindow` and `peakDecodedBytes`. Existing RGBE metadata is unchanged.
@@ -274,7 +285,8 @@ const built = buildAnimation(modelPath, outputDirectory, {
 
 `hdr: true` additionally exports `decodeAnimationHdr` and
 `loadGpuAnimationEnvironment` from the public GPU entry and emits their runtime
-modules. Static dependency closure also includes `animation_exr.mjs`, so this
+modules. Static dependency closure also includes `animation_exr.mjs` and its
+`animation_exr_piz.mjs` helper, so this
 same loader can receive EXR files after deployment. The standalone EXR decoder
 is importable from that emitted module, not an added public GPU-entry export.
 It requires `environment: true` (which requires `webgpu: true`). All added
@@ -307,6 +319,25 @@ relocation test executes the real static-closure helper and actual EXR decoder.
 These results do not establish native WebGPU pixels, full EXR support, full-suite
 compatibility, or a performance improvement.
 
+
+The PIZ/PXR24 codec and loader regressions:
+
+```sh
+node --test tools/ingest/animation_exr.test.mjs \
+  tools/ingest/animation_exr_piz.test.mjs \
+  tools/ingest/animation_exr_pxr24.test.mjs
+```
+
+These 63 cases include complete native-codec fixtures, exact 58-bit Huffman
+codes, malformed/overexpanded streams, signed data, mixed channel types, memory
+limits, immediate input transfer and cancellation. The loader case exercises
+six native panorama byte/stream routes through production source selection and
+upload code; GPU/filter/RGBE boundaries are explicit substitutes. Twenty
+native-codec references (12 PIZ, eight PXR24) match every output byte;
+the full-LUT PIZ FLOAT case also matches all 65,536 original 32-bit words before
+half conversion. Native files and compressed bytes execute, not fabricated
+codec outputs. These checks do not execute WebGPU shaders or establish full EXR
+compatibility or a performance gain.
 
 The HDR decoder, loading and packaging tests:
 

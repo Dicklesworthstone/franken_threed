@@ -60,7 +60,8 @@ function isExr(input) {
  * Streaming assembly grows a single bounded buffer, not an unbounded chunk list;
  * old/new buffers may coexist briefly during growth (at most 2*maxInputBytes).
  * maxDecodedBytes includes RGBA16F output plus decoder scratch: one RGBE row
- * or two EXR scanline blocks. EXR snapshots encoded input before decompression;
+ * or two EXR scanline blocks plus PIZ typed tables. EXR snapshots encoded input
+ * before decompression;
  * that private copy is separately bounded by maxInputBytes. Native ZIP working
  * memory is opaque. No source pixels are borrowed across decompression awaits.
  * maxTextureBytes bounds PEAK logical GPU texels: upload panorama + filtered maps.

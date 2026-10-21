@@ -171,11 +171,12 @@ if(!process.execArgv.includes('--experimental-vm-modules')) {
     const outputs=new Map([['animation_environment_loader.mjs',source]]);
     const runtime=new Map([
       ['animation_exr.mjs',fs.readFileSync(new URL('./animation_exr.mjs',import.meta.url),'utf8')],
+      ['animation_exr_piz.mjs',fs.readFileSync(new URL('./animation_exr_piz.mjs',import.meta.url),'utf8')],
       ['animation_hdr.mjs',`export class AnimationHdrError extends Error{constructor(code,message){super(message);this.code=code;}}\nexport function decodeAnimationHdr(){throw Error('EXR must not use the RGBE boundary');}`],
       ['animation_environment.mjs',`export class AnimationEnvironmentError extends Error{}\nexport function planAnimationEnvironment(){return {uniformBytes:256,textureBytes:128};}\nexport async function createGpuAnimationEnvironment(){let disposed=false;return {get disposed(){return disposed;},failed:false,textureBytes:128,dispose(){disposed=true;},async whenIdle(){}};}`],
     ]);
     helper.namespace.completeAnimationRuntimeModules(outputs,name=>{assert.ok(runtime.has(name),name);return runtime.get(name);});
-    assert.ok(outputs.has('animation_exr.mjs'));assert.equal(outputs.size,4);
+    assert.ok(outputs.has('animation_exr.mjs'));assert.ok(outputs.has('animation_exr_piz.mjs'));assert.equal(outputs.size,5);
     const root=fs.mkdtempSync(path.join(os.tmpdir(),'f3d-exr-closure-')),out=path.join(root,'package'),deployed=path.join(root,'deployed');fs.mkdirSync(out);
     for(const [name,text]of outputs)fs.writeFileSync(path.join(out,name),text);fs.renameSync(out,deployed);
     const {loadGpuAnimationEnvironment}=await import(pathToFileURL(path.join(deployed,'animation_environment_loader.mjs'))),f=await setup();

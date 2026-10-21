@@ -1,5 +1,5 @@
 /** Bounded single-part scanline OpenEXR -> owned, top-down linear RGBA16F.
- * Supports RGB(A)/Y(A), HALF/FLOAT/UINT and NONE/RLE/ZIPS/ZIP/PIZ compression.
+ * Supports RGB(A)/Y(A), HALF/FLOAT/UINT and NONE/RLE/ZIPS/ZIP/PIZ/PXR24 compression.
  * ZIP uses the host DecompressionStream, not a second runtime or codec package.
  * No GPU, file I/O, tone mapping, exposure change or import-time work.
  * Layout: https://openexr.com/en/latest/OpenEXRFileLayout.html
@@ -15,7 +15,7 @@ export class AnimationExrError extends Error {
 const fail = (code, message) => { throw new AnimationExrError('ANIMATION_EXR_' + code, message); };
 const abort = signal => { if (signal?.aborted) throw signal.reason ?? new DOMException('Aborted', 'AbortError'); };
 const positive = (n, label) => { if (!Number.isSafeInteger(n) || n < 1) fail('LIMIT', `Invalid ${label}`); return n; };
-const COMPRESSION = Object.freeze(['none', 'rle', 'zips', 'zip', 'piz']);
+const COMPRESSION = Object.freeze(['none', 'rle', 'zips', 'zip', 'piz', 'pxr24']);
 function storage(input) {
   if (input instanceof ArrayBuffer) {
     try { input = new Uint8Array(input); } catch { fail('STORAGE', 'Input is detached'); }
@@ -80,7 +80,7 @@ function parse(data, limits) {
   const width = dataWindow[2]-dataWindow[0]+1, height = dataWindow[3]-dataWindow[1]+1;
   if (width > limits.maxDimension || height > limits.maxDimension) fail('LIMIT', 'Data window exceeds dimension budget');
   const compression = data[attr('compression', 'compression', 1).at];
-  if (compression > 4) fail('PROFILE', 'Only NONE/RLE/ZIPS/ZIP/PIZ compression is supported');
+  if (compression > 5) fail('PROFILE', 'Only NONE/RLE/ZIPS/ZIP/PIZ/PXR24 compression is supported');
   const order = data[attr('lineOrder', 'lineOrder', 1).at];
   if (order > 2) fail('HEADER', 'Invalid scanline order');
   if (float('pixelAspectRatio') !== 1) fail('PROFILE', 'Non-square pixels require the source loader');
@@ -114,7 +114,7 @@ function parse(data, limits) {
   if (grayscale ? names.some(n => n !== 'Y' && n !== 'A') : !['R','G','B'].every(n => names.includes(n))) fail('PROFILE', 'Incomplete RGB or mixed luminance channels');
   // The file layout, not attribute-list insertion order, defines pixel ordering.
   channels.sort((a,b) => a.name < b.name ? -1 : 1);
-  const rows = compression === 4 ? 32 : compression === 3 ? 16 : 1, count = Math.ceil(height/rows);
+  const rows = compression === 4 ? 32 : (compression === 3 || compression === 5) ? 16 : 1, count = Math.ceil(height/rows);
   const rowBytes = width * channels.reduce((n,c) => n+c.bytes, 0);
   const byteLength = width*height*8, scratchBytes = compression ? rowBytes*Math.min(rows,height)*2 : 0;
   const peakDecodedBytes = byteLength + scratchBytes + (compression === 4 ? EXR_PIZ_TABLE_BYTES : 0);
@@ -191,6 +191,31 @@ async function inflate(input, expected, signal) {
     try { reader.releaseLock(); } catch {}
   }
 }
+/** PXR24 stores high-byte-first planes of per-row/channel integer deltas.
+ * FLOAT contributes only its high 24 bits; the file encoder already chose that
+ * precision. HALF/UINT stay lossless. Do not apply ZIP's byte predictor here.
+ * Reference: OpenEXR v3.3.2 internal_pxr24.c, undo_pxr24_impl.
+ */
+function undoPxr24(data, width, rows, channels) {
+  const rowBytes = width * channels.reduce((sum, channel) => sum + channel.bytes, 0);
+  const result = new Uint8Array(rowBytes * rows), view = new DataView(result.buffer);
+  let source = 0, target = 0;
+  for (let y = 0; y < rows; y++) for (const channel of channels) {
+    const planes = channel.type === 2 ? 3 : channel.bytes;
+    let pixel = 0;
+    for (let x = 0; x < width; x++) {
+      let delta = 0;
+      for (let plane = 0; plane < planes; plane++) delta = delta * 256 + data[source + plane * width + x];
+      if (channel.type === 2) delta *= 256;
+      pixel = (pixel + delta) >>> 0;
+      if (channel.bytes === 2) view.setUint16(target, pixel, true);
+      else view.setUint32(target, pixel, true);
+      target += channel.bytes;
+    }
+    source += width * planes;
+  }
+  return result;
+}
 const roundEven = value => { const n=Math.floor(value), tail=value-n; return n + (tail>0.5 || (tail===0.5 && n%2) ? 1 : 0); };
 function half(value) {
   const sign = value<0 || Object.is(value,-0) ? 0x8000 : 0; value=Math.abs(value);
@@ -214,9 +239,11 @@ export async function decodeAnimationExr(input, settings = {}) {
     abort(limits.signal);
     let raw=data.subarray(chunk.offset,chunk.offset+chunk.length);
     if (raw.length !== chunk.rawBytes) {
-      raw = plan.compression === 4
-        ? decodeExrPiz(raw, plan.metadata.width, chunk.rowCount, plan.channels, fail)
-        : undoPredictor(plan.compression === 1 ? rle(raw,chunk.rawBytes) : await inflate(raw,chunk.rawBytes,limits.signal));
+      if (plan.compression === 4) raw = decodeExrPiz(raw, plan.metadata.width, chunk.rowCount, plan.channels, fail);
+      else if (plan.compression === 5) {
+        const expanded = plan.metadata.width * chunk.rowCount * plan.channels.reduce((sum, channel) => sum + (channel.type === 2 ? 3 : channel.bytes), 0);
+        raw = undoPxr24(await inflate(raw, expanded, limits.signal), plan.metadata.width, chunk.rowCount, plan.channels);
+      } else raw = undoPredictor(plan.compression === 1 ? rle(raw,chunk.rawBytes) : await inflate(raw,chunk.rawBytes,limits.signal));
     }
     abort(limits.signal);
     const view=new DataView(raw.buffer,raw.byteOffset,raw.byteLength); let at=0;
