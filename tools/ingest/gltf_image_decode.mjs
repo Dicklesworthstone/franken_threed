@@ -1,4 +1,4 @@
-/** Bounded PNG/JPEG decoder handoff, independent of DOM and GPU services.
+/** Bounded PNG/JPEG/WebP decoder handoff, independent of DOM and GPU services.
  * An explicit decodeImage callback returns straight-alpha, unflipped RGBA8 in
  * the file's encoded channel domain. It must honor the supplied no-conversion
  * options. Browser ImageBitmap decoding remains the default; no decoder or
@@ -81,13 +81,13 @@ export async function decodeGltfImage(image, {
   if (!Number.isSafeInteger(width) || width < 1 ||
       !Number.isSafeInteger(height) || height < 1 || width > maxImagePixels / height)
     fail("LIMIT", "Image dimensions exceed decoded pixel budget");
-  if (!fixedBytes(image?.bytes) || !["image/png", "image/jpeg"].includes(image?.mimeType))
-    fail("IMAGE", "Expected fixed PNG/JPEG image bytes");
+  if (!fixedBytes(image?.bytes) || !["image/png", "image/jpeg", "image/webp"].includes(image?.mimeType))
+    fail("IMAGE", "Expected fixed PNG/JPEG/WebP image bytes");
   if (decodeImage !== undefined && typeof decodeImage !== "function")
     fail("DEVICE", "decodeImage must be a function");
   const raw = decodeImage !== undefined;
   if (!raw && typeof createBitmap !== "function")
-    fail("DEVICE", "PNG/JPEG decoding requires createImageBitmap or an explicit decodeImage callback");
+    fail("DEVICE", "PNG/JPEG/WebP decoding requires createImageBitmap or an explicit decodeImage callback");
   if (signal?.aborted) throw abortReason(signal);
   const options = Object.freeze({
     imageOrientation: "none", premultiplyAlpha: "none", colorSpaceConversion: "none",

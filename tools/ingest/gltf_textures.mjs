@@ -1,10 +1,11 @@
-/** Owned PNG/JPEG and BasisU KTX2 glTF image uploads and sampler/mipmap realization for WebGPU.
+/** Owned PNG/JPEG/WebP and BasisU KTX2 glTF image uploads and sampler/mipmap realization for WebGPU.
  * Requests come from prepareGltfAnimationModel(). The supplied device is borrowed.
  * A texture is shared by image AND color space, never across incompatible mip
  * filtering domains. Samplers remain distinct when source sampling differs.
  * Images retain glTF orientation, straight alpha and encoded numeric channels.
  * https://gpuweb.github.io/gpuweb/#dom-gpuqueue-copyexternalimagetotexture
  */
+import { gltfWebpDimensions } from "./gltf_webp.mjs";
 import { inspectGltfKtx2, transcodeGltfKtx2 } from "./gltf_ktx2.mjs";
 import { decodeGltfImage, GltfTextureError } from "./gltf_image_decode.mjs";
 import { createGltfImagePrefetch } from "./gltf_image_prefetch.mjs";
@@ -36,9 +37,10 @@ const filters = new Map([
 ]);
 
 /** Read dimensions BEFORE native image decoding, bounding decompression size.
- * This is a header check, not a PNG/JPEG decoder or complete file validator.
+ * This is a header check, not a PNG/JPEG/WebP decoder or complete file validator.
  */
 export function gltfImageDimensions(bytes, mimeType) {
+  if (mimeType === "image/webp") return gltfWebpDimensions(bytes);
   if (
     !(bytes instanceof Uint8Array) ||
     !(bytes.buffer instanceof ArrayBuffer) ||
@@ -84,7 +86,7 @@ export function gltfImageDimensions(bytes, mimeType) {
       at += length;
     }
   }
-  fail("IMAGE", "Missing supported PNG/JPEG dimensions");
+  fail("IMAGE", "Missing supported PNG/JPEG/WebP dimensions");
 }
 const mipShader = `
 @group(0) @binding(0) var source: texture_2d<f32>;
@@ -163,7 +165,7 @@ export async function createGltfTextureResources(
     // later explicit requirement, or disguise a PNG as a BasisU source.
     const mimeType = request.image?.mimeType;
     if (mimeType !== undefined) {
-      if (!["image/png", "image/jpeg", "image/ktx2"].includes(mimeType))
+      if (!["image/png", "image/jpeg", "image/webp", "image/ktx2"].includes(mimeType))
         fail("REQUEST", "Unsupported requested image MIME type");
       if (expectedMimeTypes.has(imageIndex) && expectedMimeTypes.get(imageIndex) !== mimeType)
         fail("REQUEST", "Conflicting image MIME requirements");
@@ -345,7 +347,7 @@ export async function createGltfTextureResources(
     textureBytes += decoded.byteLength;
     await checked(() => {
       // Compressed textures cannot be render attachments. Typed-byte uploads use
-      // the final transfer format directly, unlike external PNG/JPEG image copies.
+      // the final transfer format directly, unlike external PNG/JPEG/WebP image copies.
       const texture = device.createTexture({
         label: `glTF KTX2 image ${imageIndex}`,
         size: [decoded.width, decoded.height, 1],
@@ -384,12 +386,12 @@ export async function createGltfTextureResources(
       }
       if (decodeImage !== undefined) {
         if (typeof decodeImage !== "function" || typeof device.queue.writeTexture !== "function")
-          fail("DEVICE", "Raw PNG/JPEG uploads require decodeImage and queue.writeTexture");
+          fail("DEVICE", "Raw PNG/JPEG/WebP uploads require decodeImage and queue.writeTexture");
       } else if (
         typeof createBitmap !== "function" ||
         typeof device.queue.copyExternalImageToTexture !== "function"
       ) {
-        fail("DEVICE", "PNG/JPEG uploads require ImageBitmap and external image copy");
+        fail("DEVICE", "PNG/JPEG/WebP uploads require ImageBitmap and external image copy");
       }
       const { width, height } = gltfImageDimensions(image?.bytes, image?.mimeType);
       if (
