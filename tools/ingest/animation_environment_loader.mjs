@@ -1,4 +1,4 @@
-/** Load one Radiance HDR panorama into the existing animation IBL preparation
+/** Load a Radiance HDR or scanline OpenEXR panorama into the existing IBL preparation
  * pipeline. The returned map is directly usable as frame.environment.map.
  * CPU bytes and the temporary upload texture are released before publication;
  * the prepared map owns only its diffuse/specular/DFG textures, never the device.
@@ -11,6 +11,7 @@ import {
   planAnimationEnvironment,
 } from "./animation_environment.mjs";
 import { AnimationHdrError, decodeAnimationHdr } from "./animation_hdr.mjs";
+import { decodeAnimationExr, inspectAnimationExr } from "./animation_exr.mjs";
 
 const fail = (code, message) => {
   throw new AnimationHdrError("ANIMATION_HDR_" + code, message);
@@ -40,13 +41,28 @@ function sourceUrl(source, baseURL) {
   return url.href;
 }
 
+function isExr(input) {
+  try {
+    const bytes = input instanceof ArrayBuffer ? new Uint8Array(input) : input;
+    return bytes instanceof Uint8Array && bytes.length >= 4 &&
+      bytes[0] === 0x76 && bytes[1] === 0x2f && bytes[2] === 0x31 && bytes[3] === 1;
+  } catch { return false; } // The selected decoder reports unsafe/detached storage.
+}
+
 /** source is ArrayBuffer/Uint8Array or HTTP(S) URL; relative URLs need baseURL.
+ * format:'auto' (default) selects EXR by magic bytes, never by URL or MIME hints.
+ * format:'hdr' or 'exr' explicitly selects one decoder. EXR accepts the bounded
+ * scanline profile documented in animation_exr.mjs, with a complete 2:1 data
+ * window equal to the display window; cube/cropped files need their source route.
  * Fetch uses credentials:omit and redirect:error. An injected fetch must implement
  * streaming Response.body; this is not an SSRF sandbox for custom transports.
  * maxInputBytes limits the actual streamed body even without Content-Length.
  * Streaming assembly grows a single bounded buffer, not an unbounded chunk list;
  * old/new buffers may coexist briefly during growth (at most 2*maxInputBytes).
- * maxDecodedBytes includes RGBA16F output and scanline scratch (see decoder).
+ * maxDecodedBytes includes RGBA16F output plus decoder scratch: one RGBE row
+ * or two EXR scanline blocks. EXR snapshots encoded input before decompression;
+ * that private copy is separately bounded by maxInputBytes. Native ZIP working
+ * memory is opaque. No source pixels are borrowed across decompression awaits.
  * maxTextureBytes bounds PEAK logical GPU texels: upload panorama + filtered maps.
  * Filter uniforms remain separately checked against the device's maxBufferSize.
  * Cancellation/device loss races every asynchronous boundary, including custom
@@ -68,6 +84,7 @@ export async function loadGpuAnimationEnvironment(device, source, options = {}) 
         "maxHeaderBytes",
         "maxTextureBytes",
         "overflow",
+        "format",
         ...filterKeys,
       ].includes(key)
     )
@@ -81,6 +98,7 @@ export async function loadGpuAnimationEnvironment(device, source, options = {}) 
     maxHeaderBytes = 64 * 1024,
     maxTextureBytes = 128 * 1024 * 1024,
     overflow = "reject",
+    format = "auto",
   } = options;
   for (const [key, value] of Object.entries({
     maxInputBytes,
@@ -89,6 +107,7 @@ export async function loadGpuAnimationEnvironment(device, source, options = {}) 
     maxTextureBytes,
   }))
     positive(value, key);
+  if (!["auto", "hdr", "exr"].includes(format)) fail("OPTIONS", "format must be auto, hdr or exr");
   if (!["reject", "clamp"].includes(overflow)) fail("OPTIONS", "overflow must be reject or clamp");
   if (
     signal !== undefined &&
@@ -239,18 +258,30 @@ export async function loadGpuAnimationEnvironment(device, source, options = {}) 
     return storage.subarray(0, total);
   }
   try {
-    // Byte inputs are decoded synchronously before the first await, so the caller
-    // cannot mutate borrowed pixels while network/driver work is outstanding.
+    // HDR decodes synchronously; EXR takes its own byte snapshot synchronously
+    // before its first native decompression await. Capture size before callers
+    // can detach or overwrite their input, not after decoding completes.
     let encoded = url === null ? source : await readUrl();
     check();
-    let image = decodeAnimationHdr(encoded, {
-      maxInputBytes,
-      maxDecodedBytes,
-      maxHeaderBytes,
-      maxDimension,
-      overflow,
-    });
-    const inputBytes = encoded.byteLength;
+    const inputBytes = encoded?.byteLength;
+    const decodeOptions = {maxInputBytes, maxDecodedBytes, maxHeaderBytes, maxDimension, overflow};
+    const exr = format === "exr" || (format === "auto" && isExr(encoded));
+    let image;
+    if (exr) {
+      const info = inspectAnimationExr(encoded, decodeOptions);
+      if (info.width !== info.height * 2 || info.environmentMap === "cube" ||
+          info.dataWindow.some((value, index) => value !== info.displayWindow[index]))
+        fail("SOURCE", "Environment EXR requires a complete 2:1 latlong display/data window");
+      if (info.byteLength + plan.textureBytes > maxTextureBytes)
+        fail("LIMIT", "Panorama plus filtered environment exceeds GPU texture budget");
+      const decoding = decodeAnimationExr(encoded, {...decodeOptions, signal: controller.signal});
+      encoded = null;
+      source = null;
+      image = await wait(decoding);
+      check();
+    } else {
+      image = decodeAnimationHdr(encoded, decodeOptions);
+    }
     encoded = null;
     source = null;
     if (image.width !== image.height * 2)
@@ -262,6 +293,9 @@ export async function loadGpuAnimationEnvironment(device, source, options = {}) 
       width: image.width,
       height: image.height,
       inputBytes,
+      ...(exr ? {format: "exr", compression: image.compression, channels: image.channels,
+        dataWindow: image.dataWindow, displayWindow: image.displayWindow,
+        peakDecodedBytes: image.peakDecodedBytes} : {}),
       exposure: image.exposure,
       clampedComponents: image.clampedComponents,
       uploadTextureBytes: image.byteLength,

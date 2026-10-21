@@ -44,7 +44,7 @@ For example, use `{scene: {renderer: {environment: true}}}` with
 `loadGpuGltfAnimationScene`. The low-level factory above borrows an existing GPU
 texture; the HDR loader below handles file decoding and upload instead.
 
-## Loading HDR files
+## Loading HDR and EXR files
 
 ```js
 import { loadGpuAnimationEnvironment } from './animation_environment_loader.mjs';
@@ -62,7 +62,7 @@ const environment = await loadGpuAnimationEnvironment(device, './studio.hdr', {
 ```
 
 `source` can instead be an `ArrayBuffer` or `Uint8Array` containing a complete
-Radiance RGBE file. The loader decodes, uploads once, runs the existing IBL
+Radiance RGBE or supported scanline OpenEXR file. The loader decodes, uploads once, runs the existing IBL
 preparation, waits for filtering completion and destroys the temporary panorama
 before returning the ready receiver map. No application decoder, canvas, manual
 texture upload or second frame loop is required. The caller owns the returned map
@@ -70,8 +70,13 @@ and must dispose it after its consumers stop; the GPU device remains borrowed.
 `sourceInfo` reports dimensions, input bytes, exposure metadata, clamped component
 count, upload texture bytes and peak logical texture bytes.
 
-Only **2:1 Radiance RGBE panoramas** are accepted by this loader, not EXR, XYZE or
-arbitrary image formats. The decoder supports raw pixels, modern planar RLE and
+`format: 'auto'` selects EXR by its file signature, not the URL extension or HTTP
+Content-Type. Use `format: 'hdr'` or `format: 'exr'` to require a specific format.
+A failed selected decoder does not retry another one or fabricate a texture.
+Both routes require complete **2:1 panoramas**. XYZE and unrelated image formats
+remain outside this loader.
+
+For Radiance RGBE, the decoder supports raw pixels, modern planar RLE and
 legacy repeat packets. All eight scan-axis/sign orientations normalize to top-down
 `-Y +X`. Pixels decode directly to tightly packed linear-sRGB RGBA16F with
 nearest-even rounding; component scaling follows Three r186 HDRLoader. Exposure
@@ -85,6 +90,53 @@ The standalone `decodeAnimationHdr(bytes, options)` also exports the owned
 RGBA16F pixels without any GPU work. Its `maxDecodedBytes` bounds the output plus
 one scanline of scratch storage; encoded bytes and header bytes have separate
 limits. It accepts non-panorama dimensions for callers using decoded pixels directly.
+
+### OpenEXR scanline profile
+
+```js
+const environment = await loadGpuAnimationEnvironment(device, './studio.exr', {
+  baseURL: import.meta.url,
+  format: 'exr', // Optional; the default detects the same magic bytes.
+  size: 128,
+  samples: 1024,
+  maxInputBytes: 64 * 1024 * 1024,
+  maxDecodedBytes: 256 * 1024 * 1024,
+});
+```
+
+The decoder reads real single-part scanline EXR pixels with NONE, RLE, ZIPS
+(one-row ZIP), or ZIP (16-row blocks) compression. RGB(A) and luminance Y(A)
+channels may independently use HALF, FLOAT or UINT. Finite HALF bits are preserved;
+FLOAT and UINT narrow once to RGBA16F with ties-to-even rounding. Signed radiance
+and alpha are retained, missing alpha becomes one, and Y is replicated to RGB.
+Overflow rejects by default; `overflow: 'clamp'` explicitly saturates signed values
+at 65504 and reports the affected output-component count. NaN/Infinity always
+reject. No exposure multiplication, alpha conversion, tone mapping or resampling
+is performed. The existing environment filter retains its own sampling profile.
+
+This is an explicit linear-sRGB/Rec.709 profile. Other declared chromaticities,
+nonunit gamma/pixel aspect, color-adaptation metadata, layered/subsampled channels,
+tiled/deep/multipart images, and other codecs (including PIZ, PXR24 and DWA) reject.
+They still require their retained source loader; this is not full EXR compatibility.
+The environment entry additionally rejects cube-map files and cropped data windows
+that differ from the display window. It does not reinterpret missing pixels or
+stretch a cropped image into a panorama. Data-window origins and physical chunk
+ordering do not change the top-down output order.
+
+`animation_exr.mjs` exports `inspectAnimationExr(bytes, options)` for synchronous
+header/chunk-range preflight and `decodeAnimationExr(bytes, options)` for an owned
+RGBA16F image without GPU work. The latter also supports non-panorama dimensions.
+`maxDecodedBytes` bounds the output plus two worst-case decoded blocks;
+`maxInputBytes` independently bounds the encoded snapshot taken before the first
+asynchronous operation. JavaScript metadata and native decompressor working
+memory are not exact byte-budget claims. ZIP uses the browser's
+`DecompressionStream('deflate')`; streamed output cannot exceed the declared block.
+Cancellation/device loss aborts pending decode/upload/filter construction without
+publishing a partial map. Synchronous parsing/raw/RLE work is not preemptible.
+
+EXR `sourceInfo` adds `format`, `compression`, `channels`, `dataWindow`,
+`displayWindow` and `peakDecodedBytes`. Existing RGBE metadata is unchanged.
+Exposure headers are metadata, not instructions to scale the stored radiance.
 
 HTTP(S) loading accepts an injected `fetch` and requires streaming response bytes.
 Relative URLs require `baseURL`; embedded credentials and redirects reject, and
@@ -222,7 +274,10 @@ const built = buildAnimation(modelPath, outputDirectory, {
 
 `hdr: true` additionally exports `decodeAnimationHdr` and
 `loadGpuAnimationEnvironment` from the public GPU entry and emits their runtime
-modules. It requires `environment: true` (which requires `webgpu: true`). All added
+modules. Static dependency closure also includes `animation_exr.mjs`, so this
+same loader can receive EXR files after deployment. The standalone EXR decoder
+is importable from that emitted module, not an added public GPU-entry export.
+It requires `environment: true` (which requires `webgpu: true`). All added
 bytes participate in the existing exact pre-write output budget. No HDR URL is
 fetched while building or importing the package; loading begins only when called.
 Omitting `hdr` leaves CPU, ordinary GPU and existing GPU-IBL package output bytes
@@ -234,6 +289,24 @@ glTF pose/material/scene dependencies are explicit substitutes in those tests;
 this is not a full binary glTF-to-rendered-scene or native GPU equivalence test.
 
 ## Focused validation
+
+The EXR decoder and loader integration tests:
+
+```sh
+node --test tools/ingest/animation_exr.test.mjs \
+  tools/ingest/animation_exr_loading.test.mjs
+```
+
+There are 28 decoder cases and 20 loading/closure cases (the latter's default
+invocation runs a VM-linker child). Actual compressed EXR bytes and native ZIP
+inflation execute, including complete native OpenEXR-generated reference files.
+Eight additional HALF/FLOAT references across NONE/RLE/ZIPS/ZIP decoded byte-for-
+byte identically to native OpenEXR output narrowed to RGBA16F. Loading tests use
+recording GPU interfaces and explicit existing filter/RGBE boundaries; the
+relocation test executes the real static-closure helper and actual EXR decoder.
+These results do not establish native WebGPU pixels, full EXR support, full-suite
+compatibility, or a performance improvement.
+
 
 The HDR decoder, loading and packaging tests:
 
