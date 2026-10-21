@@ -59,17 +59,56 @@ are not changed. Existing material occlusion and coating composition remain at
 their surrounding renderer boundaries. In particular this feature does not add
 multiple-scattering compensation to direct lights or a transmission model.
 
+## More stable DFG integration at grazing angles
+
+Newly prepared environments use visible-normal GGX importance sampling for the
+DFG lookup. The projected-disk method follows Heitz (JCGT 7(4), 2018,
+https://jcgt.org/published/0007/04/01/), specialized to the lookup's view plane.
+The remaining importance weight is the correlated-Smith `G2(V,L)/G1(V)` ratio,
+which stays bounded even at grazing angles. Using `G1(L)` instead would change
+the BRDF; this implementation retains the existing correlated-Smith integral.
+The zero-roughness limit is evaluated analytically.
+
+This change is automatic during environment preparation and benefits both
+scattering modes. It does not add samples, passes, textures, uniforms, or runtime
+dependencies. The original normal-incidence specular convolution and cosine
+sampling of diffuse irradiance are unchanged. Existing prepared maps remain
+compatible. The default receiver equations are unchanged, but newly integrated
+DFG coefficients intentionally differ at finite sample counts; this is not a
+promise of bit-identical newly prepared lighting.
+
+Eleven roughness/view-angle pairs at 4,096 samples agreed within `2.5e-4` per
+coefficient with independent incoming-solid-angle quadrature. Across five fixed
+grazing-angle cases at 128 samples, the sum of coefficient-pair errors was
+`0.0223383` with visible-normal sampling versus `0.0833055` with the previous
+full-normal-distribution sampler: about 73.2% lower aggregate error for those
+cases. This does not imply every input improves, equivalent GPU timing, or
+rendered-pixel agreement. The oracle integrates the BRDF directly over incident
+light directions rather than reusing either importance sampler.
+
 ## Validation
 
 ```sh
-node --test tools/ingest/animation_environment_scattering.test.mjs
+node --test tools/ingest/animation_environment.test.mjs \
+  tools/ingest/animation_environment_receiver.test.mjs \
+  tools/ingest/animation_environment_scattering.test.mjs \
+  tools/ingest/animation_environment_vndf.test.mjs
 ```
 
-The focused tests run production admission/packing and scalarize the emitted
+These 68 tests passed with no failures or skips: 22 existing preparation tests,
+eight unchanged receiver tests, 21 scattering tests, and 17 visible-normal tests.
+The preparation tests use recording GPU interfaces for the existing allocation,
+submission, cancellation, device-loss and disposal paths. Only the existing
+shader-weight assertion changed to match the new importance estimator.
+
+The focused numerical tests run production admission/packing and scalarize the emitted
 component-independent WGSL arithmetic, comparing it against an independent sum
 of repeated bounces. They cover white-furnace energy, colored metals/dielectrics,
 partial metalness, distinct irradiance/radiance, zero F90, intensity, DFG edge
-cases, legacy shader branches, binding layout and snapshot lifetime. The test
+cases, legacy shader branches, binding layout and snapshot lifetime. Visible-normal
+checks additionally cover independent solid-angle quadrature, sample visibility,
+unit length, low sample counts, grazing and smooth limits, and unchanged budgets.
+The test
 scalarization is explicitly not a WGSL compiler or native GPU execution. Native
 browser validation was blocked by the implementation environment's browser
 policy; rendered pixels, full renderer integration and full-workspace regression

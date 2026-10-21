@@ -87,6 +87,8 @@ export function planAnimationEnvironment({
 }
 /** Shared sampling equations, also independently exercised by the numerical
  * tests. GGX alpha is perceptual roughness squared; diffuse uses cosine sampling.
+ * DFG uses visible-normal importance sampling with bounded correlated-Smith
+ * weights. Radiance convolution keeps its original normal-incidence sampling.
  */
 export const ANIMATION_ENVIRONMENT_WGSL = /* wgsl */ `
 struct FilterInfo { face: u32, kind: u32, count: u32, size: u32, roughness: f32, pad0: u32, pad1: u32, pad2: u32 }
@@ -123,16 +125,40 @@ fn half_vector(xi: vec2<f32>, roughness: f32) -> vec3<f32> {
 fn radiance(d: vec3<f32>) -> vec3<f32> {
   // SOURCE_SAMPLE
 }
+// Heitz's visible-GGX projected-disk sampling, specialized to view.y == 0.
+// T1=(0,1,0), T2=(-stretched.z,0,stretched.x) is valid even at normal incidence.
+// https://jcgt.org/published/0007/04/01/ ; no rejection or extra random samples.
+fn visible_half_vector(xi: vec2<f32>, nv: f32, alpha: f32) -> vec3<f32> {
+  let vx=alpha*sqrt(max(0.0,1.0-nv*nv));
+  let length=sqrt(vx*vx+nv*nv);
+  let sx=vx/length; let sz=nv/length;
+  let radius=sqrt(xi.x); let phi=2.0*PI*xi.y;
+  let t1=radius*cos(phi);
+  let blend=0.5*(1.0+sz);
+  let t2=(1.0-blend)*sqrt(max(0.0,1.0-t1*t1))+blend*radius*sin(phi);
+  let t3=sqrt(max(0.0,1.0-t1*t1-t2*t2));
+  let hx=alpha*(-t2*sz+t3*sx); let hy=alpha*t1;
+  let hz=max(0.0,t2*sx+t3*sz);
+  let norm=sqrt(hx*hx+hy*hy+hz*hz);
+  return vec3<f32>(hx/norm,hy/norm,hz/norm);
+}
 fn integrate_dfg(nv: f32, roughness: f32) -> vec2<f32> {
-  let v=vec3<f32>(sqrt(max(0.0,1.0-nv*nv)),0.0,nv);
+  if(roughness==0.0) {
+    let f=pow(1.0-nv,5.0); return vec2<f32>(1.0-f,f);
+  }
+  let vx=sqrt(max(0.0,1.0-nv*nv));
   let alpha=roughness*roughness; let a2=alpha*alpha;
+  let smith_v=sqrt(nv*nv*(1.0-a2)+a2);
   var result=vec2<f32>(0.0);
   for(var i=0u;i<info.count;i++) {
-    let h=half_vector(sequence(i,info.count),roughness);
-    let vh=max(dot(v,h),0.0); let l=2.0*vh*h-v; let nl=l.z;
-    if(nl>0.0&&h.z>0.0) {
-      let visibility=0.5/(nl*sqrt(nv*nv*(1.0-a2)+a2)+nv*sqrt(nl*nl*(1.0-a2)+a2));
-      let weight=4.0*visibility*nl*vh/h.z;
+    let h=visible_half_vector(sequence(i,info.count),nv,alpha);
+    let vh=clamp(vx*h.x+nv*h.z,0.0,1.0); let nl=2.0*vh*h.z-nv;
+    if(nl>0.0) {
+      // VNDF reflection PDF cancels D, V.H and G1(V). The remaining weight
+      // G2(V,L)/G1(V) is in [0,1], including grazing angles. Keep correlated
+      // Smith masking: replacing this ratio with G1(L) changes the BRDF.
+      let smith_l=sqrt(nl*nl*(1.0-a2)+a2);
+      let weight=nl*(nv+smith_v)/(nl*smith_v+nv*smith_l);
       let f=pow(1.0-vh,5.0); result+=vec2<f32>(1.0-f,f)*weight;
     }
   }

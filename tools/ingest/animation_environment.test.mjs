@@ -362,7 +362,7 @@ test("shader profiles use explicit LOD, stable cube faces, correlated visibility
     assert.match(shader, cube ? /texture_cube<f32>/ : /texture_2d<f32>/);
     assert.match(shader, /textureSampleLevel/);
     assert.doesNotMatch(shader, /textureSample\(/);
-    assert.match(shader, /4\.0\*visibility\*nl\*vh\/h\.z/);
+    assert.match(shader, /nl\*\(nv\+smith_v\)\/\(nl\*smith_v\+nv\*smith_l\)/);
     assert.match(shader, /info\.kind==2u/);
   }
   assert.match(animationEnvironmentShader(false), /atan2\(d.z,d.x\)/);
