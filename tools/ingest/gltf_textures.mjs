@@ -7,6 +7,8 @@
  */
 import { inspectGltfKtx2, transcodeGltfKtx2 } from "./gltf_ktx2.mjs";
 import { decodeGltfImage, GltfTextureError } from "./gltf_image_decode.mjs";
+import { createGltfImagePrefetch } from "./gltf_image_prefetch.mjs";
+import { waitForGltfResource } from "./gltf_resource_queue.mjs";
 export { GltfTextureError } from "./gltf_image_decode.mjs";
 const fail = (code, message) => {
   throw new GltfTextureError("GLTF_TEXTURE_" + code, message);
@@ -97,7 +99,16 @@ const mipShader = `
 }`;
 
 /** Create a synchronous resolveTexture callback for the model decoder.
- * readImage(index) -> Promise<{bytes: Uint8Array, mimeType}> (loadGltfAsset API).
+ * readImage(index, {signal}) -> Promise<{bytes: Uint8Array, mimeType}>. Providers
+ * may ignore the optional cancellation argument (including loadGltfAsset).
+ * maxConcurrentImageRequests (default 4, range 1..32) bounds a lookahead window
+ * including the current image. Encoded reads overlap; decoding, byte reservations
+ * and GPU uploads remain serial in first-use order. No unselected images load.
+ * Providers must keep outstanding encoded bytes stable; use a window of one for
+ * a serial-only provider. The provider still owns encoded-byte budgets/caches.
+ * A failed read stops the
+ * window and current decode/upload wait; borrowed I/O may finish if it ignores
+ * cancellation, but late values never reach the GPU.
  * Defaults for missing glTF filters are an explicit loader policy: linear mag,
  * trilinear min. Nonmip filters clamp LOD to zero even on a shared mip chain.
  * maxTextureBytes bounds actual texel/block storage, including authored mips,
@@ -124,6 +135,7 @@ export async function createGltfTextureResources(
     maxTextureBytes = 256 * 1024 * 1024,
     maxImagePixels = 16 * 1024 * 1024,
     maxTextures = 4096,
+    maxConcurrentImageRequests = 4,
     maxTranscodeBytes = 256 * 1024 * 1024,
     defaultMagFilter = 9729,
     defaultMinFilter = 9987,
@@ -133,6 +145,8 @@ export async function createGltfTextureResources(
   positive(maxTextureBytes, "texture byte limit");
   positive(maxImagePixels, "image pixel limit");
   positive(maxTextures, "texture count");
+  positive(maxConcurrentImageRequests, "image prefetch window");
+  if (maxConcurrentImageRequests > 32) fail("LIMIT", "At most 32 prefetched images");
   if (!Array.isArray(requests) || requests.length > maxTextures || typeof readImage !== "function")
     fail("REQUEST", "Invalid texture requests or image provider");
   if (![9728, 9729].includes(defaultMagFilter) || !filters.has(defaultMinFilter))
@@ -196,7 +210,9 @@ export async function createGltfTextureResources(
   let disposed = false,
     terminal = null,
     textureBytes = 0,
-    decodeCancel = null;
+    decodeCancel = null,
+    imageReads = null,
+    preparing = true;
   function release() {
     for (const texture of owned) texture.destroy();
     owned.clear();
@@ -206,6 +222,7 @@ export async function createGltfTextureResources(
   }
   function live() {
     if (terminal) throw terminal;
+    if (preparing && imageReads?.signal.aborted) throw imageReads.signal.reason;
     if (disposed) fail("DISPOSED", "Texture resources have been disposed");
     if (signal?.aborted) throw signal.reason ?? new DOMException("Aborted", "AbortError");
   }
@@ -228,11 +245,13 @@ export async function createGltfTextureResources(
             info?.message ?? "WebGPU device lost",
           );
           release();
+          imageReads?.cancel(terminal);
           decodeCancel?.abort(terminal);
         },
         (error) => {
           terminal = error;
           release();
+          imageReads?.cancel(error);
           decodeCancel?.abort(error);
         },
       );
@@ -251,7 +270,9 @@ export async function createGltfTextureResources(
     }
     const validation = device.popErrorScope(),
       memory = device.popErrorScope();
-    const [result, v, m] = await Promise.all([value, validation, memory]);
+    const [result, v, m] = await waitForGltfResource(
+      Promise.all([value, validation, memory]), imageReads.signal,
+    );
     if (error) throw error;
     if (v || m) fail("GPU", (v || m).message ?? "WebGPU upload failed");
     live();
@@ -302,8 +323,8 @@ export async function createGltfTextureResources(
     // the adapter closes a late native result after rejecting construction.
     const controller = new AbortController();
     decodeCancel = controller;
-    const cancel = () => controller.abort(signal.reason);
-    signal?.addEventListener("abort", cancel, { once: true });
+    const cancel = () => controller.abort(imageReads.signal.reason);
+    imageReads.signal.addEventListener("abort", cancel, { once: true });
     let decoded;
     try {
       live();
@@ -315,7 +336,7 @@ export async function createGltfTextureResources(
         signal: controller.signal,
       });
     } finally {
-      signal?.removeEventListener("abort", cancel);
+      imageReads.signal.removeEventListener("abort", cancel);
       decodeCancel = null;
     }
     live();
@@ -345,9 +366,12 @@ export async function createGltfTextureResources(
     });
   }
   try {
+    imageReads = createGltfImagePrefetch(images.keys(), readImage, {
+      windowSize: maxConcurrentImageRequests, signal,
+    });
     for (const [imageIndex, groups] of images) {
       live();
-      const image = await readImage(imageIndex);
+      const image = await imageReads.take(imageIndex);
       live();
       if (
         expectedMimeTypes.has(imageIndex) &&
@@ -391,8 +415,8 @@ export async function createGltfTextureResources(
       }
       const controller = new AbortController();
       decodeCancel = controller;
-      const cancel = () => controller.abort(signal.reason);
-      signal?.addEventListener("abort", cancel, { once: true });
+      const cancel = () => controller.abort(imageReads.signal.reason);
+      imageReads.signal.addEventListener("abort", cancel, { once: true });
       let decoded;
       try {
         live();
@@ -401,7 +425,7 @@ export async function createGltfTextureResources(
           signal: controller.signal,
         });
       } finally {
-        signal?.removeEventListener("abort", cancel);
+        imageReads.signal.removeEventListener("abort", cancel);
         decodeCancel = null;
       }
       try {
@@ -475,8 +499,10 @@ export async function createGltfTextureResources(
         decoded.close();
       }
     }
-    if (entries.size) await device.queue.onSubmittedWorkDone();
+    if (entries.size)
+      await waitForGltfResource(device.queue.onSubmittedWorkDone(), imageReads.signal);
     live();
+    preparing = false;
     return Object.freeze({
       get textureBytes() {
         return owned.size ? textureBytes : 0;
@@ -505,7 +531,11 @@ export async function createGltfTextureResources(
       },
     });
   } catch (error) {
+    imageReads?.cancel(error);
     release();
     throw error;
+  } finally {
+    imageReads?.dispose();
+    imageReads = null;
   }
 }
