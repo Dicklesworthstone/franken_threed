@@ -114,7 +114,7 @@ for(const version of [1,2|512,2|2048,2|4096,2|256])test(`unsupported version/fla
   assert.throws(()=>inspectAnimationExr(fixture({version}).bytes),error('PROFILE'));
 });
 test('unsupported compression/channel interpretation and color metadata reject explicitly',()=>{
-  for(const opts of [{compression:4},{types:{R:2,G:2}},{types:{R:2,G:2,B:2,Y:2}},{types:{'layer.R':2}},
+  for(const opts of [{compression:6},{types:{R:2,G:2}},{types:{R:2,G:2,B:2,Y:2}},{types:{'layer.R':2}},
     {sampling:2},{extra:[['gamma','float',f32(2.2)]]},{replace:{pixelAspectRatio:f32(2)}},
     {extra:[['chromaticities','chromaticities',Buffer.alloc(32)]]},{extra:[['adoptedNeutral','v2f',Buffer.alloc(8)]]}])
     assert.throws(()=>inspectAnimationExr(fixture(opts).bytes),error('PROFILE'));

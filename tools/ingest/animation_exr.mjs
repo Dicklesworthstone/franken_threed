@@ -1,5 +1,5 @@
 /** Bounded single-part scanline OpenEXR -> owned, top-down linear RGBA16F.
- * Supports RGB(A)/Y(A), HALF/FLOAT/UINT and NONE/RLE/ZIPS/ZIP compression.
+ * Supports RGB(A)/Y(A), HALF/FLOAT/UINT and NONE/RLE/ZIPS/ZIP/PIZ compression.
  * ZIP uses the host DecompressionStream, not a second runtime or codec package.
  * No GPU, file I/O, tone mapping, exposure change or import-time work.
  * Layout: https://openexr.com/en/latest/OpenEXRFileLayout.html
@@ -7,13 +7,15 @@
  * Tiled, deep, multipart, subsampled, layered and other compression profiles
  * require their retained loader; unsupported input is never partially published.
  */
+import {decodeExrPiz, EXR_PIZ_TABLE_BYTES} from './animation_exr_piz.mjs';
+
 export class AnimationExrError extends Error {
   constructor(code, message) { super(`${code}: ${message}`); this.name = 'AnimationExrError'; this.code = code; }
 }
 const fail = (code, message) => { throw new AnimationExrError('ANIMATION_EXR_' + code, message); };
 const abort = signal => { if (signal?.aborted) throw signal.reason ?? new DOMException('Aborted', 'AbortError'); };
 const positive = (n, label) => { if (!Number.isSafeInteger(n) || n < 1) fail('LIMIT', `Invalid ${label}`); return n; };
-const COMPRESSION = Object.freeze(['none', 'rle', 'zips', 'zip']);
+const COMPRESSION = Object.freeze(['none', 'rle', 'zips', 'zip', 'piz']);
 function storage(input) {
   if (input instanceof ArrayBuffer) {
     try { input = new Uint8Array(input); } catch { fail('STORAGE', 'Input is detached'); }
@@ -78,7 +80,7 @@ function parse(data, limits) {
   const width = dataWindow[2]-dataWindow[0]+1, height = dataWindow[3]-dataWindow[1]+1;
   if (width > limits.maxDimension || height > limits.maxDimension) fail('LIMIT', 'Data window exceeds dimension budget');
   const compression = data[attr('compression', 'compression', 1).at];
-  if (compression > 3) fail('PROFILE', 'Only NONE/RLE/ZIPS/ZIP compression is supported');
+  if (compression > 4) fail('PROFILE', 'Only NONE/RLE/ZIPS/ZIP/PIZ compression is supported');
   const order = data[attr('lineOrder', 'lineOrder', 1).at];
   if (order > 2) fail('HEADER', 'Invalid scanline order');
   if (float('pixelAspectRatio') !== 1) fail('PROFILE', 'Non-square pixels require the source loader');
@@ -112,10 +114,10 @@ function parse(data, limits) {
   if (grayscale ? names.some(n => n !== 'Y' && n !== 'A') : !['R','G','B'].every(n => names.includes(n))) fail('PROFILE', 'Incomplete RGB or mixed luminance channels');
   // The file layout, not attribute-list insertion order, defines pixel ordering.
   channels.sort((a,b) => a.name < b.name ? -1 : 1);
-  const rows = compression === 3 ? 16 : 1, count = Math.ceil(height/rows);
+  const rows = compression === 4 ? 32 : compression === 3 ? 16 : 1, count = Math.ceil(height/rows);
   const rowBytes = width * channels.reduce((n,c) => n+c.bytes, 0);
   const byteLength = width*height*8, scratchBytes = compression ? rowBytes*Math.min(rows,height)*2 : 0;
-  const peakDecodedBytes = byteLength + scratchBytes;
+  const peakDecodedBytes = byteLength + scratchBytes + (compression === 4 ? EXR_PIZ_TABLE_BYTES : 0);
   if (!Number.isSafeInteger(peakDecodedBytes) || peakDecodedBytes > limits.maxDecodedBytes) fail('LIMIT', 'RGBA16F output and block scratch exceed decoded budget');
   const tableEnd = table+count*8;
   if (tableEnd > data.length) fail('HEADER', 'Truncated chunk offset table');
@@ -139,7 +141,8 @@ function parse(data, limits) {
   return {metadata, chunks, channels, compression, grayscale};
 }
 /** Validate header and every chunk range before decompression or output allocation.
- * Memory accounting includes owned output + two worst-case decoded blocks, not
+ * Memory accounting includes owned output, two worst-case decoded blocks and
+ * PIZ typed Huffman/range tables when selected. It excludes
  * the input snapshot, JS metadata, or opaque native decompressor working memory.
  */
 export function inspectAnimationExr(input, settings = {}) {
@@ -210,7 +213,11 @@ export async function decodeAnimationExr(input, settings = {}) {
   for (const chunk of plan.chunks) {
     abort(limits.signal);
     let raw=data.subarray(chunk.offset,chunk.offset+chunk.length);
-    if (raw.length !== chunk.rawBytes) raw=undoPredictor(plan.compression===1 ? rle(raw,chunk.rawBytes) : await inflate(raw,chunk.rawBytes,limits.signal));
+    if (raw.length !== chunk.rawBytes) {
+      raw = plan.compression === 4
+        ? decodeExrPiz(raw, plan.metadata.width, chunk.rowCount, plan.channels, fail)
+        : undoPredictor(plan.compression === 1 ? rle(raw,chunk.rawBytes) : await inflate(raw,chunk.rawBytes,limits.signal));
+    }
     abort(limits.signal);
     const view=new DataView(raw.buffer,raw.byteOffset,raw.byteLength); let at=0;
     for (let y=0; y<chunk.rowCount; y++) for (const channel of plan.channels) for (let x=0; x<plan.metadata.width; x++) {
