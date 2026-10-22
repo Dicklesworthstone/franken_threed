@@ -51,9 +51,12 @@ receive their own billboard matrices. See [THREE_SPRITES.md](./THREE_SPRITES.md)
 for the supported source behavior and explicit custom-node/hook limits.
 
 Authored native TSL graphics graphs now execute through the same new GPU owner.
-The initial profile accepts rigid meshes with `MeshBasicNodeMaterial` or unlit
-`NodeMaterial`, including position/vertex, color/fragment, opacity, alpha-test and
-output graphs. The pinned `WGSLNodeBuilder` supplies real native shaders and
+The profile accepts rigid meshes with `MeshBasicNodeMaterial`, unlit
+`NodeMaterial`, or authored Toon, Lambert and Phong node materials, including
+position/vertex, color/fragment, opacity, alpha-test and output graphs. Lit
+materials support authored normal/emissive nodes and Phong specular/shininess
+nodes under ambient, hemisphere, directional, point and spot lights. The pinned
+`WGSLNodeBuilder` supplies real native shaders and
 uniform layouts; F3D owns geometry, pipelines, bind groups, draw ordering and
 submission. Float attributes, scalar/vector/matrix uniforms and ordinary sampled
 2D texture graphs are supported. Graphics and compute share captured texture
@@ -66,8 +69,10 @@ NodeFrame before/current/after updates run once at that logical call boundary,
 preserving frame/render/object frequencies and source object identities. Two
 queued target renders can therefore reuse a material and change its uniforms
 without rewriting the earlier render. Compilation does not invoke those updates.
-See [THREE_NODE_PROGRAMS.md](./THREE_NODE_PROGRAMS.md) for the initial profile,
-resource bounds and remaining texture-family/storage/lighting graph gaps.
+Light selection follows source visibility and camera layers, while retained
+analytic nodes preserve FRAME/RENDER light updates across objects and program
+rebuilds. See [THREE_NODE_PROGRAMS.md](./THREE_NODE_PROGRAMS.md) for the profile,
+resource bounds and remaining texture-family, storage and advanced lighting gaps.
 
 Standard and Physical materials, including their default node-material forms,
 accept independent `metalnessMap` and `roughnessMap` textures with their own

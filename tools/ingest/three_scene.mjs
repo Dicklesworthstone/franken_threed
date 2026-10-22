@@ -173,7 +173,7 @@ export async function createGpuThreeScene(device,scene,{
   const geometries=new Map(),instances=new Map(),materials=new Map(),deformations=new Map();
   const pendingDeformations=new Set(),deformationLifetime=new AbortController();
   let textureOwner=null,textureScan=null,frameTextures=null,retainedTextures=new Set();
-  let programShadowMode=false,programShadowSticky=false,preparedShadowMode=false,programShadowOwner=null,programLightMode=false;
+  let programShadowMode=false,programShadowSticky=false,preparedShadowMode=false,programShadowOwner=null,programLightMode=false,nativeLightMode=false;
   let programTransmissionMode=false,transmissionOwner=null,programViewportSize=null,transmissionCamera=null;
   const ownedTextures=()=>textureOwner??=createGpuThreeTextures(device,{...textureOptions,three});
   const textureBindings=createThreeTextureBindings(device,{
@@ -337,10 +337,12 @@ export async function createGpuThreeScene(device,scene,{
           threeSpriteCount(object);
           geometryAdmission(object.geometry,object);
         }
-      } else if(object.isLightProbe||object.isLightProbeGrid)
-        fail('OBJECT',`Unsupported source renderable: ${object.type}`);
+      }
       for(let i=object.children.length-1;i>=0;i--)stack.push(object.children[i]);
     }
+    // Captured native programs own their light selection and uniform bytes.
+    // Fixed or mixed scenes still use the ordinary fixed-light admission below.
+    nativeLightMode=!!passNodeFrame&&nodes.every(object=>!drawable(object)||capturedNodeObject(object));
     // Shadow ownership: the core's single projected map, or (WebGL surface) the
     // r186 WebGLShadowMap port drawing depth/distance programs for every caster.
     programShadowMode=wantsProgramShadows(nodes);
@@ -351,7 +353,8 @@ export async function createGpuThreeScene(device,scene,{
     // list offscreen through programs: every draw takes the program route.
     programTransmissionMode=passOverride===null&&programRoute()&&!!programSupport.createTransmission&&nodes.some(o=>(Array.isArray(o.material)?o.material:[o.material]).some(m=>m?.transmission>0));
     for(const object of nodes){
-      if(object.isLight&&!programLightMode)light(object);
+      if(!nativeLightMode&&(object.isLightProbe||object.isLightProbeGrid))fail('OBJECT',`Unsupported source renderable: ${object.type}`);
+      if(object.isLight&&!programLightMode&&!nativeLightMode)light(object);
       if(shadowEnabled&&object.isMesh&&object.castShadow&&!programShadowMode){
         if(object.customDepthMaterial!=null||object.customDistanceMaterial!=null||
             object.onBeforeShadow!==three.Object3D.prototype.onBeforeShadow||object.onAfterShadow!==three.Object3D.prototype.onAfterShadow)
@@ -384,7 +387,7 @@ export async function createGpuThreeScene(device,scene,{
     catch(error){if(String(error?.code).startsWith('THREE_SHADOW_'))return true;throw error;}
   }
   function shadowLight(nodes){
-    if(programShadowMode)return null;
+    if(programShadowMode||nativeLightMode)return null;
     const lights=nodes.filter(o=>o.isLight&&o.castShadow);
     if(lights.length>1)fail('SHADOW','Only one source projected shadow light is admitted');
     return lights[0]??null;
@@ -1507,7 +1510,7 @@ export async function createGpuThreeScene(device,scene,{
         if(object.layers.test(camera.layers)){
           if(object.isGroup)groupOrder=object.renderOrder;
           else if(object.isLOD){if(object.autoUpdate)object.update(camera);}
-          else if(object.isLight){if(!programLightMode)lighting.lights.push(light(object));lightSources.push(object);}
+          else if(object.isLight){if(!programLightMode&&!nativeLightMode)lighting.lights.push(light(object));lightSources.push(object);}
           else if(object.isLineLoop&&!programRoute()){
             // Source r186 WebGPU behavior: report and draw nothing for this object.
             (three.error??console.error)('Renderer: Objects of type THREE.LineLoop are not supported. Please use THREE.Line or THREE.LineSegments.');

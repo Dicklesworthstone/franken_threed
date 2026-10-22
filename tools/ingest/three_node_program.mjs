@@ -2,9 +2,10 @@
  * are retained helpers; this module constructs no renderer/backend and submits
  * no GPU commands. Descriptors preserve the builder's native bind groups.
  *
- * The first profile is rigid, unlit meshes with float attributes and ordinary
- * scalar/vector/matrix node uniforms and sampled 2D float textures. Storage,
- * lighting, clipping and MRT graphs fail explicitly. capture() is a logical-draw operation, never a
+ * The profile is rigid meshes, unlit or Toon/Lambert/Phong with ordinary source
+ * lights, float attributes, scalar/vector/matrix uniforms and sampled 2D float
+ * textures. Storage, shadows, clipping and MRT graphs fail explicitly.
+ * capture() is a logical-draw operation, never a
  * preparation retry: it runs source before/current updates and owns the bytes.
  * after() belongs after that draw has been accepted. Callers capture before any
  * asynchronous pipeline preparation and retain the resulting byte arrays.
@@ -17,6 +18,8 @@ export class ThreeNodeProgramError extends Error {
 }
 const fail = (code, message) => { throw new ThreeNodeProgramError(code, message); };
 const SLOTS = new Set(['colorNode', 'positionNode', 'vertexNode', 'fragmentNode', 'opacityNode', 'alphaTestNode', 'outputNode']);
+const LIT_SLOTS = new Set(['normalNode', 'emissiveNode']);
+const PHONG_SLOTS = new Set(['shininessNode', 'specularNode']);
 const TYPES = new Set(['float', 'int', 'uint', 'bool', 'color', 'vec2', 'vec3', 'vec4', 'ivec2', 'ivec3', 'ivec4',
   'uvec2', 'uvec3', 'uvec4', 'bvec2', 'bvec3', 'bvec4', 'mat2', 'mat3', 'mat4']);
 const FRAME_FIELDS = ['renderer', 'scene', 'camera', 'object', 'material', 'compute', 'frameId', 'renderId', 'time', 'deltaTime'];
@@ -36,8 +39,32 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   for (const [name, value] of Object.entries({maxPrograms, maxNodes, maxShaderBytes, maxUniformBytes, maxBindGroups}))
     if (!Number.isSafeInteger(value) || value < 1) fail('LIMIT', `Invalid ${name}`);
   const frame = renderer._nodes.nodeFrame, cache = new WeakMap(), entries = new Set();
+  const litPrototypes = [three.MeshToonNodeMaterial.prototype, three.MeshLambertNodeMaterial.prototype, three.MeshPhongNodeMaterial.prototype];
+  const lightClasses = new Map([[three.AmbientLight, three.AmbientLightNode], [three.DirectionalLight, three.DirectionalLightNode],
+    [three.HemisphereLight, three.HemisphereLightNode], [three.PointLight, three.PointLightNode], [three.SpotLight, three.SpotLightNode]]);
   let disposed = false, shaderBytes = 0, serial = 0;
   const live = () => { if (disposed) fail('DISPOSED', 'Native node program preparation is disposed'); };
+  const litMaterial = material => litPrototypes.includes(Object.getPrototypeOf(material));
+  function sourceLights(material, {lights = [], lightingEnabled = renderer.lighting?.enabled !== false} = {}) {
+    if (!litMaterial(material) || material.lights !== true || material.fragmentNode != null) return [];
+    if (typeof lightingEnabled !== 'boolean' || lightingEnabled !== (renderer.lighting?.enabled !== false))
+      fail('LIGHTS', 'Captured lighting enablement must match the source renderer during construction');
+    if (!lightingEnabled) return [];
+    if (!Array.isArray(lights)) fail('LIGHTS', 'Supply the selected source scene lights');
+    if (lights.length > 8) fail('LIMIT', 'Native lit node graphs currently admit at most eight selected scene lights');
+    for (const light of lights) {
+      const nodeClass = lightClasses.get(light?.constructor);
+      if (!nodeClass || Object.getPrototypeOf(light) !== light.constructor.prototype || light.isLight !== true ||
+          renderer.library.getLightNodeClass(light.constructor) !== nodeClass)
+        fail('LIGHTS', 'Native lit graphs require ordinary Ambient, Directional, Hemisphere, Point or Spot lights');
+      if (light.castShadow || light.map != null || light.colorNode != null)
+        fail('LIGHTS', 'Native lit graph shadows, projected maps and custom light nodes are not admitted');
+    }
+    // The pinned LightsNode retains analytic nodes in its module WeakMap by the
+    // real light identity. Never clone lights or instantiate per-program light
+    // nodes: that would repeat FRAME updates across objects and recompiles.
+    return lights.slice().sort((a, b) => a.id - b.id);
+  }
   function inspectTexture(texture) {
     if (!(texture instanceof three.Texture) || texture.isStorageTexture || texture.isCubeTexture ||
         texture.is3DTexture || texture.isArrayTexture || texture.isData3DTexture || texture.isDataArrayTexture ||
@@ -72,13 +99,16 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         node.sampler, node.updateMatrix, node.groupNode?.name];
     }));
   }
-  function inspect(material, object, {scene, camera} = {}) {
+  function inspect(material, object, context = {}) {
     live();
+    const {scene, camera} = context;
     if (!(material instanceof three.NodeMaterial) ||
-        ![three.MeshBasicNodeMaterial.prototype, three.NodeMaterial.prototype].includes(Object.getPrototypeOf(material)))
-      fail('MATERIAL', 'Native node graphs currently require MeshBasicNodeMaterial or unlit NodeMaterial');
-    if (!material.isMeshBasicNodeMaterial && material.lights !== false)
+        ![three.MeshBasicNodeMaterial.prototype, three.NodeMaterial.prototype, ...litPrototypes].includes(Object.getPrototypeOf(material)))
+      fail('MATERIAL', 'Native node graphs require Basic, Toon, Lambert, Phong or unlit base NodeMaterial');
+    const lit = litMaterial(material), phong = Object.getPrototypeOf(material) === three.MeshPhongNodeMaterial.prototype;
+    if (!lit && !material.isMeshBasicNodeMaterial && material.lights !== false)
       fail('LIGHTS', 'Base NodeMaterial graphs must be unlit');
+    sourceLights(material, context);
     if (!(object instanceof three.Mesh) || object.isSkinnedMesh || object.isInstancedMesh || object.isBatchedMesh ||
         !(object.geometry instanceof three.BufferGeometry) || object.geometry.isInstancedBufferGeometry ||
         Object.values(object.geometry.morphAttributes ?? {}).some(list => list.length))
@@ -101,11 +131,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     for (const key of Object.keys(material)) {
       const value = material[key];
       if (value?.isTexture) fail('TEXTURE', `Native node graph material texture ${key} is not admitted`);
-      if (key.endsWith('Node') && value != null && !SLOTS.has(key))
+      if (key.endsWith('Node') && value != null && !SLOTS.has(key) && !(lit && LIT_SLOTS.has(key)) && !(phong && PHONG_SLOTS.has(key)))
         fail('GRAPH', `Native node graph slot ${key} is not admitted`);
     }
     if (renderer.getMRT?.() != null) fail('MRT', 'Native node graphs currently write one color attachment');
-    const seen = new Set(), stack = [...SLOTS].map(key => material[key]).filter(Boolean);
+    const seen = new Set(), stack = [...SLOTS, ...LIT_SLOTS, ...PHONG_SLOTS].map(key => material[key]).filter(Boolean);
     while (stack.length) {
       const node = stack.pop();
       if (seen.has(node)) continue;
@@ -116,7 +146,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     }
     return material;
   }
-  function checkNode(node) {
+  function checkNode(node, lightsNode = null, lights = []) {
     if (!node?.isNode) fail('GRAPH', 'Expected source TSL nodes');
     if (node.isStorageTextureNode || node.isCubeTextureNode || node.isTexture3DNode)
       fail('TEXTURE', 'Storage, cube and volume texture graphs need additional native bindings');
@@ -127,11 +157,14 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     } else if (node.value?.isTexture) fail('TEXTURE', 'Native graphics textures require source TextureNode bindings');
     if (node.isStorageBufferNode || node.isBufferNode || node.isBufferAttributeNode || node.isComputeNode || node.isAtomicFunctionNode)
       fail('STORAGE', 'Storage, explicit buffer and compute graphs are not admitted');
-    if (node.isLightingNode || node.isLightsNode || node.isLightingContextNode || node.light?.isLight)
-      fail('LIGHTS', 'Lighting graphs require a native lighting context');
+    if (node.isLightingNode || node.isLightsNode || node.isLightingContextNode || node.light?.isLight) {
+      const admitted = lightsNode && (node === lightsNode || node.isAnalyticLightNode && lights.includes(node.light) &&
+        Object.getPrototypeOf(node) === lightClasses.get(node.light.constructor)?.prototype);
+      if (!admitted) fail('LIGHTS', 'Only the captured ordinary scene light context is admitted');
+    }
     if (node.isOutputStructNode || node.isMRTNode) fail('MRT', 'Native node graphs currently write one color attachment');
   }
-  function keyOf(material, object, {camera} = {}) {
+  function keyOf(material, object, {camera, lightingEnabled = renderer.lighting?.enabled !== false} = {}, lights = []) {
     // Match the source's graph cache key. Uniform values never participate.
     // Object/material references remain separate cache dimensions, preserving
     // builder nodes which close over a particular source object.
@@ -141,7 +174,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       object.geometry.id, camera?.isPerspectiveCamera === true,
       Object.entries(object.geometry.attributes).map(([name, a]) => [name, a.itemSize, a.normalized, a.gpuType, a.array?.constructor.name,
         a.isInterleavedBufferAttribute, a.data?.array?.constructor.name, a.data?.stride, a.offset]),
-      renderer.logarithmicDepthBuffer, renderer.reversedDepthBuffer]);
+      renderer.logarithmicDepthBuffer, renderer.reversedDepthBuffer,
+      litMaterial(material) && material.fragmentNode == null ? [lightingEnabled, lights.map(light => light.id)] : null]);
   }
   function retire(entry) {
     if (!entries.delete(entry)) return;
@@ -152,19 +186,23 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   }
   function compile(material, object, context = {}) {
     inspect(material, object, context);
-    const key = keyOf(material, object, context), byMaterial = cache.get(object);
+    const lights = sourceLights(material, context);
+    const key = keyOf(material, object, context, lights), byMaterial = cache.get(object);
     const previous = byMaterial?.get(material);
     if (previous?.key === key && textureSignature(previous.textureNodes) === previous.textureSignature) return previous.descriptor;
     if (entries.size - (previous ? 1 : 0) >= maxPrograms) fail('LIMIT', 'Native node program capacity exceeded');
     const builder = new three.WGSLNodeBuilder(object, renderer);
-    builder.material = material; builder.scene = context.scene ?? null; builder.camera = context.camera ?? null;
+    builder.material = material; builder.context.material = material;
+    builder.scene = context.scene ?? null; builder.camera = context.camera ?? null;
+    const lightsNode = litMaterial(material) ? three.TSL.lights(lights) : null;
+    if (lightsNode) builder.lightsNode = lightsNode;
     try { builder.build(); }
     catch (cause) {
       if (cause instanceof ThreeNodeProgramError) throw cause;
       throw new ThreeNodeProgramError('BUILD', `Pinned node construction failed: ${cause?.message ?? cause}`, {cause});
     }
     if (builder.nodes.size > maxNodes) fail('LIMIT', 'Generated native node graph exceeds its node budget');
-    for (const node of builder.nodes) checkNode(node);
+    for (const node of builder.nodes) checkNode(node, lightsNode, lights);
     const bindings = builder.getBindings();
     if (bindings.length > Math.min(maxBindGroups, renderer._device?.limits?.maxBindGroups ?? 4))
       fail('LIMIT', 'Native node graph exceeds its bind group budget');

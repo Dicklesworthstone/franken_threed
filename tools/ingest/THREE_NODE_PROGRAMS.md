@@ -1,6 +1,6 @@
 # Native TSL graphics programs
 
-The native `WebGPURenderer` facade can draw authored, unlit TSL graphs on ordinary
+The native `WebGPURenderer` facade can draw authored TSL graphs on ordinary
 meshes. It retains the exact r186 `WGSLNodeBuilder`, node classes, uniform packing
 and `NodeFrame`; FrankenThreeD owns the WebGPU pipelines, geometry residency,
 uniform buffers, command encoding and submission. The path does not construct an
@@ -15,6 +15,15 @@ Use `MeshBasicNodeMaterial`, or an unlit base `NodeMaterial`, with `colorNode`,
 float attributes compile through the pinned builder. Native scalar, integer,
 boolean, vector and matrix uniforms retain their source group ordering and
 padding. Clip-space vertex and fragment graphs with no uniform groups also work.
+
+Authored `MeshToonNodeMaterial`, `MeshLambertNodeMaterial` and
+`MeshPhongNodeMaterial` additionally use the pinned lighting models with ambient,
+hemisphere, directional, point and spot lights. They accept `normalNode` and
+`emissiveNode`; Phong also accepts `shininessNode` and `specularNode`. These slots
+compose with ordinary TSL arithmetic and the sampled texture graphs below.
+Unassigned slots retain their source material color, emissive, specular and
+shininess behavior. Both material arrays and scene overrides supply the effective
+material to the builder's context.
 
 Authored `texture()` graphs sample ordinary 2D data, decoded image/canvas and
 resolved color render-target textures. The pinned builder owns UV channel and
@@ -66,6 +75,21 @@ and thrown callbacks restore the surrounding context. `compileAsync()` prepares
 bindings without running node updates or advancing animation/render counters.
 Calls before initialization prepare at the source's asynchronous boundary, when
 device capabilities are available.
+The native frame clock starts during renderer initialization and continues on
+host animation frames even when the user animation callback is null. Setting
+`setAnimationLoop(null)` stops application callbacks; renderer disposal stops
+the owned clock. This lets FRAME nodes, including analytic lights, update in
+applications that call `render()` directly.
+
+Lit graphs select actual source lights through scene visibility, LOD and camera
+layers, including during compilation. The selected light identities and the
+renderer lighting switch participate in program selection; live light values
+remain uniforms. Source analytic light nodes share their retained identity across
+objects and program rebuilds, preserving FRAME updates for radiance/falloff and
+RENDER updates for view-space light positions and targets. Queued draws retain
+the light uniform bytes captured for their logical call. The profile admits up
+to eight selected lights and validates unsupported light kinds or shadow/projector
+state before any application node update.
 
 Graphics and compute share the renderer's existing sampled-texture snapshot
 adapter and upload pool. Each draw leases its post-update texture identities,
@@ -97,7 +121,9 @@ material. Original material visibility and render-list partitioning still apply.
 ## Explicit remaining boundaries
 
 This is a bounded native graphics entrance, not full TSL coverage. Storage/buffer,
-compute, lighting and multiple-render-target graphics graphs are refused.
+compute and multiple-render-target graphics graphs are refused. Authored
+Standard/Physical lighting, environment lighting, area/probe/custom lights,
+shadows, projected light maps and custom `lightsNode` graphs remain missing.
 Depth/comparison, cube, array, volume, compressed, storage, video and unfilterable
 or integer texture graphs still require additional native profiles. Sampled
 texture capture transactions reject reentrant texture capture from node updates
@@ -147,3 +173,10 @@ feedback checks, resource-only groups and bounded bind-group reuse. Browser
 scenarios `native_tsl_textures`, `native_tsl_texture_updates` and
 `native_tsl_target_texture` compare those generated programs with the pinned
 renderer at the existing tolerance.
+
+Facade regressions check source light update frequencies across objects and
+program rebuilds, queued byte history, material arrays and overrides, and unused
+versus unsupported active lights. Source shader construction and capture checks
+passed before the execution environment became unavailable. Real WebGPU lighting
+comparisons remain to be completed; the texture parity results above do not
+establish lit-graph pixel equivalence.

@@ -181,3 +181,57 @@ test('failed textured preparation releases queued histories and renderer disposa
   assert.equal(f.device.submissions.length,0);f.renderer.dispose();
   assert.equal(owner.diagnostics.snapshotBytes,0);assert.equal(owner.diagnostics.versions,0);
 });
+
+test('queued lit graphs retain source FRAME light updates across objects and program replacements',async t=>{
+  const f=fixture(t),lambert=new T.MeshLambertNodeMaterial(),phong=new T.MeshPhongNodeMaterial();
+  lambert.colorNode=f.tint;phong.colorNode=T.TSL.vec3(.2,.4,.6);f.mesh.material=lambert;
+  const second=new T.Mesh(f.mesh.geometry,phong);second.position.x=.5;f.scene.add(second);
+  const light=new T.AmbientLight(new T.Color(.125,.25,.5),2);f.scene.add(light);
+  await f.renderer.init();
+  f.renderer.render(f.scene,f.camera);
+  light.intensity=3;lambert.colorNode=T.TSL.vec3(.3,.5,.7);
+  f.renderer.render(f.scene,f.camera);
+  f.renderer._nodes.nodeFrame.update();f.renderer.render(f.scene,f.camera);
+  light.intensity=7;
+  await drain(f.renderer);
+  const draws=nativeDraws(f.device);assert.equal(draws.length,6);
+  for(const draw of draws.slice(0,4))assert.ok(containsColor(draw,[.25,.5,1]));
+  for(const draw of draws.slice(4))assert.ok(containsColor(draw,[.375,.75,1.5]));
+  assert.notEqual(draws[0].pipeline,draws[2].pipeline,'graph replacement prepares a new program');
+  assert.equal(f.renderer.info.f3d.presentedRenders,3);assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+test('lit material arrays and scene overrides use the effective source material context',async t=>{
+  const f=fixture(t),toon=new T.MeshToonNodeMaterial({emissive:new T.Color(.125,.25,.5)}),
+    phong=new T.MeshPhongNodeMaterial({emissive:new T.Color(.625,.375,.125),shininess:23});
+  toon.colorNode=f.tint;phong.colorNode=T.TSL.vec3(.1,.2,.3);
+  f.mesh.geometry.clearGroups();f.mesh.geometry.addGroup(0,3,0);f.mesh.geometry.addGroup(3,3,1);
+  f.mesh.material=[toon,phong];f.scene.add(new T.AmbientLight(0xffffff,.25));
+  await f.renderer.compileAsync(f.scene,f.camera);f.renderer.render(f.scene,f.camera);
+  const override=new T.MeshLambertNodeMaterial({emissive:new T.Color(.5,.25,.125)});
+  override.colorNode=T.TSL.vec3(.6,.3,.2);f.scene.overrideMaterial=override;
+  f.renderer.render(f.scene,f.camera);await drain(f.renderer);
+  const draws=nativeDraws(f.device);assert.equal(draws.length,4);
+  assert.ok(containsColor(draws[0],[.125,.25,.5]));assert.ok(containsColor(draws[1],[.625,.375,.125]));
+  assert.ok(draws.slice(2).every(draw=>containsColor(draw,[.5,.25,.125])));
+  assert.equal(f.mesh.material[0],toon);assert.equal(f.mesh.material[1],phong);
+  assert.equal(f.scene.overrideMaterial,override);assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+test('native-only scenes ignore unused lights and reject unsupported active lighting before callbacks',async t=>{
+  const f=fixture(t);f.scene.add(new T.RectAreaLight(),new T.LightProbe());
+  await f.renderer.compileAsync(f.scene,f.camera);f.renderer.render(f.scene,f.camera);await drain(f.renderer);
+  assert.equal(nativeDraws(f.device).length,1,'unlit authored graphs do not consume scene lights');
+  const g=fixture(t),material=new T.MeshToonNodeMaterial(),area=new T.RectAreaLight();let updates=0;
+  material.colorNode=T.TSL.uniform(new T.Color(.25,.5,.75)).onObjectUpdate(()=>{updates++;});
+  g.mesh.material=material;g.scene.add(area);g.renderer.lighting.enabled=false;
+  await g.renderer.compileAsync(g.scene,g.camera);assert.equal(updates,0);
+  g.renderer.render(g.scene,g.camera);await drain(g.renderer);assert.equal(updates,1);
+  const submissions=g.device.submissions.length,acquired=g.acquired();g.renderer.lighting.enabled=true;
+  assert.throws(()=>g.renderer.render(g.scene,g.camera),{code:'THREE_NODE_PROGRAM_LIGHTS'});
+  assert.equal(updates,1);assert.equal(g.device.submissions.length,submissions);assert.equal(g.acquired(),acquired);
+  area.visible=false;g.scene.add(new T.AmbientLight(0xffffff,.5));
+  g.renderer.render(g.scene,g.camera);await drain(g.renderer);
+  assert.equal(updates,2);assert.equal(nativeDraws(g.device).length,2);
+  assert.equal(g.renderer._nodeCaptureBytes,0);
+});

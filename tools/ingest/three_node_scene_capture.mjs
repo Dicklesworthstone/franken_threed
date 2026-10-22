@@ -74,7 +74,8 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   if (typeof getPrograms !== 'function' || typeof raster !== 'function' || !renderer?._nodes?.nodeFrame)
     fail('SOURCE', 'Native scene capture needs its source compiler, renderer NodeFrame and raster adapter');
   if (renderer.xr?.isPresenting) fail('CAMERA', 'Native node scenes do not yet capture XR camera views');
-  const programs = getPrograms(), context = {scene: root, camera};
+  const programs = getPrograms(), context = {scene: root, camera, lights: Object.freeze([]),
+    lightingEnabled: renderer.lighting?.enabled !== false};
   // Admission is completed before camera updates, graph construction or node
   // updates. In particular, a hidden unsupported graph cannot cause partial
   // visible update callbacks followed by a preparation refusal.
@@ -85,8 +86,8 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     camera.coordinateSystem = three.WebGPUCoordinateSystem; camera.updateProjectionMatrix();
   }
   if (camera.parent === null && camera.matrixWorldAutoUpdate === true) camera.updateMatrixWorld();
-  const opaque = [], translucent = [], draws = [];
-  if (uniforms) {
+  const opaque = [], translucent = [], draws = [], lights = [];
+  {
     const projection = new three.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
     const frustum = new three.Frustum().setFromProjectionMatrix(projection, camera.coordinateSystem, camera.reversedDepth);
     const center = new three.Vector4(), sortObjects = renderer.sortObjects === true;
@@ -114,7 +115,8 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       if (object.layers.test(camera.layers)) {
         if (object.isGroup) groupOrder = object.renderOrder;
         else if (object.isLOD) { if (object.autoUpdate === true) object.update(camera); }
-        else if (objects.has(object) && (!object.frustumCulled || object.intersectsFrustum(frustum))) {
+        else if (object.isLight) lights.push(object);
+        else if (uniforms && objects.has(object) && (!object.frustumCulled || object.intersectsFrustum(frustum))) {
           const state = pairs.get(object), {geometry} = state;
           let z = 0;
           if (sortObjects) {
@@ -137,6 +139,14 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     }
     draws.push(...opaque, ...translucent);
   }
+  // The source projects lights for compileAsync as well as rendering. Keep the
+  // selected source objects (including LOD visibility), not packed radiance;
+  // its shared LightsNode/NodeFrame own light uniforms and update frequencies.
+  context.lights = Object.freeze(lights);
+  // Preflight every material against the complete light list before the first
+  // graph is constructed or application node update runs. The compiler admits
+  // only lights used by a lit graph, so unused unsupported lights stay inert.
+  for (const binding of bindings) programs.inspect(binding.material, binding.object, context);
   let textureOwner = null;
   for (const binding of bindings) {
     binding.nodeProgram = programs.compile(binding.material, binding.object, context);

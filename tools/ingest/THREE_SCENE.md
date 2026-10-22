@@ -77,12 +77,15 @@ layout is handled by residency updates; changing its layout needs preparation.
 Material `.version` alone is not a reason to compile another pipeline: it does
 not hide an actual structural change, and scalar changes stay per-use values.
 
-The `WebGPURenderer` facade additionally connects authored unlit native TSL
+The `WebGPURenderer` facade additionally connects authored native TSL
 programs through captured node draw packets. These share the program geometry
 residency, raster mapping and ordered submission owners, while retaining the
 source builder's native bind-group layouts. Sampled texture resources come from
 the renderer's shared versioned texture owner, including native target borrows.
-Node updates and uniform capture
+Authored Toon, Lambert and Phong graphs use retained source lighting models and
+selected ambient/hemisphere/directional/point/spot light identities. Their light
+uniforms follow the source NodeFrame update frequencies and are captured with
+each draw. Node updates and uniform capture
 happen at the public render call, before any asynchronous preparation. The
 direct bridge consumes those prepared packets and does not replay callbacks.
 See [THREE_NODE_PROGRAMS.md](./THREE_NODE_PROGRAMS.md). Source geometry remains
