@@ -1,0 +1,30 @@
+name: Source Cube Environment Regression Tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'tools/ingest/three_environment.mjs'
+      - 'tools/ingest/three_environment.test.mjs'
+      - 'tools/ingest/three_cube_environment.test.mjs'
+      - 'tools/ingest/animation_environment.mjs'
+      - '.github/workflows/source-cube-environment.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source-environment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Check source ownership and real filter command generation
+        run: >-
+          node --test
+          tools/ingest/three_environment.test.mjs
+          tools/ingest/three_cube_environment.test.mjs

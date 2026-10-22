@@ -1,4 +1,4 @@
-/** Source-owned HDR panoramas for the native GGX environment renderer.
+/** Source-owned HDR panoramas and data cubemaps for the native GGX environment renderer.
  * The source Texture and pixels are borrowed. Preparation copies current ready
  * pixels and filters once; needsUpdate/identity changes require a new owner.
  * This is the core's explicit GGX/DFG profile, not Three PMREM pixel parity.
@@ -21,6 +21,7 @@ const same = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]);
 /** Metadata-only check: never scan or copy panorama pixels in a render loop. */
 export function inspectThreeEnvironment(texture, three, {maxPixels = 16 * 1024 * 1024} = {}) {
   if (texture?.isF3DSceneEnvironment === true) return inspectSceneCapture(texture, three, maxPixels);
+  if (texture?.isCubeTexture === true) return inspectCubeEnvironment(texture, three, maxPixels);
   if (three?.REVISION !== '186' || typeof three.DataTexture !== 'function' ||
       !(texture instanceof three.DataTexture) || texture.isCubeTexture || texture.isRenderTargetTexture)
     fail('SOURCE', 'Supply a ready r186 DataTexture panorama');
@@ -54,6 +55,71 @@ export function inspectThreeEnvironment(texture, three, {maxPixels = 16 * 1024 *
   return Object.freeze({texture, source, image, data, half, width, height, sourceBytes: width * height * 8,
     signature: Object.freeze([texture, source, image, data, data.buffer, texture.version, source.version,
       texture.type, texture.mapping, texture.colorSpace, texture.flipY, width, height])});
+}
+
+/** Six complete data-backed faces, in source +X,-X,+Y,-Y,+Z,-Z order.
+ * Face wrappers and pixels stay borrowed. Do not read pixels while matching a
+ * prepared owner: only explicit versions and storage/layout identities matter.
+ */
+function inspectCubeEnvironment(texture, three, maxPixels) {
+  if (three?.REVISION !== '186' || typeof three.CubeTexture !== 'function' ||
+      !(texture instanceof three.CubeTexture) || texture.isRenderTargetTexture || texture.isCompressedTexture)
+    fail('SOURCE', 'Supply a ready r186 data-backed CubeTexture');
+  integer(maxPixels, 1, Number.MAX_SAFE_INTEGER, 'pixel budget');
+  const half = texture.type === three.HalfFloatType, byte = texture.type === three.UnsignedByteType;
+  if ((!half && !byte && texture.type !== three.FloatType) || texture.format !== three.RGBAFormat ||
+      texture.internalFormat !== null || texture.compareFunction != null)
+    fail('FORMAT', 'Expected RGBA half-float, float or unsigned-byte cube faces');
+  const srgb = texture.colorSpace === three.SRGBColorSpace;
+  if (texture.mapping !== three.CubeReflectionMapping ||
+      ![three.LinearSRGBColorSpace, three.NoColorSpace, three.SRGBColorSpace].includes(texture.colorSpace) ||
+      (srgb && !byte)) fail('PROFILE', 'Expected a linear HDR or sRGB/linear byte reflection cube');
+  if (typeof texture.flipY !== 'boolean' || texture.premultiplyAlpha !== false ||
+      ![1, 2, 4, 8].includes(texture.unpackAlignment))
+    fail('FORMAT', 'Expected explicit row orientation and unpremultiplied cube pixels');
+  if (texture.onUpdate != null || !Array.isArray(texture.updateRanges) || texture.updateRanges.length ||
+      !Array.isArray(texture.mipmaps) || texture.mipmaps.length)
+    fail('PROFILE', 'Upload hooks, partial updates and authored cube mipmaps need another profile');
+  const images = texture.image, source = texture.source;
+  if (!source || source.dataReady !== true || source.data !== images)
+    fail('NOT_READY', 'Provide all six ready source faces before preparation');
+  integer(texture.version, 1, Number.MAX_SAFE_INTEGER, 'texture version');
+  integer(source.version, 0, Number.MAX_SAFE_INTEGER, 'source version');
+  if (!Array.isArray(images) || images.length !== 6) fail('PROFILE', 'A cubemap requires exactly six faces');
+  const signature = [texture, source, images, texture.version, source.version, texture.type,
+    texture.format, texture.mapping, texture.colorSpace, texture.flipY], faces = [];
+  let size;
+  for (const face of images) {
+    const wrapped = typeof three.DataTexture === 'function' && face instanceof three.DataTexture;
+    if (!wrapped || face.isDataTexture !== true) fail('SOURCE', 'Cube faces must be ready DataTextures');
+    const image = face.image, data = image?.data;
+    {
+      if (face.type !== texture.type || face.format !== texture.format || face.internalFormat !== null ||
+          face.onUpdate != null || !Array.isArray(face.mipmaps) || face.mipmaps.length ||
+          !Array.isArray(face.updateRanges) || face.updateRanges.length)
+        fail('PROFILE', 'Cube DataTexture faces must agree with the parent storage profile');
+      if (!face.source || face.source.dataReady !== true || face.source.data !== image)
+        fail('NOT_READY', 'Cube DataTexture face is not ready');
+      integer(face.version, 0, Number.MAX_SAFE_INTEGER, 'face version');
+      integer(face.source.version, 0, Number.MAX_SAFE_INTEGER, 'face source version');
+      signature.push(face.source, face.version, face.source.version);
+    }
+    const width = integer(image?.width, 1, 32768, 'cube face width');
+    const height = integer(image?.height, 1, 32768, 'cube face height');
+    if (width !== height || (size !== undefined && width !== size))
+      fail('LIMIT', 'Cube faces must be square and equally sized');
+    size = width;
+    if (6 * size * size > maxPixels) fail('LIMIT', 'All six cube faces exceed the pixel budget');
+    const typed = half ? data instanceof Uint16Array : byte
+      ? data instanceof Uint8Array || data instanceof Uint8ClampedArray : data instanceof Float32Array;
+    if (!typed || !(data.buffer instanceof ArrayBuffer) || data.buffer.resizable || data.length !== size * size * 4)
+      fail('STORAGE', 'Expected complete, fixed, unshared RGBA cube face storage');
+    try { new Uint8Array(data.buffer, 0, 0); } catch { fail('STORAGE', 'Cube face storage is detached'); }
+    signature.push(face, image, data, data.buffer, width, height);
+    faces.push(Object.freeze({data}));
+  }
+  return Object.freeze({texture, source, cube: true, half, byte, srgb, width: size, height: size,
+    faces: Object.freeze(faces), sourceBytes: 6 * size * size * 8, signature: Object.freeze(signature)});
 }
 
 /** A PMREMGenerator.fromScene() request from three_renderer.mjs: the capture
@@ -157,6 +223,35 @@ function halfBits(value, scratch) {
   if (remainder > halfway || (remainder === halfway && (rounded & 1))) rounded++;
   return sign | (result + rounded);
 }
+function captureCube(shape) {
+  const {width: size, faces, half, byte, srgb, texture} = shape;
+  const pixels = new Uint16Array(size * size * 4 * 6);
+  const f = new Float32Array(1), scratch = {f, u: new Uint32Array(f.buffer)};
+  // Pinned r186 CubeTextureNode samples (-direction.x, direction.yz) for
+  // source cubes. Bake that reflection: exchange +/-X, mirror every face's U.
+  // No additional handedness correction is needed in the filtered receiver.
+  // WebGPUTextureUtils._copyCubeMapToTexture also exchanges +/-Y when
+  // flipY is enabled, in addition to reversing each uploaded row order.
+  const order = texture.flipY ? [1, 0, 3, 2, 4, 5] : [1, 0, 2, 3, 4, 5];
+  for (let layer = 0; layer < 6; layer++) {
+    const data = faces[order[layer]].data;
+    for (let y = 0; y < size; y++) {
+      const row = texture.flipY ? size - 1 - y : y;
+      for (let x = 0; x < size; x++) for (let c = 0; c < 4; c++) {
+        let v = data[(row * size + size - 1 - x) * 4 + c];
+        if (half && (v & 0x7c00) === 0x7c00) fail('VALUE', 'Cube pixels contain infinity or NaN');
+        if (byte) {
+          v /= 255;
+          // Alpha is linear coverage, never sRGB-decoded or premultiplied.
+          if (srgb && c < 3) v = v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
+        }
+        pixels[((layer * size + y) * size + x) * 4 + c] = half ? v : halfBits(v, scratch);
+      }
+    }
+  }
+  return pixels;
+}
+
 function capture(shape) {
   const {data, half, width, height, texture} = shape, pixels = new Uint16Array(width * height * 4);
   const f = new Float32Array(1), scratch = {f, u: new Uint32Array(f.buffer)};
@@ -178,7 +273,9 @@ function capture(shape) {
  * Consumers must preflight their own aggregate byte budget before this copy.
  */
 export function captureThreeEnvironmentPixels(texture, three, options) {
-  return capture(inspectThreeEnvironment(texture, three, options));
+  const shape = inspectThreeEnvironment(texture, three, options);
+  if (shape.cube || shape.capture) fail('PROFILE', 'Panorama backgrounds require a data panorama');
+  return capture(shape);
 }
 
 /** Own a filtered map, not a source Texture. maxBytes bounds transient panorama,
@@ -198,13 +295,15 @@ export async function createGpuThreeEnvironment(device, texture, {
   if (typeof device?.createTexture !== 'function' || typeof device.queue?.writeTexture !== 'function' ||
       typeof device.lost?.then !== 'function') fail('DEVICE', 'Expected a WebGPU device');
   const limit = integer(device.limits?.maxTextureDimension2D, 1, 32768, 'device texture limit');
-  if (shape.width > limit || shape.height > limit) fail('LIMIT', 'Panorama exceeds device texture size');
+  if (shape.width > limit || shape.height > limit) fail('LIMIT', 'Environment exceeds device texture size');
+  if (shape.cube && integer(device.limits.maxTextureArrayLayers, 1, 65536, 'device array layers') < 6)
+    fail('LIMIT', 'Environment requires six cube array layers');
   const plan = planAnimationEnvironment({size, diffuseSize, lutSize, samples, maxSampleWork,
     maxTextureBytes: maxBytes, alignment: device.limits.minUniformBufferOffsetAlignment, maxDimension: limit});
   if (shape.sourceBytes + plan.textureBytes + plan.uniformBytes > maxBytes)
     fail('LIMIT', 'Panorama, filter uniforms and output maps exceed the old-plus-new budget');
   if (signal?.aborted) fail('ABORTED', 'Environment preparation was aborted');
-  const pixels = shape.capture ? null : capture(shape), lifetime = new AbortController();
+  const pixels = shape.capture ? null : shape.cube ? captureCube(shape) : capture(shape), lifetime = new AbortController();
   let input = null, map = null, terminal = null, disposed = false, rejectStop;
   const stopped = new Promise((_, reject) => { rejectStop = reject; }); stopped.catch(() => {});
   function release() {
@@ -240,9 +339,11 @@ export async function createGpuThreeEnvironment(device, texture, {
     } else {
       device.pushErrorScope('out-of-memory'); device.pushErrorScope('validation');
       try {
-        input = device.createTexture({label: 'f3d-source-environment', size: [shape.width, shape.height, 1],
+        input = device.createTexture({label: 'f3d-source-environment', size: [shape.width, shape.height, shape.cube ? 6 : 1],
           dimension: '2d', format: 'rgba16float', mipLevelCount: 1, sampleCount: 1, usage: 2 | 4});
-        device.queue.writeTexture({texture: input}, pixels, {bytesPerRow: shape.width * 8}, [shape.width, shape.height, 1]);
+        device.queue.writeTexture({texture: input}, pixels,
+          {bytesPerRow: shape.width * 8, ...(shape.cube ? {rowsPerImage: shape.height} : {})},
+          [shape.width, shape.height, shape.cube ? 6 : 1]);
       } catch (cause) { error = cause; }
       const validation = device.popErrorScope(), oom = device.popErrorScope();
       errors = await Promise.race([Promise.all([validation, oom]), stopped]);

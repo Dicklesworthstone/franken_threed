@@ -1,8 +1,8 @@
 # Source HDR environments in native scenes
 
 `createGpuThreeScene(device, scene, { three, environment: {} })` connects a
-ready `scene.environment` panorama to the existing native image-based lighting
-filter and material renderer. This is an opt-in extension of the source scene
+ready `scene.environment` panorama or data-backed cubemap to the existing native
+image-based lighting filter and material renderer. This is an opt-in extension of the source scene
 bridge, not a replacement for the pinned Three renderer or a PMREM-equivalence
 claim. The application still owns its Three module, scene, camera, device,
 attachments, animation clock, image decoding and frame scheduling.
@@ -79,16 +79,67 @@ settings do not redefine the core's explicit panorama sampling profile.
 
 The existing core filter produces diffuse E/pi, GGX-prefiltered radiance mips,
 and a matching split-sum DFG texture. Its sampling profile is not Three's
-PMREM/CubeUV layout or a promise of identical pixels. Cube textures, render-target
+PMREM/CubeUV layout or a promise of identical pixels. Render-target
 textures, sRGB-encoded HDR, premultiplied pixels, authored mip chains, partial
 update ranges and upload callbacks are rejected by this owner. Texture
 backgrounds, fog and per-material reflection/refraction maps are not added by
 this feature. Use the application's retained renderer for unsupported scenes. This opt-in API
 reports a refusal rather than silently downgrading or switching renderers.
 
+## Ready data cubemaps
+
+The same scene path also accepts a source `CubeTexture` containing exactly six
+ready `DataTexture` faces, in +X, -X, +Y, -Y, +Z, -Z order. Every face must be
+square, equally sized, and use the parent's RGBA storage type. Supported types
+are `HalfFloatType` / `Uint16Array`, `FloatType` / `Float32Array`, and
+`UnsignedByteType` / `Uint8Array` or `Uint8ClampedArray`.
+
+```js
+// Each entry is an already-decoded r186 DataTexture, not a URL or image element.
+const environment = new THREE.CubeTexture([px, nx, py, ny, pz, nz]);
+environment.type = THREE.HalfFloatType; // Must agree with all six faces.
+environment.format = THREE.RGBAFormat;
+environment.colorSpace = THREE.LinearSRGBColorSpace;
+environment.needsUpdate = true;
+scene.environment = environment;
+await nativeScene.prepare();
+```
+
+The parent uses `CubeReflectionMapping`; no application image decoder, worker,
+new frame loop, or intermediate panorama is created. All six faces are checked
+and captured before allocating the native six-layer `rgba16float` source. The
+existing cube filter then produces the usual diffuse, specular and DFG resources.
+HDR conversion follows the panorama rules above. Byte inputs can be linear or
+sRGB; sRGB RGB is converted to linear before filtering, while alpha stays linear
+and unpremultiplied. No color conversion is inferred from a face's own color-space
+field: the parent cube's declared color space is authoritative.
+
+Source handedness is baked into the upload: pinned r186 `CubeTextureNode`'s
+X-direction reflection swaps +/-X and mirrors every face horizontally. When
+`flipY` is true, pinned `WebGPUTextureUtils` additionally swaps +/-Y and reverses
+rows. Neither the source face order nor its pixel arrays are mutated. Runtime
+rotation and intensity use the existing environment descriptor without filtering
+again. The source rules are from Three.js commit
+`148ef33ecb6d2502ff796d4554abd1549c95d519`, not a guessed skybox convention.
+
+`maxPixels` counts all six faces together, and `maxBytes` includes their complete
+binary16 native source plus filtering uniforms and outputs. Source face identity,
+storage, dimensions and explicit face/parent versions participate in stale-state
+checks. In-place pixel edits still require `environment.needsUpdate = true` and
+`prepare()`; rendering does not scan the pixel buffers. The parent cube is the
+lifetime owner: disposing it invalidates the filtered maps without disposing its
+borrowed faces.
+
+HTML images, canvases, ImageBitmaps, compressed cubes, raw `{data,width,height}`
+face descriptors, render-target cubes, refraction mapping and authored face mips
+remain outside this explicit data-cube profile. This adds environment lighting,
+not cube backgrounds or per-material `envMap` support. The panorama-background
+copy API explicitly rejects cube input rather than treating a cube face as a
+panorama.
+
 ## Explicit updates, replacement and lifetime
 
-Panorama content is copied and filtered only during creation or `prepare()`.
+Panorama or cubemap content is copied and filtered only during creation or `prepare()`.
 For changed pixels, acknowledge the source upload and prepare before rendering:
 
 ```js
@@ -130,7 +181,7 @@ is bounded by its budget but is not exposed as completed-map residency.
 
 Environment options are `maxBytes` (default 128 MiB), `maxPixels` (16,777,216),
 `size` (128), `diffuseSize` (32), `lutSize` (128), `samples` (1024), and
-`maxSampleWork` (268,435,456). The source panorama, filter uniform allocation and
+`maxSampleWork` (268,435,456). The source panorama or complete six-face cube, filter uniform allocation and
 filtered outputs must fit the budget together. Replacements also charge the
 still-owned old map. Sizes and sample counts are never reduced automatically
 to satisfy a budget. The existing core planner enforces device limits and work
@@ -158,3 +209,10 @@ composition and package emission/relocation. Three classes, lower GPU resources,
 filter/plan boundaries and pose decoding are explicit fixtures. These tests do
 not establish native WGSL execution, retained-Three rendering parity, browser
 pixels or a measured speedup.
+
+`node --test tools/ingest/three_environment.test.mjs tools/ingest/three_cube_environment.test.mjs`
+also exercises the actual cube filter command generator, with a recording GPU
+and fixture source classes. Cubemap tests independently sample off-axis directions
+on all faces, inspect transfer conversion and emitted cube views/passes, and
+cover whole-source budgets, stale publication, cancellation and cleanup. This is
+command/ownership evidence, not native rendered-pixel equivalence.
