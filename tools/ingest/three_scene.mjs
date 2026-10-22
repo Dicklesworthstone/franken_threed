@@ -27,12 +27,13 @@
  */
 import {createGpuAnimationRenderer} from './animation_render.mjs';
 import {createGpuBufferGeometry, bufferGeometrySnapshot, createGpuInstanceAttributes,
-  instanceAttributesSnapshot, inspectInstanceAttributes} from './gpu_buffer_geometry.mjs';
+  instanceAttributesSnapshot, inspectInstanceAttributes,createGpuProgramGeometry,programGeometrySnapshot} from './gpu_buffer_geometry.mjs';
 import {createGpuThreeTextures,createThreeTextureBindings} from './three_textures.mjs';
 import {hasThreeDeformation, inspectThreeDeformation, createGpuThreeDeformation,
   updateGpuThreeDeformations} from './three_deformation.mjs';
-import {threeProgramStencil} from './three_program_stencil.mjs';
+import {createThreeSceneRaster} from './three_scene_raster.mjs';
 import {threeSpriteCount,threeSpriteWorldMatrix} from './three_sprites.mjs';
+import {hasThreeNodeProgram} from './three_node_program.mjs';
 export class ThreeSceneError extends Error {
   constructor(code,message){super(`THREE_SCENE_${code}: ${message}`);this.name='ThreeSceneError';this.code='THREE_SCENE_'+code;}
 }
@@ -55,12 +56,6 @@ const PHYSICAL_SPECULAR_MAPS=[['specularIntensityMap','specularIntensityTexture'
 const opacityFields=values=>Object.fromEntries(['baseColorTexture','alphaTexture']
   .filter(key=>values?.[key]!==undefined).map(key=>[key,values[key]]));
 const DEPTH=['never','always','less','less-equal','equal','greater-equal','greater','not-equal'];
-const BLEND_FACTOR_NAMES=[['ZeroFactor','zero'],['OneFactor','one'],['SrcColorFactor','src'],['OneMinusSrcColorFactor','one-minus-src'],
-  ['SrcAlphaFactor','src-alpha'],['OneMinusSrcAlphaFactor','one-minus-src-alpha'],['DstColorFactor','dst'],['OneMinusDstColorFactor','one-minus-dst'],
-  ['DstAlphaFactor','dst-alpha'],['OneMinusDstAlphaFactor','one-minus-dst-alpha'],['SrcAlphaSaturateFactor','src-alpha-saturated'],
-  // WebGPU has no dedicated constant-alpha factors; the source maps both forms.
-  ['ConstantColorFactor','constant'],['ConstantAlphaFactor','constant'],['OneMinusConstantColorFactor','one-minus-constant'],['OneMinusConstantAlphaFactor','one-minus-constant']];
-const BLEND_EQUATION_NAMES=[['AddEquation','add'],['SubtractEquation','subtract'],['ReverseSubtractEquation','reverse-subtract'],['MinEquation','min'],['MaxEquation','max']];
 // Source renderable family -> native primitive topology. LineLoop is excluded:
 // the r186 WebGPU renderer reports it and draws nothing (see render traversal).
 const topologyOf=object=>object.isPoints?'points':object.isLineSegments?'lines':object.isLine?'line-strip':'triangles';
@@ -74,7 +69,7 @@ export async function createGpuThreeScene(device,scene,{
   maxNodes=16384,maxGeometries=256,maxBindings=1024,maxGeometryBytes=128*1024*1024,sortObjects=true,
   maxInstanceMeshes=256,maxInstanceBytes=128*1024*1024,
   deformation:deformationOptions={},maxDeformedMeshes=256,maxDeformationBytes=128*1024*1024,shadow=null,environment=null,background=null,fog=null,clipping=null,textureTransforms=false,alphaMaps=false,signal,
-  program:programSupport=null,overrideMaterial:initialOverride=undefined,
+  program:programSupport=null,overrideMaterial:initialOverride=undefined,nodeFrame:initialNodeFrame=null,
 }={}) {
   if(three?.REVISION!=='186'||typeof three.Matrix4!=='function'||typeof three.Frustum!=='function'||
       typeof three.Mesh!=='function'||!(scene instanceof three.Object3D))fail('SOURCE','Supply the pinned r186 module and an Object3D root');
@@ -87,8 +82,13 @@ export async function createGpuThreeScene(device,scene,{
   // callbacks, geometry and textures live. Never rewrite the caller's Scene
   // across an asynchronous preparation boundary.
   let passOverride=initialOverride===undefined?scene.overrideMaterial:initialOverride;
+  // Native graphs arrive as call-time draw packets from the facade. Preparation
+  // consumes descriptors only; it never replays NodeFrame updates or reads later
+  // values from the application's UniformNodes.
+  let passNodeFrame=initialNodeFrame;
   const colorMaterial=m=>m&&m.allowOverride===true&&passOverride!==null?passOverride:m;
   const colorMaterials=o=>(Array.isArray(o.material)?o.material:[o.material]).map(colorMaterial);
+  const capturedNodeObject=o=>passNodeFrame&&(passNodeFrame.objects.has(o)||colorMaterials(o).some(hasThreeNodeProgram));
   if(!(textures instanceof Map)||typeof sortObjects!=='boolean'||typeof autoTextures!=='boolean')fail('OPTIONS','Expected a texture binding Map and boolean texture/sorting options');
   if(!textureOptions||typeof textureOptions!=='object'||Array.isArray(textureOptions))fail('OPTIONS','Expected texture ownership options');
   for(const key of Object.keys(textureOptions))if(!['maxTextureBytes','maxTextures','maxPixels','label'].includes(key))fail('OPTIONS',`Unsupported texture option: ${key}`);
@@ -154,9 +154,8 @@ export async function createGpuThreeScene(device,scene,{
   const backgroundApi=backgroundEnabled?await import('./three_background.mjs'):null;
   let backgroundOwner=null,pendingBackground=null,backgroundPasses=0,backgroundColorPasses=0;
   const sourceBackground=()=>scene.background!==null&&!scene.background?.isColor?scene.background:null;
-  const BLEND_FACTORS=new Map(BLEND_FACTOR_NAMES.map(([k,v])=>[three[k],v]));
-  const BLEND_EQUATIONS=new Map(BLEND_EQUATION_NAMES.map(([k,v])=>[three[k],v]));
   const stencilAttachment=['depth24plus-stencil8','depth32float-stencil8'].includes(renderOptions.depthFormat);
+  const sourceRaster=createThreeSceneRaster(three,{stencilAttachment,fail});
   const models=new Map([
     [three.MeshBasicMaterial.prototype,'unlit'],[three.MeshLambertMaterial.prototype,'lambert'],
     [three.MeshPhongMaterial.prototype,'phong'],[three.MeshToonMaterial.prototype,'toon'],
@@ -950,50 +949,6 @@ export async function createGpuThreeScene(device,scene,{
       return {options:config,values,structural,clipped,coat,...(fogEnabled?{receiveFog:m.fog}:{})};
     });
   }
-  /** Source r186 WebGPUPipelineUtils blend/bias mapping onto native raster state. */
-  function sourceRaster(m,topology){
-    const options={},values={};
-    const blended=m.blending!==three.NoBlending&&(m.blending!==three.NormalBlending||m.transparent!==false);
-    const premultiplied=m.premultipliedAlpha===true;
-    if(m.premultipliedAlpha!==undefined&&typeof m.premultipliedAlpha!=='boolean')fail('MATERIAL','Expected boolean premultipliedAlpha');
-    const set=(src,dst,srcAlpha,dstAlpha)=>({color:{operation:'add',srcFactor:src,dstFactor:dst},alpha:{operation:'add',srcFactor:srcAlpha,dstFactor:dstAlpha}});
-    if(!blended)options.blend=null;
-    else if(m.blending===three.CustomBlending){
-      const factor=f=>{const name=BLEND_FACTORS.get(f);if(!name)fail('MATERIAL','Unsupported source blend factor');return name;};
-      const equation=e=>{const name=BLEND_EQUATIONS.get(e);if(!name)fail('MATERIAL','Unsupported source blend equation');return name;};
-      options.blend={color:{operation:equation(m.blendEquation),srcFactor:factor(m.blendSrc),dstFactor:factor(m.blendDst)},
-        alpha:{operation:equation(m.blendEquationAlpha??m.blendEquation),srcFactor:factor(m.blendSrcAlpha??m.blendSrc),dstFactor:factor(m.blendDstAlpha??m.blendDst)}};
-      if([options.blend.color,options.blend.alpha].some(c=>[c.srcFactor,c.dstFactor].some(f=>f.includes('constant'))))
-        values.blendConstant=[m.blendColor.r,m.blendColor.g,m.blendColor.b,m.blendAlpha];
-    }else if(m.blending===three.NormalBlending)options.blend=premultiplied?set('one','one-minus-src-alpha','one','one-minus-src-alpha'):set('src-alpha','one-minus-src-alpha','one','one-minus-src-alpha');
-    else if(m.blending===three.AdditiveBlending)options.blend=premultiplied?set('one','one','one','one'):set('src-alpha','one','one','one');
-    else if(m.blending===three.SubtractiveBlending||m.blending===three.MultiplyBlending){
-      if(premultiplied)options.blend=m.blending===three.SubtractiveBlending?set('zero','one-minus-src','zero','one'):set('dst','one-minus-src-alpha','zero','one');
-      else{
-        // The source reports this configuration and then draws without blending.
-        (three.error??console.error)(`WebGPURenderer: "${m.blending===three.SubtractiveBlending?'SubtractiveBlending':'MultiplyBlending'}" requires "material.premultipliedAlpha = true".`);
-        options.blend=null;
-      }
-    }else fail('MATERIAL','Unsupported source blending mode');
-    if(premultiplied)options.premultipliedAlpha=true;
-    // Source polygon offset is triangle-only fixed state with a zero clamp.
-    if(m.polygonOffset===true&&topology==='triangles'){
-      for(const key of ['polygonOffsetUnits','polygonOffsetFactor'])finite(m[key],key);
-      if(!Number.isSafeInteger(m.polygonOffsetUnits))fail('MATERIAL','polygonOffsetUnits must be an integer depth bias');
-      Object.assign(options,{depthBias:m.polygonOffsetUnits,depthBiasSlopeScale:m.polygonOffsetFactor,depthBiasClamp:0});
-    }
-    // Ordinary NormalBlending keeps the renderer's established default path.
-    if(m.blending===three.NormalBlending&&!premultiplied)delete options.blend;
-    else if(m.blending===three.NormalBlending&&!m.transparent)options.blend=null;
-    // The source applies stencil state only on an attachment with a stencil
-    // aspect. Fixed state belongs in the pipeline key; the reference is captured
-    // per draw, so changing it neither rebuilds pipelines nor stales bundles.
-    if(stencilAttachment){
-      const {stencil,stencilReference}=threeProgramStencil(three,m,fail,{webgpu:true});
-      if(stencil){options.stencil=stencil;values.stencilReference=stencilReference;}
-    }
-    return {options,values,key:JSON.stringify(options)};
-  }
   // Derived wireframe geometries share the source attributes; only the edge
   // index is owned. Rebuilt when the source index/position version or identity
   // changes (r186 Geometries.getWireframeIndex), with drawRange scaled by two.
@@ -1023,6 +978,11 @@ export async function createGpuThreeScene(device,scene,{
   function placeholderBinding(texture=null,reflection=null){
     return textureBindings.placeholder(texture,reflection);
   }
+  function nodeDescription(binding){
+    const {nodeProgram,raster,material}=binding;
+    return {nodeProgram,options:{nodeProgram,raster,topology:'triangles'},values:{},clipped:null,
+      structural:[trackMaterial(material),'native-node',nodeProgram.key,JSON.stringify(raster)]};
+  }
   function desired(nodes){
     const clippingFrame=clippingState();
     const out=[],descriptions=new Map(),seen=new Map(),usedGeometry=new Set(),usedInstances=new Set(),usedDeformations=new Set();
@@ -1033,6 +993,7 @@ export async function createGpuThreeScene(device,scene,{
     };
     if(programRoute())programSupport.setLights(programLightList(programCamera));
     for(const object of nodes)if(drawable(object)||loopDrawn(object)){
+      if(capturedNodeObject(object))continue;
       const topology=topologyOf(object);
       const g=object.geometry,instanceSource=object.isInstancedMesh?object:null;
       const deformationSource=hasThreeDeformation(object)?object:null,key=deformationSource??instanceSource??g;
@@ -1059,6 +1020,11 @@ export async function createGpuThreeScene(device,scene,{
           if(out.length>maxBindings||usedGeometry.size>maxGeometries||usedInstances.size>maxInstanceMeshes)fail('LIMIT','Source geometry/material binding capacity exceeded');
         }
       }
+    }
+    if(passNodeFrame)for(const binding of passNodeFrame.bindings){
+      usedGeometry.add(binding.geometry);
+      out.push({key:binding.object,geometry:binding.geometry,instanceSource:null,instanceSignature:null,deformationSource:null,
+        material:binding.material,desc:nodeDescription(binding),programSource:binding.geometry});
     }
     const bg=programBackground();
     if(bg)for(const desc of get(bg.material,'triangles',bg))out.push({key:programKeyOf(bg),geometry:bg.geometry,instanceSource:null,instanceSignature:null,deformationSource:null,material:bg.material,desc,programSource:programSource(bg)});
@@ -1102,12 +1068,12 @@ export async function createGpuThreeScene(device,scene,{
   /** One retry per mesh the core deformer refused at capture: the next pass
    * describes it as its ShaderLib program. */
   async function prepare(options={}){
-    if(!options||typeof options!=='object'||Array.isArray(options)||Object.keys(options).some(k=>k!=='overrideMaterial'))
-      fail('OPTIONS','Expected preparation options with an optional overrideMaterial');
+    if(!options||typeof options!=='object'||Array.isArray(options)||Object.keys(options).some(k=>!['overrideMaterial','nodeFrame'].includes(k)))
+      fail('OPTIONS','Expected preparation options with optional overrideMaterial and native node frame');
     const explicit=Object.hasOwn(options,'overrideMaterial');
     const selected=explicit?options.overrideMaterial:scene.overrideMaterial;
     for(let attempt=0;;attempt++){
-      try{return await prepareOnce(selected,!explicit);}
+      try{passNodeFrame=options.nodeFrame??null;return await prepareOnce(selected,!explicit);}
       catch(error){if(error?.code!=='THREE_SCENE_DEFORMATION_ROUTE'||attempt>=8)throw error;}
     }
   }
@@ -1145,22 +1111,22 @@ export async function createGpuThreeScene(device,scene,{
       const environmentSignature=selectedEnvironment?environmentApi.inspectThreeEnvironment(selectedEnvironment,three,environmentOptions).signature:null;
       for(const item of request){
         live();let gpu,signature,deformation=null;
-        if(item.desc.program){
-          const compiled=item.desc.program;
+        if(item.desc.program||item.desc.nodeProgram){
+          const native=!!item.desc.nodeProgram,compiled=item.desc.nodeProgram??item.desc.program;
           let byKey=programGeometries.get(item.programSource);
           if(!byKey)programGeometries.set(item.programSource,byKey=new Map());
           gpu=byKey.get(compiled.attributesKey);
           if(!gpu){
-            gpu=programSupport.createGeometry(device,item.programSource,compiled.program.reflection.attributes,{...geometryOptions,maxBytes:maxGeometryBytes,
+            gpu=(native?createGpuProgramGeometry:programSupport.createGeometry)(device,item.programSource,native?compiled.attributes:compiled.program.reflection.attributes,{...geometryOptions,maxBytes:maxGeometryBytes,
               maxInitialBytes:Math.max(0,maxGeometryBytes-geometryBytes())});
             byKey.set(compiled.attributesKey,gpu);
           }else gpu.update({maxAdditionalBytes:Math.max(0,maxGeometryBytes-geometryBytes())});
-          signature='program:'+programSupport.geometrySnapshot(gpu,device).signature;
+          signature=(native?'node-program:':'program:')+(native?programGeometrySnapshot:programSupport.geometrySnapshot)(gpu,device).signature;
           let entry=lookup.get(item.key)?.get(item.material)?.find(e=>!e.mesh.disposed&&e.programGeometry===gpu&&e.signature===signature&&same(e.structural,item.desc.structural));
           if(!entry){
             const mesh=await Promise.race([renderer.addMesh(gpu,item.desc.options),stopped]);
             entry={key:item.key,geometry:item.geometry,instanceSource:null,instanceSignature:null,material:item.material,structural:item.desc.structural,
-              topology:item.desc.options.topology,signature,deformation:null,mesh,programGeometry:gpu};created.push(entry);live();
+              topology:item.desc.options.topology,signature,deformation:null,mesh,programGeometry:gpu,nodeProgram:native};created.push(entry);live();
           }
           next.push(entry);
           continue;
@@ -1315,7 +1281,8 @@ export async function createGpuThreeScene(device,scene,{
       for(const entry of next){
         if(entry.programGeometry){
           if(!checked.has(entry.programGeometry)){entry.programGeometry.update({maxAdditionalBytes:Math.max(0,maxGeometryBytes-geometryBytes())});checked.add(entry.programGeometry);}
-          if('program:'+programSupport.geometrySnapshot(entry.programGeometry,device).signature!==entry.signature)fail('CHANGED','Geometry layout changed during preparation');
+          const signature=(entry.nodeProgram?'node-program:':'program:')+(entry.nodeProgram?programGeometrySnapshot:programSupport.geometrySnapshot)(entry.programGeometry,device).signature;
+          if(signature!==entry.signature)fail('CHANGED','Geometry layout changed during preparation');
           continue;
         }
         if(entry.deformation){
@@ -1374,7 +1341,7 @@ export async function createGpuThreeScene(device,scene,{
       for(const source of addedInstances){instances.get(source)?.dispose();instances.delete(source);}
       if(!textureOwner?.disposed&&!textureOwner?.failed)textureOwner?.retain(retainedTextures);
       return failed(error);
-    }finally{busy=false;preparing=false;}
+    }finally{busy=false;preparing=false;passNodeFrame=null;}
   }
   function checkCamera(camera){
     if(!(camera instanceof three.Camera)||(!camera.isPerspectiveCamera&&!camera.isOrthographicCamera)||camera.reversedDepth)
@@ -1435,9 +1402,10 @@ export async function createGpuThreeScene(device,scene,{
     let backgroundSubmitted=false;
     try{
       if(!frame||typeof frame!=='object')fail('FRAME','Supply borrowed render attachments');
-      if(!options||typeof options!=='object'||Array.isArray(options)||Object.keys(options).some(k=>!['overrideMaterial','matricesUpdated'].includes(k)))
-        fail('OPTIONS','Expected draw options with an optional overrideMaterial and matrix-update flag');
+      if(!options||typeof options!=='object'||Array.isArray(options)||Object.keys(options).some(k=>!['overrideMaterial','matricesUpdated','nodeFrame'].includes(k)))
+        fail('OPTIONS','Expected draw options with optional overrideMaterial, native node frame and matrix-update flag');
       passOverride=Object.hasOwn(options,'overrideMaterial')?options.overrideMaterial:scene.overrideMaterial;
+      passNodeFrame=options.nodeFrame??null;
       // Framebuffer size for program gl_FragCoord; not a core renderer frame key.
       programTargetSize=frame.targetSize??null;
       if(Object.hasOwn(frame,'targetSize')){const {targetSize,...rest}=frame;frame=rest;}
@@ -1488,6 +1456,7 @@ export async function createGpuThreeScene(device,scene,{
         if(!byTopology.has(key))byTopology.set(key,materialDescription(m,clippingFrame,topology,object));return byTopology.get(key);
       };
       function append(object,groupOrder,z,shadowPass=false){
+        if(capturedNodeObject(object))return;
         const source=object.geometry,topology=topologyOf(object);
         if(object.isSprite&&!programRoute()&&threeSpriteCount(object)===0)return;
         function push(original,sourceGroup){
@@ -1572,9 +1541,15 @@ export async function createGpuThreeScene(device,scene,{
       const shadowFrame=lightIndex<0?null:shadowOwner.capture(camera);
       if(shadowFrame?.update)for(const object of casterObjects)
         if(!object.frustumCulled||shadowFrame.frustum===null||object.intersectsFrustum(shadowFrame.frustum))append(object,0,0,true);
+      if(passNodeFrame)for(const packet of passNodeFrame.draws){
+        const desc=nodeDescription(packet.binding),records=lookup.get(packet.object)?.get(packet.material);
+        const binding=records?.find(e=>!e.mesh.disposed&&e.nodeProgram&&same(e.structural,desc.structural));
+        if(!binding)fail('PREPARE','Prepare the captured native node program before drawing it');
+        (packet.listMaterial.transparent?transparent:opaque).push({...packet,desc:[desc],bindings:[binding],shadowPass:false,nodeProgram:true});
+      }
       if(sortObjects){
-        const order=(a,b)=>a.groupOrder-b.groupOrder||a.object.renderOrder-b.object.renderOrder;
-        opaque.sort((a,b)=>order(a,b)||(arrayViews?0:a.listMaterial.id-b.listMaterial.id)||a.z-b.z||a.object.id-b.object.id);
+        const order=(a,b)=>a.groupOrder-b.groupOrder||(a.renderOrder??a.object.renderOrder)-(b.renderOrder??b.object.renderOrder);
+        opaque.sort((a,b)=>order(a,b)||(programRoute()?a.listMaterial.id-b.listMaterial.id:0)||a.z-b.z||a.object.id-b.object.id);
         transparent.sort((a,b)=>order(a,b)||b.z-a.z||a.object.id-b.object.id);
         transmissive.sort((a,b)=>order(a,b)||b.z-a.z||a.object.id-b.object.id);
       }
@@ -1628,6 +1603,15 @@ export async function createGpuThreeScene(device,scene,{
         catch(error){if(error?.code==='THREE_PROGRAM_TRANSMISSION_PREPARE')fail('PREPARE',error.message);throw error;}
       }
       for(const item of [...casterItems,...items]){
+        if(item.nodeProgram){
+          const gpu=item.bindings[0].programGeometry;
+          if(!updated.has(gpu)){gpu.update({maxAdditionalBytes:Math.max(0,maxGeometryBytes-geometryBytes())});updated.add(gpu);}
+          if(item.bindings[0].signature!=='node-program:'+programGeometrySnapshot(gpu,device).signature)
+            fail('PREPARE','Native node geometry layout changed; prepare the captured program again');
+          draws.push({mesh:item.bindings[0].mesh,first:item.first,count:item.count,nodeUniforms:item.nodeUniforms,frontFaceCW:item.frontFaceCW,nodeRangeCaptured:true,
+            ...(fogEnabled?{receiveFog:false}:{}),...(shadowEnabled?{receiveShadow:false}:{}),...(environmentEnabled?{receiveEnvironment:false}:{})});
+          continue;
+        }
         if(item.program){
           const gpu=item.bindings[0].programGeometry;
           if(!updated.has(gpu)){gpu.update({maxAdditionalBytes:Math.max(0,maxGeometryBytes-geometryBytes())});updated.add(gpu);}
@@ -1823,7 +1807,7 @@ export async function createGpuThreeScene(device,scene,{
       // Do not expose a partially submitted owner as safe for accidental retry.
       if(backgroundSubmitted){terminal??=error;rejectStopped(terminal);}
       return failed(error);
-    }finally{busy=false;frameTextures=null;if(disposed||terminal)release();}
+    }finally{busy=false;frameTextures=null;passNodeFrame=null;if(disposed||terminal)release();}
   }
   const bridge=Object.freeze({scene:root,prepare,render,
     get disposed(){return disposed;},get failed(){return terminal!==null||resourceFailed();},
@@ -1852,6 +1836,6 @@ export async function createGpuThreeScene(device,scene,{
       if(fogEnabled)renderer=fogApi.withThreeFogReceivers(renderer,renderOptions.maxDraws??1024);
       return renderer;
     });
-    await Promise.race([construction,stopped]);live();await prepare(initialOverride===undefined?{}:{overrideMaterial:initialOverride});return bridge;
+    await Promise.race([construction,stopped]);live();await prepare({...(initialOverride===undefined?{}:{overrideMaterial:initialOverride}),nodeFrame:initialNodeFrame});return bridge;
   }catch(error){disposed=true;release();throw error;}
 }

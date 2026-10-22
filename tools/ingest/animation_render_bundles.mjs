@@ -11,7 +11,8 @@
 import {hasAnimationStencil} from './animation_raster.mjs';
 const blended = record => record.alphaMode === 'BLEND' || record.blended === true;
 function compatible(a, b) {
-  return !a.program && !b.program && a.instanceCount == null && b.instanceCount == null &&
+  return !a.program && !b.program && !a.nodeProgram && !b.nodeProgram &&
+    a.instanceCount == null && b.instanceCount == null &&
     !blended(b.record) && a.pipeline === b.pipeline &&
     a.first === b.first && a.count === b.count &&
     a.vertexBuffers.length === b.vertexBuffers.length &&
@@ -33,6 +34,22 @@ export function encodeAnimationDraws(encoder, commands, length, {
   const end = start + length;
   for (let i = start; i < end;) {
     const command = commands[i], {record, first, count, pipeline} = command;
+    if (command.nodeProgram) {
+      // Native node WGSL owns all groups in their source builder order. Its
+      // dynamic offsets select this logical draw, independent of arena index i.
+      encoder.setPipeline(pipeline);
+      for (let group = 0; group < command.nodeProgram.groups.length; group++) {
+        const binding = command.nodeProgram.groups[group];
+        encoder.setBindGroup(group, binding.group, [binding.offset]);
+      }
+      for (let slot = 0; slot < command.vertexBuffers.length; slot++) encoder.setVertexBuffer(slot, command.vertexBuffers[slot]);
+      if (command.indexBuffer) {
+        encoder.setIndexBuffer(command.indexBuffer, command.indexFormat);
+        encoder.drawIndexed(count, command.instanceCount, first, 0, 0);
+      } else encoder.draw(count, command.instanceCount, first, 0);
+      calls++; i++;
+      continue;
+    }
     if (command.program) {
       // Compiled source program: its own uniform slice (dynamic offset) and textures.
       encoder.setPipeline(pipeline);
@@ -87,10 +104,15 @@ function snapshot(command, lightGroup) {
     blend: blended(command.record),
     // Plans are immutable, owned snapshots; never retain a live index reader.
     pointRuns: command.program?.pointRuns ?? null,
+    nodeGroups: command.nodeProgram?.groups.map(({group, offset}) => ({group, offset})) ?? null,
     programGroup: command.program?.group ?? null, programOffset: command.program?.offset ?? null, firstInstance: command.firstInstance ?? 0};
 }
 function samePointRuns(a, b) {
   return a === b || (a != null && b != null && a.length === b.length && a.every((value, i) => value === b[i]));
+}
+function sameNodeGroups(a, b) {
+  return a == null ? b == null : b != null && a.length === b.length &&
+    a.every((binding, index) => binding.group === b[index].group && binding.offset === b[index].offset);
 }
 function matches(recorded, commands, length, lightGroup, start) {
   if (recorded.length !== length) return false;
@@ -104,6 +126,7 @@ function matches(recorded, commands, length, lightGroup, start) {
         a.blend !== blended(r) || a.vertexBuffers.length !== b.vertexBuffers.length ||
         a.programGroup !== (b.program?.group ?? null) || a.programOffset !== (b.program?.offset ?? null) ||
         a.firstInstance !== (b.firstInstance ?? 0) ||
+        !sameNodeGroups(a.nodeGroups, b.nodeProgram?.groups) ||
         !samePointRuns(a.pointRuns, b.program?.pointRuns ?? null))
       return false;
     for (let slot = 0; slot < a.vertexBuffers.length; slot++)

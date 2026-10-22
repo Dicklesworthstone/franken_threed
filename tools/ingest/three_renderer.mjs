@@ -40,6 +40,9 @@ import {createThreeProgramPMREM} from './three_program_pmrem.mjs';
 import {createThreeProgramShadows} from './three_program_shadows.mjs';
 import {createThreeProgramTransmission} from './three_program_transmission.mjs';
 import {withThreeCompute} from './three_compute.mjs';
+import {createThreeNodePrograms} from './three_node_program.mjs';
+import {captureThreeNodeScene} from './three_node_scene_capture.mjs';
+import {createThreeSceneRaster} from './three_scene_raster.mjs';
 // r186 src/renderers/webgpu/utils/WebGPUConstants.js GPUFeatureName values.
 const R186_GPU_FEATURES = ['core-features-and-limits', 'depth-clip-control', 'depth32float-stencil8', 'texture-compression-bc',
   'texture-compression-bc-sliced-3d', 'texture-compression-etc2', 'texture-compression-astc', 'texture-compression-astc-sliced-3d',
@@ -63,6 +66,7 @@ const PARAMETERS = new Set(['outputType', 'canvas', 'antialias', 'alpha', 'depth
   'logarithmicDepthBuffer', 'reversedDepthBuffer', 'powerPreference', 'requiredLimits', 'requiredFeatures',
   'device', 'outputBufferType', 'multiview', 'trackTimestamp', 'colorBufferType', 'getFallback', 'context']);
 const MAX_PENDING = 64;
+const MAX_NODE_CAPTURE_BYTES = 64 * 1024 * 1024;
 
 /** True when the error is a recoverable "call prepare()" boundary from the bridge. */
 const isPrepareBoundary = error => error?.code === 'THREE_SCENE_PREPARE' || error?.code === 'F3D_RENDERER_PREPARE';
@@ -119,10 +123,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
             bridges: [...entries.values()].map(e => e.bridge.diagnostics)});
         },
         entry(scene) { return entries.get(scene) ?? null; },
-        render({scene, camera, overrideMaterial, matricesUpdated}, frame) {
+        render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame}, frame) {
           const entry = entries.get(scene);
           if (!entry) fail('PREPARE', 'Scene has not been prepared');
-          entry.bridge.render(camera, frame, {overrideMaterial, matricesUpdated});
+          entry.bridge.render(camera, frame, {overrideMaterial, matricesUpdated, nodeFrame});
           entry.lastDiagnostics = entry.bridge.diagnostics;
           return entry;
         },
@@ -154,7 +158,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
               // Source renderers have no texture budget: bound residency by a
               // device-scale default (1 GiB) rather than the bridge's 128 MiB.
               texture: {maxTextureBytes: 1024 * 1024 * 1024},
-              ...sceneLimits, three: THREE, signal, maxBindings, overrideMaterial,
+              ...sceneLimits, three: THREE, signal, maxBindings, overrideMaterial, nodeFrame: passOptions?.nodeFrame ?? null,
               textures: owner._targets.bindingsFor(destination === owner ? null : destination.target, sceneLimits.textures),
               renderer: {...attachments, instancing: true, renderBundles: true, maxDraws,
                 ...(destination !== owner || owner._hdr || !owner._shaderEncodedOutput ? {} : {outputTransfer: 'srgb'})},
@@ -235,6 +239,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this.toneMappingExposure = 1;
       this.sortObjects = true;
       this.shadowMap = {enabled: false, transmitted: false, type: THREE.PCFShadowMap};
+      this.lighting = {enabled: true};
       // The source node library instance (registrations such as addLight are
       // recorded on the real object). The F3D bridge evaluates admitted light
       // and material classes itself; unadmitted classes still fail explicitly.
@@ -276,6 +281,9 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._targetLifetime = new AbortController();
       this._targets = createThreeRenderTargets(THREE, {getDevice: () => this._device, flipY: targetTextureFlipY});
       this._passSnapshots = createThreePassSnapshots(THREE);
+      this._nodeProgramSupport = null;
+      this._nodeCaptureBytes = 0;
+      this._nodeRaster = new Map();
       this._initialized = false;
       this._initPromise = null;
       this._session = null;
@@ -377,6 +385,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._session = null;
       this._wanted.clear();
       this._passSnapshots.dispose();
+      this._nodeProgramSupport?.dispose();
+      this._nodeProgramSupport = null;
       if (this._ownsDevice) { this._ownsDevice = false; this._device?.destroy(); }
     }
 
@@ -477,6 +487,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     getClearStencil() { return this._clearStencil; }
     setClearStencil(stencil) { this._clearStencil = stencil; }
     getRenderTarget() { return this._renderTarget; }
+    getMRT() { return null; }
     setRenderTarget(renderTarget, activeCubeFace = 0, activeMipmapLevel = 0) {
       if (activeCubeFace !== 0) fail('UNSUPPORTED', 'Cube faces are not admitted');
       if (activeMipmapLevel !== 0 && this._shaderEncodedOutput)
@@ -641,7 +652,18 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         frame.arrayCamera = {pixelRatio: target ? 1 : this._pixelRatio, clipSpace: 'webgpu',
           targetSize: target ? [Math.max(1, Math.floor(target.width / 2 ** mipLevel)), Math.max(1, Math.floor(target.height / 2 ** mipLevel))] : this._bufferSize()};
       }
-      return {scene: snapshot?.root ?? scene, camera: snapshot?.camera ?? camera, snapshot, matricesUpdated, clearOnly, destination, mipLevel, frame, overrideMaterial,
+      let nodeFrame = null;
+      if (!this._shaderEncodedOutput && !clearOnly) {
+        const stencilAttachment = target ? destination.shape.depthFormat?.endsWith('-stencil8') === true : this.stencil;
+        let raster = this._nodeRaster.get(stencilAttachment);
+        if (!raster) { raster = createThreeSceneRaster(THREE, {stencilAttachment, fail}).program; this._nodeRaster.set(stencilAttachment, raster); }
+        nodeFrame = captureThreeNodeScene(THREE, scene, camera, {renderer: this, overrideMaterial, raster,
+          getPrograms: () => this._nodeProgramSupport ??= createThreeNodePrograms({three: THREE, renderer: this, maxPrograms: maxBindings}),
+          maxNodes: sceneLimits.maxNodes ?? 16384, maxDraws, uniforms: captureCameras,
+          maxUniformBytes: MAX_NODE_CAPTURE_BYTES - this._nodeCaptureBytes});
+        if (nodeFrame) { this._nodeCaptureBytes += nodeFrame.bytes; matricesUpdated = true; }
+      }
+      return {scene: snapshot?.root ?? scene, camera: snapshot?.camera ?? camera, snapshot, matricesUpdated, nodeFrame, clearOnly, destination, mipLevel, frame, overrideMaterial,
         linearClearColor: this.alpha ? [c.r * a, c.g * a, c.b * a, a] : [c.r, c.g, c.b, 1],
         hdr: !target && this._wantsHdr(this._toneMapping()), key,
         programFrame: {toneMapping: this.toneMapping, toneMappingExposure: this.toneMappingExposure,
@@ -651,29 +673,33 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       const request = this._makeRequest(scene, camera, clearOnly);
       return this._dispatchRequest(request);
     }
+    _releaseRequest(request) {
+      request.snapshot?.release();
+      if (request.nodeFrame) { this._nodeCaptureBytes -= request.nodeFrame.bytes; request.nodeFrame = null; }
+    }
     _dispatchRequest(request) {
       const {scene, destination, snapshot} = request;
       destination._wanted.set(scene, request.key);
       const entry = destination._dispatcher?.entry(scene);
       if (this._drain || this._preparing || (destination === this && request.hdr !== this._hdr) || !entry || entry.key !== request.key || (!entry.clipping && request.overrideMaterial?.clippingPlanes?.length))
         return this._defer(request);
-      try { this._submit(request); snapshot?.release(); }
+      try { this._submit(request); this._releaseRequest(request); }
       catch (error) {
         if (isPrepareBoundary(error) || (error?.code === 'THREE_SCENE_MATERIAL' && !entry.clipping && needsClipping(scene, request.overrideMaterial)))
           return this._defer(request);
-        snapshot?.release();
+        this._releaseRequest(request);
         throw error;
       }
     }
-    _submit({scene, camera, frame, destination, mipLevel = 0, programFrame, snapshot, overrideMaterial, matricesUpdated, deferred = false}) {
+    _submit({scene, camera, frame, destination, mipLevel = 0, programFrame, snapshot, overrideMaterial, matricesUpdated, nodeFrame, deferred = false}) {
       snapshot?.install();
       const previous = this._programFrame;
       // Immediate source callbacks must still be able to change live program
       // state. Only deferred calls need the queued renderer-state snapshot.
       this._programFrame = deferred ? programFrame : undefined;
       try {
-        if (destination === this) this._session.render({scene, camera, overrideMaterial, matricesUpdated}, frame);
-        else this._targets.render(destination, attachments => destination._dispatcher.render({scene, camera, overrideMaterial, matricesUpdated}, {...frame, ...attachments}), {mipLevel});
+        if (destination === this) this._session.render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame}, frame);
+        else this._targets.render(destination, attachments => destination._dispatcher.render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame}, {...frame, ...attachments}), {mipLevel});
       } finally { this._programFrame = previous; }
       const d = destination._dispatcher.entry(scene)?.lastDiagnostics;
       if (d) {
@@ -691,7 +717,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     }
     _defer(request) {
       request.deferred = true; this.info.f3d.deferredRenders++;
-      try { this._enqueue(request); } catch (error) { request.snapshot?.release(); throw error; }
+      try { this._enqueue(request); } catch (error) { this._releaseRequest(request); throw error; }
     }
     _enqueue(request) {
       // A later clear is NOT a license to discard an earlier target write,
@@ -703,7 +729,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     _startDrain() {
       if (!this._drain) {
         this._drain = this._drainPending().catch(error => {
-          for (const pending of this._pending) { pending.snapshot?.release(); pending.reject?.(error); }
+          for (const pending of this._pending) { this._releaseRequest(pending); pending.reject?.(error); }
           this._pending = [];
           this._deferredError ??= error;
           throw error;
@@ -743,7 +769,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
             if (!isPrepareBoundary(error)) throw error;
           }
         }
-        request.snapshot?.release();
+        this._releaseRequest(request);
         this._pending.shift();
       }
     }
@@ -768,7 +794,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         destination._wanted.set(request.scene, request.key);
         while (this._drain) await this._drain;
         await this._prepare(destination, request);
-      } finally { snapshot?.release(); }
+      } finally { this._releaseRequest(request); }
     }
     /** All scene preparations share one queue; targets never rebuild the canvas. */
     _prepare(destination = this, request = null) {
@@ -778,7 +804,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         const previousOptions = destination._preparationOptions;
         this._programFrame = request?.programFrame;
         destination._preparationRoot = request?.scene ?? null;
-        destination._preparationOptions = request ? {overrideMaterial: request.overrideMaterial} : undefined;
+        destination._preparationOptions = request ? {overrideMaterial: request.overrideMaterial, nodeFrame: request.nodeFrame} : undefined;
         try {
           request?.snapshot?.install();
           if (destination !== this) {
@@ -864,7 +890,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       const stopped = new F3DRendererError('DISPOSED', 'Renderer is disposed');
       this._targetLifetime.abort(stopped);
       this._targets.dispose();
-      for (const request of this._pending) { request.snapshot?.release(); request.reject?.(stopped); }
+      for (const request of this._pending) { this._releaseRequest(request); request.reject?.(stopped); }
       this._pending = [];
       this._inspector.dispose?.();
       if (!this._drain) this._release();

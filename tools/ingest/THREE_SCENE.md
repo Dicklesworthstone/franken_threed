@@ -77,6 +77,15 @@ layout is handled by residency updates; changing its layout needs preparation.
 Material `.version` alone is not a reason to compile another pipeline: it does
 not hide an actual structural change, and scalar changes stay per-use values.
 
+The `WebGPURenderer` facade additionally connects authored unlit native TSL
+programs through captured node draw packets. These share the program geometry
+residency, raster mapping and ordered submission owners, while retaining the
+source builder's native bind-group layouts. Node updates and uniform capture
+happen at the public render call, before any asynchronous preparation. The
+direct bridge consumes those prepared packets and does not replay callbacks.
+See [THREE_NODE_PROGRAMS.md](./THREE_NODE_PROGRAMS.md). Source geometry remains
+live and version-governed; node packets are not copies of vertex/index buffers.
+
 All reachable meshes are admitted/prepared, including hidden LOD levels. A
 hidden unsupported renderable is not silently certified. Unsupported source
 features throw `ThreeSceneError`; original geometry/renderer errors retain their

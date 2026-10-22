@@ -234,6 +234,7 @@ import {animationClippingBytes, animationClippingFields, animationClippingWgsl,
   snapshotAnimationClipping, packAnimationClipping} from "./animation_clipping.mjs";
 import {createAnimationRenderBundleCache, encodeAnimationRenderSpans} from "./animation_render_bundles.mjs";
 import {createProgramMeshes} from "./animation_program_mesh.mjs";
+import {createThreeNodeProgramMeshes} from "./three_node_program_gpu.mjs";
 import {createAnimationColorTargetProfile} from "./animation_color_target.mjs";
 import {snapshotAnimationRaster, snapshotAnimationRasterUse, hasAnimationStencil,
   ANIMATION_NORMAL_BLEND} from "./animation_raster.mjs";
@@ -1396,6 +1397,7 @@ export async function createGpuAnimationRenderer(
   function release() {
     bundleCache?.dispose();
     programs?.dispose();
+    nodePrograms?.dispose();
     for (const buffer of buffers.keys()) forget(buffer);
     if (sharedBuffers)
       for (const bucket of sharedBuffers.values())
@@ -1421,6 +1423,9 @@ export async function createGpuAnimationRenderer(
   lost.catch(() => {});
   // Compiled source programs (ShaderMaterial) share this renderer's passes/order.
   const programs = createProgramMeshes({device, format, depthFormat, sampleCount, maxDraws, label, fail, scoped, lost});
+  // Native Three node builders provide WGSL and bind-group layouts directly.
+  // Keep their group order/uniform arenas separate from ESSL-reflected programs.
+  let nodePrograms = null;
   /** A scissor-limited clear: one full-target triangle (the scissor rect clips
    * it) writing the clear color, depth (frag_depth) and stencil (replace). */
   let clearPipelines = null, clearUniform = null;
@@ -1478,6 +1483,35 @@ struct Out { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 };
       owned.set(mesh, record);
       records.add(record);
       return mesh;
+    } finally { pendingMeshes--; }
+  }
+  async function addNodeProgramMesh(gpu, options) {
+    keys(options, ["nodeProgram", "raster", "topology"], "node program mesh");
+    if (records.size + pendingMeshes >= maxMeshes) fail("ANIMATION_RENDER_LIMIT", "Mesh capacity exceeded");
+    pendingMeshes++;
+    let record;
+    try {
+      nodePrograms ??= createThreeNodeProgramMeshes({device, format, depthFormat, sampleCount, maxDraws, label, fail, scoped, lost,
+        maxBindGroups: Math.min(4, device.limits.maxBindGroups)});
+      record = await nodePrograms.add(gpu, options);
+      live();
+      const mesh = Object.freeze({
+        get disposed() { return record.disposed || disposed; },
+        dispose() {
+          if (busy) fail("ANIMATION_RENDER_REENTRANT", "Cannot dispose a mesh during submission");
+          if (!record.disposed) {
+            records.delete(record);
+            bundleCache?.clear();
+            nodePrograms.remove(record);
+          }
+        },
+      });
+      owned.set(mesh, record);
+      records.add(record);
+      return mesh;
+    } catch (error) {
+      if (record) nodePrograms.remove(record);
+      throw error;
     } finally { pendingMeshes--; }
   }
   function live() {
@@ -1865,6 +1899,7 @@ struct Out { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 };
   async function addMesh(gpu, options = {}) {
     live();
     if (busy) fail("ANIMATION_RENDER_REENTRANT", "Cannot register a mesh during submission");
+    if (options?.nodeProgram !== undefined) return addNodeProgramMesh(gpu, options);
     if (options?.program !== undefined) return addProgramMesh(gpu, options);
     keys(
       options,
@@ -2631,9 +2666,22 @@ struct Out { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 };
         );
       }
       programs.begin();
+      nodePrograms?.begin();
       for (let i = 0; i < draws.length; i++) {
         const input = owned.has(draws[i]) ? { mesh: draws[i] } : draws[i];
         const programRecord = owned.get(input?.mesh);
+        if (programRecord?.nodeProgram) {
+          keys(input, ["mesh", "first", "count", "nodeUniforms", "frontFaceCW", "nodeRangeCaptured"], "node program draw");
+          if (programRecord.disposed) fail("ANIMATION_RENDER_MESH", "Mesh is not live in this renderer");
+          if (input.nodeRangeCaptured !== undefined && typeof input.nodeRangeCaptured !== "boolean")
+            fail("ANIMATION_RENDER_OPTIONS", "nodeRangeCaptured must be boolean");
+          const command = commands[i] ?? (commands[i] = {});
+          command.program = null;
+          command.firstInstance = 0;
+          nodePrograms.stage(programRecord, input, command);
+          dependencies.add(programRecord.gpu);
+          continue;
+        }
         if (programRecord?.program) {
           keys(input, ["mesh", "first", "count", "programUniforms", "frontFaceCW", "instanceCount"], "program draw");
           if (programRecord.disposed) fail("ANIMATION_RENDER_MESH", "Mesh is not live in this renderer");
@@ -2810,6 +2858,7 @@ struct Out { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 };
         Object.assign(command, {
           record,
           program: null,
+          nodeProgram: null,
           ...rasterUse,
           first,
           count,
@@ -2957,6 +3006,7 @@ struct Out { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 };
         // into a later unfogged span. Queue writes precede their consuming submit.
         if (fog) device.queue.writeBuffer(fogBuffer, 0, fogWords);
         programs.write();
+        nodePrograms?.write();
         if (usesLighting) device.queue.writeBuffer(lightBuffer, 0, lightWords);
         if (usesLighting && projected) device.queue.writeBuffer(shadowBuffer, 0, shadowWords);
         if (usesLighting && ambient)
@@ -3008,6 +3058,7 @@ struct Out { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 };
         command.indexFormat = null;
         command.instanceBindGroup = null;
         command.program = null;
+        command.nodeProgram = null;
       }
       busy = false;
     }

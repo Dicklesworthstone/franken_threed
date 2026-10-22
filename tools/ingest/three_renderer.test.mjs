@@ -172,7 +172,7 @@ test('unsupported source content surfaces as an explicit error instead of a sile
   const {renderer} = await create();
   await renderer.init();
   const f = sceneFixture();
-  f.mesh.material = new T.MeshMatcapMaterial();
+  f.mesh.material = new T.MeshDepthMaterial();
   renderer.render(f.scene, f.camera);
   await flush(renderer).catch(() => {});
   assert.throws(() => renderer.render(f.scene, f.camera), /Unsupported source material/);
@@ -442,7 +442,7 @@ test('clear initialization and asynchronous stencil completion follow the source
 test('an asynchronous clear reports a preceding deferred failure before claiming success', async () => {
   const {renderer, device} = await create({stencil: true}); await renderer.init();
   try {
-    const f = sceneFixture(); f.mesh.material = new T.MeshMatcapMaterial();
+    const f = sceneFixture(); f.mesh.material = new T.MeshDepthMaterial();
     renderer.render(f.scene, f.camera); await flush(renderer).catch(() => {});
     const submissions = device.submissions.length;
     await assert.rejects(renderer.clearStencilAsync(), /Unsupported source material/);

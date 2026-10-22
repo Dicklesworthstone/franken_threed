@@ -6,7 +6,9 @@ import { pbrMapScenarios } from './scenarios_pbr_maps.js';
 import { spriteScenarios } from './scenarios_sprites.js';
 import { renderMipScenarios } from './scenarios_render_mips.js';
 import { matcapScenarios } from './scenarios_matcap.js';
+import { nativeTSLScenarios } from './scenarios_native_tsl.js';
 export const scenarios = {
+  ...nativeTSLScenarios,
   ...matcapScenarios,
   ...renderMipScenarios,
   ...spriteScenarios,

@@ -292,3 +292,24 @@ test("sampler-only module retains its single runtime import", () => {
   assert.equal(source.includes("animation_controller"), false);
   assert.equal(source.includes("animation_deformer"), false);
 });
+
+for (const threeScene of [false, true])
+  test(`relocated GPU packages include native node program dependencies (source scene=${threeScene})`, async () => {
+    const f = files(), result = buildAnimation(f.entry, f.out, {webgpu: true, threeScene});
+    const required = ["three_node_program_gpu.mjs", "animation_program_uniforms.mjs", "animation_color_target.mjs",
+      ...(threeScene ? ["three_node_program.mjs", "three_scene_raster.mjs", "three_program_stencil.mjs"] : [])];
+    for (const name of required) {
+      assert.ok(result.emittedFiles.includes(name), `${name} follows its static import`);
+      const expected = fs.readFileSync(new URL("./" + name, import.meta.url));
+      assert.deepEqual(fs.readFileSync(path.join(f.out, name)), expected);
+      assert.equal(result.artifacts.find(a => a.file === name).sha256, hash(expected));
+    }
+    if (!threeScene) assert.equal(result.emittedFiles.includes("three_node_program.mjs"), false);
+    const moved = path.join(f.dir, "relocated-node-player");
+    fs.renameSync(f.out, moved);
+    const api = await import(pathToFileURL(path.join(moved, result.gpuEntry)));
+    assert.equal(typeof api.createGpuAnimationRenderer, "function");
+    if (threeScene) assert.equal(typeof api.createGpuThreeScene, "function");
+    const native = await import(pathToFileURL(path.join(moved, "three_node_program_gpu.mjs")));
+    assert.equal(typeof native.createThreeNodeProgramMeshes, "function");
+  });
