@@ -16,6 +16,14 @@ float attributes compile through the pinned builder. Native scalar, integer,
 boolean, vector and matrix uniforms retain their source group ordering and
 padding. Clip-space vertex and fragment graphs with no uniform groups also work.
 
+Authored `texture()` graphs sample ordinary 2D data, decoded image/canvas and
+resolved color render-target textures. The pinned builder owns UV channel and
+matrix selection, explicit/generated UVs, color-space interpretation, explicit
+levels and vertex/fragment sampling. Bind groups preserve the source's exact
+resource order: a uniform block can follow samplers/textures, and groups can
+contain resources without a uniform block. Filterable float formats are admitted;
+float32 inputs require the actual `float32-filterable` device feature.
+
 ```js
 const tint = TSL.uniform(new THREE.Color(0.2, 0.5, 0.8));
 const shift = TSL.uniform(0);
@@ -42,7 +50,7 @@ that mesh takes the node path.
 
 ## Call-time semantics and ownership
 
-Each logical render synchronously selects native draws and captures owned
+Each initialized logical render synchronously selects native draws and captures owned
 uniform byte packets before asynchronous pipeline preparation. Selection follows
 source visibility, layers, LOD, geometry groups, frustum culling, render order and
 WebGPU depth sorting. All reachable node bindings, including hidden objects, are
@@ -56,6 +64,18 @@ update returns `false`. A logical draw updates once even if preparation retries.
 Frame time and render identity remain fixed for the captured call; nested calls
 and thrown callbacks restore the surrounding context. `compileAsync()` prepares
 bindings without running node updates or advancing animation/render counters.
+Calls before initialization prepare at the source's asynchronous boundary, when
+device capabilities are available.
+
+Graphics and compute share the renderer's existing sampled-texture snapshot
+adapter and upload pool. Each draw leases its post-update texture identities,
+sampler state and requested CPU pixel versions before after-update callbacks.
+Later source edits cannot replace older queued contents. Image readiness joins
+the renderer FIFO; the adapter keeps immutable private images until use finishes.
+Render-target inputs borrow their native attachment views through submission and
+observe preceding GPU writes without readback, re-upload or a UV replica. Sampling
+the current destination is rejected before submission. Texture capture capacity,
+retirement and disposal use the shared owner's existing bounds.
 
 Captured graph descriptors, raster state, source list properties, draw ranges and
 uniform bytes survive later source edits. Material/geometry disposal invalidates
@@ -76,8 +96,12 @@ material. Original material visibility and render-list partitioning still apply.
 
 ## Explicit remaining boundaries
 
-This is a bounded native graphics entrance, not full TSL coverage. Texture,
-storage/buffer, compute, lighting and multiple-render-target graphs are refused.
+This is a bounded native graphics entrance, not full TSL coverage. Storage/buffer,
+compute, lighting and multiple-render-target graphics graphs are refused.
+Depth/comparison, cube, array, volume, compressed, storage, video and unfilterable
+or integer texture graphs still require additional native profiles. Sampled
+texture capture transactions reject reentrant texture capture from node updates
+or upload callbacks.
 The profile excludes shader context extensions, fog/clipping/shadows, material
 textures, wireframe, alpha hashing and alpha-to-coverage; instanced, skinned,
 batched or morph meshes; ArrayCamera, reversed depth and XR views; custom
@@ -97,7 +121,7 @@ The implementation follows Three.js r186 source commit
 and `RenderList` ordering. Native opaque sorting uses depth and object identity,
 without WebGL's material-id sort key.
 
-The three owner/capture test files contain 48 focused cases covering actual
+The three owner/capture test files cover actual
 pinned shader generation and packing, callback contexts and frequencies,
 independent byte history, call-time selection/ranges, admission and budgets,
 pipeline failures, device loss and disposal:
@@ -116,3 +140,10 @@ fragment case's mean channel difference was 0.01, and the other two were zero.
 They cover shared uniform materials, position displacement, custom attributes,
 translucent fragment graphs, nonidentity transforms, object-dependent updates
 and distinct uniform values in queued offscreen renders.
+
+The texture suites exercise source binding indices and stage visibility, sampler
+and pixel-version history, compatible image replacement, target generation and
+feedback checks, resource-only groups and bounded bind-group reuse. Browser
+scenarios `native_tsl_textures`, `native_tsl_texture_updates` and
+`native_tsl_target_texture` compare those generated programs with the pinned
+renderer at the existing tolerance.

@@ -7,7 +7,8 @@ function rig(t, options = {}) {
   const frame = new THREE.NodeFrame();
   const renderer = {library: new THREE.StandardNodeLibrary(), contextNode: N.context(),
     debug: {diagnostics: {keywords: false}}, depth: true, lighting: {enabled: true},
-    backend: {hasFeature: () => false}, hasFeature: () => false, getRenderTarget: () => null,
+    backend: {hasFeature: () => false, utils: {getTextureSampleData: () => ({samples: 1, primarySamples: 1, isMSAA: false})}},
+    hasFeature: () => false, getRenderTarget: () => null,
     getMRT: () => null, currentSamples: 1, _nodes: {nodeFrame: frame}, info: {calls: 1}};
   const owner = createThreeNodePrograms({three: THREE, renderer, ...options}); t.after(() => owner.dispose());
   const material = new THREE.MeshBasicNodeMaterial();
@@ -23,6 +24,12 @@ function rig(t, options = {}) {
     compile: () => owner.compile(material, object, context)};
 }
 const floats = packets => packets.flatMap(bytes => Array.from(new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4)));
+function dataTexture({linear = true, type = THREE.UnsignedByteType} = {}) {
+  const pixels = type === THREE.FloatType ? new Float32Array(16) : type === THREE.HalfFloatType ? new Uint16Array(16) : new Uint8Array(16);
+  const texture = new THREE.DataTexture(pixels, 2, 2, THREE.RGBAFormat, type);
+  if (linear) texture.minFilter = texture.magFilter = THREE.LinearFilter;
+  return texture;
+}
 test('real pinned node graphs preserve native WGSL groups, attributes and linear output', t => {
   const f = rig(t), d = f.compile();
   assert.equal(d.nodeProgram, true); assert.equal('reflection' in d, false);
@@ -112,6 +119,120 @@ test('same material on two objects captures different object-update values', t =
   assert.ok(floats(first).includes(.25)); assert.ok(floats(second).includes(.75));
   assert.notDeepEqual(first, second);
 });
+test('pinned sampled graphs preserve mixed binding slots and separate vertex/fragment visibility', t => {
+  const f = rig(t), texture = dataTexture();
+  f.material.fragmentNode = N.texture(texture).mul(.75);
+  f.material.positionNode = N.positionLocal.add(N.texture(texture).r.mul(.1));
+  const d = f.compile(), group = d.groups.find(group => group.name === 'object');
+  assert.deepEqual(group.entries.map(entry => [entry.binding, entry.buffer ? 'uniform' : entry.texture ? 'texture' : 'sampler', entry.visibility]),
+    [[0, 'sampler', 2], [1, 'texture', 2], [2, 'uniform', 7], [3, 'sampler', 1], [4, 'texture', 1]]);
+  assert.equal(group.entries[2].buffer.minBindingSize, group.byteLength);
+  assert.match(d.vertex, /@binding\( 4 \).*@group\( 1 \)/); assert.match(d.vertex, /textureSampleLevel/);
+  assert.match(d.fragment, /@binding\( 1 \).*@group\( 1 \)/); assert.match(d.fragment, /textureSample\(/);
+  const captured = f.owner.captureDraw(d, f.context);
+  assert.deepEqual(captured.uniforms.map(bytes => bytes.byteLength), d.groups.map(group => group.byteLength));
+  assert.deepEqual(captured.textures.map(value => [value.group, value.binding, value.isSampledTexture]),
+    [[1, 0, false], [1, 1, true], [1, 3, false], [1, 4, true]]);
+  assert.ok(captured.textures.every(value => value.texture === texture && value.isSampler && value.store === false));
+});
+test('resource-only groups and nearest texture loads retain native binding cardinality', t => {
+  for (const linear of [true, false]) {
+    const f = rig(t), texture = dataTexture({linear}), material = new THREE.NodeMaterial();
+    material.vertexNode = N.vec4(N.attribute('position', 'vec3'), 1);
+    material.fragmentNode = N.texture(texture, N.vec2(.25, .75)).setUpdateMatrix(false);
+    const d = f.owner.compile(material, f.object, f.context), captured = f.owner.captureDraw(d, {...f.context, material});
+    assert.equal(d.groups.length, 1); assert.equal(d.groups[0].byteLength, 0);
+    assert.equal(d.groups[0].entries.some(entry => entry.buffer), false);
+    assert.equal(d.groups[0].entries.length, linear ? 2 : 1);
+    assert.equal(captured.uniforms.length, 1); assert.equal(captured.uniforms[0].byteLength, 0);
+    assert.equal(captured.textures.length, linear ? 2 : 1);
+    assert.match(d.fragment, linear ? /textureSample\(/ : /textureLoad\(/);
+  }
+});
+test('source texture channel, UV matrix and native color-space metadata survive capture', t => {
+  const f = rig(t), texture = dataTexture(); texture.channel = 1; texture.colorSpace = THREE.SRGBColorSpace;
+  texture.repeat.set(2, 3); texture.offset.set(.125, .375);
+  f.object.geometry.setAttribute('uv1', f.object.geometry.attributes.uv);
+  const inspected = [];
+  f.renderer._getSampledTextureInputs = () => ({layoutOf(binding) {
+    inspected.push(binding.texture); return {texture: {sampleType: 'float', viewDimension: '2d', multisampled: false}};
+  }});
+  f.material.colorNode = N.texture(texture);
+  const d = f.compile(), first = f.owner.captureDraw(d, f.context), saved = first.uniforms.map(bytes => bytes.slice());
+  assert.ok(d.attributes.some(attribute => attribute.name === 'uv1'));
+  assert.equal(d.attributes.some(attribute => attribute.name === 'uv'), false);
+  for (const value of [2, 3, .125, .375]) assert.ok(floats(first.uniforms).includes(value));
+  assert.ok(inspected.length > 0 && inspected.every(value => value === texture));
+  assert.equal(first.textures[0].texture.colorSpace, THREE.SRGBColorSpace);
+  // Source native shaders use the sampled texture view's color conversion.
+  assert.doesNotMatch(d.fragment, /sRGBTransferEOTF/);
+  texture.offset.x = .625;
+  const second = f.owner.captureDraw(d, {...f.context, renderId: 2});
+  assert.equal(f.compile(), d); assert.ok(floats(second.uniforms).includes(.625));
+  assert.deepEqual(first.uniforms, saved);
+});
+test('compatible texture replacement reuses shaders and captures each logical update exactly once', t => {
+  const f = rig(t), a = dataTexture(), b = dataTexture(), sampled = N.texture(a), contexts = [];
+  b.offset.x = .75; let after = 0;
+  const gain = N.uniform(.5).onObjectUpdate(frame => { contexts.push(frame.object); return .5; });
+  gain.updateAfterType = 'object'; gain.updateAfter = () => { after++; };
+  f.material.colorNode = sampled.mul(gain);
+  const d = f.compile(); assert.equal(f.owner.textures(d)[0].texture, a); assert.equal(contexts.length, 0);
+  const first = f.owner.captureDraw(d, f.context); f.owner.after(d, f.context);
+  sampled.value = b; assert.equal(f.compile(), d);
+  const second = f.owner.captureDraw(d, {...f.context, renderId: 2}); f.owner.after(d, {...f.context, renderId: 2});
+  assert.ok(first.textures.every(binding => binding.texture === a));
+  assert.ok(second.textures.every(binding => binding.texture === b));
+  assert.ok(floats(second.uniforms).includes(.75)); assert.equal(contexts.length, 2); assert.equal(after, 2);
+  assert.deepEqual(contexts, [f.object, f.object]);
+  f.owner.textures(d); assert.equal(contexts.length, 2);
+});
+test('texture aliases, sampling mode and UV channels invalidate structural programs', t => {
+  const f = rig(t), a = dataTexture(), b = dataTexture(), left = N.texture(a), right = N.texture(a);
+  f.material.colorNode = left.add(right);
+  const initial = f.compile(); assert.equal(f.owner.textures(initial).length, 2);
+  right.value = b;
+  assert.throws(() => f.owner.captureDraw(initial, f.context), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  const split = f.compile(); assert.notEqual(split, initial); assert.equal(f.owner.textures(split).length, 4);
+  b.minFilter = b.magFilter = THREE.NearestFilter;
+  const nearest = f.compile(); assert.notEqual(nearest, split); assert.equal(f.owner.textures(nearest).length, 3);
+  f.object.geometry.setAttribute('uv1', f.object.geometry.attributes.uv); b.channel = 1;
+  const channel = f.compile(); assert.notEqual(channel, nearest); assert.ok(channel.attributes.some(attribute => attribute.name === 'uv1'));
+});
+test('render-target texture identity and explicit UVs use the native single-sampled layout', t => {
+  const f = rig(t), target = new THREE.RenderTarget(4, 4); target.texture.channel = 3;
+  f.material.fragmentNode = N.texture(target.texture, N.uv().yx).level(0);
+  const d = f.compile(), captured = f.owner.captureDraw(d, f.context);
+  assert.ok(captured.textures.every(binding => binding.texture === target.texture));
+  assert.equal(d.attributes.some(attribute => attribute.name === 'uv3'), false);
+  assert.match(d.fragment, /textureSampleLevel/); assert.doesNotMatch(d.fragment, /flipY/);
+  for (const group of d.groups) for (const entry of group.entries) if (entry.texture)
+    assert.deepEqual(entry.texture, {sampleType: 'float', viewDimension: '2d', multisampled: false});
+});
+test('callback texture edits cannot silently retain an incompatible compiled layout', t => {
+  const f = rig(t), texture = dataTexture(), sampled = N.texture(texture); let updates = 0;
+  f.object.geometry.setAttribute('uv1', f.object.geometry.attributes.uv);
+  const gain = N.uniform(.5).onObjectUpdate(() => { updates++; texture.channel = 1; return .5; });
+  f.material.colorNode = sampled.mul(gain); const d = f.compile();
+  assert.throws(() => f.owner.captureDraw(d, f.context), {code: 'THREE_NODE_PROGRAM_CHANGED'}); assert.equal(updates, 1);
+  const next = f.compile(); assert.notEqual(next, d); f.owner.captureDraw(next, f.context); assert.equal(updates, 2);
+});
+test('unsupported texture families, actual borrowed layouts and device binding limits refuse explicitly', t => {
+  const f = rig(t);
+  const values = [new THREE.CubeTexture(), new THREE.Data3DTexture(new Uint8Array(4), 1, 1, 1),
+    new THREE.DataArrayTexture(new Uint8Array(4), 1, 1, 1), new THREE.DepthTexture(1, 1),
+    new THREE.StorageTexture(1, 1), dataTexture({type: THREE.FloatType})];
+  const integral = dataTexture(); integral.type = THREE.UnsignedIntType; integral.format = THREE.RGBAIntegerFormat; values.push(integral);
+  const video = dataTexture(); video.isVideoTexture = true; values.push(video);
+  for (const texture of values) { f.material.colorNode = N.texture(texture); assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_TEXTURE'}); }
+  const a = dataTexture(); f.material.colorNode = N.texture(a);
+  f.renderer._getSampledTextureInputs = () => ({layoutOf: () => ({texture: {sampleType: 'unfilterable-float', viewDimension: '2d', multisampled: false}})});
+  assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_TEXTURE'});
+  delete f.renderer._getSampledTextureInputs;
+  f.renderer._device = {limits: {maxSampledTexturesPerShaderStage: 1}};
+  f.material.colorNode = N.texture(a).add(N.texture(dataTexture()));
+  assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_LIMIT'});
+});
 test('nested captures and thrown callbacks restore the exact outer NodeFrame context', t => {
   const f = rig(t), innerMaterial = new THREE.MeshBasicNodeMaterial(), innerObject = new THREE.Mesh(f.object.geometry, innerMaterial);
   innerMaterial.colorNode = N.vec3(.2); const inner = f.owner.compile(innerMaterial, innerObject, f.context);
@@ -126,7 +247,7 @@ test('nested captures and thrown callbacks restore the exact outer NodeFrame con
   assert.deepEqual(Object.fromEntries(Object.keys(initial).map(k => [k, f.frame[k]])), initial);
 });
 for (const [name, change, code] of [
-  ['texture graph', f => { f.material.colorNode = N.texture(new THREE.DataTexture(new Uint8Array(4), 1, 1)); }, 'TEXTURE'],
+  ['depth texture graph', f => { f.material.colorNode = N.texture(new THREE.DepthTexture(1, 1)); }, 'TEXTURE'],
   ['storage graph', f => { f.material.colorNode = N.storage(new THREE.StorageBufferAttribute(4, 4), 'vec4', 4).element(0).xyz; }, 'STORAGE'],
   ['material texture', f => { f.material.map = new THREE.Texture(); }, 'TEXTURE'],
   ['MRT graph', f => { f.material.fragmentNode = N.mrt({output: N.vec4(1)}); }, 'MRT'],

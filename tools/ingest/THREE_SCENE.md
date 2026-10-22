@@ -80,7 +80,9 @@ not hide an actual structural change, and scalar changes stay per-use values.
 The `WebGPURenderer` facade additionally connects authored unlit native TSL
 programs through captured node draw packets. These share the program geometry
 residency, raster mapping and ordered submission owners, while retaining the
-source builder's native bind-group layouts. Node updates and uniform capture
+source builder's native bind-group layouts. Sampled texture resources come from
+the renderer's shared versioned texture owner, including native target borrows.
+Node updates and uniform capture
 happen at the public render call, before any asynchronous preparation. The
 direct bridge consumes those prepared packets and does not replay callbacks.
 See [THREE_NODE_PROGRAMS.md](./THREE_NODE_PROGRAMS.md). Source geometry remains

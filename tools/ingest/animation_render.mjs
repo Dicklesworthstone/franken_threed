@@ -2671,7 +2671,7 @@ struct Out { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 };
         const input = owned.has(draws[i]) ? { mesh: draws[i] } : draws[i];
         const programRecord = owned.get(input?.mesh);
         if (programRecord?.nodeProgram) {
-          keys(input, ["mesh", "first", "count", "nodeUniforms", "frontFaceCW", "nodeRangeCaptured"], "node program draw");
+          keys(input, ["mesh", "first", "count", "nodeUniforms", "nodeResources", "frontFaceCW", "nodeRangeCaptured"], "node program draw");
           if (programRecord.disposed) fail("ANIMATION_RENDER_MESH", "Mesh is not live in this renderer");
           if (input.nodeRangeCaptured !== undefined && typeof input.nodeRangeCaptured !== "boolean")
             fail("ANIMATION_RENDER_OPTIONS", "nodeRangeCaptured must be boolean");
@@ -2878,6 +2878,9 @@ struct Out { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 };
       ambient?.check();
       let submittedDrawCalls = 0;
       const submitted = scoped(device, () => {
+        // Native resources were admitted/snapshotted with every logical draw.
+        // Create changed mixed bind groups only inside the submission scope.
+        nodePrograms?.prepare();
         if (
           usesLighting &&
           projected &&

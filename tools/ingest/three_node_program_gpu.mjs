@@ -1,10 +1,14 @@
 /** F3D graphics pipelines for native WGSL node programs. Bindings follow the
- * pinned builder's groups directly, with one native uniform block per group.
+ * pinned builder's groups directly, with at most one native uniform block per
+ * group plus borrowed sampler/texture resources at their source binding indices.
  * Each logical draw gets independent aligned slices. No ESSL reflection, shader
  * rewriting, vertex-index rotation, upstream backend or hidden submission path.
  *
- * The core owns submission/validation and calls begin -> stage -> write ->
- * encode/submit. Existing program geometry owns attribute upload histories.
+ * The core owns submission/validation and calls begin -> stage -> prepare ->
+ * encode -> write -> submit. stage only captures bytes/resource identities;
+ * prepare creates mixed bind groups inside the core's GPU error scope, after
+ * all logical draws pass host validation. Existing geometry/texture owners
+ * retain upload histories and lifetime; no texture is allocated or uploaded here.
  * Native uniform arena pages stay stable until this owner is disposed/lost.
  */
 import {programGeometrySnapshot} from './gpu_buffer_geometry.mjs';
@@ -15,11 +19,14 @@ import {hasAnimationStencil, snapshotAnimationRaster} from './animation_raster.m
 export function createThreeNodeProgramMeshes({device, format, depthFormat, sampleCount, maxDraws,
   label, fail, scoped, lost = device.lost, maxUniformBytes = 64 * 1024 * 1024, maxBindGroups = 4}) {
   const limit = message => fail('ANIMATION_RENDER_LIMIT', message);
-  if (!Number.isSafeInteger(maxBindGroups) || maxBindGroups < 1 || maxBindGroups > (device.limits.maxBindGroups ?? 4) ||
+  if (!Number.isSafeInteger(maxDraws) || maxDraws < 1 || maxDraws > 65536 ||
+      !Number.isSafeInteger(maxBindGroups) || maxBindGroups < 1 || maxBindGroups > (device.limits.maxBindGroups ?? 4) ||
       !Number.isSafeInteger(maxUniformBytes) || maxUniformBytes < 4 * maxBindGroups)
     limit('Invalid native node program uniform budget');
   const perGroupBytes = Math.floor(maxUniformBytes / maxBindGroups / 4) * 4;
-  const arenas = new Map(), records = new Set();
+  const arenas = new Map(), records = new Set(), resourceGroups = new Map(), resourceIds = new WeakMap();
+  const maxResourceGroups = maxDraws * maxBindGroups;
+  let pendingGroups = [], stagedDraws = 0, nextResourceId = 0;
   const colorTarget = createAnimationColorTargetProfile(device, {format, sampleCount},
     message => fail('ANIMATION_RENDER_OPTIONS', message));
   let stoppedError = null, rejectStopped;
@@ -29,6 +36,7 @@ export function createThreeNodeProgramMeshes({device, format, depthFormat, sampl
     if (stoppedError) return;
     stoppedError = reason; rejectStopped(reason);
     for (const record of records) record.disposed = true;
+    pendingGroups = []; resourceGroups.clear();
     records.clear(); for (const arena of arenas.values()) arena.dispose(); arenas.clear();
   }
   function live() { if (stoppedError) throw stoppedError; }
@@ -43,6 +51,90 @@ export function createThreeNodeProgramMeshes({device, format, depthFormat, sampl
     }
     return arena;
   }
+  function groupDescriptor(group, index) {
+    if (group.index !== index) fail('ANIMATION_RENDER_OPTIONS', 'Native node bind groups must retain their contiguous source indices');
+    const byteLength = group.byteLength;
+    if (!Number.isSafeInteger(byteLength) || byteLength < 0 || byteLength % 4)
+      fail('ANIMATION_RENDER_OPTIONS', 'Native node group uniform byte length must be a nonnegative multiple of four');
+    const sourceEntries = group.entries ?? [{binding: 0, visibility: 3,
+      buffer: {type: 'uniform', hasDynamicOffset: true, minBindingSize: byteLength}}];
+    const bindingLimit = device.limits.maxBindingsPerBindGroup ?? 1000;
+    if (!Array.isArray(sourceEntries) || sourceEntries.length > bindingLimit)
+      limit('Native node group exceeds the device binding limit');
+    const seen = new Set(); let uniform = null;
+    const entries = sourceEntries.map(entry => {
+      if (!Number.isSafeInteger(entry.binding) || entry.binding < 0 || entry.binding >= bindingLimit || seen.has(entry.binding) ||
+          !Number.isInteger(entry.visibility) || entry.visibility < 1 || entry.visibility > 7 ||
+          ['buffer', 'sampler', 'texture'].filter(kind => entry[kind] != null).length !== 1)
+        fail('ANIMATION_RENDER_OPTIONS', 'Invalid native node binding index, visibility or resource kind');
+      seen.add(entry.binding);
+      const base = {binding: entry.binding, visibility: entry.visibility};
+      if (entry.buffer) {
+        if (uniform || byteLength === 0 || entry.buffer.type !== 'uniform' || entry.buffer.hasDynamicOffset !== true ||
+            entry.buffer.minBindingSize !== byteLength)
+          fail('ANIMATION_RENDER_OPTIONS', 'Native node groups admit one exact dynamic uniform block');
+        uniform = {...base, buffer: {...entry.buffer}}; return uniform;
+      }
+      if (entry.sampler) {
+        if (!['filtering', 'non-filtering', 'comparison'].includes(entry.sampler.type))
+          fail('ANIMATION_RENDER_OPTIONS', 'Unsupported native node sampler layout');
+        return {...base, sampler: {...entry.sampler}};
+      }
+      if (!['float', 'unfilterable-float', 'depth', 'sint', 'uint'].includes(entry.texture.sampleType) ||
+          !['1d', '2d', '2d-array', 'cube', 'cube-array', '3d'].includes(entry.texture.viewDimension) ||
+          typeof entry.texture.multisampled !== 'boolean')
+        fail('ANIMATION_RENDER_OPTIONS', 'Unsupported native node sampled texture layout');
+      return {...base, texture: {...entry.texture}};
+    });
+    if (Boolean(uniform) !== (byteLength > 0))
+      fail('ANIMATION_RENDER_OPTIONS', 'Native node uniform bytes must match their group binding');
+    const arena = uniform ? arenaAt(index) : null;
+    arena?.checkSize(byteLength);
+    return {index, byteLength, arena, uniform, entries,
+      resources: entries.filter(entry => !entry.buffer),
+      arenaLayout: entries.length === 1 && uniform?.binding === 0 && uniform.visibility === 3};
+  }
+  function snapshotResources(record, input) {
+    const resources = input.nodeResources ?? [];
+    if (!Array.isArray(resources) || resources.length !== record.resourceCount)
+      fail('ANIMATION_RENDER_VALUE', 'Native node draws need one borrowed resource per sampler/texture binding');
+    const captured = record.groups.map(() => new Map());
+    for (const binding of resources) {
+      const group = record.groups[binding?.group];
+      if (!Number.isSafeInteger(binding?.group) || !group || !Number.isSafeInteger(binding.binding) ||
+          !group.resources.some(entry => entry.binding === binding.binding) || captured[binding.group].has(binding.binding) ||
+          !binding.resource || typeof binding.resource !== 'object')
+        fail('ANIMATION_RENDER_VALUE', 'Native node resource bindings must match their group layout exactly');
+      captured[binding.group].set(binding.binding, binding.resource);
+    }
+    return record.groups.map((group, index) => group.resources.map(entry => ({binding: entry.binding, resource: captured[index].get(entry.binding)})));
+  }
+  function identity(resource) {
+    let id = resourceIds.get(resource);
+    if (id === undefined) { id = ++nextResourceId; resourceIds.set(resource, id); }
+    return id;
+  }
+  function prepare() {
+    live();
+    for (const pending of pendingGroups) {
+      const {record, index, packet, resources, output} = pending, layout = record.bindGroupLayouts[index];
+      const key = [identity(layout), packet ? identity(packet.resource.buffer) : 0,
+        ...resources.map(entry => identity(entry.resource))].join('/');
+      let cached = resourceGroups.get(key);
+      if (cached) resourceGroups.delete(key);
+      else {
+        const uniform = record.groups[index].uniform;
+        const entries = [...resources];
+        if (packet) entries.push({binding: uniform.binding, resource: packet.resource});
+        entries.sort((a, b) => a.binding - b.binding);
+        cached = {record, group: device.createBindGroup({label: `${label}/node-resources`, layout, entries})};
+      }
+      resourceGroups.set(key, cached);
+      if (resourceGroups.size > maxResourceGroups) resourceGroups.delete(resourceGroups.keys().next().value);
+      output.group = cached.group;
+    }
+    pendingGroups = [];
+  }
   async function add(gpu, {nodeProgram, raster, topology = 'triangles'}) {
     live();
     if (nodeProgram?.nodeProgram !== true || typeof nodeProgram.vertex !== 'string' ||
@@ -50,11 +142,12 @@ export function createThreeNodeProgramMeshes({device, format, depthFormat, sampl
         nodeProgram.groups.length > maxBindGroups)
       fail('ANIMATION_RENDER_OPTIONS', 'Expected a native node graphics program');
     if (topology !== 'triangles') fail('ANIMATION_RENDER_OPTIONS', 'Native node graphics currently draw triangle meshes');
-    const groups = nodeProgram.groups.map((group, index) => {
-      if (group.index !== index) fail('ANIMATION_RENDER_OPTIONS', 'Native node bind groups must retain their contiguous source indices');
-      const arena = arenaAt(index); arena.checkSize(group.byteLength);
-      return {index, byteLength: group.byteLength, arena};
-    });
+    const groups = nodeProgram.groups.map(groupDescriptor);
+    for (const stage of [1, 2, 4]) for (const [kind, name, fallback] of [
+      ['buffer', 'maxUniformBuffersPerShaderStage', 12], ['sampler', 'maxSamplersPerShaderStage', 16],
+      ['texture', 'maxSampledTexturesPerShaderStage', 16]])
+      if (groups.reduce((count, group) => count + group.entries.filter(entry => entry[kind] && (entry.visibility & stage)).length, 0) > (device.limits[name] ?? fallback))
+        limit(`Native node bindings exceed ${name}`);
     const vertex = nodeProgram.vertex, fragment = nodeProgram.fragment;
     if (!raster || !['ccw', 'cw'].includes(raster.frontFace) || !['none', 'front', 'back'].includes(raster.cullMode) ||
         !Number.isSafeInteger(raster.writeMask) || raster.writeMask < 0 || raster.writeMask > 15 ||
@@ -72,10 +165,13 @@ export function createThreeNodeProgramMeshes({device, format, depthFormat, sampl
     // Capture all source-facing values before registrations or pipeline work
     // can yield. Older program records/groups survive arena growth unchanged.
     const uniformBindings = [];
-    for (const group of groups) uniformBindings.push(await group.arena.register(group.byteLength));
+    for (const group of groups) uniformBindings.push(group.arena ? await group.arena.register(group.byteLength) : null);
     live();
+    let bindGroupLayouts;
     const issued = scoped(device, () => {
-      const layout = device.createPipelineLayout({label, bindGroupLayouts: uniformBindings.map(binding => binding.layout)});
+      bindGroupLayouts = groups.map((group, index) => group.arenaLayout ? uniformBindings[index].layout
+        : device.createBindGroupLayout({label: `${label}/node-group-${index}`, entries: group.entries}));
+      const layout = device.createPipelineLayout({label, bindGroupLayouts});
       const vertexModule = device.createShaderModule({label: `${label}/node-vertex`, code: vertex});
       const fragmentModule = device.createShaderModule({label: `${label}/node-fragment`, code: fragment});
       const stencil = hasAnimationStencil(depthFormat) ? state.stencil : {};
@@ -98,7 +194,8 @@ export function createThreeNodeProgramMeshes({device, format, depthFormat, sampl
       if (issued.error) throw issued.error;
       live();
     } catch (error) { issued.errors.catch(() => {}); throw error; }
-    const record = {nodeProgram: true, gpu, groups, uniformBindings, geometrySignature,
+    const record = {nodeProgram: true, gpu, groups, uniformBindings, bindGroupLayouts, geometrySignature,
+      resourceCount: groups.reduce((sum, group) => sum + group.resources.length, 0),
       pipelines: {normal: pipelines[0], flipped: pipelines[1]},
       blended: !!state.blend, alphaMode: state.blend ? 'BLEND' : 'OPAQUE',
       blendConstant: state.blendConstant ?? null, stencilReference: state.stencilReference,
@@ -108,6 +205,7 @@ export function createThreeNodeProgramMeshes({device, format, depthFormat, sampl
   function stage(record, input, command) {
     live();
     if (!records.has(record) || record.disposed) fail('ANIMATION_RENDER_VALUE', 'Native node graphics record is not live');
+    if (stagedDraws >= maxDraws) limit('Native node draw capacity exhausted for this frame');
     if (['first', 'count'].some(key => input[key] !== undefined && (!Number.isSafeInteger(input[key]) || input[key] < 0)) ||
         (input.frontFaceCW !== undefined && typeof input.frontFaceCW !== 'boolean') ||
         (input.nodeRangeCaptured !== undefined && typeof input.nodeRangeCaptured !== 'boolean') ||
@@ -118,6 +216,7 @@ export function createThreeNodeProgramMeshes({device, format, depthFormat, sampl
         bytes.some((value, index) => !(value instanceof Uint8Array) || value.byteLength !== record.groups[index].byteLength ||
           !(value.buffer instanceof ArrayBuffer) || value.buffer.resizable))
       fail('ANIMATION_RENDER_VALUE', 'Native node draws need one owned uniform byte packet per native group');
+    const resources = snapshotResources(record, input);
     const geometry = programGeometrySnapshot(record.gpu, device);
     if (geometry.signature !== record.geometrySignature)
       fail('ANIMATION_RENDER_GEOMETRY', 'Native node geometry layout changed; register it again');
@@ -128,7 +227,14 @@ export function createThreeNodeProgramMeshes({device, format, depthFormat, sampl
     const range = input.nodeRangeCaptured ? {first: 0, count: extent} : geometry.drawRange;
     const first = Math.min(extent, Math.max(input.first ?? 0, range.first));
     const end = Math.min((input.first ?? 0) + (input.count ?? extent), range.first + range.count, extent);
-    const groups = record.groups.map((group, index) => group.arena.stage(record.uniformBindings[index], bytes[index]));
+    const groups = record.groups.map((group, index) => {
+      const packet = group.arena ? group.arena.stage(record.uniformBindings[index], bytes[index]) : null;
+      if (group.arenaLayout) return packet;
+      const output = {group: null, offset: packet?.offset ?? null};
+      pendingGroups.push({record, index, packet, resources: resources[index], output});
+      return output;
+    });
+    stagedDraws++;
     Object.assign(command, {record, first, count: Math.max(0, end - first),
       pipeline: input.frontFaceCW ? record.pipelines.flipped : record.pipelines.normal,
       nodeProgram: {groups}, vertexBuffers: geometry.vertexBuffers,
@@ -136,10 +242,14 @@ export function createThreeNodeProgramMeshes({device, format, depthFormat, sampl
       instanceCount: 1, instanceBindGroup: null, blendConstant: record.blendConstant, stencilReference: record.stencilReference});
     return geometry;
   }
-  return Object.freeze({add, stage,
-    begin() { live(); for (const arena of arenas.values()) arena.begin(); },
+  return Object.freeze({add, stage, prepare,
+    begin() { live(); pendingGroups = []; stagedDraws = 0; for (const arena of arenas.values()) arena.begin(); },
     write() { live(); for (const arena of arenas.values()) arena.write(); },
-    remove(record) { if (records.delete(record)) record.disposed = true; },
+    remove(record) {
+      if (records.delete(record)) record.disposed = true;
+      pendingGroups = pendingGroups.filter(pending => pending.record !== record);
+      for (const [key, value] of resourceGroups) if (value.record === record) resourceGroups.delete(key);
+    },
     dispose() { stop(error('ANIMATION_RENDER_DISPOSED', 'Native node graphics owner is disposed')); },
     get uniformDiagnostics() {
       const values = [...arenas.values()].map(arena => arena.diagnostics);

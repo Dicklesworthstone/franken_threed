@@ -36,9 +36,7 @@ function createThreeCompute(renderer, three) {
   if (three.REVISION !== '186' || typeof three.WGSLNodeBuilder !== 'function' || !renderer._nodes?.nodeFrame?.updateNode)
     fail('SOURCE', 'Supply the pinned r186 three/webgpu namespace for TSL compute');
   const device = renderer._device, frame = renderer._nodes.nodeFrame;
-  const textureOwner = createThreeComputeTextures({storage: renderer._storageTextures,
-    poolFactory: ({imageSnapshots}) => createGpuThreeTextures(device, {three, imageSnapshots}),
-    targetFactory: () => createThreeComputeTargets({targets: renderer._targets, device, signal: renderer._targetLifetime.signal})});
+  const textureOwner = renderer._getSampledTextureInputs();
   const gpu = createGpuCompute(device, {signal: renderer._targetLifetime.signal});
   const programs = new Map(), initialized = new Set(), listeners = new Map(), building = new Set();
   const captured = new WeakMap(), uploaded = new WeakMap(), payloads = new Set(), compiling = new Set();
@@ -366,7 +364,7 @@ function createThreeCompute(renderer, three) {
       if (disposed) return; disposed = true;
       for (const [node, listener] of listeners) node.removeEventListener?.('dispose', listener);
       for (const record of payloads) free(record);
-      listeners.clear(); initialized.clear(); programs.clear(); textureOwner.dispose(); gpu.dispose();
+      listeners.clear(); initialized.clear(); programs.clear(); gpu.dispose();
     }};
 }
 
@@ -444,12 +442,23 @@ export function withThreeCompute(Base, THREE) {
       if (this._backend) {
         this._backend.utils ??= {};
         this._backend.utils.getTextureSampleData = texture => {
-          if (!texture?.isStorageTexture) return owner(this).textureSampleData(texture);
+          if (!texture?.isStorageTexture) return this._getSampledTextureInputs().sampleData(texture);
           inspectThreeStorageTexture(texture, THREE);
           return {samples: 1, primarySamples: 1, isMSAA: false};
         };
         this._backend.hasFeature = name => !!this._device?.features?.has(name);
       }
+    }
+    /** Native graphics and compute observe the same captured texture versions.
+     * This owner reuses the existing uploader and borrows target/storage images;
+     * shader compilation does not initialize a compute pipeline or executor. */
+    _getSampledTextureInputs() {
+      check(this);
+      if (!this._device) fail('DEVICE', 'Initialize the renderer before capturing sampled texture inputs');
+      return this._sampledTextureInputs ??= createThreeComputeTextures({storage: this._storageTextures,
+        poolFactory: ({imageSnapshots}) => createGpuThreeTextures(this._device, {three: THREE, imageSnapshots}),
+        targetFactory: () => createThreeComputeTargets({targets: this._targets, device: this._device,
+          signal: this._targetLifetime.signal})});
     }
     compute(nodes, dispatchSize = null) {
       check(this);
@@ -495,8 +504,9 @@ export function withThreeCompute(Base, THREE) {
     async waitForGPU() {
       await super.waitForGPU();
       const value = owners.get(this); if (value) await value.whenIdle();
+      await this._sampledTextureInputs?.whenIdle();
       await this._storageTextures?.whenIdle();
     }
-    dispose() { owners.get(this)?.dispose(); this._storageTextures?.dispose(); super.dispose(); }
+    dispose() { owners.get(this)?.dispose(); this._sampledTextureInputs?.dispose(); this._storageTextures?.dispose(); super.dispose(); }
   };
 }

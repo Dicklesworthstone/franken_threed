@@ -59,7 +59,7 @@ function rig(t, {maxDraws = 8, maxUniformBytes = 4 * 1024 * 1024, maxBindGroups 
 }
 function packet(command, index) {
   const {group, offset} = command.nodeProgram.groups[index];
-  const {buffer, size} = group.entries[0].resource;
+  const {buffer, size} = group.entries.find(entry => entry.resource.buffer).resource;
   assert.equal(group.layout, command.pipeline.layout.bindGroupLayouts[index]);
   return buffer.bytes.slice(offset, offset + size);
 }
@@ -172,4 +172,108 @@ test('group budgets and device binding limits are checked before native allocati
   assert.equal(f.buffers.length, allocated);
   const descriptor = f.program([16]); descriptor.groups[0].index = 2;
   await assert.rejects(f.add([], {nodeProgram: descriptor}), {code: 'ANIMATION_RENDER_OPTIONS'});
+});
+
+function texturedProgram(f, byteLength = 16) {
+  const program = f.program([]);
+  program.groups = [{index: 0, name: 'object', byteLength, entries: [
+    {binding: 0, visibility: 2, sampler: {type: 'filtering'}},
+    {binding: 1, visibility: 2, texture: {sampleType: 'float', viewDimension: '2d', multisampled: false}},
+    {binding: 2, visibility: 7, buffer: {type: 'uniform', hasDynamicOffset: true, minBindingSize: byteLength}},
+  ]}];
+  return program;
+}
+const sampled = (view = {}, sampler = {}) => [{group: 0, binding: 0, resource: sampler}, {group: 0, binding: 1, resource: view}];
+
+test('mixed native layouts preserve source visibility/indices and snapshot borrowed resources before preparation', async t => {
+  const f = rig(t), program = texturedProgram(f), expected = structuredClone(program.groups[0].entries);
+  const pending = f.add([], {nodeProgram: program});
+  program.groups[0].entries[0].sampler.type = 'comparison'; program.groups[0].entries[2].visibility = 1;
+  const record = await pending;
+  assert.deepEqual(record.pipelines.normal.layout.bindGroupLayouts[0].entries, expected);
+  const view = {}, sampler = {}, resources = sampled(view, sampler), allocations = [f.buffers.length, f.bindGroups.length],
+    writes = f.writes.length;
+  const command = f.stage(record, [17], {nodeResources: resources});
+  resources[0].resource = {}; resources[1].resource = {}; resources.reverse();
+  assert.deepEqual([f.buffers.length, f.bindGroups.length], allocations);
+  assert.equal(command.nodeProgram.groups[0].group, null); assert.equal(f.writes.length, writes);
+  f.owner.prepare(); f.owner.write();
+  const group = command.nodeProgram.groups[0].group;
+  assert.deepEqual(group.entries.map(entry => entry.binding), [0, 1, 2]);
+  assert.equal(group.entries[0].resource, sampler); assert.equal(group.entries[1].resource, view);
+  assert.equal(group.entries[2].resource.size, 16); assert.ok(packet(command, 0).every(v => v === 17));
+  assert.equal(f.buffers.length, allocations[0]);
+});
+
+test('resource-only groups consume no uniform allocation or dynamic offset', async t => {
+  const f = rig(t), program = f.program([]), before = f.buffers.length, view = {};
+  program.groups = [
+    {index: 0, byteLength: 0, entries: [{binding: 0, visibility: 1,
+      texture: {sampleType: 'float', viewDimension: '2d', multisampled: false}}]},
+    {index: 1, byteLength: 16, entries: [{binding: 0, visibility: 2,
+      buffer: {type: 'uniform', hasDynamicOffset: true, minBindingSize: 16}}]},
+  ];
+  const record = await f.add([], {nodeProgram: program});
+  assert.equal(f.buffers.length, before + 1); assert.equal(f.owner.uniformDiagnostics.groups, 1);
+  const command = f.stage(record, [0, 19], {nodeResources: [{group: 0, binding: 0, resource: view}]});
+  f.owner.prepare(); f.owner.write();
+  assert.equal(command.nodeProgram.groups[0].offset, null); assert.equal(command.nodeProgram.groups[1].offset, 0);
+  assert.deepEqual(command.nodeProgram.groups[0].group.entries, [{binding: 0, resource: view}]);
+  assert.ok(packet(command, 1).every(v => v === 19));
+});
+
+test('per-draw texture changes reuse matching groups without recompilation or collapsing uniform histories', async t => {
+  const f = rig(t), record = await f.add([], {nodeProgram: texturedProgram(f)});
+  const a = sampled(), b = sampled(), pipelines = f.pipelines.length;
+  const first = f.stage(record, [1], {nodeResources: a}), second = f.stage(record, [2], {nodeResources: b});
+  const third = f.stage(record, [3], {nodeResources: a}); f.owner.prepare(); f.owner.write();
+  assert.equal(first.nodeProgram.groups[0].group, third.nodeProgram.groups[0].group);
+  assert.notEqual(first.nodeProgram.groups[0].group, second.nodeProgram.groups[0].group);
+  assert.deepEqual([first, second, third].map(c => c.nodeProgram.groups[0].offset), [0, 256, 512]);
+  assert.deepEqual([first, second, third].map(c => packet(c, 0)[0]), [1, 2, 3]);
+  const groups = f.bindGroups.length; f.owner.begin();
+  const next = f.stage(record, [4], {nodeResources: a}); f.owner.prepare(); f.owner.write();
+  assert.equal(next.nodeProgram.groups[0].group, first.nodeProgram.groups[0].group);
+  assert.equal(f.bindGroups.length, groups); assert.equal(f.pipelines.length, pipelines);
+  f.owner.remove(record); assert.equal(record.disposed, true);
+  assert.equal(a[0].resource.dead, undefined); assert.equal(a[1].resource.dead, undefined);
+});
+
+test('resource packet mismatches fail before uniform staging or any GPU allocation/write', async t => {
+  const f = rig(t, {maxDraws: 1}), record = await f.add([], {nodeProgram: texturedProgram(f)});
+  const allocations = [f.buffers.length, f.bindGroups.length, f.writes.length];
+  for (const nodeResources of [undefined, [], sampled().slice(0, 1), [sampled()[0], sampled()[0]],
+    [{group: 0, binding: 0, resource: {}}, {group: 1, binding: 1, resource: {}}],
+    [{group: 0, binding: 0, resource: {}}, {group: 0, binding: 2, resource: {}}],
+    [{group: 0, binding: 0, resource: {}}, {group: 0, binding: 1, resource: null}]])
+    assert.throws(() => f.stage(record, [1], {nodeResources}), {code: 'ANIMATION_RENDER_VALUE'});
+  assert.equal(f.owner.uniformDiagnostics.draws, 0);
+  assert.deepEqual([f.buffers.length, f.bindGroups.length, f.writes.length], allocations);
+  const command = f.stage(record, [2], {nodeResources: sampled()}); f.owner.prepare();
+  assert.equal(command.nodeProgram.groups[0].offset, 0);
+});
+
+test('mixed bind group cache is bounded while stable resource selections retain their identity', async t => {
+  const f = rig(t, {maxDraws: 1, maxBindGroups: 1}), record = await f.add([], {nodeProgram: texturedProgram(f)});
+  const a = sampled(), b = sampled();
+  const render = resources => { f.owner.begin(); const command = f.stage(record, [1], {nodeResources: resources});
+    f.owner.prepare(); return command.nodeProgram.groups[0].group; };
+  const first = render(a), second = render(b), groups = f.bindGroups.length;
+  assert.equal(render(b), second); assert.equal(f.bindGroups.length, groups);
+  assert.notEqual(render(a), first, 'the older resource group leaves the bounded cache');
+  assert.equal(f.bindGroups.length, groups + 1);
+});
+
+test('unsupported native binding layouts fail before allocating uniform pages', async t => {
+  const f = rig(t), before = f.buffers.length;
+  for (const mutate of [
+    p => { p.groups[0].entries[1].binding = 0; },
+    p => { p.groups[0].entries[1].visibility = 8; },
+    p => { p.groups[0].entries[2].buffer.minBindingSize = 32; },
+    p => { p.groups[0].entries.push({binding: 3, visibility: 3, buffer: {type: 'uniform', hasDynamicOffset: true, minBindingSize: 16}}); },
+  ]) {
+    const program = texturedProgram(f); mutate(program);
+    await assert.rejects(f.add([], {nodeProgram: program}), {code: 'ANIMATION_RENDER_OPTIONS'});
+  }
+  assert.equal(f.buffers.length, before);
 });

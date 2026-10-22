@@ -116,7 +116,9 @@ export function createProgramUniformArena(device, {maxDraws, label, fail, scoped
         if (!group || offset + binding.size > page.size) continue;
         page.staged.set(bytes, offset);
         page.used = offset + binding.size; draws++;
-        return {group, offset};
+        // Borrowed buffer metadata lets native source layouts combine this
+        // arena slice with texture/sampler bindings without owning another arena.
+        return {group, offset, resource: {buffer: page.buffer, size: binding.size}};
       }
       limit('Program uniform byte budget exhausted for this frame');
     },

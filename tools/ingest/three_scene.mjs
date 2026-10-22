@@ -1608,7 +1608,7 @@ export async function createGpuThreeScene(device,scene,{
           if(!updated.has(gpu)){gpu.update({maxAdditionalBytes:Math.max(0,maxGeometryBytes-geometryBytes())});updated.add(gpu);}
           if(item.bindings[0].signature!=='node-program:'+programGeometrySnapshot(gpu,device).signature)
             fail('PREPARE','Native node geometry layout changed; prepare the captured program again');
-          draws.push({mesh:item.bindings[0].mesh,first:item.first,count:item.count,nodeUniforms:item.nodeUniforms,frontFaceCW:item.frontFaceCW,nodeRangeCaptured:true,
+          draws.push({mesh:item.bindings[0].mesh,first:item.first,count:item.count,nodeUniforms:item.nodeUniforms,nodeResources:item.nodeResources,frontFaceCW:item.frontFaceCW,nodeRangeCaptured:true,
             ...(fogEnabled?{receiveFog:false}:{}),...(shadowEnabled?{receiveShadow:false}:{}),...(environmentEnabled?{receiveEnvironment:false}:{})});
           continue;
         }

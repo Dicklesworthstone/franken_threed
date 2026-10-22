@@ -3,8 +3,8 @@
  * no GPU commands. Descriptors preserve the builder's native bind groups.
  *
  * The first profile is rigid, unlit meshes with float attributes and ordinary
- * scalar/vector/matrix node uniforms. Texture, storage, lighting, clipping and
- * MRT graphs fail explicitly. capture() is a logical-draw operation, never a
+ * scalar/vector/matrix node uniforms and sampled 2D float textures. Storage,
+ * lighting, clipping and MRT graphs fail explicitly. capture() is a logical-draw operation, never a
  * preparation retry: it runs source before/current updates and owns the bytes.
  * after() belongs after that draw has been accepted. Callers capture before any
  * asynchronous pipeline preparation and retain the resulting byte arrays.
@@ -38,6 +38,40 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   const frame = renderer._nodes.nodeFrame, cache = new WeakMap(), entries = new Set();
   let disposed = false, shaderBytes = 0, serial = 0;
   const live = () => { if (disposed) fail('DISPOSED', 'Native node program preparation is disposed'); };
+  function inspectTexture(texture) {
+    if (!(texture instanceof three.Texture) || texture.isStorageTexture || texture.isCubeTexture ||
+        texture.is3DTexture || texture.isArrayTexture || texture.isData3DTexture || texture.isDataArrayTexture ||
+        texture.isCompressedTexture || texture.isDepthTexture || texture.isVideoTexture || texture.isVideoFrameTexture ||
+        texture.isFramebufferTexture || texture.isExternalTexture)
+      fail('TEXTURE', 'Native graphics nodes currently sample ordinary 2D textures and color render targets');
+    if (![three.UnsignedByteType, three.HalfFloatType, three.FloatType].includes(texture.type) ||
+        [three.RedIntegerFormat, three.RGIntegerFormat, three.RGBAIntegerFormat, three.RGBIntegerFormat].includes(texture.format) ||
+        texture.type === three.FloatType && !renderer.hasFeature('float32-filterable'))
+      fail('TEXTURE', 'Native graphics texture formats must have filterable float samples');
+    const layout = renderer._getSampledTextureInputs?.().layoutOf({texture, isSampledTexture: true, isSampler: true, store: false});
+    if (layout && (layout.texture?.sampleType !== 'float' || layout.texture.viewDimension !== '2d' || layout.texture.multisampled))
+      fail('TEXTURE', 'Native graphics texture bindings require a single-sampled float 2D view');
+    if (typeof renderer.backend?.utils?.getTextureSampleData !== 'function')
+      fail('SOURCE', 'The native renderer must provide source texture sample metadata');
+    if (renderer.backend.utils.getTextureSampleData(texture).primarySamples !== 1)
+      fail('TEXTURE', 'Native graphics texture bindings require resolved color views');
+    return texture;
+  }
+  function textureSignature(nodes) {
+    const aliases = new Map(), checked = new Set();
+    return JSON.stringify(nodes.map(node => {
+      const texture = node.value;
+      if (!checked.has(texture)) { inspectTexture(texture); checked.add(texture); }
+      // The pinned builder aliases uniforms by texture UUID. Keep that alias
+      // partition, not the identities themselves, in the structural signature:
+      // replacing one compatible sampled image must not rebuild the shader.
+      if (!aliases.has(texture.uuid)) aliases.set(texture.uuid, aliases.size);
+      return [aliases.get(texture.uuid), texture.type, texture.format, texture.colorSpace, texture.channel,
+        texture.isRenderTargetTexture === true, texture.normalized === true,
+        texture.minFilter === three.NearestFilter && texture.magFilter === three.NearestFilter,
+        node.sampler, node.updateMatrix, node.groupNode?.name];
+    }));
+  }
   function inspect(material, object, {scene, camera} = {}) {
     live();
     if (!(material instanceof three.NodeMaterial) ||
@@ -84,8 +118,13 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   }
   function checkNode(node) {
     if (!node?.isNode) fail('GRAPH', 'Expected source TSL nodes');
-    if (node.isTextureNode || node.isStorageTextureNode || node.value?.isTexture)
-      fail('TEXTURE', 'Texture graphs require native texture bindings and are not admitted');
+    if (node.isStorageTextureNode || node.isCubeTextureNode || node.isTexture3DNode)
+      fail('TEXTURE', 'Storage, cube and volume texture graphs need additional native bindings');
+    if (node.isTextureNode) {
+      inspectTexture(node.value);
+      if (node.compareNode !== null || node.depthNode !== null)
+        fail('TEXTURE', 'Texture comparison and array-layer sampling are not admitted');
+    } else if (node.value?.isTexture) fail('TEXTURE', 'Native graphics textures require source TextureNode bindings');
     if (node.isStorageBufferNode || node.isBufferNode || node.isBufferAttributeNode || node.isComputeNode || node.isAtomicFunctionNode)
       fail('STORAGE', 'Storage, explicit buffer and compute graphs are not admitted');
     if (node.isLightingNode || node.isLightsNode || node.isLightingContextNode || node.light?.isLight)
@@ -115,7 +154,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     inspect(material, object, context);
     const key = keyOf(material, object, context), byMaterial = cache.get(object);
     const previous = byMaterial?.get(material);
-    if (previous?.key === key) return previous.descriptor;
+    if (previous?.key === key && textureSignature(previous.textureNodes) === previous.textureSignature) return previous.descriptor;
     if (entries.size - (previous ? 1 : 0) >= maxPrograms) fail('LIMIT', 'Native node program capacity exceeded');
     const builder = new three.WGSLNodeBuilder(object, renderer);
     builder.material = material; builder.scene = context.scene ?? null; builder.camera = context.camera ?? null;
@@ -130,17 +169,33 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (bindings.length > Math.min(maxBindGroups, renderer._device?.limits?.maxBindGroups ?? 4))
       fail('LIMIT', 'Native node graph exceeds its bind group budget');
     let uniformBytes = 0;
+    const sampledCounts = [0, 0], samplerCounts = [0, 0];
     const groups = bindings.map((group, index) => {
-      if (group.bindings.length !== 1 || group.bindings[0].isNodeUniformsGroup !== true)
-        fail('BINDING', 'Native graphics groups currently require one scalar/vector/matrix uniform buffer each');
-      const binding = group.bindings[0], byteLength = binding.byteLength;
-      if (binding.uniforms.some(u => !TYPES.has(u.nodeUniform?.type)))
-        fail('UNIFORM', 'Native node uniforms must be ordinary scalars, vectors or matrices');
-      if (!Number.isSafeInteger(byteLength) || byteLength < 4 || byteLength % 4 ||
-          byteLength > (renderer._device?.limits?.maxUniformBufferBindingSize ?? 65536))
-        fail('LIMIT', 'Native node uniform buffer exceeds device binding limits');
+      let byteLength = 0;
+      const entries = group.bindings.map((binding, slot) => {
+        const base = {binding: slot, visibility: binding.visibility};
+        if (binding.isNodeUniformsGroup === true) {
+          if (byteLength) fail('BINDING', 'Native graphics groups admit one uniform block per source group');
+          byteLength = binding.byteLength;
+          if (binding.uniforms.some(u => !TYPES.has(u.nodeUniform?.type)))
+            fail('UNIFORM', 'Native node uniforms must be ordinary scalars, vectors or matrices');
+          if (!Number.isSafeInteger(byteLength) || byteLength < 4 || byteLength % 4 ||
+              byteLength > (renderer._device?.limits?.maxUniformBufferBindingSize ?? 65536))
+            fail('LIMIT', 'Native node uniform buffer exceeds device binding limits');
+          return Object.freeze({...base, buffer: Object.freeze({type: 'uniform', hasDynamicOffset: true, minBindingSize: byteLength})});
+        }
+        if (!binding.textureNode?.isTextureNode || binding.store || (!binding.isSampledTexture && !binding.isSampler))
+          fail('BINDING', 'Native graphics groups require uniform blocks or ordinary sampled 2D texture bindings');
+        inspectTexture(binding.textureNode.value);
+        const sampled = binding.isSampledTexture === true, counts = sampled ? sampledCounts : samplerCounts;
+        const limit = renderer._device?.limits?.[sampled ? 'maxSampledTexturesPerShaderStage' : 'maxSamplersPerShaderStage'] ?? 16;
+        for (let stage = 0; stage < 2; stage++) if (binding.visibility & (1 << stage))
+          if (++counts[stage] > limit) fail('LIMIT', 'Native node texture bindings exceed per-stage device limits');
+        return Object.freeze(sampled ? {...base, texture: Object.freeze({sampleType: 'float', viewDimension: '2d', multisampled: false})} :
+          {...base, sampler: Object.freeze({type: 'filtering'})});
+      });
       uniformBytes += byteLength;
-      return Object.freeze({index, name: group.name, byteLength});
+      return Object.freeze({index, name: group.name, byteLength, entries: Object.freeze(entries)});
     });
     if (uniformBytes > maxUniformBytes) fail('LIMIT', 'Native node draw exceeds its uniform byte budget');
     const attributes = builder.attributes.map((attribute, location) => {
@@ -155,8 +210,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (bytes > maxShaderBytes - shaderBytes + (previous?.bytes ?? 0)) fail('LIMIT', 'Native node shader byte budget exceeded');
     const descriptor = Object.freeze({nodeProgram: true, key: `native-node-${++serial}`, vertex, fragment,
       attributes: Object.freeze(attributes), attributesKey: JSON.stringify(attributes), groups: Object.freeze(groups)});
-    nodeStates.set(descriptor, {owner: api, builder, bindings, material, object});
-    const entry = {key, descriptor, material, object, geometry: object.geometry, bytes};
+    const textureNodes = [...builder.nodes].filter(node => node.isTextureNode);
+    const signature = textureSignature(textureNodes);
+    nodeStates.set(descriptor, {owner: api, builder, bindings, material, object, textureNodes, textureSignature: signature});
+    const entry = {key, descriptor, material, object, geometry: object.geometry, bytes, textureNodes, textureSignature: signature};
     entry.onDispose = () => retire(entry);
     if (previous) retire(previous);
     const next = byMaterial ?? new Map(); next.set(material, entry); cache.set(object, next);
@@ -177,25 +234,41 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     for (const key of ['frameId', 'time', 'deltaTime']) if (context[key] !== undefined) frame[key] = context[key];
     try { return run(); } finally { Object.assign(frame, previous); }
   }
-  function capture(descriptor, context = {}) {
+  function readTextures(state) {
+    if (textureSignature(state.textureNodes) !== state.textureSignature)
+      fail('CHANGED', 'Native node texture layout, UV channel or binding aliases changed; compile the graph again');
+    const textures = [];
+    for (const [group, source] of state.bindings.entries()) for (const [binding, value] of source.bindings.entries())
+      if (value.isSampledTexture || value.isSampler) textures.push(Object.freeze({group, binding,
+        texture: value.textureNode.value, isSampler: value.isSampler === true, isSampledTexture: value.isSampledTexture === true,
+        store: false, access: null, mipLevel: 0}));
+    return Object.freeze(textures);
+  }
+  function captureDraw(descriptor, context = {}) {
     const state = stateOf(descriptor);
     return withFrame(state, context, () => {
       for (const node of state.builder.updateBeforeNodes) frame.updateBeforeNode(node);
       for (const node of state.builder.updateNodes) frame.updateNode(node);
-      return state.bindings.map((group, index) => {
-        const binding = group.bindings[0]; binding.update();
+      const textures = readTextures(state);
+      const uniforms = state.bindings.map((group, index) => {
+        const binding = group.bindings.find(value => value.isNodeUniformsGroup);
+        if (!binding) return new Uint8Array(0);
+        binding.update();
         const buffer = binding.buffer;
         if (buffer.byteLength !== descriptor.groups[index].byteLength) fail('CHANGED', 'Native node uniform layout changed during its update');
         const bytes = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength).slice();
         binding.clearUpdateRanges(); return bytes;
       });
+      return {uniforms, textures};
     });
   }
+  function capture(descriptor, context = {}) { return captureDraw(descriptor, context).uniforms; }
   function after(descriptor, context = {}) {
     const state = stateOf(descriptor);
     return withFrame(state, context, () => { for (const node of state.builder.updateAfterNodes) frame.updateAfterNode(node); });
   }
-  const api = Object.freeze({inspect, compile, capture, after,
+  const api = Object.freeze({inspect, compile, capture, captureDraw, after,
+    textures(descriptor) { return readTextures(stateOf(descriptor)); },
     release(descriptor) { for (const entry of entries) if (entry.descriptor === descriptor) { retire(entry); break; } },
     dispose() { if (disposed) return; disposed = true; for (const entry of [...entries]) retire(entry); },
     get diagnostics() { return Object.freeze({programs: entries.size, shaderBytes, maxPrograms, maxShaderBytes}); }});

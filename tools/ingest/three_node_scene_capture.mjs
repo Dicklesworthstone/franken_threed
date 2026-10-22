@@ -12,7 +12,7 @@ const transparent = material => material.transparent === true || material.transm
 
 export function captureThreeNodeScene(three, root, camera, {getPrograms, renderer,
   overrideMaterial = null, maxNodes = 16384, maxDraws = 16384, uniforms = true,
-  maxUniformBytes = 64 * 1024 * 1024, raster} = {}) {
+  maxUniformBytes = 64 * 1024 * 1024, raster, getTextures, destination = null} = {}) {
   if (!integer(maxNodes) || maxNodes < 1 || !integer(maxDraws) || maxDraws < 1 || !integer(maxUniformBytes))
     fail('LIMIT', 'Invalid native scene capture capacity');
   const hierarchy = new Map(), objects = new Set(), bindings = [], pairs = new Map(), stack = [root];
@@ -137,9 +137,14 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     }
     draws.push(...opaque, ...translucent);
   }
+  let textureOwner = null;
   for (const binding of bindings) {
     binding.nodeProgram = programs.compile(binding.material, binding.object, context);
     binding.raster = raster(binding.material); Object.freeze(binding);
+    if (programs.textures(binding.nodeProgram).length) {
+      if (typeof getTextures !== 'function') fail('SOURCE', 'Native sampled graphs require the renderer texture owner');
+      textureOwner ??= getTextures();
+    }
   }
   let bytes = 0;
   for (const draw of draws) for (const group of draw.binding.nodeProgram.groups) {
@@ -150,13 +155,35 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   const frame = renderer._nodes.nodeFrame;
   const frameContext = {...context, frameId: frame.frameId, time: frame.time, deltaTime: frame.deltaTime,
     renderId: renderer.info.calls};
-  for (const draw of draws) {
-    draw.object.modelViewMatrix.multiplyMatrices(camera.matrixWorldInverse, draw.object.matrixWorld);
-    draw.object.normalMatrix.getNormalMatrix(draw.object.modelViewMatrix);
-    const updateContext = {...frameContext, object: draw.object, material: draw.material};
-    draw.nodeUniforms = programs.capture(draw.binding.nodeProgram, updateContext);
-    programs.after(draw.binding.nodeProgram, updateContext);
-    Object.freeze(draw.nodeUniforms); Object.freeze(draw);
+  const textureUses = [];
+  const capture = () => {
+    for (const draw of draws) {
+      draw.object.modelViewMatrix.multiplyMatrices(camera.matrixWorldInverse, draw.object.matrixWorld);
+      draw.object.normalMatrix.getNormalMatrix(draw.object.modelViewMatrix);
+      const updateContext = {...frameContext, object: draw.object, material: draw.material};
+      const captured = programs.captureDraw(draw.binding.nodeProgram, updateContext);
+      draw.nodeUniforms = captured.uniforms;
+      // Lease each post-update texture before after() or the next logical draw
+      // can edit it. The shared owner snapshots CPU upload/sampler histories;
+      // target leases hold generation metadata and observe contents in the FIFO.
+      draw.nodeTextures = Object.freeze(captured.textures.map(binding => {
+        if (destination && binding.texture.renderTarget === destination)
+          fail('FEEDBACK', 'A native draw cannot sample its own render target');
+        const lease = textureOwner.captureBinding(binding);
+        textureUses.push(lease);
+        return Object.freeze({group: binding.group, binding: binding.binding, lease});
+      }));
+      programs.after(draw.binding.nodeProgram, updateContext);
+      Object.freeze(draw.nodeUniforms); Object.freeze(draw);
+    }
+  };
+  try {
+    if (textureOwner) textureOwner.captureDispatch(capture);
+    else capture();
+  } catch (error) {
+    for (const lease of textureUses) textureOwner.release(lease);
+    throw error;
   }
-  return Object.freeze({objects, bindings: Object.freeze(bindings), draws: Object.freeze(draws), bytes});
+  return Object.freeze({objects, bindings: Object.freeze(bindings), draws: Object.freeze(draws), bytes,
+    textureOwner, textureUses: Object.freeze(textureUses)});
 }

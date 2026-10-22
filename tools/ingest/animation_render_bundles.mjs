@@ -40,7 +40,7 @@ export function encodeAnimationDraws(encoder, commands, length, {
       encoder.setPipeline(pipeline);
       for (let group = 0; group < command.nodeProgram.groups.length; group++) {
         const binding = command.nodeProgram.groups[group];
-        encoder.setBindGroup(group, binding.group, [binding.offset]);
+        encoder.setBindGroup(group, binding.group, binding.offset === null ? [] : [binding.offset]);
       }
       for (let slot = 0; slot < command.vertexBuffers.length; slot++) encoder.setVertexBuffer(slot, command.vertexBuffers[slot]);
       if (command.indexBuffer) {

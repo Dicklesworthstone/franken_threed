@@ -55,17 +55,19 @@ The initial profile accepts rigid meshes with `MeshBasicNodeMaterial` or unlit
 `NodeMaterial`, including position/vertex, color/fragment, opacity, alpha-test and
 output graphs. The pinned `WGSLNodeBuilder` supplies real native shaders and
 uniform layouts; F3D owns geometry, pipelines, bind groups, draw ordering and
-submission. Float attributes and scalar/vector/matrix uniforms are supported.
+submission. Float attributes, scalar/vector/matrix uniforms and ordinary sampled
+2D texture graphs are supported. Graphics and compute share captured texture
+versions; native target sampling borrows the actual attachment storage.
 The existing fixed shader path continues serving default node materials.
 
-Each native node render captures its program, visible draw selection, raster
-state, ranges and uniform bytes before asynchronous preparation. Source
+Each initialized native node render captures its program, visible draw selection,
+raster state, ranges, uniforms and texture versions before asynchronous preparation. Source
 NodeFrame before/current/after updates run once at that logical call boundary,
 preserving frame/render/object frequencies and source object identities. Two
 queued target renders can therefore reuse a material and change its uniforms
 without rewriting the earlier render. Compilation does not invoke those updates.
 See [THREE_NODE_PROGRAMS.md](./THREE_NODE_PROGRAMS.md) for the initial profile,
-resource bounds and remaining texture/storage/lighting graph gaps.
+resource bounds and remaining texture-family/storage/lighting graph gaps.
 
 Standard and Physical materials, including their default node-material forms,
 accept independent `metalnessMap` and `roughnessMap` textures with their own

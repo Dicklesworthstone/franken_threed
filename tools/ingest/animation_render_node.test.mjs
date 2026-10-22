@@ -20,7 +20,7 @@ const bytes=(count,value)=>new Uint8Array(new Float32Array(count).fill(value).bu
 const draw=(mesh,value)=>({mesh,nodeUniforms:[bytes(4,value),bytes(8,value+10)]});
 const frame=draws=>({colorView:{},depthView:{},viewProjection:I(),draws});
 function words(snapshot,index) {
-  const binding=snapshot.groups.get(index),resource=binding.group.entries[0].resource;
+  const binding=snapshot.groups.get(index),resource=binding.group.entries.find(entry=>entry.resource.buffer).resource;
   const start=binding.offsets[0]??0;
   return new Float32Array(snapshot.contents.get(resource.buffer).slice(start,start+resource.size).buffer);
 }
@@ -125,4 +125,73 @@ test('bundle keys own every native group identity and offset instead of mutable 
   cache.execute(pass,[command],1,null);assert.equal(cache.diagnostics.builds,3);
   groups[1].group=original;cache.execute(pass,[command],1,null);assert.equal(cache.diagnostics.reuses,2);
   cache.dispose();await r.whenIdle();r.dispose();gpu.dispose();ordinary.dispose();
+});
+
+const sampledDescriptor=()=>({...descriptor(),groups:[
+  {index:0,byteLength:16,entries:[
+    {binding:0,visibility:2,sampler:{type:'filtering'}},
+    {binding:1,visibility:2,texture:{sampleType:'float',viewDimension:'2d',multisampled:false}},
+    {binding:2,visibility:7,buffer:{type:'uniform',hasDynamicOffset:true,minBindingSize:16}},
+  ]},
+  {index:1,byteLength:0,entries:[
+    {binding:0,visibility:1,texture:{sampleType:'float',viewDimension:'2d',multisampled:false}},
+  ]},
+]});
+const sampledDraw=(mesh,value,view,sampler,vertexView)=>({mesh,nodeUniforms:[bytes(4,value),new Uint8Array(0)],
+  nodeResources:[{group:0,binding:0,resource:sampler},{group:0,binding:1,resource:view},{group:1,binding:0,resource:vertexView}]});
+
+for(const renderBundles of [false,true])
+test(`sampled native draws keep resource histories and reuse stable bindings (${renderBundles})`,async()=>{
+  const {d,r,ordinary,gpu,builtin}=await setup({instancing:true,renderBundles});
+  const mesh=await r.addMesh(gpu,{nodeProgram:sampledDescriptor(),raster:raster()});
+  const a={},b={},c={},sampler={},vertexView={},trace=[],create=d.createBindGroup,write=d.queue.writeBuffer,submit=d.queue.submit;
+  d.createBindGroup=description=>{trace.push('group');return create(description);};
+  d.queue.writeBuffer=(...args)=>{trace.push('write');return write(...args);};
+  d.queue.submit=(...args)=>{trace.push('submit');return submit(...args);};
+  for(let submission=0;submission<3;submission++) {
+    const first=sampledDraw(mesh,submission*2+1,submission===2?c:a,sampler,vertexView);
+    r.render(frame([builtin,first,sampledDraw(mesh,submission*2+2,b,sampler,vertexView),builtin]));
+    first.nodeUniforms[0].fill(255);first.nodeResources[1].resource={};first.nodeResources.reverse();
+  }
+  const native=d.snapshots.map(submission=>submission.filter(value=>value.pipeline.vertex.entryPoint==='main'));
+  for(let index=0;index<native.length;index++) {
+    assert.deepEqual(d.snapshots[index].map(value=>value.pipeline.vertex.entryPoint),['vertex_main','main','main','vertex_main']);
+    assert.deepEqual(native[index].map(value=>value.groups.get(0).offsets),[[0],[256]]);
+    assert.deepEqual(native[index].map(value=>value.groups.get(1).offsets),[[],[]]);
+    for(let drawIndex=0;drawIndex<2;drawIndex++) {
+      const snapshot=native[index][drawIndex],entries=snapshot.groups.get(0).group.entries;
+      assert.equal(entries[0].resource,sampler);
+      assert.equal(entries[1].resource,drawIndex===1?b:index===2?c:a);
+      assert.equal(snapshot.groups.get(1).group.entries[0].resource,vertexView);
+      assert.deepEqual([...words(snapshot,0)],Array(4).fill(index*2+drawIndex+1));
+    }
+  }
+  assert.equal(native[0][0].groups.get(0).group,native[1][0].groups.get(0).group);
+  assert.notEqual(native[0][0].groups.get(0).group,native[2][0].groups.get(0).group);
+  assert.equal(native[0][1].groups.get(0).group,native[2][1].groups.get(0).group);
+  assert.equal(native[0][0].groups.get(1).group,native[2][1].groups.get(1).group);
+  assert.equal(trace.filter(value=>value==='group').length,4); // Three fragment views; one shared vertex view.
+  const submissions=[];let start=0;
+  for(let index=0;index<trace.length;index++)if(trace[index]==='submit'){submissions.push(trace.slice(start,index));start=index+1;}
+  assert.equal(submissions.length,3);assert.equal(trace.at(-1),'submit');
+  for(const events of submissions){assert.ok(events.includes('write'));assert.equal(events.slice(events.indexOf('write')).includes('group'),false);}
+  if(renderBundles){assert.equal(r.bundleDiagnostics.builds,2);assert.equal(r.bundleDiagnostics.reuses,1);}
+  await r.whenIdle();mesh.dispose();r.dispose();gpu.dispose();ordinary.dispose();
+});
+
+test('a rejected final sampled draw creates no native bindings or writes and retry resets both groups',async()=>{
+  const {d,r,ordinary,gpu,builtin}=await setup({renderBundles:true});
+  const mesh=await r.addMesh(gpu,{nodeProgram:sampledDescriptor(),raster:raster()});
+  const view={},sampler={},vertexView={},create=d.createBindGroup;let groups=0;
+  d.createBindGroup=description=>{groups++;return create(description);};
+  const first=sampledDraw(mesh,1,view,sampler,vertexView),bad=sampledDraw(mesh,2,view,sampler,vertexView),writes=d.writes.length;
+  bad.nodeResources.pop();
+  assert.throws(()=>r.render(frame([first,builtin,bad])),{code:'ANIMATION_RENDER_VALUE'});
+  assert.equal(groups,0);assert.equal(d.writes.length,writes);assert.equal(d.submissions.length,0);
+  assert.equal(r.version,0);assert.equal(r.failed,false);assert.equal(r.bundleDiagnostics.cachedBundles,0);
+  r.render(frame([sampledDraw(mesh,7,view,sampler,vertexView)]));
+  const snapshot=d.snapshots[0][0];assert.equal(groups,2);
+  assert.deepEqual(snapshot.groups.get(0).offsets,[0]);assert.deepEqual(snapshot.groups.get(1).offsets,[]);
+  assert.deepEqual([...words(snapshot,0)],Array(4).fill(7));
+  await r.whenIdle();r.dispose();gpu.dispose();ordinary.dispose();
 });

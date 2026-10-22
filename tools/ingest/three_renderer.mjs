@@ -652,18 +652,15 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         frame.arrayCamera = {pixelRatio: target ? 1 : this._pixelRatio, clipSpace: 'webgpu',
           targetSize: target ? [Math.max(1, Math.floor(target.width / 2 ** mipLevel)), Math.max(1, Math.floor(target.height / 2 ** mipLevel))] : this._bufferSize()};
       }
-      let nodeFrame = null;
-      if (!this._shaderEncodedOutput && !clearOnly) {
-        const stencilAttachment = target ? destination.shape.depthFormat?.endsWith('-stencil8') === true : this.stencil;
-        let raster = this._nodeRaster.get(stencilAttachment);
-        if (!raster) { raster = createThreeSceneRaster(THREE, {stencilAttachment, fail}).program; this._nodeRaster.set(stencilAttachment, raster); }
-        nodeFrame = captureThreeNodeScene(THREE, scene, camera, {renderer: this, overrideMaterial, raster,
-          getPrograms: () => this._nodeProgramSupport ??= createThreeNodePrograms({three: THREE, renderer: this, maxPrograms: maxBindings}),
-          maxNodes: sceneLimits.maxNodes ?? 16384, maxDraws, uniforms: captureCameras,
-          maxUniformBytes: MAX_NODE_CAPTURE_BYTES - this._nodeCaptureBytes});
-        if (nodeFrame) { this._nodeCaptureBytes += nodeFrame.bytes; matricesUpdated = true; }
-      }
+      const native = !this._shaderEncodedOutput && !clearOnly;
+      // Before initialization, the source renderer prepares at its asynchronous
+      // boundary. Texture feature/layout admission needs the actual device.
+      const nodeCaptureDeferred = native && !this._initialized;
+      const nodeFrame = native && !nodeCaptureDeferred
+        ? this._captureNodeFrame({scene, camera, destination, overrideMaterial, captureCameras}) : null;
+      if (nodeFrame) matricesUpdated = true;
       return {scene: snapshot?.root ?? scene, camera: snapshot?.camera ?? camera, snapshot, matricesUpdated, nodeFrame, clearOnly, destination, mipLevel, frame, overrideMaterial,
+        nodeCaptureDeferred, captureCameras,
         linearClearColor: this.alpha ? [c.r * a, c.g * a, c.b * a, a] : [c.r, c.g, c.b, 1],
         hdr: !target && this._wantsHdr(this._toneMapping()), key,
         programFrame: {toneMapping: this.toneMapping, toneMappingExposure: this.toneMappingExposure,
@@ -673,9 +670,26 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       const request = this._makeRequest(scene, camera, clearOnly);
       return this._dispatchRequest(request);
     }
+    _captureNodeFrame({scene, camera, destination, overrideMaterial, captureCameras}) {
+      const target = destination === this ? null : destination.target;
+      const stencilAttachment = target ? destination.shape.depthFormat?.endsWith('-stencil8') === true : this.stencil;
+      let raster = this._nodeRaster.get(stencilAttachment);
+      if (!raster) { raster = createThreeSceneRaster(THREE, {stencilAttachment, fail}).program; this._nodeRaster.set(stencilAttachment, raster); }
+      const captured = captureThreeNodeScene(THREE, scene, camera, {renderer: this, overrideMaterial, raster,
+        getPrograms: () => this._nodeProgramSupport ??= createThreeNodePrograms({three: THREE, renderer: this, maxPrograms: maxBindings}),
+        getTextures: () => this._getSampledTextureInputs(), destination: target,
+        maxNodes: sceneLimits.maxNodes ?? 16384, maxDraws, uniforms: captureCameras,
+        maxUniformBytes: MAX_NODE_CAPTURE_BYTES - this._nodeCaptureBytes});
+      if (captured) this._nodeCaptureBytes += captured.bytes;
+      return captured;
+    }
     _releaseRequest(request) {
       request.snapshot?.release();
-      if (request.nodeFrame) { this._nodeCaptureBytes -= request.nodeFrame.bytes; request.nodeFrame = null; }
+      if (request.nodeFrame) {
+        const captured = request.nodeFrame;
+        for (const lease of captured.textureUses) captured.textureOwner.release(lease);
+        this._nodeCaptureBytes -= captured.bytes; request.nodeFrame = null;
+      }
     }
     _dispatchRequest(request) {
       const {scene, destination, snapshot} = request;
@@ -683,7 +697,11 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       const entry = destination._dispatcher?.entry(scene);
       if (this._drain || this._preparing || (destination === this && request.hdr !== this._hdr) || !entry || entry.key !== request.key || (!entry.clipping && request.overrideMaterial?.clippingPlanes?.length))
         return this._defer(request);
-      try { this._submit(request); this._releaseRequest(request); }
+      try {
+        const captured = request.nodeFrame;
+        if (captured?.textureOwner?.preparation(captured.textureUses)) return this._defer(request);
+        this._submit(request); this._releaseRequest(request);
+      }
       catch (error) {
         if (isPrepareBoundary(error) || (error?.code === 'THREE_SCENE_MATERIAL' && !entry.clipping && needsClipping(scene, request.overrideMaterial)))
           return this._defer(request);
@@ -698,8 +716,19 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       // state. Only deferred calls need the queued renderer-state snapshot.
       this._programFrame = deferred ? programFrame : undefined;
       try {
-        if (destination === this) this._session.render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame}, frame);
-        else this._targets.render(destination, attachments => destination._dispatcher.render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame}, {...frame, ...attachments}), {mipLevel});
+        const issue = () => {
+          if (destination === this) this._session.render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame}, frame);
+          else this._targets.render(destination, attachments => destination._dispatcher.render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame}, {...frame, ...attachments}), {mipLevel});
+        };
+        const textures = nodeFrame?.textureOwner;
+        if (textures && nodeFrame.textureUses.length) {
+          textures.validateDispatch(nodeFrame.textureUses);
+          textures.withDispatch(nodeFrame.textureUses, () => {
+            nodeFrame = {...nodeFrame, draws: nodeFrame.draws.map(draw => ({...draw,
+              nodeResources: draw.nodeTextures.map(({group, binding, lease}) => ({group, binding, resource: textures.resolve(lease)}))}))};
+            issue();
+          });
+        } else issue();
       } finally { this._programFrame = previous; }
       const d = destination._dispatcher.entry(scene)?.lastDiagnostics;
       if (d) {
@@ -799,6 +828,15 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     /** All scene preparations share one queue; targets never rebuild the canvas. */
     _prepare(destination = this, request = null) {
       const run = (this._preparing ?? Promise.resolve()).catch(() => {}).then(async () => {
+        if (this._disposed) fail('DISPOSED', 'Renderer is disposed');
+        if (request?.nodeCaptureDeferred) {
+          request.nodeFrame = this._captureNodeFrame(request);
+          request.matricesUpdated ||= !!request.nodeFrame;
+          request.nodeCaptureDeferred = false;
+        }
+        const captured = request?.nodeFrame;
+        const textureReady = captured?.textureOwner?.preparation(captured.textureUses);
+        if (textureReady) await textureReady;
         if (this._disposed) fail('DISPOSED', 'Renderer is disposed');
         const previous = this._programFrame, previousRoot = destination._preparationRoot;
         const previousOptions = destination._preparationOptions;
