@@ -11,7 +11,7 @@
  * KHR_materials_variants selects authored/default or named/indexed materials
  * before geometry/texture preparation, without mutating the source document.
  *
- * resolveTexture({textureIndex,imageIndex,image,sampler,colorSpace}) synchronously
+ * resolveTexture({textureIndex,imageIndex,image,imageMimeTypes,sampler,colorSpace}) synchronously
  * lends {view,sampler}. It must honor the source image/sampler and 'srgb'/'linear'
  * request; load/decode asynchronously BEFORE calling this API. No hidden fetches,
  * placeholder textures, color-space guesses or ownership transfers. Requests are
@@ -81,27 +81,31 @@ const indexed = (array, i, label) => {
   if (!Array.isArray(array) || i >= array.length) fail("INDEX", `Invalid ${label}`);
   return object(array[i], label);
 };
-function textureRequest(model, info, colorSpace, basisu) {
+function textureRequest(model, info, colorSpace, basisu, webp) {
   const textureIndex = uint(info.index, "texture index"),
     texture = indexed(model.textures, textureIndex, "texture");
-  const ext = extensions(texture, ["KHR_texture_basisu"], "texture").KHR_texture_basisu;
-  const compressed = basisu && ext !== undefined;
-  if (compressed) {
-    fields(ext, ["source", "extensions", "extras"], "BasisU texture");
-    extensions(ext, [], "BasisU texture");
+  const ext = extensions(texture, ["KHR_texture_basisu", "EXT_texture_webp"], "texture");
+  // Capability selection is explicit and fixed before image I/O. Preserve the
+  // existing BasisU preference when both routes are enabled, then WebP, then
+  // authored PNG/JPEG. A selected source's failure never retries another route.
+  const route = basisu && ext.KHR_texture_basisu !== undefined
+    ? { name: "BasisU", value: ext.KHR_texture_basisu, mimeType: "image/ktx2" }
+    : webp && ext.EXT_texture_webp !== undefined
+      ? { name: "WebP", value: ext.EXT_texture_webp, mimeType: "image/webp" }
+      : null;
+  if (route) {
+    fields(route.value, ["source", "extensions", "extras"], route.name + " texture");
+    extensions(route.value, [], route.name + " texture");
   }
-  // Decide once before I/O. An optional extension uses its authored core source
-  // when the caller has no BasisU route. Never fabricate a fallback or try one
-  // after a selected compressed source fails. Leave the source JSON untouched.
-  if (!compressed && texture.source === undefined)
-    fail("TEXTURE", "Texture has no core fallback; enable the BasisU route");
-  const imageIndex = uint(compressed ? ext.source : texture.source, "image index"),
+  if (!route && texture.source === undefined)
+    fail("TEXTURE", "Texture has no core fallback; enable its BasisU or WebP route");
+  const imageIndex = uint(route ? route.value.source : texture.source, "image index"),
     image = indexed(model.images, imageIndex, "image");
   extensions(image, [], "image");
   if ((image.uri === undefined) === (image.bufferView === undefined))
     fail("TEXTURE", "Image requires exactly one URI or bufferView");
   const source = {},
-    mimeTypes = compressed ? ["image/ktx2"] : ["image/png", "image/jpeg"];
+    mimeTypes = route ? [route.mimeType] : ["image/png", "image/jpeg"];
   if (image.mimeType !== undefined && !mimeTypes.includes(image.mimeType))
     fail("TEXTURE", "Image MIME type disagrees with the selected texture route");
   if (image.uri !== undefined) {
@@ -124,9 +128,9 @@ function textureRequest(model, info, colorSpace, basisu) {
     if (!mimeTypes.includes(image.mimeType))
       fail("TEXTURE", "Buffer-view image requires the selected texture MIME type");
   }
-  // URI images may omit mimeType, but a BasisU source still must contain KTX2.
+  // URI images may omit mimeType; selected extension sources still require their codec.
   // Carry that requirement to the asynchronous texture loader, not just hints.
-  if (compressed) source.mimeType = "image/ktx2";
+  if (route) source.mimeType = route.mimeType;
   else if (image.mimeType !== undefined) source.mimeType = image.mimeType;
   const sampler =
     texture.sampler === undefined ? {} : indexed(model.samplers, texture.sampler, "sampler");
@@ -151,6 +155,7 @@ function textureRequest(model, info, colorSpace, basisu) {
     textureIndex,
     imageIndex,
     image: Object.freeze(source),
+    imageMimeTypes: Object.freeze(mimeTypes),
     sampler: Object.freeze(sampling),
     colorSpace,
   });
@@ -171,7 +176,7 @@ function textureCoordinates(info) {
   }
   return { texCoord, transform };
 }
-function materialPlan(model, primitive, basisu) {
+function materialPlan(model, primitive, basisu, webp) {
   const material =
     primitive.material === null ? {} : indexed(model.materials, primitive.material, "material");
   fields(
@@ -372,7 +377,7 @@ function materialPlan(model, primitive, basisu) {
         0,
         1,
       );
-    requests.push({ field, request: textureRequest(model, info, colorSpace, basisu) });
+    requests.push({ field, request: textureRequest(model, info, colorSpace, basisu, webp) });
   }
   if (mixedUV) {
     // Keep the first map's raw coordinates for geometric picking. Each material
@@ -409,8 +414,11 @@ export function decodeGltfAnimationModel(
  * resolveTextures(resolver) consumes the plan on success. A failed resolver can
  * be retried without decoding again; borrowed resolver effects are not rolled back.
  * basisu:true selects KHR_texture_basisu sources for a preloaded KTX2 resolver.
- * The default selects authored core fallbacks for optional BasisU textures;
- * required BasisU needs explicit support. Selection does not transcode or fetch.
+ * webp:true selects still EXT_texture_webp sources for a WebP-capable image decoder.
+ * Both default false; optional extensions use authored PNG/JPEG core fallbacks.
+ * Required extensions need explicit support. With both enabled, BasisU precedes
+ * WebP. Selection does not transcode/fetch or probe decoder support; selected
+ * failures never retry fallback images. The owning loader accepts decode.webp.
  * materialVariant:null (default) uses authored materials; an integer or unique
  * exact name selects KHR_materials_variants before any buffer/resolver effects.
  * materialVariantLimits bounds the separate metadata preflight. Returned
@@ -425,12 +433,14 @@ export function prepareGltfAnimationModel(
     maxComponents = 16777216,
     maxPrimitives = 4096,
     basisu = false,
+    webp = false,
     maxInstances = 4096,
     materialVariant = null,
     materialVariantLimits,
   } = {},
 ) {
   if (typeof basisu !== "boolean") fail("TEXTURE", "basisu must be a boolean");
+  if (typeof webp !== "boolean") fail("TEXTURE", "webp must be a boolean");
   // Preserve the unextended path's existing scope/budgets: do not scan every
   // mesh in a plain asset merely to discover that no variant was requested.
   const hasVariants = Object.hasOwn(model?.extensions ?? {}, GLTF_MATERIAL_VARIANTS) ||
@@ -459,6 +469,7 @@ export function prepareGltfAnimationModel(
         "KHR_lights_punctual",
         "KHR_mesh_quantization",
         ...(basisu ? ["KHR_texture_basisu"] : []),
+        ...(webp ? ["EXT_texture_webp"] : []),
       ].includes(name)
     )
       fail("UNSUPPORTED", `Required extension needs source route: ${name}`);
@@ -487,7 +498,7 @@ export function prepareGltfAnimationModel(
       reason: "EXPANDED_INSTANCE_DRAWS_NOT_GPU_INSTANCING",
       instances: expanded.instanceCount,
     });
-  const plans = geometry.primitives.map((p) => materialPlan(model, p, basisu)),
+  const plans = geometry.primitives.map((p) => materialPlan(model, p, basisu, webp)),
     unique = new Map();
   for (const plan of plans) geometry.diagnostics.push(...plan.diagnostics);
   for (const plan of plans)

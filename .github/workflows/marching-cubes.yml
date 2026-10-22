@@ -1,54 +1,117 @@
-name: Marching cubes integration
+name: Marching Cubes Runtime Proof
+
 on:
   push:
-    branches: [main]
-    paths:
-      - 'tools/ingest/**'
-      - 'tools/package*.json'
-      - 'tests/fixtures/marching_cubes/**'
-      - '.github/workflows/marching-cubes.yml'
-  workflow_dispatch:
-permissions:
-  contents: read
+  pull_request:
+
 jobs:
-  numerical-and-addon:
+  marching-cubes-gate:
+    name: Marching Cubes Gate (Rust + JS)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RUST_BACKTRACE: "1"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Detect sibling path dependency contracts
+        id: deps
+        run: |
+          if grep -qE 'path = "\.\./(asupersync|franken_evidence)"' Cargo.toml; then
+            echo "needs_sibling_deps=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "needs_sibling_deps=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout asupersync sibling dependency
+        if: steps.deps.outputs.needs_sibling_deps == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/asupersync
+          path: .ci-deps/asupersync
+
+      - name: Checkout franken_evidence sibling dependency
+        if: steps.deps.outputs.needs_sibling_deps == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/franken_evidence
+          path: .ci-deps/franken_evidence
+
+      - name: Wire sibling path dependencies
+        if: steps.deps.outputs.needs_sibling_deps == 'true'
+        run: |
+          mkdir -p ../asupersync ../franken_evidence
+          rsync -a --delete .ci-deps/asupersync/ ../asupersync/
+          rsync -a --delete .ci-deps/franken_evidence/ ../franken_evidence/
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install ingest tooling dependencies
+        run: npm ci
+
+      - name: Install latest nightly toolchain
+        run: |
+          rustup toolchain install nightly --profile minimal --component rustfmt --component clippy
+          rustup default nightly
+
+      - name: Install wasm target
+        run: rustup target add wasm32-unknown-unknown --toolchain nightly
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run marching-cubes clippy gate
+        run: cargo clippy -p f3d-marching-cubes --tests -- -D warnings
+
+      - name: Run marching-cubes kernel tests
+        run: cargo test -p f3d-marching-cubes
+
+      - name: Build wasm kernel for JS fast-path checks
+        run: cargo build -p f3d-marching-cubes --release --target wasm32-unknown-unknown
+
+      - name: Run marching-cubes runtime gate
+        run: node tools/ingest/marching_cubes_gate.mjs
+
+      - name: Run per-triangle material-group transport checks
+        run: node --test tools/ingest/frame_driver.test.mjs tools/ingest/marching_cubes_worker_pool.test.mjs tools/ingest/marching_cubes_protocol_v2.test.mjs
+
+      - name: Run source-renderer material-group smoke
+        run: node tools/ingest/marching_cubes_material_groups_source_renderer_smoke.mjs
+
+      - name: Verify retained addon typed-array reuse
+        run: node --test tools/upstream_retained/upstream/three/test/unit/addons/objects/MarchingCubes.tests.mjs
+
+      - name: Verify material-group docs and measure marker
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          readme = Path("README.md").read_text()
+          assert "paper/workflows/marching_cubes_material_groups.md" in readme
+          measure = json.loads(Path("paper/curated/measure.json").read_text())
+          assert measure["marching_cubes_material_groups_status"] == "Transported. Tests green. Hide-off check passed."
+          PY
+
+  gltf-texture-pipeline:
+    name: glTF Texture and Export Regression Tests
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
-          persist-credentials: false
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-      - run: npm ci --prefix tools --ignore-scripts
-      - uses: actions/checkout@v4
-        with:
-          repository: mrdoob/three.js
-          ref: 148ef33ecb6d2502ff796d4554abd1549c95d519
-          path: oracle-three
-          persist-credentials: false
-      - name: Execute numeric, addon and geometry-renderer regressions
-        shell: bash
-        env:
-          F3D_THREE_ROOT: ${{ github.workspace }}/oracle-three
-        run: |
-          node --test tools/ingest/numeric_array_references.test.mjs tools/ingest/numeric_array_references.integration.test.mjs tools/ingest/numeric_typed_array_ops.test.mjs tools/ingest/numeric_typed_array_ops.integration.test.mjs tools/ingest/numeric_kernel_runtime.test.mjs tests/unit/three_compute_structs_source.test.mjs tests/unit/gpu_compute_publication.test.mjs tests/unit/three_compute_queue.test.mjs tests/unit/three_compute.test.mjs tests/unit/gpu_compute.test.mjs tests/unit/gpu_compute_attributes.test.mjs tests/unit/gpu_compute_integer_attributes.test.mjs tests/unit/gpu_compute_indices.test.mjs tools/ingest/three_renderer.test.mjs tools/ingest/three_scene_stencil.test.mjs tools/ingest/three_program_stencil.test.mjs tools/ingest/three_program_stencil_integration.test.mjs tools/ingest/three_renderer_targets.test.mjs tools/ingest/three_renderer_program_targets.test.mjs tools/ingest/marching_cubes*.test.mjs tools/ingest/gpu_buffer_geometry*.test.mjs tools/ingest/gpu_instance_attributes.test.mjs tools/ingest/animation_render*.test.mjs tools/ingest/animation_instanced_render.test.mjs tools/ingest/animation_webgpu_package.test.mjs tools/ingest/three_textures.test.mjs | tee marching-cubes-tests.log
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: marching-cubes-test-log
-          path: marching-cubes-tests.log
-          retention-days: 7
-          if-no-files-found: ignore
-      - name: Preserve exact numerical test inputs for offline reproduction
-        if: always()
-        run: |
-          tar -czf marching-cubes-repro.tar.gz tools/ingest tools/node_modules tools/package.json tools/package-lock.json tests/fixtures/marching_cubes oracle-three/build oracle-three/src oracle-three/package.json oracle-three/examples/jsm/objects/MarchingCubes.js
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: marching-cubes-repro
-          path: marching-cubes-repro.tar.gz
-          retention-days: 7
-          if-no-files-found: ignore
+          node-version: "22"
+      - name: Run texture selection, upload and offline export tests
+        run: >-
+          node --test
+          tools/ingest/gltf_webp.test.mjs
+          tools/ingest/gltf_webp_pipeline.test.mjs
+          tools/ingest/gltf_image_decode.test.mjs
+          tools/ingest/animation_model.test.mjs

@@ -1,10 +1,11 @@
-/** Runtime glTF/GLB bytes, meshopt/Draco geometry and lazy PNG/JPEG/KTX2 image loading. No Node, DOM or
+/** Runtime glTF/GLB bytes, meshopt/Draco geometry and lazy PNG/JPEG/WebP/KTX2 image loading. No Node, DOM or
  * GPU dependency and no work at import time. All I/O uses the supplied Fetch API.
  * The byte budget counts unique encoded resources, not decoded meshes/images.
  * Parsed data is owned by the caller; do not mutate it during model construction.
  * https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html
  */
 
+import { isGltfWebp } from "./gltf_webp.mjs";
 import { prepareDracoMeshes } from "./gltf_draco.mjs";
 import { prepareMeshoptBuffers } from "./gltf_meshopt.mjs";
 import { createGltfResourceQueue, waitForGltfResource } from "./gltf_resource_queue.mjs";
@@ -134,6 +135,7 @@ function dataUri(uri, limit) {
   return { bytes: output, mimeType: match[1].toLowerCase() };
 }
 function imageType(data) {
+  if (isGltfWebp(data)) return "image/webp";
   if (data.length >= 8 && [137, 80, 78, 71, 13, 10, 26, 10].every((v, i) => data[i] === v))
     return "image/png";
   if (data.length >= 3 && data[0] === 255 && data[1] === 216 && data[2] === 255)
@@ -145,7 +147,7 @@ function imageType(data) {
     [171, 75, 84, 88, 32, 50, 48, 187, 13, 10, 26, 10].every((v, i) => data[i] === v)
   )
     return "image/ktx2";
-  fail("IMAGE", "Only PNG/JPEG/KTX2 images are supported");
+  fail("IMAGE", "Only PNG/JPEG/WebP/KTX2 images are supported");
 }
 
 /** source: absolute/relative HTTP(S) URL (relative needs baseURL), or complete

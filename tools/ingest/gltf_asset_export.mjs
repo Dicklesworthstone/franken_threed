@@ -6,6 +6,8 @@
  * Use loadGltfAsset's normalized json/buffers after meshopt/Draco decoding, not
  * sourceJson with its original compression references. No GPU or codec executes.
  */
+import { isGltfWebp } from "./gltf_webp.mjs";
+
 export class GltfAssetExportError extends Error {
   constructor(code, message) {
     super(`${code}: ${message}`);
@@ -26,6 +28,7 @@ const EXTENSIONS = new Set([
   "KHR_materials_clearcoat",
   "KHR_texture_transform",
   "KHR_texture_basisu",
+  "EXT_texture_webp",
   "KHR_lights_punctual",
   "KHR_mesh_quantization",
   "EXT_mesh_gpu_instancing",
@@ -60,6 +63,7 @@ function bytes(value) {
   }
 }
 function mime(data) {
+  if (isGltfWebp(data)) return "image/webp";
   if (data.length >= 8 && [137, 80, 78, 71, 13, 10, 26, 10].every((n, i) => data[i] === n))
     return "image/png";
   if (data.length >= 3 && data[0] === 255 && data[1] === 216 && data[2] === 255)
@@ -69,7 +73,39 @@ function mime(data) {
     [171, 75, 84, 88, 32, 50, 48, 187, 13, 10, 26, 10].every((n, i) => data[i] === n)
   )
     return "image/ktx2";
-  fail("IMAGE", "Expected encoded PNG, JPEG or KTX2 image bytes");
+  fail("IMAGE", "Expected encoded PNG, JPEG, WebP or KTX2 image bytes");
+}
+// WebP is an extension source, never a core texture source. Keep original image
+// indices and fallbacks; do not convert WebP-only textures into invalid core glTF.
+// Run before provider I/O and again after URI image types have been resolved.
+function webpSources(json, images) {
+  const result = new Set(), textures = json.textures ?? [];
+  if (images.some(image => image?.mimeType === "image/webp") && !json.extensionsUsed?.includes("EXT_texture_webp"))
+    fail("EXTENSION", "WebP images require EXT_texture_webp in extensionsUsed");
+  if (!Array.isArray(textures)) fail("SHAPE", "Expected textures array");
+  for (const texture of textures) {
+    object(texture, "texture");
+    const ext = texture.extensions?.EXT_texture_webp;
+    if (texture.source !== undefined && images[texture.source]?.mimeType === "image/webp")
+      fail("IMAGE", "WebP cannot be a core texture source");
+    if (ext === undefined) continue;
+    fields(ext, ["source", "extensions", "extras"], "WebP texture");
+    integer(ext.source, 0, images.length - 1, "WebP image index");
+    const image = object(images[ext.source], "WebP image");
+    if (image.mimeType !== undefined && image.mimeType !== "image/webp")
+      fail("IMAGE", "WebP source requires image/webp");
+    if (!json.extensionsUsed?.includes("EXT_texture_webp") ||
+        (texture.source === undefined && !json.extensionsRequired?.includes("EXT_texture_webp")))
+      fail("EXTENSION", "Declare EXT_texture_webp used, and required without a core fallback");
+    if (texture.source !== undefined) {
+      integer(texture.source, 0, images.length - 1, "WebP fallback image index");
+      const fallback = object(images[texture.source], "WebP fallback image");
+      if (fallback.mimeType !== undefined && !["image/png", "image/jpeg"].includes(fallback.mimeType))
+        fail("IMAGE", "WebP core fallback must be PNG or JPEG");
+    }
+    result.add(ext.source);
+  }
+  return result;
 }
 // Capture only JSON data properties. Do not call user getters/toJSON while
 // snapshotting. Cycles, nonfinite numbers and unsupported JavaScript values must
@@ -475,6 +511,8 @@ function wait(pending, signal) {
  * each buffer/image table (bufferViews may have sixteen times as many entries).
  * A caller's image resolver may ignore abort; late settlements are still observed.
  * Images are signature-checked, not decoded or fully validated by a codec.
+ * EXT_texture_webp sources and authored PNG/JPEG fallbacks stay byte-exact;
+ * export does not require WebP decoding support or select a rendering route.
  * Unknown/compressed extension records fail before I/O. The asset loader removes
  * successfully decoded geometry compression; skipped unused buffer slots may be
  * null. Inaccessible orphan accessors/views are removed only after checking all
@@ -580,14 +618,15 @@ export async function exportGltfAssetGLB(asset, options = {}) {
       fail("EXTENSION", "Decode extended bufferViews before exporting");
   }
   // Validate all image metadata before reading/copying or invoking a provider.
-  const external = new Map();
+  const external = new Map(), webpImages = webpSources(json, images);
   for (let i = 0; i < images.length; i++) {
     const image = object(images[i], "image");
+    const expectedMime = image.mimeType ?? (webpImages.has(i) ? "image/webp" : undefined);
     if ((image.uri === undefined) === (image.bufferView === undefined))
       fail("IMAGE", "Image needs exactly one URI or bufferView");
     if (
       image.mimeType !== undefined &&
-      !["image/png", "image/jpeg", "image/ktx2"].includes(image.mimeType)
+      !["image/png", "image/jpeg", "image/webp", "image/ktx2"].includes(image.mimeType)
     )
       fail("IMAGE", "Unsupported image MIME type");
     if (image.uri !== undefined) {
@@ -596,13 +635,13 @@ export async function exportGltfAssetGLB(asset, options = {}) {
       const previous = external.get(image.uri);
       if (
         previous?.mimeType !== undefined &&
-        image.mimeType !== undefined &&
-        previous.mimeType !== image.mimeType
+        expectedMime !== undefined &&
+        previous.mimeType !== expectedMime
       )
         fail("IMAGE", "Conflicting MIME types for one URI");
       external.set(image.uri, {
         index: previous?.index ?? i,
-        mimeType: previous?.mimeType ?? image.mimeType,
+        mimeType: previous?.mimeType ?? expectedMime,
       });
     } else {
       integer(image.bufferView, 0, views.length - 1, "image bufferView");
@@ -685,6 +724,7 @@ export async function exportGltfAssetGLB(asset, options = {}) {
       Object.assign(image, uriViews.get(image.uri));
       delete image.uri;
     }
+  webpSources(json, images);
   if (views.length) json.bufferViews = views;
   if (binaryLength) {
     const buffer = { byteLength: binaryLength };

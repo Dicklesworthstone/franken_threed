@@ -156,13 +156,26 @@ export async function createGltfTextureResources(
   // Snapshot and validate every request before fetching or allocating anything.
   const entries = new Map(),
     images = new Map(),
-    expectedMimeTypes = new Map();
+    expectedMimeTypes = new Map(),
+    allowedMimeTypes = new Map();
   for (const request of requests) {
     const textureIndex = index(request?.textureIndex, "texture index"),
       imageIndex = index(request?.imageIndex, "image index");
     // Selected extension sources are contracts, not content-type hints. Merge
     // every use before deduplication/I/O so an unspecified use cannot erase a
     // later explicit requirement, or disguise a PNG as a BasisU source.
+    // Prepared core requests allow only PNG/JPEG even when a URI omits MIME.
+    // Merge constraints by image before I/O; sharing cannot erase a stricter use.
+    if (request.imageMimeTypes !== undefined) {
+      const values = request.imageMimeTypes;
+      if (!Array.isArray(values) || !values.length ||
+          values.some(value => !["image/png", "image/jpeg", "image/webp", "image/ktx2"].includes(value)))
+        fail("REQUEST", "Invalid image MIME allowlist");
+      const previous = allowedMimeTypes.get(imageIndex);
+      const selected = new Set(values.filter(value => !previous || previous.has(value)));
+      if (!selected.size) fail("REQUEST", "Conflicting image MIME allowlists");
+      allowedMimeTypes.set(imageIndex, selected);
+    }
     const mimeType = request.image?.mimeType;
     if (mimeType !== undefined) {
       if (!["image/png", "image/jpeg", "image/webp", "image/ktx2"].includes(mimeType))
@@ -205,6 +218,9 @@ export async function createGltfTextureResources(
     group.mips ||= entry.mips;
     group.entries.push(entry);
   }
+  for (const [imageIndex, mimeType] of expectedMimeTypes)
+    if (allowedMimeTypes.has(imageIndex) && !allowedMimeTypes.get(imageIndex).has(mimeType))
+      fail("REQUEST", "Image MIME requirement conflicts with its allowlist");
   const owned = new Set(),
     resolved = new Map(),
     pipelines = new Map(),
@@ -376,8 +392,8 @@ export async function createGltfTextureResources(
       const image = await imageReads.take(imageIndex);
       live();
       if (
-        expectedMimeTypes.has(imageIndex) &&
-        image?.mimeType !== expectedMimeTypes.get(imageIndex)
+        (expectedMimeTypes.has(imageIndex) && image?.mimeType !== expectedMimeTypes.get(imageIndex)) ||
+        (allowedMimeTypes.has(imageIndex) && !allowedMimeTypes.get(imageIndex).has(image?.mimeType))
       )
         fail("IMAGE", "Loaded image MIME type disagrees with the selected texture route");
       if (image?.mimeType === "image/ktx2") {
