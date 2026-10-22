@@ -1,7 +1,7 @@
 # Source HDR environments in native scenes
 
 `createGpuThreeScene(device, scene, { three, environment: {} })` connects a
-ready `scene.environment` panorama or data-backed cubemap to the existing native
+ready `scene.environment` panorama or data/image-backed cubemap to the existing native
 image-based lighting filter and material renderer. This is an opt-in extension of the source scene
 bridge, not a replacement for the pinned Three renderer or a PMREM-equivalence
 claim. The application still owns its Three module, scene, camera, device,
@@ -130,12 +130,52 @@ checks. In-place pixel edits still require `environment.needsUpdate = true` and
 lifetime owner: disposing it invalidates the filtered maps without disposing its
 borrowed faces.
 
-HTML images, canvases, ImageBitmaps, compressed cubes, raw `{data,width,height}`
-face descriptors, render-target cubes, refraction mapping and authored face mips
-remain outside this explicit data-cube profile. This adds environment lighting,
+Compressed cubes, raw `{data,width,height}` face descriptors, render-target
+cubes, refraction mapping and authored face mips remain outside this owner. This adds environment lighting,
 not cube backgrounds or per-material `envMap` support. The panorama-background
 copy API explicitly rejects cube input rather than treating a cube face as a
 panorama.
+
+## Ready browser-image cubemaps
+
+The same `scene.environment` path also admits ordinary `CubeTextureLoader`
+results once all six images have loaded. The parent must use RGBA unsigned-byte
+storage and `CubeReflectionMapping`. Ready HTML images, HTML/Offscreen canvases,
+ImageBitmaps and sRGB ImageData are supported; faces must be equally sized
+squares. Mixing data-backed and browser-image faces is not admitted.
+
+```js
+const environment = await new THREE.CubeTextureLoader().loadAsync([
+  'px.png', 'nx.png', 'py.png', 'ny.png', 'pz.png', 'nz.png',
+]);
+environment.colorSpace = THREE.SRGBColorSpace;
+scene.environment = environment;
+await nativeScene.prepare();
+```
+
+Loading/decoding remains the application's responsibility. Preparation reuses
+`createGpuThreeTextures`, including its browser-copy, source color-space, sampler
+and generated-mipmap contracts. It does not read a canvas, close a bitmap,
+change source versions, reduce mip quality or start another frame loop. The
+ImageBitmap contract requires `flipY=false` and unpremultiplied alpha; choose
+orientation during decoding. Wide-gamut ImageData and authored cube mip chains
+remain outside this profile. See `THREE_TEXTURES.md` for external-copy semantics.
+
+Six GPU texel blits convert the uploaded cube to the existing linear
+`rgba16float` filter input. Compatible sRGB views decode RGB on the GPU and leave
+alpha linear. The blits mirror U and exchange X faces; when `flipY=true`, they
+also exchange Y faces, because the shared uploader reverses rows but preserves
+layer identities. The original cube, all image objects and their order remain
+unchanged. There is no intermediate panorama or CPU image readback.
+
+`maxBytes` conservatively charges the full uploaded source mip chain, normalized
+half-float cube, filter uniforms and filtered outputs together. Conversion drains
+before source residency is retired; filter readiness is still required before
+publication. Abort, source disposal and device loss promptly retire preparation
+resources, and changed versions, face identities, dimensions or sampling state
+reject stale publication. Subsequent intensity/rotation changes do not upload or
+filter again. Canvas paint changes still need `environment.needsUpdate=true`
+and a preparation boundary.
 
 ## Explicit updates, replacement and lifetime
 
@@ -216,3 +256,9 @@ and fixture source classes. Cubemap tests independently sample off-axis directio
 on all faces, inspect transfer conversion and emitted cube views/passes, and
 cover whole-source budgets, stale publication, cancellation and cleanup. This is
 command/ownership evidence, not native rendered-pixel equivalence.
+
+`node --test tools/ingest/three_image_environment.test.mjs` exercises image
+admission, exact face/view bindings, byte budgets, asynchronous publication and
+failure cleanup through the production source owner and conversion command
+generator. Browser classes, the shared texture pool and GGX filter are explicit
+fixtures; this test does not establish browser image-copy or rendered-pixel parity.

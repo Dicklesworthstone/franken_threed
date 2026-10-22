@@ -1,4 +1,4 @@
-/** Source-owned HDR panoramas and data cubemaps for the native GGX environment renderer.
+/** Source-owned HDR panoramas and data/image cubemaps for the native GGX environment renderer.
  * The source Texture and pixels are borrowed. Preparation copies current ready
  * pixels and filters once; needsUpdate/identity changes require a new owner.
  * This is the core's explicit GGX/DFG profile, not Three PMREM pixel parity.
@@ -57,14 +57,14 @@ export function inspectThreeEnvironment(texture, three, {maxPixels = 16 * 1024 *
       texture.type, texture.mapping, texture.colorSpace, texture.flipY, width, height])});
 }
 
-/** Six complete data-backed faces, in source +X,-X,+Y,-Y,+Z,-Z order.
+/** Six complete data-backed or decoded image faces, in source +X,-X,+Y,-Y,+Z,-Z order.
  * Face wrappers and pixels stay borrowed. Do not read pixels while matching a
  * prepared owner: only explicit versions and storage/layout identities matter.
  */
 function inspectCubeEnvironment(texture, three, maxPixels) {
   if (three?.REVISION !== '186' || typeof three.CubeTexture !== 'function' ||
       !(texture instanceof three.CubeTexture) || texture.isRenderTargetTexture || texture.isCompressedTexture)
-    fail('SOURCE', 'Supply a ready r186 data-backed CubeTexture');
+    fail('SOURCE', 'Supply a ready r186 CubeTexture');
   integer(maxPixels, 1, Number.MAX_SAFE_INTEGER, 'pixel budget');
   const half = texture.type === three.HalfFloatType, byte = texture.type === three.UnsignedByteType;
   if ((!half && !byte && texture.type !== three.FloatType) || texture.format !== three.RGBAFormat ||
@@ -88,6 +88,8 @@ function inspectCubeEnvironment(texture, three, maxPixels) {
   if (!Array.isArray(images) || images.length !== 6) fail('PROFILE', 'A cubemap requires exactly six faces');
   const signature = [texture, source, images, texture.version, source.version, texture.type,
     texture.format, texture.mapping, texture.colorSpace, texture.flipY], faces = [];
+  if (images[0]?.isDataTexture !== true)
+    return inspectImageCube(texture, three, maxPixels, signature);
   let size;
   for (const face of images) {
     const wrapped = typeof three.DataTexture === 'function' && face instanceof three.DataTexture;
@@ -122,6 +124,41 @@ function inspectCubeEnvironment(texture, three, maxPixels) {
     faces: Object.freeze(faces), sourceBytes: 6 * size * size * 8, signature: Object.freeze(signature)});
 }
 
+/** Image metadata only; the shared texture inspector performs the complete
+ * upload/sampler admission before allocation. Keep every storage/sampler field
+ * in the signature so asynchronous preparation cannot publish another profile.
+ */
+function inspectImageCube(texture, three, maxPixels, signature) {
+  if (texture.type !== three.UnsignedByteType || typeof texture.generateMipmaps !== 'boolean')
+    fail('FORMAT', 'Decoded cube images require unsigned-byte storage and explicit mip generation');
+  const instance = (value, name) => typeof globalThis[name] === 'function' && value instanceof globalThis[name];
+  signature.push(texture.generateMipmaps, texture.minFilter, texture.magFilter,
+    texture.wrapS, texture.wrapT, texture.anisotropy, texture.unpackAlignment);
+  let size;
+  for (const face of texture.image) {
+    if (!['HTMLImageElement', 'HTMLCanvasElement', 'OffscreenCanvas', 'ImageBitmap', 'ImageData'].some(name => instance(face, name)))
+      fail('SOURCE', 'Cube faces must all be decoded browser images, canvases, ImageBitmaps or ImageData');
+    if (face.complete === false) fail('NOT_READY', 'Cube image has not loaded');
+    if (instance(face, 'ImageBitmap') && texture.flipY)
+      fail('PROFILE', 'ImageBitmap cube orientation must be chosen during decoding (flipY=false)');
+    if (instance(face, 'ImageData') && face.colorSpace && face.colorSpace !== 'srgb')
+      fail('PROFILE', 'ImageData cube faces require the sRGB browser-copy profile');
+    const width = integer(face.naturalWidth ?? face.width, 1, 32768, 'cube image width');
+    const height = integer(face.naturalHeight ?? face.height, 1, 32768, 'cube image height');
+    if (width !== height || (size !== undefined && size !== width))
+      fail('LIMIT', 'Cube images must be square and equally sized');
+    size = width;
+    if (6 * size * size > maxPixels) fail('LIMIT', 'All six cube images exceed the pixel budget');
+    signature.push(face, width, height);
+  }
+  const levels = texture.generateMipmaps ? 1 + Math.floor(Math.log2(size)) : 1;
+  let uploadBytes = 0;
+  for (let level = 0; level < levels; level++) uploadBytes += 6 * Math.max(1, size >> level) ** 2 * 4;
+  return Object.freeze({texture, source: texture.source, cube: true, imageCube: true,
+    width: size, height: size, uploadBytes, sourceBytes: uploadBytes + 6 * size * size * 8,
+    signature: Object.freeze(signature)});
+}
+
 /** A PMREMGenerator.fromScene() request from three_renderer.mjs: the capture
  * runs at this owner's preparation boundary (not at the source call). */
 function inspectSceneCapture(texture, three, maxPixels) {
@@ -153,6 +190,76 @@ struct Out { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32> 
   let texel = vec2<i32>(i32(size.x - 1.0 - floor(input.uv.x * size.x)), i32(floor(input.uv.y * size.y)));
   return textureLoad(face_texture, clamp(texel, vec2<i32>(0), vec2<i32>(size) - 1), 0);
 }`;
+
+/** Reuse material/background image residency, then normalize source handedness
+ * into the same linear half-float input as data cubes. The source owner handles
+ * browser copies, row flips, mipmaps and declared sRGB views. Six exact texel
+ * blits exchange X faces, mirror U and apply the native flipY Y-face exchange.
+ * There is no CPU image readback,
+ * intermediate panorama, source mutation or extra per-frame work is involved.
+ */
+async function uploadImageCube(device, shape, three, maxPixels, signal, check) {
+  const {inspectThreeTexture, createGpuThreeTextures} = await import('./three_textures.mjs');
+  check();
+  const upload = inspectThreeTexture(shape.texture, three, {maxPixels, maxTextureBytes: shape.uploadBytes,
+    maxDimension: device.limits.maxTextureDimension2D, maxLayers: device.limits.maxTextureArrayLayers});
+  if (!upload.cube || upload.data || upload.bytes !== shape.uploadBytes)
+    fail('PREPARE', 'Cube image upload layout changed during preparation');
+  let textures = null, cube = null, rejectStop;
+  const stopped = new Promise((_, reject) => { rejectStop = reject; }); stopped.catch(() => {});
+  function release() { textures?.dispose(); textures = null; cube?.destroy(); cube = null; }
+  function onAbort() {
+    release(); rejectStop(new ThreeEnvironmentError('ABORTED', 'Cube image preparation was aborted'));
+  }
+  async function wait(work) { const result = await Promise.race([work, stopped]); check(); return result; }
+  async function checked(operation) {
+    check(); device.pushErrorScope('out-of-memory'); device.pushErrorScope('validation');
+    let value, thrown;
+    try { value = operation(); } catch (error) { thrown = error; }
+    // Pop both scopes before any await: the device's scope stack is shared.
+    const validation = device.popErrorScope(), memory = device.popErrorScope();
+    const [result, invalid, oom] = await wait(Promise.all([value, validation, memory]));
+    if (thrown) throw thrown;
+    if (invalid || oom) fail('DEVICE', (invalid || oom).message ?? 'Cube image conversion failed');
+    return result;
+  }
+  signal.addEventListener('abort', onAbort, {once: true});
+  try {
+    if (signal.aborted) onAbort(); check();
+    textures = createGpuThreeTextures(device, {three, maxPixels, maxTextures: 1,
+      maxTextureBytes: shape.uploadBytes, label: 'f3d-environment-images'});
+    textures.prepare([shape.texture]);
+    await wait(textures.whenIdle());
+    const input = textures.nativeTexture(shape.texture);
+    const pipeline = await checked(() => {
+      const module = device.createShaderModule({label: 'f3d-environment-image-flip', code: FLIP_BLIT_WGSL});
+      return device.createRenderPipelineAsync({label: 'f3d-environment-image-flip', layout: 'auto',
+        vertex: {module, entryPoint: 'vertex_main'},
+        fragment: {module, entryPoint: 'fragment_main', targets: [{format: 'rgba16float'}]},
+        primitive: {topology: 'triangle-list'}});
+    });
+    await checked(() => {
+      cube = device.createTexture({label: 'f3d-environment-image-cube', size: [shape.width, shape.height, 6],
+        dimension: '2d', format: 'rgba16float', mipLevelCount: 1, sampleCount: 1, usage: 4 | 16});
+      const encoder = device.createCommandEncoder({label: 'f3d-environment-image-flip'});
+      // The shared uploader flips rows but preserves source layer identities.
+      // Native r186 additionally exchanges Y faces for flipY uploads.
+      const order = shape.texture.flipY ? [1, 0, 3, 2, 4, 5] : [1, 0, 2, 3, 4, 5];
+      for (let layer = 0; layer < 6; layer++) {
+        const view = input.createView({format: upload.viewFormat, dimension: '2d', baseMipLevel: 0,
+          mipLevelCount: 1, baseArrayLayer: order[layer], arrayLayerCount: 1});
+        const group = device.createBindGroup({layout: pipeline.getBindGroupLayout(0), entries: [{binding: 0, resource: view}]});
+        const pass = encoder.beginRenderPass({colorAttachments: [{view: cube.createView({dimension: '2d',
+          baseMipLevel: 0, mipLevelCount: 1, baseArrayLayer: layer, arrayLayerCount: 1}),
+          loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 0]}]});
+        pass.setPipeline(pipeline); pass.setBindGroup(0, group); pass.draw(3); pass.end();
+      }
+      device.queue.submit([encoder.finish()]);
+    });
+    await wait(device.queue.onSubmittedWorkDone());
+    const result = cube; cube = null; return result;
+  } finally { signal.removeEventListener('abort', onAbort); release(); }
+}
 
 /** Render the captured source scene into an rgba16float cube texture with the
  * same native scene bridge (a 90-degree camera per face at the capture
@@ -303,7 +410,7 @@ export async function createGpuThreeEnvironment(device, texture, {
   if (shape.sourceBytes + plan.textureBytes + plan.uniformBytes > maxBytes)
     fail('LIMIT', 'Panorama, filter uniforms and output maps exceed the old-plus-new budget');
   if (signal?.aborted) fail('ABORTED', 'Environment preparation was aborted');
-  const pixels = shape.capture ? null : shape.cube ? captureCube(shape) : capture(shape), lifetime = new AbortController();
+  const pixels = shape.capture || shape.imageCube ? null : shape.cube ? captureCube(shape) : capture(shape), lifetime = new AbortController();
   let input = null, map = null, terminal = null, disposed = false, rejectStop;
   const stopped = new Promise((_, reject) => { rejectStop = reject; }); stopped.catch(() => {});
   function release() {
@@ -330,8 +437,10 @@ export async function createGpuThreeEnvironment(device, texture, {
   try {
     if (signal?.aborted) onAbort(); check();
     let error, errors = [];
-    if (shape.capture) {
-      const capturing = renderSceneCapture(device, shape, three, lifetime.signal).then(value => {
+    if (shape.capture || shape.imageCube) {
+      const work = shape.imageCube ? uploadImageCube(device, shape, three, maxPixels, lifetime.signal, check)
+        : renderSceneCapture(device, shape, three, lifetime.signal);
+      const capturing = work.then(value => {
         if (disposed || terminal) { value.destroy(); throw terminal ?? new ThreeEnvironmentError('DISPOSED', 'Environment is disposed'); }
         input = value; return value;
       });
