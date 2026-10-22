@@ -115,3 +115,4 @@ jobs:
           tools/ingest/gltf_webp_pipeline.test.mjs
           tools/ingest/gltf_image_decode.test.mjs
           tools/ingest/animation_model.test.mjs
+          tools/ingest/animation_pose_webp_export.test.mjs

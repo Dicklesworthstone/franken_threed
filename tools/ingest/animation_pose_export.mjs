@@ -13,6 +13,7 @@
  * Clearcoat factors, all three maps and independently baked UVs are preserved
  * through KHR_materials_clearcoat; coating and base normal scales stay distinct.
  */
+import { gltfWebpDimensions } from "./gltf_webp.mjs";
 import { inspectGltfKtx2 } from "./gltf_ktx2.mjs";
 import { createGltfSceneView } from "./gltf_scene_view.mjs";
 export class AnimationExportError extends Error {
@@ -90,11 +91,13 @@ function checkAbort(signal) {
 }
 
 /** resolveTexture({view,sampler}, {signal,colorSpaces}) may be async and must return
- * {bytes: Uint8Array, mimeType:'image/png'|'image/jpeg'|'image/ktx2', sampler?: glTFSampler}.
+ * {bytes: Uint8Array, mimeType:'image/png'|'image/jpeg'|'image/webp'|'image/ktx2', sampler?: glTFSampler}.
  * It supplies ENCODED image bytes, never pixels, URLs or GPU handles in the GLB.
  * Images are preserved, not re-encoded; the provider owns native resources.
  * KTX2 uses required KHR_texture_basisu, with no fabricated PNG fallback. Its
  * encoded transfer/primaries must match every material use in colorSpaces.
+ * Still WebP uses required EXT_texture_webp without a fabricated fallback,
+ * preserving encoded bytes and the same header/profile contract as uploads.
  * Image validation reads headers only, never invokes a transcoder or GPU.
  * sceneView accepts the decoded view definition or a model's live view metadata.
  * Cameras/lights are captured at the same pose as meshes, as world-space roots.
@@ -690,15 +693,23 @@ export async function exportAnimationPoseGLB(pose, entries, options = {}) {
       const { bytes, mimeType, sampler = {} } = result;
       if (
         !(bytes instanceof Uint8Array) ||
-        !["image/png", "image/jpeg", "image/ktx2"].includes(mimeType)
+        !["image/png", "image/jpeg", "image/webp", "image/ktx2"].includes(mimeType)
       )
-        fail("TEXTURE", "Supply encoded PNG/JPEG or BasisU KTX2 bytes");
+        fail("TEXTURE", "Supply encoded PNG/JPEG/WebP or BasisU KTX2 bytes");
       array(bytes, bytes.length, "image bytes");
       const png =
         bytes.length >= 8 && [137, 80, 78, 71, 13, 10, 26, 10].every((v, i) => bytes[i] === v);
       const jpeg = bytes.length >= 3 && bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255;
       if ((mimeType === "image/png" && !png) || (mimeType === "image/jpeg" && !jpeg))
         fail("TEXTURE", "MIME type disagrees with encoded image");
+      if (mimeType === "image/webp") {
+        // Do not invoke a decoder or let a valid signature disguise animation,
+        // ICC/EXIF-dependent semantics, inconsistent dimensions or bad extents.
+        // Bound encoded work before checking/copying the caller's image bytes.
+        if (bytes.length > maxBytes) fail("LIMIT", "Encoded image exceeds GLB byte budget");
+        gltfWebpDimensions(bytes);
+        requireExtension("EXT_texture_webp");
+      }
       if (mimeType === "image/ktx2") {
         // No image decode takes place during export. Reuse the container checks,
         // allowing dimensions beyond the runtime uploader's default pixel limit.
@@ -764,7 +775,9 @@ export async function exportAnimationPoseGLB(pose, entries, options = {}) {
         sampler: samplers.get(key),
         ...(mimeType === "image/ktx2"
           ? { extensions: { KHR_texture_basisu: { source: image.index } } }
-          : { source: image.index }),
+          : mimeType === "image/webp"
+            ? { extensions: { EXT_texture_webp: { source: image.index } } }
+            : { source: image.index }),
       });
     }
   }

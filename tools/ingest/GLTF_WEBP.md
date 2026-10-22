@@ -59,12 +59,33 @@ Source export checks encoded signatures and resource closure, not pixel validity
 A successful repack is not a claim that a renderer supports every source image's
 profile. The runtime upload profile above remains deliberately narrower.
 
+## Posed export
+
+`exportAnimationPoseGLB` and model `exportPoseGLB` accept encoded `image/webp`
+from the existing texture resolver. They preserve those bytes, independent map
+UVs, material alpha, normal scales and sampler settings. The GLB uses an
+`EXT_texture_webp` image reference and declares the extension both used and
+required; it does not fabricate a PNG fallback or write WebP as a core source.
+
+The same still-image header/profile checks used before uploading apply before
+embedding WebP. This path does not decode, re-encode, read back GPU pixels, or
+validate the entropy-coded bitstream. Existing GLB byte budgets and cancellation
+remain in force. Posed export captures static world-space geometry and materials
+before image resolution; it is not an editable rig/animation export. Use authored
+export above to preserve the full source asset and its alternative image sources.
+
 ## Tests
 
-`node --test tools/ingest/gltf_webp.test.mjs tools/ingest/gltf_webp_pipeline.test.mjs`
+```sh
+node --test tools/ingest/gltf_webp.test.mjs \
+  tools/ingest/gltf_webp_pipeline.test.mjs \
+  tools/ingest/animation_pose_webp_export.test.mjs
+```
 
 The fixtures include native-encoded lossy, lossless, alpha and XMP WebP with
 independently decoded expected RGBA. Tests exercise image headers, route selection,
 MIME constraints, actual HTTP streams, source GLB round trips and GPU command/
-cleanup boundaries. Recorded GPU commands do not establish native rendered-pixel
-or performance equivalence.
+cleanup boundaries. Posed-export tests independently inspect real emitted GLB
+chunks, extension references, attributes, image bytes and cancellation behavior.
+Recorded GPU commands do not establish native rendered-pixel or performance
+equivalence.
