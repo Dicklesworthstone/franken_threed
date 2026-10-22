@@ -8,6 +8,7 @@ on:
       - 'tools/ingest/three_environment.test.mjs'
       - 'tools/ingest/three_cube_environment.test.mjs'
       - 'tools/ingest/three_image_environment.test.mjs'
+      - 'tools/ingest/three_ldr_environment.test.mjs'
       - 'tools/ingest/three_textures.mjs'
       - 'tools/ingest/animation_environment.mjs'
       - '.github/workflows/source-cube-environment.yml'
@@ -31,3 +32,4 @@ jobs:
           tools/ingest/three_environment.test.mjs
           tools/ingest/three_cube_environment.test.mjs
           tools/ingest/three_image_environment.test.mjs
+          tools/ingest/three_ldr_environment.test.mjs

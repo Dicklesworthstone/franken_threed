@@ -1,4 +1,4 @@
-/** Source-owned HDR panoramas and data/image cubemaps for the native GGX environment renderer.
+/** Source-owned HDR/LDR panoramas and data/image cubemaps for the native GGX environment renderer.
  * The source Texture and pixels are borrowed. Preparation copies current ready
  * pixels and filters once; needsUpdate/identity changes require a new owner.
  * This is the core's explicit GGX/DFG profile, not Three PMREM pixel parity.
@@ -22,17 +22,21 @@ const same = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]);
 export function inspectThreeEnvironment(texture, three, {maxPixels = 16 * 1024 * 1024} = {}) {
   if (texture?.isF3DSceneEnvironment === true) return inspectSceneCapture(texture, three, maxPixels);
   if (texture?.isCubeTexture === true) return inspectCubeEnvironment(texture, three, maxPixels);
+  if (texture?.type === three?.UnsignedByteType && texture?.isDataTexture !== true)
+    return inspectImagePanorama(texture, three, maxPixels);
   if (three?.REVISION !== '186' || typeof three.DataTexture !== 'function' ||
       !(texture instanceof three.DataTexture) || texture.isCubeTexture || texture.isRenderTargetTexture)
     fail('SOURCE', 'Supply a ready r186 DataTexture panorama');
   integer(maxPixels, 1, Number.MAX_SAFE_INTEGER, 'pixel budget');
-  const half = texture.type === three.HalfFloatType;
-  if ((!half && texture.type !== three.FloatType) || texture.format !== three.RGBAFormat ||
+  const half = texture.type === three.HalfFloatType, byte = texture.type === three.UnsignedByteType;
+  const srgb = texture.colorSpace === three.SRGBColorSpace;
+  if ((!half && !byte && texture.type !== three.FloatType) || texture.format !== three.RGBAFormat ||
       texture.internalFormat !== null || texture.compareFunction != null)
-    fail('FORMAT', 'Expected RGBA half-float or float storage without internal overrides');
+    fail('FORMAT', 'Expected RGBA half-float, float or unsigned-byte storage without internal overrides');
   if (texture.mapping !== three.EquirectangularReflectionMapping ||
-      ![three.LinearSRGBColorSpace, three.NoColorSpace].includes(texture.colorSpace))
-    fail('PROFILE', 'Expected a linear-sRGB equirectangular reflection panorama');
+      ![three.LinearSRGBColorSpace, three.NoColorSpace, three.SRGBColorSpace].includes(texture.colorSpace) ||
+      (srgb && !byte))
+    fail('PROFILE', 'Expected a linear HDR or sRGB/linear byte equirectangular reflection panorama');
   if (typeof texture.flipY !== 'boolean' || texture.premultiplyAlpha !== false ||
       ![1, 2, 4, 8].includes(texture.unpackAlignment))
     fail('FORMAT', 'Expected explicit row orientation and unpremultiplied HDR pixels');
@@ -48,11 +52,13 @@ export function inspectThreeEnvironment(texture, three, {maxPixels = 16 * 1024 *
   const height = integer(image?.height, 1, 16384, 'panorama height');
   if (width !== 2 * height || width * height > maxPixels)
     fail('LIMIT', 'Expected a 2:1 panorama within the pixel budget');
-  if (!(data instanceof (half ? Uint16Array : Float32Array)) || !(data.buffer instanceof ArrayBuffer) ||
+  const typed = half ? data instanceof Uint16Array : byte
+    ? data instanceof Uint8Array || data instanceof Uint8ClampedArray : data instanceof Float32Array;
+  if (!typed || !(data.buffer instanceof ArrayBuffer) ||
       data.buffer.resizable || data.length !== width * height * 4)
     fail('STORAGE', 'Expected complete, fixed, unshared RGBA source storage');
   try { new Uint8Array(data.buffer, 0, 0); } catch { fail('STORAGE', 'Source pixels are detached'); }
-  return Object.freeze({texture, source, image, data, half, width, height, sourceBytes: width * height * 8,
+  return Object.freeze({texture, source, image, data, half, byte, srgb, width, height, sourceBytes: width * height * 8,
     signature: Object.freeze([texture, source, image, data, data.buffer, texture.version, source.version,
       texture.type, texture.mapping, texture.colorSpace, texture.flipY, width, height])});
 }
@@ -159,6 +165,57 @@ function inspectImageCube(texture, three, maxPixels, signature) {
     signature: Object.freeze(signature)});
 }
 
+/** Ready TextureLoader/canvas panoramas use the same source pool as image
+ * cubes. Inspect only metadata here; complete sampler admission happens before
+ * the first allocation in uploadImageEnvironment(). No browser pixels are read.
+ */
+function inspectImagePanorama(texture, three, maxPixels) {
+  if (three?.REVISION !== '186' || typeof three.Texture !== 'function' ||
+      !(texture instanceof three.Texture) || ['isDataTexture', 'isCubeTexture', 'isDataArrayTexture',
+        'isData3DTexture', 'isVideoTexture', 'isDepthTexture', 'isCompressedTexture',
+        'isRenderTargetTexture', 'isFramebufferTexture', 'isExternalTexture'].some(key => texture[key]))
+    fail('SOURCE', 'Supply a ready r186 image Texture panorama');
+  integer(maxPixels, 1, Number.MAX_SAFE_INTEGER, 'pixel budget');
+  if (texture.type !== three.UnsignedByteType || texture.format !== three.RGBAFormat ||
+      texture.internalFormat !== null || texture.compareFunction != null)
+    fail('FORMAT', 'Decoded panoramas require RGBA unsigned-byte storage without internal overrides');
+  if (texture.mapping !== three.EquirectangularReflectionMapping ||
+      ![three.LinearSRGBColorSpace, three.NoColorSpace, three.SRGBColorSpace].includes(texture.colorSpace))
+    fail('PROFILE', 'Expected an sRGB/linear equirectangular reflection panorama');
+  if (typeof texture.flipY !== 'boolean' || texture.premultiplyAlpha !== false ||
+      typeof texture.generateMipmaps !== 'boolean' || ![1, 2, 4, 8].includes(texture.unpackAlignment))
+    fail('FORMAT', 'Expected explicit orientation, mip generation and unpremultiplied pixels');
+  if (texture.onUpdate != null || !Array.isArray(texture.updateRanges) || texture.updateRanges.length ||
+      !Array.isArray(texture.mipmaps) || texture.mipmaps.length)
+    fail('PROFILE', 'Upload hooks, partial updates and authored panorama mips need another profile');
+  const image = texture.image, source = texture.source;
+  if (!source || source.dataReady !== true || source.data !== image || image?.complete === false)
+    fail('NOT_READY', 'Provide a decoded panorama before preparation');
+  integer(texture.version, 1, Number.MAX_SAFE_INTEGER, 'texture version');
+  integer(source.version, 0, Number.MAX_SAFE_INTEGER, 'source version');
+  const instance = name => typeof globalThis[name] === 'function' && image instanceof globalThis[name];
+  if (!['HTMLImageElement', 'HTMLCanvasElement', 'OffscreenCanvas', 'ImageBitmap', 'ImageData'].some(instance))
+    fail('SOURCE', 'Use a decoded image, canvas, ImageBitmap or ImageData panorama');
+  if (instance('ImageBitmap') && texture.flipY)
+    fail('PROFILE', 'ImageBitmap panorama orientation must be chosen during decoding (flipY=false)');
+  if (instance('ImageData') && image.colorSpace && image.colorSpace !== 'srgb')
+    fail('PROFILE', 'ImageData panoramas require the sRGB browser-copy profile');
+  const width = integer(image.naturalWidth ?? image.width, 2, 32768, 'panorama image width');
+  const height = integer(image.naturalHeight ?? image.height, 1, 16384, 'panorama image height');
+  if (width !== 2 * height || width * height > maxPixels)
+    fail('LIMIT', 'Expected a 2:1 panorama within the pixel budget');
+  const levels = texture.generateMipmaps ? 1 + Math.floor(Math.log2(width)) : 1;
+  let uploadBytes = 0;
+  for (let level = 0; level < levels; level++)
+    uploadBytes += Math.max(1, width >> level) * Math.max(1, height >> level) * 4;
+  return Object.freeze({texture, source, imagePanorama: true, width, height, uploadBytes,
+    sourceBytes: uploadBytes + width * height * 8,
+    signature: Object.freeze([texture, source, image, texture.version, source.version, texture.type,
+      texture.format, texture.mapping, texture.colorSpace, texture.flipY, width, height,
+      texture.generateMipmaps, texture.minFilter, texture.magFilter, texture.wrapS, texture.wrapT,
+      texture.anisotropy, texture.unpackAlignment, ...(instance('ImageData') ? [image.colorSpace, image.data] : [])])});
+}
+
 /** A PMREMGenerator.fromScene() request from three_renderer.mjs: the capture
  * runs at this owner's preparation boundary (not at the source call). */
 function inspectSceneCapture(texture, three, maxPixels) {
@@ -191,25 +248,39 @@ struct Out { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32> 
   return textureLoad(face_texture, clamp(texel, vec2<i32>(0), vec2<i32>(size) - 1), 0);
 }`;
 
-/** Reuse material/background image residency, then normalize source handedness
- * into the same linear half-float input as data cubes. The source owner handles
- * browser copies, row flips, mipmaps and declared sRGB views. Six exact texel
- * blits exchange X faces, mirror U and apply the native flipY Y-face exchange.
- * There is no CPU image readback,
- * intermediate panorama, source mutation or extra per-frame work is involved.
+// The shared uploader has already applied source flipY. Reverse V once more
+// to map r186's asin(y)/PI+.5 to the filter's north-first acos(y)/PI. Integer
+// fragment coordinates keep every NPOT source texel and alpha unchanged; the
+// source view alone decides sRGB decoding. No sampler or interpolation is used.
+const PANORAMA_BLIT_WGSL = `
+@group(0) @binding(0) var image: texture_2d<f32>;
+@vertex fn vertex_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+  let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+  return vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
+}
+@fragment fn fragment_main(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+  let size = vec2<i32>(textureDimensions(image));
+  return textureLoad(image, vec2<i32>(i32(p.x), size.y - 1 - i32(p.y)), 0);
+}`;
+
+/** Reuse material/background residency for image panoramas and cubes, then
+ * normalize to the linear half-float filter input. The source owner handles
+ * browser copies, row flips, mipmaps and declared sRGB views. Cube blits retain
+ * the X-face exchange/U mirror and native flipY Y-face exchange. Panoramas use
+ * one V-flip pass. No CPU readback, source mutation or per-frame conversion.
  */
-async function uploadImageCube(device, shape, three, maxPixels, signal, check) {
+async function uploadImageEnvironment(device, shape, three, maxPixels, signal, check) {
   const {inspectThreeTexture, createGpuThreeTextures} = await import('./three_textures.mjs');
   check();
   const upload = inspectThreeTexture(shape.texture, three, {maxPixels, maxTextureBytes: shape.uploadBytes,
     maxDimension: device.limits.maxTextureDimension2D, maxLayers: device.limits.maxTextureArrayLayers});
-  if (!upload.cube || upload.data || upload.bytes !== shape.uploadBytes)
-    fail('PREPARE', 'Cube image upload layout changed during preparation');
-  let textures = null, cube = null, rejectStop;
+  if ((upload.cube === true) !== (shape.cube === true) || upload.data || upload.bytes !== shape.uploadBytes)
+    fail('PREPARE', 'Environment image upload layout changed during preparation');
+  let textures = null, normalized = null, rejectStop;
   const stopped = new Promise((_, reject) => { rejectStop = reject; }); stopped.catch(() => {});
-  function release() { textures?.dispose(); textures = null; cube?.destroy(); cube = null; }
+  function release() { textures?.dispose(); textures = null; normalized?.destroy(); normalized = null; }
   function onAbort() {
-    release(); rejectStop(new ThreeEnvironmentError('ABORTED', 'Cube image preparation was aborted'));
+    release(); rejectStop(new ThreeEnvironmentError('ABORTED', 'Environment image preparation was aborted'));
   }
   async function wait(work) { const result = await Promise.race([work, stopped]); check(); return result; }
   async function checked(operation) {
@@ -220,7 +291,7 @@ async function uploadImageCube(device, shape, three, maxPixels, signal, check) {
     const validation = device.popErrorScope(), memory = device.popErrorScope();
     const [result, invalid, oom] = await wait(Promise.all([value, validation, memory]));
     if (thrown) throw thrown;
-    if (invalid || oom) fail('DEVICE', (invalid || oom).message ?? 'Cube image conversion failed');
+    if (invalid || oom) fail('DEVICE', (invalid || oom).message ?? 'Environment image conversion failed');
     return result;
   }
   signal.addEventListener('abort', onAbort, {once: true});
@@ -232,24 +303,25 @@ async function uploadImageCube(device, shape, three, maxPixels, signal, check) {
     await wait(textures.whenIdle());
     const input = textures.nativeTexture(shape.texture);
     const pipeline = await checked(() => {
-      const module = device.createShaderModule({label: 'f3d-environment-image-flip', code: FLIP_BLIT_WGSL});
+      const module = device.createShaderModule({label: 'f3d-environment-image-flip', code: shape.imagePanorama ? PANORAMA_BLIT_WGSL : FLIP_BLIT_WGSL});
       return device.createRenderPipelineAsync({label: 'f3d-environment-image-flip', layout: 'auto',
         vertex: {module, entryPoint: 'vertex_main'},
         fragment: {module, entryPoint: 'fragment_main', targets: [{format: 'rgba16float'}]},
         primitive: {topology: 'triangle-list'}});
     });
     await checked(() => {
-      cube = device.createTexture({label: 'f3d-environment-image-cube', size: [shape.width, shape.height, 6],
+      normalized = device.createTexture({label: shape.imagePanorama ? 'f3d-environment-image-panorama' : 'f3d-environment-image-cube',
+        size: [shape.width, shape.height, shape.imagePanorama ? 1 : 6],
         dimension: '2d', format: 'rgba16float', mipLevelCount: 1, sampleCount: 1, usage: 4 | 16});
       const encoder = device.createCommandEncoder({label: 'f3d-environment-image-flip'});
       // The shared uploader flips rows but preserves source layer identities.
       // Native r186 additionally exchanges Y faces for flipY uploads.
-      const order = shape.texture.flipY ? [1, 0, 3, 2, 4, 5] : [1, 0, 2, 3, 4, 5];
-      for (let layer = 0; layer < 6; layer++) {
+      const order = shape.imagePanorama ? [0] : shape.texture.flipY ? [1, 0, 3, 2, 4, 5] : [1, 0, 2, 3, 4, 5];
+      for (let layer = 0; layer < order.length; layer++) {
         const view = input.createView({format: upload.viewFormat, dimension: '2d', baseMipLevel: 0,
           mipLevelCount: 1, baseArrayLayer: order[layer], arrayLayerCount: 1});
         const group = device.createBindGroup({layout: pipeline.getBindGroupLayout(0), entries: [{binding: 0, resource: view}]});
-        const pass = encoder.beginRenderPass({colorAttachments: [{view: cube.createView({dimension: '2d',
+        const pass = encoder.beginRenderPass({colorAttachments: [{view: normalized.createView({dimension: '2d',
           baseMipLevel: 0, mipLevelCount: 1, baseArrayLayer: layer, arrayLayerCount: 1}),
           loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 0]}]});
         pass.setPipeline(pipeline); pass.setBindGroup(0, group); pass.draw(3); pass.end();
@@ -257,7 +329,7 @@ async function uploadImageCube(device, shape, three, maxPixels, signal, check) {
       device.queue.submit([encoder.finish()]);
     });
     await wait(device.queue.onSubmittedWorkDone());
-    const result = cube; cube = null; return result;
+    const result = normalized; normalized = null; return result;
   } finally { signal.removeEventListener('abort', onAbort); release(); }
 }
 
@@ -360,15 +432,19 @@ function captureCube(shape) {
 }
 
 function capture(shape) {
-  const {data, half, width, height, texture} = shape, pixels = new Uint16Array(width * height * 4);
+  const {data, half, byte, srgb, width, height, texture} = shape, pixels = new Uint16Array(width * height * 4);
   const f = new Float32Array(1), scratch = {f, u: new Uint32Array(f.buffer)};
   for (let y = 0; y < height; y++) {
     // r186 equirectUv uses asin(y)/PI+.5, while the core uses acos(y)/PI.
     // The core's north-first upload therefore reverses UNFLIPPED source rows.
     const row = texture.flipY ? y : height - 1 - y;
     for (let x = 0; x < width * 4; x++) {
-      const v = data[row * width * 4 + x];
+      let v = data[row * width * 4 + x];
       if (half && (v & 0x7c00) === 0x7c00) fail('VALUE', 'HDR pixels contain infinity or NaN');
+      if (byte) {
+        v /= 255;
+        if (srgb && x % 4 < 3) v = v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
+      }
       pixels[y * width * 4 + x] = half ? v : halfBits(v, scratch);
     }
   }
@@ -381,7 +457,7 @@ function capture(shape) {
  */
 export function captureThreeEnvironmentPixels(texture, three, options) {
   const shape = inspectThreeEnvironment(texture, three, options);
-  if (shape.cube || shape.capture) fail('PROFILE', 'Panorama backgrounds require a data panorama');
+  if (shape.cube || shape.capture || shape.imagePanorama) fail('PROFILE', 'Panorama backgrounds require a data panorama');
   return capture(shape);
 }
 
@@ -410,7 +486,7 @@ export async function createGpuThreeEnvironment(device, texture, {
   if (shape.sourceBytes + plan.textureBytes + plan.uniformBytes > maxBytes)
     fail('LIMIT', 'Panorama, filter uniforms and output maps exceed the old-plus-new budget');
   if (signal?.aborted) fail('ABORTED', 'Environment preparation was aborted');
-  const pixels = shape.capture || shape.imageCube ? null : shape.cube ? captureCube(shape) : capture(shape), lifetime = new AbortController();
+  const pixels = shape.capture || shape.imageCube || shape.imagePanorama ? null : shape.cube ? captureCube(shape) : capture(shape), lifetime = new AbortController();
   let input = null, map = null, terminal = null, disposed = false, rejectStop;
   const stopped = new Promise((_, reject) => { rejectStop = reject; }); stopped.catch(() => {});
   function release() {
@@ -437,8 +513,8 @@ export async function createGpuThreeEnvironment(device, texture, {
   try {
     if (signal?.aborted) onAbort(); check();
     let error, errors = [];
-    if (shape.capture || shape.imageCube) {
-      const work = shape.imageCube ? uploadImageCube(device, shape, three, maxPixels, lifetime.signal, check)
+    if (shape.capture || shape.imageCube || shape.imagePanorama) {
+      const work = shape.imageCube || shape.imagePanorama ? uploadImageEnvironment(device, shape, three, maxPixels, lifetime.signal, check)
         : renderSceneCapture(device, shape, three, lifetime.signal);
       const capturing = work.then(value => {
         if (disposed || terminal) { value.destroy(); throw terminal ?? new ThreeEnvironmentError('DISPOSED', 'Environment is disposed'); }
