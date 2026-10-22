@@ -61,6 +61,12 @@ ordering, repeated counts and ArrayCamera views follow the bounded profile in
 [THREE_SPRITES.md](./THREE_SPRITES.md). Source geometry and object matrices remain
 application-owned.
 
+Native `MeshMatcapMaterial` and default `MeshMatcapNodeMaterial` use view-space
+normal capture shading, including the source ramp without a Matcap texture.
+Generated coordinates retain the Matcap texture's live transform independently
+of ordinary maps and do not require a geometry UV channel. See
+[THREE_MATCAP.md](./THREE_MATCAP.md) for the admitted texture and shading behavior.
+
 Color, opacity, emission, MASK alpha thresholds, Phong specular/shininess, PBR factors, shared map
 transforms, transforms, draw ranges, groups, visibility, renderOrder, camera
 layers, light values and LOD selection are live. Prepare after adding a new

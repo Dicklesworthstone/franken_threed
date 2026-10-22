@@ -13,8 +13,10 @@ function number(v) {
   if (typeof v !== 'number' || !Number.isFinite(v)) fail('Texture coordinate controls must be finite numbers');
   return v;
 }
-export function threeTextureCoordinates(texture, three) {
-  const channel = data(texture, 'channel'), auto = data(texture, 'matrixAutoUpdate'), matrix = data(texture, 'matrix');
+export function threeTextureCoordinates(texture, three, {generated = false} = {}) {
+  // TextureNode's getUV context supplies Matcap coordinates independently of
+  // geometry channels, but its live texture matrix still transforms that UV.
+  const channel = generated ? 0 : data(texture, 'channel'), auto = data(texture, 'matrixAutoUpdate'), matrix = data(texture, 'matrix');
   if (!Number.isInteger(channel) || channel < 0 || channel > 3) fail('Texture channel must be an integer in [0,3]');
   if (typeof auto !== 'boolean' || !matrix || Object.getPrototypeOf(matrix) !== three.Matrix3.prototype)
     fail('Expected a native texture matrix and boolean matrixAutoUpdate');

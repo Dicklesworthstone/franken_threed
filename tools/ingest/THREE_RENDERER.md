@@ -38,6 +38,12 @@ polygon offset; ambient/hemisphere/directional/point/spot lights (up to 8); fog;
 one directional/spot shadow; HDR environment/background panoramas; clipping
 planes; textures with transforms.
 
+Native `MeshMatcapMaterial` and default `MeshMatcapNodeMaterial` support generated
+view-space Matcap coordinates, the source fallback ramp, independent color,
+normal and alpha maps, and live Matcap texture transforms. Matcap textures do not
+need a geometry UV attribute; their alpha and channel selector are ignored by the
+pinned source path. See [THREE_MATCAP.md](./THREE_MATCAP.md).
+
 Native sprites accept `SpriteMaterial` and default `SpriteNodeMaterial`, with
 camera-facing transforms, live center/rotation, size attenuation, map/alpha-map
 textures and ordered transparent repeats from `Sprite.count`. ArrayCamera views
@@ -93,7 +99,7 @@ scene/object/material render hooks retain their existing explicit rejection.
 - Not admitted (explicit `F3DRendererError`/`ThreeSceneError`):
   XR, custom tone mapping, logarithmic/reversed depth, non-sRGB
   output, custom node graphs, the remaining physical-material extensions,
-  MeshMatcap/Depth materials,
+  MeshDepth materials,
   transparent clears with tone mapping.
 - Upstream passes non-one factors with Min/Max blend equations, which WebGPU
   rejects; this renderer keeps the GL meaning.

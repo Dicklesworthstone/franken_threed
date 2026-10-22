@@ -85,6 +85,7 @@ async function capture(kind, name) {
 const WEBGPU_ONLY = new Set(["node_materials", "pbr_maps_independent", "pbr_maps_updates", "pbr_maps_layers",
   "native_sprites", "native_sprites_orthographic", "native_sprites_updates", "native_sprites_array_camera",
   "native_render_mips", "native_render_mips_updates",
+  "native_matcap_materials", "native_matcap_updates", "native_matcap_instanced",
   "array_camera_views", "array_camera_dpr", "array_camera_background", "array_camera_overlap",
   "physical_clearcoat_lights", "physical_clearcoat_maps", "physical_clearcoat_emission",
   "physical_specular_factors", "physical_specular_maps", "physical_specular_updates"]);

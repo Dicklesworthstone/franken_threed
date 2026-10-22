@@ -116,6 +116,13 @@
  * Omission selects the derivative-smoothed 0.7/1 ramp. All ramp derivatives and
  * samples run before alpha discard or per-fragment light exits. Toon shares
  * Phong's punctual falloff but has no specular lobe; prepared IBL is diffuse.
+ * Matcap requires threeLights:true for camera/view coordinates, but receives
+ * no scene lighting. Its optional matcapTexture RGB uses r186's generated
+ * view/normal coordinates; omission selects the source gray ramp. Matcap alpha
+ * is ignored. No geometry UVs are needed for that map, and texture.channel has
+ * no equivalent here: mapChannels/mapCoordinates are rejected for matcapTexture.
+ * Its mapTransforms matrix (or shared uvTransform) applies after generation.
+ * Base color/normal/opacity maps keep their ordinary UV and alpha contracts.
  *
  * Lit frames require lighting: {cameraPosition:[x,y,z], lights:[...]}, at most
  * eight directional/point/spot lights in world space. For orthographic views,
@@ -282,6 +289,8 @@ const PHONG_MAP_FIELDS = Object.freeze(MAP_FIELDS.map((field, slot) =>
   slot === 1 ? "specularTexture" : field));
 const TOON_MAP_FIELDS = Object.freeze(MAP_FIELDS.map((field, slot) =>
   slot === 1 ? "gradientTexture" : field));
+const MATCAP_MAP_FIELDS = Object.freeze(MAP_FIELDS.map((field, slot) =>
+  slot === 1 ? "matcapTexture" : field));
 const PHONG_SPECULAR = Object.freeze([0.005605391621829107, 0.005605391621829107, 0.005605391621829107]);
 const COAT_FIELDS = Object.freeze([
   "clearcoatFactor",
@@ -403,11 +412,13 @@ function surfaceShader(
   premultipliedAlpha = false,
   srgbOutput = false,
   alphaTextureComponent = "g",
+  matcap = false,
 ) {
   // srgbOutput: encode in the shader (r186 sRGBTransferOETF) for a non-sRGB
   // attachment, so fixed-function blending sees encoded values, as WebGL does.
   const encode = value => srgbOutput ? `f3d_srgb_oetf(${value})` : value;
-  const mappedMask = coordinateMask | (textureTransforms ? mapMask & ~(toon ? 2 : 0) : 0);
+  const generatedMask = toon || matcap ? 2 : 0;
+  const mappedMask = coordinateMask | (textureTransforms ? mapMask & ~generatedMask : 0);
   const channel = slot => (channelKey >>> (slot * 2)) & 3;
   const sourceUv = slot => coordinateMask & (1 << slot) ? `uv_${slot}` : channel(slot) ? `uv${channel(slot)}` : "uv";
   const sourceChannels = [1, 2, 3].filter(c => geometryChannels?.['uv' + c]);
@@ -420,7 +431,7 @@ function surfaceShader(
     normalMapped = (mapMask & 4) !== 0,
     coatNormalMapped = (mapMask & 128) !== 0;
   const sourceCoat = threeLights && coated;
-  const sourcePhysical = threeLights && !phong && !toon;
+  const sourcePhysical = threeLights && !phong && !toon && !matcap;
   // Independent PBR/specular maps must fit with coating/opacity maps, fog and
   // batched draw indices. Pack pairs of UVs into vec4
   // varyings in this profile, without changing the legacy shader interfaces.
@@ -443,8 +454,8 @@ function surfaceShader(
   const colorWidth = attributes ? (geometryChannels?.colorSize ?? 4) : 0;
   const occluded = (mapMask & 16) !== 0,
     ambientOcclusion = occluded && (environmentCode !== "" || indirectLights);
-  const names = phong || toon ? MAP_NAMES.map((name, slot) =>
-    slot === 1 ? toon ? "gradient" : "specular" : name) : MAP_NAMES;
+  const names = phong || toon || matcap ? MAP_NAMES.map((name, slot) =>
+    slot === 1 ? matcap ? "matcap" : toon ? "gradient" : "specular" : name) : MAP_NAMES;
   const declarations = mapSlots(mapMask)
     .map(
       (slot) =>
@@ -452,17 +463,30 @@ function surfaceShader(
     )
     .join("\n");
   const coordinates = (slot) => (mappedMask & (1 << slot) ? `input.${uvOutput(slot)}` : "input.uv");
-  const samples = mapSlots(toon ? mapMask & ~2 : mapMask)
+  const samples = mapSlots(mapMask & ~generatedMask)
     .map(
       (slot) =>
         `let ${names[slot]}_texel = textureSample(${names[slot]}_texture, ${names[slot]}_sampler, ${coordinates(slot)});`,
     )
     .join("\n  ");
+  const matcapColor = matcap ? /* wgsl */ `// r186 MatcapUV: perspective view direction is normalized -positionView;
+  // the orthographic direction is constant, independent of fragment position.
+  let view_position = vec3<f32>(dot(lighting.view_x, vec4<f32>(input.world, 1.0)), dot(lighting.view_y, vec4<f32>(input.world, 1.0)), dot(lighting.view_z, vec4<f32>(input.world, 1.0)));
+  var matcap_view = unit_vector(-view_position);
+  if (lighting.camera.w > 0.0) { matcap_view = vec3<f32>(0.0, 0.0, 1.0); }
+  let matcap_normal = unit_vector(vec3<f32>(dot(lighting.view_x.xyz, normal), dot(lighting.view_y.xyz, normal), dot(lighting.view_z.xyz, normal)));
+  let matcap_x = unit_vector(vec3<f32>(matcap_view.z, 0.0, -matcap_view.x));
+  let matcap_y = cross(matcap_view, matcap_x);
+  let matcap_uv = vec2<f32>(dot(matcap_x, matcap_normal), dot(matcap_y, matcap_normal)) * 0.495 + vec2<f32>(0.5);
+  ${mapMask & 2 ? `// TextureNode applies the texture matrix after its generated UV context.
+  let matcap_coordinate = vec2<f32>(dot(${textureTransforms ? "draw_info.map_uv[2]" : "draw_info.uv_x"}.xyz, vec3<f32>(matcap_uv, 1.0)), dot(${textureTransforms ? "draw_info.map_uv[3]" : "draw_info.uv_y"}.xyz, vec3<f32>(matcap_uv, 1.0)));
+  let matcap_color = textureSample(matcap_texture, matcap_sampler, matcap_coordinate).rgb;` : "let matcap_color = vec3<f32>(mix(0.2, 0.8, matcap_uv.y));"}
+  let rgb = rgba.rgb * matcap_color;` : "";
   const lighting = lit
     ? /* wgsl */ `
 struct Light { vector: vec4<f32>, radiance: vec4<f32>, direction: vec4<f32>, cone: vec4<f32> }
 struct Lighting { camera: vec4<f32>, light_params: vec4<f32>, lights: array<Light, 8>${threeLights ? ", view_x: vec4<f32>, view_y: vec4<f32>, view_z: vec4<f32>" : ""} }
-@group(${textured ? 2 : 1}) @binding(0) var<uniform> lighting: Lighting;${threeLights ? animationDfgWgsl() : ""}
+@group(${textured ? 2 : 1}) @binding(0) var<uniform> lighting: Lighting;${threeLights && !matcap ? animationDfgWgsl() : ""}
 ${shadowed ? projectedShadowWgsl(textured ? 2 : 1, threeLights) : ""}${environmentCode ? "\n" + environmentCode : ""}
 fn unit_vector(v: vec3<f32>) -> vec3<f32> {
   let scale = max(max(abs(v.x), abs(v.y)), abs(v.z));
@@ -470,7 +494,7 @@ fn unit_vector(v: vec3<f32>) -> vec3<f32> {
   let scaled = v / scale;
   return scaled * inverseSqrt(dot(scaled, scaled));
 }
-fn illuminate(base: vec3<f32>, position: vec3<f32>, normal: vec3<f32>, metallic: f32, roughness: f32, emission: vec3<f32>${ambientOcclusion ? ", occlusion: f32" : ""}${phong ? ", specular_strength: f32" : ""}${sourcePhysical ? ", specular_color: vec3<f32>, specular_f90: f32" : ""}${sourceCoat ? ", specular_lobe: bool, shadow_normal: vec3<f32>" : ""}) -> vec3<f32> {
+${matcap ? "" : `fn illuminate(base: vec3<f32>, position: vec3<f32>, normal: vec3<f32>, metallic: f32, roughness: f32, emission: vec3<f32>${ambientOcclusion ? ", occlusion: f32" : ""}${phong ? ", specular_strength: f32" : ""}${sourcePhysical ? ", specular_color: vec3<f32>, specular_f90: f32" : ""}${sourceCoat ? ", specular_lobe: bool, shadow_normal: vec3<f32>" : ""}) -> vec3<f32> {
   var view = unit_vector(lighting.camera.xyz - position);
   if (lighting.camera.w > 0.0) { view = lighting.camera.xyz; }
   let nv = max(dot(normal, view), 0.0);${threeLights ? `
@@ -595,6 +619,7 @@ fn illuminate(base: vec3<f32>, position: vec3<f32>, normal: vec3<f32>, metallic:
   }
   return result;
 }
+`}
 `
     : "";
   return /* wgsl */ `
@@ -671,10 +696,10 @@ struct VertexOutput {
       : ""
   }
   ${mapMask & 256 ? "var" : "let"} rgba = draw_info.color * input.color ${mapMask & 1 ? "* color_texel" : ""};${mapMask & 256 ? `\n  // Native r186 MaterialNode converts its opacity vec4 to float through red;\n  // the explicit/WebGL profile keeps its green-component contract.\n  rgba.a *= alpha_texel.${alphaTextureComponent};` : ""}
-  ${toon ? "// Toon derivatives run before alpha discard, including instanced MASK draws." : "if (draw_info.options.x >= 0.0 && rgba.a < draw_info.options.x) { discard; }"}
+  ${toon || matcap ? "// Generated-map derivatives/samples run before alpha discard, including instanced MASK draws." : "if (draw_info.options.x >= 0.0 && rgba.a < draw_info.options.x) { discard; }"}
   ${
     lit
-      ? `var normal = ${flat ? "flat_normal" : "unit_vector(input.normal)"};${coated ? "\n  var coat_normal = normal;" : ""}${threeLights && !phong && !toon ? "\n  let input_geometry_normal = normal;" : ""}
+      ? `var normal = ${flat ? "flat_normal" : "unit_vector(input.normal)"};${coated ? "\n  var coat_normal = normal;" : ""}${sourcePhysical ? "\n  let input_geometry_normal = normal;" : ""}
   ${
     normalMapped
       ? `${
@@ -710,7 +735,7 @@ struct VertexOutput {
       : ""
   }
   ${coatNormalMapped ? clearcoatNormalCode(derivative) + "\n  " : ""}${flat ? "" : "normal *= select(-1.0, 1.0, front);"}${coated && !flat ? "\n  coat_normal *= select(-1.0, 1.0, front);" : ""}
-  let metallic = draw_info.options.w ${!phong && !toon && mapMask & 2 ? "* metallic_roughness_texel.b" : mapMask & (1 << 11) ? "* metallic_texel.b" : ""};
+  ${matcap ? matcapColor : `let metallic = draw_info.options.w ${!phong && !toon && mapMask & 2 ? "* metallic_roughness_texel.b" : mapMask & (1 << 11) ? "* metallic_texel.b" : ""};
   ${sourcePhysical ? `// r186 MeshPhysicalNodeMaterial.setupSpecular and MaterialNode: color RGB
   // modulates dielectric F0 before min(1), intensity uses the map's ALPHA.
   let physical_ratio = (draw_info.physical_specular_params.x - 1.0) / (draw_info.physical_specular_params.x + 1.0);
@@ -768,10 +793,10 @@ struct VertexOutput {
     rgb = rgb * (1.0 - weight) + coat_light * weight;
   }`
       : ""
-  }`
+  }`}`
       : "let rgb = rgba.rgb;"
   }
-  ${toon ? "if (draw_info.options.x >= 0.0 && rgba.a < draw_info.options.x) { discard; }\n  " : ""}${clippingCapacity ? "if (animation_clipped(input.world)) { discard; }\n  " : ""}${depthOnly ? "" : (premultipliedAlpha ? "let output_alpha = select(1.0, rgba.a, draw_info.options.y > 0.0);\n  return vec4<f32>(" + encode(fogCode ? "apply_distance_fog(rgb, input.fog_depth)" : "rgb") + " * output_alpha, output_alpha);" : "return vec4<f32>(" + encode(fogCode ? "apply_distance_fog(rgb, input.fog_depth)" : "rgb") + ", select(1.0, rgba.a, draw_info.options.y > 0.0));")}
+  ${toon || matcap ? "if (draw_info.options.x >= 0.0 && rgba.a < draw_info.options.x) { discard; }\n  " : ""}${clippingCapacity ? "if (animation_clipped(input.world)) { discard; }\n  " : ""}${depthOnly ? "" : (premultipliedAlpha ? "let output_alpha = select(1.0, rgba.a, draw_info.options.y > 0.0);\n  return vec4<f32>(" + encode(fogCode ? "apply_distance_fog(rgb, input.fog_depth)" : "rgb") + " * output_alpha, output_alpha);" : "return vec4<f32>(" + encode(fogCode ? "apply_distance_fog(rgb, input.fog_depth)" : "rgb") + ", select(1.0, rgba.a, draw_info.options.y > 0.0));")}
 }
 `;
 }
@@ -1481,7 +1506,7 @@ struct Out { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 };
     const drawLayout = nativeInstances && instancing ? instanceUniformLayout : uniformLayout;
     const coated = variant.includes("coat-");
     const phong = variant.includes("phong-"), flat = variant.includes("flat-");
-    const toon = variant.includes("toon-");
+    const toon = variant.includes("toon-"), matcap = variant.includes("matcap-");
     // Defaults preserve the pre-existing direct API (BLEND disables depth
     // writes). Explicit state is part of the pipeline and therefore bundle key.
     const state = Number(/state-(\d+)-/.exec(variant)?.[1] ?? 3);
@@ -1557,8 +1582,8 @@ struct Out { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 };
               derivative,
               coordinateMask,
               format === null,
-              shadowed,
-              environmentLit ? environmentReceiver.environmentLightingWgsl(textured ? 2 : 1, threeLights && !phong && !toon) : "",
+              shadowed && !matcap,
+              environmentLit && !matcap ? environmentReceiver.environmentLightingWgsl(textured ? 2 : 1, threeLights && !phong && !toon) : "",
               instancing && !nativeInstances ? stride : 0,
               coated,
               geometry?.channels,
@@ -1575,6 +1600,7 @@ struct Out { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 };
               raster?.premultipliedAlpha ?? false,
               srgbOutput,
               alphaTextureComponent,
+              matcap,
             )
           : ANIMATION_RENDER_WGSL,
     });
@@ -1876,6 +1902,7 @@ struct Out { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 };
         "shininess",
         "specularTexture",
         "gradientTexture",
+        "matcapTexture",
         "metallicFactor",
         "roughnessFactor",
         "emissiveFactor",
@@ -1944,16 +1971,16 @@ struct Out { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 };
     if (comparison < 0) fail("ANIMATION_RENDER_OPTIONS", "Unsupported depth comparison");
     const rgba = Float64Array.from(color(baseColor)),
       shading = options.shading ?? "unlit";
-    const mode = ["unlit", "lambert", "metallic-roughness", "phong", "toon", "normal"].indexOf(shading),
+    const mode = ["unlit", "lambert", "metallic-roughness", "phong", "toon", "normal", "matcap"].indexOf(shading),
       lit = mode > 0;
-    const phong = mode === 3, toon = mode === 4, flat = options.flatShading ?? false;
-    if (mode === 5 && !threeLights)
-      fail("ANIMATION_RENDER_OPTIONS", "View-space normal shading requires the Three.js light profile");
+    const phong = mode === 3, toon = mode === 4, matcap = mode === 6, flat = options.flatShading ?? false;
+    if ((mode === 5 || matcap) && !threeLights)
+      fail("ANIMATION_RENDER_OPTIONS", "View-space normal/Matcap shading requires the Three.js light profile");
     if (typeof flat !== "boolean" || (flat && !lit) || options.flatShading === null)
       fail("ANIMATION_RENDER_OPTIONS", "flatShading requires a lit material and a boolean");
     if (
       mode < 0 ||
-      (!lit && options.emissiveFactor !== undefined) ||
+      ((!lit || matcap) && options.emissiveFactor !== undefined) ||
       (mode !== 2 &&
         (options.metallicFactor !== undefined || options.roughnessFactor !== undefined)) ||
       (!phong && (options.shininess !== undefined || options.specularTexture != null)) ||
@@ -1961,14 +1988,15 @@ struct Out { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 };
         options.specularIntensityTexture != null || options.specularColorTexture != null ||
         options.metallicTexture != null || options.roughnessTexture != null ||
         (!phong && options.specularColor !== undefined))) ||
-      ((phong || toon) && options.metallicRoughnessTexture != null) ||
-      (!toon && options.gradientTexture != null)
+      ((phong || toon || matcap) && options.metallicRoughnessTexture != null) ||
+      (!toon && options.gradientTexture != null) ||
+      (!matcap && options.matcapTexture != null)
     )
       fail("ANIMATION_RENDER_OPTIONS", "Material parameters do not apply to shading model");
     if (format === null && (lit || alphaMode === "BLEND"))
       fail("ANIMATION_RENDER_OPTIONS", "Depth-only materials must be unlit OPAQUE or MASK");
     // Snapshot every borrowed resource descriptor before the first await.
-    const mapFields = toon ? TOON_MAP_FIELDS : phong ? PHONG_MAP_FIELDS : MAP_FIELDS;
+    const mapFields = matcap ? MATCAP_MAP_FIELDS : toon ? TOON_MAP_FIELDS : phong ? PHONG_MAP_FIELDS : MAP_FIELDS;
     const textures = mapFields.map((field) => {
       const descriptor = options[field];
       if (descriptor == null) return null;
@@ -2004,7 +2032,8 @@ struct Out { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 };
     const layoutKey = mapMask | (coated ? COAT_LAYOUT : 0);
     if (
       (!lit && mapMask & 30) ||
-      (mode !== 2 && !phong && !toon && mapMask & 2) ||
+      (mode !== 2 && !phong && !toon && !matcap && mapMask & 2) ||
+      (matcap && mapMask & 24) ||
       (!(mapMask & 4) && options.normalScale !== undefined) ||
       (!(mapMask & 16) && options.occlusionStrength !== undefined)
     ) {
@@ -2043,7 +2072,7 @@ struct Out { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 };
     )
       fail("ANIMATION_RENDER_VALUE", "Invalid material factors");
     if (lit) {
-      if (rgba.some((v) => v > 1))
+      if (!matcap && rgba.some((v) => v > 1))
         fail("ANIMATION_RENDER_VALUE", "Lit reflectance factors must be in [0,1]");
       // Flat shading never reads vertex normals: mutable geometry omits the
       // input, and the fixed 40-byte deformer/rigid stride keeps an unread slot.
@@ -2096,9 +2125,10 @@ struct Out { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 };
       data.set(indices);
     }
     const { texCoords = null, vertexColors = null } = options;
-    // The toon ramp is indexed by lighting angle, never a geometry UV. A ramp
-    // alone binds no synthetic UV/color stream, including mutable geometry.
-    const noSurface = toon && mapMask === 2 && (mutable
+    // Toon and Matcap coordinates are generated from lighting/view normals.
+    // Their maps alone bind no synthetic UV/color stream, including mutable geometry.
+    const generatedMask = toon || matcap ? 2 : 0;
+    const noSurface = generatedMask && mapMask === 2 && (mutable
       ? !mutable.channels.uv && !(geometryColors && mutable.channels.colorSize)
       : texCoords === null && vertexColors === null);
     const transform = Float64Array.from(uvTransform(options.uvTransform ?? UV_IDENTITY));
@@ -2113,14 +2143,14 @@ struct Out { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 };
     if (!textureTransforms && (options.mapTransforms !== undefined || options.mapChannels !== undefined))
       fail("ANIMATION_RENDER_OPTIONS", "Enable textureTransforms before supplying map transforms/channels");
     const mapDefaults = textureTransforms ? snapshotAnimationMapTransforms(options.mapTransforms, mapFields, mapMask, toon ? 2 : 0, uvSlots) : null;
-    const channelKey = textureTransforms ? animationMapChannelKey(options.mapChannels, mapFields, mapMask, mutable?.channels, toon ? 2 : 0, uvSlots) : 0;
+    const channelKey = textureTransforms ? animationMapChannelKey(options.mapChannels, mapFields, mapMask, mutable?.channels, generatedMask, uvSlots) : 0;
     const coordinateInput = options.mapCoordinates ?? {};
     keys(coordinateInput, mapFields, "map coordinates");
     const coordinates = [];
     for (const [slot, field] of mapFields.entries())
       if (Object.hasOwn(coordinateInput, field)) {
-        if (toon && slot === 1)
-          fail("ANIMATION_RENDER_OPTIONS", "Toon gradient coordinates come from lighting, not UVs");
+        if (generatedMask && slot === 1)
+          fail("ANIMATION_RENDER_OPTIONS", "Toon/Matcap coordinates are generated, not geometry UVs");
         if (!(mapMask & (1 << slot)))
           fail("ANIMATION_RENDER_OPTIONS", `Coordinates require ${field}`);
         const input = coordinateInput[field];
@@ -2140,8 +2170,8 @@ struct Out { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 };
       limit("maxInterStageShaderVariables", 5 + Math.ceil(varyings.length / 2) + Number(fog) + Number(instancing && !instances));
     }
     if (!packedMapUvs && instancing && !instances && (mapMask & 256)) limit("maxInterStageShaderVariables", 16);
-    if (!packedMapUvs && textureTransforms && (mapMask & ~(toon ? 2 : 0)))
-      limit("maxInterStageShaderVariables", 6 + mapSlots(mapMask & ~(toon ? 2 : 0)).at(-1));
+    if (!packedMapUvs && textureTransforms && (mapMask & ~generatedMask))
+      limit("maxInterStageShaderVariables", 6 + mapSlots(mapMask & ~generatedMask).at(-1));
     if (coordinates.length) {
       const needed = mapMask & SEPARATE_PBR_MAPS ? 5 + coordinates.length : 6 + coordinates.at(-1).slot;
       limit("maxVertexAttributes", needed);
@@ -2162,6 +2192,7 @@ struct Out { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 };
       (side === "back" ? "back-" : "") +
       (phong ? "phong-" : "") +
       (toon ? "toon-" : "") +
+      (matcap ? "matcap-" : "") +
       (flat ? "flat-" : "") +
       (noSurface ? "no-surface-" : "") +
       (coated ? "coat-" : "") +
@@ -2188,7 +2219,7 @@ struct Out { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 };
       surfaceBuffer = null,
       textureGroup = null,
       coatBuffer = null;
-    for (const slot of mapSlots(mapMask & ~coordinateMask & ~(toon ? 2 : 0))) {
+    for (const slot of mapSlots(mapMask & ~coordinateMask & ~generatedMask)) {
       const channel = (channelKey >>> (slot * 2)) & 3;
       if (mutable ? !mutable.channels[channel ? 'uv' + channel : 'uv'] : texCoords === null)
         fail("ANIMATION_RENDER_GEOMETRY", "Material textures require their selected UV coordinates");
@@ -2708,7 +2739,7 @@ struct Out { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 };
           staged[offset + 31] = determinant < 0 ? -1 : 1;
         }
         if (
-          (!record.lit && input.emissiveFactor !== undefined) ||
+          ((!record.lit || record.mode === 6) && input.emissiveFactor !== undefined) ||
           (record.mode !== 2 &&
             (input.metallicFactor !== undefined || input.roughnessFactor !== undefined)) ||
           (record.mode !== 3 && input.shininess !== undefined) ||
@@ -2721,7 +2752,7 @@ struct Out { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 };
         if (record.lit) {
           if (lighting === null)
             fail("ANIMATION_RENDER_LIGHT", "Lit draws require explicit frame lighting");
-          if (rgba.some((v) => v > 1))
+          if (record.mode !== 6 && rgba.some((v) => v > 1))
             fail("ANIMATION_RENDER_VALUE", "Lit reflectance factors must be in [0,1]");
           for (let k = 0; k < 16; k++) {
             if (!Number.isFinite(Math.fround(world[k])))

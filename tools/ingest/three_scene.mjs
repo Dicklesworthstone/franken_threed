@@ -168,7 +168,8 @@ export async function createGpuThreeScene(device,scene,{
     ...[['MeshBasicNodeMaterial','unlit'],['MeshLambertNodeMaterial','lambert'],['MeshPhongNodeMaterial','phong'],
       ['MeshToonNodeMaterial','toon'],['MeshStandardNodeMaterial','metallic-roughness'],['LineBasicNodeMaterial','unlit'],
       ['PointsNodeMaterial','unlit'],['SpriteNodeMaterial','unlit'],['MeshPhysicalMaterial','metallic-roughness'],['MeshPhysicalNodeMaterial','metallic-roughness'],
-      ['MeshNormalMaterial','normal'],['MeshNormalNodeMaterial','normal']].filter(([name])=>typeof three[name]==='function').map(([name,model])=>[three[name].prototype,model]),
+      ['MeshNormalMaterial','normal'],['MeshNormalNodeMaterial','normal'],
+      ['MeshMatcapMaterial','matcap'],['MeshMatcapNodeMaterial','matcap']].filter(([name])=>typeof three[name]==='function').map(([name,model])=>[three[name].prototype,model]),
   ]);
   const geometries=new Map(),instances=new Map(),materials=new Map(),deformations=new Map();
   const pendingDeformations=new Set(),deformationLifetime=new AbortController();
@@ -789,7 +790,7 @@ export async function createGpuThreeScene(device,scene,{
       // GL point sizes need the program route; elsewhere the core path renders
       // what it admits and the ShaderLib program covers what it rejects.
       // GL point sizes, dashed lines (lineDistance) and line loops need their programs.
-      if(m.isPointsMaterial||m.isLineDashedMaterial||object.isLineLoop||object.isSprite)return programDescription(m,topology,object);
+      if(m.isPointsMaterial||m.isLineDashedMaterial||m.isMeshMatcapMaterial||object.isLineLoop||object.isSprite)return programDescription(m,topology,object);
       // Keep GL stencil conversion on its existing ShaderLib route. The core
       // material mapper below follows WebGPU's unsigned reference contract.
       if(m.stencilWrite&&stencilAttachment)return programDescription(m,topology,object);
@@ -844,7 +845,7 @@ export async function createGpuThreeScene(device,scene,{
     }
     if(m.isNodeMaterial){
       for(const key of Object.keys(m))if(key.endsWith('Node')&&m[key]!==null)fail('MATERIAL',`Custom ${key} on ${m.type} requires the node shader path`);
-      if(shading!=='unlit'&&shading!=='normal'&&m.lights!==true)fail('MATERIAL','Node materials with lights disabled are not admitted');
+      if(!['unlit','normal','matcap'].includes(shading)&&m.lights!==true)fail('MATERIAL','Node materials with lights disabled are not admitted');
     }
     if(m.onBeforeRender!==three.Material.prototype.onBeforeRender||m.onBeforeCompile!==three.Material.prototype.onBeforeCompile||
         m.customProgramCacheKey!==(m.isNodeMaterial?three.NodeMaterial:three.Material).prototype.customProgramCacheKey)fail('HOOK','Custom material shader/render hooks require their original component');
@@ -892,19 +893,20 @@ export async function createGpuThreeScene(device,scene,{
       }
     }
     if(options.alphaTest)values.alphaCutoff=m.alphaTest;
-    if(shading!=='unlit'&&shading!=='normal')values.emissiveFactor=rgb(m.emissive).map(v=>v*m.emissiveIntensity);
+    if(!['unlit','normal','matcap'].includes(shading))values.emissiveFactor=rgb(m.emissive).map(v=>v*m.emissiveIntensity);
     if(shading==='phong'){values.specularColor=rgb(m.specular);values.shininess=m.shininess;}
     if(shading==='metallic-roughness'){values.metallicFactor=m.metalness;values.roughnessFactor=m.roughness;}
     let transform=null;const textureKey=[],mapChannels={},mapTransforms={};
     function texture(t,field){
-      if(!(t instanceof three.Texture)||t.isCubeTexture||t.isVideoTexture||(!textureTransforms&&t.channel!==0))fail('TEXTURE','Expected a current, ordinary UV0 texture binding');
+      const generated=field==='matcapTexture';
+      if(!(t instanceof three.Texture)||t.isCubeTexture||t.isVideoTexture||(!generated&&!textureTransforms&&t.channel!==0))fail('TEXTURE','Expected a current, ordinary UV0 texture binding');
       const binding=textureBinding(t);
       if(binding.sampleType&&binding.sampleType!=='float')fail('TEXTURE','Unfilterable float textures need the program route');
       options[field]={view:binding.view,sampler:binding.sampler};textureKey.push(field,t,binding.view,binding.sampler);
       if(textureTransforms&&field!=='gradientTexture'){
-        const coordinate=uvApi.threeTextureCoordinates(t,three);
-        mapChannels[field]=coordinate.channel;mapTransforms[field]=coordinate.transform;
-        textureKey.push(coordinate.channel);
+        const coordinate=uvApi.threeTextureCoordinates(t,three,{generated});
+        if(!generated){mapChannels[field]=coordinate.channel;textureKey.push(coordinate.channel);}
+        mapTransforms[field]=coordinate.transform;
       }else if(field!=='gradientTexture'){
         if(t.matrixAutoUpdate)t.updateMatrix();const e=t.matrix.elements,next=[e[0],e[1],e[3],e[4],e[6],e[7]];
         if(transform&&!same(transform,next))fail('TEXTURE','Independent mutable map transforms require an extended geometry profile');
@@ -912,6 +914,7 @@ export async function createGpuThreeScene(device,scene,{
       }
     }
     for(const [source,field] of MAPS)if(m[source])texture(m[source],field);
+    if(shading==='matcap'&&m.matcap)texture(m.matcap,'matcapTexture');
     if(coat)for(const [source,field] of COAT_MAPS)if(m[source])texture(m[source],field);
     if(nativePhysical)for(const [source,field] of PHYSICAL_SPECULAR_MAPS)if(m[source])texture(m[source],field);
     if(m.metalnessMap||m.roughnessMap){
@@ -933,7 +936,7 @@ export async function createGpuThreeScene(device,scene,{
     if(transform)values.uvTransform=transform;
     for(const [key,value] of Object.entries(values))for(const word of Array.isArray(value)?value:[value])
       if(!Number.isFinite(Math.fround(finite(word,key))))fail('VALUE',`${key} exceeds the material f32 profile`);
-    if(values.baseColor.some(v=>v<0)||m.opacity>1||(shading!=='unlit'&&values.baseColor.some(v=>v>1))||
+    if(values.baseColor.some(v=>v<0)||m.opacity>1||(!['unlit','matcap'].includes(shading)&&values.baseColor.some(v=>v>1))||
         values.emissiveFactor?.some(v=>v<0)||values.specularColor?.some(v=>v<0)||values.shininess<0||
         values.metallicFactor<0||values.metallicFactor>1||values.roughnessFactor<0||values.roughnessFactor>1||
         values.occlusionStrength<0||values.occlusionStrength>1)fail('VALUE','Source material is outside the admitted factor profile');
