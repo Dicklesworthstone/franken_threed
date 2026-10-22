@@ -38,6 +38,13 @@ polygon offset; ambient/hemisphere/directional/point/spot lights (up to 8); fog;
 one directional/spot shadow; HDR environment/background panoramas; clipping
 planes; textures with transforms.
 
+Standard and Physical materials, including their default node-material forms,
+accept independent `metalnessMap` and `roughnessMap` textures with their own
+UV channels and live transforms. Either can be used alone. Shared textures use
+the combined binding; replacing a map or changing its channel triggers the
+ordinary preparation path. Metalness reads blue and roughness reads green,
+matching pinned r186.
+
 Native `MeshPhysicalMaterial` and `MeshPhysicalNodeMaterial` with null node slots
 support IOR, specular intensity/color and their two independent maps, with
 intensity from alpha and color from RGB. Factors remain live per draw; direct

@@ -52,7 +52,8 @@
  * with metallicFactor/roughnessFactor in [0,1] (both default 1) and an explicit
  * perceptual roughness floor of 0.045. Lit materials accept emissiveFactor RGB.
  * Lit materials also accept normalTexture and emissiveTexture; metallic-roughness
- * accepts metallicRoughnessTexture. Each is a borrowed {view, sampler}, like
+ * accepts metallicRoughnessTexture. The native Three profile also accepts
+ * independent metallicTexture / roughnessTexture (blue / green). Each is a borrowed {view, sampler}, like
  * baseColorTexture. Maps inherit texCoords and uvTransform by default. Optional
  * mapCoordinates[field]={texCoords?,uvTransform?} selects independent static UVs
  * for an existing map. Its local transform is baked once into the surface stream;
@@ -270,6 +271,8 @@ const MAP_FIELDS = Object.freeze([
   "alphaTexture",
   "specularIntensityTexture",
   "specularColorTexture",
+  "metallicTexture",
+  "roughnessTexture",
 ]);
 // The exclusive Phong specular map shares slot 1 with the PBR parameter map.
 // No dummy textures, additional bindings or larger per-draw arena are needed.
@@ -283,9 +286,11 @@ const COAT_FIELDS = Object.freeze([
   "clearcoatRoughnessFactor",
   "clearcoatNormalScale",
 ]);
-const COAT_LAYOUT = 2048,
+const COAT_LAYOUT = 1 << 13,
   COAT_BYTES = 16;
 const PHYSICAL_SPECULAR_MAPS = (1 << 9) | (1 << 10);
+const SEPARATE_PBR_MAPS = (1 << 11) | (1 << 12);
+const EXTENDED_MAPS = PHYSICAL_SPECULAR_MAPS | SEPARATE_PBR_MAPS;
 const PHYSICAL_SPECULAR_BYTES = 32;
 const PHYSICAL_SPECULAR_DEFAULT = Object.freeze([1, 1, 1, 0, 1.5, 1, 0, 0]);
 const MAP_NAMES = Object.freeze([
@@ -300,7 +305,10 @@ const MAP_NAMES = Object.freeze([
   "alpha",
   "specular_intensity",
   "specular_color",
+  "metallic",
+  "roughness",
 ]);
+const MAP_SLOTS = Object.freeze(MAP_FIELDS.map((_, slot) => slot));
 const mapMaskFor = (variant) =>
   variant.includes("maps-")
     ? Number(variant.split("maps-")[1])
@@ -308,7 +316,7 @@ const mapMaskFor = (variant) =>
       ? 1
       : 0;
 const coordinateMaskFor = (variant) => Number(/uv-(\d+)-/.exec(variant)?.[1] ?? 0);
-const mapSlots = (mask) => [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10].filter((slot) => mask & (1 << slot));
+const mapSlots = (mask) => MAP_SLOTS.filter((slot) => mask & (1 << slot));
 // Binding 16 belongs to the existing clearcoat uniform. The optional alpha
 // sampler/view use 17/18, so coating and opacity never alias a resource slot.
 const mapBinding = slot => slot * 2 + Number(slot >= 8);
@@ -410,11 +418,14 @@ function surfaceShader(
     coatNormalMapped = (mapMask & 128) !== 0;
   const sourceCoat = threeLights && coated;
   const sourcePhysical = threeLights && !phong && !toon;
-  // Two independent specular maps must also fit when all coating/opacity maps,
-  // fog and batched draw indices are present. Pack pairs of UVs into vec4
+  // Independent PBR/specular maps must fit with coating/opacity maps, fog and
+  // batched draw indices. Pack pairs of UVs into vec4
   // varyings in this profile, without changing the legacy shader interfaces.
-  const packedMapUvs = threeLights && !!(mapMask & PHYSICAL_SPECULAR_MAPS);
+  const packedMapUvs = !!(mapMask & EXTENDED_MAPS);
   const varyingMaps = mapSlots(mappedMask);
+  // Secondary UVs on immutable/deformed geometry are packed by active map,
+  // so a lone high-numbered PBR slot does not require vertex location 16/17.
+  const coordinateLocation = slot => 5 + (mapMask & SEPARATE_PBR_MAPS ? mapSlots(coordinateMask).indexOf(slot) : slot);
   const uvOutput = slot => packedMapUvs
     ? `map_uv_${Math.floor(varyingMaps.indexOf(slot) / 2)}.${varyingMaps.indexOf(slot) % 2 ? "zw" : "xy"}`
     : `uv_${slot}`;
@@ -608,7 +619,7 @@ struct VertexOutput {
 @vertex fn vertex_main(@location(0) position: vec3<f32>${normalInput ? ", @location(1) normal: vec3<f32>" : ""}${tangentAttribute ? ", @location(2) tangent: vec4<f32>" : ""}${uvAttribute ? ", @location(3) uv: vec2<f32>" : ""}${colorWidth ? `, @location(4) color: vec${colorWidth}<f32>` : ""}${mapSlots(
     coordinateMask,
   )
-    .map((slot) => `, @location(${5 + slot}) uv_${slot}: vec2<f32>`)
+    .map((slot) => `, @location(${coordinateLocation(slot)}) uv_${slot}: vec2<f32>`)
     .join(
       "",
     )}${sourceChannels.map(c => `, @location(${9 + c}) uv${c}: vec2<f32>`).join("")}${nativeInstances ? ", @location(5) instance_0: vec4<f32>, @location(6) instance_1: vec4<f32>, @location(7) instance_2: vec4<f32>, @location(8) instance_3: vec4<f32>" : ""}${instanceColor ? ", @location(9) instance_color: vec3<f32>" : ""}${instanceStride ? ", @builtin(instance_index) draw_index: u32" : ""}) -> VertexOutput {
@@ -696,7 +707,7 @@ struct VertexOutput {
       : ""
   }
   ${coatNormalMapped ? clearcoatNormalCode(derivative) + "\n  " : ""}${flat ? "" : "normal *= select(-1.0, 1.0, front);"}${coated && !flat ? "\n  coat_normal *= select(-1.0, 1.0, front);" : ""}
-  let metallic = draw_info.options.w ${!phong && !toon && mapMask & 2 ? "* metallic_roughness_texel.b" : ""};
+  let metallic = draw_info.options.w ${!phong && !toon && mapMask & 2 ? "* metallic_roughness_texel.b" : mapMask & (1 << 11) ? "* metallic_texel.b" : ""};
   ${sourcePhysical ? `// r186 MeshPhysicalNodeMaterial.setupSpecular and MaterialNode: color RGB
   // modulates dielectric F0 before min(1), intensity uses the map's ALPHA.
   let physical_ratio = (draw_info.physical_specular_params.x - 1.0) / (draw_info.physical_specular_params.x + 1.0);
@@ -705,7 +716,7 @@ struct VertexOutput {
   let physical_dielectric = select(vec3<f32>(0.04), min(physical_ratio * physical_ratio * physical_color, vec3<f32>(1.0)) * physical_intensity, draw_info.physical_specular_params.z > 0.0);
   let physical_f90 = mix(physical_intensity, 1.0, metallic);
   ` : ""}
-  ${threeLights && !phong && !toon ? "let source_roughness" : "let roughness"} = draw_info.emission_roughness.w ${!phong && !toon && mapMask & 2 ? "* metallic_roughness_texel.g" : ""};${threeLights && !phong && !toon ? `
+  ${threeLights && !phong && !toon ? "let source_roughness" : "let roughness"} = draw_info.emission_roughness.w ${!phong && !toon && mapMask & 2 ? "* metallic_roughness_texel.g" : mapMask & (1 << 12) ? "* roughness_texel.g" : ""};${threeLights && !phong && !toon ? `
   // r186 getRoughness: max(roughness, 0.0525) + geometry roughness, clamped to
   // one. Geometry roughness uses world-space (not view-space) normal
   // derivatives here: equal footprint, but the per-axis maximum can differ.
@@ -1141,7 +1152,7 @@ export async function createGpuAnimationRenderer(
     fail("ANIMATION_RENDER_OPTIONS", "textureTransforms must be boolean");
   if (typeof alphaMaps !== "boolean")
     fail("ANIMATION_RENDER_OPTIONS", "alphaMaps must be boolean");
-  const uvSlots = threeLights ? 11 : alphaMaps ? 9 : 8;
+  const uvSlots = threeLights ? 13 : alphaMaps ? 9 : 8;
   const uvOffset = UNIFORM_BYTES + (clipping ? clippingBytes : 0);
   const physicalOffset = uvOffset + (textureTransforms ? animationUvBytes(uvSlots) : 0);
   const packetBytes = physicalOffset + (threeLights ? PHYSICAL_SPECULAR_BYTES : 0);
@@ -1579,7 +1590,7 @@ struct Out { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 };
           { shaderLocation: 3, offset: 0, format: "float32x2" },
           { shaderLocation: 4, offset: 8, format: "float32x4" },
           ...mapSlots(coordinateMask).map((slot, i) => ({
-            shaderLocation: 5 + slot,
+            shaderLocation: 5 + (mapMask & SEPARATE_PBR_MAPS ? i : slot),
             offset: 24 + i * 8,
             format: "float32x2",
           })),
@@ -1941,6 +1952,7 @@ struct Out { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 };
       (!phong && (options.shininess !== undefined || options.specularTexture != null)) ||
       (!(threeLights && mode === 2) && (options.ior !== undefined || options.specularIntensity !== undefined ||
         options.specularIntensityTexture != null || options.specularColorTexture != null ||
+        options.metallicTexture != null || options.roughnessTexture != null ||
         (!phong && options.specularColor !== undefined))) ||
       ((phong || toon) && options.metallicRoughnessTexture != null) ||
       (!toon && options.gradientTexture != null)
@@ -1960,6 +1972,8 @@ struct Out { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 };
       return { view, sampler };
     });
     const mapMask = textures.reduce((mask, texture, slot) => mask | (texture ? 1 << slot : 0), 0);
+    if ((mapMask & 2) && (mapMask & SEPARATE_PBR_MAPS))
+      fail("ANIMATION_RENDER_OPTIONS", "Combined and independent metallic/roughness maps are mutually exclusive");
     const mutableClearcoat = options.mutableClearcoat === undefined ? false : options.mutableClearcoat;
     if (typeof mutableClearcoat !== "boolean")
       fail("ANIMATION_RENDER_OPTIONS", "mutableClearcoat must be boolean");
@@ -1999,7 +2013,7 @@ struct Out { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 };
         (a) => a.shaderLocation === 2 && a.offset === 24 && a.format === "float32x4",
       )));
     if (mapMask & 256) limit("maxBindingsPerBindGroup", 19);
-    if (mapMask & PHYSICAL_SPECULAR_MAPS) limit("maxBindingsPerBindGroup", mapBinding(mapSlots(mapMask).at(-1)) + 2);
+    if (mapMask & EXTENDED_MAPS) limit("maxBindingsPerBindGroup", mapBinding(mapSlots(mapMask).at(-1)) + 2);
     if (mapMask) {
       limit("maxBindGroups", lit ? 3 : 2);
       limit("maxSamplersPerShaderStage", mapSlots(mapMask).length);
@@ -2113,7 +2127,7 @@ struct Out { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 };
         coordinates.push({ slot, values, transform: local });
       }
     const coordinateMask = coordinates.reduce((mask, entry) => mask | (1 << entry.slot), 0);
-    const packedMapUvs = threeLights && !!(mapMask & PHYSICAL_SPECULAR_MAPS);
+    const packedMapUvs = !!(mapMask & EXTENDED_MAPS);
     if (packedMapUvs) {
       const varyings = mapSlots(coordinateMask | (textureTransforms ? mapMask : 0));
       limit("maxInterStageShaderVariables", 5 + Math.ceil(varyings.length / 2) + Number(fog) + Number(instancing && !instances));
@@ -2122,7 +2136,7 @@ struct Out { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 };
     if (!packedMapUvs && textureTransforms && (mapMask & ~(toon ? 2 : 0)))
       limit("maxInterStageShaderVariables", 6 + mapSlots(mapMask & ~(toon ? 2 : 0)).at(-1));
     if (coordinates.length) {
-      const needed = 6 + coordinates.at(-1).slot;
+      const needed = mapMask & SEPARATE_PBR_MAPS ? 5 + coordinates.length : 6 + coordinates.at(-1).slot;
       limit("maxVertexAttributes", needed);
       if (!packedMapUvs) limit("maxInterStageShaderVariables", needed);
     }

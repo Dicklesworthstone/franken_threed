@@ -82,7 +82,8 @@ async function capture(kind, name) {
 }
 
 // Scenarios using WebGPU-build-only classes (node materials, BundleGroup).
-const WEBGPU_ONLY = new Set(["node_materials", "array_camera_views", "array_camera_dpr", "array_camera_background", "array_camera_overlap",
+const WEBGPU_ONLY = new Set(["node_materials", "pbr_maps_independent", "pbr_maps_updates", "pbr_maps_layers",
+  "array_camera_views", "array_camera_dpr", "array_camera_background", "array_camera_overlap",
   "physical_clearcoat_lights", "physical_clearcoat_maps", "physical_clearcoat_emission",
   "physical_specular_factors", "physical_specular_maps", "physical_specular_updates"]);
 // WebGLRenderer-only features (r186 WebGPURenderer does not run ShaderMaterial).

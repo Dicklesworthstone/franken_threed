@@ -2,7 +2,9 @@
 // pinned upstream WebGLRenderer reference. Each receives the page's own THREE
 // namespace; nothing here depends on which renderer executes it.
 import { RoomEnvironment } from '../../../upstream/three.js/examples/jsm/environments/RoomEnvironment.js';
+import { pbrMapScenarios } from './scenarios_pbr_maps.js';
 export const scenarios = {
+  ...pbrMapScenarios,
   physical_specular_factors(THREE) {
     const scene = new THREE.Scene(); scene.background = new THREE.Color(0x14191f);
     const geometry = new THREE.SphereGeometry(.47, 48, 32);

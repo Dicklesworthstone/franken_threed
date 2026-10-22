@@ -11,6 +11,9 @@ export async function run(THREE, createRenderer) {
     // WebGPU apps initialize before PMREM/compute work; WebGLRenderer has no init().
     if (typeof renderer.init === 'function' && !renderer.isWebGLRenderer) await renderer.init();
     const { scene, camera } = scenarios[name](THREE, renderer);
+    // Pixel comparisons start after both renderers' asynchronous pipeline warmup;
+    // slow software-GPU compilation must not saturate the deferred-frame queue.
+    if (typeof renderer.compileAsync === 'function') await renderer.compileAsync(scene, camera);
     await renderer.setAnimationLoop(() => {
       try {
         renderer.render(scene, camera); state.frames++;

@@ -41,7 +41,7 @@ function packet(draw, byteOffset = 0) {
   const group = draw.groups.get(0), buffer = group.group.entries[0].resource.buffer;
   return new Float32Array(draw.contents.get(buffer).buffer, (group.offsets[0] ?? 0) + byteOffset);
 }
-const factors = draw => packet(draw).slice(64 + 11 * 8, 72 + 11 * 8);
+const factors = draw => packet(draw).slice(64 + 13 * 8, 72 + 13 * 8);
 const factorValues = (color, ior, intensity) => f32([...color, 0, ior, intensity, 1, 0]);
 const uv = (draw, slot) => packet(draw).slice(64 + slot * 8, 72 + slot * 8);
 const matrix = texture => {

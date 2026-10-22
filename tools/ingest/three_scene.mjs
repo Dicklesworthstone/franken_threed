@@ -903,8 +903,14 @@ export async function createGpuThreeScene(device,scene,{
     if(coat)for(const [source,field] of COAT_MAPS)if(m[source])texture(m[source],field);
     if(nativePhysical)for(const [source,field] of PHYSICAL_SPECULAR_MAPS)if(m[source])texture(m[source],field);
     if(m.metalnessMap||m.roughnessMap){
-      if(m.metalnessMap!==m.roughnessMap)fail('TEXTURE','Separate metallic and roughness maps require independent shader bindings');
-      texture(m.metalnessMap,'metallicRoughnessTexture');
+      if(m.metalnessMap===m.roughnessMap)texture(m.metalnessMap,'metallicRoughnessTexture');
+      else{
+        if(programRoute())fail('TEXTURE','Independent metallic and roughness maps use the source ShaderLib program on the WebGL route');
+        // Each source map has its own identity, channel and live UV transform.
+        // A missing map leaves its scalar factor intact, without a dummy image.
+        if(m.metalnessMap)texture(m.metalnessMap,'metallicTexture');
+        if(m.roughnessMap)texture(m.roughnessMap,'roughnessTexture');
+      }
     }
     if(m.normalMap){
       if(m.normalMapType!==three.TangentSpaceNormalMap)fail('MATERIAL','The current profile requires tangent-space normal maps');

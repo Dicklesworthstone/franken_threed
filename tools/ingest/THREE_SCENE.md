@@ -184,8 +184,11 @@ can reuse a bundle; changing its native binding requires preparation.
 
 The admitted texture subset is material-dependent: base color, tangent-space
 normal, emission, occlusion, Phong specular and toon gradient maps. Metallic and
-roughness maps must share the same packed texture. Mutable maps use UV0 and one
-shared affine transform; independent transforms or UV sets are rejected. Normal
+roughness maps may share one packed texture, use distinct textures, or be used
+individually. Blue modulates metalness; green modulates roughness. By default,
+mutable maps use UV0 and one shared affine transform. With
+`textureTransforms:true`, each map selects UV0–UV3 and its own live affine matrix
+(see `THREE_SCENE_UV.md`). Normal
 mapping currently requires equal X/Y scale. Toon gradient maps use lighting
 angle, not geometry UVs. Unsupported combinations remain errors, not ignored
 fields or proof of full material coverage.

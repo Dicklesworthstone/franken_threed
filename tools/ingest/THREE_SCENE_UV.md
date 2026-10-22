@@ -48,12 +48,16 @@ Changing their UV data/version requires preparation just like other static
 animated geometry. UVs are not recomputed on the CPU each frame, and skin/morph
 color and shadow draws share the same existing GPU deformation output.
 
-All five admitted material profiles participate. Base color, normal, emissive,
-ambient occlusion, Phong specular and the combined metallic/roughness map may
-select independent channels/transforms. Toon gradient maps remain indexed by
-lighting angle and do not consume source UV coordinates. Separate metallic and
-roughness texture objects, alpha maps, light maps and unsupported material models
-remain outside this profile; this change does not silently approximate them.
+Base color, normal, emissive, ambient occlusion, Phong specular, alpha, physical
+specular and clearcoat maps may select independent channels/transforms. Standard
+and Physical materials also accept distinct `metalnessMap` and `roughnessMap`
+textures, or either map on its own: blue modulates metalness and green modulates
+roughness. An absent map leaves its scalar factor unchanged. A shared texture
+keeps the existing combined binding. Replacing a map, adding/removing one, or
+changing its channel requires preparation; scalar factors and affine matrices
+remain live. The same behavior applies to the default native node materials.
+Toon gradient maps remain indexed by lighting angle and consume no source UVs.
+Light maps and custom node graphs still require their own implementation.
 
 ## Shadows, ownership and packaging
 
@@ -67,8 +71,11 @@ fog receiver spans, clipping and render bundles retain distinct per-use data.
 Source texture/sampler ownership and upload acknowledgement are unchanged.
 `renderer.textureTransforms`, when explicitly supplied, must agree with the
 source option. Default-off scene behavior retains the shared UV0 contract.
-The 256-byte map packet follows any clipping data and is fully charged to the
-existing GPU arena/binding budget; see `ANIMATION_UV.md` for layout and limits.
+The map packet follows any clipping data and is fully charged to the existing
+GPU arena/binding budget; see `ANIMATION_UV.md` for profile-specific layout and
+limits. Copied secondary-UV attributes for deformed geometry also count against
+the device's vertex-attribute limit; exceptionally dense map combinations can
+still exceed that limit.
 
 `buildAnimation(..., { webgpu: true, threeScene: true })` includes the lazy source
 coordinate adapter and its core helper. Imports start no services. CPU-only and
@@ -81,11 +88,15 @@ pinned module.
 ```bash
 F3D_THREE_ROOT=/path/to/pinned/three.js node --test \
   tools/ingest/animation_uv.test.mjs \
-  tools/ingest/three_scene_uv.test.mjs
+  tools/ingest/three_scene_uv.test.mjs \
+  tools/ingest/three_pbr_maps.test.mjs
 ```
 
 The tests use real pinned source objects and production renderer, deformation,
 shadow and packaging modules with a recording GPU device. They check submitted
 matrices, native streams, shader wiring, ordering, preparation boundaries,
 preflight, budgets and disposal, including a physically relocated package.
-They do not execute WGSL, establish pixel equivalence, or measure GPU speedups.
+They do not execute WGSL or measure GPU speedups. The separate
+`pbr_maps_independent`, `pbr_maps_updates` and `pbr_maps_layers` cases in
+`tests/e2e/webgpu_renderer/parity.mjs` compare rendered pixels against pinned
+r186 on the existing software-GPU correctness lane.
