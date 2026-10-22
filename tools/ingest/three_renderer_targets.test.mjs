@@ -190,3 +190,74 @@ test('immediate canvas program draws keep live renderer mutations made by source
   assert.equal(f.draws[0].program.toneMappingExposure, 6);
   assert.equal(f.r.toneMappingExposure, 6); f.r.dispose();
 });
+
+test('queued native mip draws capture selectors, viewport/scissor and independent readback levels', async () => {
+  const f = await make(), t = new T.RenderTarget(64, 32), gate = deferred();
+  t.texture.mipmaps = [{}, {}, {}, {}];
+  const first = scene('mip-one', 11); first.gate = gate.promise;
+  t.viewport.set(2, 3, 48, 24); t.scissor.set(3, 4, 32, 16); t.scissorTest = true;
+  const viewport = t.viewport.toArray(), scissor = t.scissor.toArray();
+  f.r.setRenderTarget(t, 0, 1); f.r.render(first, new Camera());
+  assert.equal(f.r.getActiveMipmapLevel(), 1);
+  f.r.setRenderTarget(t, 0, 2); f.r.render(scene('mip-two', 22), new Camera());
+  assert.deepEqual(t.viewport.toArray(), viewport); assert.deepEqual(t.scissor.toArray(), scissor);
+  t.viewport.set(0, 0, 64, 32); t.scissorTest = false;
+  f.r.setRenderTarget(t, 0, 0); f.r.render(scene('base', 33), new Camera());
+  const one = f.r.readRenderTargetMipPixelsAsync(t, 1), two = f.r.readRenderTargetMipPixelsAsync(t, 2);
+  const base = f.r.readRenderTargetPixelsAsync(t, 0, 0, 64, 32);
+  f.r.setRenderTarget(null); gate.resolve();
+  const values = await Promise.all([one, two, base]); await flush(f.r);
+  assert.deepEqual(f.draws.map(d => d.frame.colorView.descriptor.baseMipLevel), [1, 2, 0]);
+  assert.deepEqual(f.draws.map(d => [d.frame.depthView.texture.width, d.frame.depthView.texture.height]), [[32, 16], [16, 8], [64, 32]]);
+  assert.deepEqual(f.draws[0].frame.viewport, [2, 3, 24, 12, 0, 1]);
+  assert.deepEqual(f.draws[1].frame.viewport, [2, 3, 12, 6, 0, 1]);
+  assert.deepEqual(f.draws[0].frame.scissor, [3, 4, 16, 8]);
+  assert.deepEqual(f.draws[1].frame.scissor, [3, 4, 8, 4]);
+  assert.deepEqual(values.map(a => a.length), [32 * 16 * 4, 16 * 8 * 4, 64 * 32 * 4]);
+  for (const [i, data] of values.entries()) assert.ok(data.every(x => x === [11, 22, 33][i]));
+  assert.deepEqual(f.copies.map(c => c.source.mipLevel), [1, 2, 0]);
+  assert.equal(f.r.getRenderTarget(), null); assert.equal(f.r.getActiveMipmapLevel(), 0);
+  assert.deepEqual(t.viewport.toArray(), [0, 0, 64, 32]); f.r.dispose();
+});
+
+test('depth-only clear selects the captured mip while ordinary source readback stays at level zero', async () => {
+  const f = await make(), t = new T.RenderTarget(8, 8); t.texture.mipmaps = [{}, {}, {}];
+  f.r.setRenderTarget(t); f.r.render(scene('base-preserved', 55), new Camera());
+  f.r.setRenderTarget(t, 0, 2); f.r.clearDepth();
+  const read = f.r.readRenderTargetPixelsAsync(t, 0, 0, 8, 8);
+  f.r.setRenderTarget(null); const pixels = await read; await flush(f.r);
+  const frame = f.draws[1].frame;
+  assert.equal(frame.colorView.descriptor.baseMipLevel, 2);
+  assert.deepEqual([frame.depthView.texture.width, frame.depthView.texture.height], [2, 2]);
+  assert.equal(frame.loadOp, 'load'); assert.equal(frame.depthLoadOp, 'clear');
+  assert.ok(pixels.every(x => x === 55)); assert.equal(f.copies[0].source.mipLevel, 0);
+  f.r.dispose();
+});
+
+test('unsupported native mip selectors preserve binding without allocation and WebGL refuses nonzero levels', async () => {
+  const f = await make(), t = new T.RenderTarget(8, 8); t.texture.mipmaps = [{}, {}, {}];
+  f.r.setRenderTarget(t, 0, 1);
+  for (const mip of [-1, .5, 3, '1']) assert.throws(() => f.r.setRenderTarget(t, 0, mip), {code: 'THREE_TARGET_MIP'});
+  assert.throws(() => f.r.setRenderTarget(null, 0, 1), {code: 'F3D_RENDERER_UNSUPPORTED'});
+  assert.throws(() => f.r.setRenderTarget(t, 1, 0), {code: 'F3D_RENDERER_UNSUPPORTED'});
+  const msaa = new T.RenderTarget(8, 8, {samples: 4}); msaa.texture.mipmaps = [{}, {}, {}];
+  assert.throws(() => f.r.setRenderTarget(msaa, 0, 1), {code: 'THREE_TARGET_MIP'});
+  assert.throws(() => f.r.setRenderTarget(new T.RenderTarget(8, 8), 0, 1), {code: 'THREE_TARGET_MIP'});
+  assert.equal(f.r.getRenderTarget(), t); assert.equal(f.r.getActiveMipmapLevel(), 1);
+  assert.equal(f.calls.textures.length, 0); f.r.dispose();
+  const gl = await make(true);
+  assert.throws(() => gl.r.setRenderTarget(t, 0, 1), {code: 'F3D_RENDERER_UNSUPPORTED'});
+  assert.equal(gl.r.getRenderTarget(), null); assert.equal(gl.calls.textures.length, 0); gl.r.dispose();
+});
+
+test('native and WebGL facades select their pinned target-texture row orientation', async () => {
+  for (const gl of [false, true]) {
+    const f = await make(gl), target = new T.RenderTarget(), consumer = scene('target-orientation');
+    consumer.sample = target.texture;
+    await f.r.compileAsync(consumer, new Camera()); f.r.render(consumer, new Camera());
+    const code = f.calls.modules.find(module => module.label === 'Source target UV orientation').code;
+    assert.equal(code.includes('i32(size.y) - 1 - i32(p.y)'), gl);
+    if (!gl) assert.match(code, /vec2i\(i32\(p.x\), i32\(p.y\)\)/);
+    assert.ok(f.draws[0].sampled.view); f.r.dispose();
+  }
+});

@@ -8,7 +8,7 @@ export function targetDevice() {
     lost: new Promise(resolve => { lose = resolve; }),
     createTexture(d) {
       const t = {...d, width: d.size.width, height: d.size.height, destroyed: 0,
-        createView() { return {texture: t}; }, destroy() { t.destroyed++; }};
+        createView(descriptor = {}) { return {texture: t, descriptor}; }, destroy() { t.destroyed++; }};
       calls.textures.push(t); return t;
     },
     createSampler(d) { const s = {...d}; calls.samplers.push(s); return s; },

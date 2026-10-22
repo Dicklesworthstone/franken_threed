@@ -130,3 +130,66 @@ for (const step of ['mip', 'flip']) test(`${step} submission failure releases bo
   assert.equal(owner.allocatedBytes, 0); await assert.rejects(owner.whenIdle(), new RegExp(`${step} submission failed`));
   assert.deepEqual(f.scopes, []); owner.dispose(); gone(f);
 });
+
+test('authored source mip descriptors allocate independent levels without automatic reduction', async () => {
+  const f = fixture({}, {generateMipmaps: false}), {owner, target} = f;
+  target.texture.mipmaps = [{}, {}];
+  const entry = owner.capture(target), shape = inspectThreeRenderTarget(target, T);
+  assert.equal(shape.mipLevelCount, 2); assert.equal(shape.colorBytes, 164);
+  owner.render(entry, frame => assert.equal(frame.colorView.descriptor.baseMipLevel, 1), {mipLevel: 1});
+  const binding = owner.bindingsFor().get(target.texture);
+  assert.equal(binding.view.texture.mipLevelCount, 2); assert.equal(binding.sampler.descriptor.lodMaxClamp, 1);
+  assert.equal(owner.allocatedBytes, 328); assert.equal(entry.storage.diagnostics.mipGenerations, 0);
+  assert.equal(f.submissions.length, 1, 'only UV orientation runs');
+  assert.deepEqual(f.submissions[0][0].passes.map(p => p.descriptor.colorAttachments[0].view.descriptor.baseMipLevel), [0, 1]);
+  await owner.whenIdle(); owner.dispose(); gone(f);
+});
+
+test('selected-mip private depth is charged once against the shared source-target budget', async () => {
+  const f = fixture({maxBytes: 332}, {depthBuffer: true, generateMipmaps: false}), {owner, target} = f;
+  target.texture.mipmaps = [{}, {}, {}];
+  const entry = owner.capture(target);
+  owner.render(entry, frame => {
+    assert.equal(frame.colorView.descriptor.baseMipLevel, 1);
+    assert.deepEqual([frame.depthView.texture.width, frame.depthView.texture.height], [3, 2]);
+  }, {mipLevel: 1});
+  assert.equal(entry.shape.bytes, 308); assert.equal(owner.allocatedBytes, 332);
+  const count = f.textures.length;
+  owner.render(entry, () => {}, {mipLevel: 1}); assert.equal(owner.allocatedBytes, 332);
+  assert.throws(() => owner.render(entry, () => assert.fail('budget failure must precede draw'), {mipLevel: 2}), {code: 'THREE_TARGET_BUDGET'});
+  assert.equal(f.textures.length, count); assert.equal(entry.alive, true);
+  owner.render(entry, () => {}, {mipLevel: 0}); assert.equal(owner.allocatedBytes, 332);
+  await owner.whenIdle(); owner.dispose(); gone(f);
+});
+
+test('authored mip-count changes invalidate queued generations and validate their extent', () => {
+  const f = fixture({}, {generateMipmaps: false}), {owner, target} = f;
+  target.texture.mipmaps = [{}, {}];
+  const entry = owner.capture(target), binding = owner.bindingsFor().get(target.texture), old = f.textures.slice();
+  target.texture.mipmaps.push({});
+  assert.throws(() => owner.assertCurrent(entry), {code: 'THREE_TARGET_STALE'});
+  const next = owner.bindingsFor().get(target.texture);
+  assert.notEqual(next.view, binding.view); assert.equal(next.view.texture.mipLevelCount, 3);
+  for (const texture of old) assert.equal(texture.destroyed, 1);
+  target.texture.mipmaps.push({});
+  assert.throws(() => inspectThreeRenderTarget(target, T), {code: 'THREE_TARGET_SIZE'});
+  target.texture.mipmaps = {length: 2};
+  assert.throws(() => inspectThreeRenderTarget(target, T), {code: 'THREE_TARGET_UNSUPPORTED'});
+  owner.dispose(); gone(f);
+});
+
+test('source sampling orientation is fixed per owner and retains bounded replicas for every mip', () => {
+  for (const flipY of [false, true]) {
+    const f = fixture({flipY}, {generateMipmaps: false}), {owner, target} = f;
+    target.texture.mipmaps = [{}, {}, {}];
+    const entry = owner.capture(target), binding = owner.bindingsFor().get(target.texture);
+    const code = f.pipelines[0].descriptor.fragment.module.code;
+    assert.equal(code.includes('i32(size.y) - 1 - i32(p.y)'), flipY);
+    if (!flipY) assert.match(code, /vec2i\(i32\(p.x\), i32\(p.y\)\)/);
+    entry.storage.withTexture(native => assert.notEqual(binding.view.texture, native));
+    assert.equal(owner.allocatedBytes, 336);
+    assert.equal(f.submissions[0][0].passes.length, 3);
+    assert.equal(owner.bindingsFor().get(target.texture).view, binding.view);
+    assert.equal(f.submissions.length, 1); owner.dispose(); gone(f);
+  }
+});

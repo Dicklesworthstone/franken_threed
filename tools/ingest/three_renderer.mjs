@@ -30,7 +30,7 @@
 import {createGpuCanvasRenderer} from './gpu_canvas_renderer.mjs';
 import {createGpuHdrCanvasRenderer} from './gpu_hdr_canvas.mjs';
 import {createGpuThreeScene} from './three_scene.mjs';
-import {createThreeRenderTargets, inspectThreeRenderTarget} from './three_render_targets.mjs';
+import {createThreeRenderTargets, inspectThreeRenderTarget, inspectThreeRenderTargetMip} from './three_render_targets.mjs';
 import {readGpuTargetPixels} from './gpu_target_readback.mjs';
 import {createThreeRendererTransfers} from './three_renderer_transfers.mjs';
 import {createThreePassSnapshots, captureThreeArrayCamera} from './three_pass_snapshot.mjs';
@@ -77,10 +77,11 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       typeof THREE.Vector2 !== 'function') fail('SOURCE', 'Supply the pinned r186 three module namespace');
   if (!classOptions || typeof classOptions !== 'object' || Array.isArray(classOptions)) fail('OPTIONS', 'Expected class options');
   const {gpu: defaultGpu, maxDraws = 16384, maxBindings = 16384, scene: sceneLimits = {}, exactBackend = null,
-    maxTransferBytes = 128 * 1024 * 1024, maxTransfers = 64} = classOptions;
+    maxTransferBytes = 128 * 1024 * 1024, maxTransfers = 64, targetTextureFlipY = false} = classOptions;
   if (![maxTransferBytes, maxTransfers].every(n => Number.isSafeInteger(n) && n > 0))
     fail('OPTIONS', 'Expected positive renderer transfer byte and request limits');
   if (exactBackend !== null && typeof exactBackend !== 'function') fail('OPTIONS', 'exactBackend must be a renderer constructor');
+  if (typeof targetTextureFlipY !== 'boolean') fail('OPTIONS', 'Expected a target sampling orientation');
   if (!Number.isSafeInteger(maxDraws) || maxDraws < 1 || !Number.isSafeInteger(maxBindings) || maxBindings < 1)
     fail('OPTIONS', 'Expected positive draw and binding capacities');
   const {NoToneMapping, SRGBColorSpace} = THREE;
@@ -271,8 +272,9 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._scissorTest = false;
       this._clearScene = null;
       this._renderTarget = null;
+      this._activeMipmapLevel = 0;
       this._targetLifetime = new AbortController();
-      this._targets = createThreeRenderTargets(THREE, {getDevice: () => this._device});
+      this._targets = createThreeRenderTargets(THREE, {getDevice: () => this._device, flipY: targetTextureFlipY});
       this._passSnapshots = createThreePassSnapshots(THREE);
       this._initialized = false;
       this._initPromise = null;
@@ -440,7 +442,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     // WebGPU's maximum sampler anisotropy, as the source WebGPU backend reports.
     getMaxAnisotropy() { return 16; }
     getActiveCubeFace() { return 0; }
-    getActiveMipmapLevel() { return 0; }
+    getActiveMipmapLevel() { return this._activeMipmapLevel; }
     /** Source Renderer.clear(): a clear-only pass on the canvas with the current
      * clear color/depth, honoring viewport/scissor state like other passes. */
     clear(color = true, depth = true, stencil = true) {
@@ -476,9 +478,13 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     setClearStencil(stencil) { this._clearStencil = stencil; }
     getRenderTarget() { return this._renderTarget; }
     setRenderTarget(renderTarget, activeCubeFace = 0, activeMipmapLevel = 0) {
-      if (activeCubeFace !== 0 || activeMipmapLevel !== 0) fail('UNSUPPORTED', 'Cube faces and target mip levels are not admitted');
-      if (renderTarget !== null) this._targets.capture(renderTarget);
+      if (activeCubeFace !== 0) fail('UNSUPPORTED', 'Cube faces are not admitted');
+      if (activeMipmapLevel !== 0 && this._shaderEncodedOutput)
+        fail('UNSUPPORTED', 'Nonzero target mips on the WebGL-authored route are not admitted');
+      if (renderTarget !== null) inspectThreeRenderTargetMip(this._targets.capture(renderTarget).shape, activeMipmapLevel);
+      else if (activeMipmapLevel !== 0) fail('UNSUPPORTED', 'The canvas has only mip level zero');
       this._renderTarget = renderTarget;
+      this._activeMipmapLevel = activeMipmapLevel;
     }
     /** F3D extensions: call-time upload snapshots and ordered GPU-only copies.
      * Regions use this surface's origin (WebGPU top-left, WebGL bottom-left),
@@ -509,8 +515,9 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     getContext() { return this._initialized ? this.domElement.getContext('webgpu') : null; }
 
     // ---- frames ----
-    _frame(scene, clearOnly = null, target = this._renderTarget) {
+    _frame(scene, clearOnly = null, target = this._renderTarget, mipLevel = this._activeMipmapLevel) {
       const targetShape = target ? inspectThreeRenderTarget(target, THREE) : null;
+      const mipShape = targetShape ? inspectThreeRenderTargetMip(targetShape, mipLevel) : null;
       if (this.xr.enabled && this.xr.isPresenting) fail('UNSUPPORTED', 'XR presentation is not admitted');
       if (!target && this.outputColorSpace !== SRGBColorSpace) fail('UNSUPPORTED', 'Only sRGB canvas output is admitted');
       const tone = this._toneMapping();
@@ -549,9 +556,12 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           : threeWebGPUStencilValue(this._clearStencil, fail)) & 0xff : 0;
       }
       const pr = target ? 1 : this._pixelRatio;
-      const [bufferWidth, bufferHeight] = target ? [target.width, target.height] : this._bufferSize();
+      const [bufferWidth, bufferHeight] = target ? [mipShape.width, mipShape.height] : this._bufferSize();
       const v = target ? target.viewport : this._viewport, px = this._pixelRound ?? Math.floor;
-      const vx = px(v.x * pr), vw = px(v.z * pr), vh = px(v.w * pr);
+      // r186 WebGPU scales only width/height at a selected mip; origins remain
+      // physical coordinates. Capture without mutating the source Vector4s.
+      const divisor = target ? 2 ** mipLevel : 1;
+      const vx = px(v.x * pr), vw = Math.floor(px(v.z * pr) / divisor), vh = Math.floor(px(v.w * pr) / divisor);
       // Program gl_FragCoord (framebuffer) and point-sprite sizes (viewport).
       if (this._shaderEncodedOutput && !hdr) frame.targetSize = [bufferWidth, bufferHeight, vw, vh];
       // r186 _currentViewport size: the transmission target follows it.
@@ -563,14 +573,14 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         frame.viewport = [vx, vy, vw, vh, minDepth, maxDepth];
       if (target ? target.scissorTest : this._scissorTest) {
         // Source clamping: non-negative and inside the drawing buffer.
-        const sc = target ? target.scissor : this._scissor, rawH = px(sc.w * pr);
+        const sc = target ? target.scissor : this._scissor, rawH = Math.floor(px(sc.w * pr) / divisor);
         const rawY = this._bottomLeftOrigin ? bufferHeight - px(sc.y * pr) - rawH : px(sc.y * pr);
         const sx = Math.max(0, px(sc.x * pr)), sy = Math.max(0, rawY);
         // WebGPU source: clamp each component to >= 0, then fit inside the buffer.
         // WebGL: the GL scissor box is intersected with the buffer, so a negative
         // origin also shortens the box.
         const clip = this._bottomLeftOrigin;
-        const sw = Math.max(0, Math.min(px(sc.z * pr) + (clip ? Math.min(0, px(sc.x * pr)) : 0), bufferWidth - sx)),
+        const sw = Math.max(0, Math.min(Math.floor(px(sc.z * pr) / divisor) + (clip ? Math.min(0, px(sc.x * pr)) : 0), bufferWidth - sx)),
           sh = Math.max(0, Math.min(rawH + (clip ? Math.min(0, rawY) : 0), bufferHeight - sy));
         if (sx !== 0 || sy !== 0 || sw !== bufferWidth || sh !== bufferHeight) frame.scissor = [sx, sy, sw, sh];
       }
@@ -598,9 +608,9 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       try { return this._renderFrame(scene, camera); } finally { this._inspector.finishRender(); }
     }
     _makeRequest(scene, camera, clearOnly = null, captureCameras = true) {
-      const target = this._renderTarget;
+      const target = this._renderTarget, mipLevel = this._activeMipmapLevel;
       const destination = target ? this._targets.capture(target) : this;
-      const frame = this._frame(scene, clearOnly, target), key = sceneKey(this, scene);
+      const frame = this._frame(scene, clearOnly, target, mipLevel), key = sceneKey(this, scene);
       // RenderPass/normal/depth passes restore this property immediately after
       // render(). Capture its selector now; source objects stay application-owned.
       const overrideMaterial = scene.isScene === true ? scene.overrideMaterial : null;
@@ -629,9 +639,9 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         matricesUpdated = true;
         // Source WebGPU viewports are logical canvas units, physical target units.
         frame.arrayCamera = {pixelRatio: target ? 1 : this._pixelRatio, clipSpace: 'webgpu',
-          targetSize: target ? [target.width, target.height] : this._bufferSize()};
+          targetSize: target ? [Math.max(1, Math.floor(target.width / 2 ** mipLevel)), Math.max(1, Math.floor(target.height / 2 ** mipLevel))] : this._bufferSize()};
       }
-      return {scene: snapshot?.root ?? scene, camera: snapshot?.camera ?? camera, snapshot, matricesUpdated, clearOnly, destination, frame, overrideMaterial,
+      return {scene: snapshot?.root ?? scene, camera: snapshot?.camera ?? camera, snapshot, matricesUpdated, clearOnly, destination, mipLevel, frame, overrideMaterial,
         linearClearColor: this.alpha ? [c.r * a, c.g * a, c.b * a, a] : [c.r, c.g, c.b, 1],
         hdr: !target && this._wantsHdr(this._toneMapping()), key,
         programFrame: {toneMapping: this.toneMapping, toneMappingExposure: this.toneMappingExposure,
@@ -655,7 +665,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         throw error;
       }
     }
-    _submit({scene, camera, frame, destination, programFrame, snapshot, overrideMaterial, matricesUpdated, deferred = false}) {
+    _submit({scene, camera, frame, destination, mipLevel = 0, programFrame, snapshot, overrideMaterial, matricesUpdated, deferred = false}) {
       snapshot?.install();
       const previous = this._programFrame;
       // Immediate source callbacks must still be able to change live program
@@ -663,7 +673,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._programFrame = deferred ? programFrame : undefined;
       try {
         if (destination === this) this._session.render({scene, camera, overrideMaterial, matricesUpdated}, frame);
-        else this._targets.render(destination, attachments => destination._dispatcher.render({scene, camera, overrideMaterial, matricesUpdated}, {...frame, ...attachments}));
+        else this._targets.render(destination, attachments => destination._dispatcher.render({scene, camera, overrideMaterial, matricesUpdated}, {...frame, ...attachments}), {mipLevel});
       } finally { this._programFrame = previous; }
       const d = destination._dispatcher.entry(scene)?.lastDiagnostics;
       if (d) {
@@ -890,7 +900,9 @@ const WEBGL_PARAMETERS = new Set(['canvas', 'context', 'depth', 'stencil', 'alph
 export function createWebGLRendererClass(THREE, classOptions = {}) {
   const {exactBackend = null, ...options} = classOptions;
   if (exactBackend !== null && typeof exactBackend !== 'function') fail('OPTIONS', 'exactBackend must be a renderer constructor');
-  const Base = createWebGPURendererClass(THREE, options);
+  // Native WGSL leaves render-target UVs unchanged; WebGL programs retain their
+  // bottom-left sampling convention. Keep this owner policy fixed per facade.
+  const Base = createWebGPURendererClass(THREE, {...options, targetTextureFlipY: true});
   const glOnly = name => ({get() { fail('UNSUPPORTED', `WebGLRenderer.${name} describes a GL context; this route has none`); }, configurable: true});
   class WebGLRenderer extends Base {
     constructor(parameters = {}) {

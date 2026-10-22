@@ -144,3 +144,78 @@ test('device loss during a stalled mip submission invalidates the target and rel
   assert.throws(() => t.withTexture(() => assert.fail()), {code: 'GPU_TARGET_DEVICE_LOST'});
   t.dispose(); gone(f);
 });
+
+test('authored mip frames preserve their levels and lazily acquire matching private depth', async () => {
+  const f = gpuTargetMipmapFixture(), t = make(f, {generateMipmaps: false, mipLevelCount: 4, depthFormat: 'depth24plus'});
+  assert.equal(t.mipLevelCount, 4); assert.equal(t.allocatedBytes, 300);
+  assert.equal(t.frameAllocationBytes(1), 32);
+  let first;
+  t.withFrame(frame => { first = frame; }, {mipLevel: 1});
+  assert.equal(first.colorView.descriptor.baseMipLevel, 1); assert.equal(first.colorView.descriptor.mipLevelCount, 1);
+  assert.deepEqual([first.depthView.texture.width, first.depthView.texture.height], [4, 2]);
+  assert.equal(first.depthView.texture.mipLevelCount, 1); assert.equal(t.allocatedBytes, 332);
+  assert.equal(t.frameAllocationBytes(1), 0);
+  t.withFrame(frame => assert.equal(frame, first), {mipLevel: 1});
+  t.withFrame(frame => {
+    assert.equal(frame.colorView.descriptor.baseMipLevel, 3);
+    assert.deepEqual([frame.depthView.texture.width, frame.depthView.texture.height], [1, 1]);
+    assert.notEqual(frame.depthView.texture, first.depthView.texture);
+  }, {mipLevel: 3});
+  assert.equal(t.allocatedBytes, 336);
+  t.withTexture(texture => assert.equal(texture.mipLevelCount, 4));
+  assert.equal(f.submissions.length, 0); assert.equal(f.pipelines.length, 0);
+  assert.equal(t.diagnostics.mipGenerations, 0);
+  await t.whenIdle(); assert.deepEqual(f.scopes, []); t.dispose(); gone(f);
+});
+
+test('private mip depth budget refusal allocates nothing and leaves the target retryable', () => {
+  const f = gpuTargetMipmapFixture(), t = make(f, {generateMipmaps: false, mipLevelCount: 4, depthFormat: 'depth24plus', maxBytes: 331});
+  const count = f.textures.length;
+  assert.throws(() => t.withFrame(() => assert.fail('budget refusal must precede callback'), {mipLevel: 1}), {code: 'GPU_TARGET_BUDGET'});
+  assert.equal(t.failed, false); assert.equal(t.allocatedBytes, 300); assert.equal(f.textures.length, count);
+  t.resize(0, 0); t.resize(8, 2);
+  t.withFrame(frame => assert.deepEqual([frame.depthView.texture.width, frame.depthView.texture.height], [4, 1]), {mipLevel: 1});
+  assert.equal(t.allocatedBytes, 172); t.dispose(); gone(f);
+});
+
+test('mip selectors reject absent levels, invalid counts, MSAA and sampled depth before callbacks', () => {
+  const f = gpuTargetMipmapFixture();
+  for (const count of [0, -1, 1.5, '4'])
+    assert.throws(() => make(f, {mipLevelCount: count}), {code: 'GPU_TARGET_OPTIONS'});
+  assert.throws(() => make(f, {mipLevelCount: 5}), {code: 'GPU_TARGET_SIZE'});
+  assert.equal(f.textures.length, 0);
+  for (const options of [
+    {generateMipmaps: false},
+    {mipLevelCount: 4, sampleCount: 4},
+    {mipLevelCount: 4, sampleDepth: true, depthFormat: 'depth24plus'},
+  ]) {
+    const t = make(f, options), count = f.textures.length;
+    assert.throws(() => t.withFrame(() => assert.fail('unsupported selector must precede callback'), {mipLevel: 1}), {code: 'GPU_TARGET_MIP'});
+    assert.equal(f.textures.length, count); assert.equal(t.failed, false); t.dispose();
+  }
+  const t = make(f);
+  for (const mipLevel of [-1, .5, 4, '1'])
+    assert.throws(() => t.withFrame(() => assert.fail(), {mipLevel}), {code: 'GPU_TARGET_MIP'});
+  t.dispose(); gone(f);
+});
+
+test('explicit mip rendering retains requested automatic regeneration', () => {
+  const f = gpuTargetMipmapFixture(), t = make(f, {mipLevelCount: 4});
+  t.withTexture(() => {}); assert.equal(t.diagnostics.mipGenerations, 1);
+  t.withFrame(frame => assert.equal(frame.colorView.descriptor.baseMipLevel, 2), {mipLevel: 2});
+  t.withTexture(() => {}); assert.equal(t.diagnostics.mipGenerations, 2);
+  assert.deepEqual(f.submissions[1][0].passes.map(p => p.descriptor.colorAttachments[0].view.descriptor.baseMipLevel), [1, 2, 3]);
+  t.dispose(); gone(f);
+});
+
+test('throwing mip callbacks retain their depth allocation through resize retirement', async () => {
+  const f = gpuTargetMipmapFixture(), t = make(f, {generateMipmaps: false, mipLevelCount: 4, depthFormat: 'depth24plus'});
+  assert.throws(() => t.withFrame(() => { throw Error('caller submitted before failure'); }, {mipLevel: 1}), /caller submitted/);
+  assert.equal(t.failed, false); assert.equal(t.allocatedBytes, 332);
+  const old = f.textures.slice(), fence = deferred(); f.controls.completion = fence;
+  t.resize(8, 2); assert.equal(t.allocatedBytes, 332 + 156);
+  for (const texture of old) assert.equal(texture.destroyed, 0);
+  fence.resolve(); await t.whenIdle();
+  for (const texture of old) assert.equal(texture.destroyed, 1);
+  assert.equal(t.allocatedBytes, 156); t.dispose(); gone(f);
+});

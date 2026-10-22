@@ -1,9 +1,11 @@
 /** Source RenderTarget residency shared by all scenes of one renderer.
  * Native attachments stay top-left for rendering/readback. A lazily allocated
- * GPU-only, vertically flipped sampling image preserves source texture UVs;
- * it is refreshed once per written version, never downloaded or re-uploaded.
- * generateMipmaps:true keeps a full native color pyramid and flips each level
- * into the sampling pyramid. Both chains are charged, including NPOT tails.
+ * GPU-only sampling image preserves the selected source surface's texture UVs:
+ * native WebGPU keeps rows unchanged; WebGL flips vertically. It is refreshed
+ * once per written version, never downloaded or re-uploaded.
+ * generateMipmaps:true keeps a full native color pyramid and copies each level
+ * with the selected orientation into the sampling pyramid. Both chains are
+ * charged, including NPOT tails.
  * Single-sample source DepthTexture attachments are sampled through a separate
  * UV-oriented r32float image: no color conversion or half-float quantization.
  * Private stencil buffers and UnsignedInt248 DepthStencilFormat attachments
@@ -93,7 +95,12 @@ export function inspectThreeRenderTarget(target, three) {
     samplerDescriptor(depthTexture, three, 1);
   }
   const generateMipmaps = texture.generateMipmaps;
-  const mipLevelCount = generateMipmaps ? 1 + Math.floor(Math.log2(Math.max(target.width, target.height))) : 1;
+  const maximumMipLevels = 1 + Math.floor(Math.log2(Math.max(target.width, target.height)));
+  if (texture.mipmaps !== undefined && !Array.isArray(texture.mipmaps)) fail('UNSUPPORTED', 'Expected source mipmap descriptors');
+  // Source Textures.getMipLevels uses authored descriptors before automatic
+  // generation. Render-target descriptors allocate levels, not uploaded pixels.
+  const mipLevelCount = texture.mipmaps?.length || (generateMipmaps ? maximumMipLevels : 1);
+  if (mipLevelCount > maximumMipLevels) fail('SIZE', 'Too many target mip levels for its extent');
   const texelBytes = format === 'rgba32float' ? 16 : ['rgba16float', 'rg32float'].includes(format) ? 8 : 4;
   const baseColorBytes = target.width * target.height * texelBytes;
   let colorBytes = baseColorBytes, w = target.width, h = target.height;
@@ -106,7 +113,17 @@ export function inspectThreeRenderTarget(target, three) {
   if (!Number.isSafeInteger(bytes)) fail('BUDGET', 'Target byte size exceeds safe integer precision');
   return {width: target.width, height: target.height, format, depthFormat, sampleCount, bytes, colorBytes, texture, generateMipmaps, mipLevelCount, float32,
     depthTexture, depthSampleBytes: depthTexture ? target.width * target.height * 4 : 0,
-    key: `${target.width}/${target.height}/${format}/${depthFormat}/${sampleCount}/${generateMipmaps}`};
+    key: `${target.width}/${target.height}/${format}/${depthFormat}/${sampleCount}/${generateMipmaps}/${mipLevelCount}`};
+}
+
+/** Validate a destination before any GPU allocation or queued submission. */
+export function inspectThreeRenderTargetMip(shape, mipLevel = 0) {
+  if (!Number.isSafeInteger(mipLevel) || mipLevel < 0 || mipLevel >= shape.mipLevelCount)
+    fail('MIP', 'Render mip level is not allocated');
+  if (mipLevel > 0 && (shape.sampleCount !== 1 || shape.depthTexture !== null))
+    fail('MIP', 'Nonzero target mips require single-sample color and private depth');
+  return {width: Math.max(1, Math.floor(shape.width / 2 ** mipLevel)),
+    height: Math.max(1, Math.floor(shape.height / 2 ** mipLevel))};
 }
 
 function samplerDescriptor(texture, three, mipLevelCount) {
@@ -131,7 +148,7 @@ function samplerDescriptor(texture, three, mipLevelCount) {
       ? Math.min(16, Math.floor(texture.anisotropy)) : 1};
 }
 
-const FLIP_WGSL = `
+const FLIP_WGSL = flipY => `
 @group(0) @binding(0) var source: texture_2d<f32>;
 @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
   let p = array<vec2f, 3>(vec2f(-1, -1), vec2f(3, -1), vec2f(-1, 3));
@@ -139,14 +156,14 @@ const FLIP_WGSL = `
 }
 @fragment fn fs(@builtin(position) p: vec4f) -> @location(0) vec4f {
   let size = textureDimensions(source);
-  return textureLoad(source, vec2i(i32(p.x), i32(size.y) - 1 - i32(p.y)), 0);
+  return textureLoad(source, vec2i(i32(p.x), ${flipY ? 'i32(size.y) - 1 - i32(p.y)' : 'i32(p.y)'}), 0);
 }`;
 
 // A scalar R32F output preserves textureLoad's f32 depth value. Sampling the
 // replica uses the program renderer's existing sampler2D float binding route.
 // Its red channel is depth; G/B are zero and A is one. Never use RGBA8 or half
 // floats here: small depth errors become large reconstructed-distance errors.
-const DEPTH_FLIP_WGSL = `
+const DEPTH_FLIP_WGSL = flipY => `
 @group(0) @binding(0) var source: texture_depth_2d;
 @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
   let p = array<vec2f, 3>(vec2f(-1, -1), vec2f(3, -1), vec2f(-1, 3));
@@ -154,12 +171,13 @@ const DEPTH_FLIP_WGSL = `
 }
 @fragment fn fs(@builtin(position) p: vec4f) -> @location(0) f32 {
   let size = textureDimensions(source);
-  return textureLoad(source, vec2i(i32(p.x), i32(size.y) - 1 - i32(p.y)), 0);
+  return textureLoad(source, vec2i(i32(p.x), ${flipY ? 'i32(size.y) - 1 - i32(p.y)' : 'i32(p.y)'}), 0);
 }`;
 
 /** getDevice is lazy so selecting a target before renderer.init() performs no GPU work. */
-export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, maxBytes = 512 * 1024 * 1024} = {}) {
-  if (typeof getDevice !== 'function' || !positive(maxTargets) || !positive(maxBytes)) fail('OPTIONS', 'Invalid target owner options');
+export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, maxBytes = 512 * 1024 * 1024, flipY = true} = {}) {
+  if (typeof getDevice !== 'function' || !positive(maxTargets) || !positive(maxBytes) || typeof flipY !== 'boolean')
+    fail('OPTIONS', 'Invalid target owner options');
   const entries = new Map(), pipelines = new Map();
   let disposed = false, allocatedBytes = 0, terminal = null;
   const live = () => { if (disposed) fail('DISPOSED', 'Render target owner is disposed'); if (terminal) throw terminal; };
@@ -219,15 +237,15 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     budget(entry.shape.bytes);
     const device = getDevice();
     if (!device) fail('DEVICE', 'Initialize the renderer before acquiring target storage');
-    const {width, height, format, depthFormat, sampleCount, generateMipmaps} = entry.shape;
-    entry.storage = createGpuRenderTarget(device, {width, height, format, depthFormat, sampleCount, maxBytes, generateMipmaps,
+    const {width, height, format, depthFormat, sampleCount, generateMipmaps, mipLevelCount} = entry.shape;
+    entry.storage = createGpuRenderTarget(device, {width, height, format, depthFormat, sampleCount, maxBytes, generateMipmaps, mipLevelCount,
       sampleDepth: entry.shape.depthTexture !== null, copyDestination: true});
     entry.charged += entry.shape.bytes; allocatedBytes += entry.shape.bytes;
     // The readback helper consumes this session-shaped object. It copies the
     // original attachment, not the UV-oriented sampling replica.
     entry.session = {device, get width() { return width; }, get height() { return height; },
       get disposed() { return !entry.alive; }, get failed() { return !!entry.error || !!entry.storage?.failed; },
-      get diagnostics() { return {target: {format}}; },
+      get diagnostics() { return {target: {format, mipLevelCount}}; },
       withTexture(callback) { assertCurrent(entry); return entry.storage.withTexture(callback); }};
     return entry;
   }
@@ -279,7 +297,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
           entry.view = entry.sample.createView();
           let pipeline = pipelines.get(format);
           if (!pipeline) {
-            const module = device.createShaderModule({label: 'Source target UV orientation', code: FLIP_WGSL});
+            const module = device.createShaderModule({label: 'Source target UV orientation', code: FLIP_WGSL(flipY)});
             // textureLoad does not need filtering, but an automatic layout would
             // still infer sampleType:float and reject a feature-free float32 view.
             const layout = entry.shape.float32 ? device.createPipelineLayout({bindGroupLayouts: [device.createBindGroupLayout({entries: [
@@ -352,7 +370,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
           entry.depthView = entry.depthSample.createView();
           let pipeline = pipelines.get('depth-to-r32float');
           if (!pipeline) {
-            const module = device.createShaderModule({label: 'Source target depth UV orientation', code: DEPTH_FLIP_WGSL});
+            const module = device.createShaderModule({label: 'Source target depth UV orientation', code: DEPTH_FLIP_WGSL(flipY)});
             pipeline = device.createRenderPipeline({label: 'Source target depth UV orientation', layout: 'auto',
               vertex: {module, entryPoint: 'vs'}, fragment: {module, entryPoint: 'fs', targets: [{format: 'r32float'}]},
               primitive: {topology: 'triangle-list'}});
@@ -503,12 +521,21 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     copyColor(source, destination, options = {}) { return copyTarget(source, destination, options); },
     copyDepth(source, destination, options = {}) { return copyTarget(source, destination, options, true); },
     get allocatedBytes() { return allocatedBytes; }, get size() { return entries.size; },
-    render(entry, callback) {
+    render(entry, callback, {mipLevel = 0} = {}) {
+      assertCurrent(entry); inspectThreeRenderTargetMip(entry.shape, mipLevel);
       ensure(entry);
       if (entry.busy) fail('REENTRANT', 'Cannot reenter a target submission');
-      entry.busy = true; entry.dirty = true; entry.depthDirty = true;
-      try { return entry.storage.withFrame((frame, texture) => { const result = callback(frame, texture); assertCurrent(entry); return result; }); }
-      finally { entry.busy = false; if (!entry.alive) release(entry); }
+      budget(entry.storage.frameAllocationBytes(mipLevel));
+      const allocatedBefore = entry.storage.allocatedBytes;
+      entry.busy = true; entry.dirty = true;
+      // Higher private depth levels never modify the source's level-zero depth.
+      if (mipLevel === 0) entry.depthDirty = true;
+      try { return entry.storage.withFrame((frame, texture) => { const result = callback(frame, texture); assertCurrent(entry); return result; }, {mipLevel}); }
+      finally {
+        const delta = entry.storage.allocatedBytes - allocatedBefore;
+        entry.charged += delta; allocatedBytes += delta;
+        entry.busy = false; if (!entry.alive) release(entry);
+      }
     },
     async whenIdle() {
       live();

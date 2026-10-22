@@ -38,6 +38,16 @@ depth storage; zero/one or four samples with color resolve; physical-pixel targe
 viewport/scissor; nearest/linear filtering and source wrap/anisotropy settings.
 Canvas pixel ratio and tone mapping do not change offscreen attachments.
 
+Native `WebGPURenderer` accepts `setRenderTarget(target, 0, mipLevel)` for
+allocated single-sample color levels. Authored `texture.mipmaps` descriptors
+allocate levels independently of automatic generation; `generateMipmaps: false`
+preserves their separately rendered contents. Each level has matching private
+depth storage, allocated lazily within the shared budget. Queued draws and clears
+retain their selected level. See
+[THREE_RENDER_TARGET_MIP_SELECTION.md](./THREE_RENDER_TARGET_MIP_SELECTION.md)
+for viewport/scissor behavior, read/copy ordering and the explicit restrictions
+on MSAA, sampled depth and the WebGL facade.
+
 On the WebGL-compatible surface, each target owns independent shader-program
 state. Intermediate passes disable renderer tone mapping and emit linear values;
 an sRGB attachment applies its transfer function natively rather than encoding
@@ -55,10 +65,11 @@ object callbacks receive the original root. Callback-free, small fullscreen
 shader roots use the per-call capture described below instead of borrowing
 mutable shader inputs through asynchronous preparation.
 
-Sampling uses a persistent GPU-only vertically oriented replica of resolved
-color, refreshed lazily after writes. This costs an additional color image and
-one fullscreen GPU pass per written-and-sampled version, not a CPU download or
-upload. An unchanged version needs no extra pass. Native views stay stable across
+Sampling uses a persistent GPU-only replica of resolved color, refreshed lazily
+after writes. Native WebGPU preserves attachment row order; the WebGL-compatible
+surface flips rows to match its texture convention. This costs an additional
+color image and one fullscreen GPU pass per written-and-sampled version, not a
+CPU download or upload. An unchanged version needs no extra pass. Native views stay stable across
 content writes; resizing/disposal invalidates them and triggers consumer
 re-preparation. Aggregate target storage, including replicas, is bounded.
 
@@ -108,8 +119,8 @@ compiler and renderer admission restrictions also remain in force.
 
 ## Remaining gaps and verification
 
-MRT, cube/array targets, mip rendering/generation, sampled depth and stencil
-targets are not implemented by this profile. Shader programs retain their
+MRT and cube/array targets remain outside this profile. Nonzero mip rendering
+retains the restrictions above. Shader programs retain their
 explicit unsupported-feature errors. Mesh-root, offscreen shader and small-pass
 capture support remove postprocessing blockers but do not establish complete
 EffectComposer compatibility, effect parity or arbitrary scene snapshots.

@@ -45,7 +45,10 @@ export async function createGpuThreeScene(device, scene, options) {
         throw Object.assign(new Error('texture changed'), {code: 'THREE_SCENE_PREPARE'});
       scene.onDraw?.();
       const output = frame.resolveTarget ?? frame.colorView;
-      output.texture.value = scene.value ?? 0;
+      const level = output.descriptor?.baseMipLevel ?? 0;
+      output.texture.mipValues ??= new Map();
+      output.texture.mipValues.set(level, scene.value ?? 0);
+      if (level === 0) output.texture.value = scene.value ?? 0;
       device.queue.submit([{scene: scene.name, frame, sampled, program: options.program?.state(), renderOptions: options.renderer}]);
     },
     whenIdle: () => device.queue.onSubmittedWorkDone(), dispose() { disposed = true; },
@@ -77,7 +80,8 @@ export function fixture() {
       if (command.scene !== undefined) draws.push(command);
       for (const copy of command.copies ?? []) {
         copies.push(copy);
-        new Uint8Array(copy.target.buffer.data).fill(copy.source.texture.value ?? 0);
+        new Uint8Array(copy.target.buffer.data).fill(copy.source.texture.mipValues?.get(copy.source.mipLevel ?? 0)
+          ?? copy.source.texture.value ?? 0);
       }
     }
     submit(commands);

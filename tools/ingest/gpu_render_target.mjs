@@ -3,7 +3,10 @@
  * handles are borrowed only inside withFrame/withTexture, with consumers submitted
  * before returning. generateMipmaps:true allocates a full resolved color pyramid;
  * withTexture refreshes it on the GPU after the last withFrame write, before the
- * consumer runs. Attachments always select level zero; MSAA/depth stay single-level.
+ * consumer runs. mipLevelCount can instead allocate an authored pyramid without
+ * automatic generation. withFrame(callback, {mipLevel}) selects one color level;
+ * nonzero levels use private matching depth storage allocated on first use.
+ * Nonzero mip rendering requires one sample and private (not sampled) depth.
  * sampleDepth:true exposes the actual depth attachment through withDepthTexture.
  * withSampledTextures borrows resolved color and sampled depth together under
  * one lifetime guard. Depth-only reads do not refresh or dirty color mipmaps.
@@ -98,12 +101,13 @@ export function createGpuRenderTarget(device, options = {}) {
   if (!options || typeof options !== 'object' || Array.isArray(options))
     fail('OPTIONS', 'Expected render target options');
   for (const key of Object.keys(options))
-    if (!['width', 'height', 'format', 'depthFormat', 'sampleCount', 'maxBytes', 'label', 'generateMipmaps', 'sampleDepth', 'copyDestination'].includes(key))
+    if (!['width', 'height', 'format', 'depthFormat', 'sampleCount', 'maxBytes', 'label', 'generateMipmaps', 'mipLevelCount', 'sampleDepth', 'copyDestination'].includes(key))
       fail('OPTIONS', `Unknown target option: ${key}`);
   const {
     width: initialWidth = 1, height: initialHeight = 1,
     format = 'rgba16float', depthFormat = 'depth24plus', sampleCount = 1,
-    maxBytes = 256 * 1024 * 1024, label = 'Offscreen render target', generateMipmaps = false, sampleDepth = false, copyDestination = false,
+    maxBytes = 256 * 1024 * 1024, label = 'Offscreen render target', generateMipmaps = false,
+    mipLevelCount: requestedMipLevels, sampleDepth = false, copyDestination = false,
   } = options;
   if (!COLOR_BYTES.has(format) || !DEPTH_BYTES.has(depthFormat))
     fail('FORMAT', 'Unsupported color or depth format');
@@ -114,6 +118,8 @@ export function createGpuRenderTarget(device, options = {}) {
   if (typeof sampleDepth !== 'boolean') fail('OPTIONS', 'sampleDepth must be boolean');
   if (sampleDepth && depthFormat === null) fail('DEPTH', 'Sampled depth requires a depth attachment');
   if (typeof generateMipmaps !== 'boolean') fail('OPTIONS', 'generateMipmaps must be boolean');
+  if (requestedMipLevels !== undefined && (!Number.isSafeInteger(requestedMipLevels) || requestedMipLevels < 1))
+    fail('OPTIONS', 'mipLevelCount must be a positive integer');
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || typeof label !== 'string')
     fail('OPTIONS', 'Expected a positive byte budget and string label');
   if (!device || ['createTexture', 'pushErrorScope', 'popErrorScope'].some(k => typeof device[k] !== 'function') ||
@@ -132,7 +138,12 @@ export function createGpuRenderTarget(device, options = {}) {
   let current = null, disposed = false, terminal = null, busy = false, version = 0;
   let validation = Promise.resolve(), retirement = Promise.resolve();
   let mipPipeline = null, mipSampler = null, mipGenerations = 0, colorUploads = 0, colorCopies = 0, depthCopies = 0;
-  const levels = (w, h) => generateMipmaps && w && h ? 1 + Math.floor(Math.log2(Math.max(w, h))) : 1;
+  const levels = (w, h) => {
+    if (!w || !h) return 1;
+    const maximum = 1 + Math.floor(Math.log2(Math.max(w, h)));
+    if (requestedMipLevels > maximum) fail('SIZE', 'mipLevelCount exceeds the target extent');
+    return requestedMipLevels ?? (generateMipmaps ? maximum : 1);
+  };
   const transferShape = () => ({width, height, format, sampleCount, mipLevelCount: levels(width, height)});
   const depthShape = () => ({width, height, depthFormat, sampleCount, sampleDepth});
   const retired = new Set(), readbacks = new Set();
@@ -156,6 +167,7 @@ export function createGpuRenderTarget(device, options = {}) {
   const allocated = () => (current?.bytes ?? 0) + [...retired].reduce((n, pair) => n + pair.bytes, 0);
   const destroy = pair => {
     pair?.color?.destroy(); pair?.multisample?.destroy(); pair?.depth?.destroy();
+    for (const depth of pair?.mipDepths?.values() ?? []) depth.destroy();
   };
   function release() {
     destroy(current); current = null;
@@ -193,7 +205,7 @@ export function createGpuRenderTarget(device, options = {}) {
   }
   function allocate(w, h, bytes) {
     if (w === 0 || h === 0) return null;
-    const pair = {bytes, used: false, color: null, multisample: null, depth: null,
+    const pair = {bytes, used: false, color: null, multisample: null, depth: null, mipDepths: new Map(), frames: new Map(),
       mipLevelCount: levels(w, h), mipsDirty: true, mipSteps: null};
     try {
       checked(() => {
@@ -215,11 +227,12 @@ export function createGpuRenderTarget(device, options = {}) {
       pair.frame = Object.freeze({colorView: pair.multisampleView ?? pair.view,
         ...(pair.depthView ? {depthView: pair.depthView} : {}),
         ...(pair.multisampleView ? {resolveTarget: pair.view} : {})});
+      pair.frames.set(0, pair.frame);
       return pair;
     } catch (error) { destroy(pair); throw error; }
   }
   function refreshMips(pair) {
-    if (!pair.mipsDirty || pair.mipLevelCount === 1) return;
+    if (!generateMipmaps || !pair.mipsDirty || pair.mipLevelCount === 1) return;
     checked(() => {
       const methods = ['createShaderModule', 'createRenderPipeline', 'createBindGroup', 'createCommandEncoder',
         ...(float32 ? ['createBindGroupLayout', 'createPipelineLayout'] : ['createSampler'])];
@@ -271,17 +284,49 @@ export function createGpuRenderTarget(device, options = {}) {
     retirement = Promise.all([retirement, fence]);
     retirement.catch(stop);
   }
-  function borrow(callback, kind) {
+  function frameAllocationBytes(mipLevel = 0) {
+    exclusive();
+    if (!Number.isSafeInteger(mipLevel) || mipLevel < 0 || mipLevel >= (current?.mipLevelCount ?? 1))
+      fail('MIP', 'Render mip level is not allocated');
+    if (mipLevel > 0 && (sampleCount !== 1 || sampleDepth))
+      fail('MIP', 'Nonzero mip rendering requires single-sample color and private depth');
+    if (!current || current.frames.has(mipLevel) || depthFormat === null) return 0;
+    return Math.max(1, Math.floor(width / 2 ** mipLevel)) * Math.max(1, Math.floor(height / 2 ** mipLevel)) * DEPTH_BYTES.get(depthFormat);
+  }
+  function frameAt(mipLevel, bytes) {
+    if (current.frames.has(mipLevel)) return current.frames.get(mipLevel);
+    if (bytes > maxBytes - allocated()) fail('BUDGET', 'Mip depth allocation exceeds maxBytes');
+    let depth = null;
+    try {
+      const frame = checked(() => {
+        const colorView = current.color.createView({baseMipLevel: mipLevel, mipLevelCount: 1});
+        if (depthFormat !== null) {
+          depth = device.createTexture({label: `${label} mip ${mipLevel} depth`,
+            size: {width: Math.max(1, Math.floor(width / 2 ** mipLevel)), height: Math.max(1, Math.floor(height / 2 ** mipLevel)), depthOrArrayLayers: 1},
+            format: depthFormat, dimension: '2d', sampleCount: 1, mipLevelCount: 1, usage: 16});
+        }
+        return Object.freeze({colorView, ...(depth ? {depthView: depth.createView()} : {})});
+      });
+      if (depth) current.mipDepths.set(mipLevel, depth);
+      current.frames.set(mipLevel, frame); current.bytes += bytes;
+      return frame;
+    } catch (error) { depth?.destroy(); throw error; }
+  }
+  function borrow(callback, kind, mipLevel = 0) {
     exclusive();
     if ((kind === 'depth' || kind === 'sampled') && !sampleDepth) fail('DEPTH', 'Enable sampleDepth before borrowing the depth texture');
     if (typeof callback !== 'function') fail('CALLBACK', 'Expected a synchronous submitted-use callback');
+    const extraBytes = kind === 'frame' ? frameAllocationBytes(mipLevel) : 0;
     if (!current) return false;
+    // Budget rejection is retryable and happens before marking this owner busy.
+    if (extraBytes > maxBytes - allocated()) fail('BUDGET', 'Mip depth allocation exceeds maxBytes');
     busy = true;
     try {
+      const frame = kind === 'frame' ? frameAt(mipLevel, extraBytes) : null;
       current.used = true; // Even a throwing callback may have submitted work.
       if (kind === 'frame') current.mipsDirty = true;
       else if (kind === 'color' || kind === 'sampled') refreshMips(current);
-      const result = kind === 'frame' ? callback(current.frame, current.color)
+      const result = kind === 'frame' ? callback(frame, current.color)
         : kind === 'sampled' ? callback(current.color, current.depth)
         : callback(kind === 'depth' ? current.depth : current.color);
       if (result && typeof result.then === 'function') {
@@ -341,7 +386,8 @@ export function createGpuRenderTarget(device, options = {}) {
       } catch (error) { destroy(replacement); stop(error); throw error; }
       finally { busy = false; if (terminal !== null) release(); }
     },
-    withFrame(callback) { return borrow(callback, 'frame'); },
+    frameAllocationBytes,
+    withFrame(callback, {mipLevel = 0} = {}) { return borrow(callback, 'frame', mipLevel); },
     withTexture(callback) { return borrow(callback, 'color'); },
     withDepthTexture(callback) { return borrow(callback, 'depth'); },
     withSampledTextures(callback) { return borrow(callback, 'sampled'); },
