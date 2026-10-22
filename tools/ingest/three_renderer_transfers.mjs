@@ -137,6 +137,9 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
     get pendingRequests() { return active.size; },
     get allocatedBytes() { return allocatedBytes; },
     async whenIdle() { await Promise.all([...active].map(state => state.promise)); },
+    // Renderer mixins can delegate source-shaped target copies to this same
+    // owner even when their prototype method prevents instance installation.
+    copyTexture(...args) { return copyTexture(...args); },
     writePixels(target, data, supplied = {}) {
       try {
         live();

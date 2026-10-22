@@ -4,6 +4,8 @@ import {ThreeStorageCopyError} from './three_texture_copy_plan.mjs';
 import {captureTargetToStorageCopy} from './three_target_texture_copy.mjs';
 export {ThreeStorageCopyError, inspectStorageTextureCopy} from './three_texture_copy_plan.mjs';
 const fail = (code, message) => { throw new ThreeStorageCopyError(code, message); };
+const ordinaryTargetTexture = texture => texture?.renderTarget != null && texture.isStorageTexture !== true &&
+  (texture.isRenderTargetTexture === true || texture.isDepthTexture === true);
 
 /** Install below withThreeCompute's facade. Its waitForGPU already waits on the
  * shared storage owner; this layer additionally reports rejected FIFO entries.
@@ -20,6 +22,15 @@ export function withStorageTextureCopies(Base) {
     copyTextureToTexture(source, destination, region = null, position = null, sourceLevel = 0, destinationLevel = 0) {
       if (this._disposed) fail('DISPOSED', 'Renderer is disposed');
       if (this._deferredError) { const error = this._deferredError; this._deferredError = null; throw error; }
+      // The target transfer facade installs source methods per instance. This
+      // inherited method suppresses that installation, so super cannot reach it.
+      // Dispatch only two ordinary target endpoints; storage admission stays here.
+      if (ordinaryTargetTexture(source) && ordinaryTargetTexture(destination) &&
+          typeof this._transfers?.copyTexture === 'function') {
+        this._transfers.copyTexture(source, destination, region, position, sourceLevel, destinationLevel)
+          .catch(error => { this._deferredError ??= error; });
+        return;
+      }
       if (!this.isWebGPURenderer) fail('ROUTE', 'Storage texture copies require the WebGPU renderer surface');
       if (!this._initialized) fail('INITIALIZATION', 'Initialize the renderer before copying textures');
       let issue;

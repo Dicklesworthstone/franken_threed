@@ -452,3 +452,28 @@ test('many transfers share one lifetime/caller listener and remove it after comp
   for (const value of countsBySignal.values()) assert.equal(value.removed, 1);
   counts(r, 0, 0); r.dispose();
 });
+
+for (const gl of [false, true]) test(`${gl ? 'WebGL' : 'WebGPU'} public target texture copies compose with the storage facade and retain FIFO capture`, async () => {
+  const f = fixture({gl}), r = f.renderer, a = target('rgba8unorm', 4, 4), b = target('rgba8unorm', 4, 4);
+  for (const t of [a, b]) t.texture = {isTexture: true, isRenderTargetTexture: true, renderTarget: t};
+  await f.ready();
+  const gate = deferred(); f.controls.prepare = gate;
+  const draw = r.renderAsync(new Scene(), new Camera());
+  const before = r.writeRenderTargetPixelsAsync(a, new Uint8Array(a.bytes.length).fill(9));
+  const region = {min: {x: 1, y: 1}, max: {x: 3, y: 3}}, position = {x: 0, y: 0};
+  assert.equal(r.copyTextureToTexture(a.texture, b.texture, region, position), undefined);
+  region.max.x = 999; position.x = 999;
+  const after = r.writeRenderTargetPixelsAsync(a, new Uint8Array(a.bytes.length).fill(17));
+  assert.equal(f.calls.length, 0);
+  gate.resolve(); await Promise.all([draw, before, after]); await r.waitForGPU();
+  assert.deepEqual(f.calls.map(call => call.kind), ['draw', 'upload', 'copy', 'upload']);
+  const call = f.calls.find(call => call.kind === 'copy');
+  assert.equal(call.options.width, 2); assert.equal(call.options.height, 2); assert.equal(call.options.x, 0);
+  assert.equal(call.options.sourceMipLevel, 0); assert.equal(call.options.flipY, gl);
+  assert.ok(a.bytes.every(n => n === 17));
+  const originY = gl ? 2 : 0;
+  for (let y = 0; y < 4; y++) for (let x = 0; x < 4; x++)
+    assert.equal(b.bytes[(y * 4 + x) * 4], x < 2 && y >= originY && y < originY + 2 ? 9 : 0);
+  assert.throws(() => r.copyTextureToTexture(a.texture, b.texture, null, null, 0, 1), {code: 'F3D_RENDERER_UNSUPPORTED'});
+  counts(r, 0, 0); r.dispose();
+});
