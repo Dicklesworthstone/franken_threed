@@ -32,6 +32,7 @@ import {createGpuThreeTextures,createThreeTextureBindings} from './three_texture
 import {hasThreeDeformation, inspectThreeDeformation, createGpuThreeDeformation,
   updateGpuThreeDeformations} from './three_deformation.mjs';
 import {threeProgramStencil} from './three_program_stencil.mjs';
+import {threeSpriteCount,threeSpriteWorldMatrix} from './three_sprites.mjs';
 export class ThreeSceneError extends Error {
   constructor(code,message){super(`THREE_SCENE_${code}: ${message}`);this.name='ThreeSceneError';this.code='THREE_SCENE_'+code;}
 }
@@ -66,7 +67,7 @@ const topologyOf=object=>object.isPoints?'points':object.isLineSegments?'lines':
 // Indexed line strips fix their index format in the native pipeline.
 const srgbEncode=rgb=>rgb.map(c=>c<=0.0031308?c*12.92:1.055*Math.pow(c,0.41666)-0.055);
 const stripSignature=(shape,topology)=>topology==='line-strip'&&shape.indexFormat?shape.signature+'|'+shape.indexFormat:shape.signature;
-const drawable=object=>object.isMesh||object.isPoints||(object.isLine&&!object.isLineLoop);
+const drawable=object=>object.isMesh||object.isSprite||object.isPoints||(object.isLine&&!object.isLineLoop);
 
 export async function createGpuThreeScene(device,scene,{
   three, textures=new Map(), autoTextures=true, texture:textureOptions={}, renderer:renderOptions={}, geometry:geometryOptions={},
@@ -160,13 +161,13 @@ export async function createGpuThreeScene(device,scene,{
     [three.MeshBasicMaterial.prototype,'unlit'],[three.MeshLambertMaterial.prototype,'lambert'],
     [three.MeshPhongMaterial.prototype,'phong'],[three.MeshToonMaterial.prototype,'toon'],
     [three.MeshStandardMaterial.prototype,'metallic-roughness'],
-    ...['LineBasicMaterial','PointsMaterial'].filter(name=>typeof three[name]==='function').map(name=>[three[name].prototype,'unlit']),
+    ...['LineBasicMaterial','PointsMaterial','SpriteMaterial'].filter(name=>typeof three[name]==='function').map(name=>[three[name].prototype,'unlit']),
     // Node-material classes of the WebGPU build with every node slot null are the
     // same shading models: the source WebGPU renderer converts the classic
     // materials into exactly these classes. Any assigned node fails explicitly.
     ...[['MeshBasicNodeMaterial','unlit'],['MeshLambertNodeMaterial','lambert'],['MeshPhongNodeMaterial','phong'],
       ['MeshToonNodeMaterial','toon'],['MeshStandardNodeMaterial','metallic-roughness'],['LineBasicNodeMaterial','unlit'],
-      ['PointsNodeMaterial','unlit'],['MeshPhysicalMaterial','metallic-roughness'],['MeshPhysicalNodeMaterial','metallic-roughness'],
+      ['PointsNodeMaterial','unlit'],['SpriteNodeMaterial','unlit'],['MeshPhysicalMaterial','metallic-roughness'],['MeshPhysicalNodeMaterial','metallic-roughness'],
       ['MeshNormalMaterial','normal'],['MeshNormalNodeMaterial','normal']].filter(([name])=>typeof three[name]==='function').map(([name,model])=>[three[name].prototype,model]),
   ]);
   const geometries=new Map(),instances=new Map(),materials=new Map(),deformations=new Map();
@@ -292,6 +293,8 @@ export async function createGpuThreeScene(device,scene,{
       }
       if(object.isMesh){
         if(Array.isArray(object.material)&&object.material.length>maxBindings)fail('LIMIT','Source material array exceeds capacity');
+        if(!programRoute()&&colorMaterials(object).some(m=>m?.isSpriteMaterial||m?.isSpriteNodeMaterial))
+          fail('MATERIAL','Native sprite materials currently require a Sprite object');
         if((object.isBatchedMesh&&!programRoute())||object.intersectsFrustum!==(object.isSkinnedMesh?three.SkinnedMesh?.prototype.intersectsFrustum:three.Mesh.prototype.intersectsFrustum))
           fail('OBJECT','Use the explicit animation/instance path for this mesh family');
         // BatchedMesh (WebGL surface): its ShaderLib program with r186's
@@ -321,11 +324,20 @@ export async function createGpuThreeScene(device,scene,{
             fail('SHADOW','Line and point shadows are not admitted');
           geometryAdmission(object.geometry,object);
         }
-      } else if(object.isSprite&&programRoute()){
-        // WebGL surface: sprites draw their SpriteMaterial (or ShaderMaterial) program.
+      } else if(object.isSprite){
         const list=colorMaterials(object);
-        if(!list.every(m=>!m||programCapable(m)))fail('OBJECT','Sprites need a program-capable material');
-      } else if(object.isSprite||object.isLightProbe||object.isLightProbeGrid)
+        if(programRoute()){
+          // WebGL-authored sprites retain their existing SpriteMaterial program.
+          if(!list.every(m=>!m||programCapable(m)))fail('OBJECT','Sprites need a program-capable material');
+        }else{
+          if(!(object instanceof three.Sprite)||object.intersectsFrustum!==three.Sprite.prototype.intersectsFrustum)
+            fail('OBJECT','Expected a source Sprite without custom frustum tests');
+          if(Array.isArray(object.material)||!list.every(m=>m?.isSpriteMaterial||m?.isSpriteNodeMaterial))
+            fail('MATERIAL','Native sprites require SpriteMaterial or SpriteNodeMaterial');
+          threeSpriteCount(object);
+          geometryAdmission(object.geometry,object);
+        }
+      } else if(object.isLightProbe||object.isLightProbeGrid)
         fail('OBJECT',`Unsupported source renderable: ${object.type}`);
       for(let i=object.children.length-1;i>=0;i--)stack.push(object.children[i]);
     }
@@ -777,7 +789,7 @@ export async function createGpuThreeScene(device,scene,{
       // GL point sizes need the program route; elsewhere the core path renders
       // what it admits and the ShaderLib program covers what it rejects.
       // GL point sizes, dashed lines (lineDistance) and line loops need their programs.
-      if(m.isPointsMaterial||m.isLineDashedMaterial||object.isLineLoop)return programDescription(m,topology,object);
+      if(m.isPointsMaterial||m.isLineDashedMaterial||object.isLineLoop||object.isSprite)return programDescription(m,topology,object);
       // Keep GL stencil conversion on its existing ShaderLib route. The core
       // material mapper below follows WebGPU's unsigned reference contract.
       if(m.stencilWrite&&stencilAttachment)return programDescription(m,topology,object);
@@ -1220,7 +1232,7 @@ export async function createGpuThreeScene(device,scene,{
         else if(!shadowOwner||shadowOwner.source!==selected||!shadowOwner.matches()){
           const available=maxShadowBytes-(shadowOwner?.allocatedBytes??0);
           if(available<1)fail('LIMIT','Shadow replacement exceeds the old-plus-new GPU budget');
-          nextShadow=await shadowApi.createGpuThreeShadow(device,selected,{three,maxBytes:available,clipping:clippingEnabled,maxClippingPlanes,textureTransforms,alphaMaps,
+          nextShadow=await shadowApi.createGpuThreeShadow(device,selected,{three,maxBytes:available,clipping:clippingEnabled,maxClippingPlanes,textureTransforms,alphaMaps,alphaTextureComponent:programRoute()?'g':'r',
             maxDraws:renderOptions.maxDraws??1024,maxMeshes:2*maxBindings,signal:deformationLifetime.signal});
           pendingShadow=nextShadow;live();
         }
@@ -1451,7 +1463,10 @@ export async function createGpuThreeScene(device,scene,{
       }
       const lighting=cameraFrame(camera,options.matricesUpdated===true);lighting.lights=[];
       const arrayViews=arrayCameraViews(camera,arrayProfile,frame);
-      const cullingFrustum=arrayViews?{intersectsObject:object=>arrayViews.some(view=>view.frustum.intersectsObject(object))}:frustum;
+      const cullingFrustum=arrayViews?{
+        intersectsObject:object=>arrayViews.some(view=>view.frustum.intersectsObject(object)),
+        intersectsSprite:object=>arrayViews.some(view=>view.frustum.intersectsSprite(object)),
+      }:frustum;
       if(programRoute()){programCamera=camera;programSupport.beginFrame?.();programSupport.setLights(programLightList(camera));programSupport.setLightsView(camera);}
       // View rotation for view-space shading models (MeshNormalMaterial).
       lighting.viewMatrix=camera.matrixWorldInverse.elements;
@@ -1471,6 +1486,7 @@ export async function createGpuThreeScene(device,scene,{
       };
       function append(object,groupOrder,z,shadowPass=false){
         const source=object.geometry,topology=topologyOf(object);
+        if(object.isSprite&&!programRoute()&&threeSpriteCount(object)===0)return;
         function push(original,sourceGroup){
               if(!original||!original.visible)return;
               if(shadowPass&&original.transparent){
@@ -1532,9 +1548,15 @@ export async function createGpuThreeScene(device,scene,{
             const g=object.geometry;
             let z=0;
             if(sortObjects){
-              const bounds=object.boundingSphere!==undefined?object: g;
-              if(bounds.boundingSphere===null)bounds.computeBoundingSphere();
-              z=center.copy(bounds.boundingSphere.center).applyMatrix4(object.matrixWorld).applyMatrix4(vp).z;
+              if(object.isSprite){
+                // Source sprite sorting uses its origin, never mutable geometry bounds.
+                const e=object.matrixWorld.elements,p=vp.elements;
+                z=p[2]*e[12]+p[6]*e[13]+p[10]*e[14]+p[14];
+              }else{
+                const bounds=object.boundingSphere!==undefined?object: g;
+                if(bounds.boundingSphere===null)bounds.computeBoundingSphere();
+                z=center.copy(bounds.boundingSphere.center).applyMatrix4(object.matrixWorld).applyMatrix4(vp).z;
+              }
             }
             append(object,groupOrder,z);
             }
@@ -1562,7 +1584,7 @@ export async function createGpuThreeScene(device,scene,{
         opaque.unshift({object:bg,geometry:bg.geometry,material:bg.material,listMaterial:bg.material,group:null,groupOrder:0,z:0,desc,bindings,shadowPass:false,program:true});
       }
       const items=[...opaque,...transmissive,...transparent],draws=[],drawObjects=[];
-      if(items.reduce((n,item)=>n+item.bindings.length*(arrayViews?.length?arrayViews.filter(v=>item.object.layers.test(v.camera.layers)).length:1),0)>(renderOptions.maxDraws??1024))
+      if(items.reduce((n,item)=>n+item.bindings.length*(item.object.isSprite&&!item.program?threeSpriteCount(item.object):1)*(arrayViews?.length?arrayViews.filter(v=>item.object.layers.test(v.camera.layers)).length:1),0)>(renderOptions.maxDraws??1024))
         fail('LIMIT','Expanded source draws exceed capacity');
       // Complete texture/material preflight first, then publish requested bytes
       // before this frame's immediate draw submission. Stable views keep bundles
@@ -1691,18 +1713,20 @@ export async function createGpuThreeScene(device,scene,{
           item.object.normalMatrix.getNormalMatrix(item.object.modelViewMatrix);
         }
         for(let i=0;i<item.bindings.length;i++){
-          const values=item.desc[i].values,clipped=item.desc[i].clipped,common={worldMatrix:item.object.matrixWorld.elements,first,count};
+          const values=item.desc[i].values,clipped=item.desc[i].clipped,common={worldMatrix:item.object.isSprite?
+            threeSpriteWorldMatrix(three,item.object,item.material,drawCamera):item.object.matrixWorld.elements,first,count};
           if(!item.shadowPass&&item.desc[i].coat)item.bindings[i].mesh.setClearcoat(item.desc[i].coat);
           if(item.shadowPass)shadowDraws.push({mesh:casters.get(item.bindings[i]),...common,baseColor:values.baseColor,
             ...(textureTransforms?{mapTransforms:opacityFields(values.mapTransforms)}:{}),
             ...(clipped?{clippingPlanes:clipped.clipShadows?clipped.clippingPlanes:[],clipIntersection:clipped.clipIntersection}:{}),
             ...(values.uvTransform?{uvTransform:values.uvTransform}:{}),
             ...(values.alphaCutoff!==undefined?{alphaCutoff:values.alphaCutoff}:{})});
-          else {drawObjects.push(item.object);draws.push({mesh:item.bindings[i].mesh,...common,...values,
+          else {for(let instance=0,instances=item.object.isSprite?threeSpriteCount(item.object):1;instance<instances;instance++){
+            drawObjects.push({object:item.object,material:item.material});draws.push({mesh:item.bindings[i].mesh,...common,...values,
             ...(clipped?{clippingPlanes:clipped.clippingPlanes,clipIntersection:clipped.clipIntersection}:{}),
             ...(fogEnabled?{receiveFog:item.desc[i].receiveFog}:{}),
             ...(shadowEnabled?{receiveShadow:item.object.receiveShadow}:{}),
-            ...(environmentEnabled?{receiveEnvironment:item.desc[i].options.shading==='metallic-roughness'}:{})});}
+            ...(environmentEnabled?{receiveEnvironment:item.desc[i].options.shading==='metallic-roughness'}:{})});}}
         }
       }
       // One fused core batch precedes all consuming material/group draws. No
@@ -1746,13 +1770,26 @@ export async function createGpuThreeScene(device,scene,{
             scissor:frame.scissor??null,screenSize:arrayProfile.targetSize??null});
           backgrounds++;live();
         }
-        for(let i=0;i<draws.length;i++)for(const view of arrayViews){
-          if(!drawObjects[i].layers.test(view.camera.layers))continue;
+        for(let i=0;i<draws.length;){
+          const {object,material}=drawObjects[i];
+          const repetitions=object.isSprite?threeSpriteCount(object):1;
+          for(const view of arrayViews){
+          if(!object.layers.test(view.camera.layers))continue;
           activeViewport=view.viewport??activeViewport;
           if(activeViewport&&(activeViewport[2]===0||activeViewport[3]===0))continue;
-          renderer.render({...loaded,viewport:activeViewport,viewProjection:view.viewProjection,
-            lighting:{...view.lighting,lights:lighting.lights},draws:[draws[i]],...(fogEnabled?{fog:view.fog}:{})});
-          geometrySubmitted=true;logical+=renderer.drawCount;calls+=renderer.drawCallCount;passes+=renderer.colorPassCount??1;live();
+          // NodeBuilder selects perspective attenuation from the ArrayCamera;
+          // its per-view matrix uniform still comes from the current child.
+          const draw=object.isSprite?{...draws[i],worldMatrix:threeSpriteWorldMatrix(three,object,material,view.camera,
+            {perspective:camera.isPerspectiveCamera===true})}:draws[i];
+          // Source draws every instance in this view before advancing views;
+          // overlapping translucent viewports make that order observable.
+          for(let instance=0;instance<repetitions;instance++){
+            renderer.render({...loaded,viewport:activeViewport,viewProjection:view.viewProjection,
+              lighting:{...view.lighting,lights:lighting.lights},draws:[draw],...(fogEnabled?{fog:view.fog}:{})});
+            geometrySubmitted=true;logical+=renderer.drawCount;calls+=renderer.drawCallCount;passes+=renderer.colorPassCount??1;live();
+          }
+          }
+          i+=repetitions;
         }
         // The initial clear resolves before the background writes. If no view
         // submits geometry afterwards, publish the final multisample image now.
@@ -1805,7 +1842,7 @@ export async function createGpuThreeScene(device,scene,{
     // Source validation precedes even the renderer's uniform allocation.
     signal?.addEventListener('abort',onAbort,{once:true});if(signal?.aborted)onAbort();live();
     scanWithShadowRoute();
-    const construction=createGpuAnimationRenderer(device,{...renderOptions,textureTransforms,alphaMaps,clipping:clippingEnabled,...(backgroundEnabled?{format:renderOptions.format??'rgba8unorm',sampleCount:renderOptions.sampleCount??1}:{}),...(shadowEnabled?{shadows:true}:{}),...(environmentEnabled?{environment:true}:{}),...(fogEnabled?{fog:true}:{}),indirectLights:true,threeLights:true,maxMeshes:2*maxBindings}).then(value=>{
+    const construction=createGpuAnimationRenderer(device,{...renderOptions,textureTransforms,alphaMaps,alphaTextureComponent:programRoute()?'g':'r',clipping:clippingEnabled,...(backgroundEnabled?{format:renderOptions.format??'rgba8unorm',sampleCount:renderOptions.sampleCount??1}:{}),...(shadowEnabled?{shadows:true}:{}),...(environmentEnabled?{environment:true}:{}),...(fogEnabled?{fog:true}:{}),indirectLights:true,threeLights:true,maxMeshes:2*maxBindings}).then(value=>{
       if(disposed||terminal){value.dispose();throw terminal??new ThreeSceneError('DISPOSED','Source scene is disposed');}
       renderer=shadowEnabled?shadowApi.withThreeShadowReceivers(value,renderOptions.maxDraws??1024):value;
       if(environmentEnabled)renderer=environmentApi.withThreeEnvironmentReceivers(renderer,renderOptions.maxDraws??1024);

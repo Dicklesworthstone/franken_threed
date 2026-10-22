@@ -95,7 +95,7 @@ function inspectSunShadow(light, three) {
  * autoUpdate:false deliberately retains the last published map until needsUpdate.
  */
 export async function createGpuThreeShadow(device, light, {three, maxBytes = 64 * 1024 * 1024,
-  maxDraws = 1024, maxMeshes = 1024, label = 'f3d-three-shadow', signal, clipping = false, maxClippingPlanes = 8, textureTransforms = false, alphaMaps = false} = {}) {
+  maxDraws = 1024, maxMeshes = 1024, label = 'f3d-three-shadow', signal, clipping = false, maxClippingPlanes = 8, textureTransforms = false, alphaMaps = false, alphaTextureComponent = 'g'} = {}) {
   if(typeof clipping!=='boolean'||!Number.isSafeInteger(maxClippingPlanes)||maxClippingPlanes<1||maxClippingPlanes>64)
     fail('OPTIONS','Invalid clipping profile');
   if(typeof textureTransforms!=='boolean') fail('OPTIONS','textureTransforms must be boolean');
@@ -125,7 +125,7 @@ export async function createGpuThreeShadow(device, light, {three, maxBytes = 64 
   try {
     if (signal?.aborted) onAbort(); live();
     const constructing = createGpuAnimationShadowMap(device, {
-      width: shape.width, height: shape.height, maxBytes, maxDraws, maxMeshes, label, filter: 'linear', ...(alphaMaps?{alphaMaps}:{}), ...(textureTransforms?{textureTransforms}:{}), ...(clipping?{clipping,maxClippingPlanes}:{}),
+      width: shape.width, height: shape.height, maxBytes, maxDraws, maxMeshes, label, filter: 'linear', alphaTextureComponent, ...(alphaMaps?{alphaMaps}:{}), ...(textureTransforms?{textureTransforms}:{}), ...(clipping?{clipping,maxClippingPlanes}:{}),
     }).then(value => {
       if (disposed || terminal) { value.dispose(); throw terminal ?? new ThreeShadowError('DISPOSED', 'Source shadows are disposed'); }
       map = value; return value;

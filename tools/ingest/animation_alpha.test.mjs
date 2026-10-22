@@ -83,6 +83,22 @@ test('depth-only masks use the same alpha sample and independent baked coordinat
   assert.equal(words(s)[20],.125);r.dispose();
 });
 
+test('native opacity component is explicit for color and depth while invalid selectors allocate nothing',async()=>{
+  for(const format of ['rgba8unorm',null]){
+    const d=device(),r=await createGpuAnimationRenderer(d,{format,alphaMaps:true,alphaTextureComponent:'r',maxDraws:1});
+    const m=await r.addMesh(geometry(d),{alphaTexture:binding(),texCoords:coords,alphaMode:'MASK'});
+    r.render(format===null?{depthView:{},viewProjection:I,draws:[m]}:frame([m]));
+    const code=d.snapshots[0][0].pipeline.fragment.module.code;
+    assert.match(code,/rgba\.a \*= alpha_texel\.r;/);assert.doesNotMatch(code,/rgba\.a \*= alpha_texel\.g;/);
+    r.dispose();
+  }
+  for(const alphaTextureComponent of [null,'b','a','rg',1]){
+    const d=device();
+    await assert.rejects(createGpuAnimationRenderer(d,{alphaMaps:true,alphaTextureComponent}),{code:'ANIMATION_RENDER_OPTIONS'});
+    assert.equal(d.buffers.length,0);assert.equal(d.pipelines.length,0);assert.equal(d.submissions.length,0);
+  }
+});
+
 test('all nine maps coexist with clearcoat: independent binding indices and layout identities',async()=>{
   const d=device(),r=await createGpuAnimationRenderer(d,{alphaMaps:true,textureTransforms:true,instancing:true,fog:true,clipping:true,maxDraws:3});
   const g=geometry(d),textures=Object.fromEntries(fields.map(f=>[f,binding()]));

@@ -30,13 +30,19 @@ color/alpha/depth, `autoClear*`, `toneMapping` (fixed at `init()`),
 `toneMappingExposure`, `shadowMap.enabled`, `info`, `dispose()`.
 
 Scene content is whatever `three_scene.mjs` admits: Mesh/InstancedMesh/skinned and
-morphed meshes; Line/LineSegments/Points (one-pixel, as upstream WebGPU; LineLoop is
+morphed meshes; Sprite; Line/LineSegments/Points (one-pixel, as upstream WebGPU; LineLoop is
 reported and not drawn, as upstream); Basic/Lambert/Phong/Toon/Standard and
 Physical with the specular and clearcoat profiles below,
 LineBasic and Points materials; all source blending modes, premultiplied alpha,
 polygon offset; ambient/hemisphere/directional/point/spot lights (up to 8); fog;
 one directional/spot shadow; HDR environment/background panoramas; clipping
 planes; textures with transforms.
+
+Native sprites accept `SpriteMaterial` and default `SpriteNodeMaterial`, with
+camera-facing transforms, live center/rotation, size attenuation, map/alpha-map
+textures and ordered transparent repeats from `Sprite.count`. ArrayCamera views
+receive their own billboard matrices. See [THREE_SPRITES.md](./THREE_SPRITES.md)
+for the supported source behavior and explicit custom-node/hook limits.
 
 Standard and Physical materials, including their default node-material forms,
 accept independent `metalnessMap` and `roughnessMap` textures with their own
@@ -87,7 +93,7 @@ scene/object/material render hooks retain their existing explicit rejection.
 - Not admitted (explicit `F3DRendererError`/`ThreeSceneError`):
   XR, custom tone mapping, logarithmic/reversed depth, non-sRGB
   output, custom node graphs, the remaining physical-material extensions,
-  MeshMatcap/Depth materials, sprites,
+  MeshMatcap/Depth materials,
   transparent clears with tone mapping.
 - Upstream passes non-one factors with Min/Max blend equations, which WebGPU
   rejects; this renderer keeps the GL meaning.

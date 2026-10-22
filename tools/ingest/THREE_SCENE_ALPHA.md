@@ -1,7 +1,12 @@
 # Independent opacity maps on the explicit WebGPU path
 
 `createGpuThreeScene` accepts source `alphaMap` textures with `alphaMaps:true`.
-The map's green channel multiplies material opacity, vertex alpha and base-color
+The pinned native r186 node-material path uses the map's red component:
+`MaterialNode.OPACITY` multiplies by its texture vector and `NodeBuilder.format`
+converts that result to a scalar through its first component. The scene bridge
+matches this behavior in color and masked shadow passes. The WebGL-authored route
+and the generic explicit renderer retain their green-component contract.
+The selected component multiplies material opacity, vertex alpha and base-color
 map alpha before alpha testing and blending. It never tints RGB and does not use
 the opacity texture's own alpha channel. This is new host/WGSL execution, not a
 retained renderer. Other scene-bridge material and object restrictions still apply.
@@ -74,6 +79,9 @@ The direct `createGpuAnimationRenderer` option is also `alphaMaps:true`; materia
 supply `alphaTexture:{view,sampler}`. Registration accepts `alphaTest:true` alongside
 `alphaMode:'BLEND'`. Alpha-tested draws may override `alphaCutoff`. Maps use the
 existing `mapCoordinates`, `mapChannels` and `mapTransforms` fields.
+The direct renderer and shadow-map API default to `alphaTextureComponent:'g'`;
+`'r'` selects the native r186 opacity component. The source scene bridge selects
+the component from its renderer route, independently of its lighting profile.
 
 The alpha sampler/view occupy bindings 17/18; binding 16 remains the clearcoat
 uniform. The optional ninth UV transform adds 32 bytes only when independent

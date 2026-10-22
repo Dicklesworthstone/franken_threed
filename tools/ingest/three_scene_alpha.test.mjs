@@ -58,7 +58,7 @@ function words(draw){const {group,offsets}=draw.groups.get(0),entry=group.entrie
 const matrix=t=>{const e=t.matrix.elements;return [e[0],e[3],e[6],0,e[1],e[4],e[7],0].map(Math.fround);};
 const uv=(draw,slot=8,clip=0)=>[...words(draw).slice(64+clip+8*slot,72+clip+8*slot)];
 const alphaView=draw=>draw.groups.get(1).group.entries.find(e=>e.binding===18).resource;
-const alphaCode=draw=>assert.match(draw.pipeline.fragment.module.code,/rgba\.a \*= alpha_texel\.g;/);
+const alphaCode=draw=>assert.match(draw.pipeline.fragment.module.code,/rgba\.a \*= alpha_texel\.r;/);
 function shadow(h,type='DirectionalLight'){
   const light=new T[type]();light.position.z=3;light.castShadow=true;light.shadow.mapSize.set(16,16);h.scene.add(light);
   h.mesh.castShadow=true;h.mesh.receiveShadow=true;return light;

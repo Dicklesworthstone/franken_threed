@@ -3,7 +3,9 @@
 // namespace; nothing here depends on which renderer executes it.
 import { RoomEnvironment } from '../../../upstream/three.js/examples/jsm/environments/RoomEnvironment.js';
 import { pbrMapScenarios } from './scenarios_pbr_maps.js';
+import { spriteScenarios } from './scenarios_sprites.js';
 export const scenarios = {
+  ...spriteScenarios,
   ...pbrMapScenarios,
   physical_specular_factors(THREE) {
     const scene = new THREE.Scene(); scene.background = new THREE.Color(0x14191f);

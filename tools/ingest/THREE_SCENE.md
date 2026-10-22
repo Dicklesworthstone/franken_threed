@@ -54,6 +54,13 @@ at every render. Shared geometry has one GPU residency but independent per-draw
 world/material packets. Source arrays, materials, mesh identities and hierarchy
 remain owned by Three.js.
 
+Native `Sprite` objects with `SpriteMaterial` or default `SpriteNodeMaterial`
+use the existing unlit material renderer with a per-draw billboard matrix.
+Center, rotation, attenuation, independent color/alpha maps, source culling and
+ordering, repeated counts and ArrayCamera views follow the bounded profile in
+[THREE_SPRITES.md](./THREE_SPRITES.md). Source geometry and object matrices remain
+application-owned.
+
 Color, opacity, emission, MASK alpha thresholds, Phong specular/shininess, PBR factors, shared map
 transforms, transforms, draw ranges, groups, visibility, renderOrder, camera
 layers, light values and LOD selection are live. Prepare after adding a new
@@ -346,7 +353,7 @@ its public geometry. These are not native shader/pixel measurements. The current
 container blocks browser navigation, so native GPU validation is still required.
 
 SkinnedMesh/BatchedMesh adoption, per-instance morph textures, arbitrary
-InstancedBufferGeometry/divisors, lines/points/sprites, source
+InstancedBufferGeometry/divisors, lines/points, source
 shadow/environment ownership, additional material/map families, fog, clipping,
 stencil, polygon offset, custom shaders/hooks, render targets and complete
 output color/tone-mapping workflows remain required work. The separate explicit

@@ -202,7 +202,9 @@
  *
  * alphaMaps:true admits alphaTexture on every shading profile, including depth.
  * Its GREEN channel multiplies base/color-map/vertex opacity before alpha test
- * and blending, never RGB. The optional ninth map supports independent UVs and
+ * and blending, never RGB. alphaTextureComponent:'r' selects the pinned native
+ * r186 node-material red component; the explicit/WebGL default remains 'g'.
+ * The optional ninth map supports independent UVs and
  * live transforms; textureTransforms adds 32 packet bytes only in this profile.
  * alphaTest:true also permits tested BLEND materials; alphaCutoff stays live.
  * This does not add stochastic alpha, alpha-to-coverage or translucent shadows.
@@ -400,6 +402,7 @@ function surfaceShader(
   uvSlots = 8,
   premultipliedAlpha = false,
   srgbOutput = false,
+  alphaTextureComponent = "g",
 ) {
   // srgbOutput: encode in the shader (r186 sRGBTransferOETF) for a non-sRGB
   // attachment, so fixed-function blending sees encoded values, as WebGL does.
@@ -667,7 +670,7 @@ struct VertexOutput {
   let coat_uv_dy = dpdy(${coordinates(7)});`
       : ""
   }
-  ${mapMask & 256 ? "var" : "let"} rgba = draw_info.color * input.color ${mapMask & 1 ? "* color_texel" : ""};${mapMask & 256 ? "\n  // Three r186 alpha maps modulate opacity with GREEN, never RGB or texture alpha.\n  rgba.a *= alpha_texel.g;" : ""}
+  ${mapMask & 256 ? "var" : "let"} rgba = draw_info.color * input.color ${mapMask & 1 ? "* color_texel" : ""};${mapMask & 256 ? `\n  // Native r186 MaterialNode converts its opacity vec4 to float through red;\n  // the explicit/WebGL profile keeps its green-component contract.\n  rgba.a *= alpha_texel.${alphaTextureComponent};` : ""}
   ${toon ? "// Toon derivatives run before alpha discard, including instanced MASK draws." : "if (draw_info.options.x >= 0.0 && rgba.a < draw_info.options.x) { discard; }"}
   ${
     lit
@@ -1083,6 +1086,7 @@ export async function createGpuAnimationRenderer(
     maxClippingPlanes = 8,
     textureTransforms = false,
     alphaMaps = false,
+    alphaTextureComponent = "g",
     indirectLights = false,
     threeLights = false,
     instancing = false,
@@ -1152,6 +1156,8 @@ export async function createGpuAnimationRenderer(
     fail("ANIMATION_RENDER_OPTIONS", "textureTransforms must be boolean");
   if (typeof alphaMaps !== "boolean")
     fail("ANIMATION_RENDER_OPTIONS", "alphaMaps must be boolean");
+  if (alphaTextureComponent !== "g" && alphaTextureComponent !== "r")
+    fail("ANIMATION_RENDER_OPTIONS", "alphaTextureComponent must be g or r");
   const uvSlots = threeLights ? 13 : alphaMaps ? 9 : 8;
   const uvOffset = UNIFORM_BYTES + (clipping ? clippingBytes : 0);
   const physicalOffset = uvOffset + (textureTransforms ? animationUvBytes(uvSlots) : 0);
@@ -1568,6 +1574,7 @@ struct Out { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 };
               uvSlots,
               raster?.premultipliedAlpha ?? false,
               srgbOutput,
+              alphaTextureComponent,
             )
           : ANIMATION_RENDER_WGSL,
     });
