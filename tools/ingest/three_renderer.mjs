@@ -299,6 +299,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._deferredError = null;
       this._animationCallback = null;
       this._animationHandle = null;
+      this._animationStarted = false;
+      this._animationHost = null;
       this._disposed = false;
       this._transfers = createThreeRendererTransfers(this, F3DRendererError, {maxBytes: maxTransferBytes, maxRequests: maxTransfers});
       Object.defineProperties(this.info.f3d, {
@@ -358,6 +360,9 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       await this._createSession(this._wantsHdr(this._toneMapping()));
       if (this._disposed) { this._release(); fail('DISPOSED', 'Renderer was disposed during initialization'); }
       this._initialized = true;
+      // Source Animation.start() advances once during initialization and keeps
+      // the node clock running even without a user animation callback.
+      if (this.isWebGPURenderer) this._setLoop(null);
       return this;
     }
     /** Tone mapping needs the linear HDR target plus a whole-image output pass
@@ -901,6 +906,19 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     }
     _setLoop(callback) {
       const host = this.domElement.ownerDocument?.defaultView ?? globalThis;
+      if (this.isWebGPURenderer) {
+        this._animationCallback = callback;
+        if (!this._initialized || this._animationStarted || this._disposed) return;
+        this._animationStarted = true; this._animationHost = host;
+        const tick = (time, xrFrame = null) => {
+          if (!this._animationStarted || this._disposed) return;
+          this._animationHandle = host.requestAnimationFrame?.(tick) ?? null;
+          this._advanceAnimationFrame();
+          this._animationCallback?.(time, xrFrame);
+        };
+        tick();
+        return;
+      }
       if (this._animationHandle !== null) { host.cancelAnimationFrame?.(this._animationHandle); this._animationHandle = null; }
       if (this._inspector.isRunning) this._inspector.finish();
       this._animationCallback = callback;
@@ -908,16 +926,19 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       const tick = time => {
         if (this._animationCallback !== callback || this._disposed) return;
         this._animationHandle = host.requestAnimationFrame(tick);
-        // Source Animation order: finish the previous inspected frame, then begin.
-        if (this._inspector.isRunning) this._inspector.finish();
-        if (this.info.autoReset === true) this.info.reset();
-        this._nodes.nodeFrame.update();
-        this._renderUid = 0; // stable per-frame call ids, like source render contexts
-        this.info.frame = this._nodes.nodeFrame.frameId;
-        this._inspector.begin();
+        this._advanceAnimationFrame();
         callback(time, null);
       };
       this._animationHandle = host.requestAnimationFrame(tick);
+    }
+    _advanceAnimationFrame() {
+      // Source Animation order: finish the previous inspected frame, then begin.
+      if (this._inspector.isRunning) this._inspector.finish();
+      if (this.info.autoReset === true) this.info.reset();
+      this._nodes.nodeFrame.update();
+      this._renderUid = 0;
+      this.info.frame = this._nodes.nodeFrame.frameId;
+      this._inspector.begin();
     }
     getAnimationLoop() { return this._animationCallback; }
 
@@ -925,6 +946,12 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       if (this._disposed) return;
       this.setAnimationLoop(null);
       this._disposed = true;
+      if (this._animationStarted) {
+        this._animationStarted = false;
+        if (this._animationHandle !== null) this._animationHost?.cancelAnimationFrame?.(this._animationHandle);
+        this._animationHandle = null;
+        if (this._inspector.isRunning) this._inspector.finish();
+      }
       const stopped = new F3DRendererError('DISPOSED', 'Renderer is disposed');
       this._targetLifetime.abort(stopped);
       this._targets.dispose();

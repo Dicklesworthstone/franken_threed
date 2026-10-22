@@ -100,7 +100,7 @@ test('ordinary first frame: render defers to preparation without presenting an e
   // Steady state: immediate synchronous submission with live source values.
   for (let i = 0; i < 3; i++) {
     f.mesh.rotation.y = 0.3 * i; f.material.color.setRGB(0.1 * i, 0.2, 0.3);
-    renderer.info.reset(); // Without setAnimationLoop the source leaves resets to the application.
+    renderer.info.reset(); // These synchronous calls occur in the same host frame.
     renderer.render(f.scene, f.camera);
   }
   assert.equal(acquired(), 4); assert.equal(renderer.info.f3d.deferredRenders, 1);
@@ -242,22 +242,24 @@ test('viewport, scissor and clear() follow source CanvasTarget semantics', async
   renderer.dispose();
 });
 
-test('setAnimationLoop initializes, drives callbacks each host frame and stops on null', async () => {
+test('native initialization starts the frame clock and null stops callbacks without stopping node updates', async () => {
   const {renderer, canvas} = await create();
   const frames = [];
   let next = null;
   canvas.ownerDocument = {defaultView: {requestAnimationFrame(cb) { next = cb; return 7; }, cancelAnimationFrame() { next = null; }}};
   const f = sceneFixture();
   await renderer.setAnimationLoop(time => { frames.push(time); renderer.render(f.scene, f.camera); });
-  assert.equal(renderer.initialized, true);
+  assert.equal(renderer.initialized, true);assert.equal(renderer.info.frame,1);
   next(16); next(32);
-  assert.deepEqual(frames, [16, 32]); assert.equal(renderer.info.frame, 2);
+  assert.deepEqual(frames, [16, 32]); assert.equal(renderer.info.frame, 3);
   await flush(renderer);
   next(48);
   assert.equal(renderer.info.f3d.presentedRenders, 3);
   await renderer.setAnimationLoop(null);
-  assert.equal(next, null); assert.equal(renderer.getAnimationLoop(), null);
-  renderer.dispose();
+  assert.equal(typeof next,'function');assert.equal(renderer.getAnimationLoop(), null);
+  next(64);assert.deepEqual(frames,[16,32,48]);assert.equal(renderer.info.frame,5);
+  const staleTick=next;renderer.dispose();assert.equal(next,null);
+  staleTick(80);assert.equal(renderer.info.frame,5,'an already scheduled callback cannot advance a disposed owner');
 });
 
 test('WebGLRenderer surface: synchronous construction, frames before init are deferred, GL-only state fails', async () => {
