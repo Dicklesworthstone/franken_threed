@@ -4,9 +4,9 @@
  *
  * The profile is rigid meshes and storage-backed InstancedMesh objects, unlit
  * or Toon/Lambert/Phong/Standard/Physical node materials and corresponding
- * built-in materials with authored slots, ordinary source lights, float attributes,
- * scalar/vector/matrix uniforms, authored typed uniform arrays and multiple
- * uniform blocks per source group,
+ * built-in materials with authored slots, ordinary or registered direct analytic
+ * lights, float attributes, scalar/vector/matrix uniforms, authored typed uniform
+ * arrays and multiple uniform blocks per source group,
  * sampled 2D float textures and read-only scalar/vector/mat4 or flat-struct storage buffers.
  * Physical direct lighting retains the source DFG texture, clearcoat, sheen,
  * iridescence, anisotropy, retroreflection and source PMREM environment lighting. Transmission,
@@ -62,6 +62,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     three.MeshPhongNodeMaterial.prototype, ...standardPrototypes];
   const lightClasses = new Map([[three.AmbientLight, three.AmbientLightNode], [three.DirectionalLight, three.DirectionalLightNode],
     [three.HemisphereLight, three.HemisphereLightNode], [three.PointLight, three.PointLightNode], [three.SpotLight, three.SpotLightNode]]);
+  const lightClassIds = new WeakMap();
+  let lightClassSerial = 0;
   const environmentNodes = new WeakMap(), environmentVersions = new WeakMap(), uniformBuffers = new WeakMap();
   const materialViews = new WeakMap();
   const sourceMaterialClasses = new Map([
@@ -204,6 +206,56 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if ((inspectInstances(object)?.signature ?? null) !== signature)
       fail('CHANGED', 'Native instance matrix/color identity or layout changed; compile the graph again');
   }
+  function sourceLightClass(light) {
+    const Source = light?.constructor;
+    if (!(light instanceof three.Light) || typeof Source !== 'function' ||
+        Object.getPrototypeOf(light) !== Source.prototype || light.isLight !== true)
+      fail('LIGHTS', 'Native lights require exact source Light instances');
+    const Native = renderer.library.getLightNodeClass(Source), builtin = lightClasses.get(Source);
+    if (builtin) {
+      if (Native !== builtin) fail('LIGHTS', 'Native built-in lights require their pinned node-library mappings');
+      return Native;
+    }
+    // Addons such as r186 SunLight register a direct AnalyticLightNode subclass.
+    // Admit that public extension point without cloning the light or replacing
+    // the source analytic node's FRAME lifecycle. Other light models stay gated.
+    const prototype = Native?.prototype;
+    const direct = prototype && Object.getOwnPropertyDescriptor(prototype, 'setupDirect');
+    if (renderer.library.getLightNodeClass !== three.StandardNodeLibrary.prototype.getLightNodeClass ||
+        Object.getPrototypeOf(Source.prototype) !== three.Light.prototype ||
+        !prototype || Object.getPrototypeOf(prototype) !== three.AnalyticLightNode.prototype ||
+        prototype.constructor !== Native || typeof direct?.value !== 'function' ||
+        Object.getOwnPropertyNames(prototype).some(key => !['constructor', 'setupDirect', 'setupShadowNode'].includes(key)))
+      fail('LIGHTS', 'Registered native lights require a direct analytic node with the pinned source lifecycle');
+    return Native;
+  }
+  function lightSignature(lights) {
+    const id = value => {
+      if (!lightClassIds.has(value)) lightClassIds.set(value, ++lightClassSerial);
+      return lightClassIds.get(value);
+    };
+    return JSON.stringify(lights.map(light => {
+      const Native = sourceLightClass(light);
+      if (light.castShadow || light.map != null || light.colorNode != null)
+        fail('LIGHTS', 'Native lit graph shadows, projected maps and custom light color nodes are not admitted');
+      return [light.id, id(light.constructor), id(Native), id(Native.prototype.setupDirect)];
+    }));
+  }
+  function checkAnalyticLight(node, lights) {
+    if (!node.isAnalyticLightNode || !lights.includes(node.light)) return false;
+    const Native = sourceLightClass(node.light);
+    if (Object.getPrototypeOf(node) !== Native.prototype) return false;
+    if (!lightClasses.has(node.light.constructor)) {
+      const source = three.AnalyticLightNode.prototype;
+      if (node.updateType !== 'frame' || node.updateBeforeType !== 'none' || node.updateAfterType !== 'none' ||
+          node.setupDirect !== Native.prototype.setupDirect ||
+          ['build', 'setup', 'analyze', 'generate', 'getHash', 'updateReference', 'getUpdateType',
+            'getUpdateBeforeType', 'getUpdateAfterType', 'update', 'updateBefore', 'updateAfter']
+            .some(key => node[key] !== source[key]))
+        fail('LIGHTS', 'Registered analytic nodes must retain the pinned source setup and update lifecycle');
+    }
+    return true;
+  }
   function sourceLights(material, {lights = [], lightingEnabled = renderer.lighting?.enabled !== false} = {}) {
     if (!litMaterial(material) || material.lights !== true || material.fragmentNode != null) return [];
     if (typeof lightingEnabled !== 'boolean' || lightingEnabled !== (renderer.lighting?.enabled !== false))
@@ -211,14 +263,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (!lightingEnabled) return [];
     if (!Array.isArray(lights)) fail('LIGHTS', 'Supply the selected source scene lights');
     if (lights.length > 8) fail('LIMIT', 'Native lit node graphs currently admit at most eight selected scene lights');
-    for (const light of lights) {
-      const nodeClass = lightClasses.get(light?.constructor);
-      if (!nodeClass || Object.getPrototypeOf(light) !== light.constructor.prototype || light.isLight !== true ||
-          renderer.library.getLightNodeClass(light.constructor) !== nodeClass)
-        fail('LIGHTS', 'Native lit graphs require ordinary Ambient, Directional, Hemisphere, Point or Spot lights');
-      if (light.castShadow || light.map != null || light.colorNode != null)
-        fail('LIGHTS', 'Native lit graph shadows, projected maps and custom light nodes are not admitted');
-    }
+    lightSignature(lights);
     // The pinned LightsNode retains analytic nodes in its module WeakMap by the
     // real light identity. Never clone lights or instantiate per-program light
     // nodes: that would repeat FRAME updates across objects and recompiles.
@@ -413,8 +458,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (node.isLightingNode || node.isLightsNode || node.isLightingContextNode || node.light?.isLight) {
       const admitted = lightsNode && (node === lightsNode ||
         environmentNode && node.constructor === three.EnvironmentNode && node.envNode === environmentNode ||
-        node.isAnalyticLightNode && lights.includes(node.light) &&
-        Object.getPrototypeOf(node) === lightClasses.get(node.light.constructor)?.prototype);
+        checkAnalyticLight(node, lights));
       if (!admitted) fail('LIGHTS', 'Only the captured source scene light and environment context is admitted');
     }
     if (node.isOutputStructNode || node.isMRTNode) fail('MRT', 'Native node graphs currently write one color attachment');
@@ -431,7 +475,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       Object.entries(object.geometry.attributes).map(([name, a]) => [name, a.itemSize, a.normalized, a.gpuType, a.array?.constructor.name,
         a.isInterleavedBufferAttribute, a.data?.array?.constructor.name, a.data?.stride, a.offset]),
       renderer.logarithmicDepthBuffer, renderer.reversedDepthBuffer,
-      litMaterial(material) && material.fragmentNode == null ? [lightingEnabled, lights.map(light => light.id)] : null,
+      litMaterial(material) && material.fragmentNode == null ? [lightingEnabled, lightSignature(lights)] : null,
       Object.getPrototypeOf(material) === three.MeshPhysicalNodeMaterial.prototype ?
         [material.useClearcoat, material.useSheen, material.useIridescence, material.useAnisotropy, material.useRetroreflection] : null]);
   }
@@ -445,6 +489,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   function compile(material, object, context = {}) {
     const preparedMaterial = inspect(material, object, context);
     const lights = sourceLights(preparedMaterial, context), environment = sourceEnvironment(preparedMaterial, context);
+    const lightKey = lightSignature(lights);
     const instances = inspectInstances(object), instanceSignature = instances?.signature ?? null;
     const key = keyOf(preparedMaterial, object, context, lights, environment, instanceSignature), byMaterial = cache.get(object);
     const previous = byMaterial?.get(material);
@@ -466,6 +511,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       throw new ThreeNodeProgramError('BUILD', `Pinned node construction failed: ${cause?.message ?? cause}`, {cause});
     }
     assertInstances(object, instanceSignature);
+    if (lightSignature(lights) !== lightKey) fail('CHANGED', 'Native light registration changed during source graph construction');
     // PMREM setup has now generated the source atlas. A later in-place refresh
     // would recursively capture renderer calls inside a whole-render texture
     // transaction. Refuse that boundary explicitly, before source callbacks;
@@ -567,7 +613,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const storageNodes = [...graphNodes].filter(node => node.isStorageBufferNode);
     const storageKey = storageSignature(storageNodes);
     const uniformNodes = [...graphNodes].filter(rawUniformBuffer), uniformKey = uniformSignature(uniformNodes, builder);
-    nodeStates.set(descriptor, {owner: api, builder, bindings, material, object, environment, instanceSignature, pmremNodes, pmremSignature: pmremKey,
+    const analyticLightNodes = [...builder.nodes].filter(node => node.isAnalyticLightNode);
+    nodeStates.set(descriptor, {owner: api, builder, bindings, material, object, lights, lightSignature: lightKey, analyticLightNodes, environment, instanceSignature, pmremNodes, pmremSignature: pmremKey,
       textureNodes, textureReferences, textureSignature: signature, materialMapSignature: materialMapSignature(material),
       storageNodes, storageSignature: storageKey, uniformNodes, uniformSignature: uniformKey});
     const entry = {key, descriptor, builder, material, object, geometry: object.geometry, bytes, pmremNodes, pmremSignature: pmremKey,
@@ -596,6 +643,12 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   function checkPMREM(state) {
     if (pmremSignature(state.pmremNodes) !== state.pmremSignature)
       fail('CHANGED', 'Native PMREM input identity or sampling orientation changed; compile the graph again');
+  }
+  function checkLights(state) {
+    if (lightSignature(state.lights) !== state.lightSignature)
+      fail('CHANGED', 'Native light constructors, registrations or direct-light graphs changed; compile the graph again');
+    for (const node of state.analyticLightNodes) if (!checkAnalyticLight(node, state.lights))
+      fail('LIGHTS', 'Native analytic light identity changed after source construction');
   }
   function checkMaterialMaps(state) {
     if (materialMapSignature(state.material) !== state.materialMapSignature)
@@ -656,6 +709,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const state = stateOf(descriptor);
     const object = context.object ?? state.object;
     checkMaterialMaps(state);
+    checkLights(state);
     assertInstances(object, state.instanceSignature);
     assertEnvironmentVersion(state.environment);
     checkPMREM(state);
@@ -667,6 +721,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       for (const node of state.builder.updateBeforeNodes) frame.updateBeforeNode(node);
       for (const node of state.builder.updateNodes) frame.updateNode(node);
       assertInstances(object, state.instanceSignature);
+      checkLights(state);
       checkPMREM(state);
       checkUniformBuffers(state);
       const textures = readTextures(state);

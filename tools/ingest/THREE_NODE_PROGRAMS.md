@@ -71,6 +71,23 @@ Authored `MeshToonNodeMaterial`, `MeshLambertNodeMaterial` and
 hemisphere, directional, point and spot lights. They accept `normalNode` and
 `emissiveNode`; Phong also accepts `shininessNode` and `specularNode`. These slots
 compose with ordinary TSL arithmetic and the sampled texture graphs below.
+
+Explicit `renderer.library.addLight(NodeClass, LightClass)` registrations can
+supply direct analytic illumination, including the pinned H7 `SunLight` and
+`SunLightNode` addons. The light must directly extend the source `Light`, and
+its registered node must directly extend `AnalyticLightNode` while retaining
+the source setup/build/update lifecycle. The source node computes SunLight's
+world-position-to-origin direction and color/intensity; FRAME updates stay
+shared across objects and recompilations. Queued draws retain their captured
+direction and radiance.
+
+Constructor, registration and direct-light graph changes participate in program
+selection. Changing the registered node class of a previously used light is
+refused because the source retains its analytic node by light identity; a fresh
+light can use the new registration. Shadows, projected maps and custom light
+color nodes remain explicitly refused. In particular, this enables H7's direct
+SunLight illumination without claiming its cascaded-shadow path is complete.
+
 Unassigned slots retain their source material color, emissive, specular and
 shininess behavior. Both material arrays and scene overrides supply the effective
 material to the builder's context.
@@ -314,7 +331,7 @@ This is a bounded native graphics entrance, not full TSL coverage. Writable or
 atomic graphics storage, standalone `mat2`/`mat3` storage arrays, nested/boolean/atomic
 struct members, PBO storage, managed uniform arrays, compute nodes inside
 graphics graphs and multiple-render-target graphics graphs are refused. Authored
-PBR transmission/dispersion, cube/custom environment lighting, area/probe/custom lights,
+PBR transmission/dispersion, cube/custom environment lighting, area/probe and other custom light models,
 shadows, projected light maps and custom `lightsNode` graphs remain missing.
 Depth/comparison, cube, array, volume, compressed, storage, video and unfilterable
 or integer texture graphs still require additional native profiles. Sampled
@@ -466,3 +483,11 @@ material arrays, UV/normal mode changes, callback ordering and alias changes
 between material maps and authored texture graphs. The registered
 `native_tsl_source_materials` browser comparison covers mapped built-in
 materials with authored deformation; its GPU pixel comparison is unmeasured.
+
+Exact pinned SunLight addon tests cover transformed-parent direction semantics,
+shared FRAME updates across objects, graph rebuilds and renderer owners,
+queued radiance/position history, registration changes and lifecycle admission.
+The direct-analytic implementation passed 82 compiler and 31 facade tests before
+integration with concurrent uniform-buffer support. Shadow requests and
+unsupported generated storage writes are refused before draw callbacks or GPU
+acquisition. No new SunLight browser pixel-parity result is claimed.

@@ -7,6 +7,7 @@ import * as T from '../../upstream/three.js/build/three.webgpu.js';
 import {createWebGPURendererClass} from './three_renderer.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
 import {captureComputeStorage} from './gpu_compute_attributes.mjs';
+import {SunLight, SunLightNode} from './fixtures/three_sun_light.mjs';
 const Renderer=createWebGPURendererClass(T);
 function fixture(t){
   const device=geometryDevice();device.limits.maxTextureDimension2D=8192;device.limits.maxBindingsPerBindGroup=1000;
@@ -682,4 +683,46 @@ test('source material arrays preserve per-group maps while ordinary materials re
     [[220,30,70,255],[40,170,230,255]]);
   assert.equal(f.device.snapshots.flat().filter(draw=>draw.pipeline.vertex.entryPoint==='vertex_main').length,1);
   assert.equal(f.mesh.material[0],a);assert.equal(f.mesh.material[1],b);assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+
+test('registered SunLight captures source color, direction and FRAME frequency through native queued draws',async t=>{
+  const f=fixture(t),material=new T.MeshPhysicalMaterial(),secondMaterial=new T.MeshLambertNodeMaterial();
+  material.colorNode=f.tint;secondMaterial.colorNode=T.TSL.vec3(.5);f.mesh.material=material;
+  const second=new T.Mesh(f.mesh.geometry,secondMaterial);second.position.x=.5;f.scene.add(second);
+  const sun=new SunLight(new T.Color(.125,.25,.5),2),group=new T.Group();
+  group.position.set(1,2,3);sun.position.set(-4,10,8);group.add(sun);f.scene.add(group);
+  f.renderer.library.addLight(SunLightNode,SunLight);await f.renderer.init();
+  f.renderer.render(f.scene,f.camera);
+  sun.intensity=3;sun.position.set(-1,4,2);material.colorNode=T.TSL.vec3(.375);
+  f.renderer.render(f.scene,f.camera);
+  f.renderer._nodes.nodeFrame.update();f.renderer.render(f.scene,f.camera);
+  sun.intensity=9;sun.position.set(90,90,90);
+  await drain(f.renderer);
+  const draws=nativeDraws(f.device);assert.equal(draws.length,6);
+  for(const draw of draws.slice(0,4))assert.ok(containsColor(draw,[.25,.5,1]));
+  for(const draw of draws.slice(4))assert.ok(containsColor(draw,[.375,.75,1.5]));
+  for(const draw of draws.slice(0,2))assert.ok(containsColor(draw,[-3,12,11]));
+  for(const draw of draws.slice(2))assert.ok(containsColor(draw,[0,6,5]));
+  assert.notEqual(draws[0].pipeline,draws[2].pipeline,'graph recompilation keeps the source light update frequency');
+  assert.equal(sun._listeners.dispose.length,1);assert.equal(sun.shadow.map,null);
+  assert.equal(f.renderer._nodeCaptureBytes,0);await f.renderer.waitForGPU();
+});
+
+test('registered SunLight shadow requests fail before facade callbacks or GPU acquisition',async t=>{
+  const f=fixture(t),material=new T.MeshStandardMaterial(),sun=new SunLight();let updates=0;
+  material.colorNode=T.TSL.uniform(new T.Color(.25,.5,.75)).onObjectUpdate(()=>{updates++;});
+  f.mesh.material=material;f.scene.add(sun);await f.renderer.init();
+  assert.throws(()=>f.renderer.render(f.scene,f.camera),{code:'THREE_NODE_PROGRAM_LIGHTS'});
+  f.renderer.library.addLight(SunLightNode,SunLight);sun.castShadow=true;
+  for(const enabled of [false,true]){
+    f.renderer.shadowMap.enabled=enabled;
+    assert.throws(()=>f.renderer.render(f.scene,f.camera),{code:'THREE_NODE_PROGRAM_LIGHTS'});
+  }
+  sun.castShadow=false;f.mesh.receiveShadow=true;
+  assert.throws(()=>f.renderer.render(f.scene,f.camera),{code:'THREE_NODE_PROGRAM_SHADOW'});
+  assert.equal(updates,0);assert.equal(f.acquired(),0);assert.equal(f.device.submissions.length,0);
+  assert.equal(f.renderer._nodeCaptureBytes,0);
+  f.mesh.receiveShadow=false;f.renderer.shadowMap.enabled=false;
+  f.renderer.render(f.scene,f.camera);await drain(f.renderer);assert.equal(updates,1);assert.equal(nativeDraws(f.device).length,1);
 });

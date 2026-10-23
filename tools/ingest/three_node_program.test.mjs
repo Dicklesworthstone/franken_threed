@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as THREE from '../../upstream/three.js/build/three.webgpu.js';
 import {createThreeNodePrograms, hasThreeNodeProgram} from './three_node_program.mjs';
+import {SunLight, SunLightNode} from './fixtures/three_sun_light.mjs';
 const N = THREE.TSL;
 function rig(t, options = {}) {
   const frame = new THREE.NodeFrame();
@@ -1127,4 +1128,128 @@ test('source material map capture respects source reference-update order', t => 
   assert.equal(f.compile(), d);
   const second = f.owner.captureDraw(d, {...f.context, renderId: 2});
   assert.ok(second.textures.some(binding => binding.texture === replacement));
+});
+
+
+function sunRig(t) {
+  const f = pbrRig(t, THREE.MeshPhysicalMaterial), sun = new SunLight(new THREE.Color(.125, .25, .5), 2), group = new THREE.Group();
+  for (const light of f.lights) f.scene.remove(light);
+  group.position.set(3, .25, -2); sun.position.set(-4, 10, 8); group.add(sun); f.scene.add(group); f.scene.updateMatrixWorld();
+  f.renderer.shadowMap = {enabled: false}; f.renderer.library.addLight(SunLightNode, SunLight);
+  const context = {...f.context, lights: [sun]};
+  return {...f, sun, group, context, compile: () => f.owner.compile(f.material, f.object, context)};
+}
+function hasVector(packets, values) {
+  return packets.some(bytes => {
+    const words = new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4);
+    return words.some((_, index) => values.every((value, offset) => words[index + offset] === value));
+  });
+}
+test('registered pinned SunLight uses source position-to-origin lighting with no shadow bindings', t => {
+  const f = sunRig(t), d = f.compile(), draw = f.owner.captureDraw(d, f.context);
+  assert.equal(f.sun.target, undefined);
+  assert.ok(hasVector(draw.uniforms, [-1, 10.25, 6]), 'the source world-space light position reaches the render group');
+  assert.ok(hasVector(draw.uniforms, [.25, .5, 1]), 'the analytic source node applies color times intensity');
+  assert.match(d.fragment, /fn D_GGX/);
+  const direction = /(\w+) = \( render\.cameraViewMatrix \* (\w+) \);/.exec(d.fragment);
+  assert.ok(direction, 'the source sun direction uses the view matrix');
+  assert.ok(new RegExp(`${direction[2]} = vec4<f32>\\( render\\.\\w+, 0\\.0 \\);`).test(d.fragment), 'a direction has zero homogeneous translation');
+  assert.ok(new RegExp(`normalize\\( ${direction[1]}\\.xyz \\)`).test(d.fragment), 'the transformed source direction is normalized');
+  assert.doesNotMatch(d.fragment, /texture_depth|textureSampleCompare/);
+  assert.ok(draw.textures.every(binding => binding.texture.name === 'DFG_LUT'));
+  assert.equal(f.sun.shadow.map, null); assert.equal(f.sun._listeners.dispose.length, 1);
+});
+test('registered SunLight retains one source FRAME node across objects and graph replacements', t => {
+  const f = sunRig(t), first = f.compile();
+  assert.ok(hasVector(f.owner.capture(first, f.context), [.25, .5, 1]));
+  const material = new THREE.MeshStandardMaterial(); material.colorNode = N.vec3(.5);
+  const object = new THREE.Mesh(f.object.geometry, material); f.scene.add(object);
+  f.sun.intensity = 3; f.sun.position.set(-2, 4, 6); f.scene.updateMatrixWorld();
+  const context = {...f.context, material, object, renderId: 2};
+  const second = f.owner.compile(material, object, context), captured = f.owner.capture(second, context);
+  assert.ok(hasVector(captured, [.25, .5, 1]), 'same-frame compilation does not repeat the shared analytic update');
+  assert.ok(hasVector(captured, [1, 4.25, 4]), 'source light position still updates for a new render');
+  material.roughnessNode = N.float(.375);
+  const replacement = f.owner.compile(material, object, context); assert.notEqual(replacement, second);
+  assert.ok(hasVector(f.owner.capture(replacement, {...context, renderId: 3}), [.25, .5, 1]));
+  assert.ok(hasVector(f.owner.capture(replacement, {...context, renderId: 4, frameId: 2}), [.375, .75, 1.5]));
+  assert.equal(f.sun._listeners.dispose.length, 1, 'all builders retain the original cached analytic node');
+});
+test('registered SunLight uses the source shared identity across renderer owners', t => {
+  const a = sunRig(t), first = a.compile(); a.owner.capture(first, a.context);
+  const b = pbrRig(t, THREE.MeshStandardMaterial); b.renderer.library.addLight(SunLightNode, SunLight);
+  a.sun.intensity = 4;
+  const context = {...b.context, lights: [a.sun], renderId: 7, frameId: 3};
+  const second = b.owner.compile(b.material, b.object, context);
+  assert.ok(hasVector(b.owner.capture(second, context), [.5, 1, 2]));
+  assert.equal(a.sun._listeners.dispose.length, 1, 'a second renderer must not instantiate a duplicate source light node');
+});
+test('registered direct-light graph and constructor edits invalidate cached programs', t => {
+  const f = pbrRig(t, THREE.MeshLambertMaterial);
+  class CustomLight extends THREE.Light {}
+  class OtherLight extends THREE.Light {}
+  class CustomNode extends THREE.AnalyticLightNode {
+    setupDirect() { return {lightDirection: N.vec3(1, 0, 0), lightColor: this.colorNode}; }
+  }
+  const light = new CustomLight(); f.scene.add(light);
+  f.renderer.library.addLight(CustomNode, CustomLight); f.renderer.library.addLight(CustomNode, OtherLight);
+  const context = {...f.context, lights: [light]}, first = f.owner.compile(f.material, f.object, context);
+  CustomNode.prototype.setupDirect = function() { return {lightDirection: N.vec3(0, 1, 0), lightColor: this.colorNode}; };
+  assert.throws(() => f.owner.capture(first, context), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  const changed = f.owner.compile(f.material, f.object, context); assert.notEqual(changed, first);
+  assert.notEqual(changed.fragment, first.fragment);
+  Object.setPrototypeOf(light, OtherLight.prototype);
+  assert.throws(() => f.owner.capture(changed, context), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  const other = f.owner.compile(f.material, f.object, context); assert.notEqual(other, changed);
+  assert.doesNotThrow(() => f.owner.capture(other, context));
+});
+test('registered light remapping refuses the source cached node instead of silently reusing its old class', t => {
+  const f = sunRig(t), first = f.compile(); let updates = 0;
+  f.material.colorNode = N.uniform(new THREE.Color(.5, .5, .5)).onObjectUpdate(() => { updates++; });
+  class ReplacementNode extends THREE.AnalyticLightNode {
+    setupDirect() { return {lightDirection: N.vec3(0, 0, 1), lightColor: this.colorNode}; }
+  }
+  f.renderer.library.lightNodes.set(SunLight, ReplacementNode);
+  assert.throws(() => f.owner.capture(first, f.context), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_LIGHTS'}); assert.equal(updates, 0);
+  const fresh = new SunLight(), context = {...f.context, lights: [fresh]};
+  assert.doesNotThrow(() => f.owner.compile(f.material, f.object, context), 'a fresh light identity uses the newly registered class');
+});
+test('registered SunLight admission never turns requested shadows or projected maps into unshadowed lighting', t => {
+  const f = sunRig(t); let updates = 0;
+  f.material.colorNode = N.uniform(new THREE.Color(.5, .5, .5)).onObjectUpdate(() => { updates++; });
+  f.renderer.library.lightNodes.delete(SunLight);
+  assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_LIGHTS'});
+  f.renderer.library.addLight(SunLightNode, SunLight);
+  for (const enabled of [false, true]) {
+    f.renderer.shadowMap.enabled = enabled; f.sun.castShadow = true;
+    assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_LIGHTS'}); f.sun.castShadow = false;
+    for (const key of ['castShadow', 'receiveShadow']) {
+      f.object[key] = true; assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_SHADOW'}); f.object[key] = false;
+    }
+  }
+  f.sun.map = dataTexture(); assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_LIGHTS'}); f.sun.map = null;
+  f.sun.colorNode = N.vec3(1); assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_LIGHTS'});
+  assert.equal(updates, 0); assert.equal(f.owner.diagnostics.programs, 0);
+});
+test('registered direct analytic nodes retain source lifecycle and native graph resource admission', t => {
+  for (const kind of ['prototype lifecycle', 'instance lifecycle', 'storage write']) {
+    const f = pbrRig(t, THREE.MeshLambertMaterial); let updates = 0;
+    f.material.colorNode = N.uniform(new THREE.Color(.5, .5, .5)).onObjectUpdate(() => { updates++; });
+    class CustomLight extends THREE.Light {}
+    class CustomNode extends THREE.AnalyticLightNode {
+      constructor(light) { super(light); if (kind === 'instance lifecycle') this.updateType = 'object'; }
+      setupDirect() {
+        const lightColor = kind === 'storage write' ? N.Fn(() => {
+          N.storage(new THREE.StorageBufferAttribute(1, 4), 'vec4', 1).element(0).assign(N.vec4(1)); return N.vec3(1);
+        })() : this.colorNode;
+        return {lightDirection: N.vec3(0, 1, 0), lightColor};
+      }
+    }
+    if (kind === 'prototype lifecycle') CustomNode.prototype.update = () => {};
+    const light = new CustomLight(); f.scene.add(light); f.renderer.library.addLight(CustomNode, CustomLight);
+    assert.throws(() => f.owner.compile(f.material, f.object, {...f.context, lights: [light]}),
+      {code: kind === 'storage write' ? 'THREE_NODE_PROGRAM_STORAGE' : 'THREE_NODE_PROGRAM_LIGHTS'});
+    assert.equal(updates, 0); assert.equal(f.owner.diagnostics.programs, 0);
+  }
 });
