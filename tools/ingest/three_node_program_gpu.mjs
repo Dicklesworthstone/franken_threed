@@ -1,5 +1,5 @@
 /** F3D graphics pipelines for native WGSL node programs. Bindings follow the
- * pinned builder's groups directly, with at most one native uniform block per
+ * pinned builder's groups directly, with native uniform blocks packed per
  * group plus borrowed sampler/texture/read-only storage resources at their
  * source binding indices.
  * Each logical draw gets independent aligned slices. No ESSL reflection, shader
@@ -62,7 +62,7 @@ export function createThreeNodeProgramMeshes({device, format, depthFormat, sampl
     const bindingLimit = device.limits.maxBindingsPerBindGroup ?? 1000;
     if (!Array.isArray(sourceEntries) || sourceEntries.length > bindingLimit)
       limit('Native node group exceeds the device binding limit');
-    const seen = new Set(); let uniform = null;
+    const seen = new Set(), uniformEntries = [];
     const entries = sourceEntries.map(entry => {
       if (!Number.isSafeInteger(entry.binding) || entry.binding < 0 || entry.binding >= bindingLimit || seen.has(entry.binding) ||
           !Number.isInteger(entry.visibility) || entry.visibility < 1 || entry.visibility > 7 ||
@@ -80,10 +80,14 @@ export function createThreeNodeProgramMeshes({device, format, depthFormat, sampl
             limit('Native node storage layout exceeds the device binding size limit');
           return {...base, buffer: {type: 'read-only-storage', hasDynamicOffset: false, minBindingSize}};
         }
-        if (uniform || byteLength === 0 || entry.buffer.type !== 'uniform' || entry.buffer.hasDynamicOffset !== true ||
-            entry.buffer.minBindingSize !== byteLength)
-          fail('ANIMATION_RENDER_OPTIONS', 'Native node groups admit one exact dynamic uniform block');
-        uniform = {...base, buffer: {...entry.buffer}}; return uniform;
+        const size = entry.buffer.minBindingSize;
+        if (entry.buffer.type !== 'uniform' || entry.buffer.hasDynamicOffset !== true ||
+            !Number.isSafeInteger(size) || size < 4 || size % 4)
+          fail('ANIMATION_RENDER_OPTIONS', 'Native node uniform bindings require exact dynamic buffer ranges');
+        if (size > (device.limits.maxUniformBufferBindingSize ?? 65536))
+          limit('Native node uniform binding exceeds the device binding size limit');
+        const uniform = {...base, buffer: {...entry.buffer}};
+        uniformEntries.push(uniform); return uniform;
       }
       if (entry.sampler) {
         if (!['filtering', 'non-filtering', 'comparison'].includes(entry.sampler.type))
@@ -96,13 +100,34 @@ export function createThreeNodeProgramMeshes({device, format, depthFormat, sampl
         fail('ANIMATION_RENDER_OPTIONS', 'Unsupported native node sampled texture layout');
       return {...base, texture: {...entry.texture}};
     });
-    if (Boolean(uniform) !== (byteLength > 0))
-      fail('ANIMATION_RENDER_OPTIONS', 'Native node uniform bytes must match their group binding');
-    const arena = uniform ? arenaAt(index) : null;
-    arena?.checkSize(byteLength);
-    return {index, byteLength, arena, uniform, entries,
-      resources: entries.filter(entry => entry !== uniform),
-      arenaLayout: entries.length === 1 && uniform?.binding === 0 && uniform.visibility === 3};
+    const planned = group.uniforms === undefined
+      ? uniformEntries.map(entry => ({binding: entry.binding, offset: 0, byteLength})) : group.uniforms;
+    if (!Array.isArray(planned) || planned.length !== uniformEntries.length ||
+        (group.uniforms === undefined && uniformEntries.length > 1) ||
+        Boolean(planned.length) !== (byteLength > 0))
+      fail('ANIMATION_RENDER_OPTIONS', 'Native node uniform packets must describe every group binding');
+    const alignment = device.limits.minUniformBufferOffsetAlignment ?? 256, uniformBindings = new Set();
+    const uniforms = planned.map(member => {
+      const entry = uniformEntries.find(value => value.binding === member?.binding);
+      if (!entry || uniformBindings.has(member.binding) || !Number.isSafeInteger(member.offset) || member.offset < 0 ||
+          member.offset % alignment || member.byteLength !== entry.buffer.minBindingSize ||
+          !Number.isSafeInteger(member.offset + member.byteLength) || member.offset + member.byteLength > byteLength)
+        fail('ANIMATION_RENDER_OPTIONS', 'Native node uniform members require aligned, non-overlapping packet ranges');
+      uniformBindings.add(member.binding);
+      return Object.freeze({binding: member.binding, offset: member.offset, byteLength: member.byteLength});
+    });
+    let end = 0;
+    for (const member of [...uniforms].sort((a, b) => a.offset - b.offset)) {
+      if (member.offset < end) fail('ANIMATION_RENDER_OPTIONS', 'Native node uniform packet members overlap');
+      end = member.offset + member.byteLength;
+    }
+    if (end !== byteLength) fail('ANIMATION_RENDER_OPTIONS', 'Native node uniform packet length must end at its final binding');
+    uniforms.sort((a, b) => a.binding - b.binding);
+    const arena = uniforms.length ? arenaAt(index) : null;
+    arena?.checkPacketSize(byteLength);
+    return {index, byteLength, arena, uniforms: Object.freeze(uniforms), entries,
+      resources: entries.filter(entry => entry.buffer?.type !== 'uniform'),
+      arenaLayout: entries.length === 1 && uniforms[0]?.binding === 0 && uniforms[0].offset === 0 && entries[0].visibility === 3};
   }
   function snapshotResources(record, input) {
     const resources = input.nodeResources ?? [];
@@ -153,9 +178,10 @@ export function createThreeNodeProgramMeshes({device, format, depthFormat, sampl
       let cached = resourceGroups.get(key);
       if (cached) resourceGroups.delete(key);
       else {
-        const uniform = record.groups[index].uniform;
         const entries = [...resources];
-        if (packet) entries.push({binding: uniform.binding, resource: packet.resource});
+        if (packet) for (const uniform of record.groups[index].uniforms)
+          entries.push({binding: uniform.binding, resource: {buffer: packet.resource.buffer,
+            offset: uniform.offset, size: uniform.byteLength}});
         entries.sort((a, b) => a.binding - b.binding);
         cached = {record, group: device.createBindGroup({label: `${label}/node-resources`, layout, entries})};
       }
@@ -173,6 +199,9 @@ export function createThreeNodeProgramMeshes({device, format, depthFormat, sampl
       fail('ANIMATION_RENDER_OPTIONS', 'Expected a native node graphics program');
     if (topology !== 'triangles') fail('ANIMATION_RENDER_OPTIONS', 'Native node graphics currently draw triangle meshes');
     const groups = nodeProgram.groups.map(groupDescriptor);
+    if (groups.reduce((count, group) => count + group.uniforms.length, 0) >
+        (device.limits.maxDynamicUniformBuffersPerPipelineLayout ?? 8))
+      limit('Native node bindings exceed maxDynamicUniformBuffersPerPipelineLayout');
     for (const stage of [1, 2, 4]) for (const [matches, name, fallback] of [
       [entry => entry.buffer?.type === 'uniform', 'maxUniformBuffersPerShaderStage', 12],
       [entry => entry.buffer?.type === 'read-only-storage', 'maxStorageBuffersPerShaderStage', 8],
@@ -197,7 +226,8 @@ export function createThreeNodeProgramMeshes({device, format, depthFormat, sampl
     // Capture all source-facing values before registrations or pipeline work
     // can yield. Older program records/groups survive arena growth unchanged.
     const uniformBindings = [];
-    for (const group of groups) uniformBindings.push(group.arena ? await group.arena.register(group.byteLength) : null);
+    for (const group of groups) uniformBindings.push(group.arena ? await (group.arenaLayout
+      ? group.arena.register(group.byteLength) : group.arena.registerPacket(group.byteLength)) : null);
     live();
     let bindGroupLayouts;
     const issued = scoped(device, () => {
@@ -262,8 +292,9 @@ export function createThreeNodeProgramMeshes({device, format, depthFormat, sampl
     const end = Math.min((input.first ?? 0) + (input.count ?? extent), range.first + range.count, extent);
     const groups = record.groups.map((group, index) => {
       const packet = group.arena ? group.arena.stage(record.uniformBindings[index], bytes[index]) : null;
-      if (group.arenaLayout) return packet;
-      const output = {group: null, offset: packet?.offset ?? null};
+      const offsets = Object.freeze(group.uniforms.map(() => packet.offset));
+      if (group.arenaLayout) return {...packet, offsets};
+      const output = {group: null, offset: packet?.offset ?? null, offsets};
       pendingGroups.push({record, index, packet, resources: resources[index], output});
       return output;
     });

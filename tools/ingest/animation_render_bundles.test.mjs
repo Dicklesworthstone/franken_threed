@@ -93,6 +93,23 @@ test('ordering, list length and arena offsets are part of the recorded schedule'
   assert.equal(cache.diagnostics.reuses, 1);
 });
 
+test('direct and bundled native draws encode every dynamic offset and own their cache snapshots', () => {
+  const device = bundleDevice(), config = parameters(), cache = createAnimationRenderBundleCache(device, config);
+  const offsets = [256, 256], command = draw({instanceCount: 1, nodeProgram: {groups: [
+    {group: {}, offset: 256, offsets}, {group: {}, offset: null, offsets: []},
+  ]}}), pass = device.pass();
+  encodeAnimationDraws(pass, [command], 1, config);
+  assert.deepEqual(pass.record.draws[0].groups.get(0).offsets, [256, 256]);
+  assert.deepEqual(pass.record.draws[0].groups.get(1).offsets, []);
+  cache.execute(pass, [command], 1); const original = pass.record.executions[0][0];
+  offsets[1] = 512; cache.execute(pass, [command], 1);
+  assert.deepEqual(pass.record.draws.at(-1).groups.get(0).offsets, [256, 512]);
+  assert.deepEqual(original.draws[0].groups.get(0).offsets, [256, 256]);
+  command.nodeProgram.groups[0].offsets = [256, 256]; cache.execute(pass, [command], 1);
+  assert.equal(pass.record.executions.at(-1)[0], original);
+  assert.deepEqual([cache.diagnostics.builds, cache.diagnostics.reuses], [2, 1]);
+});
+
 test('instancing preserves native calls, firstInstance and BLEND order', () => {
   const device = bundleDevice(), cache = createAnimationRenderBundleCache(device, {...parameters(),instancing:true});
   const a=draw({indexBuffer:{},indexFormat:'uint16'}), b={...a,record:{...a.record,alphaMode:'BLEND'}};

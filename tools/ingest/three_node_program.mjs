@@ -5,6 +5,7 @@
  * The profile is rigid meshes and storage-backed InstancedMesh objects, unlit
  * or Toon/Lambert/Phong/Standard/Physical
  * with ordinary source lights, float attributes, scalar/vector/matrix uniforms,
+ * authored typed uniform arrays and multiple uniform blocks per source group,
  * sampled 2D float textures and read-only scalar/vector/mat4 or flat-struct storage buffers.
  * Physical direct lighting retains the source DFG texture, clearcoat, sheen,
  * iridescence, anisotropy, retroreflection and source PMREM environment lighting. Transmission,
@@ -53,10 +54,44 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     three.MeshPhongNodeMaterial.prototype, ...standardPrototypes];
   const lightClasses = new Map([[three.AmbientLight, three.AmbientLightNode], [three.DirectionalLight, three.DirectionalLightNode],
     [three.HemisphereLight, three.HemisphereLightNode], [three.PointLight, three.PointLightNode], [three.SpotLight, three.SpotLightNode]]);
-  const environmentNodes = new WeakMap(), environmentVersions = new WeakMap();
+  const environmentNodes = new WeakMap(), environmentVersions = new WeakMap(), uniformBuffers = new WeakMap();
   let disposed = false, shaderBytes = 0, serial = 0;
   const live = () => { if (disposed) fail('DISPOSED', 'Native node program preparation is disposed'); };
   const litMaterial = material => litPrototypes.includes(Object.getPrototypeOf(material));
+  const rawUniformBuffer = node => node instanceof three.BufferNode && !node.isStorageBufferNode && !node.isArrayBufferNode;
+  function inspectUniformBuffer(node) {
+    // BufferNode emits the caller's array layout verbatim. Unlike UniformArrayNode,
+    // it inserts no per-element padding: scalar/vec2 arrays therefore do not have
+    // a legal uniform-address-space stride in the pinned WGSL output.
+    const type = /^(?:(i|u)?vec([34])|mat([234])|color)$/.exec(node.nodeType ?? '');
+    const matrix = Number(type?.[3] ?? 0), stride = matrix === 3 ? 12 : matrix ? matrix * matrix : 4;
+    const tail = matrix === 3 ? 11 : type?.[2] === '3' || node.nodeType === 'color' ? 3 : stride;
+    const Scalar = type?.[1] === 'i' ? Int32Array : type?.[1] === 'u' ? Uint32Array : Float32Array;
+    const array = node.value, required = (node.bufferCount - 1) * stride + tail;
+    if (!type || !rawUniformBuffer(node) || !(array instanceof Scalar) ||
+        !(array.buffer instanceof ArrayBuffer) || array.buffer.resizable ||
+        !Number.isSafeInteger(node.bufferCount) || node.bufferCount < 1 ||
+        !Number.isSafeInteger(required) || array.length < required ||
+        !Array.isArray(node.updateRanges) || node.updateRanges.length > maxNodes ||
+        node.updateRanges.some(range => !range || !Number.isSafeInteger(range.start) || range.start < 0 ||
+          !Number.isSafeInteger(range.count) || range.count < 0 || range.start + range.count > array.length))
+      fail('UNIFORM', 'Native uniform arrays require fixed unshared 32-bit arrays, valid component ranges and a matching padded vec3/vec4 or matrix layout');
+    // NodeUniformBuffer pads the allocation, not the uploaded array. A final
+    // vec3/mat3 padding word may be absent; extra source capacity is also legal.
+    const bytes = Math.ceil(array.byteLength / 16) * 16;
+    if (bytes > (renderer._device?.limits?.maxUniformBufferBindingSize ?? 65536) || bytes > maxUniformBytes)
+      fail('LIMIT', 'Native uniform array exceeds its binding or draw byte budget');
+    return bytes;
+  }
+  function uniformSignature(nodes, builder) {
+    return JSON.stringify(nodes.map(node => {
+      const bytes = inspectUniformBuffer(node), group = node.groupNode;
+      // Source uniforms share by their node hash, never by typed-array identity.
+      // Values and same-layout replacements remain live NodeUniformBuffer inputs.
+      return [node.getUniformHash(builder), node.nodeType, node.bufferType, node.bufferCount, bytes,
+        node.name, group?.id, group?.name, group?.order, group?.shared, group?.updateType];
+    }));
+  }
   function inspectStorage(node) {
     const attribute = node.value, struct = node.structTypeNode;
     const type = /^(?:(i|u)?vec([234])|(float|int|uint|mat4))$/.exec(node.nodeType ?? '');
@@ -298,14 +333,16 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     else if (node.value?.isTexture)
       fail('TEXTURE', 'Native graphics textures require source TextureNode or PMREMNode bindings');
     if (node.isStorageBufferNode) inspectStorage(node);
+    else if (rawUniformBuffer(node)) inspectUniformBuffer(node);
     else if (node.isBufferNode || node.isBufferAttributeNode || node.isComputeNode || node.isAtomicFunctionNode)
-      fail('STORAGE', 'Explicit uniform buffers, attribute conversions, atomic and compute graphs are not admitted');
+      fail('STORAGE', 'Managed uniform arrays, attribute conversions, atomic and compute graphs are not admitted');
     if (node.isAssignNode) {
       const seen = new Set(), targets = [node.targetNode];
       while (targets.length) {
         const target = targets.pop(); if (!target || seen.has(target)) continue;
         seen.add(target);
         if (target.isStorageBufferNode) fail('STORAGE', 'Native graphics storage bindings are read-only');
+        if (rawUniformBuffer(target)) fail('UNIFORM', 'Native graphics uniform buffers are read-only');
         // An explicit local variable owns a value copied from its initializer;
         // assigning it does not write back to the source storage address.
         if (target.isVarNode && target.intent === false) continue;
@@ -356,7 +393,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const previous = byMaterial?.get(material);
     if (previous?.key === key && pmremSignature(previous.pmremNodes) === previous.pmremSignature &&
         textureSignature(previous.textureNodes) === previous.textureSignature &&
-        storageSignature(previous.storageNodes) === previous.storageSignature) return previous.descriptor;
+        storageSignature(previous.storageNodes) === previous.storageSignature &&
+        uniformSignature(previous.uniformNodes, previous.builder) === previous.uniformSignature) return previous.descriptor;
     if (entries.size - (previous ? 1 : 0) >= maxPrograms) fail('LIMIT', 'Native node program capacity exceeded');
     const builder = new three.WGSLNodeBuilder(object, renderer);
     builder.material = material; builder.context.material = material;
@@ -386,21 +424,34 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     for (const node of builder.nodes) checkNode(node, lightsNode, lights, environmentNode, boundTextures);
     if (bindings.length > Math.min(maxBindGroups, renderer._device?.limits?.maxBindGroups ?? 4))
       fail('LIMIT', 'Native node graph exceeds its bind group budget');
-    let uniformBytes = 0;
-    const sampledCounts = [0, 0], samplerCounts = [0, 0], storageCounts = [0, 0];
+    let uniformBytes = 0, uniformCount = 0;
+    const alignment = renderer._device?.limits?.minUniformBufferOffsetAlignment ?? 256;
+    if (!Number.isSafeInteger(alignment) || alignment < 1 || !Number.isInteger(Math.log2(alignment)))
+      fail('LIMIT', 'Native uniform offsets require a valid device alignment');
+    const sampledCounts = [0, 0], samplerCounts = [0, 0], storageCounts = [0, 0], uniformCounts = [0, 0];
     const groups = bindings.map((group, index) => {
       let byteLength = 0;
+      const uniforms = [];
       const entries = group.bindings.map((binding, slot) => {
         const base = {binding: slot, visibility: binding.visibility};
-        if (binding.isNodeUniformsGroup === true) {
-          if (byteLength) fail('BINDING', 'Native graphics groups admit one uniform block per source group');
-          byteLength = binding.byteLength;
-          if (binding.uniforms.some(u => !TYPES.has(u.nodeUniform?.type)))
+        if (binding.isNodeUniformsGroup === true || binding.isNodeUniformBuffer === true) {
+          const size = binding.isNodeUniformBuffer ? inspectUniformBuffer(binding.nodeUniform) : binding.byteLength;
+          if (binding.isNodeUniformsGroup && binding.uniforms.some(u => !TYPES.has(u.nodeUniform?.type)))
             fail('UNIFORM', 'Native node uniforms must be ordinary scalars, vectors or matrices');
-          if (!Number.isSafeInteger(byteLength) || byteLength < 4 || byteLength % 4 ||
-              byteLength > (renderer._device?.limits?.maxUniformBufferBindingSize ?? 65536))
+          if (!Number.isSafeInteger(size) || size < 4 || size % 4 ||
+              size > (renderer._device?.limits?.maxUniformBufferBindingSize ?? 65536))
             fail('LIMIT', 'Native node uniform buffer exceeds device binding limits');
-          return Object.freeze({...base, buffer: Object.freeze({type: 'uniform', hasDynamicOffset: true, minBindingSize: byteLength})});
+          if (++uniformCount > (renderer._device?.limits?.maxDynamicUniformBuffersPerPipelineLayout ?? 8))
+            fail('LIMIT', 'Native node uniform bindings exceed the dynamic buffer pipeline limit');
+          for (let stage = 0; stage < 2; stage++) if (binding.visibility & (1 << stage))
+            if (++uniformCounts[stage] > (renderer._device?.limits?.maxUniformBuffersPerShaderStage ?? 12))
+              fail('LIMIT', 'Native node uniform bindings exceed per-stage device limits');
+          const offset = Math.ceil(byteLength / alignment) * alignment;
+          byteLength = offset + size;
+          if (!Number.isSafeInteger(byteLength) || byteLength > maxUniformBytes - uniformBytes)
+            fail('LIMIT', 'Native node draw exceeds its uniform byte budget');
+          uniforms.push(Object.freeze({binding: slot, offset, byteLength: size}));
+          return Object.freeze({...base, buffer: Object.freeze({type: 'uniform', hasDynamicOffset: true, minBindingSize: size})});
         }
         if (binding.isStorageBuffer && binding.nodeUniform?.isStorageBufferNode) {
           const minBindingSize = inspectStorage(binding.nodeUniform);
@@ -422,7 +473,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
           {...base, sampler: Object.freeze({type: 'filtering'})});
       });
       uniformBytes += byteLength;
-      return Object.freeze({index, name: group.name, byteLength, entries: Object.freeze(entries)});
+      return Object.freeze({index, name: group.name, byteLength, uniforms: Object.freeze(uniforms), entries: Object.freeze(entries)});
     });
     if (uniformBytes > maxUniformBytes) fail('LIMIT', 'Native node draw exceeds its uniform byte budget');
     const attributes = builder.attributes.map((attribute, location) => {
@@ -450,12 +501,13 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     }
     const storageNodes = [...graphNodes].filter(node => node.isStorageBufferNode);
     const storageKey = storageSignature(storageNodes);
+    const uniformNodes = [...graphNodes].filter(rawUniformBuffer), uniformKey = uniformSignature(uniformNodes, builder);
     nodeStates.set(descriptor, {owner: api, builder, bindings, material, object, environment, instanceSignature, pmremNodes, pmremSignature: pmremKey,
       textureNodes, textureSignature: signature,
-      storageNodes, storageSignature: storageKey});
-    const entry = {key, descriptor, material, object, geometry: object.geometry, bytes, pmremNodes, pmremSignature: pmremKey,
+      storageNodes, storageSignature: storageKey, uniformNodes, uniformSignature: uniformKey});
+    const entry = {key, descriptor, builder, material, object, geometry: object.geometry, bytes, pmremNodes, pmremSignature: pmremKey,
       textureNodes, textureSignature: signature,
-      storageNodes, storageSignature: storageKey};
+      storageNodes, storageSignature: storageKey, uniformNodes, uniformSignature: uniformKey};
     entry.onDispose = () => retire(entry);
     if (previous) retire(previous);
     const next = byMaterial ?? new Map(); next.set(material, entry); cache.set(object, next);
@@ -498,6 +550,33 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       if (value.isStorageBuffer) storage.push(Object.freeze({group, binding, attribute: value.attribute}));
     return Object.freeze(storage);
   }
+  function checkUniformBuffers(state) {
+    if (uniformSignature(state.uniformNodes, state.builder) !== state.uniformSignature)
+      fail('CHANGED', 'Native uniform array layout, group or binding aliases changed; compile the graph again');
+  }
+  function readUniformBuffer(binding, byteLength) {
+    let history = uniformBuffers.get(binding);
+    if (!history) {
+      // Source createUniformBuffer allocates zeroed storage without an initial
+      // upload. Even the first update may write only selected component ranges.
+      history = {bytes: new Uint8Array(byteLength), version: undefined};
+      uniformBuffers.set(binding, history);
+    }
+    if (history.bytes.byteLength !== byteLength) fail('CHANGED', 'Native uniform buffer allocation changed');
+    const group = binding.groupNode;
+    if (group.updateType === 'object' || history.version !== group.version) {
+      binding.update();
+      const array = binding.buffer, bytes = new Uint8Array(array.buffer, array.byteOffset, array.byteLength);
+      if (binding.updateRanges.length === 0) history.bytes.set(bytes);
+      else for (const {start, count} of binding.updateRanges)
+        history.bytes.set(bytes.subarray(start * 4, (start + count) * 4), start * 4);
+      history.version = group.version;
+      // Separate source bindings can refer to the same node. Consume its ranges
+      // in binding order, just as Bindings._update does for the pinned backend.
+      binding.clearUpdateRanges();
+    }
+    return history.bytes;
+  }
   function captureDraw(descriptor, context = {}) {
     const state = stateOf(descriptor);
     const object = context.object ?? state.object;
@@ -507,21 +586,29 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // Reject a stale or newly atomic schema before observable NodeFrame updates;
     // readStorage below also catches mutations performed by those updates.
     if (state.storageNodes.length) readStorage(state);
+    checkUniformBuffers(state);
     return withFrame(state, context, () => {
       for (const node of state.builder.updateBeforeNodes) frame.updateBeforeNode(node);
       for (const node of state.builder.updateNodes) frame.updateNode(node);
       assertInstances(object, state.instanceSignature);
       checkPMREM(state);
+      checkUniformBuffers(state);
       const textures = readTextures(state);
       const storage = readStorage(state);
       const uniforms = state.bindings.map((group, index) => {
-        const binding = group.bindings.find(value => value.isNodeUniformsGroup);
-        if (!binding) return new Uint8Array(0);
-        binding.update();
-        const buffer = binding.buffer;
-        if (buffer.byteLength !== descriptor.groups[index].byteLength) fail('CHANGED', 'Native node uniform layout changed during its update');
-        const bytes = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength).slice();
-        binding.clearUpdateRanges(); return bytes;
+        const layout = descriptor.groups[index], packet = new Uint8Array(layout.byteLength);
+        for (const member of layout.uniforms) {
+          const binding = group.bindings[member.binding];
+          if (binding.isNodeUniformBuffer) packet.set(readUniformBuffer(binding, member.byteLength), member.offset);
+          else {
+            binding.update();
+            const buffer = binding.buffer;
+            if (buffer.byteLength !== member.byteLength) fail('CHANGED', 'Native node uniform layout changed during its update');
+            packet.set(new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength), member.offset);
+            binding.clearUpdateRanges();
+          }
+        }
+        return packet;
       });
       return {uniforms, textures, storage};
     });

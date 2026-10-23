@@ -110,6 +110,83 @@ export const nativeTSLScenarios = {
     };
     return {...result, writer, writeCamera, targets};
   },
+  native_tsl_buffer_arrays(T, renderer) {
+    const {buffer, uniform, uint, vec3, vec4, uv, positionLocal} = T.TSL;
+    const transforms = buffer(new Float32Array(32), 'mat4', 2);
+    const palette = buffer(new Float32Array(12), 'vec4', 3), weights = buffer(new Float32Array(8), 'vec4', 2);
+    const arrays = [transforms, palette, weights], gain = uniform(.8);
+    const objectIndex = uniform(0, 'uint').onObjectUpdate(frame => frame.object.userData.bufferIndex);
+    const material = new T.MeshBasicNodeMaterial();
+    // Three explicit arrays and the ordinary object uniforms occupy distinct
+    // UBO slots; the palette node has separate vertex and fragment bindings.
+    material.positionNode = transforms.element(objectIndex).mul(vec4(positionLocal, 1)).xyz
+      .add(vec3(0, palette.element(objectIndex).g.mul(.12), 0));
+    const band = uint(uv().x.mul(3).min(2)).add(objectIndex).mod(3);
+    material.colorNode = palette.element(band).rgb.mul(weights.element(objectIndex).rgb).mul(gain);
+    const writer = scene(T), geometry = new T.PlaneGeometry(.82, 1.2, 12, 8), meshes = [];
+    for (let i = 0; i < 2; i++) {
+      const mesh = new T.Mesh(geometry, material); mesh.userData.bufferIndex = i;
+      mesh.frustumCulled = false; writer.add(mesh); meshes.push(mesh);
+    }
+    const writeCamera = new T.OrthographicCamera(-1.5, 1.5, 1.125, -1.125, .1, 10); writeCamera.position.z = 3;
+    const targets = Array.from({length: 3}, () => new T.RenderTarget(128, 96,
+      {depthBuffer: false, generateMipmaps: false, minFilter: T.NearestFilter, magFilter: T.NearestFilter}));
+    const result = {scene: scene(T), camera: camera(T, true)};
+    for (const [i, target] of targets.entries()) {
+      renderer.initRenderTarget(target);
+      const panel = new T.Mesh(new T.PlaneGeometry(1.25, .9375), new T.MeshBasicMaterial({map: target.texture}));
+      panel.position.x = (i - 1) * 1.4; result.scene.add(panel);
+    }
+    const matrix = new T.Matrix4(), scale = new T.Vector3();
+    function updateArrays(state, updated) {
+      for (let i = 0; i < 2; i++) {
+        const angle = (i ? -1 : 1) * (.12 + state * .18 + (updated ? .15 : 0));
+        matrix.makeRotationZ(angle).scale(scale.set(.95 - state * .08, .8 + i * .15, 1));
+        matrix.setPosition(i ? .62 : -.62, (i ? -1 : 1) * (updated ? .12 : -.08), 0);
+        matrix.toArray(transforms.value, i * 16);
+        weights.value.set([.7 + i * .2, .85 - state * .08, .75 + state * .08, 1], i * 4);
+      }
+      const colors = updated ? [[.16, .72, .28], [.75, .18, .48], [.18, .35, .85]]
+        : [[.8, .18, .08], [.12, .65, .32], [.15, .3, .8]];
+      for (let i = 0; i < 3; i++) palette.value.set([...colors[(i + state) % 3], 1], i * 4);
+    }
+    updateArrays(0, false);
+    const compile = renderer.compileAsync.bind(renderer), render = renderer.render.bind(renderer);
+    renderer.compileAsync = async (...args) => {
+      const previous = renderer.getRenderTarget(), previousMip = renderer.getActiveMipmapLevel();
+      try {
+        for (const target of targets) { renderer.setRenderTarget(target); await compile(writer, writeCamera); }
+      } finally { renderer.setRenderTarget(previous, 0, previousMip); }
+      return compile(...args);
+    };
+    let frame = 0;
+    renderer.render = (...args) => {
+      if (args[0] !== result.scene) return render(...args);
+      frame++;
+      if (frame === 1 || frame === 8) {
+        const retired = [], previous = renderer.getRenderTarget(), previousMip = renderer.getActiveMipmapLevel();
+        try {
+          for (const [i, target] of targets.entries()) {
+            if (i === 2) for (const node of arrays) {
+              // Same source node and layout, new array identity. The first two
+              // targets must retain the bytes from the arrays being replaced.
+              retired.push(node.value); node.value = new Float32Array(node.value.length);
+            }
+            // No needsUpdate flag or version bump: BufferNode uploads current
+            // bytes on every draw, including these in-place target A/B edits.
+            updateArrays(i, frame === 8); gain.value = (frame === 8 ? .95 : .75) - i * .16;
+            renderer.setRenderTarget(target); render(writer, writeCamera);
+          }
+        } finally { renderer.setRenderTarget(previous, 0, previousMip); }
+        // Poison both retired and live arrays after acceptance; a queued draw
+        // must use its captured bytes for every UBO binding and shared object.
+        for (const array of [...retired, ...arrays.map(node => node.value)]) array.fill(0);
+        gain.value = .01;
+      }
+      return render(...args);
+    };
+    return {...result, writer, meshes, targets, transforms, palette, weights};
+  },
   native_tsl_background_blur(T, renderer) {
     const panorama = environmentTexture(T, 0);
     const writer = new T.Scene(), writeCamera = camera(T);

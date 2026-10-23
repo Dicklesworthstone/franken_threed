@@ -4,7 +4,7 @@
  * replaces published pages or bind groups. Growth cannot invalidate earlier
  * commands, including commands staged before an asynchronous registration.
  *
- * All native allocation/validation happens in register(), not stage()/write().
+ * All native allocation/validation happens in registration, not stage()/write().
  * Submit the preceding frame before begin(); queue writes then precede this
  * frame's submission. Stable page/group/offset choices remain bundle-cacheable.
  * A tight byte budget may admit fewer than maxDraws; stage fails, never truncates.
@@ -38,17 +38,24 @@ export function createProgramUniformArena(device, {maxDraws, label, fail, scoped
     for (const page of resources) destroy(page);
   }
   lost.then(info => stop(error('ANIMATION_RENDER_LOST', info?.message || 'WebGPU device lost')), stop).catch(() => {});
-  function checkSize(size) {
+  function checkPacketSize(size) {
     live();
-    if (!Number.isSafeInteger(size) || size < 4 || size % 4 || size > bindingLimit)
-      limit('Program uniform block exceeds the binding or byte limit');
+    if (!Number.isSafeInteger(size) || size < 4 || size % 4 || size > maximum)
+      limit('Program uniform packet exceeds the buffer or byte limit');
     return size;
   }
+  function checkSize(size) {
+    checkPacketSize(size);
+    if (size > bindingLimit) limit('Program uniform block exceeds the binding or byte limit');
+    return size;
+  }
+  const keyOf = (size, packet) => packet ? `packet:${size}` : size;
   const strideOf = size => Math.ceil(size / alignment) * alignment;
   const slots = (bytes, size) => bytes < size ? 0 : 1 + Math.floor((bytes - size) / strideOf(size));
-  async function prepare(size) {
+  async function prepare(size, packet) {
     live();
-    if (bindings.has(size)) return bindings.get(size);
+    const key = keyOf(size, packet);
+    if (bindings.has(key)) return bindings.get(key);
     // Serialize registrations, not draws. Failed growth is private and cannot
     // publish invalid groups or strand memory needed by a later registration.
     let missing = maxDraws - pages.reduce((n, page) => n + slots(page.size, size), 0);
@@ -64,9 +71,12 @@ export function createProgramUniformArena(device, {maxDraws, label, fail, scoped
     let issued;
     try {
       issued = scoped(device, () => {
-        const layout = device.createBindGroupLayout({label: `${label}/program-uniforms`, entries: [{binding: 0, visibility: 3,
+        // A source group can pack several individually bounded UBOs into one
+        // reservation. Its caller owns those binding ranges and their layout;
+        // never manufacture an oversized standalone binding for the packet.
+        const layout = packet ? null : device.createBindGroupLayout({label: `${label}/program-uniforms`, entries: [{binding: 0, visibility: 3,
           buffer: {type: 'uniform', hasDynamicOffset: true, minBindingSize: size}}]});
-        const binding = Object.freeze({layout, size, groups: new WeakMap()});
+        const binding = Object.freeze({layout, size, packet, groups: new WeakMap()});
         for (const bytes of planned) {
           const staged = new Uint8Array(bytes);
           const buffer = device.createBuffer({label: `${label}/program-uniforms`, size: bytes, usage: 64 | 8});
@@ -74,7 +84,7 @@ export function createProgramUniformArena(device, {maxDraws, label, fail, scoped
           added.push(page); resources.add(page); allocatedBytes += bytes;
         }
         for (const b of [...oldBindings, binding]) for (const page of b === binding ? [...pages, ...added] : added) {
-          if (page.size < b.size) continue;
+          if (b.packet || page.size < b.size) continue;
           const group = device.createBindGroup({label: `${label}/program-uniforms`, layout: b.layout,
             entries: [{binding: 0, resource: {buffer: page.buffer, size: b.size}}]});
           groups.push({binding: b, page, group});
@@ -86,7 +96,7 @@ export function createProgramUniformArena(device, {maxDraws, label, fail, scoped
       live();
       for (const {binding, page, group} of groups) binding.groups.set(page, group);
       pages.push(...added);
-      bindings.set(size, issued.value);
+      bindings.set(key, issued.value);
       return issued.value;
     } catch (e) {
       issued?.errors.catch(() => {});
@@ -94,26 +104,28 @@ export function createProgramUniformArena(device, {maxDraws, label, fail, scoped
       throw e;
     }
   }
+  function register(size, packet) {
+    // Check before joining the queue; invalid input never reserves resources.
+    if (packet) checkPacketSize(size); else checkSize(size);
+    const ready = serial.then(() => prepare(size, packet));
+    serial = ready.catch(() => {});
+    return ready;
+  }
   return Object.freeze({
-    checkSize, live, stopped,
-    register(size) {
-      // Check before joining the queue; invalid input never reserves resources.
-      checkSize(size);
-      const ready = serial.then(() => prepare(size));
-      serial = ready.catch(() => {});
-      return ready;
-    },
+    checkSize, checkPacketSize, live, stopped,
+    register(size) { return register(size, false); },
+    registerPacket(size) { return register(size, true); },
     stage(binding, bytes) {
       live();
-      if (bindings.get(binding?.size) !== binding)
+      if (!binding || bindings.get(keyOf(binding.size, binding.packet)) !== binding)
         fail('ANIMATION_RENDER_VALUE', 'Program uniform binding is not registered in this arena');
       if (!(bytes instanceof Uint8Array) || bytes.byteLength !== binding.size ||
           !(bytes.buffer instanceof ArrayBuffer) || bytes.buffer.resizable)
         fail('ANIMATION_RENDER_VALUE', 'Program uniforms need exact, fixed unshared byte storage');
       if (draws >= maxDraws) limit('Program uniform draw capacity exhausted for this frame');
       for (const page of pages) {
-        const offset = Math.ceil(page.used / alignment) * alignment, group = binding.groups.get(page);
-        if (!group || offset + binding.size > page.size) continue;
+        const offset = Math.ceil(page.used / alignment) * alignment, group = binding.packet ? null : binding.groups.get(page);
+        if ((!binding.packet && !group) || offset + binding.size > page.size) continue;
         page.staged.set(bytes, offset);
         page.used = offset + binding.size; draws++;
         // Borrowed buffer metadata lets native source layouts combine this

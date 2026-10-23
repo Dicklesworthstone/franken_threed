@@ -375,3 +375,101 @@ test('storage layout and per-stage limits are separate from uniform limits', asy
     {group: 0, binding: 0, resource: {buffer: {size: 32, usage: 128}}},
     {group: 0, binding: 1, resource: {buffer: {size: 16, usage: 128}}}]}), {code: 'ANIMATION_RENDER_LIMIT'});
 });
+
+function multiUniformProgram(f, {large = false, mixed = false} = {}) {
+  const first = large ? 65536 : 16, second = large ? 16 : 32, offset = large ? 65536 : 256;
+  const program = f.program([]);
+  program.groups = [{index: 0, byteLength: offset + second,
+    // Intentionally unordered: dynamic offsets follow binding numbers, while
+    // packet ranges and resource-only slots retain their source indices.
+    uniforms: [{binding: 5, offset, byteLength: second}, {binding: 1, offset: 0, byteLength: first}],
+    entries: [
+      {binding: 5, visibility: 2, buffer: {type: 'uniform', hasDynamicOffset: true, minBindingSize: second}},
+      {binding: 1, visibility: 1, buffer: {type: 'uniform', hasDynamicOffset: true, minBindingSize: first}},
+      ...(mixed ? [
+        {binding: 0, visibility: 3, buffer: {type: 'read-only-storage', hasDynamicOffset: false, minBindingSize: 16}},
+        {binding: 2, visibility: 2, texture: {sampleType: 'float', viewDimension: '2d', multisampled: false}},
+        {binding: 3, visibility: 2, sampler: {type: 'filtering'}},
+      ] : []),
+    ]}];
+  return program;
+}
+function uniformBytes(command, binding) {
+  const packet = command.nodeProgram.groups[0], resource = packet.group.entries.find(entry => entry.binding === binding).resource;
+  return resource.buffer.bytes.slice(packet.offset + resource.offset, packet.offset + resource.offset + resource.size);
+}
+
+test('multiple UBOs share a source group with sampled and storage resources without merging draw histories', async t => {
+  const f = rig(t, {maxDraws: 2}), program = multiUniformProgram(f, {mixed: true});
+  const pending = f.add([], {nodeProgram: program});
+  program.groups[0].uniforms[0].offset = 0; program.groups[0].entries[0].buffer.minBindingSize = 64;
+  const record = await pending, buffer = {size: 512, usage: 128}, view = {}, sampler = {}, writes = f.writes.length;
+  const nodeResources = [{group: 0, binding: 0, resource: {buffer, offset: 256, size: 16}},
+    {group: 0, binding: 2, resource: view}, {group: 0, binding: 3, resource: sampler}];
+  const data = new Uint8Array(288); data.fill(11, 0, 16); data.fill(13, 256);
+  const first = f.stage(record, [], {nodeUniforms: [data], nodeResources});
+  data.fill(17, 0, 16); data.fill(19, 256);
+  const second = f.stage(record, [], {nodeUniforms: [data], nodeResources});
+  data.fill(0); structuredClone(data.buffer, {transfer: [data.buffer]}); nodeResources[0].resource.offset = 0;
+  f.owner.prepare(); f.owner.write();
+  const group = first.nodeProgram.groups[0].group;
+  assert.equal(second.nodeProgram.groups[0].group, group);
+  assert.deepEqual(group.entries.map(entry => entry.binding), [0, 1, 2, 3, 5]);
+  assert.deepEqual(group.entries[0].resource, {buffer, offset: 256, size: 16});
+  assert.equal(group.entries[2].resource, view); assert.equal(group.entries[3].resource, sampler);
+  assert.deepEqual([group.entries[1], group.entries[4]].map(entry => [entry.resource.offset, entry.resource.size]), [[0, 16], [256, 32]]);
+  assert.deepEqual([first, second].map(command => command.nodeProgram.groups[0].offsets), [[0, 0], [512, 512]]);
+  for (const [command, a, b] of [[first, 11, 13], [second, 17, 19]]) {
+    assert.ok(uniformBytes(command, 1).every(value => value === a));
+    assert.ok(uniformBytes(command, 5).every(value => value === b));
+  }
+  assert.ok(f.writes.every(write => write.buffer !== buffer)); assert.equal(f.writes.length, writes + 1);
+});
+
+test('aggregate packets larger than 64 KiB retain valid individual UBO ranges and independent draws', async t => {
+  const f = rig(t, {maxDraws: 2, maxBindGroups: 1, maxUniformBytes: 262144, maxBufferSize: 262144});
+  const record = await f.add([], {nodeProgram: multiUniformProgram(f, {large: true})});
+  const first = f.stage(record, [23]), second = f.stage(record, [31]); f.owner.prepare(); f.owner.write();
+  assert.equal(record.groups[0].byteLength, 65552);
+  assert.deepEqual([first, second].map(command => command.nodeProgram.groups[0].offsets), [[0, 0], [65792, 65792]]);
+  for (const [command, expected] of [[first, 23], [second, 31]]) for (const binding of [1, 5])
+    assert.ok(uniformBytes(command, binding).every(value => value === expected));
+  const entries = first.nodeProgram.groups[0].group.entries;
+  assert.deepEqual(entries.map(entry => entry.resource.size), [65536, 16]);
+  assert.ok(f.bindGroups.every(group => group.entries.every(entry => !entry.resource.buffer || entry.resource.size <= 65536)));
+  assert.ok(f.owner.uniformDiagnostics.allocatedBytes <= 262144);
+});
+
+test('malformed multi-UBO packet plans fail before allocating pages', async t => {
+  const f = rig(t), before = f.buffers.length;
+  for (const change of [
+    group => { delete group.uniforms; },
+    group => { group.uniforms.pop(); },
+    group => { group.uniforms[0].binding = 1; },
+    group => { group.uniforms[0].offset = 4; },
+    group => { group.uniforms[0].offset = 0; },
+    group => { group.uniforms[0].offset = 512; },
+    group => { group.uniforms[0].byteLength = 16; },
+    group => { group.byteLength += 4; },
+  ]) {
+    const program = multiUniformProgram(f); change(program.groups[0]);
+    await assert.rejects(f.add([], {nodeProgram: program}), {code: 'ANIMATION_RENDER_OPTIONS'});
+  }
+  const program = multiUniformProgram(f, {large: true}); program.groups[0].entries[1].buffer.minBindingSize = 65540;
+  await assert.rejects(f.add([], {nodeProgram: program}), {code: 'ANIMATION_RENDER_LIMIT'});
+  assert.equal(f.buffers.length, before); assert.equal(f.bindGroups.length, 0);
+});
+
+test('the pipeline dynamic UBO limit counts bindings across source groups and shader stages', async t => {
+  const f = rig(t), before = f.buffers.length;
+  f.device.limits.maxDynamicUniformBuffersPerPipelineLayout = 1;
+  f.device.limits.maxUniformBuffersPerShaderStage = 1;
+  await assert.rejects(f.add([], {nodeProgram: multiUniformProgram(f)}), {code: 'ANIMATION_RENDER_LIMIT'});
+  const program = f.program([16, 16]);
+  program.groups.forEach((group, index) => { group.entries = [{binding: 0, visibility: index + 1,
+    buffer: {type: 'uniform', hasDynamicOffset: true, minBindingSize: 16}}]; });
+  await assert.rejects(f.add([], {nodeProgram: program}), {code: 'ANIMATION_RENDER_LIMIT'});
+  assert.equal(f.buffers.length, before);
+  f.device.limits.maxDynamicUniformBuffersPerPipelineLayout = 2;
+  await f.add([], {nodeProgram: program});
+});

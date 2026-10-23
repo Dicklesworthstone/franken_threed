@@ -17,6 +17,37 @@ float attributes compile through the pinned builder. Native scalar, integer,
 boolean, vector and matrix uniforms retain their source group ordering and
 padding. Clip-space vertex and fragment graphs with no uniform groups also work.
 
+Authored `TSL.buffer()` arrays use native uniform-buffer bindings. The current
+raw-array profile accepts Float32 `vec3`, `color`, `vec4` and `mat2`/`mat3`/`mat4`,
+plus matching Int32/Uint32 three- and four-component vectors. Callers retain the
+pinned source array layout: `vec3` elements have four-word strides and `mat3`
+columns are padded. Final unused padding may be absent from the source view.
+Managed `uniformArray()` inputs and raw scalar, two-component or boolean arrays
+still need an additional profile.
+
+Each source group may contain several uniform buffers alongside textures and
+read-only storage. Every source binding keeps its index, visibility and exact
+size, including separate vertex/fragment bindings for the same authored buffer.
+Per-binding device limits remain enforced when the whole aligned group packet
+exceeds one buffer's binding-size limit. Pipeline dynamic-binding and shader-stage
+limits are checked before native allocation.
+
+Default object-group arrays capture current typed-array values on every logical
+draw, including edits without `needsUpdate` and compatible `.value` replacement.
+Partial updates preserve bytes outside the requested ranges; a first partial
+upload leaves untouched allocation bytes zero. Custom uniform groups retain
+their source version gating. Queued draws retain independent packets, and render
+bundle reuse includes every dynamic uniform offset.
+
+The direct-module `native_tsl_buffer_arrays` browser comparison produced an exact
+320×240 match against pinned r186: zero different pixels, mean difference zero,
+maximum difference zero. It exercised two meshes sharing a material, four raw
+array bindings across the shader stages, and three queued targets with in-place
+edits and compatible replacements, repeated at frame 8 before poisoning the
+source arrays. Chrome 151 software Vulkan completed the existing 30-frame gate
+with no page, console, GPU or request errors. This is shader/rendering evidence;
+it does not claim a fresh bundled-build check or hardware performance.
+
 Authored `MeshToonNodeMaterial`, `MeshLambertNodeMaterial` and
 `MeshPhongNodeMaterial` additionally use the pinned lighting models with ambient,
 hemisphere, directional, point and spot lights. They accept `normalNode` and
@@ -263,7 +294,7 @@ material. Original material visibility and render-list partitioning still apply.
 
 This is a bounded native graphics entrance, not full TSL coverage. Writable or
 atomic graphics storage, standalone `mat2`/`mat3` storage arrays, nested/boolean/atomic
-struct members, PBO storage, explicit uniform-buffer arrays, compute nodes inside
+struct members, PBO storage, managed uniform arrays, compute nodes inside
 graphics graphs and multiple-render-target graphics graphs are refused. Authored
 PBR transmission/dispersion, cube/custom environment lighting, area/probe/custom lights,
 shadows, projected light maps and custom `lightsNode` graphs remain missing.
@@ -406,3 +437,4 @@ unsupported textures, load preservation with `autoClear = false`, and private
 resource ownership. The registered `native_tsl_background_nodes` browser scenario
 renders two queued gradient skies into distinct targets and mutates their live
 controls afterward. Its GPU pixel comparison has not yet been run.
+

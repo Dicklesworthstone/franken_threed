@@ -212,3 +212,37 @@ test('a rejected final sampled draw creates no native bindings or writes and ret
   assert.deepEqual([...words(snapshot,0)],Array(4).fill(7));
   await r.whenIdle();r.dispose();gpu.dispose();ordinary.dispose();
 });
+
+for(const renderBundles of [false,true])
+test(`multiple native UBOs preserve submitted byte histories and bundle reuse (${renderBundles})`,async()=>{
+  const d=geometryDevice(),gpu=createGpuProgramGeometry(d,source(),attributes);
+  const r=await createGpuAnimationRenderer(d,{maxDraws:2,renderBundles});
+  const nodeProgram={...descriptor(),groups:[{index:0,byteLength:288,
+    uniforms:[{binding:1,offset:0,byteLength:16},{binding:4,offset:256,byteLength:32}],entries:[
+      {binding:1,visibility:1,buffer:{type:'uniform',hasDynamicOffset:true,minBindingSize:16}},
+      {binding:4,visibility:2,buffer:{type:'uniform',hasDynamicOffset:true,minBindingSize:32}},
+    ]}]};
+  const mesh=await r.addMesh(gpu,{nodeProgram,raster:raster()});
+  for(let submission=0;submission<2;submission++) {
+    const draws=Array.from({length:2},(_,index)=>{
+      const data=new Uint8Array(288),value=submission*2+index+1;
+      data.fill(value,0,16);data.fill(value+10,256);
+      return {mesh,nodeUniforms:[data]};
+    });
+    r.render(frame(draws));draws.forEach(draw=>draw.nodeUniforms[0].fill(255));
+  }
+  for(let submission=0;submission<2;submission++) {
+    const draws=d.snapshots[submission];
+    assert.deepEqual(draws.map(draw=>draw.groups.get(0).offsets),[[0,0],[512,512]]);
+    for(let index=0;index<2;index++) {
+      const draw=draws[index],binding=draw.groups.get(0),value=submission*2+index+1;
+      assert.deepEqual(binding.group.entries.map(entry=>entry.binding),[1,4]);
+      binding.group.entries.forEach((entry,member)=>{
+        const {buffer,offset,size}=entry.resource,start=binding.offsets[member]+offset;
+        assert.ok(draw.contents.get(buffer).slice(start,start+size).every(byte=>byte===value+member*10));
+      });
+    }
+  }
+  if(renderBundles){assert.equal(r.bundleDiagnostics.builds,1);assert.equal(r.bundleDiagnostics.reuses,1);}
+  await r.whenIdle();r.dispose();gpu.dispose();
+});

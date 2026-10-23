@@ -24,6 +24,16 @@ function rig(t, options = {}) {
     compile: () => owner.compile(material, object, context)};
 }
 const floats = packets => packets.flatMap(bytes => Array.from(new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4)));
+function uniformMember(descriptor, name, stage = 'fragment') {
+  const match = new RegExp(`@binding\\(\\s*(\\d+)\\s*\\)\\s*@group\\(\\s*(\\d+)\\s*\\)\\s*var<uniform>\\s+${name}\\s*:`).exec(descriptor[stage]);
+  assert.ok(match, `${name} is bound in the ${stage} shader`);
+  const group = Number(match[2]), member = descriptor.groups[group].uniforms.find(value => value.binding === Number(match[1]));
+  assert.ok(member); return {group, ...member};
+}
+function uniformValues(packets, member, Type = Float32Array) {
+  const bytes = packets[member.group];
+  return Array.from(new Type(bytes.buffer, bytes.byteOffset + member.offset, member.byteLength / 4));
+}
 function dataTexture({linear = true, type = THREE.UnsignedByteType} = {}) {
   const pixels = type === THREE.FloatType ? new Float32Array(16) : type === THREE.HalfFloatType ? new Uint16Array(16) : new Uint8Array(16);
   const texture = new THREE.DataTexture(pixels, 2, 2, THREE.RGBAFormat, type);
@@ -71,6 +81,176 @@ test('uniform value edits reuse the program while old packets remain immutable',
   assert.deepEqual(first, saved); assert.ok(floats(second).includes(.875)); assert.notDeepEqual(second, first);
   f.material.colorNode = N.vec3(.3, .2, .1);
   assert.notEqual(f.compile(), d); assert.equal(f.owner.diagnostics.programs, 1);
+});
+test('authored BufferNodes retain all source bindings in aligned multi-buffer draw packets', t => {
+  const f = rig(t);
+  f.renderer._device = {limits: {minUniformBufferOffsetAlignment: 64}};
+  const matrices = N.buffer(new Float32Array(32).fill(2), 'mat4', 2).setName('rawMatrices');
+  const palette = N.buffer(new Float32Array(12).fill(3), 'vec4', 3).setName('rawPalette');
+  const weights = N.buffer(new Float32Array(8).fill(5), 'vec4', 2).setName('rawWeights');
+  f.material.positionNode = matrices.element(0).mul(N.vec4(N.positionLocal, 1)).xyz.add(palette.element(1).xyz);
+  f.material.colorNode = palette.element(0).xyz.mul(weights.element(1).xyz).mul(f.tint);
+  const d = f.compile(), packets = f.owner.capture(d, f.context), group = d.groups.find(value => value.name === 'object');
+  assert.equal(group.uniforms.length, 5, 'three arrays retain four source stage bindings plus the ordinary uniform block');
+  assert.deepEqual(group.uniforms.map(value => value.binding), group.entries.filter(value => value.buffer?.type === 'uniform').map(value => value.binding));
+  let end = 0;
+  for (const member of group.uniforms) {
+    assert.equal(member.offset, Math.ceil(end / 64) * 64); assert.equal(member.offset % 64, 0);
+    assert.equal(group.entries[member.binding].buffer.minBindingSize, member.byteLength);
+    assert.ok(packets[group.index].subarray(end, member.offset).every(value => value === 0));
+    end = member.offset + member.byteLength;
+  }
+  assert.equal(group.byteLength, end); assert.equal(packets[group.index].byteLength, end);
+  const fragmentPalette = uniformMember(d, 'rawPalette'), vertexPalette = uniformMember(d, 'rawPalette', 'vertex');
+  assert.notEqual(fragmentPalette.binding, vertexPalette.binding);
+  for (const [name, stage, count, value] of [['rawMatrices', 'vertex', 32, 2], ['rawPalette', 'fragment', 12, 3],
+    ['rawPalette', 'vertex', 12, 3], ['rawWeights', 'fragment', 8, 5]])
+    assert.deepEqual(uniformValues(packets, uniformMember(d, name, stage)), Array(count).fill(value));
+  assert.ok(d.groups.every(value => value.uniforms.length !== 1 || value.uniforms[0].offset === 0));
+});
+test('raw uniform arrays capture current data and compatible replacements without needsUpdate', t => {
+  const f = rig(t), values = N.buffer(new Float32Array(8).fill(1), 'vec4', 2).setName('rawValues');
+  f.material.fragmentNode = values.element(0);
+  const d = f.compile(), member = uniformMember(d, 'rawValues'), first = f.owner.capture(d, f.context), saved = first.map(bytes => bytes.slice());
+  values.value.fill(2); assert.equal(f.compile(), d);
+  const second = f.owner.capture(d, {...f.context, renderId: 2});
+  values.value = new Float32Array(8).fill(3); assert.equal(f.compile(), d);
+  const third = f.owner.capture(d, {...f.context, renderId: 3}); values.value.fill(9);
+  assert.deepEqual(uniformValues(first, member), Array(8).fill(1));
+  assert.deepEqual(uniformValues(second, member), Array(8).fill(2));
+  assert.deepEqual(uniformValues(third, member), Array(8).fill(3)); assert.deepEqual(first, saved);
+});
+test('raw uniform partial ranges preserve zero initialization and previous GPU-visible bytes', t => {
+  const f = rig(t), values = N.buffer(Float32Array.from([1, 2, 3, 4, 5, 6, 7, 8]), 'vec4', 2).setName('rawRanges');
+  values.addUpdateRange(1, 2); f.material.fragmentNode = values.element(0);
+  const d = f.compile(), member = uniformMember(d, 'rawRanges'), first = f.owner.capture(d, f.context);
+  assert.deepEqual(uniformValues(first, member), [0, 2, 3, 0, 0, 0, 0, 0]); assert.deepEqual(values.updateRanges, []);
+  values.value.fill(9); values.addUpdateRange(4, 2); values.addUpdateRange(6, 2);
+  const second = f.owner.capture(d, {...f.context, renderId: 2});
+  assert.deepEqual(uniformValues(second, member), [0, 2, 3, 0, 9, 9, 9, 9]);
+  values.value = new Float32Array(8).fill(6); values.addUpdateRange(0, 1);
+  assert.equal(f.compile(), d);
+  const third = f.owner.capture(d, {...f.context, renderId: 3});
+  assert.deepEqual(uniformValues(third, member), [6, 2, 3, 0, 9, 9, 9, 9]);
+  assert.deepEqual(uniformValues(first, member), [0, 2, 3, 0, 0, 0, 0, 0]);
+  assert.deepEqual(uniformValues(f.owner.capture(d, {...f.context, renderId: 4}), member), Array(8).fill(6));
+});
+test('cross-stage raw buffer bindings consume shared ranges in pinned source order', t => {
+  const f = rig(t), values = N.buffer(Float32Array.from([1, 2, 3, 4, 5, 6, 7, 8]), 'vec4', 2).setName('rawStages');
+  f.material.positionNode = N.positionLocal.add(values.element(0).xyz); f.material.fragmentNode = values.element(1);
+  values.addUpdateRange(0, 4);
+  const d = f.compile(), fragment = uniformMember(d, 'rawStages'), vertex = uniformMember(d, 'rawStages', 'vertex');
+  assert.equal(fragment.group, vertex.group); assert.ok(fragment.binding < vertex.binding);
+  const first = f.owner.capture(d, f.context);
+  assert.deepEqual(uniformValues(first, fragment), [1, 2, 3, 4, 0, 0, 0, 0]);
+  assert.deepEqual(uniformValues(first, vertex), [1, 2, 3, 4, 5, 6, 7, 8]);
+  values.value.fill(9); values.addUpdateRange(4, 4);
+  const second = f.owner.capture(d, {...f.context, renderId: 2});
+  assert.deepEqual(uniformValues(second, fragment), [1, 2, 3, 4, 9, 9, 9, 9]);
+  assert.deepEqual(uniformValues(second, vertex), Array(8).fill(9));
+});
+test('raw custom uniform groups retain source version-gated uploads', t => {
+  const f = rig(t), group = N.uniformGroup('manualPalette'), values = N.buffer(new Float32Array(8).fill(1), 'vec4', 2).setName('manualValues').setGroup(group);
+  f.material.fragmentNode = values.element(0);
+  const d = f.compile(), member = uniformMember(d, 'manualValues'); f.owner.capture(d, f.context);
+  values.value.fill(2); values.addUpdateRange(0, 1);
+  assert.deepEqual(uniformValues(f.owner.capture(d, {...f.context, renderId: 2}), member), Array(8).fill(1));
+  assert.equal(values.updateRanges.length, 1, 'skipped source groups do not consume update ranges');
+  group.needsUpdate = true;
+  assert.deepEqual(uniformValues(f.owner.capture(d, {...f.context, renderId: 3}), member), [2, 1, 1, 1, 1, 1, 1, 1]);
+  assert.deepEqual(values.updateRanges, []);
+});
+test('raw uniform layouts retain matrix padding, integer bytes and an omitted final vec3 padding word', t => {
+  for (const [type, Type, stride] of [['vec3', Float32Array, 4], ['color', Float32Array, 4], ['vec4', Float32Array, 4],
+    ['ivec3', Int32Array, 4], ['ivec4', Int32Array, 4], ['uvec3', Uint32Array, 4], ['uvec4', Uint32Array, 4],
+    ['mat2', Float32Array, 4], ['mat3', Float32Array, 12], ['mat4', Float32Array, 16]]) {
+    const f = rig(t), values = N.buffer(new Type(2 * stride).fill(7), type, 2).setName('rawLayout');
+    if (type.startsWith('mat')) {
+      const count = Number(type.at(-1)), vector = count === 2 ? N.positionLocal.xy : count === 3 ? N.positionLocal : N.vec4(N.positionLocal, 1);
+      const transformed = values.element(1).mul(vector);
+      f.material.positionNode = count === 2 ? N.vec3(transformed, 0) : transformed.xyz;
+    } else f.material.fragmentNode = N.vec4(values.element(1));
+    const d = f.compile(), member = uniformMember(d, 'rawLayout', type.startsWith('mat') ? 'vertex' : 'fragment');
+    assert.deepEqual(uniformValues(f.owner.capture(d, f.context), member, Type), Array(2 * stride).fill(7), type);
+  }
+  const f = rig(t), backing = new Float32Array(12), view = new Float32Array(backing.buffer, 4, 7); view.fill(4);
+  const values = N.buffer(view, 'vec3', 2).setName('rawTail'); f.material.fragmentNode = N.vec4(values.element(1), 1);
+  const d = f.compile(), member = uniformMember(d, 'rawTail');
+  assert.equal(member.byteLength, 32); assert.deepEqual(uniformValues(f.owner.capture(d, f.context), member), [4, 4, 4, 4, 4, 4, 4, 0]);
+  values.value = new Float32Array(8).fill(6); assert.equal(f.compile(), d); f.owner.capture(d, {...f.context, renderId: 2});
+  values.value = view; assert.equal(f.compile(), d);
+  assert.deepEqual(uniformValues(f.owner.capture(d, {...f.context, renderId: 3}), member), [4, 4, 4, 4, 4, 4, 4, 6]);
+});
+test('raw buffer structural changes and Fn-created uniform aliases invalidate before callbacks', t => {
+  const f = rig(t), nodes = {}; let shared = true, updates = 0;
+  f.material.positionNode = null; f.material.colorNode = null;
+  f.material.vertexNode = N.vec4(N.attribute('position', 'vec3'), 1);
+  f.material.fragmentNode = N.Fn(() => {
+    nodes.left ??= N.buffer(new Float32Array(8).fill(1), 'vec4', 2);
+    nodes.right ??= N.buffer(nodes.left.value, 'vec4', 2);
+    nodes.left.getUniformHash = () => 'left-uniform';
+    nodes.right.getUniformHash = () => shared ? 'left-uniform' : 'right-uniform';
+    return nodes.left.element(0).add(nodes.right.element(1));
+  })();
+  const aliased = f.compile(); assert.equal(aliased.groups.flatMap(group => group.uniforms).length, 1);
+  shared = false;
+  assert.throws(() => f.owner.capture(aliased, f.context), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  const split = f.compile(); assert.notEqual(split, aliased); assert.equal(split.groups.flatMap(group => group.uniforms).length, 2);
+  nodes.right.value = new Float32Array(8).fill(2); assert.equal(f.compile(), split, 'typed-array identity never aliases source BufferNodes');
+  shared = true; assert.notEqual(f.compile(), split);
+  f.material.fragmentNode = N.vec4(nodes.left.element(0).xyz, 1).mul(N.uniform(1).onObjectUpdate(() => { updates++; return 1; }));
+  const initial = f.compile(); nodes.left.bufferCount = 1;
+  assert.throws(() => f.owner.capture(initial, f.context), {code: 'THREE_NODE_PROGRAM_CHANGED'}); assert.equal(updates, 0);
+  const counted = f.compile(); nodes.left.nodeType = nodes.left.bufferType = 'vec3';
+  assert.throws(() => f.owner.capture(counted, f.context), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  const typed = f.compile(); nodes.left.setGroup(N.uniformGroup('differentGroup', 2, 'object'));
+  assert.throws(() => f.owner.capture(typed, f.context), {code: 'THREE_NODE_PROGRAM_CHANGED'}); assert.notEqual(f.compile(), typed);
+});
+test('raw buffer updates may replace compatible arrays but cannot change captured layouts', t => {
+  const f = rig(t), values = N.buffer(new Float32Array(8), 'vec4', 2).setName('updatedRaw'); let next = new Float32Array(8).fill(3), calls = 0;
+  const gain = N.uniform(1).onObjectUpdate(() => { calls++; values.value = next; return 1; });
+  f.material.fragmentNode = values.element(0).mul(gain);
+  const d = f.compile(), member = uniformMember(d, 'updatedRaw');
+  assert.deepEqual(uniformValues(f.owner.capture(d, f.context), member), Array(8).fill(3));
+  next = new Float32Array(12); assert.throws(() => f.owner.capture(d, {...f.context, renderId: 2}), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  assert.equal(calls, 2);
+  assert.throws(() => f.owner.capture(d, {...f.context, renderId: 3}), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  assert.equal(calls, 2, 'already stale layouts refuse before observable updates');
+});
+test('invalid raw uniform arrays and read-only writes refuse before source updates', t => {
+  const mutations = [node => { node.value = new Float64Array(8); }, node => { node.value = new Uint32Array(8); },
+    node => { node.value = new Float32Array(3); }, node => { node.bufferCount = 0; }, node => { node.bufferCount = 2.5; },
+    node => { node.nodeType = 'float'; }, node => { node.nodeType = 'vec2'; }, node => { node.nodeType = 'bvec4'; },
+    node => { node.value = new Float32Array(new SharedArrayBuffer(32)); },
+    node => { node.value = new Float32Array(new ArrayBuffer(32, {maxByteLength: 64})); },
+    node => { node.addUpdateRange(7, 2); }, node => { node.addUpdateRange(-1, 1); }, node => { node.addUpdateRange(0, .5); }];
+  for (const mutate of mutations) {
+    const f = rig(t), node = N.buffer(new Float32Array(8), 'vec4', 2); let updates = 0;
+    f.material.fragmentNode = node.element(0).mul(N.uniform(1).onObjectUpdate(() => { updates++; return 1; }));
+    const d = f.compile(); mutate(node);
+    assert.throws(() => f.owner.capture(d, f.context), {code: 'THREE_NODE_PROGRAM_UNIFORM'});
+    assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_UNIFORM'}); assert.equal(updates, 0);
+  }
+  const f = rig(t), node = N.buffer(new Float32Array(8), 'vec4', 2);
+  f.material.fragmentNode = N.Fn(() => { node.element(0).assign(N.vec4(1)); return node.element(0); })();
+  assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_UNIFORM'});
+  f.material.fragmentNode = N.Fn(() => { const copy = node.element(0).toVar(); copy.assign(N.vec4(1)); return copy; })();
+  assert.doesNotThrow(f.compile, 'a local copy remains writable');
+});
+test('uniform limits apply per binding and per pipeline while packed groups may exceed 64 KiB', t => {
+  const f = rig(t), matrices = N.buffer(new Float32Array(16384), 'mat4', 1024).setName('largeMatrices');
+  f.material.positionNode = matrices.element(0).mul(N.vec4(N.positionLocal, 1)).xyz;
+  const d = f.compile(), group = d.groups.find(value => value.byteLength > 65536);
+  assert.ok(group); assert.ok(group.uniforms.every(member => member.byteLength <= 65536));
+  assert.equal(f.owner.capture(d, f.context)[group.index].byteLength, group.byteLength);
+  f.renderer._device = {limits: {maxDynamicUniformBuffersPerPipelineLayout: 2}};
+  f.material.needsUpdate = true; assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_LIMIT'});
+  f.renderer._device = {limits: {maxUniformBuffersPerShaderStage: 1}};
+  assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_LIMIT'});
+  f.renderer._device = {limits: {maxUniformBufferBindingSize: 65520}};
+  assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_LIMIT'});
+  const bounded = rig(t, {maxUniformBytes: 65536}); bounded.material.positionNode = matrices.element(0).mul(N.vec4(N.positionLocal, 1)).xyz;
+  assert.throws(bounded.compile, {code: 'THREE_NODE_PROGRAM_LIMIT'});
 });
 test('Standard nodes retain source direct-light PBR, authored surface uniforms and the real RG16F DFG resource', t => {
   const f = pbrRig(t);
@@ -582,7 +762,8 @@ test('nested captures and thrown callbacks restore the exact outer NodeFrame con
 for (const [name, change, code] of [
   ['depth texture graph', f => { f.material.colorNode = N.texture(new THREE.DepthTexture(1, 1)); }, 'TEXTURE'],
   ['atomic storage graph', f => { f.material.colorNode = N.storage(new THREE.StorageBufferAttribute(4, 1, Uint32Array), 'uint', 4).toAtomic().element(0).toFloat(); }, 'STORAGE'],
-  ['explicit buffer graph', f => { f.material.colorNode = N.buffer(new Float32Array(16), 'vec4', 4).element(0).xyz; }, 'STORAGE'],
+  ['managed uniform array graph', f => { f.material.colorNode = N.uniformArray([new THREE.Vector4(1, 0, 0, 1)]).element(0).xyz; }, 'STORAGE'],
+  ['buffer attribute graph', f => { f.material.colorNode = N.bufferAttribute(new THREE.Float32BufferAttribute(new Float32Array(12), 3)); }, 'STORAGE'],
   ['material texture', f => { f.material.map = new THREE.Texture(); }, 'TEXTURE'],
   ['MRT graph', f => { f.material.fragmentNode = N.mrt({output: N.vec4(1)}); }, 'MRT'],
   ['lighting slot', f => { f.material.lightsNode = N.vec3(1); }, 'GRAPH'],

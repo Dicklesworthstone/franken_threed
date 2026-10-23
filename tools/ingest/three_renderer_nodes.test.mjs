@@ -46,6 +46,62 @@ function containsColor(draw,color){
   return false;
 }
 
+function uniformBlocks(draw){
+  const result=[];
+  for(const {group,offsets} of draw.groups.values()){
+    const layout=group.layout.entries.filter(entry=>entry.buffer?.type==='uniform').sort((a,b)=>a.binding-b.binding);
+    for(const [index,entry] of layout.entries()){
+      const resource=group.entries.find(value=>value.binding===entry.binding).resource;
+      const bytes=draw.contents.get(resource.buffer),offset=(resource.offset??0)+(offsets[index]??0);
+      result.push([...new Float32Array(bytes.buffer,bytes.byteOffset+offset,resource.size/4)]);
+    }
+  }
+  return result;
+}
+
+test('queued uniform-buffer arrays retain every binding and current values without update flags',async t=>{
+  const f=fixture(t),N=T.TSL;
+  const initial=new Float32Array([.125,.375,.625,1,.25,.5,.75,1]);
+  const colors=N.buffer(initial,'vec4',2),gain=N.buffer(new Float32Array([.75,0,0,0]),'vec4',1);
+  f.material.colorNode=colors.element(0).rgb.mul(gain.element(0).x).mul(f.tint);
+  await f.renderer.init();
+  assert.equal(f.renderer.backend.capabilities.getUniformBufferLimit(),f.device.limits.maxUniformBufferBindingSize);
+  f.renderer.render(f.scene,f.camera);
+  initial.set([.875,.625,.375,1]);gain.value[0]=.5;
+  f.renderer.render(f.scene,f.camera);
+  colors.value=new Float32Array([.25,.75,.5,1,.375,.625,.875,1]);gain.value[0]=.25;
+  f.renderer.render(f.scene,f.camera);
+  colors.value.fill(0);gain.value.fill(0);
+  await drain(f.renderer);
+  const draws=nativeDraws(f.device);assert.equal(draws.length,3);
+  assert.deepEqual(draws.map(draw=>uniformBlocks(draw).find(words=>words.length===8)),[
+    [.125,.375,.625,1,.25,.5,.75,1],
+    [.875,.625,.375,1,.25,.5,.75,1],
+    [.25,.75,.5,1,.375,.625,.875,1]]);
+  assert.deepEqual(draws.map(draw=>uniformBlocks(draw).find(words=>words.length===4)?.[0]),[.75,.5,.25]);
+  assert.equal(draws[0].pipeline,draws[1].pipeline);assert.equal(draws[1].pipeline,draws[2].pipeline);
+  for(const draw of draws)assert.ok([...draw.groups.values()].some(({offsets})=>offsets.length>=3));
+  assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+test('uniform-buffer partial updates retain unrequested bytes across queued render calls',async t=>{
+  const f=fixture(t),N=T.TSL;
+  const colors=N.buffer(new Float32Array([.125,.375,.625,1,.25,.5,.75,1]),'vec4',2);
+  f.material.colorNode=colors.element(0).rgb.add(colors.element(1).rgb).mul(f.tint);
+  await f.renderer.init();f.renderer.render(f.scene,f.camera);
+  colors.value.set([.875,.625,.375,1,.75,.25,.5,1]);colors.addUpdateRange(4,4);
+  f.renderer.render(f.scene,f.camera);
+  assert.equal(colors.updateRanges.length,0,'source upload ranges are consumed synchronously');
+  f.renderer.render(f.scene,f.camera);
+  colors.value.fill(0);await drain(f.renderer);
+  const draws=nativeDraws(f.device);assert.equal(draws.length,3);
+  assert.deepEqual(draws.map(draw=>uniformBlocks(draw).find(words=>words.length===8)),[
+    [.125,.375,.625,1,.25,.5,.75,1],
+    [.125,.375,.625,1,.75,.25,.5,1],
+    [.875,.625,.375,1,.75,.25,.5,1]]);
+  assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
 test('two unprepared render calls keep independent native uniforms until actual submission',async t=>{
   const f=fixture(t);await f.renderer.init();
   f.renderer.render(f.scene,f.camera);

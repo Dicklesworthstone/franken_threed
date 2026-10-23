@@ -313,6 +313,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       // Tooling surface (e.g. the r186 Inspector addon). This backend records no
       // GPU timestamps: hasTimestamp stays false and no timing is reported.
       this._backend = {isWebGPUBackend: true, isF3DBackend: true, device: null, trackTimestamp: false, hasTimestamp: false,
+        capabilities: {getUniformBufferLimit: () => this._device.limits.maxUniformBufferBindingSize},
         hasTimestampQuery: () => false, getTimestampUID: () => null, delete() {}};
       // The source frame clock (Animation advances it once per loop tick).
       this._nodes = {nodeFrame: typeof THREE.NodeFrame === 'function' ? new THREE.NodeFrame() : {frameId: 0, time: 0, deltaTime: 0, update() { this.frameId++; }}};

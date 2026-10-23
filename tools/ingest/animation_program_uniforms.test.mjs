@@ -213,3 +213,36 @@ test('device loss interrupts an outstanding pipeline with the loss error, not an
   for (let i = 0; i < 12; i++) await Promise.resolve();
   f.lose({message: 'pipeline loss'}); await rejected; release();
 });
+
+test('multi-binding packets can exceed the single UBO limit without creating an oversized binding', async t => {
+  const f = fixture(t, {maxDraws: 2, maxBytes: 262144, maxBufferSize: 262144}), arena = f.arena();
+  const size = 65552, binding = await arena.registerPacket(size), expected = new Uint8Array(size).fill(17);
+  assert.equal(binding.layout, null); assert.equal(f.groups.length, 0);
+  assert.throws(() => arena.register(size), {code: 'ANIMATION_RENDER_LIMIT'});
+  const input = expected.slice(), first = arena.stage(binding, input);
+  input.fill(0); structuredClone(input.buffer, {transfer: [input.buffer]});
+  const second = arena.stage(binding, new Uint8Array(size).fill(29)); arena.write();
+  assert.deepEqual(first.resource.buffer.bytes.slice(first.offset, first.offset + size), expected);
+  assert.ok(second.resource.buffer.bytes.slice(second.offset, second.offset + size).every(value => value === 29));
+  assert.deepEqual([first.group, second.group], [null, null]);
+  assert.deepEqual([first.offset, second.offset], [0, 65792]);
+  assert.equal(f.groups.length, 0); assert.ok(arena.diagnostics.allocatedBytes <= 262144);
+  const allocated = f.buffers.length;
+  assert.throws(() => arena.registerPacket(262148), {code: 'ANIMATION_RENDER_LIMIT'});
+  assert.equal(f.buffers.length, allocated);
+});
+
+test('packet and standalone registrations share pages while retaining separate binding contracts', async t => {
+  const f = fixture(t, {maxDraws: 3, maxBytes: 262144, maxBufferSize: 262144}), arena = f.arena();
+  const packet = await arena.registerPacket(16), first = arena.stage(packet, new Uint8Array(16).fill(3));
+  const standalone = await arena.register(16), second = arena.stage(standalone, new Uint8Array(16).fill(5));
+  assert.notEqual(packet, standalone); assert.equal(packet.layout, null); assert.ok(standalone.layout);
+  const large = await arena.registerPacket(65552), third = arena.stage(large, new Uint8Array(65552).fill(7));
+  arena.write();
+  assert.equal(first.group, null); assert.equal(second.group.entries[0].resource.buffer, first.resource.buffer);
+  for (const [command, expected] of [[first, 3], [second, 5], [third, 7]])
+    assert.ok(command.resource.buffer.bytes.slice(command.offset, command.offset + command.resource.size).every(value => value === expected));
+  assert.ok(f.groups.every(group => group.entries[0].resource.size === 16));
+  arena.begin(); const reused = arena.stage(standalone, new Uint8Array(16).fill(11));
+  assert.equal(reused.group, second.group); assert.equal(reused.offset, 0);
+});

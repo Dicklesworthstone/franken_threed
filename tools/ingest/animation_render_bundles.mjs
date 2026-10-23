@@ -10,6 +10,7 @@
  */
 import {hasAnimationStencil} from './animation_raster.mjs';
 const blended = record => record.alphaMode === 'BLEND' || record.blended === true;
+const nodeOffsets = binding => binding.offsets ?? (binding.offset === null ? [] : [binding.offset]);
 function compatible(a, b) {
   return !a.program && !b.program && !a.nodeProgram && !b.nodeProgram &&
     a.instanceCount == null && b.instanceCount == null &&
@@ -43,7 +44,7 @@ export function encodeAnimationDraws(encoder, commands, length, {
       encoder.setPipeline(pipeline);
       for (let group = 0; group < command.nodeProgram.groups.length; group++) {
         const binding = command.nodeProgram.groups[group];
-        encoder.setBindGroup(group, binding.group, binding.offset === null ? [] : [binding.offset]);
+        encoder.setBindGroup(group, binding.group, nodeOffsets(binding));
       }
       for (let slot = 0; slot < command.vertexBuffers.length; slot++) encoder.setVertexBuffer(slot, command.vertexBuffers[slot]);
       if (command.indexBuffer) {
@@ -107,7 +108,7 @@ function snapshot(command, lightGroup) {
     blend: blended(command.record),
     // Plans are immutable, owned snapshots; never retain a live index reader.
     pointRuns: command.program?.pointRuns ?? null,
-    nodeGroups: command.nodeProgram?.groups.map(({group, offset}) => ({group, offset})) ?? null,
+    nodeGroups: command.nodeProgram?.groups.map(binding => ({group: binding.group, offsets: [...nodeOffsets(binding)]})) ?? null,
     programGroup: command.program?.group ?? null, programOffset: command.program?.offset ?? null, firstInstance: command.firstInstance ?? 0};
 }
 function samePointRuns(a, b) {
@@ -115,7 +116,7 @@ function samePointRuns(a, b) {
 }
 function sameNodeGroups(a, b) {
   return a == null ? b == null : b != null && a.length === b.length &&
-    a.every((binding, index) => binding.group === b[index].group && binding.offset === b[index].offset);
+    a.every((binding, index) => binding.group === b[index].group && samePointRuns(binding.offsets, nodeOffsets(b[index])));
 }
 function matches(recorded, commands, length, lightGroup, start) {
   if (recorded.length !== length) return false;
