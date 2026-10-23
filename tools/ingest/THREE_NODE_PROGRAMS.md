@@ -71,13 +71,21 @@ the native path. Replacing one authored node's source with a different required
 atlas size fails before callbacks; use a new PMREM node for that replacement.
 Ordinary same-size replacements remain supported.
 
-Authored `scene.backgroundNode` graphs are explicitly refused by this bounded
-background entrance. Sharp equirectangular backgrounds still use the existing
-fixed background path. Its controls are read during deferred preparation, so
-drain outstanding renders before crossing between zero and positive blurriness.
-The new native background path captures positive-to-positive updates and CubeUV
-updates, including CubeUV blur zero. These boundaries do not establish full H8
-application compatibility.
+Authored `scene.backgroundNode` graphs use the same private sky draw, including
+H7's `screenUV.y.mix(color(...), color(...))` gradient. They take precedence over
+`scene.background`, including Color and unsupported texture fallbacks. Their
+ordinary admitted uniforms, sampled textures and update nodes retain the original
+scene/camera context and their values for each queued render. Changing the
+background graph retains earlier queued programs. The renderer owns its private
+sky material and geometry; disposing it does not dispose the application's
+background node. Unsupported graph resources fail before application callbacks
+or submission.
+
+Sharp equirectangular backgrounds still use the existing fixed background path.
+Its controls are read during deferred preparation, so drain outstanding renders
+before crossing between zero and positive blurriness. The new native background
+path captures positive-to-positive updates and CubeUV updates, including CubeUV
+blur zero. These boundaries do not establish full H7 or H8 compatibility.
 
 Authored `texture()` graphs sample ordinary 2D data, decoded image/canvas and
 resolved color render-target textures. The pinned builder owns UV channel and
@@ -390,3 +398,11 @@ environment run exposed the corrected color-only scissor-clear depth bug.
 A subsequent candidate run crashed during compilation under exhausted workspace
 memory/storage before producing its baseline image.
 
+
+
+Authored-sky regressions cover the H7 gradient, original callback identities,
+queued uniform and graph replacement, background-node precedence over Color or
+unsupported textures, load preservation with `autoClear = false`, and private
+resource ownership. The registered `native_tsl_background_nodes` browser scenario
+renders two queued gradient skies into distinct targets and mutates their live
+controls afterward. Its GPU pixel comparison has not yet been run.

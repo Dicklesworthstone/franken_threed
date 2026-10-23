@@ -74,6 +74,42 @@ function environmentTexture(T, variant) {
   return texture;
 }
 export const nativeTSLScenarios = {
+  native_tsl_background_nodes(T, renderer) {
+    const {uniform, screenUV, color} = T.TSL;
+    const writer = new T.Scene(), writeCamera = camera(T);
+    writer.background = new T.Color(0xff00ff);
+    const lower = uniform(new T.Color(0x8f989c));
+    writer.backgroundNode = screenUV.y.mix(lower, color(0xe7eaeb));
+    const marker = new T.Mesh(new T.PlaneGeometry(.7, .6), new T.MeshBasicMaterial({color: 0x1465b8}));
+    marker.rotation.z = -.2; marker.renderOrder = -10; writer.add(marker);
+    const targets = [0, 1].map(() => new T.RenderTarget(96, 72, {
+      depthBuffer: true, generateMipmaps: false, minFilter: T.NearestFilter, magFilter: T.NearestFilter,
+    }));
+    const result = {scene: scene(T), camera: camera(T, true)};
+    for (const [index, target] of targets.entries()) {
+      renderer.initRenderTarget(target);
+      const panel = new T.Mesh(new T.PlaneGeometry(1.8, 1.35), new T.MeshBasicMaterial({map: target.texture}));
+      panel.position.x = (index - .5) * 2; result.scene.add(panel);
+    }
+    const render = renderer.render.bind(renderer); let submitted = false;
+    renderer.render = (...args) => {
+      if (args[0] !== result.scene) return render(...args);
+      if (!submitted) {
+        submitted = true;
+        const previous = renderer.getRenderTarget(), mip = renderer.getActiveMipmapLevel();
+        try {
+          renderer.setRenderTarget(targets[0]); render(writer, writeCamera);
+          lower.value.set(0x8f245a); writer.backgroundIntensity = .65;
+          renderer.setRenderTarget(targets[1]); render(writer, writeCamera);
+        } finally { renderer.setRenderTarget(previous, 0, mip); }
+        // Both accepted skies must retain their graph and uniform values.
+        lower.value.set(0x000000); writer.backgroundIntensity = .01;
+        writer.backgroundNode = color(0x00ff00);
+      }
+      return render(...args);
+    };
+    return {...result, writer, writeCamera, targets};
+  },
   native_tsl_background_blur(T, renderer) {
     const panorama = environmentTexture(T, 0);
     const writer = new T.Scene(), writeCamera = camera(T);

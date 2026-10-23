@@ -1743,7 +1743,7 @@ export async function createGpuThreeScene(device,scene,{
         ...(clippingFrame?{clippingPlanes:clippingFrame.planes}:{})};
       if(fogEnabled)prepared.fog=fogFrame;
       if(environmentEnabled)prepared.environment=environmentFrame;
-      if(scene.background?.isColor){
+      if(scene.background?.isColor&&!passNodeFrame?.background){
         prepared.clearColor=rgba(scene.background);prepared.loadOp='clear';
         // Shader-side sRGB output: the attachment stores encoded values.
         if(renderOptions.outputTransfer==='srgb')prepared.clearColor=[...srgbEncode(prepared.clearColor.slice(0,3)),1];

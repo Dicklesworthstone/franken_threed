@@ -116,15 +116,61 @@ test('queued background swaps retain differently sized atlases and reuse earlier
   assert.notEqual(atlases[0].height, atlases[1].height);
   assert.equal(f.scene.children.length, 1); assert.equal(f.renderer._nodeCaptureBytes, 0);
 });
-test('authored background node precedence refuses before generating or submitting a panorama', async t => {
-  const f = fixture(t); await f.renderer.init(); let updates = 0;
-  f.scene.background = f.scene.environment; f.scene.backgroundBlurriness = .5;
-  f.scene.backgroundNode = N.vec3(.1, .2, .3);
-  f.material.colorNode.onObjectUpdate(() => { updates++; return new THREE.Color(.5, .25, .125); });
-  assert.throws(() => f.renderer.render(f.scene, f.camera), {code: 'THREE_NODE_PROGRAM_BACKGROUND'});
-  assert.equal(updates, 0); assert.equal(f.renderer.info.f3d.offscreenRenders, 0);
-  assert.equal(f.device.submissions.length, 0); assert.equal(f.renderer._nodeCaptureBytes, 0);
+
+test('authored H7 sky nodes take precedence and capture original render context and controls', async t => {
+  const f = fixture(t); await f.renderer.init(); f.scene.environment = null;
+  f.scene.children[0].material = new THREE.MeshBasicMaterial({color: 0xff0000});
+  f.scene.background = new THREE.CubeTexture();
+  const bottom = N.uniform(new THREE.Color(.125, .25, .5)).setName('authoredSky');
+  let updates = 0, disposed = 0;
+  bottom.onRenderUpdate(frame => {
+    assert.equal(frame.scene, f.scene); assert.equal(frame.camera, f.camera);
+    assert.equal(f.scene.children.includes(frame.object), false); updates++;
+    return bottom.value;
+  });
+  const sky = N.screenUV.y.mix(bottom, N.color(0xe7eaeb));
+  sky.addEventListener('dispose', () => { disposed++; });
+  f.scene.backgroundNode = sky; f.scene.backgroundIntensity = .375;
+  const children = f.scene.children.slice();
+  f.renderer.render(f.scene, f.camera);
+  bottom.value.setRGB(.75, .625, .25); f.scene.backgroundIntensity = .875;
+  f.renderer.render(f.scene, f.camera);
+  bottom.value.setRGB(0, 0, 0); f.scene.backgroundIntensity = 9;
+  await drain(f.renderer);
+  const frames = f.device.snapshots.filter(draws => draws[0]?.pipeline.fragment?.module?.code?.includes('authoredSky'));
+  assert.equal(frames.length, 2); assert.ok(frames.every(draws => draws.length === 2));
+  assert.equal(updates, 2);
+  assert.ok(uniformValues(frames[0][0]).includes(.125)); assert.ok(uniformValues(frames[0][0]).includes(.375));
+  assert.ok(uniformValues(frames[1][0]).includes(.75)); assert.ok(uniformValues(frames[1][0]).includes(.875));
+  assert.equal(f.renderer.info.f3d.offscreenRenders, 0);
+  assert.deepEqual(f.scene.children, children); assert.equal(f.renderer._nodeCaptureBytes, 0);
+  f.renderer.dispose(); assert.equal(disposed, 0, 'renderer does not own the authored background node');
 });
+test('authored sky replacement preserves queued graphs and overrides a color without forcing a clear', async t => {
+  const f = fixture(t); await f.renderer.init(); f.scene.environment = null;
+  f.scene.children[0].material = new THREE.MeshBasicMaterial({color: 0xff0000});
+  f.scene.background = new THREE.Color(0xffffff); f.renderer.autoClear = false;
+  f.scene.backgroundNode = N.uniform(new THREE.Color(.125, .25, .5)).setName('firstSky');
+  f.renderer.render(f.scene, f.camera);
+  f.scene.backgroundNode = N.uniform(new THREE.Color(.75, .625, .25)).setName('secondSky');
+  f.renderer.render(f.scene, f.camera);
+  await drain(f.renderer);
+  assert.equal(f.device.snapshots.length, 2);
+  assert.ok(f.device.snapshots[0][0].pipeline.fragment.module.code.includes('firstSky'));
+  assert.ok(f.device.snapshots[1][0].pipeline.fragment.module.code.includes('secondSky'));
+  assert.ok(f.device.passes.every(pass => pass.desc.colorAttachments[0].loadOp === 'load'));
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+test('unsupported authored background resources fail before callbacks or submission', async t => {
+  const f = fixture(t); await f.renderer.init(); let updates = 0;
+  f.scene.environment = null;
+  f.scene.backgroundNode = N.texture(new THREE.CubeTexture());
+  f.material.colorNode.onObjectUpdate(() => { updates++; return new THREE.Color(.5, .25, .125); });
+  assert.throws(() => f.renderer.render(f.scene, f.camera), {code: 'THREE_NODE_PROGRAM_TEXTURE'});
+  assert.equal(updates, 0); assert.equal(f.device.submissions.length, 0);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
 
 test('registered blurred-background scenario queues three independent target captures', async t => {
   const f = fixture(t); await f.renderer.init();
