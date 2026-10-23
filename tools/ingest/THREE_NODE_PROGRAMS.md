@@ -113,8 +113,8 @@ intensity and rotation remain source uniforms; replacing the environment selects
 its corresponding atlas and preserves already queued draw bindings. A wholly
 native scene bypasses the separate fixed-material environment filter.
 
-The public native `PMREMGenerator.fromScene()` and `fromEquirectangular()`
-methods execute the pinned helper through F3D-owned render requests and return
+The public native `PMREMGenerator.fromScene()`, `fromEquirectangular()` and
+`fromCubemap()` methods execute the pinned helper through F3D-owned render requests and return
 real CubeUV render targets. Scene generation supports the source capture size,
 position and near/far controls, optional Gaussian pre-blur, and GGX filtering.
 Each of the six face renders retains its own camera matrices. The helper's
@@ -125,7 +125,9 @@ Immediate generator disposal and later generator resizing retain private filter
 resources until accepted work drains. Repeated scene generations use separate
 private solid-background boxes, preserving each generation's color. The public
 output target remains caller-owned and sampleable after generator disposal.
-The WebGL/core placeholder route retains its existing behavior.
+`fromCubemap()` accepts the CPU-data cube profile below, runs the source cube
+conversion and GGX filtering, and returns an ordinary CubeUV atlas for native
+PBR environments. The WebGL/core placeholder route retains its existing behavior.
 
 A same-size equirectangular input can set `needsPMREMUpdate = true` between
 native renders and regenerate its existing atlas. The cached graph must place
@@ -141,7 +143,7 @@ simultaneous graph recompilation, and unsafe mixed fixed/native foreground
 ordering fail with `THREE_NODE_PROGRAM_ENVIRONMENT_REFRESH` before the unsafe
 work runs. Atlas resizing still requires a fresh PMREM node. Replacing the source
 texture remains admitted; directly supplied CubeUV textures keep their ordinary
-upload-version behavior. Cube environment inputs, custom environment nodes and
+upload-version behavior. Direct cube environment inputs, custom environment nodes and
 the compatibility adapter's placeholder PMREM textures remain outside this
 native profile.
 
@@ -176,6 +178,20 @@ native render. Queued sharp-to-blurred-to-sharp transitions now preserve all
 three states, including later edits to the public scene. Mutable Color
 backgrounds likewise retain each call's clear value. These capabilities do not
 establish full H7 or H8 compatibility.
+
+Authored `cubeTexture()` graphs sample source CubeTextures containing exactly
+six CPU DataTexture faces. The compiler retains the pinned direction, reflection/
+refraction mapping and explicit-level semantics and declares cube views in the
+source binding order. Compatible cube replacements reuse the program; changes
+to the texture alias partition or cube mapping select a new source graph.
+The existing texture owner captures all six faces and authored mip levels for
+each accepted upload version, preserving earlier draws after later CPU edits.
+Float filtering retains the existing device-feature checks.
+
+Decoded-image cubes, render-target cubes and unsampled cube loads remain outside
+this profile. Cube textures cannot occupy ordinary material map slots or be
+assigned directly as native scene environments; use the public generator's
+CubeUV result for environment lighting.
 
 Authored `texture()` graphs sample ordinary 2D data, decoded image/canvas and
 resolved color render-target textures. The pinned builder owns UV channel and
@@ -389,9 +405,9 @@ This is a bounded native graphics entrance, not full TSL coverage. Writable or
 atomic graphics storage, standalone `mat2`/`mat3` storage arrays, nested/boolean/atomic
 struct members, PBO storage, managed uniform arrays, compute nodes inside
 graphics graphs and multiple-render-target graphics graphs are refused. Authored
-PBR transmission/dispersion, cube/custom environment lighting, area/probe and other custom light models,
+PBR transmission/dispersion, direct cube/custom environment lighting, area/probe and other custom light models,
 shadows, projected light maps and custom `lightsNode` graphs remain missing.
-Depth/comparison, cube, array, volume, compressed, storage, video and unfilterable
+Depth/comparison, decoded-image cube, array, volume, compressed, storage, video and unfilterable
 or integer texture graphs still require additional native profiles. Sampled
 texture capture transactions reject reentrant texture capture from node updates
 or upload callbacks.
@@ -421,6 +437,7 @@ pipeline failures, device loss and disposal:
 
 ```sh
 node tools/ingest/three_node_program.test.mjs
+node tools/ingest/three_node_cube.test.mjs
 node tools/ingest/three_node_attributes.test.mjs
 node tools/ingest/three_node_program_gpu.test.mjs
 node tools/ingest/three_node_scene_capture.test.mjs
@@ -592,3 +609,13 @@ coherent pre-initialization selection. The registered
 the helper immediately, and lights mapped-source-compatible Standard/Physical
 surfaces while also displaying the generated sky. Its recording-device path is
 tested; GPU pixel parity for the new scene bake is not yet measured.
+
+CPU cube regressions compare generated WGSL with the pinned builder, check cube
+binding dimensions, compatible replacements, alias/mapping changes and invalid
+source-view refusals. Recorded draws retain separate six-face and authored-mip
+upload versions. Public fromCubemap tests check retained source method identity,
+13 conversion/filter renders, HalfFloat source bytes surviving later edits,
+immediate generator disposal and a sampled output atlas. The registered
+`native_tsl_cube_textures` scenario combines six asymmetric direction panels
+with Standard/Physical environment consumers; its recording-device path is
+tested. Browser pixel parity for this cube extension is unmeasured.

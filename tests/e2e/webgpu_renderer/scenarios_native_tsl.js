@@ -74,6 +74,77 @@ function environmentTexture(T, variant) {
   return texture;
 }
 export const nativeTSLScenarios = {
+  native_tsl_cube_textures(T, renderer) {
+    const N = T.TSL, size = 16;
+    const palettes = [
+      [.9, .15, .08], [.08, .75, .22], [.12, .25, .95],
+      [.75, .12, .65], [.08, .7, .8], [.9, .6, .08],
+    ];
+    const faces = palettes.map(base => {
+      const data = new Uint16Array(size * size * 4);
+      for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {
+        const u = (x + .5) / size, v = (y + .5) / size;
+        // An off-center L and unequal gradients expose face swaps and flips.
+        const marker = (x >= 2 && x <= 3 && y >= 3 && y <= 12) ||
+          (y >= 3 && y <= 4 && x >= 2 && x <= 10);
+        const color = [
+          .025 + base[0] * (.5 + .45 * u) + .08 * v + (marker ? 1.15 : 0),
+          .025 + base[1] * (.45 + .5 * v) + .06 * u + (marker ? .6 : 0),
+          .025 + base[2] * (.55 + .3 * u + .1 * v) + (marker ? .2 : 0), 1,
+        ];
+        for (let channel = 0; channel < 4; channel++)
+          data[(y * size + x) * 4 + channel] = T.DataUtils.toHalfFloat(color[channel]);
+      }
+      const face = new T.DataTexture(data, size, size, T.RGBAFormat, T.HalfFloatType);
+      face.colorSpace = T.LinearSRGBColorSpace;
+      face.minFilter = face.magFilter = T.LinearFilter;
+      face.generateMipmaps = false; face.needsUpdate = true; return face;
+    });
+    const cube = new T.CubeTexture(faces);
+    cube.type = T.HalfFloatType; cube.format = T.RGBAFormat;
+    cube.colorSpace = T.LinearSRGBColorSpace;
+    cube.minFilter = cube.magFilter = T.LinearFilter;
+    cube.generateMipmaps = false; cube.needsUpdate = true;
+
+    const generator = new T.PMREMGenerator(renderer);
+    const atlas = generator.fromCubemap(cube);
+    generator.dispose();
+
+    const result = {scene: scene(T), camera: camera(T, true)};
+    result.camera.position.set(0, 0, 4); result.camera.lookAt(0, 0, 0);
+    result.scene.environment = atlas.texture;
+    result.scene.environmentIntensity = .85;
+    result.scene.environmentRotation.set(.08, .4, -.1);
+
+    const q = N.uv().mul(1.8).sub(.9);
+    const directions = [
+      N.vec3(1, q.y, q.x.negate()), N.vec3(-1, q.y, q.x),
+      N.vec3(q.x, 1, q.y.negate()), N.vec3(q.x, -1, q.y),
+      N.vec3(q.x, q.y, 1), N.vec3(q.x.negate(), q.y, -1),
+    ];
+    const panelGeometry = new T.PlaneGeometry(.72, .72), panels = [];
+    for (const [index, direction] of directions.entries()) {
+      const material = new T.NodeMaterial(); material.lights = false;
+      material.fragmentNode = N.cubeTexture(cube, direction);
+      const panel = new T.Mesh(panelGeometry, material);
+      panel.position.set(-1.7 + (index % 3) * .8, index < 3 ? .6 : -.6, 0);
+      result.scene.add(panel); panels.push(panel);
+    }
+    const materials = [
+      new T.MeshStandardNodeMaterial({metalness: .9, roughness: .16}),
+      new T.MeshPhysicalNodeMaterial({
+        metalness: .15, roughness: .58, clearcoat: .65, clearcoatRoughness: .18,
+      }),
+    ];
+    const sphereGeometry = new T.SphereGeometry(.62, 32, 20);
+    for (const [index, material] of materials.entries()) {
+      material.colorNode = N.color(index ? 0xadcce5 : 0xe3c79b);
+      const sphere = new T.Mesh(sphereGeometry, material);
+      sphere.position.set(1.3, index ? -.73 : .73, 0);
+      sphere.rotation.set(.1, .3, 0); result.scene.add(sphere);
+    }
+    return {...result, cube, faces, atlas, panels, materials};
+  },
   native_tsl_scene_environment(T, renderer) {
     const room = new T.Scene(); room.background = new T.Color(.035, .055, .09);
     const walls = new T.Mesh(new T.BoxGeometry(7, 5, 7),
