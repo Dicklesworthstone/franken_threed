@@ -46,10 +46,22 @@ float32 inputs require the actual `float32-filterable` device feature.
 
 `storage()` reads in vertex and fragment graphs share the renderer's compute
 allocation. Scalar and vector float32, int32 and uint32 storage attributes are
-admitted, including source vec3 padding. A compute-writable source node can be
-read by graphics; the pinned builder supplies read-only graphics bindings.
+admitted, including source vec3 padding. Flat non-atomic `struct()` records also
+work with scalar/vector 32-bit members and `mat2`, `mat3` or `mat4` fields. The
+pinned `StructTypeNode` defines their padded stride; mixed integer/float backing
+bytes and matrix-column padding remain unchanged. The H8 fluid particle record
+(`position: vec3`, `velocity: vec3`, `C: mat3`) occupies 80 bytes and can be written
+by compute and read directly in both vertex and fragment graphs.
+
+A compute-writable source node can be read by graphics; the pinned builder
+supplies read-only graphics bindings. Member, matrix-column and whole-record
+writes are rejected, while explicit local copies remain writable. Struct names,
+member order, names and types participate in the program signature, so even
+same-size layout changes require a new descriptor before node callbacks run.
 There is no readback, second graphics allocation, or CPU upload merely because
-a graphics draw consumes compute-produced values.
+a graphics draw consumes compute-produced values. Nested, boolean and atomic
+struct members are not yet admitted; a three-word struct is also refused because
+the source storage uploader treats that stride as a padded vec3.
 
 Ordinary meshes support `Mesh.count` with TSL `instanceIndex`, including
 compute-driven scalar/vector particle positions. Each logical draw captures the

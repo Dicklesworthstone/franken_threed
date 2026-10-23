@@ -4,7 +4,7 @@
  *
  * The profile is rigid meshes, unlit or Toon/Lambert/Phong/Standard/Physical
  * with ordinary source lights, float attributes, scalar/vector/matrix uniforms,
- * sampled 2D float textures and read-only scalar/vector storage buffers.
+ * sampled 2D float textures and read-only scalar/vector or flat-struct storage buffers.
  * Physical direct lighting retains the source DFG texture, clearcoat, sheen,
  * iridescence, anisotropy and retroreflection. Transmission, environments,
  * writable/atomic storage, shadows, clipping and MRT graphs fail explicitly.
@@ -57,22 +57,37 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   const live = () => { if (disposed) fail('DISPOSED', 'Native node program preparation is disposed'); };
   const litMaterial = material => litPrototypes.includes(Object.getPrototypeOf(material));
   function inspectStorage(node) {
-    const attribute = node.value, type = /^(?:(i|u)?vec([234])|(float|int|uint))$/.exec(node.nodeType ?? '');
+    const attribute = node.value, struct = node.structTypeNode;
+    const type = /^(?:(i|u)?vec([234])|(float|int|uint))$/.exec(node.nodeType ?? '');
     const components = type?.[2] ? Number(type[2]) : 1;
     const scalar = type?.[1] === 'i' || type?.[3] === 'int' ? Int32Array
       : type?.[1] === 'u' || type?.[3] === 'uint' ? Uint32Array : Float32Array;
-    if (!type || node.structTypeNode || node.isAtomic || node.isPBO ||
+    let stride = components === 3 ? 4 : components;
+    if (struct) {
+      if (node.nodeType !== 'struct' || struct.isStructTypeNode !== true ||
+          !Array.isArray(struct.membersLayout) || !struct.membersLayout.length || struct.membersLayout.length > maxNodes ||
+          struct.membersLayout.some(member => !member || typeof member.name !== 'string' || member.atomic ||
+            !/^(?:float|int|uint|[iu]?vec[234]|mat[234])$/.test(member.type)))
+        fail('STORAGE', 'Native storage structs require non-atomic scalar/vector/matrix 32-bit members');
+      // Use the pinned source layout, including vec3 member alignment and mat3
+      // column padding. Mixed integer/float fields share the original bytes.
+      stride = three.StructTypeNode.prototype.getLength.call(struct);
+      if (!Number.isSafeInteger(stride) || stride < 1 || stride === 3)
+        fail('STORAGE', 'Native storage structs require a complete source stride without ambiguous three-word padding');
+    }
+    if ((!type && !struct) || node.isAtomic || node.isPBO ||
         !['readOnly', 'readWrite'].includes(node.access) || attribute?.isIndirectStorageBufferAttribute ||
         !(attribute?.isStorageBufferAttribute || attribute?.isStorageInstancedBufferAttribute) ||
-        attribute.isInterleavedBufferAttribute || attribute.normalized || !(attribute.array instanceof scalar) ||
+        attribute.isInterleavedBufferAttribute || attribute.normalized ||
+        !(struct ? [Float32Array, Int32Array, Uint32Array].some(Type => attribute.array instanceof Type) : attribute.array instanceof scalar) ||
         !Number.isSafeInteger(attribute.count) || attribute.count < 1 ||
-        ![components, components === 3 ? 4 : components].includes(attribute.itemSize) ||
+        !(struct ? attribute.itemSize === stride : [components, stride].includes(attribute.itemSize)) ||
         attribute.array.length !== attribute.count * attribute.itemSize ||
         !Number.isSafeInteger(node.bufferCount) || node.bufferCount < 0 || node.bufferCount > attribute.count)
-      fail('STORAGE', 'Native storage reads require matching non-atomic scalar/vector 32-bit storage attributes');
+      fail('STORAGE', 'Native storage reads require matching non-atomic scalar/vector or flat-struct 32-bit storage attributes');
     if (attribute.onUploadCallback !== three.BufferAttribute.prototype.onUploadCallback)
       fail('HOOK', 'Native storage reads require the source upload callback');
-    const bytes = attribute.count * (components === 3 ? 4 : components) * 4;
+    const bytes = attribute.count * stride * 4;
     if (bytes > (renderer._device?.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024) ||
         bytes > (renderer._device?.limits?.maxBufferSize ?? 256 * 1024 * 1024))
       fail('LIMIT', 'Native storage input exceeds device buffer binding limits');
@@ -83,7 +98,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       const bytes = inspectStorage(node), attribute = node.value;
       let id = storageIds.get(attribute);
       if (id === undefined) { id = ++nextStorageId; storageIds.set(attribute, id); }
-      return [id, node.nodeType, node.bufferCount, attribute.count, bytes];
+      const struct = node.structTypeNode;
+      return [id, node.nodeType, node.bufferCount, attribute.count, bytes,
+        struct ? [struct.name, struct.membersLayout.map(({name, type}) => [name, type])] : null];
     }));
   }
   function sourceLights(material, {lights = [], lightingEnabled = renderer.lighting?.enabled !== false} = {}) {
@@ -213,6 +230,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         const target = targets.pop(); if (!target || seen.has(target)) continue;
         seen.add(target);
         if (target.isStorageBufferNode) fail('STORAGE', 'Native graphics storage bindings are read-only');
+        // An explicit local variable owns a value copied from its initializer;
+        // assigning it does not write back to the source storage address.
+        if (target.isVarNode && target.intent === false) continue;
+        if (target.structNode) targets.push(target.structNode);
         // Assignment addresses follow the node/target chain; an index expression
         // may read storage without making the assigned local variable writable.
         if (target.node) targets.push(target.node);
@@ -370,6 +391,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   }
   function captureDraw(descriptor, context = {}) {
     const state = stateOf(descriptor);
+    // Reject a stale or newly atomic schema before observable NodeFrame updates;
+    // readStorage below also catches mutations performed by those updates.
+    if (state.storageNodes.length) readStorage(state);
     return withFrame(state, context, () => {
       for (const node of state.builder.updateBeforeNodes) frame.updateBeforeNode(node);
       for (const node of state.builder.updateNodes) frame.updateNode(node);

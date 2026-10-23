@@ -59,6 +59,45 @@ function sampledNormal(T) {
   result.colorSpace = T.NoColorSpace; result.generateMipmaps = false; result.needsUpdate = true; return result;
 }
 export const nativeTSLScenarios = {
+  native_tsl_storage_structs(T, renderer) {
+    const {struct, instancedArray, Fn, instanceIndex, positionLocal, vec3, mat3, uniform} = T.TSL;
+    // Exact H8 particle layout: position at byte 0, velocity at 16, and
+    // three padded mat3 columns at 32/48/64, for an 80-byte array stride.
+    const Particle = struct({position: 'vec3', velocity: 'vec3', C: 'mat3'});
+    const particles = instancedArray(new Float32Array(5 * 20), Particle), phase = uniform(.2);
+    const initialize = Fn(() => {
+      const index = instanceIndex.toFloat(), particle = particles.element(instanceIndex);
+      particle.get('position').assign(vec3(index.sub(2).mul(.68), index.mul(1.3).add(phase).sin().mul(.22), 0));
+      particle.get('velocity').assign(vec3(index.mul(.12).add(.15), phase.mul(.08).add(.38), index.mul(-.08).add(.85)));
+      particle.get('C').assign(mat3(vec3(.8, phase.mul(.08), 0), vec3(-.12, .8, 0), vec3(0, 0, 1)));
+    })().compute(5);
+    const material = new T.MeshBasicNodeMaterial(), particle = particles.element(instanceIndex);
+    // Share the source readWrite node with compute. Native graphics lowers its
+    // vertex and fragment bindings to read-only storage, as the source does.
+    material.positionNode = particle.get('C').mul(positionLocal).add(particle.get('position'));
+    material.colorNode = particle.get('velocity');
+    const mesh = new T.Mesh(new T.PlaneGeometry(.55, .7), material); mesh.count = 5; mesh.frustumCulled = false;
+    const result = {scene: scene(T), camera: camera(T)}; result.scene.add(mesh);
+    const compile = renderer.compileAsync.bind(renderer), render = renderer.render.bind(renderer);
+    renderer.compileAsync = async (...args) => {
+      await renderer.computeAsync(initialize);
+      // No needsUpdate: these deliberately stale CPU bytes must never overwrite
+      // the authoritative GPU-written struct when graphics begins reading it.
+      particles.value.array.fill(73);
+      return compile(...args);
+    };
+    let frame = 0;
+    renderer.render = (...args) => {
+      frame++;
+      if (frame === 8) { phase.value = 1.7; renderer.compute(initialize); }
+      if (frame === 10) mesh.count = 3;
+      if (frame === 12) mesh.count = 0;
+      if (frame === 13) mesh.count = 5;
+      if (particles.value.array.some(value => value !== 73)) throw new Error('Compute changed source CPU struct storage');
+      return render(...args);
+    };
+    return {...result, mesh, particles, initialize, phase};
+  },
   native_tsl_storage_instances(T, renderer) {
     const {storage, Fn, instanceIndex, positionLocal, vec4} = T.TSL;
     const positions = new T.StorageBufferAttribute(9, 4), output = storage(positions, 'vec4', 9);
