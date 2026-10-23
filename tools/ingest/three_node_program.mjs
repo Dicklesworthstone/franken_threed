@@ -281,13 +281,12 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (!(texture instanceof three.Texture) || texture.isF3DSceneEnvironment || texture.isF3DPMREMSource ||
         ![three.EquirectangularReflectionMapping, three.EquirectangularRefractionMapping, three.CubeUVReflectionMapping].includes(texture.mapping))
       fail('ENVIRONMENT', 'Native PBR environments require a ready equirectangular image or source CubeUV texture');
-    assertEnvironmentVersion(texture);
     inspectTexture(texture);
     return texture;
   }
   function assertEnvironmentVersion(texture) {
     if (texture && environmentVersions.has(texture) && environmentVersions.get(texture) !== texture.pmremVersion)
-      fail('ENVIRONMENT_REFRESH', 'In-place source PMREM regeneration requires a nested preparation boundary; use a different environment texture identity for fresh source filtering');
+      fail('ENVIRONMENT_REFRESH', 'In-place PMREM regeneration must precede authored draw updates at the first native draw preparation boundary');
   }
   function inspectPMREMNode(node) {
     const texture = sourcePMREMTexture(node.value), target = node._generator?._pingPongRenderTarget;
@@ -498,6 +497,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         storageSignature(previous.storageNodes) === previous.storageSignature &&
         uniformSignature(previous.uniformNodes, previous.builder) === previous.uniformSignature) return previous.descriptor;
     if (entries.size - (previous ? 1 : 0) >= maxPrograms) fail('LIMIT', 'Native node program capacity exceeded');
+    // setup() itself may filter a PMREM source. An existing stale atlas must
+    // reach the first draw's ordered preparation boundary through its cached
+    // graph, rather than being rewritten while another graph is constructed.
+    assertEnvironmentVersion(environment);
+    for (const entry of entries) for (const node of entry.pmremNodes) assertEnvironmentVersion(node.value);
     const builder = new three.WGSLNodeBuilder(object, renderer);
     builder.material = material; builder.context.material = material;
     builder.scene = context.scene ?? null; builder.camera = context.camera ?? null;
@@ -512,10 +516,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     }
     assertInstances(object, instanceSignature);
     if (lightSignature(lights) !== lightKey) fail('CHANGED', 'Native light registration changed during source graph construction');
-    // PMREM setup has now generated the source atlas. A later in-place refresh
-    // would recursively capture renderer calls inside a whole-render texture
-    // transaction. Refuse that boundary explicitly, before source callbacks;
-    // changing environment identity still builds a fresh atlas normally.
+    // Initial source setup has generated its atlas. Later versions are
+    // prepared at a source-ordered boundary outside draw resource capture.
     const pmremNodes = [...builder.nodes].filter(node => node.constructor === three.PMREMNode);
     for (const node of pmremNodes) if (node.value.mapping !== three.CubeUVReflectionMapping && !node.value.isPMREMTexture)
       environmentVersions.set(node.value, node.value.pmremVersion);
@@ -640,9 +642,54 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     for (const key of ['frameId', 'time', 'deltaTime']) if (context[key] !== undefined) frame[key] = context[key];
     try { return run(); } finally { Object.assign(frame, previous); }
   }
-  function checkPMREM(state) {
+  function checkPMREM(state, versions = true) {
     if (pmremSignature(state.pmremNodes) !== state.pmremSignature)
       fail('CHANGED', 'Native PMREM input identity or sampling orientation changed; compile the graph again');
+    if (versions) {
+      assertEnvironmentVersion(state.environment);
+      for (const node of state.pmremNodes) assertEnvironmentVersion(node.value);
+    }
+  }
+  function preparePMREM(descriptors, context = {}, atSceneStart = false) {
+    const states = descriptors.map(stateOf), stale = new Set();
+    for (const state of states) {
+      checkPMREM(state, false);
+      for (const node of state.pmremNodes)
+        if (environmentVersions.has(node.value) && environmentVersions.get(node.value) !== node.value.pmremVersion)
+          stale.add(node.value);
+    }
+    if (!stale.size) return;
+    if (!atSceneStart)
+      fail('ENVIRONMENT_REFRESH', 'In-place PMREM regeneration cannot precede fixed scene draws without a native background prefix');
+    const first = states[0], prefix = [];
+    for (const node of first.builder.updateBeforeNodes) {
+      // Moving an application callback ahead of an earlier draw would change
+      // its visible source pixels and effects. Only the exact source prefix
+      // can run here; all remaining before/current/after updates stay in place.
+      if (node.constructor !== three.PMREMNode || Object.getPrototypeOf(node) !== three.PMREMNode.prototype ||
+          node.updateBefore !== three.PMREMNode.prototype.updateBefore ||
+          node.updateFromTexture !== three.PMREMNode.prototype.updateFromTexture ||
+          node.getUpdateBeforeType !== three.Node.prototype.getUpdateBeforeType ||
+          node.updateReference !== three.Node.prototype.updateReference || node.updateBeforeType !== 'render') break;
+      prefix.push(node);
+    }
+    const covered = new Set(prefix.map(node => node.value));
+    if ([...stale].some(texture => !covered.has(texture)))
+      fail('ENVIRONMENT_REFRESH', 'In-place PMREM regeneration requires the first native draw to begin with its source PMREM updates');
+    // These child filter renders enter the existing FIFO after earlier accepted
+    // frames and before this frame. Their leases are never part of the outer
+    // draw transaction, so a later authored callback refusal cannot undo them.
+    withFrame(first, context, () => {
+      for (const node of prefix) {
+        frame.updateBeforeNode(node);
+        if (environmentVersions.has(node.value)) {
+          if (node._pmrem?.renderTarget?.pmremVersion !== node.value.pmremVersion)
+            fail('ENVIRONMENT_REFRESH', 'The source PMREM update did not prepare the requested environment version');
+          environmentVersions.set(node.value, node.value.pmremVersion);
+        }
+      }
+    });
+    for (const state of states) checkPMREM(state);
   }
   function checkLights(state) {
     if (lightSignature(state.lights) !== state.lightSignature)
@@ -711,15 +758,22 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     checkMaterialMaps(state);
     checkLights(state);
     assertInstances(object, state.instanceSignature);
-    assertEnvironmentVersion(state.environment);
     checkPMREM(state);
     // Reject a stale or newly atomic schema before observable NodeFrame updates;
     // readStorage below also catches mutations performed by those updates.
     if (state.storageNodes.length) readStorage(state);
     checkUniformBuffers(state);
     return withFrame(state, context, () => {
-      for (const node of state.builder.updateBeforeNodes) frame.updateBeforeNode(node);
-      for (const node of state.builder.updateNodes) frame.updateNode(node);
+      for (const node of state.builder.updateBeforeNodes) {
+        frame.updateBeforeNode(node);
+        // A preceding callback must not start nested filtering in the texture
+        // transaction or let an earlier captured draw observe a newer atlas.
+        checkPMREM(state);
+      }
+      for (const node of state.builder.updateNodes) {
+        frame.updateNode(node);
+        checkPMREM(state);
+      }
       assertInstances(object, state.instanceSignature);
       checkLights(state);
       checkPMREM(state);
@@ -749,7 +803,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const state = stateOf(descriptor);
     return withFrame(state, context, () => { for (const node of state.builder.updateAfterNodes) frame.updateAfterNode(node); });
   }
-  const api = Object.freeze({inspect, compile, capture, captureDraw, after,
+  const api = Object.freeze({inspect, compile, preparePMREM, capture, captureDraw, after,
     textures(descriptor) { return readTextures(stateOf(descriptor), true); },
     storage(descriptor) { return readStorage(stateOf(descriptor)); },
     release(descriptor) { for (const entry of entries) if (entry.descriptor === descriptor) { retire(entry); break; } },

@@ -113,14 +113,23 @@ intensity and rotation remain source uniforms; replacing the environment selects
 its corresponding atlas and preserves already queued draw bindings. A wholly
 native scene bypasses the separate fixed-material environment filter.
 
-In-place equirectangular `needsPMREMUpdate` regeneration currently fails with
-`THREE_NODE_PROGRAM_ENVIRONMENT_REFRESH` before callbacks or submission. The
-existing whole-render resource transaction is preserved; regeneration from
-source before-updates needs further nested-pass ownership work. Replacing the
-source texture is admitted, and directly supplied CubeUV textures retain their
-ordinary upload-version behavior. Cube environment inputs, custom environment
-nodes and the compatibility adapter's placeholder PMREM textures remain outside
-this native profile.
+A same-size equirectangular input can set `needsPMREMUpdate = true` between
+native renders and regenerate its existing atlas. The cached graph must place
+its exact source PMREM before-updates at the first draw boundary. A private
+native sky is always first; a scene without that sky must have no selected
+fixed-material draw candidates. The generated filter passes enter the renderer
+FIFO after earlier accepted renders and before the new consuming render, outside
+the whole-render texture/storage transaction. Mark CPU pixel uploads with the
+source `needsUpdate` flag as usual.
+
+Refresh after an authored callback, refresh first needed by a later draw,
+simultaneous graph recompilation, and unsafe mixed fixed/native foreground
+ordering fail with `THREE_NODE_PROGRAM_ENVIRONMENT_REFRESH` before the unsafe
+work runs. Atlas resizing still requires a fresh PMREM node. Replacing the source
+texture remains admitted; directly supplied CubeUV textures keep their ordinary
+upload-version behavior. Cube environment inputs, custom environment nodes and
+the compatibility adapter's placeholder PMREM textures remain outside this
+native profile.
 
 Native panoramic backgrounds use the pinned source sphere, camera projection,
 far-plane placement and PMREM sampling graph. Equirectangular backgrounds with
@@ -491,3 +500,10 @@ The direct-analytic implementation passed 82 compiler and 31 facade tests before
 integration with concurrent uniform-buffer support. Shadow requests and
 unsupported generated storage writes are refused before draw callbacks or GPU
 acquisition. No new SunLight browser pixel-parity result is claimed.
+
+Ordered PMREM refresh regressions cover one atlas across queued old/new source
+pixel versions, original callback context/frequency, unsafe before-update and
+mixed-foreground refusal, stale graph recompilation, and accepted child filters
+surviving an outer callback failure. A private native background permits safe
+refresh with both fixed and native scene draws. These are command/resource
+ordering checks; refreshed-environment pixel parity is not established.

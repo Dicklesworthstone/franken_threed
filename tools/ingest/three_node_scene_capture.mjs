@@ -103,6 +103,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   }
   if (camera.parent === null && camera.matrixWorldAutoUpdate === true) camera.updateMatrixWorld();
   const opaque = [], translucent = [], backgroundDraws = [], draws = [], lights = [];
+  let fixedDrawCandidates = false;
   {
     const projection = new three.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
     const frustum = new three.Frustum().setFromProjectionMatrix(projection, camera.coordinateSystem, camera.reversedDepth);
@@ -136,6 +137,12 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
         if (object.isGroup) groupOrder = object.renderOrder;
         else if (object.isLOD) { if (object.autoUpdate === true) object.update(camera); }
         else if (object.isLight) lights.push(object);
+        // Fixed draws are selected and merged by the core after this native
+        // capture. Their order can precede draws[0], including when sorting is
+        // disabled, so that native prefix is not a whole-scene boundary.
+        else if (uniforms && !objects.has(object) && object.material &&
+            (Array.isArray(object.material) ? object.material : [object.material]).some(material => material?.visible))
+          fixedDrawCandidates = true;
         else if (uniforms && objects.has(object) && (!object.frustumCulled || object.intersectsFrustum(frustum))) {
           const state = pairs.get(object), {geometry} = state;
           let z = 0;
@@ -225,6 +232,13 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     }
   };
   try {
+    if (draws.length) {
+      const first = draws[0];
+      first.object.modelViewMatrix.multiplyMatrices(camera.matrixWorldInverse, first.object.matrixWorld);
+      first.object.normalMatrix.getNormalMatrix(first.object.modelViewMatrix);
+      programs.preparePMREM(draws.map(draw => draw.binding.nodeProgram),
+        {...frameContext, object: first.object, material: first.material}, first.background || !fixedDrawCandidates);
+    }
     const captureStorage = () => storageOwner ? storageOwner.captureDispatch(capture) : capture();
     if (textureOwner) textureOwner.captureDispatch(captureStorage);
     else captureStorage();
