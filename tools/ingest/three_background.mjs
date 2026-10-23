@@ -1,8 +1,8 @@
-/** Source-owned 2D, cube and unfiltered HDR backgrounds for the r186 bridge.
+/** Source-owned 2D, cube and unfiltered HDR/LDR backgrounds for the r186 bridge.
  * Borrow ready source textures and cameras; own texture residency plus one
  * native fullscreen renderer. Never replace scene.background, decode a
  * URL, run PMREM, install a frame loop or modify the source's upload versions.
- * Screen backgrounds also work with orthographic cameras; directional cube/HDR
+ * Screen backgrounds also work with orthographic cameras; directional cube/panorama
  * backgrounds require perspective. PMREM blur is not inferred.
  */
 import {inspectThreeEnvironment, captureThreeEnvironmentPixels} from './three_environment.mjs';
@@ -17,20 +17,27 @@ export class ThreeBackgroundError extends Error {
 }
 const fail = (code, message) => { throw new ThreeBackgroundError(code, message); };
 const same = (a,b) => a.length === b.length && a.every((v,i) => v === b[i]);
-/** Shared metadata-only admission. Retain the existing HDR contract, including
- * its error namespace. Byte screen/cube storage reuses source texture admission;
- * no panorama conversion, image decoding or independent upload implementation.
+/** Shared metadata-only admission. Data panoramas reuse environment conversion
+ * (including byte/sRGB inputs). Browser panoramas, screen images and cubes reuse
+ * source texture residency: no CPU readback, conversion pass or duplicate upload
+ * implementation. No environment filtering is needed for an unblurred backdrop.
  */
 export function inspectThreeBackground(texture, three, {maxPixels = 16 * 1024 * 1024} = {}) {
-  if (texture?.type !== three?.UnsignedByteType) {
+  const equirectangular = texture?.isCubeTexture !== true &&
+    texture?.mapping === three?.EquirectangularReflectionMapping;
+  if (texture?.type !== three?.UnsignedByteType || equirectangular && texture?.isDataTexture === true) {
     return Object.freeze({...inspectThreeEnvironment(texture, three, {maxPixels}), mapping: 'panorama'});
   }
   const shape = inspectThreeTexture(texture, three, {maxPixels, maxTextureBytes:Number.MAX_SAFE_INTEGER});
-  const mapping = shape.cube ? 'cube' : 'screen';
+  const imagePanorama = equirectangular && !shape.cube;
+  const mapping = shape.cube ? 'cube' : imagePanorama ? 'panorama' : 'screen';
+  if (imagePanorama && (shape.data || shape.video || shape.layered ||
+      shape.width !== 2 * shape.height || texture.premultiplyAlpha))
+    fail('PROFILE', 'Image panoramas require ready, unpremultiplied 2:1 RGBA browser images');
   if (shape.channels !== 4 || (shape.cube
       ? ![three.CubeReflectionMapping, three.CubeRefractionMapping].includes(texture.mapping)
-      : texture.mapping !== three.UVMapping))
-    fail('PROFILE', 'Byte backgrounds require RGBA UVMapping textures or reflection/refraction CubeTextures');
+      : !imagePanorama && texture.mapping !== three.UVMapping))
+    fail('PROFILE', 'Byte backgrounds require RGBA screen images, equirectangular panoramas or reflection/refraction cubes');
   if (texture.onUpdate !== null) fail('HOOK', 'Background upload callbacks require their explicit texture owner');
   if (mapping === 'screen' && (typeof texture.matrixAutoUpdate !== 'boolean' ||
       texture.updateMatrix !== three.Texture.prototype.updateMatrix))
@@ -40,7 +47,7 @@ export function inspectThreeBackground(texture, three, {maxPixels = 16 * 1024 * 
     signature.push(image, level, layer);
     if (shape.data) signature.push(image.data, image.data.buffer);
   }
-  return Object.freeze({...shape, texture, mapping, sourceBytes: shape.bytes, signature: Object.freeze(signature)});
+  return Object.freeze({...shape, texture, mapping, imagePanorama, sourceBytes: shape.bytes, signature: Object.freeze(signature)});
 }
 
 /** Admission for live scene controls, also used before scene GPU allocation. */
@@ -98,6 +105,15 @@ export function threeBackgroundFrame(scene, camera, three) {
   // AFTER inverse authored rotation. Do not reorder or flip the six faces here.
   if (texture?.isCubeTexture === true && texture.isRenderTargetTexture === false)
     for (let column = 0; column < 4; column++) direction.elements[column * 4] *= -1;
+  // Uploaded browser panoramas retain r186's asin(y)/PI+.5 orientation.
+  // Reflect environment-space Y AFTER both rotations: acos(-y)/PI is the same
+  // coordinate. The texture pool already applied flipY; do not apply it again.
+  // Data panoramas were normalized to north-first pixels by the shared CPU
+  // capture, so they must keep the original direction. This avoids an image
+  // readback or a second GPU texture just to reverse panorama rows.
+  if (texture?.type === three.UnsignedByteType && texture.isDataTexture !== true &&
+      texture.isCubeTexture !== true && texture.mapping === three.EquirectangularReflectionMapping)
+    for (let column = 0; column < 4; column++) direction.elements[column * 4 + 1] *= -1;
   const captured = Object.freeze({directionFromClip: Object.freeze(Array.from(direction.elements)), intensity: scene.backgroundIntensity});
   packAnimationBackgroundFrame(captured); // Validate packed rays before any frame GPU work.
   return captured;
@@ -105,8 +121,10 @@ export function threeBackgroundFrame(scene, camera, three) {
 
 /** maxBytes charges all source faces/mips and the 128-byte draw packet.
  * The scene retains/charges the previous owner until submitted consumers drain.
- * HDR conversion is unchanged. Byte images/cubes use the same versioned texture
- * pool as materials; source changes require prepare(), UV/intensity changes do not.
+ * Data panoramas use the environment owner's exact bounded conversion. Browser
+ * panoramas keep their full source mip chain and sampling/color-space policy in
+ * the same texture pool as materials. No half-float staging image is allocated.
+ * Source changes require prepare(); camera/rotation/intensity changes do not.
  */
 export async function createGpuThreeBackground(device, texture, options = {}) {
   if (!options || typeof options !== 'object' || Array.isArray(options)) fail('OPTIONS', 'Expected background options');
@@ -127,7 +145,7 @@ export async function createGpuThreeBackground(device, texture, options = {}) {
     fail('DEVICE', 'Expected a native WebGPU device');
   if (!(shape.width <= device.limits?.maxTextureDimension2D) || !(shape.height <= device.limits?.maxTextureDimension2D))
     fail('LIMIT', 'Source background exceeds the native texture extent limit');
-  const panorama = shape.mapping === 'panorama';
+  const panorama = shape.mapping === 'panorama' && !shape.imagePanorama;
   const pixels = panorama ? captureThreeEnvironmentPixels(texture, three, {maxPixels}) : null;
   const lifetime = new AbortController();
   let input = null, textureOwner = null, renderer = null, disposed = false, terminal = null, busy = false, rejectStop;
