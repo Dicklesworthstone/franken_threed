@@ -2,7 +2,7 @@
  * are retained helpers; this module constructs no renderer/backend and submits
  * no GPU commands. Descriptors preserve the builder's native bind groups.
  *
- * The profile is rigid meshes and storage-backed InstancedMesh objects, unlit
+ * The profile is rigid meshes and CPU/storage-backed InstancedMesh objects, unlit
  * or Toon/Lambert/Phong/Standard/Physical node materials and corresponding
  * built-in materials with authored slots, ordinary or registered direct analytic
  * lights, float attributes, scalar/vector/matrix uniforms, authored typed uniform
@@ -16,6 +16,8 @@
  * after() belongs after that draw has been accepted. Callers capture before any
  * asynchronous pipeline preparation and retain the resulting byte arrays.
  */
+import {createThreeNodeAttributes} from './three_node_attributes.mjs';
+
 export class ThreeNodeProgramError extends Error {
   constructor(code, message, options) {
     super(`THREE_NODE_PROGRAM_${code}: ${message}`, options);
@@ -50,11 +52,11 @@ export function hasThreeNodeProgram(material) {
 }
 
 export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, maxNodes = 8192,
-  maxShaderBytes = 16 * 1024 * 1024, maxUniformBytes = 256 * 1024, maxBindGroups = 4} = {}) {
+  maxShaderBytes = 16 * 1024 * 1024, maxUniformBytes = 256 * 1024, maxAttributeBytes = 64 * 1024 * 1024, maxBindGroups = 4} = {}) {
   if (three?.REVISION !== '186' || typeof three.WGSLNodeBuilder !== 'function' ||
       typeof renderer?._nodes?.nodeFrame?.updateNode !== 'function')
     fail('SOURCE', 'Supply the pinned r186 namespace and the renderer NodeFrame');
-  for (const [name, value] of Object.entries({maxPrograms, maxNodes, maxShaderBytes, maxUniformBytes, maxBindGroups}))
+  for (const [name, value] of Object.entries({maxPrograms, maxNodes, maxShaderBytes, maxUniformBytes, maxAttributeBytes, maxBindGroups}))
     if (!Number.isSafeInteger(value) || value < 1) fail('LIMIT', `Invalid ${name}`);
   const frame = renderer._nodes.nodeFrame, cache = new WeakMap(), entries = new Set();
   const standardPrototypes = [three.MeshStandardNodeMaterial.prototype, three.MeshPhysicalNodeMaterial.prototype];
@@ -65,6 +67,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   const lightClassIds = new WeakMap();
   let lightClassSerial = 0;
   const environmentNodes = new WeakMap(), environmentVersions = new WeakMap(), uniformBuffers = new WeakMap();
+  const generatedAttributes = createThreeNodeAttributes(three, {maxBytes: maxAttributeBytes, fail});
+  const instanceArrays = new WeakMap(), sourceIds = new WeakMap(); let sourceSerial = 0;
   const materialViews = new WeakMap();
   const sourceMaterialClasses = new Map([
     [three.MeshBasicMaterial, three.MeshBasicNodeMaterial], [three.MeshToonMaterial, three.MeshToonNodeMaterial],
@@ -100,6 +104,47 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     return record.view;
   }
   const rawUniformBuffer = node => node instanceof three.BufferNode && !node.isStorageBufferNode && !node.isArrayBufferNode;
+  function sourceId(value) {
+    if (value === null || (typeof value !== 'object' && typeof value !== 'function')) return value;
+    let id = sourceIds.get(value); if (id === undefined) { id = ++sourceSerial; sourceIds.set(value, id); }
+    return id;
+  }
+  function inspectAttributeInput(node, object) {
+    if (node.value instanceof Float32Array) return;
+    const inputs = object?.isInstancedMesh ? [object.instanceMatrix, object.instanceColor].filter(Boolean) : [];
+    const value = node.value;
+    // Raw arrays receive a private owner from BufferAttributeNode. Instance.js
+    // also constructs separate color/interleaved owners from admitted CPU
+    // instance arrays. Public geometry owners need residency shared across all
+    // geometry routes; copying them here would consume their partial ranges
+    // without preserving an ordinary attribute alias's GPU-visible history.
+    // r186's vec4 factory leaves node.instanced false for the matrix columns;
+    // their InstancedInterleavedBuffer is the authoritative instancing marker.
+    const instanced = node.instanced === true ||
+      value instanceof three.InstancedInterleavedBuffer && value.isInstancedInterleavedBuffer === true;
+    const derivedInstance = instanced && !inputs.includes(value) &&
+      (value instanceof three.InstancedBufferAttribute || value instanceof three.InstancedInterleavedBuffer) &&
+      inputs.some(input => input instanceof three.InstancedBufferAttribute && !input.isStorageInstancedBufferAttribute &&
+        value.array === input.array);
+    if (!derivedInstance)
+      fail('ATTRIBUTE', 'Native generated streams require raw Float32Array inputs or the source-derived CPU instance owners; public attribute inputs need shared residency');
+  }
+  function attributeSignature(nodes, object) {
+    return JSON.stringify(nodes.map(node => {
+      inspectAttributeInput(node, object);
+      const attribute = node.attribute, owner = attribute?.isInterleavedBufferAttribute ? attribute.data : attribute;
+      const array = owner?.array, inputArray = ArrayBuffer.isView(node.value) ? node.value : node.value?.array;
+      if (!attribute || !array || inputArray !== array)
+        fail('CHANGED', 'Native buffer attribute nodes must retain their source backing array; replace the node or instance attribute');
+      if (owner.isStorageBufferAttribute || owner.isStorageInstancedBufferAttribute || owner.isIndirectStorageBufferAttribute)
+        fail('ATTRIBUTE', 'Compute-backed attribute conversion requires shared GPU residency, not a CPU attribute snapshot');
+      return [node.id, node.nodeType, node.bufferType, node.bufferStride, node.bufferOffset, node.instanced, node.usage,
+        sourceId(node.value), sourceId(attribute), sourceId(owner), sourceId(array), array.length, array.byteLength,
+        attribute.count, attribute.itemSize, attribute.normalized, attribute.gpuType, attribute.isInterleavedBufferAttribute,
+        attribute.offset, attribute.isInstancedBufferAttribute, owner.stride, owner.meshPerAttribute,
+        owner.isInstancedInterleavedBuffer, owner.usage, sourceId(owner.onUploadCallback)];
+    }));
+  }
   function inspectUniformBuffer(node) {
     // BufferNode emits the caller's array layout verbatim. Unlike UniformArrayNode,
     // it inserts no per-element padding: scalar/vec2 arrays therefore do not have
@@ -190,17 +235,38 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         !(object.geometry instanceof three.BufferGeometry) || object.geometry.isInstancedBufferGeometry ||
         Object.values(object.geometry.morphAttributes ?? {}).some(list => list.length))
       fail('OBJECT', 'Native instancing requires source InstancedMesh objects without skinning or morph data');
+    const cpu = [];
     const shape = (attribute, type) => {
-      if (!(attribute instanceof three.StorageInstancedBufferAttribute) || attribute.isInstancedBufferAttribute !== true ||
-          attribute.isStorageInstancedBufferAttribute !== true)
-        fail('OBJECT', 'Native InstancedMesh matrices and colors require StorageInstancedBufferAttribute');
-      const bytes = inspectStorage({value: attribute, nodeType: type, bufferCount: attribute.count, access: 'readWrite'});
-      return [attribute.id, attribute.count, bytes];
+      if (attribute instanceof three.StorageInstancedBufferAttribute && attribute.isStorageInstancedBufferAttribute === true) {
+        const bytes = inspectStorage({value: attribute, nodeType: type, bufferCount: attribute.count, access: 'readWrite'});
+        if (attribute.isInstancedBufferAttribute !== true) fail('OBJECT', 'Native instance attributes must retain their source instancing flag');
+        return [attribute.id, attribute.count, bytes, 'storage'];
+      }
+      const array = attribute?.array, stride = type === 'mat4' ? 16 : 3;
+      if (!(attribute instanceof three.InstancedBufferAttribute) || attribute.isInstancedBufferAttribute !== true ||
+          attribute.isStorageInstancedBufferAttribute || attribute.isInterleavedBufferAttribute || attribute.normalized ||
+          attribute.gpuType === three.IntType || !(array instanceof Float32Array) ||
+          !(array.buffer instanceof ArrayBuffer) || array.buffer.resizable || attribute.itemSize !== stride ||
+          !Number.isSafeInteger(attribute.count) || attribute.count < 1 || attribute.count > 0xffffffff ||
+          array.length !== attribute.count * stride || attribute.meshPerAttribute !== 1 ||
+          !Number.isSafeInteger(attribute.version) || attribute.version < 0)
+        fail('OBJECT', 'Native CPU instances require fixed unshared Float32 matrix/RGB attributes with divisor one');
+      if (attribute.onUploadCallback !== three.BufferAttribute.prototype.onUploadCallback)
+        fail('HOOK', 'Native CPU instance attributes require the source upload callback');
+      if (instanceArrays.has(attribute) && instanceArrays.get(attribute) !== array)
+        fail('CHANGED', 'Source instance nodes retain their original CPU array; replace the instance attribute to change its backing array');
+      if (array.byteLength > maxAttributeBytes || array.byteLength > (renderer._device?.limits?.maxBufferSize ?? 256 * 1024 * 1024))
+        fail('LIMIT', 'Native CPU instance input exceeds its byte budget');
+      cpu.push(attribute);
+      return [attribute.id, attribute.count, array.byteLength, 'cpu', sourceId(array), attribute.usage];
     };
     const matrix = shape(object.instanceMatrix, 'mat4'), color = object.instanceColor == null ? null : shape(object.instanceColor, 'vec3');
+    const uniformLimit = matrix[3] === 'cpu' ? renderer.backend?.capabilities?.getUniformBufferLimit?.() : null;
+    if (matrix[3] === 'cpu' && (!Number.isSafeInteger(uniformLimit) || uniformLimit < 16))
+      fail('SOURCE', 'Native CPU instances require the source uniform buffer size capability');
     // The source instancedMesh Fn captures these attribute objects at build.
     // Packed vec3 colors and their compute-padded form share one shader layout.
-    return {signature: JSON.stringify([matrix, color]), capacity: Math.min(matrix[1], color?.[1] ?? Infinity)};
+    return {signature: JSON.stringify([matrix, color, uniformLimit]), capacity: Math.min(matrix[1], color?.[1] ?? Infinity), cpu};
   }
   function assertInstances(object, signature) {
     if ((inspectInstances(object)?.signature ?? null) !== signature)
@@ -379,7 +445,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (!(object instanceof three.Mesh) || object.isSkinnedMesh || object.isBatchedMesh ||
         !(object.geometry instanceof three.BufferGeometry) || object.geometry.isInstancedBufferGeometry ||
         Object.values(object.geometry.morphAttributes ?? {}).some(list => list.length))
-      fail('OBJECT', 'Native node graphs require rigid meshes or storage-backed InstancedMesh objects');
+      fail('OBJECT', 'Native node graphs require rigid meshes or CPU/storage-backed InstancedMesh objects');
     inspectInstances(object);
     if (camera && (!(camera instanceof three.Camera) || camera.isArrayCamera || camera.isMultiViewCamera || camera.reversedDepth))
       fail('CAMERA', 'Native node graphs require an ordinary non-reversed camera');
@@ -415,6 +481,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       seen.add(node);
       if (seen.size > maxNodes) fail('LIMIT', 'Native node graph exceeds its node budget');
       checkNode(node);
+      if (node instanceof three.BufferAttributeNode) inspectAttributeInput(node, object);
       if (typeof node.getChildren === 'function') for (const child of node.getChildren()) stack.push(child);
     }
     return material;
@@ -435,8 +502,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       fail('TEXTURE', 'Native graphics textures require source TextureNode or PMREMNode bindings');
     if (node.isStorageBufferNode) inspectStorage(node);
     else if (rawUniformBuffer(node)) inspectUniformBuffer(node);
-    else if (node.isBufferNode || node.isBufferAttributeNode || node.isComputeNode || node.isAtomicFunctionNode)
-      fail('STORAGE', 'Managed uniform arrays, attribute conversions, atomic and compute graphs are not admitted');
+    else if (!(node instanceof three.BufferAttributeNode) &&
+        (node.isBufferNode || node.isBufferAttributeNode || node.isComputeNode || node.isAtomicFunctionNode))
+      fail('STORAGE', 'Managed uniform arrays, atomic and compute graphs are not admitted');
     if (node.isAssignNode) {
       const seen = new Set(), targets = [node.targetNode];
       while (targets.length) {
@@ -444,6 +512,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         seen.add(target);
         if (target.isStorageBufferNode) fail('STORAGE', 'Native graphics storage bindings are read-only');
         if (rawUniformBuffer(target)) fail('UNIFORM', 'Native graphics uniform buffers are read-only');
+        if (target instanceof three.BufferAttributeNode) fail('ATTRIBUTE', 'Native graphics buffer attributes are read-only');
         // An explicit local variable owns a value copied from its initializer;
         // assigning it does not write back to the source storage address.
         if (target.isVarNode && target.intent === false) continue;
@@ -483,6 +552,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     shaderBytes -= entry.bytes;
     entry.material.removeEventListener('dispose', entry.onDispose);
     entry.geometry.removeEventListener('dispose', entry.onDispose);
+    if (entry.attributeNodes.length) generatedAttributes.release(entry.descriptor);
     if (cache.get(entry.object)?.get(entry.material) === entry) cache.get(entry.object).delete(entry.material);
   }
   function compile(material, object, context = {}) {
@@ -495,7 +565,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (previous?.key === key && pmremSignature(previous.pmremNodes) === previous.pmremSignature &&
         textureSignature(previous.textureNodes, previous.textureReferences) === previous.textureSignature &&
         storageSignature(previous.storageNodes) === previous.storageSignature &&
-        uniformSignature(previous.uniformNodes, previous.builder) === previous.uniformSignature) return previous.descriptor;
+        uniformSignature(previous.uniformNodes, previous.builder) === previous.uniformSignature &&
+        attributeSignature(previous.attributeNodes, object) === previous.attributeSignature) return previous.descriptor;
     if (entries.size - (previous ? 1 : 0) >= maxPrograms) fail('LIMIT', 'Native node program capacity exceeded');
     // setup() itself may filter a PMREM source. An existing stale atlas must
     // reach the first draw's ordered preparation boundary through its cached
@@ -526,7 +597,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const bindings = builder.getBindings();
     const boundTextures = new Set(bindings.flatMap(group => group.bindings)
       .filter(binding => binding.textureNode?.isTextureNode).map(binding => binding.textureNode.value));
-    for (const node of builder.nodes) checkNode(node, lightsNode, lights, environmentNode, boundTextures);
+    for (const node of builder.nodes) {
+      checkNode(node, lightsNode, lights, environmentNode, boundTextures);
+      if (node instanceof three.BufferAttributeNode) inspectAttributeInput(node, object);
+    }
     if (bindings.length > Math.min(maxBindGroups, renderer._device?.limits?.maxBindGroups ?? 4))
       fail('LIMIT', 'Native node graph exceeds its bind group budget');
     let uniformBytes = 0, uniformCount = 0;
@@ -581,12 +655,14 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       return Object.freeze({index, name: group.name, byteLength, uniforms: Object.freeze(uniforms), entries: Object.freeze(entries)});
     });
     if (uniformBytes > maxUniformBytes) fail('LIMIT', 'Native node draw exceeds its uniform byte budget');
-    const attributes = builder.attributes.map((attribute, location) => {
+    const nodeAttributes = builder.getAttributesArray(), generated = [];
+    const attributes = nodeAttributes.map((attribute, location) => {
       const components = {float: 1, vec2: 2, vec3: 3, vec4: 4}[attribute.type];
-      const source = object.geometry.attributes[attribute.name];
+      const node = attribute.node, source = node?.attribute ?? object.geometry.attributes[attribute.name];
       if (!components || !source || source.itemSize !== components || source.gpuType === three.IntType ||
-          source.isInstancedBufferAttribute || source.data?.isInstancedInterleavedBuffer)
+          (node ? !(node instanceof three.BufferAttributeNode) : source.isInstancedBufferAttribute || source.data?.isInstancedInterleavedBuffer))
         fail('ATTRIBUTE', `Native node attribute ${attribute.name} requires a matching scalar/vector float geometry attribute`);
+      if (node) generated.push({name: attribute.name, attribute: source});
       return Object.freeze({name: attribute.name, location, locations: 1, components, scalar: 'float'});
     });
     const vertex = builder.vertexShader, fragment = builder.fragmentShader, bytes = 2 * (vertex.length + fragment.length);
@@ -616,12 +692,27 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const storageKey = storageSignature(storageNodes);
     const uniformNodes = [...graphNodes].filter(rawUniformBuffer), uniformKey = uniformSignature(uniformNodes, builder);
     const analyticLightNodes = [...builder.nodes].filter(node => node.isAnalyticLightNode);
-    nodeStates.set(descriptor, {owner: api, builder, bindings, material, object, lights, lightSignature: lightKey, analyticLightNodes, environment, instanceSignature, pmremNodes, pmremSignature: pmremKey,
+    const attributeNodes = [...graphNodes].filter(node => node instanceof three.BufferAttributeNode && node.attribute);
+    const attributeKey = attributeSignature(attributeNodes, object);
+    // Instance.js caches derived color/interleaved attributes by the original
+    // attribute identity. Refuse stale cached arrays even if another renderer
+    // constructed the source nodes before this preparation owner saw them.
+    for (const attribute of instances?.cpu ?? []) {
+      if (!uniformNodes.some(node => node.value === attribute.array) &&
+          !generated.some(({attribute: value}) => (value.isInterleavedBufferAttribute ? value.data.array : value.array) === attribute.array))
+        fail('CHANGED', 'Source instance construction retained a different CPU array; replace the instance attribute');
+    }
+    if (generated.length) generatedAttributes.register(descriptor, object.geometry, generated);
+    for (const attribute of instances?.cpu ?? []) instanceArrays.set(attribute, attribute.array);
+    nodeStates.set(descriptor, {owner: api, descriptor, builder, bindings, material, object, lights, lightSignature: lightKey, analyticLightNodes,
+      environment, instanceSignature, pmremNodes, pmremSignature: pmremKey,
       textureNodes, textureReferences, textureSignature: signature, materialMapSignature: materialMapSignature(material),
-      storageNodes, storageSignature: storageKey, uniformNodes, uniformSignature: uniformKey});
+      storageNodes, storageSignature: storageKey, uniformNodes, uniformSignature: uniformKey,
+      attributeNodes, attributeSignature: attributeKey, geometry: object.geometry, generated: generated.length > 0});
     const entry = {key, descriptor, builder, material, object, geometry: object.geometry, bytes, pmremNodes, pmremSignature: pmremKey,
       textureNodes, textureReferences, textureSignature: signature,
-      storageNodes, storageSignature: storageKey, uniformNodes, uniformSignature: uniformKey};
+      storageNodes, storageSignature: storageKey, uniformNodes, uniformSignature: uniformKey,
+      attributeNodes, attributeSignature: attributeKey};
     entry.onDispose = () => retire(entry);
     if (previous) retire(previous);
     const next = byMaterial ?? new Map(); next.set(material, entry); cache.set(object, next);
@@ -729,6 +820,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (uniformSignature(state.uniformNodes, state.builder) !== state.uniformSignature)
       fail('CHANGED', 'Native uniform array layout, group or binding aliases changed; compile the graph again');
   }
+  function checkAttributes(state) {
+    if (attributeSignature(state.attributeNodes, state.object) !== state.attributeSignature)
+      fail('CHANGED', 'Native source attribute identity, backing array or layout changed; compile the graph again');
+    if (state.generated) generatedAttributes.validate(state.descriptor);
+  }
   function readUniformBuffer(binding, byteLength) {
     let history = uniformBuffers.get(binding);
     if (!history) {
@@ -763,6 +859,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // readStorage below also catches mutations performed by those updates.
     if (state.storageNodes.length) readStorage(state);
     checkUniformBuffers(state);
+    checkAttributes(state);
     return withFrame(state, context, () => {
       for (const node of state.builder.updateBeforeNodes) {
         frame.updateBeforeNode(node);
@@ -770,6 +867,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         // transaction or let an earlier captured draw observe a newer atlas.
         checkPMREM(state);
       }
+      assertInstances(object, state.instanceSignature);
+      checkAttributes(state);
+      // Match Renderer._renderObjectDirect: source geometry uploads occur after
+      // updateBefore and before ordinary node updates and uniform uploads.
+      const attributes = state.generated ? generatedAttributes.capture(descriptor, frame.renderId) : null;
       for (const node of state.builder.updateNodes) {
         frame.updateNode(node);
         checkPMREM(state);
@@ -778,6 +880,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       checkLights(state);
       checkPMREM(state);
       checkUniformBuffers(state);
+      checkAttributes(state);
       const textures = readTextures(state);
       const storage = readStorage(state);
       const uniforms = state.bindings.map((group, index) => {
@@ -795,7 +898,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         }
         return packet;
       });
-      return {uniforms, textures, storage};
+      return {uniforms, textures, storage, attributes};
     });
   }
   function capture(descriptor, context = {}) { return captureDraw(descriptor, context).uniforms; }
@@ -804,10 +907,16 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     return withFrame(state, context, () => { for (const node of state.builder.updateAfterNodes) frame.updateAfterNode(node); });
   }
   const api = Object.freeze({inspect, compile, preparePMREM, capture, captureDraw, after,
+    geometry(descriptor) { const state = stateOf(descriptor); return state.generated ? generatedAttributes.geometry(descriptor) : state.geometry; },
+    attributeBytes(descriptor) { return stateOf(descriptor).generated ? generatedAttributes.byteLength(descriptor) : 0; },
+    captureAttributes(descriptor, context = {}) {
+      const state = stateOf(descriptor); assertInstances(context.object ?? state.object, state.instanceSignature); checkAttributes(state);
+      return state.generated ? generatedAttributes.capture(descriptor, context.renderId ?? renderer.info.calls) : null;
+    },
     textures(descriptor) { return readTextures(stateOf(descriptor), true); },
     storage(descriptor) { return readStorage(stateOf(descriptor)); },
     release(descriptor) { for (const entry of entries) if (entry.descriptor === descriptor) { retire(entry); break; } },
-    dispose() { if (disposed) return; disposed = true; for (const entry of [...entries]) retire(entry); },
+    dispose() { if (disposed) return; disposed = true; for (const entry of [...entries]) retire(entry); generatedAttributes.dispose(); },
     get diagnostics() { return Object.freeze({programs: entries.size, shaderBytes, maxPrograms, maxShaderBytes}); }});
   return api;
 }

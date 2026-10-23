@@ -111,6 +111,97 @@ export const nativeTSLScenarios = {
     };
     return {...result, materials, phase};
   },
+  native_tsl_cpu_instanced_mesh(T, renderer) {
+    const {uniform, instanceIndex, positionLocal, vec3} = T.TSL;
+    const largeCapacity = Math.floor(renderer.backend.capabilities.getUniformBufferLimit() / 64) + 1;
+    const geometry = new T.BoxGeometry(.58, .48, .36), material = new T.MeshLambertNodeMaterial({side: T.DoubleSide});
+    const tint = uniform(new T.Color()).onObjectUpdate(frame => frame.object.userData.tint), gain = uniform(.9);
+    material.colorNode = tint.mul(gain);
+    material.positionNode = positionLocal.add(vec3(0, instanceIndex.toFloat().mul(.7).sin().mul(.035), 0));
+    const small = new T.InstancedMesh(geometry, material, 6), large = new T.InstancedMesh(geometry, material, largeCapacity);
+    const meshes = [small, large], matrix = new T.Matrix4(), rotation = new T.Euler(), scale = new T.Vector3(), color = new T.Color();
+    function writeMatrices(mesh, phase) {
+      const count = mesh === small ? 6 : 3;
+      for (let i = 0; i < count; i++) {
+        rotation.set(.18 + i * .08, .3 + i * .12, phase + i * .18);
+        // One mirrored axis and unequal scales exercise inverse-transpose
+        // instance normals. DoubleSide keeps both windings visible.
+        scale.set(i === 1 ? -.85 : .75 + i * .04, .7 + (i % 2) * .3, .65 + i * .06);
+        matrix.makeRotationFromEuler(rotation).scale(scale);
+        matrix.setPosition((i % 3 - 1) * .92, mesh === small ? (Math.floor(i / 3) - .5) * .82 : 0, 0);
+        mesh.setMatrixAt(i, matrix);
+      }
+    }
+    function writeColors(mesh, updated) {
+      const count = mesh === small ? 6 : 3;
+      for (let i = 0; i < count; i++) {
+        color.setRGB(updated ? .7 - i * .07 : .18 + i * .1, .3 + (i % 3) * .15, updated ? .22 + i * .1 : .8 - i * .08);
+        mesh.setColorAt(i, color);
+      }
+      mesh.instanceColor.needsUpdate = true;
+    }
+    const writers = meshes.map(mesh => {
+      mesh.frustumCulled = false; mesh.userData.tint = new T.Color(.95, .85, .75);
+      writeMatrices(mesh, .2); writeColors(mesh, false);
+      const writer = scene(T), light = new T.DirectionalLight(0xd5e7ff, 1.7); light.position.set(-2, 3, 4);
+      writer.add(mesh, new T.AmbientLight(0xffdab5, .35), light, light.target); return writer;
+    });
+    large.count = 3; large.instanceMatrix.needsUpdate = true;
+    const writeCamera = new T.OrthographicCamera(-1.6, 1.6, 1.2, -1.2, .1, 10); writeCamera.position.z = 4;
+    const targets = Array.from({length: 4}, () => new T.RenderTarget(128, 96,
+      {generateMipmaps: false, minFilter: T.NearestFilter, magFilter: T.NearestFilter}));
+    const result = {scene: scene(T), camera: camera(T, true)};
+    for (const [i, target] of targets.entries()) {
+      renderer.initRenderTarget(target);
+      const panel = new T.Mesh(new T.PlaneGeometry(1.9, 1.425), new T.MeshBasicMaterial({map: target.texture}));
+      panel.position.set(i % 2 ? 1 : -1, i < 2 ? .76 : -.76, 0); result.scene.add(panel);
+    }
+    const compile = renderer.compileAsync.bind(renderer), render = renderer.render.bind(renderer);
+    renderer.compileAsync = async (...args) => {
+      const previous = renderer.getRenderTarget(), previousMip = renderer.getActiveMipmapLevel();
+      try {
+        for (const [i, target] of targets.entries()) {
+          renderer.setRenderTarget(target); await compile(writers[i < 2 ? 0 : 1], writeCamera);
+        }
+      } finally { renderer.setRenderTarget(previous, 0, previousMip); }
+      return compile(...args);
+    };
+    let frame = 0;
+    renderer.render = (...args) => {
+      if (args[0] !== result.scene) return render(...args);
+      frame++;
+      if (frame === 1 || frame === 8) {
+        if (frame === 8) {
+          // Source-generated RGB and large matrix attributes synchronize their
+          // versions through OnBeforeFrameUpdate on this new animation frame.
+          for (const mesh of meshes) writeColors(mesh, true);
+          writeMatrices(large, 1.05); large.instanceMatrix.needsUpdate = true;
+        }
+        const previous = renderer.getRenderTarget(), previousMip = renderer.getActiveMipmapLevel();
+        try {
+          for (const [i, target] of targets.entries()) {
+            const mesh = meshes[i < 2 ? 0 : 1];
+            if (mesh === small) writeMatrices(mesh, (frame === 8 ? .8 : .2) + i * .6);
+            // Small matrix UBOs consume each draw's current bytes with no
+            // needsUpdate; large attribute data stays fixed within this frame.
+            mesh.count = (frame === 8 ? [5, 3, 3, 2] : [6, 4, 3, 1])[i];
+            mesh.rotation.z = i === 3 ? -.12 : .06;
+            mesh.userData.tint.setRGB(.95 - i * .1, .8 + i * .05, frame === 8 ? .9 : .7);
+            gain.value = .95 - i * .12;
+            renderer.setRenderTarget(target); render(writers[i < 2 ? 0 : 1], writeCamera);
+          }
+        } finally { renderer.setRenderTarget(previous, 0, previousMip); }
+        // Pending submissions retain matrices, RGB data, counts and uniforms;
+        // public CPU arrays are allowed to change after the logical draws.
+        for (const mesh of meshes) {
+          mesh.instanceMatrix.array.fill(0); mesh.instanceColor.array.fill(0); mesh.count = 1;
+        }
+        gain.value = .01;
+      }
+      return render(...args);
+    };
+    return {...result, meshes, writers, writeCamera, targets, largeCapacity};
+  },
   native_tsl_background_nodes(T, renderer) {
     const {uniform, screenUV, color} = T.TSL;
     const writer = new T.Scene(), writeCamera = camera(T);

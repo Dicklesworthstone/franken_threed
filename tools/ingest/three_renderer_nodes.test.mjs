@@ -529,6 +529,118 @@ function storageInstances(f,count=4){
   return {mesh,matrices,colors};
 }
 
+function cpuInstances(f,count=3){
+  const mesh=new T.InstancedMesh(f.mesh.geometry,f.material,count);
+  for(let i=0;i<count;i++){
+    mesh.setMatrixAt(i,new T.Matrix4().makeScale(1+i*.25,.75,1).setPosition(i*.5,0,0));
+    mesh.setColorAt(i,new T.Color(.125+i*.125,.5,.75));
+  }
+  mesh.frustumCulled=false;f.scene.remove(f.mesh);f.scene.add(mesh);
+  return {mesh,matrices:mesh.instanceMatrix,colors:mesh.instanceColor};
+}
+function instanceStreams(draw){
+  return draw.pipeline.vertex.buffers.flatMap((layout,slot)=>{
+    if(layout.stepMode!=='instance')return [];
+    const buffer=draw.streams.get(slot),bytes=draw.contents.get(buffer);
+    return [{layout,buffer,values:[...new Float32Array(bytes.buffer,bytes.byteOffset,bytes.byteLength/4)]}];
+  });
+}
+
+test('ordinary InstancedMesh captures unflagged matrix uniforms and versioned RGB streams before queued preparation',async t=>{
+  const f=fixture(t),{mesh,matrices,colors}=cpuInstances(f);
+  const geometryKeys=Object.keys(mesh.geometry.attributes),originalMatrices=matrices.array,originalColors=colors.array;
+  await f.renderer.init();f.renderer.render(f.scene,f.camera);
+  matrices.array[12]=1.5;colors.array[0]=.875;colors.needsUpdate=true;mesh.count=2;
+  f.renderer._nodes.nodeFrame.update();f.renderer.render(f.scene,f.camera);
+  mesh.count=0;f.renderer.render(f.scene,f.camera);
+  mesh.count=99;matrices.array.fill(99);colors.array.fill(99);
+  await drain(f.renderer);
+  const draws=nativeDraws(f.device);assert.deepEqual(draws.map(draw=>draw.args[1]),[3,2]);
+  assert.deepEqual(draws.map(draw=>uniformBlocks(draw).find(words=>words.length===48)?.[12]),[0,1.5]);
+  assert.deepEqual(draws.map(draw=>instanceStreams(draw).map(stream=>stream.values[0])),[[.125],[.875]]);
+  assert.ok(draws.every(draw=>instanceStreams(draw)[0].layout.arrayStride===12));
+  assert.equal(draws[0].pipeline,draws[1].pipeline);assert.equal(matrices.version,0);
+  assert.equal(matrices.array,originalMatrices);assert.equal(colors.array,originalColors);
+  assert.deepEqual(Object.keys(mesh.geometry.attributes),geometryKeys);
+  assert.equal(matrices.array[12],99);assert.equal(colors.array[0],99);
+  assert.equal(f.renderer._nodeCaptureBytes,0);assert.equal(f.renderer.info.f3d.presentedRenders,3);
+});
+
+test('large ordinary instance matrices use captured interleaved columns and preserve partial update history',async t=>{
+  const f=fixture(t);f.device.limits.maxUniformBufferBindingSize=65536;
+  const {mesh,matrices,colors}=cpuInstances(f,1025);mesh.count=3;
+  await f.renderer.init();f.renderer.render(f.scene,f.camera);
+  matrices.array[12]=2;matrices.array[28]=99;matrices.addUpdateRange(12,1);matrices.needsUpdate=true;
+  colors.array[0]=.875;colors.array[3]=99;colors.addUpdateRange(0,3);colors.needsUpdate=true;mesh.count=2;
+  f.renderer._nodes.nodeFrame.update();f.renderer.render(f.scene,f.camera);
+  assert.equal(matrices.updateRanges.length,0);assert.equal(colors.updateRanges.length,0);
+  matrices.array.fill(99);colors.array.fill(99);await drain(f.renderer);
+  const draws=nativeDraws(f.device);assert.deepEqual(draws.map(draw=>draw.args[1]),[3,2]);
+  const matrixStreams=draws.map(draw=>instanceStreams(draw).find(stream=>stream.layout.arrayStride===64));
+  assert.ok(matrixStreams.every(Boolean));assert.ok(matrixStreams.every(stream=>stream.layout.attributes.length===4));
+  assert.deepEqual(matrixStreams.map(stream=>[stream.values[12],stream.values[28]]),[[0,.5],[2,.5]]);
+  assert.deepEqual(draws.map(draw=>instanceStreams(draw).find(stream=>stream.layout.arrayStride===12).values.slice(0,4)),
+    [[.125,.5,.75,.25],[.875,.5,.75,.25]]);
+  assert.ok(draws.every(draw=>uniformBlocks(draw).every(words=>words.length<=16384)));
+  assert.equal(draws[0].pipeline,draws[1].pipeline);assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+test('ordinary instance colors upload before current node callbacks and retain history across graph replacement',async t=>{
+  const f=fixture(t),{mesh,colors}=cpuInstances(f,2);let next=.875;
+  const gain=T.TSL.uniform(1).onObjectUpdate(()=>{
+    if(next!==null){colors.array[0]=next;colors.needsUpdate=true;}return 1;
+  });
+  f.material.colorNode=f.tint.mul(gain);
+  await f.renderer.init();f.renderer.render(f.scene,f.camera);
+  next=null;f.renderer._nodes.nodeFrame.update();f.renderer.render(f.scene,f.camera);
+  colors.array[0]=99;
+  f.material.colorNode=T.TSL.vec3(.5,.75,1);f.renderer.render(f.scene,f.camera);
+  await drain(f.renderer);
+  const draws=nativeDraws(f.device);assert.equal(draws.length,3);
+  assert.deepEqual(draws.map(draw=>instanceStreams(draw)[0].values[0]),[.125,.875,.875]);
+  assert.notEqual(draws[1].pipeline,draws[2].pipeline);assert.equal(colors.array[0],99);
+  assert.equal(mesh.instanceColor,colors);assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+test('compileAsync preserves the initial instance-color upload without capturing a hidden instance',async t=>{
+  const f=fixture(t),{mesh,colors}=cpuInstances(f,2);
+  const hidden=new T.InstancedMesh(mesh.geometry,f.material,2);hidden.frustumCulled=false;hidden.visible=false;
+  for(let index=0;index<2;index++){
+    hidden.setMatrixAt(index,new T.Matrix4());hidden.setColorAt(index,new T.Color(.25,.5,.75));
+  }
+  f.scene.add(hidden);await f.renderer.compileAsync(f.scene,f.camera);
+  assert.equal(nativeDraws(f.device).length,0);
+  colors.array[0]=.875;hidden.instanceColor.array[0]=.625;hidden.visible=true;
+  f.renderer.render(f.scene,f.camera);await drain(f.renderer);
+  const draws=nativeDraws(f.device);assert.equal(draws.length,2);
+  assert.deepEqual(draws.map(draw=>instanceStreams(draw)[0].values[0]),[.125,.625]);
+  assert.equal(colors.version,0);assert.equal(hidden.instanceColor.version,0);
+  assert.equal(colors.array[0],.875);assert.equal(hidden.instanceColor.array[0],.625);
+  assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+test('graph replacement waits for submitted generated streams before retiring their GPU owner',async t=>{
+  const f=fixture(t);cpuInstances(f,2);await f.renderer.compileAsync(f.scene,f.camera);
+  let finish;f.device.completion=new Promise(resolve=>{finish=resolve;});
+  f.renderer.render(f.scene,f.camera);
+  const first=nativeDraws(f.device)[0],oldBuffer=instanceStreams(first)[0].buffer;
+  f.material.colorNode=T.TSL.vec3(.5,.75,1);f.renderer.render(f.scene,f.camera);
+  let settled=false;
+  const pending=drain(f.renderer).then(()=>{settled=true;return null;},error=>{settled=true;return error;});
+  try{
+    // Let pipeline preparation reach its retirement boundary while the first
+    // submission still holds the old geometry as an outstanding dependency.
+    await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(settled,false);assert.equal(nativeDraws(f.device).length,1);
+    assert.equal(oldBuffer.destroyed,false);
+    finish();assert.equal(await pending,null);await f.renderer.waitForGPU();
+    const draws=nativeDraws(f.device);assert.equal(draws.length,2);
+    assert.notEqual(draws[0].pipeline,draws[1].pipeline);assert.equal(oldBuffer.destroyed,true);
+    assert.deepEqual(draws.map(draw=>instanceStreams(draw)[0].values[0]),[.125,.125]);
+    assert.equal(f.renderer._nodeCaptureBytes,0);
+  }finally{finish();await pending;}
+});
+
 test('native InstancedMesh borrows compute matrices and colors while retaining queued counts and source normals',async t=>{
   const f=fixture(t);recordCompute(f.device);
   const {mesh,matrices,colors}=storageInstances(f),offsets=new T.StorageInstancedBufferAttribute(4,4);

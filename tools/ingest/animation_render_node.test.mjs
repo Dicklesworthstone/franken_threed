@@ -246,3 +246,38 @@ test(`multiple native UBOs preserve submitted byte histories and bundle reuse ($
   if(renderBundles){assert.equal(r.bundleDiagnostics.builds,1);assert.equal(r.bundleDiagnostics.reuses,1);}
   await r.whenIdle();r.dispose();gpu.dispose();
 });
+
+for(const renderBundles of [false,true])
+test(`generated instance vertex streams preserve queue history, counts and bundle reuse (${renderBundles})`,async()=>{
+  const d=geometryDevice(),s=source(),programAttributes=[...attributes];
+  const matrix={array:new Float32Array([...I(),...I(),...I()]),stride:16,version:0,meshPerAttribute:1,
+    isInstancedInterleavedBuffer:true,updateRanges:[],onUploadCallback(){},clearUpdateRanges(){this.updateRanges.length=0;}};
+  for(let column=0;column<4;column++) {
+    const name=`nodeMatrix${column}`;
+    s.attributes[name]={data:matrix,offset:column*4,itemSize:4,count:3,isInterleavedBufferAttribute:true};
+    programAttributes.push({name,location:column+1,locations:1,components:4,scalar:'float'});
+  }
+  const color={...attribute(new Float32Array([1,0,0,0,1,0]),3),isInstancedBufferAttribute:true,meshPerAttribute:1};
+  s.attributes.nodeColor=color;programAttributes.push({name:'nodeColor',location:5,locations:1,components:3,scalar:'float'});
+  const gpu=createGpuProgramGeometry(d,s,programAttributes),r=await createGpuAnimationRenderer(d,{maxDraws:1,renderBundles});
+  const mesh=await r.addMesh(gpu,{nodeProgram:{...descriptor(),attributes:programAttributes,instanceCapacity:3},raster:raster()});
+  const writes=d.writes.length;
+  assert.throws(()=>r.render(frame([{...draw(mesh,1),instanceCount:3}])),{code:'ANIMATION_RENDER_VALUE'});
+  assert.equal(d.writes.length,writes);assert.equal(d.submissions.length,0);assert.equal(r.failed,false);
+  for(const [submission,instanceCount] of [2,1,0,2].entries()) {
+    matrix.array[12]=submission+1;matrix.version++;
+    color.array[0]=submission+11;color.version++;gpu.update();
+    r.render(frame([{...draw(mesh,submission+1),instanceCount}]));
+    matrix.array[12]=99;color.array[0]=99;
+  }
+  assert.deepEqual(d.snapshots.map(draws=>draws.map(draw=>draw.args[1])),[[2],[1],[],[2]]);
+  for(const submission of [0,1,3]) {
+    const snapshot=d.snapshots[submission][0],matrixBytes=snapshot.contents.get(snapshot.streams.get(1));
+    const colorBytes=snapshot.contents.get(snapshot.streams.get(2));
+    assert.equal(new Float32Array(matrixBytes.buffer,matrixBytes.byteOffset)[12],submission+1);
+    assert.equal(new Float32Array(colorBytes.buffer,colorBytes.byteOffset)[0],submission+11);
+    assert.equal(snapshot.streams.size,3);assert.equal(snapshot.args[4],0);
+  }
+  if(renderBundles){assert.equal(r.bundleDiagnostics.builds,3);assert.equal(r.bundleDiagnostics.reuses,1);}
+  await r.whenIdle();r.dispose();gpu.dispose();
+});

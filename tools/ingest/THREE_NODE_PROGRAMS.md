@@ -1,7 +1,7 @@
 # Native TSL graphics programs
 
 The native `WebGPURenderer` facade can draw authored TSL graphs on ordinary
-meshes and storage-backed `InstancedMesh` objects. It retains the exact r186
+meshes and CPU- or storage-backed `InstancedMesh` objects. It retains the exact r186
 `WGSLNodeBuilder`, node classes, uniform packing
 and `NodeFrame`; FrankenThreeD owns the WebGPU pipelines, geometry residency,
 uniform buffers, command encoding and submission. The path does not construct an
@@ -202,14 +202,33 @@ count. Zero counts still run source node callbacks but emit no physical draw;
 direct and render-bundle paths retain the captured count. Negative source counts
 clamp to zero; admitted counts must fit an unsigned 32-bit integer.
 
-`InstancedMesh` can use the same authored materials when `instanceMatrix` is a
-Float32 `StorageInstancedBufferAttribute` with item size 16. Optional
-`instanceColor` must also use Float32 storage, with item size 3 or the source's
-padded size 4. The retained source builder applies each instance matrix to
-positions, transforms normals with its inverse transpose, and multiplies
-instance RGB into the material color. Authored `positionNode` runs after the
-instance transform, and its graph can read other storage through `instanceIndex`.
-No extra instance vertex stream or duplicate GPU allocation is introduced.
+`InstancedMesh` can use the same authored materials with ordinary Float32
+`InstancedBufferAttribute` matrices and optional RGB colors. The matrix item size
+is 16 and the color item size is 3, with instance divisor one. The pinned builder
+chooses a matrix uniform buffer when it fits the actual device binding limit;
+larger arrays use four `vec4` columns sharing one interleaved instance stream.
+Small matrix arrays capture current values on each draw without requiring
+`needsUpdate`. Large matrices and CPU colors preserve the source attribute's
+version, partial-update ranges and `DynamicDrawUsage` behavior.
+
+Float32 `StorageInstancedBufferAttribute` matrices and colors remain admitted,
+including the source's padded four-word RGB storage. CPU and storage inputs can
+be mixed. Compute-backed inputs borrow their existing GPU allocation; they never
+copy stale CPU arrays into separate graphics storage. The retained source
+builder applies each instance matrix to positions, transforms normals with its
+inverse transpose, and multiplies instance RGB into the material color.
+Authored `positionNode` runs after the instance transform, and its graph can read
+other storage through `instanceIndex`.
+
+Source-generated `BufferAttributeNode` scalar/vector streams from raw Float32
+arrays also use private captured geometry views. Ordinary geometry attributes
+remain live and can be replaced without being trapped in a stale private view.
+Generated streams require fixed, unshared arrays, unnormalized float input and
+the default upload callback. Public BufferAttribute/InterleavedBuffer inputs and
+compute-backed attribute conversion need additional shared-residency profiles;
+they are refused rather than allowing ordinary and generated consumers to
+diverge after partial updates. The pinned instance nodes' private derived
+matrix/color owners are admitted.
 
 The program records the smaller matrix/color capacity, or the matrix capacity
 when colors are absent. After node updates, the captured count must fit that
@@ -309,7 +328,21 @@ Replacement during before/current node updates is explicitly refused because
 the source-generated instance nodes retain their compiled attribute identities.
 After-update changes cannot replace the current draw's captured resources or
 count; a later render compiles against the new instance attributes. Objects
-sharing one material retain their own instance storage.
+sharing one material retain their own instance bindings. CPU capacity or backing
+array changes require replacing the attribute object: the pinned instance nodes
+cache their original CPU arrays. Replacing `.array` on an already captured CPU
+instance attribute fails explicitly instead of retaining a stale source closure.
+
+Generated vertex streams capture after source before-updates and before ordinary
+node updates, matching source geometry-upload order. A first upload captures the
+whole array without consuming its update ranges; later versioned or dynamic
+updates preserve unrequested bytes and consume the ranges. Each logical render
+retains immutable data even if later calls mutate or poison the public arrays.
+Source histories survive program replacement and retire on geometry/renderer
+disposal. `compileAsync()` establishes the initial upload history for visible
+generated streams at preparation without running application callbacks; hidden
+objects do not acquire that history until their first visible use. Replacing a
+program waits for submitted work before retiring its old GPU geometry owner.
 
 Instance culling still uses the source mesh's CPU `boundingSphere` before node
 updates. GPU writes do not refresh CPU matrices, bounds or raycasting data.
@@ -320,8 +353,9 @@ source setting.
 Captured graph descriptors, raster state, source list properties, draw ranges and
 uniform bytes survive later source edits. Material/geometry disposal invalidates
 the compiler cache, and subsequent graph or structural changes select a new
-program. Geometry arrays and attribute versions retain the existing bridge's
-live upload contract; this is not a deep snapshot of an entire mutable scene.
+program. Ordinary geometry arrays and attribute versions retain the existing
+bridge's live upload contract; generated streams use the captured histories
+above. This is not a deep snapshot of an entire mutable scene.
 GPU geometry uses the existing owner, while native uniform groups receive
 independent aligned slices. Later arena growth leaves earlier groups and bytes
 valid. Disposed or lost owners cannot publish pending pipelines, including
@@ -347,8 +381,7 @@ or integer texture graphs still require additional native profiles. Sampled
 texture capture transactions reject reentrant texture capture from node updates
 or upload callbacks.
 The profile excludes shader context extensions, fog/clipping/shadows, AO/light/material-environment
-maps, wireframe, alpha hashing and alpha-to-coverage; ordinary CPU instance
-matrix/color streams, `InstancedBufferGeometry`, skinned, batched or morph meshes,
+maps, wireframe, alpha hashing and alpha-to-coverage; `InstancedBufferGeometry`, skinned, batched or morph meshes,
 including per-instance morph textures; ArrayCamera, reversed depth and XR views;
 custom object/material render hooks and effectful attribute upload callbacks. A
 transparent DoubleSide graph currently requires `forceSinglePass: true`.
@@ -366,13 +399,14 @@ The implementation follows Three.js r186 source commit
 and `RenderList` ordering. Native opaque sorting uses depth and object identity,
 without WebGL's material-id sort key.
 
-The three owner/capture test files cover actual
+The owner/capture test files cover actual
 pinned shader generation and packing, callback contexts and frequencies,
 independent byte history, call-time selection/ranges, admission and budgets,
 pipeline failures, device loss and disposal:
 
 ```sh
 node tools/ingest/three_node_program.test.mjs
+node tools/ingest/three_node_attributes.test.mjs
 node tools/ingest/three_node_program_gpu.test.mjs
 node tools/ingest/three_node_scene_capture.test.mjs
 ```
@@ -462,6 +496,31 @@ The instanced-mesh and FIFO runs imported the current renderer modules directly
 and used the unchanged runner and scenarios for 30 frames. They validate native
 GPU execution against pinned r186 in that software-GPU environment. They do not
 include a fresh bundled-application build or a hardware performance measurement.
+
+The ordinary CPU `InstancedMesh` regressions cover small matrix uniform arrays,
+large four-column matrix streams, RGB colors, mixed CPU/storage inputs, inverse-
+transpose normals, dynamic and partial uploads, queued counts and immutable
+attribute snapshots. They also cover visible versus hidden compilation history,
+backing-array refusal, graph replacement while submitted GPU work is pending,
+and direct/bundle instance-capacity checks.
+
+`native_tsl_cpu_instanced_mesh` compares four lit targets against pinned r186,
+with final instance counts `[5, 3, 3, 2]`. Two targets use the small matrix-UBO
+path; two allocate one more matrix than the actual uniform binding limit permits
+and use generated interleaved columns. Both paths include nonuniform and mirrored
+transforms, frame-8 color/matrix updates, distinct queued target values and later
+CPU-array poisoning. Its Chrome 151 software-Vulkan direct-module comparison
+matched all 76,800 RGB pixels exactly: zero mismatches, zero mean difference and
+zero maximum difference, with 33 distinct colors in each image. The existing
+30-frame gate and 12-channel/2% thresholds were unchanged. There were no page,
+console, shader/pipeline or request errors. This is rendering correctness
+evidence, not a fresh bundled build or hardware performance measurement.
+The pixel capture includes the instance lifecycle fixes and the mapped-material
+merge at `7610a9a`. The later concurrent SunLight/PMREM-refresh merge at
+`11231f7d` passed the affected compiler, facade, scene-capture and environment
+suites. Its additional browser rerun could not load the application because the
+shared workspace exhausted disk/memory resources; that merged GPU result is not
+claimed.
 
 The environment and PMREM-background recording-device regressions cover initial
 source filtering, shared PBR/sky atlases, queued control values, mixed draw order,

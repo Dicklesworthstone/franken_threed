@@ -197,6 +197,10 @@ export function createThreeNodeProgramMeshes({device, format, depthFormat, sampl
         typeof nodeProgram.fragment !== 'string' || !Array.isArray(nodeProgram.groups) ||
         nodeProgram.groups.length > maxBindGroups)
       fail('ANIMATION_RENDER_OPTIONS', 'Expected a native node graphics program');
+    const instanceCapacity = nodeProgram.instanceCapacity ?? Infinity;
+    if (nodeProgram.instanceCapacity !== undefined &&
+        (!Number.isSafeInteger(instanceCapacity) || instanceCapacity < 0 || instanceCapacity > 0xffffffff))
+      fail('ANIMATION_RENDER_OPTIONS', 'Native node instance capacity must be a nonnegative 32-bit integer');
     if (topology !== 'triangles') fail('ANIMATION_RENDER_OPTIONS', 'Native node graphics currently draw triangle meshes');
     const groups = nodeProgram.groups.map(groupDescriptor);
     if (groups.reduce((count, group) => count + group.uniforms.length, 0) >
@@ -220,8 +224,8 @@ export function createThreeNodeProgramMeshes({device, format, depthFormat, sampl
       ...snapshotAnimationRaster(raster, {format, depthFormat})});
     colorTarget.assertBlend(state.blend);
     const geometry = programGeometrySnapshot(gpu, device);
-    if (geometry.channels.missing.length || geometry.instanced || geometry.layouts.some(layout => layout.stepMode === 'instance'))
-      fail('ANIMATION_RENDER_GEOMETRY', 'Native node graphics require complete ordinary vertex attributes');
+    if (geometry.channels.missing.length || geometry.instanced)
+      fail('ANIMATION_RENDER_GEOMETRY', 'Native node graphics require complete attributes on ordinary BufferGeometry');
     const geometrySignature = geometry.signature, layouts = geometry.layouts;
     // Capture all source-facing values before registrations or pipeline work
     // can yield. Older program records/groups survive arena growth unchanged.
@@ -256,7 +260,7 @@ export function createThreeNodeProgramMeshes({device, format, depthFormat, sampl
       if (issued.error) throw issued.error;
       live();
     } catch (error) { issued.errors.catch(() => {}); throw error; }
-    const record = {nodeProgram: true, gpu, groups, uniformBindings, bindGroupLayouts, geometrySignature,
+    const record = {nodeProgram: true, gpu, groups, uniformBindings, bindGroupLayouts, geometrySignature, instanceCapacity,
       resourceCount: groups.reduce((sum, group) => sum + group.resources.length, 0),
       pipelines: {normal: pipelines[0], flipped: pipelines[1]},
       blended: !!state.blend, alphaMode: state.blend ? 'BLEND' : 'OPAQUE',
@@ -281,8 +285,11 @@ export function createThreeNodeProgramMeshes({device, format, depthFormat, sampl
       fail('ANIMATION_RENDER_VALUE', 'Native node draws need one owned uniform byte packet per native group');
     const resources = snapshotResources(record, input);
     const geometry = programGeometrySnapshot(record.gpu, device);
-    if (geometry.signature !== record.geometrySignature)
+    if (geometry.signature !== record.geometrySignature || geometry.instanced)
       fail('ANIMATION_RENDER_GEOMETRY', 'Native node geometry layout changed; register it again');
+    const instanceCount = input.instanceCount ?? 1;
+    if (instanceCount > Math.min(record.instanceCapacity, geometry.instanceCapacity ?? Infinity))
+      fail('ANIMATION_RENDER_VALUE', 'Native node instance count exceeds the captured object or vertex stream capacity');
     const extent = geometry.indexBuffer ? geometry.indexCount : geometry.vertexCount;
     // A facade request already selected its source range synchronously. Later
     // drawRange edits must not replace that history during pipeline preparation.
@@ -303,7 +310,7 @@ export function createThreeNodeProgramMeshes({device, format, depthFormat, sampl
       pipeline: input.frontFaceCW ? record.pipelines.flipped : record.pipelines.normal,
       nodeProgram: {groups}, vertexBuffers: geometry.vertexBuffers,
       indexBuffer: geometry.indexBuffer, indexFormat: geometry.indexFormat,
-      instanceCount: input.instanceCount ?? 1, instanceBindGroup: null, blendConstant: record.blendConstant, stencilReference: record.stencilReference});
+      instanceCount, instanceBindGroup: null, blendConstant: record.blendConstant, stencilReference: record.stencilReference});
     return geometry;
   }
   return Object.freeze({add, stage, prepare,

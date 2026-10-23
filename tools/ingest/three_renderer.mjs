@@ -722,6 +722,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     }
     _submit({scene, camera, frame, destination, mipLevel = 0, programFrame, snapshot, overrideMaterial, matricesUpdated, nodeFrame, deferred = false}) {
       snapshot?.install();
+      nodeFrame?.installAttributes?.();
       const previous = this._programFrame;
       // Immediate source callbacks must still be able to change live program
       // state. Only deferred calls need the queued renderer-state snapshot.
@@ -862,6 +863,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         destination._preparationOptions = request ? {overrideMaterial: request.overrideMaterial, nodeFrame: request.nodeFrame} : undefined;
         try {
           request?.snapshot?.install();
+          captured?.prepareAttributes?.();
+          captured?.installAttributes?.();
           if (destination !== this) {
             this._targets.ensure(destination);
             if (!destination._dispatcher) createDispatcher(this, destination)(this._device, destination.storage.rendererOptions, {signal: destination.lifetime.signal});

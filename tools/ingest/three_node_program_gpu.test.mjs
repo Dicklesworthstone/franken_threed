@@ -5,7 +5,8 @@ import assert from 'node:assert/strict';
 import {createThreeNodeProgramMeshes} from './three_node_program_gpu.mjs';
 import {createGpuProgramGeometry} from './gpu_buffer_geometry.mjs';
 const fail = (code, message) => { throw Object.assign(Error(message), {code}); };
-function rig(t, {maxDraws = 8, maxUniformBytes = 4 * 1024 * 1024, maxBindGroups = 4, maxBufferSize = 1 << 22} = {}) {
+function rig(t, {maxDraws = 8, maxUniformBytes = 4 * 1024 * 1024, maxBindGroups = 4, maxBufferSize = 1 << 22,
+  configureGeometry = () => {}} = {}) {
   const buffers = [], bindGroups = [], pipelines = [], writes = [];
   let resolveLost, releasePipelines = null, pipelineGate = Promise.resolve(), pipelineError = null, scopeError = null;
   const device = {features: new Set(), limits: {maxBufferSize, maxUniformBufferBindingSize: 65536,
@@ -39,6 +40,7 @@ function rig(t, {maxDraws = 8, maxUniformBytes = 4 * 1024 * 1024, maxBindGroups 
     index: {array: new Uint16Array([0, 1, 2]), itemSize: 1, count: 3, version: 0, normalized: false,
       updateRanges: [], clearUpdateRanges() {}, onUploadCallback() {}}, drawRange: {start: 0, count: 3}};
   const attributes = [{name: 'position', location: 0, locations: 1, components: 3, scalar: 'float'}];
+  configureGeometry(source, attributes);
   const gpu = createGpuProgramGeometry(device, source, attributes);
   const owner = createThreeNodeProgramMeshes({device, format: 'rgba8unorm', depthFormat: 'depth24plus',
     sampleCount: 1, maxDraws, label: 'native-node-test', fail, scoped, maxUniformBytes, maxBindGroups});
@@ -472,4 +474,71 @@ test('the pipeline dynamic UBO limit counts bindings across source groups and sh
   assert.equal(f.buffers.length, before);
   f.device.limits.maxDynamicUniformBuffersPerPipelineLayout = 2;
   await f.add([], {nodeProgram: program});
+});
+
+function generatedInstanceRig(t, options = {}) {
+  return rig(t, {...options, configureGeometry(source, attributes) {
+    const matrix = {array: new Float32Array(48), stride: 16, version: 0, meshPerAttribute: 1,
+      isInstancedInterleavedBuffer: true, updateRanges: [], clearUpdateRanges() { this.updateRanges.length = 0; }, onUploadCallback() {}};
+    for (let instance = 0; instance < 3; instance++) {
+      for (let diagonal = 0; diagonal < 4; diagonal++) matrix.array[instance * 16 + diagonal * 5] = 1;
+      matrix.array[instance * 16 + 12] = instance + 1;
+    }
+    for (let column = 0; column < 4; column++) {
+      const name = `nodeMatrix${column}`;
+      source.attributes[name] = {data: matrix, offset: column * 4, itemSize: 4, count: 3,
+        normalized: false, isInterleavedBufferAttribute: true};
+      attributes.push({name, location: column + 1, locations: 1, components: 4, scalar: 'float'});
+    }
+    source.attributes.nodeColor = {array: new Float32Array([1, 0, 0, 0, 1, 0]), itemSize: 3, count: 2,
+      version: 0, isInstancedBufferAttribute: true, meshPerAttribute: 1, updateRanges: [],
+      clearUpdateRanges() { this.updateRanges.length = 0; }, onUploadCallback() {}};
+    attributes.push({name: 'nodeColor', location: 5, locations: 1, components: 3, scalar: 'float'});
+  }});
+}
+
+test('generated matrix columns and colors use instance streams with the smallest current capacity', async t => {
+  const f = generatedInstanceRig(t, {maxDraws: 1}), program = {...f.program([16]), instanceCapacity: 3};
+  const record = await f.add([], {nodeProgram: program}), layouts = record.pipelines.normal.vertex.buffers;
+  assert.deepEqual(layouts.map(layout => [layout.stepMode, layout.arrayStride]), [['vertex', 12], ['instance', 64], ['instance', 12]]);
+  assert.deepEqual(layouts[1].attributes.map(attribute => [attribute.shaderLocation, attribute.offset]), [[1, 0], [2, 16], [3, 32], [4, 48]]);
+  assert.throws(() => f.stage(record, [1], {instanceCount: 3}), {code: 'ANIMATION_RENDER_VALUE'});
+  assert.equal(f.owner.uniformDiagnostics.draws, 0);
+  const first = f.stage(record, [1], {instanceCount: 2});
+  assert.equal(first.instanceCount, 2); assert.equal(first.vertexBuffers.length, 3);
+  assert.equal(new Float32Array(first.vertexBuffers[1].bytes.buffer)[28], 2);
+  assert.deepEqual([...new Float32Array(first.vertexBuffers[2].bytes.buffer)], [1, 0, 0, 0, 1, 0]);
+  f.owner.begin(); f.source.attributes.nodeColor.count = 1; f.gpu.update();
+  assert.throws(() => f.stage(record, [2], {instanceCount: 2}), {code: 'ANIMATION_RENDER_VALUE'});
+  assert.equal(f.stage(record, [2], {instanceCount: 1}).instanceCount, 1);
+  f.owner.begin(); f.source.attributes.nodeColor.count = 0; f.gpu.update();
+  assert.equal(f.stage(record, [3], {instanceCount: 0}).instanceCount, 0);
+});
+
+test('captured object capacities survive descriptor edits while uncapped Mesh.count remains available', async t => {
+  const f = rig(t), allocated = f.buffers.length;
+  for (const instanceCapacity of [-1, .5, NaN, Infinity, null, 0x100000000])
+    await assert.rejects(f.add([16], {nodeProgram: {...f.program([16]), instanceCapacity}}), {code: 'ANIMATION_RENDER_OPTIONS'});
+  assert.equal(f.buffers.length, allocated);
+  const release = f.holdPipelines(), program = {...f.program([16]), instanceCapacity: 1};
+  const pending = f.add([], {nodeProgram: program}); program.instanceCapacity = 100;
+  release(); const record = await pending;
+  assert.throws(() => f.stage(record, [1], {instanceCount: 2}), {code: 'ANIMATION_RENDER_VALUE'});
+  assert.equal(f.owner.uniformDiagnostics.draws, 0); assert.equal(f.stage(record, [1]).instanceCount, 1);
+  const ordinary = await f.add([16]);
+  assert.equal(f.stage(ordinary, [2], {instanceCount: 19}).instanceCount, 19);
+  const empty = await f.add([], {nodeProgram: {...f.program([16]), instanceCapacity: 0}});
+  assert.throws(() => f.stage(empty, [3]), {code: 'ANIMATION_RENDER_VALUE'});
+  assert.equal(f.stage(empty, [3], {instanceCount: 0}).instanceCount, 0);
+});
+
+test('generated instance streams do not admit InstancedBufferGeometry or later geometry flag changes', async t => {
+  const f = generatedInstanceRig(t);
+  f.source.isInstancedBufferGeometry = true; f.gpu.update();
+  await assert.rejects(f.add([16]), {code: 'ANIMATION_RENDER_GEOMETRY'});
+  f.source.isInstancedBufferGeometry = false; f.gpu.update();
+  const record = await f.add([16]);
+  f.source.isInstancedBufferGeometry = true; f.gpu.update();
+  assert.throws(() => f.stage(record, [1], {instanceCount: 1}), {code: 'ANIMATION_RENDER_GEOMETRY'});
+  assert.equal(f.owner.uniformDiagnostics.draws, 0);
 });

@@ -8,7 +8,8 @@ function rig(t, options = {}) {
   const frame = new THREE.NodeFrame();
   const renderer = {library: new THREE.StandardNodeLibrary(), contextNode: N.context(),
     debug: {diagnostics: {keywords: false}}, depth: true, lighting: {enabled: true},
-    backend: {hasFeature: () => false, utils: {getTextureSampleData: () => ({samples: 1, primarySamples: 1, isMSAA: false})}},
+    backend: {hasFeature: () => false, utils: {getTextureSampleData: () => ({samples: 1, primarySamples: 1, isMSAA: false})},
+      capabilities: {getUniformBufferLimit: () => renderer._device?.limits?.maxUniformBufferBindingSize ?? 65536}},
     hasFeature: () => false, getRenderTarget: () => null,
     getMRT: () => null, currentSamples: 1, _nodes: {nodeFrame: frame}, info: {calls: 1}};
   const owner = createThreeNodePrograms({three: THREE, renderer, ...options}); t.after(() => owner.dispose());
@@ -58,6 +59,16 @@ function instanceRig(t, Material = THREE.MeshBasicNodeMaterial, colorStride = 4)
   const object = new THREE.InstancedMesh(f.object.geometry, material, 4);
   object.instanceMatrix = new THREE.StorageInstancedBufferAttribute(object.instanceMatrix.array, 16);
   object.instanceColor = new THREE.StorageInstancedBufferAttribute(3, colorStride); object.count = 3;
+  f.scene.remove(f.object); f.scene.add(object); f.scene.updateMatrixWorld();
+  const context = {...f.context, object, material, lights: []};
+  return {...f, material, object, context, compile: () => f.owner.compile(material, object, context)};
+}
+function cpuInstanceRig(t, {Material = THREE.MeshBasicNodeMaterial, count = 4, colors = 3, uniformLimit = 65536} = {}) {
+  const f = rig(t), material = new Material();
+  material.colorNode = f.tint; material.positionNode = N.positionLocal.add(N.vec3(f.shift, 0, 0));
+  const object = new THREE.InstancedMesh(f.object.geometry, material, count);
+  if (colors) object.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(colors * 3).fill(.5), 3);
+  object.count = Math.min(count, colors || count); f.renderer._device = {limits: {maxUniformBufferBindingSize: uniformLimit}};
   f.scene.remove(f.object); f.scene.add(object); f.scene.updateMatrixWorld();
   const context = {...f.context, object, material, lights: []};
   return {...f, material, object, context, compile: () => f.owner.compile(material, object, context)};
@@ -693,6 +704,188 @@ for (const Material of [THREE.MeshBasicNodeMaterial, THREE.MeshStandardNodeMater
     assert.equal(f.object.instanceColor.itemSize, 3, 'graphics does not normalize or upload source storage');
   });
 }
+for (const Material of [THREE.MeshBasicNodeMaterial, THREE.MeshLambertNodeMaterial]) {
+  test(`${Material.name} CPU instances retain source matrix uniforms, normals and captured RGB streams`, t => {
+    const f = cpuInstanceRig(t, {Material}), d = f.compile(), view = f.owner.geometry(d);
+    const generated = d.attributes.filter(attribute => !f.object.geometry.attributes[attribute.name]);
+    assert.equal(d.instanceCapacity, 3); assert.equal(generated.length, 1);
+    assert.match(d.vertex, /array< mat4x4<f32>, 4 >/); assert.match(d.vertex, /@builtin\( instance_index \)/);
+    assert.match(d.vertex, /normalLocal = normalize\(.*transpose\( tsl_inverse_mat3/);
+    assert.match(d.vertex, /varyings\.vInstanceColor = /); assert.match(d.fragment, /vInstanceColor/);
+    assert.equal(view.geometry, f.object.geometry); assert.equal(view.attributes.position, f.object.geometry.attributes.position);
+    assert.equal(f.owner.attributeBytes(d), 36);
+    const draw = f.owner.captureDraw(d, f.context); assert.equal(draw.storage.length, 0); assert.equal(draw.attributes.bytes, 36);
+    f.object.instanceColor.array.fill(.875); draw.attributes.install();
+    const privateColor = view.attributes[generated[0].name];
+    assert.equal(privateColor.isInstancedBufferAttribute, true); assert.notEqual(privateColor, f.object.instanceColor);
+    assert.notEqual(privateColor.array, f.object.instanceColor.array); assert.deepEqual(Array.from(privateColor.array), Array(9).fill(.5));
+    assert.equal(f.compile(), d, 'unmarked CPU value edits are data, not graph structure');
+    f.object.count = 0; assert.equal(f.compile(), d);
+  });
+}
+test('large CPU instance matrices use four source columns sharing one captured interleaved owner', t => {
+  const f = cpuInstanceRig(t, {count: 5, uniformLimit: 256}), d = f.compile(), view = f.owner.geometry(d);
+  const generated = d.attributes.filter(attribute => !f.object.geometry.attributes[attribute.name]);
+  const columns = generated.filter(attribute => attribute.components === 4).map(attribute => view.attributes[attribute.name]);
+  assert.equal(generated.length, 5); assert.equal(columns.length, 4); assert.equal(new Set(columns.map(attribute => attribute.data)).size, 1);
+  assert.deepEqual(columns.map(attribute => attribute.offset), [0, 4, 8, 12]);
+  assert.equal(columns[0].data.stride, 16); assert.equal(columns[0].data.isInstancedInterleavedBuffer, true);
+  assert.doesNotMatch(d.vertex, /array< mat4x4<f32>, 5 >/); assert.equal(d.instanceCapacity, 3);
+  assert.equal(f.owner.attributeBytes(d), 5 * 64 + 36);
+  const first = f.owner.captureDraw(d, f.context), saved = f.object.instanceMatrix.array.slice();
+  f.object.instanceMatrix.array.fill(7); f.object.instanceMatrix.needsUpdate = true;
+  const second = f.owner.captureDraw(d, {...f.context, frameId: 2, renderId: 2});
+  first.attributes.install(); assert.deepEqual(columns[0].data.array, saved);
+  second.attributes.install(); assert.deepEqual(Array.from(columns[0].data.array), Array(80).fill(7));
+  assert.notEqual(columns[0].data.array, f.object.instanceMatrix.array);
+  assert.deepEqual(Array.from(f.object.instanceMatrix.array), Array(80).fill(7), 'install never rewrites the public source');
+});
+test('ordinary and storage-backed instance matrices and colors can be mixed without extra owners', t => {
+  const f = cpuInstanceRig(t), cpuMatrix = f.object.instanceMatrix;
+  f.object.instanceColor = new THREE.StorageInstancedBufferAttribute(3, 4);
+  const uniform = f.compile(), first = f.owner.captureDraw(uniform, f.context);
+  assert.equal(f.owner.attributeBytes(uniform), 0); assert.equal(first.attributes, null); assert.equal(f.owner.geometry(uniform), f.object.geometry);
+  assert.match(uniform.vertex, /array< mat4x4<f32>, 4 >/); assert.equal(first.storage[0].attribute, f.object.instanceColor);
+  f.object.instanceMatrix = new THREE.StorageInstancedBufferAttribute(cpuMatrix.array, 16);
+  f.object.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(9), 3);
+  const storage = f.compile(), second = f.owner.captureDraw(storage, {...f.context, frameId: 2, renderId: 2});
+  assert.equal(second.storage.length, 1); assert.equal(second.storage[0].attribute, f.object.instanceMatrix);
+  assert.equal(second.attributes.bytes, 36); assert.equal(storage.instanceCapacity, 3);
+  f.object.instanceMatrix = cpuMatrix; f.object.instanceColor = null;
+  const plain = f.compile(); assert.equal(plain.instanceCapacity, 4); assert.equal(f.owner.attributeBytes(plain), 0);
+  assert.equal(f.owner.captureDraw(plain, {...f.context, frameId: 3, renderId: 3}).attributes, null);
+});
+test('generated attributes capture after before-updates and before current node updates', t => {
+  const f = rig(t), color = N.bufferAttribute(new Float32Array(12).fill(.25), 'vec3'), gain = N.uniform(1);
+  let source, before = 0, current = 0;
+  gain.updateBeforeType = 'object'; gain.updateBefore = () => { before++; source.array.fill(.5); source.needsUpdate = true; };
+  gain.updateType = 'object'; gain.update = () => { current++; source.array.fill(.75); source.needsUpdate = true; };
+  f.material.colorNode = color.mul(gain);
+  const d = f.compile(), view = f.owner.geometry(d), name = d.attributes.find(attribute => !f.object.geometry.attributes[attribute.name]).name;
+  source = color.attribute.data;
+  const draw = f.owner.captureDraw(d, f.context); draw.attributes.install();
+  assert.equal(before, 1); assert.equal(current, 1);
+  assert.deepEqual(Array.from(view.attributes[name].data.array), Array(12).fill(.5));
+  assert.deepEqual(Array.from(source.array), Array(12).fill(.75));
+  assert.match(d.vertex, new RegExp(`@location\\( ${d.attributes.find(attribute => attribute.name === name).location} \\) ${name} : vec3<f32>`));
+});
+test('public direct attribute inputs refuse before callbacks or consuming shared update ranges', t => {
+  for (const deferred of [false, true]) {
+    const f = rig(t), source = new THREE.Float32BufferAttribute(new Float32Array(12).fill(.25), 3), gain = N.uniform(1);
+    let updates = 0; gain.updateBeforeType = 'object'; gain.updateBefore = () => { updates++; };
+    gain.updateType = 'object'; gain.update = () => { updates++; };
+    f.object.geometry.setAttribute('color', source); f.material.vertexColors = true;
+    const graph = () => N.bufferAttribute(source).mul(gain);
+    f.material.colorNode = deferred ? N.Fn(graph)() : graph();
+    source.addUpdateRange(0, 3); source.needsUpdate = true;
+    assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_ATTRIBUTE'});
+    assert.equal(updates, 0); assert.equal(f.owner.diagnostics.programs, 0);
+    assert.deepEqual(source.updateRanges, [{start: 0, count: 3}]);
+    assert.deepEqual(Array.from(source.array), Array(12).fill(.25));
+  }
+  const f = cpuInstanceRig(t), original = f.object.instanceColor;
+  original.addUpdateRange(0, 3); original.needsUpdate = true;
+  f.material.colorNode = N.instancedBufferAttribute(original, 'vec3', 3, 0);
+  assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_ATTRIBUTE'}, 'the original instance input is not its separate source-derived owner');
+  assert.deepEqual(original.updateRanges, [{start: 0, count: 3}]);
+});
+test('public interleaved attribute inputs refuse before callbacks or consuming shared update ranges', t => {
+  for (const deferred of [false, true]) {
+    const f = rig(t), source = new THREE.InterleavedBuffer(new Float32Array(24).fill(.25), 6), gain = N.uniform(1);
+    const position = new THREE.InterleavedBufferAttribute(source, 3, 0), color = new THREE.InterleavedBufferAttribute(source, 3, 3);
+    let updates = 0; gain.updateBeforeType = 'object'; gain.updateBefore = () => { updates++; };
+    gain.updateType = 'object'; gain.update = () => { updates++; };
+    f.object.geometry.setAttribute('position', position); f.object.geometry.setAttribute('color', color);
+    f.material.vertexColors = true;
+    const graph = () => N.bufferAttribute(source, 'vec3', 6, 3).mul(gain);
+    f.material.colorNode = deferred ? N.Fn(graph)() : graph();
+    source.addUpdateRange(3, 3); source.needsUpdate = true;
+    assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_ATTRIBUTE'});
+    assert.equal(updates, 0); assert.equal(f.owner.diagnostics.programs, 0);
+    assert.deepEqual(source.updateRanges, [{start: 3, count: 3}]);
+    assert.deepEqual(Array.from(source.array), Array(24).fill(.25));
+    assert.equal(f.object.geometry.attributes.position, position); assert.equal(f.object.geometry.attributes.color, color);
+  }
+});
+test('small CPU matrix uniforms see current updates while RGB attributes keep the preceding geometry upload', t => {
+  const f = cpuInstanceRig(t); let calls = 0;
+  f.material.opacityNode = N.uniform(1).onObjectUpdate(() => {
+    calls++; f.object.instanceMatrix.array[12] = calls / 4;
+    f.object.instanceColor.array.fill(calls / 4); f.object.instanceColor.needsUpdate = true; return 1;
+  });
+  const d = f.compile(), view = f.owner.geometry(d), color = d.attributes.find(attribute => !f.object.geometry.attributes[attribute.name]);
+  const first = f.owner.captureDraw(d, f.context); first.attributes.install();
+  assert.deepEqual(Array.from(view.attributes[color.name].array), Array(9).fill(.5));
+  assert.ok(floats(first.uniforms).includes(.25));
+  const second = f.owner.captureDraw(d, {...f.context, frameId: 2, renderId: 2}); second.attributes.install();
+  assert.deepEqual(Array.from(view.attributes[color.name].array), Array(9).fill(.25));
+  assert.ok(floats(second.uniforms).includes(.5)); assert.equal(calls, 2);
+});
+test('CPU instance replacements rebuild source closures while existing captured streams remain usable', t => {
+  const f = cpuInstanceRig(t), d = f.compile(), oldView = f.owner.geometry(d), first = f.owner.captureDraw(d, f.context);
+  const name = d.attributes.find(attribute => !f.object.geometry.attributes[attribute.name]).name;
+  f.object.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(6).fill(.75), 3);
+  assert.throws(() => f.owner.captureDraw(d, f.context), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  const next = f.compile(); assert.notEqual(next, d); assert.equal(next.instanceCapacity, 2);
+  const second = f.owner.captureDraw(next, {...f.context, frameId: 2, renderId: 2});
+  second.attributes.install(); first.attributes.install();
+  assert.deepEqual(Array.from(oldView.attributes[name].array), Array(9).fill(.5));
+  f.object.instanceMatrix.array = f.object.instanceMatrix.array.slice();
+  assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  assert.throws(() => f.owner.captureDraw(next, f.context), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  f.object.instanceMatrix = new THREE.InstancedBufferAttribute(f.object.instanceMatrix.array, 16);
+  assert.notEqual(f.compile(), next, 'replacing the source attribute builds a fresh matrix closure');
+  f.object.instanceColor.array = f.object.instanceColor.array.slice();
+  assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_CHANGED'});
+});
+test('generated Float32 nodes retain private history across recompiles and reject stale input aliases', t => {
+  const f = rig(t), array = new Float32Array(12).fill(.25), color = N.bufferAttribute(array, 'vec3');
+  f.material.colorNode = color;
+  const d = f.compile(), first = f.owner.captureDraw(d, f.context), view = f.owner.geometry(d);
+  const name = d.attributes.find(attribute => !f.object.geometry.attributes[attribute.name]).name;
+  first.attributes.install(); array.fill(.875); f.material.opacityNode = N.uniform(.75);
+  const changed = f.compile(), second = f.owner.captureDraw(changed, {...f.context, renderId: 2}); second.attributes.install();
+  const nextName = changed.attributes.find(attribute => !f.object.geometry.attributes[attribute.name]).name;
+  const nextAttribute = f.owner.geometry(changed).attributes[nextName];
+  assert.deepEqual(Array.from(nextAttribute.data.array), Array(12).fill(.25), 'source upload history survives shader replacement');
+  first.attributes.install(); assert.deepEqual(Array.from(view.attributes[name].data.array), Array(12).fill(.25));
+  color.value = new Float32Array(12);
+  assert.throws(() => f.owner.captureDraw(changed, f.context), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  f.material.colorNode = N.bufferAttribute(color.value, 'vec3'); assert.doesNotThrow(f.compile);
+});
+test('generated attribute shape and range guards run before, between and after source callbacks', t => {
+  for (const boundary of ['before', 'current', 'preflight']) {
+    const f = rig(t), color = N.bufferAttribute(new Float32Array(12), 'vec3');
+    const gain = N.uniform(1); let before = 0, current = 0;
+    gain.updateBeforeType = 'object'; gain.updateBefore = () => { before++; if (boundary === 'before') color.attribute.itemSize = 2; };
+    gain.updateType = 'object'; gain.update = () => { current++; if (boundary === 'current') color.attribute.itemSize = 2; };
+    f.material.colorNode = color.mul(gain); const d = f.compile();
+    if (boundary === 'preflight') color.attribute.itemSize = 2;
+    assert.throws(() => f.owner.captureDraw(d, f.context), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+    assert.equal(before, boundary === 'preflight' ? 0 : 1); assert.equal(current, boundary === 'current' ? 1 : 0);
+  }
+  const f = rig(t), color = N.bufferAttribute(new Float32Array(12), 'vec3'); let updates = 0;
+  f.material.colorNode = color.mul(N.uniform(1).onObjectUpdate(() => { updates++; return 1; }));
+  const d = f.compile(); color.attribute.data.addUpdateRange(11, 2);
+  assert.throws(() => f.owner.captureDraw(d, f.context), {code: 'THREE_NODE_PROGRAM_ATTRIBUTE'}); assert.equal(updates, 0);
+});
+test('generated streams reject unsupported data and hooks before node callbacks', t => {
+  for (const source of [new Uint32Array(12), new Float32Array(new SharedArrayBuffer(48)),
+    new Float32Array(new ArrayBuffer(48, {maxByteLength: 96}))]) {
+    const f = rig(t); let updates = 0;
+    f.material.colorNode = N.bufferAttribute(source, 'vec3').mul(N.uniform(1).onObjectUpdate(() => { updates++; return 1; }));
+    assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_ATTRIBUTE'}); assert.equal(updates, 0);
+  }
+  const f = rig(t), color = N.bufferAttribute(new Float32Array(12), 'vec3'); f.material.colorNode = color;
+  f.compile(); color.attribute.normalized = true;
+  assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_ATTRIBUTE'});
+  color.attribute.normalized = false; color.attribute.data.onUpload(() => {});
+  assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_HOOK'});
+  color.attribute.data.onUploadCallback = THREE.InterleavedBuffer.prototype.onUploadCallback;
+  f.material.fragmentNode = N.Fn(() => { color.assign(N.vec3(1)); return N.vec4(1); })();
+  assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_ATTRIBUTE'});
+});
 test('instance graph keys retain data/count updates but rebuild captured matrix/color identities and capacities', t => {
   const f = instanceRig(t, THREE.MeshBasicNodeMaterial, 3), d = f.compile();
   f.object.instanceMatrix.array[12] = .25; f.object.instanceMatrix.needsUpdate = true;
@@ -730,10 +923,13 @@ test('instance replacements during source updates fail before stale generated bi
   assert.throws(() => f.owner.captureDraw(current, {...f.context, renderId: 3}), {code: 'THREE_NODE_PROGRAM_OBJECT'});
   assert.equal(updates, 2);
 });
-test('instance admission refuses CPU streams, malformed storage and deformation before node updates', t => {
+test('instance admission refuses malformed CPU/storage streams and deformation before node updates', t => {
   for (const [change, code] of [
-    [object => { object.instanceMatrix = new THREE.InstancedBufferAttribute(new Float32Array(64), 16); }, 'OBJECT'],
-    [object => { object.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(9), 3); }, 'OBJECT'],
+    [object => { object.instanceMatrix = new THREE.InstancedBufferAttribute(new Float32Array(64), 4); }, 'OBJECT'],
+    [object => { object.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(12), 4); }, 'OBJECT'],
+    [object => { object.instanceMatrix = new THREE.InstancedBufferAttribute(new Uint32Array(64), 16); }, 'OBJECT'],
+    [object => { object.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(9), 3, false, 2); }, 'OBJECT'],
+    [object => { object.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(9), 3); object.instanceColor.onUpload(() => {}); }, 'HOOK'],
     [object => { object.instanceMatrix = new THREE.StorageInstancedBufferAttribute(4, 4); }, 'STORAGE'],
     [object => { object.instanceMatrix = new THREE.StorageInstancedBufferAttribute(4, 16, Uint32Array); }, 'STORAGE'],
     [object => { object.instanceColor = new THREE.StorageInstancedBufferAttribute(3, 2); }, 'STORAGE'],
@@ -764,7 +960,7 @@ for (const [name, change, code] of [
   ['depth texture graph', f => { f.material.colorNode = N.texture(new THREE.DepthTexture(1, 1)); }, 'TEXTURE'],
   ['atomic storage graph', f => { f.material.colorNode = N.storage(new THREE.StorageBufferAttribute(4, 1, Uint32Array), 'uint', 4).toAtomic().element(0).toFloat(); }, 'STORAGE'],
   ['managed uniform array graph', f => { f.material.colorNode = N.uniformArray([new THREE.Vector4(1, 0, 0, 1)]).element(0).xyz; }, 'STORAGE'],
-  ['buffer attribute graph', f => { f.material.colorNode = N.bufferAttribute(new THREE.Float32BufferAttribute(new Float32Array(12), 3)); }, 'STORAGE'],
+  ['compute-backed buffer attribute graph', f => { f.material.colorNode = N.bufferAttribute(new THREE.StorageBufferAttribute(4, 3)); }, 'ATTRIBUTE'],
   ['material environment texture', f => { f.material.envMap = new THREE.Texture(); }, 'TEXTURE'],
   ['MRT graph', f => { f.material.fragmentNode = N.mrt({output: N.vec4(1)}); }, 'MRT'],
   ['lighting slot', f => { f.material.lightsNode = N.vec3(1); }, 'GRAPH'],

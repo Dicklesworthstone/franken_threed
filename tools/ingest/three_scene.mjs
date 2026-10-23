@@ -1031,7 +1031,7 @@ export async function createGpuThreeScene(device,scene,{
     if(passNodeFrame)for(const binding of passNodeFrame.bindings){
       usedGeometry.add(binding.geometry);
       out.push({key:binding.object,geometry:binding.geometry,instanceSource:null,instanceSignature:null,deformationSource:null,
-        material:binding.material,desc:nodeDescription(binding),programSource:binding.geometry});
+        material:binding.material,desc:nodeDescription(binding),programSource:binding.programGeometry??binding.geometry});
     }
     const bg=programBackground();
     if(bg)for(const desc of get(bg.material,'triangles',bg))out.push({key:programKeyOf(bg),geometry:bg.geometry,instanceSource:null,instanceSignature:null,deformationSource:null,material:bg.material,desc,programSource:programSource(bg)});
@@ -1275,8 +1275,10 @@ export async function createGpuThreeScene(device,scene,{
       // then recheck source structure after this additional asynchronous boundary.
       const usedGeometry=new Set(next.filter(e=>!e.deformation).map(e=>e.geometry)),usedInstances=new Set(next.map(e=>e.instanceSource));
       const usedDeformations=new Set(next.map(e=>e.deformation).filter(Boolean));
+      const usedProgramGpus=new Set(next.map(e=>e.programGeometry).filter(Boolean));
       if([...geometries.keys()].some(g=>!usedGeometry.has(g))||[...instances.keys()].some(s=>!usedInstances.has(s))||
           [...deformations.values()].some(g=>!usedDeformations.has(g))||
+          [...programGeometries.values()].some(byKey=>[...byKey.values()].some(gpu=>!usedProgramGpus.has(gpu)))||
           (shadowOwner&&(shadowOwner!==nextShadow||[...casters.keys()].some(e=>!nextCasters.has(e))))||
           (environmentOwner&&environmentOwner!==nextEnvironment)||(backgroundOwner&&backgroundOwner!==nextBackground)){
         await bridge.whenIdle();live();

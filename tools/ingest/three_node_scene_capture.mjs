@@ -102,7 +102,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     camera.coordinateSystem = three.WebGPUCoordinateSystem; camera.updateProjectionMatrix();
   }
   if (camera.parent === null && camera.matrixWorldAutoUpdate === true) camera.updateMatrixWorld();
-  const opaque = [], translucent = [], backgroundDraws = [], draws = [], lights = [];
+  const opaque = [], translucent = [], backgroundDraws = [], draws = [], lights = [], preparationBindings = new Set();
   let fixedDrawCandidates = false;
   {
     const projection = new three.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
@@ -111,6 +111,8 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     const visible = [{object: root, groupOrder: 0}];
     const append = (object, state, original, material, group, groupOrder, z, background = false) => {
       if (!original?.visible || !material) return;
+      preparationBindings.add(state.byMaterial.get(material));
+      if (!uniforms) return;
       if (opaque.length + translucent.length + backgroundDraws.length >= maxDraws) fail('LIMIT', 'Native source draw list exceeds its capacity');
       const {geometry, byMaterial} = state, range = geometry.drawRange;
       const extent = geometry.index ? geometry.index.count : geometry.attributes.position?.count;
@@ -126,7 +128,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
         nodeRangeCaptured: true, nodeUniforms: null, background};
       (background ? backgroundDraws : listMaterial.transparent ? translucent : opaque).push(packet);
     };
-    if (uniforms && backgroundMesh) {
+    if (backgroundMesh) {
       const state = pairs.get(backgroundMesh);
       append(backgroundMesh, state, state.originals[0], state.effective[0], null, 0, 0, true);
     }
@@ -143,7 +145,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
         else if (uniforms && !objects.has(object) && object.material &&
             (Array.isArray(object.material) ? object.material : [object.material]).some(material => material?.visible))
           fixedDrawCandidates = true;
-        else if (uniforms && objects.has(object) && (!object.frustumCulled || object.intersectsFrustum(frustum))) {
+        else if (objects.has(object) && (!object.frustumCulled || object.intersectsFrustum(frustum))) {
           const state = pairs.get(object), {geometry} = state;
           let z = 0;
           if (sortObjects) {
@@ -177,6 +179,9 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   let textureOwner = null, storageOwner = null;
   for (const binding of bindings) {
     binding.nodeProgram = programs.compile(binding.material, binding.object, context);
+    // Retain the selected private generated streams now. A later graph can
+    // retire its compiler entry while this accepted render is still queued.
+    binding.programGeometry = programs.geometry?.(binding.nodeProgram) ?? binding.geometry;
     binding.raster = raster(binding.material); Object.freeze(binding);
     if (programs.textures(binding.nodeProgram).length) {
       if (typeof getTextures !== 'function') fail('SOURCE', 'Native sampled graphs require the renderer texture owner');
@@ -188,10 +193,11 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     }
   }
   let bytes = 0;
-  for (const draw of draws) for (const group of draw.binding.nodeProgram.groups) {
-    bytes += group.byteLength;
+  for (const draw of draws) {
+    bytes += (programs.attributeBytes?.(draw.binding.nodeProgram) ?? 0) +
+      draw.binding.nodeProgram.groups.reduce((sum, group) => sum + group.byteLength, 0);
     if (!Number.isSafeInteger(bytes) || bytes > maxUniformBytes)
-      fail('LIMIT', 'Native scene capture exceeds its pending uniform byte budget');
+      fail('LIMIT', 'Native scene capture exceeds its pending uniform and attribute byte budget');
   }
   const frameContext = {...context, ...frameStamp};
   const textureUses = [], storageUses = [];
@@ -202,6 +208,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       const updateContext = {...frameContext, object: draw.object, material: draw.material};
       const captured = programs.captureDraw(draw.binding.nodeProgram, updateContext);
       draw.nodeUniforms = captured.uniforms;
+      draw.nodeAttributes = captured.attributes ?? null;
       // Lease each post-update texture before after() or the next logical draw
       // can edit it. The shared owner snapshots CPU upload/sampler histories;
       // target leases hold generation metadata and observe contents in the FIFO.
@@ -226,7 +233,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
         fail('OBJECT', 'Native node instance counts must fit a nonnegative 32-bit integer');
       if (draw.binding.nodeProgram.instanceCapacity !== undefined &&
           draw.instanceCount > draw.binding.nodeProgram.instanceCapacity)
-        fail('OBJECT', 'Native node instance count exceeds its captured matrix or color storage capacity');
+        fail('OBJECT', 'Native node instance count exceeds its captured matrix or color capacity');
       programs.after(draw.binding.nodeProgram, updateContext);
       Object.freeze(draw.nodeUniforms); Object.freeze(draw);
     }
@@ -248,6 +255,18 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     for (const lease of storageUses) storageOwner.release(lease);
     throw error;
   }
+  let preparedAttributes = null;
   return Object.freeze({objects, bindings: Object.freeze(bindings), draws: Object.freeze(draws), bytes, background: backgroundMesh !== null,
+    prepareAttributes() {
+      if (uniforms) return;
+      // compileAsync uploads visible geometry even though this preparation
+      // profile runs no application updates. Establish that initial resident
+      // history at preparation, so later unmarked edits remain stale. Hidden
+      // bindings are admitted above but do not acquire a source upload history.
+      preparedAttributes ??= [...preparationBindings].map(binding => programs.captureAttributes?.(
+        binding.nodeProgram, {...frameContext, object: binding.object, material: binding.material})).filter(Boolean);
+      for (const attributes of preparedAttributes) attributes.install();
+    },
+    installAttributes() { for (const draw of draws) draw.nodeAttributes?.install(); },
     textureOwner, textureUses: Object.freeze(textureUses), storageOwner, storageUses: Object.freeze(storageUses)});
 }

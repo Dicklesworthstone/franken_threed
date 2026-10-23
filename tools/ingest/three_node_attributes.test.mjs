@@ -1,0 +1,91 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import * as T from '../../upstream/three.js/build/three.webgpu.js';
+import {createThreeNodeAttributes} from './three_node_attributes.mjs';
+
+test('generated instance colors retain queued versions, partial uploads and unmarked stale bytes',()=>{
+  const histories=createThreeNodeAttributes(T),descriptor={},geometry=new T.PlaneGeometry();
+  const colors=new T.InstancedBufferAttribute(new Float32Array([.125,.25,.5,.75,.875,1]),3);
+  const view=histories.register(descriptor,geometry,[{name:'nodeColor',attribute:colors}]);
+  const originalArray=colors.array,first=histories.capture(descriptor,1);
+  colors.array.set([.5,.625,.75,.25,.375,.5]);
+  const stale=histories.capture(descriptor,2);
+  colors.addUpdateRange(3,3);colors.needsUpdate=true;
+  const partial=histories.capture(descriptor,3);
+  assert.equal(colors.updateRanges.length,0);
+  colors.array.fill(0);
+  first.install();assert.deepEqual([...view.attributes.nodeColor.array],[.125,.25,.5,.75,.875,1]);
+  stale.install();assert.deepEqual([...view.attributes.nodeColor.array],[.125,.25,.5,.75,.875,1]);
+  partial.install();assert.deepEqual([...view.attributes.nodeColor.array],[.125,.25,.5,.25,.375,.5]);
+  assert.equal(colors.array,originalArray);assert.deepEqual([...colors.array],[0,0,0,0,0,0]);
+  assert.equal(colors.version,1);assert.notEqual(view.attributes.nodeColor,colors);
+  assert.equal(view.attributes.position,geometry.attributes.position);
+  const generatedColor=view.attributes.nodeColor,position=geometry.attributes.position.clone();
+  geometry.setAttribute('position',position);
+  assert.equal(view.attributes.position,position,'ordinary attribute replacement remains live');
+  assert.equal(view.attributes.nodeColor,generatedColor,'generated streams keep their private owners');
+  assert.equal(first.bytes,24);assert.equal(histories.byteLength(descriptor),24);
+  histories.release(descriptor);assert.equal(histories.diagnostics.allocatedBytes,24);
+  const replacement={};const next=histories.register(replacement,geometry,[{name:'nodeColor',attribute:colors}]);
+  histories.capture(replacement,4).install();assert.equal(next.attributes.nodeColor.array[0],.125,'program replacement preserves unmarked stale bytes');
+  geometry.dispose();assert.equal(histories.diagnostics.allocatedBytes,0);
+  first.install();assert.equal(view.attributes.nodeColor.array[0],.125,'queued snapshots survive compiler retirement');
+  histories.dispose();histories.release(replacement);assert.equal(histories.diagnostics.allocatedBytes,0);
+});
+
+test('four generated matrix columns share one captured owner and its source upload history',()=>{
+  const histories=createThreeNodeAttributes(T),descriptor={},other={},geometry=new T.PlaneGeometry();
+  const matrix=new T.InstancedInterleavedBuffer(new Float32Array(32),16,1);
+  new T.Matrix4().makeTranslation(1,2,3).toArray(matrix.array,0);
+  new T.Matrix4().makeTranslation(4,5,6).toArray(matrix.array,16);
+  matrix.addUpdateRange(12,1);
+  const attributes=[0,4,8,12].map((offset,index)=>({name:`column${index}`,attribute:new T.InterleavedBufferAttribute(matrix,4,offset)}));
+  const view=histories.register(descriptor,geometry,attributes);
+  const shared=histories.register(other,geometry,attributes);
+  const first=histories.capture(descriptor,1);
+  assert.equal(matrix.updateRanges.length,1,'first source creation leaves ranges intact');
+  assert.equal(first.bytes,128);assert.equal(histories.diagnostics.allocatedBytes,128);
+  matrix.array[12]=7;matrix.array[28]=8;matrix.needsUpdate=true;
+  const changed=histories.capture(descriptor,2),sameCall=histories.capture(other,2);
+  assert.equal(matrix.updateRanges.length,0);
+  first.install();assert.equal(view.attributes.column3.data.array[12],1);
+  changed.install();sameCall.install();
+  assert.equal(view.attributes.column3.data.array[12],7);assert.equal(view.attributes.column3.data.array[28],4);
+  assert.equal(shared.attributes.column3.data.array[12],7);assert.equal(shared.attributes.column3.data.array[28],4);
+  assert.equal(new Set(Object.values(view.attributes).filter(a=>a.isInterleavedBufferAttribute).map(a=>a.data)).size,1);
+  histories.release(descriptor);assert.equal(histories.diagnostics.allocatedBytes,128);
+  histories.release(other);assert.equal(histories.diagnostics.allocatedBytes,128);
+  geometry.dispose();assert.equal(histories.diagnostics.allocatedBytes,0);histories.dispose();
+});
+
+test('dynamic generated attributes update without flags once per logical render',()=>{
+  const histories=createThreeNodeAttributes(T),descriptor={};
+  const color=new T.InstancedBufferAttribute(new Float32Array([.25,.5,.75]),3).setUsage(T.DynamicDrawUsage);
+  const view=histories.register(descriptor,new T.PlaneGeometry(),[{name:'nodeColor',attribute:color}]);
+  const first=histories.capture(descriptor,1);color.array[0]=.5;
+  const same=histories.capture(descriptor,1),next=histories.capture(descriptor,2);
+  first.install();assert.equal(view.attributes.nodeColor.array[0],.25);
+  same.install();assert.equal(view.attributes.nodeColor.array[0],.25);
+  next.install();assert.equal(view.attributes.nodeColor.array[0],.5);
+  color.array[0]=.75;color.addUpdateRange(0,0);
+  const empty=histories.capture(descriptor,3);empty.install();
+  assert.equal(view.attributes.nodeColor.array[0],.5,'zero WebGPU range does not upload remaining bytes');
+  assert.equal(color.updateRanges.length,0);histories.dispose();
+});
+
+test('generated attribute history validates the whole selection before consuming ranges',()=>{
+  const histories=createThreeNodeAttributes(T),descriptor={};
+  const left=new T.InstancedBufferAttribute(new Float32Array([1,2,3]),3);
+  const right=new T.InstancedBufferAttribute(new Float32Array([4,5,6]),3);
+  histories.register(descriptor,new T.PlaneGeometry(),[{name:'left',attribute:left},{name:'right',attribute:right}]);
+  histories.capture(descriptor,1);
+  left.addUpdateRange(0,1);left.needsUpdate=true;right.addUpdateRange(3,1);right.needsUpdate=true;
+  assert.throws(()=>histories.capture(descriptor,2),/bounded source update ranges/);
+  assert.equal(left.updateRanges.length,1);
+  right.clearUpdateRanges();right.array=new Float32Array(6);
+  assert.throws(()=>histories.capture(descriptor,2),/complete source stride/);
+  assert.equal(left.updateRanges.length,1);histories.dispose();
+  const small=createThreeNodeAttributes(T,{maxBytes:8});
+  assert.throws(()=>small.register({},new T.PlaneGeometry(),[{name:'left',attribute:left}]),/byte budget/);
+  assert.equal(small.diagnostics.owners,0);small.dispose();
+});
