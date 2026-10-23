@@ -1,6 +1,7 @@
 /** F3D graphics pipelines for native WGSL node programs. Bindings follow the
  * pinned builder's groups directly, with at most one native uniform block per
- * group plus borrowed sampler/texture resources at their source binding indices.
+ * group plus borrowed sampler/texture/read-only storage resources at their
+ * source binding indices.
  * Each logical draw gets independent aligned slices. No ESSL reflection, shader
  * rewriting, vertex-index rotation, upstream backend or hidden submission path.
  *
@@ -70,6 +71,15 @@ export function createThreeNodeProgramMeshes({device, format, depthFormat, sampl
       seen.add(entry.binding);
       const base = {binding: entry.binding, visibility: entry.visibility};
       if (entry.buffer) {
+        if (entry.buffer.type === 'read-only-storage') {
+          const minBindingSize = entry.buffer.minBindingSize ?? 0;
+          if ((entry.buffer.hasDynamicOffset !== undefined && entry.buffer.hasDynamicOffset !== false) ||
+              !Number.isSafeInteger(minBindingSize) || minBindingSize < 0 || minBindingSize % 4)
+            fail('ANIMATION_RENDER_OPTIONS', 'Native node storage requires a static read-only buffer layout');
+          if (minBindingSize > (device.limits.maxStorageBufferBindingSize ?? 128 * 1024 * 1024))
+            limit('Native node storage layout exceeds the device binding size limit');
+          return {...base, buffer: {type: 'read-only-storage', hasDynamicOffset: false, minBindingSize}};
+        }
         if (uniform || byteLength === 0 || entry.buffer.type !== 'uniform' || entry.buffer.hasDynamicOffset !== true ||
             entry.buffer.minBindingSize !== byteLength)
           fail('ANIMATION_RENDER_OPTIONS', 'Native node groups admit one exact dynamic uniform block');
@@ -91,13 +101,13 @@ export function createThreeNodeProgramMeshes({device, format, depthFormat, sampl
     const arena = uniform ? arenaAt(index) : null;
     arena?.checkSize(byteLength);
     return {index, byteLength, arena, uniform, entries,
-      resources: entries.filter(entry => !entry.buffer),
+      resources: entries.filter(entry => entry !== uniform),
       arenaLayout: entries.length === 1 && uniform?.binding === 0 && uniform.visibility === 3};
   }
   function snapshotResources(record, input) {
     const resources = input.nodeResources ?? [];
     if (!Array.isArray(resources) || resources.length !== record.resourceCount)
-      fail('ANIMATION_RENDER_VALUE', 'Native node draws need one borrowed resource per sampler/texture binding');
+      fail('ANIMATION_RENDER_VALUE', 'Native node draws need one borrowed resource per sampler/texture/storage binding');
     const captured = record.groups.map(() => new Map());
     for (const binding of resources) {
       const group = record.groups[binding?.group];
@@ -105,7 +115,23 @@ export function createThreeNodeProgramMeshes({device, format, depthFormat, sampl
           !group.resources.some(entry => entry.binding === binding.binding) || captured[binding.group].has(binding.binding) ||
           !binding.resource || typeof binding.resource !== 'object')
         fail('ANIMATION_RENDER_VALUE', 'Native node resource bindings must match their group layout exactly');
-      captured[binding.group].set(binding.binding, binding.resource);
+      const layout = group.resources.find(entry => entry.binding === binding.binding);
+      let resource = binding.resource;
+      if (layout.buffer) {
+        const buffer = resource.buffer, offset = resource.offset ?? 0, size = resource.size ?? (buffer?.size - offset);
+        if (!buffer || typeof buffer !== 'object' || !Number.isSafeInteger(buffer.size) || buffer.size < 4 ||
+            !Number.isSafeInteger(buffer.usage) || !(buffer.usage & 128) ||
+            !Number.isSafeInteger(offset) || offset < 0 || offset % (device.limits.minStorageBufferOffsetAlignment ?? 256) ||
+            !Number.isSafeInteger(size) || size < 4 || size % 4 || size < layout.buffer.minBindingSize ||
+            !Number.isSafeInteger(offset + size) || offset + size > buffer.size)
+          fail('ANIMATION_RENDER_VALUE', 'Native node storage resources require an aligned, in-bounds STORAGE buffer range');
+        if (size > (device.limits.maxStorageBufferBindingSize ?? 128 * 1024 * 1024))
+          limit('Native node storage resource exceeds the device binding size limit');
+        // A caller can reuse or mutate its resource wrapper after stage().
+        // Keep the selected allocation/range, while borrowing its GPU contents.
+        resource = Object.freeze({buffer, offset, size});
+      }
+      captured[binding.group].set(binding.binding, resource);
     }
     return record.groups.map((group, index) => group.resources.map(entry => ({binding: entry.binding, resource: captured[index].get(entry.binding)})));
   }
@@ -119,7 +145,11 @@ export function createThreeNodeProgramMeshes({device, format, depthFormat, sampl
     for (const pending of pendingGroups) {
       const {record, index, packet, resources, output} = pending, layout = record.bindGroupLayouts[index];
       const key = [identity(layout), packet ? identity(packet.resource.buffer) : 0,
-        ...resources.map(entry => identity(entry.resource))].join('/');
+        ...resources.map(entry => {
+          const resource = entry.resource;
+          return record.groups[index].resources.find(value => value.binding === entry.binding).buffer
+            ? `buffer:${identity(resource.buffer)}:${resource.offset}:${resource.size}` : identity(resource);
+        })].join('/');
       let cached = resourceGroups.get(key);
       if (cached) resourceGroups.delete(key);
       else {
@@ -143,10 +173,12 @@ export function createThreeNodeProgramMeshes({device, format, depthFormat, sampl
       fail('ANIMATION_RENDER_OPTIONS', 'Expected a native node graphics program');
     if (topology !== 'triangles') fail('ANIMATION_RENDER_OPTIONS', 'Native node graphics currently draw triangle meshes');
     const groups = nodeProgram.groups.map(groupDescriptor);
-    for (const stage of [1, 2, 4]) for (const [kind, name, fallback] of [
-      ['buffer', 'maxUniformBuffersPerShaderStage', 12], ['sampler', 'maxSamplersPerShaderStage', 16],
-      ['texture', 'maxSampledTexturesPerShaderStage', 16]])
-      if (groups.reduce((count, group) => count + group.entries.filter(entry => entry[kind] && (entry.visibility & stage)).length, 0) > (device.limits[name] ?? fallback))
+    for (const stage of [1, 2, 4]) for (const [matches, name, fallback] of [
+      [entry => entry.buffer?.type === 'uniform', 'maxUniformBuffersPerShaderStage', 12],
+      [entry => entry.buffer?.type === 'read-only-storage', 'maxStorageBuffersPerShaderStage', 8],
+      [entry => entry.sampler, 'maxSamplersPerShaderStage', 16],
+      [entry => entry.texture, 'maxSampledTexturesPerShaderStage', 16]])
+      if (groups.reduce((count, group) => count + group.entries.filter(entry => matches(entry) && (entry.visibility & stage)).length, 0) > (device.limits[name] ?? fallback))
         limit(`Native node bindings exceed ${name}`);
     const vertex = nodeProgram.vertex, fragment = nodeProgram.fragment;
     if (!raster || !['ccw', 'cw'].includes(raster.frontFace) || !['none', 'front', 'back'].includes(raster.cullMode) ||

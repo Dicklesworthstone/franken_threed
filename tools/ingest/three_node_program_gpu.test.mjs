@@ -277,3 +277,100 @@ test('unsupported native binding layouts fail before allocating uniform pages', 
   }
   assert.equal(f.buffers.length, before);
 });
+
+function storageProgram(f, {uniform = true, minBindingSize = 16, visibility = 3} = {}) {
+  const program = f.program([]);
+  program.groups = [{index: 0, byteLength: uniform ? 16 : 0, entries: [
+    {binding: 0, visibility, buffer: {type: 'read-only-storage', hasDynamicOffset: false, minBindingSize}},
+    ...(uniform ? [{binding: 1, visibility: 3, buffer: {type: 'uniform', hasDynamicOffset: true, minBindingSize: 16}}] : []),
+  ]}];
+  return program;
+}
+const storageResource = (buffer, offset = 0, size = 16) => [{group: 0, binding: 0, resource: {buffer, offset, size}}];
+
+test('native graphics borrows read-only storage alongside per-draw uniform slices without uploading it', async t => {
+  const f = rig(t), program = storageProgram(f), record = await f.add([], {nodeProgram: program});
+  const buffer = {size: 512, usage: 128}, resources = storageResource(buffer), before = [f.buffers.length, f.writes.length];
+  const command = f.stage(record, [29], {nodeResources: resources});
+  resources[0].resource.buffer = {}; resources[0].resource.offset = 256; resources[0].resource.size = 32;
+  assert.deepEqual([f.buffers.length, f.writes.length], before);
+  f.owner.prepare(); f.owner.write();
+  const group = command.nodeProgram.groups[0].group;
+  assert.deepEqual(group.entries[0], {binding: 0, resource: {buffer, offset: 0, size: 16}});
+  assert.equal(group.entries[1].resource.size, 16);
+  const uniform = group.entries[1].resource.buffer;
+  assert.ok(uniform.bytes.slice(command.nodeProgram.groups[0].offset, command.nodeProgram.groups[0].offset + 16).every(v => v === 29));
+  assert.equal(f.buffers.length, before[0]); assert.equal(f.writes.length, before[1] + 1);
+  assert.ok(f.writes.every(write => write.buffer !== buffer));
+});
+
+test('storage-only native groups need no uniform arena or dynamic offset', async t => {
+  const f = rig(t), before = f.buffers.length, record = await f.add([], {nodeProgram: storageProgram(f, {uniform: false})});
+  const buffer = {size: 64, usage: 128}, command = f.stage(record, [], {nodeResources: storageResource(buffer)});
+  f.owner.prepare(); f.owner.write();
+  assert.equal(f.buffers.length, before); assert.equal(f.owner.uniformDiagnostics.groups, 0);
+  assert.equal(command.nodeProgram.groups[0].offset, null);
+  assert.deepEqual(command.nodeProgram.groups[0].group.entries, [{binding: 0, resource: {buffer, offset: 0, size: 16}}]);
+});
+
+test('storage bind groups cache allocation, offset and size instead of mutable wrapper identity', async t => {
+  const f = rig(t), record = await f.add([], {nodeProgram: storageProgram(f, {uniform: false})});
+  const buffer = {size: 512, usage: 128}, other = {size: 512, usage: 128};
+  const commands = [[buffer, 0, 16], [buffer, 0, 16], [buffer, 256, 16], [buffer, 0, 32], [other, 0, 16]]
+    .map(args => f.stage(record, [], {nodeResources: storageResource(...args)}));
+  f.owner.prepare();
+  const groups = commands.map(command => command.nodeProgram.groups[0].group);
+  assert.equal(groups[0], groups[1]); assert.equal(new Set(groups).size, 4);
+  const count = f.bindGroups.length; f.owner.begin();
+  const next = f.stage(record, [], {nodeResources: storageResource(buffer)}); f.owner.prepare();
+  assert.equal(next.nodeProgram.groups[0].group, groups[0]); assert.equal(f.bindGroups.length, count);
+});
+
+test('one storage allocation can serve aliased vertex and fragment bindings with sampled resources', async t => {
+  const f = rig(t), program = texturedProgram(f), buffer = {size: 64, usage: 128};
+  program.groups[0].entries.push(
+    {binding: 3, visibility: 1, buffer: {type: 'read-only-storage'}},
+    {binding: 4, visibility: 2, buffer: {type: 'read-only-storage'}});
+  const record = await f.add([], {nodeProgram: program});
+  const command = f.stage(record, [37], {nodeResources: [...sampled(),
+    {group: 0, binding: 3, resource: {buffer}}, {group: 0, binding: 4, resource: {buffer}}]});
+  f.owner.prepare();
+  const entries = command.nodeProgram.groups[0].group.entries;
+  assert.deepEqual(entries.map(entry => entry.binding), [0, 1, 2, 3, 4]);
+  assert.deepEqual(entries[3].resource, {buffer, offset: 0, size: 64});
+  assert.deepEqual(entries[4].resource, entries[3].resource);
+});
+
+test('storage ranges are validated before any uniform slot or GPU side effect is consumed', async t => {
+  const f = rig(t, {maxDraws: 1}), record = await f.add([], {nodeProgram: storageProgram(f)}), buffer = {size: 512, usage: 128};
+  const before = [f.buffers.length, f.bindGroups.length, f.writes.length];
+  for (const resource of [{}, {buffer: {size: 512, usage: 32}}, {buffer, offset: -1, size: 16},
+    {buffer, offset: 4, size: 16}, {buffer, offset: 256, size: 260}, {buffer, size: 8},
+    {buffer, size: 18}, {buffer, size: 0}, {buffer, size: NaN}, {buffer, offset: Infinity, size: 16}])
+    assert.throws(() => f.stage(record, [1], {nodeResources: [{group: 0, binding: 0, resource}]}), {code: 'ANIMATION_RENDER_VALUE'});
+  assert.deepEqual([f.buffers.length, f.bindGroups.length, f.writes.length], before);
+  assert.equal(f.owner.uniformDiagnostics.draws, 0);
+  f.stage(record, [1], {nodeResources: storageResource(buffer)});
+});
+
+test('storage layout and per-stage limits are separate from uniform limits', async t => {
+  const f = rig(t), before = f.buffers.length;
+  for (const buffer of [{type: 'storage'}, {type: 'read-only-storage', hasDynamicOffset: true},
+    {type: 'read-only-storage', minBindingSize: 3}]) {
+    const program = storageProgram(f); program.groups[0].entries[0].buffer = buffer;
+    await assert.rejects(f.add([], {nodeProgram: program}), {code: 'ANIMATION_RENDER_OPTIONS'});
+  }
+  f.device.limits.maxStorageBufferBindingSize = 16;
+  await assert.rejects(f.add([], {nodeProgram: storageProgram(f, {minBindingSize: 32})}), {code: 'ANIMATION_RENDER_LIMIT'});
+  f.device.limits.maxUniformBuffersPerShaderStage = 0; f.device.limits.maxStorageBuffersPerShaderStage = 1;
+  const program = storageProgram(f, {uniform: false});
+  program.groups[0].entries.push({binding: 1, visibility: 1, buffer: {type: 'read-only-storage'}});
+  await assert.rejects(f.add([], {nodeProgram: program}), {code: 'ANIMATION_RENDER_LIMIT'});
+  assert.equal(f.buffers.length, before);
+  program.groups[0].entries[0].visibility = 2;
+  const record = await f.add([], {nodeProgram: program});
+  assert.equal(record.groups[0].resources.length, 2); assert.equal(f.buffers.length, before);
+  assert.throws(() => f.stage(record, [], {nodeResources: [
+    {group: 0, binding: 0, resource: {buffer: {size: 32, usage: 128}}},
+    {group: 0, binding: 1, resource: {buffer: {size: 16, usage: 128}}}]}), {code: 'ANIMATION_RENDER_LIMIT'});
+});

@@ -53,6 +53,24 @@ Compute-authored indices, integer vertex fetch, repeated instance divisors, and
 storage-node expressions in node-material slots are not added by this change.
 Those operations must not be inferred from Float32 vertex-buffer support.
 
+## Native graphics storage bindings
+
+The native program GPU owner also accepts borrowed `read-only-storage` bindings
+alongside uniform blocks, samplers and textures. `captureComputeStorage(device,
+attribute)` captures a requested source version and normalized layout without
+copying or uploading CPU bytes. Resolve the lease in the renderer FIFO, after
+the preceding compute operation has published that version. Vertex and fragment
+bindings can alias the same allocation.
+
+Resolution rejects a mismatched publication, changed owner or allocation,
+disposal and device loss. Binding admission checks storage usage, alignment,
+range and per-stage limits. Cached groups use buffer identity, offset and size,
+so a new resource wrapper does not allocate another equivalent bind group.
+
+This is the resource layer for native programs. The authored node-material
+`storage().element()` compiler and facade integration remain separate unfinished
+work; the geometry profile above does not imply that complete public route.
+
 ## Checks
 
 ```sh

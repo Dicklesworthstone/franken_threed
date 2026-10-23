@@ -1,4 +1,4 @@
-/** Internal compute -> vertex-buffer ownership seam. A source storage attribute
+/** Internal compute -> graphics-buffer ownership seam. A source storage attribute
  * identifies one published allocation per device. Geometry only borrows it:
  * no readback, CPU upload, duplicate allocation or ownership transfer occurs.
  * Publication is after compute upload (including compileComputeAsync). Native
@@ -68,13 +68,62 @@ export function createComputeAttributeOwner(device) {
           !Number.isSafeInteger(buffer.usage) || (buffer.usage & (128 | 32)) !== (128 | 32) ||
           typeof live !== 'function' || typeof whenIdle !== 'function')
         fail('PUBLICATION', 'Shared vertex storage needs a live, sufficiently sized STORAGE|VERTEX buffer at an admitted source version');
+      const previous = table.get(attribute);
+      const resource = previous?.buffer === buffer && previous.byteLength === array.byteLength
+        ? previous.resource : Object.freeze({buffer, offset: 0, size: array.byteLength});
       table.set(attribute, {identity, buffer, stride, count, version, scalar: array.constructor,
-        byteLength: array.byteLength, live, whenIdle});
+        byteLength: array.byteLength, live, whenIdle, resource});
       owned.add(attribute);
     },
     release,
     dispose() { if (disposed) return; disposed = true; for (const attribute of owned) release(attribute); },
   };
+}
+
+/** Capture a read-only shader use at the logical draw, then resolve it in the
+ * renderer FIFO after any preceding compute upload/dispatch. The lease keeps
+ * the requested source version and shape, never CPU bytes: ordinary CPU edits
+ * cannot overwrite GPU-authored simulation state. A preceding queued upload
+ * may publish after capture and after the application has advanced its live
+ * attribute again. Resolution therefore compares the captured request with
+ * compute's publication, not with the attribute's later mutable fields.
+ *
+ * This is a borrow of the existing compute owner, not an uploader. It neither
+ * allocates nor extends GPU lifetime, and released/replaced owners or resolved
+ * allocations are rejected. No release operation is needed for this lease. */
+export function captureComputeStorage(device, attribute) {
+  const array = attribute?.array, stride = attribute?.itemSize, count = attribute?.count,
+    version = attribute?.version;
+  if (!isComputeAttribute(attribute) || attribute.isIndirectStorageBufferAttribute ||
+      attribute.isInterleavedBufferAttribute || attribute.normalized ||
+      !ArrayBuffer.isView(array) || ![Float32Array, Int32Array, Uint32Array].includes(array.constructor) ||
+      !Number.isSafeInteger(stride) || stride < 1 || !Number.isSafeInteger(count) || count < 1 ||
+      stride * count !== array.length || !Number.isSafeInteger(version) || version < 0)
+    fail('SHAPE', 'Graphics storage requires a complete normalized 32-bit storage attribute and nonnegative version');
+  const scalar = array.constructor, byteLength = array.byteLength,
+    initial = devices.get(device)?.get(attribute);
+  let resolved = null;
+  function current() {
+    // Retain the actual terminal reason even when disposal/loss has removed
+    // the owner from the shared table already.
+    initial?.live(); resolved?.live();
+    const entry = devices.get(device)?.get(attribute);
+    if (!entry) fail('UNPREPARED', 'Compute must publish the captured storage version on the drawing device before submission');
+    entry.live();
+    if ((initial && entry.identity !== initial.identity) ||
+        (resolved && (entry.identity !== resolved.identity || entry.buffer !== resolved.buffer)))
+      fail('STALE', 'Captured shader storage was released or replaced before its queued use');
+    if (entry.stride !== stride || entry.count !== count || entry.scalar !== scalar || entry.byteLength !== byteLength)
+      fail('SHAPE', 'Published shader storage does not match the captured attribute layout');
+    if (entry.version !== version)
+      fail('UNPREPARED', 'Compute must publish the captured storage attribute version before drawing');
+    resolved ??= entry;
+    return entry;
+  }
+  return Object.freeze({version, byteLength,
+    resolve: () => current().resource,
+    assertCurrent() { current(); },
+    whenIdle: () => current().whenIdle()});
 }
 
 /** Only buffers published by the compute owner on this device are admitted.
