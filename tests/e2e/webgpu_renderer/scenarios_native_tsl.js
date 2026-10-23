@@ -21,7 +21,157 @@ function sampledTexture(T, variant = 0, colorSpace = T.SRGBColorSpace, alpha = f
   result.wrapS = result.wrapT = T.RepeatWrapping;
   result.colorSpace = colorSpace; result.generateMipmaps = false; result.needsUpdate = true; return result;
 }
+function litScene(T, materials = [new T.MeshToonNodeMaterial(), new T.MeshLambertNodeMaterial(), new T.MeshPhongNodeMaterial()]) {
+  const result = {scene: scene(T), camera: camera(T)};
+  const tints = [0xe29c54, 0x58bd9b, 0x709be2].map(color => T.TSL.uniform(new T.Color(color)));
+  const geometry = new T.SphereGeometry(.59, 40, 24);
+  for (const [i, material] of materials.entries()) {
+    material.colorNode = tints[i]; material.emissive.setRGB(.015, .008, .02);
+    const mesh = new T.Mesh(geometry, material);
+    mesh.position.set((i - 1) * 1.26, (i % 2) * .16 - .08, 0);
+    mesh.rotation.set(.12 * i, .35 * i, -.08 * i); result.scene.add(mesh);
+  }
+  if (materials[2].isMeshPhongNodeMaterial) {
+    materials[2].specular.setRGB(.4, .55, .7); materials[2].shininess = 38;
+  }
+  const ambient = new T.AmbientLight(0xdde8ff, .18);
+  const hemisphere = new T.HemisphereLight(0xa8caff, 0x69452c, .55);
+  const directional = new T.DirectionalLight(0xffd1a6, 1.3); directional.position.set(-2.5, 3, 3);
+  const point = new T.PointLight(0x72bcff, 12, 8, 2); point.position.set(1.5, .5, 2.3);
+  const spot = new T.SpotLight(0xf2a9cc, 16, 10, .65, .3, 2); spot.position.set(-1.8, -2, 3);
+  spot.target.position.set(.3, 0, 0);
+  result.scene.add(ambient, hemisphere, directional, directional.target, point, spot, spot.target);
+  return {...result, materials, tints, lights: {ambient, hemisphere, directional, point, spot}};
+}
+function pbrScene(T) {
+  return litScene(T, [new T.MeshStandardNodeMaterial(), new T.MeshStandardNodeMaterial(), new T.MeshPhysicalNodeMaterial()]);
+}
+function sampledNormal(T) {
+  const size = 16, pixels = new Uint8Array(size * size * 4);
+  for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {
+    const nx = Math.sin(x / size * Math.PI * 4) * .45, ny = Math.cos(y / size * Math.PI * 4) * .35;
+    const nz = Math.sqrt(1 - nx * nx - ny * ny);
+    pixels.set([Math.round((nx + 1) * 127.5), Math.round((ny + 1) * 127.5), Math.round((nz + 1) * 127.5), 255], (y * size + x) * 4);
+  }
+  const result = new T.DataTexture(pixels, size, size);
+  result.minFilter = result.magFilter = T.LinearFilter;
+  result.wrapS = result.wrapT = T.RepeatWrapping;
+  result.colorSpace = T.NoColorSpace; result.generateMipmaps = false; result.needsUpdate = true; return result;
+}
 export const nativeTSLScenarios = {
+  native_tsl_pbr_materials(T) {
+    const {uniform, vec2, vec3} = T.TSL;
+    const result = pbrScene(T), [rough, metal, physical] = result.materials;
+    rough.roughness = .72; rough.metalness = .05;
+    metal.roughnessNode = uniform(.23); metal.metalnessNode = uniform(.88);
+    physical.roughnessNode = uniform(.3); physical.metalnessNode = uniform(.32);
+    physical.clearcoatNode = uniform(.8); physical.clearcoatRoughnessNode = uniform(.13);
+    physical.sheenNode = vec3(.12, .38, .55); physical.sheenRoughnessNode = uniform(.45);
+    physical.iridescenceNode = uniform(.65); physical.iridescenceIORNode = uniform(1.4);
+    physical.iridescenceThicknessNode = uniform(330); physical.anisotropyNode = vec2(.45, .2);
+    physical.retroreflectivityNode = uniform(.3); physical.iorNode = uniform(1.65);
+    physical.specularColorNode = vec3(.8, .95, 1); physical.specularIntensityNode = uniform(.8);
+    return result;
+  },
+  native_tsl_pbr_updates(T, renderer) {
+    const {uniform} = T.TSL;
+    const result = pbrScene(T), [defaults, authored, physical] = result.materials;
+    const roughness = uniform(.22), metalness = uniform(.65), emission = uniform(new T.Color(.01, .02, .03));
+    defaults.roughness = .8; defaults.metalness = .05;
+    authored.roughnessNode = roughness; authored.metalnessNode = metalness; authored.emissiveNode = emission;
+    physical.roughness = .55; physical.metalness = .05;
+    const render = renderer.render.bind(renderer); let frame = 0;
+    renderer.render = (...args) => {
+      if (++frame === 8) {
+        defaults.roughness = .18; defaults.metalness = .9;
+        roughness.value = .68; metalness.value = .15; emission.value.setRGB(.035, .01, .07);
+        result.tints[0].value.setRGB(.8, .42, .12); result.tints[1].value.setRGB(.12, .4, .65);
+        physical.roughness = .24; physical.metalness = .35;
+        physical.clearcoat = .85; physical.clearcoatRoughness = .12;
+        physical.sheen = .8; physical.sheenColor.setRGB(.65, .18, .4); physical.sheenRoughness = .4;
+        physical.iridescence = .7; physical.iridescenceIOR = 1.35; physical.iridescenceThicknessRange = [180, 380];
+        physical.anisotropy = .55; physical.anisotropyRotation = .6; physical.retroreflectivity = .35;
+        physical.ior = 1.7; physical.specularColor.setRGB(.9, .7, .5); physical.specularIntensity = .75;
+        // Enabling source physical lobes changes the program as well as its uniforms.
+        physical.needsUpdate = true;
+        result.lights.point.position.set(-.8, .9, 2.1); result.lights.point.intensity = 16;
+        result.lights.directional.position.set(1.8, 2.5, 2.8);
+      }
+      return render(...args);
+    };
+    return result;
+  },
+  native_tsl_pbr_textures(T) {
+    const {texture, normalMap, uv, vec2} = T.TSL;
+    const result = pbrScene(T), normal = sampledNormal(T), coatNormal = sampledNormal(T);
+    normal.repeat.set(1.3, 1.1); coatNormal.repeat.set(.8, 1.7); coatNormal.rotation = .4;
+    const properties = sampledTexture(T, 2, T.NoColorSpace), glow = sampledTexture(T, 1);
+    for (const [i, material] of result.materials.entries()) {
+      const color = sampledTexture(T, i); color.offset.set(.12 * i, .05); color.repeat.set(1.5, .9);
+      material.colorNode = texture(color).rgb;
+      material.normalNode = normalMap(texture(normal), vec2(.65, .8));
+      material.roughnessNode = texture(properties).g.mul(.65).add(.15);
+      material.metalnessNode = texture(properties).r.mul(.8);
+      material.emissiveNode = texture(glow, uv().yx).rgb.mul(.05);
+    }
+    const physical = result.materials[2];
+    physical.clearcoatNode = texture(properties).b;
+    physical.clearcoatRoughnessNode = texture(properties).r.mul(.35).add(.08);
+    physical.clearcoatNormalNode = normalMap(texture(coatNormal), vec2(.6, .7));
+    physical.sheenNode = texture(glow).rgb.mul(.45); physical.sheenRoughnessNode = texture(properties).g;
+    physical.iridescenceNode = texture(properties).r; physical.iridescenceIORNode = texture(properties).g.mul(.3).add(1.2);
+    physical.iridescenceThicknessNode = texture(properties).b.mul(220).add(160);
+    physical.anisotropyNode = texture(properties).rg.sub(.5).mul(.8);
+    physical.retroreflectivityNode = texture(properties).g.mul(.3);
+    physical.iorNode = texture(properties).r.mul(.5).add(1.3);
+    physical.specularColorNode = texture(glow).rgb; physical.specularIntensityNode = texture(properties).b;
+    return result;
+  },
+  native_tsl_lit_materials(T) {
+    return litScene(T);
+  },
+  native_tsl_lit_updates(T, renderer) {
+    const result = litScene(T), {ambient, hemisphere, directional, point, spot} = result.lights;
+    const alternate = new T.PointLight(0xe89a51, 10, 9, 2); alternate.position.set(-1, -.5, 2.2);
+    alternate.layers.set(1); alternate.visible = false; result.scene.add(alternate);
+    result.scene.traverse(object => { if (object !== point && object !== alternate) object.layers.enable(1); });
+    const render = renderer.render.bind(renderer); let frame = 0;
+    renderer.render = (...args) => {
+      if (++frame === 8) {
+        result.camera.layers.set(1); alternate.visible = true;
+        ambient.color.set(0xffc9b7); ambient.intensity = .3;
+        hemisphere.color.set(0xb1e6bf); hemisphere.groundColor.set(0x493867); hemisphere.intensity = .7;
+        directional.position.set(2.2, 1.1, 2.8); directional.target.position.set(-.6, -.3, 0);
+        directional.color.set(0xc3d9ff); directional.intensity = .9;
+        // The old point is now outside the camera layer; its large intensity must not leak.
+        point.intensity = 200;
+        alternate.color.set(0xfbc26c); alternate.intensity = 18; alternate.distance = 7; alternate.decay = 1.8;
+        spot.position.set(.7, 2.7, 2.4); spot.target.position.set(-.4, -.5, 0);
+        spot.color.set(0x9dcfff); spot.intensity = 13; spot.distance = 8; spot.decay = 1.7;
+        spot.angle = .52; spot.penumbra = .55;
+        for (const [i, tint] of result.tints.entries()) tint.value.setRGB(.2 + i * .2, .55 - i * .12, .35 + i * .2);
+        result.materials[1].emissive.setRGB(.04, .01, .025);
+        result.materials[2].specular.setRGB(.75, .3, .2); result.materials[2].shininess = 12;
+      }
+      return render(...args);
+    };
+    return result;
+  },
+  native_tsl_lit_textures(T) {
+    const {texture, normalMap, uv, vec2} = T.TSL;
+    const result = litScene(T), normals = sampledNormal(T);
+    normals.repeat.set(1.4, 1.1); normals.offset.set(.1, -.05);
+    const emission = sampledTexture(T, 1), gloss = sampledTexture(T, 2, T.NoColorSpace);
+    for (const [i, material] of result.materials.entries()) {
+      const color = sampledTexture(T, i); color.repeat.set(1.2 + .2 * i, .8); color.offset.set(.08 * i, .1);
+      material.colorNode = texture(color).rgb;
+      material.normalNode = normalMap(texture(normals), vec2(.7, .85));
+      material.emissiveNode = texture(emission, uv().yx).rgb.mul(.08);
+    }
+    result.materials[2].specularNode = texture(gloss).rgb.mul(.55).add(.08);
+    result.materials[2].shininessNode = texture(gloss).g.mul(60).add(8);
+    return result;
+  },
   native_tsl_uniforms(T, renderer) {
     const {uniform, vec3, positionLocal} = T.TSL;
     const phase = uniform(.2), tint = uniform(new T.Color(0xd97c42));

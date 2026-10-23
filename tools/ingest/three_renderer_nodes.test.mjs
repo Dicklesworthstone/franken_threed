@@ -235,3 +235,48 @@ test('native-only scenes ignore unused lights and reject unsupported active ligh
   assert.equal(updates,2);assert.equal(nativeDraws(g.device).length,2);
   assert.equal(g.renderer._nodeCaptureBytes,0);
 });
+
+test('native Standard and Physical graphs share the source half-float DFG texture through the facade',async t=>{
+  const f=fixture(t),standard=new T.MeshStandardNodeMaterial({roughness:.4,metalness:.6,emissive:new T.Color(.125,.25,.375)}),
+    physical=new T.MeshPhysicalNodeMaterial({roughness:.3,metalness:.2,clearcoat:.7,clearcoatRoughness:.15,
+      sheen:.4,sheenColor:new T.Color(.2,.5,.7),iridescence:.5,anisotropy:.35,retroreflectivity:.2,
+      emissive:new T.Color(.625,.375,.125)});
+  standard.colorNode=f.tint;physical.colorNode=T.TSL.vec3(.7,.3,.2);
+  f.mesh.material=standard;const second=new T.Mesh(f.mesh.geometry,physical);second.position.x=.4;f.scene.add(second);
+  const light=new T.DirectionalLight(0xffffff,2);light.position.set(2,3,4);f.scene.add(light,new T.AmbientLight(0xffffff,.2));
+  await f.renderer.compileAsync(f.scene,f.camera);
+  assert.equal(f.device.textureWrites.length,0,'compilation captures no DFG upload');
+  f.renderer.render(f.scene,f.camera);await drain(f.renderer);
+  const draws=nativeDraws(f.device);assert.equal(draws.length,2);
+  assert.ok(containsColor(draws[0],[.125,.25,.375]));assert.ok(containsColor(draws[1],[.625,.375,.125]));
+  const lookupViews=draws.flatMap(textureResources).filter(view=>view.texture.format==='rg16float');
+  assert.ok(lookupViews.length>=2,'each PBR draw binds the actual source DFG lookup');
+  assert.equal(new Set(lookupViews.map(view=>view.texture)).size,1,'source lookup aliases share one GPU allocation');
+  assert.equal(lookupViews[0].texture.width,16);assert.equal(lookupViews[0].texture.height,16);
+  assert.equal(lookupViews[0].texture.pixels.byteLength,16*16*2*2);
+  assert.equal(f.device.textureWrites.filter(write=>write.destination.texture.format==='rg16float').length,1);
+  assert.equal(f.renderer._nodeCaptureBytes,0);await f.renderer.waitForGPU();
+});
+
+test('queued Physical feature changes keep earlier programs and shared lookup storage',async t=>{
+  const f=fixture(t),material=new T.MeshPhysicalNodeMaterial({roughness:.4});
+  const roughness=T.TSL.uniform(.234375).setName('queuedPbrRoughness');
+  material.colorNode=f.tint;material.roughnessNode=roughness;f.mesh.material=material;
+  f.scene.add(new T.DirectionalLight(0xffffff,2));await f.renderer.init();
+  f.renderer.render(f.scene,f.camera);
+  material.clearcoat=.75;roughness.value=.703125;f.renderer.render(f.scene,f.camera);
+  roughness.value=.421875;f.renderer.render(f.scene,f.camera);
+  material.clearcoat=0;roughness.value=.9375;
+  await drain(f.renderer);
+  const draws=nativeDraws(f.device);assert.equal(draws.length,3);
+  assert.notEqual(draws[0].pipeline,draws[1].pipeline,'enabling a source Physical feature selects its shader branch');
+  assert.equal(draws[1].pipeline,draws[2].pipeline,'live roughness changes keep the shader');
+  const scalarPresent=(draw,value)=>[...draw.groups.values()].some(({group,offsets})=>group.entries.some(({resource})=>{
+    if(!resource?.buffer)return false;const bytes=draw.contents.get(resource.buffer);if(!bytes)return false;
+    const words=new Float32Array(bytes.buffer,bytes.byteOffset+(offsets[0]??0),resource.size/4);return words.includes(value);
+  }));
+  assert.ok(scalarPresent(draws[0],.234375));assert.ok(scalarPresent(draws[1],.703125));assert.ok(scalarPresent(draws[2],.421875));
+  assert.ok(draws.every(draw=>!scalarPresent(draw,.9375)),'later CPU edits cannot replace queued uniform values');
+  assert.equal(new Set(draws.flatMap(textureResources).map(view=>view.texture)).size,1);
+  assert.equal(f.renderer._nodeCaptureBytes,0);
+});

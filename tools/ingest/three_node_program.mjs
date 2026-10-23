@@ -2,9 +2,12 @@
  * are retained helpers; this module constructs no renderer/backend and submits
  * no GPU commands. Descriptors preserve the builder's native bind groups.
  *
- * The profile is rigid meshes, unlit or Toon/Lambert/Phong with ordinary source
- * lights, float attributes, scalar/vector/matrix uniforms and sampled 2D float
- * textures. Storage, shadows, clipping and MRT graphs fail explicitly.
+ * The profile is rigid meshes, unlit or Toon/Lambert/Phong/Standard/Physical
+ * with ordinary source lights, float attributes, scalar/vector/matrix uniforms
+ * and sampled 2D float textures. Physical direct lighting retains the source
+ * DFG texture, clearcoat, sheen, iridescence, anisotropy and retroreflection.
+ * Transmission, environments, storage, shadows, clipping and MRT graphs fail
+ * explicitly until their additional scene/resource contexts are available.
  * capture() is a logical-draw operation, never a
  * preparation retry: it runs source before/current updates and owns the bytes.
  * after() belongs after that draw has been accepted. Callers capture before any
@@ -20,6 +23,11 @@ const fail = (code, message) => { throw new ThreeNodeProgramError(code, message)
 const SLOTS = new Set(['colorNode', 'positionNode', 'vertexNode', 'fragmentNode', 'opacityNode', 'alphaTestNode', 'outputNode']);
 const LIT_SLOTS = new Set(['normalNode', 'emissiveNode']);
 const PHONG_SLOTS = new Set(['shininessNode', 'specularNode']);
+const STANDARD_SLOTS = new Set(['metalnessNode', 'roughnessNode']);
+const PHYSICAL_SLOTS = new Set(['clearcoatNode', 'clearcoatRoughnessNode', 'clearcoatNormalNode',
+  'sheenNode', 'sheenRoughnessNode', 'iridescenceNode', 'iridescenceIORNode', 'iridescenceThicknessNode',
+  'anisotropyNode', 'retroreflectivityNode', 'iorNode', 'specularColorNode', 'specularIntensityNode']);
+const GRAPH_SLOTS = [...SLOTS, ...LIT_SLOTS, ...PHONG_SLOTS, ...STANDARD_SLOTS, ...PHYSICAL_SLOTS];
 const TYPES = new Set(['float', 'int', 'uint', 'bool', 'color', 'vec2', 'vec3', 'vec4', 'ivec2', 'ivec3', 'ivec4',
   'uvec2', 'uvec3', 'uvec4', 'bvec2', 'bvec3', 'bvec4', 'mat2', 'mat3', 'mat4']);
 const FRAME_FIELDS = ['renderer', 'scene', 'camera', 'object', 'material', 'compute', 'frameId', 'renderId', 'time', 'deltaTime'];
@@ -39,7 +47,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   for (const [name, value] of Object.entries({maxPrograms, maxNodes, maxShaderBytes, maxUniformBytes, maxBindGroups}))
     if (!Number.isSafeInteger(value) || value < 1) fail('LIMIT', `Invalid ${name}`);
   const frame = renderer._nodes.nodeFrame, cache = new WeakMap(), entries = new Set();
-  const litPrototypes = [three.MeshToonNodeMaterial.prototype, three.MeshLambertNodeMaterial.prototype, three.MeshPhongNodeMaterial.prototype];
+  const standardPrototypes = [three.MeshStandardNodeMaterial.prototype, three.MeshPhysicalNodeMaterial.prototype];
+  const litPrototypes = [three.MeshToonNodeMaterial.prototype, three.MeshLambertNodeMaterial.prototype,
+    three.MeshPhongNodeMaterial.prototype, ...standardPrototypes];
   const lightClasses = new Map([[three.AmbientLight, three.AmbientLightNode], [three.DirectionalLight, three.DirectionalLightNode],
     [three.HemisphereLight, three.HemisphereLightNode], [three.PointLight, three.PointLightNode], [three.SpotLight, three.SpotLightNode]]);
   let disposed = false, shaderBytes = 0, serial = 0;
@@ -104,11 +114,18 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const {scene, camera} = context;
     if (!(material instanceof three.NodeMaterial) ||
         ![three.MeshBasicNodeMaterial.prototype, three.NodeMaterial.prototype, ...litPrototypes].includes(Object.getPrototypeOf(material)))
-      fail('MATERIAL', 'Native node graphs require Basic, Toon, Lambert, Phong or unlit base NodeMaterial');
-    const lit = litMaterial(material), phong = Object.getPrototypeOf(material) === three.MeshPhongNodeMaterial.prototype;
+      fail('MATERIAL', 'Native node graphs require Basic, Toon, Lambert, Phong, Standard, Physical or unlit base NodeMaterial');
+    const prototype = Object.getPrototypeOf(material), lit = litMaterial(material),
+      phong = prototype === three.MeshPhongNodeMaterial.prototype, standard = standardPrototypes.includes(prototype),
+      physical = prototype === three.MeshPhysicalNodeMaterial.prototype;
     if (!lit && !material.isMeshBasicNodeMaterial && material.lights !== false)
       fail('LIGHTS', 'Base NodeMaterial graphs must be unlit');
     sourceLights(material, context);
+    if (physical && (material.useTransmission || material.useDispersion))
+      fail('TRANSMISSION', 'Native physical transmission and dispersion require the captured scene-color pass');
+    if (standard && material.lights === true && material.fragmentNode == null && renderer.lighting?.enabled !== false &&
+        (scene?.environment != null || scene?.environmentNode != null))
+      fail('ENVIRONMENT', 'Native PBR node environments require a source environment lighting context');
     if (!(object instanceof three.Mesh) || object.isSkinnedMesh || object.isInstancedMesh || object.isBatchedMesh ||
         !(object.geometry instanceof three.BufferGeometry) || object.geometry.isInstancedBufferGeometry ||
         Object.values(object.geometry.morphAttributes ?? {}).some(list => list.length))
@@ -131,11 +148,12 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     for (const key of Object.keys(material)) {
       const value = material[key];
       if (value?.isTexture) fail('TEXTURE', `Native node graph material texture ${key} is not admitted`);
-      if (key.endsWith('Node') && value != null && !SLOTS.has(key) && !(lit && LIT_SLOTS.has(key)) && !(phong && PHONG_SLOTS.has(key)))
+      if (key.endsWith('Node') && value != null && !SLOTS.has(key) && !(lit && LIT_SLOTS.has(key)) &&
+          !(phong && PHONG_SLOTS.has(key)) && !(standard && STANDARD_SLOTS.has(key)) && !(physical && PHYSICAL_SLOTS.has(key)))
         fail('GRAPH', `Native node graph slot ${key} is not admitted`);
     }
     if (renderer.getMRT?.() != null) fail('MRT', 'Native node graphs currently write one color attachment');
-    const seen = new Set(), stack = [...SLOTS, ...LIT_SLOTS, ...PHONG_SLOTS].map(key => material[key]).filter(Boolean);
+    const seen = new Set(), stack = GRAPH_SLOTS.map(key => material[key]).filter(Boolean);
     while (stack.length) {
       const node = stack.pop();
       if (seen.has(node)) continue;
@@ -175,7 +193,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       Object.entries(object.geometry.attributes).map(([name, a]) => [name, a.itemSize, a.normalized, a.gpuType, a.array?.constructor.name,
         a.isInterleavedBufferAttribute, a.data?.array?.constructor.name, a.data?.stride, a.offset]),
       renderer.logarithmicDepthBuffer, renderer.reversedDepthBuffer,
-      litMaterial(material) && material.fragmentNode == null ? [lightingEnabled, lights.map(light => light.id)] : null]);
+      litMaterial(material) && material.fragmentNode == null ? [lightingEnabled, lights.map(light => light.id)] : null,
+      Object.getPrototypeOf(material) === three.MeshPhysicalNodeMaterial.prototype ?
+        [material.useClearcoat, material.useSheen, material.useIridescence, material.useAnisotropy, material.useRetroreflection] : null]);
   }
   function retire(entry) {
     if (!entries.delete(entry)) return;

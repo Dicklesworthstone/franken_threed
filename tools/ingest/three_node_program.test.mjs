@@ -30,6 +30,17 @@ function dataTexture({linear = true, type = THREE.UnsignedByteType} = {}) {
   if (linear) texture.minFilter = texture.magFilter = THREE.LinearFilter;
   return texture;
 }
+function pbrRig(t, Material = THREE.MeshStandardNodeMaterial, parameters = {}) {
+  const f = rig(t), material = new Material(parameters);
+  material.colorNode = f.tint; f.object.material = material;
+  const lights = [new THREE.AmbientLight(0xffffff, .125), new THREE.DirectionalLight(0xffffff, 2),
+    new THREE.HemisphereLight(0x7799cc, 0x333333, .25), new THREE.PointLight(0xffddaa, 3),
+    new THREE.SpotLight(0xaaddff, 4)];
+  for (const light of lights) { light.position.set(1, 2, 3); f.scene.add(light); if (light.target) f.scene.add(light.target); }
+  f.scene.updateMatrixWorld();
+  const context = {...f.context, material, lights};
+  return {...f, material, lights, context, compile: () => f.owner.compile(material, f.object, context)};
+}
 test('real pinned node graphs preserve native WGSL groups, attributes and linear output', t => {
   const f = rig(t), d = f.compile();
   assert.equal(d.nodeProgram, true); assert.equal('reflection' in d, false);
@@ -50,6 +61,115 @@ test('uniform value edits reuse the program while old packets remain immutable',
   assert.deepEqual(first, saved); assert.ok(floats(second).includes(.875)); assert.notDeepEqual(second, first);
   f.material.colorNode = N.vec3(.3, .2, .1);
   assert.notEqual(f.compile(), d); assert.equal(f.owner.diagnostics.programs, 1);
+});
+test('Standard nodes retain source direct-light PBR, authored surface uniforms and the real RG16F DFG resource', t => {
+  const f = pbrRig(t);
+  f.material.metalnessNode = N.uniform(.375).setName('pbrMetalness');
+  f.material.roughnessNode = N.uniform(.625).setName('pbrRoughness');
+  f.material.emissiveNode = N.vec3(.015625, 0, 0);
+  f.material.normalNode = N.normalView;
+  const d = f.compile(), draw = f.owner.captureDraw(d, f.context);
+  assert.match(d.fragment, /fn D_GGX/); assert.match(d.fragment, /fn V_GGX_SmithCorrelated/);
+  assert.match(d.fragment, /object\.pbrMetalness/); assert.match(d.fragment, /object\.pbrRoughness/);
+  assert.ok(floats(draw.uniforms).includes(.375)); assert.ok(floats(draw.uniforms).includes(.625));
+  const sampled = draw.textures.filter(binding => binding.isSampledTexture);
+  assert.equal(sampled.length, 1);
+  const lut = sampled[0].texture;
+  assert.ok(lut instanceof THREE.DataTexture); assert.equal(lut.name, 'DFG_LUT');
+  assert.equal(lut.type, THREE.HalfFloatType); assert.equal(lut.format, THREE.RGFormat);
+  assert.equal(lut.image.width, 16); assert.equal(lut.image.height, 16);
+  assert.ok(lut.image.data instanceof Uint16Array); assert.equal(lut.image.data.length, 512);
+  assert.equal(lut.minFilter, THREE.LinearFilter); assert.equal(lut.magFilter, THREE.LinearFilter);
+  assert.equal(lut.generateMipmaps, false);
+  assert.equal(draw.textures.filter(binding => binding.isSampler && !binding.isSampledTexture && binding.texture === lut).length, 1);
+  const group = d.groups[sampled[0].group];
+  assert.deepEqual(group.entries[sampled[0].binding].texture, {sampleType: 'float', viewDimension: '2d', multisampled: false});
+  assert.equal(hasThreeNodeProgram(new THREE.MeshStandardNodeMaterial()), false);
+  assert.equal(hasThreeNodeProgram(new THREE.MeshPhysicalNodeMaterial()), false);
+  const saved = draw.uniforms.map(bytes => bytes.slice());
+  f.material.metalnessNode.value = .875; f.material.roughnessNode.value = .25;
+  assert.equal(f.compile(), d);
+  const changed = f.owner.captureDraw(d, {...f.context, renderId: 2});
+  assert.ok(floats(changed.uniforms).includes(.875)); assert.notDeepEqual(changed.uniforms, draw.uniforms);
+  assert.deepEqual(draw.uniforms, saved); assert.equal(changed.textures[0].texture, lut);
+});
+test('Physical authored lobes keep the pinned shader functions and share DFG bindings with Standard', t => {
+  const f = pbrRig(t, THREE.MeshPhysicalNodeMaterial), material = f.material;
+  const values = {metalnessNode: .25, roughnessNode: .5, clearcoatNode: .75, clearcoatRoughnessNode: .125,
+    sheenRoughnessNode: .625, iridescenceNode: .375, iridescenceIORNode: 1.375, iridescenceThicknessNode: 312,
+    retroreflectivityNode: .5625, iorNode: 1.625, specularIntensityNode: .875};
+  for (const [slot, value] of Object.entries(values)) material[slot] = N.uniform(value).setName(`physical_${slot}`);
+  material.sheenNode = N.uniform(new THREE.Color(.125, .25, .375)).setName('physical_sheen');
+  material.anisotropyNode = N.uniform(new THREE.Vector2(.5, .25)).setName('physical_anisotropy');
+  material.specularColorNode = N.uniform(new THREE.Color(.75, .625, .5)).setName('physical_specular');
+  material.clearcoatNormalNode = N.vec3(.125, 0, 1).normalize();
+  const d = f.compile(), draw = f.owner.captureDraw(d, f.context);
+  for (const pattern of [/fn D_Charlie/, /fn evalIridescence/, /fn D_GGX_Anisotropic/,
+    /clearcoatSpecularDirect/, /Retroreflectivity/, /physical_anisotropy/, /physical_sheen/, /physical_specular/])
+    assert.match(d.fragment, pattern);
+  for (const [slot, value] of Object.entries(values)) {
+    assert.match(d.fragment, new RegExp(`object\\.physical_${slot}`));
+    assert.ok(floats(draw.uniforms).includes(value), slot);
+  }
+  assert.ok(d.attributes.some(attribute => attribute.name === 'uv'));
+  const sampled = draw.textures.filter(binding => binding.isSampledTexture);
+  assert.equal(sampled.length, 1, 'base and clearcoat DFG reads share the source texture binding');
+  const standard = new THREE.MeshStandardNodeMaterial(); standard.colorNode = f.tint;
+  const standardProgram = f.owner.compile(standard, f.object, {...f.context, material: standard});
+  assert.equal(f.owner.textures(standardProgram).find(binding => binding.isSampledTexture).texture, sampled[0].texture);
+});
+for (const [feature, shader] of [['clearcoat', /clearcoatSpecularDirect/], ['sheen', /sheenSpecularDirect/],
+  ['iridescence', /fn evalIridescence/], ['anisotropy', /fn D_GGX_Anisotropic/], ['retroreflectivity', /Retroreflectivity/]]) {
+  test(`Physical ${feature} activation rebuilds the graph, while enabled value edits remain uniforms`, t => {
+    const f = pbrRig(t, THREE.MeshPhysicalNodeMaterial), before = f.compile();
+    assert.doesNotMatch(before.fragment, shader);
+    f.material[feature] = .5;
+    const enabled = f.compile(); assert.notEqual(enabled, before); assert.match(enabled.fragment, shader);
+    const first = f.owner.capture(enabled, f.context), saved = first.map(bytes => bytes.slice());
+    f.material[feature] = .75;
+    assert.equal(f.compile(), enabled);
+    const second = f.owner.capture(enabled, {...f.context, renderId: 2});
+    assert.notDeepEqual(second, first); assert.deepEqual(first, saved);
+    f.material[feature] = 0;
+    const disabled = f.compile(); assert.notEqual(disabled, enabled); assert.doesNotMatch(disabled.fragment, shader);
+    assert.equal(f.owner.diagnostics.programs, 1);
+  });
+}
+test('PBR authored sampled values coexist with the source DFG and preserve mutable surface references', t => {
+  const f = pbrRig(t, THREE.MeshPhysicalNodeMaterial), image = dataTexture(), sample = N.texture(image);
+  f.material.colorNode = sample.rgb; f.material.roughnessNode = sample.a;
+  f.material.clearcoat = .5; f.material.clearcoatNormalNode = N.normalMap(sample);
+  const d = f.compile(), first = f.owner.captureDraw(d, f.context);
+  assert.deepEqual(new Set(first.textures.map(binding => binding.texture.name)), new Set(['', 'DFG_LUT']));
+  const saved = first.uniforms.map(bytes => bytes.slice());
+  f.material.ior = 1.75; f.material.specularIntensity = .625;
+  const replacement = dataTexture(); sample.value = replacement;
+  assert.equal(f.compile(), d);
+  const second = f.owner.captureDraw(d, {...f.context, renderId: 2});
+  assert.ok(floats(second.uniforms).includes(1.75)); assert.ok(floats(second.uniforms).includes(.625));
+  assert.ok(second.textures.some(binding => binding.texture === replacement));
+  assert.ok(first.textures.some(binding => binding.texture === image)); assert.deepEqual(first.uniforms, saved);
+});
+test('PBR scene-color and environment dependencies refuse before source construction', t => {
+  const f = pbrRig(t, THREE.MeshPhysicalNodeMaterial);
+  for (const feature of ['transmission', 'dispersion']) {
+    f.material[feature] = .25;
+    assert.throws(() => f.compile(), {code: 'THREE_NODE_PROGRAM_TRANSMISSION'});
+    f.material[feature] = 0;
+    f.material[`${feature}Node`] = N.float(0);
+    assert.throws(() => f.compile(), {code: 'THREE_NODE_PROGRAM_TRANSMISSION'});
+    f.material[`${feature}Node`] = null;
+  }
+  for (const slot of ['thicknessNode', 'attenuationDistanceNode', 'attenuationColorNode']) {
+    f.material[slot] = N.float(1);
+    assert.throws(() => f.compile(), {code: 'THREE_NODE_PROGRAM_GRAPH'}); f.material[slot] = null;
+  }
+  for (const slot of ['environment', 'environmentNode']) {
+    f.scene[slot] = slot === 'environment' ? dataTexture() : N.vec3(1);
+    assert.throws(() => f.compile(), {code: 'THREE_NODE_PROGRAM_ENVIRONMENT'}); f.scene[slot] = null;
+  }
+  f.material.lights = false; f.scene.environment = dataTexture();
+  assert.doesNotThrow(() => f.compile(), 'the source ignores scene lighting when material.lights is false');
 });
 test('matrix, integer and boolean uniforms retain padded native values', t => {
   const f = rig(t), transform = N.uniform(new THREE.Matrix3().set(2, 0, 0, 0, 3, 0, 0, 0, 4)).setName('testMatrix');

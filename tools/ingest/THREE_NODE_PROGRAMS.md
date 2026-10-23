@@ -25,6 +25,17 @@ Unassigned slots retain their source material color, emissive, specular and
 shininess behavior. Both material arrays and scene overrides supply the effective
 material to the builder's context.
 
+Authored `MeshStandardNodeMaterial` and `MeshPhysicalNodeMaterial` use the same
+direct-light path with the source GGX model and `metalnessNode`/`roughnessNode`.
+Physical also accepts clearcoat strength, roughness and normal; sheen color and
+roughness; iridescence strength, IOR and thickness; anisotropy; retroreflectivity;
+and IOR, specular color and specular intensity nodes. Unassigned slots read their
+ordinary material properties. Enabling or disabling a Physical feature selects
+the corresponding source shader branch; changing its live value keeps the
+program. The source's shared 16×16 RG16F DFG lookup texture goes through the same
+versioned texture owner as authored textures, preserving its aliasing across
+materials and clearcoat samples.
+
 Authored `texture()` graphs sample ordinary 2D data, decoded image/canvas and
 resolved color render-target textures. The pinned builder owns UV channel and
 matrix selection, explicit/generated UVs, color-space interpretation, explicit
@@ -122,7 +133,7 @@ material. Original material visibility and render-list partitioning still apply.
 
 This is a bounded native graphics entrance, not full TSL coverage. Storage/buffer,
 compute and multiple-render-target graphics graphs are refused. Authored
-Standard/Physical lighting, environment lighting, area/probe/custom lights,
+PBR transmission/dispersion, environment lighting, area/probe/custom lights,
 shadows, projected light maps and custom `lightsNode` graphs remain missing.
 Depth/comparison, cube, array, volume, compressed, storage, video and unfilterable
 or integer texture graphs still require additional native profiles. Sampled
@@ -176,7 +187,20 @@ renderer at the existing tolerance.
 
 Facade regressions check source light update frequencies across objects and
 program rebuilds, queued byte history, material arrays and overrides, and unused
-versus unsupported active lights. Source shader construction and capture checks
-passed before the execution environment became unavailable. Real WebGPU lighting
-comparisons remain to be completed; the texture parity results above do not
-establish lit-graph pixel equivalence.
+versus unsupported active lights. They also verify shared RG16F DFG residency,
+queued Physical feature changes and independent PBR uniform values.
+
+The real WebGPU scenarios `native_tsl_lit_materials`, `native_tsl_lit_updates`
+and `native_tsl_lit_textures` pass against the pinned renderer at the existing
+12-channel/2% pixel tolerance. All three have zero pixels exceeding that
+threshold; mean differences are 0, 0.01 and 0 respectively. They cover the three
+non-PBR lighting models and five ordinary light types, light identity/layer/
+visibility and live-value changes, authored texture-driven normals/emission,
+and Phong specular/shininess. These are Chrome 151 software-Vulkan correctness
+results, not hardware performance measurements.
+
+`native_tsl_pbr_materials`, `native_tsl_pbr_updates` and
+`native_tsl_pbr_textures` also pass in that environment with zero mismatched
+pixels and zero mean difference. They exercise Standard roughness/metalness,
+all admitted Physical lobes, feature activation and live value updates, and
+authored textures including distinct base and clearcoat normal maps.
