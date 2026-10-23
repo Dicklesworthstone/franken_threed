@@ -1,8 +1,9 @@
 # Compute-authored vertex and instance streams
 
 The new WebGPU renderer can bind a compute-produced `StorageBufferAttribute`
-straight into ordinary `BufferGeometry` vertex inputs. `InstancedMesh` can use
-`StorageInstancedBufferAttribute` for `instanceMatrix` and `instanceColor`.
+straight into ordinary `BufferGeometry` vertex inputs. Its existing geometry
+path lets `InstancedMesh` use `StorageInstancedBufferAttribute` for
+`instanceMatrix` and `instanceColor`.
 Compute and drawing share the same GPU allocation; there is no intermediate
 copy, readback, CPU shadow, or geometry-side re-upload of these streams.
 This is general WebGPU execution with retained source TSL preparation, not a
@@ -49,9 +50,9 @@ requires geometry update before reuse and advances its native-buffer generation.
 A source attribute cannot have two different compute owners on one borrowed
 device: that ambiguous case fails explicitly instead of mixing renderer state.
 
-Compute-authored indices, integer vertex fetch, repeated instance divisors, and
-storage-node expressions in node-material slots are not added by this change.
-Those operations must not be inferred from Float32 vertex-buffer support.
+Compute-authored indices, integer vertex fetch and repeated instance divisors
+must not be inferred from Float32 vertex-buffer support. Shader storage reads
+through authored node-material slots use the separate profile below.
 
 ## Native graphics storage bindings
 
@@ -67,9 +68,22 @@ disposal and device loss. Binding admission checks storage usage, alignment,
 range and per-stage limits. Cached groups use buffer identity, offset and size,
 so a new resource wrapper does not allocate another equivalent bind group.
 
-This is the resource layer for native programs. The authored node-material
-`storage().element()` compiler and facade integration remain separate unfinished
-work; the geometry profile above does not imply that complete public route.
+Authored node materials can use `storage().element()` expressions in vertex and
+fragment slots with Float32, Int32 and Uint32 scalar/vector arrays, plus flat
+non-atomic structs containing scalar, vector and matrix fields. A vec3 array uses
+a padded four-word stride; structs retain the pinned source's member alignment
+and matrix-column padding. This public route uses the compute owner's shared
+upload history to initialize storage or apply marked host uploads at queued
+render submission. No preceding compute call is required for host data, and
+graphics compilation performs no upload. Unchanged host versions retain
+compute-produced GPU contents.
+
+Node updates may replace a compatible attribute, while alias/layout changes
+require a new program. Ordinary `Mesh.count` and TSL `instanceIndex` also work
+with these shader reads; authored node materials on `InstancedMesh` are not yet
+admitted. Graphics storage writes, atomics, nested/boolean/atomic struct members,
+standalone matrix arrays and PBO-backed storage remain outside this profile.
+See `THREE_NODE_PROGRAMS.md` for the graph, capture and browser-check contracts.
 
 ## Checks
 

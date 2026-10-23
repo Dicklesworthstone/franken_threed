@@ -6,6 +6,7 @@ import test from 'node:test';
 import * as T from '../../upstream/three.js/build/three.webgpu.js';
 import {createWebGPURendererClass} from './three_renderer.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
+import {captureComputeStorage} from './gpu_compute_attributes.mjs';
 const Renderer=createWebGPURendererClass(T);
 function fixture(t){
   const device=geometryDevice();device.limits.maxTextureDimension2D=8192;device.limits.maxBindingsPerBindGroup=1000;
@@ -29,12 +30,6 @@ function fixture(t){
 }
 const drain=async renderer=>{while(renderer._drain)await renderer._drain;};
 const nativeDraws=device=>device.snapshots.flat().filter(draw=>draw.pipeline.vertex.entryPoint==='main');
-function storageResources(draw){
-  const resources=[];
-  for(const {group} of draw.groups.values())for(const {resource} of group.entries)
-    if(resource.buffer?.usage&128)resources.push(resource);
-  return resources;
-}
 function storageWords(draw){
   return storageResources(draw).map(({buffer,offset=0,size=buffer.size-offset})=>{
     const bytes=draw.contents.get(buffer);
@@ -382,4 +377,85 @@ test('queued native instances preserve post-update Mesh.count and skip empty dra
   assert.equal(draws[0].pipeline,draws[1].pipeline,'count updates retain the native shader');
   assert.equal(f.renderer.info.render.drawCalls,2);assert.equal(f.renderer._nodeCaptureBytes,0);
   assert.deepEqual(updates,[3,0,2]);assert.deepEqual(after,[3,0,2]);
+});
+
+function recordCompute(device){
+  device.computePasses=[];
+  device.createComputePipeline=descriptor=>({...descriptor,getBindGroupLayout:index=>({index})});
+  device.createComputePipelineAsync=descriptor=>Promise.resolve(device.createComputePipeline(descriptor));
+  const create=device.createCommandEncoder.bind(device);
+  device.createCommandEncoder=descriptor=>{
+    const encoder=create(descriptor),passes=[];
+    return {...encoder,beginComputePass(desc){
+      const pass={desc,draws:[],groups:new Map(),dispatches:[]};passes.push(pass);device.computePasses.push(pass);
+      return {setPipeline(pipeline){pass.pipeline=pipeline;},setBindGroup(index,group){pass.groups.set(index,group);},
+        dispatchWorkgroups(...size){pass.dispatches.push(size);},end(){}};
+    },finish(){return [...encoder.finish(),...passes];}};
+  };
+}
+function storageKernel(storage){
+  return T.TSL.Fn(()=>{storage.element(T.TSL.instanceIndex).addAssign(T.TSL.vec4(0));})().compute(4);
+}
+const storageResources=draw=>[...draw.groups.values()].flatMap(({group})=>group.entries)
+  .map(entry=>entry.resource).filter(resource=>resource?.buffer && (resource.buffer.usage&128));
+
+test('native storage borrows queued compute versions in FIFO order without graphics uploads',async t=>{
+  const f=fixture(t);recordCompute(f.device);
+  const attribute=new T.StorageBufferAttribute(4,4),storage=T.TSL.storage(attribute,'vec4',4),kernel=storageKernel(storage);
+  for(let i=0;i<4;i++)attribute.array.set([.125,.25,.375,1],i*4);
+  f.material.colorNode=storage.element(0).xyz;
+  f.material.positionNode=T.TSL.positionLocal.add(storage.element(T.TSL.vertexIndex).xyz.mul(.01));
+  await f.renderer.init();
+  const firstCompute=f.renderer.compute(kernel);f.renderer.render(f.scene,f.camera);
+  for(let i=0;i<4;i++)attribute.array.set([.625,.75,.875,1],i*4);
+  attribute.needsUpdate=true;
+  const secondCompute=f.renderer.compute(kernel);f.renderer.render(f.scene,f.camera);
+  attribute.array.fill(99);
+  await Promise.all([firstCompute,secondCompute,drain(f.renderer)]);
+  const draws=nativeDraws(f.device);assert.equal(draws.length,2);assert.equal(f.device.computePasses.length,2);
+  const resources=draws.map(storageResources);
+  assert.ok(resources.every(bindings=>bindings.length===2),'source vertex and fragment aliases retain both binding slots');
+  const buffer=resources[0][0].buffer;
+  assert.ok(resources.flat().every(resource=>resource.buffer===buffer));
+  assert.deepEqual(draws.map(draw=>Array.from(new Float32Array(draw.contents.get(buffer).buffer)).slice(0,4)),
+    [[.125,.25,.375,1],[.625,.75,.875,1]]);
+  assert.equal(captureComputeStorage(f.device,attribute).resolve().buffer,buffer);
+  assert.ok(f.device.computePasses.every(pass=>[...pass.groups.values()].some(group=>
+    group.entries.some(entry=>entry.resource?.buffer===buffer))),'graphics uses the exact compute allocation');
+  assert.equal(f.device.writes.filter(write=>write.buffer===buffer).length,2,'only the two compute source versions upload');
+  assert.equal(f.device.buffers.some(candidate=>candidate.usage&1),false,'graphics creates no storage readback buffer');
+  assert.equal(storage.access,'readWrite');
+  assert.ok(f.device.computePasses.every(pass=>/var<storage,\s*read_write>/.test(pass.pipeline.compute.module.code)));
+  assert.equal(f.renderer._nodeCaptureBytes,0);await f.renderer.waitForGPU();
+});
+
+test('native storage compilation precedes publication and compileComputeAsync supplies the sole buffer',async t=>{
+  const f=fixture(t);recordCompute(f.device);
+  const attribute=new T.StorageBufferAttribute(4,4),storage=T.TSL.storage(attribute,'vec4',4),kernel=storageKernel(storage);
+  attribute.array.fill(.375);let updates=0;
+  const gain=T.TSL.uniform(1).onObjectUpdate(()=>{updates++;return 1;});
+  f.material.fragmentNode=storage.element(0).mul(gain);
+  await f.renderer.compileAsync(f.scene,f.camera);
+  assert.equal(updates,0);assert.throws(captureComputeStorage(f.device,attribute).resolve,/UNPREPARED/);
+  await f.renderer.compileComputeAsync(kernel);
+  assert.equal(f.device.computePasses.length,0,'compute compilation publishes upload storage without dispatching');
+  const buffer=captureComputeStorage(f.device,attribute).resolve().buffer,writes=f.device.writes.filter(write=>write.buffer===buffer).length;
+  assert.ok(buffer);assert.equal(writes,1);
+  attribute.array.fill(99);f.renderer.render(f.scene,f.camera);await drain(f.renderer);
+  const draw=nativeDraws(f.device)[0];assert.equal(updates,1);assert.equal(storageResources(draw)[0].buffer,buffer);
+  assert.equal(new Float32Array(draw.contents.get(buffer).buffer)[0],.375);
+  assert.equal(f.device.writes.filter(write=>write.buffer===buffer).length,writes);
+  assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+test('storage-only node callbacks cannot enqueue compute inside the draw capture transaction',async t=>{
+  const f=fixture(t);recordCompute(f.device);
+  const attribute=new T.StorageBufferAttribute(4,4),storage=T.TSL.storage(attribute,'vec4',4),kernel=storageKernel(storage);
+  const gain=T.TSL.uniform(1).onObjectUpdate(()=>{f.renderer.compute(kernel);return 1;});
+  f.material.fragmentNode=storage.element(0).mul(gain);
+  await f.renderer.compileComputeAsync(kernel);
+  const writes=f.device.writes.length,submissions=f.device.submissions.length,acquired=f.acquired();
+  assert.throws(()=>f.renderer.render(f.scene,f.camera),{code:'THREE_COMPUTE_REENTRY'});
+  assert.equal(f.device.writes.length,writes);assert.equal(f.device.submissions.length,submissions);
+  assert.equal(f.acquired(),acquired);assert.equal(f.renderer._nodeCaptureBytes,0);assert.equal(f.device.computePasses.length,0);
 });

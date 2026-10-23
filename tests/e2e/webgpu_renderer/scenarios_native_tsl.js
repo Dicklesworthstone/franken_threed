@@ -197,6 +197,87 @@ export const nativeTSLScenarios = {
     };
     return result;
   },
+  native_tsl_storage_fifo(T, renderer) {
+    const {Fn, If, storage, instanceIndex, vertexIndex, uniform, float, int, uint, vec3, vec4, uv} = T.TSL;
+    const geometry = new T.PlaneGeometry(1.7, 1.25, 16, 10), count = geometry.attributes.position.count;
+    const initial = new Float32Array(count * 4);
+    for (let i = 0; i < count; i++) initial.set([
+      geometry.attributes.position.getX(i), geometry.attributes.position.getY(i), 0, 1,
+    ], i * 4);
+    const baseData = new T.StorageBufferAttribute(initial, 4);
+    const positionData = new T.StorageBufferAttribute(new Float32Array(count * 4), 4);
+    const colorData = new T.StorageBufferAttribute(new Float32Array(12), 4);
+    const lookupData = new T.StorageBufferAttribute(new Uint32Array(3), 1);
+    const signedData = new T.StorageBufferAttribute(new Int32Array(3), 1);
+    const base = storage(baseData, 'vec4', count).toReadOnly();
+    const positions = storage(positionData, 'vec4', count), colors = storage(colorData, 'vec4', 3);
+    const lookup = storage(lookupData, 'uint', 3), signed = storage(signedData, 'int', 3);
+    const shift = uniform(0), phase = uniform(0), gain = uniform(.8), rotation = uniform(0, 'uint');
+    const kernel = Fn(() => {
+      const p = base.element(instanceIndex);
+      positions.element(instanceIndex).assign(vec4(p.xyz.add(vec3(shift, p.x.mul(4).add(phase).sin().mul(.13), 0)), 1));
+      If(instanceIndex.lessThan(3), () => {
+        const i = float(instanceIndex);
+        colors.element(instanceIndex).assign(vec4(vec3(i.mul(.21).add(.15), i.mul(-.12).add(.65), i.mul(.18).add(.25)).mul(gain), 1));
+        lookup.element(instanceIndex).assign(instanceIndex.add(rotation).mod(3));
+        signed.element(instanceIndex).assign(int(instanceIndex).sub(1));
+      });
+    })().compute(count, [64]);
+    // Separate source nodes express graphics read access to the exact compute attributes.
+    const positionRead = storage(positionData, 'vec4', count).toReadOnly();
+    const colorRead = storage(colorData, 'vec4', 3).toReadOnly(), lookupRead = storage(lookupData, 'uint', 3).toReadOnly();
+    const signedRead = storage(signedData, 'int', 3).toReadOnly();
+    const material = new T.MeshBasicNodeMaterial();
+    material.positionNode = positionRead.element(vertexIndex).xyz.add(vec3(0, colorRead.element(0).g.mul(.2), 0));
+    const band = uint(uv().x.mul(3).min(2));
+    material.colorNode = colorRead.element(lookupRead.element(band)).rgb.add(float(signedRead.element(band)).mul(.045));
+    const writer = scene(T), mesh = new T.Mesh(geometry, material);
+    mesh.frustumCulled = false; writer.add(mesh);
+    const writeCamera = new T.OrthographicCamera(-1.35, 1.35, 1, -1, .1, 10); writeCamera.position.z = 3;
+    const targets = Array.from({length: 2}, () => new T.RenderTarget(96, 72,
+      {depthBuffer: false, generateMipmaps: false, minFilter: T.NearestFilter, magFilter: T.NearestFilter}));
+    const result = {scene: scene(T), camera: camera(T, true)};
+    for (const [i, target] of targets.entries()) {
+      renderer.initRenderTarget(target);
+      const panel = new T.Mesh(new T.PlaneGeometry(1.85, 1.4), new T.MeshBasicMaterial({map: target.texture}));
+      panel.position.x = i ? 1 : -1; result.scene.add(panel);
+    }
+    const compile = renderer.compileAsync.bind(renderer), render = renderer.render.bind(renderer);
+    renderer.compileAsync = async (...args) => {
+      // Compute owns storage allocation; graphics borrows those resident buffers.
+      await renderer.compileComputeAsync(kernel);
+      const previous = renderer.getRenderTarget(), previousMip = renderer.getActiveMipmapLevel();
+      try {
+        for (const target of targets) { renderer.setRenderTarget(target); await compile(writer, writeCamera); }
+      } finally { renderer.setRenderTarget(previous, 0, previousMip); }
+      return compile(...args);
+    };
+    let frame = 0;
+    renderer.render = (...args) => {
+      frame++;
+      if (frame === 1 || frame === 8) {
+        if (frame === 8) {
+          for (let i = 0; i < count; i++) baseData.array[i * 4 + 1] *= .8;
+          baseData.needsUpdate = true;
+          // Reset the source versions before a queued compute overwrites their zeros.
+          // Graphics must resolve that pending version without uploading CPU zeros again.
+          positionData.needsUpdate = colorData.needsUpdate = lookupData.needsUpdate = signedData.needsUpdate = true;
+        }
+        for (const [i, target] of targets.entries()) {
+          shift.value = i ? .22 : -.24; phase.value = (frame === 8 ? 1.2 : .2) + i * 1.4;
+          gain.value = frame === 8 ? (i ? .45 : .9) : (i ? .8 : .55);
+          rotation.value = frame === 8 ? 2 - i : i;
+          renderer.compute(kernel);
+          renderer.setRenderTarget(target); render(writer, writeCamera);
+        }
+        renderer.setRenderTarget(null);
+        // Later application values must not replace either accepted dispatch's uniforms.
+        shift.value = 4; phase.value = 8; gain.value = .05; rotation.value = 0;
+      }
+      return render(...args);
+    };
+    return result;
+  },
   native_tsl_pbr_materials(T) {
     const {uniform, vec2, vec3} = T.TSL;
     const result = pbrScene(T), [rough, metal, physical] = result.materials;

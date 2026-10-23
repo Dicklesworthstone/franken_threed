@@ -52,7 +52,6 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     three.MeshPhongNodeMaterial.prototype, ...standardPrototypes];
   const lightClasses = new Map([[three.AmbientLight, three.AmbientLightNode], [three.DirectionalLight, three.DirectionalLightNode],
     [three.HemisphereLight, three.HemisphereLightNode], [three.PointLight, three.PointLightNode], [three.SpotLight, three.SpotLightNode]]);
-  const storageIds = new WeakMap(); let nextStorageId = 0;
   let disposed = false, shaderBytes = 0, serial = 0;
   const live = () => { if (disposed) fail('DISPOSED', 'Native node program preparation is disposed'); };
   const litMaterial = material => litPrototypes.includes(Object.getPrototypeOf(material));
@@ -94,12 +93,16 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     return bytes;
   }
   function storageSignature(nodes) {
+    const aliases = new Map();
     return JSON.stringify(nodes.map(node => {
       const bytes = inspectStorage(node), attribute = node.value;
-      let id = storageIds.get(attribute);
-      if (id === undefined) { id = ++nextStorageId; storageIds.set(attribute, id); }
+      const unsized = node.bufferCount === 0;
+      if (unsized && !aliases.has(attribute)) aliases.set(attribute, aliases.size);
       const struct = node.structTypeNode;
-      return [id, node.nodeType, node.bufferCount, attribute.count, bytes,
+      // NodeStorageBuffer.attribute follows node.value on each draw. Compatible
+      // replacements retain bindings; only unsized nodes share by attribute, so
+      // their alias partition must remain stable. Fixed arrays bind separately.
+      return [unsized ? aliases.get(attribute) : null, node.nodeType, node.bufferCount, attribute.count, bytes, node.groupNode?.name,
         struct ? [struct.name, struct.membersLayout.map(({name, type}) => [name, type])] : null];
     }));
   }
@@ -345,7 +348,15 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       attributes: Object.freeze(attributes), attributesKey: JSON.stringify(attributes), groups: Object.freeze(groups)});
     const textureNodes = [...builder.nodes].filter(node => node.isTextureNode);
     const signature = textureSignature(textureNodes);
-    const storageNodes = [...builder.nodes].filter(node => node.isStorageBufferNode);
+    // Node.build() deduplicates unsized storage by attribute before addNode().
+    // Walk the original child edges too, including graphs created inside Fn,
+    // so changing one alias cannot silently keep the old shared binding.
+    const graphNodes = new Set(builder.nodes);
+    for (const node of graphNodes) {
+      if (graphNodes.size > maxNodes) fail('LIMIT', 'Generated native node graph exceeds its node budget');
+      if (typeof node.getChildren === 'function') for (const child of node.getChildren()) graphNodes.add(child);
+    }
+    const storageNodes = [...graphNodes].filter(node => node.isStorageBufferNode);
     const storageKey = storageSignature(storageNodes);
     nodeStates.set(descriptor, {owner: api, builder, bindings, material, object, textureNodes, textureSignature: signature,
       storageNodes, storageSignature: storageKey});
@@ -383,7 +394,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   }
   function readStorage(state) {
     if (storageSignature(state.storageNodes) !== state.storageSignature)
-      fail('CHANGED', 'Native storage identity or layout changed; compile the graph again');
+      fail('CHANGED', 'Native storage layout, struct schema or binding aliases changed; compile the graph again');
     const storage = [];
     for (const [group, source] of state.bindings.entries()) for (const [binding, value] of source.bindings.entries())
       if (value.isStorageBuffer) storage.push(Object.freeze({group, binding, attribute: value.attribute}));

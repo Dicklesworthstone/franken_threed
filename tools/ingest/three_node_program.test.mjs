@@ -353,6 +353,134 @@ test('unsupported texture families, actual borrowed layouts and device binding l
   f.material.colorNode = N.texture(a).add(N.texture(dataTexture()));
   assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_LIMIT'});
 });
+test('native storage preserves source stage aliases and forces read-only graphics bindings', t => {
+  const f = rig(t), attribute = new THREE.StorageBufferAttribute(4, 4), storage = N.storage(attribute, 'vec3', 4);
+  f.material.positionNode = N.positionLocal.add(storage.element(N.vertexIndex));
+  f.material.colorNode = storage.element(0);
+  const d = f.compile(), bindings = f.owner.storage(d), captured = f.owner.captureDraw(d, f.context);
+  assert.equal(storage.access, 'readWrite', 'graphics admission does not mutate the shared compute node');
+  assert.match(d.vertex, /var<storage,\s*read>/); assert.match(d.fragment, /var<storage,\s*read>/);
+  assert.doesNotMatch(d.vertex + d.fragment, /var<storage,\s*read_write>/);
+  assert.equal(bindings.length, 2, 'the source emits separate vertex and fragment binding slots');
+  assert.equal(new Set(bindings.map(binding => `${binding.group}/${binding.binding}`)).size, 2);
+  assert.ok(bindings.every(binding => binding.attribute === attribute));
+  assert.deepEqual(captured.storage, bindings); assert.equal(captured.textures.length, 0);
+  assert.ok(Object.isFrozen(bindings) && bindings.every(Object.isFrozen));
+  const layouts = bindings.map(({group, binding}) => d.groups[group].entries[binding]);
+  assert.deepEqual(new Set(layouts.map(layout => layout.visibility)), new Set([1, 2]));
+  for (const layout of layouts) {
+    assert.equal(layout.buffer.type, 'read-only-storage'); assert.equal(layout.buffer.minBindingSize, 64);
+    assert.notEqual(layout.buffer.hasDynamicOffset, true);
+  }
+  const old = bindings;
+  storage.value = new THREE.StorageBufferAttribute(4, 4);
+  assert.equal(f.compile(), d); assert.equal(f.owner.storage(d)[0].attribute, storage.value);
+  assert.equal(old[0].attribute, attribute, 'captured attribute identities do not follow a mutable node');
+});
+test('native storage admits source f32, i32 and u32 vectors with explicit vec3 padding', t => {
+  const f = rig(t);
+  for (const [ArrayType, prefix, scalar] of [[Float32Array, '', 'float'], [Int32Array, 'i', 'int'], [Uint32Array, 'u', 'uint']]) {
+    for (const width of [1, 2, 3, 4]) {
+      const stride = width === 3 ? 4 : width, attribute = new THREE.StorageBufferAttribute(2, stride, ArrayType);
+      attribute.array.fill(ArrayType === Int32Array ? -19 : 29);
+      const storage = N.storage(attribute, width === 1 ? scalar : `${prefix}vec${width}`, 2);
+      f.material.fragmentNode = N.vec4(storage.element(0));
+      const d = f.compile(), captured = f.owner.captureDraw(d, f.context).storage;
+      assert.equal(captured.length, 1); assert.equal(captured[0].attribute, attribute);
+      assert.equal(captured[0].attribute.array.constructor, ArrayType);
+      const binding = d.groups[captured[0].group].entries[captured[0].binding];
+      assert.equal(binding.buffer.minBindingSize, 2 * stride * 4);
+      assert.match(d.fragment, new RegExp(`(?:array<\\s*|vec${width}<\\s*)${ArrayType === Float32Array ? 'f32' : ArrayType === Int32Array ? 'i32' : 'u32'}`));
+    }
+  }
+  const packed = new THREE.StorageBufferAttribute(2, 3);
+  f.material.fragmentNode = N.vec4(N.storage(packed, 'vec3', 2).element(0), 1);
+  const packedProgram = f.compile();
+  assert.equal(f.owner.storage(packedProgram)[0].attribute, packed);
+  assert.equal(packed.itemSize, 3, 'graphics does not normalize or upload the compute attribute');
+});
+test('storage alias, count and layout changes invalidate programs before captured use', t => {
+  const f = rig(t), a = new THREE.StorageBufferAttribute(4, 4), b = new THREE.StorageBufferAttribute(4, 4);
+  const left = N.storage(a, 'vec4'), right = N.storage(a, 'vec4');
+  f.material.fragmentNode = left.element(0).add(right.element(1));
+  const aliased = f.compile(); assert.equal(f.owner.storage(aliased).length, 1);
+  right.value = b;
+  assert.throws(() => f.owner.captureDraw(aliased, f.context), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  const split = f.compile(); assert.notEqual(split, aliased); assert.equal(f.owner.storage(split).length, 2);
+  right.bufferCount = 2;
+  const bounded = f.compile(); assert.notEqual(bounded, split);
+  const bigger = new THREE.StorageBufferAttribute(8, 4); right.value = bigger;
+  assert.throws(() => f.owner.captureDraw(bounded, f.context), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  assert.notEqual(f.compile(), bounded);
+  right.value = new THREE.StorageBufferAttribute(8, 4, Uint32Array);
+  assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_STORAGE'});
+});
+test('storage changed by an object update is captured only when its compiled shape still matches', t => {
+  const f = rig(t), initial = new THREE.StorageBufferAttribute(4, 4), next = new THREE.StorageBufferAttribute(4, 4),
+    storage = N.storage(initial, 'vec4', 4); let replacement = next, updates = 0;
+  const gain = N.uniform(1).onObjectUpdate(() => { updates++; storage.value = replacement; return 1; });
+  f.material.fragmentNode = storage.element(0).mul(gain);
+  const d = f.compile(); assert.equal(updates, 0);
+  assert.equal(f.owner.captureDraw(d, f.context).storage[0].attribute, next); assert.equal(updates, 1);
+  replacement = new THREE.StorageBufferAttribute(8, 4);
+  assert.throws(() => f.owner.captureDraw(d, {...f.context, renderId: 2}), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  assert.equal(updates, 2);
+});
+test('compatible vector and struct replacements between updates retain the program and each captured identity', t => {
+  for (const type of ['vec4', N.struct({color: 'vec4'}, 'ReplacementRecord')]) {
+    const f = rig(t), a = new THREE.StorageBufferAttribute(4, 4), b = new THREE.StorageBufferAttribute(4, 4),
+      after = new THREE.StorageBufferAttribute(4, 4), storage = N.storage(a, type, 4);
+    let updates = 0;
+    const gain = N.uniform(1).onObjectUpdate(() => { storage.value = ++updates === 1 ? a : b; return 1; });
+    gain.updateAfterType = 'object'; gain.updateAfter = () => { storage.value = after; };
+    f.material.fragmentNode = (type === 'vec4' ? storage.element(0) : storage.element(0).get('color')).mul(gain);
+    const d = f.compile(), first = f.owner.captureDraw(d, f.context);
+    f.owner.after(d, f.context); assert.equal(storage.value, after);
+    assert.equal(f.compile(), d, 'after-update replacement preserves the source binding layout');
+    const second = f.owner.captureDraw(d, {...f.context, renderId: 2});
+    assert.equal(updates, 2); assert.equal(first.storage[0].attribute, a); assert.equal(second.storage[0].attribute, b);
+  }
+});
+test('fixed storage bindings stay independent when replacements change their aliases with unsized nodes', t => {
+  const f = rig(t), a = new THREE.StorageBufferAttribute(4, 4), b = new THREE.StorageBufferAttribute(4, 4);
+  const left = N.storage(a, 'vec4', 4), right = N.storage(a, 'vec4', 4), unsized = N.storage(a, 'vec4');
+  f.material.fragmentNode = left.element(0).add(right.element(1)).add(unsized.element(2));
+  const d = f.compile(); assert.equal(f.owner.storage(d).length, 3);
+  left.value = b;
+  assert.equal(f.compile(), d); assert.deepEqual(f.owner.storage(d).map(binding => binding.attribute), [b, a, a]);
+  right.value = unsized.value = b;
+  assert.equal(f.compile(), d); assert.ok(f.owner.storage(d).every(binding => binding.attribute === b));
+});
+test('storage aliases created inside Fn invalidate on splitting and merging', t => {
+  const f = rig(t), a = new THREE.StorageBufferAttribute(4, 4), b = new THREE.StorageBufferAttribute(4, 4), nodes = {};
+  f.material.fragmentNode = N.Fn(() => {
+    nodes.left ??= N.storage(a, 'vec4'); nodes.right ??= N.storage(a, 'vec4');
+    return nodes.left.element(0).add(nodes.right.element(1));
+  })();
+  const aliased = f.compile(); assert.equal(f.owner.storage(aliased).length, 1);
+  nodes.right.value = b;
+  assert.throws(() => f.owner.captureDraw(aliased, f.context), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  const split = f.compile(); assert.equal(f.owner.storage(split).length, 2);
+  assert.deepEqual(new Set(f.owner.captureDraw(split, f.context).storage.map(value => value.attribute)), new Set([a, b]));
+  nodes.right.value = a;
+  assert.throws(() => f.owner.captureDraw(split, f.context), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  const merged = f.compile(); assert.equal(f.owner.storage(merged).length, 1);
+  nodes.left.value = nodes.right.value = b;
+  assert.equal(f.compile(), merged); assert.equal(f.owner.captureDraw(merged, f.context).storage[0].attribute, b);
+});
+test('graphics storage assignments fail before a descriptor is published, including Fn and component targets', t => {
+  const f = rig(t), storage = N.storage(new THREE.StorageBufferAttribute(4, 4), 'vec4', 4);
+  for (const [target, value] of [[storage.element(0), N.vec4(1)], [storage.element(0).xy, N.vec2(1)],
+    [storage.element(0).element(1), N.float(1)], [storage.element(0).context({}), N.vec4(1)]]) {
+    f.material.fragmentNode = N.Fn(() => { target.assign(value); return N.vec4(1); })();
+    assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_STORAGE'});
+    assert.equal(f.owner.diagnostics.programs, 0);
+  }
+  f.material.fragmentNode = N.Fn(() => {
+    const local = storage.element(0).toVar(); local.x.assign(.5); return local;
+  })();
+  assert.equal(f.owner.storage(f.compile())[0].attribute, storage.value, 'writes to a local copy remain valid');
+});
 test('nested captures and thrown callbacks restore the exact outer NodeFrame context', t => {
   const f = rig(t), innerMaterial = new THREE.MeshBasicNodeMaterial(), innerObject = new THREE.Mesh(f.object.geometry, innerMaterial);
   innerMaterial.colorNode = N.vec3(.2); const inner = f.owner.compile(innerMaterial, innerObject, f.context);
@@ -369,6 +497,7 @@ test('nested captures and thrown callbacks restore the exact outer NodeFrame con
 for (const [name, change, code] of [
   ['depth texture graph', f => { f.material.colorNode = N.texture(new THREE.DepthTexture(1, 1)); }, 'TEXTURE'],
   ['atomic storage graph', f => { f.material.colorNode = N.storage(new THREE.StorageBufferAttribute(4, 1, Uint32Array), 'uint', 4).toAtomic().element(0).toFloat(); }, 'STORAGE'],
+  ['explicit buffer graph', f => { f.material.colorNode = N.buffer(new Float32Array(16), 'vec4', 4).element(0).xyz; }, 'STORAGE'],
   ['material texture', f => { f.material.map = new THREE.Texture(); }, 'TEXTURE'],
   ['MRT graph', f => { f.material.fragmentNode = N.mrt({output: N.vec4(1)}); }, 'MRT'],
   ['lighting slot', f => { f.material.lightsNode = N.vec3(1); }, 'GRAPH'],
@@ -401,8 +530,10 @@ test('native storage reads retain source binding order, read-only stage access a
   attribute.array.fill(.25); attribute.needsUpdate = true;
   assert.equal(f.compile(), d, 'upload versions do not recompile a shader');
   storage.value = new THREE.StorageBufferAttribute(4, 4);
-  assert.throws(() => f.owner.captureDraw(d, f.context), {code: 'THREE_NODE_PROGRAM_CHANGED'});
-  assert.notEqual(f.compile(), d);
+  assert.equal(f.compile(), d, 'source NodeStorageBuffer.attribute follows node.value without changing its binding layout');
+  const replaced = f.owner.captureDraw(d, {...f.context, renderId: 2});
+  assert.ok(replaced.storage.every(binding => binding.attribute === storage.value));
+  assert.ok(captured.storage.every(binding => binding.attribute === attribute), 'earlier draw metadata keeps its captured identity');
 });
 test('native storage supports typed scalar/vector inputs and vec3 padded residency', t => {
   for (const [type, components, array] of [['float', 1, Float32Array], ['ivec2', 2, Int32Array], ['uvec4', 4, Uint32Array], ['vec3', 3, Float32Array]]) {

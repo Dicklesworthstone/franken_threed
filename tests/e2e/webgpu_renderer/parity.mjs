@@ -89,7 +89,7 @@ const WEBGPU_ONLY = new Set(["node_materials", "pbr_maps_independent", "pbr_maps
   "native_tsl_uniforms", "native_tsl_fragment", "native_tsl_object_targets",
   "native_tsl_textures", "native_tsl_texture_updates", "native_tsl_target_texture",
   "native_tsl_storage", "native_tsl_storage_compute", "native_tsl_storage_targets",
-  "native_tsl_storage_instances", "native_tsl_storage_structs",
+  "native_tsl_storage_instances", "native_tsl_storage_structs", "native_tsl_storage_fifo",
   "native_tsl_lit_materials", "native_tsl_lit_updates", "native_tsl_lit_textures",
   "native_tsl_pbr_materials", "native_tsl_pbr_updates", "native_tsl_pbr_textures",
   "array_camera_views", "array_camera_dpr", "array_camera_background", "array_camera_overlap",

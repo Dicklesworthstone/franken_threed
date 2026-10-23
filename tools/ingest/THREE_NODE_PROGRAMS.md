@@ -44,33 +44,37 @@ resource order: a uniform block can follow samplers/textures, and groups can
 contain resources without a uniform block. Filterable float formats are admitted;
 float32 inputs require the actual `float32-filterable` device feature.
 
-`storage()` reads in vertex and fragment graphs share the renderer's compute
-allocation. Scalar and vector float32, int32 and uint32 storage attributes are
-admitted, including source vec3 padding. Flat non-atomic `struct()` records also
-work with scalar/vector 32-bit members and `mat2`, `mat3` or `mat4` fields. The
-pinned `StructTypeNode` defines their padded stride; mixed integer/float backing
-bytes and matrix-column padding remain unchanged. The H8 fluid particle record
-(`position: vec3`, `velocity: vec3`, `C: mat3`) occupies 80 bytes and can be written
-by compute and read directly in both vertex and fragment graphs.
+Authored `storage(attribute, type, count).element(index)` reads in vertex and
+fragment graphs share the renderer's compute allocation. Float32, Int32 and
+Uint32 scalar/vector `StorageBufferAttribute` and
+`StorageInstancedBufferAttribute` arrays are admitted, including source vec3
+padding. Flat non-atomic `struct()` records also work with scalar/vector 32-bit
+members and `mat2`, `mat3` or `mat4` fields. The pinned `StructTypeNode` defines
+their padded stride; mixed integer/float backing bytes and matrix-column padding
+remain unchanged. The H8 fluid particle record (`position: vec3`,
+`velocity: vec3`, `C: mat3`) occupies 80 bytes and can be written by compute and
+read directly in both vertex and fragment graphs.
 
 A compute-writable source node can be read by graphics; the pinned builder
 supplies read-only graphics bindings. Member, matrix-column and whole-record
 writes are rejected, while explicit local copies remain writable. Struct names,
 member order, names and types participate in the program signature, so even
 same-size layout changes require a new descriptor before node callbacks run.
-There is no readback, second graphics allocation, or CPU upload merely because
-a graphics draw consumes compute-produced values. Nested, boolean and atomic
-struct members are not yet admitted; a three-word struct is also refused because
-the source storage uploader treats that stride as a padded vec3.
+Splitting or merging unsized storage aliases, including nodes created inside
+`Fn`, invalidates the compiled binding layout. There is no readback, second
+graphics allocation, or CPU upload merely because a graphics draw consumes
+compute-produced values. Nested, boolean and atomic struct members are not yet
+admitted; a three-word struct is also refused because the source storage uploader
+treats that stride as a padded vec3.
 
 Ordinary meshes support `Mesh.count` with TSL `instanceIndex`, including
-compute-driven scalar/vector particle positions. Each logical draw captures the
-count after before/current node updates and resource capture, before after-updates.
-Queued preparation cannot replace it with a later live count. Zero counts still
-run source node callbacks but emit no physical draw; direct and render-bundle
-paths retain the captured count. Negative source counts clamp to zero; admitted
-counts must fit an unsigned 32-bit integer. This does not yet admit
-`InstancedMesh` or `InstancedBufferGeometry`.
+compute-driven scalar/vector and structured particle positions. Each logical
+draw captures the count after before/current node updates and resource capture,
+before after-updates. Queued preparation cannot replace it with a later live
+count. Zero counts still run source node callbacks but emit no physical draw;
+direct and render-bundle paths retain the captured count. Negative source counts
+clamp to zero; admitted counts must fit an unsigned 32-bit integer. This does not
+yet admit `InstancedMesh` or `InstancedBufferGeometry`.
 
 ```js
 const tint = TSL.uniform(new THREE.Color(0.2, 0.5, 0.8));
@@ -140,6 +144,24 @@ observe preceding GPU writes without readback, re-upload or a UV replica. Sampli
 the current destination is rejected before submission. Texture capture capacity,
 retirement and disposal use the shared owner's existing bounds.
 
+Storage reads capture the post-update attribute identity, requested upload
+version and layout before after-update callbacks. Initial host data and marked
+full or partial uploads share compute's upload history; rendering can initialize
+storage without a preceding compute call. Queued renders submit their captured
+versions in FIFO order, including calls targeting different render targets.
+`compute(kernel); render(scene, camera)` consumes that dispatch's allocation and
+GPU contents without re-uploading an unchanged host version. Unmarked CPU edits
+cannot overwrite resident GPU results. Vertex and fragment aliases borrow one
+allocation, and `compileAsync()` performs no storage upload or node update.
+
+Storage capture has its own transaction, nested with texture capture when both
+are used, so a node callback cannot insert compute into a partially captured
+render. Leases release their captured bytes on success and failure; the compute
+owner retains GPU lifetime. Conflicting host versions of one storage attribute
+within a single logical render are rejected before any storage writes. They
+require additional per-draw storage scheduling; separate logical renders already
+retain each version.
+
 Captured graph descriptors, raster state, source list properties, draw ranges and
 uniform bytes survive later source edits. Material/geometry disposal invalidates
 the compiler cache, and subsequent graph or structural changes select a new
@@ -157,22 +179,12 @@ displacement and transparency state already matches the override. Other cases
 fail explicitly before callbacks, without temporarily changing a shared source
 material. Original material visibility and render-list partitioning still apply.
 
-Storage leases capture the host upload version at each logical draw. Marked
-full and partial uploads share compute's upload history; unmarked CPU edits
-cannot overwrite resident GPU results. Queued render calls submit their captured
-versions in FIFO order, including calls targeting different render targets.
-Compilation alone performs no storage upload or node update. Leases release
-their captured bytes on success and failure; the compute owner retains GPU
-lifetime. Conflicting host versions of one storage attribute within a single
-logical render are rejected before any storage writes. They require additional
-per-draw storage scheduling; separate logical renders already retain each version.
-
 ## Explicit remaining boundaries
 
 This is a bounded native graphics entrance, not full TSL coverage. Writable or
-atomic graphics storage, struct/matrix storage, explicit uniform-buffer arrays,
-compute nodes inside graphics graphs and multiple-render-target graphics graphs
-are refused. Authored
+atomic graphics storage, standalone matrix storage arrays, nested/boolean/atomic
+struct members, PBO storage, explicit uniform-buffer arrays, compute nodes inside
+graphics graphs and multiple-render-target graphics graphs are refused. Authored
 PBR transmission/dispersion, environment lighting, area/probe/custom lights,
 shadows, projected light maps and custom `lightsNode` graphs remain missing.
 Depth/comparison, cube, array, volume, compressed, storage, video and unfilterable
@@ -180,9 +192,9 @@ or integer texture graphs still require additional native profiles. Sampled
 texture capture transactions reject reentrant texture capture from node updates
 or upload callbacks.
 The profile excludes shader context extensions, fog/clipping/shadows, material
-textures, wireframe, alpha hashing and alpha-to-coverage; InstancedMesh,
-InstancedBufferGeometry, skinned,
-batched or morph meshes; ArrayCamera, reversed depth and XR views; custom
+textures, wireframe, alpha hashing and alpha-to-coverage; `InstancedMesh`,
+`InstancedBufferGeometry`, skinned, batched or morph meshes; ArrayCamera, reversed
+depth and XR views; custom
 object/material render hooks and effectful attribute upload callbacks. A
 transparent DoubleSide graph currently requires `forceSinglePass: true`.
 Unsupported graph slots, material subclasses, bindings and attribute layouts
@@ -246,13 +258,26 @@ pixels and zero mean difference. They exercise Standard roughness/metalness,
 all admitted Physical lobes, feature activation and live value updates, and
 authored textures including distinct base and clearcoat normal maps.
 
-Storage facade regressions verify queued full and partial uploads, unchanged
-CPU versus GPU state, compile-only behavior and borrowed compute residency.
+Storage tests cover all twelve scalar/vector types, source stage aliases,
+post-update identities, queued compute/render versions and shared buffer
+identity. They also cover unsized alias changes inside `Fn`, read-only admission,
+publication-free graphics compilation and capture reentry. Facade regressions
+verify queued full and partial uploads, unchanged CPU versus GPU state,
+compile-only behavior and borrowed compute residency.
+
 Browser scenes `native_tsl_storage`, `native_tsl_storage_compute` and
 `native_tsl_storage_targets` matched the pinned reference exactly in RGB on
 Chromium 151 with SwiftShader. They execute vertex/fragment reads, actual compute
 kernels and separate queued render-target histories. This is correctness
 evidence for that software-GPU environment, not a hardware performance result.
+
+The scenario now named `native_tsl_storage_fifo` exercises compute-produced
+positions, colors and signed/unsigned indices, a partial final workgroup, two
+queued target renders and a later upload-version reset. Its pre-merge run on
+Chrome 151 software Vulkan had zero pixels outside the existing 12-channel/2%
+tolerance, mean difference 0.02 and maximum channel difference 1 against the
+pinned renderer. That result predates integration with versioned graphics
+uploads and is not a rerun of the merged storage path.
 
 A direct-module browser comparison additionally queued compute-backed
 `Mesh.count` values 3, 0 and 5 into independent targets, then changed the live
@@ -260,4 +285,7 @@ count before readback. All three images matched the pinned reference exactly in
 RGB, including the empty target; CPU storage remained unchanged. Recording
 regressions cover post-update capture, callbacks on zero draws, indexed and
 nonindexed commands, bundle reuse/invalidation and source draw-call counts.
-The full H8 fluid application still requires struct storage beyond this profile.
+The `native_tsl_storage_structs` scenario uses the H8 particle layout with
+compute-written position, velocity and matrix fields. This bounded structured
+particle path does not establish compatibility for the complete H8 fluid
+application.

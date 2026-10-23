@@ -3,6 +3,9 @@ import assert from 'node:assert/strict';
 import * as THREE from '../../upstream/three.js/build/three.webgpu.js';
 import {createThreeNodePrograms} from './three_node_program.mjs';
 import {captureThreeNodeScene} from './three_node_scene_capture.mjs';
+import {createGpuCompute} from './gpu_compute.mjs';
+import {captureComputeStorage} from './gpu_compute_attributes.mjs';
+import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
 const N = THREE.TSL;
 function rig(t) {
   const frame = new THREE.NodeFrame(); Object.assign(frame, {frameId: 7, time: 1.25, deltaTime: .125});
@@ -167,4 +170,47 @@ test('capture bounds cyclic hierarchies and hidden node growth before matrix rec
   assert.throws(() => f.capture({maxNodes: 1}), {code: 'THREE_NODE_PROGRAM_LIMIT'});
   object.children.push(f.scene);
   assert.throws(() => f.capture(), {code: 'THREE_NODE_PROGRAM_GRAPH'});
+});
+test('storage-only compile capture needs no GPU publication and runs no node callbacks', t => {
+  const f = rig(t), device = geometryDevice(); f.renderer._device = device;
+  const attribute = new THREE.StorageBufferAttribute(4, 4), storage = N.storage(attribute, 'vec4', 4);
+  let updates = 0, transactions = 0;
+  const gain = N.uniform(1).onObjectUpdate(() => { updates++; return 1; });
+  const material = f.material(); material.fragmentNode = storage.element(0).mul(gain); f.mesh(material);
+  const guard = {captureDispatch(run) { transactions++; return run(); }, validate() {}};
+  const result = f.capture({uniforms: false, getStorage: () => guard});
+  assert.equal(result.bindings.length, 1); assert.equal(result.draws.length, 0);
+  assert.equal(f.owner.storage(result.bindings[0].nodeProgram)[0].attribute, attribute);
+  assert.equal(updates, 0); assert.equal(device.buffers.length, 0); assert.equal(device.writes.length, 0);
+  assert.equal(result.storageOwner, guard, 'storage-only graphs join the shared capture transaction');
+  assert.equal(transactions, 1);
+});
+test('storage captures lease post-update identities before later draws and after-updates can replace them', t => {
+  const f = rig(t), device = geometryDevice(), gpu = createGpuCompute(device); f.renderer._device = device;
+  t.after(() => gpu.dispose());
+  const a = new THREE.StorageBufferAttribute(4, 4), b = new THREE.StorageBufferAttribute(4, 4),
+    after = new THREE.StorageBufferAttribute(4, 4), storage = N.storage(a, 'vec4', 4);
+  a.array.fill(.125); b.array.fill(.875);
+  const aBuffer = gpu.upload(a, a.array, a.version), bBuffer = gpu.upload(b, b.array, b.version);
+  const material = f.material(), first = f.mesh(material), second = f.mesh(material);
+  let inside = false, transactions = 0, updates = 0;
+  const guard = {captureDispatch(run) {
+    assert.equal(inside, false); transactions++; inside = true;
+    try { return run(); } finally { inside = false; }
+  }, capture: attribute => captureComputeStorage(device, attribute), validate() {}, release() {}};
+  const gain = N.uniform(1).onObjectUpdate(frame => {
+    assert.equal(inside, true, 'storage callbacks run inside the shared capture transaction');
+    updates++; storage.value = frame.object === first ? a : b; return 1;
+  });
+  gain.updateAfterType = 'object'; gain.updateAfter = () => { storage.value = after; };
+  material.fragmentNode = storage.element(0).mul(gain);
+  const writes = device.writes.length, result = f.capture({getStorage: () => guard});
+  assert.equal(updates, 2); assert.equal(transactions, 1); assert.equal(storage.value, after);
+  assert.deepEqual(result.draws.map(draw => draw.object), [first, second]);
+  assert.deepEqual(result.draws.map(draw => draw.nodeStorage[0].lease.resolve().buffer), [aBuffer, bBuffer]);
+  assert.ok(result.draws.every(draw => Object.isFrozen(draw.nodeStorage) && draw.nodeStorage.every(Object.isFrozen)));
+  assert.equal(result.textureUses.length, 0); assert.equal(device.writes.length, writes, 'draw capture never uploads storage');
+  a.array.fill(99); b.array.fill(99);
+  assert.deepEqual(result.draws.map(draw => Array.from(new Float32Array(draw.nodeStorage[0].lease.resolve().buffer.data)).slice(0, 4)),
+    [[.125, .125, .125, .125], [.875, .875, .875, .875]]);
 });
