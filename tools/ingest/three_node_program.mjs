@@ -382,9 +382,13 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   function inspectTexture(texture) {
     if (!(texture instanceof three.Texture) || texture.isStorageTexture ||
         texture.is3DTexture || texture.isArrayTexture || texture.isData3DTexture || texture.isDataArrayTexture ||
-        texture.isCompressedTexture || texture.isDepthTexture || texture.isVideoTexture || texture.isVideoFrameTexture ||
+        texture.isCompressedTexture || texture.isVideoTexture || texture.isVideoFrameTexture ||
         texture.isFramebufferTexture || texture.isExternalTexture)
-      fail('TEXTURE', 'Native graphics nodes sample ordinary 2D textures, CPU-data cubes and color render targets');
+      fail('TEXTURE', 'Native graphics nodes sample ordinary 2D textures, CPU-data cubes and target-owned color/depth textures');
+    const depth = texture.isDepthTexture === true;
+    if (depth && (!(texture instanceof three.DepthTexture) || !(texture.renderTarget instanceof three.RenderTarget) ||
+        texture.renderTarget.depthTexture !== texture || texture.isCubeTexture))
+      fail('TEXTURE', 'Native depth sampling requires an attached source 2D DepthTexture');
     const viewDimension = texture.isCubeTexture === true ? 'cube' : '2d';
     if (viewDimension === 'cube' && (!(texture instanceof three.CubeTexture) || texture.isRenderTargetTexture ||
         ![three.CubeReflectionMapping, three.CubeRefractionMapping].includes(texture.mapping) ||
@@ -392,18 +396,25 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
           !(face instanceof three.DataTexture) || face.isDataTexture !== true ||
           !ArrayBuffer.isView(face.image?.data) || face.image.data instanceof DataView)))
       fail('TEXTURE', 'Native cube sampling requires six CPU DataTexture faces with source reflection or refraction mapping');
-    if (![three.UnsignedByteType, three.HalfFloatType, three.FloatType].includes(texture.type) ||
+    if (!depth && (![three.UnsignedByteType, three.HalfFloatType, three.FloatType].includes(texture.type) ||
         [three.RedIntegerFormat, three.RGIntegerFormat, three.RGBAIntegerFormat, three.RGBIntegerFormat].includes(texture.format) ||
-        texture.type === three.FloatType && !renderer.hasFeature('float32-filterable'))
+        texture.type === three.FloatType && !renderer.hasFeature('float32-filterable')))
       fail('TEXTURE', 'Native graphics texture formats must have filterable float samples');
+    if (depth && texture.compareFunction !== null && typeof renderer.hasCompatibility !== 'function')
+      fail('SOURCE', 'Native depth comparison requires source renderer compatibility metadata');
+    const sampleType = depth ? 'depth' : 'float';
     const layout = renderer._getSampledTextureInputs?.().layoutOf({texture, isSampledTexture: true, isSampler: true, store: false});
-    if (layout && (layout.texture?.sampleType !== 'float' || layout.texture.viewDimension !== viewDimension || layout.texture.multisampled))
-      fail('TEXTURE', 'Native graphics texture bindings require a matching single-sampled float view');
+    if (layout && (layout.texture?.sampleType !== sampleType || layout.texture.viewDimension !== viewDimension || layout.texture.multisampled))
+      fail('TEXTURE', 'Native graphics texture bindings require a matching single-sampled color or depth view');
     if (typeof renderer.backend?.utils?.getTextureSampleData !== 'function')
       fail('SOURCE', 'The native renderer must provide source texture sample metadata');
     if (renderer.backend.utils.getTextureSampleData(texture).primarySamples !== 1)
       fail('TEXTURE', 'Native graphics texture bindings require resolved color views');
-    return layout?.texture ?? {sampleType: 'float', viewDimension, multisampled: false};
+    return layout?.texture ?? {sampleType, viewDimension, multisampled: false};
+  }
+  function comparison(node, texture = node.value) {
+    return texture.isDepthTexture === true && texture.compareFunction !== null &&
+      node.isSampleCompare?.() === true && renderer.hasCompatibility(three.Compatibility.TEXTURE_COMPARE);
   }
   function textureValue(node, references = null) {
     const reference = references?.get(node.getBase());
@@ -424,6 +435,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       return [aliases.get(texture.uuid), texture.type, texture.format, texture.colorSpace, texture.channel,
         texture.isRenderTargetTexture === true, texture.normalized === true, texture.isCubeTexture === true,
         texture.isCubeTexture === true ? texture.mapping : null,
+        texture.isDepthTexture === true, texture.isDepthTexture === true ? texture.compareFunction : null,
+        node.isSampleCompare?.() === true, texture.isDepthTexture === true && texture.compareFunction !== null
+          ? renderer.hasCompatibility(three.Compatibility.TEXTURE_COMPARE) : null,
         texture.minFilter === three.NearestFilter && texture.magFilter === three.NearestFilter,
         node.sampler, node.updateMatrix, node.groupNode?.name];
     }));
@@ -508,9 +522,12 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       // Source shader functions introduce unbound TextureNode parameters with
       // an empty placeholder image. Only real native bindings need residency;
       // authored graph inputs were already inspected before construction.
-      if (boundTextures === null || boundTextures.has(node.value)) inspectTexture(node.value);
-      if (node.compareNode !== null || node.depthNode !== null)
-        fail('TEXTURE', 'Texture comparison and array-layer sampling are not admitted');
+      if (boundTextures === null || boundTextures.has(node.value)) {
+        inspectTexture(node.value);
+        if (node.isSampleCompare?.() === true && (!node.value.isDepthTexture || node.value.compareFunction === null || !node.sampler))
+          fail('TEXTURE', 'Native comparison sampling requires an attached depth texture with a comparison function');
+      }
+      if (node.depthNode !== null) fail('TEXTURE', 'Native array-layer sampling is not admitted');
     } else if (node.constructor === three.PMREMNode) inspectPMREMNode(node);
     else if (node.value?.isTexture)
       fail('TEXTURE', 'Native graphics textures require source TextureNode or PMREMNode bindings');
@@ -663,7 +680,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         for (let stage = 0; stage < 2; stage++) if (binding.visibility & (1 << stage))
           if (++counts[stage] > limit) fail('LIMIT', 'Native node texture bindings exceed per-stage device limits');
         return Object.freeze(sampled ? {...base, texture: Object.freeze({...textureLayout})} :
-          {...base, sampler: Object.freeze({type: 'filtering'})});
+          {...base, sampler: Object.freeze({type: comparison(binding.textureNode) ? 'comparison' :
+            binding.textureNode.value.isDepthTexture === true ? 'non-filtering' : 'filtering'})});
       });
       uniformBytes += byteLength;
       return Object.freeze({index, name: group.name, byteLength, uniforms: Object.freeze(uniforms), entries: Object.freeze(entries)});
@@ -819,6 +837,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       if (value.isSampledTexture || value.isSampler) textures.push(Object.freeze({group, binding,
         texture: liveReferences ? textureValue(value.textureNode, references) : value.textureNode.value,
         isSampler: value.isSampler === true, isSampledTexture: value.isSampledTexture === true,
+        comparison: comparison(value.textureNode, liveReferences ? textureValue(value.textureNode, references) : value.textureNode.value),
         store: false, access: null, mipLevel: 0}));
     return Object.freeze(textures);
   }

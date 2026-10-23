@@ -224,8 +224,11 @@ function createThreeCompute(renderer, three) {
   function textureBinding(binding) {
     // NodeSampledTexture/NodeSampler update their cached .texture from .value.
     // Select the live value even before binding.update() is called for this turn.
-    return {texture: binding.textureNode ? binding.textureNode.value : binding.texture,
+    const texture = binding.textureNode ? binding.textureNode.value : binding.texture;
+    return {texture,
       isSampler: binding.isSampler, isSampledTexture: binding.isSampledTexture,
+      comparison: texture?.isDepthTexture === true && texture.compareFunction !== null &&
+        binding.textureNode?.isSampleCompare?.() === true && renderer.hasCompatibility(three.Compatibility.TEXTURE_COMPARE),
       store: binding.store, access: binding.access, mipLevel: binding.mipLevel};
   }
   function captureTexture(binding) {
@@ -511,7 +514,15 @@ export function withThreeCompute(Base, THREE) {
           return {samples: 1, primarySamples: 1, isMSAA: false};
         };
         this._backend.hasFeature = name => !!this._device?.features?.has(name);
+        // Match the pinned WebGPU backend's depth comparison compatibility
+        // policy. TextureNode retains its source shader fallback on Android.
+        const textureCompare = typeof navigator === 'undefined' || !/Android/.test(navigator.userAgent);
+        this._backend.hasCompatibility = name => name === THREE.Compatibility.TEXTURE_COMPARE && textureCompare;
       }
+    }
+    hasCompatibility(name) {
+      if (!this._initialized) throw new Error('THREE.Renderer: .hasCompatibility() called before the backend is initialized. Use "await renderer.init();" before using this method.');
+      return this._backend.hasCompatibility(name);
     }
     /** Native graphics and compute observe the same captured texture versions.
      * This owner reuses the existing uploader and borrows target/storage images;

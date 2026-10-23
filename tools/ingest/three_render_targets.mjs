@@ -6,8 +6,10 @@
  * generateMipmaps:true keeps a full native color pyramid and copies each level
  * with the selected orientation into the sampling pyramid. Both chains are
  * charged, including NPOT tails.
- * Single-sample source DepthTexture attachments are sampled through a separate
+ * The WebGL surface samples ordinary DepthTexture attachments through a separate
  * UV-oriented r32float image: no color conversion or half-float quantization.
+ * Native node/compute inputs borrow the depth attachment directly, with distinct
+ * ordinary and comparison samplers captured for each accepted use.
  * Private stencil buffers and UnsignedInt248 DepthStencilFormat attachments
  * retain both aspects for rendering; depth sampling selects only the depth aspect.
  * Source FloatType R/RG/RGBA attachments retain full precision through storage,
@@ -34,6 +36,17 @@ export class ThreeRenderTargetError extends Error {
 }
 const fail = (code, message) => { throw new ThreeRenderTargetError(code, message); };
 const positive = n => Number.isSafeInteger(n) && n > 0;
+
+function depthComparison(texture, three) {
+  if (texture.compareFunction == null) return null;
+  const compares = new Map([[three.NeverCompare, 'never'], [three.LessCompare, 'less'],
+    [three.EqualCompare, 'equal'], [three.LessEqualCompare, 'less-equal'],
+    [three.GreaterCompare, 'greater'], [three.GreaterEqualCompare, 'greater-equal'],
+    [three.AlwaysCompare, 'always'], [three.NotEqualCompare, 'not-equal']]);
+  const compare = compares.get(texture.compareFunction);
+  if (!compare) fail('SAMPLER', 'Expected a source depth comparison function');
+  return compare;
+}
 
 export function inspectThreeRenderTarget(target, three) {
   if (!three?.RenderTarget || !(target instanceof three.RenderTarget)) fail('SOURCE', 'Expected a source RenderTarget');
@@ -75,8 +88,9 @@ export function inspectThreeRenderTarget(target, three) {
     const combined = three.DepthStencilFormat !== undefined && depthTexture.format === three.DepthStencilFormat;
     if ((!combined && depthTexture.format !== three.DepthFormat) || depthTexture.internalFormat != null ||
         depthTexture.colorSpace !== three.NoColorSpace || depthTexture.generateMipmaps !== false ||
-        depthTexture.mipmaps?.length || depthTexture.flipY !== false || depthTexture.compareFunction != null)
-      fail('UNSUPPORTED', 'Depth textures require ordinary non-comparison depth, no mipmaps and no color conversion');
+        depthTexture.mipmaps?.length || depthTexture.flipY !== false)
+      fail('UNSUPPORTED', 'Depth textures require no mipmaps, UV flipping or color conversion');
+    depthComparison(depthTexture, three);
     // WebGLTextures.setupDepthTexture selects the attachment from the texture's
     // format, not stencilBuffer: a depth-only texture has no stencil aspect,
     // while DepthStencilFormat attaches both even with stencilBuffer:false.
@@ -346,6 +360,8 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
   }
   function depthSampling(entry, texture) {
     assertCurrent(entry);
+    if (texture.compareFunction != null)
+      fail('UNSUPPORTED', 'Comparison depth sampling requires the native depth binding, not the WebGL float replica');
     if (entry.busy) fail('REENTRANT', 'Cannot sample depth during a target submission');
     const device = getDevice();
     if (!device) fail('DEVICE', 'Initialize the renderer before sampling target depth');
@@ -451,7 +467,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     // Native WGSL uses the attachment's top-left coordinates, not the WebGL
     // bridge's UV-flipped sampling replica. Capture only generation and sampler
     // metadata; GPU contents are observed at the consumer's FIFO submission.
-    captureNativeTexture(texture) {
+    captureNativeTexture(texture, {comparison = false} = {}) {
       live();
       if (!targetTexture(texture))
         fail('SOURCE', 'Expected a target-owned 2D color or depth texture for native sampling');
@@ -460,10 +476,15 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       if ((depth ? entry.shape.depthTexture : entry.shape.texture) !== texture)
         fail('STALE', 'Texture no longer belongs to its source target');
       if (!device) fail('DEVICE', 'Initialize the renderer before capturing native target inputs');
+      if (comparison && (!depth || texture.compareFunction == null))
+        fail('SAMPLER', 'Comparison sampling requires a source depth texture with compareFunction');
       // Native depth formats are depth bindings, not the WebGL bridge's R32F
-      // replica. Ordinary depth filtering requires no float32-filterable feature.
+      // replica. r186 forces ordinary depth samplers to nearest even when the
+      // texture requests linear filtering. Comparison uses the source filters
+      // and compare function; one depth view may have both kinds of consumers.
       const {descriptor, sampleType} = depth
-        ? {descriptor: {...samplerDescriptor(texture, three, 1), mipmapFilter: 'nearest', maxAnisotropy: 1}, sampleType: 'depth'}
+        ? {descriptor: {...samplerDescriptor(texture, three, 1), mipmapFilter: 'nearest', maxAnisotropy: 1,
+          ...(comparison ? {compare: depthComparison(texture, three)} : {magFilter: 'nearest', minFilter: 'nearest'})}, sampleType: 'depth'}
         : colorSampler(entry, texture);
       const samples = entry.shape.sampleCount;
       return Object.freeze({entry, texture, device, depth, sampler: Object.freeze(descriptor), sampleType,

@@ -128,12 +128,70 @@ test('actual allocation validation is included in dependent compute completion',
   await assert.rejects(r.adapter.whenIdle(), {code: 'GPU_TARGET_GPU'});
   assert.ok(r.textures.every(t => t.destroyed)); r.dispose();
 });
-test('native depth linear samplers do not request float32 color filtering or a comparison sampler', async () => {
+test('ordinary native depth uses non-filtering nearest samplers even with source linear filters', async () => {
   const r = await rig(), target = depthTarget(); target.depthTexture.minFilter = target.depthTexture.magFilter = THREE.LinearFilter;
   const lease = r.adapter.captureBinding(sampler(target.depthTexture));
+  assert.deepEqual(plain(r.adapter.layout(lease)), {sampler: {type: 'non-filtering'}});
   r.adapter.withDispatch([lease], () => {
     const descriptor = r.adapter.resolve(lease).descriptor;
-    assert.equal(descriptor.minFilter, 'linear'); assert.equal(descriptor.magFilter, 'linear'); assert.equal(descriptor.compare, undefined);
+    assert.equal(descriptor.minFilter, 'nearest'); assert.equal(descriptor.magFilter, 'nearest'); assert.equal(descriptor.compare, undefined);
+    assert.equal(descriptor.mipmapFilter, 'nearest');
   });
   assert.equal(r.device.features.size, 0); await r.adapter.whenIdle(); r.dispose();
+});
+test('comparison and ordinary depth samplers share the real attachment and retain independent captured state', async () => {
+  const r = await rig(), target = depthTarget(), depth = target.depthTexture;
+  depth.compareFunction = THREE.LessEqualCompare;
+  depth.minFilter = depth.magFilter = THREE.LinearFilter;
+  const read = r.adapter.captureBinding(sampled(depth));
+  const first = r.adapter.captureBinding({...sampler(depth), comparison: true});
+  const ordinary = r.adapter.captureBinding(sampler(depth));
+  depth.compareFunction = THREE.GreaterCompare;
+  depth.minFilter = depth.magFilter = THREE.NearestFilter;
+  const second = r.adapter.captureBinding({...sampler(depth), comparison: true});
+  assert.deepEqual(plain(r.adapter.layout(read)), {texture: {sampleType: 'depth', viewDimension: '2d', multisampled: false}});
+  assert.deepEqual(plain(r.adapter.layout(first)), {sampler: {type: 'comparison'}});
+  assert.deepEqual(plain(r.adapter.layout(ordinary)), {sampler: {type: 'non-filtering'}});
+  depth.compareFunction = null;
+  r.adapter.withDispatch([read, first, ordinary, second], () => {
+    const earlier = r.adapter.resolve(first).descriptor, later = r.adapter.resolve(second).descriptor;
+    assert.equal(earlier.compare, 'less-equal'); assert.equal(earlier.minFilter, 'linear'); assert.equal(earlier.magFilter, 'linear');
+    assert.equal(later.compare, 'greater'); assert.equal(later.minFilter, 'nearest');
+    assert.equal(r.adapter.resolve(ordinary).descriptor.compare, undefined);
+    assert.equal(r.adapter.resolve(ordinary).descriptor.magFilter, 'nearest');
+    assert.equal(r.adapter.resolve(read).texture, r.textures[1]);
+    assert.equal(r.adapter.resolve(read).descriptor.aspect, 'depth-only');
+    assert.equal(r.targets.capture(target).busy, true);
+  });
+  assert.equal(r.textures.length, 2); assert.equal(r.targets.capture(target).depthSample, null);
+  assert.equal(r.events.filter(e => e === 'mipPass').length, 0); assert.equal(r.device.features.size, 0);
+  await r.adapter.whenIdle(); r.dispose();
+});
+test('native depth supports all pinned source comparison functions', async () => {
+  const r = await rig(), target = depthTarget();
+  const expected = [[THREE.NeverCompare, 'never'], [THREE.LessCompare, 'less'], [THREE.EqualCompare, 'equal'],
+    [THREE.LessEqualCompare, 'less-equal'], [THREE.GreaterCompare, 'greater'], [THREE.NotEqualCompare, 'not-equal'],
+    [THREE.GreaterEqualCompare, 'greater-equal'], [THREE.AlwaysCompare, 'always']];
+  const leases = expected.map(([compareFunction]) => {
+    target.depthTexture.compareFunction = compareFunction;
+    return r.adapter.captureBinding({...sampler(target.depthTexture), comparison: true});
+  });
+  r.adapter.withDispatch(leases, () => assert.deepEqual(leases.map(lease => r.adapter.resolve(lease).descriptor.compare), expected.map(([, value]) => value)));
+  assert.equal(r.textures.length, 2); await r.adapter.whenIdle(); r.dispose();
+});
+test('comparison samplers require a valid comparison depth texture before native allocation', async () => {
+  const r = await rig(), target = depthTarget();
+  for (const texture of [target.texture, target.depthTexture])
+    assert.throws(() => r.adapter.captureBinding({...sampler(texture), comparison: true}), {code: 'THREE_TARGET_SAMPLER'});
+  target.depthTexture.compareFunction = 999;
+  assert.throws(() => r.adapter.captureBinding({...sampler(target.depthTexture), comparison: true}), {code: 'THREE_TARGET_SAMPLER'});
+  assert.equal(r.textures.length, 0); r.dispose();
+});
+test('comparison leases preserve resize invalidation before any native submission', async () => {
+  const r = await rig(), target = depthTarget(); target.depthTexture.compareFunction = THREE.LessEqualCompare;
+  const read = r.adapter.captureBinding(sampled(target.depthTexture));
+  const compare = r.adapter.captureBinding({...sampler(target.depthTexture), comparison: true});
+  target.setSize(8, 8);
+  assert.throws(() => r.adapter.withDispatch([read, compare], () => assert.fail('stale comparison consumer')), {code: 'THREE_TARGET_STALE'});
+  assert.equal(r.textures.length, 0); assert.equal(r.events.includes('submit'), false); r.dispose();
 });

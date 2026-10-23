@@ -10,6 +10,7 @@ test('native depth24plus, depth32float and packed depth/stencil retain scalar de
     const [, shader, groups, , values] = dispatches(r)[0];
     assert.deepEqual(values, [0.12345678]);
     assert.deepEqual(plain(shader.bindGroupLayouts[0].entries[0].texture), {sampleType: 'depth', viewDimension: '2d', multisampled: false});
+    assert.deepEqual(plain(shader.bindGroupLayouts[0].entries[1].sampler), {type: 'non-filtering'});
     assert.equal(groups[0].entries[0].resource.nativeTexture, r.storages[0].depth);
     assert.equal(groups[0].entries[0].resource.nativeTexture.options.format, native);
     assert.equal(groups[0].entries[0].resource.descriptor.aspect, 'depth-only');
@@ -44,11 +45,36 @@ test('queued depth reads follow producer order and retain their call-time sample
   r.renderer._preparing = true;
   const a = r.renderer.produce(target, 3, 0.125), b = r.renderer.computeAsync(node);
   target.depthTexture.magFilter = target.depthTexture.minFilter = THREE.LinearFilter;
+  target.depthTexture.wrapS = THREE.RepeatWrapping;
   const c = r.renderer.produce(target, 8, 0.875), d = r.renderer.computeAsync(node);
   await r.renderer.flush(); await Promise.all([a, b, c, d]);
   assert.deepEqual(dispatches(r).map(e => e[4]), [[0.125], [0.875]]);
-  assert.deepEqual(dispatches(r).map(e => e[2][0].entries[1].resource.sampler.magFilter), ['nearest', 'linear']);
+  assert.deepEqual(dispatches(r).map(e => e[2][0].entries[1].resource.sampler.magFilter), ['nearest', 'nearest']);
+  assert.deepEqual(dispatches(r).map(e => e[2][0].entries[1].resource.sampler.addressModeU), ['clamp-to-edge', 'repeat']);
   assert.equal(r.device.features.size, 0); r.renderer.dispose();
+});
+test('queued comparison and ordinary depth reads preserve node sampling mode and call-time comparison functions', async () => {
+  const r = await rig(), target = depthTarget(), depth = target.depthTexture;
+  let comparison = true;
+  const textureNode = {value: depth, isSampleCompare: () => comparison};
+  const node = kernel([{...sampled(depth), textureNode}, {...sampler(depth), textureNode}]);
+  depth.compareFunction = THREE.LessEqualCompare;
+  depth.minFilter = depth.magFilter = THREE.LinearFilter;
+  r.renderer._preparing = true;
+  const first = r.renderer.computeAsync(node);
+  depth.compareFunction = THREE.GreaterCompare;
+  const second = r.renderer.computeAsync(node);
+  comparison = false;
+  const third = r.renderer.computeAsync(node);
+  depth.compareFunction = null;
+  await r.renderer.flush(); await Promise.all([first, second, third]);
+  const calls = dispatches(r);
+  assert.deepEqual(calls.map(e => e[1].bindGroupLayouts[0].entries[1].sampler.type), ['comparison', 'comparison', 'non-filtering']);
+  assert.deepEqual(calls.map(e => e[2][0].entries[1].resource.sampler.compare), ['less-equal', 'greater', undefined]);
+  assert.deepEqual(calls.map(e => e[2][0].entries[1].resource.sampler.minFilter), ['linear', 'linear', 'nearest']);
+  assert.equal(calls[0][2][0].entries[0].resource, calls[2][2][0].entries[0].resource);
+  assert.equal(r.storages.length, 1); assert.equal(r.targets.capture(target).depthSample, null);
+  assert.equal(r.builds, 2); r.renderer.dispose();
 });
 test('color-depth layout replacement recompiles while retaining an earlier queued color view', async () => {
   const r = await rig(), target = depthTarget(), textureNode = {value: target.texture}; r.renderer.produce(target, 3, 0.6);
@@ -85,14 +111,16 @@ test('joint native borrow unwinds before disposal requested by a storage upload 
 });
 test('depth compilation prepares native views without a dispatch or a color mip pass', async () => {
   const r = await rig(), target = depthTarget(); target.texture.generateMipmaps = true;
-  await r.renderer.compileComputeAsync(kernel([sampled(target.depthTexture)]));
+  const compiled = r.renderer.compileComputeAsync(kernel([sampled(target.depthTexture)]));
+  await r.renderer.flush(); await compiled;
   assert.equal(dispatches(r).length, 0); assert.equal(r.events.filter(e => e[0] === 'mips').length, 0);
   assert.equal(r.storages[0].depth.options.format, 'depth32float'); r.renderer.dispose();
 });
-test('comparison, MSAA depth and writable depth routes stay explicit unsupported inputs', async () => {
-  for (const change of [t => { t.depthTexture.compareFunction = 515; }, t => { t.samples = 4; }]) {
+test('invalid comparison functions, MSAA depth and writable depth fail before allocation', async () => {
+  for (const [change, code] of [[t => { t.depthTexture.compareFunction = 999; }, 'THREE_TARGET_SAMPLER'],
+    [t => { t.samples = 4; }, 'THREE_TARGET_UNSUPPORTED']]) {
     const r = await rig(), target = depthTarget(); change(target);
-    assert.throws(() => r.renderer.compute(kernel([sampled(target.depthTexture)])), {code: 'THREE_TARGET_UNSUPPORTED'});
+    assert.throws(() => r.renderer.compute(kernel([sampled(target.depthTexture)])), {code});
     assert.equal(r.storages.length, 0); r.renderer.dispose();
   }
   const r = await rig(), target = depthTarget();

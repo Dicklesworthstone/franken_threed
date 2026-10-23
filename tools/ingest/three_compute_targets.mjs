@@ -46,10 +46,11 @@ export function createThreeComputeTargets({targets, device, signal = null,
     live();
     if (!binding?.isSampler && !binding?.isSampledTexture) fail('BINDING', 'Expected a texture or sampler binding');
     if (binding.store) fail('ACCESS', 'Render-target inputs are read-only; use StorageTexture for compute writes');
-    const source = targets.captureNativeTexture(binding.texture);
+    const source = targets.captureNativeTexture(binding.texture, {comparison: binding.comparison === true});
     if (source.device !== device) fail('DEVICE', 'Compute and render targets must use the same GPUDevice');
     const sampler = binding.isSampler && !binding.isSampledTexture;
-    const layout = sampler ? {sampler: {type: source.sampleType === 'unfilterable-float' ? 'non-filtering' : 'filtering'}}
+    const layout = sampler ? {sampler: {type: source.sampler.compare !== undefined ? 'comparison'
+      : source.sampleType === 'depth' || source.sampleType === 'unfilterable-float' ? 'non-filtering' : 'filtering'}}
       : {texture: {sampleType: source.sampleType, viewDimension: '2d', multisampled: false}};
     return {source, sampler, layout};
   }

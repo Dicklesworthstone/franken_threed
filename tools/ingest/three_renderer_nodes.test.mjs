@@ -234,6 +234,64 @@ test('native texture graphs borrow rendered target storage and reject attachment
   await f.renderer.waitForGPU();
 });
 
+test('native depth comparisons preserve queued functions and sample the rendered depth attachment',async t=>{
+  const f=fixture(t),depth=new T.DepthTexture(16,16,T.UnsignedIntType),target=new T.RenderTarget(16,16,{depthTexture:depth});
+  depth.minFilter=depth.magFilter=T.LinearFilter;depth.compareFunction=T.LessEqualCompare;
+  assert.throws(()=>f.renderer.hasCompatibility(T.Compatibility.TEXTURE_COMPARE),/before the backend is initialized/);
+  await f.renderer.init();assert.equal(f.renderer.hasCompatibility(T.Compatibility.TEXTURE_COMPARE),true);
+  assert.equal(f.renderer.hasCompatibility('unsupported-compatibility'),false);
+  f.renderer.setRenderTarget(target);f.renderer.render(f.scene,f.camera);
+  f.material.colorNode=T.TSL.vec3(T.TSL.texture(depth).compare(T.TSL.float(.5)));
+  f.renderer.setRenderTarget(null);f.renderer.render(f.scene,f.camera);
+  depth.compareFunction=T.GreaterCompare;f.renderer.render(f.scene,f.camera);
+  depth.compareFunction=T.AlwaysCompare;
+  await drain(f.renderer);
+  const draws=nativeDraws(f.device);assert.equal(draws.length,3);
+  const view=f.device.passes.find(pass=>pass.desc.colorAttachments[0].view.texture.width===16).desc.depthStencilAttachment.view;
+  const consumers=draws.slice(1);
+  for(const draw of consumers){
+    assert.match(draw.pipeline.fragment.module.code,/texture_depth_2d/);
+    assert.match(draw.pipeline.fragment.module.code,/sampler_comparison/);
+    assert.match(draw.pipeline.fragment.module.code,/textureSampleCompare/);
+    assert.equal(textureResources(draw)[0].texture,view.texture);
+    assert.equal(textureResources(draw)[0].aspect,'depth-only');
+    assert.ok([...draw.groups.values()].some(({group})=>group.layout.entries.some(entry=>entry.sampler?.type==='comparison')));
+  }
+  const samplers=consumers.map(draw=>[...draw.groups.values()].flatMap(({group})=>group.entries)
+    .map(entry=>entry.resource).find(resource=>resource?.compare));
+  assert.deepEqual(samplers.map(sampler=>sampler.compare),['less-equal','greater']);
+  assert.ok(samplers.every(sampler=>sampler.minFilter==='linear'&&sampler.magFilter==='linear'));
+  assert.equal(f.device.textureWrites.length,0);assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+test('ordinary native depth reads use the source nearest sampler and reject depth attachment feedback',async t=>{
+  const f=fixture(t),depth=new T.DepthTexture(16,16,T.UnsignedIntType),target=new T.RenderTarget(16,16,{depthTexture:depth});
+  depth.minFilter=depth.magFilter=T.LinearFilter;depth.compareFunction=T.LessEqualCompare;
+  await f.renderer.init();f.renderer.setRenderTarget(target);f.renderer.render(f.scene,f.camera);
+  f.material.colorNode=T.TSL.vec3(T.TSL.texture(depth));f.renderer.setRenderTarget(null);f.renderer.render(f.scene,f.camera);
+  await drain(f.renderer);
+  const draw=nativeDraws(f.device).at(-1);
+  assert.match(draw.pipeline.fragment.module.code,/texture_depth_2d/);
+  assert.doesNotMatch(draw.pipeline.fragment.module.code,/sampler_comparison/);
+  const sampler=[...draw.groups.values()].flatMap(({group})=>group.entries)
+    .map(entry=>entry.resource).find(resource=>resource?.addressModeU);
+  assert.equal(sampler.compare,undefined);assert.equal(sampler.minFilter,'nearest');assert.equal(sampler.magFilter,'nearest');
+  assert.ok([...draw.groups.values()].some(({group})=>group.layout.entries.some(entry=>entry.sampler?.type==='non-filtering')));
+  const submissions=f.device.submissions.length;f.renderer.setRenderTarget(target);
+  assert.throws(()=>f.renderer.render(f.scene,f.camera),{code:'THREE_NODE_PROGRAM_FEEDBACK'});
+  assert.equal(f.device.submissions.length,submissions);assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+test('depth compare graphs without a comparison function fail before application updates or submission',async t=>{
+  const f=fixture(t),depth=new T.DepthTexture(16,16,T.UnsignedIntType),target=new T.RenderTarget(16,16,{depthTexture:depth});
+  let updates=0;
+  f.material.colorNode=T.TSL.vec3(T.TSL.texture(depth).compare(.5)).mul(T.TSL.uniform(1).onObjectUpdate(()=>{updates++;return 1;}));
+  await f.renderer.init();
+  assert.equal(target.depthTexture,depth);
+  assert.throws(()=>f.renderer.render(f.scene,f.camera),{code:'THREE_NODE_PROGRAM_TEXTURE'});
+  assert.equal(updates,0);assert.equal(f.acquired(),0);assert.equal(f.device.submissions.length,0);
+});
+
 test('failed textured preparation releases queued histories and renderer disposal releases the shared owner',async t=>{
   const f=fixture(t),texture=dataTexture(190,30,70);f.material.colorNode=T.TSL.texture(texture);
   await f.renderer.init();f.device.createRenderPipelineAsync=()=>Promise.reject(new Error('textured pipeline rejected'));

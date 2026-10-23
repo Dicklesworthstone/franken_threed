@@ -38,6 +38,9 @@ export function depthTarget(type = 1015, format = 1026) {
   return target;
 }
 export const THREE = {REVISION: '186', Texture, DepthTexture, RenderTarget,
+  Compatibility: {TEXTURE_COMPARE: 'depthTextureCompare'},
+  NeverCompare: 512, LessCompare: 513, EqualCompare: 514, LessEqualCompare: 515,
+  GreaterCompare: 516, NotEqualCompare: 517, GreaterEqualCompare: 518, AlwaysCompare: 519,
   DepthFormat: 1026, DepthStencilFormat: 1027, UnsignedInt248Type: 1020,
   UnsignedByteType: 1009, HalfFloatType: 1016, FloatType: 1015, UnsignedIntType: 1014,
   RGBAFormat: 1023, RedFormat: 1028, RGFormat: 1030, NoColorSpace: '', LinearSRGBColorSpace: 'srgb-linear', SRGBColorSpace: 'srgb',
@@ -70,6 +73,8 @@ export async function rig({features = [], maxBytes, maxTargets, adapterOptions =
       createView(descriptor) { const view = {nativeTexture: depth, descriptor: plain(descriptor)}; events.push(['view', view]); return view; }};
     let busy = false, disposed = false, failure = null, completion = null, mipsDirty = true;
     const storage = {texture, depth,
+      allocatedBytes: 0,
+      frameAllocationBytes(mipLevel) { assert.equal(mipLevel, 0); return 0; },
       get failed() { return !!failure; },
       withTexture(run) {
         assert.equal(busy, false); assert.equal(disposed, false); busy = texture.borrowed = true;
@@ -115,6 +120,7 @@ export async function rig({features = [], maxBytes, maxTargets, adapterOptions =
       events.push(['dispatch', shader, bindings, plain(dimensions), values]); device.queue.submit([]);
     },
     upload(key, data) { const buffer = {data: new data.constructor(data)}; buffers.set(key, buffer); return buffer; },
+    captureUpload(key, data, version) { return {key, data, version}; }, releaseUpload() {},
     getBuffer(key) { return buffers.get(key) ?? {}; }, release(key) { buffers.delete(key); },
     async read() { events.push(['read']); return new ArrayBuffer(4); },
     async whenIdle() {}, dispose() { events.push(['gpuDispose']); },
@@ -141,6 +147,7 @@ export async function rig({features = [], maxBytes, maxTargets, adapterOptions =
       events.push(['copy']); await options.sourceCompletion();
     }})],
     ['./three_storage_textures.mjs', synthetic({createThreeStorageTextures: () => storage, inspectThreeStorageTexture() {}})],
+    ['./three_storage_texture_copy.mjs', synthetic({withStorageTextureCopies: Base => Base})],
     ['./three_textures.mjs', synthetic({createGpuThreeTextures() { throw new Error('Render targets must not use the CPU texture uploader'); }})],
   ]);
   for (const name of ['three_compute_targets', 'three_compute_textures', 'three_render_targets', 'three_compute'])

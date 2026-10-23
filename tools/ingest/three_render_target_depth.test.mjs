@@ -26,6 +26,7 @@ class RenderTarget extends targetThree.RenderTarget {
 }
 const T = {...targetThree, RenderTarget, DepthTexture, UnsignedIntType: 1014, FloatType: 1015,
   UnsignedShortType: 1012, DepthFormat: 1026, DepthStencilFormat: 1027,
+  LessEqualCompare: 515,
   LinearMipmapLinearFilter: 1008, NearestMipmapNearestFilter: 1004};
 function fixture(options = {}, source = {}) {
   const f = gpuTargetMipmapFixture();
@@ -121,6 +122,18 @@ test('non-filtering depth bindings set every WebGPU filter to nearest, including
   for (const key of ['minFilter', 'magFilter', 'mipmapFilter']) assert.equal(d[key], 'nearest');
   assert.equal(d.lodMaxClamp, 0); assert.equal(d.maxAnisotropy, 1);
   assert.equal(d.compare, undefined); f.owner.dispose(); gone(f);
+});
+
+test('comparison depth attachments cannot silently enter the WebGL float replica path', () => {
+  const f = fixture(), {owner, target, depth} = f;
+  depth.compareFunction = T.LessEqualCompare;
+  const entry = owner.capture(target);
+  assert.equal(entry.shape.depthFormat, 'depth24plus');
+  assert.throws(() => owner.bindingsFor().get(depth), {code: 'THREE_TARGET_UNSUPPORTED'});
+  assert.equal(f.textures.length, 0); assert.equal(entry.depthSample, null);
+  depth.compareFunction = null;
+  assert.equal(owner.bindingsFor().get(depth).view.texture.format, 'r32float');
+  owner.dispose(); gone(f);
 });
 
 test('sampler and version edits do not regenerate depth or replace its storage', () => {
@@ -230,7 +243,7 @@ test('shared-depth ownership is refused rather than rendering into an unrelated 
 test('unsupported depth profiles fail before allocating native attachments or mirrors', () => {
   const edits = [t => t.depthBuffer = false, t => t.samples = 4, t => t.useArrayDepthTexture = true,
     t => t.depthTexture.type = T.UnsignedShortType, t => t.depthTexture.type = 999,
-    t => t.depthTexture.format = T.DepthStencilFormat, t => t.depthTexture.compareFunction = 515,
+    t => t.depthTexture.format = T.DepthStencilFormat, t => t.depthTexture.compareFunction = 999,
     t => t.depthTexture.generateMipmaps = true, t => t.depthTexture.mipmaps = [{}],
     t => t.depthTexture.colorSpace = T.SRGBColorSpace, t => t.depthTexture.internalFormat = 'DEPTH_COMPONENT32F',
     t => t.depthTexture.flipY = true, t => t.depthTexture.image.depth = 2, t => t.depthTexture.isArrayTexture = true,
