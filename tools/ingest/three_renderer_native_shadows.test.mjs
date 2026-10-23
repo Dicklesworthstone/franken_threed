@@ -104,6 +104,19 @@ function recordCompute(device) {
   };
 }
 
+function animationHost(renderer) {
+  const callbacks = new Map(); let serial = 0;
+  renderer.domElement.ownerDocument = {defaultView: {
+    requestAnimationFrame(callback) { const id = ++serial; callbacks.set(id, callback); return id; },
+    cancelAnimationFrame(id) { callbacks.delete(id); },
+  }};
+  return {get pending() { return callbacks.size; }, tick(time) {
+    assert.equal(callbacks.size, 1, 'the source clock owns exactly one scheduled host callback');
+    const [id, callback] = callbacks.entries().next().value;
+    callbacks.delete(id); callback(time);
+  }};
+}
+
 test('native directional PCF submits only visible casters before sampling their depth attachment', async t => {
   const f = fixture(t);
   const hidden = new T.Mesh(f.caster.geometry, f.casterMaterial);
@@ -380,4 +393,70 @@ test('hidden H7 source skins do not poison their captured visible computed sibli
   assert.throws(() => f.renderer.render(f.scene, f.camera), {code: 'THREE_NODE_PROGRAM_OBJECT'});
   assert.equal(updates, 1, 'new visible unsupported source is rejected before application draw updates');
   assert.equal(f.device.submissions.length, submissions); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('pre-init computeAsync advances source frame one before its first frame-updated uniform', async t => {
+  const f = fixture(t), clock = animationHost(f.renderer), updates = [];
+  recordCompute(f.device);
+  const attribute = new T.StorageBufferAttribute(1, 1), output = N.storage(attribute, 'float', 1);
+  let kernel;
+  const value = N.uniform(0).onFrameUpdate(frame => {
+    assert.equal(frame.renderer, f.renderer); assert.equal(frame.compute, kernel);
+    updates.push(frame.frameId); return frame.frameId + .125;
+  });
+  kernel = N.Fn(() => { output.element(0).assign(value); })().compute(1);
+  t.after(() => kernel.dispose());
+  assert.equal(f.renderer.initialized, false);
+  await f.renderer.computeAsync(kernel); await drain(f.renderer);
+  assert.equal(f.renderer.initialized, true);
+  assert.equal(f.renderer.info.frame, 1); assert.equal(f.renderer._nodes.nodeFrame.frameId, 1);
+  assert.deepEqual(updates, [1]); assert.equal(value.value, 1.125);
+  assert.equal(f.device.computePasses.length, 1);
+  const uniforms = [...f.device.computePasses[0].groups.values()].flatMap(group => group.entries)
+    .filter(entry => entry.resource.buffer?.usage & 64)
+    .flatMap(entry => [...new Float32Array(entry.resource.buffer.data)]);
+  assert.ok(uniforms.includes(1.125), 'the first submitted kernel receives the updated source uniform');
+  assert.equal(clock.pending, 1); assert.equal(f.renderer.getAnimationLoop(), null);
+  f.renderer.compute(kernel);
+  assert.deepEqual(updates, [1], 'another compute in the same frame does not repeat a frame update');
+  clock.tick(16); f.renderer.compute(kernel);
+  assert.equal(f.renderer.info.frame, 2); assert.deepEqual(updates, [1, 2]);
+  assert.equal(f.device.computePasses.length, 3);
+  f.renderer.dispose(); assert.equal(clock.pending, 0);
+});
+
+test('explicit compileComputeAsync keeps the source clock and replacement animation callbacks running', async t => {
+  const f = fixture(t), clock = animationHost(f.renderer), callbacks = [], updates = [];
+  recordCompute(f.device);
+  let release, entered;
+  const held = new Promise(resolve => { release = resolve; });
+  const compiling = new Promise(resolve => { entered = resolve; });
+  t.after(release);
+  const createPipeline = f.device.createComputePipelineAsync;
+  f.device.createComputePipelineAsync = async descriptor => {
+    entered(); await held; return createPipeline(descriptor);
+  };
+  const attribute = new T.StorageBufferAttribute(1, 1), output = N.storage(attribute, 'float', 1);
+  const value = N.uniform(0).onFrameUpdate(frame => { updates.push(frame.frameId); return frame.frameId; });
+  const kernel = N.Fn(() => { output.element(0).assign(value); })().compute(1);
+  t.after(() => kernel.dispose());
+  await f.renderer.init();
+  const compilation = f.renderer.compileComputeAsync(kernel); compilation.catch(() => {});
+  await compiling;
+  assert.ok(f.renderer._drain); assert.equal(f.device.computePasses.length, 0);
+  clock.tick(16); assert.equal(f.renderer.info.frame, 2);
+  await f.renderer.setAnimationLoop(time => { callbacks.push(['first', time]); });
+  clock.tick(32);
+  await f.renderer.setAnimationLoop(time => { callbacks.push(['replacement', time]); });
+  clock.tick(48);
+  await f.renderer.setAnimationLoop(null); clock.tick(64);
+  assert.deepEqual(callbacks, [['first', 32], ['replacement', 48]]);
+  assert.equal(f.renderer.info.frame, 5); assert.equal(clock.pending, 1);
+  assert.deepEqual(updates, [1], 'host frames do not rerun the captured compilation updates');
+  release(); await compilation; await drain(f.renderer);
+  assert.equal(f.device.computePasses.length, 0, 'asynchronous compilation never dispatches the kernel');
+  f.renderer.compute(kernel);
+  assert.deepEqual(updates, [1, 5]); assert.equal(f.device.computePasses.length, 1);
+  assert.equal(clock.pending, 1, 'settling compilation does not install a second host callback');
+  f.renderer.dispose(); assert.equal(clock.pending, 0);
 });

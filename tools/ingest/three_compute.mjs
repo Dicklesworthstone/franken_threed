@@ -475,7 +475,7 @@ export function withThreeCompute(Base, THREE) {
       return result;
     }};
   }
-  function submit(renderer, issue, awaitSubmission = false) {
+  function submit(renderer, issue, awaitSubmission = false, animationBarrier = false) {
     check(renderer);
     if (renderer._computeTurn) return renderer._computeTurn.submit(issue, awaitSubmission);
     if (!awaitSubmission && renderer._initialized && !renderer._drain && !renderer._preparing) return issue();
@@ -483,7 +483,7 @@ export function withThreeCompute(Base, THREE) {
     const pending = new Promise((a, b) => { resolve = a; reject = b; });
     // Reserve outside the Promise executor: a full FIFO is a synchronous
     // capture failure, not an accepted texture version with a rejected promise.
-    renderer._enqueue({transfer: true, awaitSubmission, issue, resolve, reject});
+    renderer._enqueue({transfer: true, awaitSubmission, animationBarrier, issue, resolve, reject});
     return pending;
   }
   return class WebGPURenderer extends Base {
@@ -549,7 +549,7 @@ export function withThreeCompute(Base, THREE) {
       check(this);
       assertThreeNativeComputeOutsideCapture(this);
       const list = listOf(nodes), size = Array.isArray(dispatchSize) ? dispatchSize.slice() : dispatchSize;
-      const run = () => owner(this).compute(list, size, (issue, asynchronous) => submit(this, issue, asynchronous),
+      const run = () => owner(this).compute(list, size, (issue, asynchronous) => submit(this, issue, asynchronous, true),
         () => this._computeTurn ? !!this._computeTurn.pending : !!(this._drain || this._preparing));
       const result = this._initialized ? run() : submit(this, () => {
         // Nested onInit/before/after compute calls belong to this submit slot,
@@ -564,7 +564,7 @@ export function withThreeCompute(Base, THREE) {
           if (turn.pending) return turn.pending.then(() => { throw error; }, () => { throw error; });
           throw error;
         } finally { this._computeTurn = previous; }
-      }, true);
+      }, true, true);
       result?.catch(error => { this._deferredError ??= error; });
       return result;
     }

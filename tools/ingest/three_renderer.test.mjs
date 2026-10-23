@@ -250,7 +250,7 @@ test('native initialization starts the frame clock and null stops callbacks with
   const f = sceneFixture();
   await renderer.setAnimationLoop(time => { frames.push(time); renderer.render(f.scene, f.camera); });
   assert.equal(renderer.initialized, true);assert.equal(renderer.info.frame,1);
-  next(16); next(32);
+  next(16); await flush(renderer); next(32);
   assert.deepEqual(frames, [16, 32]); assert.equal(renderer.info.frame, 3);
   await flush(renderer);
   next(48);
@@ -260,6 +260,77 @@ test('native initialization starts the frame clock and null stops callbacks with
   next(64);assert.deepEqual(frames,[16,32,48]);assert.equal(renderer.info.frame,5);
   const staleTick=next;renderer.dispose();assert.equal(next,null);
   staleTick(80);assert.equal(renderer.info.frame,5,'an already scheduled callback cannot advance a disposed owner');
+});
+
+function animationHost(canvas) {
+  const scheduled = new Map(); let serial = 0;
+  canvas.ownerDocument = {defaultView: {
+    requestAnimationFrame(callback) { const id = ++serial; scheduled.set(id, callback); return id; },
+    cancelAnimationFrame(id) { scheduled.delete(id); }
+  }};
+  return {scheduled, step(time) {
+    assert.equal(scheduled.size, 1, 'one source animation tick is scheduled');
+    const [id, callback] = scheduled.entries().next().value;
+    scheduled.delete(id); callback(time);
+  }};
+}
+
+test('native animation waits for cold submission and resumes before GPU completion without losing accepted work', async t => {
+  const {renderer, device, canvas, acquired} = await create(), host = animationHost(canvas);
+  const frames = [], f = sceneFixture();
+  let releasePipeline, pipelineStarted, finishGPU;
+  const gate = new Promise(resolve => { releasePipeline = resolve; });
+  const started = new Promise(resolve => { pipelineStarted = resolve; });
+  device.completion = new Promise(resolve => { finishGPU = resolve; });
+  t.after(() => { releasePipeline(); finishGPU(); renderer.dispose(); });
+  await renderer.init();
+  const createPipeline = device.createRenderPipelineAsync.bind(device);
+  device.createRenderPipelineAsync = async descriptor => {
+    pipelineStarted(); await gate; return createPipeline(descriptor);
+  };
+  await renderer.setAnimationLoop(time => { frames.push(time); renderer.render(f.scene, f.camera); });
+  host.step(16); await started;
+  assert.equal(renderer._pending.length, 1); assert.equal(acquired(), 0);
+  host.step(32);
+  assert.equal(host.scheduled.size, 0, 'preparation suspends admission of further animation frames');
+  assert.deepEqual(frames, [16]); assert.equal(renderer.info.frame, 2);
+  assert.equal(renderer._pending.length, 1, 'the accepted draw remains in its original FIFO slot');
+  await renderer.setAnimationLoop(time => { frames.push(time * 10); renderer.render(f.scene, f.camera); });
+  releasePipeline(); await flush(renderer);
+  assert.equal(acquired(), 1, 'the accepted cold frame is submitted before resuming');
+  assert.equal(host.scheduled.size, 1, 'GPU completion is still pending but submission can resume animation');
+  host.step(48);
+  assert.deepEqual(frames, [16, 480], 'resume uses the replacement callback and fresh host time');
+  assert.equal(renderer.info.frame, 3); assert.equal(acquired(), 2);
+  await renderer.setAnimationLoop(null); host.step(64);
+  assert.equal(renderer.info.frame, 4, 'null callbacks preserve the source internal frame clock');
+  assert.deepEqual(frames, [16, 480]);
+});
+
+test('native animation resumes after a preparation failure and disposal makes a waiting resume inert', async t => {
+  for (const dispose of [false, true]) {
+    const {renderer, device, canvas} = await create(), host = animationHost(canvas), f = sceneFixture();
+    let releasePipeline, pipelineStarted;
+    const gate = new Promise(resolve => { releasePipeline = resolve; });
+    const started = new Promise(resolve => { pipelineStarted = resolve; });
+    t.after(() => { releasePipeline(); renderer.dispose(); });
+    await renderer.init();
+    const failure = new Error('cold pipeline failed');
+    device.createRenderPipelineAsync = async () => { pipelineStarted(); await gate; throw failure; };
+    await renderer.setAnimationLoop(() => renderer.render(f.scene, f.camera));
+    host.step(16); await started; host.step(32);
+    const pending = renderer._drain;
+    if (dispose) renderer.dispose();
+    releasePipeline(); await pending.catch(() => {});
+    if (dispose) {
+      assert.equal(host.scheduled.size, 0); assert.equal(renderer.info.frame, 2);
+    } else {
+      assert.equal(host.scheduled.size, 1, 'a failed drain does not silently stop the source loop');
+      assert.throws(() => host.step(48), /cold pipeline failed/);
+      assert.equal(host.scheduled.size, 1, 'the next source tick was scheduled before the callback threw');
+      renderer.dispose(); assert.equal(host.scheduled.size, 0);
+    }
+  }
 });
 
 test('WebGLRenderer surface: synchronous construction, frames before init are deferred, GL-only state fails', async () => {

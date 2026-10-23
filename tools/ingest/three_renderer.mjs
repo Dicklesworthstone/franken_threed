@@ -20,6 +20,9 @@
  *   as soon as preparation completes. Application callbacks are never skipped
  *   or replayed. `info.f3d.deferredRenders` counts such requests. Await
  *   `compileAsync(scene, camera)` to prepare ahead of the first frame.
+ *   Native animation callbacks wait for deferred command submission before
+ *   starting another frame; this bounds cold-start work without waiting for
+ *   GPU completion or discarding accepted render/compute requests.
  * - Admission failures discovered during deferred preparation are thrown from
  *   the next `render()`/`compileAsync()` call instead of the original call.
  * - Unsupported source state (advanced render targets, XR presentation, custom tone
@@ -314,6 +317,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._deferredError = null;
       this._animationCallback = null;
       this._animationHandle = null;
+      this._animationWaiting = null;
       this._animationStarted = false;
       this._animationHost = null;
       this._disposed = false;
@@ -989,9 +993,35 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         this._animationCallback = callback;
         if (!this._initialized || this._animationStarted || this._disposed) return;
         this._animationStarted = true; this._animationHost = host;
+        let starting = true;
+        const schedule = () => {
+          if (this._animationStarted && !this._disposed)
+            this._animationHandle = host.requestAnimationFrame?.(tick) ?? null;
+        };
         const tick = (time, xrFrame = null) => {
           if (!this._animationStarted || this._disposed) return;
-          this._animationHandle = host.requestAnimationFrame?.(tick) ?? null;
+          const initial = starting; starting = false;
+          this._animationHandle = null;
+          if (!initial && this._drain && this._pending.some(request =>
+            request.animationBarrier === true || !request.transfer && !request.readback)) {
+            // Source render preparation blocks its callback synchronously.
+            // Our asynchronous equivalent must finish submitting that accepted
+            // work before another animation callback can fill the bounded FIFO.
+            // Explicit asynchronous compilation/readbacks alone do not block
+            // the source frame clock, including Animation.start() during init.
+            // Resume on a fresh RAF timestamp, without replaying this host tick
+            // or waiting for execution of the submitted GPU commands.
+            if (!this._animationWaiting) {
+              const pending = this._animationWaiting = this._drain;
+              const resume = () => {
+                if (this._animationWaiting !== pending) return;
+                this._animationWaiting = null; schedule();
+              };
+              pending.then(resume, resume);
+            }
+            return;
+          }
+          schedule();
           this._advanceAnimationFrame();
           this._animationCallback?.(time, xrFrame);
         };
