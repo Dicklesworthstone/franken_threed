@@ -93,6 +93,7 @@ export async function createGpuThreeScene(device,scene,{
   const backgroundScene=()=>passBackgroundState??scene;
   const colorMaterial=m=>m&&m.allowOverride===true&&passOverride!==null?passOverride:m;
   const colorMaterials=o=>(Array.isArray(o.material)?o.material:[o.material]).map(colorMaterial);
+  const excludedNodeObject=o=>passNodeFrame?.excludedObjects?.has(o)===true;
   const capturedNodeObject=o=>passNodeFrame&&(passNodeFrame.objects.has(o)||colorMaterials(o).some(hasThreeNodeProgram));
   if(!(textures instanceof Map)||typeof sortObjects!=='boolean'||typeof autoTextures!=='boolean')fail('OPTIONS','Expected a texture binding Map and boolean texture/sorting options');
   if(!textureOptions||typeof textureOptions!=='object'||Array.isArray(textureOptions))fail('OPTIONS','Expected texture ownership options');
@@ -291,6 +292,11 @@ export async function createGpuThreeScene(device,scene,{
       if(!(object instanceof three.Object3D)||seen.has(object)||!Array.isArray(object.children))fail('GRAPH','Expected an acyclic source hierarchy');
       seen.add(object);nodes.push(object);if(nodes.length>maxNodes)fail('LIMIT','Source node capacity exceeded');
       if(object.children.length+stack.length+nodes.length>maxNodes)fail('LIMIT','Source node capacity exceeded');
+      for(let i=object.children.length-1;i>=0;i--)stack.push(object.children[i]);
+      // Source projection skips hidden objects before touching render hooks,
+      // materials or geometry. Keep hierarchy/capacity validation, while the
+      // accepted native capture retains inherited visibility through any await.
+      if(excludedNodeObject(object))continue;
       if(object.onBeforeRender!==three.Object3D.prototype.onBeforeRender||object.onAfterRender!==three.Object3D.prototype.onAfterRender){
         // WebGL surface: program draws run the callbacks around each draw, in
         // draw order, as renderObject does; the core path never could.
@@ -348,21 +354,21 @@ export async function createGpuThreeScene(device,scene,{
           geometryAdmission(object.geometry,object);
         }
       }
-      for(let i=object.children.length-1;i>=0;i--)stack.push(object.children[i]);
     }
+    const activeNodes=nodes.filter(object=>!excludedNodeObject(object));
     // Captured native programs own their light selection and uniform bytes.
     // Fixed or mixed scenes still use the ordinary fixed-light admission below.
-    nativeLightMode=!!passNodeFrame&&nodes.every(object=>!drawable(object)||capturedNodeObject(object));
+    nativeLightMode=!!passNodeFrame&&activeNodes.every(object=>!drawable(object)||capturedNodeObject(object));
     // Shadow ownership: the core's single projected map, or (WebGL surface) the
     // r186 WebGLShadowMap port drawing depth/distance programs for every caster.
-    programShadowMode=wantsProgramShadows(nodes);
+    programShadowMode=wantsProgramShadows(activeNodes);
     // Lights only the r186 programs shade (rect-area LTC, projected spot maps)
     // put every lit material on the program route, as shadow maps do.
-    programLightMode=programShadowMode||(programRoute()&&nodes.some(o=>o.isLight&&(o.isRectAreaLight||(o.isSpotLight&&!!o.map))));
+    programLightMode=programShadowMode||(programRoute()&&activeNodes.some(o=>o.isLight&&(o.isRectAreaLight||(o.isSpotLight&&!!o.map))));
     // Transmissive materials (r186 renderTransmissionPass) re-render the opaque
     // list offscreen through programs: every draw takes the program route.
-    programTransmissionMode=passOverride===null&&programRoute()&&!!programSupport.createTransmission&&nodes.some(o=>(Array.isArray(o.material)?o.material:[o.material]).some(m=>m?.transmission>0));
-    for(const object of nodes){
+    programTransmissionMode=passOverride===null&&programRoute()&&!!programSupport.createTransmission&&activeNodes.some(o=>(Array.isArray(o.material)?o.material:[o.material]).some(m=>m?.transmission>0));
+    for(const object of activeNodes){
       if(!nativeLightMode&&(object.isLightProbe||object.isLightProbeGrid))fail('OBJECT',`Unsupported source renderable: ${object.type}`);
       if(object.isLight&&!programLightMode&&!nativeLightMode)light(object);
       if(shadowEnabled&&object.isMesh&&object.castShadow&&!programShadowMode&&!capturedNodeObject(object)){
@@ -382,13 +388,13 @@ export async function createGpuThreeScene(device,scene,{
     if(coreEnvironment()!==null)environmentApi.inspectThreeEnvironment(scene.environment,three,environmentOptions);
     if(shadowEnabled){
       if(passOverride!==null&&!programRoute()&&!nativeLightMode)fail('SHADOW','Source shadow mode does not infer overrideMaterial depth semantics');
-      shadowLight(nodes);
+      shadowLight(activeNodes);
     }
     return nodes;
   }
   function wantsProgramShadows(nodes){
     if(!shadowEnabled||!programRoute()||!programSupport.createShadows)return false;
-    const lights=nodes.filter(o=>o.isLight&&o.castShadow);
+    const lights=nodes.filter(o=>!excludedNodeObject(o)&&o.isLight&&o.castShadow);
     if(!lights.length)return false;
     // The native single-map owner derives casters from color bindings. With an
     // override, preserve the ORIGINAL shadow materials through the program owner.
@@ -398,7 +404,7 @@ export async function createGpuThreeScene(device,scene,{
   }
   function shadowLight(nodes){
     if(programShadowMode||nativeLightMode)return null;
-    const lights=nodes.filter(o=>o.isLight&&o.castShadow);
+    const lights=nodes.filter(o=>!excludedNodeObject(o)&&o.isLight&&o.castShadow);
     if(lights.length>1)fail('SHADOW','Only one source projected shadow light is admitted');
     return lights[0]??null;
   }
@@ -1521,10 +1527,10 @@ export async function createGpuThreeScene(device,scene,{
       while(stack.length){
         const item=stack.pop(),object=item.object;let groupOrder=item.groupOrder;
         if(++visited>maxNodes)fail('LIMIT','Source traversal capacity exceeded');
-        if(object.visible===false)continue;
+        if(excludedNodeObject(object)||(passNodeFrame?.visibility?.get(object)??object.visible!==false)===false)continue;
         if(object.layers.test(camera.layers)){
           if(object.isGroup)groupOrder=object.renderOrder;
-          else if(object.isLOD){if(object.autoUpdate)object.update(camera);}
+          else if(object.isLOD){if(object.autoUpdate&&!passNodeFrame?.visibility?.has(object))object.update(camera);}
           else if(object.isLight){if(!programLightMode&&!nativeLightMode)lighting.lights.push(light(object));lightSources.push(object);}
           else if(object.isLineLoop&&!programRoute()){
             // Source r186 WebGPU behavior: report and draw nothing for this object.

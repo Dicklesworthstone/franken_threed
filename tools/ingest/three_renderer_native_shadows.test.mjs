@@ -350,3 +350,34 @@ test('explicit shadow target resize or disposal still invalidates every queued g
     assert.equal(f.renderer._targets.size, 0); assert.equal(f.renderer._nodeCaptureBytes, 0);
   }
 });
+
+test('hidden H7 source skins do not poison their captured visible computed sibling', async t => {
+  const f = fixture(t), character = new T.Group(); character.name = 'Character';
+  f.scene.remove(f.caster); character.add(f.caster); f.scene.add(character);
+  const originalMaterial = new T.MeshPhysicalMaterial(), originalGeometry = new T.BufferGeometry();
+  const source = new T.SkinnedMesh(originalGeometry, originalMaterial);
+  source.name = 'Original source skin'; source.visible = false; source.castShadow = true;
+  const hiddenAccess = () => { throw new Error('hidden source render state was inspected'); };
+  source.onBeforeRender = source.onAfterRender = source.onBeforeShadow = source.onAfterShadow = hiddenAccess;
+  Object.defineProperty(source, 'geometry', {configurable: true, get: hiddenAccess});
+  Object.defineProperty(source, 'material', {configurable: true, get: hiddenAccess});
+  character.add(source);
+  let updates = 0;
+  f.material.colorNode = f.material.colorNode.mul(N.uniform(1).onObjectUpdate(() => { updates++; return 1; }));
+  await f.renderer.init(); f.renderer.render(f.scene, f.camera);
+  assert.equal(updates, 1); assert.equal(f.acquired(), 0);
+  source.visible = true;
+  await drain(f.renderer);
+  assert.equal(f.renderer.info.f3d.presentedRenders, 1, 'later visibility cannot change an accepted parent or shadow pass');
+  assert.equal(targetPasses(f.device).flatMap(pass => pass.draws).length, 1);
+  assert.equal(receiverDraws(f.device).length, 1); assert.equal(f.renderer._nodeCaptureBytes, 0);
+  Object.defineProperty(source, 'geometry', {configurable: true, writable: true, value: f.caster.geometry});
+  Object.defineProperty(source, 'material', {configurable: true, writable: true, value: originalMaterial});
+  source.onBeforeRender = T.Object3D.prototype.onBeforeRender; source.onAfterRender = T.Object3D.prototype.onAfterRender;
+  source.onBeforeShadow = T.Object3D.prototype.onBeforeShadow; source.onAfterShadow = T.Object3D.prototype.onAfterShadow;
+  const submissions = f.device.submissions.length;
+  f.renderer._nodes.nodeFrame.update();
+  assert.throws(() => f.renderer.render(f.scene, f.camera), {code: 'THREE_NODE_PROGRAM_OBJECT'});
+  assert.equal(updates, 1, 'new visible unsupported source is rejected before application draw updates');
+  assert.equal(f.device.submissions.length, submissions); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});

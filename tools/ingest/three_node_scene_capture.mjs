@@ -26,8 +26,8 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   // The source inserts a private background object into the render list. Admit
   // and prepare it without adding it to, or updating through, the user's root.
   if (backgroundMesh) stack.push(backgroundMesh);
-  // Traverse hidden objects too: preparation must admit every program before a
-  // visible logical draw can run an application node callback.
+  // Validate the complete hierarchy without inspecting inactive renderables.
+  // The source projects only objects whose complete ancestor chain is visible.
   while (stack.length) {
     const object = stack.pop();
     if (!(object instanceof three.Object3D) || hierarchy.has(object) || !Array.isArray(object.children))
@@ -37,17 +37,42 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     const children = object.children.slice(); hierarchy.set(object, children);
     for (let i = children.length - 1; i >= 0; i--) stack.push(children[i]);
   }
+  const visibility = new Map(), excludedObjects = new Set();
+  let matricesUpdated = false, lodCaptured = false;
+  const updateMatrices = () => {
+    if (matricesUpdated) return;
+    if (root.matrixWorldAutoUpdate === true) root.updateMatrixWorld();
+    if (camera.parent === null && camera.matrixWorldAutoUpdate === true) camera.updateMatrixWorld();
+    matricesUpdated = true;
+  };
+  const pendingVisibility = [{object: root, parentVisible: true}];
+  if (backgroundMesh) pendingVisibility.push({object: backgroundMesh, parentVisible: true});
+  while (pendingVisibility.length) {
+    const {object, parentVisible} = pendingVisibility.pop();
+    const active = object === backgroundMesh || parentVisible && object.visible !== false;
+    visibility.set(object, active);
+    if (!active) { excludedObjects.add(object); objects.add(object); }
+    // LOD mutates child visibility during source projection. Run it once before
+    // admitting those children, then retain that selection through preparation.
+    if (active && object.isLOD && object.autoUpdate === true && object.layers.test(camera.layers)) {
+      updateMatrices(); object.update(camera); lodCaptured = true;
+    }
+    const children = hierarchy.get(object);
+    for (let i = children.length - 1; i >= 0; i--)
+      pendingVisibility.push({object: children[i], parentVisible: active});
+  }
   // A native shadow receiver must share one shadow owner with every caster and
   // ordinary material in its scene. Keep genuinely fixed-only scenes on their
   // established route; explicit node materials and ShadowMaterial opt the
   // complete shadow scene into native compilation. Unsupported mixed material
   // classes then fail at the compiler instead of creating a second shadow map.
   const nativeShadowScene = !shadowPass && renderer?.shadowMap?.enabled === true &&
-    [...hierarchy.keys()].some(object => object !== backgroundMesh &&
+    [...hierarchy.keys()].some(object => visibility.get(object) && object !== backgroundMesh &&
       (Array.isArray(object.material) ? object.material : [object.material]).some(material =>
         hasThreeNodeProgram(material) || material instanceof three.NodeMaterial || material?.isShadowMaterial === true));
   const nativeMaterial = material => nativeShadowScene ? material != null : hasThreeNodeProgram(material);
   for (const object of hierarchy.keys()) {
+    if (!visibility.get(object)) continue;
     if (!object.material) continue;
     if (shadowPass) {
       // The retained source selector, rather than the ordinary fixed route,
@@ -115,7 +140,21 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     pairs.set(object, {originals, effective, byMaterial, array: Array.isArray(object.material), geometry});
     objects.add(object);
   }
-  if (!objects.size && !shadowPass) return null;
+  if (!bindings.length) {
+    if (!objects.size && !shadowPass && !lodCaptured) return null;
+    // The facade marks every captured pass as having updated source matrices,
+    // including an empty pass. Hidden skins still participate in CPU animation.
+    updateMatrices();
+    if (camera.coordinateSystem !== three.WebGPUCoordinateSystem) {
+      if (typeof camera.updateProjectionMatrix !== 'function') fail('CAMERA', 'The source camera cannot update its WebGPU projection');
+      camera.coordinateSystem = three.WebGPUCoordinateSystem; camera.updateProjectionMatrix();
+    }
+    // An exclusion-only capture still owns its source visibility. In particular,
+    // a later visible=true cannot send an accepted hidden mesh to the fixed path.
+    return Object.freeze({objects, excludedObjects, visibility, bindings: Object.freeze([]), draws: Object.freeze([]),
+      bytes: 0, background: false, prepareAttributes() {}, installAttributes() {},
+      textureOwner: null, textureUses: Object.freeze([]), storageOwner: null, storageUses: Object.freeze([])});
+  }
   if (!(camera instanceof three.Camera) || camera.isArrayCamera || camera.isMultiViewCamera || camera.reversedDepth || renderer?.reversedDepthBuffer)
     fail('CAMERA', 'Native node scenes require an ordinary non-reversed camera');
   if (typeof getPrograms !== 'function' || typeof raster !== 'function' || !renderer?._nodes?.nodeFrame)
@@ -132,17 +171,16 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     ? withThreeShadowMaterial(three, renderer, binding.material, binding.original, material => {
       material.side = binding.shadowSide; return run();
     }) : run();
-  // Admission is completed before camera updates, graph construction or node
-  // updates. In particular, a hidden unsupported graph cannot cause partial
-  // visible update callbacks followed by a preparation refusal.
+  // Every active binding is admitted before graph construction or application
+  // draw updates. Previously hidden graphs are re-admitted on their first live
+  // call, so a refusal cannot follow partial visible draw callbacks.
   for (const binding of bindings) withBinding(binding, () => programs.inspect(binding.material, binding.object, context));
-  if (root.matrixWorldAutoUpdate === true) root.updateMatrixWorld();
+  updateMatrices();
   if (backgroundMesh?.matrixWorldAutoUpdate === true) backgroundMesh.updateMatrixWorld();
   if (camera.coordinateSystem !== three.WebGPUCoordinateSystem) {
     if (typeof camera.updateProjectionMatrix !== 'function') fail('CAMERA', 'The source camera cannot update its WebGPU projection');
     camera.coordinateSystem = three.WebGPUCoordinateSystem; camera.updateProjectionMatrix();
   }
-  if (camera.parent === null && camera.matrixWorldAutoUpdate === true) camera.updateMatrixWorld();
   const opaque = [], translucent = [], backgroundDraws = [], draws = [], lights = [], preparationBindings = new Set();
   let fixedDrawCandidates = false;
   {
@@ -178,10 +216,10 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     }
     while (visible.length) {
       const item = visible.pop(), object = item.object; let {groupOrder} = item;
-      if (object.visible === false) continue;
+      if (!visibility.get(object)) continue;
       if (object.layers.test(camera.layers)) {
         if (object.isGroup) groupOrder = object.renderOrder;
-        else if (object.isLOD) { if (object.autoUpdate === true) object.update(camera); }
+        else if (object.isLOD) { /* Selection was captured before binding admission. */ }
         else if (object.isLight) lights.push(object);
         // Fixed draws are selected and merged by the core after this native
         // capture. Their order can precede draws[0], including when sorting is
@@ -345,13 +383,13 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   }
   draws.splice(0, draws.length, ...capturedDraws);
   let preparedAttributes = null;
-  return Object.freeze({objects, bindings: Object.freeze(bindings), draws: Object.freeze(draws), bytes, background: backgroundMesh !== null,
+  return Object.freeze({objects, excludedObjects, visibility, bindings: Object.freeze(bindings), draws: Object.freeze(draws), bytes, background: backgroundMesh !== null,
     prepareAttributes() {
       if (uniforms) return;
       // compileAsync uploads visible geometry even though this preparation
       // profile runs no application updates. Establish that initial resident
-      // history at preparation, so later unmarked edits remain stale. Hidden
-      // bindings are admitted above but do not acquire a source upload history.
+      // history at preparation, so later unmarked edits remain stale. Inactive
+      // objects have no binding and do not acquire a source upload history.
       preparedAttributes ??= [...preparationBindings].map(binding => withBinding(binding, () => programs.captureAttributes?.(
         binding.nodeProgram, {...frameContext, object: binding.object, material: binding.material}))).filter(Boolean);
       for (const attributes of preparedAttributes) attributes.install();

@@ -100,9 +100,12 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     return `${isScene && scene.fog ? 1 : 0}${isScene && scene.environment ? 1 : 0}${background ? 1 : 0}${renderer.shadowMap.enabled ? 1 : 0}${renderer._needsGlobalClipping?.() ? 1 : 0}`;
   }
   /** Preparation-time traversal for options that depend on materials. */
-  function needsClipping(scene, overrideMaterial = scene.isScene === true ? scene.overrideMaterial : null) {
+  function needsClipping(scene, overrideMaterial = scene.isScene === true ? scene.overrideMaterial : null, nodeFrame = null) {
     let clipping = false;
     scene.traverse(object => {
+      // A queued native render owns its visibility selection. Hidden source
+      // objects must not force material admission during later preparation.
+      if (nodeFrame?.excludedObjects?.has(object)) return;
       const list = Array.isArray(object.material) ? object.material : object.material ? [object.material] : [];
       if (list.some(m => m?.clippingPlanes?.length)) clipping = true;
     });
@@ -141,7 +144,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           for (const [scene, key] of wanted) {
             const passOptions = root === scene ? destination._preparationOptions : undefined;
             const overrideMaterial = passOptions ? passOptions.overrideMaterial : scene.isScene === true ? scene.overrideMaterial : null;
-            const clipping = needsClipping(scene, overrideMaterial) || owner._needsGlobalClipping?.() === true;
+            const clipping = needsClipping(scene, overrideMaterial, passOptions?.nodeFrame) || owner._needsGlobalClipping?.() === true;
             const previous = entries.get(scene);
             if (previous && previous.key === key && (previous.clipping || !clipping) && !previous.bridge.failed) {
               await previous.bridge.prepare(passOptions);
@@ -764,7 +767,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         this._submit(request); this._releaseRequest(request);
       }
       catch (error) {
-        if (isPrepareBoundary(error) || (error?.code === 'THREE_SCENE_MATERIAL' && !entry.clipping && needsClipping(scene, request.overrideMaterial)))
+        if (isPrepareBoundary(error) || (error?.code === 'THREE_SCENE_MATERIAL' && !entry.clipping && needsClipping(scene, request.overrideMaterial, request.nodeFrame)))
           return this._defer(request);
         this._releaseRequest(request);
         throw error;

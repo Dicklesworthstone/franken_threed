@@ -40,12 +40,14 @@ test('native shadow intent promotes default mesh materials without changing fixe
     assert.deepEqual(result.draws.map(draw => draw.object), [ordinary, native]);
   }
 });
-test('unsupported mixed shadow materials fail before native draw updates', t => {
+test('unsupported mixed shadow materials are re-admitted before updates when they become visible', t => {
   const f = rig(t); f.renderer.shadowMap = {enabled: true};
   const material = f.material(); let updates = 0;
   material.colorNode = N.uniform(.5).onObjectUpdate(() => { updates++; return .5; }); f.mesh(material);
-  f.mesh(new THREE.ShaderMaterial()).visible = false;
-  assert.throws(() => f.capture(), {code: 'THREE_NODE_PROGRAM_MATERIAL'}); assert.equal(updates, 0);
+  const hidden = f.mesh(new THREE.ShaderMaterial()); hidden.visible = false;
+  const captured = f.capture(); assert.ok(captured.excludedObjects.has(hidden)); assert.equal(updates, 1);
+  hidden.visible = true;
+  assert.throws(() => f.capture(), {code: 'THREE_NODE_PROGRAM_MATERIAL'}); assert.equal(updates, 1);
 });
 test('private native backgrounds precede scene draws independently of sorting, layers and overrides', t => {
   for (const sortObjects of [false, true]) {
@@ -86,7 +88,8 @@ test('a private background prepares and captures when all user scene materials u
   assert.equal(prepared.background, true); assert.equal(prepared.bindings.length, 1);
   assert.equal(prepared.bindings[0].object, background); assert.equal(prepared.draws.length, 0); assert.equal(updates, 0);
   const captured = f.capture({backgroundMesh: background});
-  assert.equal(captured.background, true); assert.deepEqual([...captured.objects], [background]);
+  assert.equal(captured.background, true); assert.deepEqual(captured.objects, new Set([f.scene, fixed, background]));
+  assert.deepEqual(captured.excludedObjects, new Set([f.scene, fixed]));
   assert.equal(captured.draws.length, 1); assert.equal(captured.draws[0].object, background);
   assert.equal(captured.draws[0].background, true); assert.equal(updates, 1);
   assert.deepEqual(f.scene.children, children); assert.equal(fixed.parent, f.scene); assert.equal(background.parent, null);
@@ -145,13 +148,20 @@ test('nested preparation preserves the outer render clock and source update freq
   assert.equal(f.renderer.info.calls, 16, 'capturing the outer clock does not roll back nested counters');
   assert.deepEqual([f.frame.frameId, f.frame.time, f.frame.deltaTime], [8, 2, .25]);
 });
-test('compile-only capture prepares hidden bindings without node updates or frame advancement', t => {
+test('compile-only capture excludes hidden bindings without constructing their programs or advancing updates', t => {
   const f = rig(t), m = f.material(); let calls = 0;
   m.colorNode = N.uniform(new THREE.Color()).onObjectUpdate(() => { calls++; return new THREE.Color(1, 0, 0); });
   const a = f.mesh(m), b = f.mesh(m); a.visible = false; b.visible = false;
-  const result = f.capture({uniforms: false, maxUniformBytes: 0});
-  assert.equal(result.objects.size, 2); assert.equal(result.bindings.length, 2);
+  a.position.x = 3;
+  const result = f.capture({uniforms: false, maxUniformBytes: 0, getPrograms() { assert.fail('inactive graphs must not compile'); }});
+  assert.equal(result.objects.size, 2); assert.equal(result.bindings.length, 0);
+  assert.deepEqual(result.excludedObjects, new Set([a, b]));
   assert.equal(result.draws.length, 0); assert.equal(result.bytes, 0); assert.equal(calls, 0);
+  assert.equal(a.matrixWorld.elements[12], 3); assert.equal(f.camera.matrixWorld.elements[14], 5);
+  a.visible = true;
+  const visible = f.capture({uniforms: false, maxUniformBytes: 0});
+  assert.equal(visible.bindings.length, 1); assert.equal(visible.bindings[0].object, a); assert.equal(calls, 0);
+  assert.ok(result.excludedObjects.has(a), 'accepted visibility remains frozen after source flags change');
   assert.deepEqual([f.frame.frameId, f.frame.time, f.frame.deltaTime, f.renderer.info.calls], [7, 1.25, .125, 3]);
 });
 test('native Mesh.count is captured after updates, including empty draws, before after-updates', t => {
@@ -171,7 +181,7 @@ test('native Mesh.count is captured after updates, including empty draws, before
   assert.match(prepared.bindings[0].nodeProgram.vertex, /@builtin\(\s*instance_index\s*\)/);
 });
 
-test('source selection keeps hidden bindings and follows visibility, layers, frustum and LOD', t => {
+test('source selection excludes inherited hidden bindings and captures changing LOD visibility', t => {
   const f = rig(t), hidden = new THREE.Group(); hidden.visible = false; f.scene.add(hidden);
   const hiddenChild = f.mesh(undefined, hidden), offscreen = f.mesh(); offscreen.position.x = 100;
   const wrongLayer = f.mesh(); wrongLayer.layers.set(2);
@@ -180,9 +190,16 @@ test('source selection keeps hidden bindings and follows visibility, layers, fru
   const lod = new THREE.LOD(); f.scene.add(lod);
   const near = f.mesh(undefined, lod), far = f.mesh(undefined, lod); lod.addLevel(near, 0); lod.addLevel(far, 4);
   const result = f.capture();
-  assert.equal(result.bindings.length, 6); assert.ok(result.objects.has(hiddenChild));
+  assert.equal(result.bindings.length, 4); assert.ok(result.objects.has(hiddenChild));
+  assert.deepEqual(result.excludedObjects, new Set([hidden, hiddenChild, near]));
   assert.deepEqual(new Set(result.draws.map(draw => draw.object)), new Set([visibleChild, far]));
   assert.equal(near.visible, false); assert.equal(far.visible, true);
+  f.camera.position.z = 2;
+  const next = f.capture();
+  assert.equal(next.bindings.length, 4);
+  assert.deepEqual(new Set(next.draws.map(draw => draw.object)), new Set([visibleChild, near]));
+  assert.deepEqual(next.excludedObjects, new Set([hidden, hiddenChild, far]));
+  assert.equal(result.visibility.get(far), true); assert.equal(result.visibility.get(near), false);
 });
 test('native opaque sorting uses depth before object id, with source group and transparency order', t => {
   const f = rig(t), earlyMaterial = f.material(), lateMaterial = f.material();
@@ -206,9 +223,9 @@ test('material groups capture their intersections and update once per logical dr
   assert.deepEqual(result.draws.map(draw => [draw.first, draw.count]), [[1, 2], [3, 2], [1, 3]]);
   assert.equal(result.draws[0].group.start, 0); assert.equal(result.draws[0].binding, result.draws[2].binding);
 });
-test('hidden invalid graphs, mixed arrays and effectful upload/object hooks refuse before updates', t => {
+test('active invalid graphs, mixed arrays and effectful upload/object hooks refuse before updates', t => {
   const cases = [
-    f => { const m = f.material(); m.colorNode = N.texture(new THREE.Texture()); f.mesh(m).visible = false; },
+    f => { const m = f.material(); m.colorNode = N.texture(new THREE.Texture()); f.mesh(m); },
     f => { f.mesh([f.material(), new THREE.MeshBasicMaterial()]); },
     f => { f.mesh().geometry.attributes.position.onUpload(() => {}); },
     f => { f.mesh().geometry.index.onUpload(() => {}); },
@@ -223,6 +240,19 @@ test('hidden invalid graphs, mixed arrays and effectful upload/object hooks refu
     assert.throws(() => f.capture(), error => error.code?.startsWith('THREE_NODE_PROGRAM_'));
     assert.equal(updates, 0);
   }
+});
+test('hidden authored graphs stay inactive through their ancestor and re-admit before any draw update', t => {
+  const f = rig(t), activeMaterial = f.material(), hidden = new THREE.Group(); let updates = 0;
+  activeMaterial.colorNode = N.uniform(.5).onObjectUpdate(() => { updates++; return .5; }); f.mesh(activeMaterial);
+  hidden.visible = false; f.scene.add(hidden);
+  const invalidMaterial = f.material(); invalidMaterial.colorNode = N.texture(new THREE.Texture());
+  const child = f.mesh(invalidMaterial, hidden);
+  const accepted = f.capture();
+  assert.equal(accepted.bindings.length, 1); assert.equal(updates, 1);
+  assert.ok(accepted.excludedObjects.has(child)); assert.equal(child.visible, true);
+  hidden.visible = true;
+  assert.throws(() => f.capture(), error => error.code?.startsWith('THREE_NODE_PROGRAM_'));
+  assert.equal(updates, 1); assert.equal(accepted.visibility.get(child), false);
 });
 test('all compile and raster admission completes before callbacks, and budgets preflight without partial updates', t => {
   const f = rig(t), m = f.material(); let updates = 0;
