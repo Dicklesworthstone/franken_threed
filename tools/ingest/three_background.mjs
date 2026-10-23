@@ -20,12 +20,15 @@ const same = (a,b) => a.length === b.length && a.every((v,i) => v === b[i]);
 /** Shared metadata-only admission. Data panoramas reuse environment conversion
  * (including byte/sRGB inputs). Browser panoramas, screen images and cubes reuse
  * source texture residency: no CPU readback, conversion pass or duplicate upload
- * implementation. No environment filtering is needed for an unblurred backdrop.
+ * implementation. Raw half-float screen/cube data use the same texture owner,
+ * retaining HDR bits and mip chains. No filtering is run just for a backdrop.
  */
 export function inspectThreeBackground(texture, three, {maxPixels = 16 * 1024 * 1024} = {}) {
   const equirectangular = texture?.isCubeTexture !== true &&
     texture?.mapping === three?.EquirectangularReflectionMapping;
-  if (texture?.type !== three?.UnsignedByteType || equirectangular && texture?.isDataTexture === true) {
+  const rawHalf = texture?.type === three?.HalfFloatType &&
+    (texture?.isCubeTexture === true || texture?.mapping === three?.UVMapping);
+  if (!rawHalf && (texture?.type !== three?.UnsignedByteType || equirectangular && texture?.isDataTexture === true)) {
     return Object.freeze({...inspectThreeEnvironment(texture, three, {maxPixels}), mapping: 'panorama'});
   }
   const shape = inspectThreeTexture(texture, three, {maxPixels, maxTextureBytes:Number.MAX_SAFE_INTEGER});
@@ -34,10 +37,10 @@ export function inspectThreeBackground(texture, three, {maxPixels = 16 * 1024 * 
   if (imagePanorama && (shape.data || shape.video || shape.layered ||
       shape.width !== 2 * shape.height || texture.premultiplyAlpha))
     fail('PROFILE', 'Image panoramas require ready, unpremultiplied 2:1 RGBA browser images');
-  if (shape.channels !== 4 || (shape.cube
+  if (shape.channels !== 4 || shape.layered || !['rgba8unorm','rgba16float'].includes(shape.format) || (shape.cube
       ? ![three.CubeReflectionMapping, three.CubeRefractionMapping].includes(texture.mapping)
       : !imagePanorama && texture.mapping !== three.UVMapping))
-    fail('PROFILE', 'Byte backgrounds require RGBA screen images, equirectangular panoramas or reflection/refraction cubes');
+    fail('PROFILE', 'Backgrounds require filterable RGBA8/RGBA16F screen textures, panoramas or reflection/refraction cubes');
   if (texture.onUpdate !== null) fail('HOOK', 'Background upload callbacks require their explicit texture owner');
   if (mapping === 'screen' && (typeof texture.matrixAutoUpdate !== 'boolean' ||
       texture.updateMatrix !== three.Texture.prototype.updateMatrix))

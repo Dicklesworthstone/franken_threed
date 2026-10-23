@@ -69,12 +69,14 @@ const mipBytes=(w,h,mips)=>{let bytes=0;for(let i=0;i<(mips?1+Math.floor(Math.lo
 function setup(texture=new Texture()) {
   const loss=defer(),state={textures:[],buffers:[],pools:[],scopes:[],shaders:[],groups:[],pipelines:[],passes:[],writes:[],uploads:[],events:[],environmentCalls:0,pixelCalls:0};
   globalThis[key]=state;
-  state.inspect=t=>{if(state.admissionError)throw state.admissionError;const {width,height}=t.image;
+  state.inspect=t=>{if(state.admissionError)throw state.admissionError;
+    const images=t.isCubeTexture?t.image.map(f=>f.image??f):[t.image],{width,height}=images[0],bpc=t.type===1?2:1;
+    const format=bpc===2?'rgba16float':'rgba8unorm';
     const levels=t.generateMipmaps?1+Math.floor(Math.log2(Math.max(width,height))):1;
-    return {width,height,channels:4,bytes:mipBytes(width,height,t.generateMipmaps),levels,cube:!!t.isCubeTexture,
-      data:!!t.isDataTexture,video:!!t.isVideoTexture,layered:!!t.isDataArrayTexture,
-      viewFormat:t.colorSpace==='srgb'?'rgba8unorm-srgb':'rgba8unorm',uploads:[{image:t.image,level:0,layer:0}],
-      key:JSON.stringify([width,height,levels,t.colorSpace,t.flipY,t.generateMipmaps,t.minFilter,t.magFilter,t.wrapS,t.wrapT,t.anisotropy,t.unpackAlignment])};};
+    return {width,height,format,channels:4,bytes:mipBytes(width,height,t.generateMipmaps)*bpc*images.length,levels,cube:!!t.isCubeTexture,
+      data:!!t.isDataTexture||!!t.isCubeTexture&&!!t.image[0]?.isDataTexture,video:!!t.isVideoTexture,layered:!!t.isDataArrayTexture,
+      viewFormat:bpc===2?format:t.colorSpace==='srgb'?'rgba8unorm-srgb':format,uploads:images.map((image,layer)=>({image,layer,level:0})),
+      key:JSON.stringify([width,height,levels,format,t.colorSpace,t.flipY,t.generateMipmaps,t.minFilter,t.magFilter,t.wrapS,t.wrapT,t.anisotropy,t.unpackAlignment])};};
   state.environment=t=>{state.environmentCalls++;assert.ok(t.isDataTexture,'browser images must not enter CPU panorama path');
     return {width:t.image.width,height:t.image.height,sourceBytes:t.image.width*t.image.height*8,
       signature:[t,t.image,t.image.data,t.version,t.source.version,t.flipY,t.type,t.colorSpace]};};
@@ -93,7 +95,7 @@ function setup(texture=new Texture()) {
       submit(){state.events.push('submit');},onSubmittedWorkDone(){return state.queueGate?.promise??Promise.resolve();}},
   };
   state.pool=(d,options)=>{assert.equal(d,device);const p={options,disposed:false,input:null,sampler:{borrowed:true},
-    prepare(list){assert.deepEqual(list,[texture]);const s=state.inspect(texture);this.input=d.createTexture({size:[s.width,s.height,s.cube?6:1],format:'rgba8unorm',
+    prepare(list){assert.deepEqual(list,[texture]);const s=state.inspect(texture);this.input=d.createTexture({size:[s.width,s.height,s.cube?6:1],format:s.format,
       dimension:'2d',sampleCount:1,mipLevelCount:s.levels,usage:4});if(state.prepareError)throw state.prepareError;},
     async whenIdle(){if(state.uploadGate)await state.uploadGate.promise;if(state.uploadError)throw state.uploadError;},
     nativeTexture(t){assert.equal(t,texture);assert.equal(this.disposed,false);return this.input;},binding(){return {sampler:this.sampler};},
@@ -196,5 +198,53 @@ test('screen matrices and uploaded cube X handedness do not acquire panorama Y i
   const h=setup();h.texture.mapping=T.UVMapping;const o=await h.make();const f=o.capture(h.scene,h.camera);
   assert.equal(h.texture.matrixUpdates,1);assert.ok(f.uvTransform);assert.equal(f.directionFromClip,undefined);o.dispose();
   h.texture.isCubeTexture=true;h.texture.mapping=T.CubeReflectionMapping;h.texture.isRenderTargetTexture=false;
+  h.texture.image=Array.from({length:6},()=>new Image(4,4));
   const d=ray(frame(h.scene,h.camera,T).directionFromClip,.5,.7),r=sourceRay(.5,.7,euler(),euler());near(d,[-r[0],r[1],r[2]]);
+});
+
+// Raw half-float sources use existing texture residency, not the data-panorama
+// converter. Keep this regression adjacent to LDR admission so the two routes
+// cannot accidentally reclassify one another during later profile extensions.
+function halfBackground(mapping,mips=true,size=4){
+  const face=()=>{const t=new DataTexture(Uint16Array);t.type=T.HalfFloatType;t.image.width=t.image.height=size;
+    t.image.data=new Uint16Array(size*size*4).fill(0x4800);t.image.data.set([0x7bff,0xbc00,1,0x3800]);return t;};
+  const t=mapping===T.UVMapping?face():new Texture(Array.from({length:6},face));
+  Object.assign(t,{type:T.HalfFloatType,colorSpace:'linear',mapping,generateMipmaps:mips,flipY:false,isRenderTargetTexture:false});
+  if(mapping!==T.UVMapping)t.isCubeTexture=true;return t;
+}
+for(const mapping of [T.UVMapping,T.CubeReflectionMapping,T.CubeRefractionMapping])for(const mips of [false,true])
+  test(`raw half-float background uses native HDR ${mapping} / mips=${mips}`,async()=>{
+    const h=setup(halfBackground(mapping,mips)),faces=h.texture.isCubeTexture?h.texture.image:[h.texture];
+    const before=faces.map(f=>f.image.data.slice()),o=await h.make({format:'rgba16float',sampleCount:4});
+    assert.equal(h.state.environmentCalls,0);assert.equal(h.state.pixelCalls,0);assert.equal(h.state.uploads.length,0);
+    assert.equal(h.state.textures.length,1);const t=h.state.textures[0],cube=!!h.texture.isCubeTexture;
+    assert.equal(t.format,'rgba16float');assert.equal(t.depthOrArrayLayers,cube?6:1);assert.equal(t.mipLevelCount,mips?3:1);
+    const view=h.state.groups[0].entries[2].resource;assert.equal(view.dimension,cube?'cube':'2d');assert.equal(view.format,'rgba16float');
+    assert.equal(view.arrayLayerCount,cube?6:1);assert.equal(view.mipLevelCount,mips?3:1);
+    assert.equal(h.state.groups[0].entries[1].resource,h.state.pools[0].sampler);
+    assert.equal(h.state.pipelines[0].multisample.count,4);assert.equal(h.state.pipelines[0].fragment.targets[0].format,'rgba16float');
+    const capture=o.capture(h.scene,h.camera);
+    if(cube){const r=sourceRay(.5,.7,euler(),euler());near(ray(capture.directionFromClip,.5,.7),[-r[0],r[1],r[2]]);}
+    else assert.deepEqual(capture.uvTransform,[1,0,0,1,0,0]);
+    const colorView={},resolveTarget={};o.render(capture,{colorView,resolveTarget});await o.whenIdle();
+    assert.equal(h.state.passes[0].colorAttachments[0].resolveTarget,resolveTarget);
+    assert.equal(h.state.passes[0].colorAttachments[0].storeOp,'store');assert.equal(o.drawCount,1);
+    faces.forEach((f,i)=>assert.deepEqual(f.image.data,before[i]));assert.equal(h.texture.version,1);
+    o.dispose();assert.equal(t.destroyed,1);assert.equal(h.state.buffers[0].destroyed,1);
+  });
+for(const mapping of [T.UVMapping,T.CubeReflectionMapping])for(const size of [1,3,8])
+  test(`HDR background budget includes every 8-byte texel, face and mip (${mapping}, ${size})`,async()=>{
+    const h=setup(halfBackground(mapping,true,size)),bytes=mipBytes(size,size,true)*2*(h.texture.isCubeTexture?6:1)+128;
+    await assert.rejects(h.make({maxBytes:bytes-1}),code('LIMIT'));assert.equal(h.state.textures.length,0);
+    const o=await h.make({maxBytes:bytes});assert.equal(o.allocatedBytes,bytes);assert.equal(h.state.pools[0].options.maxTextureBytes,bytes-128);o.dispose();
+  });
+for(const shape of [{layered:true},{format:'rgba32float'},{format:'rgba8uint'},{format:'bc6h-rgb-float'},{channels:2}])
+  test(`non-background native storage refuses before allocation: ${JSON.stringify(shape)}`,async()=>{
+    const h=setup(halfBackground(T.UVMapping)),describe=h.state.inspect;h.state.inspect=t=>({...describe(t),...shape});
+    await assert.rejects(h.make(),code('PROFILE'));assert.equal(h.state.textures.length,0);
+  });
+test('HDR cube data identity changes during preparation reject stale resources',async()=>{
+  const h=setup(halfBackground(T.CubeReflectionMapping));h.state.pipelineGate=defer();const work=h.make();await tick();
+  h.texture.image[5].image.data=h.texture.image[5].image.data.slice();h.state.pipelineGate.resolve({});
+  await assert.rejects(work,code('PREPARE'));assert.ok(h.state.textures.every(t=>t.destroyed===1));assert.ok(h.state.buffers.every(b=>b.destroyed===1));
 });
