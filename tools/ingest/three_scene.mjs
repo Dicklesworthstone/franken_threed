@@ -311,7 +311,7 @@ export async function createGpuThreeScene(device,scene,{
           if(object.castShadow)fail('SHADOW','BatchedMesh shadow casters are not admitted yet');
           programDeformed.add(object);
         }
-        if(!shadowEnabled&&(object.castShadow||object.receiveShadow))fail('SHADOW','Enable shadow:{} to own source shadows');
+        if(!shadowEnabled&&!capturedNodeObject(object)&&(object.castShadow||object.receiveShadow))fail('SHADOW','Enable shadow:{} to own source shadows');
         if(shadowEnabled){
           if(typeof object.castShadow!=='boolean'||typeof object.receiveShadow!=='boolean')fail('SHADOW','Expected boolean source shadow flags');
         }
@@ -365,7 +365,7 @@ export async function createGpuThreeScene(device,scene,{
     for(const object of nodes){
       if(!nativeLightMode&&(object.isLightProbe||object.isLightProbeGrid))fail('OBJECT',`Unsupported source renderable: ${object.type}`);
       if(object.isLight&&!programLightMode&&!nativeLightMode)light(object);
-      if(shadowEnabled&&object.isMesh&&object.castShadow&&!programShadowMode){
+      if(shadowEnabled&&object.isMesh&&object.castShadow&&!programShadowMode&&!capturedNodeObject(object)){
         if(object.customDepthMaterial!=null||object.customDistanceMaterial!=null||
             object.onBeforeShadow!==three.Object3D.prototype.onBeforeShadow||object.onAfterShadow!==three.Object3D.prototype.onAfterShadow)
           fail('HOOK','Custom shadow materials and callbacks need their original renderer');
@@ -381,7 +381,7 @@ export async function createGpuThreeScene(device,scene,{
     }
     if(coreEnvironment()!==null)environmentApi.inspectThreeEnvironment(scene.environment,three,environmentOptions);
     if(shadowEnabled){
-      if(passOverride!==null&&!programRoute())fail('SHADOW','Source shadow mode does not infer overrideMaterial depth semantics');
+      if(passOverride!==null&&!programRoute()&&!nativeLightMode)fail('SHADOW','Source shadow mode does not infer overrideMaterial depth semantics');
       shadowLight(nodes);
     }
     return nodes;

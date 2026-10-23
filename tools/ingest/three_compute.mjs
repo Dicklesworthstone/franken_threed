@@ -17,6 +17,7 @@ import {createGpuThreeTextures} from './three_textures.mjs';
 import {createThreeComputeTextures} from './three_compute_textures.mjs';
 import {createThreeComputeTargets} from './three_compute_targets.mjs';
 import {withStorageTextureCopies} from './three_storage_texture_copy.mjs';
+import {assertThreeNativeComputeOutsideCapture, assertThreeNativeTextureWrite} from './three_node_shadows.mjs';
 
 export class ThreeComputeError extends Error {
   constructor(code, message) {
@@ -273,6 +274,7 @@ function createThreeCompute(renderer, three) {
     for (const node of entry.builder[nodes] ?? []) frame[method](node);
   }
   function capture(node, entry, override, deferred) {
+    assertThreeNativeComputeOutsideCapture(renderer);
     const held = new Set(), textureUses = [], epoch = listeners.get(node);
     let released = false;
     entry.uses++;
@@ -350,6 +352,7 @@ function createThreeCompute(renderer, three) {
   }
   function compute(list, override, schedule, deferred) {
     live();
+    assertThreeNativeComputeOutsideCapture(renderer);
     if (issuing || capturingReads) fail('REENTRY', 'Cannot compute from an upload callback or native storage capture');
     renderer.info.calls++; renderer.info.compute.calls++; renderer.info.compute.frameCalls++;
     renderer.inspector?.beginCompute?.(`compute:${renderer.info.compute.frameCalls}:f${renderer.info.frame}`, list);
@@ -544,6 +547,7 @@ export function withThreeCompute(Base, THREE) {
     }
     compute(nodes, dispatchSize = null) {
       check(this);
+      assertThreeNativeComputeOutsideCapture(this);
       const list = listOf(nodes), size = Array.isArray(dispatchSize) ? dispatchSize.slice() : dispatchSize;
       const run = () => owner(this).compute(list, size, (issue, asynchronous) => submit(this, issue, asynchronous),
         () => this._computeTurn ? !!this._computeTurn.pending : !!(this._drain || this._preparing));
@@ -566,6 +570,7 @@ export function withThreeCompute(Base, THREE) {
     }
     async computeAsync(nodes, dispatchSize = null) { await this.compute(nodes, dispatchSize); }
     async compileComputeAsync(nodes, onProgress = null) {
+      assertThreeNativeComputeOutsideCapture(this);
       const list = listOf(nodes);
       if (onProgress !== null && typeof onProgress !== 'function') fail('OPTIONS', 'onProgress must be a function');
       await submit(this, () => owner(this).compile(list, onProgress), true);
@@ -576,6 +581,7 @@ export function withThreeCompute(Base, THREE) {
      * x/y are top-left coordinates; flipY reverses rows within the copied region. */
     async copyStorageBufferToRenderTargetAsync(attribute, target, options = {}) {
       check(this);
+      assertThreeNativeTextureWrite(this, target?.texture);
       if (!attribute || !(attribute.isStorageBufferAttribute || attribute.isStorageInstancedBufferAttribute || attribute.isIndirectStorageBufferAttribute))
         fail('STORAGE', 'Expected a source storage buffer attribute');
       if (!options || typeof options !== 'object' || Array.isArray(options)) fail('OPTIONS', 'Expected copy options');

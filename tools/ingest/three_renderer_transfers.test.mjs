@@ -5,6 +5,8 @@ import test from 'node:test';
 import {createWebGPURendererClass, createWebGLRendererClass} from './three_renderer.mjs';
 import {inspectGpuTargetWrite, gpuTargetWriteData, inspectGpuTargetCopy} from './gpu_target_transfer.mjs';
 import {textureDevice} from './fixtures/gpu_texture_device.mjs';
+import {withThreeNativeCapture} from './three_node_shadows.mjs';
+import {PerspectiveCamera, Matrix4, Layers, Texture} from '../../upstream/three.js/build/three.core.js';
 
 function deferred() {
   let resolve, reject;
@@ -17,10 +19,10 @@ class Vector {
   copy(v) { return this.set(v.x, v.y, v.z, v.w); }
 }
 class Color { constructor(r = 0, g = 0, b = 0) { Object.assign(this, {r, g, b}); } }
-class Object3D { traverse(callback) { callback(this); } }
+class Object3D { children = []; traverse(callback) { callback(this); } }
 class Scene extends Object3D { isScene = true; }
-class Camera extends Object3D {}
-const T = {REVISION: '186', Scene, Object3D, Camera, Color, Vector2: Vector, Vector4: Vector,
+class Camera extends PerspectiveCamera {}
+const T = {REVISION: '186', Scene, Object3D, Camera, Color, Texture, Matrix4, Layers, Vector2: Vector, Vector4: Vector,
   NoToneMapping: 0, SRGBColorSpace: 'srgb'};
 const layout = new Map([
   ['rgba8unorm', [Uint8Array, 4]], ['rgba8unorm-srgb', [Uint8Array, 4]],
@@ -104,6 +106,32 @@ const counts = (r, requests, bytes) => {
   assert.equal(r.info.f3d.pendingTransferBytes, bytes);
 };
 
+test('public target writes and copies cannot overwrite an earlier sampled parent attachment', async () => {
+  const f = fixture(), r = f.renderer, a = target(), b = target();
+  for (const t of [a, b]) {
+    t.texture = {isTexture: true, isRenderTargetTexture: true, renderTarget: t};
+    t.depthTexture = {isTexture: true, isDepthTexture: true, renderTarget: t};
+  }
+  await f.ready(); await r.writeRenderTargetPixelsAsync(b, new Uint8Array(b.bytes.length).fill(7));
+  const before = f.calls.length, rejected = [];
+  withThreeNativeCapture(r, record => {
+    record(b.texture); record(b.depthTexture);
+    const refusal = {code: 'THREE_NODE_PROGRAM_SHADOW'};
+    rejected.push(assert.rejects(r.writeRenderTargetPixelsAsync(b, new Uint8Array(b.bytes.length).fill(23)), refusal));
+    rejected.push(assert.rejects(r.copyRenderTargetPixelsAsync(a, b), refusal));
+    rejected.push(assert.rejects(r.copyRenderTargetDepthPixelsAsync(a, b), refusal));
+    rejected.push(assert.rejects(r.copyTextureToTextureAsync(a.texture, b.texture), refusal));
+    rejected.push(assert.rejects(r.copyStorageBufferToRenderTargetAsync({isStorageBufferAttribute: true}, b), refusal));
+    assert.throws(() => r.copyTextureToTexture(a.texture, b.texture), refusal);
+    assert.throws(() => r.copyTextureToTexture(a.depthTexture, b.depthTexture), refusal);
+    counts(r, 0, 0); assert.equal(r._pending.length, 0); assert.equal(f.calls.length, before);
+  });
+  await Promise.all(rejected);
+  assert.ok(b.bytes.every(value => value === 7));
+  await r.writeRenderTargetPixelsAsync(b, new Uint8Array(b.bytes.length).fill(29));
+  assert.ok(b.bytes.every(value => value === 29)); counts(r, 0, 0); r.dispose();
+});
+
 // Use the actual renderer, compute owner, texture owner and GPU upload path.
 // Only shader construction and host image delivery are controlled here.
 async function computeFixture(t) {
@@ -117,6 +145,8 @@ async function computeFixture(t) {
     getBindings() { return this.compute.groups; }
   }
   class NodeFrame {
+    frameId = 0;
+    update() { this.frameId++; }
     updateNode(run) { run(); } updateBeforeNode(run) { run(); } updateAfterNode(run) { run(); }
   }
   class ImageBitmap {

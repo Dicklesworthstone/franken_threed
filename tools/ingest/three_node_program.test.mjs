@@ -1411,22 +1411,28 @@ test('registered light remapping refuses the source cached node instead of silen
   const fresh = new SunLight(), context = {...f.context, lights: [fresh]};
   assert.doesNotThrow(() => f.owner.compile(f.material, f.object, context), 'a fresh light identity uses the newly registered class');
 });
-test('registered SunLight admission never turns requested shadows or projected maps into unshadowed lighting', t => {
+test('registered SunLight respects disabled shadows and refuses unsupported active shadow effects before updates', t => {
   const f = sunRig(t); let updates = 0;
   f.material.colorNode = N.uniform(new THREE.Color(.5, .5, .5)).onObjectUpdate(() => { updates++; });
   f.renderer.library.lightNodes.delete(SunLight);
   assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_LIGHTS'});
   f.renderer.library.addLight(SunLightNode, SunLight);
-  for (const enabled of [false, true]) {
-    f.renderer.shadowMap.enabled = enabled; f.sun.castShadow = true;
-    assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_LIGHTS'}); f.sun.castShadow = false;
-    for (const key of ['castShadow', 'receiveShadow']) {
-      f.object[key] = true; assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_SHADOW'}); f.object[key] = false;
-    }
-  }
+  f.sun.castShadow = true; f.object.receiveShadow = true;
+  f.renderer.shadowMap.enabled = true; f.renderer.shadowMap.type = THREE.VSMShadowMap;
+  assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_SHADOW'});
+  f.renderer.shadowMap.type = THREE.PCFShadowMap; f.sun.shadow.filterNode = N.float(1);
+  assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_SHADOW'}); f.sun.shadow.filterNode = null;
+  f.sun.shadow.shadowNode = N.float(1);
+  assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_SHADOW'}); f.sun.shadow.shadowNode = undefined;
+  f.renderer.shadowMap.transmitted = true;
+  assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_SHADOW'}); f.renderer.shadowMap.transmitted = false;
   f.sun.map = dataTexture(); assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_LIGHTS'}); f.sun.map = null;
   f.sun.colorNode = N.vec3(1); assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_LIGHTS'});
   assert.equal(updates, 0); assert.equal(f.owner.diagnostics.programs, 0);
+  f.sun.colorNode = null; f.renderer.shadowMap.enabled = false;
+  const descriptor = f.compile();
+  assert.doesNotMatch(descriptor.fragment, /texture_depth|textureSampleCompare/);
+  assert.equal(f.sun.shadow.map, null); assert.equal(updates, 0);
 });
 test('registered direct analytic nodes retain source lifecycle and native graph resource admission', t => {
   for (const kind of ['prototype lifecycle', 'instance lifecycle', 'storage write']) {

@@ -9,7 +9,7 @@ export const plain = value => JSON.parse(JSON.stringify(value));
 export class Events {
   addEventListener(type, listener) { ((this.listeners ??= {})[type] ??= new Set()).add(listener); }
   removeEventListener(type, listener) { this.listeners?.[type]?.delete(listener); }
-  dispose() { for (const listener of [...this.listeners?.dispose ?? []]) listener(); }
+  dispose() { const event = {type: 'dispose', target: this}; for (const listener of [...this.listeners?.dispose ?? []]) listener(event); }
 }
 export class Texture extends Events {
   constructor() {
@@ -24,7 +24,10 @@ export class RenderTarget extends Events {
       resolveColorBuffer: true, textures: [new Texture()]}); this.texture.renderTarget = this;
   }
   get texture() { return this.textures[0]; }
-  setSize(width, height) { this.dispose(); this.width = width; this.height = height; }
+  setSize(width, height) {
+    if (this.width === width && this.height === height) return;
+    this.width = width; this.height = height; this.dispose();
+  }
 }
 export class DepthTexture extends Texture {
   constructor(type = 1015, format = 1026) {
@@ -150,7 +153,7 @@ export async function rig({features = [], maxBytes, maxTargets, adapterOptions =
     ['./three_storage_texture_copy.mjs', synthetic({withStorageTextureCopies: Base => Base})],
     ['./three_textures.mjs', synthetic({createGpuThreeTextures() { throw new Error('Render targets must not use the CPU texture uploader'); }})],
   ]);
-  for (const name of ['three_compute_targets', 'three_compute_textures', 'three_render_targets', 'three_compute'])
+  for (const name of ['three_compute_targets', 'three_compute_textures', 'three_render_targets', 'three_compute', 'three_node_shadows'])
     modules.set(`./${name}.mjs`, new vm.SourceTextModule(await readFile(new URL(`./${name}.mjs`, import.meta.url), 'utf8'), {context, identifier: name}));
   const link = specifier => { assert.ok(modules.has(specifier), specifier); return modules.get(specifier); };
   for (const module of modules.values()) if (module.status === 'unlinked') await module.link(link);

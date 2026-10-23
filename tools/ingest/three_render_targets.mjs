@@ -192,7 +192,7 @@ const DEPTH_FLIP_WGSL = flipY => `
 export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, maxBytes = 512 * 1024 * 1024, flipY = true} = {}) {
   if (typeof getDevice !== 'function' || !positive(maxTargets) || !positive(maxBytes) || typeof flipY !== 'boolean')
     fail('OPTIONS', 'Invalid target owner options');
-  const entries = new Map(), pipelines = new Map();
+  const entries = new Map(), pipelines = new Map(), preserved = new Set(), retiring = new Set(), shadowResizes = new WeakMap();
   let disposed = false, allocatedBytes = 0, terminal = null;
   const live = () => { if (disposed) fail('DISPOSED', 'Render target owner is disposed'); if (terminal) throw terminal; };
   function release(entry) {
@@ -215,7 +215,50 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     entry.shape.texture.removeEventListener('dispose', entry.onDispose);
     entry.shape.depthTexture?.removeEventListener('dispose', entry.onDispose);
     if (entries.get(entry.target) === entry) entries.delete(entry.target);
+    preserved.delete(entry);
     release(entry);
+  }
+  function collect(entry) {
+    if (!entry.alive || !preserved.has(entry) || entry.references || entry.busy || entry.retirement) return;
+    if (!entry.storage && !entry._dispatcher) { retire(entry); return; }
+    // A sampled generation can have validation/fence observers after its last
+    // submitted reader releases its lease. Let those observers finish before
+    // destroying storage or aborting the generation's scene dispatcher.
+    const task = Promise.all([entry.validation, entry.storage?.whenIdle(), entry._dispatcher?.whenIdle()]).then(() => {
+      if (!entry.references) retire(entry);
+    }, error => {
+      if (entry.alive) { terminal ??= error; entry.error = error; retire(entry); }
+    }).finally(() => { retiring.delete(task); entry.retirement = null; });
+    entry.retirement = task; retiring.add(task);
+  }
+  const sameShape = (a, b) => a.key === b.key && a.texture === b.texture && a.depthTexture === b.depthTexture;
+  function sourceDisposed(entry, event) {
+    const resize = shadowResizes.get(entry.target);
+    if (resize && event?.target === entry.target && (!resize.event || resize.event === event) &&
+        entry.target.width === resize.width && entry.target.height === resize.height && entry.target.depth === resize.depth) {
+      const shape = resize.shape ??= inspectThreeRenderTarget(entry.target, three);
+      if (shape.texture === entry.shape.texture && shape.depthTexture === entry.shape.depthTexture &&
+          shape.format === entry.shape.format && shape.depthFormat === entry.shape.depthFormat &&
+          shape.sampleCount === entry.shape.sampleCount && shape.generateMipmaps === entry.shape.generateMipmaps) {
+        resize.event = event;
+        if (entry.references || preserved.has(entry)) {
+          // Source texture identities stay unchanged across setSize(). Only
+          // this recognized automatic resize can detach a still-usable entry.
+          entry.sourceShape = shape; preserved.add(entry);
+          if (entries.get(entry.target) === entry) entries.delete(entry.target);
+          collect(entry); return;
+        }
+      }
+    }
+    retire(entry);
+  }
+  function retainGeneration(entry) {
+    assertCurrent(entry); entry.references++;
+    let held = true;
+    return () => {
+      if (!held) return;
+      held = false; entry.references--; collect(entry);
+    };
   }
   function capture(target) {
     live();
@@ -223,10 +266,11 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     let entry = entries.get(target);
     if (entry && (entry.shape.key !== shape.key || entry.shape.texture !== shape.texture || entry.shape.depthTexture !== shape.depthTexture)) { retire(entry); entry = null; }
     if (entry) return entry;
-    if (entries.size >= maxTargets) fail('BUDGET', 'Render target count exceeds maxTargets');
+    if (entries.size + preserved.size >= maxTargets) fail('BUDGET', 'Render target count exceeds maxTargets');
     entry = {target, shape, alive: true, released: false, busy: false, charged: 0, storage: null, sample: null,
+      references: 0, sourceShape: null, retirement: null,
       dirty: true, copies: 0, depthDirty: true, depthCopies: 0, depthSample: null, error: null, lifetime: new AbortController(), validation: Promise.resolve(), _wanted: new Map(), _dispatcher: null};
-    entry.onDispose = () => retire(entry);
+    entry.onDispose = event => sourceDisposed(entry, event);
     target.addEventListener('dispose', entry.onDispose);
     shape.texture.addEventListener('dispose', entry.onDispose);
     shape.depthTexture?.addEventListener('dispose', entry.onDispose);
@@ -235,9 +279,11 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
   }
   function assertCurrent(entry) {
     live();
-    if (!entry?.alive || entries.get(entry.target) !== entry) fail('STALE', 'Target was disposed or replaced before its queued use');
+    if (!entry?.alive || entries.get(entry.target) !== entry && !preserved.has(entry))
+      fail('STALE', 'Target was disposed or replaced before its queued use');
     const shape = inspectThreeRenderTarget(entry.target, three);
-    if (shape.key !== entry.shape.key || shape.texture !== entry.shape.texture || shape.depthTexture !== entry.shape.depthTexture) fail('STALE', 'Target configuration changed before its queued use');
+    if (!sameShape(shape, preserved.has(entry) ? entry.sourceShape : entry.shape))
+      fail('STALE', 'Target configuration changed before its queued use');
     if (entry.error) throw entry.error;
     if (entry.storage?.failed) fail('GPU', 'Native target storage failed');
     return entry;
@@ -463,7 +509,19 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     }
   }
   return {
-    capture, ensure, assertCurrent, bindingsFor,
+    capture, ensure, assertCurrent, bindingsFor, retainGeneration,
+    // Only the retained source ShadowNode calls this around its own update.
+    // Public setSize()/dispose() outside that synchronous source operation keep
+    // invalidating pending requests and readers, including older generations.
+    withNativeShadowResize(target, width, height, run) {
+      live();
+      if (typeof run !== 'function' || !positive(width) || !positive(height)) fail('OPTIONS', 'Expected a source shadow resize and synchronous callback');
+      if (!target || target.width === width && target.height === height) return run();
+      if (shadowResizes.has(target)) fail('REENTRANT', 'Cannot reenter a source shadow resize');
+      inspectThreeRenderTarget(target, three);
+      shadowResizes.set(target, {width, height, depth: target.depth, event: null, shape: null});
+      try { return run(); } finally { shadowResizes.delete(target); }
+    },
     // Native WGSL uses the attachment's top-left coordinates, not the WebGL
     // bridge's UV-flipped sampling replica. Capture only generation and sampler
     // metadata; GPU contents are observed at the consumer's FIFO submission.
@@ -528,7 +586,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
         if (color && depth) return entry.storage.withSampledTextures(invoke);
         if (depth) return entry.storage.withDepthTexture(native => invoke(null, native));
         return entry.storage.withTexture(native => invoke(native, null));
-      } finally { entry.busy = false; if (!entry.alive) release(entry); }
+      } finally { entry.busy = false; if (!entry.alive) release(entry); else collect(entry); }
     },
     writePixels(entry, data, options = {}) {
       assertCurrent(entry);
@@ -541,7 +599,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     },
     copyColor(source, destination, options = {}) { return copyTarget(source, destination, options); },
     copyDepth(source, destination, options = {}) { return copyTarget(source, destination, options, true); },
-    get allocatedBytes() { return allocatedBytes; }, get size() { return entries.size; },
+    get allocatedBytes() { return allocatedBytes; }, get size() { return entries.size + preserved.size; },
     render(entry, callback, {mipLevel = 0} = {}) {
       assertCurrent(entry); inspectThreeRenderTargetMip(entry.shape, mipLevel);
       ensure(entry);
@@ -555,19 +613,20 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       finally {
         const delta = entry.storage.allocatedBytes - allocatedBefore;
         entry.charged += delta; allocatedBytes += delta;
-        entry.busy = false; if (!entry.alive) release(entry);
+        entry.busy = false; if (!entry.alive) release(entry); else collect(entry);
       }
     },
     async whenIdle() {
       live();
-      try { await Promise.all([...entries.values()].flatMap(entry => [entry.validation, entry.storage?.whenIdle(), entry._dispatcher?.whenIdle()])); }
+      try { await Promise.all([...entries.values(), ...preserved].flatMap(entry =>
+        entry.retirement ? [entry.retirement] : [entry.validation, entry.storage?.whenIdle(), entry._dispatcher?.whenIdle()]).concat([...retiring])); }
       catch (error) { throw terminal ?? error; }
       live();
     },
     dispose() {
       if (disposed) return;
       disposed = true;
-      for (const entry of [...entries.values()]) retire(entry);
+      for (const entry of [...entries.values(), ...preserved]) retire(entry);
       pipelines.clear();
     },
   };

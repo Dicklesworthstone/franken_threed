@@ -7,16 +7,20 @@
  * built-in materials with authored slots, ordinary or registered direct analytic
  * lights, float attributes, scalar/vector/matrix uniforms, authored typed uniform
  * arrays and multiple uniform blocks per source group,
- * sampled 2D and CPU-data cube float textures and read-only scalar/vector/mat4 or flat-struct storage buffers.
+ * sampled 2D/CPU-data cube textures, target-owned depth comparisons and read-only
+ * scalar/vector/mat4 or flat-struct storage buffers.
  * Physical direct lighting retains the source DFG texture, clearcoat, sheen,
- * iridescence, anisotropy, retroreflection and source PMREM environment lighting. Transmission,
- * writable/atomic storage, shadows, clipping and MRT graphs fail explicitly.
+ * iridescence, anisotropy, retroreflection and source PMREM environment lighting.
+ * Directional/spot Basic/PCF shadows and the registered SunLight cascade lifecycle
+ * retain source shadow nodes and ShadowMaterial receivers. Transmission,
+ * writable/atomic storage, point/VSM shadows, clipping and MRT fail explicitly.
  * capture() is a logical-draw operation, never a
  * preparation retry: it runs source before/current updates and owns the bytes.
  * after() belongs after that draw has been accepted. Callers capture before any
  * asynchronous pipeline preparation and retain the resulting byte arrays.
  */
 import {createThreeNodeAttributes} from './three_node_attributes.mjs';
+import {registerThreeNativeShadow, updateThreeNativeShadow} from './three_node_shadows.mjs';
 
 export class ThreeNodeProgramError extends Error {
   constructor(code, message, options) {
@@ -32,7 +36,9 @@ const STANDARD_SLOTS = new Set(['metalnessNode', 'roughnessNode']);
 const PHYSICAL_SLOTS = new Set(['clearcoatNode', 'clearcoatRoughnessNode', 'clearcoatNormalNode',
   'sheenNode', 'sheenRoughnessNode', 'iridescenceNode', 'iridescenceIORNode', 'iridescenceThicknessNode',
   'anisotropyNode', 'retroreflectivityNode', 'iorNode', 'specularColorNode', 'specularIntensityNode']);
-const GRAPH_SLOTS = [...SLOTS, ...LIT_SLOTS, ...PHONG_SLOTS, ...STANDARD_SLOTS, ...PHYSICAL_SLOTS];
+const SHADOW_SLOTS = new Set(['castShadowPositionNode', 'castShadowNode', 'maskShadowNode',
+  'receivedShadowPositionNode', 'receivedShadowNode']);
+const GRAPH_SLOTS = [...SLOTS, ...LIT_SLOTS, ...PHONG_SLOTS, ...STANDARD_SLOTS, ...PHYSICAL_SLOTS, ...SHADOW_SLOTS, 'depthNode'];
 // These source material accessors lower to ordinary 2D texture bindings. Light
 // maps/AO introduce additional lighting nodes; environment maps have a separate
 // PMREM context. Keep those dependencies explicit instead of silently ignoring them.
@@ -61,7 +67,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   const frame = renderer._nodes.nodeFrame, cache = new WeakMap(), entries = new Set();
   const standardPrototypes = [three.MeshStandardNodeMaterial.prototype, three.MeshPhysicalNodeMaterial.prototype];
   const litPrototypes = [three.MeshToonNodeMaterial.prototype, three.MeshLambertNodeMaterial.prototype,
-    three.MeshPhongNodeMaterial.prototype, ...standardPrototypes];
+    three.MeshPhongNodeMaterial.prototype, three.ShadowNodeMaterial.prototype, ...standardPrototypes];
   const lightClasses = new Map([[three.AmbientLight, three.AmbientLightNode], [three.DirectionalLight, three.DirectionalLightNode],
     [three.HemisphereLight, three.HemisphereLightNode], [three.PointLight, three.PointLightNode], [three.SpotLight, three.SpotLightNode]]);
   const lightClassIds = new WeakMap();
@@ -73,7 +79,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   const sourceMaterialClasses = new Map([
     [three.MeshBasicMaterial, three.MeshBasicNodeMaterial], [three.MeshToonMaterial, three.MeshToonNodeMaterial],
     [three.MeshLambertMaterial, three.MeshLambertNodeMaterial], [three.MeshPhongMaterial, three.MeshPhongNodeMaterial],
-    [three.MeshStandardMaterial, three.MeshStandardNodeMaterial], [three.MeshPhysicalMaterial, three.MeshPhysicalNodeMaterial]
+    [three.MeshStandardMaterial, three.MeshStandardNodeMaterial], [three.MeshPhysicalMaterial, three.MeshPhysicalNodeMaterial],
+    [three.ShadowMaterial, three.ShadowNodeMaterial]
   ].map(([Source, Native]) => [Source.prototype, {Source, Native}]));
   let disposed = false, shaderBytes = 0, serial = 0;
   const live = () => { if (disposed) fail('DISPOSED', 'Native node program preparation is disposed'); };
@@ -302,9 +309,18 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     };
     return JSON.stringify(lights.map(light => {
       const Native = sourceLightClass(light);
-      if (light.castShadow || light.map != null || light.colorNode != null)
-        fail('LIGHTS', 'Native lit graph shadows, projected maps and custom light color nodes are not admitted');
-      return [light.id, id(light.constructor), id(Native), id(Native.prototype.setupDirect)];
+      if (light.map != null || light.colorNode != null)
+        fail('LIGHTS', 'Native lit graph projected maps and custom light color nodes are not admitted');
+      const shadow = light.castShadow && renderer.shadowMap?.enabled === true ? light.shadow : null;
+      if (shadow && (!(shadow instanceof three.LightShadow) || shadow.isPointLightShadow ||
+          ![three.BasicShadowMap, three.PCFShadowMap].includes(renderer.shadowMap.type) || renderer.shadowMap.transmitted ||
+          shadow.filterNode != null || shadow.shadowNode != null ||
+          ![three.DirectionalLight, three.SpotLight].includes(light.constructor) &&
+            !(light.isSunLight === true && shadow.isSunLightShadow === true)))
+        fail('SHADOW', 'Native source shadows require ordinary directional, spot or registered SunLight Basic/PCF maps');
+      return [light.id, id(light.constructor), id(Native), id(Native.prototype.setupDirect),
+        id(Native.prototype.setupShadowNode), light.castShadow === true, shadow ? id(shadow) : null,
+        renderer.shadowMap?.enabled === true, renderer.shadowMap?.type, renderer.shadowMap?.transmitted === true];
     }));
   }
   function checkAnalyticLight(node, lights) {
@@ -454,7 +470,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const {scene, camera} = context;
     if (!(material instanceof three.NodeMaterial) ||
         ![three.MeshBasicNodeMaterial.prototype, three.NodeMaterial.prototype, ...litPrototypes].includes(Object.getPrototypeOf(material)))
-      fail('MATERIAL', 'Native node graphs require Basic, Toon, Lambert, Phong, Standard, Physical or unlit base NodeMaterial');
+      fail('MATERIAL', 'Native node graphs require Basic, Toon, Lambert, Phong, Standard, Physical, Shadow or unlit base NodeMaterial');
     const prototype = Object.getPrototypeOf(material), lit = litMaterial(material),
       phong = prototype === three.MeshPhongNodeMaterial.prototype, standard = standardPrototypes.includes(prototype),
       physical = prototype === three.MeshPhysicalNodeMaterial.prototype;
@@ -471,7 +487,6 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     inspectInstances(object);
     if (camera && (!(camera instanceof three.Camera) || camera.isArrayCamera || camera.isMultiViewCamera || camera.reversedDepth))
       fail('CAMERA', 'Native node graphs require an ordinary non-reversed camera');
-    if (object.castShadow || object.receiveShadow) fail('SHADOW', 'Native node graph shadows are not admitted');
     if ((scene?.fog && material.fog !== false) || material.clippingPlanes?.length || renderer.clippingPlanes?.length)
       fail('EFFECT', 'Native node graph fog and clipping require their own shader context');
     if (material.wireframe || material.alphaHash || material.alphaToCoverage)
@@ -493,7 +508,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         inspectTexture(value);
       }
       if (key.endsWith('Node') && value != null && !SLOTS.has(key) && !(lit && LIT_SLOTS.has(key)) &&
-          !(phong && PHONG_SLOTS.has(key)) && !(standard && STANDARD_SLOTS.has(key)) && !(physical && PHYSICAL_SLOTS.has(key)))
+          !(phong && PHONG_SLOTS.has(key)) && !(standard && STANDARD_SLOTS.has(key)) && !(physical && PHYSICAL_SLOTS.has(key)) &&
+          !SHADOW_SLOTS.has(key) && !(key === 'depthNode' && material.isShadowPassMaterial === true))
         fail('GRAPH', `Native node graph slot ${key} is not admitted`);
     }
     if (renderer.getMRT?.() != null) fail('MRT', 'Native node graphs currently write one color attachment');
@@ -557,7 +573,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (node.isLightingNode || node.isLightsNode || node.isLightingContextNode || node.light?.isLight) {
       const admitted = lightsNode && (node === lightsNode ||
         environmentNode && node.constructor === three.EnvironmentNode && node.envNode === environmentNode ||
-        checkAnalyticLight(node, lights));
+        checkAnalyticLight(node, lights) || lights.includes(node.light) && registerThreeNativeShadow(three, renderer, node));
       if (!admitted) fail('LIGHTS', 'Only the captured source scene light and environment context is admitted');
     }
     if (node.isOutputStructNode || node.isMRTNode) fail('MRT', 'Native node graphs currently write one color attachment');
@@ -569,7 +585,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     return JSON.stringify([material.version, three.NodeMaterial.prototype.customProgramCacheKey.call(material), material.side,
       material.vertexColors, material.flatShading, material.transparent, material.blending, material.premultipliedAlpha,
       material.alphaTest > 0, material.depthWrite, material.depthTest, material.lights,
-      object.geometry.id, camera?.isPerspectiveCamera === true, instanceSignature, materialMapSignature(material),
+      object.geometry.id, camera?.isPerspectiveCamera === true, object.receiveShadow === true,
+      instanceSignature, materialMapSignature(material),
       environment ? [environment.id, environment.mapping, environment.isRenderTargetTexture === true, environment.isPMREMTexture === true] : null,
       Object.entries(object.geometry.attributes).map(([name, a]) => [name, a.itemSize, a.normalized, a.gpuType, a.array?.constructor.name,
         a.isInterleavedBufferAttribute, a.data?.array?.constructor.name, a.data?.stride, a.offset]),
@@ -881,8 +898,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     }
     return history.bytes;
   }
-  function captureDraw(descriptor, context = {}) {
-    const state = stateOf(descriptor);
+  function checkCapture(state, context) {
     const object = context.object ?? state.object;
     checkMaterialMaps(state);
     checkLights(state);
@@ -893,13 +909,28 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (state.storageNodes.length) readStorage(state);
     checkUniformBuffers(state);
     checkAttributes(state);
+    return object;
+  }
+  function runBefore(state) {
+    for (const node of state.builder.updateBeforeNodes) {
+      if (node instanceof three.ShadowNode) {
+        if (!state.lights.includes(node.light)) fail('SHADOW', 'A source shadow node changed its captured light identity');
+        registerThreeNativeShadow(three, renderer, node);
+        updateThreeNativeShadow(three, renderer, node, frame);
+      } else frame.updateBeforeNode(node);
+      // PMREM refresh keeps its separate ordered-prefix contract. Shadow
+      // recursion runs outside draw-resource capture at its source boundary.
+      checkPMREM(state);
+    }
+  }
+  function before(descriptor, context = {}) {
+    const state = stateOf(descriptor); checkCapture(state, context);
+    return withFrame(state, context, () => runBefore(state));
+  }
+  function captureDraw(descriptor, context = {}) {
+    const state = stateOf(descriptor), object = checkCapture(state, context);
     return withFrame(state, context, () => {
-      for (const node of state.builder.updateBeforeNodes) {
-        frame.updateBeforeNode(node);
-        // A preceding callback must not start nested filtering in the texture
-        // transaction or let an earlier captured draw observe a newer atlas.
-        checkPMREM(state);
-      }
+      if (!context.beforeDone) runBefore(state);
       assertInstances(object, state.instanceSignature);
       checkAttributes(state);
       // Match Renderer._renderObjectDirect: source geometry uploads occur after
@@ -939,7 +970,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const state = stateOf(descriptor);
     return withFrame(state, context, () => { for (const node of state.builder.updateAfterNodes) frame.updateAfterNode(node); });
   }
-  const api = Object.freeze({inspect, compile, preparePMREM, capture, captureDraw, after,
+  const api = Object.freeze({inspect, compile, preparePMREM, before, capture, captureDraw, after,
     geometry(descriptor) { const state = stateOf(descriptor); return state.generated ? generatedAttributes.geometry(descriptor) : state.geometry; },
     attributeBytes(descriptor) { return stateOf(descriptor).generated ? generatedAttributes.byteLength(descriptor) : 0; },
     captureAttributes(descriptor, context = {}) {

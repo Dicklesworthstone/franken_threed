@@ -195,3 +195,28 @@ test('comparison leases preserve resize invalidation before any native submissio
   assert.throws(() => r.adapter.withDispatch([read, compare], () => assert.fail('stale comparison consumer')), {code: 'THREE_TARGET_STALE'});
   assert.equal(r.textures.length, 0); assert.equal(r.events.includes('submit'), false); r.dispose();
 });
+
+test('source shadow resize leases distinguish generations and retire only after submitted readers finish', async () => {
+  const r = await rig(), target = depthTarget(); target.depthTexture.compareFunction = THREE.LessEqualCompare;
+  let complete;
+  const completion = new Promise(resolve => { complete = resolve; });
+  r.device.queue.onSubmittedWorkDone = () => completion;
+  const previous = r.adapter.captureBinding(sampled(target.depthTexture));
+  r.targets.withNativeShadowResize(target, 8, 8, () => target.setSize(8, 8));
+  const current = r.adapter.captureBinding(sampled(target.depthTexture));
+  assert.equal(r.targets.size, 2);
+  r.adapter.withDispatch([previous, current], () => {
+    const oldView = r.adapter.resolve(previous), newView = r.adapter.resolve(current);
+    assert.notEqual(oldView, newView);
+    assert.equal(oldView.texture.descriptor.size.width, 4);
+    assert.equal(newView.texture.descriptor.size.width, 8);
+  });
+  r.adapter.release(previous);
+  assert.ok(r.textures.every(texture => !texture.destroyed), 'pending GPU validation keeps the retired generation alive');
+  assert.equal(r.targets.allocatedBytes, (4 * 4 + 8 * 8) * 8);
+  complete(); await r.adapter.whenIdle(); await r.targets.whenIdle();
+  assert.ok(r.textures.slice(0, 2).every(texture => texture.destroyed));
+  assert.ok(r.textures.slice(2).every(texture => !texture.destroyed));
+  assert.equal(r.targets.size, 1); assert.equal(r.targets.allocatedBytes, 8 * 8 * 8);
+  r.adapter.release(current); r.dispose();
+});

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import * as THREE from '../../upstream/three.js/build/three.webgpu.js';
 import {createThreeNodePrograms} from './three_node_program.mjs';
 import {captureThreeNodeScene} from './three_node_scene_capture.mjs';
+import {withThreeNativeCapture, assertThreeNativeTargetWrite, assertThreeNativeComputeOutsideCapture} from './three_node_shadows.mjs';
 import {createGpuCompute} from './gpu_compute.mjs';
 import {captureComputeStorage} from './gpu_compute_attributes.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
@@ -26,6 +27,25 @@ test('ordinary scenes do not create a node compiler or change the source camera'
   const f = rig(t); f.mesh(new THREE.MeshBasicMaterial());
   assert.equal(f.capture({getPrograms() { assert.fail('unexpected native compiler'); }}), null);
   assert.equal(f.camera.coordinateSystem, THREE.WebGLCoordinateSystem); assert.equal(f.frame.frameId, 7);
+});
+test('native shadow intent promotes default mesh materials without changing fixed-only scenes', t => {
+  const fixed = rig(t); fixed.renderer.shadowMap = {enabled: true}; fixed.mesh(new THREE.MeshBasicMaterial());
+  assert.equal(fixed.capture({getPrograms() { assert.fail('fixed-only shadows keep their existing owner'); }}), null);
+  for (const authored of [false, true]) {
+    const f = rig(t); f.renderer.shadowMap = {enabled: true};
+    const ordinary = f.mesh(new THREE.MeshBasicMaterial()), native = f.mesh(authored ? f.material() : new THREE.MeshBasicNodeMaterial());
+    const result = f.capture();
+    assert.deepEqual([...result.objects], [ordinary, native]);
+    assert.equal(result.bindings[0].material, ordinary.material); assert.equal(result.bindings.length, 2);
+    assert.deepEqual(result.draws.map(draw => draw.object), [ordinary, native]);
+  }
+});
+test('unsupported mixed shadow materials fail before native draw updates', t => {
+  const f = rig(t); f.renderer.shadowMap = {enabled: true};
+  const material = f.material(); let updates = 0;
+  material.colorNode = N.uniform(.5).onObjectUpdate(() => { updates++; return .5; }); f.mesh(material);
+  f.mesh(new THREE.ShaderMaterial()).visible = false;
+  assert.throws(() => f.capture(), {code: 'THREE_NODE_PROGRAM_MATERIAL'}); assert.equal(updates, 0);
 });
 test('private native backgrounds precede scene draws independently of sorting, layers and overrides', t => {
   for (const sortObjects of [false, true]) {
@@ -275,7 +295,7 @@ test('storage captures lease post-update identities before later draws and after
   gain.updateAfterType = 'object'; gain.updateAfter = () => { storage.value = after; };
   material.fragmentNode = storage.element(0).mul(gain);
   const writes = device.writes.length, result = f.capture({getStorage: () => guard});
-  assert.equal(updates, 2); assert.equal(transactions, 1); assert.equal(storage.value, after);
+  assert.equal(updates, 2); assert.equal(transactions, 2, 'each draw captures after its source before-updates'); assert.equal(storage.value, after);
   assert.deepEqual(result.draws.map(draw => draw.object), [first, second]);
   assert.deepEqual(result.draws.map(draw => draw.nodeStorage[0].lease.resolve().buffer), [aBuffer, bBuffer]);
   assert.ok(result.draws.every(draw => Object.isFrozen(draw.nodeStorage) && draw.nodeStorage.every(Object.isFrozen)));
@@ -283,4 +303,73 @@ test('storage captures lease post-update identities before later draws and after
   a.array.fill(99); b.array.fill(99);
   assert.deepEqual(result.draws.map(draw => Array.from(new Float32Array(draw.nodeStorage[0].lease.resolve().buffer.data)).slice(0, 4)),
     [[.125, .125, .125, .125], [.875, .875, .875, .875]]);
+});
+
+test('per-draw capture releases earlier leases when a later source update fails', t => {
+  const f = rig(t), material = f.material(), first = f.mesh(material), second = f.mesh(material);
+  const storage = N.storage(new THREE.StorageBufferAttribute(4, 4), 'vec4', 4);
+  const leases = [], released = [];
+  let inside = false;
+  const guard = {captureDispatch(run) {
+    assert.equal(inside, false); inside = true;
+    try { return run(); } finally { inside = false; }
+  }, capture(attribute) { const lease = {attribute}; leases.push(lease); return lease; },
+  release(lease) { released.push(lease); }, validate() { assert.fail('failed capture cannot validate'); }};
+  const gain = N.uniform(1).onObjectUpdate(() => 1);
+  gain.updateAfterType = 'object'; gain.updateAfter = frame => {
+    assert.equal(inside, true);
+    if (frame.object === second) throw new Error('late shadow draw failure');
+  };
+  material.fragmentNode = storage.element(0).mul(gain);
+  assert.throws(() => f.capture({getStorage: () => guard}), /late shadow draw failure/);
+  assert.equal(leases.length, 2); assert.deepEqual(released, leases); assert.equal(inside, false);
+  assert.equal(f.frame.object, null); assert.equal(first.material, material);
+});
+
+test('source before-updates can capture child draws outside the parent resource transaction', t => {
+  const f = rig(t), material = f.material(), storage = N.storage(new THREE.StorageBufferAttribute(4, 4), 'vec4', 4);
+  material.fragmentNode = storage.element(0); f.mesh(material);
+  let inside = false, nested = false, transactions = 0;
+  const guard = {captureDispatch(run) {
+    assert.equal(inside, false); inside = true; transactions++;
+    try { return run(); } finally { inside = false; }
+  }, capture(attribute) { return {attribute}; }, release() {}, validate() {}};
+  const programs = {...f.owner, before(descriptor, context) {
+    assert.equal(inside, false);
+    if (!nested) { nested = true; f.capture({getStorage: () => guard}); }
+    f.owner.before?.(descriptor, context);
+  }};
+  const result = f.capture({getPrograms: () => programs, getStorage: () => guard});
+  assert.equal(result.draws.length, 1); assert.equal(nested, true); assert.equal(transactions, 2);
+  assert.equal(inside, false);
+});
+
+test('nested writes reject an earlier parent depth read, and release the guard after failure', () => {
+  const renderer = {}, target = new THREE.RenderTarget(8, 8);
+  target.depthTexture = new THREE.DepthTexture(8, 8);
+  const unrelated = new THREE.RenderTarget(8, 8);
+  assert.throws(() => withThreeNativeCapture(renderer, record => {
+    assert.doesNotThrow(() => assertThreeNativeTargetWrite(renderer, target));
+    record(target.depthTexture);
+    withThreeNativeCapture(renderer, recordChild => {
+      recordChild(unrelated.texture);
+      assert.throws(() => assertThreeNativeTargetWrite(renderer, target), {code: 'THREE_NODE_PROGRAM_SHADOW'});
+      assert.throws(() => assertThreeNativeTargetWrite(renderer, unrelated), {code: 'THREE_NODE_PROGRAM_SHADOW'});
+      throw new Error('nested capture failed');
+    });
+  }), /nested capture failed/);
+  assert.doesNotThrow(() => assertThreeNativeTargetWrite(renderer, target));
+  assert.doesNotThrow(() => assertThreeNativeTargetWrite(renderer, unrelated));
+});
+
+test('compute reentry stays refused until the complete native capture unwinds', () => {
+  const renderer = {};
+  assert.doesNotThrow(() => assertThreeNativeComputeOutsideCapture(renderer));
+  withThreeNativeCapture(renderer, () => {
+    assert.throws(() => assertThreeNativeComputeOutsideCapture(renderer), {code: 'THREE_COMPUTE_REENTRY'});
+    withThreeNativeCapture(renderer, () =>
+      assert.throws(() => assertThreeNativeComputeOutsideCapture(renderer), {code: 'THREE_COMPUTE_REENTRY'}));
+    assert.throws(() => assertThreeNativeComputeOutsideCapture(renderer), {code: 'THREE_COMPUTE_REENTRY'});
+  });
+  assert.doesNotThrow(() => assertThreeNativeComputeOutsideCapture(renderer));
 });

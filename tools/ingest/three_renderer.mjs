@@ -42,6 +42,7 @@ import {createThreeProgramTransmission} from './three_program_transmission.mjs';
 import {withThreeCompute} from './three_compute.mjs';
 import {createThreeNodePrograms} from './three_node_program.mjs';
 import {captureThreeNodeScene} from './three_node_scene_capture.mjs';
+import {assertThreeNativeTargetWrite, captureThreeShadowMaterialState} from './three_node_shadows.mjs';
 import {createThreeNodeBackgrounds} from './three_node_background.mjs';
 import {createThreeSceneRaster} from './three_scene_raster.mjs';
 // r186 src/renderers/webgpu/utils/WebGPUConstants.js GPUFeatureName values.
@@ -290,6 +291,11 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._nodeBackgrounds = null;
       this._nodeCaptureBytes = 0;
       this._nodeRaster = new Map();
+      this._renderObjectFunction = null;
+      this._handleObjectFunction = null;
+      this._cacheShadowNodes = new WeakMap();
+      this._currentSourceMaterial = null;
+      this._mrt = null;
       this._initialized = false;
       this._initPromise = null;
       this._session = null;
@@ -500,7 +506,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     getClearStencil() { return this._clearStencil; }
     setClearStencil(stencil) { this._clearStencil = stencil; }
     getRenderTarget() { return this._renderTarget; }
-    getMRT() { return null; }
+    getMRT() { return this._mrt; }
+    setMRT(value) { this._mrt = value; return this; }
     setRenderTarget(renderTarget, activeCubeFace = 0, activeMipmapLevel = 0) {
       if (activeCubeFace !== 0) fail('UNSUPPORTED', 'Cube faces are not admitted');
       if (activeMipmapLevel !== 0 && this._shaderEncodedOutput)
@@ -619,6 +626,27 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       return this._renderCall(scene, camera);
     }
     _beforeRender() {}
+    getRenderObjectFunction() { return this._renderObjectFunction; }
+    setRenderObjectFunction(value) {
+      if (value !== null && typeof value !== 'function') fail('SOURCE', 'A render object function must be callable or null');
+      this._renderObjectFunction = value;
+    }
+    _getShadowNodes(material) { return THREE.Renderer.prototype._getShadowNodes.call(this, material); }
+    renderObject(...args) {
+      if (typeof this._handleObjectFunction !== 'function')
+        fail('SOURCE', 'Native renderObject requires an active source draw capture');
+      const scene = args[1], material = scene.overrideMaterial;
+      const state = material ? captureThreeShadowMaterialState(material) : null;
+      const sourceMaterial = this._currentSourceMaterial;
+      try { return THREE.Renderer.prototype.renderObject.apply(this, args); }
+      catch (error) {
+        // The retained lifecycle restores its overrides on normal completion.
+        // A native admission failure must not leak the last caster into later
+        // application draws when the source callback stack unwinds early.
+        if (state) Object.assign(material, state);
+        this._currentSourceMaterial = sourceMaterial; throw error;
+      }
+    }
     _renderCall(scene, camera) {
       if (this._disposed) fail('DISPOSED', 'Renderer is disposed');
       if (this._deferredError) { const error = this._deferredError; this._deferredError = null; throw error; }
@@ -633,6 +661,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     }
     _makeRequest(scene, camera, clearOnly = null, captureCameras = true) {
       const target = this._renderTarget, mipLevel = this._activeMipmapLevel;
+      if (!this._shaderEncodedOutput) assertThreeNativeTargetWrite(this, target);
       const destination = target ? this._targets.capture(target) : this;
       const backgroundState = !this._shaderEncodedOutput ? captureThreeBackground(THREE, scene) : undefined;
       const frame = this._frame(scene, clearOnly, target, mipLevel), key = sceneKey(this, scene, backgroundState);
@@ -685,7 +714,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         linearClearColor: this.alpha ? [c.r * a, c.g * a, c.b * a, a] : [c.r, c.g, c.b, 1],
         hdr: !target && this._wantsHdr(this._toneMapping()), key,
         programFrame: {toneMapping: this.toneMapping, toneMappingExposure: this.toneMappingExposure,
-          outputColorSpace: this.outputColorSpace, pixelRatio: this._pixelRatio, height: this._height}};
+          outputColorSpace: this.outputColorSpace, pixelRatio: this._pixelRatio, height: this._height},
+        releaseDestination: destination === this ? null : this._targets.retainGeneration(destination)};
     }
     _updateNativeMatrices(scene, camera) {
       if (scene.matrixWorldAutoUpdate === true) scene.updateMatrixWorld();
@@ -720,6 +750,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         for (const lease of captured.storageUses) captured.storageOwner.release(lease);
         this._nodeCaptureBytes -= captured.bytes; request.nodeFrame = null;
       }
+      request.releaseDestination?.(); request.releaseDestination = null;
     }
     _dispatchRequest(request) {
       const {scene, destination, snapshot} = request;

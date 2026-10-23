@@ -26,6 +26,7 @@ export function createThreeComputeTargets({targets, device, signal = null,
     // Preserve driver/producer errors from other realms, including DOMException.
     terminal = error && (typeof error === 'object' || typeof error === 'function')
       ? error : new ThreeComputeTargetError('ABORTED', String(error ?? 'Renderer lifetime ended'));
+    for (const record of records.values()) record.releaseGeneration?.();
     records.clear(); samplers.clear(); rejectStop(terminal);
     signal?.removeEventListener('abort', onAbort);
   }
@@ -85,6 +86,7 @@ export function createThreeComputeTargets({targets, device, signal = null,
       if (active) fail('REENTRY', 'Cannot capture target inputs during a borrowed dispatch');
       const record = describe(binding);
       if (records.size >= maxBindings) fail('BUDGET', 'Queued render-target bindings exceed maxBindings');
+      record.releaseGeneration = targets.retainGeneration?.(record.source.entry);
       const snapshot = Object.freeze({}); records.set(snapshot, record); leases.add(snapshot); return snapshot;
     },
     layout(snapshot) { return validate(snapshot).layout; },
@@ -120,7 +122,7 @@ export function createThreeComputeTargets({targets, device, signal = null,
         const group = list[i], source = group[0];
         targets.withNativeTextures(group, textures => {
           borrowed.set(source.entry, source.entry.storage);
-          for (const [original, texture] of textures) active.textures.set(original, texture);
+          active.textures.set(source.entry, textures);
           visit(i + 1);
         });
       };
@@ -147,7 +149,7 @@ export function createThreeComputeTargets({targets, device, signal = null,
         } else samplers.delete(key);
         samplers.set(key, value); return value;
       }
-      const texture = active.textures.get(source.texture);
+      const texture = active.textures.get(source.entry)?.get(source.texture);
       if (!texture) fail('BORROW', 'The native source has not been borrowed');
       let view = views.get(texture);
       if (!view) {
@@ -157,7 +159,9 @@ export function createThreeComputeTargets({targets, device, signal = null,
       }
       return view;
     },
-    release(snapshot) { records.delete(snapshot); },
+    release(snapshot) {
+      const record = records.get(snapshot); records.delete(snapshot); record?.releaseGeneration?.();
+    },
     async whenIdle() { live(); await Promise.race([Promise.all([...pending]), stopped]); live(); },
     get diagnostics() { return {bindings: records.size, samplers: samplers.size, pending: pending.size}; },
     dispose() { if (!disposed) { disposed = true; stop(new ThreeComputeTargetError('DISPOSED', 'Compute target inputs are disposed')); } },

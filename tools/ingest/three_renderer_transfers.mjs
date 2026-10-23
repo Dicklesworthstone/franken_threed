@@ -16,6 +16,7 @@
  */
 import {inspectGpuTargetWrite, inspectGpuTargetCopy} from './gpu_target_transfer.mjs';
 import {inspectGpuDepthCopy} from './gpu_depth_transfer.mjs';
+import {assertThreeNativeTextureWrite} from './three_node_shadows.mjs';
 
 export function createThreeRendererTransfers(renderer, ErrorType, {
   maxBytes = 128 * 1024 * 1024, maxRequests = 64,
@@ -143,6 +144,7 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
     writePixels(target, data, supplied = {}) {
       try {
         live();
+        assertThreeNativeTextureWrite(renderer, target?.texture);
         const {value, signal} = options(supplied), entry = renderer._targets.capture(target);
         const plan = inspectGpuTargetWrite(entry.shape, data, value);
         // Pick built-in constructors, not a caller-controlled data.constructor.
@@ -164,6 +166,7 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
     copyDepth(source, destination, supplied = {}) {
       try {
         live();
+        assertThreeNativeTextureWrite(renderer, destination?.depthTexture);
         const {value, signal} = options(supplied);
         const from = renderer._targets.capture(source), to = renderer._targets.capture(destination);
         if (from === to) fail('TRANSFER', 'In-place render target copies are not admitted');
@@ -175,6 +178,7 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
     copyColor(source, destination, supplied = {}) {
       try {
         live();
+        assertThreeNativeTextureWrite(renderer, destination?.texture);
         const {value, signal} = options(supplied);
         const from = renderer._targets.capture(source), to = renderer._targets.capture(destination);
         if (from === to) fail('TRANSFER', 'In-place render target copies are not admitted');
@@ -207,6 +211,7 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
   function copyTexture(source, destination, sourceRegion = null, destinationPosition = null,
     sourceLevel = 0, destinationLevel = 0) {
     live();
+    assertThreeNativeTextureWrite(renderer, destination);
     if (destinationLevel !== 0)
       fail('UNSUPPORTED', 'Texture copies write destination mip zero and regenerate its derived mips');
     if (sourceRegion !== null && (!sourceRegion.min || !sourceRegion.max ||

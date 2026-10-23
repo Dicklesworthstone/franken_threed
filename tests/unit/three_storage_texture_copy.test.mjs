@@ -209,7 +209,7 @@ test('queued copy errors surface through waitForGPU and the next public call', a
 
 test('nested compute callbacks occupy their existing submit turn instead of queueing behind later work', () => {
   const {renderer, owner} = rendererSetup(), a = texture(), b = texture(); words(owner, a)[0] = 42;
-  renderer._drain = Promise.resolve(); renderer._computeTurn = 1;
+  renderer._drain = Promise.resolve(); renderer._computeTurn = {submit: issue => issue()};
   renderer.copyTextureToTexture(a, b);
   assert.equal(words(owner, b)[0], 42); assert.equal(renderer._pending.length, 0); renderer.dispose();
 });

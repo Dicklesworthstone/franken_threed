@@ -53,7 +53,11 @@ export function createThreeSceneRaster(three,{stencilAttachment=false,fail}={}){
     if(![three.FrontSide,three.BackSide,three.DoubleSide].includes(m.side)||!DEPTH[m.depthFunc])
       fail('MATERIAL','Unsupported native side/depth state');
     for(const key of ['transparent','depthWrite','depthTest','colorWrite'])
-      if(typeof m[key]!=='boolean')fail('MATERIAL',`Expected boolean ${key}`);
+      // Renderer.renderObject's inherited OR expression ends in a nullable
+      // node slot for opaque shadow casters. Preserve that exact source field;
+      // raster selection interprets it as falsy without changing the material.
+      if(typeof m[key]!=='boolean'&&!(key==='transparent'&&m.isShadowPassMaterial===true&&m[key]==null))
+        fail('MATERIAL',`Expected boolean ${key}`);
     const {options,values}=describe(m),normal={color:{operation:'add',srcFactor:'src-alpha',dstFactor:'one-minus-src-alpha'},
       alpha:{operation:'add',srcFactor:'one',dstFactor:'one-minus-src-alpha'}};
     return {...options,...values,blend:options.blend===undefined?(m.transparent?normal:null):options.blend,

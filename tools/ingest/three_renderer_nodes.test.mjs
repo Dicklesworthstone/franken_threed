@@ -879,20 +879,22 @@ test('registered SunLight captures source color, direction and FRAME frequency t
   assert.equal(f.renderer._nodeCaptureBytes,0);await f.renderer.waitForGPU();
 });
 
-test('registered SunLight shadow requests fail before facade callbacks or GPU acquisition',async t=>{
+test('registered SunLight refuses unsupported shadow effects before updates and honors disabled shadow maps',async t=>{
   const f=fixture(t),material=new T.MeshStandardMaterial(),sun=new SunLight();let updates=0;
   material.colorNode=T.TSL.uniform(new T.Color(.25,.5,.75)).onObjectUpdate(()=>{updates++;});
   f.mesh.material=material;f.scene.add(sun);await f.renderer.init();
   assert.throws(()=>f.renderer.render(f.scene,f.camera),{code:'THREE_NODE_PROGRAM_LIGHTS'});
   f.renderer.library.addLight(SunLightNode,SunLight);sun.castShadow=true;
-  for(const enabled of [false,true]){
-    f.renderer.shadowMap.enabled=enabled;
-    assert.throws(()=>f.renderer.render(f.scene,f.camera),{code:'THREE_NODE_PROGRAM_LIGHTS'});
-  }
-  sun.castShadow=false;f.mesh.receiveShadow=true;
+  f.mesh.receiveShadow=true;f.renderer.shadowMap.enabled=true;f.renderer.shadowMap.type=T.VSMShadowMap;
   assert.throws(()=>f.renderer.render(f.scene,f.camera),{code:'THREE_NODE_PROGRAM_SHADOW'});
+  f.renderer.shadowMap.type=T.PCFShadowMap;sun.shadow.filterNode=T.TSL.float(1);
+  assert.throws(()=>f.renderer.render(f.scene,f.camera),{code:'THREE_NODE_PROGRAM_SHADOW'});sun.shadow.filterNode=null;
+  f.renderer.shadowMap.transmitted=true;
+  assert.throws(()=>f.renderer.render(f.scene,f.camera),{code:'THREE_NODE_PROGRAM_SHADOW'});
+  f.renderer.shadowMap.transmitted=false;
   assert.equal(updates,0);assert.equal(f.acquired(),0);assert.equal(f.device.submissions.length,0);
   assert.equal(f.renderer._nodeCaptureBytes,0);
-  f.mesh.receiveShadow=false;f.renderer.shadowMap.enabled=false;
+  f.renderer.shadowMap.enabled=false;
   f.renderer.render(f.scene,f.camera);await drain(f.renderer);assert.equal(updates,1);assert.equal(nativeDraws(f.device).length,1);
+  assert.equal(sun.shadow.map,null);
 });

@@ -165,7 +165,7 @@ test('waitForGPU includes completion, while the initialized copy call never wait
 
 test('nested compute submit turns do not enqueue copies after later commands', () => {
   const c = setup(), target = renderTarget(), destination = storageTexture();
-  sourceBytes(c, target).fill(9); c.renderer._computeTurn = 1; c.renderer._preparing = true;
+  sourceBytes(c, target).fill(9); c.renderer._computeTurn = {submit: issue => issue()}; c.renderer._preparing = true;
   c.renderer.copyTextureToTexture(target.texture, destination);
   assert.ok(storageBytes(c, destination).every(n => n === 9)); assert.equal(c.renderer._pending.length, 0); c.renderer.dispose();
 });

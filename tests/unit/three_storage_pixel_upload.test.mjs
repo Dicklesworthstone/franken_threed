@@ -3,6 +3,24 @@ import assert from 'node:assert/strict';
 import {createStorageTextureTransfers, inspectStoragePixelRegion} from '../../tools/ingest/three_storage_texture_transfer.mjs';
 import {deferred} from './storage_texture_fixture.mjs';
 import {setup, texture, formats, THREE} from './storage_pixel_fixture.mjs';
+import {withThreeNativeCapture} from '../../tools/ingest/three_node_shadows.mjs';
+
+test('storage uploads and copies reject destinations already sampled by a pending parent draw', async () => {
+  const s = setup(), source = texture('2d', 1, 1), destination = texture('2d', 1, 1);
+  await s.renderer.writeStorageTexturePixelsAsync(source, new Uint8Array(4).fill(17));
+  await s.renderer.writeStorageTexturePixelsAsync(destination, new Uint8Array(4).fill(7));
+  const writes = s.writes.length, events = s.events.slice(); let rejected;
+  withThreeNativeCapture(s.renderer, record => {
+    record(destination);
+    rejected = assert.rejects(s.renderer.writeStorageTexturePixelsAsync(destination, new Uint8Array(4).fill(23)),
+      {code: 'THREE_NODE_PROGRAM_SHADOW'});
+    assert.throws(() => s.renderer.copyTextureToTexture(source, destination), {code: 'THREE_NODE_PROGRAM_SHADOW'});
+    assert.equal(s.renderer.queue.length, 0); assert.equal(s.writes.length, writes); assert.deepEqual(s.events, events);
+  });
+  await rejected; assert.ok(s.bytes(destination).every(value => value === 7));
+  s.renderer.copyTextureToTexture(source, destination);
+  assert.ok(s.bytes(destination).every(value => value === 17)); s.renderer.dispose();
+});
 
 for (const dimension of ['2d', '2d-array', '3d']) for (const format of formats) {
   test(`upload ${format[2]} ${dimension} preserves every byte in shared native storage`, async () => {

@@ -2,6 +2,7 @@
 import {createStorageTextureTransfers} from './three_storage_texture_transfer.mjs';
 import {ThreeStorageCopyError} from './three_texture_copy_plan.mjs';
 import {captureTargetToStorageCopy} from './three_target_texture_copy.mjs';
+import {assertThreeNativeTextureWrite} from './three_node_shadows.mjs';
 export {ThreeStorageCopyError, inspectStorageTextureCopy} from './three_texture_copy_plan.mjs';
 const fail = (code, message) => { throw new ThreeStorageCopyError(code, message); };
 const ordinaryTargetTexture = texture => texture?.renderTarget != null && texture.isStorageTexture !== true &&
@@ -22,6 +23,7 @@ export function withStorageTextureCopies(Base) {
     copyTextureToTexture(source, destination, region = null, position = null, sourceLevel = 0, destinationLevel = 0) {
       if (this._disposed) fail('DISPOSED', 'Renderer is disposed');
       if (this._deferredError) { const error = this._deferredError; this._deferredError = null; throw error; }
+      assertThreeNativeTextureWrite(this, destination);
       // The target transfer facade installs source methods per instance. This
       // inherited method suppresses that installation, so super cannot reach it.
       // Dispatch only two ordinary target endpoints; storage admission stays here.
@@ -50,7 +52,7 @@ export function withStorageTextureCopies(Base) {
         if (!failures.has(this)) failures.set(this, error);
         this._deferredError ??= error;
       };
-      if (this._computeTurn) this._computeTurn.submit(issue)?.catch(rejected);
+      if (this._computeTurn) this._computeTurn.submit(issue)?.catch?.(rejected);
       else if (!this._drain && !this._preparing) issue();
       else this._enqueue({transfer: true, issue, resolve() {}, reject: rejected});
       this.inspector?.copyTextureToTexture?.(source, destination);
@@ -59,7 +61,10 @@ export function withStorageTextureCopies(Base) {
      * Captures bytes/options now; completion includes queued GPU validation.
      * Byte offsets are relative to the supplied view, not its backing buffer. */
     writeStorageTexturePixelsAsync(texture, data, options = {}) {
-      return pixels(this).write(texture, data, options);
+      try {
+        assertThreeNativeTextureWrite(this, texture);
+        return pixels(this).write(texture, data, options);
+      } catch (error) { return Promise.reject(error); }
     }
     /** F3D extension: snapshot a GPU texture region into tightly packed bytes.
      * Captures the FIFO copy point, not a later texture state at map completion. */
