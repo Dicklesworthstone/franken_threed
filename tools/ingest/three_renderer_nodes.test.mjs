@@ -29,6 +29,18 @@ function fixture(t){
 }
 const drain=async renderer=>{while(renderer._drain)await renderer._drain;};
 const nativeDraws=device=>device.snapshots.flat().filter(draw=>draw.pipeline.vertex.entryPoint==='main');
+function storageResources(draw){
+  const resources=[];
+  for(const {group} of draw.groups.values())for(const {resource} of group.entries)
+    if(resource.buffer?.usage&128)resources.push(resource);
+  return resources;
+}
+function storageWords(draw){
+  return storageResources(draw).map(({buffer,offset=0,size=buffer.size-offset})=>{
+    const bytes=draw.contents.get(buffer);
+    return [...new Float32Array(bytes.buffer,bytes.byteOffset+offset,size/4)];
+  });
+}
 function containsColor(draw,color){
   for(const {group,offsets} of draw.groups.values()){
     const resource=group.entries.find(entry=>entry.resource?.buffer)?.resource;if(!resource)continue;
@@ -279,4 +291,75 @@ test('queued Physical feature changes keep earlier programs and shared lookup st
   assert.ok(draws.every(draw=>!scalarPresent(draw,.9375)),'later CPU edits cannot replace queued uniform values');
   assert.equal(new Set(draws.flatMap(textureResources).map(view=>view.texture)).size,1);
   assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+
+test('native storage captures queued upload versions and ignores CPU edits without needsUpdate',async t=>{
+  const f=fixture(t),attribute=new T.StorageBufferAttribute(new Float32Array([.125,.375,.625,1]),4);
+  f.material.colorNode=T.TSL.storage(attribute,'vec4',1).toReadOnly().element(0).rgb;
+  await f.renderer.init();f.renderer.render(f.scene,f.camera);
+  attribute.array.set([.875,.625,.375,1]);attribute.needsUpdate=true;
+  f.renderer.render(f.scene,f.camera);
+  attribute.array.fill(0);f.renderer.render(f.scene,f.camera);
+  await drain(f.renderer);
+  const draws=nativeDraws(f.device);assert.equal(draws.length,3);
+  assert.deepEqual(draws.map(storageWords),[[[.125,.375,.625,1]],[[.875,.625,.375,1]],[[.875,.625,.375,1]]]);
+  const buffer=storageResources(draws[0])[0].buffer;
+  assert.equal(f.device.writes.filter(write=>write.buffer===buffer).length,2,
+    'the later unchanged version must not re-upload source CPU data');
+  assert.equal(new Set(draws.flatMap(storageResources).map(resource=>resource.buffer)).size,1,
+    'sequential source renders share the renderer-owned storage allocation');
+  assert.equal(f.renderer._nodeCaptureBytes,0);await f.renderer.waitForGPU();
+});
+
+test('native storage partial uploads preserve GPU-visible bytes outside requested ranges',async t=>{
+  const f=fixture(t),attribute=new T.StorageBufferAttribute(new Float32Array([.125,.25,.5,1,.75,.5,.25,1]),4);
+  f.material.colorNode=T.TSL.storage(attribute,'vec4',2).toReadOnly().element(0).rgb;
+  await f.renderer.compileAsync(f.scene,f.camera);f.renderer.render(f.scene,f.camera);await drain(f.renderer);
+  attribute.array.fill(99);attribute.array.set([.25,.75,.5,1],4);
+  attribute.addUpdateRange(4,4);attribute.needsUpdate=true;
+  f.renderer.render(f.scene,f.camera);await drain(f.renderer);
+  assert.deepEqual(storageWords(nativeDraws(f.device).at(-1)),[[.125,.25,.5,1,.25,.75,.5,1]]);
+  assert.equal(attribute.array[0],99,'public CPU contents stay independent of GPU visibility');
+  assert.equal(attribute.updateRanges.length,0);
+  const buffer=storageResources(nativeDraws(f.device).at(-1))[0].buffer;
+  const writes=f.device.writes.filter(write=>write.buffer===buffer);
+  assert.deepEqual(writes.map(write=>[write.offset,write.input.byteLength]),[[0,32],[16,16]]);
+  await f.renderer.waitForGPU();
+});
+
+test('native storage compilation preserves source updates until the logical render',async t=>{
+  const f=fixture(t),attribute=new T.StorageBufferAttribute(new Float32Array([.25,.5,.75,1]),4);
+  let updates=0;
+  const gain=T.TSL.uniform(1).onObjectUpdate(()=>{updates++;return 1;});
+  f.material.colorNode=T.TSL.storage(attribute,'vec4',1).toReadOnly().element(0).rgb.mul(gain);
+  await f.renderer.compileAsync(f.scene,f.camera);
+  assert.equal(updates,0);
+  assert.equal(f.device.writes.filter(write=>write.buffer.label==='f3d-compute-buffer').length,0);
+  f.renderer.render(f.scene,f.camera);await drain(f.renderer);
+  const buffer=storageResources(nativeDraws(f.device)[0])[0].buffer;
+  assert.equal(f.device.writes.filter(write=>write.buffer===buffer).length,1);assert.equal(updates,1);
+  assert.deepEqual(storageWords(nativeDraws(f.device)[0]),[[.25,.5,.75,1]]);
+});
+
+test('native graphics borrows compute storage without uploading stale CPU values or owning a second copy',async t=>{
+  const f=fixture(t),attribute=new T.StorageBufferAttribute(new Float32Array([0,0,0,0]),4);
+  f.device.createComputePipeline=descriptor=>({...descriptor,getBindGroupLayout:()=>({})});
+  f.device.createComputePipelineAsync=async descriptor=>f.device.createComputePipeline(descriptor);
+  const writable=T.TSL.storage(attribute,'vec4',1);
+  const kernel=T.TSL.Fn(()=>{writable.element(0).assign(T.TSL.vec4(.25,.5,.75,1));})().compute(1);
+  await f.renderer.compileComputeAsync(kernel);
+  const buffer=f.device.buffers.find(value=>value.usage&128);
+  assert.ok(buffer,'compute preparation publishes actual owned storage');
+  // Model GPU-produced bytes at the recording boundary; the browser parity
+  // scenario executes the actual kernel and checks its rendered result.
+  f.device.queue.writeBuffer(buffer,0,new Float32Array([.25,.5,.75,1]));
+  const storageWrites=f.device.writes.filter(write=>write.buffer===buffer).length;
+  f.material.colorNode=T.TSL.storage(attribute,'vec4',1).toReadOnly().element(0).rgb;
+  await f.renderer.compileAsync(f.scene,f.camera);f.renderer.render(f.scene,f.camera);await drain(f.renderer);
+  const draw=nativeDraws(f.device)[0];assert.equal(storageResources(draw)[0].buffer,buffer);
+  assert.deepEqual(storageWords(draw),[[.25,.5,.75,1]]);assert.deepEqual([...attribute.array],[0,0,0,0]);
+  assert.equal(f.device.writes.filter(write=>write.buffer===buffer).length,storageWrites);
+  assert.equal(f.device.buffers.filter(value=>value.label==='f3d-compute-buffer'&&(value.usage&128)).length,1);
+  await f.renderer.waitForGPU();f.renderer.dispose();assert.equal(buffer.destroyed,true);
 });

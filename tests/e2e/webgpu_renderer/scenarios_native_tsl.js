@@ -59,6 +59,82 @@ function sampledNormal(T) {
   result.colorSpace = T.NoColorSpace; result.generateMipmaps = false; result.needsUpdate = true; return result;
 }
 export const nativeTSLScenarios = {
+  native_tsl_storage(T) {
+    const {storage, vertexIndex, uv, positionLocal} = T.TSL;
+    const geometry = new T.PlaneGeometry(1.45, 1.4, 12, 12);
+    const offsets = new T.StorageBufferAttribute(geometry.attributes.position.count, 4);
+    for (let i = 0; i < offsets.count; i++) {
+      const p = geometry.attributes.position;
+      offsets.setXYZW(i, .04 * Math.cos(p.getY(i) * 7), .12 * Math.sin(p.getX(i) * 6), 0, 0);
+    }
+    const colors = new T.StorageBufferAttribute(new Float32Array([.8, .15, .08, 1, .08, .5, .85, 1]), 4);
+    const material = new T.MeshBasicNodeMaterial();
+    material.positionNode = positionLocal.add(storage(offsets, 'vec4', offsets.count).toReadOnly().element(vertexIndex).xyz);
+    material.colorNode = storage(colors, 'vec4', colors.count).toReadOnly().element(uv().x.greaterThan(.5).select(1, 0).toUint()).rgb;
+    const result = {scene: scene(T), camera: camera(T)};
+    const mesh = new T.Mesh(geometry, material); mesh.rotation.set(.12, -.2, .1); result.scene.add(mesh);
+    return result;
+  },
+  native_tsl_storage_compute(T, renderer) {
+    const {storage, Fn, instanceIndex, vertexIndex, positionLocal, vec4, uniform} = T.TSL;
+    const geometry = new T.PlaneGeometry(1.6, 1.45, 12, 12);
+    const offsets = new T.StorageBufferAttribute(geometry.attributes.position.count, 4);
+    const colors = new T.StorageBufferAttribute(1, 4), phase = uniform(.2);
+    const outputOffsets = storage(offsets, 'vec4', offsets.count), outputColor = storage(colors, 'vec4', 1);
+    const deform = Fn(() => {
+      outputOffsets.element(instanceIndex).assign(vec4(0, instanceIndex.toFloat().mul(.35).add(phase).sin().mul(.12), 0, 0));
+    })().compute(offsets.count);
+    const recolor = Fn(() => { outputColor.element(0).assign(vec4(phase.mul(.25), .45, .8, 1)); })().compute(1);
+    const material = new T.MeshBasicNodeMaterial();
+    material.positionNode = positionLocal.add(storage(offsets, 'vec4', offsets.count).toReadOnly().element(vertexIndex).xyz);
+    material.colorNode = storage(colors, 'vec4', 1).toReadOnly().element(0).rgb;
+    const result = {scene: scene(T), camera: camera(T)};
+    result.scene.add(new T.Mesh(geometry, material));
+    const compile = renderer.compileAsync.bind(renderer), render = renderer.render.bind(renderer);
+    renderer.compileAsync = async (...args) => {
+      await renderer.computeAsync([deform, recolor]);
+      return compile(...args);
+    };
+    let frame = 0;
+    renderer.render = (...args) => {
+      if (++frame === 8) { phase.value = 2.5; renderer.compute([deform, recolor]); }
+      // CPU arrays remain their initial zeroes; rendering must consume GPU data.
+      if (offsets.array.some(value => value !== 0) || colors.array.some(value => value !== 0))
+        throw new Error('Compute unexpectedly changed source CPU storage');
+      return render(...args);
+    };
+    return result;
+  },
+  native_tsl_storage_targets(T, renderer) {
+    const {storage} = T.TSL;
+    const colors = new T.StorageBufferAttribute(new Float32Array([.8, .2, .1, 1]), 4);
+    const material = new T.MeshBasicNodeMaterial(); material.colorNode = storage(colors, 'vec4', 1).toReadOnly().element(0).rgb;
+    const writer = scene(T); writer.add(new T.Mesh(new T.PlaneGeometry(1.8, 1.3), material));
+    const writeCamera = new T.OrthographicCamera(-1.2, 1.2, .9, -.9, .1, 10); writeCamera.position.z = 3;
+    const targets = Array.from({length: 2}, () => new T.RenderTarget(96, 72,
+      {depthBuffer: false, generateMipmaps: false, minFilter: T.NearestFilter, magFilter: T.NearestFilter}));
+    const result = {scene: scene(T), camera: camera(T, true)};
+    for (const [i, target] of targets.entries()) {
+      renderer.initRenderTarget(target);
+      const panel = new T.Mesh(new T.PlaneGeometry(1.85, 1.4), new T.MeshBasicMaterial({map: target.texture}));
+      panel.position.x = i ? 1 : -1; result.scene.add(panel);
+    }
+    const render = renderer.render.bind(renderer); let frame = 0;
+    renderer.render = (...args) => {
+      if (++frame === 1 || frame === 8) {
+        for (const [i, target] of targets.entries()) {
+          colors.array.set(frame === 1 ? (i ? [.1, .3, .85, 1] : [.85, .2, .1, 1])
+            : (i ? [.6, .15, .8, 1] : [.1, .75, .3, 1]));
+          colors.needsUpdate = true;
+          renderer.setRenderTarget(target); render(writer, writeCamera);
+        }
+        renderer.setRenderTarget(null);
+        colors.array.fill(0); // No upload request: neither submitted target may change.
+      }
+      return render(...args);
+    };
+    return result;
+  },
   native_tsl_pbr_materials(T) {
     const {uniform, vec2, vec3} = T.TSL;
     const result = pbrScene(T), [rough, metal, physical] = result.materials;

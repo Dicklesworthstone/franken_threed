@@ -3,11 +3,11 @@
  * no GPU commands. Descriptors preserve the builder's native bind groups.
  *
  * The profile is rigid meshes, unlit or Toon/Lambert/Phong/Standard/Physical
- * with ordinary source lights, float attributes, scalar/vector/matrix uniforms
- * and sampled 2D float textures. Physical direct lighting retains the source
- * DFG texture, clearcoat, sheen, iridescence, anisotropy and retroreflection.
- * Transmission, environments, storage, shadows, clipping and MRT graphs fail
- * explicitly until their additional scene/resource contexts are available.
+ * with ordinary source lights, float attributes, scalar/vector/matrix uniforms,
+ * sampled 2D float textures and read-only scalar/vector storage buffers.
+ * Physical direct lighting retains the source DFG texture, clearcoat, sheen,
+ * iridescence, anisotropy and retroreflection. Transmission, environments,
+ * writable/atomic storage, shadows, clipping and MRT graphs fail explicitly.
  * capture() is a logical-draw operation, never a
  * preparation retry: it runs source before/current updates and owns the bytes.
  * after() belongs after that draw has been accepted. Callers capture before any
@@ -52,9 +52,40 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     three.MeshPhongNodeMaterial.prototype, ...standardPrototypes];
   const lightClasses = new Map([[three.AmbientLight, three.AmbientLightNode], [three.DirectionalLight, three.DirectionalLightNode],
     [three.HemisphereLight, three.HemisphereLightNode], [three.PointLight, three.PointLightNode], [three.SpotLight, three.SpotLightNode]]);
+  const storageIds = new WeakMap(); let nextStorageId = 0;
   let disposed = false, shaderBytes = 0, serial = 0;
   const live = () => { if (disposed) fail('DISPOSED', 'Native node program preparation is disposed'); };
   const litMaterial = material => litPrototypes.includes(Object.getPrototypeOf(material));
+  function inspectStorage(node) {
+    const attribute = node.value, type = /^(?:(i|u)?vec([234])|(float|int|uint))$/.exec(node.nodeType ?? '');
+    const components = type?.[2] ? Number(type[2]) : 1;
+    const scalar = type?.[1] === 'i' || type?.[3] === 'int' ? Int32Array
+      : type?.[1] === 'u' || type?.[3] === 'uint' ? Uint32Array : Float32Array;
+    if (!type || node.structTypeNode || node.isAtomic || node.isPBO ||
+        !['readOnly', 'readWrite'].includes(node.access) || attribute?.isIndirectStorageBufferAttribute ||
+        !(attribute?.isStorageBufferAttribute || attribute?.isStorageInstancedBufferAttribute) ||
+        attribute.isInterleavedBufferAttribute || attribute.normalized || !(attribute.array instanceof scalar) ||
+        !Number.isSafeInteger(attribute.count) || attribute.count < 1 ||
+        ![components, components === 3 ? 4 : components].includes(attribute.itemSize) ||
+        attribute.array.length !== attribute.count * attribute.itemSize ||
+        !Number.isSafeInteger(node.bufferCount) || node.bufferCount < 0 || node.bufferCount > attribute.count)
+      fail('STORAGE', 'Native storage reads require matching non-atomic scalar/vector 32-bit storage attributes');
+    if (attribute.onUploadCallback !== three.BufferAttribute.prototype.onUploadCallback)
+      fail('HOOK', 'Native storage reads require the source upload callback');
+    const bytes = attribute.count * (components === 3 ? 4 : components) * 4;
+    if (bytes > (renderer._device?.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024) ||
+        bytes > (renderer._device?.limits?.maxBufferSize ?? 256 * 1024 * 1024))
+      fail('LIMIT', 'Native storage input exceeds device buffer binding limits');
+    return bytes;
+  }
+  function storageSignature(nodes) {
+    return JSON.stringify(nodes.map(node => {
+      const bytes = inspectStorage(node), attribute = node.value;
+      let id = storageIds.get(attribute);
+      if (id === undefined) { id = ++nextStorageId; storageIds.set(attribute, id); }
+      return [id, node.nodeType, node.bufferCount, attribute.count, bytes];
+    }));
+  }
   function sourceLights(material, {lights = [], lightingEnabled = renderer.lighting?.enabled !== false} = {}) {
     if (!litMaterial(material) || material.lights !== true || material.fragmentNode != null) return [];
     if (typeof lightingEnabled !== 'boolean' || lightingEnabled !== (renderer.lighting?.enabled !== false))
@@ -173,8 +204,21 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       if (node.compareNode !== null || node.depthNode !== null)
         fail('TEXTURE', 'Texture comparison and array-layer sampling are not admitted');
     } else if (node.value?.isTexture) fail('TEXTURE', 'Native graphics textures require source TextureNode bindings');
-    if (node.isStorageBufferNode || node.isBufferNode || node.isBufferAttributeNode || node.isComputeNode || node.isAtomicFunctionNode)
-      fail('STORAGE', 'Storage, explicit buffer and compute graphs are not admitted');
+    if (node.isStorageBufferNode) inspectStorage(node);
+    else if (node.isBufferNode || node.isBufferAttributeNode || node.isComputeNode || node.isAtomicFunctionNode)
+      fail('STORAGE', 'Explicit uniform buffers, attribute conversions, atomic and compute graphs are not admitted');
+    if (node.isAssignNode) {
+      const seen = new Set(), targets = [node.targetNode];
+      while (targets.length) {
+        const target = targets.pop(); if (!target || seen.has(target)) continue;
+        seen.add(target);
+        if (target.isStorageBufferNode) fail('STORAGE', 'Native graphics storage bindings are read-only');
+        // Assignment addresses follow the node/target chain; an index expression
+        // may read storage without making the assigned local variable writable.
+        if (target.node) targets.push(target.node);
+        if (target.targetNode) targets.push(target.targetNode);
+      }
+    }
     if (node.isLightingNode || node.isLightsNode || node.isLightingContextNode || node.light?.isLight) {
       const admitted = lightsNode && (node === lightsNode || node.isAnalyticLightNode && lights.includes(node.light) &&
         Object.getPrototypeOf(node) === lightClasses.get(node.light.constructor)?.prototype);
@@ -209,7 +253,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const lights = sourceLights(material, context);
     const key = keyOf(material, object, context, lights), byMaterial = cache.get(object);
     const previous = byMaterial?.get(material);
-    if (previous?.key === key && textureSignature(previous.textureNodes) === previous.textureSignature) return previous.descriptor;
+    if (previous?.key === key && textureSignature(previous.textureNodes) === previous.textureSignature &&
+        storageSignature(previous.storageNodes) === previous.storageSignature) return previous.descriptor;
     if (entries.size - (previous ? 1 : 0) >= maxPrograms) fail('LIMIT', 'Native node program capacity exceeded');
     const builder = new three.WGSLNodeBuilder(object, renderer);
     builder.material = material; builder.context.material = material;
@@ -227,7 +272,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (bindings.length > Math.min(maxBindGroups, renderer._device?.limits?.maxBindGroups ?? 4))
       fail('LIMIT', 'Native node graph exceeds its bind group budget');
     let uniformBytes = 0;
-    const sampledCounts = [0, 0], samplerCounts = [0, 0];
+    const sampledCounts = [0, 0], samplerCounts = [0, 0], storageCounts = [0, 0];
     const groups = bindings.map((group, index) => {
       let byteLength = 0;
       const entries = group.bindings.map((binding, slot) => {
@@ -241,6 +286,15 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
               byteLength > (renderer._device?.limits?.maxUniformBufferBindingSize ?? 65536))
             fail('LIMIT', 'Native node uniform buffer exceeds device binding limits');
           return Object.freeze({...base, buffer: Object.freeze({type: 'uniform', hasDynamicOffset: true, minBindingSize: byteLength})});
+        }
+        if (binding.isStorageBuffer && binding.nodeUniform?.isStorageBufferNode) {
+          const minBindingSize = inspectStorage(binding.nodeUniform);
+          for (let stage = 0; stage < 2; stage++) if (binding.visibility & (1 << stage))
+            if (++storageCounts[stage] > (renderer._device?.limits?.maxStorageBuffersPerShaderStage ?? 8))
+              fail('LIMIT', 'Native node storage bindings exceed per-stage device limits');
+          // r186 WGSLNodeBuilder.getNodeAccess makes non-atomic graphics reads
+          // read-only even when the same source node is writable in compute.
+          return Object.freeze({...base, buffer: Object.freeze({type: 'read-only-storage', hasDynamicOffset: false, minBindingSize})});
         }
         if (!binding.textureNode?.isTextureNode || binding.store || (!binding.isSampledTexture && !binding.isSampler))
           fail('BINDING', 'Native graphics groups require uniform blocks or ordinary sampled 2D texture bindings');
@@ -270,8 +324,12 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       attributes: Object.freeze(attributes), attributesKey: JSON.stringify(attributes), groups: Object.freeze(groups)});
     const textureNodes = [...builder.nodes].filter(node => node.isTextureNode);
     const signature = textureSignature(textureNodes);
-    nodeStates.set(descriptor, {owner: api, builder, bindings, material, object, textureNodes, textureSignature: signature});
-    const entry = {key, descriptor, material, object, geometry: object.geometry, bytes, textureNodes, textureSignature: signature};
+    const storageNodes = [...builder.nodes].filter(node => node.isStorageBufferNode);
+    const storageKey = storageSignature(storageNodes);
+    nodeStates.set(descriptor, {owner: api, builder, bindings, material, object, textureNodes, textureSignature: signature,
+      storageNodes, storageSignature: storageKey});
+    const entry = {key, descriptor, material, object, geometry: object.geometry, bytes, textureNodes, textureSignature: signature,
+      storageNodes, storageSignature: storageKey};
     entry.onDispose = () => retire(entry);
     if (previous) retire(previous);
     const next = byMaterial ?? new Map(); next.set(material, entry); cache.set(object, next);
@@ -302,12 +360,21 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         store: false, access: null, mipLevel: 0}));
     return Object.freeze(textures);
   }
+  function readStorage(state) {
+    if (storageSignature(state.storageNodes) !== state.storageSignature)
+      fail('CHANGED', 'Native storage identity or layout changed; compile the graph again');
+    const storage = [];
+    for (const [group, source] of state.bindings.entries()) for (const [binding, value] of source.bindings.entries())
+      if (value.isStorageBuffer) storage.push(Object.freeze({group, binding, attribute: value.attribute}));
+    return Object.freeze(storage);
+  }
   function captureDraw(descriptor, context = {}) {
     const state = stateOf(descriptor);
     return withFrame(state, context, () => {
       for (const node of state.builder.updateBeforeNodes) frame.updateBeforeNode(node);
       for (const node of state.builder.updateNodes) frame.updateNode(node);
       const textures = readTextures(state);
+      const storage = readStorage(state);
       const uniforms = state.bindings.map((group, index) => {
         const binding = group.bindings.find(value => value.isNodeUniformsGroup);
         if (!binding) return new Uint8Array(0);
@@ -317,7 +384,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         const bytes = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength).slice();
         binding.clearUpdateRanges(); return bytes;
       });
-      return {uniforms, textures};
+      return {uniforms, textures, storage};
     });
   }
   function capture(descriptor, context = {}) { return captureDraw(descriptor, context).uniforms; }
@@ -327,6 +394,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   }
   const api = Object.freeze({inspect, compile, capture, captureDraw, after,
     textures(descriptor) { return readTextures(stateOf(descriptor)); },
+    storage(descriptor) { return readStorage(stateOf(descriptor)); },
     release(descriptor) { for (const entry of entries) if (entry.descriptor === descriptor) { retire(entry); break; } },
     dispose() { if (disposed) return; disposed = true; for (const entry of [...entries]) retire(entry); },
     get diagnostics() { return Object.freeze({programs: entries.size, shaderBytes, maxPrograms, maxShaderBytes}); }});

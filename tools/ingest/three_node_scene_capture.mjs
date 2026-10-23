@@ -12,7 +12,7 @@ const transparent = material => material.transparent === true || material.transm
 
 export function captureThreeNodeScene(three, root, camera, {getPrograms, renderer,
   overrideMaterial = null, maxNodes = 16384, maxDraws = 16384, uniforms = true,
-  maxUniformBytes = 64 * 1024 * 1024, raster, getTextures, destination = null} = {}) {
+  maxUniformBytes = 64 * 1024 * 1024, raster, getTextures, getStorage, destination = null} = {}) {
   if (!integer(maxNodes) || maxNodes < 1 || !integer(maxDraws) || maxDraws < 1 || !integer(maxUniformBytes))
     fail('LIMIT', 'Invalid native scene capture capacity');
   const hierarchy = new Map(), objects = new Set(), bindings = [], pairs = new Map(), stack = [root];
@@ -147,13 +147,17 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   // graph is constructed or application node update runs. The compiler admits
   // only lights used by a lit graph, so unused unsupported lights stay inert.
   for (const binding of bindings) programs.inspect(binding.material, binding.object, context);
-  let textureOwner = null;
+  let textureOwner = null, storageOwner = null;
   for (const binding of bindings) {
     binding.nodeProgram = programs.compile(binding.material, binding.object, context);
     binding.raster = raster(binding.material); Object.freeze(binding);
     if (programs.textures(binding.nodeProgram).length) {
       if (typeof getTextures !== 'function') fail('SOURCE', 'Native sampled graphs require the renderer texture owner');
       textureOwner ??= getTextures();
+    }
+    if (programs.storage(binding.nodeProgram).length) {
+      if (typeof getStorage !== 'function') fail('SOURCE', 'Native storage graphs require the renderer storage owner');
+      storageOwner ??= getStorage();
     }
   }
   let bytes = 0;
@@ -165,7 +169,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   const frame = renderer._nodes.nodeFrame;
   const frameContext = {...context, frameId: frame.frameId, time: frame.time, deltaTime: frame.deltaTime,
     renderId: renderer.info.calls};
-  const textureUses = [];
+  const textureUses = [], storageUses = [];
   const capture = () => {
     for (const draw of draws) {
       draw.object.modelViewMatrix.multiplyMatrices(camera.matrixWorldInverse, draw.object.matrixWorld);
@@ -183,17 +187,25 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
         textureUses.push(lease);
         return Object.freeze({group: binding.group, binding: binding.binding, lease});
       }));
+      draw.nodeStorage = Object.freeze(captured.storage.map(binding => {
+        const lease = storageOwner.capture(binding.attribute);
+        storageUses.push(lease);
+        return Object.freeze({group: binding.group, binding: binding.binding, lease});
+      }));
       programs.after(draw.binding.nodeProgram, updateContext);
       Object.freeze(draw.nodeUniforms); Object.freeze(draw);
     }
   };
   try {
-    if (textureOwner) textureOwner.captureDispatch(capture);
-    else capture();
+    const captureStorage = () => storageOwner ? storageOwner.captureDispatch(capture) : capture();
+    if (textureOwner) textureOwner.captureDispatch(captureStorage);
+    else captureStorage();
+    storageOwner?.validate(storageUses);
   } catch (error) {
     for (const lease of textureUses) textureOwner.release(lease);
+    for (const lease of storageUses) storageOwner.release(lease);
     throw error;
   }
   return Object.freeze({objects, bindings: Object.freeze(bindings), draws: Object.freeze(draws), bytes,
-    textureOwner, textureUses: Object.freeze(textureUses)});
+    textureOwner, textureUses: Object.freeze(textureUses), storageOwner, storageUses: Object.freeze(storageUses)});
 }

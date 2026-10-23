@@ -44,6 +44,13 @@ resource order: a uniform block can follow samplers/textures, and groups can
 contain resources without a uniform block. Filterable float formats are admitted;
 float32 inputs require the actual `float32-filterable` device feature.
 
+`storage()` reads in vertex and fragment graphs share the renderer's compute
+allocation. Scalar and vector float32, int32 and uint32 storage attributes are
+admitted, including source vec3 padding. A compute-writable source node can be
+read by graphics; the pinned builder supplies read-only graphics bindings.
+There is no readback, second graphics allocation, or CPU upload merely because
+a graphics draw consumes compute-produced values.
+
 ```js
 const tint = TSL.uniform(new THREE.Color(0.2, 0.5, 0.8));
 const shift = TSL.uniform(0);
@@ -129,10 +136,22 @@ displacement and transparency state already matches the override. Other cases
 fail explicitly before callbacks, without temporarily changing a shared source
 material. Original material visibility and render-list partitioning still apply.
 
+Storage leases capture the host upload version at each logical draw. Marked
+full and partial uploads share compute's upload history; unmarked CPU edits
+cannot overwrite resident GPU results. Queued render calls submit their captured
+versions in FIFO order, including calls targeting different render targets.
+Compilation alone performs no storage upload or node update. Leases release
+their captured bytes on success and failure; the compute owner retains GPU
+lifetime. Conflicting host versions of one storage attribute within a single
+logical render are rejected before any storage writes. They require additional
+per-draw storage scheduling; separate logical renders already retain each version.
+
 ## Explicit remaining boundaries
 
-This is a bounded native graphics entrance, not full TSL coverage. Storage/buffer,
-compute and multiple-render-target graphics graphs are refused. Authored
+This is a bounded native graphics entrance, not full TSL coverage. Writable or
+atomic graphics storage, struct/matrix storage, explicit uniform-buffer arrays,
+compute nodes inside graphics graphs and multiple-render-target graphics graphs
+are refused. Authored
 PBR transmission/dispersion, environment lighting, area/probe/custom lights,
 shadows, projected light maps and custom `lightsNode` graphs remain missing.
 Depth/comparison, cube, array, volume, compressed, storage, video and unfilterable
@@ -204,3 +223,11 @@ results, not hardware performance measurements.
 pixels and zero mean difference. They exercise Standard roughness/metalness,
 all admitted Physical lobes, feature activation and live value updates, and
 authored textures including distinct base and clearcoat normal maps.
+
+Storage facade regressions verify queued full and partial uploads, unchanged
+CPU versus GPU state, compile-only behavior and borrowed compute residency.
+Browser scenes `native_tsl_storage`, `native_tsl_storage_compute` and
+`native_tsl_storage_targets` matched the pinned reference exactly in RGB on
+Chromium 151 with SwiftShader. They execute vertex/fragment reads, actual compute
+kernels and separate queued render-target histories. This is correctness
+evidence for that software-GPU environment, not a hardware performance result.

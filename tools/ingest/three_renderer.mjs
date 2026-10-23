@@ -682,7 +682,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       if (!raster) { raster = createThreeSceneRaster(THREE, {stencilAttachment, fail}).program; this._nodeRaster.set(stencilAttachment, raster); }
       const captured = captureThreeNodeScene(THREE, scene, camera, {renderer: this, overrideMaterial, raster,
         getPrograms: () => this._nodeProgramSupport ??= createThreeNodePrograms({three: THREE, renderer: this, maxPrograms: maxBindings}),
-        getTextures: () => this._getSampledTextureInputs(), destination: target,
+        getTextures: () => this._getSampledTextureInputs(), getStorage: () => this._getStorageInputs(), destination: target,
         maxNodes: sceneLimits.maxNodes ?? 16384, maxDraws, uniforms: captureCameras,
         maxUniformBytes: MAX_NODE_CAPTURE_BYTES - this._nodeCaptureBytes});
       if (captured) this._nodeCaptureBytes += captured.bytes;
@@ -693,6 +693,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       if (request.nodeFrame) {
         const captured = request.nodeFrame;
         for (const lease of captured.textureUses) captured.textureOwner.release(lease);
+        for (const lease of captured.storageUses) captured.storageOwner.release(lease);
         this._nodeCaptureBytes -= captured.bytes; request.nodeFrame = null;
       }
     }
@@ -725,15 +726,21 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           if (destination === this) this._session.render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame}, frame);
           else this._targets.render(destination, attachments => destination._dispatcher.render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame}, {...frame, ...attachments}), {mipLevel});
         };
-        const textures = nodeFrame?.textureOwner;
+        const textures = nodeFrame?.textureOwner, storage = nodeFrame?.storageOwner;
+        const resources = () => {
+          if (nodeFrame) nodeFrame = {...nodeFrame, draws: nodeFrame.draws.map(draw => ({...draw,
+            nodeResources: [
+              ...draw.nodeTextures.map(({group, binding, lease}) => ({group, binding, resource: textures.resolve(lease)})),
+              ...draw.nodeStorage.map(({group, binding, lease}) => ({group, binding, resource: storage.resolve(lease)})),
+            ]}))};
+          issue();
+        };
+        const readStorage = () => storage && nodeFrame.storageUses.length
+          ? storage.withReads(nodeFrame.storageUses, resources) : resources();
         if (textures && nodeFrame.textureUses.length) {
           textures.validateDispatch(nodeFrame.textureUses);
-          textures.withDispatch(nodeFrame.textureUses, () => {
-            nodeFrame = {...nodeFrame, draws: nodeFrame.draws.map(draw => ({...draw,
-              nodeResources: draw.nodeTextures.map(({group, binding, lease}) => ({group, binding, resource: textures.resolve(lease)}))}))};
-            issue();
-          });
-        } else issue();
+          textures.withDispatch(nodeFrame.textureUses, readStorage);
+        } else readStorage();
       } finally { this._programFrame = previous; }
       const d = destination._dispatcher.entry(scene)?.lastDiagnostics;
       if (d) {

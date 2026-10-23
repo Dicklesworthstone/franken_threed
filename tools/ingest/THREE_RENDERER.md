@@ -72,7 +72,13 @@ without rewriting the earlier render. Compilation does not invoke those updates.
 Light selection follows source visibility and camera layers, while retained
 analytic nodes preserve FRAME/RENDER light updates across objects and program
 rebuilds. See [THREE_NODE_PROGRAMS.md](./THREE_NODE_PROGRAMS.md) for the profile,
-resource bounds and remaining texture-family, storage and advanced lighting gaps.
+resource bounds and remaining texture-family, writable/struct storage and advanced lighting gaps.
+
+Native scalar/vector TSL storage reads now share compute's authoritative buffer
+and upload history. Queued full and partial host uploads retain their own render
+order, while unchanged host versions consume GPU-produced data without a stale
+CPU refresh. Multiple host versions of one attribute within a single logical
+render remain an explicit unsupported case; separate queued renders work.
 
 Standard and Physical materials, including their default node-material forms,
 accept independent `metalnessMap` and `roughnessMap` textures with their own

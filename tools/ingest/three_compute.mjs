@@ -40,10 +40,11 @@ function createThreeCompute(renderer, three) {
   const gpu = createGpuCompute(device, {signal: renderer._targetLifetime.signal});
   const programs = new Map(), initialized = new Set(), listeners = new Map(), building = new Set();
   const captured = new WeakMap(), uploaded = new WeakMap(), payloads = new Set(), compiling = new Set();
+  const readLeases = new WeakMap(), readResources = new WeakMap();
   const transfers = new Set();
   let transferFailure = null;
   const maxSnapshotBytes = 128 * 1024 * 1024;
-  let disposed = false, uniformVersion = 0, snapshotBytes = 0, issuing = false;
+  let disposed = false, uniformVersion = 0, snapshotBytes = 0, issuing = false, capturingReads = false;
   function live() {
     if (disposed || renderer._disposed) fail('DISPOSED', 'Renderer compute execution is disposed');
   }
@@ -117,6 +118,77 @@ function createThreeCompute(renderer, three) {
     }
     return buffer;
   }
+  function attributeRecord(attribute, deferred) {
+    const array = normalize(attribute), version = attribute.version ?? 0;
+    const ranges = (attribute.updateRanges ?? []).map(({start, count}) => ({start, count}));
+    if (!Number.isSafeInteger(version) || version < 0 || ranges.some(({start, count}) =>
+      !Number.isSafeInteger(start) || start < 0 || !Number.isSafeInteger(count) || count < 0 || start + count > array.length))
+      fail('STORAGE', 'Expected a nonnegative storage version and in-bounds update ranges');
+    return snapshot(attribute, array, version, false, deferred, ranges);
+  }
+  function readRecord(lease) {
+    live();
+    const value = readLeases.get(lease);
+    if (!value || value.released) fail('STALE', 'Native graphics storage lease is foreign or released');
+    return value.record;
+  }
+  function validateReads(leases) {
+    live();
+    const versions = new Map();
+    for (const lease of leases) {
+      const record = readRecord(lease), previous = versions.get(record.key);
+      // One graphics pass cannot bind two queue-upload histories of the same
+      // allocation. Reject before uploading either: otherwise both draws could
+      // observe the later value. Independent render calls have FIFO boundaries.
+      if (previous && previous !== record)
+        fail('READ_CONFLICT', 'One native render cannot read conflicting upload versions of a storage attribute');
+      if (!record.data && (uploaded.get(record.key) !== record || !gpu.getBuffer(record.key)))
+        fail('STALE', 'Native graphics storage residency was released before its captured use');
+      versions.set(record.key, record);
+    }
+    return versions.values();
+  }
+  const storageReads = Object.freeze({
+    captureDispatch(run) {
+      live();
+      if (capturingReads || issuing) fail('REENTRY', 'Cannot reenter native storage capture or upload');
+      capturingReads = true;
+      try { return run(); } finally { capturingReads = false; }
+    },
+    capture(attribute) {
+      live();
+      if (issuing) fail('REENTRY', 'Cannot capture native storage from an upload callback');
+      const record = attributeRecord(attribute, true), lease = Object.freeze({});
+      record.refs++; readLeases.set(lease, {record, released: false});
+      return lease;
+    },
+    validate: validateReads,
+    withReads(leases, run) {
+      const records = [...validateReads(leases)];
+      if (issuing || capturingReads) fail('REENTRY', 'Cannot submit native storage during capture or upload');
+      issuing = true;
+      try {
+        for (const record of records) {
+          const buffer = upload(record);
+          let resource = readResources.get(buffer);
+          if (!resource) { resource = Object.freeze({buffer}); readResources.set(buffer, resource); }
+          record.resource = resource;
+        }
+        return run();
+      } finally { issuing = false; }
+    },
+    resolve(lease) {
+      const record = readRecord(lease);
+      if (!issuing || !record.resource) fail('STORAGE', 'Resolve native storage only during its submitted read interval');
+      return record.resource;
+    },
+    release(lease) {
+      const value = readLeases.get(lease);
+      if (!value || value.released) return;
+      value.released = true;
+      if (--value.record.refs === 0) free(value.record);
+    },
+  });
   function releaseUniforms(entry) {
     for (const group of entry.groups) for (const binding of group.bindings)
       if (binding.isUniformBuffer) { gpu.release(binding); uploaded.delete(binding); }
@@ -208,14 +280,6 @@ function createThreeCompute(renderer, three) {
       for (const texture of textureUses) textureOwner.release(texture);
       if (--entry.uses === 0 && entry.retired) releaseUniforms(entry);
     }
-    function attributeRecord(attribute) {
-      const array = normalize(attribute), version = attribute.version ?? 0;
-      const ranges = (attribute.updateRanges ?? []).map(({start, count}) => ({start, count}));
-      if (!Number.isSafeInteger(version) || version < 0 || ranges.some(({start, count}) =>
-        !Number.isSafeInteger(start) || start < 0 || !Number.isSafeInteger(count) || count < 0 || start + count > array.length))
-        fail('STORAGE', 'Expected a nonnegative storage version and in-bounds update ranges');
-      return hold(snapshot(attribute, array, version, false, deferred, ranges));
-    }
     try {
       const groups = entry.groups.map((group, index) => ({index, entries: group.bindings.map((binding, slot) => {
         if (binding.isSampledTexture || binding.isSampler) {
@@ -225,7 +289,7 @@ function createThreeCompute(renderer, three) {
           return {binding: slot, texture, layout: {binding: slot, visibility: 4, ...textureOwner.layout(texture)}};
         }
         let record;
-        if (binding.isStorageBuffer) record = attributeRecord(binding.attribute);
+        if (binding.isStorageBuffer) record = hold(attributeRecord(binding.attribute, deferred));
         else {
           binding.update?.();
           const array = binding.buffer instanceof ArrayBuffer ? new Uint8Array(binding.buffer) : binding.buffer;
@@ -242,7 +306,7 @@ function createThreeCompute(renderer, three) {
         bindGroupLayouts: groups.map(group => ({entries: group.entries.map(binding => binding.layout)}))} : entry.shader;
       const size = override ?? node.dispatchSize ?? node.count;
       let direct, indirect;
-      if (size?.isIndirectStorageBufferAttribute) indirect = attributeRecord(size);
+      if (size?.isIndirectStorageBufferAttribute) indirect = hold(attributeRecord(size, deferred));
       else if (Array.isArray(size)) {
         if (size.length < 1 || size.length > 3) fail('DISPATCH', 'Expected one to three workgroup dimensions');
         direct = [size[0], size[1] ?? 1, size[2] ?? 1];
@@ -283,7 +347,7 @@ function createThreeCompute(renderer, three) {
   }
   function compute(list, override, schedule, deferred) {
     live();
-    if (issuing) fail('REENTRY', 'Cannot compute from an upload callback');
+    if (issuing || capturingReads) fail('REENTRY', 'Cannot compute from an upload callback or native storage capture');
     renderer.info.calls++; renderer.info.compute.calls++; renderer.info.compute.frameCalls++;
     renderer.inspector?.beginCompute?.(`compute:${renderer.info.compute.frameCalls}:f${renderer.info.frame}`, list);
     const pending = [];
@@ -331,7 +395,7 @@ function createThreeCompute(renderer, three) {
       } finally { request.release(); }
     }
   }
-  return {compute, gpu,
+  return {compute, gpu, storageReads,
     textureSampleData(texture) {
       return textureOwner.sampleData(texture);
     },
@@ -459,6 +523,13 @@ export function withThreeCompute(Base, THREE) {
         poolFactory: ({imageSnapshots}) => createGpuThreeTextures(this._device, {three: THREE, imageSnapshots}),
         targetFactory: () => createThreeComputeTargets({targets: this._targets, device: this._device,
           signal: this._targetLifetime.signal})});
+    }
+    /** Graphics leases share compute's authoritative allocation and upload
+     * history. An unchanged host version never overwrites GPU-produced bytes. */
+    _getStorageInputs() {
+      check(this);
+      if (!this._device) fail('DEVICE', 'Initialize the renderer before capturing storage inputs');
+      return owner(this).storageReads;
     }
     compute(nodes, dispatchSize = null) {
       check(this);

@@ -368,7 +368,7 @@ test('nested captures and thrown callbacks restore the exact outer NodeFrame con
 });
 for (const [name, change, code] of [
   ['depth texture graph', f => { f.material.colorNode = N.texture(new THREE.DepthTexture(1, 1)); }, 'TEXTURE'],
-  ['storage graph', f => { f.material.colorNode = N.storage(new THREE.StorageBufferAttribute(4, 4), 'vec4', 4).element(0).xyz; }, 'STORAGE'],
+  ['atomic storage graph', f => { f.material.colorNode = N.storage(new THREE.StorageBufferAttribute(4, 1, Uint32Array), 'uint', 4).toAtomic().element(0).toFloat(); }, 'STORAGE'],
   ['material texture', f => { f.material.map = new THREE.Texture(); }, 'TEXTURE'],
   ['MRT graph', f => { f.material.fragmentNode = N.mrt({output: N.vec4(1)}); }, 'MRT'],
   ['lighting slot', f => { f.material.lightsNode = N.vec3(1); }, 'GRAPH'],
@@ -378,6 +378,57 @@ for (const [name, change, code] of [
   ['fog', f => { f.scene.fog = new THREE.Fog(0, 1, 10); }, 'EFFECT'],
 ]) test(`${name} is explicitly refused`, t => {
   const f = rig(t); change(f); assert.throws(f.compile, {code: `THREE_NODE_PROGRAM_${code}`});
+});
+test('native storage reads retain source binding order, read-only stage access and live attribute identity', t => {
+  const f = rig(t), attribute = new THREE.StorageBufferAttribute(4, 4), storage = N.storage(attribute, 'vec4', 4);
+  f.material.positionNode = storage.element(N.vertexIndex).xyz;
+  f.material.colorNode = storage.element(0).xyz.mul(f.tint);
+  const d = f.compile(), bindings = d.groups.flatMap(group => group.entries.filter(entry => entry.buffer?.type === 'read-only-storage')
+    .map(entry => ({group: group.index, ...entry})));
+  assert.ok(bindings.length > 0);
+  for (const binding of bindings) {
+    assert.equal(binding.buffer.hasDynamicOffset, false); assert.equal(binding.buffer.minBindingSize, 64);
+    assert.ok((binding.visibility & 3) !== 0); assert.equal(binding.visibility & 4, 0);
+  }
+  assert.match(d.vertex, /var<storage, read>/); assert.match(d.fragment, /var<storage, read>/);
+  assert.doesNotMatch(d.vertex + d.fragment, /var<storage, read_write>/);
+  const captured = f.owner.captureDraw(d, f.context);
+  assert.equal(captured.storage.length, bindings.length);
+  for (const binding of captured.storage) {
+    assert.equal(binding.attribute, attribute);
+    assert.ok(bindings.some(entry => entry.group === binding.group && entry.binding === binding.binding));
+  }
+  attribute.array.fill(.25); attribute.needsUpdate = true;
+  assert.equal(f.compile(), d, 'upload versions do not recompile a shader');
+  storage.value = new THREE.StorageBufferAttribute(4, 4);
+  assert.throws(() => f.owner.captureDraw(d, f.context), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  assert.notEqual(f.compile(), d);
+});
+test('native storage supports typed scalar/vector inputs and vec3 padded residency', t => {
+  for (const [type, components, array] of [['float', 1, Float32Array], ['ivec2', 2, Int32Array], ['uvec4', 4, Uint32Array], ['vec3', 3, Float32Array]]) {
+    const f = rig(t), attribute = new THREE.StorageBufferAttribute(4, components, array);
+    f.material.colorNode = N.vec3(N.storage(attribute, type, 4).element(0));
+    const d = f.compile(), entry = d.groups.flatMap(group => group.entries).find(value => value.buffer?.type === 'read-only-storage');
+    assert.equal(entry.buffer.minBindingSize, 4 * (components === 3 ? 4 : components) * 4);
+    if (components === 3) {
+      attribute.array = new Float32Array(16); attribute.itemSize = 4;
+      assert.equal(f.compile(), d, 'compute normalization keeps the shader shape');
+    }
+  }
+});
+test('native storage rejects writes, unsupported shapes and stage limits before node updates', t => {
+  const f = rig(t), attribute = new THREE.StorageBufferAttribute(4, 4), storage = N.storage(attribute, 'vec4', 4);
+  f.material.colorNode = N.Fn(() => { storage.element(0).assign(N.vec4(1)); return N.vec3(1); })();
+  assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_STORAGE'});
+  f.material.colorNode = storage.element(0).xyz;
+  attribute.normalized = true; assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_STORAGE'}); attribute.normalized = false;
+  attribute.onUploadCallback = () => {}; assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_HOOK'});
+  attribute.onUploadCallback = THREE.BufferAttribute.prototype.onUploadCallback;
+  f.renderer._device = {limits: {maxStorageBufferBindingSize: 32}};
+  assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_LIMIT'});
+  f.renderer._device.limits = {maxStorageBuffersPerShaderStage: 1};
+  f.material.colorNode = storage.element(0).xyz.add(N.storage(new THREE.StorageBufferAttribute(4, 4), 'vec4', 4).element(0).xyz);
+  assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_LIMIT'});
 });
 test('source missing attributes retain the builder constant fallback without a fake vertex stream', t => {
   const f = rig(t); f.material.positionNode = N.attribute('absent', 'vec3');
