@@ -626,3 +626,60 @@ test('shared native material keeps object-specific instance storage and validate
   assert.equal(f.device.writes.length,writes);assert.equal(f.device.submissions.length,submissions);
   assert.equal(f.acquired(),acquired);assert.equal(f.renderer._nodeCaptureBytes,0);
 });
+
+
+test('source Physical H7 material maps and compute-authored instance draws retain queued versions',async t=>{
+  const f=fixture(t);recordCompute(f.device);
+  const a=dataTexture(240,30,10),b=dataTexture(20,60,230),specular=dataTexture(120,180,220),metalRough=dataTexture(30,160,110);
+  a.colorSpace=b.colorSpace=specular.colorSpace=T.SRGBColorSpace;
+  const material=new T.MeshPhysicalMaterial({map:a,specularColorMap:specular,roughnessMap:metalRough,metalnessMap:metalRough,
+    normalMap:dataTexture(128,128,255),metalness:.5,ior:1.45,side:T.DoubleSide});
+  const vertexCount=f.mesh.geometry.attributes.position.count,attribute=new T.StorageBufferAttribute(2*vertexCount*2,4),
+    storage=T.TSL.storage(attribute,'vec4',attribute.count),index=T.TSL.instanceIndex.mul(T.TSL.uint(vertexCount)).add(T.TSL.vertexIndex).mul(T.TSL.uint(2));
+  attribute.array.fill(.125);let callbacks=0;
+  const gain=T.TSL.uniform(1).onObjectUpdate(context=>{
+    assert.equal(context.material,material);assert.equal(context.object,f.mesh);callbacks++;return 1;
+  });
+  material.positionNode=storage.element(index).xyz.mul(gain);
+  material.normalNode=T.TSL.transformNormalToView(storage.element(index.add(T.TSL.uint(1))).xyz).toVarying();
+  f.mesh.material=material;f.mesh.count=2;f.mesh.frustumCulled=false;
+  f.scene.add(new T.DirectionalLight(0xffffff,2),new T.AmbientLight(0xffffff,.25));
+  const kernel=T.TSL.Fn(()=>{storage.element(T.TSL.instanceIndex).addAssign(T.TSL.vec4(0));})().compute(attribute.count);
+  await f.renderer.init();
+  const firstCompute=f.renderer.compute(kernel);f.renderer.render(f.scene,f.camera);
+  material.map=b;attribute.array.fill(.625);attribute.needsUpdate=true;f.mesh.count=1;
+  const secondCompute=f.renderer.compute(kernel);f.renderer.render(f.scene,f.camera);
+  a.image.data.fill(0);b.image.data.fill(0);attribute.array.fill(99);f.mesh.count=12;
+  assert.equal(callbacks,2);assert.equal(f.device.textureWrites.length,0);
+  await Promise.all([firstCompute,secondCompute,drain(f.renderer)]);
+  const draws=nativeDraws(f.device);assert.equal(draws.length,2);assert.deepEqual(draws.map(draw=>draw.args[1]),[2,1]);
+  assert.equal(draws[0].pipeline,draws[1].pipeline,'compatible material-map replacements keep the native program');
+  assert.match(draws[0].pipeline.fragment.module.code,/fn D_GGX/);
+  const textures=draws.map(textureResources);
+  assert.ok(textures.every(views=>views.length===4),'map, specular color, shared metal/roughness map and DFG');
+  const colorPixels=textures.map(views=>views.filter(view=>view.format==='rgba8unorm-srgb').map(view=>[...view.texture.pixels]));
+  assert.deepEqual(colorPixels[0],[[240,30,10,255],[120,180,220,255]]);
+  assert.deepEqual(colorPixels[1],[[20,60,230,255],[120,180,220,255]]);
+  const buffer=storageResources(draws[0])[0].buffer;
+  assert.equal(storageResources(draws[1])[0].buffer,buffer);
+  assert.deepEqual(draws.map(draw=>new Float32Array(draw.contents.get(buffer).buffer)[0]),[.125,.625]);
+  assert.equal(captureComputeStorage(f.device,attribute).resolve().buffer,buffer);
+  assert.equal(f.device.writes.filter(write=>write.buffer===buffer).length,2,'graphics does not overwrite queued compute data');
+  assert.equal(f.renderer._nodeCaptureBytes,0);assert.equal(callbacks,2);await f.renderer.waitForGPU();
+});
+
+test('source material arrays preserve per-group maps while ordinary materials retain fixed rendering',async t=>{
+  const f=fixture(t),a=new T.MeshStandardMaterial({map:dataTexture(220,30,70)}),b=new T.MeshPhysicalMaterial({map:dataTexture(40,170,230)});
+  a.positionNode=b.positionNode=T.TSL.positionLocal;
+  f.mesh.geometry.clearGroups();f.mesh.geometry.addGroup(0,3,0);f.mesh.geometry.addGroup(3,3,1);f.mesh.material=[a,b];
+  const ordinary=new T.Mesh(new T.PlaneGeometry(),new T.MeshBasicMaterial({color:0xff0000}));ordinary.position.z=.25;f.scene.add(ordinary);
+  f.scene.add(new T.AmbientLight(0xffffff,.5));
+  await f.renderer.compileAsync(f.scene,f.camera);assert.equal(f.device.textureWrites.length,0);
+  f.renderer.render(f.scene,f.camera);await drain(f.renderer);
+  const native=nativeDraws(f.device);assert.equal(native.length,2);
+  assert.deepEqual(native.map(draw=>draw.args[0]),[3,3]);
+  assert.deepEqual(native.map(draw=>[...textureResources(draw).find(view=>view.texture.format==='rgba8unorm').texture.pixels]),
+    [[220,30,70,255],[40,170,230,255]]);
+  assert.equal(f.device.snapshots.flat().filter(draw=>draw.pipeline.vertex.entryPoint==='vertex_main').length,1);
+  assert.equal(f.mesh.material[0],a);assert.equal(f.mesh.material[1],b);assert.equal(f.renderer._nodeCaptureBytes,0);
+});

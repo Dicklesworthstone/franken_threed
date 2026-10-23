@@ -3,9 +3,10 @@
  * no GPU commands. Descriptors preserve the builder's native bind groups.
  *
  * The profile is rigid meshes and storage-backed InstancedMesh objects, unlit
- * or Toon/Lambert/Phong/Standard/Physical
- * with ordinary source lights, float attributes, scalar/vector/matrix uniforms,
- * authored typed uniform arrays and multiple uniform blocks per source group,
+ * or Toon/Lambert/Phong/Standard/Physical node materials and corresponding
+ * built-in materials with authored slots, ordinary source lights, float attributes,
+ * scalar/vector/matrix uniforms, authored typed uniform arrays and multiple
+ * uniform blocks per source group,
  * sampled 2D float textures and read-only scalar/vector/mat4 or flat-struct storage buffers.
  * Physical direct lighting retains the source DFG texture, clearcoat, sheen,
  * iridescence, anisotropy, retroreflection and source PMREM environment lighting. Transmission,
@@ -30,6 +31,13 @@ const PHYSICAL_SLOTS = new Set(['clearcoatNode', 'clearcoatRoughnessNode', 'clea
   'sheenNode', 'sheenRoughnessNode', 'iridescenceNode', 'iridescenceIORNode', 'iridescenceThicknessNode',
   'anisotropyNode', 'retroreflectivityNode', 'iorNode', 'specularColorNode', 'specularIntensityNode']);
 const GRAPH_SLOTS = [...SLOTS, ...LIT_SLOTS, ...PHONG_SLOTS, ...STANDARD_SLOTS, ...PHYSICAL_SLOTS];
+// These source material accessors lower to ordinary 2D texture bindings. Light
+// maps/AO introduce additional lighting nodes; environment maps have a separate
+// PMREM context. Keep those dependencies explicit instead of silently ignoring them.
+const MATERIAL_MAPS = new Set(['map', 'alphaMap', 'emissiveMap', 'normalMap', 'bumpMap', 'displacementMap',
+  'specularMap', 'specularIntensityMap', 'specularColorMap', 'roughnessMap', 'metalnessMap', 'gradientMap',
+  'clearcoatMap', 'clearcoatRoughnessMap', 'clearcoatNormalMap', 'sheenColorMap', 'sheenRoughnessMap',
+  'iridescenceMap', 'iridescenceThicknessMap', 'anisotropyMap', 'retroreflectivityMap']);
 const TYPES = new Set(['float', 'int', 'uint', 'bool', 'color', 'vec2', 'vec3', 'vec4', 'ivec2', 'ivec3', 'ivec4',
   'uvec2', 'uvec3', 'uvec4', 'bvec2', 'bvec3', 'bvec4', 'mat2', 'mat3', 'mat4']);
 const FRAME_FIELDS = ['renderer', 'scene', 'camera', 'object', 'material', 'compute', 'frameId', 'renderId', 'time', 'deltaTime'];
@@ -38,7 +46,7 @@ const nodeStates = new WeakMap();
 /** True only for materials with an authored graphics slot. Default built-ins
  * continue through the existing fixed shader path. Admission is separate. */
 export function hasThreeNodeProgram(material) {
-  return material?.isNodeMaterial === true && Object.keys(material).some(key => key.endsWith('Node') && material[key] != null);
+  return material?.isMaterial === true && Object.keys(material).some(key => key.endsWith('Node') && material[key] != null);
 }
 
 export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, maxNodes = 8192,
@@ -55,9 +63,40 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   const lightClasses = new Map([[three.AmbientLight, three.AmbientLightNode], [three.DirectionalLight, three.DirectionalLightNode],
     [three.HemisphereLight, three.HemisphereLightNode], [three.PointLight, three.PointLightNode], [three.SpotLight, three.SpotLightNode]]);
   const environmentNodes = new WeakMap(), environmentVersions = new WeakMap(), uniformBuffers = new WeakMap();
+  const materialViews = new WeakMap();
+  const sourceMaterialClasses = new Map([
+    [three.MeshBasicMaterial, three.MeshBasicNodeMaterial], [three.MeshToonMaterial, three.MeshToonNodeMaterial],
+    [three.MeshLambertMaterial, three.MeshLambertNodeMaterial], [three.MeshPhongMaterial, three.MeshPhongNodeMaterial],
+    [three.MeshStandardMaterial, three.MeshStandardNodeMaterial], [three.MeshPhysicalMaterial, three.MeshPhysicalNodeMaterial]
+  ].map(([Source, Native]) => [Source.prototype, {Source, Native}]));
   let disposed = false, shaderBytes = 0, serial = 0;
   const live = () => { if (disposed) fail('DISPOSED', 'Native node program preparation is disposed'); };
   const litMaterial = material => litPrototypes.includes(Object.getPrototypeOf(material));
+  function prepareMaterial(material) {
+    if (material instanceof three.NodeMaterial) return material;
+    const classes = material instanceof three.Material && sourceMaterialClasses.get(Object.getPrototypeOf(material));
+    if (!classes || material.type !== classes.Source.name ||
+        renderer.library.getMaterialNodeClass(material.type) !== classes.Native ||
+        renderer.library.fromMaterial !== three.StandardNodeLibrary.prototype.fromMaterial)
+      fail('MATERIAL', 'Native source materials require an ordinary built-in class and its pinned node-library conversion');
+    let record = materialViews.get(material);
+    if (!record) {
+      const view = new classes.Native();
+      record = {view, defaults: new Map(Object.entries(view)), keys: new Set()};
+      materialViews.set(material, record);
+    }
+    // Match NodeLibrary.fromMaterial's enumerable-property copy without making
+    // a new material on every admission/cache lookup. Reset removed properties
+    // to source defaults; otherwise deleting an authored slot would retain it.
+    const keys = new Set();
+    for (const key in material) { record.view[key] = material[key]; keys.add(key); }
+    for (const key of record.keys) if (!keys.has(key)) {
+      if (record.defaults.has(key)) record.view[key] = record.defaults.get(key);
+      else delete record.view[key];
+    }
+    record.keys = keys;
+    return record.view;
+  }
   const rawUniformBuffer = node => node instanceof three.BufferNode && !node.isStorageBufferNode && !node.isArrayBufferNode;
   function inspectUniformBuffer(node) {
     // BufferNode emits the caller's array layout verbatim. Unlike UniformArrayNode,
@@ -249,10 +288,17 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       fail('TEXTURE', 'Native graphics texture bindings require resolved color views');
     return texture;
   }
-  function textureSignature(nodes) {
+  function textureValue(node, references = null) {
+    const reference = references?.get(node.getBase());
+    if (!reference) return node.value;
+    let value = reference.material;
+    for (const property of reference.properties) value = value?.[property];
+    return value;
+  }
+  function textureSignature(nodes, references = null) {
     const aliases = new Map(), checked = new Set();
     return JSON.stringify(nodes.map(node => {
-      const texture = node.value;
+      const texture = references ? textureValue(node, references) : node.value;
       if (!checked.has(texture)) { inspectTexture(texture); checked.add(texture); }
       // The pinned builder aliases uniforms by texture UUID. Keep that alias
       // partition, not the identities themselves, in the structural signature:
@@ -264,8 +310,15 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         node.sampler, node.updateMatrix, node.groupNode?.name];
     }));
   }
+  function materialMapSignature(material) {
+    const maps = [...MATERIAL_MAPS].filter(key => material[key]?.isTexture);
+    return JSON.stringify([maps, material.normalMapType,
+      textureSignature(maps.map(key => ({value: material[key]})))]);
+  }
   function inspect(material, object, context = {}) {
     live();
+    const sourceMaterial = material;
+    material = prepareMaterial(material);
     const {scene, camera} = context;
     if (!(material instanceof three.NodeMaterial) ||
         ![three.MeshBasicNodeMaterial.prototype, three.NodeMaterial.prototype, ...litPrototypes].includes(Object.getPrototypeOf(material)))
@@ -295,13 +348,17 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       fail('RASTER', 'Transparent DoubleSide node graphs require forceSinglePass until side variants are supported');
     if (Object.keys(renderer.contextNode?.getFlowContextData?.() ?? {}).length)
       fail('GRAPH', 'Custom renderer node contexts require an explicit graphics context adapter');
-    if (material.onBeforeCompile !== three.Material.prototype.onBeforeCompile ||
-        material.onBeforeRender !== three.Material.prototype.onBeforeRender ||
-        material.customProgramCacheKey !== three.NodeMaterial.prototype.customProgramCacheKey)
+    if (sourceMaterial.onBeforeCompile !== three.Material.prototype.onBeforeCompile ||
+        sourceMaterial.onBeforeRender !== three.Material.prototype.onBeforeRender ||
+        sourceMaterial.customProgramCacheKey !== (sourceMaterial.isNodeMaterial === true
+          ? three.NodeMaterial.prototype.customProgramCacheKey : three.Material.prototype.customProgramCacheKey))
       fail('HOOK', 'Custom material shader/render hooks are not admitted');
     for (const key of Object.keys(material)) {
       const value = material[key];
-      if (value?.isTexture) fail('TEXTURE', `Native node graph material texture ${key} is not admitted`);
+      if (value?.isTexture) {
+        if (!MATERIAL_MAPS.has(key)) fail('TEXTURE', `Native node graph material texture ${key} is not admitted`);
+        inspectTexture(value);
+      }
       if (key.endsWith('Node') && value != null && !SLOTS.has(key) && !(lit && LIT_SLOTS.has(key)) &&
           !(phong && PHONG_SLOTS.has(key)) && !(standard && STANDARD_SLOTS.has(key)) && !(physical && PHYSICAL_SLOTS.has(key)))
         fail('GRAPH', `Native node graph slot ${key} is not admitted`);
@@ -366,10 +423,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // Match the source's graph cache key. Uniform values never participate.
     // Object/material references remain separate cache dimensions, preserving
     // builder nodes which close over a particular source object.
-    return JSON.stringify([material.version, material.customProgramCacheKey(), material.side,
+    return JSON.stringify([material.version, three.NodeMaterial.prototype.customProgramCacheKey.call(material), material.side,
       material.vertexColors, material.flatShading, material.transparent, material.blending, material.premultipliedAlpha,
       material.alphaTest > 0, material.depthWrite, material.depthTest, material.lights,
-      object.geometry.id, camera?.isPerspectiveCamera === true, instanceSignature,
+      object.geometry.id, camera?.isPerspectiveCamera === true, instanceSignature, materialMapSignature(material),
       environment ? [environment.id, environment.mapping, environment.isRenderTargetTexture === true, environment.isPMREMTexture === true] : null,
       Object.entries(object.geometry.attributes).map(([name, a]) => [name, a.itemSize, a.normalized, a.gpuType, a.array?.constructor.name,
         a.isInterleavedBufferAttribute, a.data?.array?.constructor.name, a.data?.stride, a.offset]),
@@ -386,20 +443,20 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (cache.get(entry.object)?.get(entry.material) === entry) cache.get(entry.object).delete(entry.material);
   }
   function compile(material, object, context = {}) {
-    inspect(material, object, context);
-    const lights = sourceLights(material, context), environment = sourceEnvironment(material, context);
+    const preparedMaterial = inspect(material, object, context);
+    const lights = sourceLights(preparedMaterial, context), environment = sourceEnvironment(preparedMaterial, context);
     const instances = inspectInstances(object), instanceSignature = instances?.signature ?? null;
-    const key = keyOf(material, object, context, lights, environment, instanceSignature), byMaterial = cache.get(object);
+    const key = keyOf(preparedMaterial, object, context, lights, environment, instanceSignature), byMaterial = cache.get(object);
     const previous = byMaterial?.get(material);
     if (previous?.key === key && pmremSignature(previous.pmremNodes) === previous.pmremSignature &&
-        textureSignature(previous.textureNodes) === previous.textureSignature &&
+        textureSignature(previous.textureNodes, previous.textureReferences) === previous.textureSignature &&
         storageSignature(previous.storageNodes) === previous.storageSignature &&
         uniformSignature(previous.uniformNodes, previous.builder) === previous.uniformSignature) return previous.descriptor;
     if (entries.size - (previous ? 1 : 0) >= maxPrograms) fail('LIMIT', 'Native node program capacity exceeded');
     const builder = new three.WGSLNodeBuilder(object, renderer);
     builder.material = material; builder.context.material = material;
     builder.scene = context.scene ?? null; builder.camera = context.camera ?? null;
-    const lightsNode = litMaterial(material) ? three.TSL.lights(lights) : null;
+    const lightsNode = litMaterial(preparedMaterial) ? three.TSL.lights(lights) : null;
     if (lightsNode) builder.lightsNode = lightsNode;
     const environmentNode = environmentNodeFor(environment);
     if (environmentNode) builder.environmentNode = environmentNode;
@@ -489,8 +546,6 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const descriptor = Object.freeze({nodeProgram: true, key: `native-node-${++serial}`, vertex, fragment,
       attributes: Object.freeze(attributes), attributesKey: JSON.stringify(attributes), groups: Object.freeze(groups),
       ...(instances ? {instanceCapacity: instances.capacity} : {})});
-    const textureNodes = [...builder.nodes].filter(node => node.isTextureNode && boundTextures.has(node.value));
-    const signature = textureSignature(textureNodes);
     // Node.build() deduplicates unsized storage by attribute before addNode().
     // Walk the original child edges too, including graphs created inside Fn,
     // so changing one alias cannot silently keep the old shared binding.
@@ -499,14 +554,24 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       if (graphNodes.size > maxNodes) fail('LIMIT', 'Generated native node graph exceeds its node budget');
       if (typeof node.getChildren === 'function') for (const child of node.getChildren()) graphNodes.add(child);
     }
+    // Include TextureNodes omitted by source UUID binding deduplication. Source
+    // MaterialNode caches its references across materials, so read their live
+    // source properties for cache/preflight checks without running node updates.
+    // This also detects a map that stops sharing an authored texture binding.
+    const textureReferences = new Map();
+    for (const node of graphNodes) if (node.constructor === three.MaterialReferenceNode && node.node?.isTextureNode &&
+        node.updateReference === three.MaterialReferenceNode.prototype.updateReference)
+      textureReferences.set(node.node.getBase(), {material: node.material ?? material, properties: node.properties.slice()});
+    const textureNodes = [...graphNodes].filter(node => node.isTextureNode && boundTextures.has(node.value));
+    const signature = textureSignature(textureNodes, textureReferences);
     const storageNodes = [...graphNodes].filter(node => node.isStorageBufferNode);
     const storageKey = storageSignature(storageNodes);
     const uniformNodes = [...graphNodes].filter(rawUniformBuffer), uniformKey = uniformSignature(uniformNodes, builder);
     nodeStates.set(descriptor, {owner: api, builder, bindings, material, object, environment, instanceSignature, pmremNodes, pmremSignature: pmremKey,
-      textureNodes, textureSignature: signature,
+      textureNodes, textureReferences, textureSignature: signature, materialMapSignature: materialMapSignature(material),
       storageNodes, storageSignature: storageKey, uniformNodes, uniformSignature: uniformKey});
     const entry = {key, descriptor, builder, material, object, geometry: object.geometry, bytes, pmremNodes, pmremSignature: pmremKey,
-      textureNodes, textureSignature: signature,
+      textureNodes, textureReferences, textureSignature: signature,
       storageNodes, storageSignature: storageKey, uniformNodes, uniformSignature: uniformKey};
     entry.onDispose = () => retire(entry);
     if (previous) retire(previous);
@@ -532,13 +597,23 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (pmremSignature(state.pmremNodes) !== state.pmremSignature)
       fail('CHANGED', 'Native PMREM input identity or sampling orientation changed; compile the graph again');
   }
-  function readTextures(state) {
-    if (textureSignature(state.textureNodes) !== state.textureSignature)
+  function checkMaterialMaps(state) {
+    if (materialMapSignature(state.material) !== state.materialMapSignature)
+      fail('CHANGED', 'Native material map slots, layout, normal mode or aliases changed; compile the graph again');
+  }
+  function readTextures(state, liveReferences = false) {
+    checkMaterialMaps(state);
+    // Preparation reads source properties without executing updates. Draw
+    // capture uses the values produced by the actual NodeFrame update order;
+    // a later application callback may already have edited the public map.
+    const references = liveReferences ? state.textureReferences : null;
+    if (textureSignature(state.textureNodes, references) !== state.textureSignature)
       fail('CHANGED', 'Native node texture layout, UV channel or binding aliases changed; compile the graph again');
     const textures = [];
     for (const [group, source] of state.bindings.entries()) for (const [binding, value] of source.bindings.entries())
       if (value.isSampledTexture || value.isSampler) textures.push(Object.freeze({group, binding,
-        texture: value.textureNode.value, isSampler: value.isSampler === true, isSampledTexture: value.isSampledTexture === true,
+        texture: liveReferences ? textureValue(value.textureNode, references) : value.textureNode.value,
+        isSampler: value.isSampler === true, isSampledTexture: value.isSampledTexture === true,
         store: false, access: null, mipLevel: 0}));
     return Object.freeze(textures);
   }
@@ -580,6 +655,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   function captureDraw(descriptor, context = {}) {
     const state = stateOf(descriptor);
     const object = context.object ?? state.object;
+    checkMaterialMaps(state);
     assertInstances(object, state.instanceSignature);
     assertEnvironmentVersion(state.environment);
     checkPMREM(state);
@@ -619,7 +695,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     return withFrame(state, context, () => { for (const node of state.builder.updateAfterNodes) frame.updateAfterNode(node); });
   }
   const api = Object.freeze({inspect, compile, capture, captureDraw, after,
-    textures(descriptor) { return readTextures(stateOf(descriptor)); },
+    textures(descriptor) { return readTextures(stateOf(descriptor), true); },
     storage(descriptor) { return readStorage(stateOf(descriptor)); },
     release(descriptor) { for (const entry of entries) if (entry.descriptor === descriptor) { retire(entry); break; } },
     dispose() { if (disposed) return; disposed = true; for (const entry of [...entries]) retire(entry); },

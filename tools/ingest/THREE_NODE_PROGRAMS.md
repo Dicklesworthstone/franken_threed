@@ -10,6 +10,24 @@ acceleration or a Rust implementation of node evaluation.
 
 ## Implemented graph surface
 
+Built-in `MeshBasicMaterial`, `MeshToonMaterial`, `MeshLambertMaterial`,
+`MeshPhongMaterial`, `MeshStandardMaterial` and `MeshPhysicalMaterial` can also
+carry authored node slots. Their exact pinned `StandardNodeLibrary` conversions
+supply the native graph while the builder, callbacks and disposal retain the
+original source material identity. Materials without authored slots keep their
+existing fixed rendering path. Custom material subclasses and overridden
+conversion methods remain outside this entrance.
+
+Source material maps now lower through the pinned material accessors: base
+color, alpha, emissive, normal, bump, displacement, specular, roughness,
+metalness, gradient and the admitted Physical lobe maps. Their UV channel,
+transforms, color space and normal-map mode remain source behavior. Shared
+metalness/roughness textures retain one sampled binding; changing a map's
+sharing relationship with another map or authored texture rebuilds the binding
+layout. Compatible image replacement retains the compiled program and each
+queued draw's source pixel version. AO, light maps and material environment maps
+still require additional lighting adapters.
+
 Use `MeshBasicNodeMaterial`, or an unlit base `NodeMaterial`, with `colorNode`,
 `positionNode`, `vertexNode`, `fragmentNode`, `opacityNode`, `alphaTestNode` and
 `outputNode`. Ordinary source node arithmetic, functions and custom scalar/vector
@@ -302,8 +320,8 @@ Depth/comparison, cube, array, volume, compressed, storage, video and unfilterab
 or integer texture graphs still require additional native profiles. Sampled
 texture capture transactions reject reentrant texture capture from node updates
 or upload callbacks.
-The profile excludes shader context extensions, fog/clipping/shadows, material
-textures, wireframe, alpha hashing and alpha-to-coverage; ordinary CPU instance
+The profile excludes shader context extensions, fog/clipping/shadows, AO/light/material-environment
+maps, wireframe, alpha hashing and alpha-to-coverage; ordinary CPU instance
 matrix/color streams, `InstancedBufferGeometry`, skinned, batched or morph meshes,
 including per-instance morph textures; ArrayCamera, reversed depth and XR views;
 custom object/material render hooks and effectful attribute upload callbacks. A
@@ -438,3 +456,13 @@ resource ownership. The registered `native_tsl_background_nodes` browser scenari
 renders two queued gradient skies into distinct targets and mutates their live
 controls afterward. Its GPU pixel comparison has not yet been run.
 
+
+The built-in source-material extension passes 75 compiler tests and 29 renderer
+facade tests. The H7 regression uses the model's Physical map combination with
+compute-authored position/normal storage and `Mesh.count`, checking source
+identities, sRGB views, shared bindings, queued pixel/count histories and shared
+compute residency. Other cases cover all six converted material classes,
+material arrays, UV/normal mode changes, callback ordering and alias changes
+between material maps and authored texture graphs. The registered
+`native_tsl_source_materials` browser comparison covers mapped built-in
+materials with authored deformation; its GPU pixel comparison is unmeasured.

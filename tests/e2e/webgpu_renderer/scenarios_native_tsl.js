@@ -74,6 +74,43 @@ function environmentTexture(T, variant) {
   return texture;
 }
 export const nativeTSLScenarios = {
+  native_tsl_source_materials(T, renderer) {
+    const {positionLocal, normalLocal, transformNormalToView, vec3, uniform} = T.TSL;
+    const result = {scene: scene(T), camera: camera(T)};
+    const phase = uniform(.1), maps = [sampledTexture(T), sampledTexture(T, 1)];
+    const scalarMap = sampledTexture(T, 2, T.NoColorSpace), normal = sampledNormal(T);
+    const classes = [T.MeshBasicMaterial, T.MeshToonMaterial, T.MeshLambertMaterial,
+      T.MeshPhongMaterial, T.MeshStandardMaterial, T.MeshPhysicalMaterial];
+    const materials = classes.map((Material, index) => {
+      const material = new Material({map: maps[index % 2], side: T.DoubleSide});
+      material.positionNode = positionLocal.add(vec3(0, positionLocal.x.mul(4).add(phase).sin().mul(.05), 0));
+      if (index > 0) material.normalMap = normal;
+      if (index === 3) { material.specularMap = scalarMap; material.shininess = 30; }
+      if (index >= 4) {
+        material.metalness = .5; material.roughness = .65;
+        material.metalnessMap = material.roughnessMap = scalarMap;
+      }
+      if (index === 5) {
+        material.specularColorMap = maps[1]; material.ior = 1.45;
+        // Like H7, an authored transformed normal overrides the source normal map.
+        material.normalNode = transformNormalToView(normalLocal).toVarying();
+      }
+      const mesh = new T.Mesh(new T.SphereGeometry(.49, 32, 20), material);
+      mesh.position.set((index % 3 - 1) * 1.3, index < 3 ? .66 : -.66, 0);
+      result.scene.add(mesh); return material;
+    });
+    const sun = new T.DirectionalLight(0xffe0c0, 2); sun.position.set(-2, 3, 4);
+    result.scene.add(sun, new T.HemisphereLight(0xc4dfff, 0x47302a, .7));
+    const render = renderer.render.bind(renderer); let frame = 0;
+    renderer.render = (...args) => {
+      if (args[0] === result.scene && ++frame === 8) {
+        phase.value = 1.2; materials[4].map = maps[1];
+        materials[5].map = maps[1]; materials[5].specularColorMap = maps[0];
+      }
+      return render(...args);
+    };
+    return {...result, materials, phase};
+  },
   native_tsl_background_nodes(T, renderer) {
     const {uniform, screenUV, color} = T.TSL;
     const writer = new T.Scene(), writeCamera = camera(T);

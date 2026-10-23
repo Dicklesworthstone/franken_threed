@@ -764,7 +764,7 @@ for (const [name, change, code] of [
   ['atomic storage graph', f => { f.material.colorNode = N.storage(new THREE.StorageBufferAttribute(4, 1, Uint32Array), 'uint', 4).toAtomic().element(0).toFloat(); }, 'STORAGE'],
   ['managed uniform array graph', f => { f.material.colorNode = N.uniformArray([new THREE.Vector4(1, 0, 0, 1)]).element(0).xyz; }, 'STORAGE'],
   ['buffer attribute graph', f => { f.material.colorNode = N.bufferAttribute(new THREE.Float32BufferAttribute(new Float32Array(12), 3)); }, 'STORAGE'],
-  ['material texture', f => { f.material.map = new THREE.Texture(); }, 'TEXTURE'],
+  ['material environment texture', f => { f.material.envMap = new THREE.Texture(); }, 'TEXTURE'],
   ['MRT graph', f => { f.material.fragmentNode = N.mrt({output: N.vec4(1)}); }, 'MRT'],
   ['lighting slot', f => { f.material.lightsNode = N.vec3(1); }, 'GRAPH'],
   ['transparent double side', f => { f.material.side = THREE.DoubleSide; f.material.transparent = true; }, 'RASTER'],
@@ -944,4 +944,187 @@ test('program budget, material disposal and owner identity are enforced', t => {
   assert.ok(f.owner.compile(f.material, other, f.context));
   const foreign = rig(t); assert.throws(() => foreign.owner.capture(d, f.context), {code: 'THREE_NODE_PROGRAM_SOURCE'});
   f.owner.dispose(); assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_DISPOSED'});
+});
+
+
+for (const Material of [THREE.MeshBasicMaterial, THREE.MeshToonMaterial, THREE.MeshLambertMaterial,
+  THREE.MeshPhongMaterial, THREE.MeshStandardMaterial, THREE.MeshPhysicalMaterial]) {
+  test(`source material ${Material.name} retains authored geometry and the pinned surface graph`, t => {
+    const f = pbrRig(t, Material), material = f.material;
+    delete material.colorNode;
+    material.positionNode = N.positionLocal.add(N.vec3(f.shift, 0, 0));
+    material.map = dataTexture(); material.map.colorSpace = THREE.SRGBColorSpace;
+    assert.equal(hasThreeNodeProgram(material), true);
+    assert.equal(hasThreeNodeProgram(new Material()), false, 'ordinary built-ins retain the fixed route');
+    const d = f.compile(), draw = f.owner.captureDraw(d, f.context);
+    assert.match(d.vertex, /object\.testShift/);
+    assert.match(d.fragment, /textureSample/);
+    assert.equal(draw.textures.find(binding => binding.texture === material.map).texture.colorSpace, THREE.SRGBColorSpace);
+    assert.ok(draw.textures.some(binding => binding.texture === material.map));
+    assert.ok(floats(draw.uniforms).includes(.125));
+    if (material.isMeshStandardMaterial) assert.match(d.fragment, /fn D_GGX/);
+    assert.equal(f.compile(), d);
+    material.dispose(); assert.equal(f.owner.diagnostics.programs, 0, 'the source material owns cache lifetime');
+  });
+}
+test('source material H7 Physical maps coexist with compute-authored instanced geometry', t => {
+  const f = pbrRig(t, THREE.MeshPhysicalMaterial), material = f.material, vertexCount = f.object.geometry.attributes.position.count;
+  delete material.colorNode;
+  material.side = THREE.DoubleSide; material.ior = 1.4500000476837158; material.metalness = .5;
+  material.map = dataTexture(); material.map.colorSpace = THREE.SRGBColorSpace;
+  material.normalMap = dataTexture(); material.specularColorMap = dataTexture();
+  material.specularColorMap.colorSpace = THREE.SRGBColorSpace;
+  material.metalnessMap = material.roughnessMap = dataTexture();
+  const vertices = new THREE.StorageBufferAttribute(new Float32Array(2 * vertexCount * 2 * 4), 4);
+  const storage = N.storage(vertices, 'vec4', vertices.count), index = N.instanceIndex.mul(N.uint(vertexCount)).add(N.vertexIndex).mul(N.uint(2));
+  material.positionNode = storage.element(index).xyz;
+  material.normalNode = N.transformNormalToView(storage.element(index.add(N.uint(1))).xyz).toVarying();
+  f.object.count = 2;
+  const d = f.compile(), draw = f.owner.captureDraw(d, f.context);
+  assert.match(d.vertex, /instance_index/); assert.match(d.vertex, /vertex_index/);
+  assert.match(d.vertex, /var<storage, read>/); assert.match(d.fragment, /fn D_GGX/);
+  assert.ok(draw.storage.some(binding => binding.attribute === vertices));
+  const sampled = draw.textures.filter(binding => binding.isSampledTexture).map(binding => binding.texture);
+  assert.equal(sampled.length, 4, 'map, specular color, shared metallic/roughness map and source DFG');
+  for (const texture of [material.map, material.specularColorMap, material.metalnessMap]) assert.ok(sampled.includes(texture));
+  assert.equal(sampled.includes(material.normalMap), false, 'authored H7 normalNode overrides the normal map');
+  assert.ok(sampled.some(texture => texture.name === 'DFG_LUT'));
+  assert.ok(floats(draw.uniforms).includes(Math.fround(material.ior)));
+});
+test('source material preparation preserves builder and NodeFrame source identities', t => {
+  const f = pbrRig(t, THREE.MeshStandardMaterial), material = f.material, seen = [];
+  delete material.colorNode;
+  material.map = dataTexture(); material.color.setRGB(.125, .375, .625);
+  const offset = N.uniform(0).onObjectUpdate(frame => {
+    seen.push([frame.material, frame.object, frame.scene, frame.camera]); return frame.material.roughness;
+  });
+  material.positionNode = N.Fn(builder => {
+    seen.push([builder.material, builder.object, builder.scene, builder.camera]);
+    assert.equal(builder.context.material, material);
+    return N.positionLocal.add(N.vec3(offset, 0, 0));
+  })();
+  const d = f.compile(), first = f.owner.captureDraw(d, f.context);
+  assert.ok(seen.length >= 2);
+  for (const context of seen) assert.deepEqual(context, [material, f.object, f.scene, f.camera]);
+  for (const value of [.125, .375, .625]) assert.ok(floats(first.uniforms).includes(value));
+  material.color.setRGB(.75, .5, .25); material.roughness = .875;
+  assert.equal(f.compile(), d);
+  const second = f.owner.captureDraw(d, {...f.context, renderId: 2});
+  for (const value of [.75, .5, .25, .875]) assert.ok(floats(second.uniforms).includes(value));
+  assert.notDeepEqual(second.uniforms, first.uniforms);
+});
+test('source material graph edits, removed authored slots and Physical feature switches rebuild correctly', t => {
+  const f = pbrRig(t, THREE.MeshPhysicalMaterial), material = f.material;
+  delete material.colorNode;
+  material.positionNode = N.positionLocal.add(N.vec3(f.shift, 0, 0));
+  const before = f.compile(); assert.match(before.vertex, /testShift/);
+  material.clearcoat = .5;
+  const enabled = f.compile(); assert.notEqual(enabled, before); assert.match(enabled.fragment, /clearcoatSpecularDirect/);
+  material.clearcoat = .75; assert.equal(f.compile(), enabled);
+  material.positionNode = N.positionLocal;
+  const changed = f.compile(); assert.notEqual(changed, enabled); assert.doesNotMatch(changed.vertex, /testShift/);
+  delete material.positionNode;
+  const removed = f.compile(); assert.notEqual(removed, changed); assert.equal(hasThreeNodeProgram(material), false);
+  material.clearcoat = 0;
+  const disabled = f.compile(); assert.notEqual(disabled, removed); assert.doesNotMatch(disabled.fragment, /clearcoatSpecularDirect/);
+  assert.equal(f.owner.diagnostics.programs, 1);
+});
+test('source material compatible map replacements retain programs and immutable draw captures', t => {
+  const f = pbrRig(t, THREE.MeshStandardMaterial), material = f.material;
+  delete material.colorNode; material.positionNode = N.positionLocal;
+  material.map = dataTexture(); material.map.offset.set(.125, .25);
+  const original = material.map, d = f.compile(), first = f.owner.captureDraw(d, f.context), saved = first.uniforms.map(bytes => bytes.slice());
+  const replacement = dataTexture(); replacement.offset.set(.375, .625); material.map = replacement;
+  assert.equal(f.compile(), d);
+  const second = f.owner.captureDraw(d, {...f.context, renderId: 2});
+  assert.ok(first.textures.some(binding => binding.texture === original));
+  assert.ok(second.textures.some(binding => binding.texture === replacement));
+  assert.equal(second.textures.some(binding => binding.texture === original), false);
+  assert.deepEqual(first.uniforms, saved); assert.notDeepEqual(second.uniforms, first.uniforms);
+  assert.ok(floats(second.uniforms).includes(.375)); assert.ok(floats(second.uniforms).includes(.625));
+});
+test('source material map topology, UV channels and normal mode invalidate the graph before callbacks', t => {
+  const f = pbrRig(t, THREE.MeshStandardMaterial), material = f.material;
+  delete material.colorNode; let calls = 0;
+  material.positionNode = N.positionLocal.add(N.vec3(N.uniform(0).onObjectUpdate(() => ++calls), 0, 0));
+  const noMap = f.compile();
+  material.map = dataTexture();
+  assert.throws(() => f.owner.captureDraw(noMap, f.context), {code: 'THREE_NODE_PROGRAM_CHANGED'}); assert.equal(calls, 0);
+  const mapped = f.compile(); assert.notEqual(mapped, noMap);
+  material.metalnessMap = material.roughnessMap = dataTexture();
+  const shared = f.compile(), first = f.owner.captureDraw(shared, f.context);
+  material.metalnessMap = dataTexture();
+  assert.throws(() => f.owner.captureDraw(shared, {...f.context, renderId: 2}), {code: 'THREE_NODE_PROGRAM_CHANGED'}); assert.equal(calls, 1);
+  const split = f.compile(); assert.notEqual(split, shared);
+  const second = f.owner.captureDraw(split, {...f.context, renderId: 2});
+  assert.equal(second.textures.filter(binding => binding.isSampledTexture).length,
+    first.textures.filter(binding => binding.isSampledTexture).length + 1);
+  f.object.geometry.setAttribute('uv1', f.object.geometry.attributes.uv.clone());
+  material.map.channel = 1;
+  const uv1 = f.compile(); assert.notEqual(uv1, split); assert.ok(uv1.attributes.some(attribute => attribute.name === 'uv1'));
+  material.normalMap = dataTexture();
+  const tangent = f.compile(); assert.match(tangent.fragment, /dFdx|dpdx/);
+  material.normalMapType = THREE.ObjectSpaceNormalMap;
+  assert.throws(() => f.owner.captureDraw(tangent, {...f.context, renderId: 3}), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  const objectNormal = f.compile(); assert.notEqual(objectNormal, tangent);
+});
+test('source material references switch correctly between alternating objects and maps', t => {
+  const f = pbrRig(t, THREE.MeshStandardMaterial), a = f.material;
+  delete a.colorNode; a.positionNode = N.positionLocal; a.map = dataTexture(); a.map.offset.x = .125;
+  a.color.setRGB(.125, .25, .375);
+  const b = new THREE.MeshStandardMaterial({map: dataTexture()}); b.positionNode = N.positionLocal; b.map.offset.x = .625;
+  b.color.setRGB(.625, .75, .875);
+  const objectB = new THREE.Mesh(f.object.geometry, b); f.scene.add(objectB); f.scene.updateMatrixWorld();
+  const contextB = {...f.context, object: objectB, material: b};
+  const da = f.compile(), db = f.owner.compile(b, objectB, contextB);
+  for (const [descriptor, context, material, value] of [[da, f.context, a, .125], [db, contextB, b, .625], [da, f.context, a, .125]]) {
+    const draw = f.owner.captureDraw(descriptor, context);
+    assert.ok(draw.textures.some(binding => binding.texture === material.map));
+    assert.equal(draw.textures.some(binding => binding.texture === (material === a ? b.map : a.map)), false);
+    assert.ok(floats(draw.uniforms).includes(value));
+  }
+});
+test('source material conversion refuses unregistered classes, shader hooks and unsupported map dependencies', t => {
+  const f = pbrRig(t, THREE.MeshStandardMaterial), material = f.material;
+  const Custom = class extends THREE.MeshStandardMaterial {};
+  const custom = new Custom(); custom.positionNode = N.positionLocal;
+  assert.throws(() => f.owner.compile(custom, f.object, {...f.context, material: custom}), {code: 'THREE_NODE_PROGRAM_MATERIAL'});
+  const originalConversion = f.renderer.library.fromMaterial;
+  f.renderer.library.fromMaterial = () => new THREE.MeshStandardNodeMaterial();
+  assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_MATERIAL'}); f.renderer.library.fromMaterial = originalConversion;
+  material.onBeforeCompile = () => {};
+  assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_HOOK'}); delete material.onBeforeCompile;
+  material.customProgramCacheKey = () => 'custom';
+  assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_HOOK'}); delete material.customProgramCacheKey;
+  for (const slot of ['envMap', 'lightMap', 'aoMap']) {
+    material[slot] = dataTexture(); assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_TEXTURE'}); material[slot] = null;
+  }
+  material.map = new THREE.CubeTexture(); assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_TEXTURE'});
+});
+
+test('source material maps and authored samples rebuild when a shared binding separates', t => {
+  const f = pbrRig(t, THREE.MeshBasicMaterial), material = f.material;
+  material.map = dataTexture(); const sampled = N.texture(material.map);
+  material.colorNode = N.materialColor.mul(sampled);
+  const shared = f.compile();
+  assert.equal(f.owner.captureDraw(shared, f.context).textures.filter(binding => binding.isSampledTexture).length, 1);
+  material.map = dataTexture();
+  const separate = f.compile(); assert.notEqual(separate, shared);
+  const draw = f.owner.captureDraw(separate, {...f.context, renderId: 2});
+  const textures = draw.textures.filter(binding => binding.isSampledTexture).map(binding => binding.texture);
+  assert.equal(textures.length, 2); assert.ok(textures.includes(material.map)); assert.ok(textures.includes(sampled.value));
+});
+
+test('source material map capture respects source reference-update order', t => {
+  const f = pbrRig(t, THREE.MeshBasicMaterial), material = f.material, original = dataTexture(), replacement = dataTexture();
+  material.map = original;
+  const lateChange = N.uniform(1).onObjectUpdate(() => { material.map = replacement; return 1; });
+  material.colorNode = N.materialColor.mul(lateChange);
+  const d = f.compile(), first = f.owner.captureDraw(d, f.context);
+  assert.equal(material.map, replacement);
+  assert.ok(first.textures.some(binding => binding.texture === original), 'the source map reference updates before this fragment callback');
+  assert.equal(first.textures.some(binding => binding.texture === replacement), false);
+  assert.equal(f.compile(), d);
+  const second = f.owner.captureDraw(d, {...f.context, renderId: 2});
+  assert.ok(second.textures.some(binding => binding.texture === replacement));
 });
